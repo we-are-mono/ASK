@@ -1,0 +1,114 @@
+diff -Naur a/include/fmd/Peripherals/fm_ext.h b/include/fmd/Peripherals/fm_ext.h
+--- a/include/fmd/Peripherals/fm_ext.h	2018-04-12 01:25:15.956000000 +0530
++++ b/include/fmd/Peripherals/fm_ext.h	2018-04-12 01:25:28.280000000 +0530
+@@ -585,6 +585,38 @@
+ *//***************************************************************************/
+ t_Error FM_ForceIntr (t_Handle h_Fm, e_FmExceptions exception);
+ 
++/**************************************************************************//*
++ @Function      FM_ReadTimeStamp
++
++ @Description   Reads the FMan engine's timestamp.
++
++ @Param[in]     h_Fm                A handle to an FM Module.
++
++ @Return        The indicated engine's timestamp on success; zero otherwise.
++
++ @Cautions      Allowed only following FM_Init().
++                This routine should NOT be called from guest-partition
++                (i.e. guestId != NCSW_MASTER_ID)
++*//***************************************************************************/
++uint32_t FM_ReadTimeStamp(t_Handle h_Fm);
++
++/**************************************************************************//*
++ @Function      FM_GetTimeStampIncrementPerUsec
++
++ @Description   Provides the value of the FMan engine's timestamp increment
++                per microsecond.
++
++ @Param[in]     h_Fm                A handle to an FM Module.
++
++ @Return        The value the timestamp is incremented with each microsecond
++                on success; zero otherwise.
++
++ @Cautions      Allowed only following FM_Init().
++                This routine should NOT be called from guest-partition
++                (i.e. guestId != NCSW_MASTER_ID)
++*//***************************************************************************/
++uint32_t FM_GetTimeStampIncrementPerUsec(t_Handle h_Fm);
++
+ /** @} */ /* end of lnx_usr_FM_runtime_control_grp group */
+ /** @} */ /* end of lnx_usr_FM_lib_grp group */
+ /** @} */ /* end of lnx_usr_FM_grp group */
+diff -Naur a/include/fmd/Peripherals/fm_pcd_ext.h b/include/fmd/Peripherals/fm_pcd_ext.h
+--- a/include/fmd/Peripherals/fm_pcd_ext.h	2018-04-12 01:25:15.956000000 +0530
++++ b/include/fmd/Peripherals/fm_pcd_ext.h	2018-04-12 01:25:28.280000000 +0530
+@@ -1720,6 +1720,7 @@
+         uint8_t                         relativeSchemeId;       /**< if modify=FALSE:Partition relative scheme id */
+         t_Handle                        h_Scheme;               /**< if modify=TRUE: a handle of the existing scheme */
+     } id;
++    bool                                shared;           	/**< This scheme is  shared */
+     bool                                alwaysDirect;           /**< This scheme is reached only directly, i.e. no need
+                                                                      for match vector; KeyGen will ignore it when matching */
+     struct {                                                    /**< HL Relevant only if alwaysDirect = FALSE */
+diff -Naur a/src/fm_lib.c b/src/fm_lib.c
+--- a/src/fm_lib.c	2018-04-12 01:25:15.956000000 +0530
++++ b/src/fm_lib.c	2018-04-12 01:25:28.284000000 +0530
+@@ -319,6 +319,44 @@
+     return E_OK;
+ }
+ 
++uint32_t FM_ReadTimeStamp(t_Handle h_Fm)
++{
++    t_Device    *p_Dev = (t_Device*) h_Fm;
++    uint32_t    ts = 0;
++
++    SANITY_CHECK_RETURN_ERROR(p_Dev, E_INVALID_HANDLE);
++
++    _fml_dbg("Calling...\n");
++
++    if (ioctl(p_Dev->fd, FM_IOC_READ_TIMESTAMP, &ts)) {
++        REPORT_ERROR(MAJOR, E_INVALID_OPERATION, NO_MSG);
++        return 0;
++    }
++
++    _fml_dbg("Called.\n");
++
++    return ts;
++}
++
++uint32_t FM_GetTimeStampIncrementPerUsec(t_Handle h_Fm)
++{
++    t_Device    *p_Dev = (t_Device*) h_Fm;
++    uint32_t    ts_inc = 0;
++
++    SANITY_CHECK_RETURN_ERROR(p_Dev, E_INVALID_HANDLE);
++
++    _fml_dbg("Calling...\n");
++
++    if (ioctl(p_Dev->fd, FM_IOC_GET_TIMESTAMP_INCREMENT, &ts_inc)) {
++        REPORT_ERROR(MAJOR, E_INVALID_OPERATION, NO_MSG);
++        return 0;
++    }
++
++    _fml_dbg("Called.\n");
++
++    return ts_inc;
++}
++
+ /********************************************************************************************/
+ /*  FM_PCD FUNCTIONS                                                                        */
+ /********************************************************************************************/
+@@ -599,6 +637,12 @@
+     return E_OK;
+ }
+ 
++void *FM_PCD_Get_Sch_handle(t_Handle h_Scheme)
++{
++    t_Device *p_Dev = (t_Device*) h_Scheme;
++    return(UINT_TO_PTR(p_Dev->id));
++}
++
+ t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
+ {
+     t_Device *p_PcdDev = (t_Device*) h_FmPcd;

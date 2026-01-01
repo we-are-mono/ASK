@@ -1,0 +1,46 @@
+diff -Naur a/include/fmd/Peripherals/fm_pcd_ext.h b/include/fmd/Peripherals/fm_pcd_ext.h
+--- a/include/fmd/Peripherals/fm_pcd_ext.h	2018-05-17 14:57:38.531456638 +0530
++++ b/include/fmd/Peripherals/fm_pcd_ext.h	2018-05-17 15:00:25.251456638 +0530
+@@ -1978,6 +1978,27 @@
+ /**************************************************************************//**
+  @Description   Parameters for defining a hash table
+ *//***************************************************************************/
++//sync with fm_eh_types.h
++enum {
++        IPV4_UDP_TABLE,
++        IPV4_TCP_TABLE,
++        IPV6_UDP_TABLE,
++        IPV6_TCP_TABLE,
++        ESP_IPV4_TABLE,
++        ESP_IPV6_TABLE,
++        IPV4_MULTICAST_TABLE,
++        IPV6_MULTICAST_TABLE,
++        PPPOE_RELAY_TABLE,
++        ETHERNET_TABLE,
++        IPV4_3TUPLE_UDP_TABLE,
++        IPV4_3TUPLE_TCP_TABLE,
++        IPV6_3TUPLE_UDP_TABLE,
++        IPV6_3TUPLE_TCP_TABLE,
++        IPV4_REASSM_TABLE,
++        IPV6_REASSM_TABLE,
++        MAX_MATCH_TABLES
++};
++
+ typedef struct t_FmPcdHashTableParams {
+     uint16_t                    maxNumOfKeys;               /**< Maximum Number Of Keys that will (ever) be used in this Hash-table */
+     e_FmPcdCcStatsMode          statisticsMode;             /**< If not e_FM_PCD_CC_STATS_MODE_NONE, the required structures for the
+@@ -1993,6 +2014,14 @@
+     uint8_t                     matchKeySize;               /**< Size of the exact match keys held by the hash buckets */
+ 
+     t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
++    uint32_t    table_type;     /* ip reassembly table */
++    struct {
++        uint32_t timeout_val;   //reassembly timeout
++        uint32_t timeout_fqid;  //fqid for reassmebly failures
++        uint32_t max_frags;     //max allowed fragments
++        uint32_t min_frag_size; //min allowed frag size except last frag
++        uint32_t max_sessions;  //max conn reassembly sessions
++    };
+ 
+ } t_FmPcdHashTableParams;
+ 
