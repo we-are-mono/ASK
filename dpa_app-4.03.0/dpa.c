@@ -343,7 +343,7 @@ static int get_port_info(struct cdx_fman_info *finfo)
 		goto err_ret;
 	}
 	port_info = pinfo;
-	dist_info = (struct cdx_dist_info *)(port_info + cmodel.port_count);
+	dist_info = (struct cdx_dist_info *)(port_info + ports);
 	//scan all ports associated with this fman
 	for (ii = 0; ii < cmodel.port_count; ii++) {
 		sprintf(name, "fm%d", finfo->index);
@@ -410,22 +410,26 @@ static int update_port_dist_info(struct cdx_fman_info *finfo)
 {
 	struct cdx_port_info *port_info;
 	struct cdx_dist_info *dist_info;
+	char name[256];
 	uint32_t ii;
 	uint32_t jj;
 
 	port_info = finfo->portinfo;
 	//update all ports associated with this fman
 	for (ii = 0; ii < cmodel.port_count; ii++) {
+		sprintf(name, "fm%d", finfo->index);
+		if (strstr(cmodel.port[ii].name, name) == 0)
+			continue;
 		dist_info = port_info->dist_info;
 		for (jj = 0; jj < port_info->max_dist; jj++) {
 			uint32_t handle;
-			
+
 			handle = cmodel.port[ii].schemes[jj];
 			dist_info->handle = FM_PCD_Get_Sch_handle(cmodel.scheme_handle[handle]);
 			dist_info++;
 		}
 		port_info++;
-	}	
+	}
 	return 0;
 }
 
