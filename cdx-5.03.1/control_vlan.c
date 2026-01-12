@@ -184,7 +184,7 @@ found:
 
 		case ACTION_QUERY:
 			reset_action = 1;
-			/* fall through */
+			fallthrough;
 		case ACTION_QUERY_CONT:
 			{
 				PVlanCommand pVlan = (VlanCommand*)p;

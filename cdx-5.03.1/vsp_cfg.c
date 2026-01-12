@@ -25,6 +25,7 @@
 #include "dpaa_eth_common.h"
 #include "mac.h"
 #include "portdefs.h"
+#include "cdx_defs.h"
 static struct dpa_bp *gs_dpa_vsp_bp;		/* VSP Buffer pool */
 
 #define DPAA_VSP_MAX_BUF_COUNT 512
@@ -42,10 +43,8 @@ static struct dpa_bp *dpa_vsp_bp_probe(struct net_device *net_dev)
 		goto out;
 	}
 
-	dpa_vsp_bp->percpu_count = devm_alloc_percpu(net_dev->dev.parent, *dpa_vsp_bp->percpu_count);
 	dpa_vsp_bp->config_count = DPAA_VSP_MAX_BUF_COUNT;
 	dpa_vsp_bp->size = DPAA_VSP_BUF_SIZE;
-	dpa_vsp_bp->seed_cb = dpa_bp_priv_seed;
 	dpa_vsp_bp->free_buf_cb = _dpa_bp_free_pf;
 	dpa_vsp_bp->dev = net_dev->dev.parent;
 	if (dpa_bp_alloc(dpa_vsp_bp, dpa_vsp_bp->dev)) {

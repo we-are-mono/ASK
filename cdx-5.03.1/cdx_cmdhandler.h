@@ -339,4 +339,11 @@ void comcerto_fpp_workqueue(struct work_struct *work);
 int cdx_cmdhandler_init(void);
 void cdx_cmdhandler_exit(void);
 
+int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u16 *rbuf);
+int comcerto_fpp_send_command_simple(u16 fcode, u16 length, u16 *payload);
+int comcerto_fpp_send_command_atomic(u16 fcode, u16 length, u16 *payload,
+	void (*callback)(unsigned long, int, u16, u16 *), unsigned long data);
+int cdx_ctrl_send_command_simple(u16 fcode, u16 length, u16 *payload);
+int comcerto_fpp_register_event_cb(int (*event_cb)(u16, u16, u16*));
+
 #endif /* _CDX_CMDHANDLER_H_ */

@@ -117,7 +117,7 @@ static int wifi_rx_dummy_hdlr(struct sk_buff *skb)
 	return -1;
 }
 
-int wifi_rx_fastpath_register(int (*hdlr)(struct sk_buff *skb))
+static int wifi_rx_fastpath_register(int (*hdlr)(struct sk_buff *skb))
 {
 	pr_info("%s:%d VWD Tx function registered\n", __func__, __LINE__ );
 	vwd_rx_hdlr = hdlr;
@@ -125,7 +125,7 @@ int wifi_rx_fastpath_register(int (*hdlr)(struct sk_buff *skb))
 	return 0;
 }
 
-void wifi_rx_fastpath_unregister(void)
+static void wifi_rx_fastpath_unregister(void)
 {
 	pr_info("%s:%d VWD Tx function unregistered\n", __func__, __LINE__ );
 	vwd_rx_hdlr = wifi_rx_dummy_hdlr;
@@ -939,47 +939,6 @@ done:
 }
 
 
-void wifi_release_buf(struct qm_fd *fd)
-{
-	dma_addr_t addr;
-	void *vaddr;
-	struct sk_buff *skb;
-	struct sk_buff **skbh;
-
-	//get phys address and virt address
-	addr = qm_fd_addr(fd);
-	vaddr = phys_to_virt(addr);
-	//get skb ref from buffer
-	DPA_READ_SKB_PTR(skb, skbh, vaddr, -1);
-#ifdef DPA_WIFI_DEBUG
-	DPAWIFI_INFO("%s::skb:%p addr %llx\n", 
-			__FUNCTION__, skb, addr);
-#endif
-	dev_kfree_skb(skb);
-}
-
-void disp_sglist_data(struct qm_sg_entry *sg_entry)
-{
-	void *vaddr;
-	dma_addr_t addr;
-	uint32_t len;
-
-	while(1) {
-		addr = qm_sg_addr(sg_entry);
-		vaddr = ((char *)phys_to_virt(addr) + qm_sg_entry_get_offset(sg_entry));
-		len = qm_sg_entry_get_len(sg_entry);
-		len &= 0xffff;
-		printk("sg_entry %p addr %p len %d:%d pktdata::\n", sg_entry, (void *)addr, len, sg_entry->length);
-		display_buf(sg_entry, 16);
-		printk("packet::\n");
-		display_buf(vaddr, len);
-		if(qm_sg_entry_get_final(sg_entry))
-			break;
-		sg_entry++;
-	}
-}
-
-
 static inline struct sk_buff *get_skb_from_sg_list(struct qm_sg_entry *sg_entry)
 {
 
@@ -1006,7 +965,7 @@ static inline void release_skb_in_sglist(struct qm_sg_entry *sg_entry)
 	}
 }
 
-int __hot vwd_skb_to_contig_fd(struct dpaa_vwd_priv_s *priv,
+static int __hot vwd_skb_to_contig_fd(struct dpaa_vwd_priv_s *priv,
 		struct sk_buff *skb, struct qm_fd *fd,
 		int* offset)
 {
@@ -1189,7 +1148,7 @@ sg0_map_failed:
  * vwd_skb_to_sg_fd
  *
  */
-int __hot vwd_skb_to_sg_fd(struct dpaa_vwd_priv_s *priv,
+static int __hot vwd_skb_to_sg_fd(struct dpaa_vwd_priv_s *priv,
 		struct sk_buff *skb, struct qm_fd *fd)
 {
 	dma_addr_t addr;
@@ -1944,7 +1903,7 @@ void drain_tx_bp_pool(struct dpa_bp *bp)
 }
 
 
-enum qman_cb_dqrr_result vwd_rx_exception_pkt(struct qman_portal *portal, struct qman_fq *fq,
+static enum qman_cb_dqrr_result vwd_rx_exception_pkt(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
 
@@ -1965,7 +1924,7 @@ enum qman_cb_dqrr_result vwd_rx_exception_pkt(struct qman_portal *portal, struct
 }
 
 
-void vwd_send_to_vap(struct sk_buff* skb)
+static void vwd_send_to_vap(struct sk_buff* skb)
 {
 	struct ethhdr *hdr;
 
@@ -2056,12 +2015,12 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 		skb = sec_frag_fd_to_vwd_skb(dq, dpa_bp);
 		goto process_skb;
 	}
-	/* Check if buffer is from ethernet pool to refill buffer pool 
+	/* Check if buffer is from ethernet pool to refill buffer pool
 	   for wifi packets, buffers are skb buffers and they will get freed to kernel */
 	if ( (dpa_bp != priv->txconf_bp) && (dpa_bp != priv->tx_bp))
 	{
 		wifi_skb = 0;
-		count_ptr = raw_cpu_ptr(dpa_bp->percpu_count);
+		count_ptr = raw_cpu_ptr(vwd.eth_priv->percpu_count);
 		if (unlikely(dpaa_eth_refill_bpools(dpa_bp, count_ptr,
 				CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD))) {
 			//if we cant refill give this up
@@ -2903,7 +2862,7 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 	return 0;
 }
 
-int vwd_vap_down(struct dpaa_vwd_priv_s *priv , struct vap_desc_s *vap)
+static int vwd_vap_down(struct dpaa_vwd_priv_s *priv , struct vap_desc_s *vap)
 {
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s:%d\n", __func__, __LINE__);
@@ -2955,7 +2914,7 @@ static int vwd_vap_configure(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *va
 /** dpaa_vwd_handle_vap
  *
  */
-int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *cmd )
+static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *cmd )
 {
 	int rc = 0, ii;
 	struct vap_desc_s *vap;
@@ -3350,7 +3309,7 @@ err0:
 /** dpaa_vwd_down
  *
  */
-int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
+static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 {
 	int ii;
 
@@ -3427,7 +3386,7 @@ int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
  *       -
  */
 
-int dpaa_vwd_driver_init( struct dpaa_vwd_priv_s *priv )
+static int dpaa_vwd_driver_init( struct dpaa_vwd_priv_s *priv )
 {
 	int rc;
 
@@ -3468,11 +3427,12 @@ int dpaa_vwd_init(void)
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s: created vwd device(%d, 0)\n", __func__, priv->vwd_major );
 #endif
-	priv->vwd_class = class_create(THIS_MODULE, "vwd");
-	if (priv->vwd_class == NULL)
+	priv->vwd_class = class_create("vwd");
+	if (IS_ERR(priv->vwd_class))
 	{
 		DPAWIFI_ERROR("%s class_create failed\n",__func__);
-		goto err1;	
+		priv->vwd_class = NULL;
+		goto err1;
 	}
 
 	priv->vwd_device = device_create(priv->vwd_class, NULL, MKDEV(priv->vwd_major,0), NULL, "vwd0");

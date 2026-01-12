@@ -114,7 +114,7 @@ func_ret:
 }
 #endif
 
-int disp_muram(void)
+static int __maybe_unused disp_muram(void)
 {
 #ifdef DPAA_DEBUG_ENABLE
 	int ii;
@@ -221,7 +221,7 @@ int cdx_driver_init(void)
 		return -1;
 	}
 
-	cdx_ctrl_class = class_create(THIS_MODULE, CDX_CTRL_CLS_CDEVNAME);
+	cdx_ctrl_class = class_create(CDX_CTRL_CLS_CDEVNAME);
 	if (IS_ERR(cdx_ctrl_class)) {
 		DPA_ERROR("%s::Failed to create %s class device\n",
 				__FUNCTION__, CDX_CTRL_CLS_CDEVNAME);

@@ -111,7 +111,7 @@ struct _thw_RTPinfo * cdx_rtp_alloc_muram_rtpinfo(void)
 	return rtp_info;
 }
 
-void cdx_muram_rtpinfo_free(void *hw_flow)
+static void cdx_muram_rtpinfo_free(void *hw_flow)
 {
 	t_Handle h_FmMuram;
 	uint64_t physicalMuramBase;
@@ -399,7 +399,7 @@ static int RTP_change_flow(PRTPflow pFlow, U16 ingress_socketID, U16 egress_sock
 }
 
 
-int rtp_flow_reset(void)
+static int rtp_flow_reset(void)
 {
 	PRTPflow pEntry;
 	struct slist_entry *entry;
@@ -465,7 +465,7 @@ static void RTP_release_call(PRTPCall pCall)
 	}
 }
 
-int rtp_call_reset(void)
+static int rtp_call_reset(void)
 {
 	PRTPCall pEntry;
 	struct slist_entry *entry;

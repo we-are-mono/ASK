@@ -117,8 +117,16 @@ int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action);
 int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);
 
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
-	struct ins_entry_info *pInsEntryInfo, MC4Output	*pListener, struct en_exthash_tbl_entry* prev_tbl_entry, 
+	struct ins_entry_info *pInsEntryInfo, MC4Output	*pListener, struct en_exthash_tbl_entry* prev_tbl_entry,
 	uint32_t tbl_type);
+
+/* Module init/exit functions */
+int mc4_init(void);
+int mc6_init(void);
+void mc4_exit(void);
+void mc6_exit(void);
+U16 M_mc4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
+U16 M_mc6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
 
 static inline u32 HASH_MC4(u32 destaddr)  // pass in IPv4 dest addr
 {

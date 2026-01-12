@@ -349,7 +349,7 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 	return 0;
 }
 
-void* M_ipsec_sa_cache_create(U32 *saddr,U32 *daddr, U32 spi, U8 proto, U8 family, U16 handle, U8 replay, U8 esn, U16 mtu, U16 dev_mtu, U8 dir)
+static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, U8 family, U16 handle, U8 replay, U8 esn, U16 mtu, U16 dev_mtu, U8 dir)
 {
 	U32     hash_key_sa;
 	PSAEntry sa;

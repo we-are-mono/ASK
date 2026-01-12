@@ -221,7 +221,7 @@ static int IPsec_SA_Get_Handle_Snapshot(int sa_handle_index, int sa_entries, PSA
 }
 
 
-void __reset_stats_of_sa(PSAEntry pEntry, U32 pkts_processed, U64 bytes_processed)
+static void __reset_stats_of_sa(PSAEntry pEntry, U32 pkts_processed, U64 bytes_processed)
 {
 	pEntry->stats.last_pkts_processed = pkts_processed;
 	pEntry->stats.last_bytes_processed = bytes_processed;

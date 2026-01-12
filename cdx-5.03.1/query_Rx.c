@@ -26,12 +26,12 @@ static int L2Flow_snapshot_buf_entries = 0;
 
 extern U32 L2Bridge_timeout;
 
-PVOID bridge_snapshot_alloc(U32 size)
+static PVOID bridge_snapshot_alloc(U32 size)
 {
 	return kzalloc(size, GFP_KERNEL);
 }
 
-void bridge_snapshot_free(PVOID p)
+static void bridge_snapshot_free(PVOID p)
 {
 	kfree(p);
 }

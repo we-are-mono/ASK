@@ -172,7 +172,7 @@ static U16 M_wifi_rx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 
 
 
-void M_wifi_init_rx(void)
+static void M_wifi_init_rx(void)
 {
 	int i;
 	struct physical_port	*port;

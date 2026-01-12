@@ -48,6 +48,7 @@
 #include "dpa_wifi.h"
 #include "cdx_ceetm_gdef.h" 
 #include "cdx_defs.h"
+#include "devman.h"
 #include "control_tx.h"
 #include "procfs.h"
 

@@ -121,9 +121,9 @@ int  cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa);
 int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, u32 bytes_to_copy);
 int cdx_ipsec_generate_split_key(struct auth_params *auth_param);
 void cdx_ipsec_release_sa_resources(PSAEntry pSA);
-int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, 
+int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id,
 				struct dpa_l2hdr_info *l2_info,
-				struct dpa_l3hdr_info *l3_info, uint32_t dir_in);
+				struct dpa_l3hdr_info *l3_info, uint32_t *dir_in);
 int cdx_ipsec_handle_get_inbound_sagd(U32 spi, U16 * sagd );
 int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info, 
 			uint32_t sa_dir_in);

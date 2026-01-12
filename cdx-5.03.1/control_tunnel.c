@@ -533,7 +533,14 @@ static int TNL_handle_IPSEC(U16 *p, U16 Length)
 #endif
 
 
-void TNL_set_id_conv_seed( sam_port_info_t * sp, U8 IdConvEnable, PTnlEntry t )
+/**
+ * TNL_handle_IdConv_psid
+ *
+ *
+ */
+
+#ifdef CDX_TODO_TUNNEL
+static void TNL_set_id_conv_seed( sam_port_info_t * sp, U8 IdConvEnable, PTnlEntry t )
 {
 	t->sam_id_conv_enable = (IdConvEnable) ? SAM_ID_CONV_PSID: SAM_ID_CONV_NONE;
 	if(!t->sam_id_conv_enable)
@@ -554,15 +561,6 @@ void TNL_set_id_conv_seed( sam_port_info_t * sp, U8 IdConvEnable, PTnlEntry t )
 
 	return;
 }
-
-
-/**
- * TNL_handle_IdConv_psid
- *
- *
- */
-
-#ifdef CDX_TODO_TUNNEL
 static int TNL_handle_IdConv_psid(U16 *p, U16 Length)
 {
 	TNLCommand_IdConvPsid cmd;

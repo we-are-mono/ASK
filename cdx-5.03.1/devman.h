@@ -64,3 +64,10 @@ void *create_ddr_and_copy_from_muram(void *muramptr, void **ddrptr, U32 size);
 void copy_ddr_to_muram_and_free_ddr(void *muramptr, void **ddrptr, U32 size);
 struct dpa_bp* get_ipsec_bp(void);
 struct dpa_bp* get_frag_bp(void);
+int cdx_check_rx_iface_type_vlan(struct _itf *input_itf);
+void dpa_update_timestamp(uint32_t ts);
+struct dpa_priv_s* get_eth_priv(unsigned char* name);
+int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
+		struct dpa_l3hdr_info *l3_info, uint32_t *dir_in);
+int insert_entry_in_pppoe_table(int fm_idx, int port_idx,
+		uint8_t *ac_mac_addr, uint32_t sessid, uint32_t ppp_pid);

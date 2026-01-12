@@ -231,8 +231,6 @@ typedef struct _tDMCommand {
 			** returns address being displayed in response */
 } DMCommand, *PDMCommand;
 
-__inline  void read_random(unsigned char *p_result, unsigned int rlen);
-
 /****** IPSEC related common structures *****/
 static __inline U16 HASH_SA(U32 *Daddr, U32 spi, U16 Proto, U8 family)
 {
@@ -516,6 +514,9 @@ void M_ipsec_inbound_entry(void);
 void M_ipsec_inbound_callback(void);
 void sa_remove_from_list_fqid(PSAEntry pSA);
 void sa_free(PSAEntry pSA);
+#ifdef UNIQUE_IPSEC_CP_FQID
+struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt);
+#endif
 
 
 BOOL ipsec_init(void);
@@ -524,5 +525,11 @@ void ipsec_standalone_init(void);
 
 int IPsec_get_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len);
 int IPsec_reset_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len);
+
+/* Query functions */
+int IPsec_Get_Next_SAEntry(PSAQueryCommand pSAQueryCmd, int reset_action);
+struct _tStatIpsecEntryResponse;
+int stat_Get_Next_SAEntry(struct _tStatIpsecEntryResponse *pSACmd, int reset_action);
+void reset_stats_of_sa(PSAEntry pEntry);
 
 #endif

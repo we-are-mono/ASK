@@ -16,6 +16,7 @@
 #include "portdefs.h"
 #include "module_qm.h"
 #include "cdx_ceetm_app.h"
+#include "cdx_ceetm_gdef.h"
 #include "cdx_common.h"
 
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
@@ -64,9 +65,9 @@ static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t 
 struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *info)
 {
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)info;
-	uint32_t quenum,ff = 1;
-
+	uint32_t quenum;
 #ifdef ENABLE_EGRESS_QOS
+	uint32_t ff = 1;
 	struct dpa_priv_s *priv;
 	struct qman_fq *egress_fq;
 
@@ -500,7 +501,7 @@ static void egress_ern_handler(struct qman_portal *portal, struct qman_fq *fq, c
 
 /* configure any of the prio or wbfq class queue of a channel */
 /* queues 0-7 are strict prio and queues 8-15 are in single WBFQ group */
-int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque) 
+static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque) 
 {
 	struct qm_ceetm_channel *channel;
 	struct qm_ceetm_ccg *ccg;
@@ -699,7 +700,7 @@ static int ceetm_create_cq_policer_profiles(t_Handle h_FmPcd, struct classque_in
 	return CEETM_SUCCESS;
 }
 
-int ceetm_configure_cq_policer_profiles(struct classque_info *cq_info,void *pcd_handle,uint32_t enable,uint32_t shaper_rate)
+static int ceetm_configure_cq_policer_profiles(struct classque_info *cq_info,void *pcd_handle,uint32_t enable,uint32_t shaper_rate)
 {
 	void *handle;
 	t_FmPcdPlcrProfileParams Params;
@@ -912,7 +913,7 @@ static void ceetm_cscn_handler(struct qm_ceetm_ccg *p, void *cb_ctx, int congest
 }
 #endif
 
-int ceetm_set_default_cq_policer_profile(void *pcd_handle, struct classque_info *cqinfo)
+static int ceetm_set_default_cq_policer_profile(void *pcd_handle, struct classque_info *cqinfo)
 {
 	void *handle;
 	t_FmPcdPlcrProfileParams Params;
@@ -1169,8 +1170,9 @@ static void display_shaper_config(PQosShaperConfigCommand cfg)
 	if (cfg->enable == SHAPER_ON)
 		ceetm_dbg("shaper enabled\n");
 	else {
-		if (cfg->enable == SHAPER_OFF)
+		if (cfg->enable == SHAPER_OFF) {
 			ceetm_dbg("shaper disabled\n");
+		}
 	}
 	if (cfg->cfg_flags & SHAPER_CFG_VALID) {
 		ceetm_dbg("rate %d, bucketsize %d\n",

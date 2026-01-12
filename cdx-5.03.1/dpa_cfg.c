@@ -231,7 +231,7 @@ void *get_ethdist_info_by_fman_params(struct cdx_fman_info *finfo)
 	return NULL;
 }
 #else
-void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t table_type)
+static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t table_type)
 {
 	struct cdx_port_info *port_info;
 	struct cdx_dist_info *dist;
@@ -566,8 +566,8 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 	struct file *fm_pcd_file;
 	t_LnxWrpFmDev *fm_wrapper_dev;
 
-	//get handle	
-	fm_pcd_file = fcheck((unsigned long)finfo->pcd_handle);
+	//get handle - use fget() instead of fcheck() for kernel 5.7+
+	fm_pcd_file = fget((unsigned long)finfo->pcd_handle);
 	if (!fm_pcd_file) {
 		DPA_ERROR("%s::PCD handle 0x%p trans failed.\n",
 				__FUNCTION__, finfo->pcd_handle);
@@ -578,19 +578,22 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 	if (!fm_wrapper_dev) {
 		DPA_ERROR("%s::null wrap dev for pcd 0x%p\n",
 				__FUNCTION__, finfo->pcd_handle);
+		fput(fm_pcd_file);
 		return -1;
 	}
 	if (!fm_wrapper_dev->h_PcdDev) {
 		DPA_ERROR("%s::null pcd dev for pcd 0x%p\n",
 				__FUNCTION__, finfo->pcd_handle);
+		fput(fm_pcd_file);
 		return -1;
 	}
 	//get handle from dev
 	finfo->pcd_handle = fm_wrapper_dev->h_PcdDev;
 	finfo->fm_handle = fm_wrapper_dev->h_Dev;
-	finfo->muram_handle = fm_wrapper_dev->h_MuramDev; 
-	finfo->physicalMuramBase = fm_wrapper_dev->fmMuramPhysBaseAddr; 
-	finfo->fmMuramMemSize = fm_wrapper_dev->fmMuramMemSize; 	
+	finfo->muram_handle = fm_wrapper_dev->h_MuramDev;
+	finfo->physicalMuramBase = fm_wrapper_dev->fmMuramPhysBaseAddr;
+	finfo->fmMuramMemSize = fm_wrapper_dev->fmMuramMemSize;
+	fput(fm_pcd_file);
 	return 0;
 }
 
@@ -952,11 +955,6 @@ int dpa_get_wan_port(uint32_t fm_index, uint32_t *port_idx)
 	DPA_ERROR("%s::no wan port found fm_index %d\n",
 			__FUNCTION__, fm_index);
 	return FAILURE;
-}
-
-uint32_t dpa_get_fm_timestamp(void *fm_ctx)
-{
-	return JIFFIES32;
 }
 
 void *dpa_get_fm_ctx(uint32_t fm_idx)

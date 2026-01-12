@@ -136,7 +136,7 @@ cdx_timer_t br_get_time_remaining(struct L2Flow_entry *pEntry)
 	return elapsed_time >= timer->timerdata ? 0 : timer->timerdata - elapsed_time;
 }
 
-void br_timer_update(struct L2Flow_entry *pEntry)
+static void br_timer_update(struct L2Flow_entry *pEntry)
 {
 	TIMER_ENTRY *timer = &pEntry->timer;
 	cdx_timer_t oldtimer = timer->timerdata;
@@ -157,7 +157,7 @@ void br_timer_update(struct L2Flow_entry *pEntry)
 
 
 
-int L2Bridge_timer(TIMER_ENTRY *timer)
+static int L2Bridge_timer(TIMER_ENTRY *timer)
 {
 	int rc;
 	struct L2Flow_entry *entry = container_of(timer, typeof(struct L2Flow_entry), timer);
@@ -411,7 +411,7 @@ skip_fill:
 
 		case ACTION_QUERY:
 			reset_action = 1;
-			/* fallthrough */
+			fallthrough;
 		case ACTION_QUERY_CONT:
 			ackstatus = rx_Get_Next_Hash_L2FlowEntry(pcmd, reset_action);
 			return ackstatus;
@@ -475,7 +475,7 @@ static int M_bridged_itf_update(U16 code, U16 *p, U16 Length)
 	return CMD_OK;
 }
 
-U16 M_bridge_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
+static U16 M_bridge_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 {
 	U16 acklen;
 	U16 ackstatus;

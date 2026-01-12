@@ -602,69 +602,8 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 		}
 	} 		
 	offline_port_info[iface_info->fman_idx][iface_info->port_idx].flags |=
-		(OF_FQID_VALID | PORT_VALID); 
+		(OF_FQID_VALID | PORT_VALID);
 	return 0;
-}
-
-void add_oh_port_tbl_info(uint32_t fm_index, uint32_t port_idx, void * td,
-		uint32_t type)
-{
-	uint32_t ii;
-
-	for (ii = 0; ii < MAX_OF_PORTS; ii++) {
-		if (port_idx & (1 << ii)) {
-#ifdef DEVOH_DEBUG
-			DPA_INFO("%s:;adding tab idx %p for fman %d, port %d\n", 
-					__FUNCTION__, td, fm_index, ii);
-#endif
-			offline_port_info[fm_index][ii].td[type] = td;
-			offline_port_info[fm_index][ii].flags |= (1 << type);
-		}
-	}
-}
-
-#define TEST_FMAN_INDEX 0
-#define CDXPORT_INFRA_TEST 1
-int cdx_ofport_infra_test(void)
-{
-#ifdef CDXPORT_INFRA_TEST
-	uint32_t channel;
-	void * ofport_td[MAX_MATCH_TABLES];
-	int handle;
-	uint32_t ii;
-	uint32_t jj;
-	uint32_t type;
-
-
-	for (jj = 0; jj < 2; jj++) {
-		/* Get OH port instance */
-		if (!jj)
-			type = PORT_TYPE_WIFI;
-		else
-			type = PORT_TYPE_IPSEC;
-		handle = alloc_offline_port(TEST_FMAN_INDEX, type, NULL, NULL);
-		if (handle < 0)
-		{
-			DPA_ERROR("%s: Error in allocating OH port for type %x\n",
-					__FUNCTION__, type);
-			return FAILURE;
-		}
-		if (get_ofport_info(TEST_FMAN_INDEX, handle, &channel,
-					&ofport_td[0])) {
-			DPA_ERROR("%s: Error in getting OH port info for type %x\n",
-					__FUNCTION__, type);
-			return FAILURE;
-		}
-		DPA_INFO("%s: allocated oh port for type %x - handle %d, channel %x\n",
-				__FUNCTION__, type, handle, channel);
-		for (ii = 0; ii < MAX_MATCH_TABLES; ii++) {
-			if (ofport_td[ii] != NULL )
-				DPA_INFO("table type %d, td %p\n", ii, ofport_td[ii]);
-		}
-		release_offline_port(TEST_FMAN_INDEX, handle);
-	}
-#endif
-	return SUCCESS;
 }
 
 int ohport_set_ofne(uint32_t handle, uint32_t nia_val)

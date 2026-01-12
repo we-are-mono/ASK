@@ -143,4 +143,6 @@ int delete_l2br_entry_classif_table(struct L2Flow_entry *entry);
 int rx_Get_Next_Hash_L2FlowEntry(PL2BridgeL2FlowEntryCommand pL2FlowCmd, int reset_action);
 int add_l2flow_to_hw(struct L2Flow_entry *entry);
 cdx_timer_t br_get_time_remaining(struct L2Flow_entry *pEntry);
+int bridge_interface_register(uint8_t *name, U16 phy_port_id);
+int bridge_interface_deregister(U16 phy_port_id);
 #endif /* _CONTROL_BRIDGE_H_ */

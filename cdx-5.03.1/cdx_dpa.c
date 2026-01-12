@@ -28,6 +28,7 @@
 #include "control_tunnel.h"
 #include "control_bridge.h"
 #include "dpa_ipsec.h"
+#include "devman.h"
 
 
 //#define CDX_DPA_DEBUG 1

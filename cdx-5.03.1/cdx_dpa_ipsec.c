@@ -298,7 +298,7 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 	return 0;
 }
 
-void cdx_ipsec_delete_fp_hash_entry(PSAEntry pSA)
+static void cdx_ipsec_delete_fp_hash_entry(PSAEntry pSA)
 {
 	struct hw_ct *hwct;
 
@@ -724,7 +724,7 @@ static inline void save_stats_in_external_mem(PSAEntry sa)
 }
 
 
-int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
+static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma, u32 bytes_to_copy)
 {
@@ -916,7 +916,7 @@ skip_byte_copy:
 	return 0;
 }
 
-int built_encap_extra_material(PSAEntry sa,
+static int built_encap_extra_material(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma,
 		unsigned int move_size)
@@ -1123,7 +1123,7 @@ int built_encap_extra_material(PSAEntry sa,
 }
 
 /* Move size should be set to 64 bytes */
-void built_decap_extra_material(PSAEntry sa,
+static void built_decap_extra_material(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma)
 {
@@ -1210,7 +1210,7 @@ void built_decap_extra_material(PSAEntry sa,
 #endif
 }
 
-int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
+static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma,
 		U32 bytes_to_copy,
@@ -1447,7 +1447,7 @@ int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 	return 0;
 }
 
-int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
+static int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma,
 		uint32_t bytes_to_copy,
@@ -1722,7 +1722,7 @@ int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
 	return 0;
 }
 
-int  cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
+static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 {
 	struct sec_descriptor *sec_desc;
 	PDpaSecSAContext psec_as_context;
@@ -1844,7 +1844,7 @@ int  cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 	return 0;
 }
 
-int  cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
+static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 {
 	struct sec_descriptor *sec_desc;
 	PDpaSecSAContext psec_as_context;
@@ -2166,7 +2166,7 @@ static void split_key_done(struct device *dev, u32 *desc, u32 err,
 }
 
 /* determine the HASH algorithm and the coresponding split key length */
-int cdx_ipsec_get_split_key_info(struct auth_params *auth_param, u32 *hmac_alg)
+static int cdx_ipsec_get_split_key_info(struct auth_params *auth_param, u32 *hmac_alg)
 {
 	/*
 	 * Sizes for MDHA pads (*not* keys): MD5, SHA1, 224, 256, 384, 512
@@ -2542,7 +2542,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		 * May also can be used for orginal interface stats also.  
 		 */
 		info->sa_itf_id = itf_id; 
-		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info,sa_dir_in );
+		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info, &sa_dir_in );
 #ifdef CDX_DPA_DEBUG
 		/*       printk("%s:: Got the table id for portid %d and key type %d as %p \n", 
 					__FUNCTION__, info->port_id, key_info->type, sa->ct->td); */

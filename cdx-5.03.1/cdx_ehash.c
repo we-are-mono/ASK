@@ -2594,7 +2594,9 @@ static inline int create_enque_only_hm(struct ins_entry_info *info)
 static int create_enque_hm(struct ins_entry_info *info)
 {
 	struct en_ehash_enqueue_param *param;
+#ifdef ENABLE_EGRESS_QOS
 	PCtEntry entry = (PCtEntry)info->entry;
+#endif
 	uint32_t word = 0;
 
 	if (info->l2_info.mtu == 0) {
@@ -3138,12 +3140,12 @@ int cdx_init_frag_module(void)
 }
 
 #define PROC_FRAG_DIR "ucode_frag"
-struct file_operations frag_stats_fp;
-struct file_operations buf_alloc_test_fp;
+static struct proc_ops frag_stats_fp;
+static struct proc_ops buf_alloc_test_fp;
 
 static struct proc_dir_entry *frag_proc_dir, *stats_file, *alloc_free_test_file;
 
-ssize_t stats_read(struct file *file, char __user *buf, size_t size, loff_t *ppos)
+static ssize_t stats_read(struct file *file, char __user *buf, size_t size, loff_t *ppos)
 {
 	int  tot_len = 0;
 	cdx_ucode_frag_info_t  *ucode_frag_args;
@@ -3166,7 +3168,7 @@ ssize_t stats_read(struct file *file, char __user *buf, size_t size, loff_t *ppo
 }
 
 
-ssize_t buff_alloc_test(struct file *file, char __user *buf, size_t size, loff_t *ppos)
+static ssize_t buff_alloc_test(struct file *file, char __user *buf, size_t size, loff_t *ppos)
 {
 	int ii;
 	struct bm_buffer bmb[128];
@@ -3209,7 +3211,7 @@ int cdx_init_frag_procfs(void)
 	}
 	memset (&frag_stats_fp, 0, sizeof(frag_stats_fp));
 	memset (&buf_alloc_test_fp, 0, sizeof(buf_alloc_test_fp));
-	frag_stats_fp.read = stats_read;
+	frag_stats_fp.proc_read = stats_read;
 
 	stats_file = proc_create("stats", 0444, frag_proc_dir, &frag_stats_fp);
 	if (!stats_file)
@@ -3218,7 +3220,7 @@ int cdx_init_frag_procfs(void)
 		return -1;
 	}
 
-	buf_alloc_test_fp.read = buff_alloc_test;
+	buf_alloc_test_fp.proc_read = buff_alloc_test;
 	alloc_free_test_file = proc_create("test_alloc_buf_n_free", 0444, frag_proc_dir, &buf_alloc_test_fp);
 	if (!alloc_free_test_file)
 	{

@@ -121,7 +121,7 @@ int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
 	return -1;
 }
 
-int GetNewMcastGrpId(uint8_t mctype)
+static int GetNewMcastGrpId(uint8_t mctype)
 {
 	unsigned int ii;
 
@@ -150,7 +150,7 @@ int GetNewMcastGrpId(uint8_t mctype)
 	return -1;
 }
 
-void FreeMcastGrpID(uint8_t mctype, int grp_id)
+static void FreeMcastGrpID(uint8_t mctype, int grp_id)
 {
 	if (mctype == 0)
 	{
@@ -224,7 +224,7 @@ struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo)
 	return NULL;
 }
 
-int Cdx_GetMcastMemberId(char *pIn_Info, struct mcast_group_info *pMcastGrpInfo)
+static int Cdx_GetMcastMemberId(char *pIn_Info, struct mcast_group_info *pMcastGrpInfo)
 {
 	int ii;
 	struct mcast_group_member *pMember;
@@ -266,7 +266,7 @@ int Cdx_GetMcastMemberId(char *pIn_Info, struct mcast_group_info *pMcastGrpInfo)
 }
 
 
-int Cdx_GetMcastMemberFreeIndex(struct mcast_group_info *pMcastGrpInfo)
+static int Cdx_GetMcastMemberFreeIndex(struct mcast_group_info *pMcastGrpInfo)
 {
 	int ii;
 	struct mcast_group_member *pMember;
@@ -307,7 +307,7 @@ int Cdx_GetMcastMemberFreeIndex(struct mcast_group_info *pMcastGrpInfo)
 
 
 int cdx_free_exthash_mcast_members(struct mcast_group_info *pMcastGrpInfo);
-int cdx_add_mcast_table_entry(void *mcast_cmd,
+static int cdx_add_mcast_table_entry(void *mcast_cmd,
 		struct mcast_group_info *pMcastGrpInfo)
 {
 	PMC4Command mcast4_group;
@@ -420,7 +420,7 @@ err_ret:
 }
 
 
-int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
+static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 {
 	PMC4Command mcast4_group;
 	PMC6Command mcast6_group;
@@ -1010,7 +1010,7 @@ static int MC6_Command_Handler(PMC6Command cmd)
 			break;
 		case ACTION_QUERY:
 			reset_action = 1;
-			/* fall through */
+			fallthrough;
 		case ACTION_QUERY_CONT:
 			rc = MC6_Get_Next_Hash_Entry(cmd, reset_action);
 			if(rc == NO_ERR)
@@ -1074,7 +1074,7 @@ static int MC4_Command_Handler(PMC4Command cmd)
 			break;
 		case ACTION_QUERY:
 			reset_action = 1;
-			/* fall through */
+			fallthrough;
 		case ACTION_QUERY_CONT:
 			rc = MC4_Get_Next_Hash_Entry(cmd, reset_action);
 			if(rc == NO_ERR)

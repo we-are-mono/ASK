@@ -32,7 +32,7 @@ static ssize_t proc_fqid_stats_read(struct file *fp, char __user *buff, size_t s
 	if (*ppos)
 		return 0;
 
-	node = PDE_DATA(file_inode(fp));
+	node = pde_data(file_inode(fp));
 	printk("%s()::%d node %p\n", __func__, __LINE__, node);
 
 	if (!node || !node->fq)
@@ -68,9 +68,8 @@ static ssize_t proc_fqid_stats_read(struct file *fp, char __user *buff, size_t s
 	return len;
 }
 
-static const struct file_operations proc_fqid_stats = {
-         .owner          = THIS_MODULE,
-         .read           = proc_fqid_stats_read,
+static const struct proc_ops proc_fqid_stats = {
+         .proc_read      = proc_fqid_stats_read,
 };
 
 

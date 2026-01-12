@@ -97,7 +97,7 @@ static inline struct dpa_bp *ipr_bpid2pool(uint32_t bpid)
 	return NULL;
 } 
 
-enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
+static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 		struct qman_portal         *portal,
 		struct qman_fq                  *fq,
 		const struct qm_dqrr_entry      *dq)
@@ -191,7 +191,7 @@ enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 }
 
 
-int cdx_create_ipr_fq(uint32_t *base_fqid)
+static int cdx_create_ipr_fq(uint32_t *base_fqid)
 {
 	uint32_t ii;
 	struct dpa_fq *dpa_fq;
@@ -363,7 +363,7 @@ static int replenish_ipr_frag_pool(struct net_device *net_dev, u32 bpid)
 	return 0;
 }
 
-int ipr_timer(void *data)
+static int ipr_timer(void *data)
 {
 	while (!kthread_should_stop())
 	{

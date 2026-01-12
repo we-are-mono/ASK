@@ -24,6 +24,7 @@
 #include <uapi/linux/in6.h> 
 #include <linux/spinlock.h>
 #include <linux/if_arp.h>
+#include <linux/io.h>
 #include "lnxwrp_fm.h"
 #include <linux/fsl_oh_port.h>
 #include "dpaa_eth.h"
@@ -529,14 +530,16 @@ void *create_ddr_and_copy_from_muram(void *muramptr, void **ddrptr, U32 size)
 		DPA_ERROR("%s(%d) Memory allocation failure:\n", __FUNCTION__, __LINE__);
 		return NULL;
 	}
-	memcpy(*ddrptr, muramptr, size);
+	/* Use memcpy_fromio for MURAM - it's device memory on ARM64 */
+	memcpy_fromio(*ddrptr, muramptr, size);
 
 	return *ddrptr;
 }
 
 void copy_ddr_to_muram_and_free_ddr(void *muramptr, void **ddrptr, U32 size)
 {
-	memcpy(muramptr, *ddrptr, size);
+	/* Use memcpy_toio for MURAM - it's device memory on ARM64 */
+	memcpy_toio(muramptr, *ddrptr, size);
 	kfree(*ddrptr);
 	*ddrptr = NULL;
 }
@@ -856,21 +859,6 @@ int cdxdrv_sec_policer_reset(struct cdx_fman_info *finfo)
 	return SUCCESS;
 }
 #endif /* endif for SEC_PROFILE_SUPPORT */
-
-int cdxdrv_ingress_policer_query(struct cdx_fman_info *finfo,uint32_t queue_no,void *cfg)
-{
-	PIngressQosCfgCommand plcr_cfg = (PIngressQosCfgCommand)cfg;
-
-	plcr_cfg->status = finfo->ingress_policer_info[queue_no].policer_on;
-	plcr_cfg->cir = finfo->ingress_policer_info[queue_no].cir_value;
-	plcr_cfg->pir = finfo->ingress_policer_info[queue_no].pir_value;
-
-#ifdef QOS_DEBUG
-	printk("%s::queue %d,status %d cir %d pir %d \n",
-			__FUNCTION__, queue_no,plcr_cfg->status,plcr_cfg->cir,plcr_cfg->pir);
-#endif
-	return SUCCESS;
-}
 
 int cdxdrv_ingress_policer_stats(struct cdx_fman_info *finfo,uint32_t queue_no,void *stats,uint32_t clear)
 {

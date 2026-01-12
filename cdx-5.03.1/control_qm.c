@@ -37,7 +37,7 @@ QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
 static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 {
-#ifdef ENABLE_EGRESS_QOS	
+#if defined(ENABLE_EGRESS_QOS) || defined(ENABLE_INGRESS_QOS)
 	struct tQM_context_ctl *qm_ctx;
 	struct cdx_port_info *port_info;
 #endif

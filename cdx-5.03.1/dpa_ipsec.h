@@ -123,5 +123,14 @@ void print_ipsec_offload_pkt_count(void);
 void display_fq_info(void *handle);
 int cdx_init_fqid_procfs(void);
 
+/* Exception packet handling */
+void print_ipsec_exception_pkt_cnt(void);
+void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle);
+void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
+
+/* SA frame queue management */
+int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num);
+int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num);
+
 #endif
 

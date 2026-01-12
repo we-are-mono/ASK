@@ -126,6 +126,13 @@ static struct ipsec_info ipsecinfo;
 extern struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
 #endif
 
+/* Forward declarations for internal functions */
+static int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info);
+static void ipsec_addfq_to_exceptionfq_list(struct dpa_fq *frameq,
+		struct ipsec_info *info);
+static void ipsec_delfq_from_exceptionfq_list(uint32_t fqid,
+		struct ipsec_info *info);
+
 struct dpa_bp* get_ipsec_bp(void)
 {
 	return (ipsecinfo.ipsec_bp);
@@ -167,7 +174,7 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 }
 
 
-uint32_t ipsec_exception_pkt_cnt;
+static uint32_t ipsec_exception_pkt_cnt;
 void print_ipsec_exception_pkt_cnt(void)
 {
 	printk("%s:: Ipsec offload slow path packet count = %d\n",__func__,ipsec_exception_pkt_cnt);
@@ -175,7 +182,7 @@ void print_ipsec_exception_pkt_cnt(void)
 	ipsec_exception_pkt_cnt= 0;
 }
 
-void * cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle)
+void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle)
 {
 	struct xfrm_state *x;
 	struct net_device *netdev = (struct net_device *)dev;
@@ -217,11 +224,11 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	unsigned short sagd_pkt;
 	struct sec_path *sp;
 	struct xfrm_state *x;
-	struct timespec ktime;
+	struct timespec64 ktime;
 #ifdef DPA_IPSEC_DEBUG1
 	unsigned short sagd; 
 #endif
-	int use_gro;
+	bool use_gro;
 	int *percpu_bp_cnt;
 	unsigned short protocol;
 	int no_l2_itf_dev;
@@ -288,7 +295,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		goto rel_fd;
 	}
 
-	use_gro = net_dev->features & NETIF_F_GRO;
+	use_gro = !!(net_dev->features & NETIF_F_GRO);
 	if ((x = xfrm_state_lookup_byhandle(dev_net(net_dev), sagd_pkt )) == NULL)
 	{
 #ifdef DPA_IPSEC_DEBUG
@@ -312,7 +319,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 
 	no_l2_itf_dev = vwd_is_no_l2_itf_device(net_dev);
 	ipsec_exception_pkt_cnt++;
-	percpu_bp_cnt =	raw_cpu_ptr(dpa_bp->percpu_count);
+	percpu_bp_cnt =	raw_cpu_ptr(priv->percpu_count);
 	/*  When V6 SA is applied to v4 packet and vice versa, since ether header is
 	 *  copied from input packet, it will be wrong. Below logic is added just
 	 *  make the required correction in this case.
@@ -339,9 +346,9 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 #endif
 
 	if (likely(dq->fd.format == qm_fd_contig)) {
-		skb = contig_fd_to_skb(priv, &dq->fd, &use_gro);
+		skb = contig_fd_to_skb(priv, &dq->fd, &use_gro, false);
 	} else {
-		skb = sg_fd_to_skb(priv, &dq->fd, &use_gro, percpu_bp_cnt);
+		skb = sg_fd_to_skb(priv, &dq->fd, &use_gro, percpu_bp_cnt, false);
 		percpu_priv->rx_sg++;
 	}
 
@@ -384,7 +391,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 
 	if (!x->curlft.use_time)
 	{
-		getnstimeofday(&ktime);
+		ktime_get_real_ts64(&ktime);
 		x->curlft.use_time = (unsigned long)ktime.tv_sec;
 	}
 	sp->len = 1;
@@ -401,11 +408,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 
 		np->p = qm;
 		gro_result = napi_gro_receive(&np->napi, skb);
-		/* If frame is dropped by the stack, rx_dropped counter is
-		 * incremented automatically, so no need for us to update it
-		 */
-		if (unlikely(gro_result == GRO_DROP))
-			goto pkt_drop;
+		(void)gro_result; /* Result no longer checked - GRO_DROP removed in kernel 6.12 */
 
 	}
 	else if ( (netif_receive_skb(skb) == NET_RX_DROP)) /* (netif_rx(skb) != NET_RX_SUCCESS) */
@@ -424,7 +427,7 @@ rel_fd:
 
 #define PORTID_SHIFT_VAL 8
 
-int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info)
+static int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info)
 {
 	struct dpa_fq *list = info->ipsec_exception_fq;
 	while (list)
@@ -436,14 +439,14 @@ int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info)
 	return -1;
 }
 
-void ipsec_addfq_to_exceptionfq_list(struct dpa_fq *frameq,
+static void ipsec_addfq_to_exceptionfq_list(struct dpa_fq *frameq,
 		struct ipsec_info *info)
 {
 	frameq->list.next = (struct list_head *)info->ipsec_exception_fq;
 	info->ipsec_exception_fq = frameq;
 }
 
-void ipsec_delfq_from_exceptionfq_list(uint32_t fqid,
+static void ipsec_delfq_from_exceptionfq_list(uint32_t fqid,
 		struct ipsec_info *info)
 {
 	struct dpa_fq *prev, *list = info->ipsec_exception_fq;
@@ -1104,10 +1107,8 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 			(unsigned long)bp->paddr, bp->vaddr, bp->dev);
 #endif
 	bp->dev = bp_parent->dev;
-	bp->percpu_count = devm_alloc_percpu(bp->dev, *bp->percpu_count);
 	bp->size = IPSEC_BUFSIZE;
 	bp->config_count = IPSEC_BUFCOUNT;
-	bp->seed_cb = dpa_bp_priv_seed;
 	bp->free_buf_cb = _dpa_bp_free_pf;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPAIPSEC_ERROR("%s::dpa_bp_alloc failed for ipsec\n", 

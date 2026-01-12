@@ -229,7 +229,7 @@ void ct_remove(PCtEntry pEntry_orig)
  *
  * @param pEntry		pointer to the software conntrack
  */
-void ct_update_one(PCtEntry pEntry)
+static void ct_update_one(PCtEntry pEntry)
 {
 	// TODO: for now, only supporting adding new entry -- need to support changes
 	struct hw_ct *ct = pEntry->ct;
@@ -535,7 +535,7 @@ PCtEntry IPv4_find_ctentry(U32 saddr, U32 daddr, U16 sport, U16 dport, U8 proto)
 	return NULL;
 }
 
-int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
+static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 {
 	PCtEntry pEntry_orig = NULL, pEntry_rep = NULL;
 	PCT_PAIR ppair;
@@ -951,7 +951,7 @@ int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 }
 
 
-int IP_HandleIP_ROUTE_RESOLVE (U16 *p, U16 Length)
+static int IP_HandleIP_ROUTE_RESOLVE(U16 *p, U16 Length)
 {
 	PRouteEntry pRtEntry;
 	RtCommand RtCmd;
@@ -1090,8 +1090,7 @@ int IP_HandleIP_ROUTE_RESOLVE (U16 *p, U16 Length)
 
 		case ACTION_QUERY:
 			reset_action = 1;
-
-			/* fall through */
+			fallthrough;
 
 		case ACTION_QUERY_CONT:
 			pRtCmd = (PRtCommand)p;

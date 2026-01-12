@@ -181,8 +181,10 @@ int vwd_is_no_l2_itf_device(struct net_device* dev);
 to avoid multiple declarations , declaration added here
 other header files are added in many files where the struct qman_fq 
 definition is not found */
-void cdx_create_fqid_info_in_procfs(uint32_t fqid, 
+void cdx_create_fqid_info_in_procfs(uint32_t fqid,
 					struct qman_fq *fq);
 void cdx_remove_fqid_info_in_procfs(uint32_t fqid);
+
+int cdx_wifi_rx_fastpath(struct sk_buff *skb);
 
 #endif /* _DPAA_HOST_GENERIC_H_ */

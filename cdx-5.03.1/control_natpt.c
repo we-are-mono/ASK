@@ -13,7 +13,7 @@
 #include "control_natpt.h"
 
 
-int NATPT_Open(U16 *p, U16 Length)
+static int NATPT_Open(U16 *p, U16 Length)
 {
 	NATPTOpenCommand OpenCmd;
 	PSockEntry pSocketA;
@@ -95,7 +95,7 @@ int NATPT_Open(U16 *p, U16 Length)
 }
 
 
-int NATPT_Close(U16 *p, U16 Length)
+static int NATPT_Close(U16 *p, U16 Length)
 {
 	NATPTCloseCommand CloseCmd;
 	PCtEntry pEntry_6to4, pEntry_4to6;
@@ -128,7 +128,7 @@ int NATPT_Close(U16 *p, U16 Length)
 }
 
 
-int NATPT_Query(U16 *p, U16 Length)
+static int NATPT_Query(U16 *p, U16 Length)
 {
 	NATPTQueryCommand QueryCmd;
 	PNATPTQueryResponse pResp;
@@ -181,7 +181,7 @@ int NATPT_Query(U16 *p, U16 Length)
 }
 
 
-U16 M_natpt_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+static U16 M_natpt_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
 	U16 cmdrc;
 	U16 cmdlen = 2;

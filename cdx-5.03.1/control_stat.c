@@ -187,7 +187,7 @@ static U16 stats_connection(U16 action, PStatConnResponse statConnRsp, U16 *ackl
 
 U32 stats_bitmask_enable_g = STAT_IPSEC_BITMASK;
 
-void stat_ct_flow_get(struct hw_ct *ct, U64 *pkts, U64 *bytes, int do_reset)
+static void stat_ct_flow_get(struct hw_ct *ct, U64 *pkts, U64 *bytes, int do_reset)
 {
 	if (!ct)
 	{
@@ -205,7 +205,7 @@ void stat_ct_flow_get(struct hw_ct *ct, U64 *pkts, U64 *bytes, int do_reset)
 	}
 }
 
-void stat_ct_flow_reset(struct hw_ct *ct)
+static void stat_ct_flow_reset(struct hw_ct *ct)
 {
 	U64 pkts;
 	U64 bytes;

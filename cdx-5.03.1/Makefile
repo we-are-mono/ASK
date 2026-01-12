@@ -9,13 +9,21 @@
 #
 PLATFORM?=LS1043A
 
+# Support both KERNELDIR (build dir) and KERNEL_SRC (source dir) for Yocto
+# If KERNEL_SRC not set, try $(KERNELDIR)/source symlink (Yocto pattern)
+KERNEL_SRC ?= $(KERNELDIR)/source
+ifeq ($(wildcard $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_fman),)
+# Fallback to KERNELDIR if source symlink doesn't exist
+KERNEL_SRC := $(KERNELDIR)
+endif
+
 # Include netcomm SW specific definitions
-KERNELVERSION?=3.19.3
+KERNELVERSION?=6.12
 ifeq ($(KERNELVERSION),3.19.3)
-include $(KERNELDIR)/drivers/net/ethernet/freescale/fman/ncsw_config.mk
+include $(KERNEL_SRC)/drivers/net/ethernet/freescale/fman/ncsw_config.mk
 else
-#### This KERNELDIR is for kernel version 4.1.8 and 4.1.30
-include $(KERNELDIR)/drivers/net/ethernet/freescale/sdk_fman/ncsw_config.mk
+#### This path is for kernel version 4.1.8+ and 6.12
+include $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_fman/ncsw_config.mk
 endif
 
 
@@ -31,12 +39,12 @@ modules clean:
 ####included for dpa offload
 
 ifeq ($(KERNELVERSION),3.19.3)
-FMAN_DRIVER_PATH = $(KERNELDIR)/drivers/net/ethernet/freescale/fman
-DPAA_DRIVER_PATH = $(KERNELDIR)/drivers/net/ethernet/freescale/dpa
+FMAN_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/fman
+DPAA_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/dpa
 else
-#### This driver path is for kernel version 4.1.8 and 4.1.30
-FMAN_DRIVER_PATH = $(KERNELDIR)/drivers/net/ethernet/freescale/sdk_fman
-DPAA_DRIVER_PATH = $(KERNELDIR)/drivers/net/ethernet/freescale/sdk_dpaa
+#### This driver path is for kernel version 4.1.8+ and 6.12
+FMAN_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_fman
+DPAA_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_dpaa
 endif
 
 EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/inc
@@ -49,7 +57,7 @@ EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/inc
 EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/inc/wrapper
 EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/inc/system
 EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/wrapper
-EXTRA_CFLAGS += -I$(KERNELDIR)/drivers/crypto/caam
+EXTRA_CFLAGS += -I$(KERNEL_SRC)/drivers/crypto/caam
 EXTRA_CFLAGS += -I$(DPAA_DRIVER_PATH)
 EXTRA_CFLAGS += $(CFG_FLAGS)
 

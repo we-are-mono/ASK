@@ -145,6 +145,8 @@ static __inline void rte_set_mtu(PRouteEntry prte,U16 mtu) {
   prte->mtu = mtu == 0 ? 0xFFFF : mtu;
 }
 
+/* Debug functions */
+void display_itf(struct _itf *itf);
 
 #endif /* _LAYER2_H_ */
 
