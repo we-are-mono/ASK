@@ -1156,6 +1156,14 @@ int cmmDaemonInit(struct cmm_daemon *ctx)
 		goto err0;
 	}
 
+	// Remove any stale message queue from previous run
+	ctx->queueIdRx = msgget(key, 0);
+	if (ctx->queueIdRx >= 0)
+	{
+		cmm_print(DEBUG_INFO, "%s: removing stale rx queue %d\n", __func__, ctx->queueIdRx);
+		msgctl(ctx->queueIdRx, IPC_RMID, NULL);
+	}
+
 	// Create the message queue
 	ctx->queueIdRx = msgget(key, IPC_CREAT | IPC_EXCL);
 	if (ctx->queueIdRx < 0)
@@ -1169,6 +1177,14 @@ int cmmDaemonInit(struct cmm_daemon *ctx)
 	{
 		cmm_print(DEBUG_CRIT, "%s: ftok(%d) failed, %s\n", __func__, id, strerror(errno));
 		goto err1;
+	}
+
+	// Remove any stale message queue from previous run
+	ctx->queueIdTx = msgget(key, 0);
+	if (ctx->queueIdTx >= 0)
+	{
+		cmm_print(DEBUG_INFO, "%s: removing stale tx queue %d\n", __func__, ctx->queueIdTx);
+		msgctl(ctx->queueIdTx, IPC_RMID, NULL);
 	}
 
 	ctx->queueIdTx = msgget(key, IPC_CREAT | IPC_EXCL);

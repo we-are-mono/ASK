@@ -60,6 +60,7 @@ int cmm_rtnl_listen(struct rtnl_handle *rtnl, rtnl_filter_t handler, void *jarg)
 int cmm_parse_rtattr(struct rtattr *tb[], int max, struct rtattr *rta, int len);
 struct rtattr *cmm_get_rtattr(struct rtattr *rta, int len, int type);
 void cmm_addattr_l(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen);
+int cmm_addattr8(struct nlmsghdr *n, int maxlen, int type, __u8 data);
 int cmm_addattr16(struct nlmsghdr *n, int maxlen, int type, __u16 data);
 int cmm_addattr32(struct nlmsghdr *n, int maxlen, int type, __u32 data);
 

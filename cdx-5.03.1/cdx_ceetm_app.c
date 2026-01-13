@@ -1756,11 +1756,24 @@ int ceetm_exit(void)
 		return CEETM_FAILURE;
 	}
 	ceetm_dbg("%s::deregistered ceetmFq functions\n", __FUNCTION__);
-	/*TODO : ceetm cleanup */
-	/* 1. Channels creation cleanup (memory, channel)  */
-	/* 2. class queue (ceetm ccg release, ceetm lfq, cq release) */
-	/*TODO : ENABLE_EGRESS_QOS compilation flag cleanup */
-	/* ENABLE_EGRESS_QOS compilation flag proper integration. */
+
+	/* TODO: Implement proper cleanup for module unload. Currently leaks:
+	 * - 8 channel structures (kzalloc'd in ceetm_create_channel)
+	 * - 8 hardware channels (qman_alloc_ceetm0_channel)
+	 * - 128 class queues (qman_ceetm_cq_claim)
+	 * - 128 logical FQIDs (qman_ceetm_lfq_claim)
+	 * - 128 CCGs (qman_ceetm_ccg_claim)
+	 * - 128 policer profiles (FM_PCD_PlcrProfileSet)
+	 *
+	 * Release order must be: LFQ -> CQ -> CCG -> channel (per kernel API).
+	 * For each channel in qm_chnl_info[0..7]:
+	 *   for each cq_info[0..15]:
+	 *     qman_ceetm_lfq_release(cqinfo->lfq)
+	 *     qman_ceetm_cq_release(cqinfo->cq)
+	 *     release CCG
+	 *   qman_release_ceetm0_channelid(channel->idx)
+	 *   kfree(channel)
+	 */
 
 	return CEETM_SUCCESS;
 }

@@ -525,9 +525,8 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 				return -1;
 			}
 			miss_engine_params.nextEngine = e_FM_PCD_KG;
-#if 1//def DPA_CFG_DEBUG
-			//DPA_INFO("%s::changing miss action table %s as KG scheme %p\n",
-			printk("%s::changing miss action table %s as KG scheme %p\n",
+#ifdef CDX_DPA_DEBUG
+			DPA_INFO("%s::changing miss action table %s as KG scheme %p\n",
 					__FUNCTION__, tbl_info->name,
 					miss_engine_params.params.kgParams.h_DirectScheme);
 #endif
@@ -539,9 +538,8 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 			//get policer profile id for CP traffic
 			miss_engine_params.params.plcrParams.newRelativeProfileId =
 				CDX_EXPT_ETH_RATELIMIT;
-#if 1//def DPA_CFG_DEBUG
-			//DPA_INFO("%s::changing miss action table %s as policer, profile %d\n",
-			printk("%s::changing miss action table %s as policer, profile %d\n",
+#ifdef CDX_DPA_DEBUG
+			DPA_INFO("%s::changing miss action table %s as policer, profile %d\n",
 					__FUNCTION__, tbl_info->name,
 					miss_engine_params.params.plcrParams.newRelativeProfileId);
 #endif

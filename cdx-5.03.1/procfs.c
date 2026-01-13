@@ -10,6 +10,7 @@
 #ifdef CONFIG_PROC_FS
 #include "procfs.h"
 #include <linux/slab.h>
+#include "misc.h"
 
 static struct proc_dir_entry *proc_fqid_dir = NULL ;
 static struct proc_dir_entry *proc_tx_dir = NULL ;
@@ -159,9 +160,13 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 		printk("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
 		return -1;
 	}
+#ifdef CDX_DPA_DEBUG
 	printk("/proc/fqid_stats/%s/%s directory created.\n", parent_dir,name);
+#endif
 	*proc_dir_entry = (void *)proc_entry;
+#ifdef CDX_DPA_DEBUG
 	printk("%s()::%d proc_entry %p proc dir %p\n", __func__, __LINE__, proc_entry, proc_entry->proc_dir);
+#endif
 
 	return 0;
 }

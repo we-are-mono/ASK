@@ -56,10 +56,14 @@
 {\
         printk(KERN_CRIT fmt, ## __VA_ARGS__);\
 }
+#ifdef CDX_DPA_DEBUG
 #define DPAIPSEC_INFO(fmt, ...)\
 {\
         printk(KERN_INFO fmt, ## __VA_ARGS__);\
 }
+#else
+#define DPAIPSEC_INFO(fmt, ...)
+#endif
 
 #define MAX_IPSEC_SA_INFO	16
 #define IPSEC_WQ_ID		2

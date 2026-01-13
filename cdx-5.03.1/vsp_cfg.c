@@ -26,6 +26,7 @@
 #include "mac.h"
 #include "portdefs.h"
 #include "cdx_defs.h"
+#include "misc.h"
 static struct dpa_bp *gs_dpa_vsp_bp;		/* VSP Buffer pool */
 
 #define DPAA_VSP_MAX_BUF_COUNT 512
@@ -53,7 +54,9 @@ static struct dpa_bp *dpa_vsp_bp_probe(struct net_device *net_dev)
 		goto out;
 	}
 	gs_dpa_vsp_bp = dpa_vsp_bp;
+#ifdef CDX_DPA_DEBUG
 	pr_info("%s:: VSP BPID %d created config_count %d \n",__FUNCTION__,dpa_vsp_bp->bpid, dpa_vsp_bp->config_count);
+#endif
 	return dpa_vsp_bp;
 out:
 	return NULL;
@@ -132,12 +135,14 @@ int dpa_add_virt_storage_profile(struct net_device *net_dev,
 		netdev_err(net_dev, "FM_VSP_Init failed %d\n", _errno);
 		goto out;
 	}
+#ifdef CDX_DPA_DEBUG
 	pr_info("%s:Configured storage profile -relative id %u bpid %u size %u for %s\n",
 			__FUNCTION__,
 			1,
 			fmVspParams.extBufPools.extBufPool[0].id ,
 			fmVspParams.extBufPools.extBufPool[0].size,
 			net_dev->name);
+#endif
 	return 0;
 
 out:

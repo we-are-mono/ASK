@@ -2002,8 +2002,10 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	priv = netdev_priv(iface_info->eth_info.net_dev);
 	mac_dev = priv->mac_dev;
 	iface_info->eth_info.hardwarePortId = fm_port_get_hwid(mac_dev->port_dev[RX]);
+#ifdef CDX_DPA_DEBUG
 	printk("%s::port %s hwid %d\n", __FUNCTION__,
 			iface_info->name, iface_info->eth_info.hardwarePortId);
+#endif
 #ifdef INCLUDE_ETHER_IFSTATS
 	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
 		DPA_ERROR("%s:: alloc_iface_stats failed\n", __FUNCTION__);

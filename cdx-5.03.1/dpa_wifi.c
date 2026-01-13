@@ -33,6 +33,7 @@
 #endif
 
 #include "portdefs.h"
+#include "misc.h"
 #include "dpaa_eth.h"
 #include "dpaa_eth_common.h"
 #include "dpa_wifi.h"
@@ -59,10 +60,14 @@ static DEFINE_PER_CPU(unsigned int, num_tx_done);
 {\
         printk(KERN_CRIT fmt, ## __VA_ARGS__);\
 }
+#ifdef CDX_DPA_DEBUG
 #define DPAWIFI_INFO(fmt, ...)\
 {\
         printk(KERN_INFO fmt, ## __VA_ARGS__);\
 }
+#else
+#define DPAWIFI_INFO(fmt, ...)
+#endif
 
 #define percpu_var_sum(var, total)\
 {\
