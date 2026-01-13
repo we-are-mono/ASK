@@ -34,12 +34,15 @@ typedef struct mc_listener {
         u_int8_t        padding[2];
 }__attribute__((__packed__)) mc_listener_t;
 
+/* Note: __packed__ removed - this struct is only used internally in CMM
+ * for linked list management and is not sent to kernel or used for IPC.
+ * Packed attribute caused arm64 alignment issues with list_head operations. */
 typedef struct mcast_entry {
 	struct list_head list;
 	u_int8_t  family;
 //	u_int8_t  programmed;
-	u_int8_t  mode : 1, 
-		  queue : 5, 
+	u_int8_t  mode : 1,
+		  queue : 5,
 		  rsvd : 2;
 	u_int8_t  src_mask_len;
 	u_int32_t src_addr[4];
@@ -50,7 +53,7 @@ typedef struct mcast_entry {
 	char	        input_device_str[IFNAMSIZ];
 #endif
 	struct mc_listener listener[MC_MAX_LISTENERS_PER_GROUP];
-}__attribute__((__packed__)) mcast_entry_t;
+} mcast_entry_t;
 
 extern struct list_head mc_table[MC_NUM_HASH_ENTRIES];
 struct mcast_entry *mc_find ( void  *data, unsigned char family );

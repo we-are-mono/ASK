@@ -21,7 +21,7 @@ void cmmRelayShowPrintHelp();
 int cmmRelayProcessClientCmd(FCI_CLIENT * fciMsgHandler, int function_code,
                              u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);
 
-int cmmRelayLocalShow(struct cli_def *cli, char *command, char *argv[],
+int cmmRelayLocalShow(struct cli_def *cli, const char *command, char *argv[],
                       int argc);
 int cmmRelayParseCmd(int argc, char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 #endif

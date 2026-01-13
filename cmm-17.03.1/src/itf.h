@@ -146,7 +146,13 @@ static inline char *get_port_name(int port_id, char *buf, int buf_size)
 			continue;
 
 		if (port_table[ii].port_id == port_id)
-			snprintf(buf, buf_size, "%s",  port_table[ii].ifname);
+		{
+			size_t len = strlen(port_table[ii].ifname);
+			if (len >= (size_t)buf_size)
+				len = buf_size - 1;
+			memcpy(buf, port_table[ii].ifname, len);
+			buf[len] = '\0';
+		}
 	}
 
 	return buf;

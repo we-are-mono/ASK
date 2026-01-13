@@ -333,7 +333,7 @@ refused:
 *
 *
 ******************************************************************/
-int cmmFcStop(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFcStop(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	cli_print(cli, "Killing cmm ...\n");
 
@@ -347,7 +347,7 @@ int cmmFcStop(struct cli_def * cli, char *command, char *argv[], int argc)
 *
 *
 ******************************************************************/
-int cmmFcActivate(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFcActivate(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	int val;
 	int family;
@@ -400,7 +400,7 @@ usage:
 *
 *
 ******************************************************************/
-int cmmFcActivateShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFcActivateShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	cli_print(cli, "%d", globalConf.enable);
 
@@ -412,7 +412,7 @@ int cmmFcActivateShow(struct cli_def * cli, char *command, char *argv[], int arg
 *
 *
 ******************************************************************/
-int cmmFcDebug(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFcDebug(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	int val;
 	int flag = 0;
@@ -455,7 +455,7 @@ usage:
 *
 *
 ******************************************************************/
-int cmmFcDebugShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFcDebugShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	cli_print(cli, "command:\t%s", (globalConf.debug_level & DEBUG_COMMAND) ? "printed": "not printed");
 	cli_print(cli, "error:  \t%s", (globalConf.debug_level & DEBUG_ERROR) ? "printed": "not printed");
@@ -481,8 +481,13 @@ asymFFRule_t cmmFcAsymFFRuleAddAttribut(asymFFRule_t rule, int attributType, int
 	temp->next = rule;
 	temp->type = attributType;
 	temp->value = attributValue;
-	strncpy(temp->strValue, attrStrValue, sizeof(temp->strValue));
-	STR_TRUNC_END(temp->strValue , sizeof(temp->strValue));
+	{
+		size_t len = strlen(attrStrValue);
+		if (len >= sizeof(temp->strValue))
+			len = sizeof(temp->strValue) - 1;
+		memcpy(temp->strValue, attrStrValue, len);
+		temp->strValue[len] = '\0';
+	}
 	temp->width = attributWidth;
 	temp->mask = mask;
 
@@ -504,8 +509,13 @@ struct asymFFRuleList * cmmFcAsymFFListAddRule(struct asymFFRuleList *list, char
 
 	temp->next = list;
 	temp->rule = rule;
-	strncpy(temp->name, ruleName, sizeof(temp->name));
-	STR_TRUNC_END(temp->name , sizeof(temp->name));
+	{
+		size_t len = strlen(ruleName);
+		if (len >= sizeof(temp->name))
+			len = sizeof(temp->name) - 1;
+		memcpy(temp->name, ruleName, len);
+		temp->name[len] = '\0';
+	}
 	return temp;
 }
 
@@ -514,7 +524,7 @@ struct asymFFRuleList * cmmFcAsymFFListAddRule(struct asymFFRuleList *list, char
 *
 *	Print rules on CLI
 ******************************************************************/
-int cmmFcAsymFFRulesShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFcAsymFFRulesShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct asymFFRuleList *rulesList;
 	struct asymFFRule *rule;
@@ -699,8 +709,13 @@ struct denyRuleList * cmmFcListAddRule(struct denyRuleList *list, char * ruleNam
 
 	temp->next = list;
 	temp->rule = rule;
-	strncpy(temp->name, ruleName, sizeof(temp->name));
-	STR_TRUNC_END(temp->name , sizeof(temp->name));
+	{
+		size_t len = strlen(ruleName);
+		if (len >= sizeof(temp->name))
+			len = sizeof(temp->name) - 1;
+		memcpy(temp->name, ruleName, len);
+		temp->name[len] = '\0';
+	}
 	return temp;
 }
 
@@ -709,7 +724,7 @@ struct denyRuleList * cmmFcListAddRule(struct denyRuleList *list, char * ruleNam
 *
 *		Print rules on CLI
 ******************************************************************/
-int cmmFcRulesShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFcRulesShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct denyRuleList *rulesList;
 	struct denyRule *rule;
@@ -982,8 +997,11 @@ static int section_wifi_fastforward_option_hdlr(void *data, int argc, char **arg
 
 	if (!strcasecmp(option, "ifname"))
 	{
-		strncpy(wifi_if->ifname, value, IFNAMSIZ);
-		STR_TRUNC_END(wifi_if->ifname, IFNAMSIZ);
+		size_t len = strlen(value);
+		if (len >= IFNAMSIZ)
+			len = IFNAMSIZ - 1;
+		memcpy(wifi_if->ifname, value, len);
+		wifi_if->ifname[len] = '\0';
 
 		cmm_print(DEBUG_ERROR, "cmmFcParser: WiFi name: %s\n", wifi_if->ifname);
 	}
@@ -1012,9 +1030,12 @@ err:
 static void *section_rule_start_hdlr(int argc, char **argv)
 {
 	struct rule_section_data *section = &section_data;
+	size_t len = strlen(argv[0]);
 
-	strncpy(section->name, argv[0], sizeof(section->name));
-	STR_TRUNC_END(section->name, sizeof(section->name));
+	if (len >= sizeof(section->name))
+		len = sizeof(section->name) - 1;
+	memcpy(section->name, argv[0], len);
+	section->name[len] = '\0';
 	section->rule = NULL;
 	section->last = 0;
 
@@ -1619,9 +1640,12 @@ static int section_asym_fastforward_option_hdlr(void *data, int argc, char **arg
 	}
 	else if (!strcmp(option, "interface"))
 	{
+		size_t len = strlen(value);
 		attrValue = 0;
-		strncpy(attrSValue, value, IFNAMSIZ);
-		STR_TRUNC_END(attrSValue, IFNAMSIZ);
+		if (len >= IFNAMSIZ)
+			len = IFNAMSIZ - 1;
+		memcpy(attrSValue, value, len);
+		attrSValue[len] = '\0';
 		attrType = ATTR_ORIG_COMCERTO_FP_IIF;
 		attrWidth = sizeof(int);
 		mask = 0x000000FF;
@@ -1821,7 +1845,7 @@ int cmmFcParser(char *confFilePath)
 *
 *
 ******************************************************************/
-static int cmmRxCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmRxCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmRxSetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1835,7 +1859,7 @@ static int cmmRxCmd(struct cli_def * cli, char *command, char *argv[], int argc)
 *
 *
 ******************************************************************/
-static int cmmTxCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmTxCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	/*Call TX process function*/
 	cmmTxSetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1849,7 +1873,7 @@ static int cmmTxCmd(struct cli_def * cli, char *command, char *argv[], int argc)
 *
 *
 ******************************************************************/
-static int cmmStatCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmStatCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmStatSetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1862,7 +1886,7 @@ static int cmmStatCmd(struct cli_def * cli, char *command, char *argv[], int arg
 *
 *
 ******************************************************************/
-static int cmm4rdIdConvCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmm4rdIdConvCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call tunnel 4rd id conversion set process function*/
   cmm4rdIdConvSetProcess(argv, 0, argc, globalConf.cli.daemon_handle);
@@ -1876,7 +1900,7 @@ static int cmm4rdIdConvCmd(struct cli_def * cli, char *command, char *argv[], in
 *
 *
 ******************************************************************/
-static int cmmDPDSaQueryCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmDPDSaQueryCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmDPDSaQuerySetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1890,7 +1914,7 @@ static int cmmDPDSaQueryCmd(struct cli_def * cli, char *command, char *argv[], i
 *
 *
 ******************************************************************/
-static int cmmDPIEnableCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmDPIEnableCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmDPIFlagSetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1904,7 +1928,7 @@ static int cmmDPIEnableCmd(struct cli_def * cli, char *command, char *argv[], in
 *
 *
 ******************************************************************/
-static int cmmAsymFFEnableCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmAsymFFEnableCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmAsymFFSetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1917,7 +1941,7 @@ static int cmmAsymFFEnableCmd(struct cli_def * cli, char *command, char *argv[],
 *
 *
 ******************************************************************/
-static int cmmShowRxCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmShowRxCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmRxShowProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1930,7 +1954,7 @@ static int cmmShowRxCmd(struct cli_def * cli, char *command, char *argv[], int a
 *
 *
 ******************************************************************/
-static int cmmShowStatCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmShowStatCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Stat process function*/
   cmmStatShowProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1944,7 +1968,7 @@ static int cmmShowStatCmd(struct cli_def * cli, char *command, char *argv[], int
 *
 *
 ******************************************************************/
-static int cmmQueryRxCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryRxCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmRxQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1958,7 +1982,7 @@ static int cmmQueryRxCmd(struct cli_def * cli, char *command, char *argv[], int 
 *
 *
 ******************************************************************/
-static int cmmQueryRtCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryRtCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmRtQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1971,7 +1995,7 @@ static int cmmQueryRtCmd(struct cli_def * cli, char *command, char *argv[], int 
 *
 *
 ******************************************************************/
-static int cmmQueryCtCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryCtCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmCtQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1984,7 +2008,7 @@ static int cmmQueryCtCmd(struct cli_def * cli, char *command, char *argv[], int 
 *
 *
 ******************************************************************/
-static int cmmQueryMacVlanCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryMacVlanCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call MacVlan process function*/
   cmmMacVlanQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -1997,7 +2021,7 @@ static int cmmQueryMacVlanCmd(struct cli_def * cli, char *command, char *argv[],
  * *
  * *
  * ******************************************************************/
-static int cmmQueryV6CtCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryV6CtCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmCt6QueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2012,7 +2036,7 @@ static int cmmQueryV6CtCmd(struct cli_def * cli, char *command, char *argv[], in
 *
 *
 ******************************************************************/
-static int cmmQueryPPPoECmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryPPPoECmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call PPPoE process function*/
   cmmPPPoEQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2026,7 +2050,7 @@ static int cmmQueryPPPoECmd(struct cli_def * cli, char *command, char *argv[], i
  * *
  * *
  * ******************************************************************/
-static int cmmQueryVlanCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryVlanCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Vlan process function*/
   cmmVlanQuery(argv, 0, globalConf.cli.daemon_handle);
@@ -2040,12 +2064,12 @@ static int cmmQueryVlanCmd(struct cli_def * cli, char *command, char *argv[], in
  * *
  * *
  * ******************************************************************/
-static int cmmQueryipr4statsCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryipr4statsCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   	/*Call ipr process function*/
 	return (cmmIpr4StatsQuery(argv, 0, globalConf.cli.daemon_handle));
 }
-static int cmmQueryipr6statsCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryipr6statsCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   	/*Call ipr process function*/
 	return (cmmIpr6StatsQuery(argv, 0, globalConf.cli.daemon_handle));
@@ -2057,7 +2081,7 @@ static int cmmQueryipr6statsCmd(struct cli_def * cli, char *command, char *argv[
  *   * *
  *    * *
  *     * ******************************************************************/
-static int cmmQueryMc4Cmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryMc4Cmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Multicast IPV4 process function*/
    cmmMc4QueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2070,7 +2094,7 @@ static int cmmQueryMc4Cmd(struct cli_def * cli, char *command, char *argv[], int
  *   *   * *
  *    *    * *
  *     *     * ******************************************************************/
-static int cmmQueryMc6Cmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryMc6Cmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Multicast IPV4 process function*/
    cmmMc6QueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2084,7 +2108,7 @@ static int cmmQueryMc6Cmd(struct cli_def * cli, char *command, char *argv[], int
  *   *   *   * *
  *    *    *    * *
  *     *     *     * ******************************************************************/
-static int cmmQueryQmCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryQmCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
    cmmQmQueryProcess(argv, 0, globalConf.cli.daemon_handle);
 
@@ -2097,7 +2121,7 @@ static int cmmQueryQmCmd(struct cli_def * cli, char *command, char *argv[], int 
  *   *   *   *   * *
  *    *    *    *    * *
  *     *     *     *     * ******************************************************************/
-static int cmmQmExptRateQueryCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQmExptRateQueryCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
    cmmQmExptRateQueryProcess(argv, 0, globalConf.cli.daemon_handle);
 
@@ -2110,7 +2134,7 @@ static int cmmQmExptRateQueryCmd(struct cli_def * cli, char *command, char *argv
  *   *   *   *   * * This function query the dscp fq map configuration on the interface.
  *    *    *    *    * *
  *     *     *     *     * ******************************************************************/
-static int cmmQmDSCPFqMapQueryCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQmDSCPFqMapQueryCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
    cmmQmDSCPFqMapQueryProcess(argv, 0, globalConf.cli.daemon_handle);
 
@@ -2122,7 +2146,7 @@ static int cmmQmDSCPFqMapQueryCmd(struct cli_def * cli, char *command, char *arg
  *   *   *   *   * *
  *    *    *    *    * *
  *     *     *     *     * ******************************************************************/
-static int cmmQmFFRateQueryCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQmFFRateQueryCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call process function*/
    cmmQmFFRateQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2134,7 +2158,7 @@ static int cmmQmFFRateQueryCmd(struct cli_def * cli, char *command, char *argv[]
  *   *   *   *   * * This function query the dscp vlan pcp map configuration on the interface.
  *    *    *    *    * *
  *     *     *     *     * ******************************************************************/
-static int cmmDSCPVlanPcpMapQueryCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmDSCPVlanPcpMapQueryCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	cmmDSCPVlanPcpMapQueryProcess(argv, 0, globalConf.cli.daemon_handle);
 
@@ -2147,7 +2171,7 @@ static int cmmDSCPVlanPcpMapQueryCmd(struct cli_def * cli, char *command, char *
  *   * *
  *    * *
  *     * ******************************************************************/
-static int cmmSaQueryCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmSaQueryCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Sa Query process function*/
   cmmSAQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2161,7 +2185,7 @@ static int cmmSaQueryCmd(struct cli_def * cli, char *command, char *argv[], int 
 *
 *
 ******************************************************************/
-static int cmmSECfailStatsQueryCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmSECfailStatsQueryCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	/*Call SEC failure stats Query process function*/
 	cmmSECfailStatsQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2175,7 +2199,7 @@ static int cmmSECfailStatsQueryCmd(struct cli_def * cli, char *command, char *ar
 *
 *
 ******************************************************************/
-static int cmmQueryNatptCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryNatptCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	/*Call NATPT process function*/
 	cmmNATPTQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2188,7 +2212,7 @@ static int cmmQueryNatptCmd(struct cli_def * cli, char *command, char *argv[], i
 *
 *
 ******************************************************************/
-static int cmmQueryL2FlowCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryL2FlowCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	/*Call L2Flow query function*/
 	cmmL2FlowQueryProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2201,7 +2225,7 @@ static int cmmQueryL2FlowCmd(struct cli_def * cli, char *command, char *argv[], 
 *
 *
 ******************************************************************/
-static int cmmQmCmds(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQmCmds(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	/*Call QM process function*/
 	cmmQmSetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2214,7 +2238,7 @@ static int cmmQmCmds(struct cli_def * cli, char *command, char *argv[], int argc
 *
 *
 ******************************************************************/
-static int cmmMc4Cmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmMc4Cmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmMc4SetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2226,7 +2250,7 @@ static int cmmMc4Cmd(struct cli_def * cli, char *command, char *argv[], int argc
 *
 *
 ******************************************************************/
-static int cmmMc6Cmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmMc6Cmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call RX process function*/
   cmmMc6SetProcess(argv, 0, globalConf.cli.daemon_handle);
@@ -2239,7 +2263,7 @@ static int cmmMc6Cmd(struct cli_def * cli, char *command, char *argv[], int argc
 *
 *
 ******************************************************************/
-static int cmmMspMem(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmMspMem(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Memory DIsplay function */
 	prfMspMS( globalConf.cli.daemon_handle,argc, argv);
@@ -2251,7 +2275,7 @@ static int cmmMspMem(struct cli_def * cli, char *command, char *argv[], int argc
 *
 *
 ******************************************************************/
-static int cmmMspMemW(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmMspMemW(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Memory DIsplay function */
 	prfMspMSW( globalConf.cli.daemon_handle,argc, argv);
@@ -2261,7 +2285,7 @@ static int cmmMspMemW(struct cli_def * cli, char *command, char *argv[], int arg
 /*****************************************************************
 * cmmMspMem
 ******************************************************************/
-static int cmmMspCT(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmMspCT(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   /*Call Memory DIsplay function */
 	prfMspCT(globalConf.cli.daemon_handle,argc, argv );
@@ -2272,30 +2296,30 @@ static int cmmMspCT(struct cli_def * cli, char *command, char *argv[], int argc)
 ** Performance mesaurement and tracing 
 */
 /* Busy CPU */
-static int cmmPTBusyCPU(struct cli_def * cli, char *command, char *argv[], int argc) {
+static int cmmPTBusyCPU(struct cli_def * cli, const char *command, char *argv[], int argc) {
 	prfPTBusyCPU( globalConf.cli.daemon_handle,argc, argv);
 	return CLI_OK;
 }
 /* Tracing/profiling */
-static int cmmPTsetmask(struct cli_def * cli, char *command, char *argv[], int argc) {
+static int cmmPTsetmask(struct cli_def * cli, const char *command, char *argv[], int argc) {
 	prfPTsetmask( globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
-static int cmmPTstart(struct cli_def * cli, char *command, char *argv[], int argc) {
+static int cmmPTstart(struct cli_def * cli, const char *command, char *argv[], int argc) {
 	prfPTstart(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
-static int cmmPTswitch(struct cli_def * cli, char *command, char *argv[], int argc) {
+static int cmmPTswitch(struct cli_def * cli, const char *command, char *argv[], int argc) {
 	prfPTswitch(globalConf.cli.daemon_handle, argc,argv);
 	return CLI_OK;
 }
 
-static int cmmPTshow(struct cli_def * cli, char *command, char *argv[], int argc) {
+static int cmmPTshow(struct cli_def * cli, const char *command, char *argv[], int argc) {
 	prfPTshow(globalConf.cli.daemon_handle, argc,argv);
 	return CLI_OK;
 }
 
-static int cmmPTstatus(struct cli_def * cli, char *command, char *argv[], int argc) {
+static int cmmPTstatus(struct cli_def * cli, const char *command, char *argv[], int argc) {
 	prfStatus(globalConf.cli.daemon_handle,argc, argv);
 	return CLI_OK;
 }
@@ -2305,14 +2329,14 @@ static int cmmPTstatus(struct cli_def * cli, char *command, char *argv[], int ar
 *
 *
 ******************************************************************/
-static int cmmVlanCliAdd(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmVlanCliAdd(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
 	/*Call vlan process function*/
   	vlanAddProcess(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
-static int cmmVlanCliDelete(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmVlanCliDelete(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
 	/*Call vlan process function*/
   	vlanDeleteProcess(globalConf.cli.daemon_handle, argc, argv);
@@ -2326,28 +2350,28 @@ static int cmmVlanCliDelete(struct cli_def *cli, char *command, char *argv[], in
 *
 *
 ******************************************************************/
-static int cmmPktCapSlice(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmPktCapSlice(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
 	
   	PktCapSliceProcess(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
-static int cmmPktCapStat(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmPktCapStat(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
   	PktCapStatProcess(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
 
-static int cmmPktCapFilter(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmPktCapFilter(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
   	PktCapFilterProcess(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
 
-static int cmmPktCapQuery(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmPktCapQuery(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
   	PktCapQueryProcess(cli , globalConf.cli.daemon_handle);
 	return CLI_OK;
@@ -2359,42 +2383,42 @@ static int cmmPktCapQuery(struct cli_def *cli, char *command, char *argv[], int 
 *
 *
 ******************************************************************/
-static int cmmIccReset(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmIccReset(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
 	
   	IccReset(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
-static int cmmIccThreshold(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmIccThreshold(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
   	IccThreshold(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
 
-static int cmmIccAdd(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmIccAdd(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
   	IccAdd(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
 
-static int cmmIccDelete(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmIccDelete(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
   	IccDelete(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
 
-static int cmmIccQuery(struct cli_def *cli, char *command, char *argv[], int argc)
+static int cmmIccQuery(struct cli_def *cli, const char *command, char *argv[], int argc)
 {
   	IccQuery(globalConf.cli.daemon_handle, argc, argv);
 	return CLI_OK;
 }
 
 
-static int cmmQueryTnlCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmQueryTnlCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	cmmTnlQueryProcess(argv, 0, globalConf.cli.daemon_handle);
 
@@ -2406,31 +2430,31 @@ static int cmmQueryTnlCmd(struct cli_def * cli, char *command, char *argv[], int
 /*****************************************************************
 * cmmSetTimeoutCLI
 ******************************************************************/
-static int cmmSetTimeoutCLI(struct cli_def * cli, char *command, char *argv[], int argc) 
+static int cmmSetTimeoutCLI(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
 	timeoutSet(globalConf.cli.daemon_handle, argv, argc);
 	return CLI_OK; 
 }
 
-static int cmmSetRouteCLI(struct cli_def * cli, char *command, char *argv[], int argc) 
+static int cmmSetRouteCLI(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
 	cmmRouteSetProcess(argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK; 
 }
 
-static int cmmFFControlCmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+static int cmmFFControlCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
 	cmmFFControlProcess(argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK;
 }
 
-static int cmmIpv4Cmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+static int cmmIpv4Cmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
 	cmmCtChangeProcess4(argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK;
 }
 
-static int cmmIpv6Cmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+static int cmmIpv6Cmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
 	cmmCtChangeProcess6(argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK;
@@ -2516,49 +2540,49 @@ usage:
 	return -1;
 }
 
-int cmmExptCmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+int cmmExptCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
   	/*Call exception path process function*/
  	cmmExptSetProcess(argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK;
 }
 
-int cmmRtpCmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+int cmmRtpCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
   	/*Call RTP process function*/
  	cmmRTPSetProcess(argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK;
 }
 
-int cmmSocketCmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+int cmmSocketCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
 	/*Call Socket process function*/
 	cmmSocketSetProcess(argv, 0, globalConf.cli.daemon_handle, AF_INET);
 	return CLI_OK;
 }
 
-int cmmSocket6Cmd(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmSocket6Cmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	/*Call Socket process function*/
 	cmmSocketSetProcess(argv, 0, globalConf.cli.daemon_handle, AF_INET6);
 	return CLI_OK;
 }
 
-int cmmNatptCmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+int cmmNatptCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
   	/*Call NAT-PT process function*/
  	cmmNATPTSetProcess(argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK;
 }
 
-int cmmAltConfCmd(struct cli_def * cli, char *command, char *argv[], int argc) 
+int cmmAltConfCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
   	/*Call AltConf process function*/
  	cmmAltConfClient(argc, argv, 0, globalConf.cli.daemon_handle);
 	return CLI_OK;
 }
 
-static void cliCallback(struct cli_def *cliHandle, char *format)
+static void cliCallback(struct cli_def *cliHandle, const char *format)
 {
 	if (format[0] && cliHandle->client)
 		fprintf(cliHandle->client, "%s\r\n", format);
@@ -2569,7 +2593,7 @@ static void cliCallback(struct cli_def *cliHandle, char *format)
 *
 *
 ******************************************************************/
-static int cmmBridgeControlCmd(struct cli_def * cli, char *command, char *argv[], int argc)
+static int cmmBridgeControlCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	/*Call L2Flow query function*/
 	cmmBridgeControlProcess(argv, 0, globalConf.cli.daemon_handle);

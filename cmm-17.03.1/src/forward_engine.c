@@ -361,24 +361,26 @@ int cmmFeCtUpdate4(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		 * the queue, DSCP marking parameters, and VLAN p-bit settings with the twin connection.
 		 */
 
-		qosconnmark_t qmark;
-		qmark.x = cmd.qosconnmark;
 #if !defined(LS1043)
-		if ( (qmark.qosmark_ds.ds_flag) &&
-			(((ctEntry->fpp_dir & ORIGINATOR) &&
-			(is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_ORIG_COMCERTO_FP_IIF)) &&
-			!is_wan_port_ifindex(ctEntry->orig.route->oifindex))) ||
-		     	((ctEntry->fpp_dir & REPLIER) &&
-			(!is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_REPL_COMCERTO_FP_IIF)) &&
-			is_wan_port_ifindex(ctEntry->rep.route->oifindex))))
-			)
 		{
-			qosmark_t qmark_lo, qmark_hi;
-			qmark_lo.x = qmark.x_us;
-			qmark_hi.x = qmark.x_ds;
-			qmark.x_us = qmark_hi.x; qmark.qosmark_us.ds_flag = 0;
-			qmark.x_ds = qmark_lo.x; qmark.qosmark_ds.ds_flag = 1;
-			cmd.qosconnmark = qmark.x;
+			qosconnmark_t qmark;
+			qmark.x = cmd.qosconnmark;
+			if ( (qmark.qosmark_ds.ds_flag) &&
+				(((ctEntry->fpp_dir & ORIGINATOR) &&
+				(is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_ORIG_COMCERTO_FP_IIF)) &&
+				!is_wan_port_ifindex(ctEntry->orig.route->oifindex))) ||
+				((ctEntry->fpp_dir & REPLIER) &&
+				(!is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_REPL_COMCERTO_FP_IIF)) &&
+				is_wan_port_ifindex(ctEntry->rep.route->oifindex))))
+				)
+			{
+				qosmark_t qmark_lo, qmark_hi;
+				qmark_lo.x = qmark.x_us;
+				qmark_hi.x = qmark.x_ds;
+				qmark.x_us = qmark_hi.x; qmark.qosmark_us.ds_flag = 0;
+				qmark.x_ds = qmark_lo.x; qmark.qosmark_ds.ds_flag = 1;
+				cmd.qosconnmark = qmark.x;
+			}
 		}
 #endif
 
@@ -714,24 +716,26 @@ int cmmFeCtUpdate6(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		 * the queue, DSCP marking parameters, and VLAN p-bit settings with the twin connection.
 		 */
 
-		qosconnmark_t qmark;
-		qmark.x = cmd.qosconnmark;
 #if !defined(LS1043)
-		if ( (qmark.qosmark_ds.ds_flag) &&
-			(((ctEntry->fpp_dir & ORIGINATOR) &&
-			(is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_ORIG_COMCERTO_FP_IIF)) &&
-			!is_wan_port_ifindex(ctEntry->orig.route->oifindex))) ||
-		     	((ctEntry->fpp_dir & REPLIER) &&
-			(!is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_REPL_COMCERTO_FP_IIF)) &&
-			is_wan_port_ifindex(ctEntry->rep.route->oifindex))))
-			)
 		{
-			qosmark_t qmark_lo, qmark_hi;
-			qmark_lo.x = qmark.x_us;
-			qmark_hi.x = qmark.x_ds;
-			qmark.x_us = qmark_hi.x; qmark.qosmark_us.ds_flag = 0;
-			qmark.x_ds = qmark_lo.x; qmark.qosmark_ds.ds_flag = 1;
-			cmd.qosconnmark = qmark.x;
+			qosconnmark_t qmark;
+			qmark.x = cmd.qosconnmark;
+			if ( (qmark.qosmark_ds.ds_flag) &&
+				(((ctEntry->fpp_dir & ORIGINATOR) &&
+				(is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_ORIG_COMCERTO_FP_IIF)) &&
+				!is_wan_port_ifindex(ctEntry->orig.route->oifindex))) ||
+				((ctEntry->fpp_dir & REPLIER) &&
+				(!is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_REPL_COMCERTO_FP_IIF)) &&
+				is_wan_port_ifindex(ctEntry->rep.route->oifindex))))
+				)
+			{
+				qosmark_t qmark_lo, qmark_hi;
+				qmark_lo.x = qmark.x_us;
+				qmark_hi.x = qmark.x_ds;
+				qmark.x_us = qmark_hi.x; qmark.qosmark_us.ds_flag = 0;
+				qmark.x_ds = qmark_lo.x; qmark.qosmark_ds.ds_flag = 1;
+				cmd.qosconnmark = qmark.x;
+			}
 		}
 #endif
 

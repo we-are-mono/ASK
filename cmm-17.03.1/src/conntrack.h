@@ -147,8 +147,8 @@
 	int cmmCtNetlinkRemove(struct nfct_handle * handler, struct nf_conntrack *ct);
 	int cmmCtHandle(FCI_CLIENT *fci_handle, int function_code, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);
 
-	int cmmCtShow(struct cli_def * cli, char *command, char *argv[], int argc);
-	int cmmFlowLocalShow(struct cli_def * cli, char *command, char *argv[], int argc);
+	int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc);
+	int cmmFlowLocalShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 
 	u_int64_t cmmQosmarkGet(struct nf_conntrack *ct);
 	void cmmQosmarkSet(struct nf_conntrack *ct, u_int64_t qosmark);
@@ -190,7 +190,7 @@ static __inline u_int32_t HASH_CT(int family, const u_int32_t *Saddr, const u_in
 #define DPI_ENABLE_CMD      1
 
 int cmmDPIFlagSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmmDPIEnableShow(struct cli_def * cli, char *command, char *argv[], int argc);
+int cmmDPIEnableShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 int cmmDPIFlagProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16_t *res_len);
 
 #endif /*C2000_DPI*/
@@ -231,7 +231,7 @@ int cmmDPIFlagProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16_t 
 #define ASYMFF_UNKNOWN_CMD     0
 #define ASYMFF_ENABLE_CMD      1
 int cmmAsymFFSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmmAsymFFEnableShow(struct cli_def * cli, char *command, char *argv[], int argc);
+int cmmAsymFFEnableShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 int cmmAsymFFProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16_t *res_len);
 #endif
 

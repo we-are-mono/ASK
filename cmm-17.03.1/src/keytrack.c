@@ -316,7 +316,7 @@ err0:
 
 /* This function displays the list of local Secure Flows */
 
-int cmmFlowLocalShow( struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFlowLocalShow( struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct FlowEntry *flow;
 	struct list_head *entry;
@@ -1075,7 +1075,6 @@ int cmmUpdateFlowsWithNewSAInfo(struct SATable *pNewSAEntry,unsigned short old_x
 {
 	struct ctTable *ctEntry;
 	struct list_head *entry;
-	struct list_head *entry1;
 	int list_sa_index, dir =0;
 	struct SATable *pSAEntry;
 	unsigned short	*orig_xfrm_handle, *rep_xfrm_handle;
@@ -1891,7 +1890,7 @@ int cmmDPDSAQUERYProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16
 	return 0;
 }
 
-int cmmSaQueryTimerShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmSaQueryTimerShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	if(gSAQueryTimerEnable)
 		cli_print(cli, " The SA query timer is enabled: the current timer value is %d", gSAQueryTimerVal);

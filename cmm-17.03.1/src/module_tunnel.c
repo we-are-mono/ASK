@@ -1078,7 +1078,13 @@ static int tunnel_show(FCI_CLIENT *fci_handle, char *name, u_int16_t *res_buf, u
 		res_buf[0] = CMMD_ERR_OK;
 		pInfo = (struct tunnel_info*)((uint8_t *)res_buf + 4);	
 		pInfo->tunnel_family = itf->tunnel_family;
-		strncpy(pInfo->ifname, itf->ifname, IFNAMSIZ -1);	
+		{
+			size_t len = strlen(itf->ifname);
+			if (len >= IFNAMSIZ)
+				len = IFNAMSIZ - 1;
+			memcpy(pInfo->ifname, itf->ifname, len);
+			pInfo->ifname[len] = '\0';
+		}
 		pInfo->phys_ifindex = itf->phys_ifindex;
 		pInfo->ipsec = (itf->tunnel_flags & TNL_IPSEC);
 		pInfo->itf_programmed = (itf->flags & FPP_PROGRAMMED) ? 1 : 0;

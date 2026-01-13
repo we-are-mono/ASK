@@ -155,11 +155,15 @@ static struct socket *socket_add(cmmd_socket_open_cmd_t *cmd)
 #if defined(LS1043)
 	struct RtEntry *output_route;
 	struct interface *out_itf;
-	struct flow flow = {
-		.family = cmd->family,
-		.sAddr = cmd->daddr,
-		.dAddr = cmd->saddr,
-	};
+	/* Copy addresses to aligned local buffers to avoid packed struct alignment issues */
+	unsigned int saddr_aligned[4], daddr_aligned[4];
+	struct flow flow;
+	memcpy(saddr_aligned, cmd->saddr, sizeof(saddr_aligned));
+	memcpy(daddr_aligned, cmd->daddr, sizeof(daddr_aligned));
+	memset(&flow, 0, sizeof(flow));
+	flow.family = cmd->family;
+	flow.sAddr = daddr_aligned;  /* reverse src and dest addrs for input interface */
+	flow.dAddr = saddr_aligned;
 #endif
 
 

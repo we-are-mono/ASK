@@ -293,7 +293,7 @@ int cmmRelayProcessClientCmd(FCI_CLIENT * fci_handle, int function_code,
  * *
  * *
  * ******************************************************************/
-int cmmRelayLocalShow(struct cli_def *cli, char *command, char *argv[],
+int cmmRelayLocalShow(struct cli_def *cli, const char *command, char *argv[],
                       int argc)
 {
     struct PPPoERelayEntry *temp;

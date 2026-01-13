@@ -37,8 +37,7 @@ struct list_head ct_flow_no_sa_list;
 #endif /* IPSEC_FLOW_CACHE */
 
 struct conntrack_stats ct_stats;
-char *p_nfconn_clone_buf, *p_nfconn_update_buf;
-char *p_nfconn_clone_buf_align, *p_nfconn_update_buf_align;
+struct nf_conntrack *p_nfconn_clone, *p_nfconn_update;
 unsigned char resync_buf[CMM_MAX_64K_BUFF_SIZE];
 
 pthread_mutex_t ctMutex = PTHREAD_MUTEX_INITIALIZER;		/*mutex to prevent race condition on the conntrack table*/
@@ -106,9 +105,8 @@ static void cmmCtSetPermanent(struct nfct_handle * handler, int flags,  struct n
 ******************************************************************/
 static struct nf_conntrack* cmmCtClone( struct nf_conntrack* ct)
 {
-	struct nf_conntrack *CtClone = (struct nf_conntrack* )p_nfconn_clone_buf_align;
-	nfct_copy(CtClone, ct, NFCT_CP_OVERRIDE);
-	return CtClone;
+	nfct_copy(p_nfconn_clone, ct, NFCT_CP_OVERRIDE);
+	return p_nfconn_clone;
 }
 
 /*****************************************************************
@@ -119,14 +117,14 @@ static struct nf_conntrack* cmmCtClone( struct nf_conntrack* ct)
 ******************************************************************/
 static void cmmCtForceUpdate(struct nfct_handle * handler, struct ctTable * ctEntry)
 {
-	struct nf_conntrack *ctTemp = (struct nf_conntrack *)p_nfconn_update_buf_align;
+	struct nf_conntrack *ctTemp = p_nfconn_update;
 	struct nf_conntrack *ct = ctEntry->ct;
 	const unsigned int *Saddr, *Daddr, *SaddrReply, *DaddrReply;
 	unsigned short Sport, Dport, SportReply, DportReply;
 	int family, proto;
 
 
-	memset(ctTemp, 0, nfct_maxsize());
+	nfct_clear(ctTemp);
 
 	family = nfct_get_attr_u8(ct, ATTR_ORIG_L3PROTO);
 	proto = nfct_get_attr_u8(ct, ATTR_ORIG_L4PROTO);
@@ -204,7 +202,7 @@ int cmmCtNetlinkRemove(struct nfct_handle * handler, struct nf_conntrack *ct)
 *
 *
 ******************************************************************/
-int cmmCtShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct ctTable * temp;
 	struct list_head *entry;
@@ -3165,21 +3163,17 @@ int cmmCtInit(struct cmm_ct *ctx)
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
-	p_nfconn_clone_buf = (char *)malloc(nfct_maxsize() + CMM_16B_ALIGN);
-	if (!p_nfconn_clone_buf)
-	{
-		goto err0;
-	}
-	p_nfconn_clone_buf_align = (char *) (((unsigned long) p_nfconn_clone_buf + CMM_16B_ALIGN - 1) &
-							~( CMM_16B_ALIGN - 1));
-	p_nfconn_update_buf = (char *)malloc(nfct_maxsize() + CMM_16B_ALIGN);
-	if (!p_nfconn_update_buf)
+	p_nfconn_clone = nfct_new();
+	if (!p_nfconn_clone)
 	{
 		goto err0;
 	}
 
-	p_nfconn_update_buf_align = (char *) (((unsigned long) p_nfconn_update_buf + CMM_16B_ALIGN - 1) &
-						  ~( CMM_16B_ALIGN - 1));
+	p_nfconn_update = nfct_new();
+	if (!p_nfconn_update)
+	{
+		goto err0;
+	}
 
 	for (i = 0; i < CONNTRACK_HASH_TABLE_SIZE; i++)
 	{
@@ -3490,10 +3484,10 @@ err1:
 	cmmCtKernelModuleUnInit();
 
 err0:
-	if (p_nfconn_update_buf)
-		free(p_nfconn_update_buf);
-	if (p_nfconn_clone_buf)
-		free(p_nfconn_clone_buf);
+	if (p_nfconn_update)
+		nfct_destroy(p_nfconn_update);
+	if (p_nfconn_clone)
+		nfct_destroy(p_nfconn_clone);
 	return -1;
 }
 
@@ -3542,10 +3536,10 @@ void cmmCtExit(struct cmm_ct *ctx)
 #endif
 	cmmCtKernelModuleUnInit();
 
-	if (p_nfconn_update_buf)
-		free(p_nfconn_update_buf);
-	if (p_nfconn_clone_buf)
-		free(p_nfconn_clone_buf);
+	if (p_nfconn_update)
+		nfct_destroy(p_nfconn_update);
+	if (p_nfconn_clone)
+		nfct_destroy(p_nfconn_clone);
 
 	cmm_print(DEBUG_INFO, "%s: exiting\n", __func__);
 }
@@ -3925,7 +3919,7 @@ void cmmQosmarkSet(struct nf_conntrack *ct, u_int64_t qosmark)
 *
 *
 ******************************************************************/
-int cmmDPIEnableShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmDPIEnableShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	if(globalConf.dpi_enable)
 		cli_print(cli, " The DPI flag is enabled");

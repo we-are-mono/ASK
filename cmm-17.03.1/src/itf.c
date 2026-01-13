@@ -24,6 +24,14 @@
 #include <linux/if_vlan.h>
 #include <net/if_arp.h>
 
+/* 4RD (IPv4 Residual Deployment) netlink constants - NXP ASK extension.
+ * These are defined in the ASK-patched kernel but not in glibc headers. */
+#ifndef RTM_NEW4RD
+#define RTM_NEW4RD	97
+#define RTM_DEL4RD	98
+#define RTM_GET4RD	99
+#endif
+
 #include "cmm.h"
 #include "itf.h"
 #include "pppoe.h"
@@ -510,8 +518,6 @@ static void del_itf_bridge_vlan_info(struct interface *itf)
 		vinfo = container_of(entry, struct interface_bridge_vlan_info, list);
 		vinfo_remove(vinfo);
 	}
-
-	return 0;
 }
 
 static void update_itf_bridge_vlan_info(struct interface *itf,  struct ifinfomsg *ifi, struct rtattr *tb, int dellink)
@@ -759,9 +765,9 @@ static struct interface *__itf_add(struct interface_table *ctx, int ifindex)
 #ifdef VLAN_FILTER
 	/* Default vlan filtering configuration */
 	list_head_init(&itf->bridge_vlan_info_list);
+	memset(&vinfo, 0, sizeof(vinfo));
 	vinfo.vid = 1;
-	vinfo.flags |= BRIDGE_VLAN_INFO_PVID;
-	vinfo.flags |= BRIDGE_VLAN_INFO_UNTAGGED;
+	vinfo.flags = BRIDGE_VLAN_INFO_PVID | BRIDGE_VLAN_INFO_UNTAGGED;
 	vinfo_add(itf,&vinfo);
 #endif
 

@@ -20,6 +20,6 @@
 	int cmmMc4SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 	int cmmMc4ProcessClientCmd(FCI_CLIENT* fciMsgHandler, int function_code, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);
 	 int cmmMc4QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-	int cmmMc4Show(struct cli_def * cli, char *command, char *argv[], int argc);
+	int cmmMc4Show(struct cli_def * cli, const char *command, char *argv[], int argc);
 
 #endif

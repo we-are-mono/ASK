@@ -26,7 +26,7 @@ unsigned char Null_Mac[6] = {0,0,0,0,0,0};
 
 extern pthread_mutex_t mc_lock;
 
-int cmmMc6Show(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmMc6Show(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	int count = 0, ii, jj;
 	struct list_head *entry;

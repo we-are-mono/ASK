@@ -247,7 +247,7 @@ err:
 *
 *
 ******************************************************************/
-int cmmPPPoELocalShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmPPPoELocalShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct list_head *entry;
 	struct interface *itf;

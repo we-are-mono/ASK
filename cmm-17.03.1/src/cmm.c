@@ -23,6 +23,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <ucontext.h>
 #if !defined(__UCLIBC__)
 #include <execinfo.h>
 #endif
@@ -30,6 +31,7 @@
 struct cmm_global globalConf;
 unsigned int nf_conntrack_max = CONNTRACK_MAX;
 
+#ifdef ARCH_ARM32
 struct kernel_ucontext {
 	unsigned long     uc_flags;
 	struct kernel_ucontext  *uc_link;
@@ -42,21 +44,26 @@ struct kernel_ucontext {
            coprocessors require eight byte alignment.  */
 	unsigned long     uc_regspace[128] __attribute__((__aligned__(8)));
 };
+#endif
 
 static void cmm_crit_err_hdlr(int sig_num, siginfo_t *info, void *ucontext)
 {
+#ifdef ARCH_ARM32
 	struct sigcontext *sigcontext;
+#else
+	mcontext_t *mctx;
+#endif
 #if !defined(__UCLIBC__)
 	void *array[50];
 	char **messages;
 	int size, i;
 #endif
 
+#ifdef ARCH_ARM32
 	sigcontext = &((struct kernel_ucontext *)ucontext)->uc_mcontext;
 
-#ifdef ARCH_ARM32
 	fprintf(stderr, "\n%s: signal %d (%s), fault address is %p at %p PID %d\n",
-		__func__, sig_num, strsignal(sig_num), info->si_addr, 
+		__func__, sig_num, strsignal(sig_num), info->si_addr,
 		(void *)sigcontext->arm_pc, getpid());
 
 	fprintf(stderr, "register dump:\nr0:%08lx r1:%08lx r2:%08lx r3:%08lx r4:%08lx r5:%08lx r6:%08lx r7:%08lx\n",
@@ -69,19 +76,23 @@ static void cmm_crit_err_hdlr(int sig_num, siginfo_t *info, void *ucontext)
 
 	fprintf(stderr, "cpsr:%08lx fault_address:%08lx\n", sigcontext->arm_cpsr, sigcontext->fault_address);
 #else
+	mctx = &((ucontext_t *)ucontext)->uc_mcontext;
+
 	fprintf(stderr, "\n%s: signal %d (%s), fault address is %p at %p PID %d\n",
                 __func__, sig_num, strsignal(sig_num), info->si_addr,
-                (void *)sigcontext->pc, getpid());
+                (void *)mctx->pc, getpid());
 
 	fprintf (stderr, "register dump:");
 	for (i = 0; i < 31; i++)
 	{
 		if (i%8 == 0)
 			fprintf(stderr, "\n");
-		fprintf(stderr, "r%d:%016llx", i, sigcontext->regs[i]);
+		fprintf(stderr, "r%d:%016llx", i, (unsigned long long)mctx->regs[i]);
 	}
 
-        fprintf(stderr, "pc:%016llx sp:%016llx fault_address:%016llx\n", sigcontext->pc,sigcontext->pc, sigcontext->fault_address);
+        fprintf(stderr, "\npc:%016llx sp:%016llx fault_address:%016llx\n",
+		(unsigned long long)mctx->pc, (unsigned long long)mctx->sp,
+		(unsigned long long)mctx->fault_address);
 
 #endif
 
@@ -92,7 +103,7 @@ static void cmm_crit_err_hdlr(int sig_num, siginfo_t *info, void *ucontext)
 #ifdef ARCH_ARM32
 	array[1] = (void *)sigcontext->arm_pc;
 #else
-	array[1] = (void *)sigcontext->pc;
+	array[1] = (void *)mctx->pc;
 #endif
 
 	messages = backtrace_symbols(array, size);

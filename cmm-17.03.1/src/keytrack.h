@@ -296,6 +296,6 @@ int cmmUpdateFlowsWithNewSAInfo(struct SATable *pNewSAEntry,unsigned short old_x
 #endif /* IPSEC_FLOW_CACHE */
 
 int cmmDPDSaQuerySetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmmSaQueryTimerShow(struct cli_def * cli, char *command, char *argv[], int argc);
+int cmmSaQueryTimerShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 int cmmDPDSAQUERYProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16_t *res_len);
 #endif

@@ -414,8 +414,13 @@ int cmmFeBridgedIfUpdate(FCI_CLIENT *fci_handle, int fd, struct interface *itf)
 	if ((itf->flags & (FPP_PROGRAMMED | FPP_NEEDS_UPDATE)) == FPP_PROGRAMMED)
 		return 0;
 
-	strncpy(br_cmd.ifname, itf->ifname , IFNAMSIZ);
-	STR_TRUNC_END(br_cmd.ifname, IFNAMSIZ);
+	{
+		size_t len = strlen(itf->ifname);
+		if (len >= IFNAMSIZ)
+			len = IFNAMSIZ - 1;
+		memcpy(br_cmd.ifname, itf->ifname, len);
+		br_cmd.ifname[len] = '\0';
+	}
 
 	if (__itf_is_bridged_port(itf))
 	{
@@ -508,7 +513,10 @@ int cmmFeUpdateAllBridgedIfs( FCI_CLIENT *fci_handle, int fd, struct interface *
 	struct list_head *entry;
 	struct interface *itf;
 	short ret = 0;
-	int i, j;
+	int i;
+#ifndef VLAN_FILTER
+	int j;
+#endif
 	/* Search through interface table if there are any
 	 * interface and they are part of bridge then
 	 * update the interfce in FPP with bridge MAC

@@ -59,10 +59,10 @@ cmm_SOURCES = 	neighbor_resolution.c  \
 		module_ipr.c
 
 
-cmm_LDADD = -lpthread -lfci -lcli -lcmm -lpcap @CMM_LIBS@
+cmm_LDADD = -lpthread -lfci -lcli libcmm.la -lpcap @CMM_LIBS@
 
 libcmm_sample_SOURCES = libcmm_sample.c
-libcmm_sample_LDADD = -lcmm
+libcmm_sample_LDADD = libcmm.la
 
 lib_LTLIBRARIES = libcmm.la
 libcmm_la_SOURCES = libcmm.c

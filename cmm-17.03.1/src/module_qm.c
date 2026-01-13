@@ -816,6 +816,7 @@ int qm_get_num(char **keywords, int *pcpt, uint32_t max_val, uint32_t *val, char
 	return QM_SUCCESS;
 }
 
+#ifdef ENABLE_EGRESS_QOS
 static int qm_shaper_cfg(char **keywords, int *pcpt, fpp_qm_shaper_cfg_cmd_t *shaperCmd, daemon_handle_t daemon_handle)
 {
 	union u_rxbuf rxbuf;
@@ -1328,12 +1329,16 @@ static int qm_interface_cfg(char **keywords, int *pcpt, daemon_handle_t daemon_h
 	*pcpt = cpt;
 	return QM_INVALID_KEYWORD;
 }
+#endif /* ENABLE_EGRESS_QOS */
 
 static int qm_exptrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_handle)
 {
 	/* Exception packet rate limit */
 	fpp_qm_expt_rate_cmd_t exptRateCmd;
 	union u_rxbuf rxbuf;
+	/* Use aligned local variable for qm_get_num() to avoid taking
+	 * address of packed struct members (causes alignment issues on arm64) */
+	uint32_t tmp_val;
 
 	if(!keywords[++cpt])
 		return QM_ERROR;
@@ -1343,19 +1348,21 @@ static int qm_exptrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_hand
 		return QM_ERROR;
 	exptRateCmd.if_type = FPP_EXPT_TYPE_ETH;
 	/* Get an integer from the string */
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &exptRateCmd.pkts_per_sec, 
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val,
 		"invalid value for expt rate\n"))
 		return QM_ERROR;
-	if ((exptRateCmd.pkts_per_sec != 0 && 
-		(exptRateCmd.pkts_per_sec < QM_EXPTRATE_MINVAL || exptRateCmd.pkts_per_sec > QM_EXPTRATE_MAXVAL))) {	
+	exptRateCmd.pkts_per_sec = tmp_val;
+	if ((exptRateCmd.pkts_per_sec != 0 &&
+		(exptRateCmd.pkts_per_sec < QM_EXPTRATE_MINVAL || exptRateCmd.pkts_per_sec > QM_EXPTRATE_MAXVAL))) {
 		cmm_print(DEBUG_CRIT, "CMD_QM_EXPT_RATE ERROR: rate must be zero (to disable) or a number between %d and %d\n",
 			QM_EXPTRATE_MINVAL, QM_EXPTRATE_MAXVAL);
 		return QM_ERROR;
 	}
 	cpt--;
 	/* Get an integer from the string*/
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &exptRateCmd.burst_size, "invalid value for burst_size value\n"))
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val, "invalid value for burst_size value\n"))
 		return QM_ERROR;
+	exptRateCmd.burst_size = tmp_val;
 	/* pps values for 64 bytes frames 10 Gbps max */
 	if ((exptRateCmd.burst_size < QM_EXPTRATE_MIN_BS) || (exptRateCmd.burst_size > QM_EXPTRATE_MAX_BS))
 	{
@@ -1375,6 +1382,9 @@ static int qm_exptrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_hand
 static int qm_ffrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_handle)
 {
 	union u_rxbuf rxbuf;
+	/* Use aligned local variable for qm_get_num() to avoid taking
+	 * address of packed struct members (causes alignment issues on arm64) */
+	uint32_t tmp_val;
 
 	/* fast forward rate limit */
 	fpp_qm_ff_rate_cmd_t ffRateCmd;
@@ -1395,15 +1405,16 @@ static int qm_ffrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_handle
 		return QM_ERROR;
 	}
 	strncpy((char *)&ffRateCmd.interface[0], keywords[cpt], IFNAMSIZ);
-	
+
 	if((!keywords[cpt + 1]) || (strcasecmp(keywords[++cpt], "cir") != 0))  {
 		cmm_print(DEBUG_STDERR, "Error : invalid keyword. It expects cir parameter and its value.\n");
 		return QM_ERROR;
 	}
 	/* Get an integer from the string */
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &ffRateCmd.cir, 
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val,
 		"invalid value for port cir rate\n"))
 		return QM_ERROR;
+	ffRateCmd.cir = tmp_val;
 	if ((ffRateCmd.cir < QM_FFRATE_MIN_CIR) || (ffRateCmd.cir > QM_FFRATE_MAX_CIR))
 	{
 		cmm_print(DEBUG_CRIT, "CMD_QM_FF_RATE ERROR: invalid cir rate\n");
@@ -1415,9 +1426,10 @@ static int qm_ffrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_handle
 		return QM_ERROR;
 	}
 	/* Get an integer from the string*/
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &ffRateCmd.pir, 
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val,
 		"invalid value for port pir rate\n"))
 		return QM_ERROR;
+	ffRateCmd.pir = tmp_val;
 	/* pps values for 64 bytes frames 10 Gbps max */
 	if ((ffRateCmd.pir < QM_FFRATE_MIN_PIR) || (ffRateCmd.pir > QM_FFRATE_MAX_PIR))
 	{
@@ -1592,6 +1604,9 @@ help:
 static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_handle)
 {
 	union u_rxbuf rxbuf;
+	/* Use aligned local variable for qm_get_num() to avoid taking
+	 * address of packed struct members (causes alignment issues on arm64) */
+	uint32_t tmp_val;
 
 	/* fast forward rate limit */
 	fpp_qm_sec_rate_cmd_t secRateCmd;
@@ -1614,7 +1629,7 @@ static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_h
 		fpp_qm_ingress_policer_reset_cmd_t resetCmd;
 
 		/* Send FPP_CMD_QM_SEC_POLICER_RESET command */
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_SEC_POLICER_RESET, 
+		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_SEC_POLICER_RESET,
 				&resetCmd, sizeof(fpp_qm_ingress_policer_reset_cmd_t), &rxbuf.rcvBuffer) == 2) {
 
 			if (rxbuf.result != 0) {
@@ -1632,9 +1647,10 @@ static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_h
 		goto help;
 	}
 	/* Get an integer from the string */
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &secRateCmd.cir, 
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val,
 		"invalid value for port cir rate\n"))
 		goto help;
+	secRateCmd.cir = tmp_val;
 
 	if ((secRateCmd.cir < QM_SECRATE_MIN_CIR) || (secRateCmd.cir > QM_SECRATE_MAX_CIR))
 	{
@@ -1647,9 +1663,10 @@ static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_h
 		goto help;
 	}
 	/* Get an integer from the string*/
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &secRateCmd.pir, 
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val,
 		"invalid value for port pir rate\n"))
 		goto help;
+	secRateCmd.pir = tmp_val;
 	/* pps values for 64 bytes frames 10 Gbps max */
 	if ((secRateCmd.pir < QM_SECRATE_MIN_PIR) || (secRateCmd.pir > QM_SECRATE_MAX_PIR))
 	{
@@ -1665,8 +1682,9 @@ static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_h
 		goto help;
 	}
 	/* Get an integer from the string*/
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &secRateCmd.cbs, "invalid value for port cbs value\n"))
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val, "invalid value for port cbs value\n"))
 		goto help;
+	secRateCmd.cbs = tmp_val;
 	/* pps values for 64 bytes frames 10 Gbps max */
 	if ((secRateCmd.cbs < QM_SECRATE_MIN_CBS) || (secRateCmd.cbs > QM_SECRATE_MAX_CBS))
 	{
@@ -1677,10 +1695,11 @@ static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_h
 		cmm_print(DEBUG_STDERR, "Error : invalid keyword. It expects pbs parameter and its value.\n");
 		goto help;
 	}
-	         /* Get an integer from the string*/
-	if (qm_get_num(keywords, &cpt, UINT_MAX, &secRateCmd.pbs, "invalid value for port pbs value\n"))
+	/* Get an integer from the string*/
+	if (qm_get_num(keywords, &cpt, UINT_MAX, &tmp_val, "invalid value for port pbs value\n"))
 		goto help;
-		         /* pps values for 64 bytes frames 10 Gbps max */
+	secRateCmd.pbs = tmp_val;
+	/* pps values for 64 bytes frames 10 Gbps max */
 	if ((secRateCmd.pbs < QM_SECRATE_MIN_PBS) || (secRateCmd.pbs > QM_SECRATE_MAX_PBS))
 	{
 		cmm_print(DEBUG_CRIT, "CMD_QM_SEC_POLICER_PBS ERROR: invalid pbs\n");
@@ -2731,8 +2750,7 @@ help:
 
 void cmmQmResetQ2Prio(fpp_qm_reset_cmd_t *cmdp, int cmdlen)
 {
-	u_int16_t interface;
-	char fname[128], ifname[IFNAMSIZ];
+	char fname[128];
 	FILE *fp;
 
 	if (cmdlen != sizeof(fpp_qm_reset_cmd_t))
@@ -2742,9 +2760,8 @@ void cmmQmResetQ2Prio(fpp_qm_reset_cmd_t *cmdp, int cmdlen)
 		return;
 	}
 
-	interface = cmdp->interface;
-
-	snprintf(fname, 128, "/sys/class/net/%s/q2prio", get_port_name(interface, ifname, IFNAMSIZ));
+	/* cmdp->interface already contains the interface name as a string */
+	snprintf(fname, sizeof(fname), "/sys/class/net/%s/q2prio", (const char *)cmdp->interface);
 	fp = fopen(fname, "w");
 	if (!fp)
 	{

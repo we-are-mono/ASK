@@ -25,7 +25,7 @@
 *
 *
 ******************************************************************/
-int cmmAsymFFEnableShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmAsymFFEnableShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	if(globalConf.asymff_enable)
 		cli_print(cli, " The Asymmetric Fast forward support is enabled");

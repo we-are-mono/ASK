@@ -134,6 +134,10 @@ int l2tp_new_session(FCI_CLIENT *fci_handle, cmmd_l2tp_session_t *cmd, u_int16_t
 	struct interface *itf;
 	int rc = 0;
 	struct socket *s = NULL;
+	/* Aligned local copies to avoid packed struct member address issues on arm64 */
+	u_int32_t peer_addr_aligned[4], local_addr_aligned[4];
+	memcpy(peer_addr_aligned, cmd->peer_addr, sizeof(peer_addr_aligned));
+	memcpy(local_addr_aligned, cmd->local_addr, sizeof(local_addr_aligned));
 
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&rtMutex);
@@ -186,7 +190,7 @@ int l2tp_new_session(FCI_CLIENT *fci_handle, cmmd_l2tp_session_t *cmd, u_int16_t
 	itf->l2tp.local_tun_id = cmd->local_tun_id;
 	itf->l2tp.peer_tun_id = cmd->peer_tun_id;
 
-	s = socket_find_by_addr(cmd->family, cmd->peer_addr, cmd->local_addr, cmd->peer_port, cmd->local_port, IPPROTO_UDP);
+	s = socket_find_by_addr(cmd->family, peer_addr_aligned, local_addr_aligned, cmd->peer_port, cmd->local_port, IPPROTO_UDP);
 	if (!s)	{
 
 		s = malloc(sizeof(struct socket));

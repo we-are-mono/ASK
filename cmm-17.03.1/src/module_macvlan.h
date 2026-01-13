@@ -19,7 +19,7 @@
 void __cmmGetMacVlan(int fd, struct interface *itf);
 int cmmFeMacVlanUpdate(FCI_CLIENT *fci_handle,int fd, int request, struct interface *itf);
 int cmmMacVlanQueryProcess(char **keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmmMacVlanLocalShow(struct cli_def *cli, char *command, char *argv[], int argc);
+int cmmMacVlanLocalShow(struct cli_def *cli, const char *command, char *argv[], int argc);
 
 #endif
 

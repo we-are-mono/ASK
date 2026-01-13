@@ -29,7 +29,7 @@ int * cmm_third_part_init(void)
     return NULL;
 }
 
-
+#ifdef CMM_THIRD_PART
 static void cmm_third_part_cb (void *priv, unsigned short type, void *data, unsigned short *resp_length, unsigned short *resp_payload)
 {
     struct cmm_ct_to_queue_t *msg;
@@ -74,6 +74,7 @@ static void cmm_third_part_cb (void *priv, unsigned short type, void *data, unsi
             break;
     }
 }
+#endif /* CMM_THIRD_PART */
 
 void cmm_third_part_exit(void *priv_data)
 {
@@ -86,7 +87,7 @@ void cmm_third_part_exit(void *priv_data)
     /* free allocated resources */
 }
 
-
+#ifdef CMM_THIRD_PART
 static void cmm_third_part_dump_ct(struct cmm_ct_to_queue_t * msg)
 {
     char saddr_buf[INET6_ADDRSTRLEN], daddr_buf[INET6_ADDRSTRLEN];
@@ -105,6 +106,7 @@ static void cmm_third_part_dump_ct(struct cmm_ct_to_queue_t * msg)
 
     cmm_print(DEBUG_INFO, "mark 0x%" PRIx64 "\n", msg->qosmark);
 }
+#endif /* CMM_THIRD_PART */
 
 
 void cmm_third_part_update(struct ctTable *ctEntry, int dir)

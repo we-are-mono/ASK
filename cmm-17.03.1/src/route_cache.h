@@ -129,8 +129,8 @@
 	struct fpp_rt *__cmmFPPRouteGet(int oifindex, int iifindex, int underlying_iifindex, 
 				const unsigned char *dst_mac, int mtu, const unsigned int *dst_addr, int dst_addr_len);
 
-	int cmmRtShow(struct cli_def * cli, char *command, char *argv[], int argc);
-	int cmmFPPRtShow(struct cli_def * cli, char *command, char *argv[], int argc);
+	int cmmRtShow(struct cli_def * cli, const char *command, char *argv[], int argc);
+	int cmmFPPRtShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 
 	int cmmRtnlRoute(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg);
 	int cmmRtnlRule(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg);

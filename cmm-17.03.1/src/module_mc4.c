@@ -20,7 +20,7 @@
 extern int cmmMcParseListener(char ** keywords, int *cpt, cmmd_mc6_listener_t * listener, u_int8_t * mode, u_int16_t action );
 extern pthread_mutex_t mc_lock;
 
-int cmmMc4Show(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmMc4Show(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	int count = 0, ii, jj;
 	struct list_head *entry;

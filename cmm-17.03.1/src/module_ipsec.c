@@ -42,7 +42,7 @@ static inline unsigned short  getSAHash(unsigned short id)
 }
 
 
-int cmmSAShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmSAShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	int i, count = 0;
 	struct SATable *pSAEntry;
@@ -265,9 +265,6 @@ out:
 
 static int __cmmSARemove(FCI_CLIENT *fci_handle, struct SATable *SAEntry)
 {
-	unsigned short hash;
-	hash = getSAHash(SAEntry->SAInfo.sagd);
-
 	__cmmRouteDeregister(fci_handle, &SAEntry->tnl_rt, "sa");
 
         /* Remove it from the hash table */

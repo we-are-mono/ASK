@@ -83,9 +83,9 @@
 
 	int cmmRtnlNeigh(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg);
 
-	int cmmNeighShow(struct cli_def * cli, char *command, char *argv[], int argc);
+	int cmmNeighShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 #ifdef VLAN_FILTER
-	int cmm_br_get_neigh(char *lladdr, uint32_t br_ifindex, uint16_t vlan);
+	int cmm_br_get_neigh(unsigned char *lladdr, uint32_t br_ifindex, uint16_t vlan);
 #endif
 
 static inline u_int32_t HASH_NEIGHBOR(int family, const u_int32_t *ipaddr)

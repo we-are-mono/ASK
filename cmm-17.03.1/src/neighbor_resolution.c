@@ -137,7 +137,6 @@ err0:
 
 static int get_neigh(const struct sockaddr_nl *nladdr, struct nlmsghdr *nlh, void *arg)
 {
-	struct NeighborEntry *neigh;
 	struct ndmsg *ndm;
 	struct rtattr *attr;
 	uint32_t * out_index = (uint32_t *)arg;
@@ -166,7 +165,7 @@ err:
 
 /* This function returns the index of physical port for given
    neighbour mac, bridge index and  vlan */
-int cmm_br_get_neigh(char *lladdr, uint32_t br_ifindex, uint16_t vlan)
+int cmm_br_get_neigh(unsigned char *lladdr, uint32_t br_ifindex, uint16_t vlan)
 {
 	struct rtnl_handle rth;
 	struct ndmsg ndm = {
@@ -181,7 +180,6 @@ int cmm_br_get_neigh(char *lladdr, uint32_t br_ifindex, uint16_t vlan)
 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
 	uint32_t out_index = 0;
 	char ifname[IFNAMSIZ];
-	int rc;
 
 	if(!lladdr)
 		goto err0;
@@ -205,7 +203,7 @@ int cmm_br_get_neigh(char *lladdr, uint32_t br_ifindex, uint16_t vlan)
 		goto err1;
 	}
 
-	rc = cmm_rtnl_listen(&rth, get_neigh, &out_index);
+	(void)cmm_rtnl_listen(&rth, get_neigh, &out_index);
 	cmm_print(DEBUG_STDOUT, "%s: outgoing interaface is %s\n", __func__, if_indextoname(out_index,ifname));
 
 	cmm_rtnl_close(&rth);
@@ -665,7 +663,7 @@ err:
 *
 *
 ******************************************************************/
-int cmmNeighShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmNeighShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	int i;
 	struct NeighborEntry *temp;

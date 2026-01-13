@@ -526,7 +526,7 @@ err:
 *
 *
 ******************************************************************/
-int cmmFPPRtShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmFPPRtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct fpp_rt *route;
 	struct list_head *entry;
@@ -573,7 +573,7 @@ int cmmFPPRtShow(struct cli_def * cli, char *command, char *argv[], int argc)
 *
 *
 ******************************************************************/
-int cmmRtShow(struct cli_def * cli, char *command, char *argv[], int argc)
+int cmmRtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct RtEntry *route;
 	struct list_head *entry;
