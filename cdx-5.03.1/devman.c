@@ -26,6 +26,7 @@
 #include <linux/spinlock.h>
 #include <linux/if_arp.h>
 #include "fm_vsp_ext.h"
+#include "fm_port_ext.h"
 #include "lnxwrp_fm.h"
 #include <linux/fsl_oh_port.h>
 #include "dpaa_eth.h"
