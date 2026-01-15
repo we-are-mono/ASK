@@ -10,6 +10,8 @@
  *
  *
  */
+/* Include cmm.h first to ensure musl headers set guards before kernel headers (musl compat) */
+#include "cmm.h"
 #include <libnetfilter_conntrack/libnetfilter_conntrack.h>
 #include <libnetfilter_conntrack/libnetfilter_conntrack_tcp.h>
 
@@ -18,10 +20,8 @@
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <linux/if_packet.h>
-#include <linux/if_ether.h>
+/* linux/if_ether.h removed - ethhdr already defined via cmm.h -> net/ethernet.h */
 #include <netinet/icmp6.h>
-
-#include "cmm.h"
 #include "itf.h"
 #include "forward_engine.h"
 #include "neighbor_resolution.h"

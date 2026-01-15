@@ -24,7 +24,8 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <ucontext.h>
-#if !defined(__UCLIBC__)
+/* backtrace() is a glibc extension, not available in musl or uClibc */
+#if defined(__GLIBC__) && !defined(__UCLIBC__)
 #include <execinfo.h>
 #endif
 
@@ -52,11 +53,12 @@ static void cmm_crit_err_hdlr(int sig_num, siginfo_t *info, void *ucontext)
 	struct sigcontext *sigcontext;
 #else
 	mcontext_t *mctx;
+	int i;
 #endif
-#if !defined(__UCLIBC__)
+#if defined(__GLIBC__) && !defined(__UCLIBC__)
 	void *array[50];
 	char **messages;
-	int size, i;
+	int size;
 #endif
 
 #ifdef ARCH_ARM32
@@ -96,7 +98,7 @@ static void cmm_crit_err_hdlr(int sig_num, siginfo_t *info, void *ucontext)
 
 #endif
 
-#if !defined(__UCLIBC__)
+#if defined(__GLIBC__) && !defined(__UCLIBC__)
 	size = backtrace(array, 50);
 
 	/* overwrite sigaction with caller's address */

@@ -1955,7 +1955,6 @@ static enum qman_cb_dqrr_result vap_rx_fwd_pkt(struct qman_portal *portal, struc
 #ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
 	struct dpa_priv_s               *priv = vwd.eth_priv;
 	struct dpa_percpu_priv_s        *percpu_priv;
-	struct dpa_bp	*dpa_bp = priv->dpa_bp;
 
 	DPA_BUG_ON(priv);
 	/* IRQ handler, non-migratable; safe to use raw_cpu_ptr here */

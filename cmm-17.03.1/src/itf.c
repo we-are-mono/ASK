@@ -10,6 +10,8 @@
  *
  *
  */
+/* Include cmm.h first to ensure musl headers set guards before kernel headers (musl compat) */
+#include "cmm.h"
 #include <string.h>
 #include <errno.h>
 #include <net/if.h>
@@ -31,8 +33,6 @@
 #define RTM_DEL4RD	98
 #define RTM_GET4RD	99
 #endif
-
-#include "cmm.h"
 #include "itf.h"
 #include "pppoe.h"
 #include "ffbridge.h"

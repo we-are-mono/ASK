@@ -9,21 +9,17 @@
 #
 PLATFORM?=LS1043A
 
-# Support both KERNELDIR (build dir) and KERNEL_SRC (source dir) for Yocto
-# If KERNEL_SRC not set, try $(KERNELDIR)/source symlink (Yocto pattern)
-KERNEL_SRC ?= $(KERNELDIR)/source
-ifeq ($(wildcard $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_fman),)
-# Fallback to KERNELDIR if source symlink doesn't exist
-KERNEL_SRC := $(KERNELDIR)
-endif
-
-# Include netcomm SW specific definitions
+# Include netcomm SW specific definitions from kernel source tree.
+# Use $(srctree) which Kbuild provides, pointing to kernel source directory.
+# Only include when srctree is set (i.e., when Kbuild invokes us).
 KERNELVERSION?=6.12
+ifneq ($(srctree),)
 ifeq ($(KERNELVERSION),3.19.3)
-include $(KERNEL_SRC)/drivers/net/ethernet/freescale/fman/ncsw_config.mk
+include $(srctree)/drivers/net/ethernet/freescale/fman/ncsw_config.mk
 else
 #### This path is for kernel version 4.1.8+ and 6.12
-include $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_fman/ncsw_config.mk
+include $(srctree)/drivers/net/ethernet/freescale/sdk_fman/ncsw_config.mk
+endif
 endif
 
 
@@ -37,32 +33,23 @@ modules clean:
 	make CROSS_COMPILE=$(CROSS_COMPILE) V=1 ARCH=$(ARCH) CFG_FLAGS="$(CFG_FLAGS)" -C $(KERNELDIR) M=`pwd` $@
 
 ####included for dpa offload
+# Note: Most include paths are already provided by ncsw_config.mk above.
+# Only add paths that ncsw_config.mk doesn't provide.
 
 ifeq ($(KERNELVERSION),3.19.3)
-FMAN_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/fman
-DPAA_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/dpa
+FMAN_DRIVER_PATH = $(srctree)/drivers/net/ethernet/freescale/fman
 else
 #### This driver path is for kernel version 4.1.8+ and 6.12
-FMAN_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_fman
-DPAA_DRIVER_PATH = $(KERNEL_SRC)/drivers/net/ethernet/freescale/sdk_dpaa
+FMAN_DRIVER_PATH = $(srctree)/drivers/net/ethernet/freescale/sdk_fman
 endif
 
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/inc
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/inc/etc
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/inc/cores
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/inc/Peripherals
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/inc/flib
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/inc/integrations/T4240
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/inc
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/inc/wrapper
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/inc/system
-EXTRA_CFLAGS += -I$(FMAN_DRIVER_PATH)/src/wrapper
-EXTRA_CFLAGS += -I$(KERNEL_SRC)/drivers/crypto/caam
-EXTRA_CFLAGS += -I$(DPAA_DRIVER_PATH)
-EXTRA_CFLAGS += $(CFG_FLAGS)
+# Additional include paths not covered by ncsw_config.mk
+ccflags-y += -I$(FMAN_DRIVER_PATH)/src/wrapper
+ccflags-y += -I$(srctree)/drivers/crypto/caam
+ccflags-y += $(CFG_FLAGS)
 
-#EXTRA_CFLAGS += -DDPAA_DEBUG_ENABLE
-EXTRA_CFLAGS +=  -DDPA_IPSEC_OFFLOAD
+#ccflags-y += -DDPAA_DEBUG_ENABLE
+ccflags-y +=  -DDPA_IPSEC_OFFLOAD
 
 dpa_if_objs = devman.o\
                  cdx_debug.o\
@@ -89,7 +76,7 @@ dpa_if_objs = devman.o\
 
 ####end of includes
 
-EXTRA_CFLAGS += -Werror -I$(src) -DENDIAN_LITTLE -DGCC_TOOLCHAIN
+ccflags-y += -Werror -I$(src) -DENDIAN_LITTLE -DGCC_TOOLCHAIN
 
 EXTRA_LDFLAGS += 
 

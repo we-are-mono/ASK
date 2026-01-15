@@ -16,6 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
+#include <linux/string.h>
 #include "linux/netdevice.h"
 #include "portdefs.h"
 #include "dpaa_eth.h"
@@ -1851,18 +1852,23 @@ static int create_ethernet_hm(struct ins_entry_info *info, uint32_t update_ethty
 	*(info->opcptr) = INSERT_L2_HDR;
 	info->opc_count++;
 	info->opcptr++;
+	/* l2param->l2hdr is a flexible array member (uint8_t l2hdr[0]) so
+	 * FORTIFY_SOURCE sees it as zero-size. Use unsafe_memcpy to bypass
+	 * FORTIFY checks - actual buffer allocated beyond struct with size
+	 * validated by hdrlen calculation above. */
 	if (l2_info->add_pppoe_hdr) {
 		//if pppoe header required, replace dest with ac conc address
-		memcpy(&l2param->l2hdr[0], &l2_info->ac_mac_addr[0],
-				ETHER_ADDR_LEN);
+		unsafe_memcpy(l2param->l2hdr, l2_info->ac_mac_addr, ETHER_ADDR_LEN,
+			"flexible array with caller-validated allocation");
 	} else {
 		//if no pppoe header required, replace dest with gw address
-		memcpy(&l2param->l2hdr[0], &l2_info->l2hdr[0],
-				ETHER_ADDR_LEN);
+		unsafe_memcpy(l2param->l2hdr, l2_info->l2hdr, ETHER_ADDR_LEN,
+			"flexible array with caller-validated allocation");
 	}
 	// write source address
-	memcpy(&l2param->l2hdr[ETHER_ADDR_LEN], &l2_info->l2hdr[ETHER_ADDR_LEN],
-			ETHER_ADDR_LEN);
+	unsafe_memcpy(l2param->l2hdr + ETHER_ADDR_LEN,
+			l2_info->l2hdr + ETHER_ADDR_LEN, ETHER_ADDR_LEN,
+			"flexible array with caller-validated allocation");
 	*(uint16_t*) (&l2param->l2hdr[2*ETHER_ADDR_LEN]) = htons(info->eth_type);
 
 	return SUCCESS;
