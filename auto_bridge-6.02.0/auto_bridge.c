@@ -201,7 +201,7 @@ resched:
 	queue_delayed_work(kabm_wq, &abm_work_retransmit, abm_retransmit_time);
 }
 
-int add_brevent(struct brevent_fdb_update * fdb_update)
+static int add_brevent(struct brevent_fdb_update * fdb_update)
 {
 	struct br_event_table *brtable_entry;
 						
@@ -224,7 +224,7 @@ int add_brevent(struct brevent_fdb_update * fdb_update)
 * Can be called from mostly any context. Events to user-space are not sent here.
 *
 ****************************************************************************/
-int abm_br_event(struct notifier_block *unused, unsigned long event, void *ptr){
+static int abm_br_event(struct notifier_block *unused, unsigned long event, void *ptr){
 	int work_to_do = 0;
 
 	if (event == BREVENT_PORT_DOWN) {
@@ -312,7 +312,7 @@ struct notifier_block abm_br_notifier = {
 * Return 0 if an entry is fast-forwarded, 1 otherwise
 *
 ****************************************************************************/
-int abm_fdb_can_expire(unsigned char *mac_addr, struct net_device *dev)
+static int abm_fdb_can_expire(unsigned char *mac_addr, struct net_device *dev)
 {
 	int key;
 	struct l2flowTable *table_entry;
@@ -1285,7 +1285,7 @@ struct abm_seq_state{
 	unsigned int bucket;
 };
 
-struct l2flowTable * abm_get_first(struct seq_file *seq)
+static struct l2flowTable * abm_get_first(struct seq_file *seq)
 {
 	struct abm_seq_state *state = seq->private;
 	int bucket = 0;
@@ -1302,7 +1302,7 @@ struct l2flowTable * abm_get_first(struct seq_file *seq)
 	return NULL; // Not found 
 }
 
-struct l2flowTable * abm_get_next(struct seq_file *seq, struct l2flowTable *table_entry)
+static struct l2flowTable * abm_get_next(struct seq_file *seq, struct l2flowTable *table_entry)
 {
 	struct abm_seq_state *state = seq->private;
 	struct list_head *entry;
@@ -1328,7 +1328,7 @@ struct l2flowTable * abm_get_next(struct seq_file *seq, struct l2flowTable *tabl
 	return NULL; // Not found 
 }
 
-struct l2flowTable * abm_get_idx(struct seq_file *seq, loff_t *pos)
+static struct l2flowTable * abm_get_idx(struct seq_file *seq, loff_t *pos)
 {
 	loff_t idxpos = *pos; // > 1
 	struct l2flowTable * entry = abm_get_first(seq);
@@ -1346,7 +1346,7 @@ struct l2flowTable * abm_get_idx(struct seq_file *seq, loff_t *pos)
 	return entry;
 }
 
-void * abm_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+static void * abm_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
 	void *rc;
 	

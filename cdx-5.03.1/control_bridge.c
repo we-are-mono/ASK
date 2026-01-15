@@ -89,7 +89,10 @@ static int M_bridge_expire_l2_flow_entry(struct L2Flow_entry *entry)
 	// Prepare indication message
 	memset(message, 0 , sizeof(*message));
 	message->action =  ACTION_REMOVED;
-	memcpy(message->destaddr, entry->l2flow.da, 2 * ETHER_ADDR_LEN);
+	/* Copy dest and src MAC addresses separately to avoid FORTIFY_SOURCE
+	 * warning about writing 12 bytes into a 6-byte field */
+	memcpy(message->destaddr, entry->l2flow.da, ETHER_ADDR_LEN);
+	memcpy(message->srcaddr, entry->l2flow.sa, ETHER_ADDR_LEN);
 	message->ethertype = entry->l2flow.ethertype;
 	message->svlan_tag = entry->l2flow.svlan_tag;
 	message->cvlan_tag = entry->l2flow.cvlan_tag;
