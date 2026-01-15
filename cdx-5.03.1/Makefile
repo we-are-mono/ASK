@@ -11,14 +11,15 @@ PLATFORM?=LS1043A
 
 # Include netcomm SW specific definitions from kernel source tree.
 # Use $(srctree) which Kbuild provides, pointing to kernel source directory.
-# This is required for out-of-tree module builds where KERNEL_SRC variable
-# may not be correctly passed through to the Kbuild context.
+# Only include when srctree is set (i.e., when Kbuild invokes us).
 KERNELVERSION?=6.12
+ifneq ($(srctree),)
 ifeq ($(KERNELVERSION),3.19.3)
 include $(srctree)/drivers/net/ethernet/freescale/fman/ncsw_config.mk
 else
 #### This path is for kernel version 4.1.8+ and 6.12
 include $(srctree)/drivers/net/ethernet/freescale/sdk_fman/ncsw_config.mk
+endif
 endif
 
 

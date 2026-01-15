@@ -16,7 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
-#include <linux/fortify-string.h>
+#include <linux/string.h>
 #include "linux/netdevice.h"
 #include "portdefs.h"
 #include "dpaa_eth.h"
