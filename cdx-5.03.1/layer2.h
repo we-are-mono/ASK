@@ -77,11 +77,13 @@ typedef struct _tRouteEntry {
 #define RT_F_EXTRA_INFO 0x1
 
 #define IS_NULL_ROUTE(pRoute) (!(pRoute))
-/* In the case of C2000 control or C2000 the structures hw_route and hw_route_4o6 are the same  
-till the  first word of the Dstn address, so we can safely typecast the route to type hw_route *
-and pass the address of Daddr_v4, even for the 4o6 case. */
-
-#define ROUTE_EXTRA_INFO(rt) ((void *)(&(rt)->Daddr_v4))
+/* ROUTE_EXTRA_INFO returns a pointer to the destination address union.
+ * We use Daddr_v6 (16 bytes) instead of Daddr_v4 (4 bytes) because:
+ * - Both are in a union at the same memory address
+ * - The 4o6 tunnel code copies IPV6_ADDRESS_LENGTH (16) bytes here
+ * - Using Daddr_v4 triggers FORTIFY_SOURCE buffer overflow detection
+ *   since the compiler sees a 16-byte write into a 4-byte field */
+#define ROUTE_EXTRA_INFO(rt) ((void *)(&(rt)->Daddr_v6))
 
 
 typedef struct tOnifDesc {
