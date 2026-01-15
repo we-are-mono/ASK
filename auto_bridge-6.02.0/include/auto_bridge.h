@@ -13,8 +13,17 @@
 #ifndef _AUTO_BRIDGE_H
 #define _AUTO_BRIDGE_H
 
+#ifdef __KERNEL__
 #include <linux/if_ether.h>
 #include <linux/types.h>
+#else
+/* Userspace: avoid musl struct ethhdr redefinition by not including
+ * <linux/if_ether.h>. Only ETH_ALEN is needed from that header. */
+#include <sys/types.h>
+#ifndef ETH_ALEN
+#define ETH_ALEN 6
+#endif
+#endif
 
 #ifndef NETLINK_L2FLOW
 #define NETLINK_L2FLOW             33

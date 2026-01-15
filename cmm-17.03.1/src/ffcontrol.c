@@ -20,7 +20,7 @@
 #include <signal.h>
 #include <ctype.h>
 
-#include <bits/sockaddr.h>
+/* bits/sockaddr.h is glibc internal, use sys/socket.h (already included) */
 #include <asm/types.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>

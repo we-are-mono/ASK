@@ -11,12 +11,12 @@
  *
  */
 
+/* Include cmm.h first to get netinet/in.h before linux/in6.h (musl compat) */
+#include "cmm.h"
 #include <net/if.h>
 #if defined (LS1043)
 #include <linux/xfrm.h>
 #endif
-
-#include "cmm.h"
 #include "fpp.h"
 #include "cmmd.h"
 #include "module_ipsec.h"
