@@ -77,10 +77,11 @@ static DECLARE_DELAYED_WORK(abm_work_retransmit, abm_do_work_retransmit);
 
 static unsigned int l2flow_timeouts[L2FLOW_STATE_MAX] /*__read_mostly*/ = {
 	[L2FLOW_STATE_SEEN]			= 10 SECS,
-	[L2FLOW_STATE_CONFIRMED]		= 2 MINS, 
+	[L2FLOW_STATE_CONFIRMED]		= 2 MINS,
 	[L2FLOW_STATE_LINUX]			= 10 SECS,
 	[L2FLOW_STATE_DYING]			= 2 MINS, // This state is here to give some time for retransmission
 };
+
 
 static const char *const l2flow_states_string[L2FLOW_STATE_MAX] __read_mostly = {
 	[L2FLOW_STATE_SEEN]			= "SEEN",
@@ -1504,7 +1505,9 @@ static void  abm_proc_fini(void)
 *
 ****************************************************************************/
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
 struct ctl_table_header * abm_sysctl_hdr;
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,11,0)
 static int abm_sysctl_l3_filtering(const struct ctl_table *ctl, int write,
@@ -1529,10 +1532,10 @@ static int abm_sysctl_l3_filtering(ctl_table *ctl, int write,
 	if (write && *valp != val) {
 		if(((!old_abm_l3_filtering) && *valp) || (old_abm_l3_filtering && (!*valp))){
 			abm_l2flow_table_flush();
-			
+
 			if((rc = abm_nl_send_rst_msg(abm_nl)) < 0)
 				ABM_PRINT(KERN_ERR, " Netlink send rst msg error = %d\n", rc);
-			
+
 		}
 		abm_l3_filtering = (*valp) ? 1 : 0;
 	}
@@ -1545,13 +1548,8 @@ struct ctl_path abm_sysctl_path[] = {
 	{ .procname = "abm", },
 	{ }
 };
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
-static struct ctl_table abm_sysctl_table[] = 
-#else
-static ctl_table abm_sysctl_table[] = 
-#endif
+static ctl_table abm_sysctl_table[] =
 {
 	{
 		.procname	= "abm_l3_filtering",
@@ -1603,14 +1601,24 @@ static ctl_table abm_sysctl_table[] =
 		.proc_handler	= proc_dointvec,
 	},
 };
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
 static int __net_init abm_net_init(struct net *net)
 {
+	/*
+	 * Only register sysctls for init_net. The sysctl data points to
+	 * module global variables, which is only safe for the initial
+	 * network namespace. Non-init namespaces would trigger the
+	 * kernel's ensure_safe_net_sysctl() check.
+	 */
+	if (!net_eq(net, &init_net))
+		return 0;
+
 	abm_sysctl_hdr = register_net_sysctl(net, "net/abm", abm_sysctl_table);
-	if (!abm_sysctl_hdr)
-	{
+	if (!abm_sysctl_hdr) {
 		printk(KERN_ERR "%s():: Auto bridge module sysctl init failed:\n", __func__);
+		return -ENOMEM;
 	}
 
 	return 0;
@@ -1618,13 +1626,14 @@ static int __net_init abm_net_init(struct net *net)
 
 static void __net_exit abm_net_exit(struct net *net)
 {
-	if (abm_sysctl_hdr == NULL)
+	if (!net_eq(net, &init_net))
 		return;
 
-	unregister_net_sysctl_table(abm_sysctl_hdr);
+	if (abm_sysctl_hdr)
+		unregister_net_sysctl_table(abm_sysctl_hdr);
 }
 
-static struct pernet_operations __net_initdata abm_net_ops = {
+static struct pernet_operations abm_net_ops = {
 	.init	= abm_net_init,
 	.exit	= abm_net_exit,
 };
@@ -1633,17 +1642,22 @@ static struct pernet_operations __net_initdata abm_net_ops = {
 static int __init abm_sysctl_init(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
-	register_pernet_subsys(&abm_net_ops);
+	return register_pernet_subsys(&abm_net_ops);
 #else
 	if((abm_sysctl_hdr = register_net_sysctl_table(&init_net, abm_sysctl_path,
 						abm_sysctl_table)) == NULL)
 		return -1;
-#endif
 
 	return 0;
+#endif
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
+static void abm_sysctl_fini(void)
+{
+	unregister_pernet_subsys(&abm_net_ops);
+}
+#else
 static void abm_sysctl_fini(void)
 {
 	unregister_net_sysctl_table(abm_sysctl_hdr);
