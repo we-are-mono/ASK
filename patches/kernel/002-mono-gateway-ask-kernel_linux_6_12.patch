@@ -1,23 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tzaman@zaman.io>
-Date: Sat, 24 Jan 2026 02:17:11 +0100
-Subject: [PATCH] ASK: Port NXP ASK kernel modifications to Linux 6.12
+Date: Mon, 30 Mar 2026 20:30:07 +0200
+Subject: [PATCH] Port NXP ASK to Linux 6.12 with UAPI header fixes
 
-This patch ports the NXP Advanced Switching Kit (ASK) modifications
-to the Linux 6.12 kernel. The ASK provides hardware-accelerated packet
-processing for Layerscape platforms including:
+Port NXP Application Solutions Kit modifications to Linux 6.12:
+- DPAA/FMAN driver enhancements for fast-path offloading
+- IPsec hardware offload (IPv4 + IPv6)
+- Netfilter QoS marking extensions (QOSMARK, QOSCONNMARK)
+- Bridge fast-path integration
+- QBMan portal NAPI support
+- 4RD and EtherIP tunnel support
+- PPP/PPPoE offload hooks
 
-- DPAA (Data Path Acceleration Architecture) ethernet driver enhancements
-- Frame Manager (FMan) SDK driver modifications
-- QBMan (Queue/Buffer Manager) driver updates
-- IPsec offload support for both IPv4 and IPv6
-- Netfilter QoS marking extensions
-- Bridge and network core modifications for fast path
+Fix UAPI header sanitization: remove all CONFIG_* guards from
+userspace-visible headers (if.h, if_arp.h, if_tunnel.h, ip6_tunnel.h,
+nf_conntrack_common.h, nf_conntrack_tuple_common.h, nfnetlink_conntrack.h,
+netlink.h, pfkeyv2.h, ppp-ioctl.h, rtnetlink.h). These defines are now
+unconditional in UAPI headers, fixing `make headers_install` failures.
 
-Removed dead code guarded by CONFIG_CPE_NATT which was never defined
-in any Kconfig file.
-
-Upstream-Status: Inappropriate [NXP vendor kernel modifications]
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ Makefile                                      |    5 +
+ drivers/crypto/caam/pdb.h                     |   12 +-
+ .../net/ethernet/freescale/sdk_dpaa/Kconfig   |    6 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    |   51 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   21 +-
+ .../freescale/sdk_dpaa/dpaa_eth_ceetm.c       |    1 +
+ .../freescale/sdk_dpaa/dpaa_eth_common.c      |  131 +-
+ .../freescale/sdk_dpaa/dpaa_eth_common.h      |   40 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  967 ++++++-
+ .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
+ .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
+ drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
+ .../freescale/sdk_dpaa/offline_port.c         |   53 +
+ .../net/ethernet/freescale/sdk_fman/Kconfig   |   12 +
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  220 ++
+ .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
+ .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
+ .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
+ .../sdk_fman/Peripherals/FM/Pcd/Makefile      |    7 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 2286 ++++++++++++++---
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |  130 +
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1378 ++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1987 ++++++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |   21 +
+ .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    |  125 +
+ .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.c      |  296 ++-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.h      |   40 +
+ .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c     |   13 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h     |    1 +
+ .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  155 +-
+ .../sdk_fman/Peripherals/FM/Port/fm_port.h    |    3 +
+ .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   35 +
+ .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
+ .../freescale/sdk_fman/Peripherals/FM/fm.c    |   77 +-
+ .../sdk_fman/Peripherals/FM/fm_muram.c        |   49 +-
+ .../sdk_fman/Peripherals/FM/inc/fm_common.h   |  116 +-
+ .../sdk_fman/Peripherals/FM/inc/fm_hc.h       |   17 +
+ .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
+ .../ethernet/freescale/sdk_fman/etc/memcpy.c  |   19 +
+ .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1690 ++++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ext.h         |   47 +
+ .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  156 +-
+ .../sdk_fman/inc/Peripherals/fm_port_ext.h    |   19 +
+ .../sdk_fman/inc/Peripherals/fm_vsp_ext.h     |   14 +
+ .../freescale/sdk_fman/inc/flib/fsl_fman.h    |    1 +
+ .../sdk_fman/inc/flib/fsl_fman_port.h         |    4 +-
+ .../freescale/sdk_fman/inc/stdlib_ext.h       |   47 +-
+ .../freescale/sdk_fman/ls1043_dflags.h        |    2 +
+ .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   12 +-
+ .../src/inc/wrapper/lnxwrp_fsl_fman.h         |    2 +
+ .../freescale/sdk_fman/src/system/sys_io.c    |    4 +
+ .../sdk_fman/src/wrapper/lnxwrp_fm.c          |   27 +
+ .../sdk_fman/src/wrapper/lnxwrp_fm.h          |    3 +-
+ .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |    9 +-
+ .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |   49 +-
+ .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |    8 +
+ .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c    |  192 ++
+ .../src/wrapper/lnxwrp_sysfs_fm_port.c        |    8 +-
+ .../freescale/sdk_fman/src/xx/xx_arm_linux.c  |    7 +
+ drivers/net/ppp/ppp_generic.c                 |   12 +
+ drivers/net/ppp/pppoe.c                       |   23 +
+ drivers/net/usb/usbnet.c                      |   23 +-
+ drivers/staging/fsl_qbman/Kconfig             |    7 +
+ drivers/staging/fsl_qbman/fsl_usdpaa.c        |    2 +-
+ drivers/staging/fsl_qbman/qman_config.c       |    2 +
+ drivers/staging/fsl_qbman/qman_high.c         |  121 +-
+ include/linux/fsl_oh_port.h                   |   26 +
+ include/linux/fsl_qman.h                      |    6 +
+ include/linux/if_bridge.h                     |   17 +
+ include/linux/netdevice.h                     |   29 +
+ include/linux/poll.h                          |    1 -
+ include/linux/skbuff.h                        |   15 +
+ include/net/ip.h                              |    3 +
+ include/net/ip6_tunnel.h                      |    7 +-
+ include/net/netfilter/nf_conntrack.h          |   52 +-
+ include/net/netns/xfrm.h                      |    3 +
+ include/net/tcp.h                             |    5 +
+ include/net/xfrm.h                            |   47 +
+ .../uapi/linux/fmd/Peripherals/fm_ioctls.h    |   28 +
+ .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   39 +
+ include/uapi/linux/if.h                       |    3 +
+ include/uapi/linux/if_arp.h                   |    1 +
+ include/uapi/linux/if_tunnel.h                |   25 +
+ include/uapi/linux/ip6_tunnel.h               |   46 +
+ .../linux/netfilter/nf_conntrack_common.h     |   11 +-
+ .../netfilter/nf_conntrack_tuple_common.h     |    1 +
+ .../linux/netfilter/nfnetlink_conntrack.h     |   18 +
+ include/uapi/linux/netfilter/xt_QOSCONNMARK.h |   10 +
+ include/uapi/linux/netfilter/xt_QOSMARK.h     |    6 +
+ include/uapi/linux/netfilter/xt_qosconnmark.h |   35 +
+ include/uapi/linux/netfilter/xt_qosmark.h     |   19 +
+ include/uapi/linux/netlink.h                  |    6 +-
+ include/uapi/linux/pfkeyv2.h                  |    1 +
+ include/uapi/linux/ppp-ioctl.h                |    1 +
+ include/uapi/linux/rtnetlink.h                |    8 +
+ net/Kconfig                                   |    9 +
+ net/bridge/br.c                               |   54 +
+ net/bridge/br_fdb.c                           |   60 +
+ net/bridge/br_forward.c                       |    6 +-
+ net/bridge/br_input.c                         |   12 +
+ net/bridge/br_private.h                       |   10 +
+ net/bridge/br_stp_if.c                        |    4 +
+ net/bridge/br_vlan.c                          |   20 +-
+ net/core/dev.c                                |   81 +-
+ net/core/gro.c                                |    5 +
+ net/core/rtnetlink.c                          |   19 +
+ net/core/skbuff.c                             |   52 +-
+ net/ipv4/Kconfig                              |    6 +
+ net/ipv4/ip_output.c                          |   38 +-
+ net/ipv4/ip_tunnel.c                          |    3 +
+ net/ipv4/xfrm4_policy.c                       |   13 +
+ net/ipv6/Kconfig                              |    6 +
+ net/ipv6/ip6_output.c                         |   31 +-
+ net/ipv6/ip6_tunnel.c                         |  676 ++++-
+ net/ipv6/netfilter/ip6t_NPT.c                 |   29 +
+ net/ipv6/output_core.c                        |   19 +
+ net/ipv6/sit.c                                |    3 +
+ net/ipv6/udp.c                                |    1 -
+ net/ipv6/xfrm6_policy.c                       |   10 +
+ net/key/af_key.c                              |  886 +++++++
+ net/netfilter/Kconfig                         |   24 +
+ net/netfilter/Makefile                        |    3 +
+ net/netfilter/comcerto_fp_netfilter.c         |  494 ++++
+ net/netfilter/nf_conntrack_core.c             |   75 +-
+ net/netfilter/nf_conntrack_netlink.c          |  173 +-
+ net/netfilter/nf_conntrack_proto_tcp.c        |    4 +
+ net/netfilter/nf_conntrack_standalone.c       |   13 +
+ net/netfilter/xt_qosconnmark.c                |  171 ++
+ net/netfilter/xt_qosmark.c                    |   85 +
+ net/wireless/Kconfig                          |    6 +-
+ net/wireless/wext-core.c                      |    3 +
+ net/xfrm/Makefile                             |    1 +
+ net/xfrm/ipsec_flow.c                         |  221 ++
+ net/xfrm/ipsec_flow.h                         |   31 +
+ net/xfrm/xfrm_input.c                         |   14 +
+ net/xfrm/xfrm_output.c                        |   95 +
+ net/xfrm/xfrm_policy.c                        |   94 +
+ net/xfrm/xfrm_state.c                         |  165 ++
+ net/xfrm/xfrm_user.c                          |    4 +
+ tools/perf/.gitignore                         |    1 -
+ 142 files changed, 14549 insertions(+), 571 deletions(-)
+ create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
+ create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
+ create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
+ create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
+ create mode 100644 include/linux/fsl_oh_port.h
+ create mode 100644 include/uapi/linux/netfilter/xt_QOSCONNMARK.h
+ create mode 100644 include/uapi/linux/netfilter/xt_QOSMARK.h
+ create mode 100644 include/uapi/linux/netfilter/xt_qosconnmark.h
+ create mode 100644 include/uapi/linux/netfilter/xt_qosmark.h
+ create mode 100644 net/netfilter/comcerto_fp_netfilter.c
+ create mode 100644 net/netfilter/xt_qosconnmark.c
+ create mode 100644 net/netfilter/xt_qosmark.c
+ create mode 100644 net/xfrm/ipsec_flow.c
+ create mode 100644 net/xfrm/ipsec_flow.h
 
 diff --git a/Makefile b/Makefile
 index 66ae67c52da8..a1d4113d3f65 100644
@@ -14011,72 +14170,64 @@ index c24f471bda76..5a9eda9a40b7 100644
  } ioc_fm_pcd_hash_table_params_t;
  
 diff --git a/include/uapi/linux/if.h b/include/uapi/linux/if.h
-index 797ba2c1562a..a8f014702f42 100644
+index 797ba2c1562a..ba46e4f8b021 100644
 --- a/include/uapi/linux/if.h
 +++ b/include/uapi/linux/if.h
-@@ -104,6 +104,9 @@ enum net_device_flags {
+@@ -104,6 +104,7 @@ enum net_device_flags {
  	IFF_DORMANT			= 1<<17, /* volatile */
  	IFF_ECHO			= 1<<18, /* volatile */
  #endif /* __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO */
-+#if defined(CONFIG_CPE_FAST_PATH)
 +	IFF_WIFI_OFLD		= 1<<19, /*Offload interface */
-+#endif
  };
  #endif /* __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO != 0 || __UAPI_DEF_IF_NET_DEVICE_FLAGS != 0 */
  
-@@ -133,6 +136,10 @@ enum net_device_flags {
+@@ -133,6 +134,8 @@ enum net_device_flags {
  #define IFF_ECHO			IFF_ECHO
  #endif /* __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO */
  
-+#if defined(CONFIG_CPE_FAST_PATH)
 +#define IFF_WIFI_OFLD		IFF_WIFI_OFLD
-+#endif
 +
  #define IFF_VOLATILE	(IFF_LOOPBACK|IFF_POINTOPOINT|IFF_BROADCAST|IFF_ECHO|\
  		IFF_MASTER|IFF_SLAVE|IFF_RUNNING|IFF_LOWER_UP|IFF_DORMANT)
  
 diff --git a/include/uapi/linux/if_arp.h b/include/uapi/linux/if_arp.h
-index 4783af9fe520..a876f01dff07 100644
+index 4783af9fe520..822e21ba5ebb 100644
 --- a/include/uapi/linux/if_arp.h
 +++ b/include/uapi/linux/if_arp.h
-@@ -29,6 +29,9 @@
+@@ -29,6 +29,7 @@
  /* ARP protocol HARDWARE identifiers. */
  #define ARPHRD_NETROM	0		/* from KA9Q: NET/ROM pseudo	*/
  #define ARPHRD_ETHER 	1		/* Ethernet 10Mbps		*/
-+#if defined(CONFIG_CPE_FAST_PATH)
 +#define ARPHRD_IPV6_IPV6_TUNNEL		ARPHRD_ETHER
-+#endif
  #define	ARPHRD_EETHER	2		/* Experimental Ethernet	*/
  #define	ARPHRD_AX25	3		/* AX.25 Level 2		*/
  #define	ARPHRD_PRONET	4		/* PROnet token ring		*/
 diff --git a/include/uapi/linux/if_tunnel.h b/include/uapi/linux/if_tunnel.h
-index e1a246dd8c62..69656f018bbb 100644
+index e1a246dd8c62..92b65ea7bc1f 100644
 --- a/include/uapi/linux/if_tunnel.h
 +++ b/include/uapi/linux/if_tunnel.h
-@@ -21,6 +21,18 @@
- #define SIOCADD6RD      (SIOCDEVPRIVATE + 9)
+@@ -22,6 +22,16 @@
  #define SIOCDEL6RD      (SIOCDEVPRIVATE + 10)
  #define SIOCCHG6RD      (SIOCDEVPRIVATE + 11)
-+#ifdef CONFIG_CPE_4RD_TUNNEL
+ 
 +#define SIOCGET4RD		(SIOCDEVPRIVATE + 12)
 +#define SIOCADD4RD		(SIOCDEVPRIVATE + 13)
 +#define SIOCDEL4RD		(SIOCDEVPRIVATE + 14)
 +#define SIOCCHG4RD		(SIOCDEVPRIVATE + 15)
-+#endif
 +//#define COMCERTO_ETHERIPV4
-+#ifdef CONFIG_CPE_ETHERIP
++
 +/* SIOCCHG4RD is currently not used and even if it were, these two tunnels would never co-inside*/
 +/* MSPD Added */
 +#define SIOCISETHIPV4TUNNEL  (SIOCDEVPRIVATE + 15)
-+#endif
- 
++
  #define GRE_CSUM	__cpu_to_be16(0x8000)
  #define GRE_ROUTING	__cpu_to_be16(0x4000)
-@@ -114,6 +126,22 @@ struct ip_tunnel_6rd {
+ #define GRE_KEY		__cpu_to_be16(0x2000)
+@@ -114,6 +124,21 @@ struct ip_tunnel_6rd {
  	__u16			relay_prefixlen;
  };
  
-+#ifdef CONFIG_CPE_4RD_TUNNEL
++
 +/* ip6 tnl 4rd parm -start  */
 +struct ip6_tnl_4rd {
 +	__be32                  prefix;
@@ -14090,20 +14241,18 @@ index e1a246dd8c62..69656f018bbb 100644
 +	__u16                   entry_num;
 +};
 +/* ip6 tnl 4rd parm -end  */
-+#endif
 +
  enum {
  	IFLA_GRE_UNSPEC,
  	IFLA_GRE_LINK,
 diff --git a/include/uapi/linux/ip6_tunnel.h b/include/uapi/linux/ip6_tunnel.h
-index 0245269b037c..a8e5aaa50313 100644
+index 0245269b037c..3fb6f7cda3bc 100644
 --- a/include/uapi/linux/ip6_tunnel.h
 +++ b/include/uapi/linux/ip6_tunnel.h
-@@ -53,4 +53,52 @@ struct ip6_tnl_parm2 {
+@@ -53,4 +53,50 @@ struct ip6_tnl_parm2 {
  	__be32			o_key;
  };
  
-+#ifdef CONFIG_CPE_4RD_TUNNEL
 +struct ip6_4rd_map_msg {
 +	__u32 reset;
 +	__u32 ifindex;
@@ -14148,19 +14297,17 @@ index 0245269b037c..a8e5aaa50313 100644
 +	struct list_head map_list;
 +	rwlock_t map_lock;
 +};
-+#endif
+ #endif
 +#endif
 +
- #endif
 diff --git a/include/uapi/linux/netfilter/nf_conntrack_common.h b/include/uapi/linux/netfilter/nf_conntrack_common.h
-index 26071021e986..8960c093dc8e 100644
+index 26071021e986..8dd5f5dd842d 100644
 --- a/include/uapi/linux/netfilter/nf_conntrack_common.h
 +++ b/include/uapi/linux/netfilter/nf_conntrack_common.h
-@@ -118,6 +118,16 @@ enum ip_conntrack_status {
+@@ -118,6 +118,14 @@ enum ip_conntrack_status {
  	IPS_HW_OFFLOAD_BIT = 15,
  	IPS_HW_OFFLOAD = (1 << IPS_HW_OFFLOAD_BIT),
  
-+#ifdef CONFIG_CPE_FAST_PATH
 +	/* Connection cannot expire */
 +	IPS_PERMANENT_BIT = 16,
 +	IPS_PERMANENT = (1 << IPS_PERMANENT_BIT),
@@ -14168,24 +14315,20 @@ index 26071021e986..8960c093dc8e 100644
 +	/* Connection is assured by DPI application */
 +	IPS_DPI_ALLOWED_BIT = 17,
 +	IPS_DPI_ALLOWED = (1 << IPS_DPI_ALLOWED_BIT),
-+#endif
 +
  	/* Be careful here, modifying these bits can make things messy,
  	 * so don't let users modify them directly.
  	 */
-@@ -126,7 +136,11 @@ enum ip_conntrack_status {
+@@ -126,7 +134,7 @@ enum ip_conntrack_status {
  				 IPS_SEQ_ADJUST | IPS_TEMPLATE | IPS_UNTRACKED |
  				 IPS_OFFLOAD | IPS_HW_OFFLOAD),
  
-+#ifdef CONFIG_CPE_FAST_PATH
+-	__IPS_MAX_BIT = 16,
 +	__IPS_MAX_BIT = 18,
-+#else
- 	__IPS_MAX_BIT = 16,
-+#endif
  };
  
  /* Connection tracking event types */
-@@ -143,6 +157,7 @@ enum ip_conntrack_events {
+@@ -143,6 +151,7 @@ enum ip_conntrack_events {
  	IPCT_NATSEQADJ = IPCT_SEQADJ,
  	IPCT_SECMARK,		/* new security mark has been set */
  	IPCT_LABEL,		/* new connlabel has been set */
@@ -14194,41 +14337,36 @@ index 26071021e986..8960c093dc8e 100644
  #ifdef __KERNEL__
  	__IPCT_MAX
 diff --git a/include/uapi/linux/netfilter/nf_conntrack_tuple_common.h b/include/uapi/linux/netfilter/nf_conntrack_tuple_common.h
-index 64390fac6f7e..88ad3a41c2c5 100644
+index 64390fac6f7e..a928825586a8 100644
 --- a/include/uapi/linux/netfilter/nf_conntrack_tuple_common.h
 +++ b/include/uapi/linux/netfilter/nf_conntrack_tuple_common.h
-@@ -14,6 +14,9 @@ enum ip_conntrack_dir {
+@@ -14,6 +14,7 @@ enum ip_conntrack_dir {
  	IP_CT_DIR_MAX
  };
  
-+#ifdef CONFIG_CPE_4RD_TUNNEL
 +#define IP_NAT_RANGE_4RD_NAPT 16
-+#endif
  /* The protocol-specific manipulable parts of the tuple: always in
   * network order
   */
 diff --git a/include/uapi/linux/netfilter/nfnetlink_conntrack.h b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
-index c2ac7269acf7..49f0dc31c1d8 100644
+index c2ac7269acf7..977b7ba64b7c 100644
 --- a/include/uapi/linux/netfilter/nfnetlink_conntrack.h
 +++ b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
-@@ -57,6 +57,12 @@ enum ctattr_type {
+@@ -57,6 +57,10 @@ enum ctattr_type {
  	CTA_SYNPROXY,
  	CTA_FILTER,
  	CTA_STATUS_MASK,
-+#if defined(CONFIG_CPE_FAST_PATH)
 +	CTA_LAYERSCAPE_FP_ORIG,
 +	CTA_LAYERSCAPE_FP_REPLY,
 +	CTA_QOSCONNMARK,
 +	CTA_QOSCONNMARK_PAD,
-+#endif
  	__CTA_MAX
  };
  #define CTA_MAX (__CTA_MAX - 1)
-@@ -242,6 +248,22 @@ enum ctattr_secctx {
+@@ -242,6 +246,20 @@ enum ctattr_secctx {
  };
  #define CTA_SECCTX_MAX (__CTA_SECCTX_MAX - 1)
  
-+#if defined(CONFIG_CPE_FAST_PATH)
 +enum ctattr_comcerto_fp {
 +	CTA_COMCERTO_FP_UNSPEC,
 +	CTA_COMCERTO_FP_MARK,
@@ -14242,7 +14380,6 @@ index c2ac7269acf7..49f0dc31c1d8 100644
 +	__CTA_COMCERTO_FP_MAX
 +};
 +#define CTA_COMCERTO_FP_MAX (__CTA_COMCERTO_FP_MAX - 1)
-+#endif
 +
  enum ctattr_stats_cpu {
  	CTA_STATS_UNSPEC,
@@ -14342,21 +14479,17 @@ index 000000000000..6f80bd016c40
 +
 +
 diff --git a/include/uapi/linux/netlink.h b/include/uapi/linux/netlink.h
-index f87aaf28a649..75b0b7099cce 100644
+index f87aaf28a649..b21fa5669175 100644
 --- a/include/uapi/linux/netlink.h
 +++ b/include/uapi/linux/netlink.h
-@@ -30,9 +30,17 @@
+@@ -30,9 +30,13 @@
  #define NETLINK_CRYPTO		21	/* Crypto layer */
  #define NETLINK_SMC		22	/* SMC monitoring */
  
-+#ifdef CONFIG_CPE_FAST_PATH
 +#define NETLINK_FF              30
 +#define NETLINK_KEY             32
 +#define NETLINK_L2FLOW          33
 +#define MAX_LINKS 64
-+#else
-+#define MAX_LINKS 32       
-+#endif
 +
  #define NETLINK_INET_DIAG	NETLINK_SOCK_DIAG
  
@@ -14365,51 +14498,45 @@ index f87aaf28a649..75b0b7099cce 100644
  struct sockaddr_nl {
  	__kernel_sa_family_t	nl_family;	/* AF_NETLINK	*/
 diff --git a/include/uapi/linux/pfkeyv2.h b/include/uapi/linux/pfkeyv2.h
-index 8abae1f6749c..6472850001cd 100644
+index 8abae1f6749c..e92494a1ac99 100644
 --- a/include/uapi/linux/pfkeyv2.h
 +++ b/include/uapi/linux/pfkeyv2.h
-@@ -281,6 +281,9 @@ struct sadb_x_filter {
+@@ -281,6 +281,7 @@ struct sadb_x_filter {
  #define SADB_SAFLAGS_NOPMTUDISC	0x20000000
  #define SADB_SAFLAGS_DECAP_DSCP	0x40000000
  #define SADB_SAFLAGS_NOECN	0x80000000
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 +#define SADB_SAFLAGS_ESN	0x01000000
-+#endif
  
  /* Security Association states */
  #define SADB_SASTATE_LARVAL	0
 diff --git a/include/uapi/linux/ppp-ioctl.h b/include/uapi/linux/ppp-ioctl.h
-index 1cc5ce0ae062..debf115544d9 100644
+index 1cc5ce0ae062..d1869d3f1bd4 100644
 --- a/include/uapi/linux/ppp-ioctl.h
 +++ b/include/uapi/linux/ppp-ioctl.h
-@@ -117,6 +117,9 @@ struct pppol2tp_ioc_stats {
+@@ -117,6 +117,7 @@ struct pppol2tp_ioc_stats {
  #define PPPIOCGL2TPSTATS _IOR('t', 54, struct pppol2tp_ioc_stats)
  #define PPPIOCBRIDGECHAN _IOW('t', 53, int)	/* bridge one channel to another */
  #define PPPIOCUNBRIDGECHAN _IO('t', 52)	/* unbridge channel */
-+#if defined(CONFIG_CPE_FAST_PATH)
 +#define PPPIOCSFPPIDLE	_IOW('t', 51, struct ppp_idle)	/* Set the FPP stats */
-+#endif
  
  #define SIOCGPPPSTATS   (SIOCDEVPRIVATE + 0)
  #define SIOCGPPPVER     (SIOCDEVPRIVATE + 1)	/* NEVER change this!! */
 diff --git a/include/uapi/linux/rtnetlink.h b/include/uapi/linux/rtnetlink.h
-index db7254d52d93..729d6ac8b11f 100644
+index db7254d52d93..ab4a21042a3b 100644
 --- a/include/uapi/linux/rtnetlink.h
 +++ b/include/uapi/linux/rtnetlink.h
-@@ -151,6 +151,16 @@ enum {
+@@ -151,6 +151,14 @@ enum {
  
  	RTM_NEWCACHEREPORT = 96,
  #define RTM_NEWCACHEREPORT RTM_NEWCACHEREPORT
-+/*#ifdef CONFIG_CPE_4RD_TUNNEL
-+	These defines should be enabled irrespective of CONFIG_CPE_4RD_TUNNEL is defined or not
-+	this is to enable CMM build to pass*/
++/* 4RD tunnel support */
 +	RTM_NEW4RD = 97,
 +#define RTM_NEW4RD		RTM_NEW4RD
 +	RTM_DEL4RD,
 +#define RTM_DEL4RD		RTM_DEL4RD
 +	RTM_GET4RD,
 +#define RTM_GET4RD		RTM_GET4RD
-+/*#endif*/
++
  
  	RTM_NEWCHAIN = 100,
  #define RTM_NEWCHAIN RTM_NEWCHAIN
@@ -14499,7 +14626,7 @@ index ed08717541fe..346524427218 100644
  module_exit(br_deinit)
  MODULE_LICENSE("GPL");
 diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
-index 642b8ccaae8e..f140ac15f68b 100644
+index 642b8ccaae8e..d295d1f896a2 100644
 --- a/net/bridge/br_fdb.c
 +++ b/net/bridge/br_fdb.c
 @@ -14,6 +14,10 @@
@@ -14549,7 +14676,7 @@ index 642b8ccaae8e..f140ac15f68b 100644
 @@ -567,6 +590,17 @@ void br_fdb_cleanup(struct work_struct *work)
  			continue;
  		}
-
+ 
 +#if defined(CONFIG_CPE_FAST_PATH)
 +		spin_lock(&br_fdb_cb_lock);
 +		if (br_fdb_can_expire && f->dst &&
@@ -14564,7 +14691,7 @@ index 642b8ccaae8e..f140ac15f68b 100644
  		if (time_after(this_timer, now)) {
  			work_delay = min(work_delay, this_timer - now);
  		} else {
-@@ -915,6 +948,14 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+@@ -915,6 +949,14 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
  			/* fastpath: update of existing entry */
  			if (unlikely(source != READ_ONCE(fdb->dst) &&
  				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
@@ -14579,7 +14706,7 @@ index 642b8ccaae8e..f140ac15f68b 100644
  				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
  				WRITE_ONCE(fdb->dst, source);
  				fdb_modified = true;
-@@ -1554,3 +1595,21 @@ void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
+@@ -1554,3 +1596,21 @@ void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
  	spin_unlock_bh(&p->br->hash_lock);
  }
  EXPORT_SYMBOL_GPL(br_fdb_clear_offload);
