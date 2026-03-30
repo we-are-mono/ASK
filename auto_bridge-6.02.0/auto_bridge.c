@@ -11,7 +11,6 @@
  *
  */
  
-#include <linux/version.h>
 #include <linux/socket.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -140,11 +139,7 @@ static void abm_do_work_send_msg(struct work_struct *work)
 		if (brtable_entry->brdev)
 		{
 			rtnl_lock();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,17,0)
 			rtmsg_ifinfo(RTM_NEWLINK, brtable_entry->brdev, 0, GFP_ATOMIC, 0, NULL);
-#else
-			rtmsg_ifinfo(RTM_NEWLINK, brtable_entry->brdev, 0, GFP_ATOMIC);
-#endif
 			rtnl_unlock();
 		}
 		list_del(&brtable_entry->list_rtevent);
@@ -269,15 +264,9 @@ static int abm_br_event(struct notifier_block *unused, unsigned long event, void
 			table_entry = container_of(entry, struct l2flowTable, list_by_dst_mac);
 			/* Send the event in every other state different than DYING */
 			/* There is no issue sending more events than needed */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
 			if (ether_addr_equal(fdb_update->mac_addr, table_entry->l2flow.daddr)
 			&& (fdb_update->dev->ifindex != table_entry->odev_ifi)
 			&& (table_entry->state != L2FLOW_STATE_DYING)) 
-#else
-			if (!compare_ether_addr(fdb_update->mac_addr, table_entry->l2flow.daddr)
-			&& (fdb_update->dev->ifindex != table_entry->odev_ifi)
-			&& (table_entry->state != L2FLOW_STATE_DYING)) 
-#endif
 			{
 				table_entry->odev_ifi = fdb_update->dev->ifindex;
 
@@ -324,13 +313,8 @@ static int abm_fdb_can_expire(unsigned char *mac_addr, struct net_device *dev)
 	spin_lock(&abm_lock);
 	list_for_each(entry,  &l2flow_table_by_src_mac[key]){
 		table_entry = container_of(entry, struct l2flowTable, list_by_src_mac);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
 		if (ether_addr_equal(mac_addr, table_entry->l2flow.saddr)
 		&& (dev->ifindex == table_entry->idev_ifi))
-#else
-		if(!compare_ether_addr(mac_addr, table_entry->l2flow.saddr)
-		&& (dev->ifindex == table_entry->idev_ifi))
-#endif
 		{
 			if(table_entry->state == L2FLOW_STATE_FF){
 				spin_unlock(&abm_lock);
@@ -385,11 +369,7 @@ static int abm_nl_send_rst_msg(struct sock *s)
 	nlmsg_end(skb, nlh);
 
 	if (netlink_has_listeners(s, L2FLOW_NL_GRP)){
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,7,0)
 		NETLINK_CB(skb).portid = 0;	/* from kernel */
-#else
-		NETLINK_CB(skb).pid = 0;	/* from kernel */
-#endif
 		NETLINK_CB(skb).dst_group = L2FLOW_NL_GRP;
 
 		return netlink_broadcast(s, skb, 0, L2FLOW_NL_GRP, GFP_KERNEL);
@@ -478,11 +458,7 @@ static int abm_nl_send_l2flow_msg(struct sock *s, char action, int flags, struct
 	nlmsg_end(skb, nlh);
 	
 	if (netlink_has_listeners(s, L2FLOW_NL_GRP)){
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,7,0)
 		NETLINK_CB(skb).portid = 0;	/* from kernel */
-#else
-		NETLINK_CB(skb).pid = 0;	/* from kernel */
-#endif
 		NETLINK_CB(skb).dst_group = L2FLOW_NL_GRP;
 
 		return netlink_broadcast(s, skb, 0, L2FLOW_NL_GRP, GFP_ATOMIC);
@@ -508,11 +484,7 @@ err:
 * Handle NL message from user-space
 * 
 ****************************************************************************/
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
 static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netlink_ext_ack *ext )
-#else
-static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
-#endif
 {
 	int type, err = 0;
 	struct l2flow l2flow_temp;
@@ -526,11 +498,7 @@ static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 		goto out;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
 	err = nlmsg_parse(nlh, sizeof(*l2flow_msg), tb, L2FLOWA_MAX, NULL, NULL);
-#else
-	err = nlmsg_parse(nlh, sizeof(*l2flow_msg), tb, L2FLOWA_MAX, NULL);
-#endif
 	if(err < 0)
 		goto out;
 	
@@ -634,15 +602,9 @@ static void __abm_go_dying(struct l2flowTable *table_entry)
 * Timers callback
 *
 ****************************************************************************/
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 static void  abm_death_by_timeout(struct timer_list *t)
 {
     struct l2flowTable *table_entry = from_timer(table_entry, t, timeout);
-#else
-static void  abm_death_by_timeout(unsigned long arg)
-{
-    struct l2flowTable *table_entry = (struct l2flowTable *)arg;
-#endif
 	
 	spin_lock_bh(&abm_lock);
 	__abm_go_dying(table_entry);
@@ -652,28 +614,17 @@ static void  abm_death_by_timeout(unsigned long arg)
 
 static int abm_nl_init(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,7,0)
 	struct netlink_kernel_cfg cfg = {
 		.groups	  = L2FLOW_NL_GRP,
 		.input	  = abm_nl_rcv_skb,
 	};
 	abm_nl = netlink_kernel_create(&init_net, NETLINK_L2FLOW, &cfg);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
-	if((abm_nl = netlink_kernel_create (&init_net, NETLINK_L2FLOW, L2FLOW_NL_GRP, 
-				abm_nl_rcv_skb, NULL, THIS_MODULE)) == 0)
-		return -ENOMEM;
-						
-#endif
-#endif
 
 	return 0;
 }
 static void abm_nl_exit(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
 	netlink_kernel_release(abm_nl);
-#endif
 }
 /***************************************************************************
 *
@@ -822,11 +773,7 @@ static struct l2flowTable * abm_l2flow_add(struct l2flow *l2flowtmp)
 	memset(l2flow_entry, 0, sizeof(*l2flow_entry));
 	memcpy(&l2flow_entry->l2flow, l2flowtmp, sizeof(*l2flowtmp));
 	/* Timer not yet started here */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
 	timer_setup(&l2flow_entry->timeout, abm_death_by_timeout, 0);
-#else
-    setup_timer(&l2flow_entry->timeout, abm_death_by_timeout, (unsigned long) l2flow_entry);
-#endif
 	
 	list_add(&l2flow_entry->list, &l2flow_table[key]);
 	list_add(&l2flow_entry->list_by_src_mac, &l2flow_table_by_src_mac[key_src_mac]);
@@ -905,13 +852,8 @@ static inline int abm_build_l2flow(struct sk_buff *skb, struct l2flow *l2flow_te
 		if ( rc < 0)
 			return rc;
 #endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
 		if (skb_vlan_tag_present(skb)) {
 			l2flow_temp->svlan_tag = htons(skb_vlan_tag_get(skb));
-#else
-		if (vlan_tx_tag_present(skb)) {
-			l2flow_temp->svlan_tag = htons(vlan_tx_tag_get(skb));
-#endif
 			if ((vlan_eth_h = vlan_eth_hdr(skb))!= NULL) {
 			/* vlan_eth_h->h_vlan_proto is not matched ETH_P_8021Q then cvlan_tag set to 0 (already initialized to 0)*/
 				if (vlan_eth_h->h_vlan_proto == htons(ETH_P_8021Q)) {
@@ -976,9 +918,7 @@ static inline int abm_build_l2flow(struct sk_buff *skb, struct l2flow *l2flow_te
 			struct ipv6hdr *ip6h;
 			struct ipv6hdr _ip6h;
 			uint8_t nexthdr;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
 			__be16 frag_off;
-#endif
 			
 			ip6h = skb_header_pointer(skb, 0, sizeof(_ip6h), &_ip6h);
 			if(!ip6h)
@@ -988,11 +928,7 @@ static inline int abm_build_l2flow(struct sk_buff *skb, struct l2flow *l2flow_te
 			memcpy(l2flow_temp->l3.daddr.ip6, ip6h->daddr.s6_addr, 16);
 			nexthdr = ip6h->nexthdr;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
 			l3_hdr_len = ipv6_skip_exthdr(skb, sizeof(_ip6h), &nexthdr, &frag_off);
-#else
-			l3_hdr_len = ipv6_skip_exthdr(skb, sizeof(_ip6h), &nexthdr);
-#endif
 			if(l3_hdr_len == -1)
 				return -1;
 			
@@ -1022,48 +958,19 @@ static inline int abm_build_l2flow(struct sk_buff *skb, struct l2flow *l2flow_te
 * Core l2flow detection mechanism
 *
 ****************************************************************************/
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 static unsigned int abm_ebt_hook(void *priv,
 			struct sk_buff *skb,
 			const struct nf_hook_state *state)
 
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
-static unsigned int abm_ebt_hook(const struct nf_hook_ops *ops,
-			struct sk_buff *skb,
-			const struct nf_hook_state *state)
-
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
-static unsigned int abm_ebt_hook(const struct nf_hook_ops *ops,
-			struct sk_buff *skb,
-			const struct net_device *in,
-			const struct net_device *out,
-			int (*okfn)(struct sk_buff *))
-#else
-static unsigned int abm_ebt_hook(unsigned int hooknum,
-			struct sk_buff *skb,
-			const struct net_device *in,
-			const struct net_device *out,
-			int (*okfn)(struct sk_buff *))
-#endif
 {
 	struct l2flow l2flow_temp;
 	struct l2flowTable *l2flow_entry;
 	unsigned short ethertype;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 	unsigned int hooknum = state->hook;
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
-	unsigned int hooknum = ops->hooknum;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
 	const struct net_device* in = state->in;
 	const struct net_device* out = state->out;
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
 	if (skb_vlan_tag_present(skb))
-#else
-	if (vlan_tx_tag_present(skb))
-#endif
 		ethertype = htons(ETH_P_8021Q);
 	else
 		ethertype = eth_hdr(skb)->h_proto;
@@ -1157,18 +1064,12 @@ exit0:
 static struct nf_hook_ops abm_ebt_ops[] /*__read_mostly*/ = {
 	{
 		.hook		= abm_ebt_hook,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
-		.owner		= THIS_MODULE,
-#endif
 		.pf		= NFPROTO_BRIDGE,
 		.hooknum	= NF_BR_FORWARD,
 		.priority		= NF_BR_PRI_LAST,
 	},
 	{
 		.hook		= abm_ebt_hook,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
-		.owner		= THIS_MODULE,
-#endif
 		.pf		= NFPROTO_BRIDGE,
 		.hooknum	= NF_BR_POST_ROUTING,
 		.priority		= NF_BR_PRI_LAST - 1,  //Just before bridge_netilter hook
@@ -1444,43 +1345,18 @@ static const struct seq_operations abm_seq_ops = {
 	.stop   = abm_seq_stop,
 	.show   = abm_seq_show,
 };
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,18,0)
-static int abm_seq_open(struct inode *inode, struct file *file)
-{
-	return seq_open_net(inode, file, &abm_seq_ops,
-			    sizeof(struct abm_seq_state));
-}
-
-static const struct file_operations abm_seq_fops = {
-	.owner		= THIS_MODULE,
-	.open		= abm_seq_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release		= seq_release_net,
-};
-#endif
 
 static int __init abm_proc_init(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,18,0)
     if (!proc_create_net("abm", S_IRUGO, init_net.proc_net, &abm_seq_ops,
                     sizeof(struct seq_net_private)))
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0)
-	if (!proc_create("abm", S_IRUGO, init_net.proc_net, &abm_seq_fops))
-#else
-	if (!proc_net_fops_create(&init_net, "abm", S_IRUGO, &abm_seq_fops))
-#endif
 		return -ENOMEM;
 	return 0;
 }
 
 static void  abm_proc_fini(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,9,0)
 	remove_proc_entry("abm", init_net.proc_net);
-#else
-	proc_net_remove(&init_net, "abm");
-#endif
 }
 
 #else /* CONFIG_PROC_FS */
@@ -1497,7 +1373,6 @@ static void  abm_proc_fini(void)
 
 #endif /* CONFIG_PROC_FS */
 
-#ifdef CONFIG_SYSCTL
 /***************************************************************************
 *
 *    Sysctl implementation
@@ -1505,23 +1380,11 @@ static void  abm_proc_fini(void)
 *
 ****************************************************************************/
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
-struct ctl_table_header * abm_sysctl_hdr;
-#endif
+static struct ctl_table_header *abm_sysctl_hdr;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,11,0)
 static int abm_sysctl_l3_filtering(const struct ctl_table *ctl, int write,
 				  void *buffer,
 				  size_t *lenp, loff_t *ppos)
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
-static int abm_sysctl_l3_filtering(struct ctl_table *ctl, int write,
-				  void __user *buffer,
-				  size_t *lenp, loff_t *ppos)
-#else
-static int abm_sysctl_l3_filtering(ctl_table *ctl, int write,
-				  void __user *buffer,
-				  size_t *lenp, loff_t *ppos)
-#endif
 {
 	int *valp = ctl->data;
 	int val = *valp;
@@ -1542,15 +1405,8 @@ static int abm_sysctl_l3_filtering(ctl_table *ctl, int write,
 	return ret;
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
-struct ctl_path abm_sysctl_path[] = {
-	{ .procname = "net", },
-	{ .procname = "abm", },
-	{ }
-};
 
-static ctl_table abm_sysctl_table[] =
-{
+static struct ctl_table abm_sysctl_table[] = {
 	{
 		.procname	= "abm_l3_filtering",
 		.data		= &abm_l3_filtering,
@@ -1582,28 +1438,26 @@ static ctl_table abm_sysctl_table[] =
 	{
 		.procname	= "abm_timeout_dying",
 		.data		= &l2flow_timeouts[L2FLOW_STATE_DYING],
-		.maxlen 	= sizeof(unsigned int),
+		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_jiffies,
 	},
 	{
 		.procname	= "abm_retransmit_delay",
 		.data		= &abm_retransmit_time,
-		.maxlen 		= sizeof(unsigned int),
+		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_jiffies,
 	},
 	{
 		.procname	= "abm_max_entries",
 		.data		= &abm_max_entries,
-		.maxlen 		= sizeof(unsigned int),
+		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec,
 	},
 };
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
 static int __net_init abm_net_init(struct net *net)
 {
 	/*
@@ -1637,45 +1491,17 @@ static struct pernet_operations abm_net_ops = {
 	.init	= abm_net_init,
 	.exit	= abm_net_exit,
 };
-#endif
 
 static int __init abm_sysctl_init(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
 	return register_pernet_subsys(&abm_net_ops);
-#else
-	if((abm_sysctl_hdr = register_net_sysctl_table(&init_net, abm_sysctl_path,
-						abm_sysctl_table)) == NULL)
-		return -1;
-
-	return 0;
-#endif
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
 static void abm_sysctl_fini(void)
 {
 	unregister_pernet_subsys(&abm_net_ops);
 }
-#else
-static void abm_sysctl_fini(void)
-{
-	unregister_net_sysctl_table(abm_sysctl_hdr);
-}
-#endif
 
-#else
-static int __init abm_sysctl_init(void)
-{
-	return 0;
-}
-
-static void abm_sysctl_fini(void)
-{
-
-}
-
-#endif
 
 /***************************************************************************
 *
@@ -1710,11 +1536,7 @@ static int abm_init(void)
 		ABM_PRINT(KERN_ERR, "Automatic bridging module error can't create sysctl rc = %d \n", rc);
 		return rc;
 	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
 	if((rc = nf_register_net_hooks(&init_net, abm_ebt_ops, ARRAY_SIZE(abm_ebt_ops))) < 0){
-#else
-	if((rc = nf_register_hooks(abm_ebt_ops, ARRAY_SIZE(abm_ebt_ops))) < 0){
-#endif
 	ABM_PRINT(KERN_ERR, "Automatic bridging module error can't register hooks int rc = %d \n", rc);
 		return rc;
 	}
@@ -1737,18 +1559,11 @@ static void abm_exit(void)
 	cancel_work_sync(&abm_work_send_msg);
 	cancel_delayed_work_sync(&abm_work_retransmit);
 	destroy_workqueue(kabm_wq);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
 	nf_unregister_net_hooks(&init_net, abm_ebt_ops, ARRAY_SIZE(abm_ebt_ops));
-#else
-	nf_unregister_hooks(abm_ebt_ops, ARRAY_SIZE(abm_ebt_ops));
-#endif
 	abm_nl_exit();
 	br_fdb_deregister_can_expire_cb();
 	abm_l2flow_table_exit();
 	abm_proc_fini();
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
-	abm_sysctl_fini();
-#endif
 }
 
 
