@@ -252,3 +252,28 @@ index 700ce41..0657530 100644
      t_FmPcdNetEnvParams  distinctionUnits;          ///< Port's network env
      t_FmPortPcdParams    pcdParam;
      t_FmPortPcdPrsParams prsParam;
+diff --git a/source/FMCGenericError.cpp b/source/FMCGenericError.cpp
+index 1111111..2222222 100644
+--- a/source/FMCGenericError.cpp
++++ b/source/FMCGenericError.cpp
+@@ -33,7 +33,7 @@ std::string CGenericError::lastErrors;
+ std::string CGenericError::lastWarnings;
+ std::string CGenericError::lastNotes;
+ 
+-void errorFuncHandler( void * ctx, const xmlError * error )
++void errorFuncHandler( void * ctx, xmlError * error )
+ {
+     CGenericError::lastErrors = "";
+     CGenericError::lastWarnings = "";
+diff --git a/source/FMCGenericError.h b/source/FMCGenericError.h
+index 3333333..4444444 100644
+--- a/source/FMCGenericError.h
++++ b/source/FMCGenericError.h
+@@ -35,7 +35,7 @@ public:
+     static std::string lastNotes;
+ };
+ 
+-void errorFuncHandler( void * ctx, const xmlError * error );
++void errorFuncHandler( void * ctx, xmlError * error );
+ 
+ #endif // FMCGENERICERROR_H
