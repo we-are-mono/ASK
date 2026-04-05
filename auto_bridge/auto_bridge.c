@@ -44,7 +44,7 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mindspeed Technologies");
 MODULE_DESCRIPTION("Automatic Bridging Module (ABM)");
 
-static char __initdata auto_bridge_version[] = "0.01";
+static const char auto_bridge_version[] = "0.01";
 
 #define SECS * HZ
 #define MINS * 60 SECS
@@ -1564,6 +1564,7 @@ static void abm_exit(void)
 	br_fdb_deregister_can_expire_cb();
 	abm_l2flow_table_exit();
 	abm_proc_fini();
+	abm_sysctl_fini();
 }
 
 
