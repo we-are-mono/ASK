@@ -300,9 +300,6 @@ struct RtEntry *__cmmRouteAdd(struct flow *flow)
 	struct RtEntry *route;
 	char sbuf[INET6_ADDRSTRLEN], dbuf[INET6_ADDRSTRLEN];
 	int key;
-#ifdef SAM_LEGACY
-	struct interface *itf = NULL;
-#endif
 
 	route = malloc(sizeof(struct RtEntry));
 	if (!route)
@@ -321,11 +318,6 @@ struct RtEntry *__cmmRouteAdd(struct flow *flow)
 		cmm_print(DEBUG_WARNING, "%s::%d: cmmRouteNetlinkLookup() failed\n", __func__, __LINE__);
 		goto err1;
 	}
-
-#ifdef SAM_LEGACY
-	if(((itf = __itf_get(route->oifindex)) != NULL) && (____itf_is_4o6_tunnel(itf)))
-               route->mtu = TunMtu;
-#endif
 
 	key = HASH_RT(route->family, route->sAddr, route->dAddr);
 

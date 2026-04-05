@@ -178,23 +178,6 @@ static inline char *get_port_name(int port_id, char *buf, int buf_size)
 #define ITF_L2TP	(1 << 8)
 #define ITF_LRO		(1 << 9)
 
-#ifndef SAM_LEGACY
-
-struct ip6_4rd_map_msg {
-	__u32 reset;
-	__u32 ifindex;
-	__be32 prefix;
-	__u16 prefixlen;
-	struct in6_addr relay_prefix;
-	struct in6_addr relay_suffix;
-	__u16 relay_prefixlen;
-	__u16 relay_suffixlen;
-	__u16 psid_offsetlen;
-	__u16 eabit_len;
-	__u16 entry_num;
-};
-#endif
-
 #define LINK_KIND_MACVLAN	"macvlan"
 #define LINK_KIND_GRE6		"ip6gretap"
 
@@ -207,10 +190,6 @@ struct ip_tunnel_6rd {
 	u_int16_t		prefixlen;
 	u_int16_t		relay_prefixlen;
 };
-#endif
-
-#ifndef SIOCISETHIPV4TUNNEL
-#define SIOCISETHIPV4TUNNEL  (SIOCDEVPRIVATE + 15)
 #endif
 
 struct l2tp_itf_info {
@@ -292,11 +271,6 @@ struct interface {
 	int flags;
 #ifdef WIFI_ENABLE
 	struct wifi_ff_entry *wifi_if;
-#endif
-#ifdef SAM_LEGACY
-	u_int16_t sam_enable;
-#else
-	struct list_head mr_list; /* netlink mapping rule information */
 #endif
 	/* If L2TP interface */
 	struct l2tp_itf_info l2tp;

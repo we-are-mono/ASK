@@ -21,12 +21,6 @@
 #include "module_tunnel.h"
 #include <linux/if_tun.h>
 
-#ifdef SAM_LEGACY
-extern int rt_mw_sam_make_dst_ipv6( struct in_addr *sam_dst_ipv4_addr, ushort sam_port, struct in6_addr *sam_dst_ipv6_addr );
-extern int rt_mw_sam_get_ipv6( struct in6_addr *sam_ipv6_addr );
-extern int rt_mw_sam_get_portsetid( rt_mw_ipstack_sam_port_t *sam_psid );
-unsigned short TunMtu = DEFAULT_SAM_FRAG_MTU;
-#endif
 
 extern  void __itf_update_connection(FCI_CLIENT *fci_handle, int ifindex);
 
@@ -38,19 +32,14 @@ extern  void __itf_update_connection(FCI_CLIENT *fci_handle, int ifindex);
 static int tunnel_print_usage()
 {
 	cmm_print(DEBUG_STDERR, 
-			  "Usage: tunnel <name> add {ethipoip6 | ethip | gre6} [ipsec {0|1}]\n"
+			  "Usage: tunnel <name> add {gre6} [ipsec {0|1}]\n"
 		  "       tunnel <name> del\n"
                   "       tunnel <name> show \n"
                   "\n"
                   "\n"
-		  "       Ex:  set tunnel tnl0 add ethipoip6 ipsec 1\n"
-		  "            set tunnel tnl0 add ethip ipsec 1\n"
+		  "       Ex:  set tunnel tnl0 add gre6 ipsec 1\n"
 		  "            tunnel tnl0 del\n"
 	          );
-	#ifdef SAM_LEGACY
-		cmm_print(DEBUG_STDERR,
-		  "       tunnel <name> set <sam_enable/sam_disable> [sam-frag-mtu <mtu>] \n");
-	#endif
 	return 0;
 }
 
@@ -77,9 +66,7 @@ static int tunnel_print_info(struct tunnel_info *pInfo)
 		inet_ntop(AF_INET6, &pInfo->remote, remote, INET6_ADDRSTRLEN);
 		inet_ntop(AF_INET6, &pInfo->local, local, INET6_ADDRSTRLEN);
 
-		if(pInfo->tunnel_proto == IPPROTO_ETHERIP)
-			cmm_print(DEBUG_STDOUT, "Protocol           : Etherip-o-ipv6 (%d)\n", pInfo->tunnel_proto);
-		else if( pInfo->tunnel_proto == IPPROTO_IPIP)
+		if( pInfo->tunnel_proto == IPPROTO_IPIP)
 			cmm_print(DEBUG_STDOUT, "Protocol           : 4-o-6 (%d)\n", pInfo->tunnel_proto);
 		else if (pInfo->tunnel_proto == IPPROTO_GRE)
 			cmm_print(DEBUG_STDOUT, "Protocol           : GRE over IPv6 (%d)\n", pInfo->tunnel_proto);
@@ -94,9 +81,7 @@ static int tunnel_print_info(struct tunnel_info *pInfo)
 		inet_ntop(AF_INET, &pInfo->remote, remote, INET_ADDRSTRLEN);
 		inet_ntop(AF_INET, &pInfo->local, local, INET_ADDRSTRLEN);
 
-		if(pInfo->tunnel_proto == IPPROTO_ETHERIP)
-			cmm_print(DEBUG_STDOUT, "Protocol           : Etherip-o-ipv4 (%d)\n", pInfo->tunnel_proto);
-		else if(pInfo->tunnel_proto == IPPROTO_IPV6)
+		if(pInfo->tunnel_proto == IPPROTO_IPV6)
 		{
 			cmm_print(DEBUG_STDOUT, "Protocol           : 6-o-4 (%d)\n", pInfo->tunnel_proto);
 			if (pInfo->conf_6rd)
@@ -167,11 +152,7 @@ static int tunnel_parse_cmd(int argc, char ** keywords, daemon_handle_t daemon_h
 		if((argc != 3) && (argc != 5))
 			return tunnel_print_usage();
 
-		if (strcmp(*keywords, "ethipoip6") == 0)
-			tnl_type = TNL_ETHIPOIP6;
-		else if (strcmp(*keywords, "ethip") == 0)
-			tnl_type = TNL_ETHIPOIP4;
-		else if (strcmp(*keywords, "gre6") == 0)
+		if (strcmp(*keywords, "gre6") == 0)
 			tnl_type = TNL_GRE_IPV6;
 		else
 		{
@@ -280,49 +261,6 @@ static int tunnel_parse_cmd(int argc, char ** keywords, daemon_handle_t daemon_h
 			}
 		}
 	}
-#ifdef SAM_LEGACY
-	else if (strncmp(*keywords, "set",  strlen(*keywords)) ==0)
-	{
-		unsigned int tmp;
-		char * endptr = NULL;
-		keywords++;
-		
-		if((argc < 3) ||((argc >3) && (argc <5)))
-			return tunnel_print_usage();
-		
-		strcpy(cmmtd_cmd.name, tnl_name);
-		cmmtd_cmd.tunnel_type = TNL_4O6;
-		
-		if(strncasecmp(*keywords,"sam_enable", strlen(*keywords)) == 0)
-			cmmtd_cmd.sam_enable = 1;
-		else if(strncasecmp(*keywords,"sam_disable", strlen(*keywords)) == 0)
-			cmmtd_cmd.sam_enable = 0;
-		else
-			return tunnel_print_usage();
-		
-		cmmtd_cmd.tun_mtu = DEFAULT_SAM_FRAG_MTU;
-		if( argc >3 )
-		{
-			keywords++;
-			if(strncasecmp(*keywords,"sam-frag-mtu",strlen(*keywords))==0)
-			{
-				keywords++;
-				tmp = strtoul(*keywords, &endptr, 0);
-				cmmtd_cmd.tun_mtu= tmp;
-			}
-		}
-
-		if(cmmSendToDaemon(daemon_handle, CMMD_CMD_TUNNEL_SAMREADY, &cmmtd_cmd, sizeof(cmmtd_cmd), &rxbuf.rcvBuffer) == 1)
-		{
-			if (rxbuf.result != 0)
-			{
-				showErrorMsg("CMD_TUNNEL_SAMREADY", ERRMSG_SOURCE_CMMD, rxbuf.rcvBuffer);
-				return -1;
-			}
-		}
-
-	}
-#endif
 	else
 		return tunnel_print_usage();
 
@@ -384,9 +322,7 @@ int tunnel_send_cmd(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 
 	if (itf->tunnel_family == AF_INET6)
 	{
-		if (itf->tunnel_parm6.proto == IPPROTO_ETHERIP)
-			cmd.mode = TNL_ETHIPOIP6;
-		else if (itf->tunnel_parm6.proto == IPPROTO_IPIP)
+		if (itf->tunnel_parm6.proto == IPPROTO_IPIP)
 			cmd.mode = TNL_4O6;
 		else if (itf->tunnel_parm6.proto == IPPROTO_GRE)
 			cmd.mode = TNL_GRE_IPV6;
@@ -398,10 +334,7 @@ int tunnel_send_cmd(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 		}
 
 		memcpy(cmd.local, itf->tunnel_parm6.laddr.s6_addr, 16);
-		if(!(itf->tunnel_flags & TNL_4RD))
-		{
-			memcpy(cmd.remote, itf->tunnel_parm6.raddr.s6_addr, 16);
-		}
+		memcpy(cmd.remote, itf->tunnel_parm6.raddr.s6_addr, 16);
 
 		if (itf->tunnel_parm6.flags & IP6_TNL_F_IGN_ENCAP_LIMIT)
 			cmd.encap_limit = 0;
@@ -431,9 +364,7 @@ int tunnel_send_cmd(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 	}
 	else
 	{
-		if (itf->tunnel_parm4.iph.protocol == IPPROTO_ETHERIP)
-			cmd.mode = TNL_ETHIPOIP4;
-		else if (itf->tunnel_parm4.iph.protocol == IPPROTO_IPV6)
+		if (itf->tunnel_parm4.iph.protocol == IPPROTO_IPV6)
 			cmd.mode = TNL_6O4;
 		else
 		{
@@ -665,16 +596,6 @@ int __tunnel_add(FCI_CLIENT *fci_handle, struct interface *itf)
 	{
 		dAddr = itf->tunnel_parm6.raddr.s6_addr32;
 		proto = itf->tunnel_parm6.proto;
-#ifdef SAM_LEGACY
-		if(proto == IPPROTO_IPIP)
-		{
-			if ((!itf->sam_enable) && (!rt_mw_sam_get_ipv6(&itf->tunnel_parm6.laddr)) )
-			{
-				cmm_print(DEBUG_INFO,"Tunnel %s is up but SAM is not yet Ready", itf->ifname );
-				goto err;
-			}
-		}
-#endif
 
 		sAddr = itf->tunnel_parm6.laddr.s6_addr32;
 	}
@@ -816,7 +737,6 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 
 	switch (tnl_type)
 	{
-	case TNL_ETHIPOIP6:
 	case TNL_GRE_IPV6:
 		if (itf->tunnel_family != AF_INET6)
 		{
@@ -825,7 +745,7 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 			goto err1;
 		}
 
-		if (itf->tunnel_parm6.proto != IPPROTO_ETHERIP && itf->tunnel_parm6.proto != IPPROTO_GRE)
+		if (itf->tunnel_parm6.proto != IPPROTO_GRE)
 		{
 			cmm_print(DEBUG_ERROR, "%s: tunnel type %x can't have proto %d\n", __func__, tnl_type, itf->tunnel_parm6.proto);
 			res_buf[0] = CMMD_ERR_WRONG_COMMAND_PARAM;
@@ -844,66 +764,12 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 			update_tnl_flows = 1;
 		}
 		break;
-
-	case TNL_ETHIPOIP4:
-		if (itf->tunnel_family != AF_INET)
-		{
-			cmm_print(DEBUG_ERROR, "%s: tunnel type %x can't have family %d\n", __func__, tnl_type, itf->tunnel_family);
-			res_buf[0] = CMMD_ERR_WRONG_COMMAND_PARAM;
-			goto err1;
-		}
-
-		if (itf->tunnel_parm4.iph.protocol != IPPROTO_ETHERIP)
-		{
-			cmm_print(DEBUG_ERROR, "%s: tunnel type %x can't have proto %d\n", __func__, tnl_type, itf->tunnel_parm4.iph.protocol);
-			res_buf[0] = CMMD_ERR_WRONG_COMMAND_PARAM;
-			goto err1;
-		}
-
-		if (ipsec)
-			itf->tunnel_flags |= TNL_IPSEC;
-		else
-		{
-			if(itf->tunnel_flags & TNL_IPSEC)
-				itf->flags |= FPP_NEEDS_UPDATE;
-			itf->tunnel_flags &= ~TNL_IPSEC;
-			update_tnl_flows = 1;
-		}
-		break;
-
-#ifdef SAM_LEGACY
-	case TNL_4O6:
-		if (itf->tunnel_family != AF_INET6)
-		{
-			cmm_print(DEBUG_ERROR, "%s: tunnel type %x can't have family %d\n", __func__, tnl_type, itf->tunnel_family);
-			res_buf[0] = CMMD_ERR_WRONG_COMMAND_PARAM;
-			goto err1;
-		}
-		if (itf->tunnel_parm6.proto != IPPROTO_IPIP)
-		{
-			cmm_print(DEBUG_ERROR, "%s: tunnel type %x can't have proto %d\n", __func__, tnl_type, itf->tunnel_parm6.proto);
-			res_buf[0] = CMMD_ERR_WRONG_COMMAND_PARAM;
-			goto err1;
-		}
-
-                if(tnl_type == TNL_4O6)
-                {
-                        if(! itf->sam_enable)
-                        {
-                               update_connections = 1;
-                               itf->sam_enable = 1;
-		  	       itf->tunnel_flags |= TNL_4RD;
-                        }
-                }
-		break;
-#endif
 
 	default:
 		cmm_print(DEBUG_ERROR, "%s: unsupported tunnel type %x\n", __func__, tnl_type);
 		res_buf[0] = CMMD_ERR_WRONG_COMMAND_PARAM;
 		goto err1;
 	}
-#ifndef SAM_LEGACY
 	if(itf->phys_ifindex)// Bound to an interface
 	{
 		if(!__itf_is_programmed(itf->phys_ifindex))
@@ -913,7 +779,6 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 			goto err1;
 		}
 	}
-#endif
 
 	itf->flags |= USER_ADDED;
 
@@ -1002,9 +867,6 @@ static int tunnel_del(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 		goto err;
 	}
 
-	#ifdef SAM_LEGACY
-	itf->tunnel_flags &= ~TNL_4RD;
-	#endif
 	rc = __tunnel_del(fci_handle, fci_key_handle, itf);
 	if (rc >= 0)
 	{
@@ -1115,37 +977,6 @@ err:
 	return 0;
 }
 
-#ifdef SAM_LEGACY
-
-int tunnel_conv_id_set(FCI_CLIENT *fci_handle, char *name,  char *buffer, int buffer_size)
-{
-       int ifindex;
-       struct interface *itf;
-       int rc = 0;
-
-       pthread_mutex_lock(&itf_table.lock);
-
-       ifindex = if_nametoindex(name);
-
-       itf = __itf_find(ifindex);
-       if (!itf)
-               goto err;
-
-       if (!____itf_is_4o6_tunnel(itf))
-               goto err;
-
-       rc = fci_write(fci_handle, FPP_CMD_TUNNEL_4rd_ID_CONV_psid, sizeof(fpp_tunnel_id_conv_cmd_t),(unsigned short *)buffer);
-       if(rc != 0)
-               cmm_print(DEBUG_ERROR, "%s: Error %d while sending FPP_CMD_TUNNEL_4rd_ID_CONV\n", __func__, rc);
-
-err:
-       pthread_mutex_unlock(&itf_table.lock);
-       return rc;
-
-}
-
-#endif
-
 /************************************************************
  * 
  * tunnel_daemon_msg_recv
@@ -1154,9 +985,6 @@ err:
 int tunnel_daemon_msg_recv(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int function_code, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len)
 {
 	cmmd_tunnel_t *tnl = (cmmd_tunnel_t *) cmd_buf;
-	#ifdef SAM_LEGACY
-	fpp_tunnel_id_conv_cmd_t *tnl_IdConv = (fpp_tunnel_id_conv_cmd_t*) cmd_buf;
-	#endif
 
 	switch (function_code)
 	{
@@ -1168,29 +996,7 @@ int tunnel_daemon_msg_recv(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, i
 
 	case CMMD_CMD_TUNNEL_SHOW:
 		return tunnel_show(fci_handle, tnl->name, res_buf, res_len);
-#ifdef SAM_LEGACY
-	case CMMD_CMD_TUNNEL_SAMREADY:
-	{
-               if(tnl->tun_mtu > __itf_get_mtu(if_nametoindex(tnl->name)))
-               {
-                       cmm_print(DEBUG_STDERR,"\n ERROR : configured MTU cannot be greater than tunnel interface's MTU");
-                       return 0;
-               }
-               TunMtu = tnl->tun_mtu;
 
-	       if(tnl->sam_enable)
-                     return tunnel_add(fci_handle, fci_key_handle, tnl->name, tnl->ipsec, tnl->tunnel_type , res_buf, res_len);
-               else
-                     return tunnel_del(fci_handle, fci_key_handle, tnl->name,res_buf, res_len);
-	}
-        case CMMD_CMD_TUNNEL_IDCONV_psid:
-	{
-		res_buf[0] = CMMD_ERR_OK;
-		*res_len = 2;
-
-               return tunnel_conv_id_set(fci_handle, (char*)tnl_IdConv->name,(char*)cmd_buf, sizeof(fpp_tunnel_id_conv_cmd_t));
-	}
-#endif
 	default:
 		res_buf[0] = CMMD_ERR_UNKNOWN_COMMAND;
 		*res_len = 2;
@@ -1302,7 +1108,7 @@ out:
 int __cmmGetTunnel(int fd, struct interface *itf, struct rtattr *tb[])
 {
 	struct ifreq ifr;
-	int rc, isipv4 = 0;
+	int rc;
 
 	itf->itf_flags &= ~ITF_TUNNEL;
 
@@ -1349,28 +1155,6 @@ int __cmmGetTunnel(int fd, struct interface *itf, struct rtattr *tb[])
 		/* In case this is not a real tunnel interface these should not match */
 		if (itf->phys_ifindex != itf->tunnel_parm4.link)
 			goto out;
-
-		/* Find out if the tunnel is an IPv4 / IPv6 tunnel*/
-		isipv4 = (ioctl(fd, SIOCISETHIPV4TUNNEL, &ifr) == 0 );
-
-		if(isipv4)
-		{
-			if(itf->tunnel_parm4.iph.protocol == IPPROTO_ETHERIP)
-			{
-				itf->itf_flags |= ITF_TUNNEL;
-				itf->tunnel_family = AF_INET;
-				goto out;
-			}
-		}
-		else
-		{
-			if(itf->tunnel_parm6.proto == IPPROTO_ETHERIP)
-			{
-				itf->itf_flags |= ITF_TUNNEL;
-				itf->tunnel_family = AF_INET6;
-				goto out;
-			}
-		}
 
 		break;
 
@@ -1642,75 +1426,11 @@ found:
 }
 
 
-#ifdef SAM_LEGACY
-
 int cmm4rdIdConvSetProcess(char ** keywords, int tabStart, int argc, daemon_handle_t daemon_handle)
 {
-	int rcvBytes = 0;
-	char SndBuffer[256];
-	
-	if(argc < 3)
-		goto usage;
-
-	fpp_tunnel_id_conv_cmd_t *pIdConvCmd = (fpp_tunnel_id_conv_cmd_t* )SndBuffer;
-	memset(pIdConvCmd,0, sizeof(fpp_tunnel_id_conv_cmd_t));
-	
-	if(strcasecmp(keywords[tabStart++],"interface") != 0)
-		goto usage;
-
-	strncpy((char*)pIdConvCmd->name, keywords[tabStart++],IFNAMSIZ);
-	if(strcasecmp(keywords[tabStart++],"enable") == 0)
-		 pIdConvCmd->IdConvStatus = 1;
-	
-	if(rt_mw_sam_get_portsetid(&pIdConvCmd->sam_port_info))
-	{
-		cmm_print(DEBUG_STDOUT,"\t Third party shared library failed \n");
-		goto usage;
-	}
-	
-	rcvBytes = cmmSendToDaemon(daemon_handle,CMMD_CMD_TUNNEL_IDCONV_psid, pIdConvCmd, sizeof(fpp_tunnel_id_conv_cmd_t), SndBuffer);
-	if (rcvBytes >=2)/* we expect 2 bytes in response */
-	{
-	if ((((u_int16_t*)SndBuffer)[0]) != CMMD_ERR_OK)
-		{
-			showErrorMsg("CMD_CMMTD_TUNNEL_IDCONV", ERRMSG_SOURCE_CMMD, SndBuffer);
-			return -1;
-		}
-	}
-
-	return 0;
-	
-usage:
-	cmm_print(DEBUG_STDOUT,"\tset 4rd-id-conversion interface <4o6 Interface name> <enable/disable>\n");
+	cmm_print(DEBUG_STDERR, "4RD ID conversion is no longer supported\n");
 	return -1;
 }
-
-#else
-int cmm4rdIdConvSetProcess(char ** keywords, int tabStart, int argc, daemon_handle_t daemon_handle)
-{
-	int rcvBytes = 0,rc =0;
-	union u_txbuf txbuf;
-	fpp_tunnel_id_conv_cmd_t *pIdConvCmd = (fpp_tunnel_id_conv_cmd_t* )txbuf.SndBuffer;
-
-	if(!keywords[tabStart])
-		goto usage;
-	
-	memset(pIdConvCmd,0, sizeof(fpp_tunnel_id_conv_cmd_t));
-	if(strcasecmp(keywords[tabStart],"enable") == 0)
-		pIdConvCmd->IdConvStatus = 1;
-	
-	rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_TUNNEL_4rd_ID_CONV_dport, pIdConvCmd, sizeof(fpp_tunnel_id_conv_cmd_t), txbuf.SndBuffer);
-	rc =  (rcvBytes < sizeof(unsigned short) ) ? 0 : txbuf.result;
-	if (rcvBytes !=  sizeof(unsigned short) || (rc))
-		showErrorMsg("CMD_TUNNEL_4rd_ID_CONV", ERRMSG_SOURCE_FPP, txbuf.SndBuffer);
-	
-	return  rc;
-	
-usage:
-	cmm_print(DEBUG_STDOUT,"\tset 4rd-id-conversion <enable/disable>\n");
-	return -1;
-}
-#endif
 
 int cmmTnlQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
 {
@@ -1751,13 +1471,8 @@ int cmmTnlQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 			}
                         else if (pTnlCmd->mode == TNL_GRE_IPV6)
 				mode = "GRE_IPV6";
-                        else if (pTnlCmd->mode == TNL_ETHIPOIP4)
-			{
-				mode = "EtherIP";
-				family = AF_INET;
-			}
 			else
-				mode = "EtherIP6";
+				mode = "Unknown";
 
 			cmm_print(DEBUG_STDOUT, "%d: mode=%s, name=%s, local=%s, remote=%s, enabled=%d, secure=%d, flow_info=0x%x, encap_limit=%d, hop_limit=0x%x, mtu=%d\n",
 				count, mode, pTnlCmd->name,
@@ -1773,119 +1488,11 @@ int cmmTnlQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
         return CLI_OK;
 }
 
-#ifdef SAM_LEGACY
-
 int getTunnel4rdAddress(struct interface* itf, u_int32_t * Daddrv6,  unsigned int Daddr, unsigned short Dport)
 {
-       int i =0;
-       for (i = 0; i< 4;i++)
-               Daddrv6[i] = itf->tunnel_parm6.raddr.s6_addr32[i];
-       rt_mw_sam_make_dst_ipv6( (struct in_addr *)&Daddr , Dport, (struct in6_addr *)Daddrv6 );
-       return 0;
-}
-#else
-
-static int
-__getTunnel4rdAddress(__u32 *daddr6, __u32 daddr4, __u16 dport4, struct ip6_4rd_map_msg *mr)
-{
-
-       int i, pbw0, pbi0, pbi1;
-       __u32 daddr[4];
-       __u32 port_set_id = 0;
-       __u32 mask;
-       __u32 da = ntohl(daddr4);
-       __u16 dp = ntohs(dport4);
-       __u32 diaddr[4];
-       int port_set_id_len = ( mr->eabit_len ) - ( 32 - mr->prefixlen ) ;
-
-       if ( port_set_id_len < 0) {
-               cmm_print(DEBUG_STDOUT," %s:  PSID length ERROR %d\n",__func__, port_set_id_len);
-               return -1;
-       }
-
-       if ( port_set_id_len > 0) {
-               mask = 0xffffffff >> (32 - port_set_id_len);
-               port_set_id = ( dp >> (16 - mr->psid_offsetlen - port_set_id_len ) & mask ) ;
-       }
-
-       for (i = 0; i < 4; ++i)
-               daddr[i] = ntohl(mr->relay_prefix.s6_addr32[i])
-                       | ntohl(mr->relay_suffix.s6_addr32[i]);
-
-       if( port_set_id_len != 0 ) {
-               pbw0 = mr->relay_prefixlen >> 5;
-               pbi0 = mr->relay_prefixlen & 0x1f;
-               daddr[pbw0] |= (da << mr->prefixlen) >> pbi0;
-               pbi1 = pbi0 - mr->prefixlen;
-               if (pbi1 > 0)
-                       daddr[pbw0+1] |= da << (32 - pbi1);
-
-               if ( port_set_id_len > 0) {
-                       pbw0 = (mr->relay_prefixlen + 32 - mr->prefixlen) >> 5;
-                       pbi0 = (mr->relay_prefixlen + 32 - mr->prefixlen) & 0x1f;
-                       daddr[pbw0] |= (port_set_id << (32 - port_set_id_len)) >> pbi0;
-                       pbi1 = pbi0 - (32 - port_set_id_len);
-                       if (pbi1 > 0)
-                               daddr[pbw0+1] |= port_set_id << (32 - pbi1);
-               }
-       }
-
-       memset(diaddr, 0, sizeof(diaddr));
-
-       diaddr[2] = ( da >> 8 ) ;
-       diaddr[3] = ( da << 24 ) ;
-       diaddr[3] |= ( port_set_id << 8 ) ;
-
-       for (i = 0; i < 4; ++i)
-               daddr[i] = daddr[i] | diaddr[i] ;
-
-       for (i = 0; i < 4; ++i)
-               daddr6[i] = htonl(daddr[i]);
-
-	/* DBG */
-	cmm_print(DEBUG_INFO," %s : %08x %08x %08x %08x  PSID:%04x\n",__func__ ,daddr[0], daddr[1], daddr[2], daddr[3], port_set_id);
-	/* DBG */
-
+	int i;
+	/* Use tunnel remote address directly (4RD map rules removed) */
+	for (i = 0; i < 4; i++)
+		Daddrv6[i] = itf->tunnel_parm6.raddr.s6_addr32[i];
 	return 0;
 }
-
-
-
-int getTunnel4rdAddress(struct interface* itf, u_int32_t * Daddrv6,  unsigned int Daddr, unsigned short Dport)
-{
-
-	struct list_head *entry, *next_entry;
-	struct map_rule *mr = NULL, *mr_tmp = NULL;
-	unsigned int mask  = 0;
-	int mr_prefixlen = 0;	
-	int count = 0;
-	int err = 0;
-	int i = 0;
-	// set default daddr as that of tunnel remote address will be used for  all 4o6 tunnels and when packets are intended for BR/ P-SAM.
-	for (i = 0; i< 4;i++)
-		Daddrv6[i] = itf->tunnel_parm6.raddr.s6_addr32[i];
-	
-
-	cmm_print(DEBUG_INFO, "%s: mapping rule match \n", __func__);
-
-	for (entry = list_first(&itf->mr_list); next_entry = list_next(entry), entry != &itf->mr_list; entry = next_entry)
-	{
-
-		mr = container_of(entry, struct map_rule, list);
-		mask = 0xffffffff << (32 - mr->rule.prefixlen) ;
-		cmm_print(DEBUG_INFO,"Prefix %d prefixlen %d daddr %d ",htonl(mr->rule.prefix), mr->rule.prefixlen, htonl(Daddr));
-		if( (htonl(Daddr) & mask ) == htonl( mr->rule.prefix) ) {
-	                if ( mr->rule.prefixlen >= mr_prefixlen ){
-                                       mr_prefixlen = mr->rule.prefixlen ;
-                                       mr_tmp = mr;
-                                       count++;
-			}
-		}
-	}
-	if(count)
-		err =__getTunnel4rdAddress(Daddrv6, Daddr, Dport, &mr_tmp->rule );
-	return err;
-}
-
-
-#endif

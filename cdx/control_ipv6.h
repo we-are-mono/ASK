@@ -51,7 +51,6 @@ typedef struct IPv6_ROUTING_HDR
 #define IPV6_ICMP		58
 #define IPV6_NONE		59
 #define IPV6_DESTOPT		60
-#define IPV6_ETHERIP		IPPROTOCOL_ETHERIP
 
 /* ICMPv6 Type Values */
 #define ICMPV6_ROUTER_SOLICIT   133

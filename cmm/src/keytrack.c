@@ -416,7 +416,6 @@ int __cmmFetchFlowParams(int family, struct flowi *fl, unsigned int **flsaddr, u
 	char sbuf[INET6_ADDRSTRLEN], dbuf[INET6_ADDRSTRLEN];
 	switch (fl->flowi_proto)
 	{
-		case IPPROTO_ETHERIP:
 		case IPPROTO_IPIP:
 		case IPPROTO_GRE:
 			/* Make sure to reset port information */
@@ -860,7 +859,6 @@ int cmmKeyEngineFlowRemove(FCI_CLIENT *fci_handle, unsigned short fcode, unsigne
 
 	switch (fl->flowi_proto)
 	{
-	case IPPROTO_ETHERIP:
 	case IPPROTO_IPIP:
 	case IPPROTO_GRE:
 		/* Make sure to reset port information */

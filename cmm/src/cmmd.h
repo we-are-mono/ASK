@@ -262,10 +262,6 @@ typedef struct cmmd_tunnel {
 	char		name[IFNAMSIZ];    /* Tunnel name */
         int8_t		ipsec;             /* IPSec ? */
         int8_t		tunnel_type;       /* Type */
-#ifdef SAM_LEGACY
-	int16_t          sam_enable:1,
-			 tun_mtu:15;
-#endif
 } __attribute__((__packed__)) cmmd_tunnel_t;
 
 /* CMM / FPP API Command */

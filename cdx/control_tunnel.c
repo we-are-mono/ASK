@@ -115,54 +115,8 @@ static void M_tnl_build_header(PTnlEntry pTunnelEntry)
 
 	switch (pTunnelEntry->mode)
 	{
-		/* EtherIP over IPv6 case : MAC|IPV6|ETHIP|MAC|IPV4 */
-		/* Here IPV6|ETHIP part is pre-built            */
-
-		case TNL_MODE_ETHERIPV6:
-
-			/* add IPv6 header */
-			memcpy((U8*)ip6_hdr.DestinationAddress, (U8*)pTunnelEntry->remote, IPV6_ADDRESS_LENGTH);
-			memcpy((U8*)ip6_hdr.SourceAddress, (U8*)pTunnelEntry->local, IPV6_ADDRESS_LENGTH);
-			IPV6_SET_VER_TC_FL(&ip6_hdr, pTunnelEntry->fl);
-			ip6_hdr.HopLimit = pTunnelEntry->hlim;
-			ip6_hdr.TotalLength = 0; //to be computed for each packet
-			ip6_hdr.NextHeader = IPV6_ETHERIP;
-
-			pTunnelEntry->header_size = sizeof(ipv6_hdr_t);
-			memcpy(pTunnelEntry->header, (U8*)&ip6_hdr, pTunnelEntry->header_size);
-
-			/* add EtherIP header */
-			*(U16*)(pTunnelEntry->header + pTunnelEntry->header_size) = htons(TNL_ETHERIP_VERSION);
-			pTunnelEntry->header_size += TNL_ETHERIP_HDR_LEN;
-			break;
-
-			/* EtherIP over IPv4 case : MAC|IPV4|ETHIP|MAC|IPV4 */
-			/* Here IPV4|ETHIP part is pre-built            */
-
-		case TNL_MODE_ETHERIPV4:
-			/* add IPv4 header */
-			ip4_hdr.SourceAddress = pTunnelEntry->local[0];
-			ip4_hdr.DestinationAddress = pTunnelEntry->remote[0];
-			ip4_hdr.Version_IHL = 0x45;
-			ip4_hdr.Protocol = IPPROTOCOL_ETHERIP;
-			ip4_hdr.TypeOfService = pTunnelEntry->fl & 0xFF;
-			ip4_hdr.TotalLength = 0; //to be computed for each packet
-			ip4_hdr.TTL = pTunnelEntry->hlim;
-			ip4_hdr.Identification = 0;
-			ip4_hdr.HeaderChksum = 0; //to be computed
-			ip4_hdr.Flags_FragmentOffset = 0;
-
-			pTunnelEntry->header_size = sizeof(ipv4_hdr_t);
-			memcpy(pTunnelEntry->header, (U8*)&ip4_hdr, pTunnelEntry->header_size);
-
-			/* add EtherIP header */
-			*(U16*)(pTunnelEntry->header + pTunnelEntry->header_size) = htons(TNL_ETHERIP_VERSION);
-			pTunnelEntry->header_size += TNL_ETHERIP_HDR_LEN;
-			break;
-
-
-			/* 6o4 case : MAC|IPV4|IPV6 		*/
-			/* Here IPV4 part is pre-built	*/
+		/* 6o4 case : MAC|IPV4|IPV6 		*/
+		/* Here IPV4 part is pre-built	*/
 
 		case TNL_MODE_6O4:
 			ip4_hdr.SourceAddress = pTunnelEntry->local[0];
@@ -262,18 +216,6 @@ static int TNL_handle_CREATE(U16 *p, U16 Length)
 
 	switch (cmd.mode)
 	{
-		case TNL_MODE_ETHERIPV6:
-			pTunnelEntry->proto = PROTO_IPV6;
-			pTunnelEntry->output_proto = PROTO_NONE;
-
-			break;
-
-		case TNL_MODE_ETHERIPV4:
-			pTunnelEntry->proto = PROTO_IPV4;
-			pTunnelEntry->output_proto = PROTO_NONE;
-
-			break;
-
 		case TNL_MODE_6O4:
 			if (cmd.secure)
 			{

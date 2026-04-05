@@ -16,20 +16,6 @@
 #ifndef __MODULE_TUNNEL_H__
 #define __MODULE_TUNNEL_H__
 
-#ifdef SAM_LEGACY
-#define DEFAULT_SAM_FRAG_MTU 1460 /* This is the value that will be used for all fragmentation
-decisions on packets intended for the tunnel MTU. This is a cumulative fix on an ACP fix where
-the tunnel interface MTU is configured as 1500(instead of the real 1460 (1500 - IPv6hdr size))
-Bytes in order to force IPv6 fragmentation */
-#endif
-
-#ifndef SAM_LEGACY
-struct map_rule {
-	struct list_head list;
-	struct ip6_4rd_map_msg rule;
- };
-#endif
-
 struct tunnel_info
 {
 	char ifname[IFNAMSIZ];

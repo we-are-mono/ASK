@@ -1,28 +1,13 @@
-From: Tomaz Zaman <tomaz@mono.si>
-Date: Mon, 12 Jan 2026 12:00:00 +0100
-Subject: [PATCH] fmc: Add ASK extensions for shared schemes and port ID
-
-Add support for:
-- Port ID (portid) field in port configuration output
-- Shared scheme support with CC/HT node replication
-- Fix PPPoE nextp field name (NET_HEADER_FIELD_PPPoE_PID)
-
-These extensions are required for the CMM daemon and fast path offload
-functionality on the Mono Gateway.
-
-Upstream-Status: Inappropriate [vendor-specific extension]
-Signed-off-by: Tomaz Zaman <tomaz@mono.si>
----
 diff --git a/source/FMCCModelOutput.cpp b/source/FMCCModelOutput.cpp
 index 2a3d257..54b6f21 100644
 --- a/source/FMCCModelOutput.cpp
 +++ b/source/FMCCModelOutput.cpp
 @@ -725,6 +725,7 @@ CFMCCModelOutput::output_fmc_port( const CFMCModel& model, fmc_model_t* cmodel,
-
+ 
      EMIT4STR( port[, index, ].type =, model.all_ports[index].type );
      EMIT4( port[, index, ].number  = ,  model.all_ports[index].number );
 +    EMIT4( port[, index, ].portid  = ,  model.all_ports[index].portid );
-
+ 
      EMIT4( port[, index, ].schemes_count =, model.all_ports[index].schemes.size() );
      for ( unsigned int i = 0; i < cmodel->port[index].schemes_count; ++i ) {
 @@ -952,6 +953,7 @@ CFMCCModelOutput::output_fmc_scheme( const CFMCModel& model, fmc_model_t* cmodel
@@ -33,14 +18,40 @@ index 2a3d257..54b6f21 100644
      if (sch.bypass) {
          EMIT4( scheme[, index, ].bypassFqidGeneration =, sch.bypass );
      }
+diff --git a/source/FMCGenericError.cpp b/source/FMCGenericError.cpp
+index 0bbd284..ce583b7 100644
+--- a/source/FMCGenericError.cpp
++++ b/source/FMCGenericError.cpp
+@@ -33,7 +33,7 @@
+ #include "FMCUtils.h"
+ #include "logger.hpp"
+ 
+-void errorFuncHandler( void * ctx, const xmlError * error )
++void errorFuncHandler( void * ctx, xmlError * error )
+ {
+     char *filestr = (char*)"";
+     char *msgstr  = (char*)"";
+diff --git a/source/FMCGenericError.h b/source/FMCGenericError.h
+index 4bd05b2..1c0b689 100644
+--- a/source/FMCGenericError.h
++++ b/source/FMCGenericError.h
+@@ -35,7 +35,7 @@
+ 
+ const int NO_LINE = -1;
+ 
+-void errorFuncHandler( void * ctx, const xmlError * error );
++void errorFuncHandler( void * ctx, xmlError * error );
+ 
+ 
+ class CGenericError {
 diff --git a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
-index d785eee..bea0cac 100755
+index d785eee..7a25f91 100755
 --- a/source/FMCPCDModel.cpp
 +++ b/source/FMCPCDModel.cpp
 @@ -133,12 +133,131 @@ CFMCModel::CFMCModel()
  }
-
-
+ 
+ 
 +HTNode&
 +CFMCModel::replicateHtNodes(const CTaskDef* pTaskDef, Port& port, HTNode& refnode)
 +{
@@ -167,10 +178,10 @@ index d785eee..bea0cac 100755
 +    uint32_t ii;
 +    uint32_t jj;
      assert( pTaskDef );
-
+ 
      // For all engines
 @@ -192,6 +311,23 @@ CFMCModel::createModel( CTaskDef* pTaskDef )
-
+ 
                  Scheme& scheme = all_schemes[index];
                  scheme.scheme_index_per_port = scheme_index;
 +		if (scheme.shared && (port.name != scheme.port_signature)) {
@@ -190,7 +201,7 @@ index d785eee..bea0cac 100755
 +                                }
 +                	}
 +		}
-
+ 
                  // Add scheme's protocols to the port's protocol list
                  std::set< Protocol >::iterator protoIt;
 @@ -1011,6 +1147,7 @@ CFMCModel::createScheme( const CTaskDef* pTaskDef, Port& port, const CDistributi
@@ -224,7 +235,7 @@ index 696eb79..2789d52 100755
 --- a/source/FMCPCDModel.h
 +++ b/source/FMCPCDModel.h
 @@ -192,6 +192,7 @@ public:
-
+ 
      e_FmPcdEngine     nextEngine;
      std::string       nextEngineStr;
 +    std::string       nextActionName;
@@ -238,7 +249,7 @@ index 696eb79..2789d52 100755
 +    CCNode&  replicateCCNodes(const CTaskDef* pTaskDef, Port& port, CCNode& refnode);
 +    HTNode&  replicateHtNodes(const CTaskDef* pTaskDef, Port& port, HTNode& refnode);
  };
-
+ 
  #endif // FMCMODEL_H
 diff --git a/source/fmc.h b/source/fmc.h
 index 700ce41..0657530 100644
@@ -252,28 +263,3 @@ index 700ce41..0657530 100644
      t_FmPcdNetEnvParams  distinctionUnits;          ///< Port's network env
      t_FmPortPcdParams    pcdParam;
      t_FmPortPcdPrsParams prsParam;
-diff --git a/source/FMCGenericError.cpp b/source/FMCGenericError.cpp
-index 1111111..2222222 100644
---- a/source/FMCGenericError.cpp
-+++ b/source/FMCGenericError.cpp
-@@ -33,7 +33,7 @@ std::string CGenericError::lastErrors;
- std::string CGenericError::lastWarnings;
- std::string CGenericError::lastNotes;
- 
--void errorFuncHandler( void * ctx, const xmlError * error )
-+void errorFuncHandler( void * ctx, xmlError * error )
- {
-     CGenericError::lastErrors = "";
-     CGenericError::lastWarnings = "";
-diff --git a/source/FMCGenericError.h b/source/FMCGenericError.h
-index 3333333..4444444 100644
---- a/source/FMCGenericError.h
-+++ b/source/FMCGenericError.h
-@@ -35,7 +35,7 @@ public:
-     static std::string lastNotes;
- };
- 
--void errorFuncHandler( void * ctx, const xmlError * error );
-+void errorFuncHandler( void * ctx, xmlError * error );
- 
- #endif // FMCGENERICERROR_H

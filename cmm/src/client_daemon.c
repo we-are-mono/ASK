@@ -1297,12 +1297,9 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 
 	/* Tunnel commands */
 	case CMMD_CMD_TUNNEL_ADD:
-	case CMMD_CMD_TUNNEL_DEL: 
+	case CMMD_CMD_TUNNEL_DEL:
  	case CMMD_CMD_TUNNEL_SHOW:
 	case CMMD_CMD_TUNNEL_IDCONV_psid:
-#ifdef SAM_LEGACY	
- 	case CMMD_CMD_TUNNEL_SAMREADY:
-#endif
 		return tunnel_daemon_msg_recv(ctx->fci_handle, ctx->fci_key_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
 
         case CMMD_CMD_PPPOE_RELAY_ADD:

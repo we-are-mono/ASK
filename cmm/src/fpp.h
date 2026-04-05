@@ -1978,28 +1978,10 @@ typedef struct fpp_tunnel_query_cmd {
     u_int16_t       pad;
 } __attribute__((__packed__)) fpp_tunnel_query_cmd_t;
 
-#ifdef SAM_LEGACY
-
-typedef struct {
-    int         port_set_id;        /**< Port Set ID        */
-    int         port_set_id_length; /**< Port Set ID length */
-    int         psid_offset;        /**< PSID offset        */
-}sam_port_info_t;
-typedef sam_port_info_t rt_mw_ipstack_sam_port_t;
-
-typedef struct fpp_tunnel_id_conv_cmd {
-    u_int8_t        name[IFNAMSIZ];
-    sam_port_info_t sam_port_info;
-    u_int32_t       IdConvStatus:1,
-                    unused:31;
-} __attribute__((__packed__)) fpp_tunnel_id_conv_cmd_t;
-
-#else /* SAM_LEGACY */
 typedef struct fpp_tunnel_id_conv_cmd {
     u_int16_t   IdConvStatus;
     u_int16_t   Pad;
 } __attribute__((__packed__)) fpp_tunnel_id_conv_cmd_t;
-#endif /* SAM_LEGACY */
 
 /*-------------------------------- Timeout -----------------------------------*/
 #define FPP_CMD_IPV4_SET_TIMEOUT                        0x0319

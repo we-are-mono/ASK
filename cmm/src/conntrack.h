@@ -211,15 +211,15 @@ int cmmDPIFlagProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16_t 
  */
 
 #define SUPPORTED_LOCAL_PROTO(l4proto)  ((l4proto == IPPROTO_IPIP) ||\
-					   (l4proto == IPPROTO_IPV6) || (l4proto == IPPROTO_ETHERIP) ||\
+					   (l4proto == IPPROTO_IPV6) ||\
 					    (l4proto == IPPROTO_GRE) || (l4proto == IPPROTO_ESP) || (l4proto == IPPROTO_AH))
 #elif CONFIG_IPSEC_ESP_PASSTHRU
 #define SUPPORTED_LOCAL_PROTO(l4proto)  ((l4proto == IPPROTO_IPIP) ||\
-											  (l4proto == IPPROTO_IPV6) || (l4proto == IPPROTO_ETHERIP) ||\
+											  (l4proto == IPPROTO_IPV6) ||\
 											   (l4proto == IPPROTO_GRE) || (l4proto == IPPROTO_ESP))
 #else
 #define SUPPORTED_LOCAL_PROTO(l4proto)  ((l4proto == IPPROTO_IPIP) ||\
-					   (l4proto == IPPROTO_IPV6) || (l4proto == IPPROTO_ETHERIP) ||\
+					   (l4proto == IPPROTO_IPV6) ||\
 					    (l4proto == IPPROTO_GRE))
 #endif
 

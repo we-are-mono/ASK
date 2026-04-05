@@ -30,8 +30,24 @@ libtool
 *.a
 *.so
 *.so.*
+*.ko
+*.mod
+*.mod.c
 .libs/
 .deps/
+dist/
+
+# Built binaries
+cmm/src/cmm
+dpa_app/dpa_app
+
+# Kbuild temporaries
+.*.cmd
+Module.symvers
+modules.order
+
+# Fetched sources (reproduced by make)
+sources/
 
 # Editor files
 *.swp

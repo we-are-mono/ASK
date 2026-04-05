@@ -214,7 +214,6 @@ enum return_code {
 #define IPPROTOCOL_ESP 		 50            /* Encapsulation Security Payload protocol */
 #define IPPROTOCOL_AH 		 51             /* Authentication Header protocol       */
 #define IPPROTOCOL_ICMPV6 	58
-#define IPPROTOCOL_ETHERIP	97
 
 
 
