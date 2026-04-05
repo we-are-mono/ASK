@@ -9584,12 +9584,11 @@ index 8ab81ac69431..9737beb1ea15 100644
      {
          XX_Free(p_FmMuram);
          REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM-MURAM partition!!!"));
-@@ -99,9 +120,10 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
- 
+@@ -99,8 +120,9 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
+
      /* Initialize FM MURAM parameters which will be kept by the driver */
      p_FmMuram->baseAddr = baseAddress;
--    p_FmMuram->size = size;
-+    p_FmMuram->size = size - DBG_UCODE_RESVD_MURAM_SIZE;
+     p_FmMuram->size = size;
      p_FmMuram->h_Mem = h_Mem;
 -
 +    FmMurambaseAddr = (void *)baseAddress;
