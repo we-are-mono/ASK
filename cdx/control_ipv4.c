@@ -497,8 +497,6 @@ void IP_deleteCt_from_onif_index(U32 if_index)
 restart_loop:
 		slist_for_each_safe(pCtEntry, entry, &ct_cache[i], list)
 		{
-			if (IS_NATPT(pCtEntry))	// for now, ignore NAT-PT connections
-				continue;
 			/* Check the conntrack entry matching with the corresponding Rtentry */
 			if (!IS_NULL_ROUTE(pCtEntry->pRtEntry))
 			{

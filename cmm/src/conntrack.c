@@ -1122,9 +1122,8 @@ err:
 *
 *
 ******************************************************************/
-static int __cmmCtTunnelRouteRegister(struct ct_route *rt, struct ct_route *tunnel_rt, unsigned int Daddr4o6, 
-								unsigned int Dport4o6, struct flow *Saflow,
-								const char *dir)
+static int __cmmCtTunnelRouteRegister(struct ct_route *rt, struct ct_route *tunnel_rt,
+								struct flow *Saflow, const char *dir)
 {
 	struct interface *itf = NULL;
 	unsigned int dAddrV4, dAddrV6[4];
@@ -1170,9 +1169,8 @@ static int __cmmCtTunnelRouteRegister(struct ct_route *rt, struct ct_route *tunn
 				if (!____itf_is_4o6_tunnel(itf))
 					goto out;
 
-
-				if(getTunnel4rdAddress(itf, dAddrV6, Daddr4o6,Dport4o6) < 0)
-					goto err0;
+				/* Use tunnel remote address directly */
+				memcpy(dAddrV6, itf->tunnel_parm6.raddr.s6_addr32, 16);
 
 				SET_FLOW_PARAMS(flow, (unsigned int *)itf->tunnel_parm6.laddr.s6_addr,
 						dAddrV6,itf->tunnel_parm6.proto, itf->tunnel_family,
@@ -1621,7 +1619,7 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 		}
 		tmp = ctEntry->orig_tunnel.route;
 
-		rc = __cmmCtTunnelRouteRegister(&ctEntry->orig, &ctEntry->orig_tunnel,dAddrOrig[0], dPortOrig,
+		rc = __cmmCtTunnelRouteRegister(&ctEntry->orig, &ctEntry->orig_tunnel,
 								(SAEntry)? &SAEntry->Sa_flow : NULL, "originator tunnel");
 
 		if (ctEntry->orig_tunnel.route && !tmp)
@@ -1736,7 +1734,7 @@ replier:
 
 		tmp = ctEntry->rep_tunnel.route;
 
-		rc = __cmmCtTunnelRouteRegister(&ctEntry->rep, &ctEntry->rep_tunnel, dAddrRepl[0], dPortRepl,
+		rc = __cmmCtTunnelRouteRegister(&ctEntry->rep, &ctEntry->rep_tunnel,
 							(SAEntry)? &SAEntry->Sa_flow : NULL, "replier tunnel");
 
 		if (ctEntry->rep_tunnel.route && !tmp)

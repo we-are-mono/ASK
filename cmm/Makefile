@@ -54,7 +54,6 @@ SRCS := \
 	module_route.c \
 	module_socket.c \
 	module_rtp.c \
-	module_natpt.c \
 	module_wifi.c \
 	alt_conf.c \
 	voicebuf.c \

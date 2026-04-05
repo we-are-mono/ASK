@@ -43,7 +43,6 @@ enum EVENTS {
 	EVENT_FRAG4,
 	EVENT_RTP_RELAY,
 	EVENT_MSP,
-	EVENT_NATPT,
 	EVENT_PKTCAP,
 	EVENT_ICC,
 	EVENT_L2TP,
@@ -303,13 +302,6 @@ enum EVENTS {
 #define   	FC_MACVLAN		        0x0014
 #define 	CMD_MACVLAN_ENTRY		0x1401	
 #define 	CMD_MACVLAN_ENTRY_RESET 	0x1402
-// 0x1100: NAT-PT Module
-#define FC_NATPT				0x0011
-#define CMD_NATPT_OPEN				0x1101
-#define CMD_NATPT_CLOSE				0x1102
-#define CMD_NATPT_QUERY				0x1103
-
-
 // 0x1200: Fppdiag configuration
 #define FC_FPPDIAG					0x0012
 #define CMD_FPPDIAG_ENABLE		0x1201

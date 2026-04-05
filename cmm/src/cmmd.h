@@ -255,7 +255,6 @@ typedef struct cmmd_voice_file_unload_cmd {
 #define CMMD_CMD_TUNNEL_QUERY_CONT	FPP_CMD_TUNNEL_QUERY_CONT	
 #define CMMD_CMD_TUNNEL_SHOW		0x0B09
 #define CMMD_CMD_TUNNEL_SAMREADY	0x0B0a
-#define CMMD_CMD_TUNNEL_IDCONV_psid	FPP_CMD_TUNNEL_4rd_ID_CONV_psid
 
 /* CMM to Deamon message structure */
 typedef struct cmmd_tunnel {

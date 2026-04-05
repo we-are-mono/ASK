@@ -181,17 +181,6 @@ static inline char *get_port_name(int port_id, char *buf, int buf_size)
 #define LINK_KIND_MACVLAN	"macvlan"
 #define LINK_KIND_GRE6		"ip6gretap"
 
-#ifndef SIOCGET6RD
-#define SIOCGET6RD	(SIOCDEVPRIVATE + 8)
-
-struct ip_tunnel_6rd {
-	struct in6_addr		prefix;
-	u_int32_t		relay_prefix;
-	u_int16_t		prefixlen;
-	u_int16_t		relay_prefixlen;
-};
-#endif
-
 struct l2tp_itf_info {
 	u_int16_t local_tun_id;
 	u_int16_t peer_tun_id;
@@ -261,8 +250,6 @@ struct interface {
 		struct ip6_tnl_parm tunnel_parm6;
 		struct ip_tunnel_parm tunnel_parm4;
 	};
-	struct ip_tunnel_6rd tunnel_parm6rd;
-
 	int tunnel_flags;
 	int tunnel_family;
 	int tunnel_enabled;

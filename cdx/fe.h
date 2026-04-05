@@ -158,8 +158,6 @@ enum return_code {
 	ERR_NO_ROUTE_TO_SOCK = 1217,
 	ERR_SOCK_UPDATE_ERR = 1218,
 
-	ERR_NATPT_UNKNOWN_CONNECTION = 1220,
-
 	ERR_RTP_STATS_MAX_ENTRIES = 1230,
 	ERR_RTP_STATS_STREAMID_ALREADY_USED = 1231,
 	ERR_RTP_STATS_STREAMID_UNKNOWN = 1232,
@@ -613,8 +611,6 @@ typedef struct UDP_HDR_STRUCT
 #define IS_IPV6(pEntry) (pEntry->fftype == FFTYPE_IPV6)
 #define IS_IPV6_FLOW(pEntry) ((pEntry->fftype & FFTYPE_IPV6) != 0)
 #define IS_TUNNEL(pEntry) ((pEntry->fftype & FFTYPE_TUNNEL) != 0)
-#define IS_NATPT(pEntry) ((pEntry->fftype & FFTYPE_NATPT) != 0)
-
 static __inline U32 HASH_RT(U32 id)
 {
 	U16 sum;

@@ -126,7 +126,6 @@ typedef struct _ctPair
 #define	FFTYPE_IPV4	0x01
 #define FFTYPE_IPV6	0x02
 #define FFTYPE_TUNNEL	0x04
-#define FFTYPE_NATPT	0x08
 
 
 static inline U8 GET_PROTOCOL(PCtEntry pCtEntry)

@@ -89,7 +89,6 @@ cdx_cmd_objs = control_tx.o \
 	control_vlan.o \
 	control_pppoe.o \
 	control_socket.o \
-        control_natpt.o \
 	control_bridge.o \
 	control_stat.o \
 	control_ipsec.o \

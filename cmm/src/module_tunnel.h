@@ -23,14 +23,12 @@ struct tunnel_info
 	unsigned char ipsec 	   : 1,
 		itf_programmed : 1,
 		neigh_programmed : 1,
-		sa_programmed : 1,	
-		conf_6rd:1 ;
+		sa_programmed : 1;
 	unsigned int tunnel_proto;
 	unsigned int tunnel_family;
 	unsigned int mtu;
 	unsigned int local[4];
 	unsigned int remote[4];
-	struct ip_tunnel_6rd tunnel_parm6rd;
 };
 
 /* dscp proppagation */
@@ -51,8 +49,6 @@ void __cmmTunnelUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route);
 int __cmmGetTunnel(int fd, struct interface *itf, struct rtattr *tb[]);
 int __cmmGetTunnel_gre6(int fd, struct interface *itf, struct rtattr *tb[]);
 int cmmTnlQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmm4rdIdConvSetProcess(char ** keywords, int tabStart, int argc, daemon_handle_t daemon_handle);
-int getTunnel4rdAddress(struct interface* itf, u_int32_t * Daddrv6,  unsigned int Daddr, unsigned short Dport);
 
 #endif /* __MODULE_TUNNEL_H__ */
 

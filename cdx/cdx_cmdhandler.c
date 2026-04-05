@@ -57,8 +57,6 @@ int FCODE_TO_EVENT(U32 fcode)
 
 		case FC_WIFI_RX: eventid = EVENT_PKT_WIFIRX; break;
 
-		case FC_NATPT: eventid = EVENT_NATPT; break;
-
 		case FC_PKTCAP: eventid = EVENT_PKTCAP; break;
 
 		case FC_FPPDIAG: eventid = EVENT_IPV4; break;
@@ -137,7 +135,6 @@ CMD_DECLARE(ipv4)
 CMD_DECLARE(ipv6)
 CMD_DECLARE(socket)
 CMD_DECLARE(tunnel)
-CMD_DECLARE(natpt)
 CMD_DECLARE(bridge)
 CMD_DECLARE(qm)
 CMD_DECLARE(statistics)
@@ -167,7 +164,6 @@ int __init cdx_cmdhandler_init(void)
 	CMD_INIT(ipv6);
 	CMD_INIT(socket);
 	CMD_INIT(tunnel);
-	CMD_INIT(natpt);
 	CMD_INIT(bridge);
 	CMD_INIT(qm);
 	CMD_INIT(statistics);
@@ -214,7 +210,6 @@ void __exit cdx_cmdhandler_exit(void)
 	CMD_EXIT(statistics);
 	CMD_EXIT(qm);
 	CMD_EXIT(bridge);
-	CMD_EXIT(natpt);
 	CMD_EXIT(tunnel);
 	CMD_EXIT(socket);
 	CMD_EXIT(ipv6);

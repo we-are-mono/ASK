@@ -54,8 +54,6 @@ static int tunnel_print_info(struct tunnel_info *pInfo)
 	char remote[INET6_ADDRSTRLEN];
 	char local[INET6_ADDRSTRLEN];
 	char ifname[IFNAMSIZ];
-	char prefix[INET6_ADDRSTRLEN];
-	char relayprefix[INET_ADDRSTRLEN];
 
 	cmm_print(DEBUG_STDOUT, "Tunnel name        : %s\n", pInfo->ifname);
 	cmm_print(DEBUG_STDOUT, "tunnel_ family        : %d\n", pInfo->tunnel_family);
@@ -82,17 +80,7 @@ static int tunnel_print_info(struct tunnel_info *pInfo)
 		inet_ntop(AF_INET, &pInfo->local, local, INET_ADDRSTRLEN);
 
 		if(pInfo->tunnel_proto == IPPROTO_IPV6)
-		{
 			cmm_print(DEBUG_STDOUT, "Protocol           : 6-o-4 (%d)\n", pInfo->tunnel_proto);
-			if (pInfo->conf_6rd)
-			{
-				cmm_print(DEBUG_STDOUT, "6rd-prefix         : %s\n", inet_ntop(AF_INET6, &pInfo->tunnel_parm6rd.prefix, prefix, INET6_ADDRSTRLEN));
-				cmm_print(DEBUG_STDOUT, "6rd-prefixlen      : %d\n", pInfo->tunnel_parm6rd.prefixlen);
-				cmm_print(DEBUG_STDOUT, "6rd-relayprefix    : %s\n", inet_ntop(AF_INET, &pInfo->tunnel_parm6rd.relay_prefix, relayprefix, INET_ADDRSTRLEN));
-				cmm_print(DEBUG_STDOUT, "6rd-relayprefixlen : %d\n", pInfo->tunnel_parm6rd.relay_prefixlen);
-			}
-
-		}
 		else
 			cmm_print(DEBUG_STDOUT, "Protocol           : Unknown (%d)\n", pInfo->tunnel_proto);
 
@@ -963,9 +951,6 @@ static int tunnel_show(FCI_CLIENT *fci_handle, char *name, u_int16_t *res_buf, u
 			memcpy(&pInfo->remote, &itf->tunnel_parm4.iph.daddr, 4);
 			memcpy(&pInfo->local, &itf->tunnel_parm4.iph.saddr, 4);
 			pInfo->tunnel_proto = itf->tunnel_parm4.iph.protocol;
-			pInfo->conf_6rd = (itf->tunnel_flags & TNL_6RD) ? 1: 0;
-			if(itf->tunnel_flags & TNL_6RD)
-				memcpy(&pInfo->tunnel_parm6rd, &itf->tunnel_parm6rd, sizeof(struct ip_tunnel_6rd));
 		}
 		
 		*res_len = sizeof(struct tunnel_info) + 4;
@@ -1005,57 +990,19 @@ int tunnel_daemon_msg_recv(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, i
 	return 0;
 }
 
-static u_int32_t try_6rd(const u_int32_t *daddr, struct interface *itf)
-{
-	u_int32_t dst = 0;
-
-	if (itf->tunnel_flags & TNL_6RD)
-	{
-		if (cmmPrefixEqual(daddr, itf->tunnel_parm6rd.prefix.s6_addr32, itf->tunnel_parm6rd.prefixlen)) {
-			unsigned pbw0, pbi0;
-			int pbi1;
-			u_int32_t d;
-
-			pbw0 = itf->tunnel_parm6rd.prefixlen >> 5;
-			pbi0 = itf->tunnel_parm6rd.prefixlen & 0x1f;
-
-			d = (ntohl(daddr[pbw0]) << pbi0) >> itf->tunnel_parm6rd.relay_prefixlen;
-
-			pbi1 = pbi0 - itf->tunnel_parm6rd.relay_prefixlen;
-			if (pbi1 > 0)
-				d |= ntohl(daddr[pbw0 + 1]) >> (32 - pbi1);
-
-			dst = (itf->tunnel_parm6rd.relay_prefix & ((1 << itf->tunnel_parm6rd.relay_prefixlen) - 1)) | htonl(d);
-		}
-	}
-	else
-	{
-		if (((u_int16_t *)daddr)[0] == htons(0x2002)) {
-			/* 6to4 v6 addr has 16 bits prefix, 32 v4addr, 16 SLA, ... */
-			memcpy(&dst, &((u_int16_t *)daddr)[1], 4);
-		}
-	}
-
-	return dst;
-}
-
 unsigned int tunnel_get_ipv4_dst(struct RtEntry *route, struct interface *itf)
 {
-	unsigned int dst;
+	unsigned int dst = 0;
 
-#if defined(PROPRIETARY_6RD)
-	dst = try_6rd(route->dAddr, itf);
+	/* Check for 6to4 address (2002::/16) - first 16 bits of the IPv6
+	 * address are in the high half of dAddr[0] (network byte order). */
+	if ((route->dAddr[0] & htonl(0xFFFF0000)) == htonl(0x20020000)) {
+		/* 6to4 v6 addr: 16-bit prefix | 32-bit v4addr | 16-bit SLA | ...
+		 * The embedded IPv4 address spans the low 16 bits of dAddr[0]
+		 * and the high 16 bits of dAddr[1]. */
+		memcpy(&dst, (char *)route->dAddr + 2, 4);
+	}
 
-	if (!dst)
-		dst = try_6rd(route->gwAddr, itf);
-
-	if (!dst)
-		dst = itf->tunnel_parm6rd.relay_prefix;
-
-#else
-	dst = try_6rd(route->dAddr, itf);
-
-	/* FIXME this doesn't match exactly the Linux ipv6->ipv4 address mapping */
 	if (!dst)
 	{
 		/* ipv6 addr compatible v4 */
@@ -1063,41 +1010,8 @@ unsigned int tunnel_get_ipv4_dst(struct RtEntry *route, struct interface *itf)
 			route->gwAddr[3] && (route->gwAddr[3] != htonl(0x00000001)))
 			dst = route->gwAddr[3];
 	}
-#endif
 
 	return dst;
-}
-
-/************************************************************
- *
- * __cmmGetTunnel6rd
- * Role : Check if interface is a 6rd tunnel and retrieve info from kernel
- ************************************************************/
-static void __cmmGetTunnel6rd(int fd, struct interface *itf)
-{
-	struct ifreq ifr;
-	int rc;
-
-	itf->tunnel_flags &= ~TNL_6RD;
-	memset(&itf->tunnel_parm6rd, 0, sizeof(struct ip_tunnel_6rd));
-
-	if (____itf_get_name(itf, ifr.ifr_name, sizeof(ifr.ifr_name)) < 0)
-	{
-		cmm_print(DEBUG_ERROR, "%s: ____itf_get_name(%d) failed\n", __func__, itf->ifindex);
-
-		goto out;
-	}
-
-	ifr.ifr_ifru.ifru_data = (void *)&itf->tunnel_parm6rd;
-
-	rc = ioctl(fd, SIOCGET6RD, &ifr);
-	if (rc < 0)
-		goto out;
-
-	itf->tunnel_flags |= TNL_6RD;
-
-out:
-	return;
 }
 
 /************************************************************
@@ -1192,8 +1106,6 @@ int __cmmGetTunnel(int fd, struct interface *itf, struct rtattr *tb[])
 		rc = ioctl(fd, SIOCGETTUNNEL, &ifr);
 		if (rc < 0)
 			goto out;
-
-		__cmmGetTunnel6rd(fd, itf);
 
 		itf->itf_flags |= ITF_TUNNEL;
 		itf->tunnel_family = AF_INET;
@@ -1426,12 +1338,6 @@ found:
 }
 
 
-int cmm4rdIdConvSetProcess(char ** keywords, int tabStart, int argc, daemon_handle_t daemon_handle)
-{
-	cmm_print(DEBUG_STDERR, "4RD ID conversion is no longer supported\n");
-	return -1;
-}
-
 int cmmTnlQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
 {
         int rcvBytes = 0;
@@ -1486,13 +1392,4 @@ int cmmTnlQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
            cmm_print(DEBUG_STDOUT, "Total Tunnel Entries:%d\n", count);
 
         return CLI_OK;
-}
-
-int getTunnel4rdAddress(struct interface* itf, u_int32_t * Daddrv6,  unsigned int Daddr, unsigned short Dport)
-{
-	int i;
-	/* Use tunnel remote address directly (4RD map rules removed) */
-	for (i = 0; i < 4; i++)
-		Daddrv6[i] = itf->tunnel_parm6.raddr.s6_addr32[i];
-	return 0;
 }

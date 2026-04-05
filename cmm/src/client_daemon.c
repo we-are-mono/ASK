@@ -146,9 +146,6 @@ char * getErrorString(unsigned short error)
 	caseretstr(FPP_ERR_SOCK_UPDATE_ERR);
 #endif //LS1043
 
-	/* ------------------------------- NATPT ---------------------------------*/
-	caseretstr(FPP_ERR_NATPT_UNKNOWN_CONNECTION);
-
 	/* ------------------------------- RTP -----------------------------------*/
 	caseretstr(FPP_ERR_RTP_STATS_MAX_ENTRIES);
 	caseretstr(FPP_ERR_RTP_STATS_STREAMID_ALREADY_USED);
@@ -243,7 +240,6 @@ void cmmClientPrintHelp()
 									"\tsocket: Manage Socket module\n"
 									"\tsocket6: Manage V6 socket module\n"
 									"\trtp: Manage RTP Relay module\n"
-									"\tnatpt: Manage NAT-PT module\n"
 									"\tsa_query_timer: Manage IPsec SA query timer module\n"
 #ifdef C2000_DPI
 									"\tdpi: Manage DPI Enable/disable\n"
@@ -256,9 +252,7 @@ void cmmClientPrintHelp()
 									"\tff: manage fast forwarding control\n"
 									"\tipsec: manage ipsec configurations\n"
 									"\tvoicebuf: manage voicebuf control \n"
-									"\tfrag: manage ipv4/ipv6 fragmentation configurations\n"		
-									"\t4rd-id-conversion: Enable/ Disable IPv4 header Identification conversion,\n"
-									"\t\tfor 4rd interfaces\n");
+									"\tfrag: manage ipv4/ipv6 fragmentation configurations\n");
 	cmm_print(DEBUG_STDOUT, "\nCommand usage: show <module_name> [option ...]\n"
 									"\trx: show RX module (ICC, Bridging  ...)\n"
 									"\tqm: show QM module (QOS, Rate Limiting....)\n"
@@ -294,7 +288,6 @@ void cmmClientPrintHelp()
 									"\tsocket: IPV4 sockets\n"
 									"\trtcp: RTP relay statistics\n"
 									"\trtpstats: RTP statistics for Fast Forwarded connections\n"
-				  					"\tnatpt: NAT-PT Entries\n"
 				  					"\tl2flows: L2 and L3-4 flows Entries\n"
 									"\tmacvlan: Mac-vlan interfaces\n"
 									"\ttunnels: tunnel interfaces\n");
@@ -581,11 +574,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 			if (cmmRTPStatsSetProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
-		else if (strcasecmp(keywords[1], "natpt") == 0)
-		{
-			if (cmmNATPTSetProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
 		else if (strcasecmp(keywords[1], "voicebuf") == 0)
 		{
 			if (cmmVoiceBufSetProcess(cpt - 2, &keywords[2], daemon_handle))
@@ -599,11 +587,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		else if (strcasecmp(keywords[1], "bridge") == 0)
 		{
 			if (cmmBridgeControlProcess(keywords, 2, daemon_handle))
-				return -1;
-		}		
-		else if (strcasecmp(keywords[1], "4rd-id-conversion") == 0)
-		{
-			if (cmm4rdIdConvSetProcess(keywords, 2, (cpt - 2), daemon_handle))
 				return -1;
 		}
 		else
@@ -801,11 +784,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
                         if(cmmTnlQueryProcess(keywords, 2, daemon_handle))
                         		return -1;
                 }
-		else if (strcasecmp(keywords[1], "natpt") == 0)
-		{
-		  		if(cmmNATPTQueryProcess(keywords, 2, daemon_handle))
-		  				return -1;
-  		}
 #ifdef AUTO_BRIDGE
 		else if (strcasecmp(keywords[1], "l2flows") == 0)
 		{
@@ -1299,7 +1277,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case CMMD_CMD_TUNNEL_ADD:
 	case CMMD_CMD_TUNNEL_DEL:
  	case CMMD_CMD_TUNNEL_SHOW:
-	case CMMD_CMD_TUNNEL_IDCONV_psid:
 		return tunnel_daemon_msg_recv(ctx->fci_handle, ctx->fci_key_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
 
         case CMMD_CMD_PPPOE_RELAY_ADD:
@@ -1347,9 +1324,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_RX_L2BRIDGE_QUERY_STATUS:
 	case FPP_CMD_RX_L2BRIDGE_QUERY_ENTRY:
 		return cmmL2BridgeProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len); 
-
-	case FPP_CMD_NATPT_OPEN:
-		return cmmNATPTOpenProcessClientCmd(ctx->fci_handle, cmd_buf, cmd_len, res_buf, res_len);
 
 	// Special processing for QM Reset and Scheduler config (need to notify eth driver)
 	
@@ -1478,8 +1452,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_RTP_STATS_DISABLE:
 	case FPP_CMD_RTP_STATS_QUERY:
 	case FPP_CMD_RTP_STATS_DTMF_PT:
-	case FPP_CMD_NATPT_CLOSE:
-	case FPP_CMD_NATPT_QUERY:
 	case FPP_CMD_PKTCAP_IFSTATUS:
 	case FPP_CMD_PKTCAP_SLICE:
 	case FPP_CMD_PKTCAP_FLF:
@@ -1487,7 +1459,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_MACVLAN_ENTRY:
 	case FPP_CMD_TUNNEL_QUERY:
 	case FPP_CMD_TUNNEL_QUERY_CONT:
-	case FPP_CMD_TUNNEL_4rd_ID_CONV_dport:
 		goto FCI_CMD;
 
 	// Other commands, we refuse

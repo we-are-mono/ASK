@@ -64,7 +64,6 @@
 #define VLAN_ADD_HM_VALID       (1 << 6)
 #define EHASH_BRIDGE_FLOW       (1 << 7)
 #define PPPoE_STRIP_HM_VALID    (1 << 8)
-#define NAT_HM_NATPT            (1 << 9)
 #define NAT_V6	                (1 << 10)
 #define EHASH_IPV6_FLOW		(1 << 11)
 
@@ -597,17 +596,15 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 	twin_entry = CT_TWIN(entry);
 
 	//routing and ttl decr are mandatory
-	//ttl decr handled as part of NAT-PT
 
 	//mask it as ipv6 flow if required
 	if (IS_IPV6_FLOW(entry))
 	{
 		info->flags |= EHASH_IPV6_FLOW;
-		ethertype   =  ETHERTYPE_IPV6; 
+		ethertype   =  ETHERTYPE_IPV6;
 	}
 
-	if (!IS_NATPT(entry))
-		info->flags |= TTL_HM_VALID;
+	info->flags |= TTL_HM_VALID;
 
 	//strip vlan on ingress if incoming iface is vlan
 	if (info->l2_info.vlan_present)
@@ -626,23 +623,7 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 	}
 #endif
 	//perform NAT where required
-	if (IS_NATPT(entry)) {
-		info->flags |= (NAT_HM_NATPT | NAT_HM_REPLACE_SPORT | NAT_HM_REPLACE_DPORT);
-		info->nat_sport = twin_entry->Dport;
-		info->nat_dport = twin_entry->Sport;
-		if (IS_IPV6_FLOW(twin_entry))
-		{
-			info->flags |= NAT_V6;
-			memcpy(info->v6.nat_sip, twin_entry->Daddr_v6, IPV6_ADDRESS_LENGTH);
-			memcpy(info->v6.nat_dip, twin_entry->Saddr_v6, IPV6_ADDRESS_LENGTH);
-		}
-		else
-		{
-			info->v4.nat_sip = entry->twin_Daddr;
-			info->v4.nat_dip = entry->twin_Saddr;
-		}
-		rebuild_l2_hdr = 1;
-	} else {
+	{
 		if (IS_IPV4_NAT(entry) || IS_IPV6_NAT(entry)) {
 			switch(entry->proto) {
 				case IPPROTOCOL_TCP:
@@ -2214,66 +2195,6 @@ static int create_nat_hm(struct ins_entry_info *info)
 	if (info->opc_count == MAX_OPCODES)
 		return FAILURE;
 
-	//handle NATPT case
-	if (info->flags & NAT_HM_NATPT) {
-		struct en_ehash_natpt_hdr *ptr;
-		PCtEntry entry;
-		PCtEntry twin_entry;
-		uint32_t word;
-
-		entry = info->entry;
-		twin_entry = CT_TWIN(entry);
-		ptr = (struct en_ehash_natpt_hdr *)info->paramptr;
-		if (IS_IPV4_FLOW(twin_entry)) {
-			ipv4_hdr_t *hdr;
-			info->eth_type = ETHERTYPE_IPV4;
-
-			/* 6 to 4 */
-			printk("%s::changing ipv6 hdr to ipv4\n", __FUNCTION__);
-			opcode = NATPT_6to4;
-			size = (sizeof(struct en_ehash_natpt_hdr) +
-					sizeof(ipv4_hdr_t));
-			if (size > info->param_size)
-				return FAILURE;
-			memset(ptr, 0, size);
-			/* inherit TOS and TTL values from ipv6 header fields
-				 ipident from flow */
-			word = (NATPT_TOU | NATPT_TLU | (sizeof(ipv4_hdr_t) << 16)
-					| IPID_STARTVAL);
-			ptr->word = cpu_to_be32(word);
-			hdr = (ipv4_hdr_t *)&ptr->l3hdr[0];
-			hdr->Version_IHL = 0x45;
-			hdr->SourceAddress = (twin_entry->Daddr_v4);
-			hdr->DestinationAddress = (twin_entry->Saddr_v4);
-		} 
-		else 
-		{
-			ipv6_hdr_t *hdr;
-			info->eth_type = ETHERTYPE_IPV6;
-
-			/* 4 to 6 */
-			printk("%s::changing ipv4 hdr to ipv6\n", __FUNCTION__);
-			opcode = NATPT_4to6;
-			size = (sizeof(struct en_ehash_natpt_hdr) +
-					sizeof(ipv6_hdr_t));
-			if (size > info->param_size)
-				return FAILURE;
-			memset(ptr, 0, size);
-			/* inherit Traffic class and hoplimit from ipv4 header fields */
-			word = (NATPT_TCU | NATPT_HLU | (sizeof(ipv6_hdr_t) << 16));
-			ptr->word = cpu_to_be32(word);
-			hdr = (ipv6_hdr_t *)&ptr->l3hdr[0];
-			hdr->Version_TC_FLHi = 0x60;
-			memcpy(&hdr->SourceAddress[0], twin_entry->Daddr_v6, 16);
-			memcpy(&hdr->DestinationAddress[0], twin_entry->Saddr_v6, 16);
-		}
-		//update opcode and param pointers and size
-		info->paramptr += size;
-		info->param_size -= size;
-		*(info->opcptr) = opcode;
-		info->opcptr++;
-		return SUCCESS;
-	}
 	size = 0;
 	opcode = 0;
 	if(info->flags & TTL_HM_VALID) {
@@ -3017,7 +2938,6 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 #endif
 
 	//routing and ttl decr are mandatory
-	//ttl decr handled as part of NAT-PT
 
 	/*  Addition of IP header requires the header to be inserted at the start of the packet.
 			So we need to strip and rebuild the l2 header after tunnel header insertion. */
@@ -3345,7 +3265,6 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 
 
 	//routing and ttl decr are mandatory
-	//ttl decr handled as part of NAT-PT
 
 	//mask it as ipv6 flow if required
 	if (pFromSocket->SocketFamily == PROTO_IPV6)
@@ -3379,7 +3298,6 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 	}
 #endif // TODO_IPSEC
 
-	//Not expecting NATPT for rtp-relay traffic
 	info->flags |= NAT_HM_REPLACE_SPORT;
 	info->flags |= NAT_HM_REPLACE_DPORT;
 	info->flags |= NAT_HM_REPLACE_SIP;

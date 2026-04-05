@@ -63,8 +63,6 @@
 
 /* CMM tunnel entry states */
 #define TNL_IPSEC      		(1 << 0)
-#define TNL_6RD			(1 << 1)
-
 #define TNL_6O4			1
 #define TNL_4O6			2
 #define TNL_GRE_IPV6		4

@@ -1065,7 +1065,6 @@ static int __cmmRouteIsTnlConn (int family, const unsigned int* daddr,
 	int addr_len = IPADDRLEN(family);
 	int rc = 0;
 	struct RtEntry* route;
-	unsigned short dport;
 
 	/* Conntracks pointing to a tunnel interface */
 	if (dir & ORIGINATOR)
@@ -1106,13 +1105,8 @@ static int __cmmRouteIsTnlConn (int family, const unsigned int* daddr,
 		if (!____itf_is_4o6_tunnel(itf))
 			goto free_itf;
 
-		if (dir & ORIGINATOR)
-			dport = nfct_get_attr_u16(ctEntry->ct, ATTR_ORIG_PORT_DST);
-		else
-			dport = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_DST);
-
-		if(getTunnel4rdAddress(itf, tunnel_daddr, *daddr , dport) < 0)
-			goto free_itf;
+		/* Use tunnel remote address directly */
+		memcpy(tunnel_daddr, itf->tunnel_parm6.raddr.s6_addr32, 16);
 
 		if (prefix_match)
 		{

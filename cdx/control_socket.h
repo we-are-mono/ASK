@@ -29,7 +29,6 @@ extern struct slist_head sockid_cache[];
 enum {
 	SOCK_OWNER_RTP_RELAY,
 	SOCK_OWNER_L2TP,
-	SOCK_OWNER_NATPT,
 	SOCK_OWNER_NATT,
 	SOCK_OWNER_NONE = 0xff
 };

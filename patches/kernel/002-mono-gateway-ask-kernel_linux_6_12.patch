@@ -1,179 +1,3 @@
-From b37312a4f694db338c1889f91063322dda953d3f Mon Sep 17 00:00:00 2001
-From: Tomaz Zaman <tomaz@mono.si>
-Date: Sat, 4 Apr 2026 15:40:07 +0200
-Subject: [PATCH] Port NXP ASK to Linux 6.12 with UAPI header fixes
-
-Port NXP Application Solutions Kit modifications to Linux 6.12:
-- DPAA/FMAN driver enhancements for fast-path offloading
-- IPsec hardware offload (IPv4 + IPv6)
-- Netfilter QoS marking extensions (QOSMARK, QOSCONNMARK)
-- Bridge fast-path integration
-- QBMan portal NAPI support
-- PPP/PPPoE offload hooks
-
-Fix UAPI header sanitization: remove all CONFIG_* guards from
-userspace-visible headers (if.h, if_arp.h, if_tunnel.h, ip6_tunnel.h,
-nf_conntrack_common.h, nf_conntrack_tuple_common.h, nfnetlink_conntrack.h,
-netlink.h, pfkeyv2.h, ppp-ioctl.h, rtnetlink.h). These defines are now
-unconditional in UAPI headers, fixing make headers_install failures.
-
-Signed-off-by: Tomaz Zaman <tzaman@zaman.io>
----
- Makefile                                      |    5 +
- drivers/crypto/caam/pdb.h                     |   12 +-
- .../net/ethernet/freescale/sdk_dpaa/Kconfig   |    6 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    |   51 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   21 +-
- .../freescale/sdk_dpaa/dpaa_eth_ceetm.c       |    1 +
- .../freescale/sdk_dpaa/dpaa_eth_common.c      |  131 +-
- .../freescale/sdk_dpaa/dpaa_eth_common.h      |   40 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  967 ++++++-
- .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
- .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
- drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
- .../freescale/sdk_dpaa/offline_port.c         |   53 +
- .../net/ethernet/freescale/sdk_fman/Kconfig   |   12 +
- .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  220 ++
- .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
- .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
- .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
- .../sdk_fman/Peripherals/FM/Pcd/Makefile      |    7 +-
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 2286 ++++++++++++++---
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |  130 +
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1378 ++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1987 ++++++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |   21 +
- .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    |  125 +
- .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.c      |  296 ++-
- .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.h      |   40 +
- .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c     |   13 +-
- .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h     |    1 +
- .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  155 +-
- .../sdk_fman/Peripherals/FM/Port/fm_port.h    |    3 +
- .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   35 +
- .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
- .../freescale/sdk_fman/Peripherals/FM/fm.c    |   77 +-
- .../sdk_fman/Peripherals/FM/fm_muram.c        |   49 +-
- .../sdk_fman/Peripherals/FM/inc/fm_common.h   |  116 +-
- .../sdk_fman/Peripherals/FM/inc/fm_hc.h       |   17 +
- .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
- .../ethernet/freescale/sdk_fman/etc/memcpy.c  |   19 +
- .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1690 ++++++++++++
- .../sdk_fman/inc/Peripherals/fm_ext.h         |   47 +
- .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
- .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  156 +-
- .../sdk_fman/inc/Peripherals/fm_port_ext.h    |   19 +
- .../sdk_fman/inc/Peripherals/fm_vsp_ext.h     |   14 +
- .../freescale/sdk_fman/inc/flib/fsl_fman.h    |    1 +
- .../sdk_fman/inc/flib/fsl_fman_port.h         |    4 +-
- .../freescale/sdk_fman/inc/stdlib_ext.h       |   47 +-
- .../freescale/sdk_fman/ls1043_dflags.h        |    2 +
- .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   12 +-
- .../src/inc/wrapper/lnxwrp_fsl_fman.h         |    2 +
- .../freescale/sdk_fman/src/system/sys_io.c    |    4 +
- .../sdk_fman/src/wrapper/lnxwrp_fm.c          |   27 +
- .../sdk_fman/src/wrapper/lnxwrp_fm.h          |    3 +-
- .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |    9 +-
- .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |   49 +-
- .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |    8 +
- .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c    |  192 ++
- .../src/wrapper/lnxwrp_sysfs_fm_port.c        |    8 +-
- .../freescale/sdk_fman/src/xx/xx_arm_linux.c  |    7 +
- drivers/net/ppp/ppp_generic.c                 |   12 +
- drivers/net/ppp/pppoe.c                       |   23 +
- drivers/net/usb/usbnet.c                      |   23 +-
- drivers/staging/fsl_qbman/Kconfig             |    7 +
- drivers/staging/fsl_qbman/fsl_usdpaa.c        |    2 +-
- drivers/staging/fsl_qbman/qman_config.c       |    2 +
- drivers/staging/fsl_qbman/qman_high.c         |  121 +-
- include/linux/fsl_oh_port.h                   |   26 +
- include/linux/fsl_qman.h                      |    6 +
- include/linux/if_bridge.h                     |   17 +
- include/linux/netdevice.h                     |   29 +
- include/linux/poll.h                          |    1 -
- include/linux/skbuff.h                        |   15 +
- include/net/ip6_tunnel.h                      |    4 +-
- include/net/netfilter/nf_conntrack.h          |   52 +-
- include/net/netns/xfrm.h                      |    3 +
- include/net/tcp.h                             |    5 +
- include/net/xfrm.h                            |   47 +
- .../uapi/linux/fmd/Peripherals/fm_ioctls.h    |   28 +
- .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   39 +
- include/uapi/linux/if.h                       |    3 +
- include/uapi/linux/if_arp.h                   |    1 +
- include/uapi/linux/if_tunnel.h                |    1 +
- include/uapi/linux/ip6_tunnel.h               |    1 +
- .../linux/netfilter/nf_conntrack_common.h     |   11 +-
- .../linux/netfilter/nfnetlink_conntrack.h     |   18 +
- include/uapi/linux/netfilter/xt_QOSCONNMARK.h |   10 +
- include/uapi/linux/netfilter/xt_QOSMARK.h     |    6 +
- include/uapi/linux/netfilter/xt_qosconnmark.h |   35 +
- include/uapi/linux/netfilter/xt_qosmark.h     |   19 +
- include/uapi/linux/netlink.h                  |    6 +-
- include/uapi/linux/pfkeyv2.h                  |    1 +
- include/uapi/linux/ppp-ioctl.h                |    1 +
- include/uapi/linux/rtnetlink.h                |    1 -
- net/Kconfig                                   |    9 +
- net/bridge/br.c                               |   54 +
- net/bridge/br_fdb.c                           |   60 +
- net/bridge/br_forward.c                       |    6 +-
- net/bridge/br_input.c                         |   12 +
- net/bridge/br_private.h                       |   10 +
- net/bridge/br_stp_if.c                        |    4 +
- net/bridge/br_vlan.c                          |   20 +-
- net/core/dev.c                                |   81 +-
- net/core/gro.c                                |    5 +
- net/core/rtnetlink.c                          |   19 +
- net/core/skbuff.c                             |   52 +-
- net/ipv4/Kconfig                              |    6 +
- net/ipv4/ip_output.c                          |   38 +-
- net/ipv4/ip_tunnel.c                          |    3 +
- net/ipv4/xfrm4_policy.c                       |   13 +
- net/ipv6/Kconfig                              |    6 +
- net/ipv6/ip6_output.c                         |   31 +-
- net/ipv6/ip6_tunnel.c                         |   13 +-
- net/ipv6/netfilter/ip6t_NPT.c                 |   29 +
- net/ipv6/output_core.c                        |   19 +
- net/ipv6/sit.c                                |    3 +
- net/ipv6/udp.c                                |    1 -
- net/ipv6/xfrm6_policy.c                       |   10 +
- net/key/af_key.c                              |  886 +++++++
- net/netfilter/Kconfig                         |   24 +
- net/netfilter/Makefile                        |    3 +
- net/netfilter/comcerto_fp_netfilter.c         |  487 ++++
- net/netfilter/nf_conntrack_core.c             |   75 +-
- net/netfilter/nf_conntrack_netlink.c          |  173 +-
- net/netfilter/nf_conntrack_proto_tcp.c        |    4 +
- net/netfilter/nf_conntrack_standalone.c       |   13 +
- net/netfilter/xt_qosconnmark.c                |  171 ++
- net/netfilter/xt_qosmark.c                    |   85 +
- net/wireless/Kconfig                          |    6 +-
- net/wireless/wext-core.c                      |    3 +
- net/xfrm/Makefile                             |    1 +
- net/xfrm/ipsec_flow.c                         |  221 ++
- net/xfrm/ipsec_flow.h                         |   31 +
- net/xfrm/xfrm_input.c                         |   14 +
- net/xfrm/xfrm_output.c                        |   95 +
- net/xfrm/xfrm_policy.c                        |   94 +
- net/xfrm/xfrm_state.c                         |  165 ++
- net/xfrm/xfrm_user.c                          |    4 +
- 139 files changed, 13795 insertions(+), 571 deletions(-)
- create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
- create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
- create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
- create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
- create mode 100644 include/linux/fsl_oh_port.h
- create mode 100644 include/uapi/linux/netfilter/xt_QOSCONNMARK.h
- create mode 100644 include/uapi/linux/netfilter/xt_QOSMARK.h
- create mode 100644 include/uapi/linux/netfilter/xt_qosconnmark.h
- create mode 100644 include/uapi/linux/netfilter/xt_qosmark.h
- create mode 100644 net/netfilter/comcerto_fp_netfilter.c
- create mode 100644 net/netfilter/xt_qosconnmark.c
- create mode 100644 net/netfilter/xt_qosmark.c
- create mode 100644 net/xfrm/ipsec_flow.c
- create mode 100644 net/xfrm/ipsec_flow.h
-
 diff --git a/Makefile b/Makefile
 index 66ae67c52da8..a1d4113d3f65 100644
 --- a/Makefile
@@ -2112,25 +1936,18 @@ index 3a6d1810b525..f977e4526f27 100644
  	int "Maximum L2 frame size"
  	range 64 9600
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 80fb535231b9..459e5872374f 100644
+index 80fb535231b9..d98a0d5c26ff 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-@@ -67,6 +67,14 @@
+@@ -67,6 +67,7 @@
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_CMD_SHIFT       24
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_BPID            16
  
 +
-+#ifdef CONFIG_DBG_UCODE_INFRA
-+#define HC_HCOR_OPCODE_DBG_UCODE_CMD  0x1e
-+#ifdef CONFIG_DMAR_TEST
-+#define HC_HCOR_OPCDOE_DMA_READ_TEST 0x1f
-+#endif //CONFIG_DMAR_TEST
-+#endif // CONFIG_DBG_UCODE_INFRA
-+
  #define HC_HCOR_GBL                         0x20000000
  
  #define HC_HCOR_KG_SCHEME_COUNTER           0x00000400
-@@ -79,6 +87,9 @@
+@@ -79,6 +80,9 @@
  #define SIZE_OF_HC_FRAME_PROFILE_CNT        (sizeof(t_HcFrame)-sizeof(t_FmPcdPlcrProfileRegs)+sizeof(uint32_t))
  #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
  
@@ -2140,19 +1957,15 @@ index 80fb535231b9..459e5872374f 100644
  #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
  
  #define BUILD_FD(len)                     \
-@@ -113,6 +124,11 @@ typedef struct t_HcFrame {
+@@ -113,6 +117,7 @@ typedef struct t_HcFrame {
          volatile uint32_t                       clsPlanEntries[CLS_PLAN_NUM_PER_GRP];
          t_FmPcdCcCapwapReassmTimeoutParams      ccCapwapReassmTimeout;
          t_FmPcdCcReassmTimeoutParams            ccReassmTimeout;
-+#ifdef CONFIG_DMAR_TEST
-+	volatile uint8_t			data[64];
-+#else
 +	volatile uint8_t			data[48];
-+#endif //CONFIG_DMAR_TEST
      } hcSpecificData;
  } t_HcFrame;
  
-@@ -1195,6 +1211,97 @@ t_Error FmHcPcdCcDoDynamicChange(t_Handle h_FmHc, uint32_t oldAdAddrOffset, uint
+@@ -1195,6 +1200,97 @@ t_Error FmHcPcdCcDoDynamicChange(t_Handle h_FmHc, uint32_t oldAdAddrOffset, uint
      return E_OK;
  }
  
@@ -2250,123 +2063,6 @@ index 80fb535231b9..459e5872374f 100644
  t_Error FmHcPcdSync(t_Handle h_FmHc)
  {
      t_FmHc                  *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -1250,3 +1357,116 @@ bool FmIsHcUsageAllowed(t_Handle h_FmHc)
- 
- 	return p_FmHc->usageAllowed;
- }
-+
-+#ifdef CONFIG_DBG_UCODE_INFRA
-+t_Error FmHcPcdDbgUcodeHCmd(t_Handle h_FmHc,
-+			   uint32_t muram_offset,
-+			   uint8_t  *data,
-+			   uint8_t	size)
-+{
-+    t_FmHc                  *p_FmHc = (t_FmHc*)h_FmHc;
-+    t_HcFrame               *p_HcFrame;
-+    t_DpaaFD                fmFd;
-+    t_Error                 err = E_OK;
-+    uint32_t                seqNum, ii;
-+    uint8_t		   *hc_data;
-+
-+
-+    SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
-+
-+    p_HcFrame = GetBuf(p_FmHc, &seqNum);
-+    if (!p_HcFrame)
-+        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
-+    memset(p_HcFrame, 0, sizeof(t_HcFrame));
-+
-+    p_HcFrame->opcode     = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_DBG_UCODE_CMD);
-+    p_HcFrame->actionReg = muram_offset;
-+    p_HcFrame->extraReg =  size;
-+    hc_data = (uint8_t *)p_HcFrame->hcSpecificData.data;
-+    for (ii=0; ii<size; ii++)
-+	hc_data[ii] =  data[ii];
-+
-+    BUILD_FD(SIZE_OF_HC_FRAME_READ_DBG_UCODE_CMD);
-+
-+    err = EnQFrm(p_FmHc, &fmFd, seqNum);
-+
-+    PutBuf(p_FmHc, p_HcFrame, seqNum);
-+    if (err != E_OK)
-+        RETURN_ERROR(MAJOR, err, NO_MSG);
-+
-+    return E_OK;
-+}
-+
-+t_Error FmHcPcdDbgUcodeTest(t_Handle h_FmHc,
-+			uint32_t opcode,
-+			uint32_t *data,
-+			uint16_t data_size)
-+{
-+    t_FmHc                  *p_FmHc = (t_FmHc*)h_FmHc;
-+    t_HcFrame               *p_HcFrame;
-+    t_DpaaFD                fmFd;
-+    t_Error                 err = E_OK;
-+    uint32_t                seqNum;
-+
-+    SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
-+
-+    p_HcFrame = GetBuf(p_FmHc, &seqNum);
-+    if (!p_HcFrame)
-+	RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
-+    memset(p_HcFrame, 0, sizeof(t_HcFrame));
-+
-+    p_HcFrame->opcode	  = opcode;
-+    p_HcFrame->actionReg  = *data;
-+    p_HcFrame->extraReg = data_size;
-+
-+    BUILD_FD(SIZE_OF_HC_FRAME_READ_DBG_UCODE_CMD);
-+
-+    err = EnQFrm(p_FmHc, &fmFd, seqNum);
-+
-+    PutBuf(p_FmHc, p_HcFrame, seqNum);
-+
-+    if (err != E_OK)
-+	RETURN_ERROR(MAJOR, err, NO_MSG);
-+
-+    return E_OK;
-+}
-+#ifdef CONFIG_DMAR_TEST
-+
-+t_Error FmHcPcdDMAreadTest(t_Handle h_FmHc, uint32_t muram_addr_offset,
-+									 uint8_t *ptr, uint8_t size)
-+{
-+    t_FmHc                  *p_FmHc = (t_FmHc*)h_FmHc;
-+    t_HcFrame               *p_HcFrame;
-+    uint8_t					*data;
-+    t_DpaaFD                fmFd;
-+    t_Error                 err = E_OK;
-+    uint32_t                seqNum, ii;
-+
-+    SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
-+
-+    p_HcFrame = GetBuf(p_FmHc, &seqNum);
-+    if (!p_HcFrame)
-+	RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
-+    memset(p_HcFrame, 0, sizeof(t_HcFrame));
-+
-+    p_HcFrame->opcode	  = HC_HCOR_OPCDOE_DMA_READ_TEST;
-+    p_HcFrame->actionReg  = muram_addr_offset;
-+    p_HcFrame->extraReg = size;
-+    data = p_HcFrame->hcSpecificData.data;
-+    memcpy(data, ptr, size);
-+
-+    BUILD_FD(SIZE_OF_HC_FRAME_READ_DBG_UCODE_CMD+16);
-+
-+    err = EnQFrm(p_FmHc, &fmFd, seqNum);
-+
-+    PutBuf(p_FmHc, p_HcFrame, seqNum);
-+
-+    if (err != E_OK)
-+	RETURN_ERROR(MAJOR, err, NO_MSG);
-+
-+    return E_OK;
-+}
-+
-+#endif //CONFIG_DMAR_TEST
-+
-+#endif // CONFIG_DBG_UCODE_INFRA
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
 index 5ef579872a3b..ce7b97605c7c 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
@@ -8801,7 +8497,7 @@ index 7c5cf467380f..b042ffa4b07a 100644
  {
      return ((t_FmPcdKgScheme*)h_Scheme)->vspe;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c
-index b8c18e0edf83..bebb799e2df1 100644
+index b8c18e0edf83..5855a8864ce2 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c
 @@ -3315,6 +3315,74 @@ static t_Error FmPcdManipModifyUpdate(t_Handle h_Manip, t_Handle h_Ad,
@@ -8879,67 +8575,6 @@ index b8c18e0edf83..bebb799e2df1 100644
  
  t_Error FmPcdManipUpdate(t_Handle h_FmPcd, t_Handle h_PcdParams,
                           t_Handle h_FmPort, t_Handle h_Manip, t_Handle h_Ad,
-@@ -3976,3 +4044,60 @@ t_Error FM_PCD_ManipGetStatistics(t_Handle h_ManipNode,
- 
-     return E_OK;
- }
-+
-+#ifdef CONFIG_DBG_UCODE_INFRA
-+t_Error FmPcdDbgUcodeHCmd(t_Handle h_FmPcd,
-+									uint32_t muram_addr_offset,
-+									uint8_t  *data,
-+									uint8_t  size)
-+{
-+    t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
-+    t_Error err = E_OK;
-+
-+    ASSERT_COND(p_FmPcd);
-+
-+    if ((err = FmHcPcdDbgUcodeHCmd(p_FmPcd->h_Hc, muram_addr_offset,
-+                                      data, size)) != E_OK)
-+        RETURN_ERROR(MAJOR, err, NO_MSG);
-+
-+    return E_OK;
-+}
-+EXPORT_SYMBOL(FmPcdDbgUcodeHCmd);
-+
-+t_Error FmPcdDbgUcodeTest(t_Handle h_FmPcd,
-+				uint32_t opcode,
-+				uint32_t *data,
-+				uint16_t data_size)
-+{
-+	t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
-+	t_Error err = E_OK;
-+
-+	ASSERT_COND(p_FmPcd);
-+
-+	if ((err = FmHcPcdDbgUcodeTest(p_FmPcd->h_Hc,
-+							opcode, data, data_size)) != E_OK)
-+		RETURN_ERROR(MAJOR, err, NO_MSG);
-+
-+	return E_OK;
-+}
-+EXPORT_SYMBOL(FmPcdDbgUcodeTest);
-+
-+#ifdef CONFIG_DMAR_TEST
-+t_Error FmPcdDMAreadTest(t_Handle h_FmPcd,
-+						uint32_t muram_addr_offset,
-+						uint8_t *ptr, uint8_t size)
-+{
-+	t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
-+	t_Error err = E_OK;
-+
-+	ASSERT_COND(p_FmPcd);
-+
-+	if ((err = FmHcPcdDMAreadTest(p_FmPcd->h_Hc, muram_addr_offset,
-+							ptr, size)) != E_OK)
-+		RETURN_ERROR(MAJOR, err, NO_MSG);
-+
-+	return E_OK;
-+}
-+EXPORT_SYMBOL(FmPcdDMAreadTest);
-+#endif //CONFIG_DMAR_TEST
-+#endif // CONFIG_DBG_UCODE_INFRA
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 index 5d96727f7251..a790c3cdb38c 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
@@ -9899,10 +9534,10 @@ index 01ab5788059a..89e481efb984 100644
  /*       API Advanced Init unit functions        */
  /*************************************************/
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
-index 8ab81ac69431..dc15a1642546 100644
+index 8ab81ac69431..9737beb1ea15 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
-@@ -36,7 +36,25 @@
+@@ -36,7 +36,12 @@
  
   @Description   FM MURAM ...
  *//***************************************************************************/
@@ -9912,23 +9547,10 @@ index 8ab81ac69431..dc15a1642546 100644
 +void *FmMurambaseAddr;
 +static uint32_t FmMuramsize;
 +
-+
-+#ifdef CONFIG_DBG_UCODE_INFRA
-+#ifdef CONFIG_DMAR_TEST
-+#define DBG_UCODE_RESVD_MURAM_SIZE    1328 //1024+48+256 // per task basis
-+//#define DBG_UCODE_RESVD_MURAM_SIZE  256 //per risk core
-+#else
-+// If EHASH dbg is enabled , then use 576 bytes
-+//#define DBG_UCODE_RESVD_MURAM_SIZE  576 // 64+512 // using 512 bytes for enhash dbg
-+#define DBG_UCODE_RESVD_MURAM_SIZE   64
-+#endif //CONFIG_DMAR_TEST
-+#else
-+#define DBG_UCODE_RESVD_MURAM_SIZE  0
-+#endif // CONFIG_DBG_UCODE_INFRA
  
  #include "error_ext.h"
  #include "std_ext.h"
-@@ -62,6 +80,22 @@ void FmMuramClear(t_Handle h_FmMuram)
+@@ -62,6 +67,22 @@ void FmMuramClear(t_Handle h_FmMuram)
      IOMemSet32(UINT_TO_PTR(p_FmMuram->baseAddr), 0, p_FmMuram->size);
  }
  
@@ -9951,21 +9573,18 @@ index 8ab81ac69431..dc15a1642546 100644
  
  t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
  {
-@@ -89,8 +123,12 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
+@@ -89,8 +110,8 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
      }
      memset(p_FmMuram, 0, sizeof(t_FmMuram));
  
-+#ifdef CONFIG_DBG_UCODE_INFRA 
-+	printk(KERN_INFO "%s(%d) size %d 0x%x\n", __FUNCTION__,__LINE__, size, size);
-+#endif //CONFIG_DBG_UCODE_INFRA
- 
+-
 -    if ((MM_Init(&h_Mem, baseAddress, size) != E_OK) || (!h_Mem))
-+    if ((MM_Init(&h_Mem, baseAddress, size - DBG_UCODE_RESVD_MURAM_SIZE) 
++    if ((MM_Init(&h_Mem, baseAddress, size)
 +					!= E_OK) || (!h_Mem))
      {
          XX_Free(p_FmMuram);
          REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM-MURAM partition!!!"));
-@@ -99,9 +137,10 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
+@@ -99,9 +120,10 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
  
      /* Initialize FM MURAM parameters which will be kept by the driver */
      p_FmMuram->baseAddr = baseAddress;
@@ -9978,7 +9597,7 @@ index 8ab81ac69431..dc15a1642546 100644
      return p_FmMuram;
  }
  
-@@ -132,6 +171,7 @@ void  * FM_MURAM_AllocMem(t_Handle h_FmMuram, uint32_t size, uint32_t align)
+@@ -132,6 +154,7 @@ void  * FM_MURAM_AllocMem(t_Handle h_FmMuram, uint32_t size, uint32_t align)
  
      return UINT_TO_PTR(addr);
  }
@@ -9986,7 +9605,7 @@ index 8ab81ac69431..dc15a1642546 100644
  
  void  * FM_MURAM_AllocMemForce(t_Handle h_FmMuram, uint64_t base, uint32_t size)
  {
-@@ -161,6 +201,7 @@ t_Error FM_MURAM_FreeMem(t_Handle h_FmMuram, void *ptr)
+@@ -161,6 +184,7 @@ t_Error FM_MURAM_FreeMem(t_Handle h_FmMuram, void *ptr)
  
      return E_OK;
  }
@@ -9994,7 +9613,7 @@ index 8ab81ac69431..dc15a1642546 100644
  
  uint64_t FM_MURAM_GetFreeMemSize(t_Handle h_FmMuram)
  {
-@@ -171,3 +212,5 @@ uint64_t FM_MURAM_GetFreeMemSize(t_Handle h_FmMuram)
+@@ -171,3 +195,5 @@ uint64_t FM_MURAM_GetFreeMemSize(t_Handle h_FmMuram)
  
      return MM_GetFreeMemSize(p_FmMuram->h_Mem);
  }
@@ -10172,7 +9791,7 @@ index fd9221b525b0..766e48ce8877 100644
  t_Error     FmPortGetSetCcParams(t_Handle h_FmPort, t_FmPortGetSetCcParams *p_FmPortGetSetCcParams);
  uint8_t     FmPortGetNetEnvId(t_Handle h_FmPort);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
-index 56f3ab8ee8e4..10a57116de45 100644
+index 56f3ab8ee8e4..9fde8153dc5c 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
 @@ -69,6 +69,8 @@ t_Error     FmHcPcdKgSetSchemeCounter(t_Handle h_FmHc, t_Handle h_Scheme, uint32
@@ -10184,26 +9803,12 @@ index 56f3ab8ee8e4..10a57116de45 100644
  
  t_Error     FmHcPcdPlcrSetProfile(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrProfileRegs *p_PlcrRegs);
  t_Error     FmHcPcdPlcrDeleteProfile(t_Handle h_FmHc, t_Handle h_Profile);
-@@ -89,5 +91,20 @@ void     	FmAllowHcUsage(t_Handle h_FmHc, bool allow);
+@@ -88,6 +90,4 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc);
+ void     	FmAllowHcUsage(t_Handle h_FmHc, bool allow);
  bool     	FmIsHcUsageAllowed(t_Handle h_FmHc);
  
- 
-+#ifdef CONFIG_DBG_UCODE_INFRA
-+t_Error FmHcPcdDbgUcodeHCmd(t_Handle h_FmHc,
-+			   uint32_t muram_offset,
-+			   uint8_t  *data,
-+			   uint8_t	size);
- 
-+t_Error FmHcPcdDbgUcodeTest(t_Handle h_FmHc,
-+				uint32_t opcode,
-+				uint32_t *data,
-+				uint16_t data_size);
-+
-+#ifdef CONFIG_DMAR_TEST
-+t_Error FmHcPcdDMAreadTest(t_Handle h_FmPcd,
-+						uint32_t muram_addr_offset, uint8_t *ptr, uint8_t size);
-+#endif //CONFIG_DMAR_TEST
-+#endif // CONFIG_DBG_UCODE_INFRA
+-
+-
  #endif /* __FM_HC_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_sp_common.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_sp_common.h
 index f9dd384bb685..b9cc5aa2bd1e 100644
@@ -10336,10 +9941,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..3c49fbd8e99b
+index 000000000000..c7a043cc0d59
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1690 @@
+@@ -0,0 +1,1595 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -10504,8 +10109,6 @@ index 000000000000..3c49fbd8e99b
 +#define	INSERT_PPPoE_HDR	 0x43
 +#define	INSERT_L3_HDR		 0x44
 +#define	REPLACE_PPPOE_HDR	 0x45
-+#define	NATPT_4to6		 0x51
-+#define	NATPT_6to4		 0x52
 +#define PROCESS_RTP_PAYLOAD	 0x61
 +#define PROCESS_RTCP_PAYLOAD	 0x62
 +#define	UPDATE_GLOBAL_STATS	 0x80
@@ -10864,38 +10467,6 @@ index 000000000000..3c49fbd8e99b
 +	uint32_t num_entries:7;		//number of entries in table, valid in the first entry only
 +	uint32_t stats_ptr:24;		//muRam address of en_ehash_stats member
 +}__attribute__ ((packed));
-+
-+//NATPT structures
-+struct en_ehash_natpt_hdr {
-+	union {
-+		struct {
-+			uint32_t reserved:6;
-+			uint32_t tcu:1; //traffic class update
-+			uint32_t hlu:1; //hop limit update
-+			uint32_t hdrlen:8; //length of header
-+			uint32_t reserved1:16;
-+		}ip4to6;
-+		struct {
-+			uint16_t reserved:5;
-+			uint16_t ipu:1; //ipidentifier update
-+			uint16_t tou:1; //tos update
-+			uint16_t tlu:1; //ttl update
-+			uint16_t hdrlen:8; //length of header
-+			uint16_t ipident; //flow based ipidentifier
-+		}ip6to4;
-+		uint32_t word;
-+	};
-+        uint8_t l3hdr[0];               //l3 hdr padded to next 4 bytes boundary
-+}__attribute__ ((packed));
-+
-+//4 to 6 
-+#define NATPT_TCU	(1 << 25)
-+#define NATPT_HLU	(1 << 24)
-+//6 to 4 
-+#define NATPT_IPU	(1 << 26)
-+#define NATPT_TOU	(1 << 25)
-+#define NATPT_TLU	(1 << 24)
-+
 +
 +//types for miss_action_type
 +#define EN_EHASH_MISS_ACTION_DROP       3
@@ -11832,61 +11403,6 @@ index 000000000000..3c49fbd8e99b
 +	}
 +}
 +
-+static inline void *display_natpt_4to6_opc(void *ptr)
-+{
-+	struct en_ehash_natpt_hdr *param;
-+	uint32_t word;
-+	uint32_t hdrlen;
-+
-+	printk("opcode : NATPT_4to6 - ");
-+	param = (struct en_ehash_natpt_hdr *)ptr;
-+	word = cpu_to_be32(param->word);
-+	hdrlen = ((word >> 16) & 0xff);
-+	printk("header length %d\n", hdrlen);
-+	if (word & NATPT_TCU)
-+		printk("update traffic class from ipv4 header\n");
-+	else
-+		printk("use traffic class from template\n");
-+	if (word & NATPT_HLU)
-+		printk("update HOP length from ipv4 header TTL\n");
-+	else
-+		printk("use HOP length from template\n");
-+	disp_buf(&param->l3hdr, hdrlen);	
-+	return ((uint8_t *)ptr + sizeof(struct en_ehash_natpt_hdr) + 
-+			((word >> 16) & 0xff));
-+}
-+
-+static inline void *display_natpt_6to4_opc(void *ptr)
-+{
-+	uint32_t word;
-+	struct en_ehash_natpt_hdr *param;
-+	uint32_t hdrlen;
-+
-+	printk("opcode : NATPT_6to4 - ");
-+	param = (struct en_ehash_natpt_hdr *)ptr;
-+	word = cpu_to_be32(param->word);
-+	printk("ipident %d\n", (word & 0xffff));
-+	hdrlen = ((word >> 16) & 0xff);
-+	printk("header length %d\n", hdrlen);
-+	if (word & NATPT_IPU)
-+		printk("use ipident from template\n");
-+	else
-+		printk("update ipident from flow\n");
-+	
-+	if (word & NATPT_TOU)
-+		printk("update tos from ipv6 header\n");
-+	else
-+		printk("use tos from template\n");
-+
-+	if (word & NATPT_TLU)
-+		printk("update ttl value from ipv6 header\n");
-+	else
-+		printk("use ttl value from template\n");
-+	disp_buf(&param->l3hdr, hdrlen);	
-+	return ((uint8_t *)ptr + sizeof(struct en_ehash_natpt_hdr) + 
-+			((word >> 16) & 0xff));
-+}
-+
 +static inline void display_ehash_tbl_entry(struct en_ehash_entry *entry, uint32_t keysize)
 +{
 +	uint8_t *opc_ptr;
@@ -12000,12 +11516,6 @@ index 000000000000..3c49fbd8e99b
 +				break;
 +			case UPDATE_GLOBAL_STATS:
 +				param_ptr = display_upd_glbl_stats_opc(param_ptr);
-+				break;
-+			case NATPT_4to6:
-+				param_ptr = display_natpt_4to6_opc(param_ptr);
-+				break;
-+			case NATPT_6to4:
-+				param_ptr = display_natpt_6to4_opc(param_ptr);
 +				break;
 +			case REPLACE_PPPOE_HDR:
 +				param_ptr = display_pppoe_relay_opc(param_ptr);
@@ -12554,20 +12064,10 @@ index 99759baead31..b13716ff41e6 100644
  int fm_mac_remove_hash_mac_addr(struct fm_mac_dev *fm_mac_dev,
  		t_EnetAddr *mac_addr);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/system/sys_io.c b/drivers/net/ethernet/freescale/sdk_fman/src/system/sys_io.c
-index b52ff95ce9e9..902e43060ca7 100644
+index b52ff95ce9e9..e8cc4b0c21d2 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/system/sys_io.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/system/sys_io.c
-@@ -144,6 +144,9 @@ uint64_t SYS_PhysToVirt(uint64_t addr)
-     }
-     return PTR_TO_UINT(phys_to_virt((unsigned long)addr));
- }
-+#ifdef CONFIG_DBG_UCODE_INFRA 
-+EXPORT_SYMBOL(SYS_PhysToVirt);
-+#endif // CONFIG_DBG_UCODE_INFRA
- 
- uint64_t SYS_VirtToPhys(uint64_t addr)
- {
-@@ -157,3 +160,4 @@ uint64_t SYS_VirtToPhys(uint64_t addr)
+@@ -157,3 +157,4 @@ uint64_t SYS_VirtToPhys(uint64_t addr)
          return (uint64_t)(addr - p_IoMap->virtAddr + p_IoMap->physAddr);
      return (uint64_t)virt_to_phys(UINT_TO_PTR(addr));
  }
@@ -13064,28 +12564,17 @@ index 12471f6f8597..b3f8704f1883 100644
  			"fmbm_rprai");
  		for (i = 0; i < FM_PORT_PRS_RESULT_NUM_OF_WORDS; ++i) {
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c b/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c
-index 8c677e254aff..b4505edeb111 100644
+index 8c677e254aff..a5fa28b4c998 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/xx/xx_arm_linux.c
-@@ -298,11 +298,18 @@ void * XX_MallocSmart(uint32_t size, int memPartitionId, uint32_t alignment)
-     return xx_MallocSmart(size,memPartitionId, alignment);
- }
- 
-+#ifdef CONFIG_DBG_UCODE_INFRA 
-+EXPORT_SYMBOL(XX_MallocSmart);
-+#endif // CONFIG_DBG_UCODE_INFRA
-+
- void XX_FreeSmart(void *p)
- {
+@@ -303,7 +303,6 @@ void XX_FreeSmart(void *p)
      xx_FreeSmart(p);
  }
  
-+#ifdef CONFIG_DBG_UCODE_INFRA 
-+EXPORT_SYMBOL(XX_FreeSmart);
-+#endif // CONFIG_DBG_UCODE_INFRA
- 
+-
  void XX_Free(void *p)
  {
+     xx_Free(p);
 diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
 index afc1566488b3..52ffb64c16de 100644
 --- a/drivers/net/ppp/ppp_generic.c
@@ -13950,29 +13439,6 @@ index 23dd647fe024..9c7c9758e5e1 100644
  	struct hlist_head	__rcu *state_byseq;
  	struct hlist_head	 __percpu *state_cache_input;
  	unsigned int		state_hmask;
-diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 3255a199ef60..ab98025206df 100644
---- a/include/net/tcp.h
-+++ b/include/net/tcp.h
-@@ -137,6 +137,10 @@ void tcp_time_wait(struct sock *sk, int state, int timeo);
- #define TCP_DELACK_MAX	((unsigned)(HZ/5))	/* maximal time to delay before sending an ACK */
- static_assert((1 << ATO_BITS) > TCP_DELACK_MAX);
- 
-+#ifdef CONFIG_COMCERTO_TCP_DELACK_MIN
-+#define TCP_DELACK_MIN ((unsigned)(HZ/100))
-+#define TCP_ATO_MIN    ((unsigned)(HZ/100))
-+#else
- #if HZ >= 100
- #define TCP_DELACK_MIN	((unsigned)(HZ/25))	/* minimal time to delay before sending an ACK */
- #define TCP_ATO_MIN	((unsigned)(HZ/25))
-@@ -144,6 +148,7 @@ static_assert((1 << ATO_BITS) > TCP_DELACK_MAX);
- #define TCP_DELACK_MIN	4U
- #define TCP_ATO_MIN	4U
- #endif
-+#endif
- #define TCP_RTO_MAX	((unsigned)(120*HZ))
- #define TCP_RTO_MIN	((unsigned)(HZ/5))
- #define TCP_TIMEOUT_MIN	(2U) /* Min timeout for TCP timers in jiffies */
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
 index 1484dd15a369..6a0225dbaf4f 100644
 --- a/include/net/xfrm.h
@@ -14943,7 +14409,7 @@ index 28ef506b10b0..b1ecabf41944 100644
  
  	if (!valid) {
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index 578513eb738e..e23b58bf4499 100644
+index 578513eb738e..1c5f45d1c0dd 100644
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
 @@ -1552,18 +1552,32 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
@@ -14979,56 +14445,7 @@ index 578513eb738e..e23b58bf4499 100644
  	CHECK_SKB_FIELD(vlan_proto);
  	CHECK_SKB_FIELD(vlan_tci);
  	CHECK_SKB_FIELD(transport_header);
-@@ -1598,6 +1612,24 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
- {
- #define C(x) n->x = skb->x
- 
-+#if defined(CONFIG_COMCERTO_CUSTOM_SKB_LAYOUT)
-+	if (skb->mspd_data) {
-+		if (skb->mspd_len) {
-+			int ofst = skb->len - skb->mspd_len;
-+
-+			memcpy(skb->data + ofst, skb->mspd_data + skb->mspd_ofst, skb->mspd_len);
-+			skb->mspd_len = 0;
-+		}
-+
-+		WARN_ON(skb_shared(skb));
-+
-+		if (!skb_shared(skb)) {
-+			kfree(skb->mspd_data);
-+			skb->mspd_data = NULL;
-+		}
-+	}
-+#endif
-+
- 	n->next = n->prev = NULL;
- 	n->sk = NULL;
- 	__copy_skb_header(n, skb);
-@@ -1620,6 +1652,13 @@ static struct sk_buff *__skb_clone(struct sk_buff *n, struct sk_buff *skb)
- 	C(truesize);
- 	refcount_set(&n->users, 1);
- 
-+#if defined(CONFIG_COMCERTO_CUSTOM_SKB_LAYOUT)
-+	WARN_ON(skb->mspd_data);
-+	C(mspd_data);
-+	C(mspd_len);
-+	C(mspd_ofst);
-+#endif
-+
- 	atomic_inc(&(skb_shinfo(skb)->dataref));
- 	skb->cloned = 1;
- 
-@@ -2215,6 +2254,9 @@ struct sk_buff *__pskb_copy_fclone(struct sk_buff *skb, int headroom,
- 	int flags = skb_alloc_rx_flag(skb) | (fclone ? SKB_ALLOC_FCLONE : 0);
- 	struct sk_buff *n = __alloc_skb(size, gfp_mask, flags, NUMA_NO_NODE);
- 
-+#if defined(CONFIG_COMCERTO_CUSTOM_SKB_LAYOUT)
-+	WARN_ON(skb->mspd_len);
-+#endif
- 	if (!n)
- 		goto out;
- 
-@@ -6133,7 +6175,15 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+@@ -6133,7 +6147,15 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
  	skb->skb_iif = 0;
  	skb->ignore_df = 0;
  	skb_dst_drop(skb);
@@ -16393,15 +15810,16 @@ index c56bb4f451e6..0e0177ce90bf 100644
  	return err;
  
 diff --git a/net/netfilter/Kconfig b/net/netfilter/Kconfig
-index df2dc21304ef..f00d3404c098 100644
+index df2dc21304ef..af3beb6931ed 100644
 --- a/net/netfilter/Kconfig
 +++ b/net/netfilter/Kconfig
-@@ -790,6 +790,30 @@ config NETFILTER_XT_CONNMARK
+@@ -790,6 +790,32 @@ config NETFILTER_XT_CONNMARK
  	ctmark), similarly to the packet mark (nfmark). Using this
  	target and match, you can set and match on this mark.
  
 +config NETFILTER_XT_QOSMARK
 +	tristate 'qosmark target and match support'
++	depends on CPE_FAST_PATH
 +	default m if NETFILTER_ADVANCED=n
 +	help
 +	  This option adds the "QOSMARK" target and "qosmark" match.
@@ -16413,6 +15831,7 @@ index df2dc21304ef..f00d3404c098 100644
 +
 +config NETFILTER_XT_QOSCONNMARK
 +	tristate 'qosconnmark target and match support'
++	depends on CPE_FAST_PATH
 +	depends on NF_CONNTRACK
 +	depends on NETFILTER_ADVANCED
 +	select NF_CONNTRACK_MARK
@@ -16450,7 +15869,7 @@ index f0aa4d7ef499..6af83a10050b 100644
  
 diff --git a/net/netfilter/comcerto_fp_netfilter.c b/net/netfilter/comcerto_fp_netfilter.c
 new file mode 100644
-index 000000000000..4dc64f52d5ac
+index 000000000000..81a4024204aa
 --- /dev/null
 +++ b/net/netfilter/comcerto_fp_netfilter.c
 @@ -0,0 +1,487 @@
@@ -16655,15 +16074,15 @@ index 000000000000..4dc64f52d5ac
 +
 +	if (fp_info->ifindex && (fp_info->ifindex != skb->dev->ifindex))
 +		if (printk_ratelimit())
-+			printk(KERN_INFO "ct: ifindex changed %d, %d\n", fp_info->ifindex, skb->dev->ifindex);
++			printk(KERN_DEBUG "ct: ifindex changed %d, %d\n", fp_info->ifindex, skb->dev->ifindex);
 +
 +	if (fp_info->iif && (fp_info->iif != skb->iif_index))
 +		if (printk_ratelimit())
-+			printk(KERN_INFO "ct: iif changed %d, %d\n", fp_info->iif, skb->iif_index);
++			printk(KERN_DEBUG "ct: iif changed %d, %d\n", fp_info->iif, skb->iif_index);
 +	/*      // commenting it out as a duplicate print. In most cases iif and underlying iif are the same.
 +			if (fp_info->underlying_iif && (fp_info->underlying_iif != skb->underlying_iif))
 +			if (printk_ratelimit())
-+			printk(KERN_INFO "ct: underlying_iif changed %d, %d\n", fp_info->underlying_iif, skb->underlying_iif);
++			printk(KERN_DEBUG "ct: underlying_iif changed %d, %d\n", fp_info->underlying_iif, skb->underlying_iif);
 +	 */
 +
 +	fp_info->mark = skb->mark;
@@ -16714,13 +16133,13 @@ index 000000000000..4dc64f52d5ac
 +
 +	if ((fp_info->ifindex) && (skb->dev) &&(fp_info->ifindex != skb->dev->ifindex))
 +		if (printk_ratelimit()) {
-+			printk(KERN_INFO "ct: ifindex changed %d, %d\n", fp_info->ifindex, skb->dev->ifindex);
++			printk(KERN_DEBUG "ct: ifindex changed %d, %d\n", fp_info->ifindex, skb->dev->ifindex);
 +			update_event=1;
 +		}
 +#if 0
 +	if (fp_info->iif && (fp_info->iif != skb->skb_iif))
 +		if (printk_ratelimit())
-+			printk(KERN_INFO "ct: iif changed %d, %d\n", fp_info->iif, skb->skb_iif);
++			printk(KERN_DEBUG "ct: iif changed %d, %d\n", fp_info->iif, skb->skb_iif);
 +#endif
 +
 +	fp_info->mark = skb->mark;
@@ -18676,6 +18095,3 @@ index d41e5642625e..0f8543738ab2 100644
  	put_unaligned(x->stats.replay_window, &p->stats.replay_window);
  	put_unaligned(x->stats.replay, &p->stats.replay);
  	put_unaligned(x->stats.integrity_failed, &p->stats.integrity_failed);
--- 
-2.47.3
-
