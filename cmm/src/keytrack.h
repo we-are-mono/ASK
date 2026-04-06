@@ -13,7 +13,6 @@
 #ifndef __KEYTRACK_H__
 #define __KEYTRACK_H__
 
-#include <linux/version.h>
 #include "list.h"
 #include "conntrack.h"
 #include "module_ipsec.h"
@@ -23,17 +22,13 @@
 #ifdef IPSEC_FLOW_CACHE
 #define FLOW_HASH_TABLE_SIZE	CONNTRACK_HASH_TABLE_SIZE	// uses HASH_CT macros for keys
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 struct flowi_tunnel {
         __u64                  tun_id;
 };
-#endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
 typedef struct {
 	uid_t val;
 } kuid_t;
-#endif
 
 struct flowi_common {
 	int	flowic_oif;
@@ -44,22 +39,11 @@ struct flowi_common {
 	__u8	flowic_proto;
 	__u8	flowic_flags;
 	#define FLOWI_FLAG_ANYSRC		0x01
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0)
 	#define FLOWI_FLAG_KNOWN_NH		0x02
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 	#define FLOWI_FLAG_SKIP_NH_OIF          0x04
-#endif
-#else
-	#define FLOWI_FLAG_PRECOW_METRICS	0x02
-	#define FLOWI_FLAG_CAN_SLEEP		0x04
-#endif
 	__u32	flowic_secid;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 	struct flowi_tunnel flowic_tun_key;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
 	kuid_t  flowic_uid;
-#endif
 };
 
 union flowi_uli {
@@ -96,17 +80,10 @@ struct flowi4 {
 	#define flowi4_proto		__fl_common.flowic_proto
 	#define flowi4_flags		__fl_common.flowic_flags
 	#define flowi4_secid		__fl_common.flowic_secid
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 	#define flowi4_tun_key          __fl_common.flowic_tun_key
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
 	/* (saddr,daddr) must be grouped, same order as in IP header */
 	__be32			saddr;
 	__be32			daddr;
-#else
-	__be32			daddr;
-	__be32			saddr;
-#endif
 	union flowi_uli		uli;
 	#define fl4_sport		uli.ports.sport
 	#define fl4_dport		uli.ports.dport
@@ -115,20 +92,13 @@ struct flowi4 {
 	#define fl4_ipsec_spi		uli.spi
 	#define fl4_mh_type		uli.mht.type
 	#define fl4_gre_key		uli.gre_key
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 }__attribute__((__aligned__(8)));
-#else
-};
-#endif
 
 struct flowi6 {
 	struct flowi_common	__fl_common;
 	#define flowi6_oif		__fl_common.flowic_oif
 	#define flowi6_iif		__fl_common.flowic_iif
 	#define flowi6_mark		__fl_common.flowic_mark
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,2,0)
-	#define flowi6_tos		__fl_common.flowic_tos
-#endif
 	#define flowi6_scope		__fl_common.flowic_scope
 	#define flowi6_proto		__fl_common.flowic_proto
 	#define flowi6_flags		__fl_common.flowic_flags
@@ -144,14 +114,8 @@ struct flowi6 {
 	#define fl6_ipsec_spi		uli.spi
 	#define fl6_mh_type		uli.mht.type
 	#define fl6_gre_key		uli.gre_key
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,14,0)
 	__u32                   mp_hash;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
 }__attribute__((__aligned__(8)));
-#else
-};
-#endif
 
 struct flowidn {
 	struct flowi_common	__fl_common;
@@ -175,16 +139,6 @@ struct flowi {
 		struct flowi6		ip6;
 		struct flowidn		dn;
 	} u;
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,2,0)
-#ifndef ARCH_ARM32
-	/*In kernel this structure has attribute
-	 * __attribute__((__aligned__(BITS_PER_LONG/8)))
-	 * This is making 64bit aligned for 64Bit arch
-	 * as WA following reserved feild added.
-	 */
-	unsigned int res;
-#endif
-#endif
 	#define flowi_oif	u.__fl_common.flowic_oif
 	#define flowi_iif	u.__fl_common.flowic_iif
 	#define flowi_mark	u.__fl_common.flowic_mark

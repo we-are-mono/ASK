@@ -14,8 +14,6 @@
 #ifndef _AUTO_BRIDGE_PRIVATE_H
 #define _AUTO_BRIDGE_PRIVATE_H
 
-#include <linux/version.h>
-
 #define L2FLOW_HASH_TABLE_SIZE		1024
 #define L2FLOW_HASH_BY_MAC_TABLE_SIZE 	128
 
@@ -102,7 +100,6 @@ struct br_event_table
 	struct net_device *brdev;
 };
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
 #define NLA_PUT(skb, attrtype, attrlen, data) \
         do { \
                 if (nla_put(skb, attrtype, attrlen, data)) \
@@ -126,7 +123,6 @@ struct br_event_table
                 if (nla_put_u32(skb, attrtype, data)) \
                         goto nla_put_failure; \
         } while(0)
-#endif
 
 
 #define ABM_PRINT(type, info, args...) do {printk(type "ABM :" info, ## args);} while(0)

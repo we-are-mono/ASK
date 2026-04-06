@@ -10,7 +10,6 @@
  *
  */
 
-#include <linux/version.h>
 #include <linux/socket.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -21,9 +20,7 @@
 #include <net/netlink.h>
 #include <linux/timer.h>
 #include <linux/time.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
 #include <net/net_namespace.h>
-#endif
 #include "fci.h"
 
 MODULE_LICENSE("GPL");
@@ -39,10 +36,6 @@ static int fci_fe_register(void);
 static void fci_fe_unregister(void);
 
 static void __fci_fe_inbound_data(struct sk_buff *skb);
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,33)
-static void fci_fe_inbound_data(struct sock *sk, int len);
-#endif
 
 static int fci_type_to_nl_type (int fci_nl_type);
 static int fci_fe_init(void);
@@ -113,20 +106,13 @@ static int fci_open_netlink (unsigned long proto)
 	FCI_PRINTK(FCI_NL, "fci_open_netlink() FCI type %ld\n", proto);
 
 	if(proto == FCI_NL_FF)
-	{			
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+	{
 		struct netlink_kernel_cfg cfg = {
 			.input	= __fci_fe_inbound_data,
 			.groups	= 1,
 		};
 
 		if((this_fci->fci_nl_sock[FCI_NL_FF] = netlink_kernel_create (&init_net, NETLINK_FF, &cfg)) == 0)
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
-		if((this_fci->fci_nl_sock[FCI_NL_FF] = netlink_kernel_create (&init_net, NETLINK_FF, NL_FF_GROUP, 
-									            __fci_fe_inbound_data, NULL, THIS_MODULE)) == 0)
-#else
-		if((this_fci->fci_nl_sock[FCI_NL_FF] = netlink_kernel_create (NETLINK_FF, NL_FF_GROUP, fci_fe_inbound_data, THIS_MODULE)) == 0)
-#endif
 		{
 			this_fci->stats.kernel_create_err++;
 
@@ -145,13 +131,8 @@ static int fci_open_netlink (unsigned long proto)
 
 static void fci_close_netlink (unsigned long proto)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
 	/* release netlink socket */
 	netlink_kernel_release(this_fci->fci_nl_sock[proto]);
-#else
-	sock_release(this_fci->fci_nl_sock[proto]->sk_socket);
-
-#endif
 }
 
 /*
@@ -509,21 +490,6 @@ static void __fci_fe_inbound_data(struct sk_buff *skb)
 	}
 }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,33)
-static void fci_fe_inbound_data(struct sock *sk, int len)
-{
-	struct sk_buff *skb;
-
-	FCI_PRINTK(FCI_INBOUND, "FCI: %s\n", __func__);
-
-	while ((skb = skb_dequeue(&sk->sk_receive_queue)))
-	{
-		__fci_fe_inbound_data(skb);
-
-		kfree_skb(skb);
-	}
-}
-#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(2,6,33) */
 
 /*
  * fci_fe_inbound_parser -
@@ -549,7 +515,6 @@ static int fci_fe_inbound_parser(FCI_MSG *fci_msg, FCI_MSG *fci_rep)
 
 /***************************** MISCS FUNCTIONS ********************************/
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3,10,0)
 static int fci_proc_single_open(struct seq_file *m, void *v)
 {
 	seq_printf(m, "\n");
@@ -581,58 +546,12 @@ static int fci_proc_open(struct inode *inode, struct  file *file)
 	return single_open(file, fci_proc_single_open, NULL);
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
 static const struct proc_ops fci_proc_fops = {
 	.proc_open = fci_proc_open,
 	.proc_read = seq_read,
 	.proc_lseek = seq_lseek,
 	.proc_release = single_release,
 };
-#else
-struct file_operations fci_proc_fops = {
-	.owner = THIS_MODULE,
-	.open = fci_proc_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-#endif
-
-#else
-/**
- *  fci_proc_info -
- *
- *
- */
-static int fci_proc_info(char* page, char** start, off_t off, int count, int *eof, void* data)
-{
-	int len = 0;
-
-	len += sprintf(page+len, "\n");
-	len += sprintf(page+len, "FCI Messages:\n");
-	len += sprintf(page+len, "Sent:%ld\n", this_fci->stats.tx_msg);
-	len += sprintf(page+len, "Received:%ld\n", this_fci->stats.rx_msg);
-	len += sprintf(page+len, "Sent errors:%ld\n", this_fci->stats.tx_msg_err);
-	len += sprintf(page+len, "Received errors:%ld\n", this_fci->stats.rx_msg_err);
-	len += sprintf(page+len, "\n");
-	len += sprintf(page+len, "Fast Forward Messages:\n");
-	len += sprintf(page+len, "Sent:%ld\n", this_fci->stats.sock_stats[FCI_NL_FF].tx_msg);
-	len += sprintf(page+len, "Received:%ld\n", this_fci->stats.sock_stats[FCI_NL_FF].rx_msg);
-	len += sprintf(page+len, "Sent errors:%ld\n", this_fci->stats.sock_stats[FCI_NL_FF].tx_msg_err);
-	len += sprintf(page+len, "Received errors:%ld\n", this_fci->stats.sock_stats[FCI_NL_FF].rx_msg_err);
-	len += sprintf(page+len, "\n");
-
-	len += sprintf(page+len, "\n");
-	len += sprintf(page+len, "Errors:\n");
-	len += sprintf(page+len, "Memory allocation errors:%ld\n", this_fci->stats.mem_alloc_err);
-	len += sprintf(page+len, "Kernel socket creation errors:%ld\n", this_fci->stats.kernel_create_err);
-	len += sprintf(page+len, "Unknow socket type:%ld\n", this_fci->stats.unknown_sock_type);
-
-	return len;
-}
-
-
-#endif
 /*
  * fci_module_init -
  *
@@ -651,11 +570,7 @@ static int fci_module_init(void)
 	}
 
 	/* Create /proc/fci entry */
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3,10,0)
 	proc_create("fci", 0, NULL, &fci_proc_fops);
-#else
-	create_proc_read_entry("fci", 0, 0, fci_proc_info, NULL);
-#endif
 
 	return 0;
 }

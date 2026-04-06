@@ -633,18 +633,16 @@ struct NeighborEntry *__cmmNeighGet(int family, const unsigned int *ipAddr, int 
 		}
 
 		neigh = __cmmNeighFind(family, ipAddr, ifindex);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,19,0)
-/* 
-   In 3.19 kernel, neighbor entry in linux neighbor cache is not created during the creation of route entry in linux
-   route cache as was done in previous versions. If neighbor entry is not present in linux during route look up in CMM,
-   then neigbhor is not attached to CMM route and the subsequent neighbor creation event from linux is also ignored by CMM.
+/*
+   Neighbor entry in linux neighbor cache is not created during the creation of route entry in linux
+   route cache. If neighbor entry is not present in linux during route look up in CMM,
+   then neighbor is not attached to CMM route and the subsequent neighbor creation event from linux is also ignored by CMM.
    As a result all the connections using this CMM route are not fast forwarded.
    To resolve this, if neighbor entry is not present in linux then a dummy neighbor is created in CMM. This dummy neighbor
    will be updated when the CMM receives the neighbor creation event
 */
 		if(!neigh)
 			neigh = __cmmNeighAdd(family, ipAddr, ifindex);
-#endif
 		if (!neigh)
 			goto err;
 	}
