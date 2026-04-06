@@ -62,7 +62,6 @@ SRCS := \
 	third_part.c \
 	cmm_asym_ff.c \
 	module_l2tp.c \
-	module_lro.c \
 	module_ipsec.c \
 	module_ipr.c \
 	libcmm.c

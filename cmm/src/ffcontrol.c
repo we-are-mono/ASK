@@ -29,7 +29,6 @@
 #include "pppoe.h"
 #include "cmmd.h"
 #include "fpp.h"
-#include "module_lro.h"
 #include "module_tx.h"
 
 static struct denyRuleList *denyRules = NULL;
@@ -1659,26 +1658,6 @@ err:
 	return -1;
 }
 
-static int section_tcp_lro_option_hdlr(void *data, int argc, char **argv)
-{
-	char *option = argv[0];
-	char *value = argv[1];
-
-	if (!strcmp(option, "ifname"))
-	{
-		if (lro_interface_add(value) < 0)
-			goto err;
-	}
-	else
-		goto err;
-
-	return 0;
-
-err:
-	return -1;
-}
-
-
 static int section_cli_listenaddr_option_hdlr(void *data,int argc, char **argv)
 {
 	if(strcmp(argv[0],"ip4addr"))
@@ -1723,10 +1702,6 @@ static struct section_hdlr section_handler[] = {
 		.option = section_wifi_fastforward_option_hdlr,
 	},
 #endif
-	{
-		.name = "tcp_lro",
-		.option = section_tcp_lro_option_hdlr,
-	},
 	{
 		 .name = "cli_listenaddr",
 		 .option = section_cli_listenaddr_option_hdlr,

@@ -29,7 +29,6 @@
 #include "itf.h"
 #include "pppoe.h"
 #include "ffbridge.h"
-#include "module_lro.h"
 #include "route_cache.h"
 #include "module_rx.h"
 
@@ -508,7 +507,6 @@ static void __itf_update(struct interface_table *ctx, struct interface *itf, str
 #ifdef WIFI_ENABLE
 proceed_to_lro:
 #endif
-	lro_interface_update(itf);
 
 out:
 	cmm_print(DEBUG_INFO, "%s: itf: %lx, ifindex: %d, phys_ifindex: %d, flags: %x\n", __func__, (unsigned long)itf, itf->ifindex, itf->phys_ifindex, itf->itf_flags);

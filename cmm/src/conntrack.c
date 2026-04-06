@@ -21,7 +21,6 @@
 
 #include "itf.h"
 #include "ffbridge.h"
-#include "module_lro.h"
 #include "cmmd.h"
 #include "module_ipsec.h"
 #include "conntrack.h"
@@ -1235,8 +1234,6 @@ void __cmmCheckFPPRouteIdUpdate(struct ct_route *rt, int *flags)
 ******************************************************************/
 int ____cmmCtLocalRegister(FCI_CLIENT *fci_handle, struct ctTable* ctEntry)
 {
-	lro_socket_open(fci_handle, ctEntry);
-
 	/* Update all dynamic connections/ tunnel routes for which tunnel route
 	is not attached */
 	__cmmRouteLocalNew(fci_handle, ctEntry);
@@ -2145,8 +2142,6 @@ int  ____cmmCtLocalDeregister(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle
 
 	__cmmRouteDeregister(fci_handle, &ctEntry->orig, "originator");
 	__cmmRouteDeregister(fci_handle, &ctEntry->rep, "replier");
-
-	lro_socket_close(fci_handle, fci_key_handle, ctEntry);
 
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
