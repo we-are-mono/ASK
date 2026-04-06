@@ -419,16 +419,6 @@ extern U8 gDTMF_PT[2];
 extern struct slist_head rtpflow_cache[];
 extern struct slist_head rtpcall_cache;
 
-#ifdef TODO_RTP_QOS
-
-int rtpqos_ipv4_link_stats_entry_by_tuple(PCtEntry pClient, U32 saddr, U32 daddr, U16 sport, U16 dport);
-int rtpqos_ipv6_link_stats_entry_by_tuple(PCtEntryIPv6 pClient, U32 *saddr, U32 *daddr, U16 sport, U16 dport);
-int rtpqos_mc4_link_stats_entry_by_tuple(PMC4Entry pClient, U32 saddr, U32 daddr);
-int rtpqos_mc6_link_stats_entry_by_tuple(PMC6Entry pClient, U32 *saddr, U32 *daddr);
-int rtpqos_relay_link_stats_entry_by_tuple(PSockEntry pSocket, U32 saddr, U32 daddr, U16 sport, U16 dport);
-int rtpqos_relay6_link_stats_entry_by_tuple(PSock6Entry pSocket, U32 *saddr, U32 *daddr, U16 sport, U16 dport);
-#endif  // TODO_RTP_QOS
-
 BOOL rtp_relay_init(void);
 void rtp_relay_exit(void);
 
