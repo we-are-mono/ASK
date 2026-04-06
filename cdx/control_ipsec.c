@@ -209,7 +209,7 @@ static int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 
 	if ((key_bits/8) > IPSEC_MAX_KEY_SIZE)
 	{
-		DPA_ERROR("%s (%d) key_bits %u higher than max key size\n",__FUNCTION__,__LINE__, key_bits);
+		DPA_ERROR("%s (%d) key_bits %u higher than max key size\n",__func__,__LINE__, key_bits);
 		return -1;
 	}
 
@@ -255,7 +255,7 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 
 	if ((key_bits/8) > IPSEC_MAX_KEY_SIZE)
 	{
-		DPA_ERROR("%s (%d) key_bits %u higher than max key size\n",__FUNCTION__,__LINE__, key_bits);
+		DPA_ERROR("%s (%d) key_bits %u higher than max key size\n",__func__,__LINE__, key_bits);
 		return -1;
 	}
 
@@ -390,7 +390,7 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 		}
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s(%d) dir %s, handle %x\n",
-				__FUNCTION__,__LINE__,(dir)?"INBOUND" : "OUTBOUND", sa->handle);
+				__func__,__LINE__,(dir)?"INBOUND" : "OUTBOUND", sa->handle);
 #endif
 		/* Look like staring seq number is not passed
 			 In the shared descriptor we need to set this value.
@@ -419,11 +419,11 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 				&sa->list_fqid);
 #endif /* UNIQUE_IPSEC_CP_FQID */
 #ifdef CONTROL_IPSEC_DEBUG
-		printk("%s(%d) SA pointer %p, FQID hash %d, fqid %d(%x)\n",__FUNCTION__,__LINE__,sa,
+		printk("%s(%d) SA pointer %p, FQID hash %d, fqid %d(%x)\n",__func__,__LINE__,sa,
 				(sa->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1)), sa->pSec_sa_context->to_cp_fqid,
 				sa->pSec_sa_context->to_cp_fqid);
 		printk("%s::sa %p, context %p handle %d dir %d\n",
-				__FUNCTION__, sa, sa->pSec_sa_context, sa->hash_by_h, sa->direction);
+				__func__, sa, sa->pSec_sa_context, sa->hash_by_h, sa->direction);
 #endif
 
 		if (sa_add(sa) != NO_ERR)
@@ -482,7 +482,7 @@ int IPsec_handle_CREATE_SA(U16 *p, U16 Length)
 	if (M_ipsec_sa_cache_create((U32*)cmd.said.src_ip, (U32*)cmd.said.dst_ip , cmd.said.spi, cmd.said.sa_type , family, cmd.sagd, cmd.said.replay_window, (cmd.said.flags & NLKEY_SAFLAGS_ESN), cmd.said.mtu, cmd.said.dev_mtu, (cmd.said.flags & NLKEY_SAFLAGS_INBOUND))) {
 #ifdef CONTROL_IPSEC_DEBUG
 		printk(KERN_CRIT "%s::spi %x, type %d, dstip %08x, sagd %d family %d flags %d\n",
-				__FUNCTION__, cmd.said.spi, cmd.said.sa_type, cmd.said.dst_ip[0], 
+				__func__, cmd.said.spi, cmd.said.sa_type, cmd.said.dst_ip[0], 
 				cmd.sagd, cmd.said.proto_family, cmd.said.flags);
 #endif
 		return NO_ERR;
@@ -555,11 +555,11 @@ struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
 		if (sa_ptr->flags & SA_DELETE)
 		{
 			printk("%s(%d) SA marked for deletion , fqid %x, handle %x\n",
-					__FUNCTION__,__LINE__,fqid, sa_ptr->handle);
+					__func__,__LINE__,fqid, sa_ptr->handle);
 			return NULL;
 		}
 		/*printk("%s(%d) hash %d  fqid sa %d, arg fqid %d \n",
-			__FUNCTION__,__LINE__,fqid_hash, sa_ptr->pSec_sa_context->to_cp_fqid , fqid); */
+			__func__,__LINE__,fqid_hash, sa_ptr->pSec_sa_context->to_cp_fqid , fqid); */
 		if (sa_ptr->pSec_sa_context->to_cp_fqid ==  fqid)
 		{
 			*sagd_pkt = sa_ptr->handle;
@@ -621,18 +621,18 @@ int IPsec_handle_SA_SET_KEYS(U16 *p, U16 Length)
 		key = (PIPSec_key_desc)&cmd.keys[i];
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s(%d) key type %d, key alg %d, key bits %d \n",
-				__FUNCTION__,__LINE__, key->key_type, key->key_alg,key->key_bits);
+				__func__,__LINE__, key->key_type, key->key_alg,key->key_bits);
 #endif
 		if (key->key_type) {
 			if (M_ipsec_sa_set_cipher_key(sa, key->key_alg, key->key_bits, key->key))
 			{
-				DPA_ERROR("%s (%d) M_ipsec_sa_set_cipher_key failed\n",__FUNCTION__,__LINE__);
+				DPA_ERROR("%s (%d) M_ipsec_sa_set_cipher_key failed\n",__func__,__LINE__);
 				return ERR_SA_INVALID_CIPHER_KEY;
 			}
 		}
 		else if (M_ipsec_sa_set_digest_key(sa, key->key_alg, key->key_bits, key->key))
 		{
-			DPA_ERROR("%s (%d) M_ipsec_sa_set_digest_keyfailed\n",__FUNCTION__,__LINE__);
+			DPA_ERROR("%s (%d) M_ipsec_sa_set_digest_keyfailed\n",__func__,__LINE__);
 			return ERR_SA_INVALID_DIGEST_KEY;
 		}
 	}
@@ -733,7 +733,7 @@ static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 	if (!(sa->xfrm_state = cdx_get_xfrm_state_of_sa(sa->netdev, sa->handle)))
 	{
 		printk(KERN_ERR "%s(%d) : cdx_get_xfrm_state_of_sa failed\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 		return ERR_CREATION_FAILED;
 	}
 	sa->flags |= SA_ENABLED;
@@ -772,7 +772,7 @@ static int IPsec_handle_SA_SET_TNL_ROUTE(U16 *p, U16 Length)
 		/* sa has route already, remove it */
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s::removing rtentry %p in sa %p  dir %d\n", 
-				__FUNCTION__, sa->pRtEntry, sa, sa->direction);
+				__func__, sa->pRtEntry, sa, sa->direction);
 #endif
 		L2_route_put(sa->pRtEntry);
 	}
@@ -793,7 +793,7 @@ static int IPsec_handle_SA_SET_TNL_ROUTE(U16 *p, U16 Length)
 		if ((sa->state == SA_STATE_VALID) && (NewRtEntry)) {
 #ifdef CONTROL_IPSEC_DEBUG
 			printk("%s::route updated on outbound sa %p, pushing entry to fp\n",
-					__FUNCTION__, sa);
+					__func__, sa);
 #endif
 			return(ipsec_push_sa_to_fast_path(sa));
 		}
@@ -822,7 +822,7 @@ int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length)
 		return ERR_SA_UNKNOWN;
 #ifdef CONTROL_IPSEC_DEBUG
 	printk("%s::cmd state :%x sa state %x sa %p, dir %d\n", 
-			__FUNCTION__, cmd.state, sa->state, sa, sa->direction);
+			__func__, cmd.state, sa->state, sa, sa->direction);
 #endif
 	if ((cmd.state == XFRM_STATE_VALID) &&  (sa->state == SA_STATE_INIT)) {
 #ifdef CONTROL_IPSEC_DEBUG
@@ -847,7 +847,7 @@ int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length)
 		if ((sa->direction == CDX_DPA_IPSEC_OUTBOUND) && (!sa->pRtEntry)) {
 #ifdef CONTROL_IPSEC_DEBUG
 			printk("%s::no route on outbound sa skip adding sagd %d entry to fast path\n",
-					__FUNCTION__, cmd.sagd);
+					__func__, cmd.sagd);
 #endif
 			return NO_ERR;
 
@@ -1089,7 +1089,7 @@ U16 M_ipsec_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 			break;
 
 		default:
-			printk("%s::ERR_UNKNOWN_COMMAND\n", __FUNCTION__);
+			printk("%s::ERR_UNKNOWN_COMMAND\n", __func__);
 			rc = ERR_UNKNOWN_COMMAND;
 			break;
 	}
@@ -1216,17 +1216,17 @@ static struct qman_fq *cdx_get_to_sec_fq_handler(uint32_t handle)
 	PDpaSecSAContext pSec_sa_context; 
 
 #ifdef CDX_DPA_DEBUG	
-	net_crit_ratelimited("%s:: handle %d \n", __FUNCTION__, handle);
+	net_crit_ratelimited("%s:: handle %d \n", __func__, handle);
 #endif 
 
 	if ((sa = M_ipsec_sa_cache_lookup_by_h(handle ))== NULL) {
-		/* net_crit_ratelimited("%s:: could not find a SA with handle %d\n",__FUNCTION__,handle); */
+		/* net_crit_ratelimited("%s:: could not find a SA with handle %d\n",__func__,handle); */
 		return NULL;
 	}
 
 	pSec_sa_context =sa->pSec_sa_context; 
 #ifdef CDX_DPA_DEBUG	
-	net_crit_ratelimited("%s::SA %p context %p handle %d encryption Sec fqid is %d \n",__FUNCTION__, 
+	net_crit_ratelimited("%s::SA %p context %p handle %d encryption Sec fqid is %d \n",__func__, 
 			sa, pSec_sa_context, handle, pSec_sa_context->to_sec_fqid) ; 
 #endif 
 

@@ -47,7 +47,7 @@ static const struct file_operations cdx_dev_fops = {
 
 int cdx_ctrl_open(struct inode *inode, struct file *filp)
 {
-	//DPA_INFO("%s::\n", __FUNCTION__);
+	//DPA_INFO("%s::\n", __func__);
 	//allow only one open instance
 	if (!atomic_dec_and_test(&cdx_ctrl_open_count)) {
 		atomic_inc(&cdx_ctrl_open_count);
@@ -59,7 +59,7 @@ int cdx_ctrl_open(struct inode *inode, struct file *filp)
 int cdx_ctrl_release(struct inode *inode, struct file *filp)
 {
 	//release open instance
-	//DPA_INFO("%s::\n", __FUNCTION__);
+	//DPA_INFO("%s::\n", __func__);
 	//TBD - recover resources here
 	atomic_inc(&cdx_ctrl_open_count);
 	return 0;
@@ -76,27 +76,27 @@ static long cdx_get_muram_data(unsigned long args)
 
 	if(copy_from_user(&data_in, (void *)args,
 				sizeof(struct muram_data))) {
-		DPA_ERROR("%s::unable to copy struct get_muram_data\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to copy struct get_muram_data\n", __func__);
 		return (-EIO);
 	}
 	pdata = get_muram_data(&size);
 	if (!pdata) {
-		DPA_ERROR("%s::get_muram_data failed\n", __FUNCTION__);
+		DPA_ERROR("%s::get_muram_data failed\n", __func__);
 		return (-EIO);
 	}
 	if (size > data_in.size) {
-		DPA_ERROR("%s::muram data size is %d,does not fit\n", __FUNCTION__, size);
+		DPA_ERROR("%s::muram data size is %d,does not fit\n", __func__, size);
 		retval = -EINVAL;
 		goto func_ret;
 	}
 	data_in.size = size;
 	if(copy_to_user(data_in.buff, pdata, size)) {
-		DPA_ERROR("%s::unable to copy muram data\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to copy muram data\n", __func__);
 		retval = -EIO;
 		goto func_ret;
 	}
 	if (copy_to_user((void *)args, &data_in, sizeof(struct muram_data))) {
-		DPA_ERROR("%s::unable to copy result\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to copy result\n", __func__);
 		retval = -EIO;
 		goto func_ret;
 	}
@@ -114,14 +114,14 @@ static int __maybe_unused disp_muram(void)
 	uint8_t *pdata;
 	uint32_t size;
 
-	printk("%s::\n", __FUNCTION__);
+	printk("%s::\n", __func__);
 	pdata = get_muram_data(&size);
 	if (!pdata) {
-		DPA_ERROR("%s::get_muram_data failed\n", __FUNCTION__);
+		DPA_ERROR("%s::get_muram_data failed\n", __func__);
 		return (-EIO);
 	}
 
-	printk("%s::muram data size %d\n", __FUNCTION__, size);
+	printk("%s::muram data size %d\n", __func__, size);
 	for (ii = 0; ii < size; ii++) {
 		if (!(ii % 16))
 			printk("\n%04x:%02x ", ii, *pdata);
@@ -130,7 +130,7 @@ static int __maybe_unused disp_muram(void)
 		pdata++;
 	}
 #else
-	printk("%s::\n", __FUNCTION__);
+	printk("%s::\n", __func__);
 #endif
 	return 0;
 }
@@ -141,7 +141,7 @@ long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
 {
 	int retval;
 
-	//DPA_INFO("%s::cmd %d\n", __FUNCTION__, cmd);
+	//DPA_INFO("%s::cmd %d\n", __func__, cmd);
 	switch (cmd) {
 		case CDX_CTRL_DPA_SET_PARAMS:
 			retval = cdx_ioc_set_dpa_params(args);
@@ -160,7 +160,7 @@ long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
 #endif
 
 		case CDX_CTRL_DPA_QOS_CONFIG_ADD:
-			printk("%s::cdx_ioc_dpa_configqos not called\n", __FUNCTION__);
+			printk("%s::cdx_ioc_dpa_configqos not called\n", __func__);
 			retval = 0;
 			break;
 
@@ -175,7 +175,7 @@ long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
 			break;
 		default:
 			DPA_ERROR("%s::unsupported ioctl cmd %x\n", 
-					__FUNCTION__, cmd);
+					__func__, cmd);
 			retval = -EINVAL;
 			break;
 	}
@@ -201,14 +201,14 @@ int cdx_driver_init(void)
 	cdx_ctrl_cdev_major = register_chrdev(0,CDX_CTRL_CDEVNAME,&cdx_dev_fops);
 	if (cdx_ctrl_cdev_major < 0) {
 		DPA_ERROR("%s::Could not register dev %s\n", 
-				__FUNCTION__, CDX_CTRL_CDEVNAME);
+				__func__, CDX_CTRL_CDEVNAME);
 		return -1;
 	}
 
 	cdx_ctrl_class = class_create(CDX_CTRL_CLS_CDEVNAME);
 	if (IS_ERR(cdx_ctrl_class)) {
 		DPA_ERROR("%s::Failed to create %s class device\n",
-				__FUNCTION__, CDX_CTRL_CLS_CDEVNAME);
+				__func__, CDX_CTRL_CLS_CDEVNAME);
 		unregister_chrdev(cdx_ctrl_cdev_major, CDX_CTRL_CLS_CDEVNAME);
 		cdx_ctrl_class = NULL;
 		return -1;
@@ -218,7 +218,7 @@ int cdx_driver_init(void)
 			MKDEV(cdx_ctrl_cdev_major, 0),NULL,CDX_CTRL_CLS_CDEVNAME);
 	if (IS_ERR(cdx_ctrl_dev)) {
 		DPA_ERROR("%s::Failed to create %s device\n",
-				__FUNCTION__, CDX_CTRL_CLS_CDEVNAME);
+				__func__, CDX_CTRL_CLS_CDEVNAME);
 		class_destroy(cdx_ctrl_class);
 		unregister_chrdev(cdx_ctrl_cdev_major, CDX_CTRL_CLS_CDEVNAME);
 		cdx_ctrl_cdev_major = -1;

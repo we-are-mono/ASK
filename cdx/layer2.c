@@ -59,7 +59,7 @@ POnifDesc add_onif(U8 *input_itf_name, struct _itf *itf, struct _itf *phys_itf, 
 				if (dpa_add_eth_if(input_itf_name, itf, 
 							phys_itf) != 0) {
 					printk("%s::dpa_add_eth_if failed\n", 
-							__FUNCTION__);
+							__func__);
 					return NULL;
 				}
 			} 

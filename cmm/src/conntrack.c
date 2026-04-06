@@ -479,7 +479,7 @@ void __cmmCtRemove(struct ctTable *ctEntry)
 	for (ii=0; ii<4; ii++)
 	{
 		cmm_print(DEBUG_INFO, "%s(%d) list_by_sa[%d] %p\n",
-				__FUNCTION__,__LINE__,ii, &ctEntry->list_by_sa[ii]);
+				__func__,__LINE__,ii, &ctEntry->list_by_sa[ii]);
 		list_del(&ctEntry->list_by_sa[ii]);
 	}
 
@@ -1274,20 +1274,20 @@ static void __cmm_ct_get_SA(struct ctTable *ctEntry,
 		list_node = &ctEntry->list_by_sa[list_index];
 		list_del(list_node);
 		cmm_print(DEBUG_INFO,"%s(%d) XFRM SPI of existing sagd %x, sagd %x, list_node %p , index %d\n",
-			__FUNCTION__,__LINE__,sa_entry->SAInfo.sagd, *xfrm_handle, list_node, list_index);
+			__func__,__LINE__,sa_entry->SAInfo.sagd, *xfrm_handle, list_node, list_index);
 	}
 	/* same SPI case, just return */
 	else if (sa_entry)
 	{
 		cmm_print(DEBUG_INFO,"%s(%d) XFRM SPI of existing sagd %x, xfm_hadle %x, return\n",
-			__FUNCTION__,__LINE__,sa_entry->SAInfo.sagd, *xfrm_handle);
+			__func__,__LINE__,sa_entry->SAInfo.sagd, *xfrm_handle);
 		return;
 	}
 	
 	if (!(sa_entry = cmmSAFind(*xfrm_handle)) || (sa_entry->flags & SA_DELETE))
 	{
 		cmm_print(DEBUG_INFO,"%s(%d) xfrm_handle %x, SA not found, setting flow no SA flag\n",
-			__FUNCTION__,__LINE__,*xfrm_handle);
+			__func__,__LINE__,*xfrm_handle);
 		if (!replier_f)
 			ctEntry->flags |= FLOW_NO_ORIG_SA;
 		else
@@ -1301,7 +1301,7 @@ static void __cmm_ct_get_SA(struct ctTable *ctEntry,
 		list_index ++;
 	list_node = &ctEntry->list_by_sa[list_index];
 	cmm_print(DEBUG_INFO,"%s(%d) xfrm_handle %x,  %s SA found, list_node %p, list_index %d\n",
-		__FUNCTION__,__LINE__,*xfrm_handle,
+		__func__,__LINE__,*xfrm_handle,
 		(sa_entry->SAInfo.id.flags & NLKEY_SAFLAGS_INBOUND) ? "Inbound" : "Outbound",
 		 list_node, list_index);
 	list_add(&sa_entry->ctentry_list[replier_f], list_node);
@@ -1325,7 +1325,7 @@ static void __cmm_ct_fill_orig_repl_SAs(struct ctTable *ctEntry,
 		__cmm_ct_get_SA(ctEntry, xfrm_handle, fEntryFwdSA, replier_f);
 	
 		cmm_print(DEBUG_INFO,"%s(%d) %s: fEntryFwd sa handle %x , SPI %x\n",
-			__FUNCTION__,__LINE__, (replier_f) ? "REPLIER" : "ORIGINATOR",
+			__func__,__LINE__, (replier_f) ? "REPLIER" : "ORIGINATOR",
 			(*fEntryFwdSA) ? (*fEntryFwdSA)->SAInfo.sagd : 0,
 			(*fEntryFwdSA) ? (*fEntryFwdSA)->SAInfo.id.spi : 0);
 	}	
@@ -1337,7 +1337,7 @@ static void __cmm_ct_fill_orig_repl_SAs(struct ctTable *ctEntry,
 			fEntryOutSA, replier_f);
 	
 		cmm_print(DEBUG_INFO,"%s(%d) %s: fEntryOut sa handle %x , SPI %x\n",
-			__FUNCTION__,__LINE__,  (replier_f) ? "REPLIER" : "ORIGINATOR", 
+			__func__,__LINE__,  (replier_f) ? "REPLIER" : "ORIGINATOR", 
 			(*fEntryOutSA)? (*fEntryOutSA)->SAInfo.sagd : 0,
 			(*fEntryOutSA)? (*fEntryOutSA)->SAInfo.id.spi : 0);
 	}	
@@ -1370,13 +1370,13 @@ static void cmm_ct_fill_ipsec_info(struct ctTable *ctEntry, uint16_t *orig_xfrm_
 	if (orig_xfrm_handle && ((__cmm_ct_get_num_per_dir_ipsec_SAs(orig_xfrm_handle) > 1 ) ||
 		(__cmm_ct_get_num_per_dir_ipsec_SAs(orig_xfrm_handle+MAX_SAs_INFO_PER_DIR_IN_NL_MSG) > 1 )))
 	{
-		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_SA\n",__FUNCTION__,__LINE__);
+		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_SA\n",__func__,__LINE__);
 		ctEntry->flags |=  FLOW_NO_ORIG_SA;
 	}
 	if (rep_xfrm_handle && ((__cmm_ct_get_num_per_dir_ipsec_SAs(rep_xfrm_handle) > 1 ) ||
 		(__cmm_ct_get_num_per_dir_ipsec_SAs(rep_xfrm_handle+MAX_SAs_INFO_PER_DIR_IN_NL_MSG) > 1 )))
 	{
-		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_SA\n",__FUNCTION__,__LINE__);
+		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_SA\n",__func__,__LINE__);
 		ctEntry->flags |=  FLOW_NO_REPL_SA;
 	}	
 
@@ -1505,13 +1505,13 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 			if (orig_xfrm_handle)
 			{
 				cmm_print(DEBUG_INFO, "%s(%d) xfrm originator: handles %x, %x, %x, %x\n",
-					__FUNCTION__,__LINE__, orig_xfrm_handle[0],orig_xfrm_handle[1],
+					__func__,__LINE__, orig_xfrm_handle[0],orig_xfrm_handle[1],
 					orig_xfrm_handle[2],orig_xfrm_handle[3]);
 			}
 			if (rep_xfrm_handle)
 			{
 				cmm_print(DEBUG_INFO, "%s(%d) xfrm REPL: handles %x, %x, %x, %x\n",
-					__FUNCTION__,__LINE__, rep_xfrm_handle[0],rep_xfrm_handle[1],
+					__func__,__LINE__, rep_xfrm_handle[0],rep_xfrm_handle[1],
 					rep_xfrm_handle[2],rep_xfrm_handle[3]);
 			}
 			ctEntry->flags &= ~FLOW_NO_ORIG_SA;
@@ -1530,7 +1530,7 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 			}
 		}
 		cmm_print(DEBUG_INFO, "%s(%d) origfwdSA %p, origoutSA %p, repfwdSA %p, repOutSA %p\n",
-			__FUNCTION__,__LINE__,ctEntry->fEntryOrigFwdSA,ctEntry->fEntryOrigOutSA,
+			__func__,__LINE__,ctEntry->fEntryOrigFwdSA,ctEntry->fEntryOrigOutSA,
 			ctEntry->fEntryRepFwdSA, ctEntry->fEntryRepOutSA);
 		if ((ctEntry->flags & FLOW_NO_ORIG_SA) == FLOW_NO_ORIG_SA) 
 		{

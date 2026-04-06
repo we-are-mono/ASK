@@ -49,12 +49,12 @@ void AddToMcastGrpList(struct mcast_group_info *pMcastGrpInfo)
 	else
 	{
 		uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
-		DPA_INFO("%s(%d) hash %d , ptr %p\n",__FUNCTION__,__LINE__, uiHash, &pMcastGrpInfo->list);
+		DPA_INFO("%s(%d) hash %d , ptr %p\n",__func__,__LINE__, uiHash, &pMcastGrpInfo->list);
 		spin_lock(&mc6_spinlocks[uiHash]);
 		list_add(&(pMcastGrpInfo->list),&mc6_grp_list[uiHash]);
 		spin_unlock(&mc6_spinlocks[uiHash]);
 		DPA_INFO("%s(%d) listeners %d, Src IPv6 addr 0x%x.%x.%x.%x,Dst IPv6 addr 0x%x.%x.%x.%x\n",
-				__FUNCTION__,__LINE__, pMcastGrpInfo->uiListenerCnt, pMcastGrpInfo->ipv6_saddr[0], pMcastGrpInfo->ipv6_saddr[1],
+				__func__,__LINE__, pMcastGrpInfo->uiListenerCnt, pMcastGrpInfo->ipv6_saddr[0], pMcastGrpInfo->ipv6_saddr[1],
 				pMcastGrpInfo->ipv6_saddr[2],pMcastGrpInfo->ipv6_saddr[3], 
 				pMcastGrpInfo->ipv6_daddr[0], pMcastGrpInfo->ipv6_daddr[1],pMcastGrpInfo->ipv6_daddr[2],
 				pMcastGrpInfo->ipv6_daddr[3]);
@@ -80,7 +80,7 @@ int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
 			tmp = list_entry(ptr,struct mcast_group_info,list);
 
 			DPA_INFO("%s(%d) tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s dst-addr 0x%x, s-addr %x\n",
-					__FUNCTION__,__LINE__, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface, tmp->ipv4_daddr,
+					__func__,__LINE__, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface, tmp->ipv4_daddr,
 					tmp->ipv4_saddr);
 			if((tmp->ipv4_daddr == pMcastGrpInfo->ipv4_daddr)
 					&& (tmp->ipv4_saddr == pMcastGrpInfo->ipv4_saddr))
@@ -101,9 +101,9 @@ int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
 		{
 			tmp = list_entry(ptr,struct mcast_group_info,list);
 			DPA_INFO("%s(%d) ptr %p tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s\n",
-					__FUNCTION__,__LINE__, tmp,  tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface);
+					__func__,__LINE__, tmp,  tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface);
 			DPA_INFO("%s(%d) tmp ipv6daddr: 0x%x:%x:%x:%x src-addr: 0x%x:%x:%x:%x \n",
-					__FUNCTION__,__LINE__, tmp->ipv6_daddr[0], tmp->ipv6_daddr[1],
+					__func__,__LINE__, tmp->ipv6_daddr[0], tmp->ipv6_daddr[1],
 					tmp->ipv6_daddr[2], tmp->ipv6_daddr[3], tmp->ipv6_saddr[0],
 					tmp->ipv6_saddr[1], tmp->ipv6_saddr[2], tmp->ipv6_saddr[3]);
 
@@ -183,7 +183,7 @@ struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo)
 			tmp = list_entry(ptr,struct mcast_group_info,list);
 
 			DPA_INFO("%s(%d) tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s dst-addr 0x%x, s-addr %x\n",
-					__FUNCTION__,__LINE__, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface, tmp->ipv4_daddr,
+					__func__,__LINE__, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface, tmp->ipv4_daddr,
 					tmp->ipv4_saddr);
 			if((tmp->ipv4_daddr == pMcastGrpInfo->ipv4_daddr)
 					&& (!strncmp(pMcastGrpInfo->ucIngressIface, tmp->ucIngressIface, IF_NAME_SIZE))
@@ -204,9 +204,9 @@ struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo)
 			tmp = list_entry(ptr,struct mcast_group_info,list);
 
 			DPA_INFO("%s(%d) ptr %p, tmp->ucIngressIface %s, pMcastGrpInfo->ucIngressIface %s\n",
-					__FUNCTION__,__LINE__,tmp, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface);
+					__func__,__LINE__,tmp, tmp->ucIngressIface, pMcastGrpInfo->ucIngressIface);
 			DPA_INFO("%s(%d) tmp ipv6daddr: 0x%x:%x:%x:%x src-addr: 0x%x:%x:%x:%x \n",
-					__FUNCTION__,__LINE__, tmp->ipv6_daddr[0], tmp->ipv6_daddr[1],
+					__func__,__LINE__, tmp->ipv6_daddr[0], tmp->ipv6_daddr[1],
 					tmp->ipv6_daddr[2], tmp->ipv6_daddr[3], tmp->ipv6_saddr[0],
 					tmp->ipv6_saddr[1], tmp->ipv6_saddr[2], tmp->ipv6_saddr[3]);
 			if(!strncmp(pMcastGrpInfo->ucIngressIface, tmp->ucIngressIface, IF_NAME_SIZE))
@@ -376,7 +376,7 @@ static int cdx_add_mcast_table_entry(void *mcast_cmd,
 	onif_desc = get_onif_by_name(ucInterface); 
 	if (!onif_desc)
 	{
-		DPA_ERROR("%s::unable to get onif for iface %s\n",__FUNCTION__, ucInterface);
+		DPA_ERROR("%s::unable to get onif for iface %s\n",__func__, ucInterface);
 		retval = -EIO;
 		goto err_ret;
 	}
@@ -391,7 +391,7 @@ static int cdx_add_mcast_table_entry(void *mcast_cmd,
 		{
 			phyaddr = XX_VirtToPhys(pMcastGrpInfo->members[ii].tbl_entry);
 			DPA_INFO("%s(%d) phyaddr %llx, addr %p\n",
-					__FUNCTION__,__LINE__,phyaddr, pMcastGrpInfo->members[ii].tbl_entry);
+					__func__,__LINE__,phyaddr, pMcastGrpInfo->members[ii].tbl_entry);
 			break;
 		}
 	}
@@ -399,7 +399,7 @@ static int cdx_add_mcast_table_entry(void *mcast_cmd,
 			pMcastGrpInfo->members[ii].tbl_entry);
 	if(retval)
 	{
-		DPA_ERROR("%s::Insert Mcast entry failed \r\n",__FUNCTION__);
+		DPA_ERROR("%s::Insert Mcast entry failed \r\n",__func__);
 		goto err_ret;
 	}
 
@@ -440,12 +440,12 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 	pMcastGrpInfo = (struct mcast_group_info *)kzalloc((sizeof(struct mcast_group_info)), 0);
 	if(!pMcastGrpInfo)
 	{
-		DPA_ERROR("%s::%d  failed to allocate memory \r\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d  failed to allocate memory \r\n", __func__, __LINE__);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 
 	INIT_LIST_HEAD(&pMcastGrpInfo->list); 
-	DPA_INFO("%s(%d) : IP type %s\n", __FUNCTION__,__LINE__,
+	DPA_INFO("%s(%d) : IP type %s\n", __func__,__LINE__,
 			(bIsIPv6) ? "IPv6" : "IPv4");
 	memset(&mcast4_group, 0, sizeof(mcast4_group));
 	memset(&mcast6_group, 0, sizeof(mcast6_group));
@@ -458,7 +458,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		uiNoOfListeners = mcast4_group->num_output;
 		pInIface = mcast4_group->input_device_str;
 		DPA_INFO("%s(%d) listeners %d, Src IP addr 0x%x,Dst IP addr 0x%x\n",
-				__FUNCTION__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
+				__func__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
 				mcast4_group->dst_addr);
 	}
 	else
@@ -469,7 +469,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		uiNoOfListeners = mcast6_group->num_output;
 		pInIface = mcast6_group->input_device_str;
 		DPA_INFO("%s(%d) listeners %d, Src IPv6 addr 0x%x.%x.%x.%x,Dst IPv6 addr 0x%x.%x.%x.%x\n",
-				__FUNCTION__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
+				__func__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
 				mcast6_group->src_addr[2],mcast6_group->src_addr[3], 
 				mcast6_group->dst_addr[0], mcast6_group->dst_addr[1],mcast6_group->dst_addr[2],
 				mcast6_group->dst_addr[3]);
@@ -481,7 +481,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 	if((uiNoOfListeners) > MC_MAX_LISTENERS_PER_GROUP)
 	{
 		DPA_ERROR("%s::%d Exceeding max members(%d) in the group \r\n",
-				__FUNCTION__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
+				__func__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
 		iRet	= ERR_MC_MAX_LISTENERS_PER_GROUP;
 		goto err_ret;
 	}
@@ -493,14 +493,14 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		{
 			DPA_ERROR("%s::%d multiple ingress interfaces(%s, existing %s) are not allowed \n"
 					"for the same set of source IP and dest.IP pair \r\n",
-					__FUNCTION__, __LINE__,pMcastGrpInfo->ucIngressIface,
+					__func__, __LINE__,pMcastGrpInfo->ucIngressIface,
 					IngressIface);
 			iRet	= -1;
 			goto err_ret;
 		}
 		kfree(pMcastGrpInfo);
 		DPA_INFO("%s(%d) GetMcastGrpId returned %d, calling update_mcast_grp\n",
-				__FUNCTION__,__LINE__,iRet);
+				__func__,__LINE__,iRet);
 		return (cdx_update_mcast_group(mcast_cmd, bIsIPv6));
 	}
 
@@ -546,12 +546,12 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 			pListener = &mcast6_group->output_list[ii];
 
 		DPA_INFO("%s(%d) creating table entry of mcast member %s\n",
-				__FUNCTION__,__LINE__, pListener->output_device_str);
+				__func__,__LINE__, pListener->output_device_str);
 		tbl_entry = create_exthash_entry4mcast_member(pRtEntry, pInsEntryInfo, pListener, tbl_entry, tbl_type);
 		if (!tbl_entry)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			goto err_ret;
 		}
 		pMcastGrpInfo->members[member_id].bIsValidEntry = 1;
@@ -569,7 +569,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 
 	if(iRet != 0)
 	{
-		DPA_ERROR(" %s::%d Adding mcast table entry failed \r\n", __FUNCTION__, __LINE__);
+		DPA_ERROR(" %s::%d Adding mcast table entry failed \r\n", __func__, __LINE__);
 		goto err_ret;
 	}
 	AddToMcastGrpList(pMcastGrpInfo);
@@ -581,7 +581,7 @@ err_ret:
 		//Mcast group record is created, delete the group
 		if((iRet = cdx_free_exthash_mcast_members(pMcastGrpInfo)))
 		{
-			DPA_ERROR("%s::%d mcast group deletion failed \r\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s::%d mcast group deletion failed \r\n", __func__, __LINE__);
 		}
 		kfree(pMcastGrpInfo);
 	}
@@ -646,7 +646,7 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 		uiNoOfListeners = mcast4_group->num_output;
 		pInIface = mcast4_group->input_device_str;
 		DPA_INFO("%s(%d) listeners %d, Src IP addr 0x%x,Dst IP addr 0x%x\n",
-				__FUNCTION__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
+				__func__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
 				mcast4_group->dst_addr);
 	}
 	else
@@ -657,7 +657,7 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 		uiNoOfListeners = mcast6_group->num_output;
 		pInIface = mcast6_group->input_device_str;
 		DPA_INFO("%s(%d) listeners %d, Src IPv6 addr 0x%x.%x.%x.%x,Dst IPv6 addr 0x%x.%x.%x.%x\n",
-				__FUNCTION__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
+				__func__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
 				mcast6_group->src_addr[2],mcast6_group->src_addr[3], 
 				mcast6_group->dst_addr[0], mcast6_group->dst_addr[1],mcast6_group->dst_addr[2],
 				mcast6_group->dst_addr[3]);
@@ -666,7 +666,7 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 
 	if((pTempGrpInfo = GetMcastGrp(pMcastGrpInfo)) == NULL)
 	{
-		DPA_ERROR("%s::%d multicast group does not exist \r\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d multicast group does not exist \r\n", __func__, __LINE__);
 		iRet = -1;
 		goto err_ret;
 	}
@@ -676,7 +676,7 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 	if((uiNoOfListeners +  pMcastGrpInfo->uiListenerCnt) > MC_MAX_LISTENERS_PER_GROUP)
 	{
 		DPA_ERROR("%s::%d Exceeding max members(%d) in the group \r\n",
-				__FUNCTION__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
+				__func__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
 		iRet = ERR_MC_MAX_LISTENERS_PER_GROUP;
 		goto err_ret;
 	}
@@ -716,18 +716,18 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 		if((member_id = Cdx_GetMcastMemberId(pListener->output_device_str ,pMcastGrpInfo)) != -1)
 		{
 			DPA_ERROR("%s::%d member:%s already exists in the mcgroup \r\n",
-					__FUNCTION__, __LINE__, pListener->output_device_str );
+					__func__, __LINE__, pListener->output_device_str );
 			iRet = -1;
 			goto err_ret;    
 		}
 
 		DPA_INFO("%s(%d) creating table entry of mcast member %s\n",
-				__FUNCTION__,__LINE__, pListener->output_device_str);
+				__func__,__LINE__, pListener->output_device_str);
 
 		if( (member_id = Cdx_GetMcastMemberFreeIndex(pMcastGrpInfo)) == -1)
 		{
 			DPA_ERROR("%s::%d Exceeding max members(%d) in the group \r\n",
-					__FUNCTION__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
+					__func__, __LINE__,MC_MAX_LISTENERS_PER_GROUP);
 			iRet = -1;
 			goto err_ret;
 		}
@@ -736,12 +736,12 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 		if (!tbl_entry)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			goto err_ret;
 		}
 		phyaddr = XX_VirtToPhys(tbl_entry);
 		DPA_INFO("%s(%d) member_id %d, tbl_entry %p, phy_tbl_entry %p\n",
-				__FUNCTION__,__LINE__, member_id, tbl_entry, (uint64_t *)phyaddr);
+				__func__,__LINE__, member_id, tbl_entry, (uint64_t *)phyaddr);
 		if(pMcastGrpInfo->mctype == 0)
 		{
 			uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
@@ -813,7 +813,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 	pMcastGrpInfo->mctype = bIsIPv6;
 	if(pMcastGrpInfo->mctype == 0)
 	{
-		DPA_INFO("%s(%d) IPv4 \n",__FUNCTION__,__LINE__);
+		DPA_INFO("%s(%d) IPv4 \n",__func__,__LINE__);
 		pMcastGrpInfo->ipv4_saddr = mcast4_group->src_addr;
 		pMcastGrpInfo->ipv4_daddr = mcast4_group->dst_addr;
 		pMcastGrpInfo->mctype  = 0;
@@ -821,12 +821,12 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 		strncpy(pMcastGrpInfo->ucIngressIface,
 				mcast4_group->input_device_str, IF_NAME_SIZE-1);
 		DPA_INFO("%s(%d) listeners %d, Src IP addr 0x%x,Dst IP addr 0x%x\n",
-				__FUNCTION__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
+				__func__,__LINE__, uiNoOfListeners, mcast4_group->src_addr,
 				mcast4_group->dst_addr);
 	}
 	else
 	{
-		DPA_INFO("%s(%d) IPv6 \n",__FUNCTION__,__LINE__);
+		DPA_INFO("%s(%d) IPv6 \n",__func__,__LINE__);
 		memcpy(pMcastGrpInfo->ipv6_saddr,mcast6_group->src_addr, IPV6_ADDRESS_LENGTH);
 		memcpy(pMcastGrpInfo->ipv6_daddr,mcast6_group->dst_addr, IPV6_ADDRESS_LENGTH);
 		pMcastGrpInfo->mctype  = 1;
@@ -834,7 +834,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 		strncpy(pMcastGrpInfo->ucIngressIface,
 				mcast6_group->input_device_str, IF_NAME_SIZE-1);
 		DPA_INFO("%s(%d) listeners %d, Src IPv6 addr 0x%x.%x.%x.%x,Dst IPv6 addr 0x%x.%x.%x.%x\n",
-				__FUNCTION__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
+				__func__,__LINE__, uiNoOfListeners, mcast6_group->src_addr[0], mcast6_group->src_addr[1],
 				mcast6_group->src_addr[2],mcast6_group->src_addr[3], 
 				mcast6_group->dst_addr[0], mcast6_group->dst_addr[1],mcast6_group->dst_addr[2],
 				mcast6_group->dst_addr[3]);
@@ -842,7 +842,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 
 	if((pTempGrpInfo = GetMcastGrp(pMcastGrpInfo)) == NULL)
 	{
-		DPA_ERROR("%s::%d multicast group does not exist \r\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d multicast group does not exist \r\n", __func__, __LINE__);
 		iRet = -1;
 		goto err_ret;
 	}
@@ -878,7 +878,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 		if((member_id = Cdx_GetMcastMemberId(pListener->output_device_str ,pMcastGrpInfo)) == -1)
 		{
 			DPA_ERROR("%s::%d member:%s does not exist in the mcgroup \r\n",
-					__FUNCTION__, __LINE__, pListener->output_device_str );
+					__func__, __LINE__, pListener->output_device_str );
 			iRet = -1;
 			goto err_ret;    
 		}
@@ -933,7 +933,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 		else
 			spin_unlock(&mc6_spinlocks[uiHash]);
 		if (ExternalHashTableFmPcdHcSync(pMcastGrpInfo->pCtEntry->ct->td)) {
-			DPA_ERROR("%s::FmPcdHcSync failed\n", __FUNCTION__);
+			DPA_ERROR("%s::FmPcdHcSync failed\n", __func__);
 			return -1;
 		}
 		ExternalHashTableEntryFree(tbl_entry);
@@ -970,7 +970,7 @@ void cdx_exthash_update_first_mcast_member_addr(struct en_exthash_tbl_entry *tem
 		param->first_member_flow_addr = tmp_val.addr;
 		entry = (struct en_exthash_tbl_entry *)param->first_listener_entry;
 		DPA_INFO("%s(%d) updated first_member_flow_addr %p, next_entry addr %p \n",
-				__FUNCTION__,__LINE__,(uint64_t*)param->first_member_flow_addr,
+				__func__,__LINE__,(uint64_t*)param->first_member_flow_addr,
 				(uint64_t *)listener->hashentry.next_entry);
 		if (entry)
 		{
@@ -1024,7 +1024,7 @@ static int MC6_Command_Handler(PMC6Command cmd)
 			}
 			goto out;
 		default:
-			DPA_ERROR("%s::%d Command:%d not yet handled in cdx \r\n", __FUNCTION__, __LINE__,cmd->action);
+			DPA_ERROR("%s::%d Command:%d not yet handled in cdx \r\n", __func__, __LINE__,cmd->action);
 			rc = 0;
 	}
 
@@ -1055,7 +1055,7 @@ static int MC4_Command_Handler(PMC4Command cmd)
 		// IPv4 MC addresses must be 224.x.x.x through 239.x.x.x (i.e., high byte => 0xE0-0xEF)
 		if ((ntohl(cmd->dst_addr) & 0xF0000000) != 0xE0000000)
 		{
-			DPA_ERROR("%s::%d \r\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s::%d \r\n", __func__, __LINE__);
 			*((unsigned short *)cmd) = ERR_MC_INVALID_ADDR;
 			return sizeof(unsigned short);
 		}
@@ -1088,7 +1088,7 @@ static int MC4_Command_Handler(PMC4Command cmd)
 			}
 			goto out;
 		default:
-			DPA_ERROR("%s::%d Command:%d not yet handled in cdx \r\n", __FUNCTION__, __LINE__,cmd->action);
+			DPA_ERROR("%s::%d Command:%d not yet handled in cdx \r\n", __func__, __LINE__,cmd->action);
 			rc = 0;
 	}
 
@@ -1120,7 +1120,7 @@ U16 M_mc6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 			break;
 
 		default:
-			DPA_ERROR("%s::%d invalid command code received \r\n", __FUNCTION__, __LINE__); 
+			DPA_ERROR("%s::%d invalid command code received \r\n", __func__, __LINE__); 
 	}
 	return rc;
 }
@@ -1142,7 +1142,7 @@ U16 M_mc4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 			break;
 
 		default:
-			DPA_ERROR("%s::%d invalid command code received \r\n", __FUNCTION__, __LINE__); 
+			DPA_ERROR("%s::%d invalid command code received \r\n", __func__, __LINE__); 
 	}
 	return rc;
 }

@@ -333,7 +333,7 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 		goto out;
 	}
 	cmm_print(DEBUG_INFO, "%s(%d) SA %p, XFRM handle %x, SPI %x\n",
-		__FUNCTION__,__LINE__,pSAEntry, pSA_cmd->sagd,pSAEntry->SAInfo.id.spi);
+		__func__,__LINE__,pSAEntry, pSA_cmd->sagd,pSAEntry->SAInfo.id.spi);
 	
 #ifndef IPSEC_FLOW_CACHE
 	pSAEntry->flags |= SA_DELETE;

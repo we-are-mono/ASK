@@ -275,7 +275,7 @@ void display_iface_info(struct dpa_iface_info *iface_info)
 		return;
 	}
 	DPA_INFO("%s::unsupported iface type flags %x\n",
-			__FUNCTION__, iface_info->if_flags);
+			__func__, iface_info->if_flags);
 }
 #else
 #define display_iface_info(x)
@@ -298,7 +298,7 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 					(QMAN_FQ_FLAG_DYNAMIC_FQID | QMAN_FQ_FLAG_TO_DCPORTAL),
 					fq)) {
 			DPA_ERROR("%s::unable to create fq at index %d\n",
-					__FUNCTION__, ii);
+					__func__, ii);
 			goto err_ret;
 		}
 		memset(&opts, 0, sizeof(struct qm_mcc_initfq));
@@ -320,7 +320,7 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 		opts.fqd.context_a.lo = 0xC0000000;
 		if (qman_init_fq(fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
 			DPA_ERROR("%s::qman_init_fq failed for fqid %d\n",
-					__FUNCTION__, fq->fqid);
+					__func__, fq->fqid);
 			qman_destroy_fq(fq, 0);
 			goto err_ret;
 		}
@@ -328,7 +328,7 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 		cdx_create_type_fqid_info_in_procfs(fq, TX_DIR, iface_info->tx_proc_entry, NULL);
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n", 
-				__FUNCTION__, fq->fqid, eth_info->tx_channel_id);
+				__func__, fq->fqid, eth_info->tx_channel_id);
 #endif
 		fq++;
 	}
@@ -340,19 +340,19 @@ err_ret:
 	for (; ii > 0; ii--, fq--) {
 		if (qman_retire_fq(fq, NULL)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		if (qman_oos_fq(fq)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n", 
-				__FUNCTION__, fq->fqid, eth_info->tx_channel_id);
+				__func__, fq->fqid, eth_info->tx_channel_id);
 #endif
 	}
 	return FAILURE;
@@ -372,19 +372,19 @@ static int destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
 		if (qman_retire_fq(fq, NULL)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		if (qman_oos_fq(fq)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n", 
-				__FUNCTION__, fq->fqid, eth_info->tx_channel_id);
+				__func__, fq->fqid, eth_info->tx_channel_id);
 #endif
 		fq++;
 	}
@@ -446,7 +446,7 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 
 	device = dev_get_by_name(&init_net, name);	
 	if (!device) {
-		DPA_ERROR("%s::could not find device %s\n", __FUNCTION__, name);
+		DPA_ERROR("%s::could not find device %s\n", __func__, name);
 		return FAILURE;
 	}
 	priv = netdev_priv(device);
@@ -472,7 +472,7 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 		{
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::iface %s, fqid %d, channel %d, wq %d, type %d\n",
-					__FUNCTION__, iface_info->name, 
+					__func__, iface_info->name, 
 					dpa_fq->fqid, dpa_fq->channel, dpa_fq->wq,
 					dpa_fq->fq_type);
 #endif
@@ -518,7 +518,7 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 	//number of buffer pools in use by this port
 	eth_info->num_pools = (int)priv->bp_count;
 	if (eth_info->num_pools > MAX_PORT_BMAN_POOLS) {
-		DPA_ERROR("%s::invalid num pools value\n", __FUNCTION__);
+		DPA_ERROR("%s::invalid num pools value\n", __func__);
 		return FAILURE;
 	}
 	bp = priv->dpa_bp;
@@ -539,7 +539,7 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 				&eth_info->tx_channel_id, 
 				&eth_info->tx_wq)) {
 		DPA_ERROR("%s::dpa_get_tx_chnl_info failed\n", 
-				__FUNCTION__);
+				__func__);
 		return FAILURE;
 	}
 	return SUCCESS;
@@ -636,7 +636,7 @@ static inline int dpa_get_fqid_from_eth(struct eth_iface_info *eth_info,
 
 	if (!egress_fq) {
 		DPA_ERROR("%s::unable to get ceetm fqid for chnl %d queue %d\n",
-				__FUNCTION__, qosmark->chnl_id, qosmark->queue);
+				__func__, qosmark->chnl_id, qosmark->queue);
 		return FAILURE;
 	} 
 	*tx_fqid = egress_fq->fqid;
@@ -655,7 +655,7 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 
 	iface_info =  dpa_get_phys_iface(iface_info);
 	if (!iface_info) {
-		DPA_INFO("%s:: iface info null\n", __FUNCTION__);
+		DPA_INFO("%s:: iface info null\n", __func__);
 		return FAILURE;
 	}
 
@@ -702,7 +702,7 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 		{
 			if (cdx_get_tx_dscp_fq_map(eth_info, is_dscp_fq_map, NULL) != 0)
 			{
-				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __FUNCTION__);
+				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __func__);
 				return FAILURE;
 			}
 		}
@@ -728,7 +728,7 @@ static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
 	while(iface) {
 		if (iface->if_flags & IF_TYPE_VLAN) {
 			if (l2_info->num_egress_vlan_hdrs == DPA_CLS_HM_MAX_VLANs) {
-				DPA_INFO("%s::too many vlan headers \n", __FUNCTION__);
+				DPA_INFO("%s::too many vlan headers \n", __func__);
 				break;
 			}
 			l2_info->egress_vlan_hdrs[l2_info->num_egress_vlan_hdrs].tpid = 0x8100;
@@ -739,7 +739,7 @@ static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
 			l2_info->vlan_stats_offsets[l2_info->num_egress_vlan_hdrs] =
 				iface->txstats_index;
 #ifdef DEVMAN_DEBUG
-			printk("%s::vlan tx stats offset %d\n", __FUNCTION__,
+			printk("%s::vlan tx stats offset %d\n", __func__,
 					iface->txstats_index);
 #endif
 #endif
@@ -748,7 +748,7 @@ static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
 			iface = iface->vlan_info.parent;
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::moving to parent iface %s id %d\n",
-					__FUNCTION__, iface->name, iface->itf_id);
+					__func__, iface->name, iface->itf_id);
 #endif
 		}
 		else if (iface->if_flags & IF_TYPE_PPPOE) {
@@ -765,7 +765,7 @@ static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
 			iface = iface->pppoe_info.parent;
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::moving to parent iface %s id %d\n",
-					__FUNCTION__, iface->name, iface->itf_id);
+					__func__, iface->name, iface->itf_id);
 #endif
 		}
 		else if (iface->if_flags & IF_TYPE_ETHERNET ) {
@@ -788,7 +788,7 @@ static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
 		}
 		else {
 			DPA_ERROR("%s::iface type %x not supported \n",
-					__FUNCTION__, iface->if_flags);
+					__func__, iface->if_flags);
 			return FAILURE;
 		}
 	}
@@ -796,7 +796,7 @@ static int dpa_get_tx_l2info_by_iface(struct dpa_iface_info *iface_info,
 	/* Get tx fqid*/
 	if (dpa_get_tx_fqid_devinfo_by_iface(iface_info, &(l2_info->fqid), &(l2_info->is_dscp_fq_map), NULL, NULL, hash)) {
 		DPA_ERROR("%s::faied to get tx fqid iface(%s)\n",
-				__FUNCTION__, iface_info->name);
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 
@@ -821,13 +821,13 @@ int dpa_get_tx_l2info_by_itf(struct dpa_l2hdr_info *l2_info, POnifDesc itf, uint
 
 	if (!iface_info) {
 		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s::iface(%s) is NULL\n", __FUNCTION__, itf->name);
+		DPA_ERROR("%s::iface(%s) is NULL\n", __func__, itf->name);
 		return FAILURE;
 	}
 
 	if (dpa_get_tx_l2info_by_iface(iface_info, l2_info, hash)) {
 		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s::Failed to get iface(%s) l2info\n", __FUNCTION__, itf->name);
+		DPA_ERROR("%s::Failed to get iface(%s) l2info\n", __func__, itf->name);
 		return FAILURE;
 	}
 
@@ -863,7 +863,7 @@ check_parent:
 						DPA_CLS_HM_MAX_VLANs) {
 					DPA_INFO("%s::too many vlan "
 							"headers \n",
-							__FUNCTION__);
+							__func__);
 					break;
 				}
 				l2_info->ingress_vlan_hdrs[l2_info->num_ingress_vlan_hdrs].tpid = ETHERTYPE_VLAN;
@@ -897,9 +897,9 @@ check_parent:
 				if ((!parent) || (parent == iface_info))
 				{
 					DPA_ERROR("%s(%d) iface_info %p, parent %p \n",
-							__FUNCTION__,__LINE__,iface_info, parent);
+							__func__,__LINE__,iface_info, parent);
 					DPA_ERROR("%s(%d)INVALID CONFIGURATION \n",
-							__FUNCTION__,__LINE__);
+							__func__,__LINE__);
 					return FAILURE;
 				}
 				iface_info = parent;
@@ -907,7 +907,7 @@ check_parent:
 
 			}
 			DPA_ERROR("%s::unsupported type 0x%x\n",
-					__FUNCTION__, iface_info->if_flags);
+					__func__, iface_info->if_flags);
 			break;
 		} 
 		iface_info = iface_info->next;
@@ -930,7 +930,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 			device = dev_get_by_name(&init_net, iface_info->name);
 			if (!device)
 			{
-				printk("%s:: Could not find device : %s\n",__FUNCTION__, iface_info->name);
+				printk("%s:: Could not find device : %s\n",__func__, iface_info->name);
 				goto next_iface;
 			}
 
@@ -952,7 +952,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 									tx_fqid, NULL, portid, netdev, hash);
 							if (ret < 0)
 							{
-								printk("%s:: Could not get portid and tx_fqid for : %s \n",__FUNCTION__, iface_info->name);
+								printk("%s:: Could not get portid and tx_fqid for : %s \n",__func__, iface_info->name);
 								dev_put(device);
 								rcu_read_unlock();
 								goto end;
@@ -983,7 +983,7 @@ int dpa_get_iface_info_by_ipaddress(int sa_family, uint32_t  *daddr, uint32_t * 
 									tx_fqid, NULL, portid, netdev, hash);
 							if (ret < 0)
 							{
-								printk("%s:: Could not get portid and tx_fqid for : %s \n",__FUNCTION__, iface_info->name);
+								printk("%s:: Could not get portid and tx_fqid for : %s \n",__func__, iface_info->name);
 								dev_put(device);
 								read_unlock_bh(&inet6_device->lock);
 								rcu_read_unlock();
@@ -1057,7 +1057,7 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
 			if (dir_in) {
 				l2_info->vlan_present = 1;
 				if (l2_info->num_ingress_vlan_hdrs >= DPA_CLS_HM_MAX_VLANs) {
-					DPA_INFO("%s::too many vlan " "headers \n",__FUNCTION__);
+					DPA_INFO("%s::too many vlan " "headers \n",__func__);
 					retval = FAILURE;
 					break;
 				}
@@ -1068,7 +1068,7 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
 			}
 			else {
 				if (l2_info->num_egress_vlan_hdrs == DPA_CLS_HM_MAX_VLANs) {
-					DPA_INFO("%s::too many vlan " "headers \n", __FUNCTION__); 
+					DPA_INFO("%s::too many vlan " "headers \n", __func__); 
 					retval = FAILURE;
 					break;
 				}
@@ -1115,7 +1115,7 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
 		} else {
 			DPA_INFO("%s::iface type %x not "
 					"supported \n",
-					__FUNCTION__, iface_info->if_flags);
+					__func__, iface_info->if_flags);
 			break;
 		}
 	}
@@ -1140,7 +1140,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 	if(!rt_entry)
 	{
 		DPA_ERROR("%s::NULL Route \n",
-				__FUNCTION__);
+				__func__);
 		return retval;
 	}
 	itf_id = rt_entry->itf->index;
@@ -1194,7 +1194,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				break;
 			if (cdx_get_tx_dscp_fq_map(eth_info, &l2_info->is_dscp_fq_map, NULL) != 0)
 			{
-				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __FUNCTION__);
+				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __func__);
 				break;
 			}
 			l2_info->dscp_vlanpcp_map_enable = 
@@ -1219,7 +1219,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 					DPA_CLS_HM_MAX_VLANs) {
 				DPA_INFO("%s::too many vlan "
 						"headers \n",
-						__FUNCTION__); 
+						__func__); 
 				break;
 			}
 			//move to parent interface
@@ -1227,7 +1227,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::moving to parent "
 					"iface %s id %d\n",
-					__FUNCTION__, parent->name,
+					__func__, parent->name,
 					parent->itf_id);
 #endif
 			if (!src_mac)
@@ -1251,7 +1251,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::moving to parent "
 					"iface %s id %d\n",
-					__FUNCTION__, parent->name,
+					__func__, parent->name,
 					parent->itf_id);
 #endif
 			l2_info->pppoe_sess_id = 
@@ -1267,12 +1267,12 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 			if (!parent || (iface_info == parent))
 			{
 				DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-						__FUNCTION__,__LINE__,iface_info, iface_info->pppoe_info.parent);
+						__func__,__LINE__,iface_info, iface_info->pppoe_info.parent);
 				break; // If and When more tunnels are introduced, the parent needs to be used for on floating tunnels.
 			}
 			DPA_INFO("%s::moving to parent "
 					"iface %s id %d\n",
-					__FUNCTION__, parent->name,
+					__func__, parent->name,
 					parent->itf_id);
 			l3_info->add_tnl_header = 1;
 			l3_info->header_size = iface_info->tunnel_info.header_size;
@@ -1309,7 +1309,7 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 		} else {
 			DPA_INFO("%s::iface type %x not "
 					"supported \n",
-					__FUNCTION__, iface_info->if_flags);
+					__func__, iface_info->if_flags);
 			break;
 		}
 	}
@@ -1332,20 +1332,20 @@ int dpa_get_num_vlan_iface_stats_entries(uint32_t iif, uint32_t underlying_iif,
 check_parent:
 			if (iface_info->if_flags & IF_TYPE_ETHERNET) {
 #ifdef DEVMAN_DEBUG
-				printk("%s::eth if, max %d\n", __FUNCTION__, max_stats);
+				printk("%s::eth if, max %d\n", __func__, max_stats);
 #endif
 				return SUCCESS;
 			}
 			if (iface_info->if_flags & IF_TYPE_WLAN) {
 #ifdef DEVMAN_DEBUG
-				printk("%s::wlan if, max %d\n", __FUNCTION__, max_stats);
+				printk("%s::wlan if, max %d\n", __func__, max_stats);
 #endif
 				return SUCCESS;		
 			}
 			if (iface_info->if_flags & IF_TYPE_VLAN)
 			{
 #ifdef DEVMAN_DEBUG
-				printk("%s::vlan if, max %d\n", __FUNCTION__, max_stats);
+				printk("%s::vlan if, max %d\n", __func__, max_stats);
 #endif
 				(*num_entries)++;
 				iface_info = iface_info->vlan_info.parent;
@@ -1354,7 +1354,7 @@ check_parent:
 			if (iface_info->if_flags & IF_TYPE_PPPOE)
 			{
 #ifdef DEVMAN_DEBUG
-				printk("%s::pppoe if\n", __FUNCTION__);
+				printk("%s::pppoe if\n", __func__);
 #endif
 				iface_info = iface_info->pppoe_info.parent;
 				goto check_parent;
@@ -1362,20 +1362,20 @@ check_parent:
 			if ((iface_info->if_flags & IF_TYPE_TUNNEL) && (underlying_iif))
 			{
 #ifdef DEVMAN_DEBUG
-				printk("%s::tunnel if\n", __FUNCTION__);
+				printk("%s::tunnel if\n", __func__);
 #endif
 				parent = dpa_get_ifinfo_by_itfid(underlying_iif);
 				if(!parent || (iface_info == parent))
 				{
 					DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-							__FUNCTION__,__LINE__,iface_info, iface_info->pppoe_info.parent);
+							__func__,__LINE__,iface_info, iface_info->pppoe_info.parent);
 					return FAILURE;
 				}
 				iface_info = parent;
 				goto check_parent;	
 			}
 			DPA_ERROR("%s::unsupported type 0x%x\n",
-					__FUNCTION__, iface_info->if_flags);
+					__func__, iface_info->if_flags);
 			break;
 		} 
 		iface_info = iface_info->next;
@@ -1404,14 +1404,14 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 	if(!rt_entry->input_itf || !rt_entry->underlying_input_itf)
 	{
 		DPA_ERROR("%s::NULL Input interface \n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 
 	if (dpa_check_for_logical_iface_types(rt_entry->input_itf, rt_entry->underlying_input_itf, 
 				l2_info, l3_info)) {
 		DPA_ERROR("%s::get_iface_type failed iface %d\n", 
-				__FUNCTION__,  rt_entry->input_itf->index);
+				__func__,  rt_entry->input_itf->index);
 		goto err_ret;
 	}
 
@@ -1480,7 +1480,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 				goto err_ret;
 			if (cdx_get_tx_dscp_fq_map(eth_info, &l2_info->is_dscp_fq_map, qosinfo) != 0)
 			{
-				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __FUNCTION__);
+				DPA_ERROR("%s::unable to get ceetm dscp fq map\n", __func__);
 				goto err_ret;
 			}
 			l2_info->dscp_vlanpcp_map_enable = 
@@ -1510,7 +1510,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 					DPA_CLS_HM_MAX_VLANs) {
 				DPA_INFO("%s::too many vlan "
 						"headers \n",
-						__FUNCTION__); 
+						__func__); 
 				break;
 			}
 			//move to parent interface
@@ -1518,7 +1518,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::moving to parent "
 					"iface %s id %d\n",
-					__FUNCTION__, parent->name,
+					__func__, parent->name,
 					parent->itf_id);
 #endif
 			if (!src_mac)
@@ -1537,7 +1537,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 			l2_info->vlan_stats_offsets[l2_info->num_egress_vlan_hdrs] = 
 				iface_info->txstats_index;	
 #ifdef DEVMAN_DEBUG
-			printk("%s::vlan tx stats offset %d\n", __FUNCTION__,
+			printk("%s::vlan tx stats offset %d\n", __func__,
 					iface_info->txstats_index);
 #endif
 #endif
@@ -1552,7 +1552,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::moving to parent "
 					"iface %s id %d\n",
-					__FUNCTION__, parent->name,
+					__func__, parent->name,
 					parent->itf_id);
 #endif
 			l2_info->pppoe_sess_id = 
@@ -1577,13 +1577,13 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s::moving to parent "
 					"iface %s id %d\n",
-					__FUNCTION__, parent->name,
+					__func__, parent->name,
 					parent->itf_id);
 #endif
 			if (iface_info == parent)
 			{
 				DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-						__FUNCTION__,__LINE__,iface_info, parent);
+						__func__,__LINE__,iface_info, parent);
 				retval = FAILURE;
 				goto err_ret;
 			}
@@ -1602,7 +1602,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 			{
 				if(is_ipv6_addr_any(l3_info->remote_ip)) {
 					if(!tnl_rt_entry) {
-						DPA_ERROR("%s(%d)  tnl_rt_entry is NULL\n",__FUNCTION__,__LINE__);
+						DPA_ERROR("%s(%d)  tnl_rt_entry is NULL\n",__func__,__LINE__);
 						retval = FAILURE;
 						goto err_ret;
 					}
@@ -1614,7 +1614,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 			{
 				if(!l3_info->remote_ip[0]) { // Remote address ANY
 					if(!tnl_rt_entry) {
-						DPA_ERROR("%s(%d)  tnl_rt_entry is NULL\n",__FUNCTION__,__LINE__);
+						DPA_ERROR("%s(%d)  tnl_rt_entry is NULL\n",__func__,__LINE__);
 						retval = FAILURE;
 						goto err_ret;
 					}
@@ -1633,7 +1633,7 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 		} else {
 			DPA_INFO("%s::iface type %x not "
 					"supported \n",
-					__FUNCTION__, iface_info->if_flags);
+					__func__, iface_info->if_flags);
 			break;
 		}
 	}
@@ -1659,7 +1659,7 @@ int dpa_get_tx_fqid_by_name(char *name, uint32_t *fqid, uint8_t *is_dscp_fq_map,
 						NULL, NULL, hash)) {
 				spin_unlock(&dpa_devlist_lock);
 				DPA_ERROR("%s::faied to get tx fqid iface(%s)\n",
-						__FUNCTION__, iface_info->name);
+						__func__, iface_info->name);
 				return FAILURE;
 			}
 			spin_unlock(&dpa_devlist_lock);
@@ -1751,7 +1751,7 @@ int dpa_get_iface_stats_entries(uint32_t iif_index,
 
 	iface_info = dpa_get_ifinfo_by_itfid(iif_index);
 	if (!iface_info) {
-		DPA_ERROR("%s::iface is NULL\n", __FUNCTION__);
+		DPA_ERROR("%s::iface is NULL\n", __func__);
 		return FAILURE;
 	}
 
@@ -1803,7 +1803,7 @@ check_parent:
 				if(!parent || (parent == iface_info))
 				{
 					DPA_ERROR("%s(%d) SOME THING WRONG , parent(%p) and iface(%p) are same \n",
-							__FUNCTION__,__LINE__,iface_info, iface_info->pppoe_info.parent);
+							__func__,__LINE__,iface_info, iface_info->pppoe_info.parent);
 					return FAILURE;
 				}
 				iface_info = parent;
@@ -1863,7 +1863,7 @@ void dpa_release_interface(uint32_t itf_id)
 
 #ifdef DEVMAN_DEBUG
 			printk("%s::removed iface %s, type %d\n",
-					__FUNCTION__, curr_info->name,
+					__func__, curr_info->name,
 					curr_info->if_flags);
 #endif		
 			if(curr_info->if_flags & IF_TYPE_PPPOE)
@@ -1937,7 +1937,7 @@ static int dpa_bman_reconfigure_discard_mask(struct dpa_iface_info *iface_info)
 	if (!port->h_Dev)
 	{
 		DPA_ERROR("%s::no handle for eth dev %s\n",
-				__FUNCTION__, iface_info->name);
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 
@@ -1948,7 +1948,7 @@ static int dpa_bman_reconfigure_discard_mask(struct dpa_iface_info *iface_info)
 	if (FM_PORT_SetDiscardMask(port->h_Dev, ErrDiscard) != 0)
 	{
 		DPA_ERROR("%s:: failed to set eth dev %s port ErrorsToDiscard configuration.\n",
-				__FUNCTION__, iface_info->name);
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 	return SUCCESS;
@@ -1964,7 +1964,7 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	if(iface_count >= (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES))
 	{
 		DPA_ERROR("%s::Number of interfaces support in fast path is only %d\n",
-				__FUNCTION__,
+				__func__,
 				(MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES));
 		return FAILURE;
 	}
@@ -1973,7 +1973,7 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 		kzalloc(sizeof(struct dpa_iface_info), 0);  
 	if (!iface_info) {
 		DPA_ERROR("%s::no mem for eth dev info size %d\n", 
-				__FUNCTION__, 
+				__func__, 
 				(uint32_t)sizeof(struct dpa_iface_info));
 		return FAILURE;
 	}
@@ -1985,18 +1985,18 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	//get rest of info from config 
 	if (get_dpa_eth_iface_info(&iface_info->eth_info, name)) {
 		DPA_ERROR("%s::get_dpa_eth_iface_info failed %s\n", 
-				__FUNCTION__, name);
+				__func__, name);
 		goto err_ret;
 	}
 
 	if (cdx_create_dir_in_procfs(&iface_info->tx_proc_entry, name, TX_DIR)) {
 		DPA_ERROR("%s:: create tx proc entry failed %s\n", 
-				__FUNCTION__, name);
+				__func__, name);
 		goto err_ret;
 	}
 	if (cdx_create_dir_in_procfs(&iface_info->pcd_proc_entry, name, PCD_DIR)) {
 		DPA_ERROR("%s:: create pcd proc entry failed %s\n", 
-				__FUNCTION__, name);
+				__func__, name);
 		goto err_ret1;
 	}
 
@@ -2004,12 +2004,12 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	mac_dev = priv->mac_dev;
 	iface_info->eth_info.hardwarePortId = fm_port_get_hwid(mac_dev->port_dev[RX]);
 #ifdef CDX_DPA_DEBUG
-	printk("%s::port %s hwid %d\n", __FUNCTION__,
+	printk("%s::port %s hwid %d\n", __func__,
 			iface_info->name, iface_info->eth_info.hardwarePortId);
 #endif
 #ifdef INCLUDE_ETHER_IFSTATS
 	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
-		DPA_ERROR("%s:: alloc_iface_stats failed\n", __FUNCTION__);
+		DPA_ERROR("%s:: alloc_iface_stats failed\n", __func__);
 		goto err_ret2;
 	}
 	dpa_set_eth_ifinfo(priv, iface_info->stats);
@@ -2022,19 +2022,19 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret2;
 	}
 
 	if(dpa_add_virt_storage_profile(iface_info->eth_info.net_dev ,&iface_info->eth_info)){
 		DPA_ERROR("%s::dpa_add_virt_storage_porfile_config failed\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret3;
 	}
 	//add policer profile to port
 	if (dpa_add_ethport_ff_policier_profile(iface_info)) {
 		DPA_ERROR("%s::dpa_add_policier_profile failed\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret4;
 	}
 
@@ -2045,7 +2045,7 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	/* with the above errors in bman driver, so turning off them. */
 	if (dpa_bman_reconfigure_discard_mask(iface_info)) {
 		DPA_ERROR("%s::dpa_add_policier_profile failed\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret5;
 	}
 #endif
@@ -2054,21 +2054,21 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	/* enable CEETM on this interface */
 	if (cdx_enable_ceetm_on_iface(iface_info)) {
 		DPA_ERROR("%s::cdx_enable_ceetm_on_iface failed\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret6;
 	}
 #endif
 	/* no CEETM, create fwd Fqs */
 	if (create_fwd_tx_fqs(iface_info)) {
 		DPA_ERROR("%s::create_fwd_tx_fqs failed\n", 
-				__FUNCTION__);
+				__func__);
 		goto err_ret7;
 	}
 #ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
 	/* Create Ethernet interface voip frame queues */
 	if (dpa_create_eth_if_voip_fqs(iface_info)) {
 		DPA_ERROR("%s::%d Ethernet interface voip frame queues creation failed\n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 		goto err_ret8;
 	}
 #endif
@@ -2112,19 +2112,19 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 	if(iface_pppoe_count >= MAX_PPPoE_INTERFACES)
 	{
 		DPA_ERROR("%s::Number of pppoe interfaces support in fast path is only %d\n",
-				__FUNCTION__,
+				__func__,
 				MAX_PPPoE_INTERFACES);
 		return FAILURE;
 	}
 
 	if (!(phys_itf)) {
 		DPA_ERROR("%s::null dev for phys_itf\n", 
-				__FUNCTION__); 
+				__func__); 
 		return FAILURE;
 	}
 	if (!(itf->phys)) {
 		DPA_ERROR("%s::null dev for lower iface\n", 
-				__FUNCTION__); 
+				__func__); 
 		return FAILURE;
 	}
 
@@ -2132,7 +2132,7 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 		kzalloc(sizeof(struct dpa_iface_info), 0);  
 	if (!iface_info) {
 		DPA_ERROR("%s::no mem for pppoe dev info size %d\n", 
-				__FUNCTION__, 
+				__func__, 
 				(uint32_t)sizeof(struct dpa_iface_info));
 		return FAILURE;
 	}
@@ -2147,7 +2147,7 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 	parent = dpa_get_ifinfo_by_itfid(itf->phys->index);
 	if (!parent) {
 		DPA_ERROR("%s::no ifinfo for dev idx %d\n", 
-				__FUNCTION__, itf->index);
+				__func__, itf->index);
 		spin_unlock(&dpa_devlist_lock);
 		goto err_ret;
 	}
@@ -2157,7 +2157,7 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 	spin_unlock(&dpa_devlist_lock);
 #ifdef INCLUDE_PPPoE_IFSTATS
 	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
-		DPA_ERROR("%s:: alloc_iface_stats failed\n", __FUNCTION__);
+		DPA_ERROR("%s:: alloc_iface_stats failed\n", __func__);
 		goto err_ret;
 	}
 	iface_info->if_flags |= IF_STATS_ENABLED;
@@ -2168,7 +2168,7 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n", 
-				__FUNCTION__); 
+				__func__); 
 		goto err_ret;
 	}
 #if 0
@@ -2176,7 +2176,7 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 	if (insert_entry_in_pppoe_table(parent->eth_info.fman_idx, 
 				parent->eth_info.port_idx, mac_addr, session_id, PPP_IP)) {
 		DPA_ERROR("%s::insert_entry_in_pppoe_table failed\n", 
-				__FUNCTION__); 
+				__func__); 
 		//remove it from our list
 		dpa_release_interface(itf->index);
 		goto err_ret;
@@ -2197,19 +2197,19 @@ int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_
 	if(iface_count >= (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES))
 	{
 		DPA_ERROR("%s::Number of interfaces support in fast path is only %d\n",
-				__FUNCTION__,
+				__func__,
 				(MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES));
 		return FAILURE;
 	}
 
 	if (!(phys_itf)) {
 		DPA_ERROR("%s::null dev for phys_itf\n", 
-				__FUNCTION__); 
+				__func__); 
 		return FAILURE;
 	}
 	if (!(itf->phys)) {
 		DPA_ERROR("%s::null dev for lower iface\n", 
-				__FUNCTION__); 
+				__func__); 
 		return FAILURE;
 	}
 
@@ -2218,7 +2218,7 @@ int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_
 		kzalloc(sizeof(struct dpa_iface_info), 0);  
 	if (!iface_info) {
 		DPA_ERROR("%s::no mem for eth dev info size %d\n", 
-				__FUNCTION__, 
+				__func__, 
 				(uint32_t)sizeof(struct dpa_iface_info));
 		return FAILURE;
 	}
@@ -2233,7 +2233,7 @@ int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_
 	parent = dpa_get_ifinfo_by_itfid(itf->phys->index);
 	if (!parent) {
 		DPA_ERROR("%s::no ifinfo for dev idx %d\n", 
-				__FUNCTION__, itf->index);
+				__func__, itf->index);
 		spin_unlock(&dpa_devlist_lock);
 		goto err_ret;
 	}
@@ -2244,7 +2244,7 @@ int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_
 	/* allocate interface statistics memory */
 #ifdef INCLUDE_VLAN_IFSTATS
 	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
-		DPA_ERROR("%s:: alloc_iface_stats failed\n", __FUNCTION__);
+		DPA_ERROR("%s:: alloc_iface_stats failed\n", __func__);
 		goto err_ret;
 	}
 	iface_info->if_flags |= IF_STATS_ENABLED;
@@ -2255,7 +2255,7 @@ int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n", 
-				__FUNCTION__); 
+				__func__); 
 		goto err_ret;
 	}
 	iface_count++;
@@ -2274,23 +2274,23 @@ static int get_wlan_iface_info(struct dpa_iface_info *iface_info)
 
 	device = dev_get_by_name(&init_net, iface_info->name);
 	if (!device) {
-		DPA_INFO("%s::could not find device %s\n", __FUNCTION__, iface_info->name);
+		DPA_INFO("%s::could not find device %s\n", __func__, iface_info->name);
 		return FAILURE;
 	}
 	iface_info->mtu = device->mtu;
 	dev_put(device);
 
 	dpaa_get_wifi_ohport_handle(&ohport_handle);
-	DPA_INFO("%s::OH port handle  %d\n", __FUNCTION__, ohport_handle);
+	DPA_INFO("%s::OH port handle  %d\n", __func__, ohport_handle);
 
 	ret = get_ofport_fman_and_portindex(FMAN_IDX, ohport_handle, &iface_info->wlan_info.fman_idx, 
 			&iface_info->wlan_info.port_idx, &iface_info->wlan_info.portid);
 	if (ret) {
-		DPA_ERROR("%s::get_ofport_fman_and_portindex failed\n", __FUNCTION__);
+		DPA_ERROR("%s::get_ofport_fman_and_portindex failed\n", __func__);
 		return FAILURE;
 	}
 
-	DPA_INFO("%s::fman_idx: %d port_idx: %d\n", __FUNCTION__, iface_info->wlan_info.fman_idx, iface_info->wlan_info.port_idx);
+	DPA_INFO("%s::fman_idx: %d port_idx: %d\n", __func__, iface_info->wlan_info.fman_idx, iface_info->wlan_info.port_idx);
 	return SUCCESS;
 }
 
@@ -2303,7 +2303,7 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 		kzalloc(sizeof(struct dpa_iface_info), 0);
 	if (!iface_info) {
 		DPA_ERROR("%s::no mem for eth dev info size %d\n",
-				__FUNCTION__,
+				__func__,
 				(uint32_t)sizeof(struct dpa_iface_info));
 		return FAILURE;
 	}
@@ -2321,7 +2321,7 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 
@@ -2414,7 +2414,7 @@ check_parent:
 				itf_index = iface_info->itf_id;
 #ifdef DEVMAN_DEBUG
 				DPA_INFO("%s::moving to parent iface %s id %d\n",
-						__FUNCTION__, iface_info->name, itf_index);
+						__func__, iface_info->name, itf_index);
 #endif
 				goto check_parent;
 			}
@@ -2423,7 +2423,7 @@ check_parent:
 				itf_index = iface_info->itf_id;
 #ifdef DEVMAN_DEBUG
 				DPA_INFO("%s::moving to parent iface %s id %d\n",
-						__FUNCTION__, iface_info->name, itf_index);
+						__func__, iface_info->name, itf_index);
 #endif
 				goto check_parent;
 			}
@@ -2432,14 +2432,14 @@ check_parent:
 				if(underlying_iif_index == itf_index)
 				{
 					DPA_ERROR("%s::underlying iface info cannot be same as itf_index\n",
-							__FUNCTION__);
+							__func__);
 					return FAILURE;
 				}
 
 				spin_lock(&dpa_devlist_lock);
 				if((iface_info = dpa_get_ifinfo_by_itfid(underlying_iif_index)) == NULL)
 				{
-					DPA_ERROR("%s::iface info does not exist\n", __FUNCTION__);
+					DPA_ERROR("%s::iface info does not exist\n", __func__);
 					spin_unlock(&dpa_devlist_lock);
 					return FAILURE;
 				}
@@ -2448,12 +2448,12 @@ check_parent:
 				itf_index = iface_info->itf_id;
 #ifdef DEVMAN_DEBUG
 				DPA_INFO("%s::moving to parent iface %s id %d\n",
-						__FUNCTION__, iface_info->name, itf_index);
+						__func__, iface_info->name, itf_index);
 #endif
 				goto check_parent;
 			}  else {
 				DPA_ERROR("%s::unsupported type 0x%x\n",
-						__FUNCTION__, iface_info->if_flags);
+						__func__, iface_info->if_flags);
 				break;
 			}
 		}
@@ -2470,7 +2470,7 @@ int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry)
 
 	if (!(itf)) {
 		DPA_ERROR("%s::null dev for tunnel _itf\n", 
-				__FUNCTION__); 
+				__func__); 
 		return FAILURE;
 	}
 
@@ -2478,7 +2478,7 @@ int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry)
 	if((iface_info = dpa_get_ifinfo_by_itfid(itf->index)) == NULL){
 
 		DPA_ERROR("%s::iface info does not exist\n", 
-				__FUNCTION__); 
+				__func__); 
 		spin_unlock(&dpa_devlist_lock);
 		return FAILURE;
 	}
@@ -2499,7 +2499,7 @@ int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry)
 		parent = dpa_get_ifinfo_by_itfid(phys_itf->index);
 		if (!parent) {
 			DPA_ERROR("%s::no ifinfo for dev idx %d\n", 
-					__FUNCTION__, pTunnelEntry->itf.phys->index);
+					__func__, pTunnelEntry->itf.phys->index);
 			spin_unlock(&dpa_devlist_lock);
 			return FAILURE;
 		}
@@ -2520,7 +2520,7 @@ int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry)
 	spin_unlock(&dpa_devlist_lock);
 	return SUCCESS;
 #else
-	DPA_ERROR("%s::tunnel interfaces not supported\n", __FUNCTION__); 
+	DPA_ERROR("%s::tunnel interfaces not supported\n", __func__); 
 	return FAILURE;
 #endif
 }
@@ -2534,7 +2534,7 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 	if(iface_count >= (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES))
 	{
 		DPA_ERROR("%s::Number of interfaces support in fast path is only %d\n",
-				__FUNCTION__,
+				__func__,
 				(MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES));
 		return FAILURE;
 	}
@@ -2542,13 +2542,13 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 
 	if (!(itf)) {
 		DPA_ERROR("%s::null dev for tunnel _itf\n", 
-				__FUNCTION__); 
+				__func__); 
 		return FAILURE;
 	}
 #if 0 
 	if (!(phys_itf)) {
 		DPA_ERROR("%s::null dev for phys_itf\n", 
-				__FUNCTION__); 
+				__func__); 
 		return FAILURE;
 	}
 #endif
@@ -2556,7 +2556,7 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 		kzalloc(sizeof(struct dpa_iface_info), 0);  
 	if (!iface_info) {
 		DPA_ERROR("%s::no mem for tunnel dev info size %d\n", 
-				__FUNCTION__, 
+				__func__, 
 				(uint32_t)sizeof(struct dpa_iface_info));
 		return FAILURE;
 	}
@@ -2584,7 +2584,7 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 		parent = dpa_get_ifinfo_by_itfid(phys_itf->index);
 		if (!parent || (parent == iface_info)) {
 			DPA_ERROR("%s::no ifinfo (%p) for dev idx %d, or matching with parent(%p)\n", 
-					__FUNCTION__, iface_info,pTunnelEntry->itf.phys->index,  parent);
+					__func__, iface_info,pTunnelEntry->itf.phys->index,  parent);
 			spin_unlock(&dpa_devlist_lock);
 			goto err_ret;
 		}
@@ -2604,7 +2604,7 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 	spin_unlock(&dpa_devlist_lock);
 #ifdef INCLUDE_TUNNEL_IFSTATS
 	if (alloc_iface_stats(itf->type, iface_info) != SUCCESS) {
-		DPA_ERROR("%s:: alloc_iface_stats failed\n", __FUNCTION__);
+		DPA_ERROR("%s:: alloc_iface_stats failed\n", __func__);
 		goto err_ret;
 	}
 	iface_info->if_flags |= IF_STATS_ENABLED;
@@ -2615,7 +2615,7 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n", 
-				__FUNCTION__); 
+				__func__); 
 		goto err_ret;
 	}
 	iface_count++;
@@ -2624,7 +2624,7 @@ err_ret:
 	kfree(iface_info);
 	return FAILURE;
 #else
-	DPA_ERROR("%s::tunnel interfaces not supported\n", __FUNCTION__); 
+	DPA_ERROR("%s::tunnel interfaces not supported\n", __func__); 
 	return FAILURE;
 #endif
 }
@@ -2668,7 +2668,7 @@ int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry)
 	fq = &dpa_fq->fq_base;
 	if (qman_create_fq(dpa_fq->fqid, flags, fq)) {
 		DPA_ERROR("%s::qman_create_fq failed for fqid %d\n",
-				__FUNCTION__, dpa_fq->fqid);
+				__func__, dpa_fq->fqid);
 		return -1;
 	}
 	memset(&opts, 0, sizeof(struct qm_mcc_initfq));
@@ -2688,14 +2688,14 @@ int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry)
 	opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
 	if (qman_init_fq(fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
 		DPA_ERROR("%s::qman_init_fq failed for fqid %d\n",
-				__FUNCTION__, dpa_fq->fqid);
+				__func__, dpa_fq->fqid);
 		qman_destroy_fq(fq, 0);
 		return -1;
 	}
 
 	cdx_create_type_fqid_info_in_procfs(fq, PCD_DIR, pcd_proc_entry, NULL);
 #ifdef DEVMAN_DEBUG
-	DPA_INFO("%s::created fq 0x%x channel 0x%x\n", __FUNCTION__, 
+	DPA_INFO("%s::created fq 0x%x channel 0x%x\n", __func__, 
 			dpa_fq->fqid, dpa_fq->channel);
 #endif
 	return 0;
@@ -2730,25 +2730,25 @@ static int cdxdrv_create_pcd_fqs(struct dpa_iface_info *iface_info)
 	}
 	if (!num_portals) {
 		DPA_ERROR("%s::unable to get affined portal info\n",
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 #ifdef DEVMAN_DEBUG
-	DPA_INFO("%s::num_portals %d ::", __FUNCTION__, num_portals);
+	DPA_INFO("%s::num_portals %d ::", __func__, num_portals);
 	for (ii = 0; ii < num_portals; ii++)
 		DPA_INFO("%d ", portal_channel[ii]);
 	DPA_INFO("\n");
 #endif
 
 #ifdef DEVMAN_DEBUG
-	DPA_INFO("%s::max dist %d\n", __FUNCTION__, max_dist);	
+	DPA_INFO("%s::max dist %d\n", __func__, max_dist);	
 #endif
 	for (ii = 0; ii < max_dist; ii++) {
 		fqid = (dist_info->base_fqid + 
 				(eth_iface_info->portid << PORTID_SHIFT_VAL));
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::dist %d, count %d, base %x(%d) fqid %x(%d)\n",
-				__FUNCTION__, ii, dist_info->count, 
+				__func__, ii, dist_info->count, 
 				dist_info->base_fqid, dist_info->base_fqid,
 				fqid, fqid);
 #endif
@@ -2757,12 +2757,12 @@ static int cdxdrv_create_pcd_fqs(struct dpa_iface_info *iface_info)
 				dpa_fq = kzalloc(sizeof(struct dpa_fq), 0);
 				if (!dpa_fq) {
 					DPA_ERROR("%s::unable to alloc mem for fqid %d\n",
-							__FUNCTION__, fqid);
+							__func__, fqid);
 					return -1;
 				}
 				memset(dpa_fq, 0, sizeof(struct dpa_fq));
 #ifdef DEVMAN_DEBUG
-				DPA_INFO("%s::net dev %p\n", __FUNCTION__,
+				DPA_INFO("%s::net dev %p\n", __func__,
 						eth_iface_info->net_dev);
 #endif
 				dpa_fq->net_dev = eth_iface_info->net_dev;
@@ -2781,20 +2781,20 @@ static int cdxdrv_create_pcd_fqs(struct dpa_iface_info *iface_info)
 				//create PCD FQ
 				if (cdx_create_fq(dpa_fq, 0, iface_info->pcd_proc_entry)) {
 					DPA_ERROR("%s::cdx_create_fq failed for fqid %d\n",
-							__FUNCTION__, fqid);
+							__func__, fqid);
 					kfree(dpa_fq);
 					return -1;
 				}
 				add_pcd_fq_info(dpa_fq);
 #ifdef DEVMAN_DEBUG
 				DPA_INFO("%s::netdev %s fqid 0x%x created chnl 0x%x\n", 
-						__FUNCTION__, dpa_fq->net_dev->name, fqid, dpa_fq->channel);
+						__func__, dpa_fq->net_dev->name, fqid, dpa_fq->channel);
 #endif
 			} 
 #ifdef DEVMAN_DEBUG
 			else {
 				DPA_INFO("%s::fqid 0x%x already created\n", 
-						__FUNCTION__, fqid);
+						__func__, fqid);
 			}
 #endif
 			fqid++;
@@ -2814,20 +2814,20 @@ int cdx_create_port_fqs(void)
 		if (!iface_info)
 			break;
 #ifdef DEVMAN_DEBUG
-		printk("%s::%s type %x\n", __FUNCTION__,
+		printk("%s::%s type %x\n", __func__,
 				iface_info->name, iface_info->if_flags);
 #endif
 		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
 			if (cdxdrv_create_pcd_fqs(iface_info)) {
 				DPA_ERROR("%s::create pcd fq for %s failed\n",
-						__FUNCTION__, iface_info->name);
+						__func__, iface_info->name);
 				return -1;
 			}
 		} else {
 			if (iface_info->if_flags & IF_TYPE_OFPORT) {
 				if (cdxdrv_create_of_fqs(iface_info)) {
 					DPA_ERROR("%s::create of fq for %s failed\n",
-							__FUNCTION__, iface_info->name);
+							__func__, iface_info->name);
 					return -1;
 				}
 			}
@@ -2857,7 +2857,7 @@ int get_phys_port_poolinfo_bysize(uint32_t size, struct port_bman_pool_info *poo
 		}
 		iface_info = iface_info->next;
 	}
-	printk("%s::failed\n", __FUNCTION__);
+	printk("%s::failed\n", __func__);
 	return -1;
 }
 
@@ -2868,7 +2868,7 @@ struct dpa_priv_s* get_eth_priv(unsigned char* name)
 
 	device = dev_get_by_name(&init_net, name);
 	if (!device) {
-		DPA_INFO("%s::could not find device %s\n", __FUNCTION__, name);
+		DPA_INFO("%s::could not find device %s\n", __func__, name);
 		return NULL;
 	}
 	priv = netdev_priv(device);
@@ -2897,7 +2897,7 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 			break;
 		if(iface_info->if_flags & IF_TYPE_PPPOE) {
 			struct en_ehash_ifstats_with_ts *stats;
-			//printk("%s::returning pppoe iface stats\n", __FUNCTION__);
+			//printk("%s::returning pppoe iface stats\n", __func__);
 			stats = (struct en_ehash_ifstats_with_ts *)iface_info->stats;
 			storage->rx_packets += cpu_to_be32(stats->rxstats.pkts);
 			storage->rx_bytes += cpu_to_be64(stats->rxstats.bytes);
@@ -2907,7 +2907,7 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 		} 
 		if(iface_info->if_flags & (IF_TYPE_TUNNEL | IF_TYPE_VLAN | IF_TYPE_ETHERNET)) {
 			struct en_ehash_ifstats *stats;
-			//printk("%s::returning other iface stats\n", __FUNCTION__);
+			//printk("%s::returning other iface stats\n", __func__);
 			stats = (struct en_ehash_ifstats *)iface_info->stats;
 			storage->rx_packets += cpu_to_be32(stats->rxstats.pkts);
 			storage->rx_bytes += cpu_to_be64(stats->rxstats.bytes);
@@ -2916,7 +2916,7 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 			break;
 		}
 		printk("%s::unknown iface type,no stats available\n", 
-				__FUNCTION__);
+				__func__);
 		iface_info = iface_info->next;
 	}
 	spin_unlock(&dpa_devlist_lock);
@@ -2952,7 +2952,7 @@ int dpa_get_itfid_by_fman_params(uint32_t fman_index, uint32_t portid)
 		}
 		iface_info = iface_info->next;
 	}
-	printk("%s::failed\n", __FUNCTION__);
+	printk("%s::failed\n", __func__);
 	return -1;
 }
 

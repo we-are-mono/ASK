@@ -258,7 +258,7 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 	struct en_ehash_ipsec_preempt_op *ipsec_preempt_params;
 
 	DPA_INFO("%s(%d) dir: %s , handle %x fqid %x\n",
-		__FUNCTION__,__LINE__,(pSA->direction)?"INBOUND":"OUTBOUND",
+		__func__,__LINE__,(pSA->direction)?"INBOUND":"OUTBOUND",
 		pSA->handle,
 		pSA->pSec_sa_context ? pSA->pSec_sa_context->to_sec_fqid : 0);
 	/* WE need to lock below section of code */
@@ -286,7 +286,7 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 	if ((pSA->ct) && (pSA->ct->handle)) {
 		if (ExternalHashTableDeleteKey(pSA->ct->td, 
 			pSA->ct->index, pSA->ct->handle)) {
-			DPA_ERROR("%s::unable to remove entry from hash table\n", __FUNCTION__);
+			DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
 			return -1;
 		}
 		ExternalHashTableEntryFree(pSA->ct->handle);
@@ -331,7 +331,7 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 			if (ret)
 			{
 				DPA_ERROR("%s::Failed to change state \n", 
-				__FUNCTION__);
+				__func__);
 				cdx_timer_init((TIMER_ENTRY *)&pSA->deletion_timer,
 					cdx_ipsec_release_sa_ctx_cbk);
 				cdx_timer_add((TIMER_ENTRY *)&pSA->deletion_timer,
@@ -474,7 +474,7 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 			ipsec_get_to_cp_fqid(pdpa_sec_context->dpa_ipsecsa_handle);
 #ifdef CDX_DPA_DEBUG	
 		printk("%s::fqid_to_sec %x(%d), fqid_from_sec %x(%d), to_cp_fqid %x(%d)\n",
-				__FUNCTION__, pdpa_sec_context->to_sec_fqid,
+				__func__, pdpa_sec_context->to_sec_fqid,
 				pdpa_sec_context->to_sec_fqid,
 				pdpa_sec_context->from_sec_fqid,
 				pdpa_sec_context->from_sec_fqid,
@@ -1963,7 +1963,7 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 	sec_desc->pdb_en.options = cpu_to_caam32(sec_desc->pdb_en.options);
 	salt = sa->pSec_sa_context->cipher_data.cipher_key+sa->pSec_sa_context->cipher_data.cipher_key_len;
 	/*printk("%s(%d) salt [0] %02x,[1] %02x [2] %02x, [3] %02x\n",
-		__FUNCTION__,__LINE__,salt[0],salt[1],salt[2],salt[3]); */
+		__func__,__LINE__,salt[0],salt[1],salt[2],salt[3]); */
 	if ((sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM8) ||
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM12) ||
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16) ||
@@ -2027,7 +2027,7 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	/* check whether a split or a normal key is used */
 	if (psec_sa_context->auth_data.split_key_len) {
 #if 0
-		printk("%s::split key::\n", __FUNCTION__);
+		printk("%s::split key::\n", __func__);
 		display_buff_data(psec_sa_context->auth_data.split_key, 
 				psec_sa_context->auth_data.split_key_len);
 #endif
@@ -2042,7 +2042,7 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	}
 	else if (psec_sa_context->auth_data.auth_key_len) {
 #if 0
-		printk("%s::auth key::\n", __FUNCTION__);
+		printk("%s::auth key::\n", __func__);
 		display_buff_data(psec_sa_context->auth_data.auth_key, 
 				psec_sa_context->auth_data.auth_key_len);
 #endif
@@ -2057,7 +2057,7 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	}
 
 #if 0
-	printk("%s::cipher key::\n", __FUNCTION__);
+	printk("%s::cipher key::\n", __func__);
 	display_buff_data(psec_sa_context->cipher_data.cipher_key, 
 			psec_sa_context->cipher_data.cipher_key_len);
 #endif
@@ -2129,7 +2129,7 @@ done_shared_desc:
 		PREHEADER_PREP_OFFSET(sec_desc->preheader,
 				post_sec_out_data_off);
 	}
-	//printk("%s::preheader %p\n", __FUNCTION__, 
+	//printk("%s::preheader %p\n", __func__, 
 	//	(void *)sec_desc->preheader);
 	sec_desc->preheader = cpu_to_caam64(sec_desc->preheader);
 
@@ -2410,13 +2410,13 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 					NULL , NULL, &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
-					__FUNCTION__);
+					__func__);
 			 goto err_ret;
 		}
 		if (!(sa->flags & SA_SH_DESC_BUILT))
 		{
 			if (cdx_ipsec_create_shareddescriptor(sa, bytes_to_copy)) {
-				DPA_ERROR("%s::unable to create shared desc\n", __FUNCTION__);
+				DPA_ERROR("%s::unable to create shared desc\n", __func__);
 				goto err_ret;
 			}
 			sa->flags |= SA_SH_DESC_BUILT;
@@ -2473,12 +2473,12 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	uint32_t bytes_to_copy = ETH_HDR_LEN;
 
 #ifdef CDX_DPA_DEBUG
-	printk("%s:: direction %d\n", __FUNCTION__, sa->direction);
+	printk("%s:: direction %d\n", __func__, sa->direction);
 #endif
 
 	info = kzalloc(sizeof(struct ins_entry_info), 0);
 	if (!info) {
-		DPA_ERROR("%s::unable to alloc mem for ins_info\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to alloc mem for ins_info\n", __func__);
 		//remove shared desc here??? TBD
 		return FAILURE;
 	}
@@ -2488,7 +2488,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	//allocate hw ct entry
 	sa->ct = (struct hw_ct *)kzalloc(sizeof(struct hw_ct), GFP_KERNEL);
 	if (!sa->ct) {
-		DPA_ERROR("%s::unable to alloc mem for hw_ct\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to alloc mem for hw_ct\n", __func__);
 		goto err_ret;
 	}
 	memset(sa->ct, 0, sizeof(struct hw_ct));
@@ -2499,7 +2499,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
 	if (!info->fm_pcd) {
 		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",
-				__FUNCTION__, info->fm_idx);
+				__func__, info->fm_idx);
 		goto err_ret;
 	}
 
@@ -2508,7 +2508,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	tbl_type = get_tbl_type(sa);
 	if (tbl_type ==  -1) {
 		DPA_ERROR("%s::unable to get tbl type\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 
@@ -2519,13 +2519,13 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		/* Add the Flow to the ESP table of wan port*/ 
 		sa_dir_in = 1;
 #ifdef CDX_DPA_DEBUG
-		printk("%s::inbound sa\n", __FUNCTION__);
+		printk("%s::inbound sa\n", __func__);
 #endif
 		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.daddr.a6[0], NULL, 
 					&itf_id , &info->port_id, &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
-					__FUNCTION__);
+					__func__);
 			goto err_ret;
 		}
 		//get table descriptor based on type and port
@@ -2533,7 +2533,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 				tbl_type);
 		if (sa->ct->td == NULL) {
 			DPA_ERROR("%s::unable to get td for portid %d, type %d\n",
-					__FUNCTION__, info->port_id, tbl_type);
+					__func__, info->port_id, tbl_type);
 			goto err_ret;
 		}
 		/*
@@ -2545,12 +2545,12 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info, &sa_dir_in );
 #ifdef CDX_DPA_DEBUG
 		/*       printk("%s:: Got the table id for portid %d and key type %d as %p \n", 
-					__FUNCTION__, info->port_id, key_info->type, sa->ct->td); */
+					__func__, info->port_id, key_info->type, sa->ct->td); */
 #endif
 	} else {
 		/* Add the Flow to the ESP table of sec offline port*/ 
 #ifdef CDX_DPA_DEBUG
-		printk("%s::outbound sa\n", __FUNCTION__);
+		printk("%s::outbound sa\n", __func__);
 #endif
 		sa_dir_in = 0;
 		dpa_ipsec_ofport_td(ipsec_instance, tbl_type, &sa->ct->td,
@@ -2560,7 +2560,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 					NULL , NULL,  &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
 		{
 			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
-					__FUNCTION__);
+					__func__);
 			goto err_ret;
 		}
 
@@ -2568,7 +2568,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		if(!sa->pRtEntry)
 		{
 			DPA_ERROR("%s:: NULL ROUTE for out SA  finding outbound interface by ipaddress\n",
-					__FUNCTION__);
+					__func__);
 			if (dpa_get_iface_info_by_ipaddress(sa->family,
 						((sa->family == PROTO_IPV4) ?  &sa->tunnel.ip4.SourceAddress : 
 						 &sa->tunnel.ip6.SourceAddress[0]),
@@ -2576,7 +2576,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 						NULL, NULL, (uint32_t) sa->handle) != SUCCESS)
 			{
 				DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
-						__FUNCTION__);
+						__func__);
 				goto err_ret;
 			}
 			dpa_get_l2l3_info_by_itf_id( itf_id,
@@ -2586,7 +2586,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		if (dpa_get_out_tx_info_by_itf_id(sa->pRtEntry, 
 					&info->l2_info, &info->l3_info)) {
 			DPA_ERROR("%s:: dpa_get_out_tx_info_by_itf_id returned error\n",
-					__FUNCTION__);
+					__func__);
 			goto err_ret;
 		}
 	}
@@ -2606,7 +2606,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	if (!(sa->flags & SA_SH_DESC_BUILT))
 	{
 		if (cdx_ipsec_create_shareddescriptor(sa, bytes_to_copy)) {
-			DPA_ERROR("%s::unable to create shared desc\n", __FUNCTION__);
+			DPA_ERROR("%s::unable to create shared desc\n", __func__);
 			goto err_ret;
 		}
 		sa->flags |= SA_SH_DESC_BUILT;
@@ -2617,7 +2617,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
 	if (!tbl_entry) {
 		DPA_ERROR("%s::unable to alloc hash tbl memory\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
@@ -2626,7 +2626,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 #endif
 	if (info->td == NULL) {
 		DPA_ERROR("%s:: wrong table id passed \n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 	/* Fill key information from entry */
@@ -2637,7 +2637,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		key_size = fill_ipsec_key_info(sa, tbl_entry, info->port_id);
 	if (!key_size) {
 		DPA_ERROR("%s::unable to compose key\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 
@@ -2680,7 +2680,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		info->to_sec_fqid = sa->pSec_sa_context->to_sec_fqid;
 	}
 	if (fill_ipsec_actions(sa, info, sa_dir_in)) {
-		DPA_ERROR("%s::unable to fill actions\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
 	if( IS_NATT_SA(sa) && sa_dir_in)
@@ -2695,7 +2695,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	/*insert entry into hash table */
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
 	if (retval == -1) {
-		DPA_ERROR("%s::unable to add entry in hash table\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
 	}
 	sa->ct->index = (uint16_t)retval;

@@ -64,13 +64,13 @@ static void l2flow_remove(struct L2Flow_entry *entry)
 	/* remove from hw tables */
 	if (delete_l2br_entry_classif_table(entry)) {
 		DPA_ERROR("%s::failed to remove entry\n",
-				__FUNCTION__);
+				__func__);
 		return;
 	}
 	l2flow_hash_table[hash].num_entries--;
 #ifdef CONTROL_BRIDGE_DEBUG
 	printk("%s::entry removed from flow table, count%d\n",
-			__FUNCTION__, l2flow_hash_table[hash].num_entries);
+			__func__, l2flow_hash_table[hash].num_entries);
 #endif
 }
 
@@ -111,7 +111,7 @@ static int M_bridge_expire_l2_flow_entry(struct L2Flow_entry *entry)
 	return 0;
 
 err:
-	printk("%s::err in msg send\n", __FUNCTION__);
+	printk("%s::err in msg send\n", __func__);
 	entry->status |= L2_BRIDGE_TIMED_OUT;
 	return 1;
 }
@@ -175,7 +175,7 @@ static int L2Bridge_timer(TIMER_ENTRY *timer)
 		if (rc == 0)
 			return 0;
 
-		printk("%s::M_bridge_expire_l2_flow_entry failed\n", __FUNCTION__);		
+		printk("%s::M_bridge_expire_l2_flow_entry failed\n", __func__);		
 		timer->period = 1;
 	}
 	return 1;
@@ -188,7 +188,7 @@ static struct L2Flow_entry *l2flow_find_entry(U32 hash, struct L2Flow *l2flow)
 
 #ifdef CONTROL_BRIDGE_DEBUG
 	printk("%s::entry hash %x flow table %p, head %p count %d\n",
-			__FUNCTION__, hash,
+			__func__, hash,
 			&l2flow_hash_table[hash].flowlist,
 			l2flow_hash_table[hash].flowlist.first,
 			l2flow_hash_table[hash].num_entries);
@@ -218,7 +218,7 @@ static int l2flow_add(struct L2Flow_entry *entry, U32 hash)
 	l2flow_hash_table[hash].num_entries++;
 #ifdef CONTROL_BRIDGE_DEBUG
 	printk("%s::entry added to flow table %p head %p count %d\n",
-			__FUNCTION__, 
+			__func__, 
 			&l2flow_hash_table[hash].flowlist,
 			l2flow_hash_table[hash].flowlist.first,
 			l2flow_hash_table[hash].num_entries);
@@ -310,7 +310,7 @@ static int M_bridge_handle_l2flow(U16 *p, U16 Length)
 		goto skip_fill;
 
 	if (pcmd->proto) {
-		printk("%s::l3 flows not supported now\n", __FUNCTION__);
+		printk("%s::l3 flows not supported now\n", __func__);
 		return ERR_WRONG_COMMAND_PARAM;
 	}
 	//fill flow params from command
@@ -335,10 +335,10 @@ skip_fill:
 	switch(pcmd->action) {
 		case ACTION_REGISTER:
 #ifdef CONTROL_BRIDGE_DEBUG
-			printk("%s::ACTION_REGISTER\n", __FUNCTION__);
+			printk("%s::ACTION_REGISTER\n", __func__);
 #endif
 			if (l2flow_entry) {
-				printk("%s::flow exists, trying to add again\n", __FUNCTION__);
+				printk("%s::flow exists, trying to add again\n", __func__);
 				ackstatus = ERR_BRIDGE_ENTRY_ALREADY_EXISTS;
 				goto func_ret;
 			}
@@ -366,9 +366,9 @@ skip_fill:
 			//TODO: add mark / qos code back in
 			//l2flow_entry->mark = pcmd->mark;
 #ifdef CONTROL_BRIDGE_DEBUG
-			printk("%s::output_name %s\n", __FUNCTION__,
+			printk("%s::output_name %s\n", __func__,
 					pcmd->output_name);
-			printk("%s::input_name %s\n", __FUNCTION__,
+			printk("%s::input_name %s\n", __func__,
 					pcmd->input_name);
 #endif
 			if (l2flow_add(l2flow_entry, hash)) {
@@ -381,7 +381,7 @@ skip_fill:
 		case ACTION_UPDATE:
 			//l2flow_entry->mark = pcmd->mark;
 #ifdef CONTROL_BRIDGE_DEBUG
-			printk("%s::ACTION_UPDATE\n", __FUNCTION__);
+			printk("%s::ACTION_UPDATE\n", __func__);
 #endif
 			if (!l2flow_entry) {
 				ackstatus = ERR_BRIDGE_ENTRY_NOT_FOUND;
@@ -400,11 +400,11 @@ skip_fill:
 
 		case ACTION_DEREGISTER:
 #ifdef CONTROL_BRIDGE_DEBUG
-			printk("%s::ACTION_DEREGISTER\n", __FUNCTION__);
+			printk("%s::ACTION_DEREGISTER\n", __func__);
 #endif
 			if (!l2flow_entry) {
 #ifdef CONTROL_BRIDGE_DEBUG
-				printk("%s::ACTION_DEREGISTER flow not found\n", __FUNCTION__);
+				printk("%s::ACTION_DEREGISTER flow not found\n", __func__);
 #endif
 				ackstatus = ERR_BRIDGE_ENTRY_NOT_FOUND;
 				goto func_ret;
@@ -440,7 +440,7 @@ static int M_bridge_handle_control(U16 code, U16 *p, U16 Length)
 				if (L2Bridge_timeout != timeout) {
 					L2Bridge_timeout = timeout;
 #ifdef CONTROL_BRIDGE_DEBUG
-					printk("%s::timeout changed to %d\n", __FUNCTION__, 
+					printk("%s::timeout changed to %d\n", __func__, 
 							timeout/HZ);
 #endif
 					/* Updating all the l2flows timeout */
@@ -451,7 +451,7 @@ static int M_bridge_handle_control(U16 code, U16 *p, U16 Length)
 
 		case CMD_RX_L2BRIDGE_MODE:
 			if (prsp->mode_timeout != L2_BRIDGE_MODE_AUTO) {
-				printk("%s::manual mode not supported\n", __FUNCTION__);
+				printk("%s::manual mode not supported\n", __func__);
 				ackstatus = ERR_WRONG_COMMAND_PARAM;
 			}
 			break;
@@ -488,7 +488,7 @@ static U16 M_bridge_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 	ackstatus = CMD_OK;
 
 #ifdef CONTROL_BRIDGE_DEBUG
-	printk("%s::cmd code %x p %p\n", __FUNCTION__, cmd_code, p);
+	printk("%s::cmd code %x p %p\n", __func__, cmd_code, p);
 #endif
 	switch (cmd_code)
 	{
@@ -531,21 +531,21 @@ static U16 M_bridge_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 
 int bridge_interface_deregister( U16 phy_port_id )
 {
-	printk(KERN_CRIT "%s\n", __FUNCTION__);
+	printk(KERN_CRIT "%s\n", __func__);
 	return 0;
 }
 
 int bridge_interface_register( uint8_t *name, U16 phy_port_id )
 {
 
-	printk(KERN_CRIT "%s\n", __FUNCTION__);
+	printk(KERN_CRIT "%s\n", __func__);
 	return 0;
 }
 
 static int  M_bridge_handle_reset(void)
 {
 	U16 ackstatus = CMD_OK;
-	printk("%s::implement this\n", __FUNCTION__);
+	printk("%s::implement this\n", __func__);
 	return ackstatus;
 }
 

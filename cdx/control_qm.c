@@ -135,7 +135,7 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 					qm_ctx = QM_GET_CONTEXT(port_info->portid);
 					if (!qm_ctx->qos_enabled)
 					{
-						DPA_ERROR("%s()::%d QoS not enabled on this interface <%s>\n", __FUNCTION__, __LINE__, qm_ctx->iface_info->name);
+						DPA_ERROR("%s()::%d QoS not enabled on this interface <%s>\n", __func__, __LINE__, qm_ctx->iface_info->name);
 						rtncode = QOS_ENERR_NOT_CONFIGURED;
 					}
 					else
@@ -146,7 +146,7 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 												pcmd->status))
 							{
 								rtncode = CMD_ERR;
-								DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __FUNCTION__, __LINE__, rtncode);
+								DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __func__, __LINE__, rtncode);
 							}
 						}
 						else if (cmd_code == CMD_QM_DSCP_Q_MAP_CFG)
@@ -155,7 +155,7 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 										pcmd->clsqueue_num))
 							{
 								rtncode = CMD_ERR;
-								DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __FUNCTION__, __LINE__, rtncode);
+								DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __func__, __LINE__, rtncode);
 							}
 						}
 						else /* cmd_code will be CMD_QM_DSCP_Q_MAP_RESET */
@@ -163,14 +163,14 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 							if (ceetm_dscp_fq_unmap(qm_ctx, pcmd->dscp))
 							{
 								rtncode = CMD_ERR;
-								DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __FUNCTION__, __LINE__, rtncode);
+								DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __func__, __LINE__, rtncode);
 							}
 						}
 					}
 				} else 
 				{
 					rtncode = QOS_ENERR_INVAL_PARAM;
-					DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __FUNCTION__, __LINE__, rtncode);
+					DPA_ERROR("%s()::%d return error %d QOS_ENERR_INVAL_PARAM\n", __func__, __LINE__, rtncode);
 				}
 				break;
 			}	
@@ -181,7 +181,7 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 
 				pexptrate = (PQosExptRateCommand)p;
 #ifdef QM_DEBUG
-				printk("%s::interface %d, rate pkts/s %d burst_size :%d\n",  __FUNCTION__,
+				printk("%s::interface %d, rate pkts/s %d burst_size :%d\n",  __func__,
 						pexptrate->expt_iftype,
 						pexptrate->pkts_per_sec,  pexptrate->burst_size);
 #endif
@@ -244,7 +244,7 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 				} else {
 					retlen = sizeof(QosFFRateCommand);
 #ifdef QM_DEBUG
-					printk("%s::port %s cir rate pkts/s %d, pir rate %d\n",  __FUNCTION__,
+					printk("%s::port %s cir rate pkts/s %d, pir rate %d\n",  __func__,
 							prate->interface, prate->cir, prate->pir);
 #endif
 				}
@@ -275,7 +275,7 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 					qm_ctx = QM_GET_CONTEXT(port_info->portid);
 					if (!qm_ctx->qos_enabled)
 					{
-						DPA_ERROR("%s()::%d QoS not enabled on this interface <%s>\n", __FUNCTION__, __LINE__, qm_ctx->iface_info->name);
+						DPA_ERROR("%s()::%d QoS not enabled on this interface <%s>\n", __func__, __LINE__, qm_ctx->iface_info->name);
 						rtncode = QOS_ENERR_NOT_CONFIGURED;
 					}
 					else
@@ -381,7 +381,7 @@ static U16 M_qm_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 			// unknown command code
 		default:
 			{
-				/* printk("%s::unknown command %x\n", __FUNCTION__, cmd_code); */
+				/* printk("%s::unknown command %x\n", __func__, cmd_code); */
 				rtncode = CMD_ERR;
 				break;
 			}
@@ -434,13 +434,13 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 	if (!(port_info = get_dpa_port_info(iface_info->name)))
 	{
 		ceetm_err("%s::unable to get port info for port %s\n",
-				__FUNCTION__, iface_info->name);		
+				__func__, iface_info->name);		
 		return FAILURE;
 	}
 	qm_ctx = QM_GET_CONTEXT(port_info->portid);
 	if (qm_ctx->qos_enabled) {
 		ceetm_err("%s::qos already enabled for port %s\n",
-				__FUNCTION__, iface_info->name);		
+				__func__, iface_info->name);		
 		return FAILURE;
 	}
 

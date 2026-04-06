@@ -963,7 +963,7 @@ void cmmUpdateCtEntriesInFlowNoSAList(unsigned short sgid)
 		ctEntry =  container_of(entry, struct ctTable, flow_no_sa_list_node);
 		cmm_print(DEBUG_INFO,"%s CTentry %p\n",__func__,ctEntry);
 		cmm_print(DEBUG_INFO, "%s(%d) origfwdSA %p, origoutSA %p, repfwdSA %p, repOutSA %p\n",
-				__FUNCTION__,__LINE__,ctEntry->fEntryOrigFwdSA,ctEntry->fEntryOrigOutSA,
+				__func__,__LINE__,ctEntry->fEntryOrigFwdSA,ctEntry->fEntryOrigOutSA,
 					ctEntry->fEntryRepFwdSA,ctEntry->fEntryRepOutSA);
 		entry = list_next(entry);
 		if (cmmCheckIfCtEntryWithSGID(ctEntry, sgid))
@@ -1002,7 +1002,7 @@ int cmmUpdateFlows(struct SATable *pSAEntry)
 			ctEntry = container_of(entry, struct ctTable, list_by_sa[list_sa_index]);
 			cmm_print(DEBUG_INFO,"%s CTentry %p\n",__func__,ctEntry);
 			cmm_print(DEBUG_INFO, "%s(%d) origfwdSA %p, origoutSA %p, repfwdSA %p, repOutSA %p\n",
-				__FUNCTION__,__LINE__,ctEntry->fEntryOrigFwdSA,ctEntry->fEntryOrigOutSA,
+				__func__,__LINE__,ctEntry->fEntryOrigFwdSA,ctEntry->fEntryOrigOutSA,
 					ctEntry->fEntryRepFwdSA,ctEntry->fEntryRepOutSA);
 			entry = list_next(entry);
 			ctEntry->flags |= FPP_NEEDS_UPDATE;
@@ -1012,13 +1012,13 @@ int cmmUpdateFlows(struct SATable *pSAEntry)
 				if (!(pSAEntry->SAInfo.id.flags & NLKEY_SAFLAGS_INBOUND))
 				{
 					cmm_print(DEBUG_INFO,"%s(%d) SA entry %p, origoutsa %p making to null\n",
-						__FUNCTION__,__LINE__,pSAEntry,ctEntry->fEntryOrigOutSA);
+						__func__,__LINE__,pSAEntry,ctEntry->fEntryOrigOutSA);
 					ctEntry->fEntryOrigOutSA = NULL;
 				}
 				else
 				{
 					cmm_print(DEBUG_INFO,"%s(%d) SA entry %p, origfwdsa %p making to null\n",
-						__FUNCTION__,__LINE__,pSAEntry,ctEntry->fEntryOrigFwdSA);
+						__func__,__LINE__,pSAEntry,ctEntry->fEntryOrigFwdSA);
 					ctEntry->fEntryOrigFwdSA = NULL;
 				}
 			}
@@ -1027,13 +1027,13 @@ int cmmUpdateFlows(struct SATable *pSAEntry)
 				if (!(pSAEntry->SAInfo.id.flags & NLKEY_SAFLAGS_INBOUND))
 				{
 					cmm_print(DEBUG_INFO,"%s(%d) SA entry %p, repoutsa %p making to null\n",
-						__FUNCTION__,__LINE__,pSAEntry,ctEntry->fEntryRepOutSA);
+						__func__,__LINE__,pSAEntry,ctEntry->fEntryRepOutSA);
 					ctEntry->fEntryRepOutSA = NULL;
 				}
 				else
 				{
 					cmm_print(DEBUG_INFO,"%s(%d) SA entry %p, Repfwdsa %p making to null\n",
-						__FUNCTION__,__LINE__,pSAEntry,ctEntry->fEntryRepFwdSA);
+						__func__,__LINE__,pSAEntry,ctEntry->fEntryRepFwdSA);
 					ctEntry->fEntryRepFwdSA = NULL;
 				}
 			}
@@ -1057,13 +1057,13 @@ static void cmmReplaceXfrmHandle(unsigned short  *xfrm_handle, unsigned short ol
 		{
 			if (xfrm_handle[ii] == old_val)
 			{
-				cmm_print(DEBUG_INFO,"%s(%d) old val 0x%x, new val 0x%x\n",__FUNCTION__,__LINE__, old_val,new_val);
+				cmm_print(DEBUG_INFO,"%s(%d) old val 0x%x, new val 0x%x\n",__func__,__LINE__, old_val,new_val);
 				xfrm_handle[ii] = new_val;
 				return;
 			}
 		}
 		cmm_print(DEBUG_INFO,"%s(%d) xfrm originator: handles 0x%x, 0x%x, 0x%x, 0x%x\n",
-					__FUNCTION__,__LINE__, xfrm_handle[0],xfrm_handle[1],
+					__func__,__LINE__, xfrm_handle[0],xfrm_handle[1],
 					xfrm_handle[2],xfrm_handle[3]);
 	}
 	return;
@@ -1081,7 +1081,7 @@ int cmmUpdateFlowsWithNewSAInfo(struct SATable *pNewSAEntry,unsigned short old_x
 
 	/* Find SA with old_xfrm_handle */
 	cmm_print(DEBUG_INFO,"%s(%d) old_xfrm_handle 0x%x, new handle 0x%x\n",
-		__FUNCTION__,__LINE__,old_xfrm_handle,pNewSAEntry->SAInfo.sagd);
+		__func__,__LINE__,old_xfrm_handle,pNewSAEntry->SAInfo.sagd);
 	pSAEntry = cmmSAFind(old_xfrm_handle);
 	if (!pSAEntry)
 	{

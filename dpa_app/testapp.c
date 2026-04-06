@@ -120,7 +120,7 @@ static int add_connections(void)
                 if (ioctl(cdx_dev_handle, CDX_CTRL_DPA_CONNADD,
                                 &add_conn) < 0) {
                         printf("%s:connadd ioctl failed conn id ::ii %d\n", 
-					__FUNCTION__,
+					__func__,
 					ii);
                         return -1;
                 }

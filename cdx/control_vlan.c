@@ -124,7 +124,7 @@ found:
 			parent_device = dev_get_by_name(&init_net, vlancmd.phyifname);
 
 			if ((!device) || (!parent_device)){
-				DPA_INFO("%s::could not find device %s or %s\n", __FUNCTION__, vlancmd.vlanifname, vlancmd.phyifname);
+				DPA_INFO("%s::could not find device %s or %s\n", __func__, vlancmd.vlanifname, vlancmd.phyifname);
 				rc = FAILURE;
 				break;
 			}
@@ -396,13 +396,13 @@ static U16 vlan_stats_get(PVlanEntry pEntry, PStatVlanEntryResponse snapshot, U3
 	if ((iface_info = dpa_get_ifinfo_by_itfid((uint32_t)pEntry->itf.index)) == NULL)
 	{
 		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __FUNCTION__, pEntry->itf.index);
+		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, pEntry->itf.index);
 		return ERR_UNKNOWN_INTERFACE;
 	}
 	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
-		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __FUNCTION__, ret);
+		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
 
@@ -439,7 +439,7 @@ static U16 stat_VLAN_Get_Session_Snapshot(int stat_vlan_hash_index, int stat_vla
 		if ((ret = vlan_stats_get(pStatVlanEntry, pStatVLANSnapshot,
 						gStatVlanQueryStatus & STAT_VLAN_QUERY_RESET)) != NO_ERR)
 		{
-			DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __FUNCTION__, ret);
+			DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 			return ret;
 		}
 

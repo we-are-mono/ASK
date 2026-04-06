@@ -74,14 +74,14 @@ int cdx_add_eth_onif(char *name)
 		}
 	}
 	if (ii == MAX_PHY_PORTS) {
-		DPA_ERROR("%s::mac phys port limit reached\n", __FUNCTION__);
+		DPA_ERROR("%s::mac phys port limit reached\n", __func__);
 		return -EINVAL;
 	}
 	//call add onif to add device
 	if (add_onif(name, &phy_port[ii].itf, NULL, 
 				(IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL)) == NULL) 	{
 		memset(&phy_port[ii], 0, sizeof(struct physical_port));
-		DPA_ERROR("%s::add_onif failed\n", __FUNCTION__);
+		DPA_ERROR("%s::add_onif failed\n", __func__);
 		return -EIO;
 	}
 	//fill mac address in phys port
@@ -94,15 +94,15 @@ int cdx_add_oh_iface(char *name)
 {
 
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::adding oh iface %s\n", __FUNCTION__,
+	DPA_INFO("%s::adding oh iface %s\n", __func__,
 			name);
 #endif
 	if (dpa_add_oh_if(name)) {
-		DPA_ERROR("%s::add oh port failed\n", __FUNCTION__);
+		DPA_ERROR("%s::add oh port failed\n", __func__);
 		return -EIO;
 	}
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::added oh iface %s\n", __FUNCTION__,
+	DPA_INFO("%s::added oh iface %s\n", __func__,
 			name);
 #endif
 	return 0;
@@ -127,7 +127,7 @@ int insert_entry_in_pppoe_table(int fm_idx, int port_idx,
 			uint8_t *ac_mac_addr, uint32_t sessid, 
 			uint32_t ppp_pid)
 {
-	printk("%s::not implemented\n", __FUNCTION__);
+	printk("%s::not implemented\n", __func__);
 	return FAILURE;
 }
 

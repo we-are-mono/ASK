@@ -225,14 +225,14 @@ int enable_dscp_fqid_map(uint32_t portid)
 		else
 		{
 			DPA_ERROR("%s()::%d Before enable dscp fq map on portid %u, first disable on  portid %u\n",
-				__FUNCTION__, __LINE__, portid, dscp_fq_map_ff_g.port_id);
+				__func__, __LINE__, portid, dscp_fq_map_ff_g.port_id);
 			return FAILURE;
 		}
 	}
 	else
 	{
 		DPA_ERROR("%s()::%d dscp fq map already mapped to the given port id %u\n",
-				__FUNCTION__, __LINE__, portid);
+				__func__, __LINE__, portid);
 	}
 
 	return SUCCESS;
@@ -251,12 +251,12 @@ int disable_dscp_fqid_map(uint32_t portid)
 	{
 		if (dscp_fq_map_ff_g.port_id == NO_PORT)
 		{
-			DPA_ERROR("%s()::%d Presently dscp fqid map is not enabled on any interface\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s()::%d Presently dscp fqid map is not enabled on any interface\n", __func__, __LINE__);
 		}
 		else
 		{
 			DPA_ERROR("%s()::%d dscp fqid mapping not enabled on user input portid %u(enabled on portid %u)\n",
-				__FUNCTION__, __LINE__, portid, dscp_fq_map_ff_g.port_id);
+				__func__, __LINE__, portid, dscp_fq_map_ff_g.port_id);
 		}
 		return FAILURE;
 	}
@@ -442,7 +442,7 @@ static int fill_key_info(PCtEntry entry, uint8_t *keymem, uint32_t port_id)
 			break;
 		default:
 			DPA_ERROR("%s::protocol %d not supported\n",
-					__FUNCTION__, entry->proto);
+					__func__, entry->proto);
 			key_size = 0;
 	}
 #ifdef CDX_DPA_DEBUG
@@ -465,7 +465,7 @@ void hw_ct_get_active(struct hw_ct *ct)
 	ct->timestamp = stats.timestamp;
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s::ct %p pkts %lu, bytes %lu, timestamp %x jiffies %x\n", 
-		__FUNCTION__, ct, (unsigned long)ct->pkts, (unsigned long)ct->bytes, ct->timestamp,
+		__func__, ct, (unsigned long)ct->pkts, (unsigned long)ct->bytes, ct->timestamp,
 		JIFFIES32);
 #endif
 }
@@ -475,14 +475,14 @@ int delete_entry_from_classif_table(PCtEntry entry)
 {
 	if (!entry)
 	{
-		DPA_ERROR("%s:: Ct entry is NULL\n", __FUNCTION__);
+		DPA_ERROR("%s:: Ct entry is NULL\n", __func__);
 		return FAILURE;
 	}
 
 	CDX_DPA_DPRINT("\n");
 	if (ExternalHashTableDeleteKey(entry->ct->td, 
 			entry->ct->index, entry->ct->handle)) {
-                DPA_ERROR("%s::unable to remove entry from hash table\n", __FUNCTION__);
+                DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
 		return FAILURE;
 	}
 	//free table entry
@@ -502,7 +502,7 @@ int delete_pppoe_relay_entry_from_classif_table(pPPPoE_Info entry)
 	CDX_DPA_DPRINT("\n");
 	if(ExternalHashTableDeleteKey(ct->td,ct->index, ct->handle))
 	{
-		DPA_ERROR("%s::unable to remove entry from hash table\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
 		return FAILURE;
 	}
 	//free table entry
@@ -523,7 +523,7 @@ int delete_l2br_entry_classif_table(struct L2Flow_entry *entry)
 			if (ct->td) {
 				if (ExternalHashTableDeleteKey(ct->td, ct->index, ct->handle)) {
 					DPA_ERROR("%s::unable to remove entry from hash table\n",
-							__FUNCTION__);
+							__func__);
 					return FAILURE;
 				}
 			}
@@ -570,7 +570,7 @@ static int get_table_type(PCtEntry entry, uint32_t *type)
 			return SUCCESS;
 		default:
 			DPA_ERROR("%s::protocol %d not supported\n",
-					__FUNCTION__, entry->proto);
+					__func__, entry->proto);
 			break;
 	}
 	return FAILURE;
@@ -591,7 +591,7 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s:: entry %p, opc_ptr %p, param_ptr %p, size %d\n", 
-			__FUNCTION__, entry, info->opcptr, info->paramptr, info->param_size);
+			__func__, entry, info->opcptr, info->paramptr, info->param_size);
 #endif
 	twin_entry = CT_TWIN(entry);
 
@@ -691,7 +691,7 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 				(!entry->pRtEntry->input_itf) ||
 				(!entry->pRtEntry->underlying_input_itf)) {
 			DPA_ERROR("%s::%d RtEntry or input_itf or underlying_input_itf is NULL\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			break;
 		}
 		iif_index = entry->pRtEntry->input_itf->index;
@@ -820,7 +820,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	int retval;
 
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::\n", __FUNCTION__);
+	DPA_INFO("%s::\n", __func__);
 	display_ctentry(entry);
 #endif
 
@@ -837,7 +837,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	entry->ct = NULL;
 	if (add_incoming_iface_info(entry))
 	{
-		DPA_ERROR("%s::unable to get interface %d\n",__FUNCTION__,
+		DPA_ERROR("%s::unable to get interface %d\n",__func__,
 				entry->inPhyPortNum);
 		goto err_ret1;
 	}
@@ -845,24 +845,24 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	if (dpa_get_fm_port_index(entry->inPhyPortNum, underlying_input_itf->index, &info->fm_idx,
 				&info->port_idx, &info->port_id)) {
 		DPA_ERROR("%s::unable to get fmindex for itfid %d\n",
-				__FUNCTION__, entry->inPhyPortNum);
+				__func__, entry->inPhyPortNum);
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s(%d) inPhyPortNum 0x%x, underlying_input_itf->index %d, fm_idx 0x%x, port_idx %d port_id %d\n",
-			__FUNCTION__, __LINE__, entry->inPhyPortNum, underlying_input_itf->index,
+			__func__, __LINE__, entry->inPhyPortNum, underlying_input_itf->index,
 			info->fm_idx, info->port_idx, info->port_id);
 #endif // CDX_DPA_DEBUG
 	//get pcd handle based on determined fman
 	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
 	if (!info->fm_pcd) {
 		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",
-				__FUNCTION__, info->fm_idx);
+				__func__, info->fm_idx);
 		goto err_ret;
 	}
 	if (get_table_type(entry, &tbl_type)) {
 		DPA_ERROR("%s::unable to get table type\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 	info->tbl_type = tbl_type;
@@ -878,7 +878,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, tbl_type);
 	if (info->td == NULL) {
 		DPA_ERROR("%s::unable to get td for itfid %d, type %d\n",
-				__FUNCTION__, entry->inPhyPortNum,
+				__func__, entry->inPhyPortNum,
 				tbl_type);
 		goto err_ret;
 	}
@@ -886,7 +886,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info,
 				&info->l3_info, entry->tnl_route, &entry->qosmark, (uint32_t)entry->hash)) {
 		DPA_ERROR("%s::unable to get tx params\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 
@@ -903,20 +903,20 @@ int insert_entry_in_classif_table(PCtEntry entry)
 		if(cdx_ipsec_fill_sec_info(entry,info))
 		{
 			DPA_ERROR("%s::unable to get td for offline port, type %d\n",
-					__FUNCTION__, info->tbl_type);
+					__func__, info->tbl_type);
 			goto err_ret;
 		}
 	}
 #endif
 
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: td info :%p\n", __FUNCTION__, info->td);
+	DPA_INFO("%s:: td info :%p\n", __func__, info->td);
 #endif
 	//allocate connection tracker entry
 	entry->ct = (struct hw_ct *)kzalloc(sizeof(struct hw_ct), GFP_KERNEL);
 	if (!entry->ct) {
 		DPA_ERROR("%s::unable to alloc mem for hw_ct\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 	//save table descriptor for entry release
@@ -925,22 +925,22 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	entry->ct->fm_ctx = dpa_get_fm_ctx(info->fm_idx);
 	if (entry->ct->fm_ctx == NULL) {
 		DPA_ERROR("%s::failed to get ctx fro fm idx %d\n",
-				__FUNCTION__, info->fm_idx);
+				__func__, info->fm_idx);
 		goto err_ret;
 	}
 
 	//allocate hash table entry
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::info->td %p\n", __FUNCTION__, info->td);
+	DPA_INFO("%s::info->td %p\n", __func__, info->td);
 #endif
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
 	if (!tbl_entry) {
 		DPA_ERROR("%s::unable to alloc hash tbl memory\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: hash tbl entry %p\n", __FUNCTION__, tbl_entry);
+	DPA_INFO("%s:: hash tbl entry %p\n", __func__, tbl_entry);
 #endif
 	flags = 0;
 #ifdef ENABLE_FLOW_TIME_STAMPS
@@ -957,7 +957,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	key_size = fill_key_info(entry, &tbl_entry->hashentry.key[0], info->port_id);
 	if (!key_size) {
 		DPA_ERROR("%s::unable to compose key\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}	
 
@@ -980,7 +980,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
 			GET_PARAM_OFFSET(flags));
 	if (fill_actions(entry, info)) {
-		DPA_ERROR("%s::unable to fill actions\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
 	tbl_entry->enqueue_params = info->enqueue_params;
@@ -991,7 +991,7 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	//insert entry into hash table
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry); 
 	if (retval == -1) {
-		DPA_ERROR("%s::unable to add entry in hash table\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
 	}	
 	entry->ct->index = (uint16_t)retval;
@@ -1023,7 +1023,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	uint8_t *ptr;
 	int retval;
 	
-	DPA_INFO("%s::\n", __FUNCTION__);
+	DPA_INFO("%s::\n", __func__);
 #ifdef CDX_DPA_DEBUG
 /*	display_ctentry(entry); */
 #endif
@@ -1047,7 +1047,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	entry->ct = NULL;
 	if (add_incoming_iface_info(entry))
 	{
-		DPA_ERROR("%s::unable to get interface %d\n",__FUNCTION__,
+		DPA_ERROR("%s::unable to get interface %d\n",__func__,
 							entry->inPhyPortNum);
 		goto err_ret1;
 	}
@@ -1055,24 +1055,24 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	if (dpa_get_fm_port_index(entry->inPhyPortNum, underlying_input_itf->index, &info->fm_idx,
 			&info->port_idx, &info->port_id)) {
 		DPA_ERROR("%s::unable to get fmindex for itfid %d\n",
-						__FUNCTION__, entry->inPhyPortNum);
+						__func__, entry->inPhyPortNum);
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s(%d) inPhyPortNum 0x%x, underlying_input_itf->index %d, fm_idx 0x%x, port_idx %d port_id %d\n",
-			__FUNCTION__, __LINE__, entry->inPhyPortNum, underlying_input_itf->index,
+			__func__, __LINE__, entry->inPhyPortNum, underlying_input_itf->index,
 			info->fm_idx, info->port_idx, info->port_id);
 #endif // CDX_DPA_DEBUG
 	//get pcd handle based on determined fman
 	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
 	if (!info->fm_pcd) {
 		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",
-					__FUNCTION__, info->fm_idx);
+					__func__, info->fm_idx);
 		goto err_ret;
 	}
 	if (get_table_type(entry, &tbl_type)) {
 		DPA_ERROR("%s::unable to get table type\n",
-							__FUNCTION__);
+							__func__);
 		goto err_ret;
 	}
 	
@@ -1080,16 +1080,16 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, tbl_type);
 	if (info->td == NULL) {
 		DPA_ERROR("%s::unable to get td for itfid %d, type %d\n",
-							__FUNCTION__, entry->inPhyPortNum,
+							__func__, entry->inPhyPortNum,
 								tbl_type);
 		goto err_ret;
 	}
-	DPA_INFO("%s:: td info :%p\n", __FUNCTION__, info->td);
+	DPA_INFO("%s:: td info :%p\n", __func__, info->td);
 	//allocate connection tracker entry
 	entry->ct = (struct hw_ct *)kzalloc(sizeof(struct hw_ct), GFP_KERNEL);
 	if (!entry->ct) {
 		DPA_ERROR("%s::unable to alloc mem for hw_ct\n",
-								__FUNCTION__);
+								__func__);
 		goto err_ret;
 	}
 	//save table descriptor for entry release
@@ -1098,26 +1098,26 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	entry->ct->fm_ctx = dpa_get_fm_ctx(info->fm_idx);
 	if (entry->ct->fm_ctx == NULL) {
 		DPA_ERROR("%s::failed to get ctx fro fm idx %d\n",
-						__FUNCTION__, info->fm_idx);
+						__func__, info->fm_idx);
 		goto err_ret;
 	}
 	
 	if (dpa_get_tx_info_by_itf(entry->pRtEntry, &info->l2_info,
 			&info->l3_info, entry->tnl_route, &entry->qosmark, (uint32_t)entry->hash)) {
 		DPA_ERROR("%s::unable to get tx params\n",
-									__FUNCTION__);
+									__func__);
 		goto err_ret;
 	}
 	
 	//allocate hash table entry
-	DPA_INFO("%s::info->td %p\n", __FUNCTION__, info->td);
+	DPA_INFO("%s::info->td %p\n", __func__, info->td);
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
 	if (!tbl_entry) {
 		DPA_ERROR("%s::unable to alloc hash tbl memory\n",
-									__FUNCTION__);
+									__func__);
 		goto err_ret;
 	}
-	DPA_INFO("%s:: hash tbl entry %p\n", __FUNCTION__, tbl_entry);
+	DPA_INFO("%s:: hash tbl entry %p\n", __func__, tbl_entry);
 		flags = 0;
 #ifdef ENABLE_FLOW_TIME_STAMPS
 	SET_TIMESTAMP_ENABLE(flags);
@@ -1133,7 +1133,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	key_size = fill_key_info(entry, &tbl_entry->hashentry.key[0], info->port_id);
 	if (!key_size) {
 		DPA_ERROR("%s::unable to compose key\n",
-								__FUNCTION__);
+								__func__);
 		goto err_ret;
 	}	
 		
@@ -1156,7 +1156,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
 		GET_PARAM_OFFSET(flags));
 	if (fill_actions(entry, info)) {
-		DPA_ERROR("%s::unable to fill actions\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
 	tbl_entry->replicate_params = info->replicate_params;
@@ -1168,7 +1168,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	//insert entry into hash table
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry); 
 	if (retval == -1) {
-		DPA_ERROR("%s::unable to add entry in hash table\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
 	}	
 	entry->ct->index = (uint16_t)retval;
@@ -1260,7 +1260,7 @@ static int fill_bridge_actions(struct ins_entry_info *info, POnifDesc ifdesc)
 	if ((entry->l2flow.vlan_flags & VLAN_FILTERED)) {
 		/* Always try to strip outer vlan header if present */
 		if (insert_remove_outer_vlan_hm(info, ifdesc->itf->index, 0 )) {
-			DPA_ERROR("%s::unable to strip outer vlan header\n", __FUNCTION__);
+			DPA_ERROR("%s::unable to strip outer vlan header\n", __func__);
 			return FAILURE;
 		}
 	}
@@ -1269,7 +1269,7 @@ static int fill_bridge_actions(struct ins_entry_info *info, POnifDesc ifdesc)
 		{
 #endif
 		if (insert_remove_vlan_hm(info, ifdesc->itf->index, 0 )) {
-			DPA_ERROR("%s::unable to strip vlan header\n", __FUNCTION__);
+			DPA_ERROR("%s::unable to strip vlan header\n", __func__);
 			return FAILURE;
 		}
 	}
@@ -1304,38 +1304,38 @@ int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPP
 	info = kzalloc(sizeof(struct ins_entry_info), 0);
 	if(!info)
 	{
-		DPA_ERROR("%s::unable to allocate mem for info\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to allocate mem for info\n", __func__);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d) incoming interface %s\n",__FUNCTION__,__LINE__,&entry->hw_entry.in_ifname[0]);
-	DPA_INFO("%s(%d) outgoing interface %s\n",__FUNCTION__,__LINE__,&entry->relay->hw_entry.in_ifname[0]);   
+	DPA_INFO("%s(%d) incoming interface %s\n",__func__,__LINE__,&entry->hw_entry.in_ifname[0]);
+	DPA_INFO("%s(%d) outgoing interface %s\n",__func__,__LINE__,&entry->relay->hw_entry.in_ifname[0]);   
 
 	if((ifdesc = get_onif_by_name(&entry->hw_entry.in_ifname[0])) == NULL)
 	{
-		DPA_ERROR("%s::unable to validate incoming iface %s\n", __FUNCTION__,&entry->hw_entry.in_ifname[0]);
+		DPA_ERROR("%s::unable to validate incoming iface %s\n", __func__,&entry->hw_entry.in_ifname[0]);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d) ifdesc->itf->index %d\n",__FUNCTION__,__LINE__,ifdesc->itf->index);
+	DPA_INFO("%s(%d) ifdesc->itf->index %d\n",__func__,__LINE__,ifdesc->itf->index);
 
 	if(dpa_get_fm_port_index(ifdesc->itf->index,0, &info->fm_idx,&info->port_idx, &portid))
 	{
-		DPA_ERROR("%s::unable to get fm-index for input iface %s\n",__FUNCTION__, &entry->hw_entry.in_ifname[0]);
+		DPA_ERROR("%s::unable to get fm-index for input iface %s\n",__func__, &entry->hw_entry.in_ifname[0]);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__FUNCTION__,__LINE__,info->fm_idx, info->port_idx, portid);
+	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__func__,__LINE__,info->fm_idx, info->port_idx, portid);
 
 	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
 	if(!info->fm_pcd)
 	{
-		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__FUNCTION__, info->fm_idx);
+		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__func__, info->fm_idx);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d) fm_pcd %p \n",__FUNCTION__,__LINE__, info->fm_pcd);
+	DPA_INFO("%s(%d) fm_pcd %p \n",__func__,__LINE__, info->fm_pcd);
 
 	//get egress FQID
 	if(dpa_get_tx_fqid_by_name(&entry->relay->hw_entry.in_ifname[0], &info->l2_info.fqid, &info->l2_info.is_dscp_fq_map, (uint32_t)entry->sessionID))
 	{
-		DPA_ERROR("%s::unable to get tx params-fqid\n",__FUNCTION__);
+		DPA_ERROR("%s::unable to get tx params-fqid\n",__func__);
 		goto err_ret;
 	}
 	DPA_INFO("\r\n egress fq_id = %d \r\n",info->l2_info.fqid); 
@@ -1344,23 +1344,23 @@ int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPP
 	info->l2_info.mtu = 0xffff;
 
 #ifdef CDX_DPA_DEBUG
-	//     DPA_INFO("%s:: mtu %d\n", __FUNCTION__, dev->mtu);
+	//     DPA_INFO("%s:: mtu %d\n", __func__, dev->mtu);
 #endif
 
 	//get table descriptor based on type and port
 	info->td = dpa_get_tdinfo(info->fm_idx, portid, PPPOE_RELAY_TABLE);    //ETHERNET_TABLE
 	if(info->td == NULL)
 	{
-		DPA_ERROR("%s::unable to get td for input iface %s\n",__FUNCTION__, &entry->hw_entry.in_ifname[0]);
+		DPA_ERROR("%s::unable to get td for input iface %s\n",__func__, &entry->hw_entry.in_ifname[0]);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d) td %p \n",__FUNCTION__,__LINE__, info->td); 
+	DPA_INFO("%s(%d) td %p \n",__func__,__LINE__, info->td); 
 
 	//allocate hw entry
 	ct = (struct hw_ct *)kzalloc(sizeof(struct hw_ct) , GFP_KERNEL);
 	if(!ct)
 	{
-		DPA_ERROR("%s::unable to alloc mem for hw_ct\n",__FUNCTION__);
+		DPA_ERROR("%s::unable to alloc mem for hw_ct\n",__func__);
 		goto err_ret;
 	}
 
@@ -1373,7 +1373,7 @@ int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPP
 	ct->fm_ctx = dpa_get_fm_ctx(info->fm_idx);
 	if(ct->fm_ctx == NULL)
 	{
-		DPA_ERROR("%s::failed to get ctx from fm idx %d\n", __FUNCTION__, info->fm_idx);
+		DPA_ERROR("%s::failed to get ctx from fm idx %d\n", __func__, info->fm_idx);
 		goto err_ret;
 	}
 
@@ -1381,12 +1381,12 @@ int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPP
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
 	if(!tbl_entry)
 	{
-		DPA_ERROR("%s::unable to alloc hash tbl memory\n",__FUNCTION__);
+		DPA_ERROR("%s::unable to alloc hash tbl memory\n",__func__);
 		goto err_ret;
 	}
 
 #ifdef CDX_DPA_DEBUG
-	printk("%s:: hash tbl entry %p\n", __FUNCTION__, tbl_entry);
+	printk("%s:: hash tbl entry %p\n", __func__, tbl_entry);
 #endif
 
 	//fill key info
@@ -1435,7 +1435,7 @@ int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPP
 
 	if(fill_pppoe_relay_actions(info,entry))
 	{
-		DPA_ERROR("%s::unable to fill pppoe relay actions\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to fill pppoe relay actions\n", __func__);
 		goto err_ret;
 	}
 	DPA_INFO("\r\ninsert_pppoe_relay_entry_in_classif_table:pppoe relay actions are filled successfully");
@@ -1449,7 +1449,7 @@ int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPP
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
 	if(retval == -1)
 	{
-		DPA_ERROR("%s::unable to add entry in hash table\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
 	}
 	DPA_INFO("\r\n insert_pppoe_relay_entry_in_classif_table: Added the pppoe relay key successfully");
@@ -1459,7 +1459,7 @@ int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPP
 	return SUCCESS;
 
 err_ret:
-	DPA_INFO("%s::unable to add entry in hash table\n", __FUNCTION__);
+	DPA_INFO("%s::unable to add entry in hash table\n", __func__);
 	//release all allocated items
 	if(entry->hw_entry.ct)
 		kfree(entry->hw_entry.ct);
@@ -1476,10 +1476,10 @@ static int fill_pppoe_relay_actions(struct ins_entry_info *info,pPPPoE_Info entr
 
 #ifdef CDX_DPA_DEBUG
 	// DPA_INFO("%s:: entry %p, opc_ptr %p, param_ptr %p, size %d\n",
-	//          __FUNCTION__, pRtEntry, info->opcptr, info->paramptr, info->param_size);
+	//          __func__, pRtEntry, info->opcptr, info->paramptr, info->param_size);
 #endif
 
-	DPA_INFO("%s(%d) create_pppoe_relay_hm\n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) create_pppoe_relay_hm\n",__func__,__LINE__);
 	if(create_pppoe_relay_hm(info,entry))
 		return FAILURE;  
 	return SUCCESS;
@@ -1501,13 +1501,13 @@ int add_l2flow_to_hw(struct L2Flow_entry *entry)
 
 	if((ifdesc = get_onif_by_name(&entry->in_ifname[0])) == NULL) {
 		DPA_ERROR("%s::%d unable to validate in iface %s\n", 
-				__FUNCTION__, __LINE__, &entry->in_ifname[0]);
+				__func__, __LINE__, &entry->in_ifname[0]);
 		return FAILURE;
 	}
 	if (dpa_get_fm_port_index(ifdesc->itf->index,0, &fm_idx,
 				&port_idx, &portid)) {
 		DPA_ERROR("%s::%d unable to get fmindex for iface %s\n",
-				__FUNCTION__, __LINE__, &entry->in_ifname[0]);
+				__func__, __LINE__, &entry->in_ifname[0]);
 		return FAILURE;
 	}
 
@@ -1515,12 +1515,12 @@ int add_l2flow_to_hw(struct L2Flow_entry *entry)
 	td = dpa_get_tdinfo(fm_idx, portid, ETHERNET_TABLE);
 	if (td == NULL) {
 		DPA_ERROR("%s::%d unable to get td for out iface %s\n",
-				__FUNCTION__, __LINE__, &entry->in_ifname[0]); 
+				__func__, __LINE__, &entry->in_ifname[0]); 
 		return FAILURE;
 	}
 
 	if((oifdesc = get_onif_by_name(&entry->out_ifname[0])) == NULL){
-		DPA_ERROR("%s::unable to validate iface %s\n", __FUNCTION__,
+		DPA_ERROR("%s::unable to validate iface %s\n", __func__,
 				&entry->out_ifname[0]);
 		return FAILURE;
 	}
@@ -1528,7 +1528,7 @@ int add_l2flow_to_hw(struct L2Flow_entry *entry)
 	info = kzalloc(sizeof(struct ins_entry_info), 0);
 	if (!info) {
 		DPA_ERROR("%s::unable to allocate mem for info\n",
-				__FUNCTION__);
+				__func__);
 		return FAILURE;
 	}
 	info->td = td;
@@ -1538,7 +1538,7 @@ int add_l2flow_to_hw(struct L2Flow_entry *entry)
 	entry->ct = (struct hw_ct *)kzalloc(sizeof(struct hw_ct) , GFP_KERNEL);
 	if (!entry->ct) {
 		DPA_ERROR("%s::unable to alloc mem for hw_ct\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 	ct = entry->ct;
@@ -1547,14 +1547,14 @@ int add_l2flow_to_hw(struct L2Flow_entry *entry)
 
 	/* Get ingress l2 information */
 	if (dpa_check_for_logical_iface_types(ifdesc->itf, NULL, &info->l2_info, NULL)) {
-		DPA_ERROR("%s::get_iface_type failed iface %d\n", __FUNCTION__,  ifdesc->itf->index);
+		DPA_ERROR("%s::get_iface_type failed iface %d\n", __func__,  ifdesc->itf->index);
 		goto err_ret;
 	} 
 
 	/* Get egress l2 information */
 	if (dpa_get_tx_l2info_by_itf(&info->l2_info, oifdesc, (uint32_t)entry->hash))
 	{
-		DPA_ERROR("%s::unable to get tx params\n",__FUNCTION__);
+		DPA_ERROR("%s::unable to get tx params\n",__func__);
 		goto err_ret;
 	}
 
@@ -1562,11 +1562,11 @@ int add_l2flow_to_hw(struct L2Flow_entry *entry)
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
 	if (!tbl_entry) {
 		DPA_ERROR("%s::unable to alloc hash tbl memory\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: hash tbl entry %p\n", __FUNCTION__, tbl_entry);
+	DPA_INFO("%s:: hash tbl entry %p\n", __func__, tbl_entry);
 #endif
 	{
 		union dpa_key *key;
@@ -1617,14 +1617,14 @@ int add_l2flow_to_hw(struct L2Flow_entry *entry)
 
 	/* fill actions required by entry*/
 	if (fill_bridge_actions(info, ifdesc)) {
-		DPA_ERROR("%s::unable to fill actions\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
 	/* add entry to table */
 	retval = ExternalHashTableAddKey(info->td, 
 			(sizeof(struct ethernet_key) + 1), tbl_entry);
 	if (retval == -1) {
-		DPA_ERROR("%s::unable to add table entry\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to add table entry\n", __func__);
 		goto err_ret;
 	}
 	entry->ct->index = retval;
@@ -1675,7 +1675,7 @@ static int create_pppoe_relay_hm(struct ins_entry_info *info,pPPPoE_Info entry) 
 		param->stats_ptr = cpu_to_be32(word);
 
 #ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __FUNCTION__, (word & 0xffffff));
+		DPA_INFO("%s::stats ptr %x\n", __func__, (word & 0xffffff));
 #endif
 	}
 #else
@@ -1790,7 +1790,7 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 		}
 	}
 #else
-	DPA_INFO("%s::Vlan statistics disabled\n", __FUNCTION__);
+	DPA_INFO("%s::Vlan statistics disabled\n", __func__);
 #endif
 skip_stats:
 	/* write word */
@@ -1873,19 +1873,19 @@ static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_inde
 
 		if (dpa_get_iface_stats_entries(itf_index, 0, &offset, RX_IFSTATS, IF_TYPE_PPPOE)) {
 			DPA_ERROR("%s::unable to get stats offset on pppoe iface on ingress\n",
-					__FUNCTION__);
+					__func__);
 			return FAILURE;
 		}
 		offset &= ~STATS_WITH_TS;
 		stats_ptr = (get_logical_ifstats_base() + 
 				(offset * sizeof(struct en_ehash_stats_with_ts)));
 #ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __FUNCTION__, stats_ptr);
+		DPA_INFO("%s::stats ptr %x\n", __func__, stats_ptr);
 #endif
 	}
 #else
 	stats_ptr = 0;
-	DPA_INFO("%s:PPPoE ingress stats disabled\n", __FUNCTION__);
+	DPA_INFO("%s:PPPoE ingress stats disabled\n", __func__);
 #endif
 	param->stats_ptr = cpu_to_be32(stats_ptr);
 	//add opcode
@@ -1943,7 +1943,7 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 		if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
 					&num_entries)) {
 			DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
-					__FUNCTION__);
+					__func__);
 			return FAILURE;
 		}
 		if (num_entries > 1) {
@@ -1956,7 +1956,7 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
 						&param->stats_offsets[0], RX_IFSTATS, IF_TYPE_VLAN)) {
 				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__FUNCTION__);
+						__func__);
 				return FAILURE;
 			}
 		} else {
@@ -1969,7 +1969,7 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index,
 						&offset, RX_IFSTATS, IF_TYPE_VLAN)) {
 				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__FUNCTION__);
+						__func__);
 				return FAILURE;
 			}
 			word = ((num_entries << 24) |
@@ -1978,14 +1978,14 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 		}
 #ifdef CDX_DPA_DEBUG
 		DPA_INFO("%s::padding %d, stats ptr %x, num_entries %d\n", \
-				__FUNCTION__, padding, (word & 0xffffff), num_entries);
+				__func__, padding, (word & 0xffffff), num_entries);
 #endif
 	}
 #else
 	if (param_size > info->param_size)
 		return FAILURE;
 	word = 0;
-	DPA_INFO("%s::Vlan ingress stats disabled\n", __FUNCTION__);
+	DPA_INFO("%s::Vlan ingress stats disabled\n", __func__);
 #endif
 	param->word = cpu_to_be32(word);
 	if( info->l2_info.num_ingress_vlan_hdrs)
@@ -2046,14 +2046,14 @@ static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, 
 		if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
 					&num_entries)) {
 			DPA_ERROR("%s::unable to get number on vlan iface on ingress\n",
-					__FUNCTION__);
+					__func__);
 			return FAILURE;
 		}
 		if (num_entries > 0) {
 			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
 						&param->stats_offsets[0], RX_IFSTATS, IF_TYPE_VLAN)) {
 				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__FUNCTION__);
+						__func__);
 				return FAILURE;
 			}
 		} 
@@ -2061,7 +2061,7 @@ static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, 
 			if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index, 
 						&param->stats_offsets[num_entries], RX_IFSTATS, IF_TYPE_PPPOE)) {
 				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
-						__FUNCTION__);
+						__func__);
 				return FAILURE;
 				param->stats_offsets[num_entries++] &= ~STATS_WITH_TS;
 			}
@@ -2077,14 +2077,14 @@ static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, 
 
 #ifdef CDX_DPA_DEBUG
 		DPA_INFO("%s::padding %d, stats ptr %x, num_entries %d\n", \
-				__FUNCTION__, padding, (word & 0xffffff), num_entries);
+				__func__, padding, (word & 0xffffff), num_entries);
 #endif
 	}
 #else
 	if (param_size > info->param_size)
 		return FAILURE;
 	word = 0;
-	DPA_INFO("%s::Vlan / PPPoE ingress stats disabled\n", __FUNCTION__);
+	DPA_INFO("%s::Vlan / PPPoE ingress stats disabled\n", __func__);
 #endif
 	param->word = cpu_to_be32(word);
 	if( info->l2_info.num_ingress_vlan_hdrs)
@@ -2304,19 +2304,19 @@ static int create_tunnel_insert_hm(struct ins_entry_info *info)
 		ctentry = info->entry;
 		if ((!ctentry) || (!ctentry->pRtEntry) || (!ctentry->pRtEntry->itf)) {
 			DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on egress\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			return FAILURE;
 		}
 		if (dpa_get_iface_stats_entries(ctentry->pRtEntry->itf->index, 0,
 					&offset, TX_IFSTATS, IF_TYPE_TUNNEL)) {
 			DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on egress\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			return FAILURE;
 		}
 		word |= ((get_logical_ifstats_base() +
 					(offset * sizeof(struct en_ehash_stats))) & 0xffffff);
 #ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __FUNCTION__, (word & 0xffffff));
+		DPA_INFO("%s::stats ptr %x\n", __func__, (word & 0xffffff));
 #endif
 	}
 #endif
@@ -2345,7 +2345,7 @@ static int create_tunnel_remove_hm(struct ins_entry_info *info)
 
 	if ((!ctentry) || (!ctentry->pRtEntry) || (!ctentry->pRtEntry->input_itf)) {
 		DPA_ERROR("%s::%d unable to get stats offset on tunnel iface on ingress\n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 		return FAILURE;
 	}
 
@@ -2355,12 +2355,12 @@ static int create_tunnel_remove_hm(struct ins_entry_info *info)
 		if (dpa_get_iface_stats_entries(ctentry->pRtEntry->input_itf->index, 0,
 					&offset, RX_IFSTATS, IF_TYPE_TUNNEL)) {
 			DPA_ERROR("%s::unable to get stats offset on tunnel iface on ingress\n",
-					__FUNCTION__);
+					__func__);
 			return FAILURE;
 		}
 		word |= ((get_logical_ifstats_base() +
                                 (offset * sizeof(struct en_ehash_stats))) & 0xffffff);
-		DPA_INFO("%s::stats ptr %x\n", __FUNCTION__, word);
+		DPA_INFO("%s::stats ptr %x\n", __func__, word);
 	}
 #else
 	word = 0;
@@ -2489,13 +2489,13 @@ static int create_eth_rx_stats_hm(struct ins_entry_info *info, uint32_t iif_inde
 	if (dpa_get_iface_stats_entries(iif_index, underlying_iif_index,
 				&offset, RX_IFSTATS, IF_TYPE_ETHERNET)) {
 		DPA_ERROR("%s::unable to get stats offset on ethernet iface on ingress\n",
-				__FUNCTION__);
+				__func__);
 		return FAILURE;
 	}
 	stats_ptr = (get_logical_ifstats_base() + (offset * sizeof(struct en_ehash_stats)));
 
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::stats ptr %x\n", __FUNCTION__, stats_ptr);
+	DPA_INFO("%s::stats ptr %x\n", __func__, stats_ptr);
 #endif
 	param->stats_ptr = cpu_to_be32(stats_ptr);
 	//update opcode and param ptr
@@ -2527,7 +2527,7 @@ static int create_enque_hm(struct ins_entry_info *info)
 	uint32_t word = 0;
 
 	if (info->l2_info.mtu == 0) {
-		DPA_ERROR("%s::mtu is null\n", __FUNCTION__);
+		DPA_ERROR("%s::mtu is null\n", __func__);
 		return FAILURE;
 	}
 	if (info->opc_count == MAX_OPCODES)
@@ -2546,13 +2546,13 @@ int ii;
 for (ii =0; ii< 128; ii++)
 {
 	if (bman_acquire(frag_info_g.frag_bufpool->pool, &bmb[ii], 1, 0) != 1) {
-	DPA_INFO("%s(%d) bman_acquire failed \n", __FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) bman_acquire failed \n", __func__,__LINE__);
 		bmb[ii].addr = 0;
 	}
 	else
 	{
 		DPA_INFO("%s(%d) bman_acquire success (ii %d) ,%lx \n", 
-			__FUNCTION__,__LINE__,ii,(long unsigned int)bmb[ii].opaque);
+			__func__,__LINE__,ii,(long unsigned int)bmb[ii].opaque);
 	}
 }
 for (ii =0; ii< 128; ii++)
@@ -2604,7 +2604,7 @@ if (bmb[ii].addr)
 			(offset * sizeof(struct en_ehash_stats))) & 0xffffff);
 		param->word  = cpu_to_be32(word);
 #ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __FUNCTION__, (word & 0xffffff));
+		DPA_INFO("%s::stats ptr %x\n", __func__, (word & 0xffffff));
 #endif
 
 #else
@@ -2741,7 +2741,7 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			if (create_ipsec_preemptive_checks_hm(info, entry->id.spi))
 			{
 				DPA_ERROR("%s::unable to add ipsec preemptive checks\n",
-						__FUNCTION__);
+						__func__);
 				return FAILURE;
 			}
 		}
@@ -2752,7 +2752,7 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 		in sa_itf_id tunnel type cases*/
 		if (create_eth_rx_stats_hm(info,info->sa_itf_id, 0)) {
 			DPA_ERROR("%s::unable to add ethernet stats\n",
-					__FUNCTION__);
+					__func__);
 			return FAILURE;
 		}
 #endif
@@ -2767,7 +2767,7 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 		{
 			if(create_enque_only_hm(info)) {
 				DPA_ERROR("%s::unable to add enque hm\n",
-						__FUNCTION__);
+						__func__);
 				return FAILURE;
 			}
 			return SUCCESS;
@@ -2777,7 +2777,7 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 	//enqueue
 	if(create_enque_hm(info)) {
 		DPA_ERROR("%s::unable to add enque hm\n",
-				__FUNCTION__);
+				__func__);
 		return FAILURE;
 	}
 	return SUCCESS;
@@ -2797,39 +2797,39 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 	uint16_t flags;
 	uint8_t *ptr;
 
-	DPA_INFO("%s(%d) listener output device %s\n",__FUNCTION__,__LINE__,pListener->output_device_str);
+	DPA_INFO("%s(%d) listener output device %s\n",__func__,__LINE__,pListener->output_device_str);
 	onif_desc = get_onif_by_name(pListener->output_device_str); 
 	if (!onif_desc)
 	{
-		DPA_ERROR("%s::unable to get onif for iface %s\n", __FUNCTION__, pListener->output_device_str);
+		DPA_ERROR("%s::unable to get onif for iface %s\n", __func__, pListener->output_device_str);
 		goto err_ret;
 	}
 
 
-	DPA_INFO("%s(%d) onif_desc->itf->index %d\n",__FUNCTION__,__LINE__,onif_desc->itf->index);
+	DPA_INFO("%s(%d) onif_desc->itf->index %d\n",__func__,__LINE__,onif_desc->itf->index);
 	if(dpa_get_fm_port_index(onif_desc->itf->index,0, &fm_idx, &port_idx, &pInsEntryInfo->port_id))
 	{
-		DPA_ERROR("%s::unable to get fmindex for itfid %d\n",__FUNCTION__, onif_desc->itf->index);
+		DPA_ERROR("%s::unable to get fmindex for itfid %d\n",__func__, onif_desc->itf->index);
 		goto err_ret;
 	}
 
-	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__FUNCTION__,__LINE__,fm_idx, port_idx, pInsEntryInfo->port_id);
+	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__func__,__LINE__,fm_idx, port_idx, pInsEntryInfo->port_id);
 	pInsEntryInfo->fm_pcd = dpa_get_pcdhandle(fm_idx);
 	if (!pInsEntryInfo->fm_pcd)
 	{
-		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__FUNCTION__, fm_idx);
+		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__func__, fm_idx);
 		goto err_ret;
 	} 
 
-	DPA_INFO("%s(%d) fm_pcd %p \n",__FUNCTION__,__LINE__, pInsEntryInfo->fm_pcd);
+	DPA_INFO("%s(%d) fm_pcd %p \n",__func__,__LINE__, pInsEntryInfo->fm_pcd);
 	//get table descriptor based on type and port
 	pInsEntryInfo->td = dpa_get_tdinfo(pInsEntryInfo->fm_idx, pInsEntryInfo->port_id, tbl_type);
 	if (pInsEntryInfo->td == NULL) {
 		DPA_ERROR("%s::unable to get td for itfid %d, type %d\n",
-				__FUNCTION__, onif_desc->itf->index,tbl_type);
+				__func__, onif_desc->itf->index,tbl_type);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d) td %p \n",__FUNCTION__,__LINE__, pInsEntryInfo->td);
+	DPA_INFO("%s(%d) td %p \n",__func__,__LINE__, pInsEntryInfo->td);
 
 	//Code to create hm for mcast single member
 
@@ -2852,7 +2852,7 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		qosmark.markval = 0;
 		if (dpa_get_tx_info_by_itf(pRtEntry, pL2Info, pL3Info, NULL, &qosmark, 0))
 		{
-			DPA_ERROR("%s::unable to get tx params\n",__FUNCTION__);
+			DPA_ERROR("%s::unable to get tx params\n",__func__);
 			goto err_ret;
 		}
 	}
@@ -2865,19 +2865,19 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 
 	pL2Info->mtu = dev->mtu;
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: mtu %d\n", __FUNCTION__, dev->mtu);
+	DPA_INFO("%s:: mtu %d\n", __func__, dev->mtu);
 #endif
 
 	dev_put(dev);
 	//allocate hash table entry
 	tbl_entry = ExternalHashTableAllocEntry(pInsEntryInfo->td);
 	if (!tbl_entry) {
-		DPA_ERROR("%s::unable to alloc hash tbl memory\n",__FUNCTION__);
+		DPA_ERROR("%s::unable to alloc hash tbl memory\n",__func__);
 		goto err_ret;
 	}
 
 	//#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: hash tbl entry %p\n", __FUNCTION__, tbl_entry);
+	DPA_INFO("%s:: hash tbl entry %p\n", __func__, tbl_entry);
 	//#endif
 	flags = 0;
 	//round off keysize to next 4 bytes boundary 
@@ -2901,7 +2901,7 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		pInsEntryInfo->flags |= EHASH_IPV6_FLOW;
 
 	if (fill_mcast_member_actions(pRtEntry, pInsEntryInfo)) {
-		DPA_ERROR("%s::unable to fill actions\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
@@ -2934,7 +2934,7 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s:: entry %p, opc_ptr %p, param_ptr %p, size %d\n", 
-			__FUNCTION__, pRtEntry, info->opcptr, info->paramptr, info->param_size);
+			__func__, pRtEntry, info->opcptr, info->paramptr, info->param_size);
 #endif
 
 	//routing and ttl decr are mandatory
@@ -2948,10 +2948,10 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 	else
 		info->eth_type = ETHERTYPE_IPV4;
 
-	DPA_INFO("%s(%d) rebuild_l2_hdr  %d\n",__FUNCTION__,__LINE__,rebuild_l2_hdr);
+	DPA_INFO("%s(%d) rebuild_l2_hdr  %d\n",__func__,__LINE__,rebuild_l2_hdr);
 	if (info->l2_info.num_egress_vlan_hdrs) {
 		DPA_INFO("%s(%d) num egress vlan hdrs %d\n",
-				__FUNCTION__,__LINE__, info->l2_info.num_egress_vlan_hdrs);
+				__func__,__LINE__, info->l2_info.num_egress_vlan_hdrs);
 		info->flags |= VLAN_ADD_HM_VALID;
 		for (ii = 0; ii < info->l2_info.num_egress_vlan_hdrs; ii++) {
 			info->vlan_ids[ii] =
@@ -2986,7 +2986,7 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 		/* enqueue Packet */
 		if(create_enque_hm(info))
 			break;
-		DPA_INFO("%s(%d) create_enque_hm\n",__FUNCTION__,__LINE__);
+		DPA_INFO("%s(%d) create_enque_hm\n",__func__,__LINE__);
 
 		return SUCCESS;
 	}
@@ -3010,7 +3010,7 @@ int cdx_init_frag_module(void)
 	ret = cdx_create_fragment_bufpool();
 	if (ret)
 	{
-		DPA_ERROR("%s(%d) create_fragment_bufpool failed\n",__FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) create_fragment_bufpool failed\n",__func__,__LINE__);
 		return -1;
 	}
 	frag_options = BPID_ENABLE;
@@ -3019,7 +3019,7 @@ int cdx_init_frag_module(void)
 	h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 	if (!h_FmMuram)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 #ifdef CDX_FRAG_USE_BUFF_POOL
 		cdx_deinit_fragment_bufpool();
 #endif //CDX_FRAG_USE_BUFF_POOL
@@ -3039,7 +3039,7 @@ int cdx_init_frag_module(void)
 	dscp_fq_map_ff_g.port_id = NO_PORT;
 	if ((ucode_frag_args = kmalloc(sizeof(cdx_ucode_frag_info_t), GFP_KERNEL)) == NULL)
 	{
-		DPA_ERROR("%s(%d) Failed to allocate memory:\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) Failed to allocate memory:\n", __func__, __LINE__);
 		FM_MURAM_FreeMem(h_FmMuram, (void *)dscp_fq_map_ff_g.muram_addr);
 		dscp_fq_map_ff_g.muram_addr = NULL;
 		frag_info_g.muram_frag_params = NULL;
@@ -3104,20 +3104,20 @@ static ssize_t buff_alloc_test(struct file *file, char __user *buf, size_t size,
 	for (ii =0; ii< 128; ii++)
 	{
 		if (bman_acquire(frag_info_g.frag_bufpool->pool, &bmb[ii], 1, 0) != 1) {
-			DPA_INFO("%s(%d) bman_acquire failed \n", __FUNCTION__,__LINE__);
+			DPA_INFO("%s(%d) bman_acquire failed \n", __func__,__LINE__);
 			bmb[ii].addr = 0;
 		}
 		else
 		{
 			DPA_INFO("%s(%d) bman_acquire success (ii %d) ,%lx \n", 
-					__FUNCTION__,__LINE__,ii,(long unsigned int)bmb[ii].opaque);
+					__func__,__LINE__,ii,(long unsigned int)bmb[ii].opaque);
 		}
 	}
 	for (ii =0; ii< 128; ii++)
 	{
 		if (bmb[ii].addr) {
 			if (bman_release(frag_info_g.frag_bufpool->pool, &bmb[ii], 1, 0))
-				DPA_ERROR("%s::bman release failed\n", __FUNCTION__);
+				DPA_ERROR("%s::bman release failed\n", __func__);
 		}
 	}
 	ii = sprintf(buf, "128 buffers allocated and freed successfully\n");
@@ -3132,7 +3132,7 @@ int cdx_init_frag_procfs(void)
 	frag_proc_dir = proc_mkdir(PROC_FRAG_DIR, NULL);
 	if (!frag_proc_dir)
 	{
-		DPA_INFO("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
+		DPA_INFO("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
 	memset (&frag_stats_fp, 0, sizeof(frag_stats_fp));
@@ -3142,7 +3142,7 @@ int cdx_init_frag_procfs(void)
 	stats_file = proc_create("stats", 0444, frag_proc_dir, &frag_stats_fp);
 	if (!stats_file)
 	{
-		DPA_INFO("%s(%d) proc_create failed\n",__FUNCTION__,__LINE__);
+		DPA_INFO("%s(%d) proc_create failed\n",__func__,__LINE__);
 		return -1;
 	}
 
@@ -3150,7 +3150,7 @@ int cdx_init_frag_procfs(void)
 	alloc_free_test_file = proc_create("test_alloc_buf_n_free", 0444, frag_proc_dir, &buf_alloc_test_fp);
 	if (!alloc_free_test_file)
 	{
-		DPA_INFO("%s(%d) proc_create failed\n",__FUNCTION__,__LINE__);
+		DPA_INFO("%s(%d) proc_create failed\n",__func__,__LINE__);
 		return -1;
 	}
 
@@ -3168,7 +3168,7 @@ void cdx_deinit_frag_module(void)
 	h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 	if (!h_FmMuram)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		return;
 	}
 	//FM_MURAM_FreeMem(h_FmMuram, (void *)frag_info_g.muram_frag_params_addr);
@@ -3187,7 +3187,7 @@ static int cdx_create_fragment_bufpool(void)
 	bp = kzalloc(sizeof(struct dpa_bp), 0);
 	if (unlikely(bp == NULL)) {
 		DPA_ERROR("%s::failed to allocate mem for bman pool \n",
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 
@@ -3197,7 +3197,7 @@ static int cdx_create_fragment_bufpool(void)
 	//find pools used by ethernet devices and borrow buffers from it
 	if (get_phys_port_poolinfo_bysize(CDX_FRAG_BUFF_SIZE, &frag_info_g.parent_pool_info)) {
 		DPA_ERROR("%s::failed to locate eth bman pool\n", 
-				__FUNCTION__);
+				__func__);
 		bman_free_pool(bp->pool);
 		kfree(bp);
 		return -1;
@@ -3207,11 +3207,11 @@ static int cdx_create_fragment_bufpool(void)
 	bp->dev = bp_parent->dev;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPA_ERROR("%s::dpa_bp_alloc failed\n",
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return -1;
 	}
-	DPA_INFO("%s::bp->size :%zu, bpid %d\n", __FUNCTION__, bp->size, bp->bpid);
+	DPA_INFO("%s::bp->size :%zu, bpid %d\n", __func__, bp->size, bp->bpid);
 
 
 	frag_info_g.frag_bufpool = bp;
@@ -3224,7 +3224,7 @@ static int cdx_create_fragment_bufpool(void)
 			CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD);
 		if (ret < 0)
 		{
-			DPA_ERROR("%s:: Error returned for dpaa_eth_refill_bpools %d\n", __FUNCTION__,ret);
+			DPA_ERROR("%s:: Error returned for dpaa_eth_refill_bpools %d\n", __func__,ret);
 			break;
 		}
 
@@ -3232,7 +3232,7 @@ static int cdx_create_fragment_bufpool(void)
 	}
 	bp->config_count = buffer_count;
 
-	DPA_INFO("%s::buffers_allocated %d\n", __FUNCTION__,bp->config_count);
+	DPA_INFO("%s::buffers_allocated %d\n", __func__,bp->config_count);
 	return 0;
 }
 
@@ -3275,7 +3275,7 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 	if (!pFromSocket->pRtEntry)
 	{
 		DPA_ERROR("%s(%d) socket route entry is NULL.\n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 		return FAILURE;
 	}
 	//strip vlan on ingress if incoming iface is vlan
@@ -3340,7 +3340,7 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 	{
 		if ((!pFromSocket->pRtEntry->input_itf) || (!pFromSocket->pRtEntry->underlying_input_itf)) {
 			DPA_ERROR("%s::%d input itf OR underlying input itf is NULL\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			break;
 		}
 		iif_index = pFromSocket->pRtEntry->input_itf->index;
@@ -3348,7 +3348,7 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 
 #ifdef INCLUDE_ETHER_IFSTATS
 		DPA_INFO("%s(%d) calling cdx_rtpflow_create_eth_rx_stats_hm\n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 
 		if (create_eth_rx_stats_hm(info, iif_index, underlying_iif_index)) 
 			break;
@@ -3362,7 +3362,7 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 		{
 			struct _itf *itf = NULL;
 
-			DPA_INFO("%s(%d) \n", __FUNCTION__, __LINE__);
+			DPA_INFO("%s(%d) \n", __func__, __LINE__);
 
 			/* strip pppoe hdrs */
 			if ((pFromSocket->pRtEntry->input_itf) && (pFromSocket->pRtEntry->input_itf->type & IF_TYPE_PPPOE))
@@ -3375,7 +3375,7 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 		}
 		if (cdx_check_rx_iface_type_vlan(pFromSocket->pRtEntry->itf))
 		{
-			DPA_INFO("%s(%d) \n", __FUNCTION__, __LINE__);
+			DPA_INFO("%s(%d) \n", __func__, __LINE__);
 
 			/* strip vlan hdrs */
 			if (insert_remove_vlan_hm(info, iif_index, underlying_iif_index))
@@ -3388,18 +3388,18 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 		else
 			opcode = PROCESS_RTP_PAYLOAD;
 
-		DPA_INFO("%s(%d) opcode %x \n", __FUNCTION__, __LINE__, opcode);
+		DPA_INFO("%s(%d) opcode %x \n", __func__, __LINE__, opcode);
 
 		if (create_rtprelay_process_opcode(info, pFromSocket->hw_stats, 
 					(uint32_t *)pFlow->hw_flow->rtp_info,
 					pToSocket->hw_stats, opcode))
 		{
-			DPA_ERROR("%s(%d) create_rtprelay_process_opcode failed\n",__FUNCTION__, __LINE__);
+			DPA_ERROR("%s(%d) create_rtprelay_process_opcode failed\n",__func__, __LINE__);
 			break;
 		}
 
 
-		DPA_INFO("%s(%d) \n", __FUNCTION__, __LINE__);
+		DPA_INFO("%s(%d) \n", __func__, __LINE__);
 
 		if (info->l2_info.num_egress_vlan_hdrs)
 			pFlow->hw_flow->vlan_hdr_ptr = info->vlan_hdrs;
@@ -3417,14 +3417,14 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 				if (info->flags & EHASH_IPV6_FLOW) 
 				{
 					DPA_INFO("%s(%d) \n",
-							__FUNCTION__, __LINE__);
+							__func__, __LINE__);
 					if (create_hoplimit_hm(info))
 						break;
 				} 
 				else
 				{
 					DPA_INFO("%s(%d) \n",
-							__FUNCTION__, __LINE__);
+							__func__, __LINE__);
 					if (create_ttl_hm(info))
 						break;
 				}
@@ -3432,7 +3432,7 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 		}
 		//enqueue
 		DPA_INFO("%s(%d) \n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 
 
 		if (info->l2_info.add_pppoe_hdr)  {
@@ -3493,7 +3493,7 @@ static int get_rtp_classif_table_type(PSockEntry pSocket, uint32_t *type)
 			return SUCCESS;
 		default:
 			DPA_ERROR("%s::protocol %d not supported\n",
-					__FUNCTION__, pSocket->proto);
+					__func__, pSocket->proto);
 			break;
 	}
 	return FAILURE;
@@ -3559,7 +3559,7 @@ static int cdx_rtpflow_fill_key_info(PSockEntry pSocket, uint8_t *keymem, uint32
 			break;
 		default:
 			DPA_ERROR("%s::protocol %d not supported\n",
-					__FUNCTION__, pSocket->proto);
+					__func__, pSocket->proto);
 			key_size = 0;
 	}
 #ifdef CDX_DPA_DEBUG
@@ -3649,7 +3649,7 @@ int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
 	info = kzalloc(sizeof(struct ins_entry_info), 0);
 	if (!info)
 	{
-		DPA_ERROR("%s(%d)::unable to create memory.\n",__FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d)::unable to create memory.\n",__func__, __LINE__);
 		return FAILURE;
 	}
 	ucInPhyPortNum = pSocket->iifindex;
@@ -3657,7 +3657,7 @@ int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
 	if ((iface_info = dpa_get_ifinfo_by_itfid(pSocket->iifindex)) == NULL)
 	{
 		DPA_ERROR("%s::%d unable to find the dpa interface for index(%u).\n",
-				__FUNCTION__, __LINE__, pSocket->iifindex);
+				__func__, __LINE__, pSocket->iifindex);
 		goto err_ret;
 	}
 
@@ -3665,13 +3665,13 @@ int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
 				&info->port_idx, &info->port_id))
 	{
 		DPA_ERROR("%s(%d)::unable to get fmindex for itfid %d\n",
-				__FUNCTION__, __LINE__, ucInPhyPortNum);
+				__func__, __LINE__, ucInPhyPortNum);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d)\n", __FUNCTION__, __LINE__);
+	DPA_INFO("%s(%d)\n", __func__, __LINE__);
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s(%d) ucInPhyPortNum 0x%x, underlying_input_itf->index %d, fm_idx 0x%x, port_idx %d port_id %d\n",
-			__FUNCTION__, __LINE__, ucInPhyPortNum, 0/*underlying_input_itf->index*/,
+			__func__, __LINE__, ucInPhyPortNum, 0/*underlying_input_itf->index*/,
 			info->fm_idx, info->port_idx, info->port_id);
 #endif /* CDX_DPA_DEBUG */
 	/* get pcd handle based on determined fman */
@@ -3679,12 +3679,12 @@ int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
 	if (!info->fm_pcd)
 	{
 		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",
-				__FUNCTION__, info->fm_idx);
+				__func__, info->fm_idx);
 		goto err_ret;
 	}
 	if (get_rtp_classif_table_type(pSocket, &uiTblType))
 	{
-		DPA_ERROR("%s::%d unable to get table type\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d unable to get table type\n", __func__, __LINE__);
 		goto err_ret;
 	}
 	info->tbl_type = uiTblType;
@@ -3694,7 +3694,7 @@ int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
 	if (info->td == NULL)
 	{
 		DPA_ERROR("%s::%d unable to get td for itfid %d, type %d\n",
-				__FUNCTION__, __LINE__, ucInPhyPortNum, uiTblType);
+				__func__, __LINE__, ucInPhyPortNum, uiTblType);
 		goto err_ret;
 	}
 	/*info->l2_info.mtu = 1500;*/
@@ -3702,21 +3702,21 @@ int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
 				pSocket->hash, &info->l2_info.fqid) < 0)
 	{
 		DPA_ERROR("%s::%d unable to find the frame queue for rtp qos slowpath traffic.\n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 		goto err_ret;
 	}
 
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
 	if (!tbl_entry)
 	{
-		DPA_ERROR("%s::%d unable to alloc hash tbl memory\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d unable to alloc hash tbl memory\n", __func__, __LINE__);
 		goto err_ret;
 	}
 	/* fill key information from entry */
 	uiKeySize = cdx_rtpflow_fill_key_info(pSocket, &tbl_entry->hashentry.key[0], info->port_id);
 	if (!uiKeySize)
 	{
-		DPA_ERROR("%s::%d unable to compose key.\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d unable to compose key.\n", __func__, __LINE__);
 		goto err_ret;
 	}	
 	usFlags = 0;
@@ -3758,7 +3758,7 @@ int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
 #endif /* CDX_DPA_DEBUG */
 	/* insert entry into hash table */
 	if ((iRetVal = ExternalHashTableAddKey(info->td, uiKeySize, tbl_entry)) == -1) {
-		DPA_ERROR("%s::%d unable to add entry in hash table\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d unable to add entry in hash table\n", __func__, __LINE__);
 		goto err_ret;
 	}	
 	pSocket->SktEhTblHdl.eeh_entry_handle = tbl_entry;
@@ -3787,7 +3787,7 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	int retval;
 
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s(%d)\n", __FUNCTION__, __LINE__);
+	DPA_INFO("%s(%d)\n", __func__, __LINE__);
 	display_SockEntries(pFromSocket, pToSocket);
 #endif
 
@@ -3795,7 +3795,7 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 
 	if (!pFromSocket->pRtEntry)
 	{
-		DPA_INFO("%s(%d)\n",__FUNCTION__,__LINE__);
+		DPA_INFO("%s(%d)\n",__func__,__LINE__);
 		return FAILURE;
 	}
 
@@ -3803,7 +3803,7 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	if (!info)
 		return FAILURE;
 
-	DPA_INFO("%s(%d)\n", __FUNCTION__, __LINE__);
+	DPA_INFO("%s(%d)\n", __func__, __LINE__);
 	info->entry = pFlow;
 
 	// This can never be NULL for connection routes.
@@ -3817,13 +3817,13 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 
 	if (!pFromSocket->pRtEntry->input_itf)
 		pFromSocket->pRtEntry->input_itf = pFromSocket->pRtEntry->itf;
-	DPA_INFO("%s(%d)\n", __FUNCTION__, __LINE__);
+	DPA_INFO("%s(%d)\n", __func__, __LINE__);
 
 	//clear hw entry pointer
 	if ((!pFromSocket->pRtEntry) || ( (!pFromSocket->pRtEntry->input_itf) 
 				&& (!pFromSocket->pRtEntry->itf)))
 	{
-		DPA_ERROR("%s(%d)::unable to get interface \n",__FUNCTION__,
+		DPA_ERROR("%s(%d)::unable to get interface \n",__func__,
 				__LINE__);
 		goto err_ret;
 	}
@@ -3832,19 +3832,19 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	else
 		pFlow->inPhyPortNum = pFromSocket->pRtEntry->input_itf->index;
 
-	DPA_INFO("%s(%d)\n", __FUNCTION__, __LINE__);
+	DPA_INFO("%s(%d)\n", __func__, __LINE__);
 	//get fman index and port index and port id where this entry need to be added
 	if (dpa_get_fm_port_index(pFlow->inPhyPortNum, underlying_input_itf->index, &info->fm_idx,
 				&info->port_idx, &info->port_id))
 	{
 		DPA_ERROR("%s(%d)::unable to get fmindex for itfid %d\n",
-				__FUNCTION__, __LINE__, pFlow->inPhyPortNum);
+				__func__, __LINE__, pFlow->inPhyPortNum);
 		goto err_ret;
 	}
-	DPA_INFO("%s(%d)\n", __FUNCTION__, __LINE__);
+	DPA_INFO("%s(%d)\n", __func__, __LINE__);
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s(%d) inPhyPortNum 0x%x, underlying_input_itf->index %d, fm_idx 0x%x, port_idx %d port_id %d\n",
-			__FUNCTION__, __LINE__, pFlow->inPhyPortNum, underlying_input_itf->index,
+			__func__, __LINE__, pFlow->inPhyPortNum, underlying_input_itf->index,
 			info->fm_idx, info->port_idx, info->port_id);
 #endif // CDX_DPA_DEBUG
 	//get pcd handle based on determined fman
@@ -3852,13 +3852,13 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	if (!info->fm_pcd)
 	{
 		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",
-				__FUNCTION__, info->fm_idx);
+				__func__, info->fm_idx);
 		goto err_ret;
 	}
 	if (get_rtp_classif_table_type(pFromSocket, &tbl_type))
 	{
 		DPA_ERROR("%s::unable to get table type\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 	info->tbl_type = tbl_type;
@@ -3868,7 +3868,7 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	if (info->td == NULL)
 	{
 		DPA_ERROR("%s::unable to get td for itfid %d, type %d\n",
-				__FUNCTION__, pFlow->inPhyPortNum,
+				__func__, pFlow->inPhyPortNum,
 				tbl_type);
 		goto err_ret;
 	}
@@ -3885,14 +3885,14 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 		if(cdx_ipsec_fill_sec_info(entry,info))
 		{
 			DPA_ERROR("%s::unable to get td for offline port, type %d\n",
-					__FUNCTION__, info->tbl_type);
+					__func__, info->tbl_type);
 			goto err_ret;
 		}
 	}
 #endif
 
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: td info :%p\n", __FUNCTION__, info->td);
+	DPA_INFO("%s:: td info :%p\n", __func__, info->td);
 #endif
 
 	//save table descriptor for entry release
@@ -3902,26 +3902,26 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	if (pFlow->hw_flow->fm_ctx == NULL)
 	{
 		DPA_ERROR("%s::failed to get ctx fro fm idx %d\n",
-				__FUNCTION__, info->fm_idx);
+				__func__, info->fm_idx);
 		goto err_ret;
 	}
 	if (!pToSocket->pRtEntry)
 	{
 		DPA_ERROR("%s:: No route entry for to_socket \n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 	if (!pToSocket->pRtEntry->input_itf)
 	{
 		DPA_INFO("%s(%d) pToSocket->pRtEntry->itf %p\n",
-				__FUNCTION__, __LINE__, pToSocket->pRtEntry->itf);
+				__func__, __LINE__, pToSocket->pRtEntry->itf);
 		pToSocket->pRtEntry->input_itf =  pToSocket->pRtEntry->itf;
 	}
 
 	if (!pToSocket->pRtEntry->underlying_input_itf)
 	{
 		DPA_INFO("%s(%d) pToSocket->pRtEntry->itf %p\n",
-				__FUNCTION__, __LINE__, pToSocket->pRtEntry->itf);
+				__func__, __LINE__, pToSocket->pRtEntry->itf);
 		pToSocket->pRtEntry->underlying_input_itf = pToSocket->pRtEntry->itf;
 	}
 	{
@@ -3933,24 +3933,24 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 					&info->l3_info, NULL, &qosmark, (uint32_t)pToSocket->hash))
 		{	
 			DPA_ERROR("%s::unable to get tx params\n",
-					__FUNCTION__);
+					__func__);
 			goto err_ret;
 		}
 	}
 
 	//allocate hash table entry
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::info->td %p\n", __FUNCTION__, info->td);
+	DPA_INFO("%s::info->td %p\n", __func__, info->td);
 #endif
 	tbl_entry = ExternalHashTableAllocEntry(info->td);
 	if (!tbl_entry)
 	{
 		DPA_ERROR("%s::unable to alloc hash tbl memory\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s:: hash tbl entry %p\n", __FUNCTION__, tbl_entry);
+	DPA_INFO("%s:: hash tbl entry %p\n", __func__, tbl_entry);
 #endif
 	flags = 0;
 #ifdef ENABLE_FLOW_TIME_STAMPS
@@ -3968,7 +3968,7 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	if (!key_size)
 	{
 		DPA_ERROR("%s::unable to compose key\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret;
 	}	
 
@@ -3991,7 +3991,7 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - GET_PARAM_OFFSET(flags));
 	if (cdx_rtpflow_fill_actions(pFromSocket, pToSocket, pFlow, info))
 	{
-		DPA_ERROR("%s::unable to fill actions\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
 	tbl_entry->enqueue_params = info->enqueue_params;
@@ -4002,7 +4002,7 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 	//insert entry into hash table
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry); 
 	if (retval == -1) {
-		DPA_ERROR("%s::unable to add entry in hash table\n", __FUNCTION__);
+		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;
 	}	
 	pFlow->hw_flow->eeh_entry_index = (uint16_t)retval;
@@ -4064,7 +4064,7 @@ void cdx_ehash_set_rtp_info_params(uint8_t *rtp_relay_param, PRTPflow pFlow, PSo
 	{
 		rtp_flags |= EEH_RTP_ENABLE_VLAN_P_BIT_LEARN;
 		DPA_INFO("%s(%d) enabling VLAN p bit learning feature in UCODE\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 	}
 
 	param->rtp_flags = cpu_to_be16(rtp_flags);

@@ -87,7 +87,7 @@ static inline struct dpa_bp *ipr_bpid2pool(uint32_t bpid)
 {
 #ifdef CDX_IPR_DEBUG
 	CDX_IPR_DPRINT("%s:;bpid %d, reass %d, frag %d\n",
-			__FUNCTION__, bpid, reassly_bp->bpid,
+			__func__, bpid, reassly_bp->bpid,
 			ipr_frag_bp->bpid);
 #endif
 	if (bpid == reassly_bp->bpid)
@@ -117,7 +117,7 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 	dma_sync_single_for_cpu(reassly_bp->dev, addr, reassly_bp->size, DMA_BIDIRECTIONAL);
 	bufstart = (char *)phys_to_virt(addr);
 #ifdef CDX_IPR_DEBUG	
-	CDX_IPR_DPRINT("%s::\n", __FUNCTION__);
+	CDX_IPR_DPRINT("%s::\n", __func__);
 	CDX_IPR_DPRINT("fqid %x(%d) bpid %d addr %x:%08x status %08x offset %d addr %llx\n",
 			dq->fqid, dq->fqid, dq->fd.bpid,
 			dq->fd.addr_hi, dq->fd.addr_lo, dq->fd.status, offset, 
@@ -178,11 +178,11 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 #endif
 				if (bman_release(bp->pool, &buf, 1, 0)) {
 					DPA_ERROR("%s::bman release failed\n", 
-							__FUNCTION__);
+							__func__);
 				}
 			} else {
 				DPA_ERROR("%s::unable to get bp for id %d\n", 
-						__FUNCTION__, buf.bpid);
+						__func__, buf.bpid);
 			}
 			list++;
 		}
@@ -212,11 +212,11 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 	}
 	if (!num_portals) {
 		DPA_ERROR("%s::unable to get affined portal info\n",
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 #ifdef DEVMAN_DEBUG
-	CDX_IPR_DPRINT("%s::num_portals %d ::", __FUNCTION__, num_portals);
+	CDX_IPR_DPRINT("%s::num_portals %d ::", __func__, num_portals);
 	for (ii = 0; ii < num_portals; ii++)
 		CDX_IPR_DPRINT("%d ", portal_channel[ii]);
 	CDX_IPR_DPRINT("\n");
@@ -224,12 +224,12 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 	if (qman_alloc_fqid_range(&fqid_base, num_portals, num_portals, 0) 
 			!= num_portals) {
 		DPA_ERROR("%s::unable to get ipr fqids\n",
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 #ifdef DEVMAN_DEBUG
 	CDX_IPR_DPRINT("%s::fqid_base %x(%d), num %d\n",
-			__FUNCTION__, fqid_base, fqid_base, num_portals);
+			__func__, fqid_base, fqid_base, num_portals);
 #endif
 	//create fqs
 	fqid = fqid_base;
@@ -238,7 +238,7 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 			dpa_fq = kzalloc(sizeof(struct dpa_fq), 0);
 			if (!dpa_fq) {
 				DPA_ERROR("%s::unable to alloc mem for "
-						"fqid %d\n", __FUNCTION__, fqid);
+						"fqid %d\n", __func__, fqid);
 				return -1;
 			}
 			memset(dpa_fq, 0, sizeof(struct dpa_fq));
@@ -255,20 +255,20 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 			//create PCD FQ
 			if (cdx_create_fq(dpa_fq, 0, NULL)) {
 				DPA_ERROR("%s::cdx_create_fq failed for "
-						"fqid %d\n", __FUNCTION__, fqid);
+						"fqid %d\n", __func__, fqid);
 				kfree(dpa_fq);
 				return -1;
 			}
 			add_pcd_fq_info(dpa_fq);
 #ifdef DEVMAN_DEBUG
 			CDX_IPR_DPRINT("%s::fqid 0x%x created chnl 0x%x\n", 
-					__FUNCTION__, fqid, dpa_fq->channel);
+					__func__, fqid, dpa_fq->channel);
 #endif
 		} 
 #ifdef DEVMAN_DEBUG
 		else {
 			CDX_IPR_DPRINT("%s::fqid 0x%x already created\n", 
-					__FUNCTION__, fqid);
+					__func__, fqid);
 		}
 #endif
 		fqid++;
@@ -291,10 +291,10 @@ static inline int fill_ipr_bpool(struct dpa_bp *bp, struct dpa_bp *bp_parent, ui
 			break;
 #ifdef CDX_IPR_DEBUG
 		CDX_IPR_DPRINT("%s::moving buffer %p to pool %d\n",
-				__FUNCTION__, (void *)(uint64_t)(buf.addr), bp->bpid);
+				__func__, (void *)(uint64_t)(buf.addr), bp->bpid);
 #endif
 		if (bman_release(bp->pool, &buf, 1, 0)) {
-			DPA_ERROR("%s::bman release failed\n", __FUNCTION__);
+			DPA_ERROR("%s::bman release failed\n", __func__);
 			break;
 		}
 		buffer_count++;
@@ -311,7 +311,7 @@ static inline struct dpa_bp *create_ipr_bpool(uint32_t size, uint32_t count,
 	bp = kzalloc(sizeof(struct dpa_bp), 0);
 	if (unlikely(bp == NULL)) {
 		DPA_ERROR("%s::failed to allocate mem for bman pool for reassly\n", 
-				__FUNCTION__);
+				__func__);
 		return NULL;
 	}
 	bp->dev = bp_parent->dev;
@@ -323,22 +323,22 @@ static inline struct dpa_bp *create_ipr_bpool(uint32_t size, uint32_t count,
 		bp->config_count = count;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPA_ERROR("%s::dpa_bp_alloc failed for reassly\n", 
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return NULL;
 	}
-	CDX_IPR_DPRINT("%s::allocated pool %d bp->size :%zu\n", __FUNCTION__, bp->bpid, bp->size);
-	printk("%s::allocated pool %d bp->size :%zu\n", __FUNCTION__, bp->bpid, bp->size);
+	CDX_IPR_DPRINT("%s::allocated pool %d bp->size :%zu\n", __func__, bp->bpid, bp->size);
+	printk("%s::allocated pool %d bp->size :%zu\n", __func__, bp->bpid, bp->size);
 	if (count) {
 		buffer_count = fill_ipr_bpool(bp, bp_parent, count);
 		if (buffer_count) {
 			CDX_IPR_DPRINT("%s::%d buffers added to pool %d\n",
-					__FUNCTION__, buffer_count, bp->bpid);
+					__func__, buffer_count, bp->bpid);
 			printk("%s::%d buffers added to pool %d\n",
-					__FUNCTION__, buffer_count, bp->bpid);
+					__func__, buffer_count, bp->bpid);
 		} else {
 			CDX_IPR_DPRINT("%s::no buffers added to pool %d\n",
-					__FUNCTION__, bp->bpid);
+					__func__, bp->bpid);
 		}
 	}
 	return bp;
@@ -356,7 +356,7 @@ static int replenish_ipr_frag_pool(struct net_device *net_dev, u32 bpid)
 		bp = dpa_bpid2pool(bpid);
 		if (fill_ipr_bpool(bp, bp_parent, 1) != 1) {
 			DPA_ERROR("%s::No buffers replenished to pool %d\n!!!!!\n",
-					__FUNCTION__, bpid);
+					__func__, bpid);
 			return -1;
 		}
 	}
@@ -375,7 +375,7 @@ static int ipr_timer(void *data)
 
 static void cdx_deinit_ip_reassembly(void)
 {
-	printk("%s::implement this\n", __FUNCTION__);
+	printk("%s::implement this\n", __func__);
 	return;
 }
 
@@ -385,17 +385,17 @@ int cdx_init_ip_reassembly(void)
 	uint32_t fqid; 
 	int num_fqs;
 
-	printk("%s::\n", __FUNCTION__);
+	printk("%s::\n", __func__);
 	//find pools used by ethernet devices and borrow buffers from it
 	if (get_phys_port_poolinfo_bysize(ipr_info.ipr_ctx_bsize, 
 				&reassly_ctx_parent_pool_info)) {
 		DPA_ERROR("%s::failed to locate eth bman pool for reassly\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 	bp_parent = dpa_bpid2pool(reassly_ctx_parent_pool_info.pool_id);
 	CDX_IPR_DPRINT("%s::parent bman pool for reassly - bp %p, bpid %d paddr %lx vaddr %p dev %p\n", 
-			__FUNCTION__, bp_parent, reassly_ctx_parent_pool_info.pool_id,
+			__func__, bp_parent, reassly_ctx_parent_pool_info.pool_id,
 			(unsigned long)bp_parent->paddr, bp_parent->vaddr, bp_parent->dev);
 
 	reassly_bp = create_ipr_bpool(ipr_info.ipr_ctx_bsize, 
@@ -403,7 +403,7 @@ int cdx_init_ip_reassembly(void)
 			bp_parent);
 	if (!reassly_bp) {
 		DPA_ERROR("%s::failed to create pool for reassly context\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 	//create thread for updating ip reassembly time stamp location
@@ -413,21 +413,21 @@ int cdx_init_ip_reassembly(void)
 		DPA_ERROR(KERN_ERR "%s: kthread_create() failed\n", __func__);
 		return -1;
 	}
-	CDX_IPR_DPRINT("%s::created ipr timer thread %p\n", __FUNCTION__,
+	CDX_IPR_DPRINT("%s::created ipr timer thread %p\n", __func__,
 			ipr_timer_thread);
-	CDX_IPR_DPRINT("%s::context pool %d bp->size :%zu\n", __FUNCTION__, 
+	CDX_IPR_DPRINT("%s::context pool %d bp->size :%zu\n", __func__, 
 			reassly_bp->bpid, reassly_bp->size);
 
 	//find pools used by ethernet devices and borrow buffers from it
 	if (get_phys_port_poolinfo_bysize(ipr_info.ipr_frag_bsize, 
 				&reassly_frag_parent_pool_info)) {
 		DPA_ERROR("%s::failed to locate eth bman pool for frag buffs\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 	bp_parent = dpa_bpid2pool(reassly_frag_parent_pool_info.pool_id);
 	CDX_IPR_DPRINT("%s::parent bman pool for reassly - bp %p, bpid %d paddr %lx vaddr %p dev %p\n", 
-			__FUNCTION__, bp_parent, reassly_frag_parent_pool_info.pool_id,
+			__func__, bp_parent, reassly_frag_parent_pool_info.pool_id,
 			(unsigned long)bp_parent->paddr, bp_parent->vaddr, bp_parent->dev);
 
 	ipr_frag_bp = create_ipr_bpool(ipr_info.ipr_frag_bsize, 
@@ -435,17 +435,17 @@ int cdx_init_ip_reassembly(void)
 			bp_parent);
 	if (!ipr_frag_bp) {
 		DPA_ERROR("%s::failed to create pool for ipr fragments\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 	num_fqs = cdx_create_ipr_fq(&fqid);
 	if (num_fqs == -1) {
 		DPA_ERROR("%s::unable to create txconf fqids for IPV4_REASSM\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 	CDX_IPR_DPRINT("%s::ipr txconf fqbase %x(%d), num fqs %d\n",
-			__FUNCTION__, fqid, fqid, num_fqs);
+			__func__, fqid, fqid, num_fqs);
 	//push num fqs into upper bytes of the fields
 	fqid |= (num_fqs << 24);
 	if (ExternalHashSetReasslyPool(IPV4_REASSM_TABLE, reassly_bp->bpid, 
@@ -455,7 +455,7 @@ int cdx_init_ip_reassembly(void)
 				fqid,
 				IPR_TIMER_FREQUENCY)) {
 		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}	
 	if (ExternalHashSetReasslyPool(IPV6_REASSM_TABLE , 
@@ -466,7 +466,7 @@ int cdx_init_ip_reassembly(void)
 				fqid,
 				IPR_TIMER_FREQUENCY)) {
 		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 	//register hook to replenish frag buffer pool
@@ -479,7 +479,7 @@ int cdx_get_ipr_v4_stats(void *resp)
 {
 	struct ipr_statistics *ipr_stats;
 
-	printk("%s:cdx_reassem_txc %d\n", __FUNCTION__, cdx_reassem_txc);
+	printk("%s:cdx_reassem_txc %d\n", __func__, cdx_reassem_txc);
 	ipr_stats = (struct ipr_statistics *)resp;
 	if (get_ip_reassem_info(IPV4_REASSM_TABLE, &ipr_stats->info))
 		return -1;	
@@ -489,7 +489,7 @@ int cdx_get_ipr_v6_stats(void *resp)
 {
 	struct ipr_statistics *ipr_stats;
 
-	printk("%s:cdx_reassem_txc %d\n", __FUNCTION__, cdx_reassem_txc);
+	printk("%s:cdx_reassem_txc %d\n", __func__, cdx_reassem_txc);
 	ipr_stats = (struct ipr_statistics *)resp;
 	if (get_ip_reassem_info(IPV6_REASSM_TABLE, &ipr_stats->info))
 		return -1;	

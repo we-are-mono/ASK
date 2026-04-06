@@ -79,35 +79,35 @@ int cdx_init_fqid_procfs(void)
 	proc_fqid_dir = proc_mkdir("fqid_stats", NULL);
 	if (!proc_fqid_dir)
 	{
-		printk("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
+		printk("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
 
 	proc_tx_dir = proc_mkdir("tx", proc_fqid_dir);
 	if (!proc_tx_dir)
 	{
-		printk("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
+		printk("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
 
 	proc_pcd_dir = proc_mkdir("pcd", proc_fqid_dir);
 	if (!proc_pcd_dir)
 	{
-		printk("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
+		printk("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
 
 	proc_rx_dir = proc_mkdir("rx", proc_fqid_dir);
 	if (!proc_rx_dir)
 	{
-		printk("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
+		printk("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
 
 	proc_sa_dir = proc_mkdir("sa", proc_fqid_dir);
 	if (!proc_sa_dir)
 	{
-		printk("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
+		printk("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
 
@@ -157,7 +157,7 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 	proc_entry->proc_dir = proc_mkdir(name, proc_parent_dir_entry);
 	if (!proc_entry->proc_dir)
 	{
-		printk("%s(%d) proc_mkdir failed \n",__FUNCTION__,__LINE__);
+		printk("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
 #ifdef CDX_DPA_DEBUG
@@ -209,7 +209,7 @@ static int cdx_create_fq_in_procfs(struct qman_fq *fq,
 
 	if (!proc_dir)
 	{
-		printk("%s(%d) Proc Dir is not present.\n", __FUNCTION__,__LINE__);
+		printk("%s(%d) Proc Dir is not present.\n", __func__,__LINE__);
 		return -1;
 	}
 
@@ -230,7 +230,7 @@ static int cdx_create_fq_in_procfs(struct qman_fq *fq,
 	if (!node->proc_fs)
 	{
 		kfree(node);
-		printk("%s(%d) proc_create_data failed\n",__FUNCTION__,__LINE__);
+		printk("%s(%d) proc_create_data failed\n",__func__,__LINE__);
 		return -1;
 	}
 	if (fqid_files_g)

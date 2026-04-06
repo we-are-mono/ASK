@@ -23,7 +23,7 @@ static cdx_deinit_func deinit_fn[MAX_CDX_INIT_FUNCTIONS];
 void register_cdx_deinit_func(cdx_deinit_func func)
 {
 	if (init_level == MAX_CDX_INIT_FUNCTIONS) {
-		printk("%s::cant register deinit function, increase MAX_CDX_INIT_FUNCTIONS\n", __FUNCTION__);
+		printk("%s::cant register deinit function, increase MAX_CDX_INIT_FUNCTIONS\n", __func__);
 		return;
 	}
 	deinit_fn[init_level] = func;
@@ -92,7 +92,7 @@ static int start_dpa_app(void)
 	argv[0] = modprobe_path;
 	argv[1] = NULL;
 	retval = 0;
-	printk("%s::calling dpa_app argv %p\n", __FUNCTION__, argv);
+	printk("%s::calling dpa_app argv %p\n", __func__, argv);
 	info = call_usermodehelper_setup(modprobe_path, argv, envp, GFP_KERNEL,
 			NULL, cdx_free_modprobe_argv, NULL);
 	if (info) {
@@ -122,7 +122,7 @@ static int cdx_init_device(void)
 	cdx_info->dev.release = cdx_dev_release;
 	rc = device_register(&cdx_info->dev);
 	if (rc != 0)
-		printk("%s::device_register failed\n", __FUNCTION__);
+		printk("%s::device_register failed\n", __func__);
 	else
 		register_cdx_deinit_func(cdx_deinit_device);
 	return rc;
@@ -162,22 +162,22 @@ static int __init cdx_module_init(void)
 	}
 	rc = cdx_init_device();
 	if (rc != 0) {
-		printk("%s::cdx_init_device failed\n", __FUNCTION__);
+		printk("%s::cdx_init_device failed\n", __func__);
 		goto exit;
 	}
 	rc = cdx_ctrl_init(cdx_info);
 	if (rc != 0) {
-		printk("%s::cdx_ctrl_init failed\n", __FUNCTION__);
+		printk("%s::cdx_ctrl_init failed\n", __func__);
 		goto exit;
 	}
 	rc = devman_init_linux_stats();
 	if (rc != 0)  {
-		printk("%s::devman_init call to register for linux stats failed\n", __FUNCTION__);
+		printk("%s::devman_init call to register for linux stats failed\n", __func__);
 		goto exit;
 	}
 	rc = cdx_driver_init();
 	if (rc != 0)  {
-		printk("%s::cdx_driver_init failed\n", __FUNCTION__);
+		printk("%s::cdx_driver_init failed\n", __func__);
 		goto exit;
 	}
 	/* creating a /proc/fqid_stats dir for listing fqids created by cdx module */
@@ -185,49 +185,49 @@ static int __init cdx_module_init(void)
 #ifdef START_DPA_APP
 	rc = start_dpa_app();
 	if (rc != 0)  {
-		printk("%s::start_dpa_app failed rc %d\n", __FUNCTION__, rc);
+		printk("%s::start_dpa_app failed rc %d\n", __func__, rc);
 		/* cant pass error code from start_dpa_app */
 		rc = -EIO;
 		goto exit;
 	}
-	printk("%s::start_dpa_app successful\n", __FUNCTION__);
+	printk("%s::start_dpa_app successful\n", __func__);
 #endif
 #ifdef CFG_WIFI_OFFLOAD
 	rc = dpaa_vwd_init();
 	if (rc != 0)  {
-		printk("%s::vwd_driver_init failed\n", __FUNCTION__);
+		printk("%s::vwd_driver_init failed\n", __func__);
 		goto exit;
 	}
 #endif
 	// initialize global fragmentation params
 	if (cdx_init_frag_module()) { 
-		printk("%s::cdx_init_frag_module failed\n", __FUNCTION__);
+		printk("%s::cdx_init_frag_module failed\n", __func__);
 		rc = -EIO;
 		goto exit;
 	}
 
 #ifdef DPA_IPSEC_OFFLOAD
 	if (cdx_dpa_ipsec_init()) {
-		printk("%s::dpa_ipsec start failed\n", __FUNCTION__);
+		printk("%s::dpa_ipsec start failed\n", __func__);
 		goto exit;
 	}
 
 	if (cdx_init_scatter_gather_bpool()) {
-		printk("%s::cdx_init_scatter_gather_bpool failed\n",__FUNCTION__);
+		printk("%s::cdx_init_scatter_gather_bpool failed\n",__func__);
 		rc = -ENOMEM;
 		goto exit;
 	}
 	if (cdx_init_skb_2bfreed_bpool()) {
-		printk("%s(%d) : cdx_init_skb_2bfreed_bpool failed\n", __FUNCTION__,__LINE__);
+		printk("%s(%d) : cdx_init_skb_2bfreed_bpool failed\n", __func__,__LINE__);
 		rc = -ENOMEM;
 		goto exit;
 	}
 #endif
 
 #ifdef CDX_IP_REASSEMBLY
-	printk("%s::calling cdx_init_ip_reassembly\n", __FUNCTION__);
+	printk("%s::calling cdx_init_ip_reassembly\n", __func__);
 	if (cdx_init_ip_reassembly()) {
-		printk("%s::cdx_init_ip_reassembly failed\n", __FUNCTION__);
+		printk("%s::cdx_init_ip_reassembly failed\n", __func__);
 		rc = -EIO;
 		goto exit;
 	}

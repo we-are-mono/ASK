@@ -82,7 +82,7 @@ void *  get_oh_port_td(uint32_t fm_index, uint32_t port_idx, uint32_t type)
 
 #ifdef DEVOH_DEBUG
 	DPA_INFO("%s:get td idx %d for fman %d, port %d\n",
-			__FUNCTION__, offline_port_info[fm_index][port_idx].td[type], fm_index, port_idx);
+			__func__, offline_port_info[fm_index][port_idx].td[type], fm_index, port_idx);
 #endif
 	return offline_port_info[fm_index][port_idx].td[type] ;
 
@@ -107,12 +107,12 @@ int get_ofport_portid(uint32_t fm_idx, uint32_t handle, uint32_t *portid)
 	struct oh_port_info *info;
 
 	if (fm_idx >= MAX_FRAME_MANAGERS) {
-		DPA_ERROR("%s::invalid fman index\n", __FUNCTION__);
+		DPA_ERROR("%s::invalid fman index\n", __func__);
 		return -1;	
 	}
 	if (handle >= MAX_OF_PORTS) {
 		DPA_ERROR("%s::invalid ofport handle %d\n",
-				__FUNCTION__, handle);
+				__func__, handle);
 		return -1;	
 	}
 	info = &offline_port_info[fm_idx][handle];
@@ -125,12 +125,12 @@ int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **
 	struct oh_port_info *info;
 
 	if (fm_idx >= MAX_FRAME_MANAGERS) {
-		DPA_ERROR("%s::invalid fman index\n", __FUNCTION__);
+		DPA_ERROR("%s::invalid fman index\n", __func__);
 		return -1;	
 	}
 	if (handle >= MAX_OF_PORTS) {
 		DPA_ERROR("%s::invalid ofport handle %d\n",
-				__FUNCTION__, handle);
+				__func__, handle);
 		return -1;	
 	}
 	info = &offline_port_info[fm_idx][handle];
@@ -148,7 +148,7 @@ int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **
 		return 0;
 	}
 	DPA_ERROR("%s::ofport handle %d not in use\n",
-			__FUNCTION__, handle);
+			__func__, handle);
 	return -1;
 }
 /* This function returns max distributions configured for an OH port */ 
@@ -172,7 +172,7 @@ int alloc_offline_port(uint32_t fm_idx, uint32_t type, qman_cb_dqrr defa_rx, qma
 	struct oh_port_info *info;
 
 	if (fm_idx >= MAX_FRAME_MANAGERS) {
-		DPA_ERROR("%s::invalid fman index\n", __FUNCTION__);
+		DPA_ERROR("%s::invalid fman index\n", __func__);
 		return -1;	
 	}
 	type &= PORT_TYPE_MASK;
@@ -196,7 +196,7 @@ int alloc_offline_port(uint32_t fm_idx, uint32_t type, qman_cb_dqrr defa_rx, qma
 			}
 		}
 	}
-	DPA_ERROR("%s::no free of ports\n", __FUNCTION__);
+	DPA_ERROR("%s::no free of ports\n", __func__);
 	return -1;
 }
 
@@ -205,11 +205,11 @@ int release_offline_port(uint32_t fm_idx, int handle)
 	struct oh_port_info *info;
 
 	if (fm_idx >= MAX_FRAME_MANAGERS) {
-		DPA_ERROR("%s::invalid fman index\n", __FUNCTION__);
+		DPA_ERROR("%s::invalid fman index\n", __func__);
 		return -1;
 	}
 	if (handle >= MAX_OF_PORTS) {
-		DPA_ERROR("%s::invalid port index\n", __FUNCTION__);
+		DPA_ERROR("%s::invalid port index\n", __func__);
 		return -1;
 	}
 	info = &offline_port_info[fm_idx][handle];
@@ -221,7 +221,7 @@ int release_offline_port(uint32_t fm_idx, int handle)
 		info->err_dpa_fq->fq_base.cb.dqrr = ofport_rx_err;
 		return 0;
 	}	
-	DPA_ERROR("%s::port was not in use\n", __FUNCTION__);
+	DPA_ERROR("%s::port was not in use\n", __func__);
 	return -1;
 }
 
@@ -319,19 +319,19 @@ int dpa_add_oh_if(char *name)
 
 	if (sscanf(name, "dpa-fman%d-oh@%d", &fman_idx,
 				&port_idx) != 2) {
-		DPA_ERROR("%s::invalid name %s\n", __FUNCTION__, name);
+		DPA_ERROR("%s::invalid name %s\n", __func__, name);
 		return FAILURE;
 	}
 	strncpy(&info.port_name[0], name, IF_NAME_SIZE);
 	info.port_name[IF_NAME_SIZE - 1] = '\0';
 
 	if (sprintf(oh_iface_name, "oh%d", port_idx-1) < 0) {
-		DPA_ERROR("%s::invalid port_idx %u\n", __FUNCTION__, port_idx);
+		DPA_ERROR("%s::invalid port_idx %u\n", __func__, port_idx);
 		return FAILURE;
 	}
 
 	if (oh_port_driver_get_port_info(&info)) {
-		DPA_ERROR("%s::oh_port_driver_get_port_info failed\n", __FUNCTION__);
+		DPA_ERROR("%s::oh_port_driver_get_port_info failed\n", __func__);
 		return FAILURE;
 	}
 	//ethernet/physical iface type
@@ -339,7 +339,7 @@ int dpa_add_oh_if(char *name)
 		kzalloc(sizeof(struct dpa_iface_info), 0);
 	if (!iface_info) {
 		DPA_ERROR("%s::no mem for eth dev info size %d\n",
-				__FUNCTION__,
+				__func__,
 				(uint32_t)sizeof(struct dpa_iface_info));
 		return FAILURE;
 	}
@@ -358,31 +358,31 @@ int dpa_add_oh_if(char *name)
 	//get info from config
 	if (get_dpa_oh_iface_info(&iface_info->oh_info, name)) {
 		DPA_ERROR("%s::get_dpa_oh_iface_info failed %s\n",
-				__FUNCTION__, name);
+				__func__, name);
 		goto err_ret;
 	}
 	if (cdx_create_dir_in_procfs(&iface_info->pcd_proc_entry, oh_iface_name, PCD_DIR)) {
 		DPA_ERROR("%s:: create pcd proc entry failed %s\n", 
-				__FUNCTION__, name);
+				__func__, name);
 		goto err_ret;
 	}
 
 	if (cdx_create_dir_in_procfs(&iface_info->rx_proc_entry, oh_iface_name, RX_DIR)) {
 		DPA_ERROR("%s:: create pcd proc entry failed %s\n", 
-				__FUNCTION__, name);
+				__func__, name);
 		goto err_ret;
 	}
 
 	if (cdx_create_dir_in_procfs(&iface_info->tx_proc_entry, oh_iface_name, TX_DIR)) {
 		DPA_ERROR("%s:: create pcd proc entry failed %s\n", 
-				__FUNCTION__, name);
+				__func__, name);
 		goto err_ret;
 	}
 
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n", 
-				__FUNCTION__); 
+				__func__); 
 		goto err_ret;
 	}
 #ifdef DEVOH_DEBUG
@@ -403,18 +403,18 @@ int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
 	struct oh_port_info *info;
 
 	if (fm_idx >= MAX_FRAME_MANAGERS) {
-		DPA_ERROR("%s::invalid fman index\n", __FUNCTION__);
+		DPA_ERROR("%s::invalid fman index\n", __func__);
 		return -1;
 	}
 	if (handle >= MAX_OF_PORTS) {
 		DPA_ERROR("%s::invalid ofport handle %d\n",
-				__FUNCTION__, handle);
+				__func__, handle);
 		return -1;
 	}
 	info = &offline_port_info[fm_idx][handle];
 	if (!(info->flags & IN_USE)) {
 		DPA_ERROR("%s::ofport handle %d not in use\n",
-				__FUNCTION__, handle);
+				__func__, handle);
 		return -1;
 	}
 	iface_info = info->ohinfo;	
@@ -441,7 +441,7 @@ static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struc
 	len = dq->fd.length20;
 
 	fd = &dq->fd;
-	printk("%s::fqid %x(%d), bpid %d, len %d, offset %d  addr %llx status: %x\n", __FUNCTION__,
+	printk("%s::fqid %x(%d), bpid %d, len %d, offset %d  addr %llx status: %x\n", __func__,
 			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
 			dq->fd.offset, (uint64_t)dq->fd.addr, dq->fd.status);
 	if(len)
@@ -460,14 +460,14 @@ static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struc
 			dpa_bp = dpa_bpid2pool(fd->bpid);
 			if (dpa_bp) {
 				printk(KERN_CRIT "%s::releasing buffer to pool %d\n", 
-						__FUNCTION__, fd->bpid);
+						__func__, fd->bpid);
 				memset(&bmb, 0, sizeof(struct bm_buffer));
 				bm_buffer_set64(&bmb, dq->fd.addr);
 				while (bman_release(dpa_bp->pool, &bmb, 1, 0))
 					cpu_relax();
 			}
 		} else {
-			printk(KERN_CRIT "%s::cannot handle sg buffers now\n", __FUNCTION__);
+			printk(KERN_CRIT "%s::cannot handle sg buffers now\n", __func__);
 		}
 	}
 	return qman_cb_dqrr_consume;
@@ -484,7 +484,7 @@ static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct
 
 	len = dq->fd.length20;
 	fd = &dq->fd;
-	printk("%s::fqid %x(%d), bpid %d status %08x, len %d(0x%x), format %s\n", __FUNCTION__,
+	printk("%s::fqid %x(%d), bpid %d status %08x, len %d(0x%x), format %s\n", __func__,
 			fq->fqid, fq->fqid, fd->bpid, fd->status,len,len,
 			(fd->format == qm_fd_sg) ? "SGlist" : "simple");
 	if(len)	
@@ -508,14 +508,14 @@ static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct
 			dpa_bp = dpa_bpid2pool(fd->bpid);
 			if (dpa_bp) {
 				printk(KERN_CRIT "%s::releasing buffer to pool %d\n", 
-						__FUNCTION__, fd->bpid);
+						__func__, fd->bpid);
 				memset(&bmb, 0, sizeof(struct bm_buffer));
 				bm_buffer_set64(&bmb, dq->fd.addr);
 				while (bman_release(dpa_bp->pool, &bmb, 1, 0))
 					cpu_relax();
 			}
 		} else {
-			printk(KERN_CRIT "%s::freeing sg buffers now\n", __FUNCTION__);
+			printk(KERN_CRIT "%s::freeing sg buffers now\n", __func__);
 			dpa_fd_release(NULL, fd);
 		}
 	}
@@ -539,7 +539,7 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 		dpa_fq = kzalloc(sizeof(struct dpa_fq), 0);
 		if (!dpa_fq) {
 			DPA_ERROR("%s::unable to alloc mem for defa or err fqid\n",
-					__FUNCTION__);
+					__func__);
 			port_info->rx_dpa_fq = NULL;
 			port_info->err_dpa_fq = NULL;
 			return -1;
@@ -548,7 +548,7 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 		//use channel and wq the same as any other ethernet port
 		if (cdx_copy_eth_rx_channel_info(iface_info->fman_idx, dpa_fq)) {
 			DPA_ERROR("%s::cdx_copy_eth_rx_channel_info failed\n",
-					__FUNCTION__);
+					__func__);
 			port_info->rx_dpa_fq = NULL;
 			port_info->err_dpa_fq = NULL;
 			kfree(dpa_fq);
@@ -571,7 +571,7 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 		//create FQ
 		if (cdx_create_fq(dpa_fq, 0, dpa_oh_iface_info->pcd_proc_entry)) {
 			DPA_ERROR("%s::cdx_create_fq failed for fqid %d\n",
-					__FUNCTION__, dpa_fq->fqid);
+					__func__, dpa_fq->fqid);
 			port_info->rx_dpa_fq = NULL;
 			port_info->err_dpa_fq = NULL;
 			kfree(dpa_fq);
@@ -580,7 +580,7 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 		add_pcd_fq_info(dpa_fq);
 #ifdef DEVOH_DEBUG
 		DPA_INFO("%s::%d, fqid 0x%x created chnl 0x%x\n",
-				__FUNCTION__, ii, dpa_fq->fqid, dpa_fq->channel);
+				__func__, ii, dpa_fq->fqid, dpa_fq->channel);
 #endif
 	}
 	//add fqid information into of port list
@@ -595,7 +595,7 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 		if (strcmp(ohport_assign[ii].name, &port_info->name[0]) == 0) {
 			port_info->flags |= ohport_assign[ii].type;
 #ifdef DEVOH_DEBUG
-			DPA_INFO("%s::port %s, type %x\n", __FUNCTION__,
+			DPA_INFO("%s::port %s, type %x\n", __func__,
 					port_info->name, ohport_assign[ii].type);
 #endif
 			break;

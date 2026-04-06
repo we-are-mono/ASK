@@ -49,13 +49,13 @@ static struct dpa_bp *dpa_vsp_bp_probe(struct net_device *net_dev)
 	dpa_vsp_bp->free_buf_cb = _dpa_bp_free_pf;
 	dpa_vsp_bp->dev = net_dev->dev.parent;
 	if (dpa_bp_alloc(dpa_vsp_bp, dpa_vsp_bp->dev)) {
-		dev_err(net_dev->dev.parent,"%s::dpa_bp_alloc failed for VSP\n", __FUNCTION__);
+		dev_err(net_dev->dev.parent,"%s::dpa_bp_alloc failed for VSP\n", __func__);
 		devm_kfree(net_dev->dev.parent,dpa_vsp_bp);
 		goto out;
 	}
 	gs_dpa_vsp_bp = dpa_vsp_bp;
 #ifdef CDX_DPA_DEBUG
-	pr_info("%s:: VSP BPID %d created config_count %d \n",__FUNCTION__,dpa_vsp_bp->bpid, dpa_vsp_bp->config_count);
+	pr_info("%s:: VSP BPID %d created config_count %d \n",__func__,dpa_vsp_bp->bpid, dpa_vsp_bp->config_count);
 #endif
 	return dpa_vsp_bp;
 out:
@@ -137,7 +137,7 @@ int dpa_add_virt_storage_profile(struct net_device *net_dev,
 	}
 #ifdef CDX_DPA_DEBUG
 	pr_info("%s:Configured storage profile -relative id %u bpid %u size %u for %s\n",
-			__FUNCTION__,
+			__func__,
 			1,
 			fmVspParams.extBufPools.extBufPool[0].id ,
 			fmVspParams.extBufPools.extBufPool[0].size,

@@ -367,7 +367,7 @@ found:
 				pppoe_free(pEntry);
 				return ERR_CREATION_FAILED;
 			}
-			//printk("%s::adding dpa pppoe iface\n", __FUNCTION__);
+			//printk("%s::adding dpa pppoe iface\n", __func__);
 
 			if (dpa_add_pppoe_if(cmd->log_intf,  &pEntry->itf, 
 						phys_onif->itf, pEntry->DstMAC,
@@ -607,13 +607,13 @@ static U16 pppoe_stats_get(pPPPoE_Info pEntry, PStatPPPoEEntryResponse snapshot,
 	if ((iface_info = dpa_get_ifinfo_by_itfid((uint32_t)pEntry->itf.index)) == NULL)
 	{
 		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __FUNCTION__, pEntry->itf.index);
+		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, pEntry->itf.index);
 		return ERR_UNKNOWN_INTERFACE;
 	}
 	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
-		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __FUNCTION__, ret);
+		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
 
@@ -647,7 +647,7 @@ static U16 stat_PPPoE_Get_Session_Snapshot(int stat_pppoe_hash_index, int stat_t
 		if ((ret = pppoe_stats_get(pStatPPPoEEntry, pStatPPPoESnapshot,
 						gStatPPPoEQueryStatus & STAT_PPPOE_QUERY_RESET)) != NO_ERR)
 		{
-			DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __FUNCTION__, ret);
+			DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 			return ret;
 		}
 

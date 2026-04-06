@@ -472,7 +472,7 @@ int cmmFeCtUpdate4(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		if (ctEntry->flags & FLOW_NO_ORIG_SA)
 		{
 			cmm_print(DEBUG_INFO, "%s(%d) NO FLOW SA , not setting SA related info\n",
-					__FUNCTION__,__LINE__);
+					__func__,__LINE__);
 			cmd.format |= CT_SECURE;
 			goto proceedv4_if_flow_no_orig_sa;
 		}
@@ -498,7 +498,7 @@ proceedv4_if_flow_no_orig_sa:
 		{
 			cmd.format |= CT_SECURE;
 			cmm_print(DEBUG_INFO, "%s(%d) NO FLOW SA , not setting SA related info\n",
-					__FUNCTION__,__LINE__);
+					__func__,__LINE__);
 			goto proceedv4_if_flow_no_repl_sa;
 		}
 
@@ -827,7 +827,7 @@ int cmmFeCtUpdate6(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		if (ctEntry->flags & FLOW_NO_ORIG_SA)
 		{
 			cmm_print(DEBUG_INFO, "%s(%d) NO FLOW SA , not setting SA related info\n",
-					__FUNCTION__,__LINE__);
+					__func__,__LINE__);
 			cmd.format |= CT_SECURE;
 			goto proceedv6_if_flow_no_orig_sa;
 		}	
@@ -853,7 +853,7 @@ proceedv6_if_flow_no_orig_sa:
 		if (ctEntry->flags & FLOW_NO_REPL_SA)
 		{
 			cmm_print(DEBUG_INFO, "%s(%d) NO FLOW SA , not setting SA related info\n",
-					__FUNCTION__,__LINE__);
+					__func__,__LINE__);
 			cmd.format |= CT_SECURE;
 			goto proceedv6_if_flow_no_repl_sa;
 		}

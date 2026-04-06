@@ -102,7 +102,7 @@ static enum qman_cb_dqrr_result voip_traffic_rx_handle(struct qman_portal *porta
 						count_ptr);
 			}
 		} else {
-			DPA_ERROR(KERN_CRIT "%s::cannot handle sg buffers now i %d\n", __FUNCTION__, i++);
+			DPA_ERROR(KERN_CRIT "%s::cannot handle sg buffers now i %d\n", __func__, i++);
 		}
 	}
 	return qman_cb_dqrr_consume;
@@ -136,7 +136,7 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 	iface_info->eth_info.ucNumFqs = 0;
 	if ((ucChannelType != DEDICATED_CHANNEL) && (ucChannelType != POOL_CHANNEL))
 	{
-		DPA_ERROR("%s::%d Invalid Channel type(0x%x).\n", __FUNCTION__, __LINE__, ucChannelType);
+		DPA_ERROR("%s::%d Invalid Channel type(0x%x).\n", __func__, __LINE__, ucChannelType);
 		return -1;
 	}
 	if (ucChannelType == POOL_CHANNEL)
@@ -144,18 +144,18 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 		if (usNoFqs == 0)
 		{
 			DPA_ERROR("%s::%d Invalid no. of frame queues for pool channel(0x%x).\n", 
-					__FUNCTION__, __LINE__, usNoFqs);
+					__func__, __LINE__, usNoFqs);
 			return -1;
 		}
 		if ((iRxChannelId = dpa_get_channel()) < 0)
 		{
 			DPA_ERROR("%s::%d Failed to get the RX channel id.\n", 
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			return -1;
 		}
 #ifdef DEVMAN_DEBUG
 		DPA_ERROR("%s::%d Pool channels RX channel ID %d.\n", 
-				__FUNCTION__, __LINE__, iRxChannelId);
+				__func__, __LINE__, iRxChannelId);
 #endif
 	}
 	else
@@ -174,11 +174,11 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 		}
 		if (!usNoFqs) {
 			DPA_ERROR("%s::%d unable to get affined portal info\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 			return -1;
 		}
 #ifdef DEVMAN_DEBUG
-		DPA_ERROR("%s::%d Dedicated channels RX channel ID :", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s::%d Dedicated channels RX channel ID :", __func__, __LINE__);
 		for (iIndex = 0; iIndex < usNoFqs; iIndex++)
 			DPA_ERROR("%d ", uiPortalChannel[iIndex]);
 		DPA_ERROR("\n");
@@ -189,7 +189,7 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 	/* Create  memory for frame queues.*/
 	iface_info->eth_info.voip_fqs = kzalloc(sizeof(struct dpa_fq)*usNoFqs, 0);
 	if (!iface_info->eth_info.voip_fqs) {
-		DPA_ERROR("%s::err allocating dpa_fq mem\n", __FUNCTION__) ;
+		DPA_ERROR("%s::err allocating dpa_fq mem\n", __func__) ;
 		return -1;
 	}
 	dpa_fq = &iface_info->eth_info.voip_fqs[0];
@@ -199,7 +199,7 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 		/* FQ for voip traffic */
 		fq->cb.dqrr = voip_traffic_rx_handle;
 		if (qman_create_fq(0, QMAN_FQ_FLAG_DYNAMIC_FQID, fq)) {
-			DPA_ERROR("%s::%d unable to create fq.\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s::%d unable to create fq.\n", __func__, __LINE__);
 			goto err_ret;
 		}
 		dpa_fq->net_dev = iface_info->eth_info.net_dev;
@@ -224,7 +224,7 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 		opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
 		if (qman_init_fq(fq, QMAN_INITFQ_FLAG_SCHED, &opts)) {
 			DPA_ERROR("%s::%d qman_init_fq failed for fqid %d\n",
-					__FUNCTION__, __LINE__, fq->fqid);
+					__func__, __LINE__, fq->fqid);
 			/* TODO: In case of failure, qman_destroy_fq need to be called for all the fqs
 			for which initilization is done previously. And also iface_info->eth_info.voip_fqs
 			need to freed.
@@ -236,7 +236,7 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 		cdx_create_type_fqid_info_in_procfs(fq, UNSPECIFIED, NULL, NULL);
 #ifdef DEVMAN_DEBUG
 		DPA_ERROR("%s::%d created fq 0x%x chnl id 0x%x\n", 
-				__FUNCTION__, __LINE__, fq->fqid, opts.fqd.dest.channel);
+				__func__, __LINE__, fq->fqid, opts.fqd.dest.channel);
 #endif
 		iface_info->eth_info.ucNumFqs++;
 		dpa_fq++;
@@ -252,19 +252,19 @@ err_ret:
 
 		if (qman_retire_fq(fq, NULL)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		if (qman_oos_fq(fq)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::destroyed fq 0x%x chnl id 0x%x\n", 
-				__FUNCTION__, fq->fqid, eth_info->tx_channel_id);
+				__func__, fq->fqid, eth_info->tx_channel_id);
 #endif
 	}
 	kfree(iface_info->eth_info.voip_fqs);
@@ -309,21 +309,21 @@ int dpa_destroy_eth_if_voip_fqs(struct dpa_iface_info *iface_info)
 
 		if (qman_retire_fq(fq, NULL)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		if (qman_oos_fq(fq)) {
 			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 		printk("%s::desroyed fq 0x%x chnl id 0x%x\n", 
-				__FUNCTION__, fq->fqid, eth_info->tx_channel_id);
+				__func__, fq->fqid, eth_info->tx_channel_id);
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::destroyed fq 0x%x chnl id 0x%x\n", 
-				__FUNCTION__, fq->fqid, eth_info->tx_channel_id);
+				__func__, fq->fqid, eth_info->tx_channel_id);
 #endif
 		dpa_fq++;
 	}

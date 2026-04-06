@@ -36,7 +36,7 @@ static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t 
 	if (!channel) {
 		qm_ctx = (struct tQM_context_ctl *)ctx;
 		if (!qm_ctx) {
-			ceetm_err("%s::invalid channel context\n", __FUNCTION__);
+			ceetm_err("%s::invalid channel context\n", __func__);
 			return NULL;
 		}
 		/* get least prio channel on this interface */
@@ -46,7 +46,7 @@ static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t 
 				break;
 			channel--;
 		}
-		ceetm_dbg("%s::incoming channel reassigned as %d\n", __FUNCTION__, channel);
+		ceetm_dbg("%s::incoming channel reassigned as %d\n", __func__, channel);
 	} else
 		channel--;
 	chnl_ctx = &qm_chnl_info[channel];
@@ -58,7 +58,7 @@ static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t 
 	else if(chnl_ctx->cq_info[classque].cq_shaper_enable == DISABLE_POLICER)
 		fq->fqid = (fq->fqid & 0x00FFFFFF); /* ensure MSByte is set to Zero */
 
-	/*ceetm_dbg("%s::markval %08x egress fq %p fqid %d(%x)\n", __FUNCTION__, markval, fq, fq->fqid, fq->fqid);*/
+	/*ceetm_dbg("%s::markval %08x egress fq %p fqid %d(%x)\n", __func__, markval, fq, fq->fqid, fq->fqid);*/
 	return (fq);
 }
 
@@ -76,7 +76,7 @@ struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *info)
 		egress_fq = ceetm_get_egressfq(priv->qm_ctx, qosmark->chnl_id, qosmark->queue,ff);
 		if (!egress_fq) {
 			ceetm_err("%s::unable to get ceetm fqid for markval %x\n",
-				__FUNCTION__, qosmark->markval);
+				__func__, qosmark->markval);
 			return NULL;
 		}
 		return (egress_fq);
@@ -140,18 +140,18 @@ static int ceetm_get_fqcount(struct ceetm_chnl_info *chnl_ctx, uint32_t classque
 
 	qm_ctx = chnl_ctx->qm_ctx;
 	if (!qm_ctx) {
-		ceetm_err("%s::invalid channel context\n", __FUNCTION__);
+		ceetm_err("%s::invalid channel context\n", __func__);
 		return CEETM_FAILURE;
 	}
 	query = kzalloc(sizeof(struct qm_mcr_ceetm_cq_query), GFP_KERNEL);
 	if (!query) {
-		ceetm_err("%s::error allocating query\n", __FUNCTION__);
+		ceetm_err("%s::error allocating query\n", __func__);
 		return CEETM_FAILURE;
 	}
 	cq = (struct qm_ceetm_cq *)chnl_ctx->cq_info[classque].cq;
 	qm_ctx = chnl_ctx->qm_ctx;
 	if (qman_ceetm_query_cq(cq->idx, qm_ctx->port_info->fm_index, query)) {
-		ceetm_err("%s::error getting ceetm cq fields\n", __FUNCTION__);
+		ceetm_err("%s::error getting ceetm cq fields\n", __func__);
 		kfree(query);
 		return CEETM_FAILURE;
 	}
@@ -168,18 +168,18 @@ static int ceetm_program_port_shaper(struct tQM_context_ctl *qm_ctx, struct qm_c
 
 	/* program lni shaper */	
 	ceetm_dbg("%s::port rate whole %x, fraction %x, limit whole %x, fraction %x, bsize %d\n",
-		__FUNCTION__, rate->whole, rate->fraction, 
+		__func__, rate->whole, rate->fraction, 
 		limit->whole, limit->fraction, bsize);
 	lni = qm_ctx->lni;
 	if (qman_ceetm_lni_set_commit_rate(lni, rate, bsize)) {
-		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __FUNCTION__, __LINE__);
+		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __func__, __LINE__);
 		return CEETM_FAILURE;
 	}
 	if (qman_ceetm_lni_set_excess_rate(lni, limit, bsize)) {  
-		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __FUNCTION__, __LINE__);
+		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __func__, __LINE__);
 		return CEETM_FAILURE;
 	}
-	ceetm_dbg("%s::port shaper programmed\n", __FUNCTION__); 
+	ceetm_dbg("%s::port shaper programmed\n", __func__); 
 	return CEETM_SUCCESS;
 }
 
@@ -190,18 +190,18 @@ static int ceetm_program_channel_shaper(struct ceetm_chnl_info *chnl_ctx, struct
 
 	/* program channel shaper */	
 	ceetm_dbg("%s::channel rate whole %x, fraction %x, limit whole %x, fraction %x, bsize %d\n",
-		__FUNCTION__, rate->whole, rate->fraction, 
+		__func__, rate->whole, rate->fraction, 
 		limit->whole, limit->fraction, bsize);
 	channel = chnl_ctx->channel;
 	if (qman_ceetm_channel_set_commit_rate(channel, rate, bsize)) {
-		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __FUNCTION__, __LINE__);
+		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __func__, __LINE__);
 		return CEETM_FAILURE;
 	}
 	if (qman_ceetm_channel_set_excess_rate(channel, limit, bsize)) {  
-		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __FUNCTION__, __LINE__);
+		ceetm_err("%s %d. qman_ceetm_lni_set_commit_rate failed \n", __func__, __LINE__);
 		return CEETM_FAILURE;
 	}
-	ceetm_dbg("%s::channel shaper programmed\n", __FUNCTION__); 
+	ceetm_dbg("%s::channel shaper programmed\n", __func__); 
 	return CEETM_SUCCESS;
 }
 
@@ -214,24 +214,24 @@ int ceetm_create_lni(struct tQM_context_ctl *qm_ctx)
 
 	/* use idx as lower part of tx_channel_id */
 	index = (qm_ctx->iface_info->eth_info.tx_channel_id & 0xf);
-	ceetm_dbg("%s::lni index %d\n", __FUNCTION__, index);
+	ceetm_dbg("%s::lni index %d\n", __func__, index);
 	/* claim a sub portal */
 	sp = NULL;
 	lni = NULL;
-	ceetm_dbg("%s::claiming sp\n", __FUNCTION__);
+	ceetm_dbg("%s::claiming sp\n", __func__);
 	if(qman_ceetm_sp_claim(&sp, qm_ctx->port_info->fm_index, index)) {
-    		ceetm_err("%s::unable to claim sp_index %d\n", __FUNCTION__, index);
+    		ceetm_err("%s::unable to claim sp_index %d\n", __func__, index);
 		goto err_ret;
 	}
 	/* claim a LNI */
-	ceetm_dbg("%s::claiming lni\n", __FUNCTION__);
+	ceetm_dbg("%s::claiming lni\n", __func__);
 	if(qman_ceetm_lni_claim(&lni, qm_ctx->port_info->fm_index, index)) {
-		ceetm_err("%s %d. qman_ceetm_lni_claim failed \n", __FUNCTION__, __LINE__);
+		ceetm_err("%s %d. qman_ceetm_lni_claim failed \n", __func__, __LINE__);
 		goto err_ret;
 	}
 	qm_ctx->lni = lni;
 	qm_ctx->sp = sp;
-	ceetm_dbg("%s::allocated lni %p for index %d\n", __FUNCTION__, lni, lni->idx);
+	ceetm_dbg("%s::allocated lni %p for index %d\n", __func__, lni, lni->idx);
 	return CEETM_SUCCESS;
 err_ret:
 	if(lni)
@@ -247,15 +247,15 @@ static int ceetm_setup_lni(struct tQM_context_ctl *qm_ctx)
 	struct shaper_info *shinfo;
 	struct qm_ceetm_rate token_er;
 
-	ceetm_dbg("%s::setting lni,sp\n", __FUNCTION__);
+	ceetm_dbg("%s::setting lni,sp\n", __func__);
 	if(qman_ceetm_sp_set_lni(qm_ctx->sp, qm_ctx->lni)) {
-		ceetm_err("%s %d. qman_ceetm_sp_set_lni failed \n", __FUNCTION__, __LINE__);
+		ceetm_err("%s %d. qman_ceetm_sp_set_lni failed \n", __func__, __LINE__);
 		return CEETM_FAILURE;
 	}
 	qm_ctx->lni->sp = qm_ctx->sp;
 	/* enable lni shaper coupled */
 	if (qman_ceetm_lni_enable_shaper(qm_ctx->lni, 1, CEETM_DEFA_OAL)) {
-		ceetm_err("%s %d. qman_ceetm_lni_enable_shaper failed \n", __FUNCTION__, __LINE__);
+		ceetm_err("%s %d. qman_ceetm_lni_enable_shaper failed \n", __func__, __LINE__);
 		return CEETM_FAILURE;
 	}
 	/* disable shaper by setting large values for port shaper*/
@@ -268,10 +268,10 @@ static int ceetm_setup_lni(struct tQM_context_ctl *qm_ctx)
 	shinfo->bsize = CEETM_DEFA_BSIZE;
 	if (ceetm_program_port_shaper(qm_ctx, &shinfo->token_cr, &token_er,
 			shinfo->bsize)) { 
-		ceetm_err("%s::unable to program lni shaper, idx %d\n", __FUNCTION__, qm_ctx->lni->idx);
+		ceetm_err("%s::unable to program lni shaper, idx %d\n", __func__, qm_ctx->lni->idx);
 		return CEETM_FAILURE;
 	}	
-	ceetm_dbg("%s:setup for lni %p, index %d complete\n", __FUNCTION__, qm_ctx->lni, qm_ctx->lni->idx);
+	ceetm_dbg("%s:setup for lni %p, index %d complete\n", __func__, qm_ctx->lni, qm_ctx->lni->idx);
 	return CEETM_SUCCESS;
 }
 
@@ -303,10 +303,10 @@ static int ceetm_cfg_shaper(void *ctx, uint32_t type, PQosShaperConfigCommand pa
 	if (params->cfg_flags & SHAPER_CFG_VALID) {
 		/* new configuration available */
 		if(qman_ceetm_bps2tokenrate((params->rate * 1000), &token_cr, 0)) {
-			ceetm_err("%s:CR qman_ceetm_bps2tokenrate failed\n", __FUNCTION__);
+			ceetm_err("%s:CR qman_ceetm_bps2tokenrate failed\n", __func__);
 			return CEETM_FAILURE;
 		}
-		ceetm_dbg("%s::CR Rate %d whole %d fraction %d\n", __FUNCTION__, 
+		ceetm_dbg("%s::CR Rate %d whole %d fraction %d\n", __func__, 
 			params->rate, token_cr.whole, token_cr.fraction);
 
 		shinfo->rate = (params->rate * 1000);
@@ -349,7 +349,7 @@ static int ceetm_cfg_shaper(void *ctx, uint32_t type, PQosShaperConfigCommand pa
 		}
 	}
 	shinfo->enable = enable;
-	ceetm_dbg("%s::CR and ER configured, enable %d\n", __FUNCTION__, enable);
+	ceetm_dbg("%s::CR and ER configured, enable %d\n", __func__, enable);
 	return CEETM_SUCCESS;
 }
 
@@ -363,15 +363,15 @@ int ceetm_release_lni(void *handle)
 		return CEETM_FAILURE;
 	lni = (struct qm_ceetm_lni *)handle;
 	lni_index = lni->idx;
-	ceetm_dbg("%s::releasing lni %p index %d\n", __FUNCTION__, lni, lni_index);
+	ceetm_dbg("%s::releasing lni %p index %d\n", __func__, lni, lni_index);
 	if (!qman_ceetm_lni_release(lni)) {
 		if (qman_ceetm_sp_release(lni->sp)) {
 			ceetm_err("%s:sp release failed on lni %p(%d)\n", 
-				__FUNCTION__, lni, lni->idx);
+				__func__, lni, lni->idx);
 			return CEETM_FAILURE;
 		}
 	} else {
-		ceetm_err("%s:lni %p(%d) release failed\n", __FUNCTION__, handle, lni_index);
+		ceetm_err("%s:lni %p(%d) release failed\n", __func__, handle, lni_index);
 		return CEETM_FAILURE;
 	}
 	return CEETM_SUCCESS;
@@ -384,22 +384,22 @@ static int ceetm_create_ccg_for_class_queue(struct ceetm_chnl_info *chnl_ctx, ui
 
 	channel = (struct qm_ceetm_channel *)chnl_ctx->channel;
 #ifdef CEETM_USE_CONG_STATE_CHANGE_NOTIFICATION 
-	ceetm_dbg("%s::congestion state change notification enabled\n", __FUNCTION__);
+	ceetm_dbg("%s::congestion state change notification enabled\n", __func__);
 	if (qman_ceetm_ccg_claim(&ccg, channel, chnl_ctx->cq_info[classque].ceetm_idx, 
 			ceetm_cscn_handler, NULL)) {
-		ceetm_err("%s::qman_ceetm_ccg_claim failed for channel %p\n", __FUNCTION__,
+		ceetm_err("%s::qman_ceetm_ccg_claim failed for channel %p\n", __func__,
 			channel);
 		return CEETM_FAILURE;
 	}
 #else
-	ceetm_dbg("%s::congestion state change notification disabled\n", __FUNCTION__);
+	ceetm_dbg("%s::congestion state change notification disabled\n", __func__);
 	if (qman_ceetm_ccg_claim(&ccg, channel, chnl_ctx->cq_info[classque].ceetm_idx, NULL, NULL)) {
-		ceetm_err("%s::qman_ceetm_ccg_claim failed for channel %p\n", __FUNCTION__,
+		ceetm_err("%s::qman_ceetm_ccg_claim failed for channel %p\n", __func__,
 			channel);
 		return CEETM_FAILURE;
 	}
 #endif
-	ceetm_dbg("%s::CCG claimed ccg %p for class queue %d\n", __FUNCTION__, ccg, classque);
+	ceetm_dbg("%s::CCG claimed ccg %p for class queue %d\n", __func__, ccg, classque);
 	chnl_ctx->cq_info[classque].ccg = ccg;
 	return CEETM_SUCCESS;
 }
@@ -463,11 +463,11 @@ static int ceetm_cfg_td_on_class_queue(struct ceetm_chnl_info *chnl_ctx, uint32_
 #else
 		params.cscn_en = 0; /* no congestion state change notification */
 #endif
-		ceetm_dbg("%s::setting congestion algo as QOS_CEETM_TAIL_DROP\n", __FUNCTION__);
+		ceetm_dbg("%s::setting congestion algo as QOS_CEETM_TAIL_DROP\n", __func__);
 	}
 	ccg = (struct qm_ceetm_ccg *)chnl_ctx->cq_info[index].ccg;
 	if (qman_ceetm_ccg_set(ccg, mask, &params)) {
-		ceetm_err("%s::unable to set ccg parameters\n", __FUNCTION__);
+		ceetm_err("%s::unable to set ccg parameters\n", __func__);
 		return CEETM_FAILURE;
 	}
 	chnl_ctx->cq_info[index].qdepth = tdthresh;
@@ -487,7 +487,7 @@ static void egress_ern_handler(struct qman_portal *portal, struct qman_fq *fq, c
 	offset = offsetof(struct ceetm_fq, egress_fq);
 	pceetm_fq = (struct ceetm_fq *)((char *)fq - offset); 
 	/* use BPID here */
-	ceetm_dbg("%s::fqid %d(%x), bpid %d, rc %d\n", __FUNCTION__,
+	ceetm_dbg("%s::fqid %d(%x), bpid %d, rc %d\n", __func__,
 			fq->fqid, fq->fqid, fd->bpid, msg->ern.rc); 
 	if (fd->bpid != 0xff) {
 		dpa_fd_release(pceetm_fq->net_dev, fd);
@@ -517,42 +517,42 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
 	else {
 		if (classque >= CDX_CEETM_MAX_QUEUES_PER_CHANNEL) {
 			ceetm_err("%s::invalid value %d for channel index\n", 
-				__FUNCTION__, classque);
+				__func__, classque);
 			return CEETM_FAILURE;
 		}
 		type = CEETM_WBFQ_QUEUE; 
 	}
 	ceetm_quenum = chnl_ctx->cq_info[classque].ceetm_idx;
-	ceetm_dbg("%s::channel %p chnl_idx %d, cq %d, ceetm_cq %d\n", __FUNCTION__,
+	ceetm_dbg("%s::channel %p chnl_idx %d, cq %d, ceetm_cq %d\n", __func__,
 			chnl_ctx, chnl_ctx->idx, classque, ceetm_quenum);
 	channel = (struct qm_ceetm_channel *)chnl_ctx->channel;
 	cqinfo = &chnl_ctx->cq_info[classque];
 	ccg = (struct qm_ceetm_ccg *)cqinfo->ccg;
 	if (!ccg) {
 		ceetm_err("%s::No CCG for Class Queue %d, chnl %p(%d)\n", 
-			__FUNCTION__, classque, channel, channel->idx);
+			__func__, classque, channel, channel->idx);
 		return CEETM_FAILURE;
 	}
 	if (type == CEETM_PRIO_QUEUE) {
 		/* claim a prio class queue */
-		ceetm_dbg("%s::claiming class que\n", __FUNCTION__);
+		ceetm_dbg("%s::claiming class que\n", __func__);
 		if (qman_ceetm_cq_claim(&cq, channel, ceetm_quenum, ccg)) {
 			ceetm_err("%s::Failed to claim Class Queue %d for chnl %p(%d)\n", 
-				__FUNCTION__, classque, channel, channel->idx);
+				__func__, classque, channel, channel->idx);
 			return CEETM_FAILURE;
 		}
 		cqinfo->ch_shaper_enable = 0;
-		ceetm_dbg("%s::setting CR eligibility\n", __FUNCTION__);
+		ceetm_dbg("%s::setting CR eligibility\n", __func__);
 		/* no CR eligibility */
 		if (qman_ceetm_channel_set_cq_cr_eligibility(channel, ceetm_quenum, 0)) {
-			ceetm_err("%s::Failed to set cr eligibility of cq %d chnl %p(%d)\n", __FUNCTION__,
+			ceetm_err("%s::Failed to set cr eligibility of cq %d chnl %p(%d)\n", __func__,
 				classque, channel,  channel->idx);			
 			goto err_ret;
 		}
-		ceetm_dbg("%s::setting ER eligibility\n", __FUNCTION__);
+		ceetm_dbg("%s::setting ER eligibility\n", __func__);
 		/* Set ER eligibility, disabling shaping */
 		if (qman_ceetm_channel_set_cq_er_eligibility(channel, ceetm_quenum, 1)) {
-			ceetm_err("%s::Failed to set er eligibility of cq %d chnl %p(%d)\n", __FUNCTION__,
+			ceetm_err("%s::Failed to set er eligibility of cq %d chnl %p(%d)\n", __func__,
 				classque, channel,  channel->idx);			
 			goto err_ret;
 		}
@@ -560,20 +560,20 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
   		struct qm_ceetm_weight_code weight_code;
 
 		/* all wbfq cq are in a single group, GRP A */
-		ceetm_dbg("%s::Claiming group A\n", __FUNCTION__);
+		ceetm_dbg("%s::Claiming group A\n", __func__);
 		if (qman_ceetm_cq_claim_A(&cq, channel, ceetm_quenum, ccg)) {
 			ceetm_err("%s::Failed to claim Class Queue A for CH %d\n", 
-				__FUNCTION__, channel->idx);
+				__func__, channel->idx);
 			return CEETM_FAILURE;
 		}
 		/* set shaper eligiblity */
 		if (qman_ceetm_channel_set_group_cr_eligibility(channel, 0, 0)) {
-			ceetm_err("%s::Failed to set group cr eligibility of cq %d chnl %p(%d)\n", __FUNCTION__,
+			ceetm_err("%s::Failed to set group cr eligibility of cq %d chnl %p(%d)\n", __func__,
 				classque, channel,  channel->idx);			
 			return CEETM_FAILURE;
 		}
 		if (qman_ceetm_channel_set_group_er_eligibility(channel, 0, 1)) {
-			ceetm_err("%s::Failed to set group er eligibility of cq %d chnl %p(%d)\n", __FUNCTION__,
+			ceetm_err("%s::Failed to set group er eligibility of cq %d chnl %p(%d)\n", __func__,
 				classque, channel,  channel->idx);			
 			return CEETM_FAILURE;
 		}
@@ -582,47 +582,47 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
 		cqinfo->weight = DEFAULT_WBFQ_WEIGHT;	
 		if (qman_ceetm_ratio2wbfs(DEFAULT_WBFQ_WEIGHT, 1, &weight_code, 0)) {
 			ceetm_err("%s::Failed to convert weight %d channel %d\n",
-				__FUNCTION__, DEFAULT_WBFQ_WEIGHT, channel->idx);
+				__func__, DEFAULT_WBFQ_WEIGHT, channel->idx);
 			return CEETM_FAILURE;
 		}
-		ceetm_dbg("%s::setting weight\n", __FUNCTION__);
+		ceetm_dbg("%s::setting weight\n", __func__);
 		if (qman_ceetm_set_queue_weight(cq, &weight_code)) {
 			ceetm_err("%s::Failed to set weight %d for channel %d\n",
-				__FUNCTION__, DEFAULT_WBFQ_WEIGHT, channel->idx);
+				__func__, DEFAULT_WBFQ_WEIGHT, channel->idx);
 			return CEETM_FAILURE;
 		}
 	}
 	cqinfo->cq = cq;
-	ceetm_dbg("%s::claimed cq %p, channel %p(%d), cqid %d\n", __FUNCTION__, cq, channel,
+	ceetm_dbg("%s::claimed cq %p, channel %p(%d), cqid %d\n", __func__, cq, channel,
 			channel->idx, classque);
 	/* Claim a LFQ */
-	ceetm_dbg("%s::claiming lfq\n", __FUNCTION__);
+	ceetm_dbg("%s::claiming lfq\n", __func__);
 	if (qman_ceetm_lfq_claim(&lfq, cq)) {
-		ceetm_err("%s::Failed to claim LFQ for cq %p(%d)\n", __FUNCTION__, 
+		ceetm_err("%s::Failed to claim LFQ for cq %p(%d)\n", __func__, 
 			cq, cq->idx);
 		goto err_ret;
 	}
-	ceetm_dbg("%s::claimed lfq %p idx %x for cq %p(%d, ceetm_que %d)\n", __FUNCTION__, lfq, lfq->idx, 
+	ceetm_dbg("%s::claimed lfq %p idx %x for cq %p(%d, ceetm_que %d)\n", __func__, lfq, lfq->idx, 
 			cq, classque, ceetm_quenum);
 	cqinfo->lfq = lfq;
 	context_a = (uint64_t)VQA_DPAA_VAL_TO_RELEASE_BUFFER;
-	ceetm_dbg("%s::set context\n", __FUNCTION__);
+	ceetm_dbg("%s::set context\n", __func__);
 	if (qman_ceetm_lfq_set_context(lfq, context_a, 0)) { 
-		ceetm_err("%s::set context_a for lfq %p failed\n",__FUNCTION__,
+		ceetm_err("%s::set context_a for lfq %p failed\n",__func__,
 			lfq); 
 		goto err_ret;
 	}
 	/* set Enque Rejection Notification handler */	
 	lfq->ern = egress_ern_handler;
 	/* create LFQ for egress */
-	ceetm_dbg("%s::creating lfq\n", __FUNCTION__);
+	ceetm_dbg("%s::creating lfq\n", __func__);
 	if (qman_ceetm_create_fq(lfq, &cqinfo->ceetmfq.egress_fq)) {
-		ceetm_err("%s::unable to create lfq %p\n",__FUNCTION__,
+		ceetm_err("%s::unable to create lfq %p\n",__func__,
 			lfq); 
 		goto err_ret;
 	}
 	ceetm_dbg("%s::created fq %p, fqid %x(%d) for lfq %p, classque %d, channel %d\n", 
-			__FUNCTION__, &cqinfo->ceetmfq, 
+			__func__, &cqinfo->ceetmfq, 
 			cqinfo->ceetmfq.egress_fq.fqid, 
 			cqinfo->ceetmfq.egress_fq.fqid, 
 			lfq, classque, channel->idx);
@@ -683,13 +683,13 @@ static int ceetm_create_cq_policer_profiles(t_Handle h_FmPcd, struct classque_in
 	cqinfo->pp_handle = FM_PCD_PlcrProfileSet(h_FmPcd, &Params);
 	if (!cqinfo->pp_handle) {
 		printk("%s::unable to set profile for profile %d\n",
-		 __FUNCTION__, profile);
+		 __func__, profile);
 		return CEETM_FAILURE;
 	}
 	cqinfo->pp_num = FmPcdPlcrProfileGetAbsoluteId(cqinfo->pp_handle);
 
 	ceetm_dbg("%s:plcr profile created for  handle %p,profile_id %d\n",
-		__FUNCTION__, cqinfo->pp_handle,cqinfo->pp_num);
+		__func__, cqinfo->pp_handle,cqinfo->pp_num);
 	ceetm_dbg("cir %u, pir %u, cbs %d, pbs %d\n",
 			Params.nonPassthroughAlgParams.committedInfoRate,
 			Params.nonPassthroughAlgParams.peakOrExcessInfoRate,
@@ -709,7 +709,7 @@ static int ceetm_configure_cq_policer_profiles(struct classque_info *cq_info,voi
 	if (enable == DISABLE_POLICER) {
 		cq_info->cq_shaper_enable = enable;
 		cq_info->shaper_rate = shaper_rate;
-		ceetm_dbg("%s::plcr profile is disabled on cq queue %p\n",__FUNCTION__,cq_info);
+		ceetm_dbg("%s::plcr profile is disabled on cq queue %p\n",__func__,cq_info);
 		return CEETM_SUCCESS;
 	}
 
@@ -725,14 +725,14 @@ static int ceetm_configure_cq_policer_profiles(struct classque_info *cq_info,voi
 	handle = FM_PCD_PlcrProfileSet(pcd_handle, &Params);
         if (!handle) {
 		ceetm_err("%s::unable to modify profile for cq queue %p\n",
-			__FUNCTION__,cq_info);
+			__func__,cq_info);
 		return CEETM_FAILURE;
         }
 	cq_info->cq_shaper_enable = enable;
 	cq_info->shaper_rate = shaper_rate;
 
 	ceetm_dbg("%s::plcr profile modified for cq queue %p, handle %p\n",
-	 __FUNCTION__, cq_info, handle);
+	 __func__, cq_info, handle);
 
 	return CEETM_SUCCESS;
 }
@@ -748,9 +748,9 @@ static int ceetm_create_queues(struct ceetm_chnl_info *chnl_ctx)
 	ii = GET_CEETM_PRIORITY(CEETM_DEFA_WBFQ_PRIORITY);
 	ceetm_dbg("setting wbfq priority\n");
 	ceetm_dbg("%s::setting wbfq priority, cfg->prio %d, ceetm_prio %d\n",
-		__FUNCTION__, chnl_ctx->wbfq_priority, ii);
+		__func__, chnl_ctx->wbfq_priority, ii);
 	if(qman_ceetm_channel_set_group(channel, 0, ii, ii)) {
-		ceetm_err("%s::qman_ceetm_channel_set_group failed\n", __FUNCTION__);
+		ceetm_err("%s::qman_ceetm_channel_set_group failed\n", __func__);
 		return CEETM_FAILURE;
 	}
 	/* set ceetm_cq ids in the cq structure */
@@ -761,21 +761,21 @@ static int ceetm_create_queues(struct ceetm_chnl_info *chnl_ctx)
 		/* create ccg for class queue */
 		ceetm_dbg("......................................................\n");
 		if (ceetm_create_ccg_for_class_queue(chnl_ctx, ii)) {
-			ceetm_err("%s::ceetm_create_for_class_queue failed %p\n", __FUNCTION__, channel);
+			ceetm_err("%s::ceetm_create_for_class_queue failed %p\n", __func__, channel);
 			return CEETM_FAILURE;
 		}
 		/* set TD */
 		if (ceetm_cfg_td_on_class_queue(chnl_ctx, ii, DEFAULT_CQ_DEPTH)) {
-			ceetm_err("%s::ceetm_cfg_ccg_to_class_queue failed on chnl %p\n", __FUNCTION__, channel);
+			ceetm_err("%s::ceetm_cfg_ccg_to_class_queue failed on chnl %p\n", __func__, channel);
 			return CEETM_FAILURE;
 		}
-		ceetm_dbg("%s::ccg configured to class que\n", __FUNCTION__); 
+		ceetm_dbg("%s::ccg configured to class que\n", __func__); 
 		/* create class queues */
 		if (ceetm_create_cq(chnl_ctx, ii)) {
-			ceetm_err("%s::ceetm_cfg_prio_class_queue failed on chnl %p\n", __FUNCTION__, channel);
+			ceetm_err("%s::ceetm_cfg_prio_class_queue failed on chnl %p\n", __func__, channel);
 			return CEETM_FAILURE;
 		}
-		ceetm_dbg("%s::ceetm_create_cq done on sp chnl %p\n", __FUNCTION__, channel); 
+		ceetm_dbg("%s::ceetm_create_cq done on sp chnl %p\n", __func__, channel); 
 	}
 	return CEETM_SUCCESS;
 }
@@ -787,11 +787,11 @@ static int ceetm_create_channel(struct ceetm_chnl_info *qm_channel)
 
 	channel = kzalloc(sizeof(*channel), GFP_KERNEL);
 	if (!channel) {
-		ceetm_err("%s::unable to allocate channel structure\n", __FUNCTION__);
+		ceetm_err("%s::unable to allocate channel structure\n", __func__);
 		return CEETM_FAILURE;
 	}
 	if (qman_alloc_ceetm0_channel(&channel->idx)) {
-		ceetm_err("%s::unable to allocate channel on ceetm0\n", __FUNCTION__);
+		ceetm_err("%s::unable to allocate channel on ceetm0\n", __func__);
 		kfree(channel);
 		return CEETM_FAILURE;
 	}
@@ -801,7 +801,7 @@ static int ceetm_create_channel(struct ceetm_chnl_info *qm_channel)
 	/* Enable Shaper by default, do not couple CR and ER */
 	if (qman_ceetm_channel_enable_shaper(channel, 0)) {
 		ceetm_err("%s::unable to enable shaper for chnl %p\n",
-			__FUNCTION__, channel);
+			__func__, channel);
 		return CEETM_FAILURE;
 	}
 	er_rate.whole = CEETM_TOKEN_WHOLE_MAXVAL;
@@ -810,12 +810,12 @@ static int ceetm_create_channel(struct ceetm_chnl_info *qm_channel)
 	if (ceetm_program_channel_shaper(qm_channel, &qm_channel->shaper_info.token_cr, &er_rate,
 		qm_channel->shaper_info.bsize)) {
 		ceetm_err("%s::unable to configure shaper for chnl %p\n",
-			__FUNCTION__, qm_channel);
+			__func__, qm_channel);
 		return CEETM_FAILURE;
 	}
-	ceetm_dbg("%s::created channel %d::%p\n", __FUNCTION__, qm_channel->idx, channel);
+	ceetm_dbg("%s::created channel %d::%p\n", __func__, qm_channel->idx, channel);
 	if (ceetm_create_queues(qm_channel)) {
-		ceetm_err("%s::unable to create queues on channel %p\n", __FUNCTION__, channel);
+		ceetm_err("%s::unable to create queues on channel %p\n", __func__, channel);
 		return CEETM_FAILURE;
 	}
 	return CEETM_SUCCESS;
@@ -835,7 +835,7 @@ int ceetm_init_channels(void)
 	cr.whole = CEETM_TOKEN_WHOLE_MAXVAL;
 	cr.fraction = CEETM_TOKEN_FRAC_MAXVAL;
 	if (qman_ceetm_tokenrate2bps(&cr, &rate, 0)) {
-		ceetm_err("%s::unable to deduce rate for shaper\n", __FUNCTION__);
+		ceetm_err("%s::unable to deduce rate for shaper\n", __func__);
 		return CEETM_FAILURE;
 	}
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
@@ -861,10 +861,10 @@ int ceetm_init_channels(void)
 	}
 	/* register functions to return CEETM egress FQID */
 	if (dpa_register_ceetm_get_egress_fq(ceetm_get_egressfq, ceetm_get_dscp_fq)) {
-		ceetm_err("%s::unable to register ceetmFq functions\n", __FUNCTION__);
+		ceetm_err("%s::unable to register ceetmFq functions\n", __func__);
 		return CEETM_FAILURE;
 	}
-	ceetm_dbg("%s::registered ceetmFq functions\n", __FUNCTION__);
+	ceetm_dbg("%s::registered ceetmFq functions\n", __func__);
 	return CEETM_SUCCESS;
 }
 
@@ -882,7 +882,7 @@ int ceetm_init_cq_plcr(void)
 
 	if (pcd_handle == NULL) {
 		ceetm_err("%s::no pcd handle for fm_index %d\n",
-			 __FUNCTION__, fm_index);
+			 __func__, fm_index);
 		return CEETM_FAILURE;
 	}
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
@@ -906,10 +906,10 @@ static void ceetm_cscn_handler(struct qm_ceetm_ccg *p, void *cb_ctx, int congest
   
 	/* Update the congestion state */
 	if(ceetm_fq) {
-		ceetm_dbg("%s::state %d\n", __FUNCTION__, congested); 
+		ceetm_dbg("%s::state %d\n", __func__, congested); 
 		ceetm_fq->congested = congested; 	
 	} else 
-		ceetm_err("%s::ceetm fq congestion state %d\n", __FUNCTION__, congested);
+		ceetm_err("%s::ceetm fq congestion state %d\n", __func__, congested);
 }
 #endif
 
@@ -932,14 +932,14 @@ static int ceetm_set_default_cq_policer_profile(void *pcd_handle, struct classqu
         handle = FM_PCD_PlcrProfileSet(pcd_handle, &Params);
         if (!handle) {
 		printk("%s::unable to set default values for cq queue %p\n",
-			__FUNCTION__, cqinfo);
+			__func__, cqinfo);
 		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
         }
 	/* init default cir and pir values */
 	cqinfo->shaper_rate = DEFAULT_CQ_CIR_VALUE;
 #ifdef DEVMAN_DEBUG
 	printk("%s::plcr profile set to default for cd queue %p, handle %p\n",
-		 __FUNCTION__,cqinfo, handle);
+		 __func__,cqinfo, handle);
 #endif
 	return CEETM_SUCCESS;
 }
@@ -958,16 +958,16 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 	qm_ctx->shaper_info.bsize = CEETM_DEFA_BSIZE;
 	qm_ctx->shaper_info.enable = 0;
 	if (qman_ceetm_tokenrate2bps(&qm_ctx->shaper_info.token_cr, &rate, 0)) {
-		ceetm_err("%s::qman_ceetm_tokenrate2bps failed\n", __FUNCTION__);
+		ceetm_err("%s::qman_ceetm_tokenrate2bps failed\n", __func__);
 		return CEETM_FAILURE;
 	}
 	qm_ctx->shaper_info.rate = rate;
 	token.whole = 0;
 	token.fraction = 0;
-	ceetm_dbg("%s::turning port shaper off\n", __FUNCTION__); 
+	ceetm_dbg("%s::turning port shaper off\n", __func__); 
 	if (ceetm_program_port_shaper(qm_ctx, &qm_ctx->shaper_info.token_cr,
 		&token, qm_ctx->shaper_info.bsize)) {
-		ceetm_err("%s:ceetm_program_shaper failed \n", __FUNCTION__);
+		ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 		return CEETM_FAILURE;
 	}
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
@@ -990,16 +990,16 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 			qm_channel->shaper_info.rate = rate;
 			qm_channel->shaper_info.enable = 0;
 			priority = GET_CEETM_PRIORITY(qm_channel->wbfq_priority);
-			ceetm_dbg("%s::cfg prio %d, ceetm prio %d\n", __FUNCTION__,
+			ceetm_dbg("%s::cfg prio %d, ceetm prio %d\n", __func__,
 				qm_channel->wbfq_priority, priority);
 			if(qman_ceetm_channel_set_group(channel, 0, priority, priority)) {
-				ceetm_err("%s::qman_ceetm_channel_set_group failed\n", __FUNCTION__);
+				ceetm_err("%s::qman_ceetm_channel_set_group failed\n", __func__);
 				return CEETM_FAILURE;
 			}
-			ceetm_dbg("%s::turning channel %d shaper off\n", __FUNCTION__, ii); 
+			ceetm_dbg("%s::turning channel %d shaper off\n", __func__, ii); 
 			if (ceetm_program_channel_shaper(qm_channel, &qm_channel->shaper_info.token_cr, 
 				&qm_channel->shaper_info.token_cr, qm_channel->shaper_info.bsize)) {
-				ceetm_err("%s:ceetm_program_shaper failed \n", __FUNCTION__);
+				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 				return CEETM_FAILURE;
 			}
 			/* program default weights, depths and policer profiles on all class queues */
@@ -1010,15 +1010,15 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 				if (!jj) {
 					if (qman_ceetm_ratio2wbfs(DEFAULT_CQ_DEPTH, 1, &weight_code, 0)) {
 						ceetm_err("%s::Failed to convert weight %d\n",
-							__FUNCTION__, cqinfo->weight);
+							__func__, cqinfo->weight);
 						return CEETM_FAILURE;
 					}
 				}
 				cqinfo->qdepth = DEFAULT_CQ_DEPTH;
-				ceetm_dbg("%s::resetting que depth on class queue %d\n", __FUNCTION__, ii); 
+				ceetm_dbg("%s::resetting que depth on class queue %d\n", __func__, ii); 
 				if (ceetm_cfg_td_on_class_queue(qm_channel, jj, cqinfo->qdepth)) {
 					ceetm_err("%s::ceetm_cfg_ccg_to_class_queue failed on chnl %d\n", 
-							__FUNCTION__, ii);
+							__func__, ii);
 					return CEETM_FAILURE;
 				}
 				if (jj >= NUM_PQS) {
@@ -1026,38 +1026,38 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 					/* reset weight */
 					/* Set the Queue Weight */
 					cqinfo->weight = DEFAULT_WBFQ_WEIGHT;
-					ceetm_dbg("%s::resetting weight on classque %d\n", __FUNCTION__, jj);
+					ceetm_dbg("%s::resetting weight on classque %d\n", __func__, jj);
 					if (qman_ceetm_set_queue_weight(cqinfo->cq, &weight_code)) {
-						ceetm_err("%s::qman_ceetm_set_queue_weight failed\n", __FUNCTION__);
+						ceetm_err("%s::qman_ceetm_set_queue_weight failed\n", __func__);
 						return CEETM_FAILURE;
 					}
 					/* turn off class que shapers */
 					if (qman_ceetm_channel_set_group_cr_eligibility(channel, 0, 0)) {
 						ceetm_err("%s::Failed to set group cr eligibility"
-							"of cq %d chnl %d\n", __FUNCTION__, jj, ii);			
+							"of cq %d chnl %d\n", __func__, jj, ii);			
 						return CEETM_FAILURE;
 					}
 					if (qman_ceetm_channel_set_group_er_eligibility(channel, 0, 1)) {
 						ceetm_err("%s::Failed to set group er eligibility" 
-							"of cq %d chnl %d\n", __FUNCTION__, jj, ii);			
+							"of cq %d chnl %d\n", __func__, jj, ii);			
 						return CEETM_FAILURE;
 					}
 				} else {
 					cqinfo->ch_shaper_enable = 0;
 					/* priority que */
 					/* Set CR eligibility */
-					ceetm_dbg("%s::resetting CR eligibility on cq %d\n", __FUNCTION__, jj);
+					ceetm_dbg("%s::resetting CR eligibility on cq %d\n", __func__, jj);
 					if (qman_ceetm_channel_set_cq_cr_eligibility(qm_channel->channel, jj, 0)) {
 						ceetm_err("%s::Failed to set cr eligibility of cq %d\n", 
-							__FUNCTION__, jj);
+							__func__, jj);
 						return CEETM_FAILURE;
 					}
-					ceetm_dbg("%s::resetting ER eligibility\n", __FUNCTION__);
+					ceetm_dbg("%s::resetting ER eligibility\n", __func__);
 					/* Set ER eligibility */
-					ceetm_dbg("%s::resetting ER eligibility on cq %d\n", __FUNCTION__, jj);
+					ceetm_dbg("%s::resetting ER eligibility on cq %d\n", __func__, jj);
 					if (qman_ceetm_channel_set_cq_er_eligibility(qm_channel->channel, jj, 1)) {
 						ceetm_err("%s::Failed to set er eligibility of cq %d\n", 
-							__FUNCTION__, jj);
+							__func__, jj);
 						return CEETM_FAILURE;
 					}
 				}
@@ -1084,7 +1084,7 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 
 			/* initialize lni */
 			if (ceetm_setup_lni(qm_ctx)) {
-				ceetm_err("%s:ceetm_setup_lni failed \n", __FUNCTION__);
+				ceetm_err("%s:ceetm_setup_lni failed \n", __func__);
 				return QOS_ENERR_IO;
 			}
 				
@@ -1095,7 +1095,7 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 			if (ceetm_program_port_shaper(qm_ctx, &qm_ctx->shaper_info.token_cr,
 						&token,
 						qm_ctx->shaper_info.bsize)) {
-				ceetm_err("%s:ceetm_program_shaper failed \n", __FUNCTION__);
+				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 				return QOS_ENERR_IO;
 			}
 			for (ii = 0; ii < NUM_CHANNEL_SHAPERS; ii++) {
@@ -1109,25 +1109,25 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 					if (ceetm_program_channel_shaper(chnl_ctx, &chnl_ctx->shaper_info.token_cr,
 							&token,
 							chnl_ctx->shaper_info.bsize)) {
-						ceetm_err("%s:ceetm_program_shaper failed \n", __FUNCTION__);
+						ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 						return QOS_ENERR_IO;
 					}
 				}
 			}
-			ceetm_dbg("%s::calling qman_sp_enable_ceetm_mode sp %p\n", __FUNCTION__,
+			ceetm_dbg("%s::calling qman_sp_enable_ceetm_mode sp %p\n", __func__,
 				qm_ctx->lni->sp);
 			
 			if (qman_sp_enable_ceetm_mode(qm_ctx->lni->sp->dcp_idx, 
 					qm_ctx->lni->sp->idx)) {
-				ceetm_err("%s:qman_sp_enable_ceetm_mode failed \n", __FUNCTION__);
+				ceetm_err("%s:qman_sp_enable_ceetm_mode failed \n", __func__);
 				return QOS_ENERR_IO;
 			} 
 			dpa_enable_ceetm(qm_ctx->net_dev);
 			qm_ctx->qos_enabled = 1;
-			ceetm_dbg("%s::CEETM enabled on iface %s\n", __FUNCTION__,
+			ceetm_dbg("%s::CEETM enabled on iface %s\n", __func__,
 				qm_ctx->iface_info->name);
 		} else {
-			ceetm_dbg("%s::already enabled\n",__FUNCTION__);
+			ceetm_dbg("%s::already enabled\n",__func__);
 		}
 	} else {
 		if (qm_ctx->qos_enabled) {
@@ -1136,7 +1136,7 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 			token.whole = CEETM_TOKEN_WHOLE_MAXVAL;
 			token.fraction = CEETM_TOKEN_FRAC_MAXVAL;
 			if (ceetm_program_port_shaper(qm_ctx, &token, &token, CEETM_DEFA_BSIZE)) {
-				ceetm_err("%s:ceetm_program_shaper failed \n", __FUNCTION__);
+				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 				return QOS_ENERR_IO;
 			}
 			/* disable channel shapers */
@@ -1144,14 +1144,14 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 				if (qm_ctx->chnl_map & (1 << ii)) {
 					chnl_ctx = &qm_chnl_info[ii];
 					if (ceetm_program_channel_shaper(chnl_ctx, &token, &token, CEETM_DEFA_BSIZE)) {
-						ceetm_err("%s:ceetm_program_shaper failed \n", __FUNCTION__);
+						ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 						return QOS_ENERR_IO;
 					}
 				}
 			}
 			qm_ctx->qos_enabled = 0;
 		} else {
-			ceetm_dbg("%s::already disabled\n",__FUNCTION__);
+			ceetm_dbg("%s::already disabled\n",__func__);
 		}
 	}
 	return CEETM_SUCCESS;
@@ -1160,7 +1160,7 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 
 static void display_shaper_config(PQosShaperConfigCommand cfg)
 {
-	ceetm_dbg("%s::flags %x size %ld\n", __FUNCTION__, cfg->cfg_flags,
+	ceetm_dbg("%s::flags %x size %ld\n", __func__, cfg->cfg_flags,
 			sizeof(QosShaperConfigCommand));
 	if (cfg->cfg_flags & PORT_SHAPER_CFG) {
 		ceetm_dbg("port shaper configuration iface %s::\n", cfg->ifname);
@@ -1203,24 +1203,24 @@ int ceetm_configure_shaper(void *cmd)
 		if (port_info) {
 			qm_ctx = QM_GET_CONTEXT(port_info->portid);
 		} else {
-			ceetm_err("%s::unable to get context for port\n", __FUNCTION__);
+			ceetm_err("%s::unable to get context for port\n", __func__);
 			return CEETM_FAILURE;
 		}	
 		if (ceetm_cfg_shaper(qm_ctx, PORT_SHAPER_TYPE, cfg)) {
-			ceetm_err("%s::ceetm_cfg_shaper failed for port\n", __FUNCTION__);
+			ceetm_err("%s::ceetm_cfg_shaper failed for port\n", __func__);
 			return CEETM_FAILURE;
 		}
 	} else {
 		struct ceetm_chnl_info *chnl_info;
 
 		if (cfg->channel_num >= CDX_CEETM_MAX_CHANNELS) {
-			ceetm_err("%s::invalid channel number\n", __FUNCTION__);
+			ceetm_err("%s::invalid channel number\n", __func__);
 			return CEETM_FAILURE;
 		}
 		chnl_info = &qm_chnl_info[cfg->channel_num];
 		/* channel shaper */
 		if (ceetm_cfg_shaper(chnl_info, CHANNEL_SHAPER_TYPE, cfg)) {
-			ceetm_err("%s::ceetm_cfg_shaper failed for channel\n", __FUNCTION__);
+			ceetm_err("%s::ceetm_cfg_shaper failed for channel\n", __func__);
 			return CEETM_FAILURE;
 		}
 	}
@@ -1235,13 +1235,13 @@ int ceetm_configure_cq(void *cmd)
 
 	cfg = (PQosCqConfigCommand)cmd;
 	if (cfg->channel_num >= CDX_CEETM_MAX_CHANNELS) {
-		ceetm_err("%s::invalid channel number %d\n", __FUNCTION__, cfg->channel_num);
+		ceetm_err("%s::invalid channel number %d\n", __func__, cfg->channel_num);
 		return CEETM_FAILURE;
 	}
 
 	/* check queue number */
 	if (cfg->quenum >= NUM_CLASS_QUEUES) {
-		ceetm_err("%s::invalid channel number %d\n", __FUNCTION__, cfg->channel_num);
+		ceetm_err("%s::invalid channel number %d\n", __func__, cfg->channel_num);
 		return CEETM_FAILURE;
 	}
 	chnl_ctx = &qm_chnl_info[cfg->channel_num];
@@ -1253,7 +1253,7 @@ int ceetm_configure_cq(void *cmd)
 	}
 	/* adjust quenum for strict priority types */
 	ceetm_quenum = chnl_ctx->cq_info[cfg->quenum].ceetm_idx;
-	ceetm_dbg("%s::channel %d, cfg que %d, ceetm que %d\n", __FUNCTION__,
+	ceetm_dbg("%s::channel %d, cfg que %d, ceetm que %d\n", __func__,
 		cfg->channel_num, cfg->quenum, ceetm_quenum);
 		
 	/* qdepth appliable to both queue types */
@@ -1269,12 +1269,12 @@ int ceetm_configure_cq(void *cmd)
 			return CEETM_FAILURE;
 		/* Set the Queue Weight */
 		if (qman_ceetm_ratio2wbfs(cfg->weight, 1, &weight_code, 0)) {
-			ceetm_err("%s::invalid value %d for que weight\n", __FUNCTION__,
+			ceetm_err("%s::invalid value %d for que weight\n", __func__,
 				cfg->weight);
 			return CEETM_FAILURE;
 		}
 		if (qman_ceetm_set_queue_weight(chnl_ctx->cq_info[cfg->quenum].cq, &weight_code)) {
-			ceetm_err("%s::qman_ceetm_set_queue_weight failed\n", __FUNCTION__);
+			ceetm_err("%s::qman_ceetm_set_queue_weight failed\n", __func__);
 			return CEETM_FAILURE;
 		}
 		chnl_ctx->cq_info[cfg->quenum].weight = cfg->weight;
@@ -1289,16 +1289,16 @@ int ceetm_configure_cq(void *cmd)
 		else 
 			enable = 0;
 		if (ceetm_quenum  < CEETM_WBFS_START) {
-			ceetm_dbg("%s::Setting shaper on prio queues\n", __FUNCTION__);
+			ceetm_dbg("%s::Setting shaper on prio queues\n", __func__);
 			/* Set CR eligibility */
 			if (qman_ceetm_channel_set_cq_cr_eligibility(channel, ceetm_quenum, enable)) {
-				ceetm_err("%s::Failed to set cr eligibility of cq %d chnl %p(%d)\n", __FUNCTION__,
+				ceetm_err("%s::Failed to set cr eligibility of cq %d chnl %p(%d)\n", __func__,
 					cfg->quenum, channel, channel->idx);			
 				return CEETM_FAILURE;
 			}
 			/* Set ER eligibility */
 			if (qman_ceetm_channel_set_cq_er_eligibility(channel, ceetm_quenum, (enable ^ 1))) {
-				ceetm_err("%s::Failed to set er eligibility of cq %d chnl %p(%d)\n", __FUNCTION__,
+				ceetm_err("%s::Failed to set er eligibility of cq %d chnl %p(%d)\n", __func__,
 					cfg->quenum, channel, channel->idx);			
 				return CEETM_FAILURE;
 			}
@@ -1317,19 +1317,19 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	struct qm_mcc_ceetm_mapping_shaper_tcfc_config config_opts;
 
 	if (channel_num >= CDX_CEETM_MAX_CHANNELS) {
-		ceetm_err("%s::invalid channel number %d\n", __FUNCTION__,
+		ceetm_err("%s::invalid channel number %d\n", __func__,
 			channel_num);
 		return CEETM_FAILURE;
 	}
 	chnl_ctx = &qm_chnl_info[channel_num];
 	if (chnl_ctx->qm_ctx) {
 		ceetm_err("%s::channel number %d already assigned to iface %s\n", 
-			__FUNCTION__, channel_num, qm_ctx->iface_info->name);
+			__func__, channel_num, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
 	channel = chnl_ctx->channel;
 	lni = qm_ctx->lni;
-	ceetm_dbg("%s::assigning channel %d(%d) to iface %s\n", __FUNCTION__, 
+	ceetm_dbg("%s::assigning channel %d(%d) to iface %s\n", __func__, 
 			channel_num, chnl_ctx->idx, qm_ctx->iface_info->name);
 	chnl_ctx->qm_ctx = qm_ctx;
 	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
@@ -1342,12 +1342,12 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	config_opts.channel_mapping.map_lni_id = lni->idx;
 	config_opts.channel_mapping.map_shaped = 1;
 	if (qman_ceetm_configure_mapping_shaper_tcfc(&config_opts)) {
-		ceetm_err("%s::Can't map channel %d for LNI on %s\n", __FUNCTION__, 
+		ceetm_err("%s::Can't map channel %d for LNI on %s\n", __func__, 
 			channel_num, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
 	qm_ctx->chnl_map |= (1 << chnl_ctx->idx);
-	ceetm_dbg("%s::lni %d, dcp %d, chnl_map %x\n", __FUNCTION__, lni->idx, lni->dcp_idx, qm_ctx->chnl_map);
+	ceetm_dbg("%s::lni %d, dcp %d, chnl_map %x\n", __func__, lni->idx, lni->dcp_idx, qm_ctx->chnl_map);
 	/* if qos is enabled on port and channel shaper is on program values into shaper */
 
 	for (ii = 0; ii < NUM_CLASS_QUEUES; ii++) {
@@ -1496,7 +1496,7 @@ int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp)
 	if (dscp_fq_unmap_ff(qm_ctx, dscp))
 	{
 		ceetm_err("%s::%d dscp to fq unmap is failed on interface <%s>\n", 
-				__FUNCTION__, __LINE__, qm_ctx->iface_info->name);
+				__func__, __LINE__, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
 	return CEETM_SUCCESS;
@@ -1613,33 +1613,33 @@ int ceetm_configure_wbfq(void *cmd)
 
 	cfg = (PQosWbfqConfigCommand)cmd;
 	if (cfg->channel_num >= CDX_CEETM_MAX_CHANNELS) {
-		ceetm_err("%s::invalid channel number\n", __FUNCTION__);
+		ceetm_err("%s::invalid channel number\n", __func__);
 		return CEETM_FAILURE;
 	}
 	chnl_ctx = &qm_chnl_info[cfg->channel_num];	
 	channel = chnl_ctx->channel;
 	display_wbfq_config(cmd);
 	priority = GET_CEETM_PRIORITY(cfg->priority);
-	ceetm_dbg("%s::channel %d cfg prio %d, ceetm prio %d\n", __FUNCTION__,
+	ceetm_dbg("%s::channel %d cfg prio %d, ceetm prio %d\n", __func__,
 				cfg->channel_num, cfg->priority, priority);
 	if (cfg->cfg_flags & WBFQ_PRIORITY_VALID) {
 		if(qman_ceetm_channel_set_group(channel, 0, priority, priority)) {
-			ceetm_err("%s::qman_ceetm_channel_set_group failed\n", __FUNCTION__);
+			ceetm_err("%s::qman_ceetm_channel_set_group failed\n", __func__);
 			return CEETM_FAILURE;
 		}
 		/* save it in the configuration */
 		chnl_ctx->wbfq_priority = cfg->priority;
 	}
 	/* set shaper eligiblity */
-	ceetm_dbg("%s::Setting shaper on wbfq queues\n", __FUNCTION__);
+	ceetm_dbg("%s::Setting shaper on wbfq queues\n", __func__);
 	if (cfg->cfg_flags & WBFQ_SHAPER_VALID) {
 		if (qman_ceetm_channel_set_group_cr_eligibility(channel, 0, cfg->wbfq_chshaper)) {
-			ceetm_err("%s::Failed to set group cr eligibility of wbfq chnl %p\n", __FUNCTION__,
+			ceetm_err("%s::Failed to set group cr eligibility of wbfq chnl %p\n", __func__,
 					channel);
 			return CEETM_FAILURE;
 		}
 		if (qman_ceetm_channel_set_group_er_eligibility(channel, 0, (cfg->wbfq_chshaper ^ 1))) {
-			ceetm_err("%s::Failed to set group er eligibility of wbfq chnl %p\n", __FUNCTION__,
+			ceetm_err("%s::Failed to set group er eligibility of wbfq chnl %p\n", __func__,
 					channel);
 			return CEETM_FAILURE;
 		}
@@ -1696,12 +1696,12 @@ int ceetm_get_cq_query(pQosCqQueryCmd cmd)
 	struct classque_info *cq_info;
 
 	if (cmd->channel_num >= CDX_CEETM_MAX_CHANNELS) {
-		ceetm_err("%s::invalid channel number %d\n", __FUNCTION__, cmd->channel_num);			
+		ceetm_err("%s::invalid channel number %d\n", __func__, cmd->channel_num);			
 		return CEETM_FAILURE;
 	}
 	quenum = cmd->queuenum;
 	if (quenum >= CDX_CEETM_MAX_QUEUES_PER_CHANNEL) { 
-		ceetm_err("%s::invalid queue number %d\n", __FUNCTION__, quenum);			
+		ceetm_err("%s::invalid queue number %d\n", __func__, quenum);			
 		return CEETM_FAILURE;
 	}
 	chnl_ctx = &qm_chnl_info[cmd->channel_num];
@@ -1716,12 +1716,12 @@ int ceetm_get_cq_query(pQosCqQueryCmd cmd)
 	cq = (struct qm_ceetm_cq *)cq_info->cq;
 	ccg = (struct qm_ceetm_ccg *)cq_info->ccg;
 	if (ceetm_get_fqcount(chnl_ctx, quenum, &cmd->frm_count)) {
-		ceetm_err("%s::Failed to get fq count on que %d\n", __FUNCTION__, quenum);			
+		ceetm_err("%s::Failed to get fq count on que %d\n", __func__, quenum);			
 		return CEETM_FAILURE;
 	}
 	if (qman_ceetm_cq_get_dequeue_statistics(cq, cmd->clear_stats, &pkt_count, 
 		&byte_count)) {
-		ceetm_err("%s::Failed to get cq deque stats %d\n", __FUNCTION__, quenum);			
+		ceetm_err("%s::Failed to get cq deque stats %d\n", __func__, quenum);			
 		return CEETM_FAILURE;
 	}
 	cmd->deque_pkts_high = (pkt_count >> 32);
@@ -1730,7 +1730,7 @@ int ceetm_get_cq_query(pQosCqQueryCmd cmd)
 	cmd->deque_bytes_lo = (byte_count & 0xffffffff);
 	if (qman_ceetm_ccg_get_reject_statistics(ccg, cmd->clear_stats, &pkt_count, 
 		&byte_count)) {
-		ceetm_err("%s::Failed to get cq reject stats %d\n", __FUNCTION__, quenum);			
+		ceetm_err("%s::Failed to get cq reject stats %d\n", __func__, quenum);			
 		return CEETM_FAILURE;
 	}
 	cmd->reject_pkts_high = (pkt_count >> 32);
@@ -1752,10 +1752,10 @@ int ceetm_exit(void)
 {
 	/* deregister functions to return CEETM egress FQID */
 	if (dpa_register_ceetm_get_egress_fq(NULL, NULL)) {
-		ceetm_err("%s::unable to deregister ceetmFq functions\n", __FUNCTION__);
+		ceetm_err("%s::unable to deregister ceetmFq functions\n", __func__);
 		return CEETM_FAILURE;
 	}
-	ceetm_dbg("%s::deregistered ceetmFq functions\n", __FUNCTION__);
+	ceetm_dbg("%s::deregistered ceetmFq functions\n", __func__);
 
 	/* TODO: Implement proper cleanup for module unload. Currently leaks:
 	 * - 8 channel structures (kzalloc'd in ceetm_create_channel)

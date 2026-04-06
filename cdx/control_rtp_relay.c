@@ -80,7 +80,7 @@ static void rtp_flow_free(PRTPflow pFlow)
 			}
 			else
 			{
-				DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+				DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 			}
 		}
 		kfree(pFlow->hw_flow);
@@ -97,12 +97,12 @@ struct _thw_RTPinfo * cdx_rtp_alloc_muram_rtpinfo(void)
 	uint32_t MuramSize;
 
 	DPA_INFO("%s(%d) sizeof(struct _thw_RTPinfo) %lu\n",
-			__FUNCTION__,__LINE__, sizeof(struct _thw_RTPinfo));
+			__func__,__LINE__, sizeof(struct _thw_RTPinfo));
 	// allocate MURAM memory for the RTP info, which is required to be accessed and modified by ucode
 	h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 	if (!h_FmMuram)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		return NULL;
 	}
 
@@ -120,7 +120,7 @@ static void cdx_muram_rtpinfo_free(void *hw_flow)
 	h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 	if (!h_FmMuram)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		return;
 	}
 
@@ -140,7 +140,7 @@ int cdx_rtp_set_hwinfo_fields(PRTPflow pFlow, PSockEntry pFromSocket)
 
 	if (create_ddr_and_copy_from_muram((void *)hw_flow->rtp_info, (void **)&pRtp_info, sizeof(struct _thw_RTPinfo)) == NULL)
 	{
-		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __func__, __LINE__);
 		return -1;
 	}
 	/* reflect changes to hardware flow */
@@ -166,14 +166,14 @@ int cdx_rtp_set_hwinfo_fields(PRTPflow pFlow, PSockEntry pFromSocket)
 		flags |= RTP_OFFLOAD_SEQ_TAKEOVER;
 
 	DPA_INFO("%s(%d) MarkerBitConfMode %d , takeover_flags %x, MARKER_BIT_TAKEOVER %x\n",
-			__FUNCTION__, __LINE__,
+			__func__, __LINE__,
 			pFlow->takeover_flags, pFlow->MarkerBitConfMode, MARKER_BIT_TAKEOVER);
 
 	// Marker Bit Configuration Mode 1 -- Processing is done to Reset the bit (1->0,0->0)
 	if ((pFlow->takeover_flags & MARKER_BIT_TAKEOVER) &&
 			(pFlow->MarkerBitConfMode))
 	{
-		DPA_INFO("%s(%d) \n", __FUNCTION__, __LINE__);
+		DPA_INFO("%s(%d) \n", __func__, __LINE__);
 		flags |= RTP_OFFLOAD_RESET_MARKER_BIT;
 	}
 
@@ -207,7 +207,7 @@ int cdx_rtp_set_hwinfo_fields(PRTPflow pFlow, PSockEntry pFromSocket)
 	if (pFlow->takeover_mode  & RTP_TAKEOVER_MODE_TSINCR_FREQ)
 		flags |= RTP_OFFLOAD_TS_TAKEOVER_SAMPL_FREQ;
 
-	DPA_INFO("%s(%d) flags %x \n", __FUNCTION__,__LINE__, flags);
+	DPA_INFO("%s(%d) flags %x \n", __func__,__LINE__, flags);
 	pRtp_info->TimestampBase = cpu_to_be32(pFlow->TimestampBase);
 	pRtp_info->flags = cpu_to_be16(flags);
 	pRtp_info->Seq = cpu_to_be16(pFlow->Seq);
@@ -227,14 +227,14 @@ static int rtp_flow_add(PRTPflow pFlow, U32 hash, PSockEntry pFromSocket, PSockE
 	if (!pFlow->hw_flow)
 	{
 		DPA_ERROR("%s::unable to alloc mem for pFlow->hw_flow\n",
-				__FUNCTION__);
+				__func__);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 
 	pFlow->hw_flow->rtp_info = cdx_rtp_alloc_muram_rtpinfo();
 	if (!pFlow->hw_flow->rtp_info)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		kfree(pFlow->hw_flow);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
@@ -250,7 +250,7 @@ static int rtp_flow_add(PRTPflow pFlow, U32 hash, PSockEntry pFromSocket, PSockE
 
 	if (cdx_rtp_set_hwinfo_fields(pFlow, pFromSocket) != 0)
 	{
-		DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __func__,__LINE__);
 		cdx_muram_rtpinfo_free((void *)pFlow->hw_flow->rtp_info);
 		kfree(pFlow->hw_flow);
 		pFlow->hw_flow = NULL;
@@ -298,7 +298,7 @@ static void rtp_flow_unlink(struct _thw_rtpflow *hw_flow, U32 hash)
 			(ExternalHashTableDeleteKey(hw_flow->td, 
 																	hw_flow->eeh_entry_index, hw_flow->eeh_entry_handle))) 
 	{
-		DPA_ERROR("%s(%d)::unable to remove entry from hash table\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d)::unable to remove entry from hash table\n", __func__, __LINE__);
 	}
 	//free table entry
 	if (hw_flow->eeh_entry_handle)
@@ -384,13 +384,13 @@ static int RTP_change_flow(PRTPflow pFlow, U16 ingress_socketID, U16 egress_sock
 	// create an entry in ehash table
 	if(cdx_create_rtp_conn_in_classif_table(pFlow, pingress_socket, pegress_socket))
 	{
-		DPA_ERROR("%s(%d) error in creating eehash table entry\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) error in creating eehash table entry\n", __func__, __LINE__);
 		return -1;
 	}
 
 	if (cdx_rtp_set_hwinfo_fields(pFlow, pingress_socket) != 0)
 	{
-		DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __func__,__LINE__);
 		return -1;
 	}
 	cdx_ehash_set_rtp_info_params(hw_flow->ehash_rtp_relay_params, pFlow, pingress_socket);
@@ -534,13 +534,13 @@ static U16 RTP_Call_Open (U16 *p, U16 Length)
 	if(!pSocketA->pRtEntry)
 	{
 		DPA_INFO("%s(%d) missing route, checking for route\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 		SOCKET4_check_route(pSocketA);
 	}
 	if(!pSocketB->pRtEntry)
 	{
 		DPA_INFO("%s(%d) missing route, checking for route\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 		SOCKET4_check_route(pSocketB);
 	}
 
@@ -665,13 +665,13 @@ static U16 RTP_Call_Update (U16 *p, U16 Length)
 	if(!pSocketA->pRtEntry)
 	{
 		DPA_INFO("%s(%d) missing route, checking for route\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 		SOCKET4_check_route(pSocketA);
 	}
 	if(!pSocketB->pRtEntry)
 	{
 		DPA_INFO("%s(%d) missing route, checking for route\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 		SOCKET4_check_route(pSocketB);
 	}
 
@@ -755,7 +755,7 @@ static U16 RTP_Call_Control (U16 *p, U16 Length)
 		return ERR_RTP_UNKNOWN_CALL;
 
 	DPA_INFO("%s(%d) RTPCmd.ControlDir %0x\n",
-			__FUNCTION__,__LINE__,RTPCmd.ControlDir);
+			__func__,__LINE__,RTPCmd.ControlDir);
 	pCall->AtoB_flow->state = (RTPCmd.ControlDir & 0x1);
 	pCall->BtoA_flow->state = (RTPCmd.ControlDir & 0x2);
 	if (RTPCmd.ControlDir & 0x4)
@@ -765,13 +765,13 @@ static U16 RTP_Call_Control (U16 *p, U16 Length)
 		if (RTPCmd.ControlDir & 0x8)
 		{
 			pCall->AtoB_flow->hw_flow->flags |= RTP_RELAY_ENABLE_VLAN_P_BIT_LEARNING;
-			DPA_INFO("%s(%d) AtoB flow VLAN learningn feature is enabled\n",__FUNCTION__,__LINE__);
+			DPA_INFO("%s(%d) AtoB flow VLAN learningn feature is enabled\n",__func__,__LINE__);
 		}
 
 		if (RTPCmd.ControlDir & 0x16)
 		{
 			pCall->BtoA_flow->hw_flow->flags |= RTP_RELAY_ENABLE_VLAN_P_BIT_LEARNING;
-			DPA_INFO("%s(%d) BtoA flow VLAN learningn feature is enabled\n",__FUNCTION__,__LINE__);
+			DPA_INFO("%s(%d) BtoA flow VLAN learningn feature is enabled\n",__func__,__LINE__);
 		}
 	}
 	else
@@ -788,13 +788,13 @@ static U16 RTP_Call_Control (U16 *p, U16 Length)
 			{
 				vlan_hdr_val = *(pCall->AtoB_flow->hw_flow->vlan_hdr_ptr+ii);
 				DPA_INFO("%s(%d) vlan-hdr val %0x, pbit bit %d\n",
-						__FUNCTION__,__LINE__,vlan_hdr_val,pCall->AtoB_flow->vlan_p_bit_val);
+						__func__,__LINE__,vlan_hdr_val,pCall->AtoB_flow->vlan_p_bit_val);
 				vlan_hdr_val = vlan_hdr_val & 0xff1fffff;
 				vlan_hdr_val = vlan_hdr_val | 
 					(pCall->AtoB_flow->vlan_p_bit_val << 21);
 				*(pCall->AtoB_flow->hw_flow->vlan_hdr_ptr+ii) = vlan_hdr_val;
 				DPA_INFO("%s(%d) new vlan-hdr val %x\n",
-						__FUNCTION__,__LINE__,vlan_hdr_val);
+						__func__,__LINE__,vlan_hdr_val);
 			}
 		}
 		if (RTPCmd.vlanPbitConf & 0x02) // packets received on socket B
@@ -804,14 +804,14 @@ static U16 RTP_Call_Control (U16 *p, U16 Length)
 			{
 				vlan_hdr_val = *(pCall->BtoA_flow->hw_flow->vlan_hdr_ptr+ii);
 				DPA_INFO("%s(%d) vlan-hdr val %0x, pbit val %d\n",
-						__FUNCTION__,__LINE__,vlan_hdr_val,
+						__func__,__LINE__,vlan_hdr_val,
 						pCall->BtoA_flow->vlan_p_bit_val);
 				vlan_hdr_val = vlan_hdr_val & 0xff1fffff;
 				vlan_hdr_val = vlan_hdr_val | 
 					(pCall->BtoA_flow->vlan_p_bit_val << 21);
 				*(pCall->BtoA_flow->hw_flow->vlan_hdr_ptr+ii) = vlan_hdr_val;
 				DPA_INFO("%s(%d) new vlan-hdr val %0x\n",
-						__FUNCTION__,__LINE__,vlan_hdr_val);
+						__func__,__LINE__,vlan_hdr_val);
 			}
 		}
 	}	
@@ -823,7 +823,7 @@ static U16 RTP_Call_Control (U16 *p, U16 Length)
 		if (create_ddr_and_copy_from_muram((void *)pCall->AtoB_flow->hw_flow->rtp_info,
 					(void **)&pRtp_info, sizeof(struct _thw_RTPinfo)) == NULL)
 		{
-			DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __func__, __LINE__);
 			return -1;
 		}
 
@@ -840,7 +840,7 @@ static U16 RTP_Call_Control (U16 *p, U16 Length)
 		if (create_ddr_and_copy_from_muram((void *)pCall->BtoA_flow->hw_flow->rtp_info,
 					(void **)&pRtp_info, sizeof(struct _thw_RTPinfo)) == NULL)
 		{
-			DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __func__, __LINE__);
 			return -1;
 		}
 
@@ -891,11 +891,11 @@ static int display_rtp_info(struct _thw_RTPinfo	*rtp_info_muram)
 {
 	struct _thw_RTPinfo *rtp_info = NULL;
 
-	DPA_INFO("%s (%d) RTP_INFO: \n", __FUNCTION__,__LINE__);
+	DPA_INFO("%s (%d) RTP_INFO: \n", __func__,__LINE__);
 	if (create_ddr_and_copy_from_muram((void *)rtp_info_muram, (void **)&rtp_info,
 				sizeof(struct _thw_RTPinfo)) == NULL)
 	{
-		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __func__, __LINE__);
 		return -1;
 	}
 
@@ -970,7 +970,7 @@ static U16 RTP_Call_TakeOver (U16 *p, U16 Length)
 	rtp_info = cdx_rtp_alloc_muram_rtpinfo();
 	if (!rtp_info)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 
@@ -978,7 +978,7 @@ static U16 RTP_Call_TakeOver (U16 *p, U16 Length)
 
 	/* reflect changes to hardware flow */
 	DPA_INFO("%s(%d) takeover flags %x, takeover mode %x \n",
-			__FUNCTION__, __LINE__, pflow->takeover_flags, pflow->takeover_mode);
+			__func__, __LINE__, pflow->takeover_flags, pflow->takeover_mode);
 	// in case of SSRC AUTO takeover , set SSRC value.
 	if (pflow->takeover_mode & RTP_TAKEOVER_MODE_SSRC_AUTO)
 	{
@@ -999,7 +999,7 @@ static U16 RTP_Call_TakeOver (U16 *p, U16 Length)
 
 	if (cdx_rtp_set_hwinfo_fields(pflow, pSocket) != 0)
 	{
-		DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __func__,__LINE__);
 		return -1;
 	}
 	cdx_ehash_set_rtp_info_params(hw_flow->ehash_rtp_relay_params, 
@@ -1022,7 +1022,7 @@ static U16 RTP_Call_TakeOver (U16 *p, U16 Length)
 	{
 		if (ExternalHashTableFmPcdHcSync(hw_flow->td))
 		{
-			DPA_ERROR("%s(%d) ExternalHashTableFmPcdHcSync failed\n", __FUNCTION__,__LINE__);
+			DPA_ERROR("%s(%d) ExternalHashTableFmPcdHcSync failed\n", __func__,__LINE__);
 		}
 	}
 
@@ -1084,14 +1084,14 @@ static U16 RTP_Call_SpecialTx_Control (U16 *p, U16 Length)
 	if (create_ddr_and_copy_from_muram((void *)pCall->AtoB_flow->hw_flow->rtp_info,
 				(void **)&pRtp_info_AtoB, sizeof(struct _thw_RTPinfo)) == NULL)
 	{
-		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __func__, __LINE__);
 		return -1;
 	}
 	if (create_ddr_and_copy_from_muram((void *)pCall->BtoA_flow->hw_flow->rtp_info,
 				(void **)&pRtp_info_BtoA, sizeof(struct _thw_RTPinfo)) == NULL)
 	{
 		kfree(pRtp_info_AtoB);
-		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __func__, __LINE__);
 		return -1;
 	}
 
@@ -1185,7 +1185,7 @@ static int RTP_query_stats_common(PRTCPQueryResponse pRTPRep, PRTCPStats pStats)
 		num_rx_valid = pStats->num_rx_pkts - first_packet - pStats->num_late_pkts - pStats->packets_duplicated - pStats->num_big_jumps;
 		if((pStats->average_reception_period >= num_rx_valid) && (num_rx_valid))
 		{
-			DPA_INFO("%s(%d) \n", __FUNCTION__,__LINE__); //TODO_RTP_TIME
+			DPA_INFO("%s(%d) \n", __func__,__LINE__); //TODO_RTP_TIME
 
 			pRTPRep->average_reception_period = pStats->average_reception_period / num_rx_valid; //expressed in us
 		}
@@ -1257,7 +1257,7 @@ static int RTP_reset_stats(PRTCPStats pStats_muram, U8 type)
 
 	if (create_ddr_and_copy_from_muram((void *)pStats_muram, (void **)&pStats, sizeof(RTCPStats)) == NULL)
 	{
-		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) Failed to copy from muram to ddr:\n", __func__, __LINE__);
 		return -1;
 	}
 

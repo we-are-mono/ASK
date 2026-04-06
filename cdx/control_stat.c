@@ -33,7 +33,7 @@ U16 dpa_iface_stats_get( struct dpa_iface_info *iface_info, struct iface_stats *
 {
 	if (!(iface_info->if_flags & IF_STATS_ENABLED))
 	{
-		DPA_ERROR("%s:: iface stats not enabled if_flags 0x%x\n", __FUNCTION__, iface_info->if_flags);
+		DPA_ERROR("%s:: iface stats not enabled if_flags 0x%x\n", __func__, iface_info->if_flags);
 		return ERR_STAT_FEATURE_NOT_ENABLED;
 	}
 
@@ -57,7 +57,7 @@ U16 dpa_iface_stats_get( struct dpa_iface_info *iface_info, struct iface_stats *
 	}
 	else
 	{
-		DPA_ERROR("%s:: Invalid interface type 0x%x\n", __FUNCTION__, iface_info->if_flags);
+		DPA_ERROR("%s:: Invalid interface type 0x%x\n", __func__, iface_info->if_flags);
 		return ERR_INVALID_INTERFACE_TYPE;
 	}
 
@@ -87,13 +87,13 @@ U16 interface_stats_reset(uint32_t interface)
 	if ((iface_info = dpa_get_ifinfo_by_itfid(interface)) == NULL)
 	{
 		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __FUNCTION__, interface);
+		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, interface);
 		return ERR_UNKNOWN_INTERFACE;
 	}
 	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
-		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __FUNCTION__, ret);
+		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
 	dpa_iface_stats_reset(iface_info, &ifstats);
@@ -112,13 +112,13 @@ static U16 phyif_stats_get(U16 interface, PStatInterfacePktResponse rsp, U8 do_r
 	if ((iface_info = dpa_get_ifinfo_by_itfid((uint32_t)interface)) == NULL)
 	{
 		spin_unlock(&dpa_devlist_lock);
-		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __FUNCTION__, interface);
+		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, interface);
 		return ERR_UNKNOWN_INTERFACE;
 	}
 	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
-		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __FUNCTION__, ret);
+		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
 	
@@ -146,7 +146,7 @@ static U16 stats_interface_pkt(U8 action, U16 interface, PStatInterfacePktRespon
 		if ((ackstatus = phyif_stats_get(interface, statInterfacePktRsp,
 							action & FPP_STAT_RESET)) != NO_ERR)
 		{
-			DPA_ERROR("%s:: Failed to get interface(%d) stats, return value %d\n", __FUNCTION__, interface, ackstatus);
+			DPA_ERROR("%s:: Failed to get interface(%d) stats, return value %d\n", __func__, interface, ackstatus);
 			return ackstatus;
 		}
 
@@ -157,7 +157,7 @@ static U16 stats_interface_pkt(U8 action, U16 interface, PStatInterfacePktRespon
 	{
 		if ((ackstatus = interface_stats_reset((uint32_t)interface)) != NO_ERR)
 		{
-			DPA_ERROR("%s:: Failed to reset interface(%d) stats, return value %d\n", __FUNCTION__, interface, ackstatus);
+			DPA_ERROR("%s:: Failed to reset interface(%d) stats, return value %d\n", __func__, interface, ackstatus);
 			return ackstatus;
 		}
 	}
@@ -370,7 +370,7 @@ static U16 M_stat_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 				slist_for_each(pEntry, entry, &pppoe_cache[x], list)
 					if ((ackstatus = interface_stats_reset((uint32_t)pEntry->itf.index)) != NO_ERR)
 					{
-						DPA_ERROR("%s:: Failed to reset the pppoe stats.\n", __FUNCTION__);
+						DPA_ERROR("%s:: Failed to reset the pppoe stats.\n", __func__);
 						goto end;
 					}
 			}
@@ -450,7 +450,7 @@ static U16 M_stat_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 				slist_for_each(pEntry, entry, &vlan_cache[x], list)
 					if ((ackstatus = interface_stats_reset((uint32_t)pEntry->itf.index)) != NO_ERR)
 					{
-						DPA_ERROR("%s:: Failed to reset the vlan stats.\n", __FUNCTION__);
+						DPA_ERROR("%s:: Failed to reset the vlan stats.\n", __func__);
 						goto end;
 					}
 			}
@@ -516,7 +516,7 @@ static U16 M_stat_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 				slist_for_each(pEntry, entry, &tunnel_name_cache[x], list)
 					if ((ackstatus = interface_stats_reset((uint32_t)pEntry->itf.index)) != NO_ERR)
 					{
-						DPA_ERROR("%s:: Failed to reset the tunnel stats.\n", __FUNCTION__);
+						DPA_ERROR("%s:: Failed to reset the tunnel stats.\n", __func__);
 						goto end;
 					}
 			}

@@ -147,12 +147,12 @@ int cdxdrv_modify_missaction_policer_profile(struct cdx_fman_info *finfo, uint32
 	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
 	if (!handle) {
 		printk("%s::unable to modify profile for type %d\n",
-				__FUNCTION__, type);
+				__func__, type);
 		return FAILURE;
 	}	
 #ifdef QOS_DEBUG
 	printk("%s::plcr profile modified for type %d, mode %d, handle %p\n",
-			__FUNCTION__, type, finfo->expt_ratelim_mode, handle);
+			__func__, type, finfo->expt_ratelim_mode, handle);
 #endif
 	return SUCCESS;
 }
@@ -206,12 +206,12 @@ int cdxdrv_create_missaction_policer_profiles(struct cdx_fman_info *finfo)
 		handle = FM_PCD_PlcrProfileSet(h_FmPcd, &Params);
 		if (!handle) {
 			printk("%s::unable to set profile for type %d\n",
-					__FUNCTION__, ii);
+					__func__, ii);
 			return FAILURE;
 		}	
 #ifdef QOS_DEBUG
 		printk("%s::plcr profile modified for type %d, mode %d, handle %p\n",
-				__FUNCTION__, ii, finfo->expt_ratelim_mode, handle);
+				__func__, ii, finfo->expt_ratelim_mode, handle);
 		printk("cir %d, pir %d, cbs %d, pbs %d\n",
 				Params.nonPassthroughAlgParams.committedInfoRate,
 				Params.nonPassthroughAlgParams.peakOrExcessInfoRate,
@@ -234,7 +234,7 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 	//init default cir and pir values for port
 	if (!(iface_info->if_flags & IF_TYPE_ETHERNET)) {
 		DPA_ERROR("%s::%d interface %s is not ethernet interface. Cannot configure it other than ethernet interfaces(flag 0x%x). \n",
-				__FUNCTION__, __LINE__, iface_info->name, iface_info->if_flags);
+				__func__, __LINE__, iface_info->name, iface_info->if_flags);
 		return FAILURE;
 	}
 
@@ -253,18 +253,18 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 	else
 	{
 		DPA_ERROR("%s::%d interface %s speed(%u) is not 1G or 10G. Configure proper value. \n",
-				__FUNCTION__, __LINE__, iface_info->name, iface_info->eth_info.speed);
+				__func__, __LINE__, iface_info->name, iface_info->eth_info.speed);
 		return FAILURE;
 	}
 
 	profhandle = fm_port_get_handle(port_handle);
 #ifdef QOS_DEBUG
-	printk("%s::creating profile for port %s, hwportid %d\n", __FUNCTION__,
+	printk("%s::creating profile for port %s, hwportid %d\n", __func__,
 			iface_info->name, hardwarePortId);
 #endif
 	if (FM_PORT_PcdPlcrAllocProfiles(profhandle, 1)) {
 		DPA_ERROR("%s::unable to alloc plcr profile for dev %s\n",
-				__FUNCTION__, iface_info->name);
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
@@ -300,14 +300,14 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 	handle = FM_PCD_PlcrProfileSet(h_FmPcd, &Params);
 	if (!handle) {
 		DPA_ERROR("%s::unable to profile set for port %s\n",
-				__FUNCTION__, iface_info->name);
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 	port_rate_lim_mode[hardwarePortId].handle = handle;
 	port_rate_lim_mode[hardwarePortId].h_FmPcd = h_FmPcd;
 #ifdef QOS_DEBUG
 	printk("%s::plcr profile for dev %s handle %p\n",
-			__FUNCTION__, iface_info->name, handle);
+			__func__, iface_info->name, handle);
 #endif
 	//change fmbm_rfne value to policer
 	//FM_PORT_SetBmiNia(profhandle, 0x4c0000);
@@ -333,7 +333,7 @@ int dpa_add_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
 	h_FmPcd = dpa_get_pcdhandle(eth_info->fman_idx);
 	if (h_FmPcd == NULL) {
 		DPA_ERROR("%s::no pcd handle for eth dev %s\n",
-				__FUNCTION__, iface_info->name);
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 	return(dpa_add_port_ff_policier_profile(iface_info,
@@ -370,7 +370,7 @@ int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
 		return FAILURE;	
 
 #ifdef QOS_DEBUG
-	printk("%s::modifying profile for %s::%d cir %d, pir %d\n", __FUNCTION__,
+	printk("%s::modifying profile for %s::%d cir %d, pir %d\n", __func__,
 			ifname, hardwarePortId, cir, pir);
 #endif
 	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
@@ -394,7 +394,7 @@ int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
 	else
 	{
 		DPA_ERROR("%s::%d interface %s speed(%u) is not 1G or 10G. Configure proper value. \n",
-				__FUNCTION__, __LINE__, iface_info->name, iface_info->eth_info.speed);
+				__func__, __LINE__, iface_info->name, iface_info->eth_info.speed);
 		return FAILURE;
 	}
 
@@ -419,14 +419,14 @@ int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
 	handle = FM_PCD_PlcrProfileSet(port_rate_lim_mode[hardwarePortId].h_FmPcd, &Params);
 	if (!handle) {
 		printk("%s::unable to modify profile for port %d\n",
-				__FUNCTION__, hardwarePortId);
+				__func__, hardwarePortId);
 		return FAILURE;
 	}
 	port_rate_lim_mode[hardwarePortId].cir_value = cir;
 	port_rate_lim_mode[hardwarePortId].pir_value = pir;
 #ifdef QOS_DEBUG
 	printk("%s::port %d cir value %d, pir value %d\n",
-			__FUNCTION__, hardwarePortId, cir, pir);
+			__func__, hardwarePortId, cir, pir);
 #endif
 	return SUCCESS;
 }
@@ -473,7 +473,7 @@ int cdx_get_expt_rate(void *pcmd)
 	cmd = (PQosExptRateCommand)pcmd;
 
 	if (cmd->expt_iftype != CDX_EXPT_ETH_RATELIMIT) {
-		DPA_ERROR("%s::type %d not supported\n", __FUNCTION__, cmd->expt_iftype);
+		DPA_ERROR("%s::type %d not supported\n", __func__, cmd->expt_iftype);
 		return -1;
 	}
 	finfo = (fman_info + FMAN_INDEX);
@@ -484,7 +484,7 @@ int cdx_get_expt_rate(void *pcmd)
 	cmd->burst_size =  finfo->expt_ratelim_burst_size;
 	get_plcr_counter(handle, &cmd->counterval[0], cmd->clear);
 #ifdef QOS_DEBUG
-	printk("%s::type %d rate %d pps\n", __FUNCTION__, cmd->expt_iftype, cmd->pkts_per_sec);
+	printk("%s::type %d rate %d pps\n", __func__, cmd->expt_iftype, cmd->pkts_per_sec);
 	printk("red %d yellow %d, green %d red recolored %d, yellow recolored %d\n",
 			cmd->counterval[RED_TOTAL], cmd->counterval[YELLOW_TOTAL],
 			cmd->counterval[GREEN_TOTAL], cmd->counterval[RED_RECOLORED],
@@ -506,7 +506,7 @@ int cdx_get_ff_rate(void *pcmd)
 	}
 	handle = port_rate_lim_mode[hardwarePortId].handle;
 	if (!handle)  {
-		printk("%s::invalid handle\n", __FUNCTION__);
+		printk("%s::invalid handle\n", __func__);
 		return FAILURE;	
 	}
 	cmd->cir = port_rate_lim_mode[hardwarePortId].cir_value;
@@ -514,7 +514,7 @@ int cdx_get_ff_rate(void *pcmd)
 	get_plcr_counter(handle, &cmd->counterval[0], cmd->clear);
 #ifdef QOS_DEBUG
 	printk("%s::port %s::%d cir value %d, pir value %d\n",
-			__FUNCTION__, cmd->interface, hardwarePortId, cmd->cir, cmd->pir);
+			__func__, cmd->interface, hardwarePortId, cmd->cir, cmd->pir);
 	printk("red %d yellow %d, green %d red recolored %d, yellow recolored %d\n",
 			cmd->counterval[RED_TOTAL], cmd->counterval[YELLOW_TOTAL],
 			cmd->counterval[GREEN_TOTAL], cmd->counterval[RED_RECOLORED],
@@ -527,7 +527,7 @@ void *create_ddr_and_copy_from_muram(void *muramptr, void **ddrptr, U32 size)
 {
 	if ((*ddrptr = kmalloc(size, GFP_KERNEL)) == NULL)
 	{
-		DPA_ERROR("%s(%d) Memory allocation failure:\n", __FUNCTION__, __LINE__);
+		DPA_ERROR("%s(%d) Memory allocation failure:\n", __func__, __LINE__);
 		return NULL;
 	}
 	/* Use memcpy_fromio for MURAM - it's device memory on ARM64 */
@@ -614,14 +614,14 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo)
 		handle = FM_PCD_PlcrProfileSet(h_FmPcd, &Params);
 		if (!handle) {
 			printk("%s::unable to set profile for queue %d\n",
-					__FUNCTION__, queue_no);
+					__func__, queue_no);
 			return FAILURE;
 		}
 		finfo->ingress_policer_info[queue_no].handle = handle;
 		finfo->ingress_policer_info[queue_no].profile_id = FmPcdPlcrProfileGetAbsoluteId(finfo->ingress_policer_info[queue_no].handle);
 #ifdef QOS_DEBUG
 		printk("%s::Ingress plcr profile created for  queue_no %d, handle %p,profile_id %d\n",
-				__FUNCTION__, queue_no,handle,finfo->ingress_policer_info[queue_no].profile_id);
+				__func__, queue_no,handle,finfo->ingress_policer_info[queue_no].profile_id);
 		printk("cir %u, pir %u, cbs %d, pbs %d\n",
 				Params.nonPassthroughAlgParams.committedInfoRate,
 				Params.nonPassthroughAlgParams.peakOrExcessInfoRate,
@@ -653,7 +653,7 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 
 
 	if (finfo->ingress_policer_info[queue_no].policer_on == DISABLE_INGRESS_POLICER) {
-		printk("%s::plcr profile is disabled on queue %d\n",__FUNCTION__, queue_no);
+		printk("%s::plcr profile is disabled on queue %d\n",__func__, queue_no);
 		return FAILURE;
 	}
 
@@ -702,7 +702,7 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
 	if (!handle) {
 		printk("%s::unable to modify profile for queue %d\n",
-				__FUNCTION__, queue_no);
+				__func__, queue_no);
 		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
 	}
 	finfo->ingress_policer_info[queue_no].cir_value = cir;
@@ -711,7 +711,7 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 	finfo->ingress_policer_info[queue_no].pbs = pbs;
 #ifdef QOS_DEBUG
 	printk("%s::plcr profile modified for queue %d, handle %p\n",
-			__FUNCTION__, queue_no, handle);
+			__func__, queue_no, handle);
 #endif
 	return SUCCESS;
 }
@@ -768,7 +768,7 @@ int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t
 	handle = FM_PCD_PlcrProfileSet(finfo->pcd_handle, &Params);
 	if (!handle) {
 		printk("%s::unable to set default values for queue %d\n",
-				__FUNCTION__, queue_no);
+				__func__, queue_no);
 		return ERR_QM_INGRESS_SET_PROFILE_FAILED;
 	}
 
@@ -794,7 +794,7 @@ int cdxdrv_set_default_qos_policer_profile(struct cdx_fman_info *finfo, uint32_t
 #endif /* endif for SEC_PROFILE_SUPPORT */
 #ifdef QOS_DEBUG
 	printk("%s::plcr profile set to default for queue %d, handle %p\n",
-			__FUNCTION__, queue_no, handle);
+			__func__, queue_no, handle);
 #endif
 	return SUCCESS;
 }
@@ -803,7 +803,7 @@ int cdxdrv_enable_or_disable_ingress_policer(struct cdx_fman_info *finfo, uint32
 {
 	if(oper) {
 		if(finfo->ingress_policer_info[queue_no].policer_on == ENABLE_INGRESS_POLICER)
-			printk("%s:: Policer already enabled on queue no %d\n",__FUNCTION__,queue_no);
+			printk("%s:: Policer already enabled on queue no %d\n",__func__,queue_no);
 		else {
 			finfo->ingress_policer_info[queue_no].policer_on = ENABLE_INGRESS_POLICER;
 			return cdxdrv_modify_ingress_qos_policer_profile(finfo,
@@ -830,13 +830,13 @@ int cdxdrv_ingress_policer_reset(struct cdx_fman_info *finfo)
 		if(finfo->ingress_policer_info[ii].handle) {
 			if (cdxdrv_set_default_qos_policer_profile(finfo,ii)!= SUCCESS)
 				printk("%s::plcr reset failed for queue %d, handle %p\n",
-						__FUNCTION__, ii, finfo->ingress_policer_info[ii].handle);
+						__func__, ii, finfo->ingress_policer_info[ii].handle);
 			else
 				finfo->ingress_policer_info[ii].policer_on = DISABLE_INGRESS_POLICER;
 		}
 		else
 			printk("%s::plcr reset failed as handle is NULL for queue %d\n",
-					__FUNCTION__, ii);
+					__func__, ii);
 	}
 	return SUCCESS;
 }
@@ -849,13 +849,13 @@ int cdxdrv_sec_policer_reset(struct cdx_fman_info *finfo)
 	if(finfo->ingress_policer_info[queue_no].handle) {
 		if (cdxdrv_set_default_qos_policer_profile(finfo, queue_no)!= SUCCESS)
 			printk("%s::plcr reset failed for sec profile, handle %p\n",
-					__FUNCTION__, finfo->ingress_policer_info[queue_no].handle);
+					__func__, finfo->ingress_policer_info[queue_no].handle);
 		else
 			finfo->ingress_policer_info[queue_no].policer_on = DISABLE_INGRESS_POLICER;
 	}
 	else
 		printk("%s::plcr reset failed as handle is NULL for sec profile queue\n",
-				__FUNCTION__);
+				__func__);
 	return SUCCESS;
 }
 #endif /* endif for SEC_PROFILE_SUPPORT */
@@ -876,7 +876,7 @@ int cdxdrv_ingress_policer_stats(struct cdx_fman_info *finfo,uint32_t queue_no,v
 
 #ifdef QOS_DEBUG
 	printk("%s:: queue %d policer_on %d red %d yellow %d, green %d red recolored %d, yellow recolored %d\n",
-			__FUNCTION__,queue_no,plcr_stats->policer_on,plcr_stats->counterval[RED_TOTAL],
+			__func__,queue_no,plcr_stats->policer_on,plcr_stats->counterval[RED_TOTAL],
 			plcr_stats->counterval[YELLOW_TOTAL],plcr_stats->counterval[GREEN_TOTAL],
 			plcr_stats->counterval[RED_RECOLORED],plcr_stats->counterval[YELLOW_RECOLORED]);
 #endif

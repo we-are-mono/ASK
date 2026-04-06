@@ -174,7 +174,7 @@ uint32_t ipsec_get_to_cp_fqid(void *handle)
 static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 		const struct qm_mr_entry *msg)
 {
-	DPAIPSEC_ERROR("%s::fqid %x(%d)\n", __FUNCTION__, fq->fqid, fq->fqid);
+	DPAIPSEC_ERROR("%s::fqid %x(%d)\n", __func__, fq->fqid, fq->fqid);
 }
 
 
@@ -194,7 +194,7 @@ void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle)
 	if ((x = xfrm_state_lookup_byhandle(dev_net(netdev), handle)) == NULL)
 	{
 		DPAIPSEC_ERROR("(%s)xfrm_state not found for handle %x\n",
-				__FUNCTION__, handle);
+				__func__, handle);
 		return NULL;
 	}
 	return x;
@@ -241,7 +241,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	struct dpa_napi_portal *np;;
 	/* check SEC errors here */
 #ifdef DPA_IPSEC_DEBUG1
-	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, \n offset %d sts %08x, cnt %d\n", __FUNCTION__,
+	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, \n offset %d sts %08x, cnt %d\n", __func__,
 			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
 			dq->fd.offset,dq->fd.status, ipsec_exception_pkt_cnt);
 
@@ -316,7 +316,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	if (unlikely(dpaa_eth_napi_schedule(percpu_priv, qm)))
 	{
 		DPAIPSEC_ERROR("%s(%d) dpaa_eth_napi_schedule failed\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 		return qman_cb_dqrr_stop;
 	}
 #endif /* CONFIG_FSL_ASK_QMAN_PORTAL_NAPI */
@@ -341,7 +341,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	}
 	protocol =  *((unsigned short*) (ptr + 12));
 #ifdef DPA_IPSEC_DEBUG1
-	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, offset %d netdev %p dev %s temp_dev =%s addr %llx sts %08x\n", __FUNCTION__,
+	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, offset %d netdev %p dev %s temp_dev =%s addr %llx sts %08x\n", __func__,
 			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
 			dq->fd.offset, net_dev, net_dev->name,net_dev->name, (uint64_t)dq->fd.addr, dq->fd.status);
 	DPAIPSEC_INFO(" sagd extracted from packet = %d \n",sagd_pkt);
@@ -402,7 +402,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 
 #ifdef DPA_IPSEC_DEBUG1
 	DPAIPSEC_INFO("%s::len %d ipsec_exception_pkt_cnt %d\n", 
-			__FUNCTION__, skb->len, ipsec_exception_pkt_cnt);
+			__func__, skb->len, ipsec_exception_pkt_cnt);
 #endif
 	/* netif_receive_skb(skb); */
 	if (use_gro)
@@ -416,7 +416,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 
 	}
 	else if ( (netif_receive_skb(skb) == NET_RX_DROP)) /* (netif_rx(skb) != NET_RX_SUCCESS) */
-		DPAIPSEC_ERROR("%s::packet dropped\n", __FUNCTION__);
+		DPAIPSEC_ERROR("%s::packet dropped\n", __func__);
 	return qman_cb_dqrr_consume;
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 pkt_drop:
@@ -499,12 +499,12 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 	}
 	if (!num_portals) {
 		DPAIPSEC_ERROR("%s::unable to get affined portal info\n",
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 
 #ifdef DPA_IPSEC_DEBUG
-	DPAIPSEC_INFO("%s::num_portals %d ::", __FUNCTION__, num_portals);
+	DPAIPSEC_INFO("%s::num_portals %d ::", __func__, num_portals);
 	for (ii = 0; ii < num_portals; ii++)
 		DPAIPSEC_INFO("%d ", portal_channel[ii]);
 	DPAIPSEC_INFO("\n");
@@ -512,22 +512,22 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 
 	if (get_ofport_max_dist(IPSEC_FMAN_IDX, info->ofport_handle, &max_dist) < 0)
 	{
-		DPAIPSEC_ERROR("%s::unable to get distributions for oh port\n", __FUNCTION__);
+		DPAIPSEC_ERROR("%s::unable to get distributions for oh port\n", __func__);
 		return -1;
 	}
 
-	DPAIPSEC_INFO("%s::max_dist : %d\n", __FUNCTION__, max_dist) ;
+	DPAIPSEC_INFO("%s::max_dist : %d\n", __func__, max_dist) ;
 
 	/* create all FQs */
 	info->expt_fq_count = 0;
 	/* get port id required for FQ creation */
 	if (get_ofport_portid(IPSEC_FMAN_IDX, info->ofport_handle, &portid)) {
-		DPAIPSEC_ERROR("%s::err getting of port id\n", __FUNCTION__) ;
+		DPAIPSEC_ERROR("%s::err getting of port id\n", __func__) ;
 		return -1;
 	}
 
 	if ((oh_iface_info = dpa_get_ohifinfo_by_portid(portid)) == NULL) {
-		DPAIPSEC_ERROR("%s::err getting oh iface info of port id %u\n", __FUNCTION__, portid) ;
+		DPAIPSEC_ERROR("%s::err getting oh iface info of port id %u\n", __func__, portid) ;
 		return -1;
 	}
 	if (oh_iface_info->pcd_proc_entry == NULL)
@@ -544,7 +544,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 		if (get_oh_port_pcd_fqinfo(IPSEC_FMAN_IDX, info->ofport_handle,
 					jj , &fqbase, &fqcount)) {
 			DPAIPSEC_ERROR("%s::err getting pcd fqinfo for dist %d\n",
-					__FUNCTION__,jj) ;
+					__func__,jj) ;
 			return FAILURE;
 		}
 
@@ -552,12 +552,12 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 		fqbase |= (portid << PORTID_SHIFT_VAL);
 
 		DPAIPSEC_INFO("%s::pcd FQ base for portid %d and  distribution id(%d): %x(%d), count %d\n",
-				__FUNCTION__, portid, jj, fqbase, fqbase, fqcount);
+				__func__, portid, jj, fqbase, fqbase, fqcount);
 
 		for (ii = 0; ii < fqcount; ii++)
 		{
 			DPAIPSEC_INFO("%s(%d) calling cdx_find_ipsec_pcd_fqinfo (%x)\n",
-					__FUNCTION__,__LINE__, fqbase);
+					__func__,__LINE__, fqbase);
 			if (!cdx_find_ipsec_pcd_fqinfo(fqbase, info))
 			{
 				fqbase++;
@@ -567,7 +567,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			/* create FQ for exception packets from ipsec ofline  port */
 			dpa_fq = kzalloc((sizeof(struct dpa_fq)),1);
 			if (!dpa_fq) {
-				DPAIPSEC_ERROR("%s::unable to alloc mem for dpa_fq\n", __FUNCTION__) ;
+				DPAIPSEC_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
 				return FAILURE;
 			}
 
@@ -597,7 +597,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			/* create FQ */
 			if (qman_create_fq(dpa_fq->fqid, 0, fq)) {
 				DPAIPSEC_ERROR("%s::qman_create_fq failed for fqid %d\n",
-						__FUNCTION__, dpa_fq->fqid);
+						__func__, dpa_fq->fqid);
 				goto err_ret;
 			}
 			opts.fqid = dpa_fq->fqid;
@@ -612,14 +612,14 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			/* init FQ */
 			if (qman_init_fq(fq, schedule, &opts)) {
 				DPAIPSEC_ERROR("%s::qman_init_fq failed for fqid %d\n",
-						__FUNCTION__, dpa_fq->fqid);
+						__func__, dpa_fq->fqid);
 				qman_destroy_fq(fq, 0);
 				goto err_ret;
 			}
 			cdx_create_type_fqid_info_in_procfs(fq, PCD_DIR, oh_iface_info->pcd_proc_entry, NULL);
 #ifdef DPA_IPSEC_DEBUG
 			DPAIPSEC_INFO("%s::created pcd fq %x(%d) for wlan packets "
-					"channel 0x%x\n", __FUNCTION__,
+					"channel 0x%x\n", __func__,
 					dpa_fq->fqid, dpa_fq->fqid, dpa_fq->channel);
 #endif
 			/* next FQ */
@@ -666,12 +666,12 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 	}
 	if (!num_portals) {
 		DPAIPSEC_ERROR("%s::unable to get affined portal info\n",
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 
 #ifdef DPA_IPSEC_DEBUG1
-	DPAIPSEC_INFO("%s::num_portals %d ::", __FUNCTION__, num_portals);
+	DPAIPSEC_INFO("%s::num_portals %d ::", __func__, num_portals);
 	for (ii = 0; ii < num_portals; ii++)
 		DPAIPSEC_INFO("%d ", portal_channel[ii]);
 	DPAIPSEC_INFO("\n");
@@ -685,7 +685,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 	if (!ipsecsa_info->shdesc_mem)
 	{
 		DPAIPSEC_ERROR("%s::kzalloc failed for SEC descriptor\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret0;
 	}
 	memset(ipsecsa_info->shdesc_mem, 0, (sizeof(struct sec_descriptor)+PRE_HDR_ALIGN));
@@ -697,7 +697,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 	if (errno < NUM_FQS_PER_SA)
 	{
 		DPAIPSEC_ERROR("%s::qman_alloc_fqid_range failed for allocating frame queues\n",
-				__FUNCTION__);
+				__func__);
 		goto err_ret1;
 	}
 #endif /* UNIQUE_IPSEC_CP_FQID */
@@ -705,7 +705,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 	sprintf(sa_id_name, "0x%x", handle);
 	if (cdx_create_dir_in_procfs(&ipsecsa_info->sa_proc_entry, sa_id_name, SA_DIR)) {
 		DPAIPSEC_ERROR("%s:: create pcd proc entry failed %s\n", 
-				__FUNCTION__, sa_id_name);
+				__func__, sa_id_name);
 		goto err_ret2;
 	}
 
@@ -720,7 +720,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 			case FQ_FROM_SEC:
 				{
 #ifdef DPA_IPSEC_DEBUG
-					printk("%s::handle %x\n", __FUNCTION__, handle);
+					printk("%s::handle %x\n", __func__, handle);
 #endif
 #ifdef UNIQUE_IPSEC_CP_FQID
 					flags = QMAN_FQ_FLAG_TO_DCPORTAL;
@@ -786,7 +786,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 #endif /* UNIQUE_IPSEC_CP_FQID */
 		{
 			DPAIPSEC_ERROR("%s::qman_create_fq failed for fqid %d\n",
-					__FUNCTION__, dpa_fq->fqid);
+					__func__, dpa_fq->fqid);
 			goto err_ret3;
 		}
 		dpa_fq->fqid = fq->fqid;
@@ -840,7 +840,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 		if((errno=qman_init_fq(fq, schedule, &opts)))
 		{
 			DPAIPSEC_ERROR("%s::qman_init_fq failed for fqid %d errno= %d\n",
-					__FUNCTION__, dpa_fq->fqid,errno);
+					__func__, dpa_fq->fqid,errno);
 			qman_destroy_fq(fq, 0);
 			goto err_ret4;
 			return FAILURE;
@@ -864,7 +864,7 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 
 #ifdef DPA_IPSEC_DEBUG
 		DPAIPSEC_INFO("%s::created fq %x(%d) for ipsec - type %d "
-				"channel 0x%x\n", __FUNCTION__,
+				"channel 0x%x\n", __func__,
 				dpa_fq->fqid, dpa_fq->fqid, ii, dpa_fq->channel);
 #endif
 	}
@@ -878,12 +878,12 @@ err_ret3:
 		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		if (qman_retire_fq(fq, NULL)) {
 			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		if (qman_oos_fq(fq)) {
 			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
@@ -913,12 +913,12 @@ void display_fq_info(void *handle)
 	ipsecsa_info = (struct dpa_ipsec_sainfo *)handle;
 	np = kzalloc(sizeof(struct qm_mcr_queryfq_np), GFP_KERNEL);
 	if (!np) {
-		printk("%s::error allocating fqnp\n", __FUNCTION__);
+		printk("%s::error allocating fqnp\n", __func__);
 		return;
 	}
 	fqd = kzalloc(sizeof(struct qm_fqd), GFP_KERNEL);
 	if (!fqd) {
-		printk("%s::error allocating fqd\n", __FUNCTION__);
+		printk("%s::error allocating fqd\n", __func__);
 		kfree(np);
 		return;
 	}
@@ -926,9 +926,9 @@ void display_fq_info(void *handle)
 	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
 		dpa_fq = &ipsecsa_info->sec_fq[ii];
 		fq = &dpa_fq->fq_base;
-		printk("===========================================\n%s::fqid %x(%d\n", __FUNCTION__, fq->fqid, fq->fqid);
+		printk("===========================================\n%s::fqid %x(%d\n", __func__, fq->fqid, fq->fqid);
 		if (qman_query_fq(fq, fqd)) {
-			printk("%s::error getting fq fields\n", __FUNCTION__);
+			printk("%s::error getting fq fields\n", __func__);
 			break;
 		}
 		printk("fqctrl\t%x\n", fqd->fq_ctrl);
@@ -937,7 +937,7 @@ void display_fq_info(void *handle)
 		printk("contextb\t%x\n", fqd->context_b);
 		printk("contexta\t%p\n", (void *)fqd->context_a.opaque);
 		if (qman_query_fq_np(fq, np)) {
-			printk("%s::error getting fqnp fields\n", __FUNCTION__);
+			printk("%s::error getting fqnp fields\n", __func__);
 			break;
 		}
 		printk("state\t%d\n", np->state);
@@ -957,19 +957,19 @@ static int ipsec_init_ohport(struct ipsec_info *info)
 			NULL, NULL);
 	if (info->ofport_handle < 0)
 	{
-		DPAIPSEC_ERROR("%s: Error in allocating OH port Channel\n", __FUNCTION__);
+		DPAIPSEC_ERROR("%s: Error in allocating OH port Channel\n", __func__);
 		return FAILURE;
 	}
 #ifdef DPA_IPSEC_DEBUG
-	DPAIPSEC_INFO("%s: allocated oh port %d\n", __FUNCTION__, info->ofport_handle);
+	DPAIPSEC_INFO("%s: allocated oh port %d\n", __func__, info->ofport_handle);
 #endif
 	if (get_ofport_info(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_channel, 
 				&info->ofport_td[0])) {
-		DPAIPSEC_ERROR("%s: Error in getting OH port info\n", __FUNCTION__);
+		DPAIPSEC_ERROR("%s: Error in getting OH port info\n", __func__);
 		return FAILURE;
 	}
 	if (get_ofport_portid(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_portid)) {
-		DPAIPSEC_ERROR("%s: Error in getting OH port id\n", __FUNCTION__);
+		DPAIPSEC_ERROR("%s: Error in getting OH port id\n", __func__);
 		return FAILURE;
 	}
 	printk("%s:: ipsec of port id = %d\n ", __func__, info->ofport_portid);
@@ -985,7 +985,7 @@ int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td,
 		uint32_t* portid)
 {
 	if (table_type >= MAX_MATCH_TABLES) {
-		DPAIPSEC_ERROR("%s::invalid table type %d\n", __FUNCTION__, table_type);
+		DPAIPSEC_ERROR("%s::invalid table type %d\n", __func__, table_type);
 		return FAILURE;
 	}
 	*td = info->ofport_td[table_type];
@@ -1009,7 +1009,7 @@ int cdx_init_skb_2bfreed_bpool(void)
 	bp = kzalloc(sizeof(struct dpa_bp), 0);
 	if (unlikely(bp == NULL)) {
 		DPAIPSEC_ERROR("%s(%d)::failed to mem for non_recyclable SKB free bman pool\n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 		return -1;
 	}
 	bp->size = CDX_MAX_SG_BUFF_SIZE;
@@ -1018,7 +1018,7 @@ int cdx_init_skb_2bfreed_bpool(void)
 	//find pools used by ethernet devices
 	if (get_phys_port_poolinfo_bysize(bp->size, &parent_pool_info)) {
 		DPAIPSEC_ERROR("%s::failed to locate eth bman pool for ipsec\n", 
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return -1;
 	}
@@ -1026,12 +1026,12 @@ int cdx_init_skb_2bfreed_bpool(void)
 	bp->dev = bp_parent->dev;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPAIPSEC_ERROR("%s::dpa_bp_alloc failed for bufpool of freeing skbs\n", 
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return -1;
 	}
 	DPAIPSEC_INFO("%s::bp->size :%zu, bpid %d\n", 
-			__FUNCTION__, bp->size, bp->bpid);
+			__func__, bp->size, bp->bpid);
 	skb_2bfreed_bpool_g = bp;
 	return 0;
 }
@@ -1045,7 +1045,7 @@ int cdx_init_scatter_gather_bpool(void)
 	bp = kzalloc(sizeof(struct dpa_bp), 0);
 	if (unlikely(bp == NULL)) {
 		DPAIPSEC_ERROR("%s::failed to allocate mem for SG bman pool\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 	bp->size = CDX_MAX_SG_BUFF_SIZE;
@@ -1054,30 +1054,30 @@ int cdx_init_scatter_gather_bpool(void)
 	//find pools used by ethernet devices and borrow buffers from it
 	if (get_phys_port_poolinfo_bysize(bp->size, &parent_pool_info)) {
 		DPAIPSEC_ERROR("%s::failed to locate eth bman pool for ipsec\n", 
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return -1;
 	}
 	bp_parent = dpa_bpid2pool(parent_pool_info.pool_id);
 #ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::parent bman pool for SG - bp %p, bpid %d paddr %lx vaddr %p dev %p\n", 
-			__FUNCTION__, bp, parent_pool_info.pool_id,
+			__func__, bp, parent_pool_info.pool_id,
 			(unsigned long)bp->paddr, bp->vaddr, bp->dev);
 #endif
 	bp->dev = bp_parent->dev;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPAIPSEC_ERROR("%s::dpa_bp_alloc failed for ipsec\n", 
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return -1;
 	}
 	DPAIPSEC_INFO("%s::bp->size :%zu, bpid %d\n", 
-			__FUNCTION__, bp->size, bp->bpid);
+			__func__, bp->size, bp->bpid);
 	sg_bpool_g = bp;
 
 	ret = dpaa_bp_alloc_n_add_buffs(bp, CDX_MAX_SG_BUFF_COUNT, 0);
 	DPAIPSEC_INFO("%s(%d) buffers added to ipsec pool %d info size %zu \n", 
-			__FUNCTION__,__LINE__,sg_bpool_g->bpid,
+			__func__,__LINE__,sg_bpool_g->bpid,
 			sg_bpool_g->size);
 	return 0;
 }
@@ -1088,26 +1088,26 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	//int buffer_count = 0, ret = 0, refill_cnt ;
 	//int ret =0;
 	printk (KERN_INFO"\n ################## %s", 
-			__FUNCTION__);
+			__func__);
 
 	bp = kzalloc(sizeof(struct dpa_bp), 0);
 	if (unlikely(bp == NULL)) {
 		DPAIPSEC_ERROR("%s::failed to allocate mem for bman pool for ipsec\n", 
-				__FUNCTION__);
+				__func__);
 		return -1;
 	}
 
 	//find pools used by ethernet devices and borrow buffers from it
 	if (get_phys_port_poolinfo_bysize(1700, &info->parent_pool_info)) {
 		DPAIPSEC_ERROR("%s::failed to locate eth bman pool for ipsec\n", 
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return -1;
 	}
 	bp_parent = dpa_bpid2pool(info->parent_pool_info.pool_id);
 #ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::parent bman pool for ipsec - bp %p, bpid %d paddr %lx vaddr %p dev %p\n", 
-			__FUNCTION__, bp, info->parent_pool_info.pool_id,
+			__func__, bp, info->parent_pool_info.pool_id,
 			(unsigned long)bp->paddr, bp->vaddr, bp->dev);
 #endif
 	bp->dev = bp_parent->dev;
@@ -1116,14 +1116,14 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	bp->free_buf_cb = _dpa_bp_free_pf;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPAIPSEC_ERROR("%s::dpa_bp_alloc failed for ipsec\n", 
-				__FUNCTION__);
+				__func__);
 		kfree(bp);
 		return -1;
 	}
 	DPAIPSEC_INFO("%s::bp->size :%zu, bpid %d\n", 
-			__FUNCTION__, bp->size, bp->bpid);
+			__func__, bp->size, bp->bpid);
 	printk (KERN_INFO"\n ################## %s::bp->size :%zu, bpid %d\n", 
-			__FUNCTION__, bp->size, bp->bpid);
+			__func__, bp->size, bp->bpid);
 	info->ipsec_bp = bp;
 
 #if 0 // instead allocate max 64k size buffers and add bman
@@ -1134,7 +1134,7 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 		ret = dpaa_eth_refill_bpools(bp, &refill_cnt);
 		if (ret < 0)
 		{
-			DPAIPSEC_ERROR("%s:: Error returned for dpaa_eth_refill_bpools %d\n", __FUNCTION__,ret);
+			DPAIPSEC_ERROR("%s:: Error returned for dpaa_eth_refill_bpools %d\n", __func__,ret);
 			break;
 		}
 
@@ -1143,12 +1143,12 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 
 	info->ipsec_bp->size =  bp_parent->size; 
 	DPAIPSEC_INFO("%s::%d buffers added to ipsec pool %d info size %d parent pool size %d\n", 
-			__FUNCTION__, buffer_count, info->ipsec_bp->bpid,
+			__func__, buffer_count, info->ipsec_bp->bpid,
 			info->parent_pool_info.buf_size,(int) bp_parent->size);
 //#else
 	ret = dpaa_bp_alloc_n_add_buffs(bp, IPSEC_BUFCOUNT, 1);
 	DPAIPSEC_INFO("%s(%d) buffers added to ipsec pool %d info size %zu \n", 
-			__FUNCTION__,__LINE__,info->ipsec_bp->bpid,
+			__func__,__LINE__,info->ipsec_bp->bpid,
 			info->ipsec_bp->size);
 #endif
 	return 0;
@@ -1181,7 +1181,7 @@ void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle)
 		kzalloc(sizeof(struct dpa_ipsec_sainfo), GFP_KERNEL);
 	if (!sainfo) {
 		DPAIPSEC_ERROR("%s::Error in allocating sainfo\n", 
-				__FUNCTION__);
+				__func__);
 		return NULL;
 	}	
 	memset(sainfo, 0, sizeof(struct dpa_ipsec_sainfo));
@@ -1207,7 +1207,7 @@ int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num)
 	ret = qman_retire_fq(fq, &flags);
 	if (ret < 0) {
 		DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-				__FUNCTION__, fq->fqid, fq->fqid);
+				__func__, fq->fqid, fq->fqid);
 	}
 	return ret;
 }
@@ -1233,13 +1233,13 @@ int cdx_dpa_ipsecsa_release(void *handle)
 		//take fqs out of service
 		if (qman_retire_fq(fq, &flags)) {
 			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 #endif /* 0 */
 		if (qman_oos_fq(fq)) {
 			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__FUNCTION__, fq->fqid, fq->fqid);
+					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
@@ -1280,32 +1280,32 @@ void dpa_ipsec_test(struct ipsec_info *info)
 	if (cdx_dpa_ipsec_wanport_td(info, ESP_IPV4_TABLE, &td)) {
 		return;
 	}	
-	DPAIPSEC_INFO("%s::WAN ESP_IPV4_TABLE %p\n", __FUNCTION__, td);
+	DPAIPSEC_INFO("%s::WAN ESP_IPV4_TABLE %p\n", __func__, td);
 
 	if (cdx_dpa_ipsec_wanport_td(info, ESP_IPV6_TABLE, &td)) {
 		return;
 	}	
-	DPAIPSEC_INFO("%s::WAN ESP_IPV6_TABLE %p\n", __FUNCTION__, td);
+	DPAIPSEC_INFO("%s::WAN ESP_IPV6_TABLE %p\n", __func__, td);
 
 	if (dpa_ipsec_ofport_td(info, IPV4_UDP_TABLE, &td, &portid)) {
 		return;
 	}	
-	DPAIPSEC_INFO("%s::OF IPV4_TCPUDP_TABLE %p\n", __FUNCTION__, td);
+	DPAIPSEC_INFO("%s::OF IPV4_TCPUDP_TABLE %p\n", __func__, td);
 
 	if (dpa_ipsec_ofport_td(info, IPV6_UDP_TABLE, &td, &portid )) {
 		return;
 	}	
-	DPAIPSEC_INFO("%s::OF IPV6_TCPUDP_TABLE %p\n", __FUNCTION__, td);
+	DPAIPSEC_INFO("%s::OF IPV6_TCPUDP_TABLE %p\n", __func__, td);
 
 	if (dpa_ipsec_ofport_td(info, ESP_IPV4_TABLE, &td, &portid)) {
 		return;
 	}	
-	DPAIPSEC_INFO("%s::OF ESP_IPV4_TABLE %p, portif = %d\n", __FUNCTION__, td, portid);
+	DPAIPSEC_INFO("%s::OF ESP_IPV4_TABLE %p, portif = %d\n", __func__, td, portid);
 
 	if (dpa_ipsec_ofport_td(info, ESP_IPV6_TABLE, &td, &portid)) {
 		return;
 	}	
-	DPAIPSEC_INFO("%s::OF ESP_IPV6_TABLE %p\n", __FUNCTION__, td);
+	DPAIPSEC_INFO("%s::OF ESP_IPV6_TABLE %p\n", __func__, td);
 
 	handle = cdx_dpa_ipsecsa_alloc(info, 0xaa55);
 	if (handle) {
@@ -1313,15 +1313,15 @@ void dpa_ipsec_test(struct ipsec_info *info)
 		tosec_fqid = get_fqid_to_sec(handle);	
 		fromsec_fqid = get_fqid_from_sec(handle);	
 		DPAIPSEC_INFO("%s::sh desc %p, tosec fqid %x(%d) from sec fqid %x(%d)\n",
-				__FUNCTION__, sh_desc, tosec_fqid, tosec_fqid,
+				__func__, sh_desc, tosec_fqid, tosec_fqid,
 				fromsec_fqid, fromsec_fqid); 
 		if (cdx_dpa_ipsecsa_release(handle)) {
 			DPAIPSEC_ERROR("%s::Failed to release sa %p\n", 
-					__FUNCTION__, handle);
+					__func__, handle);
 			return;
 		}		
 	} else {
-		DPAIPSEC_ERROR("%s::Failed to alloc sa\n", __FUNCTION__);
+		DPAIPSEC_ERROR("%s::Failed to alloc sa\n", __func__);
 		return;
 	}
 }
@@ -1410,7 +1410,7 @@ static void cdx_dpaa_ingress_cgr_exit(struct cgr_priv *cgr)
 int cdx_dpa_ipsec_init(void)
 {
 
-	DPAIPSEC_INFO("%s::\n", __FUNCTION__);
+	DPAIPSEC_INFO("%s::\n", __func__);
 	ipsecinfo.crypto_channel_id = qm_channel_caam;
 	ipsecinfo.ipsec_exception_fq = NULL;
 	if (ipsec_init_ohport(&ipsecinfo)) {
@@ -1443,7 +1443,7 @@ ipsec_pcd_fq_failure:
 
 void cdx_dpa_ipsec_exit(void)
 {
-	DPAIPSEC_INFO("%s::\n", __FUNCTION__);
+	DPAIPSEC_INFO("%s::\n", __func__);
 #ifdef CS_TAIL_DROP
 	if(sec_congestion)
 		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);

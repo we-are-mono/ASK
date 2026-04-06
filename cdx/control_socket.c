@@ -165,7 +165,7 @@ void socket4_remove(PSockEntry pSocket, U32 hash, U32 hash_by_id)
 		h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 		if (!h_FmMuram)
 		{
-			DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+			DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		}
 		else
 			FM_MURAM_FreeMem(h_FmMuram, (void *)pSocket->hw_stats);
@@ -235,7 +235,7 @@ void socket6_remove(PSock6Entry pSocket, U32 hash, U32 hash_by_id)
 		h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 		if (!h_FmMuram)
 		{
-			DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+			DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		}
 		else
 			FM_MURAM_FreeMem(h_FmMuram, (void *)pSocket->hw_stats);
@@ -384,7 +384,7 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	int i;
 
 	DPA_INFO("%s(%d) length %d, size %lu \n",
-		__FUNCTION__,__LINE__, Length, sizeof(SockOpenCommand));
+		__func__,__LINE__, Length, sizeof(SockOpenCommand));
 
 	// Check length
 	if (Length != sizeof(SockOpenCommand))
@@ -398,11 +398,11 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	DPA_INFO("daddr %x,, dport %d, mode %d, proto %d, type %d\n",
 		SocketCmd.Daddr, SocketCmd.Dport, SocketCmd.mode, SocketCmd.proto, SocketCmd.SockType);
 
-	DPA_INFO("%s(%d) \n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	if (!SocketCmd.SockID)
 		return ERR_WRONG_SOCKID;
 
-	DPA_INFO("%s(%d) \n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	// sockets with same set of addresses even with different mode not allowed.
 	pEntry = SOCKET4_find_entry(SocketCmd.Saddr, SocketCmd.Sport, SocketCmd.Daddr, SocketCmd.Dport, SocketCmd.proto);
 	if ((pEntry)/* && (pEntry->connected == SocketCmd.mode) */) {
@@ -412,11 +412,11 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 			return ERR_SOCK_ALREADY_OPEN;
 	}
 
-	DPA_INFO("%s(%d) \n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	if (SOCKET_find_entry_by_id(SocketCmd.SockID) != NULL)
 		return ERR_SOCKID_ALREADY_USED;
 
-	DPA_INFO("%s(%d) \n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	switch (SocketCmd.SockType) {
 	case SOCKET_TYPE_FPP:
 		break;
@@ -459,7 +459,7 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	if ((pEntry = (struct _tSockEntry*)socket4_alloc()) == NULL)
 	  	return ERR_NOT_ENOUGH_MEMORY;
 
-	DPA_INFO("%s(%d) \n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	memset(pEntry, 0, sizeof (SockEntry));
 	pEntry->SocketFamily = PROTO_IPV4;
 	pEntry->Daddr_v4 = SocketCmd.Daddr;
@@ -496,23 +496,23 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 	if (!h_FmMuram)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		socket4_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 	
-	DPA_INFO("%s(%d) \n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	if (sizeof(RTCPStats) > SOCKET_STATS_SIZE)
 	{
 		DPA_ERROR("%s(%d) RTCPStats size more than SOCKET_STATS_SIZE. Please update SOCKET_STATS_SIZE properly.\n"
-				, __FUNCTION__,__LINE__);
+				, __func__,__LINE__);
 		socket4_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 	pEntry->hw_stats = FM_MURAM_AllocMem(h_FmMuram, SOCKET_STATS_SIZE, 16);
 	if (!pEntry->hw_stats)
 	{
-		DPA_ERROR("%s(%d) FM_MURAM_AllocMem failed\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) FM_MURAM_AllocMem failed\n", __func__,__LINE__);
 		socket4_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
@@ -523,7 +523,7 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	rtpqos_relay_link_stats_entry_by_tuple(pEntry, pEntry->Saddr_v4, pEntry->Daddr_v4, pEntry->Dport, pEntry->Sport);
 #endif
 
-	DPA_INFO("%s(%d) \n",__FUNCTION__,__LINE__);
+	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	/* Add software and hardware entry to local and packet engine hash */
 	socket4_add(pEntry);  // this func not returning error in any case
 
@@ -638,20 +638,20 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 		pingress_socket = SOCKET_find_entry_by_id(pFlow->ingress_socketID);
 		if (!pingress_socket)
 		{
-			DPA_ERROR("%s(%d) error in finding ingress socket\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s(%d) error in finding ingress socket\n", __func__, __LINE__);
 			return ERR_SOCK_UPDATE_ERR;
 		}	
 		if(!pingress_socket->pRtEntry)
 		{
 			DPA_INFO("%s(%d) missing route, checking for route\n",
-			__FUNCTION__,__LINE__);
+			__func__,__LINE__);
 			SOCKET4_check_route(pingress_socket);
 		}
 
 		if ((!pingress_socket->pRtEntry) || (!pEntry->pRtEntry))
 		{
 			DPA_ERROR("%s(%d) missing route for to_socket or from_socket \n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 			return ERR_NO_ROUTE_TO_SOCK;
 		}
 
@@ -665,7 +665,7 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 				eeh_entry_index, 
 				eeh_entry_handle)) {
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 		}
 		//free table entry
 		ExternalHashTableEntryFree(eeh_entry_handle);
@@ -674,13 +674,13 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 		// create an entry in ehash table
 		if(cdx_create_rtp_conn_in_classif_table(pFlow, pingress_socket, pEntry))
 		{
-			DPA_ERROR("%s(%d) error in creating eehash table entry\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s(%d) error in creating eehash table entry\n", __func__, __LINE__);
 			return ERR_SOCK_UPDATE_ERR;
 		}
 	
 		if (cdx_rtp_set_hwinfo_fields(pFlow, pingress_socket) != 0)
 		{
-			DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __FUNCTION__,__LINE__);
+			DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __func__,__LINE__);
 			return -1;
 		}
 		cdx_ehash_set_rtp_info_params(pFlow->hw_flow->ehash_rtp_relay_params, 
@@ -731,7 +731,7 @@ int SOCKET4_HandleIP_Socket_Close (U16 *p, U16 Length)
 			pEntry->SktEhTblHdl.eeh_entry_index, 
 			pEntry->SktEhTblHdl.eeh_entry_handle)) {
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 		}
 		/* free table entry */
 		ExternalHashTableEntryFree(pEntry->SktEhTblHdl.eeh_entry_handle);
@@ -776,7 +776,7 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 	int i;
 
 	DPA_INFO("%s(%d) length %d, size %lu \n",
-		__FUNCTION__,__LINE__, Length, sizeof(Sock6OpenCommand));
+		__func__,__LINE__, Length, sizeof(Sock6OpenCommand));
 
 	// Check length
 	if (Length != sizeof(Sock6OpenCommand))
@@ -849,7 +849,7 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 	h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 	if (!h_FmMuram)
 	{
-		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		socket6_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
@@ -857,14 +857,14 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 	if (sizeof(RTCPStats) > SOCKET_STATS_SIZE)
 	{
 		DPA_ERROR("%s(%d) RTCPStats size more than SOCKET_STATS_SIZE. Please update SOCKET_STATS_SIZE properly.\n"
-				, __FUNCTION__,__LINE__);
+				, __func__,__LINE__);
 		socket6_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 	pEntry->hw_stats = FM_MURAM_AllocMem(h_FmMuram, SOCKET_STATS_SIZE, 32);
 	if (!pEntry->hw_stats)
 	{
-		DPA_ERROR("%s(%d) FM_MURAM_AllocMem failed\n", __FUNCTION__,__LINE__);
+		DPA_ERROR("%s(%d) FM_MURAM_AllocMem failed\n", __func__,__LINE__);
 		socket6_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
@@ -996,21 +996,21 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 		pingress_socket = SOCKET_find_entry_by_id(pFlow->ingress_socketID);
 		if (!pingress_socket)
 		{
-			DPA_ERROR("%s(%d) error in finding ingress socket\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s(%d) error in finding ingress socket\n", __func__, __LINE__);
 			return ERR_SOCK_UPDATE_ERR;
 		}	
 
 		if(!pingress_socket->pRtEntry)
 		{
 			DPA_INFO("%s(%d) missing route, checking for route\n",
-			__FUNCTION__,__LINE__);
+			__func__,__LINE__);
 			SOCKET6_check_route(pingress_socket);
 		}
 
 		if ((!pingress_socket->pRtEntry) || (!pEntry->pRtEntry))
 		{
 			DPA_ERROR("%s(%d) missing route for to_socket or from_socket \n",
-				__FUNCTION__,__LINE__);
+				__func__,__LINE__);
 			return ERR_NO_ROUTE_TO_SOCK;
 		}
 
@@ -1024,7 +1024,7 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 		// create an entry in ehash table
 		if(cdx_create_rtp_conn_in_classif_table(pFlow, pingress_socket, pEntry))
 		{
-			DPA_ERROR("%s(%d) error in creating eehash table entry\n", __FUNCTION__, __LINE__);
+			DPA_ERROR("%s(%d) error in creating eehash table entry\n", __func__, __LINE__);
 			return ERR_SOCK_UPDATE_ERR;
 		}
 
@@ -1034,7 +1034,7 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 				eeh_entry_handle))
 		{
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
-				__FUNCTION__, __LINE__);
+				__func__, __LINE__);
 		}
 		//free table entry
 		ExternalHashTableEntryFree(eeh_entry_handle);
@@ -1042,7 +1042,7 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 		
 		if (cdx_rtp_set_hwinfo_fields(pFlow, pingress_socket) != 0)
 		{
-			DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __FUNCTION__,__LINE__);
+			DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __func__,__LINE__);
 			return -1;
 		}
 		cdx_ehash_set_rtp_info_params(pFlow->hw_flow->ehash_rtp_relay_params, 
@@ -1093,7 +1093,7 @@ int SOCKET6_HandleIP_Socket_Close(U16 *p, U16 Length)
 			pEntry->SktEhTblHdl.eeh_entry_index, 
 			pEntry->SktEhTblHdl.eeh_entry_handle)) {
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
-					__FUNCTION__, __LINE__);
+					__func__, __LINE__);
 		}
 		/* free table entry */
 		ExternalHashTableEntryFree(pEntry->SktEhTblHdl.eeh_entry_handle);

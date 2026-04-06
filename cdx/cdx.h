@@ -79,9 +79,9 @@ static inline uint32_t get_ctentry_qosmark_from_qosconnmark(uint64_t qosconnmark
 			markval = 0;
 	}
 	if (direction == CONN_ORIG) {
-		DPRINT(KERN_ERR "%s:originator: qosmark %llx markval %x\n", __FUNCTION__, qosconnmark, markval);
+		DPRINT(KERN_ERR "%s:originator: qosmark %llx markval %x\n", __func__, qosconnmark, markval);
 	} else {
-		DPRINT(KERN_ERR "%s:replier: qosmark %llx markval %x\n", __FUNCTION__, qosconnmark, markval);
+		DPRINT(KERN_ERR "%s:replier: qosmark %llx markval %x\n", __func__, qosconnmark, markval);
 	}
 	return markval;
 }
