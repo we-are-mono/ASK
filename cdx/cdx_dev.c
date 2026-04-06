@@ -130,20 +130,6 @@ long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
 			break;
 #endif
 
-		case CDX_CTRL_DPA_QOS_CONFIG_ADD:
-			printk("%s::cdx_ioc_dpa_configqos not called\n", __func__);
-			retval = 0;
-			break;
-
-		case CDX_CTRL_DPA_ADD_MCAST_GROUP:
-			retval = cdx_ioc_create_mc_group(args);
-			break;
-		case CDX_CTRL_DPA_ADD_MCAST_MEMBER:
-			retval = cdx_ioc_add_member_to_group(args);
-			break;
-		case CDX_CTRL_DPA_ADD_MCAST_TABLE_ENTRY:
-			retval = cdx_ioc_add_mcast_table_entry(args);
-			break;
 		default:
 			DPA_ERROR("%s::unsupported ioctl cmd %x\n", 
 					__func__, cmd);

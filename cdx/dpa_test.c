@@ -39,26 +39,6 @@ enum flow_id
 };
 
 
-int mcast_grpd;
-
-int cdx_ioc_create_mc_group(unsigned long args)
-{
-	printk("%s::not implemented\n", __func__);
-	return -1;
-}
-
-
-int cdx_ioc_add_member_to_group(unsigned long args)
-{
-	printk("%s::not implemented\n", __func__);
-	return -1;
-}
-
-int cdx_ioc_add_mcast_table_entry(unsigned long args)
-{
-	return -1;
-}
-
 int cdx_ioc_dpa_connadd(unsigned long args)
 {
 	struct add_conn_info add_conn;
