@@ -187,7 +187,7 @@ int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 
 
 	/* Create  memory for frame queues.*/
-	iface_info->eth_info.voip_fqs = kzalloc(sizeof(struct dpa_fq)*usNoFqs, 0);
+	iface_info->eth_info.voip_fqs = kzalloc(sizeof(struct dpa_fq)*usNoFqs, GFP_KERNEL);
 	if (!iface_info->eth_info.voip_fqs) {
 		DPA_ERROR("%s::err allocating dpa_fq mem\n", __func__) ;
 		return -1;

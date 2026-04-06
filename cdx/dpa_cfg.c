@@ -180,7 +180,7 @@ static int get_dist_info(struct cdx_port_info *port_info)
 			port_info->name, port_info->max_dist);
 #endif
 	mem_size = (sizeof(struct cdx_dist_info) * port_info->max_dist);
-	dist_info = kzalloc(mem_size, 0);
+	dist_info = kzalloc(mem_size, GFP_KERNEL);
 	if (!dist_info) {
 		DPA_ERROR("%s::memalloc for dist_info failed\n",
 				__func__);
@@ -282,7 +282,7 @@ static int get_port_info(struct cdx_fman_info *finfo)
 	DPA_INFO("%s::fm %d num ports %d\n", __func__, 
 			finfo->index, finfo->max_ports);
 #endif
-	port_info = kzalloc(mem_size, 0); 
+	port_info = kzalloc(mem_size, GFP_KERNEL); 
 	if (!port_info) {
 		DPA_ERROR("%s::memalloc for port_info failed\n",
 				__func__);
@@ -341,7 +341,7 @@ static int get_cctbl_info(struct cdx_fman_info *finfo)
 
 	//allocate table information area
 	mem_size = (sizeof(struct table_info) * finfo->num_tables);
-	tbl_info = kzalloc(mem_size, 0); 
+	tbl_info = kzalloc(mem_size, GFP_KERNEL); 
 	if (!tbl_info) {
 		DPA_ERROR("%s::memalloc for table_info failed\n",
 				__func__);
@@ -600,7 +600,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		return -EBUSY;
 	}
 	mem_size = (sizeof(struct cdx_fman_info) * params.num_fmans);
-	fman_info = kzalloc(mem_size, 0);
+	fman_info = kzalloc(mem_size, GFP_KERNEL);
 	if (!fman_info) {
 		DPA_ERROR("%s::unable to allocate mem for fman_info\n",
 				__func__);

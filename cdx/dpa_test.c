@@ -95,12 +95,12 @@ int cdx_ioc_dpa_connadd(unsigned long args)
 		retval = -EIO;
 		goto err_ret;
 	}
-	ct = kzalloc((sizeof(struct _tCtEntry) * 2), 0);
+	ct = kzalloc((sizeof(struct _tCtEntry) * 2), GFP_KERNEL);
 	if (!ct) {
 		retval = -ENOMEM;	
 		goto err_ret;
 	}
-	rt = kzalloc((sizeof(RouteEntry) * 2), 0);
+	rt = kzalloc((sizeof(RouteEntry) * 2), GFP_KERNEL);
 	if (!rt) {
 		retval = -ENOMEM;	
 		goto err_ret;

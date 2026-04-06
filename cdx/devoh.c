@@ -333,7 +333,7 @@ int dpa_add_oh_if(char *name)
 	}
 	//ethernet/physical iface type
 	iface_info = (struct dpa_iface_info *)
-		kzalloc(sizeof(struct dpa_iface_info), 0);
+		kzalloc(sizeof(struct dpa_iface_info), GFP_KERNEL);
 	if (!iface_info) {
 		DPA_ERROR("%s::no mem for eth dev info size %d\n",
 				__func__,
@@ -533,7 +533,7 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 	for (ii = 0; ii < 2; ii++) {
 		struct qman_fq *fq;
 
-		dpa_fq = kzalloc(sizeof(struct dpa_fq), 0);
+		dpa_fq = kzalloc(sizeof(struct dpa_fq), GFP_KERNEL);
 		if (!dpa_fq) {
 			DPA_ERROR("%s::unable to alloc mem for defa or err fqid\n",
 					__func__);

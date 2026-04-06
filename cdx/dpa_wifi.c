@@ -1446,7 +1446,7 @@ static int add_device_tx_bpool(struct dpaa_vwd_priv_s  *vwd)
 	int buffer_count = 0, ret = 0, refill_cnt ;
 
 
-	bp = kzalloc(sizeof(struct dpa_bp), 0);
+	bp = kzalloc(sizeof(struct dpa_bp), GFP_KERNEL);
 	if (unlikely(bp == NULL)) {
 		DPAWIFI_ERROR("%s::failed to allocate mem for bman pool for dev %s\n",
 				__func__,vwd->name);
@@ -1911,7 +1911,7 @@ static int create_vap_fwd_from_fman_fqs(struct vap_desc_s *vap, void *proc_entry
 		uint32_t flags;
 
 		/* create FQ for forward from DPAA to wireless interface */
-		dpa_fq = kzalloc(sizeof(struct dpa_fq), 0);
+		dpa_fq = kzalloc(sizeof(struct dpa_fq), GFP_KERNEL);
 
 		if (!dpa_fq) {
 			DPAWIFI_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
@@ -2022,7 +2022,7 @@ static int create_vap_fqs(struct vap_desc_s *vap)
 
 
 	/* create FQ for exception packets from wireless interface */
-	dpa_fq = kzalloc(sizeof(struct dpa_fq), 0);
+	dpa_fq = kzalloc(sizeof(struct dpa_fq), GFP_KERNEL);
 	if (!dpa_fq) {
 		DPAWIFI_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
 		return -1;
@@ -2168,7 +2168,7 @@ static int add_device_tx_done_bpool(struct dpaa_vwd_priv_s  *vwd)
 	}
 	bp_parent = dpa_bpid2pool(vwd->parent_pool_info.pool_id);
 
-	bp = kzalloc(sizeof(struct dpa_bp), 0);
+	bp = kzalloc(sizeof(struct dpa_bp), GFP_KERNEL);
 
 	if (unlikely(bp == NULL)) {
 		DPAWIFI_ERROR("%s::failed to allocate mem for bman pool for dev %s\n",

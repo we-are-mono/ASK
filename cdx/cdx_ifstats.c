@@ -95,7 +95,7 @@ int cdxdrv_init_stats(void *muram_handle)
 
 int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 {
-	iface->last_stats = (struct iface_stats *)kzalloc(sizeof(struct iface_stats), 0);  
+	iface->last_stats = (struct iface_stats *)kzalloc(sizeof(struct iface_stats), GFP_KERNEL);  
 	if (!iface->last_stats) {
 		DPA_ERROR("%s:: memory alloc failed for iface last stats\n", __func__);
 		return FAILURE;

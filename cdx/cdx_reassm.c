@@ -235,7 +235,7 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 	fqid = fqid_base;
 	for (ii = 0; ii < num_portals; ii++) {
 		if (find_pcd_fq_info(fqid)) {
-			dpa_fq = kzalloc(sizeof(struct dpa_fq), 0);
+			dpa_fq = kzalloc(sizeof(struct dpa_fq), GFP_KERNEL);
 			if (!dpa_fq) {
 				DPA_ERROR("%s::unable to alloc mem for "
 						"fqid %d\n", __func__, fqid);
@@ -308,7 +308,7 @@ static inline struct dpa_bp *create_ipr_bpool(uint32_t size, uint32_t count,
 	struct dpa_bp *bp;
 	uint32_t buffer_count;
 
-	bp = kzalloc(sizeof(struct dpa_bp), 0);
+	bp = kzalloc(sizeof(struct dpa_bp), GFP_KERNEL);
 	if (unlikely(bp == NULL)) {
 		DPA_ERROR("%s::failed to allocate mem for bman pool for reassly\n", 
 				__func__);

@@ -1006,7 +1006,7 @@ int cdx_init_skb_2bfreed_bpool(void)
 	struct port_bman_pool_info parent_pool_info;
 
 	// allocate memory for bpool
-	bp = kzalloc(sizeof(struct dpa_bp), 0);
+	bp = kzalloc(sizeof(struct dpa_bp), GFP_KERNEL);
 	if (unlikely(bp == NULL)) {
 		DPAIPSEC_ERROR("%s(%d)::failed to mem for non_recyclable SKB free bman pool\n",
 				__func__,__LINE__);
@@ -1042,7 +1042,7 @@ int cdx_init_scatter_gather_bpool(void)
 	struct port_bman_pool_info parent_pool_info;
 	int ret =0;
 
-	bp = kzalloc(sizeof(struct dpa_bp), 0);
+	bp = kzalloc(sizeof(struct dpa_bp), GFP_KERNEL);
 	if (unlikely(bp == NULL)) {
 		DPAIPSEC_ERROR("%s::failed to allocate mem for SG bman pool\n", 
 				__func__);
@@ -1090,7 +1090,7 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	printk (KERN_INFO"\n ################## %s", 
 			__func__);
 
-	bp = kzalloc(sizeof(struct dpa_bp), 0);
+	bp = kzalloc(sizeof(struct dpa_bp), GFP_KERNEL);
 	if (unlikely(bp == NULL)) {
 		DPAIPSEC_ERROR("%s::failed to allocate mem for bman pool for ipsec\n", 
 				__func__);

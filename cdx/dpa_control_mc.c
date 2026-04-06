@@ -338,13 +338,13 @@ static int cdx_add_mcast_table_entry(void *mcast_cmd,
 		strncpy(ucInterface,mcast6_group->input_device_str,IF_NAME_SIZE-1);
 	}
 
-	pRtEntry = kzalloc((sizeof(RouteEntry)), 0);
+	pRtEntry = kzalloc((sizeof(RouteEntry)), GFP_KERNEL);
 	if (!pRtEntry)
 	{
 		return -ENOMEM;	
 	}
 
-	pCtEntry = kzalloc((sizeof(struct _tCtEntry)), 0);
+	pCtEntry = kzalloc((sizeof(struct _tCtEntry)), GFP_KERNEL);
 	if (!pCtEntry)
 	{
 		retval = -ENOMEM;	
@@ -437,7 +437,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 	uint32_t tbl_type;
 
 	// memory allocation for multicast group
-	pMcastGrpInfo = (struct mcast_group_info *)kzalloc((sizeof(struct mcast_group_info)), 0);
+	pMcastGrpInfo = (struct mcast_group_info *)kzalloc((sizeof(struct mcast_group_info)), GFP_KERNEL);
 	if(!pMcastGrpInfo)
 	{
 		DPA_ERROR("%s::%d  failed to allocate memory \r\n", __func__, __LINE__);
@@ -1154,13 +1154,13 @@ int mc4_init(void)
 	int ii;
 
 	set_cmd_handler(EVENT_MC4, M_mc4_cmdproc);
-	mc4grp_ids = kzalloc((sizeof(uint8_t)*MAX_MC4_ENTRIES), 0);
+	mc4grp_ids = kzalloc((sizeof(uint8_t)*MAX_MC4_ENTRIES), GFP_KERNEL);
 	if (!mc4grp_ids)
 	{
 		return -ENOMEM;	
 	}
 	max_mc4grp_ids = MAX_MC4_ENTRIES;
-	mc4_spinlocks = kzalloc((sizeof(spinlock_t) * MC4_NUM_HASH_ENTRIES), 0);
+	mc4_spinlocks = kzalloc((sizeof(spinlock_t) * MC4_NUM_HASH_ENTRIES), GFP_KERNEL);
 	if (!mc4_spinlocks)
 	{
 		kfree(mc4grp_ids);
@@ -1181,13 +1181,13 @@ int mc6_init(void)
 	int ii;
 
 	set_cmd_handler(EVENT_MC6, M_mc6_cmdproc);
-	mc6grp_ids = kzalloc((sizeof(uint8_t)*MAX_MC6_ENTRIES), 0);
+	mc6grp_ids = kzalloc((sizeof(uint8_t)*MAX_MC6_ENTRIES), GFP_KERNEL);
 	if (!mc6grp_ids)
 	{
 		return -ENOMEM;	
 	}
 	max_mc6grp_ids = MAX_MC6_ENTRIES;
-	mc6_spinlocks = kzalloc((sizeof(spinlock_t) * MC6_NUM_HASH_ENTRIES), 0);
+	mc6_spinlocks = kzalloc((sizeof(spinlock_t) * MC6_NUM_HASH_ENTRIES), GFP_KERNEL);
 	if (!mc6_spinlocks)
 	{
 		kfree(mc6grp_ids);
