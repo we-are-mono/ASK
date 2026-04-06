@@ -1505,9 +1505,7 @@ static void  abm_proc_fini(void)
 *
 ****************************************************************************/
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
 struct ctl_table_header * abm_sysctl_hdr;
-#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,11,0)
 static int abm_sysctl_l3_filtering(const struct ctl_table *ctl, int write,
@@ -1548,8 +1546,9 @@ struct ctl_path abm_sysctl_path[] = {
 	{ .procname = "abm", },
 	{ }
 };
+#endif
 
-static ctl_table abm_sysctl_table[] =
+static struct ctl_table abm_sysctl_table[] =
 {
 	{
 		.procname	= "abm_l3_filtering",
@@ -1601,7 +1600,6 @@ static ctl_table abm_sysctl_table[] =
 		.proc_handler	= proc_dointvec,
 	},
 };
-#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
 static int __net_init abm_net_init(struct net *net)
