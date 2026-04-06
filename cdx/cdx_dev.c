@@ -107,35 +107,6 @@ func_ret:
 }
 #endif
 
-static int __maybe_unused disp_muram(void)
-{
-#ifdef DPAA_DEBUG_ENABLE
-	int ii;
-	uint8_t *pdata;
-	uint32_t size;
-
-	printk("%s::\n", __func__);
-	pdata = get_muram_data(&size);
-	if (!pdata) {
-		DPA_ERROR("%s::get_muram_data failed\n", __func__);
-		return (-EIO);
-	}
-
-	printk("%s::muram data size %d\n", __func__, size);
-	for (ii = 0; ii < size; ii++) {
-		if (!(ii % 16))
-			printk("\n%04x:%02x ", ii, *pdata);
-		else
-			printk("%02x ", *pdata);
-		pdata++;
-	}
-#else
-	printk("%s::\n", __func__);
-#endif
-	return 0;
-}
-
-
 long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
                 unsigned long args) 
 {

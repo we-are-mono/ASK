@@ -31,7 +31,6 @@ static char __initdata fci_version[] = "0.04";
 
 /* Statics functions prototypes */
 static int fci_fe_inbound_parser(FCI_MSG *fci_msg, FCI_MSG *fci_rep);
-static void __maybe_unused fci_dump_msg(FCI_MSG *fci_msg);
 static int fci_fe_register(void);
 static void fci_fe_unregister(void);
 
@@ -244,24 +243,6 @@ static void fci_outbound_err(int nl_type, struct sk_buff *skb, u32 pid, struct n
 	this_fci->stats.tx_msg++;
 
 	this_fci->stats.sock_stats[nl_type].tx_msg++;
-}
-
-
-/*
- * fci_dump_msg -
- *
- *
- */
-static void fci_dump_msg(FCI_MSG *fci_msg)
-{
-	int i;
-
-	FCI_PRINTK(FCI_DUMP, "fci msg: fcode 0x%04x size %d bytes -> ", fci_msg->fcode, fci_msg->length);
-
-	for(i = 0; i < fci_msg->length / 2; i++)
-		FCI_PRINTK(FCI_DUMP, "%04x ", fci_msg->payload[i]);
-
-	FCI_PRINTK(FCI_DUMP, "\n");
 }
 
 

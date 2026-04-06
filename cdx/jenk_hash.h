@@ -40,7 +40,6 @@ acceptable.  Do NOT use for cryptographic purposes.
 
 #define HASH_INITVAL	0x9e3779b9
 
-static uint32_t compute_jenkins_hash(uint8_t *k, uint32_t length, uint32_t initval) __attribute__((unused));
 static uint32_t compute_jenkins_hash(uint8_t *k, uint32_t length, uint32_t initval)
 {
 	uint32_t a, b, c, len;
