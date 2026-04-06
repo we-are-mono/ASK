@@ -35,10 +35,6 @@ int cdx_ctrl_open(struct inode *inode, struct file *filp);
 int cdx_ctrl_release(struct inode *inode, struct file *filp);
 long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
                 unsigned long args);
-#ifdef CONFIG_COMPAT
-long cdx_ctrl_compat_ioctl(struct file *filp, unsigned int cmd,
-                unsigned long args);
-#endif
 
 
 /* cdx device file ops */
@@ -46,9 +42,6 @@ static const struct file_operations cdx_dev_fops = {
         .owner                  = THIS_MODULE,
         .open                   = cdx_ctrl_open,
         .unlocked_ioctl         = cdx_ctrl_ioctl,
-#ifdef CONFIG_COMPAT
-        .compat_ioctl           = cdx_ctrl_compat_ioctl,
-#endif /* CONFIG_COMPAT */
         .release                = cdx_ctrl_release
 };
 
@@ -188,15 +181,6 @@ long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
 	}
 	return retval;
 }
-
-#ifdef CONFIG_COMPAT
-long cdx_ctrl_compat_ioctl(struct file *filp, unsigned int cmd,
-                unsigned long args)
-{
-	DPA_INFO("%s::\n", __FUNCTION__);
-	return 0;
-}
-#endif
 
 static void cdx_driver_deinit(void)
 {
