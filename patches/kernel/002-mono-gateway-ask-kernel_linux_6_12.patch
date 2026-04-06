@@ -90,7 +90,7 @@ index bb6693e2d702..a14b325f2b4b 100644
  config FSL_DPAA_CS_THRESHOLD_1G
  	hex "Egress congestion threshold on 1G ports"
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-index 010b47239ccc..69ce5b9fb6f9 100644
+index 010b47239ccc..b00c8e244dc6 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 @@ -300,7 +300,7 @@ static void _dpa_tx_error(struct net_device		*net_dev,
@@ -189,19 +189,7 @@ index 010b47239ccc..69ce5b9fb6f9 100644
  };
  
  static int dpa_private_napi_add(struct net_device *net_dev)
-@@ -766,6 +778,11 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
- 	net_dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
- 				NETIF_F_RXCSUM;
- 	net_dev->lltx               = true;
-+#if 0 // commenting as of now , and skipping linearize in case of ipsec_offload
-+	// to handle fraglist in case of ipsec instead of linearize at linux
-+	// Issue is that data pointer is not getting freed after xmit/SEC engine processing if linux is linearizing
-+	net_dev->features   |=  NETIF_F_FRAGLIST;
-+#endif // 0
- 
- 	/* Advertise S/G and HIGHDMA support for private interfaces */
- 	net_dev->hw_features |= NETIF_F_SG | NETIF_F_HIGHDMA;
-@@ -892,7 +909,8 @@ static void dpa_priv_bp_seed(struct net_device *net_dev)
+@@ -892,7 +904,8 @@ static void dpa_priv_bp_seed(struct net_device *net_dev)
  		 */
  		int *count_ptr = per_cpu_ptr(priv->percpu_count, i);
  
@@ -211,7 +199,7 @@ index 010b47239ccc..69ce5b9fb6f9 100644
  	}
  }
  
-@@ -1005,9 +1023,12 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+@@ -1005,9 +1018,12 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  
  	if (err < 0)
  		goto fq_probe_failed;
@@ -219,14 +207,14 @@ index 010b47239ccc..69ce5b9fb6f9 100644
  	/* bp init */
 -
 +#ifndef EXCLUDE_FMAN_IPR_OFFLOAD
-+	printk("%s::bpid %d, count %d ", __FUNCTION__,
++	printk("%s::bpid %d, count %d ", __func__,
 +			dpa_bp->bpid, dpa_bp->config_count);
 +	printk("adj count %d\n", dpa_bp->config_count);
 +#endif
  	err = dpa_priv_bp_create(net_dev, dpa_bp, count);
  
  	if (err < 0)
-@@ -1111,6 +1132,8 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+@@ -1111,6 +1127,8 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  	device_set_wakeup_capable(dev, true);
  #endif
  
@@ -310,19 +298,19 @@ index 7109d33419bd..0685667b42b2 100644
  		struct qman_portal *portal,
  		const struct dpa_priv_s *priv,
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_ceetm.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_ceetm.c
-index f947264bf54d..05cf73183818 100644
+index f947264bf54d..ab0b34e5713f 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_ceetm.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_ceetm.c
 @@ -148,6 +148,7 @@ static void ceetm_ern(struct qman_portal *portal, struct qman_fq *fq,
  	struct ceetm_class *cls;
  	struct sk_buff *skb;
  
-+	printk("%s::\n", __FUNCTION__);
++	printk("%s::\n", __func__);
  	ceetm_fq = container_of(fq, struct ceetm_fq, fq);
  	net_dev = ceetm_fq->net_dev;
  	dpa_priv = netdev_priv(net_dev);
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-index 515dfb68ed5f..610b84c8718d 100644
+index 515dfb68ed5f..c4db971a4f97 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 @@ -166,6 +166,7 @@ int __cold dpa_start(struct net_device *net_dev)
@@ -384,7 +372,7 @@ index 515dfb68ed5f..610b84c8718d 100644
  	layout[RX].time_stamp = true;
  #endif
  	fm_port_get_buff_layout_ext_params(mac_dev->port_dev[RX], &params);
-+	printk("*********%s(%d) internal buffer offset %d\n",__FUNCTION__,__LINE__, params.manip_extra_space);
++	printk("*********%s(%d) internal buffer offset %d\n",__func__,__LINE__, params.manip_extra_space);
  	layout[RX].manip_extra_space = params.manip_extra_space;
  	/* a value of zero for data alignment means "don't care", so align to
  	 * a non-zero value to prevent FMD from using its own default
@@ -437,13 +425,13 @@ index 515dfb68ed5f..610b84c8718d 100644
 +
 +   if (!qm_fd_addr(fd))
 +   {
-+       printk("%s(%d) NULL addr in fd\n",__FUNCTION__,__LINE__);
++       printk("%s(%d) NULL addr in fd\n",__func__,__LINE__);
 +       return;
 +   }
 +
 +
 +   char *tmp = (char *) fd;
-+   printk("%s(%d) FD info : \t",__FUNCTION__,__LINE__);
++   printk("%s(%d) FD info : \t",__func__,__LINE__);
 +   printk("%0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x\n",
 +   tmp[0],tmp[1],tmp[2],tmp[3],tmp[4],tmp[5],tmp[6],tmp[7],tmp[8],tmp[9],tmp[10],tmp[11],tmp[12],tmp[13],tmp[14],tmp[15]);
 +   bm_buffer_set64(&bmb, qm_fd_addr(fd));
@@ -455,14 +443,14 @@ index 515dfb68ed5f..610b84c8718d 100644
 +       sgt = vaddr;
 +
 +       printk("%s(%d) addr %lx , size %d, buff pool id %x, fd %p\t",
-+           __FUNCTION__,__LINE__,qm_fd_addr(fd), dpa_bp->size, bmb.bpid, fd);
++           __func__,__LINE__,qm_fd_addr(fd), dpa_bp->size, bmb.bpid, fd);
 +       printk("bpid: %d, netdev name %s, vaddr %lx, fd offset %d\n",
 +           fd->bpid,net_dev->name, vaddr, dpa_fd_offset(fd));
 +
 +       while (!qm_sg_entry_get_final(&sgt[ii]))
 +           ii++;
 +       addr = qm_sg_addr(&sgt[ii+1]);
-+       printk("%s(%d) ii %d, old-skb %p \n",__FUNCTION__, __LINE__,ii,(void *)addr);
++       printk("%s(%d) ii %d, old-skb %p \n",__func__, __LINE__,ii,(void *)addr);
 +       if (addr) // free the old skb
 +       {
 +           skb =  (struct sk_buff *)(addr);
@@ -621,7 +609,7 @@ index f46c243ff1b8..9bd7f1e2a43c 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..8a139b2666e5 100644
+index 4164644d3268..0f313d6fd9bc 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -52,6 +52,55 @@
@@ -668,7 +656,7 @@ index 4164644d3268..8a139b2666e5 100644
 +int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn)
 +{
 +       if (cdx_get_ipsec_fq_hookfn) {
-+               printk("%s::hook already registered\n", __FUNCTION__);
++               printk("%s::hook already registered\n", __func__);
 +               return -1;
 +       }
 +       cdx_get_ipsec_fq_hookfn = hookfn;
@@ -718,7 +706,7 @@ index 4164644d3268..8a139b2666e5 100644
 +			if (unlikely(!ptr_buf))
 +			{
 +				pr_err("%s(%d) ii %d,  buffs2fill %d kmalloc failed \n",
-+						__FUNCTION__,__LINE__,ii, buffs2fill);
++						__func__,__LINE__,ii, buffs2fill);
 +				goto handle_fail;
 +			}
 +
@@ -736,7 +724,7 @@ index 4164644d3268..8a139b2666e5 100644
 +				skb = build_skb(ptr_buf, 0);
 +				if (unlikely(!skb)) {
 +					pr_err("%s(%d) ii %d , buffs2fill %d build_skb failed \n",
-+							__FUNCTION__,__LINE__, ii, buffs2fill);
++							__func__,__LINE__, ii, buffs2fill);
 +					kfree(new_buf);
 +					goto handle_fail;
 +				}
@@ -751,7 +739,7 @@ index 4164644d3268..8a139b2666e5 100644
 +			if (unlikely(dma_mapping_error(dev, addr)))
 +			{
 +				pr_err("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
-+						__FUNCTION__,__LINE__,ii,buffs2fill);
++						__func__,__LINE__,ii,buffs2fill);
 +				if (act_skb)
 +				{
 +					kfree_skb(skb);
@@ -767,12 +755,12 @@ index 4164644d3268..8a139b2666e5 100644
 +			cpu_relax();
 +		buffs2fill+= entries_in_bmb;
 +		/*     printk("%s(%d) adrsses %lx %lx %lx %lx %lx %lx %lx %lx\n",
-+			   __FUNCTION__,__LINE__,bm_buffer_get64(&bmb[0]),bm_buffer_get64(&bmb[1]),
++			   __func__,__LINE__,bm_buffer_get64(&bmb[0]),bm_buffer_get64(&bmb[1]),
 +			   bm_buffer_get64(&bmb[2]),bm_buffer_get64(&bmb[3]),bm_buffer_get64(&bmb[4]),
 +			   bm_buffer_get64(&bmb[5]),bm_buffer_get64(&bmb[6]),bm_buffer_get64(&bmb[7])); */
 +	}
 +	/* printk("%s(%d) buff allocation and bman release success buffs2fill %d\n",
-+	   __FUNCTION__,__LINE__,buffs2fill); */
++	   __func__,__LINE__,buffs2fill); */
 +	return 0;
 +
 +handle_fail:
@@ -899,39 +887,7 @@ index 4164644d3268..8a139b2666e5 100644
  					fd_status & FM_FD_STAT_RX_ERRORS);
  
  		percpu_stats->rx_errors++;
-@@ -589,6 +752,31 @@ void __hot _dpa_rx(struct net_device *net_dev,
- 
- 	/* The only FD types that we may receive are contig and S/G */
- 	DPA_BUG_ON((fd->format != qm_fd_contig) && (fd->format != qm_fd_sg));
-+#if 0
-+        {
-+                char *ptr;
-+                uint32_t ii;
-+
-+                ptr = ((char *)phys_to_virt(addr) + 0x0);
-+                for (ii  = 0; ii < 0x70; ii++) {
-+                        if ((ii % 16) == 0)
-+                                printk("\n%02x ", *(ptr + ii));
-+                        else
-+                                printk("%02x ", *(ptr + ii));
-+                }
-+                printk("\n");
-+        }
-+	{
-+		uint32_t ccbase;
-+		uint64_t hashval;
-+		//get ccbase 
-+		ccbase  = *((uint32_t *)((char *)phys_to_virt(addr) + 0x18));
-+                printk("%s::ccbase %08x, fqid 0x%x\n", __FUNCTION__, cpu_to_be32(ccbase), fqid);
-+		hashval  = *((uint64_t *)((char *)phys_to_virt(addr) + 0x48));
-+                printk("%s::hashval %lx\n", __FUNCTION__, cpu_to_be64(hashval));
-+	 		
-+	}
-+#endif
- 
- 	if (likely(fd->format == qm_fd_contig)) {
- #ifdef CONFIG_FSL_DPAA_HOOKS
-@@ -599,6 +787,15 @@ void __hot _dpa_rx(struct net_device *net_dev,
+@@ -599,6 +762,15 @@ void __hot _dpa_rx(struct net_device *net_dev,
  			/* won't count the rx bytes in */
  			return;
  		}
@@ -941,13 +897,13 @@ index 4164644d3268..8a139b2666e5 100644
 +			if (dpaa_eth_bpool_replenish_hook(net_dev, fd->bpid)) {
 +				//could not replenish buffer, drop packet ??
 +				printk("%s::could not replenish buffer to pool\n",
-+						__FUNCTION__);
++						__func__);
 +			}
 +		}
  #endif
  		skb = contig_fd_to_skb(priv, fd, &use_gro, dcl4c_valid);
  	} else {
-@@ -645,6 +842,7 @@ void __hot _dpa_rx(struct net_device *net_dev,
+@@ -645,6 +817,7 @@ void __hot _dpa_rx(struct net_device *net_dev,
  _release_frame:
  	dpa_fd_release(net_dev, fd);
  }
@@ -955,7 +911,7 @@ index 4164644d3268..8a139b2666e5 100644
  
  int __hot skb_to_contig_fd(struct dpa_priv_s *priv,
  			   struct sk_buff *skb, struct qm_fd *fd,
-@@ -746,7 +944,7 @@ EXPORT_SYMBOL(skb_to_contig_fd);
+@@ -746,7 +919,7 @@ EXPORT_SYMBOL(skb_to_contig_fd);
   * - SG fragments that aren't mod 16 bytes in size (except for the last
   *   fragment)
   */
@@ -964,7 +920,7 @@ index 4164644d3268..8a139b2666e5 100644
  {
  	skb_frag_t *frag;
  	int i, nr_frags;
-@@ -808,12 +1006,13 @@ static bool a050385_check_skb(struct sk_buff *skb, struct dpa_priv_s *priv)
+@@ -808,12 +981,13 @@ static bool a050385_check_skb(struct sk_buff *skb, struct dpa_priv_s *priv)
  
  	return false;
  }
@@ -979,7 +935,7 @@ index 4164644d3268..8a139b2666e5 100644
  					   struct dpa_priv_s *priv)
  {
  	int trans_offset = skb_transport_offset(skb);
-@@ -882,8 +1081,213 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
+@@ -882,8 +1056,213 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
  	put_page(npage);
  	return NULL;
  }
@@ -1109,12 +1065,12 @@ index 4164644d3268..8a139b2666e5 100644
 +	else
 +	{
 +		printk("%s(%d) bman_acquire of SG bman buffer failed\n",
-+				__FUNCTION__,__LINE__);
++				__func__,__LINE__);
 +		return -1;
 +	}
 +
 +
-+	/* net_crit_ratelimited("%s(%d) nr_frags %d, MAX frags %d \n", __FUNCTION__,__LINE__,nr_frags,DPA_SGT_MAX_ENTRIES);*/
++	/* net_crit_ratelimited("%s(%d) nr_frags %d, MAX frags %d \n", __func__,__LINE__,nr_frags,DPA_SGT_MAX_ENTRIES);*/
 +	/* After nr_frags, in next index of sgt array storing skb address in opaque. So doing memset for (nr_frags+1).*/
 +	sgt_size = sizeof(struct qm_sg_entry) * (nr_frags + 1);
 +
@@ -1184,7 +1140,7 @@ index 4164644d3268..8a139b2666e5 100644
 +	fd->length20 = skb->len;
 +	fd->offset = 0;
 +
-+	/*net_crit_ratelimited("%s(%d) sgt_index %d, addr %p \n",__FUNCTION__, __LINE__,sgt_index,(void *)(sgt[sgt_index].opaque)); */
++	/*net_crit_ratelimited("%s(%d) sgt_index %d, addr %p \n",__func__, __LINE__,sgt_index,(void *)(sgt[sgt_index].opaque)); */
 +	/* percpu_priv->tx_returned++; */
 +	return 0;
 +}
@@ -1193,7 +1149,7 @@ index 4164644d3268..8a139b2666e5 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1434,532 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1409,532 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1316,7 +1272,7 @@ index 4164644d3268..8a139b2666e5 100644
 +		if (!egress_fq)
 +		{
 +			printk("%s(%d) egress frame queue not found \n",
-+			__FUNCTION__, __LINE__);
++			__func__, __LINE__);
 +			goto sec_submit_failed;	
 +		}
 +
@@ -1357,7 +1313,7 @@ index 4164644d3268..8a139b2666e5 100644
 +		err =  skb_fraglist_to_sg_fd(dpa_bp->dev, net_dev, skb, &fd, dpovrd);
 +		if (unlikely(err < 0))
 +		{
-+			printk("%s(%d) skb_fraglist_to_sg_fd \n",__FUNCTION__,__LINE__);
++			printk("%s(%d) skb_fraglist_to_sg_fd \n",__func__,__LINE__);
 +			goto sec_submit_failed;
 +		}
 +
@@ -1372,7 +1328,7 @@ index 4164644d3268..8a139b2666e5 100644
 +			struct bm_buffer bmb;
 +			dma_addr_t addr;
 +
-+			printk("%s(%d) dpa_xmit failed\n",__FUNCTION__,__LINE__);
++			printk("%s(%d) dpa_xmit failed\n",__func__,__LINE__);
 +			/* put the buffer back to sg pool */
 +			addr = qm_fd_addr(&fd);
 +			bm_buffer_set64(&bmb, addr);
@@ -1477,7 +1433,7 @@ index 4164644d3268..8a139b2666e5 100644
 +	if (cdx_get_ipsec_fq_hookfn)
 +	{
 +		/*net_crit_ratelimited("%s(%d) x->handle %d, skb->data %p, machdr %p\n",
-+		  __FUNCTION__,__LINE__, sagd,skb->data, skb_mac_header(skb)); */
++		  __func__,__LINE__, sagd,skb->data, skb_mac_header(skb)); */
 +		/* Get the SEC FQID corresponding to sagd */
 +		sec_fq = cdx_get_ipsec_fq_hookfn(sagd);
 +
@@ -1515,7 +1471,7 @@ index 4164644d3268..8a139b2666e5 100644
 +			/* observation in case of PPPoE skb_mac_header is pointing to IP header*/
 +			/* get the IP version*/
 +			/*printk("%s(%d), MAC header ptr: \n",
-+			  __FUNCTION__,__LINE__);
++			  __func__,__LINE__);
 +			  display_buf_data(&skb->head[skb->mac_header] ,16);*/
 +			ipvsn = ((skb->head[skb->mac_header]) & 0xf0) >> 4;
 +			/*printk(KERN_INFO "iif_dev :%s, ifindex %d, ipvsn %d\n", netdev->name, netdev->ifindex, ipvsn);*/
@@ -1542,7 +1498,7 @@ index 4164644d3268..8a139b2666e5 100644
 +				skb->data[13] = 0xdd;
 +			}
 +			/*printk("%s(%d), modified header : \n",
-+			  __FUNCTION__,__LINE__);
++			  __func__,__LINE__);
 +			  display_buf_data(skb->data,16);*/
 +		}
 +
@@ -1584,12 +1540,12 @@ index 4164644d3268..8a139b2666e5 100644
 +		}
 +		/*FIXME: skb->dev->type other than ARPHRD_ETHER and ARPHRD_PPP priv is uninitialized. Here else case should add to address it. */
 +		/*net_crit_ratelimited("%s(%d) x->handle %d, skb->data %p, machdr %p, len %d, skb->dev %p\n",
-+			__FUNCTION__,__LINE__, sagd, skb->data, skb_mac_header(skb),skb->len, skb->dev); */
++			__func__,__LINE__, sagd, skb->data, skb_mac_header(skb),skb->len, skb->dev); */
 +		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
 +		if (unlikely(err < 0))
 +		{
 +			printk("%s(%d) skb_fraglist_to_sg_fd failed\n",
-+					__FUNCTION__,__LINE__);
++					__func__,__LINE__);
 +			if (skb->dev->type == ARPHRD_PPP)
 +				memcpy(skb->data, data, ETH_HLEN);
 +
@@ -1609,7 +1565,7 @@ index 4164644d3268..8a139b2666e5 100644
 +			dma_addr_t addr;
 +
 +			printk("%s(%d) qman_enqueue failed\n",
-+					__FUNCTION__,__LINE__);
++					__func__,__LINE__);
 +			/* put the buffer back to sg pool */
 +			addr = qm_fd_addr(&fd);
 +			bm_buffer_set64(&bmb, addr);
@@ -1696,7 +1652,7 @@ index 4164644d3268..8a139b2666e5 100644
 +			if (!egress_fq) {
 +				printk(KERN_CRIT "%s::unable to get ceetm fq, mark %08x registered func %p"
 +						"dropping packet\n",
-+						__FUNCTION__, markval , ceetm_fqget_func);
++						__func__, markval , ceetm_fqget_func);
 +				dev_kfree_skb(skb);
 +				return NETDEV_TX_OK;
 +			}
@@ -1727,7 +1683,7 @@ index 4164644d3268..8a139b2666e5 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +1971,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +1946,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1738,7 +1694,7 @@ index 4164644d3268..8a139b2666e5 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1114,6 +2045,7 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1114,6 +2020,7 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  	skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
  #endif /* CONFIG_FSL_DPAA_TS */
  
@@ -1746,7 +1702,7 @@ index 4164644d3268..8a139b2666e5 100644
  	/* MAX_SKB_FRAGS is larger than our DPA_SGT_MAX_ENTRIES; make sure
  	 * we don't feed FMan with more fragments than it supports.
  	 * Btw, we're using the first sgt entry to store the linear part of
-@@ -1212,13 +2144,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2119,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */
@@ -1828,7 +1784,7 @@ index 38509644c826..de5ffc0ab9c5 100644
  	int (*set_multi)(struct net_device *net_dev,
  			 struct mac_device *mac_dev);
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/offline_port.c b/drivers/net/ethernet/freescale/sdk_dpaa/offline_port.c
-index 000caf70e00e..46bab80830f1 100644
+index 000caf70e00e..2ab7e50be763 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/offline_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/offline_port.c
 @@ -50,6 +50,7 @@
@@ -1860,7 +1816,7 @@ index 000caf70e00e..46bab80830f1 100644
 +	struct fman_offline_port_info *port_info;
 +
 +	if (sscanf(info->port_name, "dpa-fman%d-oh@%d", &fman_idx, &port_idx) != 2) {
-+		printk("%s::invalid name %s\n", __FUNCTION__, info->port_name);
++		printk("%s::invalid name %s\n", __func__, info->port_name);
 +		return (-EINVAL);
 +	}
 +
@@ -1902,7 +1858,7 @@ index 000caf70e00e..46bab80830f1 100644
 +				//info->default_fqid = oh_config->error_fqid;
 +				info->default_fqid = oh_config->default_fqid;
 +				info->err_fqid = oh_config->error_fqid;
-+				printk("%s::found OH port %s, fman %d, port %d\n", __FUNCTION__,
++				printk("%s::found OH port %s, fman %d, port %d\n", __func__,
 +						&info->port_name[0], fman_idx, port_idx);
 +			}
 +		} else {
@@ -2192,7 +2148,7 @@ index 6eedcf9de5fb..bcb4567cd5bb 100644
 +##	setenv FMAN_DEBUG '-DFM_CC_MURAM_DEBUG=1'
 +ccflags-y += $(FMAN_DEBUG)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
-index b8d600fa6f25..7969d92992a6 100644
+index b8d600fa6f25..df9331be5969 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 @@ -51,7 +51,17 @@
@@ -2343,7 +2299,7 @@ index b8d600fa6f25..7969d92992a6 100644
  
      level++;
  
-+    printk("%s::p_CcKeyAndNextEngineParams %p, numOfEntries %d\n", __FUNCTION__,
++    printk("%s::p_CcKeyAndNextEngineParams %p, numOfEntries %d\n", __func__,
 +			p_CcKeyAndNextEngineParams, numOfEntries);
 +
      if (p_CcTree->h_IpReassemblyManip)
@@ -2353,18 +2309,18 @@ index b8d600fa6f25..7969d92992a6 100644
              else
                  h_Ad = PTR_MOVE(h_Ad, FM_PCD_CC_AD_ENTRY_SIZE);
  
-+	    printk("%s::.nextEngineParams %p\n", __FUNCTION__,
++	    printk("%s::.nextEngineParams %p\n", __func__,
 +			&p_CcKeyAndNextEngineParams[i].nextEngineParams);
              if (p_CcKeyAndNextEngineParams[i].nextEngineParams.nextEngine
                      == e_FM_PCD_CC)
              {
                  p_CcNode =
                          p_CcKeyAndNextEngineParams[i].nextEngineParams.params.ccParams.h_CcNode;
-+		printk("%s::next engine is CC, node %p\n", __FUNCTION__, p_CcNode);
++		printk("%s::next engine is CC, node %p\n", __func__, p_CcNode);
                  ASSERT_COND(p_CcNode);
  
 +#if (DPAA_VERSION >= 11)
-+		printk("%s::p_CcNode->externalHash %d\n", __FUNCTION__,
++		printk("%s::p_CcNode->externalHash %d\n", __func__,
 +				p_CcNode->externalHash);
 +                if (p_CcNode->externalHash)
 +                    FmPortSetFESupport(h_FmPort);
@@ -2376,7 +2332,7 @@ index b8d600fa6f25..7969d92992a6 100644
              }
              else
              {
-+		printk("%s::next engine is %d, h_manip %p\n", __FUNCTION__,		
++		printk("%s::next engine is %d, h_manip %p\n", __func__,		
 +			p_CcKeyAndNextEngineParams[i].nextEngineParams.nextEngine,
 +                	p_CcKeyAndNextEngineParams[i].nextEngineParams.h_Manip);
                  if (p_CcKeyAndNextEngineParams[i].nextEngineParams.h_Manip)
@@ -2427,7 +2383,7 @@ index b8d600fa6f25..7969d92992a6 100644
          p_CcNode->keyAndNextEngineParams[p_CcNode->numOfKeys].p_StatsObj->h_StatsCounters =
                  p_CcNode->h_PrivMissStatsCounters;
  
-@@ -1605,14 +1700,18 @@ t_Error ValidateNextEngineParams(
+@@ -1605,14 +1700,10 @@ t_Error ValidateNextEngineParams(
              if (relativeSchemeId == FM_PCD_KG_NUM_OF_SCHEMES)
                  RETURN_ERROR(MAJOR, E_NOT_IN_RANGE, NO_MSG);
              if (!FmPcdKgIsSchemeValidSw(
@@ -2435,19 +2391,16 @@ index b8d600fa6f25..7969d92992a6 100644
 +                    p_FmPcdCcNextEngineParams->params.kgParams.h_DirectScheme)) 
                  RETURN_ERROR(MAJOR, E_INVALID_STATE,
                               ("not valid schemeIndex in KG next engine param"));
+-            if (!KgIsSchemeAlwaysDirect(h_FmPcd, relativeSchemeId))
+-                RETURN_ERROR(
+-                        MAJOR,
+-                        E_INVALID_STATE,
+-                        ("CC Node may point only to a scheme that is always direct."));
 +	    
-+#if 0
-+	    //we need to allow any scheme to be part of the KG next engine param
-             if (!KgIsSchemeAlwaysDirect(h_FmPcd, relativeSchemeId))
-                 RETURN_ERROR(
-                         MAJOR,
-                         E_INVALID_STATE,
-                         ("CC Node may point only to a scheme that is always direct."));
-+#endif
              break;
  
          case (e_FM_PCD_PLCR):
-@@ -1664,7 +1763,8 @@ t_Error ValidateNextEngineParams(
+@@ -1664,7 +1755,8 @@ t_Error ValidateNextEngineParams(
  static uint8_t GetGenParseCode(e_FmPcdExtractFrom src,
                                 uint32_t offset, bool glblMask,
                                 uint8_t *parseArrayOffset, bool fromIc,
@@ -2457,7 +2410,7 @@ index b8d600fa6f25..7969d92992a6 100644
  {
      if (!fromIc)
      {
-@@ -1694,7 +1794,10 @@ static uint8_t GetGenParseCode(e_FmPcdExtractFrom src,
+@@ -1694,7 +1786,10 @@ static uint8_t GetGenParseCode(e_FmPcdExtractFrom src,
          {
              case (CC_PRIVATE_INFO_IC_KEY_EXACT_MATCH):
                  *parseArrayOffset = 0x50;
@@ -2469,7 +2422,7 @@ index b8d600fa6f25..7969d92992a6 100644
  
              case (CC_PRIVATE_INFO_IC_HASH_EXACT_MATCH):
                  *parseArrayOffset = 0x48;
-@@ -3454,6 +3557,7 @@ static t_FmPcdModifyCcKeyAdditionalParams * ModifyNodeCommonPart(
+@@ -3454,6 +3549,7 @@ static t_FmPcdModifyCcKeyAdditionalParams * ModifyNodeCommonPart(
  
      p_FmPcdModifyCcKeyAdditionalParams->h_CurrentNode = h_FmPcdCcNodeOrTree;
      p_FmPcdModifyCcKeyAdditionalParams->savedKeyIndex = keyIndex;
@@ -2477,15 +2430,15 @@ index b8d600fa6f25..7969d92992a6 100644
  
      while (i < numOfKeys)
      {
-@@ -4057,6 +4161,7 @@ static t_Error ModifyNextEngineParamNode(
+@@ -4057,6 +4153,7 @@ static t_Error ModifyNextEngineParamNode(
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
-+    display_cc_node(p_CcNode, __FUNCTION__);
++    display_cc_node(p_CcNode, __func__);
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, FALSE);
  
-@@ -4483,7 +4588,7 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
+@@ -4483,7 +4580,7 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
              p_CcNode->parseCode = GetGenParseCode(
                      p_CcNodeParam->extractCcParams.extractNonHdr.src,
                      p_CcNode->offset, glblMask, &p_CcNode->prsArrayOffset,
@@ -2494,7 +2447,7 @@ index b8d600fa6f25..7969d92992a6 100644
  
              if (p_CcNode->parseCode == CC_PC_GENERIC_IC_HASH_INDEXED)
              {
-@@ -4497,6 +4602,7 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
+@@ -4497,6 +4594,7 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
                  }
              }
              if ((p_CcNode->parseCode == CC_PC_GENERIC_IC_GMASK)
@@ -2502,7 +2455,7 @@ index b8d600fa6f25..7969d92992a6 100644
                      || (p_CcNode->parseCode == CC_PC_GENERIC_IC_HASH_INDEXED))
              {
                  p_CcNode->offset += p_CcNode->prsArrayOffset;
-@@ -4526,6 +4632,9 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
+@@ -4526,6 +4624,9 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
      if (p_CcNodeParam->keysParams.keySize != p_CcNode->sizeOfExtraction)
      {
          DeleteNode(p_CcNode);
@@ -2512,7 +2465,7 @@ index b8d600fa6f25..7969d92992a6 100644
          RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                       ("keySize has to be equal to sizeOfExtraction"));
      }
-@@ -4839,127 +4948,1158 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
+@@ -4839,124 +4940,1155 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
  
      return E_OK;
  }
@@ -2779,9 +2732,6 @@ index b8d600fa6f25..7969d92992a6 100644
 -                        p_FmPcdCcNextEngineParams->params.ccParams.h_CcNode,
 -                        p_FmPcdCcNextEngineParams->h_Manip,
 -                        p_FmPcdCcNextEngineParams->params.frParams.h_FrmReplic);
--                FrmReplicGroupUpdateOwner(
--                        p_FmPcdCcNextEngineParams->params.frParams.h_FrmReplic,
--                        TRUE/* add */);
 +    t_Handle h_FmPcd;
 +    t_Handle *p_HashBuckets, h_MissStatsCounters;
 +    uint16_t i, numOfBuckets;
@@ -3754,53 +3704,50 @@ index b8d600fa6f25..7969d92992a6 100644
 +                        p_FmPcdCcNextEngineParams->params.ccParams.h_CcNode,
 +                        p_FmPcdCcNextEngineParams->h_Manip,
 +                        p_FmPcdCcNextEngineParams->params.frParams.h_FrmReplic);
-+                FrmReplicGroupUpdateOwner(
-+                        p_FmPcdCcNextEngineParams->params.frParams.h_FrmReplic,
-+                        TRUE/* add */);
-             }
-             break;
- 
-@@ -5341,6 +6481,7 @@ t_Error FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+                 FrmReplicGroupUpdateOwner(
+                         p_FmPcdCcNextEngineParams->params.frParams.h_FrmReplic,
+                         TRUE/* add */);
+@@ -5341,6 +6473,7 @@ t_Error FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
-+    display_cc_node(p_CcNode, __FUNCTION__);
++    display_cc_node(p_CcNode, __func__);
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
  
-@@ -5432,6 +6573,7 @@ t_Error FmPcdCcModifyKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+@@ -5432,6 +6565,7 @@ t_Error FmPcdCcModifyKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
-+    display_cc_node(p_CcNode, __FUNCTION__);
++    display_cc_node(p_CcNode, __func__);
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
  
-@@ -5489,6 +6631,7 @@ t_Error FmPcdCcModifyMissNextEngineParamNode(
+@@ -5489,6 +6623,7 @@ t_Error FmPcdCcModifyMissNextEngineParamNode(
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
-+    display_cc_node(p_CcNode, __FUNCTION__);
++    display_cc_node(p_CcNode, __func__);
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, FALSE);
  
-@@ -5598,6 +6741,7 @@ t_Error FmPcdCcAddKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+@@ -5598,6 +6733,7 @@ t_Error FmPcdCcAddKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
-+    display_cc_node(p_CcNode, __FUNCTION__);
++    display_cc_node(p_CcNode, __func__);
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
      if (p_CcNode->maxNumOfKeys)
-@@ -5691,6 +6835,7 @@ t_Error FmPcdCcModifyKeyAndNextEngine(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+@@ -5691,6 +6827,7 @@ t_Error FmPcdCcModifyKeyAndNextEngine(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
-+    display_cc_node(p_CcNode, __FUNCTION__);
++    display_cc_node(p_CcNode, __func__);
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
  
-@@ -5942,6 +7087,143 @@ void FmPcdCcGetAdTablesThatPointOnReplicGroup(t_Handle h_Node,
+@@ -5942,6 +7079,143 @@ void FmPcdCcGetAdTablesThatPointOnReplicGroup(t_Handle h_Node,
  /****************************************/
  /*       API Init unit functions        */
  /****************************************/
@@ -3851,7 +3798,7 @@ index b8d600fa6f25..7969d92992a6 100644
 +	{
 +		uint8_t *ptr;
 +
-+		printk("%s::handle %p Ad %p ccptr %p\n", __FUNCTION__,
++		printk("%s::handle %p Ad %p ccptr %p\n", __func__,
 +			 handle, ptr, p_CcTreeTmp);
 +		ptr = (uint8_t *)ccptr;
 +		for (ii = 0; ii < 16; ii++)
@@ -3870,12 +3817,12 @@ index b8d600fa6f25..7969d92992a6 100644
 +	{
 +		if (info->ip_reassem_info) { 
 +			printk("%s::AD for reassembly %p %x\n",
-+				__FUNCTION__, ccptr, ii);
++				__func__, ccptr, ii);
 +		} else {
 +			printk("%s::AD for non-reassembly %p %x\n",
-+				__FUNCTION__, ccptr, ii);
++				__func__, ccptr, ii);
 +		}
-+		display_ehashtbl_info(info, __FUNCTION__);
++		display_ehashtbl_info(info, __func__);
 +	}
 +#endif
 +	//return type
@@ -3901,7 +3848,7 @@ index b8d600fa6f25..7969d92992a6 100644
 +		uint32_t ii;
 +		uint8_t *ptr;
 +
-+		printk("%s::handle %p Ad %p ccptr %p\n", __FUNCTION__,
++		printk("%s::handle %p Ad %p ccptr %p\n", __func__,
 +			 handle, ptr, p_CcTreeTmp);
 +		ptr = (uint8_t *)ccptr;
 +		for (ii = 0; ii < 16; ii++)
@@ -3924,12 +3871,12 @@ index b8d600fa6f25..7969d92992a6 100644
 +		{
 +			if (info->ip_reassem_info) { 
 +				printk("%s::AD for reassembly %p %x\n",
-+					__FUNCTION__, ccptr, ii);
++					__func__, ccptr, ii);
 +			} else {
 +				printk("%s::AD for non-reassembly %p %x\n",
-+					__FUNCTION__, ccptr, ii);
++					__func__, ccptr, ii);
 +			}
-+			display_ehashtbl_info(info, __FUNCTION__);
++			display_ehashtbl_info(info, __func__);
 +		}
 +	}
 +#endif
@@ -3944,7 +3891,7 @@ index b8d600fa6f25..7969d92992a6 100644
  
  t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
                              t_FmPcdCcTreeParams *p_PcdGroupsParam)
-@@ -5957,8 +7239,14 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -5957,8 +7231,14 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
      t_NetEnvParams netEnvParams;
      uint8_t lastOne = 0;
      uint32_t requiredAction = 0;
@@ -3959,32 +3906,32 @@ index b8d600fa6f25..7969d92992a6 100644
  
      SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
      SANITY_CHECK_RETURN_VALUE(p_PcdGroupsParam, E_INVALID_HANDLE, NULL);
-@@ -5991,6 +7279,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -5991,6 +7271,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
      numOfEntries = 0;
      p_FmPcdCcTree->netEnvId = FmPcdGetNetEnvId(p_PcdGroupsParam->h_NetEnv);
  
-+    //printk("%s::num groups %d\n", __FUNCTION__, p_PcdGroupsParam->numOfGrps);
++    //printk("%s::num groups %d\n", __func__, p_PcdGroupsParam->numOfGrps);
      for (i = 0; i < p_PcdGroupsParam->numOfGrps; i++)
      {
          p_FmPcdCcGroupParams = &p_PcdGroupsParam->ccGrpParams[i];
-@@ -6103,6 +7392,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -6103,6 +7384,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
              k++;
          }
      }
-+    //printk("%s::num entries %d\n", __FUNCTION__, numOfEntries);
++    //printk("%s::num entries %d\n", __func__, numOfEntries);
  
      p_FmPcdCcTree->numOfEntries = (uint8_t)k;
      p_FmPcdCcTree->numOfGrps = p_PcdGroupsParam->numOfGrps;
-@@ -6123,7 +7413,15 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -6123,7 +7405,15 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
              (uint32_t)(FM_PCD_MAX_NUM_OF_CC_GROUPS * FM_PCD_CC_AD_ENTRY_SIZE));
  
      p_CcTreeTmp = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
 -
 +#ifdef FM_EHASH_DEBUG
-+    printk("%s::cctree root %p baseaddr %p numentries %d\n", __FUNCTION__,
++    printk("%s::cctree root %p baseaddr %p numentries %d\n", __func__,
 +		p_CcTreeTmp, (void *)p_FmPcdCcTree->ccTreeBaseAddr, numOfEntries);
 +
-+    printk("%s::cctree root %p baseaddr %p numentries %d muram %x\n", __FUNCTION__,
++    printk("%s::cctree root %p baseaddr %p numentries %d muram %x\n", __func__,
 +	          p_CcTreeTmp, (void *)p_FmPcdCcTree->ccTreeBaseAddr, numOfEntries,
 +                (uint32_t)(XX_VirtToPhys(p_FmPcdCcTree->ccTreeBaseAddr) - p_FmPcd->physicalMuramBase)); 
 +#endif
@@ -3992,7 +3939,7 @@ index b8d600fa6f25..7969d92992a6 100644
      for (i = 0; i < numOfEntries; i++)
      {
          p_KeyAndNextEngineParams = p_Params + i;
-@@ -6159,10 +7457,175 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -6159,10 +7449,175 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
                  p_CcInformation->index++;
          }
      }
@@ -4029,7 +3976,7 @@ index b8d600fa6f25..7969d92992a6 100644
 +					ipv4_reassly_offset = (node & 0xff);
 +#ifdef FM_EHASH_DEBUG
 +					printk("%s::ipv4_reassly_offset %x\n",
-+						__FUNCTION__,
++						__func__,
 +						ipv4_reassly_offset);
 +#endif
 +					break;
@@ -4037,7 +3984,7 @@ index b8d600fa6f25..7969d92992a6 100644
 +					ipv6_reassly_offset = (node & 0xff);
 +#ifdef FM_EHASH_DEBUG
 +					printk("%s::ipv6_reassly_offset %x\n",
-+						__FUNCTION__,
++						__func__,
 +						ipv6_reassly_offset);
 +#endif
 +					break;
@@ -4049,7 +3996,7 @@ index b8d600fa6f25..7969d92992a6 100644
 +	}
 +        p_CcTreeTmp = PTR_MOVE(p_CcTreeTmp, FM_PCD_CC_AD_ENTRY_SIZE);
 +#ifdef FM_EHASH_DEBUG
-+	printk("%s::entry %d tree %p p_KeyAndNextEngineParams %p p_CcTreeTmp %p\n", __FUNCTION__, 
++	printk("%s::entry %d tree %p p_KeyAndNextEngineParams %p p_CcTreeTmp %p\n", __func__, 
 +		i, p_FmPcdCcTree, &p_FmPcdCcTree->keyAndNextEngineParams[i], p_CcTreeTmp); 
 +	
 +	printk("nextEngineParams %p requiredAction %08x\n", 
@@ -4122,7 +4069,7 @@ index b8d600fa6f25..7969d92992a6 100644
 +        			t_FmPcdCcNextCcParams *ccParams;       /**< Parameters in case next engine is CC */
 +				ccParams = &nexteng->params.ccParams;
 +				//printk("e_FM_PCD_CC ccnode handle %p\n", (void *)ccParams->h_CcNode);
-+				//display_ehashtbl_info(ccParams->h_CcNode, __FUNCTION__);
++				//display_ehashtbl_info(ccParams->h_CcNode, __func__);
 +			}
 +			break;
 +    		case e_FM_PCD_PLCR:
@@ -4169,7 +4116,7 @@ index b8d600fa6f25..7969d92992a6 100644
      if (!FmPcdLockTryLockAll(p_FmPcd))
      {
          FM_PCD_CcRootDelete(p_FmPcdCcTree);
-@@ -6193,6 +7656,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -6193,6 +7648,7 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
      }
  
      FmPcdLockUnlockAll(p_FmPcd);
@@ -4177,7 +4124,7 @@ index b8d600fa6f25..7969d92992a6 100644
      p_FmPcdCcTree->p_Lock = FmPcdAcquireLock(p_FmPcd);
      if (!p_FmPcdCcTree->p_Lock)
      {
-@@ -7030,16 +8494,6 @@ t_Error FM_PCD_MatchTableGetIndexedHashBucket(t_Handle h_CcNode,
+@@ -7030,16 +8486,6 @@ t_Error FM_PCD_MatchTableGetIndexedHashBucket(t_Handle h_CcNode,
  
  t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  {
@@ -4194,7 +4141,7 @@ index b8d600fa6f25..7969d92992a6 100644
      SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
      SANITY_CHECK_RETURN_VALUE(p_Param, E_NULL_POINTER, NULL);
  
-@@ -7064,206 +8518,39 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+@@ -7064,206 +8510,39 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  
      if (p_Param->statisticsMode == e_FM_PCD_CC_STATS_MODE_RMON)
      {
@@ -4430,7 +4377,7 @@ index b8d600fa6f25..7969d92992a6 100644
  }
  
  t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
-@@ -7283,125 +8570,49 @@ t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
+@@ -7283,125 +8562,49 @@ t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
          RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                       ("Keys masks not supported for hash table"));
  
@@ -4572,7 +4519,7 @@ index b8d600fa6f25..7969d92992a6 100644
  t_Error FM_PCD_HashTableGetMissNextEngine(
          t_Handle h_HashTbl,
          t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
-@@ -7411,6 +8622,11 @@ t_Error FM_PCD_HashTableGetMissNextEngine(
+@@ -7411,6 +8614,11 @@ t_Error FM_PCD_HashTableGetMissNextEngine(
  
      SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
  
@@ -4584,7 +4531,7 @@ index b8d600fa6f25..7969d92992a6 100644
      /* Miss next engine of each bucket was initialized with the next engine of the hash table */
      p_HashBucket =
              p_HashTbl->keyAndNextEngineParams[0].nextEngineParams.params.ccParams.h_CcNode;
-@@ -7422,6 +8638,23 @@ t_Error FM_PCD_HashTableGetMissNextEngine(
+@@ -7422,6 +8630,23 @@ t_Error FM_PCD_HashTableGetMissNextEngine(
      return E_OK;
  }
  
@@ -4608,7 +4555,7 @@ index b8d600fa6f25..7969d92992a6 100644
  t_Error FM_PCD_HashTableFindNGetKeyStatistics(
          t_Handle h_HashTbl, uint8_t keySize, uint8_t *p_Key,
          t_FmPcdCcKeyStatistics *p_KeyStatistics)
-@@ -7436,8 +8669,13 @@ t_Error FM_PCD_HashTableFindNGetKeyStatistics(
+@@ -7436,8 +8661,13 @@ t_Error FM_PCD_HashTableFindNGetKeyStatistics(
      SANITY_CHECK_RETURN_ERROR(p_Key, E_NULL_POINTER);
      SANITY_CHECK_RETURN_ERROR(p_KeyStatistics, E_NULL_POINTER);
  
@@ -4623,7 +4570,7 @@ index b8d600fa6f25..7969d92992a6 100644
                                                  &h_HashBucket, &bucketIndex,
                                                  &lastIndex);
      if (err)
-@@ -7456,6 +8694,11 @@ t_Error FM_PCD_HashTableGetMissStatistics(
+@@ -7456,6 +8686,11 @@ t_Error FM_PCD_HashTableGetMissStatistics(
      SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
      SANITY_CHECK_RETURN_ERROR(p_MissStatistics, E_NULL_POINTER);
  
@@ -4635,7 +4582,7 @@ index b8d600fa6f25..7969d92992a6 100644
      if (!p_HashTbl->statsEnForMiss)
          RETURN_ERROR(MAJOR, E_INVALID_STATE,
                       ("Statistics were not enabled for miss"));
-@@ -7465,3 +8708,240 @@ t_Error FM_PCD_HashTableGetMissStatistics(
+@@ -7465,3 +8700,240 @@ t_Error FM_PCD_HashTableGetMissStatistics(
  
      return FM_PCD_MatchTableGetMissStatistics(h_HashBucket, p_MissStatistics);
  }
@@ -5068,7 +5015,7 @@ index e3b7016b7f2e..890a9d064305 100644
      t_Handle            h_Spinlock;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
 new file mode 100644
-index 000000000000..2f7e5f302ceb
+index 000000000000..b19e51a4824d
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
 @@ -0,0 +1,1378 @@
@@ -5653,13 +5600,13 @@ index 000000000000..2f7e5f302ceb
 +static void display_cc_params(t_FmPcdCcNextCcParams *cc)
 +{
 +	printk(KERN_CRIT "h_CcNode %p::\n", cc->h_CcNode);
-+	display_cc_node((void *)cc->h_CcNode, __FUNCTION__);
++	display_cc_node((void *)cc->h_CcNode, __func__);
 +	
 +}
 +
 +static void display_plcr_params(t_FmPcdCcNextPlcrParams *plcr)
 +{
-+	printk(KERN_CRIT "%s::fill this... plcr %p!!!!\n", __FUNCTION__, plcr);
++	printk(KERN_CRIT "%s::fill this... plcr %p!!!!\n", __func__, plcr);
 +}
 +
 +static void display_next_engine(t_FmPcdCcNextEngineParams *nexteng)
@@ -6190,7 +6137,7 @@ index 000000000000..2f7e5f302ceb
 +
 +	ptr = (uint32_t *)(hmtd_offset + (uint8_t *)FmMurambaseAddr);
 +next_hmc:
-+	printk("%s::ptr %p\n", __FUNCTION__, ptr);
++	printk("%s::ptr %p\n", __func__, ptr);
 +	opcode = swap_word(ptr);
 +	switch (opcode >> 24) {
 +		case 1:
@@ -6452,10 +6399,10 @@ index 000000000000..2f7e5f302ceb
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..82d6fc9bfe95
+index 000000000000..5aab1bdb16f1
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1987 @@
+@@ -0,0 +1,1924 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -6520,51 +6467,6 @@ index 000000000000..82d6fc9bfe95
 +
 +
 +
-+#if 0
-+static int fill_ehash_key_info(PCtEntry entry, struct en_ehash_entry *entry)
-+{
-+	unsigned char *ptr;
-+	
-+	ptr = &entry->key[0];
-+	switch (entry->proto) {
-+		case IPPROTOCOL_TCP: 
-+		case IPPROTOCOL_UDP:
-+			if (IS_IPV6_FLOW(entry))
-+			{
-+				copy_ipaddr(&entry->Saddr_v6[i], ptr, 4);
-+				ptr += 16;
-+				copy_ipaddr(&entry->Daddr_v6[i], ptr, 4);
-+				ptr += 16;
-+			} else {
-+				copy_ipaddr(&entry->Saddr_v4, ptr, 1);
-+				ptr += 4;
-+				copy_ipaddr(&entry->Daddr_v4, ptr, 1);
-+				ptr += 4;
-+			}
-+			*ptr++ = entry->proto;
-+			*ptr++ = (entry->Sport >> 8);
-+			*ptr++ = (entry->Sport & 0xff);
-+			*ptr++ = (entry->Dport >> 8);
-+			*ptr++ = (entry->Dport & 0xff);
-+			break;
-+		default:
-+			DPA_ERROR("%s::protocol %d not supported\n",
-+					__FUNCTION__, entry->proto);
-+			return FAILURE;
-+
-+	}
-+#if 1//
-+	{
-+		uint32_t size;
-+
-+		size = (uint32_t)(ptr - &entry->key[0]);
-+		printk("keysize %d\n", size);
-+		display_buf(&entry->key[0]), size);
-+#endif
-+	}
-+	return SUCCESS;
-+}
-+#endif
 +
 +static inline struct en_exthash_tbl_entry *find_entry_in_bucket(struct en_exthash_tbl_entry *entry, 
 +		uint8_t *key, uint32_t size)
@@ -6678,7 +6580,7 @@ index 000000000000..82d6fc9bfe95
 +	info = (struct en_exthash_info *)h_HashTbl;
 +	bucket = (struct en_exthash_bucket *)info->table_base;
 +	printk("%s::tbl %p, num buckets %d base %p\n",
-+		__FUNCTION__, info, (info->hashmask + 1), bucket);
++		__func__, info, (info->hashmask + 1), bucket);
 +	for (ii = 0; ii <= info->hashmask; ii++) {
 +		if (bucket->h) {
 +			bucket_entries = 0;
@@ -6702,7 +6604,7 @@ index 000000000000..82d6fc9bfe95
 +		bucket++;
 +	}
 +	printk("%s::entries %d, max colls %d, min colls %d\n",
-+			__FUNCTION__, num_entries, max_collisions, 
++			__func__, num_entries, max_collisions, 
 +			min_collisions);
 +	printk("num collisions\t	num_buckets\n");	
 +	for (ii = 0; ii < MAX_HIST_SIZE; ii++) {
@@ -6741,11 +6643,11 @@ index 000000000000..82d6fc9bfe95
 +		stats->bytes = be64_to_cpu(entry->packet_bytes);
 +#ifdef  FM_EHASH_DEBUG 
 +		printk("%s(%d) stats pkts %lld , bytes %lld \n",
-+			__FUNCTION__, __LINE__, stats->pkts, stats->bytes);
++			__func__, __LINE__, stats->pkts, stats->bytes);
 +#endif // FM_EHASH_DEBUG 
 +	}
 +#ifdef FM_EHASH_DEBUG 
-+	printk("%s::stats flags %x\n", __FUNCTION__, stats->flags);
++	printk("%s::stats flags %x\n", __func__, stats->flags);
 +#endif
 +	return 0;
 +}
@@ -6778,7 +6680,7 @@ index 000000000000..82d6fc9bfe95
 +	info = (struct en_exthash_info *)h_HashTbl;
 +#ifdef FM_EHASH_DEBUG 
 +	printk("%s::keysize %d, shift %d, mask %x key::\n",
-+		__FUNCTION__, keySize, info->hashshift,
++		__func__, keySize, info->hashshift,
 +		info->hashmask);
 +	disp_buf(&new_entry->hashentry.key[0], keySize);
 +#endif
@@ -6787,8 +6689,8 @@ index 000000000000..82d6fc9bfe95
 +                                (uint16_t)info->hashmask, &index);
 +	bucket = ((struct en_exthash_bucket *)(info->table_base) + index);
 +#ifdef FM_EHASH_DEBUG 
-+	printk("%s::index %x\n", __FUNCTION__, index);
-+	printk("%s::table base %p , basePhyAddr %p \n bucket %p, bucket phy %p spinlock %p \n", __FUNCTION__,
++	printk("%s::index %x\n", __func__, index);
++	printk("%s::table base %p , basePhyAddr %p \n bucket %p, bucket phy %p spinlock %p \n", __func__,
 +		info->table_base, XX_VirtToPhys(info->table_base), bucket, XX_VirtToPhys(bucket), info->pSpinlock);
 +#endif
 +
@@ -6831,7 +6733,7 @@ index 000000000000..82d6fc9bfe95
 +		key_align =  (keySize + 7) & 0x38;
 +
 +	FM_EHASH_PRINT("%s(%d) tbl_entry %p, key size %d, key-align %d\n",
-+		__FUNCTION__,__LINE__,tbl_entry, keySize, key_align);
++		__func__,__LINE__,tbl_entry, keySize, key_align);
 +	key_align -= keySize;
 +
 +	// if no nodes in bucket, just add the node as it is
@@ -6844,7 +6746,7 @@ index 000000000000..82d6fc9bfe95
 +	}
 +	else
 +	{
-+		FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		first_entry = XX_PhysToVirt(SwapUint64(phyaddr));
 +		if (find_entry_in_bucket(first_entry, &new_entry->hashentry.key[0], 
 +				keySize)) {
@@ -6853,16 +6755,16 @@ index 000000000000..82d6fc9bfe95
 +			retval = -1;
 +			goto func_ret;
 +		}
-+		FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		// check if node is cumulative or not
 +		// if not cumulative, allocate cumulative node 
 +		// add the existing node and the current node to the cumulative node
 +		cumulative_tbl_entry = XX_PhysToVirt(SwapUint64(phyaddr));
 +		cumulative_entry = &cumulative_tbl_entry->cumulative_entry;
-+		FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		if (cumulative_entry->flags & EN_CUMULATIVE_NODE)
 +		{
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +			if (((cumulative_entry->key_size+EN_CU_HASH_TABLE_ENTRY_ADDR_SIZE) * 
 +				    (cumulative_entry->num_key_entries+1) + EN_CU_FIXED_ELEMENTS_SIZE) <= EN_CUMULATIVE_NODE_MAX_SIZE)
 +			{
@@ -6874,7 +6776,7 @@ index 000000000000..82d6fc9bfe95
 +					retval = -1;
 +					goto func_ret;
 +				}
-+				FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++				FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +				tmp = &tmp_tbl_entry->cumulative_entry;
 +				tmp->flags = cumulative_entry->flags; 
 +				tmp->key_size =  cumulative_entry->key_size;
@@ -6896,7 +6798,7 @@ index 000000000000..82d6fc9bfe95
 +				if (cumulative_tbl_entry->next_entry)
 +					cumulative_tbl_entry->next_entry->prev_entry = tmp_tbl_entry;
 +				// initiate host command
-+				FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++				FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +				if (cumulative_tbl_entry->prev_entry)
 +				{
 +					phyaddr =  XX_VirtToPhys(tmp_tbl_entry);
@@ -6920,7 +6822,7 @@ index 000000000000..82d6fc9bfe95
 +				info = (struct en_exthash_info *)h_HashTbl;
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +				if (FmPcdHcSync(info->pcd)) {
-+					printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++					printk("%s::FmPcdHcSync failed\n", __func__);
 +					retval = -1;
 +					goto func_ret;
 +				}
@@ -6963,7 +6865,7 @@ index 000000000000..82d6fc9bfe95
 +			}
 +			else
 +			{
-+				FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++				FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +				tmp_tbl_entry = ExternalHashTableAllocCumulativeEntry (h_HashTbl);
 +				if (!tmp_tbl_entry)
 +				{
@@ -6996,7 +6898,7 @@ index 000000000000..82d6fc9bfe95
 +		}
 +		else
 +		{
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +			cumulative_tbl_entry = ExternalHashTableAllocCumulativeEntry (h_HashTbl);
 +			if (!cumulative_tbl_entry)
 +			{
@@ -7010,10 +6912,10 @@ index 000000000000..82d6fc9bfe95
 +			cumulative_entry->flags = EN_CUMULATIVE_NODE;
 +			cumulative_entry->key_size = keySize+key_align;
 +			cumulative_entry->num_key_entries = 2;
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +			memcpy(cumulative_entry->data, new_entry->hashentry.key, keySize);
 +			memset(cumulative_entry->data+keySize, 0, key_align);
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +			memcpy(cumulative_entry->data+keySize+key_align, first_entry->hashentry.key, keySize);
 +			memset(cumulative_entry->data+2*keySize+key_align, 0, key_align);
 +			cumulative_entry->data[2*(keySize+key_align)] = 0;
@@ -7025,10 +6927,10 @@ index 000000000000..82d6fc9bfe95
 +			phyaddr = SwapUint64(phyaddr);
 +			*((uint64_t *)(cumulative_entry->data+2*(keySize+key_align)+1+EN_CU_HASH_TABLE_ENTRY_ADDR_SIZE)) = phyaddr;
 +			//change the head pointer in the bucket
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +			phyaddr = XX_VirtToPhys(cumulative_tbl_entry);
 +			bucket->h = SwapUint64(phyaddr);
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		}
 +		
 +#ifdef FM_EHASH_DEBUG 
@@ -7172,14 +7074,11 @@ index 000000000000..82d6fc9bfe95
 +
 +			prev_addr = cpu_to_be32(IprContextMem->next_free_ctx);
 +			printk("%s::IprContextMem %p, %08x, next free ctx %08x\n",
-+					__FUNCTION__, IprContextMem, ii, prev_addr);
++					__func__, IprContextMem, ii, prev_addr);
 +			count = 0;
 +			while(1) {
 +				if (prev_addr == IPR_CONTEXT_EOL)
 +					break;
-+#if 0
-+				printk("memaddr %08x\n", prev_addr);
-+#endif
 +				ptr = (uint32_t *)(FmMurambaseAddr + prev_addr);
 +				prev_addr = cpu_to_be32(*ptr);
 +				count++;
@@ -7214,7 +7113,7 @@ index 000000000000..82d6fc9bfe95
 +			if (ipv4_reassly_tbl_info) {
 +#ifdef FM_EHASH_DEBUG 
 +				printk("%s::ipv4_reassly_tbl_info already created %p\n",
-+						__FUNCTION__, ipv4_reassly_tbl_info);
++						__func__, ipv4_reassly_tbl_info);
 +#endif
 +				return (t_Handle)ipv4_reassly_tbl_info;
 +			}
@@ -7227,7 +7126,7 @@ index 000000000000..82d6fc9bfe95
 +			if (ipv6_reassly_tbl_info) {
 +#ifdef FM_EHASH_DEBUG 
 +				printk("%s::ipv6_reassly_tbl_info already created %p\n",
-+						__FUNCTION__, ipv6_reassly_tbl_info);
++						__func__, ipv6_reassly_tbl_info);
 +#endif
 +				return (t_Handle)ipv6_reassly_tbl_info;
 +			}
@@ -7270,7 +7169,7 @@ index 000000000000..82d6fc9bfe95
 +        	return NULL;
 +	}
 +#ifdef FM_EHASH_DEBUG 
-+	printk("%s(%d) info %p \n",__FUNCTION__,__LINE__,info);
++	printk("%s(%d) info %p \n",__func__,__LINE__,info);
 +#endif
 +	memset(info, 0, sizeof(struct en_exthash_info));
 +		
@@ -7379,7 +7278,7 @@ index 000000000000..82d6fc9bfe95
 +	}
 +#ifdef FM_EHASH_DEBUG 
 +	printk("%s::table type %d, word_1 0x%x, hashmask+1 0x%x, hashmask bits 0x%x, global mem offset 0x%x\n",
-+	__FUNCTION__, p_Param->table_type, node->word_1, info->hashmask+1, node->hash_mask_bits,
++	__func__, p_Param->table_type, node->word_1, info->hashmask+1, node->hash_mask_bits,
 +	node->global_mem_offset);
 +#endif
 +	tblphysaddr = XX_VirtToPhys(info->table_base);
@@ -7402,7 +7301,7 @@ index 000000000000..82d6fc9bfe95
 +					&p_Param->ccNextEngineParamsForMiss.params.kgParams;
 +#ifdef FM_EHASH_DEBUG 
 +				printk("%s::Nextengine = KG, kgparams->h_DirectScheme %p\n", 
-+					__FUNCTION__, kgparams->h_DirectScheme);
++					__func__, kgparams->h_DirectScheme);
 +#endif
 +				node->nia = (NIA_ENG_KG | NIA_KG_DIRECT);
 +				if (kgparams->overrideFqid) 
@@ -7422,7 +7321,7 @@ index 000000000000..82d6fc9bfe95
 +					&p_Param->ccNextEngineParamsForMiss.params.enqueueParams;
 +#ifdef FM_EHASH_DEBUG
 +                               printk("%s:: EN_EHASH_MISS_ACTION_NIA %d , ovrdfqid %d\n",
-+                                       __FUNCTION__, EN_EHASH_MISS_ACTION_NIA,enqparams->overrideFqid);
++                                       __func__, EN_EHASH_MISS_ACTION_NIA,enqparams->overrideFqid);
 +#endif
 +				if (enqparams->overrideFqid)
 +					node->fqid = enqparams->newFqid;
@@ -7440,7 +7339,7 @@ index 000000000000..82d6fc9bfe95
 +		default:
 +			node->miss_action_type = EN_EHASH_MISS_ACTION_DROP;
 +#ifdef FM_EHASH_DEBUG
-+			printk("%s::Nextengine type %d not supported, drop case\n", __FUNCTION__,
++			printk("%s::Nextengine type %d not supported, drop case\n", __func__,
 +				p_Param->ccNextEngineParamsForMiss.nextEngine);
 +#endif
 +			break;
@@ -7491,23 +7390,23 @@ index 000000000000..82d6fc9bfe95
 +		}
 +#ifdef FM_EHASH_DEBUG
 +		if (p_Param->table_type == IPV4_REASSM_TABLE)
-+			printk("%s::ipv4 reassem param ", __FUNCTION__);
++			printk("%s::ipv4 reassem param ", __func__);
 +		else
-+			printk("%s::ipv6 reassem param ", __FUNCTION__);
++			printk("%s::ipv6 reassem param ", __func__);
 +		printk("%x, size %d dbg %x\n",
 +				node->reassm_param,
 +				(uint32_t)(sizeof(struct ip_reassembly_params) +
 +				REASSM_DEBUG_SIZE),
 +				cpu_to_be32(info->ip_reassem_info->reassly_dbg));
 +		printk(KERN_INFO "%s::en ext hash reassem table created, handle %p\n",
-+				__FUNCTION__, info);
++				__func__, info);
 +#endif
 +	}
 +#endif
 +
 +#ifdef FM_EHASH_DEBUG
 +	printk(KERN_INFO "%s::en ext hash table created, handle %p\n",
-+			__FUNCTION__, info);
++			__func__, info);
 +	printk("ad_word_0::%08x\n", node->word_0);
 +	printk("ad_word_1::%08x\n", node->table_base_lo);
 +	printk("ad_word_2::%08x\n", node->word_1);
@@ -7520,14 +7419,14 @@ index 000000000000..82d6fc9bfe95
 +			ipv4_reassly_tbl_info = info;
 +#ifdef FM_EHASH_DEBUG
 +			printk("%s::saving ipv4_reassly_tbl_info %p\n",
-+					__FUNCTION__, ipv4_reassly_tbl_info);
++					__func__, ipv4_reassly_tbl_info);
 +#endif
 +			break;
 +		case IPV6_REASSM_TABLE:
 +			ipv6_reassly_tbl_info = info;
 +#ifdef FM_EHASH_DEBUG
 +			printk("%s::saving ipv6_reassly_tbl_info %p\n",
-+					__FUNCTION__, ipv6_reassly_tbl_info);
++					__func__, ipv6_reassly_tbl_info);
 +#endif
 +			break;
 +		default:
@@ -7535,8 +7434,8 @@ index 000000000000..82d6fc9bfe95
 +	}
 +#endif
 +#ifdef FM_EHASH_DEBUG
-+	//display_ehashtbl_info(info, __FUNCTION__);
-+	printk("%s::handle %p\n", __FUNCTION__, info);
++	//display_ehashtbl_info(info, __func__);
++	printk("%s::handle %p\n", __func__, info);
 +#endif //FM_EHASH_DEBUG
 +	return (t_Handle)info;
 +err_ret:
@@ -7568,7 +7467,7 @@ index 000000000000..82d6fc9bfe95
 +			kgparams = &p_FmPcdCcNextEngineParams->params.kgParams;
 +#ifdef FM_EHASH_DEBUG
 +			printk("%s::Nextengine = KG, kgparams->h_DirectScheme %p\n",
-+				__FUNCTION__, kgparams->h_DirectScheme);
++				__func__, kgparams->h_DirectScheme);
 +#endif
 +			node.nia = (NIA_ENG_KG | NIA_KG_DIRECT | NIA_KG_CC_EN);
 +			node.nia |= FmPcdKgGetSchemeId(kgparams->h_DirectScheme);
@@ -7586,7 +7485,7 @@ index 000000000000..82d6fc9bfe95
 +				&p_FmPcdCcNextEngineParams->params.enqueueParams;
 +#ifdef FM_EHASH_DEBUG
 +			printk("%s:: EN_EHASH_MISS_ACTION_NIA %d , ovrdfqid %d\n",
-+				__FUNCTION__, EN_EHASH_MISS_ACTION_NIA,enqparams->overrideFqid);
++				__func__, EN_EHASH_MISS_ACTION_NIA,enqparams->overrideFqid);
 +#endif
 +			if (enqparams->overrideFqid)
 +				node.fqid = enqparams->newFqid;
@@ -7615,7 +7514,7 @@ index 000000000000..82d6fc9bfe95
 +		default:
 +			node.miss_action_type = EN_EHASH_MISS_ACTION_DROP;
 +#ifdef FM_EHASH_DEBUG
-+			printk("%s::Nextengine type %d not supported, drop case\n", __FUNCTION__,
++			printk("%s::Nextengine type %d not supported, drop case\n", __func__,
 +				p_FmPcdCcNextEngineParams->nextEngine);
 +#endif
 +			break;
@@ -7643,7 +7542,7 @@ index 000000000000..82d6fc9bfe95
 +	struct en_exthash_info *info;
 +	info = (struct en_exthash_info *)h_HashTbl;
 +	if (FmPcdHcSync(info->pcd)) {
-+		printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++		printk("%s::FmPcdHcSync failed\n", __func__);
 +		return -1;
 +	}
 +	return 0;
@@ -7668,7 +7567,7 @@ index 000000000000..82d6fc9bfe95
 +#endif // NO_CUMULATIVE_ENTRY
 +
 +#ifdef FM_EHASH_DEBUG
-+	printk("%s::tbl %p, index %x\n", __FUNCTION__, h_HashTbl, index);
++	printk("%s::tbl %p, index %x\n", __func__, h_HashTbl, index);
 +#endif
 +	info = (struct en_exthash_info *)h_HashTbl;
 +	bucket = ((struct en_exthash_bucket *)info->table_base + index);
@@ -7702,36 +7601,36 @@ index 000000000000..82d6fc9bfe95
 +	}
 +	XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +	if (FmPcdHcSync(info->pcd)) {
-+		printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++		printk("%s::FmPcdHcSync failed\n", __func__);
 +		return -1;
 +	}
 +	return 0;
 +#else
-+	FM_EHASH_PRINT("%s(%d) tbl_entry %p\n", __FUNCTION__,__LINE__,tbl_entry);
++	FM_EHASH_PRINT("%s(%d) tbl_entry %p\n", __func__,__LINE__,tbl_entry);
 +	// check if it normal node or cumulative node 
 +	// no cumulative node, its only one node in hash bucket, delete
 +	phyaddr = XX_VirtToPhys(entry);
 +	if (bucket->h == SwapUint64(phyaddr))
 +	{
-+		FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		bucket->h = 0;
 +		XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +		if (FmPcdHcSync(info->pcd)) {
-+			printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++			printk("%s::FmPcdHcSync failed\n", __func__);
 +			return -1;
 +		}
 +		return 0;
 +	}
 +	else
 +	{
-+		FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		// get cumulative entry node address.
 +		phyaddr = bucket->h;
 +		cumulative_tbl_entry = XX_PhysToVirt(SwapUint64(phyaddr));
 +		cumulative_entry = &cumulative_tbl_entry->cumulative_entry;
 +		if (!(cumulative_entry->flags & EN_CUMULATIVE_NODE))
 +		{
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +       		REPORT_ERROR(MAJOR, E_INVALID_STATE,
 +                	     ("Invalid state"));
 +			XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
@@ -7742,7 +7641,7 @@ index 000000000000..82d6fc9bfe95
 +		{
 +			for (ii=0; ii<cumulative_entry->num_key_entries; ii++)
 +			{
-+				FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++				FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +				phyaddr = *((uint64_t *)(&cumulative_entry->data[cumulative_entry->tbl_entry_index - 12 + ii*8]));
 +				temp_entry = XX_PhysToVirt(SwapUint64(phyaddr));
 +				if (temp_entry == tbl_entry)
@@ -7763,7 +7662,7 @@ index 000000000000..82d6fc9bfe95
 +		}while (cumulative_entry);
 +		if (match) // if found
 +		{
-+			FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +			// cumulative entry might have the next entry, in that case, get the last table entry in last cumulative entry
 +			// and overwrite it with to-be-deleted table entry
 +			flags =  cumulative_entry->flags | EN_INVALID_CUMULATIVE_NODE;
@@ -7780,24 +7679,24 @@ index 000000000000..82d6fc9bfe95
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +					return -1;
 +				}
-+				FM_EHASH_PRINT(" case 1 num keys > 1 %s(%d)\n",__FUNCTION__,__LINE__);
++				FM_EHASH_PRINT(" case 1 num keys > 1 %s(%d)\n",__func__,__LINE__);
 +				tmp = &tmp_tbl_entry->cumulative_entry;
 +				tmp->flags = cumulative_entry->flags & 0xbf; 
 +				tmp->key_size =  cumulative_entry->key_size;
 +				tmp->next_entry_addr = cumulative_entry->next_entry_addr;
 +				tmp->num_key_entries = cumulative_entry->num_key_entries-1;
 +				tmp->tbl_entry_index = cumulative_entry->tbl_entry_index - cumulative_entry->key_size;
-+				FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++				FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +				if (ii)
 +				{
-+					FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++					FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +					memcpy(tmp->data, &cumulative_entry->data, (ii*cumulative_entry->key_size));
 +					memcpy(&tmp->data[tmp->num_key_entries*tmp->key_size+1], 
 +						&cumulative_entry->data[cumulative_entry->num_key_entries*tmp->key_size+1], ii*EN_CU_HASH_TABLE_ENTRY_ADDR_SIZE);
 +				}
 +				if (ii < cumulative_entry->num_key_entries-1)
 +				{
-+					FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++					FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +					memcpy(tmp->data+(ii*cumulative_entry->key_size), 
 +						&cumulative_entry->data[(ii+1)*cumulative_entry->key_size],
 +					(cumulative_entry->num_key_entries-ii-1)*cumulative_entry->key_size+1);
@@ -7807,33 +7706,33 @@ index 000000000000..82d6fc9bfe95
 +				}
 +				if (cumulative_tbl_entry->next_entry)
 +				{
-+					FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++					FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +					tmp_tbl_entry->next_entry = cumulative_tbl_entry->next_entry;
 +					cumulative_tbl_entry->next_entry->prev_entry = tmp_tbl_entry;
 +				}
 +				phyaddr = SwapUint64(XX_VirtToPhys(tmp_tbl_entry));
 +				if (cumulative_tbl_entry->prev_entry)
 +				{
-+					FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++					FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +					cumulative_tbl_entry->prev_entry->cumulative_entry.next_entry_addr = phyaddr;
 +					tmp_tbl_entry->prev_entry = cumulative_tbl_entry->prev_entry;
 +					cumulative_tbl_entry->prev_entry->next_entry =  tmp_tbl_entry;
 +				}
 +				else
 +				{
-+					FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++					FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +					bucket->h = phyaddr;
 +				}
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +				if (FmPcdHcSync(info->pcd)) {
-+					printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++					printk("%s::FmPcdHcSync failed\n", __func__);
 +					return -1;
 +				}
 +				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
 +			}
 +			else  // if only one entry in list and there is next pointer
 +			{
-+				FM_EHASH_PRINT("%s(%d)\n",__FUNCTION__,__LINE__);
++				FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +				if ((!(cumulative_tbl_entry->next_entry) &&
 +					  !(cumulative_tbl_entry->prev_entry) &&
 +					 (cumulative_entry->num_key_entries == 2)) || 
@@ -7849,7 +7748,7 @@ index 000000000000..82d6fc9bfe95
 +					// special case where only one entry in list exists
 +					if (cumulative_tbl_entry->next_entry)
 +					{
-+						FM_EHASH_PRINT("%s(%d) special case where only one entry in list exists\n",__FUNCTION__,__LINE__);
++						FM_EHASH_PRINT("%s(%d) special case where only one entry in list exists\n",__func__,__LINE__);
 +						tmp_tbl_entry = cumulative_tbl_entry->next_entry;
 +						flags = tmp_tbl_entry->cumulative_entry.flags | EN_INVALID_CUMULATIVE_NODE;
 +						tmp_tbl_entry->cumulative_entry.flags =	flags;
@@ -7859,7 +7758,7 @@ index 000000000000..82d6fc9bfe95
 +					}
 +					else if (cumulative_tbl_entry->prev_entry)
 +					{
-+						FM_EHASH_PRINT("%s(%d) special case where only one entry in list exists\n",__FUNCTION__,__LINE__);
++						FM_EHASH_PRINT("%s(%d) special case where only one entry in list exists\n",__func__,__LINE__);
 +						tmp_tbl_entry = cumulative_tbl_entry->prev_entry;
 +						flags = tmp_tbl_entry->cumulative_entry.flags | EN_INVALID_CUMULATIVE_NODE;
 +						tmp_tbl_entry->cumulative_entry.flags =	flags;
@@ -7875,12 +7774,12 @@ index 000000000000..82d6fc9bfe95
 +						else					
 +							phyaddr = *((uint64_t *)(&cumulative_entry->data[cumulative_entry->tbl_entry_index-EN_CU_FIXED_ELEMENTS_SIZE+EN_CU_HASH_TABLE_ENTRY_ADDR_SIZE]));
 +						bucket->h = phyaddr;
-+						FM_EHASH_PRINT("%s(%d) special case where only one entry %p in list exists\n",__FUNCTION__,__LINE__,
++						FM_EHASH_PRINT("%s(%d) special case where only one entry %p in list exists\n",__func__,__LINE__,
 +							XX_PhysToVirt(SwapUint64(phyaddr)));
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +					if (FmPcdHcSync(info->pcd)) {
-+						printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++						printk("%s::FmPcdHcSync failed\n", __func__);
 +						return -1;
 +					}
 +					if (tmp_tbl_entry)
@@ -7892,20 +7791,20 @@ index 000000000000..82d6fc9bfe95
 +					if (cumulative_tbl_entry->next_entry)
 +					{
 +						// update the bucket with next cumulative node
-+						FM_EHASH_PRINT("%s(%d) update the bucket with next cumulative node as no prev entry \n",__FUNCTION__,__LINE__);
++						FM_EHASH_PRINT("%s(%d) update the bucket with next cumulative node as no prev entry \n",__func__,__LINE__);
 +						cumulative_tbl_entry->next_entry->prev_entry =  NULL;
 +						phyaddr = SwapUint64(XX_VirtToPhys(cumulative_tbl_entry->next_entry));
 +						bucket->h = phyaddr;
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +						if (FmPcdHcSync(info->pcd)) {
-+							printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++							printk("%s::FmPcdHcSync failed\n", __func__);
 +							return -1;
 +						}
 +						ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);						
 +					}
 +					else // no next node , no prev node , only table entry in node ==> invalid case
 +					{
-+						FM_EHASH_PRINT("%s(%d)no next node , no prev node , only table entry in node ==> invalid case\n",__FUNCTION__,__LINE__);
++						FM_EHASH_PRINT("%s(%d)no next node , no prev node , only table entry in node ==> invalid case\n",__func__,__LINE__);
 +						REPORT_ERROR(MAJOR, E_INVALID_STATE,
 +									 ("Invalid state"));
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
@@ -7914,11 +7813,11 @@ index 000000000000..82d6fc9bfe95
 +				}
 +				else // this node is not the first node
 +				{
-+					FM_EHASH_PRINT("%s(%d) this node is not the first node \n",__FUNCTION__,__LINE__);
++					FM_EHASH_PRINT("%s(%d) this node is not the first node \n",__func__,__LINE__);
 +					if (cumulative_tbl_entry->next_entry)
 +					{
 +						// update the bucket with next cumulative node
-+						FM_EHASH_PRINT("%s(%d) update the next cumulative node with prev entry\n",__FUNCTION__,__LINE__);
++						FM_EHASH_PRINT("%s(%d) update the next cumulative node with prev entry\n",__func__,__LINE__);
 +						cumulative_tbl_entry->next_entry->prev_entry =  cumulative_tbl_entry->prev_entry;
 +						cumulative_tbl_entry->prev_entry->next_entry =	cumulative_tbl_entry->next_entry;
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.next_entry_addr = cumulative_tbl_entry->cumulative_entry.next_entry_addr ;
@@ -7926,14 +7825,14 @@ index 000000000000..82d6fc9bfe95
 +					else
 +					{
 +						flags = cumulative_tbl_entry->prev_entry->cumulative_entry.flags & ~EN_NEXT_CUMULATIVE_NODE;
-+						FM_EHASH_PRINT("%s(%d) update the next cumulative node with prev entry\n",__FUNCTION__,__LINE__);
++						FM_EHASH_PRINT("%s(%d) update the next cumulative node with prev entry\n",__func__,__LINE__);
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.flags = flags;
 +						cumulative_tbl_entry->prev_entry->next_entry =	NULL;
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.next_entry_addr = 0;
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +					if (FmPcdHcSync(info->pcd)) {
-+						printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++						printk("%s::FmPcdHcSync failed\n", __func__);
 +						return -1;
 +					}
 +					ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);						
@@ -7951,7 +7850,7 @@ index 000000000000..82d6fc9bfe95
 +	}
 +
 +#ifdef FM_EHASH_DEBUG
-+	printk("%s(%d)\n",__FUNCTION__,__LINE__);
++	printk("%s(%d)\n",__func__,__LINE__);
 +	cumulative_entry = XX_PhysToVirt(SwapUint64(bucket->h));
 +	if (!cumulative_entry)
 +		return 0;
@@ -7995,7 +7894,7 @@ index 000000000000..82d6fc9bfe95
 +#ifdef NO_CUMULATIVE_ENTRY
 +	XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +	if (FmPcdHcSync(info->pcd)) {
-+		printk("%s::FmPcdHcSync failed\n", __FUNCTION__);
++		printk("%s::FmPcdHcSync failed\n", __func__);
 +		return -1;
 +	}
 +#endif //NO_CUMULATIVE_ENTRY
@@ -8013,7 +7912,7 @@ index 000000000000..82d6fc9bfe95
 +	{
 +		case IPV4_REASSM_TABLE:
 +			if (!ipv4_reassly_tbl_info) {
-+				printk("%s::ipv4 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv4 frag table not setup\n", __func__);
 +				return -1;
 +			}
 +			printk("ipv4 reassembly ctx_bpid %d, frag_bpid %d timerfreq %d\n", 
@@ -8034,7 +7933,7 @@ index 000000000000..82d6fc9bfe95
 +			break;
 +		case IPV6_REASSM_TABLE:
 +			if (!ipv6_reassly_tbl_info) {
-+				printk("%s::ipv6 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv6 frag table not setup\n", __func__);
 +				return -1;
 +			}
 +			printk("ipv6 reassembly ctx_bpid %d, frag_bpid %d timerfreq %d\n", 
@@ -8056,7 +7955,7 @@ index 000000000000..82d6fc9bfe95
 +
 +
 +		default:
-+			printk("%s::invalid frag table type %d\n", __FUNCTION__, type);
++			printk("%s::invalid frag table type %d\n", __func__, type);
 +			return -1;
 +	}
 +	return 0;
@@ -8095,7 +7994,7 @@ index 000000000000..82d6fc9bfe95
 +	{
 +		case IPV4_REASSM_TABLE:
 +			if (!ipv4_reassly_tbl_info) {
-+				printk("%s::ipv4 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv4 frag table not setup\n", __func__);
 +				return;
 +			}
 +			printk("ipv4 reassembly params::");
@@ -8103,7 +8002,7 @@ index 000000000000..82d6fc9bfe95
 +			break;
 +		case IPV6_REASSM_TABLE:
 +			if (!ipv6_reassly_tbl_info) {
-+				printk("%s::ipv6 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv6 frag table not setup\n", __func__);
 +				return;
 +			}
 +			printk("ipv6 reassembly params::");
@@ -8111,7 +8010,7 @@ index 000000000000..82d6fc9bfe95
 +			break;
 +
 +		default:
-+			printk("%s::invalid frag table type %d\n", __FUNCTION__, type);
++			printk("%s::invalid frag table type %d\n", __func__, type);
 +			return;
 +	}
 +	printk("%p\n", params);
@@ -8146,21 +8045,6 @@ index 000000000000..82d6fc9bfe95
 +			cpu_to_be32(params->timer_tnum));
 +	printk("txc_fqid\t0x%x\n",
 +			(cpu_to_be32(params->txc_fqid) & 0xffffff));
-+#if 0
-+	{
-+		uint32_t ii;
-+		uint8_t *ptr;
-+
-+		ptr = (uint8_t *)params;
-+		for (ii = 0; ii < sizeof(struct ip_reassembly_params); ii++) {
-+			if (ii % 16 == 15)
-+				printk("%02x\n", *(ptr + ii));
-+			else
-+				printk("%02x ", *(ptr + ii));
-+		}
-+		printk("\n");
-+	}
-+#endif
 +}
 +
 +int get_ip_reassem_info(uint32_t type, struct ip_reassembly_info *info)
@@ -8171,20 +8055,20 @@ index 000000000000..82d6fc9bfe95
 +	{
 +		case IPV4_REASSM_TABLE:
 +			if (!ipv4_reassly_tbl_info) {
-+				printk("%s::ipv4 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv4 frag table not setup\n", __func__);
 +				return -1;
 +			}
 +			params = ipv4_reassly_tbl_info->ip_reassem_info; 
 +			break;
 +		case IPV6_REASSM_TABLE:
 +			if (!ipv6_reassly_tbl_info) {
-+				printk("%s::ipv6 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv6 frag table not setup\n", __func__);
 +				return -1;
 +			}
 +			params = ipv6_reassly_tbl_info->ip_reassem_info; 
 +			break;
 +		default:
-+			printk("%s::invalid frag table type %d\n", __FUNCTION__, type);
++			printk("%s::invalid frag table type %d\n", __func__, type);
 +			return -1;
 +	}
 +	info->num_frag_pkts = params->stats.num_frag_pkts;
@@ -8227,7 +8111,7 @@ index 000000000000..82d6fc9bfe95
 +	{
 +		case IPV4_REASSM_TABLE:
 +			if (!ipv4_reassly_tbl_info) {
-+				printk("%s::ipv4 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv4 frag table not setup\n", __func__);
 +				return;
 +			}
 +			stats = &ipv4_reassly_tbl_info->ip_reassem_info->stats;
@@ -8235,7 +8119,7 @@ index 000000000000..82d6fc9bfe95
 +			break;
 +		case IPV6_REASSM_TABLE:
 +			if (!ipv6_reassly_tbl_info) {
-+				printk("%s::ipv6 frag table not setup\n", __FUNCTION__);
++				printk("%s::ipv6 frag table not setup\n", __func__);
 +				return;
 +			}
 +			stats = &ipv6_reassly_tbl_info->ip_reassem_info->stats;
@@ -8243,7 +8127,7 @@ index 000000000000..82d6fc9bfe95
 +			break;
 +
 +		default:
-+			printk("%s::invalid frag table type %d\n", __FUNCTION__, type);
++			printk("%s::invalid frag table type %d\n", __func__, type);
 +			return;
 +	}
 +
@@ -8444,33 +8328,18 @@ index 000000000000..82d6fc9bfe95
 +
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
-index 7c5cf467380f..b042ffa4b07a 100644
+index 7c5cf467380f..f3e2a6233b4f 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 @@ -1243,6 +1243,7 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
                          p_SchemeRegs->kgse_ppc = ppcTmp;
                      }
                  }
-+                printk("%s::kgse_ppc %08x\n", __FUNCTION__, ppcTmp);
++                printk("%s::kgse_ppc %08x\n", __func__, ppcTmp);
              }
              break;
          case (e_FM_PCD_DONE):
-@@ -1254,6 +1255,14 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
-         default:
-              RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("Next engine not supported"));
-     }
-+#if 0 //BMR bypass classification
-+    printk("%s::actual_kgse_mode %08x\n", __FUNCTION__, tmpReg);
-+    if (p_SchemeParams->nextEngine == e_FM_PCD_CC) {
-+		tmpReg =  (KG_SCH_MODE_EN | GET_NIA_BMI_AC_ENQ_FRAME(p_FmPcd));
-+		tmpReg |= (uint32_t)(grpBase << KG_SCH_MODE_CCOBASE_SHIFT);
-+    }
-+    printk("%s::kgse_mode %08x\n", __FUNCTION__, tmpReg);
-+#endif
-     p_SchemeRegs->kgse_mode = tmpReg;
- 
-     p_SchemeRegs->kgse_mv = p_Scheme->matchVector;
-@@ -1571,6 +1580,8 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
+@@ -1571,6 +1572,8 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
                  generic = FALSE;
              }
          }
@@ -8479,7 +8348,7 @@ index 7c5cf467380f..b042ffa4b07a 100644
          p_SchemeRegs->kgse_ekfc = knownTmp;
  
          selectTmp = 0;
-@@ -2773,6 +2784,16 @@ uint8_t FmPcdKgGetSchemeId(t_Handle h_Scheme)
+@@ -2773,6 +2776,16 @@ uint8_t FmPcdKgGetSchemeId(t_Handle h_Scheme)
  
  }
  
@@ -8576,7 +8445,7 @@ index b8c18e0edf83..5855a8864ce2 100644
  t_Error FmPcdManipUpdate(t_Handle h_FmPcd, t_Handle h_PcdParams,
                           t_Handle h_FmPort, t_Handle h_Manip, t_Handle h_Ad,
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
-index 5d96727f7251..a790c3cdb38c 100644
+index 5d96727f7251..b86860b387aa 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 @@ -55,6 +55,14 @@
@@ -8765,7 +8634,7 @@ index 5d96727f7251..a790c3cdb38c 100644
 +       }
 +       extHashTsInfo.offset = (uint32_t)(XX_VirtToPhys(extHashTsInfo.ptr) -
 +                       p_FmPcd->physicalMuramBase);
-+       printk("%s::ext timers %d, base ptr %p, muram base %p, offset %x\n", __FUNCTION__,
++       printk("%s::ext timers %d, base ptr %p, muram base %p, offset %x\n", __func__,
 +                       extHashTsInfo.max_ext_ts_timers, extHashTsInfo.ptr,
 +                       (void *)p_FmPcd->physicalMuramBase, extHashTsInfo.offset);
 +   }
@@ -8871,7 +8740,7 @@ index 5d96727f7251..a790c3cdb38c 100644
 +    p_FmPcd->InternalBufMgmtMuramArea = (uint32_t)(XX_VirtToPhys(p_FmPcd->pIntMuramPtr) -
 +                       p_FmPcd->physicalMuramBase);
 +    printk("%s(%d) pIntMuramPtr %p InternalBufMgmtMuramArea %x, size 0x%x \n",
-+		__FUNCTION__,__LINE__, p_FmPcd->pIntMuramPtr,p_FmPcd->InternalBufMgmtMuramArea,
++		__func__,__LINE__, p_FmPcd->pIntMuramPtr,p_FmPcd->InternalBufMgmtMuramArea,
 +		EN_INTERNAL_BUFF_POOL_SIZE+global_data_size);
 +
 +    if (p_FmPcd->InternalBufMgmtMuramArea & 0xff)
@@ -8880,7 +8749,7 @@ index 5d96727f7251..a790c3cdb38c 100644
 +        RETURN_ERROR(MAJOR, E_EMPTY, ("InternalBufMgmtMuramArea should be aligned to 256"));	
 +    }
 +    p_FmPcd->InternalBufMgmtMuramArea >>= 8;
-+    printk("%s(%d) pIntMuramPtr %p InternalBufMgmtMuramArea %x \n",__FUNCTION__,__LINE__, p_FmPcd->pIntMuramPtr,p_FmPcd->InternalBufMgmtMuramArea);
++    printk("%s(%d) pIntMuramPtr %p InternalBufMgmtMuramArea %x \n",__func__,__LINE__, p_FmPcd->pIntMuramPtr,p_FmPcd->InternalBufMgmtMuramArea);
 +#endif //USE_ENHANCED_EHASH
 +
      return E_OK;
@@ -9053,7 +8922,7 @@ index 2bb8b969956c..e00c6cf0d993 100644
  #define FM_PCD_PLCR_PEMODE_TRB                0x00000002
  #define FM_PCD_PLCR_PEMODE_TRC                0x00000001
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
-index 3662edc25213..00dee8f4cbf0 100644
+index 3662edc25213..b5550460a91a 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 @@ -53,6 +53,11 @@
@@ -9085,7 +8954,7 @@ index 3662edc25213..00dee8f4cbf0 100644
  
 +	if (p_FmPort->portType == e_FM_PORT_TYPE_OH_OFFLINE_PARSING) {
 +		OfPortInfo[0][p_FmPort->portId] = p_FmPort;
-+		printk("%s::of port %s id %d, handle %p\n", __FUNCTION__,
++		printk("%s::of port %s id %d, handle %p\n", __func__,
 +				p_FmPort->name, p_FmPort->portId, p_FmPort);
 +	}
 +
@@ -9286,7 +9155,7 @@ index 2db8365471d5..2f290e3a890f 100644
  } t_FmPort;
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c
-index 17490acd50cd..b997edf9aadc 100644
+index 17490acd50cd..c73e24275358 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c
 @@ -101,6 +101,7 @@ static int init_bmi_rx(struct fman_port *port,
@@ -9320,7 +9189,7 @@ index 17490acd50cd..b997edf9aadc 100644
 +	tmp = ioread32be(&port->bmi_regs->oh.fmbm_ofne);
 +	tmp &= 0xff000000;
 +	tmp |= ofne_val;
-+	printk("%s::setting ofne for port %p as %08x\n", __FUNCTION__, handle, tmp);
++	printk("%s::setting ofne for port %p as %08x\n", __func__, handle, tmp);
 +	iowrite32be(tmp, &port->bmi_regs->oh.fmbm_ofne);
 +
 +}
@@ -9332,13 +9201,13 @@ index 17490acd50cd..b997edf9aadc 100644
 +	struct fman_port *port = (struct fman_port *)handle;
 +
 +	tmp = ioread32be(&port->bmi_regs->oh.fmbm_oda);
-+	pr_info("%s::read rda reg value for port %p is %x\n", __FUNCTION__, handle, tmp);
++	pr_info("%s::read rda reg value for port %p is %x\n", __func__, handle, tmp);
 +
 +	tmp &= ~(0x00300000);
 +	if(val)
 +		tmp |= BMI_DMA_ATTR_WRITE_OPTIMIZE;
 +
-+	pr_info("%s::setting dma attributes for port %p as %x\n", __FUNCTION__, handle, tmp);
++	pr_info("%s::setting dma attributes for port %p as %x\n", __func__, handle, tmp);
 +	iowrite32be(tmp, &port->bmi_regs->oh.fmbm_oda);
 +}
 +EXPORT_SYMBOL(fman_set_ohport_rda);
@@ -9393,7 +9262,7 @@ index 5f3e2cd9b05e..60bdf910ee48 100644
 +}
 +EXPORT_SYMBOL(FM_VSP_GetRelativeProfileId);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
-index 01ab5788059a..89e481efb984 100644
+index 01ab5788059a..c9efafafd393 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
 @@ -49,6 +49,9 @@
@@ -9435,11 +9304,11 @@ index 01ab5788059a..89e481efb984 100644
 +        p_Fm->firmware.p_Code = fman_firmware;
 +    }
 +    printk("%s(%d) FMAN version extracted from ls1043_r2.h: (%d.%d.%d) (0x%x) \n",
-+		 __FUNCTION__,__LINE__, (fman_firmware[1] & 0xffff0000) >> 16, (fman_firmware[1] & 0x0000ff00) >> 8,
++		 __func__,__LINE__, (fman_firmware[1] & 0xffff0000) >> 16, (fman_firmware[1] & 0x0000ff00) >> 8,
 +		fman_firmware[1] & 0x000000ff, fman_firmware[1]);
 +#endif //AUTO_FIRMWARE_LOAD
 +    printk("***************************************************************\n");
-+    printk("%s(%d) FMan-Controller code (ver %d.%d.%d) (0x%x)\n", __FUNCTION__,__LINE__,
++    printk("%s(%d) FMan-Controller code (ver %d.%d.%d) (0x%x)\n", __func__,__LINE__,
 +               ((p_Fm->firmware.p_Code)[1] & 0xffff0000) >> 16 ,
 +               ((p_Fm->firmware.p_Code)[1] & 0x0000ff00) >> 8,
 +               (p_Fm->firmware.p_Code)[1] & 0x000000ff, (p_Fm->firmware.p_Code)[1]);
@@ -9534,7 +9403,7 @@ index 01ab5788059a..89e481efb984 100644
  /*       API Advanced Init unit functions        */
  /*************************************************/
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
-index 8ab81ac69431..9737beb1ea15 100644
+index 8ab81ac69431..948daf8ea03b 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
 @@ -36,7 +36,12 @@
@@ -9559,7 +9428,7 @@ index 8ab81ac69431..9737beb1ea15 100644
 +        uint8_t *src;
 +        uint8_t *dst;
 +
-+        printk("%s::base %p size %d\n", __FUNCTION__,
++        printk("%s::base %p size %d\n", __func__,
 +                FmMurambaseAddr,
 +                FmMuramsize);
 +        *size = FmMuramsize;
@@ -9584,9 +9453,7 @@ index 8ab81ac69431..9737beb1ea15 100644
      {
          XX_Free(p_FmMuram);
          REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM-MURAM partition!!!"));
-@@ -99,9 +120,10 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
- 
-     /* Initialize FM MURAM parameters which will be kept by the driver */
+@@ -101,7 +122,8 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
      p_FmMuram->baseAddr = baseAddress;
      p_FmMuram->size = size;
      p_FmMuram->h_Mem = h_Mem;
@@ -12072,7 +11939,7 @@ index b52ff95ce9e9..e8cc4b0c21d2 100644
  }
 +EXPORT_SYMBOL(SYS_VirtToPhys);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
-index e10512983b60..55498f4c9643 100644
+index e10512983b60..82b82737d4e7 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 @@ -1319,6 +1319,17 @@ void *fm_port_get_handle(const struct fm_port *port)
@@ -12118,7 +11985,7 @@ index e10512983b60..55498f4c9643 100644
  	int	_errno;
  	t_Error	err;
  
-+        printk("%s::%d \r\n", __FUNCTION__, __LINE__);
++        printk("%s::%d \r\n", __func__, __LINE__);
  	err = FM_MAC_SetPromiscuous(fm_mac_dev, enable);
  	_errno = -GET_ERROR_TYPE(err);
  	if (unlikely(_errno < 0))
@@ -12760,7 +12627,7 @@ index 114e2773845b..a44e26aff945 100644
  int qman_ceetm_get_xsfdr(enum qm_dc_portal portal, unsigned int *num)
  {
 diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
-index 4085aa9a2dcb..dc08f09b127e 100644
+index 4085aa9a2dcb..96c3122e665b 100644
 --- a/drivers/staging/fsl_qbman/qman_high.c
 +++ b/drivers/staging/fsl_qbman/qman_high.c
 @@ -34,6 +34,9 @@
@@ -12780,7 +12647,7 @@ index 4085aa9a2dcb..dc08f09b127e 100644
 +#if 1
 +#define display_ceetm_cmd(a,b,c)
 +#else
-+#define display_ceetm_cmd(a, b, c) _display_ceetm_cmd((char *)__FUNCTION__, a, b, c)
++#define display_ceetm_cmd(a, b, c) _display_ceetm_cmd((char *)__func__, a, b, c)
 +static void _display_ceetm_cmd(char *func, uint32_t verb, void *buf, uint32_t size)
 +{
 +	uint8_t *ptr;
@@ -13557,25 +13424,31 @@ index 3cc27cafecba..e4838bd36562 100644
  /** @} */ /* end of lnx_ioctl_FM_lib_grp group */
  /** @} */ /* end of lnx_ioctl_FM_grp */
 diff --git a/include/uapi/linux/fmd/Peripherals/fm_pcd_ioctls.h b/include/uapi/linux/fmd/Peripherals/fm_pcd_ioctls.h
-index c24f471bda76..5a9eda9a40b7 100644
+index c24f471bda76..b62619fa3a53 100644
 --- a/include/uapi/linux/fmd/Peripherals/fm_pcd_ioctls.h
 +++ b/include/uapi/linux/fmd/Peripherals/fm_pcd_ioctls.h
-@@ -1359,6 +1359,14 @@ typedef struct ioc_fm_pcd_cc_key_params_t {
-                                                  of the same size defined in the key_size */
-     ioc_fm_pcd_cc_next_engine_params_t  cc_next_engine_params;
-                                             /**< parameters for the next for the defined Key in p_key */
-+#if 0 // following fields not defined in ioc_fm_pcd_cc_key_params_t 
-+#if (DPAA_VERSION >= 11)
-+	uint32_t					internal_tstamp:1; /* set to use internal FMAN time stamp */
-+	uint32_t					reserved:29;
-+	uint32_t					ext_timer_id:2; /* time stamp timer to use */
-+	uintptr_t	monitor_addr;
-+#endif /* (DPAA_VERSION >= 11) */
-+#endif // 0
+@@ -384,20 +384,6 @@ typedef struct ioc_fm_pcd_kg_dflt_value_params_t {
+ #endif
+ #define FM_PCD_IOC_KG_SCHEME_GET_CNTR  _IOR(FM_IOC_TYPE_BASE, FM_PCD_IOC_NUM(4), ioc_fm_pcd_kg_scheme_spc_t)
  
- } ioc_fm_pcd_cc_key_params_t;
+-#if 0
+-TODO: unused IOCTL
+-/**************************************************************************//**
+- @Function      FM_PCD_ModifyCounter
+-
+- @Description   Writes a value to an enabled counter. Use "0" to reset the counter.
+-
+- @Param[in]     ioc_fm_pcd_counters_params_t - The requested counter parameters.
+-
+- @Return        0 on success; Error code otherwise.
+-*//***************************************************************************/
+-#define FM_PCD_IOC_MODIFY_COUNTER   _IOW(FM_IOC_TYPE_BASE, FM_PCD_IOC_NUM(10), ioc_fm_pcd_counters_params_t)
+-#define FM_PCD_IOC_SET_COUNTER      FM_PCD_IOC_MODIFY_COUNTER
+-#endif
  
-@@ -1455,6 +1463,37 @@ typedef struct ioc_fm_pcd_hash_table_params_t {
+ /**************************************************************************//**
+  @Function      FM_PCD_ForceIntr
+@@ -1455,6 +1441,37 @@ typedef struct ioc_fm_pcd_hash_table_params_t {
  
      ioc_fm_pcd_cc_next_engine_params_t   cc_next_engine_params_for_miss;
                                                              /**< Parameters for defining the next engine when a key is not matched */
@@ -13974,7 +13847,7 @@ index ed08717541fe..346524427218 100644
  module_exit(br_deinit)
  MODULE_LICENSE("GPL");
 diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
-index 642b8ccaae8e..d295d1f896a2 100644
+index 642b8ccaae8e..ac34303f1609 100644
 --- a/net/bridge/br_fdb.c
 +++ b/net/bridge/br_fdb.c
 @@ -14,6 +14,10 @@
@@ -14000,7 +13873,7 @@ index 642b8ccaae8e..d295d1f896a2 100644
  int __init br_fdb_init(void)
  {
  	br_fdb_cache = KMEM_CACHE(net_bridge_fdb_entry, SLAB_HWCACHE_ALIGN);
-@@ -455,6 +464,20 @@ static int fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
+@@ -455,6 +464,11 @@ static int fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
  	if (!fdb)
  		return -ENOMEM;
  
@@ -14009,19 +13882,10 @@ index 642b8ccaae8e..d295d1f896a2 100644
 + * Below commented code is specific to LS1024 device unicast list.
 + * It is not applicable to other architectures.
 + */
-+#if 0
-+	list_for_each_entry(p, &br->port_list, list) {
-+		if (source == p)
-+			continue;
-+
-+		dev_uc_add(source->dev, p->dev->dev_addr);
-+		dev_uc_add(p->dev, addr);
-+	}
-+#endif
  	fdb_add_hw_addr(br, addr);
  	fdb_notify(br, fdb, RTM_NEWNEIGH, true);
  	return 0;
-@@ -567,6 +590,17 @@ void br_fdb_cleanup(struct work_struct *work)
+@@ -567,6 +581,17 @@ void br_fdb_cleanup(struct work_struct *work)
  			continue;
  		}
  
@@ -14039,7 +13903,7 @@ index 642b8ccaae8e..d295d1f896a2 100644
  		if (time_after(this_timer, now)) {
  			work_delay = min(work_delay, this_timer - now);
  		} else {
-@@ -915,6 +949,14 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+@@ -915,6 +940,14 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
  			/* fastpath: update of existing entry */
  			if (unlikely(source != READ_ONCE(fdb->dst) &&
  				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
@@ -14054,7 +13918,7 @@ index 642b8ccaae8e..d295d1f896a2 100644
  				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
  				WRITE_ONCE(fdb->dst, source);
  				fdb_modified = true;
-@@ -1554,3 +1596,21 @@ void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
+@@ -1554,3 +1587,21 @@ void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
  	spin_unlock_bh(&p->br->hash_lock);
  }
  EXPORT_SYMBOL_GPL(br_fdb_clear_offload);
@@ -14861,7 +14725,7 @@ index 1f19b6f14484..090c1456274f 100644
  
  	err = dst->error;
 diff --git a/net/key/af_key.c b/net/key/af_key.c
-index c56bb4f451e6..0e0177ce90bf 100644
+index c56bb4f451e6..7225be6880e1 100644
 --- a/net/key/af_key.c
 +++ b/net/key/af_key.c
 @@ -26,8 +26,183 @@
@@ -15260,7 +15124,7 @@ index c56bb4f451e6..0e0177ce90bf 100644
 +
 +	tos = xfrm_get_tos(&fl, x->props.family);
 +	if (tos < 0) {
-+		printk(KERN_ERR "%s:%d: FIXME\n",__FUNCTION__,__LINE__);	
++		printk(KERN_ERR "%s:%d: FIXME\n",__func__,__LINE__);	
 +		rc = -1;
 +		goto error;
 +	}
@@ -15270,7 +15134,7 @@ index c56bb4f451e6..0e0177ce90bf 100644
 +		case AF_INET:
 +			if (!__ip_route_output_key(net, &(fl.u.ip4)))
 +			{
-+				printk(KERN_ERR "%s:%d:  FIXME\n",__FUNCTION__,__LINE__);
++				printk(KERN_ERR "%s:%d:  FIXME\n",__func__,__LINE__);
 +				rc = -1;
 +				goto error;
 +			}
@@ -15281,7 +15145,7 @@ index c56bb4f451e6..0e0177ce90bf 100644
 +			rt = rt6_lookup(net, &fl.u.ip6.daddr, NULL, 0, NULL, 0);
 +			if ((!rt) || (!rt->dst.dev))
 +			{
-+				printk(KERN_ERR "%s:%d: FIXME\n",__FUNCTION__,__LINE__);
++				printk(KERN_ERR "%s:%d: FIXME\n",__func__,__LINE__);
 +				rc = -1;
 +				goto error;
 +			}
@@ -15301,7 +15165,7 @@ index c56bb4f451e6..0e0177ce90bf 100644
 +		dst = __xfrm_dst_lookup(x->props.family, &params);
 +	}
 +	if (IS_ERR(dst)) {
-+		printk(KERN_ERR "%s:%d: FIXME\n",__FUNCTION__,__LINE__);
++		printk(KERN_ERR "%s:%d: FIXME\n",__func__,__LINE__);
 +		rc = -1;
 +		goto error;
 +	}
@@ -15868,10 +15732,10 @@ index f0aa4d7ef499..6af83a10050b 100644
  
 diff --git a/net/netfilter/comcerto_fp_netfilter.c b/net/netfilter/comcerto_fp_netfilter.c
 new file mode 100644
-index 000000000000..81a4024204aa
+index 000000000000..236fdf135b28
 --- /dev/null
 +++ b/net/netfilter/comcerto_fp_netfilter.c
-@@ -0,0 +1,487 @@
+@@ -0,0 +1,392 @@
 +/* Copyright (C) 2015 Freescale Semiconductor, Inc.
 + *
 + * Redistribution and use in source and binary forms, with or without
@@ -15904,7 +15768,6 @@ index 000000000000..81a4024204aa
 + */
 +
 +#include <linux/module.h>
-+#include <linux/version.h>
 +#include <linux/kernel.h>
 +#include <linux/skbuff.h>
 +#include <linux/netfilter.h>
@@ -15925,7 +15788,7 @@ index 000000000000..81a4024204aa
 +	if (num_xfrm > MAX_SUPPORTED_XFRMS_PER_DIR)
 +	{
 +		printk(KERN_ERR "%s(%d) num_xfrm %d > %d(MAX supported)\n",
-+			__FUNCTION__,__LINE__,num_xfrm,MAX_SUPPORTED_XFRMS_PER_DIR);
++			__func__,__LINE__,num_xfrm,MAX_SUPPORTED_XFRMS_PER_DIR);
 +		return;
 +	}	
 +	/* get ct info */
@@ -15959,7 +15822,7 @@ index 000000000000..81a4024204aa
 +		/* filling SA info and xfrm handle */
 +		fp_info->xfrm_handle[xfrm_ind+ii] = xfrm[ii]->handle;
 +		/*printk("%s(%d)ii %d, index %d ct %p,  dir %d, SPI %x, proto %d xfrmdir %d, sgid %x\n",
-+		__FUNCTION__,__LINE__,ii, xfrm_ind+ii, ct,  dir, xfrm[ii]->id.spi, xfrm[ii]->id.proto,
++		__func__,__LINE__,ii, xfrm_ind+ii, ct,  dir, xfrm[ii]->id.spi, xfrm[ii]->id.proto,
 +		xfrm_dir, fp_info->xfrm_handle[xfrm_ind+ii]); */
 +	}
 +	return;
@@ -15993,7 +15856,7 @@ index 000000000000..81a4024204aa
 +			x[num_xfrms] = sp->xvec[i];
 +	
 +			/* printk("%s(%d) num_xfrm %d , xfrm %p , SPI %x dir XFRM_POLICY_FWD, handle %x\n",
-+				__FUNCTION__,__LINE__,num_xfrms, x[num_xfrms], 
++				__func__,__LINE__,num_xfrms, x[num_xfrms], 
 +				x[num_xfrms]->id.spi, x[num_xfrms]->handle);*/
 +			num_xfrms++;
 +		}
@@ -16010,12 +15873,12 @@ index 000000000000..81a4024204aa
 +	
 +		while(((tmp = dst1->xfrm) != NULL) && (num_xfrms<MAX_SUPPORTED_XFRMS_PER_DIR))  {
 +			/*printk("%s(%d) num_xfrm %d , xfrm %p , SPI %x, handle %x XFRM_POLICY_OUT\n",
-+				__FUNCTION__,__LINE__, num_xfrms, tmp, tmp->id.spi, tmp->handle);*/
++				__func__,__LINE__, num_xfrms, tmp, tmp->id.spi, tmp->handle);*/
 +			x[num_xfrms] = tmp;			
 +			dst1 = xfrm_dst_child(dst1);
 +			num_xfrms++;
 +			if (dst1 == NULL) {
-+				printk("%s(%d) DST is null \n",__FUNCTION__,__LINE__);
++				printk("%s(%d) DST is null \n",__func__,__LINE__);
 +				break;
 +			}
 +		}
@@ -16026,18 +15889,14 @@ index 000000000000..81a4024204aa
 +	/* if there is a change in ipsec info, send rekey conntrack event */
 +	if (rekey)
 +	{
-+		/*printk("%s(%d) sending rekey event\n",__FUNCTION__,__LINE__); */
++		/*printk("%s(%d) sending rekey event\n",__func__,__LINE__); */
 +		nf_conntrack_event_cache(IPCT_PROTOINFO, ct);
 +	}
 +	return NF_ACCEPT;
 +}
 +#endif /* IPSEC_FLOW_CACHE */
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +static unsigned int fp_netfilter_pre_routing(int family, const struct nf_hook_state *state, struct sk_buff *skb)
-+#else
-+static unsigned int fp_netfilter_pre_routing(int family, const struct nf_hook_ops *ops, struct sk_buff *skb)
-+#endif
 +{
 +	struct nf_conn *ct;
 +	u_int8_t protonum;
@@ -16096,11 +15955,7 @@ index 000000000000..81a4024204aa
 +	return NF_ACCEPT;
 +}
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +static unsigned int fp_netfilter_local_out(int family, const struct nf_hook_state *state, struct sk_buff *skb)
-+#else
-+static unsigned int fp_netfilter_local_out(int family, const struct nf_hook_ops *ops, struct sk_buff *skb)
-+#endif
 +{
 +	struct nf_conn *ct;
 +	u_int8_t protonum;
@@ -16135,11 +15990,6 @@ index 000000000000..81a4024204aa
 +			printk(KERN_DEBUG "ct: ifindex changed %d, %d\n", fp_info->ifindex, skb->dev->ifindex);
 +			update_event=1;
 +		}
-+#if 0
-+	if (fp_info->iif && (fp_info->iif != skb->skb_iif))
-+		if (printk_ratelimit())
-+			printk(KERN_DEBUG "ct: iif changed %d, %d\n", fp_info->iif, skb->skb_iif);
-+#endif
 +
 +	fp_info->mark = skb->mark;
 +	if (skb->dev)
@@ -16175,119 +16025,44 @@ index 000000000000..81a4024204aa
 +}
 +#endif /* IPSEC_FLOW_CACHE */
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +static unsigned int fp_ipv4_netfilter_pre_routing(void *priv,
 +		struct sk_buff *skb,
 +		const struct nf_hook_state *state)
-+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
-+static unsigned int fp_ipv4_netfilter_pre_routing(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct nf_hook_state *state)
-+#else
-+static unsigned int fp_ipv4_netfilter_pre_routing(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct net_device *in,
-+		const struct net_device *out,
-+		int (*okfn)(struct sk_buff *))
-+#endif
-+
 +{
-+
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +	return fp_netfilter_pre_routing(PF_INET, state, skb);
-+#else
-+	return fp_netfilter_pre_routing(PF_INET, ops, skb);
-+#endif
 +}
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +static unsigned int fp_ipv6_netfilter_pre_routing(void *priv,
 +		struct sk_buff *skb,
 +		const struct nf_hook_state *state)
-+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
-+static unsigned int fp_ipv6_netfilter_pre_routing(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct nf_hook_state *state)
-+#else
-+static unsigned int fp_ipv6_netfilter_pre_routing(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct net_device *in,
-+		const struct net_device *out,
-+		int (*okfn)(struct sk_buff *))
-+#endif
 +{
-+
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +	return fp_netfilter_pre_routing(PF_INET6, state, skb);
-+#else
-+	return fp_netfilter_pre_routing(PF_INET6, ops, skb);
-+#endif
 +}
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +static unsigned int fp_ipv4_netfilter_local_out(void *priv,
 +		struct sk_buff *skb,
 +		const struct nf_hook_state *state)
-+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
-+static unsigned int fp_ipv4_netfilter_local_out(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct nf_hook_state *state)
-+#else
-+static unsigned int fp_ipv4_netfilter_local_out(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct net_device *in,
-+		const struct net_device *out,
-+		int (*okfn)(struct sk_buff *))
-+#endif
 +{
-+
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +	return fp_netfilter_local_out(PF_INET, state, skb);
-+#else
-+	return fp_netfilter_local_out(PF_INET, ops, skb);
-+#endif
 +}
 +
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +static unsigned int fp_ipv6_netfilter_local_out(void *priv,
 +		struct sk_buff *skb,
 +		const struct nf_hook_state *state)
-+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,0,0)
-+static unsigned int fp_ipv6_netfilter_local_out(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct nf_hook_state *state)
-+#else
-+static unsigned int fp_ipv6_netfilter_local_out(const struct nf_hook_ops *ops,
-+		struct sk_buff *skb,
-+		const struct net_device *in,
-+		const struct net_device *out,
-+		int (*okfn)(struct sk_buff *))
-+#endif
 +{
-+
-+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
 +	return fp_netfilter_local_out(PF_INET6, state, skb);
-+#else
-+	return fp_netfilter_local_out(PF_INET6, ops, skb);
-+#endif
 +}
 +
 +
 +static struct nf_hook_ops fp_netfilter_ops[] __read_mostly = {
 +	{
 +		.hook       = fp_ipv4_netfilter_pre_routing,
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
-+		.owner      = THIS_MODULE,
-+#endif
 +		.pf     = NFPROTO_IPV4,
 +		.hooknum    = NF_INET_PRE_ROUTING,
 +		.priority   = NF_IP_PRI_LAST,
 +	},
 +	{
 +		.hook       = fp_ipv6_netfilter_pre_routing,
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
-+		.owner      = THIS_MODULE,
-+#endif
 +		.pf     = NFPROTO_IPV6,
 +		.hooknum    = NF_INET_PRE_ROUTING,
 +		.priority   = NF_IP_PRI_LAST,
@@ -16302,18 +16077,12 @@ index 000000000000..81a4024204aa
 +	 */
 +	{
 +		.hook           = fp_ipv4_netfilter_local_out,
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
-+		.owner          = THIS_MODULE,
-+#endif
 +		.pf             = NFPROTO_IPV4,
 +		.hooknum        = NF_INET_LOCAL_OUT,
 +		.priority       = NF_IP_PRI_LAST - 1,
 +	},
 +	{
 +		.hook           = fp_ipv6_netfilter_local_out,
-+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,4,0)
-+		.owner          = THIS_MODULE,
-+#endif
 +		.pf             = NFPROTO_IPV6,
 +		.hooknum        = NF_INET_LOCAL_OUT,
 +		.priority       = NF_IP_PRI_LAST - 1,
@@ -17385,7 +17154,7 @@ index 000000000000..ee8a7fa571b8
 +#endif
 +
 diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
-index 841a60a6fbfe..6be170bf0f80 100644
+index 841a60a6fbfe..b91fd2911cf3 100644
 --- a/net/xfrm/xfrm_input.c
 +++ b/net/xfrm/xfrm_input.c
 @@ -44,6 +44,10 @@ struct xfrm_trans_cb {
@@ -17405,7 +17174,7 @@ index 841a60a6fbfe..6be170bf0f80 100644
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 +		/*net_crit_ratelimited("%s(%d) x->handle %d, mac hdr %p, data %p\n",
-+			__FUNCTION__,__LINE__, x->handle, skb_mac_header(skb), skb->data);  */
++			__func__,__LINE__, x->handle, skb_mac_header(skb), skb->data);  */
 +		/* check if the corresponding SA is offloaded,
 +		   then submit the packet to SEC engine */
 +
