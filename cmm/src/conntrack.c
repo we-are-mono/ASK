@@ -1426,14 +1426,14 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 	struct nf_conntrack *ct = ctEntry->ct;
 	struct nf_conntrack *ctTemp = NULL;
 	int dir = ctEntry->dir;
-	const unsigned int *dAddrOrig, *dAddrRepl, *sAddrOrig, *sAddrRepl;
+	const unsigned int *sAddrOrig, *sAddrRepl;
 #ifdef IPSEC_FLOW_CACHE
+	const unsigned int *dAddrOrig, *dAddrRepl;
 	unsigned char proto;
 	unsigned short dPortOrig, dPortRepl, sPortOrig, sPortRepl;
 #else
-	unsigned short dPortOrig, dPortRepl;
 	unsigned short	*orig_xfrm_handle, *rep_xfrm_handle;
-#endif 
+#endif
 	struct flow flow;
 	void *tmp;
 	int key;
@@ -1451,23 +1451,27 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 	{
 		sAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV4_SRC);
 		sAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV4_SRC);
+#ifdef IPSEC_FLOW_CACHE
 		dAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV4_DST);
 		dAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV4_DST);
+#endif
 	}
 	else
 	{
 		sAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV6_SRC);
 		sAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV6_SRC);
+#ifdef IPSEC_FLOW_CACHE
 		dAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV6_DST);
 		dAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV6_DST);
+#endif
 	}
 
 #ifdef IPSEC_FLOW_CACHE
 	sPortOrig = nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC);
 	sPortRepl = nfct_get_attr_u16(ct, ATTR_REPL_PORT_SRC);
-#endif 
 	dPortOrig = nfct_get_attr_u16(ct, ATTR_ORIG_PORT_DST);
 	dPortRepl = nfct_get_attr_u16(ct, ATTR_REPL_PORT_DST);
+#endif
 
 	if (dir & ORIGINATOR)
 	{
