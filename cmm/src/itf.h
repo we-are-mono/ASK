@@ -166,7 +166,7 @@ static inline char *get_port_name(int port_id, char *buf, int buf_size)
 #define ITF_VLAN		(1 << 1)
 #if defined(LS1043)
 #define ITF_BRIDGED_PORT	(1 << 2)
-#define unsupported_bridged_interface(itf) ( __itf_is_pppoe(itf) || __itf_is_tunnel(itf) || __itf_is_l2tp(itf) || ____itf_is_bridge(itf) ) 
+#define unsupported_bridged_interface(itf) ( __itf_is_pppoe(itf) || __itf_is_tunnel(itf) || ____itf_is_bridge(itf) )
 #endif
 #define ITF_TUNNEL		(1 << 3)
 #define ITF_PPPOE_SESSION_UP    (1 << 4)
@@ -175,20 +175,9 @@ static inline char *get_port_name(int port_id, char *buf, int buf_size)
 #ifdef WIFI_ENABLE
 #define ITF_WIFI	(1 << 7)
 #endif
-#define ITF_L2TP	(1 << 8)
-#define ITF_LRO		(1 << 9)
 
 #define LINK_KIND_MACVLAN	"macvlan"
 #define LINK_KIND_GRE6		"ip6gretap"
-
-struct l2tp_itf_info {
-	u_int16_t local_tun_id;
-	u_int16_t peer_tun_id;
-	u_int16_t local_ses_id;
-	u_int16_t peer_ses_id;
-	u_int16_t options;
-	struct socket *sock;
-};
 
 #ifdef VLAN_FILTER
 struct interface_bridge_vlan_info {
@@ -259,9 +248,6 @@ struct interface {
 #ifdef WIFI_ENABLE
 	struct wifi_ff_entry *wifi_if;
 #endif
-	/* If L2TP interface */
-	struct l2tp_itf_info l2tp;
-
 #ifdef VLAN_FILTER
 	/* vlan filtering information */
 	u_int8_t vlan_filtering_enab;
@@ -304,7 +290,6 @@ int __itf_is_bridged_port(struct interface *itf);
 int __itf_is_noarp(int ifindex);
 int __itf_is_up(struct interface *itf);
 int __itf_is_tunnel(struct interface *itf);
-int __itf_is_l2tp(struct interface *itf);
 int __itf_get_from_bridge_port(int ifindex, int port);
 int ____itf_is_programmed(struct interface *itf);
 int __itf_is_programmed(int ifindex);

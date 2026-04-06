@@ -47,7 +47,6 @@
 #define CMMD_SOCKET_TYPE_LANWAN				0
 #define CMMD_SOCKET_TYPE_ACP				1
 #define CMMD_SOCKET_TYPE_MSP				2
-#define CMMD_SOCKET_TYPE_L2TP				3
 #define CMMD_SOCKET_TYPE_LRO				4
 
 #define CMMD_ERR_SOCK_ALREADY_OPEN			FPP_ERR_SOCK_ALREADY_OPEN	
@@ -386,34 +385,6 @@ typedef struct cmmd_asymff_enable {
 #define CMMD_ASYM_FF_ACTION_DISABLE		1
 
 /*-------------Asymmetric fast forward-------------------*/
-
-/*----------------------------------- L2TP ---------------------------------*/
-#define CMMD_CMD_L2TP_SESSION		0x1801		
-#define CMMD_CMD_L2TP_SESSION_CREATE		CMMD_CMD_L2TP_SESSION
-#define CMMD_CMD_L2TP_SESSION_DESTROY		0x1802
-
-#define CMMD_L2TP_OPT_LENGTH			0x0001
-#define CMMD_L2TP_OPT_SEQ			0x0002
-
-/* CMM Lib message structure */
-typedef struct cmmd_l2tp_session {
-	char		itf_name[IFNAMSIZ];		/* L2TP/PPP interface name */
-	u_int32_t	family;
-	u_int32_t	local_addr[4];
-	u_int32_t	peer_addr[4];
-	u_int16_t	local_port;
-	u_int16_t	peer_port;
-	u_int16_t	local_tun_id;
-	u_int16_t	peer_tun_id;
-	u_int16_t	local_ses_id;
-	u_int16_t	peer_ses_id;
-	u_int16_t	options;		
-	u_int16_t	dscp;
-	u_int32_t	fwmark;
-        u_int8_t	queue;
-	u_int8_t	rsvd;
-	u_int16_t	rsvd2;
-} __attribute__((__packed__)) cmmd_l2tp_session_t;
 
 #endif
 

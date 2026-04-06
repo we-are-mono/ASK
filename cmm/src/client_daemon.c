@@ -1313,10 +1313,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case CMMD_CMD_VOICE_FILE_UNLOAD:
 		return voice_file_unload(ctx->fci_handle, (cmmd_voice_file_unload_cmd_t *)cmd_buf, res_buf, res_len);
 
-	case CMMD_CMD_L2TP_SESSION_CREATE:
-	case CMMD_CMD_L2TP_SESSION_DESTROY:
-		return l2tp_daemon(ctx->fci_handle,function_code, (cmmd_l2tp_session_t *) cmd_buf, cmd_len, res_buf, res_len);
-
 	//Bridge commands
 	case FPP_CMD_RX_L2BRIDGE_ENABLE:
 	case FPP_CMD_RX_L2BRIDGE_ADD:

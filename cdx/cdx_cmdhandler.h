@@ -45,7 +45,6 @@ enum EVENTS {
 	EVENT_MSP,
 	EVENT_PKTCAP,
 	EVENT_ICC,
-	EVENT_L2TP,
 	EVENT_HIDRV,
 	EVENT_MC, 
 	EVENT_MAX
@@ -315,11 +314,6 @@ enum EVENTS {
 #define CMD_ICC_THRESHOLD		0x1501
 #define CMD_ICC_ADD_DELETE		0x1502
 #define CMD_ICC_QUERY			0x1503
-
-// 0x1600: L2TP
-#define FC_L2TP					0x0016
-#define CMD_L2TP_ITF_ADD		0x1600
-#define CMD_L2TP_ITF_DEL		0x1601
 
 // return codes
 #define CMD_OK	0x0000

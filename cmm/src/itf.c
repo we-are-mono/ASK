@@ -353,9 +353,6 @@ static void __itf_remove(struct interface *itf)
 #ifdef VLAN_FILTER
        del_itf_bridge_vlan_info(itf);
 #endif
-	if (__itf_is_l2tp(itf))
-		l2tp_itf_del(itf_table.fci_handle, itf);
-
 	list_del(&itf->list);
 	free(itf);
 }
@@ -618,14 +615,6 @@ static void __updatelink(struct interface_table *ctx, struct ifinfomsg *ifi, str
 				__tunnel_del(ctx->fci_handle, ctx->fci_key_handle, itf);
 			else
 				__tunnel_update(ctx->fci_handle, itf);
-	}
-	else if (__itf_is_l2tp(itf))
-	{
-		if (__itf_is_up(itf))
-			/* L2TP interface being a virtual interface, the physical and logical ifindices are the same */
-			l2tp_itf_add(ctx->fci_handle, ADD, itf);
-		else
-			__l2tp_itf_del(ctx->fci_handle, itf);
 	}
 	else
 	{
@@ -1172,7 +1161,7 @@ int __itf_is_pointopoint(struct interface *itf)
 
 int __itf_is_pppoe(struct interface *itf)
 {
-	if ((itf->type == ARPHRD_PPP) && !(itf->itf_flags & ITF_L2TP))
+	if (itf->type == ARPHRD_PPP)
 		return 1;
 
 	return 0;
@@ -1215,13 +1204,6 @@ int __itf_is_tunnel(struct interface *itf)
 	return 0;
 }
 
-int __itf_is_l2tp(struct interface *itf)
-{
-	if (itf->itf_flags & ITF_L2TP)
-		return 1;
-
-	return 0;
-}
 
 #ifndef VLAN_FILTER
 int __itf_get_from_bridge_port(int ifindex, int port)

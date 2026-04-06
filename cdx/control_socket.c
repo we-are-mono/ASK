@@ -431,15 +431,6 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 		/* FIXME, if MSP support was not compiled in we should return error */
 		break;
 
-	case SOCKET_TYPE_L2TP:
-		if (!SocketCmd.mode)
-			return ERR_WRONG_SOCK_MODE;
-
-		break;
-
-	case SOCKET_TYPE_LRO:
-		return ERR_WRONG_SOCK_TYPE;
-
 	default:
 		return ERR_WRONG_SOCK_TYPE;
 	}
@@ -487,10 +478,7 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	for (i = 0; i < SocketCmd.SA_nr_tx; i++)
 		pEntry->SA_handle_tx[i] = SocketCmd.SA_handle_tx[i];
 
-	if (pEntry->SocketType == SOCKET_TYPE_L2TP)
-		pEntry->owner_type = SOCK_OWNER_L2TP;
-	else
-		pEntry->owner_type = SOCK_OWNER_NONE;
+	pEntry->owner_type = SOCK_OWNER_NONE;
 
 	/* allocate MURAM memory for statistics */
 	h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
@@ -806,8 +794,6 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 	case SOCKET_TYPE_MSP:
 		break;
 
-	case SOCKET_TYPE_L2TP:
-	case SOCKET_TYPE_LRO:
 	default:
 		return ERR_WRONG_SOCK_TYPE;
 	}
@@ -832,10 +818,7 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 	pEntry->hw_stats = NULL;
 	pEntry->expt_flag =  (uint8_t)SocketCmd.expt_flag;
 
-	if (pEntry->SocketType == SOCKET_TYPE_L2TP)
-		pEntry->owner_type = SOCK_OWNER_L2TP;
-	else
-		pEntry->owner_type = SOCK_OWNER_NONE;
+	pEntry->owner_type = SOCK_OWNER_NONE;
 
 	pEntry->secure = SocketCmd.secure;
 	pEntry->SA_nr_rx = SocketCmd.SA_nr_rx;

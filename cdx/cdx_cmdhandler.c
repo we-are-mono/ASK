@@ -63,8 +63,6 @@ int FCODE_TO_EVENT(U32 fcode)
 
 		case FC_ICC: eventid = EVENT_ICC; break;
 
-		case FC_L2TP: eventid = EVENT_L2TP; break;
-
 		default: eventid = -1; break;
 	}
 
@@ -149,7 +147,6 @@ CMD_DECLARE(mc6)
 CMD_DECLARE(rtp_relay)
 #ifdef CDX_TODO
 CMD_DECLARE(pktcap)
-CMD_DECLARE(l2tp)
 #endif
 
 int __init cdx_cmdhandler_init(void)
@@ -181,7 +178,6 @@ int __init cdx_cmdhandler_init(void)
 	CMD_INIT(wifi);
 #endif
 	CMD_INIT(pktcap);
-	CMD_INIT(l2tp);
 #endif
 
 exit:
@@ -195,7 +191,6 @@ void __exit cdx_cmdhandler_exit(void)
 	// EXIT routines must be in reverse order from the INIT routines
 
 #ifdef CDX_TODO
-	CMD_EXIT(l2tp);
 	CMD_EXIT(pktcap);
 	CMD_EXIT(rtp_relay);
 #endif

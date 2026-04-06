@@ -18,8 +18,6 @@ extern struct slist_head sock4_cache[];
 extern struct slist_head sock6_cache[];
 extern struct slist_head sockid_cache[];
 
-#define SOCKET_TYPE_LRO	4	// Socket for local TCP packets
-#define SOCKET_TYPE_L2TP	3	// Socket to LAN or WAN for L2TP
 #define SOCKET_TYPE_MSP		2	// Socket to MSP
 #define SOCKET_TYPE_ACP		1	// Socket to ACP
 #define SOCKET_TYPE_FPP		0 	// Socket to LAN or WAN
@@ -28,7 +26,6 @@ extern struct slist_head sockid_cache[];
 
 enum {
 	SOCK_OWNER_RTP_RELAY,
-	SOCK_OWNER_L2TP,
 	SOCK_OWNER_NATT,
 	SOCK_OWNER_NONE = 0xff
 };

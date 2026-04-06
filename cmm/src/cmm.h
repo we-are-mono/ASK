@@ -87,7 +87,6 @@
 #ifdef WIFI_ENABLE
 	#include "module_wifi.h"
 #endif
-	#include "module_l2tp.h"
 	#include "version.h"
 
 	/***** Defines *****/

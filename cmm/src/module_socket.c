@@ -649,7 +649,7 @@ int __socket_open(FCI_CLIENT *fci_handle, struct socket *s)
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
-	if ((s->type == CMMD_SOCKET_TYPE_LANWAN) || (s->type == CMMD_SOCKET_TYPE_L2TP))
+	if (s->type == CMMD_SOCKET_TYPE_LANWAN)
 	{
 		struct flow flow = {
 					.family = s->family,

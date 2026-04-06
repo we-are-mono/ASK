@@ -2133,22 +2133,4 @@ typedef struct fpp_icc_query_reply {
     };
 } __attribute__((__packed__)) fpp_icc_query_reply_t;
 
-/*-------------------------------- L2TP --------------------------------------*/
-#define FPP_CMD_L2TP_ITF_ADD                            0x1600
-#define FPP_CMD_L2TP_ITF_DEL                            0x1601
-
-typedef struct fpp_l2tp_itf_add_cmd {
-    char ifname[IFNAMSIZ];
-    u_int16_t   sock_id;
-    u_int16_t   local_tun_id;
-    u_int16_t   peer_tun_id;
-    u_int16_t   local_ses_id;
-    u_int16_t   peer_ses_id;
-    u_int16_t   options;    
-}__attribute__((__packed__)) fpp_l2tp_itf_add_cmd_t;
-
-typedef struct fpp_l2tp_itf_del_cmd {
-    char        ifname[IFNAMSIZ];
-}__attribute__((__packed__)) fpp_l2tp_itf_del_cmd_t;
-
 #endif /* __FPP__ */
