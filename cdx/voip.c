@@ -293,42 +293,4 @@ int dpa_create_eth_if_voip_fqs(struct dpa_iface_info *iface_info)
 	return 0;
 }
 
-#if 0
-NOTE: This function can call from deinit context, to free interface voip fqs.
-int dpa_destroy_eth_if_voip_fqs(struct dpa_iface_info *iface_info)
-{
-	struct dpa_fq *dpa_fq;
-	struct qman_fq *fq;
-	uint8_t ucNumFqs;
-
-
-	ucNumFqs = iface_info->eth_info.ucNumFqs;
-	for (iIndex = 0; iIndex < usNoFqs; iIndex++) {
-		/* set FQ parameters */
-		fq = &dpa_fq->fq_base;
-
-		if (qman_retire_fq(fq, NULL)) {
-			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		if (qman_oos_fq(fq)) {
-			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		cdx_remove_fqid_info_in_procfs(fq->fqid);
-		qman_destroy_fq(fq, 0);
-		printk("%s::desroyed fq 0x%x chnl id 0x%x\n", 
-				__func__, fq->fqid, eth_info->tx_channel_id);
-#ifdef DEVMAN_DEBUG
-		DPA_INFO("%s::destroyed fq 0x%x chnl id 0x%x\n", 
-				__func__, fq->fqid, eth_info->tx_channel_id);
-#endif
-		dpa_fq++;
-	}
-
-	return 0;
-}
-#endif
 #endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */

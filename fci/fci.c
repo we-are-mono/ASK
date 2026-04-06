@@ -474,18 +474,6 @@ static void __fci_fe_inbound_data(struct sk_buff *skb)
 	}
 	else
 	{
-#if 0 /* FIXME netlink_lookup is not exported */
-		struct sock *sk;
-
-		sk = netlink_lookup(sock_net(skb->sk),
-				skb->sk->sk_protocol,
-				NETLINK_CB(skb).pid);
-		if (sk) {
-			sk->sk_err = ENOBUFS;
-			sk->sk_error_report(sk);
-			sock_put(sk);
-		}
-#endif
 		this_fci->stats.rx_msg_err++;
 	}
 }

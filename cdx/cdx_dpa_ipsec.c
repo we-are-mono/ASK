@@ -495,91 +495,6 @@ static inline int get_cipher_params(U16 cipher_alg,
                                     uint32_t *max_pad_length)
 {
 	switch (cipher_alg) {
-#if 0
-		case DPA_IPSEC_CIPHER_ALG_3DES_CBC_HMAC_96_MD5_128:
-		case DPA_IPSEC_CIPHER_ALG_3DES_CBC_HMAC_96_SHA_160:
-			*iv_length = 8;
-			*max_pad_length = 8;
-			*icv_length = 12;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_3DES_CBC_HMAC_MD5_128:
-			*iv_length = 8;
-			*max_pad_length = 8;
-			*icv_length = 16;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_3DES_CBC_HMAC_SHA_160:
-		case DPA_IPSEC_CIPHER_ALG_3DES_CBC_HMAC_SHA_256_128:
-			*iv_length = 8;
-			*max_pad_length = 8;
-			*icv_length = 20;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_3DES_CBC_HMAC_SHA_384_192:
-			*iv_length = 8;
-			*max_pad_length = 8;
-			*icv_length = 24;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_3DES_CBC_HMAC_SHA_512_256:
-			*iv_length = 8;
-			*max_pad_length = 8;
-			*icv_length = 32;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_HMAC_96_MD5_128:
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_HMAC_96_SHA_160:
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_AES_XCBC_MAC_96:
-			*iv_length = 16;
-			*max_pad_length = 16;
-			*icv_length = 12;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_HMAC_MD5_128:
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_HMAC_SHA_256_128:
-			*iv_length = 16;
-			*max_pad_length = 16;
-			*icv_length = 16;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_HMAC_SHA_160:
-			*iv_length = 16;
-			*max_pad_length = 16;
-			*icv_length = 20;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_HMAC_SHA_384_192:
-			*iv_length = 16;
-			*max_pad_length = 16;
-			*icv_length = 24;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CBC_HMAC_SHA_512_256:
-			*iv_length = 16;
-			*max_pad_length = 16;
-			*icv_length = 32;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_HMAC_96_MD5_128:
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_HMAC_96_SHA_160:
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_AES_XCBC_MAC_96:
-			*iv_length = 16;
-			*max_pad_length = 16;
-			*icv_length = 12;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_HMAC_MD5_128:
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_HMAC_SHA_256_128:
-			*iv_length = 8;
-			*max_pad_length = 4;
-			*icv_length = 16;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_HMAC_SHA_160:
-			*iv_length = 8;
-			*max_pad_length = 4;
-			*icv_length = 20;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_HMAC_SHA_384_192:
-			*iv_length = 8;
-			*max_pad_length = 4;
-			*icv_length = 24;
-			break;
-		case DPA_IPSEC_CIPHER_ALG_AES_CTR_HMAC_SHA_512_256:
-			*iv_length = 8;
-			*max_pad_length = 4;
-			*icv_length = 32;
-			break;
-#endif
 		default:
 			*iv_length = 0;
 			*icv_length = 0;
@@ -787,18 +702,6 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 		   CLASS_1 | KEY_DEST_CLASS_REG);
 
 	set_jump_tgt_here(desc, key_jump_cmd);
-#if 0
-	/*
-	 * Should enable for dscp copy or ECN. Currently could not find where
-	 * this is configured in  cdx. - Rajendran oct21. 
-	 */
-	/* copy frame meta data (IC) to enable DSCP / ECN propagation */
-	if (sa->dscp_copy || sa->ecn_copy) {
-		/* save location of ptr copy commands to update offset later */
-		copy_ptr_index = desc_len(desc);
-		build_meta_data_desc_cmds(sa, sa->dpa_ipsec->sec_era, 64);
-	}
-#endif
 	if (bytes_to_copy == 0)
 		goto skip_byte_copy;
 
@@ -865,13 +768,6 @@ skip_byte_copy:
 
 	/* Enable Stats only for IPv4  TODO-IPV6 */
 	save_stats_in_external_mem(sa);
-#if 0
-
-	if (sa->dscp_copy || sa->ecn_copy)
-		/* insert cmds to copy SEQ_IN/OUT_PTR - with updated offset */
-		insert_ptr_copy_cmds(desc, copy_ptr_index,
-				desc_len(desc), false);
-#endif
 	/*For inbound Ipsec traffic, copy SAGD  to the outer packet at the end */
 
 #ifdef UNIQUE_IPSEC_CP_FQID
@@ -2026,11 +1922,6 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 
 	/* check whether a split or a normal key is used */
 	if (psec_sa_context->auth_data.split_key_len) {
-#if 0
-		printk("%s::split key::\n", __func__);
-		display_buff_data(psec_sa_context->auth_data.split_key, 
-				psec_sa_context->auth_data.split_key_len);
-#endif
 		auth_key_dma = dma_map_single(jrdev_g, 
 				psec_sa_context->auth_data.split_key,
 				psec_sa_context->auth_data.split_key_pad_len,
@@ -2041,11 +1932,6 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 		}
 	}
 	else if (psec_sa_context->auth_data.auth_key_len) {
-#if 0
-		printk("%s::auth key::\n", __func__);
-		display_buff_data(psec_sa_context->auth_data.auth_key, 
-				psec_sa_context->auth_data.auth_key_len);
-#endif
 		auth_key_dma = dma_map_single(jrdev_g, 
 				psec_sa_context->auth_data.auth_key,
 				psec_sa_context->auth_data.auth_key_len,
@@ -2056,11 +1942,6 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 		}
 	}
 
-#if 0
-	printk("%s::cipher key::\n", __func__);
-	display_buff_data(psec_sa_context->cipher_data.cipher_key, 
-			psec_sa_context->cipher_data.cipher_key_len);
-#endif
 	crypto_key_dma = dma_map_single(jrdev_g, 
 			psec_sa_context->cipher_data.cipher_key,
 			psec_sa_context->cipher_data.cipher_key_len,
@@ -2268,9 +2149,6 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 	append_fifo_store(desc, dma_addr_out, auth_param->split_key_len,
 			LDST_CLASS_2_CCB | FIFOST_TYPE_SPLIT_KEK);
 
-#if 0//def PRINT_DESC
-	cdx_ipsec_print_desc ( desc,__func__);
-#endif
 	atomic_set(&done, 0);
 	ret = caam_jr_enqueue(jrdev_g, desc, split_key_done, &done);
 

@@ -677,13 +677,6 @@ int IPsec_handle_SA_SET_TUNNEL(U16 *p, U16 Length)
 	}
 
 	sa->mode = SA_MODE_TUNNEL;
-#if 0
-	/* TODO
-	 * 
-	 * We need to add dpa specific logic here
-	 */  
-	sa_update(sa);
-#endif
 	return NO_ERR;
 
 }
@@ -863,12 +856,6 @@ int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length)
 		M_ipsec_sa_cache_delete(sa->handle);
 		return NO_ERR;
 	}
-#if 0 
-	/* TODO
-	 * how use state information in case of dpa offload 
-	 */
-	sa_update(sa);
-#endif
 	return NO_ERR;
 }
 
@@ -902,10 +889,6 @@ int IPsec_handle_SA_SET_LIFETIME(U16 *p, U16 Length)
 #ifdef CONTROL_IPSEC_DEBUG
 	printk (KERN_INFO "set_lifetime:bytes:%llu - %llu\n",sa->lft_conf.soft_byte_limit, sa->lft_conf.hard_byte_limit);
 #endif
-#if 0
-	sa_update(sa);
-	hw_sa_set_lifetime(&cmd,sa);
-#endif
 	return NO_ERR;
 }
 
@@ -922,12 +905,6 @@ static int IPsec_handle_FRAG_CFG(U16 *p, U16 Length)
 
 	memset(&cmd, 0, sizeof(CommandIPSecSetPreFrag));
 	memcpy((U8*)&cmd, (U8*)p,  Length);
-#if 0
-	/* TODO
-	 * How do we hanlde frag in dpaa offload
-	 */
-	ipsec_set_pre_frag(cmd.pre_frag_en);
-#endif
 	return NO_ERR;
 
 }

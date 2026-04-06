@@ -2171,17 +2171,6 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 				__func__); 
 		goto err_ret;
 	}
-#if 0
-	//add entry to pppoe table
-	if (insert_entry_in_pppoe_table(parent->eth_info.fman_idx, 
-				parent->eth_info.port_idx, mac_addr, session_id, PPP_IP)) {
-		DPA_ERROR("%s::insert_entry_in_pppoe_table failed\n", 
-				__func__); 
-		//remove it from our list
-		dpa_release_interface(itf->index);
-		goto err_ret;
-	}
-#endif
 	iface_pppoe_count++;
 	return SUCCESS;
 err_ret:
@@ -2545,13 +2534,6 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 				__func__); 
 		return FAILURE;
 	}
-#if 0 
-	if (!(phys_itf)) {
-		DPA_ERROR("%s::null dev for phys_itf\n", 
-				__func__); 
-		return FAILURE;
-	}
-#endif
 	iface_info = (struct dpa_iface_info *)
 		kzalloc(sizeof(struct dpa_iface_info), 0);  
 	if (!iface_info) {

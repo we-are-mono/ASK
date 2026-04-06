@@ -867,13 +867,6 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	}
 	info->tbl_type = tbl_type;
 
-#if 0
-	if (entry->pRtEntry->input_itf->type & IF_TYPE_WLAN)
-		td = get_oh_port_td(fm_idx, port_idx, tbl_type);
-	else
-		//get table descriptor based on type and port
-		td = dpa_get_tdinfo(fm_idx, port_idx, tbl_type);
-#endif
 	//get table descriptor based on type and port
 	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, tbl_type);
 	if (info->td == NULL) {
@@ -2539,30 +2532,6 @@ static int create_enque_hm(struct ins_entry_info *info)
 	param->mtu = cpu_to_be16(info->l2_info.mtu);
 	//param->bpid = cpu_to_be16(frag_info_g.frag_bp_id);
 	param->bpid = frag_info_g.frag_bp_id;
-#if 0
-{
-int ii;
-	struct bm_buffer bmb[128];
-for (ii =0; ii< 128; ii++)
-{
-	if (bman_acquire(frag_info_g.frag_bufpool->pool, &bmb[ii], 1, 0) != 1) {
-	DPA_INFO("%s(%d) bman_acquire failed \n", __func__,__LINE__);
-		bmb[ii].addr = 0;
-	}
-	else
-	{
-		DPA_INFO("%s(%d) bman_acquire success (ii %d) ,%lx \n", 
-			__func__,__LINE__,ii,(long unsigned int)bmb[ii].opaque);
-	}
-}
-for (ii =0; ii< 128; ii++)
-{
-if (bmb[ii].addr)
-	bman_release(frag_info_g.frag_bufpool->pool, &bmb[ii], 1, 0);
-}
-
-}
-#endif /* endif for #if 0 */
 	word = 0;
 #ifdef ENABLE_EGRESS_QOS	
 	/* dscp_to_fq_map should be applied to packets which are getting 

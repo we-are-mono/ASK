@@ -35,30 +35,6 @@
 //max number of nat port translation manip nodes
 #define MAX_PORT_NAT_NODES		64
 
-#if 0
-//type field in table_info
-enum {
-        //IPV4_TCPFLAGS_TABLE,
-        IPV4_UDP_TABLE,
-        IPV4_TCP_TABLE,
-        IPV6_UDP_TABLE,
-        IPV6_TCP_TABLE,
-        //IPV4_PPPoE_TABLE,
-        ESP_IPV4_TABLE,
-        ESP_IPV6_TABLE,
-        IPV4_MULTICAST_TABLE,
-        IPV6_MULTICAST_TABLE,
-        PPPOE_RELAY_TABLE,
-        ETHERNET_TABLE,
-#ifdef CDX_RTP_RELAY // RTP relay feature
-        IPV4_3TUPLE_UDP_TABLE,
-        IPV4_3TUPLE_TCP_TABLE,
-        IPV6_3TUPLE_UDP_TABLE,
-        IPV6_3TUPLE_TCP_TABLE,
-#endif //CDX_RTP_RELAY
-        MAX_MATCH_TABLES
-};
-#endif
 
 //type field in cdx_dist_info
 enum {

@@ -738,34 +738,6 @@ int cmmRxQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 			cmm_print(DEBUG_STDOUT, "Interface %s Status: %s\n", 
 					pStatusResponse->ifname, pStatusResponse->status ? "ON":"OFF");
 		}
-#if 0
-		// Send CMD_RX_L2BRIDGE_QUERY_STATUS command
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_QUERY_STATUS, NULL, 0, rxbuf.rcvBuffer);
-		if (rcvBytes != sizeof(fpp_l2_bridge_query_status_response_t) + sizeof(unsigned short))
-		{
-			cmm_print(DEBUG_STDERR, "ERROR: Unexpected result returned from FPP rc:%04x\n",
-				  (rcvBytes < sizeof(unsigned short) ) ? 0 : *((unsigned short *) rxbuf.rcvBuffer)
-			  );
-			goto exit;
-		}
-#ifdef WIFI_ENABLE
-		cmm_print(DEBUG_STDOUT, "Interface %s (WAN) Status: %s\nInterface %s (LAN) Status: %s\nInterface %s (WIFI) Status: %s\nInterface %s (WIFI) Status: %s\n",
-						WAN_INTERFACE_NAME,
-						( pStatusResponse->status & (1 << WAN_PORT_ID))? "ON" : "OFF",
-						LAN_INTERFACE_NAME,
-						( pStatusResponse->status & (1 << LAN_PORT_ID))? "ON" : "OFF",
-						WIFI_INTERFACE_NAME0,
-						( pStatusResponse->status & (1 << WIFI_PORT0)) ? "ON" : "OFF",
-						WIFI_INTERFACE_NAME1,
-						( pStatusResponse->status & (1 << WIFI_PORT1)) ? "ON" : "OFF");
-#else
-		cmm_print(DEBUG_STDOUT, "Interface %s (WAN) Status: %s\nInterface %s (LAN) Status: %s\n",
-						WAN_INTERFACE_NAME,
-						( pStatusResponse->status & (1 << WAN_PORT_ID))? "ON" : "OFF",
-						LAN_INTERFACE_NAME,
-						( pStatusResponse->status & (1 << LAN_PORT_ID))? "ON" : "OFF");
-#endif
-#endif
 		while (1)
 		{
 			char sessionid_buf[32];

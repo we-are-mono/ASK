@@ -49,12 +49,6 @@
 #define CDX_VWD_FWD_FQ_MAX (1 << 6)
 
 //values for state
-#if 0
-#define VAP_ST_FREE				0
-#define VAP_ST_INUSE				1
-#define VAP_ST_UP				2
-#define VAP_ST_DOWN				3
-#endif
 #define VAP_ST_CLOSE            0
 #define VAP_ST_OPEN             1
 #define VAP_ST_CONFIGURED       2

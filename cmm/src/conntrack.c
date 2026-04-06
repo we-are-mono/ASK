@@ -1979,10 +1979,6 @@ static int __cmmCtRegister(FCI_CLIENT *fci_handle, struct nfct_handle *handle, s
 			rtEntryPolicy = cmmPolicyRouting(sAddrRepl[0], sAddrOrig[0], proto, sPortRepl, sPortOrig);
 			if (rtEntryPolicy)
 			{
-#if 0
-				if (rtEntryRep)
-					____cmmRouteDeregister(rtEntryRep, "replier");
-#endif
 				rtEntryRep = rtEntryPolicy;
 			}
 		}

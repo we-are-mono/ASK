@@ -355,27 +355,6 @@ static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *
 	len += sprintf(buf + len, "  WiFI Rx Fails : %u\n", total_stats.pkts_slow_fail);
 	len += sprintf(buf + len, "  WiFI Device Down Drops : %u\n", total_stats.pkts_dev_down_drop);
 
-#if 0
-	len += sprintf(buf + len, "VAPs Configuration  : \n");
-	for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
-		struct vap_desc_s *vap;
-
-		vap = &priv->vaps[ii];
-
-		if (vap->state == VAP_ST_CLOSE)
-			continue;
-
-		len += sprintf(buf + len, "VAP Name : %s \n", vap->ifname);
-		len += sprintf(buf + len, "     Id             : %d \n", vap->vapid);
-		len += sprintf(buf + len, "     Index          : %d \n", vap->ifindex);
-		len += sprintf(buf + len, "     State          : %s \n", (vap->state  == VAP_ST_OPEN) ? "OPEN":"CLOSED");
-		len += sprintf(buf + len, "     CPU Affinity   : %d \n", vap->cpu_id);
-		len += sprintf(buf + len, "     Direct Rx path : %s \n", vap->direct_rx_path ? "ON":"OFF");
-		len += sprintf(buf + len, "     Direct Tx path : %s \n", vap->direct_tx_path ? "ON":"OFF");
-		len += sprintf(buf + len, "     No L2 interface:%d\n",vap->no_l2_itf);
-		len += sprintf(buf + len, "     Dev features   : VAP: %llx WiFi: %llx \n\n", vap->dev->features, vap->wifi_dev ? vap->wifi_dev->features:0);
-	}
-#endif
 	return len;
 }
 
@@ -454,16 +433,6 @@ static int dpaa_vwd_sysfs_init( struct dpaa_vwd_priv_s *priv )
 	if (device_create_file(priv->vwd_device, &dev_attr_vwd_fast_path_enable))
 		goto err_fp_en;
 
-#if 0
-	if ((vwd_ofld == PFE_VWD_NAS_MODE ) && device_create_file(priv->vwd_device, &dev_attr_vwd_vap_create))
-		goto err_vap_add;
-
-	if ((vwd_ofld == PFE_VWD_NAS_MODE) && device_create_file(priv->vwd_device, &dev_attr_vwd_vap_reset))
-		goto err_vap_del;
-
-	if (device_create_file(vwd->vwd_device, &dev_attr_vwd_tso_stats))
-		goto err_tso_stats;
-#endif
 
 #ifdef VWD_NAPI_STATS
 	if (device_create_file(priv->vwd_device, &dev_attr_vwd_napi_stats))
@@ -497,15 +466,6 @@ err_napi:
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_tso_stats);
 #endif
 
-#if 0
-err_tso_stats:
-	if (vwd_ofld == VWD_NAS_MODE)
-		device_remove_file(priv->vwd_device, &dev_attr_vwd_vap_reset);
-err_vap_del:
-	if (vwd_ofld == VWD_NAS_MODE)
-		device_remove_file(priv->vwd_device, &dev_attr_vwd_vap_create);
-err_rt:
-#endif
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_fast_path_enable);
 err_fp_en:
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_debug_stats);
@@ -521,23 +481,10 @@ static void dpaa_vwd_sysfs_exit(void)
 {
 	struct dpaa_vwd_priv_s *priv = &vwd;
 
-#if 0
-	device_remove_file(priv->vwd_device, &dev_attr_vwd_tso_stats);
-#ifdef PFE_VWD_LRO_STATS
-	device_remove_file(priv->vwd_device, &dev_attr_vwd_lro_len_stats);
-	device_remove_file(priv->vwd_device, &dev_attr_vwd_lro_nb_stats);
-#endif
-#endif
 
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_oh_buff_limit);
 #ifdef PFE_VWD_NAPI_STATS
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_napi_stats);
-#endif
-#if 0
-	if (vwd_ofld == PFE_VWD_NAS_MODE) {
-		device_remove_file(priv->vwd_device, &dev_attr_vwd_vap_create);
-		device_remove_file(priv->vwd_device, &dev_attr_vwd_vap_reset);
-	}
 #endif
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_fast_path_enable);
 	device_remove_file(priv->vwd_device, &dev_attr_vwd_debug_stats);
@@ -2209,93 +2156,6 @@ int dpaa_get_wifi_ohport_handle( uint32_t* oh_handle)
 	*oh_handle = vwd.oh_port_handle;
 	return 0;
 }
-#if 0
-//call under vaplock, retuenrs true if device is found
-static int find_vapdev_by_name(char *devname, struct vap_desc_s **freedev)
-{
-	int retval;
-	uint16_t ii;
-	struct vap_desc_s *vapdev;
-	struct vap_desc_s *freevapdev;
-
-	vapdev = &vwd.vaps[0];
-	freevapdev = NULL;
-	retval = 0;
-	for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
-		if (vapdev->state == VAP_ST_CLOSE) {
-			if (!freevapdev) {
-				freevapdev = vapdev;
-				vapdev->vapid = ii;
-				vapdev->vwd = &vwd;
-			}
-		} else {
-			if (!strcmp(devname, vapdev->ifname)) {
-				DPAWIFI_ERROR("%s::device %s already associated\n", 
-						__func__, devname);
-				retval = 1;
-				break;
-			}
-		}
-		vapdev++;
-	}
-	if (freedev)
-		*freedev = freevapdev;
-	return retval;
-}
-
-static int fill_sg_pool(struct dpa_bp *bp)
-{
-	void *new_buf;
-	dma_addr_t addr;
-	struct page *new_page;
-	struct bm_buffer bmb[8];
-	uint32_t count;
-	uint32_t fill_count;
-	uint32_t ii;
-	int err;
-	struct device *dev;
-
-	dev = bp->dev;
-	count = 0;
-	err = 0;
-	while(1) {
-		fill_count = (bp->config_count - count);
-		if (!fill_count)
-			break;
-		if (fill_count > 8)
-			fill_count = 8;
-		for (ii = 0; ii < fill_count; ii++) {
-			new_page = alloc_page(GFP_ATOMIC);
-			if (unlikely(!new_page)) {
-				err = -1;
-				break;
-			}
-			new_buf = page_address(new_page);
-			get_skb_from_sg_list(new_buf + VAP_SG_BUF_HEAD_ROOM);
-			addr = dma_map_single(dev, new_buf,
-					bp->size, DMA_BIDIRECTIONAL);
-			if (unlikely(dma_mapping_error(dev, addr))) {
-				err = -1;
-				kfree(new_buf);
-				break;
-			}
-			bm_buffer_set64(&bmb[ii], addr);
-			bmb[ii].bpid = bp->bpid;
-		}
-		count += ii;
-		if (ii) {
-			while (unlikely(bman_release(bp->pool, bmb, ii, 0)))
-				cpu_relax();
-		}
-		if (err)
-			break;
-	}
-	printk("%s::filled %d buffers into pool %d\n", __func__,
-			count, bp->bpid);
-	return 0;
-}
-
-#endif
 
 static int add_device_tx_done_bpool(struct dpaa_vwd_priv_s  *vwd)
 {
@@ -2467,21 +2327,6 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 		dev_put(wifi_dev);
 		return -1;
 	}
-#if 0
-	//get free vap instance
-	if (find_vapdev_by_name(&cmd->ifname[0], &vap)) {
-		DPAWIFI_ERROR("%s::device %s already associated\n", 
-				__func__, &cmd->ifname[0]);
-		dev_put(wifi_dev);
-		return -1;
-	}
-	if (!vap) {
-		DPAWIFI_ERROR("%s:: no free vap instance for device %s\n", 
-				__func__, &cmd->ifname[0]);
-		dev_put(wifi_dev);
-		return -1;
-	}
-#endif
 	if (get_ofport_info(FMAN_IDX, priv->oh_port_handle, &vap->channel, 
 				&vap->td[0])) 
 	{
@@ -2704,13 +2549,6 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
  */
 static int dpaa_vwd_open(struct inode *inode, struct file *file)
 {
-#if 0
-	//allow only one open instance
-	if (!atomic_dec_and_test(&dpa_vwd_open_count)) {
-		atomic_inc(&dpa_vwd_open_count);
-		return -EBUSY;
-	}
-#endif
 	int result = 0;
 	unsigned dev_minor = iminor(inode);
 
@@ -2739,10 +2577,6 @@ out:
 static int dpaa_vwd_close(struct inode * inode, struct file * file)
 {
 	DPAWIFI_INFO("%s TODO \n", __func__);
-#if 0
-	//TBD - recover resources here
-	atomic_inc(&dpa_vwd_open_count);
-#endif
 	return 0;
 }
 
@@ -2933,23 +2767,6 @@ static int dpaa_vwd_up(struct dpaa_vwd_priv_s *priv )
 	if (dpaa_vwd_sysfs_init(priv))
 		goto err0;
 	wifi_rx_fastpath_register(vwd_wifi_if_send_pkt);
-#if 0
-	if (vwd_ofld == PFE_VWD_NAS_MODE) {
-		register_netdevice_notifier(&vwd_vap_notifier);
-	}
-
-	/* supported features */
-	priv->vap_dev_hw_features =
-		NETIF_F_RXCSUM | NETIF_F_IP_CSUM |  NETIF_F_IPV6_CSUM |
-		NETIF_F_SG | NETIF_F_TSO;
-
-	/* enabled by default */
-	if (lro_mode) {
-		priv->vap_dev_hw_features |= NETIF_F_LRO;
-	}
-
-	priv->vap_dev_features = priv->vap_dev_hw_features;
-#endif
 
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s: End\n", __func__);
@@ -2999,33 +2816,13 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 				 * using this field to store the vap_desc_t structure pointer
 				 */
 				wifi_dev->wifi_offload_dev = NULL;
-#if 0
-				if (wifi_dev->wifi_offload_dev) {
-					wifi_dev->ethtool_ops = vap->wifi_ethtool_ops;
-					wifi_dev->wifi_offload_dev = NULL;
-					wifi_dev->hw_features = vap->wifi_hw_features;
-					wifi_dev->features = vap->wifi_features;
-				}
-#endif
 				dev_put(wifi_dev);
 			}
 
-#if 0
-			sysfs_remove_group(vap->vap_kobj, &vap_attr_group);
-			kobject_put(vap->vap_kobj);
-			dev_deactivate(vap->dev);
-			unregister_netdev(vap->dev);
-			free_netdev(vap->dev);
-#endif
 			vap->state = VAP_ST_CLOSE;
 		}
 	}
 
-#if 0
-	if (vwd_ofld == PFE_VWD_NAS_MODE) {
-		unregister_netdevice_notifier(&vwd_vap_notifier);
-	}
-#endif
 
 	priv->vap_count = 0;
 	dpaa_vwd_sysfs_exit();

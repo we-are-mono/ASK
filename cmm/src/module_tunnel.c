@@ -395,13 +395,6 @@ int tunnel_send_cmd(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 		goto out;
 	}
 
-#if 0
-	if (__itf_get_name(itf->phys_ifindex, cmd.output_device, sizeof(cmd.output_device)) < 0)
-	{
-		cmm_print(DEBUG_ERROR, "%s: __itf_get_name(%d) failed\n", __func__, itf->phys_ifindex);
-		goto err;
-	}
-#endif
 
 	if (action == FPP_ACTION_REGISTER)
 	{

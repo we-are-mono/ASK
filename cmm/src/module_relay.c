@@ -259,19 +259,6 @@ int cmmRelayProcessClientCmd(FCI_CLIENT * fci_handle, int function_code,
     sh = (cmmd_relay_info_t *) cmd_buf;
     switch (function_code) {
     case CMMD_CMD_PPPOE_RELAY_ADD:
-#if 0
-        cmm_print(DEBUG_INFO,
-                  "Received CMD_PPPOE_RELAY_ENTRY command from RP-PPPoE...\n");
-        cmm_print(DEBUG_INFO, "size:%d\n", buffer_size);
-        cmm_print(DEBUG_INFO,
-                  "Received the peers %02x:%02x:%02x:%02x:%02x:%02x(%s %d) to %02x:%02x:%02x:%02x:%02x:%02x(%s %d)\n",
-                  sh->peermac1[0], sh->peermac1[1], sh->peermac1[2],
-                  sh->peermac1[3], sh->peermac1[4], sh->peermac1[5],
-                  sh->ipifname, sh->sesID, sh->peermac2[0],
-                  sh->peermac2[1], sh->peermac2[2], sh->peermac2[3],
-                  sh->peermac2[4], sh->peermac2[5], sh->opifname,
-                  sh->relaysesID);
-#endif
         rc = cmmRelayAdd(fci_handle, sh, res_buf, res_len);
         break;
 

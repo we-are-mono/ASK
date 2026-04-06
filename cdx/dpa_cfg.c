@@ -74,18 +74,6 @@ static void display_tbl_info(struct table_info *tinfo)
 	printk("table		\t%s\n", tinfo->name);
 	printk("dpa_type	\t%d\n", tinfo->dpa_type);
 	printk("type		\t%d\n", tinfo->type);
-#if 0
-	switch (tinfo->dpa_type) {
-		case DPA_CLS_TBL_EXACT_MATCH:
-			printk("num keys	\t%d\n", tinfo->num_keys);
-			break;
-		case DPA_CLS_TBL_EXTERNAL_HASH:
-		case DPA_CLS_TBL_INTERNAL_HASH:
-			printk("num sets 	\t%d\n", tinfo->num_sets);
-			printk("num ways 	\t%d\n", tinfo->num_ways);
-			break;
-	}
-#endif
 	printk("port idx 	\t%x\n", tinfo->port_idx);
 	printk("key size	\t%d\n", tinfo->key_size);
 	printk("handle		\t%p\n", tinfo->id);

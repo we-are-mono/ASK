@@ -80,28 +80,6 @@
 #define IPSEC_IPV6_ENCAPSULATION		(1<<2) /* 2nd bit */
 #define FRAG_DISABLE				(1<<3)
 
-#if 0
-struct desc_hdr {
-        uint32_t hdr_word;
-        union {
-                struct ipsec_encap_pdb pdb_en;
-                struct ipsec_decap_pdb pdb_dec;
-        };
-};
-
-struct sec_descriptor {
-        u64     preheader;
-        /* SEC Shared Descriptor */
-        union {
-                uint32_t desc[MAX_CAAM_DESCSIZE];
-                struct desc_hdr desc_hdr;
-#define hdr_word        desc_hdr.hdr_word
-#define pdb_en          desc_hdr.pdb_en
-#define pdb_dec         desc_hdr.pdb_dec
-        };
-};
-
-#endif
 
 /* defined in fpp.h */
 typedef struct fpp_sec_failure_stats_query_cmd {

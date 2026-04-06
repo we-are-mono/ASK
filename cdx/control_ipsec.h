@@ -264,17 +264,6 @@ typedef  struct  ESP_HDR_STRUCT
 } ip_esp_hdr;
 
 
-#if 0  // redeclarations 
-/* from Linux XFRM stack... (should we use PF_KEY value instead ?) */
-enum {
-	XFRM_STATE_VOID,
-	XFRM_STATE_ACQ,
-	XFRM_STATE_VALID,
-	XFRM_STATE_ERROR,
-	XFRM_STATE_EXPIRED,
-	XFRM_STATE_DEAD
-};
-#endif // 0 
 
 #define SA_MODE_TUNNEL 0x1
 #define SA_MODE_TRANSPORT 0x0

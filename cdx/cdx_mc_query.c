@@ -63,14 +63,6 @@ static int MC4_Get_Hash_Snapshot(int mc4_hash_index, int mc4_tot_entries, PMC4Co
 				continue;
 			strncpy((char *)pMC4Snapshot->output_list[i].output_device_str,
 					pMcastGrpInfo->members[j].if_info, IF_NAME_SIZE-1);
-#if 0
-			pMC4Snapshot->output_list[i].timer = pMC4Entry->mcdest.listeners[j].timer;
-			pMC4Snapshot->output_list[i].shaper_mask= pMC4Entry->mcdest.listeners[j].shaper_mask;
-			pMC4Snapshot->output_list[i].uc_bit = (pMC4Entry->mcdest.listeners[j].uc_bit);
-			if(pMC4Snapshot->output_list[i].uc_bit)
-				COPY_MACADDR(pMC4Snapshot->output_list[i].uc_mac,pMC4Entry->mcdest.listeners[j].dstmac);
-			pMC4Snapshot->output_list[i].queue = pMC4Entry->mcdest.listeners[j].queue_base;
-#endif
 			if((++i >= MC4_MAX_LISTENERS_IN_QUERY) &&
 					( (pMcastGrpInfo->uiListenerCnt - (i)) ))
 			{
@@ -83,14 +75,6 @@ static int MC4_Get_Hash_Snapshot(int mc4_hash_index, int mc4_tot_entries, PMC4Co
 			}
 		}
 		pMC4Snapshot->num_output = i;
-#if 0
-		if (i < MC4_MAX_LISTENERS_IN_QUERY)
-		{
-			pMC4Snapshot->num_output++;
-			strcpy((char *)pMC4Snapshot->output_list[i].output_device_str, "ACP");
-			//pMC4Snapshot->output_list[i].timer = pMC4Entry->mcdest.wifi_listener_timer;
-		}
-#endif
 		pMC4Snapshot++;
 		tot_mc4_entries++;
 		mc4_tot_entries--;
@@ -231,14 +215,6 @@ static int MC6_Get_Hash_Snapshot(int mc6_hash_index, int mc6_tot_entries, PMC6Co
 				continue;
 			strncpy((char *)pMC6Snapshot->output_list[i].output_device_str,
 					pMcastGrpInfo->members[j].if_info, IF_NAME_SIZE-1);
-#if 0
-			pMC6Snapshot->output_list[i].timer = pMC6Entry->mcdest.listeners[j].timer;
-			pMC6Snapshot->output_list[i].shaper_mask= pMC6Entry->mcdest.listeners[j].shaper_mask;
-			pMC6Snapshot->output_list[i].uc_bit = pMC6Entry->mcdest.listeners[j].uc_bit;
-			if(pMC6Snapshot->output_list[i].uc_bit)
-				COPY_MACADDR(pMC6Snapshot->output_list[i].uc_mac,pMC6Entry->mcdest.listeners[j].dstmac);
-			pMC6Snapshot->output_list[i].queue = pMC6Entry->mcdest.listeners[j].queue_base;
-#endif
 			if((++i >= MC4_MAX_LISTENERS_IN_QUERY) &&
 					( (pMcastGrpInfo->uiListenerCnt - (i)) ))
 			{
@@ -251,14 +227,6 @@ static int MC6_Get_Hash_Snapshot(int mc6_hash_index, int mc6_tot_entries, PMC6Co
 			}
 		}
 		pMC6Snapshot->num_output = i;
-#if 0
-		if ((pMC6Entry->mcdest.flags & MC_ACP_LISTENER) && i < MCx_MAX_LISTENERS_IN_QUERY)
-		{
-			pMC6Snapshot->num_output++;
-			strcpy((char *)pMC6Snapshot->output_list[i].output_device_str, "ACP");
-			pMC6Snapshot->output_list[i].timer = pMC6Entry->mcdest.wifi_listener_timer;
-		}
-#endif
 		pMC6Snapshot++;
 		tot_mc6_entries++;
 		mc6_tot_entries--;

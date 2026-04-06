@@ -138,23 +138,6 @@ int cmmFeVLANUpdate(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 		
 
 		break;
-#if 0
-	case ACTION_UPDATE:
-		cmm_print(DEBUG_COMMAND, "Send CMD_VLAN_ENTRY ACTION_UPDATE\n");
-
-		ret = fci_write(fci_handle, CMD_VLAN_ENTRY, sizeof(struct VlanCmd), (unsigned short *) &cmd);
-		if (ret == NO_ERR)
-		{
-			itf->flags &= ~FPP_NEEDS_UPDATE;
-		}
-		else
-		{
-			cmm_print(DEBUG_ERROR, "%s: Error %d while sending CMD_VLAN_ENTRY, ACTION_UPDATE\n", __func__, ret);
-			goto err;
-		}
-
-		break;
-#endif
 	case FPP_ACTION_DEREGISTER:
 	
 		cmm_print(DEBUG_COMMAND, "Send CMD_VLAN_ENTRY ACTION_DEREGISTER\n");

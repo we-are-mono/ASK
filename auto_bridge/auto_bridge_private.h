@@ -137,30 +137,6 @@ static inline void print_l2flow(struct l2flow *l2flowtmp)
 	ABM_PRINT(KERN_DEBUG, "  PPPoE Session id : %d\n", l2flowtmp->session_id);
 }
 
-#if 0
-static inline unsigned int abm_l2_flow_hash(u8 *saddr,  u8 *daddr, u16 ethertype, 
-	u32 session_id, u32 *ipsaddr, u32 *ipdaddr, u8 proto, u16 sport, u16 dport)
-{
-	u32 a, b, c, d , e;
-	
-	a = jhash((void *) saddr, 6, ethertype);
-	b = jhash((void *) daddr, 6, session_id);
-	c = 0;
-	d = 0;
-
-	if (ethertype == htons(ETH_P_IP))
-	{
-		c = jhash_2words(*ipsaddr, *ipdaddr, sport | (dport << 16));
-	}
-	else if (ethertype == htons(ETH_P_IPV6))
-	{
-		c = jhash2((void *) ipsaddr, 4, sport);
-		d =jhash2((void *) ipdaddr, 4, dport);
-	}
-	
-	return jhash_3words(a, b, c, d);
-}
-#endif
 static inline unsigned int abm_l2flow_hash(struct l2flow *l2flowtmp)
 {	
 	return (jhash(l2flowtmp, sizeof(struct l2flow), 0x12345678) & (L2FLOW_HASH_TABLE_SIZE - 1));

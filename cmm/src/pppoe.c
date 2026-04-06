@@ -196,23 +196,6 @@ int cmmFePPPoEUpdate(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 		}
 
 		break;
-#if 0
-	case ACTION_UPDATE:
-		cmm_print(DEBUG_COMMAND, "Send CMD_PPPOE_ENTRY ACTION_UPDATE\n");
-
-		ret = fci_write(fci_handle, CMD_PPPOE_ENTRY, sizeof(struct PPPoECommand), (unsigned short *) &cmd);
-		if (ret == FPP_ERR_OK)
-		{
-			itf->flags &= ~FPP_NEEDS_UPDATE;
-		}
-		else
-		{
-			cmm_print(DEBUG_ERROR, "%s: Error %d while sending CMD_PPPOE_ENTRY, ACTION_UPDATE\n", __func__, ret);
-			goto err;
-		}
-
-		break;
-#endif
 	case FPP_ACTION_DEREGISTER:
 	
 		cmm_print(DEBUG_COMMAND, "Send CMD_PPPOE_ENTRY ACTION_DEREGISTER\n");
@@ -416,14 +399,6 @@ int cmmPPPoEUpdateDriv(struct interface* itf, unsigned long rcv_sec, unsigned lo
                 close(fd);
                 goto err;
         }
-#if 0
-        if (ioctl (fd, PPPIOCDETACH, &unit) < 0)
-        {
-                cmm_print(DEBUG_ERROR, "%s: Couldn't attach to interface unit %d:\n", __func__, unit);
-                close(fd);
-                goto err;
-        }
-#endif
 
         close(fd);
         return 0;

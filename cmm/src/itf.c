@@ -901,11 +901,6 @@ err:
 
 void __itf_put(struct interface *itf)
 {
-#if 0
-	itf->count--;
-	if (itf->count <= 0)
-		__itf_remove(itf);
-#endif
 }
 
 /* itf_match_src_ipaddr

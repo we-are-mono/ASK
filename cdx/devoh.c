@@ -313,9 +313,6 @@ int dpa_add_oh_if(char *name)
 	uint32_t port_idx;
 	uint8_t oh_iface_name[8]="";
 
-#if 0//def DEVOH_DEBUG
-	DPA_INFO("%s::ADDING OHPORT INFO for %s\n", __func__, name);
-#endif
 
 	if (sscanf(name, "dpa-fman%d-oh@%d", &fman_idx,
 				&port_idx) != 2) {

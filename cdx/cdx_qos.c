@@ -280,12 +280,6 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 	//set algorithma mode 
 	Params.nonPassthroughAlgParams.rateMode = port_ff_lim_mode;
 
-#if 0 /* port, byte mode is not supporting */
-	if (port_ff_lim_mode == e_FM_PCD_PLCR_BYTE_MODE) {
-		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
-		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
-	}
-#endif
 
 	Params.nonPassthroughAlgParams.committedInfoRate = port_rate_lim_mode[hardwarePortId].cir_value;
 	Params.nonPassthroughAlgParams.peakOrExcessInfoRate = port_rate_lim_mode[hardwarePortId].pir_value;
@@ -398,14 +392,6 @@ int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
 		return FAILURE;
 	}
 
-#if 0 /* port byte mode is not supporting. */
-	if (port_ff_lim_mode == e_FM_PCD_PLCR_BYTE_MODE) {
-		Params.nonPassthroughAlgParams.committedInfoRate = cir;
-		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;
-		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
-		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
-	} else 
-#endif
 	{
 		Params.nonPassthroughAlgParams.committedInfoRate = cir;
 		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;

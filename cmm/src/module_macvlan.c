@@ -17,35 +17,8 @@
 #include "cmmd.h"
 #include <string.h>
 
-#if 0
-#include <linux/sockios.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
-#endif
 #include <net/if_arp.h>
 
-#if 0
-static int macvlan_get_phys_interface(struct interface *itf, struct interface **phy_itf)
-{
-	struct interface *pitf = itf;
-
-	while(1) {
-		if (pitf->ifindex == pitf->phys_ifindex) {
-			if (phy_itf != NULL)
-				*phy_itf = pitf;
-			return pitf->ifindex;
-		}
-
-		pitf = __itf_get(pitf->phys_ifindex);
-		if (pitf == NULL)
-			break;
-	}
-
-	return -1;
-}
-#endif
 
 /*********************************************************************
  * __cmmGetMacVlan:

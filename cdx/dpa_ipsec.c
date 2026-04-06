@@ -1126,31 +1126,6 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 			__func__, bp->size, bp->bpid);
 	info->ipsec_bp = bp;
 
-#if 0 // instead allocate max 64k size buffers and add bman
-
-	while (buffer_count < IPSEC_BUFCOUNT)
-	{
-		refill_cnt = 0;
-		ret = dpaa_eth_refill_bpools(bp, &refill_cnt);
-		if (ret < 0)
-		{
-			DPAIPSEC_ERROR("%s:: Error returned for dpaa_eth_refill_bpools %d\n", __func__,ret);
-			break;
-		}
-
-		buffer_count += refill_cnt;
-	}
-
-	info->ipsec_bp->size =  bp_parent->size; 
-	DPAIPSEC_INFO("%s::%d buffers added to ipsec pool %d info size %d parent pool size %d\n", 
-			__func__, buffer_count, info->ipsec_bp->bpid,
-			info->parent_pool_info.buf_size,(int) bp_parent->size);
-//#else
-	ret = dpaa_bp_alloc_n_add_buffs(bp, IPSEC_BUFCOUNT, 1);
-	DPAIPSEC_INFO("%s(%d) buffers added to ipsec pool %d info size %zu \n", 
-			__func__,__LINE__,info->ipsec_bp->bpid,
-			info->ipsec_bp->size);
-#endif
 	return 0;
 }
 static int release_ipsec_bpool(struct ipsec_info *info)
@@ -1228,15 +1203,6 @@ int cdx_dpa_ipsecsa_release(void *handle)
 		dpa_fq = &sainfo->sec_fq[ii];
 		fq = &dpa_fq->fq_base; 
 		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
-#if 0 /* calling retire before timer start */
-		//drain fq TODO
-		//take fqs out of service
-		if (qman_retire_fq(fq, &flags)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-#endif /* 0 */
 		if (qman_oos_fq(fq)) {
 			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
 					__func__, fq->fqid, fq->fqid);

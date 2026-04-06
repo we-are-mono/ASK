@@ -378,18 +378,6 @@ int cmmSendToDaemon(daemon_handle_t handle, unsigned short commandCode, void * d
 	if (dataToSend)
 		memcpy(msg.buffer, dataToSend, dataSize);
 
-#if 0
-	if ((globalConf.debug_level & DEBUG_INFO) || (globalConf.log_level & DEBUG_INFO))
-	{
-		int rcvDataSize;
-		cmm_print(DEBUG_INFO, "commandCode: (%04x) \n", (unsigned int)msg.mtype);
-		for(rcvDataSize = 0; rcvDataSize < dataSize; rcvDataSize+=2)
-		{
-			cmm_print(DEBUG_INFO, "%02x%02x \n", msg.buffer[rcvDataSize + 1], msg.buffer[rcvDataSize]);
-		}
-		cmm_print(DEBUG_INFO, "\n");
-	}
-#endif
 
 	if (msgsnd(queueIdTx, &msg, dataSize, 0) < 0)
 	{
@@ -405,18 +393,6 @@ int cmmSendToDaemon(daemon_handle_t handle, unsigned short commandCode, void * d
 		return -1;
 	}
 
-#if 0
-	if ((globalConf.debug_level & DEBUG_INFO) || (globalConf.log_level & DEBUG_INFO))
-	{
-		int rcvDataSize;
-		cmm_print(DEBUG_INFO, "commandAck:  (%04x) \n", (unsigned int)msg.mtype);
-		for(rcvDataSize = 0; rcvDataSize < rcvBytes ; rcvDataSize += 2)
-		{
-			cmm_print(DEBUG_INFO, "%04x \n", ((unsigned short *)msg.buffer)[rcvDataSize]);
-		}
-		cmm_print(DEBUG_INFO, "\n");
-	}
-#endif
 
 	if ((dataToRcv) && (rcvBytes))
 		memcpy(dataToRcv, msg.buffer, rcvBytes);

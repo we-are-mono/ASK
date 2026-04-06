@@ -101,26 +101,6 @@ typedef struct _tIPSec_sainfo {
                 ipv4_hdr_t   ipv4h;
                 ipv6_hdr_t   ipv6h;
         } tunnel;
-#if 0
-	struct {
-		unsigned short num_keys;
-		IPSec_key_desc keys[IPSEC_MAX_NUM_KEYS];
-	}key;
-
-	struct {
-                unsigned short sport;
-                unsigned short dport;
-        }natt;
-
-	struct
-        {
-                IPSec_lifetime  hard_time;
-                IPSec_lifetime  soft_time;
-                IPSec_lifetime  current_time;
-
-        }lifetime;
-
-#endif
 
 }IPSec_sainfo, *pIPSec_sainfo;
 

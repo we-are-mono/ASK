@@ -64,10 +64,6 @@ static void cmm_third_part_cb (void *priv, unsigned short type, void *data, unsi
             /* Define new mark */
             
             /* Following lines are for test purpose only (mark change for a given port 1024) */
-        #if 0
-            if(ntohs(msg->orig_sport) == 1024)
-                msg->qosmark = 0x1;
-        #endif
             break;
 
 	default:

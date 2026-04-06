@@ -246,8 +246,5 @@ int dpa_get_rtp_qos_slowpath_fq(struct eth_iface_info *eth_info/*struct qman_fq 
 				uint16_t usHash, uint32_t *puiFqId);
 int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
 		uint32_t usCpuMask, uint16_t usNoFqs/*, uint16_t *usCreatedFqs*/);
-#if 0
-int dpa_destroy_eth_if_voip_fqs(struct dpa_iface_info *iface_info);
-#endif
 #endif
 #endif
