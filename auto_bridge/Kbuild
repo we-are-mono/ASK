@@ -1,0 +1,3 @@
+ccflags-y += -DLS104X -DVLAN_FILTER
+ccflags-y += -I$(srctree)/net/bridge/
+obj-$(CONFIG_ASK_AUTO_BRIDGE) += auto_bridge.o

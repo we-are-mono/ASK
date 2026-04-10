@@ -1,0 +1,1 @@
+obj-$(CONFIG_ASK_FCI) += fci.o
