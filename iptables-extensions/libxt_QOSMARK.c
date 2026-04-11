@@ -1,19 +1,23 @@
-/* Shared library add-on to iptables to add NFMARK matching support. */
+/* Shared library add-on to iptables to add QOSMARK target support. */
 #include <stdbool.h>
 #include <stdio.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <netdb.h>
 #include <string.h>
 #include <stdlib.h>
-#include <getopt.h>
 
 #include <xtables.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter/xt_QOSMARK.h>
 
 enum {
-	F_MARK = 1 << 0,
+	O_SET_XMARK = 0,
+	O_SET_MARK,
+	O_AND_MARK,
+	O_OR_MARK,
+	O_XOR_MARK,
+	F_ANY = (1 << O_SET_XMARK) | (1 << O_SET_MARK) | (1 << O_AND_MARK) |
+	        (1 << O_OR_MARK) | (1 << O_XOR_MARK),
 };
 
 static int parse64(const char *s, char **end, uint64_t *value)
@@ -52,79 +56,76 @@ static void qosmark_tg_help(void)
 "\n");
 }
 
-static const struct option qosmark_tg_opts[] = {
-	{.name = "set-xmark", .has_arg = true, .val = 'X'},
-	{.name = "set-mark",  .has_arg = true, .val = '='},
-	{.name = "and-mark",  .has_arg = true, .val = '&'},
-	{.name = "or-mark",   .has_arg = true, .val = '|'},
-	{.name = "xor-mark",  .has_arg = true, .val = '^'},
-	XT_GETOPT_TABLEEND,
+static const struct xt_option_entry qosmark_tg_opts[] = {
+	{.name = "set-xmark", .id = O_SET_XMARK, .type = XTTYPE_STRING,
+	 .excl = F_ANY},
+	{.name = "set-mark", .id = O_SET_MARK, .type = XTTYPE_STRING,
+	 .excl = F_ANY},
+	{.name = "and-mark", .id = O_AND_MARK, .type = XTTYPE_STRING,
+	 .excl = F_ANY},
+	{.name = "or-mark", .id = O_OR_MARK, .type = XTTYPE_STRING,
+	 .excl = F_ANY},
+	{.name = "xor-mark", .id = O_XOR_MARK, .type = XTTYPE_STRING,
+	 .excl = F_ANY},
+	XTOPT_TABLEEND,
 };
 
-static int qosmark_tg_parse(int c, char **argv, int invert, unsigned int *flags,
-                         const void *entry, struct xt_entry_target **target)
+static void qosmark_tg_parse(struct xt_option_call *cb)
 {
-	struct xt_qosmark_tginfo2 *info = (void *)(*target)->data;
-	uint64_t value, mask = UINT64_MAX;
-	char *end;
+	struct xt_qosmark_tginfo2 *info = cb->data;
+	uint64_t value = 0, mask = UINT64_MAX;
+	char *end = NULL;
 
-	switch (c) {
-	case 'X': /* --set-xmark */
-	case '=': /* --set-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSMARK", *flags & F_MARK);
-		xtables_param_act(XTF_NO_INVERT, "QOSMARK", "--set-xmark/--set-mark", invert);
-		if (!parse64(optarg, &end, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSMARK", "--set-xmark/--set-mark", optarg);
+	xtables_option_parse(cb);
+
+	switch (cb->entry->id) {
+	case O_SET_XMARK:
+	case O_SET_MARK:
+		if (!parse64(cb->arg, &end, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSMARK",
+			                  "--set-xmark/--set-mark", cb->arg);
 		if (*end == '/')
 			if (!parse64(end + 1, &end, &mask))
-				xtables_param_act(XTF_BAD_VALUE, "QOSMARK", "--set-xmark/--set-mark", optarg);
+				xtables_param_act(XTF_BAD_VALUE, "QOSMARK",
+				                  "--set-xmark/--set-mark", cb->arg);
 		if (*end != '\0')
-			xtables_param_act(XTF_BAD_VALUE, "QOSMARK", "--set-xmark/--set-mark", optarg);
+			xtables_param_act(XTF_BAD_VALUE, "QOSMARK",
+			                  "--set-xmark/--set-mark", cb->arg);
 		info->mark = value;
 		info->mask = mask;
-
-		if (c == '=')
+		if (cb->entry->id == O_SET_MARK)
 			info->mask = value | mask;
 		break;
 
-	case '&': /* --and-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSMARK", *flags & F_MARK);
-		xtables_param_act(XTF_NO_INVERT, "QOSMARK", "--and-mark", invert);
-		if (!parse64(optarg, NULL, &mask))
-			xtables_param_act(XTF_BAD_VALUE, "QOSMARK", "--and-mark", optarg);
+	case O_AND_MARK:
+		if (!parse64(cb->arg, NULL, &mask))
+			xtables_param_act(XTF_BAD_VALUE, "QOSMARK",
+			                  "--and-mark", cb->arg);
 		info->mark = 0;
 		info->mask = ~mask;
 		break;
 
-	case '|': /* --or-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSMARK", *flags & F_MARK);
-		xtables_param_act(XTF_NO_INVERT, "QOSMARK", "--or-mark", invert);
-		if (!parse64(optarg, NULL, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSMARK", "--or-mark", optarg);
+	case O_OR_MARK:
+		if (!parse64(cb->arg, NULL, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSMARK",
+			                  "--or-mark", cb->arg);
 		info->mark = value;
 		info->mask = value;
 		break;
 
-	case '^': /* --xor-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSMARK", *flags & F_MARK);
-		xtables_param_act(XTF_NO_INVERT, "QOSMARK", "--xor-mark", invert);
-		if (!parse64(optarg, NULL, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSMARK", "--xor-mark", optarg);
+	case O_XOR_MARK:
+		if (!parse64(cb->arg, NULL, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSMARK",
+			                  "--xor-mark", cb->arg);
 		info->mark = value;
 		info->mask = 0;
 		break;
-
-	default:
-		return false;
 	}
-
-	*flags |= F_MARK;
-	return true;
 }
 
-static void qosmark_tg_check(unsigned int flags)
+static void qosmark_tg_check(struct xt_fcheck_call *cb)
 {
-	if (flags == 0)
+	if (cb->xflags == 0)
 		xtables_error(PARAMETER_PROBLEM, "QOSMARK: One of the --set-xmark, "
 		           "--{and,or,xor,set}-mark options is required");
 }
@@ -161,11 +162,11 @@ static struct xtables_target qosmark_target = {
 	.size          = XT_ALIGN(sizeof(struct xt_qosmark_tginfo2)),
 	.userspacesize = XT_ALIGN(sizeof(struct xt_qosmark_tginfo2)),
 	.help          = qosmark_tg_help,
-	.parse         = qosmark_tg_parse,
-	.final_check   = qosmark_tg_check,
 	.print         = qosmark_tg_print,
 	.save          = qosmark_tg_save,
-	.extra_opts    = qosmark_tg_opts,
+	.x6_parse      = qosmark_tg_parse,
+	.x6_fcheck     = qosmark_tg_check,
+	.x6_options    = qosmark_tg_opts,
 };
 
 void _init(void)

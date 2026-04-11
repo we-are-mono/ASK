@@ -1,4 +1,4 @@
-/* Shared library add-on to iptables to add connmark matching support.
+/* Shared library add-on to iptables to add QOSCONNMARK target support.
  *
  * (C) 2002,2004 MARA Systems AB <http://www.marasystems.com>
  * by Henrik Nordstrom <hno@marasystems.com>
@@ -12,18 +12,28 @@
 #include <stdio.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <netdb.h>
 #include <string.h>
 #include <stdlib.h>
-#include <getopt.h>
 
 #include <xtables.h>
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter/xt_QOSCONNMARK.h>
 
 enum {
-	F_MARK    = 1 << 0,
-	F_SR_MARK = 1 << 1,
+	O_SET_XMARK = 0,
+	O_SET_MARK,
+	O_AND_MARK,
+	O_OR_MARK,
+	O_XOR_MARK,
+	O_SAVE_MARK,
+	O_RESTORE_MARK,
+	O_CTMASK,
+	O_NFMASK,
+	O_MASK,
+	F_OP    = (1 << O_SET_XMARK) | (1 << O_SET_MARK) | (1 << O_AND_MARK) |
+	          (1 << O_OR_MARK) | (1 << O_XOR_MARK) |
+	          (1 << O_SAVE_MARK) | (1 << O_RESTORE_MARK),
+	F_SR    = (1 << O_SAVE_MARK) | (1 << O_RESTORE_MARK),
 };
 
 static int parse64(const char *s, char **end, uint64_t *value)
@@ -68,18 +78,28 @@ static void qosconnmark_tg_help(void)
 );
 }
 
-static const struct option qosconnmark_tg_opts[] = {
-	{.name = "set-xmark",     .has_arg = true,  .val = '='},
-	{.name = "set-mark",      .has_arg = true,  .val = '-'},
-	{.name = "and-mark",      .has_arg = true,  .val = '&'},
-	{.name = "or-mark",       .has_arg = true,  .val = '|'},
-	{.name = "xor-mark",      .has_arg = true,  .val = '^'},
-	{.name = "save-mark",     .has_arg = false, .val = 'S'},
-	{.name = "restore-mark",  .has_arg = false, .val = 'R'},
-	{.name = "ctmask",        .has_arg = true,  .val = 'c'},
-	{.name = "nfmask",        .has_arg = true,  .val = 'n'},
-	{.name = "mask",          .has_arg = true,  .val = 'm'},
-	XT_GETOPT_TABLEEND,
+static const struct xt_option_entry qosconnmark_tg_opts[] = {
+	{.name = "set-xmark",    .id = O_SET_XMARK,    .type = XTTYPE_STRING,
+	 .excl = F_OP},
+	{.name = "set-mark",     .id = O_SET_MARK,     .type = XTTYPE_STRING,
+	 .excl = F_OP},
+	{.name = "and-mark",     .id = O_AND_MARK,     .type = XTTYPE_STRING,
+	 .excl = F_OP},
+	{.name = "or-mark",      .id = O_OR_MARK,      .type = XTTYPE_STRING,
+	 .excl = F_OP},
+	{.name = "xor-mark",     .id = O_XOR_MARK,     .type = XTTYPE_STRING,
+	 .excl = F_OP},
+	{.name = "save-mark",    .id = O_SAVE_MARK,    .type = XTTYPE_NONE,
+	 .excl = F_OP},
+	{.name = "restore-mark", .id = O_RESTORE_MARK, .type = XTTYPE_NONE,
+	 .excl = F_OP},
+	{.name = "ctmask",       .id = O_CTMASK,       .type = XTTYPE_STRING,
+	 .excl = (1 << O_MASK)},
+	{.name = "nfmask",       .id = O_NFMASK,       .type = XTTYPE_STRING,
+	 .excl = (1 << O_MASK)},
+	{.name = "mask",         .id = O_MASK,          .type = XTTYPE_STRING,
+	 .excl = (1 << O_CTMASK) | (1 << O_NFMASK)},
+	XTOPT_TABLEEND,
 };
 
 static void qosconnmark_tg_init(struct xt_entry_target *target)
@@ -90,111 +110,103 @@ static void qosconnmark_tg_init(struct xt_entry_target *target)
 	info->nfmask = UINT64_MAX;
 }
 
-static int qosconnmark_tg_parse(int c, char **argv, int invert,
-                             unsigned int *flags, const void *entry,
-                             struct xt_entry_target **target)
+static void qosconnmark_tg_parse(struct xt_option_call *cb)
 {
-	struct xt_qosconnmark_tginfo1 *info = (void *)(*target)->data;
-	uint64_t value, mask = UINT64_MAX;
-	char *end;
+	struct xt_qosconnmark_tginfo1 *info = cb->data;
+	uint64_t value = 0, mask = UINT64_MAX;
+	char *end = NULL;
 
-	switch (c) {
-	case '=': /* --set-xmark */
-	case '-': /* --set-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSCONNMARK", *flags & F_MARK);
-		if (!parse64(optarg, &end, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--set-xmark/--set-mark", optarg);
+	xtables_option_parse(cb);
+
+	switch (cb->entry->id) {
+	case O_SET_XMARK:
+	case O_SET_MARK:
+		if (!parse64(cb->arg, &end, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--set-xmark/--set-mark", cb->arg);
 		if (*end == '/')
 			if (!parse64(end + 1, &end, &mask))
-				xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--set-xmark/--set-mark", optarg);
+				xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+				                  "--set-xmark/--set-mark", cb->arg);
 		if (*end != '\0')
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--set-xmark/--set-mark", optarg);
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--set-xmark/--set-mark", cb->arg);
 		info->mode   = XT_QOSCONNMARK_SET;
-		info->mark = value;
+		info->mark   = value;
 		info->ctmask = mask;
-		if (c == '-')
+		if (cb->entry->id == O_SET_MARK)
 			info->ctmask |= value;
-		*flags |= F_MARK;
-		return true;
+		break;
 
-	case '&': /* --and-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSCONNMARK", *flags & F_MARK);
-		if (!parse64(optarg, NULL, &mask))
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--and-mark", optarg);
+	case O_AND_MARK:
+		if (!parse64(cb->arg, NULL, &mask))
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--and-mark", cb->arg);
 		info->mode   = XT_QOSCONNMARK_SET;
-		info->mark = 0;
+		info->mark   = 0;
 		info->ctmask = ~mask;
-		*flags      |= F_MARK;
-		return true;
+		break;
 
-	case '|': /* --or-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSCONNMARK", *flags & F_MARK);
-		if (!parse64(optarg, NULL, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--or-mark", optarg);
+	case O_OR_MARK:
+		if (!parse64(cb->arg, NULL, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--or-mark", cb->arg);
 		info->mode   = XT_QOSCONNMARK_SET;
-		info->mark = value;
+		info->mark   = value;
 		info->ctmask = value;
-		*flags      |= F_MARK;
-		return true;
+		break;
 
-	case '^': /* --xor-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSCONNMARK", *flags & F_MARK);
-		if (!parse64(optarg, NULL, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--xor-mark", optarg);
+	case O_XOR_MARK:
+		if (!parse64(cb->arg, NULL, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--xor-mark", cb->arg);
 		info->mode   = XT_QOSCONNMARK_SET;
-		info->mark = value;
+		info->mark   = value;
 		info->ctmask = 0;
-		*flags      |= F_MARK;
-		return true;
+		break;
 
-	case 'S': /* --save-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSCONNMARK", *flags & F_MARK);
+	case O_SAVE_MARK:
 		info->mode = XT_QOSCONNMARK_SAVE_QOSMARK;
-		*flags |= F_MARK | F_SR_MARK;
-		return true;
+		break;
 
-	case 'R': /* --restore-mark */
-		xtables_param_act(XTF_ONE_ACTION, "QOSCONNMARK", *flags & F_MARK);
+	case O_RESTORE_MARK:
 		info->mode = XT_QOSCONNMARK_RESTORE_QOSMARK;
-		*flags |= F_MARK | F_SR_MARK;
-		return true;
+		break;
 
-	case 'n': /* --nfmask */
-		if (!(*flags & F_SR_MARK))
-			xtables_error(PARAMETER_PROBLEM, "QOSCONNMARK: --save-mark "
-			           "or --restore-mark is required for --nfmask");
-		if (!parse64(optarg, NULL, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--nfmask", optarg);
+	case O_NFMASK:
+		if (!parse64(cb->arg, NULL, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--nfmask", cb->arg);
 		info->nfmask = value;
-		return true;
+		break;
 
-	case 'c': /* --ctmask */
-		if (!(*flags & F_SR_MARK))
-			xtables_error(PARAMETER_PROBLEM, "QOSCONNMARK: --save-mark "
-			           "or --restore-mark is required for --ctmask");
-		if (!parse64(optarg, NULL, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--ctmask", optarg);
+	case O_CTMASK:
+		if (!parse64(cb->arg, NULL, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--ctmask", cb->arg);
 		info->ctmask = value;
-		return true;
+		break;
 
-	case 'm': /* --mask */
-		if (!(*flags & F_SR_MARK))
-			xtables_error(PARAMETER_PROBLEM, "QOSCONNMARK: --save-mark "
-			           "or --restore-mark is required for --mask");
-		if (!parse64(optarg, NULL, &value))
-			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK", "--mask", optarg);
+	case O_MASK:
+		if (!parse64(cb->arg, NULL, &value))
+			xtables_param_act(XTF_BAD_VALUE, "QOSCONNMARK",
+			                  "--mask", cb->arg);
 		info->nfmask = info->ctmask = value;
-		return true;
+		break;
 	}
-
-	return false;
 }
 
-static void qosconnmark_tg_check(unsigned int flags)
+static void qosconnmark_tg_check(struct xt_fcheck_call *cb)
 {
-	if (!flags)
+	unsigned int mask_opts = (1 << O_CTMASK) | (1 << O_NFMASK) | (1 << O_MASK);
+
+	if (cb->xflags == 0)
 		xtables_error(PARAMETER_PROBLEM,
 		           "QOSCONNMARK target: No operation specified");
+	if ((cb->xflags & mask_opts) && !(cb->xflags & F_SR))
+		xtables_error(PARAMETER_PROBLEM, "QOSCONNMARK: --save-mark "
+		           "or --restore-mark is required for "
+		           "--ctmask/--nfmask/--mask");
 }
 
 static void
@@ -273,11 +285,11 @@ static struct xtables_target qosconnmark_target = {
 	.userspacesize = XT_ALIGN(sizeof(struct xt_qosconnmark_tginfo1)),
 	.help          = qosconnmark_tg_help,
 	.init          = qosconnmark_tg_init,
-	.parse         = qosconnmark_tg_parse,
-	.final_check   = qosconnmark_tg_check,
 	.print         = qosconnmark_tg_print,
 	.save          = qosconnmark_tg_save,
-	.extra_opts    = qosconnmark_tg_opts,
+	.x6_parse      = qosconnmark_tg_parse,
+	.x6_fcheck     = qosconnmark_tg_check,
+	.x6_options    = qosconnmark_tg_opts,
 };
 
 void _init(void)
