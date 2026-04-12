@@ -140,7 +140,7 @@ static struct xtables_match qosconnmark_match = {
 	.x6_options    = qosconnmark_mt_opts,
 };
 
-void _init(void)
+static void __attribute__((constructor)) xt_init(void)
 {
 	xtables_register_match(&qosconnmark_match);
 }

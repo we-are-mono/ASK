@@ -292,7 +292,7 @@ static struct xtables_target qosconnmark_target = {
 	.x6_options    = qosconnmark_tg_opts,
 };
 
-void _init(void)
+static void __attribute__((constructor)) xt_init(void)
 {
 	xtables_register_target(&qosconnmark_target);
 }
