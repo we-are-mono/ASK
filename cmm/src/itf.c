@@ -1342,7 +1342,7 @@ int itf_name_update(FCI_CLIENT *fci_handle, struct gemac_port *port)
 
 	cmm_print(DEBUG_INFO, "%s: port mapping %d <=> %s\n", __func__, cmd.port_id, cmd.ifname);
 
-	if (FPP_ERR_OK != (ret = fci_write(fci_handle, FPP_CMD_PORT_UPDATE , sizeof(cmd), (unsigned short *) &cmd)))
+	if (FPP_ERR_OK != (ret = fci_write(fci_handle, FPP_CMD_PORT_UPDATE , sizeof(cmd), (unsigned short *)(void *)&cmd)))
 	{
 		cmm_print(DEBUG_CRIT, "%s: Port update failed in FPP %d \n", __func__, ret);
 		return -1;

@@ -183,7 +183,7 @@ int cmmFePPPoEUpdate(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 			goto err;
 		}
 
-		ret = fci_write(fci_handle, FPP_CMD_PPPOE_ENTRY, sizeof(fpp_pppoe_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handle, FPP_CMD_PPPOE_ENTRY, sizeof(fpp_pppoe_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_PPPOE_ENTRY_ALREADY_REGISTERED))
 		{
 			itf->flags |= FPP_PROGRAMMED;
@@ -200,7 +200,7 @@ int cmmFePPPoEUpdate(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 	
 		cmm_print(DEBUG_COMMAND, "Send CMD_PPPOE_ENTRY ACTION_DEREGISTER\n");
 
-		ret = fci_write(fci_handle, FPP_CMD_PPPOE_ENTRY, sizeof(fpp_pppoe_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handle, FPP_CMD_PPPOE_ENTRY, sizeof(fpp_pppoe_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_PPPOE_ENTRY_NOT_FOUND))
 		{
 			itf->flags &= ~FPP_PROGRAMMED;
@@ -338,7 +338,7 @@ int cmmPPPoEAutoGetIdle( struct interface* itf , unsigned long* rcv_sec , unsign
         cmd.xmit_idle = 0;
         cmd.recv_idle  = 0;
 
-        ret = fci_query(itf_table.fci_handle, FPP_CMD_PPPOE_GET_IDLE, sizeof(fpp_pppoe_idle_t), (unsigned short *) &cmd, &rcvlen, (unsigned short*) &rcvbuf[0]);
+        ret = fci_query(itf_table.fci_handle, FPP_CMD_PPPOE_GET_IDLE, sizeof(fpp_pppoe_idle_t), (unsigned short *)(void *)&cmd, &rcvlen, (unsigned short *)(void *)&rcvbuf[0]);
 
         if (ret != FPP_ERR_OK)
                 goto err;

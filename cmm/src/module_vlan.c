@@ -124,7 +124,7 @@ int cmmFeVLANUpdate(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 		memcpy(cmd.macaddr, itf->macaddr, 6);
 #endif
 
-		ret = fci_write(fci_handle, FPP_CMD_VLAN_ENTRY, sizeof(fpp_vlan_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handle, FPP_CMD_VLAN_ENTRY, sizeof(fpp_vlan_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_VLAN_ENTRY_ALREADY_REGISTERED))
 		{
 			itf->flags |= FPP_PROGRAMMED;
@@ -142,7 +142,7 @@ int cmmFeVLANUpdate(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 	
 		cmm_print(DEBUG_COMMAND, "Send CMD_VLAN_ENTRY ACTION_DEREGISTER\n");
 
-		ret = fci_write(fci_handle, FPP_CMD_VLAN_ENTRY, sizeof(fpp_vlan_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handle, FPP_CMD_VLAN_ENTRY, sizeof(fpp_vlan_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_VLAN_ENTRY_NOT_FOUND))
 		{
 			itf->flags &= ~FPP_PROGRAMMED;

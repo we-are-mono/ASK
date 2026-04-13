@@ -1443,7 +1443,7 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 
 FCI_CMD:
 	//Sending message to FPP
-	return fci_cmd(ctx->fci_handle, function_code, (unsigned short *)cmd_buf, cmd_len, (unsigned short *)res_buf, res_len);
+	return fci_cmd(ctx->fci_handle, function_code, (unsigned short *)(void *)cmd_buf, cmd_len, (unsigned short *)(void *)res_buf, res_len);
 }
 
 

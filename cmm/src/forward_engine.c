@@ -256,7 +256,7 @@ int cmmFeL2FlowUpdate(FCI_CLIENT* fci_handler, int request, struct l2flowTable *
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send FPP_CMD_RX_L2FLOW_ENTRY, ACTION_REGISTER\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_RX_L2FLOW_ENTRY, sizeof(fpp_l2_bridge_flow_entry_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_RX_L2FLOW_ENTRY, sizeof(fpp_l2_bridge_flow_entry_cmd_t), (unsigned short *)(void *)&cmd);
 
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_BRIDGE_ENTRY_ALREADY_EXISTS)){
 			l2flow_entry->flags |= FPP_PROGRAMMED;
@@ -272,7 +272,7 @@ int cmmFeL2FlowUpdate(FCI_CLIENT* fci_handler, int request, struct l2flowTable *
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send FPP_CMD_RX_L2FLOW_ENTRY, ACTION_UPDATE\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_RX_L2FLOW_ENTRY, sizeof(fpp_l2_bridge_flow_entry_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_RX_L2FLOW_ENTRY, sizeof(fpp_l2_bridge_flow_entry_cmd_t), (unsigned short *)(void *)&cmd);
 
 		if (ret == FPP_ERR_OK){
 			l2flow_entry->flags &= ~FPP_NEEDS_UPDATE;
@@ -287,7 +287,7 @@ int cmmFeL2FlowUpdate(FCI_CLIENT* fci_handler, int request, struct l2flowTable *
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send FPP_CMD_RX_L2FLOW_ENTRY, ACTION_DEREGISTER\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_RX_L2FLOW_ENTRY, sizeof(fpp_l2_bridge_flow_entry_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_RX_L2FLOW_ENTRY, sizeof(fpp_l2_bridge_flow_entry_cmd_t), (unsigned short *)(void *)&cmd);
 
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_BRIDGE_ENTRY_NOT_FOUND)){
 			l2flow_entry->flags &= ~FPP_PROGRAMMED;
@@ -558,7 +558,7 @@ proceedv4_if_flow_no_repl_sa:
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV4_CONNTRACK ACTION_REGISTER\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, cmd_size, (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, cmd_size, (unsigned short *)(void *)&cmd);
 
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_ALREADY_REGISTERED))
 		{
@@ -600,7 +600,7 @@ proceedv4_if_flow_no_repl_sa:
 	case FPP_ACTION_UPDATE:
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV4_CONNTRACK ACTION_UPDATE\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, cmd_size, (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, cmd_size, (unsigned short *)(void *)&cmd);
 		if (ret == FPP_ERR_OK)
 		{
 #ifdef	IPSEC_FLOW_CACHE
@@ -629,7 +629,7 @@ proceedv4_if_flow_no_repl_sa:
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV4_CONNTRACK ACTION_DEREGISTER\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, sizeof(fpp_ct_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, sizeof(fpp_ct_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_NOT_FOUND))
 		{
 #ifdef	IPSEC_FLOW_CACHE
@@ -912,7 +912,7 @@ proceedv6_if_flow_no_repl_sa:
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV6_CONNTRACK ACTION_REGISTER\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, cmd_size, (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, cmd_size, (unsigned short *)(void *)&cmd);
 
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_ALREADY_REGISTERED))
 		{
@@ -954,7 +954,7 @@ proceedv6_if_flow_no_repl_sa:
 	case FPP_ACTION_UPDATE:
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV6_CONNTRACK ACTION_UPDATE\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, cmd_size, (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, cmd_size, (unsigned short *)(void *)&cmd);
 		if (ret == FPP_ERR_OK)
 		{
 #ifdef  IPSEC_FLOW_CACHE 
@@ -983,7 +983,7 @@ proceedv6_if_flow_no_repl_sa:
 	default:
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV6_CONNTRACK ACTION_DEREGISTER\n");
-		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, sizeof(fpp_ct6_cmd_t), (unsigned short *) &cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, sizeof(fpp_ct6_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_NOT_FOUND))
 		{
 #ifdef  IPSEC_FLOW_CACHE 
@@ -1250,7 +1250,7 @@ int __cmmFeRouteUpdate(FCI_CLIENT* fci_handler, int action, struct fpp_rt *fpp_r
 	case FPP_ACTION_REGISTER:
 		cmm_print(DEBUG_COMMAND, "Send CMD_IP_ROUTE ACTION_REGISTER\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IP_ROUTE, sizeof(fpp_rt_cmd_t), (unsigned short *)&cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IP_ROUTE, sizeof(fpp_rt_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_RT_ENTRY_ALREADY_REGISTERED))
 		{
 			fpp_route->flags |= FPP_PROGRAMMED;
@@ -1267,7 +1267,7 @@ int __cmmFeRouteUpdate(FCI_CLIENT* fci_handler, int action, struct fpp_rt *fpp_r
 	case FPP_ACTION_UPDATE:
 		cmm_print(DEBUG_COMMAND, "Send CMD_IP_ROUTE ACTION_UPDATE\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IP_ROUTE, sizeof(fpp_rt_cmd_t), (unsigned short *)&cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IP_ROUTE, sizeof(fpp_rt_cmd_t), (unsigned short *)(void *)&cmd);
 		if (ret == FPP_ERR_OK)
 		{
 			fpp_route->flags &= ~FPP_NEEDS_UPDATE;
@@ -1285,7 +1285,7 @@ int __cmmFeRouteUpdate(FCI_CLIENT* fci_handler, int action, struct fpp_rt *fpp_r
 	default:
 		cmm_print(DEBUG_COMMAND, "Send CMD_IP_ROUTE ACTION_DEREGISTER\n");
 
-		ret = fci_write(fci_handler, FPP_CMD_IP_ROUTE, sizeof(fpp_rt_cmd_t), (unsigned short *)&cmd);
+		ret = fci_write(fci_handler, FPP_CMD_IP_ROUTE, sizeof(fpp_rt_cmd_t), (unsigned short *)(void *)&cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_RT_ENTRY_NOT_FOUND))
 		{
 			fpp_route->flags &= ~FPP_PROGRAMMED;
@@ -1692,7 +1692,7 @@ int cmmFeFFControl(FCI_CLIENT* fci_handler, u_int8_t *cmd_buf, u_int16_t cmd_len
 
 			// Send message to forward engine
 			cmm_print(DEBUG_COMMAND, "Send CMD_IPV4_FF_CONTROL cmd len=%zu\n",sizeof(fpp_ff_ctrl_cmd_t));
-			ret = fci_cmd(fci_handler, FPP_CMD_IPV4_FF_CONTROL, (unsigned short *) cmd, sizeof(fpp_ff_ctrl_cmd_t), res_buf, res_len);
+			ret = fci_cmd(fci_handler, FPP_CMD_IPV4_FF_CONTROL, (unsigned short *)(void *)cmd, sizeof(fpp_ff_ctrl_cmd_t), res_buf, res_len);
 			if (ret !=0 || res_buf[0] != FPP_ERR_OK)
 			{
 				if (ret != 0)
@@ -1719,7 +1719,7 @@ int cmmFeFFControl(FCI_CLIENT* fci_handler, u_int8_t *cmd_buf, u_int16_t cmd_len
 
 			// Send message to forward engine
 			cmm_print(DEBUG_COMMAND, "Send CMD_IPV4_FF_CONTROL cmd len=%zu\n",sizeof(fpp_ff_ctrl_cmd_t));
-			ret = fci_cmd(fci_handler, FPP_CMD_IPV4_FF_CONTROL, (unsigned short *) cmd, sizeof(fpp_ff_ctrl_cmd_t), res_buf, res_len);
+			ret = fci_cmd(fci_handler, FPP_CMD_IPV4_FF_CONTROL, (unsigned short *)(void *)cmd, sizeof(fpp_ff_ctrl_cmd_t), res_buf, res_len);
 			if (ret !=0 || res_buf[0] != FPP_ERR_OK)
 			{
 				if (ret != 0)

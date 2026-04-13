@@ -248,7 +248,7 @@ int cmmFeWiFiUpdate(FCI_CLIENT *fci_handle, int fd, int request, struct interfac
         //                                cmd.mac_addr[2],cmd.mac_addr[3],cmd.mac_addr[4],cmd.mac_addr[5]  );
 	//Send VAP entry command to FPP
 	ret = fci_write(fci_handle, FPP_CMD_WIFI_VAP_ENTRY, 
-				sizeof(fpp_wifi_cmd_t), (unsigned short *) &cmd); 
+				sizeof(fpp_wifi_cmd_t), (unsigned short *)(void *)&cmd); 
 
 	if ( ret != FPP_ERR_OK )
 	{	
@@ -284,7 +284,7 @@ int cmmFeWiFiUpdate(FCI_CLIENT *fci_handle, int fd, int request, struct interfac
 		if (cmd.action == FPP_VWD_VAP_ADD) {
 			cmd.action = FPP_VWD_VAP_REMOVE;
 			ret = fci_write(fci_handle, FPP_CMD_WIFI_VAP_ENTRY, 
-				sizeof(fpp_wifi_cmd_t), (unsigned short *) &cmd); 
+				sizeof(fpp_wifi_cmd_t), (unsigned short *)(void *)&cmd); 
 			if ( ret != FPP_ERR_OK )
 			{	
 				cmm_print(DEBUG_ERROR, "%s: %d Failed command FPP_CMD_WIFI_VAP_ENTRY, action:error %d:%d\n",

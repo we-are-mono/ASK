@@ -2431,7 +2431,7 @@ int cmmFFControlProcess(char ** keywords, int tabStart, daemon_handle_t daemon_h
 
 	// Send message to forward engine
 	cmm_print(DEBUG_COMMAND, "Send CMD_CMMTD_IPV4_FF_CONTROL cmd to daemon len=%zu\n",sizeof(cmmd_ff_ctrl_cmd_t));
-	rc = cmmSendToDaemon(daemon_handle, CMMD_CMD_IPV4_FF_CONTROL, (unsigned short *) &cmd, sizeof(cmmd_ff_ctrl_cmd_t), rxbuf.rcvBuffer);
+	rc = cmmSendToDaemon(daemon_handle, CMMD_CMD_IPV4_FF_CONTROL, &cmd, sizeof(cmmd_ff_ctrl_cmd_t), rxbuf.rcvBuffer);
 	if (rc != 2) /* we expect 2 bytes in response */
 	{
 		cmm_print(DEBUG_STDERR, "CMD_CMMTD_IPV4_FF_CONTROL unexpected response length %d\n", rc);
@@ -2475,7 +2475,7 @@ int cmmIPsecSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 
 		// Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPSEC_FRAG_CFG cmd to daemon len=%zu\n",sizeof(fpp_ipsec_cmd_t));
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_IPSEC_FRAG_CFG, (unsigned short *) &cmd, sizeof(fpp_ipsec_cmd_t), rxbuf.rcvBuffer) == 4)
+		if(cmmSendToDaemon(daemon_handle, FPP_CMD_IPSEC_FRAG_CFG, &cmd, sizeof(fpp_ipsec_cmd_t), rxbuf.rcvBuffer) == 4)
 		{
 			if (rxbuf.result != 0) {
 				showErrorMsg("CMD_IPSEC_FRAG_CFG", ERRMSG_SOURCE_CMMD,rxbuf.rcvBuffer);

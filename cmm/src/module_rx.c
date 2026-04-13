@@ -432,7 +432,7 @@ int cmmFeBridgedIfUpdate(FCI_CLIENT *fci_handle, int fd, struct interface *itf)
 
 	cmm_print(DEBUG_INFO,"%s:: sending command FPP_CMD_BRIDGED_ITF_UPDATE : %d\n", __func__, br_cmd.is_bridged);
 	cmm_print(DEBUG_INFO,"%s:: br mac: is_bridged: %d - %x:%x:%x:%x:%x:%x\n", __func__, br_cmd.is_bridged, br_cmd.br_macaddr[0], br_cmd.br_macaddr[1], br_cmd.br_macaddr[2],br_cmd.br_macaddr[3], br_cmd.br_macaddr[4], br_cmd.br_macaddr[5]);
-	if (fci_write(fci_handle, FPP_CMD_BRIDGED_ITF_UPDATE, sizeof(br_cmd), (unsigned short *)&br_cmd)){
+	if (fci_write(fci_handle, FPP_CMD_BRIDGED_ITF_UPDATE, sizeof(br_cmd), (unsigned short *)(void *)&br_cmd)){
 		cmm_print(DEBUG_ERROR, "Error while trying to set  bridge mac to interface \n");
 		return -1;
 	}
@@ -604,7 +604,7 @@ int cmmBridgeInit(struct cmm_ct *ctx)
 
 	/* Set bridge mode in FPP */
 	cmm_print(DEBUG_COMMAND, "Send FPP_CMD_RX_L2BRIDGE_MODE\n");
-	if (fci_write(ctx->fci_handle, FPP_CMD_RX_L2BRIDGE_MODE, sizeof(br_cmd), (unsigned short *)&br_cmd)){
+	if (fci_write(ctx->fci_handle, FPP_CMD_RX_L2BRIDGE_MODE, sizeof(br_cmd), (unsigned short *)(void *)&br_cmd)){
 		cmm_print(DEBUG_ERROR, "Error while trying to set  bridge mode\n");
 		return -1;
 	}
@@ -649,7 +649,7 @@ int cmmBridgeControlProcess(char ** keywords, int tabStart, daemon_handle_t daem
 	
 	// Send message to forward engine
 	cmm_print(DEBUG_COMMAND, "Send FPP_CMD_RX_L2BRIDGE_FLOW_TIMEOUT to FPP\n");
-	rc = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_FLOW_TIMEOUT, (unsigned short *) &cmd, sizeof(fpp_l2_bridge_control_cmd_t), rxbuf.rcvBuffer);
+	rc = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_FLOW_TIMEOUT, &cmd, sizeof(fpp_l2_bridge_control_cmd_t), rxbuf.rcvBuffer);
 	if (rc != 2) /* we expect 2 bytes in response */
 	{
 		cmm_print(DEBUG_STDERR, "FPP_CMD_RX_L2BRIDGE_FLOW_TIMEOUT unexpected response length %d\n", rc);

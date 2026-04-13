@@ -221,7 +221,7 @@ static int cmmRelayAdd(FCI_CLIENT * fci_handler, struct fpp_relay_info *sh, u_in
               cmd->peermac2[4], cmd->peermac2[5], cmd->opifname,
               cmd->relaysesID);
 #endif
-    ret = fci_cmd(fci_handler, FPP_CMD_PPPOE_RELAY_ENTRY, (unsigned short *) cmd, sizeof(*cmd), res_buf, res_len);
+    ret = fci_cmd(fci_handler, FPP_CMD_PPPOE_RELAY_ENTRY, (unsigned short *)(void *)cmd, sizeof(*cmd), res_buf, res_len);
     if (ret != 0 || res_buf[0] != FPP_ERR_OK)
     {
          if (ret != 0) 
@@ -363,7 +363,7 @@ static int cmmRelayRemove(FCI_CLIENT * fci_handler,fpp_relay_info_t *sh, u_int16
               cmd->relaysesID);
 #endif
 
-    ret = fci_cmd(fci_handler, FPP_CMD_PPPOE_RELAY_ENTRY, (unsigned short *) cmd, sizeof(fpp_pppoe_relay_cmd_t), res_buf, res_len);
+    ret = fci_cmd(fci_handler, FPP_CMD_PPPOE_RELAY_ENTRY, (unsigned short *)(void *)cmd, sizeof(fpp_pppoe_relay_cmd_t), res_buf, res_len);
     if (ret != 0 || (res_buf[0] != FPP_ERR_OK && res_buf[0] != FPP_ERR_PPPOE_ENTRY_NOT_FOUND))	
     {
         if (ret != 0)
