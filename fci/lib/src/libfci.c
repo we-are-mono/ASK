@@ -64,7 +64,7 @@ static int fci_destroy_client(FCI_CLIENT *this_client);
 static int fci_read(FCI_CLIENT *this_client, struct iovec *iov, int iovlen);
 static int fci_get_response(FCI_CLIENT *this_client, unsigned short fcode, unsigned short *rep_buf, unsigned short *rep_len);
 static int fci_process_data(FCI_CLIENT *this_client, unsigned char *hdr, unsigned short *buf, int len);
-static int __fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, unsigned short *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len);
+static int __fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, void *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len);
 
 #ifdef ARCH_ODP
 static unsigned int cmd_socket_src_id = CMM_SOCK_PID_CMD;
@@ -159,7 +159,7 @@ int fci_close(FCI_CLIENT *this_client)
  * fci_cmd -
  *
  */
-int fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, unsigned short *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len)
+int fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, void *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len)
 {
 	FCILIB_PRINTF(FCILIB_WRITE, "%s: send fcode %#x length %d through socket %d\n", __func__, fcode, cmd_len, this_client->nl_sock_id);
 
@@ -171,7 +171,7 @@ int fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, unsigned short *cmd_b
  * fci_write -
  *
  */
-int fci_write(FCI_CLIENT *this_client, unsigned short fcode, unsigned short cmd_len, unsigned short *cmd_buf)
+int fci_write(FCI_CLIENT *this_client, unsigned short fcode, unsigned short cmd_len, void *cmd_buf)
 {
 	unsigned short rep_buf[FCI_MAX_PAYLOAD / sizeof(u_int16_t)] __attribute__ ((aligned (4)));
 	unsigned short rep_len = sizeof(rep_buf);
@@ -191,7 +191,7 @@ int fci_write(FCI_CLIENT *this_client, unsigned short fcode, unsigned short cmd_
  * fci_query -
  *
  */
-int fci_query(FCI_CLIENT *this_client, unsigned short fcode, unsigned short cmd_len, unsigned short *cmd_buf, unsigned short *rep_len, unsigned short *rep_buf)
+int fci_query(FCI_CLIENT *this_client, unsigned short fcode, unsigned short cmd_len, void *cmd_buf, unsigned short *rep_len, void *rep_buf)
 {
 	unsigned short lrep_buf[FCI_MAX_PAYLOAD / sizeof(u_int16_t)] __attribute__ ((aligned (4)));
 	unsigned short lrep_len = sizeof(lrep_buf);
@@ -331,7 +331,7 @@ err:
  * __fci_cmd -
  *
  */
-static int __fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, unsigned short *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len)
+static int __fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, void *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len)
 {
 	unsigned char hdr[NLMSG_LENGTH(sizeof(struct fci_hdr))] __attribute__ ((aligned (4)));
 	struct iovec iov[]= {

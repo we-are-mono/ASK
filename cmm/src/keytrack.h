@@ -233,8 +233,8 @@ extern struct  list_head flow_table[FLOW_HASH_TABLE_SIZE];
 #endif
 
 int cmmKeyCatch(unsigned short fcode, unsigned short len, unsigned short *payload);
-int cmmKeyEnginetoIPSec(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, unsigned short *payload);
-int cmmIPSectoKeyEngine(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, unsigned short *payload);
+int cmmKeyEnginetoIPSec(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, void *payload);
+int cmmIPSectoKeyEngine(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, void *payload);
 #ifdef IPSEC_FLOW_CACHE
 int cmmFlowKeyEngineRemove(FCI_CLIENT *fci_handle, struct FlowEntry *fentry);
 

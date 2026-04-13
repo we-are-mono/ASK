@@ -173,7 +173,7 @@ program:
 	/* Send the tunnel command to FPP */
 	if (SAEntry->flags & FPP_NEEDS_UPDATE)
 	{
-		if (cmmKeyEnginetoIPSec(fci_handle, FPP_CMD_IPSEC_SA_TNL_ROUTE, sizeof(CommandIPSecSetTunnelRoute),(unsigned short *)(void *)&cmd_set_tnl_route) < 0)
+		if (cmmKeyEnginetoIPSec(fci_handle, FPP_CMD_IPSEC_SA_TNL_ROUTE, sizeof(CommandIPSecSetTunnelRoute),&cmd_set_tnl_route) < 0)
 		{
 			cmm_print(DEBUG_ERROR, "%s:cmmKeyEnginetoIPSec failed while setting tunnel route:\n", __func__);
 			return -1;
@@ -408,7 +408,7 @@ int cmmSASetOffloadState(FCI_CLIENT *fci_handle, unsigned short sagd, bool offlo
 	offload_status_change.sagd = sagd;
 	offload_status_change.action = offload_status;
 	if (cmmKeyEnginetoIPSec(fci_handle, FPP_CMD_IPSEC_SA_ACTION_OFFLOAD, sizeof(struct nlkey_sa_notify),
-		(unsigned short *)(void *)&offload_status_change) < 0)
+		&offload_status_change) < 0)
 	{
 		cmm_print(DEBUG_INFO,"%s: FPP_CMD_IPSEC_SA_ACTION_OFFLOAD failed", __func__);
 		rc = -1;

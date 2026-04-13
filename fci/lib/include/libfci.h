@@ -74,9 +74,9 @@ typedef struct t_FCI_CLIENT
 FCI_CLIENT * fci_open(unsigned long socket_type, unsigned long group);
 int fci_close(FCI_CLIENT *client);
 int fci_catch(FCI_CLIENT *client);
-int fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, unsigned short *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len);
-int fci_write(FCI_CLIENT *client, unsigned short fcode, unsigned short len, unsigned short *payload);
+int fci_cmd(FCI_CLIENT *this_client, unsigned short fcode, void *cmd_buf, unsigned short cmd_len, unsigned short *rep_buf, unsigned short *rep_len);
+int fci_write(FCI_CLIENT *client, unsigned short fcode, unsigned short len, void *payload);
 int fci_register_cb(FCI_CLIENT *client, int (*event_cb)(unsigned short fcode, unsigned short len, unsigned short *payload));
-int fci_query(FCI_CLIENT *this_client, unsigned short fcode, unsigned short length, unsigned short *pcmd, unsigned short *rsplen, unsigned short *rsp_data);
+int fci_query(FCI_CLIENT *this_client, unsigned short fcode, unsigned short length, void *pcmd, unsigned short *rsplen, void *rsp_data);
 int fci_fd(FCI_CLIENT *this_client);
 #endif

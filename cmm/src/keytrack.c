@@ -48,7 +48,7 @@ char ipsec_algo_name[128];
 *
 *
 ******************************************************************/
-int cmmKeyEnginetoIPSec(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, unsigned short *payload)
+int cmmKeyEnginetoIPSec(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, void *payload)
 {
 	int rc = 0;
 
@@ -70,7 +70,7 @@ int cmmKeyEnginetoIPSec(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned s
 *
 *
 ******************************************************************/
-int cmmIPSectoKeyEngine(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, unsigned short *payload)
+int cmmIPSectoKeyEngine(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, void *payload)
 {
 	int rc = 0;
 
@@ -1667,7 +1667,7 @@ void cmmDPDIPsecSAUpdate(struct cmm_ct *ctx)
 	double dt;
 	time_t now;
 	netkey_sa_update_cmd_t msg;
-	unsigned short *payload;
+	void *payload;
 	fpp_stat_ipsec_status_cmd_t ipsecStatusCmd;
 	uint64_t total_bytes_transmitted_0={0};
 	uint64_t total_bytes_transmitted_1={0};
@@ -1706,7 +1706,7 @@ void cmmDPDIPsecSAUpdate(struct cmm_ct *ctx)
 		ipsecStatusCmd.iQueryTimerVal = iQueryTimerVal;
 #endif
 		/* Send CMD_STAT_IPSEC_STATUS command */
-		ret = fci_write(ctx->fci_handle, FPP_CMD_STAT_IPSEC_STATUS, sizeof(ipsecStatusCmd), (unsigned short *)(void *)&ipsecStatusCmd);
+		ret = fci_write(ctx->fci_handle, FPP_CMD_STAT_IPSEC_STATUS, sizeof(ipsecStatusCmd), &ipsecStatusCmd);
 
 		if ((ret != FPP_ERR_OK) || (ret < 0))
 		{
@@ -1750,7 +1750,7 @@ void cmmDPDIPsecSAUpdate(struct cmm_ct *ctx)
 
 					fcode = NETKEY_CMD_SA_INFO_UPDATE;
 					len = sizeof(msg);
-					payload = (unsigned short *)(void *)&msg;
+					payload = &msg;
 					cmmIPSectoKeyEngine(ctx->fci_key_handle, fcode, len, payload);
 				}
 #if defined (LS1043)

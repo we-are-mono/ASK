@@ -82,7 +82,7 @@ int cmmFeMacVlanUpdate(FCI_CLIENT *fci_handle, int fd, int request,
 	case FPP_ACTION_REGISTER:
 		cmm_print(DEBUG_COMMAND, "Send FPP_CMD_MACVLAN_ENTRY FPP_ACTION_REGISTER\n");
 
-		ret = fci_write(fci_handle, FPP_CMD_MACVLAN_ENTRY, sizeof(fpp_macvlan_cmd_t), (unsigned short *)(void *)&cmd);
+		ret = fci_write(fci_handle, FPP_CMD_MACVLAN_ENTRY, sizeof(fpp_macvlan_cmd_t), &cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_MACVLAN_ENTRY_ALREADY_REGISTERED))
 		{
 			cmm_print(DEBUG_COMMAND, "Send FPP_CMD_MACVLAN_ENTRY FPP_ACTION_REGISTER: success\n");
@@ -99,7 +99,7 @@ int cmmFeMacVlanUpdate(FCI_CLIENT *fci_handle, int fd, int request,
 	
 		cmm_print(DEBUG_COMMAND, "Send FPP_CMD_MACVLAN_ENTRY FPP_ACTION_DEREGISTER\n");
 
-		ret = fci_write(fci_handle, FPP_CMD_MACVLAN_ENTRY, sizeof(fpp_macvlan_cmd_t), (unsigned short *)(void *)&cmd);
+		ret = fci_write(fci_handle, FPP_CMD_MACVLAN_ENTRY, sizeof(fpp_macvlan_cmd_t), &cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_MACVLAN_ENTRY_NOT_FOUND))
 		{
 			cmm_print(DEBUG_COMMAND, "Send FPP_CMD_MACVLAN_ENTRY FPP_ACTION_DEREGISTER: success\n");

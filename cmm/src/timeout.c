@@ -135,7 +135,7 @@ int cmmFeGetTimeout(FCI_CLIENT *fci_handle, struct ctTable *ctEntry, unsigned in
 		cmd.sport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_SRC);
 		cmd.dport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_DST);
 
-		rc = fci_query(fci_handle, FPP_CMD_IPV4_GET_TIMEOUT, sizeof(fpp_ct_cmd_t), (unsigned short *)(void *)&cmd, &rcvBytes, rcvBuffer);
+		rc = fci_query(fci_handle, FPP_CMD_IPV4_GET_TIMEOUT, sizeof(fpp_ct_cmd_t), &cmd, &rcvBytes, rcvBuffer);
 	}
 	else
 	{
@@ -153,7 +153,7 @@ int cmmFeGetTimeout(FCI_CLIENT *fci_handle, struct ctTable *ctEntry, unsigned in
 		cmd6.sport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_SRC);
 		cmd6.dport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_DST);
 
-		rc = fci_query(fci_handle, FPP_CMD_IPV6_GET_TIMEOUT, sizeof(fpp_ct6_cmd_t), (unsigned short *)(void *)&cmd6, &rcvBytes, rcvBuffer);
+		rc = fci_query(fci_handle, FPP_CMD_IPV6_GET_TIMEOUT, sizeof(fpp_ct6_cmd_t), &cmd6, &rcvBytes, rcvBuffer);
 	}
 
 	if (rc != 0)

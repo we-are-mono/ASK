@@ -14,7 +14,7 @@ PKG_CONFIG_PATH ?= $(SYSROOT)/lib/pkgconfig
 NFCT_CFLAGS := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --cflags libnetfilter_conntrack 2>/dev/null)
 NFCT_LIBS   := $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) $(PKG_CONFIG) --libs libnetfilter_conntrack 2>/dev/null)
 
-CFLAGS  += -O2 -g -Wall -Werror
+CFLAGS  += -O2 -g -Wall -Werror -fPIE
 CFLAGS  += $(NFCT_CFLAGS)
 CFLAGS  += -I$(SRCDIR)
 CFLAGS  += -I$(LIBFCI_DIR)/include

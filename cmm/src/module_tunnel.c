@@ -401,7 +401,7 @@ int tunnel_send_cmd(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 		//Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_TUNNEL_ADD\n");
 
-		ret = fci_write(fci_handle, FPP_CMD_TUNNEL_ADD, sizeof(fpp_tunnel_create_cmd_t), (unsigned short *)(void *)&cmd);
+		ret = fci_write(fci_handle, FPP_CMD_TUNNEL_ADD, sizeof(fpp_tunnel_create_cmd_t), &cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_TNL_ALREADY_CREATED))
 		{
 			itf->flags |= FPP_PROGRAMMED;
@@ -418,7 +418,7 @@ int tunnel_send_cmd(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 		//Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_TUNNEL_UPDATE\n");
 
-		ret = fci_write(fci_handle, FPP_CMD_TUNNEL_UPDATE, sizeof(fpp_tunnel_create_cmd_t), (unsigned short *)(void *)&cmd);
+		ret = fci_write(fci_handle, FPP_CMD_TUNNEL_UPDATE, sizeof(fpp_tunnel_create_cmd_t), &cmd);
 		if (ret == FPP_ERR_OK)
 		{
 			itf->flags &= ~FPP_NEEDS_UPDATE;
@@ -454,7 +454,7 @@ static int tunnel_send_del(FCI_CLIENT *fci_handle, struct interface *itf)
 	//Send message to forward engine
 	cmm_print(DEBUG_COMMAND, "Send CMD_TUNNEL_DEL\n");
 
-	ret = fci_write(fci_handle, FPP_CMD_TUNNEL_DEL, sizeof(fpp_tunnel_del_cmd_t), (unsigned short *)(void *)&cmd);
+	ret = fci_write(fci_handle, FPP_CMD_TUNNEL_DEL, sizeof(fpp_tunnel_del_cmd_t), &cmd);
 	if (ret == FPP_ERR_TNL_ENTRY_NOT_FOUND || ret == FPP_ERR_OK)
 		itf->flags &= ~FPP_PROGRAMMED;
 	else
@@ -540,7 +540,7 @@ static int tunnel_update_sa(FCI_CLIENT *fci_handle, struct interface *itf, unsig
 	//Send message to forward engine
 	cmm_print(DEBUG_COMMAND, "Send CMD_TUNNEL_SEC\n");
 
-	if ((ret = fci_write(fci_handle, FPP_CMD_TUNNEL_SEC, sizeof(fpp_tunnel_sec_cmd_t), (unsigned short *)(void *)&cmd)))
+	if ((ret = fci_write(fci_handle, FPP_CMD_TUNNEL_SEC, sizeof(fpp_tunnel_sec_cmd_t), &cmd)))
 	{
 		cmm_print(DEBUG_ERROR, "%s: Error %d while sending CMD_TUNNEL_SEC\n", __func__, ret);
 		goto err;
