@@ -127,12 +127,12 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 @@ -61,6 +61,11 @@
  	CTA_FILTER,
  	CTA_STATUS_MASK,
- 	CTA_TIMESTAMP_EVENT,
 +	/* NXP ASK: Layerscape fast path attributes - order must match kernel! */
 +	CTA_LAYERSCAPE_FP_ORIG,
 +	CTA_LAYERSCAPE_FP_REPLY,
 +	CTA_QOSCONNMARK,
 +	CTA_QOSCONNMARK_PAD,
+ 	CTA_TIMESTAMP_EVENT,
  	__CTA_MAX
  };
  #define CTA_MAX (__CTA_MAX - 1)
