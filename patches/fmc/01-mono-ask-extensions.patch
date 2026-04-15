@@ -261,6 +261,21 @@ index 696eb79..2789d52 100755
  };
  
  #endif // FMCMODEL_H
+diff --git a/source/FMCPDLReader.cpp b/source/FMCPDLReader.cpp
+index f8eb076..a7970a4 100644
+--- a/source/FMCPDLReader.cpp
++++ b/source/FMCPDLReader.cpp
+@@ -116,7 +116,10 @@ CPDLReader::parseNetPDL( std::string filename )
+     // LibXML preparations
+     xmlInitParser();
+     // init line numbers - critical for Linux
++    // (no-op and deprecated in libxml2 2.12+, where line numbers are always on)
++#if LIBXML_VERSION < 21200
+     xmlLineNumbersDefault(1);
++#endif
+ 
+     LIBXML_TEST_VERSION;
+     xmlSetStructuredErrorFunc( &error, errorFuncHandler );
 diff --git a/source/fmc.h b/source/fmc.h
 index 700ce41..0657530 100644
 --- a/source/fmc.h
