@@ -1,7 +1,8 @@
-diff --color -ruN a/source/FMCCModelOutput.cpp b/source/FMCCModelOutput.cpp
---- a/source/FMCCModelOutput.cpp	2026-04-05 15:53:45.751160786 +0200
-+++ b/source/FMCCModelOutput.cpp	2026-04-05 15:53:56.267362415 +0200
-@@ -725,6 +725,7 @@
+diff --git a/source/FMCCModelOutput.cpp b/source/FMCCModelOutput.cpp
+index 2a3d257..54b6f21 100644
+--- a/source/FMCCModelOutput.cpp
++++ b/source/FMCCModelOutput.cpp
+@@ -725,6 +725,7 @@ CFMCCModelOutput::output_fmc_port( const CFMCModel& model, fmc_model_t* cmodel,
  
      EMIT4STR( port[, index, ].type =, model.all_ports[index].type );
      EMIT4( port[, index, ].number  = ,  model.all_ports[index].number );
@@ -9,7 +10,7 @@ diff --color -ruN a/source/FMCCModelOutput.cpp b/source/FMCCModelOutput.cpp
  
      EMIT4( port[, index, ].schemes_count =, model.all_ports[index].schemes.size() );
      for ( unsigned int i = 0; i < cmodel->port[index].schemes_count; ++i ) {
-@@ -952,6 +953,7 @@
+@@ -952,6 +953,7 @@ CFMCCModelOutput::output_fmc_scheme( const CFMCModel& model, fmc_model_t* cmodel
      unsigned int useHash = sch.key.empty() ? 0 : 1;
      EMIT4( scheme[, index, ].useHash =,  useHash );
      EMIT4( scheme[, index, ].baseFqid =, sch.qbase );
@@ -17,45 +18,47 @@ diff --color -ruN a/source/FMCCModelOutput.cpp b/source/FMCCModelOutput.cpp
      if (sch.bypass) {
          EMIT4( scheme[, index, ].bypassFqidGeneration =, sch.bypass );
      }
-diff --color -ruN a/source/FMCGenericError.cpp b/source/FMCGenericError.cpp
---- a/source/FMCGenericError.cpp	2026-04-05 15:53:45.751160786 +0200
-+++ b/source/FMCGenericError.cpp	2026-04-05 15:53:56.267362415 +0200
-@@ -33,7 +33,7 @@
+diff --git a/source/FMCGenericError.cpp b/source/FMCGenericError.cpp
+index 0bbd284..5ba2f2b 100644
+--- a/source/FMCGenericError.cpp
++++ b/source/FMCGenericError.cpp
+@@ -33,7 +33,11 @@
  #include "FMCUtils.h"
  #include "logger.hpp"
  
--void errorFuncHandler( void * ctx, const xmlError * error )
++#if LIBXML_VERSION >= 21200
+ void errorFuncHandler( void * ctx, const xmlError * error )
++#else
 +void errorFuncHandler( void * ctx, xmlError * error )
++#endif
  {
      char *filestr = (char*)"";
      char *msgstr  = (char*)"";
-diff --color -ruN a/source/FMCGenericError.h b/source/FMCGenericError.h
---- a/source/FMCGenericError.h	2026-04-05 15:53:45.751160786 +0200
-+++ b/source/FMCGenericError.h	2026-04-05 15:53:56.267362415 +0200
-@@ -35,7 +35,7 @@
+diff --git a/source/FMCGenericError.h b/source/FMCGenericError.h
+index 4bd05b2..ddefce1 100644
+--- a/source/FMCGenericError.h
++++ b/source/FMCGenericError.h
+@@ -32,10 +32,15 @@
+ 
+ #include <string>
+ #include <libxml/parser.h>
++#include <libxml/xmlversion.h>
  
  const int NO_LINE = -1;
  
--void errorFuncHandler( void * ctx, const xmlError * error );
++#if LIBXML_VERSION >= 21200
+ void errorFuncHandler( void * ctx, const xmlError * error );
++#else
 +void errorFuncHandler( void * ctx, xmlError * error );
++#endif
  
  
  class CGenericError {
-diff --color -ruN a/source/fmc.h b/source/fmc.h
---- a/source/fmc.h	2026-04-05 15:53:45.751160786 +0200
-+++ b/source/fmc.h	2026-04-05 15:53:56.267362415 +0200
-@@ -102,6 +102,7 @@
- typedef struct fmc_port_t {
-     e_FmPortType         type;                      ///< Port type
-     unsigned int         number;                    ///< Port number
-+    unsigned int         portid;                    ///< Port identification from xml file
-     t_FmPcdNetEnvParams  distinctionUnits;          ///< Port's network env
-     t_FmPortPcdParams    pcdParam;
-     t_FmPortPcdPrsParams prsParam;
-diff --color -ruN a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
---- a/source/FMCPCDModel.cpp	2026-04-05 15:53:45.751160786 +0200
-+++ b/source/FMCPCDModel.cpp	2026-04-05 15:53:56.267362415 +0200
-@@ -133,12 +133,131 @@
+diff --git a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
+index d785eee..7a25f91 100755
+--- a/source/FMCPCDModel.cpp
++++ b/source/FMCPCDModel.cpp
+@@ -133,12 +133,131 @@ CFMCModel::CFMCModel()
  }
  
  
@@ -187,7 +190,7 @@ diff --color -ruN a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
      assert( pTaskDef );
  
      // For all engines
-@@ -192,6 +311,23 @@
+@@ -192,6 +311,23 @@ CFMCModel::createModel( CTaskDef* pTaskDef )
  
                  Scheme& scheme = all_schemes[index];
                  scheme.scheme_index_per_port = scheme_index;
@@ -211,7 +214,7 @@ diff --color -ruN a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
  
                  // Add scheme's protocols to the port's protocol list
                  std::set< Protocol >::iterator protoIt;
-@@ -1011,6 +1147,7 @@
+@@ -1011,6 +1147,7 @@ CFMCModel::createScheme( const CTaskDef* pTaskDef, Port& port, const CDistributi
      // Add next engine entry
      scheme.nextEngine        = getEngineByType( xmlDist.action );
      scheme.nextEngineStr     = getEngineByTypeStr( xmlDist.action );
@@ -219,7 +222,7 @@ diff --color -ruN a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
      scheme.doneAction        = e_FM_PCD_ENQ_FRAME;
      scheme.doneActionStr     = "e_FM_PCD_ENQ_FRAME";
      scheme.actionHandleIndex = 0xFFFFFFFF;
-@@ -2920,7 +3057,7 @@
+@@ -2920,7 +3057,7 @@ CFMCModel::getNetCommFieldType( std::string fieldname )
      fields["pppoe.code"]          = NET_HEADER_FIELD_PPPoE_CODE;
      fields["pppoe.session_ID"]    = NET_HEADER_FIELD_PPPoE_SID;
      fields["pppoe.hlen"]          = NET_HEADER_FIELD_PPPoE_LEN;
@@ -228,7 +231,7 @@ diff --color -ruN a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
      fields["minencap.dst"]        = NET_HEADER_FIELD_MINENCAP_DST_IP;
      fields["sctp.sport"]          = NET_HEADER_FIELD_SCTP_PORT_SRC;
      fields["sctp.dport"]          = NET_HEADER_FIELD_SCTP_PORT_DST;
-@@ -3007,7 +3144,7 @@
+@@ -3007,7 +3144,7 @@ CFMCModel::getNetCommFieldTypeStr( std::string fieldname )
      fields["pppoe.code"]          = "NET_HEADER_FIELD_PPPoE_CODE";
      fields["pppoe.session_ID"]    = "NET_HEADER_FIELD_PPPoE_SID";
      fields["pppoe.hlen"]          = "NET_HEADER_FIELD_PPPoE_LEN";
@@ -237,10 +240,11 @@ diff --color -ruN a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
      fields["minencap.dst"]        = "NET_HEADER_FIELD_MINENCAP_DST_IP";
      fields["sctp.sport"]          = "NET_HEADER_FIELD_SCTP_PORT_SRC";
      fields["sctp.dport"]          = "NET_HEADER_FIELD_SCTP_PORT_DST";
-diff --color -ruN a/source/FMCPCDModel.h b/source/FMCPCDModel.h
---- a/source/FMCPCDModel.h	2026-04-05 15:53:45.751160786 +0200
-+++ b/source/FMCPCDModel.h	2026-04-05 15:53:56.267362415 +0200
-@@ -192,6 +192,7 @@
+diff --git a/source/FMCPCDModel.h b/source/FMCPCDModel.h
+index 696eb79..2789d52 100755
+--- a/source/FMCPCDModel.h
++++ b/source/FMCPCDModel.h
+@@ -192,6 +192,7 @@ public:
  
      e_FmPcdEngine     nextEngine;
      std::string       nextEngineStr;
@@ -248,7 +252,7 @@ diff --color -ruN a/source/FMCPCDModel.h b/source/FMCPCDModel.h
      e_FmPcdDoneAction doneAction;
      std::string       doneActionStr;
      unsigned int      actionHandleIndex;
-@@ -604,6 +605,8 @@
+@@ -604,6 +605,8 @@ private:
  #endif /* (DPAA_VERSION >= 11) */
      unsigned int get_policer_index( const CTaskDef* pTaskDef, std::string name,
                                      std::string from, Port& port );
@@ -257,3 +261,15 @@ diff --color -ruN a/source/FMCPCDModel.h b/source/FMCPCDModel.h
  };
  
  #endif // FMCMODEL_H
+diff --git a/source/fmc.h b/source/fmc.h
+index 700ce41..0657530 100644
+--- a/source/fmc.h
++++ b/source/fmc.h
+@@ -102,6 +102,7 @@ typedef struct fmc_fman_t {
+ typedef struct fmc_port_t {
+     e_FmPortType         type;                      ///< Port type
+     unsigned int         number;                    ///< Port number
++    unsigned int         portid;                    ///< Port identification from xml file
+     t_FmPcdNetEnvParams  distinctionUnits;          ///< Port's network env
+     t_FmPortPcdParams    pcdParam;
+     t_FmPortPcdPrsParams prsParam;
