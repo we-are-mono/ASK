@@ -497,13 +497,20 @@ static int PPPoE_Get_Session_Snapshot(int pppoe_hash_index , int pppoe_tot_entri
 
 		if (!pPPPoEEntry->relay)
 		{
-			strcpy((char *)pPPPoESnapshot->phy_intf, get_onif_name(pPPPoEEntry->itf.phys->index));
-			strcpy((char *)pPPPoESnapshot->log_intf, get_onif_name(pPPPoEEntry->itf.index));
+			strscpy((char *)pPPPoESnapshot->phy_intf,
+					get_onif_name(pPPPoEEntry->itf.phys->index),
+					sizeof(pPPPoESnapshot->phy_intf));
+			strscpy((char *)pPPPoESnapshot->log_intf,
+					get_onif_name(pPPPoEEntry->itf.index),
+					sizeof(pPPPoESnapshot->log_intf));
 		}
 		else
 		{
-			strcpy((char *)pPPPoESnapshot->phy_intf, get_onif_name(pPPPoEEntry->itf.phys->index));
-			strcpy((char *)pPPPoESnapshot->log_intf, "relay");
+			strscpy((char *)pPPPoESnapshot->phy_intf,
+					get_onif_name(pPPPoEEntry->itf.phys->index),
+					sizeof(pPPPoESnapshot->phy_intf));
+			strscpy((char *)pPPPoESnapshot->log_intf, "relay",
+					sizeof(pPPPoESnapshot->log_intf));
 		}
 
 		pPPPoESnapshot++;

@@ -11,9 +11,10 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/random.h>
+#include <linux/siphash.h>
 #include "cdx.h"
 #include "control_bridge.h"
-#include "jenk_hash.h"
 #include "misc.h"
 #include "cdx_ioctl.h"
 #include "cdx_common.h"
@@ -23,6 +24,12 @@
 
 /* l2 flow hash table */
 struct flow_bucket l2flow_hash_table[NUM_BT_ENTRIES];
+
+/* Per-boot random key for the l2flow hash. SipHash + this key
+ * prevents an attacker who can choose flow keys (MACs, VLAN tags,
+ * ethertype, session_id) from crafting colliding inputs to chain
+ * a single bucket and DoS lookups. */
+static hsiphash_key_t l2flow_hashkey __read_mostly;
 
 /* flow timer infrastructure */
 U32 L2Bridge_timeout;
@@ -327,8 +334,7 @@ static int M_bridge_handle_l2flow(U16 *p, U16 Length)
 #endif
 
 	//compute hash and check if this flow exists
-	hash = compute_jenkins_hash((uint8_t *)&l2flow, 
-			sizeof(struct L2Flow), 0);
+	hash = hsiphash(&l2flow, sizeof(struct L2Flow), &l2flow_hashkey);
 	hash &= NUM_BT_ENTRIES - 1;
 	l2flow_entry = l2flow_find_entry(hash, &l2flow);
 skip_fill:
@@ -359,8 +365,10 @@ skip_fill:
 				ackstatus = ERR_UNKNOWN_INTERFACE;
 				goto func_ret;
 			}
-			strcpy(&l2flow_entry->out_ifname[0], pcmd->output_name);
-			strcpy(&l2flow_entry->in_ifname[0], pcmd->input_name);
+			strscpy(l2flow_entry->out_ifname, pcmd->output_name,
+					sizeof(l2flow_entry->out_ifname));
+			strscpy(l2flow_entry->in_ifname, pcmd->input_name,
+					sizeof(l2flow_entry->in_ifname));
 			memcpy(&l2flow_entry->l2flow, &l2flow, sizeof(struct L2Flow));
 			l2flow_entry->last_l2flow_timer = ct_timer;
 			//TODO: add mark / qos code back in
@@ -554,6 +562,7 @@ int bridge_init(void)
 	int i;
 	set_cmd_handler(EVENT_BRIDGE, M_bridge_cmdproc);
 	L2Bridge_timeout = L2_BRIDGE_DEFAULT_TIMEOUT * HZ;
+	get_random_bytes(&l2flow_hashkey, sizeof(l2flow_hashkey));
 	for (i = 0; i < NUM_BT_ENTRIES; i++)
 		INIT_HLIST_HEAD(&l2flow_hash_table[i].flowlist);
 	return 0;

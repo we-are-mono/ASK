@@ -60,8 +60,10 @@ static void rx_Get_Hash_Snapshot_L2FlowEntries(U32 hash, PL2BridgeL2FlowEntryCom
 		pL2FlowSnapshot->vlan_flags = entry->l2flow.vlan_flags;
 #endif
 		pL2FlowSnapshot->session_id = entry->l2flow.session_id;
-		strcpy(pL2FlowSnapshot->input_name, entry->in_ifname);
-		strcpy(pL2FlowSnapshot->output_name, entry->out_ifname);
+		strscpy(pL2FlowSnapshot->input_name, entry->in_ifname,
+				sizeof(pL2FlowSnapshot->input_name));
+		strscpy(pL2FlowSnapshot->output_name, entry->out_ifname,
+				sizeof(pL2FlowSnapshot->output_name));
 		pL2FlowSnapshot->timeout = br_get_time_remaining(entry)/HZ;
 		pL2FlowSnapshot++;
 	}

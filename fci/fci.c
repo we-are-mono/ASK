@@ -558,7 +558,7 @@ static int fci_module_init(void)
 	}
 
 	/* Create /proc/fci entry */
-	proc_create("fci", 0, NULL, &fci_proc_fops);
+	proc_create("fci", 0444, NULL, &fci_proc_fops);
 
 	return 0;
 }

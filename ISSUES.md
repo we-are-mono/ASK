@@ -157,24 +157,29 @@ Memory corruption or info-leak reachable from userspace (unprivileged once G1 is
 
 ## LOW / Hardening
 
-- [ ] **L1. Jenkins hash used where collision DoS matters.**
+- [x] **L1. Jenkins hash used where collision DoS matters.**
   [cdx/jenk_hash.h](cdx/jenk_hash.h). Lookup2 is non-cryptographic; if an attacker controls any of the 5-tuple feeding the EHASH, they can craft colliding keys and chain a single bucket → CPU DoS in lookups. **Fix:** switch to `siphash_*_to_u32()` (in `<linux/siphash.h>`) with a random per-module key.
+  _Scope check first:_ `compute_jenkins_hash` turned out to be called in exactly one place — `cdx/control_bridge.c:330` — indexing the kernel's internal `l2flow_hash_table[]`. That's a software-only lookup; the FMAN EHASH microcode contract was not involved. So normal C fix. _Done:_ added `static hsiphash_key_t l2flow_hashkey __read_mostly;` at file scope, initialized once in `bridge_init` via `get_random_bytes`, and replaced the hash call with `hsiphash(&l2flow, sizeof(struct L2Flow), &l2flow_hashkey)`. `cdx/jenk_hash.h` deleted (no other users). An attacker choosing source/dest MACs, VLAN tags, ethertype, or session_id can no longer precompute colliders because the key is boot-random and SipHash is algorithmically collision-resistant._
 
-- [ ] **L2. `strcpy` into equal-sized `IF_NAME_SIZE` buffers.**
+- [x] **L2. `strcpy` into equal-sized `IF_NAME_SIZE` buffers.**
   [cdx/control_bridge.c:362-363](cdx/control_bridge.c#L362-L363), [cdx/control_vlan.c:295-296](cdx/control_vlan.c#L295-L296), [cdx/control_pppoe.c:500-506](cdx/control_pppoe.c#L500-L506), [cdx/control_ipv4.c:1650,1659](cdx/control_ipv4.c#L1650), [cdx/control_tunnel.c:819](cdx/control_tunnel.c#L819), [cdx/dpa_cfg.c:311](cdx/dpa_cfg.c#L311). Kernel `net_device->name` is guaranteed NUL-terminated so these are mostly benign, but command-sourced names aren't guaranteed. **Fix:** `strscpy` everywhere; it's the modern canonical form.
+  _Done, broader sweep:_ all `strcpy` uses across `cdx/` converted to `strscpy(dst, src, sizeof(dst))` — the originally-flagged sites plus `cdx/control_vlan.c:436-437` (the stat query mirror), `cdx/control_bridge.c:368-369`, `cdx/query_Rx.c:63-64`, `cdx/procfs.c:123/128/133/138`, `cdx/dpa_cfg.c:337`, `cdx/dpa_wifi.c:2843`. All destinations are fixed-size array fields so `sizeof(dst)` yields the right bound (and tracks future size changes automatically)._
 
 - [x] **L3. `sprintf` into small fixed name buffers (procfs).**
   [cdx/procfs.c:224,226](cdx/procfs.c#L224). **Fix:** `snprintf(node->name, sizeof(node->name), …)`.
   _Done alongside M3._
 
-- [ ] **L4. `proc_create("fci", 0, …)`.**
+- [x] **L4. `proc_create("fci", 0, …)`.**
   [fci/fci.c:542](fci/fci.c#L542). Mode `0` is fragile — should be explicit `S_IRUSR` or similar. Not a security hole (proc default is root-only), but code hygiene.
+  _Done: mode `0` → `0444` (world-readable, no write). The file just exposes stats; readable by any user is fine._
 
-- [ ] **L5. Unimplemented ioctl stub declarations.**
+- [x] **L5. Unimplemented ioctl stub declarations.**
   [cdx/cdx_ioctl.h:317-321](cdx/cdx_ioctl.h#L317-L321). `cdx_ioc_create_mc_group`, `cdx_ioc_add_member_to_group`, `cdx_ioc_add_mcast_table_entry` declared without implementations. Not wired into current dispatcher. **Fix:** remove the prototypes to eliminate the land mine.
+  _Done, broader cleanup:_ removed the three stub prototypes plus the entire supporting cast that was equally dead: `struct QoSConfig_Info` + `CDX_CTRL_DPA_QOS_CONFIG_ADD`, `struct add_mc_group_info` + `CDX_CTRL_DPA_ADD_MCAST_GROUP`, `struct dpa_member_to_mcast_group` + `CDX_CTRL_DPA_ADD_MCAST_MEMBER`, `struct add_mc_entry_info` + `CDX_CTRL_DPA_ADD_MCAST_TABLE_ENTRY`. All were defined only in `cdx_ioctl.h` and referenced nowhere else — same pattern as C9b, no userspace users, no kernel dispatch, pure dead ABI surface. Also note: the removed QOS macro was colliding with (the also-now-removed) `CDX_CTRL_DPA_CONNADD` on command number 3._
 
-- [ ] **L6. Inconsistent endian conversion in reassembly release.**
+- [x] **L6. Inconsistent endian conversion in reassembly release.**
   [cdx/cdx_reassm.c:150-172](cdx/cdx_reassm.c#L150-L172). `buf.hi = list->addr_hi;` is not converted while `buf.lo = cpu_to_be32(list->addr_lo);` is. Either both should be converted or neither — the asymmetry is a bug-in-waiting. **Fix:** pick a canonical byte order for `struct bm_buffer` in this path and be consistent; add a comment stating the convention.
+  _Not actually a bug, fix is cosmetic:_ `struct ip_reassembly_frag_list.addr_hi` is a `uint8_t` (single byte, no endian applicable), and `struct bm_buffer.hi` is `u16` in host order. `buf.hi = list->addr_hi` zero-extends u8 → u16 correctly on LE ARM64. The apparent asymmetry is field-type mismatch, not endian inconsistency. However the `cpu_to_be32`/`cpu_to_be16` calls on reads from an FMAN-populated (BE) struct are semantically misnamed — they're byte-swaps to decode BE into host order, so should be `be32_to_cpu`/`be16_to_cpu`. On LE those are the same bytes; the rename documents intent and will behave correctly if anyone ever cross-compiles this for a BE target. Applied the rename in both the debug print and the release path, with a comment noting the source is BE from microcode._
 
 ---
 

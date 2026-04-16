@@ -334,7 +334,7 @@ static int get_port_info(struct cdx_fman_info *finfo)
 						__func__, port_info->name);
 				return -EIO;
 			} else {
-				strcpy(port_info->name, dev->name);
+				strscpy(port_info->name, dev->name, sizeof(port_info->name));
 			}
 		}
 #ifdef DPA_CFG_DEBUG

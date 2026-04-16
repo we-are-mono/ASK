@@ -208,77 +208,7 @@ struct muram_data {
         _IOWR(CDX_IOC_MAGIC, 4, struct muram_data)
 #endif
 
-struct QoSConfig_Info
-{
-  char If_info[12];
-  unsigned int uiCIR;
-  unsigned int uiEIR;
-  unsigned int uiCBS;
-  unsigned int uiEBS;
-  short int uiNoOfSchedulers;
-  short int uiNoOfQueues;
-  int sp; /*Strict priority algorithm*/
-} ; 
-
-#define CDX_CTRL_DPA_QOS_CONFIG_ADD\
-        _IOWR(CDX_IOC_MAGIC, 3, struct QoSConfig_Info)
-struct add_mc_group_info
-{
-   union
-   {
-     struct
-     {
-       uint32_t ipv4_saddr;	//ipv4 source addr
-       uint32_t ipv4_daddr;	//ipv4 dest addr
-     };
-     struct
-     {
-       uint8_t ipv6_saddr[16];	//ipv6 src addr
-       uint8_t ipv6_daddr[16];	//ipv6 dest addr
-     };
-   };
-   char ucListenerPort[32]; /* Interface name on which multicast packet need to be sent out*/
-   uint8_t uiMaxMembers; /*Max listeners for this group*/
-   uint8_t mctype; /* 0  for v4 and 1 for v6*/
-};
-
-#define CDX_CTRL_DPA_ADD_MCAST_GROUP\
-        _IOWR(CDX_IOC_MAGIC, 5, struct add_mc_group_info)
-
-struct dpa_member_to_mcast_group
-{
-  uint8_t mcast_grp;
-  char ucListenerPort[32];
-};
-
-#define CDX_CTRL_DPA_ADD_MCAST_MEMBER\
-        _IOWR(CDX_IOC_MAGIC, 6, struct add_mc_group_info)
-
-struct add_mc_entry_info
-{
-   union
-   {
-     struct
-     {
-       uint32_t ipv4_saddr;	//ipv4 source addr
-       uint32_t ipv4_daddr;	//ipv4 dest addr
-     };
-     struct
-     {
-       uint8_t ipv6_saddr[16];	//ipv6 src addr
-       uint8_t ipv6_daddr[16];	//ipv6 dest addr
-     };
-   };
-   char ucIngressPort[32];
-   uint8_t mctype; /* 0  for v4 and 1 for v6*/
-};
-#define CDX_CTRL_DPA_ADD_MCAST_TABLE_ENTRY\
-        _IOWR(CDX_IOC_MAGIC, 7, struct add_mc_entry_info)
-
 int cdx_ioc_set_dpa_params(unsigned long args);
-int cdx_ioc_create_mc_group(unsigned long args);
-int cdx_ioc_add_member_to_group(unsigned long args);
-int cdx_ioc_add_mcast_table_entry(unsigned long args);
 
 int cdx_driver_init(void);
 int cdxdrv_init_stats(void *muram_handle);

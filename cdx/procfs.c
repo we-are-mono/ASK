@@ -120,22 +120,22 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 	{
 		case TX_DIR:
 			proc_parent_dir_entry = proc_tx_dir;
-			strcpy(parent_dir, "tx");
+			strscpy(parent_dir, "tx", sizeof(parent_dir));
 			break;
 
 		case RX_DIR:
 			proc_parent_dir_entry = proc_rx_dir;
-			strcpy(parent_dir, "rx");
+			strscpy(parent_dir, "rx", sizeof(parent_dir));
 			break;
 
 		case PCD_DIR:
 			proc_parent_dir_entry = proc_pcd_dir;
-			strcpy(parent_dir, "pcd");
+			strscpy(parent_dir, "pcd", sizeof(parent_dir));
 			break;
 
 		case SA_DIR:
 			proc_parent_dir_entry = proc_sa_dir;
-			strcpy(parent_dir, "sa");
+			strscpy(parent_dir, "sa", sizeof(parent_dir));
 			break;
 
 		default:

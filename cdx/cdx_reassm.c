@@ -148,15 +148,16 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 #ifdef CDX_IPR_DEBUG
 	CDX_IPR_DPRINT("list %llx, refcount %d, entries %d\n",
 			addr, list->ref_count, num_entries);
+	/* Fields are populated by FMAN microcode in big-endian order. */
 	for (ii = 0; ii < num_entries; ii++)
-	{	
+	{
 		uint32_t bpid;
-		display_buff_data((uint8_t *)(list + ii), 
+		display_buff_data((uint8_t *)(list + ii),
 				sizeof(struct ip_reassembly_frag_list));
 		addr = (list + ii)->addr_hi;
 		addr <<= 32;
-		addr |= cpu_to_be32((list + ii)->addr_lo); 
-		bpid = cpu_to_be16((list + ii)->bpid);
+		addr |= be32_to_cpu((list + ii)->addr_lo);
+		bpid = be16_to_cpu((list + ii)->bpid);
 		CDX_IPR_DPRINT("addr %llx, bpid %d\n", addr, bpid);
 	}
 #endif
@@ -176,11 +177,14 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 		for (ii = 0; ii < num_entries; ii++) {
 			struct dpa_bp *bp;
 			struct bm_buffer buf;
-			buf.bpid = cpu_to_be16(list->bpid);
+			/* list fields are BE from FMAN; bm_buffer fields are
+			 * host-order in kernel memory. addr_hi is u8 so no
+			 * swap is needed (single-byte fields have no order). */
+			buf.bpid = be16_to_cpu(list->bpid);
 			bp = ipr_bpid2pool(buf.bpid);
 			if (bp) {
 				buf.hi = list->addr_hi;
-				buf.lo = cpu_to_be32(list->addr_lo);
+				buf.lo = be32_to_cpu(list->addr_lo);
 				//free members to pool
 #ifdef CDX_IPR_DEBUG	
 				CDX_IPR_DPRINT("releasing addr %x%08x to bpid %d "

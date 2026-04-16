@@ -2840,7 +2840,7 @@ static int dpaa_vwd_driver_init( struct dpaa_vwd_priv_s *priv )
 {
 	int rc;
 
-	strcpy(priv->name, "vwd");
+	strscpy(priv->name, "vwd", sizeof(priv->name));
 	spin_lock_init(&priv->vaplock);
 	spin_lock_init(&priv->txlock);
 	rc = dpaa_vwd_up(priv);

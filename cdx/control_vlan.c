@@ -292,8 +292,12 @@ static int Vlan_Get_Hash_Snapshot(int vlan_hash_index, int vlan_entries, PVlanCo
 	slist_for_each(pVlanEntry, entry, &vlan_cache[vlan_hash_index], list)
 	{
 		pVlanSnapshot->vlanID = ntohs(pVlanEntry->vlanID);
-		strcpy((char *)pVlanSnapshot->vlanifname, get_onif_name(pVlanEntry->itf.index));
-		strcpy((char *)pVlanSnapshot->phyifname, get_onif_name(pVlanEntry->itf.phys->index));
+		strscpy((char *)pVlanSnapshot->vlanifname,
+				get_onif_name(pVlanEntry->itf.index),
+				sizeof(pVlanSnapshot->vlanifname));
+		strscpy((char *)pVlanSnapshot->phyifname,
+				get_onif_name(pVlanEntry->itf.phys->index),
+				sizeof(pVlanSnapshot->phyifname));
 
 		pVlanSnapshot++;
 		tot_vlans++;
@@ -433,8 +437,12 @@ static U16 stat_VLAN_Get_Session_Snapshot(int stat_vlan_hash_index, int stat_vla
 	{
 		pStatVLANSnapshot->eof = 0;
 		pStatVLANSnapshot->vlanID = ntohs(pStatVlanEntry->vlanID);
-		strcpy((char *)pStatVLANSnapshot->vlanifname, get_onif_name(pStatVlanEntry->itf.index));
-		strcpy((char *)pStatVLANSnapshot->phyifname, get_onif_name(pStatVlanEntry->itf.phys->index));
+		strscpy((char *)pStatVLANSnapshot->vlanifname,
+				get_onif_name(pStatVlanEntry->itf.index),
+				sizeof(pStatVLANSnapshot->vlanifname));
+		strscpy((char *)pStatVLANSnapshot->phyifname,
+				get_onif_name(pStatVlanEntry->itf.phys->index),
+				sizeof(pStatVLANSnapshot->phyifname));
 
 		if ((ret = vlan_stats_get(pStatVlanEntry, pStatVLANSnapshot,
 						gStatVlanQueryStatus & STAT_VLAN_QUERY_RESET)) != NO_ERR)

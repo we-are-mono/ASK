@@ -1647,7 +1647,8 @@ static int IPV4_RT_Get_Hash_Snapshot(int rt_hash_index,int rt_total_entries, PRt
 
 		onif_desc = get_onif_by_index(pRtEntry->itf->index);
 		if (onif_desc)
-			strcpy((char *)pSnapshot->outputDevice, (char *)onif_desc->name);
+			strscpy((char *)pSnapshot->outputDevice, (char *)onif_desc->name,
+					sizeof(pSnapshot->outputDevice));
 		else
 			pSnapshot->outputDevice[0] = '\0';
 
@@ -1656,7 +1657,8 @@ static int IPV4_RT_Get_Hash_Snapshot(int rt_hash_index,int rt_total_entries, PRt
 		{
 			onif_desc = get_onif_by_index(pRtEntry->input_itf->index);
 			if (onif_desc)
-				strcpy((char *)pSnapshot->inputDevice, (char *)onif_desc->name);
+				strscpy((char *)pSnapshot->inputDevice, (char *)onif_desc->name,
+						sizeof(pSnapshot->inputDevice));
 		}
 
 		pSnapshot->mtu = pRtEntry->mtu;
