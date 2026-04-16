@@ -199,8 +199,58 @@ These were flagged as "critical" by the deep-dive agents but don't hold up on ve
 
 Not single issues — broader patterns worth an agenda item each.
 
-- [ ] **A1. Every external field needs a bounds check at its entry point.**
+- [~] **A1. Every external field needs a bounds check at its entry point.**
   Hardware descriptors, netlink attributes, ioctl structs, and kernel-internal state all look identical in this code. A pass that tags trust boundaries (comments, helper macros, or just discipline) would prevent a whole class of the above.
+  _Plan:_ the real attack surface isn't the cdx ioctl (only 2 commands after C9b: `SET_PARAMS`, `GET_MURAM_DATA`) — it's the FCI command bus. 14 event-level handlers (`set_cmd_handler(EVENT_*, M_*_cmdproc)` in `control_*.c` and `dpa_control_mc.c`), with ~75 per-command switch cases between them (ipv4=13, ipsec=14, stat=14, bridge=12, tunnel=8, ipv6=7, pppoe=3, mc4+mc6=2, vlan=2, plus qm/rtp_relay/rx/tx/wifi not yet counted). Each M_* handler today does its own length check and field validation inline, inconsistently. Phased migration below.
+
+- [ ] **A1a. Introduce the validator-table pattern.**
+  Add `cdx/cdx_cmd_validator.h` with a spec struct and dispatch helper:
+  ```c
+  struct cdx_cmd_spec {
+      u16          cmd_code;
+      size_t       arg_size;          // expected exact struct size
+      int        (*validate)(const void *cmd); // optional, field-level bounds
+      int        (*handle)(void *cmd, void *reply, size_t *reply_len);
+  };
+  U16 cdx_dispatch_cmd(const struct cdx_cmd_spec *table, size_t n,
+                       U16 cmd_code, U16 cmd_len, void *cmd, void *reply);
+  ```
+  The dispatcher looks up `cmd_code`, checks `cmd_len == spec->arg_size` (or a variable-length rule), runs `validate()`, then `handle()`. Handlers that used to receive `(U16 cmd_code, U16 cmd_len, U16 *pcmd)` and do their own checks instead take a pre-trusted typed struct. Ship the header + helper + unit-testable example before touching any subsystem. **Scope:** ~150 LOC new, no existing file touched. **Deliverable:** compiled header + helper in its own .c file.
+
+- [ ] **A1b. Prototype on `control_vlan.c` (smallest surface).**
+  Convert `M_vlan_cmdproc` to a `cdx_cmd_spec[]` table covering the 2 command codes (`CMD_VLAN_ENTRY`, `CMD_VLAN_QUERY`). Move the length/action-enum/string checks that used to live inside `Vlan_handle_entry` into the `validate()` callbacks. Keep the existing handler bodies intact but re-sign them to take the typed struct. **Scope:** ~80 LOC changed in one file. **Deliverable:** this subsystem's attack surface fully gated by the validator table; net reduction in inline length checks.
+
+- [ ] **A1c. Migrate the rest, ordered by risk + simplicity.**
+  Each subsystem is self-contained work following the A1b template:
+  - **A1c-1.** `control_mc.c` (MC4+MC6, ~2 codes each) — smallest, already hardened in M1 so low regression risk.
+  - **A1c-2.** `control_pppoe.c` (3 codes) — simple, already sanitized in L2/H9.
+  - **A1c-3.** `control_ipv6.c` (7 codes) — mirrors ipv4 but smaller, do it first to shake out the pattern on CT snapshot handling.
+  - **A1c-4.** `control_ipv4.c` (13 codes) — the bulk of conntrack path; highest payoff for bounds checking.
+  - **A1c-5.** `control_tunnel.c` (8 codes).
+  - **A1c-6.** `control_bridge.c` (12 codes) — L2 flow table, already touched for L1.
+  - **A1c-7.** `control_ipsec.c` (14 codes) — biggest single file; key-material-adjacent so extra care on the validate() side.
+  - **A1c-8.** `control_stat.c` (14 codes) — mostly read-only query paths; straightforward.
+  - **A1c-9.** `control_rtp_relay.c`, `control_qm.c`, `control_rx.c`, `control_tx.c`, `control_wifi.c` — count TBD, tack on last.
+
+  Per subsystem: ~80-150 LOC changed, one compile-and-test cycle. Total across all 9 steps: ~1000-1200 LOC, spread over ~15 files.
+
+- [ ] **A1d. Pull the cdx ioctl dispatcher onto the same table.**
+  `cdx/cdx_dev.c` has only 2 commands, but once A1a exists the switch-to-table conversion is trivial and gets the ioctl surface on the same validator idiom as FCI. **Scope:** ~30 LOC changed in one file.
+
+- [ ] **A1e. Drop the per-subsystem cmd_proc inner switches.**
+  After A1b-c-d, every `M_*_cmdproc` is just `return cdx_dispatch_cmd(foo_table, ARRAY_SIZE(foo_table), …)`. Delete the old switch bodies. **Scope:** one cleanup commit per subsystem (~20-40 LOC removed each).
+
+  ### Total effort
+  Rough budget: 2-3 focused days for A1a+A1b+A1c1-4 (the security-meaningful subset), another 1-2 days for the full sweep. Final diff: ~1500 lines across ~20 files, most of it code *removed* (inline length checks, duplicated switch scaffolding). Net LOC likely a small decrease.
+
+  ### Cheap-fallback option
+  If the full refactor isn't worth the cycles: stop after A1a+A1b plus A1c-4 (ipv4) and A1c-7 (ipsec). Those two files carry most of the security risk; the other subsystems either have smaller surface or were tightened in earlier issues. Delivers ~80% of the defense at ~25% of the effort.
+
+  ### Risks
+  - **Signature churn:** every handler's parameter types change. Migration must preserve exact semantics per command — test each subsystem in isolation.
+  - **Variable-length commands:** some FCI commands carry a trailing array (e.g. conntrack with N SA handles). The `arg_size` field needs to become `{min_len, fixed_part, per_element, max_n}` or the validate() callback needs to handle it. Prototype this on `control_ipv4.c`'s `ct_entry` command which already enforces `SA_nr <= SA_MAX_OP`.
+  - **Reply-path types:** some handlers produce variable-length replies. The dispatcher needs to know the reply buffer size and let the handler report how much it wrote (`size_t *reply_len` in the spec).
+  - **ABI:** validator-table is an internal-only structure; no ABI change to userspace.
 
 - [x] **A2. Concurrency is assumed, not enforced.**
   Globals in `dpa_cfg.c`, static cursors in every `control_*.c` snapshot path, lock-drop iteration in `auto_bridge.c`. Needs a concurrency model spelled out per subsystem (which lock protects which data, which contexts run each function).
