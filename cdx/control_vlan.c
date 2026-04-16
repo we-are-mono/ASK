@@ -8,6 +8,7 @@
  *
  */
 
+#include <linux/mutex.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "control_vlan.h"
@@ -16,7 +17,12 @@
 
 
 extern spinlock_t dpa_devlist_lock;
-U8 gStatVlanQueryStatus; 
+U8 gStatVlanQueryStatus;
+
+/* Serializes the static pagination cursors in both Vlan_Get_Next_*
+ * functions. Two concurrent queries otherwise corrupt each other's
+ * hash_index / snapshot_index / snapshot buffer pointers. */
+static DEFINE_MUTEX(vlan_query_mutex);
 
 static PVlanEntry vlan_alloc(void)
 {
@@ -316,8 +322,11 @@ int Vlan_Get_Next_Hash_Entry(PVlanCommand pVlanCmd, int reset_action)
 {
 	int total_vlan_entries;
 	PVlanCommand pVlan;
+	int retval;
 	static PVlanCommand pVlanSnapshot = NULL;
 	static int vlan_hash_index = 0, vlan_snapshot_entries =0, vlan_snapshot_index=0, vlan_snapshot_buf_entries = 0;
+
+	mutex_lock(&vlan_query_mutex);
 
 	if(reset_action)
 	{
@@ -354,7 +363,8 @@ int Vlan_Get_Next_Hash_Entry(PVlanCommand pVlanCmd, int reset_action)
 				{
 					vlan_hash_index = 0;
 					vlan_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;	
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				vlan_snapshot_buf_entries = total_vlan_entries;
 			}
@@ -373,7 +383,8 @@ int Vlan_Get_Next_Hash_Entry(PVlanCommand pVlanCmd, int reset_action)
 				pVlanSnapshot = NULL;
 			}
 			vlan_snapshot_buf_entries = 0;
-			return ERR_VLAN_ENTRY_NOT_FOUND;
+			retval = ERR_VLAN_ENTRY_NOT_FOUND;
+			goto out;
 		}
 	}
 
@@ -386,7 +397,10 @@ int Vlan_Get_Next_Hash_Entry(PVlanCommand pVlanCmd, int reset_action)
 		vlan_hash_index++;
 	}
 
-	return NO_ERR;
+	retval = NO_ERR;
+out:
+	mutex_unlock(&vlan_query_mutex);
+	return retval;
 }
 
 static U16 vlan_stats_get(PVlanEntry pEntry, PStatVlanEntryResponse snapshot, U32 do_reset)
@@ -470,6 +484,8 @@ U16 stat_VLAN_Get_Next_SessionEntry(PStatVlanEntryResponse pStatVlanCmd, int res
 	static int stat_vlan_hash_index = 0, stat_vlan_snapshot_entries =0, stat_vlan_snapshot_index=0, stat_vlan_snapshot_buf_entries = 0;
 	U16 ret = 0;
 
+	mutex_lock(&vlan_query_mutex);
+
 	if(reset_action)
 	{
 		stat_vlan_hash_index = 0;
@@ -481,7 +497,8 @@ U16 stat_VLAN_Get_Next_SessionEntry(PStatVlanEntryResponse pStatVlanCmd, int res
 			pStatVLANSnapshot = NULL;
 		}
 		stat_vlan_snapshot_buf_entries = 0;
-		return NO_ERR;
+		ret = NO_ERR;
+		goto out;
 	}
 
 	if (stat_vlan_snapshot_index == 0)
@@ -506,7 +523,8 @@ U16 stat_VLAN_Get_Next_SessionEntry(PStatVlanEntryResponse pStatVlanCmd, int res
 				{
 					stat_vlan_hash_index = 0;
 					stat_vlan_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;	
+					ret = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				stat_vlan_snapshot_buf_entries = stat_total_vlan_entries;
 			}
@@ -515,9 +533,9 @@ U16 stat_VLAN_Get_Next_SessionEntry(PStatVlanEntryResponse pStatVlanCmd, int res
 			if ((ret = stat_VLAN_Get_Session_Snapshot(stat_vlan_hash_index, stat_total_vlan_entries,
 							pStatVLANSnapshot, &stat_vlan_snapshot_entries)) != NO_ERR)
 			{
-				return ret;
+				goto out;
 			}
-			break;		
+			break;
 		}
 
 		if (stat_vlan_hash_index >= NUM_VLAN_ENTRIES)
@@ -529,7 +547,8 @@ U16 stat_VLAN_Get_Next_SessionEntry(PStatVlanEntryResponse pStatVlanCmd, int res
 				pStatVLANSnapshot = NULL;
 			}
 			stat_vlan_snapshot_buf_entries = 0;
-			return ERR_VLAN_ENTRY_NOT_FOUND;
+			ret = ERR_VLAN_ENTRY_NOT_FOUND;
+			goto out;
 		}
 	}
 
@@ -542,5 +561,8 @@ U16 stat_VLAN_Get_Next_SessionEntry(PStatVlanEntryResponse pStatVlanCmd, int res
 		stat_vlan_hash_index++;
 	}
 
-	return NO_ERR;
+	ret = NO_ERR;
+out:
+	mutex_unlock(&vlan_query_mutex);
+	return ret;
 }

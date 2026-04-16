@@ -9,6 +9,7 @@
  */
 
 
+#include <linux/mutex.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "control_ipv4.h"
@@ -18,6 +19,10 @@
 #include "control_stat.h"
 
 extern spinlock_t dpa_devlist_lock;
+
+/* Serializes the static pagination cursors in both Tnl_Get_Next_*
+ * functions. */
+static DEFINE_MUTEX(tnl_query_mutex);
 
 U8 gStatTunnelQueryStatus;
 
@@ -711,8 +716,11 @@ U16 Tnl_Get_Next_Hash_Entry(PTNLCommand_query pTnlCmd, int reset_action)
 {
 	int total_tnl_entries;
 	PTNLCommand_query pTnl;
+	U16 retval;
 	static PTNLCommand_query pTnlSnapshot = NULL;
 	static int tnl_hash_index = 0, tnl_snapshot_entries = 0, tnl_snapshot_index = 0;
+
+	mutex_lock(&tnl_query_mutex);
 
 	if(reset_action)
 	{
@@ -739,8 +747,10 @@ U16 Tnl_Get_Next_Hash_Entry(PTNLCommand_query pTnlCmd, int reset_action)
 			if (pTnlSnapshot)
 				Heap_Free(pTnlSnapshot);
 			pTnlSnapshot = Heap_Alloc(total_tnl_entries * sizeof(TNLCommand_query));
-			if (!pTnlSnapshot)
-				return ERR_NOT_ENOUGH_MEMORY;
+			if (!pTnlSnapshot) {
+				retval = ERR_NOT_ENOUGH_MEMORY;
+				goto out;
+			}
 			tnl_snapshot_entries = Tnl_Get_Hash_Snapshot(tnl_hash_index, total_tnl_entries, pTnlSnapshot);
 			break;
 		}
@@ -752,7 +762,8 @@ U16 Tnl_Get_Next_Hash_Entry(PTNLCommand_query pTnlCmd, int reset_action)
 				Heap_Free(pTnlSnapshot);
 				pTnlSnapshot = NULL;
 			}
-			return ERR_TNL_ENTRY_NOT_FOUND;
+			retval = ERR_TNL_ENTRY_NOT_FOUND;
+			goto out;
 		}
 	}
 
@@ -764,7 +775,10 @@ U16 Tnl_Get_Next_Hash_Entry(PTNLCommand_query pTnlCmd, int reset_action)
 		tnl_hash_index ++;
 	}
 
-	return NO_ERR;
+	retval = NO_ERR;
+out:
+	mutex_unlock(&tnl_query_mutex);
+	return retval;
 }
 
 static U16 tunnel_stats_get(PTnlEntry pEntry, PStatTunnelEntryResponse snapshot, U32 do_reset)
@@ -847,6 +861,8 @@ U16 stat_tunnel_Get_Next_SessionEntry(PStatTunnelEntryResponse pResponse, int re
 	static char stat_tunnel_name[IF_NAME_SIZE];
 	U16 ret = 0;
 
+	mutex_lock(&tnl_query_mutex);
+
 	if(reset_action)
 	{
 		stat_tunnel_hash_index = 0;
@@ -858,7 +874,8 @@ U16 stat_tunnel_Get_Next_SessionEntry(PStatTunnelEntryResponse pResponse, int re
 			pStatTunnelSnapshot = NULL;
 		}
 		memcpy(stat_tunnel_name, pCommand->ifname, IF_NAME_SIZE - 1);
-		return NO_ERR;
+		ret = NO_ERR;
+		goto out;
 	}
 
 top:
@@ -879,14 +896,15 @@ top:
 			if (!pStatTunnelSnapshot)
 			{
 				stat_tunnel_hash_index = 0;
-				return ERR_NOT_ENOUGH_MEMORY;
+				ret = ERR_NOT_ENOUGH_MEMORY;
+				goto out;
 			}
 
 			if ((ret = stat_tunnel_Get_Session_Snapshot(stat_tunnel_hash_index,
 							stat_total_tunnel_entries,pStatTunnelSnapshot,
 							&stat_tunnel_snapshot_entries)) != NO_ERR)
 			{
-				return ret;
+				goto out;
 			}
 			break;
 		}
@@ -899,7 +917,8 @@ top:
 				Heap_Free(pStatTunnelSnapshot);
 				pStatTunnelSnapshot = NULL;
 			}
-			return ERR_TNL_ENTRY_NOT_FOUND;
+			ret = ERR_TNL_ENTRY_NOT_FOUND;
+			goto out;
 		}
 	}
 
@@ -922,6 +941,9 @@ top:
 		stat_tunnel_snapshot_index = 0;
 	}
 
-	return NO_ERR;
+	ret = NO_ERR;
+out:
+	mutex_unlock(&tnl_query_mutex);
+	return ret;
 }
 

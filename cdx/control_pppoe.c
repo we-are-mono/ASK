@@ -9,6 +9,7 @@
  */
 
 
+#include <linux/mutex.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "control_pppoe.h"
@@ -17,7 +18,11 @@
 
 extern spinlock_t dpa_devlist_lock;
 
-U8 gStatPPPoEQueryStatus; 
+U8 gStatPPPoEQueryStatus;
+
+/* Serializes the PPPoE query cursor state in both
+ * PPPoE_Get_Next_SessionEntry and stat_PPPoE_Get_Next_SessionEntry. */
+static DEFINE_MUTEX(pppoe_query_mutex);
 
 int PPPoE_Get_Next_SessionEntry(pPPPoECommand pSessionCmd, int reset_action);
 
@@ -530,8 +535,11 @@ int PPPoE_Get_Next_SessionEntry(pPPPoECommand pSessionCmd, int reset_action)
 {
 	int pppoe_hash_entries;
 	pPPPoECommand pSession;
+	int retval;
 	static pPPPoECommand pPPPoESnapshot = NULL;
 	static int pppoe_session_hash_index =0, pppoe_snapshot_entries = 0, pppoe_snapshot_index = 0, pppoe_snapshot_buf_entries = 0;
+
+	mutex_lock(&pppoe_query_mutex);
 
 	if(reset_action)
 	{
@@ -568,7 +576,8 @@ int PPPoE_Get_Next_SessionEntry(pPPPoECommand pSessionCmd, int reset_action)
 				{
 					pppoe_session_hash_index =0;
 					pppoe_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				pppoe_snapshot_buf_entries = pppoe_hash_entries;
 			}
@@ -582,10 +591,11 @@ int PPPoE_Get_Next_SessionEntry(pPPPoECommand pSessionCmd, int reset_action)
 			if(pPPPoESnapshot)
 			{
 				Heap_Free(pPPPoESnapshot);
-				pPPPoESnapshot = NULL;	
+				pPPPoESnapshot = NULL;
 			}
 			pppoe_snapshot_buf_entries = 0;
-			return ERR_PPPOE_ENTRY_NOT_FOUND;
+			retval = ERR_PPPOE_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -600,7 +610,10 @@ int PPPoE_Get_Next_SessionEntry(pPPPoECommand pSessionCmd, int reset_action)
 
 	}
 
-	return NO_ERR;
+	retval = NO_ERR;
+out:
+	mutex_unlock(&pppoe_query_mutex);
+	return retval;
 }
 
 static U16 pppoe_stats_get(pPPPoE_Info pEntry, PStatPPPoEEntryResponse snapshot, U8 do_reset)
@@ -679,6 +692,8 @@ U16 stat_PPPoE_Get_Next_SessionEntry(PStatPPPoEEntryResponse pStatSessionCmd, in
 	static int stat_pppoe_session_hash_index=0, stat_pppoe_snapshot_entries = 0, stat_pppoe_snapshot_index = 0, stat_pppoe_snapshot_buf_entries = 0;
 	U16 ret = 0;
 
+	mutex_lock(&pppoe_query_mutex);
+
 	if(reset_action)
 	{
 		stat_pppoe_session_hash_index = 0;
@@ -690,7 +705,8 @@ U16 stat_PPPoE_Get_Next_SessionEntry(PStatPPPoEEntryResponse pStatSessionCmd, in
 			pStatPPPoESnapshot = NULL;
 		}
 		stat_pppoe_snapshot_buf_entries = 0;
-		return NO_ERR;
+		ret = NO_ERR;
+		goto out;
 	}
 
 	if (stat_pppoe_snapshot_index == 0)
@@ -707,13 +723,14 @@ U16 stat_PPPoE_Get_Next_SessionEntry(PStatPPPoEEntryResponse pStatSessionCmd, in
 			if(stat_pppoe_hash_entries > stat_pppoe_snapshot_buf_entries)
 			{
 				if(pStatPPPoESnapshot)
-					Heap_Free(pStatPPPoESnapshot);	
+					Heap_Free(pStatPPPoESnapshot);
 				pStatPPPoESnapshot = Heap_Alloc(stat_pppoe_hash_entries * sizeof(StatPPPoEEntryResponse));
 				if (!pStatPPPoESnapshot)
 				{
 					stat_pppoe_session_hash_index = 0;
 					stat_pppoe_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					ret = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				stat_pppoe_snapshot_buf_entries = stat_pppoe_hash_entries;
 			}
@@ -721,7 +738,7 @@ U16 stat_PPPoE_Get_Next_SessionEntry(PStatPPPoEEntryResponse pStatSessionCmd, in
 							stat_pppoe_hash_entries, pStatPPPoESnapshot,
 							&stat_pppoe_snapshot_entries)) != NO_ERR)
 			{
-				return ret;
+				goto out;
 			}
 			break;
 		}
@@ -734,7 +751,8 @@ U16 stat_PPPoE_Get_Next_SessionEntry(PStatPPPoEEntryResponse pStatSessionCmd, in
 				pStatPPPoESnapshot = NULL;
 			}
 			stat_pppoe_snapshot_buf_entries = 0;
-			return ERR_PPPOE_ENTRY_NOT_FOUND;
+			ret = ERR_PPPOE_ENTRY_NOT_FOUND;
+			goto out;
 		}
 	}
 
@@ -747,6 +765,9 @@ U16 stat_PPPoE_Get_Next_SessionEntry(PStatPPPoEEntryResponse pStatSessionCmd, in
 		stat_pppoe_session_hash_index++;
 	}
 
-	return NO_ERR;
+	ret = NO_ERR;
+out:
+	mutex_unlock(&pppoe_query_mutex);
+	return ret;
 }
 

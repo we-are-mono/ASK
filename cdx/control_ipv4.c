@@ -8,6 +8,7 @@
  *
  */
 
+#include <linux/mutex.h>
 #include "cdx.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
@@ -17,6 +18,9 @@
 #include "fm_ehash.h"
 
 #define hw_ct_set_active(ct, val)
+
+/* Serializes the IPv4 CT + route query cursor state. */
+static DEFINE_MUTEX(ipv4_query_mutex);
 
 int IPv4_Get_Next_Hash_CTEntry(PCtExCommand pCtCmd, int reset_action);
 int IPV4_Get_Next_Hash_RtEntry(PRtCommand pRtCmd, int reset_action);
@@ -1539,9 +1543,12 @@ static int IPv4_CT_Get_Hash_Snapshot(int ct_hash_index, int ct_total_entries, PC
 int IPv4_Get_Next_Hash_CTEntry(PCtExCommand pCtCmd, int reset_action)
 {
 	int ct_hash_entries;
+	int retval;
 	static PCtExCommand pCtSnapshot = NULL;
 	static int ct_hash_index = 0,ct_snapshot_entries =0, ct_snapshot_index = 0, ct_snapshot_buf_entries = 0;
 	PCtExCommand pCt;
+
+	mutex_lock(&ipv4_query_mutex);
 
 	if(reset_action)
 	{
@@ -1551,7 +1558,7 @@ int IPv4_Get_Next_Hash_CTEntry(PCtExCommand pCtCmd, int reset_action)
 		if(pCtSnapshot)
 		{
 			Heap_Free(pCtSnapshot);
-			pCtSnapshot = NULL;	
+			pCtSnapshot = NULL;
 		}
 		ct_snapshot_buf_entries = 0;
 	}
@@ -1579,7 +1586,8 @@ int IPv4_Get_Next_Hash_CTEntry(PCtExCommand pCtCmd, int reset_action)
 				{
 					ct_hash_index = 0;
 					ct_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				ct_snapshot_buf_entries = ct_hash_entries;
 			}
@@ -1599,7 +1607,8 @@ int IPv4_Get_Next_Hash_CTEntry(PCtExCommand pCtCmd, int reset_action)
 			}
 
 			ct_snapshot_buf_entries = 0;
-			return ERR_CT_ENTRY_NOT_FOUND;
+			retval = ERR_CT_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -1612,7 +1621,10 @@ int IPv4_Get_Next_Hash_CTEntry(PCtExCommand pCtCmd, int reset_action)
 		ct_hash_index ++;
 	}
 
-	return NO_ERR;	
+	retval = NO_ERR;
+out:
+	mutex_unlock(&ipv4_query_mutex);
+	return retval;
 
 }
 
@@ -1685,8 +1697,11 @@ int IPV4_Get_Next_Hash_RtEntry(PRtCommand pRtCmd, int reset_action)
 {
 	int rt_hash_entries;
 	PRtCommand pRt;
+	int retval;
 	static PRtCommand pRtSnapshot = NULL;
 	static int rt_hash_index = 0, rt_snapshot_entries =0, rt_snapshot_index=0, rt_snapshot_buf_entries = 0;
+
+	mutex_lock(&ipv4_query_mutex);
 
 	if(reset_action)
 	{
@@ -1723,7 +1738,8 @@ int IPV4_Get_Next_Hash_RtEntry(PRtCommand pRtCmd, int reset_action)
 				{
 					rt_hash_index = 0;
 					rt_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				rt_snapshot_buf_entries = rt_hash_entries;
 			}
@@ -1742,7 +1758,8 @@ int IPV4_Get_Next_Hash_RtEntry(PRtCommand pRtCmd, int reset_action)
 				pRtSnapshot = NULL;
 			}
 			rt_snapshot_buf_entries = 0;
-			return ERR_RT_ENTRY_NOT_FOUND;
+			retval = ERR_RT_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -1756,6 +1773,9 @@ int IPV4_Get_Next_Hash_RtEntry(PRtCommand pRtCmd, int reset_action)
 	}
 
 
-	return NO_ERR;	
+	retval = NO_ERR;
+out:
+	mutex_unlock(&ipv4_query_mutex);
+	return retval;
 
 }

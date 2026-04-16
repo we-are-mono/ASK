@@ -8,11 +8,15 @@
  *
  */
 
+#include <linux/mutex.h>
 #include "cdx.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
 #include "control_socket.h"
 #include "control_ipsec.h"
+
+/* Serializes the IPv6 CT query cursor state. */
+static DEFINE_MUTEX(ipv6_query_mutex);
 
 static int ipv6_cmp_aligned(void *src, void *dst)
 {
@@ -713,8 +717,11 @@ int IPv6_Get_Next_Hash_CTEntry(PCtExCommandIPv6 pV6CtCmd, int reset_action)
 {
 	int ipv6_ct_hash_entries;
 	PCtExCommandIPv6 pV6Ct;
+	int retval;
 	static PCtExCommandIPv6 pV6CtSnapshot = NULL;
 	static int v6_ct_hash_index = 0, v6_ct_snapshot_entries =0, v6_ct_snapshot_index=0, v6_ct_snapshot_buf_entries = 0;
+
+	mutex_lock(&ipv6_query_mutex);
 
 	if(reset_action)
 	{
@@ -724,7 +731,7 @@ int IPv6_Get_Next_Hash_CTEntry(PCtExCommandIPv6 pV6CtCmd, int reset_action)
 		if(pV6CtSnapshot)
 		{
 			Heap_Free(pV6CtSnapshot);
-			pV6CtSnapshot = NULL;	
+			pV6CtSnapshot = NULL;
 		}
 		v6_ct_snapshot_buf_entries = 0;
 	}
@@ -752,7 +759,8 @@ int IPv6_Get_Next_Hash_CTEntry(PCtExCommandIPv6 pV6CtCmd, int reset_action)
 				{
 					v6_ct_hash_index = 0;
 					v6_ct_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				v6_ct_snapshot_buf_entries = ipv6_ct_hash_entries;
 
@@ -769,10 +777,11 @@ int IPv6_Get_Next_Hash_CTEntry(PCtExCommandIPv6 pV6CtCmd, int reset_action)
 			if(pV6CtSnapshot)
 			{
 				Heap_Free(pV6CtSnapshot);
-				pV6CtSnapshot = NULL;	
+				pV6CtSnapshot = NULL;
 			}
 			v6_ct_snapshot_buf_entries = 0;
-			return ERR_CT_ENTRY_NOT_FOUND;
+			retval = ERR_CT_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -786,6 +795,9 @@ int IPv6_Get_Next_Hash_CTEntry(PCtExCommandIPv6 pV6CtCmd, int reset_action)
 	}
 
 
-	return NO_ERR;	
+	retval = NO_ERR;
+out:
+	mutex_unlock(&ipv6_query_mutex);
+	return retval;
 
 }

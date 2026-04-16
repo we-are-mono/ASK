@@ -8,9 +8,10 @@
  *
  */
 
-#ifdef DPA_IPSEC_OFFLOAD 
+#ifdef DPA_IPSEC_OFFLOAD
 //#include "module_ipsec.h"
 //#include "module_tunnel.h"
+#include <linux/mutex.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "cdx_common.h"
@@ -20,6 +21,10 @@
 #include "control_ipv6.h"
 #include "control_ipsec.h"
 #include "cdx_dpa_ipsec.h"
+
+/* Serializes the SA query cursor state in both IPsec_Get_Next_SAEntry
+ * and stat_Get_Next_SAEntry. */
+static DEFINE_MUTEX(ipsec_query_mutex);
 
 /* This function returns total SA entries configured with a given handle */
 static int IPsec_Get_Hash_SAEntries(int sa_handle_index)
@@ -244,8 +249,11 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 {
 	int ipsec_sa_hash_entries;
 	PSAQueryCommand pSACmd;
+	int retval;
 	static PSAQueryCommand pSASnapshot = NULL;
 	static int sa_hash_index = 0, sa_snapshot_entries =0, sa_snapshot_index=0 , sa_snapshot_buf_entries = 0;
+
+	mutex_lock(&ipsec_query_mutex);
 
 	if(reset_action)
 	{
@@ -283,7 +291,8 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 				{
 					sa_hash_index = 0;
 					sa_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				sa_snapshot_buf_entries = ipsec_sa_hash_entries;
 			}
@@ -298,10 +307,11 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 			if (pSASnapshot)
 			{
 				Heap_Free(pSASnapshot);
-				pSASnapshot = NULL;	
+				pSASnapshot = NULL;
 			}
 			sa_snapshot_buf_entries = 0;
-			return ERR_SA_ENTRY_NOT_FOUND;
+			retval = ERR_SA_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -316,7 +326,10 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 	}
 
 
-	return NO_ERR;	
+	retval = NO_ERR;
+out:
+	mutex_unlock(&ipsec_query_mutex);
+	return retval;
 
 }
 
@@ -382,8 +395,11 @@ int stat_Get_Next_SAEntry(PStatIpsecEntryResponse pSACmd, int reset_action)
 {
 	int stat_sa_hash_entries;
 	PStatIpsecEntryResponse pSA;
+	int retval;
 	static PStatIpsecEntryResponse pStatSASnapshot = NULL;
 	static int stat_sa_hash_index = 0, stat_sa_snapshot_entries =0, stat_sa_snapshot_index=0, stat_sa_snapshot_buf_entries = 0;
+
+	mutex_lock(&ipsec_query_mutex);
 
 	if(reset_action)
 	{
@@ -393,10 +409,11 @@ int stat_Get_Next_SAEntry(PStatIpsecEntryResponse pSACmd, int reset_action)
 		if(pStatSASnapshot)
 		{
 			Heap_Free(pStatSASnapshot);
-			pStatSASnapshot = NULL;	
+			pStatSASnapshot = NULL;
 		}
 		stat_sa_snapshot_buf_entries = 0;
-		return NO_ERR;
+		retval = NO_ERR;
+		goto out;
 	}
 
 	if (stat_sa_snapshot_index == 0)
@@ -414,14 +431,15 @@ int stat_Get_Next_SAEntry(PStatIpsecEntryResponse pSACmd, int reset_action)
 			if (stat_sa_hash_entries > stat_sa_snapshot_buf_entries)
 			{
 				if(pStatSASnapshot)
-					Heap_Free(pStatSASnapshot);	   	
+					Heap_Free(pStatSASnapshot);
 				pStatSASnapshot = Heap_Alloc(stat_sa_hash_entries * sizeof(StatIpsecEntryResponse));
 
 				if (!pStatSASnapshot)
 				{
 					stat_sa_hash_index = 0;
 					stat_sa_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				stat_sa_snapshot_buf_entries = 	stat_sa_hash_entries;
 			}
@@ -438,7 +456,8 @@ int stat_Get_Next_SAEntry(PStatIpsecEntryResponse pSACmd, int reset_action)
 				pStatSASnapshot = NULL;
 			}
 			stat_sa_snapshot_buf_entries = 0;
-			return ERR_SA_ENTRY_NOT_FOUND;
+			retval = ERR_SA_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -452,7 +471,10 @@ int stat_Get_Next_SAEntry(PStatIpsecEntryResponse pSACmd, int reset_action)
 	}
 
 
-	return NO_ERR;	
+	retval = NO_ERR;
+out:
+	mutex_unlock(&ipsec_query_mutex);
+	return retval;
 }
 
 #endif  // DPA_IPSEC_OFFLOAD
