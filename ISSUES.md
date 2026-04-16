@@ -203,7 +203,7 @@ Not single issues — broader patterns worth an agenda item each.
   Hardware descriptors, netlink attributes, ioctl structs, and kernel-internal state all look identical in this code. A pass that tags trust boundaries (comments, helper macros, or just discipline) would prevent a whole class of the above.
   _Plan:_ the real attack surface isn't the cdx ioctl (only 2 commands after C9b: `SET_PARAMS`, `GET_MURAM_DATA`) — it's the FCI command bus. 14 event-level handlers (`set_cmd_handler(EVENT_*, M_*_cmdproc)` in `control_*.c` and `dpa_control_mc.c`), with ~75 per-command switch cases between them (ipv4=13, ipsec=14, stat=14, bridge=12, tunnel=8, ipv6=7, pppoe=3, mc4+mc6=2, vlan=2, plus qm/rtp_relay/rx/tx/wifi not yet counted). Each M_* handler today does its own length check and field validation inline, inconsistently. Phased migration below.
 
-- [ ] **A1a. Introduce the validator-table pattern.**
+- [x] **A1a. Introduce the validator-table pattern.**
   Add `cdx/cdx_cmd_validator.h` with a spec struct and dispatch helper:
   ```c
   struct cdx_cmd_spec {
@@ -216,6 +216,7 @@ Not single issues — broader patterns worth an agenda item each.
                        U16 cmd_code, U16 cmd_len, void *cmd, void *reply);
   ```
   The dispatcher looks up `cmd_code`, checks `cmd_len == spec->arg_size` (or a variable-length rule), runs `validate()`, then `handle()`. Handlers that used to receive `(U16 cmd_code, U16 cmd_len, U16 *pcmd)` and do their own checks instead take a pre-trusted typed struct. Ship the header + helper + unit-testable example before touching any subsystem. **Scope:** ~150 LOC new, no existing file touched. **Deliverable:** compiled header + helper in its own .c file.
+  _Done._ New `cdx/cdx_cmd_validator.h` defines `struct cdx_cmd_spec`, `cdx_cmd_validate_fn`, `cdx_cmd_handle_fn`, four table-building macros (`CDX_CMD`, `CDX_CMD_V`, `CDX_CMD_VAR`, `CDX_CMD_NOARG`, plus `CDX_CMD_NOARG_V`), and the dispatcher prototype. `cdx/cdx_cmd_validator.c` implements `cdx_dispatch_cmd`: linear lookup, `ERR_UNKNOWN_COMMAND` on miss, `[min_len, max_len]` range check with `ERR_WRONG_COMMAND_SIZE`, optional validate, then handle. Stamps `pcmd[0]` with the handler's return code after it runs; clamps `reply_len` to `sizeof(U16)` with `WARN_ON_ONCE` if a handler trampled it below that. Linked into `cdx.ko` (verified via nm); build is warning-free with -Werror. An independent agent review surfaced three valid concerns — contract clarity around the "pcmd is in/out, read inputs before writing output" rule, WARN on broken reply_len, a no-arg validator macro — all three applied. The agent's BUG_ON-on-n_entries suggestion was rejected: an empty table legitimately returns ERR_UNKNOWN_COMMAND, and picking an arbitrary cap would just surface noise._
 
 - [ ] **A1b. Prototype on `control_vlan.c` (smallest surface).**
   Convert `M_vlan_cmdproc` to a `cdx_cmd_spec[]` table covering the 2 command codes (`CMD_VLAN_ENTRY`, `CMD_VLAN_QUERY`). Move the length/action-enum/string checks that used to live inside `Vlan_handle_entry` into the `validate()` callbacks. Keep the existing handler bodies intact but re-sign them to take the typed struct. **Scope:** ~80 LOC changed in one file. **Deliverable:** this subsystem's attack surface fully gated by the validator table; net reduction in inline length checks.

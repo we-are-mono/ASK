@@ -71,7 +71,8 @@ dpa_if_objs = devman.o\
 		voip.o\
 		cdx_qos.o\
 		vsp_cfg.o\
-		procfs.o
+		procfs.o\
+		cdx_cmd_validator.o
 
 ####end of includes
 
