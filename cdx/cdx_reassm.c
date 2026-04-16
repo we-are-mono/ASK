@@ -411,41 +411,69 @@ static int ipr_timer(void *data)
 	return 0;
 }
 
+/* Free a bpool created via create_ipr_bpool(): tear down the BMan
+ * allocation, then free the struct itself. _dpa_bp_free() is
+ * EXPORT_SYMBOLed by the kernel patch. */
+extern void _dpa_bp_free(struct dpa_bp *dpa_bp);
+
+static void free_ipr_bpool(struct dpa_bp **bp_slot)
+{
+	struct dpa_bp *bp = *bp_slot;
+
+	if (!bp)
+		return;
+	_dpa_bp_free(bp);
+	kfree(bp);
+	*bp_slot = NULL;
+}
+
 static void cdx_deinit_ip_reassembly(void)
 {
+	/* Undo the acquisitions from cdx_init_ip_reassembly() in reverse.
+	 *
+	 * We can't currently retire the IPR FQs allocated via
+	 * cdx_create_ipr_fq(): they were added to the shared dpa_pcd_fq
+	 * list in dpa_cfg.c with no IPR-specific tag, so we can't
+	 * identify them from here. qman_retire_fq + qman_oos_fq +
+	 * qman_destroy_fq per FQ would be needed to fully unwind; this
+	 * is tracked as a residual TODO. Not a UAF vector on unload
+	 * because the whole cdx module is going down together with the
+	 * FQs' callback code. */
+	register_dpaa_eth_bpool_replenish_hook(NULL);
+
 	if (ipr_timer_thread && !IS_ERR(ipr_timer_thread)) {
 		kthread_stop(ipr_timer_thread);
 		ipr_timer_thread = NULL;
 	}
-	/* TODO: tear down FQs, release reassly_bp and ipr_frag_bp, and
-	 * unregister the bpool replenish hook. Currently leaks on unload;
-	 * stopping the kthread prevents it from running against freed code. */
+	free_ipr_bpool(&ipr_frag_bp);
+	free_ipr_bpool(&reassly_bp);
 }
 
 int cdx_init_ip_reassembly(void)
 {
 	struct dpa_bp *bp_parent;
-	uint32_t fqid; 
+	uint32_t fqid;
 	int num_fqs;
+	int ret;
 
 	printk("%s::\n", __func__);
 	//find pools used by ethernet devices and borrow buffers from it
-	if (get_phys_port_poolinfo_bysize(ipr_info.ipr_ctx_bsize, 
+	if (get_phys_port_poolinfo_bysize(ipr_info.ipr_ctx_bsize,
 				&reassly_ctx_parent_pool_info)) {
-		DPA_ERROR("%s::failed to locate eth bman pool for reassly\n", 
+		DPA_ERROR("%s::failed to locate eth bman pool for reassly\n",
 				__func__);
 		return -1;
 	}
 	bp_parent = dpa_bpid2pool(reassly_ctx_parent_pool_info.pool_id);
-	CDX_IPR_DPRINT("%s::parent bman pool for reassly - bp %p, bpid %d paddr %lx vaddr %p dev %p\n", 
+	CDX_IPR_DPRINT("%s::parent bman pool for reassly - bp %p, bpid %d paddr %lx vaddr %p dev %p\n",
 			__func__, bp_parent, reassly_ctx_parent_pool_info.pool_id,
 			(unsigned long)bp_parent->paddr, bp_parent->vaddr, bp_parent->dev);
 
-	reassly_bp = create_ipr_bpool(ipr_info.ipr_ctx_bsize, 
-			ipr_info.max_contexts, 
+	reassly_bp = create_ipr_bpool(ipr_info.ipr_ctx_bsize,
+			ipr_info.max_contexts,
 			bp_parent);
 	if (!reassly_bp) {
-		DPA_ERROR("%s::failed to create pool for reassly context\n", 
+		DPA_ERROR("%s::failed to create pool for reassly context\n",
 				__func__);
 		return -1;
 	}
@@ -454,68 +482,84 @@ int cdx_init_ip_reassembly(void)
 	if (IS_ERR(ipr_timer_thread))
 	{
 		DPA_ERROR(KERN_ERR "%s: kthread_create() failed\n", __func__);
-		return -1;
+		ret = -1;
+		ipr_timer_thread = NULL;
+		goto err_free_ctx_bp;
 	}
 	CDX_IPR_DPRINT("%s::created ipr timer thread %p\n", __func__,
 			ipr_timer_thread);
-	CDX_IPR_DPRINT("%s::context pool %d bp->size :%zu\n", __func__, 
+	CDX_IPR_DPRINT("%s::context pool %d bp->size :%zu\n", __func__,
 			reassly_bp->bpid, reassly_bp->size);
 
 	//find pools used by ethernet devices and borrow buffers from it
-	if (get_phys_port_poolinfo_bysize(ipr_info.ipr_frag_bsize, 
+	if (get_phys_port_poolinfo_bysize(ipr_info.ipr_frag_bsize,
 				&reassly_frag_parent_pool_info)) {
-		DPA_ERROR("%s::failed to locate eth bman pool for frag buffs\n", 
+		DPA_ERROR("%s::failed to locate eth bman pool for frag buffs\n",
 				__func__);
-		return -1;
+		ret = -1;
+		goto err_stop_kthread;
 	}
 	bp_parent = dpa_bpid2pool(reassly_frag_parent_pool_info.pool_id);
-	CDX_IPR_DPRINT("%s::parent bman pool for reassly - bp %p, bpid %d paddr %lx vaddr %p dev %p\n", 
+	CDX_IPR_DPRINT("%s::parent bman pool for reassly - bp %p, bpid %d paddr %lx vaddr %p dev %p\n",
 			__func__, bp_parent, reassly_frag_parent_pool_info.pool_id,
 			(unsigned long)bp_parent->paddr, bp_parent->vaddr, bp_parent->dev);
 
-	ipr_frag_bp = create_ipr_bpool(ipr_info.ipr_frag_bsize, 
-			(ipr_info.max_contexts * ipr_info.max_frags), 
+	ipr_frag_bp = create_ipr_bpool(ipr_info.ipr_frag_bsize,
+			(ipr_info.max_contexts * ipr_info.max_frags),
 			bp_parent);
 	if (!ipr_frag_bp) {
-		DPA_ERROR("%s::failed to create pool for ipr fragments\n", 
+		DPA_ERROR("%s::failed to create pool for ipr fragments\n",
 				__func__);
-		return -1;
+		ret = -1;
+		goto err_stop_kthread;
 	}
 	num_fqs = cdx_create_ipr_fq(&fqid);
 	if (num_fqs == -1) {
-		DPA_ERROR("%s::unable to create txconf fqids for IPV4_REASSM\n", 
+		DPA_ERROR("%s::unable to create txconf fqids for IPV4_REASSM\n",
 				__func__);
-		return -1;
+		ret = -1;
+		goto err_free_frag_bp;
 	}
 	CDX_IPR_DPRINT("%s::ipr txconf fqbase %x(%d), num fqs %d\n",
 			__func__, fqid, fqid, num_fqs);
 	//push num fqs into upper bytes of the fields
 	fqid |= (num_fqs << 24);
-	if (ExternalHashSetReasslyPool(IPV4_REASSM_TABLE, reassly_bp->bpid, 
+	if (ExternalHashSetReasslyPool(IPV4_REASSM_TABLE, reassly_bp->bpid,
 				reassly_bp->size,
-				ipr_frag_bp->bpid, 
-				ipr_frag_bp->size, 
+				ipr_frag_bp->bpid,
+				ipr_frag_bp->size,
 				fqid,
 				IPR_TIMER_FREQUENCY)) {
-		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n", 
+		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n",
 				__func__);
-		return -1;
-	}	
-	if (ExternalHashSetReasslyPool(IPV6_REASSM_TABLE , 
-				reassly_bp->bpid, 
-				reassly_bp->size, 
-				ipr_frag_bp->bpid, 
-				ipr_frag_bp->size, 
+		ret = -1;
+		goto err_free_frag_bp;
+	}
+	if (ExternalHashSetReasslyPool(IPV6_REASSM_TABLE ,
+				reassly_bp->bpid,
+				reassly_bp->size,
+				ipr_frag_bp->bpid,
+				ipr_frag_bp->size,
 				fqid,
 				IPR_TIMER_FREQUENCY)) {
-		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n", 
+		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n",
 				__func__);
-		return -1;
+		ret = -1;
+		goto err_free_frag_bp;
 	}
 	//register hook to replenish frag buffer pool
-	register_dpaa_eth_bpool_replenish_hook(replenish_ipr_frag_pool);	
+	register_dpaa_eth_bpool_replenish_hook(replenish_ipr_frag_pool);
 	register_cdx_deinit_func(cdx_deinit_ip_reassembly);
 	return 0;
+
+err_free_frag_bp:
+	free_ipr_bpool(&ipr_frag_bp);
+err_stop_kthread:
+	kthread_stop(ipr_timer_thread);
+	ipr_timer_thread = NULL;
+err_free_ctx_bp:
+	free_ipr_bpool(&reassly_bp);
+	return ret;
 }
 
 int cdx_get_ipr_v4_stats(void *resp)

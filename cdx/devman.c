@@ -575,11 +575,30 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 int dpa_add_port_to_list(struct dpa_iface_info *iface_info)
 {
 	spin_lock(&dpa_devlist_lock);
-	if (dpa_interface_info) 
+	if (dpa_interface_info)
 		iface_info->next = dpa_interface_info;
 	dpa_interface_info = iface_info;
 	spin_unlock(&dpa_devlist_lock);
 	return SUCCESS;
+}
+
+/* Undo dpa_add_port_to_list(): unlink iface_info from the global
+ * list. Safe to call if the entry isn't linked. */
+static void dpa_remove_port_from_list(struct dpa_iface_info *iface_info)
+{
+	struct dpa_iface_info **slot;
+
+	spin_lock(&dpa_devlist_lock);
+	slot = &dpa_interface_info;
+	while (*slot) {
+		if (*slot == iface_info) {
+			*slot = iface_info->next;
+			iface_info->next = NULL;
+			break;
+		}
+		slot = &(*slot)->next;
+	}
+	spin_unlock(&dpa_devlist_lock);
 }
 
 
@@ -2105,20 +2124,29 @@ err_ret8:
 #endif
 err_ret7:
 #ifdef ENABLE_EGRESS_QOS
-	/*TODO: Disable ceetm on iface. Release ceetm lni and sp  */
+	/* TODO: disable CEETM on iface + release CEETM lni/sp. No
+	 * reverse helper for cdx_enable_ceetm_on_iface() exists today;
+	 * implementing it requires understanding the CEETM channel
+	 * teardown sequence (see cdx_ceetm_app.c). Residual leak on
+	 * this error path is one CEETM LNI + SP per failed iface add. */
 err_ret6:
-#ifdef DPA_IPSEC_OFFLOAD 
-	/* TODO: reset bman discard mask */
+#ifdef DPA_IPSEC_OFFLOAD
+	/* TODO: restore BMan discard mask (undo
+	 * dpa_bman_reconfigure_discard_mask). No reverse helper; the
+	 * residual effect is that the port keeps the IPsec-adjusted
+	 * discard mask until module unload. */
 #endif
 #endif
-#ifdef DPA_IPSEC_OFFLOAD 
+#ifdef DPA_IPSEC_OFFLOAD
 err_ret5:
 #endif
-	/*TODO: Remove ff policer profile. */
+	/* TODO: remove the fast-forward policer profile. No reverse
+	 * helper for dpa_add_ethport_ff_policier_profile(); residual
+	 * effect is a leaked profile slot per failed iface add. */
 err_ret4:
 	dpa_remove_virt_storage_profile(&iface_info->eth_info);
 err_ret3:
-	/*TODO: DPA remove from port list. */
+	dpa_remove_port_from_list(iface_info);
 err_ret2:
 	proc_remove(((cdx_proc_dir_entry_t *)(iface_info->pcd_proc_entry))->proc_dir);
 err_ret1:

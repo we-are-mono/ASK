@@ -1247,9 +1247,11 @@ static int abm_l2flow_table_init(void)
 
 	brroute_cache = kmem_cache_create("brroute_cache",
 					 sizeof(struct br_event_table), 0, 0, NULL);
-	if (!brroute_cache)
+	if (!brroute_cache) {
+		kmem_cache_destroy(l2flow_cache);
+		l2flow_cache = NULL;
 		return -ENOMEM;
-	
+	}
 
 	return 0;
 }
@@ -1641,29 +1643,42 @@ static int abm_init(void)
 	}
 	if((rc = abm_l2flow_table_init()) < 0){
 		ABM_PRINT(KERN_ERR, "Automatic bridging module error l2flow_table init rc = %d \n", rc);
-		return rc;
+		goto err_destroy_wq;
 	}
 	br_fdb_register_can_expire_cb(&abm_fdb_can_expire);
 	if((rc = abm_nl_init()) < 0){
 		ABM_PRINT(KERN_ERR, "Automatic bridging module error netlink init int rc = %d \n", rc);
-		return rc;
+		goto err_dereg_fdb_cb;
 	}
 	if((rc = abm_proc_init()) < 0){
 		ABM_PRINT(KERN_ERR, "Automatic bridging module error can't create /proc file rc = %d \n", rc);
-		return rc;
+		goto err_nl_exit;
 	}
 	if((rc = abm_sysctl_init()) < 0){
 		ABM_PRINT(KERN_ERR, "Automatic bridging module error can't create sysctl rc = %d \n", rc);
-		return rc;
+		goto err_proc_fini;
 	}
 	if((rc = nf_register_net_hooks(&init_net, abm_ebt_ops, ARRAY_SIZE(abm_ebt_ops))) < 0){
-	ABM_PRINT(KERN_ERR, "Automatic bridging module error can't register hooks int rc = %d \n", rc);
-		return rc;
+		ABM_PRINT(KERN_ERR, "Automatic bridging module error can't register hooks int rc = %d \n", rc);
+		goto err_sysctl_fini;
 	}
 	register_brevent_notifier(&abm_br_notifier);
 	queue_delayed_work(kabm_wq, &abm_work_retransmit, abm_retransmit_time);
-	
+
 	return 0;
+
+err_sysctl_fini:
+	abm_sysctl_fini();
+err_proc_fini:
+	abm_proc_fini();
+err_nl_exit:
+	abm_nl_exit();
+err_dereg_fdb_cb:
+	br_fdb_deregister_can_expire_cb();
+	abm_l2flow_table_exit();
+err_destroy_wq:
+	destroy_workqueue(kabm_wq);
+	return rc;
 }
 
 /***************************************************************************
