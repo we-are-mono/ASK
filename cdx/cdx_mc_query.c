@@ -30,16 +30,17 @@ static int MC4_Get_Hash_Entries(int mc4_hash_index)
 {
 
 	int tot_mc4_entries = 0;
-	struct mcast_group_info *pMcastGrpInfo;
 	struct list_head *ptr;
 
 	spin_lock(&mc4_spinlocks[mc4_hash_index]);
 	list_for_each(ptr, &mc4_grp_list[mc4_hash_index])
 	{
-		pMcastGrpInfo = list_entry(ptr,struct mcast_group_info,list);
-		tot_mc4_entries++;
-		if((pMcastGrpInfo->uiListenerCnt > MC4_MAX_LISTENERS_IN_QUERY))
-			tot_mc4_entries++;
+		/* Worst case MC_MAX_LISTENERS_PER_GROUP (8) listeners, split
+		 * across ceil(8/MC4_MAX_LISTENERS_IN_QUERY) = 2 query cmds.
+		 * Reserve two regardless of uiListenerCnt so the caller's
+		 * snapshot buffer can never be undersized if that counter
+		 * ever goes out of sync with bIsValidEntry. */
+		tot_mc4_entries += 2;
 	}
 	spin_unlock(&mc4_spinlocks[mc4_hash_index]);
 	return tot_mc4_entries;
@@ -67,22 +68,35 @@ static int MC4_Get_Hash_Snapshot(int mc4_hash_index, int mc4_tot_entries, PMC4Co
 		//pMC4Snapshot->queue = pMC4Entry->mcdest.queue_base;
 		strncpy((char*)pMC4Snapshot->input_device_str,
 				pMcastGrpInfo->ucIngressIface,IF_NAME_SIZE-1);
-		for(i = 0,j = 0; j < MC_MAX_LISTENERS_PER_GROUP; j++) //pMcastGrpInfo->uiListenerCnt; j++)
+		for(i = 0,j = 0; j < MC_MAX_LISTENERS_PER_GROUP; j++)
 		{
+			int k, more;
+
 			if (!pMcastGrpInfo->members[j].bIsValidEntry)
 				continue;
 			strncpy((char *)pMC4Snapshot->output_list[i].output_device_str,
 					pMcastGrpInfo->members[j].if_info, IF_NAME_SIZE-1);
-			if((++i >= MC4_MAX_LISTENERS_IN_QUERY) &&
-					( (pMcastGrpInfo->uiListenerCnt - (i)) ))
-			{
-				pMC4Snapshot->num_output = MC4_MAX_LISTENERS_IN_QUERY;
-				pMC4Snapshot++;
-				tot_mc4_entries++;
-				mc4_tot_entries--;
-				i = 0;
-				memset(pMC4Snapshot, 0, sizeof(MC4Command));
+			if (++i < MC4_MAX_LISTENERS_IN_QUERY)
+				continue;
+
+			/* Cmd is full. Look ahead in members[] for another
+			 * valid entry instead of trusting uiListenerCnt. */
+			more = 0;
+			for (k = j + 1; k < MC_MAX_LISTENERS_PER_GROUP; k++) {
+				if (pMcastGrpInfo->members[k].bIsValidEntry) {
+					more = 1;
+					break;
+				}
 			}
+			if (!more)
+				continue;
+
+			pMC4Snapshot->num_output = MC4_MAX_LISTENERS_IN_QUERY;
+			pMC4Snapshot++;
+			tot_mc4_entries++;
+			mc4_tot_entries--;
+			i = 0;
+			memset(pMC4Snapshot, 0, sizeof(MC4Command));
 		}
 		pMC4Snapshot->num_output = i;
 		pMC4Snapshot++;
@@ -193,17 +207,13 @@ static int MC6_Get_Hash_Entries(int mc6_hash_index)
 {
 
 	int tot_mc6_entries = 0;
-	struct mcast_group_info *pMcastGrpInfo;
 	struct list_head *ptr;
 
 	spin_lock(&mc6_spinlocks[mc6_hash_index]);
 	list_for_each(ptr, &mc6_grp_list[mc6_hash_index])
 	{
-		pMcastGrpInfo = list_entry(ptr,struct mcast_group_info,list);
-
-		tot_mc6_entries++;
-		if(pMcastGrpInfo->uiListenerCnt > MC4_MAX_LISTENERS_IN_QUERY)
-			tot_mc6_entries++;
+		/* See MC4_Get_Hash_Entries for the reserve-2 rationale. */
+		tot_mc6_entries += 2;
 	}
 	spin_unlock(&mc6_spinlocks[mc6_hash_index]);
 
@@ -231,22 +241,33 @@ static int MC6_Get_Hash_Snapshot(int mc6_hash_index, int mc6_tot_entries, PMC6Co
 		//pMC6Snapshot->queue = pMC6Entry->mcdest.queue_base;
 		strncpy((char*)pMC6Snapshot->input_device_str,
 				pMcastGrpInfo->ucIngressIface,IF_NAME_SIZE-1);
-		for(i = 0,j = 0; j < MC_MAX_LISTENERS_PER_GROUP; j++) //pMcastGrpInfo->uiListenerCnt; j++)
+		for(i = 0,j = 0; j < MC_MAX_LISTENERS_PER_GROUP; j++)
 		{
+			int k, more;
+
 			if (!pMcastGrpInfo->members[j].bIsValidEntry)
 				continue;
 			strncpy((char *)pMC6Snapshot->output_list[i].output_device_str,
 					pMcastGrpInfo->members[j].if_info, IF_NAME_SIZE-1);
-			if((++i >= MC4_MAX_LISTENERS_IN_QUERY) &&
-					( (pMcastGrpInfo->uiListenerCnt - (i)) ))
-			{
-				pMC6Snapshot->num_output = MC6_MAX_LISTENERS_IN_QUERY;
-				pMC6Snapshot++;
-				tot_mc6_entries++;
-				mc6_tot_entries--;
-				i = 0;
-				memset(pMC6Snapshot, 0, sizeof(MC6Command));
+			if (++i < MC6_MAX_LISTENERS_IN_QUERY)
+				continue;
+
+			more = 0;
+			for (k = j + 1; k < MC_MAX_LISTENERS_PER_GROUP; k++) {
+				if (pMcastGrpInfo->members[k].bIsValidEntry) {
+					more = 1;
+					break;
+				}
 			}
+			if (!more)
+				continue;
+
+			pMC6Snapshot->num_output = MC6_MAX_LISTENERS_IN_QUERY;
+			pMC6Snapshot++;
+			tot_mc6_entries++;
+			mc6_tot_entries--;
+			i = 0;
+			memset(pMC6Snapshot, 0, sizeof(MC6Command));
 		}
 		pMC6Snapshot->num_output = i;
 		pMC6Snapshot++;

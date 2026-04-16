@@ -72,7 +72,7 @@ static void display_port_info(struct cdx_port_info *pinfo)
 		dist_info = pinfo->dist_info;
 		printk("distributions\n");
 		for (ii = 0; ii < pinfo->max_dist; ii++) {
-			printk("handle		\t%p\n", dist_info->handle);
+			printk("handle		\t%pK\n", dist_info->handle);
 			printk("type		\t%d\n", dist_info->type);
 			printk("fq_base		\t%x(%d)\n", dist_info->base_fqid,
 					dist_info->base_fqid);
@@ -92,7 +92,7 @@ static void display_tbl_info(struct table_info *tinfo)
 	printk("type		\t%d\n", tinfo->type);
 	printk("port idx 	\t%x\n", tinfo->port_idx);
 	printk("key size	\t%d\n", tinfo->key_size);
-	printk("handle		\t%p\n", tinfo->id);
+	printk("handle		\t%pK\n", tinfo->id);
 	//printk("table desc	\t%d\n", tinfo->td);
 }
 
@@ -113,8 +113,8 @@ static void display_dpa_cfg(void)
 		printk("fm index	\t%d\n", finfo->index);
 		printk("max ports	\t%d\n", finfo->max_ports);
 		printk("num tables	\t%d\n", finfo->num_tables);
-		printk("fm handle 	\t%p\n", finfo->fm_handle);
-		printk("pcd handle 	\t%p\n", finfo->pcd_handle);
+		printk("fm handle 	\t%pK\n", finfo->fm_handle);
+		printk("pcd handle 	\t%pK\n", finfo->pcd_handle);
 		pinfo = finfo->portinfo;
 		for (jj = 0; jj < finfo->max_ports; jj++) {
 			display_port_info(pinfo);
@@ -449,8 +449,8 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 			miss_engine_params.params.kgParams.h_DirectScheme = 
 				get_ethdist_info_by_fman_params(finfo);
 #if 1//def DPA_CFG_DEBUG
-			DPA_INFO("%s::changing miss action for table %s as KG scheme %p\n",
-					__func__, tbl_info->name, 
+			DPA_INFO("%s::changing miss action for table %s as KG scheme %pK\n",
+					__func__, tbl_info->name,
 					miss_engine_params.params.kgParams.h_DirectScheme);
 #endif
 			if (miss_engine_params.params.kgParams.h_DirectScheme == NULL) {

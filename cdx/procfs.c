@@ -10,6 +10,7 @@
 #ifdef CONFIG_PROC_FS
 #include "procfs.h"
 #include <linux/slab.h>
+#include <linux/seq_file.h>
 #include "misc.h"
 
 static struct proc_dir_entry *proc_fqid_dir = NULL ;
@@ -19,57 +20,53 @@ static struct proc_dir_entry *proc_pcd_dir = NULL ;
 static struct proc_dir_entry *proc_sa_dir = NULL ;
 static struct fqid_file_list_node_s *fqid_files_g = NULL;
 
-static ssize_t proc_fqid_stats_read(struct file *fp, char __user *buff, size_t size, loff_t *ppos)
+static int proc_fqid_stats_show(struct seq_file *m, void *v)
 {
-	struct qman_fq *fq_info = NULL;
+	struct fqid_file_list_node_s *node = m->private;
+	struct qman_fq *fq_info;
 	struct qm_mcr_queryfq_np np;
-	struct qm_fqd fqd_inst,*fqd;
-	struct fqid_file_list_node_s *node;
-	int len = 0;
-	uint8_t *name;
+	struct qm_fqd fqd_inst, *fqd;
+	const char *name = m->file->f_path.dentry->d_name.name;
 
-	name = (uint8_t *)fp->f_path.dentry->d_name.name;
-
-	if (*ppos)
+	if (!node || !node->fq) {
+		seq_printf(m, "===========================================\n::file %s\n", name);
+		seq_puts(m, "corresponding FQ ID not created by CDX module\n");
 		return 0;
-
-	node = pde_data(file_inode(fp));
-
-	if (!node || !node->fq)
-	{
-		len += sprintf(buff, "===========================================\n::file %s\n", name);
-		len += sprintf(buff + len, "corresponding FQ ID not created by CDX module\n");
-		*ppos +=len;
-		return len;
 	}
 
-	fq_info = node->fq;		
-	len += sprintf(buff, "===========================================\n::fqid %x(%d)\n", node->fqid, node->fqid);
+	fq_info = node->fq;
+	seq_printf(m, "===========================================\n::fqid %x(%d)\n",
+			node->fqid, node->fqid);
 	if (qman_query_fq(fq_info, &fqd_inst)) {
-		len += sprintf(buff + len, "error getting fq fields\n");
-		*ppos +=len;
-		return len;
+		seq_puts(m, "error getting fq fields\n");
+		return 0;
 	}
 	fqd = &fqd_inst;
-	len += sprintf(buff+len, "fqctrl\t%x\n", fqd->fq_ctrl);
-	len += sprintf(buff+len, "channel\t%x\n", fqd->dest.channel);
-	len += sprintf(buff+len, "Wq\t%d\n", fqd->dest.wq);
-	len += sprintf(buff+len, "contextb\t%x\n", fqd->context_b);
-	len += sprintf(buff+len, "contexta\t%llx\n", fqd->context_a.opaque);
+	seq_printf(m, "fqctrl\t%x\n", fqd->fq_ctrl);
+	seq_printf(m, "channel\t%x\n", fqd->dest.channel);
+	seq_printf(m, "Wq\t%d\n", fqd->dest.wq);
+	seq_printf(m, "contextb\t%x\n", fqd->context_b);
+	seq_printf(m, "contexta\t%llx\n", fqd->context_a.opaque);
 	if (qman_query_fq_np(fq_info, &np)) {
-		len += sprintf(buff + len, "error getting fq fields\n");
-		*ppos +=len;
-		return len;
+		seq_puts(m, "error getting fq fields\n");
+		return 0;
 	}
-	len += sprintf(buff+len, "state\t%d\n", np.state);
-	len += sprintf(buff+len, "byte count\t%d\n", np.byte_cnt);
-	len += sprintf(buff+len, "frame count\t%d\n", np.frm_cnt);
-	*ppos +=len;
-	return len;
+	seq_printf(m, "state\t%d\n", np.state);
+	seq_printf(m, "byte count\t%d\n", np.byte_cnt);
+	seq_printf(m, "frame count\t%d\n", np.frm_cnt);
+	return 0;
+}
+
+static int proc_fqid_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, proc_fqid_stats_show, pde_data(inode));
 }
 
 static const struct proc_ops proc_fqid_stats = {
-         .proc_read      = proc_fqid_stats_read,
+	.proc_open	= proc_fqid_stats_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
 };
 
 
@@ -164,7 +161,7 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 #endif
 	*proc_dir_entry = (void *)proc_entry;
 #ifdef CDX_DPA_DEBUG
-	printk("%s()::%d proc_entry %px proc dir %px\n", __func__, __LINE__, proc_entry, proc_entry->proc_dir);
+	printk("%s()::%d proc_entry %pK proc dir %pK\n", __func__, __LINE__, proc_entry, proc_entry->proc_dir);
 #endif
 
 	return 0;
@@ -221,9 +218,9 @@ static int cdx_create_fq_in_procfs(struct qman_fq *fq,
 	memset(node, 0, sizeof(struct fqid_file_list_node_s ));
 	node->fqid = fq->fqid;
 	if (fq_alias_name)
-		sprintf(node->name,"%d_%s",fq->fqid, fq_alias_name);
+		snprintf(node->name, sizeof(node->name), "%d_%s", fq->fqid, fq_alias_name);
 	else
-		sprintf(node->name,"%d",fq->fqid);
+		snprintf(node->name, sizeof(node->name), "%d", fq->fqid);
 	node->fq = fq;
 	node->proc_fs = proc_create_data(node->name, 0444,proc_dir,  &proc_fqid_stats, node);
 	if (!node->proc_fs)

@@ -512,7 +512,8 @@ static const struct nla_policy abm_l2flow_policy[L2FLOWA_MAX + 1] = {
 ****************************************************************************/
 static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netlink_ext_ack *ext )
 {
-	int type, err = 0;
+	u16 type;
+	int err = 0;
 	struct l2flow l2flow_temp;
 	struct l2flow_msg *l2flow_msg;
 	struct nlattr *tb[L2FLOWA_MAX + 1];
@@ -583,7 +584,10 @@ static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netl
 			
 		break;
 		case L2FLOW_MSG_RESET:
-		break;	
+		break;
+		default:
+			err = -EINVAL;
+			break;
 	}
 out:
 	return err;
@@ -1134,20 +1138,24 @@ static  void abm_l2flow_table_flush(void)
 ****************************************************************************/
 static  __inline void abm_l2flow_table_wait_timers(void)
 {
+	unsigned long deadline = jiffies + 5 * HZ;
 	int i, empty;
-test_list:
-	empty = 1;
-	for(i = 0; i < L2FLOW_HASH_TABLE_SIZE; i++)
-		if(!list_empty(&l2flow_table[i])){
-			empty = 0;
-			break;
+
+	while (time_before(jiffies, deadline)) {
+		empty = 1;
+		for (i = 0; i < L2FLOW_HASH_TABLE_SIZE; i++) {
+			if (!list_empty(&l2flow_table[i])) {
+				empty = 0;
+				break;
+			}
 		}
-		
-	if(empty)
-		return;
-	else{
-		schedule();
-	}	goto test_list;
+		if (empty)
+			return;
+		schedule_timeout_uninterruptible(1);
+	}
+
+	pr_warn("abm: timed out waiting for l2flow entries to drain; "
+		"proceeding with module exit\n");
 }
 
 /***************************************************************************

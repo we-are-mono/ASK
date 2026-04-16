@@ -125,23 +125,29 @@ Memory corruption or info-leak reachable from userspace (unprivileged once G1 is
 
 ## MEDIUM
 
-- [ ] **M1. Multicast listener-count mismatch.**
+- [x] **M1. Multicast listener-count mismatch.**
   [cdx/dpa_control_mc.c:541](cdx/dpa_control_mc.c#L541) enforces `uiNoOfListeners <= MC_MAX_LISTENERS_PER_GROUP` (8), but query output in [cdx/cdx_mc_query.c:60](cdx/cdx_mc_query.c#L60) loops with that bound while writing into `output_list[]` sized at `MC_MAX_LISTENERS_IN_QUERY` (5). A group with 6–8 listeners OOBs the query response buffer. **Fix:** pick one bound, or clamp the loop with `min(listeners, MC_MAX_LISTENERS_IN_QUERY)` and document that queries are paginated.
+  _Done, correction on the original claim:_ the existing pagination actually handles 6–8 listeners correctly *provided* `uiListenerCnt` stays in sync with the `bIsValidEntry` flags — but the `(uiListenerCnt - i)` "more to come" test is fragile (any drift between the counter and the flags can either OOB or truncate). Two-part fix: (1) `MC{4,6}_Get_Hash_Entries` now reserves `ceil(MC_MAX_LISTENERS_PER_GROUP / MC_MAX_LISTENERS_IN_QUERY) = 2` cmds per group unconditionally, so the caller's snapshot buffer can never be undersized. (2) `MC{4,6}_Get_Hash_Snapshot` replaces the `uiListenerCnt - i` check with a local look-ahead over `members[]` for the next `bIsValidEntry`, so pagination depends only on the truth of the flag array (which is what's actually walked)._
 
-- [ ] **M2. `dev_get_by_name` leaks on error paths (control_vlan).**
+- [-] **M2. `dev_get_by_name` leaks on error paths (control_vlan).**
   [cdx/control_vlan.c:103-112,123-134](cdx/control_vlan.c#L103-L134). Both deregister and register call `dev_get_by_name` twice but only `dev_put` on the happy path. **Fix:** refcount-balanced goto-out pattern; `dev_put(device)` / `dev_put(parent_device)` only if non-NULL. Audit other control_*.c for the same pattern.
+  _Not a bug on re-reading._ Both `device` and `parent_device` are `NULL`-initialized at [line 89](cdx/control_vlan.c#L89). Every `break` in the switch falls through to the `end:` label at [line 199](cdx/control_vlan.c#L199) which already does `if (device) dev_put(...); if (parent_device) dev_put(...);` — the NULL guard correctly handles the DEREGISTER case (which sets only `device`) and every error break in REGISTER. The only paths that bypass `end:` are `QUERY`/`QUERY_CONT`/`default`, all of which return before touching `dev_get_by_name`, so no refs are leaked. Audit of the other three cdx files using `dev_get_by_name` (`devman.c`, `cdx_ehash.c`, `dpa_wifi.c`) found all paths balanced — `devman.c:447` and `:2851` transfer the ref into stored structs with matching `dev_put` on teardown, local uses in `cdx_ehash.c:2832` and `dpa_wifi.c:2315/2812` pair with `dev_put` in the same scope. Agent misread the cleanup flow._
 
-- [ ] **M3. Unbounded `sprintf` chain in procfs read handler.**
+- [x] **M3. Unbounded `sprintf` chain in procfs read handler.**
   [cdx/procfs.c:22-69](cdx/procfs.c#L22-L69). `proc_fqid_stats_read` does `sprintf(buff + len, …)` repeatedly without tracking remaining space against the caller's `size`. **Fix:** migrate to `seq_file` (`single_open` + `seq_printf`) — this is the standard approach and eliminates the issue.
+  _Done, plus a bigger issue uncovered:_ the original handler was `sprintf`-ing directly into the `char __user *buff` it received, which is straight-up wrong — that's a user pointer, not a kernel buffer, and on ARM64 with KUAP any dereference would fault. Converted to the standard `seq_file` pattern: `proc_fqid_stats_show` / `proc_fqid_stats_open` / `single_open` / `seq_read` / `seq_lseek` / `single_release`. All `sprintf` calls replaced with `seq_printf`/`seq_puts`. The node pointer flows via `proc_create_data` → `pde_data(inode)` → `single_open`'s private._
 
-- [ ] **M4. Kernel pointer leaks in debug output.**
+- [x] **M4. Kernel pointer leaks in debug output.**
   [cdx/procfs.c:167](cdx/procfs.c#L167) uses `%px`. [cdx/dpa_cfg.c](cdx/dpa_cfg.c) has ~10 debug `printk("…%p…", kernel_ptr)` sites around lines 59, 79, 100, 101, 401, 421, 517, 558, 565, 571. Gated by `DPA_CFG_DEBUG` / `CDX_DPA_DEBUG`, but still: if ever enabled, defeats KASLR. **Fix:** bulk replace `%p` → `%pK` and `%px` → `%pK` in debug-only prints; remove gratuitous pointer dumps.
+  _Scoped fix:_ Modern kernel `%p` is hashed by default since 4.15 (and always-on default since ~5.x), so the agent's "defeats KASLR" claim only held if `no_hash_pointers` is passed on the cmdline. The one real unconditional leak was the single `%px` in `procfs.c:164` — that always prints raw regardless of `kptr_restrict`. Changed to `%pK`. Also changed the production-path pointer dumps in `dpa_cfg.c` (the four `display_*` helpers that run every SET_PARAMS ioctl, plus the `#if 1//def DPA_CFG_DEBUG` site that's effectively always-on) from `%p` → `%pK` so `kptr_restrict=2` forces them to zero. Debug-gated-only `%p` sites left alone (`%p` is already safe under default config; would be defense-in-depth but not security-blocking). `DPA_ERROR` sites printing `finfo->pcd_handle` left as `%p` because that value is user-supplied, not a kernel address._
 
-- [ ] **M5. `nlh->nlmsg_type` signedness / missing default.**
+- [x] **M5. `nlh->nlmsg_type` signedness / missing default.**
   [auto_bridge/auto_bridge.c:494-560](auto_bridge/auto_bridge.c#L494-L560). `type` is `int`, compared `>= L2FLOW_MSG_MAX`; `nlmsg_type` is `__u16` so currently safe, but the switch has no `default` arm. **Fix:** declare `type` as `u16`, add a `default: err = -EINVAL; goto out;` to the switch for protocol hygiene.
+  _Done: `type` narrowed to `u16` matching `nlmsg_type`'s underlying type; added `default: err = -EINVAL; break;` to the switch._
 
-- [ ] **M6. auto_bridge module-exit busy-loop.**
+- [x] **M6. auto_bridge module-exit busy-loop.**
   [auto_bridge/auto_bridge.c:1109-1125](auto_bridge/auto_bridge.c#L1109-L1125). `abm_l2flow_table_wait_timers` spins with `schedule()` until all buckets empty. Module unload can hang indefinitely. **Fix:** cancel timers synchronously (`timer_shutdown_sync` per entry) during exit, then a single empty-check instead of a loop.
+  _Scoped fix._ On re-reading, the loop actually drains quickly in practice — `abm_l2flow_table_flush` sets `FL_DEAD` on every entry and triggers `__abm_go_dying` for any whose timer it could cancel or that were in `STATE_FF`; entries whose timers already fired will run their callback soon and free themselves (since `__abm_go_dying` now takes the DEAD-branch and calls `abm_l2flow_del`). The "hang indefinitely" claim was pessimistic; the real bugs were (a) bare `schedule()` gives no yield pressure and can hot-spin, (b) no deadline guard if timer firing goes wrong. Replaced with a 5-second bounded wait using `schedule_timeout_uninterruptible(1)` (sleeps one jiffy instead of busy-yielding), plus a `pr_warn` on timeout. The proper `timer_shutdown_sync`-per-entry fix is trickier than the agent suggested (callback race on the embedded `timer_list` when the entry is freed); this improvement fixes the observable symptom without introducing that race._
 
 - [x] **M7. `cdx_ipsec_add_classification_table_entry` explicit TBD leak.**
   Same issue as H3 but with a self-acknowledged `TBD???` comment at [cdx/cdx_dpa_ipsec.c:2586](cdx/cdx_dpa_ipsec.c#L2586). Track separately so it gets a real fix rather than a move.
@@ -157,8 +163,9 @@ Memory corruption or info-leak reachable from userspace (unprivileged once G1 is
 - [ ] **L2. `strcpy` into equal-sized `IF_NAME_SIZE` buffers.**
   [cdx/control_bridge.c:362-363](cdx/control_bridge.c#L362-L363), [cdx/control_vlan.c:295-296](cdx/control_vlan.c#L295-L296), [cdx/control_pppoe.c:500-506](cdx/control_pppoe.c#L500-L506), [cdx/control_ipv4.c:1650,1659](cdx/control_ipv4.c#L1650), [cdx/control_tunnel.c:819](cdx/control_tunnel.c#L819), [cdx/dpa_cfg.c:311](cdx/dpa_cfg.c#L311). Kernel `net_device->name` is guaranteed NUL-terminated so these are mostly benign, but command-sourced names aren't guaranteed. **Fix:** `strscpy` everywhere; it's the modern canonical form.
 
-- [ ] **L3. `sprintf` into small fixed name buffers (procfs).**
+- [x] **L3. `sprintf` into small fixed name buffers (procfs).**
   [cdx/procfs.c:224,226](cdx/procfs.c#L224). **Fix:** `snprintf(node->name, sizeof(node->name), …)`.
+  _Done alongside M3._
 
 - [ ] **L4. `proc_create("fci", 0, …)`.**
   [fci/fci.c:542](fci/fci.c#L542). Mode `0` is fragile — should be explicit `S_IRUSR` or similar. Not a security hole (proc default is root-only), but code hygiene.
@@ -196,5 +203,6 @@ Not single issues — broader patterns worth an agenda item each.
 - [ ] **A3. Error paths don't unwind.**
   Recurring leak-on-failure pattern for DMA mappings, hash entries, device refs. A single-label goto-out idiom (with a counter/flag for "how far did init get") would catch most of these.
 
-- [ ] **A4. Debug code is production code.**
+- [~] **A4. Debug code is production code.**
   `dpa_test.c` is always compiled in (C9). Debug `%p` is one Kconfig flip from leaking KASLR (M4). `cdx_deinit_ip_reassembly` is a `printk("implement this")` stub (C5). Either delete or `#ifdef`-gate.
+  _Mostly resolved:_ `dpa_test.c` deleted entirely (C9b). `cdx_deinit_ip_reassembly` at least stops the kthread now (C5); full DPAA teardown still TODO but no longer leaves code-freed-while-kthread-running. Remaining: the `%p`/`%px` debug prints under M4._
