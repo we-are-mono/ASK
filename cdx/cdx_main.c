@@ -11,11 +11,22 @@
 //uncomment to start dpa_app from cdx module
 #define START_DPA_APP 1
 
+/*
+ * Minimum FMAN microcode package the ASK data path requires.
+ * Matches ASK_UCODE_PACKAGE_NUMBER in sdk_fman fm_common.h.
+ */
+#define CDX_MIN_FW_PACKAGE 209
+
 #define DEFINE_GLOBALS
 #include "portdefs.h"
 #include "cdx.h"
 #include "cdx_cmdhandler.h"
 #include "dpa_ipsec.h"
+
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
+#include "lnxwrp_fsl_fman.h"
 
 static uint32_t init_level;
 static cdx_deinit_func deinit_fn[MAX_CDX_INIT_FUNCTIONS];
@@ -143,12 +154,57 @@ static void cdx_module_deinit(void)
 	return;
 }
 
+static int cdx_check_fman_firmware(void)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+	struct fm *fm;
+	u16 pkg = 0;
+	u8 maj = 0, min = 0;
+	int rc;
+
+	np = of_find_compatible_node(NULL, NULL, "fsl,fman");
+	if (!np) {
+		pr_err("cdx: fsl,fman device-tree node not found\n");
+		return -ENODEV;
+	}
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev) {
+		pr_err("cdx: fsl,fman platform device not ready\n");
+		return -EPROBE_DEFER;
+	}
+
+	fm = fm_bind(&pdev->dev);
+	rc = fm_get_fw_rev(fm, &pkg, &maj, &min);
+	fm_unbind(fm);
+	if (rc) {
+		pr_err("cdx: cannot read FMAN firmware revision (%d)\n", rc);
+		return rc;
+	}
+
+	if (pkg < CDX_MIN_FW_PACKAGE) {
+		pr_err("cdx: FMAN firmware %u.%u.%u lacks ASK support "
+		       "(need package >= %u). Load the ASK microcode in U-Boot.\n",
+		       pkg, maj, min, CDX_MIN_FW_PACKAGE);
+		return -ENODEV;
+	}
+
+	pr_info("cdx: FMAN firmware %u.%u.%u - ASK supported\n",
+		pkg, maj, min);
+	return 0;
+}
+
 static int __init cdx_module_init(void)
 {
 	int rc = 0;
 	int ii;
 
 	printk(KERN_INFO "%s\n", __func__);
+
+	rc = cdx_check_fman_firmware();
+	if (rc)
+		return rc;
 
 	for(ii = 0; ii < MAX_CDX_INIT_FUNCTIONS; ii++)
 		deinit_fn[ii] = NULL;
