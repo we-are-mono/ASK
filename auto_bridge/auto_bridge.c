@@ -104,36 +104,40 @@ static void abm_do_work_send_msg(struct work_struct *work)
 	struct br_event_table *brtable_entry;
 	char action = 0;
 
-	if (!netlink_has_listeners(abm_nl, L2FLOW_NL_GRP)){
-		return;
-	}
 	spin_lock_bh(&abm_lock);
-	//TODO : Need to limit the number of messages to sent while holding the lock.
-	list_for_each_safe(entry, tmp, &l2flow_list_msg_to_send){
-		table_entry = container_of(entry, struct l2flowTable, list_msg_to_send);
-		if((table_entry->state == L2FLOW_STATE_SEEN) 
-		|| (table_entry->state == L2FLOW_STATE_CONFIRMED)){
-			action = L2FLOW_ENTRY_NEW;		
-		}
-		else if((table_entry->state == L2FLOW_STATE_LINUX) 
-		|| (table_entry->state == L2FLOW_STATE_FF)){
-			action = L2FLOW_ENTRY_UPDATE;
-		}
-		else if (table_entry->state == L2FLOW_STATE_DYING){
-			action = L2FLOW_ENTRY_DEL;
-		}
-		if(abm_nl_send_l2flow_msg(abm_nl, action, 0, table_entry) != -ENOTCONN){
-			table_entry->flags &= ~L2FLOW_FL_PENDING_MSG;
-			table_entry->flags &= ~L2FLOW_FL_NEEDS_UPDATE;
-			list_del(&table_entry->list_msg_to_send);
-			table_entry->time_sent = jiffies;
-			if(!(table_entry->flags & L2FLOW_FL_WAIT_ACK)){
-				list_add(&table_entry->list_wait_for_ack, &l2flow_list_wait_for_ack);
-				table_entry->flags |= L2FLOW_FL_WAIT_ACK;
+
+	/* l2flow messages only make sense with an abm_nl listener. */
+	if (netlink_has_listeners(abm_nl, L2FLOW_NL_GRP)) {
+		//TODO : Need to limit the number of messages to sent while holding the lock.
+		list_for_each_safe(entry, tmp, &l2flow_list_msg_to_send){
+			table_entry = container_of(entry, struct l2flowTable, list_msg_to_send);
+			if((table_entry->state == L2FLOW_STATE_SEEN)
+			|| (table_entry->state == L2FLOW_STATE_CONFIRMED)){
+				action = L2FLOW_ENTRY_NEW;
+			}
+			else if((table_entry->state == L2FLOW_STATE_LINUX)
+			|| (table_entry->state == L2FLOW_STATE_FF)){
+				action = L2FLOW_ENTRY_UPDATE;
+			}
+			else if (table_entry->state == L2FLOW_STATE_DYING){
+				action = L2FLOW_ENTRY_DEL;
+			}
+			if(abm_nl_send_l2flow_msg(abm_nl, action, 0, table_entry) != -ENOTCONN){
+				table_entry->flags &= ~L2FLOW_FL_PENDING_MSG;
+				table_entry->flags &= ~L2FLOW_FL_NEEDS_UPDATE;
+				list_del(&table_entry->list_msg_to_send);
+				table_entry->time_sent = jiffies;
+				if(!(table_entry->flags & L2FLOW_FL_WAIT_ACK)){
+					list_add(&table_entry->list_wait_for_ack, &l2flow_list_wait_for_ack);
+					table_entry->flags |= L2FLOW_FL_WAIT_ACK;
+				}
 			}
 		}
 	}
 
+	/* Bridge events go to RTNL netlink, not abm_nl — drain regardless
+	 * of L2FLOW_NL_GRP listeners so the dev_hold() paired in
+	 * add_brevent() doesn't leak device refs indefinitely. */
 	list_for_each_safe(entry, tmp, &bridge_list_rtevent){
 		brtable_entry = container_of(entry, struct br_event_table, list_rtevent);
 		if (brtable_entry->brdev)
@@ -141,6 +145,7 @@ static void abm_do_work_send_msg(struct work_struct *work)
 			rtnl_lock();
 			rtmsg_ifinfo(RTM_NEWLINK, brtable_entry->brdev, 0, GFP_ATOMIC, 0, NULL);
 			rtnl_unlock();
+			dev_put(brtable_entry->brdev);
 		}
 		list_del(&brtable_entry->list_rtevent);
 		kmem_cache_free(brroute_cache, brtable_entry);
@@ -208,6 +213,7 @@ static int add_brevent(struct brevent_fdb_update * fdb_update)
 	}
 	memset(brtable_entry, 0, sizeof(*brtable_entry));
 	brtable_entry->brdev = fdb_update->brdev;
+	dev_hold(brtable_entry->brdev);
 	list_add(&brtable_entry->list_rtevent, &bridge_list_rtevent);
 
 	return 0;
@@ -1188,8 +1194,24 @@ static int abm_l2flow_table_init(void)
 ****************************************************************************/
 static void abm_l2flow_table_exit(void)
 {
+	struct list_head *entry, *tmp;
+	struct br_event_table *brtable_entry;
+
 	abm_l2flow_table_flush();
 	abm_l2flow_table_wait_timers();
+
+	/* Drop any bridge events not yet processed by the workqueue so
+	 * the dev_hold() from add_brevent() is balanced before unload. */
+	spin_lock_bh(&abm_lock);
+	list_for_each_safe(entry, tmp, &bridge_list_rtevent) {
+		brtable_entry = container_of(entry, struct br_event_table, list_rtevent);
+		if (brtable_entry->brdev)
+			dev_put(brtable_entry->brdev);
+		list_del(&brtable_entry->list_rtevent);
+		kmem_cache_free(brroute_cache, brtable_entry);
+	}
+	spin_unlock_bh(&abm_lock);
+
 	kmem_cache_destroy(l2flow_cache);
 	kmem_cache_destroy(brroute_cache);
 }
@@ -1402,6 +1424,9 @@ static void  abm_proc_fini(void)
 
 static struct ctl_table_header *abm_sysctl_hdr;
 
+static unsigned int abm_max_entries_min = 1;
+static unsigned int abm_max_entries_max = 1000000;
+
 static int abm_sysctl_l3_filtering(const struct ctl_table *ctl, int write,
 				  void *buffer,
 				  size_t *lenp, loff_t *ppos)
@@ -1410,7 +1435,12 @@ static int abm_sysctl_l3_filtering(const struct ctl_table *ctl, int write,
 	int val = *valp;
 	int rc;
 	int old_abm_l3_filtering = abm_l3_filtering;
-	int ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	int ret;
+
+	if (write && !capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
 
 	if (write && *valp != val) {
 		if(((!old_abm_l3_filtering) && *valp) || (old_abm_l3_filtering && (!*valp))){
@@ -1474,7 +1504,9 @@ static struct ctl_table abm_sysctl_table[] = {
 		.data		= &abm_max_entries,
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
+		.proc_handler	= proc_douintvec_minmax,
+		.extra1		= &abm_max_entries_min,
+		.extra2		= &abm_max_entries_max,
 	},
 };
 

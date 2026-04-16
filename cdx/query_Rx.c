@@ -9,9 +9,16 @@
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include "cdx.h"
 #include "control_bridge.h"
 #include "misc.h"
+
+/* Serializes the static pagination cursors below. The list walk
+ * itself remains unprotected because the l2flow_hash_table subsystem
+ * is currently lock-free on the mutator side too; fixing that race
+ * is tracked as an architectural follow-up (A2). */
+static DEFINE_MUTEX(l2flow_query_mutex);
 
 //snap shot buffer pointer
 static PL2BridgeL2FlowEntryCommand pL2FlowSnapshot = NULL;
@@ -66,6 +73,8 @@ int rx_Get_Next_Hash_L2FlowEntry(PL2BridgeL2FlowEntryCommand pL2FlowCmd, int res
 {
 	int retval;
 	int L2Flow_hash_entries;
+
+	mutex_lock(&l2flow_query_mutex);
 
 	if(reset_action){
 		/* start all over */
@@ -129,12 +138,14 @@ int rx_Get_Next_Hash_L2FlowEntry(PL2BridgeL2FlowEntryCommand pL2FlowCmd, int res
 	rx_Get_Hash_Snapshot_L2FlowEntries(L2Flow_hash_index, pL2FlowSnapshot);
 	L2Flow_hash_index++;
 	//release the bucket
-return_next_entry:	
+return_next_entry:
 	memcpy(pL2FlowCmd, &pL2FlowSnapshot[L2Flow_snapshot_index], sizeof(L2BridgeL2FlowEntryCommand));
 	//move to next index
 	L2Flow_snapshot_index++;
 	//if no more entries are at this bucket, increment hash index and zero the index
+	mutex_unlock(&l2flow_query_mutex);
 	return NO_ERR;
 err_ret:
-	return retval;		
+	mutex_unlock(&l2flow_query_mutex);
+	return retval;
 }

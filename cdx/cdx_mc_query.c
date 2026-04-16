@@ -7,6 +7,8 @@
  * included with this distribution or at http://www.gnu.org/licenses/gpl-2.0.html
  *
  */
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include "cdx.h"
 #include "list.h"
 #include "cdx_common.h"
@@ -15,6 +17,11 @@
 #include "layer2.h"
 #include "fe.h"
 #include "dpa_control_mc.h"
+
+/* Serializes the static pagination cursors below against concurrent
+ * callers. The per-bucket mc4/mc6 spinlocks additionally protect the
+ * list walks against concurrent mutators. */
+static DEFINE_MUTEX(mc_query_mutex);
 
 /* This function returns total multicast entries 
    configured in a given hash index */
@@ -26,6 +33,7 @@ static int MC4_Get_Hash_Entries(int mc4_hash_index)
 	struct mcast_group_info *pMcastGrpInfo;
 	struct list_head *ptr;
 
+	spin_lock(&mc4_spinlocks[mc4_hash_index]);
 	list_for_each(ptr, &mc4_grp_list[mc4_hash_index])
 	{
 		pMcastGrpInfo = list_entry(ptr,struct mcast_group_info,list);
@@ -33,6 +41,7 @@ static int MC4_Get_Hash_Entries(int mc4_hash_index)
 		if((pMcastGrpInfo->uiListenerCnt > MC4_MAX_LISTENERS_IN_QUERY))
 			tot_mc4_entries++;
 	}
+	spin_unlock(&mc4_spinlocks[mc4_hash_index]);
 	return tot_mc4_entries;
 
 }
@@ -46,6 +55,7 @@ static int MC4_Get_Hash_Snapshot(int mc4_hash_index, int mc4_tot_entries, PMC4Co
 	struct list_head *ptr;
 	int j = 0;
 
+	spin_lock(&mc4_spinlocks[mc4_hash_index]);
 	list_for_each(ptr, &mc4_grp_list[mc4_hash_index])
 	{
 		pMcastGrpInfo = list_entry(ptr,struct mcast_group_info,list);
@@ -81,12 +91,13 @@ static int MC4_Get_Hash_Snapshot(int mc4_hash_index, int mc4_tot_entries, PMC4Co
 		if (mc4_tot_entries == 0)
 			break;
 	}
+	spin_unlock(&mc4_spinlocks[mc4_hash_index]);
 
 	return tot_mc4_entries;
 }
 
 
-/* This function creates the snapshot memory and returns the 
+/* This function creates the snapshot memory and returns the
 	 next MC4 entry from the snapshot of the MC4 entries of a
 	 single hash to the caller  */
 
@@ -94,8 +105,11 @@ int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action)
 {
 	int mc4_hash_entries;
 	PMC4Command pMC4;
+	int retval;
 	static PMC4Command pMC4Snapshot = NULL;
 	static int mc4_hash_index = 0, mc4_snapshot_entries =0, mc4_snapshot_index=0, mc4_snapshot_buf_entries = 0;
+
+	mutex_lock(&mc_query_mutex);
 
 	if(reset_action)
 	{
@@ -133,7 +147,8 @@ int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action)
 				{
 					mc4_hash_index = 0;
 					mc4_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				mc4_snapshot_buf_entries = mc4_hash_entries;
 			}
@@ -152,7 +167,8 @@ int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action)
 				pMC4Snapshot = NULL;
 			}
 			mc4_snapshot_buf_entries = 0;
-			return ERR_MC_ENTRY_NOT_FOUND;
+			retval = ERR_MC_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -164,7 +180,10 @@ int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action)
 		mc4_snapshot_index = 0;
 		mc4_hash_index ++;
 	}
-	return NO_ERR;	
+	retval = NO_ERR;
+out:
+	mutex_unlock(&mc_query_mutex);
+	return retval;
 
 }
 
@@ -177,6 +196,7 @@ static int MC6_Get_Hash_Entries(int mc6_hash_index)
 	struct mcast_group_info *pMcastGrpInfo;
 	struct list_head *ptr;
 
+	spin_lock(&mc6_spinlocks[mc6_hash_index]);
 	list_for_each(ptr, &mc6_grp_list[mc6_hash_index])
 	{
 		pMcastGrpInfo = list_entry(ptr,struct mcast_group_info,list);
@@ -185,6 +205,7 @@ static int MC6_Get_Hash_Entries(int mc6_hash_index)
 		if(pMcastGrpInfo->uiListenerCnt > MC4_MAX_LISTENERS_IN_QUERY)
 			tot_mc6_entries++;
 	}
+	spin_unlock(&mc6_spinlocks[mc6_hash_index]);
 
 	return tot_mc6_entries;
 
@@ -199,6 +220,7 @@ static int MC6_Get_Hash_Snapshot(int mc6_hash_index, int mc6_tot_entries, PMC6Co
 	struct mcast_group_info *pMcastGrpInfo;
 	struct list_head *ptr;
 
+	spin_lock(&mc6_spinlocks[mc6_hash_index]);
 	list_for_each(ptr, &mc6_grp_list[mc6_hash_index])
 	{
 		pMcastGrpInfo = list_entry(ptr,struct mcast_group_info,list);
@@ -233,6 +255,7 @@ static int MC6_Get_Hash_Snapshot(int mc6_hash_index, int mc6_tot_entries, PMC6Co
 		if (mc6_tot_entries == 0)
 			break;
 	}
+	spin_unlock(&mc6_spinlocks[mc6_hash_index]);
 
 	return tot_mc6_entries;
 }
@@ -246,8 +269,11 @@ int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action)
 {
 	int mc6_hash_entries;
 	PMC6Command pMC6;
+	int retval;
 	static PMC6Command pMC6Snapshot = NULL;
 	static int mc6_hash_index = 0, mc6_snapshot_entries =0, mc6_snapshot_index=0, mc6_snapshot_buf_entries = 0;
+
+	mutex_lock(&mc_query_mutex);
 
 	if(reset_action)
 	{
@@ -284,7 +310,8 @@ int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action)
 				{
 					mc6_hash_index = 0;
 					mc6_snapshot_buf_entries = 0;
-					return ERR_NOT_ENOUGH_MEMORY;
+					retval = ERR_NOT_ENOUGH_MEMORY;
+					goto out;
 				}
 				mc6_snapshot_buf_entries = mc6_hash_entries;
 			}
@@ -300,10 +327,11 @@ int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action)
 			if(pMC6Snapshot)
 			{
 				Heap_Free(pMC6Snapshot);
-				pMC6Snapshot = NULL;	
+				pMC6Snapshot = NULL;
 			}
 			mc6_snapshot_buf_entries =  0;
-			return ERR_MC_ENTRY_NOT_FOUND;
+			retval = ERR_MC_ENTRY_NOT_FOUND;
+			goto out;
 		}
 
 	}
@@ -316,6 +344,9 @@ int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action)
 		mc6_hash_index ++;
 	}
 
-	return NO_ERR;	
+	retval = NO_ERR;
+out:
+	mutex_unlock(&mc_query_mutex);
+	return retval;
 
 }

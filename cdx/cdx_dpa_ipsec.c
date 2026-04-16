@@ -208,11 +208,11 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 	if(pdpa_sec_context->dpa_ipsecsa_handle)
 		cdx_dpa_ipsecsa_release(pdpa_sec_context->dpa_ipsecsa_handle);
 	if(pdpa_sec_context->cipher_data.cipher_key)
-		kfree(pdpa_sec_context->cipher_data.cipher_key);
+		kfree_sensitive(pdpa_sec_context->cipher_data.cipher_key);
 	if(pdpa_sec_context->auth_data.auth_key)
-		kfree(pdpa_sec_context->auth_data.auth_key);
+		kfree_sensitive(pdpa_sec_context->auth_data.auth_key);
 	if(pdpa_sec_context->auth_data.split_key)
-		kfree(pdpa_sec_context->auth_data.split_key); 
+		kfree_sensitive(pdpa_sec_context->auth_data.split_key);
 	if(pdpa_sec_context->sec_desc_extra_cmds_unaligned)
 		kfree(pdpa_sec_context->sec_desc_extra_cmds_unaligned);
 	if(pdpa_sec_context->rjob_desc_unaligned)
@@ -1942,13 +1942,14 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 		}
 	}
 
-	crypto_key_dma = dma_map_single(jrdev_g, 
+	crypto_key_dma = dma_map_single(jrdev_g,
 			psec_sa_context->cipher_data.cipher_key,
 			psec_sa_context->cipher_data.cipher_key_len,
 			DMA_TO_DEVICE);
 	if (!crypto_key_dma) {
 		log_err("Could not DMA map cipher key\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_unmap_auth;
 	}
 
 	/*
@@ -1956,9 +1957,9 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	 * 64 words. If build_shared_descriptor returns -EPERM than it is
 	 * required to build the extended shared descriptor in order to have
 	 * all the SA features that were required.
-	 * Forth argument is passed was l2_hdr_size. Since we already removed 
-	 * L2 header before passing to sec , I am passing zero. 
-	 * This need to be revisited and corrected if required.  
+	 * Forth argument is passed was l2_hdr_size. Since we already removed
+	 * L2 header before passing to sec , I am passing zero.
+	 * This need to be revisited and corrected if required.
 	 */
 
 	ret = cdx_ipsec_build_shared_descriptor(sa, auth_key_dma, crypto_key_dma,
@@ -1972,32 +1973,34 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 			goto build_extended_shared_desc;
 		default:
 			log_err("Failed to create SEC descriptor for SA with   spi %d\n", sa->id.spi);
-			return -EFAULT;
+			ret = -EFAULT;
+			goto err_unmap_crypto;
 	}
 
 build_extended_shared_desc:
 	/* Build the extended shared descriptor */
 	if (sa->direction == CDX_DPA_IPSEC_INBOUND)
-		ret = cdx_ipsec_build_extended_decap_shared_descriptor(sa, 
+		ret = cdx_ipsec_build_extended_decap_shared_descriptor(sa,
 				auth_key_dma,
 				crypto_key_dma, 0, 64,
 				sec_era);
 	else
-		ret = cdx_ipsec_build_extended_encap_shared_descriptor(sa, 
+		ret = cdx_ipsec_build_extended_encap_shared_descriptor(sa,
 				auth_key_dma,
 				crypto_key_dma, 0 ,
 				sec_era);
 	if (ret < 0) {
-		log_err("Failed to create SEC descriptor for SA with spi %d\n", 
+		log_err("Failed to create SEC descriptor for SA with spi %d\n",
 				sa->id.spi);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto err_unmap_crypto;
 	}
 
 done_shared_desc:
 	sec_desc = psec_sa_context->sec_desc;
 	/* setup preheader */
 
-	PREHEADER_PREP_IDLEN(sec_desc->preheader, 
+	PREHEADER_PREP_IDLEN(sec_desc->preheader,
 			desc_len(sec_desc->shared_desc));
 	PREHEADER_PREP_BPID(sec_desc->preheader, bpid);
 	PREHEADER_PREP_BSIZE(sec_desc->preheader, buf_size); // 0 indicates max size
@@ -2010,28 +2013,47 @@ done_shared_desc:
 		PREHEADER_PREP_OFFSET(sec_desc->preheader,
 				post_sec_out_data_off);
 	}
-	//printk("%s::preheader %p\n", __func__, 
+	//printk("%s::preheader %p\n", __func__,
 	//	(void *)sec_desc->preheader);
 	sec_desc->preheader = cpu_to_caam64(sec_desc->preheader);
 
+	dma_unmap_single(jrdev_g, crypto_key_dma,
+			psec_sa_context->cipher_data.cipher_key_len,
+			DMA_TO_DEVICE);
 	if (psec_sa_context->auth_data.split_key_pad_len)
 		dma_unmap_single(jrdev_g, auth_key_dma,
-				psec_sa_context->auth_data.split_key_pad_len, 
+				psec_sa_context->auth_data.split_key_pad_len,
 				DMA_TO_DEVICE);
 	else if (psec_sa_context->auth_data.auth_key_len)
 		dma_unmap_single(jrdev_g, auth_key_dma,
-				psec_sa_context->auth_data.auth_key_len, 
+				psec_sa_context->auth_data.auth_key_len,
 				DMA_TO_DEVICE);
-	dma_unmap_single(jrdev_g, crypto_key_dma,
-			psec_sa_context->cipher_data.cipher_key_len, 
-			DMA_TO_DEVICE);
+	/* Flush the CPU-cached writes to sec_desc (preheader, PDB,
+	 * shared_desc) out to memory so the SEC engine reads them
+	 * correctly later. The address is unused; only the cache-sync
+	 * side-effect of the map/unmap pair matters. */
 	shared_desc_dma = dma_map_single(jrdev_g, sec_desc,
 			sizeof(struct sec_descriptor),
 			DMA_TO_DEVICE);
-	dma_unmap_single(jrdev_g, shared_desc_dma, 
+	dma_unmap_single(jrdev_g, shared_desc_dma,
 			sizeof(struct sec_descriptor),
 			DMA_TO_DEVICE);
 	return 0;
+
+err_unmap_crypto:
+	dma_unmap_single(jrdev_g, crypto_key_dma,
+			psec_sa_context->cipher_data.cipher_key_len,
+			DMA_TO_DEVICE);
+err_unmap_auth:
+	if (psec_sa_context->auth_data.split_key_pad_len)
+		dma_unmap_single(jrdev_g, auth_key_dma,
+				psec_sa_context->auth_data.split_key_pad_len,
+				DMA_TO_DEVICE);
+	else if (psec_sa_context->auth_data.auth_key_len)
+		dma_unmap_single(jrdev_g, auth_key_dma,
+				psec_sa_context->auth_data.auth_key_len,
+				DMA_TO_DEVICE);
+	return ret;
 }
 
 static void split_key_done(struct device *dev, u32 *desc, u32 err,
@@ -2309,7 +2331,7 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 			natt_tbl_entry = (struct en_exthash_tbl_entry *)sa->ct->handle;
 			ipsec_preempt_params = (struct en_ehash_ipsec_preempt_op*) natt_tbl_entry->ipsec_preempt_params;
 			arr_index = get_free_natt_arr_index(be16_to_cpu(ipsec_preempt_params->natt_arr_mask));
-			if (arr_index > MAX_SPI_PER_FLOW)
+			if (arr_index >= MAX_SPI_PER_FLOW)
 				goto err_ret;
 			sa->ct->natt_in_refcnt++;
 			ipsec_preempt_params->spi_param[arr_index].spi = sa->id.spi;
@@ -2349,6 +2371,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	uint32_t sa_dir_in = 0;
 	uint32_t  itf_id = 0;
 	uint32_t bytes_to_copy = ETH_HDR_LEN;
+	bool sh_desc_just_built = false;
 
 #ifdef CDX_DPA_DEBUG
 	printk("%s:: direction %d\n", __func__, sa->direction);
@@ -2488,6 +2511,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 			goto err_ret;
 		}
 		sa->flags |= SA_SH_DESC_BUILT;
+		sh_desc_just_built = true;
 	}
 	//get table descriptor based on type and port
 	info->td = sa->ct->td;
@@ -2580,10 +2604,15 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	kfree(info);
 	return SUCCESS;
 err_ret:
+	/* If we built the shared descriptor in this call but the table
+	 * insert later failed, clear the flag so a retry rebuilds the
+	 * descriptor from a consistent state. pSec_sa_context lifetime
+	 * is owned elsewhere, so don't free it here. */
+	if (sh_desc_just_built)
+		sa->flags &= ~SA_SH_DESC_BUILT;
 	if (sa->ct)
 	{
 		kfree(sa->ct);
-		/*shared descriptor to be released? TBD??? */
 		sa->ct = NULL;
 	}
 	if (tbl_entry)

@@ -108,6 +108,8 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 void AddToMcastGrpList(struct mcast_group_info *pMcastGrpInfo);
 extern struct list_head mc4_grp_list[MC4_NUM_HASH_ENTRIES];
 extern struct list_head mc6_grp_list[MC6_NUM_HASH_ENTRIES];
+extern spinlock_t *mc4_spinlocks;
+extern spinlock_t *mc6_spinlocks;
 int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6);
 
 struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo);

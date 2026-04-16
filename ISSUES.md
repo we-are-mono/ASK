@@ -82,32 +82,44 @@ Memory corruption or info-leak reachable from userspace (unprivileged once G1 is
   [cdx/dpa_cfg.c:588-719](cdx/dpa_cfg.c#L588-L719). `fman_info` and `num_fmans` are rewritten while other contexts (policer, query, etc.) read them lock-free. Concurrent ioctls → UAF on the old `fman_info`. **Fix:** take a dedicated module-level mutex for the whole config-set operation; audit readers and either take the same mutex or convert to RCU.
   _Done: added `static DEFINE_MUTEX(dpa_cfg_lock)` in dpa_cfg.c and took it for the whole `cdx_ioc_set_dpa_params` body. On entry, reject re-init with `-EBUSY` if `fman_info` is already set — the original code just overwrote and leaked the old pointer, which was the real UAF vector. Converted the three mid-function bare `return -1;` leaks (`cdxdrv_get_fman_handles`, `cdxdrv_init_stats`, `cdx_create_port_fqs` failure paths) into `retval = -EIO; goto err_ret;` so teardown and unlock run. Same for the three goto-err-ret sites that previously left `retval` uninitialized (`cdxdrv_create_ingress_qos_policer_profiles`, `ceetm_init_cq_plcr`, `cdxdrv_set_miss_action`). Reader-during-init race remains theoretical (A2): in practice init runs once at boot before any traffic, so readers never see partial state._
 
-- [ ] **H2. IPsec SA key material not zeroed on free.**
+- [x] **H2. IPsec SA key material not zeroed on free.**
   [cdx/cdx_dpa_ipsec.c:205-222](cdx/cdx_dpa_ipsec.c#L205-L222). `cipher_key`, `auth_key`, `split_key` are freed with plain `kfree()`. **Fix:** replace with `kfree_sensitive()` (Linux ≥5.10), or `memzero_explicit(ptr, len); kfree(ptr);`. Track each buffer's length alongside the pointer since `kfree_sensitive` handles that automatically.
+  _Done: three key-field `kfree` calls in `cdx_ipsec_sec_sa_context_free` replaced with `kfree_sensitive`. Non-key descriptor fields (`sec_desc_extra_cmds_unaligned`, `rjob_desc_unaligned`) kept as plain `kfree`._
 
-- [ ] **H3. IPsec error paths leak DMA mappings.**
+- [x] **H3. IPsec error paths leak DMA mappings.**
   [cdx/cdx_dpa_ipsec.c:1964-1995](cdx/cdx_dpa_ipsec.c#L1964-L1995). On non-zero return from `cdx_ipsec_build_shared_descriptor`, `auth_key_dma` and `crypto_key_dma` are left mapped. Also [cdx/cdx_dpa_ipsec.c:2580-2593](cdx/cdx_dpa_ipsec.c#L2580-L2593) has an explicit `TBD???` comment about leaking the shared descriptor on table-insert failure. **Fix:** single error label that unmaps in reverse of the success order; free the shared-descriptor context via `cdx_ipsec_sec_sa_context_free()` on failure.
+  _Done: `cdx_ipsec_create_shareddescriptor` now has a two-label unwind (`err_unmap_crypto` / `err_unmap_auth`) covering the three previous leak paths — crypto-key map failure, default switch case (build_shared_descriptor returning other than 0 or -EPERM), and extended-build failure. `cdx_ipsec_add_classification_table_entry` tracks whether it built the shared descriptor in this call; on failure it clears `SA_SH_DESC_BUILT` so a retry rebuilds cleanly (addresses the `TBD???` without making lifetime assumptions about `pSec_sa_context`, which is owned elsewhere). M7 collapses into H3._
 
-- [ ] **H4. Suspicious DMA map-then-immediately-unmap for CAAM descriptor.**
+- [-] **H4. Suspicious DMA map-then-immediately-unmap for CAAM descriptor.**
   [cdx/cdx_dpa_ipsec.c:2028-2033](cdx/cdx_dpa_ipsec.c#L2028-L2033). The shared descriptor is mapped, then unmapped, both within the same call site, with no intervening hardware access visible here. If the descriptor's bus address is being cached elsewhere for later use by SEC, this is a DMA use-after-unmap. **Fix:** verify on hardware whether CAAM actually needs the cached DMA handle beyond this call. If yes, keep the mapping alive and unmap on SA teardown; if no, delete the dead `dma_map_single` entirely.
+  _Not a bug, correction to the agent's claim:_ `shared_desc_dma` is a local that is never stored or passed anywhere, so there's no use-after-unmap. The pair is a legitimate cache-flush idiom — `dma_map_single(..., DMA_TO_DEVICE)` flushes the CPU-cached writes to `sec_desc` (preheader, PDB, shared_desc) out to memory, and the matching unmap on `DMA_TO_DEVICE` is a no-op that releases bookkeeping. On non-coherent ARM64 this flush is necessary; the SEC engine reads the descriptor later via the handle stored in `dpa_ipsecsa_handle`. Added a comment documenting the intent so a future reader doesn't flag it again._
 
-- [ ] **H5. NAT-T SPI array bound is off-by-one.**
+- [x] **H5. NAT-T SPI array bound is off-by-one.**
   [cdx/cdx_dpa_ipsec.c:2310-2318](cdx/cdx_dpa_ipsec.c#L2310-L2318). `if (arr_index > MAX_SPI_PER_FLOW) goto err_ret;` admits `arr_index == MAX_SPI_PER_FLOW`, one past the array. **Fix:** change to `>=`.
+  _Done: `>` → `>=`. `get_free_natt_arr_index` returns `MAX_SPI_PER_FLOW` when the mask is full, so that exact value must be rejected._
 
-- [ ] **H6. auto_bridge iterates hash buckets with lock drop between buckets.**
+- [-] **H6. auto_bridge iterates hash buckets with lock drop between buckets.**
   [auto_bridge/auto_bridge.c:232-251](auto_bridge/auto_bridge.c#L232-L251). `spin_lock_bh(&abm_lock) / spin_unlock_bh` inside the `for (i < L2FLOW_HASH_TABLE_SIZE)` loop. A cached `table_entry` pointer carried across iterations can be freed by a concurrent writer. **Fix:** either hold the lock across the whole scan (check it's not called from a softirq path that would dead-bh), or take references / use RCU for the entries.
+  _Not a concrete bug, correction to the agent's claim:_ `table_entry` is rebound each inner iteration via `container_of`, never persisted across outer iterations. The only mutator called inside (`__abm_go_dying`) does not remove the entry from the current bucket — it only flips state/flags, adds to `l2flow_list_wait_for_ack`, and schedules a timer. Hash keys are immutable after insert, so entries never rehash between buckets. The lock-drop between buckets is a deliberate bounded-hold-time design for port-down sweeps that can touch thousands of entries. Concurrent writers serialize on the same lock. Filed-away improvement: switch to `list_for_each_safe` inside each bucket so a future modification that does `list_del` won't silently UAF — but that's forward-hardening, not a current fix._
 
-- [ ] **H7. auto_bridge stores `net_device *` without `dev_hold()`.**
+- [x] **H7. auto_bridge stores `net_device *` without `dev_hold()`.**
   [auto_bridge/auto_bridge.c:210](auto_bridge/auto_bridge.c#L210) and use at [line 139-143](auto_bridge/auto_bridge.c#L139-L143). Pointer persists across a workqueue boundary with no refcount. **Fix:** `dev_hold()` at capture, `dev_put()` when the work completes or the entry is freed. Prefer storing `ifindex` and re-resolving with `dev_get_by_index_rcu()` at use time if the pointer isn't needed for identity.
+  _Done: `dev_hold()` added in `add_brevent` (caller already guarantees non-NULL brdev), paired `dev_put()` in the `abm_do_work_send_msg` drain and a new drain in `abm_l2flow_table_exit` so entries pending at module unload are balanced. Also lifted the "skip everything if no L2FLOW_NL_GRP listener" early return — bridge events use RTNL netlink, not abm_nl, and were being starved (plus, once dev_hold was added, a pile-up with no listeners would have indefinitely blocked `unregister_netdevice`). The l2flow msg drain stays gated on abm_nl listeners; the bridge drain runs unconditionally._
 
-- [ ] **H8. auto_bridge sysctl is world-writable, triggers state flush.**
+- [x] **H8. auto_bridge sysctl is world-writable, triggers state flush.**
   [auto_bridge/auto_bridge.c:1385-1406](auto_bridge/auto_bridge.c#L1385-L1406). `abm_l3_filtering` is mode `0644`; a write calls `abm_l2flow_table_flush()`. `abm_max_entries` (same file, ~1453) accepts any `u32` including 0. **Fix:** set mode to `0600`, or add an explicit `capable(CAP_NET_ADMIN)` check in a custom `.proc_handler`. Add a lower bound on `abm_max_entries`.
+  _Correction + done:_ `0644` on proc/sys nodes is owner-writable only (others read-only), not "world-writable" — the agent's phrasing was off. The defense-in-depth concern stands, so `abm_sysctl_l3_filtering` now rejects writes from callers without `CAP_NET_ADMIN`. `abm_max_entries` switched from `proc_dointvec` to `proc_douintvec_minmax` with bounds [1, 1_000_000] — rejects 0 (which silently broke the `abm_nb_entries >= abm_max_entries` gate) and rejects absurd upper values. The timeout/retransmit sysctls stay on `proc_dointvec_jiffies`; they only adjust timing, not state-mutating._
 
-- [ ] **H9. Query-snapshot static state is shared and lock-free.**
+- [~] **H9. Query-snapshot static state is shared and lock-free.**
   Statics for pagination in multiple files — [cdx/cdx_mc_query.c](cdx/cdx_mc_query.c) (mc4/mc6 snapshot globals), [cdx/query_Rx.c:65-140](cdx/query_Rx.c#L65-L140), [cdx/control_ipv4.c:1542-1543](cdx/control_ipv4.c#L1542-L1543), [cdx/control_ipv6.c:716-717](cdx/control_ipv6.c#L716-L717), [cdx/control_vlan.c:315-316](cdx/control_vlan.c#L315-L316), [cdx/control_tunnel.c:714-715](cdx/control_tunnel.c#L714-L715). Two concurrent enumerators corrupt each other's cursors; the walked lists can be mutated concurrently → UAF. **Fix:** move cursor state into the per-open `file->private_data`, or at minimum take the corresponding table lock during the entire snapshot build. List walks in `cdx_mc_query.c` ([lines 29,49,180,202](cdx/cdx_mc_query.c#L29)) must take the same `mc4_spinlocks`/`mc6_spinlocks` the mutators use.
+  _Partial done:_
+  - `cdx_mc_query.c`: added `mc_query_mutex` serializing MC4/MC6 cursor state, and took the existing `mc4_spinlocks[hash]`/`mc6_spinlocks[hash]` around the inner list walks in `MC{4,6}_Get_Hash_Entries` and `MC{4,6}_Get_Hash_Snapshot`. Now matches the locking the mutators use. Exported the spinlock symbols in `dpa_control_mc.h`.
+  - `cdx/query_Rx.c`: added `l2flow_query_mutex` around `rx_Get_Next_Hash_L2FlowEntry`. The list walk itself stays unprotected because the underlying `l2flow_hash_table` subsystem is lock-free on the mutator side too (see `control_bridge.c` — walks and inserts with no lock). That's an architectural fix tied to A2, not fixable from the query path alone.
+  - Deferred to follow-up: `control_ipv4.c`, `control_ipv6.c`, `control_vlan.c`, `control_tunnel.c` snapshot cursors. Each has its own statics and its own per-subsystem locking story — touching them is a larger change than the rest of this pass warrants. Each needs either the same mutex-around-cursor treatment or a move to `file->private_data`._
 
-- [ ] **H10. `strncpy_from_user` truncation not checked.**
+- [x] **H10. `strncpy_from_user` truncation not checked.**
   [cdx/dpa_test.c:127,143,187,203](cdx/dpa_test.c#L127). Return value only tested for `== -EFAULT`; positive return equal to buffer size means "truncated, no NUL". **Fix:** `n = strncpy_from_user(buf, src, sizeof(buf)); if (n < 0) return -EFAULT; if (n >= sizeof(buf)) return -ENAMETOOLONG;` and ensure `buf[sizeof(buf)-1] = '\0'` anyway. (May be mooted if C9 removes `dpa_test.c`.)
+  _Moot — all four cited sites were in `cdx/dpa_test.c` which C9b deleted._
 
 ---
 
@@ -131,8 +143,9 @@ Memory corruption or info-leak reachable from userspace (unprivileged once G1 is
 - [ ] **M6. auto_bridge module-exit busy-loop.**
   [auto_bridge/auto_bridge.c:1109-1125](auto_bridge/auto_bridge.c#L1109-L1125). `abm_l2flow_table_wait_timers` spins with `schedule()` until all buckets empty. Module unload can hang indefinitely. **Fix:** cancel timers synchronously (`timer_shutdown_sync` per entry) during exit, then a single empty-check instead of a loop.
 
-- [ ] **M7. `cdx_ipsec_add_classification_table_entry` explicit TBD leak.**
+- [x] **M7. `cdx_ipsec_add_classification_table_entry` explicit TBD leak.**
   Same issue as H3 but with a self-acknowledged `TBD???` comment at [cdx/cdx_dpa_ipsec.c:2586](cdx/cdx_dpa_ipsec.c#L2586). Track separately so it gets a real fix rather than a move.
+  _Done as part of H3 — SA_SH_DESC_BUILT now rolls back on error._
 
 ---
 
