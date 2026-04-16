@@ -49,9 +49,36 @@ struct cdx_ipr_info ipr_info;
 #define CDX_MAX_DIST		256
 #define CDX_MAX_TABLES		256
 
-/* Serializes CDX_CTRL_DPA_SET_PARAMS. Config is set once at dpa_app
- * init; a second caller is rejected with -EBUSY rather than racing
- * against readers holding the old fman_info pointer. */
+/*
+ * Concurrency:
+ *   dpa_cfg_lock (file-local mutex)
+ *      - Serializes the one-shot install of the DPA configuration
+ *        (fman_info, num_fmans, ipr_info, associated port/table/
+ *        distribution sub-allocations). Held for the whole body of
+ *        cdx_ioc_set_dpa_params(). release_cfg_info() assumes it
+ *        is held by the caller.
+ *
+ *   fman_info, num_fmans (file-scope globals)
+ *      - Populated exactly once, in cdx_ioc_set_dpa_params() under
+ *        dpa_cfg_lock, on the first successful call. A second call
+ *        is rejected with -EBUSY. All later readers (dpa_get_tdinfo,
+ *        dpa_get_wan_port, cdx_ingress_*, cdx_get_policer_profile_id,
+ *        etc.) observe a stable pointer and count; they run lock-
+ *        free on packet/ioctl paths because the one-time-init
+ *        ordering is guaranteed by the CAP_NET_ADMIN-gated ioctl
+ *        and the run-once dpa_app boot sequence.
+ *
+ *   ipr_info (file-scope global)
+ *      - Written once in the same set_params call, read by
+ *        cdx_reassm.c; see that file for the init-completion
+ *        ordering that makes lock-free reads safe.
+ *
+ * Contexts:
+ *   cdx_ioc_set_dpa_params()         - process, ioctl path.
+ *   display_dpa_cfg(), release_cfg_info()
+ *                                    - process, called under lock.
+ *   dpa_get_*() readers              - any context, lock-free after init.
+ */
 static DEFINE_MUTEX(dpa_cfg_lock);
 
 #ifdef DPA_CFG_DEBUG
@@ -152,7 +179,7 @@ int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags
 }
 
 //release all configuration releated resources
-static void release_cfg_info(void)
+static void release_cfg_info(void) __must_hold(&dpa_cfg_lock)
 {
 	struct cdx_fman_info *finfo;
 	uint32_t ii;

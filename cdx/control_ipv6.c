@@ -15,7 +15,18 @@
 #include "control_socket.h"
 #include "control_ipsec.h"
 
-/* Serializes the IPv6 CT query cursor state. */
+/*
+ * Concurrency:
+ *   ipv6_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in
+ *        IPv6_Get_Next_Hash_CTEntry (pV6CtSnapshot, v6_ct_*).
+ *
+ * Same caveat as control_ipv4.c: the CT table itself is lock-free
+ * on both sides; this mutex only protects the cursor state.
+ *
+ * Contexts: public entry point runs in process context from the
+ * ioctl dispatcher.
+ */
 static DEFINE_MUTEX(ipv6_query_mutex);
 
 static int ipv6_cmp_aligned(void *src, void *dst)

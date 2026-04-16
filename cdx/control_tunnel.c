@@ -20,8 +20,23 @@
 
 extern spinlock_t dpa_devlist_lock;
 
-/* Serializes the static pagination cursors in both Tnl_Get_Next_*
- * functions. */
+/*
+ * Concurrency:
+ *   tnl_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in both
+ *        Tnl_Get_Next_Hash_Entry (pTnlSnapshot, tnl_*) and
+ *        stat_tunnel_Get_Next_SessionEntry (pStatTunnelSnapshot,
+ *        stat_tunnel_*, stat_tunnel_name).
+ *   dpa_devlist_lock (owned by devman.c)
+ *      - Acquired briefly in tunnel_stats_get() while looking up
+ *        iface_info by index; not held across tunnel table walks.
+ *
+ * The tunnel_name_cache slist is currently lock-free on the mutator
+ * side too. Same gap as the IPv4/IPv6 cases.
+ *
+ * Contexts: both public entry points run in process context from
+ * the ioctl dispatcher.
+ */
 static DEFINE_MUTEX(tnl_query_mutex);
 
 U8 gStatTunnelQueryStatus;

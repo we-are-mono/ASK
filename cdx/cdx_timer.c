@@ -12,6 +12,27 @@
 
 #include "cdx.h"
 
+/*
+ * Concurrency:
+ *   x_inner, x_outer (file-scope wheel positions)
+ *   ctrl->timer_inner_wheel, ctrl->timer_outer_wheel
+ *      - The inner/outer timer wheels and their position counters
+ *        are protected by cdx_info->ctrl.lock (spinlock owned by
+ *        cdx_main.c). All modifications (__timer_add, __timer_del,
+ *        tick progression in the kthread) take this spinlock via
+ *        spin_lock_bh / spin_unlock_bh since ticks may fire from
+ *        softirq on some paths.
+ *   ctrl->timer_thread
+ *      - Started in cdx_main.c under ctrl->mutex; runs until
+ *        cdx_ctrl_timer_exit() stops it via kthread_stop.
+ *
+ * Internal helpers (__timer_add, __timer_del) assume caller holds
+ * ctrl->lock. They are marked __must_hold below.
+ *
+ * Contexts:
+ *   public TIMER_START/STOP wrappers - process, take ctrl->lock.
+ *   timer kthread tick loop          - kthread, takes ctrl->lock.
+ */
 
 u32 x_inner = 0;
 u32 x_outer = 0;
@@ -31,7 +52,7 @@ static inline void __timer_del(TIMER_ENTRY *timer)
 	timer->period = 0;
 }
 
-static void __timer_add(struct _cdx_ctrl *ctrl, TIMER_ENTRY *timer)
+static void __timer_add(struct _cdx_ctrl *ctrl, TIMER_ENTRY *timer) __must_hold(&ctrl->lock)
 {
 	u32 x;
 	signed int this_period;

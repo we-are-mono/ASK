@@ -14,10 +14,27 @@
 #include "control_bridge.h"
 #include "misc.h"
 
-/* Serializes the static pagination cursors below. The list walk
- * itself remains unprotected because the l2flow_hash_table subsystem
- * is currently lock-free on the mutator side too; fixing that race
- * is tracked as an architectural follow-up (A2). */
+/*
+ * Concurrency:
+ *   l2flow_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in
+ *        rx_Get_Next_Hash_L2FlowEntry (pL2FlowSnapshot,
+ *        L2Flow_{hash_index,snapshot_entries,snapshot_index,
+ *        snapshot_buf_entries}).
+ *
+ * KNOWN GAP: the l2flow_hash_table itself is lock-free on both
+ * mutator (control_bridge.c) and reader (here) sides. A concurrent
+ * delete during a walk can UAF. Fixing requires adding a lock to
+ * the whole bridge subsystem (hlist walk + insert + delete + free),
+ * which is out of scope for the query path alone. Entries here are
+ * only freed from process-context paths that also hold no
+ * synchronization today, so in practice the race triggers only when
+ * bridge events fire concurrently with a stats query; it's a real
+ * bug but orthogonal to this cursor serialization.
+ *
+ * Contexts: rx_Get_Next_Hash_L2FlowEntry runs in process context
+ * from the ioctl dispatcher.
+ */
 static DEFINE_MUTEX(l2flow_query_mutex);
 
 //snap shot buffer pointer

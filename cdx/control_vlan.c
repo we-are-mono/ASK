@@ -19,9 +19,25 @@
 extern spinlock_t dpa_devlist_lock;
 U8 gStatVlanQueryStatus;
 
-/* Serializes the static pagination cursors in both Vlan_Get_Next_*
- * functions. Two concurrent queries otherwise corrupt each other's
- * hash_index / snapshot_index / snapshot buffer pointers. */
+/*
+ * Concurrency:
+ *   vlan_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in both
+ *        Vlan_Get_Next_Hash_Entry (pVlanSnapshot, vlan_*) and
+ *        stat_VLAN_Get_Next_SessionEntry (pStatVLANSnapshot,
+ *        stat_vlan_*).
+ *   dpa_devlist_lock (owned by devman.c)
+ *      - Briefly acquired in the stat path while resolving iface
+ *        info; never held across vlan_cache walks.
+ *
+ * The vlan_cache slist itself is lock-free on both the mutator
+ * (Vlan_handle_entry) and walker sides. Attackers reaching those
+ * paths need CAP_NET_ADMIN via the cdx ioctl gate (G1), so the
+ * race is privilege-bounded.
+ *
+ * Contexts: all public entry points run in process context from
+ * the ioctl dispatcher (CAP_NET_ADMIN gated).
+ */
 static DEFINE_MUTEX(vlan_query_mutex);
 
 static PVlanEntry vlan_alloc(void)

@@ -20,8 +20,23 @@ extern spinlock_t dpa_devlist_lock;
 
 U8 gStatPPPoEQueryStatus;
 
-/* Serializes the PPPoE query cursor state in both
- * PPPoE_Get_Next_SessionEntry and stat_PPPoE_Get_Next_SessionEntry. */
+/*
+ * Concurrency:
+ *   pppoe_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in both
+ *        PPPoE_Get_Next_SessionEntry (pPPPoESnapshot, pppoe_*) and
+ *        stat_PPPoE_Get_Next_SessionEntry (pStatPPPoESnapshot,
+ *        stat_pppoe_*).
+ *   dpa_devlist_lock (owned by devman.c)
+ *      - Briefly taken in pppoe_stats_get() for iface_info lookup.
+ *
+ * The PPPoE session cache is lock-free on the mutator side. Same
+ * gap as the other control_*.c files — fixing requires a subsystem
+ * lock, out of scope here.
+ *
+ * Contexts: all public entry points run in process context from
+ * the ioctl dispatcher.
+ */
 static DEFINE_MUTEX(pppoe_query_mutex);
 
 int PPPoE_Get_Next_SessionEntry(pPPPoECommand pSessionCmd, int reset_action);

@@ -58,6 +58,31 @@
 #define NULL_MAC_ADDR(mac) (mac[0] | mac[1] | mac[2] | mac[3] | mac[4] | mac[5] )
 
 
+/*
+ * Concurrency:
+ *   dpa_devlist_lock (spinlock, exported)
+ *      - Guards the dpa_interface_info singly-linked list of
+ *        registered interfaces, plus their eth/vlan/tunnel/pppoe
+ *        sub-structures in place. Taken by readers (e.g.
+ *        dpa_get_ifinfo_by_itfid, virt_iface_stats_callback) and
+ *        writers (interface add/remove) alike. Held briefly;
+ *        callers from softirq (stats callbacks) use spin_lock(),
+ *        matching the default this file uses.
+ *   dpa_interface_info (file-scope head pointer)
+ *      - Protected by dpa_devlist_lock.
+ *
+ * Cross-file users:
+ *   control_vlan.c, control_tunnel.c, control_pppoe.c all take
+ *   dpa_devlist_lock in their stats helpers; that's the only lock
+ *   held across that call. No ordering constraints vs. the
+ *   per-file query mutexes elsewhere because dpa_devlist_lock is
+ *   always the innermost lock taken.
+ *
+ * Contexts:
+ *   dpa_add_*, dpa_remove_*    - process, ioctl configuration.
+ *   dpa_get_ifinfo_by_itfid    - any context (stats callbacks).
+ *   get_eth_iface_info         - process, ioctl.
+ */
 DEFINE_SPINLOCK(dpa_devlist_lock);
 struct dpa_iface_info *dpa_interface_info;
 

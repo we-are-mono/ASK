@@ -25,6 +25,34 @@ typedef union ucode_phyaddr_u {
 	uint64_t addr;
 }ucode_phyaddr_t;
 
+/*
+ * Concurrency:
+ *   mc4_spinlocks[hash], mc6_spinlocks[hash]
+ *      - Per-bucket spinlocks. Allocated during module init as
+ *        arrays of MC{4,6}_NUM_HASH_ENTRIES entries. A given
+ *        bucket's list (mc{4,6}_grp_list[hash]) is walked and
+ *        mutated under its matching spinlock. Mutators and walkers
+ *        (the latter in cdx_mc_query.c) must agree on the
+ *        convention - use plain spin_lock()/unlock() everywhere
+ *        so process-context and softirq-context callers don't
+ *        disagree on bh state.
+ *   mc4_grp_list[], mc6_grp_list[]
+ *      - Arrays of list heads, one per hash bucket. Protected by
+ *        the matching spinlock above.
+ *   mc{4,6}grp_ids, max_mc{4,6}grp_ids
+ *      - Allocated once at init, not mutated on the datapath;
+ *        read-only after init.
+ *
+ * Contexts:
+ *   AddToMcastGrpList(), GetMcastGrp(), cdx_delete_mcast_group_*()
+ *                        - process, IGMP/MLD-driven slow path.
+ *   Lookups from mc_query.c
+ *                        - process, ioctl query path.
+ *
+ * Lock ordering: these spinlocks are leaves - do not take any
+ * other cdx lock while holding one.
+ */
+
 struct list_head mc4_grp_list[MC4_NUM_HASH_ENTRIES];
 struct list_head mc6_grp_list[MC6_NUM_HASH_ENTRIES];
 

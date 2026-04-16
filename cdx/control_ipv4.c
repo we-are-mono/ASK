@@ -19,7 +19,22 @@
 
 #define hw_ct_set_active(ct, val)
 
-/* Serializes the IPv4 CT + route query cursor state. */
+/*
+ * Concurrency:
+ *   ipv4_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in both
+ *        IPv4_Get_Next_Hash_CTEntry (pCtSnapshot, ct_*) and
+ *        IPV4_Get_Next_Hash_RtEntry (pRtSnapshot, rt_*).
+ *
+ * The CT/route tables themselves are currently lock-free on both
+ * mutator and walker sides — see control_bridge.c / control_ipv4.c
+ * mutator paths. Fixing that race is out of scope here; this mutex
+ * only prevents two concurrent callers from corrupting each other's
+ * cursor state and double-freeing the snapshot buffer.
+ *
+ * Contexts: both public entry points run in process context from
+ * the ioctl dispatcher.
+ */
 static DEFINE_MUTEX(ipv4_query_mutex);
 
 int IPv4_Get_Next_Hash_CTEntry(PCtExCommand pCtCmd, int reset_action);

@@ -53,6 +53,29 @@ struct ipr_statistics {
 };
 
 
+/*
+ * Concurrency:
+ *   reassly_bp, ipr_frag_bp, reassly_*_pool_info, ipr_info
+ *      - Populated once in cdx_init_ip_reassembly() during module
+ *        init, then only read on the datapath. Not mutated at
+ *        runtime, so lock-free reads are safe.
+ *   ipr_timer_thread
+ *      - kthread started in cdx_init_ip_reassembly(); calls
+ *        ipr_update_timestamp() once per tick. Stopped via
+ *        kthread_stop() in cdx_deinit_ip_reassembly() so the
+ *        thread's code pages aren't freed from under it on unload.
+ *   list->ref_count (per-reassembly-context, in DDR)
+ *      - Decremented in ipr_buff_release_dqrr() under the implicit
+ *        serialization of a single FQ/portal delivering the context
+ *        confirmations. Guarded against underflow before the
+ *        decrement; the release loop runs only when it hits zero.
+ *
+ * Contexts:
+ *   ipr_buff_release_dqrr()   - softirq (QMan DQRR callback).
+ *   ipr_timer()               - kthread.
+ *   cdx_init/deinit_*         - module load/unload.
+ */
+
 //pool info for reassembly context pool
 static struct port_bman_pool_info reassly_ctx_parent_pool_info;
 struct dpa_bp *reassly_bp;

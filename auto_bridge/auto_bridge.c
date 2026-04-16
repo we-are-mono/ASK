@@ -46,6 +46,66 @@ MODULE_DESCRIPTION("Automatic Bridging Module (ABM)");
 
 static const char auto_bridge_version[] = "0.01";
 
+/*
+ * Concurrency:
+ *   abm_lock (spinlock, DEFINE_SPINLOCK below)
+ *      - Guards every shared data structure in this file:
+ *        l2flow_table[] buckets, l2flow_table_by_{src,dst}_mac[],
+ *        l2flow_list_{wait_for_ack,msg_to_send},
+ *        bridge_list_rtevent, abm_nb_entries, and the per-entry
+ *        flags/state/timer fields on struct l2flowTable.
+ *        Taken spin_lock_bh / spin_unlock_bh — callers run from a
+ *        mix of process (netlink, workqueue, sysctl, module exit)
+ *        and softirq (bridge notifier, EBT hook) contexts, so
+ *        BH disable is mandatory for producers and consumers
+ *        alike.
+ *   abm_l3_filtering, abm_max_entries, abm_retransmit_time
+ *      - Runtime-tunable via the /proc/sys/net/abm tree. Writers
+ *        go through the sysctl proc handlers; runtime readers on
+ *        the fast path snapshot the value (plain read is
+ *        acceptable for these coarse policy knobs).
+ *   abm_nl (netlink socket)
+ *      - Written once at init, freed once at exit; runtime code
+ *        only reads the pointer.
+ *   kabm_wq (workqueue)
+ *      - Created at init, destroyed at exit (cancel + destroy);
+ *        work items abm_work_send_msg and abm_work_retransmit
+ *        take abm_lock to access the lists.
+ *
+ * Per-entry timers (struct l2flowTable::timeout):
+ *      - Timer callback abm_death_by_timeout() takes abm_lock
+ *        before touching entry state. del_timer() is used in
+ *        normal paths; at module exit the final drain relies on
+ *        abm_lock + FL_DEAD to serialize against in-flight
+ *        callbacks rather than timer_shutdown_sync (see
+ *        abm_l2flow_table_wait_timers).
+ *
+ * brdev references:
+ *      - Entries on bridge_list_rtevent carry a dev_hold() on
+ *        brtable_entry->brdev (taken in add_brevent()); paired
+ *        dev_put() runs in abm_do_work_send_msg() when the entry
+ *        is popped, and in abm_l2flow_table_exit() for any
+ *        entries still pending at unload.
+ *
+ * Contexts and lock requirements:
+ *   abm_nl_rcv_msg, abm_l2flow_msg_handle    - process, take abm_lock.
+ *   abm_br_event (notifier)                  - softirq, takes abm_lock.
+ *   abm_do_work_{send_msg,retransmit}        - workqueue process,
+ *                                              take abm_lock.
+ *   abm_death_by_timeout                     - softirq timer, takes
+ *                                              abm_lock.
+ *   abm_build_vlan_l2flow / abm_ebt_hook     - netfilter/softirq,
+ *                                              take abm_lock.
+ *   __abm_go_dying, abm_l2flow_del           - caller must hold
+ *                                              abm_lock.
+ *
+ * Known gap: the module-exit drain calls rtnl_lock() while abm_lock
+ * is held (rtmsg_ifinfo); that's a pre-existing pattern flagged in
+ * ISSUES.md. It triggers under CONFIG_DEBUG_ATOMIC_SLEEP / lockdep
+ * but hasn't been observed in the wild because the exit drain runs
+ * only at module unload.
+ */
+
 #define SECS * HZ
 #define MINS * 60 SECS
 #define HOURS * 60 MINS
@@ -603,7 +663,7 @@ static void abm_nl_rcv_skb(struct sk_buff *skb)
 * Move an entry to the the L2FLOW_STATE_DYING or delete the entry depending
 * on L2FLOW_FL_DEAD flag.
 ****************************************************************************/
-static void __abm_go_dying(struct l2flowTable *table_entry)
+static void __abm_go_dying(struct l2flowTable *table_entry) __must_hold(&abm_lock)
 {
 	/* This function can be called from bridge event notifier, timer and netlink */
 	if(!(table_entry->flags & L2FLOW_FL_DEAD)){
@@ -720,7 +780,7 @@ static void abm_l2flow_update(int flags, struct l2flowTable *table_entry)
 * Remove entry from table and free entry
 *
 ****************************************************************************/
-static void abm_l2flow_del(struct l2flowTable *table_entry)
+static void abm_l2flow_del(struct l2flowTable *table_entry) __must_hold(&abm_lock)
 {
 	list_del(&table_entry->list);
 	list_del(&table_entry->list_by_src_mac);

@@ -28,6 +28,23 @@
 //#define IFSTATS_DEBUG	1
 
 
+/*
+ * Concurrency:
+ *   dpa_statslist_lock (spinlock)
+ *      - Guards the cdx_iface_ifinfo free lists (ifstats_freelist
+ *        and the PPPoE variant) and their backing stats_mem
+ *        region. Taken by alloc/free helpers on the ioctl path and
+ *        by stats-read helpers called from softirq (netdev stats
+ *        callback), so plain spin_lock() with implicit BH
+ *        discipline where needed.
+ *   stats_mem, stats_mem_phys
+ *      - Set once at init in cdx_init_stats; after that read-only.
+ *
+ * Contexts:
+ *   cdx_alloc_ifstats, cdx_free_ifstats     - process, ioctl.
+ *   cdx_iface_stats_get                     - any context.
+ *   cdx_init_stats                          - module init.
+ */
 DEFINE_SPINLOCK(dpa_statslist_lock);
 //base of stats area
 static void *stats_mem;

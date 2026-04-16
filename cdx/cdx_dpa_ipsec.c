@@ -8,7 +8,42 @@
  *
  */
 
-#ifdef DPA_IPSEC_OFFLOAD 
+/*
+ * Concurrency:
+ *   The IPsec SA lifecycle (add, remove, update) is driven by
+ *   netlink from userspace through the FCI command path, which
+ *   serializes ioctl dispatch through cdx_cmdhandler via
+ *   ctrl->mutex (see cdx_main.c). SA state mutations therefore
+ *   run single-threaded with respect to each other.
+ *
+ *   Per-SA DMA maps (auth_key_dma, crypto_key_dma, shared_desc):
+ *      - Maps/unmaps happen inside a single call to
+ *        cdx_ipsec_create_shareddescriptor(); error paths unwind
+ *        via goto labels. No cross-call ownership.
+ *
+ *   Key material (cipher_key, auth_key, split_key):
+ *      - Allocated during SA context construction, freed via
+ *        cdx_ipsec_sec_sa_context_free() with kfree_sensitive so
+ *        the slab is zeroed before reuse.
+ *
+ *   SA classification table (DDR, accessed by SEC/CAAM hardware):
+ *      - Reads are lock-free from the hardware fast path. Writes
+ *        (insert/delete) go through the same serialized command
+ *        path. SA_SH_DESC_BUILT flag is rolled back on error so a
+ *        retry sees consistent state.
+ *
+ *   NAT-T SPI array (per-flow preempt_params):
+ *      - arr_index selection uses get_free_natt_arr_index, bounded
+ *        by MAX_SPI_PER_FLOW. Mutations serialized by the same
+ *        command path.
+ *
+ * Contexts:
+ *   cdx_ipsec_add/remove/update_*     - process, FCI command.
+ *   cdx_ipsec_sec_sa_context_*        - process, under command path.
+ *   split_key_done (CAAM callback)    - softirq; touches only the
+ *                                       per-call completion atomic_t.
+ */
+#ifdef DPA_IPSEC_OFFLOAD
 #include <linux/delay.h>
 #include <linux/udp.h>
 #include "error.h"

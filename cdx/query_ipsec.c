@@ -22,8 +22,21 @@
 #include "control_ipsec.h"
 #include "cdx_dpa_ipsec.h"
 
-/* Serializes the SA query cursor state in both IPsec_Get_Next_SAEntry
- * and stat_Get_Next_SAEntry. */
+/*
+ * Concurrency:
+ *   ipsec_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in both
+ *        IPsec_Get_Next_SAEntry (pSASnapshot, sa_*) and
+ *        stat_Get_Next_SAEntry (pStatSASnapshot, stat_sa_*).
+ *
+ * SA state itself lives in cdx_dpa_ipsec.c and is mutated on the
+ * netlink path; the lock story there is the subsystem's own, not
+ * this file's. This mutex only protects the cursor state from
+ * concurrent callers.
+ *
+ * Contexts: both public entry points run in process context from
+ * the ioctl dispatcher.
+ */
 static DEFINE_MUTEX(ipsec_query_mutex);
 
 /* This function returns total SA entries configured with a given handle */

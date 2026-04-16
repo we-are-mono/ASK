@@ -18,9 +18,27 @@
 #include "fe.h"
 #include "dpa_control_mc.h"
 
-/* Serializes the static pagination cursors below against concurrent
- * callers. The per-bucket mc4/mc6 spinlocks additionally protect the
- * list walks against concurrent mutators. */
+/*
+ * Concurrency:
+ *   mc_query_mutex (file-local)
+ *      - Serializes the static pagination cursors in
+ *        MC{4,6}_Get_Next_Hash_Entry (pMC{4,6}Snapshot,
+ *        mc{4,6}_{hash_index,snapshot_entries,snapshot_index,
+ *        snapshot_buf_entries}). Two concurrent readers would
+ *        otherwise trample each other and UAF on free-and-realloc
+ *        of the snapshot buffer.
+ *   mc4_spinlocks[hash], mc6_spinlocks[hash] (owned by dpa_control_mc.c)
+ *      - Per-bucket locks that protect mc{4,6}_grp_list[] walks.
+ *        Taken inside MC{4,6}_Get_Hash_{Entries,Snapshot}; must match
+ *        the discipline used by the mutators in dpa_control_mc.c.
+ *
+ * Contexts:
+ *   All public entry points (MC{4,6}_Get_Next_Hash_Entry) run in
+ *   process context from the ioctl dispatcher. Helpers run with
+ *   mc_query_mutex held and take mc{4,6}_spinlocks[] per bucket.
+ *
+ * Lock ordering: mc_query_mutex -> mc{4,6}_spinlocks[].
+ */
 static DEFINE_MUTEX(mc_query_mutex);
 
 /* This function returns total multicast entries 

@@ -31,6 +31,32 @@ struct flow_bucket l2flow_hash_table[NUM_BT_ENTRIES];
  * a single bucket and DoS lookups. */
 static hsiphash_key_t l2flow_hashkey __read_mostly;
 
+/*
+ * Concurrency:
+ *   l2flow_hash_table[] (NUM_BT_ENTRIES buckets of hlist_head)
+ *      - Mutated by M_bridge_cmdproc() on CMD_BRIDGE_L2FLOW_*
+ *        commands and walked by l2flow_find_entry() from the same
+ *        dispatcher and by query_Rx.c. LOCK-FREE on both sides
+ *        today; a concurrent delete during a walk is UAF.
+ *
+ *        KNOWN GAP: adding a subsystem lock here requires matching
+ *        walkers in query_Rx.c and any other reader paths in a
+ *        single coordinated change. The attack surface is gated
+ *        behind the cdx ioctl dispatch (CAP_NET_ADMIN, G1), so all
+ *        callers today are trusted, but the race is real under
+ *        concurrent ioctls.
+ *   l2flow_hashkey (hsiphash_key_t)
+ *      - Set once in bridge_init() via get_random_bytes(); never
+ *        mutated at runtime. Lock-free reads are safe.
+ *   L2Bridge_timeout
+ *      - Set once at init; read at runtime; lock-free is fine.
+ *
+ * Contexts:
+ *   bridge_init()        - module load.
+ *   M_bridge_cmdproc()   - process, ioctl dispatcher.
+ *   l2flow_*() helpers   - process, called under the dispatcher.
+ */
+
 /* flow timer infrastructure */
 U32 L2Bridge_timeout;
 

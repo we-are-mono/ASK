@@ -84,6 +84,35 @@ static DEFINE_PER_CPU(unsigned int, num_tx_done);
 
 #ifdef CFG_WIFI_OFFLOAD
 
+/*
+ * Concurrency (VWD, virtual wifi driver):
+ *   vwd.vaplock (spinlock_t in dpaa_vwd_priv_s)
+ *      - Guards the VAP table (vwd.vap[] and dev_attr_vap[]) and
+ *        the associated sysfs attribute bindings. Taken on ioctl
+ *        register/unregister paths and by stats readers.
+ *   vwd.txlock (spinlock_t)
+ *      - Guards the tx-path state used by dpaa_vwd_send_packet and
+ *        the netfilter route/bridge hooks. Taken in softirq
+ *        context (hook path), so spin_lock() without _bh is OK
+ *        because callers are already under softirq or sufficiently
+ *        serialized. Producers on the ioctl path disable BH as
+ *        needed.
+ *   vwd (file-scope struct)
+ *      - Initialized once in dpaa_vwd_driver_init(), torn down in
+ *        dpaa_vwd_driver_remove(). vwd.eth_priv is set once and
+ *        held across VWD lifetime; the underlying netdev ref
+ *        belongs to devman.c (get_eth_priv).
+ *   vwd_ofld
+ *      - Runtime-settable via sysfs; plain read on fast path is
+ *        acceptable.
+ *
+ * Contexts:
+ *   dpaa_vwd_open/close/ioctl               - process.
+ *   dpaa_vwd_nf_{route,bridge}_hook_fn      - softirq (netfilter).
+ *   dpaa_vwd_send_packet                    - softirq.
+ *   dpaa_vwd_driver_{init,remove,up,down}   - module init/exit.
+ */
+
 struct dpaa_vwd_priv_s vwd;
 unsigned int vwd_ofld = VWD_BHR_MODE;
 

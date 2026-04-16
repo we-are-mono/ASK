@@ -42,7 +42,29 @@ static void fci_fe_exit(void);
 
 static int fci_outbound_fe_data(unsigned short fcode, unsigned short len, unsigned short *payload);
 
-/* Global struture managing the FCI module */
+/*
+ * Concurrency:
+ *   this_fci (file-scope pointer)
+ *      - Allocated once in fci_init() during module load, freed
+ *        once in fci_exit() at module unload. No runtime
+ *        mutation. this_fci->fci_nl_sock[] is set during init,
+ *        released at exit.
+ *   this_fci->stats.*
+ *      - Counters bumped from the netlink inbound callback and
+ *        from outbound paths. Not protected by any lock - a
+ *        concurrent bump on two CPUs may lose one increment.
+ *        These are non-critical statistics, so the race is
+ *        acceptable; a reader of stats via the proc entry may
+ *        likewise see a value slightly behind reality.
+ *
+ * Contexts:
+ *   __fci_fe_inbound_data                - netlink rx callback
+ *                                          (process, from netlink
+ *                                          worker).
+ *   fci_outbound_{unicast,multicast,err} - process, caller-driven.
+ *   fci_proc_*                           - process, /proc read.
+ *   fci_fe_init/exit                     - module load/unload.
+ */
 static FCI *this_fci;
 
 

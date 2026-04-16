@@ -9,6 +9,31 @@
  */
 #include "cdx.h"
 
+/*
+ * Concurrency:
+ *   gCmdProcTable[EVENT_MAX] (file-scope array of function ptrs)
+ *      - Populated in cdx_cmdhandler_init() (module init) via
+ *        set_cmd_handler() calls. cdx_main.c holds ctrl->mutex
+ *        across init and across exit. No per-command mutation
+ *        at runtime.
+ *
+ *   Command dispatch itself is serialized by cdx_info->ctrl.mutex
+ *   (owned by cdx_main.c): the FCI inbound netlink callback takes
+ *   this mutex, looks up the handler in gCmdProcTable, and invokes
+ *   it. Handlers therefore run single-threaded within the FCI
+ *   transport and rely on their own subsystem locks (the various
+ *   *_query_mutex, dpa_cfg_lock, abm_lock, etc.) only for
+ *   synchronization against non-FCI callers.
+ *
+ * Contexts:
+ *   cdx_cmdhandler_init/exit              - module load/unload,
+ *                                           under ctrl->mutex.
+ *   set_cmd_handler, FCODE_TO_EVENT       - process, init-time
+ *                                           or callback-time.
+ *   comcerto_fpp_send_command / dispatch  - process, under
+ *                                           ctrl->mutex.
+ */
+
 CmdProc gCmdProcTable[EVENT_MAX];
 
 int FCODE_TO_EVENT(U32 fcode)

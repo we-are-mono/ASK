@@ -27,6 +27,23 @@
 #include "cdx_ioctl.h"
 #include "lnxwrp_fm.h"
 
+/*
+ * Concurrency:
+ *   cdx_ctrl_open_count (atomic_t)
+ *      - Single-opener gate. Flipped 1->0 by cdx_ctrl_open() via
+ *        atomic_cmpxchg; restored to 1 by cdx_ctrl_release() via
+ *        atomic_set. Guarantees at most one fd against /dev/cdx_ctrl
+ *        at any time.
+ *   cdx_ctrl_{cdev_major,class,dev}
+ *      - Set once in cdx_driver_init() (module init), cleared once
+ *        in cdx_driver_deinit() (module exit). No per-ioctl access.
+ *
+ * Contexts:
+ *   cdx_ctrl_open/release/ioctl - process, via /dev/cdx_ctrl.
+ *     All ioctls are gated by CAP_NET_ADMIN before dispatch.
+ *     Dispatched handlers may take their own subsystem locks (e.g.
+ *     dpa_cfg_lock for SET_PARAMS).
+ */
 static int cdx_ctrl_cdev_major = -1;
 static struct class *cdx_ctrl_class;
 static struct device *cdx_ctrl_dev;
