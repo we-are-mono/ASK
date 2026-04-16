@@ -15,7 +15,7 @@ cdx-y += cdx_main.o cdx_hal.o cdx_timer.o cdx_cmdhandler.o layer2.o \
 	control_vlan.o control_pppoe.o control_socket.o control_bridge.o \
 	control_stat.o control_ipsec.o query_Rx.o control_tunnel.o \
 	control_qm.o control_wifi.o \
-	devman.o cdx_debug.o dpa_cfg.o cdx_dev.o dpa_test.o \
+	devman.o cdx_debug.o dpa_cfg.o cdx_dev.o \
 	cdx_dpa.o cdx_ehash.o devoh.o cdx_ceetm_app.o \
 	dpa_control_mc.o cdx_mc_query.o dpa_ipsec.o cdx_dpa_ipsec.o \
 	query_ipsec.o cdx_ifstats.o control_rtp_relay.o cdx_reassm.o \

@@ -416,16 +416,35 @@ err:
  */
 static void __fci_fe_inbound_data(struct sk_buff *skb)
 {
-	struct nlmsghdr *nlh = (struct nlmsghdr *)skb->data;
+	struct nlmsghdr *nlh;
 	struct nlmsghdr *rep;
 	struct sk_buff *nskb;
 	FCI_MSG *fci_msg, *fci_rep;
 	int rc;
+	size_t payload_bytes;
 
 	FCI_PRINTK(FCI_INBOUND, "FCI: %s\n", __func__);
 
-	/* extract fci message from skb */
+	/* Trust skb->len as the authoritative size; the sender's
+	 * nlmsg_len can be set to the aligned value (NLMSG_ALIGN)
+	 * while the actual skb carries only the unaligned payload,
+	 * which libfci does by convention. The real OOB risk is
+	 * fci_msg->length claiming more payload than the skb
+	 * carries, so validate that directly against skb->len
+	 * rather than the sender-supplied nlmsg_len. */
+	if (skb->len < NLMSG_LENGTH(FCI_MSG_HDR_SIZE)) {
+		this_fci->stats.rx_msg_err++;
+		return;
+	}
+	nlh = nlmsg_hdr(skb);
+
 	fci_msg = nlmsg_data(nlh);
+	payload_bytes = skb->len - NLMSG_LENGTH(FCI_MSG_HDR_SIZE);
+	if (fci_msg->length > FCI_MSG_MAX_PAYLOAD ||
+	    fci_msg->length > payload_bytes) {
+		this_fci->stats.rx_msg_err++;
+		return;
+	}
 
 	this_fci->stats.rx_msg++;
 

@@ -139,7 +139,13 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 	}
 	list = (struct ip_reassembly_frag_list *)bufstart;
 	num_entries = list->num_entries;
-#ifdef CDX_IPR_DEBUG	
+	if (num_entries > reassly_bp->size / sizeof(*list)) {
+		DPA_ERROR("%s::bogus num_entries %u (max %u), dropping frame\n",
+				__func__, num_entries,
+				(uint32_t)(reassly_bp->size / sizeof(*list)));
+		return qman_cb_dqrr_consume;
+	}
+#ifdef CDX_IPR_DEBUG
 	CDX_IPR_DPRINT("list %llx, refcount %d, entries %d\n",
 			addr, list->ref_count, num_entries);
 	for (ii = 0; ii < num_entries; ii++)
@@ -152,10 +158,15 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 		addr |= cpu_to_be32((list + ii)->addr_lo); 
 		bpid = cpu_to_be16((list + ii)->bpid);
 		CDX_IPR_DPRINT("addr %llx, bpid %d\n", addr, bpid);
-	}	
+	}
 #endif
+	if (list->ref_count == 0) {
+		DPA_ERROR("%s::ref_count underflow on ctx %llx\n",
+				__func__, (unsigned long long)addr);
+		return qman_cb_dqrr_consume;
+	}
 	list->ref_count--;
-#ifdef CDX_IPR_DEBUG	
+#ifdef CDX_IPR_DEBUG
 	CDX_IPR_DPRINT("refcount %d\n",
 			list->ref_count);
 #endif
@@ -375,8 +386,13 @@ static int ipr_timer(void *data)
 
 static void cdx_deinit_ip_reassembly(void)
 {
-	printk("%s::implement this\n", __func__);
-	return;
+	if (ipr_timer_thread && !IS_ERR(ipr_timer_thread)) {
+		kthread_stop(ipr_timer_thread);
+		ipr_timer_thread = NULL;
+	}
+	/* TODO: tear down FQs, release reassly_bp and ipr_frag_bp, and
+	 * unregister the bpool replenish hook. Currently leaks on unload;
+	 * stopping the kthread prevents it from running against freed code. */
 }
 
 int cdx_init_ip_reassembly(void)

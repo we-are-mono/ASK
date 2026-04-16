@@ -55,7 +55,6 @@ dpa_if_objs = devman.o\
                  cdx_debug.o\
                  dpa_cfg.o\
                  cdx_dev.o\
-                 dpa_test.o\
 		 cdx_dpa.o\
 		 cdx_ehash.o\
 		 devoh.o\

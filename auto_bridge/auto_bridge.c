@@ -478,11 +478,31 @@ err:
 
 }
 
+static const struct nla_policy abm_l2flow_policy[L2FLOWA_MAX + 1] = {
+	[L2FLOWA_SVLAN_TAG]  = { .type = NLA_U16 },
+	[L2FLOWA_CVLAN_TAG]  = { .type = NLA_U16 },
+	[L2FLOWA_PPP_S_ID]   = { .type = NLA_U16 },
+	[L2FLOWA_IIF_IDX]    = { .type = NLA_U32 },
+	[L2FLOWA_OIF_IDX]    = { .type = NLA_U32 },
+	[L2FLOWA_IP_SRC]     = { .type = NLA_BINARY,
+	                         .len = sizeof_field(struct l2flow, l3.saddr.all) },
+	[L2FLOWA_IP_DST]     = { .type = NLA_BINARY,
+	                         .len = sizeof_field(struct l2flow, l3.daddr.all) },
+	[L2FLOWA_IP_PROTO]   = { .type = NLA_U8 },
+	[L2FLOWA_SPORT]      = { .type = NLA_U16 },
+	[L2FLOWA_DPORT]      = { .type = NLA_U16 },
+	[L2FLOWA_MARK]       = { .type = NLA_U16 },
+#ifdef VLAN_FILTER
+	[L2FLOWA_VID]        = { .type = NLA_U16 },
+	[L2FLOWA_VLAN_FLAGS] = { .type = NLA_U8 },
+#endif
+};
+
 /***************************************************************************
 *
 * abm_nl_rcv_msg
 * Handle NL message from user-space
-* 
+*
 ****************************************************************************/
 static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netlink_ext_ack *ext )
 {
@@ -498,7 +518,7 @@ static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netl
 		goto out;
 	}
 
-	err = nlmsg_parse(nlh, sizeof(*l2flow_msg), tb, L2FLOWA_MAX, NULL, NULL);
+	err = nlmsg_parse(nlh, sizeof(*l2flow_msg), tb, L2FLOWA_MAX, abm_l2flow_policy, NULL);
 	if(err < 0)
 		goto out;
 	

@@ -279,9 +279,12 @@ int set_dscp_vlan_pcp_map_cfg(uint8_t dscp, uint8_t vlan_pcp)
 {
 	en_dscp_vlanpcp_map_cfg	dscp_vlanpcp_map;
 
+	if (dscp >= ARRAY_SIZE(dscp_vlanpcp_map.dscp_vlanpcp))
+		return FAILURE;
+
 	if (ExternalHashGetDscpVlanpcpMapCfg(&dscp_vlanpcp_map) != 0)
 	{
-		DPA_ERROR("%s()::%d Failed to disable DSCP VLANPCP MAP configuration:\n", 
+		DPA_ERROR("%s()::%d Failed to disable DSCP VLANPCP MAP configuration:\n",
 								__func__, __LINE__);
 		return FAILURE;
 	}

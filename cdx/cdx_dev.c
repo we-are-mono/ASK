@@ -15,6 +15,7 @@
 
 #include <linux/device.h>
 #include "linux/ioctl.h"
+#include <linux/capability.h>
 #include <linux/compat.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
@@ -47,21 +48,14 @@ static const struct file_operations cdx_dev_fops = {
 
 int cdx_ctrl_open(struct inode *inode, struct file *filp)
 {
-	//DPA_INFO("%s::\n", __func__);
-	//allow only one open instance
-	if (!atomic_dec_and_test(&cdx_ctrl_open_count)) {
-		atomic_inc(&cdx_ctrl_open_count);
+	if (atomic_cmpxchg(&cdx_ctrl_open_count, 1, 0) != 1)
 		return -EBUSY;
-	}
 	return 0;
 }
 
 int cdx_ctrl_release(struct inode *inode, struct file *filp)
 {
-	//release open instance
-	//DPA_INFO("%s::\n", __func__);
-	//TBD - recover resources here
-	atomic_inc(&cdx_ctrl_open_count);
+	atomic_set(&cdx_ctrl_open_count, 1);
 	return 0;
 }
 
@@ -108,19 +102,17 @@ func_ret:
 #endif
 
 long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
-                unsigned long args) 
+                unsigned long args)
 {
 	int retval;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
 
 	//DPA_INFO("%s::cmd %d\n", __func__, cmd);
 	switch (cmd) {
 		case CDX_CTRL_DPA_SET_PARAMS:
 			retval = cdx_ioc_set_dpa_params(args);
-			break;
-
-		case CDX_CTRL_DPA_CONNADD:
-			//test conection addition
-			retval = cdx_ioc_dpa_connadd(args);
 			break;
 
 #ifdef DPAA_DEBUG_ENABLE

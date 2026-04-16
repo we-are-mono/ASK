@@ -184,7 +184,7 @@ exit:
 	return rc;
 }
 
-void __exit cdx_cmdhandler_exit(void)
+void cdx_cmdhandler_exit(void)
 {
 	DPRINT("\n");
 

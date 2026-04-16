@@ -15,18 +15,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-//#define ENABLE_TESTAPP		1
-
 extern int dpa_init(void);
-extern int test_app_init(void);
 
 int main(int argc __attribute__((unused)), char *argv[] __attribute__((unused)))
 {
 	if (dpa_init())
 		return -1;
-#ifdef ENABLE_TESTAPP
-	if (test_app_init())
-		return -1;
-#endif
 	return 0;
 }

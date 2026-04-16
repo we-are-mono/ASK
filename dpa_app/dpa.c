@@ -743,7 +743,6 @@ void set_exptrate_policer_defaults(struct cdx_fman_info *fman_info)
  should be called once from uspace application.
 */
 
-void show_muram_temp(void);
 int dpa_init(void)
 {
 	uint32_t ii;

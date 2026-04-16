@@ -10,7 +10,7 @@
 #/*
 #* Copyright (c) 2014 Freescale Semiconductor, Inc. All rights reserved.
 #*/
-OBJS = main.o dpa.o testapp.o
+OBJS = main.o dpa.o
 TARGET = dpa_app
 
 all:	$(TARGET)

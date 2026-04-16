@@ -198,45 +198,6 @@ struct cdx_ctrl_set_dpa_params {
 #define CDX_CTRL_DPA_SET_PARAMS\
         _IOWR(CDX_IOC_MAGIC, 1, struct cdx_ctrl_set_dpa_params)
 
-//flow add ioctl structures, used only by test code
-struct test_flow_info {
-	uint16_t sport;		//source port for tcp/udp conn
-	uint16_t dport;		//dest port for tcp/udp conn
-	uint16_t mtu;		//mtu to be used
-	char *ingress_port;	//packets ingress iface name
-	char *egress_port;	//packets egress iface name
-	char dest_mac[6];	//dest gw mac address
-	union {
-		struct {
-			uint32_t ipv4_saddr;	//ipv4 source addr
-			uint32_t ipv4_daddr;	//ipv4 dest addr
-		};
-		struct {
-			uint8_t ipv6_saddr[16];	//ipv6 src addr
-			uint8_t ipv6_daddr[16];	//ipv6 dest addr
-		};
-	};
-};
-
-
-//per connection info
-struct test_conn_info {
-	uint32_t flags;                 //mapped to CTentry status flags
-	uint8_t proto;                  //protocol - udp, tcp, icmp etc
-	struct test_flow_info fwd_flow; //forward flow info
-	struct test_flow_info rev_flow; //rev flow info
-};
-
-
-//structure used by CDX_CTRL_DPA_CONNADD call
-struct add_conn_info {
-	uint32_t num_conn;                //num conn to add
-	struct test_conn_info *conn_info; //pointer to array of connections
-};
-
-#define CDX_CTRL_DPA_CONNADD\
-        _IOWR(CDX_IOC_MAGIC, 3, struct add_conn_info)
-
 #ifdef DPAA_DEBUG_ENABLE
 struct muram_data {
         uint8_t *buff;
@@ -315,7 +276,6 @@ struct add_mc_entry_info
         _IOWR(CDX_IOC_MAGIC, 7, struct add_mc_entry_info)
 
 int cdx_ioc_set_dpa_params(unsigned long args);
-int cdx_ioc_dpa_connadd(unsigned long args);
 int cdx_ioc_create_mc_group(unsigned long args);
 int cdx_ioc_add_member_to_group(unsigned long args);
 int cdx_ioc_add_mcast_table_entry(unsigned long args);
