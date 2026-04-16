@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include "portdefs.h"
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_vlan.h"
 #include "misc.h"
 #include "control_stat.h"
@@ -100,124 +101,143 @@ static U16 Vlan_handle_reset(void)
 }
 
 
-static U16 Vlan_handle_entry(U16 * p,U16 Length)
+/*
+ * Semantic validator for CMD_VLAN_ENTRY. Length has already been
+ * checked against sizeof(VlanCommand) by the dispatcher, so the
+ * struct cast is safe. Mirrors the original default arm of
+ * Vlan_handle_entry's action switch - any other action value was
+ * rejected with ERR_UNKNOWN_ACTION.
+ */
+static U16 vlan_entry_validate(const void *pcmd, U16 cmd_len)
 {
+	const VlanCommand *cmd = pcmd;
+
+	(void)cmd_len;
+
+	switch (cmd->action) {
+	case ACTION_REGISTER:
+	case ACTION_DEREGISTER:
+	case ACTION_QUERY:
+	case ACTION_QUERY_CONT:
+		return NO_ERR;
+	default:
+		return ERR_UNKNOWN_ACTION;
+	}
+}
+
+/*
+ * Handler for CMD_VLAN_ENTRY.
+ *
+ * pcmd is in/out: the dispatcher stamps pcmd[0] with the return
+ * value AFTER we return, and the QUERY paths rewrite pcmd with
+ * the next snapshot entry. The first thing we do is memcpy the
+ * incoming command into vlancmd; after that point pcmd may be
+ * mutated freely.
+ */
+static U16 vlan_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	VlanCommand vlancmd;
 	PVlanEntry pEntry;
 	struct slist_entry *entry;
-	VlanCommand vlancmd;
 	POnifDesc phys_onif;
-	int reset_action = 0;
 	U32 hash;
 	struct net_device *device = NULL, *parent_device = NULL;
-	int rc = NO_ERR;
+	U16 rc = NO_ERR;
 
-	// Check length
-	if (Length != sizeof(VlanCommand))
-		return ERR_WRONG_COMMAND_SIZE;
+	(void)cmd_len;
 
-	memcpy((U8*)&vlancmd, (U8*)p,  sizeof(VlanCommand));
+	memcpy(&vlancmd, pcmd, sizeof(vlancmd));
 	hash = HASH_VLAN(htons(vlancmd.vlanID));
 
-	switch(vlancmd.action)
-	{
-		case ACTION_DEREGISTER: 
+	switch (vlancmd.action) {
+	case ACTION_DEREGISTER:
+		device = dev_get_by_name(&init_net, vlancmd.vlanifname);
 
-			device = dev_get_by_name(&init_net, vlancmd.vlanifname);
+		slist_for_each(pEntry, entry, &vlan_cache[hash], list) {
+			if ((pEntry->vlanID == htons(vlancmd.vlanID & 0xfff)) &&
+			    (strcmp(get_onif_name(pEntry->itf.index), (char *)vlancmd.vlanifname) == 0))
+				goto found;
+		}
 
-			slist_for_each(pEntry, entry, &vlan_cache[hash], list)
-			{
-				if ((pEntry->vlanID == htons(vlancmd.vlanID & 0xfff)) && (strcmp(get_onif_name(pEntry->itf.index), (char *)vlancmd.vlanifname) == 0))
-					goto found;
-			}
-
-			rc = ERR_VLAN_ENTRY_NOT_FOUND;
-			break;
+		rc = ERR_VLAN_ENTRY_NOT_FOUND;
+		break;
 
 found:
-			if (device)
-				device->wifi_offload_dev = NULL;
-			vlan_remove(pEntry);
-			vlan_free(pEntry);
+		if (device)
+			device->wifi_offload_dev = NULL;
+		vlan_remove(pEntry);
+		vlan_free(pEntry);
+		break;
+
+	case ACTION_REGISTER:
+		device = dev_get_by_name(&init_net, vlancmd.vlanifname);
+		parent_device = dev_get_by_name(&init_net, vlancmd.phyifname);
+
+		if ((!device) || (!parent_device)) {
+			DPA_INFO("%s::could not find device %s or %s\n", __func__, vlancmd.vlanifname, vlancmd.phyifname);
+			rc = FAILURE;
 			break;
+		}
 
-		case ACTION_REGISTER: 
+		if (get_onif_by_name(vlancmd.vlanifname)) {
+			rc = ERR_VLAN_ENTRY_ALREADY_REGISTERED;
+			break;
+		}
 
-			device = dev_get_by_name(&init_net, vlancmd.vlanifname);
-			parent_device = dev_get_by_name(&init_net, vlancmd.phyifname);
-
-			if ((!device) || (!parent_device)){
-				DPA_INFO("%s::could not find device %s or %s\n", __func__, vlancmd.vlanifname, vlancmd.phyifname);
-				rc = FAILURE;
-				break;
-			}
-
-			if (get_onif_by_name(vlancmd.vlanifname))
-			{
+		slist_for_each(pEntry, entry, &vlan_cache[hash], list) {
+			if ((pEntry->vlanID == htons(vlancmd.vlanID & 0xfff)) &&
+			    (strcmp(get_onif_name(pEntry->itf.index), (char *)vlancmd.vlanifname) == 0)) {
 				rc = ERR_VLAN_ENTRY_ALREADY_REGISTERED;
-				break;
+				goto end;
 			}
+		}
 
-			slist_for_each(pEntry, entry, &vlan_cache[hash], list)
-			{
-				if ((pEntry->vlanID == htons(vlancmd.vlanID & 0xfff)) && (strcmp(get_onif_name(pEntry->itf.index), (char *)vlancmd.vlanifname) == 0) )
-				{
-					rc = ERR_VLAN_ENTRY_ALREADY_REGISTERED; //trying to add exactly the same vlan entry
-					goto end;
-				}
-			}
-
-			if ((pEntry = vlan_alloc()) == NULL)
-			{
-				rc =  ERR_NOT_ENOUGH_MEMORY;
-				break;
-			}
-
-			pEntry->vlanID = htons(vlancmd.vlanID & 0xfff);
-
-			/*Check if the Physical interface is known by the Interface manager*/
-			phys_onif = get_onif_by_name(vlancmd.phyifname);
-			if (!phys_onif)
-			{
-				vlan_free(pEntry);
-				rc = ERR_UNKNOWN_INTERFACE;
-				break;
-			}
-
-			/*Now create a new interface in the Interface Manager and remember the index*/
-			if (!add_onif(vlancmd.vlanifname, &pEntry->itf, phys_onif->itf, IF_TYPE_VLAN))
-			{
-				vlan_free(pEntry);
-				rc = ERR_CREATION_FAILED;
-				break;
-			}
-			if (dpa_add_vlan_if(vlancmd.vlanifname, &pEntry->itf, phys_onif->itf, pEntry->vlanID, vlancmd.macaddr)) {
-				remove_onif_by_index(pEntry->itf.index);
-				vlan_free(pEntry);
-				rc =  ERR_CREATION_FAILED;
-				break;
-			}
-
-			if(parent_device->wifi_offload_dev)
-				device->wifi_offload_dev = parent_device->wifi_offload_dev;
-
-			vlan_add(pEntry);
-
+		if ((pEntry = vlan_alloc()) == NULL) {
+			rc = ERR_NOT_ENOUGH_MEMORY;
 			break;
+		}
 
-		case ACTION_QUERY:
-			reset_action = 1;
-			fallthrough;
-		case ACTION_QUERY_CONT:
-			{
-				PVlanCommand pVlan = (VlanCommand*)p;
-				int rc;
+		pEntry->vlanID = htons(vlancmd.vlanID & 0xfff);
 
-				rc = Vlan_Get_Next_Hash_Entry(pVlan, reset_action);
-				return rc;
-			}
-		default:
-			return ERR_UNKNOWN_ACTION;
+		/* Check if the Physical interface is known by the Interface manager */
+		phys_onif = get_onif_by_name(vlancmd.phyifname);
+		if (!phys_onif) {
+			vlan_free(pEntry);
+			rc = ERR_UNKNOWN_INTERFACE;
+			break;
+		}
+
+		/* Now create a new interface in the Interface Manager and remember the index */
+		if (!add_onif(vlancmd.vlanifname, &pEntry->itf, phys_onif->itf, IF_TYPE_VLAN)) {
+			vlan_free(pEntry);
+			rc = ERR_CREATION_FAILED;
+			break;
+		}
+		if (dpa_add_vlan_if(vlancmd.vlanifname, &pEntry->itf, phys_onif->itf, pEntry->vlanID, vlancmd.macaddr)) {
+			remove_onif_by_index(pEntry->itf.index);
+			vlan_free(pEntry);
+			rc = ERR_CREATION_FAILED;
+			break;
+		}
+
+		if (parent_device->wifi_offload_dev)
+			device->wifi_offload_dev = parent_device->wifi_offload_dev;
+
+		vlan_add(pEntry);
+		break;
+
+	case ACTION_QUERY:
+	case ACTION_QUERY_CONT: {
+		PVlanCommand pVlan = (PVlanCommand)pcmd;
+		int query_rc;
+
+		query_rc = Vlan_Get_Next_Hash_Entry(pVlan, vlancmd.action == ACTION_QUERY);
+		if (query_rc == NO_ERR)
+			*out_reply_len = sizeof(U16) + sizeof(VlanCommand);
+		return (U16)query_rc;
 	}
+	}
+
 end:
 	if (device)
 		dev_put(device);
@@ -227,33 +247,36 @@ end:
 	return rc;
 }
 
+/*
+ * Handler for CMD_VLAN_ENTRY_RESET. No argument, status-only reply.
+ */
+static U16 vlan_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+
+	return Vlan_handle_reset();
+}
+
+/*
+ * CMD_VLAN_ENTRY_RESET uses CDX_CMD_VAR(0, U16_MAX) rather than
+ * CDX_CMD_NOARG to preserve the pre-migration permissive length
+ * contract: the old M_vlan_cmdproc did not length-check RESET at
+ * all. Canonical callers (CMM) send zero, but tightening here
+ * would be a behavior change smuggled into a mechanical
+ * refactor. Hardening this to strict 0-length is a separate
+ * follow-up.
+ */
+static const struct cdx_cmd_spec vlan_cmd_table[] = {
+	CDX_CMD_V  (CMD_VLAN_ENTRY,       VlanCommand, vlan_entry_validate, vlan_entry_handle),
+	CDX_CMD_VAR(CMD_VLAN_ENTRY_RESET, 0, U16_MAX,  NULL,                vlan_reset_handle),
+};
 
 static U16 M_vlan_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-	U16 rc;
-	U16 retlen = 2;
-	U16 action;
-
-	switch (cmd_code)
-	{
-		case CMD_VLAN_ENTRY:
-			action = *pcmd;
-			rc = Vlan_handle_entry(pcmd, cmd_len);
-			if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
-				retlen += sizeof (VlanCommand);
-			break;
-
-		case CMD_VLAN_ENTRY_RESET:
-			rc = Vlan_handle_reset();
-			break;
-
-		default:
-			rc = ERR_UNKNOWN_COMMAND;
-			break;
-	}
-
-	*pcmd = rc;
-	return retlen;
+	return cdx_dispatch_cmd(vlan_cmd_table, ARRAY_SIZE(vlan_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 
