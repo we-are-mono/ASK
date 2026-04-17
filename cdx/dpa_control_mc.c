@@ -8,6 +8,7 @@
  *
  */
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "list.h"
 #include "cdx_common.h"
 #include "misc.h"
@@ -1131,48 +1132,63 @@ out:
 	return rc;
 }
 
+/*
+ * MC wrapper discipline is different from the other control_*.c
+ * subsystems: MC{4,6}_Command_Handler writes the status word (or
+ * query reply payload) directly into pcmd and returns the total
+ * reply length in bytes, not a U16 status code. The dispatcher's
+ * contract is the other way around - handler returns a U16 status,
+ * dispatcher stamps pcmd[0] afterwards. To fit, the wrapper reads
+ * pcmd[0] back after the inner call (the value the inner just
+ * wrote) and returns it, so the dispatcher's pcmd[0] = rc stamp
+ * is a no-op. The inner-returned length flows through
+ * *out_reply_len unchanged.
+ *
+ * Query-success path in the inner handler returns sizeof(MC{4,6}
+ * Command) - larger than sizeof(U16) - and leaves pcmd holding
+ * the query data. Matches PPPoE's "struct-as-reply-status word
+ * replaces action field at offset 0" wire contract.
+ */
+static U16 mc4_multicast_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int rc_len;
+
+	(void)cmd_len;
+	rc_len = MC4_Command_Handler((PMC4Command)pcmd);
+	*out_reply_len = (U16)rc_len;
+	return *(U16 *)pcmd;
+}
+
+static U16 mc6_multicast_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int rc_len;
+
+	(void)cmd_len;
+	rc_len = MC6_Command_Handler((PMC6Command)pcmd);
+	*out_reply_len = (U16)rc_len;
+	return *(U16 *)pcmd;
+}
+
+static const struct cdx_cmd_spec mc4_cmd_table[] = {
+	CDX_CMD_VAR(CMD_MC4_MULTICAST, MC4_MIN_COMMAND_SIZE, sizeof(MC4Command),
+		    NULL, mc4_multicast_handle),
+};
+
+static const struct cdx_cmd_spec mc6_cmd_table[] = {
+	CDX_CMD_VAR(CMD_MC6_MULTICAST, MC6_MIN_COMMAND_SIZE, sizeof(MC6Command),
+		    NULL, mc6_multicast_handle),
+};
+
 U16 M_mc6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-	U16 rc = NO_ERR;
-
-	/* Check length */
-	if ((cmd_len > sizeof(MC6Command)) || (cmd_len < MC6_MIN_COMMAND_SIZE)) {
-		*pcmd = ERR_WRONG_COMMAND_SIZE;
-		return sizeof(unsigned short);
-	}
-
-	switch(cmd_code)
-	{
-		case CMD_MC6_MULTICAST:
-			rc = MC6_Command_Handler((MC6Command *)pcmd);
-			break;
-
-		default:
-			DPA_ERROR("%s::%d invalid command code received \r\n", __func__, __LINE__); 
-	}
-	return rc;
+	return cdx_dispatch_cmd(mc6_cmd_table, ARRAY_SIZE(mc6_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 U16 M_mc4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-	U16 rc = NO_ERR;
-
-	/* Check length */
-	if ((cmd_len > sizeof(MC4Command)) || (cmd_len < MC4_MIN_COMMAND_SIZE)) {
-		*pcmd = ERR_WRONG_COMMAND_SIZE;
-		return sizeof(unsigned short);
-	}
-
-	switch(cmd_code)
-	{
-		case CMD_MC4_MULTICAST:
-			rc = MC4_Command_Handler((MC4Command  *)pcmd);
-			break;
-
-		default:
-			DPA_ERROR("%s::%d invalid command code received \r\n", __func__, __LINE__); 
-	}
-	return rc;
+	return cdx_dispatch_cmd(mc4_cmd_table, ARRAY_SIZE(mc4_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 #define MAX_MC4_ENTRIES 512
