@@ -235,7 +235,7 @@ Not single issues — broader patterns worth an agenda item each.
   - **A1c-1.** `control_mc.c` (MC4+MC6, ~2 codes each) — smallest, already hardened in M1 so low regression risk.
   - **A1c-2.** `control_pppoe.c` (3 codes) — simple, already sanitized in L2/H9.
   - **A1c-3.** `control_ipv6.c` (7 codes) — mirrors ipv4 but smaller, do it first to shake out the pattern on CT snapshot handling.
-  - **A1c-4.** `control_ipv4.c` (13 codes) — the bulk of conntrack path; highest payoff for bounds checking.
+  - [x] **A1c-4.** `control_ipv4.c` (13 codes) — the bulk of conntrack path; highest payoff for bounds checking. _Done. 9 active codes plus 4 ifdef-gated; CONNTRACK uses `CDX_CMD_VAR[sizeof(CtCommand), sizeof(CtExCommand)]` with the inner handler's exact-two-size check preserving rejection of intermediate values; RESET stays permissive via `CDX_CMD_VAR(0, U16_MAX)`; GET_TIMEOUT bumps reply_len on NO_ERR only. Boot-tested on ls1046a, HW offload on normal traffic works._
   - **A1c-5.** `control_tunnel.c` (8 codes).
   - **A1c-6.** `control_bridge.c` (12 codes) — L2 flow table, already touched for L1.
   - **A1c-7.** `control_ipsec.c` (14 codes) — biggest single file; key-material-adjacent so extra care on the validate() side.
