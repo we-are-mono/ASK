@@ -9,50 +9,41 @@
  */
 
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_rx.h"
+
+static U16 rx_enable_disable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U32 portid = (U8)*(U16 *)pcmd;
+
+	(void)cmd_len;
+	(void)out_reply_len;
+	if (portid >= GEM_PORTS)
+		return CMD_ERR;
+	return CMD_OK;
+}
+
+static U16 rx_lro_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U8 enable = (U8)*(U16 *)pcmd;
+
+	(void)cmd_len;
+	(void)out_reply_len;
+	if (enable > 0)
+		return CMD_ERR;
+	return CMD_OK;
+}
+
+static const struct cdx_cmd_spec rx_cmd_table[] = {
+	CDX_CMD_VAR(CMD_RX_ENABLE,  0, U16_MAX, NULL, rx_enable_disable_handle),
+	CDX_CMD_VAR(CMD_RX_DISABLE, 0, U16_MAX, NULL, rx_enable_disable_handle),
+	CDX_CMD_VAR(CMD_RX_LRO,     0, U16_MAX, NULL, rx_lro_handle),
+};
 
 static U16 M_rx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-	U32  portid;
-	U16 acklen;
-	U16 ackstatus;
-	U8 enable;
-
-	acklen = 2;
-	ackstatus = CMD_OK;
-
-	switch (cmd_code)
-	{
-	case CMD_RX_ENABLE:
-		portid = (U8)*pcmd;
-		if (portid >= GEM_PORTS) {
-			ackstatus = CMD_ERR;
-			break;
-		}
-		break;
-
-	case CMD_RX_DISABLE:
-		portid = (U8)*pcmd;
-		if (portid >= GEM_PORTS) {
-			ackstatus = CMD_ERR;
-			break;
-		}
-		break;
-
-	case CMD_RX_LRO:
-		enable = (U8)*pcmd;
-		if (enable > 0)
-			ackstatus = CMD_ERR;
-
-		break;
-
-	default:
-		ackstatus = CMD_ERR;
-		break;
-	}
-
-	*pcmd = ackstatus;
-	return acklen;
+	return cdx_dispatch_cmd(rx_cmd_table, ARRAY_SIZE(rx_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 

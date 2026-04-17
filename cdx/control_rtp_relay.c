@@ -9,6 +9,7 @@
 
 #include "portdefs.h"
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "misc.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
@@ -1358,58 +1359,79 @@ static int rtp_set_dtmf_pt(U16 *p, U16 Length)
 	return NO_ERR;
 }
 
+static U16 rtp_open_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)RTP_Call_Open(pcmd, cmd_len);
+}
+
+static U16 rtp_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)RTP_Call_Update(pcmd, cmd_len);
+}
+
+static U16 rtp_takeover_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)RTP_Call_TakeOver(pcmd, cmd_len);
+}
+
+static U16 rtp_control_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)RTP_Call_Control(pcmd, cmd_len);
+}
+
+static U16 rtp_close_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)RTP_Call_Close(pcmd, cmd_len);
+}
+
+static U16 rtp_spectx_pld_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)RTP_Call_SpecialTx_Payload(pcmd, cmd_len);
+}
+
+static U16 rtp_spectx_ctrl_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)RTP_Call_SpecialTx_Control(pcmd, cmd_len);
+}
+
+static U16 rtcp_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc = (U16)RTCP_Query(pcmd, cmd_len);
+
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(U16) + sizeof(RTCPQueryResponse);
+	return rc;
+}
+
+static U16 rtp_stats_dtmf_pt_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)rtp_set_dtmf_pt(pcmd, cmd_len);
+}
+
+static const struct cdx_cmd_spec rtp_cmd_table[] = {
+	CDX_CMD_VAR(CMD_RTP_OPEN,           0, U16_MAX, NULL, rtp_open_handle),
+	CDX_CMD_VAR(CMD_RTP_UPDATE,         0, U16_MAX, NULL, rtp_update_handle),
+	CDX_CMD_VAR(CMD_RTP_TAKEOVER,       0, U16_MAX, NULL, rtp_takeover_handle),
+	CDX_CMD_VAR(CMD_RTP_CONTROL,        0, U16_MAX, NULL, rtp_control_handle),
+	CDX_CMD_VAR(CMD_RTP_CLOSE,          0, U16_MAX, NULL, rtp_close_handle),
+	CDX_CMD_VAR(CMD_RTP_SPECTX_PLD,     0, U16_MAX, NULL, rtp_spectx_pld_handle),
+	CDX_CMD_VAR(CMD_RTP_SPECTX_CTRL,    0, U16_MAX, NULL, rtp_spectx_ctrl_handle),
+	CDX_CMD_VAR(CMD_RTCP_QUERY,         0, U16_MAX, NULL, rtcp_query_handle),
+	CDX_CMD_VAR(CMD_RTP_STATS_DTMF_PT,  0, U16_MAX, NULL, rtp_stats_dtmf_pt_handle),
+};
+
 static U16 M_rtp_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-	U16 rc;
-	U16 retlen = 2;
-
-	switch (cmd_code)
-	{
-		case CMD_RTP_OPEN:
-			rc = RTP_Call_Open(pcmd, cmd_len);
-			break;
-
-		case CMD_RTP_UPDATE:
-			rc = RTP_Call_Update(pcmd, cmd_len);
-			break;
-
-		case CMD_RTP_TAKEOVER:
-			rc = RTP_Call_TakeOver(pcmd, cmd_len);
-			break;
-
-		case CMD_RTP_CONTROL:
-			rc = RTP_Call_Control(pcmd, cmd_len);
-			break;
-
-		case CMD_RTP_CLOSE:
-			rc = RTP_Call_Close(pcmd, cmd_len);
-			break;
-
-		case CMD_RTP_SPECTX_PLD:
-			rc = RTP_Call_SpecialTx_Payload(pcmd, cmd_len);
-			break;
-
-		case CMD_RTP_SPECTX_CTRL:
-			rc = RTP_Call_SpecialTx_Control(pcmd, cmd_len);
-			break;
-
-		case CMD_RTCP_QUERY:
-			rc = RTCP_Query(pcmd, cmd_len);
-			if (rc == NO_ERR)
-				retlen += sizeof(RTCPQueryResponse);
-			break;
-
-		case CMD_RTP_STATS_DTMF_PT:
-			rc = rtp_set_dtmf_pt(pcmd, cmd_len);
-			break;	
-
-		default:
-			rc = ERR_UNKNOWN_COMMAND;
-			break;
-	}
-
-	*pcmd = rc;
-	return retlen;
+	return cdx_dispatch_cmd(rtp_cmd_table, ARRAY_SIZE(rtp_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 BOOL rtp_relay_init(void)

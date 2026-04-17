@@ -9,6 +9,7 @@
  */
 
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_tx.h"
 #include "misc.h"
 
@@ -155,88 +156,118 @@ static void M_tx_port_update(PPortUpdateCommand cmd)
 	if_name[INTERFACE_NAME_LENGTH - 1] = '\0';
 }
 
-static U16 M_tx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+/*
+ * CMD_TX_ENABLE / CMD_TX_DISABLE / CMD_PORT_UPDATE share a
+ * portid = pcmd[0] and bound-check portid < GEM_PORTS. The
+ * dispatcher doesn't pass a group identifier, so each of the
+ * three handlers does the check inline. DSCP/VLANPCP-map codes
+ * do not use the portid from pcmd[0] and have no such check —
+ * matches pre-migration `if (cmd_code < CMD_TX_DSCP_VLANPCP_MAP_STATUS)` gate.
+ */
+static inline U16 tx_portid_check(U16 *pcmd, U32 *portid_out)
+{
+	U32 portid = *pcmd;
+
+	if (portid >= GEM_PORTS)
+		return CMD_ERR;
+	*portid_out = portid;
+	return CMD_OK;
+}
+
+static U16 tx_enable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
 	U32 portid;
 	U16 rc;
-	U16 retlen = 2;
 
-	portid = *pcmd;
-
-	if (cmd_code < CMD_TX_DSCP_VLANPCP_MAP_STATUS) {
-		if (portid >= GEM_PORTS) {
-			rc = CMD_ERR;
-			goto out;
-		}
+	(void)out_reply_len;
+	rc = tx_portid_check((U16 *)pcmd, &portid);
+	if (rc != CMD_OK)
+		return rc;
+	if (cmd_len > 2 && cmd_len > 14) {
+		memcpy(phy_port[portid].mac_addr, &(((U8 *)pcmd)[14]), 6);
+		phy_port[portid].flags |= TX_ENABLED;
 	}
+	return CMD_OK;
+}
 
-	switch (cmd_code)
-	{
-	case CMD_TX_ENABLE:
-		if (cmd_len > 2) {
-			if (cmd_len > 14) {
-				memcpy(phy_port[portid].mac_addr, &(((U8*)pcmd)[14]), 6);
-				phy_port[portid].flags |= TX_ENABLED;
-			}
-		}
+static U16 tx_disable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U32 portid;
+	U16 rc;
 
-		rc = CMD_OK;
-		break;
-
-	case CMD_TX_DISABLE:
-		phy_port[portid].flags &= ~TX_ENABLED;
+	(void)cmd_len;
+	(void)out_reply_len;
+	rc = tx_portid_check((U16 *)pcmd, &portid);
+	if (rc != CMD_OK)
+		return rc;
+	phy_port[portid].flags &= ~TX_ENABLED;
 #ifdef CDX_TODO_TX
-		/*Reset tx enable flag in class and Util for this physical port*/
-		for (id = CLASS0_ID; id <= CLASS_MAX_ID; id++)
-			pe_dmem_writeb(id, phy_port[portid].flags, virt_to_class_dmem(&phy_port[portid].flags));
-		pe_dmem_writeb(UTIL_ID, phy_port[portid].flags, virt_to_util_dmem(&util_phy_port[portid].flags));
+	/* Reset tx enable flag in class and Util for this physical port */
+	for (id = CLASS0_ID; id <= CLASS_MAX_ID; id++)
+		pe_dmem_writeb(id, phy_port[portid].flags, virt_to_class_dmem(&phy_port[portid].flags));
+	pe_dmem_writeb(UTIL_ID, phy_port[portid].flags, virt_to_util_dmem(&util_phy_port[portid].flags));
 #endif
+	return CMD_OK;
+}
 
-		rc = CMD_OK;
-		break;
+static U16 tx_port_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U32 portid;
+	U16 rc;
 
-	case CMD_PORT_UPDATE:
+	(void)cmd_len;
+	(void)out_reply_len;
+	rc = tx_portid_check((U16 *)pcmd, &portid);
+	if (rc != CMD_OK)
+		return rc;
+	M_tx_port_update((PPortUpdateCommand)pcmd);
+	return CMD_OK;
+}
 
-		/* Update the port info in the onif */
-		M_tx_port_update((PPortUpdateCommand)pcmd);
-		rc = CMD_OK;
-		break;
+static U16 tx_dscp_vlanpcp_map_status_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PDSCPVlanPCPMapCmd pMapCmd = (PDSCPVlanPCPMapCmd)pcmd;
 
-	case CMD_TX_DSCP_VLANPCP_MAP_STATUS:
-		{
-			PDSCPVlanPCPMapCmd  pMapCmd = (PDSCPVlanPCPMapCmd)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	return update_port_dscp_vlan_pcp_map_status(pMapCmd->ifname, pMapCmd->status);
+}
 
-			rc = update_port_dscp_vlan_pcp_map_status(pMapCmd->ifname, 
-							pMapCmd->status);
-		}
-		break;
+static U16 tx_dscp_vlanpcp_map_cfg_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PDSCPVlanPCPMapCmd pMapCmd = (PDSCPVlanPCPMapCmd)pcmd;
 
-	case CMD_TX_DSCP_VLANPCP_MAP_CFG:
-		{
-			PDSCPVlanPCPMapCmd  pMapCmd = (PDSCPVlanPCPMapCmd)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	return update_port_dscp_vlan_pcp_map_cfg(pMapCmd->ifname,
+						pMapCmd->dscp, pMapCmd->vlan_pcp);
+}
 
-			rc = update_port_dscp_vlan_pcp_map_cfg(pMapCmd->ifname, 
-							pMapCmd->dscp, pMapCmd->vlan_pcp);
-		}
-		break;
+static U16 tx_query_iface_dscp_vlanpcp_map_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PQueryDSCPVlanPCPMapCmd pQueryCmd = (PQueryDSCPVlanPCPMapCmd)pcmd;
+	U16 rc;
 
-	case CMD_TX_QUERY_IFACE_DSCP_VLANPCP_MAP:
-		{
-			PQueryDSCPVlanPCPMapCmd  pQueryCmd = (PQueryDSCPVlanPCPMapCmd)pcmd;
+	(void)cmd_len;
+	rc = get_port_dscp_vlan_pcp_map_cfg(pQueryCmd);
+	if (rc == CMD_OK)
+		*out_reply_len = sizeof(QueryDSCPVlanPCPMapCmd);
+	return rc;
+}
 
-			if ((rc = get_port_dscp_vlan_pcp_map_cfg(pQueryCmd)) == CMD_OK)
-				retlen = sizeof(QueryDSCPVlanPCPMapCmd);
-		}
-		break;
+static const struct cdx_cmd_spec tx_cmd_table[] = {
+	CDX_CMD_VAR(CMD_TX_ENABLE,                  0, U16_MAX, NULL, tx_enable_handle),
+	CDX_CMD_VAR(CMD_TX_DISABLE,                 0, U16_MAX, NULL, tx_disable_handle),
+	CDX_CMD_VAR(CMD_PORT_UPDATE,                0, U16_MAX, NULL, tx_port_update_handle),
+	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_STATUS, 0, U16_MAX, NULL, tx_dscp_vlanpcp_map_status_handle),
+	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_CFG,    0, U16_MAX, NULL, tx_dscp_vlanpcp_map_cfg_handle),
+	CDX_CMD_VAR(CMD_TX_QUERY_IFACE_DSCP_VLANPCP_MAP, 0, U16_MAX, NULL, tx_query_iface_dscp_vlanpcp_map_handle),
+};
 
-	default:
-		rc = CMD_ERR;
-		break;
-	}
-
-out:
-	*pcmd = rc;
-	return retlen;
+static U16 M_tx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+{
+	return cdx_dispatch_cmd(tx_cmd_table, ARRAY_SIZE(tx_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 

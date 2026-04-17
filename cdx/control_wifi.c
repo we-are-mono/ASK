@@ -9,6 +9,7 @@
  */
 
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "system.h"
 #include "layer2.h"
 #include "globals.h"
@@ -104,70 +105,68 @@ static int wifi_vap_entry( U16 *ptr, U16 len )
 }
 
 
-static U16 M_wifi_rx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+static U16 wifi_vap_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
-	U16 acklen;
-	U16 ackstatus;
-	U16 i;
-	struct tRX_wifi_context *rxc;
-	struct physical_port	*port;
-
-	rxc = &gWifiRxCtx;
-
-	acklen = 2;
-	ackstatus = CMD_OK;
+	(void)out_reply_len;
 	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
-	switch (cmd_code)
-	{
-		case CMD_WIFI_VAP_ENTRY:
-			ackstatus = wifi_vap_entry(pcmd, cmd_len);
-			break;
+	return (U16)wifi_vap_entry(pcmd, cmd_len);
+}
 
+static U16 wifi_vap_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	wifi_vap_query_response_t *vaps = (wifi_vap_query_response_t *)pcmd;
+	struct physical_port *port;
+	U16 i;
 
-		case CMD_WIFI_VAP_QUERY:
-			{
-				wifi_vap_query_response_t *vaps;
-				vaps = (wifi_vap_query_response_t *)pcmd;
-				printk("%s:%d\n", __func__, __LINE__);
+	(void)cmd_len;
+	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
+	printk("%s:%d\n", __func__, __LINE__);
 
-				for (i = 0; i < MAX_WIFI_VAPS; i++)
-				{
-					vaps[i].vap_id = wifiDesc[i].VAPID;
-					if( vaps[i].vap_id != 0xFFFF )
-						vaps[i].phy_port_id = PORT_WIFI_IDX + i;
-					port = phy_port_get(PORT_WIFI_IDX + i);
-
-					memcpy(vaps[i].ifname, get_onif_name(port->itf.index), IF_NAME_SIZE);
-				}
-
-				acklen += ( MAX_WIFI_VAPS * sizeof(wifi_vap_query_response_t));
-				break;
-			}
-
-		case CMD_WIFI_VAP_RESET:
-			printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
-			for (i = 0; i < MAX_WIFI_VAPS; i++)
-			{
-				if( wifiDesc[i].VAPID != 0XFFFF )
-				{
-					wifiDesc[i].VAPID = 0xFFFF;
-					port = phy_port_get(PORT_WIFI_IDX + i);
-
-					remove_onif_by_index(port->itf.index);
-
-					if ( rxc->users  )
-						rxc->users--;
-				}
-			}
-			break;
-
-		default:
-			ackstatus = CMD_ERR;
-			break;
+	for (i = 0; i < MAX_WIFI_VAPS; i++) {
+		vaps[i].vap_id = wifiDesc[i].VAPID;
+		if (vaps[i].vap_id != 0xFFFF)
+			vaps[i].phy_port_id = PORT_WIFI_IDX + i;
+		port = phy_port_get(PORT_WIFI_IDX + i);
+		memcpy(vaps[i].ifname, get_onif_name(port->itf.index), IF_NAME_SIZE);
 	}
 
-	*pcmd = ackstatus;
-	return acklen;
+	*out_reply_len = sizeof(U16) + MAX_WIFI_VAPS * sizeof(wifi_vap_query_response_t);
+	return CMD_OK;
+}
+
+static U16 wifi_vap_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	struct tRX_wifi_context *rxc = &gWifiRxCtx;
+	struct physical_port *port;
+	U16 i;
+
+	(void)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
+	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
+	for (i = 0; i < MAX_WIFI_VAPS; i++) {
+		if (wifiDesc[i].VAPID != 0xFFFF) {
+			wifiDesc[i].VAPID = 0xFFFF;
+			port = phy_port_get(PORT_WIFI_IDX + i);
+			remove_onif_by_index(port->itf.index);
+			if (rxc->users)
+				rxc->users--;
+		}
+	}
+	return CMD_OK;
+}
+
+static const struct cdx_cmd_spec wifi_rx_cmd_table[] = {
+	CDX_CMD_VAR(CMD_WIFI_VAP_ENTRY, 0, U16_MAX, NULL, wifi_vap_entry_handle),
+	CDX_CMD_VAR(CMD_WIFI_VAP_QUERY, 0, U16_MAX, NULL, wifi_vap_query_handle),
+	CDX_CMD_VAR(CMD_WIFI_VAP_RESET, 0, U16_MAX, NULL, wifi_vap_reset_handle),
+};
+
+static U16 M_wifi_rx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+{
+	return cdx_dispatch_cmd(wifi_rx_cmd_table, ARRAY_SIZE(wifi_rx_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 
