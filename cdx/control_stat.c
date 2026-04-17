@@ -10,6 +10,7 @@
 
 #include "portdefs.h"
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_stat.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
@@ -274,443 +275,394 @@ static U16 Get_Flow_stats(PStatFlowEntryResp flowStats, int do_reset)
  *
  *
  */
-static U16 M_stat_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+static U16 stat_enable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
-	U16 acklen;
-	U16 ackstatus;
+	StatEnableCmd statcmd;
+
+	(void)cmd_len;
+	(void)out_reply_len;
+	memcpy((U8 *)&statcmd, (U8 *)pcmd, sizeof(StatEnableCmd));
+
+	if (statcmd.action == 1) {
+		stats_bitmask_enable_g |= statcmd.bitmask;
+	} else {
+		if (statcmd.bitmask & STAT_IPSEC_BITMASK) {
+			printk("ERROR: Disable IPSec stats not allowed. Because it disables ESP Sequence overfow rekeying.\n");
+			return ERR_STAT_FEATURE_NOT_ALLOWED_TO_DISABLE;
+		}
+		stats_bitmask_enable_g &= ~(statcmd.bitmask);
+	}
+	return NO_ERR;
+}
+
+static U16 stat_interface_pkt_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 interface;
+	U16 action;
+	StatInterfaceCmd intPktCmd;
+	PStatInterfacePktResponse statInterfacePktRsp;
+
+	(void)cmd_len;
+	if (!(stats_bitmask_enable_g & STAT_INTERFACE_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	memcpy((U8 *)&intPktCmd, (U8 *)pcmd, sizeof(StatInterfaceCmd));
+	interface = intPktCmd.interface;
+	action = intPktCmd.action;
+	statInterfacePktRsp = (PStatInterfacePktResponse)pcmd;
+	return (U16)stats_interface_pkt(action, interface, statInterfacePktRsp, out_reply_len);
+}
+
+static U16 stat_conn_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	StatConnectionCmd connCmd;
+	PStatConnResponse statConnRsp;
 	U16 action;
 
-	acklen = 2;
-	ackstatus = CMD_OK;
+	(void)cmd_len;
+	memcpy((U8 *)&connCmd, (U8 *)pcmd, sizeof(StatConnectionCmd));
+	action = connCmd.action;
+	statConnRsp = (PStatConnResponse)pcmd;
+	return (U16)stats_connection(action, statConnRsp, out_reply_len);
+}
 
-	switch (cmd_code)
-	{
+static U16 stat_pppoe_status_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int x;
+	struct slist_entry *entry;
+	pPPPoE_Info pEntry;
+	StatPPPoEStatusCmd pppoeStatusCmd;
+	U16 action;
+	U16 rc;
 
-	case CMD_STAT_ENABLE:
-	{
-		StatEnableCmd statcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	if (!(stats_bitmask_enable_g & STAT_PPPOE_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
 
-		memcpy((U8*)&statcmd, (U8*)pcmd, sizeof(StatEnableCmd));
+	memcpy((U8 *)&pppoeStatusCmd, (U8 *)pcmd, sizeof(StatPPPoEStatusCmd));
+	action = pppoeStatusCmd.action;
 
-		if (statcmd.action == 1) /* ENABLE */
-		{
-			stats_bitmask_enable_g |= statcmd.bitmask;
-		}
-		else /*DISABLE */
-		{
-			if (statcmd.bitmask & STAT_IPSEC_BITMASK)
-			{
-				printk("ERROR: Disable IPSec stats not allowed. Because it disables ESP Sequence overfow rekeying.\n");
-				ackstatus = ERR_STAT_FEATURE_NOT_ALLOWED_TO_DISABLE;
-				goto end;
-			}
-			stats_bitmask_enable_g &= ~(statcmd.bitmask);
-		}
-
-		break;
-	}
-
-	case CMD_STAT_INTERFACE_PKT:
-	{
-		U16 interface;
-		StatInterfaceCmd intPktCmd;
-		PStatInterfacePktResponse statInterfacePktRsp;
-
-		if (!(stats_bitmask_enable_g & STAT_INTERFACE_BITMASK))
-		{
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-			goto end;
-		}
-
-		/* Ensure alignment */
-		memcpy((U8*)&intPktCmd, (U8*)pcmd, sizeof(StatInterfaceCmd));
-		interface = intPktCmd.interface;
-		action = intPktCmd.action;
-		statInterfacePktRsp = (PStatInterfacePktResponse)pcmd;
-		ackstatus = stats_interface_pkt(action, interface, statInterfacePktRsp, &acklen);
-		break;
-	}
-
-	case CMD_STAT_CONN:
-	{
-		StatConnectionCmd connCmd;
-		PStatConnResponse statConnRsp;
-		
-		// Ensure alignment
-		memcpy((U8*)&connCmd, (U8*)pcmd, sizeof(StatConnectionCmd));
-		action = connCmd.action;
-		statConnRsp = (PStatConnResponse)pcmd;
-		ackstatus = stats_connection(action, statConnRsp, &acklen);
-		break;
-	}
-	
-	case CMD_STAT_PPPOE_STATUS:
-	{
-		int x;
-		struct slist_entry *entry;
-		pPPPoE_Info pEntry;
-		StatPPPoEStatusCmd pppoeStatusCmd;
-
-		if (!(stats_bitmask_enable_g & STAT_PPPOE_BITMASK))
-		{
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-			goto end;
-		}
-
-		/* Ensure alignment */
-		memcpy((U8*)&pppoeStatusCmd, (U8*)pcmd, sizeof(StatPPPoEStatusCmd));
-
-		action = pppoeStatusCmd.action;
-
-		if (action == FPP_STAT_RESET)
-		{
-			/* Reset the packet counters for all PPPoE Entries */
-			for (x = 0; x < NUM_PPPOE_ENTRIES; x++)
-			{
-				slist_for_each(pEntry, entry, &pppoe_cache[x], list)
-					if ((ackstatus = interface_stats_reset((uint32_t)pEntry->itf.index)) != NO_ERR)
-					{
-						DPA_ERROR("%s:: Failed to reset the pppoe stats.\n", __func__);
-						goto end;
-					}
-			}
-		}
-		else if ((action == FPP_STAT_QUERY) || (action == FPP_STAT_QUERY_RESET))
-		{
-			gStatPPPoEQueryStatus = 0;
-			if (action == FPP_STAT_QUERY_RESET)
-				gStatPPPoEQueryStatus |= STAT_PPPOE_QUERY_RESET;
-
-			ackstatus = stat_PPPoE_Get_Next_SessionEntry((PStatPPPoEEntryResponse)pcmd, 1);
-		}
-		else
-			ackstatus = ERR_WRONG_COMMAND_PARAM;
-		break;
-	}
-
-
-	case CMD_STAT_PPPOE_ENTRY:{
-		int result;
-
-		PStatPPPoEEntryResponse prsp = (PStatPPPoEEntryResponse)pcmd;
-
-		if (stats_bitmask_enable_g & STAT_PPPOE_BITMASK)
-		{
-			result = stat_PPPoE_Get_Next_SessionEntry(prsp, 0);
-			if (result != NO_ERR)
-			{
-				prsp->eof = 1;
-			}
-
-			acklen = sizeof(StatPPPoEEntryResponse);
-		}
-		else
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-		break;
-	}
-
-
-	case CMD_STAT_BRIDGE_STATUS:
-	{
-		ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-		break;
-	}
-
-
-	case CMD_STAT_BRIDGE_ENTRY:
-	{
-		
-		ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-		break;
-	}
-
-	case CMD_STAT_VLAN_STATUS:
-	{
-		int x;
-		PVlanEntry pEntry;
-		struct slist_entry *entry;
-		StatVlanStatusCmd vlanStatusCmd;	
-
-		if (!(stats_bitmask_enable_g & STAT_VLAN_BITMASK))
-		{
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-			goto end;
-		}
-
-		/* Ensure alignment */
-		memcpy((U8*)&vlanStatusCmd, (U8*)pcmd, sizeof(StatVlanStatusCmd));
-
-		action = vlanStatusCmd.action;
-
-		if (action == FPP_STAT_RESET)
-		{
-			/* Reset the packet counters for all VLAN Entries */
-			for (x = 0; x < NUM_VLAN_ENTRIES; x++)
-			{
-				slist_for_each(pEntry, entry, &vlan_cache[x], list)
-					if ((ackstatus = interface_stats_reset((uint32_t)pEntry->itf.index)) != NO_ERR)
-					{
-						DPA_ERROR("%s:: Failed to reset the vlan stats.\n", __func__);
-						goto end;
-					}
-			}
-		}
-		else if ((action == FPP_STAT_QUERY) || (action == FPP_STAT_QUERY_RESET))
-		{
-			gStatVlanQueryStatus = 0;
-			if (action == FPP_STAT_QUERY_RESET)
-				gStatVlanQueryStatus |= STAT_VLAN_QUERY_RESET;
-
-			ackstatus = stat_VLAN_Get_Next_SessionEntry((PStatVlanEntryResponse)pcmd, 1);
-		}
-		else
-			ackstatus = ERR_WRONG_COMMAND_PARAM;
-
-		break;
-	}
-
-
-	case CMD_STAT_VLAN_ENTRY:
-	{
-		int result;
-		
-		PStatVlanEntryResponse prsp = (PStatVlanEntryResponse)pcmd;
-
-		if (stats_bitmask_enable_g & STAT_VLAN_BITMASK)
-		{
-			result = stat_VLAN_Get_Next_SessionEntry(prsp, 0);
-			if (result != NO_ERR)
-			{
-				prsp->eof = 1;
-			}
-
-			acklen = sizeof(StatVlanEntryResponse);
-		}
-		else
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-		break;
-	}
-
-	case CMD_STAT_TUNNEL_STATUS:
-	{
-		int x;
-		PTnlEntry pEntry;
-		struct slist_entry *entry;
-		StatTunnelStatusCmd tunnelStatusCmd;
-
-		if (!(stats_bitmask_enable_g & STAT_TUNNEL_BITMASK))
-		{
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-			goto end;
-		}
-
-		/* Ensure alignment */
-		memcpy((U8*)&tunnelStatusCmd, (U8*)pcmd, sizeof(StatTunnelStatusCmd));
-
-		action = tunnelStatusCmd.action;
-		if (action == FPP_STAT_RESET)
-		{
-			/* Reset the packet counters for all Tunnel Entries */
-			for (x = 0; x < NUM_TUNNEL_ENTRIES; x++)
-			{
-				slist_for_each(pEntry, entry, &tunnel_name_cache[x], list)
-					if ((ackstatus = interface_stats_reset((uint32_t)pEntry->itf.index)) != NO_ERR)
-					{
-						DPA_ERROR("%s:: Failed to reset the tunnel stats.\n", __func__);
-						goto end;
-					}
-			}
-		}
-		else if ((action == FPP_STAT_QUERY) || (action == FPP_STAT_QUERY_RESET))
-		{
-			gStatTunnelQueryStatus = 0;
-			if (action == FPP_STAT_QUERY_RESET)
-				gStatTunnelQueryStatus |= STAT_TUNNEL_QUERY_RESET;
-
-			ackstatus = stat_tunnel_Get_Next_SessionEntry((PStatTunnelEntryResponse)pcmd, 1);
-		}
-		else
-			ackstatus = ERR_WRONG_COMMAND_PARAM;
-		break;
-	}
-
-
-	case CMD_STAT_TUNNEL_ENTRY:
-	{
-		int result;
-
-		PStatTunnelEntryResponse prsp = (PStatTunnelEntryResponse)pcmd;
-
-		if (stats_bitmask_enable_g & STAT_TUNNEL_BITMASK)
-		{
-			result = stat_tunnel_Get_Next_SessionEntry(prsp, 0);
-			if (result != NO_ERR)
-			{
-				prsp->eof = 1;
-			}
-			acklen = sizeof(StatTunnelEntryResponse);
-		}
-		else
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-		break;
-	}
-
-#ifdef DPA_IPSEC_OFFLOAD 
-	case CMD_STAT_IPSEC_STATUS:
-	{
-		int x;
-		PSAEntry pEntry;
-		struct slist_entry *entry;
-		StatIpsecStatusCmd ipsecStatusCmd;
-
-		if (!(stats_bitmask_enable_g & STAT_IPSEC_BITMASK))
-		{
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-			goto end;
-		}
-
-		/* Ensure alignment */
-		memcpy((U8*)&ipsecStatusCmd, (U8*)pcmd, sizeof(StatIpsecStatusCmd));
-
-		action = ipsecStatusCmd.action;
-		/* Setting sequence number overflow query check interval time. */
-		if (ipsecStatusCmd.iQueryTimerVal > MAX_QUERY_TIMER_VAL)
-		{
-			ackstatus = ERR_WRONG_COMMAND_PARAM;
-			goto end;
-		}
-		gIPSecStatQueryTimer = ipsecStatusCmd.iQueryTimerVal;
-
-		if(action == FPP_STAT_RESET)
-		{
-			/* Reset the packet counter for all SA Entries */
-			for(x=0; x<NUM_SA_ENTRIES;x++) {
-
-				slist_for_each(pEntry, entry, &sa_cache_by_h[x], list_h)
-				{
-					reset_stats_of_sa(pEntry);
+	if (action == FPP_STAT_RESET) {
+		for (x = 0; x < NUM_PPPOE_ENTRIES; x++) {
+			slist_for_each(pEntry, entry, &pppoe_cache[x], list) {
+				rc = (U16)interface_stats_reset((uint32_t)pEntry->itf.index);
+				if (rc != NO_ERR) {
+					DPA_ERROR("%s:: Failed to reset the pppoe stats.\n", __func__);
+					return rc;
 				}
 			}
-
 		}
-		else if( (action == FPP_STAT_QUERY) || (action == FPP_STAT_QUERY_RESET))
-		{
-			gStatIpsecQueryStatus = 0;
-
-			if(action == FPP_STAT_QUERY_RESET)
-			{
-				gStatIpsecQueryStatus |= STAT_IPSEC_QUERY_RESET;
-			}
-
-			/* This function just initializes the static variables and returns */
-			stat_Get_Next_SAEntry((PStatIpsecEntryResponse)pcmd, 1);
-
-		}
-
-		else
-			ackstatus = ERR_WRONG_COMMAND_PARAM;
-		break;
+		return NO_ERR;
+	} else if (action == FPP_STAT_QUERY || action == FPP_STAT_QUERY_RESET) {
+		gStatPPPoEQueryStatus = 0;
+		if (action == FPP_STAT_QUERY_RESET)
+			gStatPPPoEQueryStatus |= STAT_PPPOE_QUERY_RESET;
+		return (U16)stat_PPPoE_Get_Next_SessionEntry((PStatPPPoEEntryResponse)pcmd, 1);
 	}
-	case CMD_STAT_IPSEC_ENTRY:
-	{
-		int  result;
-		/*PSAEntry pEntry;*/
-		PStatIpsecEntryResponse prsp = (PStatIpsecEntryResponse)pcmd;
+	return ERR_WRONG_COMMAND_PARAM;
+}
 
-		if (stats_bitmask_enable_g & STAT_IPSEC_BITMASK)
-		{
-			result = stat_Get_Next_SAEntry(prsp, 0);
-			if (result != NO_ERR)
-			{
-				prsp->eof = 1;
+static U16 stat_pppoe_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PStatPPPoEEntryResponse prsp = (PStatPPPoEEntryResponse)pcmd;
+	int result;
+
+	(void)cmd_len;
+	if (!(stats_bitmask_enable_g & STAT_PPPOE_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	result = stat_PPPoE_Get_Next_SessionEntry(prsp, 0);
+	if (result != NO_ERR)
+		prsp->eof = 1;
+	*out_reply_len = sizeof(StatPPPoEEntryResponse);
+	return NO_ERR;
+}
+
+static U16 stat_bridge_disabled_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	return ERR_STAT_FEATURE_NOT_ENABLED;
+}
+
+static U16 stat_vlan_status_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int x;
+	PVlanEntry pEntry;
+	struct slist_entry *entry;
+	StatVlanStatusCmd vlanStatusCmd;
+	U16 action;
+	U16 rc;
+
+	(void)cmd_len;
+	(void)out_reply_len;
+	if (!(stats_bitmask_enable_g & STAT_VLAN_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	memcpy((U8 *)&vlanStatusCmd, (U8 *)pcmd, sizeof(StatVlanStatusCmd));
+	action = vlanStatusCmd.action;
+
+	if (action == FPP_STAT_RESET) {
+		for (x = 0; x < NUM_VLAN_ENTRIES; x++) {
+			slist_for_each(pEntry, entry, &vlan_cache[x], list) {
+				rc = (U16)interface_stats_reset((uint32_t)pEntry->itf.index);
+				if (rc != NO_ERR) {
+					DPA_ERROR("%s:: Failed to reset the vlan stats.\n", __func__);
+					return rc;
+				}
 			}
-
-			acklen = sizeof(StatIpsecEntryResponse);
 		}
-		else
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
+		return NO_ERR;
+	} else if (action == FPP_STAT_QUERY || action == FPP_STAT_QUERY_RESET) {
+		gStatVlanQueryStatus = 0;
+		if (action == FPP_STAT_QUERY_RESET)
+			gStatVlanQueryStatus |= STAT_VLAN_QUERY_RESET;
+		return (U16)stat_VLAN_Get_Next_SessionEntry((PStatVlanEntryResponse)pcmd, 1);
+	}
+	return ERR_WRONG_COMMAND_PARAM;
+}
 
+static U16 stat_vlan_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PStatVlanEntryResponse prsp = (PStatVlanEntryResponse)pcmd;
+	int result;
 
-                break;
-        }
+	(void)cmd_len;
+	if (!(stats_bitmask_enable_g & STAT_VLAN_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	result = stat_VLAN_Get_Next_SessionEntry(prsp, 0);
+	if (result != NO_ERR)
+		prsp->eof = 1;
+	*out_reply_len = sizeof(StatVlanEntryResponse);
+	return NO_ERR;
+}
+
+static U16 stat_tunnel_status_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int x;
+	PTnlEntry pEntry;
+	struct slist_entry *entry;
+	StatTunnelStatusCmd tunnelStatusCmd;
+	U16 action;
+	U16 rc;
+
+	(void)cmd_len;
+	(void)out_reply_len;
+	if (!(stats_bitmask_enable_g & STAT_TUNNEL_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	memcpy((U8 *)&tunnelStatusCmd, (U8 *)pcmd, sizeof(StatTunnelStatusCmd));
+	action = tunnelStatusCmd.action;
+
+	if (action == FPP_STAT_RESET) {
+		for (x = 0; x < NUM_TUNNEL_ENTRIES; x++) {
+			slist_for_each(pEntry, entry, &tunnel_name_cache[x], list) {
+				rc = (U16)interface_stats_reset((uint32_t)pEntry->itf.index);
+				if (rc != NO_ERR) {
+					DPA_ERROR("%s:: Failed to reset the tunnel stats.\n", __func__);
+					return rc;
+				}
+			}
+		}
+		return NO_ERR;
+	} else if (action == FPP_STAT_QUERY || action == FPP_STAT_QUERY_RESET) {
+		gStatTunnelQueryStatus = 0;
+		if (action == FPP_STAT_QUERY_RESET)
+			gStatTunnelQueryStatus |= STAT_TUNNEL_QUERY_RESET;
+		return (U16)stat_tunnel_Get_Next_SessionEntry((PStatTunnelEntryResponse)pcmd, 1);
+	}
+	return ERR_WRONG_COMMAND_PARAM;
+}
+
+static U16 stat_tunnel_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PStatTunnelEntryResponse prsp = (PStatTunnelEntryResponse)pcmd;
+	int result;
+
+	(void)cmd_len;
+	if (!(stats_bitmask_enable_g & STAT_TUNNEL_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	result = stat_tunnel_Get_Next_SessionEntry(prsp, 0);
+	if (result != NO_ERR)
+		prsp->eof = 1;
+	*out_reply_len = sizeof(StatTunnelEntryResponse);
+	return NO_ERR;
+}
+
+#ifdef DPA_IPSEC_OFFLOAD
+static U16 stat_ipsec_status_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int x;
+	PSAEntry pEntry;
+	struct slist_entry *entry;
+	StatIpsecStatusCmd ipsecStatusCmd;
+	U16 action;
+
+	(void)cmd_len;
+	(void)out_reply_len;
+	if (!(stats_bitmask_enable_g & STAT_IPSEC_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	memcpy((U8 *)&ipsecStatusCmd, (U8 *)pcmd, sizeof(StatIpsecStatusCmd));
+	action = ipsecStatusCmd.action;
+	if (ipsecStatusCmd.iQueryTimerVal > MAX_QUERY_TIMER_VAL)
+		return ERR_WRONG_COMMAND_PARAM;
+	gIPSecStatQueryTimer = ipsecStatusCmd.iQueryTimerVal;
+
+	if (action == FPP_STAT_RESET) {
+		for (x = 0; x < NUM_SA_ENTRIES; x++) {
+			slist_for_each(pEntry, entry, &sa_cache_by_h[x], list_h)
+				reset_stats_of_sa(pEntry);
+		}
+		return NO_ERR;
+	} else if (action == FPP_STAT_QUERY || action == FPP_STAT_QUERY_RESET) {
+		gStatIpsecQueryStatus = 0;
+		if (action == FPP_STAT_QUERY_RESET)
+			gStatIpsecQueryStatus |= STAT_IPSEC_QUERY_RESET;
+		/* Just initializes the static variables and returns. */
+		stat_Get_Next_SAEntry((PStatIpsecEntryResponse)pcmd, 1);
+		return NO_ERR;
+	}
+	return ERR_WRONG_COMMAND_PARAM;
+}
+
+static U16 stat_ipsec_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PStatIpsecEntryResponse prsp = (PStatIpsecEntryResponse)pcmd;
+	int result;
+
+	(void)cmd_len;
+	if (!(stats_bitmask_enable_g & STAT_IPSEC_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
+
+	result = stat_Get_Next_SAEntry(prsp, 0);
+	if (result != NO_ERR)
+		prsp->eof = 1;
+	*out_reply_len = sizeof(StatIpsecEntryResponse);
+	return NO_ERR;
+}
 #endif
 
-	case CMD_STAT_FLOW:
-	{
-		StatFlowStatusCmd flowEntryCmd;
-		PStatFlowEntryResp pflowEntryResp;
-		int i;
+static U16 stat_flow_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	StatFlowStatusCmd flowEntryCmd;
+	PStatFlowEntryResp pflowEntryResp;
+	U16 action;
+	U16 rc;
+	int i;
 
-		if (!(stats_bitmask_enable_g & STAT_FLOW_BITMASK))
-		{
-			ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-			goto end;
-		}
-		memcpy((U8*)&flowEntryCmd, (U8*)pcmd, sizeof(StatFlowStatusCmd));
-		pflowEntryResp = (PStatFlowEntryResp)pcmd;
+	(void)cmd_len;
+	if (!(stats_bitmask_enable_g & STAT_FLOW_BITMASK))
+		return ERR_STAT_FEATURE_NOT_ENABLED;
 
-		action = flowEntryCmd.action;
-		if (action == FPP_STAT_RESET)
-		{
-			ResetAllFlowStats();	/* Reset the statistics for all IPv4/IPv6 Entries */	
-		}
-		else if ((action == FPP_STAT_QUERY) || (action == FPP_STAT_QUERY_RESET))
-		{
-			pflowEntryResp->ip_family = flowEntryCmd.ip_family;
-			if (pflowEntryResp->ip_family == 4)
-			{
-				pflowEntryResp->Saddr = flowEntryCmd.Saddr;
-				pflowEntryResp->Daddr = flowEntryCmd.Daddr;
+	memcpy((U8 *)&flowEntryCmd, (U8 *)pcmd, sizeof(StatFlowStatusCmd));
+	pflowEntryResp = (PStatFlowEntryResp)pcmd;
+	action = flowEntryCmd.action;
+
+	if (action == FPP_STAT_RESET) {
+		ResetAllFlowStats();
+		return NO_ERR;
+	} else if (action == FPP_STAT_QUERY || action == FPP_STAT_QUERY_RESET) {
+		pflowEntryResp->ip_family = flowEntryCmd.ip_family;
+		if (pflowEntryResp->ip_family == 4) {
+			pflowEntryResp->Saddr = flowEntryCmd.Saddr;
+			pflowEntryResp->Daddr = flowEntryCmd.Daddr;
+		} else {
+			for (i = 0; i < 4; i++) {
+				pflowEntryResp->Saddr_v6[i] = flowEntryCmd.Saddr_v6[i];
+				pflowEntryResp->Daddr_v6[i] = flowEntryCmd.Daddr_v6[i];
 			}
-			else
-			{
-				for (i = 0; i < 4; i++)
-				{
-					pflowEntryResp->Saddr_v6[i] = flowEntryCmd.Saddr_v6[i];
-					pflowEntryResp->Daddr_v6[i] = flowEntryCmd.Daddr_v6[i];
-				}
-			}
-			pflowEntryResp->Sport = flowEntryCmd.Sport;
-			pflowEntryResp->Dport = flowEntryCmd.Dport;
-			pflowEntryResp->Protocol = flowEntryCmd.Protocol;
-			if ((ackstatus = Get_Flow_stats(pflowEntryResp, action == FPP_STAT_QUERY_RESET)) == NO_ERR)
-				acklen = sizeof(StatFlowEntryResp);
 		}
-		else
-			ackstatus = ERR_WRONG_COMMAND_PARAM;
-		break;
+		pflowEntryResp->Sport = flowEntryCmd.Sport;
+		pflowEntryResp->Dport = flowEntryCmd.Dport;
+		pflowEntryResp->Protocol = flowEntryCmd.Protocol;
+		rc = (U16)Get_Flow_stats(pflowEntryResp, action == FPP_STAT_QUERY_RESET);
+		if (rc == NO_ERR)
+			*out_reply_len = sizeof(StatFlowEntryResp);
+		return rc;
 	}
-	
-	case FPP_CMD_IPR_V4_STATS:
-		{
-			int rc;
-			rc = cdx_get_ipr_v4_stats((void *)pcmd);
-			if (rc  == -1)
-				ackstatus = ERR_WRONG_COMMAND_PARAM;		
-			else
-				acklen = (U16)rc;
+	return ERR_WRONG_COMMAND_PARAM;
+}
 
-		}
-		break;
+/*
+ * FPP_CMD_IPR_V{4,6}_STATS: inner returns -1 on error, otherwise
+ * the reply length in bytes (not a status). Pre-migration set
+ * acklen = (U16)rc on success and ackstatus = ERR_WRONG_COMMAND_PARAM
+ * on rc == -1. Preserve by passing the inner rc through
+ * *out_reply_len on success and returning ERR_WRONG_COMMAND_PARAM
+ * on failure.
+ */
+static U16 stat_ipr_v4_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int rc;
 
-	case FPP_CMD_IPR_V6_STATS:
-		{
-			int rc;
-			rc = cdx_get_ipr_v6_stats((void *)pcmd);
-			if (rc  == -1)
-				ackstatus = ERR_WRONG_COMMAND_PARAM;		
-			else
-				acklen = (U16)rc;
-		}
-		break;
-	default:
-		ackstatus = ERR_STAT_FEATURE_NOT_ENABLED;
-		break;
-	}
+	(void)cmd_len;
+	rc = cdx_get_ipr_v4_stats((void *)pcmd);
+	if (rc == -1)
+		return ERR_WRONG_COMMAND_PARAM;
+	*out_reply_len = (U16)rc;
+	return NO_ERR;
+}
 
-end:
-	*pcmd = ackstatus;
-	return acklen;
+static U16 stat_ipr_v6_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int rc;
+
+	(void)cmd_len;
+	rc = cdx_get_ipr_v6_stats((void *)pcmd);
+	if (rc == -1)
+		return ERR_WRONG_COMMAND_PARAM;
+	*out_reply_len = (U16)rc;
+	return NO_ERR;
+}
+
+/*
+ * None of the stat codes length-check pcmd against the struct size
+ * in the pre-migration code — each case does a blind `memcpy(
+ * sizeof(StatXxxCmd))` from pcmd regardless of cmd_len. To preserve
+ * exact behavior (per A1b template item 6) all entries use
+ * CDX_CMD_VAR(0, U16_MAX). Tightening to CDX_CMD(exact struct) is
+ * worth doing as a separate hardening pass once we confirm CMM
+ * always sends the full struct.
+ *
+ * The pre-migration default arm returned ERR_STAT_FEATURE_NOT_ENABLED
+ * on unknown cmd_code. The dispatcher returns ERR_UNKNOWN_COMMAND
+ * instead — a minor behavior tightening that gives userspace a more
+ * truthful reply ("we don't know that code" vs "we don't have that
+ * feature enabled"). If any caller relies on the old error code,
+ * flip this back to a dedicated handler that returns
+ * ERR_STAT_FEATURE_NOT_ENABLED for every unlisted code; none is
+ * expected to do so.
+ */
+static const struct cdx_cmd_spec stat_cmd_table[] = {
+	CDX_CMD_VAR(CMD_STAT_ENABLE,        0, U16_MAX, NULL, stat_enable_handle),
+	CDX_CMD_VAR(CMD_STAT_INTERFACE_PKT, 0, U16_MAX, NULL, stat_interface_pkt_handle),
+	CDX_CMD_VAR(CMD_STAT_CONN,          0, U16_MAX, NULL, stat_conn_handle),
+	CDX_CMD_VAR(CMD_STAT_PPPOE_STATUS,  0, U16_MAX, NULL, stat_pppoe_status_handle),
+	CDX_CMD_VAR(CMD_STAT_PPPOE_ENTRY,   0, U16_MAX, NULL, stat_pppoe_entry_handle),
+	CDX_CMD_VAR(CMD_STAT_BRIDGE_STATUS, 0, U16_MAX, NULL, stat_bridge_disabled_handle),
+	CDX_CMD_VAR(CMD_STAT_BRIDGE_ENTRY,  0, U16_MAX, NULL, stat_bridge_disabled_handle),
+	CDX_CMD_VAR(CMD_STAT_VLAN_STATUS,   0, U16_MAX, NULL, stat_vlan_status_handle),
+	CDX_CMD_VAR(CMD_STAT_VLAN_ENTRY,    0, U16_MAX, NULL, stat_vlan_entry_handle),
+	CDX_CMD_VAR(CMD_STAT_TUNNEL_STATUS, 0, U16_MAX, NULL, stat_tunnel_status_handle),
+	CDX_CMD_VAR(CMD_STAT_TUNNEL_ENTRY,  0, U16_MAX, NULL, stat_tunnel_entry_handle),
+#ifdef DPA_IPSEC_OFFLOAD
+	CDX_CMD_VAR(CMD_STAT_IPSEC_STATUS,  0, U16_MAX, NULL, stat_ipsec_status_handle),
+	CDX_CMD_VAR(CMD_STAT_IPSEC_ENTRY,   0, U16_MAX, NULL, stat_ipsec_entry_handle),
+#endif
+	CDX_CMD_VAR(CMD_STAT_FLOW,          0, U16_MAX, NULL, stat_flow_handle),
+	CDX_CMD_VAR(FPP_CMD_IPR_V4_STATS,   0, U16_MAX, NULL, stat_ipr_v4_stats_handle),
+	CDX_CMD_VAR(FPP_CMD_IPR_V6_STATS,   0, U16_MAX, NULL, stat_ipr_v6_stats_handle),
+};
+
+static U16 M_stat_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+{
+	return cdx_dispatch_cmd(stat_cmd_table, ARRAY_SIZE(stat_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 
