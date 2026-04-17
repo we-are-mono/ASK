@@ -10,6 +10,7 @@
 
 #include <linux/mutex.h>
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
 #include "control_socket.h"
@@ -568,57 +569,95 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
  *
  *
  */
-static U16 M_ipv6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+/*
+ * CMD_IPV6_CONNTRACK: two valid exact sizes (CtCommandIPv6 or
+ * CtExCommandIPv6). Dispatcher's CDX_CMD_VAR admits the full
+ * range; the inner handler's own length check rejects any
+ * intermediate size with ERR_WRONG_COMMAND_SIZE. Snapshot action
+ * at entry because the QUERY paths call
+ * IPv6_Get_Next_Hash_CTEntry which overwrites pcmd.
+ */
+static U16 ipv6_conntrack_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
-	U16 rc;
-	U16 querySize = 0;
-	U16 action;
+	U16 action = *(U16 *)pcmd;
+	U16 rc = (U16)IPv6_handle_CONNTRACK(pcmd, cmd_len);
 
-	switch (cmd_code)
-	{
-		case CMD_IPV6_CONNTRACK:			
-			action = *pcmd;
-			rc = IPv6_handle_CONNTRACK(pcmd, cmd_len);
-			if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
-				querySize = sizeof(CtExCommandIPv6);
-			break;
+	if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
+		*out_reply_len = sizeof(U16) + sizeof(CtExCommandIPv6);
+	return rc;
+}
 
-		case CMD_IPV6_RESET:			
-			//now handled as part of IPv4 reset -- just return success
-			rc = NO_ERR;
-			break;
+/*
+ * CMD_IPV6_RESET: IPv6 state lives on the shared CT cache that
+ * control_ipv4.c's IPv4_HandleIP_RESET already flushes, so this
+ * handler is a no-op that just returns NO_ERR. Matches the
+ * pre-migration inline case.
+ */
+static U16 ipv6_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	return NO_ERR;
+}
 
-		case CMD_IPV6_GET_TIMEOUT:
-			rc = IPv6_HandleIP_Get_Timeout(pcmd, cmd_len);
-			if (rc == NO_ERR)
-				querySize = sizeof(TimeoutCommand);
-			break;
+static U16 ipv6_get_timeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc = (U16)IPv6_HandleIP_Get_Timeout(pcmd, cmd_len);
 
-		case CMD_IPV6_SOCK_OPEN:
-			rc = SOCKET6_HandleIP_Socket_Open(pcmd, cmd_len);
-			break;
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(U16) + sizeof(TimeoutCommand);
+	return rc;
+}
 
-		case CMD_IPV6_SOCK_CLOSE:
-			rc = SOCKET6_HandleIP_Socket_Close(pcmd, cmd_len);
-			break;
+static U16 ipv6_sock_open_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)SOCKET6_HandleIP_Socket_Open(pcmd, cmd_len);
+}
 
-		case CMD_IPV6_SOCK_UPDATE:
-			rc = SOCKET6_HandleIP_Socket_Update(pcmd, cmd_len);
-			break;
+static U16 ipv6_sock_close_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)SOCKET6_HandleIP_Socket_Close(pcmd, cmd_len);
+}
+
+static U16 ipv6_sock_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)SOCKET6_HandleIP_Socket_Update(pcmd, cmd_len);
+}
 
 #ifdef CDX_TODO_IPV6FRAG
-		case CMD_IPV6_FRAGTIMEOUT:
-			rc = IPv6_HandleIP_Set_FragTimeout(pcmd, cmd_len);
-			break;
+static U16 ipv6_fragtimeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPv6_HandleIP_Set_FragTimeout(pcmd, cmd_len);
+}
 #endif
 
-		default:
-			rc = ERR_UNKNOWN_COMMAND;
-			break;
-	}
+/*
+ * CMD_IPV6_RESET uses CDX_CMD_VAR(0, U16_MAX) to preserve the
+ * pre-migration permissive length contract: the old cmdproc did
+ * not length-check RESET at all.
+ */
+static const struct cdx_cmd_spec ipv6_cmd_table[] = {
+	CDX_CMD_VAR(CMD_IPV6_CONNTRACK,   sizeof(CtCommandIPv6), sizeof(CtExCommandIPv6),
+		    NULL, ipv6_conntrack_handle),
+	CDX_CMD_VAR(CMD_IPV6_RESET,       0, U16_MAX,          NULL, ipv6_reset_handle),
+	CDX_CMD    (CMD_IPV6_GET_TIMEOUT, CtCommandIPv6,         ipv6_get_timeout_handle),
+	CDX_CMD    (CMD_IPV6_SOCK_OPEN,   Sock6OpenCommand,      ipv6_sock_open_handle),
+	CDX_CMD    (CMD_IPV6_SOCK_CLOSE,  Sock6CloseCommand,     ipv6_sock_close_handle),
+	CDX_CMD    (CMD_IPV6_SOCK_UPDATE, Sock6UpdateCommand,    ipv6_sock_update_handle),
+#ifdef CDX_TODO_IPV6FRAG
+	CDX_CMD_VAR(CMD_IPV6_FRAGTIMEOUT, 0, U16_MAX, NULL,      ipv6_fragtimeout_handle),
+#endif
+};
 
-	*pcmd = rc;
-	return 2 + querySize;
+static U16 M_ipv6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+{
+	return cdx_dispatch_cmd(ipv6_cmd_table, ARRAY_SIZE(ipv6_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 
