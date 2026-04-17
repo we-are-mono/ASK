@@ -1,0 +1,31 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ask-modules
+# Required-Start:    mountvirtfs
+# Default-Start:     S
+# Short-Description: Load ASK fast-path kernel modules
+### END INIT INFO
+
+# Read /etc/modules-load.d/ask.conf and modprobe each non-comment line in order.
+# Order matters: cdx before fci, auto_bridge after cdx.
+
+CONF=/etc/modules-load.d/ask.conf
+
+case "$1" in
+    start|"")
+        [ -r "$CONF" ] || exit 0
+        grep -v '^[[:space:]]*#' "$CONF" | grep -v '^[[:space:]]*$' | while read mod; do
+            modprobe "$mod"
+        done
+        ;;
+    stop)
+        # Deliberate no-op: unloading ASK modules at shutdown is risky on a
+        # test board; power-cycle instead.
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

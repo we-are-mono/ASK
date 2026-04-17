@@ -1,0 +1,9 @@
+INTERVAL=10
+DEVPATH=hwmon15=devices/virtual/thermal/thermal_zone3 hwmon3=devices/platform/soc/2180000.i2c/i2c-0/i2c-7/7-002e
+DEVNAME=hwmon15=cluster_thermal hwmon3=emc2305
+FCTEMPS=hwmon3/pwm1=hwmon15/temp1_input
+FCFANS= hwmon3/pwm1=hwmon3/fan1_input
+MINTEMP=hwmon3/pwm1=40
+MAXTEMP=hwmon3/pwm1=80
+MINSTART=hwmon3/pwm1=51
+MINSTOP=hwmon3/pwm1=34

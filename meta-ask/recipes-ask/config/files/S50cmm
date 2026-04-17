@@ -1,0 +1,54 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          cmm
+# Required-Start:    ask-modules gateway-setup
+# Default-Start:     S
+# Short-Description: Start CMM — ASK fast-path connection manager
+### END INIT INFO
+
+# cmm daemonizes itself (daemon(0,1)) so we can just invoke it directly.
+# -n sets the conntrack table size (matches NXP/OpenWrt default).
+
+CMM=/usr/bin/cmm
+FASTFORWARD_CONF=/etc/config/fastforward
+VWD_ENABLE=/sys/class/vwd/vwd0/vwd_fast_path_enable
+PIDFILE=/var/run/cmm.pid
+
+case "$1" in
+    start|"")
+        [ -x "$CMM" ] || { echo "cmm not installed" >&2; exit 1; }
+        [ -e /dev/cdx_ctrl ] || { echo "/dev/cdx_ctrl missing — is cdx.ko loaded?" >&2; exit 1; }
+        if pidof cmm >/dev/null 2>&1; then
+            echo "cmm already running"
+            exit 0
+        fi
+        [ -e "$VWD_ENABLE" ] && echo 1 > "$VWD_ENABLE"
+        "$CMM" -f "$FASTFORWARD_CONF" -n 131072
+        ;;
+    stop)
+        [ -e "$VWD_ENABLE" ] && echo 0 > "$VWD_ENABLE" 2>/dev/null || true
+        # Kill via pidfile only. busybox's `killall cmm` also matches this
+        # init script (its argv[0] is /etc/init.d/cmm → basename "cmm"),
+        # which terminates the stop action mid-run.
+        # cmm's SIGTERM handler can hang inside cmmDaemonExit/cmmCliExit, so
+        # give it a couple of seconds and then escalate to SIGKILL.
+        pid=""
+        [ -r "$PIDFILE" ] && pid=$(cat "$PIDFILE")
+        [ -n "$pid" ] && [ -d "/proc/$pid" ] || pid=$(pidof cmm)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            for _ in 1 2 3; do
+                [ -d "/proc/$pid" ] || break
+                sleep 1
+            done
+            [ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

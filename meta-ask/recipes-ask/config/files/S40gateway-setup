@@ -1,0 +1,96 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          gateway-setup
+# Required-Start:    ask-modules
+# Default-Start:     S
+# Short-Description: Configure gateway networking — WAN=eth3 DHCP, LAN=eth4 static + NAT + DHCP server
+### END INIT INFO
+
+# eth3 = WAN (DHCP client), eth4 = LAN (static 192.168.1.1/24, NAT out via eth3).
+# Matches the manual Armbian test setup so the board is usable as a gateway on boot.
+
+LAN_IF=eth4
+LAN_ADDR=192.168.1.1/24
+WAN_IF=eth3
+DNSMASQ_CONF=/etc/dnsmasq-gateway.conf
+
+start_loopback() {
+    # cmm's CLI listener binds 127.0.0.1:2103; if lo is down the bind fails
+    # with EADDRNOTAVAIL and cmm tears down its IPC msgqs and exits(1).
+    ip link set lo up
+}
+
+start_lan() {
+    ip link set "$LAN_IF" up
+    ip addr replace "$LAN_ADDR" dev "$LAN_IF"
+}
+
+start_wan() {
+    ip link set "$WAN_IF" up
+    # busybox udhcpc: -b backgrounds after a lease, default script writes /etc/resolv.conf.
+    udhcpc -i "$WAN_IF" -b -t 5 -T 2 >/dev/null 2>&1 || true
+}
+
+start_forward() {
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+}
+
+add_rule() {
+    # $1 = table (or empty), rest = rule spec
+    local tbl=""
+    if [ "$1" = "-t" ]; then
+        tbl="-t $2"
+        shift 2
+    fi
+    iptables $tbl -C "$@" 2>/dev/null || iptables $tbl -A "$@"
+}
+
+start_nat() {
+    # iptables' own auto-modprobe is unreliable on this busybox image, so load
+    # the nat/filter tables explicitly before applying rules. Without these,
+    # `iptables -t nat -A ...` silently fails ("Table does not exist") and
+    # MASQUERADE never gets installed — LAN clients reach the gateway but not
+    # anything beyond it.
+    modprobe iptable_nat 2>/dev/null || true
+    modprobe iptable_filter 2>/dev/null || true
+    # xt_MASQUERADE (6.12 consolidated ipt_MASQUERADE into xt_MASQUERADE) isn't
+    # auto-loaded by iptables when you request the target.
+    modprobe xt_MASQUERADE 2>/dev/null || true
+
+    add_rule -t nat POSTROUTING -o "$WAN_IF" -j MASQUERADE
+    add_rule FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
+    add_rule FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+}
+
+start_dnsmasq() {
+    # dnsmasq's bind-interfaces requires the LAN address to exist, which
+    # start_lan above guarantees. Exit early if a dnsmasq is already running.
+    if pidof dnsmasq >/dev/null 2>&1; then
+        return 0
+    fi
+    dnsmasq --conf-file="$DNSMASQ_CONF"
+}
+
+case "$1" in
+    start|"")
+        start_loopback
+        start_lan
+        start_wan
+        start_forward
+        start_nat
+        start_dnsmasq
+        ;;
+    stop)
+        killall dnsmasq 2>/dev/null || true
+        killall udhcpc 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

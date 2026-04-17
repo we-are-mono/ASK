@@ -1,0 +1,43 @@
+header:
+  version: 11
+
+machine: ask-ls1046a
+distro: ask
+
+repos:
+  bitbake:
+    url: https://git.openembedded.org/bitbake
+    branch: "2.12"
+    path: sources/bitbake
+    layers:
+      .: "disabled"
+
+  openembedded-core:
+    url: https://git.openembedded.org/openembedded-core
+    branch: walnascar
+    path: sources/openembedded-core
+    layers:
+      meta:
+
+  meta-openembedded:
+    url: https://git.openembedded.org/meta-openembedded
+    branch: walnascar
+    path: sources/meta-openembedded
+    layers:
+      meta-oe:
+      meta-python:
+      meta-networking:
+
+  meta-ask:
+    path: ..
+
+target:
+  - ask-image
+
+local_conf_header:
+  site: |
+    require ${TOPDIR}/../site.conf
+  spdx: |
+    # This is a dev/test image — skip SBOM generation to avoid SPDX
+    # task failures on externalsrc recipes and shave build time.
+    INHERIT:remove = "create-spdx"
