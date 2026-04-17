@@ -118,34 +118,49 @@ func_ret:
 }
 #endif
 
+/*
+ * Table-driven ioctl dispatch, matching the validator-table
+ * idiom that FCI cmdprocs use (cdx_cmd_validator.h). The ioctl
+ * ABI is different enough from FCI's (cmd, cmd_len, pcmd)
+ * that we keep a file-local spec here rather than reusing
+ * cdx_dispatch_cmd: ioctl commands don't carry a cmd_len and
+ * the handler communicates back via copy_to_user instead of an
+ * in/out buffer. What we do preserve is the single lookup
+ * surface so adding, removing, or gating a new ioctl is a
+ * single-line table edit.
+ */
+struct cdx_ioctl_spec {
+	unsigned int cmd;
+	long (*handle)(unsigned long args);
+};
+
+static long cdx_ioc_set_dpa_params_wrap(unsigned long args)
+{
+	return cdx_ioc_set_dpa_params(args);
+}
+
+static const struct cdx_ioctl_spec cdx_ioctl_table[] = {
+	{ CDX_CTRL_DPA_SET_PARAMS,      cdx_ioc_set_dpa_params_wrap },
+#ifdef DPAA_DEBUG_ENABLE
+	{ CDX_CTRL_DPA_GET_MURAM_DATA,  cdx_get_muram_data },
+#endif
+};
+
 long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
                 unsigned long args)
 {
-	int retval;
+	size_t i;
 
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	//DPA_INFO("%s::cmd %d\n", __func__, cmd);
-	switch (cmd) {
-		case CDX_CTRL_DPA_SET_PARAMS:
-			retval = cdx_ioc_set_dpa_params(args);
-			break;
-
-#ifdef DPAA_DEBUG_ENABLE
-		case CDX_CTRL_DPA_GET_MURAM_DATA:
-			//get muram contents
-			retval = cdx_get_muram_data(args);
-			break;
-#endif
-
-		default:
-			DPA_ERROR("%s::unsupported ioctl cmd %x\n", 
-					__func__, cmd);
-			retval = -EINVAL;
-			break;
+	for (i = 0; i < ARRAY_SIZE(cdx_ioctl_table); i++) {
+		if (cdx_ioctl_table[i].cmd == cmd)
+			return cdx_ioctl_table[i].handle(args);
 	}
-	return retval;
+
+	DPA_ERROR("%s::unsupported ioctl cmd %x\n", __func__, cmd);
+	return -EINVAL;
 }
 
 static void cdx_driver_deinit(void)
