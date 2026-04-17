@@ -199,9 +199,10 @@ These were flagged as "critical" by the deep-dive agents but don't hold up on ve
 
 Not single issues — broader patterns worth an agenda item each.
 
-- [~] **A1. Every external field needs a bounds check at its entry point.**
+- [x] **A1. Every external field needs a bounds check at its entry point.**
   Hardware descriptors, netlink attributes, ioctl structs, and kernel-internal state all look identical in this code. A pass that tags trust boundaries (comments, helper macros, or just discipline) would prevent a whole class of the above.
   _Plan:_ the real attack surface isn't the cdx ioctl (only 2 commands after C9b: `SET_PARAMS`, `GET_MURAM_DATA`) — it's the FCI command bus. 14 event-level handlers (`set_cmd_handler(EVENT_*, M_*_cmdproc)` in `control_*.c` and `dpa_control_mc.c`), with ~75 per-command switch cases between them (ipv4=13, ipsec=14, stat=14, bridge=12, tunnel=8, ipv6=7, pppoe=3, mc4+mc6=2, vlan=2, plus qm/rtp_relay/rx/tx/wifi not yet counted). Each M_* handler today does its own length check and field validation inline, inconsistently. Phased migration below.
+  _Done._ A1a-e all landed on `fix/security-hardening`, each boot-tested on ls1046a with HW offload on normal traffic as the regression check. Every FCI cmdproc (vlan, mc4, mc6, pppoe, ipv6, ipv4, tunnel, bridge, ipsec, stat, rtp_relay, qm, rx, tx, wifi) plus the cdx ioctl dispatcher now routes through a validator-table lookup. Total ~120 command codes under one audit surface. One real regression caught during this work (the C2 libfci `nlmsg_len` check was too strict — diagnosed via strace on cmm, corrected in the folded C2 commit) and two pre-existing latent bugs silently fixed (MC4/MC6 unknown-cmd-code returning a zero-byte reply; stat unknown-cmd-code returning the misleading `ERR_STAT_FEATURE_NOT_ENABLED`). A1e merged into A1b/A1c/A1d — each migration replaced the whole cmdproc body in one shot, so no stale switches left behind._
 
 - [x] **A1a. Introduce the validator-table pattern.**
   Add `cdx/cdx_cmd_validator.h` with a spec struct and dispatch helper:
@@ -244,23 +245,13 @@ Not single issues — broader patterns worth an agenda item each.
 
   Per subsystem: ~80-150 LOC changed, one compile-and-test cycle. Total across all 9 steps: ~1000-1200 LOC, spread over ~15 files.
 
-- [ ] **A1d. Pull the cdx ioctl dispatcher onto the same table.**
+- [x] **A1d. Pull the cdx ioctl dispatcher onto the same table.**
   `cdx/cdx_dev.c` has only 2 commands, but once A1a exists the switch-to-table conversion is trivial and gets the ioctl surface on the same validator idiom as FCI. **Scope:** ~30 LOC changed in one file.
+  _Done, with a note:_ the ioctl ABI is different enough from FCI's (no cmd_len, `unsigned long args` is a userspace pointer, `long` errno return, in/out via copy_{from,to}_user rather than an in-band buffer) that forcing it onto `cdx_dispatch_cmd` would fork the dispatcher. Instead used a file-local `cdx_ioctl_table[]` in `cdx/cdx_dev.c` with the same spec-struct + dispatcher shape. Preserves the A1 goal (single audit surface for all ioctls; add/gate/remove a command is one line). Boot-tested on ls1046a.
 
-- [ ] **A1e. Drop the per-subsystem cmd_proc inner switches.**
+- [x] **A1e. Drop the per-subsystem cmd_proc inner switches.**
   After A1b-c-d, every `M_*_cmdproc` is just `return cdx_dispatch_cmd(foo_table, ARRAY_SIZE(foo_table), …)`. Delete the old switch bodies. **Scope:** one cleanup commit per subsystem (~20-40 LOC removed each).
-
-  ### Total effort
-  Rough budget: 2-3 focused days for A1a+A1b+A1c1-4 (the security-meaningful subset), another 1-2 days for the full sweep. Final diff: ~1500 lines across ~20 files, most of it code *removed* (inline length checks, duplicated switch scaffolding). Net LOC likely a small decrease.
-
-  ### Cheap-fallback option
-  If the full refactor isn't worth the cycles: stop after A1a+A1b plus A1c-4 (ipv4) and A1c-7 (ipsec). Those two files carry most of the security risk; the other subsystems either have smaller surface or were tightened in earlier issues. Delivers ~80% of the defense at ~25% of the effort.
-
-  ### Risks
-  - **Signature churn:** every handler's parameter types change. Migration must preserve exact semantics per command — test each subsystem in isolation.
-  - **Variable-length commands:** some FCI commands carry a trailing array (e.g. conntrack with N SA handles). The `arg_size` field needs to become `{min_len, fixed_part, per_element, max_n}` or the validate() callback needs to handle it. Prototype this on `control_ipv4.c`'s `ct_entry` command which already enforces `SA_nr <= SA_MAX_OP`.
-  - **Reply-path types:** some handlers produce variable-length replies. The dispatcher needs to know the reply buffer size and let the handler report how much it wrote (`size_t *reply_len` in the spec).
-  - **ABI:** validator-table is an internal-only structure; no ABI change to userspace.
+  _Done in-line with each A1b/A1c step rather than as a separate pass._ Every migration commit replaced the whole cmdproc body with the table + tail call in one shot, so there are no stale inner switches left behind to clean up. No separate A1e commits.
 
 - [x] **A2. Concurrency is assumed, not enforced.**
   Globals in `dpa_cfg.c`, static cursors in every `control_*.c` snapshot path, lock-drop iteration in `auto_bridge.c`. Needs a concurrency model spelled out per subsystem (which lock protects which data, which contexts run each function).
