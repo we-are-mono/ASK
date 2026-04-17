@@ -434,22 +434,22 @@ void qm_exit(void)
 #error MAX_SCHEDULER_QUEUES exceeds DPAA_ETH_TX_QUEUES
 #endif
 
-int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info) 
+int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 {
-#ifdef ENABLE_EGRESS_QOS	
+#ifdef ENABLE_EGRESS_QOS
 	struct cdx_port_info *port_info;
 	struct tQM_context_ctl *qm_ctx;
 
 	if (!(port_info = get_dpa_port_info(iface_info->name)))
 	{
 		ceetm_err("%s::unable to get port info for port %s\n",
-				__func__, iface_info->name);		
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 	qm_ctx = QM_GET_CONTEXT(port_info->portid);
 	if (qm_ctx->qos_enabled) {
 		ceetm_err("%s::qos already enabled for port %s\n",
-				__func__, iface_info->name);		
+				__func__, iface_info->name);
 		return FAILURE;
 	}
 
@@ -462,7 +462,7 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 	if (!qm_ctx->net_dev) {
 		return FAILURE;
 	}
-	/* create lni */	
+	/* create lni */
 	if (ceetm_create_lni(qm_ctx))
 		return FAILURE;
 	/* Add qm_ctx to priv structure */
@@ -472,6 +472,58 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 		priv = netdev_priv(qm_ctx->net_dev);
 		priv->qm_ctx = qm_ctx;
 	}
+#endif
+	return SUCCESS;
+}
+
+/*
+ * Undo cdx_enable_ceetm_on_iface(). Releases the CEETM LNI+SP
+ * claimed in ceetm_create_lni() and clears the cached qm_ctx
+ * fields + netdev priv->qm_ctx pointer.
+ *
+ * Used on the dpa_add_eth_if err-path unwind (err_ret7). Does
+ * NOT touch qm_chnl_info[] or any CEETM channel state — those
+ * are set up by a separate ceetm_assign_chnl() path that
+ * cdx_enable_ceetm_on_iface does not invoke.
+ *
+ * Best-effort: returns without bubbling up failures because we
+ * are inside an err-path cascade where subsequent cleanup still
+ * has to run.
+ */
+int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info)
+{
+#ifdef ENABLE_EGRESS_QOS
+	struct cdx_port_info *port_info;
+	struct tQM_context_ctl *qm_ctx;
+	struct net_device *net_dev;
+
+	port_info = get_dpa_port_info(iface_info->name);
+	if (!port_info)
+		return FAILURE;
+	qm_ctx = QM_GET_CONTEXT(port_info->portid);
+
+	if (!qm_ctx->lni)
+		return SUCCESS;  /* nothing was allocated */
+
+	net_dev = qm_ctx->net_dev;
+
+	if (ceetm_release_lni(qm_ctx->lni) != CEETM_SUCCESS)
+		ceetm_err("%s::ceetm_release_lni failed for %s\n",
+				__func__, iface_info->name);
+
+	qm_ctx->lni = NULL;
+	qm_ctx->sp = NULL;
+	qm_ctx->iface_info = NULL;
+	qm_ctx->port_info = NULL;
+	qm_ctx->qos_enabled = 0;
+	qm_ctx->dscp_fq_map = NULL;
+
+	if (net_dev) {
+		struct dpa_priv_s *priv = netdev_priv(net_dev);
+
+		priv->qm_ctx = NULL;
+	}
+	qm_ctx->net_dev = NULL;
 #endif
 	return SUCCESS;
 }

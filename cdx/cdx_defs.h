@@ -12,6 +12,7 @@
 #define _CDX_DEFS_H_
 
 int dpa_add_ethport_ff_policier_profile(struct dpa_iface_info *iface_info);
+void dpa_remove_ethport_ff_policier_profile(struct dpa_iface_info *iface_info);
 int dpa_get_iface_hwid_by_name_and_type(char *name, uint32_t type);
 struct dpa_iface_info *dpa_get_iface_by_name(char *name);
 int dpa_add_virt_storage_profile(struct net_device *net_dev,

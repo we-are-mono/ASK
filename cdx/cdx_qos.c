@@ -335,6 +335,41 @@ int dpa_add_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
 
 }
 
+/*
+ * Undo dpa_add_ethport_ff_policier_profile() on the err-path
+ * unwind of dpa_add_eth_if(). Deletes the PlcrProfile created via
+ * FM_PCD_PlcrProfileSet() and clears the cached handle so later
+ * cdx_{set,get}_ff_rate() calls don't chase a dangling pointer.
+ *
+ * Known residual leak: the one-slot allocation that
+ * FM_PORT_PcdPlcrAllocProfiles() reserved on this port's private
+ * profile partition is NOT released. The matching
+ * FM_PORT_PcdPlcrFreeProfiles() is documented to be legal only
+ * before FM_PORT_SetPCD(), and by the time we're on this unwind
+ * path the DPAA driver has long since brought the port up and
+ * done its own SetPCD. Releasing the slot safely would require
+ * coordinating with the DPAA ndo_close path; out of scope here.
+ * One leaked profile slot per failed dpa_add_eth_if — the
+ * hardware has 64 slots per FMan partition, so this is
+ * tolerable in practice.
+ */
+void dpa_remove_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
+{
+	int hardwarePortId = iface_info->eth_info.hardwarePortId;
+
+	if (hardwarePortId < 0 || hardwarePortId >= MAX_PHYS_PORTS)
+		return;
+	if (!port_rate_lim_mode[hardwarePortId].handle)
+		return;
+
+	if (FM_PCD_PlcrProfileDelete(port_rate_lim_mode[hardwarePortId].handle) != 0)
+		DPA_ERROR("%s::PlcrProfileDelete failed for %s (port %d)\n",
+				__func__, iface_info->name, hardwarePortId);
+
+	port_rate_lim_mode[hardwarePortId].handle = NULL;
+	port_rate_lim_mode[hardwarePortId].h_FmPcd = NULL;
+}
+
 /* api to modify port specific policer profile to reserver bandwidth for incoming control packets */
 int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
 {

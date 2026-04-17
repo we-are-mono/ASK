@@ -1997,6 +1997,42 @@ static int dpa_bman_reconfigure_discard_mask(struct dpa_iface_info *iface_info)
 	}
 	return SUCCESS;
 }
+
+/*
+ * Undo dpa_bman_reconfigure_discard_mask() — restore the port's
+ * discard mask to FM_RFSDM_DEFAULT.
+ *
+ * There is no FM_PORT_GetDiscardMask in the FMan SDK, so we can't
+ * capture and restore the exact prior value. Instead we write
+ * back the architectural default, which is what the port held
+ * before dpa_bman_reconfigure_discard_mask ran. Correct only as
+ * long as dpa_bman_reconfigure_discard_mask remains the sole
+ * writer of this port's discard mask from ASK; flag for SME
+ * review if that assumption ever breaks.
+ *
+ * Used on the dpa_add_eth_if err-path unwind (err_ret6). Best-
+ * effort: logs but ignores failure, because we're already in an
+ * error-handling cascade.
+ */
+static void dpa_bman_restore_discard_mask(struct dpa_iface_info *iface_info)
+{
+	struct eth_iface_info *eth_info;
+	struct dpa_priv_s *priv;
+	struct mac_device *mac_dev;
+	t_LnxWrpFmPortDev *port = NULL;
+
+	eth_info = &iface_info->eth_info;
+	priv = netdev_priv(eth_info->net_dev);
+	mac_dev = priv->mac_dev;
+	port = (t_LnxWrpFmPortDev *)mac_dev->port_dev[RX];
+
+	if (!port || !port->h_Dev)
+		return;
+
+	if (FM_PORT_SetDiscardMask(port->h_Dev, FM_RFSDM_DEFAULT) != 0)
+		DPA_ERROR("%s:: failed to restore discard mask on %s\n",
+				__func__, iface_info->name);
+}
 #endif
 
 int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf) 
@@ -2124,25 +2160,21 @@ err_ret8:
 #endif
 err_ret7:
 #ifdef ENABLE_EGRESS_QOS
-	/* TODO: disable CEETM on iface + release CEETM lni/sp. No
-	 * reverse helper for cdx_enable_ceetm_on_iface() exists today;
-	 * implementing it requires understanding the CEETM channel
-	 * teardown sequence (see cdx_ceetm_app.c). Residual leak on
-	 * this error path is one CEETM LNI + SP per failed iface add. */
+	cdx_disable_ceetm_on_iface(iface_info);
 err_ret6:
 #ifdef DPA_IPSEC_OFFLOAD
-	/* TODO: restore BMan discard mask (undo
-	 * dpa_bman_reconfigure_discard_mask). No reverse helper; the
-	 * residual effect is that the port keeps the IPsec-adjusted
-	 * discard mask until module unload. */
+	dpa_bman_restore_discard_mask(iface_info);
 #endif
 #endif
 #ifdef DPA_IPSEC_OFFLOAD
 err_ret5:
 #endif
-	/* TODO: remove the fast-forward policer profile. No reverse
-	 * helper for dpa_add_ethport_ff_policier_profile(); residual
-	 * effect is a leaked profile slot per failed iface add. */
+	/* Note: dpa_remove_ethport_ff_policier_profile() leaks the
+	 * one alloc-profile slot intentionally — FM_PORT_PcdPlcrFreeProfiles
+	 * is only legal before FM_PORT_SetPCD(), and the DPAA driver has
+	 * already called SetPCD by the time we run. See the helper's
+	 * comment for details. */
+	dpa_remove_ethport_ff_policier_profile(iface_info);
 err_ret4:
 	dpa_remove_virt_storage_profile(&iface_info->eth_info);
 err_ret3:

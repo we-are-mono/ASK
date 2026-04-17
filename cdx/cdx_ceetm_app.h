@@ -106,6 +106,7 @@ int ceetm_release_lni(void *handle);
 int ceetm_cfg_channel(void *handle, uint32_t rate, uint32_t limit, uint32_t bsize);
 int ceetm_cfg_class_queue(struct tQM_context_ctl *qm_ctx, uint32_t classque);
 int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);
+int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx);
 int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper);
 int ceetm_configure_shaper(void *cfg);

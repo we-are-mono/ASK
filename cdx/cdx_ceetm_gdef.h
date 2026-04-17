@@ -9,4 +9,5 @@
  */
 
 int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);
+int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int ceetm_init_cq_plcr(void);
