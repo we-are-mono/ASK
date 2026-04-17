@@ -8,9 +8,10 @@
  *
  */
 
-#ifdef DPA_IPSEC_OFFLOAD 
+#ifdef DPA_IPSEC_OFFLOAD
 #include "dpaa_eth_common.h"
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "cdx_common.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
@@ -994,86 +995,149 @@ int IPsec_print_SAEntrys(PSAQueryCommand  pSAQueryCmd, int reset_action)
  *
  *
  */
+static U16 ipsec_create_sa_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_CREATE_SA(pcmd, cmd_len);
+}
+
+static U16 ipsec_delete_sa_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_DELETE_SA(pcmd, cmd_len);
+}
+
+static U16 ipsec_flush_sa_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_FLUSH_SA(pcmd, cmd_len);
+}
+
+static U16 ipsec_set_keys_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_SA_SET_KEYS(pcmd, cmd_len);
+}
+
+static U16 ipsec_set_tunnel_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_SA_SET_TUNNEL(pcmd, cmd_len);
+}
+
+static U16 ipsec_set_tnl_route_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_SA_SET_TNL_ROUTE(pcmd, cmd_len);
+}
+
+static U16 ipsec_set_natt_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_SA_SET_NATT(pcmd, cmd_len);
+}
+
+static U16 ipsec_set_state_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_SA_SET_STATE(pcmd, cmd_len);
+}
+
+static U16 ipsec_set_lifetime_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_SA_SET_LIFETIME(pcmd, cmd_len);
+}
+
+/*
+ * Query/query-cont split (dispatcher doesn't forward cmd_code):
+ *   QUERY     → reset_action = 1
+ *   QUERY_CONT → reset_action = 0
+ * On NO_ERR, reply_len = sizeof(U16) + sizeof(SAQueryCommand)
+ * (VLAN/IPv4-style wire contract). The old cmdproc did not
+ * length-check the query arms, so preserve via CDX_CMD_VAR(0,
+ * U16_MAX).
+ */
+static U16 ipsec_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc;
+
+	(void)cmd_len;
+#ifdef PRINT_SA_INFO
+	IPsec_print_SAEntrys((PSAQueryCommand)pcmd, 0);
+#endif
+	rc = (U16)IPsec_Get_Next_SAEntry((PSAQueryCommand)pcmd, 1);
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(U16) + sizeof(SAQueryCommand);
+	return rc;
+}
+
+static U16 ipsec_query_cont_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc;
+
+	(void)cmd_len;
+	rc = (U16)IPsec_Get_Next_SAEntry((PSAQueryCommand)pcmd, 0);
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(U16) + sizeof(SAQueryCommand);
+	return rc;
+}
+
+static U16 ipsec_frag_cfg_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_handle_FRAG_CFG(pcmd, cmd_len);
+}
+
+/*
+ * CMD_IPSEC_SEC_FAILURE_STATS: inner returns positive stats-buffer
+ * length on success (not a U16 status), or ERR_WRONG_COMMAND_SIZE /
+ * ERR_WRONG_COMMAND_PARAM on failure. The old cmdproc treated
+ * any rc > 0 as "payload length present" and did retlen += rc.
+ * Reproduce exactly: bump reply_len on any rc > 0 (including error
+ * paths — the pre-migration behavior is that the error codes are
+ * small positive numbers so retlen would grow by a handful of
+ * bytes), and let the dispatcher stamp pcmd[0] with the returned
+ * value. On the success path pcmd[0] holds the byte count, NOT
+ * NO_ERR — that's the pre-existing wire contract.
+ */
+static U16 ipsec_sec_failure_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	int rc;
+
+	rc = IPsec_get_SEC_failure_stats((uint16_t *)pcmd, cmd_len);
+	if (rc > 0)
+		*out_reply_len = sizeof(U16) + (U16)rc;
+	return (U16)rc;
+}
+
+static U16 ipsec_reset_sec_failure_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPsec_reset_SEC_failure_stats((uint16_t *)pcmd, cmd_len);
+}
+
+static const struct cdx_cmd_spec ipsec_cmd_table[] = {
+	CDX_CMD    (CMD_IPSEC_SA_CREATE,                CommandIPSecCreateSA,       ipsec_create_sa_handle),
+	CDX_CMD    (CMD_IPSEC_SA_DELETE,                CommandIPSecDeleteSA,       ipsec_delete_sa_handle),
+	CDX_CMD_VAR(CMD_IPSEC_SA_FLUSH,                 0, U16_MAX, NULL,           ipsec_flush_sa_handle),
+	CDX_CMD    (CMD_IPSEC_SA_SET_KEYS,              CommandIPSecSetKey,         ipsec_set_keys_handle),
+	CDX_CMD    (CMD_IPSEC_SA_SET_TUNNEL,            CommandIPSecSetTunnel,      ipsec_set_tunnel_handle),
+	CDX_CMD    (CMD_IPSEC_SA_SET_TNL_ROUTE,         CommandIPSecSetTunnelRoute, ipsec_set_tnl_route_handle),
+	CDX_CMD    (CMD_IPSEC_SA_SET_NATT,              CommandIPSecSetNatt,        ipsec_set_natt_handle),
+	CDX_CMD    (CMD_IPSEC_SA_SET_STATE,             CommandIPSecSetState,       ipsec_set_state_handle),
+	CDX_CMD    (CMD_IPSEC_SA_SET_LIFETIME,          CommandIPSecSetLifetime,    ipsec_set_lifetime_handle),
+	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY,          0, U16_MAX, NULL,           ipsec_query_handle),
+	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY_CONT,     0, U16_MAX, NULL,           ipsec_query_cont_handle),
+	CDX_CMD    (CMD_IPSEC_FRAG_CFG,                 CommandIPSecSetPreFrag,     ipsec_frag_cfg_handle),
+	CDX_CMD_VAR(CMD_IPSEC_SEC_FAILURE_STATS,        0, U16_MAX, NULL,           ipsec_sec_failure_stats_handle),
+	CDX_CMD_VAR(CMD_IPSEC_RESET_SEC_FAILURE_STATS,  0, U16_MAX, NULL,           ipsec_reset_sec_failure_stats_handle),
+};
+
 U16 M_ipsec_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-	U16 rc = ERR_UNKNOWN_COMMAND;
-	U16 retlen = 2;
-	//	printk(KERN_DEBUG "%s: cmd_code=0x%04x, cmd_len=%d\n", __func__, cmd_code, cmd_len);
-
-	switch (cmd_code)
-	{
-		case CMD_IPSEC_SA_CREATE:
-			rc = IPsec_handle_CREATE_SA(pcmd, cmd_len);
-			break;
-
-		case CMD_IPSEC_SA_DELETE:
-			rc = IPsec_handle_DELETE_SA(pcmd, cmd_len);
-			break;
-
-		case CMD_IPSEC_SA_FLUSH:
-			rc = IPsec_handle_FLUSH_SA(pcmd, cmd_len);
-			break;
-
-		case CMD_IPSEC_SA_SET_KEYS:
-			rc = IPsec_handle_SA_SET_KEYS(pcmd, cmd_len);
-			break;
-
-		case CMD_IPSEC_SA_SET_TUNNEL:
-			rc = IPsec_handle_SA_SET_TUNNEL(pcmd, cmd_len);
-			break;
-			/* Could not find defintion for CMD_IPSEC_SA_SET_TNL_ROUTE 
-			 * deifed some tmp value in cdx_cmdhandler.h file
-			 * time being - Rajendran 6 Oct 2016  
-			 */
-		case CMD_IPSEC_SA_SET_TNL_ROUTE:
-			rc = IPsec_handle_SA_SET_TNL_ROUTE(pcmd, cmd_len);
-			break;
-		case CMD_IPSEC_SA_SET_NATT:
-			rc = IPsec_handle_SA_SET_NATT(pcmd, cmd_len);
-			break;
-
-		case CMD_IPSEC_SA_SET_STATE:
-			rc = IPsec_handle_SA_SET_STATE(pcmd, cmd_len);
-			break;
-
-		case CMD_IPSEC_SA_SET_LIFETIME:
-			rc = IPsec_handle_SA_SET_LIFETIME(pcmd, cmd_len);
-			break;
-		case CMD_IPSEC_SA_ACTION_QUERY:
-		case CMD_IPSEC_SA_ACTION_QUERY_CONT:
-#ifdef PRINT_SA_INFO 
-			if(cmd_code == CMD_IPSEC_SA_ACTION_QUERY)
-				IPsec_print_SAEntrys((PSAQueryCommand)pcmd, 0);
-#endif
-			rc = IPsec_Get_Next_SAEntry((PSAQueryCommand)pcmd, cmd_code == CMD_IPSEC_SA_ACTION_QUERY);
-			if (rc == NO_ERR)
-				retlen += sizeof (SAQueryCommand);
-			break;
-
-		case CMD_IPSEC_FRAG_CFG:
-			rc = IPsec_handle_FRAG_CFG(pcmd, cmd_len);
-			break;
-
-		case CMD_IPSEC_SEC_FAILURE_STATS:
-			rc = IPsec_get_SEC_failure_stats(pcmd, cmd_len);
-
-			if (rc > 0) /* in case of success , retval is stats struct length */
-				retlen += rc;
-			break;
-
-		case CMD_IPSEC_RESET_SEC_FAILURE_STATS:
-			rc = IPsec_reset_SEC_failure_stats(pcmd, cmd_len);
-			break;
-
-		default:
-			printk("%s::ERR_UNKNOWN_COMMAND\n", __func__);
-			rc = ERR_UNKNOWN_COMMAND;
-			break;
-	}
-
-	*pcmd = rc;
-
-	return retlen;
+	return cdx_dispatch_cmd(ipsec_cmd_table, ARRAY_SIZE(ipsec_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 static __inline int M_ipsec_sa_expire_notify(PSAEntry sa, int hard)
