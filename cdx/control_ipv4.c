@@ -10,6 +10,7 @@
 
 #include <linux/mutex.h>
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
 #include "control_pppoe.h"
@@ -1306,85 +1307,150 @@ static int IPv4_HandleIP_FF_CONTROL (U16 *p, U16 Length)
 
 
 
-static U16 M_ipv4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+/*
+ * CMD_IPV4_CONNTRACK: two valid exact sizes, CtCommand or
+ * CtExCommand. Dispatcher's CDX_CMD_VAR admits the full range
+ * [CtCommand, CtExCommand]; the inner handler's own length
+ * check rejects any intermediate size with ERR_WRONG_COMMAND_SIZE.
+ * Snapshot action before the handler runs because the QUERY
+ * paths overwrite pcmd in place.
+ */
+static U16 ipv4_conntrack_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
-	U16 rc;
-	U16 querySize = 0;
-	U16 action;
-#ifdef  IPV4_CMD_DEBUG_
-	printk(KERN_DEBUG "%s: cmd_code=0x%04x, cmd_len=%d\n", __func__, cmd_code, cmd_len);
-#endif
-	switch (cmd_code)
-	{
-		case CMD_IPV4_CONNTRACK:			
-			action = *pcmd;
-			rc = IPv4_HandleIP_CONNTRACK(pcmd, cmd_len);
-			if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
-				querySize = sizeof(CtExCommand);
-			break;
+	U16 action = *(U16 *)pcmd;
+	U16 rc = (U16)IPv4_HandleIP_CONNTRACK(pcmd, cmd_len);
 
-		case CMD_IP_ROUTE:
-			action = *pcmd;
-			rc = IP_HandleIP_ROUTE_RESOLVE(pcmd, cmd_len);
-			if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
-				querySize = sizeof(RtCommand);
-			break;
+	if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
+		*out_reply_len = sizeof(U16) + sizeof(CtExCommand);
+	return rc;
+}
 
-		case CMD_IPV4_RESET:			
-			rc = IPv4_HandleIP_RESET();
-			break;
+static U16 ipv4_route_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 action = *(U16 *)pcmd;
+	U16 rc = (U16)IP_HandleIP_ROUTE_RESOLVE(pcmd, cmd_len);
 
-		case CMD_IPV4_SET_TIMEOUT:
-			rc = IPv4_HandleIP_SET_TIMEOUT(pcmd, cmd_len);
-			break;
+	if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
+		*out_reply_len = sizeof(U16) + sizeof(RtCommand);
+	return rc;
+}
 
-		case CMD_IPV4_GET_TIMEOUT:
-			rc = IPv4_HandleIP_Get_Timeout(pcmd, cmd_len);
-			if (rc == NO_ERR)
-				querySize = sizeof(TimeoutCommand);
-			break;
+static U16 ipv4_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	return (U16)IPv4_HandleIP_RESET();
+}
 
-		case CMD_IPV4_FF_CONTROL:
-			rc = IPv4_HandleIP_FF_CONTROL(pcmd, cmd_len);
-			break;
+static U16 ipv4_set_timeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPv4_HandleIP_SET_TIMEOUT(pcmd, cmd_len);
+}
+
+/*
+ * CMD_IPV4_GET_TIMEOUT: takes a CtCommand in, always produces a
+ * TimeoutCommand reply (offset 2) on success. Inner handler does
+ * memset(pcmd, 0, 256) up-front, so anything we read from pcmd
+ * here must be read before calling the handler — but we only need
+ * cmd_len, which is already a parameter.
+ */
+static U16 ipv4_get_timeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc = (U16)IPv4_HandleIP_Get_Timeout(pcmd, cmd_len);
+
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(U16) + sizeof(TimeoutCommand);
+	return rc;
+}
+
+static U16 ipv4_ff_control_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPv4_HandleIP_FF_CONTROL(pcmd, cmd_len);
+}
 
 #ifdef CDX_TODO_ALTCONF
-			/* IPv4 module is used to handle alternate configuration API */
-		case CMD_ALTCONF_SET:
-			rc = ALTCONF_HandleCONF_SET(pcmd, cmd_len);
-			break;
-		case CMD_ALTCONF_RESET:
-			rc = ALTCONF_HandleCONF_RESET_ALL(pcmd, cmd_len);
-			break;
+static U16 ipv4_altconf_set_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)ALTCONF_HandleCONF_SET(pcmd, cmd_len);
+}
+
+static U16 ipv4_altconf_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)ALTCONF_HandleCONF_RESET_ALL(pcmd, cmd_len);
+}
 #endif
 
-		case CMD_IPV4_SOCK_OPEN:
-			DPRINT("%s(%d) \n",__func__,__LINE__);
-			rc = SOCKET4_HandleIP_Socket_Open(pcmd, cmd_len);
-			break;
+static U16 ipv4_sock_open_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	DPRINT("%s(%d) \n", __func__, __LINE__);
+	return (U16)SOCKET4_HandleIP_Socket_Open(pcmd, cmd_len);
+}
 
-		case CMD_IPV4_SOCK_CLOSE:
-			rc = SOCKET4_HandleIP_Socket_Close(pcmd, cmd_len);
-			break;
+static U16 ipv4_sock_close_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)SOCKET4_HandleIP_Socket_Close(pcmd, cmd_len);
+}
 
-		case CMD_IPV4_SOCK_UPDATE:
-			rc = SOCKET4_HandleIP_Socket_Update(pcmd, cmd_len);
-			break;
+static U16 ipv4_sock_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)SOCKET4_HandleIP_Socket_Update(pcmd, cmd_len);
+}
 
 #ifdef CDX_TODO_IPV4FRAG
-		case CMD_IPV4_FRAGTIMEOUT:
-		case CMD_IPV4_SAM_FRAGTIMEOUT:
-			rc = IPv4_HandleIP_Set_FragTimeout(pcmd, cmd_len, (cmd_code == CMD_IPV4_SAM_FRAGTIMEOUT));
-			break;
+static U16 ipv4_fragtimeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPv4_HandleIP_Set_FragTimeout(pcmd, cmd_len, 0);
+}
+
+static U16 ipv4_sam_fragtimeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)IPv4_HandleIP_Set_FragTimeout(pcmd, cmd_len, 1);
+}
 #endif
 
-		default:
-			rc = ERR_UNKNOWN_COMMAND;
-			break;
-	}
+/*
+ * CMD_IPV4_RESET uses CDX_CMD_VAR(0, U16_MAX) to preserve the
+ * pre-migration permissive length contract: the old cmdproc did
+ * not length-check RESET at all. Hardening is a separate pass.
+ */
+static const struct cdx_cmd_spec ipv4_cmd_table[] = {
+	CDX_CMD_VAR(CMD_IPV4_CONNTRACK,      sizeof(CtCommand), sizeof(CtExCommand),
+		    NULL, ipv4_conntrack_handle),
+	CDX_CMD    (CMD_IP_ROUTE,            RtCommand,           ipv4_route_handle),
+	CDX_CMD_VAR(CMD_IPV4_RESET,          0, U16_MAX,          NULL, ipv4_reset_handle),
+	CDX_CMD    (CMD_IPV4_SET_TIMEOUT,    TimeoutCommand,      ipv4_set_timeout_handle),
+	CDX_CMD    (CMD_IPV4_GET_TIMEOUT,    CtCommand,           ipv4_get_timeout_handle),
+	CDX_CMD    (CMD_IPV4_FF_CONTROL,     FFControlCommand,    ipv4_ff_control_handle),
+#ifdef CDX_TODO_ALTCONF
+	CDX_CMD_VAR(CMD_ALTCONF_SET,         0, U16_MAX, NULL,    ipv4_altconf_set_handle),
+	CDX_CMD_VAR(CMD_ALTCONF_RESET,       0, U16_MAX, NULL,    ipv4_altconf_reset_handle),
+#endif
+	CDX_CMD    (CMD_IPV4_SOCK_OPEN,      SockOpenCommand,     ipv4_sock_open_handle),
+	CDX_CMD    (CMD_IPV4_SOCK_CLOSE,     SockCloseCommand,    ipv4_sock_close_handle),
+	CDX_CMD    (CMD_IPV4_SOCK_UPDATE,    SockUpdateCommand,   ipv4_sock_update_handle),
+#ifdef CDX_TODO_IPV4FRAG
+	CDX_CMD_VAR(CMD_IPV4_FRAGTIMEOUT,    0, U16_MAX, NULL,    ipv4_fragtimeout_handle),
+	CDX_CMD_VAR(CMD_IPV4_SAM_FRAGTIMEOUT, 0, U16_MAX, NULL,   ipv4_sam_fragtimeout_handle),
+#endif
+};
 
-	*pcmd = rc;
-	return 2 + querySize;
+static U16 M_ipv4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+{
+#ifdef IPV4_CMD_DEBUG_
+	printk(KERN_DEBUG "%s: cmd_code=0x%04x, cmd_len=%d\n", __func__, cmd_code, cmd_len);
+#endif
+	return cdx_dispatch_cmd(ipv4_cmd_table, ARRAY_SIZE(ipv4_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 
