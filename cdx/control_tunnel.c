@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include "portdefs.h"
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_ipv4.h"
 #include "control_ipv6.h"
 #include "control_tunnel.h"
@@ -594,58 +595,103 @@ void tnl_update(PTnlEntry pTunnelEntry)
  *
  *
  */
-static U16 M_tnl_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+static U16 tnl_create_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
-	U16 rc;
-	U16 retlen = 2;
+	(void)out_reply_len;
+	return (U16)TNL_handle_CREATE(pcmd, cmd_len);
+}
 
-	switch (cmd_code)
-	{
-		case CMD_TNL_CREATE:
-			rc = TNL_handle_CREATE(pcmd, cmd_len);
-			break;
+static U16 tnl_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)TNL_handle_UPDATE(pcmd, cmd_len);
+}
 
-		case CMD_TNL_UPDATE:
-			rc = TNL_handle_UPDATE(pcmd, cmd_len);
-			break;
-
-		case CMD_TNL_DELETE:
-			rc = TNL_handle_DELETE(pcmd, cmd_len);
-			break;
+static U16 tnl_delete_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)TNL_handle_DELETE(pcmd, cmd_len);
+}
 
 #ifdef CDX_TODO_IPSEC
-		case CMD_TNL_IPSEC:
-			rc = TNL_handle_IPSEC(pcmd, cmd_len);
-			break;
+static U16 tnl_ipsec_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)TNL_handle_IPSEC(pcmd, cmd_len);
+}
 #endif
 
 #ifdef CDX_TODO_TUNNEL
-		case CMD_TNL_4o6_ID_CONVERSION_dupsport:
-			rc = TNL_handle_IdConv_dupsport(pcmd, cmd_len);
-			break;
+static U16 tnl_idconv_dupsport_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)TNL_handle_IdConv_dupsport(pcmd, cmd_len);
+}
 
-		case CMD_TNL_4o6_ID_CONVERSION_psid:
-			rc = TNL_handle_IdConv_psid(pcmd, cmd_len);
-			break;
+static U16 tnl_idconv_psid_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)TNL_handle_IdConv_psid(pcmd, cmd_len);
+}
 #endif
 
-		case CMD_TNL_QUERY:
-		case CMD_TNL_QUERY_CONT:
-			{
-				PTNLCommand_query ptnl_cmd_qry = (PTNLCommand_query) (pcmd);
-				rc = Tnl_Get_Next_Hash_Entry(ptnl_cmd_qry, cmd_code == CMD_TNL_QUERY);
-				if (rc == NO_ERR)
-					retlen = sizeof(TNLCommand_query);
-				break;
-			}
+/*
+ * CMD_TNL_QUERY / CMD_TNL_QUERY_CONT: pre-migration code handled
+ * both inline under the same case with `cmd_code == CMD_TNL_QUERY`
+ * picking the reset flag. Split into two handlers here so each
+ * table entry points at the right one; functionally identical.
+ *
+ * Reply-length follows the PPPoE-style wire contract: on NO_ERR
+ * the status word at pcmd[0] replaces the action field and the
+ * rest of TNLCommand_query is the query payload, so total reply
+ * length is exactly sizeof(TNLCommand_query) — NOT
+ * sizeof(U16) + sizeof(TNLCommand_query).
+ *
+ * Length: the old cmdproc did not length-check the query arms,
+ * so use CDX_CMD_VAR(0, U16_MAX) to preserve permissive behavior
+ * per the A1b template.
+ */
+static U16 tnl_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc;
 
-		default:
-			rc = ERR_UNKNOWN_COMMAND;
-			break;
-	}
+	(void)cmd_len;
+	rc = (U16)Tnl_Get_Next_Hash_Entry((PTNLCommand_query)pcmd, 1);
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(TNLCommand_query);
+	return rc;
+}
 
-	*pcmd = rc;
-	return retlen;
+static U16 tnl_query_cont_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc;
+
+	(void)cmd_len;
+	rc = (U16)Tnl_Get_Next_Hash_Entry((PTNLCommand_query)pcmd, 0);
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(TNLCommand_query);
+	return rc;
+}
+
+static const struct cdx_cmd_spec tnl_cmd_table[] = {
+	CDX_CMD(CMD_TNL_CREATE, TNLCommand_create, tnl_create_handle),
+	CDX_CMD(CMD_TNL_UPDATE, TNLCommand_create, tnl_update_handle),
+	CDX_CMD(CMD_TNL_DELETE, TNLCommand_delete, tnl_delete_handle),
+#ifdef CDX_TODO_IPSEC
+	CDX_CMD(CMD_TNL_IPSEC,  TNLCommand_ipsec,  tnl_ipsec_handle),
+#endif
+#ifdef CDX_TODO_TUNNEL
+	CDX_CMD(CMD_TNL_4o6_ID_CONVERSION_dupsport, TNLCommand_IdConvDP,   tnl_idconv_dupsport_handle),
+	CDX_CMD(CMD_TNL_4o6_ID_CONVERSION_psid,     TNLCommand_IdConvPsid, tnl_idconv_psid_handle),
+#endif
+	CDX_CMD_VAR(CMD_TNL_QUERY,      0, U16_MAX, NULL, tnl_query_handle),
+	CDX_CMD_VAR(CMD_TNL_QUERY_CONT, 0, U16_MAX, NULL, tnl_query_cont_handle),
+};
+
+static U16 M_tnl_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
+{
+	return cdx_dispatch_cmd(tnl_cmd_table, ARRAY_SIZE(tnl_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 
