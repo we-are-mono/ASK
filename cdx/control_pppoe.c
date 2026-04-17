@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include "portdefs.h"
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_pppoe.h"
 #include "misc.h"
 #include "control_stat.h"
@@ -420,41 +421,70 @@ found:
 }
 
 
+/*
+ * CMD_PPPOE_ENTRY: snapshot action at entry because the QUERY
+ * paths call PPPoE_Get_Next_SessionEntry which overwrites pcmd.
+ *
+ * Reply-length quirk: the pre-migration wrapper set
+ * ret_len = sizeof(PPPoECommand) for query-success (NOT
+ * sizeof(U16) + sizeof(PPPoECommand) as VLAN/IPv4 use).
+ * The wire format is status word (2 bytes) replacing the
+ * action field at offset 0, followed by the rest of
+ * PPPoECommand. So the total reply is exactly sizeof(PPPoECommand)
+ * bytes, and libfci parses it as a PPPoECommand struct where
+ * the first U16 holds the status. Preserve that.
+ */
+static U16 pppoe_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 action = *(U16 *)pcmd;
+	U16 rc = (U16)PPPoE_Handle_Entry(pcmd, cmd_len);
+
+	if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
+		*out_reply_len = sizeof(PPPoECommand);
+	return rc;
+}
+
+/*
+ * CMD_PPPOE_RELAY_ENTRY: PPPoE_Handle_Relay_Entry has no QUERY
+ * arm (its default: returns ERR_UNKNOWN_COMMAND on unknown
+ * actions), so the query-reply bump below is effectively dead
+ * on the happy path. Preserve the pre-migration shape anyway
+ * to keep behavior bit-exact if a client ever sends QUERY here.
+ */
+static U16 pppoe_relay_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 action = *(U16 *)pcmd;
+	U16 rc = (U16)PPPoE_Handle_Relay_Entry(pcmd, cmd_len);
+
+	if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
+		*out_reply_len = sizeof(PPPoECommand);
+	return rc;
+}
+
+/*
+ * CMD_PPPOE_GET_IDLE: takes a PPPoEIdleTimeCmd in, writes a
+ * PPPoEIdleTimeCmd at pcmd+1 on success. Reply is 2-byte status
+ * followed by the struct — total sizeof(U16) + sizeof(PPPoEIdleTimeCmd).
+ */
+static U16 pppoe_get_idle_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 rc = (U16)PPPoE_Handle_Get_Idle(pcmd, cmd_len);
+
+	if (rc == NO_ERR)
+		*out_reply_len = sizeof(U16) + sizeof(PPPoEIdleTimeCmd);
+	return rc;
+}
+
+static const struct cdx_cmd_spec pppoe_cmd_table[] = {
+	CDX_CMD(CMD_PPPOE_ENTRY,       PPPoECommand,      pppoe_entry_handle),
+	CDX_CMD(CMD_PPPOE_RELAY_ENTRY, PPPoERelayCommand, pppoe_relay_entry_handle),
+	CDX_CMD(CMD_PPPOE_GET_IDLE,    PPPoEIdleTimeCmd,  pppoe_get_idle_handle),
+};
+
 static U16 M_pppoe_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-	U16 rc = NO_ERR;
-	U16 ret_len = 2;
-	U16 action;
-
-	switch (cmd_code)
-	{
-		case CMD_PPPOE_ENTRY:
-			action = *pcmd;
-			rc = PPPoE_Handle_Entry(pcmd, cmd_len);
-			if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
-				ret_len = sizeof(PPPoECommand);
-			break;
-
-		case CMD_PPPOE_RELAY_ENTRY:
-			action = *pcmd;
-			rc = PPPoE_Handle_Relay_Entry(pcmd, cmd_len);
-			if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
-				ret_len = sizeof(PPPoECommand);
-			break;
-
-		case CMD_PPPOE_GET_IDLE:
-			rc = PPPoE_Handle_Get_Idle(pcmd, cmd_len);
-			if (rc == NO_ERR)
-				ret_len = sizeof(PPPoEIdleTimeCmd) + 2;
-			break;	
-
-		default:
-			rc = ERR_UNKNOWN_COMMAND;
-			break;
-	}
-
-	*pcmd = rc;
-	return ret_len;
+	return cdx_dispatch_cmd(pppoe_cmd_table, ARRAY_SIZE(pppoe_cmd_table),
+				cmd_code, cmd_len, pcmd);
 }
 
 
