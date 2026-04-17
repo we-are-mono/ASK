@@ -14,6 +14,7 @@
 #include <linux/random.h>
 #include <linux/siphash.h>
 #include "cdx.h"
+#include "cdx_cmd_validator.h"
 #include "control_bridge.h"
 #include "misc.h"
 #include "cdx_ioctl.h"
@@ -512,53 +513,101 @@ static int M_bridged_itf_update(U16 code, U16 *p, U16 Length)
 	return CMD_OK;
 }
 
+/*
+ * CMD_RX_L2BRIDGE_{ENABLE,ADD,REMOVE,QUERY_STATUS,FLOW_RESET}: the
+ * old cmdproc just `break`'d for these, so the reply is status-only
+ * with CMD_OK (= NO_ERR = 0). Preserve exactly. No length check in
+ * the old code either -> CDX_CMD_VAR(0, U16_MAX).
+ */
+static U16 bridge_noop_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+	return NO_ERR;
+}
+
+/*
+ * CMD_RX_L2BRIDGE_QUERY_ENTRY: old cmdproc always wrote
+ * L2BridgeQueryEntryResponse{eof=1} into pcmd and returned
+ * acklen = sizeof(L2BridgeQueryEntryResponse), ackstatus = CMD_OK.
+ * The dispatcher stamps pcmd[0] = NO_ERR after this handler, which
+ * overwrites the eof byte's low U16 slot — but the old code did
+ * the exact same thing via *p = ackstatus after writing prsp->eof,
+ * so the net wire layout is identical.
+ */
+static U16 bridge_query_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	PL2BridgeQueryEntryResponse prsp = (PL2BridgeQueryEntryResponse)pcmd;
+
+	(void)cmd_len;
+	prsp->eof = 1;
+	*out_reply_len = sizeof(L2BridgeQueryEntryResponse);
+	return NO_ERR;
+}
+
+/*
+ * CMD_RX_L2BRIDGE_FLOW_ENTRY: action snapshot at entry; query-
+ * success reply uses the VLAN/IPv4-style sizeof(U16) + sizeof(
+ * L2BridgeL2FlowEntryCommand) layout (NOT the PPPoE/tunnel
+ * sizeof(struct) layout). Inner handler's own length check
+ * enforces exact sizeof(L2BridgeL2FlowEntryCommand).
+ */
+static U16 bridge_flow_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	U16 action = *(U16 *)pcmd;
+	U16 rc = (U16)M_bridge_handle_l2flow(pcmd, cmd_len);
+
+	if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
+		*out_reply_len = sizeof(U16) + sizeof(L2BridgeL2FlowEntryCommand);
+	return rc;
+}
+
+/*
+ * M_bridge_handle_control takes cmd_code as an argument — old
+ * cmdproc passed the matching code through. Split into two
+ * wrappers here because the dispatcher doesn't forward cmd_code.
+ * Neither the old cmdproc nor the inner handler length-checks
+ * these, so CDX_CMD_VAR(0, U16_MAX) preserves behavior.
+ */
+static U16 bridge_flow_timeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)M_bridge_handle_control(CMD_RX_L2BRIDGE_FLOW_TIMEOUT, pcmd, cmd_len);
+}
+
+static U16 bridge_mode_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)M_bridge_handle_control(CMD_RX_L2BRIDGE_MODE, pcmd, cmd_len);
+}
+
+static U16 bridged_itf_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)out_reply_len;
+	return (U16)M_bridged_itf_update(CMD_BRIDGED_ITF_UPDATE, pcmd, cmd_len);
+}
+
+static const struct cdx_cmd_spec bridge_cmd_table[] = {
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_ENABLE,       0, U16_MAX, NULL, bridge_noop_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_ADD,          0, U16_MAX, NULL, bridge_noop_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_REMOVE,       0, U16_MAX, NULL, bridge_noop_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_STATUS, 0, U16_MAX, NULL, bridge_noop_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_RESET,   0, U16_MAX, NULL, bridge_noop_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_ENTRY,  0, U16_MAX, NULL, bridge_query_entry_handle),
+	CDX_CMD    (CMD_RX_L2BRIDGE_FLOW_ENTRY,   L2BridgeL2FlowEntryCommand, bridge_flow_entry_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_TIMEOUT, 0, U16_MAX, NULL, bridge_flow_timeout_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_MODE,         0, U16_MAX, NULL, bridge_mode_handle),
+	CDX_CMD_VAR(CMD_BRIDGED_ITF_UPDATE,       0, U16_MAX, NULL, bridged_itf_update_handle),
+};
+
 static U16 M_bridge_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 {
-	U16 acklen;
-	U16 ackstatus;
-	U32 action;
-
-	acklen = 2;
-	ackstatus = CMD_OK;
-
 #ifdef CONTROL_BRIDGE_DEBUG
 	printk("%s::cmd code %x p %p\n", __func__, cmd_code, p);
 #endif
-	switch (cmd_code)
-	{
-		case CMD_RX_L2BRIDGE_ENABLE: 
-		case CMD_RX_L2BRIDGE_ADD: 
-		case CMD_RX_L2BRIDGE_REMOVE: 
-		case CMD_RX_L2BRIDGE_QUERY_STATUS: 
-		case CMD_RX_L2BRIDGE_FLOW_RESET:
-			break;
-		case CMD_RX_L2BRIDGE_QUERY_ENTRY: 
-			{
-				PL2BridgeQueryEntryResponse prsp = (PL2BridgeQueryEntryResponse)p;
-				prsp->eof = 1;
-				acklen = sizeof(L2BridgeQueryEntryResponse);
-			}
-			break;
-		case CMD_RX_L2BRIDGE_FLOW_ENTRY:
-			action = *p;
-			ackstatus = M_bridge_handle_l2flow(p, cmd_len);
-			if(ackstatus == NO_ERR && ((action == ACTION_QUERY) || (action == ACTION_QUERY_CONT)))
-				acklen += sizeof(L2BridgeL2FlowEntryCommand);
-			break;
-
-		case CMD_RX_L2BRIDGE_FLOW_TIMEOUT:
-		case CMD_RX_L2BRIDGE_MODE: 
-			ackstatus = M_bridge_handle_control(cmd_code, p, cmd_len);
-			break;
-		case CMD_BRIDGED_ITF_UPDATE: 
-			ackstatus = M_bridged_itf_update(cmd_code, p, cmd_len);
-			break;
-		default:
-			ackstatus = ERR_UNKNOWN_COMMAND;
-			break;
-	}
-	*p = ackstatus;
-	return acklen;
+	return cdx_dispatch_cmd(bridge_cmd_table, ARRAY_SIZE(bridge_cmd_table),
+				cmd_code, cmd_len, p);
 }
 
 
