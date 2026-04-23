@@ -160,7 +160,10 @@ long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	DPA_ERROR("%s::unsupported ioctl cmd %x\n", __func__, cmd);
-	return -EINVAL;
+	/* Linux convention: ENOTTY means "fd doesn't recognize this ioctl",
+	 * which is what happened here. EINVAL is overloaded to mean "the
+	 * handler got bad args", reserve it for that. */
+	return -ENOTTY;
 }
 
 static void cdx_driver_deinit(void)
