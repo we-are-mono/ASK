@@ -1846,7 +1846,12 @@ static int create_ethernet_hm(struct ins_entry_info *info, uint32_t update_ethty
 	unsafe_memcpy(l2param->l2hdr + ETHER_ADDR_LEN,
 			l2_info->l2hdr + ETHER_ADDR_LEN, ETHER_ADDR_LEN,
 			"flexible array with caller-validated allocation");
-	*(uint16_t*) (&l2param->l2hdr[2*ETHER_ADDR_LEN]) = htons(info->eth_type);
+	/* Use pointer arithmetic rather than l2hdr[2*ETHER_ADDR_LEN] — UBSAN
+	 * bounds-checks the subscript form against l2hdr's declared size
+	 * (flexible array = 0) and would flag this even though the buffer
+	 * is allocated past the struct by the caller. Same rationale as the
+	 * surrounding unsafe_memcpy calls. */
+	*(uint16_t *)(l2param->l2hdr + 2 * ETHER_ADDR_LEN) = htons(info->eth_type);
 
 	return SUCCESS;
 }
