@@ -23,7 +23,18 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://ask.cfg \
            file://mono-gateway-dk.dts \
            file://001-hwmon-ina2xx-Add-INA234-support.patch \
-           file://002-mono-gateway-ask-kernel_linux_6_12.patch \
+           file://010-ask-fman-dpaa-ehash.patch \
+           file://020-ask-bridge-hooks.patch \
+           file://030-ask-ipv4-ipv6-forwarding.patch \
+           file://040-ask-xfrm-ipsec-offload.patch \
+           file://050-ask-conntrack-offload.patch \
+           file://060-ask-netfilter-qosmark.patch \
+           file://070-ask-ppp-hooks.patch \
+           file://080-wext-core-restore-ndo_do_ioctl.patch \
+           file://090-qbman-dpa_alloc-preallocate-nodes.patch \
+           file://091-sdk_dpaa-dpa_get_channel-use-mutex.patch \
+           file://092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch \
+           file://093-netlink-name-L2FLOW-cb-mutex.patch \
           "
 
 S = "${WORKDIR}/git"
