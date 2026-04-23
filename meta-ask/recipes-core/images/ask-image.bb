@@ -51,6 +51,22 @@ IMAGE_INSTALL = " \
     lmsensors-config-fancontrol \
 "
 
+# Test harness (agent + python fuzzing/orchestration tooling + stress tools).
+# Kept separate so it's obvious what the test image adds on top of the base.
+IMAGE_INSTALL:append = " \
+    ask-test-agent \
+    python3-core \
+    python3-aiohttp \
+    python3-pyroute2 \
+    python3-scapy \
+    python3-pytest \
+    python3-cffi \
+    nmap \
+    stress-ng \
+    trace-cmd \
+    perf \
+"
+
 IMAGE_FSTYPES = "cpio.gz"
 
 IMAGE_FEATURES += "empty-root-password"

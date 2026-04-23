@@ -1,0 +1,17 @@
+[Unit]
+Description=ASK test harness agent
+After=network.target
+
+[Service]
+Type=simple
+Environment=ASKD_HOST=0.0.0.0
+Environment=ASKD_PORT=9110
+# askd_agent/ sits at /opt/askd-agent/askd_agent/ — the parent dir has to
+# be on sys.path for `python -m askd_agent` to find it.
+Environment=PYTHONPATH=/opt/askd-agent
+ExecStart=/opt/askd-agent/venv/bin/python -m askd_agent
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

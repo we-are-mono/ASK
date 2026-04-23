@@ -12,6 +12,12 @@
 LAN_IF=eth4
 LAN_ADDR=192.168.1.1/24
 WAN_IF=eth3
+# Test image: pin WAN to a stable static address so the orchestrator has
+# a fixed POST target and installed FMAN offload rules can't go stale
+# under DHCP lease churn. Gateway/DNS come from the WAN-side setup.
+WAN_ADDR=10.0.0.62/24
+WAN_GATEWAY=10.0.0.1
+WAN_DNS=10.0.0.1
 DNSMASQ_CONF=/etc/dnsmasq-gateway.conf
 
 start_loopback() {
@@ -27,8 +33,9 @@ start_lan() {
 
 start_wan() {
     ip link set "$WAN_IF" up
-    # busybox udhcpc: -b backgrounds after a lease, default script writes /etc/resolv.conf.
-    udhcpc -i "$WAN_IF" -b -t 5 -T 2 >/dev/null 2>&1 || true
+    ip addr replace "$WAN_ADDR" dev "$WAN_IF"
+    ip route replace default via "$WAN_GATEWAY" dev "$WAN_IF"
+    printf 'nameserver %s\n' "$WAN_DNS" > /etc/resolv.conf
 }
 
 start_forward() {
@@ -82,7 +89,6 @@ case "$1" in
         ;;
     stop)
         killall dnsmasq 2>/dev/null || true
-        killall udhcpc 2>/dev/null || true
         iptables -t nat -D POSTROUTING -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
         iptables -D FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
         iptables -D FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true

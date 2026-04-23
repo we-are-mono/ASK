@@ -1,0 +1,55 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          askd-agent
+# Required-Start:    cmm gateway-setup
+# Default-Start:     S
+# Short-Description: ASK test-harness on-target HTTP/JSON agent
+### END INIT INFO
+
+# Serves the orchestrator (running on the WAN host) over the WAN-facing
+# interface. Listens on all interfaces:9110 — reachable from both LAN
+# and WAN for consistency; not exposed outside the lab network.
+
+AGENT=/usr/bin/askd-agent
+# /var/log is a dangling symlink to volatile/log on the initramfs and
+# busybox's mkdir -p won't resolve through it; /tmp is a plain tmpfs
+# that's always mounted and writable.
+LOGFILE=/tmp/askd-agent.log
+PIDFILE=/var/run/askd-agent.pid
+PORT=9110
+
+case "$1" in
+    start|"")
+        [ -x "$AGENT" ] || { echo "askd-agent not installed" >&2; exit 1; }
+        if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "askd-agent already running"; exit 0
+        fi
+        ASKD_PORT="$PORT" "$AGENT" >>"$LOGFILE" 2>&1 &
+        echo $! > "$PIDFILE"
+        ;;
+    stop)
+        pid=""
+        [ -r "$PIDFILE" ] && pid=$(cat "$PIDFILE")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            for _ in 1 2 3; do
+                [ -d "/proc/$pid" ] || break
+                sleep 1
+            done
+            [ -d "/proc/$pid" ] && kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+        ;;
+    status)
+        if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "running (pid $(cat "$PIDFILE"))"; exit 0
+        fi
+        echo "not running"; exit 3
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

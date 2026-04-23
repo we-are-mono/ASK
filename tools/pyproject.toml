@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+# All async tests run under asyncio with no @pytest.mark.asyncio decorator needed.
+asyncio_mode = "auto"
+# Function-scoped so each test gets its own event loop — aiohttp.ClientSession
+# is loop-bound, so sharing across tests would hit "Timeout context manager
+# should be used inside a task" on the second test. Session-scoped async
+# fixtures that need to outlive individual tests must declare their loop
+# scope explicitly via @pytest_asyncio.fixture(loop_scope="session").
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope    = "function"
+
+# -ra: summary of non-passing results. -x: stop after first failure
+# (comment out when triaging a suite run). --tb=short: compact tracebacks.
+addopts = "-ra -x --tb=short"
+testpaths = ["tests"]
