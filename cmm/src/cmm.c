@@ -315,8 +315,14 @@ static void sig_term_hdlr(int signum)
 	{
 		free((void *)globalConf.rtnl_buf_pools[ii]);
 	}
+	/*
+	 * On reboot the pidfile can already be gone — the init script's stop
+	 * action (S50cmm) runs `rm -f $PIDFILE` as a belt-and-braces cleanup,
+	 * and on some shutdown paths /var/run (a tmpfs) may be unwound early.
+	 * Treat ENOENT as already-cleaned; only log real errors.
+	 */
 	ret = remove(CMM_PID_FILE_PATH);
-	if (ret < 0)
+	if (ret < 0 && errno != ENOENT)
 		cmm_print(DEBUG_STDERR, "%s: file %s removal failed: %s\n", __func__, CMM_PID_FILE_PATH, strerror(errno));
 
 	cmm_print(DEBUG_INFO, "%s: exiting\n", __func__);
@@ -538,7 +544,7 @@ err1:
 		free((void *)globalConf.rtnl_buf_pools[ii]);
 	}
 	ret = remove(CMM_PID_FILE_PATH);
-	if (ret < 0)
+	if (ret < 0 && errno != ENOENT)
 		cmm_print(DEBUG_STDERR, "%s: file %s removal failed: %s\n", __func__, CMM_PID_FILE_PATH, strerror(errno));
 err0:
 	cmm_print(DEBUG_INFO, "%s: exiting\n", __func__);

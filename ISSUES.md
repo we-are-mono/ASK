@@ -185,6 +185,10 @@ Memory corruption or info-leak reachable from userspace (unprivileged once G1 is
   [cdx/cdx_ehash.c:1849](cdx/cdx_ehash.c#L1849). `*(uint16_t*)(&l2param->l2hdr[2*ETHER_ADDR_LEN]) = ...` writes through an index-form reference to `l2hdr`, which is a flexible array member (`uint8_t l2hdr[0]`). The buffer is genuinely allocated past the struct (caller validates `hdrlen` and calls `unsafe_memcpy` on adjacent lines for the same reason) but UBSAN bounds-checks the subscript form against the declared size (0) and warns "index 12 is out of range for type 'uint8_t [*]'". Surfaced the first time the test image installed an FCI IPv4 conntrack entry under `CONFIG_UBSAN`. **Fix:** convert to pointer arithmetic (`l2param->l2hdr + 2 * ETHER_ADDR_LEN`) matching the surrounding memcpy arguments; UBSAN does not instrument pointer-add, only array-subscript.
   _Done. Caught on the first ever real-traffic test run against the sanitizer-enabled image — this is exactly the ROI the test harness was built for._
 
+- [x] **L8. cmm `sig_term_hdlr` benign ENOENT noise on reboot.**
+  [cmm/src/cmm.c:318-320](cmm/src/cmm.c#L318-L320). On reboot, a race between the init script's `rm -f $PIDFILE` and cmm's own `remove(CMM_PID_FILE_PATH)` (or an early tmpfs unwind) can leave the pidfile already gone when the signal handler runs. The `remove()` returns -1/ENOENT and cmm prints a misleading "removal failed" error. **Fix:** treat ENOENT as already-cleaned — only log real errors. Same treatment applied to the `err1` startup-failure cleanup path.
+  _Done in `cmm/src/cmm.c` — `if (ret < 0 && errno != ENOENT)` guards both print sites._
+
 ---
 
 ## Corrections to the original review
@@ -294,6 +298,7 @@ Not single issues — broader patterns worth an agenda item each.
 - [~] **A4. Debug code is production code.**
   `dpa_test.c` is always compiled in (C9). Debug `%p` is one Kconfig flip from leaking KASLR (M4). `cdx_deinit_ip_reassembly` is a `printk("implement this")` stub (C5). Either delete or `#ifdef`-gate.
   _Mostly resolved:_ `dpa_test.c` deleted entirely (C9b). `cdx_deinit_ip_reassembly` at least stops the kthread now (C5); full DPAA teardown still TODO but no longer leaves code-freed-while-kthread-running. Remaining: the `%p`/`%px` debug prints under M4._
+
 - [x] **A5. Kernel-side fixes unblocking sanitizer coverage.**
   Bringing up the test image with `CONFIG_LOCKDEP`, `CONFIG_PROVE_LOCKING`, `CONFIG_DEBUG_ATOMIC_SLEEP`, and `CONFIG_UBSAN` enabled surfaced four pre-existing bugs in vendored kernel code that ASK exercises. All four are real (two would genuinely deadlock under memory pressure; one is a lockdep-annotation gap; one is a kernel-internal name-table gap). They fire whether or not KASAN is on — KASAN was a red herring from the earlier bisect. Patches landed in `meta-ask/recipes-kernel/linux/files/` for now; need to move to `patches/kernel/` so Armbian production picks them up (TODO.md tracks that).
 
