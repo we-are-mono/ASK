@@ -170,9 +170,6 @@ CMD_DECLARE(wifi)
 CMD_DECLARE(mc4)
 CMD_DECLARE(mc6)
 CMD_DECLARE(rtp_relay)
-#ifdef CDX_TODO
-CMD_DECLARE(pktcap)
-#endif
 
 int __init cdx_cmdhandler_init(void)
 {
@@ -198,12 +195,6 @@ int __init cdx_cmdhandler_init(void)
 	CMD_INIT(mc4);
 	CMD_INIT(mc6);
 	CMD_INIT(rtp_relay);
-#ifdef CDX_TODO
-#ifdef WIFI_ENABLE
-	CMD_INIT(wifi);
-#endif
-	CMD_INIT(pktcap);
-#endif
 
 exit:
 	return rc;
@@ -215,10 +206,7 @@ void cdx_cmdhandler_exit(void)
 
 	// EXIT routines must be in reverse order from the INIT routines
 
-#ifdef CDX_TODO
-	CMD_EXIT(pktcap);
 	CMD_EXIT(rtp_relay);
-#endif
 	CMD_EXIT(mc6);
 	CMD_EXIT(mc4);
 #ifdef WIFI_ENABLE

@@ -153,20 +153,6 @@ int ct_add(PCtEntry pEntry_orig, TIMER_HANDLER handler)
 		}
 		pEntry_rep->status |= CONNTRACK_HWSET;
 	}
-#ifdef CDX_TODO_RTPRELAY
-	if(IS_IPV4(pEntry_orig))
-	{
-		/* check if rtp stats entry is created for this conntrack, if found link the two object and mark the conntrack 's status field for RTP stats */
-		rtpqos_ipv4_link_stats_entry_by_tuple(pEntry_orig, pEntry_orig->Saddr_v4, pEntry_orig->Daddr_v4, pEntry_orig->Sport, pEntry_orig->Dport);
-		rtpqos_ipv4_link_stats_entry_by_tuple(pEntry_rep, pEntry_rep->Saddr_v4, pEntry_rep->Daddr_v4, pEntry_rep->Sport, pEntry_rep->Dport);
-	}
-	else
-	{
-		/* check if rtp stats entry is created for this conntrack, if found link the two object and mark the conntrack 's status field for RTP stats */
-		rtpqos_ipv6_link_stats_entry_by_tuple(pEntry_orig, pEntry_orig->Saddr_v6, pEntry_orig->Daddr_v6, pEntry_orig->Sport, pEntry_orig->Dport);
-		rtpqos_ipv6_link_stats_entry_by_tuple(pEntry_rep, pEntry_rep->Saddr_v6, pEntry_rep->Daddr_v6, pEntry_rep->Sport, pEntry_rep->Dport);
-	}
-#endif
 
 	/* Add to local hash */
 	slist_add(&ct_cache[pEntry_orig->hash], &pEntry_orig->list);
@@ -1371,20 +1357,6 @@ static U16 ipv4_ff_control_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return (U16)IPv4_HandleIP_FF_CONTROL(pcmd, cmd_len);
 }
 
-#ifdef CDX_TODO_ALTCONF
-static U16 ipv4_altconf_set_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)ALTCONF_HandleCONF_SET(pcmd, cmd_len);
-}
-
-static U16 ipv4_altconf_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)ALTCONF_HandleCONF_RESET_ALL(pcmd, cmd_len);
-}
-#endif
-
 static U16 ipv4_sock_open_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
 	(void)out_reply_len;
@@ -1404,20 +1376,6 @@ static U16 ipv4_sock_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return (U16)SOCKET4_HandleIP_Socket_Update(pcmd, cmd_len);
 }
 
-#ifdef CDX_TODO_IPV4FRAG
-static U16 ipv4_fragtimeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPv4_HandleIP_Set_FragTimeout(pcmd, cmd_len, 0);
-}
-
-static U16 ipv4_sam_fragtimeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPv4_HandleIP_Set_FragTimeout(pcmd, cmd_len, 1);
-}
-#endif
-
 /*
  * CMD_IPV4_RESET uses CDX_CMD_VAR(0, U16_MAX) to preserve the
  * pre-migration permissive length contract: the old cmdproc did
@@ -1431,17 +1389,9 @@ static const struct cdx_cmd_spec ipv4_cmd_table[] = {
 	CDX_CMD    (CMD_IPV4_SET_TIMEOUT,    TimeoutCommand,      ipv4_set_timeout_handle),
 	CDX_CMD    (CMD_IPV4_GET_TIMEOUT,    CtCommand,           ipv4_get_timeout_handle),
 	CDX_CMD    (CMD_IPV4_FF_CONTROL,     FFControlCommand,    ipv4_ff_control_handle),
-#ifdef CDX_TODO_ALTCONF
-	CDX_CMD_VAR(CMD_ALTCONF_SET,         0, U16_MAX, NULL,    ipv4_altconf_set_handle),
-	CDX_CMD_VAR(CMD_ALTCONF_RESET,       0, U16_MAX, NULL,    ipv4_altconf_reset_handle),
-#endif
 	CDX_CMD    (CMD_IPV4_SOCK_OPEN,      SockOpenCommand,     ipv4_sock_open_handle),
 	CDX_CMD    (CMD_IPV4_SOCK_CLOSE,     SockCloseCommand,    ipv4_sock_close_handle),
 	CDX_CMD    (CMD_IPV4_SOCK_UPDATE,    SockUpdateCommand,   ipv4_sock_update_handle),
-#ifdef CDX_TODO_IPV4FRAG
-	CDX_CMD_VAR(CMD_IPV4_FRAGTIMEOUT,    0, U16_MAX, NULL,    ipv4_fragtimeout_handle),
-	CDX_CMD_VAR(CMD_IPV4_SAM_FRAGTIMEOUT, 0, U16_MAX, NULL,   ipv4_sam_fragtimeout_handle),
-#endif
 };
 
 static U16 M_ipv4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)

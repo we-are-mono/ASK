@@ -71,10 +71,6 @@ static void vlan_remove(PVlanEntry pEntry)
 
 	hash = HASH_VLAN(pEntry->vlanID);
 
-#ifdef CDX_TODO_VLAN
-	/* remove the hardware entry */
-#endif
-
 	/* Remove from our local table */
 	prev = slist_prev(&vlan_cache[hash], &pEntry->list);
 	slist_remove_after(prev);

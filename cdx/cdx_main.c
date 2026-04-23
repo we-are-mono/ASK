@@ -317,9 +317,6 @@ static int __init cdx_module_init(void)
 	}
 #endif // CDX_IP_REASSEMBLY
 
-#ifdef CDX_TODO
-	clk_put(clk_axi);
-#endif
 exit:
 	if (rc) {
 		printk("<<<<<<<<<<<<<<<<<<<< CDX module failed initialization >>>>>>>>>>>>>>>>>>>>>>>>>\n");

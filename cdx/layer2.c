@@ -115,15 +115,6 @@ void remove_onif_by_index(U32 if_index)
 		}
 	}
 
-#ifdef CDX_TODO_MC
-	// Remove any multicast listener entries that reference this interface
-	MC6_interface_purge(if_index);
-	MC4_interface_purge(if_index);
-
-	// Remove any Bridge entry references
-	Bridge_output_interface_reset(if_index);
-#endif
-
 	memset(&gOnif_DB[if_index], 0, sizeof(OnifDesc));
 	dpa_release_interface(if_index);
 }

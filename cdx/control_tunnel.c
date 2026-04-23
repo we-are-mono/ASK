@@ -110,10 +110,6 @@ static BOOL M_tnl_delete(PTnlEntry pTunnelEntry)
 	struct slist_entry *prev;
 	U32 hash;
 
-#ifdef CDX_TODO_TUNNEL
-	// delete hw entry
-#endif
-
 	/* Free the software entry */
 	hash = HASH_TUNNEL_NAME(pTunnelEntry->tnl_name);
 	prev = slist_prev(&tunnel_name_cache[hash], &pTunnelEntry->list);
@@ -321,22 +317,6 @@ err0:
 }
 
 /**
- * TNL_reset_IPSEC
- *
- *
- */
-#ifdef CDX_TODO_IPSEC
-static void TNL_reset_IPSEC(PTnlEntry pTunnelEntry)
-{
-	pTunnelEntry->SA_nr =  0;
-	pTunnelEntry->SAReply_nr =  0;
-	pTunnelEntry->state &= ~TNL_STATE_SA_COMPLETE;
-	pTunnelEntry->state &= ~TNL_STATE_SAREPLY_COMPLETE;
-}
-#endif
-
-
-/**
  * TNL_handle_UPDATE
  *
  *
@@ -375,12 +355,6 @@ static int TNL_handle_UPDATE(U16 *p, U16 Length)
 	if(((pTunnelEntry->proto == PROTO_IPV4) && (!pTunnelEntry->remote[0])) ||
 			is_ipv6_addr_any(pTunnelEntry->remote))
 		pTunnelEntry->state |= TNL_STATE_REMOTE_ANY;
-
-
-#ifdef CDX_TODO_IPSEC
-	if((!cmd.secure) && (pTunnelEntry->secure))
-		TNL_reset_IPSEC(pTunnelEntry);
-#endif
 
 	pTunnelEntry->secure = cmd.secure;
 	pTunnelEntry->fl = cmd.fl;
@@ -431,152 +405,6 @@ static int TNL_handle_DELETE(U16 *p, U16 Length)
 
 
 /**
- * TNL_handle_IPSEC
- *
- *
- */
-#ifdef CDX_TODO_IPSEC
-static int TNL_handle_IPSEC(U16 *p, U16 Length)
-{
-	TNLCommand_ipsec cmd;
-	PTnlEntry pTunnelEntry = NULL;
-	int i;
-
-	/* Check length */
-	if (Length != sizeof(TNLCommand_ipsec))
-		return ERR_WRONG_COMMAND_SIZE;
-
-	memcpy((U8*)&cmd, (U8*)p,  sizeof(TNLCommand_ipsec));
-
-	if((pTunnelEntry = M_tnl_get_by_name(cmd.name)) == NULL)
-		return ERR_TNL_ENTRY_NOT_FOUND;
-
-	if(pTunnelEntry->secure == 0)
-		return ERR_WRONG_COMMAND_PARAM;
-
-	if (cmd.SA_nr > SA_MAX_OP)
-		return ERR_CT_ENTRY_TOO_MANY_SA_OP;
-
-	for (i=0;i<cmd.SA_nr;i++) {
-		if (M_ipsec_sa_cache_lookup_by_h( cmd.SA_handle[i]) == NULL)
-			return ERR_CT_ENTRY_INVALID_SA;
-	}
-
-	if (cmd.SAReply_nr > SA_MAX_OP)
-		return ERR_CT_ENTRY_TOO_MANY_SA_OP;
-
-	for (i=0;i<cmd.SAReply_nr;i++) {
-		if (M_ipsec_sa_cache_lookup_by_h(cmd.SAReply_handle[i]) == NULL)
-			return ERR_CT_ENTRY_INVALID_SA;
-	}
-
-	for (i=0;i<cmd.SA_nr;i++) {
-		pTunnelEntry->hSAEntry_out[i]= cmd.SA_handle[i];
-		pTunnelEntry->SA_nr = cmd.SA_nr;
-		pTunnelEntry->state |= TNL_STATE_SA_COMPLETE;
-	}
-
-	for (i=0;i<cmd.SAReply_nr;i++)  {
-		pTunnelEntry->hSAEntry_in[i]= cmd.SAReply_handle[i];
-		pTunnelEntry->SAReply_nr = cmd.SAReply_nr;
-		pTunnelEntry->state |= TNL_STATE_SAREPLY_COMPLETE;
-	}
-
-	if(pTunnelEntry->mode == TNL_MODE_GRE_IPV6)
-	{
-		tnl_update_gre(pTunnelEntry);
-	}
-	else
-	{
-		tnl_update(pTunnelEntry->tunnel_index);
-	}
-
-	return NO_ERR;
-}
-#endif
-
-
-/**
- * TNL_handle_IdConv_psid
- *
- *
- */
-
-#ifdef CDX_TODO_TUNNEL
-static void TNL_set_id_conv_seed( sam_port_info_t * sp, U8 IdConvEnable, PTnlEntry t )
-{
-	t->sam_id_conv_enable = (IdConvEnable) ? SAM_ID_CONV_PSID: SAM_ID_CONV_NONE;
-	if(!t->sam_id_conv_enable)
-		return;
-	// initialize global value
-	t->sam_abit     = 0;
-	t->sam_abit_len = sp->psid_offset;
-
-	t->sam_kbit     = sp->port_set_id;
-	t->sam_kbit_len = sp->port_set_id_length;
-
-	t->sam_mbit     = 0;
-	t->sam_mbit_len = 16 - (t->sam_abit_len + t->sam_kbit_len);
-
-	// set the maximum value for a bit and m bit
-	t->sam_abit_max = ~(0xffff<<t->sam_abit_len);
-	t->sam_mbit_max = ~(0xffff<<t->sam_mbit_len);
-
-	return;
-}
-static int TNL_handle_IdConv_psid(U16 *p, U16 Length)
-{
-	TNLCommand_IdConvPsid cmd;
-	PTnlEntry pTunnelEntry = NULL;
-
-	/* Check length */
-	if (Length != sizeof(TNLCommand_IdConvPsid))
-		return ERR_WRONG_COMMAND_SIZE;
-	memcpy((U8*)&cmd, (U8*)p,  sizeof(TNLCommand_IdConvPsid));
-	if((pTunnelEntry = M_tnl_get_by_name(cmd.name)) == NULL)
-		return ERR_TNL_ENTRY_NOT_FOUND;
-	TNL_set_id_conv_seed(&cmd.sam_port_info,cmd.IdConvStatus,pTunnelEntry);
-	tnl_update(pTunnelEntry);
-	return 0;
-}
-#endif
-
-
-/**
- * TNL_handle_IdConv_dupsport
- *
- *
- */
-
-#ifdef CDX_TODO_TUNNEL
-static int TNL_handle_IdConv_dupsport(U16 *p, U16 Length)
-{
-	TNLCommand_IdConvDP cmd;
-	PTnlEntry pTunnelEntry = NULL;
-	int i = 0;
-
-	/* Check length */
-	if (Length != sizeof(TNLCommand_IdConvDP))
-		return ERR_WRONG_COMMAND_SIZE;
-
-	memcpy((U8*)&cmd, (U8*)p,  sizeof(TNLCommand_IdConvDP));
-
-	for (i = 0; i < TNL_MAX_TUNNEL_DMEM; i++)
-	{
-		pTunnelEntry = &gTNLCtx.tunnel_table[i];
-		if(pTunnelEntry->mode == TNL_MODE_4O6)
-		{
-			pTunnelEntry->sam_id_conv_enable = (cmd.IdConvStatus) ? SAM_ID_CONV_DUPSPORT: SAM_ID_CONV_NONE;
-			tnl_update(pTunnelEntry);
-		}
-	}
-
-	return 0;
-}
-#endif
-
-
-/**
  * tnl_update
  *
  * Update the hardware tunnel tables
@@ -612,28 +440,6 @@ static U16 tnl_delete_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	(void)out_reply_len;
 	return (U16)TNL_handle_DELETE(pcmd, cmd_len);
 }
-
-#ifdef CDX_TODO_IPSEC
-static U16 tnl_ipsec_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)TNL_handle_IPSEC(pcmd, cmd_len);
-}
-#endif
-
-#ifdef CDX_TODO_TUNNEL
-static U16 tnl_idconv_dupsport_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)TNL_handle_IdConv_dupsport(pcmd, cmd_len);
-}
-
-static U16 tnl_idconv_psid_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)TNL_handle_IdConv_psid(pcmd, cmd_len);
-}
-#endif
 
 /*
  * CMD_TNL_QUERY / CMD_TNL_QUERY_CONT: pre-migration code handled
@@ -677,13 +483,6 @@ static const struct cdx_cmd_spec tnl_cmd_table[] = {
 	CDX_CMD(CMD_TNL_CREATE, TNLCommand_create, tnl_create_handle),
 	CDX_CMD(CMD_TNL_UPDATE, TNLCommand_create, tnl_update_handle),
 	CDX_CMD(CMD_TNL_DELETE, TNLCommand_delete, tnl_delete_handle),
-#ifdef CDX_TODO_IPSEC
-	CDX_CMD(CMD_TNL_IPSEC,  TNLCommand_ipsec,  tnl_ipsec_handle),
-#endif
-#ifdef CDX_TODO_TUNNEL
-	CDX_CMD(CMD_TNL_4o6_ID_CONVERSION_dupsport, TNLCommand_IdConvDP,   tnl_idconv_dupsport_handle),
-	CDX_CMD(CMD_TNL_4o6_ID_CONVERSION_psid,     TNLCommand_IdConvPsid, tnl_idconv_psid_handle),
-#endif
 	CDX_CMD_VAR(CMD_TNL_QUERY,      0, U16_MAX, NULL, tnl_query_handle),
 	CDX_CMD_VAR(CMD_TNL_QUERY_CONT, 0, U16_MAX, NULL, tnl_query_cont_handle),
 };

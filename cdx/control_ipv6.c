@@ -628,14 +628,6 @@ static U16 ipv6_sock_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return (U16)SOCKET6_HandleIP_Socket_Update(pcmd, cmd_len);
 }
 
-#ifdef CDX_TODO_IPV6FRAG
-static U16 ipv6_fragtimeout_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPv6_HandleIP_Set_FragTimeout(pcmd, cmd_len);
-}
-#endif
-
 /*
  * CMD_IPV6_RESET uses CDX_CMD_VAR(0, U16_MAX) to preserve the
  * pre-migration permissive length contract: the old cmdproc did
@@ -649,9 +641,6 @@ static const struct cdx_cmd_spec ipv6_cmd_table[] = {
 	CDX_CMD    (CMD_IPV6_SOCK_OPEN,   Sock6OpenCommand,      ipv6_sock_open_handle),
 	CDX_CMD    (CMD_IPV6_SOCK_CLOSE,  Sock6CloseCommand,     ipv6_sock_close_handle),
 	CDX_CMD    (CMD_IPV6_SOCK_UPDATE, Sock6UpdateCommand,    ipv6_sock_update_handle),
-#ifdef CDX_TODO_IPV6FRAG
-	CDX_CMD_VAR(CMD_IPV6_FRAGTIMEOUT, 0, U16_MAX, NULL,      ipv6_fragtimeout_handle),
-#endif
 };
 
 static U16 M_ipv6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)

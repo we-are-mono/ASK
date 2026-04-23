@@ -201,12 +201,6 @@ static U16 tx_disable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	if (rc != CMD_OK)
 		return rc;
 	phy_port[portid].flags &= ~TX_ENABLED;
-#ifdef CDX_TODO_TX
-	/* Reset tx enable flag in class and Util for this physical port */
-	for (id = CLASS0_ID; id <= CLASS_MAX_ID; id++)
-		pe_dmem_writeb(id, phy_port[portid].flags, virt_to_class_dmem(&phy_port[portid].flags));
-	pe_dmem_writeb(UTIL_ID, phy_port[portid].flags, virt_to_util_dmem(&util_phy_port[portid].flags));
-#endif
 	return CMD_OK;
 }
 
@@ -280,19 +274,6 @@ int tx_init(void)
 	for (i = 0; i < MAX_PHY_PORTS; i++) {
 		phy_port[i].id = i;
 	}
-
-#ifdef CDX_TODO
-	add_onif((U8 *)IF0_NAME, &phy_port[0].itf, NULL, IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL);
-	add_onif((U8 *)IF1_NAME, &phy_port[1].itf, NULL, IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL);
-	add_onif((U8 *)IF2_NAME, &phy_port[2].itf, NULL, IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL);
-#endif
-
-#ifdef CDX_TODO_BRIDGE
-	/* Register interfaces with bridge */
-	bridge_interface_register((U8 *) IF0_NAME, 0);
-	bridge_interface_register((U8 *) IF1_NAME, 1);
-	bridge_interface_register((U8 *) IF2_NAME, 2);
-#endif
 
 	gDscpVlanPcpMapCtx.portid = NO_TX_PORT;
 

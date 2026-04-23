@@ -74,10 +74,6 @@ void socket4_update(PSockEntry pSocket, u8 event)
 		if(!pSocket->pRtEntry)
 			SOCKET4_check_route(pSocket);
 	}
-
-#ifdef CDX_TODO
-	// update hw entry, if it exists
-#endif
 }
 
 
@@ -90,10 +86,6 @@ void socket6_update(PSock6Entry pSocket, u8 event)
 		if(!pSocket->pRtEntry)
 			SOCKET6_check_route(pSocket);
 	}
-
-#ifdef CDX_TODO
-	// update hw entry, if it exists
-#endif
 }
 
 
@@ -126,13 +118,6 @@ int socket4_add(PSockEntry pSocket)
 	slist_add(&sockid_cache[pSocket->hash_by_id], &pSocket->list_id);
 
 	return rc;
-
-#ifdef CDX_TODO
-err:
-	socket4_free(pSocket);
-	return rc;
-#endif
-
 }
 
 
@@ -149,9 +134,6 @@ void socket4_remove(PSockEntry pSocket, U32 hash, U32 hash_by_id)
 	t_Handle h_FmMuram;
 	uint64_t physicalMuramBase;
 	uint32_t MuramSize;
-#ifdef CDX_TODO
-	/* Check if there is a hardware socket */
-#endif
 
 	/* destroy sw socket entry */
 	SOCKET4_delete_route(pSocket);
@@ -196,13 +178,6 @@ int socket6_add(PSock6Entry pSocket)
 	slist_add(&sockid_cache[pSocket->hash_by_id], &pSocket->list_id);
 
 	return rc;
-
-#ifdef CDX_TODO
-err:
-	socket6_free(pSocket);
-	return rc;
-#endif
-
 }
 
 
@@ -218,10 +193,6 @@ void socket6_remove(PSock6Entry pSocket, U32 hash, U32 hash_by_id)
 	t_Handle h_FmMuram;
 	uint64_t physicalMuramBase;
 	uint32_t MuramSize;
-
-#ifdef CDX_TODO
-	/* Check if there is a hardware socket */
-#endif
 
 	/* destroy sw socket entry */
 	SOCKET6_delete_route(pSocket);
@@ -505,11 +476,6 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 	memset(pEntry->hw_stats, 0, SOCKET_STATS_SIZE);
-
-	/* check if rtp stats entry is created for this socket, if found link the two object and mark the socket 's for RTP stats */
-#ifdef CDX_TODO_RTPRELAYQOS
-	rtpqos_relay_link_stats_entry_by_tuple(pEntry, pEntry->Saddr_v4, pEntry->Daddr_v4, pEntry->Dport, pEntry->Sport);
-#endif
 
 	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	/* Add software and hardware entry to local and packet engine hash */
@@ -852,11 +818,6 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 	memset(pEntry->hw_stats, 0, SOCKET_STATS_SIZE);
-
-	/* check if rtp stats entry is created for this socket, if found link the two object and mark the socket 's for RTP stats */
-#ifdef CDX_TODO_RTPRELAY
-	rtpqos_relay6_link_stats_entry_by_tuple(pEntry, pEntry->Saddr_v6, pEntry->Daddr_v6, pEntry->Dport, pEntry->Sport);
-#endif
 
 	socket6_add(pEntry);  // this func not returning error in any case
 
