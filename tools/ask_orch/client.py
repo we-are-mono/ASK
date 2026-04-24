@@ -42,10 +42,16 @@ class Agent:
         params = []
         if filter_substrs:
             params.append(("filter", ",".join(filter_substrs)))
+        # Timeout budget: the agent writes "scan" to /sys/kernel/debug/
+        # kmemleak, waits for the scanner (which on a first-boot image
+        # with DPAA's ~16k baseline objects + the test storm's footprint
+        # can take 30-60s to complete a full heap walk), then reads +
+        # serialises the report. 120s covers the worst-case first scan
+        # on our DUT; steady-state subsequent scans are much faster.
         async with session.get(
             f"{self.base_url}/kmemleak-scan",
             params=params,
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=120),
         ) as r:
             return await r.json()
 
