@@ -36,6 +36,8 @@ import textwrap
 
 import pytest
 
+from ask_orch.client import ASK_KMEMLEAK_FILTER
+
 
 WAN_IPERF_IP = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
 
@@ -157,10 +159,10 @@ async def test_reassembly_fragment_storm(
     await asyncio.sleep(3.0)
 
     report = await target_agent.kmemleak(
-        aiohttp_session, filter_substrs=["cdx_", "fci_", "abm_"],
+        aiohttp_session, filter_substrs=ASK_KMEMLEAK_FILTER,
     )
     assert report.get("leak_count", 0) == 0, (
-        f"kmemleak found {report['leak_count']} new leak(s) in cdx/fci/abm "
+        f"kmemleak found {report['leak_count']} new leak(s) in ASK code "
         f"after {label} storm ({out.strip().splitlines()[-1]}):\n"
         + report.get("report", "")[:4000]
     )

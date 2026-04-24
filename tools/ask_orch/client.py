@@ -7,6 +7,38 @@ from dataclasses import dataclass
 import aiohttp
 
 
+# Canonical filter for "leaks originating from ASK-maintained code".
+# Pass as `filter_substrs=ASK_KMEMLEAK_FILTER` when calling Agent.kmemleak().
+#
+# Two signal classes combined:
+#
+#   1. Module-name annotations. kmemleak writes backtrace frames via %pS,
+#      which for symbols in loadable modules appends "[modname]". All our
+#      three out-of-tree kmods show up as [cdx], [fci], [auto_bridge] in
+#      any frame that sits in that module — regardless of what the
+#      function is called. This is the strongest signal: a frame either
+#      is in a given .ko or it isn't.
+#
+#   2. Function-name prefixes. Backup signal for cases where module
+#      annotation might be stripped (e.g. certain aggressive link-time
+#      optimisations or symbol-table truncation). cdx/fci/auto_bridge
+#      consistently prefix their exported + file-scope functions with
+#      cdx_/fci_/abm_ respectively. Redundant with (1) on a healthy
+#      kallsyms setup; cheap insurance when it isn't.
+#
+# Built-in kernel code (including NXP's sdk_dpaa / sdk_fman / fsl_qbman,
+# which link into vmlinux in our config) shows no bracket annotation, so
+# (1) automatically excludes those. That's why DPAA's ~16k baseline
+# false-positives don't trip this filter even though some of their
+# symbol names happen to contain "dpa_" — those frames lack [cdx] and
+# their names start with "dpa_" / "dpaa_" / "qman_" / "bman_" / "fm_",
+# none of which appear in the needles below.
+ASK_KMEMLEAK_FILTER = [
+    "[cdx]", "[fci]", "[auto_bridge]",
+    "cdx_", "fci_", "abm_",
+]
+
+
 @dataclass
 class Agent:
     name: str           # human label, e.g. "target", "lan", "wan"
@@ -42,6 +74,8 @@ class Agent:
         params = []
         if filter_substrs:
             params.append(("filter", ",".join(filter_substrs)))
+        # If no filter: return everything. For "ASK-code only" callers,
+        # pass ASK_KMEMLEAK_FILTER (defined at module top).
         # Timeout budget: the agent writes "scan" to /sys/kernel/debug/
         # kmemleak, waits for the scanner (which on a first-boot image
         # with DPAA's ~16k baseline objects + the test storm's footprint
