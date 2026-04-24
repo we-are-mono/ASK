@@ -889,6 +889,26 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 
 	if(pMcastGrpInfo->uiListenerCnt == uiNoOfListeners)
 	{
+		/* Unlink the group from the per-bucket list under the same
+		 * spinlock that cdx_mc_query.c readers hold during traversal.
+		 * Once we release the lock, no reader can find the node, so
+		 * the rest of teardown (HW table evict + listener tbl_entry
+		 * frees + pCtEntry/pRtEntry/group frees) runs unlocked — the
+		 * ExternalHashTable* helpers issue hardware completions and
+		 * can sleep, which the per-listener REMOVE path at lines
+		 * 967-975 likewise performs outside the spinlock. */
+		if (pMcastGrpInfo->mctype == 0) {
+			uiHash = HASH_MC4(pMcastGrpInfo->ipv4_daddr);
+			spin_lock(&mc4_spinlocks[uiHash]);
+			list_del(&(pMcastGrpInfo->list));
+			spin_unlock(&mc4_spinlocks[uiHash]);
+		} else {
+			uiHash = HASH_MC6((void *)(pMcastGrpInfo->ipv6_daddr));
+			spin_lock(&mc6_spinlocks[uiHash]);
+			list_del(&(pMcastGrpInfo->list));
+			spin_unlock(&mc6_spinlocks[uiHash]);
+		}
+
 		//Delete entry in ct table;
 		delete_entry_from_classif_table(pMcastGrpInfo->pCtEntry);
 		cdx_free_exthash_mcast_members(pMcastGrpInfo);
@@ -898,7 +918,6 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 				kfree(pMcastGrpInfo->pCtEntry->pRtEntry);
 			kfree(pMcastGrpInfo->pCtEntry);
 		}
-		list_del(&(pMcastGrpInfo->list));
 		kfree(pMcastGrpInfo);
 		return 0;
 	}
