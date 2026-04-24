@@ -16,6 +16,24 @@ PROVIDES = "kernel-module-cdx"
 # so olddefconfig strips it from .config — force it here.
 EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX=m"
 
+# Silence the [buildpaths] QA warning on the split kernel-module sub-package.
+# cdx.ko embeds a handful of TMPDIR-prefixed header paths in its .rodata
+# (rcupdate.h, dma-mapping.h, caam/regs.h) from __FILE__ macro expansions
+# inside static-inline kernel helpers that cdx calls. We tried both
+# `-fmacro-prefix-map` and `-ffile-prefix-map` via KCFLAGS with the canonical
+# source paths, and verified the flags reach every gcc invocation — but
+# those specific __FILE__ sites still leak through. Kernel's own in-tree
+# modules (cfg80211.ko etc.) have the identical leak but aren't packaged as
+# separate Yocto sub-packages so QA doesn't run on them. Paths are
+# cosmetic (dmesg output gets full paths; no runtime or ABI impact).
+#
+# Package name format comes from kernel-module-split.bbclass:
+#   ${KERNEL_MODULE_PACKAGE_PREFIX}${kernel_pkg}-module-<name>${SUFFIX}
+# which for cdx under the default kernel recipe expands to
+# `kernel-module-cdx-${KERNEL_VERSION}`. Using the variable keeps it
+# version-agnostic across kernel bumps.
+INSANE_SKIP:kernel-module-cdx-${KERNEL_VERSION} += "buildpaths"
+
 # ASK's cdx/Makefile has `modules` and `clean` but no `modules_install`.
 # Compile via `modules` target; install the .ko by hand —
 # kernel-module-split still picks it up because it scans /lib/modules/
