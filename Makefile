@@ -275,6 +275,7 @@ deploy-agent-lan:
 	    sudo mv /tmp/askd-agent.service /etc/systemd/system/; \
 	    [ -x $(LAN_PREFIX)/venv/bin/python ] || sudo python3 -m venv $(LAN_PREFIX)/venv; \
 	    sudo $(LAN_PREFIX)/venv/bin/pip install --quiet --upgrade $(ASKD_REQUIREMENTS); \
+	    sudo apt-get install -y --no-install-recommends python3-scapy; \
 	    sudo systemctl daemon-reload; \
 	    sudo systemctl enable --now askd-agent.service'
 	@echo "==> deploy-agent-lan: done."

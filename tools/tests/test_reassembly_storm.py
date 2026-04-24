@@ -103,7 +103,14 @@ def _push_script_to_lan(lan_console, script: str, path: str) -> None:
 
 
 async def _run_storm(lan_console, duplicate: bool) -> str:
-    """Fire the storm on lan via UART, return the script's stdout."""
+    """Fire the storm on lan via UART, return the script's stdout.
+
+    Depends on system python3 having scapy importable. `make
+    deploy-agent-lan` installs `python3-scapy` via apt on the lan VM
+    exactly to satisfy this; on a fresh lan that hasn't been deployed
+    to, run deploy-agent-lan first (or apt-get install python3-scapy
+    by hand).
+    """
     script = _storm_script(duplicate=duplicate)
     path = "/tmp/ask_reassembly_storm.py"
     _push_script_to_lan(lan_console, script, path)
