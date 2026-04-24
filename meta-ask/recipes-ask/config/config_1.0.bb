@@ -4,7 +4,8 @@ LIC_FILES_CHKSUM = "file://${ASK_SRCROOT}/LICENSE;md5=b234ee4d69f5fce4486a80fdaf
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
-SRC_URI = "file://S05ask-modules \
+SRC_URI = "file://S03debugfs \
+           file://S05ask-modules \
            file://S40gateway-setup \
            file://S50cmm \
            file://dnsmasq-gateway.conf \
@@ -42,10 +43,17 @@ fakeroot do_install() {
     install -d ${D}${sysconfdir}/config
     install -m 0644 ${ASK_SRCROOT}/config/fastforward ${D}${sysconfdir}/config/fastforward
 
-    # sysvinit hook that reads modules-load.d/ask.conf and modprobes each
-    # line — busybox has no systemd-modules-load.service equivalent.
     install -d ${D}${sysconfdir}/init.d
     install -d ${D}${sysconfdir}/rcS.d
+
+    # Mount debugfs early (needed by kmemleak + failslab in the test harness;
+    # sysvinit's mountvirtfs doesn't do this). Runs before module loading so
+    # modules that register debugfs entries see the mount point ready.
+    install -m 0755 ${UNPACKDIR}/S03debugfs ${D}${sysconfdir}/init.d/debugfs
+    ln -sf ../init.d/debugfs ${D}${sysconfdir}/rcS.d/S03debugfs
+
+    # sysvinit hook that reads modules-load.d/ask.conf and modprobes each
+    # line — busybox has no systemd-modules-load.service equivalent.
     install -m 0755 ${UNPACKDIR}/S05ask-modules ${D}${sysconfdir}/init.d/ask-modules
     ln -sf ../init.d/ask-modules ${D}${sysconfdir}/rcS.d/S05ask-modules
 
@@ -68,6 +76,8 @@ FILES:${PN} = " \
     ${sysconfdir}/fmc/config/* \
     ${sysconfdir}/modules-load.d/ask.conf \
     ${sysconfdir}/config/fastforward \
+    ${sysconfdir}/init.d/debugfs \
+    ${sysconfdir}/rcS.d/S03debugfs \
     ${sysconfdir}/init.d/ask-modules \
     ${sysconfdir}/rcS.d/S05ask-modules \
     ${sysconfdir}/init.d/gateway-setup \

@@ -1,0 +1,40 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          debugfs
+# Required-Start:    mountvirtfs
+# Default-Start:     S
+# Short-Description: Mount debugfs (needed by kmemleak, failslab, etc.)
+### END INIT INFO
+
+# /proc and /sys are mounted by mountvirtfs (busybox-inittab). debugfs,
+# which hosts kmemleak's scan file + failslab's fault-injection knobs, is
+# not — the Yocto base image expects systemd's sys-kernel-debug.mount to
+# handle it, but we're on sysvinit.
+#
+# The test harness depends on /sys/kernel/debug being mounted:
+#   * askd-agent's /kmemleak-scan + /kmemleak-clear endpoints (used by
+#     test_reassembly_storm's leak-delta guard)
+#   * future A3a-e failslab fault-injection tests
+#   * general debug visibility (ftrace, sched debug, lockdep stats)
+#
+# If we ever switch this image to systemd, delete this script — the mount
+# unit takes over automatically.
+
+case "$1" in
+    start|"")
+        if ! mountpoint -q /sys/kernel/debug; then
+            mount -t debugfs debugfs /sys/kernel/debug
+        fi
+        ;;
+    stop)
+        # No-op: /sys/kernel/debug is harmless to leave mounted at shutdown,
+        # and consumers (kmemleak's scan thread, etc.) don't need a clean
+        # unmount since they don't write persistent state.
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
