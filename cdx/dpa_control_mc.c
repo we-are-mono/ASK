@@ -621,9 +621,16 @@ int cdx_free_exthash_mcast_members(struct mcast_group_info *pMcastGrpInfo)
 {
 	unsigned int ii;
 	FreeMcastGrpID(pMcastGrpInfo->mctype, pMcastGrpInfo->grpid);
-	for (ii=0; ii<pMcastGrpInfo->uiListenerCnt; ii++)
+	/* Walk every slot in members[], not just the first uiListenerCnt:
+	 * after a partial REMOVE followed by UPDATE, valid entries can sit
+	 * at any index, with invalid slots interleaved. Using uiListenerCnt
+	 * as the loop bound misses the high-index valid entries and leaks
+	 * their ExternalHashTable allocations. Filter by bIsValidEntry
+	 * (the invariant the rest of this file uses for slot ownership). */
+	for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++)
 	{
-		if (pMcastGrpInfo->members[ii].tbl_entry)
+		if (pMcastGrpInfo->members[ii].bIsValidEntry &&
+		    pMcastGrpInfo->members[ii].tbl_entry)
 			ExternalHashTableEntryFree(pMcastGrpInfo->members[ii].tbl_entry);
 	}
 	return 0;
