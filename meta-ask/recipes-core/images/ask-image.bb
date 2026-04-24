@@ -37,6 +37,7 @@ IMAGE_INSTALL = " \
     cdx \
     fci \
     auto-bridge \
+    sfp-led \
     config \
     kernel-module-nf-conntrack-netlink \
     kernel-module-xt-conntrack \

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Load SFP LED kernel module
+modprobe sfp-led
