@@ -7,6 +7,7 @@
  * included with this distribution or at http://www.gnu.org/licenses/gpl-2.0.html
  *
  */
+#include <linux/mutex.h>
 #include "cdx.h"
 #include "cdx_cmd_validator.h"
 #include "list.h"
@@ -62,6 +63,31 @@ extern uint64_t XX_VirtToPhys(void * addr);
 uint8_t *mc4grp_ids=NULL, *mc6grp_ids=NULL;
 spinlock_t *mc4_spinlocks =  NULL, *mc6_spinlocks = NULL;
 uint16_t  max_mc4grp_ids, max_mc6grp_ids;
+
+/* Serializes mcast mutators (ADD / REMOVE / UPDATE). The lookup-then-
+ * mutate sequences inside cdx_create/update/delete_mcast_group_member
+ * unavoidably drop the per-bucket spinlock between GetMcastGrp /
+ * Cdx_GetMcastMemberId and the eventual members[] / list mutation —
+ * helpers like ExternalHashTableFmPcdHcSync sleep on FmPcdLock and
+ * can't be held under spinlock. Without an outer lock, two concurrent
+ * mutators of the same group could TOCTOU each other's member_id /
+ * pMcastGrpInfo pointer (ISSUES.md M10, M11). Today's FCI dispatcher
+ * happens to run one command at a time, providing the invariant
+ * implicitly; this mutex makes it explicit and survives any future
+ * caller that runs from a kthread / workqueue.
+ *
+ * Held only across mutators in MC{4,6}_Command_Handler; queries
+ * stay outside it (they're protected by mc{4,6}_spinlocks[] for
+ * list traversal plus mc_query_mutex in cdx_mc_query.c for the
+ * paginated snapshot state). */
+static DEFINE_MUTEX(mc_mutators_mutex);
+
+static inline bool mcast_action_is_mutator(uint16_t action)
+{
+	return action == CDX_MC_ACTION_ADD ||
+	       action == CDX_MC_ACTION_REMOVE ||
+	       action == CDX_MC_ACTION_UPDATE;
+}
 
 
 void AddToMcastGrpList(struct mcast_group_info *pMcastGrpInfo)
@@ -626,6 +652,20 @@ err_ret:
 		if (free_rc)
 			DPA_ERROR("%s::%d mcast group deletion failed (rc=%d)\n",
 				  __func__, __LINE__, free_rc);
+		/* Defense in depth (ISSUES.md M9): pMcastGrpInfo->pCtEntry
+		 * is only assigned inside cdx_add_mcast_table_entry's
+		 * success arm at line ~435, after which the outer caller
+		 * returns 0 without taking err_ret — so today this branch
+		 * is unreachable. Any future path that lands here with
+		 * pCtEntry already wired in would silently leak the CT
+		 * chain; freeing it here keeps the err_ret invariant
+		 * "no caller-owned allocation survives" intact. */
+		if (pMcastGrpInfo->pCtEntry) {
+			if (pMcastGrpInfo->pCtEntry->pRtEntry)
+				kfree(pMcastGrpInfo->pCtEntry->pRtEntry);
+			kfree(pMcastGrpInfo->pCtEntry);
+			pMcastGrpInfo->pCtEntry = NULL;
+		}
 		kfree(pMcastGrpInfo);
 	}
 	return iRet;
@@ -917,19 +957,40 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 	 * path and delete the whole group, even though `foo` was never
 	 * a member (ISSUES.md M12). Validating up-front rejects mismatched
 	 * requests atomically, before either path mutates members[] or
-	 * unlinks the group. */
-	for (ii = 0; ii < uiNoOfListeners; ii++) {
-		if (bIsIPv6)
-			pListener = &(mcast6_group->output_list[ii]);
-		else
-			pListener = &(mcast4_group->output_list[ii]);
-		if (Cdx_GetMcastMemberId(pListener->output_device_str,
-					 pMcastGrpInfo) == -1) {
-			DPA_ERROR("%s::%d member:%s does not exist in the mcgroup\n",
-				  __func__, __LINE__,
-				  pListener->output_device_str);
-			iRet = -1;
-			goto err_ret;
+	 * unlinks the group.
+	 *
+	 * Also dedupe by tracking which members[] slot each requested
+	 * name resolved to. A request like REMOVE [a, a] against
+	 * { a, b } would otherwise validate twice against the same
+	 * member_id, the count-match fast path would trigger, and the
+	 * whole group would be wiped (ISSUES.md M13). MC_MAX_LISTENERS_PER_GROUP
+	 * is 8 so a u8 bitmap fits the slot space exactly. */
+	{
+		uint8_t seen_members = 0;
+		int found_id;
+		BUILD_BUG_ON(MC_MAX_LISTENERS_PER_GROUP > 8);
+		for (ii = 0; ii < uiNoOfListeners; ii++) {
+			if (bIsIPv6)
+				pListener = &(mcast6_group->output_list[ii]);
+			else
+				pListener = &(mcast4_group->output_list[ii]);
+			found_id = Cdx_GetMcastMemberId(
+				pListener->output_device_str, pMcastGrpInfo);
+			if (found_id == -1) {
+				DPA_ERROR("%s::%d member:%s does not exist in the mcgroup\n",
+					  __func__, __LINE__,
+					  pListener->output_device_str);
+				iRet = -1;
+				goto err_ret;
+			}
+			if (seen_members & (1u << found_id)) {
+				DPA_ERROR("%s::%d duplicate listener %s in REMOVE\n",
+					  __func__, __LINE__,
+					  pListener->output_device_str);
+				iRet = -1;
+				goto err_ret;
+			}
+			seen_members |= (1u << found_id);
 		}
 	}
 
@@ -1089,6 +1150,7 @@ static int MC6_Command_Handler(PMC6Command cmd)
 {
 	int rc = NO_ERR;
 	int reset_action = 0;
+	bool locked = false;
 
 	if(cmd->action != ACTION_QUERY && cmd->action != ACTION_QUERY_CONT)
 	{
@@ -1096,6 +1158,14 @@ static int MC6_Command_Handler(PMC6Command cmd)
 			*((unsigned short *)cmd)= ERR_MC_MAX_LISTENERS;
 			return sizeof(unsigned short);
 		}
+	}
+
+	/* See MC4_Command_Handler — mutators run serialized via
+	 * mc_mutators_mutex. Same mutex protects v4 and v6 paths
+	 * because they share the same mutator functions. */
+	if (mcast_action_is_mutator(cmd->action)) {
+		mutex_lock(&mc_mutators_mutex);
+		locked = true;
 	}
 
 	switch(cmd->action)
@@ -1137,6 +1207,8 @@ static int MC6_Command_Handler(PMC6Command cmd)
 	rc = sizeof(unsigned short);
 
 out:
+	if (locked)
+		mutex_unlock(&mc_mutators_mutex);
 	return rc;
 }
 
@@ -1144,6 +1216,7 @@ static int MC4_Command_Handler(PMC4Command cmd)
 {
 	int rc = NO_ERR;
 	int reset_action=0;
+	bool locked = false;
 
 	/* some errors parsing on the command*/
 	if(cmd->action != ACTION_QUERY && cmd->action != ACTION_QUERY_CONT)
@@ -1160,6 +1233,16 @@ static int MC4_Command_Handler(PMC4Command cmd)
 			*((unsigned short *)cmd) = ERR_MC_INVALID_ADDR;
 			return sizeof(unsigned short);
 		}
+	}
+
+	/* Mutators run serialized — see mc_mutators_mutex docstring at
+	 * the top of this file. cdx_create_mcast_group can recursively
+	 * invoke cdx_update_mcast_group on the duplicate-group fast
+	 * path, so the mutex is taken here at the dispatcher rather
+	 * than inside each mutator (which would deadlock). */
+	if (mcast_action_is_mutator(cmd->action)) {
+		mutex_lock(&mc_mutators_mutex);
+		locked = true;
 	}
 
 	switch(cmd->action)
@@ -1201,6 +1284,8 @@ static int MC4_Command_Handler(PMC4Command cmd)
 	rc = sizeof(unsigned short);
 
 out:
+	if (locked)
+		mutex_unlock(&mc_mutators_mutex);
 	return rc;
 }
 

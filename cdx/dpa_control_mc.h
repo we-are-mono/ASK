@@ -110,6 +110,13 @@ extern struct list_head mc4_grp_list[MC4_NUM_HASH_ENTRIES];
 extern struct list_head mc6_grp_list[MC6_NUM_HASH_ENTRIES];
 extern spinlock_t *mc4_spinlocks;
 extern spinlock_t *mc6_spinlocks;
+/* The three mcast mutators (cdx_create/update/delete_mcast_group_member)
+ * must run under mc_mutators_mutex, taken in MC{4,6}_Command_Handler.
+ * The functions themselves don't take the mutex (cdx_create can recurse
+ * into cdx_update for the duplicate-group fast path, which would
+ * deadlock); they rely on the dispatcher being the only entry point.
+ * Add a new caller? Either route it through the dispatcher, or take
+ * mc_mutators_mutex explicitly before calling. See ISSUES.md M10/M11. */
 int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6);
 
 struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo);
