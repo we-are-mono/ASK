@@ -42,12 +42,6 @@ from ask_orch.uart import Console
 LAN_USER     = os.environ.get("ASK_LAN_USER",     "root")
 LAN_PASSWORD = os.environ.get("ASK_LAN_PASSWORD", "password")
 
-# Boot-time info lines whose substrings collide with our splat regex but
-# are not real problems. Keep extremely narrow.
-_SPLAT_FALSE_POSITIVES = (
-    "RCU lockdep checking is enabled",
-)
-
 
 # ---- per-test aiohttp ---------------------------------------------------
 
@@ -107,10 +101,10 @@ async def splat_window(aiohttp_session, target_agent):
     cap_id = await target_agent.capture_start(aiohttp_session, ifaces=["eth3", "eth4"])
     yield cap_id
     result = await target_agent.capture_stop(aiohttp_session, cap_id)
-    splats = [
-        s for s in result.get("splats", [])
-        if not any(fp in s for fp in _SPLAT_FALSE_POSITIVES)
-    ]
+    # Splat false-positive filtering happens agent-side now (see
+    # askd_agent.dmesg.has_splat). Anything in result["splats"] is
+    # already a real splat — no further filtering here.
+    splats = result.get("splats", [])
     assert not splats, (
         f"kernel splats during test ({len(splats)}): "
         + "; ".join(s.strip() for s in splats[:3])

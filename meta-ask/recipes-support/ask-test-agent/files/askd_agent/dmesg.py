@@ -18,11 +18,38 @@ from pathlib import Path
 
 KMSG_PATH = Path("/dev/kmsg")
 
-# KASAN/BUG/WARN signatures we treat as instant failure.
+# Kernel-splat banner patterns. Match the *first line* of a kernel
+# sanitiser/lockdep/BUG report; the agent reports the line as an
+# instant-failure signal up to the orchestrator's splat_window.
 SPLAT_RE = re.compile(
-    r"(BUG: KASAN|KFENCE: \w+|==============|UBSAN:|WARNING:|BUG: |"
-    r"kernel BUG at|Oops:|Unable to handle|lockdep|"
-    r"inconsistent.*usage|possible circular locking)"
+    r"(BUG: KASAN|"
+    r"KFENCE: \w+|"
+    r"==============|"          # KASAN/KFENCE/UBSAN banner separator
+    r"UBSAN:|"
+    r"WARNING:|"                # WARN_ON family + bad-unlock-balance etc.
+    r"BUG: |"                   # generic kernel BUG()
+    r"kernel BUG at|"           # BUG_ON
+    r"Oops:|"                   # NULL deref / page fault
+    r"Unable to handle|"        # arm64 page-fault banner
+    r"INFO: possible (recursive locking|circular locking|"
+    r"irq lock inversion)|"     # lockdep dependency reports
+    r"INFO: trying to register non-static key|"
+    r"inconsistent.*usage)"     # lockdep state-mismatch
+)
+
+# Lines that pass SPLAT_RE on substring but are benign informational
+# kernel banners — e.g. CONFIG_PROVE_RCU's boot announcement before any
+# real lock has been taken. These are routine on every boot of a
+# lockdep-enabled image and aren't splats. The pattern below is
+# matched against the same lines BEFORE reporting; matches are
+# excluded from the splat list.
+#
+# (Today this is belt-and-braces defence — the rcu line no longer
+# matches SPLAT_RE itself once we tightened "lockdep" to specific
+# splat patterns above. Kept so a future SPLAT_RE broadening doesn't
+# silently re-introduce the false positive.)
+_SPLAT_FALSE_POSITIVES_RE = re.compile(
+    r"rcu: RCU lockdep checking is enabled"
 )
 
 
@@ -99,5 +126,15 @@ def read_since(cursor: int | None) -> tuple[int | None, list[str]]:
 
 
 def has_splat(lines: list[str]) -> list[str]:
-    """Return the subset of lines matching KASAN/BUG/UBSAN/lockdep signatures."""
-    return [l for l in lines if SPLAT_RE.search(l)]
+    """Return the subset of lines that look like real kernel splats.
+
+    Filters out informational lines that match SPLAT_RE on substring
+    but aren't actual sanitiser/lockdep reports — see
+    `_SPLAT_FALSE_POSITIVES_RE` for the deny-list. Centralising the
+    filter here means every caller of /capture-stop and /dmesg-delta
+    benefits, not just orchestrator fixtures with their own ad-hoc
+    deny-list."""
+    return [
+        l for l in lines
+        if SPLAT_RE.search(l) and not _SPLAT_FALSE_POSITIVES_RE.search(l)
+    ]
