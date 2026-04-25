@@ -607,11 +607,16 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 err_ret:
 	if(pMcastGrpInfo)
 	{
-		//Mcast group record is created, delete the group
-		if((iRet = cdx_free_exthash_mcast_members(pMcastGrpInfo)))
-		{
-			DPA_ERROR("%s::%d mcast group deletion failed \r\n", __func__, __LINE__);
-		}
+		/* Use a local for the cleanup return; reassigning iRet here
+		 * would clobber the original failure code set by whichever
+		 * arm of the create path jumped here. cdx_free_exthash_mcast_members
+		 * always returns 0 today, so a reassignment would make every
+		 * err_ret path return "success" to the caller even though the
+		 * group has been torn down. */
+		int free_rc = cdx_free_exthash_mcast_members(pMcastGrpInfo);
+		if (free_rc)
+			DPA_ERROR("%s::%d mcast group deletion failed (rc=%d)\n",
+				  __func__, __LINE__, free_rc);
 		kfree(pMcastGrpInfo);
 	}
 	return iRet;
