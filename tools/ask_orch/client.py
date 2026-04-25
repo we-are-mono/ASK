@@ -90,9 +90,14 @@ class Agent:
             return await r.json()
 
     async def kmemleak_clear(self, session: aiohttp.ClientSession) -> dict:
+        # Clear now internally does `scan` + `clear` on the agent side so
+        # unclassified boot-time baseline objects don't slip past the
+        # cursor. The `scan` write is synchronous in the kernel and on a
+        # first-boot image walking ~16k DPAA baseline objects it can run
+        # 30-60s. Match the scan-timeout budget for consistency.
         async with session.post(
             f"{self.base_url}/kmemleak-clear",
-            timeout=aiohttp.ClientTimeout(total=10),
+            timeout=aiohttp.ClientTimeout(total=120),
         ) as r:
             r.raise_for_status()
             return await r.json()
@@ -110,7 +115,16 @@ class Agent:
         payload: bytes = b"",
         timeout_ms: int = 500,
         nlmsg_len_override: int | None = None,
+        failslab_times: int | None = None,
     ) -> dict:
+        """Send an FCI command and return the parsed reply. When
+        `failslab_times=N` is set, the agent wraps the netlink send in a
+        forked child with `make-it-fail` task-scoping armed + failslab
+        `probability=100`/`times=N` — the Nth kmalloc in the send's call
+        path (and everything it descends into, including the FCI handler
+        and cdx dispatcher) fails. Use this to exercise kernel err-path
+        unwind discipline: pair with a kmemleak cursor around each
+        sweep iteration to catch leaks on unwind."""
         body: dict = {
             "fcode":       fcode & 0xFFFF,
             "length":      length & 0xFFFF,
@@ -119,6 +133,8 @@ class Agent:
         }
         if nlmsg_len_override is not None:
             body["nlmsg_len_override"] = nlmsg_len_override
+        if failslab_times is not None:
+            body["failslab_times"] = int(failslab_times)
         async with session.post(f"{self.base_url}/fci/send", json=body) as r:
             r.raise_for_status()
             return await r.json()

@@ -188,6 +188,145 @@ def _netlink_send_sync(
         sock.close()
 
 
+_FAILSLAB_DIR = Path("/sys/kernel/debug/failslab")
+
+
+def _arm_failslab(times: int) -> None:
+    """Configure failslab to fault the next `times` kmalloc calls that come
+    from a task with /proc/self/make-it-fail set. Probability 100 so every
+    candidate inside the window deterministically fails. Callers must hold
+    the task-filter context alone (typically via fork) — arming in the
+    shared agent process would poison all subsequent allocations."""
+    (_FAILSLAB_DIR / "task-filter").write_text("Y\n")
+    (_FAILSLAB_DIR / "probability").write_text("100\n")
+    (_FAILSLAB_DIR / "times").write_text(f"{times}\n")
+    # `space` is a byte-budget countdown; zero it so `times` is the only gate.
+    try:
+        (_FAILSLAB_DIR / "space").write_text("0\n")
+    except OSError:
+        pass
+    Path("/proc/self/make-it-fail").write_text("1\n")
+
+
+def _disarm_failslab() -> None:
+    """Best-effort disarm. Call before the child exits so global state
+    (probability, times) doesn't linger for the next test."""
+    try:
+        (_FAILSLAB_DIR / "probability").write_text("0\n")
+    except OSError:
+        pass
+    try:
+        Path("/proc/self/make-it-fail").write_text("0\n")
+    except OSError:
+        pass
+
+
+def _netlink_send_failslab(
+    protocol: int,
+    body: bytes,
+    nlmsg_len_override: int | None,
+    nlmsg_type: int,
+    nlmsg_flags: int,
+    timeout_s: float,
+    failslab_times: int,
+) -> dict:
+    """Fork a child, open the netlink socket there, arm failslab scoped to
+    the child only, send the FCI message, then disarm. The fork isolates
+    make-it-fail from the parent agent — otherwise arming would fault the
+    agent's own kmallocs (aiohttp handlers, JSON serialization) and wedge
+    the service.
+
+    Arming *after* socket creation means the `times=N` counter is spent on
+    kmallocs during the send/recv syscall path and whatever they call into
+    (FCI inbound handler, cdx dispatcher, mcast handlers) — not on the
+    bookkeeping overhead of opening the socket itself.
+    """
+    import pickle
+
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        result: dict = {}
+        armed = False
+        try:
+            sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, protocol)
+            sock.bind((0, 0))
+            sock.settimeout(timeout_s)
+
+            real_len   = _NLMSGHDR_SIZE + len(body)
+            header_len = real_len if nlmsg_len_override is None else nlmsg_len_override
+            nlh = struct.pack(
+                "=IHHII", header_len & 0xFFFFFFFF,
+                nlmsg_type & 0xFFFF, nlmsg_flags & 0xFFFF,
+                1, 0,
+            )
+            msg = nlh + body
+
+            _arm_failslab(failslab_times)
+            armed = True
+
+            send_err = None
+            try:
+                sock.send(msg)
+            except OSError as e:
+                send_err = f"send: errno={e.errno} {e.strerror}"
+
+            reply = b""
+            if send_err is None:
+                try:
+                    reply = sock.recv(8192)
+                except socket.timeout:
+                    reply = b""
+                except OSError as e:
+                    send_err = f"recv: errno={e.errno} {e.strerror}"
+
+            # Disarm ASAP so the subsequent pickle/pipe write doesn't
+            # also see faults.
+            _disarm_failslab()
+            armed = False
+
+            result = {
+                "sent_bytes":     real_len,
+                "reply_hex":      reply.hex(),
+                "failslab_times": failslab_times,
+            }
+            if send_err:
+                result["send_error"] = send_err
+            if len(reply) >= _NLMSGHDR_SIZE:
+                result["body_hex"] = reply[_NLMSGHDR_SIZE:].hex()
+            sock.close()
+        except OSError as e:
+            result = {"error": f"setup failed: errno={e.errno} {e.strerror}"}
+        except Exception as e:
+            result = {"error": f"{type(e).__name__}: {e}"}
+        finally:
+            if armed:
+                # Exception between arm and explicit disarm — best effort.
+                _disarm_failslab()
+        try:
+            os.write(w_fd, pickle.dumps(result))
+        finally:
+            os.close(w_fd)
+            os._exit(0)
+
+    os.close(w_fd)
+    buf = b""
+    try:
+        while True:
+            chunk = os.read(r_fd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        os.close(r_fd)
+    os.waitpid(pid, 0)
+    try:
+        return pickle.loads(buf)
+    except Exception as e:
+        return {"error": f"child produced no result: {e}"}
+
+
 def _parse_fci_reply(result: dict) -> dict:
     """Overlay FCI_MSG interpretation on a generic netlink send result."""
     body_hex = result.get("body_hex", "")
@@ -222,14 +361,26 @@ async def fci_send(request: web.Request) -> web.Response:
         )
     nlmsg_len_override = body.get("nlmsg_len_override")
     timeout_s = float(body.get("timeout_ms", 500)) / 1000.0
+    failslab_times = body.get("failslab_times")
 
     fci_body = struct.pack("<HH", fcode, length) + payload
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            _netlink_send_sync,
-            NETLINK_FF, fci_body, nlmsg_len_override, 0, 0, timeout_s,
-        )
+        if failslab_times is None:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _netlink_send_sync,
+                NETLINK_FF, fci_body, nlmsg_len_override, 0, 0, timeout_s,
+            )
+        else:
+            # Fork-isolated path: failslab make-it-fail can only safely
+            # target a throwaway child, otherwise the agent's own aiohttp
+            # response path also faults and the service hangs.
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _netlink_send_failslab,
+                NETLINK_FF, fci_body, nlmsg_len_override, 0, 0, timeout_s,
+                int(failslab_times),
+            )
     except OSError as e:
         return web.json_response({"error": f"socket error: {e}"}, status=500)
     result = _parse_fci_reply(result)
@@ -509,7 +660,12 @@ async def kmemleak_scan(request: web.Request) -> web.Response:
 async def kmemleak_clear(request: web.Request) -> web.Response:
     """POST -> mark all currently-reported kmemleak leaks as seen.
 
-    Writes "clear" to /sys/kernel/debug/kmemleak. Subsequent scans
+    Writes "scan" first, waits a beat for the scanner to classify all
+    currently-unreferenced objects (`clear` only marks the
+    already-classified ones; boot-time allocations that the kernel's
+    own background scanner hasn't swept yet would otherwise slip past
+    the cursor and appear as "new" leaks on the next scan), then
+    writes "clear" to /sys/kernel/debug/kmemleak. Subsequent scans
     (and reads of the file) only show leaks detected after this call.
     This is the cursor primitive for per-test leak deltas: the 16k
     DPAA false-positive baseline is erased once and the test window
@@ -517,10 +673,22 @@ async def kmemleak_clear(request: web.Request) -> web.Response:
     """
     if not KMEMLEAK_PATH.exists():
         return web.json_response({"error": "kmemleak not available"}, status=501)
-    try:
+    # The write to "scan" is synchronous — the kernel walks the heap
+    # before returning. Necessary to run this BEFORE "clear": `clear`
+    # only sets OBJECT_REPORTED on allocations that are already marked
+    # UNREFERENCED, and the in-kernel background scanner runs on a
+    # 10-minute cadence. Without a forced scan first, fresh boot-time
+    # allocations that haven't been classified yet slip past the
+    # cursor and reappear as "new" leaks on the very next scan.
+    # Offload to a thread so we don't block the event loop during the
+    # 30-60s first-boot heap walk.
+    def _scan_then_clear() -> None:
+        KMEMLEAK_PATH.write_text("scan\n")
         KMEMLEAK_PATH.write_text("clear\n")
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _scan_then_clear)
     except OSError as e:
-        return web.json_response({"error": f"clear write failed: {e}"}, status=500)
+        return web.json_response({"error": f"scan/clear failed: {e}"}, status=500)
     return web.json_response({"ok": True})
 
 
