@@ -967,18 +967,24 @@ invalid_error_queue:
 EXPORT_SYMBOL(dpa_fq_probe_mac);
 
 static u32 rx_pool_channel;
-static DEFINE_SPINLOCK(rx_pool_channel_init);
+/* qman_alloc_pool() → dpa_alloc_new() → kmalloc(GFP_KERNEL), which may
+ * sleep under direct reclaim. This one-shot init only runs during probe
+ * (process context), so a mutex is the correct primitive — the original
+ * spinlock was an unprovoked atomic-context violation that made
+ * CONFIG_DEBUG_ATOMIC_SLEEP WARN and would deadlock under memory pressure.
+ */
+static DEFINE_MUTEX(rx_pool_channel_init);
 
 int dpa_get_channel(void)
 {
-	spin_lock(&rx_pool_channel_init);
+	mutex_lock(&rx_pool_channel_init);
 	if (!rx_pool_channel) {
 		u32 pool;
 		int ret = qman_alloc_pool(&pool);
 		if (!ret)
 			rx_pool_channel = pool;
 	}
-	spin_unlock(&rx_pool_channel_init);
+	mutex_unlock(&rx_pool_channel_init);
 	if (!rx_pool_channel)
 		return -ENOMEM;
 	return rx_pool_channel;
