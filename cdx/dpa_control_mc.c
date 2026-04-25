@@ -536,6 +536,11 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 	if ((pMcastGrpInfo->grpid = GetNewMcastGrpId(pMcastGrpInfo->mctype)) == -1)
 	{
 		DPA_ERROR("Exceeding max number of multicast entries\n");
+		/* iRet currently equals -1 here only as a side-effect of
+		 * line 518's `if((iRet = GetMcastGrpId(...))!= -1)` test —
+		 * a refactor of that idiom would silently regress this path
+		 * to NO_ERR. Set explicitly. */
+		iRet = -1;
 		goto err_ret;
 	}
 	memset(&InsEntryInfo, 0, sizeof(struct ins_entry_info));
@@ -581,6 +586,10 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
 					__func__, __LINE__);
+			/* See note at the GetNewMcastGrpId failure above —
+			 * don't depend on iRet's value carried in from the
+			 * GetMcastGrpId-test side-effect. */
+			iRet = -1;
 			goto err_ret;
 		}
 		pMcastGrpInfo->members[member_id].bIsValidEntry = 1;
@@ -778,6 +787,14 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
 					__func__, __LINE__);
+			/* Preserve a non-zero status all the way back to the
+			 * FCI handler. iRet is initialised to 0 at function
+			 * entry and the loop body only sets it on error
+			 * branches, so without an explicit assignment here
+			 * the err_ret label returns 0 = NO_ERR even though
+			 * the listener add failed and any prior listeners
+			 * in this UPDATE batch are about to be torn down. */
+			iRet = -1;
 			goto err_ret;
 		}
 		phyaddr = XX_VirtToPhys(tbl_entry);

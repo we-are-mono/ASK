@@ -56,6 +56,7 @@ MCAST_LEAK_FILTER = [
 CMD_MC4_MULTICAST    = 0x0701
 CDX_MC_ACTION_ADD    = 0
 CDX_MC_ACTION_REMOVE = 1
+CDX_MC_ACTION_UPDATE = 2
 NO_ERR               = 0
 ERR_MC_CONFIG        = 707   # cdx/fe.h — stamped when cdx_create_mcast_group returns -1
 IF_NAME_SIZE         = 16
@@ -119,6 +120,35 @@ NSWEEP = int(os.environ.get("ASK_MCAST_FAILSLAB_SWEEP", "30"))
 # little longer than that after the sweep finishes so the final scan
 # sees every leak the sweep caused.
 KMEMLEAK_AGE_GRACE_S = 7.0
+
+
+@pytest_asyncio.fixture
+async def two_vlan_listeners(aiohttp_session, target_agent):
+    """Two VLAN subifs (`eth4.{VID}` and `eth4.{VID+1}`) for the UPDATE
+    sweep — the group is seeded with the first listener via a clean
+    ADD, then each iteration tries to UPDATE in the second listener
+    under failslab. CMM picks both up via netlink so get_onif_by_name
+    succeeds for both names."""
+    listener_a = f"{TARGET_LAN_IF}.{VID}"
+    listener_b = f"{TARGET_LAN_IF}.{VID + 1}"
+    for n in (listener_a, listener_b):
+        await target_agent.exec_cmd(aiohttp_session, ["ip", "link", "del", n])
+    try:
+        for vid_off, name in ((0, listener_a), (1, listener_b)):
+            r = await target_agent.exec_cmd(aiohttp_session, [
+                "ip", "link", "add", "link", TARGET_LAN_IF,
+                "name", name, "type", "vlan", "id", str(VID + vid_off),
+            ])
+            assert r["rc"] == 0, f"vlan add {name} failed: {r}"
+            r = await target_agent.exec_cmd(
+                aiohttp_session, ["ip", "link", "set", name, "up"],
+            )
+            assert r["rc"] == 0, f"vlan up {name} failed: {r}"
+        await asyncio.sleep(1.0)
+        yield listener_a, listener_b
+    finally:
+        for n in (listener_a, listener_b):
+            await target_agent.exec_cmd(aiohttp_session, ["ip", "link", "del", n])
 
 
 @pytest_asyncio.fixture
@@ -245,5 +275,92 @@ async def test_mcast_add_failslab_sweep(
             f"failslab sweep (1..{NSWEEP}) leaked {leak_count} mcast-path "
             f"object(s); {len(faulted)} iteration(s) hit ERR_MC_CONFIG.\n"
             f"Per-step outcomes: {outcome_summary}\n\n"
+            + report.get("report", "")[:4000]
+        )
+
+
+async def test_mcast_update_failslab_sweep(
+    aiohttp_session, target_agent, splat_window, two_vlan_listeners,
+):
+    """Sweep failslab over the mcast UPDATE path. Companion to the ADD
+    sweep, with the same oracle: some iterations must drive cdx to
+    ERR_MC_CONFIG, none may leave mcast-path kmemleak objects behind.
+
+    Setup: ADD listener_a once cleanly so a group exists. Each iteration
+    then attempts to UPDATE in listener_b under failslab. Successful
+    UPDATEs are immediately followed by a REMOVE of listener_b so the
+    next iteration sees the group with only listener_a (avoiding the
+    duplicate-member rejection at cdx_update_mcast_group line 757)."""
+    listener_a, listener_b = two_vlan_listeners
+
+    # Seed group with listener_a (no failslab, must succeed cleanly).
+    seed = _pack_mc4_command(CDX_MC_ACTION_ADD, [listener_a])
+    r = await target_agent.fci_send(
+        aiohttp_session, fcode=CMD_MC4_MULTICAST,
+        length=len(seed), payload=seed, timeout_ms=3000,
+    )
+    assert r.get("reply_rc") == NO_ERR, f"seed ADD failed: {r}"
+
+    update_payload = _pack_mc4_command(CDX_MC_ACTION_UPDATE, [listener_b])
+    remove_b      = _pack_mc4_command(CDX_MC_ACTION_REMOVE, [listener_b])
+
+    # Cursor for the sweep window only — seed-ADD's allocations are
+    # legitimate group state and shouldn't count against us.
+    await target_agent.kmemleak_clear(aiohttp_session)
+
+    outcomes: list[tuple[int, int | None, str | None]] = []
+    for n in range(1, NSWEEP + 1):
+        # If the previous iteration's UPDATE managed to add listener_b,
+        # take it back out so the duplicate-check at cdx_update line 757
+        # doesn't short-circuit the next iteration before allocations
+        # happen.
+        await target_agent.fci_send(
+            aiohttp_session, fcode=CMD_MC4_MULTICAST,
+            length=len(remove_b), payload=remove_b, timeout_ms=2000,
+        )
+
+        r = await target_agent.fci_send(
+            aiohttp_session,
+            fcode=CMD_MC4_MULTICAST,
+            length=len(update_payload),
+            payload=update_payload,
+            timeout_ms=3000,
+            failslab_times=n,
+        )
+        outcomes.append((n, r.get("reply_rc"), r.get("send_error")))
+
+    # Final teardown: REMOVE both listeners so the group is fully gone.
+    full_remove = _pack_mc4_command(
+        CDX_MC_ACTION_REMOVE, [listener_a, listener_b],
+    )
+    await target_agent.fci_send(
+        aiohttp_session, fcode=CMD_MC4_MULTICAST,
+        length=len(full_remove), payload=full_remove, timeout_ms=2000,
+    )
+
+    faulted = [n for n, rc, e in outcomes if rc == ERR_MC_CONFIG]
+    assert faulted, (
+        f"failslab UPDATE sweep never drove cdx into ERR_MC_CONFIG "
+        f"across times=1..{NSWEEP}; outcomes={outcomes}. The UPDATE "
+        f"path's create_exthash_entry4mcast_member allocation didn't "
+        f"trip — either failslab plumbing broke or cdx swallowed the "
+        f"error."
+    )
+
+    await asyncio.sleep(KMEMLEAK_AGE_GRACE_S)
+
+    report = await target_agent.kmemleak(
+        aiohttp_session, filter_substrs=MCAST_LEAK_FILTER,
+    )
+    leak_count = report.get("leak_count", 0)
+    if leak_count:
+        outcome_summary = ", ".join(
+            f"{n}={'OK' if rc == NO_ERR and e is None else (f'rc={rc}' if e is None else e)}"
+            for n, rc, e in outcomes
+        )
+        raise AssertionError(
+            f"failslab UPDATE sweep (1..{NSWEEP}) leaked {leak_count} "
+            f"mcast-path object(s); {len(faulted)} iteration(s) hit "
+            f"ERR_MC_CONFIG.\nPer-step outcomes: {outcome_summary}\n\n"
             + report.get("report", "")[:4000]
         )
