@@ -220,6 +220,9 @@ These were flagged as "critical" by the deep-dive agents but don't hold up on ve
 - [-] **X2. "strcpy IF_NAME_SIZE → IF_NAME_SIZE overflows" in multiple control_*.c.**
   Downgraded to L2. Kernel net_device names are guaranteed NUL-terminated within `IFNAMSIZ` (16), so when the source is `dev->name`, strcpy is bounded. Stays a hygiene issue, not a corruption bug.
 
+- [-] **X3. Continuous "N new suspected memory leaks" from `dpaa_eth_refill_bpools`.**
+  Background kmemleak scanner (default 10-min cadence) reports tens to hundreds of new "leaks" on an idle DUT, all tracing to `dpaa_eth_refill_bpools` via `priv_rx_default_dqrr` / `__napi_poll` / `handle_softirqs`. **Not a leak.** The DPAA SDK's bpool replenish hook allocates fresh skbs and hands their physical addresses to hardware via descriptor rings; during the hardware-owned phase kmemleak's pointer scanner has no kernel-side reference to find, so the skbs look unreferenced. Hardware eventually delivers RX completions, the kernel processes the skbs and frees them, refill allocates new ones. The reported count fluctuates per scan because the population mid-cycle fluctuates with traffic and bpool depth; total memory stays bounded by `bpool_size * skb_size`. Confirmed via `/proc/meminfo` RSS staying flat for hours on an idle target. **Don't chase this with `assert leak_count == 0` against the unfiltered report** — every test that uses kmemleak as an oracle must filter to specific function-name needles (e.g. `MCAST_LEAK_FILTER` in `tools/tests/test_mcast_failslab.py`), never to the broad `[cdx]` / `[auto_bridge]` module-tag matcher (which false-positives on the boot-time `dpaa_vwd_init` allocation that runs through cdx.ko).
+
 ---
 
 ## Architectural themes
