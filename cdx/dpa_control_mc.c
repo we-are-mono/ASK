@@ -909,6 +909,30 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 
 	mcast_grpd = pMcastGrpInfo->grpid;
 
+	/* Validate every listener in the request actually exists in the
+	 * group before touching any state. The count-match fast path
+	 * below (and the per-listener loop further down) used to assume
+	 * the request was well-formed: REMOVE [foo] against a group
+	 * { bar } whose count happened to equal 1 would hit the fast
+	 * path and delete the whole group, even though `foo` was never
+	 * a member (ISSUES.md M12). Validating up-front rejects mismatched
+	 * requests atomically, before either path mutates members[] or
+	 * unlinks the group. */
+	for (ii = 0; ii < uiNoOfListeners; ii++) {
+		if (bIsIPv6)
+			pListener = &(mcast6_group->output_list[ii]);
+		else
+			pListener = &(mcast4_group->output_list[ii]);
+		if (Cdx_GetMcastMemberId(pListener->output_device_str,
+					 pMcastGrpInfo) == -1) {
+			DPA_ERROR("%s::%d member:%s does not exist in the mcgroup\n",
+				  __func__, __LINE__,
+				  pListener->output_device_str);
+			iRet = -1;
+			goto err_ret;
+		}
+	}
+
 	if(pMcastGrpInfo->uiListenerCnt == uiNoOfListeners)
 	{
 		/* Unlink the group from the per-bucket list under the same

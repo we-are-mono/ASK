@@ -53,14 +53,17 @@ MCAST_LEAK_FILTER = [
 # Wire constants — mirror of test_mcast_pagination.py. Self-contained
 # deliberately; keeping the two files independent avoids the
 # tools.tests.* import gymnastics pytest's rootdir-flat-layout forces.
-CMD_MC4_MULTICAST    = 0x0701
-CDX_MC_ACTION_ADD    = 0
-CDX_MC_ACTION_REMOVE = 1
-CDX_MC_ACTION_UPDATE = 2
-NO_ERR               = 0
-ERR_MC_CONFIG        = 707   # cdx/fe.h — stamped when cdx_create_mcast_group returns -1
-IF_NAME_SIZE         = 16
-MC4_MIN_COMMAND_SIZE = 44
+CMD_MC4_MULTICAST      = 0x0701
+CDX_MC_ACTION_ADD      = 0
+CDX_MC_ACTION_REMOVE   = 1
+CDX_MC_ACTION_UPDATE   = 2
+ACTION_QUERY           = 6
+ACTION_QUERY_CONT      = 7
+NO_ERR                 = 0
+ERR_MC_ENTRY_NOT_FOUND = 700  # cdx/fe.h — QUERY when no group exists
+ERR_MC_CONFIG          = 707  # cdx/fe.h — stamped when cdx_create_mcast_group returns -1
+IF_NAME_SIZE           = 16
+MC4_MIN_COMMAND_SIZE   = 44
 
 
 def _ip_be_bytes(addr: str) -> bytes:
@@ -374,3 +377,57 @@ async def test_mcast_update_failslab_sweep(
             f"ERR_MC_CONFIG.\nPer-step outcomes: {outcome_summary}\n\n"
             + report.get("report", "")[:4000]
         )
+
+
+async def test_mcast_remove_with_nonmember_listener_rejects(
+    aiohttp_session, target_agent, splat_window, one_vlan_listener,
+):
+    """ISSUES.md M12 regression: REMOVE with a listener name that is
+    not a member of the group must NOT destroy the group, even when
+    the request count happens to match the group's current member
+    count (which used to trip an unconditional full-group-delete
+    fast path)."""
+    listener_a = one_vlan_listener
+    bogus = f"{TARGET_LAN_IF}.999"   # never registered as an onif
+
+    # Seed { listener_a }, count 1.
+    seed = _pack_mc4_command(CDX_MC_ACTION_ADD, [listener_a])
+    r = await target_agent.fci_send(
+        aiohttp_session, fcode=CMD_MC4_MULTICAST,
+        length=len(seed), payload=seed, timeout_ms=3000,
+    )
+    assert r.get("reply_rc") == NO_ERR, f"seed ADD failed: {r}"
+
+    # REMOVE [bogus] — count 1, group count 1. Pre-fix: count-match
+    # fast path destroys the group. Post-fix: pre-validation catches
+    # the unknown name and returns ERR_MC_CONFIG without mutation.
+    bad_remove = _pack_mc4_command(CDX_MC_ACTION_REMOVE, [bogus])
+    r = await target_agent.fci_send(
+        aiohttp_session, fcode=CMD_MC4_MULTICAST,
+        length=len(bad_remove), payload=bad_remove, timeout_ms=2000,
+    )
+    assert r.get("reply_rc") == ERR_MC_CONFIG, (
+        f"REMOVE with bogus listener should return ERR_MC_CONFIG "
+        f"(707), got {r}"
+    )
+
+    # Group must still exist with listener_a — verify via QUERY.
+    query = _pack_mc4_command(ACTION_QUERY, [])
+    r = await target_agent.fci_send(
+        aiohttp_session, fcode=CMD_MC4_MULTICAST,
+        length=len(query), payload=query, timeout_ms=2000,
+    )
+    assert r.get("reply_rc") == NO_ERR, (
+        f"QUERY should find the group; got {r}. The bogus REMOVE "
+        f"likely destroyed it (M12 regression)."
+    )
+
+    # Cleanup: legitimate REMOVE [listener_a] hits the count-match
+    # fast path validly (validation passes since listener_a is a
+    # real member, count matches, group cleanly deleted).
+    teardown = _pack_mc4_command(CDX_MC_ACTION_REMOVE, [listener_a])
+    r = await target_agent.fci_send(
+        aiohttp_session, fcode=CMD_MC4_MULTICAST,
+        length=len(teardown), payload=teardown, timeout_ms=2000,
+    )
+    assert r.get("reply_rc") == NO_ERR, f"teardown REMOVE failed: {r}"
