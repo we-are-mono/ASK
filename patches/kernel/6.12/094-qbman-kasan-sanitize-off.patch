@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sat, 25 Apr 2026 17:55:41 +0200
+Subject: [PATCH] soc: fsl: qbman: skip KASAN instrumentation
+
+The SDK copy's Makefiles (sdk_fman, sdk_dpaa and staging/fsl_qbman in
+sdk/<line>) turn KASAN instrumentation off: those drivers do plain
+memset()/memcpy() on iomem (MURAM and QBMan portal regions), and with
+CONFIG_KASAN_GENERIC=y the instrumented calls look up shadow an iomem
+address does not have, and fault. The change that did so opted
+mainline's QBMan driver out with them; this is that line.
+
+KASAN_SANITIZE := n suppresses only the compiler's instrumentation of
+these objects. KASAN stays enabled, so a caller's kmalloc'd buffer passed
+down is still checked.
+
+ASK's kernel config builds the SDK's QBMan, not this one (CONFIG_FSL_DPAA
+is off): the line matters only to a kernel that builds mainline's QBMan
+as well.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ drivers/soc/fsl/qbman/Makefile | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/soc/fsl/qbman/Makefile b/drivers/soc/fsl/qbman/Makefile
+index 811312ad526fb..4ee2a84159f0d 100644
+--- a/drivers/soc/fsl/qbman/Makefile
++++ b/drivers/soc/fsl/qbman/Makefile
+@@ -1,4 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
++KASAN_SANITIZE := n
++
+ obj-$(CONFIG_FSL_DPAA)                          += bman_ccsr.o qman_ccsr.o \
+ 						   bman_portal.o qman_portal.o \
+ 						   bman.o qman.o dpaa_sys.o
+-- 
+2.47.3
+

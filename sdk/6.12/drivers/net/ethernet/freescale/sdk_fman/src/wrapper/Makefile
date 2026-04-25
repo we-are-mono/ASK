@@ -1,3 +1,5 @@
+KASAN_SANITIZE := n
+
 #
 # Makefile for the Freescale Ethernet controllers
 #
