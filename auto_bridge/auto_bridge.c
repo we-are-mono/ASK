@@ -123,7 +123,13 @@ struct list_head			bridge_list_rtevent;
 static struct kmem_cache		*l2flow_cache /*__read_mostly*/;
 static struct kmem_cache		*brroute_cache /*__read_mostly*/;
 static struct sock			*abm_nl = NULL;
-static char			abm_l3_filtering = 0;
+/* Declared `int` to match the sysctl wiring at abm_sysctl_table[]
+ * (`.maxlen = sizeof(unsigned int)`) and abm_sysctl_l3_filtering's
+ * 4-byte `int *valp; int val = *valp;` reads. The pre-fix `char`
+ * was a 1-byte object that proc_dointvec treated as int* per
+ * .maxlen, producing a global-out-of-bounds read KASAN catches on
+ * the very first sysctl write. */
+static int			abm_l3_filtering = 0;
 static unsigned int			abm_max_entries = ABM_DEFAULT_MAX_ENTRIES;
 static unsigned int			abm_nb_entries =	0;
 struct workqueue_struct		*kabm_wq;
