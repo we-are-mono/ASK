@@ -19,7 +19,6 @@ SRC_URI += "\
            file://040-ask-xfrm-ipsec-offload.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \
-           file://092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch \
            file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-sdk-fman-dpaa-qbman-kasan-sanitize-off.patch \
            file://096-sdk_fman-mac-hash-alloc-null-check.patch \

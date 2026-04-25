@@ -514,6 +514,13 @@ uint32_t XX_LockIntrSpinlock(t_Handle h_Spinlock)
     return intrFlags;
 }
 
+uint32_t XX_LockIntrSpinlockNested(t_Handle h_Spinlock, int subclass)
+{
+    unsigned long intrFlags;
+    spin_lock_irqsave_nested((spinlock_t *)h_Spinlock, intrFlags, subclass);
+    return intrFlags;
+}
+
 void XX_UnlockIntrSpinlock(t_Handle h_Spinlock, uint32_t intrFlags)
 {
      spin_unlock_irqrestore((spinlock_t *)h_Spinlock, (unsigned long)intrFlags);

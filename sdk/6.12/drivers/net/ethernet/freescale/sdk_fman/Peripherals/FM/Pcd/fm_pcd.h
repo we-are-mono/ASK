@@ -518,6 +518,28 @@ static __inline__ bool FmPcdLockTryLock(t_FmPcdLock *p_Lock)
     return TRUE;
 }
 
+/* Variant that takes its spinlock with an explicit lockdep subclass.
+ * All XX_InitSpinlock()-created locks share one lockdep class, so any code
+ * path that acquires a second instance while holding the first (see
+ * FmPcdLockTryLockAll) triggers a false-positive recursive-locking warning.
+ * Pass SINGLE_DEPTH_NESTING from the inner site.
+ */
+static __inline__ bool FmPcdLockTryLockNested(t_FmPcdLock *p_Lock, int subclass)
+{
+    uint32_t intFlags;
+
+    ASSERT_COND(p_Lock);
+    intFlags = XX_LockIntrSpinlockNested(p_Lock->h_Spinlock, subclass);
+    if (p_Lock->flag)
+    {
+        XX_UnlockIntrSpinlock(p_Lock->h_Spinlock, intFlags);
+        return FALSE;
+    }
+    p_Lock->flag = TRUE;
+    XX_UnlockIntrSpinlock(p_Lock->h_Spinlock, intFlags);
+    return TRUE;
+}
+
 static __inline__ void FmPcdLockUnlock(t_FmPcdLock *p_Lock)
 {
     ASSERT_COND(p_Lock);

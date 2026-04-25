@@ -369,6 +369,24 @@ void XX_UnlockSpinlock(t_Handle h_Spinlock);
 uint32_t XX_LockIntrSpinlock(t_Handle h_Spinlock);
 
 /**************************************************************************//**
+ @Function      XX_LockIntrSpinlockNested
+
+ @Description   Locks a spinlock (interrupt safe) with an explicit lockdep
+                subclass. Needed when code acquires two instances of locks
+                that were allocated via XX_InitSpinlock() (which gives every
+                lock the same lockdep class), under a known outer-before-
+                inner ordering — otherwise lockdep reports a false positive
+                recursive-locking deadlock.
+
+ @Param[in]     h_Spinlock - A handle to a spinlock.
+ @Param[in]     subclass   - Lockdep subclass (0..7). Typical use:
+                             SINGLE_DEPTH_NESTING for a nested acquire.
+
+ @Return        As for XX_LockIntrSpinlock.
+*//***************************************************************************/
+uint32_t XX_LockIntrSpinlockNested(t_Handle h_Spinlock, int subclass);
+
+/**************************************************************************//**
  @Function      XX_UnlockIntrSpinlock
 
  @Description   Unlocks a spinlock (interrupt safe).
