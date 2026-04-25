@@ -308,16 +308,24 @@ async def test_mcast_update_failslab_sweep(
     # legitimate group state and shouldn't count against us.
     await target_agent.kmemleak_clear(aiohttp_session)
 
+    # Track listener_b's presence so the per-iter cleanup hits the
+    # right cdx_delete branch. Caveat: ISSUES.md M12 — REMOVE's
+    # full-group-delete fast path triggers whenever request count
+    # equals current group count, IGNORING listener names. So a naive
+    # `REMOVE [b]` against `{ a }` (counts both 1) destroys the group
+    # we want to keep seeding from. Skipping the cleanup in that case.
+    b_in_group = False
     outcomes: list[tuple[int, int | None, str | None]] = []
     for n in range(1, NSWEEP + 1):
-        # If the previous iteration's UPDATE managed to add listener_b,
-        # take it back out so the duplicate-check at cdx_update line 757
-        # doesn't short-circuit the next iteration before allocations
-        # happen.
-        await target_agent.fci_send(
-            aiohttp_session, fcode=CMD_MC4_MULTICAST,
-            length=len(remove_b), payload=remove_b, timeout_ms=2000,
-        )
+        if b_in_group:
+            # Group is { a, b } (count 2). REMOVE [b] (count 1) takes
+            # the per-listener path: removes b, keeps a. Group ends
+            # at { a } again.
+            await target_agent.fci_send(
+                aiohttp_session, fcode=CMD_MC4_MULTICAST,
+                length=len(remove_b), payload=remove_b, timeout_ms=2000,
+            )
+            b_in_group = False
 
         r = await target_agent.fci_send(
             aiohttp_session,
@@ -328,11 +336,13 @@ async def test_mcast_update_failslab_sweep(
             failslab_times=n,
         )
         outcomes.append((n, r.get("reply_rc"), r.get("send_error")))
+        if r.get("reply_rc") == NO_ERR and r.get("send_error") is None:
+            b_in_group = True
 
-    # Final teardown: REMOVE both listeners so the group is fully gone.
-    full_remove = _pack_mc4_command(
-        CDX_MC_ACTION_REMOVE, [listener_a, listener_b],
-    )
+    # Final teardown: pass exactly the group's current listener set so
+    # the count-match fast path triggers a full-group delete cleanly.
+    final_listeners = [listener_a, listener_b] if b_in_group else [listener_a]
+    full_remove = _pack_mc4_command(CDX_MC_ACTION_REMOVE, final_listeners)
     await target_agent.fci_send(
         aiohttp_session, fcode=CMD_MC4_MULTICAST,
         length=len(full_remove), payload=full_remove, timeout_ms=2000,
