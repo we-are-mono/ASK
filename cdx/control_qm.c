@@ -361,36 +361,55 @@ static U16 qm_sec_policer_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_l
 #endif /* SEC_PROFILE_SUPPORT */
 #endif /* ENABLE_INGRESS_QOS */
 
+/*
+ * Lower bounds were tightened from the previous CDX_CMD_VAR(0, U16_MAX)
+ * permissive entries (ISSUES.md A1b item 6). Each handler casts pcmd to
+ * a specific request struct and dereferences fields without checking
+ * cmd_len, so an undersized input would read uninit bytes from the
+ * shared FCI rbuf. Setting min == sizeof(request struct) makes the
+ * dispatcher reject those before they reach the handler. Max stays at
+ * U16_MAX because libfci callers may pre-size the buffer for a larger
+ * response struct and we don't want to break that — the FCI inbound
+ * path already caps cmd_len at FCI_MSG_MAX_PAYLOAD.
+ *
+ * Two RESET-style handlers (CMD_QM_INGRESS_POLICER_RESET,
+ * CMD_QM_SEC_POLICER_RESET) take no input — they `(void)pcmd; (void)cmd_len;`
+ * and call the underlying reset directly. No read-uninit risk, so they
+ * stay at (0, U16_MAX) for compatibility with senders that pad with
+ * zero bytes.
+ */
 static const struct cdx_cmd_spec qm_cmd_table[] = {
 #ifdef ENABLE_EGRESS_QOS
-	CDX_CMD_VAR(CMD_QM_RESET,              0, U16_MAX, NULL, qm_reset_handle),
-	CDX_CMD_VAR(CMD_QM_QOSENABLE,          0, U16_MAX, NULL, qm_qosenable_handle),
-	CDX_CMD_VAR(CMD_QM_SHAPER_CONFIG,      0, U16_MAX, NULL, qm_shaper_config_handle),
-	CDX_CMD_VAR(CMD_QM_WBFQ_CONFIG,        0, U16_MAX, NULL, qm_wbfq_config_handle),
-	CDX_CMD_VAR(CMD_QM_CQ_CONFIG,          0, U16_MAX, NULL, qm_cq_config_handle),
-	CDX_CMD_VAR(CMD_QM_CHNL_ASSIGN,        0, U16_MAX, NULL, qm_chnl_assign_handle),
-	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_STATUS,  0, U16_MAX, NULL, qm_dscp_q_map_status_handle),
-	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_CFG,     0, U16_MAX, NULL, qm_dscp_q_map_cfg_handle),
-	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_RESET,   0, U16_MAX, NULL, qm_dscp_q_map_reset_handle),
+	CDX_CMD_VAR(CMD_QM_RESET,              sizeof(QosResetCommand),         U16_MAX, NULL, qm_reset_handle),
+	CDX_CMD_VAR(CMD_QM_QOSENABLE,          sizeof(QosEnableCommand),        U16_MAX, NULL, qm_qosenable_handle),
+	CDX_CMD_VAR(CMD_QM_SHAPER_CONFIG,      sizeof(QosShaperConfigCommand),  U16_MAX, NULL, qm_shaper_config_handle),
+	CDX_CMD_VAR(CMD_QM_WBFQ_CONFIG,        sizeof(QosWbfqConfigCommand),    U16_MAX, NULL, qm_wbfq_config_handle),
+	CDX_CMD_VAR(CMD_QM_CQ_CONFIG,          sizeof(QosCqConfigCommand),      U16_MAX, NULL, qm_cq_config_handle),
+	CDX_CMD_VAR(CMD_QM_CHNL_ASSIGN,        sizeof(QosChnlAssignCommand),    U16_MAX, NULL, qm_chnl_assign_handle),
+	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_STATUS,  sizeof(QosDscpChnlClsq_mapCmd),  U16_MAX, NULL, qm_dscp_q_map_status_handle),
+	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_CFG,     sizeof(QosDscpChnlClsq_mapCmd),  U16_MAX, NULL, qm_dscp_q_map_cfg_handle),
+	CDX_CMD_VAR(CMD_QM_DSCP_Q_MAP_RESET,   sizeof(QosDscpChnlClsq_mapCmd),  U16_MAX, NULL, qm_dscp_q_map_reset_handle),
 #endif
-	CDX_CMD_VAR(CMD_QM_EXPT_RATE,          0, U16_MAX, NULL, qm_expt_rate_handle),
-	CDX_CMD_VAR(CMD_QM_FF_RATE,            0, U16_MAX, NULL, qm_ff_rate_handle),
+	CDX_CMD_VAR(CMD_QM_EXPT_RATE,          sizeof(QosExptRateCommand),      U16_MAX, NULL, qm_expt_rate_handle),
+	CDX_CMD_VAR(CMD_QM_FF_RATE,            sizeof(QosFFRateCommand),        U16_MAX, NULL, qm_ff_rate_handle),
 #ifdef ENABLE_EGRESS_QOS
-	CDX_CMD_VAR(CMD_QM_QUERY,              0, U16_MAX, NULL, qm_query_handle),
-	CDX_CMD_VAR(CMD_QM_QUERY_QUEUE,        0, U16_MAX, NULL, qm_query_queue_handle),
+	CDX_CMD_VAR(CMD_QM_QUERY,              sizeof(QosQueryCmd),             U16_MAX, NULL, qm_query_handle),
+	CDX_CMD_VAR(CMD_QM_QUERY_QUEUE,        sizeof(QosCqQueryCmd),           U16_MAX, NULL, qm_query_queue_handle),
 #endif
-	CDX_CMD_VAR(CMD_QM_QUERY_FF_RATE,      0, U16_MAX, NULL, qm_query_ff_rate_handle),
-	CDX_CMD_VAR(CMD_QM_QUERY_EXPT_RATE,    0, U16_MAX, NULL, qm_query_expt_rate_handle),
+	CDX_CMD_VAR(CMD_QM_QUERY_FF_RATE,      sizeof(QosFFRateCommand),        U16_MAX, NULL, qm_query_ff_rate_handle),
+	CDX_CMD_VAR(CMD_QM_QUERY_EXPT_RATE,    sizeof(QosExptRateCommand),      U16_MAX, NULL, qm_query_expt_rate_handle),
 #ifdef ENABLE_INGRESS_QOS
-	CDX_CMD_VAR(CMD_QM_QUERY_IFACE_DSCP_FQID_MAP, 0, U16_MAX, NULL, qm_query_iface_dscp_fqid_map_handle),
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_ENABLE,    0, U16_MAX, NULL, qm_ingress_policer_enable_handle),
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_CONFIG,    0, U16_MAX, NULL, qm_ingress_policer_config_handle),
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_RESET,     0, U16_MAX, NULL, qm_ingress_policer_reset_handle),
-	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_QUERY_STATS, 0, U16_MAX, NULL, qm_ingress_policer_query_stats_handle),
+	CDX_CMD_VAR(CMD_QM_QUERY_IFACE_DSCP_FQID_MAP, sizeof(QosIfaceDscpFqidMapCommand), U16_MAX, NULL, qm_query_iface_dscp_fqid_map_handle),
+	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_ENABLE,    sizeof(IngressQosEnableCommand),    U16_MAX, NULL, qm_ingress_policer_enable_handle),
+	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_CONFIG,    sizeof(IngressQosCfgCommand),       U16_MAX, NULL, qm_ingress_policer_config_handle),
+	/* INGRESS_POLICER_RESET ignores pcmd entirely — see comment above. */
+	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_RESET,       0,                                U16_MAX, NULL, qm_ingress_policer_reset_handle),
+	CDX_CMD_VAR(CMD_QM_INGRESS_POLICER_QUERY_STATS, sizeof(IngressQosStatCmd),        U16_MAX, NULL, qm_ingress_policer_query_stats_handle),
 #ifdef SEC_PROFILE_SUPPORT
-	CDX_CMD_VAR(CMD_QM_SEC_POLICER_CONFIG,       0, U16_MAX, NULL, qm_sec_policer_config_handle),
-	CDX_CMD_VAR(CMD_QM_SEC_POLICER_QUERY_STATS,  0, U16_MAX, NULL, qm_sec_policer_query_stats_handle),
-	CDX_CMD_VAR(CMD_QM_SEC_POLICER_RESET,        0, U16_MAX, NULL, qm_sec_policer_reset_handle),
+	CDX_CMD_VAR(CMD_QM_SEC_POLICER_CONFIG,       sizeof(QosSecRateCommand),           U16_MAX, NULL, qm_sec_policer_config_handle),
+	CDX_CMD_VAR(CMD_QM_SEC_POLICER_QUERY_STATS,  sizeof(SecQosStatCmd),               U16_MAX, NULL, qm_sec_policer_query_stats_handle),
+	/* SEC_POLICER_RESET ignores pcmd entirely — see comment above. */
+	CDX_CMD_VAR(CMD_QM_SEC_POLICER_RESET,        0,                                   U16_MAX, NULL, qm_sec_policer_reset_handle),
 #endif
 #endif
 };

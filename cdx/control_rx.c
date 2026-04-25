@@ -35,9 +35,12 @@ static U16 rx_lro_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 }
 
 static const struct cdx_cmd_spec rx_cmd_table[] = {
-	CDX_CMD_VAR(CMD_RX_ENABLE,  0, U16_MAX, NULL, rx_enable_disable_handle),
-	CDX_CMD_VAR(CMD_RX_DISABLE, 0, U16_MAX, NULL, rx_enable_disable_handle),
-	CDX_CMD_VAR(CMD_RX_LRO,     0, U16_MAX, NULL, rx_lro_handle),
+	/* All three handlers read pcmd[0..1] as a U16 (portid for
+	 * ENABLE/DISABLE, enable flag for LRO). Tightened from
+	 * CDX_CMD_VAR(0, U16_MAX) per ISSUES.md A1b item 6. */
+	CDX_CMD_VAR(CMD_RX_ENABLE,  sizeof(U16), U16_MAX, NULL, rx_enable_disable_handle),
+	CDX_CMD_VAR(CMD_RX_DISABLE, sizeof(U16), U16_MAX, NULL, rx_enable_disable_handle),
+	CDX_CMD_VAR(CMD_RX_LRO,     sizeof(U16), U16_MAX, NULL, rx_lro_handle),
 };
 
 static U16 M_rx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)

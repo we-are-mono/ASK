@@ -249,13 +249,24 @@ static U16 tx_query_iface_dscp_vlanpcp_map_handle(void *pcmd, U16 cmd_len, U16 *
 	return rc;
 }
 
+/*
+ * Lower bounds tightened from CDX_CMD_VAR(0, U16_MAX) per ISSUES.md
+ * A1b item 6. ENABLE/DISABLE only need a 2-byte portid prefix; the
+ * MAC override at offset 14 in ENABLE is internally gated on
+ * cmd_len > 14 so we don't bump the floor that high. PORT_UPDATE
+ * casts pcmd to PortUpdateCommand and reads ifname; the DSCP
+ * commands cast to their respective request structs and read named
+ * fields without internal length-checking. Max stays at U16_MAX
+ * for compatibility with libfci callers that pre-size the buffer
+ * for a larger reply.
+ */
 static const struct cdx_cmd_spec tx_cmd_table[] = {
-	CDX_CMD_VAR(CMD_TX_ENABLE,                  0, U16_MAX, NULL, tx_enable_handle),
-	CDX_CMD_VAR(CMD_TX_DISABLE,                 0, U16_MAX, NULL, tx_disable_handle),
-	CDX_CMD_VAR(CMD_PORT_UPDATE,                0, U16_MAX, NULL, tx_port_update_handle),
-	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_STATUS, 0, U16_MAX, NULL, tx_dscp_vlanpcp_map_status_handle),
-	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_CFG,    0, U16_MAX, NULL, tx_dscp_vlanpcp_map_cfg_handle),
-	CDX_CMD_VAR(CMD_TX_QUERY_IFACE_DSCP_VLANPCP_MAP, 0, U16_MAX, NULL, tx_query_iface_dscp_vlanpcp_map_handle),
+	CDX_CMD_VAR(CMD_TX_ENABLE,                  sizeof(U16),                    U16_MAX, NULL, tx_enable_handle),
+	CDX_CMD_VAR(CMD_TX_DISABLE,                 sizeof(U16),                    U16_MAX, NULL, tx_disable_handle),
+	CDX_CMD_VAR(CMD_PORT_UPDATE,                sizeof(PortUpdateCommand),      U16_MAX, NULL, tx_port_update_handle),
+	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_STATUS, sizeof(DSCPVlanPCPMapCmd),      U16_MAX, NULL, tx_dscp_vlanpcp_map_status_handle),
+	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_CFG,    sizeof(DSCPVlanPCPMapCmd),      U16_MAX, NULL, tx_dscp_vlanpcp_map_cfg_handle),
+	CDX_CMD_VAR(CMD_TX_QUERY_IFACE_DSCP_VLANPCP_MAP, sizeof(QueryDSCPVlanPCPMapCmd), U16_MAX, NULL, tx_query_iface_dscp_vlanpcp_map_handle),
 };
 
 static U16 M_tx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)

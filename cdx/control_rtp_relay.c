@@ -1416,6 +1416,22 @@ static U16 rtp_stats_dtmf_pt_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return (U16)rtp_set_dtmf_pt(pcmd, cmd_len);
 }
 
+/*
+ * Every entry here is a thin wrapper passing pcmd + cmd_len through
+ * to an inner RTP_Call_* / RTCP_Query / rtp_set_dtmf_pt that owns
+ * the length-validation responsibility. The wrappers themselves do
+ * not dereference pcmd as a struct, so undersized cmd_len doesn't
+ * read uninit at the dispatcher boundary; the inner functions
+ * handle wrong-size requests with their own error returns.
+ *
+ * Tightening these would require auditing each inner's expected
+ * payload shape (which depends on cmd_code-specific message types
+ * the wrappers don't see). Out of scope for the A1b item 6 pass —
+ * left at CDX_CMD_VAR(0, U16_MAX) intentionally. Note also that
+ * RTP/RTCP isn't built in our LS1046A target image (CMM doesn't
+ * generate these codes), so any tightening here would be
+ * un-tested unless the SoC / userspace surface changes.
+ */
 static const struct cdx_cmd_spec rtp_cmd_table[] = {
 	CDX_CMD_VAR(CMD_RTP_OPEN,           0, U16_MAX, NULL, rtp_open_handle),
 	CDX_CMD_VAR(CMD_RTP_UPDATE,         0, U16_MAX, NULL, rtp_update_handle),

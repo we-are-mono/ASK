@@ -621,40 +621,45 @@ static U16 stat_ipr_v6_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 }
 
 /*
- * None of the stat codes length-check pcmd against the struct size
- * in the pre-migration code — each case does a blind `memcpy(
- * sizeof(StatXxxCmd))` from pcmd regardless of cmd_len. To preserve
- * exact behavior (per A1b template item 6) all entries use
- * CDX_CMD_VAR(0, U16_MAX). Tightening to CDX_CMD(exact struct) is
- * worth doing as a separate hardening pass once we confirm CMM
- * always sends the full struct.
+ * Lower bounds tightened from CDX_CMD_VAR(0, U16_MAX) to
+ * sizeof(request struct) for every entry whose handler reads pcmd
+ * via memcpy/cast (ISSUES.md A1b item 6). The handlers don't
+ * length-check internally, so an undersized input would memcpy
+ * uninit bytes from the FCI rbuf and read those as the request.
+ * Setting min == sizeof(struct) makes the dispatcher reject those
+ * before they reach the handler. Max stays at U16_MAX to preserve
+ * compatibility with libfci callers that pre-size the buffer for
+ * a larger response struct.
  *
- * The pre-migration default arm returned ERR_STAT_FEATURE_NOT_ENABLED
- * on unknown cmd_code. The dispatcher returns ERR_UNKNOWN_COMMAND
- * instead — a minor behavior tightening that gives userspace a more
- * truthful reply ("we don't know that code" vs "we don't have that
- * feature enabled"). If any caller relies on the old error code,
- * flip this back to a dedicated handler that returns
- * ERR_STAT_FEATURE_NOT_ENABLED for every unlisted code; none is
- * expected to do so.
+ * Two exceptions:
+ *  - CMD_STAT_BRIDGE_{STATUS,ENTRY} route to stat_bridge_disabled_handle
+ *    which `(void)pcmd; (void)cmd_len;` — bridge stats aren't built
+ *    in this port. No read-uninit risk; left at (0, U16_MAX).
+ *  - FPP_CMD_IPR_V{4,6}_STATS write `struct ipr_statistics` into pcmd
+ *    but the type is private to cdx_reassm.c. Promoting it to a
+ *    shared header just to express the bound is more churn than
+ *    the read-of-uninit risk justifies (write-only handler — no
+ *    bytes from pcmd are read). Left at (0, U16_MAX).
  */
 static const struct cdx_cmd_spec stat_cmd_table[] = {
-	CDX_CMD_VAR(CMD_STAT_ENABLE,        0, U16_MAX, NULL, stat_enable_handle),
-	CDX_CMD_VAR(CMD_STAT_INTERFACE_PKT, 0, U16_MAX, NULL, stat_interface_pkt_handle),
-	CDX_CMD_VAR(CMD_STAT_CONN,          0, U16_MAX, NULL, stat_conn_handle),
-	CDX_CMD_VAR(CMD_STAT_PPPOE_STATUS,  0, U16_MAX, NULL, stat_pppoe_status_handle),
-	CDX_CMD_VAR(CMD_STAT_PPPOE_ENTRY,   0, U16_MAX, NULL, stat_pppoe_entry_handle),
+	CDX_CMD_VAR(CMD_STAT_ENABLE,        sizeof(StatEnableCmd),         U16_MAX, NULL, stat_enable_handle),
+	CDX_CMD_VAR(CMD_STAT_INTERFACE_PKT, sizeof(StatInterfaceCmd),      U16_MAX, NULL, stat_interface_pkt_handle),
+	CDX_CMD_VAR(CMD_STAT_CONN,          sizeof(StatConnectionCmd),     U16_MAX, NULL, stat_conn_handle),
+	CDX_CMD_VAR(CMD_STAT_PPPOE_STATUS,  sizeof(StatPPPoEStatusCmd),    U16_MAX, NULL, stat_pppoe_status_handle),
+	CDX_CMD_VAR(CMD_STAT_PPPOE_ENTRY,   sizeof(StatPPPoEEntryResponse), U16_MAX, NULL, stat_pppoe_entry_handle),
+	/* bridge stats not built — handlers ignore pcmd entirely. */
 	CDX_CMD_VAR(CMD_STAT_BRIDGE_STATUS, 0, U16_MAX, NULL, stat_bridge_disabled_handle),
 	CDX_CMD_VAR(CMD_STAT_BRIDGE_ENTRY,  0, U16_MAX, NULL, stat_bridge_disabled_handle),
-	CDX_CMD_VAR(CMD_STAT_VLAN_STATUS,   0, U16_MAX, NULL, stat_vlan_status_handle),
-	CDX_CMD_VAR(CMD_STAT_VLAN_ENTRY,    0, U16_MAX, NULL, stat_vlan_entry_handle),
-	CDX_CMD_VAR(CMD_STAT_TUNNEL_STATUS, 0, U16_MAX, NULL, stat_tunnel_status_handle),
-	CDX_CMD_VAR(CMD_STAT_TUNNEL_ENTRY,  0, U16_MAX, NULL, stat_tunnel_entry_handle),
+	CDX_CMD_VAR(CMD_STAT_VLAN_STATUS,   sizeof(StatVlanStatusCmd),     U16_MAX, NULL, stat_vlan_status_handle),
+	CDX_CMD_VAR(CMD_STAT_VLAN_ENTRY,    sizeof(StatVlanEntryResponse), U16_MAX, NULL, stat_vlan_entry_handle),
+	CDX_CMD_VAR(CMD_STAT_TUNNEL_STATUS, sizeof(StatTunnelStatusCmd),   U16_MAX, NULL, stat_tunnel_status_handle),
+	CDX_CMD_VAR(CMD_STAT_TUNNEL_ENTRY,  sizeof(StatTunnelEntryResponse), U16_MAX, NULL, stat_tunnel_entry_handle),
 #ifdef DPA_IPSEC_OFFLOAD
-	CDX_CMD_VAR(CMD_STAT_IPSEC_STATUS,  0, U16_MAX, NULL, stat_ipsec_status_handle),
-	CDX_CMD_VAR(CMD_STAT_IPSEC_ENTRY,   0, U16_MAX, NULL, stat_ipsec_entry_handle),
+	CDX_CMD_VAR(CMD_STAT_IPSEC_STATUS,  sizeof(StatIpsecStatusCmd),    U16_MAX, NULL, stat_ipsec_status_handle),
+	CDX_CMD_VAR(CMD_STAT_IPSEC_ENTRY,   sizeof(StatIpsecEntryResponse), U16_MAX, NULL, stat_ipsec_entry_handle),
 #endif
-	CDX_CMD_VAR(CMD_STAT_FLOW,          0, U16_MAX, NULL, stat_flow_handle),
+	CDX_CMD_VAR(CMD_STAT_FLOW,          sizeof(StatFlowStatusCmd),     U16_MAX, NULL, stat_flow_handle),
+	/* IPR stats: see comment above re: ipr_statistics privacy. */
 	CDX_CMD_VAR(FPP_CMD_IPR_V4_STATS,   0, U16_MAX, NULL, stat_ipr_v4_stats_handle),
 	CDX_CMD_VAR(FPP_CMD_IPR_V6_STATS,   0, U16_MAX, NULL, stat_ipr_v6_stats_handle),
 };

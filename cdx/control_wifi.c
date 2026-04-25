@@ -158,9 +158,20 @@ static U16 wifi_vap_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 }
 
 static const struct cdx_cmd_spec wifi_rx_cmd_table[] = {
-	CDX_CMD_VAR(CMD_WIFI_VAP_ENTRY, 0, U16_MAX, NULL, wifi_vap_entry_handle),
-	CDX_CMD_VAR(CMD_WIFI_VAP_QUERY, 0, U16_MAX, NULL, wifi_vap_query_handle),
-	CDX_CMD_VAR(CMD_WIFI_VAP_RESET, 0, U16_MAX, NULL, wifi_vap_reset_handle),
+	/* VAP_ENTRY: forwarded to wifi_vap_entry which copies a
+	 * struct wifiCmd out of pcmd via memcpy(sizeof(struct wifiCmd))
+	 * — the inner does its own VAPID range check but not the
+	 * length check, so set min == sizeof(struct wifiCmd) here.
+	 *
+	 * VAP_QUERY: writes a wifi_vap_query_response_t array of
+	 * MAX_WIFI_VAPS entries into pcmd; buffer must hold the whole
+	 * array.
+	 *
+	 * VAP_RESET: handler `(void)pcmd; (void)cmd_len;` — kept
+	 * permissive because there's no read to underflow. */
+	CDX_CMD_VAR(CMD_WIFI_VAP_ENTRY, sizeof(struct wifiCmd),                                 U16_MAX, NULL, wifi_vap_entry_handle),
+	CDX_CMD_VAR(CMD_WIFI_VAP_QUERY, sizeof(wifi_vap_query_response_t) * MAX_WIFI_VAPS,      U16_MAX, NULL, wifi_vap_query_handle),
+	CDX_CMD_VAR(CMD_WIFI_VAP_RESET, 0,                                                      U16_MAX, NULL, wifi_vap_reset_handle),
 };
 
 static U16 M_wifi_rx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)

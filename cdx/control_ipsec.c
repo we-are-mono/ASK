@@ -1127,8 +1127,11 @@ static const struct cdx_cmd_spec ipsec_cmd_table[] = {
 	CDX_CMD    (CMD_IPSEC_SA_SET_NATT,              CommandIPSecSetNatt,        ipsec_set_natt_handle),
 	CDX_CMD    (CMD_IPSEC_SA_SET_STATE,             CommandIPSecSetState,       ipsec_set_state_handle),
 	CDX_CMD    (CMD_IPSEC_SA_SET_LIFETIME,          CommandIPSecSetLifetime,    ipsec_set_lifetime_handle),
-	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY,          0, U16_MAX, NULL,           ipsec_query_handle),
-	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY_CONT,     0, U16_MAX, NULL,           ipsec_query_cont_handle),
+	/* QUERY/QUERY_CONT cast pcmd to PSAQueryCommand and write
+	 * sizeof(SAQueryCommand) into it; min == sizeof(SAQueryCommand)
+	 * ensures the buffer is large enough. ISSUES.md A1b item 6. */
+	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY,          sizeof(SAQueryCommand), U16_MAX, NULL,           ipsec_query_handle),
+	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY_CONT,     sizeof(SAQueryCommand), U16_MAX, NULL,           ipsec_query_cont_handle),
 	CDX_CMD    (CMD_IPSEC_FRAG_CFG,                 CommandIPSecSetPreFrag,     ipsec_frag_cfg_handle),
 	CDX_CMD_VAR(CMD_IPSEC_SEC_FAILURE_STATS,        0, U16_MAX, NULL,           ipsec_sec_failure_stats_handle),
 	CDX_CMD_VAR(CMD_IPSEC_RESET_SEC_FAILURE_STATS,  0, U16_MAX, NULL,           ipsec_reset_sec_failure_stats_handle),

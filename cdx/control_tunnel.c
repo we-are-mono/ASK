@@ -483,8 +483,13 @@ static const struct cdx_cmd_spec tnl_cmd_table[] = {
 	CDX_CMD(CMD_TNL_CREATE, TNLCommand_create, tnl_create_handle),
 	CDX_CMD(CMD_TNL_UPDATE, TNLCommand_create, tnl_update_handle),
 	CDX_CMD(CMD_TNL_DELETE, TNLCommand_delete, tnl_delete_handle),
-	CDX_CMD_VAR(CMD_TNL_QUERY,      0, U16_MAX, NULL, tnl_query_handle),
-	CDX_CMD_VAR(CMD_TNL_QUERY_CONT, 0, U16_MAX, NULL, tnl_query_cont_handle),
+	/* QUERY/QUERY_CONT write the TNLCommand_query reply into pcmd
+	 * (sizeof(TNLCommand_query)) — the buffer must be at least that
+	 * size, so min == sizeof(TNLCommand_query). Tightened from the
+	 * A1b template's CDX_CMD_VAR(0, U16_MAX) per ISSUES.md A1b
+	 * item 6. Max stays at U16_MAX. */
+	CDX_CMD_VAR(CMD_TNL_QUERY,      sizeof(TNLCommand_query), U16_MAX, NULL, tnl_query_handle),
+	CDX_CMD_VAR(CMD_TNL_QUERY_CONT, sizeof(TNLCommand_query), U16_MAX, NULL, tnl_query_cont_handle),
 };
 
 static U16 M_tnl_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)

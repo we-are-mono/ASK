@@ -589,12 +589,26 @@ static U16 bridged_itf_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len
 }
 
 static const struct cdx_cmd_spec bridge_cmd_table[] = {
+	/* The five noop entries route to bridge_noop_handle which
+	 * `(void)pcmd; (void)cmd_len;` and just returns NO_ERR — no
+	 * read-of-uninit risk, kept permissive.
+	 *
+	 * QUERY_ENTRY writes prsp->eof = 1 and sets reply length to
+	 * sizeof(L2BridgeQueryEntryResponse); the buffer must hold
+	 * that, so min == sizeof(...).
+	 *
+	 * FLOW_TIMEOUT, MODE, BRIDGED_ITF_UPDATE pass pcmd through to
+	 * inner M_bridge_handle_control / M_bridged_itf_update wrappers
+	 * that don't length-check either. Kept permissive (CDX_CMD_VAR
+	 * 0..U16_MAX) to preserve pre-migration behaviour; tightening
+	 * those would require auditing each inner's expected struct
+	 * shape across cmd_codes. */
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_ENABLE,       0, U16_MAX, NULL, bridge_noop_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_ADD,          0, U16_MAX, NULL, bridge_noop_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_REMOVE,       0, U16_MAX, NULL, bridge_noop_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_STATUS, 0, U16_MAX, NULL, bridge_noop_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_RESET,   0, U16_MAX, NULL, bridge_noop_handle),
-	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_ENTRY,  0, U16_MAX, NULL, bridge_query_entry_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_ENTRY,  sizeof(L2BridgeQueryEntryResponse), U16_MAX, NULL, bridge_query_entry_handle),
 	CDX_CMD    (CMD_RX_L2BRIDGE_FLOW_ENTRY,   L2BridgeL2FlowEntryCommand, bridge_flow_entry_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_TIMEOUT, 0, U16_MAX, NULL, bridge_flow_timeout_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_MODE,         0, U16_MAX, NULL, bridge_mode_handle),
