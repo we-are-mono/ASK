@@ -41,3 +41,10 @@ local_conf_header:
     # This is a dev/test image — skip SBOM generation to avoid SPDX
     # task failures on externalsrc recipes and shave build time.
     INHERIT:remove = "create-spdx"
+  kasan: |
+    # Pass through the KASAN env var so `KASAN=1 kas build .config.yaml`
+    # reaches linux-ask_6.12.bb's do_configure:append, which conditionally
+    # layers ask-kasan.cfg over ask.cfg. Default builds (KASAN unset)
+    # produce a fast non-instrumented image; KASAN=1 produces the
+    # sanitiser-instrumented one for periodic deep sweeps.
+    BB_ENV_PASSTHROUGH_ADDITIONS:append = " KASAN"

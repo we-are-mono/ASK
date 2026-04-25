@@ -21,6 +21,7 @@ SRCREV = "df24f9428e38740256a410b983003a478e72a7c0"
 SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://defconfig \
            file://ask.cfg \
+           file://ask-kasan.cfg \
            file://mono-gateway-dk.dts \
            file://001-hwmon-ina2xx-Add-INA234-support.patch \
            file://010-ask-fman-dpaa-ehash.patch \
@@ -35,7 +36,16 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://091-sdk_dpaa-dpa_get_channel-use-mutex.patch \
            file://092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch \
            file://093-netlink-name-L2FLOW-cb-mutex.patch \
+           file://094-sdk-fman-dpaa-qbman-kasan-sanitize-off.patch \
+           file://095-sdk_fman-iomem-mem-ops.patch \
           "
+
+# Optional KASAN overlay — flipped on by the user with
+# `KASAN=1 kas build .config.yaml`. The env var is propagated to
+# bitbake via BB_ENV_PASSTHROUGH_ADDITIONS in .config.yaml's
+# local_conf_header. Default builds skip ask-kasan.cfg entirely so
+# the image stays fast (~13 MB smaller, ~60% faster suite).
+KASAN ??= "0"
 
 S = "${WORKDIR}/git"
 
@@ -50,8 +60,13 @@ do_configure:prepend() {
 }
 
 # Merge the ASK config fragment after the base defconfig is in place, then
-# re-run olddefconfig so implicit dependencies resolve.
+# re-run olddefconfig so implicit dependencies resolve. ask-kasan.cfg is
+# layered AFTER ask.cfg when KASAN=1 — its `CONFIG_KASAN=y` lines override
+# the `# CONFIG_KASAN is not set` markers in the base fragment.
 do_configure:append() {
     cat ${UNPACKDIR}/ask.cfg >> ${B}/.config
+    if [ "${KASAN}" = "1" ]; then
+        cat ${UNPACKDIR}/ask-kasan.cfg >> ${B}/.config
+    fi
     oe_runmake -C ${S} O=${B} olddefconfig
 }
