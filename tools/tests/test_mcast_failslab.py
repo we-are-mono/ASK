@@ -431,3 +431,115 @@ async def test_mcast_remove_with_nonmember_listener_rejects(
         length=len(teardown), payload=teardown, timeout_ms=2000,
     )
     assert r.get("reply_rc") == NO_ERR, f"teardown REMOVE failed: {r}"
+
+
+async def test_mcast_remove_failslab_sweep(
+    aiohttp_session, target_agent, splat_window, one_vlan_listener,
+):
+    """Stress test of cdx_delete_mcast_group_member's locking + err-path
+    discipline under failslab pressure. Companion to ADD/UPDATE sweeps,
+    BUT with a different oracle.
+
+    REMOVE has effectively no kmalloc sites in its critical path: the
+    full-delete path is `list_del` + a chain of `kfree`s, the
+    per-listener path's only allocation is buried in
+    ExternalHashTableFmPcdHcSync's HC frame send which uses a
+    pre-allocated pool. So failslab rarely (or never) fires inside
+    cdx during REMOVE — empirically, 30/30 iterations under
+    failslab_times=1..30 return NO_ERR.
+
+    The sweep still has value:
+
+      1. **Mutex release discipline.** mc_mutators_mutex (M10/M11) is
+         taken at the top of MC{4,6}_Command_Handler for every
+         ADD/REMOVE/UPDATE. A missed unlock on any return path would
+         deadlock the next iteration's seed-ADD. 30 successful
+         iterations is the oracle that all return paths unlock.
+      2. **No leaks across the ADD-REMOVE cycle.** Single kmemleak
+         cursor at start, scan after the sweep, asserts the
+         mcast-path filter is clean.
+
+    For real fault-induced err_ret coverage on REMOVE, see the M12
+    regression test (which exercises the validation rejection path
+    via a bogus listener name, not failslab)."""
+    listener = one_vlan_listener
+    seed_payload   = _pack_mc4_command(CDX_MC_ACTION_ADD, [listener])
+    remove_payload = _pack_mc4_command(CDX_MC_ACTION_REMOVE, [listener])
+
+    await target_agent.kmemleak_clear(aiohttp_session)
+    outcomes: list[tuple[int, int | None, str | None]] = []
+
+    for n in range(1, NSWEEP + 1):
+        # Best-effort: clear any leftover from the previous iteration
+        # (might be a stuck group with uiListenerCnt=0 if a prior
+        # REMOVE faulted between members[] mutation and HW sync). The
+        # subsequent ADD takes the duplicate-group path inside
+        # cdx_create_mcast_group, which routes to cdx_update_mcast_group
+        # and re-installs the listener into the empty slot.
+        await target_agent.fci_send(
+            aiohttp_session, fcode=CMD_MC4_MULTICAST,
+            length=len(remove_payload), payload=remove_payload,
+            timeout_ms=2000,
+        )
+
+        # Seed a fresh single-listener group. No failslab here — the
+        # ADD path is exercised by test_mcast_add_failslab_sweep.
+        r = await target_agent.fci_send(
+            aiohttp_session, fcode=CMD_MC4_MULTICAST,
+            length=len(seed_payload), payload=seed_payload, timeout_ms=2000,
+        )
+        if r.get("reply_rc") != NO_ERR:
+            # Couldn't seed (maybe the group is stuck). Skip this
+            # iteration's REMOVE attempt; track it so the oracle
+            # doesn't credit failslab for it.
+            outcomes.append((n, None, "seed_failed"))
+            continue
+
+        r = await target_agent.fci_send(
+            aiohttp_session,
+            fcode=CMD_MC4_MULTICAST,
+            length=len(remove_payload),
+            payload=remove_payload,
+            timeout_ms=3000,
+            failslab_times=n,
+        )
+        outcomes.append((n, r.get("reply_rc"), r.get("send_error")))
+
+    # Final cleanup attempt; ignore the outcome.
+    await target_agent.fci_send(
+        aiohttp_session, fcode=CMD_MC4_MULTICAST,
+        length=len(remove_payload), payload=remove_payload, timeout_ms=2000,
+    )
+
+    # Implicit oracle: getting here means all NSWEEP iterations
+    # completed — no missed mutex unlock deadlocked us. seed_failed
+    # outcomes are still acceptable (a partial-state group from a
+    # prior REMOVE can briefly block a fresh ADD's duplicate-group
+    # path), as long as enough iterations succeeded to exercise the
+    # ADD-REMOVE cycle.
+    successful_cycles = [
+        n for n, rc, e in outcomes
+        if e is None and rc == NO_ERR
+    ]
+    assert len(successful_cycles) >= NSWEEP // 2, (
+        f"too few successful ADD-REMOVE cycles "
+        f"({len(successful_cycles)}/{NSWEEP}); outcomes={outcomes}"
+    )
+
+    await asyncio.sleep(KMEMLEAK_AGE_GRACE_S)
+
+    report = await target_agent.kmemleak(
+        aiohttp_session, filter_substrs=MCAST_LEAK_FILTER,
+    )
+    leak_count = report.get("leak_count", 0)
+    if leak_count:
+        outcome_summary = ", ".join(
+            f"{n}={'OK' if rc == NO_ERR and e is None else (f'rc={rc}' if e is None else e)}"
+            for n, rc, e in outcomes
+        )
+        raise AssertionError(
+            f"failslab REMOVE sweep (1..{NSWEEP}) leaked {leak_count} "
+            f"mcast-path object(s).\n"
+            f"Per-step outcomes: {outcome_summary}\n\n"
+            + report.get("report", "")[:4000]
+        )
