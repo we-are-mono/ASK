@@ -437,9 +437,10 @@ static void DUMP(struct dpa_alloc *alloc)
 int dpa_alloc_new(struct dpa_alloc *alloc, u32 *result, u32 count, u32 align,
 		  int partial)
 {
-	struct alloc_node *i = NULL, *next_best = NULL, *used_node = NULL;
+	struct alloc_node *i = NULL, *next_best = NULL;
+	struct alloc_node *used_node = NULL;
 	u32 base, next_best_base = 0, num = 0, next_best_num = 0;
-	struct alloc_node *margin_left, *margin_right;
+	struct alloc_node *margin_left = NULL, *margin_right = NULL;
 
 	*result = (u32)-1;
 	DPRINT("alloc_range(%d,%d,%d)\n", count, align, partial);
@@ -447,14 +448,21 @@ int dpa_alloc_new(struct dpa_alloc *alloc, u32 *result, u32 count, u32 align,
 	/* If 'align' is 0, it should behave as though it was 1 */
 	if (!align)
 		align = 1;
-	margin_left = kmalloc(sizeof(*margin_left), GFP_KERNEL);
-	if (!margin_left)
-		goto err;
+
+	/* Preallocate every list node we might need BEFORE taking the
+	 * spinlock. The old code kmalloc(GFP_KERNEL)'d the used_node (and
+	 * occasionally freed margins) inside spin_lock_irq — illegal, since
+	 * GFP_KERNEL can sleep under direct reclaim. CONFIG_DEBUG_ATOMIC_SLEEP
+	 * flags it; under memory pressure it would genuinely deadlock.
+	 * Unused nodes are kfree'd after the critical section (kfree(NULL) is
+	 * a no-op, and kfree outside the lock is preferred anyway).
+	 */
+	margin_left  = kmalloc(sizeof(*margin_left),  GFP_KERNEL);
 	margin_right = kmalloc(sizeof(*margin_right), GFP_KERNEL);
-	if (!margin_right) {
-		kfree(margin_left);
-		goto err;
-	}
+	used_node    = kmalloc(sizeof(*used_node),    GFP_KERNEL);
+	if (!margin_left || !margin_right || !used_node)
+		goto err_nomem;
+
 	spin_lock_irq(&alloc->lock);
 	list_for_each_entry(i, &alloc->free, list) {
 		base = (i->base + align - 1) / align;
@@ -486,43 +494,44 @@ done:
 			margin_left->base = i->base;
 			margin_left->num = base - i->base;
 			list_add_tail(&margin_left->list, &i->list);
-		} else
-			kfree(margin_left);
+			margin_left = NULL; /* ownership handed to list */
+		}
 		if ((base + num) < (i->base + i->num)) {
 			margin_right->base = base + num;
 			margin_right->num = (i->base + i->num) -
 						(base + num);
 			list_add(&margin_right->list, &i->list);
-		} else
-			kfree(margin_right);
+			margin_right = NULL;
+		}
 		list_del(&i->list);
 		kfree(i);
 		*result = base;
-	} else {
-		spin_unlock_irq(&alloc->lock);
-		kfree(margin_left);
-		kfree(margin_right);
-	}
 
-err:
+		/* Add the allocation to the used list with a refcount of 1 */
+		used_node->base = *result;
+		used_node->num = num;
+		used_node->refcount = 1;
+		used_node->is_alloced = 1;
+		list_add_tail(&used_node->list, &alloc->used);
+		used_node = NULL;
+	}
+	spin_unlock_irq(&alloc->lock);
+
+	kfree(margin_left);
+	kfree(margin_right);
+	kfree(used_node);
+
 	DPRINT("returning %d\n", i ? num : -ENOMEM);
 	DUMP(alloc);
 	if (!i)
 		return -ENOMEM;
-
-	/* Add the allocation to the used list with a refcount of 1 */
-	used_node = kmalloc(sizeof(*used_node), GFP_KERNEL);
-	if (!used_node) {
-		spin_unlock_irq(&alloc->lock);
-		return -ENOMEM;
-	}
-	used_node->base = *result;
-	used_node->num = num;
-	used_node->refcount = 1;
-	used_node->is_alloced = 1;
-	list_add_tail(&used_node->list, &alloc->used);
-	spin_unlock_irq(&alloc->lock);
 	return (int)num;
+
+err_nomem:
+	kfree(margin_left);
+	kfree(margin_right);
+	kfree(used_node);
+	return -ENOMEM;
 }
 
 /* Allocate the list node using GFP_ATOMIC, because we *really* want to avoid

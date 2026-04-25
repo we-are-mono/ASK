@@ -16,7 +16,6 @@ SRC_URI += "\
            file://040-ask-xfrm-ipsec-offload.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \
-           file://090-qbman-dpa_alloc-preallocate-nodes.patch \
            file://091-sdk_dpaa-dpa_get_channel-use-mutex.patch \
            file://092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch \
            file://093-netlink-name-every-cb-mutex-class.patch \
