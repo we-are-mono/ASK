@@ -1510,21 +1510,26 @@ static int abm_sysctl_l3_filtering(const struct ctl_table *ctl, int write,
 	int *valp = ctl->data;
 	int val = *valp;
 	int rc;
-	int old_abm_l3_filtering = abm_l3_filtering;
 	int ret;
 
 	if (write && !capable(CAP_NET_ADMIN))
 		return -EPERM;
 
 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
+	/* Bail before the side-effect block on parse error. proc_dointvec
+	 * may have partially updated *valp, but firing the table flush +
+	 * netlink reset off a half-parsed input is worse than no action. */
+	if (ret < 0)
+		return ret;
 
 	if (write && *valp != val) {
-		if(((!old_abm_l3_filtering) && *valp) || (old_abm_l3_filtering && (!*valp))){
+		/* val was the pre-handler value of *valp, so it equals the
+		 * old abm_l3_filtering — no separate snapshot needed. */
+		if ((!val && *valp) || (val && !*valp)) {
 			abm_l2flow_table_flush();
 
-			if((rc = abm_nl_send_rst_msg(abm_nl)) < 0)
+			if ((rc = abm_nl_send_rst_msg(abm_nl)) < 0)
 				ABM_PRINT(KERN_ERR, " Netlink send rst msg error = %d\n", rc);
-
 		}
 		abm_l3_filtering = (*valp) ? 1 : 0;
 	}
