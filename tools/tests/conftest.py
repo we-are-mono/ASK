@@ -19,12 +19,17 @@ site; override for other deployments):
 
     ASK_TARGET_IP       agent HTTP host (default 10.0.0.62)
     ASK_TARGET_DEV      target serial device (default /dev/ttyUSB0)
-    ASK_LAN_IP          LAN-side agent HTTP host (default 172.30.0.10)
     ASK_LAN_VM          libvirt domain for LAN UART (default "loki")
     ASK_LAN_USER        LAN VM serial login user (default root)
     ASK_LAN_PASSWORD    LAN VM serial login password (default password)
     ASK_WAN_IP          WAN-side agent HTTP host (default 127.0.0.1)
     ASK_WAN_IPERF_IP    iperf3 server on the WAN side (default 10.0.0.141)
+
+The LAN VM is reached only via libvirt PTY (Console.lan()) — it sits
+behind the DUT's NAT and has no IP path from the orchestrator, by
+design. Tests drive LAN-side work through the UART; parallel-shape
+work uses backgrounded shell processes coordinated via filesystem
+state (see test_mcast_replication.py for the pattern).
 """
 
 from __future__ import annotations
@@ -62,16 +67,6 @@ async def aiohttp_session():
 @pytest.fixture(scope="session")
 def target_agent():
     return client.TARGET
-
-
-@pytest.fixture(scope="session")
-def lan_agent():
-    """LAN-side askd-agent. Same Agent class as target_agent, just
-    pointed at $ASK_LAN_IP. Used by Phase 2 mcast replication tests
-    that need parallel tcpdump captures across N listener subifs —
-    the UART console is a single serial channel and can't run
-    concurrent commands."""
-    return client.LAN
 
 
 # Loaded once per session. An expired entry raises here, failing the suite

@@ -233,10 +233,10 @@ class Agent:
             return await r.json()
 
 # Node endpoints — overridable via env so the harness works on anyone's
-# lab setup. The orchestrator runs on the WAN-side host; LAN is the
-# traffic-generator VM/box behind the DUT's NAT.
+# lab setup. The orchestrator runs on the WAN-side host. The LAN VM
+# sits behind the DUT's NAT and has no IP path from the orchestrator;
+# LAN-side scripting is driven by Console.lan() (libvirt PTY) instead.
 _DEFAULT_PORT = "9110"
 
 TARGET = Agent("target", f"http://{os.environ.get('ASK_TARGET_IP', '10.0.0.62')}:{_DEFAULT_PORT}")
-LAN    = Agent("lan",    f"http://{os.environ.get('ASK_LAN_IP',    '172.30.0.10')}:{_DEFAULT_PORT}")
 WAN    = Agent("wan",    f"http://{os.environ.get('ASK_WAN_IP',    '127.0.0.1')}:{_DEFAULT_PORT}")
