@@ -9,7 +9,6 @@ default), bounded by the agent-side exec timeout.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import textwrap
 
@@ -17,6 +16,7 @@ from _topology import (
     ICMP4_FRAG_NEEDED,
     dut_egress_mtu,  # noqa: F401  (fixture)
     expect_icmp_egress,
+    lan_run_python,
 )
 
 
@@ -36,31 +36,20 @@ _INJECT_TEMPLATE = textwrap.dedent("""
 """).strip()
 
 
-def _push_and_run(lan, script: str, path: str) -> None:
-    b64 = base64.b64encode(script.encode()).decode()
-    r = lan.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert "OK" in r.stdout, f"stage failed: rc={r.rc}, {r.stdout!r}"
-
-
 async def test_ipv4_edge_df_too_big_emits_frag_needed(
     aiohttp_session, target_agent, lan, splat_window, dut_egress_mtu,
 ):
     # Lower the WAN-facing egress MTU; restored on fixture teardown.
     await dut_egress_mtu(TARGET_WAN_IF, LOWERED_MTU)
 
-    # Stage the scapy script on LAN.
     script = _INJECT_TEMPLATE.format(wan=WAN_IPERF_IP)
-    path = "/tmp/ask_ipv4_df_too_big.py"
-    _push_and_run(lan, script, path)
 
     # Start the egress watcher BEFORE injection so we don't race the
     # ICMP response. expect_icmp_egress waits up to timeout_s for one
     # matching frame; gather() lets injection and observation overlap.
     async def _inject():
-        # 200 ms buffer so tcpdump on the DUT is listening before the
-        # ICMP frame would arrive.
         await asyncio.sleep(0.2)
-        r = await asyncio.to_thread(lan.run, f"python3 {path}", 15.0)
+        r = await lan_run_python(lan, script, label="ipv4_df", timeout=15.0)
         assert r.rc == 0, f"injection failed: {r.stdout!r}"
 
     summary, _ = await asyncio.gather(

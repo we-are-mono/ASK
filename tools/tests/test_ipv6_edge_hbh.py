@@ -15,7 +15,6 @@ reflect DUT processing.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import textwrap
 
@@ -24,6 +23,7 @@ from _topology import (
     counter_signature,
     golden_for,
     ipv6_topology,  # noqa: F401  (fixture)
+    lan_run_python,
 )
 
 
@@ -54,12 +54,7 @@ async def test_ipv6_edge_hbh_options_tripwire(
     script = _INJECT_TEMPLATE.format(
         wan=WAN_IPV6, sport=TEST_SPORT, dport=TEST_DPORT,
     )
-    b64 = base64.b64encode(script.encode()).decode()
-    path = "/tmp/ask_ipv6_hbh.py"
-    r = lan.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert "OK" in r.stdout, f"stage failed: rc={r.rc}, {r.stdout!r}"
-
-    r = await asyncio.to_thread(lan.run, f"python3 {path}", 30.0)
+    r = await lan_run_python(lan, script, label="ipv6_hbh", timeout=30.0)
     assert r.rc == 0, f"injection failed: rc={r.rc}, out={r.stdout!r}"
     assert "INJECTED 3" in r.stdout, r.stdout
 

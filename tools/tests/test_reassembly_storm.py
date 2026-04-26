@@ -30,11 +30,12 @@ config of 128), which exercises context eviction under churn.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import textwrap
 
 import pytest
+
+from _topology import lan_run_python
 
 # ISSUES.md X3 calls out the broad ASK_KMEMLEAK_FILTER as too coarse:
 # `dpaa_eth_refill_bpools` allocations carry [cdx]/[auto_bridge] tags
@@ -105,20 +106,6 @@ def _storm_script(duplicate: bool) -> str:
     """).strip()
 
 
-def _push_script_to_lan(lan_console, script: str, path: str) -> None:
-    """Drop the scapy script onto the lan VM via UART using base64.
-
-    Base64 avoids any shell-escape landmine when the source contains
-    quotes / backslashes / non-printables. The serial write is one
-    blast followed by a `base64 -d` on the remote.
-    """
-    b64 = base64.b64encode(script.encode()).decode()
-    r = lan_console.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert r.rc == 0 and "OK" in r.stdout, (
-        f"failed to stage scapy script on lan: rc={r.rc}, out={r.stdout!r}"
-    )
-
-
 async def _run_storm(lan_console, duplicate: bool) -> str:
     """Fire the storm on lan via UART, return the script's stdout.
 
@@ -127,17 +114,13 @@ async def _run_storm(lan_console, duplicate: bool) -> str:
     exactly to satisfy this; on a fresh lan that hasn't been deployed
     to, run deploy-agent-lan first (or apt-get install python3-scapy
     by hand).
+
+    Scapy's pure-Python send() does ~10 kpps; worst case 30k frags
+    finishes in ~3 s, but the kernel PTY path adds its own slack.
     """
     script = _storm_script(duplicate=duplicate)
-    path = "/tmp/ask_reassembly_storm.py"
-    _push_script_to_lan(lan_console, script, path)
-
-    # Scapy's pure-Python send() does ~10 kpps; worst case 30k frags
-    # finishes in ~3 s, but the kernel PTY path adds its own slack.
-    # Budget generously but not absurdly.
-    r = await asyncio.to_thread(
-        lan_console.run, f"python3 {path}", 180.0
-    )
+    label = "reassembly_storm_dup" if duplicate else "reassembly_storm"
+    r = await lan_run_python(lan_console, script, label=label, timeout=180.0)
     assert r.rc == 0, f"storm script failed: rc={r.rc}, out={r.stdout!r}"
     assert "STORM_DONE" in r.stdout, f"storm did not finish: {r.stdout!r}"
     return r.stdout

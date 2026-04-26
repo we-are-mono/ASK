@@ -18,7 +18,6 @@ plan: malformed-packet parsers are precisely what KASAN catches.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import textwrap
 
@@ -28,6 +27,7 @@ from _topology import (
     assert_counter_signature,
     counter_signature,
     golden_for,
+    lan_run_python,
 )
 
 
@@ -69,12 +69,6 @@ def _injection_script(mutation: str, n: int) -> str:
     """).strip()
 
 
-def _stage_script(lan, body: str, path: str) -> None:
-    b64 = base64.b64encode(body.encode()).decode()
-    r = lan.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert "OK" in r.stdout, f"stage failed: rc={r.rc}, {r.stdout!r}"
-
-
 @pytest.mark.parametrize(
     "label,mutation,n",
     _VARIANTS,
@@ -90,9 +84,9 @@ async def test_ipv4_edge_malformed_tripwire(
     )
 
     script = _injection_script(mutation, n)
-    path = f"/tmp/ask_ipv4_malformed_{label}.py"
-    _stage_script(lan, script, path)
-    r = await asyncio.to_thread(lan.run, f"python3 {path}", 30.0)
+    r = await lan_run_python(
+        lan, script, label=f"ipv4_malformed_{label}", timeout=30.0,
+    )
     assert r.rc == 0, f"injection failed: rc={r.rc}, out={r.stdout!r}"
     assert f"INJECTED {n}" in r.stdout, r.stdout
 

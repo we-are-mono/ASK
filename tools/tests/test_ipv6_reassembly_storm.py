@@ -12,7 +12,6 @@ code path that 1e exercises, just exercised through the IPv6 path.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import textwrap
 
@@ -20,6 +19,7 @@ import pytest
 
 from _topology import (
     ipv6_topology,  # noqa: F401  (fixture)
+    lan_run_python,
 )
 
 
@@ -73,17 +73,10 @@ def _storm_script(duplicate: bool) -> str:
     """).strip()
 
 
-def _push_script(lan, body: str, path: str) -> None:
-    b64 = base64.b64encode(body.encode()).decode()
-    r = lan.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert "OK" in r.stdout, f"stage failed: rc={r.rc}, {r.stdout!r}"
-
-
 async def _run_storm(lan, duplicate: bool) -> str:
     script = _storm_script(duplicate=duplicate)
-    path = "/tmp/ask_ipv6_reassembly_storm.py"
-    _push_script(lan, script, path)
-    r = await asyncio.to_thread(lan.run, f"python3 {path}", 180.0)
+    label = "ipv6_storm_dup" if duplicate else "ipv6_storm"
+    r = await lan_run_python(lan, script, label=label, timeout=180.0)
     assert r.rc == 0, f"storm script failed: rc={r.rc}, out={r.stdout!r}"
     assert "STORM_DONE" in r.stdout, f"storm did not finish: {r.stdout!r}"
     return r.stdout

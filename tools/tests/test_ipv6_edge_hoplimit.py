@@ -9,7 +9,6 @@ the LAN-facing interface.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import textwrap
 
@@ -17,6 +16,7 @@ from _topology import (
     ICMP6_TIME_EXCEEDED,
     expect_icmp_egress,
     ipv6_topology,  # noqa: F401  (fixture)
+    lan_run_python,
 )
 
 
@@ -38,14 +38,10 @@ async def test_ipv6_edge_hoplimit_emits_time_exceeded(
     aiohttp_session, target_agent, lan, splat_window, ipv6_topology,
 ):
     script = _INJECT.format(wan=WAN_IPV6)
-    b64 = base64.b64encode(script.encode()).decode()
-    path = "/tmp/ask_ipv6_hlim1.py"
-    r = lan.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert "OK" in r.stdout, f"stage failed: rc={r.rc}, {r.stdout!r}"
 
     async def _inject():
         await asyncio.sleep(0.2)
-        r = await asyncio.to_thread(lan.run, f"python3 {path}", 15.0)
+        r = await lan_run_python(lan, script, label="ipv6_hlim1", timeout=15.0)
         assert r.rc == 0, f"injection failed: {r.stdout!r}"
 
     summary, _ = await asyncio.gather(

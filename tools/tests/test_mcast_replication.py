@@ -43,7 +43,6 @@ multicast filtered out by VLAN membership); tight UDP-port match.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import struct
 
@@ -51,6 +50,7 @@ import pytest
 import pytest_asyncio
 
 from _topology import (
+    lan_run_python,
     multi_listener_subifs,  # noqa: F401  (fixture, imported for resolution)
 )
 
@@ -403,14 +403,9 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
         f"!= src_target_if={src_target_if}"
     )
 
-    # Stage scapy on LAN VM for VLAN-tagged egress.
     script = _LAN_INJECT_TEMPLATE.format(
         dst=MCAST_DST_3C, port=MCAST_PORT, lan_if=src_lan_if,
     )
-    b64 = base64.b64encode(script.encode()).decode()
-    path = "/tmp/ask_mcast_lan_inject.py"
-    r = lan.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert "OK" in r.stdout, f"stage failed: rc={r.rc}, {r.stdout!r}"
 
     await asyncio.sleep(0.3)
 
@@ -424,7 +419,7 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
     )
     # Grace before injection so tcpdumps are listening.
     await asyncio.sleep(0.4)
-    r = await asyncio.to_thread(lan.run, f"python3 {path}", 15.0)
+    r = await lan_run_python(lan, script, label="mcast_vlan_inject", timeout=15.0)
     assert r.rc == 0, f"injection failed: {r.stdout!r}"
     # Wait for tcpdumps to self-terminate (window=2s + slack).
     await asyncio.sleep(2.0)

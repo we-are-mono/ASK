@@ -15,7 +15,6 @@ flagging it for human review.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import textwrap
 
@@ -25,6 +24,7 @@ from _topology import (
     assert_counter_signature,
     counter_signature,
     golden_for,
+    lan_run_python,
 )
 
 
@@ -60,14 +60,6 @@ def _injection_script(variant_expr: str, n: int) -> str:
     """).strip()
 
 
-def _push_script(lan, body: str, path: str) -> None:
-    b64 = base64.b64encode(body.encode()).decode()
-    r = lan.run(f"echo {b64} | base64 -d > {path} && echo OK", timeout=10)
-    assert r.rc == 0 and "OK" in r.stdout, (
-        f"failed to stage scapy script: rc={r.rc}, out={r.stdout!r}"
-    )
-
-
 @pytest.mark.parametrize(
     "label,variant_expr,n",
     _OPTION_VARIANTS,
@@ -84,10 +76,9 @@ async def test_ipv4_edge_options_tripwire(
     )
 
     script = _injection_script(variant_expr, n)
-    path = f"/tmp/ask_ipv4_opt_{label}.py"
-    _push_script(lan, script, path)
-
-    r = await asyncio.to_thread(lan.run, f"python3 {path}", 30.0)
+    r = await lan_run_python(
+        lan, script, label=f"ipv4_opt_{label}", timeout=30.0,
+    )
     assert r.rc == 0, f"injection failed: rc={r.rc}, out={r.stdout!r}"
     assert f"INJECTED {n}" in r.stdout, (
         f"injection script did not finish: {r.stdout!r}"

@@ -379,6 +379,42 @@ def _lan_run(lan, cmd: str, timeout: float = 10.0):
     return asyncio.to_thread(lan.run, cmd, timeout)
 
 
+async def lan_run_python(
+    lan,
+    script: str,
+    *,
+    timeout: float = 30.0,
+    label: str = "script",
+):
+    """Stage a Python script on the LAN VM via base64-over-UART, run it,
+    return the RunResult.
+
+    The script is written to a unique /tmp path so concurrent invocations
+    (or reruns within the same minute) don't collide. `label` is folded
+    into the path for debuggability — e.g. label="ipv4_options" produces
+    something like "/tmp/ask_lan_ipv4_options_<pid>_<usec>.py".
+
+    Single staging pattern across all Phase 2 LAN-injection tests so
+    callers don't reimplement the base64 boilerplate.
+    """
+    import base64
+    import time
+
+    path = f"/tmp/ask_lan_{label}_{os.getpid()}_{int(time.monotonic() * 1e6)}.py"
+    b64 = base64.b64encode(script.encode()).decode()
+
+    stage = lan.run(
+        f"echo {b64} | base64 -d > {path} && echo STAGED",
+        timeout=10,
+    )
+    if stage.rc != 0 or "STAGED" not in stage.stdout:
+        raise AssertionError(
+            f"failed to stage Python script on LAN at {path}: "
+            f"rc={stage.rc}, stdout={stage.stdout!r}"
+        )
+    return await asyncio.to_thread(lan.run, f"python3 {path}", timeout)
+
+
 # DUT and LAN IPv6 addresses for the Phase 2 IPv6 tests. Two ULA /64s
 # (fc00::/7 documentation/private space) — keeps routing self-contained
 # without needing real upstream IPv6 connectivity. ASK_WAN_IPV6 should
