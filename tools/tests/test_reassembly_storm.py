@@ -181,3 +181,96 @@ async def test_reassembly_fragment_storm(
         f"after {label} storm ({out.strip().splitlines()[-1]}):\n"
         + report.get("report", "")[:4000]
     )
+
+
+# --- Phase 2 item 1e: fragmentation under concurrent live traffic ---------
+#
+# Liveness-only oracle: iperf3 must complete and report non-zero
+# throughput. No Mbps SLA — throughput baselines are deferred to
+# Phase 4 (the roadmap explicitly defers them pending a noise-floor
+# study). The signal here is "the storm doesn't kill the offload path
+# entirely", not "throughput stays at X".
+
+import re as _re
+
+_IPERF_RX_RE = _re.compile(
+    r"^\[\s*\d+\]\s+[\d.]+-[\d.]+\s+sec\s+[\d.]+\s[KMGT]?Bytes\s+([\d.]+)\s+([KMG]?)bits/sec",
+    _re.M,
+)
+_IPERF_DURATION_S = int(os.environ.get("ASK_IPERF_DURATION", "5"))
+
+
+def _iperf_receiver_bps(log: str) -> float | None:
+    matches = _IPERF_RX_RE.findall(log)
+    if not matches:
+        return None
+    val, unit = matches[-1]
+    scale = {"": 1.0, "K": 1e3, "M": 1e6, "G": 1e9}.get(unit, 0.0)
+    return float(val) * scale
+
+
+async def test_reassembly_storm_with_concurrent_iperf(
+    aiohttp_session, target_agent, lan, splat_window,
+):
+    """Fragment storm AND iperf3 in parallel through the DUT.
+
+    The storm exercises FMAN reassembly (memory-class). iperf3 exercises
+    the offloaded fast path. Running both at once verifies the
+    interleave doesn't collapse the offload path entirely (liveness)
+    and doesn't introduce splats or leaks (correctness).
+
+    KASAN-eligible per the Phase 2 plan: the fragment pool kmallocs in
+    cdx/cdx_reassm.c are exactly what KASAN catches.
+    """
+    await target_agent.kmemleak_clear(aiohttp_session)
+
+    # Unique per-test-invocation log path — avoids collisions across
+    # reruns within the same minute.
+    log_path = f"/tmp/iperf-storm-{os.getpid()}-{int(asyncio.get_event_loop().time() * 1e6)}.log"
+
+    # Launch iperf3 in the background; the UART command returns
+    # immediately due to the trailing `&`. iperf3 then runs on the LAN
+    # VM concurrently with the storm. We do NOT run two UART commands
+    # at once — that would interleave on the serial channel and
+    # corrupt the marker-based exit detection (per Phase 2 plan
+    # §Risks #1).
+    await asyncio.to_thread(
+        lan.run,
+        f"nohup iperf3 -c {WAN_IPERF_IP} -t {_IPERF_DURATION_S} "
+        f"> {log_path} 2>&1 & echo started",
+    )
+    # Brief warm-up so the TCP handshake completes before fragments
+    # start hammering the reassembly pool.
+    await asyncio.sleep(0.5)
+
+    # Storm runs synchronously on the UART. iperf3 keeps running in
+    # parallel as a backgrounded LAN process.
+    storm_out = await _run_storm(lan, duplicate=False)
+
+    # The storm typically takes several seconds; ensure iperf3 has
+    # finished before we read its log.
+    await asyncio.sleep(2.0)
+    log_result = await asyncio.to_thread(lan.run, f"cat {log_path}")
+    iperf_log = log_result.stdout
+
+    # iperf3 must have completed and reported non-zero throughput.
+    bps = _iperf_receiver_bps(iperf_log)
+    assert bps is not None, (
+        f"iperf3 summary missing during concurrent storm; log:\n{iperf_log}"
+    )
+    assert bps > 0, (
+        f"iperf3 reported zero throughput during concurrent fragment "
+        f"storm — offload path collapsed. log tail:\n"
+        + "\n".join(iperf_log.splitlines()[-10:])
+    )
+
+    # kmemleak grace then scan, same shape as the standalone variant.
+    await asyncio.sleep(3.0)
+    report = await target_agent.kmemleak(
+        aiohttp_session, filter_substrs=REASSM_LEAK_FILTER,
+    )
+    assert report.get("leak_count", 0) == 0, (
+        f"kmemleak found {report['leak_count']} new leak(s) after "
+        f"storm+iperf concurrent run ({storm_out.strip().splitlines()[-1]}):\n"
+        + report.get("report", "")[:4000]
+    )

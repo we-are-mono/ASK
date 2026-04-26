@@ -64,6 +64,16 @@ def target_agent():
     return client.TARGET
 
 
+@pytest.fixture(scope="session")
+def lan_agent():
+    """LAN-side askd-agent. Same Agent class as target_agent, just
+    pointed at $ASK_LAN_IP. Used by Phase 2 mcast replication tests
+    that need parallel tcpdump captures across N listener subifs —
+    the UART console is a single serial channel and can't run
+    concurrent commands."""
+    return client.LAN
+
+
 # Loaded once per session. An expired entry raises here, failing the suite
 # at collection rather than letting a stale suppressor mask a regression.
 @pytest.fixture(scope="session")
