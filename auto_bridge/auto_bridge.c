@@ -20,8 +20,8 @@
 #include <linux/timer.h>
 #include <linux/time.h>
 #include <linux/if_ether.h>
-#include <linux/jhash.h>
 #include <linux/list.h>
+#include <linux/random.h>
 #include <linux/netfilter_bridge.h>
 #include <net/net_namespace.h>
 #include <linux/netfilter.h>
@@ -123,6 +123,13 @@ struct list_head			bridge_list_rtevent;
 static struct kmem_cache		*l2flow_cache /*__read_mostly*/;
 static struct kmem_cache		*brroute_cache /*__read_mostly*/;
 static struct sock			*abm_nl = NULL;
+
+/* Per-boot key used by abm_l2flow_hash{,_mac} (declared extern in
+ * auto_bridge_private.h). Initialized at the top of abm_init below
+ * with get_random_bytes() — must run before any caller of those
+ * inline helpers, which means before br_fdb_register_can_expire_cb. */
+siphash_key_t abm_l2flow_hash_key;
+
 /* Declared `int` to match the sysctl wiring at abm_sysctl_table[]
  * (`.maxlen = sizeof(unsigned int)`) and abm_sysctl_l3_filtering's
  * 4-byte `int *valp; int val = *valp;` reads. The pre-fix `char`
@@ -1647,6 +1654,13 @@ static int abm_init(void)
 	int rc = 0;
 
 	printk(KERN_DEBUG "Initializing Automatic bridging module v%s\n", auto_bridge_version);
+
+	/* Randomize the L2-flow hash key before anything that might
+	 * call abm_l2flow_hash{,_mac}. The fdb-can-expire callback
+	 * registered below is the first such caller, so this has to
+	 * land here, not later in the cascade. */
+	get_random_bytes(&abm_l2flow_hash_key, sizeof(abm_l2flow_hash_key));
+
 	if((kabm_wq = create_singlethread_workqueue("abm_wq")) == NULL){
 		rc = -ENOMEM;
 		ABM_PRINT(KERN_ERR, "Automatic bridging module error creating wq rc = %d \n", rc);

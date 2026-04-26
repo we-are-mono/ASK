@@ -14,8 +14,20 @@
 #ifndef _AUTO_BRIDGE_PRIVATE_H
 #define _AUTO_BRIDGE_PRIVATE_H
 
+#include <linux/siphash.h>
+
 #define L2FLOW_HASH_TABLE_SIZE		1024
 #define L2FLOW_HASH_BY_MAC_TABLE_SIZE 	128
+
+/* Per-boot key for L2-flow hashing, randomized in abm_init via
+ * get_random_bytes(). The previous fixed-seed jhash was fine for
+ * uniform distribution but offered no collision-resistance against
+ * an adversary who can craft L2 flows offline (the seed was a
+ * compile-time constant). siphash with a per-boot key forces every
+ * attacker to start from scratch on every boot, raising the cost
+ * of pinning a hash bucket from "preimage in software" to
+ * "observe-by-side-channel-and-recompute". */
+extern siphash_key_t abm_l2flow_hash_key;
 
 #define ABM_DEFAULT_MAX_ENTRIES		5000
 
@@ -138,12 +150,14 @@ static inline void print_l2flow(struct l2flow *l2flowtmp)
 }
 
 static inline unsigned int abm_l2flow_hash(struct l2flow *l2flowtmp)
-{	
-	return (jhash(l2flowtmp, sizeof(struct l2flow), 0x12345678) & (L2FLOW_HASH_TABLE_SIZE - 1));
+{
+	return (siphash(l2flowtmp, sizeof(struct l2flow), &abm_l2flow_hash_key)
+	        & (L2FLOW_HASH_TABLE_SIZE - 1));
 }
 static inline unsigned int abm_l2flow_hash_mac(char *src_mac)
-{	
-	return (jhash(src_mac, ETH_ALEN, 0x12345678) & (L2FLOW_HASH_BY_MAC_TABLE_SIZE - 1));
+{
+	return (siphash(src_mac, ETH_ALEN, &abm_l2flow_hash_key)
+	        & (L2FLOW_HASH_BY_MAC_TABLE_SIZE - 1));
 }
 
 static inline int abm_l2flow_cmp(struct l2flow *flow_a, struct l2flow *flow_b);
