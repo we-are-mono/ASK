@@ -47,6 +47,14 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
 # the image stays fast (~13 MB smaller, ~60% faster suite).
 KASAN ??= "0"
 
+# Make KASAN's value part of do_configure's task hash. Without this,
+# bitbake's signature for the configure step doesn't notice when KASAN
+# flips between runs, and we get a stale (cached) .config from the
+# previous mode — silently producing a non-instrumented kernel under
+# `KASAN=1 kas build`. Listing it as a vardep forces a re-configure
+# whenever the value changes.
+do_configure[vardeps] += "KASAN"
+
 S = "${WORKDIR}/git"
 
 # The ASK bundle is shared with Armbian which strips Upstream-Status headers;

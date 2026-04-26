@@ -34,6 +34,18 @@ repos:
 target:
   - ask-image
 
+# Whitelist env vars kas passes through to bitbake. BitBake imports
+# env *before* parsing local.conf, so a `BB_ENV_PASSTHROUGH_ADDITIONS`
+# set inside local_conf_header is too late — by then env-import has
+# already happened with the default whitelist and KASAN has been
+# dropped (defaulting to KASAN ??= "0" in linux-ask_6.12.bb). Listing
+# it in kas's `env:` block makes kas inject it into the bitbake env
+# *and* add it to BB_ENV_PASSTHROUGH_ADDITIONS before bitbake starts.
+# Default value "" so unset → recipe sees "" → falsy → image stays
+# non-instrumented; `KASAN=1 kas build .config.yaml` flips it on.
+env:
+  KASAN: ""
+
 local_conf_header:
   site: |
     require ${TOPDIR}/../site.conf
@@ -41,10 +53,3 @@ local_conf_header:
     # This is a dev/test image — skip SBOM generation to avoid SPDX
     # task failures on externalsrc recipes and shave build time.
     INHERIT:remove = "create-spdx"
-  kasan: |
-    # Pass through the KASAN env var so `KASAN=1 kas build .config.yaml`
-    # reaches linux-ask_6.12.bb's do_configure:append, which conditionally
-    # layers ask-kasan.cfg over ask.cfg. Default builds (KASAN unset)
-    # produce a fast non-instrumented image; KASAN=1 produces the
-    # sanitiser-instrumented one for periodic deep sweeps.
-    BB_ENV_PASSTHROUGH_ADDITIONS:append = " KASAN"

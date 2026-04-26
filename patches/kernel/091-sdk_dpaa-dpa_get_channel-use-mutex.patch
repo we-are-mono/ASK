@@ -1,6 +1,10 @@
-From: Mono Gateway ASK <noreply@example.com>
-Date: Tue, 21 Apr 2026 00:00:00 +0000
+From f48a9f334f3873939dffc316ef0bf36925d4ba17 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] net: dpaa: dpa_get_channel: use mutex not spinlock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 dpa_get_channel() takes a spinlock around a qman_alloc_pool() call that
 can sleep (it goes through dpa_alloc_new → kmalloc(GFP_KERNEL)). This
@@ -19,7 +23,11 @@ genuinely deadlock.
 
 No functional change beyond dropping preempt-disable across the alloc.
 
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_common.c    | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 index c4db971a4f97..7191856e3424 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
@@ -52,3 +60,6 @@ index c4db971a4f97..7191856e3424 100644
  	if (!rx_pool_channel)
  		return -ENOMEM;
  	return rx_pool_channel;
+-- 
+2.47.3
+

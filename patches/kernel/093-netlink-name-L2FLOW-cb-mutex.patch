@@ -1,6 +1,11 @@
-From: Mono Gateway ASK <noreply@example.com>
-Date: Tue, 21 Apr 2026 00:00:00 +0000
-Subject: [PATCH] netlink: name NETLINK_KEY and NETLINK_L2FLOW in cb_mutex string table
+From bfba753e663ad8d15f1289d9fcea1b5d91f93f08 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sat, 25 Apr 2026 17:55:41 +0200
+Subject: [PATCH] netlink: name NETLINK_KEY and NETLINK_L2FLOW in cb_mutex
+ string table
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 The nlk_cb_mutex_key_strings[] array is declared sized [MAX_LINKS + 1]
 (65 entries with MAX_LINKS=64) but only initialized for indices 0..32,
@@ -23,7 +28,11 @@ at index 33.
 This only affects lockdep trace readability and the DEBUG_LOCKS_WARN_ON
 above — no functional change.
 
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
+ net/netlink/af_netlink.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
 diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
 index 8b060465a2be..5fa41e9e22da 100644
 --- a/net/netlink/af_netlink.c
@@ -37,3 +46,6 @@ index 8b060465a2be..5fa41e9e22da 100644
  	"nlk_cb_mutex-MAX_LINKS"
  };
  
+-- 
+2.47.3
+

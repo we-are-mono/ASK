@@ -1,6 +1,10 @@
-From: Mono Gateway ASK <noreply@example.com>
-Date: Tue, 21 Apr 2026 00:00:00 +0000
+From ab4ef45511daf90e3adf4314a9166677048946e9 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sat, 25 Apr 2026 17:55:41 +0200
 Subject: [PATCH] sdk_fman: annotate FmPcdLockTryLockAll inner lock as nested
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Every FMAN spinlock is allocated via XX_InitSpinlock(), which means they
 all share the same lockdep class. FmPcdLockTryLockAll() takes an outer
@@ -30,7 +34,14 @@ class) would require making XX_InitSpinlock() assign per-call-site keys,
 which is a larger refactor. This minimal change eliminates the warning
 at the single site known to nest.
 
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
+ .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.c      |  8 ++++++-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.h      | 22 +++++++++++++++++++
+ .../ethernet/freescale/sdk_fman/inc/xx_ext.h  | 18 +++++++++++++++
+ .../freescale/sdk_fman/src/xx/xx_arm_linux.c  |  7 ++++++
+ 4 files changed, 54 insertions(+), 1 deletion(-)
+
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 index b86860b387aa..a20088a0bf77 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
@@ -130,3 +141,6 @@ index a5fa28b4c998..3369f857d6f5 100644
  void XX_UnlockIntrSpinlock(t_Handle h_Spinlock, uint32_t intrFlags)
  {
       spin_unlock_irqrestore((spinlock_t *)h_Spinlock, (unsigned long)intrFlags);
+-- 
+2.47.3
+
