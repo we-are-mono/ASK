@@ -456,7 +456,7 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 		t_FmPcdCcNextEngineParams miss_engine_params;
 		memset(&miss_engine_params, 0, sizeof(t_FmPcdCcNextEngineParams));
 #ifdef DPA_CFG_DEBUG
-		DPA_INFO("%s::tbl %s %p changing miss action\n", __func__,
+		DPA_INFO("%s::tbl %s %pK changing miss action\n", __func__,
 				tbl_info->name, tbl_info->id);
 #endif
 #ifndef CDX_RTP_RELAY // if no RTP relay setting of miss-action is same for all tables
@@ -572,7 +572,7 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 			}
 			miss_engine_params.nextEngine = e_FM_PCD_KG;
 #ifdef CDX_DPA_DEBUG
-			DPA_INFO("%s::changing miss action table %s as KG scheme %p\n",
+			DPA_INFO("%s::changing miss action table %s as KG scheme %pK\n",
 					__func__, tbl_info->name,
 					miss_engine_params.params.kgParams.h_DirectScheme);
 #endif
