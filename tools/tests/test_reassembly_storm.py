@@ -35,7 +35,7 @@ import textwrap
 
 import pytest
 
-from _topology import lan_run_python
+from _topology import lan_run, lan_run_python
 
 # ISSUES.md X3 calls out the broad ASK_KMEMLEAK_FILTER as too coarse:
 # `dpaa_eth_refill_bpools` allocations carry [cdx]/[auto_bridge] tags
@@ -217,8 +217,8 @@ async def test_reassembly_storm_with_concurrent_iperf(
     # at once — that would interleave on the serial channel and
     # corrupt the marker-based exit detection (per Phase 2 plan
     # §Risks #1).
-    await asyncio.to_thread(
-        lan.run,
+    await lan_run(
+        lan,
         f"nohup iperf3 -c {WAN_IPERF_IP} -t {_IPERF_DURATION_S} "
         f"> {log_path} 2>&1 & echo started",
     )
@@ -233,7 +233,7 @@ async def test_reassembly_storm_with_concurrent_iperf(
     # The storm typically takes several seconds; ensure iperf3 has
     # finished before we read its log.
     await asyncio.sleep(2.0)
-    log_result = await asyncio.to_thread(lan.run, f"cat {log_path}")
+    log_result = await lan_run(lan, f"cat {log_path}")
     iperf_log = log_result.stdout
 
     # iperf3 must have completed and reported non-zero throughput.

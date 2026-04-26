@@ -33,6 +33,7 @@ from _topology import (
     LAN_NIC,
     VLAN_IDS_BRIDGE,
     bridge_with_n_ports,  # noqa: F401  (fixture)
+    lan_run,
 )
 
 
@@ -66,11 +67,9 @@ async def test_abm_port_flap_no_splat_no_leak(
 
     # Set up LAN-side vlan231 with an IP in the bridge subnet, so its
     # tagged egress ingresses on eth4.231 (a bridge port) on the DUT.
-    await asyncio.to_thread(
-        lan.run, f"ip link del {LAN_BRIDGE_IF} 2>/dev/null", 5.0,
-    )
-    r = await asyncio.to_thread(
-        lan.run,
+    await lan_run(lan, f"ip link del {LAN_BRIDGE_IF} 2>/dev/null", 5.0)
+    r = await lan_run(
+        lan,
         f"ip link add link {LAN_NIC} name {LAN_BRIDGE_IF} "
         f"type vlan id {PRIMARY_VID} && "
         f"ip addr add {LAN_SELF_IP}/24 dev {LAN_BRIDGE_IF} && "
@@ -83,8 +82,8 @@ async def test_abm_port_flap_no_splat_no_leak(
     # kernel sends ARP requests forever (broadcast on vlan231) — those
     # are exactly the frames the bridge floods, populating l2flow.
     # Foreground until the cleanup, killed via pkill.
-    await asyncio.to_thread(
-        lan.run,
+    await lan_run(
+        lan,
         f"nohup ping -I {LAN_BRIDGE_IF} -i 0.01 -W 0.1 -q "
         f"{LAN_TARGET_IP} > /tmp/abm_flap_ping.log 2>&1 & echo started",
         5.0,
@@ -124,9 +123,7 @@ async def test_abm_port_flap_no_splat_no_leak(
             + report.get("report", "")[:4000]
         )
     finally:
-        await asyncio.to_thread(
-            lan.run, f"pkill -f 'ping -I {LAN_BRIDGE_IF}' 2>/dev/null", 5.0,
+        await lan_run(
+            lan, f"pkill -f 'ping -I {LAN_BRIDGE_IF}' 2>/dev/null", 5.0,
         )
-        await asyncio.to_thread(
-            lan.run, f"ip link del {LAN_BRIDGE_IF} 2>/dev/null", 5.0,
-        )
+        await lan_run(lan, f"ip link del {LAN_BRIDGE_IF} 2>/dev/null", 5.0)

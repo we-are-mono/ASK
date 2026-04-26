@@ -11,6 +11,8 @@ import asyncio
 import os
 import re
 
+from _topology import lan_run
+
 
 WAN_IPERF_IP     = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
 IPERF_DURATION_S = int(os.environ.get("ASK_IPERF_DURATION", "5"))
@@ -47,10 +49,8 @@ async def test_iperf_ipv4_tcp_offload(
     baseline = await target_agent.cmm_query(aiohttp_session, "connections")
     baseline_count = _flow_count(baseline)
 
-    # Console.run is blocking — shove it onto a thread so we don't stall
-    # the event loop during the ~0.5s UART round-trip.
-    await asyncio.to_thread(
-        lan.run,
+    await lan_run(
+        lan,
         f"nohup iperf3 -c {WAN_IPERF_IP} -t {IPERF_DURATION_S} "
         f"> /tmp/iperf.log 2>&1 & echo started",
     )
@@ -66,7 +66,7 @@ async def test_iperf_ipv4_tcp_offload(
 
     # Wait for iperf to finish, then fetch the result.
     await asyncio.sleep(IPERF_DURATION_S + 1)
-    log_result = await asyncio.to_thread(lan.run, "cat /tmp/iperf.log")
+    log_result = await lan_run(lan, "cat /tmp/iperf.log")
     gbps = _iperf_receiver_gbps(log_result.stdout)
     assert gbps is not None, f"iperf summary missing; log:\n{log_result.stdout}"
     assert gbps >= OFFLOAD_MIN_GBPS, (

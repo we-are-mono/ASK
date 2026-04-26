@@ -372,11 +372,15 @@ async def dut_egress_mtu(target_agent, aiohttp_session):
                 warnings.warn(f"failed to restore MTU on {iface}: {e}")
 
 
-def _lan_run(lan, cmd: str, timeout: float = 10.0):
-    """Synchronous LAN console call wrapped for asyncio. Console.run is
-    blocking on serial I/O — bounce through to_thread so we don't stall
-    the event loop."""
-    return asyncio.to_thread(lan.run, cmd, timeout)
+async def lan_run(lan, cmd: str, timeout: float = 10.0):
+    """Async wrapper around `Console.lan().run(...)`.
+
+    `Console.run` is blocking on serial I/O — bounce through
+    `asyncio.to_thread` so concurrent async work isn't stalled while
+    the UART round-trip is in flight. Use this from any async test
+    body or fixture; sync-only helpers can call `lan.run` directly.
+    """
+    return await asyncio.to_thread(lan.run, cmd, timeout)
 
 
 async def lan_run_python(
@@ -394,8 +398,8 @@ async def lan_run_python(
     into the path for debuggability — e.g. label="ipv4_options" produces
     something like "/tmp/ask_lan_ipv4_options_<pid>_<usec>.py".
 
-    Single staging pattern across all Phase 2 LAN-injection tests so
-    callers don't reimplement the base64 boilerplate.
+    Single staging pattern across all LAN-injection tests so callers
+    don't reimplement the base64 boilerplate.
     """
     import base64
     import time
@@ -412,7 +416,7 @@ async def lan_run_python(
             f"failed to stage Python script on LAN at {path}: "
             f"rc={stage.rc}, stdout={stage.stdout!r}"
         )
-    return await asyncio.to_thread(lan.run, f"python3 {path}", timeout)
+    return await lan_run(lan, f"python3 {path}", timeout)
 
 
 # DUT and LAN IPv6 addresses for the Phase 2 IPv6 tests. Two ULA /64s
@@ -451,7 +455,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         return await target_agent.exec_cmd(aiohttp_session, list(argv))
 
     async def _lan(cmd: str, timeout_s: float = 5.0):
-        return await asyncio.to_thread(lan.run, cmd, timeout_s)
+        return await lan_run(lan, cmd, timeout_s)
 
     try:
         # ---- DUT sysctl: enable IPv6 forwarding ----
@@ -560,7 +564,7 @@ async def multi_listener_subifs(aiohttp_session, target_agent, lan):
 
     async def _push_lan_cleanup(iface: str) -> None:
         async def _cleanup():
-            await _lan_run(lan, f"ip link del {iface} 2>/dev/null", 5.0)
+            await lan_run(lan, f"ip link del {iface} 2>/dev/null", 5.0)
         cleanups.append(_cleanup)
 
     listeners: list[tuple[str, str, int]] = []
@@ -573,7 +577,7 @@ async def multi_listener_subifs(aiohttp_session, target_agent, lan):
             await target_agent.exec_cmd(
                 aiohttp_session, ["ip", "link", "del", target_if],
             )
-            await _lan_run(lan, f"ip link del {lan_if} 2>/dev/null", 5.0)
+            await lan_run(lan, f"ip link del {lan_if} 2>/dev/null", 5.0)
 
             # Target side
             r = await target_agent.exec_cmd(aiohttp_session, [
@@ -589,7 +593,7 @@ async def multi_listener_subifs(aiohttp_session, target_agent, lan):
             assert r["rc"] == 0, f"target vlan up {target_if}: {r}"
 
             # LAN side
-            res = await _lan_run(
+            res = await lan_run(
                 lan,
                 f"ip link add link {LAN_NIC} name {lan_if} "
                 f"type vlan id {vid} && ip link set {lan_if} up",

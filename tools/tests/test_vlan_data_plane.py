@@ -34,6 +34,8 @@ import re
 import pytest
 import pytest_asyncio
 
+from _topology import lan_run
+
 
 LAN_NIC           = os.environ.get("ASK_LAN_NIC",       "enp4s0")
 TARGET_LAN_IF     = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
@@ -142,8 +144,8 @@ async def test_vlan_tagged_flow_offloaded(
     baseline_count = _flow_count(baseline)
 
     # iperf3 picks up our /32 route automatically — no -B needed.
-    await asyncio.to_thread(
-        lan.run,
+    await lan_run(
+        lan,
         f"nohup iperf3 -c {WAN_IPERF_IP} -t {IPERF_DURATION_S} "
         f"> /tmp/iperf-vlan.log 2>&1 & echo started",
     )
@@ -158,7 +160,7 @@ async def test_vlan_tagged_flow_offloaded(
     )
 
     await asyncio.sleep(IPERF_DURATION_S + 1)
-    log_result = await asyncio.to_thread(lan.run, "cat /tmp/iperf-vlan.log")
+    log_result = await lan_run(lan, "cat /tmp/iperf-vlan.log")
     gbps = _iperf_receiver_gbps(log_result.stdout)
     assert gbps is not None, (
         f"iperf3 summary missing from log:\n{log_result.stdout}"
