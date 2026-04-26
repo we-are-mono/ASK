@@ -37,6 +37,7 @@
 #include "control_pppoe.h"
 #include "control_socket.h"
 #include "module_rtp_relay.h"
+#include "procfs.h"
 
 //#define CDX_IPR_DEBUG 1
 
@@ -84,6 +85,15 @@ static struct port_bman_pool_info reassly_frag_parent_pool_info;
 struct dpa_bp *ipr_frag_bp;
 //reassmebly timer tick task
 static struct task_struct *ipr_timer_thread;
+
+/* Private IPR FQ tracking for module-unload teardown.
+ * cdx_create_ipr_fq() also push-registers each FQ on the shared
+ * dpa_pcd_fq list (for cross-subsystem duplicate detection), but
+ * that list has no remove API and mixes IPR with eth-PCD entries
+ * created in devman.c, so we keep our own pointer array here. */
+static struct dpa_fq **ipr_fqs;
+static uint32_t ipr_num_fqs;
+static uint32_t ipr_fqid_base;
 
 
 //IP reassembly timer frequency
@@ -229,6 +239,41 @@ static enum qman_cb_dqrr_result __hot ipr_buff_release_dqrr(
 }
 
 
+/* Tear down everything cdx_create_ipr_fq() built. Called both from
+ * the init err-path (mid-loop failure or post-create ehash-table
+ * setup failure) and from cdx_deinit_ip_reassembly() on unload.
+ * Idempotent: safe to call when ipr_fqs is NULL. */
+static void cdx_destroy_ipr_fqs(void)
+{
+	uint32_t ii;
+
+	if (!ipr_fqs)
+		return;
+	for (ii = 0; ii < ipr_num_fqs; ii++) {
+		struct qman_fq *fq;
+
+		if (!ipr_fqs[ii])
+			continue;
+		fq = &ipr_fqs[ii]->fq_base;
+		if (qman_retire_fq(fq, NULL))
+			DPA_ERROR("%s::failed to retire fqid %d\n",
+					__func__, fq->fqid);
+		if (qman_oos_fq(fq))
+			DPA_ERROR("%s::failed to oos fqid %d\n",
+					__func__, fq->fqid);
+		cdx_remove_fqid_info_in_procfs(fq->fqid);
+		qman_destroy_fq(fq, 0);
+		kfree(ipr_fqs[ii]);
+		ipr_fqs[ii] = NULL;
+	}
+	if (ipr_num_fqs)
+		qman_release_fqid_range(ipr_fqid_base, ipr_num_fqs);
+	kfree(ipr_fqs);
+	ipr_fqs = NULL;
+	ipr_num_fqs = 0;
+	ipr_fqid_base = 0;
+}
+
 static int cdx_create_ipr_fq(uint32_t *base_fqid)
 {
 	uint32_t ii;
@@ -259,7 +304,7 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 		CDX_IPR_DPRINT("%d ", portal_channel[ii]);
 	CDX_IPR_DPRINT("\n");
 #endif
-	if (qman_alloc_fqid_range(&fqid_base, num_portals, num_portals, 0) 
+	if (qman_alloc_fqid_range(&fqid_base, num_portals, num_portals, 0)
 			!= num_portals) {
 		DPA_ERROR("%s::unable to get ipr fqids\n",
 				__func__);
@@ -269,6 +314,15 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 	CDX_IPR_DPRINT("%s::fqid_base %x(%d), num %d\n",
 			__func__, fqid_base, fqid_base, num_portals);
 #endif
+	ipr_fqs = kcalloc(num_portals, sizeof(*ipr_fqs), GFP_KERNEL);
+	if (!ipr_fqs) {
+		DPA_ERROR("%s::no mem for ipr fq tracking\n", __func__);
+		qman_release_fqid_range(fqid_base, num_portals);
+		return -1;
+	}
+	ipr_fqid_base = fqid_base;
+	ipr_num_fqs = num_portals;
+
 	//create fqs
 	fqid = fqid_base;
 	for (ii = 0; ii < num_portals; ii++) {
@@ -277,9 +331,9 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 			if (!dpa_fq) {
 				DPA_ERROR("%s::unable to alloc mem for "
 						"fqid %d\n", __func__, fqid);
+				cdx_destroy_ipr_fqs();
 				return -1;
 			}
-			memset(dpa_fq, 0, sizeof(struct dpa_fq));
 			dpa_fq->fqid = fqid;
 			dpa_fq->fq_type = FQ_TYPE_RX_PCD;
 			//round robin channel ids
@@ -288,30 +342,32 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 				next_portal_ch_idx = 0;
 			else
 				next_portal_ch_idx++;
-			//use ipr release callback 
+			//use ipr release callback
 			dpa_fq->fq_base.cb.dqrr = ipr_buff_release_dqrr;
 			//create PCD FQ
 			if (cdx_create_fq(dpa_fq, 0, NULL)) {
 				DPA_ERROR("%s::cdx_create_fq failed for "
 						"fqid %d\n", __func__, fqid);
 				kfree(dpa_fq);
+				cdx_destroy_ipr_fqs();
 				return -1;
 			}
+			ipr_fqs[ii] = dpa_fq;
 			add_pcd_fq_info(dpa_fq);
 #ifdef DEVMAN_DEBUG
-			CDX_IPR_DPRINT("%s::fqid 0x%x created chnl 0x%x\n", 
+			CDX_IPR_DPRINT("%s::fqid 0x%x created chnl 0x%x\n",
 					__func__, fqid, dpa_fq->channel);
 #endif
-		} 
+		}
 #ifdef DEVMAN_DEBUG
 		else {
-			CDX_IPR_DPRINT("%s::fqid 0x%x already created\n", 
+			CDX_IPR_DPRINT("%s::fqid 0x%x already created\n",
 					__func__, fqid);
 		}
 #endif
 		fqid++;
 	}
-	*base_fqid = fqid_base; 
+	*base_fqid = fqid_base;
 	return num_portals;
 }
 
@@ -430,21 +486,18 @@ static void free_ipr_bpool(struct dpa_bp **bp_slot)
 static void cdx_deinit_ip_reassembly(void)
 {
 	/* Undo the acquisitions from cdx_init_ip_reassembly() in reverse.
-	 *
-	 * We can't currently retire the IPR FQs allocated via
-	 * cdx_create_ipr_fq(): they were added to the shared dpa_pcd_fq
-	 * list in dpa_cfg.c with no IPR-specific tag, so we can't
-	 * identify them from here. qman_retire_fq + qman_oos_fq +
-	 * qman_destroy_fq per FQ would be needed to fully unwind; this
-	 * is tracked as a residual TODO. Not a UAF vector on unload
-	 * because the whole cdx module is going down together with the
-	 * FQs' callback code. */
+	 * Replenish hook off first so no new fragments arrive, kthread
+	 * stop so timer-driven walks are quiescent, then retire/oos/
+	 * destroy each IPR FQ (qman_retire waits for in-flight dqrr to
+	 * drain), then bpools — by that point both fq pipelines are oos
+	 * so no buffers are stranded in fq state. */
 	register_dpaa_eth_bpool_replenish_hook(NULL);
 
 	if (ipr_timer_thread && !IS_ERR(ipr_timer_thread)) {
 		kthread_stop(ipr_timer_thread);
 		ipr_timer_thread = NULL;
 	}
+	cdx_destroy_ipr_fqs();
 	free_ipr_bpool(&ipr_frag_bp);
 	free_ipr_bpool(&reassly_bp);
 }
@@ -533,7 +586,7 @@ int cdx_init_ip_reassembly(void)
 		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n",
 				__func__);
 		ret = -1;
-		goto err_free_frag_bp;
+		goto err_destroy_ipr_fqs;
 	}
 	if (ExternalHashSetReasslyPool(IPV6_REASSM_TABLE ,
 				reassly_bp->bpid,
@@ -545,13 +598,15 @@ int cdx_init_ip_reassembly(void)
 		DPA_ERROR("%s::unable to set bpid for IPV4_REASSM_TABLE\n",
 				__func__);
 		ret = -1;
-		goto err_free_frag_bp;
+		goto err_destroy_ipr_fqs;
 	}
 	//register hook to replenish frag buffer pool
 	register_dpaa_eth_bpool_replenish_hook(replenish_ipr_frag_pool);
 	register_cdx_deinit_func(cdx_deinit_ip_reassembly);
 	return 0;
 
+err_destroy_ipr_fqs:
+	cdx_destroy_ipr_fqs();
 err_free_frag_bp:
 	free_ipr_bpool(&ipr_frag_bp);
 err_stop_kthread:
