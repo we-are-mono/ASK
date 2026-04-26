@@ -372,6 +372,135 @@ async def dut_egress_mtu(target_agent, aiohttp_session):
                 warnings.warn(f"failed to restore MTU on {iface}: {e}")
 
 
+# ---- 3. composable topology primitives ----------------------------------
+
+class TopologyStack:
+    """Per-fixture LIFO of teardown callables.
+
+    Pushes happen as each setup step succeeds; the matching `teardown()`
+    walks the stack in reverse so a partial setup tears down only what
+    actually came up. Failures during teardown emit a warning rather
+    than raising — one cleanup failure shouldn't mask the rest.
+    """
+
+    def __init__(self) -> None:
+        self._cleanups: list[Callable[[], Awaitable[None]]] = []
+
+    def push(self, cleanup: Callable[[], Awaitable[None]]) -> None:
+        self._cleanups.append(cleanup)
+
+    async def teardown(self, label: str = "topology") -> None:
+        for c in reversed(self._cleanups):
+            try:
+                await c()
+            except Exception as e:
+                warnings.warn(f"{label} cleanup failed: {e}")
+
+
+async def dut_vlan_subif(
+    stack: TopologyStack,
+    target_agent,
+    session: aiohttp.ClientSession,
+    *,
+    parent: str,
+    vid: int,
+    name: str | None = None,
+    ipv4: str | None = None,
+    ipv6: str | None = None,
+    master: str | None = None,
+) -> str:
+    """Create a VLAN subif on the DUT, push its cleanup onto `stack`,
+    return the iface name.
+
+    `name` defaults to `f"{parent}.{vid}"`. `ipv4`/`ipv6` are CIDR
+    strings (e.g. "192.168.100.1/24"). `master` enslaves to a bridge.
+    The subif is brought up at the end. Idempotent: a stale iface
+    with the same name is deleted before re-add.
+    """
+    iface = name or f"{parent}.{vid}"
+
+    async def _exec(*argv: str):
+        return await target_agent.exec_cmd(session, list(argv))
+
+    await _exec("ip", "link", "del", iface)  # idempotent
+
+    r = await _exec(
+        "ip", "link", "add", "link", parent,
+        "name", iface, "type", "vlan", "id", str(vid),
+    )
+    assert r["rc"] == 0, f"DUT vlan add {iface} (vid {vid}): {r}"
+
+    async def _cleanup():
+        await _exec("ip", "link", "del", iface)
+    stack.push(_cleanup)
+
+    if ipv4:
+        r = await _exec("ip", "addr", "add", ipv4, "dev", iface)
+        assert r["rc"] == 0, f"DUT ipv4 {ipv4} on {iface}: {r}"
+    if ipv6:
+        r = await _exec("ip", "-6", "addr", "add", ipv6, "dev", iface)
+        assert r["rc"] == 0, f"DUT ipv6 {ipv6} on {iface}: {r}"
+    if master:
+        r = await _exec("ip", "link", "set", iface, "master", master)
+        assert r["rc"] == 0, f"DUT enslave {iface} → {master}: {r}"
+
+    r = await _exec("ip", "link", "set", iface, "up")
+    assert r["rc"] == 0, f"DUT vlan up {iface}: {r}"
+    return iface
+
+
+async def lan_vlan_subif(
+    stack: TopologyStack,
+    lan,
+    *,
+    parent: str,
+    vid: int,
+    name: str | None = None,
+    ipv4: str | None = None,
+    ipv6: str | None = None,
+    routes: list[str] | None = None,
+) -> str:
+    """LAN-side counterpart to `dut_vlan_subif`. Same shape, driven via
+    UART. `routes` is a list of `ip route add ARGS` argument strings;
+    each is added with a matching `ip route del FIRST_TOKEN` cleanup
+    pushed onto `stack`.
+    """
+    iface = name or f"vlan{vid}"
+
+    await lan_run(lan, f"ip link del {iface} 2>/dev/null", 5.0)
+
+    r = await lan_run(
+        lan,
+        f"ip link add link {parent} name {iface} type vlan id {vid}",
+        10.0,
+    )
+    assert r.rc == 0, f"LAN vlan add {iface} (vid {vid}): {r.stdout!r}"
+
+    async def _cleanup():
+        await lan_run(lan, f"ip link del {iface} 2>/dev/null", 5.0)
+    stack.push(_cleanup)
+
+    if ipv4:
+        r = await lan_run(lan, f"ip addr add {ipv4} dev {iface}", 5.0)
+        assert r.rc == 0, f"LAN ipv4 {ipv4} on {iface}: {r.stdout!r}"
+    if ipv6:
+        r = await lan_run(lan, f"ip -6 addr add {ipv6} dev {iface}", 5.0)
+        assert r.rc == 0, f"LAN ipv6 {ipv6} on {iface}: {r.stdout!r}"
+
+    r = await lan_run(lan, f"ip link set {iface} up", 5.0)
+    assert r.rc == 0, f"LAN vlan up {iface}: {r.stdout!r}"
+
+    for spec in (routes or []):
+        await lan_run(lan, f"ip route add {spec}", 5.0)
+        async def _del_route(_first=spec.split()[0]):
+            await lan_run(lan, f"ip route del {_first} 2>/dev/null", 5.0)
+        stack.push(_del_route)
+
+    return iface
+
+
+# ---- 4. low-level helpers -----------------------------------------------
+
 async def lan_run(lan, cmd: str, timeout: float = 10.0):
     """Async wrapper around `Console.lan().run(...)`.
 
@@ -547,76 +676,25 @@ async def multi_listener_subifs(aiohttp_session, target_agent, lan):
     up the target-side NEWLINK netlink events and registers each VLAN
     in the FMAN onif table — prerequisite for mcast ADD's
     get_onif_by_name(listener) resolution.
-
-    Cleanup discipline: each successfully-brought-up interface registers
-    its own teardown closure into a stack; the finally block walks the
-    stack in reverse so a partial setup tears down only what actually
-    came up.
     """
-    cleanups: list[Callable[[], Awaitable[None]]] = []
-
-    async def _push_target_cleanup(iface: str) -> None:
-        async def _cleanup():
-            await target_agent.exec_cmd(
-                aiohttp_session, ["ip", "link", "del", iface],
-            )
-        cleanups.append(_cleanup)
-
-    async def _push_lan_cleanup(iface: str) -> None:
-        async def _cleanup():
-            await lan_run(lan, f"ip link del {iface} 2>/dev/null", 5.0)
-        cleanups.append(_cleanup)
-
+    stack = TopologyStack()
     listeners: list[tuple[str, str, int]] = []
     try:
         for vid in VLAN_IDS_MCAST:
-            target_if = f"{TARGET_LAN_IF}.{vid}"
-            lan_if    = f"vlan{vid}"
-
-            # Idempotent nuke before setup
-            await target_agent.exec_cmd(
-                aiohttp_session, ["ip", "link", "del", target_if],
+            t = await dut_vlan_subif(
+                stack, target_agent, aiohttp_session,
+                parent=TARGET_LAN_IF, vid=vid,
             )
-            await lan_run(lan, f"ip link del {lan_if} 2>/dev/null", 5.0)
-
-            # Target side
-            r = await target_agent.exec_cmd(aiohttp_session, [
-                "ip", "link", "add", "link", TARGET_LAN_IF,
-                "name", target_if, "type", "vlan", "id", str(vid),
-            ])
-            assert r["rc"] == 0, f"target vlan add {target_if}: {r}"
-            await _push_target_cleanup(target_if)
-
-            r = await target_agent.exec_cmd(
-                aiohttp_session, ["ip", "link", "set", target_if, "up"],
+            l = await lan_vlan_subif(
+                stack, lan, parent=LAN_NIC, vid=vid,
             )
-            assert r["rc"] == 0, f"target vlan up {target_if}: {r}"
-
-            # LAN side
-            res = await lan_run(
-                lan,
-                f"ip link add link {LAN_NIC} name {lan_if} "
-                f"type vlan id {vid} && ip link set {lan_if} up",
-                10.0,
-            )
-            assert res.rc == 0, (
-                f"lan vlan add {lan_if} (id {vid}) on {LAN_NIC}: "
-                f"rc={res.rc}, out={res.stdout!r}"
-            )
-            await _push_lan_cleanup(lan_if)
-
-            listeners.append((target_if, lan_if, vid))
+            listeners.append((t, l, vid))
 
         # Let CMM/netlink propagate the NEWLINKs.
         await asyncio.sleep(1.0)
         yield listeners
-
     finally:
-        for cleanup in reversed(cleanups):
-            try:
-                await cleanup()
-            except Exception as e:
-                warnings.warn(f"multi_listener_subifs cleanup failed: {e}")
+        await stack.teardown("multi_listener_subifs")
 
 
 @pytest_asyncio.fixture
@@ -624,62 +702,40 @@ async def bridge_with_n_ports(aiohttp_session, target_agent):
     """Linux bridge `br_test_abm` on the DUT with N=2 VLAN-pseudo-port
     members on TARGET_LAN_IF. Yields (bridge_name, [port_iface, ...]).
 
-    Same finalizer-stack discipline as multi_listener_subifs: every
-    successful setup step registers its teardown immediately, so a
-    partial setup tears down only what came up.
-
     Single-physical-link constraint applies — see §Item 4 in the plan
     for the stimulus-validity gate that must run before this fixture
     is used to assert anything about BREVENT_PORT_DOWN behaviour.
     """
     bridge = "br_test_abm"
-    cleanups: list[Callable[[], Awaitable[None]]] = []
+    stack = TopologyStack()
 
     async def _exec(*argv: str):
         return await target_agent.exec_cmd(aiohttp_session, list(argv))
 
     ports: list[str] = []
     try:
-        # Idempotent nuke
-        await _exec("ip", "link", "del", bridge)
-
+        await _exec("ip", "link", "del", bridge)  # idempotent
         r = await _exec("ip", "link", "add", "name", bridge, "type", "bridge")
         assert r["rc"] == 0, f"bridge add {bridge}: {r}"
 
         async def _cleanup_bridge():
             await _exec("ip", "link", "del", bridge)
-        cleanups.append(_cleanup_bridge)
+        stack.push(_cleanup_bridge)
 
         r = await _exec("ip", "link", "set", bridge, "up")
         assert r["rc"] == 0, f"bridge up {bridge}: {r}"
 
         for vid in VLAN_IDS_BRIDGE:
-            port = f"{TARGET_LAN_IF}.{vid}"
-            await _exec("ip", "link", "del", port)
-            r = await _exec(
-                "ip", "link", "add", "link", TARGET_LAN_IF,
-                "name", port, "type", "vlan", "id", str(vid),
+            port = await dut_vlan_subif(
+                stack, target_agent, aiohttp_session,
+                parent=TARGET_LAN_IF, vid=vid, master=bridge,
             )
-            assert r["rc"] == 0, f"port add {port}: {r}"
-
-            async def _cleanup_port(_port=port):
-                await _exec("ip", "link", "del", _port)
-            cleanups.append(_cleanup_port)
-
-            r = await _exec("ip", "link", "set", port, "master", bridge)
-            assert r["rc"] == 0, f"port enslave {port}: {r}"
-            r = await _exec("ip", "link", "set", port, "up")
-            assert r["rc"] == 0, f"port up {port}: {r}"
             ports.append(port)
 
         await asyncio.sleep(0.5)
         yield bridge, ports
     finally:
-        for cleanup in reversed(cleanups):
-            try:
-                await cleanup()
-            except Exception as e:
-                warnings.warn(f"bridge_with_n_ports cleanup failed: {e}")
+        await stack.teardown("bridge_with_n_ports")
 
 
 # ---- helpers for golden-file paths ----------------------------------------

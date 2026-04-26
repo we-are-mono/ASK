@@ -155,35 +155,21 @@ async def eight_vlan_listeners(aiohttp_session, target_agent):
     emits CMD_VLAN_ENTRY REGISTER for each, adding them to the FMAN onif
     table — a prerequisite for create_exthash_entry4mcast_member to
     resolve get_onif_by_name(listener_name) during mcast ADD.
-
-    Tear them down unconditionally so a failing test can't leak 8
-    sticky netdevs onto the DUT.
     """
-    # Nuke any stale state from a previous aborted run.
-    for iface in LISTENER_IFACES:
-        await target_agent.exec_cmd(
-            aiohttp_session, ["ip", "link", "del", iface],
-        )
+    from _topology import TopologyStack, dut_vlan_subif
 
+    stack = TopologyStack()
     try:
         for i, iface in enumerate(LISTENER_IFACES):
-            r = await target_agent.exec_cmd(aiohttp_session, [
-                "ip", "link", "add", "link", TARGET_LAN_IF,
-                "name", iface, "type", "vlan", "id", str(BASE_VID + i),
-            ])
-            assert r["rc"] == 0, f"vlan add failed for {iface}: {r}"
-            r = await target_agent.exec_cmd(
-                aiohttp_session, ["ip", "link", "set", iface, "up"],
+            await dut_vlan_subif(
+                stack, target_agent, aiohttp_session,
+                parent=TARGET_LAN_IF, vid=BASE_VID + i, name=iface,
             )
-            assert r["rc"] == 0, f"vlan up failed for {iface}: {r}"
         # Let CMM pick up the NEWLINK events and push CMD_VLAN_ENTRY.
         await asyncio.sleep(1.0)
         yield LISTENER_IFACES
     finally:
-        for iface in LISTENER_IFACES:
-            await target_agent.exec_cmd(
-                aiohttp_session, ["ip", "link", "del", iface],
-            )
+        await stack.teardown("eight_vlan_listeners")
 
 
 @pytest_asyncio.fixture
