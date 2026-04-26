@@ -42,6 +42,8 @@ CMM_QUERY_TABLES = {
     "ipsec-sa",
     "mcast",
     "bridge",
+    "mc4",                  # IPv4 multicast group entries (FCI mc4)
+    "mc6",                  # IPv6 multicast group entries (FCI mc6)
 }
 
 

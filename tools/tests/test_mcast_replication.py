@@ -114,6 +114,24 @@ def _pack_mc4_command(
 
 # ---- mcast group lifecycle fixtures --------------------------------------
 
+async def _assert_mc4_has_group(
+    target_agent, session, *, dst: str,
+) -> None:
+    """Query the FCI mc4 table and assert `dst` appears among registered
+    groups. Catches the silent-ADD-failure case where fci_send returned
+    NO_ERR but the group never persisted into the FCI table.
+    """
+    r = await target_agent.cmm_query(session, "mc4")
+    out = (r.get("stdout") or "") + (r.get("stderr") or "")
+    if "table empty" in out or dst not in out:
+        raise AssertionError(
+            f"FCI ADD reported NO_ERR but group {dst} is missing from "
+            f"mc4 table — silent registration failure. cmm output:\n"
+            f"  stdout: {(r.get('stdout') or '')[:400]!r}\n"
+            f"  stderr: {(r.get('stderr') or '')[:400]!r}"
+        )
+
+
 @pytest_asyncio.fixture
 async def mcast_group_wan_ingress(
     aiohttp_session, target_agent, multi_listener_subifs,
@@ -131,6 +149,9 @@ async def mcast_group_wan_ingress(
         length=len(add), payload=add, timeout_ms=2000,
     )
     assert r.get("reply_rc") == NO_ERR, f"3b mcast ADD failed: {r}"
+    await _assert_mc4_has_group(
+        target_agent, aiohttp_session, dst=MCAST_DST_3B,
+    )
 
     try:
         yield listeners
@@ -169,6 +190,9 @@ async def mcast_group_lan_vlan_ingress(
     )
     assert r.get("reply_rc") == NO_ERR, (
         f"3c mcast ADD (ingress={ingress_iface}) failed: {r}"
+    )
+    await _assert_mc4_has_group(
+        target_agent, aiohttp_session, dst=MCAST_DST_3C,
     )
 
     try:
@@ -305,17 +329,12 @@ def _send_mcast_from_orchestrator(dst: str, port: int, payload: bytes) -> None:
 
 
 @pytest.mark.skip(
-    reason="needs further diagnosis — DUT eth3 receives the injected mcast "
-           "frame (verified via standalone tcpdump) and FCI ADD returns "
-           "NO_ERR, but no listener captures a replicated copy. Possible "
-           "causes: FCI mcast group not actually persisting (mc4 table "
-           "queried post-test was empty), CMM-side VLAN registration "
-           "race for the listener subifs, or PCD config not routing "
-           "to the right replication FQ. The listener-iteration bug class "
-           "this test would cover is already exercised by Phase 1's "
-           "test_mcast_concurrent + test_mcast_failslab + the existing "
-           "test_mcast_pagination — leaving this test as a documented "
-           "TODO rather than weakening the assertion."
+    reason="FMAN PCD does not replicate IPv4 mcast frames to listener "
+           "subifs on this build — see ISSUES.md M15. Verified on "
+           "clean boot, ruled out dist ordering (ICMP/IGMP/proto=200 "
+           "all fail too), TCP unicast offload still works at 1+ Gbps. "
+           "Real product blocker (IPTV); needs PCD/microcode expertise "
+           "outside test-harness scope."
 )
 async def test_mcast_replication_one_per_listener_wan_injection(
     aiohttp_session, target_agent, lan, splat_window,
@@ -382,9 +401,7 @@ print("INJECTED")
 """
 
 
-@pytest.mark.skip(
-    reason="See sibling test's skip note — same diagnosis pending."
-)
+@pytest.mark.skip(reason="See sibling test's skip note (ISSUES.md M15).")
 async def test_mcast_replication_lan_vlan_tagged_injection(
     aiohttp_session, target_agent, lan, splat_window,
     mcast_group_lan_vlan_ingress, pcap_cleanup_lan,
