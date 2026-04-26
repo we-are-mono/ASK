@@ -1888,6 +1888,10 @@ static void free_stats(struct dpa_iface_info *info)
 	return;
 }
 
+#ifdef DPA_IPSEC_OFFLOAD
+static void dpa_bman_restore_discard_mask(struct dpa_iface_info *iface_info);
+#endif
+
 /* remove dpa interface */
 void dpa_release_interface(uint32_t itf_id)
 {
@@ -1917,6 +1921,15 @@ void dpa_release_interface(uint32_t itf_id)
 
 			if((curr_info->if_flags	& IF_TYPE_ETHERNET) && (curr_info->eth_info.net_dev))
 			{
+				/* Reverse of dpa_add_eth_if() acquisition order:
+				 * CEETM → discard mask → FF policer → virt storage profile → netdev ref. */
+#ifdef ENABLE_EGRESS_QOS
+				cdx_disable_ceetm_on_iface(curr_info);
+#endif
+#ifdef DPA_IPSEC_OFFLOAD
+				dpa_bman_restore_discard_mask(curr_info);
+#endif
+				dpa_remove_ethport_ff_policier_profile(curr_info);
 				dpa_remove_virt_storage_profile(&curr_info->eth_info);
 				dev_put(curr_info->eth_info.net_dev);
 			}
