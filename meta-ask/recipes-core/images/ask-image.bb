@@ -38,6 +38,7 @@ IMAGE_INSTALL = " \
     fci \
     auto-bridge \
     sfp-led \
+    lp5812-driver \
     config \
     kernel-module-nf-conntrack-netlink \
     kernel-module-xt-conntrack \

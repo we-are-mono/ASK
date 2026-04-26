@@ -6,6 +6,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 SRC_URI = "file://S03debugfs \
            file://S05ask-modules \
+           file://S20status-leds \
            file://S40gateway-setup \
            file://S50cmm \
            file://dnsmasq-gateway.conf \
@@ -67,6 +68,12 @@ fakeroot do_install() {
     # CMM (ASK connection manager) — depends on cdx/fci being loaded first.
     install -m 0755 ${UNPACKDIR}/S50cmm ${D}${sysconfdir}/init.d/cmm
     ln -sf ../init.d/cmm ${D}${sysconfdir}/rcS.d/S50cmm
+
+    # Status LED config — runs after modules-load.d brings up leds-lp5812
+    # (S05ask-modules), but before the gateway/CMM bring-up so the cue is
+    # visible from early boot.
+    install -m 0755 ${UNPACKDIR}/S20status-leds ${D}${sysconfdir}/init.d/status-leds
+    ln -sf ../init.d/status-leds ${D}${sysconfdir}/rcS.d/S20status-leds
 }
 
 FILES:${PN} = " \
@@ -85,4 +92,6 @@ FILES:${PN} = " \
     ${sysconfdir}/dnsmasq-gateway.conf \
     ${sysconfdir}/init.d/cmm \
     ${sysconfdir}/rcS.d/S50cmm \
+    ${sysconfdir}/init.d/status-leds \
+    ${sysconfdir}/rcS.d/S20status-leds \
 "

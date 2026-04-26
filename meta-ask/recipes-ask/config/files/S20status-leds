@@ -1,0 +1,39 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          status-leds
+# Required-Start:    ask-modules
+# Default-Start:     S
+# Short-Description: Static RGBW status LED — green off, white at low brightness
+### END INIT INFO
+
+# U-Boot leaves the green LED lit. After leds-lp5812 binds, this script
+# turns green off and lights white at a low intensity so the board is
+# visibly running but the LED isn't distractingly bright.
+
+GREEN=/sys/class/leds/status:green
+WHITE=/sys/class/leds/status:white
+
+case "$1" in
+    start|"")
+        # S05ask-modules reads only /etc/modules-load.d/ask.conf, not the
+        # whole directory, so the lp5812 driver's autoload file isn't seen
+        # by it. Probe explicitly here.
+        modprobe leds-lp5812 2>/dev/null || true
+        if [ -d "$GREEN" ]; then
+            echo none > "$GREEN/trigger"
+            echo 0    > "$GREEN/brightness"
+        fi
+        if [ -d "$WHITE" ]; then
+            echo none > "$WHITE/trigger"
+            echo 16   > "$WHITE/brightness"
+        fi
+        ;;
+    stop)
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
