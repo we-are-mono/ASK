@@ -9,7 +9,14 @@ inherit externalsrc
 EXTERNALSRC = "${ASK_SRCROOT}/cmm"
 EXTERNALSRC_BUILD = "${ASK_SRCROOT}/cmm"
 
-DEPENDS = "libfci libcli libnetfilter-conntrack libnfnetlink libmnl libpcap libxcrypt auto-bridge"
+DEPENDS = "libfci libcli libnetfilter-conntrack libnfnetlink libmnl libpcap libxcrypt auto-bridge \
+           gcc-sanitizers"
+
+# Runtime sanitizer libs for cmm_rtnl_fuzzer (ASAN+UBSAN-instrumented).
+# The binary's DT_NEEDED list pulls these implicitly through Yocto's
+# shlib scanner, but list them explicitly so a package-level breakage
+# trips at build time rather than at first test run.
+RDEPENDS:${PN} += "libasan libubsan"
 
 # cmm/Makefile takes LIBFCI_DIR, ABM_DIR, SYSROOT — point them at the Yocto
 # sysroot so pkg-config and includes resolve against our patched libraries.
@@ -40,14 +47,20 @@ fakeroot do_compile() {
     # and we ship the Debian binary.
     oe_runmake clean || true
     oe_runmake all
+    # Fuzz harness for the RTNL parser (cmm/test/cmm_rtnl_fuzzer.c).
+    # Built ASAN/UBSAN-instrumented and shipped alongside cmm so
+    # tools/tests/test_cmm_rtnl_fuzz.py can drive it via the agent's
+    # exec_cmd whitelist.
+    oe_runmake fuzzer
 }
 
 fakeroot do_install() {
     install -d ${D}${bindir}
     install -m 0755 ${S}/src/cmm ${D}${bindir}/cmm
+    install -m 0755 ${S}/src/cmm_rtnl_fuzzer ${D}${bindir}/cmm_rtnl_fuzzer
 }
 
-FILES:${PN} = "${bindir}/cmm"
+FILES:${PN} = "${bindir}/cmm ${bindir}/cmm_rtnl_fuzzer"
 
 # Yocto's file-rdeps scanner auto-detects the shared-lib packages (libpcap1,
 # libmnl0, libcli, libnetfilter-conntrack3, libnfnetlink0) — don't duplicate

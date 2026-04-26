@@ -11,6 +11,17 @@
  *
  */
 #include "cmm.h"
+#include "rtnl_parse.h"
+
+/*
+ * Hook for cmm_parse_rtattr's overflow diagnostic. The parser body lives
+ * in rtnl_parse.c (shared with the userspace fuzzer in cmm/test/).
+ */
+void cmm_parse_rtattr_overflow(const char *func, int line, int len_remaining)
+{
+	cmm_print(DEBUG_ERROR, "%s::%d: payload too long, %d byte(s) trailing\n",
+		  func, line, len_remaining);
+}
 
 /*********************************************************************************************/
 
@@ -265,22 +276,8 @@ err:
 	return -1;
 }
 
-int cmm_parse_rtattr(struct rtattr *tb[], int max, struct rtattr *rta, int len)
-{
-	memset(tb, 0, sizeof(struct rtattr *) * (max + 1));
-
-	while (RTA_OK(rta, len)) {
-		if (rta->rta_type <= max)
-			tb[rta->rta_type] = rta;
-
-		rta = RTA_NEXT(rta,len);
-	}
-
-	if (len)
-		cmm_print(DEBUG_ERROR, "%s::%d: payload too long %d %d\n", __func__, __LINE__, len, rta->rta_len);
-
-	return 0;
-}
+/* cmm_parse_rtattr() body lives in rtnl_parse.c — shared with the
+ * fuzzer in cmm/test/cmm_rtnl_fuzzer.c. */
 
 struct rtattr *cmm_get_rtattr(struct rtattr *rta, int len, int type)
 {

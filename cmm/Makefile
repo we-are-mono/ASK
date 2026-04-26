@@ -25,6 +25,7 @@ LDFLAGS += -L$(LIBFCI_DIR) -L$(SYSROOT)/lib
 LDLIBS  := -lpthread -lfci -lcli -lpcap $(NFCT_LIBS) -lmnl
 
 SRCS := \
+	rtnl_parse.c \
 	neighbor_resolution.c \
 	module_expt.c \
 	cmm.c \
@@ -75,6 +76,25 @@ $(BUILDDIR)/cmm: $(OBJS)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# Fuzz harness for cmm's RTNL attribute parser. ASAN/UBSAN-instrumented;
+# OOB detection is the oracle. Built separately — `make -C cmm fuzzer` —
+# so the default image isn't sanitizer-instrumented. The Yocto recipe
+# (meta-ask/recipes-ask/cmm/cmm_1.0.bb) DEPENDS on gcc-sanitizers to
+# stage libasan/libubsan into the cross sysroot.
+FUZZER_SRC    := test/cmm_rtnl_fuzzer.c
+FUZZER_BIN    := $(BUILDDIR)/cmm_rtnl_fuzzer
+FUZZER_CFLAGS := -O1 -g -Wall -Werror \
+                 -fsanitize=address,undefined -fno-omit-frame-pointer
+
+fuzzer: $(FUZZER_BIN)
+
+# Builds together with the production rtnl_parse.c so the fuzzer
+# exercises the same cmm_parse_rtattr the daemon ships. LDFLAGS picks
+# up Yocto's --hash-style=gnu / reproducible-build flags when invoked
+# from the recipe; harmless additions on a host build.
+$(FUZZER_BIN): $(FUZZER_SRC) $(SRCDIR)/rtnl_parse.c
+	$(CC) $(FUZZER_CFLAGS) $(LDFLAGS) -o $@ $(FUZZER_SRC) $(SRCDIR)/rtnl_parse.c
+
 version:
 	@if [ -d .git ]; then \
 		V=$$(git describe --always --tags --dirty 2>/dev/null || echo "unknown"); \
@@ -82,6 +102,6 @@ version:
 	fi
 
 clean:
-	rm -f $(BUILDDIR)/*.o $(BUILDDIR)/cmm
+	rm -f $(BUILDDIR)/*.o $(BUILDDIR)/cmm $(FUZZER_BIN)
 
-.PHONY: all version clean
+.PHONY: all version clean fuzzer

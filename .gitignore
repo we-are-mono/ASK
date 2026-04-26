@@ -39,6 +39,7 @@ dist/
 
 # Built binaries
 cmm/src/cmm
+cmm/src/cmm_rtnl_fuzzer
 dpa_app/dpa_app
 
 # Kbuild temporaries
