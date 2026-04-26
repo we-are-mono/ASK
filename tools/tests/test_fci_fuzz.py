@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import pytest
 
-from _cmd_catalog import build_catalogs
+from _cmd_catalog import build_catalogs, exact_payload_types
+from _payload_structs import sizes_for_commands
 
 
 NO_ERR                 = 0
@@ -34,6 +35,8 @@ ERR_UNKNOWN_COMMAND    = 1
 ERR_WRONG_COMMAND_SIZE = 2
 
 EXACT_CMDS, BOUNDED_CMDS, PERMISSIVE_CMDS = build_catalogs()
+_EXACT_TYPES = exact_payload_types()
+EXACT_SIZES  = sizes_for_commands(_EXACT_TYPES)
 
 
 # ------------------------------------------------------------------
@@ -140,4 +143,84 @@ async def test_fci_bounded_spec_zero_length(
         f"{cmd_name} (0x{cmd_code:04x}) len=0: expected rc="
         f"ERR_WRONG_COMMAND_SIZE ({ERR_WRONG_COMMAND_SIZE}), got {rc}; "
         f"full reply={reply}"
+    )
+
+
+# ------------------------------------------------------------------
+# Mutation class 4: payload-body mutations at the correct length.
+#
+# The dispatcher accepts the length so the handler runs. We don't
+# care about the handler's reply rc — handlers may legitimately
+# accept or reject mutated payloads. The oracle is the splat_window
+# fixture: under KASAN (and UBSAN/lockdep/etc.) the kernel must not
+# OOPS / WARN / report OOB on these inputs. Bug class targeted:
+#
+#   - integer-overflow         : all 0xFF in numeric fields
+#   - enum out-of-range        : leading 16-bit field set high
+#                                (most cdx commands lead with an
+#                                action/mode enum)
+#   - string overflow          : trailing fixed-length char arrays
+#                                with no NUL terminator
+#
+# Sizes are derived from sizeof(TYPE) parsed from cdx headers via
+# _payload_structs. Commands whose TYPE has fields we can't size
+# (function pointers, deeply nested structs) are silently skipped.
+#
+# Note this test only covers payload bytes — a tighter version would
+# generate per-field semantic mutations once a ctypes wrapper exists.
+# ------------------------------------------------------------------
+
+
+def _payload_all_ff(size: int) -> bytes:
+    return b"\xff" * size
+
+
+def _payload_high_enum(size: int) -> bytes:
+    # First 2 bytes = 0xFFFF (likely a bogus action/mode), rest 0x00.
+    return b"\xff\xff" + b"\x00" * (size - 2) if size >= 2 else b"\xff" * size
+
+
+def _payload_no_nul_strings(size: int) -> bytes:
+    # First 2 bytes = 0x0001 (typical "valid" action), rest 0xFF — fills
+    # any trailing char arrays with non-NUL bytes so handlers walking
+    # them as C strings run off the end.
+    return b"\x01\x00" + b"\xff" * (size - 2) if size >= 2 else b"\xff" * size
+
+
+_PAYLOAD_MUTATORS = {
+    "all_ff":      _payload_all_ff,
+    "high_enum":   _payload_high_enum,
+    "no_nul_str":  _payload_no_nul_strings,
+}
+
+
+_PAYLOAD_CASES = [
+    (name, code, EXACT_SIZES[name], mut_label, mut_fn)
+    for (name, code) in EXACT_CMDS
+    if name in EXACT_SIZES
+    for mut_label, mut_fn in _PAYLOAD_MUTATORS.items()
+]
+
+
+@pytest.mark.parametrize(
+    "cmd_name,cmd_code,arg_size,mut_label,mut_fn",
+    _PAYLOAD_CASES,
+    ids=[f"{n}/{lbl}" for (n, _, _, lbl, _) in _PAYLOAD_CASES],
+)
+async def test_fci_payload_mutation(
+    aiohttp_session, target_agent, splat_window,
+    cmd_name, cmd_code, arg_size, mut_label, mut_fn,
+):
+    """Correct-length / mutated-body must not splat the kernel.
+
+    No assertion on reply_rc — handlers may accept or reject. The
+    splat_window fixture catches KASAN/UBSAN/WARN/BUG.
+    """
+    payload = mut_fn(arg_size)
+    assert len(payload) == arg_size  # mutator self-check
+    await target_agent.fci_send(
+        aiohttp_session,
+        fcode=cmd_code,
+        length=arg_size,
+        payload=payload,
     )

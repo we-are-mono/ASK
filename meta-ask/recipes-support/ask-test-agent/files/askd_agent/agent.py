@@ -701,6 +701,134 @@ async def _maybe_json(request: web.Request) -> dict:
     return {}
 
 
+# ASK loadable-module stack. Listed in rmmod order (top-of-stack first):
+# auto_bridge depends on fci which depends on cdx, so unloading goes
+# auto_bridge -> fci -> cdx and modprobing goes in reverse.
+_ASK_MODULES = ("auto_bridge", "fci", "cdx")
+
+
+def _module_reload_init_work(target: str, failslab_times: int) -> dict:
+    """Inside a fork: configure failslab if requested, then modprobe.
+
+    Targeting subtlety: failslab's `times` counter is global, but
+    fires only on tasks tagged via /proc/<pid>/make-it-fail. If we
+    tagged this child (the work-runner), our own pre-modprobe kmallocs
+    (Python interpreter, subprocess.run scaffolding, fork-for-exec)
+    would consume the budget before modprobe even starts. So we
+    configure failslab globally here but defer the per-task tag to
+    `preexec_fn`, which runs in the modprobe child *after* fork but
+    *before* exec — every kmalloc from then on counts against `times`.
+
+    Even with this targeting, exec setup + modprobe userspace + the
+    finit_module syscall path all still happen before the module's
+    init function runs, so the first ~dozens of fault budgets are
+    spent on scaffolding. Sweeping `failslab_times` over a range that
+    extends past that scaffolding count is what gets the fault into
+    the actual init body.
+    """
+    armed = False
+    try:
+        if failslab_times > 0:
+            # Configure global failslab knobs but don't tag ourselves.
+            (_FAILSLAB_DIR / "task-filter").write_text("Y\n")
+            (_FAILSLAB_DIR / "probability").write_text("100\n")
+            (_FAILSLAB_DIR / "times").write_text(f"{failslab_times}\n")
+            try:
+                (_FAILSLAB_DIR / "space").write_text("0\n")
+            except OSError:
+                pass
+            armed = True
+
+            def _tag_modprobe_child():
+                # Runs in the modprobe child between fork and exec.
+                # No kmallocs in this Python callback are an issue —
+                # they happen before the tag is applied. The tag
+                # affects only allocations after the write below.
+                Path("/proc/self/make-it-fail").write_text("1\n")
+        else:
+            _tag_modprobe_child = None
+
+        proc = subprocess.run(
+            ["modprobe", target],
+            capture_output=True, timeout=15,
+            preexec_fn=_tag_modprobe_child,
+        )
+        return {
+            "init_rc": proc.returncode,
+            "init_stderr": proc.stderr.decode(errors="replace").strip(),
+            "init_stdout": proc.stdout.decode(errors="replace").strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {"init_rc": -1, "init_stderr": "modprobe timeout"}
+    except Exception as e:
+        return {"init_rc": -1, "init_stderr": f"{type(e).__name__}: {e}"}
+    finally:
+        if armed:
+            _disarm_failslab()
+
+
+async def module_reload(request: web.Request) -> web.Response:
+    """POST {target, [failslab_times], [timeout_ms]} -> reload result.
+
+    Tears down the ASK module stack from auto_bridge down to (and
+    including) `target`, modprobes `target` with optional failslab
+    arming during init, then restores the rest of the stack so the
+    system isn't left half-loaded for the next test.
+
+    Used by A3a-e fault-injection tests to probe init-path leak/UAF
+    behaviour. failslab=0 just exercises the rmmod/modprobe round-trip
+    (useful as a baseline / smoke).
+    """
+    body = await _maybe_json(request)
+    target = body.get("target")
+    if target not in _ASK_MODULES:
+        return web.json_response(
+            {"error": f"target must be one of {list(_ASK_MODULES)}"},
+            status=400,
+        )
+    failslab_times = int(body.get("failslab_times", 0))
+    timeout_s = float(body.get("timeout_ms", 30000)) / 1000.0
+
+    # Tear down stack from auto_bridge down to (and including) target.
+    rmmod_log: list[dict] = []
+    for mod in _ASK_MODULES:
+        proc = subprocess.run(["rmmod", mod], capture_output=True)
+        rmmod_log.append({
+            "module": mod,
+            "rc": proc.returncode,
+            "stderr": proc.stderr.decode(errors="replace").strip(),
+        })
+        if mod == target:
+            break
+
+    # Modprobe target with optional failslab — isolated child.
+    def _work():
+        return _module_reload_init_work(target, failslab_times)
+    init_result = await asyncio.get_event_loop().run_in_executor(
+        None, _run_isolated, _work, None, timeout_s,
+    )
+
+    # Restore the rest of the stack regardless of init outcome.
+    restore: list[dict] = []
+    order = list(reversed(_ASK_MODULES))
+    idx = order.index(target)
+    for mod in order[idx:]:
+        proc = subprocess.run(["modprobe", mod], capture_output=True)
+        restore.append({
+            "module": mod,
+            "rc": proc.returncode,
+            "stderr": proc.stderr.decode(errors="replace").strip(),
+        })
+
+    return web.json_response({
+        "target": target,
+        "failslab_times": failslab_times,
+        "rmmod_log": rmmod_log,
+        "init_result": init_result,
+        "restore": restore,
+    })
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app["captures"] = {}
@@ -717,6 +845,7 @@ def build_app() -> web.Application:
     app.router.add_post("/ioctl/send",       ioctl_send)
     app.router.add_post("/fs/write",         fs_write)
     app.router.add_post("/exec",             exec_cmd)
+    app.router.add_post("/module/reload",    module_reload)
     return app
 
 

@@ -219,6 +219,30 @@ class Agent:
             r.raise_for_status()
             return await r.json()
 
+    async def module_reload(
+        self,
+        session: aiohttp.ClientSession,
+        target: str,
+        *,
+        failslab_times: int = 0,
+        timeout_ms: int = 30000,
+    ) -> dict:
+        """Tear down ASK module stack down to `target`, modprobe target
+        (optionally with failslab armed during init), then restore the
+        rest of the stack. Used by A3 init-cascade fault-injection tests.
+        """
+        body = {
+            "target":         target,
+            "failslab_times": failslab_times,
+            "timeout_ms":     timeout_ms,
+        }
+        async with session.post(
+            f"{self.base_url}/module/reload", json=body,
+            timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000.0 + 5),
+        ) as r:
+            r.raise_for_status()
+            return await r.json()
+
 
 # Node endpoints — overridable via env so the harness works on anyone's
 # lab setup. The orchestrator runs on the WAN-side host; LAN is the

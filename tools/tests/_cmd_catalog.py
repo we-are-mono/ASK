@@ -34,8 +34,8 @@ _CMD_DEFINE_RE = re.compile(
     r"^\s*#\s*define\s+(CMD_\w+)\s+(0x[0-9a-fA-F]+|\d+)\b",
     re.MULTILINE,
 )
-_CDX_CMD_RE       = re.compile(r"\bCDX_CMD\s*\(\s*(CMD_\w+)\b")
-_CDX_CMD_V_RE     = re.compile(r"\bCDX_CMD_V\s*\(\s*(CMD_\w+)\b")
+_CDX_CMD_RE       = re.compile(r"\bCDX_CMD\s*\(\s*(CMD_\w+)\s*,\s*([A-Za-z_]\w*)")
+_CDX_CMD_V_RE     = re.compile(r"\bCDX_CMD_V\s*\(\s*(CMD_\w+)\s*,\s*([A-Za-z_]\w*)")
 _CDX_CMD_NOARG_RE = re.compile(r"\bCDX_CMD_NOARG\s*\(\s*(CMD_\w+)\b")
 _CDX_CMD_NOARG_V_RE = re.compile(r"\bCDX_CMD_NOARG_V\s*\(\s*(CMD_\w+)\b")
 _CDX_CMD_VAR_RE   = re.compile(
@@ -139,7 +139,12 @@ def _strip_disabled_ifdefs(txt: str) -> str:
 
 
 def _scan_sources(src_files: list[Path], code_map: dict[str, int]):
-    """Yield (kind, name, code, extra) tuples for every CDX_CMD* site."""
+    """Yield (kind, name, code, extra) tuples for every CDX_CMD* site.
+
+    For exact-spec entries with a payload type (CDX_CMD / CDX_CMD_V),
+    extra carries the type name; for noarg / var entries it's None or
+    the (lo, hi) tuple respectively.
+    """
     for f in src_files:
         try:
             raw = f.read_text(errors="replace")
@@ -155,17 +160,13 @@ def _scan_sources(src_files: list[Path], code_map: dict[str, int]):
             if name in code_map:
                 yield ("exact", name, code_map[name], None)
         for m in _CDX_CMD_V_RE.finditer(txt):
-            name = m.group(1)
+            name, type_name = m.group(1), m.group(2)
             if name in code_map:
-                yield ("exact", name, code_map[name], None)
+                yield ("exact", name, code_map[name], type_name)
         for m in _CDX_CMD_RE.finditer(txt):
-            name = m.group(1)
-            # Avoid matching CDX_CMD_V / CDX_CMD_VAR etc. — the CDX_CMD
-            # regex intentionally has no `_` boundary, so filter here.
-            if name in code_map and re.search(
-                rf"\bCDX_CMD\s*\(\s*{re.escape(name)}\b", txt
-            ):
-                yield ("exact", name, code_map[name], None)
+            name, type_name = m.group(1), m.group(2)
+            if name in code_map:
+                yield ("exact", name, code_map[name], type_name)
         for m in _CDX_CMD_VAR_RE.finditer(txt):
             name, min_e, max_e = m.group(1), m.group(2), m.group(3)
             if name not in code_map:
@@ -173,6 +174,13 @@ def _scan_sources(src_files: list[Path], code_map: dict[str, int]):
             lo = _eval_bound(min_e, code_map)
             hi = _eval_bound(max_e, code_map)
             yield ("var", name, code_map[name], (lo, hi))
+
+
+def _src_paths(root: Path) -> list[Path]:
+    return [p for p in (
+        sorted((root / "cdx").glob("control_*.c"))
+        + [root / "cdx" / "dpa_control_mc.c", root / "cdx" / "cdx_dev.c"]
+    ) if p.is_file()]
 
 
 def build_catalogs() -> tuple[list[tuple[str, int]], list[tuple[str, int]], list[tuple[str, int]]]:
@@ -187,21 +195,13 @@ def build_catalogs() -> tuple[list[tuple[str, int]], list[tuple[str, int]], list
         root / "cdx" / "cdx_cmdhandler.h",
         root / "cdx" / "cdx_ioctl.h",
     ]
-    src_paths = sorted(
-        (root / "cdx").glob("control_*.c")
-    ) + [
-        root / "cdx" / "dpa_control_mc.c",
-        root / "cdx" / "cdx_dev.c",
-    ]
-    src_paths = [p for p in src_paths if p.is_file()]
-
     code_map = _parse_code_defines(header_paths)
 
     exact: set[tuple[str, int]] = set()
     bounded: set[tuple[str, int]] = set()
     permissive: set[tuple[str, int]] = set()
 
-    for kind, name, code, extra in _scan_sources(src_paths, code_map):
+    for kind, name, code, extra in _scan_sources(_src_paths(root), code_map):
         if kind == "exact":
             exact.add((name, code))
         else:
@@ -220,3 +220,24 @@ def build_catalogs() -> tuple[list[tuple[str, int]], list[tuple[str, int]], list
         sorted(bounded,    key=lambda x: x[1]),
         sorted(permissive, key=lambda x: x[1]),
     )
+
+
+def exact_payload_types() -> dict[str, str]:
+    """Map cmd_name -> payload type-name for CDX_CMD / CDX_CMD_V sites.
+
+    Only covers entries that carry a TYPE arg (so CDX_CMD_NOARG is
+    omitted — it has no payload). Used by the payload-mutation fuzzer
+    to look up sizeof(TYPE) via _payload_structs.
+    """
+    root = _repo_root()
+    header_paths = [
+        root / "cdx" / "cdx_cmdhandler.h",
+        root / "cdx" / "cdx_ioctl.h",
+    ]
+    code_map = _parse_code_defines(header_paths)
+
+    out: dict[str, str] = {}
+    for kind, name, _code, extra in _scan_sources(_src_paths(root), code_map):
+        if kind == "exact" and isinstance(extra, str):
+            out[name] = extra
+    return out
