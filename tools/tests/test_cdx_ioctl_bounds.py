@@ -24,8 +24,10 @@ import pytest
 from _ioctl import (
     CDX_CTRL_DPA_SET_PARAMS,
     CDX_CTRL_DPA_CONNADD_LEGACY,
+    CDX_CTRL_DPA_GET_MURAM_DATA,
     CDX_CTRL_UNKNOWN_NR,
     SIZEOF_CDX_CTRL_SET_DPA_PARAMS,
+    SIZEOF_CDX_CTRL_GET_MURAM_DATA,
 )
 
 
@@ -113,4 +115,26 @@ async def test_unknown_ioctl_nr_rejected(
     )
     assert r.get("errno") in _NO_SUCH_IOCTL, (
         f"unregistered ioctl (nr=99) should be rejected, got {r}"
+    )
+
+
+async def test_get_muram_data_nr_rejected_when_debug_disabled(
+    aiohttp_session, target_agent, splat_window,
+):
+    """CDX_CTRL_DPA_GET_MURAM_DATA (nr=4) is gated on DPAA_DEBUG_ENABLE.
+    Production images don't define that, so the dispatcher has no entry
+    and the ioctl must come back ENOTTY. Tripwire: if a build flips
+    DPAA_DEBUG_ENABLE on, this test starts seeing 0/EFAULT/EINVAL — at
+    which point the test should be extended to bound the size field of
+    struct muram_data, where there's an unchecked memcpy in the handler
+    (cdx_dev.c:104)."""
+    data = b"\x00" * SIZEOF_CDX_CTRL_GET_MURAM_DATA
+    r = await target_agent.ioctl_send(
+        aiohttp_session,
+        device=DEVICE, cmd=CDX_CTRL_DPA_GET_MURAM_DATA, data=data,
+    )
+    assert r.get("errno") in _NO_SUCH_IOCTL, (
+        f"GET_MURAM_DATA on a non-debug build should be ENOTTY; got {r}. "
+        f"If DPAA_DEBUG_ENABLE was just turned on, extend this test "
+        f"with a bounds sweep on struct muram_data.size."
     )

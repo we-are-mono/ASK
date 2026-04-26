@@ -36,7 +36,22 @@ import textwrap
 
 import pytest
 
-from ask_orch.client import ASK_KMEMLEAK_FILTER
+# ISSUES.md X3 calls out the broad ASK_KMEMLEAK_FILTER as too coarse:
+# `dpaa_eth_refill_bpools` allocations carry [cdx]/[auto_bridge] tags
+# but aren't real leaks (skb addresses live in HW descriptor rings,
+# kmemleak's pointer scanner can't see them). Those baseline objects
+# can age into "suspected" between this test's clear and scan, so the
+# broad filter trips intermittently. Narrow to reassembly-handler
+# function needles instead — they only match leaks rooted in the
+# code path under test here.
+REASSM_LEAK_FILTER = [
+    "cdx_init_ip_reassembly",
+    "cdx_create_ipr_fq",
+    "replenish_ipr_frag_pool",
+    "cdx_get_ipr_v4_stats",
+    "cdx_get_ipr_v6_stats",
+    "ip_reassembly_frag_list",
+]
 
 
 WAN_IPERF_IP = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
@@ -159,7 +174,7 @@ async def test_reassembly_fragment_storm(
     await asyncio.sleep(3.0)
 
     report = await target_agent.kmemleak(
-        aiohttp_session, filter_substrs=ASK_KMEMLEAK_FILTER,
+        aiohttp_session, filter_substrs=REASSM_LEAK_FILTER,
     )
     assert report.get("leak_count", 0) == 0, (
         f"kmemleak found {report['leak_count']} new leak(s) in ASK code "

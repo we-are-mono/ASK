@@ -28,7 +28,7 @@ ASK_ORCH_SRC   := $(CURDIR)/tools/ask_orch
 
 # Python deps pinned on the WAN + LAN venvs. pyserial is for the uart
 # helper used by tests from the WAN host (not the agent itself).
-ASKD_REQUIREMENTS := aiohttp scapy pyroute2 pytest pytest-asyncio cffi pyserial
+ASKD_REQUIREMENTS := aiohttp scapy pyroute2 pytest pytest-asyncio cffi pyserial pyyaml
 
 # TFTP root on the WAN host — U-Boot on the DUT does
 #   tftpboot ${loadaddr} ${tftp_root}/Image; booti ...

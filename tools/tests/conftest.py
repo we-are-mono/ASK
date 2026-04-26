@@ -38,6 +38,8 @@ import pytest_asyncio
 from ask_orch import client
 from ask_orch.uart import Console
 
+from _dmesg_allowlist import filter_splats, load_allowlist
+
 
 LAN_USER     = os.environ.get("ASK_LAN_USER",     "root")
 LAN_PASSWORD = os.environ.get("ASK_LAN_PASSWORD", "password")
@@ -60,6 +62,13 @@ async def aiohttp_session():
 @pytest.fixture(scope="session")
 def target_agent():
     return client.TARGET
+
+
+# Loaded once per session. An expired entry raises here, failing the suite
+# at collection rather than letting a stale suppressor mask a regression.
+@pytest.fixture(scope="session")
+def dmesg_allowlist():
+    return load_allowlist()
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -91,20 +100,23 @@ def lan():
 # ---- per-test ------------------------------------------------------------
 
 @pytest_asyncio.fixture
-async def splat_window(aiohttp_session, target_agent):
+async def splat_window(request, aiohttp_session, target_agent, dmesg_allowlist):
     """Wrap a test in a capture window; fail if new kernel splats appear.
 
     Even if the test's main assertion failed, run the splat check — a
     sanitizer report is independently important and surfacing both
     signals beats hiding one.
+
+    Splat filtering is two-stage: the agent emits everything matching
+    SPLAT_RE; this fixture then drops anything in the checked-in
+    allowlist (golden/dmesg_allowlist.yaml). Test authors should *not*
+    add inline filters here — extend the YAML.
     """
     cap_id = await target_agent.capture_start(aiohttp_session, ifaces=["eth3", "eth4"])
     yield cap_id
     result = await target_agent.capture_stop(aiohttp_session, cap_id)
-    # Splat false-positive filtering happens agent-side now (see
-    # askd_agent.dmesg.has_splat). Anything in result["splats"] is
-    # already a real splat — no further filtering here.
-    splats = result.get("splats", [])
+    raw = result.get("splats", [])
+    splats = filter_splats(raw, request.node.nodeid, dmesg_allowlist)
     assert not splats, (
         f"kernel splats during test ({len(splats)}): "
         + "; ".join(s.strip() for s in splats[:3])

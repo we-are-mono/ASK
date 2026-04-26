@@ -54,6 +54,13 @@ CDX_CTRL_DPA_SET_PARAMS = _IOWR(CDX_IOC_MAGIC, 1, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
 # table has no entry for it — any invocation must return -ENOTTY.
 CDX_CTRL_DPA_CONNADD_LEGACY = _IOWR(CDX_IOC_MAGIC, 3, 0)
 
+# Debug-only ioctl (cdx/cdx_ioctl.h, gated on DPAA_DEBUG_ENABLE). On
+# production builds this nr has no dispatcher entry, so any invocation
+# must return -ENOTTY. struct muram_data layout: void *buff (8 B) +
+# uint32_t size (4 B + 4 B tail pad) = 16 B on arm64.
+SIZEOF_CDX_CTRL_GET_MURAM_DATA = 16
+CDX_CTRL_DPA_GET_MURAM_DATA = _IOWR(CDX_IOC_MAGIC, 4, SIZEOF_CDX_CTRL_GET_MURAM_DATA)
+
 # An arbitrary never-used nr so we can probe the "unknown ioctl" path
 # without accidentally matching something we don't remember.
 CDX_CTRL_UNKNOWN_NR = _IOWR(CDX_IOC_MAGIC, 99, 0)

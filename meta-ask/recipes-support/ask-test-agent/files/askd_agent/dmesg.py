@@ -37,22 +37,6 @@ SPLAT_RE = re.compile(
     r"inconsistent.*usage)"     # lockdep state-mismatch
 )
 
-# Lines that pass SPLAT_RE on substring but are benign informational
-# kernel banners — e.g. CONFIG_PROVE_RCU's boot announcement before any
-# real lock has been taken. These are routine on every boot of a
-# lockdep-enabled image and aren't splats. The pattern below is
-# matched against the same lines BEFORE reporting; matches are
-# excluded from the splat list.
-#
-# (Today this is belt-and-braces defence — the rcu line no longer
-# matches SPLAT_RE itself once we tightened "lockdep" to specific
-# splat patterns above. Kept so a future SPLAT_RE broadening doesn't
-# silently re-introduce the false positive.)
-_SPLAT_FALSE_POSITIVES_RE = re.compile(
-    r"rcu: RCU lockdep checking is enabled"
-)
-
-
 def read_kmsg_seq() -> int | None:
     """Return the current last-written /dev/kmsg sequence number (None if N/A)."""
     if not KMSG_PATH.exists():
@@ -126,15 +110,10 @@ def read_since(cursor: int | None) -> tuple[int | None, list[str]]:
 
 
 def has_splat(lines: list[str]) -> list[str]:
-    """Return the subset of lines that look like real kernel splats.
+    """Return the subset of lines that look like kernel splats.
 
-    Filters out informational lines that match SPLAT_RE on substring
-    but aren't actual sanitiser/lockdep reports — see
-    `_SPLAT_FALSE_POSITIVES_RE` for the deny-list. Centralising the
-    filter here means every caller of /capture-stop and /dmesg-delta
-    benefits, not just orchestrator fixtures with their own ad-hoc
-    deny-list."""
-    return [
-        l for l in lines
-        if SPLAT_RE.search(l) and not _SPLAT_FALSE_POSITIVES_RE.search(l)
-    ]
+    Policy lives client-side: orchestrator's splat_window fixture filters
+    this raw list against tools/tests/golden/dmesg_allowlist.yaml. Keeping
+    the agent simple means no rebuild/restage cycle to update suppressions.
+    """
+    return [l for l in lines if SPLAT_RE.search(l)]

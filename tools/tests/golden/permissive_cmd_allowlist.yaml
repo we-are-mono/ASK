@@ -1,0 +1,79 @@
+# Acknowledged CDX_CMD_VAR(0, U16_MAX) commands.
+#
+# A PERMISSIVE entry on the FCI command bus means the dispatcher accepts
+# *any* payload size — the handler owns rejection. The validator-table
+# migration (ISSUES.md A1b/A1c) progressively tightens these toward
+# EXACT / BOUNDED. Until a given command migrates, list it here with a
+# brief reason, so a NEWLY-permissive command can't sneak past CI.
+#
+# Required fields per entry:
+#   name    - exact CMD_* identifier as it appears in cdx headers
+#   reason  - short justification (e.g. "noop handler", "RTP gated", ...)
+#
+# When A1c migrates a command, drop its entry here. The validator-coverage
+# test fails if the source has a permissive command not listed below — at
+# which point either tighten the spec, or add an entry with a reason.
+
+allowlist:
+  - name: CMD_BRIDGED_ITF_UPDATE
+    reason: "auto_bridge bridged-iface notification; pcmd passed through to abm with own validation"
+  - name: CMD_RX_L2BRIDGE_ADD
+    reason: "cdx-side noop (real logic in auto_bridge via netfilter)"
+  - name: CMD_RX_L2BRIDGE_REMOVE
+    reason: "cdx-side noop (real logic in auto_bridge via netfilter)"
+  - name: CMD_RX_L2BRIDGE_ENABLE
+    reason: "cdx-side noop"
+  - name: CMD_RX_L2BRIDGE_MODE
+    reason: "cdx-side noop"
+  - name: CMD_RX_L2BRIDGE_FLOW_TIMEOUT
+    reason: "cdx-side noop"
+  - name: CMD_RX_L2BRIDGE_FLOW_RESET
+    reason: "cdx-side noop"
+  - name: CMD_RX_L2BRIDGE_QUERY_STATUS
+    reason: "cdx-side noop"
+  - name: CMD_VLAN_ENTRY_RESET
+    reason: "ISSUES.md A1b item 6; vlan reset accepts any length, handler ignores body"
+  - name: CMD_IPV4_RESET
+    reason: "wholesale conntrack flush; no body interpretation"
+  - name: CMD_IPV6_RESET
+    reason: "wholesale conntrack flush; no body interpretation"
+
+  # Subsystems gated under CDX_TODO_* in the .c registrations are
+  # already filtered out of PERMISSIVE_CMDS by _cmd_catalog. The entries
+  # below are PERMISSIVE because their CMD_* defines exist in headers
+  # but the registrations live in feature-flagged blocks; if a future
+  # build flips that flag on, we want explicit acknowledgement.
+  - name: CMD_IPSEC_RESET_SEC_FAILURE_STATS
+    reason: "IPSec stats reset; gated by CDX_TODO_IPSEC in production"
+  - name: CMD_IPSEC_SA_FLUSH
+    reason: "IPSec SA flush; gated by CDX_TODO_IPSEC in production"
+  - name: CMD_IPSEC_SEC_FAILURE_STATS
+    reason: "IPSec stats query; gated by CDX_TODO_IPSEC in production"
+  - name: CMD_QM_INGRESS_POLICER_RESET
+    reason: "QM policer reset; no body interpretation"
+  - name: CMD_QM_SEC_POLICER_RESET
+    reason: "QM SEC policer reset; no body interpretation"
+  - name: CMD_RTCP_QUERY
+    reason: "RTP/RTCP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_OPEN
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_CLOSE
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_CONTROL
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_UPDATE
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_TAKEOVER
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_SPECTX_PLD
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_SPECTX_CTRL
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_RTP_STATS_DTMF_PT
+    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+  - name: CMD_STAT_BRIDGE_ENTRY
+    reason: "STAT bridge query; cdx-side noop"
+  - name: CMD_STAT_BRIDGE_STATUS
+    reason: "STAT bridge query; cdx-side noop"
+  - name: CMD_WIFI_VAP_RESET
+    reason: "WIFI VAP reset; gated by CDX_TODO_WIFI in production"
