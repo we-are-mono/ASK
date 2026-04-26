@@ -1,357 +1,256 @@
 # ASK Kernel-Module Security & Memory-Safety Issues
 
 Working list from the security review of `cdx/`, `fci/`, and `auto_bridge/`.
-Each item has enough context to be picked up in isolation. Check off as we fix.
+Entries are short by design — each fix's reasoning lives in the commit
+referenced as `Fixed: <hash>`. Read the commit message for context.
 
-**Status legend:** `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` wontfix/not-a-bug (explain inline)
+**Status legend:** `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` wontfix/not-a-bug
 
 ---
 
-## Gating Issue — fix this first
+## Gating
 
-It changes the reachability (and therefore severity) of almost everything else.
-
-- [x] **G1. `/dev/cdx_ctrl` ioctl has no capability check.**
-  [cdx/cdx_dev.c:110-140](cdx/cdx_dev.c#L110-L140). `cdx_ctrl_ioctl` dispatches `CDX_CTRL_DPA_SET_PARAMS`, `CDX_CTRL_DPA_CONNADD`, and (when built with `DPAA_DEBUG_ENABLE`) `CDX_CTRL_DPA_GET_MURAM_DATA` with no `capable(CAP_NET_ADMIN)` / `CAP_SYS_ADMIN` guard. Combined with whatever udev mode the device node gets, unprivileged users may be able to reconfigure the entire DPAA datapath. **Fix:** add `if (!capable(CAP_NET_ADMIN)) return -EPERM;` at the top of the dispatcher (or per-command for finer granularity). Confirm device node perms in the target rootfs.
-  _Done on branch `fix/cdx-ioctl-cap-check`: added `CAP_NET_ADMIN` gate + `<linux/capability.h>` include in `cdx_dev.c`._
+- [x] **G1. `/dev/cdx_ctrl` ioctl had no capability check.**
+  [cdx/cdx_dev.c:110-140](cdx/cdx_dev.c#L110-L140). Unprivileged users could reconfigure the DPAA datapath. _Fixed: 815a0ca_ — `CAP_NET_ADMIN` gate on the dispatcher.
 
 - [x] **G2. Racy single-open gate.**
-  [cdx/cdx_dev.c:48-56](cdx/cdx_dev.c#L48-L56). `atomic_dec_and_test` followed by `atomic_inc` on failure is check-then-act: two concurrent `open()`s can both succeed. **Fix:** use a mutex, or `atomic_cmpxchg(&cnt, 1, 0)` to flip from "free" to "taken" atomically.
-  _Done on branch `fix/cdx-ioctl-cap-check`: switched open to `atomic_cmpxchg(1→0)`, release to `atomic_set(1)`. Correction: the original dec/inc can't actually let two openers both succeed (`atomic_dec_and_test` is itself atomic), but it does have a transient window where a new opener is spuriously rejected between release and the failed-opener's inc; and a stray release inflates the counter past 1. Both are resolved._
+  [cdx/cdx_dev.c:48-56](cdx/cdx_dev.c#L48-L56). `atomic_dec_and_test` + `atomic_inc` was check-then-act with a transient mis-rejection window. _Fixed: 815a0ca_ — `atomic_cmpxchg(1→0)`.
 
 ---
 
 ## CRITICAL
 
-Memory corruption or info-leak reachable from userspace (unprivileged once G1 is open, privileged if G1 is fixed).
+Memory corruption or info-leak reachable from userspace.
 
-- [x] **C1. Netlink attribute length trusted as memcpy size (auto_bridge).**
-  [auto_bridge/auto_bridge.c:540-544](auto_bridge/auto_bridge.c#L540-L544). `memcpy(&l2flow_temp.l3.saddr.all, nla_data(tb[L2FLOWA_IP_SRC]), nla_len(tb[L2FLOWA_IP_SRC]))` — destination is a 16-byte union on the stack, length is attacker-controlled. `nlmsg_parse` at line 501 passes `NULL` policy, so per-attribute lengths are never validated. Same pattern on `L2FLOWA_IP_DST`. **Fix:** define a `struct nla_policy[]` that constrains `L2FLOWA_IP_SRC`/`_DST` to `NLA_BINARY` with `.len = sizeof(union)`, or guard with `if (nla_len(..) > sizeof(l2flow_temp.l3.saddr.all)) return -EINVAL;` before each memcpy.
-  _Done: added `abm_l2flow_policy[]` covering all L2FLOWA_* attrs (IP_SRC/DST bounded to `sizeof_field(struct l2flow, l3.saddr.all)` = 16 B via `NLA_BINARY`; integer attrs strict-typed as `NLA_U8/U16/U32`), passed to `nlmsg_parse`. Oversized or mistyped attributes are now rejected before the memcpy runs._
+- [x] **C1. Netlink attr length trusted as memcpy size (auto_bridge).**
+  [auto_bridge/auto_bridge.c:540-544](auto_bridge/auto_bridge.c#L540-L544). `nla_len` controlled the memcpy into a 16-byte stack union. _Fixed: 815a0ca_ — `nla_policy[]` for L2FLOWA_*.
 
 - [x] **C2. FCI netlink message — no length validation.**
-  [fci/fci.c:417-475](fci/fci.c#L417-L475). `__fci_fe_inbound_data` does `fci_msg = nlmsg_data(nlh)` and then calls `comcerto_fpp_send_command(fci_msg->fcode, fci_msg->length, fci_msg->payload, …)` with zero checks that (a) `nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(FCI_MSG))`, (b) `fci_msg->length <= FCI_MSG_MAX_PAYLOAD`, (c) `fci_msg->length <= nlmsg_len(nlh) - FCI_MSG_HDR_SIZE`. Short nlmsg + large `length` → OOB read into the FPP command path. **Fix:** validate all three before dispatch; reject malformed messages with `-EINVAL`.
-  _Done, with a target-boot correction:_ first pass rejected any `nlh->nlmsg_len > skb->len`, which silently dropped every FCI command cmm sent — libfci writes `nlmsg_len = NLMSG_ALIGN(payload)` (e.g. 24) while the actual skb carries only the unaligned iov sum (e.g. 22). cmm's `recvmsg()` then hung forever waiting for a reply that was never going to come, so HW offload never started even though the module loaded. Diagnosed by stracing cmm on the target and seeing `sendmsg(…) = 22` followed by an indefinite `recvmsg(5, <unfinished>`. Corrected version uses `skb->len` as the authoritative size: reject only if `skb->len < NLMSG_LENGTH(FCI_MSG_HDR_SIZE)`, then bound `fci_msg->length` against `skb->len - NLMSG_LENGTH(FCI_MSG_HDR_SIZE)`. Original OOB concern (payload lying about its length) is still covered; the sender-supplied `nlmsg_len` is now ignored for this purpose._
+  [fci/fci.c:417-475](fci/fci.c#L417-L475). Short `nlmsg_len` + large `fci_msg->length` → OOB read. _Fixed: 815a0ca, corrected in 0a8a5f6_ — gate on `skb->len`, not on the sender-supplied `nlmsg_len`.
 
 - [x] **C3. Reassembly trusts hardware-sourced `num_entries`.**
-  [cdx/cdx_reassm.c:141,163-189](cdx/cdx_reassm.c#L141-L189). `num_entries = list->num_entries;` is read from a reassembly context populated by FMAN and used unbounded in the buffer-release loop (`for (ii = 0; ii < num_entries; ii++) … list++`). A malformed frame walks `list` past the allocated pool and feeds garbage addrs/bpids to `bman_release`. **Fix:** bound-check `num_entries` against the known max fragments per context (derived from `ipr_info.max_frags_per_ctx` or similar); skip release on overflow.
-  _Done: `num_entries > reassly_bp->size / sizeof(*list)` rejects the frame (consume without acting) before the release loop runs. Uses physical buffer capacity as the bound, the tightest defense that requires no config plumbing._
+  [cdx/cdx_reassm.c:141,163-189](cdx/cdx_reassm.c#L141-L189). Loop walked `list` past the pool on malformed frames. _Fixed: 815a0ca_ — bound against `reassly_bp->size`.
 
-- [x] **C4. Reassembly refcount is a `uint8_t` with no underflow guard.**
-  [cdx/cdx_reassm.c:157,163](cdx/cdx_reassm.c#L157-L163). `list->ref_count--;` then `if (!list->ref_count)` releases buffers. Double-entry into this callback for the same context wraps the counter to 255 and skips release — or, if the hardware delivers the same context N+1 times, the (N+1)th decrement flips zero→255 and silently leaks the release. **Fix:** change to `uint32_t` (cheap) and guard with `if (list->ref_count == 0) { WARN_ON(1); return …; }` before the decrement.
-  _Done: guard `if (list->ref_count == 0) { DPA_ERROR(...); return consume; }` placed before the decrement. Kept `uint8_t` since the struct is hardware-populated and layout-sensitive._
+- [x] **C4. Reassembly refcount is `uint8_t` with no underflow guard.**
+  [cdx/cdx_reassm.c:157,163](cdx/cdx_reassm.c#L157-L163). Wrap to 255 on double-decrement. _Fixed: 815a0ca_ — zero-guard before decrement.
 
-- [x] **C5. IP reassembly deinit is a stub → UAF on module unload.**
-  [cdx/cdx_reassm.c:366-380](cdx/cdx_reassm.c#L366-L380). `cdx_deinit_ip_reassembly()` is literally `printk("implement this\n")`. The `ipr_timer` kthread keeps running after init resources are freed. **Fix:** implement deinit: `kthread_stop(ipr_timer_thread)` first, then tear down FQs/bpool/ehash in reverse init order. Also cover the partial-init failure path in `cdx_init_ip_reassembly()`.
-  _Partial done: `kthread_stop(ipr_timer_thread)` now runs on unload (resolves the UAF-via-code-gone). FQ/bpool/hook teardown remains TODO and is flagged inline; those leak on unload but no longer crash._
+- [x] **C5. IP reassembly deinit was a stub.**
+  [cdx/cdx_reassm.c](cdx/cdx_reassm.c). `printk("implement this")` while `ipr_timer` kthread kept running → UAF on unload. _Fixed in stages:_ 815a0ca (kthread stop), b5a7bf8 (bpool free + hook unregister), 78ac2af (FQ retire/oos/destroy + fqid range release via private `ipr_fqs[]` tracking).
 
-- [x] **C6. Integer-scaled/unbounded allocations driven by userspace (dpa_cfg).**
-  Repeated pattern in [cdx/dpa_cfg.c](cdx/dpa_cfg.c):
-    - `sizeof(struct cdx_fman_info) * params.num_fmans` at [L602](cdx/dpa_cfg.c#L602)
-    - `sizeof(struct cdx_port_info) * finfo->max_ports` at [L280](cdx/dpa_cfg.c#L280)
-    - `sizeof(struct cdx_dist_info) * port_info->max_dist` at [L182](cdx/dpa_cfg.c#L182)
-    - `sizeof(struct table_info) * finfo->num_tables` at [L343](cdx/dpa_cfg.c#L343)
+- [x] **C6. Integer-scaled allocations driven by userspace (dpa_cfg).**
+  [cdx/dpa_cfg.c](cdx/dpa_cfg.c). `sizeof(...) * num_fmans/max_ports/max_dist/num_tables` with attacker-influenced counts. _Fixed: 815a0ca, corrected in 0a8a5f6_ — sanity caps + `kcalloc`; legitimate zero counts allowed for unused-resource sub-structs.
 
-  On 64-bit the pure-overflow angle is weak, but userspace can drive arbitrarily large allocations (DoS), and the results land in globals with no locking. **Fix:** reject unreasonable counts up-front (`if (num > MAX_SANE) return -EINVAL;`), use `kmalloc_array`/`kcalloc` for overflow-safe scaling.
-  _Done, with a target-boot correction:_ defined `CDX_MAX_FMANS=16`, `CDX_MAX_PORTS=128`, `CDX_MAX_DIST=256`, `CDX_MAX_TABLES=256` at the top of dpa_cfg.c (4x-16x current hardware/userspace ceilings) and switched the three sub-allocations to `kcalloc`. First pass also rejected `max_dist == 0 / max_ports == 0 / num_tables == 0`, which turns out to be over-strict: dpa_app legitimately passes zero for an FMAN sub-struct that just doesn't use that resource (a port with no distribution, an FMAN with no tables, etc.), and the pre-hardening code accepted that silently via `kzalloc(0) → ZERO_SIZE_PTR` with zero-iteration downstream loops. Corrected: only reject `> MAX`, let zero through; `kcalloc(0, size, flags)` returns the same `ZERO_SIZE_PTR` sentinel and the NULL-guard keeps working. `num_fmans == 0` is still hard-rejected — the post-alloc code dereferences `fman_info` unconditionally, so zero really is invalid there. Redundant `memset` after zero-alloc removed; unused `mem_size` in `cdx_ioc_set_dpa_params` removed._
-
-- [x] **C7. Off-by-one index validation in `fm_index` checks.**
-  [cdx/dpa_cfg.c:367](cdx/dpa_cfg.c#L367) plus near-identical sites at ~993, 1008, 1022, 1035, 1048: `if (fm_index > num_fmans) return -1;` should be `>=`. Allows one-past-end access to `fman_info[]`. **Fix:** change all six to `>=` and grep the file for the pattern `> num_fmans` / `> max_ports` to catch siblings.
-  _Done: all six `fm_index > num_fmans` sites flipped to `>=`._
-
-- [x] **C8. Unbounded user-controlled array indices.**
-  [cdx/dpa_cfg.c:981,998,1013,1053](cdx/dpa_cfg.c#L981) use `queue_no` as an index into `ingress_policer_info[]` with no bound. [cdx/dpa_cfg.c:902](cdx/dpa_cfg.c#L902) does `1 << port_idx` with no `port_idx < 32` check (UB). [cdx/cdx_ehash.c:288-289](cdx/cdx_ehash.c#L288) indexes `dscp_vlanpcp_map.dscp_vlanpcp[dscp]` with no `dscp < 64` check. **Fix:** bound-check all three at entry.
-  _Done: `queue_no >= INGRESS_ALL_POLICER_QUEUES` added to `cdx_get_policer_profile_id`, `cdx_ingress_enable_or_disable_qos`, `cdx_ingress_policer_modify_config`, `cdx_ingress_policer_stats`. `port_idx >= 32` guard added to `dpa_get_tdinfo` and shift made `1U << port_idx`. `dscp >= ARRAY_SIZE(dscp_vlanpcp_map.dscp_vlanpcp)` guard in `set_dscp_vlan_pcp_map_cfg`._
+- [x] **C7. Off-by-one `fm_index` checks.**
+  [cdx/dpa_cfg.c:367,993,1008,1022,1035,1048](cdx/dpa_cfg.c#L367). All six `> num_fmans` flipped to `>=` in _815a0ca_.
 
 - [x] **Bonus. Pre-existing modpost section mismatch.**
-  `cdx_ctrl_deinit` (.text) called `cdx_cmdhandler_exit` (.exit.text). Dropped the `__exit` attribute from `cdx_cmdhandler_exit`; loadable module gets no real benefit from `.exit.text` here and the cross-section call is now clean. Hidden from earlier builds by `tail -10` truncation; surfaced with `tail -25`.
+  `cdx_ctrl_deinit` (.text) called `cdx_cmdhandler_exit` (.exit.text). _Fixed: 815a0ca_ — dropped `__exit`.
 
-- [x] **C9. Test ioctl is always compiled in, has broken kzalloc flags.**
-  [cdx/dpa_test.c:61-63](cdx/dpa_test.c#L61-L63): `kzalloc(sizeof(struct test_conn_info) * add_conn.num_conn, 0)` — GFP flag is literally `0`, and `num_conn` is unbounded from userspace. [cdx/cdx_dev.c:121-124](cdx/cdx_dev.c#L121-L124) dispatches `cdx_ioc_dpa_connadd` unconditionally (not behind `DPAA_DEBUG_ENABLE`). **Fix:** either gate the handler behind `#ifdef DPAA_DEBUG_ENABLE` like `CDX_CTRL_DPA_GET_MURAM_DATA`, or remove `dpa_test.c` from the Kbuild list entirely. If kept, use `kcalloc(num_conn, sizeof(*conn_info), GFP_KERNEL)` with a sanity bound on `num_conn`.
-  _Done (kept-and-fixed): added `CDX_MAX_TEST_CONN=64` sanity cap (real usage = 1), rejected zero/oversize up-front, replaced `kzalloc(size*n, 0)` with `kcalloc(num_conn, sizeof(*conn_info), GFP_KERNEL)`. Correction on the "wired to production" claim I made mid-session: `test_app_init()` is actually **dead code** — `#define ENABLE_TESTAPP 1` in `dpa_app/main.c:18` is commented out, so userspace never calls it. But `testapp.o` is still linked into `dpa_app` and the kernel dispatcher exposes `CDX_CTRL_DPA_CONNADD` unconditionally. See follow-up C9b._
+- [x] **C8. Unbounded user-controlled array indices.**
+  [cdx/dpa_cfg.c](cdx/dpa_cfg.c) `queue_no`, `port_idx`, [cdx/cdx_ehash.c:288-289](cdx/cdx_ehash.c#L288) `dscp`. _Fixed: 815a0ca_ — bound checks at entry.
 
-- [x] **C9b. Follow-up: remove the dead testapp scaffolding entirely.**
-  Now that C9 is fixed, the test surface is safe but still exposed. Cleaner end-state: (a) drop `testapp.o` from [dpa_app/Makefile](dpa_app/Makefile#L13) and delete [dpa_app/testapp.c](dpa_app/testapp.c) + its extern in [dpa_app/main.c](dpa_app/main.c#L21-L30); (b) gate `CDX_CTRL_DPA_CONNADD` in [cdx/cdx_dev.c](cdx/cdx_dev.c#L121-L124) behind `#ifdef DPAA_DEBUG_ENABLE` like `CDX_CTRL_DPA_GET_MURAM_DATA`. Also moves `cdx/dpa_test.c` compilation under the same guard or drops it from the Kbuild list. Deferred to the userspace review session since (a) is userspace-side.
-  _Done — full removal instead of gating._ Kernel: deleted `cdx/dpa_test.c`, removed `dpa_test.o` from `cdx/Kbuild` and `cdx/Makefile`, removed the `CDX_CTRL_DPA_CONNADD` dispatcher case in `cdx/cdx_dev.c`, removed `struct test_flow_info`, `struct test_conn_info`, `struct add_conn_info`, the `CDX_CTRL_DPA_CONNADD` macro, and the `cdx_ioc_dpa_connadd` prototype from `cdx/cdx_ioctl.h`. Userspace: deleted `dpa_app/testapp.c`, removed `testapp.o` from `dpa_app/Makefile`, removed the `ENABLE_TESTAPP` block and `test_app_init` extern from `dpa_app/main.c`, removed the orphan `show_muram_temp` forward decl in `dpa_app/dpa.c`. H10 (the `strncpy_from_user` truncation issue) is now moot since dpa_test.c is gone._
+- [x] **C9. Test ioctl always compiled in, broken kzalloc flags.**
+  [cdx/dpa_test.c:61-63](cdx/dpa_test.c#L61-L63). `kzalloc(... * num_conn, 0)` with unbounded `num_conn`, dispatched unconditionally. _Fixed: 815a0ca_ — sanity-cap + `kcalloc`.
+
+- [x] **C9b. Remove dead testapp scaffolding entirely.**
+  After C9 the surface was safe but still exposed. _Fixed: 815a0ca_ — deleted `cdx/dpa_test.c`, `dpa_app/testapp.c`, and the `CDX_CTRL_DPA_CONNADD` ioctl. H10 mooted by this.
 
 ---
 
 ## HIGH
 
-- [x] **H1. `cdx_ioc_set_dpa_params` mutates globals without locking.**
-  [cdx/dpa_cfg.c:588-719](cdx/dpa_cfg.c#L588-L719). `fman_info` and `num_fmans` are rewritten while other contexts (policer, query, etc.) read them lock-free. Concurrent ioctls → UAF on the old `fman_info`. **Fix:** take a dedicated module-level mutex for the whole config-set operation; audit readers and either take the same mutex or convert to RCU.
-  _Done: added `static DEFINE_MUTEX(dpa_cfg_lock)` in dpa_cfg.c and took it for the whole `cdx_ioc_set_dpa_params` body. On entry, reject re-init with `-EBUSY` if `fman_info` is already set — the original code just overwrote and leaked the old pointer, which was the real UAF vector. Converted the three mid-function bare `return -1;` leaks (`cdxdrv_get_fman_handles`, `cdxdrv_init_stats`, `cdx_create_port_fqs` failure paths) into `retval = -EIO; goto err_ret;` so teardown and unlock run. Same for the three goto-err-ret sites that previously left `retval` uninitialized (`cdxdrv_create_ingress_qos_policer_profiles`, `ceetm_init_cq_plcr`, `cdxdrv_set_miss_action`). Reader-during-init race remains theoretical (A2): in practice init runs once at boot before any traffic, so readers never see partial state._
+- [x] **H1. `cdx_ioc_set_dpa_params` mutated globals without locking.**
+  [cdx/dpa_cfg.c:588-719](cdx/dpa_cfg.c#L588-L719). Concurrent ioctls → UAF on the old `fman_info`. _Fixed: 613efa3_ — `dpa_cfg_lock` mutex, reject re-init, convert bare-return leaks to `goto err_ret`.
 
 - [x] **H2. IPsec SA key material not zeroed on free.**
-  [cdx/cdx_dpa_ipsec.c:205-222](cdx/cdx_dpa_ipsec.c#L205-L222). `cipher_key`, `auth_key`, `split_key` are freed with plain `kfree()`. **Fix:** replace with `kfree_sensitive()` (Linux ≥5.10), or `memzero_explicit(ptr, len); kfree(ptr);`. Track each buffer's length alongside the pointer since `kfree_sensitive` handles that automatically.
-  _Done: three key-field `kfree` calls in `cdx_ipsec_sec_sa_context_free` replaced with `kfree_sensitive`. Non-key descriptor fields (`sec_desc_extra_cmds_unaligned`, `rjob_desc_unaligned`) kept as plain `kfree`._
+  [cdx/cdx_dpa_ipsec.c:205-222](cdx/cdx_dpa_ipsec.c#L205-L222). _Fixed: 613efa3_ — `kfree_sensitive()` on the three key fields.
 
 - [x] **H3. IPsec error paths leak DMA mappings.**
-  [cdx/cdx_dpa_ipsec.c:1964-1995](cdx/cdx_dpa_ipsec.c#L1964-L1995). On non-zero return from `cdx_ipsec_build_shared_descriptor`, `auth_key_dma` and `crypto_key_dma` are left mapped. Also [cdx/cdx_dpa_ipsec.c:2580-2593](cdx/cdx_dpa_ipsec.c#L2580-L2593) has an explicit `TBD???` comment about leaking the shared descriptor on table-insert failure. **Fix:** single error label that unmaps in reverse of the success order; free the shared-descriptor context via `cdx_ipsec_sec_sa_context_free()` on failure.
-  _Done: `cdx_ipsec_create_shareddescriptor` now has a two-label unwind (`err_unmap_crypto` / `err_unmap_auth`) covering the three previous leak paths — crypto-key map failure, default switch case (build_shared_descriptor returning other than 0 or -EPERM), and extended-build failure. `cdx_ipsec_add_classification_table_entry` tracks whether it built the shared descriptor in this call; on failure it clears `SA_SH_DESC_BUILT` so a retry rebuilds cleanly (addresses the `TBD???` without making lifetime assumptions about `pSec_sa_context`, which is owned elsewhere). M7 collapses into H3._
+  [cdx/cdx_dpa_ipsec.c:1964-1995,2580-2593](cdx/cdx_dpa_ipsec.c#L1964-L1995). _Fixed: 613efa3_ — two-label unwind in `cdx_ipsec_create_shareddescriptor`; `SA_SH_DESC_BUILT` rolls back on entry-add failure (M7 folded in).
 
 - [-] **H4. Suspicious DMA map-then-immediately-unmap for CAAM descriptor.**
-  [cdx/cdx_dpa_ipsec.c:2028-2033](cdx/cdx_dpa_ipsec.c#L2028-L2033). The shared descriptor is mapped, then unmapped, both within the same call site, with no intervening hardware access visible here. If the descriptor's bus address is being cached elsewhere for later use by SEC, this is a DMA use-after-unmap. **Fix:** verify on hardware whether CAAM actually needs the cached DMA handle beyond this call. If yes, keep the mapping alive and unmap on SA teardown; if no, delete the dead `dma_map_single` entirely.
-  _Not a bug, correction to the agent's claim:_ `shared_desc_dma` is a local that is never stored or passed anywhere, so there's no use-after-unmap. The pair is a legitimate cache-flush idiom — `dma_map_single(..., DMA_TO_DEVICE)` flushes the CPU-cached writes to `sec_desc` (preheader, PDB, shared_desc) out to memory, and the matching unmap on `DMA_TO_DEVICE` is a no-op that releases bookkeeping. On non-coherent ARM64 this flush is necessary; the SEC engine reads the descriptor later via the handle stored in `dpa_ipsecsa_handle`. Added a comment documenting the intent so a future reader doesn't flag it again._
+  [cdx/cdx_dpa_ipsec.c:2028-2033](cdx/cdx_dpa_ipsec.c#L2028-L2033). Not a bug — `shared_desc_dma` is a local never stored anywhere. The pair is a legitimate cache-flush idiom on non-coherent ARM64; SEC reads the descriptor later via the handle stored in `dpa_ipsecsa_handle`. Comment added documenting intent.
 
 - [x] **H5. NAT-T SPI array bound is off-by-one.**
-  [cdx/cdx_dpa_ipsec.c:2310-2318](cdx/cdx_dpa_ipsec.c#L2310-L2318). `if (arr_index > MAX_SPI_PER_FLOW) goto err_ret;` admits `arr_index == MAX_SPI_PER_FLOW`, one past the array. **Fix:** change to `>=`.
-  _Done: `>` → `>=`. `get_free_natt_arr_index` returns `MAX_SPI_PER_FLOW` when the mask is full, so that exact value must be rejected._
+  [cdx/cdx_dpa_ipsec.c:2310-2318](cdx/cdx_dpa_ipsec.c#L2310-L2318). `> MAX_SPI_PER_FLOW` should be `>=`. _Fixed: 613efa3_.
 
 - [-] **H6. auto_bridge iterates hash buckets with lock drop between buckets.**
-  [auto_bridge/auto_bridge.c:232-251](auto_bridge/auto_bridge.c#L232-L251). `spin_lock_bh(&abm_lock) / spin_unlock_bh` inside the `for (i < L2FLOW_HASH_TABLE_SIZE)` loop. A cached `table_entry` pointer carried across iterations can be freed by a concurrent writer. **Fix:** either hold the lock across the whole scan (check it's not called from a softirq path that would dead-bh), or take references / use RCU for the entries.
-  _Not a concrete bug, correction to the agent's claim:_ `table_entry` is rebound each inner iteration via `container_of`, never persisted across outer iterations. The only mutator called inside (`__abm_go_dying`) does not remove the entry from the current bucket — it only flips state/flags, adds to `l2flow_list_wait_for_ack`, and schedules a timer. Hash keys are immutable after insert, so entries never rehash between buckets. The lock-drop between buckets is a deliberate bounded-hold-time design for port-down sweeps that can touch thousands of entries. Concurrent writers serialize on the same lock. Filed-away improvement: switch to `list_for_each_safe` inside each bucket so a future modification that does `list_del` won't silently UAF — but that's forward-hardening, not a current fix._
+  [auto_bridge/auto_bridge.c:232-251](auto_bridge/auto_bridge.c#L232-L251). Not a bug — `table_entry` is rebound each inner iteration via `container_of`, never persisted across outer iterations; the lock-drop is a deliberate bounded-hold-time design. Hash keys are immutable post-insert.
 
 - [x] **H7. auto_bridge stores `net_device *` without `dev_hold()`.**
-  [auto_bridge/auto_bridge.c:210](auto_bridge/auto_bridge.c#L210) and use at [line 139-143](auto_bridge/auto_bridge.c#L139-L143). Pointer persists across a workqueue boundary with no refcount. **Fix:** `dev_hold()` at capture, `dev_put()` when the work completes or the entry is freed. Prefer storing `ifindex` and re-resolving with `dev_get_by_index_rcu()` at use time if the pointer isn't needed for identity.
-  _Done: `dev_hold()` added in `add_brevent` (caller already guarantees non-NULL brdev), paired `dev_put()` in the `abm_do_work_send_msg` drain and a new drain in `abm_l2flow_table_exit` so entries pending at module unload are balanced. Also lifted the "skip everything if no L2FLOW_NL_GRP listener" early return — bridge events use RTNL netlink, not abm_nl, and were being starved (plus, once dev_hold was added, a pile-up with no listeners would have indefinitely blocked `unregister_netdevice`). The l2flow msg drain stays gated on abm_nl listeners; the bridge drain runs unconditionally._
+  [auto_bridge/auto_bridge.c:210](auto_bridge/auto_bridge.c#L210). Pointer crossed a workqueue boundary unrefcounted. _Fixed: 613efa3_ — `dev_hold`/`dev_put` balance + module-exit drain.
 
-- [x] **H8. auto_bridge sysctl is world-writable, triggers state flush.**
-  [auto_bridge/auto_bridge.c:1385-1406](auto_bridge/auto_bridge.c#L1385-L1406). `abm_l3_filtering` is mode `0644`; a write calls `abm_l2flow_table_flush()`. `abm_max_entries` (same file, ~1453) accepts any `u32` including 0. **Fix:** set mode to `0600`, or add an explicit `capable(CAP_NET_ADMIN)` check in a custom `.proc_handler`. Add a lower bound on `abm_max_entries`.
-  _Correction + done:_ `0644` on proc/sys nodes is owner-writable only (others read-only), not "world-writable" — the agent's phrasing was off. The defense-in-depth concern stands, so `abm_sysctl_l3_filtering` now rejects writes from callers without `CAP_NET_ADMIN`. `abm_max_entries` switched from `proc_dointvec` to `proc_douintvec_minmax` with bounds [1, 1_000_000] — rejects 0 (which silently broke the `abm_nb_entries >= abm_max_entries` gate) and rejects absurd upper values. The timeout/retransmit sysctls stay on `proc_dointvec_jiffies`; they only adjust timing, not state-mutating._
+- [x] **H8. auto_bridge sysctl, missing CAP check + accepts 0.**
+  [auto_bridge/auto_bridge.c:1385-1406](auto_bridge/auto_bridge.c#L1385-L1406). `0644` on proc/sys is owner-write-only (not "world-writable" as originally claimed), but a `CAP_NET_ADMIN` gate is sound defense-in-depth. _Fixed: 613efa3_ — explicit cap check + `proc_douintvec_minmax` bounds.
 
-- [x] **H9. Query-snapshot static state is shared and lock-free.**
-  Statics for pagination in multiple files — [cdx/cdx_mc_query.c](cdx/cdx_mc_query.c) (mc4/mc6 snapshot globals), [cdx/query_Rx.c:65-140](cdx/query_Rx.c#L65-L140), [cdx/control_ipv4.c:1542-1543](cdx/control_ipv4.c#L1542-L1543), [cdx/control_ipv6.c:716-717](cdx/control_ipv6.c#L716-L717), [cdx/control_vlan.c:315-316](cdx/control_vlan.c#L315-L316), [cdx/control_tunnel.c:714-715](cdx/control_tunnel.c#L714-L715). Two concurrent enumerators corrupt each other's cursors; the walked lists can be mutated concurrently → UAF. **Fix:** move cursor state into the per-open `file->private_data`, or at minimum take the corresponding table lock during the entire snapshot build. List walks in `cdx_mc_query.c` ([lines 29,49,180,202](cdx/cdx_mc_query.c#L29)) must take the same `mc4_spinlocks`/`mc6_spinlocks` the mutators use.
-  _Partial done:_
-  - `cdx_mc_query.c`: added `mc_query_mutex` serializing MC4/MC6 cursor state, and took the existing `mc4_spinlocks[hash]`/`mc6_spinlocks[hash]` around the inner list walks in `MC{4,6}_Get_Hash_Entries` and `MC{4,6}_Get_Hash_Snapshot`. Now matches the locking the mutators use. Exported the spinlock symbols in `dpa_control_mc.h`.
-  - `cdx/query_Rx.c`: added `l2flow_query_mutex` around `rx_Get_Next_Hash_L2FlowEntry`. The list walk itself stays unprotected because the underlying `l2flow_hash_table` subsystem is lock-free on the mutator side too (see `control_bridge.c` — walks and inserts with no lock). That's an architectural fix tied to A2, not fixable from the query path alone.
-  - **Follow-up done:** every file with the static-cursor pattern now has a file-local query mutex and single `out:` unwind: `control_ipv4.c` (`ipv4_query_mutex` covers both CT and RT queries), `control_ipv6.c` (`ipv6_query_mutex` covers the CT query), `control_vlan.c` (`vlan_query_mutex` covers both session and stat queries), `control_tunnel.c` (`tnl_query_mutex` covers both tunnel queries), `control_pppoe.c` (`pppoe_query_mutex` covers both session and stat queries), and `query_ipsec.c` (`ipsec_query_mutex` covers both SA queries). Each of the 11 query functions had its multiple return paths converted to a single `goto out;` pattern so the mutex always unwinds on every exit._
+- [x] **H9. Query-snapshot static state shared and lock-free.**
+  [cdx/cdx_mc_query.c](cdx/cdx_mc_query.c), [cdx/query_Rx.c:65-140](cdx/query_Rx.c#L65-L140), and the per-`control_*.c` cursor sites. Two concurrent enumerators corrupted each other's cursors. _Fixed: 613efa3 + 75dfbba_ — per-file query mutex around each cursor + bucket spinlock around list walks. The mutator-side lock-free walks (l2flow, ipv4/6/tunnel/pppoe tables) remain — covered by A2's documentation pass.
 
 - [x] **H10. `strncpy_from_user` truncation not checked.**
-  [cdx/dpa_test.c:127,143,187,203](cdx/dpa_test.c#L127). Return value only tested for `== -EFAULT`; positive return equal to buffer size means "truncated, no NUL". **Fix:** `n = strncpy_from_user(buf, src, sizeof(buf)); if (n < 0) return -EFAULT; if (n >= sizeof(buf)) return -ENAMETOOLONG;` and ensure `buf[sizeof(buf)-1] = '\0'` anyway. (May be mooted if C9 removes `dpa_test.c`.)
-  _Moot — all four cited sites were in `cdx/dpa_test.c` which C9b deleted._
+  Mooted: all four sites were in `cdx/dpa_test.c` which C9b deleted.
 
 ---
 
 ## MEDIUM
 
 - [x] **M1. Multicast listener-count mismatch.**
-  [cdx/dpa_control_mc.c:541](cdx/dpa_control_mc.c#L541) enforces `uiNoOfListeners <= MC_MAX_LISTENERS_PER_GROUP` (8), but query output in [cdx/cdx_mc_query.c:60](cdx/cdx_mc_query.c#L60) loops with that bound while writing into `output_list[]` sized at `MC_MAX_LISTENERS_IN_QUERY` (5). A group with 6–8 listeners OOBs the query response buffer. **Fix:** pick one bound, or clamp the loop with `min(listeners, MC_MAX_LISTENERS_IN_QUERY)` and document that queries are paginated.
-  _Done, correction on the original claim:_ the existing pagination actually handles 6–8 listeners correctly *provided* `uiListenerCnt` stays in sync with the `bIsValidEntry` flags — but the `(uiListenerCnt - i)` "more to come" test is fragile (any drift between the counter and the flags can either OOB or truncate). Two-part fix: (1) `MC{4,6}_Get_Hash_Entries` now reserves `ceil(MC_MAX_LISTENERS_PER_GROUP / MC_MAX_LISTENERS_IN_QUERY) = 2` cmds per group unconditionally, so the caller's snapshot buffer can never be undersized. (2) `MC{4,6}_Get_Hash_Snapshot` replaces the `uiListenerCnt - i` check with a local look-ahead over `members[]` for the next `bIsValidEntry`, so pagination depends only on the truth of the flag array (which is what's actually walked)._
+  [cdx/dpa_control_mc.c:541](cdx/dpa_control_mc.c#L541) vs [cdx/cdx_mc_query.c:60](cdx/cdx_mc_query.c#L60). Group with 6-8 listeners OOB'd the query response buffer. _Fixed: 5f9fbf0, refined in a578eca_ — pagination reserves 2 cmds per group, look-ahead over `members[]` instead of fragile counter math.
 
 - [-] **M2. `dev_get_by_name` leaks on error paths (control_vlan).**
-  [cdx/control_vlan.c:103-112,123-134](cdx/control_vlan.c#L103-L134). Both deregister and register call `dev_get_by_name` twice but only `dev_put` on the happy path. **Fix:** refcount-balanced goto-out pattern; `dev_put(device)` / `dev_put(parent_device)` only if non-NULL. Audit other control_*.c for the same pattern.
-  _Not a bug on re-reading._ Both `device` and `parent_device` are `NULL`-initialized at [line 89](cdx/control_vlan.c#L89). Every `break` in the switch falls through to the `end:` label at [line 199](cdx/control_vlan.c#L199) which already does `if (device) dev_put(...); if (parent_device) dev_put(...);` — the NULL guard correctly handles the DEREGISTER case (which sets only `device`) and every error break in REGISTER. The only paths that bypass `end:` are `QUERY`/`QUERY_CONT`/`default`, all of which return before touching `dev_get_by_name`, so no refs are leaked. Audit of the other three cdx files using `dev_get_by_name` (`devman.c`, `cdx_ehash.c`, `dpa_wifi.c`) found all paths balanced — `devman.c:447` and `:2851` transfer the ref into stored structs with matching `dev_put` on teardown, local uses in `cdx_ehash.c:2832` and `dpa_wifi.c:2315/2812` pair with `dev_put` in the same scope. Agent misread the cleanup flow._
+  Not a bug. Both `device` and `parent_device` are NULL-init at L89; all switch-arms fall to `end:` which has NULL-guarded `dev_put`s. Audited the other three callers (devman, cdx_ehash, dpa_wifi); all balanced.
 
 - [x] **M3. Unbounded `sprintf` chain in procfs read handler.**
-  [cdx/procfs.c:22-69](cdx/procfs.c#L22-L69). `proc_fqid_stats_read` does `sprintf(buff + len, …)` repeatedly without tracking remaining space against the caller's `size`. **Fix:** migrate to `seq_file` (`single_open` + `seq_printf`) — this is the standard approach and eliminates the issue.
-  _Done, plus a bigger issue uncovered:_ the original handler was `sprintf`-ing directly into the `char __user *buff` it received, which is straight-up wrong — that's a user pointer, not a kernel buffer, and on ARM64 with KUAP any dereference would fault. Converted to the standard `seq_file` pattern: `proc_fqid_stats_show` / `proc_fqid_stats_open` / `single_open` / `seq_read` / `seq_lseek` / `single_release`. All `sprintf` calls replaced with `seq_printf`/`seq_puts`. The node pointer flows via `proc_create_data` → `pde_data(inode)` → `single_open`'s private._
+  [cdx/procfs.c:22-69](cdx/procfs.c#L22-L69). The original handler was `sprintf`-ing into a `char __user *buff` (kernel-vs-userspace pointer confusion, would fault under KUAP). _Fixed: 5f9fbf0_ — full `seq_file` conversion.
 
 - [x] **M4. Kernel pointer leaks in debug output.**
-  [cdx/procfs.c:167](cdx/procfs.c#L167) uses `%px`. [cdx/dpa_cfg.c](cdx/dpa_cfg.c) has ~10 debug `printk("…%p…", kernel_ptr)` sites around lines 59, 79, 100, 101, 401, 421, 517, 558, 565, 571. Gated by `DPA_CFG_DEBUG` / `CDX_DPA_DEBUG`, but still: if ever enabled, defeats KASLR. **Fix:** bulk replace `%p` → `%pK` and `%px` → `%pK` in debug-only prints; remove gratuitous pointer dumps.
-  _Scoped fix:_ Modern kernel `%p` is hashed by default since 4.15 (and always-on default since ~5.x), so the agent's "defeats KASLR" claim only held if `no_hash_pointers` is passed on the cmdline. The one real unconditional leak was the single `%px` in `procfs.c:164` — that always prints raw regardless of `kptr_restrict`. Changed to `%pK`. Also changed the production-path pointer dumps in `dpa_cfg.c` (the four `display_*` helpers that run every SET_PARAMS ioctl, plus the `#if 1//def DPA_CFG_DEBUG` site that's effectively always-on) from `%p` → `%pK` so `kptr_restrict=2` forces them to zero. Debug-gated-only `%p` sites left alone (`%p` is already safe under default config; would be defense-in-depth but not security-blocking). `DPA_ERROR` sites printing `finfo->pcd_handle` left as `%p` because that value is user-supplied, not a kernel address._
+  [cdx/procfs.c:167](cdx/procfs.c#L167) (`%px`) + production-path `%p` in `cdx/dpa_cfg.c`. Modern `%p` is hashed by default since 4.15, so the original "defeats KASLR" claim only held with `no_hash_pointers`. _Fixed: 5f9fbf0 + c776317_ — `%px` → `%pK`; production-path `display_*` and the always-on debug print → `%pK`; the two remaining `DPA_INFO` debug-gated `%p` sites in `dpa_cfg.c` flipped under A4.
 
 - [x] **M5. `nlh->nlmsg_type` signedness / missing default.**
-  [auto_bridge/auto_bridge.c:494-560](auto_bridge/auto_bridge.c#L494-L560). `type` is `int`, compared `>= L2FLOW_MSG_MAX`; `nlmsg_type` is `__u16` so currently safe, but the switch has no `default` arm. **Fix:** declare `type` as `u16`, add a `default: err = -EINVAL; goto out;` to the switch for protocol hygiene.
-  _Done: `type` narrowed to `u16` matching `nlmsg_type`'s underlying type; added `default: err = -EINVAL; break;` to the switch._
+  [auto_bridge/auto_bridge.c:494-560](auto_bridge/auto_bridge.c#L494-L560). _Fixed: 5f9fbf0_ — `type` narrowed to `u16`, `default: -EINVAL` added.
 
 - [x] **M6. auto_bridge module-exit busy-loop.**
-  [auto_bridge/auto_bridge.c:1109-1125](auto_bridge/auto_bridge.c#L1109-L1125). `abm_l2flow_table_wait_timers` spins with `schedule()` until all buckets empty. Module unload can hang indefinitely. **Fix:** cancel timers synchronously (`timer_shutdown_sync` per entry) during exit, then a single empty-check instead of a loop.
-  _Scoped fix._ On re-reading, the loop actually drains quickly in practice — `abm_l2flow_table_flush` sets `FL_DEAD` on every entry and triggers `__abm_go_dying` for any whose timer it could cancel or that were in `STATE_FF`; entries whose timers already fired will run their callback soon and free themselves (since `__abm_go_dying` now takes the DEAD-branch and calls `abm_l2flow_del`). The "hang indefinitely" claim was pessimistic; the real bugs were (a) bare `schedule()` gives no yield pressure and can hot-spin, (b) no deadline guard if timer firing goes wrong. Replaced with a 5-second bounded wait using `schedule_timeout_uninterruptible(1)` (sleeps one jiffy instead of busy-yielding), plus a `pr_warn` on timeout. The proper `timer_shutdown_sync`-per-entry fix is trickier than the agent suggested (callback race on the embedded `timer_list` when the entry is freed); this improvement fixes the observable symptom without introducing that race._
+  [auto_bridge/auto_bridge.c:1109-1125](auto_bridge/auto_bridge.c#L1109-L1125). Bare `schedule()` could hot-spin. _Fixed: 5f9fbf0_ — bounded 5s wait via `schedule_timeout_uninterruptible(1)` with `pr_warn` on timeout.
 
 - [x] **M7. `cdx_ipsec_add_classification_table_entry` explicit TBD leak.**
-  Same issue as H3 but with a self-acknowledged `TBD???` comment at [cdx/cdx_dpa_ipsec.c:2586](cdx/cdx_dpa_ipsec.c#L2586). Track separately so it gets a real fix rather than a move.
-  _Done as part of H3 — SA_SH_DESC_BUILT now rolls back on error._
+  Folded into H3.
 
-- [x] **M8. Full-group mcast delete tears down shared state without the bucket spinlock.**
-  [cdx/dpa_control_mc.c:883-897](cdx/dpa_control_mc.c#L883-L897). `cdx_delete_mcast_group_member`'s full-group-delete branch calls `delete_entry_from_classif_table` → `cdx_free_exthash_mcast_members` → `kfree(pCtEntry->pRtEntry)` → `kfree(pCtEntry)` → `list_del(&pMcastGrpInfo->list)` → `kfree(pMcastGrpInfo)` without taking `mc{4,6}_spinlocks[uiHash]`. Concurrent readers in `cdx_mc_query.c` (`MC{4,6}_Get_Hash_Snapshot` at lines 53/230) do `list_for_each(&mc{4,6}_grp_list[hash])` under that same per-bucket lock; a reader can observe the list mid-unlink or dereference `pMcastGrpInfo` after it's been freed. The per-listener-delete branch immediately above (lines 915-963) *does* take the lock for its members[] mutation — the mismatch is purely in the full-group branch. **Fix:** take `mc{4,6}_spinlocks[uiHash]` around the `list_del`, and hold it over the frees of pCtEntry/pMcastGrpInfo (or at least until no concurrent reader can still hold a pointer into the group). Discovered by the M1 verification agent after the `cdx_free_exthash_mcast_members` fix.
-  _Done: list_del is now the first thing in the full-group-delete branch, under `mc{4,6}_spinlocks[uiHash]`. Drop the lock after `list_del` (a reader that parks on our spinlock and runs after release starts from the bucket head and can't see the unlinked node), then run the HW teardown + frees unlocked — which matches the per-listener REMOVE path discipline at lines 967-975, and is necessary because `ExternalHashTableFmPcdHcSync` → `FmPcdHcSync` takes a sleeping mutex (`FmPcdLock`). Verified independently: reader paths (`GetMcastGrpId`/`GetMcastGrp`/`MC{4,6}_Get_Hash_{Entries,Snapshot}`) all take the matching bucket lock; no query reader dereferences `pMcastGrpInfo->pCtEntry`, so freeing it after `list_del` is safe. Two pre-existing adjacent issues (M10, M11) filed as follow-ups._
+- [x] **M8. Full-group mcast delete tore down shared state without bucket spinlock.**
+  [cdx/dpa_control_mc.c:883-897](cdx/dpa_control_mc.c#L883-L897). _Fixed: 61f1904_ — `list_del` under `mc{4,6}_spinlocks[uiHash]`, HW teardown unlocked (FmPcdLock is sleeping). Surfaced two pre-existing follow-ons (M10, M11).
 
 - [x] **M9. Conditional `pCtEntry` leak on ADD err_ret unwind.**
-  [cdx/dpa_control_mc.c:599-617](cdx/dpa_control_mc.c#L599-L617). `cdx_create_mcast_group`'s err_ret at line 607 frees `pMcastGrpInfo` and its listener `tbl_entry`s via `cdx_free_exthash_mcast_members`, but does not free `pMcastGrpInfo->pCtEntry` or its owned `pCtEntry->pRtEntry` / `pCtEntry->ct`. In the tested scenario, `cdx_add_mcast_table_entry` either succeeds (ownership transferred correctly) or fails with its own internal err_ret that cleans up pCtEntry itself, so the outer err_ret never sees a half-assigned pCtEntry. However, if any future path sets `pMcastGrpInfo->pCtEntry` and then returns non-zero from somewhere other than `cdx_add_mcast_table_entry`'s internal cleanup, the outer err_ret leaks it. **Fix:** make the outer err_ret check `if (pMcastGrpInfo->pCtEntry)` and free the CT entry chain there too, matching the full-group-delete path at line 886-895.
-  _Done as defense in depth: outer err_ret now does `if (pMcastGrpInfo->pCtEntry) { kfree(pCtEntry->pRtEntry); kfree(pCtEntry); pCtEntry = NULL; }` before `kfree(pMcastGrpInfo)`. No live leak today (the only assignment to `pMcastGrpInfo->pCtEntry` lives inside `cdx_add_mcast_table_entry`'s success arm, after which the outer caller returns 0 without entering err_ret), but the guard preserves the invariant for any future caller._
+  [cdx/dpa_control_mc.c:599-617](cdx/dpa_control_mc.c#L599-L617). _Fixed: 782700d_ — defense-in-depth pCtEntry guard in outer err_ret.
 
-- [x] **M10. `Cdx_GetMcastMemberId`/`Cdx_GetMcastMemberFreeIndex` leak member_id across a dropped spinlock.**
-  [cdx/dpa_control_mc.c:256-335](cdx/dpa_control_mc.c#L256-L335) and callers at [line 914](cdx/dpa_control_mc.c#L914) (REMOVE) / [line 745](cdx/dpa_control_mc.c#L745) (UPDATE). Both helpers take `mc{4,6}_spinlocks[uiHash]` just long enough to scan `pMcastGrpInfo->members[]` for a matching-name (or free) slot, drop the lock, then return the integer index. The caller then re-takes the spinlock and uses that index to mutate the slot. Between drop and re-take, a concurrent mutator of the same group could invalidate the slot (set `bIsValidEntry = 0`) or reuse it, causing the caller to clobber the wrong listener or double-free. Today this is serialized by the single-writer-per-group invariant of the FCI command dispatcher (`cdx_cmd_handler` processes one command at a time), but that invariant is nowhere documented and would break if any future path ever dispatched mcast mutations from a kthread/workqueue in parallel. **Fix:** fold the lookup and the mutation into a single critical section (either inline `Cdx_GetMcastMemberId` at its call sites under the existing `spin_lock` there, or have it take+hold the lock with the caller responsible for unlocking).
-  _Done in c23817b: `static DEFINE_MUTEX(mc_mutators_mutex)` taken at MC{4,6}_Command_Handler around the ADD/REMOVE/UPDATE branches makes the single-writer invariant explicit. The lookup-then-mutate window inside each mutator is now safe because no second mutator can race in. Header note in `dpa_control_mc.h` documents the contract for any non-dispatcher caller. Sleeping helpers (ExternalHashTableFmPcdHcSync etc.) still get called outside the per-bucket spinlock — the mutex is a higher-level lock that doesn't need to be released for HW sync._
+- [x] **M10. `Cdx_GetMcastMember*` lookup leaks member_id across dropped spinlock.**
+  [cdx/dpa_control_mc.c:256-335](cdx/dpa_control_mc.c#L256-L335). Implicit single-writer-per-group invariant was undocumented. _Fixed: c23817b_ — `mc_mutators_mutex` taken at MC4/6 dispatcher level makes the invariant explicit.
 
-- [x] **M12. `cdx_delete_mcast_group_member` full-group-delete fast path keys off count alone, ignores listener names.**
-  [cdx/dpa_control_mc.c:912](cdx/dpa_control_mc.c#L912). The shortcut `if(pMcastGrpInfo->uiListenerCnt == uiNoOfListeners)` triggers an unconditional full-group delete when the request's listener count equals the group's current count. The names being removed are never compared against the group's actual `members[]`. Consequence: `REMOVE [foo]` against a group `{ bar }` (both count 1) deletes the entire group even though `foo` was never a member. Surfaced by the failslab UPDATE sweep test, where per-iteration `REMOVE [listener_b]` against a 1-listener group `{ listener_a }` was inadvertently destroying the seed group, making subsequent UPDATEs return ERR_MC_CONFIG ("group does not exist") instead of exercising the failslab-induced err_ret cascade we wanted to test. **Fix:** before taking the full-delete fast path, walk the request's listener list and verify each name has a `Cdx_GetMcastMemberId` hit on the group; on any miss, fall through to per-listener removal (which itself will cleanly error per-name). Or drop the fast path entirely and always use the per-listener loop — the per-listener loop already runs full-cleanup once it observes `uiListenerCnt == 0`. Worth adding a kernel-side test that exercises this exact misuse pattern alongside the fix.
-  _Done in 2d7689f: pre-validation loop walks every requested listener with `Cdx_GetMcastMemberId` before either the fast path or the per-listener loop. Mismatched names bail to err_ret with iRet=-1 (stamped as ERR_MC_CONFIG). Regression test `test_mcast_remove_with_nonmember_listener_rejects` lives in tools/tests/test_mcast_failslab.py._
+- [x] **M11. `GetMcastGrp` returned a pointer freeable after the bucket spinlock dropped.**
+  [cdx/dpa_control_mc.c:200-252](cdx/dpa_control_mc.c#L200-L252). Same root cause as M10. _Fixed: c23817b_ — same `mc_mutators_mutex` closes the dangling-pointer window.
 
-- [x] **M13. Duplicate listener names in REMOVE request still trip the count-match fast path.**
-  [cdx/dpa_control_mc.c:912](cdx/dpa_control_mc.c#L912). M12's pre-validation loop confirms each requested listener exists in the group, but treats each entry independently — so a request like `REMOVE [a, a]` against `{ a, b }` validates twice against the same `member_id`, the count check (2 == 2) passes, and the fast-path full-delete wipes both `a` and `b`. Userspace probably never sends duplicates intentionally, but a stricter fix would either dedupe the request before count comparison, or count-match against the number of *distinct* member_ids found during validation. **Fix:** track resolved member_ids in a small bitmap during pre-validation, reject duplicate hits with `ERR_MC_CONFIG`, then count-compare bits-set against `uiListenerCnt`.
-  _Done in c23817b: u8 bitmap tracks resolved member_ids during pre-validation; duplicate hits return ERR_MC_CONFIG before reaching the count-match fast path. `BUILD_BUG_ON(MC_MAX_LISTENERS_PER_GROUP > 8)` enforces the bitmap-fits-the-slot-space invariant._
+- [x] **M12. Full-group-delete fast path keyed off count alone, ignored listener names.**
+  [cdx/dpa_control_mc.c:912](cdx/dpa_control_mc.c#L912). `REMOVE [foo]` against `{ bar }` (both count 1) wiped the entire group. _Fixed: 2d7689f_ — pre-validation walks every requested listener; mismatches bail with `ERR_MC_CONFIG`. Regression test in `tools/tests/test_mcast_failslab.py`.
 
-- [x] **M11. `GetMcastGrp` returns a pointer that can be freed once the caller drops the bucket spinlock.**
-  [cdx/dpa_control_mc.c:200-252](cdx/dpa_control_mc.c#L200-L252) and callers like `cdx_delete_mcast_group_member` at [line 879](cdx/dpa_control_mc.c#L879), `cdx_update_mcast_group` at [line 692](cdx/dpa_control_mc.c#L692). `GetMcastGrp` takes `mc{4,6}_spinlocks[uiHash]`, walks the bucket list to match src/dst IP, drops the lock, and returns the `pMcastGrpInfo*`. The caller subsequently dereferences that pointer (reads `uiListenerCnt`, mutates members[], eventually unlinks + frees). Nothing in the current code prevents a concurrent mutator from observing the same group under a different spinlock acquisition and freeing it between `GetMcastGrp`'s return and the caller's first access, leaving the caller with a dangling pointer. Today safe for the same single-writer-per-group reason as M10, but the invariant is implicit. **Fix:** at minimum, document the invariant with a comment at `GetMcastGrp` and each call site. Better: restructure so the caller holds the spinlock across the lookup and its first mutation (then re-takes as needed for later slot work), or add a per-group refcount/mutex that outlives the list membership.
-  _Done in c23817b: covered by the same `mc_mutators_mutex` that closes M10 — a second mutator can't race the first into `GetMcastGrp` while the first is still holding the returned pointer, so the dangling-pointer window is gone. Header note in `dpa_control_mc.h` documents the dispatcher-only contract._
+- [x] **M13. Duplicate listener names in REMOVE still tripped the count-match fast path.**
+  [cdx/dpa_control_mc.c:912](cdx/dpa_control_mc.c#L912). M12's pre-validation didn't dedupe. _Fixed: c23817b_ — bitmap tracks resolved member_ids, duplicate hits return `ERR_MC_CONFIG`.
 
 ---
 
 ## LOW / Hardening
 
-- [x] **L1. Jenkins hash used where collision DoS matters.**
-  [cdx/jenk_hash.h](cdx/jenk_hash.h). Lookup2 is non-cryptographic; if an attacker controls any of the 5-tuple feeding the EHASH, they can craft colliding keys and chain a single bucket → CPU DoS in lookups. **Fix:** switch to `siphash_*_to_u32()` (in `<linux/siphash.h>`) with a random per-module key.
-  _Scope check first:_ `compute_jenkins_hash` turned out to be called in exactly one place — `cdx/control_bridge.c:330` — indexing the kernel's internal `l2flow_hash_table[]`. That's a software-only lookup; the FMAN EHASH microcode contract was not involved. So normal C fix. _Done:_ added `static hsiphash_key_t l2flow_hashkey __read_mostly;` at file scope, initialized once in `bridge_init` via `get_random_bytes`, and replaced the hash call with `hsiphash(&l2flow, sizeof(struct L2Flow), &l2flow_hashkey)`. `cdx/jenk_hash.h` deleted (no other users). An attacker choosing source/dest MACs, VLAN tags, ethertype, or session_id can no longer precompute colliders because the key is boot-random and SipHash is algorithmically collision-resistant._
+- [x] **L1. Jenkins hash where collision DoS matters.**
+  [cdx/jenk_hash.h](cdx/jenk_hash.h). Only used in `cdx/control_bridge.c:330` for kernel-side `l2flow_hash_table[]` indexing — software-only lookup, attacker-controllable 5-tuple. _Fixed: bf8c453_ — keyed `hsiphash` with boot-random key; `jenk_hash.h` deleted.
 
 - [x] **L2. `strcpy` into equal-sized `IF_NAME_SIZE` buffers.**
-  [cdx/control_bridge.c:362-363](cdx/control_bridge.c#L362-L363), [cdx/control_vlan.c:295-296](cdx/control_vlan.c#L295-L296), [cdx/control_pppoe.c:500-506](cdx/control_pppoe.c#L500-L506), [cdx/control_ipv4.c:1650,1659](cdx/control_ipv4.c#L1650), [cdx/control_tunnel.c:819](cdx/control_tunnel.c#L819), [cdx/dpa_cfg.c:311](cdx/dpa_cfg.c#L311). Kernel `net_device->name` is guaranteed NUL-terminated so these are mostly benign, but command-sourced names aren't guaranteed. **Fix:** `strscpy` everywhere; it's the modern canonical form.
-  _Done, broader sweep:_ all `strcpy` uses across `cdx/` converted to `strscpy(dst, src, sizeof(dst))` — the originally-flagged sites plus `cdx/control_vlan.c:436-437` (the stat query mirror), `cdx/control_bridge.c:368-369`, `cdx/query_Rx.c:63-64`, `cdx/procfs.c:123/128/133/138`, `cdx/dpa_cfg.c:337`, `cdx/dpa_wifi.c:2843`. All destinations are fixed-size array fields so `sizeof(dst)` yields the right bound (and tracks future size changes automatically)._
+  Multiple sites in `cdx/control_*.c`. Mostly bounded today (kernel `net_device->name` is NUL-terminated) but command-sourced names aren't guaranteed. _Fixed: 89e5b32_ — broader sweep to `strscpy` across `cdx/`.
 
 - [x] **L3. `sprintf` into small fixed name buffers (procfs).**
-  [cdx/procfs.c:224,226](cdx/procfs.c#L224). **Fix:** `snprintf(node->name, sizeof(node->name), …)`.
-  _Done alongside M3._
+  [cdx/procfs.c:224,226](cdx/procfs.c#L224). _Fixed: 5f9fbf0_ alongside M3 (`snprintf`).
 
 - [x] **L4. `proc_create("fci", 0, …)`.**
-  [fci/fci.c:542](fci/fci.c#L542). Mode `0` is fragile — should be explicit `S_IRUSR` or similar. Not a security hole (proc default is root-only), but code hygiene.
-  _Done: mode `0` → `0444` (world-readable, no write). The file just exposes stats; readable by any user is fine._
+  [fci/fci.c:542](fci/fci.c#L542). Mode `0` is fragile. _Fixed: 89e5b32_ — `0444`.
 
 - [x] **L5. Unimplemented ioctl stub declarations.**
-  [cdx/cdx_ioctl.h:317-321](cdx/cdx_ioctl.h#L317-L321). `cdx_ioc_create_mc_group`, `cdx_ioc_add_member_to_group`, `cdx_ioc_add_mcast_table_entry` declared without implementations. Not wired into current dispatcher. **Fix:** remove the prototypes to eliminate the land mine.
-  _Done, broader cleanup:_ removed the three stub prototypes plus the entire supporting cast that was equally dead: `struct QoSConfig_Info` + `CDX_CTRL_DPA_QOS_CONFIG_ADD`, `struct add_mc_group_info` + `CDX_CTRL_DPA_ADD_MCAST_GROUP`, `struct dpa_member_to_mcast_group` + `CDX_CTRL_DPA_ADD_MCAST_MEMBER`, `struct add_mc_entry_info` + `CDX_CTRL_DPA_ADD_MCAST_TABLE_ENTRY`. All were defined only in `cdx_ioctl.h` and referenced nowhere else — same pattern as C9b, no userspace users, no kernel dispatch, pure dead ABI surface. Also note: the removed QOS macro was colliding with (the also-now-removed) `CDX_CTRL_DPA_CONNADD` on command number 3._
+  [cdx/cdx_ioctl.h:317-321](cdx/cdx_ioctl.h#L317-L321). _Fixed: 89e5b32_ — removed the stubs and the supporting struct/macro dead code.
 
 - [x] **L6. Inconsistent endian conversion in reassembly release.**
-  [cdx/cdx_reassm.c:150-172](cdx/cdx_reassm.c#L150-L172). `buf.hi = list->addr_hi;` is not converted while `buf.lo = cpu_to_be32(list->addr_lo);` is. Either both should be converted or neither — the asymmetry is a bug-in-waiting. **Fix:** pick a canonical byte order for `struct bm_buffer` in this path and be consistent; add a comment stating the convention.
-  _Not actually a bug, fix is cosmetic:_ `struct ip_reassembly_frag_list.addr_hi` is a `uint8_t` (single byte, no endian applicable), and `struct bm_buffer.hi` is `u16` in host order. `buf.hi = list->addr_hi` zero-extends u8 → u16 correctly on LE ARM64. The apparent asymmetry is field-type mismatch, not endian inconsistency. However the `cpu_to_be32`/`cpu_to_be16` calls on reads from an FMAN-populated (BE) struct are semantically misnamed — they're byte-swaps to decode BE into host order, so should be `be32_to_cpu`/`be16_to_cpu`. On LE those are the same bytes; the rename documents intent and will behave correctly if anyone ever cross-compiles this for a BE target. Applied the rename in both the debug print and the release path, with a comment noting the source is BE from microcode._
+  [cdx/cdx_reassm.c:150-172](cdx/cdx_reassm.c#L150-L172). Type mismatch (u8 ↔ u16 zero-extend), not endian bug. _Fixed: 89e5b32_ — renamed `cpu_to_be*` → `be*_to_cpu` to document intent (no-op on LE).
 
 - [x] **L7. UBSAN array-bounds: flex-array subscript in `create_ethernet_hm`.**
-  [cdx/cdx_ehash.c:1849](cdx/cdx_ehash.c#L1849). `*(uint16_t*)(&l2param->l2hdr[2*ETHER_ADDR_LEN]) = ...` writes through an index-form reference to `l2hdr`, which is a flexible array member (`uint8_t l2hdr[0]`). The buffer is genuinely allocated past the struct (caller validates `hdrlen` and calls `unsafe_memcpy` on adjacent lines for the same reason) but UBSAN bounds-checks the subscript form against the declared size (0) and warns "index 12 is out of range for type 'uint8_t [*]'". Surfaced the first time the test image installed an FCI IPv4 conntrack entry under `CONFIG_UBSAN`. **Fix:** convert to pointer arithmetic (`l2param->l2hdr + 2 * ETHER_ADDR_LEN`) matching the surrounding memcpy arguments; UBSAN does not instrument pointer-add, only array-subscript.
-  _Done. Caught on the first ever real-traffic test run against the sanitizer-enabled image — this is exactly the ROI the test harness was built for._
+  [cdx/cdx_ehash.c:1849](cdx/cdx_ehash.c#L1849). `*(uint16_t*)(&l2param->l2hdr[2*ETHER_ADDR_LEN]) = ...` warned under UBSAN. _Fixed: f717ba7_ — pointer arithmetic.
 
 - [x] **L8. cmm `sig_term_hdlr` benign ENOENT noise on reboot.**
-  [cmm/src/cmm.c:318-320](cmm/src/cmm.c#L318-L320). On reboot, a race between the init script's `rm -f $PIDFILE` and cmm's own `remove(CMM_PID_FILE_PATH)` (or an early tmpfs unwind) can leave the pidfile already gone when the signal handler runs. The `remove()` returns -1/ENOENT and cmm prints a misleading "removal failed" error. **Fix:** treat ENOENT as already-cleaned — only log real errors. Same treatment applied to the `err1` startup-failure cleanup path.
-  _Done in `cmm/src/cmm.c` — `if (ret < 0 && errno != ENOENT)` guards both print sites._
+  [cmm/src/cmm.c:318-320](cmm/src/cmm.c#L318-L320). `remove()` of an already-cleaned pidfile printed misleading error. _Fixed: ff1be40_ — gate on `errno != ENOENT`.
 
 ---
 
 ## Corrections to the original review
 
-These were flagged as "critical" by the deep-dive agents but don't hold up on verification — leaving here so we don't chase them.
+Flagged as critical by deep-dive agents but don't hold up on verification.
 
-- [-] **X1. "256-byte memset + partial fill = info leak" in `control_ipv4.c:1231` / `control_ipv6.c:170`.**
-  False positive. `memset(p, 0, 256)` zeros the buffer *before* the partial fill, so uninitialized bytes that get copied back are zeros, not kernel stack. No leak.
+- [-] **X1. "256-byte memset + partial fill = info leak."**
+  False positive. `memset(p, 0, 256)` zeros the buffer *before* the partial fill — uninitialized bytes copied back are zeros.
 
-- [-] **X2. "strcpy IF_NAME_SIZE → IF_NAME_SIZE overflows" in multiple control_*.c.**
-  Downgraded to L2. Kernel net_device names are guaranteed NUL-terminated within `IFNAMSIZ` (16), so when the source is `dev->name`, strcpy is bounded. Stays a hygiene issue, not a corruption bug.
+- [-] **X2. "strcpy IF_NAME_SIZE → IF_NAME_SIZE overflows."**
+  Downgraded to L2. Kernel `net_device->name` is NUL-terminated within `IFNAMSIZ` so when source is `dev->name`, strcpy is bounded.
 
-- [-] **X3. Continuous "N new suspected memory leaks" from `dpaa_eth_refill_bpools`.**
-  Background kmemleak scanner (default 10-min cadence) reports tens to hundreds of new "leaks" on an idle DUT, all tracing to `dpaa_eth_refill_bpools` via `priv_rx_default_dqrr` / `__napi_poll` / `handle_softirqs`. **Not a leak.** The DPAA SDK's bpool replenish hook allocates fresh skbs and hands their physical addresses to hardware via descriptor rings; during the hardware-owned phase kmemleak's pointer scanner has no kernel-side reference to find, so the skbs look unreferenced. Hardware eventually delivers RX completions, the kernel processes the skbs and frees them, refill allocates new ones. The reported count fluctuates per scan because the population mid-cycle fluctuates with traffic and bpool depth; total memory stays bounded by `bpool_size * skb_size`. Confirmed via `/proc/meminfo` RSS staying flat for hours on an idle target. **Don't chase this with `assert leak_count == 0` against the unfiltered report** — every test that uses kmemleak as an oracle must filter to specific function-name needles (e.g. `MCAST_LEAK_FILTER` in `tools/tests/test_mcast_failslab.py`), never to the broad `[cdx]` / `[auto_bridge]` module-tag matcher (which false-positives on the boot-time `dpaa_vwd_init` allocation that runs through cdx.ko).
+- [-] **X3. "N new suspected memory leaks" from `dpaa_eth_refill_bpools`.**
+  Not a leak. The DPAA SDK hands skb addresses to hardware via descriptor rings; during the hardware-owned phase kmemleak's pointer scanner can't find a kernel-side reference. RSS stays flat for hours on idle. Tests that use kmemleak as an oracle must filter to specific function-name needles, never to the broad `[cdx]`/`[auto_bridge]` module-tag matcher.
 
 ---
 
 ## Architectural themes
 
-Not single issues — broader patterns worth an agenda item each.
-
 - [x] **A1. Every external field needs a bounds check at its entry point.**
-  Hardware descriptors, netlink attributes, ioctl structs, and kernel-internal state all look identical in this code. A pass that tags trust boundaries (comments, helper macros, or just discipline) would prevent a whole class of the above.
-  _Plan:_ the real attack surface isn't the cdx ioctl (only 2 commands after C9b: `SET_PARAMS`, `GET_MURAM_DATA`) — it's the FCI command bus. 14 event-level handlers (`set_cmd_handler(EVENT_*, M_*_cmdproc)` in `control_*.c` and `dpa_control_mc.c`), with ~75 per-command switch cases between them (ipv4=13, ipsec=14, stat=14, bridge=12, tunnel=8, ipv6=7, pppoe=3, mc4+mc6=2, vlan=2, plus qm/rtp_relay/rx/tx/wifi not yet counted). Each M_* handler today does its own length check and field validation inline, inconsistently. Phased migration below.
-  _Done._ A1a-e all landed on `fix/security-hardening`, each boot-tested on ls1046a with HW offload on normal traffic as the regression check. Every FCI cmdproc (vlan, mc4, mc6, pppoe, ipv6, ipv4, tunnel, bridge, ipsec, stat, rtp_relay, qm, rx, tx, wifi) plus the cdx ioctl dispatcher now routes through a validator-table lookup. Total ~120 command codes under one audit surface. One real regression caught during this work (the C2 libfci `nlmsg_len` check was too strict — diagnosed via strace on cmm, corrected in the folded C2 commit) and two pre-existing latent bugs silently fixed (MC4/MC6 unknown-cmd-code returning a zero-byte reply; stat unknown-cmd-code returning the misleading `ERR_STAT_FEATURE_NOT_ENABLED`). A1e merged into A1b/A1c/A1d — each migration replaced the whole cmdproc body in one shot, so no stale switches left behind._
+  Hardware descriptors, netlink attrs, ioctl structs, kernel-internal state all looked alike. _Fixed in stages: A1a-A1e._ The whole FCI command bus (~120 codes across 14 cmdprocs) plus the cdx ioctl dispatcher now route through a single validator-table idiom. Two pre-existing latent bugs surfaced and silently fixed in the migration (MC4/MC6 zero-byte reply on unknown cmd; misleading `ERR_STAT_FEATURE_NOT_ENABLED` for unknown stat cmd).
 
-- [x] **A1a. Introduce the validator-table pattern.**
-  Add `cdx/cdx_cmd_validator.h` with a spec struct and dispatch helper:
-  ```c
-  struct cdx_cmd_spec {
-      u16          cmd_code;
-      size_t       arg_size;          // expected exact struct size
-      int        (*validate)(const void *cmd); // optional, field-level bounds
-      int        (*handle)(void *cmd, void *reply, size_t *reply_len);
-  };
-  U16 cdx_dispatch_cmd(const struct cdx_cmd_spec *table, size_t n,
-                       U16 cmd_code, U16 cmd_len, void *cmd, void *reply);
-  ```
-  The dispatcher looks up `cmd_code`, checks `cmd_len == spec->arg_size` (or a variable-length rule), runs `validate()`, then `handle()`. Handlers that used to receive `(U16 cmd_code, U16 cmd_len, U16 *pcmd)` and do their own checks instead take a pre-trusted typed struct. Ship the header + helper + unit-testable example before touching any subsystem. **Scope:** ~150 LOC new, no existing file touched. **Deliverable:** compiled header + helper in its own .c file.
-  _Done._ New `cdx/cdx_cmd_validator.h` defines `struct cdx_cmd_spec`, `cdx_cmd_validate_fn`, `cdx_cmd_handle_fn`, four table-building macros (`CDX_CMD`, `CDX_CMD_V`, `CDX_CMD_VAR`, `CDX_CMD_NOARG`, plus `CDX_CMD_NOARG_V`), and the dispatcher prototype. `cdx/cdx_cmd_validator.c` implements `cdx_dispatch_cmd`: linear lookup, `ERR_UNKNOWN_COMMAND` on miss, `[min_len, max_len]` range check with `ERR_WRONG_COMMAND_SIZE`, optional validate, then handle. Stamps `pcmd[0]` with the handler's return code after it runs; clamps `reply_len` to `sizeof(U16)` with `WARN_ON_ONCE` if a handler trampled it below that. Linked into `cdx.ko` (verified via nm); build is warning-free with -Werror. An independent agent review surfaced three valid concerns — contract clarity around the "pcmd is in/out, read inputs before writing output" rule, WARN on broken reply_len, a no-arg validator macro — all three applied. The agent's BUG_ON-on-n_entries suggestion was rejected: an empty table legitimately returns ERR_UNKNOWN_COMMAND, and picking an arbitrary cap would just surface noise._
+- [x] **A1a. Validator-table pattern (`cdx/cdx_cmd_validator.{h,c}`).**
+  Spec struct + dispatcher: lookup by cmd_code, range-check len, run validate(), run handle(). _Fixed: cf1fa1b_.
 
-- [x] **A1b. Prototype on `control_vlan.c` (smallest surface).**
-  Convert `M_vlan_cmdproc` to a `cdx_cmd_spec[]` table covering the 2 command codes (`CMD_VLAN_ENTRY`, `CMD_VLAN_QUERY`). Move the length/action-enum/string checks that used to live inside `Vlan_handle_entry` into the `validate()` callbacks. Keep the existing handler bodies intact but re-sign them to take the typed struct. **Scope:** ~80 LOC changed in one file. **Deliverable:** this subsystem's attack surface fully gated by the validator table; net reduction in inline length checks.
-  _Done._ Migration pattern — use this as the template for A1c-N:
-    1. `#include "cdx_cmd_validator.h"` alongside the existing includes.
-    2. For each `CMD_FOO` in the old cmdproc switch that took an argument struct, write a pair `foo_validate(const void *, U16) -> U16` (optional, runs after length check, rejects semantic garbage like an unknown action enum) and `foo_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len) -> U16`. Reset / no-arg commands skip the validator and just get a thin handler that calls the existing reset routine.
-    3. Handler discipline: `memcpy` the whole incoming struct into a local at the very top of the function before touching pcmd for any reply, because the dispatcher stamps pcmd[0] AFTER the handler returns and query helpers like `Vlan_Get_Next_Hash_Entry` overwrite pcmd in place. Every input you need must be read before the first reply-path write.
-    4. Reply-length rule: dispatcher pre-seeds `*out_reply_len = sizeof(U16)`. Only bump it when a code path produces a trailing payload (e.g. QUERY success: `*out_reply_len = sizeof(U16) + sizeof(FooCommand)`). Error paths and status-only paths leave it alone. Never shrink it below sizeof(U16) — the dispatcher WARNs.
-    5. Preserve `dev_get_by_name` / `dev_put` balance verbatim. Keep the existing `end:` label and the NULL-guarded `dev_put`s in the handler; moving this logic into the dispatcher is out of scope.
-    6. Preserve exact error codes. Do not opportunistically tighten length rules for no-arg commands — the original `M_*_cmdproc` often skipped length checks on reset/no-arg commands, and tightening to `CDX_CMD_NOARG` silently breaks any caller that trailed bytes. Use `CDX_CMD_VAR(CODE, 0, U16_MAX, NULL, handler)` for those (see `CMD_VLAN_ENTRY_RESET` in `cdx/control_vlan.c` for the canonical shape and the explaining comment). Hardening these is a separate follow-up pass. _Done as that follow-up pass: ~50 of 86 permissive validators across qm/stat/tx/tunnel/wifi/rx/bridge/ipsec tightened to `CDX_CMD_VAR(sizeof(request_struct), U16_MAX, ...)` so the dispatcher rejects undersized inputs that the handler would otherwise read as uninit memcpy bytes. Remaining permissive entries (rtp_relay wrappers; reset-style `(void)pcmd` handlers) documented in-source as intentionally permissive. Suite 161/161 (the fuzzer auto-promoted the ~50 newly-bounded commands from PERMISSIVE_CMDS to BOUNDED_CMDS, growing the parametrised case set)._
-    7. Replace `M_foo_cmdproc` with a one-liner: `return cdx_dispatch_cmd(foo_cmd_table, ARRAY_SIZE(foo_cmd_table), cmd_code, cmd_len, pcmd);`.
-    8. Run an independent-agent review before committing — the A1b review caught the CDX_CMD_NOARG-vs-CDX_CMD_VAR issue in item 6. Expect similar-shaped feedback on every subsystem.
+- [x] **A1b. Prototype on `control_vlan.c`.**
+  _Fixed: f2f3a82_. Migration template documented in commit message + ISSUES history. Permissive-validator follow-up pass to tighten min-length bounds: _c4d3965_.
 
-- [ ] **A1c. Migrate the rest, ordered by risk + simplicity.**
-  Each subsystem is self-contained work following the A1b template:
-  - [x] **A1c-1.** `control_mc.c` (MC4+MC6, ~2 codes each) — smallest, already hardened in M1 so low regression risk. _Done. One code per cmdproc (`CMD_MC{4,6}_MULTICAST`). The inner `MC{4,6}_Command_Handler` has a different ABI — writes status directly to pcmd and returns reply length as int — so the adapter reads pcmd[0] back after the inner call and returns that U16 to make the dispatcher's stamp a no-op. Fixes a pre-existing latent bug: old default: arm returned a zero-byte reply on unknown cmd_code; dispatcher now returns `ERR_UNKNOWN_COMMAND` with 2-byte reply. Boot-tested on ls1046a._
-  - [x] **A1c-2.** `control_pppoe.c` (3 codes) — simple, already sanitized in L2/H9. _Done. Worth noting: PPPoE's pre-migration query-reply length is `sizeof(PPPoECommand)` (not `sizeof(U16) + sizeof(PPPoECommand)` as VLAN/IPv4/IPv6 use); preserved bit-for-bit. PPPOE_RELAY_ENTRY has no QUERY arm so its reply-bump is dead code, also preserved. Boot-tested on ls1046a._
-  - [x] **A1c-3.** `control_ipv6.c` (7 codes) — mirrors ipv4 but smaller, do it first to shake out the pattern on CT snapshot handling. _Done. 6 active codes + 1 ifdef-gated; CONNTRACK uses `CDX_CMD_VAR[sizeof(CtCommandIPv6), sizeof(CtExCommandIPv6)]`; RESET is a trivial NO_ERR handler with permissive length; everything else mirrors A1c-4's shape. Boot-tested on ls1046a, HW offload intact._
-  - [x] **A1c-4.** `control_ipv4.c` (13 codes) — the bulk of conntrack path; highest payoff for bounds checking. _Done. 9 active codes plus 4 ifdef-gated; CONNTRACK uses `CDX_CMD_VAR[sizeof(CtCommand), sizeof(CtExCommand)]` with the inner handler's exact-two-size check preserving rejection of intermediate values; RESET stays permissive via `CDX_CMD_VAR(0, U16_MAX)`; GET_TIMEOUT bumps reply_len on NO_ERR only. Boot-tested on ls1046a, HW offload on normal traffic works._
-  - [x] **A1c-5.** `control_tunnel.c` (8 codes). _Done. 5 active + 3 ifdef-gated. QUERY / QUERY_CONT split into two handlers (reset=1 / reset=0) because the dispatcher doesn't pass cmd_code to handlers, and the pre-migration code keyed the reset flag on `cmd_code == CMD_TNL_QUERY`. Query reply_len follows PPPoE-style `sizeof(TNLCommand_query)` (not `sizeof(U16) + sizeof(...)`). Boot-tested on ls1046a._
-  - [x] **A1c-6.** `control_bridge.c` (12 codes) — L2 flow table, already touched for L1. _Done. Actual count was 10 codes. 5 are no-op-break in the old cmdproc (shared noop handler); QUERY_ENTRY writes a fake-eof response; FLOW_ENTRY is the real L2 flow installer; FLOW_TIMEOUT/MODE/BRIDGED_ITF_UPDATE take cmd_code in the inner handler (split into per-code wrappers). Normal traffic test confirmed; dedicated LAN-to-LAN bridge-offload exercise still pending._
-  - [x] **A1c-7.** `control_ipsec.c` (14 codes) — biggest single file; key-material-adjacent so extra care on the validate() side. _Done. 14 codes migrated. QUERY/QUERY_CONT split into two handlers. SEC_FAILURE_STATS wire quirk preserved verbatim (on success pcmd[0] holds the byte count, not NO_ERR; retlen = 2 + rc for any rc>0). Normal-traffic test confirmed; dedicated IPsec SA install/query exercise deferred to the per-protocol test harness._
-  - [x] **A1c-8.** `control_stat.c` (14 codes) — mostly read-only query paths; straightforward. _Done. Actual count was 16 codes. Known intentional divergence: unknown cmd_code used to return `ERR_STAT_FEATURE_NOT_ENABLED` and now returns `ERR_UNKNOWN_COMMAND` — more truthful, inline-documented. Boot-tested; normal traffic offload works._
-  - [x] **A1c-9.** `control_rtp_relay.c`, `control_qm.c`, `control_rx.c`, `control_tx.c`, `control_wifi.c` — count TBD, tack on last. _Done — 41 codes across 5 files in one commit. Notable: control_tx has a shared portid bound-check gated by `cmd_code < CMD_TX_DSCP_VLANPCP_MAP_STATUS` — moved to a per-handler inline helper since the dispatcher can't key on cmd_code groups. control_qm's DSCP_Q_MAP STATUS/CFG/RESET share a preamble factored into a common helper with op function pointers. All query reply shapes preserved per-code (PPPoE-style `sizeof(struct)` for qm/tx/wifi/tunnel; VLAN/IPv4-style `sizeof(U16) + sizeof(struct)` for rtp). Normal-traffic HW offload verified on ls1046a._
+- [x] **A1c. Migrate the rest, ordered by risk + simplicity.**
+  - [x] **A1c-1.** `dpa_control_mc.c` (MC4+MC6) — _cbc2a6e_.
+  - [x] **A1c-2.** `control_pppoe.c` — _37f0e37_.
+  - [x] **A1c-3.** `control_ipv6.c` — _f5e1bba_.
+  - [x] **A1c-4.** `control_ipv4.c` — _394452b_.
+  - [x] **A1c-5.** `control_tunnel.c` — _74643c8_.
+  - [x] **A1c-6.** `control_bridge.c` — _5059240_.
+  - [x] **A1c-7.** `control_ipsec.c` — _37f99e3_.
+  - [x] **A1c-8.** `control_stat.c` — _4fa6df7_.
+  - [x] **A1c-9.** `control_{rx,rtp_relay,wifi,tx,qm}.c` (5 files, 41 codes) — _56dbb07_.
 
-  Per subsystem: ~80-150 LOC changed, one compile-and-test cycle. Total across all 9 steps: ~1000-1200 LOC, spread over ~15 files.
+- [x] **A1d. cdx ioctl dispatcher onto the same idiom.**
+  ABI is different enough (no cmd_len, copy_{from,to}_user, errno return) that forcing it onto `cdx_dispatch_cmd` would fork the dispatcher. _Fixed: ed082ea_ — file-local `cdx_ioctl_table[]` with same spec-struct shape.
 
-- [x] **A1d. Pull the cdx ioctl dispatcher onto the same table.**
-  `cdx/cdx_dev.c` has only 2 commands, but once A1a exists the switch-to-table conversion is trivial and gets the ioctl surface on the same validator idiom as FCI. **Scope:** ~30 LOC changed in one file.
-  _Done, with a note:_ the ioctl ABI is different enough from FCI's (no cmd_len, `unsigned long args` is a userspace pointer, `long` errno return, in/out via copy_{from,to}_user rather than an in-band buffer) that forcing it onto `cdx_dispatch_cmd` would fork the dispatcher. Instead used a file-local `cdx_ioctl_table[]` in `cdx/cdx_dev.c` with the same spec-struct + dispatcher shape. Preserves the A1 goal (single audit surface for all ioctls; add/gate/remove a command is one line). Boot-tested on ls1046a.
+- [x] **A1e. Drop the per-subsystem inner switches.**
+  Done in-line with each A1b/A1c migration — every commit replaced the whole cmdproc body in one shot. No separate cleanup pass.
 
-- [x] **A1e. Drop the per-subsystem cmd_proc inner switches.**
-  After A1b-c-d, every `M_*_cmdproc` is just `return cdx_dispatch_cmd(foo_table, ARRAY_SIZE(foo_table), …)`. Delete the old switch bodies. **Scope:** one cleanup commit per subsystem (~20-40 LOC removed each).
-  _Done in-line with each A1b/A1c step rather than as a separate pass._ Every migration commit replaced the whole cmdproc body with the table + tail call in one shot, so there are no stale inner switches left behind to clean up. No separate A1e commits.
-
-- [x] **A2. Concurrency is assumed, not enforced.**
-  Globals in `dpa_cfg.c`, static cursors in every `control_*.c` snapshot path, lock-drop iteration in `auto_bridge.c`. Needs a concurrency model spelled out per subsystem (which lock protects which data, which contexts run each function).
-  _Done (documentation + sparse annotations, no logic changes):_ Every .c file with non-trivial concurrency now has a top-of-file `Concurrency:` block listing the locks, what data each one protects, the contexts each public entry point runs in, and any ordering rules or known gaps. Files covered: `cdx_dev.c`, `cdx_main.c`, `cdx_cmdhandler.c`, `cdx_timer.c`, `cdx_dpa_ipsec.c`, `cdx_mc_query.c`, `cdx_reassm.c`, `dpa_cfg.c`, `dpa_control_mc.c`, `dpa_wifi.c`, `devman.c`, `cdx_ifstats.c`, `control_bridge.c`, `control_ipv4.c`, `control_ipv6.c`, `control_tunnel.c`, `control_vlan.c`, `control_pppoe.c`, `query_ipsec.c`, `query_Rx.c`, `auto_bridge/auto_bridge.c`, `fci/fci.c`. Plus sparse-checkable `__must_hold()` annotations on the four internal helpers that assume a lock held by their caller: `__abm_go_dying`, `abm_l2flow_del`, `release_cfg_info`, `__timer_add`. Known gaps (lock-free mutator sides in `control_bridge.c`'s `l2flow_hash_table`, same for IPv4/IPv6/tunnel/PPPoE tables) are called out explicitly in each file's block so the next reader doesn't mistake "no lock" for "safe." Runtime enforcement comes from enabling `CONFIG_PROVE_LOCKING` in the Armbian kernel config — that's a one-line config flip outside this repo._
+- [x] **A2. Concurrency assumed, not enforced.**
+  Globals in `dpa_cfg.c`, static cursors in every `control_*.c`, lock-drop iteration in auto_bridge. _Fixed: d99bb62_ — top-of-file `Concurrency:` block per .c file documenting locks/contexts/ordering, plus sparse `__must_hold()` annotations on internal helpers. Runtime enforcement via `CONFIG_PROVE_LOCKING` (Armbian config flip, out-of-repo).
 
 - [x] **A3. Error paths don't unwind.**
-  Recurring leak-on-failure pattern for DMA mappings, hash entries, device refs. A single-label goto-out idiom (with a counter/flag for "how far did init get") would catch most of these.
-  _Scope:_ concrete audit done. Already fixed in earlier commits: `cdx_ipsec_create_shareddescriptor` (H3), `cdx_ipsec_add_classification_table_entry` (H3/M7), `cdx_ioc_set_dpa_params` bare-returns (H1), auto_bridge `dev_hold`/`dev_put` balance and module-exit drain (H7). Remaining concrete sites to fix, broken out below as A3a-A3e.
-  _Done._ A3a-A3e all landed. One residual not covered by A3's scope but flagged as a sibling follow-on: `dpa_release_interface` in `cdx/devman.c:1892` has the same set of leaks as the pre-A3e err paths and should call the three new A3e helpers once someone audits the happy-path teardown ordering._
+  Recurring leak-on-failure pattern. _Fixed in A3a-A3e_ plus two follow-ons: `dpa_release_interface` sibling (d0d0b3f) and the IPR FQ teardown originally noted as A3a residual (78ac2af).
 
 - [x] **A3a. `cdx_init_ip_reassembly` / `cdx_deinit_ip_reassembly` — init/deinit asymmetry.**
-  [cdx/cdx_reassm.c:388-481](cdx/cdx_reassm.c#L388-L481) (init) and [cdx/cdx_reassm.c:376-386](cdx/cdx_reassm.c#L376-L386) (deinit). Init acquires a reassembly bpool, a kthread, a fragment bpool, IPR FQs (via `cdx_create_ipr_fq`), EHASH table setup, and a bpool replenish hook — each failure is a bare `return -1;` that leaves earlier acquisitions in place. C5 made deinit stop the kthread, but FQ/bpool teardown and the replenish-hook unregister are still TODO (comment in-file). **Fix:** convert init to nested-label cascade (`err_free_fqs:`, `err_destroy_frag_bp:`, `err_stop_kthread:`, `err_destroy_ctx_bp:`), and make deinit call those same unwind steps in reverse so module unload no longer leaks. **Severity:** Real if module unload is ever exercised with the subsystem initialized; Likely on partial-init failure.
-  _Done: init now cascades via `err_free_frag_bp` → `err_stop_kthread` → `err_free_ctx_bp` labels. Added a local `free_ipr_bpool(bp_slot)` helper that calls the kernel-patched `_dpa_bp_free()` and then kfree()s the struct. Deinit unregisters the replenish hook (by setting the global to NULL via `register_dpaa_eth_bpool_replenish_hook(NULL)`), stops the kthread, and frees both bpools. One residual: the IPR FQs created via `cdx_create_ipr_fq` are added to the shared `dpa_pcd_fq` list with no IPR-specific tag, so we can't identify them from here for `qman_retire_fq`/`oos`/`destroy`. Documented inline; not a UAF on unload since the FQs' callback code goes down with the module._
+  _Fixed: b5a7bf8 + 78ac2af_ — full nested-label cascade; deinit retires/oos/destroys IPR FQs via private `ipr_fqs[]` tracking and releases the fqid range.
 
 - [x] **A3b. `cdx_init_fqid_procfs` — sequential `proc_mkdir` without unwind.**
-  [cdx/procfs.c:76-114](cdx/procfs.c#L76-L114). Creates `/proc/fqid_stats` and four child dirs (`tx`, `pcd`, `rx`, `sa`) in sequence; each child failure returns `-1` without `proc_remove`'ing the earlier dirs. Module then loads in a half-initialized state from a procfs-user's perspective. **Fix:** add `proc_remove` unwind labels or a single error path that walks the already-created children. **Severity:** Theoretical in normal conditions, Real under procfs allocator pressure.
-  _Done: nested-label cascade with `err_remove_{rx,pcd,tx,fqid}` unwinding in reverse order, each NULL-ing the corresponding global pointer so callers can't dereference a freed proc_dir_entry._
+  [cdx/procfs.c:76-114](cdx/procfs.c#L76-L114). _Fixed: b5a7bf8_ — nested `err_remove_*` cascade.
 
 - [x] **A3c. `abm_l2flow_table_init` — `l2flow_cache` leaked on `brroute_cache` failure.**
-  [auto_bridge/auto_bridge.c:1176-1197](auto_bridge/auto_bridge.c#L1176-L1197). `kmem_cache_create("l2flow_cache", …)` at ~L1187 succeeds, then `kmem_cache_create("brroute_cache", …)` at ~L1192 fails → function returns `-ENOMEM` without `kmem_cache_destroy(l2flow_cache)`. **Fix:** on the brroute_cache failure branch, destroy l2flow_cache first. **Severity:** Real under memory pressure at module load.
-  _Done: brroute_cache failure path now destroys l2flow_cache and NULLs the pointer before returning `-ENOMEM`._
+  [auto_bridge/auto_bridge.c:1176-1197](auto_bridge/auto_bridge.c#L1176-L1197). _Fixed: b5a7bf8_.
 
 - [x] **A3d. `abm_init` — cascading subsystem init leaks.**
-  [auto_bridge/auto_bridge.c:1599-1627](auto_bridge/auto_bridge.c#L1599-L1627) (approx). Sequence: `create_workqueue(kabm_wq)` → `abm_l2flow_table_init()` → `abm_nl_init()` → `abm_proc_init()` → `abm_sysctl_init()` → `nf_register_net_hooks()` → `register_brevent_notifier()` → `br_fdb_register_can_expire_cb()`. Most failures are bare returns that don't undo earlier steps. **Fix:** cascading `goto err_*` labels that run the matching subsystem's `_exit`/`_fini` helper in reverse. **Severity:** Real on intermediate init failure; symptom is a half-loaded module that can't be cleanly unloaded.
-  _Done: every failed init step now goes to an `err_*` label that runs the matching `_fini`/`_exit` in reverse (`err_sysctl_fini` → `err_proc_fini` → `err_nl_exit` → `err_dereg_fdb_cb` → `err_destroy_wq`). `register_brevent_notifier` and `queue_delayed_work` come last and can't fail, so no unwind is needed past `nf_register_net_hooks`._
+  [auto_bridge/auto_bridge.c](auto_bridge/auto_bridge.c). _Fixed: b5a7bf8_ — every failed init step routes to its matching `_fini`/`_exit` in reverse.
 
-- [x] **A3e. `dpa_add_eth_if` — `err_ret*` cascade has three explicit TODO gaps.**
-  [cdx/devman.c:1983-2128](cdx/devman.c#L1983-L2128). The function's unwind labels are in place, but three of them are inline comments that say "TODO" instead of real cleanup:
-    - `err_ret5:` ([cdx/devman.c:2117](cdx/devman.c#L2117)) — "TODO: Remove ff policer profile"
-    - `err_ret3:` ([cdx/devman.c:2121](cdx/devman.c#L2121)) — "TODO: DPA remove from port list"
-    - conditional `err_ret6` region ([cdx/devman.c:2111](cdx/devman.c#L2111)) — "TODO: reset bman discard mask" (only under `DPA_IPSEC_OFFLOAD`).
+- [x] **A3e. `dpa_add_eth_if` — `err_ret*` cascade had three explicit TODO gaps.**
+  [cdx/devman.c:1983-2128](cdx/devman.c#L1983-L2128). _Fixed: ba1ac4e_ — three new helpers: `dpa_remove_ethport_ff_policier_profile`, `dpa_bman_restore_discard_mask`, `cdx_disable_ceetm_on_iface`. Sibling follow-on `dpa_release_interface` calls these in reverse acquisition order — _d0d0b3f_.
 
-  Each empty TODO is a leak when the function hits an error at that stage. **Fix:** fill in the three stubs by looking up how the matching "remove" path (see `dpa_remove_eth_if` if it exists, otherwise the teardown in devman's existing remove helpers) handles the corresponding resource. **Severity:** Likely — exercised when a late stage of Ethernet interface registration fails, e.g. if classifier table binding fails after the port has been added.
-  _Done._ Three new reverse helpers wire the last three TODO stubs: `dpa_remove_ethport_ff_policier_profile` in `cdx/cdx_qos.c` (wraps `FM_PCD_PlcrProfileDelete`; one `FM_PORT_PcdPlcrAllocProfiles` slot intentionally leaked since the matching Free API is only legal pre-`FM_PORT_SetPCD` and the DPAA driver has already run SetPCD by the time we hit this unwind), `dpa_bman_restore_discard_mask` in `cdx/devman.c` (writes `FM_RFSDM_DEFAULT` back since there's no `GetDiscardMask` SDK API to snapshot-and-restore), and `cdx_disable_ceetm_on_iface` in `cdx/control_qm.c` (wraps the previously-unused `ceetm_release_lni`, clears `qm_ctx->{lni,sp,iface_info,port_info,qos_enabled,dscp_fq_map,net_dev}` plus `priv->qm_ctx`). Ifdef cascade verified across all four combinations of `ENABLE_EGRESS_QOS × DPA_IPSEC_OFFLOAD`. Boot-tested on ls1046a; err paths are only reached on late-stage init failure, so happy-path boot = no regressions is the confirmation. Sibling follow-on: `dpa_release_interface` has the same set of leaks as the pre-A3e err paths and should call the three new helpers once someone confirms its happy-path teardown ordering._
+  _Test coverage:_ A3a-e fixes are validated by code review only. The natural design (`failslab_times` over modprobe of cdx/fci/auto_bridge) doesn't work because those modules are persistent — daemons hold their refcounts. Runtime err_ret coverage continues via the FCI-reachable mcast paths in [test_mcast_failslab.py](tools/tests/test_mcast_failslab.py).
 
-  _Test-coverage note:_ A3a-e fixes are validated by code review only; no automated regression test exercises these init paths. The natural design — sweep `failslab_times` over `modprobe cdx/fci/auto_bridge` — doesn't work on the test image: cdx, fci, and auto_bridge are persistent (cmm and other boot daemons hold FCI/L2FLOW sockets, so `rmmod` returns "in use" and `modprobe` becomes a no-op). Runtime err_ret coverage continues via [test_mcast_failslab.py](tools/tests/test_mcast_failslab.py) for the FCI-reachable mcast paths. A future principled approach would skip modprobe entirely: open the .ko, arm failslab, call `init_module(2)` directly so faults land inside the module's own init rather than the loader scaffolding. Not on the critical path; the agent's `module_reload` endpoint is in place for if/when this gets picked up (also useful for non-persistent modules like sfp_led, which is its de-facto current consumer).
-
-- [~] **A4. Debug code is production code.**
-  `dpa_test.c` is always compiled in (C9). Debug `%p` is one Kconfig flip from leaking KASLR (M4). `cdx_deinit_ip_reassembly` is a `printk("implement this")` stub (C5). Either delete or `#ifdef`-gate.
-  _Mostly resolved:_ `dpa_test.c` deleted entirely (C9b). `cdx_deinit_ip_reassembly` at least stops the kthread now (C5); full DPAA teardown still TODO but no longer leaves code-freed-while-kthread-running. Remaining: the `%p`/`%px` debug prints under M4._
+- [x] **A4. Debug code is production code.**
+  `dpa_test.c` (C9), debug `%p` (M4), `cdx_deinit_ip_reassembly` stub (C5). All resolved across C9b, M4, C5/A3a, plus the two debug-gated `%p` sites in `dpa_cfg.c` flipped to `%pK` (_c776317_). Other debug-gated `%p` across cdx/ left alone (default-hashed by kernel; out-of-scope churn).
 
 - [x] **A5. Kernel-side fixes unblocking sanitizer coverage.**
-  Bringing up the test image with `CONFIG_LOCKDEP`, `CONFIG_PROVE_LOCKING`, `CONFIG_DEBUG_ATOMIC_SLEEP`, and `CONFIG_UBSAN` enabled surfaced four pre-existing bugs in vendored kernel code that ASK exercises. All four are real (two would genuinely deadlock under memory pressure; one is a lockdep-annotation gap; one is a kernel-internal name-table gap). They fire whether or not KASAN is on — KASAN was a red herring from the earlier bisect. Patches landed in `meta-ask/recipes-kernel/linux/files/` for now; need to move to `patches/kernel/` so Armbian production picks them up (TODO.md tracks that).
+  Bringing up the test image with LOCKDEP/PROVE_LOCKING/DEBUG_ATOMIC_SLEEP/UBSAN surfaced four pre-existing bugs in vendored kernel code (qbman, sdk_dpaa, sdk_fman, netlink). Two would deadlock under memory pressure; one is a lockdep annotation gap; one is a kernel-internal name-table gap. Patches live in `patches/kernel/` (`090-…` through `093-…`) so Armbian production picks them up.
 
-  - [x] **A5a. qbman `dpa_alloc_new` sleeps under `spin_lock_irq`.**
-    `drivers/staging/fsl_qbman/dpa_alloc.c`. The used_node allocation happens inside the spinlock-held region via `kmalloc(GFP_KERNEL)`, which can sleep under direct reclaim — violates atomic-context invariant and would deadlock under memory pressure. Fires from `qman_alloc_fqid_range` (FMAN probe), `qman_alloc_cgrid_range` (CAAM qi init), `qman_alloc_ceetm0_channel_range` (our `cdx_module_init → ceetm_init_channels`), `bman_alloc_bpid_range` (our `cdx_add_eth_onif → dpa_bp_alloc`). **Fix:** pre-allocate `margin_left`/`margin_right`/`used_node` before `spin_lock_irq`; transfer ownership into the lists when consumed, `kfree()` leftovers after unlock. Patch `003-qbman-dpa_alloc-preallocate-nodes.patch`.
+- [x] **A5a. qbman `dpa_alloc_new` sleeps under `spin_lock_irq`.**
+  Patch `090-qbman-dpa_alloc-preallocate-nodes.patch`.
 
-  - [x] **A5b. `dpa_get_channel` holds a spinlock over a sleeping allocation.**
-    `drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c:968`. A `spin_lock(&rx_pool_channel_init)` wraps `qman_alloc_pool()`, which eventually goes through `dpa_alloc_new → kmalloc(GFP_KERNEL)`. The lock protects a one-shot u32 init called only from probe (process context) — a mutex is the correct primitive. **Fix:** replace `DEFINE_SPINLOCK` with `DEFINE_MUTEX`, swap `spin_lock`/`spin_unlock` for `mutex_lock`/`mutex_unlock`. Patch `004-sdk_dpaa-dpa_get_channel-use-mutex.patch`.
+- [x] **A5b. `dpa_get_channel` holds a spinlock over a sleeping allocation.**
+  Patch `091-sdk_dpaa-dpa_get_channel-use-mutex.patch`.
 
-  - [x] **A5c. FMAN `FmPcdLockTryLockAll` false-positive recursive-lock warning.**
-    `drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c`. The function takes an outer FmPcd spinlock then walks a list taking per-object spinlocks. All FMAN spinlocks are allocated via one `XX_InitSpinlock()` call site, so they share a single lockdep class; lockdep sees "p_Spinlock held, p_Spinlock acquired" and warns. Instances are distinct with a fixed outer-before-inner ordering — genuine false positive. **Fix:** add `XX_LockIntrSpinlockNested(h, subclass)` wrapper, `FmPcdLockTryLockNested` inline variant, use `SINGLE_DEPTH_NESTING` at the inner site in `FmPcdLockTryLockAll`. Pure lockdep annotation — compiles away without `CONFIG_LOCKDEP`. Patch `005-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch`.
+- [x] **A5c. FMAN `FmPcdLockTryLockAll` false-positive recursive-lock warning.**
+  Patch `092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch`.
 
-  - [x] **A5d. Netlink `nlk_cb_mutex_key_strings[]` underpopulated for `NETLINK_L2FLOW = 33`.**
-    `net/netlink/af_netlink.c`. The string array is declared `[MAX_LINKS + 1]` (65 entries, MAX_LINKS=64) but the init list only supplies 33 strings, with a leftover "nlk_cb_mutex-MAX_LINKS" sentinel stuck at index 32 from when MAX_LINKS=32. Indices 33..64 are implicitly NULL, so `__netlink_create` hands lockdep a NULL name when our custom protocol number 33 is opened. Fires as `WARNING at lockdep.c:4925 DEBUG_LOCKS_WARN_ON(!name)` from `abm_init → __netlink_kernel_create`. **Fix:** add proper names at indices 32 (NETLINK_KEY) and 33 (NETLINK_L2FLOW). Patch `006-netlink-name-L2FLOW-cb-mutex.patch`.
+- [x] **A5d. Netlink `nlk_cb_mutex_key_strings[]` underpopulated for `NETLINK_L2FLOW = 33`.**
+  Patch `093-netlink-name-L2FLOW-cb-mutex.patch`.
 
-- [x] **A6. CDX tunnel handlers walk untrusted name fields as C strings.**
-  `cdx/control_tunnel.c` / `cdx/control_tunnel.h`. `TNL_handle_DELETE` and `TNL_handle_UPDATE` `memcpy` a fixed-size `cmd.name[16]` from the FCI payload, then call `M_tnl_get_by_name(cmd.name)` which calls `HASH_TUNNEL_NAME(tnl_name)` — a `while (*tnlname)` walker — followed by `strcmp(...)`. Neither bounds the read to the field width. A 16-byte payload with no NUL byte (the canonical malformed-FCI input) reads past the struct on the stack:
+- [x] **A6. CDX tunnel handlers walked untrusted name fields as C strings.**
+  `cdx/control_tunnel.c`. `TNL_handle_DELETE/UPDATE` `memcpy`'d a fixed-size `cmd.name[16]` then walked it as a C string — KASAN OOB on a 16-byte payload with no NUL. Caught by the new payload-mutation fuzzer (A7) on first run under `KASAN=1`. _Fixed: 9f9b69d_ — `HASH_TUNNEL_NAME(name, maxlen)`, `M_tnl_get_by_name(name, maxlen)`, `strncmp` instead of `strcmp`.
 
-        BUG: KASAN: stack-out-of-bounds in HASH_TUNNEL_NAME+0x4c/0x78 [cdx]
-        Read of size 1 at addr ffff800095c17710 by task python3/325
-        ...
-        HASH_TUNNEL_NAME+0x4c/0x78
-        M_tnl_get_by_name+0x24/0xc0
-        tnl_delete_handle+0x9c/0x128
-        cdx_dispatch_cmd+0x27c/0x2dc
+- [x] **A7. Fuzzer payload-body coverage for the validator-table surface.**
+  Original fuzzer hit dispatcher-level length checks only. _Fixed: 0bf177b_ — 30 mutation cases (10 sized commands × {`all_ff`, `high_enum`, `no_nul_str`}) with KASAN/UBSAN/lockdep splat oracle. First run caught A6.
 
-  Caught on first run of the new payload-mutation fuzzer ([tools/tests/test_fci_fuzz.py](tools/tests/test_fci_fuzz.py) `no_nul_str` case for CMD_TNL_DELETE) under `KASAN=1` — exactly the bug class the fuzzer was built for. CREATE happens to be safe because it `strncpy`s the user name into a pre-zeroed destination, but DELETE and UPDATE pass `cmd.name` straight in. **Fix:** make `HASH_TUNNEL_NAME(name, maxlen)` and `M_tnl_get_by_name(name, maxlen)` take an explicit field width; replace the unbounded `strcmp` with `strncmp(..., maxlen)`. Callers (`M_tnl_add`, `M_tnl_delete`, `TNL_handle_UPDATE`, `TNL_handle_DELETE`) pass `sizeof(field)`. Direct edits to cdx/ — out-of-tree module, no `patches/kernel/` entry.
+- [ ] **A8. CAAM job ring consumers not released at shutdown.**
+  On `reboot`, kernel logs `caam_jr 17{1,2}0000.jr: Device is busy; consumers might start to crash`. JR3/JR4 still have registered consumers when `caam_jr` is being torn down. Mostly cosmetic on a hard reboot but indicates a real cleanup gap. **Likely culprits:** (a) IPsec SAs registered via [cdx/cdx_dpa_ipsec.c](cdx/cdx_dpa_ipsec.c); (b) async crypto contexts held by in-kernel `caamalg`/`caamhash`/`caamrng` users; (c) a daemon (cmm/askd-agent) pinning SAs across systemd's stop-units phase. **Investigation:** (1) confirm reproducibility with no IPsec SAs ever installed; (2) if IPsec-related, audit `cdx_ipsec_sec_sa_context_free` for paths that don't unregister from JR; (3) test daemon-stop-first. Sibling-thread to C5/A3a.
