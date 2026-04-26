@@ -48,7 +48,12 @@ U8 gStatTunnelQueryStatus;
  *
  *
  */
-static PTnlEntry M_tnl_get_by_name(U8 *tnl_name)
+/* `maxlen` bounds both the hash walk and the name comparison so a
+ * non-NUL-terminated user-supplied name (the typical malformed-FCI
+ * case) can't read past the buffer. Pass sizeof(field) at the call
+ * site — typically 16 for cmd.name / pTunnelEntry->tnl_name.
+ */
+static PTnlEntry M_tnl_get_by_name(const U8 *tnl_name, size_t maxlen)
 {
 	PTnlEntry pTunnelEntry;
 	struct slist_entry *entry;
@@ -56,10 +61,11 @@ static PTnlEntry M_tnl_get_by_name(U8 *tnl_name)
 
 	if (tnl_name)
 	{
-		hash = HASH_TUNNEL_NAME(tnl_name);
+		hash = HASH_TUNNEL_NAME(tnl_name, maxlen);
 		slist_for_each(pTunnelEntry, entry, &tunnel_name_cache[hash], list)
 		{
-			if(!strcmp((const char*)tnl_name, pTunnelEntry->tnl_name))
+			if (!strncmp((const char *)tnl_name,
+			             pTunnelEntry->tnl_name, maxlen))
 				return pTunnelEntry;
 		}
 	}
@@ -89,7 +95,8 @@ static int M_tnl_add(PTnlEntry pTunnelEntry)
 	U32 hash;
 
 	/* Add to our local hash */
-	hash = HASH_TUNNEL_NAME(pTunnelEntry->tnl_name);
+	hash = HASH_TUNNEL_NAME(pTunnelEntry->tnl_name,
+	                        sizeof(pTunnelEntry->tnl_name));
 	slist_add(&tunnel_name_cache[hash], &pTunnelEntry->list);
 
 	dpa_add_tunnel_if(&pTunnelEntry->itf, (pTunnelEntry->pRtEntry) ? pTunnelEntry->pRtEntry->itf : NULL  , pTunnelEntry);
@@ -111,7 +118,8 @@ static BOOL M_tnl_delete(PTnlEntry pTunnelEntry)
 	U32 hash;
 
 	/* Free the software entry */
-	hash = HASH_TUNNEL_NAME(pTunnelEntry->tnl_name);
+	hash = HASH_TUNNEL_NAME(pTunnelEntry->tnl_name,
+	                        sizeof(pTunnelEntry->tnl_name));
 	prev = slist_prev(&tunnel_name_cache[hash], &pTunnelEntry->list);
 	slist_remove_after(prev);
 	tunnel_free(pTunnelEntry);
@@ -332,7 +340,7 @@ static int TNL_handle_UPDATE(U16 *p, U16 Length)
 
 	memcpy((U8*)&cmd, (U8*)p,  sizeof(TNLCommand_create));
 
-	pTunnelEntry = M_tnl_get_by_name(cmd.name);
+	pTunnelEntry = M_tnl_get_by_name(cmd.name, sizeof(cmd.name));
 	if (!pTunnelEntry)
 		return ERR_TNL_ENTRY_NOT_FOUND;
 
@@ -393,7 +401,7 @@ static int TNL_handle_DELETE(U16 *p, U16 Length)
 
 	memcpy((U8*)&cmd, (U8*)p,  sizeof(TNLCommand_delete));
 
-	if((pTunnelEntry = M_tnl_get_by_name(cmd.name)) == NULL)
+	if((pTunnelEntry = M_tnl_get_by_name(cmd.name, sizeof(cmd.name))) == NULL)
 		return ERR_TNL_ENTRY_NOT_FOUND;
 
 	/* Tell the Interface Manager to remove the tunnel IF */

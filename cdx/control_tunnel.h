@@ -183,13 +183,22 @@ U16 Tnl_Get_Next_Hash_Entry(PTNLCommand_query pTnlCmd, int reset_action);
 int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry);
 int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry);
 
-static __inline U32 HASH_TUNNEL_NAME(U8 *tnlname)
+/* Hash a fixed-width tunnel-name field. `maxlen` is the size of the
+ * underlying buffer (always 16 in current callers); the loop stops at
+ * the first NUL or once `maxlen` bytes have been consumed, whichever
+ * comes first. The earlier "while (*tnlname)" form trusted the input
+ * to be NUL-terminated, which it isn't when the name comes straight
+ * from a malformed FCI command — KASAN caught the resulting stack-OOB
+ * read in tnl_delete_handle (ISSUES.md A6).
+ */
+static __inline U32 HASH_TUNNEL_NAME(const U8 *tnlname, size_t maxlen)
 {
 	U32 hash = 0;
-	while (*tnlname)
+	size_t i;
+	for (i = 0; i < maxlen && tnlname[i]; i++)
 	{
 		hash <<= 3;
-		hash ^= *tnlname++;
+		hash ^= tnlname[i];
 	}
 	return (hash & TUNNEL_HASH_MASK);
 }
