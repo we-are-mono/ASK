@@ -135,18 +135,8 @@ Memory corruption or info-leak reachable from userspace.
 - [x] **M14. cmm `cmm_parse_rtattr` tail dereference on truncated rtattr.**
   [cmm/src/rtnl.c:280-281](cmm/src/rtnl.c#L280-L281). When the parser loop exited with `len != 0` (truncated trailing rtattr), the next line passed `rta->rta_len` to `cmm_print` — but `rta` may point past the buffer at that point, so the read was OOB by up to 2 bytes. Surfaced while authoring [tools/tests/test_cmm_rtnl_fuzz.py](tools/tests/test_cmm_rtnl_fuzz.py); ASAN-instrumented input `04 00 01 00 99` reproduces. _Fixed_ — extracted parser body into [cmm/src/rtnl_parse.c](cmm/src/rtnl_parse.c) so cmm and the fuzzer link the same code; dropped `rta->rta_len` from the diagnostic (only `len_remaining` is logged now); fuzzer ASAN run confirms no further OOB.
 
-- [ ] **M15. FMAN PCD does not replicate IPv4 multicast frames to listener subifs.**
-  **Real product blocker — IPTV use case depends on this.** Surfaced while authoring [tools/tests/test_mcast_replication.py](tools/tests/test_mcast_replication.py). Symptoms confirmed on a clean-boot meta-ask image (not stale state, not a test-harness issue):
-
-  - **Working**: FCI `MC4 ADD` returns `NO_ERR`. `cmm -c "query mc4"` shows the group registered with correct `(ingress=eth3, src=10.0.0.141, dst=239.7.2.1, output=eth4.241/242/243)`. The `cdx_ipv4multicast_dist` and `cdx_multicast4_cc` are present in [dpa_app/files/etc/cdx_pcd.xml](dpa_app/files/etc/cdx_pcd.xml). TCP unicast offload via [test_offload.py](tools/tests/test_offload.py) hits ≥1 Gbps, proving PCD/FMAN itself is functional.
-  - **Broken**: zero replicated frames ever transmitted on DUT eth4. Tested with UDP (proto=17), ICMP (proto=1), IGMP (proto=2), and a custom proto=200 — **none** replicate. LAN-side `enp4s0` tcpdump confirms nothing reaches the LAN at all.
-
-  Tested hypotheses (all ruled out):
-  - ~~Dist ordering~~: UDP mcast eaten by `cdx_udp4_dist` before `cdx_ipv4multicast_dist`. **Ruled out** — ICMP/IGMP/proto=200 frames also fail to replicate, and those skip the UDP/TCP dist filters entirely.
-  - ~~Stale state from prior test runs~~: clean-boot reproduction confirms not a test-harness artefact.
-  - ~~`mc_forwarding=0` slow-path~~: design intent is FCI ADD = HW offload only; sysctl irrelevant unless an mroute daemon is running.
-
-  **Remaining narrow root cause**: the mcast classifier path (frame ingress → `cdx_ipv4multicast_dist` → `cdx_multicast4_cc` lookup → REPLICATE_PKT opcode → per-listener egress FQ) is broken somewhere between "kernel-side MC4 ADD writes the HW EHASH entry" and "FMAN microcode actually consults the table on ingress". Possibilities: kernel writes the entry to a different table than the dist looks up; the FQ list pointed at by the entry's REPLICATE_PKT chain is dead; the microcode opcode sequence isn't getting fired for this entry shape. Needs FMAN PCD / microcode expertise — outside the cdx/fci kernel-side scope and outside the scope of test-harness work. The two replication-correctness tests in [test_mcast_replication.py](tools/tests/test_mcast_replication.py) are `pytest.mark.skip`'d with this diagnosis pinned.
+- [x] **M15. FMAN PCD does not replicate IPv4 multicast frames to listener subifs.**
+  [cdx/dpa_control_mc.c](cdx/dpa_control_mc.c). Two independent kernel-side bugs in the MC4 ADD path: (a) no `dev_mc_add()` on the ingress netdev, so FMAN MEMAC's hardware multicast filter dropped frames at L2 before PCD ran (PROMISC doesn't bypass mcast filtering on FMAN); (b) no write barrier between the per-listener EHASH chain writes and `ExternalHashTableAddKey()`'s bucket-head publish, so on weak-ordered ARM64 FMAN could read the new bucket head and walk a still-stale chain — CC counters tick but listener TX FQs stay at 0. _Fixed_ — early `dev_mc_add`/`dev_mc_del` in create + err_ret + REMOVE-all branches; `wmb()` in `insert_mcast_entry_in_classif_table` before AddKey; replication-correctness tests in [test_mcast_replication.py](tools/tests/test_mcast_replication.py) un-skipped and pass.
 
 ---
 

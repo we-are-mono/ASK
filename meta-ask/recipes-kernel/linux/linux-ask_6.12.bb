@@ -38,6 +38,7 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://093-netlink-name-L2FLOW-cb-mutex.patch \
            file://094-sdk-fman-dpaa-qbman-kasan-sanitize-off.patch \
            file://095-sdk_fman-iomem-mem-ops.patch \
+           file://096-sdk_fman-mac-hash-alloc-null-check.patch \
           "
 
 # Optional KASAN overlay — flipped on by the user with

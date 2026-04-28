@@ -1161,8 +1161,19 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 #ifdef CDX_DPA_DEBUG
 	display_ehash_tbl_entry(&tbl_entry->hashentry, key_size);
 #endif // CDX_DPA_DEBUG
+	/* The per-listener entries built earlier (their opcodes, params,
+	 * and the chain's prev_listener->next_entry pointers) plus this
+	 * root entry's REPLICATE_PARAMS were all stored to coherent DDR.
+	 * On weak-ordered ARM64 those writes can sit in the CPU's store
+	 * buffer when AddKey installs the bucket->head pointer that FMAN
+	 * microcode walks. Without a barrier, FMAN can read the new bucket
+	 * head and dereference a listener entry whose opcode/chain bytes
+	 * are still stale, hitting CC stats but failing to enqueue to the
+	 * listener TX FQ. wmb() drains the store buffer, ordering all
+	 * prior writes before AddKey's bucket-head publication. */
+	wmb();
 	//insert entry into hash table
-	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry); 
+	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
 	if (retval == -1) {
 		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
 		goto err_ret;

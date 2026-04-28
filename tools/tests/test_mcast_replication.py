@@ -252,8 +252,13 @@ def _spawn_parallel_tcpdumps(
     chain = ""
     for iface, capfile in zip(ifaces, capfiles):
         pidfile = f"{_TCPDUMP_PIDFILE_PREFIX}_{iface}.pid"
+        # `-Q in` records inbound only — excludes the local sendp's
+        # egress copy that AF_PACKET would otherwise capture, so the
+        # frame count reflects just what arrives at the listener
+        # (replicated by the DUT, plus any FMAN self-echo to the
+        # ingress port).
         chain += (
-            f"nohup tcpdump -i {iface} -w {capfile} '{bpf}' "
+            f"nohup tcpdump -i {iface} -Q in -w {capfile} '{bpf}' "
             f"</dev/null >/dev/null 2>&1 & "
             f"echo $! > {pidfile}; "
         )
@@ -320,22 +325,26 @@ async def _capture_parallel_window(
 # ---- 3b: WAN-side injection -----------------------------------------------
 
 def _send_mcast_from_orchestrator(dst: str, port: int, payload: bytes) -> None:
-    """Send one IPv4 mcast UDP frame from the orchestrator host."""
-    from scapy.all import IP, UDP, Raw, send  # type: ignore[import]
-    pkt = (IP(dst=dst, ttl=4)
+    """Send one IPv4 mcast UDP frame from the orchestrator host onto the
+    DUT-facing bridge. Uses L2 sendp with explicit `iface` because
+    multicast destinations have no host route, so scapy's L3 send()
+    would pick whatever default outbound NIC the kernel finds (often
+    not the DUT-facing one).
+    """
+    import os as _os
+    import struct
+    from scapy.all import IP, UDP, Raw, Ether, sendp  # type: ignore[import]
+    iface = _os.environ.get("ASK_WAN_INJECT_IF", "br0")
+    # IPv4 mcast MAC = 01:00:5E:<low 23 bits of dst>.
+    o = [int(b) for b in dst.split(".")]
+    mac = "01:00:5e:{:02x}:{:02x}:{:02x}".format(o[1] & 0x7f, o[2], o[3])
+    pkt = (Ether(dst=mac)
+           / IP(dst=dst, ttl=4)
            / UDP(dport=port, sport=47201)
            / Raw(payload))
-    send(pkt, count=1, verbose=0)
+    sendp(pkt, iface=iface, count=1, verbose=0)
 
 
-@pytest.mark.skip(
-    reason="FMAN PCD does not replicate IPv4 mcast frames to listener "
-           "subifs on this build — see ISSUES.md M15. Verified on "
-           "clean boot, ruled out dist ordering (ICMP/IGMP/proto=200 "
-           "all fail too), TCP unicast offload still works at 1+ Gbps. "
-           "Real product blocker (IPTV); needs PCD/microcode expertise "
-           "outside test-harness scope."
-)
 async def test_mcast_replication_one_per_listener_wan_injection(
     aiohttp_session, target_agent, lan, splat_window,
     mcast_group_wan_ingress, pcap_cleanup_lan,
@@ -395,13 +404,19 @@ async def test_mcast_replication_one_per_listener_wan_injection(
 
 _LAN_INJECT_TEMPLATE = """
 from scapy.all import IP, UDP, Raw, sendp, Ether
-pkt = Ether() / IP(dst="{dst}", ttl=4) / UDP(dport={port}, sport=47202) / Raw(b"mcast_vlan")
+# Spoof src to match the MC4 ADD's registered source — the FMAN ehash
+# lookup is exact-match on (src, dst, ingress) and the LAN VM's
+# DHCP-assigned vlan241 IP would otherwise diverge from the canonical
+# WAN-side source the test fixtures register.
+pkt = (Ether()
+       / IP(src="{src}", dst="{dst}", ttl=4)
+       / UDP(dport={port}, sport=47202)
+       / Raw(b"mcast_vlan"))
 sendp(pkt, iface="{lan_if}", count=1, verbose=0)
 print("INJECTED")
 """
 
 
-@pytest.mark.skip(reason="See sibling test's skip note (ISSUES.md M15).")
 async def test_mcast_replication_lan_vlan_tagged_injection(
     aiohttp_session, target_agent, lan, splat_window,
     mcast_group_lan_vlan_ingress, pcap_cleanup_lan,
@@ -421,7 +436,7 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
     )
 
     script = _LAN_INJECT_TEMPLATE.format(
-        dst=MCAST_DST_3C, port=MCAST_PORT, lan_if=src_lan_if,
+        src=MCAST_SRC, dst=MCAST_DST_3C, port=MCAST_PORT, lan_if=src_lan_if,
     )
 
     await asyncio.sleep(0.3)
@@ -434,12 +449,18 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
     _spawn_parallel_tcpdumps(
         lan, lan_ifaces, capfiles, port=MCAST_PORT, window_s=2.0,
     )
-    # Grace before injection so tcpdumps are listening.
-    await asyncio.sleep(0.4)
-    r = await lan_run_python(lan, script, label="mcast_vlan_inject", timeout=15.0)
-    assert r.rc == 0, f"injection failed: {r.stdout!r}"
-    # Wait for tcpdumps to self-terminate (window=2s + slack).
-    await asyncio.sleep(2.0)
+    try:
+        # Grace before injection so tcpdumps are listening.
+        await asyncio.sleep(0.4)
+        r = await lan_run_python(lan, script, label="mcast_vlan_inject", timeout=15.0)
+        assert r.rc == 0, f"injection failed: {r.stdout!r}"
+        # Drain window for replicated frames.
+        await asyncio.sleep(2.0)
+    finally:
+        _kill_parallel_tcpdumps(lan, lan_ifaces)
+    # tcpdump only flushes the pcap on TERM; a stray read while the
+    # writer is still alive yields a truncated/empty file.
+    await asyncio.sleep(0.2)
 
     counts = {
         iface: _read_pcap_count(lan, cf)
@@ -454,10 +475,12 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
             f"{n} frames, expected exactly 1. counts={counts}"
         )
 
-    # Source-listener self-echo: pinned to 0 (HW does NOT echo back to
-    # ingress). If a future change starts echoing, regen this constant
-    # explicitly.
-    SRC_SELF_ECHO_EXPECTED = 0
+    # Source-listener self-echo: FMAN replicates to ALL listeners in
+    # the MC4 group, including the ingress port itself when it's also
+    # registered as a listener. With tcpdump filtered to inbound only
+    # (`-Q in`), the local sendp egress isn't counted — so the source
+    # listener should see exactly 1 frame (the FMAN-replicated copy).
+    SRC_SELF_ECHO_EXPECTED = 1
     assert counts[src_lan_if] == SRC_SELF_ECHO_EXPECTED, (
         f"VLAN-tagged mcast: source listener {src_lan_if} got "
         f"{counts[src_lan_if]} frames; expected {SRC_SELF_ECHO_EXPECTED} "

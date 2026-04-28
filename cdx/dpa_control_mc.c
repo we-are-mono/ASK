@@ -17,6 +17,8 @@
 #include "dpa_control_mc.h"
 #include "control_ipv6.h"
 #include "linux/netdevice.h"
+#include <linux/if_ether.h>
+#include <net/net_namespace.h>
 
 typedef union ucode_phyaddr_u {
 	struct {
@@ -87,6 +89,74 @@ static inline bool mcast_action_is_mutator(uint16_t action)
 	return action == CDX_MC_ACTION_ADD ||
 	       action == CDX_MC_ACTION_REMOVE ||
 	       action == CDX_MC_ACTION_UPDATE;
+}
+
+/* The ingress netdev must be subscribed to the group's L2 multicast
+ * MAC — otherwise the FMAN MEMAC hardware filter drops matching
+ * frames before PCD can classify and replicate them. PROMISC on this
+ * driver bypasses unicast filtering only; multicast filtering still
+ * applies. Without an explicit dev_mc_add() during MC4 ADD, an
+ * offload-managed group silently fails: FCI returns NO_ERR, cmm
+ * query mc4 shows the group, zero frames replicate. */
+static void cdx_mcast_compute_mac(const struct mcast_group_info *grp,
+				  uint8_t mac[ETH_ALEN])
+{
+	if (grp->mctype == 0) {
+		/* IPv4: 01:00:5E:<low 23 bits of dst>. The mask on byte 3
+		 * matches the on-disk daddr endianness used elsewhere in
+		 * this file (see cdx_add_mcast_table_entry's pRtEntry->dstmac
+		 * computation). */
+		mac[0] = 0x01;
+		mac[1] = 0x00;
+		mac[2] = 0x5e;
+		mac[3] = (grp->ipv4_daddr >> 8)  & 0x7f;
+		mac[4] = (grp->ipv4_daddr >> 16) & 0xff;
+		mac[5] = (grp->ipv4_daddr >> 24) & 0xff;
+	} else {
+		/* IPv6: 33:33:<low 32 bits of dst>. Same byte-order convention
+		 * as the existing pRtEntry->dstmac code below. */
+		uint32_t lo = grp->ipv6_daddr[3];
+		mac[0] = 0x33;
+		mac[1] = 0x33;
+		mac[2] = (lo) & 0xff;
+		mac[3] = (lo >> 8) & 0xff;
+		mac[4] = (lo >> 16) & 0xff;
+		mac[5] = (lo >> 24) & 0xff;
+	}
+}
+
+static int cdx_mcast_subscribe_ingress_mac(const char *ifname,
+					   const uint8_t mac[ETH_ALEN])
+{
+	struct net_device *dev;
+	int rc;
+
+	dev = dev_get_by_name(&init_net, ifname);
+	if (!dev) {
+		DPA_ERROR("%s::ingress netdev %s not found\n", __func__, ifname);
+		return -ENODEV;
+	}
+	rc = dev_mc_add(dev, mac);
+	dev_put(dev);
+	if (rc)
+		DPA_ERROR("%s::dev_mc_add(%s, %pM) failed: %d\n",
+			  __func__, ifname, mac, rc);
+	return rc;
+}
+
+static void cdx_mcast_unsubscribe_ingress_mac(const char *ifname,
+					      const uint8_t mac[ETH_ALEN])
+{
+	struct net_device *dev;
+
+	dev = dev_get_by_name(&init_net, ifname);
+	if (!dev) {
+		/* Interface gone (e.g. removed before group teardown). The
+		 * subscription is gone with it; nothing to undo. */
+		return;
+	}
+	(void)dev_mc_del(dev, mac);
+	dev_put(dev);
 }
 
 
@@ -595,6 +665,23 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		tbl_type = IPV6_MULTICAST_TABLE;
 	}
 
+	/* Subscribe the ingress netdev to the group's L2 multicast MAC
+	 * BEFORE any HW state is committed. Sequencing this first means a
+	 * subscribe failure (e.g. -ENOMEM under memory pressure / failslab)
+	 * unwinds with no FMAN-side cleanup needed — keeping the err_ret
+	 * cascade simple and (per ISSUES.md M9) reachable only via paths
+	 * that haven't installed an EHASH entry yet. */
+	{
+		uint8_t mac[ETH_ALEN];
+		cdx_mcast_compute_mac(pMcastGrpInfo, mac);
+		iRet = cdx_mcast_subscribe_ingress_mac(
+			pMcastGrpInfo->ucIngressIface, mac);
+		if (iRet) {
+			DPA_ERROR("%s::%d MAC filter subscription failed (%d)\n",
+				  __func__, __LINE__, iRet);
+			goto err_ret;
+		}
+	}
 
 	pMcastGrpInfo->uiListenerCnt = 0;
 
@@ -622,7 +709,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		strncpy(pMcastGrpInfo->members[member_id].if_info, pListener->output_device_str,IF_NAME_SIZE-1);
 		pMcastGrpInfo->members[member_id].member_id = member_id;
 		pMcastGrpInfo->members[member_id].tbl_entry= tbl_entry;
-		pMcastGrpInfo->uiListenerCnt++; 
+		pMcastGrpInfo->uiListenerCnt++;
 		member_id++;
 	}
 
@@ -636,12 +723,24 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		DPA_ERROR(" %s::%d Adding mcast table entry failed \r\n", __func__, __LINE__);
 		goto err_ret;
 	}
+
 	AddToMcastGrpList(pMcastGrpInfo);
 	return 0;
 
 err_ret:
 	if(pMcastGrpInfo)
 	{
+		/* Undo the dev_mc_add() done above (if it ran). dev_mc_del
+		 * is refcounted and silently no-ops when the address isn't
+		 * present, so calling it unconditionally is safe — covers
+		 * both "subscribe failed at the call site" and "subscribe
+		 * succeeded then a later step failed". */
+		{
+			uint8_t mac[ETH_ALEN];
+			cdx_mcast_compute_mac(pMcastGrpInfo, mac);
+			cdx_mcast_unsubscribe_ingress_mac(
+				pMcastGrpInfo->ucIngressIface, mac);
+		}
 		/* Use a local for the cleanup return; reassigning iRet here
 		 * would clobber the original failure code set by whichever
 		 * arm of the create path jumped here. cdx_free_exthash_mcast_members
@@ -1024,6 +1123,17 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 			if(pMcastGrpInfo->pCtEntry->pRtEntry)
 				kfree(pMcastGrpInfo->pCtEntry->pRtEntry);
 			kfree(pMcastGrpInfo->pCtEntry);
+		}
+		/* Undo the dev_mc_add() from the create path so the FMAN
+		 * MAC's hardware multicast filter doesn't keep accepting
+		 * frames for a now-gone group. dev_mc_add/del refcount, so
+		 * groups sharing a MAC (IPv4 32→23-bit collisions) decrement
+		 * cleanly. */
+		{
+			uint8_t mac[ETH_ALEN];
+			cdx_mcast_compute_mac(pMcastGrpInfo, mac);
+			cdx_mcast_unsubscribe_ingress_mac(
+				pMcastGrpInfo->ucIngressIface, mac);
 		}
 		kfree(pMcastGrpInfo);
 		return 0;
