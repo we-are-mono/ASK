@@ -798,6 +798,8 @@ static t_Error MemacAddHashMacAddress(t_Handle h_Memac, t_EnetAddr *p_EthAddr)
 
     /* Create element to be added to the driver hash table */
     p_HashEntry = (t_EthHashEntry *)XX_Malloc(sizeof(t_EthHashEntry));
+    if (!p_HashEntry)
+        RETURN_ERROR(MAJOR, E_NO_MEMORY, ("hash entry"));
     p_HashEntry->addr = ethAddr;
     INIT_LIST(&p_HashEntry->node);
 
