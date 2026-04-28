@@ -43,6 +43,9 @@ IMAGE_INSTALL = " \
     kernel-module-nf-conntrack-netlink \
     kernel-module-xt-conntrack \
     kernel-module-xt-masquerade \
+    kernel-module-ip6-tables \
+    kernel-module-ip6table-filter \
+    kernel-module-ip6table-mangle \
     cmm \
     dpa-app \
     dnsmasq \

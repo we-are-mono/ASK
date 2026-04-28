@@ -18,3 +18,9 @@ allowlist:
   - pattern: "rcu: RCU lockdep checking is enabled"
     reason: "CONFIG_PROVE_RCU boot announcement; not a real splat. Belt-and-braces in case SPLAT_RE broadens."
     expires: "2027-01-01"
+
+  - pattern: 'create_tunnel_insert_hm\+0x[0-9a-f]+/0x[0-9a-f]+ \[cdx\]'
+    reason: "ISSUES.md A11 — FORTIFY_SOURCE false positive on flex-array l3hdr[0] in struct en_ehash_insert_l3_hdr (kernel header). The caller pre-allocates sizeof(struct)+header_size at cdx_ehash.c:2280; FORTIFY sees compile-time dst=0 and warns at the memcpy on line 2298. Fix: convert l3hdr[0] -> l3hdr[] (proper flex array) OR switch to unsafe_memcpy(). Drop this entry when the kernel patch lands."
+    expires: "2026-07-01"
+    applies_to:
+      - "test_tunnel_tx_offload"

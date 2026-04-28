@@ -18,6 +18,14 @@ WAN_IF=eth3
 WAN_ADDR=10.0.0.62/24
 WAN_GATEWAY=10.0.0.1
 WAN_DNS=10.0.0.1
+# IPv6 LAN ULA — production deployments would use the ISP-delegated
+# /64 instead. Keeping a static ULA on LAN means the test harness has
+# a stable inner-subnet target without depending on RA/DHCPv6.
+LAN_ADDR6=fc00:dead::1/64
+# WAN-side ULA used by the FMAN tunnel-offload tests as the outer
+# IPv6 source/dest for 4o6 / GRE-IPv6. Real deployments would have
+# global addressing here.
+WAN_ADDR6=fc00:beef::1/64
 DNSMASQ_CONF=/etc/dnsmasq-gateway.conf
 
 start_loopback() {
@@ -29,17 +37,20 @@ start_loopback() {
 start_lan() {
     ip link set "$LAN_IF" up
     ip addr replace "$LAN_ADDR" dev "$LAN_IF"
+    ip -6 addr replace "$LAN_ADDR6" dev "$LAN_IF"
 }
 
 start_wan() {
     ip link set "$WAN_IF" up
     ip addr replace "$WAN_ADDR" dev "$WAN_IF"
+    ip -6 addr replace "$WAN_ADDR6" dev "$WAN_IF"
     ip route replace default via "$WAN_GATEWAY" dev "$WAN_IF"
     printf 'nameserver %s\n' "$WAN_DNS" > /etc/resolv.conf
 }
 
 start_forward() {
     echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
 }
 
 add_rule() {
@@ -50,6 +61,16 @@ add_rule() {
         shift 2
     fi
     iptables $tbl -C "$@" 2>/dev/null || iptables $tbl -A "$@"
+}
+
+add_rule6() {
+    # ip6tables variant of add_rule (idempotent insert).
+    local tbl=""
+    if [ "$1" = "-t" ]; then
+        tbl="-t $2"
+        shift 2
+    fi
+    ip6tables $tbl -C "$@" 2>/dev/null || ip6tables $tbl -A "$@"
 }
 
 start_nat() {
@@ -69,6 +90,27 @@ start_nat() {
     add_rule FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
 }
 
+start_filter6() {
+    # IPv6 is routed (no NAT) — every device gets a real address from
+    # the ISP delegation in production. We still need an ip6tables
+    # FORWARD rule with `-m conntrack` so the kernel engages IPv6
+    # conntrack tracking on forwarded flows. Without it, no v6 flow
+    # gets tracked, CMM has nothing to mirror, and FMAN never offloads
+    # the tunnel encap egress (the whole point of this image's
+    # tunnel-offload tests).
+    #
+    # The rule is intentionally interface-agnostic: scoping it to
+    # `-o $WAN_IF` (the obvious analog of the IPv4 NAT rule) misses
+    # tunnel egress, which leaves through sit/ipip/gre netdevs not
+    # eth3. Catching all NEW/ESTABLISHED/RELATED forwarded v6 flows
+    # is the right shape for a routed v6 path with FMAN-offloaded
+    # tunnels.
+    modprobe ip6_tables    2>/dev/null || true
+    modprobe ip6table_filter 2>/dev/null || true
+
+    add_rule6 FORWARD -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+}
+
 start_dnsmasq() {
     # dnsmasq's bind-interfaces requires the LAN address to exist, which
     # start_lan above guarantees. Exit early if a dnsmasq is already running.
@@ -85,6 +127,7 @@ case "$1" in
         start_wan
         start_forward
         start_nat
+        start_filter6
         start_dnsmasq
         ;;
     stop)
@@ -92,6 +135,7 @@ case "$1" in
         iptables -t nat -D POSTROUTING -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
         iptables -D FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
         iptables -D FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        ip6tables -D FORWARD -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
         ;;
     *)
         echo "Usage: $0 {start|stop}" >&2
