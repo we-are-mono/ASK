@@ -24,3 +24,9 @@ allowlist:
     expires: "2026-07-01"
     applies_to:
       - "test_tunnel_tx_offload"
+
+  - pattern: '(={20,}|circular locking dependency detected|ppp_ioctl\+0x[0-9a-f]+/0x[0-9a-f]+ \[ppp_generic\])'
+    reason: "ISSUES.md A13 — upstream ppp_generic lockdep WARNING (not deadlock): all_ppp_mutex ↔ rtnl_mutex inversion between ppp_ioctl path (mutex first, then rtnl_lock via register_netdev) and rtnetlink ppp_link_ops path (rtnl held, then all_ppp_mutex). Pre-existing in upstream Linux 6.12; surfaces once per boot on first PPPIOCNEWUNIT. Not introduced by ASK code. Pattern catches the lockdep banner (===), the WARNING line, and the PPP stack-trace line; applies_to scopes the broad banner-match to PPPoE tests only. Drop when upstream fix lands and we rebase past it."
+    expires: "2026-10-01"
+    applies_to:
+      - "test_pppoe_e2e"

@@ -16,6 +16,10 @@ IMAGE_INSTALL = " \
     nftables \
     bridge-utils \
     conntrack-tools \
+    ppp \
+    ppp-oe \
+    kernel-module-ppp-generic \
+    kernel-module-pppoe \
     tcpdump \
     iperf3 \
     netcat \
