@@ -155,6 +155,7 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 	if (!proc_entry->proc_dir)
 	{
 		printk("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
+		kfree(proc_entry);
 		return -1;
 	}
 #ifdef CDX_DPA_DEBUG

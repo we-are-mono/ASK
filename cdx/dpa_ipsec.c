@@ -887,20 +887,23 @@ err_ret3:
 		fq = &(ipsecsa_info->sec_fq[ii-1].fq_base);
 		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		if (qman_retire_fq(fq, NULL)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
+			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
 					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		if (qman_oos_fq(fq)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
+			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
 					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 	}
-	if (ipsecsa_info->sa_proc_entry)
+	if (ipsecsa_info->sa_proc_entry) {
 		proc_remove(((cdx_proc_dir_entry_t *)(ipsecsa_info->sa_proc_entry))->proc_dir);
+		kfree(ipsecsa_info->sa_proc_entry);
+		ipsecsa_info->sa_proc_entry = NULL;
+	}
 err_ret2:
 #ifdef UNIQUE_IPSEC_CP_FQID
 	/*TODO : qman_release_fqid_range */
@@ -1158,24 +1161,24 @@ int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size)
 
 }
 
-void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle) 
+void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
 
 	sainfo = (struct dpa_ipsec_sainfo *)
 		kzalloc(sizeof(struct dpa_ipsec_sainfo), GFP_KERNEL);
 	if (!sainfo) {
-		DPAIPSEC_ERROR("%s::Error in allocating sainfo\n", 
+		DPAIPSEC_ERROR("%s::Error in allocating sainfo\n",
 				__func__);
 		return NULL;
-	}	
+	}
 	memset(sainfo, 0, sizeof(struct dpa_ipsec_sainfo));
 	//create fqs in scheduled state
 	if (create_ipsec_fqs(sainfo, 1, handle)) {
 		kfree(sainfo);
 		return NULL;
 	}
-	return sainfo; 	
+	return sainfo;
 }
 
 /* change the state of frame queues */
@@ -1197,7 +1200,7 @@ int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num)
 	return ret;
 }
 
-int cdx_dpa_ipsecsa_release(void *handle) 
+int cdx_dpa_ipsecsa_release(void *handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
 	struct dpa_fq *dpa_fq;
@@ -1211,10 +1214,10 @@ int cdx_dpa_ipsecsa_release(void *handle)
 
 	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
 		dpa_fq = &sainfo->sec_fq[ii];
-		fq = &dpa_fq->fq_base; 
+		fq = &dpa_fq->fq_base;
 		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		if (qman_oos_fq(fq)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n", 
+			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
 					__func__, fq->fqid, fq->fqid);
 			return FAILURE;
 		}
@@ -1224,7 +1227,14 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	if (sainfo->sa_proc_entry)
 	{
 		proc_remove(((cdx_proc_dir_entry_t *)(sainfo->sa_proc_entry))->proc_dir);
+		kfree(sainfo->sa_proc_entry);
 	}
+	/* shdesc_mem was allocated in create_ipsec_fqs and the SEC shared
+	 * descriptor lives inside it (sainfo->shared_desc points into this
+	 * buffer with PTR_ALIGN offset). The err_ret1 unwind in
+	 * create_ipsec_fqs frees it on partial-init failure; this is the
+	 * matching free on the normal release path. */
+	kfree(sainfo->shdesc_mem);
 #ifdef  UNIQUE_IPSEC_CP_FQID
 	qman_release_fqid_range(sainfo->sec_fq[FQ_FROM_SEC].fqid, NUM_FQS_PER_SA);
 #endif /* UNIQUE_IPSEC_CP_FQID */

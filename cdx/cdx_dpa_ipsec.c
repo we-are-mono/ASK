@@ -237,9 +237,8 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 	return 0;
 }
 
-void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context ) 
+void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 {
-
 	if(pdpa_sec_context->dpa_ipsecsa_handle)
 		cdx_dpa_ipsecsa_release(pdpa_sec_context->dpa_ipsecsa_handle);
 	if(pdpa_sec_context->cipher_data.cipher_key)
@@ -253,7 +252,6 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 	if(pdpa_sec_context->rjob_desc_unaligned)
 		kfree(pdpa_sec_context->rjob_desc_unaligned);
 	kfree(pdpa_sec_context);
-
 }
 
 /* natt_arr_mask enables bits according to the number of spi
@@ -365,7 +363,7 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 			/* if fq is not in retired state, restart timer */
 			if (ret)
 			{
-				DPA_ERROR("%s::Failed to change state \n", 
+				DPA_ERROR("%s::Failed to change state \n",
 				__func__);
 				cdx_timer_init((TIMER_ENTRY *)&pSA->deletion_timer,
 					cdx_ipsec_release_sa_ctx_cbk);
