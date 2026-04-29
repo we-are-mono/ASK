@@ -3,6 +3,7 @@ LICENSE = "MIT"
 
 IMAGE_INSTALL = " \
     busybox \
+    coreutils \
     base-files \
     shadow \
     kmod \
@@ -36,6 +37,7 @@ IMAGE_INSTALL = " \
     ltrace \
     gdb \
     file \
+    sysstat \
     \
     \
     cdx \
