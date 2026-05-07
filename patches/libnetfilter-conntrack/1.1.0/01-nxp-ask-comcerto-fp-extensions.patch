@@ -63,7 +63,7 @@ index 658e4d2..1520b3b 100644
 +	uint32_t	mark;
 +	int		underlying_iif;
 +	uint16_t	underlying_vlan_id;
-+	uint32_t	xfrm_handle[4];
++	uint16_t	xfrm_handle[4];
 +};
 +
  struct nfct_tuple_head {
@@ -463,8 +463,8 @@ index 3cbfc6a..33f7824 100644
 +			abi_breakage();
 +		break;
 +	case CTA_COMCERTO_FP_XFRM_HANDLE:
-+		/* 4 x u32 = 16 bytes */
-+		if (mnl_attr_validate2(attr, MNL_TYPE_UNSPEC, 16) < 0)
++		/* 4 x u16 = 8 bytes — kernel struct nf_ct_fp_info::xfrm_handle */
++		if (mnl_attr_validate2(attr, MNL_TYPE_UNSPEC, 8) < 0)
 +			abi_breakage();
 +		break;
 +	}

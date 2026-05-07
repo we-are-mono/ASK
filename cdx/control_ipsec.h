@@ -359,6 +359,12 @@ struct auth_params {
 
 /* timer value for defered release of SA resources */
 #define SA_CTX_RELEASE_TIMER_VAL (1 * HZ)
+/* A24b: cap the FQ-retire poll loop so a wedged FQ doesn't pin the SAEntry
+ * forever. SA_CTX_RELEASE_TIMER_VAL is 1s, so this is a 30s wall-clock cap.
+ * On cap-hit, the deferred-release callback logs and skips the final free —
+ * SA resources leak, but the system stays observable and recoverable for
+ * the rest of cdx. */
+#define SA_RELEASE_MAX_ITER 30
 typedef struct dpa_sec_sa_context_s{
 	U32   to_sec_fqid;
 	U32   from_sec_fqid;
@@ -392,6 +398,7 @@ typedef struct _tSAEntry {
 	struct slist_entry      list_fqid;
 #endif /* UNIQUE_IPSEC_CP_FQID */
 	TIMER_ENTRY 		deletion_timer;	/* should be the first member */
+	U32			deletion_iter;	/* A24b: poll count for FQ-retire wait; capped via SA_RELEASE_MAX_ITER */
 	U16			hash_by_h;
 	U16			hash_by_spi;
 	struct _tSAID           id;             // SA 3-tuple

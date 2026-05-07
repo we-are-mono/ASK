@@ -26,6 +26,9 @@
 
 //#define CONTROL_IPSEC_DEBUG 1
 
+/* A24 GCM investigation — runtime evidence printks. Drop after diagnosis. */
+#define CDX_DEBUG_GCM 1
+
 #define SOCKET_NATT	0
 
 TIMER_ENTRY sa_timer;
@@ -263,6 +266,9 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 	switch (key_alg) {
 		case SADB_X_EALG_AESCTR:
 			algo = OP_PCL_IPSEC_AES_CTR;
+			sa->blocksz = 16;
+			comb_mode = 1;
+			extra_size = 4;	/* RFC 3686 nonce trails the AES key */
 			break;
 		case SADB_X_EALG_AESCBC:
 			algo = OP_PCL_IPSEC_AES_CBC;
@@ -346,6 +352,20 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 	{
 		sa->pSec_sa_context->cipher_data.cipher_key_len -= extra_size;
 	}
+
+#ifdef CDX_DEBUG_GCM
+	if (comb_mode) {
+		U8 *kbuf = sa->pSec_sa_context->cipher_data.cipher_key;
+		U32 klen = sa->pSec_sa_context->cipher_data.cipher_key_len;
+		printk(KERN_INFO "CDX_DEBUG_GCM cipher: alg=0x%x key_alg=%u key_bits=%u "
+				"post_trim_klen=%u extra=%u icvsz=%u blocksz=%u "
+				"split_key_len=%u salt=%02x%02x%02x%02x\n",
+				algo, key_alg, key_bits, klen, extra_size,
+				sa->icvsz, sa->blocksz,
+				sa->pSec_sa_context->auth_data.split_key_len,
+				kbuf[klen+0], kbuf[klen+1], kbuf[klen+2], kbuf[klen+3]);
+	}
+#endif
 
 	return 0;
 }
@@ -614,12 +634,19 @@ int IPsec_handle_SA_SET_KEYS(U16 *p, U16 Length)
 	printk(KERN_INFO "%s sagd %d, numkeys %d\n", __func__, cmd.sagd,cmd.num_keys);
 #endif
 	sa = M_ipsec_sa_cache_lookup_by_h(cmd.sagd);
-	sa->pSec_sa_context->auth_data.auth_type = 0;
-
 	if (sa == NULL)
 		return ERR_SA_UNKNOWN;
+	sa->pSec_sa_context->auth_data.auth_type = 0;
+#ifdef CDX_DEBUG_GCM
+	printk(KERN_INFO "CDX_DEBUG_GCM SET_KEYS sagd=%u num_keys=%u\n",
+			cmd.sagd, cmd.num_keys);
+#endif
 	for (i = 0;i<cmd.num_keys;i++) {
 		key = (PIPSec_key_desc)&cmd.keys[i];
+#ifdef CDX_DEBUG_GCM
+		printk(KERN_INFO "CDX_DEBUG_GCM SET_KEYS  [%d] type=%u alg=%u bits=%u\n",
+				i, key->key_type, key->key_alg, key->key_bits);
+#endif
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s(%d) key type %d, key alg %d, key bits %d \n",
 				__func__,__LINE__, key->key_type, key->key_alg,key->key_bits);
@@ -715,12 +742,18 @@ static int IPsec_handle_SA_SET_NATT(U16 *p, U16 Length)
 
 static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 {
+	int rc;
+
+
 	if (IS_NATT_SA(sa))
 	{
-		cdx_ipsec_process_udp_classification_table_entry(sa);
+		rc = cdx_ipsec_process_udp_classification_table_entry(sa);
+		if (rc)
+			return ERR_CREATION_FAILED;
 	}
 	else {
-		if (cdx_ipsec_add_classification_table_entry(sa))
+		rc = cdx_ipsec_add_classification_table_entry(sa);
+		if (rc)
 			return ERR_CREATION_FAILED;
 	}
 
@@ -818,25 +851,26 @@ int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length)
 	printk("%s::cmd state :%x sa state %x sa %p, dir %d\n", 
 			__func__, cmd.state, sa->state, sa, sa->direction);
 #endif
+
 	if ((cmd.state == XFRM_STATE_VALID) &&  (sa->state == SA_STATE_INIT)) {
 #ifdef CONTROL_IPSEC_DEBUG
 		printk(KERN_INFO "valid:\n");
 #endif
 		sa->state = SA_STATE_VALID;
 		/* SA information is populated in various commands.
-		 * This will be the final command in the sequnce.  
+		 * This will be the final command in the sequnce.
 		 * So here we can push all the relevent information to DPAA.
 		 * a) populate  algorithm, key, tunnel header to shared descriptor.
-		 * b) create flow entry for encrypted traffic. 
-		 * For ipsec enabled traffic there will be total of 4 flows (considering  both 
-		 * directions). Two flows will get added during  SA creation time. 
-		 * Other two will get added when the connection tracker add the flow. 
-		 * The entry added during sa will be used by all the connections which will 
-		 * use this SA.  
+		 * b) create flow entry for encrypted traffic.
+		 * For ipsec enabled traffic there will be total of 4 flows (considering  both
+		 * directions). Two flows will get added during  SA creation time.
+		 * Other two will get added when the connection tracker add the flow.
+		 * The entry added during sa will be used by all the connections which will
+		 * use this SA.
 		 *       - for inbound SA flow entry  will be added to WAN interface's ESP
 		 *	  classification table.
 		 *	- for outbound SA,flow entry will be added to offline port's ESP
-		 *         classification table. 
+		 *         classification table.
 		 */
 		if ((sa->direction == CDX_DPA_IPSEC_OUTBOUND) && (!sa->pRtEntry)) {
 #ifdef CONTROL_IPSEC_DEBUG
@@ -847,7 +881,7 @@ int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length)
 
 		}
 		return (ipsec_push_sa_to_fast_path(sa));
-	} 
+	}
 	else if (cmd.state != XFRM_STATE_VALID) {
 #ifdef CONTROL_IPSEC_DEBUG
 		printk(KERN_INFO "not valid:\n");

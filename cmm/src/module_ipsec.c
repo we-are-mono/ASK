@@ -103,7 +103,25 @@ static struct SATable *__cmmSAAdd(PCommandIPSecCreateSA pSA_info)
 	newEntry->SAInfo.sagd = pSA_info->sagd;
 	hash = getSAHash(newEntry->SAInfo.sagd);
 	memcpy(&newEntry->SAInfo.id, &pSA_info->said, sizeof(newEntry->SAInfo.id));
-	
+
+	/* Populate Sa_flow with the SA's outer endpoints so transport-mode
+	 * SAs (which never go through __cmmSATunnelRegister) have valid
+	 * sAddr/dAddr pointers. Without this, the conntrack-event path
+	 * (____cmmCtRegister → __cmmCtTunnelRouteRegister) reaches the
+	 * CMM_ENCAP_SECURE branch with a zeroed Sa_flow and crashes inside
+	 * HASH_RT (NULL dAddr deref). For tunnel-mode SAs, __cmmSATunnelRegister
+	 * later overwrites these with tunnel addresses — same call site,
+	 * just runs later in the SET_TUNNEL handler.
+	 */
+	newEntry->Sa_flow.family = (newEntry->SAInfo.id.proto_family == PROTO_FAMILY_IPV4)
+	                          ? AF_INET : AF_INET6;
+	newEntry->Sa_flow.sAddr = newEntry->SAInfo.id.src_ip;
+	newEntry->Sa_flow.dAddr = newEntry->SAInfo.id.dst_ip;
+	newEntry->Sa_flow.fwmark = 0;
+	newEntry->Sa_flow.iifindex = 0;
+	newEntry->Sa_flow.proto = 0;
+	newEntry->Sa_flow.flow_flags = FLOWFLAG_SA_ROUTE;
+
 #ifdef IPSEC_FLOW_CACHE
 	/* Add it to the hash table */
 	for(i =0; i < MAX_SA_PER_FLOW; i++)

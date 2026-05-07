@@ -44,6 +44,8 @@
  *                                       per-call completion atomic_t.
  */
 #ifdef DPA_IPSEC_OFFLOAD
+/* A24 GCM investigation — runtime evidence printks. Drop after diagnosis. */
+#define CDX_DEBUG_GCM 1
 #include <linux/delay.h>
 #include <linux/udp.h>
 #include "error.h"
@@ -239,8 +241,29 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 
 void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 {
-	if(pdpa_sec_context->dpa_ipsecsa_handle)
-		cdx_dpa_ipsecsa_release(pdpa_sec_context->dpa_ipsecsa_handle);
+	/*
+	 * A24b: if cdx_dpa_ipsecsa_release fails (qman_oos_fq did not move
+	 * the FQ to OOS), QMan still owns the sainfo memory and may invoke
+	 * dqrr/ern callbacks on it. Freeing the per-SA crypto material below
+	 * — cipher_key, auth_key, split_key, extra_cmds, rjob_desc — would
+	 * UAF those buffers from the SEC pipeline (they are DMA-mapped while
+	 * any in-flight op is still resident). Leak the sec_context entirely
+	 * and let the operator restart to recover the resources. The leak is
+	 * surfaced via the pr_warn here and dpa_ipsec_ern_count.
+	 *
+	 * Pre-init error paths (handle == NULL) skip the release call and
+	 * proceed to free the crypto material — the buffers were never
+	 * DMA-mapped to SEC, so it's safe.
+	 */
+	if (pdpa_sec_context->dpa_ipsecsa_handle) {
+		if (cdx_dpa_ipsecsa_release(pdpa_sec_context->dpa_ipsecsa_handle)
+				!= SUCCESS) {
+			pr_warn_ratelimited(
+				"cdx: SA release failed for handle %p — leaking sec_context (A24b)\n",
+				pdpa_sec_context->dpa_ipsecsa_handle);
+			return;
+		}
+	}
 	if(pdpa_sec_context->cipher_data.cipher_key)
 		kfree_sensitive(pdpa_sec_context->cipher_data.cipher_key);
 	if(pdpa_sec_context->auth_data.auth_key)
@@ -351,6 +374,7 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 	PSAEntry         pSA;
 	PDpaSecSAContext sa_context;
 	int32_t ii, ret;
+	bool fq_stuck = false;
 
 	pSA  = container_of(entry, SAEntry, deletion_timer);
 	cdx_timer_del(entry);
@@ -363,8 +387,23 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 			/* if fq is not in retired state, restart timer */
 			if (ret)
 			{
-				DPA_ERROR("%s::Failed to change state \n",
-				__func__);
+				/*
+				 * A24b: cap the poll loop. A permanently-stuck FQ
+				 * (SEC pipeline wedge, hardware fault) without this
+				 * cap pins the SAEntry forever and prevents fresh
+				 * SA installs from reusing the slot. On cap-hit we
+				 * log loudly and skip the final free — sainfo +
+				 * crypto material leak, but the rest of cdx stays
+				 * recoverable in-band.
+				 */
+				pSA->deletion_iter++;
+				if (pSA->deletion_iter >= SA_RELEASE_MAX_ITER) {
+					pr_warn_ratelimited(
+						"cdx: SA release timeout on handle=0x%x fq[%d] after %u polls — leaking SA resources (A24b)\n",
+						pSA->handle, (int)ii, pSA->deletion_iter);
+					fq_stuck = true;
+					break;
+				}
 				cdx_timer_init((TIMER_ENTRY *)&pSA->deletion_timer,
 					cdx_ipsec_release_sa_ctx_cbk);
 				cdx_timer_add((TIMER_ENTRY *)&pSA->deletion_timer,
@@ -373,6 +412,16 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 			}
 			pSA->flags &= ~((SA_FQ_WAIT_B4_FREE << ii));
 		}
+	}
+	if (fq_stuck) {
+		/*
+		 * Don't touch sainfo / sec_context / SAEntry — qman may still
+		 * deliver dqrr/ern callbacks through the unretired FQ. Drop the
+		 * SAEntry from cache lists so traffic can't hit it again, but
+		 * leave the per-SA memory alone until the OS reboots.
+		 */
+		sa_remove_from_list_fqid(pSA);
+		return 0;
 	}
 	/* free hash table entry if rqd */
 	if (pSA->flags & SA_FREE_HASH_ENTRY)
@@ -494,26 +543,18 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 	memset(pdpa_sec_context->rjob_desc_unaligned, 0,(MAX_CAAM_DESCSIZE * sizeof(U32)+64));
 	pdpa_sec_context->rjob_desc = 
 		PTR_ALIGN(pdpa_sec_context->rjob_desc_unaligned, 64);
-	pdpa_sec_context->dpa_ipsecsa_handle  = cdx_dpa_ipsecsa_alloc(NULL, handle); 
+	pdpa_sec_context->dpa_ipsecsa_handle  = cdx_dpa_ipsecsa_alloc(NULL, handle);
 	if(pdpa_sec_context->dpa_ipsecsa_handle){
-		pdpa_sec_context->sec_desc = 
+		pdpa_sec_context->sec_desc =
 			get_shared_desc(pdpa_sec_context->dpa_ipsecsa_handle);
-		pdpa_sec_context->to_sec_fqid = 
-			get_fqid_to_sec(pdpa_sec_context->dpa_ipsecsa_handle);	
-		pdpa_sec_context->from_sec_fqid = 
+		pdpa_sec_context->to_sec_fqid =
+			get_fqid_to_sec(pdpa_sec_context->dpa_ipsecsa_handle);
+		pdpa_sec_context->from_sec_fqid =
 			get_fqid_from_sec(pdpa_sec_context->dpa_ipsecsa_handle);
 #ifdef UNIQUE_IPSEC_CP_FQID
 		pdpa_sec_context->to_cp_fqid =
 			ipsec_get_to_cp_fqid(pdpa_sec_context->dpa_ipsecsa_handle);
-#ifdef CDX_DPA_DEBUG	
-		printk("%s::fqid_to_sec %x(%d), fqid_from_sec %x(%d), to_cp_fqid %x(%d)\n",
-				__func__, pdpa_sec_context->to_sec_fqid,
-				pdpa_sec_context->to_sec_fqid,
-				pdpa_sec_context->from_sec_fqid,
-				pdpa_sec_context->from_sec_fqid,
-				pdpa_sec_context->to_cp_fqid,
-				pdpa_sec_context->to_cp_fqid);
-#endif
+#else
 #endif
 	}
 	else {
@@ -680,8 +721,9 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 	//uint32_t  copy_ptr_index = 0;
 	int opthdrsz;
 	size_t pdb_len = 0;
-	uint32_t sa_op; 
-	PDpaSecSAContext pSec_sa_context; 
+	uint32_t sa_op;
+	uint32_t share_mode;
+	PDpaSecSAContext pSec_sa_context;
 
 	pSec_sa_context =sa->pSec_sa_context; 
 
@@ -689,20 +731,40 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 	/* Reserve 2 words for statistics */
 	pdb_len = CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
 
+	/*
+	 * A24: GCM/GMAC use HDR_SHARE_NEVER (private per-DECO copy of the
+	 * shared descriptor) to eliminate the cross-DECO race in SEC's
+	 * GHASH path that produces ~86% AEAD ICV-fail at line rate (visible
+	 * as duplicate ESP seq numbers + AAD-vs-wire-seq drift). CBC, CCM
+	 * and CTR are immune (HMAC robust to IV semantics; CBC-MAC/CTR auth
+	 * inherently serial) and keep HDR_SHARE_SERIAL for throughput.
+	 * Cost: GCM throughput drops slightly because DECOs can't pipeline
+	 * the descriptor fetch — that's the price for race-free GHASH state.
+	 * Side effect (A24a): each DECO maintains its own seq counter →
+	 * wire-seq duplicates in the ~21 % range over a 500-frame capture.
+	 * Anti-replay-enabled peers (default strongSwan replay-window=32)
+	 * will reject duplicates.
+	 */
+	if (pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM8 ||
+	    pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM12 ||
+	    pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16 ||
+	    pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC)
+		share_mode = HDR_SHARE_NEVER;
+	else
+		share_mode = HDR_SHARE_SERIAL;
+
 	if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND) {
 		/* Compute optional header size, rounded up to descriptor
 		 * word size */
-		opthdrsz = 
+		opthdrsz =
 			(caam32_to_cpu(pSec_sa_context->sec_desc->pdb_en.ip_hdr_len) +
 			 3) & ~3;
 		pdb_len += sizeof(struct ipsec_encap_pdb) + opthdrsz;
-		init_sh_desc_pdb(desc, HDR_SAVECTX | HDR_SHARE_SERIAL, pdb_len);
-		//init_sh_desc_pdb(desc, HDR_SAVECTX | HDR_SHARE_WAIT, pdb_len);
-		sa_op = OP_TYPE_ENCAP_PROTOCOL;  
+		init_sh_desc_pdb(desc, HDR_SAVECTX | share_mode, pdb_len);
+		sa_op = OP_TYPE_ENCAP_PROTOCOL;
 	} else {
 		pdb_len += sizeof(struct ipsec_decap_pdb);
-		init_sh_desc_pdb(desc, HDR_SAVECTX | HDR_SHARE_SERIAL, pdb_len);
-		//init_sh_desc_pdb(desc, HDR_SAVECTX | HDR_SHARE_WAIT, pdb_len);
+		init_sh_desc_pdb(desc, HDR_SAVECTX | share_mode, pdb_len);
 		sa_op = OP_TYPE_DECAP_PROTOCOL;
 	}
 
@@ -776,16 +838,32 @@ skip_byte_copy:
 
 	if(sa->mode == SA_MODE_TUNNEL)
 	{
-		/* Protocol specific operation */
-		append_operation(desc, OP_PCLID_IPSEC_TUNNEL |sa_op |
+		uint32_t op_word = OP_PCLID_IPSEC_TUNNEL | sa_op |
 				pSec_sa_context->cipher_data.cipher_type |
-				pSec_sa_context->auth_data.auth_type);
+				pSec_sa_context->auth_data.auth_type;
+#ifdef CDX_DEBUG_GCM
+		printk(KERN_INFO "CDX_DEBUG_GCM op TUNNEL sagd=%u dir=%u op=0x%08x "
+				"(sa_op=0x%x cipher=0x%x auth=0x%x ckl=%u akl=%u skl=%u)\n",
+				sa->handle, sa->direction, op_word, sa_op,
+				pSec_sa_context->cipher_data.cipher_type,
+				pSec_sa_context->auth_data.auth_type,
+				pSec_sa_context->cipher_data.cipher_key_len,
+				pSec_sa_context->auth_data.auth_key_len,
+				pSec_sa_context->auth_data.split_key_len);
+#endif
+		/* Protocol specific operation */
+		append_operation(desc, op_word);
 	}
 	else {
-		/* Protocol specific operation */
-		append_operation(desc, OP_PCLID_IPSEC |sa_op |
+		uint32_t op_word = OP_PCLID_IPSEC | sa_op |
 				pSec_sa_context->cipher_data.cipher_type |
-				pSec_sa_context->auth_data.auth_type);
+				pSec_sa_context->auth_data.auth_type;
+#ifdef CDX_DEBUG_GCM
+		printk(KERN_INFO "CDX_DEBUG_GCM op TRANSPORT sagd=%u dir=%u op=0x%08x\n",
+				sa->handle, sa->direction, op_word);
+#endif
+		/* Protocol specific operation */
+		append_operation(desc, op_word);
 	}
 
 	if (sa->direction  == CDX_DPA_IPSEC_INBOUND)
@@ -1740,6 +1818,25 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
 	{
 		memcpy(sec_desc->pdb_dec.gcm.salt, salt, AES_GCM_SALT_LEN);
+#ifdef CDX_DEBUG_GCM
+		printk(KERN_INFO "CDX_DEBUG_GCM pdb_dec sagd=%u opts=0x%08x "
+				"salt=%02x%02x%02x%02x seq_hi=0x%08x seq_lo=0x%08x\n",
+				sa->handle,
+				be32_to_cpu(sec_desc->pdb_dec.options),
+				sec_desc->pdb_dec.gcm.salt[0],
+				sec_desc->pdb_dec.gcm.salt[1],
+				sec_desc->pdb_dec.gcm.salt[2],
+				sec_desc->pdb_dec.gcm.salt[3],
+				be32_to_cpu(sec_desc->pdb_dec.seq_num_ext_hi),
+				be32_to_cpu(sec_desc->pdb_dec.seq_num));
+#endif
+	}
+
+	/* CTR — RFC 3686: nonce trails the AES key, block-counter starts at 1 */
+	else if (sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_CTR)
+	{
+		memcpy(sec_desc->pdb_dec.ctr.ctr_nonce, salt, AES_CTR_SALT_LEN);
+		sec_desc->pdb_dec.ctr.ctr_initial = cpu_to_caam32(1);
 	}
 
 	/* CCM */ // RFC 4309
@@ -1899,6 +1996,27 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
 	{
 		memcpy(sec_desc->pdb_en.gcm.salt, salt,  AES_GCM_SALT_LEN);
+#ifdef CDX_DEBUG_GCM
+		printk(KERN_INFO "CDX_DEBUG_GCM pdb_en  sagd=%u opts=0x%08x spi(raw)=0x%08x "
+				"salt=%02x%02x%02x%02x seq_hi=0x%08x seq_lo=0x%08x ivsrc=%d\n",
+				sa->handle,
+				be32_to_cpu(sec_desc->pdb_en.options),
+				sec_desc->pdb_en.spi,
+				sec_desc->pdb_en.gcm.salt[0],
+				sec_desc->pdb_en.gcm.salt[1],
+				sec_desc->pdb_en.gcm.salt[2],
+				sec_desc->pdb_en.gcm.salt[3],
+				be32_to_cpu(sec_desc->pdb_en.seq_num_ext_hi),
+				be32_to_cpu(sec_desc->pdb_en.seq_num),
+				!!(be32_to_cpu(sec_desc->pdb_en.options) & PDBOPTS_ESP_IVSRC));
+#endif
+	}
+
+	/* CTR — RFC 3686. Per-packet 8-byte iv is filled by SEC under PDBOPTS_ESP_IVSRC. */
+	else if (sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_CTR)
+	{
+		memcpy(sec_desc->pdb_en.ctr.ctr_nonce, salt, AES_CTR_SALT_LEN);
+		sec_desc->pdb_en.ctr.ctr_initial = cpu_to_caam32(1);
 	}
 
 	/* AES CCM */
@@ -2380,7 +2498,8 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 			sa->ct->natt_out_refcnt++;
 	}
 	else{
-		cdx_ipsec_add_classification_table_entry(sa);
+		if (cdx_ipsec_add_classification_table_entry(sa))
+			goto err_ret;
 		if (sa->direction ==  CDX_DPA_IPSEC_INBOUND)
 			sa->ct->natt_in_refcnt = 1;
 		else
@@ -2405,6 +2524,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	uint32_t  itf_id = 0;
 	uint32_t bytes_to_copy = ETH_HDR_LEN;
 	bool sh_desc_just_built = false;
+
 
 #ifdef CDX_DPA_DEBUG
 	printk("%s:: direction %d\n", __func__, sa->direction);
@@ -2450,20 +2570,20 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	if(sa->direction == CDX_DPA_IPSEC_INBOUND)
 	{
 		//inbound
-		/* Add the Flow to the ESP table of wan port*/ 
+		/* Add the Flow to the ESP table of wan port*/
 		sa_dir_in = 1;
 #ifdef CDX_DPA_DEBUG
 		printk("%s::inbound sa\n", __func__);
 #endif
-		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.daddr.a6[0], NULL, 
+		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.daddr.a6[0], NULL,
 					&itf_id , &info->port_id, &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
 		{
-			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
+			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n",
 					__func__);
 			goto err_ret;
 		}
 		//get table descriptor based on type and port
-		sa->ct->td = dpa_get_tdinfo(info->fm_idx, info->port_id, 
+		sa->ct->td = dpa_get_tdinfo(info->fm_idx, info->port_id,
 				tbl_type);
 		if (sa->ct->td == NULL) {
 			DPA_ERROR("%s::unable to get td for portid %d, type %d\n",
@@ -2473,16 +2593,16 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		/*
 		 * storing the interface id for the inbound sa.
 		 * This is used for finding interface stats pointer for pppoe interface
-		 * May also can be used for orginal interface stats also.  
+		 * May also can be used for orginal interface stats also.
 		 */
-		info->sa_itf_id = itf_id; 
+		info->sa_itf_id = itf_id;
 		dpa_get_l2l3_info_by_itf_id( itf_id, &info->l2_info, &info->l3_info, &sa_dir_in );
 #ifdef CDX_DPA_DEBUG
-		/*       printk("%s:: Got the table id for portid %d and key type %d as %p \n", 
+		/*       printk("%s:: Got the table id for portid %d and key type %d as %p \n",
 					__func__, info->port_id, key_info->type, sa->ct->td); */
 #endif
 	} else {
-		/* Add the Flow to the ESP table of sec offline port*/ 
+		/* Add the Flow to the ESP table of sec offline port*/
 #ifdef CDX_DPA_DEBUG
 		printk("%s::outbound sa\n", __func__);
 #endif
@@ -2490,10 +2610,10 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		dpa_ipsec_ofport_td(ipsec_instance, tbl_type, &sa->ct->td,
 				&info->port_id);
 
-		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.saddr[0], NULL, 
+		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.saddr[0], NULL,
 					NULL , NULL,  &sa->netdev, (uint32_t)sa->handle) != SUCCESS)
 		{
-			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n", 
+			DPA_ERROR("%s:: dpa_get_iface_info_by_ipaddress returned error\n",
 					__func__);
 			goto err_ret;
 		}
@@ -2517,7 +2637,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 					&info->l2_info, &info->l3_info,sa_dir_in );
 		} else {
 */
-		if (dpa_get_out_tx_info_by_itf_id(sa->pRtEntry, 
+		if (dpa_get_out_tx_info_by_itf_id(sa->pRtEntry,
 					&info->l2_info, &info->l3_info)) {
 			DPA_ERROR("%s:: dpa_get_out_tx_info_by_itf_id returned error\n",
 					__func__);
@@ -2556,7 +2676,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		goto err_ret;
 	}
 #ifdef CDX_DPA_DEBUG
-	/*	printk("%s: Sa direction = %d Table id = %d port id = %d\n ", __func__,sa_dir_in, info->td, 
+	/*	printk("%s: Sa direction = %d Table id = %d port id = %d\n ", __func__,sa_dir_in, info->td,
 			info->port_id); */
 #endif
 	if (info->td == NULL) {
@@ -2567,7 +2687,7 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	/* Fill key information from entry */
 	/* For NATT use the 5 tuple key info */
 	if (IS_NATT_SA(sa))
-		key_size = fill_natt_key_info(sa, tbl_entry, info->port_id); 
+		key_size = fill_natt_key_info(sa, tbl_entry, info->port_id);
 	else
 		key_size = fill_ipsec_key_info(sa, tbl_entry, info->port_id);
 	if (!key_size) {
@@ -2620,13 +2740,13 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 	}
 	if( IS_NATT_SA(sa) && sa_dir_in)
 		tbl_entry->ipsec_preempt_params = info->preempt_params;
-	else	
+	else
 		tbl_entry->enqueue_params = info->enqueue_params;
 
 	sa->ct->handle = tbl_entry;
 #ifdef CDX_DPA_DEBUG
 	display_ehash_tbl_entry(&tbl_entry->hashentry, key_size);
-#endif 
+#endif
 	/*insert entry into hash table */
 	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
 	if (retval == -1) {

@@ -1129,6 +1129,7 @@ static int __cmmCtTunnelRouteRegister(struct ct_route *rt, struct ct_route *tunn
 	int encap_type = AF_UNSPEC; /* AF_UNSPEC 0, AF_INET  2 , AF_INET6 10, Secure 0xFF*/
 
 	struct flow flow;
+	memset(&flow, 0, sizeof(flow));
 
 	if(Saflow)/* This is an IPSec Tunnel */
 		encap_type = CMM_ENCAP_SECURE;

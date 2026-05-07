@@ -10,9 +10,22 @@
     <port type="10G" number="0" policy="cdx_ethport_6_policy" portid="6"/>
     <port type="10G" number="1" policy="cdx_ethport_7_policy" portid="7"/>
     <!-- OFFLINE ports for CDX -->
-    <!-- number="1" -> dpa-fman0-oh@2 (IPsec), number="2" -> dpa-fman0-oh@3 (WiFi) -->
-    <port type="OFFLINE" number="1" policy="cdx_port_of2_policy" portid="8"/>
-    <port type="OFFLINE" number="2" policy="cdx_port_of3_policy" portid="9"/>
+    <!-- number="1" -> dpa-fman0-oh@2 (IPsec), number="2" -> dpa-fman0-oh@3 (WiFi).
+         number is consumed by fmc/fmlib as the /dev/fm0-port-oh<number> handle.
+
+         portid=9/10 matches every NXP reference cdx_cfg variant. This is
+         load-bearing: cdx_sp.xml's espschema/tcpschema/udpschema soft-parser
+         hooks gate the policing/early-exit path on `$logicalportid lt 9` —
+         eth ports (1..8) get the policing path; OH ports (>=9) get the
+         fast path that preserves IPsec ESP recognition in the parse result.
+         A previous attempt to use portid=2,3 (to keep FQID composition inside
+         the gateway-dk DT FQID range) tripped the espschema policing gate for
+         SEC's encrypted output frames, leaving cdx_esp4_dist's ipsec_esp
+         protocolref unmet so OH@2's PCD never matched the OUTBOUND classifier
+         entry — encrypted frames fell through to the per-SA TO_CP exception
+         queue instead of routing to eth3 TX. -->
+    <port type="OFFLINE" number="1" policy="cdx_port_of2_policy" portid="9"/>
+    <port type="OFFLINE" number="2" policy="cdx_port_of3_policy" portid="10"/>
   </engine>
 </config>
 </cfgdata>

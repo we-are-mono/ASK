@@ -26,8 +26,9 @@ RDEPENDS:${PN} += "libasan libubsan"
 # Extra defines that Armbian passes to CMM — keep identical so behavior
 # matches the production build. Passed via env so cmm/Makefile's
 # CFLAGS += ... appends (rather than its := overriding us).
-export CFLAGS = "-DFLOW_STATS -DSEC_PROFILE_SUPPORT -DUSE_QOSCONNMARK \
-                 -DENABLE_INGRESS_QOS -DIPSEC_NO_FLOW_CACHE -DVLAN_FILTER"
+export CFLAGS = "-Wno-error -DLS1043 -DFLOW_STATS -DWIFI_ENABLE -DAUTO_BRIDGE \
+                 -DSEC_PROFILE_SUPPORT -DUSE_QOSCONNMARK -DENABLE_INGRESS_QOS \
+                 -DIPSEC_NO_FLOW_CACHE -DVLAN_FILTER"
 
 EXTRA_OEMAKE = " \
     CC='${CC}' \

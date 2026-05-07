@@ -600,9 +600,9 @@ index c56bb4f451e6..7225be6880e1 100644
 +			memcpy(&sa_notify_msg, msg->payload, sizeof(struct nlkey_sa_notify));
 +			x = xfrm_state_lookup_byhandle(&init_net, sa_notify_msg.sagd);
 +			if (x) {
-+				spin_lock(&x->lock);
++				spin_lock_bh(&x->lock);
 +
-+				if (sa_notify_msg.action) { 
++				if (sa_notify_msg.action) {
 +					// hard expired
 +					x->km.state = XFRM_STATE_EXPIRED;
 +					hrtimer_start(&x->mtimer, ktime_set(0,0), HRTIMER_MODE_REL_SOFT);
@@ -612,7 +612,7 @@ index c56bb4f451e6..7225be6880e1 100644
 +					 km_state_expired(x, 0, 0);
 +				}
 +
-+				spin_unlock(&x->lock);
++				spin_unlock_bh(&x->lock);
 +				xfrm_state_put(x);
 +			}
 +			break;
@@ -622,7 +622,7 @@ index c56bb4f451e6..7225be6880e1 100644
 +
 +			x = xfrm_state_lookup_byhandle(&init_net,sa_info_msg.sagd);
 +			if (x) {
-+				spin_lock(&x->lock);
++				spin_lock_bh(&x->lock);
 +
 +				if (x->curlft.bytes != sa_info_msg.bytes)
 +					x->curr_time = ktime_get_real_seconds();
@@ -630,7 +630,7 @@ index c56bb4f451e6..7225be6880e1 100644
 +				x->curlft.bytes = sa_info_msg.bytes;
 +				x->curlft.packets = sa_info_msg.packets;
 +
-+				spin_unlock(&x->lock);
++				spin_unlock_bh(&x->lock);
 +				xfrm_state_put(x);
 +			}
 +			break;
@@ -639,12 +639,12 @@ index c56bb4f451e6..7225be6880e1 100644
 +			memcpy(&sa_notify_msg, msg->payload, sizeof(struct nlkey_sa_notify));
 +			x = xfrm_state_lookup_byhandle(&init_net,sa_notify_msg.sagd);
 +			if (x) {
-+				spin_lock(&x->lock);
++				spin_lock_bh(&x->lock);
 +				if(sa_notify_msg.action)
 +					x->offloaded = 	1;
 +				else
 +					x->offloaded = 	0;
-+				spin_unlock(&x->lock);
++				spin_unlock_bh(&x->lock);
 +				xfrm_state_put(x);
 +			}
 +			break;

@@ -18,6 +18,23 @@ S = "${UNPACKDIR}"
 
 RDEPENDS:${PN} += "dnsmasq iptables iproute2 cmm"
 
+# These files are installed from ${ASK_SRCROOT} (outside SRC_URI's reach).
+# Without listing them as task input checksums, bitbake's sstate signature for
+# do_install doesn't change when their *content* does — meaning a fresh kas
+# build silently restores the previous (stale) version from sstate. Each
+# entry is "<path>:True" so bitbake hashes the file and the task re-runs on
+# any content change.
+do_install[file-checksums] += " \
+    ${ASK_SRCROOT}/config/gateway-dk/cdx_cfg.xml:True \
+    ${ASK_SRCROOT}/dpa_app/files/etc/cdx_pcd.xml:True \
+    ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml:True \
+    ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/hxs_pdl_v3.xml:True \
+    ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/cfgdata.xsd:True \
+    ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/netpcd.xsd:True \
+    ${ASK_SRCROOT}/config/ask-modules.conf:True \
+    ${ASK_SRCROOT}/config/fastforward:True \
+"
+
 fakeroot do_install() {
     # Board-specific FMAN port config (consumed by dpa_app / fmc).
     install -d ${D}${sysconfdir}

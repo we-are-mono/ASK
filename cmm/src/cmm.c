@@ -348,6 +348,9 @@ int main (int argc, char ** argv)
 	int ret = 0;
 	int ch;
 
+	/* unbuffered stderr so crash-probe fprintfs survive a segfault */
+	setvbuf(stderr, NULL, _IONBF, 0);
+
 	// Forward engine programmation is enabled by default
 	globalConf.enable = 1;
 	globalConf.debug_level = DEBUG_ERROR;
