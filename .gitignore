@@ -54,3 +54,10 @@ sources/
 *.swp
 *.swo
 *~
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local setup notes — environment-specific, not part of the codebase
+IPSEC.md
