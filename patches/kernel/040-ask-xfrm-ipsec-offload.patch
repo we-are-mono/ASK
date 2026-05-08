@@ -530,7 +530,7 @@ index c56bb4f451e6..7225be6880e1 100644
  	if (atomic_read(&net_pfkey->socks_nr) == 0)
  		return 0;
  
-@@ -3863,6 +4057,687 @@ static struct xfrm_mgr pfkeyv2_mgr =
+@@ -3863,6 +4057,704 @@ static struct xfrm_mgr pfkeyv2_mgr =
  	.is_alive	= pfkey_is_alive,
  };
  
@@ -788,7 +788,24 @@ index c56bb4f451e6..7225be6880e1 100644
 +					printk(KERN_ERR "protocol %d not supported in fast path.\n", x->id.proto);
 +					*msg_id = NLKEY_NULL_MSG;
 +					goto exit;
-+				}	
++				}
++
++				/* A24a: cdx GCM offload races on per-DECO PDB.seq under
++				 * sustained load — wire-seq dupes violate RFC 4303 anti-replay
++				 * on standards-compliant peers. SEC IVSRC is independent of
++				 * PDB.seq (IVs stay unique), so not a GCM cryptographic break,
++				 * but unusable with replay-window > 0. Refuse here so the SA
++				 * never reaches cmm/cdx; kernel xfrm via caamalg_qi.c
++				 * (non-protocol AEAD) handles GCM with unique seqs by
++				 * construction. See ISSUES.md A24a. */
++				if (x->aead && x->aead->alg_name &&
++				    (strstr(x->aead->alg_name, "rfc4106(gcm") ||
++				     strstr(x->aead->alg_name, "rfc4543(gcm"))) {
++					pr_info("ASK: %s offload disabled (A24a) — software xfrm\n",
++					        x->aead->alg_name);
++					*msg_id = NLKEY_NULL_MSG;
++					goto exit;
++				}
 +
 +				memset(&sa_create_msg, 0, sizeof(struct nlkey_sa_create));
 +
@@ -1218,7 +1235,7 @@ index c56bb4f451e6..7225be6880e1 100644
  static int __net_init pfkey_net_init(struct net *net)
  {
  	struct netns_pfkey *net_pfkey = net_generic(net, pfkey_net_id);
-@@ -3897,6 +4772,11 @@ static void __exit ipsec_pfkey_exit(void)
+@@ -3897,6 +4789,11 @@ static void __exit ipsec_pfkey_exit(void)
  	sock_unregister(PF_KEY);
  	unregister_pernet_subsys(&pfkey_net_ops);
  	proto_unregister(&key_proto);
@@ -1230,7 +1247,7 @@ index c56bb4f451e6..7225be6880e1 100644
  }
  
  static int __init ipsec_pfkey_init(void)
-@@ -3913,6 +4793,12 @@ static int __init ipsec_pfkey_init(void)
+@@ -3913,6 +4810,12 @@ static int __init ipsec_pfkey_init(void)
  	if (err != 0)
  		goto out_unregister_pernet;
  	xfrm_register_km(&pfkeyv2_mgr);

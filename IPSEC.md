@@ -24,30 +24,31 @@ strongSwan/IKE-driven setup.
 The protected pair is `192.168.1.0/24 ↔ 10.99.0.2/32`. Outer endpoints
 `10.0.0.62 ↔ 10.0.0.141` carry the ESP.
 
-## Cipher status summary (2026-05-05)
+## Cipher status summary
 
-Measured under loki → 10.99.0.2 via the manual setups below. DUT is a freshly-booted
-LS1046A; cdx hardware encap path is engaged in every case (verified via wire capture +
-DUT SA byte counters staying at 0 and `xfrm_output` not firing — both directions are
-SEC-offloaded, not Linux software xfrm).
+Measured under loki → 10.99.0.2 via the manual setups below. CBC + HMAC and CCM run
+on the cdx hardware encap path (DUT SA byte counters stay at 0, `xfrm_output` does
+not fire). GCM is **refused** by cdx at SA install (ISSUES.md A24) so the SA falls
+through to kernel xfrm via `caamalg_qi.c` — DUT byte counters tick, `xfrm_output`
+does fire, replay-window=32 works correctly, throughput ~1–2 Gbit/s.
 
-| Cipher | TCP iperf3 (15 s) | UDP @ 1 Gbit/s (5 s) | seq dupes / 500 frames | Status |
-| ------ | ----------------- | -------------------- | ---------------------- | ------ |
-| **AES-128-CBC + HMAC-SHA-256-128** | 2.60 Gbit/s, 365 retx | 1.00 Gbit/s, 0 % loss | 0 | works |
-| **AES-128-CCM-ICV16** | 1.45 Gbit/s, 12 retx | 1.00 Gbit/s, 0.005 % loss | 0 | works |
-| **AES-128-GCM-ICV16** | 2-3 Mbit/s, 600+ retx | 140 Mbit/s, **86 % loss** | sporadic (0-4) | **broken** |
-| **AES-128-GCM-ICV8** | n/a | 144 Mbit/s, **86 % loss** | sporadic | **broken** |
+| Cipher | TCP iperf3 (15 s) | UDP @ 1 Gbit/s (5 s) | replay-window=32 | Path |
+| ------ | ----------------- | -------------------- | ---------------- | ---- |
+| **AES-128-CBC + HMAC-SHA-256-128** | 2.60 Gbit/s, 365 retx | 1.00 Gbit/s, 0 % loss | ✓ | cdx hardware |
+| **AES-128-CCM-ICV16** | 1.45 Gbit/s, 12 retx | 1.00 Gbit/s, 0.005 % loss | ✓ | cdx hardware |
+| **AES-128-GCM-ICV16** | 77 Mbit/s, 970 retx | 89 % loss above ~80 Mbit/s | ✓ | kernel xfrm (caamalg.c JR) |
 | **AES-128-GMAC** (rfc4543) | n/a | failed at 4 PPS | n/a | separate bug |
 
-The CBC and CCM rows are usable production proposals; the GCM rows reproduce **ISSUES.md
-A24** symptom. Reboots don't change the picture — same 86 % loss on the first packet of
-the first iperf3 after a fresh boot.
-
-The bug is **specific to the GHASH-based authentication path in SEC** under concurrent
-ops on the same SA. CCM uses inherently-serial CBC-MAC and is immune; CBC + HMAC is
-serial-by-construction over the whole packet and is immune. GCM (and GMAC, which is
-GCM with null encryption) parallelize the GHASH polynomial — which is the contended
-state. See ISSUES.md A24 for the full diagnosis.
+GCM hardware offload was deprecated after A24a — the cdx fast path produced ~21–25 %
+wire-seq duplicates above ~100 Mbit/s per SA (per-DECO PDB.seq counters diverge)
+which violates RFC 4303 anti-replay on standards-compliant peers. IV-uniqueness was
+empirically verified preserved (no GCM cryptographic break), so the issue is purely
+operational. See ISSUES.md A24 for the full disposition. The kernel-xfrm GCM
+fallback throughput (~77 Mbit/s TCP on this kernel/config) is much lower than the
+2.60 Gbit/s offloaded CBC+HMAC path because `/proc/crypto` selects the higher-priority
+`rfc4106-gcm-aes-caam` (JR) over `rfc4106-gcm-aes-caam-qi` and JR has higher
+per-request overhead. CBC + HMAC is the high-throughput recommendation; GCM is the
+strongSwan-defaults-compatible fallback at substantially lower throughput.
 
 ---
 
@@ -73,10 +74,10 @@ ICV_TRUNC=128
 sudo ip xfrm state flush; sudo ip xfrm policy flush
 
 sudo ip xfrm state add src 10.0.0.62  dst 10.0.0.141 \
-    proto esp spi $SPI_DUT_OUT mode tunnel reqid 1 \
+    proto esp spi $SPI_DUT_OUT mode tunnel reqid 1 replay-window 32 \
     enc 'cbc(aes)' $ENC1 auth-trunc 'hmac(sha256)' $AUTH1 $ICV_TRUNC
 sudo ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
-    proto esp spi $SPI_DUT_IN  mode tunnel reqid 1 \
+    proto esp spi $SPI_DUT_IN  mode tunnel reqid 1 replay-window 32 \
     enc 'cbc(aes)' $ENC2 auth-trunc 'hmac(sha256)' $AUTH2 $ICV_TRUNC
 
 sudo ip xfrm policy add src 10.99.0.2/32   dst 192.168.1.0/24 dir out \
@@ -93,11 +94,11 @@ sudo ip xfrm policy add src 192.168.1.0/24 dst 10.99.0.2/32   dir fwd \
 ip xfrm state flush; ip xfrm policy flush
 
 ip xfrm state add src 10.0.0.62  dst 10.0.0.141 \
-    proto esp spi 0xcb010001 mode tunnel reqid 1 \
+    proto esp spi 0xcb010001 mode tunnel reqid 1 replay-window 32 \
     enc 'cbc(aes)' 0x00112233445566778899aabbccddeeff \
     auth-trunc 'hmac(sha256)' 0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f 128
 ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
-    proto esp spi 0xcb010002 mode tunnel reqid 1 \
+    proto esp spi 0xcb010002 mode tunnel reqid 1 replay-window 32 \
     enc 'cbc(aes)' 0xfedcba9876543210ffeeddccbbaa9988 \
     auth-trunc 'hmac(sha256)' 0x202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f 128
 
@@ -153,10 +154,10 @@ ICV_LEN=128
 sudo ip xfrm state flush; sudo ip xfrm policy flush
 
 sudo ip xfrm state add src 10.0.0.62  dst 10.0.0.141 \
-    proto esp spi $SPI_DUT_OUT mode tunnel reqid 1 \
+    proto esp spi $SPI_DUT_OUT mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4309(ccm(aes))' $KEY1 $ICV_LEN
 sudo ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
-    proto esp spi $SPI_DUT_IN  mode tunnel reqid 1 \
+    proto esp spi $SPI_DUT_IN  mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4309(ccm(aes))' $KEY2 $ICV_LEN
 
 # Policies identical to §1.
@@ -168,10 +169,10 @@ sudo ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
 ip xfrm state flush; ip xfrm policy flush
 
 ip xfrm state add src 10.0.0.62  dst 10.0.0.141 \
-    proto esp spi 0xcc010001 mode tunnel reqid 1 \
+    proto esp spi 0xcc010001 mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4309(ccm(aes))' 0x0123456789abcdef0123456789abcdef111213 128
 ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
-    proto esp spi 0xcc010002 mode tunnel reqid 1 \
+    proto esp spi 0xcc010002 mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4309(ccm(aes))' 0xfedcba9876543210fedcba9876543210a1b2c3 128
 
 # Policies + route + MASQUERADE bypass identical to §1.
@@ -187,10 +188,14 @@ ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
 
 ---
 
-## 3. AES-128-GCM-ICV16 (RFC 4106) — broken under load (ISSUES.md A24)
+## 3. AES-128-GCM-ICV16 (RFC 4106) — kernel xfrm fallback (ISSUES.md A24)
 
-**Do not use in production until A24 is fixed.** Documented here to make the failure
-reproducible.
+**cdx refuses GCM offload at SA install.** The kernel-side SA still installs (via
+`ip xfrm state add` below), but `M_ipsec_sa_set_cipher_key` returns -1 for GCM/GMAC
+cipher types and emits a `pr_warn`, so `x->offloaded` stays 0 and the SA falls
+through to Linux xfrm + `caamalg_qi.c`. Replay-window=32 works correctly here
+(unique seqs by construction); throughput is the kernel-xfrm envelope ~1–2 Gbit/s.
+Bring-up commands are kept verbatim for regression testing once A24 closes.
 
 ### Test parameters
 
@@ -208,10 +213,10 @@ ICV_LEN=128
 sudo ip xfrm state flush; sudo ip xfrm policy flush
 
 sudo ip xfrm state add src 10.0.0.62  dst 10.0.0.141 \
-    proto esp spi $SPI_DUT_OUT mode tunnel reqid 1 \
+    proto esp spi $SPI_DUT_OUT mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4106(gcm(aes))' $KEY1 $ICV_LEN
 sudo ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
-    proto esp spi $SPI_DUT_IN  mode tunnel reqid 1 \
+    proto esp spi $SPI_DUT_IN  mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4106(gcm(aes))' $KEY2 $ICV_LEN
 
 # Policies identical to §1.
@@ -223,29 +228,31 @@ sudo ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
 ip xfrm state flush; ip xfrm policy flush
 
 ip xfrm state add src 10.0.0.62  dst 10.0.0.141 \
-    proto esp spi 0xc0ffee01 mode tunnel reqid 1 \
+    proto esp spi 0xc0ffee01 mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4106(gcm(aes))' 0x0123456789abcdef0123456789abcdef0a1b2c3d 128
 ip xfrm state add src 10.0.0.141 dst 10.0.0.62  \
-    proto esp spi 0xc0ffee02 mode tunnel reqid 1 \
+    proto esp spi 0xc0ffee02 mode tunnel reqid 1 replay-window 32 \
     aead 'rfc4106(gcm(aes))' 0xfedcba9876543210fedcba9876543210e0f1a2b3 128
 
 # Policies + route + MASQUERADE bypass identical to §1.
 ```
 
-### Observed
+### Observed (post-refusal)
 
-- ICMP from loki at 1 PPS: 100 % delivered. Bug doesn't manifest at low rate.
-- TCP iperf3 (15 s): **2 – 3 Mbit/s, 600+ retransmits** — TCP cwnd never escapes
-  congestion-recovery because of high ICV-fail loss.
-- UDP iperf3 (5 s, 1 Gbit/s, 1400 B): **140 Mbit/s receiver, 86 % loss**, +384 000
-  `XfrmInStateProtoError` ticks on Vision in 5 s. ProtoError = AEAD ICV verification
-  failed — the wire packets arrive but Vision can't authenticate them.
-- 500-frame ESP capture occasionally shows 4 / 500 sequence-number duplicates (0.8 %).
-  Duplicates are the visible tip of a deeper concurrency race — most failed packets
-  have unique seqs but internally-inconsistent ICV vs wire SEQ/IV (race between AAD
-  construction and wire-header emission inside SEC).
-- **Reproduces identically on a freshly-booted DUT** — first iperf3 after first ping
-  produces the same 86 % loss. Not a wedge, not a state-buildup, not transient.
+- DUT `dmesg` on SA install: `cdx: AES-GCM/GMAC offload disabled (A24a). SA falls
+  through to kernel xfrm. For hardware offload use AES-128-CCM-16 or AES-128-CBC +
+  HMAC-SHA-256.`
+- DUT `xfrm_output` fires on every encap; `ip -s xfrm state` byte/packet counters
+  tick (in contrast to CBC/CCM where they stay at 0 because cdx is offloading).
+- TCP iperf3 (15 s) on a `replay-window=32` Vision peer: clean — 77 Mbit/s, 970 retx,
+  0 ICV failures, 0 wire-seq duplicates, 0 replay-window rejections.
+- UDP iperf3 (5 s @ 1 Gbit/s, 1400 B): 85 Mbit/s receiver, 89 % upstream loss from
+  software-xfrm CPU saturation, but 0 `XfrmInStateProtoError` and 0
+  `XfrmInStateSeqError` deltas — losses are pre-xfrm, not cryptographic.
+- A regression that re-enables cdx GCM offload would surface here as either
+  `XfrmInStateProtoError` ticks (cross-DECO GHASH race) or wire-seq duplicates
+  triggering `XfrmInStateSeqError` on Vision — tracked by
+  [tools/tests/test_ipsec_gcm_replay_window.py](tools/tests/test_ipsec_gcm_replay_window.py).
 
 ### Tear-down (any of the three configs)
 
