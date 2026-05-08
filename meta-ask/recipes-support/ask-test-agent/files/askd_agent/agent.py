@@ -126,11 +126,16 @@ async def cmm_query(request: web.Request) -> web.Response:
     try:
         # Use argv form (no shell=True) — no injection risk even before the
         # whitelist, and cmm -c takes the query as a single argument.
+        # Capture as bytes (text=False) and decode with errors='replace':
+        # cmm's query output occasionally embeds non-UTF-8 bytes (binary
+        # fields, raw memory in name buffers), which under text=True makes
+        # subprocess raise UnicodeDecodeError mid-_communicate and the
+        # handler returns 500 to the caller.
         r = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: subprocess.run(
                 ["cmm", "-c", f"query {table}"],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True, timeout=5, check=False,
             ),
         )
     except FileNotFoundError:
@@ -140,8 +145,8 @@ async def cmm_query(request: web.Request) -> web.Response:
     return web.json_response({
         "table":  table,
         "rc":     r.returncode,
-        "stdout": r.stdout,
-        "stderr": r.stderr,
+        "stdout": r.stdout.decode("utf-8", errors="replace"),
+        "stderr": r.stderr.decode("utf-8", errors="replace"),
     })
 
 
@@ -594,10 +599,14 @@ async def exec_cmd(request: web.Request) -> web.Response:
         )
     timeout_s = float(body.get("timeout_ms", 5000)) / 1000.0
     try:
+        # bytes + errors='replace' decode — same rationale as cmm_query:
+        # any allowlisted command can emit non-UTF-8 bytes (tcpdump -X
+        # output, iptables names with high-byte chars, etc.) and the
+        # default text=True path raises UnicodeDecodeError → 500.
         r = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: subprocess.run(
-                argv, capture_output=True, text=True,
+                argv, capture_output=True,
                 timeout=timeout_s, check=False,
             ),
         )
@@ -608,8 +617,8 @@ async def exec_cmd(request: web.Request) -> web.Response:
     return web.json_response({
         "argv":   argv,
         "rc":     r.returncode,
-        "stdout": r.stdout,
-        "stderr": r.stderr,
+        "stdout": r.stdout.decode("utf-8", errors="replace"),
+        "stderr": r.stderr.decode("utf-8", errors="replace"),
     })
 
 
