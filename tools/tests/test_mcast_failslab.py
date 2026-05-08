@@ -242,19 +242,26 @@ async def test_mcast_add_failslab_sweep(
     # Final REMOVE in case the last iteration left a group behind.
     await _remove_if_present(target_agent, aiohttp_session, [one_vlan_listener])
 
-    # Oracle #1: failslab must actually have driven cdx into err_ret
-    # for this sweep to mean anything. ERR_MC_CONFIG (707) is what
-    # MC4_Command_Handler stamps when cdx_create_mcast_group returns
-    # -1 (the listener loop hit create_exthash_entry4mcast_member
-    # returning NULL, which is the failslab-induced failure we want).
-    # If every iteration came back NO_ERR, either failslab is not
-    # arming (fork-isolated make-it-fail broke), the `times` values
-    # are being consumed entirely in the socket/netlink syscall path
-    # before reaching cdx, or the handler is silently swallowing
-    # errors — any of which invalidates the leak oracle below.
-    faulted = [n for n, rc, e in outcomes if rc == ERR_MC_CONFIG]
+    # Oracle #1: failslab must actually have surfaced a cdx-side error
+    # for this sweep to mean anything (otherwise the leak oracle below
+    # is testing nothing). Accept any non-NO_ERR cdx reply — failslab
+    # can land at multiple allocation sites within mcast ADD, each with
+    # a distinct error code:
+    #   - ERR_MC_CONFIG (707): listener-loop create_exthash_entry4mcast_member
+    #     returned NULL → cdx_create_mcast_group returns -1 → handler
+    #     stamps ERR_MC_CONFIG.
+    #   - ERR_NOT_ENOUGH_MEMORY (6): top-level kzalloc of pMcastGrpInfo
+    #     failed early in cdx_create_mcast_group.
+    #   - 65524 (= -ENOMEM cast to U16): a deeper allocation surfaced
+    #     -ENOMEM directly without translation.
+    # The earlier "must be exactly ERR_MC_CONFIG" oracle assumed every
+    # path routes through the listener-loop catch, but ADD's allocation
+    # pattern often trips the top-level kzalloc instead. Transport-only
+    # errors (rc is None, send_error set) don't count — those mean
+    # failslab caught the FCI ingress path before cdx saw the request.
+    faulted = [n for n, rc, e in outcomes if rc is not None and rc != NO_ERR]
     assert faulted, (
-        f"failslab sweep never drove cdx into ERR_MC_CONFIG across "
+        f"failslab sweep never surfaced a cdx-side error across "
         f"times=1..{NSWEEP}; outcomes={outcomes}. Either failslab "
         f"isn't firing in the cdx path, or cdx is swallowing errors."
     )
@@ -351,13 +358,14 @@ async def test_mcast_update_failslab_sweep(
         length=len(full_remove), payload=full_remove, timeout_ms=2000,
     )
 
-    faulted = [n for n, rc, e in outcomes if rc == ERR_MC_CONFIG]
+    # Same oracle as ADD: any cdx-side error proves failslab fired and
+    # the leak oracle is meaningful. See the matching comment in
+    # test_mcast_add_failslab_sweep for the rationale.
+    faulted = [n for n, rc, e in outcomes if rc is not None and rc != NO_ERR]
     assert faulted, (
-        f"failslab UPDATE sweep never drove cdx into ERR_MC_CONFIG "
-        f"across times=1..{NSWEEP}; outcomes={outcomes}. The UPDATE "
-        f"path's create_exthash_entry4mcast_member allocation didn't "
-        f"trip — either failslab plumbing broke or cdx swallowed the "
-        f"error."
+        f"failslab UPDATE sweep never surfaced a cdx-side error "
+        f"across times=1..{NSWEEP}; outcomes={outcomes}. Either "
+        f"failslab plumbing broke or cdx swallowed the error."
     )
 
     await asyncio.sleep(KMEMLEAK_AGE_GRACE_S)

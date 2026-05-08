@@ -11,7 +11,7 @@ Three tiered tests, each gating on the previous:
       assertion message names that gate as the suspect.
 
   Tier B — test_pppoe_dut_ping
-      Triage-only: from DUT, `ping -I ppp0 10.99.0.1`. NOT an offload
+      Triage-only: from DUT, `ping -I ppp0 10.98.0.1`. NOT an offload
       test (DUT-originated traffic uses Linux ppp_generic xmit path,
       not FMAN classification). Useful as a triage step before Tier C.
 
@@ -120,7 +120,7 @@ async def test_pppoe_dut_ping(
     xmit, NOT FMAN — this proves the link works, not that offload works.
     Tier C is the real offload test."""
     ppp = pppoe_dut_session
-    inner_local = os.environ.get("ASK_PPPOE_INNER_LOCAL", "10.99.0.1")
+    inner_local = os.environ.get("ASK_PPPOE_INNER_LOCAL", "10.98.0.1")
     target = Console.target()
     target.login("root")
     try:
@@ -151,13 +151,17 @@ async def test_pppoe_lan_through_dut_iperf_offloaded(
     inner_remote and replies via PPP without needing reverse routes on
     vision."""
     ppp = pppoe_dut_session
-    inner_local  = os.environ.get("ASK_PPPOE_INNER_LOCAL",  "10.99.0.1")
+    inner_local  = os.environ.get("ASK_PPPOE_INNER_LOCAL",  "10.98.0.1")
 
-    # Vision-side iperf3 server bound to the inner IP. No -1 — keep
-    # alive across retries; tear down in finally.
+    # Vision-side iperf3 server bound to the inner IP. Pin a non-default
+    # port (5201 is typically held by a system iperf3 service for ad-hoc
+    # client connects). Capture stderr so any bind failure surfaces in
+    # the assertion message rather than as a silent connect timeout.
+    iperf_log = "/tmp/ask_pppoe_iperf3_server.log"
+    iperf_port = 5333
     server = subprocess.Popen(
-        ["iperf3", "-s", "-B", inner_local],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ["iperf3", "-s", "-B", inner_local, "-p", str(iperf_port)],
+        stdout=open(iperf_log, "w"), stderr=subprocess.STDOUT,
     )
 
     target = Console.target()
@@ -166,6 +170,42 @@ async def test_pppoe_lan_through_dut_iperf_offloaded(
     prior_ip_forward: str | None = None
     try:
         await asyncio.sleep(0.5)  # iperf3 server bind grace
+
+        # Diagnose iperf3 server bind: poll up to 3s for the listen
+        # socket to appear. ppp0 may take a moment to come up after
+        # the fixture yields; if iperf3 -s exited (bind failure on a
+        # not-yet-present 10.98.0.1), surface the captured stderr.
+        bind_ok = False
+        for _ in range(15):
+            if server.poll() is not None:
+                break
+            try:
+                ck = subprocess.run(
+                    ["ss", "-ltn", f"sport = :{iperf_port}"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if inner_local in ck.stdout:
+                    bind_ok = True
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+        if not bind_ok:
+            try:
+                with open(iperf_log) as f:
+                    log_tail = f.read()[-2000:]
+            except Exception as e:
+                log_tail = f"<log unreadable: {e}>"
+            ppp_local = subprocess.run(
+                ["ip", "-br", "addr", "show"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            pytest.fail(
+                f"iperf3 -s on Vision didn't bind {inner_local}:{iperf_port} "
+                f"within 3s. server poll={server.poll()!r}.\n"
+                f"iperf3 stderr/stdout:\n{log_tail}\n"
+                f"vision interfaces:\n{ppp_local}"
+            )
 
         # DUT-side: route inner_local via ppp, enable forwarding,
         # MASQUERADE outbound on ppp.
@@ -213,7 +253,8 @@ async def test_pppoe_lan_through_dut_iperf_offloaded(
         # can mid-flow query cmm's connection table without serializing.
         iperf_task = asyncio.create_task(lan_run(
             lan,
-            f"iperf3 -c {inner_local} -t 5 -i 1 --connect-timeout 5000",
+            f"iperf3 -c {inner_local} -p {iperf_port} -t 5 -i 1 "
+            f"--connect-timeout 5000",
             timeout=30.0,
         ))
 
@@ -234,9 +275,63 @@ async def test_pppoe_lan_through_dut_iperf_offloaded(
             "awk '/^cpu / {print}' /proc/stat", timeout=3,
         ).stdout.strip()
 
-        assert r.rc == 0, (
-            f"iperf3 client failed: rc={r.rc} out={r.stdout!r}"
-        )
+        if r.rc != 0:
+            # Capture path-trace diagnostics so flakes don't require a
+            # second run with extra logging.
+            vision_pcap = "/tmp/ask_pppoe_vision_ppp0.pcap"
+            tcpdump_proc = subprocess.Popen(
+                ["tcpdump", "-ni", "any", "-w", vision_pcap, "-c", "10",
+                 f"port {iperf_port} or icmp"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            await asyncio.sleep(0.5)  # tcpdump warmup
+            await lan_run(
+                lan,
+                f"ping -c 2 -W 2 {inner_local} >/dev/null 2>&1",
+                timeout=10.0,
+            )
+            await asyncio.sleep(1.0)
+            tcpdump_proc.terminate()
+            try:
+                tcpdump_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                tcpdump_proc.kill()
+            wire = subprocess.run(
+                ["tcpdump", "-r", vision_pcap, "-nn", "-tt"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+
+            dut_route = target.run(
+                f"ip route get {inner_local}; "
+                f"ip a show {ppp}; "
+                f"iptables -t nat -nvL POSTROUTING | head -5; "
+                f"iptables -nvL FORWARD | head -10; "
+                f"sysctl -n net.ipv4.ip_forward",
+                timeout=5,
+            ).stdout
+            vision_listen = subprocess.run(
+                ["ss", "-ltnp", f"sport = :{iperf_port}"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout
+            try:
+                with open(iperf_log) as f:
+                    server_log = f.read()[-1000:]
+            except Exception:
+                server_log = "<unreadable>"
+            lan_ping = await lan_run(
+                lan,
+                f"ping -c 2 -W 2 {inner_local}; "
+                f"traceroute -n -w 1 -m 5 {inner_local} 2>/dev/null | head -8",
+                timeout=15.0,
+            )
+            pytest.fail(
+                f"iperf3 client failed: rc={r.rc} out={r.stdout!r}\n\n"
+                f"--- DUT route + iptables + ip_forward ---\n{dut_route}\n"
+                f"--- Vision listen ---\n{vision_listen}\n"
+                f"--- iperf3 server log ---\n{server_log}\n"
+                f"--- LAN VM ping/traceroute ---\n{lan_ping.stdout}\n"
+                f"--- Vision tcpdump (any iface, port {iperf_port} or icmp) ---\n{wire}"
+            )
         assert "/sec" in r.stdout, (
             f"iperf3 didn't report throughput — connect failed or "
             f"silent error: {r.stdout!r}"
@@ -291,3 +386,5 @@ async def test_pppoe_lan_through_dut_iperf_offloaded(
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait()
+        try: os.unlink(iperf_log)
+        except FileNotFoundError: pass

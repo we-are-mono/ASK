@@ -92,8 +92,11 @@ async def pppoe_real_server():
         target.close()
 
     bind_if      = _env("ASK_PPPOE_BIND_IF",      "br0")
-    inner_local  = _env("ASK_PPPOE_INNER_LOCAL",  "10.99.0.1")
-    inner_remote = _env("ASK_PPPOE_INNER_REMOTE", "10.99.0.2")
+    # 10.98.0.x deliberately avoided the 10.99.0.x range — IPSEC.md
+    # tests put 10.99.0.2/32 on Vision's lo, so a PPP peer of 10.99.0.2
+    # would loop replies back via loopback instead of ppp0.
+    inner_local  = _env("ASK_PPPOE_INNER_LOCAL",  "10.98.0.1")
+    inner_remote = _env("ASK_PPPOE_INNER_REMOTE", "10.98.0.2")
     user         = "ask-test"
     secret       = "ask-test-secret"
 

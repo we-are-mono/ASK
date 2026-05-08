@@ -35,9 +35,10 @@ import os
 import re
 import subprocess
 
+import pytest
 import pytest_asyncio
 
-from _topology import lan_run
+from _topology import lan_run, ipv6_topology  # noqa: F401  (fixture re-export)
 
 
 # Topology constants — defaults match the primary dev site.
@@ -60,6 +61,11 @@ TUNNEL_MTU   = 1480       # 1500 (eth) - 20 (IPv4 outer)
 # 10G line rate. 1 Gbps splits the two cleanly.
 OFFLOAD_MIN_GBPS = float(os.environ.get("ASK_TUNNEL_TX_MIN_GBPS", "1.0"))
 IPERF_DURATION_S = int(os.environ.get("ASK_TUNNEL_TX_DURATION", "8"))
+
+# Non-default port — 5201 is typically held by a system iperf3 service
+# for ad-hoc client connects, and `iperf3 -s -D` on default would fail
+# to bind silently (stderr is discarded under -D).
+IPERF_PORT       = int(os.environ.get("ASK_TUNNEL_TX_IPERF_PORT", "5333"))
 
 # CMM's tunnel-aware conntrack offload programs both directions only
 # after seeing packets in both — TCP's SYN+SYNACK provides that
@@ -90,13 +96,19 @@ def _sh(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
 # ---- fixture: bring up sit tunnel on orchestrator + DUT + LAN VM ----------
 
 @pytest_asyncio.fixture
-async def sit_tunnel(aiohttp_session, target_agent, lan):
+async def sit_tunnel(aiohttp_session, target_agent, lan, ipv6_topology):
     """Create a kernel-sit tunnel on DUT and orchestrator, plus inner-
     subnet IPv6 routes on LAN VM. Yields nothing (the test references
     constants directly). Cleans up on teardown.
 
     The sit netdev is what CMM watches and registers with FCI as an
     ASK tunnel — that's how the FMAN encap path becomes engaged.
+
+    Depends on `ipv6_topology` for the underlying LAN→DUT v6 plumbing
+    (fc00:dead::1/64 on DUT eth4, fc00:dead::2/64 on the LAN NIC,
+    default v6 route on the LAN VM via fc00:dead::1, IPv6 forwarding
+    on DUT). Without that, ND for the inner default-route next-hop
+    fails and iperf3 reports `No route to host` immediately.
     """
     # Idempotent cleanup — prior test runs may have left state.
     _sh(f"ip link del {TUNNEL_IF} 2>/dev/null")
@@ -118,9 +130,10 @@ async def sit_tunnel(aiohttp_session, target_agent, lan):
     _sh(f"ip -6 route add fc00:dead::/64 dev {TUNNEL_IF}")
     _sh("sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null")
 
-    # iperf3 server on orchestrator (one-shot, exit after first client)
+    # iperf3 server on orchestrator (one-shot, exit after first client).
+    # Pinned to IPERF_PORT to avoid colliding with a system iperf3 on 5201.
     iperf_proc = subprocess.Popen(
-        ["iperf3", "-s", "-D", "-1"],
+        ["iperf3", "-s", "-D", "-1", "-p", str(IPERF_PORT)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     # Give iperf3 a moment to bind.
@@ -196,15 +209,52 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
     # ASSURED, programmed when packets are seen in both directions).
     r = await lan_run(
         lan,
-        f"iperf3 -c {ORCH_TUN_V6} -t {IPERF_DURATION_S} 2>&1",
+        f"iperf3 -c {ORCH_TUN_V6} -p {IPERF_PORT} -t {IPERF_DURATION_S} 2>&1",
         timeout=IPERF_DURATION_S + 15,
     )
     log = r.stdout
     gbps = _iperf_receiver_gbps(log)
-    assert gbps is not None, (
-        f"iperf3 didn't report a receiver throughput line; full output:\n"
-        f"{log[-1000:]}"
-    )
+    if gbps is None:
+        # Path-trace on failure: tunnel state on DUT/Vision + LAN
+        # routing. Quickest discriminator between "tunnel not up", "v6
+        # forwarding off", "iperf3 didn't bind", and "FMAN dropped".
+        vision_a  = _sh(f"ip a show {TUNNEL_IF}").stdout
+        vision_rt = _sh("ip -6 route show").stdout
+        vision_ls = _sh(f"ss -ltnp 'sport = :{IPERF_PORT}'").stdout
+        vision_state = (
+            f"ip a {TUNNEL_IF}:\n{vision_a}\n"
+            f"ip -6 route:\n{vision_rt}\n"
+            f"listen on :{IPERF_PORT}:\n{vision_ls}"
+        )
+        dut_a   = await target_agent.exec_cmd(
+            aiohttp_session, ["ip", "a", "show", TUNNEL_IF],
+        )
+        dut_rt  = await target_agent.exec_cmd(
+            aiohttp_session, ["ip", "-6", "route", "show"],
+        )
+        dut_fwd = await target_agent.exec_cmd(
+            aiohttp_session, ["sysctl", "-n", "net.ipv6.conf.all.forwarding"],
+        )
+        dut_text = (
+            f"ip a {TUNNEL_IF}:\n{dut_a.get('stdout','')}\n"
+            f"ip -6 route:\n{dut_rt.get('stdout','')}\n"
+            f"v6 forwarding: {dut_fwd.get('stdout','').strip()}"
+        )
+        lan_state = await lan_run(
+            lan,
+            f"ip a show {LAN_NIC}; ip -6 route show; "
+            f"ping -6 -c 2 -W 2 {ORCH_TUN_V6} 2>&1; "
+            f"ping -6 -c 2 -W 2 {DUT_LAN_V6} 2>&1",
+            timeout=15.0,
+        )
+        pytest.fail(
+            f"iperf3 didn't report a receiver throughput line.\n"
+            f"--- iperf3 output ---\n{log[-800:]}\n"
+            f"--- Vision tunnel + ipv6 routes + listen ---\n{vision_state}\n"
+            f"--- DUT tunnel + ipv6 routes + forwarding ---\n{dut_text}\n"
+            f"--- LAN VM ipv6 + ping(orch_tun_v6) + ping(dut_lan_v6) ---\n"
+            f"{lan_state.stdout}"
+        )
 
     # Counter snapshot: did the kernel grow any IPv6 conntrack entries?
     r = await target_agent.exec_cmd(
