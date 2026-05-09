@@ -38,9 +38,13 @@ from _topology import (
 
 
 # Filter to abm-only symbols. The broad ASK_KMEMLEAK_FILTER would
-# incidentally flag DPAA bpool refills under [auto_bridge]; abm_-prefix
-# function needles are the precise ones.
-ABM_LEAK_FILTER = ["abm_", "[auto_bridge]"]
+# incidentally flag DPAA bpool refills via the [auto_bridge] module
+# annotation — kmemleak's stack walker for soft-IRQ/init-path traces
+# sometimes resolves a frame to a sibling address that happens to
+# lie in auto_bridge.ko's symbol range, so the bracket annotation is
+# noisy in this code path. The abm_-function-prefix needle catches
+# real abm allocations without that aliasing footgun.
+ABM_LEAK_FILTER = ["abm_"]
 
 # Primary bridge VLAN — matches VLAN_IDS_BRIDGE[0] in the fixture.
 PRIMARY_VID    = VLAN_IDS_BRIDGE[0]

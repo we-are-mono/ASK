@@ -13,6 +13,7 @@ import secrets
 import socket
 import struct
 import subprocess
+import threading
 from pathlib import Path
 
 from aiohttp import web
@@ -655,6 +656,117 @@ async def fs_write(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+# Multicast subscription via setsockopt() — kernel uapi value, not in
+# the Python `socket` module on every distro we run against.
+_SOL_NETLINK            = 270
+_NETLINK_ADD_MEMBERSHIP = 1
+
+
+class _NetlinkListener:
+    """Per-id state for /netlink-listen-{start,stop}.
+
+    A blocking AF_NETLINK socket is read by a daemon thread that appends
+    each received frame to `frames` under `lock`. Stop closes the socket
+    (which unblocks recv with EBADF/0) and joins the thread.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.frames: list[bytes] = []
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            try:
+                # 64K is the max netlink datagram size; truncation
+                # would lose part of a notification we'd then fail to
+                # parse. Use MSG_TRUNC if you need to know it happened.
+                buf = self.sock.recv(65536)
+            except OSError:
+                # Socket closed by stop() — exit cleanly.
+                return
+            if not buf:
+                return
+            with self.lock:
+                self.frames.append(buf)
+
+    def drain(self) -> list[bytes]:
+        with self.lock:
+            out, self.frames = self.frames, []
+        return out
+
+    def shutdown(self) -> None:
+        self.stop.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.thread.join(timeout=2.0)
+
+
+async def netlink_listen_start(request: web.Request) -> web.Response:
+    """POST {protocol, group} -> {listener_id}.
+
+    Opens an AF_NETLINK socket on `protocol`, joins multicast `group`,
+    and spawns a daemon thread that buffers received frames. Pair with
+    /netlink-listen-stop/{listener_id} to drain + close. The thread-
+    based capture mirrors the tcpdump capture pattern: socket I/O off
+    the asyncio loop so the event-loop thread stays responsive.
+    """
+    body = await _maybe_json(request)
+    try:
+        protocol = int(body["protocol"])
+        group    = int(body["group"])
+    except (KeyError, ValueError, TypeError) as e:
+        return web.json_response({"error": f"bad request: {e}"}, status=400)
+    if not (1 <= group <= 32):
+        return web.json_response(
+            {"error": f"group must be 1..32 (netlink legacy mask range), got {group}"},
+            status=400,
+        )
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, protocol)
+        # bind(0, 0) — kernel allocates pid; nl_groups bitmask 0 means
+        # we don't ask for any groups via the legacy bind path. The
+        # NETLINK_ADD_MEMBERSHIP setsockopt below is the modern way
+        # (works for group ids beyond the 32-bit nl_groups bitmask).
+        sock.bind((0, 0))
+        sock.setsockopt(_SOL_NETLINK, _NETLINK_ADD_MEMBERSHIP, group)
+    except OSError as e:
+        return web.json_response(
+            {"error": f"netlink socket setup failed: errno={e.errno} {e.strerror}"},
+            status=500,
+        )
+    listener = _NetlinkListener(sock)
+    listener.thread.start()
+    listener_id = secrets.token_hex(8)
+    request.app["netlink_listeners"][listener_id] = listener
+    return web.json_response({"listener_id": listener_id})
+
+
+async def netlink_listen_stop(request: web.Request) -> web.Response:
+    """POST /netlink-listen-stop/{listener_id} -> {messages: [hex,...], count}.
+
+    Drains the buffered frames, closes the socket, joins the reader
+    thread. Frames are returned as hex strings so the JSON transport
+    is text-clean.
+    """
+    listener_id = request.match_info["listener_id"]
+    listener = request.app["netlink_listeners"].pop(listener_id, None)
+    if listener is None:
+        return web.json_response({"error": "unknown listener_id"}, status=404)
+    # shutdown() blocks on socket.close() + thread.join(); offload so
+    # the asyncio loop isn't stalled if the reader is mid-recv.
+    await asyncio.get_event_loop().run_in_executor(None, listener.shutdown)
+    frames = listener.drain()
+    return web.json_response({
+        "messages": [f.hex() for f in frames],
+        "count":    len(frames),
+    })
+
+
 async def netlink_send(request: web.Request) -> web.Response:
     """POST {protocol, body_hex, [nlmsg_type, nlmsg_flags,
                                   nlmsg_len_override, timeout_ms]}
@@ -801,6 +913,7 @@ async def _maybe_json(request: web.Request) -> dict:
 def build_app() -> web.Application:
     app = web.Application()
     app["captures"] = {}
+    app["netlink_listeners"] = {}
     app.router.add_get("/health",            health)
     app.router.add_get("/counters",          counters_get)
     app.router.add_post("/capture-start",    capture_start)
@@ -811,6 +924,8 @@ def build_app() -> web.Application:
     app.router.add_post("/cmm/query",        cmm_query)
     app.router.add_post("/fci/send",         fci_send)
     app.router.add_post("/netlink/send",     netlink_send)
+    app.router.add_post("/netlink-listen-start", netlink_listen_start)
+    app.router.add_post("/netlink-listen-stop/{listener_id}", netlink_listen_stop)
     app.router.add_post("/ioctl/send",       ioctl_send)
     app.router.add_post("/fs/write",         fs_write)
     app.router.add_post("/exec",             exec_cmd)

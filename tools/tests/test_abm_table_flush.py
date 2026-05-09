@@ -28,7 +28,10 @@ from _topology import (
 )
 
 
-ABM_LEAK_FILTER = ["abm_", "[auto_bridge]"]
+# abm_-prefix only; the [auto_bridge] bracket annotation is too noisy
+# under soft-IRQ stack unwinding and incidentally tags DPAA bpool
+# refills as abm leaks. See test_abm_port_flap.py for the rationale.
+ABM_LEAK_FILTER = ["abm_"]
 
 
 async def _read_l3_filtering(target_agent, session) -> int:

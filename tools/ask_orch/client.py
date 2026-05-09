@@ -164,6 +164,42 @@ class Agent:
             r.raise_for_status()
             return await r.json()
 
+    async def netlink_listen_start(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        protocol: int,
+        group: int,
+    ) -> str:
+        """Subscribe to a netlink multicast group on the agent.
+
+        Returns a listener_id. The agent opens an AF_NETLINK socket on
+        `protocol`, joins multicast `group` via NETLINK_ADD_MEMBERSHIP,
+        and runs a daemon thread that buffers received frames until
+        netlink_listen_stop drains them. Use for kernel-emitted netlink
+        notifications (e.g. abm's NETLINK_L2FLOW=33 group=1 broadcasts).
+        """
+        body = {"protocol": int(protocol), "group": int(group)}
+        async with session.post(f"{self.base_url}/netlink-listen-start", json=body) as r:
+            r.raise_for_status()
+            return (await r.json())["listener_id"]
+
+    async def netlink_listen_stop(
+        self,
+        session: aiohttp.ClientSession,
+        listener_id: str,
+    ) -> dict:
+        """Drain buffered frames + close the listener socket.
+
+        Returns {"messages": [hex, ...], "count": int}; `messages` is
+        the list of raw netlink frames as hex strings, in arrival order.
+        """
+        async with session.post(
+            f"{self.base_url}/netlink-listen-stop/{listener_id}",
+        ) as r:
+            r.raise_for_status()
+            return await r.json()
+
     async def ioctl_send(
         self,
         session: aiohttp.ClientSession,
