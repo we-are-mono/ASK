@@ -721,9 +721,14 @@ async def netlink_listen_start(request: web.Request) -> web.Response:
         group    = int(body["group"])
     except (KeyError, ValueError, TypeError) as e:
         return web.json_response({"error": f"bad request: {e}"}, status=400)
-    if not (1 <= group <= 32):
+    # Group 0 is meaningless for netlink multicast (groups are 1-indexed).
+    # The upper bound is just a sanity guard against negative ints
+    # silently wrapping into a huge unsigned setsockopt value; the
+    # kernel rejects unknown groups with -ENOENT against the protocol's
+    # configured ngroups, so we don't need a tight ceiling here.
+    if group < 1 or group > 0x7fffffff:
         return web.json_response(
-            {"error": f"group must be 1..32 (netlink legacy mask range), got {group}"},
+            {"error": f"group must be a positive 32-bit int, got {group}"},
             status=400,
         )
     try:
