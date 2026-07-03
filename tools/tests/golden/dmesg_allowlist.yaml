@@ -19,12 +19,6 @@ allowlist:
     reason: "CONFIG_PROVE_RCU boot announcement; not a real splat. Belt-and-braces in case SPLAT_RE broadens."
     expires: "2027-01-01"
 
-  - pattern: 'create_tunnel_insert_hm\+0x[0-9a-f]+/0x[0-9a-f]+ \[cdx\]'
-    reason: "ISSUES.md A11 — FORTIFY_SOURCE false positive on flex-array l3hdr[0] in struct en_ehash_insert_l3_hdr (kernel header). The caller pre-allocates sizeof(struct)+header_size at cdx_ehash.c:2280; FORTIFY sees compile-time dst=0 and warns at the memcpy on line 2298. Fix: convert l3hdr[0] -> l3hdr[] (proper flex array) OR switch to unsafe_memcpy(). Drop this entry when the kernel patch lands."
-    expires: "2026-07-01"
-    applies_to:
-      - "test_tunnel_tx_offload"
-
   - pattern: '(={20,}|circular locking dependency detected|ppp_ioctl\+0x[0-9a-f]+/0x[0-9a-f]+ \[ppp_generic\])'
     reason: "ISSUES.md A13 — upstream ppp_generic lockdep WARNING (not deadlock): all_ppp_mutex ↔ rtnl_mutex inversion between ppp_ioctl path (mutex first, then rtnl_lock via register_netdev) and rtnetlink ppp_link_ops path (rtnl held, then all_ppp_mutex). Pre-existing in upstream Linux 6.12; surfaces once per boot on first PPPIOCNEWUNIT. Not introduced by ASK code. Pattern catches the lockdep banner (===), the WARNING line, and the PPP stack-trace line; applies_to scopes the broad banner-match to PPPoE tests only. Drop when upstream fix lands and we rebase past it."
     expires: "2026-10-01"
