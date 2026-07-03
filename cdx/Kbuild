@@ -7,6 +7,12 @@ ccflags-y += -I$(srctree)/drivers/crypto/caam
 ccflags-y += -DSEC_PROFILE_SUPPORT -DVLAN_FILTER -DWIFI_ENABLE -DENABLE_EGRESS_QOS
 ccflags-y += -DDPA_IPSEC_OFFLOAD
 ccflags-y += -Werror -I$(src) -DENDIAN_LITTLE -DGCC_TOOLCHAIN
+# CFG_FLAGS is forwarded by cdx/Makefile from the outer make invocation
+# (kbuild prefers Kbuild over Makefile when both exist, so the latter's
+# ccflags-y += $(CFG_FLAGS) line never runs in this build path).
+# meta-ask's recipe sets CFG_FLAGS=-DCDX_DEBUG_KEY_ZEROING=1 to enable
+# the H2 regression tripwire; production builds leave it empty.
+ccflags-y += $(CFG_FLAGS)
 
 obj-$(CONFIG_ASK_CDX) += cdx.o
 

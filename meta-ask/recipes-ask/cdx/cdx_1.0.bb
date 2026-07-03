@@ -16,6 +16,13 @@ PROVIDES = "kernel-module-cdx"
 # so olddefconfig strips it from .config — force it here.
 EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX=m"
 
+# H2 regression tripwire (test image only; production Armbian build never
+# sets this). cdx/Makefile forwards CFG_FLAGS into ccflags-y, so the macro
+# reaches the cdx_dpa_ipsec.c capture probe + the cdx_main.c init hook.
+# Without it, the probe code compiles to empty inlines and no procfs file
+# is created. See tools/tests/test_ipsec_key_zeroing.py.
+EXTRA_OEMAKE += "CFG_FLAGS=-DCDX_DEBUG_KEY_ZEROING=1"
+
 # Silence the [buildpaths] QA warning on the split kernel-module sub-package.
 # cdx.ko embeds a handful of TMPDIR-prefixed header paths in its .rodata
 # (rcupdate.h, dma-mapping.h, caam/regs.h) from __FILE__ macro expansions

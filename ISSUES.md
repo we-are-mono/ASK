@@ -284,8 +284,8 @@ Flagged as critical by deep-dive agents but don't hold up on verification.
 - [-] **A12. PPPoE RX-decap "missing classifier-table install" — not a bug.**
   Endpoint RX is intentionally inner-keyed: PCD `dist_order` ([dpa_app/files/etc/cdx_pcd.xml:335-352](dpa_app/files/etc/cdx_pcd.xml#L335-L352)) tries `cdx_udp4_dist`/`cdx_tcp4_dist` before `cdx_pppoe_dist`, and `STRIP_PPPoE_HDR` chains in at CT-add time via `pppoe_present` metadata ([cdx/cdx_ehash.c:740](cdx/cdx_ehash.c#L740)). `cdx_pppoe_cc` is for relay only. Filed during synthetic-FCI wire-tracing then retracted after audit; [test_pppoe_e2e.py](tools/tests/test_pppoe_e2e.py) confirms the path works under real pppd at 1.55 Gbps / 0.5% CPU.
 
-- [ ] **A14. H2 key-zeroing regression test needs kernel-side observability probe.**
-  Parked at [tools/tests/test_ipsec_key_zeroing.py](tools/tests/test_ipsec_key_zeroing.py); no userspace surface for freed-slab contents (kmemleak reports refs not contents).
+- [x] **A14. H2 key-zeroing regression test needs kernel-side observability probe.**
+  Shipped: cdx grew a `CDX_DEBUG_KEY_ZEROING`-gated probe ([cdx/cdx_dpa_ipsec.c](cdx/cdx_dpa_ipsec.c)) that snapshots the post-`kfree_sensitive` cipher_key slab into `/proc/cdx/last_freed_key` (root-only, seq-counted so the test can prove it observed its own free; KFENCE-sampled allocations are recorded but not read). The test ([tools/tests/test_ipsec_key_zeroing.py](tools/tests/test_ipsec_key_zeroing.py)) installs an SA with a 0xA5 cipher key, deletes it, and asserts the snapshot is mostly zero. The flag is set only by the meta-ask test image; production Armbian builds do not define it. Scope: the probe observes **cipher_key only** — a regression confined to the `auth_key`/`split_key` frees in the same function would not trip it.
 
 - [ ] **A15. cmm has no incoming xfrm netlink subscription.**
   [cmm/src/keytrack.c:1613](cmm/src/keytrack.c#L1613) only sends outbound `XFRM_MSG_EXPIRE`; nothing watches incoming `NEWSA`/`NEWPOLICY`. Design finding — slice-2 fixture drives `ip xfrm` AND FCI in parallel.

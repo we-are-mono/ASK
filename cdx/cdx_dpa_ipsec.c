@@ -71,6 +71,169 @@
 
 //#define CDX_DPA_DEBUG	1
 
+#ifdef CDX_DEBUG_KEY_ZEROING
+/*
+ * H2 regression tripwire — DEBUG-ONLY, NOT FOR PRODUCTION.
+ *
+ * The H2 fix replaced kfree with kfree_sensitive on cipher_key /
+ * auth_key / split_key in cdx_ipsec_sec_sa_context_free; the
+ * sensitive variant zeroes the buffer before returning the slot to
+ * the slab allocator. A regression to plain kfree leaves the bytes
+ * in place where the next slab consumer can read them.
+ *
+ * To make that observable from user space, this probe snapshots the
+ * bytes at the cipher_key buffer's address immediately after
+ * kfree_sensitive returns, and exposes the snapshot via
+ * /proc/cdx/last_freed_key. The read is a deliberate UAF: the
+ * buffer is freed but not yet handed to a new owner. KASAN would
+ * trap it on instrumented builds, so the read is wrapped in
+ * kasan_disable_current() / kasan_enable_current(); both are no-ops
+ * without CONFIG_KASAN, so the same code compiles either way.
+ * KFENCE-sampled allocations cannot be read after free at all — the
+ * object's page is guard-protected and the access would fault with a
+ * use-after-free report — so those events are recorded with an empty
+ * snapshot (captured=false) and the test retries with a fresh SA.
+ *
+ * The snapshot is best-effort by design: SLUB may write its freelist
+ * pointer into the slot before the memcpy, and another context may
+ * reallocate the slot entirely, in which case the snapshot holds the
+ * new owner's bytes. Accepted — the file is root-only (0400) on a
+ * test-image-only build, and the test asserts on byte patterns, not
+ * exact contents.
+ *
+ * The seq counter increments on every observed cipher_key free so a
+ * reader can tell a fresh capture from a stale one; without it, a
+ * snapshot latched by an earlier test's teardown would satisfy a
+ * naive captured=true poll.
+ *
+ * Production (Armbian) builds DO NOT define CDX_DEBUG_KEY_ZEROING.
+ * The flag is set only in the meta-ask test image. cdx_module_init
+ * prints a pr_warn_once at boot if the probe is on, so an
+ * accidental enable surfaces loudly.
+ */
+#include <linux/kasan.h>
+#include <linux/kfence.h>
+#include <linux/mutex.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
+#define CDX_KEY_ZEROING_SNAPSHOT_LEN MAX_CIPHER_KEY_LEN
+
+static DEFINE_MUTEX(cdx_key_zeroing_lock);
+static struct {
+	u64    seq;
+	void  *addr;
+	size_t len;
+	bool   captured;
+	u8     snapshot[CDX_KEY_ZEROING_SNAPSHOT_LEN];
+} cdx_key_zeroing_state;
+
+static struct proc_dir_entry *cdx_key_zeroing_dir;
+static struct proc_dir_entry *cdx_key_zeroing_file;
+
+static void cdx_ipsec_capture_post_free(void *p, size_t n)
+{
+	size_t to_copy;
+
+	if (!p || !n)
+		return;
+
+	to_copy = min(n, (size_t)CDX_KEY_ZEROING_SNAPSHOT_LEN);
+
+	mutex_lock(&cdx_key_zeroing_lock);
+	cdx_key_zeroing_state.seq++;
+	cdx_key_zeroing_state.addr = p;
+	if (is_kfence_address(p)) {
+		/* KFENCE guard-protects the page on free; reading it
+		 * would fault and splat. Record the event with an empty
+		 * snapshot so the reader knows to retry with a new
+		 * allocation (which is virtually never KFENCE-sampled).
+		 */
+		cdx_key_zeroing_state.len      = 0;
+		cdx_key_zeroing_state.captured = false;
+	} else {
+		cdx_key_zeroing_state.len = to_copy;
+		/* Deliberate UAF: p was just handed to the slab. The
+		 * bytes are still readable until SLUB writes its
+		 * freelist pointer or a new owner allocates the slot.
+		 * KASAN must be told to ignore this single memcpy.
+		 */
+		kasan_disable_current();
+		memcpy(cdx_key_zeroing_state.snapshot, p, to_copy);
+		kasan_enable_current();
+		cdx_key_zeroing_state.captured = true;
+	}
+	mutex_unlock(&cdx_key_zeroing_lock);
+}
+
+static int cdx_key_zeroing_show(struct seq_file *m, void *v)
+{
+	u8 buf[CDX_KEY_ZEROING_SNAPSHOT_LEN];
+	void *addr;
+	size_t i, n;
+	u64 seq;
+	bool captured;
+
+	mutex_lock(&cdx_key_zeroing_lock);
+	seq      = cdx_key_zeroing_state.seq;
+	addr     = cdx_key_zeroing_state.addr;
+	n        = cdx_key_zeroing_state.len;
+	captured = cdx_key_zeroing_state.captured;
+	memcpy(buf, cdx_key_zeroing_state.snapshot, n);
+	mutex_unlock(&cdx_key_zeroing_lock);
+
+	seq_printf(m, "seq=%llu addr=%p len=%zu captured=%s\n",
+		   seq, addr, n, captured ? "true" : "false");
+	for (i = 0; i < n; i++)
+		seq_printf(m, "%02x", buf[i]);
+	seq_putc(m, '\n');
+	return 0;
+}
+
+static int cdx_key_zeroing_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, cdx_key_zeroing_show, NULL);
+}
+
+static const struct proc_ops cdx_key_zeroing_proc_ops = {
+	.proc_open    = cdx_key_zeroing_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+int cdx_ipsec_init_key_zeroing_probe(void)
+{
+	pr_warn_once("cdx: CDX_DEBUG_KEY_ZEROING is on — diagnostic probe leaks freed-key snapshots via /proc/cdx/last_freed_key; do not ship\n");
+	cdx_key_zeroing_dir = proc_mkdir("cdx", NULL);
+	if (!cdx_key_zeroing_dir)
+		return -ENOMEM;
+	cdx_key_zeroing_file = proc_create("last_freed_key", 0400,
+					   cdx_key_zeroing_dir,
+					   &cdx_key_zeroing_proc_ops);
+	if (!cdx_key_zeroing_file) {
+		proc_remove(cdx_key_zeroing_dir);
+		cdx_key_zeroing_dir = NULL;
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+void cdx_ipsec_remove_key_zeroing_probe(void)
+{
+	if (cdx_key_zeroing_file) {
+		proc_remove(cdx_key_zeroing_file);
+		cdx_key_zeroing_file = NULL;
+	}
+	if (cdx_key_zeroing_dir) {
+		proc_remove(cdx_key_zeroing_dir);
+		cdx_key_zeroing_dir = NULL;
+	}
+}
+#else
+static inline void cdx_ipsec_capture_post_free(void *p, size_t n) { }
+#endif /* CDX_DEBUG_KEY_ZEROING */
+
 #define CLASS_SHIFT		25
 #define CLASS_MASK		(0x03 << CLASS_SHIFT)
 
@@ -264,8 +427,12 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 			return;
 		}
 	}
-	if(pdpa_sec_context->cipher_data.cipher_key)
-		kfree_sensitive(pdpa_sec_context->cipher_data.cipher_key);
+	if (pdpa_sec_context->cipher_data.cipher_key) {
+		void *cipher_addr = pdpa_sec_context->cipher_data.cipher_key;
+
+		kfree_sensitive(cipher_addr);
+		cdx_ipsec_capture_post_free(cipher_addr, MAX_CIPHER_KEY_LEN);
+	}
 	if(pdpa_sec_context->auth_data.auth_key)
 		kfree_sensitive(pdpa_sec_context->auth_data.auth_key);
 	if(pdpa_sec_context->auth_data.split_key)

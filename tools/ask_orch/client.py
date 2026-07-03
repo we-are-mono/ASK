@@ -248,6 +248,25 @@ class Agent:
             r.raise_for_status()
             return await r.json()
 
+    async def fs_read(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        *,
+        max_bytes: int = 1 << 20,
+    ) -> dict:
+        """Read a file on the agent and return {content_hex, size, errno}.
+
+        Used for /proc, /sys, and other binary-safe surfaces where exec_cmd
+        with `cat` is unavailable (cat is not in the exec allowlist). The
+        kernel-side H2 key-zeroing probe at /proc/cdx/last_freed_key is the
+        primary consumer.
+        """
+        body = {"path": path, "max_bytes": int(max_bytes)}
+        async with session.post(f"{self.base_url}/fs/read", json=body) as r:
+            r.raise_for_status()
+            return await r.json()
+
     async def fs_write(
         self,
         session: aiohttp.ClientSession,

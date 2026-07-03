@@ -623,6 +623,34 @@ async def exec_cmd(request: web.Request) -> web.Response:
     })
 
 
+async def fs_read(request: web.Request) -> web.Response:
+    """POST {path, [max_bytes]} -> {content_hex, size, errno}.
+
+    Returns file contents hex-encoded so binary payloads (e.g.
+    /proc/cdx/last_freed_key under CDX_DEBUG_KEY_ZEROING — see the H2
+    regression test) survive transport without UnicodeDecodeError.
+    Mirrors fs_write's bytes-discipline. max_bytes caps the response.
+    """
+    body = await _maybe_json(request)
+    try:
+        path = body["path"]
+    except (KeyError, TypeError) as e:
+        return web.json_response({"error": f"bad request: {e}"}, status=400)
+    max_bytes = int(body.get("max_bytes", 1 << 20))
+
+    def _work():
+        try:
+            with open(path, "rb") as f:
+                data = f.read(max_bytes)
+            return {"content_hex": data.hex(), "size": len(data), "errno": 0}
+        except OSError as e:
+            return {"content_hex": "", "size": 0,
+                    "errno": e.errno, "error": e.strerror}
+
+    result = await asyncio.get_event_loop().run_in_executor(None, _work)
+    return web.json_response(result)
+
+
 async def fs_write(request: web.Request) -> web.Response:
     """POST {path, content, [uid], [timeout_ms]} -> write attempt result.
 
@@ -932,6 +960,7 @@ def build_app() -> web.Application:
     app.router.add_post("/netlink-listen-start", netlink_listen_start)
     app.router.add_post("/netlink-listen-stop/{listener_id}", netlink_listen_stop)
     app.router.add_post("/ioctl/send",       ioctl_send)
+    app.router.add_post("/fs/read",          fs_read)
     app.router.add_post("/fs/write",         fs_write)
     app.router.add_post("/exec",             exec_cmd)
     return app

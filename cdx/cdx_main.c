@@ -51,6 +51,16 @@
 #include "cdx_cmdhandler.h"
 #include "dpa_ipsec.h"
 
+#ifdef CDX_DEBUG_KEY_ZEROING
+/* H2 regression tripwire — see cdx_dpa_ipsec.c for design rationale.
+ * Forward-declared here so cdx_main.c does not need to pull in the
+ * full cdx_dpa_ipsec.h surface (which references types not in scope
+ * at this point in the include order).
+ */
+int  cdx_ipsec_init_key_zeroing_probe(void);
+void cdx_ipsec_remove_key_zeroing_probe(void);
+#endif
+
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -266,6 +276,12 @@ static int __init cdx_module_init(void)
 	}
 	/* creating a /proc/fqid_stats dir for listing fqids created by cdx module */
 	cdx_init_fqid_procfs();
+#ifdef CDX_DEBUG_KEY_ZEROING
+	if (cdx_ipsec_init_key_zeroing_probe() == 0)
+		register_cdx_deinit_func(cdx_ipsec_remove_key_zeroing_probe);
+	else
+		printk(KERN_WARNING "%s::cdx_ipsec_init_key_zeroing_probe failed\n", __func__);
+#endif
 #ifdef START_DPA_APP
 	rc = start_dpa_app();
 	if (rc != 0)  {

@@ -214,9 +214,9 @@ def set_keys(
     switch in M_ipsec_sa_set_cipher_key / M_ipsec_sa_set_digest_key.
 
     Recognizable byte patterns (0xA5 cipher, 0x5A auth) so the H2
-    key-zeroing regression CAN be observed if a kernel-side probe ever
-    surfaces freed-slab contents — see test_ipsec_key_zeroing.py and
-    ISSUES.md A14.
+    key-zeroing regression test can detect surviving cipher key bytes
+    in the post-kfree_sensitive slab snapshot — see
+    test_ipsec_key_zeroing.py.
     """
     return (
         struct.pack("<HH", sagd & 0xFFFF, 0)
