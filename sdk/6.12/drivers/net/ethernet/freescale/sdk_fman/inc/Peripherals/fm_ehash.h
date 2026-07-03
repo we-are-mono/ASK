@@ -60,7 +60,7 @@ struct en_ehash_entry {
 				};
 				uint64_t next_entry;
 			};
-			uint8_t key[0];			//variable size key
+			uint8_t key[];			//variable size key
 		}__attribute__ ((packed));
 		struct {
 			uint8_t	hash_entry[MAX_EN_EHASH_ENTRY_SIZE];
@@ -313,7 +313,7 @@ struct en_ehash_strip_all_vlan_hdrs {
 	uint8_t         op_flags;       /* To check vlan validation should be enabled or disabled*/
 	uint8_t         pad;
 	uint16_t         pad1;
-	uint8_t stats_offsets[0];		//array of offsets into stats base
+	uint8_t stats_offsets[];		//array of offsets into stats base
 }__attribute__ ((packed));
 
 //parameters for STRIP_PPPoE_HDR
@@ -332,7 +332,7 @@ struct en_ehash_strip_l2_hdrs {
 		};
 		uint32_t word;
 	};
-	uint8_t stats_offsets[0];		//array of offsets into stats base
+	uint8_t stats_offsets[];		//array of offsets into stats base
 }__attribute__ ((packed));
 
 //parameters for opcode VALIDATE_IPSEC_ID
@@ -381,7 +381,7 @@ struct en_ehash_insert_l2_hdr {
 		};
 		uint32_t word;
 	};
-        uint8_t l2hdr[0];               //l2 hdr padded to next 4 bytes boundary
+        uint8_t l2hdr[];               //l2 hdr padded to next 4 bytes boundary
 }__attribute__ ((packed));
 
 struct en_ehash_insert_l2_hdr_stats {
@@ -393,7 +393,7 @@ struct en_ehash_insert_l2_hdr_stats {
                 };
                 uint32_t word;
         };
-        uint8_t stats_offsets[0];               //array of offsets into stats base
+        uint8_t stats_offsets[];               //array of offsets into stats base
 }__attribute__ ((packed));
 
 
@@ -408,7 +408,7 @@ struct en_ehash_insert_vlan_hdr {
 		}__attribute__ ((packed));
 		uint32_t word;
 	}__attribute__ ((packed));
-	uint32_t vlanhdr[0];				/* array of vlan header includes TPID */
+	uint32_t vlanhdr[];				/* array of vlan header includes TPID */
 }__attribute__ ((packed));
 
 struct en_ehash_insert_vlan_hdr_stats {
@@ -469,7 +469,7 @@ struct en_ehash_insert_l3_hdr {
 		};
 		uint32_t word_1;
 	};
-        uint8_t l3hdr[0];               //l3 hdr padded to next 4 bytes boundary
+        uint8_t l3hdr[];               //l3 hdr padded to next 4 bytes boundary
 }__attribute__ ((packed));
 
 #define COPY_DSCP_OUTER_INNER (1U << 24)
