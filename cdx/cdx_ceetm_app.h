@@ -102,7 +102,7 @@ void RegisterCEETMHandler(FnHandler pCeetmGetQueue);
 int ceetm_create_lni(struct tQM_context_ctl *qm_ctx);
 int ceetm_init_channels(void);
 int ceetm_cfg_lni(struct tQM_context_ctl *qm_ctx, PQosShaperConfigCommand params);
-int ceetm_release_lni(void *handle);
+int ceetm_release_lni(void *handle, void *sp_handle);
 int ceetm_cfg_channel(void *handle, uint32_t rate, uint32_t limit, uint32_t bsize);
 int ceetm_cfg_class_queue(struct tQM_context_ctl *qm_ctx, uint32_t classque);
 int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);

@@ -526,7 +526,7 @@ int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 
 	net_dev = qm_ctx->net_dev;
 
-	if (ceetm_release_lni(qm_ctx->lni) != CEETM_SUCCESS)
+	if (ceetm_release_lni(qm_ctx->lni, qm_ctx->sp) != CEETM_SUCCESS)
 		ceetm_err("%s::ceetm_release_lni failed for %s\n",
 				__func__, iface_info->name);
 

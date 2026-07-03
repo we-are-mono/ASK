@@ -123,6 +123,7 @@ int cdx_init_skb_2bfreed_bpool(void);
 void print_ipsec_offload_pkt_count(void);
 void display_fq_info(void *handle);
 int cdx_init_fqid_procfs(void);
+void cdx_deinit_fqid_procfs(void);
 
 /* Exception packet handling */
 void print_ipsec_exception_pkt_cnt(void);

@@ -353,25 +353,36 @@ static int ceetm_cfg_shaper(void *ctx, uint32_t type, PQosShaperConfigCommand pa
 	return CEETM_SUCCESS;
 }
 
-/* release lni */
-int ceetm_release_lni(void *handle)
+/* release lni and its sub-portal.
+ *
+ * sp_handle must be the sub-portal claimed alongside the lni in
+ * ceetm_create_lni (the caller's qm_ctx->sp). lni->sp cannot be used
+ * here: it is bound only in ceetm_setup_lni, which runs on the first
+ * QoS configuration command — a port that is torn down before any QoS
+ * config (module-init failure, interface removed early) still holds
+ * the sp claim while lni->sp is NULL, and qman_ceetm_sp_release
+ * dereferences its argument unconditionally.
+ */
+int ceetm_release_lni(void *handle, void *sp_handle)
 {
 	struct qm_ceetm_lni *lni;
+	struct qm_ceetm_sp *sp;
 	uint32_t lni_index;
 
 	if (!handle)
 		return CEETM_FAILURE;
 	lni = (struct qm_ceetm_lni *)handle;
+	sp = (struct qm_ceetm_sp *)sp_handle;
 	lni_index = lni->idx;
-	ceetm_dbg("%s::releasing lni %p index %d\n", __func__, lni, lni_index);
-	if (!qman_ceetm_lni_release(lni)) {
-		if (qman_ceetm_sp_release(lni->sp)) {
-			ceetm_err("%s:sp release failed on lni %p(%d)\n", 
-				__func__, lni, lni->idx);
-			return CEETM_FAILURE;
-		}
-	} else {
+	ceetm_dbg("%s::releasing lni %p index %d sp %p\n", __func__, lni,
+			lni_index, sp);
+	if (qman_ceetm_lni_release(lni)) {
 		ceetm_err("%s:lni %p(%d) release failed\n", __func__, handle, lni_index);
+		return CEETM_FAILURE;
+	}
+	if (sp && qman_ceetm_sp_release(sp)) {
+		ceetm_err("%s:sp release failed on lni %p(%d)\n",
+			__func__, lni, lni_index);
 		return CEETM_FAILURE;
 	}
 	return CEETM_SUCCESS;

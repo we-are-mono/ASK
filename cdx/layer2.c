@@ -99,6 +99,12 @@ void remove_onif_by_index(U32 if_index)
 {
 	int i;
 
+	if (if_index >= L2_MAX_ONIF) {
+		printk(KERN_ERR "%s::onif index %u out of range\n",
+				__func__, if_index);
+		return;
+	}
+
 	IP_deleteCt_from_onif_index(if_index);
 
 	// disable route entries bound to this interface

@@ -179,14 +179,11 @@ static int cdx_init_device(void)
 
 static void cdx_module_deinit(void)
 {
-	int ii = (init_level - 1);
+	int ii;
 
-	while(1) {
+	for (ii = init_level - 1; ii >= 0; ii--) {
 		if (deinit_fn[ii])
 			deinit_fn[ii]();
-		if (!ii)
-			break;
-		ii--;
 	}
 	kfree(cdx_info);
 	return;
@@ -275,7 +272,8 @@ static int __init cdx_module_init(void)
 		goto exit;
 	}
 	/* creating a /proc/fqid_stats dir for listing fqids created by cdx module */
-	cdx_init_fqid_procfs();
+	if (cdx_init_fqid_procfs() == 0)
+		register_cdx_deinit_func(cdx_deinit_fqid_procfs);
 #ifdef CDX_DEBUG_KEY_ZEROING
 	if (cdx_ipsec_init_key_zeroing_probe() == 0)
 		register_cdx_deinit_func(cdx_ipsec_remove_key_zeroing_probe);
@@ -309,6 +307,7 @@ static int __init cdx_module_init(void)
 #ifdef DPA_IPSEC_OFFLOAD
 	if (cdx_dpa_ipsec_init()) {
 		printk("%s::dpa_ipsec start failed\n", __func__);
+		rc = -EIO;
 		goto exit;
 	}
 

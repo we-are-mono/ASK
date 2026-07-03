@@ -111,6 +111,21 @@ err:
 	return -1;
 }
 
+/* proc_remove is recursive, so this also drops the per-interface
+ * fqid dirs and files created under fqid_stats. Without it, a failed
+ * module init left proc entries whose proc_ops pointed into freed
+ * module text — any later read oopsed.
+ */
+void cdx_deinit_fqid_procfs(void)
+{
+	proc_remove(proc_fqid_dir);
+	proc_fqid_dir = NULL;
+	proc_tx_dir = NULL;
+	proc_pcd_dir = NULL;
+	proc_rx_dir = NULL;
+	proc_sa_dir = NULL;
+}
+
 int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 {
 	cdx_proc_dir_entry_t *proc_entry;
