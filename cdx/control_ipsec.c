@@ -26,9 +26,6 @@
 
 //#define CONTROL_IPSEC_DEBUG 1
 
-/* A24 GCM investigation — runtime evidence printks. Drop after diagnosis. */
-#define CDX_DEBUG_GCM 1
-
 #define SOCKET_NATT	0
 
 TIMER_ENTRY sa_timer;
@@ -338,20 +335,6 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 		sa->pSec_sa_context->cipher_data.cipher_key_len -= extra_size;
 	}
 
-#ifdef CDX_DEBUG_GCM
-	if (comb_mode) {
-		U8 *kbuf = sa->pSec_sa_context->cipher_data.cipher_key;
-		U32 klen = sa->pSec_sa_context->cipher_data.cipher_key_len;
-		printk(KERN_INFO "CDX_DEBUG_GCM cipher: alg=0x%x key_alg=%u key_bits=%u "
-				"post_trim_klen=%u extra=%u icvsz=%u blocksz=%u "
-				"split_key_len=%u salt=%02x%02x%02x%02x\n",
-				algo, key_alg, key_bits, klen, extra_size,
-				sa->icvsz, sa->blocksz,
-				sa->pSec_sa_context->auth_data.split_key_len,
-				kbuf[klen+0], kbuf[klen+1], kbuf[klen+2], kbuf[klen+3]);
-	}
-#endif
-
 	return 0;
 }
 
@@ -622,16 +605,8 @@ int IPsec_handle_SA_SET_KEYS(U16 *p, U16 Length)
 	if (sa == NULL)
 		return ERR_SA_UNKNOWN;
 	sa->pSec_sa_context->auth_data.auth_type = 0;
-#ifdef CDX_DEBUG_GCM
-	printk(KERN_INFO "CDX_DEBUG_GCM SET_KEYS sagd=%u num_keys=%u\n",
-			cmd.sagd, cmd.num_keys);
-#endif
 	for (i = 0;i<cmd.num_keys;i++) {
 		key = (PIPSec_key_desc)&cmd.keys[i];
-#ifdef CDX_DEBUG_GCM
-		printk(KERN_INFO "CDX_DEBUG_GCM SET_KEYS  [%d] type=%u alg=%u bits=%u\n",
-				i, key->key_type, key->key_alg, key->key_bits);
-#endif
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s(%d) key type %d, key alg %d, key bits %d \n",
 				__func__,__LINE__, key->key_type, key->key_alg,key->key_bits);

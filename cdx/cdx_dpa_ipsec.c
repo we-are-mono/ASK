@@ -44,8 +44,6 @@
  *                                       per-call completion atomic_t.
  */
 #ifdef DPA_IPSEC_OFFLOAD
-/* A24 GCM investigation — runtime evidence printks. Drop after diagnosis. */
-#define CDX_DEBUG_GCM 1
 #include <linux/delay.h>
 #include <linux/udp.h>
 #include "error.h"
@@ -1008,16 +1006,6 @@ skip_byte_copy:
 		uint32_t op_word = OP_PCLID_IPSEC_TUNNEL | sa_op |
 				pSec_sa_context->cipher_data.cipher_type |
 				pSec_sa_context->auth_data.auth_type;
-#ifdef CDX_DEBUG_GCM
-		printk(KERN_INFO "CDX_DEBUG_GCM op TUNNEL sagd=%u dir=%u op=0x%08x "
-				"(sa_op=0x%x cipher=0x%x auth=0x%x ckl=%u akl=%u skl=%u)\n",
-				sa->handle, sa->direction, op_word, sa_op,
-				pSec_sa_context->cipher_data.cipher_type,
-				pSec_sa_context->auth_data.auth_type,
-				pSec_sa_context->cipher_data.cipher_key_len,
-				pSec_sa_context->auth_data.auth_key_len,
-				pSec_sa_context->auth_data.split_key_len);
-#endif
 		/* Protocol specific operation */
 		append_operation(desc, op_word);
 	}
@@ -1025,10 +1013,6 @@ skip_byte_copy:
 		uint32_t op_word = OP_PCLID_IPSEC | sa_op |
 				pSec_sa_context->cipher_data.cipher_type |
 				pSec_sa_context->auth_data.auth_type;
-#ifdef CDX_DEBUG_GCM
-		printk(KERN_INFO "CDX_DEBUG_GCM op TRANSPORT sagd=%u dir=%u op=0x%08x\n",
-				sa->handle, sa->direction, op_word);
-#endif
 		/* Protocol specific operation */
 		append_operation(desc, op_word);
 	}
@@ -1985,18 +1969,6 @@ static int cdx_ipsec_build_in_sa_pdb(PSAEntry sa)
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
 	{
 		memcpy(sec_desc->pdb_dec.gcm.salt, salt, AES_GCM_SALT_LEN);
-#ifdef CDX_DEBUG_GCM
-		printk(KERN_INFO "CDX_DEBUG_GCM pdb_dec sagd=%u opts=0x%08x "
-				"salt=%02x%02x%02x%02x seq_hi=0x%08x seq_lo=0x%08x\n",
-				sa->handle,
-				be32_to_cpu(sec_desc->pdb_dec.options),
-				sec_desc->pdb_dec.gcm.salt[0],
-				sec_desc->pdb_dec.gcm.salt[1],
-				sec_desc->pdb_dec.gcm.salt[2],
-				sec_desc->pdb_dec.gcm.salt[3],
-				be32_to_cpu(sec_desc->pdb_dec.seq_num_ext_hi),
-				be32_to_cpu(sec_desc->pdb_dec.seq_num));
-#endif
 	}
 
 	/* CTR — RFC 3686: nonce trails the AES key, block-counter starts at 1 */
@@ -2163,20 +2135,6 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 			(sa->pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC))
 	{
 		memcpy(sec_desc->pdb_en.gcm.salt, salt,  AES_GCM_SALT_LEN);
-#ifdef CDX_DEBUG_GCM
-		printk(KERN_INFO "CDX_DEBUG_GCM pdb_en  sagd=%u opts=0x%08x spi(raw)=0x%08x "
-				"salt=%02x%02x%02x%02x seq_hi=0x%08x seq_lo=0x%08x ivsrc=%d\n",
-				sa->handle,
-				be32_to_cpu(sec_desc->pdb_en.options),
-				sec_desc->pdb_en.spi,
-				sec_desc->pdb_en.gcm.salt[0],
-				sec_desc->pdb_en.gcm.salt[1],
-				sec_desc->pdb_en.gcm.salt[2],
-				sec_desc->pdb_en.gcm.salt[3],
-				be32_to_cpu(sec_desc->pdb_en.seq_num_ext_hi),
-				be32_to_cpu(sec_desc->pdb_en.seq_num),
-				!!(be32_to_cpu(sec_desc->pdb_en.options) & PDBOPTS_ESP_IVSRC));
-#endif
 	}
 
 	/* CTR — RFC 3686. Per-packet 8-byte iv is filled by SEC under PDBOPTS_ESP_IVSRC. */
