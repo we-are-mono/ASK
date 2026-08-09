@@ -2479,6 +2479,22 @@ static int vwd_vap_configure(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *va
 	return 0;
 }
 
+/* Clear every netdev's wifi_offload_dev alias pointing at this VAP —
+ * the wifi netdev itself and any VLAN-on-vap device control_vlan
+ * copied the pointer onto. Caller holds rtnl (the ioctl entry takes
+ * it), which is what makes the netdev walk safe. */
+static void vwd_unpublish_vap(struct vap_desc_s *vap)
+{
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+	for_each_netdev(&init_net, dev) {
+		if (READ_ONCE(dev->wifi_offload_dev) ==
+				(struct net_device *)vap)
+			WRITE_ONCE(dev->wifi_offload_dev, NULL);
+	}
+}
+
 /** dpaa_vwd_handle_vap
  *
  */
@@ -2487,6 +2503,11 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 	int rc = 0, ii;
 	int create_sysfs = 0;
 	struct vap_desc_s *vap;
+	DECLARE_BITMAP(reset_mask, MAX_WIFI_VAPS);
+	DECLARE_BITMAP(open_mask, MAX_WIFI_VAPS);
+
+	bitmap_zero(reset_mask, MAX_WIFI_VAPS);
+	bitmap_zero(open_mask, MAX_WIFI_VAPS);
 
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO( "%s function called %d: %s\n", __func__, cmd->action, cmd->ifname);
@@ -2568,6 +2589,17 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 				rc = -1;
 				break;
 			}
+			/* Claim the slot (other ioctls are also rtnl-
+			 * serialized; the claim additionally keeps the exit
+			 * walk away), unpublish every wifi_offload_dev alias
+			 * and wait out in-flight lock-free consumers before
+			 * vwd_vap_down tears down the fq netdev links they
+			 * use. synchronize_rcu sleeps, hence the unlock. */
+			vap->state = VAP_ST_CONFIGURING;
+			spin_unlock_bh(&priv->vaplock);
+			vwd_unpublish_vap(vap);
+			synchronize_rcu();
+			spin_lock_bh(&priv->vaplock);
 			vwd_vap_down(priv, vap);
 
 			break;
@@ -2586,6 +2618,8 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			break;		
 		case RESET:
 			DPAWIFI_INFO("%s: RESET ...\n", __func__);
+			/* pass 1 (locked): claim OPEN slots and mark
+			 * everything that will drop to CLOSE */
 			for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
 				vap = &priv->vaps[ii];
 
@@ -2593,11 +2627,27 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 						vap->state == VAP_ST_CONFIGURING)
 					continue;
 
-				if (vap->state == VAP_ST_OPEN)
-					vwd_vap_down(priv, vap);
-				if (vap->state == VAP_ST_CONFIGURED) {
-					vap->state = VAP_ST_CLOSE;
+				if (vap->state == VAP_ST_OPEN) {
+					vap->state = VAP_ST_CONFIGURING;
+					__set_bit(ii, open_mask);
 				}
+				__set_bit(ii, reset_mask);
+			}
+			if (!bitmap_empty(reset_mask, MAX_WIFI_VAPS)) {
+				/* unpublish + grace period for the formerly
+				 * OPEN slots, outside the BH spinlock */
+				spin_unlock_bh(&priv->vaplock);
+				for_each_set_bit(ii, open_mask, MAX_WIFI_VAPS)
+					vwd_unpublish_vap(&priv->vaps[ii]);
+				if (!bitmap_empty(open_mask, MAX_WIFI_VAPS))
+					synchronize_rcu();
+				spin_lock_bh(&priv->vaplock);
+				for_each_set_bit(ii, open_mask, MAX_WIFI_VAPS)
+					vwd_vap_down(priv, &priv->vaps[ii]);
+				for_each_set_bit(ii, reset_mask, MAX_WIFI_VAPS)
+					priv->vaps[ii].state = VAP_ST_CLOSE;
+				/* per-vap sysfs attrs are removed after the
+				 * final unlock below */
 			}
 			break;
 
@@ -2616,6 +2666,11 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 					__func__, cmd->ifname);
 		}
 	}
+	/* RESET dropped these to CLOSE; drop their sysfs attrs too so a
+	 * later re-CONFIGURE doesn't double-create (device_remove_file
+	 * sleeps, so it runs here, after the unlock) */
+	for_each_set_bit(ii, reset_mask, MAX_WIFI_VAPS)
+		device_remove_file(priv->vwd_device, &dev_attr_vap[ii]);
 	return rc;
 
 }
@@ -2868,39 +2923,66 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO( "%s: %s\n", priv->name, __func__);
 #endif
+	DECLARE_BITMAP(attr_mask, MAX_WIFI_VAPS);
+	DECLARE_BITMAP(fq_mask, MAX_WIFI_VAPS);
+	struct net_device *dev;
+
+	bitmap_zero(attr_mask, MAX_WIFI_VAPS);
+	bitmap_zero(fq_mask, MAX_WIFI_VAPS);
+
 	wifi_rx_fastpath_unregister();
 	nf_unregister_net_hook(&init_net, &vwd_hook);
 	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
 	nf_unregister_net_hook(&init_net, &vwd_hook_bridge);
+	/* nf_unregister_net_hook only call_rcu()s the old entries array —
+	 * it does NOT wait — and the rx-fastpath unregister is a bare
+	 * pointer swap. Wait out in-flight classifiers/rx handlers here so
+	 * release_vap_fqs below can't free FQs under them. */
+	synchronize_rcu();
 
+	/* state transitions under the lock; sleeping teardown after */
+	spin_lock_bh(&priv->vaplock);
 	for (ii = 0; ii < MAX_WIFI_VAPS; ii++)
 	{
 		struct vap_desc_s *vap = &priv->vaps[ii];
-		struct net_device *wifi_dev = NULL;
 
-		if (vap->state == VAP_ST_OPEN) {
+		/* a CONFIGURING slot means an ADD is mid-flight through
+		 * the failed-init chardev window; leave it alone */
+		if (vap->state == VAP_ST_CONFIGURING)
+			continue;
+
+		if (vap->state == VAP_ST_OPEN)
 			vwd_vap_down(priv, vap);
-		}
-		release_vap_fqs(vap);
-
 		if (vap->state == VAP_ST_CONFIGURED) {
-
-			wifi_dev = dev_get_by_name(&init_net, vap->ifname);
-
-			if (wifi_dev) {
-				/* In struct net_device , wifi_offload_dev field is defined,
-				 * using this field to store the vap_desc_t structure pointer
-				 */
-				wifi_dev->wifi_offload_dev = NULL;
-				dev_put(wifi_dev);
-			}
-
+			__set_bit(ii, attr_mask);
 			vap->state = VAP_ST_CLOSE;
 		}
+		__set_bit(ii, fq_mask);
 	}
-
-
 	priv->vap_count = 0;
+	spin_unlock_bh(&priv->vaplock);
+
+	/* clear every wifi_offload_dev still pointing into the vap table —
+	 * covers the wifi netdevs and any VLAN-on-vap aliases; a stale
+	 * pointer surviving module unload would hand a later cdx instance
+	 * a dangling vap */
+	rtnl_lock();
+	for_each_netdev(&init_net, dev) {
+		struct net_device *p = READ_ONCE(dev->wifi_offload_dev);
+
+		if ((void *)p >= (void *)&priv->vaps[0] &&
+		    (void *)p < (void *)&priv->vaps[MAX_WIFI_VAPS])
+			WRITE_ONCE(dev->wifi_offload_dev, NULL);
+	}
+	rtnl_unlock();
+
+	for (ii = 0; ii < MAX_WIFI_VAPS; ii++)
+	{
+		if (test_bit(ii, fq_mask))
+			release_vap_fqs(&priv->vaps[ii]);
+		if (test_bit(ii, attr_mask))
+			device_remove_file(priv->vwd_device, &dev_attr_vap[ii]);
+	}
 	dpaa_vwd_sysfs_exit();
 
 	return 0;
