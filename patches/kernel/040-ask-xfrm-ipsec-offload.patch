@@ -1,6 +1,6 @@
-From ef6123c134436d0769d2a5a9e997bc2a116906c4 Mon Sep 17 00:00:00 2001
+From 41d1abf5fa34cf23c16293d9ed5830c8139a93a1 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
-Date: Thu, 23 Apr 2026 17:55:40 +0200
+Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
 
 Adds the IPsec fast-path offload: a new net/xfrm/ipsec_flow.c/.h pair
@@ -15,28 +15,34 @@ for SEC's view of the IPsec descriptor layout, the net/key/af_key.c
 integration, and xfrm.h/netns/xfrm.h additions (xfrm_state.handle/byh,
 netns_xfrm.state_byh, xfrm_input_shared) plus pfkeyv2.h UAPI.
 
+Compiles warning-free: the offload entry points are declared in
+include/net/xfrm.h instead of per-file externs, __xfrm_state_lookup_byhandle
+is static, and the A24a GCM-refusal gate drops an always-true NULL check
+on the aead alg_name array.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  drivers/crypto/caam/pdb.h    |  12 +-
  include/net/ip6_tunnel.h     |   4 +-
  include/net/netns/xfrm.h     |   3 +
- include/net/xfrm.h           |  47 +++
+ include/net/xfrm.h           |  59 +++
  include/uapi/linux/pfkeyv2.h |   1 +
  net/ipv4/Kconfig             |   6 +
  net/ipv4/xfrm4_policy.c      |  13 +
  net/ipv6/Kconfig             |   6 +
  net/ipv6/xfrm6_policy.c      |  10 +
- net/key/af_key.c             | 886 +++++++++++++++++++++++++++++++++++++++++++
+ net/key/af_key.c             | 897 +++++++++++++++++++++++++++++++++++
  net/xfrm/Makefile            |   1 +
- net/xfrm/ipsec_flow.c        | 221 +++++++++++
+ net/xfrm/ipsec_flow.c        | 221 +++++++++
  net/xfrm/ipsec_flow.h        |  31 ++
  net/xfrm/xfrm_input.c        |  14 +
- net/xfrm/xfrm_output.c       |  95 +++++
- net/xfrm/xfrm_policy.c       |  94 +++++
- net/xfrm/xfrm_state.c        | 165 ++++++++
+ net/xfrm/xfrm_output.c       |  95 ++++
+ net/xfrm/xfrm_policy.c       |  90 ++++
+ net/xfrm/xfrm_state.c        | 165 +++++++
  net/xfrm/xfrm_user.c         |   4 +
- 18 files changed, 1606 insertions(+), 7 deletions(-)
-
+ 18 files changed, 1625 insertions(+), 7 deletions(-)
+ create mode 100644 net/xfrm/ipsec_flow.c
+ create mode 100644 net/xfrm/ipsec_flow.h
 
 diff --git a/drivers/crypto/caam/pdb.h b/drivers/crypto/caam/pdb.h
 index 4b1bcf53f7ac..1669e0d267e3 100644
@@ -126,7 +132,7 @@ index 23dd647fe024..9c7c9758e5e1 100644
  	struct hlist_head	 __percpu *state_cache_input;
  	unsigned int		state_hmask;
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index 1484dd15a369..6a0225dbaf4f 100644
+index 1484dd15a369..06a0fc04ad66 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
 @@ -183,6 +183,12 @@ struct xfrm_state {
@@ -154,7 +160,7 @@ index 1484dd15a369..6a0225dbaf4f 100644
  	u8			dir;
  };
  
-@@ -320,6 +331,13 @@ enum {
+@@ -320,6 +331,25 @@ enum {
  	XFRM_STATE_EXPIRED,
  	XFRM_STATE_DEAD
  };
@@ -164,11 +170,23 @@ index 1484dd15a369..6a0225dbaf4f 100644
 +	 XFRM_STATE_DIR_IN,
 +	 XFRM_STATE_DIR_OUT,
 +};
++
++/* ASK IPsec offload glue (xfrm_policy.c, xfrm_state.c, ipsec_flow.c,
++ * af_key.c); some symbols also consumed by the out-of-tree cdx module. */
++int xfrm_get_tos(const struct flowi *fl, int family);
++struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
++int ipsec_flow_init(struct net *net);
++void ipsec_flow_fini(struct net *net);
++void flow_cache_remove(const struct flowi *fl, unsigned short family,
++		unsigned short dir);
++int ipsec_nlkey_flow(u16 xfrm_nr, u16 *xfrm_handle, const struct flowi *fl,
++		u16 family, u16 dir, u16 ignore_neigh);
++int ipsec_nlkey_flow_remove(struct flowi *fl, u16 family, u16 dir);
 +#endif
  
  /* callback structure passed from either netlink or pfkey */
  struct km_event {
-@@ -1114,6 +1132,35 @@ struct sec_path {
+@@ -1114,6 +1144,35 @@ struct sec_path {
  
  struct sec_path *secpath_set(struct sk_buff *skb);
  
@@ -296,10 +314,10 @@ index 1f19b6f14484..090c1456274f 100644
  
  	err = dst->error;
 diff --git a/net/key/af_key.c b/net/key/af_key.c
-index c56bb4f451e6..7225be6880e1 100644
+index c56bb4f451e6..981e968541c4 100644
 --- a/net/key/af_key.c
 +++ b/net/key/af_key.c
-@@ -26,8 +26,183 @@
+@@ -26,8 +26,178 @@
  #include <net/net_namespace.h>
  #include <net/netns/generic.h>
  #include <net/xfrm.h>
@@ -319,9 +337,6 @@ index c56bb4f451e6..7225be6880e1 100644
 +#include <net/dsfield.h>
 +#include <net/inet_ecn.h>
 +#include <net/ipv6.h>
-+
-+
-+extern int xfrm_get_tos(struct flowi *fl, int family);
 +
 +
 +#define	NLKEY_SA_CREATE		0x0A01
@@ -472,8 +487,6 @@ index c56bb4f451e6..7225be6880e1 100644
 +					const struct km_event *c, unsigned short *msg_id);
 +static int ipsec_nlkey_set_said(struct net *net, struct xfrm_state *x, const struct km_event *c, struct nlkey_sa_id *said);
 +
-+void flow_cache_remove(const struct flowi *fl, unsigned short family,
-+		unsigned short dir);
 +/* netlink NETLINK_KEY socket */
 +struct sock *nlkey_socket = NULL;
 +
@@ -483,7 +496,7 @@ index c56bb4f451e6..7225be6880e1 100644
  
  #define _X2KEY(x) ((x) == XFRM_INF ? 0 : (x))
  #define _KEY2X(x) ((x) == 0 ? XFRM_INF : (x))
-@@ -876,6 +1051,10 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
+@@ -876,6 +1046,10 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
  		sa->sadb_sa_flags |= SADB_SAFLAGS_DECAP_DSCP;
  	if (x->props.flags & XFRM_STATE_NOPMTUDISC)
  		sa->sadb_sa_flags |= SADB_SAFLAGS_NOPMTUDISC;
@@ -494,7 +507,7 @@ index c56bb4f451e6..7225be6880e1 100644
  
  	/* hard time */
  	if (hsc & 2) {
-@@ -908,6 +1087,11 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
+@@ -908,6 +1082,11 @@ static struct sk_buff *__pfkey_xfrm_state2msg(const struct xfrm_state *x,
  	lifetime->sadb_lifetime_bytes = x->curlft.bytes;
  	lifetime->sadb_lifetime_addtime = x->curlft.add_time;
  	lifetime->sadb_lifetime_usetime = x->curlft.use_time;
@@ -506,7 +519,7 @@ index c56bb4f451e6..7225be6880e1 100644
  	/* src address */
  	addr = skb_put(skb, sizeof(struct sadb_address) + sockaddr_size);
  	addr->sadb_address_len =
-@@ -1133,6 +1317,10 @@ static struct xfrm_state * pfkey_msg2xfrm_state(struct net *net,
+@@ -1133,6 +1312,10 @@ static struct xfrm_state * pfkey_msg2xfrm_state(struct net *net,
  		x->props.flags |= XFRM_STATE_DECAP_DSCP;
  	if (sa->sadb_sa_flags & SADB_SAFLAGS_NOPMTUDISC)
  		x->props.flags |= XFRM_STATE_NOPMTUDISC;
@@ -517,7 +530,7 @@ index c56bb4f451e6..7225be6880e1 100644
  
  	lifetime = ext_hdrs[SADB_EXT_LIFETIME_HARD - 1];
  	if (lifetime != NULL) {
-@@ -3076,6 +3264,12 @@ static int pfkey_send_notify(struct xfrm_state *x, const struct km_event *c)
+@@ -3076,6 +3259,12 @@ static int pfkey_send_notify(struct xfrm_state *x, const struct km_event *c)
  	struct net *net = x ? xs_net(x) : c->net;
  	struct netns_pfkey *net_pfkey = net_generic(net, pfkey_net_id);
  
@@ -530,13 +543,12 @@ index c56bb4f451e6..7225be6880e1 100644
  	if (atomic_read(&net_pfkey->socks_nr) == 0)
  		return 0;
  
-@@ -3863,6 +4057,704 @@ static struct xfrm_mgr pfkeyv2_mgr =
+@@ -3863,6 +4052,703 @@ static struct xfrm_mgr pfkeyv2_mgr =
  	.is_alive	= pfkey_is_alive,
  };
  
 +
 +#ifdef NLKEY_SUPPORT
-+extern struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
 +
 +static unsigned short ipsec_sacode_to_nlkeycode(unsigned short sa_code)
 +{
@@ -798,7 +810,7 @@ index c56bb4f451e6..7225be6880e1 100644
 +				 * never reaches cmm/cdx; kernel xfrm via caamalg_qi.c
 +				 * (non-protocol AEAD) handles GCM with unique seqs by
 +				 * construction. See ISSUES.md A24a. */
-+				if (x->aead && x->aead->alg_name &&
++				if (x->aead &&
 +				    (strstr(x->aead->alg_name, "rfc4106(gcm") ||
 +				     strstr(x->aead->alg_name, "rfc4543(gcm"))) {
 +					pr_info("ASK: %s offload disabled (A24a) — software xfrm\n",
@@ -1235,7 +1247,7 @@ index c56bb4f451e6..7225be6880e1 100644
  static int __net_init pfkey_net_init(struct net *net)
  {
  	struct netns_pfkey *net_pfkey = net_generic(net, pfkey_net_id);
-@@ -3897,6 +4789,11 @@ static void __exit ipsec_pfkey_exit(void)
+@@ -3897,6 +4783,11 @@ static void __exit ipsec_pfkey_exit(void)
  	sock_unregister(PF_KEY);
  	unregister_pernet_subsys(&pfkey_net_ops);
  	proto_unregister(&key_proto);
@@ -1247,7 +1259,7 @@ index c56bb4f451e6..7225be6880e1 100644
  }
  
  static int __init ipsec_pfkey_init(void)
-@@ -3913,6 +4810,12 @@ static int __init ipsec_pfkey_init(void)
+@@ -3913,6 +4804,12 @@ static int __init ipsec_pfkey_init(void)
  	if (err != 0)
  		goto out_unregister_pernet;
  	xfrm_register_km(&pfkeyv2_mgr);
@@ -1746,7 +1758,7 @@ index a30538a980cc..06a66b6aae92 100644
  	WARN_ON_ONCE(1);
  	return -EAFNOSUPPORT;
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index 2c42d83fbaa2..6e59a2b10409 100644
+index 2c42d83fbaa2..43c9182f71f0 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
 @@ -48,6 +48,11 @@
@@ -1761,23 +1773,19 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  
  #define XFRM_QUEUE_TMO_MIN ((unsigned)(HZ/10))
  #define XFRM_QUEUE_TMO_MAX ((unsigned)(60*HZ))
-@@ -179,6 +184,15 @@ static struct xfrm_policy_afinfo const __rcu *xfrm_policy_afinfo[AF_INET6 + 1]
+@@ -179,6 +184,11 @@ static struct xfrm_policy_afinfo const __rcu *xfrm_policy_afinfo[AF_INET6 + 1]
  
  static struct kmem_cache *xfrm_dst_cache __ro_after_init;
  
 +#ifdef IPSEC_FLOW_CACHE
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+extern int ipsec_nlkey_flow(u16 xfrm_nr, u16 *xfrm_handle,
-+		const struct flowi *fl, u16 family, u16 dir, u16 ignore_neigh);
-+int ipsec_flow_init(struct net *net);
-+void ipsec_flow_fini(struct net *net);
 +#endif
 +#endif
 +
  static struct rhashtable xfrm_policy_inexact_table;
  static const struct rhashtable_params xfrm_pol_inexact_params;
  
-@@ -2590,7 +2604,11 @@ xfrm_tmpl_resolve(struct xfrm_policy **pols, int npols, const struct flowi *fl,
+@@ -2590,7 +2600,11 @@ xfrm_tmpl_resolve(struct xfrm_policy **pols, int npols, const struct flowi *fl,
  
  }
  
@@ -1789,7 +1797,7 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  {
  	if (family == AF_INET)
  		return fl->u.ip4.flowi4_tos & INET_DSCP_MASK;
-@@ -2656,6 +2674,9 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+@@ -2656,6 +2670,9 @@ static inline int xfrm_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
  
  	return err;
  }
@@ -1799,7 +1807,7 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  
  
  /* Allocate chain of dst_entry's, attach known xfrm's, calculate
-@@ -3290,6 +3311,35 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
+@@ -3290,6 +3307,35 @@ struct dst_entry *xfrm_lookup_with_ifid(struct net *net,
  		dst = dst_orig;
  	}
  
@@ -1835,7 +1843,7 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  ok:
  	xfrm_pols_put(pols, drop_pols);
  	if (dst && dst->xfrm &&
-@@ -3847,6 +3897,31 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+@@ -3847,6 +3893,31 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
  			goto reject;
  		}
  
@@ -1867,7 +1875,7 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  		xfrm_pols_put(pols, npols);
  		sp->verified_cnt = k;
  
-@@ -4316,6 +4391,14 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4316,6 +4387,14 @@ static int __net_init xfrm_net_init(struct net *net)
  	if (rv < 0)
  		goto out_sysctl;
  
@@ -1882,7 +1890,7 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  	rv = xfrm_nat_keepalive_net_init(net);
  	if (rv < 0)
  		goto out_nat_keepalive;
-@@ -4323,6 +4406,12 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4323,6 +4402,12 @@ static int __net_init xfrm_net_init(struct net *net)
  	return 0;
  
  out_nat_keepalive:
@@ -1895,7 +1903,7 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  	xfrm_sysctl_fini(net);
  out_sysctl:
  	xfrm_policy_fini(net);
-@@ -4337,6 +4426,11 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4337,6 +4422,11 @@ static int __net_init xfrm_net_init(struct net *net)
  static void __net_exit xfrm_net_exit(struct net *net)
  {
  	xfrm_nat_keepalive_net_fini(net);
@@ -1908,7 +1916,7 @@ index 2c42d83fbaa2..6e59a2b10409 100644
  	xfrm_policy_fini(net);
  	xfrm_state_fini(net);
 diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
-index 6f99fd2d966c..38a0386a7162 100644
+index 6f99fd2d966c..730268e115c2 100644
 --- a/net/xfrm/xfrm_state.c
 +++ b/net/xfrm/xfrm_state.c
 @@ -58,6 +58,9 @@ static inline bool xfrm_state_hold_rcu(struct xfrm_state __rcu *x)
@@ -2139,7 +2147,7 @@ index 6f99fd2d966c..38a0386a7162 100644
  EXPORT_SYMBOL(xfrm_state_lookup_byaddr);
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+struct xfrm_state *__xfrm_state_lookup_byhandle(struct net *net, u16 handle)
++static struct xfrm_state *__xfrm_state_lookup_byhandle(struct net *net, u16 handle)
 +{
 +	unsigned int h = (handle & net->xfrm.state_hmask);
 +	struct xfrm_state *x;
@@ -2243,3 +2251,6 @@ index d41e5642625e..0f8543738ab2 100644
  	put_unaligned(x->stats.replay_window, &p->stats.replay_window);
  	put_unaligned(x->stats.replay, &p->stats.replay);
  	put_unaligned(x->stats.integrity_failed, &p->stats.integrity_failed);
+-- 
+2.47.3
+
