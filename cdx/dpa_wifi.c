@@ -88,8 +88,18 @@ static DEFINE_PER_CPU(unsigned int, num_tx_done);
  * Concurrency (VWD, virtual wifi driver):
  *   vwd.vaplock (spinlock_t in dpaa_vwd_priv_s)
  *      - Guards the VAP table (vwd.vap[] and dev_attr_vap[]) and
- *        the associated sysfs attribute bindings. Taken on ioctl
- *        register/unregister paths and by stats readers.
+ *        the associated sysfs attribute bindings. Taken _bh on the
+ *        ioctl paths and by the softirq classifiers/rx fastpath, so
+ *        NOTHING may sleep under it. Sleeping VAP setup (vwd_vap_up:
+ *        GFP_KERNEL allocs, qman FQ creation; device_create_file)
+ *        runs outside the lock: the ioctl handler claims the slot
+ *        with VAP_ST_CONFIGURING under the lock, drops it for the
+ *        work, and re-takes it to publish VAP_ST_OPEN or roll back.
+ *        Datapath consumers key on net_dev->wifi_offload_dev (the
+ *        nf-hook classifiers and the lock-free ipsec xmit hook —
+ *        release-published only after the FQs are live) or on
+ *        VAP_ST_OPEN (the rx fastpath), so they never observe a
+ *        half-built VAP.
  *   vwd.txlock (spinlock_t)
  *      - Guards the tx-path state used by dpaa_vwd_send_packet and
  *        the netfilter route/bridge hooks. Taken in softirq
@@ -2360,8 +2370,8 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 		dev_put(wifi_dev);
 		return -1;
 	}
-	if (get_ofport_info(FMAN_IDX, priv->oh_port_handle, &vap->channel, 
-				&vap->td[0])) 
+	if (get_ofport_info(FMAN_IDX, priv->oh_port_handle, &vap->channel,
+				&vap->td[0]))
 	{
 		dev_put(wifi_dev);
 		return -1;
@@ -2374,23 +2384,19 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 	vap->direct_tx_path = 0;
 	memcpy(vap->macaddr, cmd->macaddr, ETH_ALEN);
 	vap->wifi_dev = wifi_dev;
-
-	/* In struct net_device , wifi_offload_dev field is defined,
-	 * using this field to store the vap_desc_t structure pointer
-	 */
-	wifi_dev->wifi_offload_dev = (struct net_device *)vap;
 	vap->vwd = priv;
 
-	dev_put(wifi_dev);
 	/* vap->wlan_fq_to_fman is NULL means so far this interface is not up. If it gets up first time
 	   it creates all the frame queues. These frame queues can delete only cdx module gets unloaded.*/
 	if (!vap->wlan_fq_to_fman)
 	{
 		/* create frame queues */
 		if (create_vap_fqs(vap)) {
-			DPAWIFI_ERROR("%s::unable to create vap fqs for device %s\n", 
+			DPAWIFI_ERROR("%s::unable to create vap fqs for device %s\n",
 					__func__, &cmd->ifname[0]);
-			release_vap_fqs(vap);	
+			release_vap_fqs(vap);
+			vap->wifi_dev = NULL;
+			dev_put(wifi_dev);
 			return -1;
 		}
 	}
@@ -2398,7 +2404,18 @@ static int vwd_vap_up(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *vap, stru
 	{
 		set_vap_fqs_netdev(vap);
 	}
-	vap->state = VAP_ST_OPEN;
+
+	/* In struct net_device , wifi_offload_dev field is defined,
+	 * using this field to store the vap_desc_t structure pointer.
+	 * Published only now, after the FQs are live: the ipsec xmit
+	 * hook consumes this pointer lock-free, so a release-publish
+	 * after the FQ stores is what keeps it from seeing a half-built
+	 * VAP. The caller flips vap->state to VAP_ST_OPEN under vaplock.
+	 */
+	smp_store_release(&wifi_dev->wifi_offload_dev,
+			(struct net_device *)vap);
+
+	dev_put(wifi_dev);
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s: UP: name:%s, vapid:%d, direct_rx_path : %s, ifindex:%d, mac:%x:%x:%x:%x:%x:%x\n",
 			__func__, vap->ifname, vap->vapid,
@@ -2423,12 +2440,14 @@ static int vwd_vap_down(struct dpaa_vwd_priv_s *priv , struct vap_desc_s *vap)
 			vap->macaddr[4], vap->macaddr[5] );
 #endif
 
+	/* unpublish from the lock-free ipsec xmit hook first, then tear
+	 * down the fq netdev links it would have used */
+	if(vap->wifi_dev)
+		WRITE_ONCE(vap->wifi_dev->wifi_offload_dev, NULL);
+
 	reset_vap_fqs_netdev(vap);
 
 	vap->state = VAP_ST_CONFIGURED;
-
-	if(vap->wifi_dev)
-		vap->wifi_dev->wifi_offload_dev =  NULL;
 
 	vap->wifi_dev = NULL;
 	priv->vap_count--;
@@ -2466,6 +2485,7 @@ static int vwd_vap_configure(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *va
 static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *cmd )
 {
 	int rc = 0, ii;
+	int create_sysfs = 0;
 	struct vap_desc_s *vap;
 
 #ifdef DPA_WIFI_DEBUG
@@ -2496,15 +2516,9 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			if (!(rc = vwd_vap_configure(priv, vap, cmd)))
 			{
 				DPAWIFI_INFO("%s: Configured VAP (id : %d  name : %s)\n", __func__, cmd->vapid, cmd->ifname);
-
-                                spin_unlock_bh(&priv->vaplock);
-                                /* Create sysfs entry for vap interface */
-                                if(device_create_file(priv->vwd_device, &dev_attr_vap[cmd->vapid])) {
-                                        DPAWIFI_ERROR("%s::unable to create sysfs entry for vap iface %s\n",
-                                                        __func__, cmd->ifname);
-                                }
-                                spin_lock_bh(&priv->vaplock);
-
+				/* device_create_file sleeps; do it after the
+				 * final unlock below */
+				create_sysfs = 1;
 			}
 			else
 			{
@@ -2523,13 +2537,27 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 				break;
 			}
 
-
-			rc = vwd_vap_up(priv,vap,cmd);
+			/* vwd_vap_up sleeps (GFP_KERNEL allocs, qman FQ
+			 * setup) and must not run under the BH spinlock the
+			 * softirq classifiers share. Claim the slot so
+			 * concurrent ioctls see it mid-transition and bail;
+			 * the classifiers and the ipsec xmit hook key on
+			 * VAP_ST_OPEN / wifi_offload_dev and stay away. */
+			vap->state = VAP_ST_CONFIGURING;
+			spin_unlock_bh(&priv->vaplock);
+			rc = vwd_vap_up(priv, vap, cmd);
+			spin_lock_bh(&priv->vaplock);
 			if (rc < 0)
 			{
 				DPAWIFI_ERROR("%s : VAP (id : %d  name : %s) is not UP \n",
 						__func__, cmd->vapid, cmd->ifname);
+				vap->state = VAP_ST_CONFIGURED;
 				rc = -1;
+			}
+			else
+			{
+				vap->state = VAP_ST_OPEN;
+				priv->vap_count++;
 			}
 			break;
 		case REMOVE:
@@ -2545,6 +2573,12 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			break;
 		case UPDATE:
 			DPAWIFI_INFO("%s: UPDATE ... %s\n", __func__, cmd->ifname);
+			if (vap->state == VAP_ST_CONFIGURING) {
+				/* an ADD is mid-flight outside the lock;
+				 * updating its fields now would race it */
+				rc = -1;
+				break;
+			}
 			vap->ifindex = cmd->ifindex;
 			vap->direct_rx_path = cmd->direct_rx_path;
 			vap->no_l2_itf = cmd->no_l2_itf;
@@ -2555,7 +2589,8 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
 				vap = &priv->vaps[ii];
 
-				if (vap->state == VAP_ST_CLOSE)
+				if (vap->state == VAP_ST_CLOSE ||
+						vap->state == VAP_ST_CONFIGURING)
 					continue;
 
 				if (vap->state == VAP_ST_OPEN)
@@ -2573,6 +2608,14 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 	}
 
 	spin_unlock_bh(&priv->vaplock);
+
+	if (create_sysfs) {
+		/* Create sysfs entry for vap interface */
+		if (device_create_file(priv->vwd_device, &dev_attr_vap[cmd->vapid])) {
+			DPAWIFI_ERROR("%s::unable to create sysfs entry for vap iface %s\n",
+					__func__, cmd->ifname);
+		}
+	}
 	return rc;
 
 }
