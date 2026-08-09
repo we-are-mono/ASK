@@ -47,6 +47,17 @@ stale line refs) are folded into the archive one-liners.
   reset). Test-tooling workaround: gate each boot on eth4 rx>0 (reboot until
   alive) and pin static neighbors on both LAN peers.
 
+- [ ] **N18. SA key DMA buffers are unmapped at descriptor-build time while the
+  descriptor's KEY commands keep referencing their bus addresses.**
+  `cdx_ipsec_create_shareddescriptor` maps the auth/cipher keys, embeds the
+  dma_addr in KEY commands, then unmaps before returning — every SEC job
+  thereafter DMA-reads through addresses the kernel considers unmapped
+  (works today because the streaming mapping is identity/coherent on this
+  SoC, but it is a use-after-unmap by the DMA-API contract and would break
+  under an IOMMU/SWIOTLB config). Long-standing NXP pattern, surfaced
+  during the A24 audit; needs keys kept mapped for the SA lifetime (or
+  inlined into the descriptor as immediates).
+
 - [ ] **N17. cmm-programmed IPsec inner flows are heavily lossy.** With the
   LAN alive and an SA installed, tunnel TCP completes but with ~80x the
   retransmits once cmm programs the inner flow (941 vs 12 retx over 8 s at

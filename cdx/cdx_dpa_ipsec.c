@@ -1166,8 +1166,11 @@ skip_byte_copy:
 #endif
 	if (desc_len(desc) >= MAX_CAAM_SHARED_DESCSIZE) {
 		printk("%s:: Descriptor length increased more than 50 words :%x \n", __func__, desc_len(desc));
+		/* shared_desc is MAX_SHARED_DESC_SIZE (62) words — zeroing to
+		 * MAX_CAAM_DESCSIZE (64) overran the array by 8 bytes into the
+		 * preheader alignment slack */
 		memset((uint8_t *)desc + sa->stats_offset, 0,
-				MAX_CAAM_DESCSIZE * sizeof(u32) -
+				MAX_SHARED_DESC_SIZE * sizeof(u32) -
 				sa->stats_offset);
 		return -EPERM;
 	}
@@ -2360,10 +2363,11 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 			/* The extended builders lack the per-job PDB store
 			 * that keeps GCM sequence state coherent across
 			 * DECOs. A GCM descriptor fits the normal builder
-			 * with >20 words to spare, so this is unreachable
-			 * today; refuse loudly rather than corrupt quietly
-			 * if that ever changes. The SA then stays on kernel
-			 * xfrm. */
+			 * (worst case, IPv6 tunnel + NAT-T with L2 copy,
+			 * builds ~45 words against the 50-word limit), so
+			 * this is unreachable today; refuse loudly rather
+			 * than corrupt quietly if that ever changes. The SA
+			 * then stays on kernel xfrm. */
 			if (cdx_ipsec_cipher_is_gcm(
 					psec_sa_context->cipher_data.cipher_type)) {
 				log_err("GCM SA spi %d needs an extended descriptor; not supported\n",
@@ -2422,7 +2426,9 @@ done_shared_desc:
 	dma_unmap_single(jrdev_g, crypto_key_dma,
 			psec_sa_context->cipher_data.cipher_key_len,
 			DMA_TO_DEVICE);
-	if (psec_sa_context->auth_data.split_key_pad_len)
+	/* mirror the map-site guard (split_key_len); the mapped length is
+	 * still split_key_pad_len */
+	if (psec_sa_context->auth_data.split_key_len)
 		dma_unmap_single(jrdev_g, auth_key_dma,
 				psec_sa_context->auth_data.split_key_pad_len,
 				DMA_TO_DEVICE);
@@ -2447,7 +2453,9 @@ err_unmap_crypto:
 			psec_sa_context->cipher_data.cipher_key_len,
 			DMA_TO_DEVICE);
 err_unmap_auth:
-	if (psec_sa_context->auth_data.split_key_pad_len)
+	/* mirror the map-site guard (split_key_len); the mapped length is
+	 * still split_key_pad_len */
+	if (psec_sa_context->auth_data.split_key_len)
 		dma_unmap_single(jrdev_g, auth_key_dma,
 				psec_sa_context->auth_data.split_key_pad_len,
 				DMA_TO_DEVICE);

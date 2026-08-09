@@ -22,6 +22,8 @@ side (DNCPE-2358).
 Compiles warning-free: the offload entry points are declared in
 include/net/xfrm.h instead of per-file externs and
 __xfrm_state_lookup_byhandle is static.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  drivers/crypto/caam/pdb.h    |  12 +-
  include/net/ip6_tunnel.h     |   4 +-
