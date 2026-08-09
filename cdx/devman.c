@@ -70,6 +70,21 @@
  *        is why plain spin_lock() is sufficient — there are no
  *        softirq takers; do not add one without switching the
  *        discipline to _bh.
+ *        Serialization invariant (remove-side): every UNLINK/FREE
+ *        of a live node holds the FCI dispatcher's ctrl mutex
+ *        (dpa_release_interface's only caller chain is FCI
+ *        cmdprocs; the deinit-path tx_exit runs under the same
+ *        mutex via cdx_ctrl_deinit). ADDS are not all
+ *        mutex-covered — the boot-time set_dpa_params injection
+ *        ioctl publishes fresh nodes under dpa_cfg_lock only — but
+ *        fresh-node publication can't invalidate a reader. The
+ *        spinlock covers readers outside the mutex
+ *        (virt_iface_stats_callback via dev_get_stats) and any FCI
+ *        reader that wants local invariants. Lock-free lookups in
+ *        FCI-only paths lean on the remove-side invariant; see
+ *        dpa_get_iface_stats_entries. Non-FCI lock-free walkers
+ *        (vwd init/ioctl, devoh injection) are tracked in
+ *        ISSUES.md N10.
  *   dpa_interface_info (file-scope head pointer)
  *      - Protected by dpa_devlist_lock.
  *
@@ -1793,8 +1808,11 @@ int dpa_get_iface_stats_entries(uint32_t iif_index,
 {
 	struct dpa_iface_info *iface_info, *parent;
 
-	/*spin_lock(&dpa_devlist_lock);*/
-
+	/* lock-free lookups and parent-chain walks are safe here: this
+	 * runs only from FCI-dispatched hw-entry creation, and every
+	 * unlink/free of a live node is likewise FCI-dispatched — the
+	 * dispatcher's ctrl mutex serializes us against the frees
+	 * (non-mutex adds only publish fresh nodes). */
 	iface_info = dpa_get_ifinfo_by_itfid(iif_index);
 	if (!iface_info) {
 		DPA_ERROR("%s::iface is NULL\n", __func__);
@@ -1908,51 +1926,58 @@ void dpa_release_interface(uint32_t itf_id)
 	spin_lock(&dpa_devlist_lock);
 	curr_info = dpa_interface_info;
 	while (curr_info) {
-		if(curr_info->itf_id == itf_id) {
-
-			if (prev_info)
-				prev_info->next = curr_info->next;
-			else
-				dpa_interface_info =  curr_info->next;
-
-#ifdef DEVMAN_DEBUG
-			printk("%s::removed iface %s, type %d\n",
-					__func__, curr_info->name,
-					curr_info->if_flags);
-#endif		
-			if(curr_info->if_flags & IF_TYPE_PPPOE)
-				iface_pppoe_count--;
-			else
-				iface_count--;
-
-			if((curr_info->if_flags	& IF_TYPE_ETHERNET) && (curr_info->eth_info.net_dev))
-			{
-				/* Reverse of dpa_add_eth_if() acquisition order:
-				 * CEETM → discard mask → FF policer → virt storage profile → netdev ref. */
-#ifdef ENABLE_EGRESS_QOS
-				cdx_disable_ceetm_on_iface(curr_info);
-#endif
-#ifdef DPA_IPSEC_OFFLOAD
-				dpa_bman_restore_discard_mask(curr_info);
-#endif
-				dpa_remove_ethport_ff_policier_profile(curr_info);
-				dpa_remove_virt_storage_profile(&curr_info->eth_info);
-				/* unpublish the stats slot from the driver before
-				 * free_stats below returns it to the freelist */
-				dpa_reset_eth_ifinfo(netdev_priv(curr_info->eth_info.net_dev));
-				dev_put(curr_info->eth_info.net_dev);
-			}
-			/* free stats */
-			free_stats(curr_info);
-			/* free iface structure */
-			kfree(curr_info);
-			goto func_ret;
-		}
+		if (curr_info->itf_id == itf_id)
+			break;
 		prev_info = curr_info;
 		curr_info = curr_info->next;
 	}
-func_ret:
+	if (!curr_info) {
+		spin_unlock(&dpa_devlist_lock);
+		return;
+	}
+
+	if (prev_info)
+		prev_info->next = curr_info->next;
+	else
+		dpa_interface_info = curr_info->next;
+
+	if (curr_info->if_flags & IF_TYPE_PPPOE)
+		iface_pppoe_count--;
+	else
+		iface_count--;
 	spin_unlock(&dpa_devlist_lock);
+
+	/* Unlinked: the dev_get_stats reader can no longer reach the
+	 * node, and every other unlink/free holds the FCI dispatcher
+	 * mutex we are called under — so the slow HW teardown (the
+	 * FM_PCD HC path busy-waits up to ~10ms) and the frees run
+	 * without holding the spinlock. */
+#ifdef DEVMAN_DEBUG
+	printk("%s::removed iface %s, type %d\n",
+			__func__, curr_info->name,
+			curr_info->if_flags);
+#endif
+	if((curr_info->if_flags	& IF_TYPE_ETHERNET) && (curr_info->eth_info.net_dev))
+	{
+		/* Reverse of dpa_add_eth_if() acquisition order:
+		 * CEETM → discard mask → FF policer → virt storage profile → netdev ref. */
+#ifdef ENABLE_EGRESS_QOS
+		cdx_disable_ceetm_on_iface(curr_info);
+#endif
+#ifdef DPA_IPSEC_OFFLOAD
+		dpa_bman_restore_discard_mask(curr_info);
+#endif
+		dpa_remove_ethport_ff_policier_profile(curr_info);
+		dpa_remove_virt_storage_profile(&curr_info->eth_info);
+		/* unpublish the stats slot from the driver before
+		 * free_stats below returns it to the freelist */
+		dpa_reset_eth_ifinfo(netdev_priv(curr_info->eth_info.net_dev));
+		dev_put(curr_info->eth_info.net_dev);
+	}
+	/* free stats */
+	free_stats(curr_info);
+	/* free iface structure */
+	kfree(curr_info);
 }
 
 
