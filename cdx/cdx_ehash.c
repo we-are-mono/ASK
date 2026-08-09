@@ -16,6 +16,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/string.h>
 #include "linux/netdevice.h"
 #include "portdefs.h"
@@ -3054,40 +3055,52 @@ int cdx_init_frag_module(void)
 }
 
 #define PROC_FRAG_DIR "ucode_frag"
-static struct proc_ops frag_stats_fp;
-static struct proc_ops buf_alloc_test_fp;
 
 static struct proc_dir_entry *frag_proc_dir, *stats_file, *alloc_free_test_file;
 
-static ssize_t stats_read(struct file *file, char __user *buf, size_t size, loff_t *ppos)
+static int frag_stats_show(struct seq_file *m, void *v)
 {
-	int  tot_len = 0;
 	cdx_ucode_frag_info_t  *ucode_frag_args;
 
-	if (!create_ddr_and_copy_from_muram((void *)frag_info_g.muram_frag_params, (void **)&ucode_frag_args, sizeof(cdx_ucode_frag_info_t)))
+	if (!frag_info_g.muram_frag_params) {
+		seq_puts(m, "fragmentation module not initialized\n");
 		return 0;
-	
-	if (*ppos)
-		return 0;
+	}
 
-	tot_len += sprintf(buf+tot_len, "IPv4 frames received : %u\n", be32_to_cpu(ucode_frag_args->v4_frames_counter));
-	tot_len += sprintf(buf+tot_len, "IPv6 frames received : %u\n", be32_to_cpu(ucode_frag_args->v6_frames_counter));
-	tot_len += sprintf(buf+tot_len, "Number of IPv4 fragments sent : %u\n", be32_to_cpu(ucode_frag_args->v4_frags_counter));
-	tot_len += sprintf(buf+tot_len, "Number of IPv6 fragments sent : %u\n", be32_to_cpu(ucode_frag_args->v6_frags_counter));
-	tot_len += sprintf(buf+tot_len, "Failures in allocating buffers: %u\n", be32_to_cpu(ucode_frag_args->alloc_buff_failures));
-	*ppos += tot_len;
+	if (!create_ddr_and_copy_from_muram((void *)frag_info_g.muram_frag_params, (void **)&ucode_frag_args, sizeof(cdx_ucode_frag_info_t)))
+		return -ENOMEM;
+
+	seq_printf(m, "IPv4 frames received : %u\n", be32_to_cpu(ucode_frag_args->v4_frames_counter));
+	seq_printf(m, "IPv6 frames received : %u\n", be32_to_cpu(ucode_frag_args->v6_frames_counter));
+	seq_printf(m, "Number of IPv4 fragments sent : %u\n", be32_to_cpu(ucode_frag_args->v4_frags_counter));
+	seq_printf(m, "Number of IPv6 fragments sent : %u\n", be32_to_cpu(ucode_frag_args->v6_frags_counter));
+	seq_printf(m, "Failures in allocating buffers: %u\n", be32_to_cpu(ucode_frag_args->alloc_buff_failures));
 
 	kfree(ucode_frag_args);
-	return tot_len;
+	return 0;
 }
 
-
-static ssize_t buff_alloc_test(struct file *file, char __user *buf, size_t size, loff_t *ppos)
+static int frag_stats_open(struct inode *inode, struct file *file)
 {
-	int ii;
+	return single_open(file, frag_stats_show, NULL);
+}
+
+static const struct proc_ops frag_stats_fp = {
+	.proc_open	= frag_stats_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static int buff_alloc_test_show(struct seq_file *m, void *v)
+{
+	int ii, acquired = 0;
 	struct bm_buffer bmb[128];
-	if (*ppos)
+
+	if (!frag_info_g.frag_bufpool) {
+		seq_puts(m, "fragment buffer pool not initialized\n");
 		return 0;
+	}
 
 	for (ii =0; ii< 128; ii++)
 	{
@@ -3097,8 +3110,9 @@ static ssize_t buff_alloc_test(struct file *file, char __user *buf, size_t size,
 		}
 		else
 		{
-			DPA_INFO("%s(%d) bman_acquire success (ii %d) ,%lx \n", 
+			DPA_INFO("%s(%d) bman_acquire success (ii %d) ,%lx \n",
 					__func__,__LINE__,ii,(long unsigned int)bmb[ii].opaque);
+			acquired++;
 		}
 	}
 	for (ii =0; ii< 128; ii++)
@@ -3108,12 +3122,29 @@ static ssize_t buff_alloc_test(struct file *file, char __user *buf, size_t size,
 				DPA_ERROR("%s::bman release failed\n", __func__);
 		}
 	}
-	ii = sprintf(buf, "128 buffers allocated and freed successfully\n");
-	*ppos += ii;
-	return ii;
+	seq_printf(m, "%d of 128 buffers allocated and freed\n", acquired);
+	return 0;
 }
 
+static int buff_alloc_test_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, buff_alloc_test_show, NULL);
+}
 
+static const struct proc_ops buf_alloc_test_fp = {
+	.proc_open	= buff_alloc_test_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static void cdx_deinit_frag_procfs(void)
+{
+	proc_remove(frag_proc_dir);
+	frag_proc_dir = NULL;
+	stats_file = NULL;
+	alloc_free_test_file = NULL;
+}
 
 int cdx_init_frag_procfs(void)
 {
@@ -3123,26 +3154,27 @@ int cdx_init_frag_procfs(void)
 		DPA_INFO("%s(%d) proc_mkdir failed \n",__func__,__LINE__);
 		return -1;
 	}
-	memset (&frag_stats_fp, 0, sizeof(frag_stats_fp));
-	memset (&buf_alloc_test_fp, 0, sizeof(buf_alloc_test_fp));
-	frag_stats_fp.proc_read = stats_read;
 
 	stats_file = proc_create("stats", 0444, frag_proc_dir, &frag_stats_fp);
 	if (!stats_file)
 	{
 		DPA_INFO("%s(%d) proc_create failed\n",__func__,__LINE__);
-		return -1;
+		goto err_remove;
 	}
 
-	buf_alloc_test_fp.proc_read = buff_alloc_test;
-	alloc_free_test_file = proc_create("test_alloc_buf_n_free", 0444, frag_proc_dir, &buf_alloc_test_fp);
+	/* Exercises 128 bman acquire/release cycles per read - root only */
+	alloc_free_test_file = proc_create("test_alloc_buf_n_free", 0400, frag_proc_dir, &buf_alloc_test_fp);
 	if (!alloc_free_test_file)
 	{
 		DPA_INFO("%s(%d) proc_create failed\n",__func__,__LINE__);
-		return -1;
+		goto err_remove;
 	}
 
 	return 0;
+
+err_remove:
+	cdx_deinit_frag_procfs();
+	return -1;
 }
 
 void cdx_deinit_frag_module(void)
@@ -3150,6 +3182,11 @@ void cdx_deinit_frag_module(void)
 	t_Handle h_FmMuram;
 	uint64_t physicalMuramBase;
 	uint32_t MuramSize;
+
+	/* remove the proc entries first; proc_remove waits out in-flight
+	 * readers, so nothing can touch the bufpool/MURAM state torn down
+	 * below (or run this module's text after unload) */
+	cdx_deinit_frag_procfs();
 #ifdef CDX_FRAG_USE_BUFF_POOL
 	cdx_deinit_fragment_bufpool();
 #endif //CDX_FRAG_USE_BUFF_POOL
@@ -3184,9 +3221,10 @@ static int cdx_create_fragment_bufpool(void)
 
 	//find pools used by ethernet devices and borrow buffers from it
 	if (get_phys_port_poolinfo_bysize(CDX_FRAG_BUFF_SIZE, &frag_info_g.parent_pool_info)) {
-		DPA_ERROR("%s::failed to locate eth bman pool\n", 
+		DPA_ERROR("%s::failed to locate eth bman pool\n",
 				__func__);
-		bman_free_pool(bp->pool);
+		/* bp->pool is still NULL here (pool is created by dpa_bp_alloc
+		 * below) and bman_free_pool derefs its argument */
 		kfree(bp);
 		return -1;
 	}
