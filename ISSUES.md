@@ -35,23 +35,30 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
-- [ ] **N10. Non-FCI lock-free iface-list walkers, and injection-vs-FCI add races.** (boot-window / latent)
-  The devlist safety story is the remove-side invariant (all unlinks/frees of
-  live nodes hold the FCI dispatcher mutex), but a few paths sit outside it:
-  (1) `dpa_get_ohifinfo_by_portid` ([cdx/devman.c:631](cdx/devman.c#L631)) and
-  `cdx_copy_eth_rx_channel_info` (:2770) walk the list with no lock from
-  `vwd_init_pcd_fqs` (module init), `create_vap_fqs` (vwd char-dev ioctl via
-  `vwd_vap_up`) and `devoh.c:546` (dpa_app injection) — a concurrent
-  FCI-driven release could free what they read (OH/eth fixtures are never
-  removed at runtime in practice). (2) During the boot-time `set_dpa_params`
-  injection window, ioctl-path adds (under `dpa_cfg_lock` only) race FCI adds:
-  the `iface_count`/`iface_pppoe_count` updates sit outside the spinlock, and
-  `dpa_add_eth_if`'s failure arm unlinks+frees a transiently-linked node
-  outside the mutex. (3) Dead code: `dpa_update_wlan_if`,
-  `dpa_get_itfid_by_fman_params`, `dpa_get_pool_info` have zero callers —
-  remove or justify. Options: take `dpa_devlist_lock` in the two walkers
-  (all non-sleeping) + move the counters under the spinlock; or serialize the
-  injection ioctl under the ctrl mutex. (Found by the N8 follow-up audit.)
+- [ ] **N11. VAP ioctl state machine sleeps under `spin_lock_bh(vaplock)`.**
+  The whole CONFIGURE/ADD/REMOVE switch in the vwd vap ioctl handler runs
+  under `spin_lock_bh(&priv->vaplock)` ([cdx/dpa_wifi.c:2484](cdx/dpa_wifi.c#L2484)),
+  and the arms call sleeping work: `vwd_vap_configure` (netdev lookups),
+  `vwd_vap_up` → `create_vap_fqs` (GFP_KERNEL allocs, qman FQ inits), plus the
+  existing unlock/relock hack around `device_create_file`. vaplock cannot
+  become a mutex — the netfilter classifiers (`vwd_classify_route_packet`
+  :555, `vwd_classify_bridge_packet` :657) and `vwd_wifi_if_send_pkt` :2768
+  take it in softirq. Fix shape: keep vaplock for state/lookup only — mark
+  the VAP transitioning under the lock, drop it for the sleeping setup,
+  re-take to publish the final state (failure re-transitions included).
+  Would splat under DEBUG_ATOMIC_SLEEP on every vap add. (Found by the N10
+  audit.)
+
+- [ ] **N12. Module deinit never releases the iface list — eth netdev refs leak on failed init.** (latent)
+  Nothing in the deinit chain frees `dpa_interface_info` nodes;
+  `dpa_release_iflist` exists but has zero callers (and would leak refs —
+  it only kfrees). A cdx init failure *after* the dpa_app injection leaves
+  eth nodes holding `dev_get_by_name` refs → `unregister_netdevice: waiting
+  for ethX` hang, plus the OH/eth node memory. Needs a proper deinit sweep
+  (per-node: reset ifinfo, dev_put, free stats, kfree — HW teardown validity
+  at that point needs thought), ordered correctly in the LIFO chain.
+  Unreachable on clean systems (cdx unloads only on failed init, and most
+  init failures precede injection), hence latent. (Found by the N10 audit.)
 
 ---
 
@@ -118,6 +125,7 @@ file's git history.
 - **M15-r.** UPDATE-path mcast publish (`first_member_flow_addr` into a live FMAN chain) lacked the ADD-path's `wmb()` — barrier added before the store; REMOVE unlink reviewed barrier-free-correct (redirects target already-published entries, free is HcSync-gated), but its invalid-flag store used the host-order macro on the BE-stored flags (set an OPC_OFFSET bit, corrupting the live entry) — now ORs `cpu_to_be16(1<<15)` per the reference driver's swap-modify idiom (_5376281_). Closes M15 fully.
 - **N4.** `dpaa_vwd_init`'s `err7` unwind nulled `vwd.eth_priv` without dropping the `dev_get_by_name` ref from `get_eth_priv` — `dev_put` added, mirroring `dpaa_vwd_exit`; all other `dev_get_by_name` sites re-audited balanced except devman.c:472 (already open as A3e-r) (_5376281_).
 - **N9.** `alloc_iface_stats` returned SUCCESS with a NULL slot on freelist exhaustion (stats indices aliasing slot 0, NULL deref waiting in the FCI stats query) — now frees `last_stats` and returns FAILURE; the pppoe/vlan/tunnel add cascades also free stats on (currently-impossible) `dpa_add_port_to_list` failure, mirroring the eth path (_1f996c0_).
+- **N10.** Devlist discipline sweep — OH fixtures carried `itf_id` 0, so releasing/looking up the legitimate onif index 0 could alias one (release now skips OFPORT + `~0U` sentinel at creation); the two non-FCI walkers (`dpa_get_ohifinfo_by_portid` — which also lacked the union type check — and `cdx_copy_eth_rx_channel_info`) now walk under the list lock; `dpa_add_wlan_if` gained the missing `iface_count++`/cap/rc checks (vap cycles underflowed the u8 counter until all adds were rejected); `remove_onif_by_index` bails on invalid slots; injection-precedes-FCI serialization documented; dead code removed (`dpa_update_wlan_if`, `dpa_get_itfid_by_fman_params`, the caller-less `comcerto_fpp_send_command_simple`/`_atomic`, `cdx_ctrl_send_command_simple`) (_26b408a_). Sleeping-under-vaplock and the deinit list leak filed as N11/N12.
 
 ## Low / Hardening
 - **L1.** Fixed-seed Jenkins/jhash on attacker-chosen L2-flow keys (cdx + auto_bridge) — per-boot-keyed hsiphash/siphash; jenk_hash.h deleted (_89e5b32_ + _bf8c453_).
