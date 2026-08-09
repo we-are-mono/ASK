@@ -1,6 +1,6 @@
-From 8958217de0bd9d8706e4bdf87a93e009f7e9100f Mon Sep 17 00:00:00 2001
+From 8c694c84ada22cb52919f2b05fb5684f11698379 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
-Date: Thu, 23 Apr 2026 17:55:40 +0200
+Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] ask: IPv4/IPv6 forwarding-path hook points
 
 Wires Comcerto fast-path hooks into the kernel's IP forwarding code path:
@@ -10,18 +10,22 @@ UAPI (if_arp.h ARPHRD_IPV6_IPV6_TUNNEL, if_tunnel.h, ip6_tunnel.h).
 
 Depends on the dpa_add_dummy_eth_hdr export and skb fields from 010.
 
+The underlying_iif RX stamp covers all three tunnel receive paths
+(ip_tunnel.c, sit.c, __ip6_tnl_rcv) matching the NXP 5.4 reference;
+the ip6_tunnel site was dropped during the forward-port when the
+4RD machinery was stripped, which broke the 4o6/6in6 decap binding.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  include/uapi/linux/if_arp.h   |  1 +
- net/ipv4/ip_output.c          | 38 +++++++++++++++++++++++++++++++++++++-
+ net/ipv4/ip_output.c          | 38 ++++++++++++++++++++++++++++++++++-
  net/ipv4/ip_tunnel.c          |  3 +++
- net/ipv6/ip6_output.c         | 31 +++++++++++++++++++++++++++++--
- net/ipv6/ip6_tunnel.c         | 12 ++++++++----
- net/ipv6/netfilter/ip6t_NPT.c | 29 +++++++++++++++++++++++++++++
- net/ipv6/output_core.c        | 19 +++++++++++++++++++
+ net/ipv6/ip6_output.c         | 31 ++++++++++++++++++++++++++--
+ net/ipv6/ip6_tunnel.c         | 15 ++++++++++----
+ net/ipv6/netfilter/ip6t_NPT.c | 29 ++++++++++++++++++++++++++
+ net/ipv6/output_core.c        | 19 ++++++++++++++++++
  net/ipv6/sit.c                |  3 +++
- 8 files changed, 129 insertions(+), 7 deletions(-)
-
+ 8 files changed, 132 insertions(+), 7 deletions(-)
 
 diff --git a/include/uapi/linux/if_arp.h b/include/uapi/linux/if_arp.h
 index 4783af9fe520..822e21ba5ebb 100644
@@ -199,7 +203,7 @@ index f0e5431c2d46..87fe154cd7ea 100644
  	skb_copy_hash(to, from);
  
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index 5350c9bb2319..8273f86c6372 100644
+index 5350c9bb2319..263476551f52 100644
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
 @@ -19,6 +19,7 @@
@@ -210,7 +214,17 @@ index 5350c9bb2319..8273f86c6372 100644
  #include <linux/sockios.h>
  #include <linux/icmp.h>
  #include <linux/if.h>
-@@ -1196,11 +1197,14 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
+@@ -832,6 +833,9 @@ static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
+ 		skb->protocol = eth_type_trans(skb, tunnel->dev);
+ 		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
+ 	} else {
++#ifdef CONFIG_CPE_FAST_PATH
++		skb->underlying_iif = skb->dev->ifindex;
++#endif
+ 		skb->dev = tunnel->dev;
+ 		skb_reset_mac_header(skb);
+ 	}
+@@ -1196,11 +1200,14 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
  		       IPV6_MIN_MTU : IPV4_MIN_MTU);
  
  	skb_dst_update_pmtu_no_confirm(skb, mtu);
@@ -335,3 +349,6 @@ index 3c15a0ae228e..338f3d6674c3 100644
  		skb->dev = tunnel->dev;
  
  		if (packet_is_spoofed(skb, iph, tunnel)) {
+-- 
+2.47.3
+
