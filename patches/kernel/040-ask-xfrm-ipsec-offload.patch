@@ -1,4 +1,4 @@
-From 41d1abf5fa34cf23c16293d9ed5830c8139a93a1 Mon Sep 17 00:00:00 2001
+From 146ae66dedf5c4e6e5e2c9ca31354bec469cf483 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -31,7 +31,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/ipv4/xfrm4_policy.c      |  13 +
  net/ipv6/Kconfig             |   6 +
  net/ipv6/xfrm6_policy.c      |  10 +
- net/key/af_key.c             | 897 +++++++++++++++++++++++++++++++++++
+ net/key/af_key.c             | 924 +++++++++++++++++++++++++++++++++++
  net/xfrm/Makefile            |   1 +
  net/xfrm/ipsec_flow.c        | 221 +++++++++
  net/xfrm/ipsec_flow.h        |  31 ++
@@ -40,7 +40,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/xfrm_policy.c       |  90 ++++
  net/xfrm/xfrm_state.c        | 165 +++++++
  net/xfrm/xfrm_user.c         |   4 +
- 18 files changed, 1625 insertions(+), 7 deletions(-)
+ 18 files changed, 1652 insertions(+), 7 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -314,7 +314,7 @@ index 1f19b6f14484..090c1456274f 100644
  
  	err = dst->error;
 diff --git a/net/key/af_key.c b/net/key/af_key.c
-index c56bb4f451e6..981e968541c4 100644
+index c56bb4f451e6..0c314c2ebe98 100644
 --- a/net/key/af_key.c
 +++ b/net/key/af_key.c
 @@ -26,8 +26,178 @@
@@ -543,7 +543,7 @@ index c56bb4f451e6..981e968541c4 100644
  	if (atomic_read(&net_pfkey->socks_nr) == 0)
  		return 0;
  
-@@ -3863,6 +4052,703 @@ static struct xfrm_mgr pfkeyv2_mgr =
+@@ -3863,6 +4052,730 @@ static struct xfrm_mgr pfkeyv2_mgr =
  	.is_alive	= pfkey_is_alive,
  };
  
@@ -587,11 +587,30 @@ index c56bb4f451e6..981e968541c4 100644
 +	struct xfrm_state *x;
 +	struct nlkey_sa_notify sa_notify_msg;
 +	struct nlkey_sa_info sa_info_msg;
++	unsigned int payload_len;
++
++	/* Reconfiguring IPsec offload is a host-wide datapath operation:
++	 * expiring SAs, forging byte/packet counters and toggling offload
++	 * all act on init-net xfrm state. Require CAP_NET_ADMIN in the
++	 * initial user namespace so a process in an unprivileged netns or
++	 * userns cannot drive it. Binding NETLINK_KEY needs no capability,
++	 * so the check must be per-message against the sender's socket. */
++	if (!netlink_capable(skb, CAP_NET_ADMIN))
++		return;
++
++	/* This is a raw .input callback, so the netlink core does not
++	 * validate message length for us. Reject anything too short to carry
++	 * the nlkey header, and bound every per-command payload access below
++	 * against the bytes the skb actually holds rather than msg->length,
++	 * which the sender controls. */
++	if (skb->len < NLMSG_HDRLEN + NLKEY_HDR_LEN)
++		return;
 +
 +	/* extract message from skb */
 +	nlh = (struct nlmsghdr *)skb->data;
 +
 +	msg = (struct nlkey_msg *)NLMSG_DATA(nlh);
++	payload_len = skb->len - NLMSG_HDRLEN - NLKEY_HDR_LEN;
 +
 +	//printk(KERN_INFO "ipsec_nlkey_rcv fcode: 0x%x length: %d bytes\n",msg->fcode,msg->length);
 +
@@ -600,6 +619,8 @@ index c56bb4f451e6..981e968541c4 100644
 +	{
 +		case NLKEY_FLOW_REMOVE:
 +			//printk(KERN_INFO "ipsec_nlkey_rcv NLKEY_FLOW_REMOVE\n");
++			if (payload_len < sizeof(struct flowi) + 2 * sizeof(unsigned short))
++				break;
 +			p = msg->payload;
 +			memcpy(&flow, p, sizeof(struct flowi)); p += sizeof(struct flowi)/2;
 +			family = *p; p++;
@@ -609,6 +630,8 @@ index c56bb4f451e6..981e968541c4 100644
 +
 +		case NLKEY_SA_NOTIFY:
 +			//printk(KERN_INFO "ipsec_nlkey_rcv NLKEY_SA_NOTIFY\n");
++			if (payload_len < sizeof(struct nlkey_sa_notify))
++				break;
 +			memcpy(&sa_notify_msg, msg->payload, sizeof(struct nlkey_sa_notify));
 +			x = xfrm_state_lookup_byhandle(&init_net, sa_notify_msg.sagd);
 +			if (x) {
@@ -630,6 +653,8 @@ index c56bb4f451e6..981e968541c4 100644
 +			break;
 +
 +		case NLKEY_SA_INFO_UPDATE:
++			if (payload_len < sizeof(struct nlkey_sa_info))
++				break;
 +			memcpy(&sa_info_msg, msg->payload, sizeof(struct nlkey_sa_info));
 +
 +			x = xfrm_state_lookup_byhandle(&init_net,sa_info_msg.sagd);
@@ -648,6 +673,8 @@ index c56bb4f451e6..981e968541c4 100644
 +			break;
 +
 +		case NLKEY_SA_SET_OFFLOAD:
++			if (payload_len < sizeof(struct nlkey_sa_notify))
++				break;
 +			memcpy(&sa_notify_msg, msg->payload, sizeof(struct nlkey_sa_notify));
 +			x = xfrm_state_lookup_byhandle(&init_net,sa_notify_msg.sagd);
 +			if (x) {
@@ -1247,7 +1274,7 @@ index c56bb4f451e6..981e968541c4 100644
  static int __net_init pfkey_net_init(struct net *net)
  {
  	struct netns_pfkey *net_pfkey = net_generic(net, pfkey_net_id);
-@@ -3897,6 +4783,11 @@ static void __exit ipsec_pfkey_exit(void)
+@@ -3897,6 +4810,11 @@ static void __exit ipsec_pfkey_exit(void)
  	sock_unregister(PF_KEY);
  	unregister_pernet_subsys(&pfkey_net_ops);
  	proto_unregister(&key_proto);
@@ -1259,7 +1286,7 @@ index c56bb4f451e6..981e968541c4 100644
  }
  
  static int __init ipsec_pfkey_init(void)
-@@ -3913,6 +4804,12 @@ static int __init ipsec_pfkey_init(void)
+@@ -3913,6 +4831,12 @@ static int __init ipsec_pfkey_init(void)
  	if (err != 0)
  		goto out_unregister_pernet;
  	xfrm_register_km(&pfkeyv2_mgr);
