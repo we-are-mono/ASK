@@ -410,10 +410,6 @@ err_ret:
 	return FAILURE;
 }
 
-/* NOTE: This compilation flag can remove when it calls from other than this 
- * compilation flag. Like in init fails on adding some eth iface, it can call
- * from earlier added eth ifaces deinit. */
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
 static int destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 {
 	struct eth_iface_info *eth_info = &(iface_info->eth_info);
@@ -442,7 +438,6 @@ static int destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 	}
 	return 0;
 }
-#endif /* endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 
 struct net_device *find_osdev_by_fman_params(uint32_t fm_idx, uint32_t port_idx,
 		uint32_t speed)
@@ -1925,6 +1920,11 @@ void dpa_release_iflist(void)
 			dev_put(iface_info->eth_info.net_dev);
 		}
 		free_stats(iface_info);
+		/* the fqid proc tree is already gone at this point in the
+		 * LIFO chain; these reclaim only the wrapper structs */
+		cdx_remove_dir_in_procfs(&iface_info->tx_proc_entry);
+		cdx_remove_dir_in_procfs(&iface_info->pcd_proc_entry);
+		cdx_remove_dir_in_procfs(&iface_info->rx_proc_entry);
 		kfree(iface_info);
 
 		spin_lock(&dpa_devlist_lock);
@@ -1932,6 +1932,16 @@ void dpa_release_iflist(void)
 	iface_count = 0;
 	iface_pppoe_count = 0;
 	spin_unlock(&dpa_devlist_lock);
+
+	/* every stats slot is back on the freelist now; release the MURAM
+	 * carve behind them */
+	{
+		uint64_t muram_base;
+		uint32_t muram_size;
+
+		cdx_deinit_iface_stats(dpa_get_fm_MURAM_handle(0, &muram_base,
+				&muram_size));
+	}
 }
 
 
@@ -2019,6 +2029,10 @@ void dpa_release_interface(uint32_t itf_id)
 #endif
 		dpa_remove_ethport_ff_policier_profile(curr_info);
 		dpa_remove_virt_storage_profile(&curr_info->eth_info);
+		/* fwd tx FQs were created unconditionally in dpa_add_eth_if;
+		 * retire/oos/destroy them (removes their fqid proc nodes
+		 * first, while the per-iface tx dir still exists) */
+		destroy_fwd_tx_fqs(curr_info);
 		/* unpublish the stats slot from the driver before
 		 * free_stats below returns it to the freelist */
 		dpa_reset_eth_ifinfo(netdev_priv(curr_info->eth_info.net_dev));
@@ -2026,6 +2040,14 @@ void dpa_release_interface(uint32_t itf_id)
 	}
 	/* free stats */
 	free_stats(curr_info);
+	/* per-iface proc dirs + their wrappers. The pcd dir may still hold
+	 * nodes for dist FQs that outlive the iface registration; those
+	 * pdes die with the dir here and their tracking nodes are
+	 * reclaimed by cdx_deinit_fqid_procfs (which skips the stale
+	 * proc_remove) */
+	cdx_remove_dir_in_procfs(&curr_info->tx_proc_entry);
+	cdx_remove_dir_in_procfs(&curr_info->pcd_proc_entry);
+	cdx_remove_dir_in_procfs(&curr_info->rx_proc_entry);
 	/* free iface structure */
 	kfree(curr_info);
 }

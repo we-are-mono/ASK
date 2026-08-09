@@ -208,6 +208,7 @@ void display_ohport_info(struct oh_iface_info *ohinfo);
 int get_ofport_fman_and_portindex(uint32_t fm_index, uint32_t handle, uint32_t* fm_idx, uint32_t* port_idx,
 		uint32_t *portid);
 int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface);
+void cdx_deinit_iface_stats(void *muram_handle);
 void free_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface);
 int get_ofport_portid(uint32_t fm_idx, uint32_t handle, uint32_t *portid);
 int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **td);

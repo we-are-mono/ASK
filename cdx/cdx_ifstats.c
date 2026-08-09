@@ -58,6 +58,23 @@ struct cdx_pppoe_iface_ifinfo *pppoe_ifstats_freelist;
 
 extern void *FmMurambaseAddr;
 
+/* Free the stats MURAM carve and drop the freelists. Called from the
+ * dpa_release_iflist deinit sweep, after every slot has been returned —
+ * nothing may touch stats_mem-backed slots past this point. */
+void cdx_deinit_iface_stats(void *muram_handle)
+{
+	if (!stats_mem)
+		return;
+	if (muram_handle)
+		FM_MURAM_FreeMem(muram_handle, stats_mem);
+	spin_lock(&dpa_statslist_lock);
+	stats_mem = NULL;
+	stats_mem_phys = 0;
+	ifstats_freelist = NULL;
+	pppoe_ifstats_freelist = NULL;
+	spin_unlock(&dpa_statslist_lock);
+}
+
 /* allocate muram and create free lists */
 int cdxdrv_init_stats(void *muram_handle)
 {

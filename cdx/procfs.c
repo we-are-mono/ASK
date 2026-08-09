@@ -118,12 +118,37 @@ err:
  */
 void cdx_deinit_fqid_procfs(void)
 {
+	struct fqid_file_list_node_s *node;
+
 	proc_remove(proc_fqid_dir);
 	proc_fqid_dir = NULL;
 	proc_tx_dir = NULL;
 	proc_pcd_dir = NULL;
 	proc_rx_dir = NULL;
 	proc_sa_dir = NULL;
+	/* the recursive proc_remove above freed every child pde; the
+	 * tracking nodes are ours to reclaim */
+	while (fqid_files_g) {
+		node = fqid_files_g;
+		fqid_files_g = (struct fqid_file_list_node_s *)node->list.next;
+		kfree(node);
+	}
+}
+
+/* Remove a per-iface proc dir created by cdx_create_dir_in_procfs and
+ * free its wrapper. Once the fqid tree is gone (deinit removed it
+ * recursively) the pde is already freed, so only the wrapper is
+ * reclaimed. NULL-safe for interfaces that never created dirs. */
+void cdx_remove_dir_in_procfs(void **proc_dir_entry)
+{
+	cdx_proc_dir_entry_t *proc_entry = *proc_dir_entry;
+
+	if (!proc_entry)
+		return;
+	if (proc_fqid_dir)
+		proc_remove(proc_entry->proc_dir);
+	kfree(proc_entry);
+	*proc_dir_entry = NULL;
 }
 
 int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
@@ -193,7 +218,12 @@ void cdx_remove_fqid_info_in_procfs(uint32_t fqid)
 	{
 		if (node->fqid == fqid)
 		{
-			proc_remove(node->proc_fs);
+			/* cdx_deinit_fqid_procfs removes the whole tree
+			 * recursively and NULLs proc_fqid_dir; the pde behind
+			 * node->proc_fs is freed with it, so only unlink and
+			 * reclaim the node once the tree is down */
+			if (proc_fqid_dir)
+				proc_remove(node->proc_fs);
 			if (node == fqid_files_g)
 			{
 				fqid_files_g = 
@@ -209,7 +239,9 @@ void cdx_remove_fqid_info_in_procfs(uint32_t fqid)
 	}
 	if (node)
 		kfree(node);
-	else
+	else if (proc_fqid_dir)
+		/* not-found is expected once the deinit walk has already
+		 * reclaimed every node; only report it while the tree lives */
 		printk("ERROR:: unable to find fqid %d node\n", fqid);
 	return;
 }
