@@ -88,6 +88,7 @@ typedef struct fpp_sec_failure_stats_query_cmd {
 } __attribute__((__packed__)) fpp_sec_failure_stats_query_cmd_t;
 
 int cdx_ipsec_init(void);
+void cdx_ipsec_deinit(void);
 int cdx_ipsec_get_of_port_tbl_id ( PCtEntry entry, struct ins_entry_info *info);
 
 PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc (uint32_t);

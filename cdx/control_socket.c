@@ -1052,7 +1052,7 @@ int SOCKET6_HandleIP_Socket_Close(U16 *p, U16 Length)
 }
 
 
-BOOL socket_init(void)
+int socket_init(void)
 {
 	int i;
 	for (i = 0; i < NUM_SOCK_ENTRIES; i++)

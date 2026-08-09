@@ -46,6 +46,7 @@
 #ifdef DPA_IPSEC_OFFLOAD
 #include <linux/delay.h>
 #include <linux/udp.h>
+#include <linux/reboot.h>
 #include "error.h"
 #include "desc.h"
 #include "jr.h"
@@ -327,7 +328,7 @@ int sec_era;
 U64 post_sec_out_data_off;
 U64 post_sec_in_data_off;
 
-struct device *jrdev_g;
+static struct device *jrdev_g;
 
 extern void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 
@@ -350,6 +351,30 @@ void cdx_ipsec_print_desc ( U32 *desc,const char* function, int line)
 }
 #endif
 
+/* Idempotent: runs from both the module deinit chain and the reboot
+ * notifier — whichever fires first drops our consumer count so
+ * caam_jr's .shutdown doesn't find the ring busy. The command path
+ * is quiescent by the time either runs (daemons stopped / module
+ * exiting), so no split-key job can be in flight. */
+static void cdx_ipsec_release_jr(void)
+{
+	struct device *jrdev = xchg(&jrdev_g, NULL);
+
+	if (jrdev)
+		caam_jr_free(jrdev);
+}
+
+static int cdx_ipsec_reboot_notify(struct notifier_block *nb,
+		unsigned long action, void *data)
+{
+	cdx_ipsec_release_jr();
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block cdx_ipsec_reboot_nb = {
+	.notifier_call = cdx_ipsec_reboot_notify,
+};
+
 int cdx_ipsec_init(void)
 {
 	printk(KERN_INFO "%s\n", __func__);
@@ -357,14 +382,22 @@ int cdx_ipsec_init(void)
 	sec_era = 4 ;
 	post_sec_out_data_off = ((uint64_t )POST_SEC_OUT_DATA_OFFSET /64);
 	post_sec_in_data_off = ((uint64_t )POST_SEC_IN_DATA_OFFSET / 64);
-	/* get the jr device  */
+	/* get the jr device (caam_jr_alloc returns ERR_PTR, never NULL) */
 	jrdev_g  = caam_jr_alloc();
-	if (!jrdev_g) {
+	if (IS_ERR(jrdev_g)) {
 		log_err("Failed to get the job ring device, check the dts\n");
-		return -EINVAL;
+		jrdev_g = NULL;
+		return -ENODEV;
 	}
+	register_reboot_notifier(&cdx_ipsec_reboot_nb);
 	printk(KERN_INFO "%s job ring device= %p\n", __func__,jrdev_g);
 	return 0;
+}
+
+void cdx_ipsec_deinit(void)
+{
+	unregister_reboot_notifier(&cdx_ipsec_reboot_nb);
+	cdx_ipsec_release_jr();
 }
 
 
@@ -2187,6 +2220,8 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	uint32_t buf_size;
 	PDpaSecSAContext psec_sa_context;
 
+	if (!jrdev_g)
+		return -ENODEV;
 	if (cdx_dpa_get_ipsec_pool_info(&bpid, &buf_size))
 		return -EIO;
 	psec_sa_context = sa->pSec_sa_context;
@@ -2393,6 +2428,9 @@ int cdx_ipsec_generate_split_key(struct auth_params *auth_param)
 	u32 *desc, timeout = 1000000, alg_sel = 0;
 	atomic_t done;
 	int ret = 0;
+
+	if (!jrdev_g)
+		return -ENODEV;
 
 	ret = cdx_ipsec_get_split_key_info(auth_param, &alg_sel);
 	/* exit if error or there is no need to compute a split key */

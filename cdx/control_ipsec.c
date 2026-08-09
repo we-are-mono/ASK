@@ -1272,7 +1272,7 @@ static struct qman_fq *cdx_get_to_sec_fq_handler(uint32_t handle)
 
 }
 #endif
-BOOL ipsec_init(void)
+int ipsec_init(void)
 {
 	int i;
 
@@ -1289,9 +1289,10 @@ BOOL ipsec_init(void)
 	 */
 
 	/* initialize a singled list for puting the sec sa context with the pair of fqid
-	 * and the shared descriptor and other memory if any required by Sec. 
+	 * and the shared descriptor and other memory if any required by Sec.
 	 */
-	cdx_ipsec_init();
+	if (cdx_ipsec_init())
+		return -1;
 #ifdef CONTROL_IPSEC_DEBUG
 	printk(KERN_INFO "%s timer is initialized \n", __func__);
 #endif
@@ -1302,8 +1303,13 @@ BOOL ipsec_init(void)
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 	//register hook function for intercepting ipsec packets from ethernet driver
 	if (dpa_register_ipsec_fq_handler(cdx_get_to_sec_fq_handler)) {
-		printk(KERN_INFO "%s unable to registeri ipsec hook func\n", 
+		printk(KERN_INFO "%s unable to registeri ipsec hook func\n",
 				__func__);
+		/* ipsec_exit() won't run when init fails — release the JR
+		 * and the reboot notifier here or the notifier would point
+		 * into freed module text after an unload. */
+		cdx_timer_del(&sa_timer);
+		cdx_ipsec_deinit();
 		return -1;
 	}
 #endif
@@ -1313,5 +1319,6 @@ BOOL ipsec_init(void)
 void ipsec_exit(void)
 {
 	cdx_timer_del(&sa_timer);
+	cdx_ipsec_deinit();
 }
 #endif  // DPA_IPSEC_OFFLOAD

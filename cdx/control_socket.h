@@ -166,7 +166,7 @@ void socket6_update(PSock6Entry pSocket, u8 event);
 int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket);
 #endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 
-BOOL socket_init(void);
+int socket_init(void);
 void socket_exit(void);
 
 

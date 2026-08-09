@@ -419,7 +419,7 @@ extern U8 gDTMF_PT[2];
 extern struct slist_head rtpflow_cache[];
 extern struct slist_head rtpcall_cache;
 
-BOOL rtp_relay_init(void);
+int rtp_relay_init(void);
 void rtp_relay_exit(void);
 
 

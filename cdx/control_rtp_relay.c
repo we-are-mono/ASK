@@ -1450,7 +1450,7 @@ static U16 M_rtp_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 				cmd_code, cmd_len, pcmd);
 }
 
-BOOL rtp_relay_init(void)
+int rtp_relay_init(void)
 {
 	int i;
 

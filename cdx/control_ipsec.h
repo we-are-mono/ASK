@@ -515,7 +515,7 @@ struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt);
 #endif
 
 
-BOOL ipsec_init(void);
+int ipsec_init(void);
 void ipsec_exit(void);
 void ipsec_standalone_init(void);
 
