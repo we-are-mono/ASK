@@ -35,6 +35,29 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
+- [ ] **N16. eth4 (LAN) FMAN ingress comes up dead on a fraction of boots.**
+  `ethtool -S eth4` shows `rx packets [TOTAL]: 0` and 0 interrupts from boot
+  with link UP while eth3 works; ARP goes unanswered because requests never
+  reach the kernel. The rig masked this for months by running off loki's
+  cached neighbor entry for the DUT's constant MAC (a seeded entry survives
+  indefinitely under bidirectional traffic without ARP), so it surfaces as
+  seemingly random delayed LAN blackouts when the cache expires. Same family
+  as the fman-pcd-tnum-stall finding (missing dist FQs → port stall); needs a
+  boot-time bring-up ordering investigation (fmc/dpa_app vs cdx init vs VAP
+  reset). Test-tooling workaround: gate each boot on eth4 rx>0 (reboot until
+  alive) and pin static neighbors on both LAN peers.
+
+- [ ] **N17. cmm-programmed IPsec inner flows are heavily lossy.** With the
+  LAN alive and an SA installed, tunnel TCP completes but with ~80x the
+  retransmits once cmm programs the inner flow (941 vs 12 retx over 8 s at
+  ~63 Mbit/s), and iperf3's TCP control channel usually times out
+  mid-exchange. ICMP (never programmed) is clean; plain non-IPsec forwarding
+  passes test_offload on the same boot. Points at the programmed fast-path
+  forward leg for IPsec inner flows (classified ingress → SEC → OH egress);
+  reproduces identically with CBC+HMAC, so unrelated to the A24 descriptor
+  work. Suspect the N13-N15 fwd-FQ/VAP teardown rework or the OH-port
+  egress path.
+
 ---
 
 <a name="archive"></a>
@@ -161,6 +184,6 @@ file's git history.
 - **A21.** Deinit from a failed init crashed in qman_ceetm_sp_release(lni->sp=NULL) — SP claim passed explicitly + NULL-guarded; init failure now propagates (_d236aa3_).
 - **A22.** gateway-dk cdx_cfg.xml OH portid 8/9 tripped the cdx_sp.xml espschema `$logicalportid lt 9` policing gate, breaking ESP recognition — restored to NXP 9/10 (_d5be3ae_).
 - **A23.** ipsec_bp registered but never seeded — SEC hit BPDERR, silent drops; dpaa_bp_alloc_n_add_buffs(512, act_skb=1) added with unwind (_d5be3ae_).
-- **A24.** SEC GCM per-DECO PDB.seq divergence broke RFC4303 anti-replay (no cdx-side fix) — GCM/GMAC refused at SA install (kernel NLKEY gate + cdx); CBC+HMAC/CCM still offload.
+- **A24.** DNCPE-2358 root-caused and fixed; GCM/GMAC offload re-enabled. Two descriptor defects per the SEC RM: HDR_SAVECTX let SERIAL self-sharing carry GCM's class-1 GHASH/counter context into the next packet (the >18%-load ICV failures — CBC/CTR/CCM re-init context and were immune), and cross-DECO refetches weren't ordered against PDB.seq writeback because jobs only STOREd the stats words, not the PDB (RM §7.3.1 interlock — A24a's wire-seq dupes). Fix: WAIT sharing without SAVECTX + per-job PDB+stats STORE; encap PDB now seeds sa->seq+1 (first packet of every SA used to go out as seq 0 and be replay-dropped, all ciphers). Measured at ~185 Mbit/s hardware encap: legacy ~2.8M ICV fails/12s + 0.4-0.5% dup seqs → fix 0 ICV fails + 0.086% dup seqs (CBC baseline: 0.154%) (_451bc18_).
 - **A25.** AES-128-CTR lacked the RFC 3686 nonce trim and CTR PDB fields — comb_mode/extra_size=4 trim + ctr_nonce/ctr_initial=1 in both PDBs (_d5be3ae_).
 - **A26.** ASK patch stack compiled with ~52 warnings (missing prototypes, bad formats, one wrong-signature extern) — 010/040 regenerated warning-free (_3b93e0e_).
