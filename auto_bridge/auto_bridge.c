@@ -1564,6 +1564,24 @@ static int abm_sysctl_l3_filtering(const struct ctl_table *ctl, int write,
 }
 
 
+/* proc_dointvec_jiffies with a floor of one jiffy: 0 would make the
+ * self-requeuing retransmit work spin, and a negative write (stored as
+ * -N*HZ, then cast to unsigned long by queue_delayed_work) would park
+ * the work for ~2^64 jiffies with no rescheduling site to revive it. */
+static int abm_sysctl_retransmit_delay(const struct ctl_table *ctl, int write,
+				  void *buffer,
+				  size_t *lenp, loff_t *ppos)
+{
+	int prev = abm_retransmit_time;
+	int ret = proc_dointvec_jiffies(ctl, write, buffer, lenp, ppos);
+
+	if (!ret && write && abm_retransmit_time <= 0) {
+		abm_retransmit_time = prev;
+		ret = -EINVAL;
+	}
+	return ret;
+}
+
 static struct ctl_table abm_sysctl_table[] = {
 	{
 		.procname	= "abm_l3_filtering",
@@ -1605,7 +1623,7 @@ static struct ctl_table abm_sysctl_table[] = {
 		.data		= &abm_retransmit_time,
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec_jiffies,
+		.proc_handler	= abm_sysctl_retransmit_delay,
 	},
 	{
 		.procname	= "abm_max_entries",
