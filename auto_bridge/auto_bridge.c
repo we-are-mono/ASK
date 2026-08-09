@@ -99,11 +99,12 @@ static const char auto_bridge_version[] = "0.01";
  *   __abm_go_dying, abm_l2flow_del           - caller must hold
  *                                              abm_lock.
  *
- * Known gap: the module-exit drain calls rtnl_lock() while abm_lock
- * is held (rtmsg_ifinfo); that's a pre-existing pattern flagged in
- * ISSUES.md. It triggers under CONFIG_DEBUG_ATOMIC_SLEEP / lockdep
- * but hasn't been observed in the wild because the exit drain runs
- * only at module unload.
+ * rtnl_lock() vs abm_lock: rtnl_lock is a sleeping mutex and must
+ * never be taken with abm_lock (a BH spinlock) held. The workqueue
+ * drain in abm_do_work_send_msg observes this by splicing
+ * bridge_list_rtevent to a local list under abm_lock and calling
+ * rtmsg_ifinfo only after the unlock; the module-exit drain never
+ * takes rtnl (it only dev_puts and frees).
  */
 
 #define SECS * HZ
@@ -175,6 +176,7 @@ static void abm_do_work_send_msg(struct work_struct *work)
 	struct list_head *entry, *tmp;
 	struct l2flowTable *table_entry;
 	struct br_event_table *brtable_entry;
+	LIST_HEAD(rtevents);
 	char action = 0;
 
 	spin_lock_bh(&abm_lock);
@@ -210,21 +212,27 @@ static void abm_do_work_send_msg(struct work_struct *work)
 
 	/* Bridge events go to RTNL netlink, not abm_nl — drain regardless
 	 * of L2FLOW_NL_GRP listeners so the dev_hold() paired in
-	 * add_brevent() doesn't leak device refs indefinitely. */
-	list_for_each_safe(entry, tmp, &bridge_list_rtevent){
+	 * add_brevent() doesn't leak device refs indefinitely.
+	 * rtmsg_ifinfo needs rtnl_lock (a sleeping mutex), so only splice
+	 * the list out here and do the sending after abm_lock is dropped.
+	 * Entries added concurrently land on the emptied bridge_list_rtevent
+	 * and re-queue this work. */
+	list_splice_init(&bridge_list_rtevent, &rtevents);
+
+	spin_unlock_bh(&abm_lock);
+
+	list_for_each_safe(entry, tmp, &rtevents){
 		brtable_entry = container_of(entry, struct br_event_table, list_rtevent);
 		if (brtable_entry->brdev)
 		{
 			rtnl_lock();
-			rtmsg_ifinfo(RTM_NEWLINK, brtable_entry->brdev, 0, GFP_ATOMIC, 0, NULL);
+			rtmsg_ifinfo(RTM_NEWLINK, brtable_entry->brdev, 0, GFP_KERNEL, 0, NULL);
 			rtnl_unlock();
 			dev_put(brtable_entry->brdev);
 		}
 		list_del(&brtable_entry->list_rtevent);
 		kmem_cache_free(brroute_cache, brtable_entry);
 	}
-
-	spin_unlock_bh(&abm_lock);
 }
 
 /***************************************************************************
@@ -389,19 +397,24 @@ static int abm_fdb_can_expire(unsigned char *mac_addr, struct net_device *dev)
 
 	key = abm_l2flow_hash_mac(mac_addr);
 
-	spin_lock(&abm_lock);
+	/* Invoked from br_fdb_cleanup, a workqueue callback running in process
+	 * context with BH enabled. abm_lock is also taken from softirq context
+	 * (the death-by-timeout timer, the EBT hook), so it must be held with
+	 * BH disabled here too — otherwise a softirq on this CPU can re-enter
+	 * and self-deadlock. */
+	spin_lock_bh(&abm_lock);
 	list_for_each(entry,  &l2flow_table_by_src_mac[key]){
 		table_entry = container_of(entry, struct l2flowTable, list_by_src_mac);
 		if (ether_addr_equal(mac_addr, table_entry->l2flow.saddr)
 		&& (dev->ifindex == table_entry->idev_ifi))
 		{
 			if(table_entry->state == L2FLOW_STATE_FF){
-				spin_unlock(&abm_lock);
+				spin_unlock_bh(&abm_lock);
 				return 0;
 			}
 		}
 	}
-	spin_unlock(&abm_lock);
+	spin_unlock_bh(&abm_lock);
 	return 1;
 }
 static inline size_t abm_l2flow_msg_size(void)
@@ -590,6 +603,13 @@ static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netl
 	struct l2flow l2flow_temp;
 	struct l2flow_msg *l2flow_msg;
 	struct nlattr *tb[L2FLOWA_MAX + 1];
+
+	/* The l2flow bus drives bridge-flow offload state — require the
+	 * same privilege as the cdx ioctl gate. Creating and binding a
+	 * NETLINK_L2FLOW socket needs no capability, so the check must be
+	 * per-message against the sender's socket, before any parsing. */
+	if (!netlink_capable(skb, CAP_NET_ADMIN))
+		return -EPERM;
 
 	type = nlh->nlmsg_type;
 
