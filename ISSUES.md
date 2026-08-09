@@ -35,36 +35,23 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
-- [ ] **N7. `dpaa_vwd_up`'s netfilter hooks leak on cdx unload while the vwd fast path is enabled.**
-  `dpaa_vwd_up` ([cdx/dpa_wifi.c:2791](cdx/dpa_wifi.c#L2791)) registers three
-  `nf_register_net_hook` entries when the sysfs toggle enables the vwd fast
-  path; only the sysfs-driven `dpaa_vwd_down` unregisters them, and
-  `dpaa_vwd_exit` never calls it. `rmmod cdx` (or a failed-init unwind) with
-  `vwd_fast_path_enable=1` leaves netfilter dispatching into freed module
-  text. Unreachable in the N3 failed-init flow (the toggle requires a running
-  system) and cdx is persistent in practice, but the exit path should tear
-  down the fast path (call the `dpaa_vwd_down` logic, or unregister-if-enabled)
-  before the rest of the vwd teardown. (Found by the N3 hook-lifecycle audit.)
-
-- [ ] **N8. Stats query paths deref `iface_info` after dropping `dpa_devlist_lock`.**
-  `phyif_stats_get`/`tunnel_stats_get`/`interface_stats_reset`
-  ([cdx/control_stat.c:87](cdx/control_stat.c#L87), control_tunnel.c:664) look
-  the interface up under `dpa_devlist_lock`, drop the lock, then read
-  `iface_info`/`last_stats` — racy against `dpa_release_interface`'s `kfree`.
-  Same lookup-then-use shape H9 fixed for the query cursors. Fix: hold the lock
-  across the read, or copy what's needed under the lock. (Found by the A3e-r
-  audit.)
-
-- [ ] **N9. `alloc_iface_stats` returns SUCCESS with a NULL slot; sibling add-cascades never free stats.** (latent)
-  On freelist exhaustion `alloc_iface_stats` leaves `iface->stats = NULL` with
-  `rxstats_index/txstats_index = 0` (aliasing slot 0) and still returns SUCCESS,
-  so `IF_STATS_ENABLED` gets set and a later FCI stats query NULL-derefs in
-  `dpa_iface_stats_get`. Unreachable today — the freelist is sized to the
-  interface cap and the A3e-r fix stopped the slot leak — but the contract is a
-  landmine; return FAILURE (freeing `last_stats`) instead. Related latent gap:
-  the pppoe/vlan/tunnel add cascades (devman.c:2279/2355/2708) have no
-  `free_iface_stats` on post-alloc failure — dead today only because
-  `dpa_add_port_to_list` cannot fail. (Found by the A3e-r audit.)
+- [ ] **N10. Non-FCI lock-free iface-list walkers, and injection-vs-FCI add races.** (boot-window / latent)
+  The devlist safety story is the remove-side invariant (all unlinks/frees of
+  live nodes hold the FCI dispatcher mutex), but a few paths sit outside it:
+  (1) `dpa_get_ohifinfo_by_portid` ([cdx/devman.c:631](cdx/devman.c#L631)) and
+  `cdx_copy_eth_rx_channel_info` (:2770) walk the list with no lock from
+  `vwd_init_pcd_fqs` (module init), `create_vap_fqs` (vwd char-dev ioctl via
+  `vwd_vap_up`) and `devoh.c:546` (dpa_app injection) — a concurrent
+  FCI-driven release could free what they read (OH/eth fixtures are never
+  removed at runtime in practice). (2) During the boot-time `set_dpa_params`
+  injection window, ioctl-path adds (under `dpa_cfg_lock` only) race FCI adds:
+  the `iface_count`/`iface_pppoe_count` updates sit outside the spinlock, and
+  `dpa_add_eth_if`'s failure arm unlinks+frees a transiently-linked node
+  outside the mutex. (3) Dead code: `dpa_update_wlan_if`,
+  `dpa_get_itfid_by_fman_params`, `dpa_get_pool_info` have zero callers —
+  remove or justify. Options: take `dpa_devlist_lock` in the two walkers
+  (all non-sleeping) + move the counters under the spinlock; or serialize the
+  injection ioctl under the ctrl mutex. (Found by the N8 follow-up audit.)
 
 ---
 
@@ -109,6 +96,7 @@ file's git history.
 - **N3.** `cdx_get_ipsec_fq_hookfn` had no unregister and the register refuses overwrite — a failed cdx init after `CMD_INIT(ipsec)` wedged every later load at `ipsec_init` until reboot (same wedge reachable via the wifi hook on the vwd stats-failure unwind). All five cdx-facing hook families (ipsec fq / ceetm fq / bpool replenish / wifi xmit / fp stats) got unregister-on-deinit with `synchronize_rcu` teardown, release-publish registers, snapshot readers, explicit RCU sections at the two process-context readers, and the ceetm dscp NULL guard (_81421c2_ patch 010 regen, _b2342ce_ cdx). Sibling vwd nf-hook unload leak filed as N7.
 - **H2-r.** SA query snapshots memcpy'd full cipher/auth keys and were freed with plain kfree — all three frees switched to `kfree_sensitive`, and the fill slice is zeroed per bucket so partially-filled entries and buffer reuse no longer leak slab garbage or a previous bucket's keys into the fixed-size replies (_5376281_). Closes H2 fully.
 - **N5.** Five CAAM/bman `dma_map_single` results tested with `!addr` (or not at all) — `DMA_MAPPING_ERROR` is ~0UL/truthy, so real failures sailed past the H3 unwind or reached hardware; all sites (shared-desc keys ×3, extended-desc extra-cmds ×2, vwd sg-fd) now use `dma_mapping_error()` (_5376281_).
+- **N8.** Five iface stats getters (phyif/reset/tunnel/vlan/pppoe) dropped `dpa_devlist_lock` between the `dpa_get_ifinfo_by_itfid` lookup and the `iface_info`/`last_stats` use — theoretical today (getters and `dpa_release_interface` are both FCI-dispatched, serialized by the dispatcher mutex) but the safety was non-local; all five now hold the lock across the read/reset (_062484a_). Follow-up (_9c103b9_): `dpa_release_interface` unlinks under the lock but runs the eth HW teardown (FM_PCD HC busy-waits ~10ms) and frees after unlock; the false "softirq callers" claims in the devman/cdx_ifstats concurrency blocks corrected (every taker is process context); the remaining lock-free FCI-path lookups documented safe under the remove-side invariant (all unlinks/frees of live nodes are dispatcher-mutex-serialized — adds from the boot injection ioctl only publish fresh nodes). Non-FCI walkers filed as N10.
 
 ## Medium
 - **M1.** Query of 6-8 listener groups OOB'd the reply buffer — pagination reserves 2 cmds/group, pages via bIsValidEntry look-ahead.
@@ -129,6 +117,7 @@ file's git history.
 - **N2.** `/proc/ucode_frag/*` read handlers sprintf'd into the `__user` buffer (M3's class) — both converted to single_open/seq_file; proc entries now removed at deinit ahead of bufpool/MURAM teardown (stale-proc_ops class A3b fixed for fqid), partial-create unwound, test file 0400 with honest acquire count, and a NULL `bp->pool` deref dropped from the bufpool-create error path (_b593f93_).
 - **M15-r.** UPDATE-path mcast publish (`first_member_flow_addr` into a live FMAN chain) lacked the ADD-path's `wmb()` — barrier added before the store; REMOVE unlink reviewed barrier-free-correct (redirects target already-published entries, free is HcSync-gated), but its invalid-flag store used the host-order macro on the BE-stored flags (set an OPC_OFFSET bit, corrupting the live entry) — now ORs `cpu_to_be16(1<<15)` per the reference driver's swap-modify idiom (_5376281_). Closes M15 fully.
 - **N4.** `dpaa_vwd_init`'s `err7` unwind nulled `vwd.eth_priv` without dropping the `dev_get_by_name` ref from `get_eth_priv` — `dev_put` added, mirroring `dpaa_vwd_exit`; all other `dev_get_by_name` sites re-audited balanced except devman.c:472 (already open as A3e-r) (_5376281_).
+- **N9.** `alloc_iface_stats` returned SUCCESS with a NULL slot on freelist exhaustion (stats indices aliasing slot 0, NULL deref waiting in the FCI stats query) — now frees `last_stats` and returns FAILURE; the pppoe/vlan/tunnel add cascades also free stats on (currently-impossible) `dpa_add_port_to_list` failure, mirroring the eth path (_1f996c0_).
 
 ## Low / Hardening
 - **L1.** Fixed-seed Jenkins/jhash on attacker-chosen L2-flow keys (cdx + auto_bridge) — per-boot-keyed hsiphash/siphash; jenk_hash.h deleted (_89e5b32_ + _bf8c453_).
@@ -147,6 +136,7 @@ file's git history.
 - **X3.** "dpaa_eth_refill_bpools suspected leaks" — wontfix: the skb backpointer lives in the BMan hardware-owned frag pool kmemleak can't scan; error paths free cleanly.
 - **A12.** "PPPoE RX-decap missing classifier install" — wontfix: inner udp4/tcp4 dist precedes pppoe_dist; the PPPoE strip is an HM chained on the inner CT entry, not a table.
 - **A15.** "cmm has no incoming xfrm subscription" — wontfix: the af_key km hook broadcasts every SA event on NETLINK_KEY grp1 (before the no-PF_KEY early-return); cmm binds it via libfci. On-DUT restart experiment (2026-08-09) confirmed no resync gap; only cmm-downtime events are lost, recoverable via `ip xfrm state flush`.
+- **N7.** "vwd nf hooks leak on cdx unload with fast path enabled" — wontfix/not-a-bug: the audit claim misread the wiring. The three hooks are registered at module init (the sysfs toggle only flips the per-packet gate flag) and every path unregisters them exactly once — `dpaa_vwd_exit` → `dpaa_vwd_driver_remove` → `dpaa_vwd_down`, the failed-init unwind via `err4` (a `driver_init` failure goes to `err3`, below it — no double-unregister), and `dpaa_vwd_up`'s own `err0`. Traced link-by-link and independently re-verified.
 
 ## Architectural themes
 - **A1.** External command fields validated ad hoc per cmdproc — the whole FCI bus + cdx ioctl dispatcher routed through one validator-table idiom (2 latent bugs fixed en route).
