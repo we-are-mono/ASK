@@ -61,12 +61,27 @@ async def _tun_rx(target_agent, session, ifname: str) -> int:
     return json.loads(r["stdout"])[0]["stats64"]["rx"]["packets"]
 
 
+async def _await_path(dst: str, port: int, deadline_s: float = 12.0) -> int:
+    """Poll the echo path until it comes up, absorbing DAD-tentative
+    latency on the LAN address and cmm's tunnel registration. Returns
+    the echo count of the first good burst (>=8), else the last count."""
+    import time as _t
+    end = _t.monotonic() + deadline_s
+    got = 0
+    while _t.monotonic() < end:
+        got = await asyncio.to_thread(_udp_echo_burst, dst, port, 10, 0.05)
+        if got >= 8:
+            return got
+        await asyncio.sleep(1.0)
+    return got
+
+
 async def _start_lan_udp_echo(lan, port: int, family: str) -> None:
     """Backgrounded UDP echo server on the LAN VM (:: binds dual-stack)."""
     src = (
         "import socket\\n"
         "s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)\\n"
-        f"s.bind(('::', {port}))\\n"
+        f's.bind((\"::\", {port}))\\n'
         "while True:\\n"
         "    d, a = s.recvfrom(2048)\\n"
         "    s.sendto(d, a)\\n"
@@ -143,10 +158,12 @@ async def test_tunnel_6o4_decap_offloaded(
 ):
     tun = sit_decap_tunnel
 
-    # Warm-up: bidirectional flow so conntrack reaches ASSURED and cmm
-    # programs both directions.
-    warm = await asyncio.to_thread(_udp_echo_burst, LAN_V6, ECHO_PORT_6O4, 40, 0.05)
-    assert warm >= 30, f"6o4 path broken before offload check: {warm}/40 echoes"
+    # Warm-up: wait for the path (DAD-tentative LAN addr + cmm tunnel
+    # registration), then a bidirectional flow so conntrack reaches
+    # ASSURED and cmm programs both directions.
+    warm = await _await_path(LAN_V6, ECHO_PORT_6O4)
+    assert warm >= 8, f"6o4 path never came up: {warm}/10 echoes"
+    await asyncio.to_thread(_udp_echo_burst, LAN_V6, ECHO_PORT_6O4, 40, 0.05)
     await asyncio.sleep(PROGRAM_S)
 
     rx0 = await _tun_rx(target_agent, aiohttp_session, tun)
