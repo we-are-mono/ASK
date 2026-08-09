@@ -35,22 +35,6 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
-- [ ] **A3e-r. `dpa_add_eth_if` leaks a netdev refcount and iface stats on error paths.** (reopened)
-  The A3e helpers (policer/discard-mask/CEETM teardown) landed correctly, but two
-  acquisitions inside the same cascade are released on no error path:
-  (1) `get_eth_iface_info` takes a netdev ref via `dev_get_by_name`
-  ([cdx/devman.c:472](cdx/devman.c#L472)); no `err_ret*` label does the matching
-  `dev_put`, so every failure after devman.c:2076 leaks it — later surfacing as
-  the `unregister_netdevice: waiting for ethX to become free` hang (the internal
-  returns at :547/:568 leak too). (2) `alloc_iface_stats` (:2104) kzallocs
-  `last_stats` and consumes a freelist slot with no error-path `free_iface_stats`,
-  and the stale pointer is already published via `dpa_set_eth_ifinfo` (:2108).
-  Related: `free_stats` ([:1873](cdx/devman.c#L1873)) has no `IF_TYPE_ETHERNET`
-  arm, so even the normal release path leaks `last_stats` on every eth removal.
-  A3 (umbrella) stays open until this is fixed. Fix: `dev_put` +
-  `free_iface_stats` + `dpa_set_eth_ifinfo(priv, NULL)` in the cascade, plus an
-  eth arm in `free_stats`.
-
 - [ ] **N7. `dpaa_vwd_up`'s netfilter hooks leak on cdx unload while the vwd fast path is enabled.**
   `dpaa_vwd_up` ([cdx/dpa_wifi.c:2791](cdx/dpa_wifi.c#L2791)) registers three
   `nf_register_net_hook` entries when the sysfs toggle enables the vwd fast
@@ -61,6 +45,26 @@ stale line refs) are folded into the archive one-liners.
   system) and cdx is persistent in practice, but the exit path should tear
   down the fast path (call the `dpaa_vwd_down` logic, or unregister-if-enabled)
   before the rest of the vwd teardown. (Found by the N3 hook-lifecycle audit.)
+
+- [ ] **N8. Stats query paths deref `iface_info` after dropping `dpa_devlist_lock`.**
+  `phyif_stats_get`/`tunnel_stats_get`/`interface_stats_reset`
+  ([cdx/control_stat.c:87](cdx/control_stat.c#L87), control_tunnel.c:664) look
+  the interface up under `dpa_devlist_lock`, drop the lock, then read
+  `iface_info`/`last_stats` — racy against `dpa_release_interface`'s `kfree`.
+  Same lookup-then-use shape H9 fixed for the query cursors. Fix: hold the lock
+  across the read, or copy what's needed under the lock. (Found by the A3e-r
+  audit.)
+
+- [ ] **N9. `alloc_iface_stats` returns SUCCESS with a NULL slot; sibling add-cascades never free stats.** (latent)
+  On freelist exhaustion `alloc_iface_stats` leaves `iface->stats = NULL` with
+  `rxstats_index/txstats_index = 0` (aliasing slot 0) and still returns SUCCESS,
+  so `IF_STATS_ENABLED` gets set and a later FCI stats query NULL-derefs in
+  `dpa_iface_stats_get`. Unreachable today — the freelist is sized to the
+  interface cap and the A3e-r fix stopped the slot leak — but the contract is a
+  landmine; return FAILURE (freeing `last_stats`) instead. Related latent gap:
+  the pppoe/vlan/tunnel add cascades (devman.c:2279/2355/2708) have no
+  `free_iface_stats` on post-alloc failure — dead today only because
+  `dpa_add_port_to_list` cannot fail. (Found by the A3e-r audit.)
 
 ---
 
@@ -156,6 +160,7 @@ file's git history.
 - **A3b.** fqid procfs mkdirs left earlier dirs on later failure — nested err_remove_* cascade; deinit proc_removes the whole tree.
 - **A3c.** l2flow_cache leaked when brroute_cache creation failed — destroy+NULL l2flow_cache on that error path.
 - **A3d.** abm_init leaked earlier subsystems on later init failure — goto cascade runs each matching _fini/_exit in reverse order.
+- **A3e-r.** `dpa_add_eth_if`'s cascade leaked the `get_eth_iface_info` netdev ref (every post-acquisition failure incl. the helper's internal returns) and the published stats slot; normal eth removal leaked `last_stats` + the slot too (no eth arm in `free_stats`) and never unpublished `priv->ifinfo` — guarded `dev_put` at `err_ret`, new `err_stats` unwind (`dpa_reset_eth_ifinfo` + `free_iface_stats`), eth arm added, `free_iface_stats` NULL-slot-guarded and now NULLs its pointers, reset-before-free on the release path, and the discard-mask restore un-nested from `ENABLE_EGRESS_QOS` so non-QoS builds restore it on late failures (_dffbbd6_). Closes the A3 umbrella. Query-path race and alloc-contract landmine filed as N8/N9.
 - **A4.** Debug scaffolding shipped as production — dpa_test.c removed, IPR deinit stub implemented, %px/%p prints flipped to %pK.
 - **A5.** Sanitizer bring-up surfaced 4 vendored-kernel bugs (qbman, sdk_dpaa, sdk_fman, netlink) — fixed as patches 090-093, shipped to both images.
 - **A5a.** qbman dpa_alloc_new kmalloc'd GFP_KERNEL under spin_lock_irq — patch 090 preallocates all list nodes before the lock, frees leftovers after.
