@@ -116,6 +116,8 @@ class Agent:
         timeout_ms: int = 500,
         nlmsg_len_override: int | None = None,
         failslab_times: int | None = None,
+        uid: int | None = None,
+        userns: bool = False,
     ) -> dict:
         """Send an FCI command and return the parsed reply. When
         `failslab_times=N` is set, the agent wraps the netlink send in a
@@ -136,6 +138,10 @@ class Agent:
             body["nlmsg_len_override"] = nlmsg_len_override
         if failslab_times is not None:
             body["failslab_times"] = int(failslab_times)
+        if uid is not None:
+            body["uid"] = int(uid)
+        if userns:
+            body["userns"] = True
         async with session.post(f"{self.base_url}/fci/send", json=body) as r:
             r.raise_for_status()
             return await r.json()
@@ -150,6 +156,8 @@ class Agent:
         nlmsg_flags: int = 0,
         nlmsg_len_override: int | None = None,
         timeout_ms: int = 500,
+        uid: int | None = None,
+        userns: bool = False,
     ) -> dict:
         body: dict = {
             "protocol":    protocol,
@@ -160,6 +168,10 @@ class Agent:
         }
         if nlmsg_len_override is not None:
             body["nlmsg_len_override"] = nlmsg_len_override
+        if uid is not None:
+            body["uid"] = int(uid)
+        if userns:
+            body["userns"] = True
         async with session.post(f"{self.base_url}/netlink/send", json=body) as r:
             r.raise_for_status()
             return await r.json()

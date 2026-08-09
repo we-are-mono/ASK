@@ -16,11 +16,17 @@ SYSROOT    := $(SRCDIR)/sysroot
 ABM_DIR    := $(CURDIR)/auto_bridge
 
 # Kernel module args
+# CONFIG_ASK_* gate the obj-m lines in each module's Kbuild; the kernel
+# tree doesn't define them, so pass them explicitly like the Yocto
+# recipes do — without them the Kbuild descent silently builds nothing.
 KBUILD_ARGS := CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH)
-CDX_ARGS    := $(KBUILD_ARGS) KERNELDIR=$(KDIR) PLATFORM=$(PLATFORM)
+CDX_ARGS    := $(KBUILD_ARGS) KERNELDIR=$(KDIR) PLATFORM=$(PLATFORM) \
+               CONFIG_ASK_CDX=m
 FCI_ARGS    := $(KBUILD_ARGS) KERNEL_SOURCE=$(KDIR) BOARD_ARCH=$(ARCH) \
-               KBUILD_EXTRA_SYMBOLS=$(CURDIR)/cdx/Module.symvers
-ABM_ARGS    := $(KBUILD_ARGS) KERNEL_SOURCE=$(KDIR) PLATFORM=$(PLATFORM)
+               KBUILD_EXTRA_SYMBOLS=$(CURDIR)/cdx/Module.symvers \
+               CONFIG_ASK_FCI=m
+ABM_ARGS    := $(KBUILD_ARGS) KERNEL_SOURCE=$(KDIR) PLATFORM=$(PLATFORM) \
+               CONFIG_ASK_AUTO_BRIDGE=m
 
 # Stamps to track what's been fetched/patched/built
 S := $(SRCDIR)/.stamps

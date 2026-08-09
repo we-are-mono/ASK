@@ -359,12 +359,17 @@ def _parse_fci_reply(result: dict) -> dict:
 
 
 async def fci_send(request: web.Request) -> web.Response:
-    """POST {fcode, length, payload_hex, [nlmsg_len_override], [timeout_ms]}
+    """POST {fcode, length, payload_hex, [nlmsg_len_override], [timeout_ms],
+             [uid], [userns]}
     -> FCI kernel reply.
 
     Designed for fuzzing the A1 validator tables AND the C2 length-
     validation defense: pass `nlmsg_len_override` to lie about the
     netlink header's length field independent of the body bytes sent.
+
+    `uid` / `userns` fork a child that drops privilege before opening
+    the netlink socket (the in-kernel netlink_capable gate checks the
+    socket opener's credentials), for capability-gate tests.
     """
     body = await _maybe_json(request)
     try:
@@ -378,10 +383,25 @@ async def fci_send(request: web.Request) -> web.Response:
     nlmsg_len_override = body.get("nlmsg_len_override")
     timeout_s = float(body.get("timeout_ms", 500)) / 1000.0
     failslab_times = body.get("failslab_times")
+    uid = body.get("uid")
+    if uid is not None:
+        uid = int(uid)
+    userns = bool(body.get("userns", False))
 
     fci_body = struct.pack("<HH", fcode, length) + payload
     try:
-        if failslab_times is None:
+        if uid is not None or userns:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _run_isolated(
+                    lambda: _netlink_send_sync(
+                        NETLINK_FF, fci_body, nlmsg_len_override,
+                        0, 0, timeout_s,
+                    ),
+                    uid, timeout_s, userns=userns,
+                ),
+            )
+        elif failslab_times is None:
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
                 _netlink_send_sync,
@@ -802,7 +822,8 @@ async def netlink_listen_stop(request: web.Request) -> web.Response:
 
 async def netlink_send(request: web.Request) -> web.Response:
     """POST {protocol, body_hex, [nlmsg_type, nlmsg_flags,
-                                  nlmsg_len_override, timeout_ms]}
+                                  nlmsg_len_override, timeout_ms,
+                                  uid, userns]}
     -> raw kernel reply.
 
     Lower-level than /fci/send: the agent prepends a netlink header but
@@ -810,6 +831,10 @@ async def netlink_send(request: web.Request) -> web.Response:
     netlink protocols that aren't FCI (e.g. NETLINK_L2FLOW=33 for
     auto_bridge) or to probe layers that wrap FCI with their own
     structure (like libfci's nlmsg_len trickery from the C2 write-up).
+
+    `uid` / `userns` fork a child that drops privilege before opening
+    the netlink socket (the in-kernel netlink_capable gate checks the
+    socket opener's credentials), for capability-gate tests.
     """
     body = await _maybe_json(request)
     try:
@@ -821,13 +846,29 @@ async def netlink_send(request: web.Request) -> web.Response:
     nlmsg_flags = int(body.get("nlmsg_flags", 0))
     nlmsg_len_override = body.get("nlmsg_len_override")
     timeout_s = float(body.get("timeout_ms", 500)) / 1000.0
+    uid = body.get("uid")
+    if uid is not None:
+        uid = int(uid)
+    userns = bool(body.get("userns", False))
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            _netlink_send_sync,
-            protocol, msg, nlmsg_len_override,
-            nlmsg_type, nlmsg_flags, timeout_s,
-        )
+        if uid is not None or userns:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _run_isolated(
+                    lambda: _netlink_send_sync(
+                        protocol, msg, nlmsg_len_override,
+                        nlmsg_type, nlmsg_flags, timeout_s,
+                    ),
+                    uid, timeout_s, userns=userns,
+                ),
+            )
+        else:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _netlink_send_sync,
+                protocol, msg, nlmsg_len_override,
+                nlmsg_type, nlmsg_flags, timeout_s,
+            )
     except OSError as e:
         return web.json_response({"error": f"socket error: {e}"}, status=500)
     return web.json_response(result)
