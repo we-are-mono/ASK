@@ -19,6 +19,11 @@ static struct proc_dir_entry *proc_rx_dir = NULL ;
 static struct proc_dir_entry *proc_pcd_dir = NULL ;
 static struct proc_dir_entry *proc_sa_dir = NULL ;
 static struct fqid_file_list_node_s *fqid_files_g = NULL;
+/* Guards the fqid_files_g list. Its mutators span two serialization
+ * domains (FCI dispatch and the rtnl-held vwd ioctl paths), all
+ * process context — plain spin_lock; list ops only under it, the
+ * sleeping proc_create/proc_remove run outside. */
+static DEFINE_SPINLOCK(fqid_files_lock);
 
 static int proc_fqid_stats_show(struct seq_file *m, void *v)
 {
@@ -128,10 +133,16 @@ void cdx_deinit_fqid_procfs(void)
 	proc_sa_dir = NULL;
 	/* the recursive proc_remove above freed every child pde; the
 	 * tracking nodes are ours to reclaim */
-	while (fqid_files_g) {
-		node = fqid_files_g;
-		fqid_files_g = (struct fqid_file_list_node_s *)node->list.next;
+	spin_lock(&fqid_files_lock);
+	node = fqid_files_g;
+	fqid_files_g = NULL;
+	spin_unlock(&fqid_files_lock);
+	while (node) {
+		struct fqid_file_list_node_s *next =
+			(struct fqid_file_list_node_s *)node->list.next;
+
 		kfree(node);
+		node = next;
 	}
 }
 
@@ -213,21 +224,18 @@ void cdx_remove_fqid_info_in_procfs(uint32_t fqid)
 {
 	struct fqid_file_list_node_s *node;
 
+	spin_lock(&fqid_files_lock);
 	node = fqid_files_g;
 	while (node)
 	{
 		if (node->fqid == fqid)
 		{
-			/* cdx_deinit_fqid_procfs removes the whole tree
-			 * recursively and NULLs proc_fqid_dir; the pde behind
-			 * node->proc_fs is freed with it, so only unlink and
-			 * reclaim the node once the tree is down */
-			if (proc_fqid_dir)
-				proc_remove(node->proc_fs);
 			if (node == fqid_files_g)
 			{
-				fqid_files_g = 
-					(struct fqid_file_list_node_s *)fqid_files_g->list.next;
+				fqid_files_g =
+					(struct fqid_file_list_node_s *)node->list.next;
+				if (fqid_files_g)
+					fqid_files_g->list.prev = NULL;
 				break;
 			}
 			node->list.prev->next = node->list.next;
@@ -237,9 +245,16 @@ void cdx_remove_fqid_info_in_procfs(uint32_t fqid)
 		}
 		node = (struct fqid_file_list_node_s *)node->list.next;
 	}
-	if (node)
+	spin_unlock(&fqid_files_lock);
+	if (node) {
+		/* cdx_deinit_fqid_procfs removes the whole tree recursively
+		 * and NULLs proc_fqid_dir; the pde behind node->proc_fs is
+		 * freed with it, so only reclaim the node once the tree is
+		 * down. proc_remove sleeps — outside the lock. */
+		if (proc_fqid_dir)
+			proc_remove(node->proc_fs);
 		kfree(node);
-	else if (proc_fqid_dir)
+	} else if (proc_fqid_dir)
 		/* not-found is expected once the deinit walk has already
 		 * reclaimed every node; only report it while the tree lives */
 		printk("ERROR:: unable to find fqid %d node\n", fqid);
@@ -278,12 +293,14 @@ static int cdx_create_fq_in_procfs(struct qman_fq *fq,
 		printk("%s(%d) proc_create_data failed\n",__func__,__LINE__);
 		return -1;
 	}
+	spin_lock(&fqid_files_lock);
 	if (fqid_files_g)
 	{
 		node->list.next = (struct dlist_head *)fqid_files_g;
 		fqid_files_g->list.prev = (struct dlist_head *)node;
 	}
 	fqid_files_g = node;
+	spin_unlock(&fqid_files_lock);
 
 	return 0;
 }

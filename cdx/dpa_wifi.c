@@ -15,6 +15,7 @@
 #include <net/pkt_sched.h>
 #include <linux/rcupdate.h>
 #include <linux/netdevice.h>
+#include <linux/if_vlan.h>
 #include <linux/etherdevice.h>
 #include <linux/if_ether.h>
 #include <linux/netfilter.h>
@@ -2495,6 +2496,29 @@ static void vwd_unpublish_vap(struct vap_desc_s *vap)
 	}
 }
 
+/* Republish the vap pointer onto VLAN devices riding on its wifi
+ * netdev. FCI VLAN registration copies the parent's pointer when the
+ * VLAN entry is added (control_vlan); a REMOVE/re-ADD cycle of the vap
+ * would otherwise leave those aliases cleared until the VLAN entry is
+ * re-registered, which no netlink event triggers. This publishes by
+ * netdev relationship, so VLANs that were never FCI-registered get the
+ * alias too — safe: their ESP traffic takes the SEC round-trip and
+ * falls back to the exception/software path. Caller holds rtnl. */
+static void vwd_publish_vlan_aliases(struct vap_desc_s *vap)
+{
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+	if (!vap->wifi_dev)
+		return;
+	for_each_netdev(&init_net, dev) {
+		if (is_vlan_dev(dev) &&
+		    vlan_dev_real_dev(dev) == vap->wifi_dev)
+			WRITE_ONCE(dev->wifi_offload_dev,
+					(struct net_device *)vap);
+	}
+}
+
 /** dpaa_vwd_handle_vap
  *
  */
@@ -2567,6 +2591,8 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			vap->state = VAP_ST_CONFIGURING;
 			spin_unlock_bh(&priv->vaplock);
 			rc = vwd_vap_up(priv, vap, cmd);
+			if (!rc)
+				vwd_publish_vlan_aliases(vap);
 			spin_lock_bh(&priv->vaplock);
 			if (rc < 0)
 			{
@@ -2882,6 +2908,75 @@ end:
 	return rc;
 }
 
+/* NETDEV_UNREGISTER teardown: cdx deliberately holds no ref on the
+ * wifi netdev (vwd_vap_up dev_puts after publishing), so an unregister
+ * while a VAP is OPEN would leave vap->wifi_dev and the fq net_dev
+ * links dangling. Notifiers run in process context under rtnl, so the
+ * unpublish + grace + down sequence the ioctl REMOVE arm uses works
+ * here too. Upper devices (VLAN aliases) unregister before their real
+ * device and each event clears its own dev's pointer. */
+static int vwd_netdev_event(struct notifier_block *nb,
+		unsigned long event, void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct dpaa_vwd_priv_s *priv = &vwd;
+	struct vap_desc_s *found = NULL;
+	struct net_device *p;
+	int ii;
+
+	if (event != NETDEV_UNREGISTER)
+		return NOTIFY_DONE;
+
+	p = READ_ONCE(dev->wifi_offload_dev);
+	if ((void *)p >= (void *)&priv->vaps[0] &&
+	    (void *)p < (void *)&priv->vaps[MAX_WIFI_VAPS])
+		WRITE_ONCE(dev->wifi_offload_dev, NULL);
+
+	/* claim every OPEN vap riding on the dying dev (a pathological
+	 * config can point several at one ifname) */
+	spin_lock_bh(&priv->vaplock);
+	for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
+		struct vap_desc_s *vap = &priv->vaps[ii];
+
+		if (vap->state == VAP_ST_OPEN && vap->wifi_dev == dev) {
+			vap->state = VAP_ST_CONFIGURING;
+			found = vap;
+		}
+	}
+	spin_unlock_bh(&priv->vaplock);
+
+	if (found) {
+		/* clear the claimed vaps' remaining aliases ourselves
+		 * rather than relying on upper devices (8021q) having
+		 * unregistered first — rtnl is held here */
+		for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
+			struct vap_desc_s *vap = &priv->vaps[ii];
+
+			if (vap->state == VAP_ST_CONFIGURING &&
+					vap->wifi_dev == dev)
+				vwd_unpublish_vap(vap);
+		}
+		/* wait out in-flight lock-free consumers before the fq
+		 * net_dev links go; the netdev itself outlives the
+		 * notifier chain, so vwd_vap_down's derefs are safe */
+		synchronize_rcu();
+		spin_lock_bh(&priv->vaplock);
+		for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
+			struct vap_desc_s *vap = &priv->vaps[ii];
+
+			if (vap->state == VAP_ST_CONFIGURING &&
+					vap->wifi_dev == dev)
+				vwd_vap_down(priv, vap);
+		}
+		spin_unlock_bh(&priv->vaplock);
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block vwd_netdev_notifier = {
+	.notifier_call = vwd_netdev_event,
+};
+
 /** dpaa_vwd_up
  *
  */
@@ -2898,6 +2993,10 @@ static int dpaa_vwd_up(struct dpaa_vwd_priv_s *priv )
 	if (dpaa_vwd_sysfs_init(priv))
 		goto err0;
 	wifi_rx_fastpath_register(vwd_wifi_if_send_pkt);
+	if (register_netdevice_notifier(&vwd_netdev_notifier))
+		DPAWIFI_ERROR("%s::netdevice notifier registration failed; "
+				"unregister-while-open teardown disabled\n",
+				__func__);
 
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s: End\n", __func__);
@@ -2930,6 +3029,13 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 	bitmap_zero(attr_mask, MAX_WIFI_VAPS);
 	bitmap_zero(fq_mask, MAX_WIFI_VAPS);
 
+	/* unregister_netdevice_notifier replays a synthesized
+	 * NETDEV_UNREGISTER for every live netdev to the departing
+	 * notifier, so this line already runs the notifier's
+	 * claim/grace/down sequence for each still-OPEN vap; the walk
+	 * below then finds them CONFIGURED and still releases their FQs
+	 * and attrs exactly once via the masks */
+	unregister_netdevice_notifier(&vwd_netdev_notifier);
 	wifi_rx_fastpath_unregister();
 	nf_unregister_net_hook(&init_net, &vwd_hook);
 	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
@@ -2940,14 +3046,21 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 	 * release_vap_fqs below can't free FQs under them. */
 	synchronize_rcu();
 
+	/* rtnl taken for the whole vap teardown: it drains any in-flight
+	 * vap ioctl (they run entirely under rtnl), so no slot can be
+	 * mid-ADD when the walk below runs, and it covers the netdev walk
+	 * in the alias sweep. Ioctls arriving after we drop it find every
+	 * slot CLOSE and bail on their state checks. */
+	rtnl_lock();
+
 	/* state transitions under the lock; sleeping teardown after */
 	spin_lock_bh(&priv->vaplock);
 	for (ii = 0; ii < MAX_WIFI_VAPS; ii++)
 	{
 		struct vap_desc_s *vap = &priv->vaps[ii];
 
-		/* a CONFIGURING slot means an ADD is mid-flight through
-		 * the failed-init chardev window; leave it alone */
+		/* unreachable now that rtnl above drains in-flight ioctls
+		 * before this walk; kept as a defensive skip */
 		if (vap->state == VAP_ST_CONFIGURING)
 			continue;
 
@@ -2966,7 +3079,6 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 	 * covers the wifi netdevs and any VLAN-on-vap aliases; a stale
 	 * pointer surviving module unload would hand a later cdx instance
 	 * a dangling vap */
-	rtnl_lock();
 	for_each_netdev(&init_net, dev) {
 		struct net_device *p = READ_ONCE(dev->wifi_offload_dev);
 

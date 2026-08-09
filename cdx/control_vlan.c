@@ -12,6 +12,7 @@
 #include "portdefs.h"
 #include "cdx.h"
 #include "cdx_cmd_validator.h"
+#include <linux/rtnetlink.h>
 #include "control_vlan.h"
 #include "misc.h"
 #include "control_stat.h"
@@ -217,8 +218,14 @@ found:
 			break;
 		}
 
+		/* under rtnl so the copy can't race the vwd REMOVE-time
+		 * unpublish walk (which runs with rtnl held) into
+		 * resurrecting a cleared alias */
+		rtnl_lock();
 		if (parent_device->wifi_offload_dev)
-			device->wifi_offload_dev = parent_device->wifi_offload_dev;
+			WRITE_ONCE(device->wifi_offload_dev,
+					READ_ONCE(parent_device->wifi_offload_dev));
+		rtnl_unlock();
 
 		vlan_add(pEntry);
 		break;
