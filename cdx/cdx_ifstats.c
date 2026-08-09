@@ -169,26 +169,36 @@ int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 }
 
 void free_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
-{	
+{
+	/* alloc_iface_stats returns SUCCESS with a NULL slot when the
+	 * freelist is exhausted — guard the pushback */
 	if (dev_type == IF_TYPE_PPPOE) {
 		struct cdx_pppoe_iface_ifinfo *pppoe_stats;
 
 		pppoe_stats = (struct cdx_pppoe_iface_ifinfo *)iface->stats;
-		spin_lock(&dpa_statslist_lock);
-		pppoe_stats->next = pppoe_ifstats_freelist;
-		pppoe_ifstats_freelist = pppoe_stats;
-		spin_unlock(&dpa_statslist_lock);
+		if (pppoe_stats) {
+			spin_lock(&dpa_statslist_lock);
+			pppoe_stats->next = pppoe_ifstats_freelist;
+			pppoe_ifstats_freelist = pppoe_stats;
+			spin_unlock(&dpa_statslist_lock);
+			iface->stats = NULL;
+		}
 	} else {
 		struct cdx_iface_ifinfo *ifstats;
 
 		ifstats = (struct cdx_iface_ifinfo *)iface->stats;
-		spin_lock(&dpa_statslist_lock);
-		ifstats->next = ifstats_freelist;
-		ifstats_freelist = ifstats;
-		spin_unlock(&dpa_statslist_lock);
+		if (ifstats) {
+			spin_lock(&dpa_statslist_lock);
+			ifstats->next = ifstats_freelist;
+			ifstats_freelist = ifstats;
+			spin_unlock(&dpa_statslist_lock);
+			iface->stats = NULL;
+		}
 	}
-	if (iface->last_stats)
+	if (iface->last_stats) {
 		kfree(iface->last_stats);
+		iface->last_stats = NULL;
+	}
 }
 
 uint32_t get_logical_ifstats_base(void)

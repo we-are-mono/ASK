@@ -1885,6 +1885,10 @@ static void free_stats(struct dpa_iface_info *info)
 		free_iface_stats(IF_TYPE_TUNNEL, info);
 		return;
 	}
+	if(info->if_flags & IF_TYPE_ETHERNET) {
+		free_iface_stats(IF_TYPE_ETHERNET, info);
+		return;
+	}
 	return;
 }
 
@@ -1931,6 +1935,9 @@ void dpa_release_interface(uint32_t itf_id)
 #endif
 				dpa_remove_ethport_ff_policier_profile(curr_info);
 				dpa_remove_virt_storage_profile(&curr_info->eth_info);
+				/* unpublish the stats slot from the driver before
+				 * free_stats below returns it to the freelist */
+				dpa_reset_eth_ifinfo(netdev_priv(curr_info->eth_info.net_dev));
 				dev_put(curr_info->eth_info.net_dev);
 			}
 			/* free stats */
@@ -2116,7 +2123,7 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 	if (dpa_add_port_to_list(iface_info)) {
 		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
 				__func__);
-		goto err_ret2;
+		goto err_stats;
 	}
 
 	if(dpa_add_virt_storage_profile(iface_info->eth_info.net_dev ,&iface_info->eth_info)){
@@ -2175,11 +2182,12 @@ err_ret7:
 #ifdef ENABLE_EGRESS_QOS
 	cdx_disable_ceetm_on_iface(iface_info);
 err_ret6:
+#endif
 #ifdef DPA_IPSEC_OFFLOAD
+	/* not nested under ENABLE_EGRESS_QOS: the discard mask was
+	 * reconfigured regardless of CEETM, so later failures must
+	 * restore it even in builds without egress QoS */
 	dpa_bman_restore_discard_mask(iface_info);
-#endif
-#endif
-#ifdef DPA_IPSEC_OFFLOAD
 err_ret5:
 #endif
 	/* Note: dpa_remove_ethport_ff_policier_profile() leaks the
@@ -2192,11 +2200,26 @@ err_ret4:
 	dpa_remove_virt_storage_profile(&iface_info->eth_info);
 err_ret3:
 	dpa_remove_port_from_list(iface_info);
+err_stats:
+#ifdef INCLUDE_ETHER_IFSTATS
+	if (iface_info->if_flags & IF_STATS_ENABLED) {
+		/* unpublish before the slot goes back to the freelist —
+		 * priv->ifinfo would otherwise keep pointing at recycled
+		 * stats memory the datapath writes through */
+		dpa_reset_eth_ifinfo(priv);
+		free_iface_stats(itf->type, iface_info);
+	}
+#endif
 err_ret2:
 	proc_remove(((cdx_proc_dir_entry_t *)(iface_info->pcd_proc_entry))->proc_dir);
 err_ret1:
 	proc_remove(((cdx_proc_dir_entry_t *)(iface_info->tx_proc_entry))->proc_dir);
 err_ret:
+	/* get_eth_iface_info holds a dev_get_by_name ref once net_dev is
+	 * set; released on no other error path (normal release is in
+	 * dpa_release_interface) */
+	if (iface_info->eth_info.net_dev)
+		dev_put(iface_info->eth_info.net_dev);
 	kfree(iface_info);
 	return FAILURE;
 }
