@@ -82,9 +82,19 @@
  *        (virt_iface_stats_callback via dev_get_stats) and any FCI
  *        reader that wants local invariants. Lock-free lookups in
  *        FCI-only paths lean on the remove-side invariant; see
- *        dpa_get_iface_stats_entries. Non-FCI lock-free walkers
- *        (vwd init/ioctl, devoh injection) are tracked in
- *        ISSUES.md N10.
+ *        dpa_get_iface_stats_entries. The former non-FCI lock-free
+ *        walkers (dpa_get_ohifinfo_by_portid,
+ *        cdx_copy_eth_rx_channel_info) now take the spinlock.
+ *        The boot injection ioctl (set_dpa_params) adds entries
+ *        outside the ctrl mutex, but it runs exactly once,
+ *        synchronously inside cdx module init (dpa_app via
+ *        UMH_WAIT_PROC, re-runs rejected with -EBUSY) — before
+ *        fci.ko can even load — so injection adds cannot overlap
+ *        FCI dispatch. (The ctrl timer thread does run during
+ *        injection, under ctrl->mutex, but its handlers touch only
+ *        the then-empty SA/CT tables, not this list.) The u8 iface
+ *        counters are therefore mutator-serialized in every
+ *        reachable schedule.
  *   dpa_interface_info (file-scope head pointer)
  *      - Protected by dpa_devlist_lock.
  *
@@ -639,13 +649,22 @@ struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid)
 {
 	struct dpa_iface_info *iface_info;
 
+	/* Called from vwd init and the vwd char-dev ioctl — outside the
+	 * FCI dispatcher mutex — so walk under the list lock. The
+	 * returned pointer stays valid without it: OFPORT entries are
+	 * never released (dpa_release_interface skips them), so their
+	 * lifetime is the module's. The type check matters — oh_info
+	 * lives in the per-type union, so a non-OFPORT entry's bytes at
+	 * that offset could false-match the portid. */
+	spin_lock(&dpa_devlist_lock);
 	iface_info = dpa_interface_info;
 	while (iface_info) {
-		/* search list for matching id */
-		if (iface_info->oh_info.portid == portid) 
+		if ((iface_info->if_flags & IF_TYPE_OFPORT) &&
+				(iface_info->oh_info.portid == portid))
 			break;
 		iface_info = iface_info->next;
 	}
+	spin_unlock(&dpa_devlist_lock);
 	return iface_info;
 }
 
@@ -1926,7 +1945,12 @@ void dpa_release_interface(uint32_t itf_id)
 	spin_lock(&dpa_devlist_lock);
 	curr_info = dpa_interface_info;
 	while (curr_info) {
-		if (curr_info->itf_id == itf_id)
+		/* OFPORT fixtures are injection-created, carry no onif id
+		 * (historically 0 from kzalloc, now the ~0U sentinel) and
+		 * are never FCI-released; skip them so a legitimate itf_id
+		 * can't alias one */
+		if (!(curr_info->if_flags & IF_TYPE_OFPORT) &&
+				(curr_info->itf_id == itf_id))
 			break;
 		prev_info = curr_info;
 		curr_info = curr_info->next;
@@ -2439,6 +2463,13 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 {
 	struct dpa_iface_info *iface_info;
 
+	if(iface_count >= (MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES))
+	{
+		DPA_ERROR("%s::Number of interfaces support in fast path is only %d\n",
+				__func__,
+				(MAX_LOGICAL_INTERFACES - MAX_PPPoE_INTERFACES));
+		return FAILURE;
+	}
 	//ethernet/physical iface type
 	iface_info = (struct dpa_iface_info *)
 		kzalloc(sizeof(struct dpa_iface_info), GFP_KERNEL);
@@ -2453,37 +2484,30 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 	iface_info->if_flags = itf->type;
 	strncpy(&iface_info->name[0], name, IF_NAME_SIZE);
 	iface_info->wlan_info.vap_id = vap_id;
-	memcpy(&iface_info->wlan_info.mac_addr[0], mac, ETH_ALEN); 
-	get_wlan_iface_info(iface_info);
+	memcpy(&iface_info->wlan_info.mac_addr[0], mac, ETH_ALEN);
+	if (get_wlan_iface_info(iface_info)) {
+		DPA_ERROR("%s::get_wlan_iface_info failed\n", __func__);
+		goto err_ret;
+	}
 
 #ifdef DEVMAN_DEBUG
 	display_iface_info(iface_info);
 #endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
-		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n",
+		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
 				__func__);
 		goto err_ret;
 	}
+	/* dpa_release_interface decrements iface_count for WLAN entries;
+	 * without this increment repeated vap add/remove cycles underflow
+	 * the u8 counter and the cap checks then reject every add */
+	iface_count++;
 
 	return SUCCESS;
 err_ret:
 	kfree(iface_info);
 	return FAILURE;
-}
-
-/* Update mac address of wlan interface */
-int dpa_update_wlan_if(struct _itf *itf, unsigned char* mac)
-{
-	struct dpa_iface_info *iface_info;
-	iface_info = dpa_get_ifinfo_by_itfid(itf->index);
-	if (!iface_info)
-	{
-		DPA_ERROR("%s::interface info not found \n",__func__);
-		return FAILURE;
-	}
-	memcpy(&iface_info->wlan_info.mac_addr[0], mac, ETH_ALEN); 
-	return SUCCESS;
 }
 
 /* This function sets the interface with its bridged status
@@ -2780,6 +2804,10 @@ int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq)
 {
 	struct dpa_iface_info *iface_info;
 
+	/* reachable from vwd init/ioctl and the injection path — outside
+	 * the FCI dispatcher mutex — so walk and copy under the list
+	 * lock; the caller keeps only the copied channel id */
+	spin_lock(&dpa_devlist_lock);
 	iface_info = dpa_interface_info;
 	while(1) {
 		if (!iface_info)
@@ -2787,11 +2815,13 @@ int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq)
 		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
 			if (iface_info->eth_info.fman_idx == fman_idx) {
 				dpa_fq->channel = iface_info->eth_info.rx_channel_id;
+				spin_unlock(&dpa_devlist_lock);
 				return 0;
 			}
 		}
 		iface_info = iface_info->next;
 	}
+	spin_unlock(&dpa_devlist_lock);
 	return -1;
 }
 
@@ -3071,24 +3101,5 @@ int devman_init_linux_stats(void)
 	/* init number active connecions counter */
 	atomic_set(&num_active_connections, 0);
 	return 0;
-}
-
-int dpa_get_itfid_by_fman_params(uint32_t fman_index, uint32_t portid)
-{
-	struct dpa_iface_info *iface_info;
-
-	iface_info = dpa_interface_info;
-	while(1) {
-		if (!iface_info)
-			break;
-		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
-			if ((fman_index == iface_info->eth_info.fman_idx) &&
-					(portid == iface_info->eth_info.portid))
-				return (iface_info->itf_id);
-		}
-		iface_info = iface_info->next;
-	}
-	printk("%s::failed\n", __func__);
-	return -1;
 }
 

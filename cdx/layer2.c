@@ -105,6 +105,12 @@ void remove_onif_by_index(U32 if_index)
 		return;
 	}
 
+	/* Stale or never-configured indexes (e.g. tx_exit's sweep over
+	 * unconfigured ports, whose itf.index is still 0) must not tear
+	 * down whatever live interface currently owns that index. */
+	if (!(gOnif_DB[if_index].flags & ENTRY_VALID))
+		return;
+
 	IP_deleteCt_from_onif_index(if_index);
 
 	// disable route entries bound to this interface

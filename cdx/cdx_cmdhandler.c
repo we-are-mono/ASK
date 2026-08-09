@@ -242,42 +242,11 @@ int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u1
 }
 EXPORT_SYMBOL(comcerto_fpp_send_command);
 
-/**
- * comcerto_fpp_send_command_simple - 
- *
- *	This function is used to send command to FPP in a synchronous way. Calls to the function blocks until a response
- *	from FPP is received. This API can not be used to query data from FPP
- *	
- * Parameters
- *	fcode:		Function code. FPP function code associated to the specified command payload
- *	length:		Command length. Length in bytes of the command payload
- *	payload:	Command payload. Payload of the command sent to the FPP. 16bits buffer allocated by the client's code and sized up to 256 bytes
- *
- * Return values
- *	0:	Success
- *	<0:	Linux system failure (check errno for detailed error condition)
- *	>0:	FPP returned code
- */
-int comcerto_fpp_send_command_simple(u16 fcode, u16 length, u16 *payload)
-{
-	u16 rbuf[128];
-	u16 rlen;
-	int rc;
-
-	rc = comcerto_fpp_send_command(fcode, length, payload, &rlen, rbuf);
-
-	/* if a command delivery error is detected, do not check command returned code */
-	if (rc < 0)
-		return rc;
-
-	/* retrieve FPP command returned code. Could be error or acknowledgment */
-	rc = rbuf[0];
-
-	return rc;
-}
-EXPORT_SYMBOL(comcerto_fpp_send_command_simple);
 
 
+/* Drains ctrl->msg_list into comcerto_fpp_send_command. Its only
+ * producer (the exported _atomic wrapper) was removed as dead code;
+ * the work is INIT_WORK'd but never scheduled today. */
 void comcerto_fpp_workqueue(struct work_struct *work)
 {
 	struct _cdx_ctrl *ctrl = container_of(work, struct _cdx_ctrl, work);
@@ -311,83 +280,7 @@ void comcerto_fpp_workqueue(struct work_struct *work)
 	spin_unlock_irqrestore(&ctrl->lock, flags);
 }
 
-/**
- * comcerto_fpp_send_command_atomic -
- *
- *	This function is used to send command to FPP in an asynchronous way. The Caller specifies a function pointer
- *	that is called by the FPP Comcerto driver when command reponse from FPP engine is received. This API can be also
- *	used to query data from FPP. Queried data are returned through the specified client's callback function
- *
- * Parameters
- *	fcode:		Function code. FPP function code associated to the specified command payload
- *	length:		Command length. Length in bytes of the command payload
- *	payload:	Command payload. Payload of the command sent to the FPP. 16bits buffer allocated by the client's code and sized up to 256 bytes
- *	callback:	Client's callback handler for FPP response processing
- *	data:		Client's private data. Not interpreted by the FPP driver and sent back to the Client as a reference (client's code own usage)
- *
- * Return values
- *	0:	Success
- *	<0:	Linux system failure (check errno for detailed error condition)
- **/
-int comcerto_fpp_send_command_atomic(u16 fcode, u16 length, u16 *payload, void (*callback)(unsigned long, int, u16, u16 *), unsigned long data)
-{
-	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
-	struct fpp_msg *msg;
-	unsigned long flags;
-	int rc;
 
-	if (length > FPP_MAX_MSG_LENGTH) {
-		rc = -EINVAL;
-		goto err0;
-	}
-
-	msg = kmalloc(sizeof(struct fpp_msg) + length, GFP_ATOMIC);
-	if (!msg) {
-		rc = -ENOMEM;
-		goto err0;
-	}
-
-	/* set caller's callback function */
-	msg->callback = callback;
-	msg->data = data;
-
-	msg->payload = (u16 *)(msg + 1);
-
-	msg->fcode = fcode;
-	msg->length = length;
-	memcpy(msg->payload, payload, length);
-
-	spin_lock_irqsave(&ctrl->lock, flags);
-
-	list_add(&msg->list, &ctrl->msg_list);
-
-	spin_unlock_irqrestore(&ctrl->lock, flags);
-
-	schedule_work(&ctrl->work);
-
-	return 0;
-
-err0:
-	return rc;
-}
-
-EXPORT_SYMBOL(comcerto_fpp_send_command_atomic);
-
-
-int cdx_ctrl_send_command_simple(u16 fcode, u16 length, u16 *payload)
-{
-	u16 rbuf[128];
-	u16 rlen;
-	int rc;
-
-	/* send command to FE */
-	comcerto_fpp_send_command(fcode, length, payload, &rlen, rbuf);
-
-	/* retrieve FE command returned code. Could be error or acknowledgment */
-	rc = rbuf[0];
-
-	return rc;
-}
 
 
 /**

@@ -228,7 +228,6 @@ struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);
 void display_iface_info(struct dpa_iface_info *iface_info);
 int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq);
 int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry);
-int dpa_get_itfid_by_fman_params(uint32_t fman_index, uint32_t portid);
 void dpa_release_iflist(void);
 uint32_t get_logical_ifstats_base(void);
 void *dpa_get_fm_MURAM_handle(uint32_t fm_idx, uint64_t *phyBaseAddr,
