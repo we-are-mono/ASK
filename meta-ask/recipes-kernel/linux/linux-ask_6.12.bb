@@ -41,6 +41,7 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://096-sdk_fman-mac-hash-alloc-null-check.patch \
            file://097-xfrm-trans-queue-force-dst-refcount.patch \
            file://098-sdk_dpaa-bp-alloc-slab-build-skb.patch \
+           file://099-sdk_fman-ehash-flex-arrays.patch \
           "
 
 # Optional KASAN overlay — flipped on by the user with
