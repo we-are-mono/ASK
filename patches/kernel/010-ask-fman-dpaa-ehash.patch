@@ -1,7 +1,10 @@
-From 273be3c024ce46c5d9d9efb30ad5764e253976ff Mon Sep 17 00:00:00 2001
+From c4c74e38723bc2bdfdb0d1f40d474d8f2624dab2 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 The foundation patch for the ASK fast-path stack on LS1046A.
 
@@ -15,6 +18,15 @@ netdevice/net_device fields (wifi_offload_dev) plus the dev_queue_xmit
 hook infrastructure (dpaa_wifi_xmit_local_ipsec_handler,
 dpa_register_wifi_xmit_local_hook, original_dev_queue_xmit,
 dpa_add_dummy_eth_hdr) that downstream slices (020-080) consume.
+
+Every cdx-registered hook has a matching unregister
+(dpa_unregister_ipsec_fq_handler, dpa_unregister_ceetm_get_egress_fq,
+unregister_dpaa_eth_bpool_replenish_hook,
+dpa_unregister_wifi_xmit_local_hook) that clears the pointer and
+synchronize_rcu()s before returning, so cdx deinit — including the
+failed-init unwind — can free module text safely and a later load can
+register again. Datapath readers take a READ_ONCE snapshot instead of
+re-reading the global across the NULL check and the call.
 
 Also ships the NETLINK_FF=30, NETLINK_KEY=32, NETLINK_L2FLOW=33 protocol
 reservations and the IFF_WIFI_OFLD interface flag in UAPI.
@@ -32,8 +44,8 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   34 +-
  .../freescale/sdk_dpaa/dpaa_eth_ceetm.c       |    1 +
  .../freescale/sdk_dpaa/dpaa_eth_common.c      |  131 +-
- .../freescale/sdk_dpaa/dpaa_eth_common.h      |   40 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  941 ++++++-
+ .../freescale/sdk_dpaa/dpaa_eth_common.h      |   43 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  991 ++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
@@ -94,18 +106,18 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/staging/fsl_qbman/qman_high.c         |  121 +-
  include/linux/fsl_oh_port.h                   |   26 +
  include/linux/fsl_qman.h                      |    6 +
- include/linux/netdevice.h                     |   29 +
+ include/linux/netdevice.h                     |   43 +
  include/linux/skbuff.h                        |   15 +
  .../uapi/linux/fmd/Peripherals/fm_ioctls.h    |   28 +
  .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   45 +-
  include/uapi/linux/if.h                       |    3 +
  include/uapi/linux/netlink.h                  |    6 +-
  net/Kconfig                                   |    9 +
- net/core/dev.c                                |   81 +-
+ net/core/dev.c                                |  101 +-
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 79 files changed, 10232 insertions(+), 560 deletions(-)
+ 79 files changed, 10319 insertions(+), 560 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -593,16 +605,17 @@ index 515dfb68ed5f..5fb8fb920675 100644
 +}
 +EXPORT_SYMBOL(dpa_update_eth_if);
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-index f46c243ff1b8..9bd7f1e2a43c 100644
+index f46c243ff1b8..f2aab2fd806c 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-@@ -97,6 +97,21 @@ typedef enum dpaa_eth_hook_result (*dpaa_eth_egress_hook_t)(
+@@ -97,6 +97,23 @@ typedef enum dpaa_eth_hook_result (*dpaa_eth_egress_hook_t)(
  typedef enum dpaa_eth_hook_result (*dpaa_eth_confirm_hook_t)(
  		struct net_device *net_dev, const struct qm_fd *fd, u32 fqid);
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 +typedef struct qman_fq *(*cdx_get_ipsec_fq_hook_t)(u32 handle);
 +int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn);
++void dpa_unregister_ipsec_fq_handler(void);
 +int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd);
 + __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp);
 +
@@ -612,13 +625,14 @@ index f46c243ff1b8..9bd7f1e2a43c 100644
 +typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint32_t queue, uint32_t ff);
 +typedef struct qman_fq *(*cdx_get_ceetm_dscp_fq)(void *, uint8_t dscp);
 +int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func);
++void dpa_unregister_ceetm_get_egress_fq(void);
 +#endif
 +
 +
  /* used in napi related functions */
  extern u16 qman_portal_max;
  
-@@ -136,6 +151,12 @@ void fsl_dpaa_eth_set_hooks(struct dpaa_eth_hooks_s *hooks);
+@@ -136,6 +153,13 @@ void fsl_dpaa_eth_set_hooks(struct dpaa_eth_hooks_s *hooks);
  extern struct dpaa_eth_hooks_s dpaa_eth_hooks;
  #endif
  
@@ -626,12 +640,13 @@ index f46c243ff1b8..9bd7f1e2a43c 100644
 +typedef int (*dpaa_eth_bpool_replenish_hook_t)(
 +				struct net_device *net_dev, u32 bpid);
 +void register_dpaa_eth_bpool_replenish_hook(dpaa_eth_bpool_replenish_hook_t func);
++void unregister_dpaa_eth_bpool_replenish_hook(void);
 +#endif
 +
  int dpa_netdev_init(struct net_device *net_dev,
  		    const uint8_t *mac_addr,
  		    uint16_t tx_timeout);
-@@ -147,6 +168,8 @@ dpa_get_stats64(struct net_device *net_dev,
+@@ -147,6 +171,8 @@ dpa_get_stats64(struct net_device *net_dev,
  		struct rtnl_link_stats64 *stats);
  int dpa_ndo_init(struct net_device *net_dev);
  int dpa_set_features(struct net_device *dev, netdev_features_t features);
@@ -640,7 +655,7 @@ index f46c243ff1b8..9bd7f1e2a43c 100644
  #ifdef CONFIG_FSL_DPAA_TS
  u64 dpa_get_timestamp_ns(const struct dpa_priv_s *priv,
  			enum port_type rx_tx, const void *data);
-@@ -170,6 +193,8 @@ struct dpa_bp *dpa_bpid2pool(int bpid);
+@@ -170,6 +196,8 @@ struct dpa_bp *dpa_bpid2pool(int bpid);
  void dpa_bpid2pool_map(int bpid, struct dpa_bp *dpa_bp);
  bool dpa_bpid2pool_use(int bpid);
  void dpa_bp_drain(struct dpa_bp *bp);
@@ -649,7 +664,7 @@ index f46c243ff1b8..9bd7f1e2a43c 100644
  #ifdef CONFIG_FMAN_PFC
  u16 dpa_select_queue(struct net_device *net_dev, struct sk_buff *skb,
  		     struct net_device *sb_dev,
-@@ -201,13 +226,14 @@ void dpaa_eth_init_ports(struct mac_device *mac_dev,
+@@ -201,13 +229,14 @@ void dpaa_eth_init_ports(struct mac_device *mac_dev,
  		struct device *dev);
  void dpa_release_sgt(struct qm_sg_entry *sgt);
  void dpa_release_sgt_by_bpid(struct qm_sg_entry *sgt);
@@ -666,7 +681,7 @@ index f46c243ff1b8..9bd7f1e2a43c 100644
  void dpa_enable_ceetm(struct net_device *dev);
  void dpa_disable_ceetm(struct net_device *dev);
  #endif
-@@ -222,5 +248,15 @@ int dpa_proxy_set_mac_address(struct proxy_device *proxy_dev,
+@@ -222,5 +251,15 @@ int dpa_proxy_set_mac_address(struct proxy_device *proxy_dev,
  			  struct net_device *net_dev);
  int dpa_proxy_set_rx_mode(struct proxy_device *proxy_dev,
  		      struct net_device *net_dev);
@@ -683,14 +698,13 @@ index f46c243ff1b8..9bd7f1e2a43c 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..1784cf262c25 100644
+index 4164644d3268..f5db837fcfc0 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -52,6 +52,55 @@
- #endif
+@@ -53,6 +53,78 @@
  #ifdef CONFIG_FSL_DPAA_CEETM
  #include "dpaa_eth_ceetm.h"
-+#endif
+ #endif
 +#if defined(CONFIG_IP_NF_CONNTRACK_MARK) || defined(CONFIG_NF_CONNTRACK_MARK)
 +#include "net/netfilter/nf_conntrack.h"
 +#endif // CONFIG_IP_NF_CONNTRACK_MARK ||  CONFIG_NF_CONNTRACK_MARK
@@ -713,15 +727,27 @@ index 4164644d3268..1784cf262c25 100644
 +#ifdef CONFIG_CPE_FAST_PATH
 +static cdx_get_ceetm_egressfq ceetm_fqget_func;
 +static cdx_get_ceetm_dscp_fq ceetm_dscp_fqget_func;
-+/* This function registers two cdx functions, which are to get the egress fq. 
++/* This function registers two cdx functions, which are to get the egress fq.
 +   One is based on channel and classqueue and another one is based on dscp. */
 +int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func)
 +{
-+	ceetm_fqget_func = egress_fq_func;
-+	ceetm_dscp_fqget_func = dscp_fq_func;
++	/* release-publish so readers can't see the hooks before the
++	 * ceetm state they walk is initialized */
++	smp_store_release(&ceetm_fqget_func, egress_fq_func);
++	smp_store_release(&ceetm_dscp_fqget_func, dscp_fq_func);
 +	return 0;
 +}
 +EXPORT_SYMBOL(dpa_register_ceetm_get_egress_fq);
++
++/* Called on cdx deinit. Waits out in-flight datapath readers so the
++ * hooks' module text may be freed once this returns. */
++void dpa_unregister_ceetm_get_egress_fq(void)
++{
++	WRITE_ONCE(ceetm_fqget_func, NULL);
++	WRITE_ONCE(ceetm_dscp_fqget_func, NULL);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL(dpa_unregister_ceetm_get_egress_fq);
 +#endif
 +
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
@@ -729,20 +755,32 @@ index 4164644d3268..1784cf262c25 100644
 +
 +int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn)
 +{
-+       if (cdx_get_ipsec_fq_hookfn) {
-+               printk("%s::hook already registered\n", __func__);
-+               return -1;
-+       }
-+       cdx_get_ipsec_fq_hookfn = hookfn;
-+       return 0;
++	if (cdx_get_ipsec_fq_hookfn) {
++		printk("%s::hook already registered\n", __func__);
++		return -1;
++	}
++	/* release-publish so readers can't see the hook before the SA
++	 * state it walks is initialized */
++	smp_store_release(&cdx_get_ipsec_fq_hookfn, hookfn);
++	return 0;
 +}
-+
 +EXPORT_SYMBOL(dpa_register_ipsec_fq_handler);
 +
- #endif
++/* Called on cdx deinit, including the failed-init unwind. Clearing the
++ * hook is what lets the next cdx load register again (the register
++ * refuses to overwrite); the synchronize_rcu makes sure no softirq
++ * reader is still inside the old hook once this returns. */
++void dpa_unregister_ipsec_fq_handler(void)
++{
++	WRITE_ONCE(cdx_get_ipsec_fq_hookfn, NULL);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL(dpa_unregister_ipsec_fq_handler);
++#endif
  
  /* DMA map and add a page frag back into the bpool.
-@@ -81,6 +130,109 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
+  * @vaddr fragment must have been allocated with netdev_alloc_frag(),
+@@ -81,6 +153,109 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
  	(*count_ptr)++;
  }
  
@@ -852,7 +890,7 @@ index 4164644d3268..1784cf262c25 100644
  static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
  {
  	void *new_buf, *fman_buf;
-@@ -182,12 +334,13 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
+@@ -182,12 +357,13 @@ static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
  /* Add buffers/(pages) for Rx processing whenever bpool count falls below
   * REFILL_THRESHOLD.
   */
@@ -868,7 +906,7 @@ index 4164644d3268..1784cf262c25 100644
  		do {
  			new_bufs = _dpa_bp_add_8_bufs(dpa_bp);
  			if (unlikely(!new_bufs)) {
-@@ -198,10 +351,10 @@ int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr)
+@@ -198,10 +374,10 @@ int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr)
  				break;
  			}
  			count += new_bufs;
@@ -881,7 +919,7 @@ index 4164644d3268..1784cf262c25 100644
  			return -ENOMEM;
  	}
  
-@@ -365,7 +518,7 @@ EXPORT_SYMBOL(dpa_buf_is_recyclable);
+@@ -365,7 +541,7 @@ EXPORT_SYMBOL(dpa_buf_is_recyclable);
   * We are guaranteed there is enough room at the end of the data buffer to
   * accommodate the shared info area of the skb.
   */
@@ -890,7 +928,7 @@ index 4164644d3268..1784cf262c25 100644
  					      const struct qm_fd *fd,
  					      bool *use_gro, bool dcl4c_valid)
  {
-@@ -417,14 +570,14 @@ static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
+@@ -417,14 +593,14 @@ static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
  
  	return skb;
  }
@@ -907,7 +945,7 @@ index 4164644d3268..1784cf262c25 100644
  					  const struct qm_fd *fd, bool *use_gro,
  					  int *count_ptr, bool dcl4c_valid)
  {
-@@ -444,7 +597,8 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+@@ -444,7 +620,8 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
  	vaddr = phys_to_virt(addr);
  	DPA_BUG_ON(!IS_ALIGNED((unsigned long)vaddr, SMP_CACHE_BYTES));
  
@@ -917,7 +955,7 @@ index 4164644d3268..1784cf262c25 100644
  	/* Iterate through the SGT entries and add data buffers to the skb */
  	sgt = vaddr + fd_off;
  	for (i = 0; i < DPA_SGT_MAX_ENTRIES; i++) {
-@@ -452,9 +606,9 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+@@ -452,9 +629,9 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
  		DPA_BUG_ON(qm_sg_entry_get_ext(&sgt[i]));
  
  		/* We use a single global Rx pool */
@@ -929,7 +967,7 @@ index 4164644d3268..1784cf262c25 100644
  		sg_addr = qm_sg_addr(&sgt[i]);
  		sg_vaddr = phys_to_virt(sg_addr);
  		DPA_BUG_ON(!IS_ALIGNED((unsigned long)sg_vaddr,
-@@ -537,6 +691,7 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+@@ -537,6 +714,7 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
  	dpa_bp_recycle_frag(dpa_bp, (unsigned long)vaddr, count_ptr);
  	return skb;
  }
@@ -937,22 +975,33 @@ index 4164644d3268..1784cf262c25 100644
  
  #ifdef CONFIG_FSL_DPAA_DBG_LOOP
  static inline int dpa_skb_loop(const struct dpa_priv_s *priv,
-@@ -554,6 +709,14 @@ static inline int dpa_skb_loop(const struct dpa_priv_s *priv,
+@@ -554,6 +732,25 @@ static inline int dpa_skb_loop(const struct dpa_priv_s *priv,
  }
  #endif
  
 +#ifndef EXCLUDE_FMAN_IPR_OFFLOAD
 +void register_dpaa_eth_bpool_replenish_hook(dpaa_eth_bpool_replenish_hook_t func)
 +{
-+	dpaa_eth_bpool_replenish_hook = func;
++	/* release-publish so readers can't see the hook before the
++	 * bpools it refills are initialized */
++	smp_store_release(&dpaa_eth_bpool_replenish_hook, func);
 +}
 +EXPORT_SYMBOL(register_dpaa_eth_bpool_replenish_hook);
++
++/* Called on cdx IPR deinit. Waits out in-flight RX readers so the
++ * hook's module text may be freed once this returns. */
++void unregister_dpaa_eth_bpool_replenish_hook(void)
++{
++	WRITE_ONCE(dpaa_eth_bpool_replenish_hook, NULL);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL(unregister_dpaa_eth_bpool_replenish_hook);
 +#endif
 +
  void __hot _dpa_rx(struct net_device *net_dev,
  		struct qman_portal *portal,
  		const struct dpa_priv_s *priv,
-@@ -573,7 +736,7 @@ void __hot _dpa_rx(struct net_device *net_dev,
+@@ -573,7 +770,7 @@ void __hot _dpa_rx(struct net_device *net_dev,
  
  	if (unlikely(fd_status & FM_FD_STAT_RX_ERRORS) != 0) {
  		if (netif_msg_hw(priv) && net_ratelimit())
@@ -961,23 +1010,28 @@ index 4164644d3268..1784cf262c25 100644
  					fd_status & FM_FD_STAT_RX_ERRORS);
  
  		percpu_stats->rx_errors++;
-@@ -599,6 +762,15 @@ void __hot _dpa_rx(struct net_device *net_dev,
+@@ -599,6 +796,20 @@ void __hot _dpa_rx(struct net_device *net_dev,
  			/* won't count the rx bytes in */
  			return;
  		}
 +#endif
 +#ifndef EXCLUDE_FMAN_IPR_OFFLOAD
-+		if (dpaa_eth_bpool_replenish_hook) {
-+			if (dpaa_eth_bpool_replenish_hook(net_dev, fd->bpid)) {
-+				//could not replenish buffer, drop packet ??
-+				printk("%s::could not replenish buffer to pool\n",
-+						__func__);
++		{
++			dpaa_eth_bpool_replenish_hook_t replenish_hook =
++					READ_ONCE(dpaa_eth_bpool_replenish_hook);
++
++			if (replenish_hook) {
++				if (replenish_hook(net_dev, fd->bpid)) {
++					//could not replenish buffer, drop packet ??
++					printk("%s::could not replenish buffer to pool\n",
++							__func__);
++				}
 +			}
 +		}
  #endif
  		skb = contig_fd_to_skb(priv, fd, &use_gro, dcl4c_valid);
  	} else {
-@@ -645,6 +817,7 @@ void __hot _dpa_rx(struct net_device *net_dev,
+@@ -645,6 +856,7 @@ void __hot _dpa_rx(struct net_device *net_dev,
  _release_frame:
  	dpa_fd_release(net_dev, fd);
  }
@@ -985,7 +1039,7 @@ index 4164644d3268..1784cf262c25 100644
  
  int __hot skb_to_contig_fd(struct dpa_priv_s *priv,
  			   struct sk_buff *skb, struct qm_fd *fd,
-@@ -746,7 +919,7 @@ EXPORT_SYMBOL(skb_to_contig_fd);
+@@ -746,7 +958,7 @@ EXPORT_SYMBOL(skb_to_contig_fd);
   * - SG fragments that aren't mod 16 bytes in size (except for the last
   *   fragment)
   */
@@ -994,7 +1048,7 @@ index 4164644d3268..1784cf262c25 100644
  {
  	skb_frag_t *frag;
  	int i, nr_frags;
-@@ -808,12 +981,13 @@ static bool a050385_check_skb(struct sk_buff *skb, struct dpa_priv_s *priv)
+@@ -808,12 +1020,13 @@ static bool a050385_check_skb(struct sk_buff *skb, struct dpa_priv_s *priv)
  
  	return false;
  }
@@ -1009,7 +1063,7 @@ index 4164644d3268..1784cf262c25 100644
  					   struct dpa_priv_s *priv)
  {
  	int trans_offset = skb_transport_offset(skb);
-@@ -882,8 +1056,213 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
+@@ -882,8 +1095,213 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
  	put_page(npage);
  	return NULL;
  }
@@ -1223,7 +1277,7 @@ index 4164644d3268..1784cf262c25 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1409,532 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1448,543 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1332,14 +1386,17 @@ index 4164644d3268..1784cf262c25 100644
 +	unsigned char* skb_nh ;
 +	struct sec_path *sp;
 +	unsigned int dpovrd = 0;
++	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
++	 * concurrently; never read the global twice */
++	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
 +
 +	sp = skb_sec_path(skb);
 +
-+	if ((cdx_get_ipsec_fq_hookfn) && (sp) && (sp->len))
++	if ((get_ipsec_fq) && (sp) && (sp->len))
 +	{
 +		x = sp->xvec[0];
 +
-+		egress_fq = cdx_get_ipsec_fq_hookfn(x->handle);
++		egress_fq = get_ipsec_fq(x->handle);
 +
 +		/* when a packet is submitting to SEC engine,
 +		use the below code */
@@ -1503,13 +1560,16 @@ index 4164644d3268..1784cf262c25 100644
 +	unsigned short dev_type = skb->dev->type;
 +#endif
 +	struct net_device *real_dev = NULL;
++	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
++	 * concurrently; never read the global twice */
++	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
 +
-+	if (cdx_get_ipsec_fq_hookfn)
++	if (get_ipsec_fq)
 +	{
 +		/*net_crit_ratelimited("%s(%d) x->handle %d, skb->data %p, machdr %p\n",
 +		  __func__,__LINE__, sagd,skb->data, skb_mac_header(skb)); */
 +		/* Get the SEC FQID corresponding to sagd */
-+		sec_fq = cdx_get_ipsec_fq_hookfn(sagd);
++		sec_fq = get_ipsec_fq(sagd);
 +
 +		/*if no SEC FQID found, return non-zero to return pkt to linux*/
 +		if (!sec_fq || !(skb->dev))
@@ -1686,17 +1746,22 @@ index 4164644d3268..1784cf262c25 100644
 +#endif
 +#endif
 +	if (priv->ceetm_en) {
++		/* snapshot: dpa_unregister_ceetm_get_egress_fq may NULL the
++		 * hooks concurrently; never read the globals twice */
++		cdx_get_ceetm_egressfq ceetm_get_fq = READ_ONCE(ceetm_fqget_func);
++		cdx_get_ceetm_dscp_fq ceetm_get_dscp_fq = READ_ONCE(ceetm_dscp_fqget_func);
++
 +		/* markval also using to know qosconnmark is present for this packet. */
 +		/* If markval is 0 assuming qosconnmark is not present for this packet(connection). */
 +		markval = pfe_eth_get_queuenum(skb);
 +		queuenum = markval & 0xf;
 +		channel_id = (markval >> CHANNEL_BIT_POSITION) & 0xf;
 +		egress_fq = NULL;
-+		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when qosconnark(markval is 0) is not present or 
++		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when qosconnark(markval is 0) is not present or
 +						can't find egress fq for dscp */
 +		/* markval is 0 means qosconnmark is not configured, so getting dscp from skb. */
 +		/* using dscp get the egress fq. */
-+		if (!markval) {
++		if (!markval && ceetm_get_dscp_fq) {
 +			skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
 +			if (skb_nh)
 +			{
@@ -1712,21 +1777,21 @@ index 4164644d3268..1784cf262c25 100644
 +					dscp = ((((struct ipv6hdr *)skb_nh)->priority) << 2) /* priority is 4 bit size, shifting 2 bits left to give space for flow_lbl[0] 2 bits */
 +						+ ((((struct ipv6hdr *)skb_nh)->flow_lbl[0]) >> 6); /* flow_lbl[0] is 8 bit size, DSCP 2 bits are here, so shifting 6 bits right*/
 +				}
-+				egress_fq = ceetm_dscp_fqget_func(priv->qm_ctx, dscp);
++				egress_fq = ceetm_get_dscp_fq(priv->qm_ctx, dscp);
 +				if (egress_fq)
 +					get_ceetm_cm_egress_fq = 0;
 +			}
 +		}
 +		if (get_ceetm_cm_egress_fq)
 +		{
-+			if (ceetm_fqget_func) {
-+				egress_fq = ceetm_fqget_func(priv->qm_ctx, 
++			if (ceetm_get_fq) {
++				egress_fq = ceetm_get_fq(priv->qm_ctx,
 +					channel_id,queuenum,ff);
 +			}
 +			if (!egress_fq) {
 +				printk(KERN_CRIT "%s::unable to get ceetm fq, mark %08x registered func %p"
 +						"dropping packet\n",
-+						__func__, markval , ceetm_fqget_func);
++						__func__, markval , ceetm_get_fq);
 +				dev_kfree_skb(skb);
 +				return NETDEV_TX_OK;
 +			}
@@ -1757,7 +1822,7 @@ index 4164644d3268..1784cf262c25 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +1946,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +1996,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1768,7 +1833,7 @@ index 4164644d3268..1784cf262c25 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1212,13 +2118,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2168,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */
@@ -13097,7 +13162,7 @@ index c42bde697436..68225db4d865 100644
  }
  #endif
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index 35b886385f32..18df164f5752 100644
+index 35b886385f32..44c1346c0077 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -2071,6 +2071,10 @@ struct net_device {
@@ -13111,7 +13176,7 @@ index 35b886385f32..18df164f5752 100644
  	int			ifindex;
  	unsigned int		real_num_rx_queues;
  	struct netdev_rx_queue	*_rx;
-@@ -3097,10 +3101,27 @@ u16 dev_pick_tx_zero(struct net_device *dev, struct sk_buff *skb,
+@@ -3097,10 +3101,41 @@ u16 dev_pick_tx_zero(struct net_device *dev, struct sk_buff *skb,
  int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev);
  int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id);
  
@@ -13125,9 +13190,23 @@ index 35b886385f32..18df164f5752 100644
 +
 +static inline int dev_queue_xmit(struct sk_buff *skb)
 +{
-+	if (dpaa_wifi_xmit_local_ipsec_handler && skb->ipsec_offload &&
-+	    skb->dev->wifi_offload_dev)
-+		return dpaa_wifi_xmit_local_ipsec_handler(skb);
++	/* snapshot: dpa_unregister_wifi_xmit_local_hook may NULL the hook
++	 * concurrently; never read the global twice. This runs before
++	 * __dev_queue_xmit's rcu_read_lock_bh, possibly in plain process
++	 * context, so take an explicit read-side section for the
++	 * unregister's synchronize_rcu */
++	dpaa_wifi_xmit_local_hook_t wifi_xmit_hook;
++
++	rcu_read_lock();
++	wifi_xmit_hook = READ_ONCE(dpaa_wifi_xmit_local_ipsec_handler);
++	if (wifi_xmit_hook && skb->ipsec_offload &&
++	    skb->dev->wifi_offload_dev) {
++		int rc = wifi_xmit_hook(skb);
++
++		rcu_read_unlock();
++		return rc;
++	}
++	rcu_read_unlock();
 +	return original_dev_queue_xmit(skb);
 +}
 +#else
@@ -13139,7 +13218,7 @@ index 35b886385f32..18df164f5752 100644
  
  static inline int dev_queue_xmit_accel(struct sk_buff *skb,
  				       struct net_device *sb_dev)
-@@ -5271,6 +5292,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
+@@ -5271,6 +5306,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
  
  extern struct net_device *blackhole_netdev;
  
@@ -13350,7 +13429,7 @@ index 5b3c54974d06..f41e7658b445 100644
  source "net/ipv6/Kconfig"
  source "net/netlabel/Kconfig"
 diff --git a/net/core/dev.c b/net/core/dev.c
-index cfd32bd02a69..7f01d99fffd6 100644
+index cfd32bd02a69..33389c965fe1 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -172,6 +172,10 @@ static int call_netdevice_notifiers_extack(unsigned long val,
@@ -13386,7 +13465,7 @@ index cfd32bd02a69..7f01d99fffd6 100644
  		/* If packet is not checksummed and device does not
  		 * support checksumming for this protocol, complete
  		 * checksumming here.
-@@ -4544,6 +4555,40 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
+@@ -4544,6 +4555,44 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
  }
  EXPORT_SYMBOL(__dev_queue_xmit);
  
@@ -13404,15 +13483,19 @@ index cfd32bd02a69..7f01d99fffd6 100644
 +		pr_warn("%s: hook already registered\n", __func__);
 +		return -1;
 +	}
-+	dpaa_wifi_xmit_local_ipsec_handler = hookfn;
++	/* release-publish so readers can't see the hook before the vwd
++	 * state it uses is initialized */
++	smp_store_release(&dpaa_wifi_xmit_local_ipsec_handler, hookfn);
 +	return 0;
 +}
 +EXPORT_SYMBOL(dpa_register_wifi_xmit_local_hook);
 +
-+/* Unregister the IPSEC offload hook */
++/* Unregister the IPSEC offload hook. Waits out in-flight xmit readers
++ * so the hook's module text may be freed once this returns. */
 +void dpa_unregister_wifi_xmit_local_hook(void)
 +{
-+	dpaa_wifi_xmit_local_ipsec_handler = NULL;
++	WRITE_ONCE(dpaa_wifi_xmit_local_ipsec_handler, NULL);
++	synchronize_rcu();
 +}
 +EXPORT_SYMBOL(dpa_unregister_wifi_xmit_local_hook);
 +
@@ -13427,7 +13510,7 @@ index cfd32bd02a69..7f01d99fffd6 100644
  int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
  {
  	struct net_device *dev = skb->dev;
-@@ -5552,6 +5597,14 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
+@@ -5552,6 +5601,14 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
  
  	trace_netif_receive_skb(skb);
  
@@ -13442,7 +13525,7 @@ index cfd32bd02a69..7f01d99fffd6 100644
  	orig_dev = skb->dev;
  
  	skb_reset_network_header(skb);
-@@ -6893,8 +6946,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
+@@ -6893,8 +6950,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
  		napi_gro_flush(n, HZ >= 1000);
  	}
  
@@ -13451,13 +13534,24 @@ index cfd32bd02a69..7f01d99fffd6 100644
  	/* Some drivers may have called napi_schedule
  	 * prior to exhausting their budget.
  	 */
-@@ -11045,10 +11096,28 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
+@@ -11045,10 +11100,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
  			storage->rx_otherhost_dropped += READ_ONCE(core_stats->rx_otherhost_dropped);
  		}
  	}
 +#if defined(CONFIG_CPE_FAST_PATH)
-+	if (fast_path_stats_get)
-+		fast_path_stats_get(dev, storage);
++	{
++		/* snapshot: dev_fp_stats_get_deregister may NULL the hook
++		 * concurrently; never read the global twice. dev_get_stats
++		 * runs in plain process context, so take an explicit
++		 * read-side section for the deregister's synchronize_rcu */
++		fp_iface_stats_get fp_stats_get;
++
++		rcu_read_lock();
++		fp_stats_get = READ_ONCE(fast_path_stats_get);
++		if (fp_stats_get)
++			fp_stats_get(dev, storage);
++		rcu_read_unlock();
++	}
 +#endif
  	return storage;
  }
@@ -13466,13 +13560,18 @@ index cfd32bd02a69..7f01d99fffd6 100644
 +#if defined(CONFIG_CPE_FAST_PATH)
 +void dev_fp_stats_get_register(fp_iface_stats_get func)
 +{
-+	fast_path_stats_get = func;
++	/* release-publish so readers can't see the hook before the state
++	 * it walks is initialized */
++	smp_store_release(&fast_path_stats_get, func);
 +}
 +EXPORT_SYMBOL(dev_fp_stats_get_register);
 +
++/* Called on cdx deinit. Waits out in-flight dev_get_stats readers so
++ * the hook's module text may be freed once this returns. */
 +void dev_fp_stats_get_deregister(void)
 +{
-+	fast_path_stats_get = NULL;
++	WRITE_ONCE(fast_path_stats_get, NULL);
++	synchronize_rcu();
 +}
 +EXPORT_SYMBOL(dev_fp_stats_get_deregister);
 +#endif
