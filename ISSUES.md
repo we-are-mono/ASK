@@ -75,17 +75,6 @@ stale line refs) are folded into the archive one-liners.
   stays 0" hazard for any listener added to an existing group. Fix: `wmb()` before
   the :1242 publish; review the REMOVE unlink at :1176-1196 (lower risk).
 
-- [ ] **N3. `cdx_get_ipsec_fq_hookfn` is never cleared — a failed init after ipsec wedges all future cdx loads.**
-  The kernel-side hook (patch 010, `dpaa_eth_common`) set by `ipsec_init` has no
-  unregister API, and `dpa_register_ipsec_fq_handler` refuses re-registration.
-  If `CMD_INIT(ipsec)` succeeds but a later `CMD_INIT` (mc4/mc6/rtp_relay) fails,
-  the failed load leaves the hook pointing into freed module text and every
-  subsequent cdx load fails permanently at `ipsec_init` until reboot. Crash
-  reachability is near-zero (the hook needs offloaded SA state that can't exist
-  without cdx/cmm alive) and cdx is persistent in practice, so this didn't block
-  A21's closure — but it deserves an unregister-on-deinit fix. (Found by the
-  tunnel/route audit pass.)
-
 - [ ] **N4. `dpaa_vwd_driver_init` leaks the eth0 netdev ref on its `err7` unwind.**
   `get_eth_priv("eth0")` ([cdx/dpa_wifi.c:2944](cdx/dpa_wifi.c#L2944)) takes a
   netdev ref held for VWD lifetime; the init-failure path at `err7:` (:2986) does
@@ -105,6 +94,17 @@ stale line refs) are folded into the archive one-liners.
   Root-only footgun, not a security issue — the H8 bounds were applied to
   `abm_max_entries` but `abm_retransmit_delay` still accepts 0. Fix: min bound 1.
   (Adjacent finding from the H-series audit pass.)
+
+- [ ] **N7. `dpaa_vwd_up`'s netfilter hooks leak on cdx unload while the vwd fast path is enabled.**
+  `dpaa_vwd_up` ([cdx/dpa_wifi.c:2791](cdx/dpa_wifi.c#L2791)) registers three
+  `nf_register_net_hook` entries when the sysfs toggle enables the vwd fast
+  path; only the sysfs-driven `dpaa_vwd_down` unregisters them, and
+  `dpaa_vwd_exit` never calls it. `rmmod cdx` (or a failed-init unwind) with
+  `vwd_fast_path_enable=1` leaves netfilter dispatching into freed module
+  text. Unreachable in the N3 failed-init flow (the toggle requires a running
+  system) and cdx is persistent in practice, but the exit path should tear
+  down the fast path (call the `dpaa_vwd_down` logic, or unregister-if-enabled)
+  before the rest of the vwd teardown. (Found by the N3 hook-lifecycle audit.)
 
 ---
 
@@ -146,6 +146,7 @@ file's git history.
 - **H7-r.** `rtnl_lock()` under `spin_lock_bh(&abm_lock)` on the *regular* abm workqueue drain (not exit-only as the in-code comment claimed) — `bridge_list_rtevent` is now spliced to a local list under the lock and `rtmsg_ifinfo`/`dev_put` run after unlock (GFP_KERNEL); concurrency comment corrected. Exercised by `test_abm_port_flap.py` under PROVE_LOCKING/DEBUG_ATOMIC_SLEEP.
 - **H2 (partial).** IPsec keys not zeroed on free — kfree_sensitive on the SA-context keys; the query-snapshot sibling leak is reopened as H2-r.
 - **H11.** `abm_fdb_can_expire` (a `br_fdb_cleanup` workqueue callback — process context, BH enabled) took `abm_lock` with plain `spin_lock`, violating the BH-disable discipline it shares with the softirq-context timer/EBT paths — a self-deadlock / `{SOFTIRQ-ON-W}` lockdep hazard. All three sites switched to `spin_lock_bh`/`spin_unlock_bh`.
+- **N3.** `cdx_get_ipsec_fq_hookfn` had no unregister and the register refuses overwrite — a failed cdx init after `CMD_INIT(ipsec)` wedged every later load at `ipsec_init` until reboot (same wedge reachable via the wifi hook on the vwd stats-failure unwind). All five cdx-facing hook families (ipsec fq / ceetm fq / bpool replenish / wifi xmit / fp stats) got unregister-on-deinit with `synchronize_rcu` teardown, release-publish registers, snapshot readers, explicit RCU sections at the two process-context readers, and the ceetm dscp NULL guard (_81421c2_ patch 010 regen, _b2342ce_ cdx). Sibling vwd nf-hook unload leak filed as N7.
 
 ## Medium
 - **M1.** Query of 6-8 listener groups OOB'd the reply buffer — pagination reserves 2 cmds/group, pages via bIsValidEntry look-ahead.
