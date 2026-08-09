@@ -75,17 +75,6 @@ stale line refs) are folded into the archive one-liners.
   stays 0" hazard for any listener added to an existing group. Fix: `wmb()` before
   the :1242 publish; review the REMOVE unlink at :1176-1196 (lower risk).
 
-- [ ] **N2. `/proc/ucode_frag/*` read handlers `sprintf` into the `__user` buffer.**
-  `stats_read` ([cdx/cdx_ehash.c:3061](cdx/cdx_ehash.c#L3061)) and
-  `buff_alloc_test` (:3084) `sprintf` directly into `char __user *buf` with no
-  `copy_to_user` — the exact KUAP/PAN-broken pattern M3 fixed in procfs.c. Both
-  are registered world-readable (0444) as `/proc/ucode_frag/stats` and
-  `/proc/ucode_frag/test_alloc_buf_n_free`, created unconditionally at cdx init,
-  so any local user's `cat` makes the kernel write through a user pointer (PAN
-  fault/oops = local DoS). `buff_alloc_test` additionally runs 128 bman
-  acquire/release cycles per read. Fix: same seq_file conversion as M3.
-  (Independently flagged by two audit passes — high confidence.)
-
 - [ ] **N3. `cdx_get_ipsec_fq_hookfn` is never cleared — a failed init after ipsec wedges all future cdx loads.**
   The kernel-side hook (patch 010, `dpaa_eth_common`) set by `ipsec_init` has no
   unregister API, and `dpa_register_ipsec_fq_handler` refuses re-registration.
@@ -174,6 +163,7 @@ file's git history.
 - **M13.** Duplicate names in REMOVE still tripped the count-match full delete — member_id bitmap dedupes, repeats rejected with ERR_MC_CONFIG.
 - **M14.** cmm_parse_rtattr logged rta->rta_len after loop exit (OOB read on a truncated rtattr) — parser shared with the ASAN fuzzer, logs remaining length only.
 - **M15 (partial).** FMAN PCD didn't replicate IPv4 mcast to listener subifs — dev_mc_add/del sequencing + wmb before the ADD-path publish; UPDATE-path barrier reopened as M15-r.
+- **N2.** `/proc/ucode_frag/*` read handlers sprintf'd into the `__user` buffer (M3's class) — both converted to single_open/seq_file; proc entries now removed at deinit ahead of bufpool/MURAM teardown (stale-proc_ops class A3b fixed for fqid), partial-create unwound, test file 0400 with honest acquire count, and a NULL `bp->pool` deref dropped from the bufpool-create error path (_b593f93_).
 
 ## Low / Hardening
 - **L1.** Fixed-seed Jenkins/jhash on attacker-chosen L2-flow keys (cdx + auto_bridge) — per-boot-keyed hsiphash/siphash; jenk_hash.h deleted (_89e5b32_ + _bf8c453_).
