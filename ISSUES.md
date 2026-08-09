@@ -4,340 +4,245 @@ Working list from the security review of `cdx/`, `fci/`, and `auto_bridge/`.
 Entries are short by design — each fix's reasoning lives in the commit
 referenced as `Fixed: <hash>`. Read the commit message for context.
 
+Closed items are collapsed to one-liners under **[Archive](#archive)**;
+the full reasoning for each lives in its referenced commit and in this
+file's git history. The **Open** section below is the live work list.
+
 **Status legend:** `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` wontfix/not-a-bug
 
+An adversarial re-audit (2026-08-09, 12 grouped correctness passes over all
+89 closed items) confirmed 74 closures on repo evidence and reopened the
+items below. Every reopening is static-conclusive — none needs on-DUT
+verification. Bookkeeping corrections from that audit (wrong commit hashes,
+stale line refs) are folded into the archive one-liners.
+
 ---
+
+## Open
+
+- [ ] **A9. Tunnel TX encap never offloads — ucode 210.10.1 `INSERT_L3_HDR` punts unconditionally.**
+  The completed A9 work (RX decap offload for 6o4+4o6, the `ip6_tunnel.c`
+  underlying_iif RX stamp in patch 030, the second 10G port in
+  `cdx_cfg.xml`, patch 099 shipped, the honest TX tripwire test, the
+  occupancy-golden re-oracle) is archived. The residual is external: the
+  encap ehash entry is byte-perfect in DDR and matches in hardware (per-entry
+  stats count the packets), but the HM chain aborts at `INSERT_L3_HDR(0x44)`
+  and punts every frame to the exception path. Every other opcode in the
+  chain is proven working in live decap/forward chains; `create_tunnel_insert_hm`
+  is line-identical to the NXP reference and the ucode is md5-identical to
+  NXP's ASK release, so the reference shipped the same untested path.
+  **Disposition: NXP-support ticket** (memory `a9-insert-l3-hdr-ucode-blocked`).
+  Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
+  and decap is hardware-offloaded. Keep open as the tracking anchor.
+
+- [ ] **H2-r. SA query snapshot leaks full key material through plain `kfree`.** (reopened)
+  The primary H2 fix (`kfree_sensitive` on cipher/auth/split keys at
+  [cdx/cdx_dpa_ipsec.c:461-470](cdx/cdx_dpa_ipsec.c#L461)) is correct, but the
+  same class survives at a sibling site the closure claimed clean:
+  [cdx/query_ipsec.c:181,188](cdx/query_ipsec.c#L181) memcpy the full
+  `cipher_key[64]`/`auth_key[64]` into the `SAQueryCommand` snapshot, which is
+  released with `Heap_Free` (= plain `kfree`, [cdx/cdx_hal.c:67-69](cdx/cdx_hal.c#L67))
+  at query_ipsec.c:278/299/322. Any SA-QUERY therefore leaves complete key
+  copies in freed slab — exactly what H2 set out to eliminate. Fix: zeroize the
+  snapshot (or route it through `kfree_sensitive`) before free. The stat
+  snapshot carries no keys and is fine.
+
+- [ ] **H7-r. `rtnl_lock()` taken under `spin_lock_bh()` on the abm workqueue send path.** (reopened)
+  The H7 refcount fix (`dev_hold`/balanced `dev_put`) is correct. But the drain
+  it extends calls `rtnl_lock()` (a sleeping mutex) at
+  [auto_bridge/auto_bridge.c:218](auto_bridge/auto_bridge.c#L218) while holding
+  `spin_lock_bh(&abm_lock)` taken at :180 — and this is the *regular* workqueue
+  path `abm_do_work_send_msg` (queued on every bridge FDB event), not module
+  exit. The in-code concurrency comment at :102-106 misdescribes it as
+  exit-only and claims it's "flagged in ISSUES.md" (it was not). Pre-existing
+  NXP pattern, but a real recurring sleep-in-atomic that DEBUG_ATOMIC_SLEEP will
+  flag. Fix: splice `bridge_list_rtevent` to a local list under the lock, send
+  `rtmsg_ifinfo` + `dev_put` after unlock.
+
+- [ ] **A3e-r. `dpa_add_eth_if` leaks a netdev refcount and iface stats on error paths.** (reopened)
+  The A3e helpers (policer/discard-mask/CEETM teardown) landed correctly, but two
+  acquisitions inside the same cascade are released on no error path:
+  (1) `get_eth_iface_info` takes a netdev ref via `dev_get_by_name`
+  ([cdx/devman.c:472](cdx/devman.c#L472)); no `err_ret*` label does the matching
+  `dev_put`, so every failure after devman.c:2076 leaks it — later surfacing as
+  the `unregister_netdevice: waiting for ethX to become free` hang (the internal
+  returns at :547/:568 leak too). (2) `alloc_iface_stats` (:2104) kzallocs
+  `last_stats` and consumes a freelist slot with no error-path `free_iface_stats`,
+  and the stale pointer is already published via `dpa_set_eth_ifinfo` (:2108).
+  Related: `free_stats` ([:1873](cdx/devman.c#L1873)) has no `IF_TYPE_ETHERNET`
+  arm, so even the normal release path leaks `last_stats` on every eth removal.
+  A3 (umbrella) stays open until this is fixed. Fix: `dev_put` +
+  `free_iface_stats` + `dpa_set_eth_ifinfo(priv, NULL)` in the cascade, plus an
+  eth arm in `free_stats`.
+
+- [ ] **M15-r. Mcast replication write-barrier missing on the UPDATE-path chain publish.** (reopened)
+  M15's `dev_mc_add/del` sequencing and the `wmb()` before the *initial-ADD*
+  ehash publish ([cdx/cdx_ehash.c:1174](cdx/cdx_ehash.c#L1174)) are correct, but
+  `cdx_exthash_update_first_mcast_member_addr` publishes a freshly built listener
+  entry into a *live* chain with no barrier between the entry-fill stores and the
+  `first_member_flow_addr` store at
+  [cdx/dpa_control_mc.c:1242](cdx/dpa_control_mc.c#L1242); the intervening
+  spinlock is acquire-only and orders nothing for FMAN. UPDATE is the only way to
+  reach the 6-8 listener case, so this is the same "CC ticks, listener TX FQ
+  stays 0" hazard for any listener added to an existing group. Fix: `wmb()` before
+  the :1242 publish; review the REMOVE unlink at :1176-1196 (lower risk).
+
+- [ ] **N1. FCI/abm netlink input paths have no capability gate.**
+  G1 closed the CAP gap on the `/dev/cdx_ctrl` ioctl, but the sibling entry
+  points are ungated: `fci_open_netlink` ([fci/fci.c:131](fci/fci.c#L131),
+  `NETLINK_FF`) and `abm_nl_init` ([auto_bridge/auto_bridge.c:720](auto_bridge/auto_bridge.c#L720),
+  `NETLINK_L2FLOW`) create sockets with no `netlink_capable`/`CAP_NET_ADMIN`
+  check in the `.input` path. The FCI command bus reconfigures the datapath, so
+  an unprivileged process that opens the socket bypasses the G1 gate entirely.
+  Same bug class as G1. (Found by the G/C audit pass.)
+
+- [ ] **N2. `/proc/ucode_frag/*` read handlers `sprintf` into the `__user` buffer.**
+  `stats_read` ([cdx/cdx_ehash.c:3061](cdx/cdx_ehash.c#L3061)) and
+  `buff_alloc_test` (:3084) `sprintf` directly into `char __user *buf` with no
+  `copy_to_user` — the exact KUAP/PAN-broken pattern M3 fixed in procfs.c. Both
+  are registered world-readable (0444) as `/proc/ucode_frag/stats` and
+  `/proc/ucode_frag/test_alloc_buf_n_free`, created unconditionally at cdx init,
+  so any local user's `cat` makes the kernel write through a user pointer (PAN
+  fault/oops = local DoS). `buff_alloc_test` additionally runs 128 bman
+  acquire/release cycles per read. Fix: same seq_file conversion as M3.
+  (Independently flagged by two audit passes — high confidence.)
+
+- [ ] **N3. `cdx_get_ipsec_fq_hookfn` is never cleared — a failed init after ipsec wedges all future cdx loads.**
+  The kernel-side hook (patch 010, `dpaa_eth_common`) set by `ipsec_init` has no
+  unregister API, and `dpa_register_ipsec_fq_handler` refuses re-registration.
+  If `CMD_INIT(ipsec)` succeeds but a later `CMD_INIT` (mc4/mc6/rtp_relay) fails,
+  the failed load leaves the hook pointing into freed module text and every
+  subsequent cdx load fails permanently at `ipsec_init` until reboot. Crash
+  reachability is near-zero (the hook needs offloaded SA state that can't exist
+  without cdx/cmm alive) and cdx is persistent in practice, so this didn't block
+  A21's closure — but it deserves an unregister-on-deinit fix. (Found by the
+  tunnel/route audit pass.)
+
+- [ ] **N4. `dpaa_vwd_driver_init` leaks the eth0 netdev ref on its `err7` unwind.**
+  `get_eth_priv("eth0")` ([cdx/dpa_wifi.c:2944](cdx/dpa_wifi.c#L2944)) takes a
+  netdev ref held for VWD lifetime; the init-failure path at `err7:` (:2986) does
+  `vwd.eth_priv = NULL` without `dev_put(vwd.eth_priv->net_dev)`, so any failure
+  of the tx-bpool/xmit-hook/stats setup leaks the ref permanently. This also
+  refutes M2's closure claim that "the other three callers are all balanced."
+  Fix: one `dev_put` before nulling. (Found by the cmm/cdx-misc audit pass.)
+
+- [ ] **N5. `cdx_ipsec_create_shareddescriptor` tests DMA maps with `!addr` instead of `dma_mapping_error()`.**
+  [cdx/cdx_dpa_ipsec.c:2240,2250,2260](cdx/cdx_dpa_ipsec.c#L2240) check
+  `if (!auth_key_dma)` / `if (!crypto_key_dma)`; a real mapping failure returns
+  `DMA_MAPPING_ERROR` (~0UL, truthy) and sails past the guard, so the H3 unwind
+  never fires on an actual map failure. Fix: `dma_mapping_error(dev, addr)`.
+  (Adjacent finding from the H-series audit pass.)
+
+- [ ] **N6. `abm_retransmit_delay` sysctl accepts 0, spinning the self-requeuing retransmit work.** (minor)
+  Root-only footgun, not a security issue — the H8 bounds were applied to
+  `abm_max_entries` but `abm_retransmit_delay` still accepts 0. Fix: min bound 1.
+  (Adjacent finding from the H-series audit pass.)
+
+---
+
+<a name="archive"></a>
+# Archive
+
+Closed items, one line each. Detail lives in the referenced commit and in this
+file's git history.
 
 ## Gating
+- **G1.** `/dev/cdx_ctrl` ioctl dispatcher was ungated — added a CAP_NET_ADMIN check ahead of the command-table lookup (_815a0ca_).
+- **G2.** Single-open gate had a mis-rejection window — replaced with a single atomic_cmpxchg(1→0).
 
-- [x] **G1. `/dev/cdx_ctrl` ioctl had no capability check.**
-  [cdx/cdx_dev.c:110-140](cdx/cdx_dev.c#L110-L140). Unprivileged users could reconfigure the DPAA datapath. _Fixed: 815a0ca_ — `CAP_NET_ADMIN` gate on the dispatcher.
+## Critical
+- **C1.** auto_bridge L2FLOWA_IP_SRC/DST memcpy trusted attacker nla_len into a 16-byte union — nla_policy caps NLA_BINARY len to the field size.
+- **C2.** FCI inbound trusted sender nlmsg_len for OOB-sized payloads — validate fci_msg->length against skb->len and FCI_MSG_MAX_PAYLOAD.
+- **C3.** IPR release loop walked FMAN-supplied num_entries unbounded — cap against reassly_bp->size / entry-size before the release loop.
+- **C4.** IPR ref_count (uint8_t) could wrap on double-decrement — zero-check and drop before decrementing.
+- **C5.** IPR deinit was a stub leaving the timer kthread and FQs live (UAF on unload) — full kthread-stop + FQ retire/oos/destroy + bpool free.
+- **C6.** dpa_cfg scaled allocations by attacker-influenced counts — sanity caps + kcalloc, num_fmans==0 rejected, sub-counts allow legit zero.
+- **C7.** Six fm_index checks used `> num_fmans` (one index OOB) — all flipped to `>=`.
+- **Bonus.** cdx_ctrl_deinit (.text) referenced cdx_cmdhandler_exit (.exit.text) — dropped __exit so the section reference is legal.
+- **C8.** queue_no/port_idx/dscp used as unchecked array indices from userspace — entry bounds checks added in dpa_cfg.c and cdx_ehash.c.
+- **C9.** Test ioctl kzalloc overflow — mooted: the buggy code was deleted outright with the testapp scaffolding (see C9b), not sanity-capped (_815a0ca_).
+- **C9b.** Dead testapp scaffolding remained compiled-in — deleted dpa_test.c, testapp.c and the CDX_CTRL_DPA_CONNADD ioctl + structs (moots H10).
 
-- [x] **G2. Racy single-open gate.**
-  [cdx/cdx_dev.c:48-56](cdx/cdx_dev.c#L48-L56). `atomic_dec_and_test` + `atomic_inc` was check-then-act with a transient mis-rejection window. _Fixed: 815a0ca_ — `atomic_cmpxchg(1→0)`.
+## High
+- **H1.** Concurrent CDX_CTRL_DPA_SET_PARAMS ioctls could UAF fman_info — dpa_cfg_lock mutex, -EBUSY re-init reject, err_ret unwind (_815a0ca_).
+- **H3.** IPsec shared-desc error paths leaked auth/cipher key DMA maps — two-label unwind + SA_SH_DESC_BUILT rollback on add failure.
+- **H4.** CAAM shared-desc map-then-unmap suspected bug — wontfix: deliberate cache-flush idiom; SEC reads the desc via the ipsecsa handle; documented.
+- **H5.** NAT-T SPI slot check used `> MAX_SPI_PER_FLOW`, letting the "full" sentinel index the array — reject with `>=`.
+- **H6.** auto_bridge per-bucket lock-drop iteration suspected UAF — wontfix: no state crosses the drop; entries rebound per bucket under lock.
+- **H8.** abm sysctls lacked a capability gate and abm_max_entries accepted 0 — CAP_NET_ADMIN check + proc_douintvec_minmax bounds 1..1e6.
+- **H9.** Static query-snapshot cursors raced concurrent enumerators — per-file query mutexes + mc bucket spinlocks; mutator walks tracked under A2.
+- **H10.** strncpy_from_user truncation unchecked — mooted: all four sites lived in dpa_test.c, deleted with the C9b test-scaffolding removal.
+- **H7 (partial).** net_device stored without dev_hold — dev_hold/balanced dev_put added; the drain's sleep-under-spinlock residual is reopened as H7-r.
+- **H2 (partial).** IPsec keys not zeroed on free — kfree_sensitive on the SA-context keys; the query-snapshot sibling leak is reopened as H2-r.
 
----
+## Medium
+- **M1.** Query of 6-8 listener groups OOB'd the reply buffer — pagination reserves 2 cmds/group, pages via bIsValidEntry look-ahead.
+- **M2.** dev_get_by_name leaks (control_vlan) — wontfix: control_vlan paths are NULL-guarded and balanced; a missed dpa_wifi sibling is filed as N4.
+- **M3.** Unbounded sprintf chain in the fqid_stats procfs handler — converted to seq_file; two ucode_frag siblings of the same class filed as N2.
+- **M4.** %px and raw %p handle prints in cdx debug output — %px removed, sensitive handle prints flipped to %pK; hashed %p left per policy.
+- **M5.** auto_bridge netlink dispatch used signed nlmsg_type with no default arm — narrowed to u16, unknown types return -EINVAL.
+- **M6.** auto_bridge exit hot-spun on bare schedule() waiting for l2flow drain — bounded 5s wait with 1-jiffy sleeps and pr_warn on timeout.
+- **M7.** IPsec table-entry add left the shared descriptor dangling on failure (explicit TBD) — SA_SH_DESC_BUILT rolled back, entry/ct/info freed on unwind.
+- **M8.** Full-group mcast delete unlinked shared list state lock-free — list_del now under the bucket spinlock, sleeping HW teardown after unlock.
+- **M9.** mcast ADD unwind could leak pCtEntry/pRtEntry if a future path failed after wiring them — err_ret now frees both, defense in depth (_c23817b_).
+- **M10.** Cdx_GetMcastMemberId returned ids stale across dropped bucket locks — mc_mutators_mutex serializes ADD/REMOVE/UPDATE at the dispatcher.
+- **M11.** GetMcastGrp returned a group pointer freeable after the bucket lock dropped — the same mc_mutators_mutex closes the window.
+- **M12.** REMOVE fast path keyed on count alone; wrong names wiped the group — every listener pre-validated, mismatch returns ERR_MC_CONFIG.
+- **M13.** Duplicate names in REMOVE still tripped the count-match full delete — member_id bitmap dedupes, repeats rejected with ERR_MC_CONFIG.
+- **M14.** cmm_parse_rtattr logged rta->rta_len after loop exit (OOB read on a truncated rtattr) — parser shared with the ASAN fuzzer, logs remaining length only.
+- **M15 (partial).** FMAN PCD didn't replicate IPv4 mcast to listener subifs — dev_mc_add/del sequencing + wmb before the ADD-path publish; UPDATE-path barrier reopened as M15-r.
 
-## CRITICAL
+## Low / Hardening
+- **L1.** Fixed-seed Jenkins/jhash on attacker-chosen L2-flow keys (cdx + auto_bridge) — per-boot-keyed hsiphash/siphash; jenk_hash.h deleted (_89e5b32_ + _bf8c453_).
+- **L2.** strcpy into equal-sized IF_NAME_SIZE buffers across cdx control paths — full sweep to strscpy(dst, src, sizeof(dst)); none remain.
+- **L3.** sprintf into small fixed name buffers in cdx procfs — snprintf bounded by sizeof(node->name).
+- **L4.** proc_create("fci", 0, ...) left permissions implicit — mode set to 0444, read-only intent explicit.
+- **L5.** Dead unimplemented ioctl prototypes in cdx_ioctl.h — stubs plus supporting structs/macros removed (incl. a cmd-number collision).
+- **L6.** Reassembly release misnamed cpu_to_be* on BE-to-host reads — renamed be*_to_cpu, u8→u16 zero-extend documented; no-op on LE.
+- **L7.** UBSAN array-bounds on the flex-array subscript in create_ethernet_hm — store converted to pointer arithmetic, semantics unchanged.
+- **L8.** cmm sig_term_hdlr logged benign ENOENT for an already-removed pidfile — both cleanup sites report only errno != ENOENT.
 
-Memory corruption or info-leak reachable from userspace.
-
-- [x] **C1. Netlink attr length trusted as memcpy size (auto_bridge).**
-  [auto_bridge/auto_bridge.c:540-544](auto_bridge/auto_bridge.c#L540-L544). `nla_len` controlled the memcpy into a 16-byte stack union. _Fixed: 815a0ca_ — `nla_policy[]` for L2FLOWA_*.
-
-- [x] **C2. FCI netlink message — no length validation.**
-  [fci/fci.c:417-475](fci/fci.c#L417-L475). Short `nlmsg_len` + large `fci_msg->length` → OOB read. _Fixed: 815a0ca, corrected in 0a8a5f6_ — gate on `skb->len`, not on the sender-supplied `nlmsg_len`.
-
-- [x] **C3. Reassembly trusts hardware-sourced `num_entries`.**
-  [cdx/cdx_reassm.c:141,163-189](cdx/cdx_reassm.c#L141-L189). Loop walked `list` past the pool on malformed frames. _Fixed: 815a0ca_ — bound against `reassly_bp->size`.
-
-- [x] **C4. Reassembly refcount is `uint8_t` with no underflow guard.**
-  [cdx/cdx_reassm.c:157,163](cdx/cdx_reassm.c#L157-L163). Wrap to 255 on double-decrement. _Fixed: 815a0ca_ — zero-guard before decrement.
-
-- [x] **C5. IP reassembly deinit was a stub.**
-  [cdx/cdx_reassm.c](cdx/cdx_reassm.c). `printk("implement this")` while `ipr_timer` kthread kept running → UAF on unload. _Fixed in stages:_ 815a0ca (kthread stop), b5a7bf8 (bpool free + hook unregister), 78ac2af (FQ retire/oos/destroy + fqid range release via private `ipr_fqs[]` tracking).
-
-- [x] **C6. Integer-scaled allocations driven by userspace (dpa_cfg).**
-  [cdx/dpa_cfg.c](cdx/dpa_cfg.c). `sizeof(...) * num_fmans/max_ports/max_dist/num_tables` with attacker-influenced counts. _Fixed: 815a0ca, corrected in 0a8a5f6_ — sanity caps + `kcalloc`; legitimate zero counts allowed for unused-resource sub-structs.
-
-- [x] **C7. Off-by-one `fm_index` checks.**
-  [cdx/dpa_cfg.c:367,993,1008,1022,1035,1048](cdx/dpa_cfg.c#L367). All six `> num_fmans` flipped to `>=` in _815a0ca_.
-
-- [x] **Bonus. Pre-existing modpost section mismatch.**
-  `cdx_ctrl_deinit` (.text) called `cdx_cmdhandler_exit` (.exit.text). _Fixed: 815a0ca_ — dropped `__exit`.
-
-- [x] **C8. Unbounded user-controlled array indices.**
-  [cdx/dpa_cfg.c](cdx/dpa_cfg.c) `queue_no`, `port_idx`, [cdx/cdx_ehash.c:288-289](cdx/cdx_ehash.c#L288) `dscp`. _Fixed: 815a0ca_ — bound checks at entry.
-
-- [x] **C9. Test ioctl always compiled in, broken kzalloc flags.**
-  [cdx/dpa_test.c:61-63](cdx/dpa_test.c#L61-L63). `kzalloc(... * num_conn, 0)` with unbounded `num_conn`, dispatched unconditionally. _Fixed: 815a0ca_ — sanity-cap + `kcalloc`.
-
-- [x] **C9b. Remove dead testapp scaffolding entirely.**
-  After C9 the surface was safe but still exposed. _Fixed: 815a0ca_ — deleted `cdx/dpa_test.c`, `dpa_app/testapp.c`, and the `CDX_CTRL_DPA_CONNADD` ioctl. H10 mooted by this.
-
----
-
-## HIGH
-
-- [x] **H1. `cdx_ioc_set_dpa_params` mutated globals without locking.**
-  [cdx/dpa_cfg.c:588-719](cdx/dpa_cfg.c#L588-L719). Concurrent ioctls → UAF on the old `fman_info`. _Fixed: 613efa3_ — `dpa_cfg_lock` mutex, reject re-init, convert bare-return leaks to `goto err_ret`.
-
-- [x] **H2. IPsec SA key material not zeroed on free.**
-  [cdx/cdx_dpa_ipsec.c:205-222](cdx/cdx_dpa_ipsec.c#L205-L222). _Fixed: 613efa3_ — `kfree_sensitive()` on the three key fields.
-
-- [x] **H3. IPsec error paths leak DMA mappings.**
-  [cdx/cdx_dpa_ipsec.c:1964-1995,2580-2593](cdx/cdx_dpa_ipsec.c#L1964-L1995). _Fixed: 613efa3_ — two-label unwind in `cdx_ipsec_create_shareddescriptor`; `SA_SH_DESC_BUILT` rolls back on entry-add failure (M7 folded in).
-
-- [-] **H4. Suspicious DMA map-then-immediately-unmap for CAAM descriptor.**
-  [cdx/cdx_dpa_ipsec.c:2028-2033](cdx/cdx_dpa_ipsec.c#L2028-L2033). Not a bug — `shared_desc_dma` is a local never stored anywhere. The pair is a legitimate cache-flush idiom on non-coherent ARM64; SEC reads the descriptor later via the handle stored in `dpa_ipsecsa_handle`. Comment added documenting intent.
-
-- [x] **H5. NAT-T SPI array bound is off-by-one.**
-  [cdx/cdx_dpa_ipsec.c:2310-2318](cdx/cdx_dpa_ipsec.c#L2310-L2318). `> MAX_SPI_PER_FLOW` should be `>=`. _Fixed: 613efa3_.
-
-- [-] **H6. auto_bridge iterates hash buckets with lock drop between buckets.**
-  [auto_bridge/auto_bridge.c:232-251](auto_bridge/auto_bridge.c#L232-L251). Not a bug — `table_entry` is rebound each inner iteration via `container_of`, never persisted across outer iterations; the lock-drop is a deliberate bounded-hold-time design. Hash keys are immutable post-insert.
-
-- [x] **H7. auto_bridge stores `net_device *` without `dev_hold()`.**
-  [auto_bridge/auto_bridge.c:210](auto_bridge/auto_bridge.c#L210). Pointer crossed a workqueue boundary unrefcounted. _Fixed: 613efa3_ — `dev_hold`/`dev_put` balance + module-exit drain.
-
-- [x] **H8. auto_bridge sysctl, missing CAP check + accepts 0.**
-  [auto_bridge/auto_bridge.c:1385-1406](auto_bridge/auto_bridge.c#L1385-L1406). `0644` on proc/sys is owner-write-only (not "world-writable" as originally claimed), but a `CAP_NET_ADMIN` gate is sound defense-in-depth. _Fixed: 613efa3_ — explicit cap check + `proc_douintvec_minmax` bounds.
-
-- [x] **H9. Query-snapshot static state shared and lock-free.**
-  [cdx/cdx_mc_query.c](cdx/cdx_mc_query.c), [cdx/query_Rx.c:65-140](cdx/query_Rx.c#L65-L140), and the per-`control_*.c` cursor sites. Two concurrent enumerators corrupted each other's cursors. _Fixed: 613efa3 + 75dfbba_ — per-file query mutex around each cursor + bucket spinlock around list walks. The mutator-side lock-free walks (l2flow, ipv4/6/tunnel/pppoe tables) remain — covered by A2's documentation pass.
-
-- [x] **H10. `strncpy_from_user` truncation not checked.**
-  Mooted: all four sites were in `cdx/dpa_test.c` which C9b deleted.
-
----
-
-## MEDIUM
-
-- [x] **M1. Multicast listener-count mismatch.**
-  [cdx/dpa_control_mc.c:541](cdx/dpa_control_mc.c#L541) vs [cdx/cdx_mc_query.c:60](cdx/cdx_mc_query.c#L60). Group with 6-8 listeners OOB'd the query response buffer. _Fixed: 5f9fbf0, refined in a578eca_ — pagination reserves 2 cmds per group, look-ahead over `members[]` instead of fragile counter math.
-
-- [-] **M2. `dev_get_by_name` leaks on error paths (control_vlan).**
-  Not a bug. Both `device` and `parent_device` are NULL-init at L89; all switch-arms fall to `end:` which has NULL-guarded `dev_put`s. Audited the other three callers (devman, cdx_ehash, dpa_wifi); all balanced.
-
-- [x] **M3. Unbounded `sprintf` chain in procfs read handler.**
-  [cdx/procfs.c:22-69](cdx/procfs.c#L22-L69). The original handler was `sprintf`-ing into a `char __user *buff` (kernel-vs-userspace pointer confusion, would fault under KUAP). _Fixed: 5f9fbf0_ — full `seq_file` conversion.
-
-- [x] **M4. Kernel pointer leaks in debug output.**
-  [cdx/procfs.c:167](cdx/procfs.c#L167) (`%px`) + production-path `%p` in `cdx/dpa_cfg.c`. Modern `%p` is hashed by default since 4.15, so the original "defeats KASLR" claim only held with `no_hash_pointers`. _Fixed: 5f9fbf0 + c776317_ — `%px` → `%pK`; production-path `display_*` and the always-on debug print → `%pK`; the two remaining `DPA_INFO` debug-gated `%p` sites in `dpa_cfg.c` flipped under A4.
-
-- [x] **M5. `nlh->nlmsg_type` signedness / missing default.**
-  [auto_bridge/auto_bridge.c:494-560](auto_bridge/auto_bridge.c#L494-L560). _Fixed: 5f9fbf0_ — `type` narrowed to `u16`, `default: -EINVAL` added.
-
-- [x] **M6. auto_bridge module-exit busy-loop.**
-  [auto_bridge/auto_bridge.c:1109-1125](auto_bridge/auto_bridge.c#L1109-L1125). Bare `schedule()` could hot-spin. _Fixed: 5f9fbf0_ — bounded 5s wait via `schedule_timeout_uninterruptible(1)` with `pr_warn` on timeout.
-
-- [x] **M7. `cdx_ipsec_add_classification_table_entry` explicit TBD leak.**
-  Folded into H3.
-
-- [x] **M8. Full-group mcast delete tore down shared state without bucket spinlock.**
-  [cdx/dpa_control_mc.c:883-897](cdx/dpa_control_mc.c#L883-L897). _Fixed: 61f1904_ — `list_del` under `mc{4,6}_spinlocks[uiHash]`, HW teardown unlocked (FmPcdLock is sleeping). Surfaced two pre-existing follow-ons (M10, M11).
-
-- [x] **M9. Conditional `pCtEntry` leak on ADD err_ret unwind.**
-  [cdx/dpa_control_mc.c:599-617](cdx/dpa_control_mc.c#L599-L617). _Fixed: 782700d_ — defense-in-depth pCtEntry guard in outer err_ret.
-
-- [x] **M10. `Cdx_GetMcastMember*` lookup leaks member_id across dropped spinlock.**
-  [cdx/dpa_control_mc.c:256-335](cdx/dpa_control_mc.c#L256-L335). Implicit single-writer-per-group invariant was undocumented. _Fixed: c23817b_ — `mc_mutators_mutex` taken at MC4/6 dispatcher level makes the invariant explicit.
-
-- [x] **M11. `GetMcastGrp` returned a pointer freeable after the bucket spinlock dropped.**
-  [cdx/dpa_control_mc.c:200-252](cdx/dpa_control_mc.c#L200-L252). Same root cause as M10. _Fixed: c23817b_ — same `mc_mutators_mutex` closes the dangling-pointer window.
-
-- [x] **M12. Full-group-delete fast path keyed off count alone, ignored listener names.**
-  [cdx/dpa_control_mc.c:912](cdx/dpa_control_mc.c#L912). `REMOVE [foo]` against `{ bar }` (both count 1) wiped the entire group. _Fixed: 2d7689f_ — pre-validation walks every requested listener; mismatches bail with `ERR_MC_CONFIG`. Regression test in `tools/tests/test_mcast_failslab.py`.
-
-- [x] **M13. Duplicate listener names in REMOVE still tripped the count-match fast path.**
-  [cdx/dpa_control_mc.c:912](cdx/dpa_control_mc.c#L912). M12's pre-validation didn't dedupe. _Fixed: c23817b_ — bitmap tracks resolved member_ids, duplicate hits return `ERR_MC_CONFIG`.
-
-- [x] **M14. cmm `cmm_parse_rtattr` tail dereference on truncated rtattr.**
-  [cmm/src/rtnl.c:280-281](cmm/src/rtnl.c#L280-L281). When the parser loop exited with `len != 0` (truncated trailing rtattr), the next line passed `rta->rta_len` to `cmm_print` — but `rta` may point past the buffer at that point, so the read was OOB by up to 2 bytes. Surfaced while authoring [tools/tests/test_cmm_rtnl_fuzz.py](tools/tests/test_cmm_rtnl_fuzz.py); ASAN-instrumented input `04 00 01 00 99` reproduces. _Fixed_ — extracted parser body into [cmm/src/rtnl_parse.c](cmm/src/rtnl_parse.c) so cmm and the fuzzer link the same code; dropped `rta->rta_len` from the diagnostic (only `len_remaining` is logged now); fuzzer ASAN run confirms no further OOB.
-
-- [x] **M15. FMAN PCD does not replicate IPv4 multicast frames to listener subifs.**
-  [cdx/dpa_control_mc.c](cdx/dpa_control_mc.c). Two independent kernel-side bugs in the MC4 ADD path: (a) no `dev_mc_add()` on the ingress netdev, so FMAN MEMAC's hardware multicast filter dropped frames at L2 before PCD ran (PROMISC doesn't bypass mcast filtering on FMAN); (b) no write barrier between the per-listener EHASH chain writes and `ExternalHashTableAddKey()`'s bucket-head publish, so on weak-ordered ARM64 FMAN could read the new bucket head and walk a still-stale chain — CC counters tick but listener TX FQs stay at 0. _Fixed_ — early `dev_mc_add`/`dev_mc_del` in create + err_ret + REMOVE-all branches; `wmb()` in `insert_mcast_entry_in_classif_table` before AddKey; replication-correctness tests in [test_mcast_replication.py](tools/tests/test_mcast_replication.py) un-skipped and pass.
-
----
-
-## LOW / Hardening
-
-- [x] **L1. Jenkins hash where collision DoS matters.**
-  [cdx/jenk_hash.h](cdx/jenk_hash.h). Only used in `cdx/control_bridge.c:330` for kernel-side `l2flow_hash_table[]` indexing — software-only lookup, attacker-controllable 5-tuple. _Fixed: bf8c453_ — keyed `hsiphash` with boot-random key; `jenk_hash.h` deleted.
-
-- [x] **L2. `strcpy` into equal-sized `IF_NAME_SIZE` buffers.**
-  Multiple sites in `cdx/control_*.c`. Mostly bounded today (kernel `net_device->name` is NUL-terminated) but command-sourced names aren't guaranteed. _Fixed: 89e5b32_ — broader sweep to `strscpy` across `cdx/`.
-
-- [x] **L3. `sprintf` into small fixed name buffers (procfs).**
-  [cdx/procfs.c:224,226](cdx/procfs.c#L224). _Fixed: 5f9fbf0_ alongside M3 (`snprintf`).
-
-- [x] **L4. `proc_create("fci", 0, …)`.**
-  [fci/fci.c:542](fci/fci.c#L542). Mode `0` is fragile. _Fixed: 89e5b32_ — `0444`.
-
-- [x] **L5. Unimplemented ioctl stub declarations.**
-  [cdx/cdx_ioctl.h:317-321](cdx/cdx_ioctl.h#L317-L321). _Fixed: 89e5b32_ — removed the stubs and the supporting struct/macro dead code.
-
-- [x] **L6. Inconsistent endian conversion in reassembly release.**
-  [cdx/cdx_reassm.c:150-172](cdx/cdx_reassm.c#L150-L172). Type mismatch (u8 ↔ u16 zero-extend), not endian bug. _Fixed: 89e5b32_ — renamed `cpu_to_be*` → `be*_to_cpu` to document intent (no-op on LE).
-
-- [x] **L7. UBSAN array-bounds: flex-array subscript in `create_ethernet_hm`.**
-  [cdx/cdx_ehash.c:1849](cdx/cdx_ehash.c#L1849). `*(uint16_t*)(&l2param->l2hdr[2*ETHER_ADDR_LEN]) = ...` warned under UBSAN. _Fixed: f717ba7_ — pointer arithmetic.
-
-- [x] **L8. cmm `sig_term_hdlr` benign ENOENT noise on reboot.**
-  [cmm/src/cmm.c:318-320](cmm/src/cmm.c#L318-L320). `remove()` of an already-cleaned pidfile printed misleading error. _Fixed: ff1be40_ — gate on `errno != ENOENT`.
-
----
-
-## Corrections to the original review
-
-Flagged as critical by deep-dive agents but don't hold up on verification.
-
-- [-] **X1. "256-byte memset + partial fill = info leak."**
-  False positive. `memset(p, 0, 256)` zeros the buffer *before* the partial fill — uninitialized bytes copied back are zeros.
-
-- [-] **X2. "strcpy IF_NAME_SIZE → IF_NAME_SIZE overflows."**
-  Downgraded to L2. Kernel `net_device->name` is NUL-terminated within `IFNAMSIZ` so when source is `dev->name`, strcpy is bounded.
-
-- [-] **X3. "N new suspected memory leaks" from `dpaa_eth_refill_bpools`.**
-  Not a leak. The DPAA SDK hands skb addresses to hardware via descriptor rings; during the hardware-owned phase kmemleak's pointer scanner can't find a kernel-side reference. RSS stays flat for hours on idle. Tests that use kmemleak as an oracle must filter to specific function-name needles, never to the broad `[cdx]`/`[auto_bridge]` module-tag matcher.
-
----
+## Corrections to the original review (wontfix / not-a-bug)
+- **X1.** "256B memset + partial fill info leak" — wontfix: memset(p,0,256) zeros the full rbuf before the Get_Timeout partial fill; surplus bytes are zeros.
+- **X2.** "strcpy IF_NAME_SIZE overflow" — wontfix/fixed: downgraded to L2 and swept to strscpy (_89e5b32_); all cdx name copies now dst-size bounded.
+- **X3.** "dpaa_eth_refill_bpools suspected leaks" — wontfix: the skb backpointer lives in the BMan hardware-owned frag pool kmemleak can't scan; error paths free cleanly.
+- **A12.** "PPPoE RX-decap missing classifier install" — wontfix: inner udp4/tcp4 dist precedes pppoe_dist; the PPPoE strip is an HM chained on the inner CT entry, not a table.
+- **A15.** "cmm has no incoming xfrm subscription" — wontfix: the af_key km hook broadcasts every SA event on NETLINK_KEY grp1 (before the no-PF_KEY early-return); cmm binds it via libfci. On-DUT restart experiment (2026-08-09) confirmed no resync gap; only cmm-downtime events are lost, recoverable via `ip xfrm state flush`.
 
 ## Architectural themes
-
-- [x] **A1. Every external field needs a bounds check at its entry point.**
-  Hardware descriptors, netlink attrs, ioctl structs, kernel-internal state all looked alike. _Fixed in stages: A1a-A1e._ The whole FCI command bus (~120 codes across 14 cmdprocs) plus the cdx ioctl dispatcher now route through a single validator-table idiom. Two pre-existing latent bugs surfaced and silently fixed in the migration (MC4/MC6 zero-byte reply on unknown cmd; misleading `ERR_STAT_FEATURE_NOT_ENABLED` for unknown stat cmd).
-
-- [x] **A1a. Validator-table pattern (`cdx/cdx_cmd_validator.{h,c}`).**
-  Spec struct + dispatcher: lookup by cmd_code, range-check len, run validate(), run handle(). _Fixed: cf1fa1b_.
-
-- [x] **A1b. Prototype on `control_vlan.c`.**
-  _Fixed: f2f3a82_. Migration template documented in commit message + ISSUES history. Permissive-validator follow-up pass to tighten min-length bounds: _c4d3965_.
-
-- [x] **A1c. Migrate the rest, ordered by risk + simplicity.**
-  - [x] **A1c-1.** `dpa_control_mc.c` (MC4+MC6) — _cbc2a6e_.
-  - [x] **A1c-2.** `control_pppoe.c` — _37f0e37_.
-  - [x] **A1c-3.** `control_ipv6.c` — _f5e1bba_.
-  - [x] **A1c-4.** `control_ipv4.c` — _394452b_.
-  - [x] **A1c-5.** `control_tunnel.c` — _74643c8_.
-  - [x] **A1c-6.** `control_bridge.c` — _5059240_.
-  - [x] **A1c-7.** `control_ipsec.c` — _37f99e3_.
-  - [x] **A1c-8.** `control_stat.c` — _4fa6df7_.
-  - [x] **A1c-9.** `control_{rx,rtp_relay,wifi,tx,qm}.c` (5 files, 41 codes) — _56dbb07_.
-
-- [x] **A1d. cdx ioctl dispatcher onto the same idiom.**
-  ABI is different enough (no cmd_len, copy_{from,to}_user, errno return) that forcing it onto `cdx_dispatch_cmd` would fork the dispatcher. _Fixed: ed082ea_ — file-local `cdx_ioctl_table[]` with same spec-struct shape.
-
-- [x] **A1e. Drop the per-subsystem inner switches.**
-  Done in-line with each A1b/A1c migration — every commit replaced the whole cmdproc body in one shot. No separate cleanup pass.
-
-- [x] **A2. Concurrency assumed, not enforced.**
-  Globals in `dpa_cfg.c`, static cursors in every `control_*.c`, lock-drop iteration in auto_bridge. _Fixed: d99bb62_ — top-of-file `Concurrency:` block per .c file documenting locks/contexts/ordering, plus sparse `__must_hold()` annotations on internal helpers. Runtime enforcement via `CONFIG_PROVE_LOCKING` (Armbian config flip, out-of-repo).
-
-- [x] **A3. Error paths don't unwind.**
-  Recurring leak-on-failure pattern. _Fixed in A3a-A3e_ plus two follow-ons: `dpa_release_interface` sibling (d0d0b3f) and the IPR FQ teardown originally noted as A3a residual (78ac2af).
-
-- [x] **A3a. `cdx_init_ip_reassembly` / `cdx_deinit_ip_reassembly` — init/deinit asymmetry.**
-  _Fixed: b5a7bf8 + 78ac2af_ — full nested-label cascade; deinit retires/oos/destroys IPR FQs via private `ipr_fqs[]` tracking and releases the fqid range.
-
-- [x] **A3b. `cdx_init_fqid_procfs` — sequential `proc_mkdir` without unwind.**
-  [cdx/procfs.c:76-114](cdx/procfs.c#L76-L114). _Fixed: b5a7bf8_ — nested `err_remove_*` cascade.
-
-- [x] **A3c. `abm_l2flow_table_init` — `l2flow_cache` leaked on `brroute_cache` failure.**
-  [auto_bridge/auto_bridge.c:1176-1197](auto_bridge/auto_bridge.c#L1176-L1197). _Fixed: b5a7bf8_.
-
-- [x] **A3d. `abm_init` — cascading subsystem init leaks.**
-  [auto_bridge/auto_bridge.c](auto_bridge/auto_bridge.c). _Fixed: b5a7bf8_ — every failed init step routes to its matching `_fini`/`_exit` in reverse.
-
-- [x] **A3e. `dpa_add_eth_if` — `err_ret*` cascade had three explicit TODO gaps.**
-  [cdx/devman.c:1983-2128](cdx/devman.c#L1983-L2128). _Fixed: ba1ac4e_ — three new helpers: `dpa_remove_ethport_ff_policier_profile`, `dpa_bman_restore_discard_mask`, `cdx_disable_ceetm_on_iface`. Sibling follow-on `dpa_release_interface` calls these in reverse acquisition order — _d0d0b3f_.
-
-  _Test coverage:_ A3a-e fixes are validated by code review only. The natural design (`failslab_times` over modprobe of cdx/fci/auto_bridge) doesn't work because those modules are persistent — daemons hold their refcounts. Runtime err_ret coverage continues via the FCI-reachable mcast paths in [test_mcast_failslab.py](tools/tests/test_mcast_failslab.py).
-
-- [x] **A4. Debug code is production code.**
-  `dpa_test.c` (C9), debug `%p` (M4), `cdx_deinit_ip_reassembly` stub (C5). All resolved across C9b, M4, C5/A3a, plus the two debug-gated `%p` sites in `dpa_cfg.c` flipped to `%pK` (_c776317_). Other debug-gated `%p` across cdx/ left alone (default-hashed by kernel; out-of-scope churn).
-
-- [x] **A5. Kernel-side fixes unblocking sanitizer coverage.**
-  Bringing up the test image with LOCKDEP/PROVE_LOCKING/DEBUG_ATOMIC_SLEEP/UBSAN surfaced four pre-existing bugs in vendored kernel code (qbman, sdk_dpaa, sdk_fman, netlink). Two would deadlock under memory pressure; one is a lockdep annotation gap; one is a kernel-internal name-table gap. Patches live in `patches/kernel/` (`090-…` through `093-…`) so Armbian production picks them up.
-
-- [x] **A5a. qbman `dpa_alloc_new` sleeps under `spin_lock_irq`.**
-  Patch `090-qbman-dpa_alloc-preallocate-nodes.patch`.
-
-- [x] **A5b. `dpa_get_channel` holds a spinlock over a sleeping allocation.**
-  Patch `091-sdk_dpaa-dpa_get_channel-use-mutex.patch`.
-
-- [x] **A5c. FMAN `FmPcdLockTryLockAll` false-positive recursive-lock warning.**
-  Patch `092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch`.
-
-- [x] **A5d. Netlink `nlk_cb_mutex_key_strings[]` underpopulated for `NETLINK_L2FLOW = 33`.**
-  Patch `093-netlink-name-L2FLOW-cb-mutex.patch`.
-
-- [x] **A6. CDX tunnel handlers walked untrusted name fields as C strings.**
-  `cdx/control_tunnel.c`. `TNL_handle_DELETE/UPDATE` `memcpy`'d a fixed-size `cmd.name[16]` then walked it as a C string — KASAN OOB on a 16-byte payload with no NUL. Caught by the new payload-mutation fuzzer (A7) on first run under `KASAN=1`. _Fixed: 9f9b69d_ — `HASH_TUNNEL_NAME(name, maxlen)`, `M_tnl_get_by_name(name, maxlen)`, `strncmp` instead of `strcmp`.
-
-- [x] **A7. Fuzzer payload-body coverage for the validator-table surface.**
-  Original fuzzer hit dispatcher-level length checks only. _Fixed: 0bf177b_ — 30 mutation cases (10 sized commands × {`all_ff`, `high_enum`, `no_nul_str`}) with KASAN/UBSAN/lockdep splat oracle. First run caught A6.
-
-- [x] **A8. CAAM job ring consumers not released at shutdown.**
-  On `reboot`, kernel logs `caam_jr 17{1,2}0000.jr: Device is busy; consumers might start to crash`. Root cause (static audit): two leaked JR consumers. (1) cdx — `cdx_ipsec_init()` did `caam_jr_alloc()` at module load with no `caam_jr_free` anywhere; `caam_jr_remove` is wired as both `.remove_new` and `.shutdown`, so every reboot hit the busy check. Reproduces with zero SAs installed. (2) `caamrng` — allocates a JR at probe, frees only on module unload; upstream behavior, out of ASK scope, its one line will remain. _Fix landed:_ idempotent `cdx_ipsec_release_jr()` (xchg + `caam_jr_free`) called from both the deinit chain (`ipsec_exit` → `cdx_ipsec_deinit`) and a reboot notifier (notifiers run in `kernel_restart_prepare`, before `device_shutdown`); `caam_jr_alloc` failure now checked with `IS_ERR` (it returns ERR_PTR, never NULL — the old `!jrdev_g` check was dead) and propagated; NULL guards on the two JR-using entry points. Review follow-ups folded in: `ipsec_init`/`socket_init`/`rtp_relay_init` flipped `BOOL`→`int` (cross-TU prototype mismatch vs `CMD_DECLARE`; `return -1` truncated to 255 so `CMD_INIT`'s `rc < 0` never fired), and the fq-handler error path now unwinds timer + JR + notifier. _Verified on target 2026-08-09:_ zero busy lines on reboot (caamrng's consumer not active in this image; cdx's line gone).
-  Residual (accepted): the reboot notifier shares no lock with the FCI command path, so a reboot racing an in-flight SA install could still touch the freed ring; orderly shutdown stops the daemons first, so the quiescence assumption holds in practice.
-
-- [ ] **A9. Tunnel offload — premise inverted by on-DUT tracing (2026-08-09): RX decap WORKS; it's TX encap that never offloads.**
-  Live-topology probes (real sit tunnel, cmm auto-registration, real conntrack; UDP echo + TCP echo + iperf3, both flow orientations):
-  - **RX decap offloads.** After ~10 packets of cmm programming latency, incoming 6o4 outer frames stop touching the kernel (`sit_test` RX +0 across measurement windows; the ACK stream of a 9.15 Gbit/s TCP run hit kernel sit only 5 times). Engages for UDP and TCP, in both conntrack orientations.
-  - **TX encap never offloads.** Kernel `sit_test` TX ticks 1:1 with every LAN→WAN packet in every experiment — including 6.5 M packets during the 9.15 Gbit/s iperf3 run. The [test_tunnel_tx_offload.py](tools/tests/test_tunnel_tx_offload.py) pass was a false positive: its ">1 Gbps ⇒ offloaded" threshold rests on a stale "software sit caps at ~165 Mbps" baseline, but the A72s + GSO do kernel sit encap at ~9 Gbit/s, so the test proves nothing about offload. The encap HM is being *built* at CT-add (A11's FORTIFY warning fired from `create_tunnel_insert_hm`), so the entry exists — LAN-ingress (eth4) traffic just never hits it. Suspects: eth4-side PCD dist/classification miss, or the entry landing keyed/ported for the wrong direction.
-  - **The 6o4 decap xfail was a mis-keyed test, not a feature gap** (A12 pattern): [test_tunnel_offload.py](tools/tests/test_tunnel_offload.py)'s fixture installs an outer-keyed proto=41 CT, which `fill_key_info` rightly rejects — the design keys decap on the *inner* tuple. The test needs rewriting to the real-path shape (or retiring in favor of a counter-oracle on the live topology).
-  - **Instrumentation gap:** all 1057 `/proc/fqid_stats` frame counters read zero even during gigabit runs — the golden-tripwire oracle several tests rely on is currently blind; investigate before trusting any counter-signature test.
-  **Second-session narrowing (same day):** `cdx_cfg.xml` declared only ONE 10G port — gateway-dk has two; the second (eth4/LAN) had no PCD policy. Added `<port type="10G" number="1" policy="cdx_ethport_7_policy" portid="7"/>` (the policy already existed in cdx_pcd.xml; even the NXP reference only ever wired one 10G port). After the change, elimination matrix from live probes: plain v4 NAT from LAN offloads (3243 roundtrips, kernel FORWARD +0), plain v6 forward from LAN offloads (Ip6OutForwDatagrams +0), tunnel decap offloads — but **tunnel-encap entries still never match**: eth4 frames classify in FMAN (eth4 driver rx ~0 during a 9.15 Gbit/s run) yet the encap CT lookup misses and frames reach the kernel via the OH/exception path (kernel sit tx +3.25M). Entry inserts succeed (no td errors; same IPV6_TCP_TABLE type as the working plain-v6 case), so the residual suspect is the encap entry's key layout vs what the eth4 dist extracts for tunnel-bound flows.
-  **Instrumentation note:** `/proc/fqid_stats` "frame count" is instantaneous queue occupancy, not a cumulative counter — earlier "all zero = blind" read was wrong in kind, but tests using it as a delta oracle are still measuring occupancy, worth an audit.
-  **Third-session narrowing (instrumented cdx, same day):** insert-time prints prove the encap-direction entry is fully correct in software: right port table (`port_id 7`), right key (`07 | inner-src | inner-dst | proto | sport | dport`, byte-exact vs wire), `add_tnl_header=1`, correct egress FQ (eth3 TX 0x1eb), inserted a few seconds after the decap entry once conntrack reaches ASSURED (cmm's two-phase per-direction registration — earlier "never inserted" reads were racing this latency window). Yet the echo counts show zero duplicate deliveries, so FMAN never executes the entry: the miss is inside the FMAN-side EHASH bucket walk/compare, specific to entries carrying the tunnel-insert HM opcode chain (plain-v6 and v4-NAT entries in the same tables with the same key layout match fine, and nothing suggests tunnel-encap offload was ever observed working on this ucode — the TX test's throughput oracle never proved it).
-  **Fourth-session findings (DDR entry dumps, same day):** raw 256-byte dumps of live entries show tunnel-encap entries are byte-perfect in DDR: flags `0x3310` (opcodes@48, params@64, stats+TS enabled — identical to working entries), correct key, correct outer-IPv4 template (proto 41, right src/dst), correct egress L2 header (eth3 MAC, ethertype 0800), correct enqueue FQ. Opcode chains decoded: decap (works) = `PREEMPTIVE, RX_STATS, STRIP_ETH, STRIP_VLAN, REMOVE_FIRST_IP, HOPLIMIT, INSERT_L2, ENQUEUE`; tunnel encap (broken) = same with `REMOVE_FIRST_IP` replaced by `INSERT_L3_HDR(0x44)` — the only opcode no working chain exercises. The deployed FMAN ucode is byte-identical (md5) to NXP's ASK 5.03.1 release, and our `create_tunnel_insert_hm` is line-identical to NXP's — so the reference had the exact same untested path. One concrete mechanism candidate: tunnel entries carry `hdr_xpnd_sz=20` in enqueue params (plain entries: 0); if the ucode's PREEMPTIVE_CHECKS fails the 20-byte expansion (headroom/MTU accounting), every packet punts to the exception path regardless of match.
-  **Final isolation (same day): ucode INSERT_L3_HDR is the blocker.** Two more eliminations: the sealed preemptive-check params decoded clean (`mtu_offset` correct, `OpMask=PREEMPT_TX_VALIDATE` only), and an on-target experiment clearing TX_VALIDATE for tunnel entries (verified `OpMask=00` in DDR) changed nothing — the chain still punts every matched packet. Every other opcode in the encap chain is proven working in other live chains; the INSERT_L3_HDR params are line-identical to the NXP reference; the ucode is md5-identical to NXP's ASK release. Conclusion: `INSERT_L3_HDR(0x44)` execution in ucode 210.10.1 punts unconditionally — an unexercised/broken opcode in the shipped microcode. **Disposition: NXP-support ticket territory (same as A24/DNCPE).** Practical impact is CPU headroom only: kernel sit encap sustains 9.15 Gbit/s on the A72s, and decap (the RX direction) is fully hardware-offloaded.
-  **Probe result (prior): the entry MATCHES.** Per-entry hardware stats read back at CT-delete show the encap entry counted 239 packets (of ~260 sent) while every frame still reached the kernel — so the ucode finds the entry, runs the chain at least through `UPDATE_ETH_RX_STATS`, then aborts mid-chain and punts to the exception path at or before `INSERT_L3_HDR`. The decap twin on the same flow counted its packets AND hardware-forwarded them. Remaining suspects, in order: (1) the PREEMPTIVE_CHECKS_ON_PKT params sealed by the enqueue/insert coupling (`hdr_xpnd_sz=20` expansion vs the ucode's headroom/MTU accounting — the one knob still cdx-tunable; start next session by decoding the sealed preemptive params in the entry dump against `fm_ehash.h`'s param struct and the ucode's expectations); (2) `INSERT_L3_HDR` execution itself — ucode 210.10.1 internals, NXP-support territory (same neighborhood as A24/DNCPE). The reference tree shipped this exact path with the exact same ucode, so there is no known-good baseline to compare against — tunnel-encap offload has plausibly never executed end-to-end on this ucode anywhere.
-  **Prior next-tools note:** dump the entry's bucket from DDR (display_ehash_tbl_entry under CDX_DPA_DEBUG on the target bucket, or via /dev/mem) and byte-compare a working plain-v6 entry against the tunnel entry as the ucode sees them; FM sysfs `pcd_kg_total` deltas to confirm the scheme processes the frames; if the layouts are byte-identical up to the opcode section, the suspicion moves to ucode 210.10.1's INSERT-tunnel opcode handling and NXP support territory. Insert-time debug printks currently live uncommitted in `cdx/cdx_ehash.c` + `cdx/control_ipv4.c` (`ehash_ins`/`ehash_act`/`ehash_skip`) — keep for the next session, do not ship.
-  **Remaining work:** (1) ~~FMAN-side comparison~~ done — encap blocked in ucode INSERT_L3_HDR (above); (2)+(5) ~~real-path decap tests~~ done — [test_tunnel_decap_offload.py](tools/tests/test_tunnel_decap_offload.py) (6o4 + 4o6) passes green in automation (2 consecutive runs). Three harness fixes got it there: `nodad` on the static ULA addresses in `ipv6_topology` (DAD left loki's `fc00:dead::2` tentative ~1.5 s, killing the first flow), `ask-test` now forwards `ASK_*` env vars through sudo (they were silently dropped, so `ASK_WAN_IP` fell back to the stale `10.0.0.141` default and tunnels were built with a nonexistent local address), and the 4o6 client-log read anchors on `echoed N` content with a retry poll instead of positional token parsing (UART consoles carry async residue — nohup stderr, wrapped command echoes); (3) TX test reframed with a kernel-sit-tx tripwire (done, [test_tunnel_tx_offload.py](tools/tests/test_tunnel_tx_offload.py)); (4) ~~occupancy-based golden audit~~ done — worse than suspected: every fqid-based golden was vacuous `{}` (occupancy deltas are always 0 between drained snapshots), and the agent's ethtool fallback was equally blind (sdk_dpaa stat names like `rx packets [TOTAL]` don't survive its name regex, so the ethtool dict was empty). The four edge-case tripwires (ipv4 options/malformed, ipv6 hbh/eh-chain) were re-oracled onto the ingress netdev's kernel RX counter — cumulative, and it ticks only for punted frames — classified as `hardware` vs `kernel` per variant and pinned in the goldens. Regenerated goldens now carry real signal (IPv4 options/malformed: FMAN handles/drops in hardware; IPv6 EH chains: kernel slow-path punt) and repeat cleanly. Injection counts raised 3→20 so the signal dominates LAN background chatter. Debug printks have been stripped from cdx (reverted clean).
-
-- **A9 history (superseded framing kept for context).**
-  Original framing ("no outer-keyed proto=41/47/4 entries installed") described a mechanism the design never used. NXP-reference comparison shows decap offload is **inner-keyed**: PCD dists use `header_index="last"` so FMAN keys on the innermost L3 header, and decap is a `REMOVE_FIRST_IP_HDR` HM op chained at CT-add when `l3_info.tnl_header_present` (set when the route carries an `UnderlyingInputDevice`). The whole chain is ported and present in our tree: HM op + call site ([cdx/cdx_ehash.c:744,2388](cdx/cdx_ehash.c#L744)), `skb->underlying_iif` stamps (patch 030, `ip_tunnel.c` + `sit.c`), conntrack export `CTA_COMCERTO_FP_UNDERLYING_IIF` (patch 050), cmm translation ([cmm/src/forward_engine.c:1221](cmm/src/forward_engine.c#L1221)), cdx route store ([cdx/control_ipv4.c:983-1005](cdx/control_ipv4.c#L983)). **Known gap:** `net/ipv6/ip6_tunnel.c` is missing the `underlying_iif` stamp the NXP 5.4 patch had (third site) — breaks the binding for 4o6/6in6 decap. History (audited 2026-08-09): the omission was **collateral, not a decision** — the NXP `ip6_tunnel.c` diff was ~946 lines, ~80% 4RD mapping-rule machinery, and when the 6.12 forward-port stripped 4RD/EtherIP (7f1f585) the rebuilt file diff kept only the TX MTU hunk; no commit records dropping the 3-line RX stamp. Meanwhile `TNL_MODE_4O6` remains live in cdx (tunnel-create, `CONNTRACK_4O6`, ehash 4o6 encap — see A11), so the tree currently offloads 4o6 TX but not RX. **Decision executed (2026-08-09):** the RX decap chain was proven at runtime, so the stamp was restored to `__ip6_tnl_rcv` (patch 030 regenerated) and verified live: an ipip6 (4o6) tunnel over the WAN ULA with a loki-initiated inner-v4 echo flow shows the decap direction fully hardware-offloaded — 1167 echoes delivered with the kernel tunnel RX counter at +0 across measurement windows. A pytest 4o6 decap test (clone of the rewritten 6o4 one) remains on the test-rewrite list.
-  **Open question:** 6o4/sit has every hop present yet [test_tunnel_offload.py::test_tunnel_6o4_decap_to_lan](tools/tests/test_tunnel_offload.py) still xfails — needs runtime tracing on the DUT (does the CT install actually carry the underlying iif for real sit traffic?). Site-for-site audit vs the NXP bundle found all 7 `underlying_iif` code sites ported except the `ip6_tunnel.c` one, which sit doesn't use — so the trace starts from "the stamp should be there; find where it disappears" (GRO/napi recycling is the prime suspect).
-
-- [x] **A10. `RouteEntry.id` is U16 but `RtCommand.id` is U32 — silent truncation on store.**
-  [cdx/layer2.h:56](cdx/layer2.h#L56) declared `RouteEntry.id` as U16 while the wire format `RtCommand.id` carries U32. `CMD_IP_ROUTE` ADD with `id ≥ 0x10000` succeeded (returns `reply_rc=0`) but the entry was silently truncated on store, leaving it unfindable on subsequent lookup keyed by the original U32 id — and tripping the `pRtEntry->id != Ctcmd.route_id` comparisons in the CT-update paths. _Fix landed:_ `RouteEntry.id` widened to U32 — the entire route API (`L2_route_{find,get,remove,add}`, `HASH_RT`) and every `fe.h` wire field were already U32; only the store was narrow. IPv6 shares the same `RouteEntry`, so it's covered. Regression test [test_route_id_width.py](tools/tests/test_route_id_width.py) (ADD/REMOVE round-trip on a wide id) passes on target (2026-08-09).
-  Cross-check note: `CommandIPSecSetTunnelRoute.route_id` ([cdx/control_ipsec.h:141](cdx/control_ipsec.h#L141), mirrored in `cmm/src/module_ipsec.h`) is U16 **on the wire**. Not a truncation bug — cmm's allocator caps route ids at `ROUTE_MAX_ID 0x10000` so it never emits a wide id — but a direct-FCI caller that creates a route with id ≥ 0x10000 cannot reference it from `FPP_CMD_IPSEC_SA_TNL_ROUTE`. Widening it is a wire-ABI change; left documented instead.
-
-- [x] **A11. FORTIFY_SOURCE false positive on `create_tunnel_insert_hm` flex-array memcpy.**
-  [cdx/cdx_ehash.c:2298](cdx/cdx_ehash.c#L2298) does `memcpy(&ptr->l3hdr[0], &info->l3_info.header_v4, info->l3_info.header_size)` where `l3hdr` is a zero-length array (`uint8_t l3hdr[0]`) at the tail of `struct en_ehash_insert_l3_hdr` (kernel header [drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h](drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h)). With `CONFIG_FORTIFY_SOURCE` enabled in the meta-ask test image, the memcpy fires a runtime WARNING because the compile-time destination size is 0 — even though the caller correctly pre-allocates `sizeof(struct) + header_size` at [cdx_ehash.c:2280](cdx/cdx_ehash.c#L2280). The same warning fires from line 2290 for TNL_MODE_4O6. **Surfaced** by [test_tunnel_tx_offload.py](tools/tests/test_tunnel_tx_offload.py) — the iperf3-over-sit-tunnel test exercised the encap path for the first time. **Severity:** false positive — no actual OOB; the buffer is sized for `header_size` bytes by the caller. The data plane works (8.8 Gbps offloaded throughput observed). _Fixed in-repo but not shipped until 2026-08-09:_ the patch existed in `patches/kernel/` but was **missing from linux-ask's SRC_URI enumeration**, so every meta-ask image built without it and the WARNING kept firing (rediscovered during the A9 DUT session; recipe fixed; runtime-verified same day: tunnel CT installs on the rebuilt image produce zero FORTIFY warnings). `patches/kernel/099-sdk_fman-ehash-flex-arrays.patch` converts all seven zero-length tails in `fm_ehash.h` (`key`, `stats_offsets` ×3, `l2hdr`, `vlanhdr`, `l3hdr`) to C99 flexible arrays; `sizeof(struct)` is unchanged and FORTIFY/UBSAN treat `[]` tails as unbounded. The expired dmesg-allowlist tripwire entry is dropped in the same commit.
-
-- [x] **A13. `ppp_generic` lockdep WARNING — `all_ppp_mutex` ↔ `rtnl_mutex` inversion (vendored hunk).**
-  Lockdep splat on first `PPPIOCNEWUNIT` ioctl issued by pppd:
-  ```
-  pppd is trying to acquire lock: rtnl_mutex, at: rtnl_lock
-  but task is already holding lock: &pn->all_ppp_mutex, at: ppp_ioctl+0x3b8 [ppp_generic]
-  ...
-  CPU0: lock(&pn->all_ppp_mutex); lock(rtnl_mutex)
-  CPU1: lock(rtnl_mutex);         lock(&pn->all_ppp_mutex)
-  ```
-  ~~Originally diagnosed as an upstream inversion~~ — **rediagnosed 2026-08-09: this is OUR vendored patch's bug, not upstream's.** Upstream 6.12 is clean (`ppp_unit_register` drops `all_ppp_mutex` before `register_netdevice`). The inversion comes from the ASK forward-port of NXP's `CONFIG_CPE_FAST_PATH` hunk (present in the NXP 5.4 reference patch): `ppp_connect_channel` at [drivers/net/ppp/ppp_generic.c:3528](../../linux/drivers/net/ppp/ppp_generic.c) takes `rtnl_lock()` for an `rtmsg_ifinfo(RTM_NEWLINK, …)` while still holding `pn->all_ppp_mutex` (taken :3492, released :3535) — inverse of `ppp_nl_newlink`'s rtnl→all_ppp order. _Fix landed:_ `070-ask-ppp-hooks.patch` regenerated — the connect-channel hunk now takes only a `dev_hold` under `all_ppp_mutex` and sends the `rtmsg_ifinfo` NEWLINK after the mutex drops; it also no longer fires on failed connects. (The disconnect-side `rtnl_trylock` oddity exists only in the NXP 5.4 reference, not in our forward-port.) _Verified on target 2026-08-09:_ `test_pppoe_session_lifecycle` (real pppd, first PPPIOCNEWUNIT after fresh boot) passes with zero lockdep output under PROVE_LOCKING; dmesg-allowlist entry removed. **Tripwire:** allowlist entry in [tools/tests/golden/dmesg_allowlist.yaml](tools/tests/golden/dmesg_allowlist.yaml) suppresses for `test_pppoe_e2e` until 2026-10-01; expiry forces re-review.
-
-- [-] **A12. PPPoE RX-decap "missing classifier-table install" — not a bug.**
-  Endpoint RX is intentionally inner-keyed: PCD `dist_order` ([dpa_app/files/etc/cdx_pcd.xml:335-352](dpa_app/files/etc/cdx_pcd.xml#L335-L352)) tries `cdx_udp4_dist`/`cdx_tcp4_dist` before `cdx_pppoe_dist`, and `STRIP_PPPoE_HDR` chains in at CT-add time via `pppoe_present` metadata ([cdx/cdx_ehash.c:740](cdx/cdx_ehash.c#L740)). `cdx_pppoe_cc` is for relay only. Filed during synthetic-FCI wire-tracing then retracted after audit; [test_pppoe_e2e.py](tools/tests/test_pppoe_e2e.py) confirms the path works under real pppd at 1.55 Gbps / 0.5% CPU.
-
-- [x] **A14. H2 key-zeroing regression test needs kernel-side observability probe.**
-  Shipped: cdx grew a `CDX_DEBUG_KEY_ZEROING`-gated probe ([cdx/cdx_dpa_ipsec.c](cdx/cdx_dpa_ipsec.c)) that snapshots the post-`kfree_sensitive` cipher_key slab into `/proc/cdx/last_freed_key` (root-only, seq-counted so the test can prove it observed its own free; KFENCE-sampled allocations are recorded but not read). The test ([tools/tests/test_ipsec_key_zeroing.py](tools/tests/test_ipsec_key_zeroing.py)) installs an SA with a 0xA5 cipher key, deletes it, and asserts the snapshot is mostly zero. The flag is set only by the meta-ask test image; production Armbian builds do not define it. Scope: the probe observes **cipher_key only** — a regression confined to the `auth_key`/`split_key` frees in the same function would not trip it.
-
-- [-] **A15. cmm has no incoming xfrm netlink subscription — by design, not a gap.**
-  [cmm/src/keytrack.c:1613](cmm/src/keytrack.c#L1613) only sends outbound `XFRM_MSG_EXPIRE`; nothing watches incoming `NEWSA`/`NEWPOLICY`. Resolved as a documented design decision (2026-08-09): SA state reaches cmm through the kernel-side NLKEY shim ([patches/kernel/040-ask-xfrm-ipsec-offload.patch](patches/kernel/040-ask-xfrm-ipsec-offload.patch), `af_key.c` → `NLKEY_SA_*` on `NETLINK_KEY=32`), whose km-notification hooks fire for every SA install regardless of interface (strongSwan netlink, `ip xfrm`, pfkey) — a userspace xfrm subscription would be redundant coverage of the same events. NXP-reference comparison confirms the original has the identical architecture (send-only XFRM socket, no multicast bind, same af_key translation).
-  **Restart experiment run (2026-08-09, on-DUT, static `ip xfrm` SAs + FCI SA-QUERY cursor as oracle):** the feared restart gap does not exist. cdx SA state survives a cmm `kill -9` + restart untouched (no wipe at cmm startup); new SA installs after restart propagate normally; and — the surprise — `ip xfrm state del` of SAs installed *before* the restart still propagates to cdx through the restarted cmm, so the SA↔fast-path mapping needed for teardown lives kernel-side in the NLKEY shim, not in cmm's process memory. A restarted cmm needs no resync for correctness of later teardowns. The only real loss window is **xfrm events during cmm downtime**: a delete/flush while cmm is dead never reaches cdx, leaving stale SA entries whose FMAN ehash keys then make same-SPI re-establishment fail loudly (`FM-PCD ExternalHashTableAddKey: Resource Already Exists` → `cdx_ipsec_add_classification_table_entry` failure). Recovery is control-plane-only and reboot-free: `ip xfrm state flush` with cmm up propagates a wholesale flush that clears the stale entries (including ones this cmm incarnation never knew), after which same-SPI re-adds succeed — verified end-to-end. **Revisit only if:** (a) *automatic* recovery from a cmm blackout is ever required (an `XFRM_MSG_GETSA` resync at cmm startup would close the window; today the operator/orchestrator must flush + re-establish); or (b) the vendored af_key/NLKEY shim is ever retired — the xfrm subscription is its replacement architecture. Incidental find, fixed: `S50cmm` `start` was unable to ever start cmm (`pidof cmm` self-matches the init script; even `$(pidof ...)` self-matches via the comm-inheriting subshell) — now checks the pidfile + `/proc/<pid>/cmdline` instead; all four lifecycle transitions verified on target.
-
-- [x] **A16. NAT-T fast-path push discarded classification-table-entry failure.**
-  [cdx/control_ipsec.c:720](cdx/control_ipsec.c#L720) — return of `cdx_ipsec_process_udp_classification_table_entry` was thrown away on the NAT-T branch, so `reply_rc` stayed NO_ERR on H5/lookup failures. _Fixed: pending commit_ — capture and propagate, matching the non-NAT-T branch.
-
-- [x] **A17. `IPsec_handle_SA_SET_KEYS` derefed `sa` before NULL check.**
-  [cdx/control_ipsec.c:617](cdx/control_ipsec.c#L617) wrote through `sa` BEFORE the line 619 `sa == NULL` check; SET_KEYS on a stale sagd NULL-derefed. _Fixed: pending commit_ — assignment moved after the check.
-
-- [x] **A18. NAT-T fast-path push NULL-derefed `sa->ct`.**
-  [cdx/cdx_dpa_ipsec.c:2382-2388](cdx/cdx_dpa_ipsec.c#L2382-L2388) — else-branch ignored `cdx_ipsec_add_classification_table_entry`'s return then wrote `sa->ct->natt_in_refcnt`; oops on any NAT-T SA whose dst_ip wasn't bound to an iface. _Fixed: pending commit_ — `goto err_ret` on failure.
-
-- [x] **A20. `ipsec_nlkey_rcv` took xfrm state lock without softirq disable.**
-  [patches/kernel/040-ask-xfrm-ipsec-offload.patch](patches/kernel/040-ask-xfrm-ipsec-offload.patch) ipsec_nlkey_rcv used `spin_lock(&x->lock)` from netlink-callback (process) context; upstream `xfrm_timer_handler` takes the same per-state lock from softirq. Lockdep flagged `SOFTIRQ-ON-W -> IN-SOFTIRQ-W` on the first xfrm operation each boot. Surfaced while bringing up slice-2's static-`ip xfrm` fixture. _Fixed: pending commit_ — three pairs flipped to `spin_lock_bh()` / `spin_unlock_bh()` (NLKEY_SA_NOTIFY, NLKEY_SA_INFO_UPDATE, NLKEY_SA_SET_OFFLOAD).
-
-- [x] **A19. IPsec SA install/release leak triad.**
-  Three asymmetric-cleanup leaks surfaced by failslab + kmemleak: [cdx/procfs.c:158](cdx/procfs.c#L158) `cdx_create_dir_in_procfs` missed `kfree` on `proc_mkdir` NULL; [cdx/dpa_ipsec.c](cdx/dpa_ipsec.c) `cdx_dpa_ipsecsa_release` missed `kfree` on the `cdx_proc_dir_entry_t` wrapper struct (8 B per SA) and on `sainfo->shdesc_mem` (~512 B per SA — `create_ipsec_fqs:err_ret1` freed it but the success-then-release path didn't). _Fixed: cd0548c_.
-
-- [x] **A21. `cdx_module_deinit()` NULL-derefs when called from a failed `cdx_module_init`.**
-  Root cause: `cdx_enable_ceetm_on_iface` (runs at interface-add, during `start_dpa_app`) claims LNI+SP into `qm_ctx`, but `lni->sp` is only bound by `ceetm_setup_lni` on the first QoS config command from userspace. Teardown before any QoS config (module-init failure: cmm never starts) hit `qman_ceetm_sp_release(lni->sp=NULL)`, which derefs its argument unconditionally — the recorded data abort at `0x20`. The historical workaround left `rc=0` on `cdx_dpa_ipsec_init` failure so deinit never ran — which also silently skipped the SG/skb bpool inits and IP reassembly while reporting module-load success. _Fixed_ — `ceetm_release_lni(lni, sp)` now takes the SP claim explicitly from `qm_ctx->sp` (NULL-guarded; releases both claims in the never-configured state, unchanged when fully bound); `cdx_dpa_ipsec_init` failure propagates `rc = -EIO`; `remove_onif_by_index` bounds-checks the onif index; `cdx_module_deinit` loop no longer reads `deinit_fn[-1]` when `init_level==0`; `cdx_deinit_fqid_procfs` registered so a failed init no longer leaves `/proc/fqid_stats` entries pointing into freed module text. Audit of the full deinit-from-partial-init chain found no remaining crash path; residual non-crash leak hazards filed separately.
-
-- [x] **A23. IPsec offload silent drop — `ipsec_bp` (BPID 37) registered but never seeded.**
-  [add_ipsec_bpool()](cdx/dpa_ipsec.c#L1131) called `dpa_bp_alloc()` but not `dpaa_bp_alloc_n_add_buffs(bp, IPSEC_BUFCOUNT, 1)` — SEC saw `BPDERR`. `act_skb=1` is load-bearing for the inbound-decap cb's `contig_fd_to_skb`. _Fixed in this branch._
-
-- [x] **A25. cdx AES-128-CTR — missing nonce trim + missing CTR PDB writes.**
-  CTR case in [`M_ipsec_sa_set_cipher_key`](cdx/control_ipsec.c#L264) didn't set `comb_mode=1; extra_size=4;` (RFC 3686 nonce wasn't split off the 20-byte key), and `cdx_ipsec_build_{in,out}_sa_pdb` had no branch writing `pdb.ctr.ctr_nonce`/`ctr_initial=1`. Lifted on the existing GCM precedent. Verified at 2.58 Gbit/s (CBC parity). _Fixed in this branch._
-
-- [x] **A24. SEC GCM offload — cross-DECO race on PDB.seq has no clean cdx-side fix; refused at SA install. CBC+HMAC and CCM unaffected.**
-  Both share modes failed: `HDR_SHARE_SERIAL` → ~86 % ICV-fail (cross-DECO GHASH contention); `HDR_SHARE_NEVER` → ~21–25 % wire-seq dupes above ~100 Mbit/s per SA (per-DECO PDB.seq counters diverge — matches NXP DNCPE-2358). IV-uniqueness empirically preserved (53 323 dupe-seq pairs in 223 k frames @ 500 Mbit/s, all with distinct IVs — SEC IVSRC independent of PDB.seq), so this is RFC 4303 anti-replay non-compliance, not a Joux-class break. Refused at [patches/kernel/040-ask-xfrm-ipsec-offload.patch](patches/kernel/040-ask-xfrm-ipsec-offload.patch) (kernel `ipsec_xfrm2nlkey` NLKEY_SA_CREATE — load-bearing gate; cmm fire-and-forgets cdx replies so the cdx-side refusal alone cannot prevent `x->offloaded=1`) plus [cdx/control_ipsec.c::M_ipsec_sa_set_cipher_key](cdx/control_ipsec.c) (defense-in-depth for direct-FCI tooling). GCM falls through to kernel xfrm via `rfc4106-gcm-aes-caam` (JR variant, the higher-priority one in `/proc/crypto` on this kernel; ~77 Mbit/s TCP measured, replay-window=32 correct, 0 ICV/seq errors). Reopen with feature gate if NXP delivers PDB.seq atomicity. _Fixed in this branch._
-
-- [x] **A26. Vendored kernel patches compile with ~52 warnings.**
-  The ASK patch stack's kernel-side code warned under the in-tree build: 42 sites across `sdk_fman`/`sdk_dpaa` (patch 010) and 10 across `net/` (patch 040) — `-Wmissing-prototypes` for every cross-TU export, unused locals, `%d`-for-pointer/`size_t` format strings, one `-Wmisleading-indentation` in the `rtnetlink.c` hunk, one always-true `-Waddress` in the af_key GCM-refusal gate. _Fixed_ — patches 010 and 040 regenerated: cross-TU APIs declared in their owning headers (`fm_ehash.h`, `fm_cc.h`, `fm_kg.h`, `fm_port_ext.h`, `fsl_fman_port.h`, `fm_muram_ext.h`, `lnxwrp_fsl_fman.h`, `dpaa_eth.h`, `include/net/xfrm.h`), single-TU helpers made static, scattered per-file `extern`s removed (one of which — `ExternalHashTableAddKey` in `fm_cc.c` — had a wrong signature vs. the definition: pre-existing cross-TU UB the sweep surfaced). Kernel compile log now reports 0 warnings; full 010–099 stack re-verified to apply cleanly from the base tag.
-
-- [x] **A22. IPsec OH-port classifier miss — gateway-dk cdx_cfg.xml portid tripped cdx_sp.xml espschema gate.**
-  Soft-parser hooks in [cdx_sp.xml](dpa_app/files/etc/cdx_sp.xml) gate policing/early-exit on `$logicalportid lt 9` — NXP-reference OH portids 9/10 sit above; the gateway-dk override at 2/3 tripped it, breaking ESP recognition on SEC's encrypted output. Restored OH portids to 9/10. _Fixed in this branch._
+- **A1.** External command fields validated ad hoc per cmdproc — the whole FCI bus + cdx ioctl dispatcher routed through one validator-table idiom (2 latent bugs fixed en route).
+- **A1a.** No shared bounds-check idiom — added cdx_cmd_validator.{h,c}: spec table + cdx_dispatch_cmd (lookup, [min,max] length, validate, then handle) (_cf1fa1b_).
+- **A1b.** control_vlan migrated as the prototype — VlanCommand length + action validator, cmdproc reduced to a dispatch tail-call (_f2f3a82_, _c4d3965_).
+- **A1c.** Remaining 13 cmdprocs (~120 codes) migrated to validator tables with per-command length bounds.
+- **A1d.** /dev/cdx_ctrl ioctl switch replaced by a table-driven cdx_ioctl_table[] with CAP_NET_ADMIN gate and ENOTTY on unknown cmd (_ed082ea_).
+- **A1e.** Per-subsystem inner cmd_code switches removed — each cmdproc is a one-line dispatch tail-call.
+- **A2.** Locking assumptions were implicit per-file folklore — top-of-file Concurrency: blocks + sparse __must_hold() across cdx/abm/fci (_d99bb62_).
+- **A3a.** IPR init leaked bpools/kthread/FQs on failure — nested unwind cascade; deinit tears down FQs via private ipr_fqs[] tracking (_b5a7bf8_ + _78ac2af_).
+- **A3b.** fqid procfs mkdirs left earlier dirs on later failure — nested err_remove_* cascade; deinit proc_removes the whole tree.
+- **A3c.** l2flow_cache leaked when brroute_cache creation failed — destroy+NULL l2flow_cache on that error path.
+- **A3d.** abm_init leaked earlier subsystems on later init failure — goto cascade runs each matching _fini/_exit in reverse order.
+- **A4.** Debug scaffolding shipped as production — dpa_test.c removed, IPR deinit stub implemented, %px/%p prints flipped to %pK.
+- **A5.** Sanitizer bring-up surfaced 4 vendored-kernel bugs (qbman, sdk_dpaa, sdk_fman, netlink) — fixed as patches 090-093, shipped to both images.
+- **A5a.** qbman dpa_alloc_new kmalloc'd GFP_KERNEL under spin_lock_irq — patch 090 preallocates all list nodes before the lock, frees leftovers after.
+- **A5b.** dpa_get_channel held a spinlock over qman_alloc_pool (sleeps) — patch 091 swaps it for a mutex; the only caller is probe-time process context.
+- **A5c.** A shared lockdep class made FmPcdLockTryLockAll's inner locks look recursive — patch 092 adds a SINGLE_DEPTH_NESTING try-lock variant.
+- **A5d.** NETLINK_L2FLOW=33 got a NULL lockdep name from the 0..32-only cb_mutex string table — patch 093 names indices 32 (KEY) and 33 (L2FLOW).
+- **A6.** Tunnel handlers walked 16-byte FCI name fields as C strings (KASAN OOB) — HASH_TUNNEL_NAME/M_tnl_get_by_name take maxlen, strncmp lookup (_9f9b69d_).
+- **A7.** Fuzzer only hit dispatcher length checks — 30 payload-body mutation cases (10 cmds × all_ff/high_enum/no_nul_str) with a splat oracle (_0bf177b_).
+- **A8.** cdx never freed its CAAM job ring, tripping the caam_jr busy check on reboot — idempotent release from the deinit chain + reboot notifier.
+- **A9 (decap portion).** TX-offload test was a false positive (stale 165 Mbps baseline) — reframed as a software-path tripwire; RX decap proven offloaded (6o4+4o6) after the ip6_tunnel iif stamp + second 10G port wired. TX-encap residual stays open as A9.
+- **A10.** RouteEntry.id stored the U32 wire route id as U16, silently truncating on ADD — widened to U32; API/hash/wire already U32 (_d61c50f_).
+- **A11.** FORTIFY warned on memcpy into [0]-tails in fm_ehash.h (patch 099 not in SRC_URI) — all 7 tails now C99 flex arrays, recipe ships 099 (_e499b98_).
+- **A13.** Vendored CPE_FAST_PATH hunk took rtnl_lock under all_ppp_mutex — NEWLINK now sent after mutex drop via dev_hold (patch 070).
+- **A14.** H2 key-zeroing was unobservable — test-image-only probe snapshots the post-kfree_sensitive cipher_key to /proc/cdx (_5358b5b_).
+- **A16.** NAT-T fast-path push threw away the classification-entry rc, reply stayed NO_ERR — rc captured and propagated as ERR_CREATION_FAILED (_d5be3ae_).
+- **A17.** SET_KEYS wrote through sa before the NULL check — stale-sagd NULL-deref; assignment moved after the ERR_SA_UNKNOWN return (_d5be3ae_).
+- **A18.** NAT-T push wrote sa->ct->natt_in_refcnt after ignoring add-entry failure — now bails to err_ret; the callee frees+NULLs sa->ct (_d5be3ae_).
+- **A19.** Three SA leaks (procfs wrapper on mkdir-fail, release-path wrapper, shdesc_mem) — symmetric kfrees added (_cd0548c_).
+- **A20.** ipsec_nlkey_rcv took x->lock without BH disable vs the softirq xfrm_timer — all three NLKEY pairs flipped to spin_lock_bh (patch 040, _d5be3ae_).
+- **A21.** Deinit from a failed init crashed in qman_ceetm_sp_release(lni->sp=NULL) — SP claim passed explicitly + NULL-guarded; init failure now propagates (_d236aa3_).
+- **A22.** gateway-dk cdx_cfg.xml OH portid 8/9 tripped the cdx_sp.xml espschema `$logicalportid lt 9` policing gate, breaking ESP recognition — restored to NXP 9/10 (_d5be3ae_).
+- **A23.** ipsec_bp registered but never seeded — SEC hit BPDERR, silent drops; dpaa_bp_alloc_n_add_buffs(512, act_skb=1) added with unwind (_d5be3ae_).
+- **A24.** SEC GCM per-DECO PDB.seq divergence broke RFC4303 anti-replay (no cdx-side fix) — GCM/GMAC refused at SA install (kernel NLKEY gate + cdx); CBC+HMAC/CCM still offload.
+- **A25.** AES-128-CTR lacked the RFC 3686 nonce trim and CTR PDB fields — comb_mode/extra_size=4 trim + ctr_nonce/ctr_initial=1 in both PDBs (_d5be3ae_).
+- **A26.** ASK patch stack compiled with ~52 warnings (missing prototypes, bad formats, one wrong-signature extern) — 010/040 regenerated warning-free (_3b93e0e_).
