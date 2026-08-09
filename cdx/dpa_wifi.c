@@ -2978,6 +2978,10 @@ int dpaa_vwd_init(void)
 	register_cdx_deinit_func(dpaa_vwd_exit);
 	return rc;
 err10:
+	/* the hook was registered just above; leaving it set would make
+	 * every later dpa_register_wifi_xmit_local_hook fail until reboot.
+	 * Clear it before freeing the stats it increments. */
+	dpa_unregister_wifi_xmit_local_hook();
 	vwd_release_stats(priv);
 err9:
 	release_device_tx_bpool(priv);

@@ -1318,6 +1318,14 @@ int ipsec_init(void)
 
 void ipsec_exit(void)
 {
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+	/* Clear the ethernet-driver hook first: it waits out in-flight
+	 * datapath readers, so nothing can enter this module or look up SA
+	 * state while it is torn down below. Without this, a cdx init
+	 * failure after ipsec_init left the hook pointing into freed module
+	 * text and every later load failed here until reboot. */
+	dpa_unregister_ipsec_fq_handler();
+#endif
 	cdx_timer_del(&sa_timer);
 	cdx_ipsec_deinit();
 }

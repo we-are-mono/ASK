@@ -1762,10 +1762,7 @@ int ceetm_get_cq_query(pQosCqQueryCmd cmd)
 int ceetm_exit(void)
 {
 	/* deregister functions to return CEETM egress FQID */
-	if (dpa_register_ceetm_get_egress_fq(NULL, NULL)) {
-		ceetm_err("%s::unable to deregister ceetmFq functions\n", __func__);
-		return CEETM_FAILURE;
-	}
+	dpa_unregister_ceetm_get_egress_fq();
 	ceetm_dbg("%s::deregistered ceetmFq functions\n", __func__);
 
 	/* TODO: Implement proper cleanup for module unload. Currently leaks:

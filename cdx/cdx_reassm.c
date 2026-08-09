@@ -491,7 +491,7 @@ static void cdx_deinit_ip_reassembly(void)
 	 * destroy each IPR FQ (qman_retire waits for in-flight dqrr to
 	 * drain), then bpools — by that point both fq pipelines are oos
 	 * so no buffers are stranded in fq state. */
-	register_dpaa_eth_bpool_replenish_hook(NULL);
+	unregister_dpaa_eth_bpool_replenish_hook();
 
 	if (ipr_timer_thread && !IS_ERR(ipr_timer_thread)) {
 		kthread_stop(ipr_timer_thread);
