@@ -35,24 +35,6 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
-- [ ] **N15. VAP/netdev lifetime residue after the N13 teardown work.**
-  What remains open after the unpublish+grace redesign: (1) no
-  NETDEV_UNREGISTER notifier — a wifi netdev unregistered while its vap is
-  OPEN leaves `vap->wifi_dev` and the fq `net_dev` links dangling (cdx holds
-  no ref by design; the N13 sweeps themselves are immune since they walk the
-  live netdev list); (2) VLAN-on-vap aliases are cleared on REMOVE but not
-  republished on re-ADD — ESP-over-VLAN traffic falls back to the normal
-  (safe, unoffloaded) path until the FCI VLAN entry is re-registered, and
-  vap cycling emits no netlink event for cmm to react to; (3) FCI
-  VLAN-REGISTER copies the parent's `wifi_offload_dev` without rtnl, so a
-  registration racing the REMOVE-time sweep can resurrect one alias (lands
-  in a CONFIGURED vap, safe-drop — pre-N13 behavior for that alias);
-  (4) `fqid_files_g` is walked lock-free from two serialization domains
-  (FCI dispatch vs vwd ioctl/rtnl); (5) a CONFIGURING slot skipped by the
-  failed-init exit walk leaks its FQs if the racing ADD completes. All
-  bounded, none crash-reachable in normal operation. (Found by the N13/N14
-  audit.)
-
 ---
 
 <a name="archive"></a>
@@ -122,6 +104,7 @@ file's git history.
 - **N12.** Deinit never freed the interface list (`dpa_release_iflist` had zero callers and only kfree'd) — rewritten as a pop-under-lock/release-outside sweep (eth backstop: reset ifinfo + `dev_put`; `free_stats` + kfree for all), counters zeroed, registered so the LIFO chain runs it after `tx_exit`'s onif releases — frees the OFPORT fixtures and backstops leaked netdev refs on failed init (_a34063c_). Adjacent teardown leaks filed as N14.
 - **N13.** VAP REMOVE/RESET tore down state lock-free consumers could still reach — new rtnl-held `vwd_unpublish_vap` clears every `wifi_offload_dev` alias (incl. VLAN-on-vap), REMOVE/RESET claim the slot and wait a `synchronize_rcu` grace before `vwd_vap_down`, RESET also drops the per-vap sysfs attrs (double-create fixed), and the exit path gained the same discipline plus an explicit grace (`nf_unregister_net_hook` stopped synchronizing in 4.14) and a global alias sweep (_de0aef4_). Residue filed as N15.
 - **N14.** Teardown gaps closed: `destroy_fwd_tx_fqs` un-ifdef'd (was compiled out — fwd tx FQs undestroyable) and called on release; per-iface proc dirs + wrappers reclaimed via tree-aliveness-aware `cdx_remove_dir_in_procfs`; `cdx_deinit_fqid_procfs` frees the tracking nodes it leaked; stats MURAM carve freed from the sweep tail (_79089f1_). Failed-injection MURAM/HW residue stays accepted (handle gone by then).
+- **N15.** VAP/netdev lifetime residue closed: NETDEV_UNREGISTER notifier (unpublish + grace + down for OPEN vaps on a dying wifi netdev, multi-vap aware, alias-clearing without relying on 8021q ordering; also covers netns moves); VLAN aliases republished on vap re-ADD (by netdev relationship — never-FCI-registered VLANs now get the alias too, safe via the SEC round-trip/exception path); the FCI VLAN-REGISTER copy runs under rtnl; `fqid_files_g` spinlocked with sleeping ops outside; exit drains in-flight ioctls under rtnl (mid-ADD FQ leak gone) (_f094aba_). Accepted residue: a CONFIGURE→ADD issued on a held-open fd after a failed-init teardown can still poke freed OH state (pre-existing class, failed-init-only, needs a shutting-down gate); frames parked in SEC/FMAN can outlive a netdev unregister (inherent, narrowed by the notifier). cdx.ko now depends on 8021q.ko (vlan_dev_real_dev).
 - **N10.** Devlist discipline sweep — OH fixtures carried `itf_id` 0, so releasing/looking up the legitimate onif index 0 could alias one (release now skips OFPORT + `~0U` sentinel at creation); the two non-FCI walkers (`dpa_get_ohifinfo_by_portid` — which also lacked the union type check — and `cdx_copy_eth_rx_channel_info`) now walk under the list lock; `dpa_add_wlan_if` gained the missing `iface_count++`/cap/rc checks (vap cycles underflowed the u8 counter until all adds were rejected); `remove_onif_by_index` bails on invalid slots; injection-precedes-FCI serialization documented; dead code removed (`dpa_update_wlan_if`, `dpa_get_itfid_by_fman_params`, the caller-less `comcerto_fpp_send_command_simple`/`_atomic`, `cdx_ctrl_send_command_simple`) (_26b408a_). Sleeping-under-vaplock and the deinit list leak filed as N11/N12.
 
 ## Low / Hardening
