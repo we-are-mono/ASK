@@ -33,10 +33,10 @@
  *   dpa_statslist_lock (spinlock)
  *      - Guards the cdx_iface_ifinfo free lists (ifstats_freelist
  *        and the PPPoE variant) and their backing stats_mem
- *        region. Taken by alloc/free helpers on the ioctl path and
- *        by stats-read helpers called from softirq (netdev stats
- *        callback), so plain spin_lock() with implicit BH
- *        discipline where needed.
+ *        region. All takers are process context (ioctl-path
+ *        alloc/free and the dev_get_stats callback), which is why
+ *        plain spin_lock() is sufficient; do not add a softirq
+ *        taker without switching the discipline to _bh.
  *   stats_mem, stats_mem_phys
  *      - Set once at init in cdx_init_stats; after that read-only.
  *
@@ -165,13 +165,24 @@ int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 		iface->stats = ifstats;
 		spin_unlock(&dpa_statslist_lock);
 	}
+	if (!iface->stats) {
+		/* freelist exhausted. Returning SUCCESS here would leave
+		 * rxstats_index/txstats_index aliasing slot 0 and a NULL
+		 * stats pointer that the FCI stats query would deref. */
+		DPA_ERROR("%s::stats freelist exhausted for type %x\n",
+				__func__, dev_type);
+		kfree(iface->last_stats);
+		iface->last_stats = NULL;
+		return FAILURE;
+	}
 	return SUCCESS;
 }
 
 void free_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 {
-	/* alloc_iface_stats returns SUCCESS with a NULL slot when the
-	 * freelist is exhausted — guard the pushback */
+	/* NULL-guarded for idempotence: callers may legitimately hold
+	 * an iface whose slot was already returned, and the guards make
+	 * a double call harmless */
 	if (dev_type == IF_TYPE_PPPOE) {
 		struct cdx_pppoe_iface_ifinfo *pppoe_stats;
 

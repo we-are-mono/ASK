@@ -64,10 +64,12 @@
  *      - Guards the dpa_interface_info singly-linked list of
  *        registered interfaces, plus their eth/vlan/tunnel/pppoe
  *        sub-structures in place. Taken by readers (e.g.
- *        dpa_get_ifinfo_by_itfid, virt_iface_stats_callback) and
- *        writers (interface add/remove) alike. Held briefly;
- *        callers from softirq (stats callbacks) use spin_lock(),
- *        matching the default this file uses.
+ *        dpa_get_ifinfo_by_itfid callers, virt_iface_stats_callback)
+ *        and writers (interface add/remove) alike. All takers run
+ *        in process context (FCI dispatch / dev_get_stats), which
+ *        is why plain spin_lock() is sufficient — there are no
+ *        softirq takers; do not add one without switching the
+ *        discipline to _bh.
  *   dpa_interface_info (file-scope head pointer)
  *      - Protected by dpa_devlist_lock.
  *
@@ -2288,8 +2290,10 @@ int dpa_add_pppoe_if(char *name, struct _itf *itf, struct _itf *phys_itf,
 #endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
-		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n", 
-				__func__); 
+		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
+				__func__);
+		if (iface_info->if_flags & IF_STATS_ENABLED)
+			free_stats(iface_info);
 		goto err_ret;
 	}
 	iface_pppoe_count++;
@@ -2364,8 +2368,10 @@ int dpa_add_vlan_if(char *name, struct _itf *itf, struct _itf *phys_itf, uint16_
 #endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
-		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n", 
-				__func__); 
+		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
+				__func__);
+		if (iface_info->if_flags & IF_STATS_ENABLED)
+			free_stats(iface_info);
 		goto err_ret;
 	}
 	iface_count++;
@@ -2717,8 +2723,10 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 #endif
 	//add to list
 	if (dpa_add_port_to_list(iface_info)) {
-		DPA_ERROR("%s::get_dpa_eth_iface_info failed\n", 
-				__func__); 
+		DPA_ERROR("%s::dpa_add_port_to_list failed\n",
+				__func__);
+		if (iface_info->if_flags & IF_STATS_ENABLED)
+			free_stats(iface_info);
 		goto err_ret;
 	}
 	iface_count++;
