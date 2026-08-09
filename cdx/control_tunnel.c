@@ -29,8 +29,9 @@ extern spinlock_t dpa_devlist_lock;
  *        stat_tunnel_Get_Next_SessionEntry (pStatTunnelSnapshot,
  *        stat_tunnel_*, stat_tunnel_name).
  *   dpa_devlist_lock (owned by devman.c)
- *      - Acquired briefly in tunnel_stats_get() while looking up
- *        iface_info by index; not held across tunnel table walks.
+ *      - Held in tunnel_stats_get() across the iface_info lookup AND
+ *        the stats read/reset (the iface can be kfreed once the lock
+ *        drops); still not held across tunnel table walks.
  *
  * The tunnel_name_cache slist is currently lock-free on the mutator
  * side too. Same gap as the IPv4/IPv6 cases.
@@ -661,6 +662,9 @@ static U16 tunnel_stats_get(PTnlEntry pEntry, PStatTunnelEntryResponse snapshot,
 	struct iface_stats *last_stats;
 	U16 ret = 0;
 
+	/* hold the lock across the use, not just the lookup — the iface
+	 * (and its stats) can be kfreed by dpa_release_interface the
+	 * moment the lock drops. Non-sleeping work only under the lock. */
 	spin_lock(&dpa_devlist_lock);
 	if ((iface_info = dpa_get_ifinfo_by_itfid((uint32_t)pEntry->itf.index)) == NULL)
 	{
@@ -668,9 +672,9 @@ static U16 tunnel_stats_get(PTnlEntry pEntry, PStatTunnelEntryResponse snapshot,
 		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, pEntry->itf.index);
 		return ERR_UNKNOWN_INTERFACE;
 	}
-	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
+		spin_unlock(&dpa_devlist_lock);
 		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
@@ -686,6 +690,7 @@ static U16 tunnel_stats_get(PTnlEntry pEntry, PStatTunnelEntryResponse snapshot,
 
 	if (do_reset)
 		dpa_iface_stats_reset(iface_info, &ifstats);
+	spin_unlock(&dpa_devlist_lock);
 
 	return NO_ERR;
 }

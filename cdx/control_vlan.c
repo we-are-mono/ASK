@@ -28,8 +28,9 @@ U8 gStatVlanQueryStatus;
  *        stat_VLAN_Get_Next_SessionEntry (pStatVLANSnapshot,
  *        stat_vlan_*).
  *   dpa_devlist_lock (owned by devman.c)
- *      - Briefly acquired in the stat path while resolving iface
- *        info; never held across vlan_cache walks.
+ *      - Held in vlan_stats_get() across the iface_info lookup AND
+ *        the stats read/reset (the iface can be kfreed once the
+ *        lock drops); never held across vlan_cache walks.
  *
  * The vlan_cache slist itself is lock-free on both the mutator
  * (Vlan_handle_entry) and walker sides. Attackers reaching those
@@ -445,6 +446,9 @@ static U16 vlan_stats_get(PVlanEntry pEntry, PStatVlanEntryResponse snapshot, U3
 	struct iface_stats *last_stats;
 	U16 ret = 0;
 
+	/* hold the lock across the use, not just the lookup — the iface
+	 * (and its stats) can be kfreed by dpa_release_interface the
+	 * moment the lock drops. Non-sleeping work only under the lock. */
 	spin_lock(&dpa_devlist_lock);
 	if ((iface_info = dpa_get_ifinfo_by_itfid((uint32_t)pEntry->itf.index)) == NULL)
 	{
@@ -452,9 +456,9 @@ static U16 vlan_stats_get(PVlanEntry pEntry, PStatVlanEntryResponse snapshot, U3
 		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, pEntry->itf.index);
 		return ERR_UNKNOWN_INTERFACE;
 	}
-	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
+		spin_unlock(&dpa_devlist_lock);
 		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
@@ -470,6 +474,7 @@ static U16 vlan_stats_get(PVlanEntry pEntry, PStatVlanEntryResponse snapshot, U3
 
 	if (do_reset)
 		dpa_iface_stats_reset(iface_info, &ifstats);
+	spin_unlock(&dpa_devlist_lock);
 
 	return NO_ERR;
 }

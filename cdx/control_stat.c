@@ -84,6 +84,10 @@ U16 interface_stats_reset(uint32_t interface)
 	struct iface_stats ifstats;
 	U16 ret = 0;
 
+	/* hold the lock across the use, not just the lookup — the iface
+	 * (and its stats) can be kfreed by dpa_release_interface the
+	 * moment the lock drops. All work under the lock is non-sleeping
+	 * (slot reads + arithmetic). */
 	spin_lock(&dpa_devlist_lock);
 	if ((iface_info = dpa_get_ifinfo_by_itfid(interface)) == NULL)
 	{
@@ -91,13 +95,14 @@ U16 interface_stats_reset(uint32_t interface)
 		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, interface);
 		return ERR_UNKNOWN_INTERFACE;
 	}
-	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
+		spin_unlock(&dpa_devlist_lock);
 		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
 	dpa_iface_stats_reset(iface_info, &ifstats);
+	spin_unlock(&dpa_devlist_lock);
 
 	return NO_ERR;
 }
@@ -109,6 +114,7 @@ static U16 phyif_stats_get(U16 interface, PStatInterfacePktResponse rsp, U8 do_r
 	struct iface_stats *last_stats;
 	U16 ret = 0;
 
+	/* held across the use — see interface_stats_reset */
 	spin_lock(&dpa_devlist_lock);
 	if ((iface_info = dpa_get_ifinfo_by_itfid((uint32_t)interface)) == NULL)
 	{
@@ -116,13 +122,13 @@ static U16 phyif_stats_get(U16 interface, PStatInterfacePktResponse rsp, U8 do_r
 		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, interface);
 		return ERR_UNKNOWN_INTERFACE;
 	}
-	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
+		spin_unlock(&dpa_devlist_lock);
 		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
-	
+
 	last_stats = iface_info->last_stats;
 	rsp->total_bytes_received[0] = statistics_get_lsb(ifstats.rx_bytes - last_stats->rx_bytes);
 	rsp->total_bytes_received[1] = statistics_get_msb(ifstats.rx_bytes - last_stats->rx_bytes);
@@ -134,6 +140,7 @@ static U16 phyif_stats_get(U16 interface, PStatInterfacePktResponse rsp, U8 do_r
 
 	if (do_reset)
 		dpa_iface_stats_reset(iface_info, &ifstats);
+	spin_unlock(&dpa_devlist_lock);
 	return NO_ERR;
 }
 

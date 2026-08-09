@@ -29,7 +29,9 @@ U8 gStatPPPoEQueryStatus;
  *        stat_PPPoE_Get_Next_SessionEntry (pStatPPPoESnapshot,
  *        stat_pppoe_*).
  *   dpa_devlist_lock (owned by devman.c)
- *      - Briefly taken in pppoe_stats_get() for iface_info lookup.
+ *      - Held in pppoe_stats_get() across the iface_info lookup AND
+ *        the stats read/reset (the iface can be kfreed once the
+ *        lock drops).
  *
  * The PPPoE session cache is lock-free on the mutator side. Same
  * gap as the other control_*.c files — fixing requires a subsystem
@@ -656,6 +658,9 @@ static U16 pppoe_stats_get(pPPPoE_Info pEntry, PStatPPPoEEntryResponse snapshot,
 	struct iface_stats *last_stats;
 	U16 ret = 0;
 
+	/* hold the lock across the use, not just the lookup — the iface
+	 * (and its stats) can be kfreed by dpa_release_interface the
+	 * moment the lock drops. Non-sleeping work only under the lock. */
 	spin_lock(&dpa_devlist_lock);
 	if ((iface_info = dpa_get_ifinfo_by_itfid((uint32_t)pEntry->itf.index)) == NULL)
 	{
@@ -663,9 +668,9 @@ static U16 pppoe_stats_get(pPPPoE_Info pEntry, PStatPPPoEEntryResponse snapshot,
 		DPA_ERROR("%s:: Failed to find the interface index 0x%x\n", __func__, pEntry->itf.index);
 		return ERR_UNKNOWN_INTERFACE;
 	}
-	spin_unlock(&dpa_devlist_lock);
 	if ((ret = dpa_iface_stats_get(iface_info, &ifstats)) != NO_ERR)
 	{
+		spin_unlock(&dpa_devlist_lock);
 		DPA_ERROR("%s:: Failed to get interface stats, return value %d\n", __func__, ret);
 		return ret;
 	}
@@ -676,6 +681,7 @@ static U16 pppoe_stats_get(pPPPoE_Info pEntry, PStatPPPoEEntryResponse snapshot,
 
 	if (do_reset)
 		dpa_iface_stats_reset(iface_info, &ifstats);
+	spin_unlock(&dpa_devlist_lock);
 
 	return NO_ERR;
 }
