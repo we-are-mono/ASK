@@ -256,6 +256,12 @@ static int __init cdx_module_init(void)
 		printk("%s::cdx_init_device failed\n", __func__);
 		goto exit;
 	}
+	/* registered before cdx_ctrl_init so the LIFO deinit chain runs
+	 * it after cdx_ctrl_deinit (whose tx_exit releases all
+	 * onif-tracked interfaces) — the sweep then frees the remaining
+	 * OFPORT fixtures, or, on a failed init after the dpa_app
+	 * injection, the eth nodes still holding netdev refs */
+	register_cdx_deinit_func(dpa_release_iflist);
 	rc = cdx_ctrl_init(cdx_info);
 	if (rc != 0) {
 		printk("%s::cdx_ctrl_init failed\n", __func__);

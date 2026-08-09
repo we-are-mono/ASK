@@ -1897,15 +1897,41 @@ check_parent:
 	return FAILURE;
 }
 
-/* free device resources */
+static void free_stats(struct dpa_iface_info *info);
+
+/* Last-gasp deinit sweep: free whatever is still on the interface
+ * list. On a clean teardown the FCI tx_exit path has already released
+ * every onif-tracked interface through dpa_release_interface, so what
+ * remains are the injection-created OFPORT fixtures; the eth arm is a
+ * backstop for nodes tx_exit's onif sweep missed, whose leaked
+ * dev_get_by_name refs would hang unregister_netdevice forever.
+ * No FMan HW teardown here: this runs last in the LIFO
+ * deinit chain, when the HW state is already torn down or was never
+ * fully up. Unpublish, drop refs, free memory. */
 void dpa_release_iflist(void)
 {
 	struct dpa_iface_info *iface_info;
+
+	spin_lock(&dpa_devlist_lock);
 	while (dpa_interface_info) {
 		iface_info = dpa_interface_info;
 		dpa_interface_info = iface_info->next;
+		spin_unlock(&dpa_devlist_lock);
+
+		if ((iface_info->if_flags & IF_TYPE_ETHERNET) &&
+				iface_info->eth_info.net_dev) {
+			dpa_reset_eth_ifinfo(
+				netdev_priv(iface_info->eth_info.net_dev));
+			dev_put(iface_info->eth_info.net_dev);
+		}
+		free_stats(iface_info);
 		kfree(iface_info);
+
+		spin_lock(&dpa_devlist_lock);
 	}
+	iface_count = 0;
+	iface_pppoe_count = 0;
+	spin_unlock(&dpa_devlist_lock);
 }
 
 
