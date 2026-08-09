@@ -330,6 +330,77 @@ U64 post_sec_in_data_off;
 
 static struct device *jrdev_g;
 
+static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
+{
+	return cipher_type == OP_PCL_IPSEC_AES_GCM8 ||
+	       cipher_type == OP_PCL_IPSEC_AES_GCM12 ||
+	       cipher_type == OP_PCL_IPSEC_AES_GCM16 ||
+	       cipher_type == OP_PCL_IPSEC_AES_GMAC;
+}
+
+/*
+ * Sharing policy for the IPsec protocol shared descriptor (SEC RM rev 0,
+ * §7.3.1/7.3.2 sharing rules, §9.1 protocol-op PDB behaviour, header SC
+ * bit definition).
+ *
+ * The PDB embedded in the shared descriptor is live state (encap: ESP
+ * sequence counter; decap: sequence + anti-replay window), so the header
+ * flags decide correctness, not just throughput:
+ *
+ *  - HDR_SAVECTX carries the CCB context registers from one job into the
+ *    next when the same DECO runs the same SA back-to-back (SERIAL
+ *    self-sharing — exactly what SEC's scheduler prefers once per-SA
+ *    load rises). The bit exists for operations split across several
+ *    jobs; for independent per-packet jobs it seeds packet N+1 with
+ *    packet N's residue. AES-GCM keeps GHASH/counter state in class-1
+ *    context, so inherited residue corrupts the ICV of nearly every
+ *    packet once self-sharing kicks in (NXP DNCPE-2358's ">18% load"
+ *    ICV failures). CBC/CTR/CCM protocol machines fully re-init their
+ *    context from PDB/keys per packet and are immune. The kernel CAAM
+ *    library draws the same line: cnstr_shdsc_{gcm,rfc4106,rfc4543}_*
+ *    omit SAVECTX while the CBC/XTS constructors keep it.
+ *
+ *  - HDR_SHARE_NEVER forces every job to refetch the descriptor from
+ *    memory "without any consideration for any pending writes to update
+ *    the Shared Descriptor PDB from another DECO" (RM §9.1) — duplicate
+ *    ESP sequence numbers are the documented outcome, and 21-25 % of
+ *    wire seqs were duplicates when GCM ran this way.
+ *
+ *  - HDR_SHARE_WAIT hands the descriptor - updated PDB included - to the
+ *    next job as soon as the protocol engine signals OK-to-Share, which
+ *    for random-IV encap (PDBOPTS_ESP_IVSRC, always set here) happens
+ *    right after the sequence number is updated (RM §9.1): cross-DECO
+ *    sequence atomicity without serializing whole jobs. NXP's flib uses
+ *    the same mode for PDCP, its other protocol family with a mutable
+ *    counter in a shared PDB.
+ *
+ * GCM/GMAC therefore run WAIT without SAVECTX; the other ciphers keep
+ * the SERIAL+SAVECTX arrangement they have always shipped and measured
+ * clean with. The paired half of the fix is in
+ * save_sa_state_in_external_mem(): RM §7.3.1 requires every job of a
+ * WAIT/SERIAL flow to STORE the PDB back so SEC orders descriptor
+ * refetches against prior jobs' updates.
+ *
+ * Measured on the DNCPE-2358 setup (~185 Mbit/s of 1390-byte UDP
+ * through hardware encap, 200k-frame wire samples, Linux peer with
+ * replay-window 32): SERIAL+SAVECTX ~2.8M ICV failures per 12 s and
+ * 0.4-0.5 % duplicate wire seqs; WAIT without SAVECTX 0 ICV failures
+ * and 0.086 % duplicates — fewer than the CBC+HMAC production path
+ * measured at the same scale (0.154 %), i.e. the residual duplication
+ * is a platform-wide DPAA/SEC characteristic absorbed by the peer's
+ * anti-replay window, not a GCM-specific defect. SERIAL without
+ * SAVECTX also clears the ICV failures but quadruples the duplicates
+ * and adds out-of-window reorders; NEVER is documented by the RM
+ * itself to duplicate sequence numbers.
+ */
+static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)
+{
+	if (cdx_ipsec_cipher_is_gcm(sa->pSec_sa_context->cipher_data.cipher_type))
+		return HDR_SHARE_WAIT;
+
+	return HDR_SAVECTX | HDR_SHARE_SERIAL;
+}
+
 extern void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 
 extern int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num);
@@ -887,10 +958,11 @@ void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow)
 	return;
 }
 
-static inline void save_stats_in_external_mem(PSAEntry sa)
+static inline void save_sa_state_in_external_mem(PSAEntry sa)
 {
 	uint32_t *desc;
 	uint32_t stats_offset;
+	uint32_t off_w, len_w;
 	PDpaSecSAContext pSec_sa_context = sa->pSec_sa_context;
 
 	desc = (u32 *) pSec_sa_context->sec_desc->shared_desc;
@@ -899,11 +971,25 @@ static inline void save_stats_in_external_mem(PSAEntry sa)
 	/* statistics offset = predetermined offset */
 	stats_offset = sa->stats_offset;
 
+	if (cdx_ipsec_cipher_is_gcm(pSec_sa_context->cipher_data.cipher_type)) {
+		/* RM §7.3.1: in a WAIT/SERIAL sharing flow every job must
+		 * write the PDB back to memory with a STORE — that is what
+		 * makes SEC order later shared-descriptor fetches against
+		 * prior jobs' PDB updates (encap seq counter; decap seq +
+		 * anti-replay window). The PDB occupies words 1..stats and
+		 * the stats words trail it, so cover both in one store. */
+		off_w = 1;
+		len_w = stats_offset / 4 - 1 + CDX_DPA_IPSEC_STATS_LEN;
+	} else {
+		off_w = stats_offset / 4;
+		len_w = CDX_DPA_IPSEC_STATS_LEN;
+	}
+
 	/* Store command: in the case of the Descriptor Buffer the length
 	 * is specified in 4-byte words, but in all other cases the length
 	 * is specified in bytes. Offset in 4 byte words */
-	append_store(desc, 0, CDX_DPA_IPSEC_STATS_LEN , LDST_CLASS_DECO |
-			((stats_offset / 4) << LDST_OFFSET_SHIFT) |
+	append_store(desc, 0, len_w, LDST_CLASS_DECO |
+			(off_w << LDST_OFFSET_SHIFT) |
 			LDST_SRCDST_WORD_DESCBUF_SHARED);
 
 	/* Jump with CALM to be sure previous operation was finished */
@@ -920,36 +1006,18 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 	int opthdrsz;
 	size_t pdb_len = 0;
 	uint32_t sa_op;
-	uint32_t share_mode;
+	uint32_t hdr_flags;
 	PDpaSecSAContext pSec_sa_context;
 
-	pSec_sa_context =sa->pSec_sa_context; 
+	pSec_sa_context =sa->pSec_sa_context;
 
 	desc = (u32 *) pSec_sa_context->sec_desc->shared_desc;
 	/* Reserve 2 words for statistics */
 	pdb_len = CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
 
-	/*
-	 * A24: GCM/GMAC use HDR_SHARE_NEVER (private per-DECO copy of the
-	 * shared descriptor) to eliminate the cross-DECO race in SEC's
-	 * GHASH path that produces ~86% AEAD ICV-fail at line rate (visible
-	 * as duplicate ESP seq numbers + AAD-vs-wire-seq drift). CBC, CCM
-	 * and CTR are immune (HMAC robust to IV semantics; CBC-MAC/CTR auth
-	 * inherently serial) and keep HDR_SHARE_SERIAL for throughput.
-	 * Cost: GCM throughput drops slightly because DECOs can't pipeline
-	 * the descriptor fetch — that's the price for race-free GHASH state.
-	 * Side effect (A24a): each DECO maintains its own seq counter →
-	 * wire-seq duplicates in the ~21 % range over a 500-frame capture.
-	 * Anti-replay-enabled peers (default strongSwan replay-window=32)
-	 * will reject duplicates.
-	 */
-	if (pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM8 ||
-	    pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM12 ||
-	    pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GCM16 ||
-	    pSec_sa_context->cipher_data.cipher_type == OP_PCL_IPSEC_AES_GMAC)
-		share_mode = HDR_SHARE_NEVER;
-	else
-		share_mode = HDR_SHARE_SERIAL;
+	/* Sharing policy is correctness-critical for the stateful PDB —
+	 * see cdx_ipsec_sh_desc_hdr_flags(). */
+	hdr_flags = cdx_ipsec_sh_desc_hdr_flags(sa);
 
 	if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND) {
 		/* Compute optional header size, rounded up to descriptor
@@ -958,11 +1026,11 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 			(caam32_to_cpu(pSec_sa_context->sec_desc->pdb_en.ip_hdr_len) +
 			 3) & ~3;
 		pdb_len += sizeof(struct ipsec_encap_pdb) + opthdrsz;
-		init_sh_desc_pdb(desc, HDR_SAVECTX | share_mode, pdb_len);
+		init_sh_desc_pdb(desc, hdr_flags, pdb_len);
 		sa_op = OP_TYPE_ENCAP_PROTOCOL;
 	} else {
 		pdb_len += sizeof(struct ipsec_decap_pdb);
-		init_sh_desc_pdb(desc, HDR_SAVECTX | share_mode, pdb_len);
+		init_sh_desc_pdb(desc, hdr_flags, pdb_len);
 		sa_op = OP_TYPE_DECAP_PROTOCOL;
 	}
 
@@ -1062,7 +1130,7 @@ skip_byte_copy:
 	}
 
 	/* Enable Stats only for IPv4  TODO-IPV6 */
-	save_stats_in_external_mem(sa);
+	save_sa_state_in_external_mem(sa);
 	/*For inbound Ipsec traffic, copy SAGD  to the outer packet at the end */
 
 #ifdef UNIQUE_IPSEC_CP_FQID
@@ -1459,7 +1527,7 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 		return -ENXIO;
 	}
 
-	init_sh_desc_pdb(desc, HDR_SAVECTX | HDR_SHARE_SERIAL,
+	init_sh_desc_pdb(desc, cdx_ipsec_sh_desc_hdr_flags(sa),
 			(sa->next_cmd_indx - 1) * sizeof(uint32_t));
 
 	if (sec_era == 2) {
@@ -1684,7 +1752,7 @@ static int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
 		return -ENXIO;
 	}
 
-	init_sh_desc_pdb(desc, HDR_SAVECTX | HDR_SHARE_SERIAL,
+	init_sh_desc_pdb(desc, cdx_ipsec_sh_desc_hdr_flags(sa),
 			(sa->next_cmd_indx - 1) * sizeof(uint32_t));
 
 	if (sec_era == 2) {
@@ -2051,20 +2119,29 @@ static int cdx_ipsec_build_out_sa_pdb(PSAEntry sa)
 	struct encap_ccm_opt *ccm_opt;
 	uint8_t	*salt;
 
+	uint64_t next_seq;
+
 	psec_as_context = sa->pSec_sa_context;
-	sec_desc= psec_as_context->sec_desc; 
+	sec_desc= psec_as_context->sec_desc;
 	memset(&sec_desc->pdb_en, 0, sizeof(sec_desc->pdb_en));
 
 	//sec_desc->pdb_en.spi = cpu_to_caam32(sa->id.spi);
 	sec_desc->pdb_en.spi = sa->id.spi;
 
+	/* The PDB carries the sequence number the SEC will emit NEXT (it
+	 * sends the stored value, then increments). sa->seq is the kernel
+	 * checkpoint of the last sequence used — 0 on a fresh SA — so seed
+	 * one past it: RFC 4303 starts the wire at 1, and Linux peers drop
+	 * a seq-0 ESP packet as a replay. */
+	next_seq = sa->seq + 1;
+
 	if (sa->flags & SA_ALLOW_EXT_SEQ_NUM ) {
 		sec_desc->pdb_en.seq_num_ext_hi =
-			cpu_to_caam32((sa->seq & SEQ_NUM_HI_MASK) >> 32);
+			cpu_to_caam32((next_seq & SEQ_NUM_HI_MASK) >> 32);
 		sec_desc->pdb_en.options |= PDBOPTS_ESP_ESN;
 	}
 	sec_desc->pdb_en.seq_num =
-		cpu_to_caam32(sa->seq & SEQ_NUM_LOW_MASK);
+		cpu_to_caam32(next_seq & SEQ_NUM_LOW_MASK);
 
 
 	//if (!sa->init_vector)
@@ -2280,6 +2357,20 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 			psec_sa_context->sec_desc_extended = false;
 			goto done_shared_desc;
 		case -EPERM:
+			/* The extended builders lack the per-job PDB store
+			 * that keeps GCM sequence state coherent across
+			 * DECOs. A GCM descriptor fits the normal builder
+			 * with >20 words to spare, so this is unreachable
+			 * today; refuse loudly rather than corrupt quietly
+			 * if that ever changes. The SA then stays on kernel
+			 * xfrm. */
+			if (cdx_ipsec_cipher_is_gcm(
+					psec_sa_context->cipher_data.cipher_type)) {
+				log_err("GCM SA spi %d needs an extended descriptor; not supported\n",
+						sa->id.spi);
+				ret = -EFAULT;
+				goto err_unmap_crypto;
+			}
 			psec_sa_context->sec_desc_extended = true;
 			goto build_extended_shared_desc;
 		default:

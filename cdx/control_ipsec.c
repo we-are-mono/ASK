@@ -295,23 +295,43 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 			sa->icvsz = 16;
 			sa->pSec_sa_context->auth_data.split_key_len = 0;
 			break;
+		/* GCM/GMAC offload re-enabled: the shared-descriptor sharing
+		 * policy now keeps GHASH context and PDB.seq coherent across
+		 * DECOs — see cdx_ipsec_sh_desc_hdr_flags() in
+		 * cdx_dpa_ipsec.c. RFC 4106/4543: 4-byte salt trails the AES
+		 * key, hence comb_mode with extra_size 4. */
 		case SADB_X_EALG_AES_GCM_ICV8:
+			algo = OP_PCL_IPSEC_AES_GCM8;
+			sa->blocksz = 16;
+			comb_mode = 1;
+			extra_size = 4;
+			sa->icvsz = 8;
+			sa->pSec_sa_context->auth_data.split_key_len = 0;
+			break;
 		case SADB_X_EALG_AES_GCM_ICV12:
+			algo = OP_PCL_IPSEC_AES_GCM12;
+			comb_mode = 1;
+			extra_size = 4;
+			sa->blocksz = 16;
+			sa->icvsz = 12;
+			sa->pSec_sa_context->auth_data.split_key_len = 0;
+			break;
 		case SADB_X_EALG_AES_GCM_ICV16:
+			algo = OP_PCL_IPSEC_AES_GCM16;
+			sa->blocksz = 16;
+			comb_mode = 1;
+			extra_size = 4;
+			sa->icvsz = 16;
+			sa->pSec_sa_context->auth_data.split_key_len = 0;
+			break;
 		case SADB_X_EALG_NULL_AES_GMAC:
-			/* Per-DECO PDB.seq diverges above ~100 Mbit/s per SA → wire-seq
-			 * dupes that violate RFC 4303 anti-replay on standards-compliant
-			 * peers. IVs stay unique (SEC IVSRC is independent of PDB.seq —
-			 * empirically verified), so this is not a GCM cryptographic break,
-			 * but the offload is unusable with replay-window > 0. Refuse here
-			 * so x->offloaded stays 0 and the SA falls through to kernel xfrm
-			 * via caamalg_qi.c, which generates unique seqs by construction.
-			 * See ISSUES.md A24a. */
-			pr_warn("cdx: AES-GCM/GMAC offload disabled (A24a). "
-				"SA falls through to kernel xfrm. "
-				"For hardware offload use AES-128-CCM-16 or "
-				"AES-128-CBC + HMAC-SHA-256.\n");
-			return -1;
+			algo = OP_PCL_IPSEC_AES_GMAC;
+			sa->blocksz = 16;
+			comb_mode = 1;
+			extra_size = 4;
+			sa->icvsz = 16;
+			sa->pSec_sa_context->auth_data.split_key_len = 0;
+			break;
 		case SADB_EALG_3DESCBC:
 			algo = OP_PCL_IPSEC_3DES;
 			sa->blocksz = 8;
