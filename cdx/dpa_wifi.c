@@ -1023,6 +1023,10 @@ static int __hot vwd_skb_to_sg_fd(struct dpaa_vwd_priv_s *priv,
 	skb_copy_from_linear_data(skb, ptr, skb->len);
 
 	addr = dma_map_single(priv->tx_bp->dev, buffer_start, priv->tx_bp->size, DMA_TO_DEVICE);
+	if (dma_mapping_error(priv->tx_bp->dev, addr)) {
+		printk(KERN_ERR "%s::dma map failed\n", __func__);
+		goto skb_failed;
+	}
 	fd->addr = addr;
 
 	return 0;
@@ -2987,7 +2991,10 @@ err9:
 	release_device_tx_bpool(priv);
 err8:
 	release_device_tx_done_bpool(priv);
-err7: 
+err7:
+	/* get_eth_priv took a netdev ref via dev_get_by_name; dropping it
+	 * here mirrors the dev_put in dpaa_vwd_exit */
+	dev_put(vwd.eth_priv->net_dev);
 	vwd.eth_priv = NULL;
 err6:
 	vwd_release_pcd_fqs(priv);

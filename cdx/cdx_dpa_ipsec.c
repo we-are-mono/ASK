@@ -1454,7 +1454,7 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 			pSec_sa_context->sec_desc_extra_cmds,
 			extra_cmds_len * sizeof(uint32_t),
 			DMA_TO_DEVICE);
-	if (!dma_extra_cmds) {
+	if (dma_mapping_error(jrdev_g, dma_extra_cmds)) {
 		log_err("Could not DMA map extra CAAM commands\n");
 		return -ENXIO;
 	}
@@ -1679,7 +1679,7 @@ static int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
 	dma_extra_cmds = dma_map_single(jrdev_g, psec_as_context->sec_desc_extra_cmds,
 			extra_cmds_len * sizeof(uint32_t),
 			DMA_TO_DEVICE);
-	if (!dma_extra_cmds) {
+	if (dma_mapping_error(jrdev_g, dma_extra_cmds)) {
 		log_err("Could not DMA map extra CAAM commands\n");
 		return -ENXIO;
 	}
@@ -2237,7 +2237,7 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 				psec_sa_context->auth_data.split_key,
 				psec_sa_context->auth_data.split_key_pad_len,
 				DMA_TO_DEVICE);
-		if (!auth_key_dma) {
+		if (dma_mapping_error(jrdev_g, auth_key_dma)) {
 			log_err("Could not DMA map authentication key\n");
 			return -EINVAL;
 		}
@@ -2247,7 +2247,7 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 				psec_sa_context->auth_data.auth_key,
 				psec_sa_context->auth_data.auth_key_len,
 				DMA_TO_DEVICE);
-		if (!auth_key_dma) {
+		if (dma_mapping_error(jrdev_g, auth_key_dma)) {
 			log_err("Could not DMA map authentication key\n");
 			return -EINVAL;
 		}
@@ -2257,7 +2257,7 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 			psec_sa_context->cipher_data.cipher_key,
 			psec_sa_context->cipher_data.cipher_key_len,
 			DMA_TO_DEVICE);
-	if (!crypto_key_dma) {
+	if (dma_mapping_error(jrdev_g, crypto_key_dma)) {
 		log_err("Could not DMA map cipher key\n");
 		ret = -EINVAL;
 		goto err_unmap_auth;

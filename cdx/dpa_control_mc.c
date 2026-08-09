@@ -1172,7 +1172,12 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 
 		if (tbl_entry)
 		{
-			SET_INVALID_ENTRY(tbl_entry->hashentry.flags); // setting invalid flag
+			/* flags is stored big-endian (cpu_to_be16 at entry build), so
+			 * SET_INVALID_ENTRY's host-order 1<<15 would set BE bit 7 — an
+			 * OPC_OFFSET bit — corrupting the live entry instead of
+			 * invalidating it. The reference driver switched to a
+			 * swap-modify-swap of the whole word for the same reason. */
+			tbl_entry->hashentry.flags |= cpu_to_be16(1 << 15);
 			if (tbl_entry == replicate_params->first_listener_entry)  // first listener
 			{
 				phyaddr = XX_VirtToPhys(tbl_entry->next);
@@ -1239,6 +1244,14 @@ void cdx_exthash_update_first_mcast_member_addr(struct en_exthash_tbl_entry *tem
 		tmp_val.rsvd = 0;
 		tmp_val.addr_hi = cpu_to_be16((listener_phyaddr >> 32) & 0xffff);
 		tmp_val.addr_lo = cpu_to_be32(listener_phyaddr  & 0xffffffff);
+		/* The freshly built listener entry (opcodes, params, and the
+		 * next_entry chain words written just above) sits in coherent
+		 * DDR that FMAN walks the moment first_member_flow_addr below
+		 * points at it. This publishes into a live chain — the bucket
+		 * spinlock held by the caller only orders CPU accesses, not
+		 * FMAN's. Same hazard as the ADD-path publish in
+		 * cdx_create_hw_entry; drain the store buffer first. */
+		wmb();
 		param->first_member_flow_addr = tmp_val.addr;
 		entry = (struct en_exthash_tbl_entry *)param->first_listener_entry;
 		DPA_INFO("%s(%d) updated first_member_flow_addr %p, next_entry addr %p \n",

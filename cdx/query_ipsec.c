@@ -12,6 +12,7 @@
 //#include "module_ipsec.h"
 //#include "module_tunnel.h"
 #include <linux/mutex.h>
+#include <linux/slab.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "cdx_common.h"
@@ -275,7 +276,8 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 		sa_snapshot_index=0;
 		if(pSASnapshot)
 		{
-			Heap_Free(pSASnapshot);
+			/* entries carry full cipher/auth key copies */
+			kfree_sensitive(pSASnapshot);
 			pSASnapshot = NULL;
 		}
 		sa_snapshot_buf_entries = 0;
@@ -296,7 +298,7 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 			if(ipsec_sa_hash_entries > sa_snapshot_buf_entries)
 			{
 				if(pSASnapshot)
-					Heap_Free(pSASnapshot);
+					kfree_sensitive(pSASnapshot);
 
 				pSASnapshot = Heap_Alloc(ipsec_sa_hash_entries * sizeof(SAQueryCommand));
 
@@ -310,6 +312,12 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 				sa_snapshot_buf_entries = ipsec_sa_hash_entries;
 			}
 
+			/* entries are only partially filled (keys/tnl skipped for
+			 * SAs without sec context or with unknown algos) and the
+			 * buffer is reused across buckets — zero the slice so no
+			 * slab garbage or previous bucket's key bytes ride along
+			 * in the fixed-size replies */
+			memset(pSASnapshot, 0, ipsec_sa_hash_entries * sizeof(SAQueryCommand));
 			sa_snapshot_entries = IPsec_SA_Get_Handle_Snapshot(sa_hash_index , ipsec_sa_hash_entries,pSASnapshot);
 			break;
 		}
@@ -319,7 +327,7 @@ int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action)
 			sa_hash_index = 0;
 			if (pSASnapshot)
 			{
-				Heap_Free(pSASnapshot);
+				kfree_sensitive(pSASnapshot);
 				pSASnapshot = NULL;
 			}
 			sa_snapshot_buf_entries = 0;
