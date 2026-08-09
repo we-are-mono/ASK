@@ -366,37 +366,36 @@ static bool cdx_ipsec_cipher_is_gcm(uint32_t cipher_type)
  *    ESP sequence numbers are the documented outcome, and 21-25 % of
  *    wire seqs were duplicates when GCM ran this way.
  *
- *  - HDR_SHARE_WAIT hands the descriptor - updated PDB included - to the
- *    next job as soon as the protocol engine signals OK-to-Share, which
- *    for random-IV encap (PDBOPTS_ESP_IVSRC, always set here) happens
- *    right after the sequence number is updated (RM §9.1): cross-DECO
- *    sequence atomicity without serializing whole jobs. NXP's flib uses
- *    the same mode for PDCP, its other protocol family with a mutable
- *    counter in a shared PDB.
+ *  - HDR_SHARE_WAIT hands the descriptor to the next job once the
+ *    protocol engine signals OK-to-Share (RM §9.1) and yields the
+ *    cleanest wire (0.086 % duplicate seqs at blast scale), but the
+ *    per-job handshake serializes the SA at ~73 kpps (~0.87 Gbit/s at
+ *    1390 bytes) and line-rate TCP bursts overrun it and tail-drop
+ *    (measured 65 Mbit/s with ~1000 retransmits on a 10 s stream).
  *
- * GCM/GMAC therefore run WAIT without SAVECTX; the other ciphers keep
- * the SERIAL+SAVECTX arrangement they have always shipped and measured
- * clean with. The paired half of the fix is in
- * save_sa_state_in_external_mem(): RM §7.3.1 requires every job of a
- * WAIT/SERIAL flow to STORE the PDB back so SEC orders descriptor
- * refetches against prior jobs' updates.
+ * GCM/GMAC therefore run SERIAL without SAVECTX; the other ciphers
+ * keep the SERIAL+SAVECTX arrangement they have always shipped with.
+ * The paired half of the fix is in save_sa_state_in_external_mem():
+ * RM §7.3.1 requires every job of a WAIT/SERIAL flow to STORE the PDB
+ * back so SEC orders descriptor refetches against prior jobs' updates.
  *
- * Measured on the DNCPE-2358 setup (~185 Mbit/s of 1390-byte UDP
- * through hardware encap, 200k-frame wire samples, Linux peer with
- * replay-window 32): SERIAL+SAVECTX ~2.8M ICV failures per 12 s and
- * 0.4-0.5 % duplicate wire seqs; WAIT without SAVECTX 0 ICV failures
- * and 0.086 % duplicates — fewer than the CBC+HMAC production path
- * measured at the same scale (0.154 %), i.e. the residual duplication
- * is a platform-wide DPAA/SEC characteristic absorbed by the peer's
- * anti-replay window, not a GCM-specific defect. SERIAL without
- * SAVECTX also clears the ICV failures but quadruples the duplicates
- * and adds out-of-window reorders; NEVER is documented by the RM
- * itself to duplicate sequence numbers.
+ * Measured on the DNCPE-2358 setup (hardware encap, Linux peer with
+ * replay-window 32): the legacy SERIAL+SAVECTX flags produce ~2.8M
+ * ICV failures per 12 s at blast load; SERIAL without SAVECTX plus
+ * the PDB store produces zero ICV failures and 2.55 Gbit/s TCP with
+ * 20 retransmits — ahead of the CBC+HMAC production path on the same
+ * boot (2.37 Gbit/s, 842 retransmits). The residual ESP-level
+ * replay-window rejections (~0.45 % at full TCP rate) do not surface
+ * as TCP loss (9805 rejections vs 20 retransmits in the same run):
+ * the rejected frames are redundant wire duplicates the peer's
+ * anti-replay window discards by design, a platform-wide DPAA/SEC
+ * trait the CBC path shares (0.154 % at blast scale). NEVER sharing
+ * is documented by the RM itself to duplicate sequence numbers.
  */
 static uint32_t cdx_ipsec_sh_desc_hdr_flags(PSAEntry sa)
 {
 	if (cdx_ipsec_cipher_is_gcm(sa->pSec_sa_context->cipher_data.cipher_type))
-		return HDR_SHARE_WAIT;
+		return HDR_SHARE_SERIAL;
 
 	return HDR_SAVECTX | HDR_SHARE_SERIAL;
 }
