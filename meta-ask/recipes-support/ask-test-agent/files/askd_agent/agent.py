@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import re
 import secrets
 import socket
 import struct
@@ -895,11 +896,53 @@ def _kmemleak_split(report: str) -> list[str]:
     return blocks
 
 
+# Frames that never own an allocation: the kmemleak/slab machinery and
+# the skb construction helpers sitting between the slab and the caller.
+_NONOWNER_FRAME = re.compile(
+    r"^(kmemleak_|kmem_cache_|__kmalloc|kmalloc|krealloc|slab_"
+    r"|__build_skb|build_skb|__alloc_skb|__napi_build_skb)"
+)
+
+
+def _owner_frames(block: str, n: int = 2) -> list[str]:
+    """First `n` plausible owner frames of a leak block's backtrace."""
+    frames: list[str] = []
+    in_bt = False
+    for line in block.splitlines():
+        if "backtrace" in line:
+            in_bt = True
+            continue
+        if not in_bt:
+            continue
+        frame = line.strip()
+        if not frame:
+            continue
+        if _NONOWNER_FRAME.match(frame):
+            continue
+        frames.append(frame)
+        if len(frames) >= n:
+            break
+    return frames
+
+
 def _kmemleak_filter(blocks: list[str], needles: list[str]) -> list[str]:
-    """Keep leak blocks whose trace text contains any of `needles`."""
+    """Keep leak blocks whose ALLOCATION OWNER matches any of `needles`.
+
+    Substring-anywhere matching is unsound: the arm64 frame-pointer
+    unwinder occasionally emits a stale frame from a previous stack
+    user (observed: every DPAA bpool-seed record from cdx module init
+    carrying a bogus `abm_build_l2flow` frame below the cdx frames —
+    an impossible call chain that made 4600 X3-class false positives
+    match an `abm_` needle). The allocation's owner is within the
+    first couple of real frames above the allocator, so only those are
+    matched.
+    """
     if not needles:
         return blocks
-    return [b for b in blocks if any(n in b for n in needles)]
+    return [
+        b for b in blocks
+        if any(n in f for n in needles for f in _owner_frames(b))
+    ]
 
 
 async def kmemleak_scan(request: web.Request) -> web.Response:
@@ -965,7 +1008,16 @@ async def kmemleak_clear(request: web.Request) -> web.Response:
     # cursor and reappear as "new" leaks on the very next scan.
     # Offload to a thread so we don't block the event loop during the
     # 30-60s first-boot heap walk.
+    # TWO scans, not one: kmemleak only classifies a white object as
+    # reportable once its content checksum is STABLE across consecutive
+    # scans (mm/kmemleak.c update_checksum — the first scan just
+    # records the CRC and returns false). On a freshly booted DUT the
+    # background scanner (10-min cadence) has never run, so a single
+    # scan leaves every boot-time allocation unclassified, `clear`
+    # misses it, and it surfaces as a "new" leak inside the very next
+    # test window.
     def _scan_then_clear() -> None:
+        KMEMLEAK_PATH.write_text("scan\n")
         KMEMLEAK_PATH.write_text("scan\n")
         KMEMLEAK_PATH.write_text("clear\n")
     try:
