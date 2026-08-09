@@ -47,18 +47,6 @@ stale line refs) are folded into the archive one-liners.
   snapshot (or route it through `kfree_sensitive`) before free. The stat
   snapshot carries no keys and is fine.
 
-- [ ] **H7-r. `rtnl_lock()` taken under `spin_lock_bh()` on the abm workqueue send path.** (reopened)
-  The H7 refcount fix (`dev_hold`/balanced `dev_put`) is correct. But the drain
-  it extends calls `rtnl_lock()` (a sleeping mutex) at
-  [auto_bridge/auto_bridge.c:218](auto_bridge/auto_bridge.c#L218) while holding
-  `spin_lock_bh(&abm_lock)` taken at :180 — and this is the *regular* workqueue
-  path `abm_do_work_send_msg` (queued on every bridge FDB event), not module
-  exit. The in-code concurrency comment at :102-106 misdescribes it as
-  exit-only and claims it's "flagged in ISSUES.md" (it was not). Pre-existing
-  NXP pattern, but a real recurring sleep-in-atomic that DEBUG_ATOMIC_SLEEP will
-  flag. Fix: splice `bridge_list_rtevent` to a local list under the lock, send
-  `rtmsg_ifinfo` + `dev_put` after unlock.
-
 - [ ] **A3e-r. `dpa_add_eth_if` leaks a netdev refcount and iface stats on error paths.** (reopened)
   The A3e helpers (policer/discard-mask/CEETM teardown) landed correctly, but two
   acquisitions inside the same cascade are released on no error path:
@@ -86,15 +74,6 @@ stale line refs) are folded into the archive one-liners.
   reach the 6-8 listener case, so this is the same "CC ticks, listener TX FQ
   stays 0" hazard for any listener added to an existing group. Fix: `wmb()` before
   the :1242 publish; review the REMOVE unlink at :1176-1196 (lower risk).
-
-- [ ] **N1. FCI/abm netlink input paths have no capability gate.**
-  G1 closed the CAP gap on the `/dev/cdx_ctrl` ioctl, but the sibling entry
-  points are ungated: `fci_open_netlink` ([fci/fci.c:131](fci/fci.c#L131),
-  `NETLINK_FF`) and `abm_nl_init` ([auto_bridge/auto_bridge.c:720](auto_bridge/auto_bridge.c#L720),
-  `NETLINK_L2FLOW`) create sockets with no `netlink_capable`/`CAP_NET_ADMIN`
-  check in the `.input` path. The FCI command bus reconfigures the datapath, so
-  an unprivileged process that opens the socket bypasses the G1 gate entirely.
-  Same bug class as G1. (Found by the G/C audit pass.)
 
 - [ ] **N2. `/proc/ucode_frag/*` read handlers `sprintf` into the `__user` buffer.**
   `stats_read` ([cdx/cdx_ehash.c:3061](cdx/cdx_ehash.c#L3061)) and
@@ -148,6 +127,7 @@ file's git history.
 
 ## Gating
 - **G1.** `/dev/cdx_ctrl` ioctl dispatcher was ungated — added a CAP_NET_ADMIN check ahead of the command-table lookup (_815a0ca_).
+- **N1.** FCI (`NETLINK_FF`), abm (`NETLINK_L2FLOW`) and the NETLINK_KEY ipsec-offload bus (patch 040) had no capability gate, bypassing G1 — per-message `netlink_capable(skb, CAP_NET_ADMIN)` (init userns) in all three input handlers; unprivileged senders now get NLMSG_ERROR/-EPERM (FF/L2FLOW) or a silent drop (KEY sends no reply) before any parsing. Covered by `test_fci_netlink_caps.py` (uid-drop + unmapped-userns cases; agent /fci/send and /netlink/send grew `uid`/`userns`).
 - **G2.** Single-open gate had a mis-rejection window — replaced with a single atomic_cmpxchg(1→0).
 
 ## Critical
@@ -162,6 +142,7 @@ file's git history.
 - **C8.** queue_no/port_idx/dscp used as unchecked array indices from userspace — entry bounds checks added in dpa_cfg.c and cdx_ehash.c.
 - **C9.** Test ioctl kzalloc overflow — mooted: the buggy code was deleted outright with the testapp scaffolding (see C9b), not sanity-capped (_815a0ca_).
 - **C9b.** Dead testapp scaffolding remained compiled-in — deleted dpa_test.c, testapp.c and the CDX_CTRL_DPA_CONNADD ioctl + structs (moots H10).
+- **C10.** Raw netlink `.input` handlers get no core nlmsg_len/length validation — FCI's cap-fail `-EPERM` ack and `fci_outbound_err` echoed `nlmsg_len`-indexed bytes out of the request skb (unprivileged heap over-read / nlmsgerr-reservation overflow), and `ipsec_nlkey_rcv` memcpy'd per-command structs out of a possibly-short skb. Bounded all against the real skb: `nlmsg_len ≤ NLMSG_ALIGN(skb->len)` before the ack (libfci sends the NLMSG_ALIGN'd length), header-only echo in `fci_outbound_err`, per-command `payload_len` guards in `ipsec_nlkey_rcv`. The cap-fail `-EPERM` ack also trims its echo to `skb->len` so the ≤3 alignment-pad bytes `netlink_sendmsg` never wrote aren't disclosed to an unprivileged caller (CWE-200). Distinct from C2 (payload-parse path).
 
 ## High
 - **H1.** Concurrent CDX_CTRL_DPA_SET_PARAMS ioctls could UAF fman_info — dpa_cfg_lock mutex, -EBUSY re-init reject, err_ret unwind (_815a0ca_).
@@ -172,8 +153,10 @@ file's git history.
 - **H8.** abm sysctls lacked a capability gate and abm_max_entries accepted 0 — CAP_NET_ADMIN check + proc_douintvec_minmax bounds 1..1e6.
 - **H9.** Static query-snapshot cursors raced concurrent enumerators — per-file query mutexes + mc bucket spinlocks; mutator walks tracked under A2.
 - **H10.** strncpy_from_user truncation unchecked — mooted: all four sites lived in dpa_test.c, deleted with the C9b test-scaffolding removal.
-- **H7 (partial).** net_device stored without dev_hold — dev_hold/balanced dev_put added; the drain's sleep-under-spinlock residual is reopened as H7-r.
+- **H7 (partial).** net_device stored without dev_hold — dev_hold/balanced dev_put added; the drain's sleep-under-spinlock residual closed as H7-r.
+- **H7-r.** `rtnl_lock()` under `spin_lock_bh(&abm_lock)` on the *regular* abm workqueue drain (not exit-only as the in-code comment claimed) — `bridge_list_rtevent` is now spliced to a local list under the lock and `rtmsg_ifinfo`/`dev_put` run after unlock (GFP_KERNEL); concurrency comment corrected. Exercised by `test_abm_port_flap.py` under PROVE_LOCKING/DEBUG_ATOMIC_SLEEP.
 - **H2 (partial).** IPsec keys not zeroed on free — kfree_sensitive on the SA-context keys; the query-snapshot sibling leak is reopened as H2-r.
+- **H11.** `abm_fdb_can_expire` (a `br_fdb_cleanup` workqueue callback — process context, BH enabled) took `abm_lock` with plain `spin_lock`, violating the BH-disable discipline it shares with the softirq-context timer/EBT paths — a self-deadlock / `{SOFTIRQ-ON-W}` lockdep hazard. All three sites switched to `spin_lock_bh`/`spin_unlock_bh`.
 
 ## Medium
 - **M1.** Query of 6-8 listener groups OOB'd the reply buffer — pagination reserves 2 cmds/group, pages via bIsValidEntry look-ahead.
