@@ -251,7 +251,12 @@ static void fci_outbound_err(int nl_type, struct sk_buff *skb, u32 pid, struct n
 
 	errmsg = nlmsg_data(rep);
 	errmsg->error = err;
-	memcpy(&errmsg->msg, nlh, err ? nlh->nlmsg_len : sizeof(*nlh));
+	/* Echo only the request header: the reply reserved room for exactly
+	 * one struct nlmsghdr, and libfci reads only err->error, never the
+	 * echoed body. Copying nlh->nlmsg_len bytes on the error branch would
+	 * both overrun that reservation and, for a sender-inflated nlmsg_len,
+	 * read past the request skb. */
+	memcpy(&errmsg->msg, nlh, sizeof(*nlh));
 
 	NETLINK_CB(skb).portid = 0;	/* from kernel */
 
@@ -447,19 +452,48 @@ static void __fci_fe_inbound_data(struct sk_buff *skb)
 
 	FCI_PRINTK(FCI_INBOUND, "FCI: %s\n", __func__);
 
-	/* Trust skb->len as the authoritative size; the sender's
-	 * nlmsg_len can be set to the aligned value (NLMSG_ALIGN)
-	 * while the actual skb carries only the unaligned payload,
-	 * which libfci does by convention. The real OOB risk is
-	 * fci_msg->length claiming more payload than the skb
-	 * carries, so validate that directly against skb->len
-	 * rather than the sender-supplied nlmsg_len. */
+	/* The skb must physically carry at least a netlink header plus the
+	 * FCI header before anything below can dereference either. */
 	if (skb->len < NLMSG_LENGTH(FCI_MSG_HDR_SIZE)) {
 		this_fci->stats.rx_msg_err++;
 		return;
 	}
 	nlh = nlmsg_hdr(skb);
 
+	/* This is a raw .input callback: unlike handlers dispatched through
+	 * netlink_rcv_skb, the netlink core does not validate nlmsg_len
+	 * against skb->len for us. The -EPERM netlink_ack on the cap-fail
+	 * path and fci_outbound_err both echo nlmsg_len-indexed bytes
+	 * straight out of this skb, so a sender claiming a huge nlmsg_len
+	 * would read past it. libfci sets nlmsg_len to the NLMSG_ALIGN'd
+	 * payload size, which can exceed skb->len by up to the alignment
+	 * padding, so bound against the aligned length rather than skb->len. */
+	if (nlh->nlmsg_len < NLMSG_LENGTH(FCI_MSG_HDR_SIZE) ||
+	    nlh->nlmsg_len > NLMSG_ALIGN(skb->len)) {
+		this_fci->stats.rx_msg_err++;
+		return;
+	}
+
+	/* The FCI bus reconfigures the hardware datapath — require the
+	 * same privilege as the cdx ioctl gate. Creating and binding a
+	 * NETLINK_FF socket needs no capability, so the check must be
+	 * per-message against the sender's socket here. */
+	if (!netlink_capable(skb, CAP_NET_ADMIN)) {
+		this_fci->stats.rx_msg_err++;
+		/* netlink_ack echoes nlmsg_len bytes of the request back to the
+		 * sender. libfci's NLMSG_ALIGN'd nlmsg_len can run a few bytes
+		 * past skb->len — padding netlink_sendmsg never wrote — so trim
+		 * the echo to the bytes actually received, else those
+		 * uninitialised slab bytes leak to an unprivileged caller. */
+		nlh->nlmsg_len = skb->len;
+		netlink_ack(skb, nlh, -EPERM, NULL);
+		return;
+	}
+
+	/* fci_msg->length is the sender's own payload-size claim; validate it
+	 * against the bytes the skb actually carries (skb->len), not the
+	 * NLMSG_ALIGN'd nlmsg_len, so a padded header can't wave an over-long
+	 * payload past the bounds check. */
 	fci_msg = nlmsg_data(nlh);
 	payload_bytes = skb->len - NLMSG_LENGTH(FCI_MSG_HDR_SIZE);
 	if (fci_msg->length > FCI_MSG_MAX_PAYLOAD ||
