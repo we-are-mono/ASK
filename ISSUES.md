@@ -35,18 +35,6 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
-- [ ] **H2-r. SA query snapshot leaks full key material through plain `kfree`.** (reopened)
-  The primary H2 fix (`kfree_sensitive` on cipher/auth/split keys at
-  [cdx/cdx_dpa_ipsec.c:461-470](cdx/cdx_dpa_ipsec.c#L461)) is correct, but the
-  same class survives at a sibling site the closure claimed clean:
-  [cdx/query_ipsec.c:181,188](cdx/query_ipsec.c#L181) memcpy the full
-  `cipher_key[64]`/`auth_key[64]` into the `SAQueryCommand` snapshot, which is
-  released with `Heap_Free` (= plain `kfree`, [cdx/cdx_hal.c:67-69](cdx/cdx_hal.c#L67))
-  at query_ipsec.c:278/299/322. Any SA-QUERY therefore leaves complete key
-  copies in freed slab — exactly what H2 set out to eliminate. Fix: zeroize the
-  snapshot (or route it through `kfree_sensitive`) before free. The stat
-  snapshot carries no keys and is fine.
-
 - [ ] **A3e-r. `dpa_add_eth_if` leaks a netdev refcount and iface stats on error paths.** (reopened)
   The A3e helpers (policer/discard-mask/CEETM teardown) landed correctly, but two
   acquisitions inside the same cascade are released on no error path:
@@ -62,38 +50,6 @@ stale line refs) are folded into the archive one-liners.
   A3 (umbrella) stays open until this is fixed. Fix: `dev_put` +
   `free_iface_stats` + `dpa_set_eth_ifinfo(priv, NULL)` in the cascade, plus an
   eth arm in `free_stats`.
-
-- [ ] **M15-r. Mcast replication write-barrier missing on the UPDATE-path chain publish.** (reopened)
-  M15's `dev_mc_add/del` sequencing and the `wmb()` before the *initial-ADD*
-  ehash publish ([cdx/cdx_ehash.c:1174](cdx/cdx_ehash.c#L1174)) are correct, but
-  `cdx_exthash_update_first_mcast_member_addr` publishes a freshly built listener
-  entry into a *live* chain with no barrier between the entry-fill stores and the
-  `first_member_flow_addr` store at
-  [cdx/dpa_control_mc.c:1242](cdx/dpa_control_mc.c#L1242); the intervening
-  spinlock is acquire-only and orders nothing for FMAN. UPDATE is the only way to
-  reach the 6-8 listener case, so this is the same "CC ticks, listener TX FQ
-  stays 0" hazard for any listener added to an existing group. Fix: `wmb()` before
-  the :1242 publish; review the REMOVE unlink at :1176-1196 (lower risk).
-
-- [ ] **N4. `dpaa_vwd_driver_init` leaks the eth0 netdev ref on its `err7` unwind.**
-  `get_eth_priv("eth0")` ([cdx/dpa_wifi.c:2944](cdx/dpa_wifi.c#L2944)) takes a
-  netdev ref held for VWD lifetime; the init-failure path at `err7:` (:2986) does
-  `vwd.eth_priv = NULL` without `dev_put(vwd.eth_priv->net_dev)`, so any failure
-  of the tx-bpool/xmit-hook/stats setup leaks the ref permanently. This also
-  refutes M2's closure claim that "the other three callers are all balanced."
-  Fix: one `dev_put` before nulling. (Found by the cmm/cdx-misc audit pass.)
-
-- [ ] **N5. `cdx_ipsec_create_shareddescriptor` tests DMA maps with `!addr` instead of `dma_mapping_error()`.**
-  [cdx/cdx_dpa_ipsec.c:2240,2250,2260](cdx/cdx_dpa_ipsec.c#L2240) check
-  `if (!auth_key_dma)` / `if (!crypto_key_dma)`; a real mapping failure returns
-  `DMA_MAPPING_ERROR` (~0UL, truthy) and sails past the guard, so the H3 unwind
-  never fires on an actual map failure. Fix: `dma_mapping_error(dev, addr)`.
-  (Adjacent finding from the H-series audit pass.)
-
-- [ ] **N6. `abm_retransmit_delay` sysctl accepts 0, spinning the self-requeuing retransmit work.** (minor)
-  Root-only footgun, not a security issue — the H8 bounds were applied to
-  `abm_max_entries` but `abm_retransmit_delay` still accepts 0. Fix: min bound 1.
-  (Adjacent finding from the H-series audit pass.)
 
 - [ ] **N7. `dpaa_vwd_up`'s netfilter hooks leak on cdx unload while the vwd fast path is enabled.**
   `dpaa_vwd_up` ([cdx/dpa_wifi.c:2791](cdx/dpa_wifi.c#L2791)) registers three
@@ -147,6 +103,8 @@ file's git history.
 - **H2 (partial).** IPsec keys not zeroed on free — kfree_sensitive on the SA-context keys; the query-snapshot sibling leak is reopened as H2-r.
 - **H11.** `abm_fdb_can_expire` (a `br_fdb_cleanup` workqueue callback — process context, BH enabled) took `abm_lock` with plain `spin_lock`, violating the BH-disable discipline it shares with the softirq-context timer/EBT paths — a self-deadlock / `{SOFTIRQ-ON-W}` lockdep hazard. All three sites switched to `spin_lock_bh`/`spin_unlock_bh`.
 - **N3.** `cdx_get_ipsec_fq_hookfn` had no unregister and the register refuses overwrite — a failed cdx init after `CMD_INIT(ipsec)` wedged every later load at `ipsec_init` until reboot (same wedge reachable via the wifi hook on the vwd stats-failure unwind). All five cdx-facing hook families (ipsec fq / ceetm fq / bpool replenish / wifi xmit / fp stats) got unregister-on-deinit with `synchronize_rcu` teardown, release-publish registers, snapshot readers, explicit RCU sections at the two process-context readers, and the ceetm dscp NULL guard (_81421c2_ patch 010 regen, _b2342ce_ cdx). Sibling vwd nf-hook unload leak filed as N7.
+- **H2-r.** SA query snapshots memcpy'd full cipher/auth keys and were freed with plain kfree — all three frees switched to `kfree_sensitive`, and the fill slice is zeroed per bucket so partially-filled entries and buffer reuse no longer leak slab garbage or a previous bucket's keys into the fixed-size replies (_5376281_). Closes H2 fully.
+- **N5.** Five CAAM/bman `dma_map_single` results tested with `!addr` (or not at all) — `DMA_MAPPING_ERROR` is ~0UL/truthy, so real failures sailed past the H3 unwind or reached hardware; all sites (shared-desc keys ×3, extended-desc extra-cmds ×2, vwd sg-fd) now use `dma_mapping_error()` (_5376281_).
 
 ## Medium
 - **M1.** Query of 6-8 listener groups OOB'd the reply buffer — pagination reserves 2 cmds/group, pages via bIsValidEntry look-ahead.
@@ -165,6 +123,8 @@ file's git history.
 - **M14.** cmm_parse_rtattr logged rta->rta_len after loop exit (OOB read on a truncated rtattr) — parser shared with the ASAN fuzzer, logs remaining length only.
 - **M15 (partial).** FMAN PCD didn't replicate IPv4 mcast to listener subifs — dev_mc_add/del sequencing + wmb before the ADD-path publish; UPDATE-path barrier reopened as M15-r.
 - **N2.** `/proc/ucode_frag/*` read handlers sprintf'd into the `__user` buffer (M3's class) — both converted to single_open/seq_file; proc entries now removed at deinit ahead of bufpool/MURAM teardown (stale-proc_ops class A3b fixed for fqid), partial-create unwound, test file 0400 with honest acquire count, and a NULL `bp->pool` deref dropped from the bufpool-create error path (_b593f93_).
+- **M15-r.** UPDATE-path mcast publish (`first_member_flow_addr` into a live FMAN chain) lacked the ADD-path's `wmb()` — barrier added before the store; REMOVE unlink reviewed barrier-free-correct (redirects target already-published entries, free is HcSync-gated), but its invalid-flag store used the host-order macro on the BE-stored flags (set an OPC_OFFSET bit, corrupting the live entry) — now ORs `cpu_to_be16(1<<15)` per the reference driver's swap-modify idiom (_5376281_). Closes M15 fully.
+- **N4.** `dpaa_vwd_init`'s `err7` unwind nulled `vwd.eth_priv` without dropping the `dev_get_by_name` ref from `get_eth_priv` — `dev_put` added, mirroring `dpaa_vwd_exit`; all other `dev_get_by_name` sites re-audited balanced except devman.c:472 (already open as A3e-r) (_5376281_).
 
 ## Low / Hardening
 - **L1.** Fixed-seed Jenkins/jhash on attacker-chosen L2-flow keys (cdx + auto_bridge) — per-boot-keyed hsiphash/siphash; jenk_hash.h deleted (_89e5b32_ + _bf8c453_).
@@ -175,6 +135,7 @@ file's git history.
 - **L6.** Reassembly release misnamed cpu_to_be* on BE-to-host reads — renamed be*_to_cpu, u8→u16 zero-extend documented; no-op on LE.
 - **L7.** UBSAN array-bounds on the flex-array subscript in create_ethernet_hm — store converted to pointer arithmetic, semantics unchanged.
 - **L8.** cmm sig_term_hdlr logged benign ENOENT for an already-removed pidfile — both cleanup sites report only errno != ENOENT.
+- **N6.** `abm_retransmit_delay` accepted 0 (retransmit work spins) and negatives (`-N*HZ` cast to unsigned parks the work ~forever with no rescheduler) — dedicated handler rejects `<= 0` with -EINVAL and restores the previous value (_d8083c6_).
 
 ## Corrections to the original review (wontfix / not-a-bug)
 - **X1.** "256B memset + partial fill info leak" — wontfix: memset(p,0,256) zeros the full rbuf before the Get_Timeout partial fill; surplus bytes are zeros.
