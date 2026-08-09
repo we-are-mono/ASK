@@ -58,6 +58,7 @@
 #include <uapi/linux/ppp_defs.h>
 #include <uapi/linux/if_pppox.h>
 #include <linux/if_vlan.h>
+#include <net/ipv6.h>
 #include <net/xfrm.h>
 #endif
 
@@ -1442,6 +1443,30 @@ static int pfe_eth_get_queuenum( struct sk_buff *skb )
 #define ETHHDR_MACEND_OFFSET    12
 
 #define DPOVRD_ENABLE		0x80000000
+/* A tunnel SA's decapsulation word (SEC RM table 9-27) carries the length of
+ * the outer IP header material SEC strips in its low twelve bits. The offset
+ * of the IP header within that material, the bits above, stays zero. */
+#define DPOVRD_TUNNEL_DECAP_LEN	0xfff
+
+/* The longest IP header SEC may keep ahead of a transport SA's ESP, either
+ * way. Whatever SEC outputs is parsed next by the IPsec offline port, behind
+ * the Ethernet header and the SA's 4-byte VLAN tag the descriptor inserts:
+ * outbound it finds the SA by ESP's SPI, inbound the decrypted flow by its
+ * transport header. FMan's parser reads only a frame's first 256-byte
+ * internal buffer, of which the board DTS's buffer-layout keeps the first 96
+ * bytes (FMBM_RIM[FOF]) as headroom for the headers the microcode inserts:
+ * it reaches byte 160 of the frame. A header it cannot finish there leaves
+ * the frame marked block-limit-exceeded, and the microcode discards many
+ * such frames (A367). Measured with IPv6 extension headers: ESP's SPI
+ * and sequence number ending at byte 154 of SEC's output were always
+ * classified, ending at 162 almost never. The eight bytes left here are
+ * ESP's or a UDP header's. A decrypted TCP header is longer and meets the
+ * limit with a shorter IP header: SEC decrypts such a packet and the offline
+ * port discards it, which nothing here can tell before decryption. The bound
+ * is well inside DPOVRD's eight-bit length field. */
+#define DPA_IPSEC_PARSE_REACH	(256 - 96)
+#define DPA_IPSEC_TRANSPORT_HDR_MAX \
+	(DPA_IPSEC_PARSE_REACH - ETH_HDR_SIZE - VLAN_HDR_SIZE - 8)
 
 static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_proto, unsigned short* l3_offset)
 {
@@ -1478,17 +1503,120 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
 	}
 }
 
-static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+/* The transport-mode DPOVRD for an IP header `hdr_len` bytes long whose byte
+ * `at` is the next header ESP follows, with `next` in the next-header field;
+ * false if SEC cannot be told about that header.
+ *
+ * With the override bit set SEC takes the header's length and the offset of
+ * that byte from here instead of from the SA's PDB. It encrypts or decrypts
+ * only what follows the header. Encapsulating, it moves the byte into the ESP
+ * trailer and writes `next` in its place; decapsulating, it writes the
+ * protocol it finds in the trailer there, and `next` is reserved.
+ */
+static bool dpa_ipsec_transport_dpovrd(const u8 *nh, unsigned int hdr_len,
+				       unsigned int at, u8 next, u32 *dpovrd)
+{
+	unsigned int nh_offset;
+
+	if (hdr_len > DPA_IPSEC_TRANSPORT_HDR_MAX)
+		return false;
+	if ((*nh >> 4) == IPVERSION)
+		/* Any non-zero offset names byte 9 of an IPv4 header. */
+		nh_offset = 1;
+	else if (at == offsetof(struct ipv6hdr, nexthdr))
+		/* SEC reads byte 6 for an offset of one... */
+		nh_offset = 1;
+	else if (at % 8 == 0)
+		/* ...and eight times the offset otherwise, which is where
+		 * every extension header, starting on an eight-byte boundary,
+		 * keeps its own. */
+		nh_offset = at / 8;
+	else
+		return false;
+	*dpovrd = DPOVRD_ENABLE | hdr_len << 16 | nh_offset << 8 | next;
+	return true;
+}
+
+/* The DPOVRD value SEC encrypts a frame for `x` with; false if the frame's IP
+ * header is one it cannot be told about.
+ *
+ * A tunnel's is the inner packet's own protocol for the ESP trailer, IPIP or
+ * IPv6. A transport SA's describes the frame's own IP header, with ESP for
+ * the next header (dpa_ipsec_transport_dpovrd()). Given a tunnel's value --
+ * offset and length zero -- a transport frame has its IP header encrypted and
+ * IPIP named in the trailer, which no peer decodes. The PDB's own values fit
+ * only a header of the plain length, so a transport frame's are taken from
+ * the frame, IPv4 options and IPv6 extension headers included.
+ */
+static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
+			     unsigned int len, u32 *dpovrd)
+{
+	unsigned int hdr_len, at;
+
+	if (x->props.mode != XFRM_MODE_TRANSPORT) {
+		*dpovrd = DPOVRD_ENABLE |
+			  ((*nh >> 4) == IPVERSION ? IPPROTO_IPIP : IPPROTO_IPV6);
+		return true;
+	}
+	if ((*nh >> 4) == IPVERSION) {
+		hdr_len = (nh[0] & 0xf) * 4;
+		if (hdr_len < sizeof(struct iphdr) || hdr_len > len)
+			return false;
+		at = offsetof(struct iphdr, protocol);
+	} else {
+		bool routing = false;
+		u8 next;
+
+		at = offsetof(struct ipv6hdr, nexthdr);
+		hdr_len = sizeof(struct ipv6hdr);
+		if (hdr_len > len)
+			return false;
+		next = nh[at];
+		/* ESP follows hop-by-hop options, a routing header and any
+		 * destination options ahead of one, where ip6_find_1stfragopt()
+		 * puts the transport header. */
+		for (;;) {
+			if (next == NEXTHDR_ROUTING)
+				routing = true;
+			else if (next != NEXTHDR_HOP &&
+				 (next != NEXTHDR_DEST || routing))
+				break;
+			if (hdr_len + 2 > len)
+				return false;
+			at = hdr_len;
+			next = nh[at];
+			hdr_len += (nh[at + 1] + 1) * 8;
+			if (hdr_len > len)
+				return false;
+		}
+		/* The offline port sends a frame with a hop limit of 1 or 0 to
+		 * the CPU unless its fixed header names ESP: it cannot see ESP
+		 * behind extension headers before it decides, and anything else
+		 * there may be a decrypted packet its forwarding entry would
+		 * pass on expired. On the CPU an outbound SA's output can only
+		 * be freed, so such a frame is not encrypted at all. */
+		if (at != offsetof(struct ipv6hdr, nexthdr) &&
+		    nh[offsetof(struct ipv6hdr, hop_limit)] <= 1)
+			return false;
+	}
+	return dpa_ipsec_transport_dpovrd(nh, hdr_len, at, IPPROTO_ESP, dpovrd);
+}
+
+/* Hand a frame for a packet-offloaded SA to SEC. 0 means SEC has it; anything
+ * else means it was freed here instead and counted as dropped on net_dev, so
+ * a caller counting what it gave SEC counts only a 0.
+ */
+static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
 {
 	struct xfrm_state *x;
 	struct qman_fq *egress_fq = NULL;
 	struct qm_fd		 fd;
-	int err = 0,ii;
+	int err = -ENOENT, ii;
 	int new_ethhdr_end, old_ethhdr_end;
 	unsigned short l3_proto, l3_offset;
 	unsigned char* skb_nh ;
 	struct sec_path *sp;
-	unsigned int dpovrd = 0;
+	u32 dpovrd = 0;
 	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
 	 * concurrently; never read the global twice */
 	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
@@ -1505,9 +1633,9 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
 		use the below code */
 		if (!egress_fq)
 		{
-			printk("%s(%d) egress frame queue not found \n",
-			__func__, __LINE__);
-			goto sec_submit_failed;	
+			net_err_ratelimited("%s: no SEC queue for SA handle %u\n",
+					    __func__, x->handle);
+			goto sec_submit_failed;
 		}
 
 		/*
@@ -1528,7 +1656,8 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
 				 * offload interface), COW it first so the capture is not
 				 * corrupted. skb_cow_head() is a cheap branch when the skb is
 				 * not cloned; on failure drop the packet like the paths below. */
-				if (skb_cow_head(skb, 0))
+				err = skb_cow_head(skb, 0);
+				if (err)
 					goto sec_submit_failed;
 				/* skb_cow_head() may have reallocated skb->head, so the cached
 				 * network-header pointer is now stale; re-derive it against the
@@ -1544,22 +1673,20 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
 				skb->data = skb->data + l3_offset - ETH_HDR_SIZE;
 				skb->len = skb->len - l3_offset + ETH_HDR_SIZE;
 			}
-			if ((*skb_nh >> 4) == IPVERSION) /* Extracting ip version from network header */
-			{
-				dpovrd = IPPROTO_IPIP; /* ESP trailer NH type. Here traffic is IPv4 */
+			if (!dpa_ipsec_dpovrd(x, skb_nh,
+					      skb_headlen(skb) - (skb_nh - skb->data),
+					      &dpovrd)) {
+				err = -EINVAL;
+				goto sec_submit_failed;
 			}
-			else
-			{
-				dpovrd = IPPROTO_IPV6; /* ESP trailer NH type. Here traffic is IPv4 */
-			}
-			dpovrd |= DPOVRD_ENABLE; /* OVRD enable */
 		}
 
 
 		err =  skb_fraglist_to_sg_fd(dpa_bp->dev, net_dev, skb, &fd, dpovrd);
 		if (unlikely(err < 0))
 		{
-			printk("%s(%d) skb_fraglist_to_sg_fd \n",__func__,__LINE__);
+			net_err_ratelimited("%s: no S/G frame for SEC: %d\n",
+					    __func__, err);
 			goto sec_submit_failed;
 		}
 
@@ -1617,12 +1744,12 @@ static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_de
 
 		/* sucessful transmit to CAAM */
 		netif_trans_update(net_dev);
-		return;
+		return 0;
 	}
 sec_submit_failed:
-	dev_kfree_skb(skb);
-	return;
-
+	dev_core_stats_tx_dropped_inc(net_dev);
+	kfree_skb(skb);
+	return err;
 }
 
 /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
@@ -1647,11 +1774,79 @@ static bool dpa_inb_port_ok(const struct net_device *port,
 	return dpa_netdev_is_dpaa_port(port) && port == READ_ONCE(x->xso.dev);
 }
 
+/* The DPOVRD value SEC decrypts @skb, an inbound frame of @x, with; false if
+ * its IP header is one SEC cannot be told about. Read as xfrm_input() has the
+ * frame: data at ESP, the network header at the IP header ESP came in.
+ *
+ * Either mode's PDB states a plain IP header of the SA's family
+ * (cdx_ipsec_build_in_sa_pdb()), so a frame with IPv4 options or IPv6
+ * extension headers ahead of ESP would have them read as ESP and fail SEC's
+ * ICV check. Each frame's value describes its own header instead, as the
+ * stack found it, and so as the stack would have decrypted it.
+ *
+ * A tunnel's gives the length of everything ahead of ESP, which SEC strips:
+ * the outer IP header and, for ESP-in-UDP, the UDP header behind it. The
+ * frame has to come the way the state receives, which xfrm_input() checks
+ * only after this: through the state's UDP encapsulation if it has one, bare
+ * otherwise. Only ESP-in-UDP without a non-ESP marker is offloaded
+ * (ft_ipsec_spec()), from which xfrm4_udp_encap_rcv() and
+ * xfrm6_udp_encap_rcv() pull exactly the UDP header.
+ *
+ * A transport SA's gives SEC the frame's header up to ESP and the byte naming
+ * ESP, the one the stack found it by (IP6CB()'s nhoff, where
+ * xfrm6_transport_finish() writes the protocol too), for SEC to write the
+ * protocol from the trailer into. ESP the stack found anywhere else -- behind
+ * a UDP header, say -- is not this SA's to decrypt.
+ */
+static bool dpa_ipsec_inb_dpovrd(const struct xfrm_state *x,
+				 const struct sk_buff *skb, u32 *dpovrd)
+{
+	const u8 *nh = skb_network_header(skb);
+	bool tunnel = x->props.mode != XFRM_MODE_TRANSPORT;
+	unsigned int hdr_len, ip_len, at;
+	u8 next = IPPROTO_ESP;
+
+	*dpovrd = 0;
+	if (skb->data <= nh)
+		return false;
+	hdr_len = ip_len = skb->data - nh;
+	if (x->encap) {
+		if (!tunnel || ip_len <= sizeof(struct udphdr))
+			return false;
+		ip_len -= sizeof(struct udphdr);
+		next = IPPROTO_UDP;
+	}
+	switch (*nh >> 4) {
+	case IPVERSION:
+		if (ip_len != (nh[0] & 0xf) * 4)
+			return false;
+		at = offsetof(struct iphdr, protocol);
+		break;
+	case 6:
+		at = IP6CB(skb)->nhoff;
+		if (ip_len < sizeof(struct ipv6hdr) || at >= ip_len)
+			return false;
+		break;
+	default:
+		return false;
+	}
+	if (nh[at] != next)
+		return false;
+	if (tunnel) {
+		if (hdr_len > DPOVRD_TUNNEL_DECAP_LEN)
+			return false;
+		*dpovrd = DPOVRD_ENABLE | hdr_len;
+		return true;
+	}
+	return dpa_ipsec_transport_dpovrd(nh, hdr_len, at, 0, dpovrd);
+}
+
 /* Hand an inbound ESP frame of the packet-offloaded state @x to SEC, from
  * xfrm_input(). 0: SEC has the frame. Anything else: SEC was not given it --
  * no hook, no queue for the state's handle, a frame that did not arrive on
- * the state's own port (directly, over a VLAN or in a PPPoE session), or one
- * that could not be queued -- and the skb is exactly as it came, for
+ * the state's own port (directly, over a VLAN or in a PPPoE session), a
+ * header SEC cannot be told about, or one that could not be queued -- and the
+ * skb is as it came, a stale IPv4 header checksum at most put right, for
  * xfrm_input() to decide what becomes of it.
  */
 int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
@@ -1661,10 +1856,14 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
 	struct dpa_percpu_priv_s *percpu_priv = NULL;
 	struct qm_fd		 fd;
 	int err, ii;
-	uint8_t tmp_len = 0, data[ETH_HLEN],ipvsn;
+	/* How far the frame is moved back to its MAC header: past a tunnel's
+	 * outer header, which may run to DPOVRD_TUNNEL_DECAP_LEN. */
+	unsigned int tmp_len = 0;
+	uint8_t data[ETH_HLEN], ipvsn;
 	struct net_device *netdev;
 	struct device* dev;
 	struct net_device *real_dev = NULL;
+	u32 dpovrd;
 	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
 	 * concurrently; never read the global twice */
 	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
@@ -1679,7 +1878,11 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
 		{
 			return -1; /* give packet to linux */
 		}
-		if (skb->dev->type == ARPHRD_ETHER) 
+		/* Measured from ESP, before the frame is moved to its MAC
+		 * header below. */
+		if (!dpa_ipsec_inb_dpovrd(x, skb, &dpovrd))
+			return -1;
+		if (skb->dev->type == ARPHRD_ETHER)
 		{
 			/* Get the corresponding physical device info, if the skb->dev corresponds to vlan*/
 			real_dev = is_vlan_dev(skb->dev) ? vlan_dev_real_dev(skb->dev) : skb->dev;
@@ -1745,16 +1948,36 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
 		if (!priv)
 			return -1;
 
+		/* The stack writes its address into a Record Route or
+		 * Timestamp option of a packet it delivers, in place, after
+		 * checking the header checksum and without updating it. SEC
+		 * updates that checksum for the transport header it passes on
+		 * rather than computing it afresh, so the decrypted packet
+		 * would carry the stale one and the offline port discard it.
+		 * The header may be shared again since, with a raw socket's
+		 * clone say, so it is unshared before it is written. A
+		 * tunnel's outer header is stripped, checksum and all. */
+		if (x->props.mode == XFRM_MODE_TRANSPORT && dpovrd &&
+		    (skb_network_header(skb)[0] >> 4) == IPVERSION) {
+			struct iphdr *iph = ip_hdr(skb);
+
+			if (iph->ihl > 5 && ip_fast_csum(iph, iph->ihl)) {
+				if (skb_cow_head(skb, 0))
+					goto err_giveback;
+				ip_send_check(ip_hdr(skb));
+			}
+		}
+
 		/* Both arms above leave the state's own port in priv, so the
 		 * frame is mapped for that port's pool whatever device it
 		 * reached the stack by. */
 		dev = priv->dpa_bp->dev;
 		netdev = priv->net_dev;
-		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
+		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, dpovrd);
 		if (unlikely(err < 0))
 		{
-			printk("%s(%d) skb_fraglist_to_sg_fd failed\n",
-					__func__,__LINE__);
+			net_err_ratelimited("%s: no S/G frame for SEC: %d\n",
+					    __func__, err);
 			goto err_giveback; /* give packet to linux */
 		}
 
@@ -1860,9 +2083,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
 #ifdef CONFIG_XFRM
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 	if(skb->ipsec_offload) {
-		dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp);
-		percpu_priv = raw_cpu_ptr(priv->percpu_priv);
-		percpu_priv->tx_caam_enc++;
+		/* tx toenc counts frames SEC was given; one freed instead is
+		 * already counted as dropped. */
+		if (!dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp)) {
+			percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+			percpu_priv->tx_caam_enc++;
+		}
 		return NETDEV_TX_OK;
 	}
 #endif
