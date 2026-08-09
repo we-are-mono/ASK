@@ -1,9 +1,10 @@
 """IPv4 control-plane edge case 1a: IP options.
 
 Injects packets carrying record-route and source-route options via scapy
-on the LAN VM. Records the per-FQ frame-count delta on the DUT into a
-golden file (regen with ASK_REGEN_GOLDEN=1); subsequent runs
-assert byte-equality.
+on the LAN VM. Classifies whether the DUT handled them in hardware or
+punted them to the kernel (ingress netdev kernel RX counter) and pins
+the classification in a golden file (regen with ASK_REGEN_GOLDEN=1);
+subsequent runs assert equality.
 
 Tripwire shape: we don't pre-suppose whether FMAN drops options-bearing
 packets, punts them to the kernel slow path, or fast-paths them.
@@ -21,9 +22,11 @@ import textwrap
 import pytest
 
 from _topology import (
+    TARGET_LAN_IF,
     assert_counter_signature,
-    counter_signature,
+    classify_rx_path,
     golden_for,
+    kernel_rx_packets,
     lan_run_python,
 )
 
@@ -39,9 +42,11 @@ TEST_SPORT  = 47101
 
 _OPTION_VARIANTS: list[tuple[str, str, int]] = [
     # (label, scapy IPOption ctor expression, packet count)
-    ("record_route",  "IPOption_RR(length=39)",                            3),
-    ("loose_source",  "IPOption_LSRR(routers=['10.0.0.50','10.0.0.60'])",  3),
-    ("strict_source", "IPOption_SSRR(routers=['10.0.0.50','10.0.0.60'])",  3),
+    # Counts must dominate background chatter on the LAN segment —
+    # see classify_rx_path().
+    ("record_route",  "IPOption_RR(length=39)",                            20),
+    ("loose_source",  "IPOption_LSRR(routers=['10.0.0.50','10.0.0.60'])",  20),
+    ("strict_source", "IPOption_SSRR(routers=['10.0.0.50','10.0.0.60'])",  20),
 ]
 
 
@@ -71,9 +76,8 @@ async def test_ipv4_edge_options_tripwire(
 ):
     # Drain any in-flight traffic before the pre-snapshot.
     await asyncio.sleep(0.5)
-    before = await target_agent.counters(
-        aiohttp_session, ifaces=["eth3", "eth4"],
-    )
+    before = await kernel_rx_packets(
+        target_agent, aiohttp_session, TARGET_LAN_IF)
 
     script = _injection_script(variant_expr, n)
     r = await lan_run_python(
@@ -84,18 +88,12 @@ async def test_ipv4_edge_options_tripwire(
         f"injection script did not finish: {r.stdout!r}"
     )
 
-    # Let the DUT's classifier and FQ counters settle.
+    # Let in-flight frames land before the post-snapshot.
     await asyncio.sleep(1.0)
-    after = await target_agent.counters(
-        aiohttp_session, ifaces=["eth3", "eth4"],
-    )
+    after = await kernel_rx_packets(
+        target_agent, aiohttp_session, TARGET_LAN_IF)
 
-    # Per-FQ frame counts only — ethtool counters get noise from BMC
-    # and link-state ticks during the test window, which would make
-    # the golden non-deterministic.
-    sig = counter_signature(
-        before, after, key_regex=r"^fqid_stats/.*frame_count$",
-    )
+    sig = {"rx_path": classify_rx_path(after - before, n)}
     assert_counter_signature(
         sig,
         golden_path=golden_for("ipv4_edge_options.json"),

@@ -1,11 +1,10 @@
 """IPv6 control-plane edge case 2d: extension-header chain.
 
 LAN sends IPv6 packets with a chained sequence of extension headers
-(HopByHop → Routing → Fragment → DestOpt → UDP). Records the per-FQ
-frame-count delta into a golden file; subsequent runs assert
-byte-equality. Tripwire shape — same as 1a/2a — discriminates between
-HW drop, slow-path punt, and fast-path handling without pre-supposing
-any of them.
+(HopByHop → Routing → Fragment → DestOpt → UDP). Pins the hardware-
+vs-kernel RX-path classification in a golden file; subsequent runs
+assert equality. Tripwire shape — same as 1a/2a — discriminates
+between HW handling and slow-path punt without pre-supposing either.
 """
 
 from __future__ import annotations
@@ -17,10 +16,12 @@ import textwrap
 import pytest
 
 from _topology import (
+    TARGET_LAN_IF,
     assert_counter_signature,
-    counter_signature,
+    classify_rx_path,
     golden_for,
     ipv6_topology,  # noqa: F401  (fixture)
+    kernel_rx_packets,
     lan_run_python,
 )
 
@@ -30,18 +31,20 @@ WAN_IPV6 = os.environ.get("ASK_WAN_IPV6", "fc00:beef::99")
 
 _VARIANTS: list[tuple[str, str, int]] = [
     # (label, scapy chain expression, packet count)
+    # Counts must dominate background chatter on the LAN segment —
+    # see classify_rx_path().
     ("hbh_only",
      "IPv6ExtHdrHopByHop(options=[PadN(optdata=b'\\x00' * 4)])",
-     3),
+     20),
     ("hbh_dest",
      "IPv6ExtHdrHopByHop(options=[PadN(optdata=b'\\x00' * 4)]) "
      "/ IPv6ExtHdrDestOpt(options=[PadN(optdata=b'\\x00' * 4)])",
-     3),
+     20),
     ("hbh_routing_dest",
      "IPv6ExtHdrHopByHop(options=[PadN(optdata=b'\\x00' * 4)]) "
      "/ IPv6ExtHdrRouting(addresses=['2001:db8::beef']) "
      "/ IPv6ExtHdrDestOpt(options=[PadN(optdata=b'\\x00' * 4)])",
-     3),
+     20),
 ]
 
 
@@ -71,9 +74,8 @@ async def test_ipv6_edge_eh_chain_tripwire(
     label, chain_expr, n,
 ):
     await asyncio.sleep(0.5)
-    before = await target_agent.counters(
-        aiohttp_session, ifaces=["eth3", "eth4"],
-    )
+    before = await kernel_rx_packets(
+        target_agent, aiohttp_session, TARGET_LAN_IF)
 
     script = _injection_script(chain_expr, n)
     r = await lan_run_python(
@@ -83,13 +85,10 @@ async def test_ipv6_edge_eh_chain_tripwire(
     assert f"INJECTED {n}" in r.stdout, r.stdout
 
     await asyncio.sleep(1.0)
-    after = await target_agent.counters(
-        aiohttp_session, ifaces=["eth3", "eth4"],
-    )
+    after = await kernel_rx_packets(
+        target_agent, aiohttp_session, TARGET_LAN_IF)
 
-    sig = counter_signature(
-        before, after, key_regex=r"^fqid_stats/.*frame_count$",
-    )
+    sig = {"rx_path": classify_rx_path(after - before, n)}
     assert_counter_signature(
         sig,
         golden_path=golden_for("ipv6_edge_eh_chain.json"),

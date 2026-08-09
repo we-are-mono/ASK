@@ -1,5 +1,11 @@
 {
-  "bad_checksum": {},
-  "version_15": {},
-  "version_5": {}
+  "bad_checksum": {
+    "rx_path": "hardware"
+  },
+  "version_15": {
+    "rx_path": "hardware"
+  },
+  "version_5": {
+    "rx_path": "hardware"
+  }
 }

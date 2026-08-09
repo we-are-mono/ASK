@@ -1,5 +1,11 @@
 {
-  "hbh_dest": {},
-  "hbh_only": {},
-  "hbh_routing_dest": {}
+  "hbh_dest": {
+    "rx_path": "kernel"
+  },
+  "hbh_only": {
+    "rx_path": "kernel"
+  },
+  "hbh_routing_dest": {
+    "rx_path": "kernel"
+  }
 }

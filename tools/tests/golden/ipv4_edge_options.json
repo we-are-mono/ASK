@@ -1,5 +1,11 @@
 {
-  "loose_source": {},
-  "record_route": {},
-  "strict_source": {}
+  "loose_source": {
+    "rx_path": "hardware"
+  },
+  "record_route": {
+    "rx_path": "hardware"
+  },
+  "strict_source": {
+    "rx_path": "hardware"
+  }
 }

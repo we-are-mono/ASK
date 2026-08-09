@@ -2,13 +2,14 @@
 
 Three concerns colocated here, in order of increasing scope:
 
-  1. Counter signatures + golden-file tripwires. Items 1a / 1d / 2a / 2d
-     don't know in advance whether HW silently drops, punts to the
-     kernel slow path, or fast-paths the edge-case packet — so they
-     record the observed delta of /proc/fqid_stats `frame count` (and
-     ethtool stats) on first run and assert byte-for-byte equality on
-     subsequent runs. Drift in either direction (HW behaviour shift,
-     PCD config change) fails the test loudly.
+  1. RX-path classification + golden-file tripwires. The edge-case
+     tests don't know in advance whether HW silently drops, punts to
+     the kernel slow path, or fast-paths the edge-case packet — so
+     they classify what *did* happen (via the ingress netdev's kernel
+     RX counter: FMAN-handled frames never tick it, punted frames tick
+     it 1:1), pin the classification in a golden on first run, and
+     assert equality on subsequent runs. A behaviour shift (PCD config
+     change, ucode change) fails the test loudly.
 
   2. ICMP-egress observation. Items 1b / 1c / 2b / 2c assert "the
      kernel emitted an ICMP error" by tcpdumping the DUT's egress
@@ -59,102 +60,52 @@ TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
 LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "enp4s0")
 
 
-# ---- 1. counter signatures ------------------------------------------------
+# ---- 1. RX-path classification -------------------------------------------
+#
+# Earlier revisions built golden signatures from /proc/fqid_stats
+# "frame count" deltas. That counter is *instantaneous queue occupancy*,
+# not cumulative: queues drain between the before/after snapshots, every
+# delta was zero, and all recorded goldens were vacuous {} — the
+# tripwire could never fire. The DPAA ethtool stats are no alternative
+# tripwire source either: they are kernel-side per-CPU counters, i.e.
+# they tick only for frames that reached the kernel, and their names
+# ("rx packets [TOTAL]") don't survive the agent's stat-name parser.
+#
+# The question the tripwire actually needs answered — did the DUT
+# handle this packet shape in hardware, or punt it to the kernel? — is
+# answered by the ingress netdev's kernel RX packet counter alone:
+# FMAN-handled frames (fast-pathed or dropped) never tick it, punted
+# frames tick it 1:1. classify_rx_path() reduces the delta to a stable
+# label the goldens can pin. Injection counts must be large enough to
+# dominate background chatter on the segment (ND, mDNS): use >= 20.
 
-# /proc/fqid_stats/<class>/<iface>/<file> contents:
-#   ::fqid 1700(5888)
-#   fqctrl   1
-#   ...
-#   byte count    0
-#   frame count   42
-# Multiple ::fqid stanzas per file. Only "frame count" is the per-FQ
-# numeric signal worth comparing; "byte count" varies with payload size
-# and would make goldens fragile.
-_FQID_LINE = re.compile(r"^::fqid\s+(\S+)")
-_FRAME_COUNT_LINE = re.compile(r"^frame count\s+(-?\d+)\s*$")
-
-
-def _parse_fq_file(content: str) -> dict[str, int]:
-    """Extract {fqid: frame_count} from one /proc/fqid_stats file's text.
-
-    Tolerant: malformed stanzas are skipped, not raised on. Returns an
-    empty dict for content with no ::fqid markers (some files are
-    empty under no-traffic conditions)."""
-    out: dict[str, int] = {}
-    current: str | None = None
-    for line in content.splitlines():
-        m = _FQID_LINE.match(line)
-        if m:
-            current = m.group(1)
-            continue
-        if current is not None:
-            mm = _FRAME_COUNT_LINE.match(line)
-            if mm:
-                try:
-                    out[current] = int(mm.group(1))
-                except ValueError:
-                    pass
-                current = None
-    return out
+async def kernel_rx_packets(target_agent, session, iface: str) -> int:
+    """Cumulative kernel-side RX packet count for `iface` on the DUT."""
+    r = await target_agent.exec_cmd(
+        session, ["ip", "-s", "-j", "link", "show", iface])
+    assert r["rc"] == 0, f"ip -s link show {iface}: {r}"
+    return json.loads(r["stdout"])[0]["stats64"]["rx"]["packets"]
 
 
-def flatten_counters(snap: dict[str, Any]) -> dict[str, int]:
-    """Flatten Agent.counters() output into a single {key: int} dict.
-
-    Keys are slash-joined paths so a regex selector can pick subsets
-    without walking nested dicts. Three classes of keys are emitted:
-
-      fqid_stats/<class>/<iface>/<file>/<fqid>/frame_count
-      ethtool/<iface>/<stat_name>
-      (ask_proc/ — text-only on this kernel, no numeric leaves; skipped)
-    """
-    out: dict[str, int] = {}
-
-    for relpath, content in (snap.get("fqid_stats") or {}).items():
-        if not isinstance(content, str):
-            continue
-        for fqid, frames in _parse_fq_file(content).items():
-            out[f"fqid_stats/{relpath}/{fqid}/frame_count"] = frames
-
-    for iface, stats in (snap.get("ethtool") or {}).items():
-        if not isinstance(stats, dict):
-            continue
-        for k, v in stats.items():
-            if isinstance(v, int):
-                out[f"ethtool/{iface}/{k}"] = v
-
-    return out
-
-
-def counter_signature(
-    before: dict[str, Any],
-    after: dict[str, Any],
-    *,
-    key_regex: str | None = None,
-) -> dict[str, int]:
-    """Return {key: delta} for keys whose value changed between snapshots.
-
-    `key_regex` filters to a subset (e.g. r"^fqid_stats/.*frame_count$"
-    to keep only per-FQ frame counters and drop ethtool noise from
-    BMC/link-state ticks). Keys present only in one snapshot are
-    treated as having a baseline of 0.
-    """
-    flat_b = flatten_counters(before)
-    flat_a = flatten_counters(after)
-    pat = re.compile(key_regex) if key_regex else None
-    sig: dict[str, int] = {}
-    keys = set(flat_a) | set(flat_b)
-    for k in keys:
-        if pat and not pat.search(k):
-            continue
-        delta = flat_a.get(k, 0) - flat_b.get(k, 0)
-        if delta != 0:
-            sig[k] = delta
-    return sig
+def classify_rx_path(kernel_rx_delta: int, injected: int) -> str:
+    """Classify where injected frames went: 'kernel' if ~all reached
+    the kernel (punt / slow path), 'hardware' if ~none did (FMAN drop
+    or fast-path). An in-between delta is asserted on rather than
+    returned — pinning a noise-dependent value in a golden would make
+    the tripwire flaky in both directions."""
+    if kernel_rx_delta >= injected:
+        return "kernel"
+    if kernel_rx_delta <= injected // 4:
+        return "hardware"
+    raise AssertionError(
+        f"ambiguous RX path: kernel rx +{kernel_rx_delta} for "
+        f"{injected} injected frames — neither ~all (punt) nor ~none "
+        f"(hardware); rerun on a quieter segment or raise the count"
+    )
 
 
 def assert_counter_signature(
-    observed: dict[str, int],
+    observed: dict[str, Any],
     *,
     golden_path: pathlib.Path,
     label: str,
@@ -196,11 +147,11 @@ def assert_counter_signature(
         f"({golden_path.name}):\n"
         f"  expected: {expected}\n"
         f"  observed: {observed}\n"
-        f"  diff (observed - expected):\n"
+        f"  changed keys:\n"
         + "\n".join(
-            f"    {k}: {observed.get(k, 0) - expected.get(k, 0):+d}"
+            f"    {k}: {expected.get(k)!r} -> {observed.get(k)!r}"
             for k in sorted(set(observed) | set(expected))
-            if observed.get(k, 0) != expected.get(k, 0)
+            if observed.get(k) != expected.get(k)
         )
     )
 
