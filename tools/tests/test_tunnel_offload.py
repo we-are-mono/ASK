@@ -110,11 +110,11 @@ DUT_ETH3_MAC = os.environ.get("ASK_TARGET_WAN_MAC", "e8:f6:d7:00:01:13")
 DUT_ETH4_MAC = os.environ.get("ASK_TARGET_LAN_MAC", "e8:f6:d7:00:01:14")
 LAN_NIC_MAC  = os.environ.get("ASK_LAN_NIC_MAC",    "64:9d:99:b2:33:02")
 
-# Route IDs. RouteEntry.id is U16 in the kernel ([cdx/layer2.h:56]) —
-# values >0xFFFF are silently truncated on store but compared as U32 in
-# lookup, so they can be added but never found. Stay below 0x10000.
-# 0x6041/0x6042 echo the "6o4" mode visually without colliding with the
-# small-int ids CMM tends to allocate from the bottom of the U16 range.
+# Route IDs. 0x6041/0x6042 echo the "6o4" mode visually without
+# colliding with the small-int ids CMM tends to allocate from the
+# bottom of the range. (RouteEntry.id was U16 until the A10 fix
+# widened it to match the U32 wire field; these ids predate that and
+# work either way.)
 TUNNEL_FORWARD_ROUTE_ID = 0x6041
 TUNNEL_DECAP_ROUTE_ID   = 0x6042
 

@@ -53,7 +53,10 @@
 typedef struct _tRouteEntry {
 	struct slist_entry list;
 	U16 nbref;
-	U16 id;
+	/* Matches the U32 RtCommand.id wire field; storing anything
+	 * narrower silently truncates and makes the route unfindable
+	 * by its original id. */
+	U32 id;
 	struct _itf *itf;
 	U8 dstmac[ETHER_ADDR_LEN];
 	U16 mtu;
