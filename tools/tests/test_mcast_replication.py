@@ -338,8 +338,11 @@ def _send_mcast_from_orchestrator(dst: str, port: int, payload: bytes) -> None:
     # IPv4 mcast MAC = 01:00:5E:<low 23 bits of dst>.
     o = [int(b) for b in dst.split(".")]
     mac = "01:00:5e:{:02x}:{:02x}:{:02x}".format(o[1] & 0x7f, o[2], o[3])
+    # src must match the (S,G) key the MC4 fixture programs (MCAST_SRC).
+    # Left to scapy's auto-pick it depends on the orchestrator's address
+    # plan — the entry misses and the DUT punts the frame unreplicated.
     pkt = (Ether(dst=mac)
-           / IP(dst=dst, ttl=4)
+           / IP(src=MCAST_SRC, dst=dst, ttl=4)
            / UDP(dport=port, sport=47201)
            / Raw(payload))
     sendp(pkt, iface=iface, count=1, verbose=0)
