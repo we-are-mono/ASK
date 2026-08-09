@@ -605,7 +605,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         await _exec("ip", "-6", "addr", "del",
                     f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
         r = await _exec("ip", "-6", "addr", "add",
-                        f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
+                        f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF, "nodad")
         assert r["rc"] == 0, f"DUT eth4 v6 addr: {r}"
 
         async def _del_dut_lan():
@@ -616,7 +616,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
         await _exec("ip", "-6", "addr", "del",
                     f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
         r = await _exec("ip", "-6", "addr", "add",
-                        f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
+                        f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, "nodad")
         assert r["rc"] == 0, f"DUT eth3 v6 addr: {r}"
 
         async def _del_dut_wan():
@@ -626,7 +626,10 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
 
         # ---- LAN address + default route ----
         await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null")
-        r = await _lan(f"ip -6 addr add {LAN_IPV6}/64 dev {LAN_NIC}")
+        # nodad: static ULA on a point-to-point test segment — DAD would
+        # leave the address tentative ~1.5 s and the first test flow of
+        # the session silently fails to come up.
+        r = await _lan(f"ip -6 addr add {LAN_IPV6}/64 dev {LAN_NIC} nodad")
         assert r.rc == 0, f"LAN v6 addr: {r.stdout!r}"
 
         async def _del_lan_addr():

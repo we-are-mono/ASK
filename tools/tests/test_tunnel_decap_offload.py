@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -278,8 +279,26 @@ async def test_tunnel_4o6_decap_offloaded(
         rx1 = await _tun_rx(target_agent, aiohttp_session, tun)
         await asyncio.sleep(5)
 
-        r = await lan_run(lan, f"tail -1 /tmp/cli_{ECHO_PORT_4O6}.log")
-        echoed = int(r.stdout.strip().rsplit(" ", 1)[-1])
+        # The client prints "echoed N" only at exit, and the UART console
+        # carries asynchronous residue (nohup's stderr, wrapped command
+        # echoes), so anchor on the content with a regex and poll rather
+        # than trusting the positional last token of a single read.
+        m = None
+        for _ in range(10):
+            r = await lan_run(
+                lan,
+                f"grep -o 'echoed [0-9]*' /tmp/cli_{ECHO_PORT_4O6}.log "
+                f"| tail -1",
+            )
+            m = re.search(r"echoed (\d+)", r.stdout)
+            if m:
+                break
+            await asyncio.sleep(1.0)
+        assert m, (
+            f"4o6 client never reported a final echo count; "
+            f"last read: {r.stdout!r}"
+        )
+        echoed = int(m.group(1))
         kernel_rx = rx1 - rx0
         window_rate = echoed / total_s   # ~echoes per second
         expected_in_window = window_rate * WINDOW_S

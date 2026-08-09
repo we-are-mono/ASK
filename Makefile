@@ -294,8 +294,17 @@ deploy-agents: deploy-agent-wan deploy-agent-lan
 #
 # Pass extra pytest args via ASK_TEST_ARGS, e.g.:
 #   make ask-test ASK_TEST_ARGS='-k iperf --junit-xml=/tmp/out.xml'
+#
+# sudo resets the environment, so ASK_* configuration variables
+# (ASK_WAN_IP, ASK_REGEN_GOLDEN, ...) are re-stated explicitly on the
+# sudo command line — without this they silently fall back to their
+# in-tree defaults.
+# Space-free values only (they're IPs/ifnames/flags) — a value with
+# spaces would word-split on the sudo command line. ASK_TEST_ARGS is
+# pytest arguments, not test configuration, and is passed separately.
+ASK_ENV := $(shell env | grep -E '^ASK_[A-Za-z0-9_]+=[^ ]*$$' | grep -v '^ASK_TEST_ARGS=' | tr '\n' ' ')
 ask-test:
-	sudo PYTHONPATH=$(CURDIR)/tools $(WAN_PREFIX)/venv/bin/pytest \
+	sudo $(ASK_ENV) PYTHONPATH=$(CURDIR)/tools $(WAN_PREFIX)/venv/bin/pytest \
 	    -c $(CURDIR)/tools/pyproject.toml \
 	    $(CURDIR)/tools/tests $(ASK_TEST_ARGS)
 
