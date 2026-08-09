@@ -137,11 +137,6 @@ t_Error  LNXWRP_FM_Free(t_Handle h_LnxWrpFm);
 *//***************************************************************************/
 t_Handle LNXWRP_FM_GetMacHandle(t_Handle h_LnxWrpFm, uint8_t fmId, uint8_t macId);
 
-#ifdef CONFIG_FSL_SDK_FMAN_TEST
-t_Handle LNXWRP_FM_TEST_Init(void);
-t_Error  LNXWRP_FM_TEST_Free(t_Handle h_FmTestLnxWrp);
-#endif /* CONFIG_FSL_SDK_FMAN_TEST */
-
 /** @} */ /* end of FM_LnxKern_init_grp group */
 
 

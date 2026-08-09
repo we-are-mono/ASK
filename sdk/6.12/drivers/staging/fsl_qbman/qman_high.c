@@ -34,6 +34,9 @@
 
 #include "qman_low.h"
 
+#include <linux/net.h>
+#include <linux/netdevice.h>
+
 /* Compilation constants */
 #define DQRR_MAXFILL	15
 #define EQCR_ITHRESH	4	/* if EQCR congests, interrupt threshold */
@@ -128,6 +131,10 @@ struct qman_portal {
 	u8 alloced;
 	/* power management data */
 	u32 save_isdr;
+#ifdef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+	struct net_device dummy_dev;
+	struct napi_struct napi;
+#endif
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	/* Keep a shadow copy of the DQRR on LE systems as the SW needs to
 	 * do byte swaps of DQRR read only memory.  First entry must be aligned
@@ -473,7 +480,16 @@ static irqreturn_t portal_isr(__always_unused int irq, void *ptr)
 
 	/* DQRR-handling if it's interrupt-driven */
 	if (is & QM_PIRQ_DQRI) {
+#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
 		__poll_portal_fast(p, CONFIG_FSL_QMAN_POLL_LIMIT);
+#else
+		/* Disable QMan IRQ and invoke NAPI */
+		qman_p_irqsource_remove(p, QM_PIRQ_DQRI);
+		if (napi_schedule_prep(&p->napi))
+		{
+			__napi_schedule(&p->napi);
+		}
+#endif
 		clear = QM_DQAVAIL_MASK | QM_PIRQ_DQRI;
 	}
 
@@ -574,6 +590,25 @@ struct dev_pm_domain qman_portal_device_pm_domain = {
 		.resume_noirq = _qman_portal_resume_noirq,
 	}
 };
+
+
+
+#ifdef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+static int qman_portal_dqrr_poll(struct napi_struct *napi, int budget)
+{
+	struct qman_portal *portal = container_of(napi, struct qman_portal, napi);
+
+	int cleaned = qman_p_poll_dqrr(portal, budget);
+
+	if (cleaned < budget) {
+		napi_complete(napi);
+		qman_p_irqsource_add(portal, QM_PIRQ_DQRI);
+	}
+
+	return cleaned;
+}
+#endif
+
 
 struct qman_portal *qman_create_portal(
 			struct qman_portal *portal,
@@ -737,6 +772,12 @@ struct qman_portal *qman_create_portal(
 			goto fail_dqrr_mr_empty;
 		}
 	}
+#ifdef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+	/* Initilize NAPI for Rx processing */
+	init_dummy_netdev(&portal->dummy_dev);
+	netif_napi_add(&portal->dummy_dev, &portal->napi, qman_portal_dqrr_poll);
+	napi_enable(&portal->napi);
+#endif
 	/* Success */
 	portal->config = config;
 	/*
@@ -831,6 +872,11 @@ void qman_destroy_portal(struct qman_portal *qm)
 {
 	const struct qm_portal_config *pcfg;
 	int i;
+
+#ifdef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
+	napi_disable(&qm->napi);
+	netif_napi_del(&qm->napi);
+#endif
 
 	/* Stop dequeues on the portal */
 	qm_dqrr_sdqcr_set(&qm->p, 0);
@@ -1438,6 +1484,39 @@ void *qman_get_affine_portal(int cpu)
 	return affine_portals[cpu];
 }
 EXPORT_SYMBOL(qman_get_affine_portal);
+
+/* The entries a CPU's portal has dequeued into its ring that the CPU has not
+ * consumed yet: frames waiting on that CPU however its channel's work queues
+ * stand. Two register reads from any CPU, for a report; a full ring reads as
+ * empty. -ENODEV for a CPU without a portal of its own. */
+int qman_affine_portal_dqrr_pending(int cpu)
+{
+	struct qman_portal *p = affine_portals[cpu];
+	struct qm_portal *portal;
+	u32 pi, ci;
+
+	if (!p || !p->config)
+		return -ENODEV;
+	portal = &p->p;
+	pi = qm_in(DQRR_PI_CINH) & (QM_DQRR_SIZE - 1);
+	ci = qm_in(DQRR_CI_CINH) & (QM_DQRR_SIZE - 1);
+	return (pi - ci) & (QM_DQRR_SIZE - 1);
+}
+EXPORT_SYMBOL(qman_affine_portal_dqrr_pending);
+
+/* The commands a CPU has written into its portal's enqueue ring that QMan has
+ * not taken yet: that CPU's cursor, read without its lock, against the
+ * consumer index QMan publishes. For a report of where a frame waits; -ENODEV
+ * for a CPU without a portal of its own (one sharing another's has no ring). */
+int qman_affine_portal_eqcr_fill(int cpu)
+{
+	struct qman_portal *p = affine_portals[cpu];
+
+	if (!p || !p->config)
+		return -ENODEV;
+	return qm_eqcr_get_hw_fill(&p->p);
+}
+EXPORT_SYMBOL(qman_affine_portal_eqcr_fill);
 
 int qman_p_poll_dqrr(struct qman_portal *p, unsigned int limit)
 {
@@ -2150,7 +2229,30 @@ int qman_query_fq(struct qman_fq *fq, struct qm_fqd *fqd)
 }
 EXPORT_SYMBOL(qman_query_fq);
 
-int qman_query_fq_np(struct qman_fq *fq, struct qm_mcr_queryfq_np *np)
+/* A query's command, and its answer: without bound for @timeout_us 0, the
+ * SDK's own behaviour, else for at most that long -- NULL then, the command
+ * not written or abandoned (qm_mc_result_timeout()). */
+static struct qm_mc_command *query_start(struct qm_portal *portal,
+					 unsigned int timeout_us)
+{
+	return timeout_us ? qm_mc_start_timeout(portal, timeout_us) :
+			    qm_mc_start(portal);
+}
+
+static struct qm_mc_result *query_result(struct qm_portal *portal,
+					 unsigned int timeout_us)
+{
+	struct qm_mc_result *mcr;
+
+	if (timeout_us)
+		return qm_mc_result_timeout(portal, timeout_us);
+	while (!(mcr = qm_mc_result(portal)))
+		cpu_relax();
+	return mcr;
+}
+
+static int __qman_query_fq_np(struct qman_fq *fq, struct qm_mcr_queryfq_np *np,
+			      unsigned int timeout_us)
 {
 	struct qm_mc_command *mcc;
 	struct qm_mc_result *mcr;
@@ -2159,11 +2261,14 @@ int qman_query_fq_np(struct qman_fq *fq, struct qm_mcr_queryfq_np *np)
 	u8 res;
 
 	PORTAL_IRQ_LOCK(p, irqflags);
-	mcc = qm_mc_start(&p->p);
+	mcc = query_start(&p->p, timeout_us);
+	if (!mcc)
+		goto timeout;
 	mcc->queryfq.fqid = cpu_to_be32(fq->fqid);
 	qm_mc_commit(&p->p, QM_MCC_VERB_QUERYFQ_NP);
-	while (!(mcr = qm_mc_result(&p->p)))
-		cpu_relax();
+	mcr = query_result(&p->p, timeout_us);
+	if (!mcr)
+		goto timeout;
 	DPA_ASSERT((mcr->verb & QM_MCR_VERB_MASK) == QM_MCR_VERB_QUERYFQ_NP);
 	res = mcr->result;
 	if (res == QM_MCR_RESULT_OK) {
@@ -2193,10 +2298,27 @@ int qman_query_fq_np(struct qman_fq *fq, struct qm_mcr_queryfq_np *np)
 	else if (res != QM_MCR_RESULT_OK)
 		return -EIO;
 	return 0;
+timeout:
+	PORTAL_IRQ_UNLOCK(p, irqflags);
+	put_affine_portal();
+	return -ETIMEDOUT;
+}
+
+int qman_query_fq_np(struct qman_fq *fq, struct qm_mcr_queryfq_np *np)
+{
+	return __qman_query_fq_np(fq, np, 0);
 }
 EXPORT_SYMBOL(qman_query_fq_np);
 
-int qman_query_wq(u8 query_dedicated, struct qm_mcr_querywq *wq)
+int qman_query_fq_np_timeout(struct qman_fq *fq, struct qm_mcr_queryfq_np *np,
+			     unsigned int timeout_us)
+{
+	return __qman_query_fq_np(fq, np, max(timeout_us, 1U));
+}
+EXPORT_SYMBOL(qman_query_fq_np_timeout);
+
+static int __qman_query_wq(u8 query_dedicated, struct qm_mcr_querywq *wq,
+			   unsigned int timeout_us)
 {
 	struct qm_mc_command *mcc;
 	struct qm_mc_result *mcr;
@@ -2207,11 +2329,14 @@ int qman_query_wq(u8 query_dedicated, struct qm_mcr_querywq *wq)
 	PORTAL_IRQ_LOCK(p, irqflags);
 	myverb = (query_dedicated) ? QM_MCR_VERB_QUERYWQ_DEDICATED :
 				 QM_MCR_VERB_QUERYWQ;
-	mcc = qm_mc_start(&p->p);
+	mcc = query_start(&p->p, timeout_us);
+	if (!mcc)
+		goto timeout;
 	mcc->querywq.channel.id = cpu_to_be16(wq->channel.id);
 	qm_mc_commit(&p->p, myverb);
-	while (!(mcr = qm_mc_result(&p->p)))
-		cpu_relax();
+	mcr = query_result(&p->p, timeout_us);
+	if (!mcr)
+		goto timeout;
 	DPA_ASSERT((mcr->verb & QM_MCR_VERB_MASK) == myverb);
 	res = mcr->result;
 	if (res == QM_MCR_RESULT_OK) {
@@ -2228,8 +2353,24 @@ int qman_query_wq(u8 query_dedicated, struct qm_mcr_querywq *wq)
 		return -EIO;
 	}
 	return 0;
+timeout:
+	PORTAL_IRQ_UNLOCK(p, irqflags);
+	put_affine_portal();
+	return -ETIMEDOUT;
+}
+
+int qman_query_wq(u8 query_dedicated, struct qm_mcr_querywq *wq)
+{
+	return __qman_query_wq(query_dedicated, wq, 0);
 }
 EXPORT_SYMBOL(qman_query_wq);
+
+int qman_query_wq_timeout(u8 query_dedicated, struct qm_mcr_querywq *wq,
+			  unsigned int timeout_us)
+{
+	return __qman_query_wq(query_dedicated, wq, max(timeout_us, 1U));
+}
+EXPORT_SYMBOL(qman_query_wq_timeout);
 
 int qman_testwrite_cgr(struct qman_cgr *cgr, u64 i_bcnt,
 			struct qm_mcr_cgrtestwrite *result)
@@ -3296,7 +3437,6 @@ static int qman_ceetm_configure_dct(struct qm_mcc_ceetm_dct_config *opts)
 
 	p = get_affine_portal();
 	PORTAL_IRQ_LOCK(p, irqflags);
-
 	mcc = qm_mc_start(&p->p);
 	mcc->dct_config = *opts;
 	qm_mc_commit(&p->p, QM_CEETM_VERB_DCT_CONFIG);
@@ -3410,7 +3550,7 @@ static int qman_ceetm_query_class_scheduler(struct qm_ceetm_channel *channel,
 	return 0;
 }
 
-static int qman_ceetm_configure_mapping_shaper_tcfc(
+int qman_ceetm_configure_mapping_shaper_tcfc(
 		struct qm_mcc_ceetm_mapping_shaper_tcfc_config *opts)
 {
 	struct qm_mc_command *mcc;
@@ -3440,6 +3580,7 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(
 	}
 	return 0;
 }
+EXPORT_SYMBOL(qman_ceetm_configure_mapping_shaper_tcfc);
 
 static int qman_ceetm_query_mapping_shaper_tcfc(
 		struct qm_mcc_ceetm_mapping_shaper_tcfc_query *opts,
@@ -3485,7 +3626,6 @@ static int qman_ceetm_configure_ccgr(struct qm_mcc_ceetm_ccgr_config *opts)
 
 	p = get_affine_portal();
 	PORTAL_IRQ_LOCK(p, irqflags);
-
 	mcc = qm_mc_start(&p->p);
 	mcc->ccgr_config = *opts;
 
@@ -3903,6 +4043,7 @@ int qman_ceetm_lni_enable_shaper(struct qm_ceetm_lni *lni, int coupled,
 	lni->shaper_couple = coupled;
 	lni->oal = oal;
 
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	config_opts.cid = cpu_to_be16(CEETM_COMMAND_LNI_SHAPER | lni->idx);
 	config_opts.dcpid = lni->dcp_idx;
 	config_opts.shaper_config.cpl = coupled;
@@ -3936,7 +4077,8 @@ int qman_ceetm_lni_disable_shaper(struct qm_ceetm_lni *lni)
 		pr_err("The shaper has been disabled\n");
 		return -EINVAL;
 	}
-
+	
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	config_opts.cid = cpu_to_be16(CEETM_COMMAND_LNI_SHAPER | lni->idx);
 	config_opts.dcpid = lni->dcp_idx;
 	config_opts.shaper_config.cpl = lni->shaper_couple;
@@ -4173,6 +4315,7 @@ int qman_ceetm_lni_set_tcfcc(struct qm_ceetm_lni *lni,
 		return -EINVAL;
 	}
 
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	query_opts.cid = cpu_to_be16(CEETM_COMMAND_TCFC | lni->idx);
 	query_opts.dcpid = lni->dcp_idx;
 	if (qman_ceetm_query_mapping_shaper_tcfc(&query_opts, &query_result)) {
@@ -4254,6 +4397,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
 	p = kzalloc(sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	p->idx = channel_idx;
 	p->dcp_idx = lni->dcp_idx;
 	p->lni_idx = lni->idx;
@@ -4264,7 +4408,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
 						channel_idx);
 	config_opts.dcpid = lni->dcp_idx;
 	config_opts.channel_mapping.map_lni_id = lni->idx;
-	config_opts.channel_mapping.map_shaped = 0;
+	config_opts.channel_mapping.map_shaped = 1;
 	if (qman_ceetm_configure_mapping_shaper_tcfc(&config_opts)) {
 		pr_err("Can't map channel#%d for LNI#%d\n",
 						channel_idx, lni->idx);
@@ -4296,7 +4440,7 @@ int qman_ceetm_channel_release(struct qm_ceetm_channel *channel)
 			channel->dcp_idx);
 		return -EINVAL;
 	}
-
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_SHAPER |
 				      channel->idx);
 	config_opts.dcpid = channel->dcp_idx;
@@ -4334,7 +4478,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
 		pr_err("This channel shaper has been enabled!\n");
 		return -EINVAL;
 	}
-
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	channel->shaper_enable = 1;
 	channel->shaper_couple = coupled;
 
@@ -4347,6 +4491,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
 		return -EINVAL;
 	}
 
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_MAPPING |
 						channel->idx);
 	config_opts.dcpid = channel->dcp_idx;
@@ -4441,7 +4586,7 @@ int qman_ceetm_channel_set_commit_rate(struct qm_ceetm_channel *channel,
 		pr_err("Fail to get the current channel shaper setting\n");
 		return -EINVAL;
 	}
-
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	channel->cr_token_rate.whole = token_rate->whole;
 	channel->cr_token_rate.fraction = token_rate->fraction;
 	channel->cr_token_bucket_limit = token_limit;
@@ -4534,7 +4679,8 @@ int qman_ceetm_channel_set_excess_rate(struct qm_ceetm_channel *channel,
 		pr_err("Fail to get the current channel shaper setting\n");
 		return -EINVAL;
 	}
-
+	
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	channel->er_token_rate.whole = token_rate->whole;
 	channel->er_token_rate.fraction = token_rate->fraction;
 	channel->er_token_bucket_limit = token_limit;
@@ -4618,7 +4764,7 @@ int qman_ceetm_channel_set_weight(struct qm_ceetm_channel *channel,
 		pr_err("This channel is a shaped one\n");
 		return -EINVAL;
 	}
-
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	channel->cr_token_bucket_limit = token_limit;
 	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_SHAPER |
 						channel->idx);
@@ -4668,7 +4814,7 @@ int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int group_b,
 		pr_err("Can't query channel#%d's scheduler!\n", channel->idx);
 		return -EINVAL;
 	}
-
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
 	config_opts.cqcid = cpu_to_be16(channel->idx);
 	config_opts.dcpid = channel->dcp_idx;
 	config_opts.gpc_combine_flag = !group_b;
@@ -4759,6 +4905,7 @@ int qman_ceetm_channel_set_group_er_eligibility(struct qm_ceetm_channel
 						channel->idx);
 		return -EINVAL;
 	}
+	memset(&csch_config, 0, sizeof(struct qm_mcc_ceetm_class_scheduler_config));
 	csch_config.cqcid = cpu_to_be16(channel->idx);
 	csch_config.dcpid = channel->dcp_idx;
 	csch_config.gpc_combine_flag = csch_query.gpc_combine_flag;
@@ -4806,6 +4953,7 @@ int qman_ceetm_channel_set_cq_cr_eligibility(struct qm_ceetm_channel *channel,
 						channel->idx);
 		return -EINVAL;
 	}
+	memset(&csch_config, 0, sizeof(struct qm_mcc_ceetm_class_scheduler_config));
 	csch_config.cqcid = cpu_to_be16(channel->idx);
 	csch_config.dcpid = channel->dcp_idx;
 	csch_config.gpc_combine_flag = csch_query.gpc_combine_flag;
@@ -4889,7 +5037,7 @@ int qman_ceetm_cq_claim(struct qm_ceetm_cq **cq,
 		pr_err("Can't allocate memory for CQ#%d!\n", idx);
 		return -ENOMEM;
 	}
-
+	memset(&cq_config, 0, sizeof(struct qm_mcc_ceetm_cq_config));
 	list_add_tail(&p->node, &channel->class_queues);
 	p->idx = idx;
 	p->is_claimed = 1;
@@ -4938,7 +5086,7 @@ int qman_ceetm_cq_claim_A(struct qm_ceetm_cq **cq,
 		pr_err("Can't allocate memory for CQ#%d!\n", idx);
 		return -ENOMEM;
 	}
-
+	memset(&cq_config, 0, sizeof(struct qm_mcc_ceetm_cq_config));
 	list_add_tail(&p->node, &channel->class_queues);
 	p->idx = idx;
 	p->is_claimed = 1;
@@ -4986,7 +5134,7 @@ int qman_ceetm_cq_claim_B(struct qm_ceetm_cq **cq,
 		pr_err("Can't allocate memory for CQ#%d!\n", idx);
 		return -ENOMEM;
 	}
-
+	memset(&cq_config, 0, sizeof(struct qm_mcc_ceetm_cq_config));
 	list_add_tail(&p->node, &channel->class_queues);
 	p->idx = idx;
 	p->is_claimed = 1;
@@ -5040,7 +5188,7 @@ int qman_ceetm_set_queue_weight(struct qm_ceetm_cq *cq,
 						cq->parent->idx);
 		return -EINVAL;
 	}
-
+	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_class_scheduler_config));
 	config_opts.cqcid = cpu_to_be16(cq->parent->idx);
 	config_opts.dcpid = cq->parent->dcp_idx;
 	config_opts.crem = query_result.crem;
@@ -5257,6 +5405,7 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
 	p = kmalloc(sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
+	memset(&lfqmt_config, 0, sizeof(struct qm_mcc_ceetm_lfqmt_config));
 	p->idx = lfqid;
 	p->dctidx = (u16)(lfqid & CEETM_LFQMT_LFQID_LSB);
 	p->parent = cq->parent;

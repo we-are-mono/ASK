@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 9 Aug 2026 03:51:31 +0200
+Subject: [PATCH] ask: core kernel fields and hooks for the fast path
+
+The core kernel side of the ASK fast-path stack on LS1046A. The SDK
+drivers' side -- the FMan EHASH classifier extensions and the DPAA hooks
+cdx registers -- is in ASK's SDK copy, sdk/<line>.
+
+Declares the master CONFIG_CPE_FAST_PATH Kconfig in net/Kconfig and
+extends the core kernel with the skb fields (iif_index, ipsec_offload)
+and the net_device field (wifi_offload_dev) that later patches consume:
+__netif_receive_skb_core() records the ifindex a frame arrived on, GRO's
+skb reuse clears it, and the skb header copy carries ipsec_offload.
+validate_xmit_skb() does not linearize a frame for an offloaded SA, and
+skb_scrub_packet() keeps such a frame's extensions: the DPAA driver reads
+its secpath to find the SA's SEC queue after a PPPoE or tunnel device has
+scrubbed it.
+
+dev_get_stats() adds the offloaded interfaces' counters through a hook
+cdx registers (dev_fp_stats_get_register()). Its deregister clears the
+pointer and synchronize_rcu()s before returning, so cdx deinit can free
+module text safely and a later load can register again; readers take a
+READ_ONCE snapshot.
+
+rtnetlink reports a route's MTU metric from its dst when the route sets
+none, usbnet reserves 64 bytes of fast-path headroom, and
+include/linux/fsl_oh_port.h declares the offline-port lookup the SDK's
+OH port driver exports. MAX_LINKS in UAPI rises from 32 to 64; the Wi-Fi
+driver opens its socket at MAX_LINKS - 1. The top Makefile takes
+SUBDIRS= as M= for out-of-tree module builds.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ Makefile                     |  5 +++
+ drivers/net/usb/usbnet.c     | 23 +++++++++++++-
+ include/linux/fsl_oh_port.h  | 28 +++++++++++++++++
+ include/linux/netdevice.h    | 12 +++++++
+ include/linux/skbuff.h       |  7 +++++
+ include/uapi/linux/if.h      |  1 +
+ include/uapi/linux/netlink.h |  2 +-
+ net/Kconfig                  |  9 ++++++
+ net/core/dev.c               | 61 ++++++++++++++++++++++++++++++++----
+ net/core/gro.c               |  3 ++
+ net/core/rtnetlink.c         | 19 +++++++++++
+ net/core/skbuff.c            | 30 +++++++++++++++++-
+ 12 files changed, 191 insertions(+), 9 deletions(-)
+ create mode 100644 include/linux/fsl_oh_port.h
+
+diff --git a/Makefile b/Makefile
+index c0d66e826498b..f6bc0cd00e988 100644
+--- a/Makefile
++++ b/Makefile
+@@ -130,6 +130,11 @@ export KBUILD_CLIPPY
+ 
+ # Use make M=dir or set the environment variable KBUILD_EXTMOD to specify the
+ # directory of external module to build. Setting M= takes precedence.
++
++ifdef SUBDIRS
++  KBUILD_EXTMOD ?= $(SUBDIRS)
++endif
++
+ ifeq ("$(origin M)", "command line")
+   KBUILD_EXTMOD := $(M)
+ endif
+diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
+index 30585ef53ae35..b3109ef2d5b21 100644
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -31,6 +31,15 @@
+ #include <linux/kernel.h>
+ #include <linux/pm_runtime.h>
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++/*
++ * We alllocate extra 64 Bytes to reserve headroom in the sk_buff
++ * To be used by Fast Path (Head Room must be 4 Byte aligned
++ * because USB 2.0 controller doesn't support 2 byte alignment
++ */
++#define C2K_USBNET_SKB_HEADROOM_FAST_PATH 64
++#endif
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /*
+@@ -504,11 +513,19 @@ static int rx_submit (struct usbnet *dev, struct urb *urb, gfp_t flags)
+ 		usb_free_urb(urb);
+ 		return -ENOLINK;
+ 	}
+-
++#ifdef CONFIG_CPE_FAST_PATH
++	/* 
++	* We alllocate extra 64 Bytes to reserve headroom in the sk_buff 
++	* To be used by Fast Path (Head Room must be 4 Byte aligned 
++	* because USB 2.0 controller doesn't support 2 byte alignment
++	*/
++	skb = __netdev_alloc_skb(dev->net, size + C2K_USBNET_SKB_HEADROOM_FAST_PATH, GFP_ATOMIC);
++#else
+ 	if (test_bit(EVENT_NO_IP_ALIGN, &dev->flags))
+ 		skb = __netdev_alloc_skb(dev->net, size, flags);
+ 	else
+ 		skb = __netdev_alloc_skb_ip_align(dev->net, size, flags);
++#endif
+ 	if (!skb) {
+ 		netif_dbg(dev, rx_err, dev->net, "no rx skb\n");
+ 		usbnet_defer_kevent (dev, EVENT_RX_MEMORY);
+@@ -516,6 +533,10 @@ static int rx_submit (struct usbnet *dev, struct urb *urb, gfp_t flags)
+ 		return -ENOMEM;
+ 	}
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++	skb_reserve (skb, C2K_USBNET_SKB_HEADROOM_FAST_PATH);
++#endif    
++
+ 	entry = (struct skb_data *) skb->cb;
+ 	entry->urb = urb;
+ 	entry->dev = dev;
+diff --git a/include/linux/fsl_oh_port.h b/include/linux/fsl_oh_port.h
+new file mode 100644
+index 0000000000000..1126851f08f32
+--- /dev/null
++++ b/include/linux/fsl_oh_port.h
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2018 NXP
++ */
++
++/*
++ * include/linux/fsl_oh_port.h
++ *
++ * Definitions for offline parsing port device related flags or structures i
++ */
++
++#ifndef _FSL_OH_PORT_H_
++#define _FSL_OH_PORT_H_
++
++#include <linux/types.h>
++
++#define MAX_FMANS               1
++#define MAX_OFFLINE_PORTS       4
++
++struct fman_offline_port_info {
++	char port_name[32];
++	uint32_t channel_id;
++	uint32_t err_fqid;
++	uint32_t default_fqid;
++};
++int oh_port_driver_get_port_info(struct fman_offline_port_info *info);
++
++#endif
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 4d1e0b91402d1..fc4efe5881857 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2080,6 +2080,10 @@ struct net_device {
+ 	__cacheline_group_begin(net_device_read_rx);
+ 	struct bpf_prog __rcu	*xdp_prog;
+ 	struct list_head	ptype_specific;
++#if defined(CONFIG_CPE_FAST_PATH)
++	/* This is pointing to network device that offload WiFi data to PFE */
++	struct net_device	*wifi_offload_dev;
++#endif
+ 	int			ifindex;
+ 	unsigned int		real_num_rx_queues;
+ 	struct netdev_rx_queue	*_rx;
+@@ -5352,6 +5356,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
+ 
+ extern struct net_device *blackhole_netdev;
+ 
++#if defined(CONFIG_CPE_FAST_PATH)
++/* hook function for getting statistics from offloaded interfaces */
++typedef void (*fp_iface_stats_get)(struct net_device *device, struct rtnl_link_stats64 *tot);
++
++void dev_fp_stats_get_register(fp_iface_stats_get func);
++void dev_fp_stats_get_deregister(void);
++#endif
++
+ /* Note: Avoid these macros in fast path, prefer per-cpu or per-queue counters. */
+ #define DEV_STATS_INC(DEV, FIELD) atomic_long_inc(&(DEV)->stats.__##FIELD)
+ #define DEV_STATS_ADD(DEV, FIELD, VAL) 	\
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index df548a3d60657..ed0b0e0278e32 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1028,6 +1028,9 @@ struct sk_buff {
+ 	};
+ 	__u32			priority;
+ 	int			skb_iif;
++#ifdef CONFIG_CPE_FAST_PATH
++	int			iif_index;
++#endif
+ 	__u32			hash;
+ 	union {
+ 		u32		vlan_all;
+@@ -1051,6 +1054,10 @@ struct sk_buff {
+ 		__u32		reserved_tailroom;
+ 	};
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	__u16			ipsec_offload;
++#endif
++
+ 	union {
+ 		__be16		inner_protocol;
+ 		__u8		inner_ipproto;
+diff --git a/include/uapi/linux/if.h b/include/uapi/linux/if.h
+index 797ba2c1562af..1fd18997282c8 100644
+--- a/include/uapi/linux/if.h
++++ b/include/uapi/linux/if.h
+@@ -133,6 +133,7 @@ enum net_device_flags {
+ #define IFF_ECHO			IFF_ECHO
+ #endif /* __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO */
+ 
++
+ #define IFF_VOLATILE	(IFF_LOOPBACK|IFF_POINTOPOINT|IFF_BROADCAST|IFF_ECHO|\
+ 		IFF_MASTER|IFF_SLAVE|IFF_RUNNING|IFF_LOWER_UP|IFF_DORMANT)
+ 
+diff --git a/include/uapi/linux/netlink.h b/include/uapi/linux/netlink.h
+index f87aaf28a6491..ac5461d57fb00 100644
+--- a/include/uapi/linux/netlink.h
++++ b/include/uapi/linux/netlink.h
+@@ -32,7 +32,7 @@
+ 
+ #define NETLINK_INET_DIAG	NETLINK_SOCK_DIAG
+ 
+-#define MAX_LINKS 32		
++#define MAX_LINKS 64
+ 
+ struct sockaddr_nl {
+ 	__kernel_sa_family_t	nl_family;	/* AF_NETLINK	*/
+diff --git a/net/Kconfig b/net/Kconfig
+index a629f92dc86bf..020d6dd73bca9 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -125,6 +125,15 @@ config INET
+ 	  Short answer: say Y.
+ 
+ if INET
++
++config CPE_FAST_PATH
++	bool "Fast Path Processing offload"
++	depends on ARCH_LAYERSCAPE
++	depends on NETFILTER
++	select NF_CONNTRACK
++	help
++	  Support for Fast Path offload.
++
+ source "net/ipv4/Kconfig"
+ source "net/ipv6/Kconfig"
+ source "net/netlabel/Kconfig"
+diff --git a/net/core/dev.c b/net/core/dev.c
+index f42ec2837143e..2b5317f48b6d9 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -172,6 +172,10 @@ static int call_netdevice_notifiers_extack(unsigned long val,
+ 					   struct net_device *dev,
+ 					   struct netlink_ext_ack *extack);
+ 
++#if defined(CONFIG_CPE_FAST_PATH)
++static fp_iface_stats_get fast_path_stats_get;
++#endif
++
+ static DEFINE_MUTEX(ifalias_mutex);
+ 
+ /* protects napi_hash addition/deletion and napi_gen_id */
+@@ -3803,10 +3807,17 @@ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device
+ 			skb = segs;
+ 		}
+ 	} else {
+-		if (skb_needs_linearize(skb, features) &&
+-		    __skb_linearize(skb))
+-			goto out_kfree_skb;
+-
++		// linearise only if ipsec policy is not selected
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		if(!(skb->ipsec_offload))
++#endif // defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		{
++			if (skb_needs_linearize(skb, features))
++			{
++				if (__skb_linearize(skb))
++					goto out_kfree_skb;
++			}
++		}
+ 		/* If packet is not checksummed and device does not
+ 		 * support checksumming for this protocol, complete
+ 		 * checksumming here.
+@@ -5653,6 +5664,12 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
+ 
+ 	trace_netif_receive_skb(skb);
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++	/* ifindex of device we arrived on,now skb->skb_iif
++	always tracks skb->dev */
++	if (!skb->iif_index)
++		skb->iif_index = skb->dev->ifindex;
++#endif
+ 	orig_dev = skb->dev;
+ 
+ 	skb_reset_network_header(skb);
+@@ -7000,8 +7017,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
+ 		napi_gro_flush(n, HZ >= 1000);
+ 	}
+ 
+-	gro_normal_list(n);
+-
+ 	/* Some drivers may have called napi_schedule
+ 	 * prior to exhausting their budget.
+ 	 */
+@@ -11206,10 +11221,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
+ 			storage->rx_otherhost_dropped += READ_ONCE(core_stats->rx_otherhost_dropped);
+ 		}
+ 	}
++#if defined(CONFIG_CPE_FAST_PATH)
++	{
++		/* snapshot: dev_fp_stats_get_deregister may NULL the hook
++		 * concurrently; never read the global twice. dev_get_stats
++		 * runs in plain process context, so take an explicit
++		 * read-side section for the deregister's synchronize_rcu */
++		fp_iface_stats_get fp_stats_get;
++
++		rcu_read_lock();
++		fp_stats_get = READ_ONCE(fast_path_stats_get);
++		if (fp_stats_get)
++			fp_stats_get(dev, storage);
++		rcu_read_unlock();
++	}
++#endif
+ 	return storage;
+ }
+ EXPORT_SYMBOL(dev_get_stats);
+ 
++#if defined(CONFIG_CPE_FAST_PATH)
++void dev_fp_stats_get_register(fp_iface_stats_get func)
++{
++	/* release-publish so readers can't see the hook before the state
++	 * it walks is initialized */
++	smp_store_release(&fast_path_stats_get, func);
++}
++EXPORT_SYMBOL(dev_fp_stats_get_register);
++
++/* Called on cdx deinit. Waits out in-flight dev_get_stats readers so
++ * the hook's module text may be freed once this returns. */
++void dev_fp_stats_get_deregister(void)
++{
++	WRITE_ONCE(fast_path_stats_get, NULL);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL(dev_fp_stats_get_deregister);
++#endif
++
+ /**
+  *	dev_fetch_sw_netstats - get per-cpu network device statistics
+  *	@s: place to store stats
+diff --git a/net/core/gro.c b/net/core/gro.c
+index 74b1ed66693f4..0a5aea4b8158f 100644
+--- a/net/core/gro.c
++++ b/net/core/gro.c
+@@ -671,6 +671,9 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
+ 	__vlan_hwaccel_clear_tag(skb);
+ 	skb->dev = napi->dev;
+ 	skb->skb_iif = 0;
++#ifdef CONFIG_CPE_FAST_PATH
++	skb->iif_index = 0;
++#endif
+ 
+ 	/* eth_type_trans() assumes pkt_type is PACKET_HOST */
+ 	skb->pkt_type = PACKET_HOST;
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 159a6270d5fb8..b4d7ceb0265af 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -884,9 +884,17 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
+ 	struct nlattr *mx;
+ 	int i, valid = 0;
+ 
++#ifndef CONFIG_CPE_FAST_PATH
++	/*By default this metric is zero for all routes unless mtu is 
++		included while adding route.Due to this mtu is coming as zero 
++		when cmm gets the route through netlink messge.So Added condtion 
++		to bypass this code so that cmm gets right mtu value even if route
++		is added without including mtu
++					*/
+ 	/* nothing is dumped for dst_default_metrics, so just skip the loop */
+ 	if (metrics == dst_default_metrics.metrics)
+ 		return 0;
++#endif
+ 
+ 	mx = nla_nest_start_noflag(skb, RTA_METRICS);
+ 	if (mx == NULL)
+@@ -916,6 +924,17 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
+ 			}
+ 			valid++;
+ 		}
++#ifdef CONFIG_CPE_FAST_PATH
++		else if (i  == RTAX_MTU - 1){
++			struct dst_entry *dst = skb_dst(skb);
++			if(dst)
++			{
++				if (nla_put_u32(skb, i + 1, dst_mtu(dst)))
++					goto nla_put_failure;
++				valid++;
++			}
++		}
++#endif	
+ 	}
+ 
+ 	if (!valid) {
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 04862f052adcf..570b5aa1c3f0f 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1538,12 +1538,18 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+ 	 */
+ 	new->queue_mapping = old->queue_mapping;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	new->ipsec_offload       = old->ipsec_offload;
++#endif
+ 	memcpy(&new->headers, &old->headers, sizeof(new->headers));
+ 	CHECK_SKB_FIELD(protocol);
+ 	CHECK_SKB_FIELD(csum);
+ 	CHECK_SKB_FIELD(hash);
+ 	CHECK_SKB_FIELD(priority);
+ 	CHECK_SKB_FIELD(skb_iif);
++#ifdef CONFIG_CPE_FAST_PATH
++	CHECK_SKB_FIELD(iif_index);
++#endif
+ 	CHECK_SKB_FIELD(vlan_proto);
+ 	CHECK_SKB_FIELD(vlan_tci);
+ 	CHECK_SKB_FIELD(transport_header);
+@@ -6179,7 +6185,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+ 	skb->skb_iif = 0;
+ 	skb->ignore_df = 0;
+ 	skb_dst_drop(skb);
+-	skb_ext_reset(skb);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/*
++	 * ASK IPsec offload: preserve the skb extensions on an offloaded skb
++	 * instead of scrubbing them. xfrm_output_one() sets ->ipsec_offload
++	 * and attaches the secpath (SKB_EXT_SEC_PATH); the DPAA egress driver
++	 * later reads sp->xvec[0] in dpaa_submit_outb_pkt_to_SEC() to find the
++	 * CAAM frame queue for this SA. On a PPPoE/tunnel WAN the packet
++	 * crosses a scrub boundary (e.g. ppp_start_xmit()) between that point
++	 * and the driver read, so a plain skb_ext_reset() here would drop the
++	 * secpath and the offload would silently free the packet.
++	 *
++	 * Skipping the whole reset (rather than surgically preserving just the
++	 * secpath) is safe: in this configuration the only other extension is
++	 * nf_bridge_info, which is read only by br_netfilter hooks that never
++	 * run on the egress-to-CAAM path, pins no counted netdev reference,
++	 * and is freed with the skb. br_netfilter has no IP forward/post-
++	 * routing hook to strip it, so stock already carries it out to any
++	 * non-scrubbing egress device. Every other scrub action below still
++	 * runs for offloaded skbs.
++	 */
++	if (!skb->ipsec_offload)
++#endif
++		skb_ext_reset(skb);
+ 	nf_reset_ct(skb);
+ 	nf_reset_trace(skb);
+ 
+-- 
+2.47.3
+

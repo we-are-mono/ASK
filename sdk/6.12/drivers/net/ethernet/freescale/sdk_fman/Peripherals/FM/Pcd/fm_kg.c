@@ -873,9 +873,9 @@ static t_Error BindPortToClsPlanGrp(t_FmPcd *p_FmPcd, uint8_t hardwarePortId, ui
     return KgWriteCpp(p_FmPcd, hardwarePortId, tmpKgpeCpp);
 }
 
-static void UnbindPortToClsPlanGrp(t_FmPcd *p_FmPcd, uint8_t hardwarePortId)
+static t_Error UnbindPortToClsPlanGrp(t_FmPcd *p_FmPcd, uint8_t hardwarePortId)
 {
-    KgWriteCpp(p_FmPcd, hardwarePortId, 0);
+    return KgWriteCpp(p_FmPcd, hardwarePortId, 0);
 }
 
 #if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
@@ -1000,16 +1000,15 @@ static void  ValidateSchemeSw(t_FmPcdKgScheme *p_Scheme)
     p_Scheme->valid = TRUE;
 }
 
-static t_Error InvalidateSchemeSw(t_FmPcdKgScheme *p_Scheme)
+static void InvalidateSchemeSw(t_FmPcdKgScheme *p_Scheme)
 {
-    if (p_Scheme->owners)
-       RETURN_ERROR(MINOR, E_INVALID_STATE, ("Trying to delete a scheme that has ports bound to"));
+    /* The caller holds the scheme flag and has deleted the hardware entry. */
+    ASSERT_COND(p_Scheme->valid);
+    ASSERT_COND(!p_Scheme->owners);
 
     if (p_Scheme->netEnvId != ILLEGAL_NETENV)
         FmPcdDecNetEnvOwners(p_Scheme->h_FmPcd, p_Scheme->netEnvId);
     p_Scheme->valid = FALSE;
-
-    return E_OK;
 }
 
 static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
@@ -1243,6 +1242,7 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
                         p_SchemeRegs->kgse_ppc = ppcTmp;
                     }
                 }
+                pr_debug("%s: kgse_ppc %08x\n", __func__, ppcTmp);
             }
             break;
         case (e_FM_PCD_DONE):
@@ -1571,6 +1571,8 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
                 generic = FALSE;
             }
         }
+	//bmr
+	knownTmp |= KG_SCH_KN_PORT_ID;
         p_SchemeRegs->kgse_ekfc = knownTmp;
 
         selectTmp = 0;
@@ -1843,7 +1845,7 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
 t_Error FmPcdKgBuildClsPlanGrp(t_Handle h_FmPcd, t_FmPcdKgInterModuleClsPlanGrpParams *p_Grp, t_FmPcdKgInterModuleClsPlanSet *p_ClsPlanSet)
 {
     t_FmPcd                         *p_FmPcd = (t_FmPcd*)h_FmPcd;
-    t_FmPcdKgClsPlanGrp             *p_ClsPlanGrp;
+    t_FmPcdKgClsPlanGrp              group = {0}, *p_ClsPlanGrp = &group;
     t_FmPcdIpcKgClsPlanParams       kgAlloc;
     t_Error                         err = E_OK;
     uint32_t                        oredVectors = 0;
@@ -1860,19 +1862,8 @@ t_Error FmPcdKgBuildClsPlanGrp(t_Handle h_FmPcd, t_FmPcdKgInterModuleClsPlanGrpP
     if (i == FM_MAX_NUM_OF_PORTS)
         RETURN_ERROR(MAJOR, E_FULL,("No classification plan groups available."));
 
-    p_FmPcd->p_FmPcdKg->clsPlanGrps[i].used = TRUE;
-
     p_Grp->clsPlanGrpId = (uint8_t)i;
-
-    if (p_Grp->numOfOptions == 0)
-        p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId = (uint8_t)i;
-
-    p_ClsPlanGrp = &p_FmPcd->p_FmPcdKg->clsPlanGrps[i];
     p_ClsPlanGrp->netEnvId = p_Grp->netEnvId;
-    p_ClsPlanGrp->owners = 0;
-    FmPcdSetClsPlanGrpId(p_FmPcd, p_Grp->netEnvId, p_Grp->clsPlanGrpId);
-    if (p_Grp->numOfOptions != 0)
-        FmPcdIncNetEnvOwners(p_FmPcd, p_Grp->netEnvId);
 
     p_ClsPlanGrp->sizeOfGrp = (uint16_t)(1 << p_Grp->numOfOptions);
     /* a minimal group of 8 is required */
@@ -1964,6 +1955,16 @@ t_Error FmPcdKgBuildClsPlanGrp(t_Handle h_FmPcd, t_FmPcdKgInterModuleClsPlanGrpP
                 p_ClsPlanSet->vectors[j] |= p_Grp->optVectors[i];
         }
     }
+
+    /* Publish the group and its environment reference only after all
+     * fallible allocations have completed. */
+    p_ClsPlanGrp->used = TRUE;
+    p_FmPcd->p_FmPcdKg->clsPlanGrps[p_Grp->clsPlanGrpId] = group;
+    FmPcdSetClsPlanGrpId(p_FmPcd, p_Grp->netEnvId, p_Grp->clsPlanGrpId);
+    if (p_Grp->numOfOptions == 0)
+        p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId = p_Grp->clsPlanGrpId;
+    else
+        FmPcdIncNetEnvOwners(p_FmPcd, p_Grp->netEnvId);
 
     return E_OK;
 }
@@ -2481,6 +2482,7 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
     t_FmPcdKgClsPlanGrp                     *p_ClsPlanGrp;
     t_FmPcdKgInterModuleClsPlanSet          *p_ClsPlanSet;
     t_Error                                 err;
+    bool                                    newGroup = FALSE;
 
     /* This function is issued only from FM_PORT_SetPcd which locked all PCD modules,
        so no need for lock here */
@@ -2516,6 +2518,7 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
             RETURN_ERROR(MINOR, err, NO_MSG);
         }
         *p_ClsPlanGrpId = p_GrpParams->clsPlanGrpId;
+        newGroup = TRUE;
 
         if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
         {
@@ -2524,6 +2527,7 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
             if (err)
             {
                 XX_Free(p_ClsPlanSet);
+                FmPcdKgDestroyClsPlanGrp(h_FmPcd, *p_ClsPlanGrpId);
                 RETURN_ERROR(MAJOR, err, NO_MSG);
             }
         }
@@ -2534,26 +2538,20 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
         XX_Free(p_ClsPlanSet);
     }
 
-    /* Set caller parameters     */
-
-    /* mark if this is an empty classification group */
-    if (*p_ClsPlanGrpId == p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId)
-        *p_IsEmptyClsPlanGrp = TRUE;
-    else
-        *p_IsEmptyClsPlanGrp = FALSE;
-
-    p_ClsPlanGrp = &p_FmPcd->p_FmPcdKg->clsPlanGrps[*p_ClsPlanGrpId];
-
-   /* increment owners number */
-    p_ClsPlanGrp->owners++;
-
-    /* copy options array for port */
-    memcpy(p_OptArray, &p_FmPcd->p_FmPcdKg->clsPlanGrps[*p_ClsPlanGrpId].optArray, FM_PCD_MAX_NUM_OF_OPTIONS(FM_PCD_MAX_NUM_OF_CLS_PLANS)*sizeof(protocolOpt_t));
-
-    /* bind port to the new or existing group */
+    /* Bind before publishing a port owner. A refused bind must leave a
+     * shared group alone and release a group created by this attempt. */
     err = BindPortToClsPlanGrp(p_FmPcd, hardwarePortId, p_GrpParams->clsPlanGrpId);
     if (err)
+    {
+        if (newGroup)
+            FmPcdKgDestroyClsPlanGrp(h_FmPcd, *p_ClsPlanGrpId);
         RETURN_ERROR(MINOR, err, NO_MSG);
+    }
+
+    *p_IsEmptyClsPlanGrp = (*p_ClsPlanGrpId == p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId);
+    p_ClsPlanGrp = &p_FmPcd->p_FmPcdKg->clsPlanGrps[*p_ClsPlanGrpId];
+    p_ClsPlanGrp->owners++;
+    memcpy(p_OptArray, p_ClsPlanGrp->optArray, sizeof(p_ClsPlanGrp->optArray));
 
     return E_OK;
 }
@@ -2568,7 +2566,9 @@ t_Error FmPcdKgDeleteOrUnbindPortToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardware
     /* This function is issued only from FM_PORT_DeletePcd which locked all PCD modules,
        so no need for lock here */
 
-    UnbindPortToClsPlanGrp(p_FmPcd, hardwarePortId);
+    err = UnbindPortToClsPlanGrp(p_FmPcd, hardwarePortId);
+    if (err)
+        return err;
 
     /* decrement owners number */
     ASSERT_COND(p_ClsPlanGrp->owners);
@@ -2579,6 +2579,8 @@ t_Error FmPcdKgDeleteOrUnbindPortToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardware
         if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
         {
             err = FmHcPcdKgDeleteClsPlan(p_FmPcd->h_Hc, clsPlanGrpId);
+            if (err)
+                p_ClsPlanGrp->owners++;
             return err;
         }
         else
@@ -2587,6 +2589,7 @@ t_Error FmPcdKgDeleteOrUnbindPortToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardware
             p_ClsPlanSet = (t_FmPcdKgInterModuleClsPlanSet *)XX_Malloc(sizeof(t_FmPcdKgInterModuleClsPlanSet));
             if (!p_ClsPlanSet)
             {
+                p_ClsPlanGrp->owners++;
                 RETURN_ERROR(MAJOR, E_NO_MEMORY, ("Classification plan set"));
             }
             memset(p_ClsPlanSet, 0, sizeof(t_FmPcdKgInterModuleClsPlanSet));
@@ -2955,17 +2958,26 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
     uint32_t                            tmpKgarReg;
     uint32_t                            intFlags;
     uint8_t                             physicalSchemeId, relativeSchemeId = 0;
-    t_FmPcdKgScheme                     *p_Scheme;
+    t_FmPcdKgScheme                     *p_Scheme, candidate = {0};
+    t_FmPcdLock                         *p_Lock;
+
+    SANITY_CHECK_RETURN_VALUE(p_SchemeParams, E_INVALID_HANDLE, NULL);
+    if (!p_SchemeParams->alwaysDirect && !p_SchemeParams->netEnvParams.h_NetEnv)
+    {
+        REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("Ordinary scheme requires a network environment"));
+        return NULL;
+    }
 
     if (p_SchemeParams->modify)
     {
         p_Scheme = (t_FmPcdKgScheme *)p_SchemeParams->id.h_Scheme;
+        SANITY_CHECK_RETURN_VALUE(p_Scheme, E_INVALID_HANDLE, NULL);
         p_FmPcd = p_Scheme->h_FmPcd;
 
         SANITY_CHECK_RETURN_VALUE(p_FmPcd, E_INVALID_HANDLE, NULL);
         SANITY_CHECK_RETURN_VALUE(p_FmPcd->p_FmPcdKg, E_INVALID_HANDLE, NULL);
 
-        if (!FmPcdKgIsSchemeValidSw(p_Scheme))
+        if (!FmPcdKgIsSchemeValidSw(p_Scheme) || !p_Scheme->p_Lock)
         {
             REPORT_ERROR(MAJOR, E_ALREADY_EXISTS,
                          ("Scheme is invalid"));
@@ -2996,34 +3008,44 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
         }
 
         p_Scheme = &p_FmPcd->p_FmPcdKg->schemes[relativeSchemeId];
-        if (FmPcdKgIsSchemeValidSw(p_Scheme))
+        p_Lock = FmPcdAcquireLockedLock(p_FmPcd);
+        if (!p_Lock)
         {
-            REPORT_ERROR(MAJOR, E_ALREADY_EXISTS,
-                         ("Scheme id (%d)!", relativeSchemeId));
+            REPORT_ERROR(MAJOR, E_NOT_AVAILABLE, ("FM KG Scheme lock obj!"));
             return NULL;
         }
-        /* Clear all fields, scheme may have beed previously used */
-        memset(p_Scheme, 0, sizeof(t_FmPcdKgScheme));
 
+        /* Reserve the slot before building. A second creator must not clear
+         * an invalid but still owned scheme or steal its operation lock. */
+        intFlags = FmPcdLock(p_FmPcd);
+        if (p_Scheme->valid || p_Scheme->p_Lock)
+        {
+            FmPcdUnlock(p_FmPcd, intFlags);
+            FmPcdReleaseLock(p_FmPcd, p_Lock);
+            REPORT_ERROR(MAJOR, E_ALREADY_EXISTS, ("Scheme id (%d)!", relativeSchemeId));
+            return NULL;
+        }
+        memset(p_Scheme, 0, sizeof(*p_Scheme));
         p_Scheme->schemeId = p_FmPcd->p_FmPcdKg->schemesIds[relativeSchemeId];
         p_Scheme->h_FmPcd = p_FmPcd;
-
-        p_Scheme->p_Lock = FmPcdAcquireLock(p_FmPcd);
-        if (!p_Scheme->p_Lock)
-            REPORT_ERROR(MAJOR, E_NOT_AVAILABLE, ("FM KG Scheme lock obj!"));
+        p_Scheme->p_Lock = p_Lock;
+        FmPcdUnlock(p_FmPcd, intFlags);
     }
 
-    err = BuildSchemeRegs((t_Handle)p_Scheme, p_SchemeParams, &schemeRegs);
+    /* Build configuration separately; retain identity, bindings and pending
+     * required-action bookkeeping until programming has succeeded. */
+    intFlags = KgSchemeLock(p_Scheme);
+    candidate.h_FmPcd = p_FmPcd;
+    candidate.schemeId = p_Scheme->schemeId;
+    candidate.p_Lock = p_Scheme->p_Lock;
+    candidate.valid = p_Scheme->valid;
+    candidate.owners = p_Scheme->owners;
+    candidate.requiredActionFlag = p_Scheme->requiredActionFlag;
+    candidate.requiredAction = p_Scheme->requiredAction;
+    KgSchemeUnlock(p_Scheme, intFlags);
+    err = BuildSchemeRegs(&candidate, p_SchemeParams, &schemeRegs);
     if (err)
-    {
-        REPORT_ERROR(MAJOR, err, NO_MSG);
-        if (p_SchemeParams->modify)
-            KgSchemeFlagUnlock(p_Scheme);
-        if (!p_SchemeParams->modify &&
-            p_Scheme->p_Lock)
-            FmPcdReleaseLock(p_FmPcd, p_Scheme->p_Lock);
-        return NULL;
-    }
+        goto failed;
 
     if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
     {
@@ -3031,18 +3053,9 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
                                  (t_Handle)p_Scheme,
                                  &schemeRegs,
                                  p_SchemeParams->schemeCounter.update);
-        if (p_SchemeParams->modify)
-            KgSchemeFlagUnlock(p_Scheme);
         if (err)
-        {
-            if (!p_SchemeParams->modify &&
-                p_Scheme->p_Lock)
-                FmPcdReleaseLock(p_FmPcd, p_Scheme->p_Lock);
-            return NULL;
-        }
-        if (!p_SchemeParams->modify)
-            ValidateSchemeSw(p_Scheme);
-        return (t_Handle)p_Scheme;
+            goto failed;
+        goto programmed;
     }
 
     physicalSchemeId = p_Scheme->schemeId;
@@ -3071,58 +3084,100 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
     /* call indirect command for scheme write */
     tmpKgarReg = FmPcdKgBuildWriteSchemeActionReg(physicalSchemeId, p_SchemeParams->schemeCounter.update);
 
-    WriteKgarWait(p_FmPcd, tmpKgarReg);
+    err = WriteKgarWait(p_FmPcd, tmpKgarReg);
     KgHwUnlock(p_FmPcd->p_FmPcdKg, intFlags);
+    if (err)
+        goto failed;
 
+programmed:
+    /* Transfer the netenv reference only after hardware accepts the new
+     * configuration. Keep the old reference throughout a failed modify. */
+    if (p_SchemeParams->modify && candidate.netEnvId != p_Scheme->netEnvId)
+    {
+        if (candidate.netEnvId != ILLEGAL_NETENV)
+            FmPcdIncNetEnvOwners(p_FmPcd, candidate.netEnvId);
+        if (p_Scheme->netEnvId != ILLEGAL_NETENV)
+            FmPcdDecNetEnvOwners(p_FmPcd, p_Scheme->netEnvId);
+    }
+    intFlags = KgSchemeLock(p_Scheme);
+    /* Dynamic binding updates these fields under the scheme spinlock while
+     * the operation flag protects configuration and hardware programming. */
+    candidate.owners = p_Scheme->owners;
+    candidate.requiredActionFlag = p_Scheme->requiredActionFlag;
+    candidate.requiredAction = p_Scheme->requiredAction;
+    *p_Scheme = candidate;
+    KgSchemeUnlock(p_Scheme, intFlags);
     if (!p_SchemeParams->modify)
         ValidateSchemeSw(p_Scheme);
-    else
-        KgSchemeFlagUnlock(p_Scheme);
-
+    KgSchemeFlagUnlock(p_Scheme);
     return (t_Handle)p_Scheme;
+
+failed:
+    /* E_TIMEOUT does not prove hardware rollback. A117's HC failure latch
+     * blocks further programming (including direct fallback) until reset. */
+    REPORT_ERROR(MAJOR, err, NO_MSG);
+    if (p_SchemeParams->modify)
+        KgSchemeFlagUnlock(p_Scheme);
+    else
+    {
+        intFlags = FmPcdLock(p_FmPcd);
+        p_Lock = p_Scheme->p_Lock;
+        p_Scheme->p_Lock = NULL;
+        FmPcdUnlock(p_FmPcd, intFlags);
+        FmPcdReleaseLock(p_FmPcd, p_Lock);
+    }
+    return NULL;
 }
 
 t_Error  FM_PCD_KgSchemeDelete(t_Handle h_Scheme)
 {
     t_FmPcd             *p_FmPcd;
-    uint8_t             physicalSchemeId;
+    t_FmPcdLock         *p_Lock;
     uint32_t            tmpKgarReg, intFlags;
-    t_Error             err = E_OK;
+    t_Error             err;
     t_FmPcdKgScheme     *p_Scheme = (t_FmPcdKgScheme *)h_Scheme;
 
     SANITY_CHECK_RETURN_ERROR(h_Scheme, E_INVALID_HANDLE);
+    if (!p_Scheme->valid || !p_Scheme->p_Lock)
+        RETURN_ERROR(MINOR, E_INVALID_STATE, ("Scheme is invalid"));
 
-    p_FmPcd = (t_FmPcd*)(p_Scheme->h_FmPcd);
+    p_FmPcd = (t_FmPcd*)p_Scheme->h_FmPcd;
 
-    UpdateRequiredActionFlag(h_Scheme, FALSE);
+    /* Use the operation flag, not an IRQ spinlock: HC completion needs
+     * interrupts. Port binding takes these flags through TryLockAll. */
+    if (!KgSchemeFlagTryLock(p_Scheme))
+        return ERROR_CODE(E_BUSY);
 
-    /* check that no port is bound to this scheme */
-    err = InvalidateSchemeSw(h_Scheme);
-    if (err)
-        RETURN_ERROR(MINOR, err, NO_MSG);
+    if (p_Scheme->owners)
+    {
+        KgSchemeFlagUnlock(p_Scheme);
+        RETURN_ERROR(MINOR, E_INVALID_STATE, ("Trying to delete a scheme that has ports bound to"));
+    }
 
     if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
-    {
         err = FmHcPcdKgDeleteScheme(p_FmPcd->h_Hc, h_Scheme);
-        if (p_Scheme->p_Lock)
-            FmPcdReleaseLock(p_FmPcd, p_Scheme->p_Lock);
+    else
+    {
+        intFlags = KgHwLock(p_FmPcd->p_FmPcdKg);
+        /* Clear mode register, including enable bit. */
+        WRITE_UINT32(p_FmPcd->p_FmPcdKg->p_IndirectAccessRegs->schemeRegs.kgse_mode, 0);
+        tmpKgarReg = FmPcdKgBuildWriteSchemeActionReg(p_Scheme->schemeId, FALSE);
+        err = WriteKgarWait(p_FmPcd, tmpKgarReg);
+        KgHwUnlock(p_FmPcd->p_FmPcdKg, intFlags);
+    }
+
+    if (err)
+    {
+        KgSchemeFlagUnlock(p_Scheme);
         return err;
     }
 
-    physicalSchemeId = ((t_FmPcdKgScheme *)h_Scheme)->schemeId;
-
-    intFlags = KgHwLock(p_FmPcd->p_FmPcdKg);
-    /* clear mode register, including enable bit */
-    WRITE_UINT32(p_FmPcd->p_FmPcdKg->p_IndirectAccessRegs->schemeRegs.kgse_mode, 0);
-
-    /* call indirect command for scheme write */
-    tmpKgarReg = FmPcdKgBuildWriteSchemeActionReg(physicalSchemeId, FALSE);
-
-    WriteKgarWait(p_FmPcd, tmpKgarReg);
-    KgHwUnlock(p_FmPcd->p_FmPcdKg, intFlags);
-
-    if (p_Scheme->p_Lock)
-        FmPcdReleaseLock(p_FmPcd, p_Scheme->p_Lock);
+    /* Software ownership changes only after hardware deletion succeeds. */
+    UpdateRequiredActionFlag(p_Scheme, FALSE);
+    InvalidateSchemeSw(p_Scheme);
+    p_Lock = p_Scheme->p_Lock;
+    p_Scheme->p_Lock = NULL;
+    FmPcdReleaseLock(p_FmPcd, p_Lock);
 
     return E_OK;
 }

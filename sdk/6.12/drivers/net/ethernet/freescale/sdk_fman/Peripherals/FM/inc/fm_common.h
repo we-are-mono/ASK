@@ -53,7 +53,8 @@
 
 #define IP_OFFLOAD_PACKAGE_NUMBER                   106
 #define CAPWAP_OFFLOAD_PACKAGE_NUMBER               108
-#define IS_OFFLOAD_PACKAGE(num) ((num == IP_OFFLOAD_PACKAGE_NUMBER) || (num == CAPWAP_OFFLOAD_PACKAGE_NUMBER))
+#define ASK_UCODE_PACKAGE_NUMBER                    209
+#define IS_OFFLOAD_PACKAGE(num) ((num == IP_OFFLOAD_PACKAGE_NUMBER) || (num == CAPWAP_OFFLOAD_PACKAGE_NUMBER) || (num >= ASK_UCODE_PACKAGE_NUMBER) )
 
 
 
@@ -164,11 +165,6 @@ typedef _Packed struct t_FmPcdPlcrProfileRegs {
 	uint32_t fmpl_res1[12];    /* 0x0D0-0x0FF Reserved */
 } _PackedType t_FmPcdPlcrProfileRegs;
 
-typedef _Packed struct t_FmPcdCcCapwapReassmTimeoutParams {
-    volatile uint32_t                       portIdAndCapwapReassmTbl;
-    volatile uint32_t                       fqidForTimeOutFrames;
-    volatile uint32_t                       timeoutRequestTime;
-}_PackedType t_FmPcdCcCapwapReassmTimeoutParams;
 
 /**************************************************************************//**
  @Description   PCD CTRL Parameters Page
@@ -185,7 +181,9 @@ typedef _Packed struct t_FmPcdCtrlParamsPage {
     volatile uint32_t discardMask;
     volatile uint8_t  reserved3[4];
     volatile uint32_t postBmiFetchNia;
-    volatile uint8_t  reserved4[172];
+    volatile uint32_t internalFEBufferManagementIndexAddr;
+    volatile uint32_t internalFEBufferDepletionCounter;
+    volatile uint8_t  reserved4[164];
 } _PackedType t_FmPcdCtrlParamsPage;
 
 
@@ -208,11 +206,6 @@ typedef struct t_FmPcdCcFragScratchPoolCmdParams {
     uint8_t     bufferPoolId;
 } t_FmPcdCcFragScratchPoolCmdParams;
 
-typedef struct t_FmPcdCcReassmTimeoutParams {
-    bool        activate;
-    uint8_t     tsbs;
-    uint32_t    iprcpt;
-} t_FmPcdCcReassmTimeoutParams;
 
 typedef struct {
     uint8_t             baseEntry;
@@ -661,7 +654,6 @@ typedef struct t_FmPcdLock {
 typedef t_Error (t_FmPortGetSetCcParamsCallback) (t_Handle                  h_FmPort,
                                                   t_FmPortGetSetCcParams    *p_FmPortGetSetCcParams);
 
-
 /***********************************************************************/
 /*          Common API for FM-PCD module                               */
 /***********************************************************************/
@@ -678,8 +670,6 @@ uint32_t    FmPcdLock(t_Handle h_FmPcd);
 void        FmPcdUnlock(t_Handle h_FmPcd, uint32_t  intFlags);
 bool        FmPcdNetEnvIsHdrExist(t_Handle h_FmPcd, uint8_t netEnvId, e_NetHeaderType hdr);
 t_Error     FmPcdFragHcScratchPoolInit(t_Handle h_FmPcd, uint8_t scratchBpid);
-t_Error     FmPcdRegisterReassmPort(t_Handle h_FmPcd, t_Handle h_IpReasmCommonPramTbl);
-t_Error     FmPcdUnregisterReassmPort(t_Handle h_FmPcd, t_Handle h_IpReasmCommonPramTbl);
 bool        FmPcdIsAdvancedOffloadSupported(t_Handle h_FmPcd);
 bool        FmPcdLockTryLockAll(t_Handle h_FmPcd);
 void        FmPcdLockUnlockAll(t_Handle h_FmPcd);
@@ -769,8 +759,6 @@ t_Error     FmPcdCcModifyNextEngineParamTree(t_Handle h_FmPcd, t_Handle h_FmPcdC
 uint32_t    FmPcdCcGetNodeAddrOffsetFromNodeInfo(t_Handle h_FmPcd, t_Handle h_Pointer);
 t_Handle    FmPcdCcTreeGetSavedManipParams(t_Handle h_FmTree);
 void        FmPcdCcTreeSetSavedManipParams(t_Handle h_FmTree, t_Handle h_SavedManipParams);
-t_Error     FmPcdCcTreeAddIPR(t_Handle h_FmPcd, t_Handle h_FmTree, t_Handle h_NetEnv, t_Handle h_ReassemblyManip, bool schemes);
-t_Error     FmPcdCcTreeAddCPR(t_Handle h_FmPcd, t_Handle h_FmTree, t_Handle h_NetEnv, t_Handle h_ReassemblyManip, bool schemes);
 t_Error     FmPcdCcBindTree(t_Handle h_FmPcd, t_Handle h_PcdParams, t_Handle h_CcTree,  uint32_t  *p_Offset,t_Handle h_FmPort);
 t_Error     FmPcdCcUnbindTree(t_Handle h_FmPcd, t_Handle h_CcTree);
 
@@ -789,6 +777,8 @@ typedef enum e_FmPortGprFuncType
 } e_FmPortGprFuncType;
 
 t_Error     FmPortSetGprFunc(t_Handle h_FmPort, e_FmPortGprFuncType gprFunc, void **p_Value);
+t_Error     FmPortSetFESupport(t_Handle h_FmPort);
+t_Error     FmPortDeleteFESupport(t_Handle h_FmPort);
 t_Error     FmGetSetParams(t_Handle h_Fm, t_FmGetSetParams *p_FmGetSetParams);
 t_Error     FmPortGetSetCcParams(t_Handle h_FmPort, t_FmPortGetSetCcParams *p_FmPortGetSetCcParams);
 uint8_t     FmPortGetNetEnvId(t_Handle h_FmPort);

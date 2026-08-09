@@ -37,6 +37,7 @@
 #include <linux/fsl_qman.h>	/* struct qman_fq */
 
 #include "fm_ext.h"
+#include "fm_ehash.h"
 #include "dpaa_eth_trace.h"
 
 extern int dpa_rx_extra_headroom;
@@ -88,8 +89,13 @@ static inline void DPA_BUG_ON(bool cond)
 	(FM_PORT_FRM_ERR_UNSUPPORTED_FORMAT | \
 	 FM_PORT_FRM_ERR_LENGTH | FM_PORT_FRM_ERR_DMA)
 
-/* The raw buffer size must be cacheline aligned. */
-#define DPA_BP_RAW_SIZE		2048
+/* The raw buffer size must be cacheline aligned.
+ * As 1518 byte packets are received in scatter gather buffers from DPAA,
+ * and these buffers are used by WIFI which requires contiguous buffers,
+ * the buffer size is increased from 2048 to 2176, to accommodate them in a
+ * contiguous fd.
+ */
+#define DPA_BP_RAW_SIZE		2176
 
 /* This is what FMan is ever allowed to use.
  * FMan-DMA requires 16-byte alignment for Rx buffers, but SKB_DATA_ALIGN is
@@ -174,6 +180,7 @@ static inline void DPA_BUG_ON(bool cond)
 #endif
 
 #define DPAA_ETH_RX_QUEUES	128
+#define DPAA_IP_VERSION_4  4
 
 /* Convenience macros for storing/retrieving the skb back-pointers. They must
  * accommodate both recycling and confirmation paths - i.e. cases when the buf
@@ -304,11 +311,15 @@ struct dpa_percpu_priv_s {
 	u64 tx_frag_skbuffs;
 	/* number of S/G frames received */
 	u64 rx_sg;
-
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) && defined(CONFIG_CPE_FAST_PATH)
+	u64 tx_caam_enc;
+	u64 tx_caam_dec;
+#endif
 	struct rtnl_link_stats64 stats;
 	struct dpa_rx_errors rx_errors;
 	struct dpa_ern_cnt ern_cnt;
 };
+
 
 struct dpa_priv_s {
 	struct dpa_percpu_priv_s	__percpu *percpu_priv;
@@ -376,9 +387,13 @@ struct dpa_priv_s {
 	int loop_id;
 	int loop_to;
 #endif
-#ifdef CONFIG_FSL_DPAA_CEETM
+#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
 	bool ceetm_en; /* CEETM QoS enabled */
+#ifdef CONFIG_CPE_FAST_PATH
+	void *qm_ctx;  /* CEETM context */
 #endif
+#endif
+	void *ifinfo;
 };
 
 struct fm_port_fqs {
@@ -393,7 +408,7 @@ struct fm_port_fqs {
 extern struct net_device *dpa_loop_netdevs[20];
 #endif
 
-int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *count_ptr);
+int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *count_ptr, int threshold);
 void __hot _dpa_rx(struct net_device *net_dev,
 		struct qman_portal *portal,
 		const struct dpa_priv_s *priv,
@@ -619,5 +634,10 @@ static inline void _dpa_bp_free_pf(void *addr)
  * we reserve 256 bytes instead to guarantee 256 data alignment.
  */
 #define DPAA_A050385_HEADROOM	256
+
+/* ASK fast-path exports (dpaa_eth_sg.c / dpaa_eth_common.c); also
+ * consumed by the out-of-tree cdx module. */
+int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs,
+			      bool act_skb);
 
 #endif	/* __DPA_H */

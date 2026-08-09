@@ -182,6 +182,21 @@ typedef _Packed struct t_FmPrsResult {
                                          FM_FD_ERR_LENGTH               | \
                                          FM_FD_ERR_DMA) /**< TX Error FD bits */
 
+#define FM_RFSDM_DEFAULT		(FM_FD_ERR_DMA |\
+					 FM_FD_ERR_PHYSICAL |\
+					 FM_FD_ERR_SIZE |\
+					 FM_FD_ERR_CLS_DISCARD |\
+					 FM_FD_ERR_EXTRACTION |\
+					 FM_FD_ERR_NO_SCHEME |\
+					 FM_FD_ERR_KEYSIZE_OVERFLOW |\
+					 FM_FD_ERR_ILL_PLCR|\
+					 FM_FD_ERR_PRS_TIMEOUT|\
+					 FM_FD_ERR_PLCR_FRAME_LEN|\
+					 FM_FD_ERR_PRS_ILL_INSTRUCT|\
+					 FM_FD_ERR_PRS_HDR_ERR|\
+					 FM_FD_ERR_BLOCK_LIMIT_EXCEEDED)
+
+
 #define FM_FD_RX_STATUS_ERR_MASK        (FM_FD_ERR_UNSUPPORTED_FORMAT   | \
                                          FM_FD_ERR_LENGTH               | \
                                          FM_FD_ERR_DMA                  | \

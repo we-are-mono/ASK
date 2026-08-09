@@ -2132,6 +2132,22 @@ u16 qman_affine_channel(unsigned int cpu);
 void *qman_get_affine_portal(int cpu);
 
 /**
+ * qman_affine_portal_eqcr_fill - commands @cpu's portal ring holds untaken
+ *
+ * What the CPU has written into its portal's enqueue ring and QMan has not
+ * consumed yet, for a report of where a frame waits. -ENODEV without a portal.
+ */
+int qman_affine_portal_eqcr_fill(int cpu);
+
+/**
+ * qman_affine_portal_dqrr_pending - entries @cpu's portal holds unconsumed
+ *
+ * What the portal has dequeued into its ring and the CPU has not processed,
+ * for a report of where a frame waits. -ENODEV without a portal.
+ */
+int qman_affine_portal_dqrr_pending(int cpu);
+
+/**
  * qman_poll_dqrr - process DQRR (fast-path) entries
  * @limit: the maximum number of DQRR entries to process
  *
@@ -2429,6 +2445,19 @@ int qman_query_fq_np(struct qman_fq *fq, struct qm_mcr_queryfq_np *np);
  *	to query if query_dedicated is zero.
  */
 int qman_query_wq(u8 query_dedicated, struct qm_mcr_querywq *wq);
+
+/**
+ * qman_query_fq_np_timeout - qman_query_fq_np(), waiting at most @timeout_us
+ * qman_query_wq_timeout - qman_query_wq(), waiting at most @timeout_us
+ *
+ * For a report made because QMan may have stopped answering: -ETIMEDOUT
+ * when this CPU's portal does not answer in time. The portal then owes that
+ * answer, and its next command, of any kind, waits for it first.
+ */
+int qman_query_fq_np_timeout(struct qman_fq *fq, struct qm_mcr_queryfq_np *np,
+			     unsigned int timeout_us);
+int qman_query_wq_timeout(u8 query_dedicated, struct qm_mcr_querywq *wq,
+			  unsigned int timeout_us);
 
 /**
  * qman_volatile_dequeue - Issue a volatile dequeue command
@@ -3962,6 +3991,12 @@ static inline int qman_is_probed(void) {
 static inline int qman_portals_probed(void) {
 	return 1;
 }
+
+int qman_ceetm_configure_mapping_shaper_tcfc(
+	struct qm_mcc_ceetm_mapping_shaper_tcfc_config *opts);
+/* Macro used to configure queue for control traffic, 7 is the highest */
+#define QOS_DEFAULT_QUEUE      7
+#define QOS_LEAST_PRIORITY_QUEUE   0
 
 #ifdef __cplusplus
 }

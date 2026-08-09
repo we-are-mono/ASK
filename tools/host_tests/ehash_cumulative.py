@@ -1,4 +1,4 @@
-"""Compile the ehash add and delete from the shipped patch and check what a
+"""Compile the ehash add and delete from the line's SDK copy and check what a
 failed barrier or a failed allocation leaves behind in a bucket whose keys
 collide."""
 
@@ -13,17 +13,9 @@ import re
 
 
 def test_ehash_cumulative(tmp_path):
-    # Every patch that writes either file, in order, so the types are the
-    # shipped ones: a later patch turns the key into a flexible array.
-    for patch in sorted(kernel_line.patches().glob("*.patch")):
-        if patch.name.startswith("999") or not re.search(
-                r"^diff --git a/(?:" + re.escape(PCD) + "|" + re.escape(HEADER) + ") ",
-                patch.read_text(), re.M):
-            continue
-        run_process(["git", "apply", "--whitespace=nowarn", f"--include={PCD}",
-                        f"--include={HEADER}", str(patch)], cwd=tmp_path, check=True)
-    header = (tmp_path / HEADER).read_text()
-    pcd = (tmp_path / PCD).read_text()
+    # The line's SDK copy, so the types and the code are the shipped ones.
+    header = (kernel_line.sdk() / HEADER).read_text()
+    pcd = (kernel_line.sdk() / PCD).read_text()
     (tmp_path / "ehash_types.inc").write_text(
         "\n".join(re.findall(r"^#define\s+(?:MAX_EN_EHASH_(?:EXT_)?ENTRY_SIZE|EN_EHASH_ENTRY_ALIGN|"
                              r"EN_CUMULATIVE_NODE(?:_MAX_SIZE)?|EN_INVALID_CUMULATIVE_NODE|"

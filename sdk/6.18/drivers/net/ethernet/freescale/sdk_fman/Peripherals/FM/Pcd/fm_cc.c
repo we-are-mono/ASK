@@ -51,6 +51,8 @@
 #include "fm_hc.h"
 #include "fm_cc.h"
 #include "crc64.h"
+#include "fm_cc_dbg.h"
+#include "fm_ehash.h"
 
 /****************************************/
 /*       static functions               */
@@ -934,8 +936,10 @@ static t_Error DynamicChangeHc(
             }
 
             /* Invoke host command to copy from new AD to old AD */
+	    display_pcd_cc_hc((t_FmPcd *)h_FmPcd, oldAdAddrOffset,
+			newAdAddrOffset);
             err = FmHcPcdCcDoDynamicChange(((t_FmPcd *)h_FmPcd)->h_Hc,
-                                           oldAdAddrOffset, newAdAddrOffset);
+                                       oldAdAddrOffset, newAdAddrOffset);
             if (err)
             {
                 ReleaseModifiedDataStructure(h_FmPcd, h_OldPointersLst,
@@ -1023,7 +1027,7 @@ static t_Error DoDynamicChange(
 
 			/* HC to copy from the new Ad (old updated structures) to current Ad (uses shadow structures) */
 			err = DynamicChangeHc(h_FmPcd, h_OldPointersLst, h_NewPointersLst,
-								  p_AdditionalParams, useShadowStructs);
+                                  p_AdditionalParams, useShadowStructs);
 			if (err)
 				RETURN_ERROR(MAJOR, err, NO_MSG);
 		}
@@ -1044,93 +1048,11 @@ static t_Error CcUpdateParam(
         uint16_t numOfEntries, t_Handle h_Ad, bool validate, uint16_t level,
         t_Handle h_FmTree, bool modify)
 {
-    t_FmPcdCcNode *p_CcNode;
-    t_Error err;
-    uint16_t tmp = 0;
-    int i = 0;
-    t_FmPcdCcTree *p_CcTree = (t_FmPcdCcTree *)h_FmTree;
-
-    level++;
-
-    if (p_CcTree->h_IpReassemblyManip)
-    {
-        err = FmPcdManipUpdate(h_FmPcd, h_PcdParams, h_FmPort,
-                               p_CcTree->h_IpReassemblyManip, NULL, validate,
-                               level, h_FmTree, modify);
-        if (err)
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-    }
-
-    if (p_CcTree->h_CapwapReassemblyManip)
-    {
-        err = FmPcdManipUpdate(h_FmPcd, h_PcdParams, h_FmPort,
-                               p_CcTree->h_CapwapReassemblyManip, NULL, validate,
-                               level, h_FmTree, modify);
-        if (err)
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-    }
-
-    if (numOfEntries)
-    {
-        for (i = 0; i < numOfEntries; i++)
-        {
-            if (i == 0)
-                h_Ad = PTR_MOVE(h_Ad, i*FM_PCD_CC_AD_ENTRY_SIZE);
-            else
-                h_Ad = PTR_MOVE(h_Ad, FM_PCD_CC_AD_ENTRY_SIZE);
-
-            if (p_CcKeyAndNextEngineParams[i].nextEngineParams.nextEngine
-                    == e_FM_PCD_CC)
-            {
-                p_CcNode =
-                        p_CcKeyAndNextEngineParams[i].nextEngineParams.params.ccParams.h_CcNode;
-                ASSERT_COND(p_CcNode);
-
-                if (p_CcKeyAndNextEngineParams[i].nextEngineParams.h_Manip)
-                {
-                    err =
-                            FmPcdManipUpdate(
-                                    h_FmPcd,
-                                    NULL,
-                                    h_FmPort,
-                                    p_CcKeyAndNextEngineParams[i].nextEngineParams.h_Manip,
-                                    h_Ad, validate, level, h_FmTree, modify);
-                    if (err)
-                        RETURN_ERROR(MAJOR, err, NO_MSG);
-                }
-
-                if (p_CcNode->keyAndNextEngineParams[p_CcNode->numOfKeys].nextEngineParams.nextEngine
-                        != e_FM_PCD_INVALID)
-                    tmp = (uint8_t)(p_CcNode->numOfKeys + 1);
-                else
-                    tmp = p_CcNode->numOfKeys;
-
-                err = CcUpdateParam(h_FmPcd, h_PcdParams, h_FmPort,
-                                    p_CcNode->keyAndNextEngineParams, tmp,
-                                    p_CcNode->h_AdTable, validate, level,
-                                    h_FmTree, modify);
-                if (err)
-                    RETURN_ERROR(MAJOR, err, NO_MSG);
-            }
-            else
-            {
-                if (p_CcKeyAndNextEngineParams[i].nextEngineParams.h_Manip)
-                {
-                    err =
-                            FmPcdManipUpdate(
-                                    h_FmPcd,
-                                    NULL,
-                                    h_FmPort,
-                                    p_CcKeyAndNextEngineParams[i].nextEngineParams.h_Manip,
-                                    h_Ad, validate, level, h_FmTree, modify);
-                    if (err)
-                        RETURN_ERROR(MAJOR, err, NO_MSG);
-                }
-            }
-        }
-    }
-
+#if (DPAA_VERSION >= 11)
+  //  FmPortSetFESupport(h_FmPort);
     return E_OK;
+#endif /* (DPAA_VERSION >= 11) */
+
 }
 
 static ccPrivateInfo_t IcDefineCode(t_FmPcdCcNodeParams *p_CcNodeParam)
@@ -1232,6 +1154,17 @@ static void DeleteNode(t_FmPcdCcNode *p_CcNode)
         p_CcNode->h_TmpAd = NULL;
     }
 
+    /* h_TmpAd is only ever aliased into h_Ad by AllocAndFillAdForContLookupManip(),
+       which runs lazily and only when a manip is chained ahead of this node. If it
+       never ran, the block above did not fire and h_TmpAd is still a live MURAM
+       allocation that nothing else frees. */
+    if (p_CcNode->h_TmpAd)
+    {
+        FM_MURAM_FreeMem(FmPcdGetMuramHandle(p_CcNode->h_FmPcd),
+                         p_CcNode->h_TmpAd);
+        p_CcNode->h_TmpAd = NULL;
+    }
+
     if (p_CcNode->h_StatsFLRs)
     {
         FM_MURAM_FreeMem(FmPcdGetMuramHandle(p_CcNode->h_FmPcd),
@@ -1247,7 +1180,8 @@ static void DeleteNode(t_FmPcdCcNode *p_CcNode)
 
     /* Restore the original counters pointer instead of the mutual pointer (mutual to all hash buckets) */
     if (p_CcNode->isHashBucket
-            && (p_CcNode->statisticsMode != e_FM_PCD_CC_STATS_MODE_NONE))
+            && (p_CcNode->statisticsMode != e_FM_PCD_CC_STATS_MODE_NONE) &&
+            p_CcNode->keyAndNextEngineParams[p_CcNode->numOfKeys].p_StatsObj)
         p_CcNode->keyAndNextEngineParams[p_CcNode->numOfKeys].p_StatsObj->h_StatsCounters =
                 p_CcNode->h_PrivMissStatsCounters;
 
@@ -1605,14 +1539,10 @@ t_Error ValidateNextEngineParams(
             if (relativeSchemeId == FM_PCD_KG_NUM_OF_SCHEMES)
                 RETURN_ERROR(MAJOR, E_NOT_IN_RANGE, NO_MSG);
             if (!FmPcdKgIsSchemeValidSw(
-                    p_FmPcdCcNextEngineParams->params.kgParams.h_DirectScheme))
+                    p_FmPcdCcNextEngineParams->params.kgParams.h_DirectScheme)) 
                 RETURN_ERROR(MAJOR, E_INVALID_STATE,
                              ("not valid schemeIndex in KG next engine param"));
-            if (!KgIsSchemeAlwaysDirect(h_FmPcd, relativeSchemeId))
-                RETURN_ERROR(
-                        MAJOR,
-                        E_INVALID_STATE,
-                        ("CC Node may point only to a scheme that is always direct."));
+	    
             break;
 
         case (e_FM_PCD_PLCR):
@@ -4057,6 +3987,7 @@ static t_Error ModifyNextEngineParamNode(
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
+    display_cc_node(p_CcNode, __func__);
     err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                           p_ModifyKeyParams, FALSE);
 
@@ -4526,6 +4457,9 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
     if (p_CcNodeParam->keysParams.keySize != p_CcNode->sizeOfExtraction)
     {
         DeleteNode(p_CcNode);
+	pr_err("keySize %d, sizeOfExtraction %d\n",
+		p_CcNodeParam->keysParams.keySize,
+		p_CcNode->sizeOfExtraction);
         RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                      ("keySize has to be equal to sizeOfExtraction"));
     }
@@ -4839,6 +4773,26 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
 
     return E_OK;
 }
+
+
+#if (DPAA_VERSION >= 11)
+void get_indexed_hash_bucket(uint8_t key_size,
+	uint8_t *key_ptr,
+	uint8_t crc_shift,
+	uint16_t mask,
+	uint16_t *bucket_index)
+{
+	uint64_t crc64 = 0;
+
+	crc64 = crc64_init();
+	crc64 = crc64_compute(key_ptr, key_size, crc64);
+
+	crc64 >>= ((6 - crc_shift) << 3);
+	*bucket_index = (uint16_t)crc64 & mask;
+}
+
+#endif /* (DPAA_VERSION >= 11) */
+
 /************************** End of static functions **************************/
 
 /*****************************************************************************/
@@ -4979,190 +4933,6 @@ void NextStepAd(t_Handle h_Ad, t_FmPcdCcStatsParams *p_FmPcdCcStatsParams,
     }
 }
 
-t_Error FmPcdCcTreeAddIPR(t_Handle h_FmPcd, t_Handle h_FmTree,
-                          t_Handle h_NetEnv, t_Handle h_IpReassemblyManip,
-                          bool createSchemes)
-{
-    t_FmPcdCcTree *p_FmPcdCcTree = (t_FmPcdCcTree *)h_FmTree;
-    t_FmPcdCcNextEngineParams nextEngineParams;
-    t_NetEnvParams netEnvParams;
-    t_Handle h_Ad;
-    bool isIpv6Present;
-    uint8_t ipv4GroupId, ipv6GroupId;
-    t_Error err;
-
-    ASSERT_COND(p_FmPcdCcTree);
-
-    /* this routine must be protected by the calling routine! */
-
-    memset(&nextEngineParams, 0, sizeof(t_FmPcdCcNextEngineParams));
-    memset(&netEnvParams, 0, sizeof(t_NetEnvParams));
-
-    h_Ad = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
-
-    isIpv6Present = FmPcdManipIpReassmIsIpv6Hdr(h_IpReassemblyManip);
-
-    if (isIpv6Present
-            && (p_FmPcdCcTree->numOfEntries > (FM_PCD_MAX_NUM_OF_CC_GROUPS - 2)))
-        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("need two free entries for IPR"));
-
-    if (p_FmPcdCcTree->numOfEntries > (FM_PCD_MAX_NUM_OF_CC_GROUPS - 1))
-        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("need two free entries for IPR"));
-
-    nextEngineParams.nextEngine = e_FM_PCD_DONE;
-    nextEngineParams.h_Manip = h_IpReassemblyManip;
-
-    /* Lock tree */
-    err = CcRootTryLock(p_FmPcdCcTree);
-    if (err)
-        return ERROR_CODE(E_BUSY);
-
-    if (p_FmPcdCcTree->h_IpReassemblyManip == h_IpReassemblyManip)
-    {
-        CcRootReleaseLock(p_FmPcdCcTree);
-        return E_OK;
-    }
-
-    if ((p_FmPcdCcTree->h_IpReassemblyManip)
-            && (p_FmPcdCcTree->h_IpReassemblyManip != h_IpReassemblyManip))
-    {
-        CcRootReleaseLock(p_FmPcdCcTree);
-        RETURN_ERROR(MAJOR, E_INVALID_STATE,
-                     ("This tree was previously updated with different IPR"));
-    }
-
-    /* Initialize IPR for the first time for this tree */
-    if (isIpv6Present)
-    {
-        ipv6GroupId = p_FmPcdCcTree->numOfGrps++;
-        p_FmPcdCcTree->fmPcdGroupParam[ipv6GroupId].baseGroupEntry =
-                (FM_PCD_MAX_NUM_OF_CC_GROUPS - 2);
-
-        if (createSchemes)
-        {
-            err = FmPcdManipBuildIpReassmScheme(h_FmPcd, h_NetEnv,
-                                                p_FmPcdCcTree,
-                                                h_IpReassemblyManip, FALSE,
-                                                ipv6GroupId);
-            if (err)
-            {
-                p_FmPcdCcTree->numOfGrps--;
-                CcRootReleaseLock(p_FmPcdCcTree);
-                RETURN_ERROR(MAJOR, err, NO_MSG);
-            }
-        }
-
-        NextStepAd(
-                PTR_MOVE(h_Ad, (FM_PCD_MAX_NUM_OF_CC_GROUPS-2) * FM_PCD_CC_AD_ENTRY_SIZE),
-                NULL, &nextEngineParams, h_FmPcd);
-    }
-
-    ipv4GroupId = p_FmPcdCcTree->numOfGrps++;
-    p_FmPcdCcTree->fmPcdGroupParam[ipv4GroupId].totalBitsMask = 0;
-    p_FmPcdCcTree->fmPcdGroupParam[ipv4GroupId].baseGroupEntry =
-            (FM_PCD_MAX_NUM_OF_CC_GROUPS - 1);
-
-    if (createSchemes)
-    {
-        err = FmPcdManipBuildIpReassmScheme(h_FmPcd, h_NetEnv, p_FmPcdCcTree,
-                                            h_IpReassemblyManip, TRUE,
-                                            ipv4GroupId);
-        if (err)
-        {
-            p_FmPcdCcTree->numOfGrps--;
-            if (isIpv6Present)
-            {
-                p_FmPcdCcTree->numOfGrps--;
-                FmPcdManipDeleteIpReassmSchemes(h_IpReassemblyManip);
-            }
-            CcRootReleaseLock(p_FmPcdCcTree);
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-        }
-    }
-
-    NextStepAd(
-            PTR_MOVE(h_Ad, (FM_PCD_MAX_NUM_OF_CC_GROUPS-1) * FM_PCD_CC_AD_ENTRY_SIZE),
-            NULL, &nextEngineParams, h_FmPcd);
-
-    p_FmPcdCcTree->h_IpReassemblyManip = h_IpReassemblyManip;
-
-    CcRootReleaseLock(p_FmPcdCcTree);
-
-    return E_OK;
-}
-
-t_Error FmPcdCcTreeAddCPR(t_Handle h_FmPcd, t_Handle h_FmTree,
-                          t_Handle h_NetEnv, t_Handle h_ReassemblyManip,
-                          bool createSchemes)
-{
-    t_FmPcdCcTree *p_FmPcdCcTree = (t_FmPcdCcTree *)h_FmTree;
-    t_FmPcdCcNextEngineParams nextEngineParams;
-    t_NetEnvParams netEnvParams;
-    t_Handle h_Ad;
-    uint8_t groupId;
-    t_Error err;
-
-    ASSERT_COND(p_FmPcdCcTree);
-
-    /* this routine must be protected by the calling routine! */
-    memset(&nextEngineParams, 0, sizeof(t_FmPcdCcNextEngineParams));
-    memset(&netEnvParams, 0, sizeof(t_NetEnvParams));
-
-    h_Ad = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
-
-    if (p_FmPcdCcTree->numOfEntries > (FM_PCD_MAX_NUM_OF_CC_GROUPS - 1))
-        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("need one free entries for CPR"));
-
-    nextEngineParams.nextEngine = e_FM_PCD_DONE;
-    nextEngineParams.h_Manip = h_ReassemblyManip;
-
-    /* Lock tree */
-    err = CcRootTryLock(p_FmPcdCcTree);
-    if (err)
-        return ERROR_CODE(E_BUSY);
-
-    if (p_FmPcdCcTree->h_CapwapReassemblyManip == h_ReassemblyManip)
-    {
-        CcRootReleaseLock(p_FmPcdCcTree);
-        return E_OK;
-    }
-
-    if ((p_FmPcdCcTree->h_CapwapReassemblyManip)
-            && (p_FmPcdCcTree->h_CapwapReassemblyManip != h_ReassemblyManip))
-    {
-        CcRootReleaseLock(p_FmPcdCcTree);
-        RETURN_ERROR(MAJOR, E_INVALID_STATE,
-                     ("This tree was previously updated with different CPR"));
-    }
-
-    groupId = p_FmPcdCcTree->numOfGrps++;
-    p_FmPcdCcTree->fmPcdGroupParam[groupId].baseGroupEntry =
-            (FM_PCD_MAX_NUM_OF_CC_GROUPS - 1);
-
-    if (createSchemes)
-    {
-        err = FmPcdManipBuildCapwapReassmScheme(h_FmPcd, h_NetEnv,
-                                                p_FmPcdCcTree,
-                                                h_ReassemblyManip, groupId);
-        if (err)
-        {
-            p_FmPcdCcTree->numOfGrps--;
-            CcRootReleaseLock(p_FmPcdCcTree);
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-        }
-    }
-
-    NextStepAd(
-            PTR_MOVE(h_Ad, (FM_PCD_MAX_NUM_OF_CC_GROUPS-1) * FM_PCD_CC_AD_ENTRY_SIZE),
-            NULL, &nextEngineParams, h_FmPcd);
-
-    p_FmPcdCcTree->h_CapwapReassemblyManip = h_ReassemblyManip;
-
-    CcRootReleaseLock(p_FmPcdCcTree);
-
-    return E_OK;
-}
-
 t_Handle FmPcdCcTreeGetSavedManipParams(t_Handle h_FmTree)
 {
     t_FmPcdCcTree *p_FmPcdCcTree = (t_FmPcdCcTree *)h_FmTree;
@@ -5213,68 +4983,8 @@ t_Error FmPcdCcModifyNextEngineParamTree(
         t_Handle h_FmPcd, t_Handle h_FmPcdCcTree, uint8_t grpId, uint8_t index,
         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
 {
-    t_FmPcdCcTree *p_FmPcdCcTree = (t_FmPcdCcTree *)h_FmPcdCcTree;
-    t_FmPcd *p_FmPcd;
-    t_List h_OldPointersLst, h_NewPointersLst;
-    uint16_t keyIndex;
-    t_FmPcdModifyCcKeyAdditionalParams *p_ModifyKeyParams;
-    t_Error err = E_OK;
-
-    SANITY_CHECK_RETURN_ERROR(h_FmPcd, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(h_FmPcdCcTree, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR((grpId <= 7), E_INVALID_VALUE);
-
-    if (grpId >= p_FmPcdCcTree->numOfGrps)
-        RETURN_ERROR(MAJOR, E_INVALID_HANDLE,
-                     ("grpId you asked > numOfGroup of relevant tree"));
-
-    if (index >= p_FmPcdCcTree->fmPcdGroupParam[grpId].numOfEntriesInGroup)
-        RETURN_ERROR(MAJOR, E_INVALID_HANDLE, ("index > numOfEntriesInGroup"));
-
-    p_FmPcd = (t_FmPcd *)h_FmPcd;
-
-    INIT_LIST(&h_OldPointersLst);
-    INIT_LIST(&h_NewPointersLst);
-
-    keyIndex = (uint16_t)(p_FmPcdCcTree->fmPcdGroupParam[grpId].baseGroupEntry
-            + index);
-
-    p_ModifyKeyParams = ModifyNodeCommonPart(p_FmPcdCcTree, keyIndex,
-                                             e_MODIFY_STATE_CHANGE, FALSE,
-                                             FALSE, TRUE);
-    if (!p_ModifyKeyParams)
-        RETURN_ERROR(MAJOR, E_INVALID_STATE, NO_MSG);
-
-    p_ModifyKeyParams->tree = TRUE;
-
-    if (p_FmPcd->p_CcShadow
-            && !TRY_LOCK(p_FmPcd->h_ShadowSpinlock, &p_FmPcd->shadowLock))
-    {
-        XX_Free(p_ModifyKeyParams);
-        return ERROR_CODE(E_BUSY);
-    }
-
-    err = BuildNewNodeModifyNextEngine(p_FmPcd, p_FmPcdCcTree, keyIndex,
-                                       p_FmPcdCcNextEngineParams,
-                                       &h_OldPointersLst, &h_NewPointersLst,
-                                       p_ModifyKeyParams);
-    if (err)
-    {
-        XX_Free(p_ModifyKeyParams);
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-    }
-
-    err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
-                          p_ModifyKeyParams, FALSE);
-
-    if (p_FmPcd->p_CcShadow)
-        RELEASE_LOCK(p_FmPcd->shadowLock);
-
-	ReleaseLst(&h_OldPointersLst);
-	ReleaseLst(&h_NewPointersLst);
-
-    return err;
-
+    RETURN_ERROR(MAJOR, E_NOT_SUPPORTED,
+                 ("ASK external-hash roots cannot be modified in place"));
 }
 
 t_Error FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
@@ -5341,6 +5051,7 @@ t_Error FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
+    display_cc_node(p_CcNode, __func__);
     err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                           p_ModifyKeyParams, useShadowStructs);
 
@@ -5432,6 +5143,7 @@ t_Error FmPcdCcModifyKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
+    display_cc_node(p_CcNode, __func__);
     err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                           p_ModifyKeyParams, useShadowStructs);
 
@@ -5489,6 +5201,7 @@ t_Error FmPcdCcModifyMissNextEngineParamNode(
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
+    display_cc_node(p_CcNode, __func__);
     err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                           p_ModifyKeyParams, FALSE);
 
@@ -5598,6 +5311,7 @@ t_Error FmPcdCcAddKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
+    display_cc_node(p_CcNode, __func__);
     err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                           p_ModifyKeyParams, useShadowStructs);
     if (p_CcNode->maxNumOfKeys)
@@ -5691,6 +5405,7 @@ t_Error FmPcdCcModifyKeyAndNextEngine(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
+    display_cc_node(p_CcNode, __func__);
     err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                           p_ModifyKeyParams, useShadowStructs);
 
@@ -5943,6 +5658,23 @@ void FmPcdCcGetAdTablesThatPointOnReplicGroup(t_Handle h_Node,
 /*       API Init unit functions        */
 /****************************************/
 
+static void copy_td_to_ccbase(void *handle, t_Handle p_CcTreeTmp)
+{
+    struct en_exthash_info *info = handle;
+    struct en_exthash_node *ptr = &info->node;
+    struct en_exthash_node *ccptr = p_CcTreeTmp;
+
+    /* The microcode ABI requires 0xff for both absent reassembly tables. */
+    ptr->ipv4_ad_offset = 0xff;
+    ptr->word_2 = (ptr->word_2 & 0x00ffffff) | 0xff000000;
+    WRITE_UINT32(ccptr->word_1, ptr->word_1);
+    WRITE_UINT32(ccptr->table_base_lo, ptr->table_base_lo);
+    WRITE_UINT32(ccptr->word_2, ptr->word_2);
+    WRITE_UINT32(ccptr->word_0, ptr->word_0);
+    info->h_Ad = ccptr;
+    info->tree_owners++;
+}
+
 t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
                             t_FmPcdCcTreeParams *p_PcdGroupsParam)
 {
@@ -5957,8 +5689,6 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
     t_NetEnvParams netEnvParams;
     uint8_t lastOne = 0;
     uint32_t requiredAction = 0;
-    t_FmPcdCcNode *p_FmPcdCcNextNode;
-    t_CcNodeInformation ccNodeInfo, *p_CcInformation;
 
     SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
     SANITY_CHECK_RETURN_VALUE(p_PcdGroupsParam, E_INVALID_HANDLE, NULL);
@@ -6123,76 +5853,105 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
             (uint32_t)(FM_PCD_MAX_NUM_OF_CC_GROUPS * FM_PCD_CC_AD_ENTRY_SIZE));
 
     p_CcTreeTmp = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
+    pr_debug("%s: cctree root %p baseaddr %p numentries %d muram %x\n", __func__,
+	          p_CcTreeTmp, (void *)p_FmPcdCcTree->ccTreeBaseAddr, numOfEntries,
+                (uint32_t)(XX_VirtToPhys(UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr))
+                           - p_FmPcd->physicalMuramBase));
+    for (i = 0; i < numOfEntries; i++) {
+	struct t_FmPcdCcNextEngineParams *nexteng;
+	
+        p_KeyAndNextEngineParams = p_Params + i;
+	memcpy(&p_FmPcdCcTree->keyAndNextEngineParams[i],
+               p_KeyAndNextEngineParams,
+               sizeof(t_FmPcdCcKeyAndNextEngineParams));
+	nexteng = &p_FmPcdCcTree->keyAndNextEngineParams[i].nextEngineParams;
+
+	if (nexteng->nextEngine == e_FM_PCD_CC)
+	{
+		
+        	t_FmPcdCcNextCcParams *ccParams;       /**< Parameters in case next engine is CC */
+		ccParams = &nexteng->params.ccParams;
+		copy_td_to_ccbase(ccParams->h_CcNode, p_CcTreeTmp);
+
+	}
+        p_CcTreeTmp = PTR_MOVE(p_CcTreeTmp, FM_PCD_CC_AD_ENTRY_SIZE);
+    }
 
     for (i = 0; i < numOfEntries; i++)
     {
-        p_KeyAndNextEngineParams = p_Params + i;
+	struct t_FmPcdCcNextEngineParams *nexteng;
 
-        NextStepAd(p_CcTreeTmp, NULL,
-                   &p_KeyAndNextEngineParams->nextEngineParams, p_FmPcd);
-
-        p_CcTreeTmp = PTR_MOVE(p_CcTreeTmp, FM_PCD_CC_AD_ENTRY_SIZE);
-
-        memcpy(&p_FmPcdCcTree->keyAndNextEngineParams[i],
-               p_KeyAndNextEngineParams,
-               sizeof(t_FmPcdCcKeyAndNextEngineParams));
-
-        if (p_FmPcdCcTree->keyAndNextEngineParams[i].nextEngineParams.nextEngine
-                == e_FM_PCD_CC)
-        {
-            p_FmPcdCcNextNode =
-                    (t_FmPcdCcNode*)p_FmPcdCcTree->keyAndNextEngineParams[i].nextEngineParams.params.ccParams.h_CcNode;
-            p_CcInformation = FindNodeInfoInReleventLst(
-                    &p_FmPcdCcNextNode->ccTreeIdLst, (t_Handle)p_FmPcdCcTree,
-                    p_FmPcdCcNextNode->h_Spinlock);
-
-            if (!p_CcInformation)
-            {
-                memset(&ccNodeInfo, 0, sizeof(t_CcNodeInformation));
-                ccNodeInfo.h_CcNode = (t_Handle)p_FmPcdCcTree;
-                ccNodeInfo.index = 1;
-                EnqueueNodeInfoToRelevantLst(&p_FmPcdCcNextNode->ccTreeIdLst,
-                                             &ccNodeInfo,
-                                             p_FmPcdCcNextNode->h_Spinlock);
-            }
-            else
-                p_CcInformation->index++;
-        }
+        p_KeyAndNextEngineParams = 
+		&p_FmPcdCcTree->keyAndNextEngineParams[i];
+	nexteng = &p_KeyAndNextEngineParams->nextEngineParams;
+	switch(nexteng->nextEngine) {
+		case e_FM_PCD_DONE:
+			{
+        			t_FmPcdCcNextEnqueueParams *enqueueParams;  /**< Parameters in case next engine is BMI */
+				enqueueParams = &nexteng->params.enqueueParams;
+				pr_debug("e_FM_PCD_DONE: action %d, overrideFqid %d, newFqid %x(%d), storageid %d\n",
+					enqueueParams->action,
+					enqueueParams->overrideFqid,
+					enqueueParams->newFqid,
+					enqueueParams->newFqid,
+					enqueueParams->newRelativeStorageProfileId);
+			}
+			break;
+    		case e_FM_PCD_KG:
+			{
+        			t_FmPcdCcNextKgParams *kgParams;       /**< Parameters in case next engine is KG */
+				kgParams = &nexteng->params.kgParams;
+				pr_debug("e_FM_PCD_KG: overrideFqid %d, newFqid %x(%d), storageid %d directschhandle %p\n",
+					kgParams->overrideFqid,
+					kgParams->newFqid,
+					kgParams->newFqid,
+					kgParams->newRelativeStorageProfileId,
+					kgParams->h_DirectScheme);
+			}
+			break;
+    		case e_FM_PCD_CC:
+			{
+        			t_FmPcdCcNextCcParams *ccParams;       /**< Parameters in case next engine is CC */
+				ccParams = &nexteng->params.ccParams;
+				pr_debug("e_FM_PCD_CC: ccnode handle %p\n", (void *)ccParams->h_CcNode);
+			}
+			break;
+    		case e_FM_PCD_PLCR:
+			{
+        			t_FmPcdCcNextPlcrParams *plcrParams;     /**< Parameters in case next engine is PLCR */
+				plcrParams = &nexteng->params.plcrParams;
+				pr_debug("e_FM_PCD_PLCR: overrideParams %d, sharedProfile %d, newRelativeProfileId %d, newfqid %x(%d) "
+					"storageid %d\n",
+       		                        plcrParams->overrideParams,
+       		                        plcrParams->sharedProfile,
+                                	plcrParams->newRelativeProfileId,
+                                	plcrParams->newFqid,
+                                	plcrParams->newFqid,
+                                	plcrParams->newRelativeStorageProfileId);
+			}
+			break;
+    		case e_FM_PCD_PRS:
+			pr_debug("e_FM_PCD_PRS\n");
+			break;
+#if (DPAA_VERSION >= 11)
+		case e_FM_PCD_FR:
+			{
+        			t_FmPcdCcNextFrParams *frParams;       /**< Parameters in case next engine is FR */
+				frParams = &nexteng->params.frParams;
+				pr_debug("e_FM_PCD_FR: frhandle handle %p\n", frParams->h_FrmReplic);
+			}
+			break;
+#endif /* (DPAA_VERSION >= 11) */
+		case e_FM_PCD_HASH:
+			pr_debug("e_FM_PCD_HASH\n");
+			break;
+		default:
+			pr_debug("next engine %d\n", nexteng->nextEngine);
+	}
     }
-
     FmPcdIncNetEnvOwners(h_FmPcd, p_FmPcdCcTree->netEnvId);
     p_CcTreeTmp = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
 
-    if (!FmPcdLockTryLockAll(p_FmPcd))
-    {
-        FM_PCD_CcRootDelete(p_FmPcdCcTree);
-        XX_Free(p_Params);
-        DBG(TRACE, ("FmPcdLockTryLockAll failed"));
-        return NULL;
-    }
-
-    for (i = 0; i < numOfEntries; i++)
-    {
-        if (p_FmPcdCcTree->keyAndNextEngineParams[i].requiredAction)
-        {
-            err = SetRequiredAction(
-                    h_FmPcd,
-                    p_FmPcdCcTree->keyAndNextEngineParams[i].requiredAction,
-                    &p_FmPcdCcTree->keyAndNextEngineParams[i], p_CcTreeTmp, 1,
-                    p_FmPcdCcTree);
-            if (err)
-            {
-                FmPcdLockUnlockAll(p_FmPcd);
-                FM_PCD_CcRootDelete(p_FmPcdCcTree);
-                XX_Free(p_Params);
-                REPORT_ERROR(MAJOR, E_NO_MEMORY, ("No memory"));
-                return NULL;
-            }
-            p_CcTreeTmp = PTR_MOVE(p_CcTreeTmp, FM_PCD_CC_AD_ENTRY_SIZE);
-        }
-    }
-
-    FmPcdLockUnlockAll(p_FmPcd);
     p_FmPcdCcTree->p_Lock = FmPcdAcquireLock(p_FmPcd);
     if (!p_FmPcdCcTree->p_Lock)
     {
@@ -6217,35 +5976,29 @@ t_Error FM_PCD_CcRootDelete(t_Handle h_CcTree)
     p_FmPcd = (t_FmPcd *)p_CcTree->h_FmPcd;
     SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
 
-    FmPcdDecNetEnvOwners(p_FmPcd, p_CcTree->netEnvId);
-
     if (p_CcTree->owners)
         RETURN_ERROR(
                 MAJOR,
                 E_INVALID_SELECTION,
                 ("the tree with this ID can not be removed because this tree is occupied, first - unbind this tree"));
 
-    /* Delete ip-reassembly schemes if exist */
-    if (p_CcTree->h_IpReassemblyManip)
-    {
-        FmPcdManipDeleteIpReassmSchemes(p_CcTree->h_IpReassemblyManip);
-        FmPcdManipUpdateOwner(p_CcTree->h_IpReassemblyManip, FALSE);
-    }
-
-    /* Delete capwap-reassembly schemes if exist */
-    if (p_CcTree->h_CapwapReassemblyManip)
-    {
-        FmPcdManipDeleteCapwapReassmSchemes(p_CcTree->h_CapwapReassemblyManip);
-        FmPcdManipUpdateOwner(p_CcTree->h_CapwapReassemblyManip, FALSE);
-    }
+    FmPcdDecNetEnvOwners(p_FmPcd, p_CcTree->netEnvId);
 
     for (i = 0; i < p_CcTree->numOfEntries; i++)
     {
         if (p_CcTree->keyAndNextEngineParams[i].nextEngineParams.nextEngine
                 == e_FM_PCD_CC)
-            UpdateNodeOwner(
-                    p_CcTree->keyAndNextEngineParams[i].nextEngineParams.params.ccParams.h_CcNode,
-                    FALSE);
+        {
+            struct en_exthash_info *info = p_CcTree->keyAndNextEngineParams[i].
+                    nextEngineParams.params.ccParams.h_CcNode;
+
+            /* ASK root entries hold external tables, not t_FmPcdCcNode. */
+            ASSERT_COND(info->tree_owners);
+            info->tree_owners--;
+            if (info->h_Ad == PTR_MOVE(UINT_TO_PTR(p_CcTree->ccTreeBaseAddr),
+                                      i * FM_PCD_CC_AD_ENTRY_SIZE))
+                info->h_Ad = NULL;
+        }
 
         if (p_CcTree->keyAndNextEngineParams[i].nextEngineParams.h_Manip)
             FmPcdManipUpdateOwner(
@@ -6272,31 +6025,8 @@ t_Error FM_PCD_CcRootModifyNextEngine(
         t_Handle h_CcTree, uint8_t grpId, uint8_t index,
         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
 {
-    t_FmPcd *p_FmPcd;
-    t_FmPcdCcTree *p_CcTree = (t_FmPcdCcTree *)h_CcTree;
-    t_Error err = E_OK;
-
-    SANITY_CHECK_RETURN_ERROR(p_FmPcdCcNextEngineParams, E_NULL_POINTER);
-    SANITY_CHECK_RETURN_ERROR(p_CcTree, E_INVALID_STATE);
-    p_FmPcd = (t_FmPcd *)p_CcTree->h_FmPcd;
-    SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
-
-    if (!FmPcdLockTryLockAll(p_FmPcd))
-    {
-        DBG(TRACE, ("FmPcdLockTryLockAll failed"));
-        return ERROR_CODE(E_BUSY);
-    }
-
-    err = FmPcdCcModifyNextEngineParamTree(p_FmPcd, p_CcTree, grpId, index,
-                                           p_FmPcdCcNextEngineParams);
-    FmPcdLockUnlockAll(p_FmPcd);
-
-    if (err)
-    {
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-    }
-
-    return E_OK;
+    RETURN_ERROR(MAJOR, E_NOT_SUPPORTED,
+                 ("ASK external-hash roots cannot be modified in place"));
 }
 
 t_Handle FM_PCD_MatchTableSet(t_Handle h_FmPcd,
@@ -7030,16 +6760,6 @@ t_Error FM_PCD_MatchTableGetIndexedHashBucket(t_Handle h_CcNode,
 
 t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
 {
-    t_FmPcdCcNode *p_CcNodeHashTbl;
-    t_FmPcdCcNodeParams *p_IndxHashCcNodeParam, *p_ExactMatchCcNodeParam;
-    t_FmPcdCcNode *p_CcNode;
-    t_Handle h_MissStatsCounters = NULL;
-    t_FmPcdCcKeyParams *p_HashKeyParams;
-    int i;
-    uint16_t numOfSets, numOfWays, countMask, onesCount = 0;
-    bool statsEnForMiss = FALSE;
-    t_Error err;
-
     SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
     SANITY_CHECK_RETURN_VALUE(p_Param, E_NULL_POINTER, NULL);
 
@@ -7069,399 +6789,13 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
         return NULL;
     }
 
-    p_ExactMatchCcNodeParam = (t_FmPcdCcNodeParams*)XX_Malloc(
-            sizeof(t_FmPcdCcNodeParams));
-    if (!p_ExactMatchCcNodeParam)
-    {
-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("p_ExactMatchCcNodeParam"));
-        return NULL;
-    }
-    memset(p_ExactMatchCcNodeParam, 0, sizeof(t_FmPcdCcNodeParams));
-
-    p_IndxHashCcNodeParam = (t_FmPcdCcNodeParams*)XX_Malloc(
-            sizeof(t_FmPcdCcNodeParams));
-    if (!p_IndxHashCcNodeParam)
-    {
-        XX_Free(p_ExactMatchCcNodeParam);
-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("p_IndxHashCcNodeParam"));
-        return NULL;
-    }
-    memset(p_IndxHashCcNodeParam, 0, sizeof(t_FmPcdCcNodeParams));
-
-    /* Calculate number of sets and number of ways of the hash table */
-    countMask = (uint16_t)(p_Param->hashResMask >> 4);
-    while (countMask)
-    {
-        onesCount++;
-        countMask = (uint16_t)(countMask >> 1);
-    }
-
-    numOfSets = (uint16_t)(1 << onesCount);
-    numOfWays = (uint16_t)DIV_CEIL(p_Param->maxNumOfKeys, numOfSets);
-
-    if (p_Param->maxNumOfKeys % numOfSets)
-        DBG(INFO, ("'maxNumOfKeys' is not a multiple of hash number of ways, so number of ways will be rounded up"));
-
-    if ((p_Param->statisticsMode == e_FM_PCD_CC_STATS_MODE_FRAME)
-            || (p_Param->statisticsMode == e_FM_PCD_CC_STATS_MODE_BYTE_AND_FRAME))
-    {
-        /* Allocating a statistics counters table that will be used by all
-         'miss' entries of the hash table */
-        h_MissStatsCounters = (t_Handle)FM_MURAM_AllocMem(
-                FmPcdGetMuramHandle(h_FmPcd), 2 * FM_PCD_CC_STATS_COUNTER_SIZE,
-                FM_PCD_CC_AD_TABLE_ALIGN);
-        if (!h_MissStatsCounters)
-        {
-            REPORT_ERROR(MAJOR, E_NO_MEMORY, ("MURAM allocation for statistics table for hash miss"));
-            XX_Free(p_IndxHashCcNodeParam);
-            XX_Free(p_ExactMatchCcNodeParam);
-            return NULL;
-        }
-        memset(h_MissStatsCounters, 0, (2 * FM_PCD_CC_STATS_COUNTER_SIZE));
-
-        /* Always enable statistics for 'miss', so that a statistics AD will be
-         initialized from the start. We'll store the requested 'statistics enable'
-         value and it will be used when statistics are read by the user. */
-        statsEnForMiss = p_Param->ccNextEngineParamsForMiss.statisticsEn;
-        p_Param->ccNextEngineParamsForMiss.statisticsEn = TRUE;
-    }
-
-    /* Building exact-match node params, will be used to create the hash buckets */
-    p_ExactMatchCcNodeParam->extractCcParams.type = e_FM_PCD_EXTRACT_NON_HDR;
-
-    p_ExactMatchCcNodeParam->extractCcParams.extractNonHdr.src =
-            e_FM_PCD_EXTRACT_FROM_KEY;
-    p_ExactMatchCcNodeParam->extractCcParams.extractNonHdr.action =
-            e_FM_PCD_ACTION_EXACT_MATCH;
-    p_ExactMatchCcNodeParam->extractCcParams.extractNonHdr.offset = 0;
-    p_ExactMatchCcNodeParam->extractCcParams.extractNonHdr.size =
-            p_Param->matchKeySize;
-
-    p_ExactMatchCcNodeParam->keysParams.maxNumOfKeys = numOfWays;
-    p_ExactMatchCcNodeParam->keysParams.maskSupport = FALSE;
-    p_ExactMatchCcNodeParam->keysParams.statisticsMode =
-            p_Param->statisticsMode;
-    p_ExactMatchCcNodeParam->keysParams.numOfKeys = 0;
-    p_ExactMatchCcNodeParam->keysParams.keySize = p_Param->matchKeySize;
-    p_ExactMatchCcNodeParam->keysParams.ccNextEngineParamsForMiss =
-            p_Param->ccNextEngineParamsForMiss;
-
-    p_HashKeyParams = p_IndxHashCcNodeParam->keysParams.keyParams;
-
-    for (i = 0; i < numOfSets; i++)
-    {
-        /* Each exact-match node will be marked as a 'bucket' and provided with
-           a pointer to statistics counters, to be used for 'miss' entry
-           statistics */
-        p_CcNode = (t_FmPcdCcNode *)XX_Malloc(sizeof(t_FmPcdCcNode));
-        if (!p_CcNode)
-            break;
-        memset(p_CcNode, 0, sizeof(t_FmPcdCcNode));
-
-        p_CcNode->isHashBucket = TRUE;
-        p_CcNode->h_MissStatsCounters = h_MissStatsCounters;
-
-        err = MatchTableSet(h_FmPcd, p_CcNode, p_ExactMatchCcNodeParam);
-        if (err)
-            break;
-
-        p_HashKeyParams[i].ccNextEngineParams.nextEngine = e_FM_PCD_CC;
-        p_HashKeyParams[i].ccNextEngineParams.statisticsEn = FALSE;
-        p_HashKeyParams[i].ccNextEngineParams.params.ccParams.h_CcNode =
-                p_CcNode;
-    }
-
-    if (i < numOfSets)
-    {
-        for (i = i - 1; i >= 0; i--)
-            FM_PCD_MatchTableDelete(
-                    p_HashKeyParams[i].ccNextEngineParams.params.ccParams.h_CcNode);
-
-        FM_MURAM_FreeMem(FmPcdGetMuramHandle(h_FmPcd), h_MissStatsCounters);
-
-        REPORT_ERROR(MAJOR, E_NULL_POINTER, NO_MSG);
-        XX_Free(p_IndxHashCcNodeParam);
-        XX_Free(p_ExactMatchCcNodeParam);
-        return NULL;
-    }
-
-    /* Creating indexed-hash CC node */
-    p_IndxHashCcNodeParam->extractCcParams.type = e_FM_PCD_EXTRACT_NON_HDR;
-    p_IndxHashCcNodeParam->extractCcParams.extractNonHdr.src =
-            e_FM_PCD_EXTRACT_FROM_HASH;
-    p_IndxHashCcNodeParam->extractCcParams.extractNonHdr.action =
-            e_FM_PCD_ACTION_INDEXED_LOOKUP;
-    p_IndxHashCcNodeParam->extractCcParams.extractNonHdr.icIndxMask =
-            p_Param->hashResMask;
-    p_IndxHashCcNodeParam->extractCcParams.extractNonHdr.offset =
-            p_Param->hashShift;
-    p_IndxHashCcNodeParam->extractCcParams.extractNonHdr.size = 2;
-
-    p_IndxHashCcNodeParam->keysParams.maxNumOfKeys = numOfSets;
-    p_IndxHashCcNodeParam->keysParams.maskSupport = FALSE;
-    p_IndxHashCcNodeParam->keysParams.statisticsMode =
-            e_FM_PCD_CC_STATS_MODE_NONE;
-    /* Number of keys of this node is number of sets of the hash */
-    p_IndxHashCcNodeParam->keysParams.numOfKeys = numOfSets;
-    p_IndxHashCcNodeParam->keysParams.keySize = 2;
-
-    p_CcNodeHashTbl = FM_PCD_MatchTableSet(h_FmPcd, p_IndxHashCcNodeParam);
-
-    if (p_CcNodeHashTbl)
-    {
-        p_CcNodeHashTbl->kgHashShift = p_Param->kgHashShift;
-
-        /* Storing the allocated counters for buckets 'miss' in the hash table
-         and if statistics for miss were enabled. */
-        p_CcNodeHashTbl->h_MissStatsCounters = h_MissStatsCounters;
-        p_CcNodeHashTbl->statsEnForMiss = statsEnForMiss;
-    }
-
-    XX_Free(p_IndxHashCcNodeParam);
-    XX_Free(p_ExactMatchCcNodeParam);
-
-    return p_CcNodeHashTbl;
-}
-
-t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl)
-{
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_Handle h_FmPcd;
-    t_Handle *p_HashBuckets, h_MissStatsCounters;
-    uint16_t i, numOfBuckets;
-    t_Error err;
-
-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-
-    /* Store all hash buckets before the hash is freed */
-    numOfBuckets = p_HashTbl->numOfKeys;
-
-    p_HashBuckets = (t_Handle *)XX_Malloc(numOfBuckets * sizeof(t_Handle));
-    if (!p_HashBuckets)
-        RETURN_ERROR(MAJOR, E_NO_MEMORY, NO_MSG);
-
-    for (i = 0; i < numOfBuckets; i++)
-        p_HashBuckets[i] =
-                p_HashTbl->keyAndNextEngineParams[i].nextEngineParams.params.ccParams.h_CcNode;
-
-    h_FmPcd = p_HashTbl->h_FmPcd;
-    h_MissStatsCounters = p_HashTbl->h_MissStatsCounters;
-
-    /* Free the hash */
-    err = FM_PCD_MatchTableDelete(p_HashTbl);
-
-    /* Free each hash bucket */
-    for (i = 0; i < numOfBuckets; i++)
-        err |= FM_PCD_MatchTableDelete(p_HashBuckets[i]);
-
-    XX_Free(p_HashBuckets);
-
-    /* Free statistics counters for 'miss', if these were allocated */
-    if (h_MissStatsCounters)
-        FM_MURAM_FreeMem(FmPcdGetMuramHandle(h_FmPcd), h_MissStatsCounters);
-
-    if (err)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    return E_OK;
-}
-
-t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
-                               t_FmPcdCcKeyParams *p_KeyParams)
-{
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_Handle h_HashBucket;
-    uint8_t bucketIndex;
-    uint16_t lastIndex;
-    t_Error err;
-
-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_KeyParams, E_NULL_POINTER);
-    SANITY_CHECK_RETURN_ERROR(p_KeyParams->p_Key, E_NULL_POINTER);
-
-    if (p_KeyParams->p_Mask)
-        RETURN_ERROR(MAJOR, E_INVALID_VALUE,
-                     ("Keys masks not supported for hash table"));
-
-    err = FM_PCD_MatchTableGetIndexedHashBucket(p_HashTbl, keySize,
-                                                p_KeyParams->p_Key,
-                                                p_HashTbl->kgHashShift,
-                                                &h_HashBucket, &bucketIndex,
-                                                &lastIndex);
-    if (err)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    return FM_PCD_MatchTableAddKey(h_HashBucket, FM_PCD_LAST_KEY_INDEX, keySize,
-                                   p_KeyParams);
-}
-
-t_Error FM_PCD_HashTableRemoveKey(t_Handle h_HashTbl, uint8_t keySize,
-                                  uint8_t *p_Key)
-{
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_Handle h_HashBucket;
-    uint8_t bucketIndex;
-    uint16_t lastIndex;
-    t_Error err;
-
-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_Key, E_NULL_POINTER);
-
-    err = FM_PCD_MatchTableGetIndexedHashBucket(p_HashTbl, keySize, p_Key,
-                                                p_HashTbl->kgHashShift,
-                                                &h_HashBucket, &bucketIndex,
-                                                &lastIndex);
-    if (err)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    return FM_PCD_MatchTableFindNRemoveKey(h_HashBucket, keySize, p_Key, NULL);
-}
-
-t_Error FM_PCD_HashTableModifyNextEngine(
-        t_Handle h_HashTbl, uint8_t keySize, uint8_t *p_Key,
-        t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
-{
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_Handle h_HashBucket;
-    uint8_t bucketIndex;
-    uint16_t lastIndex;
-    t_Error err;
-
-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_Key, E_NULL_POINTER);
-    SANITY_CHECK_RETURN_ERROR(p_FmPcdCcNextEngineParams, E_NULL_POINTER);
-
-    err = FM_PCD_MatchTableGetIndexedHashBucket(p_HashTbl, keySize, p_Key,
-                                                p_HashTbl->kgHashShift,
-                                                &h_HashBucket, &bucketIndex,
-                                                &lastIndex);
-    if (err)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    return FM_PCD_MatchTableFindNModifyNextEngine(h_HashBucket, keySize, p_Key,
-                                                  NULL,
-                                                  p_FmPcdCcNextEngineParams);
+    return ExternalHashTableSet(h_FmPcd, p_Param);
 }
 
 t_Error FM_PCD_HashTableModifyMissNextEngine(
         t_Handle h_HashTbl,
         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
 {
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_Handle h_HashBucket;
-    uint8_t i;
-    bool nullifyMissStats = FALSE;
-    t_Error err;
-
-    SANITY_CHECK_RETURN_ERROR(h_HashTbl, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_FmPcdCcNextEngineParams, E_NULL_POINTER);
-
-    if ((!p_HashTbl->h_MissStatsCounters)
-            && (p_FmPcdCcNextEngineParams->statisticsEn))
-        RETURN_ERROR(
-                MAJOR,
-                E_CONFLICT,
-                ("Statistics are requested for a key, but statistics mode was set"
-                "to 'NONE' upon initialization"));
-
-    if (p_HashTbl->h_MissStatsCounters)
-    {
-        if ((!p_HashTbl->statsEnForMiss)
-                && (p_FmPcdCcNextEngineParams->statisticsEn))
-            nullifyMissStats = TRUE;
-
-        if ((p_HashTbl->statsEnForMiss)
-                && (!p_FmPcdCcNextEngineParams->statisticsEn))
-        {
-            p_HashTbl->statsEnForMiss = FALSE;
-            p_FmPcdCcNextEngineParams->statisticsEn = TRUE;
-        }
-    }
-
-    for (i = 0; i < p_HashTbl->numOfKeys; i++)
-    {
-        h_HashBucket =
-                p_HashTbl->keyAndNextEngineParams[i].nextEngineParams.params.ccParams.h_CcNode;
-
-        err = FM_PCD_MatchTableModifyMissNextEngine(h_HashBucket,
-                                                    p_FmPcdCcNextEngineParams);
-        if (err)
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-    }
-
-    if (nullifyMissStats)
-    {
-        memset(p_HashTbl->h_MissStatsCounters, 0,
-               (2 * FM_PCD_CC_STATS_COUNTER_SIZE));
-        memset(p_HashTbl->h_MissStatsCounters, 0,
-               (2 * FM_PCD_CC_STATS_COUNTER_SIZE));
-        p_HashTbl->statsEnForMiss = TRUE;
-    }
-
-    return E_OK;
+    return ExternalHashTableModifyMissNextEngine(h_HashTbl, p_FmPcdCcNextEngineParams);
 }
 
-
-t_Error FM_PCD_HashTableGetMissNextEngine(
-        t_Handle h_HashTbl,
-        t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
-{
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_FmPcdCcNode *p_HashBucket;
-
-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-
-    /* Miss next engine of each bucket was initialized with the next engine of the hash table */
-    p_HashBucket =
-            p_HashTbl->keyAndNextEngineParams[0].nextEngineParams.params.ccParams.h_CcNode;
-
-    memcpy(p_FmPcdCcNextEngineParams,
-           &p_HashBucket->keyAndNextEngineParams[p_HashBucket->numOfKeys].nextEngineParams,
-           sizeof(t_FmPcdCcNextEngineParams));
-
-    return E_OK;
-}
-
-t_Error FM_PCD_HashTableFindNGetKeyStatistics(
-        t_Handle h_HashTbl, uint8_t keySize, uint8_t *p_Key,
-        t_FmPcdCcKeyStatistics *p_KeyStatistics)
-{
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_Handle h_HashBucket;
-    uint8_t bucketIndex;
-    uint16_t lastIndex;
-    t_Error err;
-
-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_Key, E_NULL_POINTER);
-    SANITY_CHECK_RETURN_ERROR(p_KeyStatistics, E_NULL_POINTER);
-
-    err = FM_PCD_MatchTableGetIndexedHashBucket(p_HashTbl, keySize, p_Key,
-                                                p_HashTbl->kgHashShift,
-                                                &h_HashBucket, &bucketIndex,
-                                                &lastIndex);
-    if (err)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    return FM_PCD_MatchTableFindNGetKeyStatistics(h_HashBucket, keySize, p_Key,
-                                                  NULL, p_KeyStatistics);
-}
-
-t_Error FM_PCD_HashTableGetMissStatistics(
-        t_Handle h_HashTbl, t_FmPcdCcKeyStatistics *p_MissStatistics)
-{
-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-    t_Handle h_HashBucket;
-
-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(p_MissStatistics, E_NULL_POINTER);
-
-    if (!p_HashTbl->statsEnForMiss)
-        RETURN_ERROR(MAJOR, E_INVALID_STATE,
-                     ("Statistics were not enabled for miss"));
-
-    h_HashBucket =
-            p_HashTbl->keyAndNextEngineParams[0].nextEngineParams.params.ccParams.h_CcNode;
-
-    return FM_PCD_MatchTableGetMissStatistics(h_HashBucket, p_MissStatistics);
-}

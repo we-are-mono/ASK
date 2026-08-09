@@ -1363,510 +1363,6 @@ static t_Error CreateManipActionBackToOrig(
     return E_OK;
 }
 
-t_Error FmPcdRegisterReassmPort(t_Handle h_FmPcd, t_Handle h_ReasmCommonPramTbl)
-{
-    t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
-    t_FmPcdCcReassmTimeoutParams ccReassmTimeoutParams = { 0 };
-    t_Error err = E_OK;
-    uint8_t result;
-    uint32_t bitFor1Micro, tsbs, log2num;
-
-    ASSERT_COND(p_FmPcd);
-    ASSERT_COND(h_ReasmCommonPramTbl);
-
-    bitFor1Micro = FmGetTimeStampScale(p_FmPcd->h_Fm);
-    if (bitFor1Micro == 0)
-        RETURN_ERROR(MAJOR, E_NOT_AVAILABLE, ("Timestamp scale"));
-
-    bitFor1Micro = 32 - bitFor1Micro;
-    LOG2(FM_PCD_MANIP_REASM_TIMEOUT_THREAD_THRESH, log2num);
-    tsbs = bitFor1Micro - log2num;
-
-    ccReassmTimeoutParams.iprcpt = (uint32_t)(XX_VirtToPhys(
-            h_ReasmCommonPramTbl) - p_FmPcd->physicalMuramBase);
-    ccReassmTimeoutParams.tsbs = (uint8_t)tsbs;
-    ccReassmTimeoutParams.activate = TRUE;
-    if ((err = FmHcPcdCcTimeoutReassm(p_FmPcd->h_Hc, &ccReassmTimeoutParams,
-                                      &result)) != E_OK)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    switch (result)
-    {
-        case (0):
-            return E_OK;
-        case (1):
-            RETURN_ERROR(MAJOR, E_NO_MEMORY, ("failed to allocate TNUM"));
-        case (2):
-            RETURN_ERROR(
-                    MAJOR, E_NO_MEMORY,
-                    ("failed to allocate internal buffer from the HC-Port"));
-        case (3):
-            RETURN_ERROR(MAJOR, E_INVALID_VALUE,
-                         ("'Disable Timeout Task' with invalid IPRCPT"));
-        case (4):
-            RETURN_ERROR(MAJOR, E_FULL, ("too many timeout tasks"));
-        case (5):
-            RETURN_ERROR(MAJOR, E_INVALID_SELECTION, ("invalid sub command"));
-        default:
-            RETURN_ERROR(MAJOR, E_INVALID_VALUE, NO_MSG);
-    }
-    return E_OK;
-}
-
-static t_Error CreateReassCommonTable(t_FmPcdManip *p_Manip)
-{
-    uint32_t tmpReg32 = 0, i, bitFor1Micro;
-    uint64_t tmpReg64, size;
-    t_FmPcd *p_FmPcd = (t_FmPcd *)p_Manip->h_FmPcd;
-    t_Error err = E_OK;
-
-    bitFor1Micro = FmGetTimeStampScale(p_FmPcd->h_Fm);
-    if (bitFor1Micro == 0)
-        RETURN_ERROR(MAJOR, E_NOT_AVAILABLE, ("Timestamp scale"));
-
-    /* Allocation of the Reassembly Common Parameters table. This table is located in the
-     MURAM. Its size is 64 bytes and its base address should be 8-byte aligned. */
-    p_Manip->reassmParams.p_ReassCommonTbl =
-            (t_ReassCommonTbl *)FM_MURAM_AllocMem(
-                    p_FmPcd->h_FmMuram,
-                    FM_PCD_MANIP_REASM_COMMON_PARAM_TABLE_SIZE,
-                    FM_PCD_MANIP_REASM_COMMON_PARAM_TABLE_ALIGN);
-
-    if (!p_Manip->reassmParams.p_ReassCommonTbl)
-        RETURN_ERROR(MAJOR, E_NO_MEMORY,
-                     ("MURAM alloc for Reassembly common parameters table"));
-
-    MemSet8(p_Manip->reassmParams.p_ReassCommonTbl, 0,
-               FM_PCD_MANIP_REASM_COMMON_PARAM_TABLE_SIZE);
-
-    /* Setting the TimeOut Mode.*/
-    tmpReg32 = 0;
-    if (p_Manip->reassmParams.timeOutMode
-            == e_FM_PCD_MANIP_TIME_OUT_BETWEEN_FRAMES)
-        tmpReg32 |= FM_PCD_MANIP_REASM_TIME_OUT_BETWEEN_FRAMES;
-
-    /* Setting TimeOut FQID - Frames that time out are enqueued to this FQID.
-     In order to cause TimeOut frames to be discarded, this queue should be configured accordingly*/
-    tmpReg32 |= p_Manip->reassmParams.fqidForTimeOutFrames;
-    WRITE_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->timeoutModeAndFqid,
-                 tmpReg32);
-
-    /* Calculation the size of IP Reassembly Frame Descriptor - number of frames that are allowed to be reassembled simultaneously + 129.*/
-    size = p_Manip->reassmParams.maxNumFramesInProcess + 129;
-
-    /*Allocation of IP Reassembly Frame Descriptor Indexes Pool - This pool resides in the MURAM */
-    p_Manip->reassmParams.reassFrmDescrIndxPoolTblAddr =
-            PTR_TO_UINT(FM_MURAM_AllocMem(p_FmPcd->h_FmMuram,
-                            (uint32_t)(size * 2),
-                            256));
-    if (!p_Manip->reassmParams.reassFrmDescrIndxPoolTblAddr)
-        RETURN_ERROR(
-                MAJOR, E_NO_MEMORY,
-                ("MURAM alloc for Reassembly frame descriptor indexes pool"));
-
-    MemSet8(UINT_TO_PTR(p_Manip->reassmParams.reassFrmDescrIndxPoolTblAddr),
-               0, (uint32_t)(size * 2));
-
-    /* The entries in IP Reassembly Frame Descriptor Indexes Pool contains indexes starting with 1 up to
-     the maximum number of frames that are allowed to be reassembled simultaneously + 128.
-     The last entry in this pool must contain the index zero*/
-    for (i = 0; i < (size - 1); i++)
-        WRITE_UINT16(
-                *(uint16_t *)PTR_MOVE(UINT_TO_PTR(p_Manip->reassmParams.reassFrmDescrIndxPoolTblAddr), (i<<1)),
-                (uint16_t)(i+1));
-
-    /* Sets the IP Reassembly Frame Descriptor Indexes Pool offset from MURAM */
-    tmpReg32 = (uint32_t)(XX_VirtToPhys(
-            UINT_TO_PTR(p_Manip->reassmParams.reassFrmDescrIndxPoolTblAddr))
-            - p_FmPcd->physicalMuramBase);
-    WRITE_UINT32(
-            p_Manip->reassmParams.p_ReassCommonTbl->reassFrmDescIndexPoolTblPtr,
-            tmpReg32);
-
-    /* Allocation of the Reassembly Frame Descriptors Pool - This pool resides in external memory.
-     The number of entries in this pool should be equal to the number of entries in IP Reassembly Frame Descriptor Indexes Pool.*/
-    p_Manip->reassmParams.reassFrmDescrPoolTblAddr =
-            PTR_TO_UINT(XX_MallocSmart((uint32_t)(size * 64), p_Manip->reassmParams.dataMemId, 64));
-
-    if (!p_Manip->reassmParams.reassFrmDescrPoolTblAddr)
-        RETURN_ERROR(MAJOR, E_NO_MEMORY, ("Memory allocation FAILED"));
-
-    MemSet8(UINT_TO_PTR(p_Manip->reassmParams.reassFrmDescrPoolTblAddr), 0,
-               (uint32_t)(size * 64));
-
-    /* Sets the Reassembly Frame Descriptors Pool and liodn offset*/
-    tmpReg64 = (uint64_t)(XX_VirtToPhys(
-            UINT_TO_PTR(p_Manip->reassmParams.reassFrmDescrPoolTblAddr)));
-    tmpReg64 |= ((uint64_t)(p_Manip->reassmParams.dataLiodnOffset
-            & FM_PCD_MANIP_REASM_LIODN_MASK)
-            << (uint64_t)FM_PCD_MANIP_REASM_LIODN_SHIFT);
-    tmpReg64 |= ((uint64_t)(p_Manip->reassmParams.dataLiodnOffset
-            & FM_PCD_MANIP_REASM_ELIODN_MASK)
-            << (uint64_t)FM_PCD_MANIP_REASM_ELIODN_SHIFT);
-    WRITE_UINT32(
-            p_Manip->reassmParams.p_ReassCommonTbl->liodnAndReassFrmDescPoolPtrHi,
-            (uint32_t)(tmpReg64 >> 32));
-    WRITE_UINT32(
-            p_Manip->reassmParams.p_ReassCommonTbl->reassFrmDescPoolPtrLow,
-            (uint32_t)tmpReg64);
-
-    /*Allocation of the TimeOut table - This table resides in the MURAM.
-     The number of entries in this table is identical to the number of entries in the Reassembly Frame Descriptors Pool*/
-    p_Manip->reassmParams.timeOutTblAddr =
-            PTR_TO_UINT(FM_MURAM_AllocMem(p_FmPcd->h_FmMuram, (uint32_t)(size * 8),8));
-
-    if (!p_Manip->reassmParams.timeOutTblAddr)
-        RETURN_ERROR(MAJOR, E_NO_MEMORY,
-                     ("MURAM alloc for Reassembly timeout table"));
-
-    MemSet8(UINT_TO_PTR(p_Manip->reassmParams.timeOutTblAddr), 0,
-               (uint16_t)(size * 8));
-
-    /* Sets the TimeOut table offset from MURAM */
-    tmpReg32 = (uint32_t)(XX_VirtToPhys(
-            UINT_TO_PTR(p_Manip->reassmParams.timeOutTblAddr))
-            - p_FmPcd->physicalMuramBase);
-    WRITE_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->timeOutTblPtr,
-                 tmpReg32);
-
-    /* Sets the Expiration Delay */
-    tmpReg32 = 0;
-    tmpReg32 |= (((uint32_t)(1 << bitFor1Micro))
-            * p_Manip->reassmParams.timeoutThresholdForReassmProcess);
-    WRITE_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->expirationDelay,
-                 tmpReg32);
-
-    err = FmPcdRegisterReassmPort(p_FmPcd,
-                                  p_Manip->reassmParams.p_ReassCommonTbl);
-    if (err != E_OK)
-    {
-        FM_MURAM_FreeMem(p_FmPcd->h_FmMuram,
-                         p_Manip->reassmParams.p_ReassCommonTbl);
-        RETURN_ERROR(MAJOR, err, ("port registration"));
-    }
-
-    return err;
-}
-
-static t_Error CreateReassTable(t_FmPcdManip *p_Manip, e_NetHeaderType hdr)
-{
-    t_FmPcd *p_FmPcd = p_Manip->h_FmPcd;
-    uint32_t tmpReg32, autoLearnHashTblSize;
-    uint32_t numOfWays, setSize, setSizeCode, keySize;
-    uint32_t waySize, numOfSets, numOfEntries;
-    uint64_t tmpReg64;
-    uint16_t minFragSize;
-    uint16_t maxReassemSize;
-    uintptr_t *p_AutoLearnHashTblAddr, *p_AutoLearnSetLockTblAddr;
-    t_ReassTbl **p_ReassTbl;
-
-    switch (hdr)
-    {
-        case HEADER_TYPE_IPv4:
-            p_ReassTbl = &p_Manip->reassmParams.ip.p_Ipv4ReassTbl;
-            p_AutoLearnHashTblAddr =
-                    &p_Manip->reassmParams.ip.ipv4AutoLearnHashTblAddr;
-            p_AutoLearnSetLockTblAddr =
-                    &p_Manip->reassmParams.ip.ipv4AutoLearnSetLockTblAddr;
-            minFragSize = p_Manip->reassmParams.ip.minFragSize[0];
-            maxReassemSize = 0;
-            numOfWays = p_Manip->reassmParams.ip.numOfFramesPerHashEntry[0];
-            keySize = 4 + 4 + 1 + 2; /* 3-tuple + IP-Id */
-            break;
-        case HEADER_TYPE_IPv6:
-            p_ReassTbl = &p_Manip->reassmParams.ip.p_Ipv6ReassTbl;
-            p_AutoLearnHashTblAddr =
-                    &p_Manip->reassmParams.ip.ipv6AutoLearnHashTblAddr;
-            p_AutoLearnSetLockTblAddr =
-                    &p_Manip->reassmParams.ip.ipv6AutoLearnSetLockTblAddr;
-            minFragSize = p_Manip->reassmParams.ip.minFragSize[1];
-            maxReassemSize = 0;
-            numOfWays = p_Manip->reassmParams.ip.numOfFramesPerHashEntry[1];
-            keySize = 16 + 16 + 4; /* 2-tuple + IP-Id */
-            if (numOfWays > e_FM_PCD_MANIP_SIX_WAYS_HASH)
-                RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("num of ways"));
-            break;
-        case HEADER_TYPE_CAPWAP:
-            p_ReassTbl = &p_Manip->reassmParams.capwap.p_ReassTbl;
-            p_AutoLearnHashTblAddr =
-                    &p_Manip->reassmParams.capwap.autoLearnHashTblAddr;
-            p_AutoLearnSetLockTblAddr =
-                    &p_Manip->reassmParams.capwap.autoLearnSetLockTblAddr;
-            minFragSize = 0;
-            maxReassemSize = p_Manip->reassmParams.capwap.maxRessembledsSize;
-            numOfWays = p_Manip->reassmParams.capwap.numOfFramesPerHashEntry;
-            keySize = 4;
-            break;
-        default:
-            RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("header type"));
-    }
-    keySize += 4; /* 2 bytes reserved for RFDIndex, 2 bytes reserved */
-    waySize = ROUND_UP(keySize, 8);
-
-    /* Allocates the Reassembly Parameters Table - This table is located in the MURAM.*/
-    *p_ReassTbl = (t_ReassTbl *)FM_MURAM_AllocMem(
-            p_FmPcd->h_FmMuram, FM_PCD_MANIP_REASM_TABLE_SIZE,
-            FM_PCD_MANIP_REASM_TABLE_ALIGN);
-    if (!*p_ReassTbl)
-        RETURN_ERROR( MAJOR, E_NO_MEMORY,
-                     ("MURAM alloc for Reassembly specific parameters table"));
-    memset(*p_ReassTbl, 0, sizeof(t_ReassTbl));
-
-    /* Sets the Reassembly common Parameters table offset from MURAM in the Reassembly Table descriptor*/
-    tmpReg32 = (uint32_t)(XX_VirtToPhys(p_Manip->reassmParams.p_ReassCommonTbl)
-            - p_FmPcd->physicalMuramBase);
-    WRITE_UINT32((*p_ReassTbl)->reassCommonPrmTblPtr, tmpReg32);
-
-    /* Calculate set size (set size is rounded-up to next power of 2) */
-    NEXT_POWER_OF_2(numOfWays * waySize, setSize);
-
-    /* Get set size code */
-    LOG2(setSize, setSizeCode);
-
-    /* Sets ways number and set size code */
-    WRITE_UINT16((*p_ReassTbl)->waysNumAndSetSize,
-                 (uint16_t)((numOfWays << 8) | setSizeCode));
-
-    /* It is recommended that the total number of entries in this table
-     (number of sets * number of ways) will be twice the number of frames that
-     are expected to be reassembled simultaneously.*/
-    numOfEntries = (uint32_t)(p_Manip->reassmParams.maxNumFramesInProcess * 2);
-
-    /* sets number calculation - number of entries = number of sets * number of ways */
-    numOfSets = numOfEntries / numOfWays;
-
-    /* Sets AutoLearnHashKeyMask*/
-    NEXT_POWER_OF_2(numOfSets, numOfSets);
-
-    WRITE_UINT16((*p_ReassTbl)->autoLearnHashKeyMask,
-                 (uint16_t)(numOfSets - 1));
-
-    /* Allocation of Reassembly Automatic Learning Hash Table - This table resides in external memory.
-     The size of this table is determined by the number of sets and the set size.
-     Table size = set size * number of sets
-     This table base address should be aligned to SetSize.*/
-    autoLearnHashTblSize = numOfSets * setSize;
-
-    *p_AutoLearnHashTblAddr =
-            PTR_TO_UINT(XX_MallocSmart(autoLearnHashTblSize, p_Manip->reassmParams.dataMemId, setSize));
-    if (!*p_AutoLearnHashTblAddr)
-    {
-        FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, *p_ReassTbl);
-        *p_ReassTbl = NULL;
-        RETURN_ERROR(MAJOR, E_NO_MEMORY, ("Memory allocation FAILED"));
-    }
-    MemSet8(UINT_TO_PTR(*p_AutoLearnHashTblAddr), 0, autoLearnHashTblSize);
-
-    /* Sets the Reassembly Automatic Learning Hash Table and liodn offset */
-    tmpReg64 = ((uint64_t)(p_Manip->reassmParams.dataLiodnOffset
-            & FM_PCD_MANIP_REASM_LIODN_MASK)
-            << (uint64_t)FM_PCD_MANIP_REASM_LIODN_SHIFT);
-    tmpReg64 |= ((uint64_t)(p_Manip->reassmParams.dataLiodnOffset
-            & FM_PCD_MANIP_REASM_ELIODN_MASK)
-            << (uint64_t)FM_PCD_MANIP_REASM_ELIODN_SHIFT);
-    tmpReg64 |= XX_VirtToPhys(UINT_TO_PTR(*p_AutoLearnHashTblAddr));
-    WRITE_UINT32( (*p_ReassTbl)->liodnAlAndAutoLearnHashTblPtrHi,
-                 (uint32_t)(tmpReg64 >> 32));
-    WRITE_UINT32((*p_ReassTbl)->autoLearnHashTblPtrLow, (uint32_t)tmpReg64);
-
-    /* Allocation of the Set Lock table - This table resides in external memory
-     The size of this table is (number of sets in the Reassembly Automatic Learning Hash table)*4 bytes.
-     This table resides in external memory and its base address should be 4-byte aligned */
-    *p_AutoLearnSetLockTblAddr =
-            PTR_TO_UINT(XX_MallocSmart((uint32_t)(numOfSets * 4), p_Manip->reassmParams.dataMemId, 4));
-    if (!*p_AutoLearnSetLockTblAddr)
-    {
-        FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, *p_ReassTbl);
-        *p_ReassTbl = NULL;
-        XX_FreeSmart(UINT_TO_PTR(*p_AutoLearnHashTblAddr));
-        *p_AutoLearnHashTblAddr = 0;
-        RETURN_ERROR(MAJOR, E_NO_MEMORY, ("Memory allocation FAILED"));
-    }
-    MemSet8(UINT_TO_PTR(*p_AutoLearnSetLockTblAddr), 0, (numOfSets * 4));
-
-    /* sets Set Lock table pointer and liodn offset*/
-    tmpReg64 = ((uint64_t)(p_Manip->reassmParams.dataLiodnOffset
-            & FM_PCD_MANIP_REASM_LIODN_MASK)
-            << (uint64_t)FM_PCD_MANIP_REASM_LIODN_SHIFT);
-    tmpReg64 |= ((uint64_t)(p_Manip->reassmParams.dataLiodnOffset
-            & FM_PCD_MANIP_REASM_ELIODN_MASK)
-            << (uint64_t)FM_PCD_MANIP_REASM_ELIODN_SHIFT);
-    tmpReg64 |= XX_VirtToPhys(UINT_TO_PTR(*p_AutoLearnSetLockTblAddr));
-    WRITE_UINT32( (*p_ReassTbl)->liodnSlAndAutoLearnSetLockTblPtrHi,
-                 (uint32_t)(tmpReg64 >> 32));
-    WRITE_UINT32((*p_ReassTbl)->autoLearnSetLockTblPtrLow, (uint32_t)tmpReg64);
-
-    /* Sets user's requested minimum fragment size (in Bytes) for First/Middle fragment */
-    WRITE_UINT16((*p_ReassTbl)->minFragSize, minFragSize);
-
-    WRITE_UINT16((*p_ReassTbl)->maxReassemblySize, maxReassemSize);
-
-    return E_OK;
-}
-
-static t_Error UpdateInitReasm(t_Handle h_FmPcd, t_Handle h_PcdParams,
-                               t_Handle h_FmPort, t_FmPcdManip *p_Manip,
-                               t_Handle h_Ad, bool validate)
-{
-    t_FmPortGetSetCcParams fmPortGetSetCcParams;
-    uint32_t tmpReg32;
-    t_Error err;
-    t_FmPortPcdParams *p_PcdParams = (t_FmPortPcdParams *)h_PcdParams;
-    t_FmPcdCtrlParamsPage *p_ParamsPage;
-
-    SANITY_CHECK_RETURN_ERROR(p_Manip, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(!p_Manip->frag, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(
-            (p_Manip->opcode == HMAN_OC_IP_REASSEMBLY) || (p_Manip->opcode == HMAN_OC_CAPWAP_REASSEMBLY),
-            E_INVALID_STATE);
-    SANITY_CHECK_RETURN_ERROR(h_FmPcd, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(!p_Manip->updateParams || h_PcdParams,
-                              E_INVALID_HANDLE);
-
-    UNUSED(h_Ad);
-
-    if (!p_Manip->updateParams)
-        return E_OK;
-
-    if (p_Manip->h_FmPcd != h_FmPcd)
-        RETURN_ERROR(
-                MAJOR, E_INVALID_STATE,
-                ("handler of PCD previously was initiated by different value"));
-
-    if (p_Manip->updateParams)
-    {
-        if ((!(p_Manip->updateParams
-                & (NUM_OF_TASKS | NUM_OF_EXTRA_TASKS | DISCARD_MASK)))
-                || ((p_Manip->shadowUpdateParams
-                        & (NUM_OF_TASKS | NUM_OF_EXTRA_TASKS | DISCARD_MASK))))
-            RETURN_ERROR(
-                    MAJOR, E_INVALID_STATE,
-                    ("in this stage parameters from Port has not be updated"));
-
-        fmPortGetSetCcParams.setCcParams.type = 0;
-        if (p_Manip->opcode == HMAN_OC_CAPWAP_REASSEMBLY)
-        {
-            fmPortGetSetCcParams.setCcParams.type |= UPDATE_OFP_DPTE;
-            fmPortGetSetCcParams.setCcParams.ofpDpde = 0xF;
-        }
-        fmPortGetSetCcParams.getCcParams.type = p_Manip->updateParams | FM_REV;
-        if ((err = FmPortGetSetCcParams(h_FmPort, &fmPortGetSetCcParams))
-                != E_OK)
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-        if (fmPortGetSetCcParams.getCcParams.type
-                & (NUM_OF_TASKS | NUM_OF_EXTRA_TASKS | DISCARD_MASK | FM_REV))
-            RETURN_ERROR(MAJOR, E_INVALID_STATE,
-                         ("offset of the data wasn't configured previously"));
-        if (p_Manip->updateParams
-                & (NUM_OF_TASKS | NUM_OF_EXTRA_TASKS | DISCARD_MASK))
-        {
-            t_FmPcd *p_FmPcd = (t_FmPcd *)h_FmPcd;
-            uint8_t *p_Ptr, i, totalNumOfTnums;
-
-            totalNumOfTnums =
-                    (uint8_t)(fmPortGetSetCcParams.getCcParams.numOfTasks
-                            + fmPortGetSetCcParams.getCcParams.numOfExtraTasks);
-
-            p_Manip->reassmParams.internalBufferPoolAddr =
-                    PTR_TO_UINT(FM_MURAM_AllocMem(p_FmPcd->h_FmMuram,
-                                    (uint32_t)(totalNumOfTnums * BMI_FIFO_UNITS),
-                                    BMI_FIFO_UNITS));
-            if (!p_Manip->reassmParams.internalBufferPoolAddr)
-                RETURN_ERROR(
-                        MAJOR, E_NO_MEMORY,
-                        ("MURAM alloc for Reassembly internal buffers pool"));
-            MemSet8(
-                    UINT_TO_PTR(p_Manip->reassmParams.internalBufferPoolAddr),
-                    0, (uint32_t)(totalNumOfTnums * BMI_FIFO_UNITS));
-
-            p_Manip->reassmParams.internalBufferPoolManagementIndexAddr =
-                    PTR_TO_UINT(FM_MURAM_AllocMem(p_FmPcd->h_FmMuram,
-                                    (uint32_t)(5 + totalNumOfTnums),
-                                    4));
-            if (!p_Manip->reassmParams.internalBufferPoolManagementIndexAddr)
-                RETURN_ERROR(
-                        MAJOR,
-                        E_NO_MEMORY,
-                        ("MURAM alloc for Reassembly internal buffers management"));
-
-            p_Ptr =
-                    (uint8_t*)UINT_TO_PTR(p_Manip->reassmParams.internalBufferPoolManagementIndexAddr);
-            WRITE_UINT32(
-                    *(uint32_t*)p_Ptr,
-                    (uint32_t)(XX_VirtToPhys(UINT_TO_PTR(p_Manip->reassmParams.internalBufferPoolAddr)) - p_FmPcd->physicalMuramBase));
-            for (i = 0, p_Ptr += 4; i < totalNumOfTnums; i++, p_Ptr++)
-                WRITE_UINT8(*p_Ptr, i);
-            WRITE_UINT8(*p_Ptr, 0xFF);
-
-            tmpReg32 =
-                    (4 << FM_PCD_MANIP_REASM_COMMON_INT_BUFFER_IDX_SHIFT)
-                            | ((uint32_t)(XX_VirtToPhys(
-                                    UINT_TO_PTR(p_Manip->reassmParams.internalBufferPoolManagementIndexAddr))
-                                    - p_FmPcd->physicalMuramBase));
-            WRITE_UINT32(
-                    p_Manip->reassmParams.p_ReassCommonTbl->internalBufferManagement,
-                    tmpReg32);
-
-            p_Manip->updateParams &= ~(NUM_OF_TASKS | NUM_OF_EXTRA_TASKS
-                    | DISCARD_MASK);
-            p_Manip->shadowUpdateParams |= (NUM_OF_TASKS | NUM_OF_EXTRA_TASKS
-                    | DISCARD_MASK);
-        }
-    }
-
-    if (p_Manip->opcode == HMAN_OC_CAPWAP_REASSEMBLY)
-    {
-        if (p_Manip->reassmParams.capwap.h_Scheme)
-        {
-            p_PcdParams->p_KgParams->h_Schemes[p_PcdParams->p_KgParams->numOfSchemes] =
-                    p_Manip->reassmParams.capwap.h_Scheme;
-            p_PcdParams->p_KgParams->numOfSchemes++;
-        }
-
-    }
-    else
-    {
-        if (p_Manip->reassmParams.ip.h_Ipv4Scheme)
-        {
-            p_PcdParams->p_KgParams->h_Schemes[p_PcdParams->p_KgParams->numOfSchemes] =
-                    p_Manip->reassmParams.ip.h_Ipv4Scheme;
-            p_PcdParams->p_KgParams->numOfSchemes++;
-        }
-        if (p_Manip->reassmParams.ip.h_Ipv6Scheme)
-        {
-            p_PcdParams->p_KgParams->h_Schemes[p_PcdParams->p_KgParams->numOfSchemes] =
-                    p_Manip->reassmParams.ip.h_Ipv6Scheme;
-            p_PcdParams->p_KgParams->numOfSchemes++;
-        }
-        if (fmPortGetSetCcParams.getCcParams.revInfo.majorRev >= 6)
-        {
-            if ((err = FmPortSetGprFunc(h_FmPort, e_FM_PORT_GPR_MURAM_PAGE,
-                                        (void**)&p_ParamsPage)) != E_OK)
-                RETURN_ERROR(MAJOR, err, NO_MSG);
-
-            tmpReg32 = NIA_ENG_KG;
-            if (p_Manip->reassmParams.ip.h_Ipv4Scheme)
-            {
-                tmpReg32 |= NIA_KG_DIRECT;
-                tmpReg32 |= NIA_KG_CC_EN;
-                tmpReg32 |= FmPcdKgGetSchemeId(
-                        p_Manip->reassmParams.ip.h_Ipv4Scheme);
-                WRITE_UINT32(p_ParamsPage->iprIpv4Nia, tmpReg32);
-            }
-            if (p_Manip->reassmParams.ip.h_Ipv6Scheme)
-            {
-                tmpReg32 &= ~NIA_AC_MASK;
-                tmpReg32 |= NIA_KG_DIRECT;
-                tmpReg32 |= NIA_KG_CC_EN;
-                tmpReg32 |= FmPcdKgGetSchemeId(
-                        p_Manip->reassmParams.ip.h_Ipv6Scheme);
-                WRITE_UINT32(p_ParamsPage->iprIpv6Nia, tmpReg32);
-            }
-        }
-    }
-    return E_OK;
-}
-
 static void ReleaseManipHandler(t_FmPcdManip *p_Manip, t_FmPcd *p_FmPcd)
 {
     if (p_Manip->h_Ad)
@@ -1889,64 +1385,6 @@ static void ReleaseManipHandler(t_FmPcdManip *p_Manip, t_FmPcd *p_FmPcd)
             FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, p_Manip->fragParams.p_Frag);
         }
     }
-    else
-        if (p_Manip->reassm)
-        {
-            FmPcdUnregisterReassmPort(p_FmPcd,
-                                      p_Manip->reassmParams.p_ReassCommonTbl);
-
-            if (p_Manip->reassmParams.timeOutTblAddr)
-                FM_MURAM_FreeMem(
-                        p_FmPcd->h_FmMuram,
-                        UINT_TO_PTR(p_Manip->reassmParams.timeOutTblAddr));
-            if (p_Manip->reassmParams.reassFrmDescrPoolTblAddr)
-                XX_FreeSmart(
-                        UINT_TO_PTR(p_Manip->reassmParams.reassFrmDescrPoolTblAddr));
-            if (p_Manip->reassmParams.p_ReassCommonTbl)
-                FM_MURAM_FreeMem(p_FmPcd->h_FmMuram,
-                                 p_Manip->reassmParams.p_ReassCommonTbl);
-            if (p_Manip->reassmParams.reassFrmDescrIndxPoolTblAddr)
-                FM_MURAM_FreeMem(
-                        p_FmPcd->h_FmMuram,
-                        UINT_TO_PTR(p_Manip->reassmParams.reassFrmDescrIndxPoolTblAddr));
-            if (p_Manip->reassmParams.internalBufferPoolManagementIndexAddr)
-                FM_MURAM_FreeMem(
-                        p_FmPcd->h_FmMuram,
-                        UINT_TO_PTR(p_Manip->reassmParams.internalBufferPoolManagementIndexAddr));
-            if (p_Manip->reassmParams.internalBufferPoolAddr)
-                FM_MURAM_FreeMem(
-                        p_FmPcd->h_FmMuram,
-                        UINT_TO_PTR(p_Manip->reassmParams.internalBufferPoolAddr));
-            if (p_Manip->reassmParams.hdr == HEADER_TYPE_CAPWAP)
-            {
-
-            }
-            else
-            {
-                if (p_Manip->reassmParams.ip.ipv4AutoLearnHashTblAddr)
-                    XX_FreeSmart(
-                            UINT_TO_PTR(p_Manip->reassmParams.ip.ipv4AutoLearnHashTblAddr));
-                if (p_Manip->reassmParams.ip.ipv6AutoLearnHashTblAddr)
-                    XX_FreeSmart(
-                            UINT_TO_PTR(p_Manip->reassmParams.ip.ipv6AutoLearnHashTblAddr));
-                if (p_Manip->reassmParams.ip.ipv4AutoLearnSetLockTblAddr)
-                    XX_FreeSmart(
-                            UINT_TO_PTR(p_Manip->reassmParams.ip.ipv4AutoLearnSetLockTblAddr));
-                if (p_Manip->reassmParams.ip.ipv6AutoLearnSetLockTblAddr)
-                    XX_FreeSmart(
-                            UINT_TO_PTR(p_Manip->reassmParams.ip.ipv6AutoLearnSetLockTblAddr));
-                if (p_Manip->reassmParams.ip.p_Ipv4ReassTbl)
-                    FM_MURAM_FreeMem(p_FmPcd->h_FmMuram,
-                                     p_Manip->reassmParams.ip.p_Ipv4ReassTbl);
-                if (p_Manip->reassmParams.ip.p_Ipv6ReassTbl)
-                    FM_MURAM_FreeMem(p_FmPcd->h_FmMuram,
-                                     p_Manip->reassmParams.ip.p_Ipv6ReassTbl);
-                if (p_Manip->reassmParams.ip.h_Ipv6Ad)
-                    XX_FreeSmart(p_Manip->reassmParams.ip.h_Ipv6Ad);
-                if (p_Manip->reassmParams.ip.h_Ipv4Ad)
-                    XX_FreeSmart(p_Manip->reassmParams.ip.h_Ipv4Ad);
-            }
-        }
 
     if (p_Manip->p_StatsTbl)
         FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, p_Manip->p_StatsTbl);
@@ -2151,28 +1589,7 @@ static t_Error CheckManipParamsAndSetType(t_FmPcdManip *p_Manip,
                         }
             break;
         case e_FM_PCD_MANIP_REASSEM:
-            if (p_ManipParams->h_NextManip)
-                RETURN_ERROR(MAJOR, E_NOT_SUPPORTED,
-                             ("next manip with reassembly"));
-            switch (p_ManipParams->u.reassem.hdr)
-            {
-                case (HEADER_TYPE_IPv4):
-                    p_Manip->reassmParams.hdr = HEADER_TYPE_IPv4;
-                    p_Manip->opcode = HMAN_OC_IP_REASSEMBLY;
-                    break;
-                case (HEADER_TYPE_IPv6):
-                    p_Manip->reassmParams.hdr = HEADER_TYPE_IPv6;
-                    p_Manip->opcode = HMAN_OC_IP_REASSEMBLY;
-                    break;
-                case (HEADER_TYPE_CAPWAP):
-                    p_Manip->reassmParams.hdr = HEADER_TYPE_CAPWAP;
-                    p_Manip->opcode = HMAN_OC_CAPWAP_REASSEMBLY;
-                    break;
-                default:
-                    RETURN_ERROR(MAJOR, E_NOT_SUPPORTED,
-                                 ("header for reassembly"));
-            }
-            break;
+            RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("Hardware reassembly is unsupported in Mono"));
         case e_FM_PCD_MANIP_FRAG:
             if (p_ManipParams->h_NextManip)
                 RETURN_ERROR(MAJOR, E_NOT_SUPPORTED,
@@ -2212,381 +1629,6 @@ static t_Error CheckManipParamsAndSetType(t_FmPcdManip *p_Manip,
             RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("manip type"));
     }
 
-    return E_OK;
-}
-
-static t_Error FillReassmManipParams(t_FmPcdManip *p_Manip, e_NetHeaderType hdr)
-{
-    t_AdOfTypeContLookup *p_Ad;
-    t_FmPcd *p_FmPcd = (t_FmPcd *)p_Manip->h_FmPcd;
-    uint32_t tmpReg32;
-    t_Error err = E_OK;
-
-    /* Creates the Reassembly Parameters table. It contains parameters that are specific to either the IPv4 reassembly
-     function or to the IPv6 reassembly function. If both IPv4 reassembly and IPv6 reassembly are required, then
-     two separate IP Reassembly Parameter tables are required.*/
-    if ((err = CreateReassTable(p_Manip, hdr)) != E_OK)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    /* Sets the first Ad register (ccAdBase) - Action Descriptor Type and Pointer to the Reassembly Parameters Table offset from MURAM*/
-    tmpReg32 = 0;
-    tmpReg32 |= FM_PCD_AD_CONT_LOOKUP_TYPE;
-
-    /* Gets the required Action descriptor table pointer */
-    switch (hdr)
-    {
-        case HEADER_TYPE_IPv4:
-            p_Ad = (t_AdOfTypeContLookup *)p_Manip->reassmParams.ip.h_Ipv4Ad;
-            tmpReg32 |= (uint32_t)(XX_VirtToPhys(
-                    p_Manip->reassmParams.ip.p_Ipv4ReassTbl)
-                    - (p_FmPcd->physicalMuramBase));
-            break;
-        case HEADER_TYPE_IPv6:
-            p_Ad = (t_AdOfTypeContLookup *)p_Manip->reassmParams.ip.h_Ipv6Ad;
-            tmpReg32 |= (uint32_t)(XX_VirtToPhys(
-                    p_Manip->reassmParams.ip.p_Ipv6ReassTbl)
-                    - (p_FmPcd->physicalMuramBase));
-            break;
-        case HEADER_TYPE_CAPWAP:
-            p_Ad = (t_AdOfTypeContLookup *)p_Manip->reassmParams.capwap.h_Ad;
-            tmpReg32 |= (uint32_t)(XX_VirtToPhys(
-                    p_Manip->reassmParams.capwap.p_ReassTbl)
-                    - (p_FmPcd->physicalMuramBase));
-            break;
-        default:
-            RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("header type"));
-    }
-
-    WRITE_UINT32(p_Ad->ccAdBase, tmpReg32);
-
-    /* Sets the second Ad register (matchTblPtr) - Buffer pool ID (BPID for V2) and Scatter/Gather table offset*/
-    /* mark the Scatter/Gather table offset to be set later on when the port will be known */
-    p_Manip->updateParams = (NUM_OF_TASKS | NUM_OF_EXTRA_TASKS | DISCARD_MASK);
-
-    if ((hdr == HEADER_TYPE_IPv6) || (hdr == HEADER_TYPE_IPv4))
-    {
-        if (p_Manip->reassmParams.ip.nonConsistentSpFqid != 0)
-        {
-            tmpReg32 = FM_PCD_AD_NCSPFQIDM_MASK
-                    | (uint32_t)(p_Manip->reassmParams.ip.nonConsistentSpFqid);
-            WRITE_UINT32(p_Ad->gmask, tmpReg32);
-        }
-        /* Sets the third Ad register (pcAndOffsets)- IP Reassemble Operation Code*/
-        tmpReg32 = 0;
-        tmpReg32 |= (uint32_t)HMAN_OC_IP_REASSEMBLY;
-    }
-    else
-        if (hdr == HEADER_TYPE_CAPWAP)
-        {
-            tmpReg32 = 0;
-            tmpReg32 |= (uint32_t)HMAN_OC_CAPWAP_REASSEMBLY;
-        }
-
-    WRITE_UINT32(p_Ad->pcAndOffsets, tmpReg32);
-
-    p_Manip->reassm = TRUE;
-
-    return E_OK;
-}
-
-static t_Error SetIpv4ReassmManip(t_FmPcdManip *p_Manip)
-{
-    t_FmPcd *p_FmPcd = (t_FmPcd *)p_Manip->h_FmPcd;
-
-    /* Allocation if IPv4 Action descriptor */
-    p_Manip->reassmParams.ip.h_Ipv4Ad = (t_Handle)XX_MallocSmart(
-            FM_PCD_CC_AD_ENTRY_SIZE, p_Manip->reassmParams.dataMemId,
-            FM_PCD_CC_AD_TABLE_ALIGN);
-    if (!p_Manip->reassmParams.ip.h_Ipv4Ad)
-    {
-        ReleaseManipHandler(p_Manip, p_FmPcd);
-        RETURN_ERROR(MAJOR, E_NO_MEMORY,
-                     ("Allocation of IPv4 table descriptor"));
-    }
-
-    memset(p_Manip->reassmParams.ip.h_Ipv4Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE);
-
-    /* Fill reassembly manipulation parameter in the IP Reassembly Action Descriptor */
-    return FillReassmManipParams(p_Manip, HEADER_TYPE_IPv4);
-}
-
-static t_Error SetIpv6ReassmManip(t_FmPcdManip *p_Manip)
-{
-    t_FmPcd *p_FmPcd = (t_FmPcd *)p_Manip->h_FmPcd;
-
-    /* Allocation if IPv6 Action descriptor */
-    p_Manip->reassmParams.ip.h_Ipv6Ad = (t_Handle)XX_MallocSmart(
-            FM_PCD_CC_AD_ENTRY_SIZE, p_Manip->reassmParams.dataMemId,
-            FM_PCD_CC_AD_TABLE_ALIGN);
-    if (!p_Manip->reassmParams.ip.h_Ipv6Ad)
-    {
-        ReleaseManipHandler(p_Manip, p_FmPcd);
-        RETURN_ERROR(MAJOR, E_NO_MEMORY,
-                     ("Allocation of IPv6 table descriptor"));
-    }
-
-    memset(p_Manip->reassmParams.ip.h_Ipv6Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE);
-
-    /* Fill reassembly manipulation parameter in the IP Reassembly Action Descriptor */
-    return FillReassmManipParams(p_Manip, HEADER_TYPE_IPv6);
-}
-
-static t_Error IpReassembly(t_FmPcdManipReassemParams *p_ManipReassmParams,
-                            t_FmPcdManip *p_Manip)
-{
-    uint32_t maxSetNumber = 10000;
-    t_FmPcdManipReassemIpParams reassmManipParams =
-            p_ManipReassmParams->u.ipReassem;
-    t_Error res;
-
-    SANITY_CHECK_RETURN_ERROR(p_Manip->h_FmPcd, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(((t_FmPcd *)p_Manip->h_FmPcd)->h_Hc,
-                              E_INVALID_HANDLE);
-
-    /* Check validation of user's parameter.*/
-    if ((reassmManipParams.timeoutThresholdForReassmProcess < 1000)
-            || (reassmManipParams.timeoutThresholdForReassmProcess > 8000000))
-        RETURN_ERROR(
-                MAJOR, E_INVALID_VALUE,
-                ("timeoutThresholdForReassmProcess should be 1msec - 8sec"));
-    /* It is recommended that the total number of entries in this table (number of sets * number of ways)
-     will be twice the number of frames that are expected to be reassembled simultaneously.*/
-    if (reassmManipParams.maxNumFramesInProcess
-            > (reassmManipParams.maxNumFramesInProcess * maxSetNumber / 2))
-        RETURN_ERROR(
-                MAJOR,
-                E_INVALID_VALUE,
-                ("maxNumFramesInProcess has to be less than (maximun set number * number of ways / 2)"));
-
-    if ((p_ManipReassmParams->hdr == HEADER_TYPE_IPv6)
-            && (reassmManipParams.minFragSize[1] < 256))
-        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("minFragSize[1] must be >= 256"));
-
-    /* Saves user's reassembly manipulation parameters */
-    p_Manip->reassmParams.ip.relativeSchemeId[0] =
-            reassmManipParams.relativeSchemeId[0];
-    p_Manip->reassmParams.ip.relativeSchemeId[1] =
-            reassmManipParams.relativeSchemeId[1];
-    p_Manip->reassmParams.ip.numOfFramesPerHashEntry[0] =
-            reassmManipParams.numOfFramesPerHashEntry[0];
-    p_Manip->reassmParams.ip.numOfFramesPerHashEntry[1] =
-            reassmManipParams.numOfFramesPerHashEntry[1];
-    p_Manip->reassmParams.ip.minFragSize[0] = reassmManipParams.minFragSize[0];
-    p_Manip->reassmParams.ip.minFragSize[1] = reassmManipParams.minFragSize[1];
-    p_Manip->reassmParams.maxNumFramesInProcess =
-            reassmManipParams.maxNumFramesInProcess;
-    p_Manip->reassmParams.timeOutMode = reassmManipParams.timeOutMode;
-    p_Manip->reassmParams.fqidForTimeOutFrames =
-            reassmManipParams.fqidForTimeOutFrames;
-    p_Manip->reassmParams.timeoutThresholdForReassmProcess =
-            reassmManipParams.timeoutThresholdForReassmProcess;
-    p_Manip->reassmParams.dataMemId = reassmManipParams.dataMemId;
-    p_Manip->reassmParams.dataLiodnOffset = reassmManipParams.dataLiodnOffset;
-    if (reassmManipParams.nonConsistentSpFqid != 0)
-    {
-        p_Manip->reassmParams.ip.nonConsistentSpFqid =
-                reassmManipParams.nonConsistentSpFqid;
-    }
-
-    /* Creates and initializes the IP Reassembly common parameter table */
-    CreateReassCommonTable(p_Manip);
-
-    /* Creation of IPv4 reassembly manipulation */
-    if ((p_Manip->reassmParams.hdr == HEADER_TYPE_IPv6)
-            || (p_Manip->reassmParams.hdr == HEADER_TYPE_IPv4))
-    {
-        res = SetIpv4ReassmManip(p_Manip);
-        if (res != E_OK)
-            return res;
-    }
-
-    /* Creation of IPv6 reassembly manipulation */
-    if (p_Manip->reassmParams.hdr == HEADER_TYPE_IPv6)
-    {
-        res = SetIpv6ReassmManip(p_Manip);
-        if (res != E_OK)
-            return res;
-    }
-
-    return E_OK;
-}
-
-static void setIpReassmSchemeParams(t_FmPcd* p_FmPcd,
-                                    t_FmPcdKgSchemeParams *p_Scheme,
-                                    t_Handle h_CcTree, bool ipv4,
-                                    uint8_t groupId)
-{
-    uint32_t j;
-    uint8_t res;
-
-    /* Configures scheme's network environment parameters */
-    p_Scheme->netEnvParams.numOfDistinctionUnits = 2;
-    if (ipv4)
-        res = FmPcdNetEnvGetUnitId(
-                p_FmPcd, FmPcdGetNetEnvId(p_Scheme->netEnvParams.h_NetEnv),
-                HEADER_TYPE_IPv4, FALSE, 0);
-    else
-        res = FmPcdNetEnvGetUnitId(
-                p_FmPcd, FmPcdGetNetEnvId(p_Scheme->netEnvParams.h_NetEnv),
-                HEADER_TYPE_IPv6, FALSE, 0);
-    ASSERT_COND(res != FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS);
-    p_Scheme->netEnvParams.unitIds[0] = res;
-
-    res = FmPcdNetEnvGetUnitId(
-            p_FmPcd, FmPcdGetNetEnvId(p_Scheme->netEnvParams.h_NetEnv),
-            HEADER_TYPE_USER_DEFINED_SHIM2, FALSE, 0);
-    ASSERT_COND(res != FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS);
-    p_Scheme->netEnvParams.unitIds[1] = res;
-
-    /* Configures scheme's next engine parameters*/
-    p_Scheme->nextEngine = e_FM_PCD_CC;
-    p_Scheme->kgNextEngineParams.cc.h_CcTree = h_CcTree;
-    p_Scheme->kgNextEngineParams.cc.grpId = groupId;
-    p_Scheme->useHash = TRUE;
-
-    /* Configures scheme's key*/
-    if (ipv4 == TRUE)
-    {
-        p_Scheme->keyExtractAndHashParams.numOfUsedExtracts = 4;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].type =
-                e_FM_PCD_EXTRACT_BY_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].extractByHdr.type =
-                e_FM_PCD_EXTRACT_FULL_FIELD;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].extractByHdr.hdr =
-                HEADER_TYPE_IPv4;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].extractByHdr.extractByHdrType.fullField.ipv4 =
-                NET_HEADER_FIELD_IPv4_DST_IP;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].type =
-                e_FM_PCD_EXTRACT_BY_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].extractByHdr.type =
-                e_FM_PCD_EXTRACT_FULL_FIELD;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].extractByHdr.hdr =
-                HEADER_TYPE_IPv4;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].extractByHdr.extractByHdrType.fullField.ipv4 =
-                NET_HEADER_FIELD_IPv4_SRC_IP;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].type =
-                e_FM_PCD_EXTRACT_BY_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.type =
-                e_FM_PCD_EXTRACT_FULL_FIELD;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.hdr =
-                HEADER_TYPE_IPv4;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.extractByHdrType.fullField.ipv4 =
-                NET_HEADER_FIELD_IPv4_PROTO;
-        p_Scheme->keyExtractAndHashParams.extractArray[3].type =
-                e_FM_PCD_EXTRACT_BY_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[3].extractByHdr.hdr =
-                HEADER_TYPE_IPv4;
-        p_Scheme->keyExtractAndHashParams.extractArray[3].extractByHdr.type =
-                e_FM_PCD_EXTRACT_FROM_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[3].extractByHdr.ignoreProtocolValidation =
-                FALSE;
-        p_Scheme->keyExtractAndHashParams.extractArray[3].extractByHdr.extractByHdrType.fromHdr.size =
-                2;
-        p_Scheme->keyExtractAndHashParams.extractArray[3].extractByHdr.extractByHdrType.fromHdr.offset =
-                4;
-    }
-    else /* IPv6 */
-    {
-        p_Scheme->keyExtractAndHashParams.numOfUsedExtracts = 3;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].type =
-                e_FM_PCD_EXTRACT_BY_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].extractByHdr.type =
-                e_FM_PCD_EXTRACT_FULL_FIELD;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].extractByHdr.hdr =
-                HEADER_TYPE_IPv6;
-        p_Scheme->keyExtractAndHashParams.extractArray[0].extractByHdr.extractByHdrType.fullField.ipv6 =
-                NET_HEADER_FIELD_IPv6_DST_IP;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].type =
-                e_FM_PCD_EXTRACT_BY_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].extractByHdr.type =
-                e_FM_PCD_EXTRACT_FULL_FIELD;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].extractByHdr.hdr =
-                HEADER_TYPE_IPv6;
-        p_Scheme->keyExtractAndHashParams.extractArray[1].extractByHdr.extractByHdrType.fullField.ipv6 =
-                NET_HEADER_FIELD_IPv6_SRC_IP;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].type =
-                e_FM_PCD_EXTRACT_BY_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.hdr =
-                HEADER_TYPE_USER_DEFINED_SHIM2;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.type =
-                e_FM_PCD_EXTRACT_FROM_HDR;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.extractByHdrType.fromHdr.size =
-                4;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.extractByHdrType.fromHdr.offset =
-                4;
-        p_Scheme->keyExtractAndHashParams.extractArray[2].extractByHdr.ignoreProtocolValidation =
-                TRUE;
-    }
-
-    p_Scheme->keyExtractAndHashParams.privateDflt0 = 0x01020304;
-    p_Scheme->keyExtractAndHashParams.privateDflt1 = 0x11121314;
-    p_Scheme->keyExtractAndHashParams.numOfUsedDflts =
-            FM_PCD_KG_NUM_OF_DEFAULT_GROUPS;
-    for (j = 0; j < FM_PCD_KG_NUM_OF_DEFAULT_GROUPS; j++)
-    {
-        p_Scheme->keyExtractAndHashParams.dflts[j].type =
-                (e_FmPcdKgKnownFieldsDfltTypes)j; /* all types */
-        p_Scheme->keyExtractAndHashParams.dflts[j].dfltSelect =
-                e_FM_PCD_KG_DFLT_GBL_0;
-    }
-}
-
-static t_Error IpReassemblyStats(t_FmPcdManip *p_Manip,
-                                 t_FmPcdManipReassemIpStats *p_Stats)
-{
-    ASSERT_COND(p_Manip);
-    ASSERT_COND(p_Stats);
-    ASSERT_COND(p_Manip->reassmParams.p_ReassCommonTbl);
-
-    p_Stats->timeout =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalTimeOutCounter);
-    p_Stats->rfdPoolBusy =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalRfdPoolBusyCounter);
-    p_Stats->internalBufferBusy =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalInternalBufferBusy);
-    p_Stats->externalBufferBusy =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalExternalBufferBusy);
-    p_Stats->sgFragments =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalSgFragmentCounter);
-    p_Stats->dmaSemaphoreDepletion =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalDmaSemaphoreDepletionCounter);
-    p_Stats->nonConsistentSp =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalNCSPCounter);
-
-    if (p_Manip->reassmParams.ip.p_Ipv4ReassTbl)
-    {
-        p_Stats->specificHdrStatistics[0].successfullyReassembled =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv4ReassTbl->totalSuccessfullyReasmFramesCounter);
-        p_Stats->specificHdrStatistics[0].validFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv4ReassTbl->totalValidFragmentCounter);
-        p_Stats->specificHdrStatistics[0].processedFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv4ReassTbl->totalProcessedFragCounter);
-        p_Stats->specificHdrStatistics[0].malformedFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv4ReassTbl->totalMalformdFragCounter);
-        p_Stats->specificHdrStatistics[0].autoLearnBusy =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv4ReassTbl->totalSetBusyCounter);
-        p_Stats->specificHdrStatistics[0].discardedFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv4ReassTbl->totalDiscardedFragsCounter);
-        p_Stats->specificHdrStatistics[0].moreThan16Fragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv4ReassTbl->totalMoreThan16FramesCounter);
-    }
-    if (p_Manip->reassmParams.ip.p_Ipv6ReassTbl)
-    {
-        p_Stats->specificHdrStatistics[1].successfullyReassembled =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv6ReassTbl->totalSuccessfullyReasmFramesCounter);
-        p_Stats->specificHdrStatistics[1].validFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv6ReassTbl->totalValidFragmentCounter);
-        p_Stats->specificHdrStatistics[1].processedFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv6ReassTbl->totalProcessedFragCounter);
-        p_Stats->specificHdrStatistics[1].malformedFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv6ReassTbl->totalMalformdFragCounter);
-        p_Stats->specificHdrStatistics[1].autoLearnBusy =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv6ReassTbl->totalSetBusyCounter);
-        p_Stats->specificHdrStatistics[1].discardedFragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv6ReassTbl->totalDiscardedFragsCounter);
-        p_Stats->specificHdrStatistics[1].moreThan16Fragments =
-                GET_UINT32(p_Manip->reassmParams.ip.p_Ipv6ReassTbl->totalMoreThan16FramesCounter);
-    }
     return E_OK;
 }
 
@@ -2798,113 +1840,6 @@ static t_Error IPSecManip(t_FmPcdManipParams *p_ManipParams,
     return err;
 }
 
-static t_Error SetCapwapReassmManip(t_FmPcdManip *p_Manip)
-{
-    t_FmPcd *p_FmPcd = (t_FmPcd *)p_Manip->h_FmPcd;
-
-    /* Allocation if CAPWAP Action descriptor */
-    p_Manip->reassmParams.capwap.h_Ad = (t_Handle)XX_MallocSmart(
-            FM_PCD_CC_AD_ENTRY_SIZE, p_Manip->reassmParams.dataMemId,
-            FM_PCD_CC_AD_TABLE_ALIGN);
-    if (!p_Manip->reassmParams.capwap.h_Ad)
-    {
-        ReleaseManipHandler(p_Manip, p_FmPcd);
-        RETURN_ERROR(MAJOR, E_NO_MEMORY,
-                     ("Allocation of CAPWAP table descriptor"));
-    }
-
-    memset(p_Manip->reassmParams.capwap.h_Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE);
-
-    /* Fill reassembly manipulation parameter in the Reassembly Action Descriptor */
-    return FillReassmManipParams(p_Manip, HEADER_TYPE_CAPWAP);
-}
-
-static void setCapwapReassmSchemeParams(t_FmPcd* p_FmPcd,
-                                        t_FmPcdKgSchemeParams *p_Scheme,
-                                        t_Handle h_CcTree, uint8_t groupId)
-{
-    uint8_t res;
-
-    /* Configures scheme's network environment parameters */
-    p_Scheme->netEnvParams.numOfDistinctionUnits = 1;
-    res = FmPcdNetEnvGetUnitId(
-            p_FmPcd, FmPcdGetNetEnvId(p_Scheme->netEnvParams.h_NetEnv),
-            HEADER_TYPE_USER_DEFINED_SHIM2, FALSE, 0);
-    ASSERT_COND(res != FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS);
-    p_Scheme->netEnvParams.unitIds[0] = res;
-
-    /* Configures scheme's next engine parameters*/
-    p_Scheme->nextEngine = e_FM_PCD_CC;
-    p_Scheme->kgNextEngineParams.cc.h_CcTree = h_CcTree;
-    p_Scheme->kgNextEngineParams.cc.grpId = groupId;
-    p_Scheme->useHash = TRUE;
-
-    /* Configures scheme's key*/
-    p_Scheme->keyExtractAndHashParams.numOfUsedExtracts = 2;
-    p_Scheme->keyExtractAndHashParams.extractArray[0].type =
-            e_FM_PCD_EXTRACT_NON_HDR;
-    p_Scheme->keyExtractAndHashParams.extractArray[0].extractNonHdr.src =
-            e_FM_PCD_EXTRACT_FROM_PARSE_RESULT;
-    p_Scheme->keyExtractAndHashParams.extractArray[0].extractNonHdr.action =
-            e_FM_PCD_ACTION_NONE;
-    p_Scheme->keyExtractAndHashParams.extractArray[0].extractNonHdr.offset = 20;
-    p_Scheme->keyExtractAndHashParams.extractArray[0].extractNonHdr.size = 4;
-    p_Scheme->keyExtractAndHashParams.extractArray[1].type =
-            e_FM_PCD_EXTRACT_NON_HDR;
-    p_Scheme->keyExtractAndHashParams.extractArray[1].extractNonHdr.src =
-            e_FM_PCD_EXTRACT_FROM_DFLT_VALUE;
-    p_Scheme->keyExtractAndHashParams.extractArray[1].extractNonHdr.action =
-            e_FM_PCD_ACTION_NONE;
-    p_Scheme->keyExtractAndHashParams.extractArray[1].extractNonHdr.offset = 0;
-    p_Scheme->keyExtractAndHashParams.extractArray[1].extractNonHdr.size = 1;
-
-    p_Scheme->keyExtractAndHashParams.privateDflt0 = 0x0;
-    p_Scheme->keyExtractAndHashParams.privateDflt1 = 0x0;
-    p_Scheme->keyExtractAndHashParams.numOfUsedDflts = 1;
-    p_Scheme->keyExtractAndHashParams.dflts[0].type = e_FM_PCD_KG_GENERIC_NOT_FROM_DATA;
-    p_Scheme->keyExtractAndHashParams.dflts[0].dfltSelect = e_FM_PCD_KG_DFLT_PRIVATE_0;
-}
-
-static t_Error CapwapReassemblyStats(t_FmPcdManip *p_Manip,
-                                     t_FmPcdManipReassemCapwapStats *p_Stats)
-{
-    ASSERT_COND(p_Manip);
-    ASSERT_COND(p_Stats);
-    ASSERT_COND(p_Manip->reassmParams.p_ReassCommonTbl);
-
-    p_Stats->timeout =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalTimeOutCounter);
-    p_Stats->rfdPoolBusy =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalRfdPoolBusyCounter);
-    p_Stats->internalBufferBusy =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalInternalBufferBusy);
-    p_Stats->externalBufferBusy =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalExternalBufferBusy);
-    p_Stats->sgFragments =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalSgFragmentCounter);
-    p_Stats->dmaSemaphoreDepletion =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalDmaSemaphoreDepletionCounter);
-    p_Stats->exceedMaxReassemblyFrameLen =
-            GET_UINT32(p_Manip->reassmParams.p_ReassCommonTbl->totalNCSPCounter);
-
-    p_Stats->successfullyReassembled =
-            GET_UINT32(p_Manip->reassmParams.capwap.p_ReassTbl->totalSuccessfullyReasmFramesCounter);
-    p_Stats->validFragments =
-            GET_UINT32(p_Manip->reassmParams.capwap.p_ReassTbl->totalValidFragmentCounter);
-    p_Stats->processedFragments =
-            GET_UINT32(p_Manip->reassmParams.capwap.p_ReassTbl->totalProcessedFragCounter);
-    p_Stats->malformedFragments =
-            GET_UINT32(p_Manip->reassmParams.capwap.p_ReassTbl->totalMalformdFragCounter);
-    p_Stats->autoLearnBusy =
-            GET_UINT32(p_Manip->reassmParams.capwap.p_ReassTbl->totalSetBusyCounter);
-    p_Stats->discardedFragments =
-            GET_UINT32(p_Manip->reassmParams.capwap.p_ReassTbl->totalDiscardedFragsCounter);
-    p_Stats->moreThan16Fragments =
-            GET_UINT32(p_Manip->reassmParams.capwap.p_ReassTbl->totalMoreThan16FramesCounter);
-
-    return E_OK;
-}
-
 static t_Error CapwapFragmentationStats(t_FmPcdManip *p_Manip,
 		t_FmPcdManipFragCapwapStats *p_Stats)
 {
@@ -2920,60 +1855,6 @@ static t_Error CapwapFragmentationStats(t_FmPcdManip *p_Manip,
 	p_Stats->totalFrames = GET_UINT32(p_Ad->gmask);
 
 	return E_OK;
-}
-
-static t_Error CapwapReassembly(t_FmPcdManipReassemParams *p_ManipReassmParams,
-                                t_FmPcdManip *p_Manip)
-{
-    uint32_t maxSetNumber = 10000;
-    t_FmPcdManipReassemCapwapParams reassmManipParams =
-            p_ManipReassmParams->u.capwapReassem;
-    t_Error res;
-
-    SANITY_CHECK_RETURN_ERROR(p_Manip->h_FmPcd, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(((t_FmPcd *)p_Manip->h_FmPcd)->h_Hc,
-                              E_INVALID_HANDLE);
-
-    /* Check validation of user's parameter.*/
-    if ((reassmManipParams.timeoutThresholdForReassmProcess < 1000)
-            || (reassmManipParams.timeoutThresholdForReassmProcess > 8000000))
-        RETURN_ERROR(
-                MAJOR, E_INVALID_VALUE,
-                ("timeoutThresholdForReassmProcess should be 1msec - 8sec"));
-    /* It is recommended that the total number of entries in this table (number of sets * number of ways)
-     will be twice the number of frames that are expected to be reassembled simultaneously.*/
-    if (reassmManipParams.maxNumFramesInProcess
-            > (reassmManipParams.maxNumFramesInProcess * maxSetNumber / 2))
-        RETURN_ERROR(
-                MAJOR,
-                E_INVALID_VALUE,
-                ("maxNumFramesInProcess has to be less than (maximun set number * number of ways / 2)"));
-
-    /* Saves user's reassembly manipulation parameters */
-    p_Manip->reassmParams.capwap.relativeSchemeId =
-            reassmManipParams.relativeSchemeId;
-    p_Manip->reassmParams.capwap.numOfFramesPerHashEntry =
-            reassmManipParams.numOfFramesPerHashEntry;
-    p_Manip->reassmParams.capwap.maxRessembledsSize =
-            reassmManipParams.maxReassembledFrameLength;
-    p_Manip->reassmParams.maxNumFramesInProcess =
-            reassmManipParams.maxNumFramesInProcess;
-    p_Manip->reassmParams.timeOutMode = reassmManipParams.timeOutMode;
-    p_Manip->reassmParams.fqidForTimeOutFrames =
-            reassmManipParams.fqidForTimeOutFrames;
-    p_Manip->reassmParams.timeoutThresholdForReassmProcess =
-            reassmManipParams.timeoutThresholdForReassmProcess;
-    p_Manip->reassmParams.dataMemId = reassmManipParams.dataMemId;
-    p_Manip->reassmParams.dataLiodnOffset = reassmManipParams.dataLiodnOffset;
-
-    /* Creates and initializes the Reassembly common parameter table */
-    CreateReassCommonTable(p_Manip);
-
-    res = SetCapwapReassmManip(p_Manip);
-    if (res != E_OK)
-        return res;
-
-    return E_OK;
 }
 
 static t_Error CapwapFragmentation(t_FmPcdManipFragCapwapParams *p_ManipParams,
@@ -3150,40 +2031,36 @@ static t_Handle ManipOrStatsSetNode(t_Handle h_FmPcd, t_Handle *p_Params,
         return NULL;
     }
 
-    if ((p_Manip->opcode != HMAN_OC_IP_REASSEMBLY) && (p_Manip->opcode != HMAN_OC_CAPWAP_REASSEMBLY))
+    if (p_Manip->muramAllocate)
     {
-        /* In Case of reassembly manipulation the reassembly action descriptor will
-         be defines later on */
-        if (p_Manip->muramAllocate)
+        p_Manip->h_Ad = (t_Handle)FM_MURAM_AllocMem(
+                p_FmPcd->h_FmMuram, FM_PCD_CC_AD_ENTRY_SIZE,
+                FM_PCD_CC_AD_TABLE_ALIGN);
+        if (!p_Manip->h_Ad)
         {
-            p_Manip->h_Ad = (t_Handle)FM_MURAM_AllocMem(
-                    p_FmPcd->h_FmMuram, FM_PCD_CC_AD_ENTRY_SIZE,
-                    FM_PCD_CC_AD_TABLE_ALIGN);
-            if (!p_Manip->h_Ad)
-            {
-                REPORT_ERROR(MAJOR, E_NO_MEMORY, ("MURAM alloc for Manipulation action descriptor"));
-                ReleaseManipHandler(p_Manip, p_FmPcd);
-                XX_Free(p_Manip);
-                return NULL;
-            }
-
-            MemSet8(p_Manip->h_Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE);
+            REPORT_ERROR(MAJOR, E_NO_MEMORY, ("MURAM alloc for Manipulation action descriptor"));
+            ReleaseManipHandler(p_Manip, p_FmPcd);
+            XX_Free(p_Manip);
+            return NULL;
         }
-        else
-        {
-            p_Manip->h_Ad = (t_Handle)XX_Malloc(
-                    FM_PCD_CC_AD_ENTRY_SIZE * sizeof(uint8_t));
-            if (!p_Manip->h_Ad)
-            {
-                REPORT_ERROR(MAJOR, E_NO_MEMORY, ("Allocation of Manipulation action descriptor"));
-                ReleaseManipHandler(p_Manip, p_FmPcd);
-                XX_Free(p_Manip);
-                return NULL;
-            }
 
-            memset(p_Manip->h_Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE * sizeof(uint8_t));
-        }
+        MemSet8(p_Manip->h_Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE);
     }
+    else
+    {
+        p_Manip->h_Ad = (t_Handle)XX_Malloc(
+                FM_PCD_CC_AD_ENTRY_SIZE * sizeof(uint8_t));
+        if (!p_Manip->h_Ad)
+        {
+            REPORT_ERROR(MAJOR, E_NO_MEMORY, ("Allocation of Manipulation action descriptor"));
+            ReleaseManipHandler(p_Manip, p_FmPcd);
+            XX_Free(p_Manip);
+            return NULL;
+        }
+
+        memset(p_Manip->h_Ad, 0, FM_PCD_CC_AD_ENTRY_SIZE * sizeof(uint8_t));
+    }
+
 
     p_Manip->h_FmPcd = h_FmPcd;
 
@@ -3270,10 +2147,6 @@ static t_Error FmPcdManipInitUpdate(t_Handle h_FmPcd, t_Handle h_PcdParams,
 
     switch (p_Manip->opcode)
     {
-        case (HMAN_OC_IP_REASSEMBLY):
-            err = UpdateInitReasm(h_FmPcd, h_PcdParams, h_FmPort, p_Manip, h_Ad,
-                                  validate);
-            break;
         case (HMAN_OC_IP_FRAGMENTATION):
             err = UpdateInitIpFrag(h_FmPcd, h_PcdParams, h_FmPort, p_Manip,
                                    h_Ad, validate);
@@ -3281,10 +2154,6 @@ static t_Error FmPcdManipInitUpdate(t_Handle h_FmPcd, t_Handle h_PcdParams,
         case (HMAN_OC_CAPWAP_FRAGMENTATION):
             err = UpdateInitCapwapFrag(h_FmPcd, h_PcdParams, h_FmPort, p_Manip,
                                        h_Ad, validate);
-            break;
-        case (HMAN_OC_CAPWAP_REASSEMBLY):
-            err = UpdateInitReasm(h_FmPcd, h_PcdParams, h_FmPort, p_Manip, h_Ad,
-                                  validate);
             break;
         default:
             return E_OK;
@@ -3315,6 +2184,74 @@ static t_Error FmPcdManipModifyUpdate(t_Handle h_Manip, t_Handle h_Ad,
 /*****************************************************************************/
 /*              Inter-module API routines                                    */
 /*****************************************************************************/
+void FmPcdManipGetInternaltHmTdAndNonHmAd(t_Handle h_Manip, t_Handle *p_InernalHmtd, t_Handle *p_NonHmAd)
+{
+    t_FmPcdManip *p_FirstManip, *p_Manip = (t_FmPcdManip *)h_Manip;
+
+    ASSERT_COND(h_Manip);
+    ASSERT_COND(p_InernalHmtd);
+    ASSERT_COND(p_NonHmAd);
+
+    *p_InernalHmtd = NULL;
+    *p_NonHmAd = NULL;
+ 
+    p_FirstManip = p_Manip;
+    do {
+        if ((p_Manip->type == e_FM_PCD_MANIP_HDR) && (p_Manip->dataSize)) {
+            *p_InernalHmtd = p_FirstManip->h_Ad;
+            break;
+        }
+        if (p_Manip->type != e_FM_PCD_MANIP_HDR) {
+            *p_NonHmAd = p_Manip->h_Ad;
+            break;
+        }
+        p_Manip = p_Manip->h_NextManip;
+    } while (p_Manip);
+}
+
+void FmPcdManipLocalHMGetParams(t_Handle h_Manip, t_FmPcdManipHmCcParams *p_Params, t_Handle *h_ManipIter)
+{
+    t_FmPcdManip *p_Manip;
+
+    ASSERT_COND(h_Manip);
+    ASSERT_COND(h_ManipIter);
+    ASSERT_COND(p_Params);
+
+    p_Manip = (t_FmPcdManip *)h_Manip;
+ 
+    if (p_Manip->type != e_FM_PCD_MANIP_HDR)
+    {
+        p_Params->p_Hmct = NULL;
+        p_Params->tableSize = 0;
+        *h_ManipIter = NULL;
+        return;
+    }
+ 
+    if (*h_ManipIter == NULL) {
+        /* jump to the end of the HM chain */
+        while (p_Manip->h_NextManip &&
+                (((t_FmPcdManip *)p_Manip->h_NextManip)->type == e_FM_PCD_MANIP_HDR))
+            p_Manip = p_Manip->h_NextManip;
+    } else {
+        p_Manip = *h_ManipIter;
+    }
+
+    do {
+        if (!MANIP_IS_UNIFIED(p_Manip) ||
+                MANIP_IS_UNIFIED_FIRST(p_Manip))
+        {
+            p_Params->p_Hmct = p_Manip->p_Hmct;
+            p_Params->tableSize += p_Manip->tableSize;
+            p_Params->parseAfterHm = !p_Manip->dontParseAfterManip;
+            p_Manip = p_Manip->h_PrevManip;
+            break;
+        }
+        p_Params->tableSize += p_Manip->tableSize;
+        p_Manip = p_Manip->h_PrevManip;
+    } while (p_Manip);
+
+    *h_ManipIter = p_Manip;
+}
 
 t_Error FmPcdManipUpdate(t_Handle h_FmPcd, t_Handle h_PcdParams,
                          t_Handle h_FmPort, t_Handle h_Manip, t_Handle h_Ad,
@@ -3379,8 +2316,6 @@ t_Error FmPcdManipCheckParamsForCcNextEngine(
         switch (p_Manip->opcode)
         {
             case (HMAN_OC_IP_FRAGMENTATION):
-            case (HMAN_OC_IP_REASSEMBLY):
-            case (HMAN_OC_CAPWAP_REASSEMBLY):
             case (HMAN_OC_CAPWAP_FRAGMENTATION):
                 if (p_FmPcdCcNextEngineParams->nextEngine != e_FM_PCD_DONE)
                     RETURN_ERROR(
@@ -3475,33 +2410,6 @@ void FmPcdManipUpdateAdResultForCc(
             else
                 *p_AdNewPtr = p_Manip->h_Ad;
             break;
-        case (HMAN_OC_IP_REASSEMBLY):
-            if (FmPcdManipIpReassmIsIpv6Hdr(p_Manip))
-            {
-                if (!p_Manip->reassmParams.ip.ipv6Assigned)
-                {
-                    *p_AdNewPtr = p_Manip->reassmParams.ip.h_Ipv6Ad;
-                    p_Manip->reassmParams.ip.ipv6Assigned = TRUE;
-                    FmPcdManipUpdateOwner(h_Manip, FALSE);
-                }
-                else
-                {
-                    *p_AdNewPtr = p_Manip->reassmParams.ip.h_Ipv4Ad;
-                    p_Manip->reassmParams.ip.ipv6Assigned = FALSE;
-                }
-            }
-            else
-                *p_AdNewPtr = p_Manip->reassmParams.ip.h_Ipv4Ad;
-            memcpy((uint8_t *)p_Ad, (uint8_t *)*p_AdNewPtr,
-                   sizeof(t_AdOfTypeContLookup));
-            *p_AdNewPtr = NULL;
-            break;
-        case (HMAN_OC_CAPWAP_REASSEMBLY):
-            *p_AdNewPtr = p_Manip->reassmParams.capwap.h_Ad;
-            memcpy((uint8_t *)p_Ad, (uint8_t *)*p_AdNewPtr,
-                   sizeof(t_AdOfTypeContLookup));
-            *p_AdNewPtr = NULL;
-            break;
         case (HMAN_OC):
             /* Allocate and initialize HMTD */
             *p_AdNewPtr = p_Manip->h_Ad;
@@ -3546,143 +2454,6 @@ void FmPcdManipUpdateAdContLookupForCc(t_Handle h_Manip, t_Handle p_Ad,
     }
 }
 
-t_Error FmPcdManipBuildIpReassmScheme(t_FmPcd *p_FmPcd, t_Handle h_NetEnv,
-                                      t_Handle h_CcTree, t_Handle h_Manip,
-                                      bool isIpv4, uint8_t groupId)
-{
-    t_FmPcdManip *p_Manip = (t_FmPcdManip *)h_Manip;
-    t_FmPcdKgSchemeParams *p_SchemeParams = NULL;
-    t_Handle h_Scheme;
-
-    ASSERT_COND(p_FmPcd);
-    ASSERT_COND(h_NetEnv);
-    ASSERT_COND(p_Manip);
-
-    /* scheme was already build, no need to check for IPv6 */
-    if (p_Manip->reassmParams.ip.h_Ipv4Scheme)
-        return E_OK;
-
-    if (isIpv4) {
-        h_Scheme = FmPcdKgGetSchemeHandle(p_FmPcd, p_Manip->reassmParams.ip.relativeSchemeId[0]);
-        if (h_Scheme) {
-            /* scheme was found */
-            p_Manip->reassmParams.ip.h_Ipv4Scheme = h_Scheme;
-            return E_OK;
-        }
-    } else {
-        h_Scheme = FmPcdKgGetSchemeHandle(p_FmPcd, p_Manip->reassmParams.ip.relativeSchemeId[1]);
-        if (h_Scheme) {
-            /* scheme was found */
-            p_Manip->reassmParams.ip.h_Ipv6Scheme = h_Scheme;
-            return E_OK;
-        }
-    }
-
-     p_SchemeParams = XX_Malloc(sizeof(t_FmPcdKgSchemeParams));
-    if (!p_SchemeParams)
-        RETURN_ERROR(MAJOR, E_NO_MEMORY,
-                     ("Memory allocation failed for scheme"));
-
-    /* Configures the IPv4 or IPv6 scheme*/
-    memset(p_SchemeParams, 0, sizeof(t_FmPcdKgSchemeParams));
-    p_SchemeParams->netEnvParams.h_NetEnv = h_NetEnv;
-    p_SchemeParams->id.relativeSchemeId = (uint8_t)(
-            (isIpv4 == TRUE) ? p_Manip->reassmParams.ip.relativeSchemeId[0] :
-                    p_Manip->reassmParams.ip.relativeSchemeId[1]);
-    p_SchemeParams->schemeCounter.update = TRUE;
-    p_SchemeParams->alwaysDirect = TRUE;
-    p_SchemeParams->bypassFqidGeneration = TRUE;
-
-    setIpReassmSchemeParams(p_FmPcd, p_SchemeParams, h_CcTree, isIpv4, groupId);
-
-    /* Sets the new scheme */
-    if (isIpv4)
-        p_Manip->reassmParams.ip.h_Ipv4Scheme = FM_PCD_KgSchemeSet(
-                p_FmPcd, p_SchemeParams);
-    else
-        p_Manip->reassmParams.ip.h_Ipv6Scheme = FM_PCD_KgSchemeSet(
-                p_FmPcd, p_SchemeParams);
-
-    XX_Free(p_SchemeParams);
-
-    return E_OK;
-}
-
-t_Error FmPcdManipDeleteIpReassmSchemes(t_Handle h_Manip)
-{
-    t_FmPcdManip *p_Manip = (t_FmPcdManip *)h_Manip;
-
-    ASSERT_COND(p_Manip);
-
-    if ((p_Manip->reassmParams.ip.h_Ipv4Scheme) &&
-        !FmPcdKgIsSchemeHasOwners(p_Manip->reassmParams.ip.h_Ipv4Scheme))
-        FM_PCD_KgSchemeDelete(p_Manip->reassmParams.ip.h_Ipv4Scheme);
-
-    if ((p_Manip->reassmParams.ip.h_Ipv6Scheme) &&
-        !FmPcdKgIsSchemeHasOwners(p_Manip->reassmParams.ip.h_Ipv6Scheme))
-        FM_PCD_KgSchemeDelete(p_Manip->reassmParams.ip.h_Ipv6Scheme);
-
-    return E_OK;
-}
-
-bool FmPcdManipIpReassmIsIpv6Hdr(t_Handle h_Manip)
-{
-    t_FmPcdManip *p_Manip = (t_FmPcdManip *)h_Manip;
-
-    ASSERT_COND(p_Manip);
-
-    return (p_Manip->reassmParams.hdr == HEADER_TYPE_IPv6);
-}
-
-t_Error FmPcdManipBuildCapwapReassmScheme(t_FmPcd *p_FmPcd, t_Handle h_NetEnv,
-                                          t_Handle h_CcTree, t_Handle h_Manip,
-                                          uint8_t groupId)
-{
-    t_FmPcdManip *p_Manip = (t_FmPcdManip *)h_Manip;
-    t_FmPcdKgSchemeParams *p_SchemeParams = NULL;
-
-    ASSERT_COND(p_FmPcd);
-    ASSERT_COND(h_NetEnv);
-    ASSERT_COND(p_Manip);
-
-    /* scheme was already build, no need to check for IPv6 */
-    if (p_Manip->reassmParams.capwap.h_Scheme)
-        return E_OK;
-
-    p_SchemeParams = XX_Malloc(sizeof(t_FmPcdKgSchemeParams));
-    if (!p_SchemeParams)
-        RETURN_ERROR(MAJOR, E_NO_MEMORY,
-                     ("Memory allocation failed for scheme"));
-
-    memset(p_SchemeParams, 0, sizeof(t_FmPcdKgSchemeParams));
-    p_SchemeParams->netEnvParams.h_NetEnv = h_NetEnv;
-    p_SchemeParams->id.relativeSchemeId =
-            (uint8_t)p_Manip->reassmParams.capwap.relativeSchemeId;
-    p_SchemeParams->schemeCounter.update = TRUE;
-    p_SchemeParams->bypassFqidGeneration = TRUE;
-
-    setCapwapReassmSchemeParams(p_FmPcd, p_SchemeParams, h_CcTree, groupId);
-
-    p_Manip->reassmParams.capwap.h_Scheme = FM_PCD_KgSchemeSet(p_FmPcd,
-                                                               p_SchemeParams);
-
-    XX_Free(p_SchemeParams);
-
-    return E_OK;
-}
-
-t_Error FmPcdManipDeleteCapwapReassmSchemes(t_Handle h_Manip)
-{
-    t_FmPcdManip *p_Manip = (t_FmPcdManip *)h_Manip;
-
-    ASSERT_COND(p_Manip);
-
-    if (p_Manip->reassmParams.capwap.h_Scheme)
-        FM_PCD_KgSchemeDelete(p_Manip->reassmParams.capwap.h_Scheme);
-
-    return E_OK;
-}
-
 /*********************** End of inter-module routines ************************/
 
 /****************************************/
@@ -3699,17 +2470,21 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd,
     SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
     SANITY_CHECK_RETURN_VALUE(p_ManipParams, E_INVALID_HANDLE, NULL);
 
+    if (p_ManipParams->type == e_FM_PCD_MANIP_REASSEM)
+    {
+        REPORT_ERROR(MAJOR, E_NOT_SUPPORTED, ("Hardware reassembly is unsupported in Mono"));
+        return NULL;
+    }
+
     p_Manip = ManipOrStatsSetNode(h_FmPcd, (t_Handle)p_ManipParams, FALSE);
     if (!p_Manip)
         return NULL;
 
-    if (((p_Manip->opcode == HMAN_OC_IP_REASSEMBLY)
-            || (p_Manip->opcode == HMAN_OC_IP_FRAGMENTATION)
+    if (((p_Manip->opcode == HMAN_OC_IP_FRAGMENTATION)
             || (p_Manip->opcode == HMAN_OC)
             || (p_Manip->opcode == HMAN_OC_IPSEC_MANIP)
             || (p_Manip->opcode == HMAN_OC_CAPWAP_MANIP)
             || (p_Manip->opcode == HMAN_OC_CAPWAP_FRAGMENTATION)
-            || (p_Manip->opcode == HMAN_OC_CAPWAP_REASSEMBLY)
             ) && (!FmPcdIsAdvancedOffloadSupported(p_FmPcd)))
     {
         REPORT_ERROR(MAJOR, E_INVALID_STATE, ("Advanced-offload must be enabled"));
@@ -3729,10 +2504,6 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd,
 
     switch (p_Manip->opcode)
     {
-        case (HMAN_OC_IP_REASSEMBLY):
-            /* IpReassembly */
-            err = IpReassembly(&p_ManipParams->u.reassem, p_Manip);
-            break;
         case (HMAN_OC_IP_FRAGMENTATION):
             /* IpFragmentation */
             err = IpFragmentation(&p_ManipParams->u.frag.u.ipFrag, p_Manip);
@@ -3742,10 +2513,6 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd,
             break;
         case (HMAN_OC_IPSEC_MANIP):
             err = IPSecManip(p_ManipParams, p_Manip);
-            break;
-        case (HMAN_OC_CAPWAP_REASSEMBLY):
-            /* CapwapReassembly */
-            err = CapwapReassembly(&p_ManipParams->u.reassem, p_Manip);
             break;
         case (HMAN_OC_CAPWAP_FRAGMENTATION):
             /* CapwapFragmentation */
@@ -3957,15 +2724,9 @@ t_Error FM_PCD_ManipGetStatistics(t_Handle h_ManipNode,
 
     switch (p_Manip->opcode)
     {
-        case (HMAN_OC_IP_REASSEMBLY):
-            return IpReassemblyStats(p_Manip,
-                                     &p_FmPcdManipStats->u.reassem.u.ipReassem);
         case (HMAN_OC_IP_FRAGMENTATION):
             return IpFragmentationStats(p_Manip,
                                         &p_FmPcdManipStats->u.frag.u.ipFrag);
-        case (HMAN_OC_CAPWAP_REASSEMBLY):
-            return CapwapReassemblyStats(
-                    p_Manip, &p_FmPcdManipStats->u.reassem.u.capwapReassem);
 	case (HMAN_OC_CAPWAP_FRAGMENTATION):
 		return CapwapFragmentationStats(
 			p_Manip, &p_FmPcdManipStats->u.frag.u.capwapFrag);

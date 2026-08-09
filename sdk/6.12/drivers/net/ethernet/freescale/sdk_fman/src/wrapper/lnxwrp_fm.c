@@ -42,7 +42,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/fs.h>
-#include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/irq.h>
 #include <linux/interrupt.h>
@@ -66,9 +65,8 @@
 #include "debug_ext.h"
 #include "sys_io_ext.h"
 
-#include "fm_ioctls.h"
-
 #include "lnxwrp_fm.h"
+#include "lnxwrp_fsl_fman.h"
 #include "lnxwrp_fm_port.h"
 #include "lnxwrp_resources.h"
 #include "lnxwrp_sysfs_fm.h"
@@ -1066,10 +1064,16 @@ static void FqFree(struct qman_fq *fq)
 	XX_Free((t_FmTestFq *) fq);
 }
 
-static void FreeFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+static t_Error FreeFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 {
-	if (p_LnxWrpFmDev->h_PcdDev)
-		FM_PCD_Free(p_LnxWrpFmDev->h_PcdDev);
+	t_Error err;
+
+	if (p_LnxWrpFmDev->h_PcdDev) {
+		err = FM_PCD_Free(p_LnxWrpFmDev->h_PcdDev);
+		if (err)
+			return err;
+		p_LnxWrpFmDev->h_PcdDev = NULL;
+	}
 
 	if (p_LnxWrpFmDev->hc_tx_err_fq)
 		FqFree(p_LnxWrpFmDev->hc_tx_err_fq);
@@ -1079,14 +1083,20 @@ static void FreeFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 
 	if (p_LnxWrpFmDev->hc_tx_fq)
 		FqFree(p_LnxWrpFmDev->hc_tx_fq);
+
+	return E_OK;
 }
 
-static void FreeFmDev(t_LnxWrpFmDev  *p_LnxWrpFmDev)
+static t_Error FreeFmDev(t_LnxWrpFmDev  *p_LnxWrpFmDev)
 {
-    if (!p_LnxWrpFmDev->active)
-        return;
+    t_Error err;
 
-    FreeFmPcdDev(p_LnxWrpFmDev);
+    if (!p_LnxWrpFmDev->active)
+        return E_OK;
+
+    err = FreeFmPcdDev(p_LnxWrpFmDev);
+    if (err)
+        RETURN_ERROR(MAJOR, err, ("FMan HC cleanup refused; board reset required"));
 
 #ifdef CONFIG_FSL_SDK_FMAN_RTC_API
     if (p_LnxWrpFmDev->h_RtcDev)
@@ -1118,10 +1128,8 @@ static void FreeFmDev(t_LnxWrpFmDev  *p_LnxWrpFmDev)
     }
 
     devm_free_irq(p_LnxWrpFmDev->dev, p_LnxWrpFmDev->irq, p_LnxWrpFmDev);
+    return E_OK;
 }
-
-/* FMan character device file operations */
-extern struct file_operations fm_fops;
 
 static int /*__devinit*/ fm_probe(struct platform_device *of_dev)
 {
@@ -1138,46 +1146,14 @@ static int /*__devinit*/ fm_probe(struct platform_device *of_dev)
         return -EIO;
     }
 
-    /* IOCTL ABI checking */
-    LnxWrpPCDIOCTLEnumChecking();
-    LnxWrpPCDIOCTLTypeChecking();
+    /* Port names ("fm0-port-rx6") are built from this one. */
+    Sprint (p_LnxWrpFmDev->name, "fm%d", p_LnxWrpFmDev->id);
 
-    Sprint (p_LnxWrpFmDev->name, "%s%d", DEV_FM_NAME, p_LnxWrpFmDev->id);
-
-    /* Register to the /dev for IOCTL API */
-    /* Register dynamically a new major number for the character device: */
-    if ((p_LnxWrpFmDev->major = register_chrdev(0, p_LnxWrpFmDev->name, &fm_fops)) <= 0) {
-        FreeFmDev(p_LnxWrpFmDev);
-        REPORT_ERROR(MAJOR, E_INVALID_STATE, ("Failed to allocate a major number for device \"%s\"", p_LnxWrpFmDev->name));
-        return -EIO;
-    }
-
-    /* Creating classes for FM */
-    DBG(TRACE ,("class_create fm_class"));
-    p_LnxWrpFmDev->fm_class = class_create(p_LnxWrpFmDev->name);
-    if (IS_ERR(p_LnxWrpFmDev->fm_class)) {
-        unregister_chrdev(p_LnxWrpFmDev->major, p_LnxWrpFmDev->name);
-        FreeFmDev(p_LnxWrpFmDev);
-        REPORT_ERROR(MAJOR, E_INVALID_STATE, ("class_create error fm_class"));
-        return -EIO;
-    }
-
-    device_create(p_LnxWrpFmDev->fm_class, NULL, MKDEV(p_LnxWrpFmDev->major, DEV_FM_MINOR_BASE), NULL,
-                  "fm%d", p_LnxWrpFmDev->id);
-    device_create(p_LnxWrpFmDev->fm_class, NULL, MKDEV(p_LnxWrpFmDev->major, DEV_FM_PCD_MINOR_BASE), NULL,
-                  "fm%d-pcd", p_LnxWrpFmDev->id);
     dev_set_drvdata(p_LnxWrpFmDev->dev, p_LnxWrpFmDev);
 
    /* create sysfs entries for stats and regs */
     if ( fm_sysfs_create(p_LnxWrpFmDev->dev) !=0 )
     {
-		device_destroy(p_LnxWrpFmDev->fm_class,
-			       MKDEV(p_LnxWrpFmDev->major, DEV_FM_MINOR_BASE));
-		device_destroy(p_LnxWrpFmDev->fm_class,
-			       MKDEV(p_LnxWrpFmDev->major,
-				     DEV_FM_PCD_MINOR_BASE));
-		class_destroy(p_LnxWrpFmDev->fm_class);
-		unregister_chrdev(p_LnxWrpFmDev->major, p_LnxWrpFmDev->name);
         FreeFmDev(p_LnxWrpFmDev);
         REPORT_ERROR(MAJOR, E_INVALID_STATE, ("Unable to create sysfs entry - fm!!!"));
         return -EIO;
@@ -1202,15 +1178,8 @@ static void fm_remove(struct platform_device *of_dev)
 
     fm_sysfs_destroy(dev);
 
-    DBG(TRACE, ("destroy fm_class"));
-    device_destroy(p_LnxWrpFmDev->fm_class, MKDEV(p_LnxWrpFmDev->major, DEV_FM_MINOR_BASE));
-    device_destroy(p_LnxWrpFmDev->fm_class, MKDEV(p_LnxWrpFmDev->major, DEV_FM_PCD_MINOR_BASE));
-    class_destroy(p_LnxWrpFmDev->fm_class);
-
-    /* Destroy chardev */
-    unregister_chrdev(p_LnxWrpFmDev->major, p_LnxWrpFmDev->name);
-
-    FreeFmDev(p_LnxWrpFmDev);
+    if (FreeFmDev(p_LnxWrpFmDev) != E_OK)
+        return;
 
     DestroyFmDev(p_LnxWrpFmDev);
 
@@ -1232,6 +1201,9 @@ static struct platform_driver fm_driver = {
         .name           = "fsl-fman",
         .of_match_table    = fm_match,
         .owner          = THIS_MODULE,
+        /* Built-in FMan has no DMA drain/reset path for a timed-out HC.
+         * A void remove cannot veto devres cleanup: require a board reset. */
+        .suppress_bind_attrs = true,
     },
     .probe          = fm_probe,
     .remove         = fm_remove
@@ -1287,6 +1259,26 @@ void * fm_get_handle(struct fm *fm)
 }
 EXPORT_SYMBOL(fm_get_handle);
 
+int fm_get_fw_rev(struct fm *fm, u16 *package, u8 *major, u8 *minor)
+{
+    t_LnxWrpFmDev               *p_LnxWrpFmDev = (t_LnxWrpFmDev*)fm;
+    t_FmCtrlCodeRevisionInfo    rv;
+    t_Error                     err;
+
+    if (!p_LnxWrpFmDev || !p_LnxWrpFmDev->active || !p_LnxWrpFmDev->h_Dev)
+        return -ENODEV;
+
+    err = FM_GetFmanCtrlCodeRevision((t_Handle)p_LnxWrpFmDev->h_Dev, &rv);
+    if (err != E_OK)
+        return -EIO;
+
+    if (package) *package = rv.packageRev;
+    if (major)   *major   = rv.majorRev;
+    if (minor)   *minor   = rv.minorRev;
+    return 0;
+}
+EXPORT_SYMBOL(fm_get_fw_rev);
+
 #ifdef CONFIG_FSL_SDK_FMAN_RTC_API
 void * fm_get_rtc_handle(struct fm *fm)
 {
@@ -1318,6 +1310,15 @@ void *fm_port_get_handle(const struct fm_port *port)
     return (void *)p_LnxWrpFmPortDev->h_Dev;
 }
 EXPORT_SYMBOL(fm_port_get_handle);
+
+int fm_port_get_hwid(const struct fm_port *port)
+{
+	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev*)port;
+	return(FmPortGetHardwarePortId(p_LnxWrpFmPortDev->h_Dev));
+
+}
+EXPORT_SYMBOL(fm_port_get_hwid);
+
 
 u64 *fm_port_get_buffer_time_stamp(const struct fm_port *port,
 		const void *data)
@@ -1379,12 +1380,14 @@ uint16_t fm_get_tx_port_channel(struct fm_port *port)
 }
 EXPORT_SYMBOL(fm_get_tx_port_channel);
 
+/* Both answer in negative errnos, as their netdev callers test them: the
+ * SDK's error type is a positive errno value (E_BUSY from a fenced port). */
 int fm_port_enable (struct fm_port *port)
 {
     t_LnxWrpFmPortDev   *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev*)port;
     t_Error err = FM_PORT_Enable(p_LnxWrpFmPortDev->h_Dev);
 
-    return GET_ERROR_TYPE(err);
+    return -GET_ERROR_TYPE(err);
 }
 EXPORT_SYMBOL(fm_port_enable);
 
@@ -1393,15 +1396,17 @@ int fm_port_disable(struct fm_port *port)
     t_LnxWrpFmPortDev   *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev*)port;
     t_Error err = FM_PORT_Disable(p_LnxWrpFmPortDev->h_Dev);
 
-    return GET_ERROR_TYPE(err);
+    return -GET_ERROR_TYPE(err);
 }
 EXPORT_SYMBOL(fm_port_disable);
 
+/* These three answer in negative errnos too: ndo_set_features and the PM
+ * core read nothing else as a failure. */
 int fm_port_enable_rx_l4csum(struct fm_port *port, bool enable)
 {
 	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev *)port;
 
-	return FM_PORT_SetRxL4ChecksumVerify(p_LnxWrpFmPortDev->h_Dev, enable);
+	return -GET_ERROR_TYPE(FM_PORT_SetRxL4ChecksumVerify(p_LnxWrpFmPortDev->h_Dev, enable));
 }
 EXPORT_SYMBOL(fm_port_enable_rx_l4csum);
 
@@ -1409,7 +1414,7 @@ int fm_port_suspend(struct fm_port *port)
 {
 	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev *)port;
 
-	return FM_PORT_Disable(p_LnxWrpFmPortDev->h_Dev);
+	return -GET_ERROR_TYPE(FM_PORT_Disable(p_LnxWrpFmPortDev->h_Dev));
 }
 EXPORT_SYMBOL(fm_port_suspend);
 
@@ -1417,7 +1422,7 @@ int fm_port_resume(struct fm_port *port)
 {
 	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (t_LnxWrpFmPortDev *)port;
 
-	return FM_PORT_Enable(p_LnxWrpFmPortDev->h_Dev);
+	return -GET_ERROR_TYPE(FM_PORT_Enable(p_LnxWrpFmPortDev->h_Dev));
 }
 EXPORT_SYMBOL(fm_port_resume);
 
@@ -1609,6 +1614,21 @@ int fm_mac_resume(struct fm_mac_dev *fm_mac_dev)
         return _errno;
 }
 EXPORT_SYMBOL(fm_mac_resume);
+
+int fm_mac_set_allmulti(struct fm_mac_dev *fm_mac_dev,
+		bool enable)
+{
+	int	_errno;
+	t_Error	err;
+
+	err = FM_MAC_SetAllMulti(fm_mac_dev, enable);
+	_errno = -GET_ERROR_TYPE(err);
+	if (unlikely(_errno < 0))
+		pr_err("FM_MAC_SetAllMulti() = 0x%08x\n", err);
+
+	return _errno;
+}
+EXPORT_SYMBOL(fm_mac_set_allmulti);
 
 int fm_mac_set_promiscuous(struct fm_mac_dev *fm_mac_dev,
 		bool enable)
@@ -1987,11 +2007,7 @@ static int __init __cold fm_load (void)
         return -ENODEV;
     }
 
-	printk(KERN_INFO "Freescale FM module," \
-		" FMD API version %d.%d.%d\n",
-		FMD_API_VERSION_MAJOR,
-		FMD_API_VERSION_MINOR,
-		FMD_API_VERSION_RESPIN);
+	printk(KERN_INFO "Freescale FM module\n");
     return 0;
 }
 

@@ -55,6 +55,10 @@ static const char dpa_stats_percpu[][ETH_GSTRING_LEN] = {
 	"tx packets",
 	"tx recycled",
 	"tx confirm",
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) && defined(CONFIG_CPE_FAST_PATH)
+	"tx toenc",
+	"tx todec",
+#endif
 	"tx S/G",
 	"rx S/G",
 	"tx error",
@@ -385,6 +389,13 @@ static void copy_stats(struct dpa_percpu_priv_s *percpu_priv, int num_cpus,
 	data[crr_stat * num_stat_values + crr_cpu] = percpu_priv->tx_confirm;
 	data[crr_stat++ * num_stat_values + num_cpus] += percpu_priv->tx_confirm;
 
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) && defined(CONFIG_CPE_FAST_PATH)
+	data[crr_stat * num_stat_values + crr_cpu] = percpu_priv->tx_caam_enc;
+	data[crr_stat++ * num_stat_values + num_cpus] += percpu_priv->tx_caam_enc;
+
+	data[crr_stat * num_stat_values + crr_cpu] = percpu_priv->tx_caam_dec;
+	data[crr_stat++ * num_stat_values + num_cpus] += percpu_priv->tx_caam_dec;
+#endif
 	data[crr_stat * num_stat_values + crr_cpu] = percpu_priv->tx_frag_skbuffs;
 	data[crr_stat++ * num_stat_values + num_cpus] += percpu_priv->tx_frag_skbuffs;
 

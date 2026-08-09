@@ -37,6 +37,7 @@
 #include <linux/fsl_qman.h>	/* struct qman_fq */
 
 #include "fm_ext.h"
+#include "fm_ehash.h"
 #include "dpaa_eth_trace.h"
 
 extern int dpa_rx_extra_headroom;
@@ -92,7 +93,10 @@ static inline void DPA_BUG_ON(bool cond)
 /* The raw buffer size must be cacheline aligned.
  * Normally we use 2K buffers.
  */
-#define DPA_BP_RAW_SIZE		2048
+/* As 1518 byte packets are received in scatter gather buffers from DPAA, 
+and these buffers are used by WIFI which requires contiguous buffers. So
+increased buffer size from 2048 to 2176, to accomodate them in contiguous fd */
+#define DPA_BP_RAW_SIZE		2176
 #else
 /* For jumbo frame optimizations, use buffers large enough to accommodate
  * 9.6K frames, FD maximum offset, skb sh_info overhead and some extra
@@ -133,11 +137,6 @@ static inline void DPA_BUG_ON(bool cond)
  * supported frame size), set the recycling upper limit to 16K.
  */
 #define DPA_RECYCLE_MAX_SIZE	16384
-
-#if defined(CONFIG_FSL_SDK_FMAN_TEST)
-/*TODO: temporary for fman pcd testing */
-#define FMAN_PCD_TESTS_MAX_NUM_RANGES	20
-#endif
 
 #define DPAA_ETH_FQ_DELTA	0x10000
 
@@ -198,6 +197,7 @@ static inline void DPA_BUG_ON(bool cond)
 #endif
 
 #define DPAA_ETH_RX_QUEUES	128
+#define DPAA_IP_VERSION_4  4
 
 /* Convenience macros for storing/retrieving the skb back-pointers. They must
  * accommodate both recycling and confirmation paths - i.e. cases when the buf
@@ -221,13 +221,6 @@ static inline void DPA_BUG_ON(bool cond)
 #ifdef CONFIG_PM
 /* Magic Packet wakeup */
 #define DPAA_WOL_MAGIC		0x00000001
-#endif
-
-#if defined(CONFIG_FSL_SDK_FMAN_TEST)
-struct pcd_range {
-	uint32_t			 base;
-	uint32_t			 count;
-};
 #endif
 
 /* More detailed FQ types - used for fine-grained WQ assignments */
@@ -335,11 +328,15 @@ struct dpa_percpu_priv_s {
 	u64 tx_frag_skbuffs;
 	/* number of S/G frames received */
 	u64 rx_sg;
-
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) && defined(CONFIG_CPE_FAST_PATH)
+	u64 tx_caam_enc;
+	u64 tx_caam_dec;
+#endif
 	struct rtnl_link_stats64 stats;
 	struct dpa_rx_errors rx_errors;
 	struct dpa_ern_cnt ern_cnt;
 };
+
 
 struct dpa_priv_s {
 	struct dpa_percpu_priv_s	__percpu *percpu_priv;
@@ -367,12 +364,6 @@ struct dpa_priv_s {
 	uint32_t		 msg_enable;	/* net_device message level */
 #ifdef CONFIG_FSL_DPAA_1588
 	struct dpa_ptp_tsu	 *tsu;
-#endif
-
-#if defined(CONFIG_FSL_SDK_FMAN_TEST)
-/* TODO: this is temporary until pcd support is implemented in dpaa */
-	int			priv_pcd_num_ranges;
-	struct pcd_range	priv_pcd_ranges[FMAN_PCD_TESTS_MAX_NUM_RANGES];
 #endif
 
 	struct {
@@ -412,9 +403,13 @@ struct dpa_priv_s {
 	int loop_id;
 	int loop_to;
 #endif
-#ifdef CONFIG_FSL_DPAA_CEETM
+#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
 	bool ceetm_en; /* CEETM QoS enabled */
+#ifdef CONFIG_CPE_FAST_PATH
+	void *qm_ctx;  /* CEETM context */
 #endif
+#endif
+	void *ifinfo;
 };
 
 struct fm_port_fqs {
@@ -429,7 +424,7 @@ struct fm_port_fqs {
 extern struct net_device *dpa_loop_netdevs[20];
 #endif
 
-int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *count_ptr);
+int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *count_ptr, int threshold);
 void __hot _dpa_rx(struct net_device *net_dev,
 		struct qman_portal *portal,
 		const struct dpa_priv_s *priv,
@@ -665,5 +660,10 @@ static inline void _dpa_bp_free_pf(void *addr)
  */
 #define DPAA_A050385_HEADROOM	256
 #endif  /* FM_ERRATUM_A050385 */
+
+/* ASK fast-path exports (dpaa_eth_sg.c / dpaa_eth_common.c); also
+ * consumed by the out-of-tree cdx module. */
+int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs,
+			      bool act_skb);
 
 #endif	/* __DPA_H */

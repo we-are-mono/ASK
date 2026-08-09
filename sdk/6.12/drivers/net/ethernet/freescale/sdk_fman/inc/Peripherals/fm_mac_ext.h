@@ -764,6 +764,7 @@ t_Error FM_MAC_RemovelExactMatchMacAddr(t_Handle h_FmMac, t_EnetAddr *p_EnetAddr
  @Cautions      Allowed only after FM_MAC_Init().
 *//***************************************************************************/
 t_Error FM_MAC_SetPromiscuous(t_Handle h_FmMac, bool enable);
+t_Error FM_MAC_SetAllMulti(t_Handle h_FmMac, bool enable);
 
 /**************************************************************************//**
  @Function      FM_MAC_AdjustLink

@@ -58,311 +58,32 @@ void * MemSet8(void* pDst, int c, uint32_t size)
 
 void * MemCpy32(void* pDst,void* pSrc, uint32_t size)
 {
-    uint32_t leftAlign;
-    uint32_t rightAlign;
-    uint32_t lastWord;
-    uint32_t currWord;
-    uint32_t *p_Src32;
-    uint32_t *p_Dst32;
-    uint8_t  *p_Src8;
-    uint8_t  *p_Dst8;
-
-    p_Src8 = (uint8_t*)(pSrc);
-    p_Dst8 = (uint8_t*)(pDst);
-    /* first copy byte by byte till the source first alignment
-     * this step is necessary to ensure we do not even try to access
-     * data which is before the source buffer, hence it is not ours.
-     */
-    while((PTR_TO_UINT(p_Src8) & 3) && size) /* (pSrc mod 4) > 0 and size > 0 */
-    {
-        *p_Dst8++ = *p_Src8++;
-        size--;
-    }
-
-    /* align destination (possibly disaligning source)*/
-    while((PTR_TO_UINT(p_Dst8) & 3) && size) /* (pDst mod 4) > 0 and size > 0 */
-    {
-        *p_Dst8++ = *p_Src8++;
-        size--;
-    }
-
-    /* dest is aligned and source is not necessarily aligned */
-    leftAlign = (uint32_t)((PTR_TO_UINT(p_Src8) & 3) << 3); /* leftAlign = (pSrc mod 4)*8 */
-    rightAlign = 32 - leftAlign;
-
-
-    if (leftAlign == 0)
-    {
-        /* source is also aligned */
-        p_Src32 = (uint32_t*)(p_Src8);
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        while (size >> 2) /* size >= 4 */
-        {
-            *p_Dst32++ = *p_Src32++;
-            size -= 4;
-        }
-        p_Src8 = (uint8_t*)(p_Src32);
-        p_Dst8 = (uint8_t*)(p_Dst32);
-    }
-    else
-    {
-        /* source is not aligned (destination is aligned)*/
-        p_Src32 = (uint32_t*)(p_Src8 - (leftAlign >> 3));
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        lastWord = *p_Src32++;
-        while(size >> 3) /* size >= 8 */
-        {
-            currWord = *p_Src32;
-            *p_Dst32 = (lastWord << leftAlign) | (currWord >> rightAlign);
-            lastWord = currWord;
-            p_Src32++;
-            p_Dst32++;
-            size -= 4;
-        }
-        p_Dst8 = (uint8_t*)(p_Dst32);
-        p_Src8 = (uint8_t*)(p_Src32) - 4 + (leftAlign >> 3);
-    }
-
-    /* complete the left overs */
-    while (size--)
-        *p_Dst8++ = *p_Src8++;
-
+    memcpy(pDst, pSrc, size);
     return pDst;
 }
 
+/* FMan MURAM/register space is Device-nGnRE iomem (devm_ioremap), NOT
+ * cacheable memory. Plain memcpy() is tolerated only because arm64 memcpy
+ * never emits dc zva (unlike memset); memcpy_fromio/_toio are preferable and
+ * are what the in-tree callers (fm.c, fm_replic.c) now use. These three
+ * helpers remain only for out-of-tree/vendor callers. */
 void * IO2IOCpy32(void* pDst,void* pSrc, uint32_t size)
 {
-    uint32_t leftAlign;
-    uint32_t rightAlign;
-    uint32_t lastWord;
-    uint32_t currWord;
-    uint32_t *p_Src32;
-    uint32_t *p_Dst32;
-    uint8_t  *p_Src8;
-    uint8_t  *p_Dst8;
-
-    p_Src8 = (uint8_t*)(pSrc);
-    p_Dst8 = (uint8_t*)(pDst);
-    /* first copy byte by byte till the source first alignment
-     * this step is necessary to ensure we do not even try to access
-     * data which is before the source buffer, hence it is not ours.
-     */
-    while((PTR_TO_UINT(p_Src8) & 3) && size) /* (pSrc mod 4) > 0 and size > 0 */
-    {
-        WRITE_UINT8(*p_Dst8, GET_UINT8(*p_Src8));
-        p_Dst8++;p_Src8++;
-        size--;
-    }
-
-    /* align destination (possibly disaligning source)*/
-    while((PTR_TO_UINT(p_Dst8) & 3) && size) /* (pDst mod 4) > 0 and size > 0 */
-    {
-        WRITE_UINT8(*p_Dst8, GET_UINT8(*p_Src8));
-        p_Dst8++;p_Src8++;
-        size--;
-    }
-
-    /* dest is aligned and source is not necessarily aligned */
-    leftAlign = (uint32_t)((PTR_TO_UINT(p_Src8) & 3) << 3); /* leftAlign = (pSrc mod 4)*8 */
-    rightAlign = 32 - leftAlign;
-
-    if (leftAlign == 0)
-    {
-        /* source is also aligned */
-        p_Src32 = (uint32_t*)(p_Src8);
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        while (size >> 2) /* size >= 4 */
-        {
-            WRITE_UINT32(*p_Dst32, GET_UINT32(*p_Src32));
-            p_Dst32++;p_Src32++;
-            size -= 4;
-        }
-        p_Src8 = (uint8_t*)(p_Src32);
-        p_Dst8 = (uint8_t*)(p_Dst32);
-    }
-    else
-    {
-        /* source is not aligned (destination is aligned)*/
-        p_Src32 = (uint32_t*)(p_Src8 - (leftAlign >> 3));
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        lastWord = GET_UINT32(*p_Src32);
-        p_Src32++;
-        while(size >> 3) /* size >= 8 */
-        {
-            currWord = GET_UINT32(*p_Src32);
-            WRITE_UINT32(*p_Dst32, (lastWord << leftAlign) | (currWord >> rightAlign));
-            lastWord = currWord;
-            p_Src32++;p_Dst32++;
-            size -= 4;
-        }
-        p_Dst8 = (uint8_t*)(p_Dst32);
-        p_Src8 = (uint8_t*)(p_Src32) - 4 + (leftAlign >> 3);
-    }
-
-    /* complete the left overs */
-    while (size--)
-    {
-        WRITE_UINT8(*p_Dst8, GET_UINT8(*p_Src8));
-        p_Dst8++;p_Src8++;
-    }
-
+    memcpy(pDst, pSrc, size);
     return pDst;
 }
 
+/* Aliases plain memcpy() on this platform -- see IO2IOCpy32(). */
 void * Mem2IOCpy32(void* pDst,void* pSrc, uint32_t size)
 {
-    uint32_t leftAlign;
-    uint32_t rightAlign;
-    uint32_t lastWord;
-    uint32_t currWord;
-    uint32_t *p_Src32;
-    uint32_t *p_Dst32;
-    uint8_t  *p_Src8;
-    uint8_t  *p_Dst8;
-
-    p_Src8 = (uint8_t*)(pSrc);
-    p_Dst8 = (uint8_t*)(pDst);
-    /* first copy byte by byte till the source first alignment
-     * this step is necessary to ensure we do not even try to access
-     * data which is before the source buffer, hence it is not ours.
-     */
-    while((PTR_TO_UINT(p_Src8) & 3) && size) /* (pSrc mod 4) > 0 and size > 0 */
-    {
-        WRITE_UINT8(*p_Dst8, *p_Src8);
-        p_Dst8++;p_Src8++;
-        size--;
-    }
-
-    /* align destination (possibly disaligning source)*/
-    while((PTR_TO_UINT(p_Dst8) & 3) && size) /* (pDst mod 4) > 0 and size > 0 */
-    {
-        WRITE_UINT8(*p_Dst8, *p_Src8);
-        p_Dst8++;p_Src8++;
-        size--;
-    }
-
-    /* dest is aligned and source is not necessarily aligned */
-    leftAlign = (uint32_t)((PTR_TO_UINT(p_Src8) & 3) << 3); /* leftAlign = (pSrc mod 4)*8 */
-    rightAlign = 32 - leftAlign;
-
-    if (leftAlign == 0)
-    {
-        /* source is also aligned */
-        p_Src32 = (uint32_t*)(p_Src8);
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        while (size >> 2) /* size >= 4 */
-        {
-            WRITE_UINT32(*p_Dst32, *p_Src32);
-            p_Dst32++;p_Src32++;
-            size -= 4;
-        }
-        p_Src8 = (uint8_t*)(p_Src32);
-        p_Dst8 = (uint8_t*)(p_Dst32);
-    }
-    else
-    {
-        /* source is not aligned (destination is aligned)*/
-        p_Src32 = (uint32_t*)(p_Src8 - (leftAlign >> 3));
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        lastWord = *p_Src32++;
-        while(size >> 3) /* size >= 8 */
-        {
-            currWord = *p_Src32;
-            WRITE_UINT32(*p_Dst32, (lastWord << leftAlign) | (currWord >> rightAlign));
-            lastWord = currWord;
-            p_Src32++;p_Dst32++;
-            size -= 4;
-        }
-        p_Dst8 = (uint8_t*)(p_Dst32);
-        p_Src8 = (uint8_t*)(p_Src32) - 4 + (leftAlign >> 3);
-    }
-
-    /* complete the left overs */
-    while (size--)
-    {
-        WRITE_UINT8(*p_Dst8, *p_Src8);
-        p_Dst8++;p_Src8++;
-    }
-
+    memcpy(pDst, pSrc, size);
     return pDst;
 }
 
+/* Aliases plain memcpy() on this platform -- see IO2IOCpy32(). */
 void * IO2MemCpy32(void* pDst,void* pSrc, uint32_t size)
 {
-    uint32_t leftAlign;
-    uint32_t rightAlign;
-    uint32_t lastWord;
-    uint32_t currWord;
-    uint32_t *p_Src32;
-    uint32_t *p_Dst32;
-    uint8_t  *p_Src8;
-    uint8_t  *p_Dst8;
-
-    p_Src8 = (uint8_t*)(pSrc);
-    p_Dst8 = (uint8_t*)(pDst);
-    /* first copy byte by byte till the source first alignment
-     * this step is necessary to ensure we do not even try to access
-     * data which is before the source buffer, hence it is not ours.
-     */
-    while((PTR_TO_UINT(p_Src8) & 3) && size) /* (pSrc mod 4) > 0 and size > 0 */
-    {
-        *p_Dst8 = GET_UINT8(*p_Src8);
-        p_Dst8++;p_Src8++;
-        size--;
-    }
-
-    /* align destination (possibly disaligning source)*/
-    while((PTR_TO_UINT(p_Dst8) & 3) && size) /* (pDst mod 4) > 0 and size > 0 */
-    {
-        *p_Dst8 = GET_UINT8(*p_Src8);
-        p_Dst8++;p_Src8++;
-        size--;
-    }
-
-    /* dest is aligned and source is not necessarily aligned */
-    leftAlign = (uint32_t)((PTR_TO_UINT(p_Src8) & 3) << 3); /* leftAlign = (pSrc mod 4)*8 */
-    rightAlign = 32 - leftAlign;
-
-    if (leftAlign == 0)
-    {
-        /* source is also aligned */
-        p_Src32 = (uint32_t*)(p_Src8);
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        while (size >> 2) /* size >= 4 */
-        {
-            *p_Dst32 = GET_UINT32(*p_Src32);
-            p_Dst32++;p_Src32++;
-            size -= 4;
-        }
-        p_Src8 = (uint8_t*)(p_Src32);
-        p_Dst8 = (uint8_t*)(p_Dst32);
-    }
-    else
-    {
-        /* source is not aligned (destination is aligned)*/
-        p_Src32 = (uint32_t*)(p_Src8 - (leftAlign >> 3));
-        p_Dst32 = (uint32_t*)(p_Dst8);
-        lastWord = GET_UINT32(*p_Src32);
-        p_Src32++;
-        while(size >> 3) /* size >= 8 */
-        {
-            currWord = GET_UINT32(*p_Src32);
-            *p_Dst32 = (lastWord << leftAlign) | (currWord >> rightAlign);
-            lastWord = currWord;
-            p_Src32++;p_Dst32++;
-            size -= 4;
-        }
-        p_Dst8 = (uint8_t*)(p_Dst32);
-        p_Src8 = (uint8_t*)(p_Src32) - 4 + (leftAlign >> 3);
-    }
-
-    /* complete the left overs */
-    while (size--)
-    {
-        *p_Dst8 = GET_UINT8(*p_Src8);
-        p_Dst8++;p_Src8++;
-    }
-
+    memcpy(pDst, pSrc, size);
     return pDst;
 }
 

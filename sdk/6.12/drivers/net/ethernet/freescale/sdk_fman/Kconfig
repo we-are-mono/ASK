@@ -9,12 +9,17 @@ menuconfig FSL_SDK_FMAN
 
 if FSL_SDK_FMAN
 
-config FSL_SDK_FMAN_TEST
-	bool "FMan test module"
+config FSL_SDK_FMAN_EHASH_SYNC_FAULT
+	bool "Fault injection for external-hash DeleteKey HC syncs"
 	default n
-	select FSL_DPAA_HOOKS
 	help
-		This option compiles test code for FMan.
+		Adds /proc/fm_ehash_hcsync_fail: writing a decimal N makes the
+		next N host-command syncs issued inside ExternalHashTableDeleteKey,
+		or for deferred unlinks by ExternalHashTableDeleteSync, report
+		failure without touching hardware, so the
+		unlinked-but-unsynced delete paths and their caller-side
+		quarantine handling can be exercised deterministically.
+		Test images only; never enable in production.
 
 config FSL_SDK_FMAN_RTC_API
 	bool "FMan RTC (1588 timer) APIs"

@@ -43,7 +43,6 @@
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
-#include <linux/cdev.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/io.h>
@@ -55,7 +54,6 @@
 #include "lnxwrp_fsl_fman.h"
 #include "fm_port_ext.h"
 #include "fm_vsp_ext.h"
-#include "fm_ioctls.h"
 #include "lnxwrp_resources.h"
 #include "lnxwrp_sysfs_fm_port.h"
 
@@ -77,34 +75,29 @@ do {\
 	} \
 } while (0)
 
-static volatile int hcFrmRcv/* = 0 */;
-static spinlock_t lock;
-
-static enum qman_cb_dqrr_result qm_tx_conf_dqrr_cb(struct qman_portal *portal,
-						   struct qman_fq *fq,
-						   const struct qm_dqrr_entry
-						   *dq)
+static void hc_swap_frame(struct qm_fd *fd)
 {
-	t_LnxWrpFmDev *p_LnxWrpFmDev = ((t_FmTestFq *) fq)->h_Arg;
-	unsigned long flags;
-
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-{
 	/* extract the HC frame address */
-	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr((struct qm_fd *)&dq->fd));
-	int hcf_l = ((struct qm_fd *)&dq->fd)->length20;
+	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr(fd));
+	int hcf_l = fd->length20;
 	int i;
 
 	/* 32b byteswap of all data in the HC Frame */
 	for(i = 0; i < hcf_l / 4; ++i)
 		hcf_va[i] =
 			___constant_swab32(hcf_va[i]);
-}
 #endif
+}
+
+static enum qman_cb_dqrr_result qm_tx_conf_dqrr_cb(struct qman_portal *portal,
+                                                   struct qman_fq *fq,
+                                                   const struct qm_dqrr_entry *dq)
+{
+	t_LnxWrpFmDev *p_LnxWrpFmDev = ((t_FmTestFq *) fq)->h_Arg;
+
+	hc_swap_frame((struct qm_fd *)&dq->fd);
 	FM_PCD_HcTxConf(p_LnxWrpFmDev->h_PcdDev, (t_DpaaFD *)&dq->fd);
-	spin_lock_irqsave(&lock, flags);
-	hcFrmRcv--;
-	spin_unlock_irqrestore(&lock, flags);
 
 	return qman_cb_dqrr_consume;
 }
@@ -184,50 +177,101 @@ static struct qman_fq *FqAlloc(t_LnxWrpFmDev * p_LnxWrpFmDev,
 	return fq;
 }
 
+/* How long a host command waits for room in the portal's enqueue ring. Under
+ * load QMan can leave every portal's ring full at once for some 200 us (an
+ * order restoration point's walk, cdx_wg.c), and a command refused fails the
+ * sync it carries, which is asked again only a second later. */
+#define HC_ENQUEUE_WAIT_NS	(1000 * NSEC_PER_USEC)
+
 static t_Error QmEnqueueCB(t_Handle h_Arg, void *p_Fd)
 {
 	t_LnxWrpFmDev *p_LnxWrpFmDev = (t_LnxWrpFmDev *) h_Arg;
-	int _errno, timeout = 1000000;
-	unsigned long flags;
+	u64 deadline = ktime_get_ns() + HC_ENQUEUE_WAIT_NS;
+	int _errno;
 
 	ASSERT_COND(p_LnxWrpFmDev);
 
-	spin_lock_irqsave(&lock, flags);
-	hcFrmRcv++;
-	spin_unlock_irqrestore(&lock, flags);
+	hc_swap_frame((struct qm_fd *)p_Fd);
 
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-{
-	/* extract the HC frame address */
-	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr((struct qm_fd *) p_Fd));
-	int hcf_l = ((struct qm_fd *)p_Fd)->length20;
-	int i;
-
-	/* 32b byteswap of all data in the HC Frame */
-	for(i = 0; i < hcf_l / 4; ++i)
-		hcf_va[i] =
-			___constant_swab32(hcf_va[i]);
-}
-#endif
-
-	_errno = qman_enqueue(p_LnxWrpFmDev->hc_tx_fq, (struct qm_fd *) p_Fd,
-			      0);
-	if (_errno)
-		RETURN_ERROR(MINOR, E_INVALID_STATE,
-			     ("qman_enqueue() failed"));
-
-	while (hcFrmRcv && --timeout) {
-		udelay(1);
+	while ((_errno = qman_enqueue(p_LnxWrpFmDev->hc_tx_fq, (struct qm_fd *) p_Fd,
+				      0)) == -EBUSY && ktime_get_ns() < deadline)
 		cpu_relax();
-	}
-	if (timeout == 0) {
-		dump_stack();
-		RETURN_ERROR(MINOR, E_WRITE_FAILED,
-			     ("timeout waiting for Tx confirmation"));
-		return E_WRITE_FAILED;
+	if (_errno) {
+		/* Rejection leaves ownership with the caller, in CPU byte order.
+		 * EnQFrm() reports it, if it is the first of a run: a sync
+		 * retried on a timer is rejected the same way every time. */
+		hc_swap_frame((struct qm_fd *)p_Fd);
+		return ERROR_CODE(E_INVALID_STATE);
 	}
 
+	/* Accepted: the SDK waits for this frame's confirmation. */
 	return E_OK;
+}
+
+/* How long the description waits for each of QMan's answers. The command it
+ * describes went unanswered past its own deadline, so QMan may have stopped
+ * answering commands altogether: a query not answered in this time is said
+ * so, and none follows it (the portal owes that answer to its next command,
+ * qman_query_fq_np_timeout()). */
+#define HC_DESCRIBE_TIMEOUT_US	10000
+
+/* What the host command's three queues hold, the work queues of the channel
+ * its answers are delivered on, and what each CPU's portal still holds, for a
+ * command that has timed out (EnQFrm()). -1 for a queue that could not be
+ * asked. */
+static void QmDescribeCB(t_Handle h_Arg, char *buf, uint32_t size)
+{
+	t_LnxWrpFmDev *p_LnxWrpFmDev = (t_LnxWrpFmDev *)h_Arg;
+	struct qman_fq *fqs[3] = { p_LnxWrpFmDev->hc_tx_fq,
+				   p_LnxWrpFmDev->hc_tx_conf_fq,
+				   p_LnxWrpFmDev->hc_tx_err_fq };
+	struct qm_mcr_queryfq_np np;
+	struct qm_mcr_querywq wq;
+	long frames[3] = { -1, -1, -1 };
+	unsigned int i;
+	int n, err = 0, cpu, self;
+
+	/* One portal for every query, so a timeout names the one that did
+	 * not answer. */
+	self = get_cpu();
+	for (i = 0; i < ARRAY_SIZE(fqs) && err != -ETIMEDOUT; i++) {
+		if (!fqs[i])
+			continue;
+		err = qman_query_fq_np_timeout(fqs[i], &np, HC_DESCRIBE_TIMEOUT_US);
+		if (!err)
+			frames[i] = np.frm_cnt;
+	}
+	n = scnprintf(buf, size, "frames queued: command %ld, answer %ld, error %ld",
+		      frames[0], frames[1], frames[2]);
+	if (err == -ETIMEDOUT) {
+		n += scnprintf(buf + n, size - n, "; QMan did not answer cpu %d's portal in %u us",
+			       self, HC_DESCRIBE_TIMEOUT_US);
+	} else {
+		memset(&wq, 0, sizeof(wq));
+		wq.channel.id = p_LnxWrpFmDev->hcCh;
+		err = qman_query_wq_timeout(0, &wq, HC_DESCRIBE_TIMEOUT_US);
+		if (!err) {
+			n += scnprintf(buf + n, size - n, "; channel 0x%x wq0-7:", wq.channel.id);
+			/* The upper bits of each length are not part of it. */
+			for (i = 0; i < ARRAY_SIZE(wq.wq_len); i++)
+				n += scnprintf(buf + n, size - n, " %u", wq.wq_len[i] & 0x0fff);
+		} else if (err == -ETIMEDOUT) {
+			n += scnprintf(buf + n, size - n, "; QMan did not answer cpu %d's portal in %u us",
+				       self, HC_DESCRIBE_TIMEOUT_US);
+		}
+	}
+	put_cpu();
+	/* Dequeued, but not yet processed by the CPU that portal belongs to
+	 * (lnxwrp_fm.c, hcCh): an answer on neither queue is either here or
+	 * still inside the FMan. */
+	n += scnprintf(buf + n, size - n, "; its portal holds %d unprocessed",
+		       qman_affine_portal_dqrr_pending(cpumask_first(qman_affine_cpus())));
+	/* Written into a CPU's enqueue ring and not yet taken by QMan: the
+	 * command itself, if the CPU that sent it holds some, and every CPU at
+	 * once if QMan has stopped taking commands. */
+	n += scnprintf(buf + n, size - n, "; enqueue rings hold");
+	for_each_online_cpu(cpu)
+		n += scnprintf(buf + n, size - n, " %d", qman_affine_portal_eqcr_fill(cpu));
 }
 
 static t_LnxWrpFmPortDev *ReadFmPortDevTreeNode(struct platform_device
@@ -792,11 +836,10 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
 
 
     if ((p_LnxWrpFmPortDev->settings.param.portType != e_FM_PORT_TYPE_TX) &&
-        (p_LnxWrpFmPortDev->settings.param.portType != e_FM_PORT_TYPE_TX_10G)) {
-            if (FM_PORT_ConfigErrorsToDiscard(p_LnxWrpFmPortDev->h_Dev, (FM_PORT_FRM_ERR_IPRE |
-                                                                         FM_PORT_FRM_ERR_IPR_NCSP |
-                                                                         FM_PORT_FRM_ERR_CLS_DISCARD)) !=E_OK)
-            RETURN_ERROR(MAJOR, E_INVALID_STATE, NO_MSG);
+        (p_LnxWrpFmPortDev->settings.param.portType != e_FM_PORT_TYPE_TX_10G)) { 
+            /*(FM_PORT_FRM_ERR_IPRE | FM_PORT_FRM_ERR_IPR_NCSP | FM_PORT_FRM_ERR_CLS_DISCARD*/
+            if (FM_PORT_ConfigErrorsToDiscard(p_LnxWrpFmPortDev->h_Dev, FM_RFSDM_DEFAULT) != E_OK)
+            	RETURN_ERROR(MAJOR, E_INVALID_STATE, NO_MSG);
     }
 
     if (CheckNConfigFmPortAdvArgs(p_LnxWrpFmPortDev) != E_OK)
@@ -999,8 +1042,6 @@ static void LnxwrpFmPcdDevIndexedExceptionsCb(t_Handle h_App,
 
 static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 {
-	spin_lock_init(&lock);
-
 	if (p_LnxWrpFmDev->pcdActive) {
 		t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = &p_LnxWrpFmDev->hcPort;
 		t_FmPcdParams fmPcdParams;
@@ -1038,11 +1079,18 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 			RETURN_ERROR(MAJOR, E_NULL_POINTER,
 				     ("Frame queue allocation failed..."));
 
+		/* Both answers to a host command at WQ0, the top of the CPU's
+		 * channel. QMan serves a channel's WQ0 and WQ1 strictly ahead of
+		 * everything else on it, so an answer queued below a queue that
+		 * stays busy -- a receive or exception stream the CPU cannot keep
+		 * up with -- waits for as long as it stays busy, past the
+		 * command's deadline (EnQFrm()). At WQ0 it waits for no queue
+		 * below it, and for at most one turn of any beside it. */
 		p_LnxWrpFmDev->hc_tx_conf_fq =
 			FqAlloc(p_LnxWrpFmDev,
 				0,
 				QMAN_FQ_FLAG_NO_ENQUEUE,
-				p_LnxWrpFmDev->hcCh, 1);
+				p_LnxWrpFmDev->hcCh, 0);
 		if (!p_LnxWrpFmDev->hc_tx_conf_fq)
 			RETURN_ERROR(MAJOR, E_NULL_POINTER,
 				     ("Frame queue allocation failed..."));
@@ -1051,7 +1099,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 			FqAlloc(p_LnxWrpFmDev,
 				0,
 				QMAN_FQ_FLAG_NO_ENQUEUE,
-				p_LnxWrpFmDev->hcCh, 2);
+				p_LnxWrpFmDev->hcCh, 0);
 		if (!p_LnxWrpFmDev->hc_tx_err_fq)
 			RETURN_ERROR(MAJOR, E_NULL_POINTER,
 				     ("Frame queue allocation failed..."));
@@ -1067,6 +1115,7 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 			qman_fq_fqid(p_LnxWrpFmDev->hc_tx_conf_fq);
 		fmPcdParams.hc.qmChannel = p_LnxWrpFmPortDev->txCh;
 		fmPcdParams.hc.f_QmEnqueue = QmEnqueueCB;
+		fmPcdParams.hc.f_QmDescribe = QmDescribeCB;
 		fmPcdParams.hc.h_QmArg = (t_Handle) p_LnxWrpFmDev;
 
 		p_LnxWrpFmDev->h_PcdDev = FM_PCD_Config(&fmPcdParams);
@@ -1164,55 +1213,33 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
 	if (p_LnxWrpFmPortDev->settings.param.portType == e_FM_PORT_TYPE_RX) {
 		Sprint(p_LnxWrpFmPortDev->name, "%s-port-rx%d",
 		       p_LnxWrpFmDev->name, p_LnxWrpFmPortDev->id);
-		p_LnxWrpFmPortDev->minor =
-			p_LnxWrpFmPortDev->id + DEV_FM_RX_PORTS_MINOR_BASE;
 	} else if (p_LnxWrpFmPortDev->settings.param.portType ==
 		 e_FM_PORT_TYPE_RX_10G) {
 		Sprint(p_LnxWrpFmPortDev->name, "%s-port-rx%d",
 		       p_LnxWrpFmDev->name,
 		       p_LnxWrpFmPortDev->id + FM_MAX_NUM_OF_1G_RX_PORTS);
-		p_LnxWrpFmPortDev->minor =
-			p_LnxWrpFmPortDev->id + FM_MAX_NUM_OF_1G_RX_PORTS +
-			DEV_FM_RX_PORTS_MINOR_BASE;
 	} else if (p_LnxWrpFmPortDev->settings.param.portType ==
 		 e_FM_PORT_TYPE_TX) {
 		Sprint(p_LnxWrpFmPortDev->name, "%s-port-tx%d",
 		       p_LnxWrpFmDev->name, p_LnxWrpFmPortDev->id);
-		p_LnxWrpFmPortDev->minor =
-			p_LnxWrpFmPortDev->id + DEV_FM_TX_PORTS_MINOR_BASE;
 	} else if (p_LnxWrpFmPortDev->settings.param.portType ==
 		 e_FM_PORT_TYPE_TX_10G) {
 		Sprint(p_LnxWrpFmPortDev->name, "%s-port-tx%d",
 		       p_LnxWrpFmDev->name,
 		       p_LnxWrpFmPortDev->id + FM_MAX_NUM_OF_1G_TX_PORTS);
-		p_LnxWrpFmPortDev->minor =
-			p_LnxWrpFmPortDev->id + FM_MAX_NUM_OF_1G_TX_PORTS +
-			DEV_FM_TX_PORTS_MINOR_BASE;
 	} else if (p_LnxWrpFmPortDev->settings.param.portType ==
 		 e_FM_PORT_TYPE_OH_HOST_COMMAND) {
 		Sprint(p_LnxWrpFmPortDev->name, "%s-port-oh%d",
 		       p_LnxWrpFmDev->name, p_LnxWrpFmPortDev->id);
-		p_LnxWrpFmPortDev->minor =
-			p_LnxWrpFmPortDev->id + DEV_FM_OH_PORTS_MINOR_BASE;
 	} else if (p_LnxWrpFmPortDev->settings.param.portType ==
 		 e_FM_PORT_TYPE_OH_OFFLINE_PARSING) {
 		Sprint(p_LnxWrpFmPortDev->name, "%s-port-oh%d",
 		       p_LnxWrpFmDev->name, p_LnxWrpFmPortDev->id + 1);
-		p_LnxWrpFmPortDev->minor =
-			p_LnxWrpFmPortDev->id + 1 +
-			DEV_FM_OH_PORTS_MINOR_BASE;
 	}
-
-	device_create(p_LnxWrpFmDev->fm_class, NULL,
-		      MKDEV(p_LnxWrpFmDev->major, p_LnxWrpFmPortDev->minor),
-		      NULL, p_LnxWrpFmPortDev->name);
 
 	/* create sysfs entries for stats and regs */
 
 	if (fm_port_sysfs_create(dev) != 0) {
-		device_destroy(p_LnxWrpFmDev->fm_class,
-			       MKDEV(p_LnxWrpFmDev->major,
-				     p_LnxWrpFmPortDev->minor));
 		FreeFmPortDev(p_LnxWrpFmPortDev);
 		REPORT_ERROR(MAJOR, E_INVALID_STATE,
 			     ("Unable to create sys entry - fm port!!!"));
@@ -1231,17 +1258,12 @@ static int /*__devinit*/ fm_port_probe(struct platform_device *of_dev)
 static void fm_port_remove(struct platform_device *of_dev)
 {
 	t_LnxWrpFmPortDev *p_LnxWrpFmPortDev;
-	t_LnxWrpFmDev *p_LnxWrpFmDev;
 	struct device *dev;
 
 	dev = &of_dev->dev;
 	p_LnxWrpFmPortDev = dev_get_drvdata(dev);
 
 	fm_port_sysfs_destroy(dev);
-
-	p_LnxWrpFmDev = (t_LnxWrpFmDev *) p_LnxWrpFmPortDev->h_LnxWrpFmDev;
-	device_destroy(p_LnxWrpFmDev->fm_class,
-		       MKDEV(p_LnxWrpFmDev->major, p_LnxWrpFmPortDev->minor));
 
 	FreeFmPortDev(p_LnxWrpFmPortDev);
 

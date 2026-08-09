@@ -1413,6 +1413,36 @@ t_Error FM_PORT_Disable(t_Handle h_FmPort);
 *//***************************************************************************/
 t_Error FM_PORT_Enable(t_Handle h_FmPort);
 
+/* Query the initialized port's current enable state without changing it. */
+t_Error FM_PORT_GetEnabled(t_Handle h_FmPort, bool *p_Enabled);
+
+/* Whether the port has finished stopping: disabled, and its registers report
+ * no frame still in hand. FM_PORT_Disable() gives up waiting for that after a
+ * bounded time and succeeds anyway, so a caller that has to know nothing is
+ * moving any more asks here, and asks again until it is so. */
+t_Error FM_PORT_GetStopped(t_Handle h_FmPort, bool *p_Stopped);
+
+/* Whether the port hands received frames to its PCD rather than enqueueing
+ * them directly (BMI-to-BMI). Only Rx and offline-parsing ports can have a
+ * PCD; any other port reports false. */
+t_Error FM_PORT_IsPcdAttached(t_Handle h_FmPort, bool *p_Attached);
+
+/* While fenced, FM_PORT_Enable() fails with E_BUSY, whoever calls it, and the
+ * port stays as it is; disabling it still works. For an owner that has stopped
+ * the port and must keep it stopped until it says otherwise: an enable that
+ * completed before the fence went up is undone by the owner's disable after
+ * it, and none can complete after. */
+t_Error FM_PORT_SetFenced(t_Handle h_FmPort, bool fenced);
+
+/* Sends a disabled Rx or offline-parsing port's frames straight to its
+ * default queue, as FM_PORT_DetachPCD() does, but keeps everything the PCD
+ * was given, so the same call with bypass false gives it back unchanged. No
+ * host command: the port is disabled, and the caller has seen it stop
+ * (FM_PORT_GetStopped()), so no frame of it can be inside the PCD when the
+ * registers change. E_INVALID_STATE for an enabled port or one without a
+ * PCD; idempotent either way. */
+t_Error FM_PORT_BypassPCD(t_Handle h_FmPort, bool bypass);
+
 /**************************************************************************//**
  @Function      FM_PORT_SetRateLimit
 
@@ -1733,6 +1763,25 @@ t_Error FM_PORT_SetRxL4ChecksumVerify(t_Handle h_FmPort, bool enable);
 t_Error FM_PORT_SetErrorsRoute(t_Handle h_FmPort, fmPortFrameErrSelect_t errs);
 
 /**************************************************************************//**
+ @Function      FM_PORT_SetDiscardMask
+
+ @Description   Sets user provided DiscardMask value  to Port BMI register 
+			rfsdm in case of rx
+			ofsdm in case of op port
+
+                used for Rx and OP ports only
+
+ @Param[in]     h_FmPort    A handle to a FM Port module.
+ @Param[in]     errs        A list of errors to discard the frame.
+
+ @Return        E_OK on success; Error code otherwise.
+
+ @Cautions      Allowed only following FM_PORT_Config() and before FM_PORT_Init().
+*//***************************************************************************/
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+t_Error FM_PORT_SetDiscardMask(t_Handle h_FmPort, fmPortFrameErrSelect_t errs);
+#endif
+/**************************************************************************//**
  @Function      FM_PORT_SetIMExceptions
 
  @Description   Calling this routine enables/disables FM PORT interrupts.
@@ -1951,8 +2000,8 @@ typedef struct t_FmPortPcdParams {
                                                      or if any flow uses a KG scheme were policer
                                                      profile is not generated
                                                      ('bypassPlcrProfileGeneration selected'). */
-    t_Handle                h_IpReassemblyManip;    /**< IP Reassembly manipulation */
-    t_Handle                h_CapwapReassemblyManip;/**< CAPWAP Reassembly manipulation */
+    t_Handle                h_IpReassemblyManip; /**< Reserved in Mono; must be NULL. */
+    t_Handle                h_CapwapReassemblyManip; /**< Reserved in Mono; must be NULL. */
 } t_FmPortPcdParams;
 
 /**************************************************************************//**
@@ -2039,14 +2088,15 @@ t_Error FM_PORT_AttachPCD(t_Handle h_FmPort);
  @Description   Calling this routine detaches the port from its PCD functionality.
                 The port returns to its default flow which is BMI to BMI.
 
-                May be used for Rx and OP ports which are
-                in PCD mode only
+                May be used for Rx and OP ports. An initialized port without
+                PCD configuration is already detached and returns E_OK;
+                incomplete PCD setup or cleanup still returns an error.
 
  @Param[in]     h_FmPort        A handle to a FM Port module.
 
  @Return        E_OK on success; Error code otherwise.
 
- @Cautions      Allowed only following FM_PORT_AttachPCD().
+ @Cautions      Allowed only following FM_PORT_Init().
 *//***************************************************************************/
 t_Error FM_PORT_DetachPCD(t_Handle h_FmPort);
 
@@ -2136,18 +2186,13 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
 /**************************************************************************//**
  @Function      FM_PORT_PcdCcModifyTree
 
- @Description   This routine may be called for ports that use coarse classification tree
-                if the user wishes to replace the tree. The routine may not be called while port
-                receives packets using the PCD functionalities, therefor port must be first detached
-                from the PCD, only than the routine may be called, and than port be attached to PCD again.
+ @Description   Whole-tree replacement is unsupported in Mono. This entry point
+                is retained for API compatibility and does not access either handle.
 
- @Param[in]     h_FmPort            A handle to a FM Port module.
- @Param[in]     h_CcTree            A CC tree that was already built. The tree id as returned from
-                                    the BuildTree routine.
+ @Param[in]     h_FmPort            Unused port handle.
+ @Param[in]     h_CcTree            Unused tree handle.
 
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      Allowed only following FM_PORT_Init(), FM_PORT_SetPCD() and FM_PORT_DetachPCD()
+ @Return        E_NOT_SUPPORTED.
 *//***************************************************************************/
 t_Error FM_PORT_PcdCcModifyTree (t_Handle h_FmPort, t_Handle h_CcTree);
 

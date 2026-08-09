@@ -107,7 +107,6 @@
 #define CC_PC_GENERIC_WITH_MASK             0x28
 #define CC_PC_GENERIC_IC_GMASK              0x2B
 #define CC_PC_GENERIC_IC_HASH_INDEXED       0x2C
-#define CC_PC_GENERIC_IC_AGING_MASK         0x2D
 
 #define CC_PR_OFFSET                        0x25
 #define CC_PR_WITHOUT_OFFSET                0x26
@@ -131,6 +130,19 @@
 
 #define CC_PC_ILLEGAL                       0xff
 #define CC_SIZE_ILLEGAL                     0
+
+#if (DPAA_VERSION >= 11)
+#define FM_PCD_AD_FE_ENTER_ALLOCATE         0x00800000
+#define FM_PCD_AD_FE_ENTER_OPCODE           0x000000F6
+
+#define FM_PCD_FE_T_HASH_UPDATE_TS          0x00020000
+#define FM_PCD_FE_T_HASH_UPDATE_STATS       0x00010000
+#define FM_PCD_FE_T_HASH_LIODN_MASK         0x0000003F
+#define FM_PCD_FE_T_HASH_LIODN_SHIFT        56
+#define FM_PCD_FE_T_HASH_ELIODN_MASK        0x000003c0
+#define FM_PCD_FE_T_HASH_ELIODN_SHIFT       38
+
+#endif /* (DPAA_VERSION >= 11) */
 
 #define FM_PCD_CC_KEYS_MATCH_TABLE_ALIGN    16
 #define FM_PCD_CC_AD_TABLE_ALIGN            16
@@ -173,7 +185,6 @@
 
 #define GLBL_MASK_FOR_HASH_INDEXED          0xfff00000
 #define CC_GLBL_MASK_SIZE                   4
-#define CC_AGING_MASK_SIZE                  4
 
 typedef uint32_t ccPrivateInfo_t; /**< private info of CC: */
 
@@ -183,7 +194,8 @@ typedef uint32_t ccPrivateInfo_t; /**< private info of CC: */
 #define CC_PRIVATE_INFO_IC_KEY_EXACT_MATCH         0x20000000
 #define CC_PRIVATE_INFO_IC_DEQ_FQID_INDEX_LOOKUP   0x10000000
 
-#define CC_BUILD_AGING_MASK(numOfKeys)      ((((1LL << ((numOfKeys) + 1)) - 1)) << (31 - (numOfKeys)))
+#define CC_EXT_HASH_BUCKET_SIZE					256
+
 /***********************************************************************/
 /*          Memory map                                                 */
 /***********************************************************************/
@@ -380,8 +392,6 @@ typedef struct
     t_Handle            h_FmPcdCcSavedManipParams;
     bool                modifiedState;
     uint32_t            requiredAction;
-    t_Handle            h_IpReassemblyManip;
-    t_Handle            h_CapwapReassemblyManip;
 
     t_FmPcdCcKeyAndNextEngineParams keyAndNextEngineParams[FM_PCD_MAX_NUM_OF_CC_GROUPS];
 } t_FmPcdCcTree;
@@ -391,5 +401,11 @@ t_Error     FmPcdCcNodeTreeTryLock(t_Handle h_FmPcd,t_Handle h_FmPcdCcNode, t_Li
 void        FmPcdCcNodeTreeReleaseLock(t_Handle h_FmPcd, t_List *p_List);
 t_Error     FmPcdUpdateCcShadow (t_FmPcd *p_FmPcd, uint32_t size, uint32_t align);
 
+/* External-hash (EHASH) glue shared between fm_cc.c and fm_ehash.c */
+t_Handle    ExternalHashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
+t_Error     ExternalHashTableModifyMissNextEngine(t_Handle h_HashTbl,
+                t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
+void        get_indexed_hash_bucket(uint8_t key_size, uint8_t *key_ptr,
+                uint8_t crc_shift, uint16_t mask, uint16_t *bucket_index);
 
 #endif /* __FM_CC_H */

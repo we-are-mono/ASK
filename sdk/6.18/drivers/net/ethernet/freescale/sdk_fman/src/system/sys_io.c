@@ -157,3 +157,4 @@ uint64_t SYS_VirtToPhys(uint64_t addr)
         return (uint64_t)(addr - p_IoMap->virtAddr + p_IoMap->physAddr);
     return (uint64_t)virt_to_phys(UINT_TO_PTR(addr));
 }
+EXPORT_SYMBOL(SYS_VirtToPhys);

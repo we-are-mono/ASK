@@ -45,7 +45,7 @@
 #include "list_ext.h"
 #include "fm_ext.h"
 #include "fsl_fman_kg.h"
-
+#include "fm_eh_types.h"
 
 /**************************************************************************//**
  @Group         FM_grp Frame Manager API
@@ -185,6 +185,13 @@ typedef void (t_FmPcdIdExceptionCallback) ( t_Handle           h_App,
 /**************************************************************************//**
  @Description   A callback for enqueuing frame onto a QM queue.
 
+                E_OK transfers ownership until FM_PCD_HcTxConf. An error
+                means the frame was rejected and remains in CPU byte order;
+                the callback must not return an error after accepting it.
+                Completion waiting belongs to the HC transport. A timeout
+                does not establish whether the hardware operation ran: do
+                not reuse affected PCD objects; board reset is required.
+
  @Param[in]     h_QmArg         - Application's handle passed to QM module on enqueue.
  @Param[in]     p_Fd            - Frame descriptor for the frame.
 
@@ -215,6 +222,10 @@ typedef struct t_FmPcdHcParams {
                                                          will be used by the FM for dequeue. */
     t_FmPcdQmEnqueueCallback    *f_QmEnqueue;       /**< Callback routine for enqueuing a frame to the QM */
     t_Handle                    h_QmArg;            /**< Application's handle passed to QM module on enqueue */
+    /* Where a timed-out command's frame is, in one line for its report:
+     * still on the port's queue, in the FMan, or answered and waiting on the
+     * CPU's portal behind what its channel holds. Optional. */
+    void                        (*f_QmDescribe)(t_Handle h_QmArg, char *p_Buf, uint32_t size);
 } t_FmPcdHcParams;
 
 /**************************************************************************//**
@@ -507,6 +518,22 @@ t_Error FM_PCD_Disable(t_Handle h_FmPcd);
                 disabled counter is accessed.
 *//***************************************************************************/
 uint32_t FM_PCD_GetCounter(t_Handle h_FmPcd, e_FmPcdCounters counter);
+
+/**************************************************************************//**
+ @Function      FmPcdPlcrProfileGetAbsoluteId
+
+ @Description   Returns absolute profile Id by profile handle.
+
+
+ @Param[in]     h_Profile       A handle to the profile.
+
+ @Return        Absolute profile ID.
+
+ @Cautions      Allowed only following FM_PCD_Init().
+*//***************************************************************************/
+
+uint16_t     FmPcdPlcrProfileGetAbsoluteId(t_Handle h_Profile);
+
 
 /**************************************************************************//**
 @Function       FM_PCD_PrsLoadSw
@@ -1244,7 +1271,7 @@ typedef enum e_FmPcdManipReassemWaysNumber {
 *//***************************************************************************/
 typedef enum e_FmPcdManipType {
     e_FM_PCD_MANIP_HDR = 0,             /**< Header manipulation */
-    e_FM_PCD_MANIP_REASSEM,             /**< Reassembly */
+    e_FM_PCD_MANIP_REASSEM,            /**< Reserved in Mono; hardware reassembly is unsupported. */
     e_FM_PCD_MANIP_FRAG,                /**< Fragmentation */
     e_FM_PCD_MANIP_SPECIAL_OFFLOAD      /**< Special Offloading */
 } e_FmPcdManipType;
@@ -1699,6 +1726,7 @@ typedef struct t_FmPcdKgSchemeParams {
         uint8_t                         relativeSchemeId;       /**< if modify=FALSE:Partition relative scheme id */
         t_Handle                        h_Scheme;               /**< if modify=TRUE: a handle of the existing scheme */
     } id;
+    bool                                shared;           	/**< This scheme is shared */
     bool                                alwaysDirect;           /**< This scheme is reached only directly, i.e. no need
                                                                      for match vector; KeyGen will ignore it when matching */
     struct {                                                    /**< HL Relevant only if alwaysDirect = FALSE */
@@ -1944,8 +1972,7 @@ typedef struct t_FmPcdHashTableParams {
     uint16_t                    maxNumOfKeys;               /**< Maximum Number Of Keys that will (ever) be used in this Hash-table */
     e_FmPcdCcStatsMode          statisticsMode;             /**< If not e_FM_PCD_CC_STATS_MODE_NONE, the required structures for the
                                                                  requested statistics mode will be allocated according to maxNumOfKeys. */
-    uint8_t                     kgHashShift;                /**< KG-Hash-shift as it was configured in the KG-scheme
-                                                                 that leads to this hash-table. */
+    uint8_t                     kgHashShift;                /**< Obsolete; will be considered as '0'. */
     uint16_t                    hashResMask;                /**< Mask that will be used on the hash-result;
                                                                  The number-of-sets for this hash will be calculated
                                                                  as (2^(number of bits set in 'hashResMask'));
@@ -1956,6 +1983,24 @@ typedef struct t_FmPcdHashTableParams {
 
     t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
 
+#if (DPAA_VERSION >= 11)
+    bool                        externalHash;               /**< TRUE to use external hash table */
+
+    uint32_t                    table_type;                 /**< ip reassembly table type */
+    struct {
+        uint32_t                timeout_val;                /**< reassembly timeout */
+        uint32_t                timeout_fqid;               /**< fqid for reassembly failures */
+        uint32_t                max_frags;                  /**< max allowed fragments */
+        uint32_t                min_frag_size;              /**< min allowed frag size except last frag */
+        uint32_t                max_sessions;               /**< max conn reassembly sessions */
+    };
+
+    struct {
+        uint8_t                 dataMemId;                  /**< Memory partition ID for external hash table */
+        uint16_t                dataLiodnOffs;              /**< LIODN offset for external hash access */
+        uintptr_t               missMonitorAddr;            /**< User-allocated miss monitor address */
+    } externalHashParams;
+#endif /* (DPAA_VERSION >= 11) */
 } t_FmPcdHashTableParams;
 
 /**************************************************************************//**
@@ -2802,6 +2847,11 @@ t_Error FM_PCD_NetEnvCharacteristicsDelete(t_Handle h_NetEnv);
                 p_SchemeParams->id.h_Scheme will return NULL if action fails due to scheme
                 BUSY state.
 
+                Failed construction or programming does not publish candidate
+                software state. An unconfirmed HC timeout does not prove that
+                hardware is unchanged; the HC transport remains failed until
+                board reset, even if a late confirmation arrives.
+
  @Cautions      Allowed only following FM_PCD_Init().
 *//***************************************************************************/
 t_Handle FM_PCD_KgSchemeSet(t_Handle                h_FmPcd,
@@ -2896,6 +2946,22 @@ t_Error FM_PCD_PlcrProfileDelete(t_Handle h_Profile);
 *//***************************************************************************/
 uint32_t FM_PCD_PlcrProfileGetCounter(t_Handle                      h_Profile,
                                       e_FmPcdPlcrProfileCounters    counter);
+
+/* A profile's five packet counters as one read of its registers. */
+typedef struct t_FmPcdPlcrProfileCounterValues {
+    uint32_t    green;
+    uint32_t    yellow;
+    uint32_t    red;
+    uint32_t    recolouredYellow;
+    uint32_t    recolouredRed;
+} t_FmPcdPlcrProfileCounterValues;
+
+/* FM_PCD_PlcrProfileGetCounter() returns 0 when the read fails, which a
+ * reader taking a baseline cannot tell from a counter at zero. This says
+ * whether it read: E_OK with every counter of the same instant, or an error
+ * and nothing written. */
+t_Error FM_PCD_PlcrProfileReadCounters(t_Handle                         h_Profile,
+                                       t_FmPcdPlcrProfileCounterValues  *p_Values);
 
 /**************************************************************************//**
  @Function      FM_PCD_PlcrProfileSetCounter
@@ -3362,8 +3428,7 @@ t_Error FM_PCD_MatchTableGetNextEngine(t_Handle                     h_CcNode,
  @Param[in]     p_KgKey                 Pointer to the key; must be like the key
                                         that the KG is generated, i.e. the same
                                         extraction and with mask if exist.
- @Param[in]     kgHashShift             Hash-shift as it was configured in the KG
-                                        scheme that leads to this hash.
+ @Param[in]     kgHashShift             Obsolete; will be considered as '0'
  @Param[out]    p_CcNodeBucketHandle    Pointer to the bucket of the provided key.
  @Param[out]    p_BucketIndex           Index to the bucket of the provided key
  @Param[out]    p_LastIndex             Pointer to last index in the bucket of the
@@ -3423,71 +3488,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
 t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl);
 
 /**************************************************************************//**
- @Function      FM_PCD_HashTableAddKey
-
- @Description   This routine adds the provided key (including next engine
-                parameters of this key) to the hash table.
-                The key is added as the last key of the bucket that it is
-                mapped to.
-
- @Param[in]     h_HashTbl    A handle to a hash table
- @Param[in]     keySize      Key size of added key
- @Param[in]     p_KeyParams  A pointer to the parameters includes
-                             new key with next engine parameters; The pointer
-                             to the key mask must be NULL, as masks are not
-                             supported in hash table implementation.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      Allowed only following FM_PCD_HashTableSet().
-*//***************************************************************************/
-t_Error FM_PCD_HashTableAddKey(t_Handle            h_HashTbl,
-                               uint8_t             keySize,
-                               t_FmPcdCcKeyParams  *p_KeyParams);
-
-/**************************************************************************//**
- @Function      FM_PCD_HashTableRemoveKey
-
- @Description   This routine removes the requested key (including next engine
-                parameters of this key) from the hash table.
-
- @Param[in]     h_HashTbl    A handle to a hash table
- @Param[in]     keySize      Key size of the one to remove.
- @Param[in]     p_Key        A pointer to the requested key to remove.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      Allowed only following FM_PCD_HashTableSet().
-*//***************************************************************************/
-t_Error FM_PCD_HashTableRemoveKey(t_Handle h_HashTbl,
-                                  uint8_t  keySize,
-                                  uint8_t  *p_Key);
-
-/**************************************************************************//**
- @Function      FM_PCD_HashTableModifyNextEngine
-
- @Description   This routine modifies the next engine for the provided key. The
-                key should be previously added to the hash table.
-
- @Param[in]     h_HashTbl                   A handle to a hash table
- @Param[in]     keySize                     Key size of the key to modify.
- @Param[in]     p_Key                       A pointer to the requested key to modify.
- @Param[in]     p_FmPcdCcNextEngineParams   A structure for defining new next engine
-                                            parameters.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      Allowed only following FM_PCD_HashTableSet().
-                When configuring nextEngine = e_FM_PCD_CC, note that
-                p_FmPcdCcNextEngineParams->ccParams.h_CcNode must be different
-                from the currently changed table.
-*//***************************************************************************/
-t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
-                                         uint8_t                   keySize,
-                                         uint8_t                   *p_Key,
-                                         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
-
-/**************************************************************************//**
  @Function      FM_PCD_HashTableModifyMissNextEngine
 
  @Description   This routine modifies the next engine on key match miss.
@@ -3505,75 +3505,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
 *//***************************************************************************/
 t_Error FM_PCD_HashTableModifyMissNextEngine(t_Handle                  h_HashTbl,
                                              t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
-
-/**************************************************************************//*
- @Function      FM_PCD_HashTableGetMissNextEngine
-
- @Description   Gets NextEngine in case of key match miss.
-
- @Param[in]     h_HashTbl                   A handle to a hash table
- @Param[out]    p_FmPcdCcNextEngineParams   Next engine parameters for the specified
-                                            hash table.
-
- @Return        E_OK on success; Error code otherwise.
-
- @Cautions      Allowed only following FM_PCD_HashTableSet().
-*//***************************************************************************/
-t_Error FM_PCD_HashTableGetMissNextEngine(t_Handle                     h_HashTbl,
-                                          t_FmPcdCcNextEngineParams    *p_FmPcdCcNextEngineParams);
-
-/**************************************************************************//**
- @Function      FM_PCD_HashTableFindNGetKeyStatistics
-
- @Description   This routine may be used to get statistics counters of specific key
-                in a hash table.
-
-                If 'e_FM_PCD_CC_STATS_MODE_FRAME' and
-                'e_FM_PCD_CC_STATS_MODE_BYTE_AND_FRAME' were set for this node,
-                these counters reflect how many frames passed that were matched
-                this key; The total frames count will be returned in the counter
-                of the first range (as only one frame length range was defined).
-                If 'e_FM_PCD_CC_STATS_MODE_RMON' was set for this node, the total
-                frame count will be separated to frame length counters, based on
-                provided frame length ranges.
-                Note that this routine will identify the bucket of this key in
-                the hash table and will search the bucket to locate the index
-                of the required key based on received key parameters.
-
- @Param[in]     h_HashTbl       A handle to a hash table
- @Param[in]     keySize         Size of the requested key
- @Param[in]     p_Key           A pointer to the requested key
- @Param[out]    p_KeyStatistics Key statistics counters
-
- @Return        The specific key statistics.
-
- @Cautions      Allowed only following FM_PCD_HashTableSet().
-*//***************************************************************************/
-t_Error FM_PCD_HashTableFindNGetKeyStatistics(t_Handle                 h_HashTbl,
-                                              uint8_t                  keySize,
-                                              uint8_t                  *p_Key,
-                                              t_FmPcdCcKeyStatistics   *p_KeyStatistics);
-
-/**************************************************************************//**
- @Function      FM_PCD_HashTableGetMissStatistics
-
- @Description   This routine may be used to get statistics counters of 'miss'
-                entry of the a hash table.
-
-                If 'e_FM_PCD_CC_STATS_MODE_FRAME' and
-                'e_FM_PCD_CC_STATS_MODE_BYTE_AND_FRAME' were set for this node,
-                these counters reflect how many frames were not matched to any
-                existing key and therefore passed through the miss entry;
-
- @Param[in]     h_HashTbl           A handle to a hash table
- @Param[out]    p_MissStatistics    Statistics counters for 'miss'
-
- @Return        The statistics for 'miss'.
-
- @Cautions      Allowed only following FM_PCD_HashTableSet().
-*//***************************************************************************/
-t_Error FM_PCD_HashTableGetMissStatistics(t_Handle                 h_HashTbl,
-                                          t_FmPcdCcKeyStatistics   *p_MissStatistics);
 
 /**************************************************************************//**
  @Function      FM_PCD_ManipNodeSet
@@ -3696,5 +3627,25 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
 /** @} */ /* end of FM_PCD_Runtime_grp group */
 /** @} */ /* end of FM_PCD_grp group */
 /** @} */ /* end of FM_grp group */
+
+//external hash table time stamp options
+#define MAX_EXT_TS_TIMERS       4
+#define EXT_TS_TYPE             uint32_t
+#define EXT_TS_SIZE             sizeof(EXT_TS_TYPE)
+struct ext_hash_ts_info {
+        uint32_t max_ext_ts_timers;
+        void *ptr;
+        uint32_t offset;
+};
+#define FM_PCD_UpdateExtTimeStamp(id, val) \
+{\
+        *((EXT_TS_TYPE *)extHashTsInfo.ptr + id) = (EXT_TS_TYPE)val;\
+}
+#define FM_PCD_GetExtTimeStampAddr(id) \
+	(extHashTsInfo.offset + (id * EXT_TS_SIZE))
+
+#define FM_PCD_GetExtTsRef(id)\
+        (extHashTsInfo.offset + (id * EXT_TS_SIZE))
+extern struct ext_hash_ts_info extHashTsInfo;
 
 #endif /* __FM_PCD_EXT */

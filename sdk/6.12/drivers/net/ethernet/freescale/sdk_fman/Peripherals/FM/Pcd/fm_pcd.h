@@ -368,6 +368,8 @@ typedef struct {
     uintptr_t                   capwapFrameIdAddr;
     bool                        advancedOffloadSupport;
 
+    uint32_t			InternalBufMgmtMuramArea; // MURAM address area used for internal buffers in EHASH
+    void *pIntMuramPtr; // MURAM pointer for internal buffers in EHASH
     t_FmPcdDriverParam          *p_FmPcdDriverParam;
 } t_FmPcd;
 
@@ -387,11 +389,6 @@ e_NetHeaderType FmPcdGetAliasHdr(t_FmPcd *p_FmPcd, uint8_t netEnvId, e_NetHeader
 uint8_t     FmPcdNetEnvGetUnitIdForSingleHdr(t_FmPcd *p_FmPcd, uint8_t netEnvId, e_NetHeaderType hdr);
 uint8_t     FmPcdNetEnvGetUnitId(t_FmPcd *p_FmPcd, uint8_t netEnvId, e_NetHeaderType hdr, bool interchangeable, protocolOpt_t opt);
 
-t_Error     FmPcdManipBuildIpReassmScheme(t_FmPcd *p_FmPcd, t_Handle h_NetEnv, t_Handle h_CcTree, t_Handle h_Manip, bool isIpv4, uint8_t groupId);
-t_Error     FmPcdManipDeleteIpReassmSchemes(t_Handle h_Manip);
-t_Error     FmPcdManipBuildCapwapReassmScheme(t_FmPcd *p_FmPcd, t_Handle h_NetEnv, t_Handle h_CcTree, t_Handle h_Manip, uint8_t groupId);
-t_Error     FmPcdManipDeleteCapwapReassmSchemes(t_Handle h_Manip);
-bool        FmPcdManipIpReassmIsIpv6Hdr(t_Handle h_Manip);
 
 t_Handle    KgConfig( t_FmPcd *p_FmPcd, t_FmPcdParams *p_FmPcdParams);
 t_Error     KgInit(t_FmPcd *p_FmPcd);
@@ -410,6 +407,7 @@ t_Error     FmPcdKgFreeSchemes(t_Handle h_FmPcd, uint8_t numOfSchemes, uint8_t g
 t_Error     KgBindPortToSchemes(t_Handle h_FmPcd , uint8_t hardwarePortId, uint32_t spReg);
 
 t_FmPcdLock *FmPcdAcquireLock(t_Handle h_FmPcd);
+t_FmPcdLock * FmPcdAcquireLockedLock(t_Handle h_FmPcd);
 void        FmPcdReleaseLock(t_Handle h_FmPcd, t_FmPcdLock *p_Lock);
 
 t_Handle    PlcrConfig(t_FmPcd *p_FmPcd, t_FmPcdParams *p_FmPcdParams);
@@ -454,6 +452,16 @@ void DequeueNodeInfoFromRelevantLst(t_List *p_List, t_Handle h_Info, t_Handle h_
 t_CcNodeInformation* FindNodeInfoInReleventLst(t_List *p_List, t_Handle h_Info, t_Handle h_Spinlock);
 t_List *FmPcdManipGetSpinlock(t_Handle h_Manip);
 t_List *FmPcdManipGetNodeLstPointedOnThisManip(t_Handle h_Manip);
+
+typedef struct
+{
+    uint8_t     *p_Hmct;
+    uint16_t    tableSize;
+    bool        parseAfterHm;
+} t_FmPcdManipHmCcParams;
+
+void FmPcdManipLocalHMGetParams(t_Handle h_Manip, t_FmPcdManipHmCcParams *p_Params, t_Handle *h_ManipIter);
+void FmPcdManipGetInternaltHmTdAndNonHmAd(t_Handle h_Manip, t_Handle *p_InernalHmtd, t_Handle *p_NonHmAd);
 
 typedef struct
 {

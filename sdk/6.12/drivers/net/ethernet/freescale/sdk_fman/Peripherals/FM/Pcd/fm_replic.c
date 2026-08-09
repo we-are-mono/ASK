@@ -288,6 +288,7 @@ static t_Error BuildShadowAndModifyDescriptor(t_FmPcdFrmReplicGroup   *p_ReplicG
     t_FmPcd                 *p_FmPcd;
     t_FmPcdFrmReplicMember  shadowMember;
     t_Error                 err;
+    uint8_t                 tmpAd[FM_PCD_CC_AD_ENTRY_SIZE];
 
     ASSERT_COND(p_ReplicGroup);
     ASSERT_COND(p_ReplicGroup->h_FmPcd);
@@ -315,9 +316,16 @@ static t_Error BuildShadowAndModifyDescriptor(t_FmPcdFrmReplicGroup   *p_ReplicG
     }
     else
     {
-        IO2IOCpy32(p_FmPcd->p_CcShadow,
-                   p_CurrentMember->p_MemberAd,
-                   FM_PCD_CC_AD_ENTRY_SIZE);
+        /* Both the member AD and the CC shadow are FM_MURAM_AllocMem()
+         * allocations - device memory on ARM64. There is no iomem-to-iomem
+         * copy in the kernel, so bounce through the stack with
+         * memcpy_fromio()/memcpy_toio(). */
+        memcpy_fromio(tmpAd,
+                      (const void __iomem *)p_CurrentMember->p_MemberAd,
+                      FM_PCD_CC_AD_ENTRY_SIZE);
+        memcpy_toio((void __iomem *)p_FmPcd->p_CcShadow,
+                    tmpAd,
+                    FM_PCD_CC_AD_ENTRY_SIZE);
 
         /* update the last bit in the shadow ad */
         FillReplicAdOfTypeResult(p_FmPcd->p_CcShadow, last);

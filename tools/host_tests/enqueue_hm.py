@@ -20,12 +20,8 @@ HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
 
 
 def test_cpu_egress_storage_profile(tmp_path):
-    # The shipped patch, so this does not depend on a previously built kernel.
-    run_process([
-        "git", "apply", f"--include={HEADER}",
-        str(kernel_line.patches() / "010-ask-fman-dpaa-ehash.patch"),
-    ], cwd=tmp_path, check=True)
-    header = (tmp_path / HEADER).read_text()
+    # The line's SDK copy, so this does not depend on a previously built kernel.
+    header = (kernel_line.sdk() / HEADER).read_text()
     common = (ROOT / "cdx/cdx_common.h").read_text()
     ipv4 = (ROOT / "cdx/control_ipv4.h").read_text()
     fe = (ROOT / "cdx/fe.h").read_text()

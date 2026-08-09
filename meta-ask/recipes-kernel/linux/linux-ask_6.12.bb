@@ -12,7 +12,7 @@ require linux-ask.inc
 # The series, in order: one entry per patch in patches/kernel/6.12 (a glob
 # once dropped every patch numbered 100 or above).
 SRC_URI += "\
-           file://010-ask-fman-dpaa-ehash.patch \
+           file://010-ask-fast-path-core.patch \
            file://040-ask-xfrm-ipsec-offload.patch \
            file://070-ask-ppp-hooks.patch \
            file://080-wext-core-restore-ndo_do_ioctl.patch \

@@ -114,8 +114,10 @@ config FSL_DPAA_ETH_REFILL_THRESHOLD
 	default "80"
 	help
 	  The DPAA-Ethernet driver will start replenishing buffer pools whose count
-	  falls below this threshold per CPU. This must be related to DPAA_ETH_MAX_BUF_COUNT.
-	  One needn't normally modify this value unless one has very specific performance reasons.
+	  falls below (buffer pool config count - this threshold)(for ethernet buffer case
+	  config count is DPAA_ETH_MAX_BUF_COUNT). This parameter can also useful for other
+	  buffer pools(vsp is using it). One needn't normally modify this value unless one
+	  has very specific performance reasons.
 
 config FSL_DPAA_CS_THRESHOLD_1G
 	hex "Egress congestion threshold on 1G ports"

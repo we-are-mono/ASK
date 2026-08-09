@@ -526,6 +526,9 @@ static void get_oh_stats_reg(struct fman_port *port,
     case E_FMAN_PORT_STATS_CNT_DEALLOC_BUF:
         *stats_reg = &regs->fmbm_obdc;
         break;
+    case E_FMAN_PORT_STATS_CNT_RX_OUT_OF_BUF:
+        *stats_reg = &regs->fmbm_oodc;
+        break;
     case E_FMAN_PORT_STATS_CNT_FILTERED_FRAME:
         *stats_reg = &regs->fmbm_offc;
         break;
@@ -881,6 +884,48 @@ int fman_port_disable(const struct fman_port *port)
         return -EBUSY;
 
     return 0;
+}
+
+/* Whether the port has finished stopping, read from the registers rather than
+ * from what software last asked for: its BMI is disabled and reports no
+ * graceful stop still under way, and for a port QMI dequeues for, QMI is
+ * disabled and handles no frame descriptor. fman_port_disable() waits a
+ * bounded time for the same bits and then gives up, so a port it reported
+ * stopped may still be finishing a frame; this is the question to ask again. */
+bool fman_port_is_stopped(const struct fman_port *port)
+{
+    uint32_t *bmi_cfg_reg, *bmi_status_reg;
+    bool rx_port;
+
+    switch (port->type) {
+    case E_FMAN_PORT_TYPE_RX:
+    case E_FMAN_PORT_TYPE_RX_10G:
+        bmi_cfg_reg = &port->bmi_regs->rx.fmbm_rcfg;
+        bmi_status_reg = &port->bmi_regs->rx.fmbm_rst;
+        rx_port = TRUE;
+        break;
+    case E_FMAN_PORT_TYPE_TX:
+    case E_FMAN_PORT_TYPE_TX_10G:
+        bmi_cfg_reg = &port->bmi_regs->tx.fmbm_tcfg;
+        bmi_status_reg = &port->bmi_regs->tx.fmbm_tst;
+        rx_port = FALSE;
+        break;
+    case E_FMAN_PORT_TYPE_OP:
+    case E_FMAN_PORT_TYPE_HC:
+        bmi_cfg_reg = &port->bmi_regs->oh.fmbm_ocfg;
+        bmi_status_reg = &port->bmi_regs->oh.fmbm_ost;
+        rx_port = FALSE;
+        break;
+    default:
+        return FALSE;
+    }
+
+    if (!rx_port &&
+        ((ioread32be(&port->qmi_regs->fmqm_pnc) & QMI_PORT_CFG_EN) ||
+         (ioread32be(&port->qmi_regs->fmqm_pns) & QMI_PORT_STATUS_DEQ_FD_BSY)))
+        return FALSE;
+    return !(ioread32be(bmi_cfg_reg) & BMI_PORT_CFG_EN) &&
+           !(ioread32be(bmi_status_reg) & BMI_PORT_STATUS_BSY);
 }
 
 int fman_port_set_bpools(const struct fman_port *port,

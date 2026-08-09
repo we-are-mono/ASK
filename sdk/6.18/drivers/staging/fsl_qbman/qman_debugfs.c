@@ -31,6 +31,9 @@
 #include "qman_private.h"
 
 #define MAX_FQID (0x00ffffff)
+/* How long a frame-queue query waits for QMan: these files are read when QMan
+ * may be the thing that stopped answering (qman_query_fq_np_timeout()). */
+#define QMAN_DEBUGFS_TIMEOUT_US	10000
 #define QM_FQD_BLOCK_SIZE     64
 #define QM_FQD_AR             (0xC10)
 
@@ -239,7 +242,7 @@ static int query_fq_np_fields_show(struct seq_file *file, void *offset)
 	struct qman_fq fq;
 
 	fq.fqid = query_fq_np_fields_data.fqid;
-	ret = qman_query_fq_np(&fq, &np);
+	ret = qman_query_fq_np_timeout(&fq, &np, QMAN_DEBUGFS_TIMEOUT_US);
 	if (ret)
 		return ret;
 	/* Print state */
@@ -998,7 +1001,7 @@ static int qman_fqd_state_show(struct seq_file *file, void *offset)
 
 	for (i = 1; i < fqid_max; i++) {
 		fq.fqid = i;
-		ret = qman_query_fq_np(&fq, &np);
+		ret = qman_query_fq_np_timeout(&fq, &np, QMAN_DEBUGFS_TIMEOUT_US);
 		if (ret)
 			return ret;
 		if (*state == (np.state & QM_MCR_NP_STATE_MASK))
@@ -1098,7 +1101,7 @@ static int qman_fqd_non_prog_summary_show(struct seq_file *file, void *offset)
 
 	for (i = 1; i < fqid_max; i++) {
 		fq.fqid = i;
-		ret = qman_query_fq_np(&fq, &np);
+		ret = qman_query_fq_np_timeout(&fq, &np, QMAN_DEBUGFS_TIMEOUT_US);
 		if (ret)
 			return ret;
 		/* Keep a summary count of all states */

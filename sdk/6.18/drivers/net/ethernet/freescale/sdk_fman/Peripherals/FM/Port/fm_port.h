@@ -168,12 +168,10 @@ typedef uint32_t fmPcdEngines_t; /**< options as defined below: */
 /***********************************************************************/
 /*          SW parser OFFLOAD labels (offsets)                         */
 /***********************************************************************/
-#define OFFLOAD_SW_PATCH_IPv4_IPR_LABEL         0x100
 /* Will be used for:
  * 1. identify fragments
  * 2. udp-lite
  */
-#define OFFLOAD_SW_PATCH_IPv6_IPR_LABEL         0x146
 /* Will be used for:
  * 1. will identify the fragmentable area
  * 2. udp-lite
@@ -743,6 +741,12 @@ typedef struct {
 } t_FmMacIm;
 
 
+struct fm_port_pcd_bindings {
+    bool cc;
+    bool clsPlan;
+    bool schemes;
+};
+
 typedef struct {
     struct fman_port_cfg                dfltCfg;
     uint32_t                            dfltFqid;
@@ -813,13 +817,26 @@ typedef struct {
     uint8_t                     portId;
     e_FmPortType                portType;
     int                         enabled;
+    /* FM_PORT_Enable() refuses while set (FM_PORT_SetFenced()). Read and
+     * written under h_Spinlock. */
+    bool                        fenced;
     char                        name[MODULE_NAME_SIZE];
     uint8_t                     hardwarePortId;
+    /* FM resource accounting outlives the initialization parameters. */
+    uint8_t                     deqPipelineDepth;
+    bool                        fmPortParamsAllocated;
     uint16_t                    fmClkFreq;
     t_FmPortQmiRegs             *p_FmPortQmiRegs;
     u_FmPortBmiRegs             *p_FmPortBmiRegs;
     t_FmPortPrsRegs             *p_FmPortPrsRegs;
     fmPcdEngines_t              pcdEngines;
+    /* Persist ownership until cleanup succeeds, including a failed setup. */
+    struct fm_port_pcd_bindings pcdBindings;
+    bool                        pcdConfigured;
+    bool                        pcdNetEnvOwner;
+    /* The PCD stays configured, but new frames go to the default queue
+     * (FM_PORT_BypassPCD()). Under the port lock. */
+    bool                        pcdBypassed;
     uint32_t                    savedBmiNia;
     uint8_t                     netEnvId;
     uint32_t                    optArray[FM_PCD_MAX_NUM_OF_OPTIONS(FM_PCD_MAX_NUM_OF_CLS_PLANS)];
@@ -861,14 +878,14 @@ typedef struct {
     t_FmPortRsrc                fifoBufs;
     t_FmPortRxPoolsParams       rxPoolsParams;
 //    bool                        explicitUserSizeOfFifo;
-    t_Handle                    h_IpReassemblyManip;
-    t_Handle                    h_CapwapReassemblyManip;
-    t_Handle                    h_ReassemblyTree;
     uint64_t                    fmMuramPhysBaseAddr;
     bool                        vspe;
     uint8_t                     dfltRelativeId;
     e_FmPortGprFuncType         gprFunc;
     t_FmPcdCtrlParamsPage       *p_ParamsPage;
+    bool						supportFE;
+    uintptr_t                   internalFEBufferPoolManagementIndexAddr;
+    uintptr_t                   internalFEBufferPoolAddr;
     t_FmPortDriverParam         *p_FmPortDriverParam;
 } t_FmPort;
 

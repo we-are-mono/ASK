@@ -41,11 +41,11 @@ def policer_layer(tmp_path: Path) -> None:
     cfg = (ROOT / "cdx/dpa_cfg.c").read_text()
     # The class layout the profile numbers are bounded by, as the rule's
     # header states it, and the shared-profile pool the FMan wrapper is built
-    # with, as patch 010 sets it: what the layer's own assertions check the
-    # profile count against.
+    # with, as the line's SDK copy sets it: what the layer's own assertions
+    # check the profile count against.
     backend = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
-    fman = (kernel_line.patches() / "010-ask-fman-dpaa-ehash.patch").read_text()
-    shared = re.search(r"^\+(#define LNXWRP_FM_NUM_OF_SHARED_PROFILES\s+\d+)", fman, re.M)
+    fman = (kernel_line.sdk() / "drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h").read_text()
+    shared = re.search(r"^(#define LNXWRP_FM_NUM_OF_SHARED_PROFILES\s+\d+)", fman, re.M)
     assert shared
     (tmp_path / "plcr_layout.inc").write_text(
         "\n".join(re.findall(r"^#define CDX_FT_QOS_\w+(?:[^\n]*\\\n)*[^\n]*$", backend, re.M))

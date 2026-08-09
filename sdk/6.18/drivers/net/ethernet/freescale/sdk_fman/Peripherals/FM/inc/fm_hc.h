@@ -47,7 +47,10 @@ typedef struct t_FmHcParams {
 
 
 t_Handle    FmHcConfigAndInit(t_FmHcParams *p_FmHcParams);
-void        FmHcFree(t_Handle h_FmHc);
+/* Stop new borrowers only when no frame is owned. A timeout permanently
+ * refuses teardown/reconfiguration: reset the board to recover PCD state. */
+t_Error     FmHcQuiesce(t_Handle h_FmHc);
+t_Error     FmHcFree(t_Handle h_FmHc);
 t_Error     FmHcSetFramesDataMemory(t_Handle h_FmHc,
                                     uint8_t  memId);
 t_Error     FmHcDumpRegs(t_Handle h_FmHc);
@@ -59,9 +62,7 @@ t_Error     FmHcPcdKgSetScheme(t_Handle                   h_FmHc,
                                struct fman_kg_scheme_regs *p_SchemeRegs,
                                bool                       updateCounter);
 t_Error     FmHcPcdKgDeleteScheme(t_Handle h_FmHc, t_Handle h_Scheme);
-t_Error     FmHcPcdCcCapwapTimeoutReassm(t_Handle h_FmHc, t_FmPcdCcCapwapReassmTimeoutParams *p_CcCapwapReassmTimeoutParams );
 t_Error     FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams);
-t_Error     FmHcPcdCcTimeoutReassm(t_Handle h_FmHc, t_FmPcdCcReassmTimeoutParams *p_CcReassmTimeoutParams, uint8_t *p_Result);
 t_Error     FmHcPcdKgSetClsPlan(t_Handle h_FmHc, t_FmPcdKgInterModuleClsPlanSet *p_Set);
 t_Error     FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t clsPlanGrpId);
 
@@ -75,6 +76,7 @@ t_Error     FmHcPcdPlcrDeleteProfile(t_Handle h_FmHc, t_Handle h_Profile);
 
 t_Error     FmHcPcdPlcrSetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter, uint32_t value);
 uint32_t    FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter);
+t_Error     FmHcPcdPlcrReadProfileCounters(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrProfileCounterValues *p_Values);
 
 t_Error     FmHcKgWriteSp(t_Handle h_FmHc, uint8_t hardwarePortId, uint32_t spReg, bool add);
 t_Error     FmHcKgWriteCpp(t_Handle h_FmHc, uint8_t hardwarePortId, uint32_t cppReg);
@@ -85,7 +87,7 @@ t_Error     FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId
 t_Error     FmHcPcdSync(t_Handle h_FmHc);
 t_Handle    FmHcGetPort(t_Handle h_FmHc);
 
-void     	FmAllowHcUsage(t_Handle h_FmHc, bool allow);
+t_Error     FmAllowHcUsage(t_Handle h_FmHc, bool allow);
 bool     	FmIsHcUsageAllowed(t_Handle h_FmHc);
 
 

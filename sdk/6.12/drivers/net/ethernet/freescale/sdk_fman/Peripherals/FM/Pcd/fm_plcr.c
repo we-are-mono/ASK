@@ -161,6 +161,14 @@ static t_Error SetProfileNia(t_FmPcd *p_FmPcd, e_FmPcdEngine nextEngine, u_FmPcd
                 RETURN_ERROR(MAJOR, E_INVALID_STATE, ("Invalid profile "));
             nia |= NIA_ENG_PLCR | NIA_PLCR_ABSOLUTE | absoluteProfileId;
             break;
+		case e_FM_PCD_PRS:
+			//send it to parser
+			nia |= 0x00480200;
+			break;
+		case e_FM_PCD_CC:
+			//send it to coarse classifier
+			nia |= 0x26;
+			break;
         default:
             RETURN_ERROR(MAJOR, E_INVALID_SELECTION, NO_MSG);
     }
@@ -345,7 +353,7 @@ static t_Error BuildProfileRegs(t_FmPcd                     *p_FmPcd,
 
     bitFor1Micro = FmGetTimeStampScale(p_FmPcd->h_Fm);
     if (bitFor1Micro == 0)
-    RETURN_ERROR(MAJOR, E_NOT_AVAILABLE, ("Timestamp scale"));
+		RETURN_ERROR(MAJOR, E_NOT_AVAILABLE, ("Timestamp scale"));
 
 /* Set G, Y, R Nia */
     err = SetProfileNia(p_FmPcd, p_ProfileParams->nextEngineOnGreen,  &(p_ProfileParams->paramsOnGreen), &gnia);
@@ -460,7 +468,8 @@ cont_rfc:
                                 pemode |= FM_PCD_PLCR_PEMODE_FLS_L4;
                                 break;
                             case e_FM_PCD_PLCR_FULL_FRM_LEN:
-                                pemode |= FM_PCD_PLCR_PEMODE_FLS_FULL;
+								/* for full frame length, include FCS size for calculation */
+								pemode |= (FM_PCD_PLCR_PEMODE_FLS_FULL | FM_PCD_PLCR_PEMODE_FCS);
                                 break;
                             default:
                                 RETURN_ERROR(MAJOR, E_INVALID_SELECTION, NO_MSG);
@@ -1794,6 +1803,37 @@ uint32_t FM_PCD_PlcrProfileGetCounter(t_Handle h_Profile, e_FmPcdPlcrProfileCoun
     PlcrHwUnlock(p_FmPcd->p_FmPcdPlcr, intFlags);
 
     return counterVal;
+}
+
+t_Error FM_PCD_PlcrProfileReadCounters(t_Handle h_Profile, t_FmPcdPlcrProfileCounterValues *p_Values)
+{
+    t_FmPcdPlcrProfile  *p_Profile = (t_FmPcdPlcrProfile*)h_Profile;
+    t_FmPcd             *p_FmPcd;
+    t_FmPcdPlcrRegs     *p_FmPcdPlcrRegs;
+    uint32_t            intFlags;
+
+    SANITY_CHECK_RETURN_ERROR(p_Profile, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(p_Values, E_NULL_POINTER);
+    p_FmPcd = p_Profile->h_FmPcd;
+    SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
+
+    if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
+        return FmHcPcdPlcrReadProfileCounters(p_FmPcd->h_Hc, h_Profile, p_Values);
+
+    p_FmPcdPlcrRegs = p_FmPcd->p_FmPcdPlcr->p_FmPcdPlcrRegs;
+    SANITY_CHECK_RETURN_ERROR(p_FmPcdPlcrRegs, E_INVALID_HANDLE);
+    if (p_Profile->absoluteProfileId >= FM_PCD_PLCR_NUM_ENTRIES)
+        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("profileId too Big "));
+
+    intFlags = PlcrHwLock(p_FmPcd->p_FmPcdPlcr);
+    WritePar(p_FmPcd, FmPcdPlcrBuildReadPlcrActionReg(p_Profile->absoluteProfileId));
+    p_Values->green = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_pegpc);
+    p_Values->yellow = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_peypc);
+    p_Values->red = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_perpc);
+    p_Values->recolouredYellow = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_perypc);
+    p_Values->recolouredRed = GET_UINT32(p_FmPcdPlcrRegs->profileRegs.fmpl_perrpc);
+    PlcrHwUnlock(p_FmPcd->p_FmPcdPlcr, intFlags);
+    return E_OK;
 }
 
 t_Error FM_PCD_PlcrProfileSetCounter(t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter, uint32_t value)

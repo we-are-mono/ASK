@@ -32,6 +32,9 @@
  */
 #define __ERR_MODULE__  MODULE_FM
 
+#include <linux/jiffies.h>
+#include <linux/printk.h>
+
 #include "std_ext.h"
 #include "error_ext.h"
 #include "sprint_ext.h"
@@ -50,20 +53,7 @@
 #define HC_HCOR_OPCODE_KG_SCM                                   0x1
 #define HC_HCOR_OPCODE_SYNC                                     0x2
 #define HC_HCOR_OPCODE_CC                                       0x3
-#define HC_HCOR_OPCODE_CC_AGE_MASK                              0x4
-#define HC_HCOR_OPCODE_CC_CAPWAP_REASSM_TIMEOUT                 0x5
-#define HC_HCOR_OPCODE_CC_REASSM_TIMEOUT                        0x10
 #define HC_HCOR_OPCODE_CC_IP_FRAG_INITIALIZATION                0x11
-#define HC_HCOR_OPCODE_CC_UPDATE_WITH_AGING                     0x13
-#define HC_HCOR_ACTION_REG_REASSM_TIMEOUT_ACTIVE_SHIFT          24
-#define HC_HCOR_EXTRA_REG_REASSM_TIMEOUT_TSBS_SHIFT             24
-#define HC_HCOR_EXTRA_REG_CC_AGING_ADD                          0x80000000
-#define HC_HCOR_EXTRA_REG_CC_AGING_REMOVE                       0x40000000
-#define HC_HCOR_EXTRA_REG_CC_AGING_CHANGE_MASK                  0xC0000000
-#define HC_HCOR_EXTRA_REG_CC_REMOVE_INDX_SHIFT                  24
-#define HC_HCOR_EXTRA_REG_CC_REMOVE_INDX_MASK                   0x1F000000
-#define HC_HCOR_ACTION_REG_REASSM_TIMEOUT_RES_SHIFT             16
-#define HC_HCOR_ACTION_REG_REASSM_TIMEOUT_RES_MASK              0xF
 #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_CMD_SHIFT       24
 #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_BPID            16
 
@@ -79,7 +69,12 @@
 #define SIZE_OF_HC_FRAME_PROFILE_CNT        (sizeof(t_HcFrame)-sizeof(t_FmPcdPlcrProfileRegs)+sizeof(uint32_t))
 #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
 
+
+
 #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
+/* Preserve the Linux wrapper's former one-second confirmation allowance. */
+#define HC_CONFIRM_POLLS                    10000
+#define HC_CONFIRM_POLL_US                  100
 
 #define BUILD_FD(len)                     \
 do {                                      \
@@ -111,8 +106,6 @@ typedef struct t_HcFrame {
         volatile uint32_t                       singleRegForWrite;    /* for writing SP, CPP, profile counter */
         t_FmPcdKgPortRegs                       portRegsForRead;
         volatile uint32_t                       clsPlanEntries[CLS_PLAN_NUM_PER_GRP];
-        t_FmPcdCcCapwapReassmTimeoutParams      ccCapwapReassmTimeout;
-        t_FmPcdCcReassmTimeoutParams            ccReassmTimeout;
     } hcSpecificData;
 } t_HcFrame;
 
@@ -121,21 +114,121 @@ typedef struct t_HcFrame {
 #endif /* defined(__MWERKS__) && ... */
 
 
+typedef enum e_HcBufState {
+    e_HC_BUF_FREE,
+    e_HC_BUF_READY,       /* Borrowed by a command builder or confirmed caller. */
+    e_HC_BUF_IN_FLIGHT,   /* Hardware may access the frame; caller still owns it. */
+    e_HC_BUF_ORPHANED     /* Caller returned after timeout; confirmation owns it. */
+} e_HcBufState;
+
 typedef struct t_FmHc {
     t_Handle                    h_FmPcd;
     t_Handle                    h_HcPortDev;
     bool						usageAllowed;    /**< HC usage is allowed or denied by user via API */
     t_FmPcdQmEnqueueCallback    *f_QmEnqueue;     /**< A callback for enqueuing frames to the QM */
     t_Handle                    h_QmArg;          /**< A handle to the QM module */
+    void                        (*f_QmDescribe)(t_Handle h_QmArg, char *p_Buf, uint32_t size);
     uint8_t                     dataMemId;        /**< Memory partition ID for data buffers */
 
     uint32_t                    seqNum[HC_CMD_POOL_SIZE];   /* FIFO of seqNum to use when
                                                                taking buffer */
     uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
-    volatile bool               enqueued[HC_CMD_POOL_SIZE]; /* HC is active - frame is enqueued
-                                                               and not confirmed yet */
+    t_Handle                    h_Spinlock;
+    e_HcBufState                bufState[HC_CMD_POOL_SIZE];
+    bool                        quiescing;    /* No new borrowers during teardown. */
+    uint32_t                    failures;     /* Failed since a command last completed. */
     t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
+    /* What each command in flight is and when it went out, taken before the
+     * enqueue swaps the frame to hardware order: a timeout names its command,
+     * and that command's confirmation, should it still come, says how late. */
+    uint32_t                    sentOpcode[HC_CMD_POOL_SIZE];
+    unsigned long               sentAt[HC_CMD_POOL_SIZE];
+    /* Each command that timed out, until its confirmation says how late it
+     * was: commands in flight together can each time out. While any is
+     * unanswered the port is sent nothing more (HcUnanswered()). */
+    bool                        timedOut[HC_CMD_POOL_SIZE];
 } t_FmHc;
+
+static const char *HcOpcodeName(uint32_t opcode)
+{
+    switch (opcode & ~HC_HCOR_GBL)
+    {
+        case HC_HCOR_OPCODE_PLCR_PRFL:                 return "policer profile";
+        case HC_HCOR_OPCODE_KG_SCM:                    return "KeyGen scheme";
+        case HC_HCOR_OPCODE_SYNC:                      return "sync";
+        case HC_HCOR_OPCODE_CC:                        return "coarse classification";
+        case HC_HCOR_OPCODE_CC_IP_FRAG_INITIALIZATION: return "IP fragmentation init";
+        default:                                       return "unknown";
+    }
+}
+
+/* Caller holds the HC lock. */
+static uint32_t HcOutstanding(t_FmHc *p_FmHc)
+{
+    uint32_t i, n = 0;
+
+    for (i = 0; i < HC_CMD_POOL_SIZE; i++)
+        if (p_FmHc->bufState[i] == e_HC_BUF_IN_FLIGHT ||
+            p_FmHc->bufState[i] == e_HC_BUF_ORPHANED)
+            n++;
+    return n;
+}
+
+static uint32_t HcLock(t_FmHc *p_FmHc)
+{
+    return XX_LockIntrSpinlock(p_FmHc->h_Spinlock);
+}
+
+static void HcUnlock(t_FmHc *p_FmHc, uint32_t flags)
+{
+    XX_UnlockIntrSpinlock(p_FmHc->h_Spinlock, flags);
+}
+
+/* Caller holds the HC lock. Both the borrower and hardware are finished. */
+static void ReturnBuf(t_FmHc *p_FmHc, uint32_t seqNum)
+{
+    ASSERT_COND(p_FmHc->nextSeqNumLocation);
+    p_FmHc->bufState[seqNum] = e_HC_BUF_FREE;
+    p_FmHc->seqNum[--p_FmHc->nextSeqNumLocation] = seqNum;
+}
+
+/* Caller holds the HC lock. Whether a command that timed out is still to be
+ * answered. Until each is, the port that has not answered is sent nothing
+ * more: what it was given may still be running, and a command sent after it
+ * would wait out its own deadline behind it. Its answer opens the channel
+ * again (FmHcTxConf()). */
+static bool HcUnanswered(t_FmHc *p_FmHc)
+{
+    uint32_t i;
+
+    for (i = 0; i < HC_CMD_POOL_SIZE; i++)
+        if (p_FmHc->timedOut[i])
+            return TRUE;
+    return FALSE;
+}
+
+/* While a timed-out command is unanswered, or while commands cannot be
+ * queued, every later command fails the same way -- and CDX retries a sync
+ * once a second while anything waits on a barrier. So a run of failures
+ * reports its first only, and the command that ends it says how many there
+ * were: a new run always reports again. A timeout is reported
+ * unconditionally and starts a run of its own. */
+static bool HcFirstFailure(t_FmHc *p_FmHc)
+{
+    uint32_t    intFlags = HcLock(p_FmHc);
+    bool        first = !p_FmHc->failures++;
+
+    HcUnlock(p_FmHc, intFlags);
+    return first;
+}
+
+#define HC_RETURN_FIRST_ERROR(_p_FmHc, _level, _err, _vmsg) \
+    do { \
+        if (HcFirstFailure(_p_FmHc)) { \
+            REPORT_ERROR(_level, (_err), _vmsg); \
+        } \
+        return ERROR_CODE(_err); \
+    } while (0)
 
 
 static t_Error FillBufPool(t_FmHc *p_FmHc)
@@ -163,6 +256,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
     for (i = 0; i < HC_CMD_POOL_SIZE; i++)
     {
         p_FmHc->seqNum[i] = i;
+        p_FmHc->bufState[i] = e_HC_BUF_FREE;
     }
     p_FmHc->nextSeqNumLocation = 0;
 
@@ -175,19 +269,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
 
     ASSERT_COND(p_FmHc);
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+    intFlags = HcLock(p_FmHc);
 
-    if (p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
+    if (p_FmHc->quiescing || p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
     {
         /* No more buffers */
-        FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+        HcUnlock(p_FmHc, intFlags);
         return NULL;
     }
 
     *p_SeqNum = p_FmHc->seqNum[p_FmHc->nextSeqNumLocation];
+    ASSERT_COND(p_FmHc->bufState[*p_SeqNum] == e_HC_BUF_FREE);
+    p_FmHc->bufState[*p_SeqNum] = e_HC_BUF_READY;
     p_FmHc->nextSeqNumLocation++;
 
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    HcUnlock(p_FmHc, intFlags);
     return p_FmHc->p_Frm[*p_SeqNum];
 }
 
@@ -195,40 +291,101 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
 {
     uint32_t    intFlags;
 
-    UNUSED(p_Buf);
-
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-    ASSERT_COND(p_FmHc->nextSeqNumLocation);
-    p_FmHc->nextSeqNumLocation--;
-    p_FmHc->seqNum[p_FmHc->nextSeqNumLocation] = seqNum;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    intFlags = HcLock(p_FmHc);
+    ASSERT_COND(seqNum < HC_CMD_POOL_SIZE && p_Buf == p_FmHc->p_Frm[seqNum]);
+    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY ||
+                p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT);
+    if (p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT)
+        p_FmHc->bufState[seqNum] = e_HC_BUF_ORPHANED;
+    else
+        ReturnBuf(p_FmHc, seqNum);
+    HcUnlock(p_FmHc, intFlags);
 }
 
 static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
 {
     t_Error     err = E_OK;
     uint32_t    intFlags;
-    uint32_t    timeout=100;
+    uint32_t    timeout = HC_CONFIRM_POLLS;
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
-    ASSERT_COND(!p_FmHc->enqueued[seqNum]);
-    p_FmHc->enqueued[seqNum] = TRUE;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    intFlags = HcLock(p_FmHc);
+    if (p_FmHc->quiescing || HcUnanswered(p_FmHc))
+    {
+        HcUnlock(p_FmHc, intFlags);
+        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, E_INVALID_STATE,
+                              ("HC unavailable until a timed-out command is answered"));
+    }
+    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
+    p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
+    p_FmHc->sentOpcode[seqNum] = p_FmHc->p_Frm[seqNum]->opcode;
+    p_FmHc->sentAt[seqNum] = jiffies;
+    HcUnlock(p_FmHc, intFlags);
     DBG(TRACE, ("Send Hc, SeqNum %d, buff@0x%p, fd offset 0x%x",
                 seqNum,
                 DPAA_FD_GET_ADDR(p_FmFd),
                 DPAA_FD_GET_OFFSET(p_FmFd)));
     err = p_FmHc->f_QmEnqueue(p_FmHc->h_QmArg, (void *)p_FmFd);
     if (err)
-        RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
+    {
+        /* Enqueue errors mean rejection, never an accepted-command timeout. */
+        intFlags = HcLock(p_FmHc);
+        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+        HcUnlock(p_FmHc, intFlags);
+        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, err, ("HC enqueue failed"));
+    }
 
-    while (p_FmHc->enqueued[seqNum] && --timeout)
-        XX_UDelay(100);
+    for (;;)
+    {
+        intFlags = HcLock(p_FmHc);
+        if (p_FmHc->bufState[seqNum] == e_HC_BUF_READY)
+        {
+            uint32_t failures = p_FmHc->failures;
 
-    if (!timeout)
-        RETURN_ERROR(MINOR, E_TIMEOUT, ("HC Callback, timeout exceeded"));
+            p_FmHc->failures = 0;
+            HcUnlock(p_FmHc, intFlags);
+            if (failures)
+                pr_info("FM HC: a command completed after %u failed\n", failures);
+            return E_OK;
+        }
+        if (!timeout--)
+        {
+            /* Unanswered, the command may still run, or be running: its
+             * frame stays the hardware's (PutBuf()), and nothing more goes
+             * to the port until it is answered, nor may register programming
+             * switch to direct (FmIsHcUsageAllowed()). Its caller learns
+             * only that the outcome is unknown -- for a change to the FMan's
+             * state, that it may have been made -- and puts its own record
+             * right once the answer has opened the channel again. */
+            uint32_t opcode = p_FmHc->sentOpcode[seqNum];
+            uint32_t waited = jiffies_to_msecs(jiffies - p_FmHc->sentAt[seqNum]);
+            uint32_t others = HcOutstanding(p_FmHc) - 1;
+            char queues[256] = "not known";
 
-    return err;
+            p_FmHc->timedOut[seqNum] = TRUE;
+            p_FmHc->failures++;
+            HcUnlock(p_FmHc, intFlags);
+            /* Where the frame is: in the sending CPU's enqueue ring, QMan
+             * never took it; on the port's queue, the port never took it; on
+             * the answer queue, the CPU's portal has not dequeued it, and its
+             * channel's work queues say what it served first; in the portal's
+             * ring, that CPU has not processed it; on none of them, the FMan
+             * is still running it. The description asks QMan only within a
+             * bound, and says so when QMan does not answer. */
+            if (p_FmHc->f_QmDescribe)
+                p_FmHc->f_QmDescribe(p_FmHc->h_QmArg, queues, sizeof(queues));
+            /* The builder below is the HC entry point; who asked for the
+             * command -- an ehash insert or delete barrier, a quarantine
+             * drain -- is further up. Once per episode: until the answer,
+             * every later command is refused before it is sent. */
+            dump_stack();
+            RETURN_ERROR(MINOR, E_TIMEOUT,
+                         ("HC confirmation timed out; commands wait for its answer: seq %u, %s (opcode 0x%08x) built by %pS, unconfirmed after %u ms, %u other commands outstanding; %s",
+                          seqNum, HcOpcodeName(opcode), opcode,
+                          __builtin_return_address(0), waited, others, queues));
+        }
+        HcUnlock(p_FmHc, intFlags);
+        XX_UDelay(HC_CONFIRM_POLL_US);
+    }
 }
 
 
@@ -249,8 +406,15 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     p_FmHc->h_FmPcd             = p_FmHcParams->h_FmPcd;
     p_FmHc->f_QmEnqueue         = p_FmHcParams->params.f_QmEnqueue;
     p_FmHc->h_QmArg             = p_FmHcParams->params.h_QmArg;
+    p_FmHc->f_QmDescribe        = p_FmHcParams->params.f_QmDescribe;
     p_FmHc->dataMemId           = DEFAULT_dataMemId;
     p_FmHc->usageAllowed		= TRUE;
+    p_FmHc->h_Spinlock = XX_InitSpinlock();
+    if (!p_FmHc->h_Spinlock)
+    {
+        XX_Free(p_FmHc);
+        return NULL;
+    }
 
     err = FillBufPool(p_FmHc);
     if (err != E_OK)
@@ -278,7 +442,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     if (!p_FmHc->h_HcPortDev)
     {
         REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM HC port!"));
-        XX_Free(p_FmHc);
+        FmHcFree(p_FmHc);
         return NULL;
     }
 
@@ -312,13 +476,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     return (t_Handle)p_FmHc;
 }
 
-void FmHcFree(t_Handle h_FmHc)
+t_Error FmHcQuiesce(t_Handle h_FmHc)
+{
+    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
+    uint32_t flags;
+    t_Error err = E_OK;
+
+    if (!p_FmHc)
+        return E_OK;
+    flags = HcLock(p_FmHc);
+    /* An unanswered command's frame is still the hardware's, and borrowed
+     * until its answer returns it. */
+    if (p_FmHc->nextSeqNumLocation || HcUnanswered(p_FmHc))
+        err = ERROR_CODE(E_BUSY);
+    else
+        p_FmHc->quiescing = TRUE;
+    HcUnlock(p_FmHc, flags);
+    return err;
+}
+
+t_Error FmHcFree(t_Handle h_FmHc)
 {
     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
+    t_Error err;
     int     i;
 
     if (!p_FmHc)
-        return;
+        return E_OK;
+
+    err = FmHcQuiesce(p_FmHc);
+    if (err)
+        return err;
+    if (p_FmHc->h_HcPortDev)
+    {
+        err = FM_PORT_Free(p_FmHc->h_HcPortDev);
+        if (err)
+            return err;
+    }
 
     for (i=0; i<HC_CMD_POOL_SIZE; i++)
         if (p_FmHc->p_Frm[i])
@@ -326,10 +520,9 @@ void FmHcFree(t_Handle h_FmHc)
         else
             break;
 
-    if (p_FmHc->h_HcPortDev)
-        FM_PORT_Free(p_FmHc->h_HcPortDev);
-
+    XX_FreeSpinlock(p_FmHc->h_Spinlock);
     XX_Free(p_FmHc);
+    return E_OK;
 }
 
 /*****************************************************************************/
@@ -338,16 +531,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
 {
     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
     int     i;
+    t_Error err;
 
     SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
 
+    err = FmHcQuiesce(p_FmHc);
+    if (err)
+        return err;
     p_FmHc->dataMemId            = memId;
 
     for (i=0; i<HC_CMD_POOL_SIZE; i++)
         if (p_FmHc->p_Frm[i])
+        {
             XX_FreeSmart(p_FmHc->p_Frm[i]);
+            p_FmHc->p_Frm[i] = NULL;
+        }
 
-    return FillBufPool(p_FmHc);
+    err = FillBufPool(p_FmHc);
+    if (!err)
+    {
+        uint32_t flags = HcLock(p_FmHc);
+        p_FmHc->quiescing = FALSE;
+        HcUnlock(p_FmHc, flags);
+    }
+    return err;
 }
 
 void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
@@ -355,20 +562,48 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
     t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
     t_HcFrame   *p_HcFrame;
     uint32_t    intFlags;
+    uint32_t    seqNum;
+    bool        late = FALSE, reopened = FALSE;
+    uint32_t    opcode = 0, waited = 0;
 
     ASSERT_COND(p_FmHc);
 
-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+    intFlags = HcLock(p_FmHc);
     p_HcFrame  = (t_HcFrame *)PTR_MOVE(DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd));
 
-    DBG(TRACE, ("Hc Conf, SeqNum %d, FD@0x%p, fd offset 0x%x",
-                p_HcFrame->commandSequence, DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd)));
-
-    if (!(p_FmHc->enqueued[p_HcFrame->commandSequence]))
+    /* Match an owned buffer before reading an untrusted sequence index. */
+    for (seqNum = 0; seqNum < HC_CMD_POOL_SIZE; seqNum++)
+        if (p_HcFrame == p_FmHc->p_Frm[seqNum])
+            break;
+    if (!p_HcFrame || seqNum == HC_CMD_POOL_SIZE ||
+        p_HcFrame->commandSequence != seqNum ||
+        (p_FmHc->bufState[seqNum] != e_HC_BUF_IN_FLIGHT &&
+         p_FmHc->bufState[seqNum] != e_HC_BUF_ORPHANED))
         REPORT_ERROR(MINOR, E_INVALID_FRAME, ("Not an Host-Command frame received!"));
     else
-        p_FmHc->enqueued[p_HcFrame->commandSequence] = FALSE;
-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
+    {
+        /* A command that timed out answering after all says it was late
+         * rather than lost: the one thing a timeout cannot tell. The last
+         * such answer opens the channel again, with nothing left inside the
+         * port. */
+        if (p_FmHc->timedOut[seqNum])
+        {
+            p_FmHc->timedOut[seqNum] = FALSE;
+            late = TRUE;
+            reopened = !HcUnanswered(p_FmHc);
+            opcode = p_FmHc->sentOpcode[seqNum];
+            waited = jiffies_to_msecs(jiffies - p_FmHc->sentAt[seqNum]);
+        }
+        if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
+            ReturnBuf(p_FmHc, seqNum);
+        else
+            p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
+    }
+    HcUnlock(p_FmHc, intFlags);
+    if (late)
+        pr_warn("FM HC: seq %u, %s (opcode 0x%08x), confirmed %u ms after it was sent, after its timeout%s\n",
+                seqNum, HcOpcodeName(opcode), opcode, waited,
+                reopened ? "; commands resume" : "");
 }
 
 t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,
@@ -704,32 +939,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
     return E_OK;
 }
 
-t_Error FmHcPcdCcCapwapTimeoutReassm(t_Handle h_FmHc, t_FmPcdCcCapwapReassmTimeoutParams *p_CcCapwapReassmTimeoutParams )
-{
-    t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
-    t_HcFrame                           *p_HcFrame;
-    t_DpaaFD                            fmFd;
-    t_Error                             err;
-    uint32_t                            seqNum;
-
-    SANITY_CHECK_RETURN_VALUE(h_FmHc, E_INVALID_HANDLE,0);
-
-    p_HcFrame = GetBuf(p_FmHc, &seqNum);
-    if (!p_HcFrame)
-        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
-
-    memset(p_HcFrame, 0, sizeof(t_HcFrame));
-    p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_CC_CAPWAP_REASSM_TIMEOUT);
-    memcpy(&p_HcFrame->hcSpecificData.ccCapwapReassmTimeout, p_CcCapwapReassmTimeoutParams, sizeof(t_FmPcdCcCapwapReassmTimeoutParams));
-    p_HcFrame->commandSequence = seqNum;
-    BUILD_FD(sizeof(t_HcFrame));
-
-    err = EnQFrm(p_FmHc, &fmFd, seqNum);
-
-    PutBuf(p_FmHc, p_HcFrame, seqNum);
-    return err;
-}
-
 t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams)
 {
     t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
@@ -763,40 +972,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
     }
 
     p_FmPcdCcFragScratchPoolCmdParams->numOfBuffers = p_HcFrame->extraReg;
-
-    PutBuf(p_FmHc, p_HcFrame, seqNum);
-    return E_OK;
-}
-
-t_Error FmHcPcdCcTimeoutReassm(t_Handle h_FmHc, t_FmPcdCcReassmTimeoutParams *p_CcReassmTimeoutParams, uint8_t *p_Result)
-{
-    t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
-    t_HcFrame                           *p_HcFrame;
-    t_DpaaFD                            fmFd;
-    t_Error                             err;
-    uint32_t                            seqNum;
-
-    SANITY_CHECK_RETURN_VALUE(h_FmHc, E_INVALID_HANDLE,0);
-
-    p_HcFrame = GetBuf(p_FmHc, &seqNum);
-    if (!p_HcFrame)
-        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
-
-    memset(p_HcFrame, 0, sizeof(t_HcFrame));
-    p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_CC_REASSM_TIMEOUT);
-    p_HcFrame->actionReg = (uint32_t)((p_CcReassmTimeoutParams->activate ? 0 : 1) << HC_HCOR_ACTION_REG_REASSM_TIMEOUT_ACTIVE_SHIFT);
-    p_HcFrame->extraReg = (p_CcReassmTimeoutParams->tsbs << HC_HCOR_EXTRA_REG_REASSM_TIMEOUT_TSBS_SHIFT) | p_CcReassmTimeoutParams->iprcpt;
-    p_HcFrame->commandSequence = seqNum;
-
-    BUILD_FD(sizeof(t_HcFrame));
-    if ((err = EnQFrm(p_FmHc, &fmFd, seqNum)) != E_OK)
-    {
-        PutBuf(p_FmHc, p_HcFrame, seqNum);
-        RETURN_ERROR(MINOR, err, NO_MSG);
-    }
-
-    *p_Result = (uint8_t)
-        ((p_HcFrame->actionReg >> HC_HCOR_ACTION_REG_REASSM_TIMEOUT_RES_SHIFT) & HC_HCOR_ACTION_REG_REASSM_TIMEOUT_RES_MASK);
 
     PutBuf(p_FmHc, p_HcFrame, seqNum);
     return E_OK;
@@ -932,7 +1107,7 @@ t_Error FmHcPcdPlcrSetProfile(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrPr
 
     p_HcFrame = GetBuf(p_FmHc, &seqNum);
     if (!p_HcFrame)
-        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
+        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, E_NO_MEMORY, ("HC Frame object"));
 
     profileIndx = FmPcdPlcrProfileGetAbsoluteId(h_Profile);
 
@@ -949,8 +1124,11 @@ t_Error FmHcPcdPlcrSetProfile(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrPr
 
     PutBuf(p_FmHc, p_HcFrame, seqNum);
 
+    /* A policer's owner writes it again until it lands, once a second while
+     * the channel is shut: EnQFrm() reported it, if it was the first of its
+     * run. */
     if (err != E_OK)
-        RETURN_ERROR(MINOR, err, NO_MSG);
+        return ERROR_CODE(err);
 
     return E_OK;
 }
@@ -1021,25 +1199,20 @@ t_Error  FmHcPcdPlcrSetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmP
     return E_OK;
 }
 
-uint32_t FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter)
+t_Error FmHcPcdPlcrReadProfileCounters(t_Handle h_FmHc, t_Handle h_Profile, t_FmPcdPlcrProfileCounterValues *p_Values)
 {
     t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
     uint16_t    absoluteProfileId = FmPcdPlcrProfileGetAbsoluteId(h_Profile);
     t_Error     err;
     t_HcFrame   *p_HcFrame;
     t_DpaaFD    fmFd;
-    uint32_t    retVal = 0;
     uint32_t    seqNum;
 
-    SANITY_CHECK_RETURN_VALUE(h_FmHc, E_INVALID_HANDLE,0);
+    SANITY_CHECK_RETURN_ERROR(h_FmHc, E_INVALID_HANDLE);
 
-    /* first read scheme and check that it is valid */
     p_HcFrame = GetBuf(p_FmHc, &seqNum);
     if (!p_HcFrame)
-    {
-        REPORT_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
-        return 0;
-    }
+        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, E_NO_MEMORY, ("HC Frame object"));
     memset(p_HcFrame, 0, sizeof(t_HcFrame));
     p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_PLCR_PRFL);
     p_HcFrame->actionReg  = FmPcdPlcrBuildReadPlcrActionReg(absoluteProfileId);
@@ -1049,36 +1222,44 @@ uint32_t FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmP
     BUILD_FD(SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC);
 
     err = EnQFrm(p_FmHc, &fmFd, seqNum);
-    if (err != E_OK)
+    if (err == E_OK)
     {
-        PutBuf(p_FmHc, p_HcFrame, seqNum);
-        REPORT_ERROR(MINOR, err, NO_MSG);
-        return 0;
+        p_Values->green = p_HcFrame->hcSpecificData.profileRegs.fmpl_pegpc;
+        p_Values->yellow = p_HcFrame->hcSpecificData.profileRegs.fmpl_peypc;
+        p_Values->red = p_HcFrame->hcSpecificData.profileRegs.fmpl_perpc;
+        p_Values->recolouredYellow = p_HcFrame->hcSpecificData.profileRegs.fmpl_perypc;
+        p_Values->recolouredRed = p_HcFrame->hcSpecificData.profileRegs.fmpl_perrpc;
     }
+    PutBuf(p_FmHc, p_HcFrame, seqNum);
+    /* Read again on every stats dump: EnQFrm() reported it, if it was the
+     * first of its run. */
+    if (err != E_OK)
+        return ERROR_CODE(err);
+    return E_OK;
+}
 
+uint32_t FmHcPcdPlcrGetProfileCounter(t_Handle h_FmHc, t_Handle h_Profile, e_FmPcdPlcrProfileCounters counter)
+{
+    t_FmPcdPlcrProfileCounterValues values;
+
+    if (FmHcPcdPlcrReadProfileCounters(h_FmHc, h_Profile, &values) != E_OK)
+        return 0;
     switch (counter)
     {
         case e_FM_PCD_PLCR_PROFILE_GREEN_PACKET_TOTAL_COUNTER:
-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_pegpc;
-            break;
+            return values.green;
         case e_FM_PCD_PLCR_PROFILE_YELLOW_PACKET_TOTAL_COUNTER:
-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_peypc;
-            break;
+            return values.yellow;
         case e_FM_PCD_PLCR_PROFILE_RED_PACKET_TOTAL_COUNTER:
-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_perpc;
-            break;
+            return values.red;
         case e_FM_PCD_PLCR_PROFILE_RECOLOURED_YELLOW_PACKET_TOTAL_COUNTER:
-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_perypc;
-            break;
+            return values.recolouredYellow;
         case e_FM_PCD_PLCR_PROFILE_RECOLOURED_RED_PACKET_TOTAL_COUNTER:
-            retVal = p_HcFrame->hcSpecificData.profileRegs.fmpl_perrpc;
-            break;
+            return values.recolouredRed;
         default:
             REPORT_ERROR(MAJOR, E_INVALID_SELECTION, NO_MSG);
+            return 0;
     }
-
-    PutBuf(p_FmHc, p_HcFrame, seqNum);
-    return retVal;
 }
 
 t_Error FmHcKgWriteSp(t_Handle h_FmHc, uint8_t hardwarePortId, uint32_t spReg, bool add)
@@ -1205,9 +1386,11 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
 
     ASSERT_COND(p_FmHc);
 
+    /* The one command a waiter retries on a timer: both failures below
+     * repeat on every retry once the channel is gone. */
     p_HcFrame = GetBuf(p_FmHc, &seqNum);
     if (!p_HcFrame)
-        RETURN_ERROR(MINOR, E_NO_MEMORY, ("HC Frame object"));
+        HC_RETURN_FIRST_ERROR(p_FmHc, MINOR, E_NO_MEMORY, ("HC Frame object"));
     memset(p_HcFrame, 0, sizeof(t_HcFrame));
     /* first read SP register */
     p_HcFrame->opcode = (uint32_t)(HC_HCOR_GBL | HC_HCOR_OPCODE_SYNC);
@@ -1221,8 +1404,9 @@ t_Error FmHcPcdSync(t_Handle h_FmHc)
 
     PutBuf(p_FmHc, p_HcFrame, seqNum);
 
+    /* EnQFrm() reported it, if it was the first of its run. */
     if (err != E_OK)
-        RETURN_ERROR(MINOR, err, NO_MSG);
+        return ERROR_CODE(err);
 
     return E_OK;
 }
@@ -1233,20 +1417,38 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
     return p_FmHc->h_HcPortDev;
 }
 
-void FmAllowHcUsage(t_Handle h_FmHc, bool allow)
+t_Error FmAllowHcUsage(t_Handle h_FmHc, bool allow)
 {
-	t_FmHc *p_FmHc = (t_FmHc*)h_FmHc;
+    t_FmHc *p_FmHc = (t_FmHc*)h_FmHc;
+    uint32_t flags;
+    t_Error err = E_OK;
 
-	if (p_FmHc)
-		p_FmHc->usageAllowed = allow;
+    if (!p_FmHc)
+        return E_OK;
+    flags = HcLock(p_FmHc);
+    if (p_FmHc->quiescing)
+        err = ERROR_CODE(E_INVALID_STATE);
+    else if (p_FmHc->nextSeqNumLocation || HcUnanswered(p_FmHc))
+        err = ERROR_CODE(E_BUSY);
+    else
+        p_FmHc->usageAllowed = allow;
+    HcUnlock(p_FmHc, flags);
+    return err;
 }
 
 bool FmIsHcUsageAllowed(t_Handle h_FmHc)
 {
 	t_FmHc *p_FmHc = (t_FmHc*)h_FmHc;
+	uint32_t flags;
+	bool allowed;
 
 	if (p_FmHc == NULL)
 		return FALSE;
 
-	return p_FmHc->usageAllowed;
+	/* Never direct while an unanswered command may still be inside the
+	 * port: a register write would race it. */
+	flags = HcLock(p_FmHc);
+	allowed = p_FmHc->usageAllowed || HcUnanswered(p_FmHc);
+	HcUnlock(p_FmHc, flags);
+	return allowed;
 }

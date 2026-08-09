@@ -200,5 +200,4 @@ switch (i) {                                        \
 #define KG_MAX_PROFILE                          255
 #define SCHEME_ALWAYS_DIRECT                    0xFFFFFFFF
 
-
 #endif /* __FM_KG_H */

@@ -53,6 +53,71 @@
 #ifdef CONFIG_FSL_DPAA_CEETM
 #include "dpaa_eth_ceetm.h"
 #endif
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+#include <uapi/linux/if_ether.h>
+#include <uapi/linux/ppp_defs.h>
+#include <uapi/linux/if_pppox.h>
+#include <linux/if_vlan.h>
+#include <net/xfrm.h>
+#endif
+
+#define DPAA_EXTRA_BUF_SIZE_4_SKB SMP_CACHE_BYTES + DPA_MAX_FD_OFFSET + \
+		sizeof(struct skb_shared_info) +  128 
+
+/* registered function to get ceetm Fqs */
+#ifdef CONFIG_CPE_FAST_PATH
+static cdx_get_ceetm_egressfq ceetm_fqget_func;
+static cdx_get_ceetm_dscp_fq ceetm_dscp_fqget_func;
+/* This function registers two cdx functions, which are to get the egress fq.
+   One is based on channel and classqueue and another one is based on dscp. */
+int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func)
+{
+	/* release-publish so readers can't see the hooks before the
+	 * ceetm state they walk is initialized */
+	smp_store_release(&ceetm_fqget_func, egress_fq_func);
+	smp_store_release(&ceetm_dscp_fqget_func, dscp_fq_func);
+	return 0;
+}
+EXPORT_SYMBOL(dpa_register_ceetm_get_egress_fq);
+
+/* Called on cdx deinit. Waits out in-flight datapath readers so the
+ * hooks' module text may be freed once this returns. */
+void dpa_unregister_ceetm_get_egress_fq(void)
+{
+	WRITE_ONCE(ceetm_fqget_func, NULL);
+	WRITE_ONCE(ceetm_dscp_fqget_func, NULL);
+	synchronize_rcu();
+}
+EXPORT_SYMBOL(dpa_unregister_ceetm_get_egress_fq);
+#endif
+
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+cdx_get_ipsec_fq_hook_t cdx_get_ipsec_fq_hookfn;
+
+int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn)
+{
+	if (cdx_get_ipsec_fq_hookfn) {
+		pr_err("%s: hook already registered\n", __func__);
+		return -1;
+	}
+	/* release-publish so readers can't see the hook before the SA
+	 * state it walks is initialized */
+	smp_store_release(&cdx_get_ipsec_fq_hookfn, hookfn);
+	return 0;
+}
+EXPORT_SYMBOL(dpa_register_ipsec_fq_handler);
+
+/* Called on cdx deinit, including the failed-init unwind. Clearing the
+ * hook is what lets the next cdx load register again (the register
+ * refuses to overwrite); the synchronize_rcu makes sure no softirq
+ * reader is still inside the old hook once this returns. */
+void dpa_unregister_ipsec_fq_handler(void)
+{
+	WRITE_ONCE(cdx_get_ipsec_fq_hookfn, NULL);
+	synchronize_rcu();
+}
+EXPORT_SYMBOL(dpa_unregister_ipsec_fq_handler);
+#endif
 
 /* DMA map and add a page frag back into the bpool.
  * @vaddr fragment must have been allocated with netdev_alloc_frag(),
@@ -80,6 +145,103 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
 
 	(*count_ptr)++;
 }
+
+// adding a new function which allocates memory for buffers and adds bman pool
+int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool act_skb)
+{
+	struct bm_buffer bmb[8];
+	char *new_buf, *ptr_buf;
+	dma_addr_t addr;
+	int ii,entries_in_bmb,buffs2fill;
+	struct device *dev = dpa_bp->dev;
+	struct sk_buff *skb = NULL, **skbh;
+	uint32_t bufsize;
+
+	if (act_skb)
+		bufsize =  DPAA_EXTRA_BUF_SIZE_4_SKB + dpa_bp->size;
+	else
+		bufsize =  SMP_CACHE_BYTES + dpa_bp->size + DPA_MAX_FD_OFFSET + 128;
+
+	/* aligning to SMP_CACHE_BYTES */
+	bufsize = DPA_SKB_SIZE(bufsize);
+
+	buffs2fill= 0;
+	while (buffs2fill < nbuffs)
+	{
+		memset(bmb, 0, sizeof(struct bm_buffer) * 8);
+
+		if ((nbuffs -   buffs2fill) < 8)
+			entries_in_bmb = (nbuffs - buffs2fill);
+		else
+			entries_in_bmb = 8;
+		for (ii= 0; ii<entries_in_bmb; ii++) {
+			ptr_buf = (char *)kmalloc(bufsize, GFP_DMA | GFP_ATOMIC);
+
+			if (unlikely(!ptr_buf))
+			{
+				pr_err("%s(%d) ii %d,  buffs2fill %d kmalloc failed \n",
+						__func__,__LINE__,ii, buffs2fill);
+				goto handle_fail;
+			}
+
+			new_buf = ptr_buf;
+			if (act_skb)
+			{
+				/* We'll prepend the skb back-pointer; can't use the DPA
+				 * priv space, because FMan will overwrite it (from offset 0)
+				 * if it ends up being the second, third, etc. fragment
+				 * in a S/G frame.
+				 *
+				 * We only need enough space to store a pointer, but allocate
+				 * an entire cacheline for performance reasons.
+				 */
+				skb = build_skb(ptr_buf, 0);
+				if (unlikely(!skb)) {
+					pr_err("%s(%d) ii %d , buffs2fill %d build_skb failed \n",
+							__func__,__LINE__, ii, buffs2fill);
+					kfree(new_buf);
+					goto handle_fail;
+				}
+				ptr_buf = PTR_ALIGN(ptr_buf, SMP_CACHE_BYTES) + SMP_CACHE_BYTES;
+				skb_reserve(skb, (ptr_buf-new_buf));
+				DPA_WRITE_SKB_PTR(skb, skbh, ptr_buf, -1);
+			}
+			else
+				ptr_buf = PTR_ALIGN(ptr_buf /*+ SMP_CACHE_BYTES */, SMP_CACHE_BYTES);
+
+			addr = dma_map_single(dev, ptr_buf, dpa_bp->size, DMA_BIDIRECTIONAL);
+			if (unlikely(dma_mapping_error(dev, addr)))
+			{
+				pr_err("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
+						__func__,__LINE__,ii,buffs2fill);
+				if (act_skb)
+				{
+					kfree_skb(skb);
+				}
+				kfree(new_buf);
+				goto handle_fail;
+			}
+			bm_buffer_set64(&bmb[ii], addr);
+
+			bmb[ii].bpid = cpu_to_be16(dpa_bp->bpid & 0xff);
+		}
+		while (unlikely(bman_release(dpa_bp->pool, bmb, entries_in_bmb, 0)))
+			cpu_relax();
+		buffs2fill+= entries_in_bmb;
+	}
+	return 0;
+
+handle_fail:
+	if (ii)
+	{
+		while (unlikely(bman_release(dpa_bp->pool, bmb, ii, 0)))
+			cpu_relax();
+	}
+	return ii+buffs2fill;
+
+}
+EXPORT_SYMBOL(dpaa_bp_alloc_n_add_buffs);
+
 
 static int _dpa_bp_add_8_bufs(const struct dpa_bp *dpa_bp)
 {
@@ -182,12 +344,13 @@ netdev_alloc_failed:
 /* Add buffers/(pages) for Rx processing whenever bpool count falls below
  * REFILL_THRESHOLD.
  */
-int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr)
+int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr, int threshold)
 {
 	int count = *countptr;
 	int new_bufs;
+	int percpu_buf_cfg_count = dpa_bp->config_count;
 
-	if (unlikely(count < CONFIG_FSL_DPAA_ETH_REFILL_THRESHOLD)) {
+	if (unlikely(count <= (percpu_buf_cfg_count - threshold))) {
 		do {
 			new_bufs = _dpa_bp_add_8_bufs(dpa_bp);
 			if (unlikely(!new_bufs)) {
@@ -198,10 +361,10 @@ int dpaa_eth_refill_bpools(struct dpa_bp *dpa_bp, int *countptr)
 				break;
 			}
 			count += new_bufs;
-		} while (count < CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT);
+		} while (count < percpu_buf_cfg_count);
 
 		*countptr = count;
-		if (unlikely(count < CONFIG_FSL_DPAA_ETH_MAX_BUF_COUNT))
+		if (unlikely(count < percpu_buf_cfg_count))
 			return -ENOMEM;
 	}
 
@@ -365,7 +528,7 @@ EXPORT_SYMBOL(dpa_buf_is_recyclable);
  * We are guaranteed there is enough room at the end of the data buffer to
  * accommodate the shared info area of the skb.
  */
-static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
+struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
 					      const struct qm_fd *fd,
 					      bool *use_gro, bool dcl4c_valid)
 {
@@ -417,14 +580,14 @@ static struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
 
 	return skb;
 }
-
+EXPORT_SYMBOL(contig_fd_to_skb);
 
 /* Build an skb with the data of the first S/G entry in the linear portion and
  * the rest of the frame as skb fragments.
  *
  * The page fragment holding the S/G Table is recycled here.
  */
-static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
 					  const struct qm_fd *fd, bool *use_gro,
 					  int *count_ptr, bool dcl4c_valid)
 {
@@ -444,16 +607,12 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
 	vaddr = phys_to_virt(addr);
 	DPA_BUG_ON(!IS_ALIGNED((unsigned long)vaddr, SMP_CACHE_BYTES));
 
-	dpa_bp = priv->dpa_bp;
+	dpa_bp =  dpa_bpid2pool(fd->bpid);
 	/* Iterate through the SGT entries and add data buffers to the skb */
 	sgt = vaddr + fd_off;
 	for (i = 0; i < DPA_SGT_MAX_ENTRIES; i++) {
 		/* Extension bit is not supported */
 		DPA_BUG_ON(qm_sg_entry_get_ext(&sgt[i]));
-
-		/* We use a single global Rx pool */
-		DPA_BUG_ON(dpa_bp !=
-			   dpa_bpid2pool(qm_sg_entry_get_bpid(&sgt[i])));
 
 		sg_addr = qm_sg_addr(&sgt[i]);
 		sg_vaddr = phys_to_virt(sg_addr);
@@ -537,6 +696,7 @@ static struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
 	dpa_bp_recycle_frag(dpa_bp, (unsigned long)vaddr, count_ptr);
 	return skb;
 }
+EXPORT_SYMBOL(sg_fd_to_skb);
 
 #ifdef CONFIG_FSL_DPAA_DBG_LOOP
 static inline int dpa_skb_loop(const struct dpa_priv_s *priv,
@@ -573,7 +733,7 @@ void __hot _dpa_rx(struct net_device *net_dev,
 
 	if (unlikely(fd_status & FM_FD_STAT_RX_ERRORS) != 0) {
 		if (netif_msg_hw(priv) && net_ratelimit())
-			netdev_warn(net_dev, "FD status = 0x%08x\n",
+			netdev_warn(net_dev, "_dpa_rx FD status = 0x%08x\n",
 					fd_status & FM_FD_STAT_RX_ERRORS);
 
 		percpu_stats->rx_errors++;
@@ -884,6 +1044,233 @@ err:
 }
 #endif
 
+struct dpa_bp *sg_bpool_g;
+EXPORT_SYMBOL(sg_bpool_g);
+
+struct dpa_bp *skb_2bfreed_bpool_g; //if no recyclable skbs exist in skb fraglist, those should be freed back, SEC engine will add to this bman pool
+EXPORT_SYMBOL(skb_2bfreed_bpool_g);
+
+/* 
+ *This functions unmaps all the mapped skb sg so far and stored in sgt.  
+*/
+static void dma_unmap_skb_sg_addrs(struct device *dev, struct sk_buff *skb,
+			struct qm_sg_entry *sgt, int skb_list_frags)
+{
+	dma_addr_t addr;
+	struct sk_buff *list_skb;
+	struct sk_buff *cur_skb;
+	const enum dma_data_direction dma_dir = DMA_TO_DEVICE;
+	int sgt_idx = 0;
+	int nr_frags = 0;
+
+
+	for (cur_skb = skb, list_skb = skb_shinfo(skb)->frag_list; 
+		(sgt_idx < skb_list_frags) && (cur_skb); )
+	{
+		addr = qm_sg_addr(&sgt[sgt_idx]);
+		dma_unmap_single(dev, addr, qm_sg_entry_get_len(&sgt[sgt_idx]), dma_dir);
+		sgt_idx++;
+
+		nr_frags = skb_shinfo(cur_skb)->nr_frags;
+		while(nr_frags)
+		{
+			addr = qm_sg_addr(&sgt[sgt_idx]);
+			dma_unmap_page(dev, addr, qm_sg_entry_get_len(&sgt[sgt_idx]), dma_dir);
+			nr_frags--;
+			sgt_idx++;
+		}
+		cur_skb = list_skb;
+		if (list_skb)
+			list_skb = list_skb->next;
+	}
+
+	return;
+}
+
+/*
+ * This inline function updates the sgt entry parameters.
+ */
+static inline void prepare_qm_sg_entry(struct qm_sg_entry *sgt, int sgt_idx, 
+					unsigned int len, dma_addr_t addr)
+{
+	qm_sg_entry_set_ext(&sgt[sgt_idx], 0);
+	qm_sg_entry_set_final(&sgt[sgt_idx], 0);
+	/* fill the first entry with skb details */
+	qm_sg_entry_set_bpid(&sgt[sgt_idx], 0xff);
+	/* set the offset and addr pointers such that
+	   in next alloc, that addr should point to skb*/
+	qm_sg_entry_set_offset(&sgt[sgt_idx],0);
+	qm_sg_entry_set_len(&sgt[sgt_idx], len);
+	qm_sg_entry_set64(&sgt[sgt_idx], addr);
+
+	return;
+}
+
+static int __hot skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev , struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd)
+{
+	dma_addr_t addr, sg_addr;
+	struct sk_buff *list_skb;
+	struct sk_buff *cur_skb;
+	int  sgt_size;
+	int err;
+	struct qm_sg_entry *sgt;
+	struct bm_buffer bmb;
+	int sgt_index = 0, nr_frags = 0;
+	const enum dma_data_direction dma_dir = DMA_TO_DEVICE;
+	int dma_map_size;
+	skb_frag_t *frag;
+
+	// calculate the number of fragments
+	// check if any of skb is not recyclable
+	nr_frags = 1 + skb_shinfo(skb)->nr_frags;
+	skb_walk_frags(skb, list_skb)
+	{
+		nr_frags += 1 + skb_shinfo(list_skb)->nr_frags;
+	}
+
+	/* The below condition covers nr_frags + 1(This is to store skb address in opaque variable at the end.)*/
+	if (nr_frags > (DPA_SGT_MAX_ENTRIES))
+	{
+		/* Too many fragments for a single SGT: collapse the skb into one
+		 * contiguous buffer and rebuild the count instead of dropping the
+		 * frame. This TX/offload path owns an unshared skb (ndo_start_xmit
+		 * and xfrm_input both hand over skb->users == 1, and this code
+		 * already rewrites skb->data in place), so skb_linearize() may
+		 * realloc its data. Only drop if the collapse itself fails (OOM). */
+		if (skb_linearize(skb))
+		{
+			pr_err_ratelimited("%s()::%d skb frags %d crossed the MAX SGT entries %d and linearize failed", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
+			return -1;
+		}
+		/* recompute after linearize -- a linear skb is a single buffer */
+		nr_frags = 1 + skb_shinfo(skb)->nr_frags;
+		skb_walk_frags(skb, list_skb)
+		{
+			nr_frags += 1 + skb_shinfo(list_skb)->nr_frags;
+		}
+		if (nr_frags > (DPA_SGT_MAX_ENTRIES))
+		{
+			/* defensive: a linearized skb should collapse to a single entry */
+			pr_err_ratelimited("%s()::%d number of skb frags %d crossed the MAX SGT entries%d", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
+			return -1;
+		}
+	}
+
+	fd->format = qm_fd_sg;
+	/* allocate an SG buffer from SG BMAN POOL
+	   if any entries in skb_2bfreed_bpool_g, acquire and free skb and use the SG buffer */
+	if (bman_acquire(skb_2bfreed_bpool_g->pool, &bmb, 1, 0) == 1)
+	{
+		/* Scrub the acquire response's bpid/reserved high bits down to
+		 * the bare address: __bman_release() ORs the pool id into bits
+		 * 48-55 rather than overwriting them, so a mid-build error
+		 * release below would misroute the buffer to a foreign pool if
+		 * they came back nonzero. */
+		bmb.opaque = bmb.addr;
+		sgt =  (struct qm_sg_entry *)phys_to_virt(bmb.addr);
+		/* Bounded walk: the builder never sets final past index
+		 * DPA_SGT_MAX_ENTRIES - 1. No final bit inside that bound
+		 * means a malformed layout whose opaque slot cannot be
+		 * trusted -- reuse the buffer (memset below) and skip the
+		 * deferred free. */
+		while (sgt_index < DPA_SGT_MAX_ENTRIES &&
+		       !qm_sg_entry_get_final(&sgt[sgt_index]))
+			sgt_index++;
+		if (sgt_index < DPA_SGT_MAX_ENTRIES)
+		{
+			addr = sgt[sgt_index+1].opaque;
+			if (addr) /* free the old skb */
+			{
+				list_skb =  (struct sk_buff *)(addr);
+				kfree_skb(list_skb);
+			}
+			sgt[sgt_index+1].opaque = 0; /* set to 0*/
+		}
+	}
+	else if (bman_acquire(sg_bpool_g->pool, &bmb, 1, 0) == 1)
+	{
+		bmb.opaque = bmb.addr;	/* scrub high bits; see above */
+		sgt =  (struct qm_sg_entry *)phys_to_virt(bmb.addr);
+	}
+	else
+	{
+		printk("%s(%d) bman_acquire of SG bman buffer failed\n",
+				__func__,__LINE__);
+		return -1;
+	}
+
+
+	/* After nr_frags, in next index of sgt array storing skb address in opaque. So doing memset for (nr_frags+1).*/
+	sgt_size = sizeof(struct qm_sg_entry) * (nr_frags + 1);
+
+
+	/* memset to 0s of size sgt_size*/
+	memset(sgt, 0, sgt_size);
+
+	
+
+	sgt_index = 0;
+	for (cur_skb = skb, list_skb = skb_shinfo(skb)->frag_list; cur_skb;)
+	{
+		dma_map_size = skb_headlen(cur_skb);
+		addr = dma_map_single(dev, cur_skb->data, dma_map_size, dma_dir);
+		if (unlikely(dma_mapping_error(dev, addr))) {
+			if (net_ratelimit())
+				netdev_err(net_dev, "skb_fraglist_to_sg_fd : 2.DMA mappping error");
+			err = -EINVAL;
+			dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_index);
+			bman_release(sg_bpool_g->pool, &bmb, 1, 0);
+			return -1;
+		}
+		prepare_qm_sg_entry(sgt, sgt_index, dma_map_size, addr);
+		sgt_index++;
+		
+		nr_frags = skb_shinfo(cur_skb)->nr_frags;
+		frag = skb_shinfo(cur_skb)->frags;
+		while(nr_frags)
+		{
+			addr = skb_frag_dma_map(dev, frag, 0, skb_frag_size(frag), dma_dir);
+			if (unlikely(dma_mapping_error(dev, addr))) {
+				if (net_ratelimit())
+					netdev_err(net_dev, "skb_fraglist_to_sg_fd : 2.DMA mappping error");
+				dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_index);
+				err = -EINVAL;
+				bman_release(sg_bpool_g->pool, &bmb, 1, 0);
+				return -1;
+			}
+			prepare_qm_sg_entry(sgt, sgt_index, skb_frag_size(frag), addr);
+			frag++;
+			nr_frags--;
+			sgt_index++;
+		}
+		cur_skb = list_skb;
+		if (list_skb)
+			list_skb = list_skb->next;
+	}
+
+	qm_sg_entry_set_final(&sgt[sgt_index-1], 1);
+
+	addr = (dma_addr_t) (skb);
+	sgt[sgt_index].opaque = addr;
+
+	sg_addr = dma_map_single(dev, sgt, sgt_size, dma_dir);
+	if (unlikely(dma_mapping_error(dev, sg_addr))) {
+		dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_index);
+		if (net_ratelimit())
+			netdev_err(net_dev, "skb_fraglist_to_sg_fd : 2.DMA mappping error");
+		err = -EINVAL;
+		bman_release(sg_bpool_g->pool, &bmb, 1, 0);
+		return -1;
+	}
+	qm_fd_addr_set64(fd, sg_addr);
+	fd->bpid = skb_2bfreed_bpool_g->bpid; /*sg_bpool_g->bpid;*/
+	fd->cmd = fd_cmd;
+	fd->length20 = skb->len;
+	fd->offset = 0;
+
+	return 0;
+}
+
 int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
 		       struct sk_buff *skb, struct qm_fd *fd)
 {
@@ -1030,9 +1417,531 @@ csum_failed:
 }
 EXPORT_SYMBOL(skb_to_sg_fd);
 
-int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+#define EMAC_QUEUENUM_MASK 0xff
+
+#ifdef CONFIG_CPE_FAST_PATH
+/* Resolve a frame's CEETM class from the skb mark. This is the fallback for
+ * frames the qdisc layer did not already place on a leaf class's Tx queue;
+ * a frame that did carries its class in the queue index instead.
+ */
+static int pfe_eth_get_queuenum( struct sk_buff *skb )
+{
+	if (skb->mark)
+		return (skb->mark & EMAC_QUEUENUM_MASK);
+	/* These are packets through control path, assign highest priority */
+	return (QOS_DEFAULT_QUEUE);
+}
+#endif /*endif for CONFIG_CPE_FAST_PATH */
+
+#ifdef CONFIG_XFRM
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+
+#define ETH_HDR_SIZE            14
+#define VLAN_HDR_SIZE           4
+#define PPPOE_HDR_SIZE          8
+#define ETHHDR_MACEND_OFFSET    12
+
+#define DPOVRD_ENABLE		0x80000000
+
+static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_proto, unsigned short* l3_offset)
+{
+	unsigned short type_id;
+	unsigned short offset = ETH_HDR_SIZE;
+	type_id = *((unsigned short*) (skb->data + offset - 2));
+	while (1)
+	{
+		switch (type_id)
+		{
+			case htons(ETH_P_PPP_SES):
+				offset += PPPOE_HDR_SIZE;
+				type_id = *(unsigned short*)(skb->data + offset - 2);
+
+				if (type_id == htons(PPP_IP))
+					type_id = ntohs(ETH_P_IP);
+				else if (type_id == htons(PPP_IPV6))
+					type_id = ntohs(ETH_P_IPV6);
+				break;
+			case htons(ETH_P_8021Q):
+				offset += VLAN_HDR_SIZE;
+				type_id = *(unsigned short*) (skb->data + offset - 2);
+				break;
+			case htons(ETH_P_IP):
+			case htons(ETH_P_IPV6):
+				*l3_proto = type_id;
+				*l3_offset = offset;
+				return (skb->data + offset);
+			default:
+				*l3_proto = type_id;
+				*l3_offset = offset;
+				return NULL;
+		}
+	}
+}
+
+static __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+{
+	struct xfrm_state *x;
+	struct qman_fq *egress_fq = NULL;
+	struct qm_fd		 fd;
+	int err = 0,ii;
+	int new_ethhdr_end, old_ethhdr_end;
+	unsigned short l3_proto, l3_offset;
+	unsigned char* skb_nh ;
+	struct sec_path *sp;
+	unsigned int dpovrd = 0;
+	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
+	 * concurrently; never read the global twice */
+	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
+
+	sp = skb_sec_path(skb);
+
+	if ((get_ipsec_fq) && (sp) && (sp->len))
+	{
+		x = sp->xvec[0];
+
+		egress_fq = get_ipsec_fq(x->handle);
+
+		/* when a packet is submitting to SEC engine,
+		use the below code */
+		if (!egress_fq)
+		{
+			printk("%s(%d) egress frame queue not found \n",
+			__func__, __LINE__);
+			goto sec_submit_failed;	
+		}
+
+		/*
+		* For packets with L2 headers other than ethernet header, L2 headers are
+		* stripped off and only ethernet header is maintained. These L2 headers
+		* will be added again in offline port classification table entry
+		* after SEC processing.
+		*/
+
+		skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
+
+		if (skb_nh)
+		{
+			if(l3_offset != ETH_HDR_SIZE)
+			{
+				/* The loop below rewrites the L2 header in place. If the head
+				 * buffer is shared with a clone (e.g. a tcpdump tap on the
+				 * offload interface), COW it first so the capture is not
+				 * corrupted. skb_cow_head() is a cheap branch when the skb is
+				 * not cloned; on failure drop the packet like the paths below. */
+				if (skb_cow_head(skb, 0))
+					goto sec_submit_failed;
+				/* skb_cow_head() may have reallocated skb->head, so the cached
+				 * network-header pointer is now stale; re-derive it against the
+				 * new buffer before the in-place rewrite reads it back. */
+				skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
+
+				new_ethhdr_end = l3_offset - 2  ; /*l3 offset - protocol(2bytes) */
+				old_ethhdr_end = ETHHDR_MACEND_OFFSET ;
+				while(old_ethhdr_end >= 0)
+					skb->data[new_ethhdr_end--] = skb->data[old_ethhdr_end--];
+
+				*((unsigned short*) (skb->data + l3_offset - 2) ) = l3_proto;
+				skb->data = skb->data + l3_offset - ETH_HDR_SIZE;
+				skb->len = skb->len - l3_offset + ETH_HDR_SIZE;
+			}
+			if ((*skb_nh >> 4) == IPVERSION) /* Extracting ip version from network header */
+			{
+				dpovrd = IPPROTO_IPIP; /* ESP trailer NH type. Here traffic is IPv4 */
+			}
+			else
+			{
+				dpovrd = IPPROTO_IPV6; /* ESP trailer NH type. Here traffic is IPv4 */
+			}
+			dpovrd |= DPOVRD_ENABLE; /* OVRD enable */
+		}
+
+
+		err =  skb_fraglist_to_sg_fd(dpa_bp->dev, net_dev, skb, &fd, dpovrd);
+		if (unlikely(err < 0))
+		{
+			printk("%s(%d) skb_fraglist_to_sg_fd \n",__func__,__LINE__);
+			goto sec_submit_failed;
+		}
+
+
+		for (ii = 0; ii < 100000; ii++) {
+			err = qman_enqueue(egress_fq, &fd, 0);
+			if (err != -EBUSY)
+				break;
+		}
+
+		if (unlikely(err < 0)) {
+			struct bm_buffer bmb;
+			dma_addr_t addr;
+			struct qm_sg_entry *sgt;
+			struct sk_buff *list_skb;
+			int sgt_entries, sgt_size;
+
+			printk("%s(%d) dpa_xmit failed\n",__func__,__LINE__);
+			/* The frame was never handed to hardware, so the driver
+			 * still owns the fully-built SGT FD and must unwind
+			 * everything skb_fraglist_to_sg_fd() mapped before the
+			 * buffer is recycled and the skb is freed below --
+			 * otherwise the DMA_TO_DEVICE mappings leak and the
+			 * skb data is freed while still mapped for the device.
+			 * Recompute the entry count / SGT size by re-walking
+			 * the (possibly linearized) skb exactly as the builder
+			 * did so they match the mappings actually created.
+			 * Unmap the SGT buffer itself, then each per-fragment
+			 * mapping, and clear the skb pointer stashed in the
+			 * trailing opaque slot so the recycled pool buffer
+			 * carries no stale reference. Same unwind as the
+			 * enqueue-failure path in dpaa_submit_inb_pkt_to_SEC().
+			 */
+			addr = qm_fd_addr(&fd);
+			sgt = (struct qm_sg_entry *)phys_to_virt(addr);
+			sgt_entries = 1 + skb_shinfo(skb)->nr_frags;
+			skb_walk_frags(skb, list_skb)
+				sgt_entries += 1 + skb_shinfo(list_skb)->nr_frags;
+			sgt_size = sizeof(struct qm_sg_entry) * (sgt_entries + 1);
+			dma_unmap_single(dpa_bp->dev, addr, sgt_size, DMA_TO_DEVICE);
+			dma_unmap_skb_sg_addrs(dpa_bp->dev, skb, sgt, sgt_entries);
+			sgt[sgt_entries].opaque = 0;
+			/* put the buffer back to sg pool; zero bmb first --
+			 * __bman_release() ORs the pool id into the high bits
+			 * of the release command rather than overwriting them,
+			 * so stack garbage there would misroute the buffer to
+			 * a foreign pool. */
+			bmb.opaque = 0;
+			bm_buffer_set64(&bmb, addr);
+			while (bman_release(sg_bpool_g->pool, &bmb, 1, 0))
+				cpu_relax();
+			/* release skb and retuen */
+			goto sec_submit_failed;
+		}
+
+		/* sucessful transmit to CAAM */
+		netif_trans_update(net_dev);
+		return;
+	}
+sec_submit_failed:
+	dev_kfree_skb(skb);
+	return;
+
+}
+
+/* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
+ * its private area. The ops table is the driver's own, and dpa_ndo_init is
+ * the one member of it exported, so no other driver's ops carry it: the test
+ * the offload module makes too (dpa_netdev_is_dpaa()). */
+static bool dpa_netdev_is_dpaa_port(const struct net_device *dev)
+{
+	return dev && dev->netdev_ops && dev->netdev_ops->ndo_init == dpa_ndo_init;
+}
+
+/* Whether @port may lend its receive state to a frame of @x: a port of this
+ * driver, and the one the state is bound to. xfrm_input() finds the state by
+ * address and SPI, not by device, so the frame may have reached the stack on
+ * anything: a bridge, a VLAN over one, a veth, a Wi-Fi VAP or another port.
+ * Only a port has a dpa_priv_s to lend. And only the state's own port is
+ * where SEC's output goes back to Linux, with the Ethernet header the frame
+ * came in with, so from any other port it would arrive addressed elsewhere. */
+static bool dpa_inb_port_ok(const struct net_device *port,
+			    const struct xfrm_state *x)
+{
+	return dpa_netdev_is_dpaa_port(port) && port == READ_ONCE(x->xso.dev);
+}
+
+/* Hand an inbound ESP frame of the packet-offloaded state @x to SEC, from
+ * xfrm_input(). 0: SEC has the frame. Anything else: SEC was not given it --
+ * no hook, no queue for the state's handle, a frame that did not arrive on
+ * the state's own port (directly, over a VLAN or in a PPPoE session), or one
+ * that could not be queued -- and the skb is exactly as it came, for
+ * xfrm_input() to decide what becomes of it.
+ */
+int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+{
+	struct qman_fq *sec_fq = NULL;
+	struct dpa_priv_s	*priv = NULL;
+	struct dpa_percpu_priv_s *percpu_priv = NULL;
+	struct qm_fd		 fd;
+	int err, ii;
+	uint8_t tmp_len = 0, data[ETH_HLEN],ipvsn;
+	struct net_device *netdev;
+	struct device* dev;
+	struct net_device *real_dev = NULL;
+	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
+	 * concurrently; never read the global twice */
+	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
+
+	if (get_ipsec_fq)
+	{
+		/* Get the SEC FQID corresponding to the state's handle */
+		sec_fq = get_ipsec_fq(x->handle);
+
+		/*if no SEC FQID found, return non-zero to return pkt to linux*/
+		if (!sec_fq || !(skb->dev))
+		{
+			return -1; /* give packet to linux */
+		}
+		if (skb->dev->type == ARPHRD_ETHER) 
+		{
+			/* Get the corresponding physical device info, if the skb->dev corresponds to vlan*/
+			real_dev = is_vlan_dev(skb->dev) ? vlan_dev_real_dev(skb->dev) : skb->dev;
+			/* Anything but the state's own port goes back untouched,
+			 * before its private area is read or the frame moved. */
+			if (!dpa_inb_port_ok(real_dev, x))
+				return -1;
+			priv = netdev_priv(real_dev);
+			/* SEC shared descriptor designed to take packet including MAC hdr */
+			/* modify skb->data to point to MAC hdr */
+			tmp_len = (skb->data - skb_mac_header(skb));
+			skb->len += tmp_len;
+			skb->data = skb_mac_header(skb);
+		}
+		else if (skb->dev->type == ARPHRD_PPP)
+		{
+			/* Get the corresponding physica device info */
+			netdev = dev_get_by_index_rcu(dev_net(skb->dev), skb->iif_index);
+			/* The device the frame entered the stack by, below any
+			 * VLAN or bridge, looked up under the RCU read side the
+			 * submit runs in, without RTNL. Given back as above
+			 * unless it is the state's own port. */
+			if (!dpa_inb_port_ok(netdev, x))
+			{
+				return -1;
+			}
+			priv = netdev_priv(netdev);
+			/* The PPPoE-to-Ethernet header reconstruction below rewrites
+			 * skb->data in place. COW the head first so a live clone (e.g. a
+			 * tcpdump tap) is not corrupted; on failure give the packet back
+			 * to linux like the other early-outs in this branch. skb->data and
+			 * skb->len are still untouched here, so the packet stays intact. */
+			if (skb_cow_head(skb, 0))
+				return -1;
+			/* observation in case of PPPoE skb_mac_header is pointing to IP header*/
+			/* get the IP version*/
+			ipvsn = ((skb->head[skb->mac_header]) & 0xf0) >> 4;
+			/* SEC shared descriptor designed to take packet including MAC hdr */
+			/* modify skb->data to point to MAC hdr */
+			tmp_len = (skb->data - skb_mac_header(skb) + ETH_HLEN);
+			skb->len += tmp_len;
+			skb->data = skb_mac_header(skb) - ETH_HLEN;
+			/* Copy MAC hdr to the skb->data */
+			/* have a backup data in case of failure */
+			memcpy(data, skb->data, ETH_HLEN);
+			/* copying 8 bytes and then 4 bytes from the backup , as there is overlap*/
+			memcpy(skb->data, skb->data-PPPOE_SES_HLEN, PPPOE_SES_HLEN);
+			memcpy(skb->data+PPPOE_SES_HLEN, data, 4);
+			/* setting IPv4/IPv6 ethernet protocol value */
+			if (ipvsn == DPAA_IP_VERSION_4)
+			{
+				skb->data[12] = 0x08;
+				skb->data[13] = 0x00;
+			}
+			else /* IP v6 */
+			{
+				skb->data[12] = 0x86;
+				skb->data[13] = 0xdd;
+			}
+		}
+		/* Neither Ethernet nor PPP: a tunnel or any other device with
+		 * no port under it, so not the state's own port either. */
+		if (!priv)
+			return -1;
+
+		/* Both arms above leave the state's own port in priv, so the
+		 * frame is mapped for that port's pool whatever device it
+		 * reached the stack by. */
+		dev = priv->dpa_bp->dev;
+		netdev = priv->net_dev;
+		err =  skb_fraglist_to_sg_fd(dev, netdev, skb, &fd, 0);
+		if (unlikely(err < 0))
+		{
+			printk("%s(%d) skb_fraglist_to_sg_fd failed\n",
+					__func__,__LINE__);
+			goto err_giveback; /* give packet to linux */
+		}
+
+		for (ii = 0; ii < 100000; ii++) {
+			err = qman_enqueue(sec_fq, &fd, 0);
+			if (err != -EBUSY)
+				break;
+		}
+
+		if (unlikely(err < 0)) {
+			struct bm_buffer bmb;
+			dma_addr_t addr;
+			struct qm_sg_entry *sgt;
+			struct sk_buff *list_skb;
+			int sgt_entries, sgt_size;
+
+			printk("%s(%d) qman_enqueue failed\n",
+					__func__,__LINE__);
+			/* The frame was never handed to hardware, so the driver
+			 * still owns the fully-built SGT FD and must unwind
+			 * everything skb_fraglist_to_sg_fd() mapped before the
+			 * buffer is recycled and the skb is returned to Linux --
+			 * otherwise the DMA_TO_DEVICE mappings leak and the skb
+			 * goes back to the stack still mapped for the device.
+			 * Recompute the entry count / SGT size by re-walking the
+			 * (possibly linearized) skb exactly as the builder did so
+			 * they match the mappings actually created. Unmap the SGT
+			 * buffer itself, then each per-fragment mapping, and clear
+			 * the skb pointer stashed in the trailing opaque slot so
+			 * the recycled pool buffer carries no stale reference.
+			 * Unlike skb_fraglist_to_sg_fd()'s own mid-build error
+			 * paths (which fail before the SGT buffer is mapped and so
+			 * only undo fragment maps), a fully-built SGT additionally
+			 * needs the sg_addr unmap done here. */
+			addr = qm_fd_addr(&fd);
+			sgt = (struct qm_sg_entry *)phys_to_virt(addr);
+			sgt_entries = 1 + skb_shinfo(skb)->nr_frags;
+			skb_walk_frags(skb, list_skb)
+				sgt_entries += 1 + skb_shinfo(list_skb)->nr_frags;
+			sgt_size = sizeof(struct qm_sg_entry) * (sgt_entries + 1);
+			dma_unmap_single(dev, addr, sgt_size, DMA_TO_DEVICE);
+			dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_entries);
+			sgt[sgt_entries].opaque = 0;
+			/* put the buffer back to sg pool; zero bmb first --
+			 * __bman_release() ORs the pool id into the high bits
+			 * of the release command rather than overwriting them,
+			 * so stack garbage there would misroute the buffer to
+			 * a foreign pool. */
+			bmb.opaque = 0;
+			bm_buffer_set64(&bmb, addr);
+			while (bman_release(sg_bpool_g->pool, &bmb, 1, 0))
+				cpu_relax();
+			goto err_giveback; /* give packet to linux */
+		}
+		if (priv)
+		{
+			percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+			percpu_priv->tx_caam_dec++;
+		}
+		return 0;
+	}
+	/* No hook, so nothing was given to SEC. xfrm_input() asks about any
+	 * packet-offloaded state, not only this driver's, and a frame claimed
+	 * here would be left with no owner. */
+	return -1; /* give packet to linux */
+
+	/* Inbound offload failed after the branch above shifted skb->data/len
+	 * (the ARPHRD_ETHER / ARPHRD_PPP reposition). The skb is handed back to
+	 * Linux, not consumed, so undo the shift first or Linux sees a packet
+	 * with a shifted data pointer / inflated length. tmp_len is the shift
+	 * delta; adjusting the live skb->data pointer (rather than restoring a
+	 * saved one) stays correct across an intervening skb_cow_head() that
+	 * may have reallocated the head. The PPP branch additionally rewrote
+	 * ETH_HLEN bytes in place, so restore them from the backup before
+	 * moving the pointer back. */
+err_giveback:
+	if (skb->dev->type == ARPHRD_PPP)
+		memcpy(skb->data, data, ETH_HLEN);
+	skb->len -= tmp_len;
+	skb->data += tmp_len;
+	return -1; /* give packet to linux */
+}
+#endif
+#endif
+
+#ifdef CONFIG_CPE_FAST_PATH
+#define CHANNEL_BIT_POSITION 24
+
+static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
 {
 	struct dpa_priv_s	*priv;
+	struct dpa_percpu_priv_s *percpu_priv;
+	int channel_id;
+	int queuenum;
+	int markval,ff=0;
+	struct qman_fq *egress_fq, *conf_fq;
+	uint8_t get_ceetm_cm_egress_fq;
+	uint8_t dscp;
+	unsigned char* skb_nh ;
+	uint16_t l3_proto = 0, l3_offset = 0;
+
+	priv = netdev_priv(net_dev);
+#ifdef CONFIG_XFRM
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+	if(skb->ipsec_offload) {
+		dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp);
+		percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+		percpu_priv->tx_caam_enc++;
+		return NETDEV_TX_OK;
+	}
+#endif
+#endif
+	if (priv->ceetm_en) {
+		/* snapshot: dpa_unregister_ceetm_get_egress_fq may NULL the
+		 * hooks concurrently; never read the globals twice */
+		cdx_get_ceetm_egressfq ceetm_get_fq = READ_ONCE(ceetm_fqget_func);
+		cdx_get_ceetm_dscp_fq ceetm_get_dscp_fq = READ_ONCE(ceetm_dscp_fqget_func);
+
+		/* markval carries both the class and whether one was asked for
+		 * at all: zero means this frame names no class, so the DSCP map
+		 * below gets to choose instead. */
+		markval = pfe_eth_get_queuenum(skb);
+		queuenum = markval & 0xf;
+		channel_id = (markval >> CHANNEL_BIT_POSITION) & 0xf;
+		egress_fq = NULL;
+		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when the frame names
+						no class and the DSCP map answers */
+		/* No class named, so take the DSCP from the frame and let the
+		 * map choose the egress fq. */
+		if (!markval && ceetm_get_dscp_fq) {
+			skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
+			if (skb_nh)
+			{
+				/* skb_nh is non NULL means either it is pointing to ipv4 or ipv6 header only */
+				if (l3_proto ==  htons(ETH_P_IP))
+				{
+					/* Getting the DSCP value from IPv4 header*/
+					dscp = (((struct iphdr *)skb_nh)->tos) >> 2; /* tos 8 bit size, DSCP 6 bit value, shifting 2 bits right to get actual DSCP value*/
+				}
+				else
+				{
+					 /* Getting the DSCP value from IPv6 header*/
+					dscp = ((((struct ipv6hdr *)skb_nh)->priority) << 2) /* priority is 4 bit size, shifting 2 bits left to give space for flow_lbl[0] 2 bits */
+						+ ((((struct ipv6hdr *)skb_nh)->flow_lbl[0]) >> 6); /* flow_lbl[0] is 8 bit size, DSCP 2 bits are here, so shifting 6 bits right*/
+				}
+				egress_fq = ceetm_get_dscp_fq(priv->qm_ctx, dscp);
+				if (egress_fq)
+					get_ceetm_cm_egress_fq = 0;
+			}
+		}
+		if (get_ceetm_cm_egress_fq)
+		{
+			if (ceetm_get_fq) {
+				egress_fq = ceetm_get_fq(priv->qm_ctx,
+					channel_id,queuenum,ff);
+			}
+			if (!egress_fq) {
+				printk(KERN_CRIT "%s::unable to get ceetm fq, mark %08x registered func %p"
+						"dropping packet\n",
+						__func__, markval , ceetm_get_fq);
+				dev_kfree_skb(skb);
+				return NETDEV_TX_OK;
+			}
+		}
+	}  else
+	{
+		queuenum = dpa_get_queue_mapping(skb);
+		if (unlikely(queuenum >= DPAA_ETH_TX_QUEUES))
+			queuenum = queuenum % DPAA_ETH_TX_QUEUES;
+		egress_fq = priv->egress_fqs[queuenum];
+	}
+	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
+	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
+}
+#endif
+
+static inline void skb_reset_truesize(struct sk_buff *skb, unsigned int size)
+{
+	size -= SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	skb->truesize = SKB_TRUESIZE(size);
+
+	return;
+}
+
+int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+{
+	struct dpa_priv_s       *priv;
 	int queue_mapping = dpa_get_queue_mapping(skb);
 	struct qman_fq *egress_fq, *conf_fq;
 
@@ -1042,6 +1951,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
 		dpaa_eth_hooks.tx(skb, net_dev) == DPAA_ETH_STOLEN)
 		/* won't update any Tx stats */
 		return NETDEV_TX_OK;
+#endif
+
+#ifdef CONFIG_CPE_FAST_PATH
+	return cpe_fp_tx(skb, net_dev);
 #endif
 
 	priv = netdev_priv(net_dev);
@@ -1212,13 +2125,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
 		 * but we need the skb to look as if returned by build_skb().
 		 * We need to manually adjust the tailptr as well.
 		 */
+		/* skb_reset_truesize() resets the skb truesize, to avoid 
+		 * skb truesize gets increment continuously when the same 
+		 * skb used for next fragments.
+		 */
+		skb_reset_truesize(skb, SMP_CACHE_BYTES + DPA_SKB_SIZE(priv->dpa_bp->size) +
+				SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
 		skb->data = skb->head + offset;
 		skb_reset_tail_pointer(skb);
 
 		(*countptr)++;
 		percpu_priv->tx_returned++;
 	}
-
 	if (unlikely(dpa_xmit(priv, percpu_stats, &fd, egress_fq, conf_fq) < 0))
 		goto xmit_failed;
 

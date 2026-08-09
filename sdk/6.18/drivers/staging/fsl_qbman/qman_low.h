@@ -204,6 +204,11 @@ struct qm_mc {
 	struct qm_mc_command *cr;
 	struct qm_mc_result *rr;
 	u8 rridx, vbit;
+	/* A command whose caller stopped waiting (qm_mc_result_timeout()). Its
+	 * answer is still to come, into rr[rridx], and no command may be
+	 * written until it has: QMan would not see a new valid bit, and the
+	 * old answer would be taken for the new one (qm_mc_settle()). */
+	bool abandoned;
 #ifdef CONFIG_FSL_DPA_CHECKING
 	enum {
 		/* Can be _mc_start()ed */
@@ -1068,6 +1073,7 @@ static inline int qm_mc_init(struct qm_portal *portal)
 		mc->rridx = 0;
 
 	mc->vbit = mc->rridx ? QM_MCC_VERB_VBIT : 0;
+	mc->abandoned = false;
 #ifdef CONFIG_FSL_DPA_CHECKING
 	mc->state = qman_mc_idle;
 #endif
@@ -1084,9 +1090,37 @@ static inline void qm_mc_finish(struct qm_portal *portal)
 #endif
 }
 
+/* Whether the portal may take a command: true unless a command was abandoned
+ * and its answer has not come. One that has is consumed here as
+ * qm_mc_result() would have consumed it, so the next command carries the
+ * valid bit QMan expects and is answered where its caller looks. */
+static inline bool qm_mc_settle(struct qm_portal *portal)
+{
+	register struct qm_mc *mc = &portal->mc;
+	struct qm_mc_result *rr = mc->rr + mc->rridx;
+
+	if (likely(!mc->abandoned))
+		return true;
+	if (!__raw_readb(&rr->verb)) {
+		dcbit_ro(rr);
+		return false;
+	}
+	mc->rridx ^= 1;
+	mc->vbit ^= QM_MCC_VERB_VBIT;
+	mc->abandoned = false;
+#ifdef CONFIG_FSL_DPA_CHECKING
+	mc->state = qman_mc_idle;
+#endif
+	return true;
+}
+
 static inline struct qm_mc_command *qm_mc_start(struct qm_portal *portal)
 {
 	register struct qm_mc *mc = &portal->mc;
+	/* Every caller waits for its own answer however long it takes; an
+	 * abandoned command's comes first and is waited for the same way. */
+	while (unlikely(!qm_mc_settle(portal)))
+		cpu_relax();
 	DPA_ASSERT(mc->state == qman_mc_idle);
 #ifdef CONFIG_FSL_DPA_CHECKING
 	mc->state = qman_mc_user;
@@ -1135,6 +1169,37 @@ static inline struct qm_mc_result *qm_mc_result(struct qm_portal *portal)
 	mc->state = qman_mc_idle;
 #endif
 	return rr;
+}
+
+/* qm_mc_result() for at most @timeout_us. A command not answered by then is
+ * abandoned, not forgotten: its answer may still come, into the slot the next
+ * command would otherwise be answered in, so the next start consumes it first
+ * (qm_mc_settle()). */
+static inline struct qm_mc_result *qm_mc_result_timeout(struct qm_portal *portal,
+							 unsigned int timeout_us)
+{
+	struct qm_mc_result *mcr;
+
+	if (read_poll_timeout_atomic(qm_mc_result, mcr, mcr, QM_MC_DELAY_US,
+				     timeout_us, false, portal)) {
+		portal->mc.abandoned = true;
+		return NULL;
+	}
+	return mcr;
+}
+
+/* qm_mc_start() for a caller that does not wait without bound: NULL, with
+ * nothing written, while an abandoned command's answer has not come within
+ * @timeout_us. */
+static inline struct qm_mc_command *qm_mc_start_timeout(struct qm_portal *portal,
+							 unsigned int timeout_us)
+{
+	bool settled;
+
+	if (read_poll_timeout_atomic(qm_mc_settle, settled, settled, QM_MC_DELAY_US,
+				     timeout_us, false, portal))
+		return NULL;
+	return qm_mc_start(portal);
 }
 
 
@@ -1228,6 +1293,19 @@ static inline int _qm_dqrr_consume_and_match(struct qm_portal *p, u32 fqid,
 #define qm_dqrr_drain_nomatch(p) \
 	_qm_dqrr_consume_and_match(p, 0, 0, false)
 
+/* qm_shutdown_fq()'s command start, as bounded as its waits for answers: a
+ * portal still owed an earlier command's answer is not waited on for good. */
+static inline struct qm_mc_command *qm_shutdown_start(struct qm_portal *portal,
+						       u32 fqid)
+{
+	struct qm_mc_command *mcc = qm_mc_start_timeout(portal, QM_MC_TIMEOUT_US);
+
+	if (!mcc)
+		pr_err("QMan: FQID %u: the portal has not answered an earlier command\n",
+		       fqid);
+	return mcc;
+}
+
 /* Cleanup FQs */
 static inline int qm_shutdown_fq(struct qm_portal **portal, int portal_count,
 				 u32 fqid)
@@ -1247,12 +1325,14 @@ static inline int qm_shutdown_fq(struct qm_portal **portal, int portal_count,
 	int err;
 
 	/* Determine the state of the FQID */
-	mcc = qm_mc_start(portal[0]);
+	mcc = qm_shutdown_start(portal[0], fqid);
+	if (!mcc)
+		return -ETIMEDOUT;
 	mcc->queryfq_np.fqid = cpu_to_be32(fqid);
 	qm_mc_commit(portal[0], QM_MCC_VERB_QUERYFQ_NP);
 
-	err = read_poll_timeout_atomic(qm_mc_result, mcr, mcr, QM_MC_DELAY_US,
-				       QM_MC_TIMEOUT_US, false, portal[0]);
+	mcr = qm_mc_result_timeout(portal[0], QM_MC_TIMEOUT_US);
+	err = mcr ? 0 : -ETIMEDOUT;
 	if (err) {
 		pr_err("QMan: Failed to query FQ non-programmable fields for FQID %u: %pe\n",
 		       fqid, ERR_PTR(err));
@@ -1265,12 +1345,14 @@ static inline int qm_shutdown_fq(struct qm_portal **portal, int portal_count,
 		return 0; /* Already OOS, no need to do anymore checks */
 
 	/* Query which channel the FQ is using */
-	mcc = qm_mc_start(portal[0]);
+	mcc = qm_shutdown_start(portal[0], fqid);
+	if (!mcc)
+		return -ETIMEDOUT;
 	mcc->queryfq.fqid = cpu_to_be32(fqid);
 	qm_mc_commit(portal[0], QM_MCC_VERB_QUERYFQ);
 
-	err = read_poll_timeout_atomic(qm_mc_result, mcr, mcr, QM_MC_DELAY_US,
-				       QM_MC_TIMEOUT_US, false, portal[0]);
+	mcr = qm_mc_result_timeout(portal[0], QM_MC_TIMEOUT_US);
+	err = mcr ? 0 : -ETIMEDOUT;
 	if (err) {
 		pr_err("QMan: Failed to query FQ programmable fields for FQID %u: %pe\n",
 		       fqid, ERR_PTR(err));
@@ -1284,6 +1366,13 @@ static inline int qm_shutdown_fq(struct qm_portal **portal, int portal_count,
 	channel = dest_wq>>3;
 
 	if (channel < qm_channel_pool1) {
+		/* A dedicated channel's FQ is retired through that channel's
+		 * portal, another CPU's, with only this CPU's interrupts
+		 * masked: that CPU's own commands could interleave with these
+		 * on its command register, and its portal then wait for good.
+		 * Every caller takes an FQ out of service before releasing it,
+		 * so none comes here live on another CPU's channel; one that
+		 * would has to run this on that CPU. */
 		channel_portal = qm_get_portal_for_channel(channel);
 		if (channel_portal == NULL) {
 			pr_err("QMan: Can't find portal for dedicated channel 0x%x\n",
@@ -1300,13 +1389,14 @@ static inline int qm_shutdown_fq(struct qm_portal **portal, int portal_count,
 	case QM_MCR_NP_STATE_ACTIVE:
 	case QM_MCR_NP_STATE_PARKED:
 		orl_empty = 0;
-		mcc = qm_mc_start(channel_portal);
+		mcc = qm_shutdown_start(channel_portal, fqid);
+		if (!mcc)
+			return -ETIMEDOUT;
 		mcc->alterfq.fqid = cpu_to_be32(fqid);
 		qm_mc_commit(channel_portal, QM_MCC_VERB_ALTER_RETIRE);
 
-		err = read_poll_timeout_atomic(qm_mc_result, mcr, mcr,
-					       QM_MC_DELAY_US, QM_MC_TIMEOUT_US,
-					       false, channel_portal);
+		mcr = qm_mc_result_timeout(channel_portal, QM_MC_TIMEOUT_US);
+		err = mcr ? 0 : -ETIMEDOUT;
 		if (err) {
 			pr_err("QMan: Failed to retire FQID %u: %pe\n", fqid,
 			       ERR_PTR(err));
@@ -1404,13 +1494,14 @@ static inline int qm_shutdown_fq(struct qm_portal **portal, int portal_count,
 		fallthrough;
 	case QM_MCR_NP_STATE_RETIRED:
 		/* Send OOS Command */
-		mcc = qm_mc_start(portal[0]);
+		mcc = qm_shutdown_start(portal[0], fqid);
+		if (!mcc)
+			return -ETIMEDOUT;
 		mcc->alterfq.fqid = cpu_to_be32(fqid);
 		qm_mc_commit(portal[0], QM_MCC_VERB_ALTER_OOS);
 
-		err = read_poll_timeout_atomic(qm_mc_result, mcr, mcr,
-					       QM_MC_DELAY_US, QM_MC_TIMEOUT_US,
-					       false, portal[0]);
+		mcr = qm_mc_result_timeout(portal[0], QM_MC_TIMEOUT_US);
+		err = mcr ? 0 : -ETIMEDOUT;
 		if (err) {
 			pr_err("QMan: Failed to put FQID %u out of service: %pe\n",
 			       fqid, ERR_PTR(err));

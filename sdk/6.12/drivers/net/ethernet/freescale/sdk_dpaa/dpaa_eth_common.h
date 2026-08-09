@@ -97,6 +97,23 @@ typedef enum dpaa_eth_hook_result (*dpaa_eth_egress_hook_t)(
 typedef enum dpaa_eth_hook_result (*dpaa_eth_confirm_hook_t)(
 		struct net_device *net_dev, const struct qm_fd *fd, u32 fqid);
 
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+typedef struct qman_fq *(*cdx_get_ipsec_fq_hook_t)(u32 handle);
+int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn);
+void dpa_unregister_ipsec_fq_handler(void);
+struct xfrm_state;
+int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x);
+
+#endif
+
+#ifdef CONFIG_CPE_FAST_PATH
+typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint32_t queue, uint32_t ff);
+typedef struct qman_fq *(*cdx_get_ceetm_dscp_fq)(void *, uint8_t dscp);
+int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func);
+void dpa_unregister_ceetm_get_egress_fq(void);
+#endif
+
+
 /* used in napi related functions */
 extern u16 qman_portal_max;
 
@@ -147,6 +164,8 @@ dpa_get_stats64(struct net_device *net_dev,
 		struct rtnl_link_stats64 *stats);
 int dpa_ndo_init(struct net_device *net_dev);
 int dpa_set_features(struct net_device *dev, netdev_features_t features);
+netdev_features_t dpa_fix_features(struct net_device *dev,
+				   netdev_features_t features);
 #ifdef CONFIG_FSL_DPAA_TS
 u64 dpa_get_timestamp_ns(const struct dpa_priv_s *priv,
 			enum port_type rx_tx, const void *data);
@@ -170,6 +189,8 @@ struct dpa_bp *dpa_bpid2pool(int bpid);
 void dpa_bpid2pool_map(int bpid, struct dpa_bp *dpa_bp);
 bool dpa_bpid2pool_use(int bpid);
 void dpa_bp_drain(struct dpa_bp *bp);
+void __cold __attribute__((nonnull))
+_dpa_bp_free(struct dpa_bp *dpa_bp);
 #ifdef CONFIG_FMAN_PFC
 u16 dpa_select_queue(struct net_device *net_dev, struct sk_buff *skb,
 		     struct net_device *sb_dev,
@@ -201,13 +222,14 @@ void dpaa_eth_init_ports(struct mac_device *mac_dev,
 		struct device *dev);
 void dpa_release_sgt(struct qm_sg_entry *sgt);
 void dpa_release_sgt_by_bpid(struct qm_sg_entry *sgt);
-void __attribute__((nonnull))
+//void __attribute__((nonnull))
+void
 dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd);
 void count_ern(struct dpa_percpu_priv_s *percpu_priv,
 		      const struct qm_mr_entry *msg);
 int dpa_enable_tx_csum(struct dpa_priv_s *priv,
 	struct sk_buff *skb, struct qm_fd *fd, char *parse_results);
-#ifdef CONFIG_FSL_DPAA_CEETM
+#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
 void dpa_enable_ceetm(struct net_device *dev);
 void dpa_disable_ceetm(struct net_device *dev);
 #endif
@@ -222,5 +244,15 @@ int dpa_proxy_set_mac_address(struct proxy_device *proxy_dev,
 			  struct net_device *net_dev);
 int dpa_proxy_set_rx_mode(struct proxy_device *proxy_dev,
 		      struct net_device *net_dev);
+void dpa_set_eth_ifinfo(struct dpa_priv_s *priv, void* ifinfo);
+void dpa_reset_eth_ifinfo(struct dpa_priv_s *priv);
+int dpa_update_eth_if(struct dpa_priv_s *priv);
+struct sk_buff *__hot contig_fd_to_skb(const struct dpa_priv_s *priv,
+				       const struct qm_fd *fd,
+				       bool *use_gro, bool dcl4c_valid);
+struct sk_buff *__hot sg_fd_to_skb(const struct dpa_priv_s *priv,
+				   const struct qm_fd *fd, bool *use_gro,
+				   int *count_ptr, bool dcl4c_valid);
+
 
 #endif /* __DPAA_ETH_COMMON_H */

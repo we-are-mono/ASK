@@ -47,6 +47,7 @@ struct mac_device {
 	void __iomem		*vaddr;
 	uint8_t			 addr[ETH_ALEN];
 	bool			 promisc;
+	bool			 allmulti;
 
 	struct fm		*fm_dev;
 	struct fm_port		*port_dev[2];
@@ -78,6 +79,7 @@ struct mac_device {
 	int (*start)(struct mac_device *mac_dev);
 	int (*stop)(struct mac_device *mac_dev);
 	int (*set_promisc)(struct fm_mac_dev *fm_mac_dev, bool enable);
+	int (*set_allmulti)(struct fm_mac_dev *fm_mac_dev, bool enable);
 	int (*change_addr)(struct fm_mac_dev *fm_mac_dev, const uint8_t *addr);
 	int (*set_multi)(struct net_device *net_dev,
 			 struct mac_device *mac_dev);

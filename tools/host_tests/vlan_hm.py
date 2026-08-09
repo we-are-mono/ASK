@@ -21,12 +21,8 @@ HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
 
 
 def test_vlan_hm(tmp_path):
-    # The shipped patch, so this does not depend on a previously built kernel.
-    run_process([
-        "git", "apply", f"--include={HEADER}",
-        str(kernel_line.patches() / "010-ask-fman-dpaa-ehash.patch"),
-    ], cwd=tmp_path, check=True)
-    header = (tmp_path / HEADER).read_text()
+    # The line's SDK copy, so this does not depend on a previously built kernel.
+    header = (kernel_line.sdk() / HEADER).read_text()
     common = (ROOT / "cdx/cdx_common.h").read_text()
     ehash = (ROOT / "cdx/cdx_ehash.c").read_text()
     # The real L2 description, the real caller-supplied encapsulation and the

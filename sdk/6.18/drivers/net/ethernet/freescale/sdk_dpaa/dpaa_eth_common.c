@@ -166,12 +166,18 @@ int __cold dpa_start(struct net_device *net_dev)
 	}
 
 	netif_tx_start_all_queues(net_dev);
+	dpa_update_eth_if(priv);
 
 	return 0;
 
 mac_start_failed:
 	for_each_port_device(i, mac_dev->port_dev)
 		fm_port_disable(mac_dev->port_dev[i]);
+	/* Let the PHY go as dpa_stop() does, or the next open finds it
+	 * attached and fails too. */
+	if (mac_dev->phy_dev)
+		phy_disconnect(mac_dev->phy_dev);
+	mac_dev->phy_dev = NULL;
 
 	return err;
 }
@@ -185,6 +191,8 @@ int __cold dpa_stop(struct net_device *net_dev)
 
 	priv = netdev_priv(net_dev);
 	mac_dev = priv->mac_dev;
+
+	dpa_update_eth_if(priv);
 
 	netif_tx_stop_all_queues(net_dev);
 	/* Allow the Fman (Tx) port to process in-flight frames before we
@@ -296,6 +304,19 @@ int dpa_set_features(struct net_device *dev, netdev_features_t features)
 	return 0;
 }
 EXPORT_SYMBOL(dpa_set_features);
+
+netdev_features_t dpa_fix_features(struct net_device *dev,
+				   netdev_features_t features)
+{
+	netdev_features_t unsupported_features = 0;
+
+	/* We don't support enabling Rx csum through ethtool yet */
+	unsupported_features |= NETIF_F_RXCSUM;
+
+	features &= ~unsupported_features;
+
+	return features;
+}
 
 #ifdef CONFIG_FSL_DPAA_TS
 u64 dpa_get_timestamp_ns(const struct dpa_priv_s *priv, enum port_type rx_tx,
@@ -594,6 +615,16 @@ void dpa_set_rx_mode(struct net_device *net_dev)
 					   "mac_dev->set_promisc() = %d\n",
 					   _errno);
 	}
+	if (!!(net_dev->flags & IFF_ALLMULTI) != priv->mac_dev->allmulti) {
+		priv->mac_dev->allmulti = !priv->mac_dev->allmulti;
+		_errno = priv->mac_dev->set_allmulti(
+				priv->mac_dev->get_mac_handle(priv->mac_dev),
+				priv->mac_dev->allmulti);
+		if (unlikely(_errno < 0) && netif_msg_drv(priv))
+			netdev_err(net_dev,
+					   "mac_dev->set_allmulti() = %d\n",
+					   _errno);
+	}
 
 	_errno = priv->mac_dev->set_multi(net_dev, priv->mac_dev);
 	if (unlikely(_errno < 0) && netif_msg_drv(priv))
@@ -614,6 +645,7 @@ void dpa_set_buffers_layout(struct mac_device *mac_dev,
 	layout[RX].time_stamp = true;
 #endif
 	fm_port_get_buff_layout_ext_params(mac_dev->port_dev[RX], &params);
+	pr_debug("%s: internal buffer offset %d\n", __func__, params.manip_extra_space);
 	layout[RX].manip_extra_space = params.manip_extra_space;
 	/* a value of zero for data alignment means "don't care", so align to
 	 * a non-zero value to prevent FMD from using its own default
@@ -724,7 +756,7 @@ void dpa_bp_drain(struct dpa_bp *bp)
 }
 EXPORT_SYMBOL(dpa_bp_drain);
 
-static void __cold __attribute__((nonnull))
+void __cold __attribute__((nonnull))
 _dpa_bp_free(struct dpa_bp *dpa_bp)
 {
 	struct dpa_bp *bp = dpa_bpid2pool(dpa_bp->bpid);
@@ -745,6 +777,7 @@ _dpa_bp_free(struct dpa_bp *dpa_bp)
 	dpa_bp_array[bp->bpid] = NULL;
 	bman_free_pool(bp->pool);
 }
+EXPORT_SYMBOL(_dpa_bp_free);
 
 void __cold __attribute__((nonnull))
 dpa_bp_free(struct dpa_priv_s *priv)
@@ -1443,18 +1476,9 @@ dpaa_eth_init_rx_port(struct fm_port *port, struct dpa_bp *bp, size_t count,
 			   buf_layout, frag_enabled);
 }
 
-#if defined(CONFIG_FSL_SDK_FMAN_TEST)
-/* Defined as weak, to be implemented by fman pcd tester. */
-int dpa_alloc_pcd_fqids(struct device *, uint32_t, uint8_t, uint32_t *)
-__attribute__((weak));
-
-int dpa_free_pcd_fqids(struct device *, uint32_t) __attribute__((weak));
-#else
 int dpa_alloc_pcd_fqids(struct device *, uint32_t, uint8_t, uint32_t *);
 
 int dpa_free_pcd_fqids(struct device *, uint32_t);
-
-#endif /* CONFIG_FSL_SDK_FMAN_TEST */
 
 
 int dpa_alloc_pcd_fqids(struct device *dev, uint32_t num,
@@ -1551,8 +1575,9 @@ void dpa_release_sgt(struct qm_sg_entry *sgt)
 }
 EXPORT_SYMBOL(dpa_release_sgt);
 
-void __attribute__((nonnull))
-dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
+// net_dev is not used internally, so commenting non null check
+//void __attribute__((nonnull))
+void dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
 {
 	struct qm_sg_entry	*sgt;
 	struct dpa_bp		*dpa_bp;
@@ -1743,7 +1768,7 @@ return_error:
 }
 EXPORT_SYMBOL(dpa_enable_tx_csum);
 
-#ifdef CONFIG_FSL_DPAA_CEETM
+#if defined(CONFIG_FSL_DPAA_CEETM) || defined(CONFIG_CPE_FAST_PATH)
 void dpa_enable_ceetm(struct net_device *dev)
 {
 	struct dpa_priv_s *priv = netdev_priv(dev);
@@ -1758,3 +1783,36 @@ void dpa_disable_ceetm(struct net_device *dev)
 }
 EXPORT_SYMBOL(dpa_disable_ceetm);
 #endif
+
+void dpa_set_eth_ifinfo(struct dpa_priv_s *priv, void* ifinfo)
+{
+	if(!priv)
+		return;
+	priv->ifinfo = ifinfo;
+	return;
+}
+EXPORT_SYMBOL(dpa_set_eth_ifinfo);
+
+
+void dpa_reset_eth_ifinfo(struct dpa_priv_s *priv)
+{
+	if(!priv)
+		return;
+	priv->ifinfo = NULL;
+	return;
+}
+EXPORT_SYMBOL(dpa_reset_eth_ifinfo);
+
+int dpa_update_eth_if(struct dpa_priv_s *priv)
+{
+	unsigned int port_status;
+	if(!priv->ifinfo || !priv->net_dev)
+		return 1;
+	port_status = test_bit(__LINK_STATE_START,
+							&priv->net_dev->state);
+		/* Synch tx port here */
+		((struct en_ehash_ifportinfo*)(priv->ifinfo))->txpinfo.port_info = ntohl(port_status);
+
+		return 0;
+}
+EXPORT_SYMBOL(dpa_update_eth_if);

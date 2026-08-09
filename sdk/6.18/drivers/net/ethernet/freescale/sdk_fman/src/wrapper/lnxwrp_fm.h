@@ -52,7 +52,8 @@
 
 #define FM_MAX_NUM_OF_ADV_SETTINGS          10
 
-#define LNXWRP_FM_NUM_OF_SHARED_PROFILES    16
+/*#define LNXWRP_FM_NUM_OF_SHARED_PROFILES    16  default value */
+#define LNXWRP_FM_NUM_OF_SHARED_PROFILES    144 /* currently 140 shared profiles are in use */
 
 #if defined(CONFIG_FMAN_DISABLE_OH_TO_REUSE_RESOURCES)
 #define FM_10G_OPENDMA_MIN_TRESHOLD 8 /* 10g minimum treshold if only HC is enabled and no OH port enabled */
@@ -88,7 +89,6 @@ typedef struct t_FmTestFq {
 
 typedef struct {
     uint8_t                     id; /* sw port id, see SW_PORT_ID_TO_HW_PORT_ID() in fm_common.h */
-    int                         minor;
     char                        name[20];
     bool                        active;
     uint64_t                    phys_baseAddr;
@@ -222,8 +222,6 @@ typedef struct {
 
     struct device               *dev;
     struct resource             *res;
-    int                         major;
-    struct class                *fm_class;
     struct device_attribute     *dev_attr_stats;
     struct device_attribute     *dev_attr_regs;
     struct device_attribute     *dev_attr_risc_load;
@@ -247,11 +245,6 @@ typedef struct {
 #define LNXWRP_FM_OBJECT(ptr)   LIST_OBJECT(ptr, t_LnxWrpFm, fms[((t_LnxWrpFmDev *)ptr)->id])
 
 
-t_Error  LnxwrpFmIOCTL(t_LnxWrpFmDev *p_LnxWrpFmDev, unsigned int cmd, unsigned long arg, bool compat);
-t_Error  LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd, unsigned long arg, bool compat);
-
-void LnxWrpPCDIOCTLTypeChecking(void);
-void LnxWrpPCDIOCTLEnumChecking(void);
 struct device_node *GetFmAdvArgsDevTreeNode(uint8_t fmIndx);
 
 #endif /* __LNXWRP_FM_H__ */

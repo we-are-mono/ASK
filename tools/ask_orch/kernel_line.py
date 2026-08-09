@@ -57,6 +57,11 @@ def patches(line=None, root=ROOT):
     return Path(root) / "patches/kernel" / (line or current())
 
 
+def sdk(line=None, root=ROOT):
+    """The line's copy of the NXP SDK drivers, laid out as in a kernel tree."""
+    return Path(root) / "sdk" / (line or current())
+
+
 def tmpdir(line=None, root=ROOT):
     """The line's bitbake TMPDIR: its work, work-shared and deploy trees."""
     return Path(root) / "meta-ask/build" / f"tmp-{line or current()}"

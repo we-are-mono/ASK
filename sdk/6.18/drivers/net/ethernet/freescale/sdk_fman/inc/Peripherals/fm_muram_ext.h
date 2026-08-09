@@ -166,5 +166,6 @@ uint64_t FM_MURAM_GetFreeMemSize(t_Handle h_FmMuram);
 /** @} */ /* end of FM_grp group */
 
 
+void *get_muram_data(uint32_t *size);
 
 #endif /* __FM_MURAM_EXT */

@@ -55,6 +55,12 @@
 #include "fm_prs.h"
 #include "fm_hc.h"
 #include "fm_muram_ext.h"
+#include "fm_ehash.h"
+#if (DPAA_VERSION >= 11)
+//time stamp infrastructure for use in the case of ext hash tables
+struct ext_hash_ts_info extHashTsInfo;
+EXPORT_SYMBOL(extHashTsInfo);
+#endif
 
 /****************************************/
 /*       static functions               */
@@ -321,11 +327,12 @@ static t_FmPcdLock * DequeueLockFromFreeLst(t_FmPcd *p_FmPcd)
     return p_Lock;
 }
 
-static void EnqueueLockToAcquiredLst(t_FmPcd *p_FmPcd, t_FmPcdLock *p_Lock)
+static void EnqueueLockToAcquiredLst(t_FmPcd *p_FmPcd, t_FmPcdLock *p_Lock, bool held)
 {
     uint32_t   intFlags;
 
     intFlags = XX_LockIntrSpinlock(p_FmPcd->h_Spinlock);
+    p_Lock->flag = held;
     LIST_AddToTail(&p_Lock->node, &p_FmPcd->acquiredLocksLst);
     XX_UnlockIntrSpinlock(p_FmPcd->h_Spinlock, intFlags);
 }
@@ -366,8 +373,6 @@ static void ReleaseFreeLocksLst(t_FmPcd *p_FmPcd)
         p_Lock = DequeueLockFromFreeLst(p_FmPcd);
     }
 }
-
-
 
 /*****************************************************************************/
 /*              Inter-module API routines                                    */
@@ -565,39 +570,6 @@ uint8_t FmPcdNetEnvGetUnitId(t_FmPcd *p_FmPcd, uint8_t netEnvId, e_NetHeaderType
     return FM_PCD_MAX_NUM_OF_DISTINCTION_UNITS;
 }
 
-t_Error FmPcdUnregisterReassmPort(t_Handle h_FmPcd, t_Handle h_ReasmCommonPramTbl)
-{
-    t_FmPcd                         *p_FmPcd = (t_FmPcd*)h_FmPcd;
-    t_FmPcdCcReassmTimeoutParams    ccReassmTimeoutParams = {0};
-    uint8_t                         result;
-    t_Error                         err = E_OK;
-
-    ASSERT_COND(p_FmPcd);
-    ASSERT_COND(h_ReasmCommonPramTbl);
-
-    ccReassmTimeoutParams.iprcpt   = (uint32_t)(XX_VirtToPhys(h_ReasmCommonPramTbl) - p_FmPcd->physicalMuramBase);
-    ccReassmTimeoutParams.activate = FALSE; /*Disable Timeout Task*/
-
-    if ((err = FmHcPcdCcTimeoutReassm(p_FmPcd->h_Hc, &ccReassmTimeoutParams, &result)) != E_OK)
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-
-    switch (result)
-    {
-        case (0):
-            return E_OK;
-        case (1):
-            RETURN_ERROR(MAJOR, E_INVALID_STATE, (""));
-        case (2):
-            RETURN_ERROR(MAJOR, E_INVALID_STATE, (""));
-        case (3):
-            RETURN_ERROR(MAJOR, E_INVALID_HANDLE, ("Disable Timeout Task with invalid IPRCPT"));
-        default:
-            RETURN_ERROR(MAJOR, E_INVALID_VALUE, NO_MSG);
-    }
-
-    return E_OK;
-}
-
 e_NetHeaderType FmPcdGetAliasHdr(t_FmPcd *p_FmPcd, uint8_t netEnvId, e_NetHeaderType hdr)
 {
     int         i;
@@ -681,7 +653,7 @@ void FmPcdUnlock(t_Handle h_FmPcd, uint32_t intFlags)
     XX_UnlockIntrSpinlock(((t_FmPcd*)h_FmPcd)->h_Spinlock, intFlags);
 }
 
-t_FmPcdLock * FmPcdAcquireLock(t_Handle h_FmPcd)
+static t_FmPcdLock * AcquireLock(t_Handle h_FmPcd, bool held)
 {
     t_FmPcdLock *p_Lock;
     ASSERT_COND(h_FmPcd);
@@ -693,8 +665,19 @@ t_FmPcdLock * FmPcdAcquireLock(t_Handle h_FmPcd)
     }
 
     if (p_Lock)
-        EnqueueLockToAcquiredLst((t_FmPcd*)h_FmPcd, p_Lock);
+        EnqueueLockToAcquiredLst((t_FmPcd*)h_FmPcd, p_Lock, held);
     return p_Lock;
+}
+
+t_FmPcdLock * FmPcdAcquireLock(t_Handle h_FmPcd)
+{
+    return AcquireLock(h_FmPcd, FALSE);
+}
+
+t_FmPcdLock * FmPcdAcquireLockedLock(t_Handle h_FmPcd)
+{
+    /* Publish the operation flag and acquired-list membership together. */
+    return AcquireLock(h_FmPcd, TRUE);
 }
 
 void FmPcdReleaseLock(t_Handle h_FmPcd, t_FmPcdLock *p_Lock)
@@ -703,8 +686,11 @@ void FmPcdReleaseLock(t_Handle h_FmPcd, t_FmPcdLock *p_Lock)
     ASSERT_COND(h_FmPcd);
     intFlags = FmPcdLock(h_FmPcd);
     LIST_DelAndInit(&p_Lock->node);
+    /* Retire a held operation flag and move the lock under one PCD lock.
+     * TryLockAll must not acquire it between flag release and removal. */
+    p_Lock->flag = FALSE;
+    LIST_AddToTail(&p_Lock->node, &((t_FmPcd*)h_FmPcd)->freeLocksLst);
     FmPcdUnlock(h_FmPcd, intFlags);
-    EnqueueLockToFreeLst((t_FmPcd*)h_FmPcd, p_Lock);
 }
 
 bool FmPcdLockTryLockAll(t_Handle h_FmPcd)
@@ -786,6 +772,7 @@ bool FmPcdIsAdvancedOffloadSupported(t_Handle h_FmPcd)
     ASSERT_COND(h_FmPcd);
     return ((t_FmPcd*)h_FmPcd)->advancedOffloadSupport;
 }
+
 /*********************** End of inter-module routines ************************/
 
 
@@ -919,6 +906,7 @@ t_Error FM_PCD_Init(t_Handle h_FmPcd)
     t_FmPcd         *p_FmPcd = (t_FmPcd*)h_FmPcd;
     t_Error         err = E_OK;
     t_FmPcdIpcMsg   msg;
+	uint32_t global_data_size;
 
     SANITY_CHECK_RETURN_ERROR(p_FmPcd, E_INVALID_HANDLE);
     SANITY_CHECK_RETURN_ERROR(p_FmPcd->p_FmPcdDriverParam, E_INVALID_HANDLE);
@@ -1018,10 +1006,51 @@ t_Error FM_PCD_Init(t_Handle h_FmPcd)
     }
     IOMemSet32(UINT_TO_PTR(p_FmPcd->capwapFrameIdAddr), 0,  2);
 
+#if (DPAA_VERSION >= 11)
+    {
+       extHashTsInfo.max_ext_ts_timers = MAX_EXT_TS_TIMERS;
+       /* allocate memory for external timestamp used in ext hash table */
+       extHashTsInfo.ptr =
+               FM_MURAM_AllocMem(p_FmPcd->h_FmMuram, (MAX_EXT_TS_TIMERS * EXT_TS_SIZE), EXT_TS_SIZE);
+       if (!extHashTsInfo.ptr) {
+               FM_PCD_Free(p_FmPcd);
+               RETURN_ERROR(MAJOR, E_NO_MEMORY, ("MURAM allocation for Ext TS"));
+       }
+       extHashTsInfo.offset = (uint32_t)(XX_VirtToPhys(extHashTsInfo.ptr) -
+                       p_FmPcd->physicalMuramBase);
+       pr_debug("%s: ext timers %d, base ptr %p, muram base %p, offset %x\n", __func__,
+                       extHashTsInfo.max_ext_ts_timers, extHashTsInfo.ptr,
+                       (void *)p_FmPcd->physicalMuramBase, extHashTsInfo.offset);
+   }
+#endif
+
     XX_Free(p_FmPcd->p_FmPcdDriverParam);
     p_FmPcd->p_FmPcdDriverParam = NULL;
 
     FmRegisterPcd(p_FmPcd->h_Fm, p_FmPcd);
+
+	global_data_size = (sizeof(en_exthash_global_mem) / 256) * 256 + 256;
+	
+
+	/* allocate MURAM memory for Internal buffers and global data */
+	p_FmPcd->pIntMuramPtr = FM_MURAM_AllocMem(p_FmPcd->h_FmMuram, 
+    						EN_INTERNAL_BUFF_POOL_SIZE+global_data_size, 256);
+    if (!p_FmPcd->pIntMuramPtr)
+    {
+        FM_PCD_Free(p_FmPcd);
+        RETURN_ERROR(MAJOR, E_EMPTY, ("MURAM alloc error"));	
+    }
+    p_FmPcd->InternalBufMgmtMuramArea = (uint32_t)(XX_VirtToPhys(p_FmPcd->pIntMuramPtr) -
+                       p_FmPcd->physicalMuramBase);
+    if (p_FmPcd->InternalBufMgmtMuramArea & 0xff)
+    {
+        FM_PCD_Free(p_FmPcd);
+        RETURN_ERROR(MAJOR, E_EMPTY, ("InternalBufMgmtMuramArea should be aligned to 256"));	
+    }
+    p_FmPcd->InternalBufMgmtMuramArea >>= 8;
+    pr_debug("%s: pIntMuramPtr %p InternalBufMgmtMuramArea %x size 0x%x\n",
+		__func__, p_FmPcd->pIntMuramPtr, p_FmPcd->InternalBufMgmtMuramArea,
+		EN_INTERNAL_BUFF_POOL_SIZE+global_data_size);
 
     return E_OK;
 }
@@ -1031,11 +1060,19 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
     t_FmPcd                             *p_FmPcd =(t_FmPcd *)h_FmPcd;
     t_Error                             err = E_OK;
 
+    /* HC confirmations can still use this PCD and its resources. Refuse
+     * before any teardown, and prevent new frame borrowers once idle. */
+    if (p_FmPcd->h_Hc && (err = FmHcQuiesce(p_FmPcd->h_Hc)) != E_OK)
+        RETURN_ERROR(MINOR, err, ("HC still owned, or a timed-out command not yet answered"));
+
     if (p_FmPcd->ipv6FrameIdAddr)
         FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, UINT_TO_PTR(p_FmPcd->ipv6FrameIdAddr));
 
     if (p_FmPcd->capwapFrameIdAddr)
         FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, UINT_TO_PTR(p_FmPcd->capwapFrameIdAddr));
+
+    if (p_FmPcd->pIntMuramPtr)
+        FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, p_FmPcd->pIntMuramPtr);
 
     if (p_FmPcd->enabled)
         FM_PCD_Disable(p_FmPcd);
@@ -1069,9 +1106,11 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
         p_FmPcd->p_FmPcdPrs = NULL;
     }
 
-    if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
+    if (p_FmPcd->h_Hc)
     {
-        FmHcFree(p_FmPcd->h_Hc);
+        err = FmHcFree(p_FmPcd->h_Hc);
+        if (err)
+            RETURN_ERROR(MINOR, err, NO_MSG);
         p_FmPcd->h_Hc = NULL;
     }
 
@@ -1572,7 +1611,8 @@ t_Error FM_PCD_SetAdvancedOffloadSupport(t_Handle h_FmPcd)
         revInfo.packageRev = IP_OFFLOAD_PACKAGE_NUMBER;
     }
     if (!IS_OFFLOAD_PACKAGE(revInfo.packageRev))
-        RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("Fman ctrl code package"));
+		RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("Fman version (%d) is not matching with the kernel fman version(%d). Please update proper fman version", revInfo.packageRev, ASK_UCODE_PACKAGE_NUMBER));
+	
 
     if (!p_FmPcd->h_Hc)
         RETURN_ERROR(MAJOR, E_INVALID_HANDLE, ("HC must be initialized in this mode"));
@@ -1973,7 +2013,7 @@ t_Error FM_PCD_AllowHcUsage(t_Handle h_FmPcd, uint8_t allow)
         RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("FM_PCD_AllowHcUsage - guest mode!"));
 
     if (p_FmPcd->h_Hc)
-    	FmAllowHcUsage(p_FmPcd->h_Hc, allow);
+        return FmAllowHcUsage(p_FmPcd->h_Hc, allow);
 
     return E_OK;
 }
@@ -2114,4 +2154,3 @@ t_Handle FM_PCD_GetHcPort(t_Handle h_FmPcd)
     t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
     return FmHcGetPort(p_FmPcd->h_Hc);
 }
-

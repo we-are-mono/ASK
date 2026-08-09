@@ -36,7 +36,12 @@
 
  @Description   FM MURAM ...
 *//***************************************************************************/
+#include <linux/slab.h>
+
 #define __ERR_MODULE__  MODULE_FM_MURAM
+void *FmMurambaseAddr;
+static uint32_t FmMuramsize;
+
 
 #include "error_ext.h"
 #include "std_ext.h"
@@ -62,6 +67,22 @@ void FmMuramClear(t_Handle h_FmMuram)
     IOMemSet32(UINT_TO_PTR(p_FmMuram->baseAddr), 0, p_FmMuram->size);
 }
 
+void *get_muram_data(uint32_t *size)
+{
+        uint8_t *src;
+        uint8_t *dst;
+
+        pr_debug("%s: base %p size %d\n", __func__,
+                FmMurambaseAddr,
+                FmMuramsize);
+        *size = FmMuramsize;
+        src = (uint8_t *)FmMurambaseAddr;
+        dst = (uint8_t *)kzalloc(FmMuramsize, GFP_KERNEL);
+        if (dst)
+                memcpy(dst, src, FmMuramsize);
+        return (dst);
+}
+EXPORT_SYMBOL(get_muram_data);
 
 t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
 {
@@ -89,8 +110,8 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
     }
     memset(p_FmMuram, 0, sizeof(t_FmMuram));
 
-
-    if ((MM_Init(&h_Mem, baseAddress, size) != E_OK) || (!h_Mem))
+    if ((MM_Init(&h_Mem, baseAddress, size)
+					!= E_OK) || (!h_Mem))
     {
         XX_Free(p_FmMuram);
         REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM-MURAM partition!!!"));
@@ -101,7 +122,8 @@ t_Handle FM_MURAM_ConfigAndInit(uintptr_t baseAddress, uint32_t size)
     p_FmMuram->baseAddr = baseAddress;
     p_FmMuram->size = size;
     p_FmMuram->h_Mem = h_Mem;
-
+    FmMurambaseAddr = (void *)baseAddress;
+    FmMuramsize = size;
     return p_FmMuram;
 }
 
@@ -132,6 +154,7 @@ void  * FM_MURAM_AllocMem(t_Handle h_FmMuram, uint32_t size, uint32_t align)
 
     return UINT_TO_PTR(addr);
 }
+EXPORT_SYMBOL(FM_MURAM_AllocMem);
 
 void  * FM_MURAM_AllocMemForce(t_Handle h_FmMuram, uint64_t base, uint32_t size)
 {
@@ -161,6 +184,7 @@ t_Error FM_MURAM_FreeMem(t_Handle h_FmMuram, void *ptr)
 
     return E_OK;
 }
+EXPORT_SYMBOL(FM_MURAM_FreeMem);
 
 uint64_t FM_MURAM_GetFreeMemSize(t_Handle h_FmMuram)
 {
@@ -171,3 +195,5 @@ uint64_t FM_MURAM_GetFreeMemSize(t_Handle h_FmMuram)
 
     return MM_GetFreeMemSize(p_FmMuram->h_Mem);
 }
+EXPORT_SYMBOL(FmMurambaseAddr);
+

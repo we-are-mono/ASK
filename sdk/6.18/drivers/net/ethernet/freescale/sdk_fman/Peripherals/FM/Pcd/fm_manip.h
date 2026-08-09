@@ -55,10 +55,8 @@
 #define HMAN_OC_CAPWAP_MANIP                                    0x2F
 #define HMAN_OC_CAPWAP_FRAG_CHECK                               0x2E
 #define HMAN_OC_CAPWAP_FRAGMENTATION                            0x33
-#define HMAN_OC_CAPWAP_REASSEMBLY                               0x30
 #define HMAN_OC_IP_MANIP                                        0x34
 #define HMAN_OC_IP_FRAGMENTATION                                0x74
-#define HMAN_OC_IP_REASSEMBLY                                   0xB4
 #define HMAN_OC_IPSEC_MANIP                                     0xF4
 #define HMAN_OC                                                 0x35
 
@@ -75,22 +73,7 @@
 #define FM_PCD_MANIP_CAPWAP_FRAG_SG_BDID_MASK               0xFF000000
 #define FM_PCD_MANIP_CAPWAP_FRAG_SG_BDID_SHIFT              24
 
-#define FM_PCD_MANIP_REASM_TABLE_SIZE                    0x40
-#define FM_PCD_MANIP_REASM_TABLE_ALIGN                   8
 
-#define FM_PCD_MANIP_REASM_COMMON_PARAM_TABLE_SIZE       64
-#define FM_PCD_MANIP_REASM_COMMON_PARAM_TABLE_ALIGN      8
-#define FM_PCD_MANIP_REASM_TIME_OUT_BETWEEN_FRAMES       0x80000000
-#define FM_PCD_MANIP_REASM_COUPLING_ENABLE               0x40000000
-#define FM_PCD_MANIP_REASM_COUPLING_MASK                 0xFF000000
-#define FM_PCD_MANIP_REASM_COUPLING_SHIFT                24
-#define FM_PCD_MANIP_REASM_LIODN_MASK                    0x0000003F
-#define FM_PCD_MANIP_REASM_LIODN_SHIFT                   56
-#define FM_PCD_MANIP_REASM_ELIODN_MASK                   0x000003c0
-#define FM_PCD_MANIP_REASM_ELIODN_SHIFT                  38
-#define FM_PCD_MANIP_REASM_COMMON_INT_BUFFER_IDX_MASK    0x000000FF
-#define FM_PCD_MANIP_REASM_COMMON_INT_BUFFER_IDX_SHIFT   24
-#define FM_PCD_MANIP_REASM_TIMEOUT_THREAD_THRESH        1024
 
 #define FM_PCD_MANIP_IP_MTU_SHIFT                           16
 #define FM_PCD_MANIP_IP_NO_FRAGMENTATION                    0xFFFF0000
@@ -278,45 +261,6 @@ typedef enum e_ManipInfo {
 #pragma pack(push,1)
 #endif /* defined(__MWERKS__) && ... */
 
-typedef _Packed struct t_ReassTbl {
-    volatile uint16_t waysNumAndSetSize;
-    volatile uint16_t autoLearnHashKeyMask;
-    volatile uint32_t reassCommonPrmTblPtr;
-    volatile uint32_t liodnAlAndAutoLearnHashTblPtrHi;
-    volatile uint32_t autoLearnHashTblPtrLow;
-    volatile uint32_t liodnSlAndAutoLearnSetLockTblPtrHi;
-    volatile uint32_t autoLearnSetLockTblPtrLow;
-    volatile uint16_t minFragSize; /* Not relevant for CAPWAP*/
-    volatile uint16_t maxReassemblySize; /* Only relevant for CAPWAP*/
-    volatile uint32_t totalSuccessfullyReasmFramesCounter;
-    volatile uint32_t totalValidFragmentCounter;
-    volatile uint32_t totalProcessedFragCounter;
-    volatile uint32_t totalMalformdFragCounter;
-    volatile uint32_t totalSetBusyCounter;
-    volatile uint32_t totalDiscardedFragsCounter;
-    volatile uint32_t totalMoreThan16FramesCounter;
-    volatile uint32_t reserved2[2];
-} _PackedType t_ReassTbl;
-
-typedef struct t_ReassCommonTbl {
-    volatile uint32_t timeoutModeAndFqid;
-    volatile uint32_t reassFrmDescIndexPoolTblPtr;
-    volatile uint32_t liodnAndReassFrmDescPoolPtrHi;
-    volatile uint32_t reassFrmDescPoolPtrLow;
-    volatile uint32_t timeOutTblPtr;
-    volatile uint32_t expirationDelay;
-    volatile uint32_t internalBufferManagement;
-    volatile uint32_t reserved2;
-    volatile uint32_t totalTimeOutCounter;
-    volatile uint32_t totalRfdPoolBusyCounter;
-    volatile uint32_t totalInternalBufferBusy;
-    volatile uint32_t totalExternalBufferBusy;
-    volatile uint32_t totalSgFragmentCounter;
-    volatile uint32_t totalDmaSemaphoreDepletionCounter;
-    volatile uint32_t totalNCSPCounter;
-    volatile uint32_t discardMask;
-} t_ReassCommonTbl;
-
 typedef _Packed struct t_Hmtd {
     volatile uint16_t   cfg;
     volatile uint8_t    eliodnOffset;
@@ -340,53 +284,6 @@ typedef struct
 {
     t_AdOfTypeContLookup    *p_Frag;
 } t_FragParams;
-
-typedef struct t_ReassmParams
-{
-    e_NetHeaderType                 hdr; /* Header selection */
-    t_ReassCommonTbl              	*p_ReassCommonTbl;
-    uintptr_t                       reassFrmDescrIndxPoolTblAddr;
-    uintptr_t                       reassFrmDescrPoolTblAddr;
-    uintptr_t                       timeOutTblAddr;
-    uintptr_t                       internalBufferPoolManagementIndexAddr;
-    uintptr_t                       internalBufferPoolAddr;
-    uint32_t                        maxNumFramesInProcess;
-    uint8_t                         sgBpid;
-    uint8_t                         dataMemId;
-    uint16_t                        dataLiodnOffset;
-    uint32_t                        fqidForTimeOutFrames;
-    e_FmPcdManipReassemTimeOutMode  timeOutMode;
-    uint32_t                        timeoutThresholdForReassmProcess;
-    union {
-	struct {
-		t_Handle                h_Ipv4Ad;
-	    t_Handle                h_Ipv6Ad;
-	    bool                    ipv6Assigned;
-	    t_ReassTbl				*p_Ipv4ReassTbl;
-	    t_ReassTbl              *p_Ipv6ReassTbl;
-	    uintptr_t               ipv4AutoLearnHashTblAddr;
-	    uintptr_t               ipv6AutoLearnHashTblAddr;
-	    uintptr_t               ipv4AutoLearnSetLockTblAddr;
-	    uintptr_t               ipv6AutoLearnSetLockTblAddr;
-	    uint16_t                        minFragSize[2];
-	    e_FmPcdManipReassemWaysNumber   numOfFramesPerHashEntry[2];
-	    uint8_t                         relativeSchemeId[2];
-	    t_Handle                        h_Ipv4Scheme;
-	    t_Handle                        h_Ipv6Scheme;
-	    uint32_t                        nonConsistentSpFqid;
-	} ip;
-	struct {
-		t_Handle                h_Ad;
-	    t_ReassTbl				*p_ReassTbl;
-	    uintptr_t               autoLearnHashTblAddr;
-	    uintptr_t               autoLearnSetLockTblAddr;
-	    uint16_t                maxRessembledsSize;
-	    e_FmPcdManipReassemWaysNumber   numOfFramesPerHashEntry;
-	    uint8_t                 relativeSchemeId;
-	    t_Handle                h_Scheme;
-	} capwap;
-    };
-} t_ReassmParams;
 
 typedef struct{
     e_FmPcdManipType        type;
@@ -415,12 +312,8 @@ typedef struct{
     uint32_t                updateParams;
     uint32_t                shadowUpdateParams;
     bool                    frag;
-    bool                    reassm;
     uint16_t                sizeForFragmentation;
-    union {
-        t_ReassmParams    	reassmParams;
-        t_FragParams      	fragParams;
-    };
+    t_FragParams            fragParams;
     uint8_t                 icOffset;
     uint16_t                ownerTmp;
     bool                    cnia;

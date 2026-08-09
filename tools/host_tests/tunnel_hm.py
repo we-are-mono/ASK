@@ -42,12 +42,8 @@ def display(source, name):
 
 @pytest.mark.parametrize("ifstats", [False, True], ids=["no-stats", "stats"])
 def test_tunnel_hm(tmp_path, ifstats):
-    # Test the shipped patch, without depending on a previously built kernel.
-    run_process([
-        "git", "apply", f"--include={HEADER}",
-        str(kernel_line.patches() / "010-ask-fman-dpaa-ehash.patch"),
-    ], cwd=tmp_path, check=True)
-    header = (tmp_path / HEADER).read_text()
+    # Test the line's SDK copy, without depending on a previously built kernel.
+    header = (kernel_line.sdk() / HEADER).read_text()
     common = (ROOT / "cdx/cdx_common.h").read_text()
     tunnel = (ROOT / "cdx/control_tunnel.h").read_text()
     ehash = (ROOT / "cdx/cdx_ehash.c").read_text()

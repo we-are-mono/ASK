@@ -412,6 +412,10 @@ static t_Error CheckInitParameters(t_FmPort *p_FmPort)
 static t_Error VerifySizeOfFifo(t_FmPort *p_FmPort)
 {
     uint32_t minFifoSizeRequired = 0, optFifoSizeForB2B = 0;
+    /* Initialization parameters are freed before runtime FIFO resizing. */
+    uint8_t deqDepth = p_FmPort->p_FmPortDriverParam ?
+            p_FmPort->p_FmPortDriverParam->dfltCfg.tx_fifo_deq_pipeline_depth :
+            p_FmPort->deqPipelineDepth;
 
     /*************************/
     /*    TX PORTS           */
@@ -424,8 +428,7 @@ static t_Error VerifySizeOfFifo(t_FmPort *p_FmPort)
                         + (3 * BMI_FIFO_UNITS));
         if (!p_FmPort->imEn)
             minFifoSizeRequired +=
-                    p_FmPort->p_FmPortDriverParam->dfltCfg.tx_fifo_deq_pipeline_depth
-                            * BMI_FIFO_UNITS;
+                    deqDepth * BMI_FIFO_UNITS;
 
         optFifoSizeForB2B = minFifoSizeRequired;
 
@@ -496,8 +499,7 @@ static t_Error VerifySizeOfFifo(t_FmPort *p_FmPort)
                     optFifoSizeForB2B =
                             minFifoSizeRequired =
                                     (uint32_t)(ROUND_UP(p_FmPort->maxFrameLength, BMI_FIFO_UNITS)
-                                            + ((p_FmPort->p_FmPortDriverParam->dfltCfg.tx_fifo_deq_pipeline_depth
-                                                    + 5) * BMI_FIFO_UNITS));
+                                            + ((deqDepth + 5) * BMI_FIFO_UNITS));
                     /* 4 according to spec + 1 for FOF>0 */
                 }
 
@@ -662,7 +664,8 @@ static t_Error InitLowLevelDriver(t_FmPort *p_FmPort)
     {
         case (e_FM_PORT_TYPE_RX_10G):
         case (e_FM_PORT_TYPE_RX):
-            portParams.err_mask = (RX_ERRS_TO_ENQ & ~portParams.discard_mask);
+	    //not required to enqueue error frames
+            portParams.err_mask = 0;
             if (!p_FmPort->imEn)
             {
                 if (p_DriverParams->forwardReuseIntContext)
@@ -819,6 +822,7 @@ static bool CheckOhBmiCounter(t_FmPort *p_FmPort, e_FmPortCounters counter)
         case (e_FM_PORT_COUNTERS_LENGTH_ERR):
         case (e_FM_PORT_COUNTERS_UNSUPPRTED_FORMAT):
         case (e_FM_PORT_COUNTERS_DEALLOC_BUF):
+        case (e_FM_PORT_COUNTERS_RX_OUT_OF_BUFFERS_DISCARD):
             return TRUE;
         case (e_FM_PORT_COUNTERS_RX_FILTER_FRAME):
             if (p_FmPort->portType == e_FM_PORT_TYPE_OH_HOST_COMMAND)
@@ -1093,7 +1097,10 @@ static void FmPortCheckNApplyMacsec(t_Handle h_FmPort)
     }
 }
 
-static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+static t_Error DeletePcd(t_FmPort *p_FmPort);
+
+static t_Error ConfigurePcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams,
+                           struct fm_port_pcd_bindings *bindings)
 {
     t_Error err = E_OK;
     uint32_t tmpReg;
@@ -1184,14 +1191,6 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
             RETURN_ERROR(MAJOR, E_INVALID_STATE, ("invalid pcdSupport"));
     }
 
-    if ((p_FmPort->pcdEngines & FM_PCD_PRS)
-            && (p_PcdParams->p_PrsParams->numOfHdrsWithAdditionalParams
-                    > FM_PCD_PRS_NUM_OF_HDRS))
-        RETURN_ERROR(
-                MAJOR,
-                E_INVALID_VALUE,
-                ("Port parser numOfHdrsWithAdditionalParams may not exceed %d", FM_PCD_PRS_NUM_OF_HDRS));
-
     /* check that parameters exist for each and only each defined engine */
     if ((!!(p_FmPort->pcdEngines & FM_PCD_PRS) != !!p_PcdParams->p_PrsParams)
             || (!!(p_FmPort->pcdEngines & FM_PCD_KG)
@@ -1202,6 +1201,14 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
                 MAJOR,
                 E_INVALID_STATE,
                 ("PCD initialization structure is not consistent with pcdSupport"));
+
+    if ((p_FmPort->pcdEngines & FM_PCD_PRS)
+            && (p_PcdParams->p_PrsParams->numOfHdrsWithAdditionalParams
+                    > FM_PCD_PRS_NUM_OF_HDRS))
+        RETURN_ERROR(
+                MAJOR,
+                E_INVALID_VALUE,
+                ("Port parser numOfHdrsWithAdditionalParams may not exceed %d", FM_PCD_PRS_NUM_OF_HDRS));
 
     /* get PCD registers pointers */
     switch (p_FmPort->portType)
@@ -1236,6 +1243,7 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
 
         WRITE_UINT32(*p_BmiCcBase, ccTreePhysOffset);
         p_FmPort->ccTreeId = p_PcdParams->p_CcParams->h_CcTree;
+        bindings->cc = TRUE;
     }
 
     if (p_FmPort->pcdEngines & FM_PCD_KG)
@@ -1256,6 +1264,7 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
             RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                          ("FmPcdKgSetOrBindToClsPlanGrp failed. "));
 
+        bindings->clsPlan = TRUE;
         p_FmPort->useClsPlan = !isEmptyClsPlanGrp;
 
         schemeBind.netEnvId = p_FmPort->netEnvId;
@@ -1284,6 +1293,7 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
         err = FmPcdKgBindPortToSchemes(p_FmPort->h_FmPcd, &schemeBind);
         if (err)
             RETURN_ERROR(MAJOR, err, NO_MSG);
+        bindings->schemes = TRUE;
     }
 
     /***************************/
@@ -1524,30 +1534,20 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
                 RETURN_ERROR(MAJOR, E_INVALID_VALUE, NO_MSG);
         }
 
-        /* Check if ip-reassembly port - need to link sw-parser code */
-        if (p_FmPort->h_IpReassemblyManip)
+        if (FmPcdNetEnvIsHdrExist(p_FmPort->h_FmPcd, p_FmPort->netEnvId, HEADER_TYPE_UDP_LITE))
         {
-           /* link to sw parser code for IP Frag - only if no other code is applied. */
-            hdrNum = GetPrsHdrNum(HEADER_TYPE_IPv4);
-            if (!(tmpHxs[hdrNum] & PRS_HDR_SW_PRS_EN))
-                tmpHxs[hdrNum] |= (PRS_HDR_SW_PRS_EN | OFFLOAD_SW_PATCH_IPv4_IPR_LABEL);
             hdrNum = GetPrsHdrNum(HEADER_TYPE_IPv6);
             if (!(tmpHxs[hdrNum] & PRS_HDR_SW_PRS_EN))
-                tmpHxs[hdrNum] |= (PRS_HDR_SW_PRS_EN | OFFLOAD_SW_PATCH_IPv6_IPR_LABEL);
-        } else {
-            if (FmPcdNetEnvIsHdrExist(p_FmPort->h_FmPcd, p_FmPort->netEnvId, HEADER_TYPE_UDP_LITE))
+                tmpHxs[hdrNum] |= (PRS_HDR_SW_PRS_EN | OFFLOAD_SW_PATCH_IPv6_IPF_LABEL);
+        } else if ((FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)
+                   && (p_FmPort->portType == e_FM_PORT_TYPE_OH_OFFLINE_PARSING)))
             {
                 hdrNum = GetPrsHdrNum(HEADER_TYPE_IPv6);
                 if (!(tmpHxs[hdrNum] & PRS_HDR_SW_PRS_EN))
                     tmpHxs[hdrNum] |= (PRS_HDR_SW_PRS_EN | OFFLOAD_SW_PATCH_IPv6_IPF_LABEL);
-            } else if ((FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)
-                       && (p_FmPort->portType == e_FM_PORT_TYPE_OH_OFFLINE_PARSING)))
-                {
-                    hdrNum = GetPrsHdrNum(HEADER_TYPE_IPv6);
-                    if (!(tmpHxs[hdrNum] & PRS_HDR_SW_PRS_EN))
-                        tmpHxs[hdrNum] |= (PRS_HDR_SW_PRS_EN | OFFLOAD_SW_PATCH_IPv6_IPF_LABEL);
-                }
             }
+
+
 
         for (i = 0; i < FM_PCD_PRS_NUM_OF_HDRS; i++)
         {
@@ -1621,6 +1621,24 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
     return E_OK;
 }
 
+/* Keep any bindings whose rollback failed so the public API can retry. */
+static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+{
+    t_Error err, cleanupErr;
+
+    if (p_FmPort->pcdEngines)
+        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD is already configured"));
+
+    err = ConfigurePcd(p_FmPort, p_PcdParams, &p_FmPort->pcdBindings);
+    if (err && p_FmPort->pcdEngines)
+    {
+        cleanupErr = DeletePcd(p_FmPort);
+        if (cleanupErr)
+            REPORT_ERROR(MAJOR, cleanupErr, ("Failed to roll back port PCD bindings"));
+    }
+    return err;
+}
+
 static t_Error DeletePcd(t_FmPort *p_FmPort)
 {
     t_Error err = E_OK;
@@ -1641,7 +1659,7 @@ static t_Error DeletePcd(t_FmPort *p_FmPort)
                      ("available for Rx and offline parsing ports only"));
 
     if (!p_FmPort->pcdEngines)
-        RETURN_ERROR(MAJOR, E_INVALID_OPERATION, ("called for non PCD port"));
+        return E_OK;
 
     /* get PCD registers pointers */
     switch (p_FmPort->portType)
@@ -1678,34 +1696,47 @@ static t_Error DeletePcd(t_FmPort *p_FmPort)
             ;
     }
 
-    if (p_FmPort->pcdEngines & FM_PCD_KG)
+    if (p_FmPort->includeInPrsStatistics)
+    {
+        err = FmPcdPrsIncludePortInStatistics(p_FmPort->h_FmPcd,
+                                             p_FmPort->hardwarePortId, FALSE);
+        if (err)
+            return err;
+        p_FmPort->includeInPrsStatistics = FALSE;
+    }
+
+    if (p_FmPort->pcdBindings.schemes)
     {
         t_FmPcdKgInterModuleBindPortToSchemes schemeBind;
 
-        /* unbind all schemes */
-        p_FmPort->schemesPerPortVector = GetPortSchemeBindParams(p_FmPort,
-                                                                 &schemeBind);
-
+        GetPortSchemeBindParams(p_FmPort, &schemeBind);
         err = FmPcdKgUnbindPortToSchemes(p_FmPort->h_FmPcd, &schemeBind);
         if (err)
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-
+            return err;
+        p_FmPort->pcdBindings.schemes = FALSE;
+        p_FmPort->schemesPerPortVector = 0;
+    }
+    if (p_FmPort->pcdBindings.clsPlan)
+    {
         err = FmPcdKgDeleteOrUnbindPortToClsPlanGrp(p_FmPort->h_FmPcd,
-                                                    p_FmPort->hardwarePortId,
-                                                    p_FmPort->clsPlanGrpId);
+                                p_FmPort->hardwarePortId, p_FmPort->clsPlanGrpId);
         if (err)
-            RETURN_ERROR(MAJOR, err, NO_MSG);
+            return err;
+        p_FmPort->pcdBindings.clsPlan = FALSE;
         p_FmPort->useClsPlan = FALSE;
     }
-
-    if (p_FmPort->pcdEngines & FM_PCD_CC)
+    if (p_FmPort->pcdBindings.cc)
     {
-        /* unbind - we need to get the treeId too */
         err = FmPcdCcUnbindTree(p_FmPort->h_FmPcd, p_FmPort->ccTreeId);
         if (err)
-            RETURN_ERROR(MAJOR, err, NO_MSG);
+            return err;
+        p_FmPort->pcdBindings.cc = FALSE;
+        p_FmPort->ccTreeId = NULL;
     }
 
+    p_FmPort->schemesPerPortVector = 0;
+    p_FmPort->useClsPlan = FALSE;
+    memset(p_FmPort->optArray, 0, sizeof(p_FmPort->optArray));
     p_FmPort->pcdEngines = 0;
 
     return E_OK;
@@ -1789,7 +1820,9 @@ static t_Error AttachPCD(t_FmPort *p_FmPort)
     return E_OK;
 }
 
-static t_Error DetachPCD(t_FmPort *p_FmPort)
+/* The first half of a detach: new frames go straight to the port's default
+ * queue rather than to its PCD. */
+static void DetachPCDEntry(t_FmPort *p_FmPort)
 {
     volatile uint32_t *p_BmiNia = NULL;
 
@@ -1808,10 +1841,12 @@ static t_Error DetachPCD(t_FmPort *p_FmPort)
     WRITE_UINT32(
             *p_BmiNia,
             (p_FmPort->savedBmiNia & BMI_RFNE_FDCS_MASK) | GET_NO_PCD_NIA_BMI_AC_ENQ_FRAME());
+}
 
-    if (FmPcdIsHcUsageAllowed(p_FmPort->h_FmPcd))
-        FmPcdHcSync(p_FmPort->h_FmPcd);
-
+/* The second half: what a frame does once the PCD would have handed it back,
+ * which frames the PCD already had still need until they are done. */
+static t_Error DetachPCDActions(t_FmPort *p_FmPort)
+{
     if (p_FmPort->requiredAction & UPDATE_NIA_FENE)
     {
         if (p_FmPort->portType == e_FM_PORT_TYPE_OH_OFFLINE_PARSING)
@@ -1831,7 +1866,28 @@ static t_Error DetachPCD(t_FmPort *p_FmPort)
                                    p_FmPort->orFmanCtrl) != E_OK)
             RETURN_ERROR(MAJOR, E_INVALID_STATE, NO_MSG);
 
+    return E_OK;
+}
+
+static t_Error DetachPCD(t_FmPort *p_FmPort)
+{
+    t_Error err;
+
+    DetachPCDEntry(p_FmPort);
+
+    if (FmPcdIsHcUsageAllowed(p_FmPort->h_FmPcd))
+    {
+        err = FmPcdHcSync(p_FmPort->h_FmPcd);
+        if (err)
+            return err;
+    }
+
+    err = DetachPCDActions(p_FmPort);
+    if (err)
+        return err;
+
     p_FmPort->requiredAction = 0;
+    p_FmPort->pcdBypassed = FALSE;
 
     return E_OK;
 }
@@ -2154,6 +2210,100 @@ t_Error FmPortGetSetCcParams(t_Handle h_FmPort,
 
     return E_OK;
 }
+
+#if (DPAA_VERSION >= 11)
+t_Error FmPortSetFESupport(t_Handle h_FmPort)
+{
+    t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
+    t_FmPcdCtrlParamsPage *p_ParamsPage;
+    t_Error err;
+    uint8_t *p_Ptr, i, totalNumOfTnums;
+
+    if (p_FmPort->supportFE)
+    	return E_OK;
+
+    err = FmPortSetGprFunc(p_FmPort, e_FM_PORT_GPR_MURAM_PAGE,
+                     (void**)&p_ParamsPage);
+    if (err)
+        return err;
+    ASSERT_COND(p_ParamsPage);
+
+
+    totalNumOfTnums =
+            (uint8_t)(p_FmPort->tasks.num + p_FmPort->tasks.extra);
+
+    p_FmPort->internalFEBufferPoolAddr =
+            PTR_TO_UINT(FM_MURAM_AllocMem(p_FmPort->h_FmMuram,
+                            (uint32_t)(totalNumOfTnums * BMI_FIFO_UNITS*2),
+                            BMI_FIFO_UNITS));
+    if (!p_FmPort->internalFEBufferPoolAddr)
+        RETURN_ERROR(
+                MAJOR, E_NO_MEMORY,
+                ("MURAM alloc for FE internal buffers pool"));
+    IOMemSet32(UINT_TO_PTR(p_FmPort->internalFEBufferPoolAddr),
+            0, (uint32_t)(totalNumOfTnums * BMI_FIFO_UNITS*2));
+
+    p_FmPort->internalFEBufferPoolManagementIndexAddr =
+            PTR_TO_UINT(FM_MURAM_AllocMem(p_FmPort->h_FmMuram,
+                            (uint32_t)(5 + totalNumOfTnums),
+                            4));
+    if (!p_FmPort->internalFEBufferPoolManagementIndexAddr)
+    {
+        FM_MURAM_FreeMem(p_FmPort->h_FmMuram,
+                        UINT_TO_PTR(p_FmPort->internalFEBufferPoolAddr));
+        p_FmPort->internalFEBufferPoolAddr = 0;
+        RETURN_ERROR(MAJOR, E_NO_MEMORY,
+                     ("MURAM alloc for FE internal buffers management"));
+    }
+
+    p_Ptr =
+            (uint8_t*)UINT_TO_PTR(p_FmPort->internalFEBufferPoolManagementIndexAddr);
+    WRITE_UINT32(
+            *(uint32_t*)p_Ptr,
+            (uint32_t)(XX_VirtToPhys(UINT_TO_PTR(p_FmPort->internalFEBufferPoolAddr)) - p_FmPort->fmMuramPhysBaseAddr));
+    /* Initialize the pool management index to 4: */
+    WRITE_UINT8(*p_Ptr, 4);
+    for (i = 0, p_Ptr += 4; i < totalNumOfTnums; i++, p_Ptr++)
+        WRITE_UINT8(*p_Ptr, i);
+    WRITE_UINT8(*p_Ptr, 0xFF);
+
+    WRITE_UINT32(p_ParamsPage->internalFEBufferDepletionCounter, 0);
+    WRITE_UINT32(p_ParamsPage->internalFEBufferManagementIndexAddr,
+            (uint32_t)(XX_VirtToPhys(UINT_TO_PTR(p_FmPort->internalFEBufferPoolManagementIndexAddr))
+                                            - p_FmPort->fmMuramPhysBaseAddr));
+
+    p_FmPort->supportFE = TRUE;
+
+    return E_OK;
+}
+
+t_Error FmPortDeleteFESupport(t_Handle h_FmPort)
+{
+    t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
+    t_FmPcdCtrlParamsPage *p_ParamsPage;
+    t_Error err;
+
+    if (!p_FmPort->supportFE)
+        return E_OK;
+
+    err = FmPortSetGprFunc(p_FmPort, e_FM_PORT_GPR_MURAM_PAGE,
+                     (void**)&p_ParamsPage);
+    if (err)
+        return err;
+    ASSERT_COND(p_ParamsPage);
+
+    p_FmPort->supportFE = FALSE;
+    WRITE_UINT32(p_ParamsPage->internalFEBufferManagementIndexAddr, 0);
+ 
+    FM_MURAM_FreeMem(p_FmPort->h_FmMuram, UINT_TO_PTR(p_FmPort->internalFEBufferPoolAddr));
+    FM_MURAM_FreeMem(p_FmPort->h_FmMuram, UINT_TO_PTR(p_FmPort->internalFEBufferPoolManagementIndexAddr));
+    p_FmPort->internalFEBufferPoolAddr = 0;
+    p_FmPort->internalFEBufferPoolManagementIndexAddr = 0;
+ 
+    return E_OK;
+}
+#endif /* (DPAA_VERSION >= 11) */
+
 /*********************** End of inter-module routines ************************/
 
 /****************************************/
@@ -2531,6 +2681,9 @@ t_Error FM_PORT_Init(t_Handle h_FmPort)
 
     SANITY_CHECK_RETURN_ERROR(h_FmPort, E_INVALID_HANDLE);
     SANITY_CHECK_RETURN_ERROR(p_FmPort->p_FmPortDriverParam, E_INVALID_HANDLE);
+    if (p_FmPort->fmPortParamsAllocated)
+        RETURN_ERROR(MAJOR, E_INVALID_STATE,
+                     ("Port resources already allocated; free the failed port before retrying."));
 
     errCode = FmSpBuildBufferStructure(
             &p_FmPort->p_FmPortDriverParam->intContext,
@@ -2647,6 +2800,11 @@ t_Error FM_PORT_Init(t_Handle h_FmPort)
     if (errCode)
         RETURN_ERROR(MAJOR, errCode, NO_MSG);
 
+    /* Keep the charged depth, including the revision override, after the
+     * initialization parameters are freed or low-level initialization fails. */
+    p_FmPort->deqPipelineDepth = fmParams.deqPipelineDepth;
+    p_FmPort->fmPortParamsAllocated = TRUE;
+
     /* get params for use in init */
     p_FmPort->fmMuramPhysBaseAddr =
             (uint64_t)((uint64_t)(fmParams.fmMuramPhysBaseAddr.low)
@@ -2714,7 +2872,7 @@ t_Error FM_PORT_Free(t_Handle h_FmPort)
 
     SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
 
-    if (p_FmPort->pcdEngines)
+    if (p_FmPort->pcdEngines || p_FmPort->pcdNetEnvOwner)
         RETURN_ERROR(
                 MAJOR,
                 E_INVALID_STATE,
@@ -2731,13 +2889,16 @@ t_Error FM_PORT_Free(t_Handle h_FmPort)
 
     FmPortDriverParamFree(p_FmPort);
 
-    memset(&fmParams, 0, sizeof(fmParams));
-    fmParams.hardwarePortId = p_FmPort->hardwarePortId;
-    fmParams.portType = (e_FmPortType)p_FmPort->portType;
-    fmParams.deqPipelineDepth =
-            p_FmPort->p_FmPortDriverParam->dfltCfg.tx_fifo_deq_pipeline_depth;
+    if (p_FmPort->fmPortParamsAllocated)
+    {
+        memset(&fmParams, 0, sizeof(fmParams));
+        fmParams.hardwarePortId = p_FmPort->hardwarePortId;
+        fmParams.portType = (e_FmPortType)p_FmPort->portType;
+        fmParams.deqPipelineDepth = p_FmPort->deqPipelineDepth;
 
-    FmFreePortParams(p_FmPort->h_Fm, &fmParams);
+        FmFreePortParams(p_FmPort->h_Fm, &fmParams);
+        p_FmPort->fmPortParamsAllocated = FALSE;
+    }
 
     if (FmVSPFreeForPort(p_FmPort->h_Fm, p_FmPort->portType, p_FmPort->portId)
             != E_OK)
@@ -3362,6 +3523,7 @@ t_Error FM_PORT_SetSizeOfFifo(t_Handle h_FmPort, t_FmPortRsrc *p_SizeOfFifo)
 {
     t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
     t_Error err;
+    t_FmPortRsrc previous;
 
     SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
     SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_HANDLE);
@@ -3390,10 +3552,12 @@ t_Error FM_PORT_SetSizeOfFifo(t_Handle h_FmPort, t_FmPortRsrc *p_SizeOfFifo)
             RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                          (" No SizeOfFifo-extra for non Rx ports"));
 
-    memcpy(&p_FmPort->fifoBufs, p_SizeOfFifo, sizeof(t_FmPortRsrc));
+    previous = p_FmPort->fifoBufs;
+    p_FmPort->fifoBufs = *p_SizeOfFifo;
 
     /* we do not change user's parameter */
     err = VerifySizeOfFifo(p_FmPort);
+    p_FmPort->fifoBufs = previous;
     if (err)
         RETURN_ERROR(MAJOR, err, NO_MSG);
 
@@ -3402,6 +3566,7 @@ t_Error FM_PORT_SetSizeOfFifo(t_Handle h_FmPort, t_FmPortRsrc *p_SizeOfFifo)
     if (err)
         RETURN_ERROR(MAJOR, err, NO_MSG);
 
+    p_FmPort->fifoBufs = *p_SizeOfFifo;
     return E_OK;
 }
 
@@ -3500,13 +3665,92 @@ t_Error FM_PORT_Disable(t_Handle h_FmPort)
     return E_OK;
 }
 
+t_Error FM_PORT_GetEnabled(t_Handle h_FmPort, bool *p_Enabled)
+{
+    t_FmPort *p_FmPort = (t_FmPort *)h_FmPort;
+
+    SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(p_Enabled, E_NULL_POINTER);
+    SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+    *p_Enabled = p_FmPort->enabled;
+    return E_OK;
+}
+
+t_Error FM_PORT_GetStopped(t_Handle h_FmPort, bool *p_Stopped)
+{
+    t_FmPort *p_FmPort = (t_FmPort *)h_FmPort;
+
+    SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(p_Stopped, E_NULL_POINTER);
+    SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+    *p_Stopped = !p_FmPort->enabled && fman_port_is_stopped(&p_FmPort->port);
+    return E_OK;
+}
+
+t_Error FM_PORT_IsPcdAttached(t_Handle h_FmPort, bool *p_Attached)
+{
+    t_FmPort *p_FmPort = (t_FmPort *)h_FmPort;
+    volatile uint32_t *p_BmiNia;
+
+    SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(p_Attached, E_NULL_POINTER);
+    SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+    switch (p_FmPort->portType)
+    {
+        case (e_FM_PORT_TYPE_RX_10G):
+        case (e_FM_PORT_TYPE_RX):
+            p_BmiNia = &p_FmPort->port.bmi_regs->rx.fmbm_rfne;
+            break;
+        case (e_FM_PORT_TYPE_OH_OFFLINE_PARSING):
+            p_BmiNia = &p_FmPort->port.bmi_regs->oh.fmbm_ofne;
+            break;
+        default:
+            /* No other port type can be given a PCD (FM_PORT_SetPCD()). */
+            *p_Attached = FALSE;
+            return E_OK;
+    }
+    /* The test AttachPCD() makes of a port in the BMI-to-BMI state. */
+    *p_Attached = (GET_UINT32(*p_BmiNia) & ~BMI_RFNE_FDCS_MASK)
+            != GET_NO_PCD_NIA_BMI_AC_ENQ_FRAME();
+    return E_OK;
+}
+
+t_Error FM_PORT_SetFenced(t_Handle h_FmPort, bool fenced)
+{
+    t_FmPort *p_FmPort = (t_FmPort *)h_FmPort;
+    uint32_t intFlags;
+
+    SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+    /* Under the lock FM_PORT_Enable() reads the fence and enables under: an
+     * enable either finished before this, and the disable a fencing caller
+     * issues next stops the port again, or it finds the fence. */
+    intFlags = XX_LockIntrSpinlock(p_FmPort->h_Spinlock);
+    p_FmPort->fenced = fenced;
+    XX_UnlockIntrSpinlock(p_FmPort->h_Spinlock, intFlags);
+    return E_OK;
+}
+
 t_Error FM_PORT_Enable(t_Handle h_FmPort)
 {
     t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
+    uint32_t intFlags;
     int err;
 
     SANITY_CHECK_RETURN_ERROR(p_FmPort, E_INVALID_HANDLE);
     SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+
+    /* A port whose owner has stopped it to inspect the classifier stays
+     * stopped, whoever asks: a netdev's open, a resume. The fence is read
+     * and the port enabled under one hold of the lock FM_PORT_SetFenced()
+     * takes, so no enable that found the fence open lands after the
+     * owner's stop. */
+    intFlags = XX_LockIntrSpinlock(p_FmPort->h_Spinlock);
+    if (p_FmPort->fenced)
+    {
+        XX_UnlockIntrSpinlock(p_FmPort->h_Spinlock, intFlags);
+        return ERROR_CODE(E_BUSY);
+    }
 
     /* Used by FM_PORT_Free routine as indication
      if to disable port. Thus set it to TRUE prior
@@ -3521,6 +3765,7 @@ t_Error FM_PORT_Enable(t_Handle h_FmPort)
         FmPortImEnable(p_FmPort);
 
     err = fman_port_enable(&p_FmPort->port);
+    XX_UnlockIntrSpinlock(p_FmPort->h_Spinlock, intFlags);
     if (err != 0)
         RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("fman_port_enable"));
 
@@ -3938,6 +4183,21 @@ t_Error FM_PORT_SetErrorsRoute(t_Handle h_FmPort, fmPortFrameErrSelect_t errs)
 
     return E_OK;
 }
+
+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+t_Error FM_PORT_SetDiscardMask(t_Handle h_FmPort, fmPortFrameErrSelect_t errs)
+{
+    t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
+    int err;
+
+    err = fman_port_set_discard_mask(&p_FmPort->port, (uint32_t)errs);
+    if (err != 0)
+        RETURN_ERROR(MAJOR, E_INVALID_VALUE, ("fman_port_set_discard_mask"));
+
+    return E_OK;
+}
+EXPORT_SYMBOL(FM_PORT_SetDiscardMask);
+#endif
 
 t_Error FM_PORT_SetAllocBufCounter(t_Handle h_FmPort, uint8_t poolId,
                                    bool enable)
@@ -4490,6 +4750,8 @@ t_Error FM_PORT_PcdPlcrAllocProfiles(t_Handle h_FmPort, uint16_t numOfProfiles)
 
     return E_OK;
 }
+EXPORT_SYMBOL(FM_PORT_PcdPlcrAllocProfiles);
+
 
 t_Error FM_PORT_PcdPlcrFreeProfiles(t_Handle h_FmPort)
 {
@@ -4545,6 +4807,12 @@ t_Error FM_PORT_PcdKgModifyInitialScheme(t_Handle h_FmPort,
     {
         DBG(TRACE, ("FM Port Try Lock - BUSY"));
         return ERROR_CODE(E_BUSY);
+    }
+
+    if (!p_FmPort->pcdConfigured)
+    {
+        RELEASE_LOCK(p_FmPort->lock);
+        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD setup is not complete"));
     }
 
     /* if we want to change to direct scheme, we need to check that this scheme is valid */
@@ -4636,6 +4904,12 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile(t_Handle h_FmPort,
         return ERROR_CODE(E_BUSY);
     }
 
+    if (!p_FmPort->pcdConfigured)
+    {
+        RELEASE_LOCK(p_FmPort->lock);
+        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD setup is not complete"));
+    }
+
     if (!FmPcdPlcrIsProfileValid(p_FmPort->h_FmPcd, absoluteProfileId))
     {
         RELEASE_LOCK(p_FmPort->lock);
@@ -4662,96 +4936,10 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile(t_Handle h_FmPort,
 
 t_Error FM_PORT_PcdCcModifyTree(t_Handle h_FmPort, t_Handle h_CcTree)
 {
-    t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
-    t_Error err = E_OK;
-    volatile uint32_t *p_BmiCcBase = NULL;
-    volatile uint32_t *p_BmiNia = NULL;
-    uint32_t ccTreePhysOffset;
-
-    SANITY_CHECK_RETURN_ERROR(h_FmPort, E_INVALID_HANDLE);
-    SANITY_CHECK_RETURN_ERROR(h_CcTree, E_INVALID_HANDLE);
-
-    if (p_FmPort->imEn)
-        RETURN_ERROR(MAJOR, E_INVALID_OPERATION,
-                     ("available for non-independent mode ports only"));
-
-    /* get PCD registers pointers */
-    switch (p_FmPort->portType)
-    {
-        case (e_FM_PORT_TYPE_RX_10G):
-        case (e_FM_PORT_TYPE_RX):
-            p_BmiNia = &p_FmPort->port.bmi_regs->rx.fmbm_rfne;
-            break;
-        case (e_FM_PORT_TYPE_OH_OFFLINE_PARSING):
-            p_BmiNia = &p_FmPort->port.bmi_regs->oh.fmbm_ofne;
-            break;
-        default:
-            RETURN_ERROR( MAJOR, E_INVALID_OPERATION,
-                         ("available for Rx and offline parsing ports only"));
-    }
-
-    /* check that current NIA is BMI to BMI */
-    if ((GET_UINT32(*p_BmiNia) & ~BMI_RFNE_FDCS_MASK)
-            != GET_NIA_BMI_AC_ENQ_FRAME(p_FmPort->h_FmPcd))
-        RETURN_ERROR( MAJOR, E_INVALID_OPERATION,
-                     ("may be called only for ports in BMI-to-BMI state."));
-
-    if (p_FmPort->pcdEngines & FM_PCD_CC)
-    {
-        if (p_FmPort->h_IpReassemblyManip)
-        {
-            err = FmPcdCcTreeAddIPR(p_FmPort->h_FmPcd, h_CcTree, NULL,
-                                    p_FmPort->h_IpReassemblyManip, FALSE);
-            if (err != E_OK)
-            {
-                RETURN_ERROR(MAJOR, err, NO_MSG);
-            }
-        }
-        else
-            if (p_FmPort->h_CapwapReassemblyManip)
-            {
-                err = FmPcdCcTreeAddCPR(p_FmPort->h_FmPcd, h_CcTree, NULL,
-                                        p_FmPort->h_CapwapReassemblyManip,
-                                        FALSE);
-                if (err != E_OK)
-                {
-                    RETURN_ERROR(MAJOR, err, NO_MSG);
-                }
-            }
-        switch (p_FmPort->portType)
-        {
-            case (e_FM_PORT_TYPE_RX_10G):
-            case (e_FM_PORT_TYPE_RX):
-                p_BmiCcBase = &p_FmPort->port.bmi_regs->rx.fmbm_rccb;
-                break;
-            case (e_FM_PORT_TYPE_OH_OFFLINE_PARSING):
-                p_BmiCcBase = &p_FmPort->port.bmi_regs->oh.fmbm_occb;
-                break;
-            default:
-                RETURN_ERROR(MAJOR, E_INVALID_STATE, ("Invalid port type"));
-        }
-
-        if (!TRY_LOCK(p_FmPort->h_Spinlock, &p_FmPort->lock))
-        {
-            DBG(TRACE, ("FM Port Try Lock - BUSY"));
-            return ERROR_CODE(E_BUSY);
-        }
-        err = FmPcdCcBindTree(p_FmPort->h_FmPcd, NULL, h_CcTree,
-                              &ccTreePhysOffset, h_FmPort);
-        if (err)
-        {
-            RELEASE_LOCK(p_FmPort->lock);
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-        }WRITE_UINT32(*p_BmiCcBase, ccTreePhysOffset);
-
-        p_FmPort->ccTreeId = h_CcTree;
-        RELEASE_LOCK(p_FmPort->lock);
-    }
-    else
-        RETURN_ERROR( MAJOR, E_INVALID_STATE,
-                     ("Coarse Classification not defined for this port."));
-
-    return E_OK;
+    /* Keep the API entry point, but never mutate a tree or port. */
+    (void)h_FmPort;
+    (void)h_CcTree;
+    return ERROR_CODE(E_NOT_SUPPORTED);
 }
 
 t_Error FM_PORT_AttachPCD(t_Handle h_FmPort)
@@ -4778,8 +4966,11 @@ t_Error FM_PORT_AttachPCD(t_Handle h_FmPort)
         return ERROR_CODE(E_BUSY);
     }
 
-    if (p_FmPort->h_ReassemblyTree)
-        p_FmPort->pcdEngines |= FM_PCD_CC;
+    if (!p_FmPort->pcdConfigured)
+    {
+        RELEASE_LOCK(p_FmPort->lock);
+        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD setup is not complete"));
+    }
 
     err = AttachPCD(h_FmPort);
     RELEASE_LOCK(p_FmPort->lock);
@@ -4811,6 +5002,18 @@ t_Error FM_PORT_DetachPCD(t_Handle h_FmPort)
         return ERROR_CODE(E_BUSY);
     }
 
+    if (!p_FmPort->pcdConfigured)
+    {
+        /* A port without a policy already uses its default path. Keep
+         * incomplete setup/cleanup failures distinct from this no-op. */
+        bool unconfigured = !p_FmPort->pcdEngines && !p_FmPort->pcdNetEnvOwner;
+
+        RELEASE_LOCK(p_FmPort->lock);
+        if (unconfigured)
+            return E_OK;
+        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD setup is not complete"));
+    }
+
     err = DetachPCD(h_FmPort);
     if (err != E_OK)
     {
@@ -4818,10 +5021,63 @@ t_Error FM_PORT_DetachPCD(t_Handle h_FmPort)
         RETURN_ERROR(MAJOR, err, NO_MSG);
     }
 
-    if (p_FmPort->h_ReassemblyTree)
-        p_FmPort->pcdEngines &= ~FM_PCD_CC;
     RELEASE_LOCK(p_FmPort->lock);
 
+    return E_OK;
+}
+
+t_Error FM_PORT_BypassPCD(t_Handle h_FmPort, bool bypass)
+{
+    t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
+    t_Error err = E_OK;
+
+    SANITY_CHECK_RETURN_ERROR(h_FmPort, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+
+    if (p_FmPort->imEn)
+        RETURN_ERROR(MAJOR, E_INVALID_OPERATION,
+                     ("available for non-independent mode ports only"));
+
+    if ((p_FmPort->portType != e_FM_PORT_TYPE_RX_10G)
+            && (p_FmPort->portType != e_FM_PORT_TYPE_RX)
+            && (p_FmPort->portType != e_FM_PORT_TYPE_OH_OFFLINE_PARSING))
+        RETURN_ERROR( MAJOR, E_INVALID_OPERATION,
+                     ("available for Rx and offline parsing ports only"));
+
+    if (!TRY_LOCK(p_FmPort->h_Spinlock, &p_FmPort->lock))
+    {
+        DBG(TRACE, ("FM Port Try Lock - BUSY"));
+        return ERROR_CODE(E_BUSY);
+    }
+
+    /* Switched only while the port takes no frame, so none sees half of
+     * either set of registers and none needs a barrier to finish. */
+    if (!p_FmPort->pcdConfigured || p_FmPort->enabled)
+    {
+        RELEASE_LOCK(p_FmPort->lock);
+        RETURN_ERROR(MAJOR, E_INVALID_STATE,
+                     ("PCD not configured, or the port is enabled"));
+    }
+
+    /* The flag follows the entry register: once new frames bypass the PCD,
+     * a later call with bypass false gives it back, even if the rest of
+     * the bypass failed. AttachPCD() writes that register last. */
+    if (bypass && !p_FmPort->pcdBypassed)
+    {
+        DetachPCDEntry(p_FmPort);
+        p_FmPort->pcdBypassed = TRUE;
+        err = DetachPCDActions(p_FmPort);
+    }
+    else if (!bypass && p_FmPort->pcdBypassed)
+    {
+        err = AttachPCD(p_FmPort);
+        if (err == E_OK)
+            p_FmPort->pcdBypassed = FALSE;
+    }
+
+    RELEASE_LOCK(p_FmPort->lock);
+    if (err != E_OK)
+        RETURN_ERROR(MAJOR, err, NO_MSG);
     return E_OK;
 }
 
@@ -4853,11 +5109,11 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
 	if (err)
 		return err;
 
-	/* Allocate a MURAM page which will be used by the microcode
-	 * for IP reassembly.
-	 */
-	FmPortSetGprFunc(p_FmPort, e_FM_PORT_GPR_MURAM_PAGE,
+	/* Allocate the microcode control page for offload and VSP settings. */
+	err = FmPortSetGprFunc(p_FmPort, e_FM_PORT_GPR_MURAM_PAGE,
 			 (void**)&p_ParamsPage);
+	if (err)
+		return err;
 	ASSERT_COND(p_ParamsPage);
 
 	if (FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)) {
@@ -4866,18 +5122,6 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
 			     FM_CTL_PARAMS_PAGE_OFFLOAD_SUPPORT_EN);
 	}
 
-	/* For OH ports, communicate the discard mask to the microcode
-	 * through the MURAM page
-	 */
-	if (p_FmPort->h_IpReassemblyManip || p_FmPort->h_CapwapReassemblyManip) {
-		if (p_FmPort->portType == e_FM_PORT_TYPE_OH_OFFLINE_PARSING) {
-			WRITE_UINT32(p_ParamsPage->discardMask,
-				     GET_UINT32(p_FmPort->p_FmPortBmiRegs->ohPortBmiRegs.fmbm_ofsdm));
-		} else {
-			WRITE_UINT32(p_ParamsPage->discardMask,
-				     GET_UINT32(p_FmPort->p_FmPortBmiRegs->rxPortBmiRegs.fmbm_rfsdm));
-		}
-	}
 #ifdef FM_ERROR_VSP_NO_MATCH_SW006
 	if (p_FmPort->vspe) {
 		WRITE_UINT32(p_ParamsPage->misc,
@@ -4889,166 +5133,112 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
 	return 0;
 }
 
+/* The port is detached (or setup never attached it). Keep every remaining
+ * owner recorded if cleanup fails so DeletePCD or the next SetPCD can retry.
+ * Hold all PCD object locks while removing bindings. Release them before
+ * deleting private objects: the SDK returns their locks to its reuse pool
+ * without clearing the flags. */
+static t_Error DeletePortPcd(t_FmPort *p_FmPort, bool *allLocked)
+{
+    t_Error err;
+
+    err = DeletePcd(p_FmPort);
+    if (err)
+        return err;
+    if (*allLocked)
+    {
+        FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
+        *allLocked = FALSE;
+    }
+#if (DPAA_VERSION >= 11)
+    if (p_FmPort->supportFE)
+    {
+        err = FmPortDeleteFESupport(p_FmPort);
+        if (err)
+            return err;
+    }
+#endif
+    if (p_FmPort->pcdNetEnvOwner)
+    {
+        FmPcdDecNetEnvOwners(p_FmPort->h_FmPcd, p_FmPort->netEnvId);
+        p_FmPort->pcdNetEnvOwner = FALSE;
+    }
+    p_FmPort->requiredAction = 0;
+    p_FmPort->pcdConfigured = FALSE;
+    return E_OK;
+}
+
 t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
 {
-	t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
-	t_Error err = E_OK;
-	t_FmPortPcdParams modifiedPcdParams, *p_PcdParams;
-	t_FmPcdCcTreeParams *p_FmPcdCcTreeParams;
-	t_FmPortPcdCcParams fmPortPcdCcParams;
-	t_FmPortGetSetCcParams fmPortGetSetCcParams;
+    t_FmPort *p_FmPort = (t_FmPort *)h_FmPort;
+    t_Error err = E_OK, cleanupErr;
+    t_FmPortPcdParams modifiedPcdParams, *p_PcdParams = &modifiedPcdParams;
+    t_FmPortGetSetCcParams fmPortGetSetCcParams;
+    bool allLocked = FALSE;
 
-	SANITY_CHECK_RETURN_ERROR(h_FmPort, E_INVALID_HANDLE);
-	SANITY_CHECK_RETURN_ERROR(p_PcdParam, E_NULL_POINTER);
-	SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+    SANITY_CHECK_RETURN_ERROR(h_FmPort, E_INVALID_HANDLE);
+    SANITY_CHECK_RETURN_ERROR(p_PcdParam, E_NULL_POINTER);
+    if (p_PcdParam->h_IpReassemblyManip || p_PcdParam->h_CapwapReassemblyManip)
+        RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("Hardware reassembly is unsupported in Mono"));
+    SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
+    if (p_FmPort->imEn)
+        RETURN_ERROR(MAJOR, E_INVALID_OPERATION, ("Not available in independent mode"));
+    if (p_FmPort->portType != e_FM_PORT_TYPE_RX_10G &&
+        p_FmPort->portType != e_FM_PORT_TYPE_RX &&
+        p_FmPort->portType != e_FM_PORT_TYPE_OH_OFFLINE_PARSING)
+        RETURN_ERROR(MAJOR, E_INVALID_OPERATION, ("Available for Rx and offline ports only"));
 
-	if (p_FmPort->imEn) {
-		RETURN_ERROR(MAJOR, E_INVALID_OPERATION,
-			     ("available for non-independent mode ports only"));
-	}
+    /* Validate combinations before acquiring the port lock or saving handles. */
+    if (!p_PcdParam->h_NetEnv)
+        RETURN_ERROR(MAJOR, E_INVALID_HANDLE, ("Network environment is required"));
+    if (p_PcdParam->p_CcParams && !p_PcdParam->p_CcParams->h_CcTree)
+        RETURN_ERROR(MAJOR, E_INVALID_HANDLE, ("Tree handle is required for CC"));
+    if (!TRY_LOCK(p_FmPort->h_Spinlock, &p_FmPort->lock))
+        return ERROR_CODE(E_BUSY);
+    if (p_FmPort->pcdConfigured)
+    {
+        err = ERROR_CODE(E_INVALID_STATE);
+        goto out;
+    }
+    p_FmPort->h_FmPcd = FmGetPcdHandle(p_FmPort->h_Fm);
+    ASSERT_COND(p_FmPort->h_FmPcd);
 
-	if (p_FmPort->portType != e_FM_PORT_TYPE_RX_10G &&
-	    p_FmPort->portType != e_FM_PORT_TYPE_RX &&
-	    p_FmPort->portType != e_FM_PORT_TYPE_OH_OFFLINE_PARSING) {
-		RETURN_ERROR(MAJOR, E_INVALID_OPERATION,
-			     ("available for Rx and offline parsing ports only"));
-	}
+    /* A previous rollback may have retained ownership after a second error. */
+    if (p_FmPort->pcdNetEnvOwner || p_FmPort->pcdEngines)
+    {
+        if (!FmPcdLockTryLockAll(p_FmPort->h_FmPcd))
+        {
+            err = ERROR_CODE(E_BUSY);
+            goto out;
+        }
+        allLocked = TRUE;
+        err = DeletePortPcd(p_FmPort, &allLocked);
+        if (err)
+            goto out;
+    }
 
-	if (!TRY_LOCK(p_FmPort->h_Spinlock, &p_FmPort->lock)) {
-		DBG(TRACE, ("FM Port Try Lock - BUSY"));
-		return ERROR_CODE(E_BUSY);
-	}
-
-	p_FmPort->h_FmPcd = FmGetPcdHandle(p_FmPort->h_Fm);
-	ASSERT_COND(p_FmPort->h_FmPcd);
-
-	if (p_PcdParam->p_CcParams && !p_PcdParam->p_CcParams->h_CcTree) {
-		RETURN_ERROR(MAJOR, E_INVALID_HANDLE,
-			     ("Tree handle must be given if CC is required"));
-	}
-
-	memcpy(&modifiedPcdParams, p_PcdParam, sizeof(t_FmPortPcdParams));
-	p_PcdParams = &modifiedPcdParams;
-	if (p_PcdParams->h_IpReassemblyManip ||
-	    p_PcdParams->h_CapwapReassemblyManip) {
-		if (p_PcdParams->pcdSupport != e_FM_PORT_PCD_SUPPORT_PRS_AND_KG &&
-		    p_PcdParams->pcdSupport != e_FM_PORT_PCD_SUPPORT_PRS_AND_KG_AND_CC &&
-		    p_PcdParams->pcdSupport != e_FM_PORT_PCD_SUPPORT_PRS_AND_KG_AND_CC_AND_PLCR &&
-		    p_PcdParams->pcdSupport != e_FM_PORT_PCD_SUPPORT_PRS_AND_KG_AND_PLCR) {
-			RELEASE_LOCK(p_FmPort->lock);
-			RETURN_ERROR(MAJOR, E_INVALID_STATE,
-				     ("pcdSupport must have KG for supporting Reassembly"));
-		}
-		p_FmPort->h_IpReassemblyManip = p_PcdParams->h_IpReassemblyManip;
-		if (p_PcdParams->h_IpReassemblyManip && p_PcdParams->h_CapwapReassemblyManip) {
-			RETURN_ERROR(MAJOR, E_INVALID_STATE,
-				     ("Either IP-R or CAPWAP-R is allowed"));
-		}
-		if (p_PcdParams->h_CapwapReassemblyManip &&
-		    p_FmPort->portType != e_FM_PORT_TYPE_OH_OFFLINE_PARSING) {
-			RETURN_ERROR(MAJOR, E_INVALID_STATE,
-				     ("CAPWAP-R is allowed only on offline-port"));
-		}
-		if (p_PcdParams->h_CapwapReassemblyManip)
-			p_FmPort->h_CapwapReassemblyManip = p_PcdParams->h_CapwapReassemblyManip;
-
-		if (!p_PcdParams->p_CcParams) {
-			if (!(p_PcdParams->pcdSupport == e_FM_PORT_PCD_SUPPORT_PRS_AND_KG ||
-			      p_PcdParams->pcdSupport == e_FM_PORT_PCD_SUPPORT_PRS_AND_KG_AND_PLCR)) {
-				RELEASE_LOCK(p_FmPort->lock);
-				RETURN_ERROR(MAJOR, E_INVALID_STATE,
-					     ("PCD initialization structure is not consistent with pcdSupport"));
-			}
-
-			/* No user-tree, need to build internal tree */
-			p_FmPcdCcTreeParams = (t_FmPcdCcTreeParams*)XX_Malloc(sizeof(t_FmPcdCcTreeParams));
-			if (!p_FmPcdCcTreeParams)
-				RETURN_ERROR(MAJOR, E_NO_MEMORY, ("p_FmPcdCcTreeParams"));
-
-			memset(p_FmPcdCcTreeParams, 0, sizeof(t_FmPcdCcTreeParams));
-			p_FmPcdCcTreeParams->h_NetEnv = p_PcdParams->h_NetEnv;
-
-			p_FmPort->h_ReassemblyTree = FM_PCD_CcRootBuild(p_FmPort->h_FmPcd,
-									p_FmPcdCcTreeParams);
-			if (!p_FmPort->h_ReassemblyTree) {
-				RELEASE_LOCK(p_FmPort->lock);
-				XX_Free(p_FmPcdCcTreeParams);
-				RETURN_ERROR(MAJOR, E_INVALID_HANDLE,
-					     ("FM_PCD_CcBuildTree for Reassembly failed"));
-			}
-			if (p_PcdParams->pcdSupport == e_FM_PORT_PCD_SUPPORT_PRS_AND_KG)
-				p_PcdParams->pcdSupport = e_FM_PORT_PCD_SUPPORT_PRS_AND_KG_AND_CC;
-			else
-				p_PcdParams->pcdSupport = e_FM_PORT_PCD_SUPPORT_PRS_AND_KG_AND_CC_AND_PLCR;
-
-			memset(&fmPortPcdCcParams, 0, sizeof(t_FmPortPcdCcParams));
-			fmPortPcdCcParams.h_CcTree = p_FmPort->h_ReassemblyTree;
-			p_PcdParams->p_CcParams = &fmPortPcdCcParams;
-			XX_Free(p_FmPcdCcTreeParams);
-		}
-
-		if (p_FmPort->h_IpReassemblyManip) {
-			err = FmPcdCcTreeAddIPR(p_FmPort->h_FmPcd,
-						p_PcdParams->p_CcParams->h_CcTree,
-						p_PcdParams->h_NetEnv,
-						p_FmPort->h_IpReassemblyManip, TRUE);
-		} else if (p_FmPort->h_CapwapReassemblyManip) {
-			err = FmPcdCcTreeAddCPR(p_FmPort->h_FmPcd,
-						p_PcdParams->p_CcParams->h_CcTree,
-						p_PcdParams->h_NetEnv,
-						p_FmPort->h_CapwapReassemblyManip,
-						TRUE);
-		}
-		if (err != E_OK) {
-			if (p_FmPort->h_ReassemblyTree) {
-				FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-				p_FmPort->h_ReassemblyTree = NULL;
-			}
-			RELEASE_LOCK(p_FmPort->lock);
-			RETURN_ERROR(MAJOR, err, NO_MSG);
-		}
-	}
-
-	if (!FmPcdLockTryLockAll(p_FmPort->h_FmPcd)) {
-		if (p_FmPort->h_ReassemblyTree) {
-			FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-			p_FmPort->h_ReassemblyTree = NULL;
-		}
-		RELEASE_LOCK(p_FmPort->lock);
-		DBG(TRACE, ("Try LockAll - BUSY"));
-		return ERROR_CODE(E_BUSY);
-	}
-
-	err = SetPcd(h_FmPort, p_PcdParams);
-	if (err) {
-		if (p_FmPort->h_ReassemblyTree) {
-			FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-			p_FmPort->h_ReassemblyTree = NULL;
-		}
-		FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
-		RELEASE_LOCK(p_FmPort->lock);
-		RETURN_ERROR(MAJOR, err, NO_MSG);
-	}
-
-	if ((p_FmPort->pcdEngines & FM_PCD_PRS) &&
-	    p_PcdParams->p_PrsParams->includeInPrsStatistics) {
-		err = FmPcdPrsIncludePortInStatistics(p_FmPort->h_FmPcd,
-						      p_FmPort->hardwarePortId,
-						      TRUE);
-		if (err) {
-			DeletePcd(p_FmPort);
-			if (p_FmPort->h_ReassemblyTree) {
-				FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-				p_FmPort->h_ReassemblyTree = NULL;
-			}
-			FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
-			RELEASE_LOCK(p_FmPort->lock);
-			RETURN_ERROR(MAJOR, err, NO_MSG);
-		}
-		p_FmPort->includeInPrsStatistics = TRUE;
-	}
-
-	FmPcdIncNetEnvOwners(p_FmPort->h_FmPcd, p_FmPort->netEnvId);
+    modifiedPcdParams = *p_PcdParam;
+    p_FmPort->netEnvId = FmPcdGetNetEnvId(p_PcdParams->h_NetEnv);
+    FmPcdIncNetEnvOwners(p_FmPort->h_FmPcd, p_FmPort->netEnvId);
+    p_FmPort->pcdNetEnvOwner = TRUE;
+    if (!FmPcdLockTryLockAll(p_FmPort->h_FmPcd))
+    {
+        err = ERROR_CODE(E_BUSY);
+        goto fail;
+    }
+    allLocked = TRUE;
+    err = SetPcd(p_FmPort, p_PcdParams);
+    if (err)
+        goto fail;
+    if ((p_FmPort->pcdEngines & FM_PCD_PRS) &&
+        p_PcdParams->p_PrsParams->includeInPrsStatistics)
+    {
+        err = FmPcdPrsIncludePortInStatistics(p_FmPort->h_FmPcd,
+                                             p_FmPort->hardwarePortId, TRUE);
+        if (err)
+            goto fail;
+        p_FmPort->includeInPrsStatistics = TRUE;
+    }
 
 	if (FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)) {
 		memset(&fmPortGetSetCcParams, 0, sizeof(t_FmPortGetSetCcParams));
@@ -5070,8 +5260,10 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
 			}
 #endif /* FM_KG_ERASE_FLOW_ID_ERRATA_FMAN_SW004 */
 
-			FmPortSetGprFunc(p_FmPort, e_FM_PORT_GPR_MURAM_PAGE,
+			err = FmPortSetGprFunc(p_FmPort, e_FM_PORT_GPR_MURAM_PAGE,
 					 (void**)&p_ParamsPage);
+			if (err)
+			goto fail;
 			ASSERT_COND(p_ParamsPage);
 			WRITE_UINT32(p_ParamsPage->postBmiFetchNia, p_FmPort->savedBmiNia);
 
@@ -5085,163 +5277,83 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
 							       NIA_ENG_FM_CTL;
 
 			err = FmPortGetSetCcParams(p_FmPort, &fmPortGetSetCcParams);
-			if (err != E_OK) {
-				DeletePcd(p_FmPort);
-				if (p_FmPort->h_ReassemblyTree) {
-					FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-					p_FmPort->h_ReassemblyTree = NULL;
-				}
-				FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
-				RELEASE_LOCK(p_FmPort->lock);
-				RETURN_ERROR(MAJOR, err, NO_MSG);
-			}
+			if (err)
+			goto fail;
 		}
 
-		FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
-
-		/* Set pop-to-next-step nia */
-		fmPortGetSetCcParams.getCcParams.type = GET_NIA_FPNE;
-		err = FmPortGetSetCcParams(h_FmPort, &fmPortGetSetCcParams);
-		if (err != E_OK) {
-			DeletePcd(p_FmPort);
-			if (p_FmPort->h_ReassemblyTree) {
-				FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-				p_FmPort->h_ReassemblyTree = NULL;
-			}
-			RELEASE_LOCK(p_FmPort->lock);
-			RETURN_ERROR(MAJOR, err, NO_MSG);
-		}
 
 		/* Set post-bmi-prepare-to-enq nia */
 		fmPortGetSetCcParams.setCcParams.type = UPDATE_NIA_FENE;
 		fmPortGetSetCcParams.setCcParams.nia = NIA_FM_CTL_AC_POST_BMI_ENQ | NIA_ENG_FM_CTL;
 
 		err = FmPortGetSetCcParams(h_FmPort, &fmPortGetSetCcParams);
-		if (err != E_OK) {
-			DeletePcd(p_FmPort);
-			if (p_FmPort->h_ReassemblyTree) {
-				FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-				p_FmPort->h_ReassemblyTree = NULL;
-			}
-			RELEASE_LOCK(p_FmPort->lock);
-			RETURN_ERROR(MAJOR, err, NO_MSG);
-		}
+		if (err)
+			goto fail;
 
-		if (p_FmPort->h_IpReassemblyManip || p_FmPort->h_CapwapReassemblyManip) {
-			/* Set the ORR bit (for order-restoration) */
-			fmPortGetSetCcParams.setCcParams.type = UPDATE_NIA_FPNE;
-			fmPortGetSetCcParams.setCcParams.nia = fmPortGetSetCcParams.getCcParams.nia |
-							       NIA_ORDER_RESTOR;
 
-			err = FmPortGetSetCcParams(h_FmPort, &fmPortGetSetCcParams);
-			if (err != E_OK) {
-				DeletePcd(p_FmPort);
-				if (p_FmPort->h_ReassemblyTree) {
-					FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-					p_FmPort->h_ReassemblyTree = NULL;
-				}
-				RELEASE_LOCK(p_FmPort->lock);
-				RETURN_ERROR(MAJOR, err, NO_MSG);
-			}
-		}
-	} else {
-		FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
 	}
 
-	err = FM_PORT_ConfigureMuramPage(h_FmPort);
-	if (err) {
-		DeletePcd(p_FmPort);
-		if (p_FmPort->h_ReassemblyTree) {
-			FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-			p_FmPort->h_ReassemblyTree = NULL;
-		}
-		RELEASE_LOCK(p_FmPort->lock);
-		RETURN_ERROR(MAJOR, err, NO_MSG);
-	}
+    err = FM_PORT_ConfigureMuramPage(p_FmPort);
+    if (err)
+        goto fail;
+    err = AttachPCD(p_FmPort);
+    if (err)
+        goto fail;
+    p_FmPort->pcdConfigured = TRUE;
+    goto out;
 
-	err = AttachPCD(h_FmPort);
-	if (err) {
-		DeletePcd(p_FmPort);
-		if (p_FmPort->h_ReassemblyTree) {
-			FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
-			p_FmPort->h_ReassemblyTree = NULL;
-		}
-		RELEASE_LOCK(p_FmPort->lock);
-		RETURN_ERROR(MAJOR, err, NO_MSG);
-	}
-
-	RELEASE_LOCK(p_FmPort->lock);
-
-	return err;
+fail:
+    cleanupErr = DeletePortPcd(p_FmPort, &allLocked);
+    if (cleanupErr)
+        REPORT_ERROR(MAJOR, cleanupErr, ("Port PCD cleanup is pending; retry delete or setup"));
+out:
+    if (allLocked)
+        FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
+    RELEASE_LOCK(p_FmPort->lock);
+    return err;
 }
 
 t_Error FM_PORT_DeletePCD(t_Handle h_FmPort)
 {
-    t_FmPort *p_FmPort = (t_FmPort*)h_FmPort;
-    t_Error err = E_OK;
+    t_FmPort *p_FmPort = (t_FmPort *)h_FmPort;
+    t_Error err;
+    bool allLocked = FALSE;
 
     SANITY_CHECK_RETURN_ERROR(h_FmPort, E_INVALID_HANDLE);
     SANITY_CHECK_RETURN_ERROR(!p_FmPort->p_FmPortDriverParam, E_INVALID_STATE);
-
     if (p_FmPort->imEn)
-        RETURN_ERROR(MAJOR, E_INVALID_OPERATION,
-                     ("available for non-independant mode ports only"));
-
-    if ((p_FmPort->portType != e_FM_PORT_TYPE_RX_10G)
-            && (p_FmPort->portType != e_FM_PORT_TYPE_RX)
-            && (p_FmPort->portType != e_FM_PORT_TYPE_OH_OFFLINE_PARSING))
-        RETURN_ERROR( MAJOR, E_INVALID_OPERATION,
-                     ("available for Rx and offline parsing ports only"));
-
+        RETURN_ERROR(MAJOR, E_INVALID_OPERATION, ("Not available in independent mode"));
+    if (p_FmPort->portType != e_FM_PORT_TYPE_RX_10G &&
+        p_FmPort->portType != e_FM_PORT_TYPE_RX &&
+        p_FmPort->portType != e_FM_PORT_TYPE_OH_OFFLINE_PARSING)
+        RETURN_ERROR(MAJOR, E_INVALID_OPERATION, ("Available for Rx and offline ports only"));
     if (!TRY_LOCK(p_FmPort->h_Spinlock, &p_FmPort->lock))
-    {
-        DBG(TRACE, ("FM Port Try Lock - BUSY"));
         return ERROR_CODE(E_BUSY);
-    }
-
-    err = DetachPCD(h_FmPort);
-    if (err)
+    if (!p_FmPort->pcdNetEnvOwner && !p_FmPort->pcdEngines)
     {
-        RELEASE_LOCK(p_FmPort->lock);
-        RETURN_ERROR(MAJOR, err, NO_MSG);
+        err = ERROR_CODE(E_INVALID_STATE);
+        goto out;
     }
-
-    FmPcdDecNetEnvOwners(p_FmPort->h_FmPcd, p_FmPort->netEnvId);
-
-    /* we do it anyway, instead of checking if included */
-    if ((p_FmPort->pcdEngines & FM_PCD_PRS) && p_FmPort->includeInPrsStatistics)
-    {
-        FmPcdPrsIncludePortInStatistics(p_FmPort->h_FmPcd,
-                                        p_FmPort->hardwarePortId, FALSE);
-        p_FmPort->includeInPrsStatistics = FALSE;
-    }
-
+    /* A refused lock must not detach the port or consume any references. */
     if (!FmPcdLockTryLockAll(p_FmPort->h_FmPcd))
     {
-        RELEASE_LOCK(p_FmPort->lock);
-        DBG(TRACE, ("Try LockAll - BUSY"));
-        return ERROR_CODE(E_BUSY);
+        err = ERROR_CODE(E_BUSY);
+        goto out;
     }
-
-    err = DeletePcd(h_FmPort);
-    FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
-    if (err)
+    allLocked = TRUE;
+    if (p_FmPort->pcdConfigured)
     {
-        RELEASE_LOCK(p_FmPort->lock);
-        RETURN_ERROR(MAJOR, err, NO_MSG);
-    }
-
-    if (p_FmPort->h_ReassemblyTree)
-    {
-        err = FM_PCD_CcRootDelete(p_FmPort->h_ReassemblyTree);
+        err = DetachPCD(p_FmPort);
         if (err)
-        {
-            RELEASE_LOCK(p_FmPort->lock);
-            RETURN_ERROR(MAJOR, err, NO_MSG);
-        }
-        p_FmPort->h_ReassemblyTree = NULL;
-    }RELEASE_LOCK(p_FmPort->lock);
-
+            goto unlock;
+        p_FmPort->pcdConfigured = FALSE;
+    }
+    err = DeletePortPcd(p_FmPort, &allLocked);
+unlock:
+    if (allLocked)
+        FmPcdLockUnlockAll(p_FmPort->h_FmPcd);
+out:
+    RELEASE_LOCK(p_FmPort->lock);
     return err;
 }
 
@@ -5277,9 +5389,18 @@ t_Error FM_PORT_PcdKgBindSchemes(t_Handle h_FmPort,
         return ERROR_CODE(E_BUSY);
     }
 
+    if (!p_FmPort->pcdConfigured)
+    {
+        RELEASE_LOCK(p_FmPort->lock);
+        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD setup is not complete"));
+    }
+
     err = FmPcdKgBindPortToSchemes(p_FmPort->h_FmPcd, &schemeBind);
     if (err == E_OK)
+    {
         p_FmPort->schemesPerPortVector |= tmpScmVec;
+        p_FmPort->pcdBindings.schemes = !!p_FmPort->schemesPerPortVector;
+    }
 
 #ifdef FM_KG_ERASE_FLOW_ID_ERRATA_FMAN_SW004
     if ((FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)) &&
@@ -5327,9 +5448,18 @@ t_Error FM_PORT_PcdKgUnbindSchemes(t_Handle h_FmPort,
         return ERROR_CODE(E_BUSY);
     }
 
+    if (!p_FmPort->pcdConfigured)
+    {
+        RELEASE_LOCK(p_FmPort->lock);
+        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD setup is not complete"));
+    }
+
     err = FmPcdKgUnbindPortToSchemes(p_FmPort->h_FmPcd, &schemeBind);
     if (err == E_OK)
+    {
         p_FmPort->schemesPerPortVector &= ~tmpScmVec;
+        p_FmPort->pcdBindings.schemes = !!p_FmPort->schemesPerPortVector;
+    }
     RELEASE_LOCK(p_FmPort->lock);
 
     return err;
