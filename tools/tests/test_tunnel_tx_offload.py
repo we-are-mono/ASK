@@ -31,6 +31,7 @@ to Linux's sit module in software. See ISSUES.md A9.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -193,7 +194,17 @@ async def sit_tunnel(aiohttp_session, target_agent, lan, ipv6_topology):
 async def test_tunnel_tx_ipv6_in_ipv4_offload(
     aiohttp_session, target_agent, lan, splat_window, sit_tunnel,
 ):
-    """LAN→WAN IPv6 traffic over a sit tunnel — assert FMAN encaps."""
+    """LAN→WAN IPv6 iperf3 over a sit tunnel — throughput + path truth.
+
+    This is a THROUGHPUT test, not an offload proof: TX-encap offload is
+    blocked inside FMAN ucode 210.10.1 (INSERT_L3_HDR punts every matched
+    packet — ISSUES.md A9), and modern kernel sit encap sustains ~9 Gbit/s
+    on the A72s, which is what the >1 Gbps floor actually measures. A
+    kernel-tx counter tripwire below asserts the software path explicitly,
+    so if a future ucode fixes INSERT_L3_HDR and encap starts offloading,
+    this test fails loudly and gets rewritten rather than silently
+    changing meaning.
+    """
     # Conntrack baseline (we want at least ONE new IPv6 entry to appear,
     # which proves the kernel netfilter conntrack engaged on the
     # forwarded v6 path — prerequisite for CMM→FCI mirroring).
@@ -202,6 +213,10 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
         ["sysctl", "-n", "net.netfilter.nf_conntrack_count"],
     )
     ct_before = int((r.get("stdout") or "0").strip() or "0")
+
+    r = await target_agent.exec_cmd(
+        aiohttp_session, ["ip", "-s", "-j", "link", "show", TUNNEL_IF])
+    sit_tx_before = json.loads(r["stdout"])[0]["stats64"]["tx"]["packets"]
 
     # iperf3 client on LAN VM, target = orchestrator's tunnel-side v6.
     # TCP so SYN+SYNACK marks the flow assured-equivalent enough for
@@ -281,4 +296,20 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
         f"(before={ct_before}, after={ct_after}). Either ip6tables "
         f"FORWARD rule isn't engaging conntrack, or traffic bypassed "
         f"the kernel forward path entirely (LAN-side bottleneck)."
+    )
+
+    # Oracle (iii): software-encap tripwire. Kernel sit tx must have
+    # carried the bulk of the run; if it stays near zero the encap
+    # direction started hardware-offloading (ucode INSERT_L3_HDR fixed?)
+    # and this test's premise changed — rewrite it as a real offload
+    # test with counter oracles (see ISSUES.md A9).
+    r = await target_agent.exec_cmd(
+        aiohttp_session, ["ip", "-s", "-j", "link", "show", TUNNEL_IF])
+    sit_tx_after = json.loads(r["stdout"])[0]["stats64"]["tx"]["packets"]
+    sit_tx_delta = sit_tx_after - sit_tx_before
+    assert sit_tx_delta > 1000, (
+        f"kernel sit tx only +{sit_tx_delta} during a {gbps:.2f} Gbps "
+        f"run — encap appears hardware-offloaded now, which contradicts "
+        f"the known ucode 210.10.1 INSERT_L3_HDR limitation. Re-verify "
+        f"and rewrite this test; see ISSUES.md A9."
     )
