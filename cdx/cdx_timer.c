@@ -208,6 +208,8 @@ int cdx_ctrl_timer_init(struct _cdx_ctrl *ctrl)
 	{
 		printk(KERN_ERR "%s: kthread_create() failed\n", __func__);
 		rc = PTR_ERR(ctrl->timer_thread);
+		/* cdx_ctrl_timer_exit's NULL guard must not see the ERR_PTR */
+		ctrl->timer_thread = NULL;
 		goto error;
 	}
 	ctrl->timer_inner_wheel = kmalloc(INNER_WHEEL_SIZE * sizeof(struct hlist_head), GFP_KERNEL);
