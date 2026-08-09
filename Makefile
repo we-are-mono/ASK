@@ -91,7 +91,7 @@ $(S)/libnfnetlink:
 	tar xf $(SRCDIR)/tarballs/libnfnetlink-$(LIBNFNETLINK_VER).tar.bz2 -C $(SRCDIR)
 	cd $(SRCDIR)/libnfnetlink-$(LIBNFNETLINK_VER) && \
 		git init -q && git add -A && git commit -q -m "upstream" && \
-		git apply $(PATCHES)/libnfnetlink/01-nxp-ask-nonblocking-heap-buffer.patch && \
+		git apply $(PATCHES)/libnfnetlink/$(LIBNFNETLINK_VER)/01-nxp-ask-nonblocking-heap-buffer.patch && \
 		./configure --host=$(HOST) --prefix=$(SYSROOT) --enable-static --disable-shared -q && \
 		$(MAKE) -j$$(nproc) -s && $(MAKE) install -s
 	@touch $@
@@ -107,7 +107,7 @@ $(S)/libnfct: $(S)/libnfnetlink
 	tar xf $(SRCDIR)/tarballs/libnetfilter_conntrack-$(LIBNFCT_VER).tar.xz -C $(SRCDIR)
 	cd $(SRCDIR)/libnetfilter_conntrack-$(LIBNFCT_VER) && \
 		git init -q && git add -A && git commit -q -m "upstream" && \
-		git apply $(PATCHES)/libnetfilter-conntrack/01-nxp-ask-comcerto-fp-extensions.patch && \
+		git apply $(PATCHES)/libnetfilter-conntrack/$(LIBNFCT_VER)/01-nxp-ask-comcerto-fp-extensions.patch && \
 		PKG_CONFIG_PATH=$(SYSROOT)/lib/pkgconfig \
 		./configure --host=$(HOST) --prefix=$(SYSROOT) --enable-static --disable-shared -q \
 			CFLAGS="-I$(SYSROOT)/include" LDFLAGS="-L$(SYSROOT)/lib" && \
