@@ -970,19 +970,17 @@ static inline void save_sa_state_in_external_mem(PSAEntry sa)
 	/* statistics offset = predetermined offset */
 	stats_offset = sa->stats_offset;
 
-	if (cdx_ipsec_cipher_is_gcm(pSec_sa_context->cipher_data.cipher_type)) {
-		/* RM §7.3.1: in a WAIT/SERIAL sharing flow every job must
-		 * write the PDB back to memory with a STORE — that is what
-		 * makes SEC order later shared-descriptor fetches against
-		 * prior jobs' PDB updates (encap seq counter; decap seq +
-		 * anti-replay window). The PDB occupies words 1..stats and
-		 * the stats words trail it, so cover both in one store. */
-		off_w = 1;
-		len_w = stats_offset / 4 - 1 + CDX_DPA_IPSEC_STATS_LEN;
-	} else {
-		off_w = stats_offset / 4;
-		len_w = CDX_DPA_IPSEC_STATS_LEN;
-	}
+	/* RM §7.3.1: in a WAIT/SERIAL sharing flow every job must write the
+	 * PDB back to memory with a STORE — that is what makes SEC order
+	 * later shared-descriptor fetches against prior jobs' PDB updates
+	 * (encap seq counter; decap seq + anti-replay window). The PDB
+	 * occupies words 1..stats and the stats words trail it, so cover
+	 * both in one store. Applies to every cipher: the legacy stats-only
+	 * store left CBC/CCM/CTR refetches unordered, measured as ~840 TCP
+	 * retransmits per 10 s at 2.37 Gbit/s on CBC+HMAC where GCM with
+	 * this store shows ~20 (ISSUES.md N19). */
+	off_w = 1;
+	len_w = stats_offset / 4 - 1 + CDX_DPA_IPSEC_STATS_LEN;
 
 	/* Store command: in the case of the Descriptor Buffer the length
 	 * is specified in 4-byte words, but in all other cases the length
