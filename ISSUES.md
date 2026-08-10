@@ -47,16 +47,21 @@ stale line refs) are folded into the archive one-liners.
   reset). Test-tooling workaround: gate each boot on eth4 rx>0 (reboot until
   alive) and pin static neighbors on both LAN peers.
 
-- [ ] **N18. SA key DMA buffers are unmapped at descriptor-build time while the
-  descriptor's KEY commands keep referencing their bus addresses.**
-  `cdx_ipsec_create_shareddescriptor` maps the auth/cipher keys, embeds the
-  dma_addr in KEY commands, then unmaps before returning — every SEC job
-  thereafter DMA-reads through addresses the kernel considers unmapped
-  (works today because the streaming mapping is identity/coherent on this
-  SoC, but it is a use-after-unmap by the DMA-API contract and would break
-  under an IOMMU/SWIOTLB config). Long-standing NXP pattern, surfaced
-  during the A24 audit; needs keys kept mapped for the SA lifetime (or
-  inlined into the descriptor as immediates).
+- [ ] **N20. Reinstalling an SA with the same SPI blackholes the tunnel.**
+  install → traffic → `ip xfrm state flush` → reinstall the identical
+  SPIs: the new SA claims offloaded (kernel oseq stays 0, zero lifetime
+  packets) but nothing flows, and it stays dead even 36 s past the A24b
+  FQ-retire cap. Reinstalling with fresh SPIs on the same boot works
+  immediately (2.56 Gbit/s), so the residue is keyed on the SPI —
+  presumably the ehash/classifier entry from the first install is never
+  removed (or shadows the second). Pre-existing and image-independent
+  (reproduced identically before and after the N18/N19 changes); this is
+  the probable mechanism behind the "cumulative datapath degradation"
+  seen during the A24 validation campaign, whose scripted runs always
+  reinstalled identical SPIs. Protocol-driven rekeys allocate fresh SPIs
+  and are unaffected; manual same-SPI recovery (the runtime-recovery
+  requirement) is what breaks. Suspect the SPI-keyed classification
+  entry teardown in cdx_ipsec_delete_fp_entry / ehash removal.
 
 ---
 
@@ -129,6 +134,7 @@ file's git history.
 - **N14.** Teardown gaps closed: `destroy_fwd_tx_fqs` un-ifdef'd (was compiled out — fwd tx FQs undestroyable) and called on release; per-iface proc dirs + wrappers reclaimed via tree-aliveness-aware `cdx_remove_dir_in_procfs`; `cdx_deinit_fqid_procfs` frees the tracking nodes it leaked; stats MURAM carve freed from the sweep tail (_79089f1_). Failed-injection MURAM/HW residue stays accepted (handle gone by then).
 - **N15.** VAP/netdev lifetime residue closed: NETDEV_UNREGISTER notifier (unpublish + grace + down for OPEN vaps on a dying wifi netdev, multi-vap aware, alias-clearing without relying on 8021q ordering; also covers netns moves); VLAN aliases republished on vap re-ADD (by netdev relationship — never-FCI-registered VLANs now get the alias too, safe via the SEC round-trip/exception path); the FCI VLAN-REGISTER copy runs under rtnl; `fqid_files_g` spinlocked with sleeping ops outside; exit drains in-flight ioctls under rtnl (mid-ADD FQ leak gone) (_f094aba_). Accepted residue: a CONFIGURE→ADD issued on a held-open fd after a failed-init teardown can still poke freed OH state (pre-existing class, failed-init-only, needs a shutting-down gate); frames parked in SEC/FMAN can outlive a netdev unregister (inherent, narrowed by the notifier). cdx.ko now depends on 8021q.ko (vlan_dev_real_dev).
 - **N19.** CBC+HMAC wire showed 26x the seq-duplicates of fixed GCM (308 vs 12 per 200k after the fix) — the RM §7.3.1 per-job PDB STORE was GCM-only; extended to every cipher, CBC dupes 0.154%→0.006% at unchanged 2.4-2.5 Gbit/s, GCM 0 dupes/0 dup-IVs per 200k. The ~840-retx signal that opened this was a flow-setup transient, not steady-state loss (_1055403_).
+- **N18.** Descriptor KEY commands DMA-read key bus addresses that were unmapped at build time (use-after-unmap by the DMA-API contract; harmless on identity mapping, fatal under IOMMU/SWIOTLB) — mappings now live in the SA context for the SA lifetime, released beside the key buffers in cdx_ipsec_sec_sa_context_free (_14722d1_).
 - **N17.** cmm-programmed IPsec inner flows suspected heavily lossy — not reproducible on a clean boot: mid-run FPP conntrack shows the iperf flows programmed with IPsec annotations while TCP runs 2.54 Gbit/s, and tx-toenc moves +41 across ~1.1M packets (99.996 % hardware-classified path, 20-22 retx). Original evidence decomposed: the iperf3 UDP-mode control deaths were a Vision-side source-selection artifact (unconnected UDP replies left plaintext via the br0 source, missing the src-10.99.0.2 policy — fixed by the `ip route … src 10.99.0.2` pin, now in the IPSEC.md recipes); the 0.84 Mbit/s GCM run was WAIT-mode burst tail-drops (default since moved to SERIAL, 43f29a0); the 63 Mbit/s CBC cmm-up/down comparison ran on a state-degraded boot. The one real residual — CBC's ~840 retx vs GCM's 20 — refiled as N19 (descriptor store, not path).
 - **N10.** Devlist discipline sweep — OH fixtures carried `itf_id` 0, so releasing/looking up the legitimate onif index 0 could alias one (release now skips OFPORT + `~0U` sentinel at creation); the two non-FCI walkers (`dpa_get_ohifinfo_by_portid` — which also lacked the union type check — and `cdx_copy_eth_rx_channel_info`) now walk under the list lock; `dpa_add_wlan_if` gained the missing `iface_count++`/cap/rc checks (vap cycles underflowed the u8 counter until all adds were rejected); `remove_onif_by_index` bails on invalid slots; injection-precedes-FCI serialization documented; dead code removed (`dpa_update_wlan_if`, `dpa_get_itfid_by_fman_params`, the caller-less `comcerto_fpp_send_command_simple`/`_atomic`, `cdx_ctrl_send_command_simple`) (_26b408a_). Sleeping-under-vaplock and the deinit list leak filed as N11/N12.
 
