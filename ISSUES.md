@@ -47,21 +47,6 @@ stale line refs) are folded into the archive one-liners.
   reset). Test-tooling workaround: gate each boot on eth4 rx>0 (reboot until
   alive) and pin static neighbors on both LAN peers.
 
-- [ ] **N20. Reinstalling an SA with the same SPI blackholes the tunnel.**
-  install → traffic → `ip xfrm state flush` → reinstall the identical
-  SPIs: the new SA claims offloaded (kernel oseq stays 0, zero lifetime
-  packets) but nothing flows, and it stays dead even 36 s past the A24b
-  FQ-retire cap. Reinstalling with fresh SPIs on the same boot works
-  immediately (2.56 Gbit/s), so the residue is keyed on the SPI —
-  presumably the ehash/classifier entry from the first install is never
-  removed (or shadows the second). Pre-existing and image-independent
-  (reproduced identically before and after the N18/N19 changes); this is
-  the probable mechanism behind the "cumulative datapath degradation"
-  seen during the A24 validation campaign, whose scripted runs always
-  reinstalled identical SPIs. Protocol-driven rekeys allocate fresh SPIs
-  and are unaffected; manual same-SPI recovery (the runtime-recovery
-  requirement) is what breaks. Suspect the SPI-keyed classification
-  entry teardown in cdx_ipsec_delete_fp_entry / ehash removal.
 
 ---
 
@@ -150,6 +135,7 @@ file's git history.
 - **N6.** `abm_retransmit_delay` accepted 0 (retransmit work spins) and negatives (`-N*HZ` cast to unsigned parks the work ~forever with no rescheduler) — dedicated handler rejects `<= 0` with -EINVAL and restores the previous value (_d8083c6_).
 
 ## Corrections to the original review (wontfix / not-a-bug)
+- **N20 (not a bug).** "Same-SPI reinstall blackholes the tunnel" was a test artifact: reinstalling one peer's SA rewinds its ESP sequence to 1 while the other peer's inbound SA retains the old replay-window high-water mark and correctly rejects the rewound seqs (RFC 4303). Proven by isolation — a DUT-only reinstall drops 100% with the peer's XfrmInStateSeqError ticking one-per-packet; resetting only the peer's replay window (DUT untouched) restores it instantly. Runtime SA replacement must reset both peers together or use fresh SPIs (which real IKE always does); no cdx defect.
 - **X1.** "256B memset + partial fill info leak" — wontfix: memset(p,0,256) zeros the full rbuf before the Get_Timeout partial fill; surplus bytes are zeros.
 - **X2.** "strcpy IF_NAME_SIZE overflow" — wontfix/fixed: downgraded to L2 and swept to strscpy (_89e5b32_); all cdx name copies now dst-size bounded.
 - **X3.** "dpaa_eth_refill_bpools suspected leaks" — wontfix: the skb backpointer lives in the BMan hardware-owned frag pool kmemleak can't scan; error paths free cleanly.
