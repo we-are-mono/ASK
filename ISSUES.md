@@ -58,15 +58,6 @@ stale line refs) are folded into the archive one-liners.
   during the A24 audit; needs keys kept mapped for the SA lifetime (or
   inlined into the descriptor as immediates).
 
-- [ ] **N19. CBC+HMAC shows ~40x the TCP retransmits of fixed GCM at rate.**
-  Same clean boot, same 10 s iperf3 TCP through the tunnel: CBC+HMAC
-  2.37 Gbit/s with 842 retransmits vs GCM (post-A24 descriptor) 2.55 Gbit/s
-  with 20. The GCM descriptor carries the RM §7.3.1 per-job PDB STORE
-  (cross-DECO refetch interlock) that the legacy CBC/CCM/CTR descriptors
-  lack — extending the store to all ciphers is the candidate fix; needs a
-  measured before/after (and would also close their latent cross-DECO
-  seq-duplication, 0.154 % for CBC at blast scale).
-
 ---
 
 <a name="archive"></a>
@@ -137,6 +128,7 @@ file's git history.
 - **N13.** VAP REMOVE/RESET tore down state lock-free consumers could still reach — new rtnl-held `vwd_unpublish_vap` clears every `wifi_offload_dev` alias (incl. VLAN-on-vap), REMOVE/RESET claim the slot and wait a `synchronize_rcu` grace before `vwd_vap_down`, RESET also drops the per-vap sysfs attrs (double-create fixed), and the exit path gained the same discipline plus an explicit grace (`nf_unregister_net_hook` stopped synchronizing in 4.14) and a global alias sweep (_de0aef4_). Residue filed as N15.
 - **N14.** Teardown gaps closed: `destroy_fwd_tx_fqs` un-ifdef'd (was compiled out — fwd tx FQs undestroyable) and called on release; per-iface proc dirs + wrappers reclaimed via tree-aliveness-aware `cdx_remove_dir_in_procfs`; `cdx_deinit_fqid_procfs` frees the tracking nodes it leaked; stats MURAM carve freed from the sweep tail (_79089f1_). Failed-injection MURAM/HW residue stays accepted (handle gone by then).
 - **N15.** VAP/netdev lifetime residue closed: NETDEV_UNREGISTER notifier (unpublish + grace + down for OPEN vaps on a dying wifi netdev, multi-vap aware, alias-clearing without relying on 8021q ordering; also covers netns moves); VLAN aliases republished on vap re-ADD (by netdev relationship — never-FCI-registered VLANs now get the alias too, safe via the SEC round-trip/exception path); the FCI VLAN-REGISTER copy runs under rtnl; `fqid_files_g` spinlocked with sleeping ops outside; exit drains in-flight ioctls under rtnl (mid-ADD FQ leak gone) (_f094aba_). Accepted residue: a CONFIGURE→ADD issued on a held-open fd after a failed-init teardown can still poke freed OH state (pre-existing class, failed-init-only, needs a shutting-down gate); frames parked in SEC/FMAN can outlive a netdev unregister (inherent, narrowed by the notifier). cdx.ko now depends on 8021q.ko (vlan_dev_real_dev).
+- **N19.** CBC+HMAC wire showed 26x the seq-duplicates of fixed GCM (308 vs 12 per 200k after the fix) — the RM §7.3.1 per-job PDB STORE was GCM-only; extended to every cipher, CBC dupes 0.154%→0.006% at unchanged 2.4-2.5 Gbit/s, GCM 0 dupes/0 dup-IVs per 200k. The ~840-retx signal that opened this was a flow-setup transient, not steady-state loss (_1055403_).
 - **N17.** cmm-programmed IPsec inner flows suspected heavily lossy — not reproducible on a clean boot: mid-run FPP conntrack shows the iperf flows programmed with IPsec annotations while TCP runs 2.54 Gbit/s, and tx-toenc moves +41 across ~1.1M packets (99.996 % hardware-classified path, 20-22 retx). Original evidence decomposed: the iperf3 UDP-mode control deaths were a Vision-side source-selection artifact (unconnected UDP replies left plaintext via the br0 source, missing the src-10.99.0.2 policy — fixed by the `ip route … src 10.99.0.2` pin, now in the IPSEC.md recipes); the 0.84 Mbit/s GCM run was WAIT-mode burst tail-drops (default since moved to SERIAL, 43f29a0); the 63 Mbit/s CBC cmm-up/down comparison ran on a state-degraded boot. The one real residual — CBC's ~840 retx vs GCM's 20 — refiled as N19 (descriptor store, not path).
 - **N10.** Devlist discipline sweep — OH fixtures carried `itf_id` 0, so releasing/looking up the legitimate onif index 0 could alias one (release now skips OFPORT + `~0U` sentinel at creation); the two non-FCI walkers (`dpa_get_ohifinfo_by_portid` — which also lacked the union type check — and `cdx_copy_eth_rx_channel_info`) now walk under the list lock; `dpa_add_wlan_if` gained the missing `iface_count++`/cap/rc checks (vap cycles underflowed the u8 counter until all adds were rejected); `remove_onif_by_index` bails on invalid slots; injection-precedes-FCI serialization documented; dead code removed (`dpa_update_wlan_if`, `dpa_get_itfid_by_fman_params`, the caller-less `comcerto_fpp_send_command_simple`/`_atomic`, `cdx_ctrl_send_command_simple`) (_26b408a_). Sleeping-under-vaplock and the deinit list leak filed as N11/N12.
 
