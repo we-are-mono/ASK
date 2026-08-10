@@ -389,6 +389,13 @@ typedef struct dpa_sec_sa_context_s{
                                 * MAX_CAAM_DESCSIZE                           */
 
 	U16           	alg_suite;
+
+	/* The descriptor's KEY commands DMA-read these bus addresses on
+	 * every SEC job, so the mappings must live as long as the SA —
+	 * created in cdx_ipsec_create_shareddescriptor, released in
+	 * cdx_ipsec_sec_sa_context_free. 0 = never mapped. */
+	dma_addr_t crypto_key_dma;
+	dma_addr_t auth_key_dma;
 } DpaSecSAContext , *PDpaSecSAContext;
 
 typedef struct _tSAEntry {

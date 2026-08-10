@@ -528,6 +528,29 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 			return;
 		}
 	}
+	/* Release the SA-lifetime key mappings before freeing the buffers.
+	 * Guards mirror the map sites in cdx_ipsec_create_shareddescriptor;
+	 * 0 means the SA never got a descriptor built. */
+	if (jrdev_g) {
+		if (pdpa_sec_context->crypto_key_dma)
+			dma_unmap_single(jrdev_g,
+					pdpa_sec_context->crypto_key_dma,
+					pdpa_sec_context->cipher_data.cipher_key_len,
+					DMA_TO_DEVICE);
+		if (pdpa_sec_context->auth_key_dma) {
+			if (pdpa_sec_context->auth_data.split_key_len)
+				dma_unmap_single(jrdev_g,
+						pdpa_sec_context->auth_key_dma,
+						pdpa_sec_context->auth_data.split_key_pad_len,
+						DMA_TO_DEVICE);
+			else
+				dma_unmap_single(jrdev_g,
+						pdpa_sec_context->auth_key_dma,
+						pdpa_sec_context->auth_data.auth_key_len,
+						DMA_TO_DEVICE);
+		}
+	}
+
 	if (pdpa_sec_context->cipher_data.cipher_key) {
 		void *cipher_addr = pdpa_sec_context->cipher_data.cipher_key;
 
@@ -2420,19 +2443,12 @@ done_shared_desc:
 	//	(void *)sec_desc->preheader);
 	sec_desc->preheader = cpu_to_caam64(sec_desc->preheader);
 
-	dma_unmap_single(jrdev_g, crypto_key_dma,
-			psec_sa_context->cipher_data.cipher_key_len,
-			DMA_TO_DEVICE);
-	/* mirror the map-site guard (split_key_len); the mapped length is
-	 * still split_key_pad_len */
-	if (psec_sa_context->auth_data.split_key_len)
-		dma_unmap_single(jrdev_g, auth_key_dma,
-				psec_sa_context->auth_data.split_key_pad_len,
-				DMA_TO_DEVICE);
-	else if (psec_sa_context->auth_data.auth_key_len)
-		dma_unmap_single(jrdev_g, auth_key_dma,
-				psec_sa_context->auth_data.auth_key_len,
-				DMA_TO_DEVICE);
+	/* The KEY commands embedded above reference these bus addresses on
+	 * every SEC job — keep the mappings alive for the SA lifetime
+	 * instead of unmapping here (DMA-API use-after-unmap otherwise;
+	 * ISSUES.md N18). Released in cdx_ipsec_sec_sa_context_free(). */
+	psec_sa_context->crypto_key_dma = crypto_key_dma;
+	psec_sa_context->auth_key_dma = auth_key_dma;
 	/* Flush the CPU-cached writes to sec_desc (preheader, PDB,
 	 * shared_desc) out to memory so the SEC engine reads them
 	 * correctly later. The address is unused; only the cache-sync
