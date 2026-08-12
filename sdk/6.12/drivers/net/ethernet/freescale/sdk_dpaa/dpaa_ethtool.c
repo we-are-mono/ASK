@@ -127,7 +127,7 @@ static int __cold dpa_set_ksettings(struct net_device *net_dev,
 		return -ENODEV;
 	}
 	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
-		netdev_err(net_dev, "phy device not initialized\n");
+		netdev_dbg(net_dev, "phy device not initialized\n");
 		return -ENODEV;
 	}
 
@@ -182,7 +182,7 @@ static int __cold dpa_nway_reset(struct net_device *net_dev)
 		return -ENODEV;
 	}
 	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
-		netdev_err(net_dev, "phy device not initialized\n");
+		netdev_dbg(net_dev, "phy device not initialized\n");
 		return -ENODEV;
 	}
 
@@ -214,7 +214,7 @@ static void __cold dpa_get_pauseparam(struct net_device *net_dev,
 
 	phy_dev = mac_dev->phy_dev;
 	if (unlikely(phy_dev == NULL)) {
-		netdev_err(net_dev, "phy device not initialized\n");
+		netdev_dbg(net_dev, "phy device not initialized\n");
 		return;
 	}
 
@@ -242,7 +242,7 @@ static int __cold dpa_set_pauseparam(struct net_device *net_dev,
 
 	phy_dev = mac_dev->phy_dev;
 	if (unlikely(phy_dev == NULL)) {
-		netdev_err(net_dev, "phy device not initialized\n");
+		netdev_dbg(net_dev, "phy device not initialized\n");
 		return -ENODEV;
 	}
 
@@ -329,7 +329,7 @@ static int dpa_get_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
 	}
 
 	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
-		netdev_err(net_dev, "phy device not initialized\n");
+		netdev_dbg(net_dev, "phy device not initialized\n");
 		return -ENODEV;
 	}
 
@@ -347,7 +347,7 @@ static int dpa_set_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
 	}
 
 	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
-		netdev_err(net_dev, "phy device not initialized\n");
+		netdev_dbg(net_dev, "phy device not initialized\n");
 		return -ENODEV;
 	}
 
