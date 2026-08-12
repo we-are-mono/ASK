@@ -347,6 +347,7 @@ int main (int argc, char ** argv)
 	char *buf;
 	int ret = 0;
 	int ch;
+	int foreground = 0;	// -F: stay in foreground, do not daemonize
 
 	/* unbuffered stderr so crash-probe fprintfs survive a segfault */
 	setvbuf(stderr, NULL, _IONBF, 0);
@@ -411,7 +412,7 @@ int main (int argc, char ** argv)
 	}
 
 	// Analyse the command line
-	while ((option = getopt(argc, argv, "c:f:n:hv")) != -1)
+	while ((option = getopt(argc, argv, "c:f:n:hvF")) != -1)
 	{
 		switch (option)
 		{
@@ -439,6 +440,9 @@ int main (int argc, char ** argv)
 			case 'v':	// Print version and exit
 				cmmVersion();
 				return 0;
+			case 'F':	// Run in foreground (do not daemonize)
+				foreground = 1;
+				break;
 			default:
 				break;
 		}
@@ -452,9 +456,13 @@ int main (int argc, char ** argv)
 		goto err0;
 	}
 
-	// Daemonize the application
-	if(daemon(0, 1) == -1)
-		goto err0;
+	// Daemonize the application, unless -F requested foreground mode
+	// (so a process supervisor can track the PID and restart on exit).
+	if (!foreground)
+	{
+		if(daemon(0, 1) == -1)
+			goto err0;
+	}
 	//Ensure clean termination
 	action.sa_handler = sig_term_hdlr;
 	sigemptyset(&action.sa_mask);

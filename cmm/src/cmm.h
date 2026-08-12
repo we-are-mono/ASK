@@ -97,9 +97,10 @@
 
 
 	#define	developpers 		"Freescale Semiconductor <www.freescale.com>"
-	#define cmm_help 	"Usage : cmm [-c command] [-f configurationfile]-h -v \n" \
+	#define cmm_help 	"Usage : cmm [-c command] [-f configurationfile] [-F] -h -v \n" \
 							"-c command \tRun cmm to send a command. Need cmm daemon to be running\n" \
 							"-f conffile\tTell cmm to use the following configuration file. Available in daemon mode only\n" \
+							"-F         \tRun in foreground (do not daemonize)\n" \
 							"-h         \tPrint this help\n" \
 							"-v         \tPrint cmm version\n"
 
