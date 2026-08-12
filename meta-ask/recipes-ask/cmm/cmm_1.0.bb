@@ -28,7 +28,7 @@ RDEPENDS:${PN} += "libasan libubsan"
 # CFLAGS += ... appends (rather than its := overriding us).
 export CFLAGS = "-Wno-error -DLS1043 -DFLOW_STATS -DWIFI_ENABLE -DAUTO_BRIDGE \
                  -DSEC_PROFILE_SUPPORT -DUSE_QOSCONNMARK -DENABLE_INGRESS_QOS \
-                 -DIPSEC_NO_FLOW_CACHE -DVLAN_FILTER"
+                 -DENABLE_EGRESS_QOS -DIPSEC_NO_FLOW_CACHE -DVLAN_FILTER"
 
 EXTRA_OEMAKE = " \
     CC='${CC}' \

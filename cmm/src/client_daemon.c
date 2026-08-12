@@ -568,6 +568,22 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		else
 			goto help;
 	}
+#ifdef LS1043
+	else if (strcasecmp(keywords[0], "qm-config") == 0)
+	{
+		/* qm-config <file>: reload the egress shaper config. Returns the
+		 * exit-code sentinel (not -1) on any failure so that "cmm -c" exits
+		 * nonzero for a bad reload while every other subcommand keeps its
+		 * historical exit-0 behaviour. */
+		if (cpt < 2)
+		{
+			cmm_print(DEBUG_CRIT, "usage: qm-config <file>\n");
+			return CMM_CLIENT_EXIT_FAIL;
+		}
+		if (cmmQmConfigReload(keywords[1], daemon_handle))
+			return CMM_CLIENT_EXIT_FAIL;
+	}
+#endif
 	else if (strcasecmp(keywords[0], "show") == 0)
 	{
 	  	if(cpt < 2)
@@ -907,8 +923,25 @@ help:
  * cmmClient()
  *
  *      cmm client main function
- *  
+ *
  *****************************************************************/
+/* qm-config opts into exit-code reporting (see CMM_CLIENT_EXIT_FAIL): a
+ * reload that never reaches the daemon must fail, not silently exit 0. Match
+ * the whole first token of the raw "-c" string so "qm-configXYZ" does not. */
+static int cmmClientDaemonDownRc(const char *command)
+{
+	/* Mirror the dispatch's tokenization (strtok on ' '): skip leading
+	 * spaces, then the first token must be exactly "qm-config". */
+	if (command) {
+		while (*command == ' ')
+			command++;
+		if (strncasecmp(command, "qm-config", 9) == 0 &&
+				(command[9] == '\0' || command[9] == ' '))
+			return CMM_CLIENT_EXIT_FAIL;
+	}
+	return -1;
+}
+
 int cmmClient(char * command, int argc, char **argv)
 {
 	daemon_handle_t daemon_handle;
@@ -919,14 +952,14 @@ int cmmClient(char * command, int argc, char **argv)
 	if (!daemon_handle)
 	{
 		cmm_print(DEBUG_STDERR, "%s: CMM handle creation failed\n", __func__);
-		return -1;
+		return cmmClientDaemonDownRc(command);
 	}
 #else
 	/*First check cmm daemon is alive*/
 	if( (daemon_handle = cmmIsDaemonRunning()) <= 0)
 	{
 		cmm_print(DEBUG_CRIT, "Error, cmm daemon is not running\n");
-		return -1;
+		return cmmClientDaemonDownRc(command);
 	}
 #endif
 

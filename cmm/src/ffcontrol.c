@@ -2182,6 +2182,30 @@ static int cmmQmCmds(struct cli_def * cli, const char *command, char *argv[], in
 	return CLI_OK;
 }
 
+#ifdef LS1043
+/*****************************************************************
+* cmmQmConfigCmd
+*
+*   "qm-config <file>" -- reload the egress shaper parameters from <file>
+*   (one "set qm interface|channel ..." shaper directive per line): validate
+*   the whole file, flush the current egress shaper state, then apply it as a
+*   full replace. Enables live shaper reload without restarting cmm. See
+*   cmmQmConfigReload() for the accepted grammar and what is refused.
+******************************************************************/
+static int cmmQmConfigCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
+{
+	if (argc < 1)
+	{
+		cli_print(cli, "Usage: qm-config <file>");
+		return CLI_ERROR;
+	}
+	if (cmmQmConfigReload(argv[0], globalConf.cli.daemon_handle))
+		return CLI_ERROR;
+
+	return CLI_OK;
+}
+#endif /* LS1043 */
+
 /*****************************************************************
 * cmmMc4Cmd
 *
@@ -2727,6 +2751,14 @@ int cmmCliInit(struct cmm_cli *ctx)
 		cli_register_command(ctx->handle, c, "update", cmmIpv6Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Update IPv6 Connection");
 
 	cli_register_command(ctx->handle, NULL, "stop", cmmFcStop, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Kill cmm");
+
+#ifdef LS1043
+	/* Reload egress shaper parameters at runtime (validate -> flush ->
+	 * apply, full replace). <file> is a text file of "set qm interface|
+	 * channel ..." shaper directives, one per line; '#' comments and blanks
+	 * ignored. Channel<->port assignment is startup-only, not reloaded. */
+	cli_register_command(ctx->handle, NULL, "qm-config", cmmQmConfigCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Reload egress shaper params from <file> (set qm interface/channel; full replace, no assign)");
+#endif /* LS1043 */
 
 	c = cli_register_command(ctx->handle, NULL, "prf",NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
 	if (c)

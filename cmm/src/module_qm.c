@@ -15,6 +15,8 @@
 #include "fpp.h"
 #include <ctype.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 
 /************************************************************
  *
@@ -792,7 +794,40 @@ void cmmQmSetPrintHelp()
  *
  *
  ************************************************************/
+/*
+ * cmmQmValidateOnly: when set, cmmQmSend() skips the actual FPP write, so
+ * cmmQmSetProcess() runs as a pure parser/validator -- every keyword and
+ * range check still executes (they all run before the send), but nothing
+ * reaches the fast path. qm-config uses this to dry-run a whole config file
+ * before it flushes anything.
+ *
+ * Only the set path (the "if (cmmQmSend(...) == 2)" sites) routes through
+ * cmmQmSend; the query handlers keep calling cmmSendToDaemon directly since
+ * they are never dry-run and inspect their own replies. FPP reply status is
+ * left to each handler (they already log/tolerate it as they see fit) -- the
+ * wrapper does not reinterpret it as a command failure.
+ *
+ * Defined outside the LS1043 guard because both cmmQmSetProcess variants
+ * route their sends through cmmQmSend, and it only depends on the
+ * always-available cmmSendToDaemon.
+ *
+ * Not re-entrant: the validate-only flag is a process global, so
+ * cmmQmSetProcess (hence cmmQmConfigReload) must run single-threaded within a
+ * process. cmm services CLI commands one at a time on a single thread and
+ * "cmm -c" is a one-shot client, so this holds.
+ */
+static int cmmQmValidateOnly;
+
+static int cmmQmSend(daemon_handle_t daemon_handle, unsigned short cmd,
+		void *snd, int sz, void *rcv)
+{
+	if (cmmQmValidateOnly)
+		return 0;	/* != 2: the caller's "== 2" result check is skipped */
+	return cmmSendToDaemon(daemon_handle, cmd, snd, sz, rcv);
+}
+
 #ifdef LS1043
+
 int qm_get_num(char **keywords, int *pcpt, uint32_t max_val, uint32_t *val, char *errmsg)
 {
 	char *endptr;
@@ -821,6 +856,7 @@ static int qm_shaper_cfg(char **keywords, int *pcpt, fpp_qm_shaper_cfg_cmd_t *sh
 {
 	union u_rxbuf rxbuf;
 	int cpt;
+	uint32_t val;
 
 	cpt = *pcpt;
 	/* use interface name is present treat it as port shaper configuration */
@@ -847,17 +883,19 @@ static int qm_shaper_cfg(char **keywords, int *pcpt, fpp_qm_shaper_cfg_cmd_t *sh
 		}
 		if(strcasecmp(keywords[cpt], "rate") == 0) {
 			/* Get an integer from the string */
-			if (qm_get_num(keywords, &cpt, UINT_MAX, &shaperCmd->rate,
+			if (qm_get_num(keywords, &cpt, UINT_MAX, &val,
 				"invalid value for shaper rate\n"))
 				return QM_ERROR;
+			shaperCmd->rate = val;
 			shaperCmd->cfg_flags |= (RATE_VALID | SHAPER_CFG_VALID);
 			continue;
 		}	
 		if(strcasecmp(keywords[cpt], "bucketsize") == 0) {
 			/* Get an integer from the string*/
-			if (qm_get_num(keywords, &cpt, UINT_MAX, &shaperCmd->bsize,
+			if (qm_get_num(keywords, &cpt, UINT_MAX, &val,
 				"invalid value for bucket size\n"))
 				return QM_ERROR;
+			shaperCmd->bsize = val;
 			shaperCmd->cfg_flags |= (BSIZE_VALID | SHAPER_CFG_VALID);
 			continue;
 		}
@@ -873,7 +911,7 @@ static int qm_shaper_cfg(char **keywords, int *pcpt, fpp_qm_shaper_cfg_cmd_t *sh
 			return QM_ERROR;
 		}
 	}
-	if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_SHAPER_CFG, shaperCmd, sizeof(fpp_qm_shaper_cfg_cmd_t), 
+	if(cmmQmSend(daemon_handle, FPP_CMD_QM_SHAPER_CFG, shaperCmd, sizeof(fpp_qm_shaper_cfg_cmd_t), 
 		&rxbuf.rcvBuffer) == 2)
 	{
 		if (rxbuf.result != 0)
@@ -910,6 +948,7 @@ static int qm_wbfq_cfg(char **keywords, int *pcpt, uint32_t channel, daemon_hand
 	fpp_qm_wbfq_cfg_cmd_t wbfqCmd;
 	union u_rxbuf rxbuf;
 	char *kw;
+	uint32_t val;
 
 	memset(&wbfqCmd, 0, sizeof(fpp_qm_wbfq_cfg_cmd_t));
 
@@ -939,14 +978,15 @@ static int qm_wbfq_cfg(char **keywords, int *pcpt, uint32_t channel, daemon_hand
 
 	if(kw && strcasecmp(kw, "priority") == 0) {
 		/* Get an integer from the string*/
-		if (qm_get_num(keywords, pcpt, (MAX_PQS - 2), &wbfqCmd.priority,
+		if (qm_get_num(keywords, pcpt, (MAX_PQS - 2), &val,
 			"invalid value for wbfq priority\n"))
 			return QM_ERROR;
+		wbfqCmd.priority = val;
 		wbfqCmd.cfg_flags |= WBFQ_PRIORITY_VALID;
 	}
 	wbfqCmd.channel_num = channel;
 	/* Send the command to CDX */
-	if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_WBFQ_CFG, &wbfqCmd, sizeof(wbfqCmd), 
+	if(cmmQmSend(daemon_handle, FPP_CMD_QM_WBFQ_CFG, &wbfqCmd, sizeof(wbfqCmd), 
 		&rxbuf.rcvBuffer) == 2)
 	{
 		if (rxbuf.result != 0) {
@@ -961,13 +1001,15 @@ static int qm_classque_cfg(char **keywords, int *pcpt, uint32_t channel, daemon_
 	fpp_qm_cq_cfg_cmd_t CqCmd;
 	union u_rxbuf rxbuf;	
 	char *kw;
+	uint32_t val;
 
 	memset(&CqCmd, 0, sizeof(fpp_qm_cq_cfg_cmd_t));
 	CqCmd.channel_num = channel;
 	/* Get que number from the string */
-	if (qm_get_num(keywords, pcpt, 15, &CqCmd.quenum,
+	if (qm_get_num(keywords, pcpt, 15, &val,
 		"invalid value for que number\n"))
 		return QM_ERROR;
+	CqCmd.quenum = val;
 	while (keywords[*pcpt] != NULL) {
 		kw = keywords[*pcpt];
 
@@ -992,9 +1034,10 @@ static int qm_classque_cfg(char **keywords, int *pcpt, uint32_t channel, daemon_
 
 			if(strcasecmp(kw, "rate") == 0) {
 				/* Get an integer from the string */
-				if (qm_get_num(keywords, pcpt, UINT_MAX, &CqCmd.shaper_rate,
+				if (qm_get_num(keywords, pcpt, UINT_MAX, &val,
 					"invalid value for shaper rate\n"))
 					return QM_ERROR;
+				CqCmd.shaper_rate = val;
 				CqCmd.cfg_flags |= (CQ_RATE_VALID | CQ_SHAPER_CFG_VALID);
 			}
 			/* if no parameters are set abort */
@@ -1007,9 +1050,10 @@ static int qm_classque_cfg(char **keywords, int *pcpt, uint32_t channel, daemon_
 			if (CqCmd.quenum >= NUM_PRIO_QUEUES) {
 				if(strcasecmp(kw, "weight") == 0) {
 					/* Get weight from the string */
-					if (qm_get_num(keywords, pcpt, UINT_MAX, &CqCmd.weight,
+					if (qm_get_num(keywords, pcpt, UINT_MAX, &val,
 						"invalid value for que weight\n"))
 						return QM_ERROR;
+					CqCmd.weight = val;
 					CqCmd.cfg_flags |= (CQ_WEIGHT_VALID);
 					continue;
 				}
@@ -1033,9 +1077,10 @@ static int qm_classque_cfg(char **keywords, int *pcpt, uint32_t channel, daemon_
 			}
 			if(strcasecmp(kw, "qdepth") == 0) {
 				/* Get td threshold from the string */
-				if (qm_get_num(keywords, pcpt, UINT_MAX, &CqCmd.tdthresh,
+				if (qm_get_num(keywords, pcpt, UINT_MAX, &val,
 					"invalid value for que depth\n"))
 					return QM_ERROR;
+				CqCmd.tdthresh = val;
 				CqCmd.cfg_flags |= (CQ_TDINFO_VALID);
 				continue;
 			}
@@ -1049,7 +1094,7 @@ static int qm_classque_cfg(char **keywords, int *pcpt, uint32_t channel, daemon_
 		return QM_ERROR;
 
 	/* Send the command to CDX */
-	if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_CQ_CFG, &CqCmd, sizeof(CqCmd),
+	if(cmmQmSend(daemon_handle, FPP_CMD_QM_CQ_CFG, &CqCmd, sizeof(CqCmd),
 		&rxbuf.rcvBuffer) == 2)
 	{
 		if (rxbuf.result != 0)
@@ -1081,7 +1126,7 @@ static int qm_channel_assign(char **keywords, int cpt, uint32_t channel, daemon_
 	STR_TRUNC_COPY(assignCmd.interface, ifname, sizeof(assignCmd.interface));
 	assignCmd.channel_num = channel;
 	/* Send CMD_QM_EXPT_RATE command */
-	if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_CHNL_ASSIGN, &assignCmd, 
+	if(cmmQmSend(daemon_handle, FPP_CMD_QM_CHNL_ASSIGN, &assignCmd, 
 		sizeof(fpp_qm_chnl_assign_cmd_t), &rxbuf.rcvBuffer) == 2)
 	{
 		if (rxbuf.result != 0)
@@ -1230,7 +1275,7 @@ static int qm_dscp_fqmap_cfg(char **keywords, int *pcpt, daemon_handle_t daemon_
 
 send_cmd:
 	/* Send the command to CDX */
-	if(cmmSendToDaemon(daemon_handle, cmd, &dscp_fq_map_cmd, sizeof(dscp_fq_map_cmd),
+	if(cmmQmSend(daemon_handle, cmd, &dscp_fq_map_cmd, sizeof(dscp_fq_map_cmd),
 		&rxbuf.rcvBuffer) == 2)
 	{
 		if (rxbuf.result != 0)
@@ -1276,7 +1321,7 @@ static int qm_interface_cfg(char **keywords, int *pcpt, daemon_handle_t daemon_h
 		memset(&resetCmd, 0, sizeof(fpp_qm_reset_cmd_t));
 		STR_TRUNC_COPY(resetCmd.interface, ifname, sizeof(resetCmd.interface));
 		/* Send CMD_QM_RESET command */
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_RESET, &resetCmd, sizeof(fpp_qm_reset_cmd_t), 
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_RESET, &resetCmd, sizeof(fpp_qm_reset_cmd_t), 
 			&rxbuf.rcvBuffer) == 2) {
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_RESET", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -1302,7 +1347,7 @@ static int qm_interface_cfg(char **keywords, int *pcpt, daemon_handle_t daemon_h
 				return QM_INVALID_KEYWORD;
 		}
 		/* Send CMD_QM_QOSENABLE command */
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_QOSENABLE, &enableCmd, 
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_QOSENABLE, &enableCmd, 
 			sizeof(fpp_qm_qos_enable_cmd_t), 
 			&rxbuf.rcvBuffer) == 2) {
 			switch (rxbuf.result) {
@@ -1370,7 +1415,7 @@ static int qm_exptrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_hand
 		return QM_ERROR;
 	}
 	/* Send CMD_QM_EXPT_RATE command */
-	if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_EXPT_RATE, &exptRateCmd, 
+	if(cmmQmSend(daemon_handle, FPP_CMD_QM_EXPT_RATE, &exptRateCmd, 
 		sizeof(exptRateCmd), &rxbuf.rcvBuffer) == 2)
 	{
 		if (rxbuf.result != 0)
@@ -1441,7 +1486,7 @@ static int qm_ffrate_cfg(char **keywords, int cpt, daemon_handle_t daemon_handle
 		return QM_ERROR;
 	}
 	/* Send CMD_QM_FF_RATE command */
-	if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_FF_RATE, &ffRateCmd, sizeof(ffRateCmd), &rxbuf) == 2)
+	if(cmmQmSend(daemon_handle, FPP_CMD_QM_FF_RATE, &ffRateCmd, sizeof(ffRateCmd), &rxbuf) == 2)
 	{
 		if (rxbuf.result != 0)
 			showErrorMsg("CMD_QM_FF_RATE", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -1505,7 +1550,7 @@ static int qm_ingress_policer_cfg(char **keywords, int *pcpt, daemon_handle_t da
 			enableCmd.queue_no = queue_no;
 
 			/* Send CMD_QM_QOSENABLE command */
-			if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_INGRESS_POLICER_ENABLE, &enableCmd,
+			if(cmmQmSend(daemon_handle, FPP_CMD_QM_INGRESS_POLICER_ENABLE, &enableCmd,
 						sizeof(fpp_qm_ingress_policer_enable_cmd_t),
 						&rxbuf.rcvBuffer) == 2) {
 
@@ -1560,7 +1605,7 @@ static int qm_ingress_policer_cfg(char **keywords, int *pcpt, daemon_handle_t da
 			policerCfgcmd.queue_no = queue_no;
 
 			/* Send CMD_QM_QOSENABLE command */
-			if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_INGRESS_POLICER_CONFIG, &policerCfgcmd,
+			if(cmmQmSend(daemon_handle, FPP_CMD_QM_INGRESS_POLICER_CONFIG, &policerCfgcmd,
 						sizeof(fpp_qm_ingress_policer_cfg_cmd_t),
 						rxbuf.rcvBuffer) == 2) {
 				if (rxbuf.result != 0) {
@@ -1579,7 +1624,7 @@ static int qm_ingress_policer_cfg(char **keywords, int *pcpt, daemon_handle_t da
 			fpp_qm_ingress_policer_reset_cmd_t resetCmd;
 
 			/* Send CMD_QM_INGRESS_POLICER_RESET command */
-			if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_INGRESS_POLICER_RESET, &resetCmd, sizeof(fpp_qm_ingress_policer_reset_cmd_t),
+			if(cmmQmSend(daemon_handle, FPP_CMD_QM_INGRESS_POLICER_RESET, &resetCmd, sizeof(fpp_qm_ingress_policer_reset_cmd_t),
 						&rxbuf.rcvBuffer) == 2) {
 
 				if (rxbuf.result != 0) {
@@ -1629,7 +1674,7 @@ static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_h
 		fpp_qm_ingress_policer_reset_cmd_t resetCmd;
 
 		/* Send FPP_CMD_QM_SEC_POLICER_RESET command */
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_SEC_POLICER_RESET,
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_SEC_POLICER_RESET,
 				&resetCmd, sizeof(fpp_qm_ingress_policer_reset_cmd_t), &rxbuf.rcvBuffer) == 2) {
 
 			if (rxbuf.result != 0) {
@@ -1708,7 +1753,7 @@ static int qm_sec_policer_cfg(char **keywords, int cpt, daemon_handle_t daemon_h
 
 
 	/* Send CMD_QM_SEC_RATE command */
-	if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_SEC_POLICER_RATE, &secRateCmd, sizeof(secRateCmd), &rxbuf) == 2)
+	if(cmmQmSend(daemon_handle, FPP_CMD_QM_SEC_POLICER_RATE, &secRateCmd, sizeof(secRateCmd), &rxbuf) == 2)
 	{
 		if (rxbuf.result != 0)
 			showErrorMsg("FPP_CMD_QM_SEC_POLICER_RATE", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -1792,6 +1837,9 @@ err_ret:
 			cmmQmSetPrintHelp();
 			break;
 		default:
+			/* parsed OK (0 in validate-only mode too, where nothing was
+			 * sent). FPP reply status is handled per-directive by the
+			 * sub-handlers, not reinterpreted here. */
 			return 0;
 	}
 	return -1;
@@ -1902,7 +1950,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 		//exptRateCmd.pkts_per_msec = tmp / 1000;
 		exptRateCmd.pkts_per_sec = tmp;
 		// Send CMD_QM_EXPT_RATE command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_EXPT_RATE, &exptRateCmd, sizeof(exptRateCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_EXPT_RATE, &exptRateCmd, sizeof(exptRateCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_EXPT_RATE", ERRMSG_SOURCE_FPP,rxbuf.rcvBuffer);
@@ -2006,7 +2054,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 				cmm_print(DEBUG_INFO, "%d ", dscpCmd.dscp[i]);
 			cmm_print(DEBUG_INFO, "\n");
 
-			if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_DSCP_MAP, &dscpCmd, sizeof(fpp_qm_dscp_queue_mod_t), rxbuf.rcvBuffer) == 2)
+			if(cmmQmSend(daemon_handle, FPP_CMD_QM_DSCP_MAP, &dscpCmd, sizeof(fpp_qm_dscp_queue_mod_t), rxbuf.rcvBuffer) == 2)
 			{
 				if (rxbuf.result != 0)
 					showErrorMsg("CMD_QM_DSCP_MAP", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2629,7 +2677,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_RESET))
 	{
 		// Send CMD_QM_RATE_LIMIT command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_RESET, &resetCmd, sizeof(resetCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_RESET, &resetCmd, sizeof(resetCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_RESET", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2639,7 +2687,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_QOSENABLE))
 	{
 		// Send CMD_QM_QOSENABLE command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_QOSENABLE, & enableCmd, sizeof(enableCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_QOSENABLE, & enableCmd, sizeof(enableCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_QOSENABLE", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2649,7 +2697,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_QUEUE_QOSENABLE))
 	{
 		// Send FPP_CMD_QM_QUEUE_QOSENABLE command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_QUEUE_QOSENABLE, &queueenableCmd, sizeof(queueenableCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_QUEUE_QOSENABLE, &queueenableCmd, sizeof(queueenableCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_QUEUE_QOSENABLE", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2659,7 +2707,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_QOSALG))
 	{
 		// Send CMD_QM_QOSALG command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_QOSALG, & algCmd, sizeof(algCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_QOSALG, & algCmd, sizeof(algCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_QOSALG", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2669,7 +2717,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_NHIGH))
 	{
 		// Send CMD_QM_NHIGH command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_NHIGH, & nHighCmd, sizeof(nHighCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_NHIGH, & nHighCmd, sizeof(nHighCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_NHIGH", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2679,7 +2727,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_MAX_TXDEPTH))
 	{
 		// Send CMD_QM_MAX_TXDEPTH command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_MAX_TXDEPTH, &maxTxDepthCmd, sizeof(maxTxDepthCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_MAX_TXDEPTH, &maxTxDepthCmd, sizeof(maxTxDepthCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_MAX_TXDEPTH", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2689,7 +2737,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_MAX_QDEPTH))
 	{
 		// Send CMD_QM_MAX_QDEPTH command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_MAX_QDEPTH, & maxQdepthCmd , sizeof(maxQdepthCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_MAX_QDEPTH, & maxQdepthCmd , sizeof(maxQdepthCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_MAX_QDEPTH", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2699,7 +2747,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_MAX_WEIGHT))
 	{
 		// Send CMD_QM_MAX_WEIGHT command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_MAX_WEIGHT, &maxWeightCmd , sizeof(maxWeightCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_MAX_WEIGHT, &maxWeightCmd , sizeof(maxWeightCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_MAX_WEIGHT", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2709,7 +2757,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_RATE_LIMIT))
 	{
 		// Send CMD_QM_RATE_LIMIT command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_RATE_LIMIT, &rateLimitCmd, sizeof(rateLimitCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_RATE_LIMIT, &rateLimitCmd, sizeof(rateLimitCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_RATE_LIMIT", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2719,7 +2767,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_SHAPER_CFG))
 	{
 		// Send CMD_QM_RATE_LIMIT command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_SHAPER_CFG, &shaperCmd, sizeof(shaperCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_SHAPER_CFG, &shaperCmd, sizeof(shaperCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_SHAPER_CFG", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2729,7 +2777,7 @@ int cmmQmSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_QM_SCHED_CFG))
 	{
 		// Send CMD_QM_RATE_LIMIT command
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_QM_SCHED_CFG, &schedulerCmd, sizeof(schedulerCmd), &rxbuf.rcvBuffer) == 2)
+		if(cmmQmSend(daemon_handle, FPP_CMD_QM_SCHED_CFG, &schedulerCmd, sizeof(schedulerCmd), &rxbuf.rcvBuffer) == 2)
 		{
 			if (rxbuf.result != 0)
 				showErrorMsg("CMD_QM_SCHED_CFG", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
@@ -2803,3 +2851,278 @@ void cmmQmUpdateQ2Prio(fpp_qm_scheduler_cfg_t *cmdp, int cmdlen)
 	fclose(fp);
 }
 
+/* qm-config reload builds on the LS1043 validate/apply plumbing
+ * (cmmQmValidateOnly, cmmQmSend, FPP_CMD_QM_RESET on the egress ports),
+ * so scope it to LS1043 like the other egress-QoS-only commands. */
+#ifdef LS1043
+/*****************************************************************
+ * QoS/shaper config reload -- "qm-config <file>".
+ *
+ * Reloads the egress shaper parameters from <file> without restarting cmm.
+ * <file> is plain text: one "set qm ..." directive per line, reusing the
+ * existing "set qm" keyword grammar (no second config language). A '#'
+ * starts a comment to end of line; blank and comment-only lines are ignored:
+ *
+ *     # egress shaper parameters; replaces the programmed CEETM state
+ *     set qm interface eth0 shaper rate 1000 bucketsize 5
+ *     set qm channel 1 shaper rate 500 bucketsize 5
+ *
+ * Only "interface" and "channel" directives are accepted, and only for their
+ * shaper/wbfq/class-queue parameters -- the per-port CEETM shaper state that
+ * phase 2's FPP_CMD_QM_RESET resets to default and phase 3 reprograms. (The
+ * reset leaves the port's qos-enabled flag and channel<->port map intact --
+ * harmless here, as the reload grammar can neither disable qos nor re-home a
+ * channel: "qos off" is rejected by set-qm and "assign" is refused below.)
+ * Refused at validate time, because the reset cannot clear them and a reload
+ * could not truly
+ * replace them:
+ *   - other qm families -- global expt_rate/ff_rate, the ingress/sec
+ *     policers, the DSCP->FQ map;
+ *   - "channel ... assign interface ..." -- the channel<->port mapping is
+ *     sticky topology, established at startup, not reloaded.
+ *
+ * Three phases:
+ *   1. VALIDATE -- the whole file is DRY-RUN through cmmQmSetProcess in
+ *      validate-only mode: every directive's keyword and value ranges are
+ *      checked against the compiled grammar with NO FPP write. Any malformed
+ *      line, unsupported/unknown keyword, or out-of-range value aborts here
+ *      -- the fast path is never touched, so a bad file cannot leave QoS
+ *      half-applied. A file with zero directives is refused (it would
+ *      otherwise silently wipe all QoS).
+ *   2. FLUSH -- every egress port's shaper state is reset via
+ *      FPP_CMD_QM_RESET, so the file fully replaces the old config.
+ *      Resetting a port with no QoS is a benign no-op; the reply is
+ *      intentionally not inspected.
+ *   3. APPLY -- each directive is applied through cmmQmSetProcess (the FPP
+ *      protocol is not reimplemented). Per-directive FPP reply status is
+ *      logged by the handlers, exactly as an interactive "set qm" would.
+ *
+ * Not atomic: phase 2 flushes before phase 3 re-applies, so there is a brief
+ * window where egress QoS is cleared. <file> is read once up front so
+ * validate and apply see identical bytes; a producer should still write a
+ * temp file and rename() it into place so a concurrent writer cannot
+ * truncate it mid-read.
+ *
+ * Reachable from the live CLI ("qm-config <file>") and "cmm -c 'qm-config
+ * <file>'". Returns 0 once a validated file is flushed and applied; returns
+ * -1 (a nonzero exit under "cmm -c") on a validation or I/O failure -- a file
+ * that could not be accepted, not a runtime fast-path rejection of a single
+ * directive.
+ *****************************************************************/
+#define QM_RELOAD_LINE_MAX	512
+#define QM_RELOAD_MAX_TOKENS	64
+#define QM_RELOAD_MAX_SIZE	(256 * 1024)	/* refuse larger files */
+
+static int cmmQmReloadTokenize(char *line, char **kw)
+{
+	int n = 0;
+	char *save = NULL;
+	char *t = strtok_r(line, " \t\r\n", &save);
+
+	while (t && n < (QM_RELOAD_MAX_TOKENS - 1)) {
+		if (t[0] == '#')	/* '#' starts a comment: ignore rest of line */
+			break;
+		kw[n++] = t;
+		t = strtok_r(NULL, " \t\r\n", &save);
+	}
+	kw[n] = NULL;
+	return n;
+}
+
+static void cmmQmReloadFlush(daemon_handle_t daemon_handle)
+{
+	fpp_qm_reset_cmd_t resetCmd;
+	union u_rxbuf rxbuf;
+	int ii;
+
+	/* Full REPLACE: reset every egress port so config the file omits does
+	 * not survive. port_table[] holds the GEMAC names statically, so this
+	 * works in the daemon (live CLI) and the "cmm -c" client alike.
+	 * Resetting a port with no QoS is a no-op returning an error we
+	 * deliberately ignore -- fire-and-forget, no per-port failure. */
+	for (ii = 0; ii < GEM_PORTS; ii++) {
+		if (!port_table[ii].enable)
+			continue;
+		memset(&resetCmd, 0, sizeof(resetCmd));
+		/* both fields are exactly IFNAMSIZ and the names are static
+		 * NUL-terminated strings, so a full-field copy is safe and keeps
+		 * the buffer NUL-terminated (resetCmd is zeroed). */
+		memcpy(resetCmd.interface, port_table[ii].ifname,
+				sizeof(resetCmd.interface));
+		cmmSendToDaemon(daemon_handle, FPP_CMD_QM_RESET, &resetCmd,
+				sizeof(resetCmd), &rxbuf.rcvBuffer);
+	}
+}
+
+/* Copy the next '\n'-delimited line of [p,end) into out[] (bounded) and
+ * return the start of the following line; *overlong set if it didn't fit. */
+static const char *cmmQmReloadNextLine(const char *p, const char *end,
+		char *out, size_t outsz, int *overlong)
+{
+	const char *nl = memchr(p, '\n', (size_t)(end - p));
+	size_t len = (size_t)((nl ? nl : end) - p);
+
+	*overlong = (len >= outsz);
+	if (len >= outsz)
+		len = outsz - 1;
+	memcpy(out, p, len);
+	out[len] = '\0';
+	return nl ? nl + 1 : end;
+}
+
+/* qm-config replaces only the egress shaper hierarchy, which
+ * FPP_CMD_QM_RESET clears per port. Directives whose subsystem the flush
+ * cannot clear (global expt_rate/ff_rate, the ingress/sec policers, the
+ * DSCP->FQ map) are refused so a reload can never accumulate on top of state
+ * the flush left behind. */
+static int cmmQmReloadSupported(const char *kw)
+{
+	return strcasecmp(kw, "interface") == 0 || strcasecmp(kw, "channel") == 0;
+}
+
+/* A "channel ... assign interface ..." directive maps a channel to a port.
+ * That mapping is sticky topology the per-port reset does not clear, so a
+ * reload can neither move nor drop it -- accepting it would let a reload
+ * silently fail to re-home a channel. Refuse it: assignments are established
+ * at startup; qm-config reloads shaper/wbfq/class-queue parameters only. */
+static int cmmQmReloadHasAssign(char **kw, int n)
+{
+	int i;
+
+	for (i = 3; i < n; i++)
+		if (strcasecmp(kw[i], "assign") == 0)
+			return 1;
+	return 0;
+}
+
+int cmmQmConfigReload(const char *path, daemon_handle_t daemon_handle)
+{
+	char scratch[QM_RELOAD_LINE_MAX];
+	char *kw[QM_RELOAD_MAX_TOKENS];
+	const char *p, *end;
+	struct stat st;
+	char *buf;
+	size_t sz;
+	int lineno, ndir, overlong, n;
+	FILE *fp;
+
+	fp = fopen(path, "r");
+	if (!fp) {
+		cmm_print(DEBUG_CRIT, "qm-config: cannot open %s\n", path);
+		return -1;
+	}
+	/* refuse non-regular files: fgets on /dev/zero never ends, a fifo
+	 * blocks forever. */
+	if (fstat(fileno(fp), &st) != 0 || !S_ISREG(st.st_mode)) {
+		cmm_print(DEBUG_CRIT, "qm-config: %s is not a regular file\n", path);
+		fclose(fp);
+		return -1;
+	}
+	if (st.st_size <= 0 || st.st_size > QM_RELOAD_MAX_SIZE) {
+		cmm_print(DEBUG_CRIT, "qm-config: %s is empty or exceeds %d bytes\n",
+				path, QM_RELOAD_MAX_SIZE);
+		fclose(fp);
+		return -1;
+	}
+	sz = (size_t)st.st_size;
+	buf = malloc(sz + 1);
+	if (!buf) {
+		cmm_print(DEBUG_CRIT, "qm-config: out of memory reading %s\n", path);
+		fclose(fp);
+		return -1;
+	}
+	/* read once so validate and apply see identical bytes (no re-read /
+	 * TOCTOU between passes). */
+	if (fread(buf, 1, sz, fp) != sz || ferror(fp)) {
+		cmm_print(DEBUG_CRIT, "qm-config: read error on %s\n", path);
+		free(buf);
+		fclose(fp);
+		return -1;
+	}
+	buf[sz] = '\0';
+	fclose(fp);
+	end = buf + sz;
+
+	/* Phase 1: dry-run the whole file (validate-only: no FPP writes). */
+	cmmQmValidateOnly = 1;
+	ndir = 0;
+	lineno = 0;
+	for (p = buf; p < end; ) {
+		p = cmmQmReloadNextLine(p, end, scratch, sizeof(scratch), &overlong);
+		lineno++;
+		if (overlong) {
+			cmm_print(DEBUG_CRIT, "qm-config: %s:%d: line too long; nothing applied\n",
+					path, lineno);
+			cmmQmValidateOnly = 0;
+			free(buf);
+			return -1;
+		}
+		n = cmmQmReloadTokenize(scratch, kw);
+		if (n == 0)		/* blank or comment-only line */
+			continue;
+		if (n < 3 || strcasecmp(kw[0], "set") || strcasecmp(kw[1], "qm")) {
+			cmm_print(DEBUG_CRIT, "qm-config: %s:%d: expected 'set qm <keyword> ...'; "
+					"nothing applied\n", path, lineno);
+			cmmQmValidateOnly = 0;
+			free(buf);
+			return -1;
+		}
+		if (!cmmQmReloadSupported(kw[2])) {
+			cmm_print(DEBUG_CRIT, "qm-config: %s:%d: directive '%s' not supported in "
+					"qm-config (only 'interface' and 'channel'); nothing applied\n",
+					path, lineno, kw[2]);
+			cmmQmValidateOnly = 0;
+			free(buf);
+			return -1;
+		}
+		if (cmmQmReloadHasAssign(kw, n)) {
+			cmm_print(DEBUG_CRIT, "qm-config: %s:%d: 'assign' is not supported in "
+					"qm-config (channel assignment is set at startup, not "
+					"reloaded); nothing applied\n", path, lineno);
+			cmmQmValidateOnly = 0;
+			free(buf);
+			return -1;
+		}
+		if (cmmQmSetProcess(kw, 2, daemon_handle) != 0) {
+			cmm_print(DEBUG_CRIT, "qm-config: %s:%d: invalid qm directive; "
+					"nothing applied\n", path, lineno);
+			cmmQmValidateOnly = 0;
+			free(buf);
+			return -1;
+		}
+		ndir++;
+	}
+	cmmQmValidateOnly = 0;
+
+	if (ndir == 0) {
+		cmm_print(DEBUG_CRIT, "qm-config: %s has no directives; refusing "
+				"(would wipe all QoS)\n", path);
+		free(buf);
+		return -1;
+	}
+
+	/* Phase 2: flush current QoS/shaper state (validated file). */
+	cmmQmReloadFlush(daemon_handle);
+
+	/* Phase 3: apply. Every directive already passed the identical parse in
+	 * phase 1 (same bytes, same parser), so cmmQmSetProcess re-parses cleanly
+	 * and its return conveys nothing new. Per-directive FPP reply status is
+	 * logged by the handlers, exactly as an interactive "set qm" would; it is
+	 * not reflected in the reload's result. The exit code therefore reports a
+	 * rejected file (validation) or an I/O error, not a runtime fast-path
+	 * rejection of an individual directive. */
+	lineno = 0;
+	for (p = buf; p < end; ) {
+		p = cmmQmReloadNextLine(p, end, scratch, sizeof(scratch), &overlong);
+		lineno++;
+		n = cmmQmReloadTokenize(scratch, kw);
+		if (n == 0)
+			continue;
+		cmmQmSetProcess(kw, 2, daemon_handle);
+	}
+	free(buf);
+
+	cmm_print(DEBUG_STDOUT, "qm-config: reloaded %s (%d directives)\n", path, ndir);
+	return 0;
+}
+#endif /* LS1043 */
