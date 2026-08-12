@@ -77,18 +77,6 @@ static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct
 		const struct qm_dqrr_entry *dq);
 extern int FM_PORT_SetOhPortRda(uint32_t fmidx, uint32_t portidx, uint32_t val);
 
-void *  get_oh_port_td(uint32_t fm_index, uint32_t port_idx, uint32_t type)
-{
-
-#ifdef DEVOH_DEBUG
-	DPA_INFO("%s:get td idx %d for fman %d, port %d\n",
-			__func__, offline_port_info[fm_index][port_idx].td[type], fm_index, port_idx);
-#endif
-	return offline_port_info[fm_index][port_idx].td[type] ;
-
-}
-
-
 int get_ofport_fman_and_portindex(uint32_t fm_index, uint32_t handle, uint32_t* fm_idx, uint32_t* port_idx,
 		uint32_t *portid)
 {

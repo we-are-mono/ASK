@@ -373,7 +373,6 @@ void display_buf(void *buf, uint32_t size);
 void *dpa_get_pcdhandle(uint32_t fm_index);
 void *dpa_get_tdinfo(uint32_t fm_index, uint32_t port_idx, uint32_t type);
 void *dpa_get_fm_ctx(uint32_t fm_idx);
-void *  get_oh_port_td(uint32_t fm_index, uint32_t port_idx, uint32_t type);
 int dpa_get_tx_chnl_info(uint32_t fqid, uint32_t *ch_id, uint32_t *wq_id);
 int dpa_add_oh_if(char *name);
 
