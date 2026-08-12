@@ -1,3 +1,4 @@
+From 4d521c341d361dde4ea35572b1aacd5ca2ed105b Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 24 Jan 2026 00:17:21 +0100
 Subject: [PATCH] NXP ASK extensions for Comcerto fast path
@@ -23,18 +24,18 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/internal/object.h                     |  12 ++
  .../libnetfilter_conntrack.h                  |  17 ++
  .../linux_nf_conntrack_common.h               |  10 +-
- .../linux_nfnetlink_conntrack.h               |  18 +++
+ .../linux_nfnetlink_conntrack.h               |  18 ++
  src/conntrack/api.c                           |  50 ++++++
  src/conntrack/build_mnl.c                     |  21 +++
  src/conntrack/compare.c                       |  14 +-
- src/conntrack/copy.c                          |   9 ++
- src/conntrack/getter.c                        |  80 ++++++++++
- src/conntrack/parse_mnl.c                     | 151 ++++++++++++++++++
- src/conntrack/setter.c                        |   9 ++
+ src/conntrack/copy.c                          |   9 +
+ src/conntrack/getter.c                        |  80 +++++++++
+ src/conntrack/parse_mnl.c                     | 161 ++++++++++++++++++
+ src/conntrack/setter.c                        |   9 +
  src/conntrack/snprintf_default.c              |  13 ++
  src/conntrack/snprintf_xml.c                  |   6 +
  src/main.c                                    |   3 +
- 15 files changed, 412 insertions(+), 2 deletions(-)
+ 15 files changed, 422 insertions(+), 2 deletions(-)
 
 diff --git a/include/internal/internal.h b/include/internal/internal.h
 index 7cd7c44..2b544cd 100644
@@ -49,7 +50,7 @@ index 7cd7c44..2b544cd 100644
  #include <sys/types.h>
  #include <arpa/inet.h>
 diff --git a/include/internal/object.h b/include/internal/object.h
-index 658e4d2..1520b3b 100644
+index 658e4d2..72263c9 100644
 --- a/include/internal/object.h
 +++ b/include/internal/object.h
 @@ -149,6 +149,16 @@ struct __nfct_nat {
@@ -433,14 +434,24 @@ index d1f9a5a..ff46725 100644
 +	[ATTR_QOSCONNMARK]			= get_attr_qosconnmark,
  };
 diff --git a/src/conntrack/parse_mnl.c b/src/conntrack/parse_mnl.c
-index 3cbfc6a..33f7824 100644
+index 3cbfc6a..3af6cd4 100644
 --- a/src/conntrack/parse_mnl.c
 +++ b/src/conntrack/parse_mnl.c
-@@ -856,6 +856,129 @@ static int nfct_parse_synproxy(const struct nlattr *attr,
+@@ -856,6 +856,139 @@ static int nfct_parse_synproxy(const struct nlattr *attr,
  	return 0;
  }
  
 +/* NXP ASK: Comcerto fast path parsing */
++/*
++ * The kernel emits fast-path conntrack metadata by attribute number and this
++ * library parses by number; if a rebase inserts a standard CTA_* above these,
++ * the values shift on one side only and offload metadata is silently misfiled.
++ * Pin the numbers so that shift is a loud build failure -- when it fires,
++ * re-check enum ctattr_type in linux_nfnetlink_conntrack.h and re-pin.
++ */
++_Static_assert(CTA_LAYERSCAPE_FP_ORIG == 27 && CTA_LAYERSCAPE_FP_REPLY == 28,
++	       "CTA_LAYERSCAPE_FP_* ABI shifted -- re-check enum ctattr_type");
++
 +static int
 +nfct_parse_comcerto_fp_attr_cb(const struct nlattr *attr, void *data)
 +{
@@ -566,7 +577,7 @@ index 3cbfc6a..33f7824 100644
  static int
  nfct_parse_conntrack_attr_cb(const struct nlattr *attr, void *data)
  {
-@@ -897,6 +1020,16 @@ nfct_parse_conntrack_attr_cb(const struct nlattr *attr, void *data)
+@@ -897,6 +1030,16 @@ nfct_parse_conntrack_attr_cb(const struct nlattr *attr, void *data)
  	case CTA_NAT_DST:
  		/* deprecated */
  		break;
@@ -583,7 +594,7 @@ index 3cbfc6a..33f7824 100644
  	}
  	tb[type] = attr;
  	return MNL_CB_OK;
-@@ -1029,6 +1162,24 @@ nfct_payload_parse(const void *payload, size_t payload_len,
+@@ -1029,6 +1172,24 @@ nfct_payload_parse(const void *payload, size_t payload_len,
  			return -1;
  	}
  

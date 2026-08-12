@@ -1,6 +1,10 @@
+From cf26c8405400b30bad882c8231fa88cf7b146736 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 15 Apr 2026 15:00:00 +0200
 Subject: [PATCH] NXP ASK extensions for Comcerto fast path (rebased for 1.1.1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Same semantic changes as the 1.1.0 variant of this patch — rebased to
 accommodate upstream 1.1.1's addition of ATTR_TIMESTAMP_EVENT /
@@ -25,6 +29,25 @@ Note: CTA attribute ordering matches kernel 6.12 nfnetlink_conntrack.h:
 Upstream-Status: Inappropriate [NXP vendor extension]
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
+ include/internal/internal.h                   |   1 +
+ include/internal/object.h                     |  12 ++
+ .../libnetfilter_conntrack.h                  |  17 ++
+ .../linux_nf_conntrack_common.h               |  10 +-
+ .../linux_nfnetlink_conntrack.h               |  18 ++
+ src/conntrack/api.c                           |  50 ++++++
+ src/conntrack/build_mnl.c                     |  21 +++
+ src/conntrack/compare.c                       |  14 +-
+ src/conntrack/copy.c                          |   9 +
+ src/conntrack/getter.c                        |  80 +++++++++
+ src/conntrack/parse_mnl.c                     | 161 ++++++++++++++++++
+ src/conntrack/setter.c                        |   9 +
+ src/conntrack/snprintf_default.c              |  13 ++
+ src/conntrack/snprintf_xml.c                  |   6 +
+ src/main.c                                    |   3 +
+ 15 files changed, 422 insertions(+), 2 deletions(-)
+
+diff --git a/include/internal/internal.h b/include/internal/internal.h
+index 7cd7c44..2b544cd 100644
 --- a/include/internal/internal.h
 +++ b/include/internal/internal.h
 @@ -9,6 +9,7 @@
@@ -35,9 +58,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  #include <string.h>
  #include <sys/types.h>
  #include <arpa/inet.h>
+diff --git a/include/internal/object.h b/include/internal/object.h
+index d72b31c..5df72d5 100644
 --- a/include/internal/object.h
 +++ b/include/internal/object.h
-@@ -149,6 +149,16 @@
+@@ -149,6 +149,16 @@ struct __nfct_nat {
  	union __nfct_l4_src 	l4min, l4max;
  };
  
@@ -54,7 +79,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  struct nfct_tuple_head {
  	struct __nfct_tuple 	orig;
  
-@@ -164,6 +174,8 @@
+@@ -164,6 +174,8 @@ struct nf_conntrack {
  	uint32_t 	timeout;
  	uint32_t	mark;
  	uint32_t	secmark;
@@ -63,9 +88,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	uint32_t 	status;
  	uint32_t	use;
  	uint32_t	id;
+diff --git a/include/libnetfilter_conntrack/libnetfilter_conntrack.h b/include/libnetfilter_conntrack/libnetfilter_conntrack.h
+index 086c81a..f973950 100644
 --- a/include/libnetfilter_conntrack/libnetfilter_conntrack.h
 +++ b/include/libnetfilter_conntrack/libnetfilter_conntrack.h
-@@ -145,6 +145,20 @@
+@@ -145,6 +145,20 @@ enum nf_conntrack_attr {
  	ATTR_SYNPROXY_ITS,			/* u32 bits */
  	ATTR_SYNPROXY_TSOFF,			/* u32 bits */
  	ATTR_TIMESTAMP_EVENT,			/* u64 bits */
@@ -86,7 +113,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	ATTR_MAX
  };
  
-@@ -220,6 +234,9 @@
+@@ -220,6 +234,9 @@ enum nf_conntrack_msg_type {
  extern struct nf_conntrack *nfct_new(void);
  extern void nfct_destroy(struct nf_conntrack *ct);
  
@@ -96,9 +123,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  /* clone */
  struct nf_conntrack *nfct_clone(const struct nf_conntrack *ct);
  
+diff --git a/include/libnetfilter_conntrack/linux_nf_conntrack_common.h b/include/libnetfilter_conntrack/linux_nf_conntrack_common.h
+index 131ca25..73953fa 100644
 --- a/include/libnetfilter_conntrack/linux_nf_conntrack_common.h
 +++ b/include/libnetfilter_conntrack/linux_nf_conntrack_common.h
-@@ -123,6 +123,14 @@
+@@ -123,6 +123,14 @@ enum ip_conntrack_status {
  	IPS_HW_OFFLOAD_BIT = 15,
  	IPS_HW_OFFLOAD = (1 << IPS_HW_OFFLOAD_BIT),
  
@@ -113,7 +142,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	/* Be careful here, modifying these bits can make things messy,
  	 * so don't let users modify them directly.
  	 */
-@@ -131,7 +139,7 @@
+@@ -131,7 +139,7 @@ enum ip_conntrack_status {
  				 IPS_SEQ_ADJUST | IPS_TEMPLATE | IPS_UNTRACKED |
  				 IPS_OFFLOAD | IPS_HW_OFFLOAD),
  
@@ -122,9 +151,12 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  };
  
  /* Connection tracking event types */
+diff --git a/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h b/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h
+index 88c14c8..c8bc2b5 100644
 --- a/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h
 +++ b/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h
-@@ -61,6 +61,11 @@
+@@ -60,6 +60,11 @@ enum ctattr_type {
+ 	CTA_SYNPROXY,
  	CTA_FILTER,
  	CTA_STATUS_MASK,
 +	/* NXP ASK: Layerscape fast path attributes - order must match kernel! */
@@ -135,8 +167,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	CTA_TIMESTAMP_EVENT,
  	__CTA_MAX
  };
- #define CTA_MAX (__CTA_MAX - 1)
-@@ -239,6 +244,19 @@
+@@ -239,6 +244,19 @@ enum ctattr_help {
  };
  #define CTA_HELP_MAX (__CTA_HELP_MAX - 1)
  
@@ -156,12 +187,15 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  enum ctattr_secctx {
  	CTA_SECCTX_UNSPEC,
  	CTA_SECCTX_NAME,
+diff --git a/src/conntrack/api.c b/src/conntrack/api.c
+index f0e038b..72adfb6 100644
 --- a/src/conntrack/api.c
 +++ b/src/conntrack/api.c
-@@ -106,6 +106,56 @@
+@@ -105,6 +105,56 @@ void nfct_destroy(struct nf_conntrack *ct)
+ 	ct = NULL; /* bugtrap */
  }
  
- /**
++/**
 + * nfct_clear - clear/reset a conntrack object for reuse
 + * \param ct pointer to the conntrack object
 + *
@@ -211,13 +245,14 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 +	memset(&ct->synproxy, 0, sizeof(ct->synproxy));
 +}
 +
-+/**
+ /**
   * nf_sizeof - return the size in bytes of a certain conntrack object
   * \param ct pointer to the conntrack object
-  *
+diff --git a/src/conntrack/build_mnl.c b/src/conntrack/build_mnl.c
+index e563c4e..66fd9dc 100644
 --- a/src/conntrack/build_mnl.c
 +++ b/src/conntrack/build_mnl.c
-@@ -449,6 +449,20 @@
+@@ -449,6 +449,20 @@ static void nfct_build_synproxy(struct nlmsghdr *nlh,
  	mnl_attr_nest_end(nlh, nest);
  }
  
@@ -238,7 +273,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  int
  nfct_nlmsg_build(struct nlmsghdr *nlh, const struct nf_conntrack *ct)
  {
-@@ -592,6 +606,13 @@
+@@ -592,6 +606,13 @@ nfct_nlmsg_build(struct nlmsghdr *nlh, const struct nf_conntrack *ct)
  	    test_bit(ATTR_SYNPROXY_TSOFF, ct->head.set))
  		nfct_build_synproxy(nlh, ct);
  
@@ -252,9 +287,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	return 0;
  }
  
+diff --git a/src/conntrack/compare.c b/src/conntrack/compare.c
+index 8b2f3cb..86dece3 100644
 --- a/src/conntrack/compare.c
 +++ b/src/conntrack/compare.c
-@@ -318,7 +318,16 @@
+@@ -318,7 +318,16 @@ cmp_mark(const struct nf_conntrack *ct1,
  	       nfct_get_attr_u32(ct2, ATTR_MARK);
  }
  
@@ -272,7 +309,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  cmp_timeout(const struct nf_conntrack *ct1,
  	    const struct nf_conntrack *ct2,
  	    unsigned int flags)
-@@ -448,6 +457,9 @@
+@@ -448,6 +457,9 @@ static int cmp_meta(const struct nf_conntrack *ct1,
  		return 0;
  	if (!__cmp(ATTR_MARK, ct1, ct2, flags, cmp_mark, false))
  		return 0;
@@ -282,9 +319,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	if (!__cmp(ATTR_TIMEOUT, ct1, ct2, flags, cmp_timeout, true))
  		return 0;
  	if (!__cmp(ATTR_STATUS, ct1, ct2, flags, cmp_status, true))
+diff --git a/src/conntrack/copy.c b/src/conntrack/copy.c
+index 402f994..c20b400 100644
 --- a/src/conntrack/copy.c
 +++ b/src/conntrack/copy.c
-@@ -516,6 +516,13 @@
+@@ -516,6 +516,13 @@ static void copy_attr_synproxy_tsoff(struct nf_conntrack *dest,
  	dest->synproxy.tsoff = orig->synproxy.tsoff;
  }
  
@@ -298,7 +337,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  const copy_attr copy_attr_array[ATTR_MAX] = {
  	[ATTR_ORIG_IPV4_SRC]		= copy_attr_orig_ipv4_src,
  	[ATTR_ORIG_IPV4_DST] 		= copy_attr_orig_ipv4_dst,
-@@ -592,6 +599,8 @@
+@@ -592,6 +599,8 @@ const copy_attr copy_attr_array[ATTR_MAX] = {
  	[ATTR_SYNPROXY_ITS]		= copy_attr_synproxy_its,
  	[ATTR_SYNPROXY_ISN]		= copy_attr_synproxy_isn,
  	[ATTR_SYNPROXY_TSOFF]		= copy_attr_synproxy_tsoff,
@@ -307,9 +346,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  };
  
  /* this is used by nfct_copy() with the NFCT_CP_OVERRIDE flag set. */
+diff --git a/src/conntrack/getter.c b/src/conntrack/getter.c
+index c9615d5..80aaa48 100644
 --- a/src/conntrack/getter.c
 +++ b/src/conntrack/getter.c
-@@ -389,6 +389,72 @@
+@@ -389,6 +389,72 @@ static const void *get_attr_timestamp_event(const struct nf_conntrack *ct)
  	return &ct->timestamp_event;
  }
  
@@ -382,7 +423,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  const get_attr get_attr_array[ATTR_MAX] = {
  	[ATTR_ORIG_IPV4_SRC]		= get_attr_orig_ipv4_src,
  	[ATTR_ORIG_IPV4_DST] 		= get_attr_orig_ipv4_dst,
-@@ -466,4 +532,18 @@
+@@ -466,4 +532,18 @@ const get_attr get_attr_array[ATTR_MAX] = {
  	[ATTR_SYNPROXY_ITS]		= get_attr_synproxy_its,
  	[ATTR_SYNPROXY_TSOFF]		= get_attr_synproxy_tsoff,
  	[ATTR_TIMESTAMP_EVENT]		= get_attr_timestamp_event,
@@ -401,13 +442,25 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 +	[ATTR_REPL_COMCERTO_FP_UNDERLYING_VID]	= get_attr_repl_comcerto_fp_underlying_vid,
 +	[ATTR_QOSCONNMARK]			= get_attr_qosconnmark,
  };
+diff --git a/src/conntrack/parse_mnl.c b/src/conntrack/parse_mnl.c
+index 0f87f69..60a626c 100644
 --- a/src/conntrack/parse_mnl.c
 +++ b/src/conntrack/parse_mnl.c
-@@ -856,6 +856,129 @@
+@@ -856,6 +856,139 @@ static int nfct_parse_synproxy(const struct nlattr *attr,
  	return 0;
  }
  
 +/* NXP ASK: Comcerto fast path parsing */
++/*
++ * The kernel emits fast-path conntrack metadata by attribute number and this
++ * library parses by number; if a rebase inserts a standard CTA_* above these,
++ * the values shift on one side only and offload metadata is silently misfiled.
++ * Pin the numbers so that shift is a loud build failure -- when it fires,
++ * re-check enum ctattr_type in linux_nfnetlink_conntrack.h and re-pin.
++ */
++_Static_assert(CTA_LAYERSCAPE_FP_ORIG == 27 && CTA_LAYERSCAPE_FP_REPLY == 28,
++	       "CTA_LAYERSCAPE_FP_* ABI shifted -- re-check enum ctattr_type");
++
 +static int
 +nfct_parse_comcerto_fp_attr_cb(const struct nlattr *attr, void *data)
 +{
@@ -533,7 +586,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  static int
  nfct_parse_conntrack_attr_cb(const struct nlattr *attr, void *data)
  {
-@@ -901,6 +1024,16 @@
+@@ -901,6 +1034,16 @@ nfct_parse_conntrack_attr_cb(const struct nlattr *attr, void *data)
  		if (mnl_attr_validate(attr, MNL_TYPE_U64) < 0)
  			abi_breakage();
  		break;
@@ -550,7 +603,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	}
  	tb[type] = attr;
  	return MNL_CB_OK;
-@@ -1039,6 +1172,24 @@
+@@ -1039,6 +1182,24 @@ nfct_payload_parse(const void *payload, size_t payload_len,
  			be64toh(mnl_attr_get_u64(tb[CTA_TIMESTAMP_EVENT]));
  	}
  
@@ -575,9 +628,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	return 0;
  }
  
+diff --git a/src/conntrack/setter.c b/src/conntrack/setter.c
+index cee81f1..2d25380 100644
 --- a/src/conntrack/setter.c
 +++ b/src/conntrack/setter.c
-@@ -457,6 +457,13 @@
+@@ -457,6 +457,13 @@ set_attr_synproxy_tsoff(struct nf_conntrack *ct, const void *value, size_t len)
  	ct->synproxy.tsoff = *((uint32_t *) value);
  }
  
@@ -591,16 +646,18 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  static void
  set_attr_do_nothing(struct nf_conntrack *ct, const void *value, size_t len) {}
  
-@@ -536,4 +543,6 @@
+@@ -536,4 +543,6 @@ const set_attr set_attr_array[ATTR_MAX] = {
  	[ATTR_SYNPROXY_ISN]	= set_attr_synproxy_isn,
  	[ATTR_SYNPROXY_ITS]	= set_attr_synproxy_its,
  	[ATTR_SYNPROXY_TSOFF]	= set_attr_synproxy_tsoff,
 +	/* NXP ASK: QoS connection mark */
 +	[ATTR_QOSCONNMARK]	= set_attr_qosconnmark,
  };
+diff --git a/src/conntrack/snprintf_default.c b/src/conntrack/snprintf_default.c
+index 4fe2a2d..8d43808 100644
 --- a/src/conntrack/snprintf_default.c
 +++ b/src/conntrack/snprintf_default.c
-@@ -244,6 +244,13 @@
+@@ -244,6 +244,13 @@ __snprintf_mark(char *buf, unsigned int len, const struct nf_conntrack *ct)
  	return (snprintf(buf, len, "mark=%u ", ct->mark));
  }
  
@@ -614,7 +671,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  static int
  __snprintf_secmark(char *buf, unsigned int len, const struct nf_conntrack *ct)
  {
-@@ -473,6 +480,12 @@
+@@ -473,6 +480,12 @@ int __snprintf_conntrack_default(char *buf,
  		BUFFER_SIZE(ret, size, len, offset);
  	}
  
@@ -627,9 +684,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	if (test_bit(ATTR_SECMARK, ct->head.set)) {
  		ret = __snprintf_secmark(buf+offset, len, ct);
  		BUFFER_SIZE(ret, size, len, offset);
+diff --git a/src/conntrack/snprintf_xml.c b/src/conntrack/snprintf_xml.c
+index e557df2..ef917e2 100644
 --- a/src/conntrack/snprintf_xml.c
 +++ b/src/conntrack/snprintf_xml.c
-@@ -480,6 +480,12 @@
+@@ -480,6 +480,12 @@ int __snprintf_conntrack_xml(char *buf,
  		BUFFER_SIZE(ret, size, len, offset);
  	}
  
@@ -642,9 +701,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	if (map && test_bit(ATTR_CONNLABELS, ct->head.set)) {
  		ret = __snprintf_clabels_xml(buf+offset, len, ct, map);
  		BUFFER_SIZE(ret, size, len, offset);
+diff --git a/src/main.c b/src/main.c
+index 4011ad6..c0d5896 100644
 --- a/src/main.c
 +++ b/src/main.c
-@@ -89,6 +89,9 @@
+@@ -89,6 +89,9 @@ struct nfct_handle *nfct_open(uint8_t subsys_id, unsigned subscriptions)
  	if (!nfnlh)
  		return NULL;
  
@@ -654,3 +715,6 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	nfcth = nfct_open_nfnl(nfnlh, subsys_id, subscriptions);
  	if (!nfcth)
  		nfnl_close(nfnlh);
+-- 
+2.47.3
+

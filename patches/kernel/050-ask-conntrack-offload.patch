@@ -1,4 +1,4 @@
-From b6910a4e32f7e7dd01b8ab9d0feecd90376580fc Mon Sep 17 00:00:00 2001
+From 695e001527a8aa613f68461aef73307d1bfa7639 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 23 Apr 2026 17:55:41 +0200
 Subject: [PATCH] ask: conntrack offload notifications
@@ -14,14 +14,14 @@ UAPI additions: nf_conntrack_common.h, nfnetlink_conntrack.h.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/net/netfilter/nf_conntrack.h          |  52 +++++-
+ include/net/netfilter/nf_conntrack.h          |  52 ++++-
  .../linux/netfilter/nf_conntrack_common.h     |  11 +-
  .../linux/netfilter/nfnetlink_conntrack.h     |  18 ++
  net/netfilter/nf_conntrack_core.c             |  75 +++++++-
- net/netfilter/nf_conntrack_netlink.c          | 171 +++++++++++++++++-
+ net/netfilter/nf_conntrack_netlink.c          | 181 +++++++++++++++++-
  net/netfilter/nf_conntrack_proto_tcp.c        |   4 +
  net/netfilter/nf_conntrack_standalone.c       |  13 ++
- 7 files changed, 340 insertions(+), 4 deletions(-)
+ 7 files changed, 350 insertions(+), 4 deletions(-)
 
 diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
 index 8cb70e7485e2..846d19ff054f 100644
@@ -313,7 +313,7 @@ index f5bde4f13958..cfb67c09add4 100644
 +EXPORT_SYMBOL_GPL(nf_ct_is_expired);
 +#endif
 diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
-index 18a91c031554..c10d9296e475 100644
+index 18a91c031554..b48eeef64023 100644
 --- a/net/netfilter/nf_conntrack_netlink.c
 +++ b/net/netfilter/nf_conntrack_netlink.c
 @@ -28,6 +28,11 @@
@@ -381,11 +381,21 @@ index 18a91c031554..c10d9296e475 100644
  #ifdef CONFIG_NF_CONNTRACK_SECMARK
  static int ctnetlink_dump_secctx(struct sk_buff *skb, const struct nf_conn *ct)
  {
-@@ -413,6 +443,59 @@ ctnetlink_dump_labels(struct sk_buff *skb, const struct nf_conn *ct)
+@@ -413,6 +443,69 @@ ctnetlink_dump_labels(struct sk_buff *skb, const struct nf_conn *ct)
  	return 0;
  }
  
 +#if defined(CONFIG_CPE_FAST_PATH)
++/*
++ * The kernel emits fast-path conntrack metadata BY attribute number and each
++ * userspace consumer parses by number; if a rebase inserts a standard CTA_*
++ * above these, the values shift on one side only and offload metadata is
++ * silently misfiled. Pin the numbers so that shift is a loud build failure --
++ * when it fires, re-check enum ctattr_type in this header and re-pin.
++ */
++static_assert(CTA_LAYERSCAPE_FP_ORIG == 27 && CTA_LAYERSCAPE_FP_REPLY == 28,
++	      "CTA_LAYERSCAPE_FP_* ABI shifted -- re-check enum ctattr_type");
++
 +static int
 +ctnetlink_dump_comcerto_fp(struct sk_buff *skb, const struct nf_conn *ct)
 +{
@@ -441,7 +451,7 @@ index 18a91c031554..c10d9296e475 100644
  #define master_tuple(ct) &(ct->master->tuplehash[IP_CT_DIR_ORIGINAL].tuple)
  
  static int ctnetlink_dump_master(struct sk_buff *skb, const struct nf_conn *ct)
-@@ -553,7 +636,11 @@ static int ctnetlink_dump_info(struct sk_buff *skb, struct nf_conn *ct)
+@@ -553,7 +646,11 @@ static int ctnetlink_dump_info(struct sk_buff *skb, struct nf_conn *ct)
  {
  	if (ctnetlink_dump_status(skb, ct) < 0 ||
  	    ctnetlink_dump_mark(skb, ct, true) < 0 ||
@@ -453,7 +463,7 @@ index 18a91c031554..c10d9296e475 100644
  	    ctnetlink_dump_id(skb, ct) < 0 ||
  	    ctnetlink_dump_use(skb, ct) < 0 ||
  	    ctnetlink_dump_master(skb, ct) < 0)
-@@ -705,6 +792,13 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
+@@ -705,6 +802,13 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
  	       + nla_total_size(0) /* CTA_HELP */
  	       + nla_total_size(NF_CT_HELPER_NAME_LEN) /* CTA_HELP_NAME */
  	       + ctnetlink_secctx_size(ct)
@@ -467,7 +477,7 @@ index 18a91c031554..c10d9296e475 100644
  #if IS_ENABLED(CONFIG_NF_NAT)
  	       + 2 * nla_total_size(0) /* CTA_NAT_SEQ_ADJ_ORIG|REPL */
  	       + 6 * nla_total_size(sizeof(u_int32_t)) /* CTA_NAT_SEQ_OFFSET */
-@@ -712,6 +806,9 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
+@@ -712,6 +816,9 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
  #ifdef CONFIG_NF_CONNTRACK_MARK
  	       + nla_total_size(sizeof(u_int32_t)) /* CTA_MARK */
  #endif
@@ -477,7 +487,7 @@ index 18a91c031554..c10d9296e475 100644
  #ifdef CONFIG_NF_CONNTRACK_ZONES
  	       + nla_total_size(sizeof(u_int16_t)) /* CTA_ZONE|CTA_TUPLE_ZONE */
  #endif
-@@ -786,6 +883,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
+@@ -786,6 +893,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
  				   NF_CT_DEFAULT_ZONE_DIR) < 0)
  		goto nla_put_failure;
  
@@ -489,7 +499,7 @@ index 18a91c031554..c10d9296e475 100644
  	if (ctnetlink_dump_id(skb, ct) < 0)
  		goto nla_put_failure;
  
-@@ -837,6 +939,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
+@@ -837,6 +949,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
  #ifdef CONFIG_NF_CONNTRACK_MARK
  	if (ctnetlink_dump_mark(skb, ct, events & (1 << IPCT_MARK)))
  		goto nla_put_failure;
@@ -501,7 +511,7 @@ index 18a91c031554..c10d9296e475 100644
  #endif
  	nlmsg_end(skb, nlh);
  	err = nfnetlink_send(skb, net, item->portid, group, item->report,
-@@ -1546,6 +1653,9 @@ static const struct nla_policy ct_nla_policy[CTA_MAX+1] = {
+@@ -1546,6 +1663,9 @@ static const struct nla_policy ct_nla_policy[CTA_MAX+1] = {
  	[CTA_NAT_SRC]		= { .type = NLA_NESTED },
  	[CTA_TIMEOUT] 		= { .type = NLA_U32 },
  	[CTA_MARK]		= { .type = NLA_U32 },
@@ -511,7 +521,7 @@ index 18a91c031554..c10d9296e475 100644
  	[CTA_ID]		= { .type = NLA_U32 },
  	[CTA_NAT_DST]		= { .type = NLA_NESTED },
  	[CTA_TUPLE_MASTER]	= { .type = NLA_NESTED },
-@@ -1900,6 +2010,46 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
+@@ -1900,6 +2020,46 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
  	return nf_ct_change_status_common(ct, ntohl(nla_get_be32(cda[CTA_STATUS])));
  }
  
@@ -558,7 +568,7 @@ index 18a91c031554..c10d9296e475 100644
  static int
  ctnetlink_setup_nat(struct nf_conn *ct, const struct nlattr * const cda[])
  {
-@@ -2204,6 +2354,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
+@@ -2204,6 +2364,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
  			return err;
  	}
  
@@ -570,7 +580,7 @@ index 18a91c031554..c10d9296e475 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2342,6 +2497,11 @@ ctnetlink_create_conntrack(struct net *net,
+@@ -2342,6 +2507,11 @@ ctnetlink_create_conntrack(struct net *net,
  			goto err2;
  	}
  
@@ -582,7 +592,7 @@ index 18a91c031554..c10d9296e475 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2468,6 +2628,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
+@@ -2468,6 +2638,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
  	err = -EEXIST;
  	ct = nf_ct_tuplehash_to_ctrack(h);
  	if (!(info->nlh->nlmsg_flags & NLM_F_EXCL)) {
