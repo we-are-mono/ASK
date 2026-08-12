@@ -42,6 +42,7 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://097-xfrm-trans-queue-force-dst-refcount.patch \
            file://098-sdk_dpaa-bp-alloc-slab-build-skb.patch \
            file://099-sdk_fman-ehash-flex-arrays.patch \
+           file://100-sdk_dpaa-ethtool-quiet-phyless-ports.patch \
           "
 
 # Optional KASAN overlay — flipped on by the user with
