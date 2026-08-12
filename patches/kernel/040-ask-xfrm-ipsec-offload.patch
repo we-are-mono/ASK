@@ -1,4 +1,4 @@
-From 5ecab19e5c35fdf22b4b2cf13d39b66dab43f3d4 Mon Sep 17 00:00:00 2001
+From 84b14175a8682ef3bf462b294b80dc9c974d71ea Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -38,12 +38,12 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/Makefile            |   1 +
  net/xfrm/ipsec_flow.c        | 221 +++++++++
  net/xfrm/ipsec_flow.h        |  31 ++
- net/xfrm/xfrm_input.c        |  14 +
+ net/xfrm/xfrm_input.c        |  20 +
  net/xfrm/xfrm_output.c       |  95 ++++
  net/xfrm/xfrm_policy.c       |  90 ++++
- net/xfrm/xfrm_state.c        | 211 ++++++++
+ net/xfrm/xfrm_state.c        | 218 +++++++++
  net/xfrm/xfrm_user.c         |   4 +
- 18 files changed, 1681 insertions(+), 7 deletions(-)
+ 18 files changed, 1694 insertions(+), 7 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -1559,7 +1559,7 @@ index 000000000000..ee8a7fa571b8
 +#endif
 +
 diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
-index 841a60a6fbfe..b91fd2911cf3 100644
+index 841a60a6fbfe..4952428eac00 100644
 --- a/net/xfrm/xfrm_input.c
 +++ b/net/xfrm/xfrm_input.c
 @@ -44,6 +44,10 @@ struct xfrm_trans_cb {
@@ -1573,7 +1573,7 @@ index 841a60a6fbfe..b91fd2911cf3 100644
  static DEFINE_SPINLOCK(xfrm_input_afinfo_lock);
  static struct xfrm_input_afinfo const __rcu *xfrm_input_afinfo[2][AF_INET6 + 1];
  
-@@ -599,6 +603,16 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+@@ -599,6 +603,22 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
  			goto drop;
  		}
  
@@ -1583,7 +1583,13 @@ index 841a60a6fbfe..b91fd2911cf3 100644
 +		/* check if the corresponding SA is offloaded,
 +		   then submit the packet to SEC engine */
 +
-+		if ((x->offloaded) && 
++		/*
++		 * Only hand the packet to SEC for a live SA. A deleted/expired SA
++		 * goes XFRM_STATE_DEAD before the km.state check below; submitting
++		 * its stale handle would target a hardware SA context cmm may have
++		 * already torn down (or reused).
++		 */
++		if ((x->offloaded) && (x->km.state == XFRM_STATE_VALID) &&
 +		    !(dpaa_submit_inb_pkt_to_SEC(skb, x->handle)))
 +			return 0;
 +#endif /* IPSEC offload end */
@@ -1929,7 +1935,7 @@ index 2c42d83fbaa2..43c9182f71f0 100644
  	xfrm_policy_fini(net);
  	xfrm_state_fini(net);
 diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
-index 6f99fd2d966c..22f0bb1fba38 100644
+index 6f99fd2d966c..9c29ae914e73 100644
 --- a/net/xfrm/xfrm_state.c
 +++ b/net/xfrm/xfrm_state.c
 @@ -58,6 +58,57 @@ static inline bool xfrm_state_hold_rcu(struct xfrm_state __rcu *x)
@@ -2119,11 +2125,18 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  		x->pcpu_num = UINT_MAX;
  		spin_lock_init(&x->lock);
  	}
-@@ -769,6 +876,17 @@ int __xfrm_state_delete(struct xfrm_state *x)
+@@ -769,6 +876,24 @@ int __xfrm_state_delete(struct xfrm_state *x)
  
  		if (x->id.spi)
  			hlist_del_rcu(&x->byspi);
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++		/*
++		 * The SA is going away: stop the datapath from treating it as
++		 * offloaded (xfrm_input/xfrm_output gate the SEC submit on this
++		 * flag). cmm cannot clear it via SET_OFFLOAD once we unlink it from
++		 * byh below, so clear it here.
++		 */
++		x->offloaded = 0;
 +		/*
 +		 * if 'handle' value is assigned and xfrm_state is inserted
 +		 * into 'byh' hash table, remove it now and reset 'in_byh_hash'
@@ -2137,7 +2150,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  		net->xfrm.state_num--;
  		xfrm_nat_keepalive_state_updated(x);
  		spin_unlock(&net->xfrm.xfrm_state_lock);
-@@ -1521,6 +1639,15 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
+@@ -1521,6 +1646,15 @@ xfrm_state_find(const xfrm_address_t *daddr, const xfrm_address_t *saddr,
  						  net->xfrm.state_byseq + h,
  						  x->xso.type);
  			}
@@ -2153,7 +2166,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  			x->lft.hard_add_expires_seconds = net->xfrm.sysctl_acq_expires;
  			hrtimer_start(&x->mtimer,
  				      ktime_set(net->xfrm.sysctl_acq_expires, 0),
-@@ -1691,6 +1818,15 @@ static void __xfrm_state_insert(struct xfrm_state *x)
+@@ -1691,6 +1825,15 @@ static void __xfrm_state_insert(struct xfrm_state *x)
  				  x->xso.type);
  	}
  
@@ -2169,7 +2182,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  	hrtimer_start(&x->mtimer, ktime_set(1, 0), HRTIMER_MODE_REL_SOFT);
  	if (x->replay_maxage)
  		mod_timer(&x->rtimer, jiffies + x->replay_maxage);
-@@ -1712,6 +1848,9 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
+@@ -1712,6 +1855,9 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
  	u32 mark = xnew->mark.v & xnew->mark.m;
  	u32 if_id = xnew->if_id;
  	u32 cpu_id = xnew->pcpu_num;
@@ -2179,7 +2192,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  
  	h = xfrm_dst_hash(net, &xnew->id.daddr, &xnew->props.saddr, reqid, family);
  	hlist_for_each_entry(x, net->xfrm.state_bydst+h, bydst) {
-@@ -1722,8 +1861,19 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
+@@ -1722,8 +1868,19 @@ static void __xfrm_state_bump_genids(struct xfrm_state *xnew)
  		    (mark & x->mark.m) == x->mark.v &&
  		    xfrm_addr_equal(&x->id.daddr, &xnew->id.daddr, family) &&
  		    xfrm_addr_equal(&x->props.saddr, &xnew->props.saddr, family))
@@ -2199,7 +2212,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  }
  
  void xfrm_state_insert(struct xfrm_state *x)
-@@ -2263,6 +2413,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
+@@ -2263,6 +2420,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
  }
  EXPORT_SYMBOL(xfrm_state_lookup_byaddr);
  
@@ -2236,7 +2249,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  struct xfrm_state *
  xfrm_find_acq(struct net *net, const struct xfrm_mark *mark, u8 mode, u32 reqid,
  	      u32 if_id, u32 pcpu_num, u8 proto, const xfrm_address_t *daddr,
-@@ -2510,6 +2690,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+@@ -2510,6 +2697,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
  			x->id.spi = newspi;
  			h = xfrm_spi_hash(net, &x->id.daddr, newspi, x->id.proto, x->props.family);
  			XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h, x->xso.type);
@@ -2253,7 +2266,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  			spin_unlock_bh(&net->xfrm.xfrm_state_lock);
  			err = 0;
  			goto unlock;
-@@ -3184,6 +3374,19 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3184,6 +3381,19 @@ int __net_init xfrm_state_init(struct net *net)
  	if (!net->xfrm.state_byseq)
  		goto out_byseq;
  
@@ -2273,7 +2286,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  	net->xfrm.state_cache_input = alloc_percpu(struct hlist_head);
  	if (!net->xfrm.state_cache_input)
  		goto out_state_cache_input;
-@@ -3198,6 +3401,10 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3198,6 +3408,10 @@ int __net_init xfrm_state_init(struct net *net)
  	return 0;
  
  out_state_cache_input:
@@ -2284,7 +2297,7 @@ index 6f99fd2d966c..22f0bb1fba38 100644
  	xfrm_hash_free(net->xfrm.state_byseq, sz);
  out_byseq:
  	xfrm_hash_free(net->xfrm.state_byspi, sz);
-@@ -3228,6 +3435,10 @@ void xfrm_state_fini(struct net *net)
+@@ -3228,6 +3442,10 @@ void xfrm_state_fini(struct net *net)
  	xfrm_hash_free(net->xfrm.state_bysrc, sz);
  	WARN_ON(!hlist_empty(net->xfrm.state_bydst));
  	xfrm_hash_free(net->xfrm.state_bydst, sz);
