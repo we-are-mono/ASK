@@ -763,8 +763,8 @@ int dpa_init(void)
    	retval = fmc_compile(&cmodel, cfg_file, pcd_file, pdl_file, sp_file,  SP_OFFSET, 0, 
 			NULL);
 	if (retval) {
-		printf("%s::unable to compile fmc input files, err %d\n",
-			__func__, retval);
+		printf("%s::unable to compile fmc input files, err %d: %s\n",
+			__func__, retval, fmc_get_error());
                 return -1;
 	}
 	retval = -1;
