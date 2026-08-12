@@ -1,4 +1,4 @@
-From c425c3a0afd9d153f7a0ee1cbfb4163786d630ed Mon Sep 17 00:00:00 2001
+From b6910a4e32f7e7dd01b8ab9d0feecd90376580fc Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 23 Apr 2026 17:55:41 +0200
 Subject: [PATCH] ask: conntrack offload notifications
@@ -14,15 +14,14 @@ UAPI additions: nf_conntrack_common.h, nfnetlink_conntrack.h.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/net/netfilter/nf_conntrack.h               |  52 ++++++-
- include/uapi/linux/netfilter/nf_conntrack_common.h |  11 +-
- include/uapi/linux/netfilter/nfnetlink_conntrack.h |  18 +++
- net/netfilter/nf_conntrack_core.c                  |  75 ++++++++-
- net/netfilter/nf_conntrack_netlink.c               | 173 ++++++++++++++++++++-
- net/netfilter/nf_conntrack_proto_tcp.c             |   4 +
- net/netfilter/nf_conntrack_standalone.c            |  13 ++
- 7 files changed, 342 insertions(+), 4 deletions(-)
-
+ include/net/netfilter/nf_conntrack.h          |  52 +++++-
+ .../linux/netfilter/nf_conntrack_common.h     |  11 +-
+ .../linux/netfilter/nfnetlink_conntrack.h     |  18 ++
+ net/netfilter/nf_conntrack_core.c             |  75 +++++++-
+ net/netfilter/nf_conntrack_netlink.c          | 171 +++++++++++++++++-
+ net/netfilter/nf_conntrack_proto_tcp.c        |   4 +
+ net/netfilter/nf_conntrack_standalone.c       |  13 ++
+ 7 files changed, 340 insertions(+), 4 deletions(-)
 
 diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
 index 8cb70e7485e2..846d19ff054f 100644
@@ -314,7 +313,7 @@ index f5bde4f13958..cfb67c09add4 100644
 +EXPORT_SYMBOL_GPL(nf_ct_is_expired);
 +#endif
 diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
-index 18a91c031554..96731d50534a 100644
+index 18a91c031554..c10d9296e475 100644
 --- a/net/netfilter/nf_conntrack_netlink.c
 +++ b/net/netfilter/nf_conntrack_netlink.c
 @@ -28,6 +28,11 @@
@@ -512,46 +511,44 @@ index 18a91c031554..96731d50534a 100644
  	[CTA_ID]		= { .type = NLA_U32 },
  	[CTA_NAT_DST]		= { .type = NLA_NESTED },
  	[CTA_TUPLE_MASTER]	= { .type = NLA_NESTED },
-@@ -1900,6 +2010,48 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
+@@ -1900,6 +2010,46 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
  	return nf_ct_change_status_common(ct, ntohl(nla_get_be32(cda[CTA_STATUS])));
  }
  
 +#if defined(CONFIG_CPE_FAST_PATH)
 +/*
-+ * This function detects ctnetlink messages that require
-+ * to set the conntrack status to IPS_PERMANENT.
-+ * It updates only this bit regardless of other possible
-+ * changes.
-+ * Return 0 if succesfull
++ * Handle a dedicated pin/unpin (IPS_PERMANENT) request and short-circuit the
++ * rest of the update. Only a real flip of the PERMANENT bit counts: an
++ * ordinary update that merely carries the already-set (or already-clear) bit
++ * falls through (-1) so ctnetlink_change_conntrack() still applies the
++ * mark/NAT/protoinfo/... attributes bundled in the same message.
++ * Returns 0 on a handled pin/unpin, -ENOENT if CTA_ID does not match this
++ * conntrack, or -1 to let the normal update path run.
 + */
 +static int
 +ctnetlink_change_permanent(struct nf_conn *ct, const struct nlattr * const cda[])
 +{
 +	unsigned int status;
 +	u_int32_t id;
++	int want, have;
 +	__be32 conntrack_id = ntohl((__force __be32)nf_ct_get_id(ct));
 +
 +	if (cda[CTA_STATUS] && cda[CTA_ID]) {
 +		status = ntohl(nla_get_be32(cda[CTA_STATUS]));
 +		id = ntohl(nla_get_be32(cda[CTA_ID]));
 +
-+		if (status & IPS_PERMANENT) {
-+			if (conntrack_id == id) {
-+				ct->status |= IPS_PERMANENT;
-+				return 0;
-+			}
-+			else
++		want = !!(status & IPS_PERMANENT);
++		have = nf_ct_is_permanent(ct);
++
++		/* Act only when the PERMANENT bit actually flips. */
++		if (want != have) {
++			if (conntrack_id != id)
 +				return -ENOENT;
-+		}
-+		else if (nf_ct_is_permanent(ct))
-+		{
-+			/* Clear the PERMANENT bit. */
-+			if (conntrack_id == id) {
-+				clear_bit(IPS_PERMANENT_BIT, &ct->status);
-+				return 0;
-+			}
++			if (want)
++				set_bit(IPS_PERMANENT_BIT, &ct->status);   /* pin */
 +			else
-+				return -ENOENT;
++				clear_bit(IPS_PERMANENT_BIT, &ct->status); /* unpin */
++			return 0;
 +		}
 +	}
 +	return -1;
@@ -561,7 +558,7 @@ index 18a91c031554..96731d50534a 100644
  static int
  ctnetlink_setup_nat(struct nf_conn *ct, const struct nlattr * const cda[])
  {
-@@ -2204,6 +2356,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
+@@ -2204,6 +2354,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
  			return err;
  	}
  
@@ -573,7 +570,7 @@ index 18a91c031554..96731d50534a 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2342,6 +2499,11 @@ ctnetlink_create_conntrack(struct net *net,
+@@ -2342,6 +2497,11 @@ ctnetlink_create_conntrack(struct net *net,
  			goto err2;
  	}
  
@@ -585,7 +582,7 @@ index 18a91c031554..96731d50534a 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2468,6 +2630,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
+@@ -2468,6 +2628,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
  	err = -EEXIST;
  	ct = nf_ct_tuplehash_to_ctrack(h);
  	if (!(info->nlh->nlmsg_flags & NLM_F_EXCL)) {
@@ -647,3 +644,6 @@ index 3ea60ff7a6a4..f1aab3a1066a 100644
  
  	ct_show_secctx(s, ct);
  	ct_show_zone(s, ct, NF_CT_DEFAULT_ZONE_DIR);
+-- 
+2.47.3
+
