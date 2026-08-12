@@ -170,8 +170,22 @@ int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags
 	for (jj = 0; jj < finfo->num_tables; jj++) {
 		if(tinfo->port_idx  == (1<< portid))
 		{
-			td[tinfo->type] = tinfo->id ;
-			*flags |= (1 << tinfo->type);
+			/* type is copied verbatim from the user-supplied
+			 * table_info (CDX_CTRL_DPA_SET_PARAMS) and is used
+			 * both to index td[] and as a shift count for flags.
+			 * A malformed config carrying type >= MAX_MATCH_TABLES
+			 * would write past td[MAX_MATCH_TABLES] and shift out
+			 * of range; skip such an entry rather than corrupt
+			 * memory. Valid types (0..MAX_MATCH_TABLES-1) behave
+			 * exactly as before. */
+			if (tinfo->type < MAX_MATCH_TABLES) {
+				td[tinfo->type] = tinfo->id ;
+				*flags |= (1 << tinfo->type);
+			} else {
+				DPA_ERROR("%s::table type %u out of range (>= %u), skipping\n",
+						__func__, tinfo->type,
+						(uint32_t)MAX_MATCH_TABLES);
+			}
 		}
 		tinfo++;
 	}
