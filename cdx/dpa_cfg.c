@@ -165,10 +165,21 @@ int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags
 	struct cdx_fman_info *finfo;
 	struct table_info *tinfo;
 
-	finfo = &fman_info[fm_index];	
+	/* portid selects a bit in the 32-bit port_idx bitmap; a shift by
+	 * >= 32 (or negative -- portid is signed here, unlike the uint32_t
+	 * param in the sibling dpa_get_tdinfo) is undefined. Reject
+	 * out-of-range ports: no tables are attached to them. */
+	if (portid < 0 || portid >= 32)
+		return 0;
+
+	finfo = &fman_info[fm_index];
 	tinfo = finfo->tbl_info;
 	for (jj = 0; jj < finfo->num_tables; jj++) {
-		if(tinfo->port_idx  == (1<< portid))
+		/* port_idx is a bitmap (a table may serve several ports, e.g.
+		 * offline/multi-port tables). Match on the bit, mirroring
+		 * dpa_get_tdinfo; the old == test only matched single-port
+		 * tables and silently dropped multi-port/OH ones. */
+		if (tinfo->port_idx & (1U << portid))
 		{
 			/* type is copied verbatim from the user-supplied
 			 * table_info (CDX_CTRL_DPA_SET_PARAMS) and is used
