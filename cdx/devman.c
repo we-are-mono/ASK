@@ -1476,17 +1476,24 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 	memset(l3_info, 0, sizeof(struct dpa_l3hdr_info));
 	//decide if vlan strip hm is required
 	spin_lock(&dpa_devlist_lock);
-	if(!rt_entry->input_itf || !rt_entry->underlying_input_itf)
+	if(!rt_entry->underlying_input_itf)
 	{
-		DPA_ERROR("%s::NULL Input interface \n",
+		DPA_ERROR("%s::NULL underlying input interface\n",
 				__func__);
 		goto err_ret;
 	}
 
-	if (dpa_check_for_logical_iface_types(rt_entry->input_itf, rt_entry->underlying_input_itf, 
+	/* input_itf may be NULL for a VLAN-on-bridge ingress that never
+	 * registered as an onif; the physical port (underlying_input_itf) is
+	 * the real classification key, so fall back to it. */
+	if (dpa_check_for_logical_iface_types(
+				rt_entry->input_itf ? rt_entry->input_itf : rt_entry->underlying_input_itf,
+				rt_entry->underlying_input_itf,
 				l2_info, l3_info)) {
-		DPA_ERROR("%s::get_iface_type failed iface %d\n", 
-				__func__,  rt_entry->input_itf->index);
+		DPA_ERROR("%s::get_iface_type failed iface %d\n",
+				__func__,
+				rt_entry->input_itf ? rt_entry->input_itf->index :
+						rt_entry->underlying_input_itf->index);
 		goto err_ret;
 	}
 

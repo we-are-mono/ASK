@@ -909,6 +909,8 @@ static int __cmmCtItfRegister(struct RtEntry *route, const char *dir)
 
 	if (!route->phys_oifindex || (route->flags & CHECK_BRIDGE_PORT))
 	{
+		struct interface *out_itf = __itf_find(route->oifindex);
+
 		rc = __itf_is_bridge(route->oifindex);
 		if (rc < 0)
 		{
@@ -916,7 +918,14 @@ static int __cmmCtItfRegister(struct RtEntry *route, const char *dir)
 			goto err;
 		}
 
-		if (rc)
+		/* A VLAN on a vlan-aware bridge (br-lan.N) is not an FPP onif and
+		 * needs the same bridge->physical + egress-VLAN resolution as a
+		 * plain bridge; without this the reverse (to-LAN) direction of
+		 * every offloaded flow falls to software. Mirror of the ingress
+		 * fix in __cmmFPPRouteRegister. */
+		if (rc ||
+		    (out_itf && __itf_is_vlan(out_itf) &&
+		     __itf_is_bridge(out_itf->phys_ifindex)))
 		{
 			rc = cmmBrToFF(route);
 			if (rc < 0)
@@ -1008,11 +1017,25 @@ static int __cmmFPPRouteRegister(struct ct_route *rt, const char *dir)
 		dst_mac = null_mac;
 
 #if defined(LS1043)
-	if (__itf_is_bridge(rt->route->iifindex))
- 		iifindex = rt->route->underlying_iifindex; 
-	else
+	{
+		/* Use the physical ingress port when the L3 input interface is
+		 * not a single FMan port: a plain bridge, or a VLAN stacked on a
+		 * vlan-aware bridge (e.g. br-lan.N). Neither registers as a cdx
+		 * onif, so cdx must be handed the underlying physical port; else
+		 * the whole connection drops to CPU (the ASK-DIAG no-input-itf
+		 * path in cdx add_incoming_iface_info). */
+		struct interface *in_itf = __itf_find(rt->route->iifindex);
+
+		if (__itf_is_bridge(rt->route->iifindex) ||
+		    (in_itf && __itf_is_vlan(in_itf) &&
+		     __itf_is_bridge(in_itf->phys_ifindex)))
+			iifindex = rt->route->underlying_iifindex;
+		else
+			iifindex = rt->route->iifindex;
+	}
+#else
+	iifindex = rt->route->iifindex;
 #endif
-		iifindex = rt->route->iifindex;
 		
 
 	if (rt->route->flow_flags & FLOWFLAG_FLOATING_TUNNEL)

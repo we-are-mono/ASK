@@ -155,6 +155,8 @@ err:
 int cmmBrToFF(struct RtEntry *route)
 {
 	int ifindex;
+	int br_ifindex;
+	struct interface *out_itf;
 	char brname[IFNAMSIZ], ifname[IFNAMSIZ];
 #ifdef VLAN_FILTER
 	struct interface *br_itf;
@@ -168,8 +170,23 @@ int cmmBrToFF(struct RtEntry *route)
 		goto err;
 	}
 
+	out_itf = __itf_find(route->oifindex);
+	if (!out_itf) {
+		cmm_print(DEBUG_ERROR, "%s: output interface %d not found in route\n", __func__, route->oifindex);
+		goto err;
+	}
+
+	/* If the L3 output device is a VLAN on a vlan-aware bridge (br-lan.N),
+	 * the FDB and per-port VLAN state live on the underlying bridge, and
+	 * the egress VID is the VLAN device's own id. For a plain bridge L3
+	 * device the bridge is the output device itself (unchanged). */
+	if (__itf_is_vlan(out_itf) && __itf_is_bridge(out_itf->phys_ifindex))
+		br_ifindex = out_itf->phys_ifindex;
+	else
+		br_ifindex = route->oifindex;
+
 #ifdef VLAN_FILTER
-	br_itf = __itf_find(route->oifindex);
+	br_itf = __itf_find(br_ifindex);
 	if (!br_itf) {
 		cmm_print(DEBUG_ERROR, "%s: bridge index is missing in route\n", __func__);
 		goto err;
@@ -181,46 +198,52 @@ int cmmBrToFF(struct RtEntry *route)
 	{
 		route->vlan_filter_flags |= VLAN_FILTER_EN;
 
-		/* Check first PVID on bridge first*/
-		vinfo = vinfo_find_by_pvid(route->oifindex);
-		if(vinfo) {
-			/* Get the index of interface through which neighbour can be reached */
-			ifindex = cmm_br_get_neigh(route->neighEntry->macAddr,route->oifindex,vinfo->vlan_info.vid);
-			if (ifindex <= 0)
+		if (br_ifindex != route->oifindex) {
+			/* VLAN-on-bridge: the egress VID is the VLAN device's own
+			 * id, not the bridge PVID. */
+			vid = out_itf->vlan_id;
+		}
+		else {
+			/* Plain bridge L3 device: use the bridge PVID (unchanged). */
+			vinfo = vinfo_find_by_pvid(br_ifindex);
+			if (!vinfo) {
+				cmm_print(DEBUG_ERROR, "%s PVID is not found on bridge\n",__func__);
 				goto err;
-
-			vid = vinfo->vlan_info.vid;
-			/* Extract port tag configuration on outgoing interface for matching vid*/
-			vinfo = vinfo_find_by_vid(ifindex,vid);
-			if(vinfo) {
-				route->egress_vid = vinfo->vlan_info.vid;
-
-				if (vinfo->vlan_info.flags & BRIDGE_VLAN_INFO_UNTAGGED) {
-					route->vlan_filter_flags |= EGRESS_UNTAG;
-					cmm_print(DEBUG_INFO, "%s: ifindex %d is Egress untagged\n", __func__, ifindex);
-				}
 			}
-			else {
-				cmm_print(DEBUG_ERROR, "%s: egress filtering is failed for vlan id %d\n", __func__, vid);
-				goto err;
+			vid = vinfo->vlan_info.vid;
+		}
+
+		/* Get the index of interface through which neighbour can be reached */
+		ifindex = cmm_br_get_neigh(route->neighEntry->macAddr, br_ifindex, vid);
+		if (ifindex <= 0)
+			goto err;
+
+		/* Extract port tag configuration on outgoing interface for matching vid*/
+		vinfo = vinfo_find_by_vid(ifindex,vid);
+		if(vinfo) {
+			route->egress_vid = vinfo->vlan_info.vid;
+
+			if (vinfo->vlan_info.flags & BRIDGE_VLAN_INFO_UNTAGGED) {
+				route->vlan_filter_flags |= EGRESS_UNTAG;
+				cmm_print(DEBUG_INFO, "%s: ifindex %d is Egress untagged\n", __func__, ifindex);
 			}
 		}
 		else {
-			cmm_print(DEBUG_ERROR, "%s PVID is not found on bridge\n",__func__);
+			cmm_print(DEBUG_ERROR, "%s: egress filtering is failed for vlan id %d\n", __func__, vid);
 			goto err;
 		}
 	}
 	else
-		ifindex = cmm_br_get_neigh(route->neighEntry->macAddr,route->oifindex,0);
+		ifindex = cmm_br_get_neigh(route->neighEntry->macAddr, br_ifindex, 0);
 #else
 	/* FIXME Update also if more than N seconds have passed since last update */
 	if (route->neighEntry->port < 0)
-		cmmBrgetAllMacPort(route->oifindex);
+		cmmBrgetAllMacPort(br_ifindex);
 
 	if (route->neighEntry->port < 0)
 		goto err;
 
-	ifindex = __itf_get_from_bridge_port(route->oifindex, route->neighEntry->port);
+	ifindex = __itf_get_from_bridge_port(br_ifindex, route->neighEntry->port);
 
 	if (ifindex <= 0)
 		goto err;

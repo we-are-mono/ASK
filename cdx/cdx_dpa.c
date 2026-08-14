@@ -110,15 +110,79 @@ int cdx_add_oh_iface(char *name)
 
 int add_incoming_iface_info(PCtEntry entry)
 {
-	if (!entry->pRtEntry) 
+	struct _itf *iif;
+
+	if (!entry->pRtEntry) {
+		/* ASK-DIAG: offload attempted with no route entry at all */
+		pr_err_ratelimited("ASK-DIAG add_incoming_iface_info: NO-ROUTE proto=%u sport=%u dport=%u status=0x%04x fftype=0x%02x\n",
+				(unsigned int)entry->proto,
+				(unsigned int)ntohs(entry->Sport),
+				(unsigned int)ntohs(entry->Dport),
+				(unsigned int)entry->status,
+				(unsigned int)entry->fftype);
 		return 1;
-	if (!entry->pRtEntry->input_itf)
+	}
+	/* Prefer the logical input interface, but fall back to the physical
+	 * ingress port when the logical one didn't resolve to a cdx onif
+	 * (e.g. a VLAN on a vlan-aware bridge -- br-lan.N is not a
+	 * registrable onif). The FMan classifier keys on physical port +
+	 * 5-tuple, so the physical ingress alone is a complete discriminator;
+	 * input_itf only fed per-VLAN ingress byte counters. */
+	iif = entry->pRtEntry->input_itf;
+	if (!iif)
+		iif = entry->pRtEntry->underlying_input_itf;
+
+	if (!iif)
 	{
-		DPA_ERROR("%s No Input interface information \n",__func__);
+		PRouteEntry rt = entry->pRtEntry;
+		const char *pn =
+			entry->proto == IPPROTOCOL_TCP ? "TCP"  :
+			entry->proto == IPPROTOCOL_UDP ? "UDP"  :
+			entry->proto == 1              ? "ICMP" :
+			entry->proto == 50             ? "ESP"  :
+			entry->proto == 47             ? "GRE"  : "?";
+
+		/* ASK-DIAG (permanent -- keep in production): neither the logical
+		 * input interface nor the physical ingress port
+		 * (underlying_input_itf) resolved, so the flow has no offloadable
+		 * ingress at all -- typically a router-local flow (iif=0). With
+		 * the VLAN-on-bridge fallback above, a healthy forwarded flow
+		 * never reaches here, so seeing this in production means
+		 * something is genuinely wrong. Full flow identity dumped to
+		 * identify it; rate-limited (fires once per rejected flow). */
+		if (IS_IPV6_FLOW(entry))
+			pr_err_ratelimited("ASK-DIAG no-input-itf: %s %pI6c.%u -> %pI6c.%u %s status=0x%04x fftype=0x%02x route_id=0x%x oif[idx=%u type=0x%x phys=%d] onif_idx=%u underlying_iif[idx=%d] inPhyPort=%u\n",
+				pn,
+				entry->Saddr_v6, (unsigned int)ntohs(entry->Sport),
+				entry->Daddr_v6, (unsigned int)ntohs(entry->Dport),
+				(entry->status & CONNTRACK_ORIG) ? "ORIG" : "REPLY",
+				(unsigned int)entry->status, (unsigned int)entry->fftype,
+				(unsigned int)rt->id,
+				(unsigned int)(rt->itf ? rt->itf->index : 0xff),
+				(unsigned int)(rt->itf ? rt->itf->type : 0),
+				(rt->itf && rt->itf->phys) ? (int)rt->itf->phys->index : -1,
+				(unsigned int)rt->onif_index,
+				rt->underlying_input_itf ? (int)rt->underlying_input_itf->index : -1,
+				(unsigned int)entry->inPhyPortNum);
+		else
+			pr_err_ratelimited("ASK-DIAG no-input-itf: %s %pI4.%u -> %pI4.%u %s status=0x%04x fftype=0x%02x route_id=0x%x oif[idx=%u type=0x%x phys=%d] onif_idx=%u underlying_iif[idx=%d] inPhyPort=%u\n",
+				pn,
+				&entry->Saddr_v4, (unsigned int)ntohs(entry->Sport),
+				&entry->Daddr_v4, (unsigned int)ntohs(entry->Dport),
+				(entry->status & CONNTRACK_ORIG) ? "ORIG" : "REPLY",
+				(unsigned int)entry->status, (unsigned int)entry->fftype,
+				(unsigned int)rt->id,
+				(unsigned int)(rt->itf ? rt->itf->index : 0xff),
+				(unsigned int)(rt->itf ? rt->itf->type : 0),
+				(rt->itf && rt->itf->phys) ? (int)rt->itf->phys->index : -1,
+				(unsigned int)rt->onif_index,
+				rt->underlying_input_itf ? (int)rt->underlying_input_itf->index : -1,
+				(unsigned int)entry->inPhyPortNum);
+
 		return ERR_UNKNOWN_INTERFACE;
 	}
 
-	entry->inPhyPortNum = entry->pRtEntry->input_itf->index;
+	entry->inPhyPortNum = iif->index;
 	return NO_ERR;
 }
 

@@ -894,7 +894,11 @@ void __cmmRouteUpdate(FCI_CLIENT *fci_handle, struct RtEntry *route)
 #ifdef LS1043
 	else
 	{
-		if (__itf_is_bridge(route->oifindex))
+		struct interface *out_itf = __itf_find(route->oifindex);
+
+		if (__itf_is_bridge(route->oifindex) ||
+		    (out_itf && __itf_is_vlan(out_itf) &&
+		     __itf_is_bridge(out_itf->phys_ifindex)))
 		{
 			/* Need to check how to get phys_oifindex to minimize updates */
 			/*if (route->phys_oifindex != route_prev.phys_oifindex)*/

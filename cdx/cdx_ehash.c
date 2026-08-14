@@ -692,13 +692,16 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 
 	while(1) {
 		if ((!entry->pRtEntry) ||
-				(!entry->pRtEntry->input_itf) ||
 				(!entry->pRtEntry->underlying_input_itf)) {
-			DPA_ERROR("%s::%d RtEntry or input_itf or underlying_input_itf is NULL\n",
+			DPA_ERROR("%s::%d RtEntry or underlying_input_itf is NULL\n",
 					__func__, __LINE__);
 			break;
 		}
-		iif_index = entry->pRtEntry->input_itf->index;
+		/* input_itf may be NULL for VLAN-on-bridge ingress; fall back to
+		 * the physical port for the ingress ifstats index. */
+		iif_index = (entry->pRtEntry->input_itf ?
+				entry->pRtEntry->input_itf :
+				entry->pRtEntry->underlying_input_itf)->index;
 		underlying_iif_index = entry->pRtEntry->underlying_input_itf->index;
 
 		iface_info = dpa_get_ifinfo_by_itfid(entry->pRtEntry->itf->index);
