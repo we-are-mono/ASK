@@ -16,19 +16,15 @@
 #include "pppoe.h"
 #include "fpp.h"
 
-#if PPPOE_AUTO_ENABLE
 #include <sys/ioctl.h>
 #include <linux/ppp_defs.h>
 #include <linux/if_ppp.h>
-#endif
 
-#if PPPOE_AUTO_ENABLE
 	#define DEFAULT_AUTO_TIMEOUT    1  // in secs
 
 	#define PPPOE_AUTO_MODE         0x1
 
 	#define PPPIOCSFPPIDLE  _IOW('t', 53, struct ppp_idle)      /* Set the FPP stats */
-#endif
 
 
 /*****************************************************************
@@ -97,7 +93,6 @@ int __cmmGetPPPoESession(FILE *fp, struct interface* ppp_itf)
 		}
 	}
 
-#if PPPOE_AUTO_ENABLE
         if ( !(ppp_itf->itf_flags & ITF_PPPOE_AUTO_MODE))
         {
                 if(__itf_is_up(ppp_itf) && (!(ppp_itf->itf_flags & ITF_PPPOE_SESSION_UP)))
@@ -106,7 +101,6 @@ int __cmmGetPPPoESession(FILE *fp, struct interface* ppp_itf)
                         ppp_itf->itf_flags |= ITF_PPPOE_AUTO_MODE;
                 }
         }
-#endif
 
 
 	return 0;
@@ -159,10 +153,8 @@ int cmmFePPPoEUpdate(FCI_CLIENT *fci_handle, int request, struct interface *itf)
 	memcpy(cmd.macaddr, itf->dst_macaddr, 6);
 	cmd.sessionid = itf->session_id;
 
-#if PPPOE_AUTO_ENABLE
         if( itf->itf_flags & ITF_PPPOE_AUTO_MODE)
                 cmd.mode |= PPPOE_AUTO_MODE;
-#endif
 
 	if (____itf_get_name(itf, cmd.log_intf, sizeof(cmd.log_intf)) < 0)
 	{
@@ -320,7 +312,6 @@ int cmmPPPoEQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_
 	return CLI_OK;
 }
 
-#if PPPOE_AUTO_ENABLE
 
 int cmmPPPoEAutoGetIdle( struct interface* itf , unsigned long* rcv_sec , unsigned long* xmit_sec)
 {
@@ -450,5 +441,4 @@ void cmmPPPoEAutoKeepAlive(void)
         }
         last_pppoe = now;
 }
-#endif
 

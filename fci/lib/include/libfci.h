@@ -29,23 +29,6 @@
 #define NL_KEY_FLOW_GROUP	(1 << 1)
 #define NL_KEY_ALL_GROUP	(NL_KEY_SA_GROUP | NL_KEY_FLOW_GROUP)
 
-#ifndef CMM_SOCK_PID_CMD
-#define CMM_SOCK_PID_CMD 100
-#endif
-
-#ifndef FCI_SOCK_PID_CMD
-#define FCI_SOCK_PID_CMD 200
-#endif
-
-#ifndef CMM_SOCK_PID_EVENT
-#define CMM_SOCK_PID_EVENT 300
-#endif
-
-
-#ifndef FCI_SOCK_PID_EVENT
-#define FCI_SOCK_PID_EVENT 400
-#endif
-
 /* FCI callbacks return codes */
 enum FCI_CB_ACTION {
 	FCI_CB_STOP = 0,		/* stop catching event from FCI */

@@ -131,207 +131,8 @@ uint8_t iface_count;
 uint8_t iface_pppoe_count;
 #define PORTID_SHIFT_VAL	8
 
-#ifdef DEVMAN_DEBUG
-static void display_pool_info(struct port_bman_pool_info *pool_info)
-{
-	DPA_INFO("pool_id          \t%d\n", pool_info->pool_id);
-	DPA_INFO("buffer size      \t%d\n", pool_info->buf_size);
-	DPA_INFO("buffer count     \t%d\n", pool_info->count);
-	DPA_INFO("buffer base      \t%llx\n\n", pool_info->base_addr);
-}
 
-static void display_eth_port_info(struct eth_iface_info *port_info)
-{
-	uint32_t ii;
-
-	DPA_INFO("net dev 	   \t%p\n", port_info->net_dev);
-	DPA_INFO("fman_idx         \t%d\n", port_info->fman_idx);
-	DPA_INFO("port_idx         \t%d\n", port_info->port_idx);
-	DPA_INFO("portid           \t%d\n", port_info->portid);
-	DPA_INFO("speed        	   \t%d\n", port_info->speed);
-	DPA_INFO("rx channel       \t%d\n", port_info->rx_channel_id);
-	DPA_INFO("tx channel       \t%d\n", port_info->tx_channel_id);
-	DPA_INFO("tx wq		   \t%d\n", port_info->tx_wq);
-	DPA_INFO("rx pcd wq	   \t%d\n", port_info->rx_pcd_wq);
-	DPA_INFO("dqrr cb	   \t%p\n", port_info->dqrr);
-	DPA_INFO("mac addr         \t");
-	for (ii = 0; ii < ETH_ALEN; ii++) {
-		if (ii == (ETH_ALEN - 1)) {
-			printk("%02x\n", port_info->mac_addr[ii]);
-		} else {
-			printk("%02x:", port_info->mac_addr[ii]);
-		}
-	}
-	DPA_INFO("receive frame que info\n");
-	DPA_INFO("Error FQ         \t%x\n", 
-			port_info->fqinfo[RX_ERR_FQ].fq_base);
-	DPA_INFO("Default FQ  	\t%x\n", 
-			port_info->fqinfo[RX_DEFA_FQ].fq_base);
-	DPA_INFO("transmit frame que info\n");
-	DPA_INFO("Error FQ         \t%d\n", 
-			port_info->fqinfo[TX_ERR_FQ].fq_base);
-	DPA_INFO("Confirmation FQ  \t%x\n", 
-			port_info->fqinfo[TX_CFM_FQ].fq_base);
-	DPA_INFO("Transmit Fqs\n");
-	for (ii = 0; ii < DPAA_ETH_TX_QUEUES; ii++) {
-		if (!(ii % 16)) 
-			printk("\n\t");
-		printk("%x ", port_info->eth_tx_fqinfo[ii].fq_base);
-	}
-	printk("\n");
-	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
-		if (!(ii % 16)) 
-			printk("\n\t");
-		printk("%x ", port_info->fwd_tx_fqinfo[ii].fqid);
-	}
-	printk("\n");
-	if (port_info->max_dist) {
-		struct cdx_dist_info *dist_info;
-		DPA_INFO("PCD Fqs\n");
-		dist_info = port_info->dist_info;
-		for (ii = 0; ii < port_info->max_dist; ii++) {
-			printk("fq_base         \t%x(%d)\n", dist_info->base_fqid,
-					dist_info->base_fqid);
-			printk("fq_count        \t%d\n", dist_info->count);
-			dist_info++;
-		}
-	}
-	DPA_INFO("\nbuffer pool info, pools %d\n", port_info->num_pools);
-	for (ii = 0; ii < port_info->num_pools; ii++)
-		display_pool_info(&port_info->pool_info[ii]);
-}
-
-static void display_vlan_info(struct vlan_iface_info *vlan_info)
-{
-	DPA_INFO("vlan_id		\t%d\n", vlan_info->vlan_id);
-	DPA_INFO("parent		\t%s\n",
-			vlan_info->parent->name);
-#ifdef INCLUDE_VLAN_IFSTATS
-	if (vlan_info->stats) {
-		DPA_INFO("vlan stats		\t%x\n", vlan_info->stats);
-		DPA_INFO("vlan stats idx	\t%d\n", vlan_info->stats_index);
-		DPA_INFO("vlan rxpkts		\t%ld\n", 
-				cpu_to_be32(vlan_info->stats->rxstats.pkts));
-		DPA_INFO("vlan rxbytes		\t%ld\n", 
-				cpu_to_be64(vlan_info->stats->rxstats.bytes));
-		DPA_INFO("vlan txpkts		\t%ld\n", 
-				cpu_to_be32(vlan_info->stats->txstats.pkts));
-		DPA_INFO("vlan txbytes		\t%ld\n", 
-				cpu_to_be64(vlan_info->stats->txstats.bytes));
-	}
-#else
-	DPA_INFO("vlan iface stats disabled\n");
-#endif
-}
-
-static void display_pppoe_info(struct pppoe_iface_info *pppoe_info)
-{
-	uint32_t ii;
-
-	DPA_INFO("session_id		\t%d\n", pppoe_info->session_id);
-	DPA_INFO("dest mac address	\t:");
-	for (ii = 0; ii < ETH_ALEN; ii++) {
-		if (ii == (ETH_ALEN - 1)) {
-			printk("%02x\n", pppoe_info->mac_addr[ii]);
-		} else {
-			printk("%02x:", pppoe_info->mac_addr[ii]);
-		}
-	}
-	DPA_INFO("session id		\t%d\n",
-			pppoe_info->session_id);
-	DPA_INFO("parent		\t%s\n",
-			pppoe_info->parent->name);
-#ifdef INCLUDE_PPPoE_IFSTATS
-	if (pppoe_info->stats) {
-		DPA_INFO("pppoe stats		\t%x\n", pppoe_info->stats);
-		DPA_INFO("pppoe stats idx	\t%d\n", pppoe_info->stats_index);
-		DPA_INFO("pppoe rx_pkts		\t%ld\n", 	
-				cpu_to_be32(pppoe_info->stats->rxstats.pkts));
-		DPA_INFO("pppoe rx_bytes	\t%ld\n", 
-				cpu_to_be64(pppoe_info->stats->rxstats.bytes));
-		DPA_INFO("pppoe rx_timestamp	\t%ld\n", 
-				cpu_to_be64(pppoe_info->stats->rxstats.timestamp));
-		DPA_INFO("pppoe tx_pkts		\t%ld\n", 
-				cpu_to_be32(pppoe_info->stats->txstats.pkts));
-		DPA_INFO("pppoe tx_bytes	\t%ld\n", 
-				cpu_to_be64(pppoe_info->stats->rxstats.bytes));
-		DPA_INFO("pppoe tx_timestamp	\t%ld\n", 
-				cpu_to_be64(pppoe_info->stats->txstats.timestamp));
-	}
-#else
-	DPA_INFO("pppoe ifstats disabled\n");
-#endif
-}
-
-static void display_tunnel_info(struct tunnel_iface_info *tunnel_info) 
-{
-#ifdef TUNNEL_IF_SUPPORT
-
-	DPA_INFO("mode		\t%d\n", tunnel_info->mode);
-	DPA_INFO("proto		\t%d\n", tunnel_info->proto);
-	DPA_INFO("parent	\t%s\n", tunnel_info->parent->name);
-	DPA_INFO("local ip::");
-	display_ipv4_addr(tunnel_info->local_ip);
-	DPA_INFO("remote ip::");
-	display_ipv4_addr(tunnel_info->remote_ip);
-	DPA_INFO("dest mac::");
-	display_mac_addr(tunnel_info->dstmac);
-	DPA_INFO("tunnel header - len %d ::\n", tunnel_info->header_size);
-	display_buff_data(tunnel_info->header, tunnel_info->header_size);
-#ifdef INCLUDE_TUNNEL_IFSTATS
-	if (tunnel_info->stats) {
-		DPA_INFO("tunnel stats		\t%x\n", tunnel_info->stats);
-		DPA_INFO("tunnel stats idx	\t%d\n", tunnel_info->stats_index);
-		DPA_INFO("tunnel rxpkts		\t%ld\n", 
-				cpu_to_be32(tunnel_info->stats->rxstats.pkts));
-		DPA_INFO("tunnel rxbytes	\t%ld\n", 
-				cpu_to_be64(tunnel_info->stats->rxstats.bytes));
-		DPA_INFO("tunnel txpkts		\t%ld\n", 
-				cpu_to_be32(tunnel_info->stats->txstats.pkts));
-		DPA_INFO("tunnel txbytes	\t%ld\n", 
-				cpu_to_be64(tunnel_info->stats->txstats.bytes));
-	}
-#else
-	DPA_INFO("tunnel ifstats disabled\n");
-#endif
-#endif
-}
-#endif
-
-#ifdef DEVMAN_DEBUG
-void display_iface_info(struct dpa_iface_info *iface_info)
-{
-
-	DPA_INFO(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n");
-	DPA_INFO("port             \t%s\n", iface_info->name);
-	DPA_INFO("osindex          \t%d\n", iface_info->osid);
-	DPA_INFO("mtu         	 \t%d\n", iface_info->mtu);
-	if (iface_info->if_flags & IF_TYPE_ETHERNET) {
-		display_eth_port_info(&iface_info->eth_info);
-		return;
-	}
-	if (iface_info->if_flags & IF_TYPE_VLAN) {
-		display_vlan_info(&iface_info->vlan_info);
-		return;
-	}
-	if (iface_info->if_flags & IF_TYPE_PPPOE) {
-		display_pppoe_info(&iface_info->pppoe_info);
-		return;
-	}
-	if (iface_info->if_flags & IF_TYPE_TUNNEL) {
-		display_tunnel_info(&iface_info->tunnel_info);
-		return;
-	}
-	if (iface_info->if_flags & IF_TYPE_OFPORT) {
-		display_ohport_info(&iface_info->oh_info);
-		return;
-	}
-	DPA_INFO("%s::unsupported iface type flags %x\n",
-			__func__, iface_info->if_flags);
-}
-#else
 #define display_iface_info(x)
-#endif
 
 
 //create frame queues for the port used to transmit packets from ENQ action
@@ -1360,7 +1161,6 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 			if(iface_info->tunnel_info.mode == TNL_MODE_4O6)
 			{
 				//if(is_ipv6_addr_any(l3_info->remote_ip))
-				//memcpy(&l3_info->header_v6.DestinationAddress, tnl_rt_entry->Daddr_v6, IPV6_ADDRESS_LENGTH);
 			}
 			/*
 				 else if (iface_info->tunnel_info.mode == TNL_MODE_6O4)
@@ -1406,22 +1206,13 @@ int dpa_get_num_vlan_iface_stats_entries(uint32_t iif, uint32_t underlying_iif,
 		if (iface_info->itf_id  == iif) {
 check_parent:
 			if (iface_info->if_flags & IF_TYPE_ETHERNET) {
-#ifdef DEVMAN_DEBUG
-				printk("%s::eth if, max %d\n", __func__, max_stats);
-#endif
 				return SUCCESS;
 			}
 			if (iface_info->if_flags & IF_TYPE_WLAN) {
-#ifdef DEVMAN_DEBUG
-				printk("%s::wlan if, max %d\n", __func__, max_stats);
-#endif
 				return SUCCESS;		
 			}
 			if (iface_info->if_flags & IF_TYPE_VLAN)
 			{
-#ifdef DEVMAN_DEBUG
-				printk("%s::vlan if, max %d\n", __func__, max_stats);
-#endif
 				(*num_entries)++;
 				iface_info = iface_info->vlan_info.parent;
 				goto check_parent;
@@ -1806,16 +1597,10 @@ static int dpa_get_iface_stats(struct dpa_iface_info *iface_info,
 {
 	if (stats_type == TX_IFSTATS) {
 		**offset = iface_info->txstats_index;
-#ifdef devman_debug 
-		DPA_INFO("%s::tx offset %d\n", __function__, **offset);
-#endif
 		if (iface_type == IF_TYPE_VLAN)
 			(*offset)--;
 	} else {
 		**offset = iface_info->rxstats_index;
-#ifdef devman_debug 
-		DPA_INFO("%s::rx offset %d\n", __function__, **offset);
-#endif
 		if (iface_type == IF_TYPE_VLAN)
 			(*offset)++;
 	}
@@ -2270,20 +2055,8 @@ int dpa_add_eth_if(char *name, struct _itf *itf, struct _itf *phys_itf)
 				__func__);
 		goto err_ret7;
 	}
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	/* Create Ethernet interface voip frame queues */
-	if (dpa_create_eth_if_voip_fqs(iface_info)) {
-		DPA_ERROR("%s::%d Ethernet interface voip frame queues creation failed\n",
-				__func__, __LINE__);
-		goto err_ret8;
-	}
-#endif
 	iface_count++;
 	return SUCCESS;
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-err_ret8:
-	destroy_fwd_tx_fqs(iface_info);
-#endif
 err_ret7:
 #ifdef ENABLE_EGRESS_QOS
 	cdx_disable_ceetm_on_iface(iface_info);
@@ -2739,9 +2512,6 @@ int dpa_update_tunnel_if(itf_t *itf,  itf_t *phys_itf, PTnlEntry pTunnelEntry)
 
 	spin_unlock(&dpa_devlist_lock);
 	return SUCCESS;
-#else
-	DPA_ERROR("%s::tunnel interfaces not supported\n", __func__); 
-	return FAILURE;
 #endif
 }
 
@@ -2837,9 +2607,6 @@ int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry)
 	return SUCCESS;
 err_ret:
 	kfree(iface_info);
-	return FAILURE;
-#else
-	DPA_ERROR("%s::tunnel interfaces not supported\n", __func__); 
 	return FAILURE;
 #endif
 }

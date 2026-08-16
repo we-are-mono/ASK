@@ -32,7 +32,6 @@
 #include "route_cache.h"
 #include "module_rx.h"
 
-#if defined(LS1043)
 struct gemac_port port_table[GEM_PORTS] = {
 				   {"eth0", "wan", GEMAC_PORT_TYPE_WAN, 0, GEMAC0_PORT, 1},
 				   {"eth1", "lan1", GEMAC_PORT_TYPE_LAN, 0, GEMAC0_PORT + 1 , 1},
@@ -42,29 +41,6 @@ struct gemac_port port_table[GEM_PORTS] = {
 				   {"eth5", "wan3", GEMAC_PORT_TYPE_WAN, 0, GEMAC0_PORT + 5, 1},
 				   {"eth6", "wan5", GEMAC_PORT_TYPE_WAN, 0, GEMAC0_PORT + 6, 1}
 				};
-#elif defined(COMCERTO_2000) && !defined(LS1012A)
-struct gemac_port port_table[GEM_PORTS] = {
-				   {"eth0", "wan", GEMAC_PORT_TYPE_WAN, 0, GEMAC0_PORT, 1},
-				   {"eth2", "lan", GEMAC_PORT_TYPE_LAN, 0, GEMAC1_PORT, 1},
-				   {"eth3", "wan1", GEMAC_PORT_TYPE_WAN, 0, GEMAC2_PORT, 1}
-				};
-#elif defined(LS1012A)
-struct gemac_port port_table[GEM_PORTS] = {
-				   {"eth0", "wan", GEMAC_PORT_TYPE_WAN, 0, GEMAC0_PORT, 1},
-				   {"eth2", "lan", GEMAC_PORT_TYPE_LAN, 0, GEMAC1_PORT, 1},
-				};
-#elif defined(LS1088)
-struct gemac_port port_table[GEM_PORTS] = {
-				   {"eth0", "wan", GEMAC_PORT_TYPE_WAN, 0, GEMAC0_PORT, 1},
-				   {"eth2", "lan", GEMAC_PORT_TYPE_LAN, 0, GEMAC1_PORT, 1},
-				   {"eth3", "lan", GEMAC_PORT_TYPE_LAN, 0, GEMAC1_PORT, 1},
-				};
-#else
-struct gemac_port port_table[GEM_PORTS] = {
-				   {"eth0", "wan", GEMAC_PORT_TYPE_WAN, 0, GEMAC0_PORT, 1},
-				   {"eth2", "lan", GEMAC_PORT_TYPE_LAN, 0, GEMAC1_PORT, 1}
-				};
-#endif
 
 struct interface_table itf_table;
 
@@ -527,8 +503,6 @@ static struct interface *__itf_add(struct interface_table *ctx, int ifindex)
 
 	memset(itf, 0, sizeof(struct interface));
 
-	itf->count = 0;
-
 	list_head_init(&itf->addr_list);
 #ifdef VLAN_FILTER
 	/* Default vlan filtering configuration */
@@ -663,21 +637,14 @@ static void __updatelink(struct interface_table *ctx, struct ifinfomsg *ifi, str
 		}
 		else if (____itf_is_bridge( itf ))
 		{
-#if defined(LS1043)
-			cmmFeUpdateAllBridgedIfs(ctx->fci_handle, ctx->fd, itf);
-#else
-#ifdef WIFI_ENABLE	
-			if (__itf_is_up(itf))	
-				cmmFeWiFiBridgeUpdate(ctx->fci_handle, ctx->fd, ADD, itf);
-#endif
-#endif
+			cmmFeUpdateAllBridgedIfs(ctx->fci_handle, itf);
 		}
 
 #if defined(LS1043)
 		if ( ((was_bridged_port) && !__itf_is_bridged_port(itf)) || ((!was_bridged_port) && __itf_is_bridged_port(itf)))
 		{
 			itf->flags |= FPP_NEEDS_UPDATE;
-			cmmFeBridgedIfUpdate(ctx->fci_handle, ctx->fd, itf);
+			cmmFeBridgedIfUpdate(ctx->fci_handle, itf);
 		}
 #endif
 	}
@@ -891,16 +858,10 @@ struct interface *__itf_get(int ifindex)
 			goto err;
 	}
 
-//	itf->count++;
-
 	return itf;
 
 err:
 	return NULL;
-}
-
-void __itf_put(struct interface *itf)
-{
 }
 
 /* itf_match_src_ipaddr
@@ -940,7 +901,6 @@ int itf_match_src_ipaddr(int ifindex, int family, unsigned int *ipaddr )
 		}
 	}
 
-	__itf_put(itf);
 out:
 	return rc;
 }
@@ -975,8 +935,6 @@ int itf_get_ipaddr(int ifindex, int family, unsigned char scope, unsigned int *i
 			break;
 		}
 	}
-
-	__itf_put(itf);
 
 unlock:
 #ifdef IPSEC_FLOW_CACHE
@@ -1022,7 +980,6 @@ int itf_get_macaddr(int ifindex, unsigned char *macaddr)
 
 	rc = __itf_get_macaddr(itf, macaddr);
 
-	__itf_put(itf);
 
 unlock:
 #ifdef IPSEC_FLOW_CACHE
@@ -1395,14 +1352,12 @@ int itf_table_init(struct interface_table *ctx)
 		goto err3;
 	}
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	ctx->fci_key_handle = fci_open(FCILIB_KEY_TYPE, 0);
 	if (!ctx->fci_key_handle)
 	{
 		cmm_print(DEBUG_ERROR, "%s::%d: fci_open() %s\n", __func__, __LINE__, strerror(errno));
 		goto err4;
 	}
-#endif
 
 #ifdef WIFI_ENABLE
 	cmmWiFiReset(ctx->fci_handle);
@@ -1414,10 +1369,8 @@ int itf_table_init(struct interface_table *ctx)
 
 	return 0;
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 err4:
 	fci_close(ctx->fci_handle);
-#endif
 
 err3:
 	cmm_rtnl_close(&ctx->rth);

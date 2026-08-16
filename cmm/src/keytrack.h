@@ -117,27 +117,11 @@ struct flowi6 {
 	__u32                   mp_hash;
 }__attribute__((__aligned__(8)));
 
-struct flowidn {
-	struct flowi_common	__fl_common;
-	#define flowidn_oif		__fl_common.flowic_oif
-	#define flowidn_iif		__fl_common.flowic_iif
-	#define flowidn_mark		__fl_common.flowic_mark
-	#define flowidn_scope		__fl_common.flowic_scope
-	#define flowidn_proto		__fl_common.flowic_proto
-	#define flowidn_flags		__fl_common.flowic_flags
-	__le16			daddr;
-	__le16			saddr;
-	union flowi_uli		uli;
-	#define fld_sport		uli.ports.sport
-	#define fld_dport		uli.ports.dport
-};
-
 struct flowi {
 	union {
 		struct flowi_common	__fl_common;
 		struct flowi4		ip4;
 		struct flowi6		ip6;
-		struct flowidn		dn;
 	} u;
 	#define flowi_oif	u.__fl_common.flowic_oif
 	#define flowi_iif	u.__fl_common.flowic_iif
@@ -177,7 +161,6 @@ typedef struct netkey_sa_update_cmd{
 #define FLOW_DIR_OUT    1  // Output flow to be sent out with ipsec policy applied 
 #define FLOW_DIR_FWD    2  // Forwarded flow for all traffic getting forwarded
 
-#define FLOW_DIR_IN_BITVAL (1 << FLOW_DIR_IN)
 #define FLOW_DIR_OUT_BITVAL (1 << FLOW_DIR_OUT)
 #define FLOW_DIR_FWD_BITVAL (1 << FLOW_DIR_FWD)
 

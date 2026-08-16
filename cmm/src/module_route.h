@@ -14,7 +14,6 @@
 #ifndef __MODULE_ROUTE_H__
 #define __MODULE_ROUTE_H__
 
-	void cmmRouteShowPrintHelp();
 	int cmmRouteShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 	void cmmRouteSetPrintHelp();
 	int cmmRouteSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);

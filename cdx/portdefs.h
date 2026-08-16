@@ -22,7 +22,6 @@
 
 #define ETH_ALEN		6	
 #define MAX_PORT_BMAN_POOLS     8	//max bman pools per port
-#define MAX_POSSIBLE_POOLS	64	//max possible bman pools on SOC
 
 #ifndef ENABLE_EGRESS_QOS
 #define DPAA_FWD_TX_QUEUES	8	/* max forwarding(PCD) queues per port */
@@ -86,10 +85,6 @@ struct eth_iface_info {
 	struct cdx_dist_info *dist_info;//pointer to array of pcd dist
 	struct dpa_fq *defa_rx_dpa_fq; //default rx fq pointer
 	struct dpa_fq *err_rx_dpa_fq;  //rx err fq pointer
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	struct dpa_fq	*voip_fqs;
-	uint8_t	ucNumFqs;
-#endif
 };
 
 //offline port device information
@@ -190,9 +185,6 @@ struct dpa_iface_info {
 
 
 //flags field values in struct oh_port_fq_td_info
-#define IPV4_TBL_VALID          (1 << 0)
-#define IPV6_TBL_VALID          (1 << 1)
-#define ETHERNET_TBL_VALID      (1 << 2)
 #define OF_FQID_VALID           (1 << 8)
 #define IN_USE                  (1 << 9)
 #define PORT_VALID              (1 << 16)
@@ -213,13 +205,11 @@ void free_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface);
 int get_ofport_portid(uint32_t fm_idx, uint32_t handle, uint32_t *portid);
 int get_ofport_info(uint32_t fm_idx, uint32_t handle, uint32_t *channel, void **td);
 int get_ofport_max_dist(uint32_t fm_idx, uint32_t handle, uint32_t* max_dist);
-int dpa_get_wan_port(uint32_t fm_index, uint32_t *port_idx);
 int get_phys_port_poolinfo_bysize(uint32_t size, struct port_bman_pool_info *pool_info);
 int alloc_offline_port(uint32_t fm_idx, uint32_t type, qman_cb_dqrr defa_rx, qman_cb_dqrr err_rx);
 int get_oh_port_pcd_fqinfo(uint32_t fm_idx, uint32_t handle, uint32_t type,
 			uint32_t *pfqid, uint32_t *count);
 int ohport_set_ofne(uint32_t handle, uint32_t nia_val);
-int ohport_set_dma(uint32_t handle, uint32_t val);
 int release_offline_port(uint32_t fm_idx, int handle);
 int get_dpa_oh_iface_info(struct oh_iface_info *iface_info, char *name);
 int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags);
@@ -240,11 +230,4 @@ void  dpa_iface_stats_reset(struct dpa_iface_info *iface_info, struct iface_stat
 struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *markval);
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void *markval);
 int dpaa_is_oh_port(uint32_t portid);
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-int dpa_create_eth_if_voip_fqs(struct dpa_iface_info *iface_info);
-int dpa_get_rtp_qos_slowpath_fq(struct eth_iface_info *eth_info/*struct qman_fq *voip_fqs*/, 
-				uint16_t usHash, uint32_t *puiFqId);
-int create_voip_fqs(struct dpa_iface_info *iface_info, uint8_t ucChannelType,
-		uint32_t usCpuMask, uint16_t usNoFqs/*, uint16_t *usCreatedFqs*/);
-#endif
 #endif

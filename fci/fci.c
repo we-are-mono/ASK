@@ -27,8 +27,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mindspeed Technologies");
 MODULE_DESCRIPTION("Fast Control Interface");
 
-static char __initdata fci_version[] = "0.04";
-
 /* Statics functions prototypes */
 static int fci_fe_inbound_parser(FCI_MSG *fci_msg, FCI_MSG *fci_rep);
 static int fci_fe_register(void);
@@ -36,7 +34,6 @@ static void fci_fe_unregister(void);
 
 static void __fci_fe_inbound_data(struct sk_buff *skb);
 
-static int fci_type_to_nl_type (int fci_nl_type);
 static int fci_fe_init(void);
 static void fci_fe_exit(void);
 
@@ -82,8 +79,6 @@ static int fci_init(void)
 	if ((this_fci = kmalloc (sizeof (FCI), GFP_KERNEL)) == NULL)
 	{
 		printk(KERN_ERR "FCI: out of memory (%zu)\n", sizeof (FCI));
-
-//		this_fci->stats.mem_alloc_err++;
 		rc = -ENOMEM;
 		goto err0;
 	}
@@ -124,8 +119,6 @@ static void fci_exit(void)
 static int fci_open_netlink (unsigned long proto)
 {
 
-	FCI_PRINTK(FCI_NL, "fci_open_netlink() FCI type %ld\n", proto);
-
 	if(proto == FCI_NL_FF)
 	{
 		struct netlink_kernel_cfg cfg = {
@@ -164,8 +157,6 @@ static void fci_close_netlink (unsigned long proto)
  */
 static void fci_outbound_unicast(int nl_type, struct sk_buff *skb, u32 pid)
 {
-	FCI_PRINTK(FCI_OUTBOUND, "%s: size=%d bytes, FCI nl_sock_type %d pid %u\n", __func__, skb->len, fci_type_to_nl_type(nl_type), pid);
-
 	NETLINK_CB(skb).portid = 0;	/* from kernel */
 
 	/* unicast */
@@ -190,8 +181,6 @@ static int fci_outbound_multicast(int nl_type, struct sk_buff *skb, int group)
 {
 	gfp_t allocation = in_interrupt() ? GFP_ATOMIC : GFP_KERNEL;
 	int rc = 0;
-
-	FCI_PRINTK(FCI_OUTBOUND, "%s: size=%d bytes, FCI nl_sock_type %d group %x\n", __func__, skb->len, fci_type_to_nl_type(nl_type), group);
 
 	NETLINK_CB(skb).portid = 0;	/* from kernel */
 
@@ -244,8 +233,6 @@ static void fci_outbound_err(int nl_type, struct sk_buff *skb, u32 pid, struct n
 	struct nlmsgerr *errmsg;
 	struct nlmsghdr *rep;
 
-	FCI_PRINTK(FCI_OUTBOUND, "%s: size=%d bytes, FCI nl_sock_type %d pid %u\n", __func__, skb->len, fci_type_to_nl_type(nl_type), pid);
-
 	rep = __nlmsg_put(skb, pid, nlh->nlmsg_seq,
 			NLMSG_ERROR, sizeof(struct nlmsgerr), 0);
 
@@ -271,31 +258,6 @@ static void fci_outbound_err(int nl_type, struct sk_buff *skb, u32 pid, struct n
 
 	this_fci->stats.sock_stats[nl_type].tx_msg++;
 }
-
-
-/*
- * fci_type_to_nl_type -
- *
- *
- */
-static int fci_type_to_nl_type (int fci_nl_type)
-{
-	int nl_type;
-
-	switch (fci_nl_type)
-	{
-	case FCI_NL_FF:
-		nl_type = NETLINK_FF;
-		break;
-
-	default:
-		nl_type = -1;
-		break;
-	}
-
-	return nl_type;
-}
-
 
 
 /****************************** Fast Forward Support ********************************/
@@ -408,8 +370,6 @@ static int fci_outbound_fe_data(u16 fcode, u16 len, u16 *payload)
 	FCI_MSG *fci_msg;
 	int rc;
 
-	FCI_PRINTK(FCI_OUTBOUND, "\nFCI: fci_outbound_fe_data()\n");
-
 	skb = fci_alloc_msg();
 	if (!skb)
 	{
@@ -449,8 +409,6 @@ static void __fci_fe_inbound_data(struct sk_buff *skb)
 	FCI_MSG *fci_msg, *fci_rep;
 	int rc;
 	size_t payload_bytes;
-
-	FCI_PRINTK(FCI_INBOUND, "FCI: %s\n", __func__);
 
 	/* The skb must physically carry at least a netlink header plus the
 	 * FCI header before anything below can dereference either. */
@@ -544,8 +502,6 @@ static int fci_fe_inbound_parser(FCI_MSG *fci_msg, FCI_MSG *fci_rep)
 {
 	int rc = 0;
 
-	FCI_PRINTK(FCI_INBOUND, "FCI: fci_fe_inbound_parser()\n");
-
 	fci_rep->length = 0;
 	rc = comcerto_fpp_send_command(fci_msg->fcode, fci_msg->length, fci_msg->payload, &fci_rep->length, fci_rep->payload);
 
@@ -579,7 +535,6 @@ static int fci_proc_single_open(struct seq_file *m, void *v)
 	seq_printf(m, "Errors:\n");
 	seq_printf(m, "Memory allocation errors:%ld\n", this_fci->stats.mem_alloc_err);
 	seq_printf(m, "Kernel socket creation errors:%ld\n", this_fci->stats.kernel_create_err);
-	seq_printf(m, "Unknow socket type:%ld\n", this_fci->stats.unknown_sock_type);
 
 	return 0;
 
@@ -604,8 +559,6 @@ static int fci_module_init(void)
 {
 	int rc;
 
-	FCI_PRINTK(FCI_INIT, "Initializing Fast Control Interface v%s\n", fci_version);
-
 	if((rc = fci_init()) < 0)
 	{
 		printk(KERN_ERR "FCI: fci init failed\n");
@@ -626,8 +579,6 @@ static int fci_module_init(void)
  */
 static void fci_module_exit(void)
 {
-	FCI_PRINTK(FCI_INIT, "Unloading Fast Control Interface\n");
-
 	/* Remove /proc/fci entry */
 	remove_proc_entry("fci", NULL);
 

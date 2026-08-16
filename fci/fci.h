@@ -21,25 +21,6 @@
 extern int comcerto_fpp_send_command(unsigned short fcode, unsigned short length, unsigned short *payload, unsigned short *, unsigned short *);
 extern int comcerto_fpp_register_event_cb(void *cb);
 
-/*
-* Debug macros
-*/
-
-#define FCI_PRINT	0
-#define FCI_INIT	0
-#define FCI_STAT	0
-#define FCI_OUTBOUND	0
-#define FCI_INBOUND	0
-#define FCI_DUMP	0
-#define FCI_NL		0
-#define FCI_ACK		0
-
-#ifdef FCI_PRINT
-#define FCI_PRINTK(type, info, args...) do {if(type) printk(KERN_DEBUG info, ## args);} while(0);
-#else
-#define FCI_PRINTK(type, info, args...) do {} while(0);
-#endif
-
 /* Supported netlink protocol type NETLINK_FF */
 #define FCI_NL_FF		0
 #define FCI_MAX_PROTO		1

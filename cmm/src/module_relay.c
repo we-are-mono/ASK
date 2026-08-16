@@ -34,8 +34,6 @@ pthread_mutex_t RelayMutex = PTHREAD_MUTEX_INITIALIZER;
 *
 *************************************************************/
 
-#if 1
-
 static int cmmGetIfMac(unsigned char *ifname, unsigned char *mac){
     struct ifreq ifr;
     int fd;
@@ -211,7 +209,6 @@ static int cmmRelayAdd(FCI_CLIENT * fci_handler, struct fpp_relay_info *sh, u_in
     cmd->relaysesID = sh->relaysesID;
     memcpy(cmd->peermac2, sh->peermac2, 6);
     memcpy(cmd->opifname, out_ifname, IFNAMSIZ);
-#if 1
     cmm_print(DEBUG_INFO,
               "Sending command %02x:%02x:%02x:%02x:%02x:%02x(%s %d) to %02x:%02x:%02x:%02x:%02x:%02x(%s %d)\n",
               cmd->peermac1[0], cmd->peermac1[1], cmd->peermac1[2],
@@ -220,7 +217,6 @@ static int cmmRelayAdd(FCI_CLIENT * fci_handler, struct fpp_relay_info *sh, u_in
               cmd->peermac2[1], cmd->peermac2[2], cmd->peermac2[3],
               cmd->peermac2[4], cmd->peermac2[5], cmd->opifname,
               cmd->relaysesID);
-#endif
     ret = fci_cmd(fci_handler, FPP_CMD_PPPOE_RELAY_ENTRY, cmd, sizeof(*cmd), res_buf, res_len);
     if (ret != 0 || res_buf[0] != FPP_ERR_OK)
     {
@@ -247,7 +243,6 @@ static int cmmRelayAdd(FCI_CLIENT * fci_handler, struct fpp_relay_info *sh, u_in
     __pthread_mutex_unlock(&RelayMutex);
     return ret;
 }
-#endif
 static int cmmRelayRemove(FCI_CLIENT * fci_handler,fpp_relay_info_t *sh, u_int16_t *res_buf, u_int16_t *res_len);
 
 int cmmRelayProcessClientCmd(FCI_CLIENT * fci_handle, int function_code,
@@ -352,7 +347,6 @@ static int cmmRelayRemove(FCI_CLIENT * fci_handler,fpp_relay_info_t *sh, u_int16
     cmd = temp->pppoe;
     cmd->action = FPP_ACTION_DEREGISTER;
 
-#if 1
     cmm_print(DEBUG_INFO,
               "Removing Entry %02x:%02x:%02x:%02x:%02x:%02x(%s %d) to %02x:%02x:%02x:%02x:%02x:%02x(%s %d)\n",
               cmd->peermac1[0], cmd->peermac1[1], cmd->peermac1[2],
@@ -361,7 +355,6 @@ static int cmmRelayRemove(FCI_CLIENT * fci_handler,fpp_relay_info_t *sh, u_int16
               cmd->peermac2[1], cmd->peermac2[2], cmd->peermac2[3],
               cmd->peermac2[4], cmd->peermac2[5], cmd->opifname,
               cmd->relaysesID);
-#endif
 
     ret = fci_cmd(fci_handler, FPP_CMD_PPPOE_RELAY_ENTRY, cmd, sizeof(fpp_pppoe_relay_cmd_t), res_buf, res_len);
     if (ret != 0 || (res_buf[0] != FPP_ERR_OK && res_buf[0] != FPP_ERR_PPPOE_ENTRY_NOT_FOUND))	

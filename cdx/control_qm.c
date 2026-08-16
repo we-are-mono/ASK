@@ -23,8 +23,6 @@
 QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
 
-//uncomment to disable Egress QOS 
-//#define DISABLE_EGRESS_QOS	1
 
 /** QOS command executer.
  * This function is the QOS handler function / the entry point

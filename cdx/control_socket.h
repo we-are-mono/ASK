@@ -26,7 +26,6 @@ extern struct slist_head sockid_cache[];
 
 enum {
 	SOCK_OWNER_RTP_RELAY,
-	SOCK_OWNER_NATT,
 	SOCK_OWNER_NONE = 0xff
 };
 
@@ -36,16 +35,6 @@ enum {
 #define SOCKET_UPDATE	3
 
 #define SOCKET_UNCONNECTED	1
-#define SOCKET_CONNECTED		0
-#define SOCKET_UNCONNECTED_WO_SRC  2
-
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-struct eh_table_handle{
-	void 		*td;
-	void 		*eeh_entry_handle;
-	uint16_t 	 eeh_entry_index;
-};
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 
 // IPv4/v6 control path SW socket entry
 typedef struct _tSockEntry{
@@ -53,7 +42,6 @@ typedef struct _tSockEntry{
 	struct slist_entry 	list_id;
 	U16 hash;
 	U16 hash_by_id;
-	U32 nextid;
 	U16 SocketID;
 	U8 SocketFamily;
 	U8 SocketType;	/** 1 -> to ACP  /  0 -> to LAN or WAN (based on pRtEntry) */
@@ -68,9 +56,6 @@ typedef struct _tSockEntry{
 	U32 route_id;
 	U16 Sport;
 	U16 Dport;
-	U8 initial_takeover_done;
-	BOOL qos_enable;
-	U8 rtpqos_slot;
 
 	U8 proto;
 	U8 unconnected;
@@ -85,17 +70,11 @@ typedef struct _tSockEntry{
 			U32 Daddr_v6[4];
 		};
 	};
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	U16 iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	U16 secure;
 	U16 SA_nr_rx;
 	U16 SA_handle_rx[SA_MAX_OP];
 	U16 SA_nr_tx;
 	U16 SA_handle_tx[SA_MAX_OP];
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	struct eh_table_handle SktEhTblHdl; /*This structure stores the MSP socket(slow path voice traffic) Extended hash table handle entries. */
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 }SockEntry, *PSockEntry;
 
 typedef SockEntry Sock6Entry;
@@ -158,13 +137,9 @@ void socket6_free(PSock6Entry pSocket);
 void socket4_free(PSockEntry pSocket);
 PSockEntry SOCKET_bind(U16 socketID, PVOID owner, U16 owner_type);
 PSockEntry SOCKET_unbind(U16 socketID);
-PSockEntry SOCKET_find_entry_by_id(U16 socketID);
 
 void socket4_update(PSockEntry pSocket, u8 event);
 void socket6_update(PSock6Entry pSocket, u8 event);
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket);
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 
 int socket_init(void);
 void socket_exit(void);

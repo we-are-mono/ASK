@@ -18,7 +18,6 @@
 #include "control_ipsec.h"
 #include "fm_ehash.h"
 
-#define hw_ct_set_active(ct, val)
 
 /*
  * Concurrency:
@@ -66,7 +65,6 @@ PCT_PAIR ct_alloc(void)
 	ppair = kzalloc(sizeof(CT_PAIR), GFP_KERNEL);
 	if (!ppair)
 		return NULL;
-	memset(ppair, 0, sizeof(CT_PAIR));
 	pEntry_orig = &ppair->orig;
 	pEntry_rep = &ppair->repl;
 
@@ -290,11 +288,6 @@ static void ct_update_one(PCtEntry pEntry)
 					if(((sa = M_ipsec_sa_cache_lookup_by_h(pEntry->hSAEntry[i])) != NULL) &&
 							(sa->direction == CDX_DPA_IPSEC_OUTBOUND ))
 					{
-#ifdef IPV4_CONTROL_DEBUG
-						printk("%s(%d) enque fqid %x, SA tosec fqid %x\n",
-								__func__,__LINE__,be32_to_cpu(param->fqid),
-								sa->pSec_sa_context->to_sec_fqid);
-#endif
 						param->fqid = cpu_to_be32(sa->pSec_sa_context->to_sec_fqid);
 						break;
 					}
@@ -439,10 +432,6 @@ cdx_timer_t ct_get_time_remaining(PCT_PAIR ppair)
 	PCtEntry pEntry_orig = &ppair->orig;
 	PCtEntry pEntry_rep = &ppair->repl;
 	TIMER_ENTRY *timer = &ppair->timer;
-#ifndef ENABLE_FLOW_TIME_STAMPS
-	//for debug only, if timestamping is not nabled do not age connections
-	return 1; 
-#endif
 	if (IS_BIDIR(pEntry_orig, pEntry_rep))
 	{
 		ct_timer_refresh(pEntry_orig);
@@ -984,7 +973,7 @@ static int IP_HandleIP_ROUTE_RESOLVE(U16 *p, U16 Length)
 			if (!onif_desc) 
 				return ERR_UNKNOWN_INTERFACE;
 
-			pRtEntry = L2_route_add(RtCmd.id, 0);
+			pRtEntry = L2_route_add(RtCmd.id);
 
 			if (!pRtEntry)
 				return ERR_NOT_ENOUGH_MEMORY;
@@ -1396,9 +1385,6 @@ static const struct cdx_cmd_spec ipv4_cmd_table[] = {
 
 static U16 M_ipv4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 {
-#ifdef IPV4_CMD_DEBUG_
-	printk(KERN_DEBUG "%s: cmd_code=0x%04x, cmd_len=%d\n", __func__, cmd_code, cmd_len);
-#endif
 	return cdx_dispatch_cmd(ipv4_cmd_table, ARRAY_SIZE(ipv4_cmd_table),
 				cmd_code, cmd_len, pcmd);
 }
@@ -1438,16 +1424,13 @@ U32 get_timeout_value(U32 Proto,int sam_flag, int bidir_flag)
 			if(sam_flag)
 				return bidir_flag ? udp_4o6_bidir_timeout : udp_4o6_unidir_timeout;
 			return bidir_flag ? udp_bidir_timeout : udp_unidir_timeout;
-			break;
 
 		case IPPROTOCOL_TCP:
 			return sam_flag ? tcp_4o6_timeout: tcp_timeout;
-			break;
 
 		case IPPROTOCOL_IPIP:
 		default:
 			return sam_flag ? other_4o6_proto_timeout : other_proto_timeout;
-			break;
 	}
 }
 
@@ -1476,43 +1459,11 @@ static int IPv4_CT_Get_Hash_Snapshot(int ct_hash_index, int ct_total_entries, PC
 	PCtEntry pCtEntry;
 	PCtEntry pReplyEntry = NULL;
 	struct slist_entry *entry;
-#ifdef PRINT_CTENTRY_STATS
-	struct dpa_cls_tbl_entry_stats stats;
-#endif
 	slist_for_each(pCtEntry, entry, &ct_cache[ct_hash_index], list)
 	{
 		if (IS_IPV4(pCtEntry) &&(pCtEntry->status & CONNTRACK_ORIG) == CONNTRACK_ORIG)
 		{
 			pReplyEntry = CT_TWIN(pCtEntry);
-#ifdef PRINT_CTENTRY_STATS
-			if(pCtEntry->ct){
-				if (dpa_classif_table_get_entry_stats_by_ref(pCtEntry->ct->td, pCtEntry->ct->dpa_handle, &stats))
-				{
-					printk("%s:: Getting stats for CT entry failed\n",__func__);
-				}
-				else
-				{
-					printk(" entry pkt count = %lu and byte count = %lu\n ",
-							(unsigned long)stats.pkts,(unsigned long)stats.bytes );
-				}
-			}else{
-				printk("No classification table for orginal flow\n");
-			}
-
-			if(pReplyEntry->ct){
-				if (dpa_classif_table_get_entry_stats_by_ref(pReplyEntry->ct->td, pReplyEntry->ct->dpa_handle, &stats))
-				{
-					printk("%s:: Getting stats for CT entry failed\n",__func__);
-				}
-				else
-				{
-					printk(" entry pkt count = %lu and byte count = %lu\n ",
-							(unsigned long)stats.pkts,(unsigned long)stats.bytes );
-				}
-			}else{
-				printk("No classification table for response flow\n");
-			}
-#endif
 			pSnapshot->Daddr = pCtEntry->Daddr_v4;
 			pSnapshot->Saddr = pCtEntry->Saddr_v4;
 			pSnapshot->Sport = pCtEntry->Sport;

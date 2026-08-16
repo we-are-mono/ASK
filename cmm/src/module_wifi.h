@@ -15,9 +15,6 @@
 #define __MODULE_WIFI__
 #include "itf.h"
 
-#define WIFI_FF_SYSCTL_PATH "/proc/sys/net/"
-#define WIFI_FF_SYSCTL_ENTRY "wifi_fast_path_enable"
-
 typedef struct vwd_cmd_s {
 	int32_t		action;
 	int32_t		ifindex;
@@ -29,11 +26,7 @@ typedef struct vwd_cmd_s {
 } __attribute__((__packed__)) vwd_cmd_t;
 
 void __cmmGetWiFi(int fd, struct interface *itf);
-struct interface *cmmFeWiFiGetRootIf();
 int cmmFeWiFiUpdate(FCI_CLIENT *fci_handle, int fd, int request, struct interface *itf);
-int cmmFeWiFiEnable( FCI_CLIENT *fci_handle, int fd, struct interface *witf );
-int cmmFeWiFiDisable( FCI_CLIENT *fci_handle, int fd, struct interface *itf );
-int cmmFeWiFiBridgeUpdate( FCI_CLIENT *fci_handle, int fd, int request, struct interface *bitf);
 void cmmWiFiReset(FCI_CLIENT *fci_handle);
 
 #endif //__MODULE_WIFI__

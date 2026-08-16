@@ -46,7 +46,6 @@ import asyncio
 import os
 import struct
 
-import pytest
 import pytest_asyncio
 
 from _topology import (
@@ -233,7 +232,7 @@ _TCPDUMP_PIDFILE_PREFIX = "/tmp/ask_mcast_tcpdump"
 
 
 def _spawn_parallel_tcpdumps(
-    lan, ifaces: list[str], capfiles: list[str], port: int, window_s: float,
+    lan, ifaces: list[str], capfiles: list[str], port: int,
 ) -> None:
     """Launch one backgrounded tcpdump per (iface, capfile) on the LAN VM.
 
@@ -308,7 +307,7 @@ async def _capture_parallel_window(
     read the pcaps, return per-iface counts. Pure UART — no LAN agent
     needed (LAN VM is behind the DUT NAT).
     """
-    _spawn_parallel_tcpdumps(lan, ifaces, capfiles, port, window_s)
+    _spawn_parallel_tcpdumps(lan, ifaces, capfiles, port)
     # Tiny grace so tcpdumps are listening before any traffic arrives.
     # Caller is expected to inject AFTER this returns.
     await asyncio.sleep(0.4)
@@ -375,7 +374,7 @@ async def test_mcast_replication_one_per_listener_wan_injection(
     pcap_cleanup_lan.extend(capfiles)
 
     _spawn_parallel_tcpdumps(
-        lan, lan_ifaces, capfiles, port=MCAST_PORT, window_s=2.0,
+        lan, lan_ifaces, capfiles, port=MCAST_PORT,
     )
     try:
         # Small grace so tcpdumps are listening before the mcast hits.
@@ -450,7 +449,7 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
     pcap_cleanup_lan.extend(capfiles)
 
     _spawn_parallel_tcpdumps(
-        lan, lan_ifaces, capfiles, port=MCAST_PORT, window_s=2.0,
+        lan, lan_ifaces, capfiles, port=MCAST_PORT,
     )
     try:
         # Grace before injection so tcpdumps are listening.

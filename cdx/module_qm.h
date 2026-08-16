@@ -25,9 +25,7 @@ struct ceetm_fq {
 #define NUM_WBFQS		8
 #define NUM_CHANNEL_SHAPERS	8
 #define MAX_SCHEDULER_QUEUES	(NUM_PQS + NUM_WBFQS)
-#define DEFAULT_MAX_QDEPTH 	96
 #define GET_CEETM_PRIORITY(x)	((x) < NUM_PQS) ? ((x) ^ (NUM_PQS - 1)) : (x)
-#define MAX_CONNMARK_VAL 16
 #define EGRESS_MAX_CQ_PROFILES  (MAX_SCHEDULER_QUEUES * NUM_CHANNEL_SHAPERS)
 
 
@@ -118,10 +116,7 @@ typedef struct _tQosEnableCommand {
 	unsigned short enable_flag;
 }QosEnableCommand, *PQosEnableCommand;
 
-#define RATE_VALID          	(1 << 0)
-#define BSIZE_VALID          	(1 << 1)
 #define PORT_SHAPER_CFG         (1 << 2)
-#define CHANNEL_SHAPER_CFG      (0 << 2)
 #define SHAPER_CFG_VALID        (1 << 3)
 
 #define SHAPER_ON               1
@@ -163,7 +158,6 @@ typedef struct _tQosWbfqConfigCommand {
 #define CQ_SHAPER_CFG_VALID (1 << 0)
 #define CQ_WEIGHT_VALID (1 << 1)
 #define CQ_TDINFO_VALID (1 << 2)    
-#define CQ_CMINFO_VALID (1 << 3)
 #define CQ_RATE_VALID   (1 << 4)
 
 typedef struct _tQosCqConfigCommand {
@@ -234,13 +228,6 @@ typedef struct _tQosFFRateCommand {
 	uint32_t counterval[MAX_RATLIM_CNTR];
 }__attribute__((__packed__)) QosFFRateCommand, *PQosFFRateCommand;
 
-typedef struct _tQosRlkuery
-{
-	unsigned short action;
-	unsigned short mask;
-	unsigned int   aggregate_bandwidth;
-	unsigned int   bucket_size;	
-} __attribute__((packed)) QosRlQuery,*pQosRlQuery;
 
 
 struct QosChnlShaperInfo {

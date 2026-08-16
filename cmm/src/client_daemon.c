@@ -241,9 +241,6 @@ void cmmClientPrintHelp()
 									"\tsocket6: Manage V6 socket module\n"
 									"\trtp: Manage RTP Relay module\n"
 									"\tsa_query_timer: Manage IPsec SA query timer module\n"
-#ifdef C2000_DPI
-									"\tdpi: Manage DPI Enable/disable\n"
-#endif
 									"\tasym_fastforward: Manage Asymmetric Fastforward Enable/disable\n"
 									"\trtpstats: Manage RTP Stats for Fast Forwarded connections\n"
 									"\tbridge: Manage bridge (timeout)\n"
@@ -306,7 +303,6 @@ void cmmClientPrintHelp()
 int cmmSendToDaemon(daemon_handle_t handle, unsigned short commandCode, void * dataToSend, int dataSize, void* dataToRcv)
 {
 	int rcvBytes = 0;
-#ifdef NEW_IPC
 	cmm_command_t cmd;
 	cmm_response_t res;
 
@@ -335,68 +331,6 @@ int cmmSendToDaemon(daemon_handle_t handle, unsigned short commandCode, void * d
 	}
 
 	rcvBytes = res.length;
-#else
-	int queueIdRx;
-	int queueIdTx;
-	struct cmm_msg msg;
-	key_t key;
-
-	handle = ((handle & 0xff) ^ ((handle >> 8) & 0xff)) | 1;
-
-	key = ftok("/tmp", handle);
-	if (key == (key_t)-1)
-	{
-		cmm_print(DEBUG_STDERR, "%s: ftok(%d) failed, %s\n", __func__, handle, strerror(errno));
-		return -1;
-	}
-
-	queueIdRx = msgget(key, 0);
-	if (queueIdRx < 0)
-	{
-		cmm_print(DEBUG_STDERR, "%s: rx msgget() failed, %s\n", __func__, strerror(errno));
-		return -1;
-	}
-
-	key = ftok("/tmp", handle ^ 0xff);
-	if (key == (key_t)-1)
-	{
-		cmm_print(DEBUG_STDERR, "%s: ftok(%d) failed, %s\n", __func__, handle ^ 0xff, strerror(errno));
-		return -1;
-	}
-
-	queueIdTx = msgget(key, 0);
-	if (queueIdTx < 0)
-	{
-		cmm_print(DEBUG_STDERR, "%s: tx msgget() failed, %s\n", __func__, strerror(errno));
-		return -1;
-	}
-
-	if (dataSize > sizeof(msg.buffer))
-		return -1;
-
-	msg.mtype = commandCode;
-	if (dataToSend)
-		memcpy(msg.buffer, dataToSend, dataSize);
-
-
-	if (msgsnd(queueIdTx, &msg, dataSize, 0) < 0)
-	{
-		cmm_print(DEBUG_STDERR, "%s: msgsnd() failed, %s\n", __func__, strerror(errno));
-		return -1;
-	}
-
-	// Now wait for an answer
-	if ((rcvBytes = msgrcv(queueIdRx, &msg, sizeof(msg.buffer), commandCode, 0)) < 0)
-	{
-		// Error !!
-		cmm_print(DEBUG_STDERR, "%s: msgrcv() failed, %s\n", __func__, strerror(errno));
-		return -1;
-	}
-
-
-	if ((dataToRcv) && (rcvBytes))
-		memcpy(dataToRcv, msg.buffer, rcvBytes);
-#endif
 	return (rcvBytes );
 }
 
@@ -507,13 +441,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 			if(cmmDPDSaQuerySetProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
-#ifdef C2000_DPI
-		else if (strcasecmp(keywords[1], "dpi") == 0)
-		{
-			if(cmmDPIFlagSetProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
-#endif
 		else if (strcasecmp(keywords[1], "asym_fastforward") == 0)
 		{
 			if(cmmAsymFFSetProcess(keywords, 2, daemon_handle))
@@ -947,28 +874,17 @@ int cmmClient(char * command, int argc, char **argv)
 	daemon_handle_t daemon_handle;
 	int rc;
 
-#ifdef NEW_IPC
 	daemon_handle = cmm_open();
 	if (!daemon_handle)
 	{
 		cmm_print(DEBUG_STDERR, "%s: CMM handle creation failed\n", __func__);
 		return cmmClientDaemonDownRc(command);
 	}
-#else
-	/*First check cmm daemon is alive*/
-	if( (daemon_handle = cmmIsDaemonRunning()) <= 0)
-	{
-		cmm_print(DEBUG_CRIT, "Error, cmm daemon is not running\n");
-		return cmmClientDaemonDownRc(command);
-	}
-#endif
 
 	/*Process the command*/
 	rc = cmmClientProcessCmd(command, argc, argv, daemon_handle);
 
-#ifdef NEW_IPC
 	cmm_close(daemon_handle);
-#endif
 
 	return rc;
 }
@@ -985,12 +901,8 @@ static void *cmmDaemonThread(void *data)
 {
 	struct cmm_daemon *ctx = data;
 
-#ifdef NEW_IPC
 	cmm_command_t cmd;
 	cmm_response_t res;
-#else
-	struct cmm_msg msg;
-#endif
 	int dataSize;
 	unsigned short dataRcvSize;
 	int rc;
@@ -1003,13 +915,12 @@ static void *cmmDaemonThread(void *data)
 	while (1)
 	{
 		// Waiting for a message
-#ifdef NEW_IPC
 		/* We have to reset errno, because it could left after previous error condition,
 		 * and we will wrongly report it later as "daemon_errno" even if no error occured.
 		 * From 'man errno':
 		 * "Successful calls never set errno; once set, it remains until another error occurs".
 		 * XXX: this is a hack needed to support "daemon_errno" field in cmm_response_t.
-		 * CMM library on client side sets system errno according to "daemon_errno" 
+		 * CMM library on client side sets system errno according to "daemon_errno"
 		 * and returns -1 when it's not 0.
 		 */
 		errno = 0;
@@ -1025,13 +936,6 @@ static void *cmmDaemonThread(void *data)
 		func = cmd.func;
 		rx_buf = cmd.buf;
 		tx_buf = res.buf;
-#else
-		dataSize = msgrcv(ctx->queueIdRx, &msg, sizeof(msg.buffer), 0, 0);
-		dataRcvSize = sizeof(msg.buffer);
-		func = msg.mtype;
-		rx_buf = msg.buffer;
-		tx_buf = msg.buffer;
-#endif
 		if (dataSize < 0)
 		{
 			/* Exit if queue id no longer exists */
@@ -1099,7 +1003,6 @@ static void *cmmDaemonThread(void *data)
 
 answer:
 		// Send answer to client		
-#ifdef NEW_IPC
 		res.func = func;
 		if (rc < 0) {
 			if (errno)
@@ -1110,9 +1013,6 @@ answer:
 
 		res.length = dataRcvSize;
 		if (msgsnd(ctx->queueIdTx, &res, sizeof(res) - sizeof(res.buf) + res.length, 0) < 0)
-#else
-		if (msgsnd(ctx->queueIdTx, &msg, dataRcvSize, 0) < 0)
-#endif
 		{
 			cmm_print(DEBUG_WARNING, "%s: msgsnd() failed, %s\n", __func__, strerror(errno));
 			break;
@@ -1188,14 +1088,12 @@ int cmmDaemonInit(struct cmm_daemon *ctx)
 		goto err2;
 	}
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	ctx->fci_key_handle = fci_open(FCILIB_KEY_TYPE, 0);
 	if (!ctx->fci_key_handle)
 	{
 		cmm_print(DEBUG_CRIT, "%s::%d: fci_open() failed, %s\n", __func__, __LINE__, strerror(errno));
 		goto err3;
 	}
-#endif
 	voice_buffer_reset(ctx->fci_handle);
 
 	// Thread for getting cmm client command
@@ -1208,11 +1106,9 @@ int cmmDaemonInit(struct cmm_daemon *ctx)
 	return 0;
 
 err4:
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	fci_close(ctx->fci_key_handle);
 
 err3:
-#endif
 	fci_close(ctx->fci_handle);
 
 err2:
@@ -1229,24 +1125,14 @@ void cmmDaemonExit(struct cmm_daemon *ctx)
 {
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
-#if defined(__UCLIBC__)
-	/* workaround uclibc pthread_cancel() bug, force thread to exit */
-	msgctl(ctx->queueIdTx, IPC_RMID, NULL);
-	msgctl(ctx->queueIdRx, IPC_RMID, NULL);
-#else
 	pthread_cancel(ctx->pthread);
-#endif
 
 	pthread_join(ctx->pthread, NULL);
 
 	fci_close(ctx->fci_handle);
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	fci_close(ctx->fci_key_handle);
-#endif
-#if !defined(__UCLIBC__)
 	msgctl(ctx->queueIdTx, IPC_RMID, NULL);
 	msgctl(ctx->queueIdRx, IPC_RMID, NULL);
-#endif
 
 	cmm_print(DEBUG_INFO, "%s: exiting\n", __func__);
 }
@@ -1304,10 +1190,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 								 
 	case CMMD_CMD_IPSEC_DPDSAQUERYTIMER:
 		return cmmDPDSAQUERYProcessClientCmd(cmd_buf, res_buf, res_len);
-#ifdef C2000_DPI
-	case CMMD_CMD_DPIENABLE:
-		return cmmDPIFlagProcessClientCmd(cmd_buf, res_buf, res_len);
-#endif
 	case CMMD_ASYM_FF_ENABLE:
 		return cmmAsymFFProcessClientCmd(cmd_buf, res_buf, res_len);
 	case CMMD_CMD_SOCKET_OPEN:
@@ -1330,17 +1212,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_RX_L2BRIDGE_QUERY_ENTRY:
 		return cmmL2BridgeProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len); 
 
-	// Special processing for QM Reset and Scheduler config (need to notify eth driver)
-	
-#ifndef LS1043
-	case FPP_CMD_QM_RESET:
-		cmmQmResetQ2Prio((fpp_qm_reset_cmd_t *)cmd_buf, cmd_len);
-		goto FCI_CMD;
-
-	case FPP_CMD_QM_SCHED_CFG:
-		cmmQmUpdateQ2Prio((fpp_qm_scheduler_cfg_t *)cmd_buf, cmd_len);
-		goto FCI_CMD;
-#endif
 #ifdef LS1043
         case FPP_CMD_QM_QUERY_FF_RATE:
         case FPP_CMD_QM_FF_RATE:
@@ -1383,10 +1254,7 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_QM_SHAPER_CFG:
 	case FPP_CMD_QM_DSCP_MAP:
 	case FPP_CMD_QM_QUEUE_QOSENABLE:
-	case FPP_CMD_QM_QUERY_PORTINFO:
 	case FPP_CMD_QM_QUERY_QUEUE:
-	case FPP_CMD_QM_QUERY_SHAPER:
-	case FPP_CMD_QM_QUERY_SCHED:
 	// Accept ICC commands
 	case FPP_CMD_ICC_RESET:
 	case FPP_CMD_ICC_THRESHOLD:

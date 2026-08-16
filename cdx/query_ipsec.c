@@ -9,8 +9,6 @@
  */
 
 #ifdef DPA_IPSEC_OFFLOAD
-//#include "module_ipsec.h"
-//#include "module_tunnel.h"
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include "portdefs.h"
@@ -202,7 +200,6 @@ static int IPsec_SA_Get_Handle_Snapshot(int sa_handle_index, int sa_entries, PSA
 				pSAHandleSnapshot->tnl.ipv4.tos   = pSAEntry->tunnel.ip4.TypeOfService;
 				pSAHandleSnapshot->tnl.ipv4.protocol = pSAEntry->tunnel.ip4.Protocol;
 				pSAHandleSnapshot->tnl.ipv4.total_length = pSAEntry->tunnel.ip4.TotalLength;	
-				/*printk(KERN_INFO "tunnel: %x:%x:%x:%x:%x\n",  pSAEntry->tunnel.ip4.DestinationAddress, pSAEntry->tunnel.ip4.SourceAddress,  pSAEntry->tunnel.ip4.TypeOfService, pSAEntry->tunnel.ip4.Protocol, pSAEntry->tunnel.ip4.TotalLength);*/
 			}
 			else
 			{
@@ -216,9 +213,6 @@ static int IPsec_SA_Get_Handle_Snapshot(int sa_handle_index, int sa_entries, PSA
 				pSAHandleSnapshot->tnl.ipv6.saddr[1] = pSAEntry->tunnel.ip6.SourceAddress[1];
 				pSAHandleSnapshot->tnl.ipv6.saddr[2] = pSAEntry->tunnel.ip6.SourceAddress[2];
 				pSAHandleSnapshot->tnl.ipv6.saddr[3] = pSAEntry->tunnel.ip6.SourceAddress[3];
-				//IPV6_SET_TRAFFIC_CLASS(&pSAHandleSnapshot->tnl.ipv6, IPV6_GET_TRAFFIC_CLASS(&pSAEntry->tunnel.ip6));
-				//IPV6_SET_VERSION(&pSAHandleSnapshot->tnl.ipv6, IPV6_GET_VERSION(&pSAEntry->tunnel.ip6));
-				//IPV6_COPY_FLOW_LABEL(&pSAHandleSnapshot->tnl.ipv6, &pSAEntry->tunnel.ip6);
 			}
 		}
 

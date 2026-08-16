@@ -40,22 +40,7 @@
 #endif
 
 //disable flow statistics
-#define ENABLE_STATISTICS 1
 
-#define PPPoE_HASH_TBL_BUCKETS	(1 << 4) //16 
-struct pppoe_table_entry {
-	struct pppoe_table_entry *next;
-	struct pppoe_key key;	
-	int dpa_handle;
-};
-
-struct pppoe_sess_table {
-	spinlock_t lock;	
-	struct pppoe_table_entry *head;
-};
-
-
-/* static struct pppoe_sess_table *pppoe_tbl[MAX_FRAME_MANAGERS][MAX_PORTS_PER_FMAN]; */
 
 
 /* add ethernet type device */
@@ -186,12 +171,4 @@ int add_incoming_iface_info(PCtEntry entry)
 	return NO_ERR;
 }
 
-//insert entry in pppoe class table
-int insert_entry_in_pppoe_table(int fm_idx, int port_idx,
-			uint8_t *ac_mac_addr, uint32_t sessid, 
-			uint32_t ppp_pid)
-{
-	printk("%s::not implemented\n", __func__);
-	return FAILURE;
-}
 

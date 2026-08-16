@@ -25,13 +25,10 @@
 #define FMAN_IDX		0
 
 #define L2_MAX_ONIF		255
-#define L2_INVALID_ONIF		L2_MAX_ONIF
 
 #define INTERFACE_NAME_LENGTH	16
 
 /* FLAGS */
-//Routing cache entry
-#define UNICAST_L2_HEADER_SIZE	26	// 14 (eth) + 4 (vlan) + 8 (pppoe)
 
 // INTERFACE FLAGS
 #define ENTRY_VALID	0x80
@@ -40,9 +37,7 @@
 #define	IF_TYPE_VLAN		(1 << 1)
 #define	IF_TYPE_PPPOE		(1 << 2)
 #define	IF_TYPE_TUNNEL		(1 << 3)
-#define	IF_TYPE_MACVLAN		(1 << 4)
 #define IF_TYPE_WLAN		(1 << 5)
-#define IF_TYPE_L2TP		(1 << 6)
 #define IF_TYPE_PHYSICAL	(1 << 7)
 //The following definition will not be used in if structures
 //defined here as others are also used in the dpaoffload layers.
@@ -77,8 +72,6 @@ typedef struct _tRouteEntry {
 }RouteEntry, *PRouteEntry;
 
 
-#define RT_F_EXTRA_INFO 0x1
-
 #define IS_NULL_ROUTE(pRoute) (!(pRoute))
 /* ROUTE_EXTRA_INFO returns a pointer to the destination address union.
  * We use Daddr_v6 (16 bytes) instead of Daddr_v4 (4 bytes) because:
@@ -102,14 +95,12 @@ PRouteEntry L2_route_get(U32 id);
 void L2_route_put(PRouteEntry pRtEntry);
 PRouteEntry L2_route_find(U32 id);
 int L2_route_remove(U32 id);
-PRouteEntry L2_route_add(U32 id, int info_size);
+PRouteEntry L2_route_add(U32 id);
 
 
 POnifDesc get_onif_by_name(U8 *itf_name);
 POnifDesc add_onif(U8 *input_itf_name, struct _itf *itf, struct _itf *phys_itf, U8 type);
-void remove_onif_by_name(U8 *itf_name);
 void remove_onif_by_index(U32 if_index);
-void remove_onif(POnifDesc onif_desc);
 U16 itf_get_phys_port(struct _itf *itf);
 struct _itf *itf_get_phys_itf(struct _itf *itf);
 

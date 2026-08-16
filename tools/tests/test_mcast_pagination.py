@@ -37,9 +37,6 @@ ACTION_QUERY_CONT    = 7
 
 # Return codes (cdx/fe.h)
 NO_ERR                         = 0
-ERR_WRONG_COMMAND_SIZE         = 2
-ERR_MC_ENTRY_NOT_FOUND         = 700
-ERR_MC_MAX_LISTENERS           = 701
 ERR_MC_MAX_LISTENERS_PER_GROUP = 706
 ERR_MC_CONFIG                  = 707  # "mcast group does not exist" on REMOVE
 

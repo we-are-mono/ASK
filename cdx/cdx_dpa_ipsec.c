@@ -281,8 +281,6 @@ static inline void cdx_ipsec_capture_post_free(void *p, size_t n) { }
 	(preh) |= ((u64)(bpid) << PREHDR_TBPID_SHIFT) & PREHDR_TBPID_MASK
 
 // setting the table buffer pool size
-#define PREHEADER_PREP_TBP_SIZE(preh, tbpsz) \
-	(preh) |= ((u64)(tbpsz) << 48) & 0x0007000000000000 ; 
 
 #define PREHEADER_PREP_OFFSET(preh, offs) \
 	(preh) |= ((u64)(offs) << PREHDR_OFFSET_SHIFT) & PREHDR_OFFSET_MASK
@@ -842,11 +840,8 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 			get_fqid_to_sec(pdpa_sec_context->dpa_ipsecsa_handle);
 		pdpa_sec_context->from_sec_fqid =
 			get_fqid_from_sec(pdpa_sec_context->dpa_ipsecsa_handle);
-#ifdef UNIQUE_IPSEC_CP_FQID
 		pdpa_sec_context->to_cp_fqid =
 			ipsec_get_to_cp_fqid(pdpa_sec_context->dpa_ipsecsa_handle);
-#else
-#endif
 	}
 	else {
 		cdx_ipsec_sec_sa_context_free(pdpa_sec_context); 
@@ -1151,34 +1146,6 @@ skip_byte_copy:
 
 	/* Enable Stats only for IPv4  TODO-IPV6 */
 	save_sa_state_in_external_mem(sa);
-	/*For inbound Ipsec traffic, copy SAGD  to the outer packet at the end */
-
-#ifdef UNIQUE_IPSEC_CP_FQID
-	if (0) /* not adding sgid  2 bytes to shared descriptor stuff */
-#else
-	if (sa->direction  == CDX_DPA_IPSEC_INBOUND)
-#endif /* UNIQUE_IPSEC_CP_FQID */
-	{
-		/* ld: deco-deco-ctrl len=0 offs=8 imm -auto-nfifo-entries */
-		append_cmd(desc, CMD_LOAD | DISABLE_AUTO_INFO_FIFO);
-
-		/* fifo load immediate: sa-> handle value to input fifo */
-		append_fifo_load_as_imm(desc, (void *)&sa->handle,
-				2, FIFOLD_TYPE_MSG|
-				FIFOLD_CLASS_BOTH | FIFOLD_TYPE_LAST1 |
-				FIFOLD_TYPE_LAST2 | FIFOLD_TYPE_FLUSH1);
-
-		/* ld: deco-deco-ctrl len=0 offs=4 imm +auto-nfifo-entries */
-		append_cmd(desc, CMD_LOAD | ENABLE_AUTO_INFO_FIFO);
-
-		/* move: ififo->deco-alnblk -> ofifo, len=4 */
-		append_move(desc, MOVE_SRC_INFIFO | MOVE_DEST_OUTFIFO | 2);
-
-		/* seqfifostr: msgdata len=4 */
-		append_seq_fifo_store(desc, FIFOST_TYPE_MESSAGE_DATA, 2);
-
-	}
-	/* Done coping SAGD value to the outer packet at the end*/
 
 #ifdef PRINT_DESC
 	//if (sa->direction == CDX_DPA_IPSEC_OUTBOUND)

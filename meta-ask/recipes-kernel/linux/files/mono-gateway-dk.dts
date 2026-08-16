@@ -99,15 +99,6 @@
 		};
 	};
 
-	/* Boot memory regions for SDK DPAA driver */
-	bootmem0@a0000000 {
-		reg = <0x00 0xa0000000 0x00 0x4000000 0x00 0xa4000000 0x00 0x6000000>;
-	};
-
-	bootmem1@aa000000 {
-		reg = <0x00 0xaa000000 0x00 0x4000000 0x00 0xae000000 0x00 0x6000000>;
-	};
-
 	cpus {
 		fman0-extended-args {
 			cell-index = <0x00>;

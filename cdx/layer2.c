@@ -70,25 +70,6 @@ POnifDesc add_onif(U8 *input_itf_name, struct _itf *itf, struct _itf *phys_itf, 
 	return NULL;
 }
 
-/**
- * remove_onif_by_name()
- *
- *
- */
-void remove_onif_by_name(U8 *itf_name)
-{
-	int i;
-
-	for (i = 0; i < L2_MAX_ONIF; i++)
-	{
-		if(!strcmp((char*)itf_name, (char*)gOnif_DB[i].name))
-		{
-			remove_onif_by_index(i);
-			return; 
-		}
-	}
-}
-
 
 /**
  * remove_onif_by_index()
@@ -131,16 +112,6 @@ void remove_onif_by_index(U32 if_index)
 	dpa_release_interface(if_index);
 }
 
-
-/**
- * remove_onif()
- *
- *
- */
-void remove_onif(POnifDesc onif_desc)
-{
-	remove_onif_by_index(get_onif_index(onif_desc));
-}
 
 
 PRouteEntry L2_route_find(U32 id)
@@ -264,13 +235,13 @@ void L2_route_put(PRouteEntry pRtEntry)
  *          This function removes an L2 route entry
  *
  */
-PRouteEntry L2_route_add(U32 id, int info_size)
+PRouteEntry L2_route_add(U32 id)
 {
 	PRouteEntry pRtEntry;
 	int size;
 	U32 hash;
 
-	size = ROUND_UP32(sizeof (RouteEntry)) + info_size;
+	size = ROUND_UP32(sizeof (RouteEntry));
 
 	pRtEntry = (PRouteEntry)__Heap_Alloc(hGlobalHeap, size);
 	if (!pRtEntry)
@@ -281,9 +252,6 @@ PRouteEntry L2_route_add(U32 id, int info_size)
 	hash = HASH_RT(id);
 
 	pRtEntry->id = id;
-
-	if (info_size)
-		pRtEntry->flags |= RT_F_EXTRA_INFO;
 
 	pRtEntry->nbref = 0;
 

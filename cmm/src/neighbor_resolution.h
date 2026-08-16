@@ -18,13 +18,6 @@
 
 #include "jhash.h"
 
-	#define APP_SOLICIT_IPV4_PATH "/proc/sys/net/ipv4/neigh/default/app_solicit"
-	#define APP_SOLICIT_IPV4_WAN_PATH "/proc/sys/net/ipv4/neigh/" WAN_INTERFACE_NAME "/app_solicit"
-	#define APP_SOLICIT_IPV4_LAN_PATH "/proc/sys/net/ipv4/neigh/" LAN_INTERFACE_NAME "/app_solicit"
-	#define APP_SOLICIT_IPV6_PATH "/proc/sys/net/ipv6/neigh/default/app_solicit"
-	#define APP_SOLICIT_IPV6_WAN_PATH "/proc/sys/net/ipv6/neigh/" WAN_INTERFACE_NAME "/app_solicit"
-	#define APP_SOLICIT_IPV6_LAN_PATH "/proc/sys/net/ipv6/neigh/" LAN_INTERFACE_NAME "/app_solicit"
-
 #ifndef NUD_VALID
 	#define NUD_VALID	(NUD_PERMANENT|NUD_NOARP|NUD_REACHABLE|NUD_PROBE|NUD_STALE|NUD_DELAY)
 #endif

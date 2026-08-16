@@ -25,8 +25,6 @@ from __future__ import annotations
 
 import struct
 
-import pytest
-
 
 CMD_VLAN_ENTRY    = 0x0901
 CMD_VLAN_ENTRY_RESET = 0x0902
@@ -43,7 +41,6 @@ ERR_VLAN_ENTRY_NOT_FOUND = 601
 ACTION_REGISTER    = 0
 ACTION_DEREGISTER  = 1
 ACTION_QUERY       = 6
-ACTION_QUERY_CONT  = 7
 
 IF_NAME_SIZE = 16
 # VlanCommand layout (cdx/control_vlan.h):

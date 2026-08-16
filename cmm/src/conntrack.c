@@ -42,7 +42,6 @@ unsigned char resync_buf[CMM_MAX_64K_BUFF_SIZE];
 pthread_mutex_t ctMutex = PTHREAD_MUTEX_INITIALIZER;		/*mutex to prevent race condition on the conntrack table*/
 
 const unsigned char null_mac[ETH_ALEN] = {0, };
-const unsigned int null_ip[4] = {0, };
 
 extern void cmmDPDIPsecSAUpdate(struct cmm_ct *ctx);
 extern int cmmNeighSendSolicit(void);
@@ -1219,12 +1218,10 @@ static int __cmmCtTunnelRouteRegister(struct ct_route *rt, struct ct_route *tunn
 		goto err0;
 
 out:
-	__itf_put(itf);
 
 	return 0;
 
 err0:
-	__itf_put(itf);
 
 	return -1;
 }
@@ -1831,8 +1828,6 @@ program_ct:
 	__cmmCheckFPPRouteIdUpdate(&ctEntry->rep, &ctEntry->flags);
 	__cmmCheckFPPRouteIdUpdate(&ctEntry->rep_tunnel, &ctEntry->flags);
 
-	cmm_third_part_update(ctEntry, dir);
-
 	if (dir)
 		rc = cmmFeCtUpdate(fci_handle, ADD | UPDATE, ctEntry);
 	else
@@ -2408,7 +2403,7 @@ static int cmmCheckEvent(struct cmm_ct *ctx, struct nf_conntrack *ct, struct ctT
 				/* Do not process a new event
 				 * which arrives after an update
 				 */
-				if (*ctEntry && __cmmCtFindId(*ctEntry, id))
+				if (__cmmCtFindId(*ctEntry, id))
 					return -1;
 
 			case NFCT_T_UPDATE:
@@ -2469,14 +2464,6 @@ static int __cmmCtCatch(struct cmm_ct *ctx, enum nf_conntrack_msg_type type, str
 	// If Forward Engine programmation is forbidden, don't do anything
 	if (globalConf.enable == 0)
 		goto exit;
-
-#ifdef C2000_DPI
-	status = nfct_get_attr_u32(ct, ATTR_STATUS);
-	if ((globalConf.dpi_enable) && ((status & IPS_DPI_ALLOWED) != IPS_DPI_ALLOWED))
-	{
-		goto exit;
-	}
-#endif
 
 	l3proto = nfct_get_attr_u8(ct, ATTR_ORIG_L3PROTO);
 
@@ -2725,90 +2712,6 @@ static void cmmCtKernelModuleUnInit()
 
 	file_write(TCP_BE_LIBERAL_PATH, "0", 1);
 }
-#ifdef APP_SOLICIT
-/*****************************************************************
-* cmmNeighborKernelModuleInit
-* 
-*
-******************************************************************/
-static int cmmRtnlKernelModuleInit()
-{
-	cmm_print(DEBUG_INFO, "%s:\n", __func__);
-
-	/*Prepare the neighbor code to be in a good configuration*/
-	if (file_write(APP_SOLICIT_IPV4_PATH, "1", 1) < 0)
-	{
-		goto err0;
-	}
-
-	if (file_write(APP_SOLICIT_IPV4_WAN_PATH, "1", 1) < 0)
-	{
-		goto err1;
-	}
-
-	if (file_write(APP_SOLICIT_IPV4_LAN_PATH, "1", 1) < 0)
-	{
-		goto err2;
-	}
-
-	if (file_write(APP_SOLICIT_IPV6_PATH, "1", 1) < 0)
-	{
-		goto err3;
-	}
-
-	if (file_write(APP_SOLICIT_IPV6_WAN_PATH, "1", 1) < 0)
-	{
-		goto err4;
-	}
-
-	if (file_write(APP_SOLICIT_IPV6_LAN_PATH, "1", 1) < 0)
-	{
-		goto err5;
-	}
-
-	return 0;
-
-err5:
-	file_write(APP_SOLICIT_IPV6_WAN_PATH, "0", 1);
-
-err4:
-	file_write(APP_SOLICIT_IPV6_PATH, "0", 1);
-
-err3:
-	file_write(APP_SOLICIT_IPV4_LAN_PATH, "0", 1);
-
-err2:
-	file_write(APP_SOLICIT_IPV4_WAN_PATH, "0", 1);
-
-err1:
-	file_write(APP_SOLICIT_IPV4_PATH, "0", 1);
-
-err0:
-	return -1;
-}
-
-/*****************************************************************
-* cmmNeighborKernelModuleUnInit
-* 
-*
-******************************************************************/
-static void cmmRtnlKernelModuleUnInit()
-{
-	cmm_print(DEBUG_INFO, "%s:\n", __func__);
-
-	file_write(APP_SOLICIT_IPV4_PATH, "0", 1);
-
-	file_write(APP_SOLICIT_IPV4_WAN_PATH, "0", 1);
-
-	file_write(APP_SOLICIT_IPV4_LAN_PATH, "0", 1);
-
-	file_write(APP_SOLICIT_IPV6_PATH, "0", 1);
-
-	file_write(APP_SOLICIT_IPV6_WAN_PATH, "0", 1);
-
-	file_write(APP_SOLICIT_IPV6_LAN_PATH, "0", 1);
-}
-#endif
 
 
 
@@ -2828,7 +2731,6 @@ static int cmmCtResync(struct cmm_ct *ctx)
 	int destroyed = 0;
 	int len, read = 0;
 	int mult_ids_dest = 0;
-	int entry_exist = 0;
 	unsigned char *buf = resync_buf;
 
 	cmm_print(DEBUG_ERROR, "%s: start %d\n", __func__, ct_stats.current);
@@ -2893,7 +2795,7 @@ destroy:
 
 	}
 
-	cmm_print(DEBUG_ERROR, "%s: end %d %d %d %d %d\n", __func__, ct_stats.current, queried, destroyed, mult_ids_dest, entry_exist);
+	cmm_print(DEBUG_ERROR, "%s: end %d %d %d %d\n", __func__, ct_stats.current, queried, destroyed, mult_ids_dest);
 
 	__pthread_mutex_unlock(&ctMutex);
 
@@ -2930,9 +2832,7 @@ static void *cmmCtThread(void *data)
 	struct cmm_ct *ctx = data;
 	fd_set set;
 	int fd_ct, fd_fci;
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	int fd_key;
-#endif
 	int fd_neigh, fd_link, fd_ifaddr, fd_route, fd_rule, fd_abm;
 	struct timeval timeout;
 	struct itimerval itimer;
@@ -2942,9 +2842,7 @@ static void *cmmCtThread(void *data)
 
 	cmm_print(DEBUG_INFO, "%s: pid %d\n", __func__, getpid());
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	fd_key = fci_fd(ctx->fci_key_catch_handle);
-#endif
 	fd_fci = fci_fd(ctx->fci_catch_handle);
 	fd_ct = nfct_fd(ctx->catch_handle);
 
@@ -2984,9 +2882,7 @@ static void *cmmCtThread(void *data)
 	{
 		if (timer_expired)
 		{
-#if PPPOE_AUTO_ENABLE
                         cmmPPPoEAutoKeepAlive();
-#endif
 
 			cmmDPDIPsecSAUpdate(ctx);
 
@@ -3005,9 +2901,7 @@ static void *cmmCtThread(void *data)
 
 		FD_ZERO (&set);
 		FD_SET (fd_ct, &set);
-#if !defined(IPSEC_SUPPORT_DISABLED)
 		FD_SET (fd_key, &set);
-#endif
 		FD_SET (fd_fci, &set);
 		FD_SET (fd_neigh, &set);
 		FD_SET (fd_link, &set);
@@ -3032,7 +2926,6 @@ static void *cmmCtThread(void *data)
 			goto out;
 		}
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 		if (FD_ISSET(fd_key, &set))
 		{
 			rc = fci_catch(ctx->fci_key_catch_handle);
@@ -3044,7 +2937,6 @@ static void *cmmCtThread(void *data)
 				}
 			}
 		}
-#endif
 		if (FD_ISSET(fd_ct, &set))
 		{
 			rc = nfct_catch(ctx->catch_handle);
@@ -3248,12 +3140,6 @@ int cmmCtInit(struct cmm_ct *ctx)
 	{
 		goto err0;
 	}
-#ifdef APP_SOLICIT
-	if (cmmRtnlKernelModuleInit() < 0)
-	{
-		goto err1;
-	}
-#endif
 	ctx->fci_catch_handle = fci_open(FCILIB_FF_TYPE, NL_FF_GROUP);
 	if (!ctx->fci_catch_handle)
 	{
@@ -3268,7 +3154,6 @@ int cmmCtInit(struct cmm_ct *ctx)
 		goto err3;
 	}
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	ctx->fci_key_catch_handle = fci_open(FCILIB_KEY_TYPE, NL_KEY_ALL_GROUP);
 	if (!ctx->fci_key_catch_handle)
 	{
@@ -3282,7 +3167,6 @@ int cmmCtInit(struct cmm_ct *ctx)
 		cmm_print(DEBUG_CRIT, "%s:%d fci_open() failed, %s\n", __func__, __LINE__, strerror(errno));
 		goto err5;
 	}
-#endif
 
 	// Open a Conntrack socket
 	ctx->catch_handle = nfct_open(CONNTRACK, NFCT_ALL_CT_GROUPS);
@@ -3350,7 +3234,6 @@ int cmmCtInit(struct cmm_ct *ctx)
 		goto err14;
 	}
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	fd = fci_fd(ctx->fci_key_catch_handle);
 
 	if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
@@ -3358,7 +3241,6 @@ int cmmCtInit(struct cmm_ct *ctx)
 		cmm_print(DEBUG_ERROR, "%s:%d fcntl(%d) failed %s\n", __func__, __LINE__, fd, strerror(errno));
 		goto err14;
 	}
-#endif
 
 	if (nfnl_set_nonblocking_mode((struct nfnl_handle *)nfct_nfnlh(ctx->catch_handle)) < 0)
 	{
@@ -3405,10 +3287,6 @@ int cmmCtInit(struct cmm_ct *ctx)
 	// Change socket size to avoid losing messages
 	nfnl_rcvbufsiz((struct nfnl_handle *)nfct_nfnlh(ctx->catch_handle), NFNL_SOCK_SIZE);
 
-#ifdef ROUTER
-	nfnl_rcvbufsiz((struct nfnl_handle *)nfct_nfnlh(ctx->handle), 128 * 1024);
-#endif
-
 	nfnl_set_rcv_buffer_size((struct nfnl_handle *)nfct_nfnlh(ctx->catch_handle), 128 * 1024);
 
 	nfnl_unset_sequence_tracking((struct nfnl_handle *)nfct_nfnlh(ctx->catch_handle));
@@ -3427,18 +3305,9 @@ int cmmCtInit(struct cmm_ct *ctx)
 	}
 
 	fci_register_cb(ctx->fci_catch_handle, cmmFeCatch);
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	fci_register_cb(ctx->fci_key_catch_handle, cmmKeyCatch);
-#endif
 	nfct_callback_register(ctx->catch_handle, NFCT_T_ALL, cmmCtCatch, ctx);
 	nfct_callback_register(ctx->get_handle, NFCT_T_ALL, cmmCtCheckCtCb, NULL);
-
-#ifndef LS1043
-	for (i = 0; i < GEM_PORTS; i++) {
-		if (itf_name_update(ctx->fci_handle, &port_table[i]) < 0)
-			goto err14;
-	}
-#endif
 
 	if (itf_table_init(&itf_table) < 0)
 		goto err14;
@@ -3479,24 +3348,18 @@ err7:
 	nfct_close(ctx->catch_handle);
 
 err6:
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	fci_close(ctx->fci_key_handle);
 
 err5:
 	fci_close(ctx->fci_key_catch_handle);
 
 err4:
-#endif
 	fci_close(ctx->fci_handle);
 
 err3:
 	fci_close(ctx->fci_catch_handle);
 
 err2:
-#ifdef APP_SOLICIT
-	cmmRtnlKernelModuleUnInit();
-err1:
-#endif
 
 	cmmCtKernelModuleUnInit();
 
@@ -3512,14 +3375,7 @@ void cmmCtExit(struct cmm_ct *ctx)
 {
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
-#if defined(__UCLIBC__)
-	/* workaround uclibc pthread_cancel() bug, force thread to exit */
-#if !defined(IPSEC_SUPPORT_DISABLED)
-	fci_close(ctx->fci_key_catch_handle);
-#endif
-#else
 	pthread_cancel(ctx->pthread);
-#endif
 
 	pthread_join(ctx->pthread, NULL);
 
@@ -3537,20 +3393,13 @@ void cmmCtExit(struct cmm_ct *ctx)
 
 	nfct_close(ctx->catch_handle);
 
-#if !defined(IPSEC_SUPPORT_DISABLED)
 	fci_close(ctx->fci_key_handle);
 
-#if !defined(__UCLIBC__)
 	fci_close(ctx->fci_key_catch_handle);
-#endif
-#endif
 	fci_close(ctx->fci_handle);
 
 	fci_close(ctx->fci_catch_handle);
 
-#ifdef APP_SOLICIT
-	cmmRtnlKernelModuleUnInit();
-#endif
 	cmmCtKernelModuleUnInit();
 
 	if (p_nfconn_update)
@@ -3929,108 +3778,3 @@ void cmmQosmarkSet(struct nf_conntrack *ct, u_int64_t qosmark)
 		nfct_set_attr_u32(ct, ATTR_MARK, (u_int32_t)qosmark);
 #endif
 }
-
-#ifdef C2000_DPI
-/*****************************************************************
-* cmmDPIEnableShow
-*
-*
-******************************************************************/
-int cmmDPIEnableShow(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-	if(globalConf.dpi_enable)
-		cli_print(cli, " The DPI flag is enabled");
-	else
-		cli_print(cli, " The DPI flag is disabled");
-	return CLI_OK;
-}
-
-int cmmDPIFlagProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16_t *res_len)
-{
-        cmmd_dpi_enable_t    *entryCmd = (cmmd_dpi_enable_t*) cmd_buf;
-
-        cmm_print(DEBUG_INFO, "cmmDPIFlagProcessClientCmd\n");
-
-        res_buf[0] = CMMD_ERR_OK;
-        *res_len = 2;
-
-        switch (entryCmd->action) {
-                case CMMD_DPIFLAG_ACTION_ENABLE:
-                        cmm_print(DEBUG_INFO, "cmmDPIFlagProcessClientCmd- CMMD_DPIFLAG_ACTION_ENABLE\n");
-                        globalConf.dpi_enable = 1;
-                        break;
-
-                case CMMD_DPIFLAG_ACTION_DISABLE:
-                        cmm_print(DEBUG_INFO, "cmmDPIFlagProcessClientCmd- CMMD_DPIFLAG_ACTION_DISABLE\n");
-                        globalConf.dpi_enable = 0;
-                        break;
-
-                default:
-                        res_buf[0] = CMMD_ERR_UNKNOWN_ACTION;
-                        break;
-        }
-        return 0;
-}
-
-void cmmDPIFlagPrintHelp(int cmd_type)
-{
-        if (cmd_type == DPI_UNKNOWN_CMD || cmd_type == DPI_ENABLE_CMD)
-        {
-            cmm_print(DEBUG_STDOUT, "Usage: set dpi enable \n"
-                                    "       set dpi disable \n");
-        }
-}
-
-int cmmDPIFlagSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
-{
-	int cmd_type = DPI_UNKNOWN_CMD;
-	int cpt = tabStart;
-	int rc;
-
-	char sndBuffer[256];
-	union u_rxbuf rxbuf;
-	cmmd_dpi_enable_t* entryCmd = (cmmd_dpi_enable_t*) sndBuffer;
-
-	memset(sndBuffer, 0, sizeof(sndBuffer));
-	cmm_print(DEBUG_INFO, "Entered DPI Flag Set Process\n");
-
-	if(!keywords[cpt])
-		goto help;
-
-	if( (strcasecmp(keywords[cpt], "enable") == 0) ||
-	    (strcasecmp(keywords[cpt], "disable") == 0) )
-	{
-		cmd_type = DPI_ENABLE_CMD;
-
-		if(strcasecmp(keywords[cpt], "enable") == 0)
-			entryCmd->action = CMMD_DPIFLAG_ACTION_ENABLE;
-		else
-			entryCmd->action = CMMD_DPIFLAG_ACTION_DISABLE;
-	}
-	else
-		goto keyword_error;
-
-	rc = cmmSendToDaemon(daemon_handle, CMMD_CMD_DPIENABLE, sndBuffer, sizeof(cmmd_dpi_enable_t), rxbuf.rcvBuffer);
-	if(rc != 2)
-	{
-		if(rc >= 0)
-			cmm_print(DEBUG_STDERR, "Unexpected response size for CMD_DPIENABLE: %d\n", rc);
-		return -1;
-	}
-	else if (rxbuf.result != CMMD_ERR_OK)
-	{
-		showErrorMsg("CMD_DPIENABLE", ERRMSG_SOURCE_CMMD, rxbuf.rcvBuffer);
-		return -1;
-	}
-        
-	return 0;
-
-keyword_error:
-	cmm_print(DEBUG_CRIT, "ERROR: Unknown keyword %s\n", keywords[cpt]);
-
-help:
-	cmmDPIFlagPrintHelp(cmd_type);
-	return -1;
-}
-#endif /*C2000_DPI*/
-

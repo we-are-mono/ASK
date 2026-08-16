@@ -7,21 +7,21 @@ inherit externalsrc
 EXTERNALSRC = "${ASK_SRCROOT}/dpa_app"
 EXTERNALSRC_BUILD = "${ASK_SRCROOT}/dpa_app"
 
-DEPENDS = "fmlib fmc libcli libxml2 libxcrypt"
+DEPENDS = "fmlib fmc libxml2 libxcrypt"
 
 # The Yocto fmlib recipe installs include/fmd; fmc installs libfmc.a + headers.
 EXTRA_OEMAKE = " \
     CC='${CC}' \
     CFLAGS='${CFLAGS} \
             -DENDIAN_LITTLE -DLS1043 -DNCSW_LINUX \
-            -DDPAA_DEBUG_ENABLE -DSEC_PROFILE_SUPPORT -DVLAN_FILTER \
+            -DSEC_PROFILE_SUPPORT -DVLAN_FILTER \
             -I${ASK_SRCROOT}/cdx \
             -I${STAGING_INCDIR}/fmc \
             -I${STAGING_INCDIR}/fmd \
             -I${STAGING_INCDIR}/fmd/Peripherals \
             -I${STAGING_INCDIR}/fmd/integrations \
             -I${STAGING_INCDIR}/libxml2' \
-    LDFLAGS='${LDFLAGS} -lpthread -lcli -lfmc -lfm -lstdc++ -lxml2 -lm -lcrypt' \
+    LDFLAGS='${LDFLAGS} -lfmc -lfm -lstdc++ -lxml2 -lm -lcrypt' \
 "
 
 # -DLS1043 is MANDATORY: it selects dpaa_integration_LS1043.h which sets

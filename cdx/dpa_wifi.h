@@ -17,7 +17,6 @@
 #include "portdefs.h"
 #include "system.h"
 
-#define VWD_BHR_MODE 0
 #define VWD_NAS_MODE 1
 #define VWD_BHR_NAS_MODE 2
 
@@ -28,7 +27,6 @@
 #define VWD_MINOR_COUNT         1
 #define VWD_DRV_NAME            "vwd"
 #define VWD_DEV_COUNT           1
-#define VWD_RX_POLL_WEIGHT	64 - 16
 #define	WIFI_TOE_PE_ID	5
 
 #define VWD_INFOSTR_LEN          32
@@ -45,7 +43,6 @@
 #define VAPDEV_BUFSIZE  1700
 #define VAPDEV_BUFCOUNT 1024
 #define VAPBUF_HEADROOM 128
-#define USE_PCD_FQ	1
 #define CDX_VWD_FWD_FQ_MAX (1 << 6)
 
 //values for state
@@ -59,14 +56,10 @@ struct vap_desc_s {
 	struct net_device 			*wifi_dev;
 	unsigned int				ifindex;
 	unsigned int				state;
-	int									cpu_id;
 	char								ifname[IFNAMSIZ];
 	unsigned char  				macaddr[ETH_ALEN];
 	unsigned short 				vapid;
-	unsigned short 				programmed;
-	unsigned short 				bridged;
 	unsigned short  			direct_rx_path;          /* Direct path support from offload device=>VWD */
-	unsigned short  			direct_tx_path;          /* Direct path support from offload VWD=>device */
 	unsigned short				no_l2_itf;
 #ifdef DPAA_VWD_TX_STATS
 	unsigned int 				stop_queue_total[VWD_TXQ_CNT];
@@ -126,17 +119,13 @@ struct dpaa_vwd_priv_s {
 	int 					vwd_major;
 	struct class 				*vwd_class;
 	struct device 				*vwd_device;
-	struct net_device			*vwd_net_dev;
 	struct dpa_priv_s			*eth_priv;
-	struct dpa_bp 				*sg_bp;
 	struct dpa_bp 				*txconf_bp;
 	struct dpa_bp 				*tx_bp;
 	struct port_bman_pool_info		parent_pool_info;
 	uint32_t						oh_port_handle;
 	struct dpa_fq				*wlan_exception_fq;
 	uint32_t						expt_fq_count; /* Number of FQs created to HOST */
-	unsigned int 				vap_dev_hw_features;
-	unsigned int 				vap_dev_features;
 	struct vap_desc_s 	vaps[MAX_WIFI_VAPS];
 	int								vap_count;
 	spinlock_t 				vaplock;
@@ -145,7 +134,6 @@ struct dpaa_vwd_priv_s {
 	int 					fast_bridging_enable;
 	int 					fast_routing_enable;
 	struct vwd_global_stats_s  __percpu         	*vwd_global_stats;
-	u32 					msg_enable;
 };
 
 /* Common stats not corresponding to specific vap*/
@@ -155,16 +143,6 @@ struct vwd_global_stats_s {
 	u32 					pkts_dev_down_drop;
 };
 
-static inline void display_fd(struct qm_fd *fd)
-{
-        printk("fd %p\n", fd);
-        printk("dd %d, eliodn_offset %x, liodn_offset %x, bpid %d\n",
-                fd->dd, fd->eliodn_offset, fd->liodn_offset,
-                fd->bpid);
-        printk("format %d, offset %d, length %d, addr %llx cmd %x\n",
-                fd->format, fd->offset, fd->length20,
-                (uint64_t)fd->addr, fd->cmd);
-}
 int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash);
 int dpaa_get_wifi_dev(uint16_t vap_id, void** netdev);
 int dpaa_get_wifi_ohport_handle( uint32_t* oh_handle);
@@ -175,8 +153,6 @@ int vwd_is_no_l2_itf_device(struct net_device* dev);
 to avoid multiple declarations , declaration added here
 other header files are added in many files where the struct qman_fq 
 definition is not found */
-void cdx_create_fqid_info_in_procfs(uint32_t fqid,
-					struct qman_fq *fq);
 void cdx_remove_fqid_info_in_procfs(uint32_t fqid);
 
 int cdx_wifi_rx_fastpath(struct sk_buff *skb);

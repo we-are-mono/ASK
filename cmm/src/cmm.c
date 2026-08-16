@@ -32,52 +32,16 @@
 struct cmm_global globalConf;
 unsigned int nf_conntrack_max = CONNTRACK_MAX;
 
-#ifdef ARCH_ARM32
-struct kernel_ucontext {
-	unsigned long     uc_flags;
-	struct kernel_ucontext  *uc_link;
-	stack_t           uc_stack;
-	struct sigcontext uc_mcontext;
-	sigset_t          uc_sigmask;
-	/* Allow for uc_sigmask growth.  Glibc uses a 1024-bit sigset_t.  */
-	int               __unused[32 - (sizeof (sigset_t) / sizeof (int))];
-	/* Last for extensibility.  Eight byte aligned because some
-           coprocessors require eight byte alignment.  */
-	unsigned long     uc_regspace[128] __attribute__((__aligned__(8)));
-};
-#endif
-
 static void cmm_crit_err_hdlr(int sig_num, siginfo_t *info, void *ucontext)
 {
-#ifdef ARCH_ARM32
-	struct sigcontext *sigcontext;
-#else
 	mcontext_t *mctx;
 	int i;
-#endif
 #if defined(__GLIBC__) && !defined(__UCLIBC__)
 	void *array[50];
 	char **messages;
 	int size;
 #endif
 
-#ifdef ARCH_ARM32
-	sigcontext = &((struct kernel_ucontext *)ucontext)->uc_mcontext;
-
-	fprintf(stderr, "\n%s: signal %d (%s), fault address is %p at %p PID %d\n",
-		__func__, sig_num, strsignal(sig_num), info->si_addr,
-		(void *)sigcontext->arm_pc, getpid());
-
-	fprintf(stderr, "register dump:\nr0:%08lx r1:%08lx r2:%08lx r3:%08lx r4:%08lx r5:%08lx r6:%08lx r7:%08lx\n",
-		sigcontext->arm_r0, sigcontext->arm_r1, sigcontext->arm_r2, sigcontext->arm_r3,
-		sigcontext->arm_r4, sigcontext->arm_r5, sigcontext->arm_r6, sigcontext->arm_r7);
-
-	fprintf(stderr, "r8:%08lx r9:%08lx r10:%08lx fp:%08lx ip:%08lx sp:%08lx lr:%08lx pc:%08lx\n",
-		sigcontext->arm_r8, sigcontext->arm_r9, sigcontext->arm_r10, sigcontext->arm_fp,
-		sigcontext->arm_ip, sigcontext->arm_sp, sigcontext->arm_lr, sigcontext->arm_pc);
-
-	fprintf(stderr, "cpsr:%08lx fault_address:%08lx\n", sigcontext->arm_cpsr, sigcontext->fault_address);
-#else
 	mctx = &((ucontext_t *)ucontext)->uc_mcontext;
 
 	fprintf(stderr, "\n%s: signal %d (%s), fault address is %p at %p PID %d\n",
@@ -96,17 +60,11 @@ static void cmm_crit_err_hdlr(int sig_num, siginfo_t *info, void *ucontext)
 		(unsigned long long)mctx->pc, (unsigned long long)mctx->sp,
 		(unsigned long long)mctx->fault_address);
 
-#endif
-
 #if defined(__GLIBC__) && !defined(__UCLIBC__)
 	size = backtrace(array, 50);
 
 	/* overwrite sigaction with caller's address */
-#ifdef ARCH_ARM32
-	array[1] = (void *)sigcontext->arm_pc;
-#else
 	array[1] = (void *)mctx->pc;
-#endif
 
 	messages = backtrace_symbols(array, size);
 
@@ -301,8 +259,6 @@ static void sig_term_hdlr(int signum)
 
 	cmm_print(DEBUG_INFO, "%s: entered\n", __func__);
 
-	cmm_third_part_exit(globalConf.third_part_data);
-
 	cmmCliExit(&globalConf.cli);
 
 	cmmDaemonExit(&globalConf.daemon);
@@ -341,7 +297,6 @@ int main (int argc, char ** argv)
   	extern char *optarg;
 	extern int optind;
 	char confFilePath[512+1] = "";
-	//struct sched_param schedParams;
 	struct sigaction action;
 	int option,ii;
 	char *buf;
@@ -358,19 +313,12 @@ int main (int argc, char ** argv)
 	globalConf.vlan_policy = ALLOW;
 	globalConf.ff_enable = 1;
 	globalConf.cli_listenaddr=htonl(INADDR_LOOPBACK);
-#ifdef C2000_DPI
-	globalConf.dpi_enable = 0;
-#endif
 	globalConf.asymff_enable = 0;
 	globalConf.logFile = NULL;
 	globalConf.log_level = 0;
 	globalConf.tun_proto = IPPROTO_IPIP; /* Current default handling of TUN interface is an 4o6 tunnel*/
 	globalConf.tun_family = AF_INET6;
 	globalConf.enable_sam_itfs = 0; /* by default , this option will be disabled */
-
-#ifdef MUTEX_DEBUG
-	mutexes = 0;
-#endif
 
 	action.sa_sigaction = cmm_crit_err_hdlr;
 	sigemptyset (&action.sa_mask);
@@ -489,10 +437,6 @@ int main (int argc, char ** argv)
 		goto err1;
 
 	// Change priority of the process (we need to have a highest priority)
-	//memset(&schedParams, 0 , sizeof(schedParams));
-	//schedParams.sched_priority = 99;
-	//sched_setscheduler(0, SCHED_FIFO, &schedParams);
-
 	//Init process does not set stdout on console
 	if(freopen("/dev/console", "w", stdout) == NULL)
 		goto err0;		
@@ -532,18 +476,11 @@ int main (int argc, char ** argv)
 	if (cmmCliInit(&globalConf.cli) < 0)
 		goto err3;
 
-	/* If callback support is enabled, then CMM calls 3rd Party initialization function */
-	globalConf.third_part_data = cmm_third_part_init();
-
 	sigprocmask(SIG_UNBLOCK, &block_mask, NULL);
 
 	/* Loop until sigterm is received */
 	while (1)
 		pause();
-
-	cmm_print(DEBUG_INFO, "%s: exiting\n", __func__);
-
-	return 0;
 
 err3:
 	cmmDaemonExit(&globalConf.daemon);

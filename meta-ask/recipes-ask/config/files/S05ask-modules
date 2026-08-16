@@ -14,17 +14,6 @@ CONF=/etc/modules-load.d/ask.conf
 case "$1" in
     start|"")
         [ -r "$CONF" ] || exit 0
-        # DEBUG (REVERT-ME after A22 lands): wrap /usr/bin/dpa_app so its
-        # stdout/stderr survive — call_usermodehelper from cdx_main.c drops
-        # both streams. Output goes to /tmp/dpa_app.{stdout,stderr}.
-        if [ ! -e /usr/bin/dpa_app.real ]; then
-            mv /usr/bin/dpa_app /usr/bin/dpa_app.real
-            cat > /usr/bin/dpa_app <<'WRAP'
-#!/bin/sh
-exec /usr/bin/dpa_app.real >>/tmp/dpa_app.stdout 2>>/tmp/dpa_app.stderr
-WRAP
-            chmod +x /usr/bin/dpa_app
-        fi
         grep -v '^[[:space:]]*#' "$CONF" | grep -v '^[[:space:]]*$' | while read mod; do
             modprobe "$mod"
         done

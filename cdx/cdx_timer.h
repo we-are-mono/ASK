@@ -20,7 +20,6 @@
 #define TIME_BEFORE(a, b)	((signed int)((cdx_timer_t)a - (cdx_timer_t)b) < 0)
 #define TIME_BEFORE_EQ(a, b)	((signed int)((cdx_timer_t)a - (cdx_timer_t)b) <= 0)
 #define TIME_AFTER(a, b)	TIME_BEFORE_EQ(b, a)
-#define TIME_AFTER_EQ(a, b)	TIME_BEFORE(b, a)
 
 // The inner wheel should have a maximum period of 1 second.
 // The outer wheel should have a minimum period of 1 minute.

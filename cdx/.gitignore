@@ -6,4 +6,3 @@
 *.d
 Module.symvers
 modules.order
-version.h

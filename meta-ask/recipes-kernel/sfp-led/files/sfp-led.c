@@ -75,7 +75,6 @@
 
 /* Polling interval in milliseconds */
 #define SFP_LED_POLL_INTERVAL_MS	100
-#define SFP_LED_NETDEV_RETRY_MS		1000
 #define SFP_LED_MAX_NETDEV_RETRIES	30
 
 /* SFP I2C addresses per SFP MSA */
@@ -85,13 +84,10 @@
 /* SFP A2h page registers */
 #define SFP_STATUS_CTRL_REG	110	/* Status/Control register */
 #define SFP_STATUS_LOS		BIT(1)	/* RX Loss of Signal */
-#define SFP_STATUS_TX_FAULT	BIT(2)	/* TX Fault */
 
 /* SFP A0h page - cable type detection (per SFP MSA) */
-#define SFP_PHYS_EXT_ID		1	/* Extended identifier */
 #define SFP_COMPLIANCE_3	3	/* 10G/1G Ethernet compliance */
 #define SFP_COMPLIANCE_8	8	/* SFP+ cable technology */
-#define SFP_8472_COMPLIANCE	94	/* SFF-8472 compliance (DDM support) */
 
 /* Byte 3 bits - 1G Ethernet copper compliance */
 #define SFP_IF_1X_COPPER_PASSIVE	BIT(0)

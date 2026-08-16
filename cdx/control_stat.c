@@ -26,7 +26,6 @@
 extern spinlock_t dpa_devlist_lock;
 int stat_Get_Next_SAEntry(PStatIpsecEntryResponse pSACmd, int reset_action);
 void reset_stats_of_sa(PSAEntry pEntry);
-extern int fmdev_get_port_base_addr(struct device *dev, uint32_t *base);
 int gStatIpsecQueryStatus;
 int gIPSecStatQueryTimer;
 

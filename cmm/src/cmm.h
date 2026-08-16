@@ -50,11 +50,7 @@
 #define	IPSEC_FLOW_CACHE
 #endif
 	
-#ifdef NEW_IPC
 	typedef cmm_handle_t *daemon_handle_t;
-#else
-	typedef int daemon_handle_t;
-#endif
 
 	#include "forward_engine.h"
 	#include "rtnl.h"
@@ -83,7 +79,6 @@
 	#include "module_pktcap.h"
 	#include "module_icc.h"
 	#include "module_ipsec.h"
-	#include "third_part.h"
 #ifdef WIFI_ENABLE
 	#include "module_wifi.h"
 #endif
@@ -128,45 +123,9 @@
 	/* This debug is not controlled via CLI */
 	#define IPSEC_DBG
 
-	//#define MUTEX_DEBUG
-
-	#ifdef MUTEX_DEBUG
-	
-	extern pthread_mutex_t ctMutex;
-	extern pthread_mutex_t rtMutex;
-	extern pthread_mutex_t neighMutex;
-#ifdef IPSEC_FLOW_CACHE
-	extern pthread_mutex_t flowMutex;
-#endif /* IPSEC_FLOW_CACHE */
-	
-	int mutexes;
-	#define __pthread_mutex_lock(mutex)		\
-		({	\
-			if (mutex == &ctMutex) mutexes |= 0x1; \
-			else if (mutex == &rtMutex) mutexes |= 0x10; \
-			else if (mutex == &neighMutex) mutexes |= 0x100; \
-			else if (mutex == &flowMutex) mutexes |= 0x1000; \
-			cmm_print(DEBUG_CRIT, "0x%04x: lock at %s %u\n", mutexes, __func__, __LINE__); \
-			pthread_mutex_lock (mutex);	\
-		})
-	#define __pthread_mutex_unlock(mutex)		\
-		({	\
-			if (mutex == &ctMutex) mutexes &= ~0x1; \
-			else if (mutex == &rtMutex) mutexes &= ~0x10; \
-			else if (mutex == &neighMutex) mutexes &= ~0x100; \
-			else if (mutex == &flowMutex) mutexes &= ~0x1000; \
-			cmm_print(DEBUG_CRIT, "0x%04x: unlock at %s %u\n", mutexes, __func__, __LINE__); \
-			pthread_mutex_unlock (mutex);	\
-		})
-
-	#else
 	#define __pthread_mutex_lock pthread_mutex_lock
 	#define __pthread_mutex_unlock pthread_mutex_unlock
-	#endif
 
-
-        /* This macro is used for PPPoE Auto mode */
-        #define PPPOE_AUTO_ENABLE       1
 
 
 #ifndef IPSEC_FLOW_CACHE
@@ -177,9 +136,6 @@
 
 	#define CMM_PID_FILE_PATH "/var/run/cmm.pid"
 
-	/* The following define is enabled if 3rd party callback support is required */
-	//#define CMM_THIRD_PART
-	
 	struct cmm_ct {
 		pthread_t pthread;
 
@@ -228,11 +184,6 @@
                 char rcvBuffer[1024];
         };
 
-	union u_txbuf {
-                uint16_t result;
-                char SndBuffer[CMM_BUF_SIZE];
-        };
-
 #define CMM_MAX_NUM_THREADS 4
 #define CMM_MAX_64K_BUFF_SIZE 64 *1024
 #define CMM_16B_ALIGN 16
@@ -247,9 +198,6 @@
 		int enable;						/*Forward engine can be programmed or not*/
 
 		int ff_enable;						/* Fast-forward enable/disable, all packets go through ACP but all control path is enabled */
-#ifdef C2000_DPI
-		int dpi_enable;						/* DPI enable/disable, CMM pushes connections to FPP normally if disabled */
-#endif
 		int asymff_enable;					/* Asymmetric Fastpath enable/disable*/
 		char debug_level;
 		char log_level;
@@ -272,7 +220,6 @@
 		uint64_t   rtnl_buf_pools_align[CMM_MAX_NUM_THREADS];
 		uint8_t	   cur_rtnl_bufs;
 
-		int *third_part_data;
 		int auto_bridge;
 		unsigned int cli_listenaddr;
 	};
@@ -281,11 +228,6 @@
 	 * This structure is used to exchange messages
 	 * between cmm daemon and cmm client
 	 */
-	struct cmm_msg
-	{
-		long mtype; 				// This field is mandatory to use IPC message queues
-		char buffer[CMM_BUF_SIZE];		// A buffer where the data are stored
-	};
 	/*
 	 * Common parser defines/helpers
 	 */

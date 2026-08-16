@@ -18,20 +18,14 @@
 #include "control_pppoe.h"
 #include "control_socket.h"
 #include "layer2.h"
-//#include "module_hidrv.h"
 #include "control_ipsec.h"
 #include "cdx_dpa_ipsec.h"
 #include "misc.h"
-//#include "module_socket.h"
 
 //#define CONTROL_IPSEC_DEBUG 1
 
-#define SOCKET_NATT	0
-
 TIMER_ENTRY sa_timer;
 int IPsec_Get_Next_SAEntry(PSAQueryCommand  pSAQueryCmd, int reset_action);
-//static int IPsec_Free_Natt_socket_v6(PSAEntry sa);
-//static int IPsec_Free_Natt_socket_v4(PSAEntry sa);
 
 U16 M_ipsec_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
 static int IPsec_handle_CREATE_SA(U16 *p, U16 Length);
@@ -45,14 +39,8 @@ static int IPsec_handle_SA_SET_LIFETIME(U16 *p, U16 Length);
 static int IPsec_handle_FRAG_CFG(U16 *p, U16 Length);
 struct slist_head sa_cache_by_spi[NUM_SA_ENTRIES];
 struct slist_head sa_cache_by_h[NUM_SA_ENTRIES];
-#ifdef UNIQUE_IPSEC_CP_FQID
 struct slist_head sa_cache_by_fqid[NUM_SA_ENTRIES];
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
-struct slist_head dpa_sa_context_list;
-#ifdef PRINT_OFFLOAD_PKT_COUNT 
-extern void print_ipsec_offload_pkt_count(void);
-#endif
 extern void * cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle);
 
 void sa_free(PSAEntry pSA)
@@ -82,11 +70,9 @@ static int sa_add(PSAEntry pSA)
 
 void sa_remove_from_list_fqid(PSAEntry pSA)
 {
-#ifdef UNIQUE_IPSEC_CP_FQID
 	U16 hash;
 	hash = (pSA->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1));
 	slist_remove(&sa_cache_by_fqid[hash], &pSA->list_fqid);
-#endif /* UNIQUE_IPSEC_CP_FQID */
 }
 static void sa_remove(PSAEntry pSA, U32 hash_by_h, U32 hash_by_spi)
 {
@@ -100,21 +86,6 @@ static void sa_remove(PSAEntry pSA, U32 hash_by_h, U32 hash_by_spi)
 	 * remove the table entry and free the Sec_SA context
 	 */
 	cdx_ipsec_release_sa_resources(pSA);
-}
-
-void*  M_ipsec_get_sa_netdev( U16 handle)
-{
-	U16 hash = handle & (NUM_SA_ENTRIES -1);
-	PSAEntry pEntry;
-	struct net_device *net_dev = NULL;
-	struct slist_entry *entry;
-
-	slist_for_each(pEntry, entry, &sa_cache_by_h[hash], list_h)
-	{
-		if (pEntry->handle == handle)
-			net_dev = pEntry->netdev;
-	}
-	return net_dev;
 }
 
 void*  M_ipsec_sa_cache_lookup_by_h( U16 handle)
@@ -422,11 +393,9 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 			sa->flags |= SA_ALLOW_EXT_SEQ_NUM;
 		sa->hash_by_spi = hash_key_sa;
 		sa->hash_by_h   =  handle & (NUM_SA_ENTRIES - 1);
-#ifdef UNIQUE_IPSEC_CP_FQID
 		/* maintaining SA table with cp_to_fqids */
 		slist_add(&sa_cache_by_fqid[(sa->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1))],
 				&sa->list_fqid);
-#endif /* UNIQUE_IPSEC_CP_FQID */
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s(%d) SA pointer %p, FQID hash %d, fqid %d(%x)\n",__func__,__LINE__,sa,
 				(sa->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1)), sa->pSec_sa_context->to_cp_fqid,
@@ -525,34 +494,6 @@ static int IPsec_handle_DELETE_SA(U16 *p, U16 Length)
 
 }
 
-int cdx_ipsec_handle_get_inbound_sagd(U32 spi, U16 * sagd )
-{
-	PSAEntry pEntry;
-	int i;
-
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s::\n", __func__);
-#endif
-	// scan sa_cache and retrun matching handle
-	for(i = 0; i < NUM_SA_ENTRIES; i++)
-	{
-		struct slist_entry *entry;
-		slist_for_each_safe(pEntry, entry, &sa_cache_by_h[i], list_h)
-		{
-			//if((pEntry->direction == CDX_DPA_IPSEC_INBOUND) &&
-			//	(pEntry->id.spi == spi)) { 
-			if(pEntry->direction == CDX_DPA_IPSEC_INBOUND)
-			{
-				*sagd = pEntry->handle ;
-				return NO_ERR;
-			}
-		}
-	}
-
-	return ERR_CT_ENTRY_INVALID_SA;
-}
-
-#ifdef UNIQUE_IPSEC_CP_FQID
 struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
 {
 	PSAEntry sa_ptr;
@@ -577,7 +518,6 @@ struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
 	}
 	return NULL;
 }
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
 
 static int IPsec_handle_FLUSH_SA(U16 *p, U16 Length)
@@ -923,85 +863,7 @@ static int IPsec_handle_FRAG_CFG(U16 *p, U16 Length)
 	return NO_ERR;
 
 }
-//#define PRINT_SA_INFO 1
 
-#ifdef PRINT_SA_INFO 
-static int IPsec_Get_Hash_SAEntries(int sa_handle_index)
-{
-
-	int tot_sa_entries = 0;
-	PSAEntry  pSAEntry;
-	struct slist_entry *entry;
-
-	slist_for_each(pSAEntry, entry, &sa_cache_by_h[sa_handle_index], list_h)
-	{
-		tot_sa_entries++;
-	}
-
-	return tot_sa_entries;
-
-}
-
-void display_sa_info(PSAEntry pSA)
-{
-	struct en_tbl_entry_stats stats;
-
-
-	memset(&stats, 0, sizeof(stats));
-	printk("===========================================\n");
-	printk("SA information::(spi = 0x%x SAGD = %d  )\n",htonl(pSA->id.spi),pSA->handle);	
-	printk("===========================================\n");
-	printk("SA direction : %d\n",pSA->direction);
-	printk("SA route id = %d and route pointer = %p\n", pSA->route_id,pSA->pRtEntry);
-	if(pSA->ct){
-
-		printk("Classification table %p and handle = %p\n",pSA->ct->td,
-				pSA->ct->handle);
-		printk("index = %d\n ",pSA->ct->index);
-		ExternalHashTableEntryGetStatsAndTS(pSA->ct->handle, &stats);
-		{
-			printk(" entry pkt count = %lu and byte count = %lu\n ",
-					(unsigned long)stats.pkts,(unsigned long)stats.bytes );
-		}
-	}else{
-		printk("Hardware ct is NULL\n");
-	}
-}
-extern void print_ipsec_exception_pkt_cnt(void);
-
-int IPsec_print_SAEntrys(PSAQueryCommand  pSAQueryCmd, int reset_action)
-{
-	int ipsec_sa_hash_entries;
-	int sa_hash_index;
-
-	sa_hash_index = 0;
-	while( sa_hash_index < NUM_SA_ENTRIES)
-	{
-		ipsec_sa_hash_entries = IPsec_Get_Hash_SAEntries(sa_hash_index);
-		if(!ipsec_sa_hash_entries) {
-			sa_hash_index++;
-			continue;
-		}
-		{
-			PSAEntry pSAEntry;
-			struct slist_entry *entry;
-
-			slist_for_each(pSAEntry, entry, &sa_cache_by_h[sa_hash_index], list_h)
-			{
-				display_sa_info(pSAEntry);
-				display_fq_info(pSAEntry->pSec_sa_context->dpa_ipsecsa_handle);
-			}
-		}
-		sa_hash_index++;
-	}
-#ifdef PRINT_OFFLOAD_PKT_COUNT 
-	print_ipsec_offload_pkt_count();
-#endif
-	print_ipsec_exception_pkt_cnt();
-	return NO_ERR;
-}
-
-#endif
 
 /**
  * M_ipsec_cmdproc
@@ -1077,9 +939,6 @@ static U16 ipsec_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	U16 rc;
 
 	(void)cmd_len;
-#ifdef PRINT_SA_INFO
-	IPsec_print_SAEntrys((PSAQueryCommand)pcmd, 0);
-#endif
 	rc = (U16)IPsec_Get_Next_SAEntry((PSAQueryCommand)pcmd, 1);
 	if (rc == NO_ERR)
 		*out_reply_len = sizeof(U16) + sizeof(SAQueryCommand);

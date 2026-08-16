@@ -82,8 +82,6 @@ struct physical_port {
 
 /*physical_port flags bit fields */
 #define TX_ENABLED		(1 << 0)
-#define L2_BRIDGE_ENABLED	(1 << 1)
-#define QOS_ENABLED		(1 << 2)
 
 #define INLINE	__inline
 

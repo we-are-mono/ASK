@@ -39,7 +39,7 @@ $(shell mkdir -p $(S))
 .PHONY: all setup sources modules userspace kernel dist serve clean clean-all help \
         cdx fci auto_bridge fmc cmm dpa_app \
         ask-image stage-image \
-        deploy-agent-wan deploy-agent-lan deploy-agents ask-test
+        deploy-agent-wan deploy-agents ask-test
 
 all: modules userspace
 
@@ -152,12 +152,12 @@ cmm: $(S)/libfci $(S)/libnfct
 
 dpa_app: $(S)/fmc
 	$(MAKE) -C dpa_app CC=$(CC) \
-		CFLAGS="-DDPAA_DEBUG_ENABLE -DNCSW_LINUX \
+		CFLAGS="-DNCSW_LINUX \
 		-I$(FMC_DIR) -I$(CURDIR)/cdx \
 		-I$(FMLIB_DIR)/include/fmd \
 		-I$(FMLIB_DIR)/include/fmd/Peripherals \
 		-I$(FMLIB_DIR)/include/fmd/integrations" \
-		LDFLAGS="-lpthread -lcli -L$(FMC_DIR) -lfmc -L$(FMLIB_DIR) -lfm -lstdc++ -lxml2 -lm"
+		LDFLAGS="-L$(FMC_DIR) -lfmc -L$(FMLIB_DIR) -lfm -lstdc++ -lxml2 -lm"
 
 # ============================================================================
 #  Kernel image
@@ -258,7 +258,6 @@ deploy-agent-wan:
 	@echo "==> deploy-agent: wan (local)"
 	sudo install -d $(WAN_PREFIX)
 	sudo rsync -a --delete $(ASKD_AGENT_SRC)/ $(WAN_PREFIX)/askd_agent/
-	sudo rsync -a --delete $(ASK_ORCH_SRC)/   $(WAN_PREFIX)/ask_orch/  2>/dev/null || true
 	sudo install -m0644 $(ASKD_SERVICE) /etc/systemd/system/askd-agent.service
 	@if [ ! -x $(WAN_PREFIX)/venv/bin/python ]; then \
 	    echo "==> wan: bootstrapping venv"; \
@@ -269,24 +268,7 @@ deploy-agent-wan:
 	sudo systemctl enable --now askd-agent.service
 	@echo "==> deploy-agent-wan: done. curl http://127.0.0.1:9110/health to verify."
 
-# The LAN host needs a control-plane NIC reachable from the WAN host at
-# $(LAN_SSH) (default root@172.30.0.10 — override via env/override file
-# if your setup differs). Until that's provisioned, this target will
-# fail — use deploy-agent-wan alone for smoke-testing the WAN half.
-deploy-agent-lan:
-	@echo "==> deploy-agent: lan ($(LAN_SSH))"
-	rsync -a --delete -e ssh $(ASKD_AGENT_SRC)/ $(LAN_SSH):$(LAN_PREFIX)/askd_agent/
-	scp $(ASKD_SERVICE) $(LAN_SSH):/tmp/askd-agent.service
-	ssh $(LAN_SSH) 'set -e; \
-	    sudo mv /tmp/askd-agent.service /etc/systemd/system/; \
-	    [ -x $(LAN_PREFIX)/venv/bin/python ] || sudo python3 -m venv $(LAN_PREFIX)/venv; \
-	    sudo $(LAN_PREFIX)/venv/bin/pip install --quiet --upgrade $(ASKD_REQUIREMENTS); \
-	    sudo apt-get install -y --no-install-recommends python3-scapy; \
-	    sudo systemctl daemon-reload; \
-	    sudo systemctl enable --now askd-agent.service'
-	@echo "==> deploy-agent-lan: done."
-
-deploy-agents: deploy-agent-wan deploy-agent-lan
+deploy-agents: deploy-agent-wan
 
 # Run the end-to-end test suite. Does NOT auto-deploy — assumes the DUT
 # is already on the test image; the conftest's autouse reachability

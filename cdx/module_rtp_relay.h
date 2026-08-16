@@ -12,85 +12,23 @@
 
 #define NUM_RTPFLOW_ENTRIES 	256
 
-#define MAX_RTP_STATS_ENTRY 64
 
 #define RTP_SPECIAL_PAYLOAD_LEN	160
 
 #define RTP_MIN_SEQUENTIAL	2
-#define RTP_MAX_DROPOUT 	3000
-#define RTP_LATE_THRESH 	0xFF00
-#define RTP_SEQ_MOD			1 << 16
-
-#define RTP_MAX_SEQNUM	0xFFFF
-
-enum {
-	RCVD_OK,
-	RCVD_ERR,
-	RCVD_FIRST_PACKET,				// 1st received packet
-	RCVD_IN_ORDER_PACKET,			// sequential packet
-	RCVD_OUT_OF_ORDER_PACKET,		// out-of-order packet (could be late or duplicated)
-	RCVD_FIRST_UNEXPECTED_PACKET,	// large jump of seq.
-	RCVD_SECOND_SEQUENTIAL_PACKET,	// 2nd of the new seq.
-	RCVD_LATE_PACKET,
-	RCVD_DUPLICATED_PACKET,
-	RCVD_NEW_SSRC_DECTECTED,
-	INVALID
-};
 
 
-typedef enum {
-	RTCP_SR		= 200,
-	RTCP_RR		= 201,
-	RTCP_SDES	= 202,
-	RTCP_BYE	= 203,
-	RTCP_APP	= 204,
-	RTCP_XR 	= 207
-}rtcp_type_t;
 
 
-typedef enum {
-	RTP_PT_G711U	= 0,
-	RTP_PT_G711A	= 8,
-} rtp_pt_t;
 
 
-#ifdef ENDIAN_LITTLE
-typedef struct RTP_HDR_STRUCT
-{
-	U8	cc:4;		// CSRC count
-	U8	x:1;		// header extension flag
-	U8	p:1;		// padding flag
-	U8	version:2;	// protocol version
-	U8	pt:7;		// payload type
-	U8	m:1;		// marker bit
-	U16 seq;		// sequence number
-	U32 ts;			// timestamp
-	U32 ssrc;		// synchronization source
-} __attribute__((packed)) rtp_hdr_t;
-#else
-typedef struct RTP_HDR_STRUCT
-{
-	U8	version:2;	// protocol version
-	U8	p:1;		// padding flag
-	U8	x:1;		// header extension flag
-	U8	cc:4;		// CSRC count
-	U8	m:1;		// marker bit
-	U8	pt:7;		// payload type
-	U16 seq;		// sequence number
-	U32 ts;			// timestamp
-	U32 ssrc;		// synchronization source
-} __attribute__((packed)) rtp_hdr_t;
-#endif
+
+
 
 
 #define  RTP_HDR_SIZE	12
 
-#define RTP_DISCARD	0x0
-#define RTP_RELAY		0x1
 
-#define FLOW_VALID		(1 << 0)
-#define FLOW_USED		(1 << 1)
-#define FLOW_UPDATING	(1 << 2)
 
 
 #define	RTP_OFFLOAD_PROCESS_PKT		0x01 // state to mention whether to discard or process
@@ -136,8 +74,6 @@ struct _thw_RTPinfo {
 //	U8		TS_takeover;
 //	U8		call_update_seen;
 //	uint8_t		takeover_mode;
-//	U8		Special_tx_active;
-//	uint8_t		Special_tx_type;
 //	uint8_t		first_packet;
 }__attribute__ ((packed));
 
@@ -187,7 +123,6 @@ typedef struct _thw_rtpflow {
 	
 	/* These fields are only used by host software (not fetched by data path), so keep them at the end of the structure */
 	struct dlist_head 	list;
-	unsigned long		removal_time;
 }hw_rtpflow, *Phw_rtpflow;
 
 /* control path SW flow entry */
@@ -235,8 +170,6 @@ typedef struct _tRTPcall {
 	U8		Special_payload2[RTP_SPECIAL_PAYLOAD_LEN];
 	U8		Next_Special_payload1[RTP_SPECIAL_PAYLOAD_LEN];
 	U8		Next_Special_payload2[RTP_SPECIAL_PAYLOAD_LEN];
-	U8		Special_tx_active;
-	U8		Special_tx_type;
 }RTPCall, *PRTPCall;
 
 typedef struct _tRTCPStats {
@@ -313,7 +246,6 @@ typedef struct _tRTPTakeoverCommand {
 #define SSRC_TAKEOVER           0x04
 #define MARKER_BIT_TAKEOVER     0x08
 #define SSRC_1_TAKEOVER         0x10
-#define FEATURE_TAKEOVER_MASK   0x1F
 
 
 typedef struct _tRTPControlCommand {
@@ -376,7 +308,6 @@ typedef struct _tRTCPQueryResponse {
 
 /**************** RTP Statistics for FF connections *******************/
 
-#define RTP_STATS_FREE 0xFFFF
 
 #define RTP_STATS_FULL_RESET 	1
 #define RTP_STATS_PARTIAL_RESET 2
@@ -390,25 +321,8 @@ typedef struct _tRTCPQueryResponse {
 #define RLY	4
 #define RLY6	5
 
-typedef struct _tRTP_enable_stats_command {
-	U16 stream_id;
-	U16 stream_type;
-	U32 saddr[4];
-	U32 daddr[4];
-	U16 sport;
-	U16 dport;
-	U16 proto;
-	U16 mode;
-}RTP_ENABLE_STATS_COMMAND, *PRTP_ENABLE_STATS_COMMAND;
 
-typedef struct _tRTP_disable_stats_command {
-	U16 stream_id;
-}RTP_DISABLE_STATS_COMMAND, *PRTP_DISABLE_STATS_COMMAND;
 
-typedef struct _tRTP_query_stats_command {
-	U16 stream_id;
-	U16 flags;
-}RTP_QUERY_STATS_COMMAND, *PRTP_QUERY_STATS_COMMAND;
 
 typedef struct _tRTP_dmtf_pt_command {
 	U16 pt;
@@ -417,13 +331,10 @@ typedef struct _tRTP_dmtf_pt_command {
 extern U8 gDTMF_PT[2];
 
 extern struct slist_head rtpflow_cache[];
-extern struct slist_head rtpcall_cache;
 
 int rtp_relay_init(void);
 void rtp_relay_exit(void);
 
-
-PRTPflow RTP_find_flow(U16 in_socket);
 
 void cdx_ehash_set_rtp_info_params(uint8_t *rtp_relay_param, PRTPflow pFlow, PSockEntry pSocket);
 void cdx_ehash_update_dtmf_rtp_info_params(uint8_t *rtp_relay_param, uint8_t *DTMF_PT);

@@ -16,8 +16,6 @@ from __future__ import annotations
 
 import errno
 
-import pytest
-
 
 NON_ROOT_UID = 1000
 

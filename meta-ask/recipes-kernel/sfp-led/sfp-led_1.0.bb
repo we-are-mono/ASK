@@ -14,9 +14,6 @@ SRC_URI = " \
 S = "${WORKDIR}/sources"
 UNPACKDIR = "${S}"
 
-# Depends on SFP bus being available
-DEPENDS += "virtual/kernel"
-
 do_install:append() {
     if ${@bb.utils.contains('DISTRO_FEATURES', 'systemd', 'true', 'false', d)}; then
         # systemd: modules-load.d

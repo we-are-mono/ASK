@@ -134,21 +134,12 @@ int cmmMc6QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
                 int i, listner_count;
 		if(mc6_entry->dst_addr[0] & 0xFF)
 		{
-#if defined(LS1043)
 	                cmm_print(DEBUG_STDOUT, "\n%04d: Ingress Interface: %s Src addr: %s  src_mask_len: %x   Dst addr: %s   Queue: 0x%x \n\n", count,
                                   mc6_entry->input_device_str,
                 	          inet_ntop(AF_INET6, &mc6_entry->src_addr, buf1, INET6_ADDRSTRLEN),
                         	  mc6_entry->src_mask_len,
 	                          inet_ntop(AF_INET6, &mc6_entry->dst_addr, buf2, INET6_ADDRSTRLEN),
 				  mc6_entry->queue );
-#else
-	                cmm_print(DEBUG_STDOUT, "\n%04d: Src addr: %s  src_mask_len: %x   Dst addr: %s   Queue: 0x%x \n\n",
-        	                  count,
-                	          inet_ntop(AF_INET6, &mc6_entry->src_addr, buf1, INET6_ADDRSTRLEN),
-                        	  mc6_entry->src_mask_len,
-	                          inet_ntop(AF_INET6, &mc6_entry->dst_addr, buf2, INET6_ADDRSTRLEN),
-				  mc6_entry->queue );
-#endif
 			count++;
 		}
                 listner_count = mc6_entry->num_output;
@@ -187,14 +178,7 @@ int cmmMc6QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
  ************************************************************/
 void cmmMc6SetPrintHelp()
 {
-#ifdef COMCERTO_2000	
-	cmm_print(DEBUG_STDOUT, "Usage: set mc6 interface {if_name} {add | del | update } \n\tgroup {bit_mask} {IPv6 Src Address} {IPv6 Multicast Dst Address} [mode {bridged | routed}] [queue {0..19}] \n\t[listener [timer {timer_value1}] [shapers {0..0xFF}][mc | uc {Mac addr1} ] [queue {0..19}]] [if {if_name}] \n\t [ listener [timer {timer_value2}]  [shapers {0..0xFF}][mc | uc {Mac addr2} ] [queue {0..19}]] [if {if_name}]...  \n\t[ listener [timer {timer_valueN}]  [shapers {0..0xFF}][mc | uc {Mac addrN} ] [queue {0..19}]] [if {if_name}]");
-#elif defined(LS1043)
 	cmm_print(DEBUG_STDOUT, "Usage: set mc6 ingress_interface {if_name} interface {if_name} {add | del | update } \n\tgroup {bit_mask} {IPv6 Src Address} {IPv6 Multicast Dst Address} [mode {bridged | routed}] [queue {0..31}]\n\t[listener [timer {timer_value1}] [shapers {0..0xFF}][mc | uc {Mac addr1} ] [queue {0..31}]] [if {if_name}] \n\t [ listener [timer {timer_value2}]  [shapers {0..0xFF}][mc | uc {Mac addr2} ] [queue {0..31}]] [if {if_name}]...  \n\t[ listener [timer {timer_valueN}]  [shapers {0..0xFF}][mc | uc {Mac addrN} ] [queue {0..31}]] [if {if_name}] ");
-#else
-	cmm_print(DEBUG_STDOUT, "Usage: set mc6 interface {if_name} {add | del | update } \n\tgroup {bit_mask} {IPv6 Src Address} {IPv6 Multicast Dst Address} [mode {bridged | routed}] [queue {0..31}]\n\t[listener [timer {timer_value1}] [shapers {0..0xFF}][mc | uc {Mac addr1} ] [queue {0..31}]] [if {if_name}] \n\t [ listener [timer {timer_value2}]  [shapers {0..0xFF}][mc | uc {Mac addr2} ] [queue {0..31}]] [if {if_name}]...  \n\t[ listener [timer {timer_valueN}]  [shapers {0..0xFF}][mc | uc {Mac addrN} ] [queue {0..31}]] [if {if_name}] ");
-
-#endif
 	cmm_print(DEBUG_STDOUT, "\n\nUsage:set mc6 mode route|bridge\n");
 }
 
@@ -342,7 +326,6 @@ int cmmMc6SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 
 	if(!keywords[cpt])
 		goto help;
-#if defined(LS1043)
 	if(strcasecmp(keywords[cpt], "ingress_interface") == 0)
 	{
 		if(!keywords[++cpt])
@@ -362,7 +345,6 @@ int cmmMc6SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
         {
           goto keyword_error;
         }
-#endif
 
 	if(strcasecmp(keywords[cpt], "interface") == 0)
 	{

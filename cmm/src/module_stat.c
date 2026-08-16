@@ -28,11 +28,7 @@ void cmmStatShowPrintHelp()
 	char buf[128];
 
 	print_all_gemac_ports(buf, 128);
-#ifndef LS1043
-	cmm_print(DEBUG_STDOUT, "Usage: show stat queue {queue_no} interface {%s} query|query_reset\n"
-#else
 	cmm_print(DEBUG_STDOUT, "Usage: "
-#endif
 				"       show stat interface {%s} query|query_reset\n"
 				"       show stat vlan query|query_reset\n"
 				"       show stat connection query\n"
@@ -42,9 +38,6 @@ void cmmStatShowPrintHelp()
 				"       show stat ipsec query|query_reset\n"
 #if defined(FLOW_STATS)
 				"       show stat flow query|query_reset|reset sip {sip} dip {dip} sport {sport} dport {dport} proto {protonumber}\n"
-#endif
-#ifndef LS1043
-				, buf
 #endif
 				, buf);
 }
@@ -193,11 +186,6 @@ int cmmStatShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
         union u_rxbuf rxbuf;
 	char *pinterface;
 	unsigned short interface;
-#ifndef LS1043
-	char * endptr;
-	unsigned int tmp;
-	fpp_stat_queue_cmd_t queueShowCmd;
-#endif
 	fpp_stat_interface_cmd_t interfaceShowCmd;
 	fpp_stat_connection_cmd_t connShowCmd;
 	fpp_stat_pppoe_status_cmd_t pppoeStatusCmd;
@@ -205,9 +193,6 @@ int cmmStatShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 	fpp_stat_ipsec_status_cmd_t ipsecStatusCmd;
 	fpp_stat_vlan_status_cmd_t vlanStatusCmd;
 	fpp_stat_tunnel_status_cmd_t tunnelStatusCmd;
-#ifndef LS1043
-	fpp_stat_queue_response_t *queueStatRsp;
-#endif
 	fpp_stat_interface_pkt_response_t *interfacePktStatRsp;
 	fpp_stat_conn_response_t *connStatRsp;
 #if defined(FLOW_STATS)
@@ -225,54 +210,6 @@ int cmmStatShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 	//goto help
 	if(!keywords[cpt])
 		goto help;
-#ifndef LS1043
-	if(strcasecmp(keywords[cpt], "queue") == 0)
-	{
-		if(!keywords[++cpt])
-			goto help;
-
-		/*Get an integer from the string*/
-		endptr = NULL;
-		tmp = strtoul(keywords[cpt], &endptr, 0);
-		if ((keywords[cpt] == endptr) || (tmp >= FPP_NUM_QUEUES))
-		{
-			cmm_print(DEBUG_CRIT, "Stat ERROR: Queue Number must be a number between 0 and %d\n", FPP_NUM_QUEUES - 1);
-			goto help;
-		}
-		queueShowCmd.queue = tmp;
-
-		if(!keywords[++cpt])
-			goto help;
-
-		if(strcasecmp(keywords[cpt], "interface") != 0) 
-			goto keyword_error;
-
-		if(!keywords[++cpt])
-			goto help;
-
-		pinterface = keywords[cpt];
-		if (parse_interface(pinterface, &interface) < 0)
-			goto help;
-
-		queueShowCmd.interface = interface;
-
-		if(!keywords[++cpt])
-			goto help;
-
-		if(strcasecmp(keywords[cpt], "query") == 0) 
-		{
-			queueShowCmd.action = FPP_CMM_STAT_QUERY;
-		}
-		else if(strcasecmp(keywords[cpt], "query_reset") == 0) 
-		{
-			queueShowCmd.action = FPP_CMM_STAT_QUERY_RESET;
-		}
-		else
-			goto keyword_error;
-
-		cmdToSend |= CMD_BIT(FPP_CMD_STAT_QUEUE);
-	}
-#endif
 	else if(strcasecmp(keywords[cpt], "interface") == 0)
 	{
 		if(!keywords[++cpt])
@@ -441,26 +378,6 @@ int cmmStatShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 #endif
 	else
 		goto keyword_error;
-#ifndef LS1043
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_QUEUE))
-	{
-		/* Send CMD_STAT_QUEUE command */
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_STAT_QUEUE, & queueShowCmd, sizeof(queueShowCmd), rxbuf.rcvBuffer);
-
-		if ( rcvBytes != sizeof(fpp_stat_queue_response_t))
-		{
-			cmm_print(DEBUG_STDERR, "ERROR: Unexpected returned result from FPP rc:%04x\n",
-						  (rcvBytes < sizeof(unsigned short) ) ? 0 : rxbuf.result);
-  			goto exit;
-                }
-		else
-		{
-			queueStatRsp = (fpp_stat_queue_response_t *)(rxbuf.rcvBuffer);
-			cmm_print(DEBUG_STDOUT, "Emitted Pkts: 0x%0x \n" "Dropped Packets: 0x%0x\n" "Peak Queue Occupancy: 0x%0x \n",
-						queueStatRsp->emitted_pkts, queueStatRsp->dropped_pkts, queueStatRsp->peak_queue_occ);
-		}
-	}
-#endif
 
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_INTERFACE_PKT))
 	{
@@ -861,15 +778,6 @@ void cmmStatSetPrintHelp(int cmd_type)
 	print_all_gemac_ports(buf, 128);
 	if (cmd_type == FPP_STAT_UNKNOWN_CMD || cmd_type == FPP_STAT_ENABLE_CMD)
 	{
-#ifndef LS1043
-#if defined(FLOW_STATS)
-	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {queue|interface|vlan|pppoe|bridge|ipsec|tunnel|flow}\n"
-		                     "      set stat disable {queue|interface|vlan|pppoe|bridge|ipsec|tunnel|flow}\n");
-#else
-	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {queue|interface|vlan|pppoe|bridge|ipsec|tunnel}\n"
-		                     "      set stat disable {queue|interface|vlan|pppoe|bridge|ipsec|tunnel}\n");
-#endif
-#else
 #if defined(FLOW_STATS)
 	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {interface|vlan|pppoe|bridge|ipsec|tunnel|flow}\n"
 		                     "      set stat disable {interface|vlan|pppoe|bridge|ipsec|tunnel|flow}\n");
@@ -877,15 +785,7 @@ void cmmStatSetPrintHelp(int cmd_type)
 	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {interface|vlan|pppoe|bridge|ipsec|tunnel}\n"
 		                     "      set stat disable {interface|vlan|pppoe|bridge|ipsec|tunnel}\n");
 #endif
-#endif
 	}
-#ifndef LS1043
-	if (cmd_type == FPP_STAT_UNKNOWN_CMD || cmd_type == FPP_STAT_QUEUE_CMD)
-	{
-	    cmm_print(DEBUG_STDOUT, 
-                      "Usage: set stat queue {queue_no} interface {%s} reset \n", buf);
-      	}
-#endif
 	if (cmd_type == FPP_STAT_UNKNOWN_CMD || cmd_type == FPP_STAT_INTERFACE_PKT_CMD)
 	{
 	    cmm_print(DEBUG_STDOUT, 
@@ -949,14 +849,8 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
         int rcvBytes = 0;
 	char *pinterface;
 	unsigned short interface;
-#ifndef LS1043
-	unsigned int tmp;
-#endif
 
 	fpp_stat_enable_cmd_t statEnableCmd;
-#ifndef LS1043
-	fpp_stat_queue_cmd_t queueResetCmd;  
-#endif
 	fpp_stat_interface_cmd_t interfaceResetCmd;
 	fpp_stat_pppoe_status_cmd_t pppoeResetCmd;
 	fpp_stat_bridge_status_cmd_t bridgeResetCmd;
@@ -984,10 +878,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 
 		if(!keywords[++cpt])
 			goto help;
-#ifndef LS1043
-		if(strcasecmp(keywords[cpt], "queue") == 0)
-			statEnableCmd.bitmask = FPP_STAT_QUEUE_BITMASK;
-#endif
 		else if(strcasecmp(keywords[cpt], "interface") == 0)
 			statEnableCmd.bitmask = FPP_STAT_INTERFACE_BITMASK;
 		else if(strcasecmp(keywords[cpt], "pppoe") == 0)
@@ -1010,48 +900,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 		cmdToSend |= CMD_BIT(FPP_CMD_STAT_ENABLE);
 	
 	}
-#ifndef LS1043
-	else if(strcasecmp(keywords[cpt], "queue") == 0)
-	{
-		cmd_type = FPP_STAT_QUEUE_CMD;
-		if(!keywords[++cpt])
-			goto help;
-
-		/*Get an integer from the string*/
-		endptr = NULL;
-		tmp = strtoul(keywords[cpt], &endptr, 0);
-		if ((keywords[cpt] == endptr) || (tmp >= FPP_NUM_QUEUES))
-		{
-			cmm_print(DEBUG_CRIT, "Stat ERROR: Queue Number must be a number between 0 and %d\n", FPP_NUM_QUEUES - 1);
-			goto help;
-		}
-		memset(&queueResetCmd, 0, sizeof(queueResetCmd));
-		queueResetCmd.queue= tmp;
-		if(!keywords[++cpt])
-			goto help;
-
-		if(strcasecmp(keywords[cpt], "interface") != 0)
-			goto keyword_error;
-
-		if(!keywords[++cpt])
-			goto help;
-
-		pinterface = keywords[cpt];
-		if (parse_interface(pinterface, &interface) < 0)
-			goto help;
-
-		queueResetCmd.interface = interface;
-
-		if(!keywords[++cpt])
-			goto help;
-
-		if(strcasecmp(keywords[cpt], "reset") != 0)
-			goto help;
-
-		queueResetCmd.action = FPP_CMM_STAT_RESET;
-		cmdToSend |= CMD_BIT(FPP_CMD_STAT_QUEUE);
-	}
-#endif
 	else if(strcasecmp(keywords[cpt], "interface") == 0)
 	{
 		cmd_type = FPP_STAT_INTERFACE_PKT_CMD;
@@ -1190,13 +1038,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 		/* Send CMD_STAT_ENABLE command */
 		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_STAT_ENABLE, &statEnableCmd, sizeof(statEnableCmd), rxbuf.rcvBuffer);
 	}
-#ifndef LS1043
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_QUEUE))
-	{
-		/* Send CMD_STAT_QUEUE command */
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_STAT_QUEUE, &queueResetCmd, sizeof(queueResetCmd), rxbuf.rcvBuffer);
-	}
-#endif
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_INTERFACE_PKT))
 	{
 		/* Send CMD_STAT_INTERFACE_PKT command */

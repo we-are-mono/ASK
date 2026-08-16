@@ -16,7 +16,6 @@
 #define MC6_MAX_LISTENERS_IN_QUERY    MC_MAX_LISTENERS_IN_QUERY
 #define MC_MAX_LISTENERS_PER_GROUP 8
 #define MC4_MAX_LISTENERS_PER_GROUP  MC_MAX_LISTENERS_PER_GROUP
-#define MC6_MAX_LISTENERS_PER_GROUP  MC_MAX_LISTENERS_PER_GROUP
 
 typedef struct _tMC4Output {
         U32             timer;
@@ -95,7 +94,6 @@ struct mcast_group_info
 #define CDX_MC_ACTION_ADD			0
 #define CDX_MC_ACTION_REMOVE			1
 #define CDX_MC_ACTION_UPDATE       		2
-#define CDX_MC_ACTION_REMOVE_LOCAL       	11
 
 int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
 						uint8_t *ingress_iface);
@@ -120,7 +118,6 @@ extern spinlock_t *mc6_spinlocks;
 int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6);
 
 struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo);
-int dpa_classif_mcast_free_group(int grpd);
 int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action);
 int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action);
 int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);

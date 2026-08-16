@@ -23,22 +23,10 @@
 #include "rtnl.h"
 #include "list.h"
 
-#ifdef LS1043
 #define GEM_PORTS 7
-#elif defined(COMCERTO_2000) && !defined(LS1012A)
-#define GEM_PORTS 3
-#elif LS1012A
-#define GEM_PORTS 2
-#elif LS1088
-#define GEM_PORTS 3
-#else
-#define GEM_PORTS 2
-#endif
 
 /* default value for WAN interface is eth0, and LAN interface is eth2 */
 #define GEMAC0_PORT	0 //do not change !
-#define GEMAC1_PORT	1 //do not change !
-#define GEMAC2_PORT	2 //do not change !
 
 struct gemac_port {
 	char ifname[IFNAMSIZ];
@@ -243,7 +231,6 @@ struct interface {
 	int tunnel_family;
 	int tunnel_enabled;
 
-	int count;
 	int flags;
 #ifdef WIFI_ENABLE
 	struct wifi_ff_entry *wifi_if;
@@ -267,10 +254,8 @@ struct interface_table {
 
 extern struct interface_table itf_table;
 extern int LO_IFINDEX;
-struct gemac_port ;
 
 struct interface *__itf_get(int ifindex);
-void __itf_put(struct interface *itf);
 struct interface *__itf_find(int ifindex);
 
 int itf_table_init(struct interface_table *ctx);
@@ -303,9 +288,9 @@ int itf_match_src_ipaddr(int ifindex, int family, unsigned int *ipaddr);
 int cmmRtnlLink(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg);
 int cmmRtnlIfAddr(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg);
 #if defined(LS1043)
-int cmmFeUpdateAllBridgedIfs( FCI_CLIENT *fci_handle, int fd, struct interface *bitf);
+int cmmFeUpdateAllBridgedIfs( FCI_CLIENT *fci_handle, struct interface *bitf);
 int cmmGetBridgedItf(struct interface *br_itf);
-int cmmFeBridgedIfUpdate(FCI_CLIENT *fci_handle, int fd, struct interface *itf);
+int cmmFeBridgedIfUpdate(FCI_CLIENT *fci_handle, struct interface *itf);
 #endif
 
 #ifdef VLAN_FILTER

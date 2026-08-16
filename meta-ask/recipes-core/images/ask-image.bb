@@ -83,10 +83,6 @@ IMAGE_FSTYPES = "cpio.gz"
 IMAGE_FEATURES += "empty-root-password"
 IMAGE_FEATURES:remove = "package-management"
 
-# Bundle the initramfs into the kernel Image so U-Boot only needs to
-# tftpboot a single file.
-INITRAMFS_IMAGE_BUNDLE = "1"
-
 # Skip a root filesystem for this boot — everything lives in the initramfs.
 USE_DEVFS = "0"
 

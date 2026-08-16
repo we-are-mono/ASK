@@ -156,7 +156,6 @@ int rx_Get_Next_Hash_L2FlowEntry(PL2BridgeL2FlowEntryCommand pL2FlowCmd, int res
 	//get all entries into snapshot buffer at this index
 	rx_Get_Hash_Snapshot_L2FlowEntries(L2Flow_hash_index, pL2FlowSnapshot);
 	L2Flow_hash_index++;
-	//release the bucket
 return_next_entry:
 	memcpy(pL2FlowCmd, &pL2FlowSnapshot[L2Flow_snapshot_index], sizeof(L2BridgeL2FlowEntryCommand));
 	//move to next index

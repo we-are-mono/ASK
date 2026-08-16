@@ -18,7 +18,6 @@
 
 
 /* Modes */
-#define L2_BRIDGE_MODE_MANUAL		0	
 #define L2_BRIDGE_MODE_AUTO		1
 
 /* Timer */
@@ -26,7 +25,6 @@
 
 /* Status */
 #define L2_BRIDGE_TIMED_OUT		0x1
-#define L2FLOW_UPDATING			(1 << 0)
 
 //flow table bucket head
 struct flow_bucket {
@@ -68,12 +66,6 @@ struct L2Flow_entry {
 	TIMER_ENTRY timer;
 };
 
-/* L2 Bridging Enable command */
-typedef struct _tL2BridgeEnableCommand {
-	U16 interface;
-	U16 enable_flag;
-	U8 input_name[16];
-}L2BridgeEnableCommand, *PL2BridgeEnableCommand;
 
 /* L2 Bridging  Flow entry command */
 typedef struct _tL2BridgeL2FlowEntryCommand {
@@ -143,6 +135,4 @@ int delete_l2br_entry_classif_table(struct L2Flow_entry *entry);
 int rx_Get_Next_Hash_L2FlowEntry(PL2BridgeL2FlowEntryCommand pL2FlowCmd, int reset_action);
 int add_l2flow_to_hw(struct L2Flow_entry *entry);
 cdx_timer_t br_get_time_remaining(struct L2Flow_entry *pEntry);
-int bridge_interface_register(uint8_t *name, U16 phy_port_id);
-int bridge_interface_deregister(U16 phy_port_id);
 #endif /* _CONTROL_BRIDGE_H_ */

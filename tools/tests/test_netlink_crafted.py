@@ -26,7 +26,6 @@ import pytest
 
 NETLINK_L2FLOW    = 33
 L2FLOW_MSG_ENTRY  = 17   # from enum l2flow_msg_types
-L2FLOWA_SVLAN_TAG = 1
 L2FLOWA_IP_SRC    = 6
 L2FLOWA_IP_PROTO  = 8
 NLM_F_REQUEST     = 1

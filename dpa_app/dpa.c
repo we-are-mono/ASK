@@ -28,8 +28,6 @@
 
 //uncomment to enable debug messages from this app
 //#define DPA_C_DEBUG 	1
-#define MAX_FMAN_PORTS 	16
-#define MAX_TABLES 	64
 #define SP_OFFSET 	0x20
 
 //default configuration, pcd and pdl files 
@@ -131,12 +129,10 @@ static struct model_dist_params dist_name[] = {
 	{(char *)"cdx_esp6_dist", 	IPV6_ESP_DIST},
 	{(char *)"cdx_pppoe_dist",      PPPOE_DIST},
 	{(char *)"cdx_ethernet_dist", 	ETHERNET_DIST},
-#ifdef CDX_RTP_RELAY // RTP relay support
 	{(char *)"cdx_tup3udp4_dist", 	IPV4_3TUPLE_UDP_DIST},
 	{(char *)"cdx_tup3tcp4_dist", 	IPV4_3TUPLE_TCP_DIST},
 	{(char *)"cdx_tup3udp6_dist", 	IPV6_3TUPLE_UDP_DIST},
 	{(char *)"cdx_tup3tcp6_dist", 	IPV6_3TUPLE_TCP_DIST},
-#endif //CDX_RTP_RELAY
 	{(char *)"cdx_ipv4frag_dist",   IPV4_FRAG_DIST},
     {(char *)"cdx_ipv6frag_dist",   IPV6_FRAG_DIST},
 };

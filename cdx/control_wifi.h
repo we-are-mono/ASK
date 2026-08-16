@@ -23,7 +23,6 @@ typedef struct tWifiIfDesc
 
 typedef struct tRX_wifi_context {
    U16 users;
-   U16  enabled;
 }RX_wifi_context;
 
 typedef struct wifi_vap_query_response
@@ -43,7 +42,6 @@ struct wifiCmd
 };
 #define WIFI_ADD_VAP       0
 #define WIFI_REMOVE_VAP    1
-#define WIFI_UPDATE_VAP    2
 
 
 int wifi_init(void);

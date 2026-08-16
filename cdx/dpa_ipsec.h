@@ -13,9 +13,6 @@
 #ifndef DPA_IPSEC_H
 #define DPA_IPSEC_H
 
-#define  UNIQUE_IPSEC_CP_FQID
-
-
 /* following flags are used to set in context A field of FQD */
 #define CDX_FQD_CTX_A_OVERRIDE_FQ	0x80
 #define CDX_FQD_CTX_A_IGNORE_CMD	0x40
@@ -35,19 +32,13 @@
 
 #define FQ_FROM_SEC		0
 #define FQ_TO_SEC		1
-#ifdef UNIQUE_IPSEC_CP_FQID
 #define FQ_TO_CP		2 /* creating a frame queue to receive a packet to CP */
-#endif
 
 
-#ifdef UNIQUE_IPSEC_CP_FQID
 /*If we have to avoid adding sagd in packet, we need to use this
   logic, currently some issue with this ,
   so adding this code under a macro */
 #define NUM_FQS_PER_SA	3 /* creating 3 frame queues per SA */
-#else
-#define NUM_FQS_PER_SA	2 /* creating 2 frame queues per SA */
-#endif
 
 
 #define IPSEC_FMAN_IDX		0
@@ -104,9 +95,7 @@ int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td,
 int cdx_dpa_ipsecsa_release(void *handle) ;
 uint32_t get_fqid_to_sec(void *handle);
 uint32_t get_fqid_from_sec(void *handle);
-#ifdef UNIQUE_IPSEC_CP_FQID
 uint32_t ipsec_get_to_cp_fqid(void *handle);
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
 struct sec_descriptor *get_shared_desc(void *handle);
 

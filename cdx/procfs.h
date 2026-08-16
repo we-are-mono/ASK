@@ -45,8 +45,6 @@ enum {
 int cdx_init_fqid_procfs(void);
 void cdx_deinit_fqid_procfs(void);
 void cdx_remove_fqid_info_in_procfs(uint32_t fqid);
-ssize_t read_fqid4stats(struct file *fp, char __user *buff, size_t size, loff_t *ppos);
-void cdx_create_fqid_info_in_procfs(uint32_t fqid, struct qman_fq *fq);
 int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type);
 void cdx_remove_dir_in_procfs(void **proc_dir_entry);
 int cdx_create_type_fqid_info_in_procfs(struct qman_fq *fq, uint32_t type, 

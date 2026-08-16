@@ -26,7 +26,6 @@
 #include "forward_engine.h"
 #include "neighbor_resolution.h"
 
-extern pthread_mutex_t tnlMutex;
 
 struct list_head neigh_table[2 * NEIGHBOR_HASH_TABLE_SIZE];
 struct list_head neigh_table_by_mac[NEIGHBOR_HASH_TABLE_SIZE];

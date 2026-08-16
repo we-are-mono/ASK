@@ -94,7 +94,6 @@ int cdx_ipsec_get_of_port_tbl_id ( PCtEntry entry, struct ins_entry_info *info);
 PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc (uint32_t);
 void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context ) ;
 
-int cdx_dpa_ipsec_find_sa_direction(PSAEntry sa);
 int  cdx_ipsec_add_classification_table_entry(PSAEntry sa);
 int  cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa);
 int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, u32 bytes_to_copy);
@@ -103,8 +102,7 @@ void cdx_ipsec_release_sa_resources(PSAEntry pSA);
 int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id,
 				struct dpa_l2hdr_info *l2_info,
 				struct dpa_l3hdr_info *l3_info, uint32_t *dir_in);
-int cdx_ipsec_handle_get_inbound_sagd(U32 spi, U16 * sagd );
-int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info, 
+int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 			uint32_t sa_dir_in);
 int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info);
 int cdx_ipsec_delete_fp_entry(PSAEntry pSA);

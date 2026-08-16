@@ -51,7 +51,6 @@ static inline u_int32_t testbit_in_array(u_int8_t *pbits, u_int32_t bitindex)
 
 	struct cmm_daemon;
 
-	int cmmCommandCheck(struct cmm_daemon *ctx, int function_code, char * buffer, int buffer_size_in, int max_buffer_size);
 	char * getErrorString(unsigned short error);
 	void showErrorMsg(char *commandCodeString, unsigned int source, char *rxBuffer);
 	

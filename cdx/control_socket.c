@@ -67,9 +67,6 @@ BOOL SOCKET6_check_route(PSock6Entry pSocket)
 
 void socket4_update(PSockEntry pSocket, u8 event)
 {
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	if (pSocket->SocketType != SOCKET_TYPE_MSP)
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	{
 		if(!pSocket->pRtEntry)
 			SOCKET4_check_route(pSocket);
@@ -79,9 +76,6 @@ void socket4_update(PSockEntry pSocket, u8 event)
 
 void socket6_update(PSock6Entry pSocket, u8 event)
 {
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	if (pSocket->SocketType != SOCKET_TYPE_MSP)
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	{
 		if(!pSocket->pRtEntry)
 			SOCKET6_check_route(pSocket);
@@ -406,9 +400,6 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 		return ERR_WRONG_SOCK_TYPE;
 	}
 
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	if (SocketCmd.SockType != SOCKET_TYPE_MSP)
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	{
 		if (!SocketCmd.route_id)
 			return ERR_NO_ROUTE_TO_SOCK;
@@ -435,7 +426,6 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	pEntry->SocketType = SocketCmd.SockType;	
 	pEntry->unconnected = SocketCmd.mode;
 	pEntry->route_id = SocketCmd.route_id;
-	pEntry->initial_takeover_done = FALSE;
 	pEntry->hash = HASH_SOCK(pEntry->Daddr_v4, pEntry->Dport, pEntry->proto);
 	pEntry->hash_by_id = HASH_SOCKID(pEntry->SocketID);
 	pEntry->expt_flag =  (uint8_t)SocketCmd.expt_flag;
@@ -481,13 +471,6 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	/* Add software and hardware entry to local and packet engine hash */
 	socket4_add(pEntry);  // this func not returning error in any case
 
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	if (SocketCmd.SockType == SOCKET_TYPE_MSP) {
-		pEntry->iifindex = SocketCmd.iifindex;
-		cdx_create_rtp_qos_slowpath_flow(pEntry);
-		return NO_ERR;
-	}
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	if(!pEntry->pRtEntry)
 	{
 		socket4_remove(pEntry, pEntry->hash, pEntry->hash_by_id);
@@ -677,22 +660,6 @@ int SOCKET4_HandleIP_Socket_Close (U16 *p, U16 Length)
 	hash = HASH_SOCK(pEntry->Daddr_v4, pEntry->Dport, pEntry->proto);
 	hash_by_id = HASH_SOCKID(pEntry->SocketID);
 
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	if (pEntry->SocketType == SOCKET_TYPE_MSP) {
-		/* deleting entry */
-
-		if (ExternalHashTableDeleteKey(pEntry->SktEhTblHdl.td, 
-			pEntry->SktEhTblHdl.eeh_entry_index, 
-			pEntry->SktEhTblHdl.eeh_entry_handle)) {
-			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
-					__func__, __LINE__);
-		}
-		/* free table entry */
-		ExternalHashTableEntryFree(pEntry->SktEhTblHdl.eeh_entry_handle);
-		DPA_INFO("%s()::%d Successfully deleted old extended hash table key and entry:\n", 
-							__func__, __LINE__);
-	}
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	/* destroy hw socket entry */
 	socket4_remove(pEntry, hash, hash_by_id);
 
@@ -821,13 +788,6 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 
 	socket6_add(pEntry);  // this func not returning error in any case
 
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	if (SocketCmd.SockType == SOCKET_TYPE_MSP) {
-		pEntry->iifindex = SocketCmd.iifindex;
-		cdx_create_rtp_qos_slowpath_flow(pEntry);
-		return NO_ERR;
-	}
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	if(!pEntry->pRtEntry)
 	{
 		socket6_remove(pEntry, pEntry->hash, pEntry->hash_by_id);
@@ -1028,23 +988,6 @@ int SOCKET6_HandleIP_Socket_Close(U16 *p, U16 Length)
 
 	hash = HASH_SOCK6(pEntry->Daddr_v6[IP6_LO_ADDR], pEntry->Dport, pEntry->proto);
 	hash_by_id = HASH_SOCKID(pEntry->SocketID);
-
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	if (pEntry->SocketType == SOCKET_TYPE_MSP) {
-		/* deleting entry */
-
-		if (ExternalHashTableDeleteKey(pEntry->SktEhTblHdl.td, 
-			pEntry->SktEhTblHdl.eeh_entry_index, 
-			pEntry->SktEhTblHdl.eeh_entry_handle)) {
-			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
-					__func__, __LINE__);
-		}
-		/* free table entry */
-		ExternalHashTableEntryFree(pEntry->SktEhTblHdl.eeh_entry_handle);
-		DPA_INFO("%s()::%d Successfully deleted extended hash table key and entry:\n", 
-							__func__, __LINE__);
-	}
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 
 	socket6_remove(pEntry, hash, hash_by_id);
 

@@ -198,14 +198,12 @@ typedef struct fpp_socket4_open_cmd {
     u_int16_t	expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t	iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
 #endif //LS1043
-#if defined(COMCERTO_2000) || defined(LS1043)
     u_int16_t   secure;
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
     u_int16_t   sa_handle_tx[4];
     u_int16_t   pad;
-#endif
 } __attribute__((__packed__)) fpp_socket4_open_cmd_t;
 
 typedef struct fpp_socket4_update_cmd {
@@ -222,14 +220,12 @@ typedef struct fpp_socket4_update_cmd {
     u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t       rsvd3;
 #endif //LS1043
-#if defined(COMCERTO_2000) || defined(LS1043)
     u_int16_t   secure;
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
     u_int16_t   sa_handle_tx[4];
     u_int16_t pad2;
-#endif
 } __attribute__((__packed__)) fpp_socket4_update_cmd_t;
 
 typedef struct fpp_socket4_close_cmd {
@@ -253,14 +249,12 @@ typedef struct fpp_socket6_open_cmd {
     u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t	iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
 #endif //LS1043
-#if defined(COMCERTO_2000) || defined(LS1043)
     u_int16_t   secure;
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
     u_int16_t   sa_handle_tx[4];
     u_int16_t pad;
-#endif
 } __attribute__((__packed__)) fpp_socket6_open_cmd_t;
 
 typedef struct fpp_socket6_update_cmd {
@@ -277,14 +271,12 @@ typedef struct fpp_socket6_update_cmd {
     u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t       rsvd3;
 #endif //LS1043
-#if defined(COMCERTO_2000) || defined(LS1043)
     u_int16_t   secure;
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
     u_int16_t   sa_handle_tx[4];
     u_int16_t pad2;
-#endif
 } __attribute__((__packed__)) fpp_socket6_update_cmd_t;
 
 typedef struct fpp_socket6_close_cmd {
@@ -324,20 +316,6 @@ typedef union
 		u_int32_t chnl_id : 4;        /* egress Qos channel id */
 		u_int32_t reserved_3: 3;
 		u_int32_t ds_info_valid: 1;   /* bit indicates qosconmark specified values for DS direction */
-	};
-} qosmark_t;
-#else
-typedef union
-{
-	u_int32_t x;
-	struct {
-		u_int32_t queue : 8;
-		u_int32_t vlan_pbits : 3;
-		u_int32_t dscp_mark_flag : 1;
-		u_int32_t dscp_mark_value : 6;
-		u_int32_t set_vlan_pbits : 1;
-		u_int32_t unused_19_30 : 12;
-		u_int32_t ds_flag : 1;
 	};
 } qosmark_t;
 #endif
@@ -451,7 +429,6 @@ typedef struct fpp_ct6_ex_cmd {
 /*-------------------------------- IP ----------------------------------------*/ 
 #define FPP_CMD_IP_ROUTE                                0x0313
 #define FPP_CMD_IPV4_RESET                              0x0316
-#define FPP_CMD_IP_ROUTE_CHANGE                         0x0318
 
 #define FPP_CMD_IPV6_RESET                              0x0416
 
@@ -490,12 +467,6 @@ typedef struct fpp_ipsec_cmd {
 } __attribute__((__packed__)) fpp_ipsec_cmd_t;
 
 /* ------------------------------- RTP ---------------------------------------*/
-#define FPP_ERR_RTP_STATS_MAX_ENTRIES			1230
-#define FPP_ERR_RTP_STATS_STREAMID_ALREADY_USED	1231
-#define FPP_ERR_RTP_STATS_STREAMID_UNKNOWN		1232
-#define FPP_ERR_RTP_STATS_DUPLICATED			1233
-#define FPP_ERR_RTP_STATS_WRONG_DTMF_PT			1234
-#define FPP_ERR_RTP_STATS_WRONG_TYPE			1235
 
 #define FPP_CMD_RTP_OPEN                                0x0801
 #define FPP_CMD_RTP_UPDATE                              0x0802
@@ -507,11 +478,7 @@ typedef struct fpp_ipsec_cmd {
 #define FPP_CMD_RTP_CLOSE                               0x0808
 
 #define FPP_RTP_TAKEOVER_MODE_TSINCR_FREQ               1
-#if defined(LS1043)
 #define FPP_RTP_TAKEOVER_MODE_AUTO_SSRC                      2
-#else
-#define FPP_RTP_TAKEOVER_MODE_SSRC                      2
-#endif // LS1043
 
 #define TIMESTAMP_TAKEOVER      0x01
 #define SEQ_NUM_TAKEOVER        0x02
@@ -606,30 +573,6 @@ typedef struct fpp_rtcp_query_res {
     u_int32_t   ssrc_overwrite_value;
 } __attribute__((__packed__)) fpp_rtcp_query_res_t;
 
-#define MAX_SOCKET_IN_MSG 10
-
-typedef struct fpp_socketstats_status_cmd {
-        u_int16_t rsvd1; /* Reserved for future enchancements. Now by default only query is allowed */
-        u_int16_t start_sock_id;
-        u_int16_t end_sock_id;
-        u_int16_t rsvd2;
-} __attribute__((__packed__)) fpp_socketstats_status_cmd_t;
-
-typedef struct fpp_socketstats {
-        u_int16_t sock_id;
-        u_int16_t rsvd1;
-        u_int32_t total_packets_received;
-        u_int32_t total_packets_transmitted;
-}__attribute__((__packed__)) fpp_socketstats_t;
-
-typedef struct fpp_socketstats_entry_response {
-        u_int16_t ackstatus;
-        u_int16_t eof;
-        u_int16_t socket_no; /* Number of sockets for which stats are given in this response message */
-        u_int16_t rsvd1;
-        fpp_socketstats_t socket_stats[MAX_SOCKET_IN_MSG];
-} __attribute__((__packed__)) fpp_socketstats_entry_response_t;
-
 
 
 /*-------------------------------- RTP QoS Measurement -----------------------*/
@@ -637,8 +580,6 @@ typedef struct fpp_socketstats_entry_response {
 #define FPP_CMD_RTP_STATS_DISABLE                       0x0811
 #define FPP_CMD_RTP_STATS_QUERY                         0x0812
 #define FPP_CMD_RTP_STATS_DTMF_PT                       0x0813
-#define FPP_CMD_SOCKETSTATS_STATUS              0x0814
-#define FPP_CMD_SOCKETSTATS_ENTRY               0x0815
 
 #define FPP_RTPSTATS_TYPE_IP4                           0
 #define FPP_RTPSTATS_TYPE_IP6                           1      
@@ -706,9 +647,6 @@ typedef struct fpp_voice_buffer_stop_cmd {
 #define FPP_CMD_EXPT_QUEUE_CONTROL                      0x0C02
 #define FPP_CMD_EXPT_QUEUE_RESET                        0x0C03
 
-#define FPP_EXPT_Q0                                     0
-#define FPP_EXPT_Q1                                     1
-#define FPP_EXPT_Q2                                     2
 #define FPP_EXPT_Q3                                     3
 #define FPP_EXPT_MAX_QUEUE                              FPP_EXPT_Q3
 
@@ -782,13 +720,9 @@ typedef struct fpp_expt_queue_control_cmd {
 #define FPP_MAX_DSCP                                    63
 #define FPP_NUM_DSCP                                    64
 
-#if defined(COMCERTO_2000) ||  defined(LS1043)
 #define FPP_NUM_QUEUES                                  16
 #define FPP_PORT_SHAPER_NUM                             0xffff
 #define FPP_NUM_INGRESS_POLICER_QUEUES                  8
-#else
-#define FPP_NUM_QUEUES                                  32
-#endif
 
 #define FPP_NUM_SHAPERS                                 8
 #define FPP_NUM_SCHEDULERS                              8
@@ -797,13 +731,6 @@ typedef struct fpp_expt_queue_control_cmd {
 #define FPP_EXPT_TYPE_WIFI                              0x1
 #define FPP_EXPT_TYPE_ARP                               0x2
 #define FPP_EXPT_TYPE_PCAP                              0x3
-
-#ifndef LS1043
-typedef struct fpp_qm_qos_enable_cmd {
-	u_int16_t   interface;
-	u_int16_t   enable;
-} __attribute__((__packed__)) fpp_qm_qos_enable_cmd_t;              
-#endif
 
 typedef struct fpp_qm_queue_qos_enable_cmd {
     u_int16_t   interface;
@@ -888,16 +815,6 @@ typedef struct fpp_qm_sec_rate_cmd {
 } __attribute__((__packed__)) fpp_qm_sec_rate_cmd_t;
 #endif /* endif for SEC_PROFILE_SUPPORT */
 
-typedef struct fpp_qm_query_rl
-{
-    u_int16_t   action;
-    u_int16_t   mask;
-    u_int32_t   aggregate_bandwidth;
-    u_int32_t   bucketsize;
-} __attribute__((__packed__)) fpp_qm_query_rl_t;
-
-#ifndef COMCERTO_2000
-#ifdef LS1043
 #define NUM_PQS		8
 #define NUM_WBFS	8
 #define MAX_QUEUES	(NUM_PQS + NUM_WBFS)
@@ -1000,75 +917,6 @@ typedef struct fpp_qm_sec_plcr_query_stats_cmd {
 } __attribute__((__packed__)) fpp_qm_sec_plcr_query_stats_cmd_t;
 #endif /* endif for SEC_PROFILE_SUPPORT */
 
-#else
-typedef struct fpp_qm_query_cmd
-{
-    u_int16_t   action;
-    u_int16_t   port;
-    u_int32_t   queue_qosenable_mask;                       // bit mask of queues on which Qos is enabled
-    u_int32_t   max_txdepth;
-
-    u_int32_t   shaper_qmask[FPP_NUM_SHAPERS];              // mask of queues assigned to this shaper
-    u_int32_t   tokens_per_clock_period[FPP_NUM_SHAPERS];   // bits worth of tokens available on every 1 msec clock period
-    u_int32_t   bucket_size[FPP_NUM_SHAPERS];               // max bucket size in bytes 
-
-    u_int32_t   sched_qmask[FPP_NUM_SCHEDULERS];
-    u_int8_t    sched_alg[FPP_NUM_SCHEDULERS];              // current scheduling algorithm
-
-    u_int16_t   max_qdepth[FPP_NUM_QUEUES];
-} __attribute__((__packed__)) fpp_qm_query_cmd_t;
-#endif
-#endif
-
-#if defined(COMCERTO_2000)
-typedef struct fpp_qm_query_portinfo_cmd
-{
-    u_int16_t   status;
-    u_int16_t   port;
-    u_int32_t   queue_qosenable_mask;       // bit mask of queues on which Qos is enabled
-    u_int16_t   max_txdepth;                // ignored on C2000
-    u_int8_t    ifg;
-    u_int8_t    unused;
-} __attribute__((__packed__)) fpp_qm_query_portinfo_cmd_t;
-
-typedef struct fpp_qm_query_queue_cmd
-{
-    u_int16_t   status;
-    u_int16_t   port;
-    u_int16_t   queue_num;
-    u_int16_t   qweight;
-    u_int16_t   max_qdepth;
-    u_int16_t   unused;
-} __attribute__((__packed__)) fpp_qm_query_queue_cmd_t;
-
-typedef struct fpp_qm_query_shaper_cmd
-{
-    u_int16_t   status;
-    u_int16_t   port;
-    u_int16_t   shaper_num;
-    u_int8_t    enabled;
-    u_int8_t    unused;
-    u_int32_t   qmask;
-    u_int32_t   rate;
-    u_int32_t   bucket_size;
-} __attribute__((__packed__)) fpp_qm_query_shaper_cmd_t;
-
-typedef struct fpp_qm_query_sched_cmd
-{
-    u_int16_t   status;
-    u_int16_t   port;
-    u_int16_t   sched_num;
-    u_int8_t    alg;
-    u_int8_t    unused;
-    u_int32_t   qmask;
-} __attribute__((__packed__)) fpp_qm_query_sched_cmd_t;
-
-typedef struct fpp_qm_reset_cmd {
-    u_int16_t   interface;
-    u_int16_t   pad;
-} __attribute__((__packed__)) fpp_qm_reset_cmd_t;
-#endif
-
 #ifdef LS1043
 typedef struct fpp_qm_reset_cmd {
 	uint16_t status;
@@ -1148,7 +996,6 @@ typedef struct fpp_qm_chnl_assign_cmd {
 } __attribute__((__packed__)) fpp_qm_chnl_assign_cmd_t;
 
 #define NUM_PRIO_QUEUES 	8
-#define MAX_CLASS_QUEUES	16
 
 /*
  * This structure to map the dscp with channel and classqueue on an interface.
@@ -1160,17 +1007,6 @@ typedef struct fpp_qm_dscp_chnl_clsq_map {
 	uint8_t status;			/* Status of dscp to fq mapping. Enable/Disable. */
 	uint8_t interface[IFNAMSIZ];	/* interface name. */
 } __attribute__((__packed__)) fpp_qm_dscp_chnl_clsq_map_t;
-#else
-typedef struct fpp_qm_shaper_cfg {
-	u_int16_t   interface;
-	u_int16_t   shaper;
-	u_int16_t   enable;
-	u_int8_t    ifg;
-	u_int8_t    ifg_change_flag;
-	u_int32_t   rate;
-	u_int32_t   bucket_size;
-	u_int32_t   queues;
-} __attribute__((__packed__)) fpp_qm_shaper_cfg_t;
 #endif
 
 typedef struct fpp_qm_scheduler_cfg {
@@ -1493,10 +1329,6 @@ typedef struct fpp_stat_conn_response {
     u_int32_t   num_active_connections;
 } __attribute__((__packed__)) fpp_stat_conn_response_t;
 
-typedef struct fpp_stat_pppoe_status_response {
-    u_int16_t   ackstatus;
-} __attribute__((__packed__)) fpp_stat_pppoe_status_response_t;
-
 typedef struct fpp_stat_pppoe_entry_response {
     u_int16_t   ackstatus;
     u_int16_t   eof;
@@ -1505,10 +1337,6 @@ typedef struct fpp_stat_pppoe_entry_response {
     u_int32_t   total_packets_received;  
     u_int32_t   total_packets_transmitted; 
 } __attribute__((__packed__)) fpp_stat_pppoe_entry_response_t;
-
-typedef struct fpp_stat_bridge_status_response {
-    u_int16_t    ackstatus;
-} __attribute__((__packed__)) fpp_stat_bridge_status_response_t;
 
 typedef struct fpp_stat_bridge_entry_response {
     u_int16_t   ackstatus;
@@ -1541,8 +1369,6 @@ typedef struct fpp_stat_ipsec_entry_response {
 #if defined(LS1043)
     u_int8_t    seqOverflow;
     u_int8_t    pad;
-#else
-    u_int16_t    pad;
 #endif
 } __attribute__((__packed__)) fpp_stat_ipsec_entry_response_t;
 
@@ -1598,19 +1424,16 @@ typedef struct fpp_stat_flow_entry_response {
 #define FPP_ALTCONF_OPTION_MCTTL                        0x0001 /* Multicast TTL option */
 #define FPP_ALTCONF_OPTION_IPSECRL                      0x0002 /* IPSEC Rate Limiting option */
 #define FPP_ALTCONF_OPTION_ALL                          0xFFFF
-#define FPP_ALTCONF_OPTION_MAX                          FPP_ALTCONF_OPTION_IPSECRL + 1 /*include the "all" option*/
 
 #define FPP_ALTCONF_MODE_DEFAULT                        0 /* Same default value used for all options */
 #define FPP_ALTCONF_OPTION_MAX_PARAMS                   3 /* IPSEC Rate Limiting has 3 parameters. */
                                                           /* To be updated if a new option is add with more 32bits params */
 /* ALL options */
 #define FPP_ALTCONF_ALL_NUM_PARAMS                      1
-#define FPP_ALTCONF_ALL_MODE_DEFAULT                    FPP_ALTCONF_MODE_DEFAULT
 
 /* Multicast TTL Configuration definitions */
 #define FPP_ALTCONF_MCTTL_MODE_DEFAULT                  FPP_ALTCONF_MODE_DEFAULT
 #define FPP_ALTCONF_MCTTL_MODE_IGNORE                   1
-#define FPP_ALTCONF_MCTTL_MODE_MAX                      FPP_ALTCONF_MCTTL_MODE_IGNORE
 #define FPP_ALTCONF_MCTTL_NUM_PARAMS                    1 /* Maximum number of u32 allowed for this option */
 
 /* IPSEC Rate Limiting Configuration definitions */
@@ -1677,10 +1500,8 @@ typedef struct fpp_macvlan_cmd {
 #define FPP_CMD_IPSEC_SA_ACTION_OFFLOAD			0x0a0d
 #define FPP_CMD_IPSEC_FLOW_ADD                          0x0a11
 #define FPP_CMD_IPSEC_FLOW_REMOVE                       0x0a12
-#define FPP_CMD_IPSEC_FLOW_NOTIFY                       0x0a13
 #define FPP_CMD_IPSEC_FRAG_CFG                          0x0a14
 #define FPP_CMD_IPSEC_SA_TNL_ROUTE                      0x0a15
-#define FPP_CMD_IPSEC_SA_ACTION_SHOW                    0x0a16
 #if defined(LS1043)
 #define FPP_CMD_IPSEC_SEC_FAILURE_STATS	                0x0a17
 #define FPP_CMD_IPSEC_RESET_SEC_FAILURE_STATS	        0x0a18
@@ -1696,7 +1517,6 @@ typedef struct fpp_macvlan_cmd {
 #define FPP_CMD_NETKEY_SA_SET_LIFETIME                  FPP_CMD_IPSEC_SA_SET_LIFETIME
 #define FPP_CMD_NETKEY_FLOW_ADD                         FPP_CMD_IPSEC_FLOW_ADD
 #define FPP_CMD_NETKEY_FLOW_REMOVE                      FPP_CMD_IPSEC_FLOW_REMOVE
-#define FPP_CMD_NETKEY_FLOW_NOTIFY                      FPP_CMD_IPSEC_FLOW_NOTIFY
 
 #if defined(LS1043)
 // also defined in fm_ehash.h in kernel space
@@ -1756,10 +1576,6 @@ typedef struct fpp_sa_query_cmd {
 #ifdef LS1043
     u_int8_t    cipher_key[64];
     u_int8_t    auth_key[64];
-#else
-    u_int8_t    cipher_key[32];
-    u_int8_t    auth_key[20];
-    u_int8_t    ext_auth_key[12];
 #endif
 
 
@@ -1845,17 +1661,8 @@ typedef struct fpp_pppoe_relay_cmd {
 /*-------------------------------- WiFi --------------------------------------*/
 //0x2000: WiFi module
 #define FPP_CMD_WIFI_VAP_ENTRY                          0x2001
-#define FPP_CMD_VWD_ENABLE                              0x2002
-#define FPP_CMD_VWD_DISABLE                             0x2003
 #define FPP_CMD_WIFI_VAP_QUERY                          0x2004
 #define FPP_CMD_WIFI_VAP_RESET                          0x2005
-
-typedef struct fpp_wifi_vap_query_response
-{
-    u_int16_t   vap_id;
-    char        ifname[IFNAMSIZ];
-    u_int16_t   phy_port_id;
-} __attribute__((__packed__)) fpp_wifi_vap_query_response_t;
 
 typedef struct fpp_wifi_cmd
 {
@@ -1928,11 +1735,6 @@ typedef struct fpp_tunnel_query_cmd {
     u_int16_t       mtu;
     u_int16_t       pad;
 } __attribute__((__packed__)) fpp_tunnel_query_cmd_t;
-
-typedef struct fpp_tunnel_id_conv_cmd {
-    u_int16_t   IdConvStatus;
-    u_int16_t   Pad;
-} __attribute__((__packed__)) fpp_tunnel_id_conv_cmd_t;
 
 /*-------------------------------- Timeout -----------------------------------*/
 #define FPP_CMD_IPV4_SET_TIMEOUT                        0x0319

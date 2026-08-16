@@ -139,16 +139,6 @@ struct br_event_table
 
 #define ABM_PRINT(type, info, args...) do {printk(type "ABM :" info, ## args);} while(0)
 
-static inline void print_l2flow(struct l2flow *l2flowtmp)
-{
-	ABM_PRINT(KERN_DEBUG, "  Saddr : %02x:%02x:%02x:%02x:%02x:%02x\n", l2flowtmp->saddr[0], l2flowtmp->saddr[1], l2flowtmp->saddr[2],
-															l2flowtmp->saddr[3], l2flowtmp->saddr[4], l2flowtmp->saddr[5]);
-	ABM_PRINT(KERN_DEBUG, "  Daddr : %02x:%02x:%02x:%02x:%02x:%02x\n", l2flowtmp->daddr[0], l2flowtmp->daddr[1], l2flowtmp->daddr[2],
-															l2flowtmp->daddr[3], l2flowtmp->daddr[4], l2flowtmp->daddr[5]);
-	ABM_PRINT(KERN_DEBUG, "  Ethertype : %04x\n", htons(l2flowtmp->ethertype));
-	ABM_PRINT(KERN_DEBUG, "  PPPoE Session id : %d\n", l2flowtmp->session_id);
-}
-
 static inline unsigned int abm_l2flow_hash(struct l2flow *l2flowtmp)
 {
 	return (siphash(l2flowtmp, sizeof(struct l2flow), &abm_l2flow_hash_key)
@@ -171,7 +161,7 @@ extern void br_fdb_register_can_expire_cb(int(*cb)(unsigned char *mac_addr, stru
 extern void br_fdb_deregister_can_expire_cb(void);
 static void abm_do_work_send_msg(struct work_struct *work);
 static void abm_do_work_retransmit(struct work_struct *work);
-static int abm_nl_send_l2flow_msg(struct sock *s, char action, int flags, struct l2flowTable *table_entry);
+static int abm_nl_send_l2flow_msg(struct sock *s, char action, struct l2flowTable *table_entry);
 static void __abm_go_dying(struct l2flowTable *table_entry);
 
 

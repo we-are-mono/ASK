@@ -233,29 +233,5 @@ uint32_t get_logical_ifstats_base(void)
 {
 	return (stats_mem_phys);
 }
-#else
-int cdxdrv_init_stats(void *muram_handle) 
-{
-	printk("%s::interface statistics module disabled\n", __func__);
-	return SUCCESS;	
-}
-int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
-{
-	printk("%s::interface statistics disabled for type %x\n", 
-			__func__, dev_type);
-	return FAILURE;	
-}
-void free_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
-{
-	printk("%s::interface statistics disabled for type %x\n",
-			__func__, dev_type);
-
-}
-uint32_t get_logical_ifstats_base(void)
-{
-	printk("%s::interface statistics disabled for all types\n", 
-		__func__);
-	return 0;
-}
 #endif
 

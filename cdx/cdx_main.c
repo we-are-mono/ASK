@@ -96,8 +96,6 @@ static int __init cdx_ctrl_init(struct _cdx_info *cdx_info)
 
 	mutex_init(&ctrl->mutex);
 	spin_lock_init(&ctrl->lock);
-	INIT_WORK(&ctrl->work, comcerto_fpp_workqueue);
-	INIT_LIST_HEAD(&ctrl->msg_list);
 
 	ctrl->dev = &cdx_info->dev;
 	rc = cdx_ctrl_timer_init(ctrl);

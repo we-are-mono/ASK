@@ -16,7 +16,6 @@
 
 #include "cmm.h"
 
-void cmmRelayShowPrintHelp();
 
 int cmmRelayProcessClientCmd(FCI_CLIENT * fciMsgHandler, int function_code,
                              u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);

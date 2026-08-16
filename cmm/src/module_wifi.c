@@ -24,13 +24,6 @@
 #include <sys/ioctl.h>
 #include <module_wifi.h>
 
-#define WIFI_FF_SYSCTL_PATH "/proc/sys/net/"
-#define WIFI_FF_SYSCTL_ENTRY "wifi_fast_path_enable"
-
-#ifndef LS1043
-static int cmmFeWiFiGetBridge( FCI_CLIENT *fci_handle, int fd, struct interface *witf );
-#endif
-
 //static unsigned char wifi_sysctl[128];	
 #define SIOCVAPUPDATE (0x6401)
 #define WIFI_FF_MASTER_IF "/dev/vwd0"
@@ -68,7 +61,6 @@ void __cmmGetWiFi(int fd, struct interface *itf)
 
 static int cmmResetVWD()
 {
-#ifndef VWD_IOCTL_DISABLE
         vwd_cmd_t cmd;
 	int sfd;
 
@@ -91,13 +83,11 @@ static int cmmResetVWD()
         }
 
 	close(sfd);
-#endif
         return 0;
 }
 
 static int cmmUpdateVWD(struct interface *itf, int req)
 {
-#ifndef VWD_IOCTL_DISABLE
         vwd_cmd_t cmd;
        // struct ifreq ifr;
 	int sfd;
@@ -139,14 +129,12 @@ static int cmmUpdateVWD(struct interface *itf, int req)
         }
 
 	close(sfd);
-#endif
         return 0;
 }
 
 
 int cmmFeWiFiAddInterface(struct wifi_ff_entry *wifi_if, int vapid)
 {
-#ifndef VWD_IOCTL_DISABLE
 	vwd_cmd_t cmd;
 	int sfd;
 
@@ -173,7 +161,6 @@ int cmmFeWiFiAddInterface(struct wifi_ff_entry *wifi_if, int vapid)
 	}
 
 	close(sfd);
-#endif
 
 	return 0;
 
@@ -199,9 +186,6 @@ int cmmFeWiFiUpdate(FCI_CLIENT *fci_handle, int fd, int request, struct interfac
 			ret = -1;
 			goto out;
 		}
-#ifndef LS1043
-		cmmFeWiFiGetBridge(fci_handle, fd, itf);
-#endif
 		action = FPP_VWD_VAP_ADD;
 		
 
@@ -300,122 +284,7 @@ out:
 	
 }
 
-#ifndef LS1043
-int cmmFeWiFiBridgeUpdate( FCI_CLIENT *fci_handle, int fd, int request, struct interface *bitf)
-{
-	struct list_head *entry;
-	struct interface *itf;
-	short ret = 0;
-	int i, j;
-	/* Search through interface table if there are any
-	 * WiFi interface and they are part of bridge then
-	 * update the WiFi interfce in FPP with bridge MAC
-	 * MAC address.
-	 */
-
-	for (i = 0; i < ITF_HASH_TABLE_SIZE; i++)
-	{
-		for (entry = list_first(&itf_table.hash[i]); entry != &itf_table.hash[i]; entry = list_next(entry))
-		{
-			itf = container_of(entry, struct interface, list);
-
-			if (!__itf_is_wifi(itf))
-				continue;
-
-			for( j = 0; j < MAX_PORTS; j++ )
-			{
-				//cmm_print(DEBUG_ERROR, "%s: index: %d:%d\n ", __func__,
-				//bitf->ifindices[j], itf->ifindex );
-				if(bitf->ifindices[j] == itf->ifindex )
-					break;
-			}
-
-			if( (j < MAX_PORTS) && (itf->flags & FPP_PROGRAMMED) && __itf_is_up(itf) )
-			{
-				cmm_print(DEBUG_INFO, "%s: wifi mac: %x:%x:%x:%x:%x:%x  bridge mac: %x:%x:%x:%x:%x:%x\n ", __func__,
-						itf->macaddr[0], itf->macaddr[1], itf->macaddr[2],
-						itf->macaddr[3],itf->macaddr[4],itf->macaddr[5],
-						bitf->macaddr[0], bitf->macaddr[1], bitf->macaddr[2],
-						bitf->macaddr[3],bitf->macaddr[4],bitf->macaddr[5]
-					 );
-
-				if ( (itf->macaddr[0] ^  bitf->macaddr[0]) ||
-						(itf->macaddr[1] ^  bitf->macaddr[1]) ||
-						(itf->macaddr[2] ^  bitf->macaddr[2]) ||
-						(itf->macaddr[3] ^  bitf->macaddr[3]) ||
-						(itf->macaddr[4] ^  bitf->macaddr[4]) ||
-						(itf->macaddr[5] ^  bitf->macaddr[5]) )
-				{
-					memcpy( itf->macaddr, bitf->macaddr, 6 );
-					ret = cmmFeWiFiUpdate(fci_handle, fd, UPDATE, itf);
-
-				}
-			}
-		}
-	}
-
-	return ret;
-}
-
-static int cmmFeWiFiGetBridge( FCI_CLIENT *fci_handle, int fd, struct interface *witf )
-{
-	struct list_head *entry;
-	struct interface *itf;
-	int i, j;
-
-	/* Search through interface table if there are any
-	 * bridge interface and it has given WiFi interface
-	 * as one of its port and they are part of bridge then
-	 * update the WiFi interfce in FPP with bridge MAC
-	 * MAC address.
-	 */
-
-	for (i = 0; i < ITF_HASH_TABLE_SIZE; i++)
-	{
-		for (entry = list_first(&itf_table.hash[i]); entry != &itf_table.hash[i]; entry = list_next(entry))
-		{
-			itf = container_of(entry, struct interface, list);
-
-			if (!__itf_is_bridge(itf->ifindex))
-				continue;
-
-			for( j = 0; j < MAX_PORTS; j++ )
-			{
-				//cmm_print(DEBUG_ERROR, "%s: index: %d:%d\n ", __func__,
-				//bitf->ifindices[j], itf->ifindex );
-				if(itf->ifindices[j] == witf->ifindex )
-					break;
-			}
-
-
-			if( (j < MAX_PORTS) &&  __itf_is_up(witf) )
-			{
-				cmm_print(DEBUG_INFO, "%s: wifi mac: %x:%x:%x:%x:%x:%x  bridge mac: %x:%x:%x:%x:%x:%x\n ", __func__,
-						witf->macaddr[0], witf->macaddr[1], witf->macaddr[2],
-						witf->macaddr[3],witf->macaddr[4],witf->macaddr[5],
-						itf->macaddr[0], itf->macaddr[1], itf->macaddr[2],
-						itf->macaddr[3],itf->macaddr[4],itf->macaddr[5]
-					 );
-
-				if ( (itf->macaddr[0] ^  witf->macaddr[0]) ||
-						(itf->macaddr[1] ^  witf->macaddr[1]) ||
-						(itf->macaddr[2] ^  witf->macaddr[2]) ||
-						(itf->macaddr[3] ^  witf->macaddr[3]) ||
-						(itf->macaddr[4] ^  witf->macaddr[4]) ||
-						(itf->macaddr[5] ^  witf->macaddr[5]) )
-				{
-					memcpy( witf->macaddr, itf->macaddr, 6 );
-
-				}
-			}
-
-		}
-	}
-
-	return 0;
-}
-#endif
-
+	
 /*****************************************************************
 * cmmWiFiReset
 * 

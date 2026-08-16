@@ -43,9 +43,6 @@ static __inline u_int32_t HASH_SOCK_ADDR(int family, const u_int32_t *Saddr, con
 #define SOCKET_UNCONNECTED	1
 #define SOCKET_CONNECTED		0
 #define SOCKET_UNCONNECTED_WO_SRC  2
-#else
-#define SOCKET_UNCONNECTED	0
-#define SOCKET_CONNECTED		1
 #endif //LS1043
 
 #define SOCK_ID_PRIVATE_START	1
@@ -63,7 +60,6 @@ static __inline u_int32_t HASH_SOCK_ADDR(int family, const u_int32_t *Saddr, con
 	#error SOCK_ID_PRIVATE_END cannot be greater than 65535
 #endif
 #define NUM_INTERNAL_SOCKET_ID	(SOCK_ID_PRIVATE_END - SOCK_ID_PRIVATE_START + 1)
-#define SOCK_MAX_ID			0x7FFF
 
 struct socket {
 	struct list_head list;

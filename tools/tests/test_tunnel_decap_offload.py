@@ -77,7 +77,7 @@ async def _await_path(dst: str, port: int, deadline_s: float = 12.0) -> int:
     return got
 
 
-async def _start_lan_udp_echo(lan, port: int, family: str) -> None:
+async def _start_lan_udp_echo(lan, port: int) -> None:
     """Backgrounded UDP echo server on the LAN VM (:: binds dual-stack)."""
     src = (
         "import socket\\n"
@@ -144,7 +144,7 @@ async def sit_decap_tunnel(aiohttp_session, target_agent, lan, ipv6_topology):
     ):
         await target_agent.exec_cmd(aiohttp_session, argv)
 
-    await _start_lan_udp_echo(lan, ECHO_PORT_6O4, "v6")
+    await _start_lan_udp_echo(lan, ECHO_PORT_6O4)
     await asyncio.sleep(2.0)  # cmm registers the tunnel
     try:
         yield tun

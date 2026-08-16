@@ -96,9 +96,7 @@ int cmmFlowKeyEngineRemove(FCI_CLIENT *fci_handle, struct FlowEntry *fentry)
 {
 	unsigned short msg[sizeof(fentry->fl) + sizeof(fentry->family) + sizeof(fentry->dir)] = {0};
 	unsigned short len = 0;
-#ifdef IPSEC_DBG
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
-#endif
 
 	memcpy(msg, (unsigned char *)&fentry->fl, sizeof(struct flowi));
 	len += sizeof(struct flowi);
@@ -720,9 +718,7 @@ int cmmKeyEngineFlow2Conntrack(FCI_CLIENT *fci_handle, unsigned short fcode, uns
 	// SA handles
 	for (i = 0; i < sa_nr; i++) {
 		sa_handle[i] = *payload++;
-		//#ifdef  IPSEC_DBG
 		cmm_print(DEBUG_INFO, "%s: sa_handle %x\n", __func__, sa_handle[i]);
-		//#endif
 	}
 
 	msg_len += sa_nr * sizeof(unsigned short);
@@ -1404,9 +1400,6 @@ int cmmSAQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 	union u_rxbuf rxbuf;
 	uint8_t *key_p;
 	int temp_val,i;
-#ifndef LS1043
-	int key_size;
-#endif
 	short rc;
 	char output_buf[256];
 	char buf1[INET6_ADDRSTRLEN];
@@ -1517,22 +1510,6 @@ int cmmSAQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 
 			cmm_print(DEBUG_STDOUT, "%s",output_buf);
 			len = 0;
-#ifndef LS1043
-			if (pSAQuery->auth_algo == 3)
-			{
-				len += sprintf(output_buf+len, "\nExt-Auth Key : " );
-				key_size = sizeof(pSAQuery->ext_auth_key);
-				for (i = 0; i < (key_size/4); i++)
-				{
-					key_p = &pSAQuery->ext_auth_key[i*4];
-					temp_val =htonl(*(unsigned int*)key_p);
-					len += sprintf (output_buf+len,"%08x", temp_val);
-				}
-				cmm_print(DEBUG_STDOUT,"%s", output_buf);
-				len = 0;
-				cmm_print(DEBUG_STDOUT, "\n");
-			}
-#endif
 		}
 
 		

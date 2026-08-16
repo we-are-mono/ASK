@@ -394,22 +394,12 @@ static int ceetm_create_ccg_for_class_queue(struct ceetm_chnl_info *chnl_ctx, ui
 	struct qm_ceetm_ccg *ccg;
 
 	channel = (struct qm_ceetm_channel *)chnl_ctx->channel;
-#ifdef CEETM_USE_CONG_STATE_CHANGE_NOTIFICATION 
-	ceetm_dbg("%s::congestion state change notification enabled\n", __func__);
-	if (qman_ceetm_ccg_claim(&ccg, channel, chnl_ctx->cq_info[classque].ceetm_idx, 
-			ceetm_cscn_handler, NULL)) {
-		ceetm_err("%s::qman_ceetm_ccg_claim failed for channel %p\n", __func__,
-			channel);
-		return CEETM_FAILURE;
-	}
-#else
 	ceetm_dbg("%s::congestion state change notification disabled\n", __func__);
 	if (qman_ceetm_ccg_claim(&ccg, channel, chnl_ctx->cq_info[classque].ceetm_idx, NULL, NULL)) {
 		ceetm_err("%s::qman_ceetm_ccg_claim failed for channel %p\n", __func__,
 			channel);
 		return CEETM_FAILURE;
 	}
-#endif
 	ceetm_dbg("%s::CCG claimed ccg %p for class queue %d\n", __func__, ccg, classque);
 	chnl_ctx->cq_info[classque].ccg = ccg;
 	return CEETM_SUCCESS;
@@ -464,16 +454,7 @@ static int ceetm_cfg_td_on_class_queue(struct ceetm_chnl_info *chnl_ctx, uint32_
 		params.td_thres.Tn = uiNum;
 		params.td_thres.TA = uiMul;
 		mask |= (QM_CCGR_WE_TD_THRES); 
-#ifdef CEETM_USE_CONG_STATE_CHANGE_NOTIFICATION
-		params.cscn_en = 1; /* enable congestion state change notification */
-		params.cs_thres_in.TA = QOS_CEETM_CS_THRSIN_TA;
-		params.cs_thres_in.Tn = QOS_CEETM_CS_THRSIN_TN;
-		params.cs_thres_out.TA = QOS_CEETM_CS_THRSOUT_TA;
-		params.cs_thres_out.Tn = QOS_CEETM_CS_THRSOUT_TN;
-		mask |= (QM_CCGR_WE_CSCN_EN | QM_CCGR_WE_CS_THRES_IN | QM_CCGR_WE_CS_THRES_OUT);
-#else
 		params.cscn_en = 0; /* no congestion state change notification */
-#endif
 		ceetm_dbg("%s::setting congestion algo as QOS_CEETM_TAIL_DROP\n", __func__);
 	}
 	ccg = (struct qm_ceetm_ccg *)chnl_ctx->cq_info[index].ccg;
@@ -910,19 +891,6 @@ int ceetm_init_cq_plcr(void)
 	return CEETM_SUCCESS;
 }
 
-#ifdef CEETM_USE_CONG_STATE_CHANGE_NOTIFICATION 
-static void ceetm_cscn_handler(struct qm_ceetm_ccg *p, void *cb_ctx, int congested)
-{
-	struct ceetm_fq *ceetm_fq = (struct ceetm_fq *)cb_ctx;
-  
-	/* Update the congestion state */
-	if(ceetm_fq) {
-		ceetm_dbg("%s::state %d\n", __func__, congested); 
-		ceetm_fq->congested = congested; 	
-	} else 
-		ceetm_err("%s::ceetm fq congestion state %d\n", __func__, congested);
-}
-#endif
 
 static int ceetm_set_default_cq_policer_profile(void *pcd_handle, struct classque_info *cqinfo)
 {

@@ -42,7 +42,6 @@ enum l2flow_msg_types{
 /* Flags used for CMM answers */
 #define L2FLOW_OFFLOADED			0x1
 #define L2FLOW_DENIED				0x2
-#define L2FLOW_ACK				0x4
 
 /* Actions */
 enum l2flow_msg_actions{

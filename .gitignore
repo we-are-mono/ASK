@@ -1,25 +1,3 @@
-# Autotools generated files
-autom4te.cache/
-Makefile.in
-aclocal.m4
-config.guess
-config.sub
-configure
-depcomp
-install-sh
-ltmain.sh
-missing
-compile
-INSTALL
-COPYING
-
-# Configure output
-config.log
-config.status
-config.h
-stamp-h1
-libtool
-
 # Backup files
 *~
 
@@ -53,7 +31,6 @@ sources/
 # Editor files
 *.swp
 *.swo
-*~
 
 # Python bytecode
 __pycache__/

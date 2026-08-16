@@ -7,6 +7,5 @@ PLATFORM       := LS1043A
 CC             := $(CROSS_COMPILE)gcc
 CXX            := $(CROSS_COMPILE)g++
 AR             := $(CROSS_COMPILE)ar
-STRIP          := $(CROSS_COMPILE)strip
 
 KDIR           ?= $(HOME)/Mono/linux

@@ -20,14 +20,6 @@
 	/* Macros */
 	#define CHUNK	256
 
-	/* Structures */
-	struct fdb_entry
-	{
-		u_int8_t mac_addr[ETH_ALEN];
-		u_int16_t port_no;
-		unsigned char is_local;
-	};
-
 	/* Functions */
 	void __cmmGetBridges(int fd);
 	int cmmBrToFF(struct RtEntry *route);

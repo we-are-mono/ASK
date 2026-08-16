@@ -18,11 +18,9 @@ graceful skip rather than a confused failure.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import shutil
 import subprocess
-import time
 
 import pathlib
 import pytest
@@ -164,7 +162,7 @@ async def pppoe_real_server():
 
 
 @pytest_asyncio.fixture
-async def pppoe_dut_session(pppoe_real_server, target_agent, aiohttp_session):
+async def pppoe_dut_session(pppoe_real_server):
     """Dial the session from the DUT via pppd (UART). Yields ppp_ifname.
 
     Failure modes are common during PPPoE bring-up (auth, MTU, IPCP);

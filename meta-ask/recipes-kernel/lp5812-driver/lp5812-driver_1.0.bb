@@ -13,11 +13,3 @@ SRC_URI = " \
 
 S = "${WORKDIR}/sources"
 UNPACKDIR = "${S}"
-
-do_install:append() {
-    # Install module configuration if needed
-    install -d ${D}${sysconfdir}/modules-load.d
-    echo "leds-lp5812" > ${D}${sysconfdir}/modules-load.d/leds-lp5812.conf
-}
-
-FILES:${PN} += "${sysconfdir}/modules-load.d/leds-lp5812.conf"

@@ -12,9 +12,6 @@
 #ifndef _CONTROL_TX_H_
 #define _CONTROL_TX_H_
 
-#define DEFAULT_NAME_0		eth0
-#define DEFAULT_NAME_1		eth2
-#define DEFAULT_NAME_2		eth3
 
 #define NO_TX_PORT			-1
 #define MAX_VLAN_PCP			7

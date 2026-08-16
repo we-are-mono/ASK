@@ -16,14 +16,70 @@ NO_ERR.
 from __future__ import annotations
 
 import os
+import struct
 
-from test_tunnel_offload import (
-    ACTION_DEREGISTER,
-    ACTION_REGISTER,
-    CMD_IP_ROUTE,
-    NO_ERR,
-    _pack_rt_command,
-)
+
+CMD_IP_ROUTE = 0x0313
+
+# Action codes (cdx/fe.h:38-43)
+ACTION_REGISTER   = 0
+ACTION_DEREGISTER = 1
+
+NO_ERR = 0
+
+
+def _ip_be_bytes(addr: str) -> bytes:
+    return bytes(int(o) for o in addr.split("."))
+
+
+def _pack_rt_command(
+    *,
+    action: int,
+    output_device: bytes,
+    input_device: bytes = b"",
+    underlying_input_device: bytes = b"",
+    route_id: int,
+    flags: int = 0,
+    mac: bytes = b"\x00" * 6,
+    daddr_v4: str | None = None,
+    daddr_v6_bytes: bytes | None = None,
+    mtu: int = 1500,
+    egress_vid: int = 0,
+    underlying_vid: int = 0,
+) -> bytes:
+    """Pack RtCommand (cdx/fe.h:364-380) — 88 bytes when VLAN_FILTER is
+    defined (which it is for ASK cdx — see cdx/Kbuild:7).
+
+    Layout:
+      0   action(2) mtu(2) macAddr(6) egress_vid(2) underlying_vid(2)
+      14  pad(2) outputDevice(16) inputDevice(16) UnderlyingInputDevice(16)
+      66  id(4) flags(4) daddr[4](16)
+    """
+    if daddr_v4 is not None:
+        daddr_field = _ip_be_bytes(daddr_v4) + b"\x00" * 12
+    elif daddr_v6_bytes is not None:
+        assert len(daddr_v6_bytes) == 16
+        daddr_field = daddr_v6_bytes
+    else:
+        daddr_field = b"\x00" * 16
+
+    out_dev = output_device.ljust(16, b"\x00")[:16]
+    in_dev  = input_device.ljust(16, b"\x00")[:16]
+    uin_dev = underlying_input_device.ljust(16, b"\x00")[:16]
+
+    wire = (
+        struct.pack("<HH", action, mtu)               # 4
+        + mac.ljust(6, b"\x00")[:6]                   # +6 = 10
+        + struct.pack("<HH", egress_vid, underlying_vid)  # +4 = 14
+        + struct.pack("<H", 0)                        # +2 pad = 16
+        + out_dev                                     # +16 = 32
+        + in_dev                                      # +16 = 48
+        + uin_dev                                     # +16 = 64
+        + struct.pack("<II", route_id, flags)         # +8 = 72
+        + daddr_field                                 # +16 = 88
+    )
+    assert len(wire) == 88, f"RtCommand wire size {len(wire)} != 88"
+    return wire
 
 # High word non-zero (the class of id that surfaced A10: tunnel-fixture
 # ids in the 0x0604xxxx range); low word distinct from ids other tests

@@ -22,8 +22,6 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 
-#define IPR_DEBUG_INFO_DISPLAY 1
-
 /*
 ** cmmIprStatsProcessClientCmd
 ** Daemon side demux.
@@ -109,7 +107,6 @@ static inline int cmmIprStatsQuery(char ** keywords, int tabStart, daemon_handle
                 __bswap_32(iprstats.info.min_frag_size));
         cmm_print(DEBUG_STDOUT,"max sessions allowed       \t%d\n",
                 __bswap_32(iprstats.info.max_con_reassm));
-#ifdef IPR_DEBUG_INFO_DISPLAY
 	cmm_print(DEBUG_STDOUT, "debug:\n");
         cmm_print(DEBUG_STDOUT,"active sessions            \t%d\n",
                 __bswap_32(iprstats.info.curr_sessions));
@@ -133,7 +130,6 @@ static inline int cmmIprStatsQuery(char ** keywords, int tabStart, daemon_handle
                 __bswap_32(iprstats.info.reassly_dbg));
         cmm_print(DEBUG_STDOUT,"ipr bucket base            \t0x%x\n",
                 __bswap_32(iprstats.info.bucket_base));
-#endif
         return CLI_OK;
 }
 

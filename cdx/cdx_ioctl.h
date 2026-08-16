@@ -25,15 +25,11 @@
 #define CDX_IOC_MAGIC           0xbe
 
 //table create ioctl
-#define CDX_CTRL_TBL_NAME_LEN	64
 #define CDX_CTRL_PORT_NAME_LEN	32	
 
 //max number of fwd manip nodes
-#define MAX_FW_MANIP_NODES		64
 //max number of nat addr translation manip nodes
-#define MAX_IPV4ADDR_NAT_NODES		64
 //max number of nat port translation manip nodes
-#define MAX_PORT_NAT_NODES		64
 
 
 //type field in cdx_dist_info
@@ -93,7 +89,6 @@ struct table_info {
 	};
 	uint32_t key_size;      //sizeof key in bytes
 	void *id;               //id for handle
-	//	int td;               	//kernel table desc for id, used, filled by LKM
 };
 
 enum {
@@ -133,7 +128,6 @@ struct cdx_expt_ratelimit_info {
 * 2. The no. of secure profiles are 1. 
 */
 #define	INGRESS_SEC_POLICER_QUEUE_NUM	(INGRESS_ALL_POLICER_QUEUES - 1)
-#define POLICER_NIA 			0x4c80
 
 enum {
 	CDX_INGRESS_QUEUE0_PROFILE_NO=CDX_EXPT_MAX_EXPT_LIMIT_TYPES,
@@ -172,7 +166,6 @@ struct cdx_fman_info {
 	uint32_t index;		//0 based index within DPAA
 	uint32_t max_ports;	//max ports with this fman
 	uint32_t num_tables;	//max tables for this fman
-	//struct cdx_dist_info *dist;
 	uint32_t fmMuramMemSize; 
 	uint32_t expt_ratelim_mode;       //0 bytes mode, 1 pkt mode
 	uint32_t expt_ratelim_burst_size; //bytes or packets
@@ -225,7 +218,6 @@ int cdxdrv_ingress_policer_stats(struct cdx_fman_info *finfo,uint32_t queue_no,v
 #ifdef SEC_PROFILE_SUPPORT
 int cdxdrv_sec_policer_reset(struct cdx_fman_info *finfo);
 #endif /* endif for SEC_PROFILE_SUPPORT */
-//int cdxdrv_get_policer_profile_id(struct cdx_fman_info *finfo,uint32_t queue_no,uint8_t *absolute_profid);
 #endif
 
 struct cdx_port_info *get_dpa_port_info(char *name);

@@ -49,12 +49,6 @@ class Agent:
             r.raise_for_status()
             return await r.json()
 
-    async def counters(self, session: aiohttp.ClientSession, ifaces: list[str] | None = None) -> dict:
-        params = [("iface", i) for i in (ifaces or [])]
-        async with session.get(f"{self.base_url}/counters", params=params) as r:
-            r.raise_for_status()
-            return await r.json()
-
     async def capture_start(self, session: aiohttp.ClientSession, ifaces: list[str] | None = None) -> str:
         body = {"ifaces": ifaces or []}
         async with session.post(f"{self.base_url}/capture-start", json=body) as r:
@@ -306,4 +300,3 @@ class Agent:
 _DEFAULT_PORT = "9110"
 
 TARGET = Agent("target", f"http://{os.environ.get('ASK_TARGET_IP', '10.0.0.62')}:{_DEFAULT_PORT}")
-WAN    = Agent("wan",    f"http://{os.environ.get('ASK_WAN_IP',    '127.0.0.1')}:{_DEFAULT_PORT}")

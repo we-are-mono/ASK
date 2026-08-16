@@ -68,12 +68,9 @@ struct port_ff_rate_lim_info {
 #define DEFAULT_1G_PORT_FF_CBS		1
 #define DEFAULT_10G_PORT_FF_PBS		3
 #define DEFAULT_1G_PORT_FF_PBS		1
-#define DEFAULT_PORT_FF_MODE		e_FM_PCD_PLCR_PACKET_MODE
 
 //enable rate limiting on exception traffic
-#define ENABLE_EXTP_RATE_LIMIT  1
 //enable rate limiting on fast forward traffic
-#define ENABLE_FF_RATE_LIMIT    1
 #define DEFAULT_INGRESS_CIR_VALUE 0xffffffff
 #define DEFAULT_INGRESS_PIR_VALUE 0xffffffff
 /* For packet mode expected no of packets

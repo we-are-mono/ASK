@@ -85,59 +85,6 @@ def _eval_bound(expr: str, code_map: dict[str, int]) -> int | None:
     return None
 
 
-# Guard macros that are never defined at build time. Any CDX_CMD entry
-# inside these #ifdef blocks is compiled out — the kernel never sees it
-# and the dispatcher returns ERR_UNKNOWN_COMMAND for that code. The
-# catalog must skip them to match reality.
-_DISABLED_GUARDS = frozenset({
-    "CDX_TODO_IPSEC",
-    "CDX_TODO_TUNNEL",
-    "CDX_TODO_MC",
-    "CDX_TODO_PPPOE",
-    "CDX_TODO_VLAN",
-    "CDX_TODO_RX",
-    "CDX_TODO_TX",
-    "CDX_TODO_QM",
-    "CDX_TODO_STAT",
-    "CDX_TODO_BRIDGE",
-    "CDX_TODO_WIFI",
-    "CDX_TODO_RTP",
-    "CDX_TODO_IPV4",
-    "CDX_TODO_IPV6",
-})
-
-_IFDEF_RE  = re.compile(r"^\s*#\s*if(n?def)?\s+(\w+)", re.MULTILINE)
-_ENDIF_RE  = re.compile(r"^\s*#\s*endif\b", re.MULTILINE)
-
-
-def _strip_disabled_ifdefs(txt: str) -> str:
-    """Remove text inside #ifdef <DISABLED> ... #endif blocks.
-
-    Simple line-by-line walk tracking nest depth. Doesn't try to
-    evaluate real conditionals — only filters guards that are in the
-    known-always-off set, and only tracks depth for those. Other
-    #ifdefs pass through untouched so regex matching behaves as before.
-    """
-    out: list[str] = []
-    skip_depth = 0
-    lines = txt.splitlines(keepends=True)
-    for line in lines:
-        if skip_depth > 0:
-            m = _IFDEF_RE.match(line)
-            if m and m.group(2) in _DISABLED_GUARDS:
-                skip_depth += 1
-            elif _ENDIF_RE.match(line):
-                skip_depth -= 1
-            # otherwise: line is inside a skipped block, drop it
-            continue
-        m = _IFDEF_RE.match(line)
-        if m and m.group(2) in _DISABLED_GUARDS:
-            skip_depth = 1
-            continue   # swallow the #ifdef line itself too
-        out.append(line)
-    return "".join(out)
-
-
 def _scan_sources(src_files: list[Path], code_map: dict[str, int]):
     """Yield (kind, name, code, extra) tuples for every CDX_CMD* site.
 
@@ -150,7 +97,7 @@ def _scan_sources(src_files: list[Path], code_map: dict[str, int]):
             raw = f.read_text(errors="replace")
         except OSError:
             continue
-        txt = _strip_disabled_ifdefs(raw)
+        txt = raw
         for m in _CDX_CMD_NOARG_V_RE.finditer(txt):
             name = m.group(1)
             if name in code_map:

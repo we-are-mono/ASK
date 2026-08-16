@@ -21,18 +21,10 @@
 
 #define TNL_STATE_CREATED 			0x01
 #define TNL_STATE_ENABLED			0x02
-#define TNL_STATE_SA_COMPLETE			0x04
-#define TNL_STATE_SAREPLY_COMPLETE		0x08
 #define TNL_STATE_REMOTE_ANY			0x10
 
-#define TNL_NOSET_PRIV				0
-#define TNL_SET_PRIV				1
 
 
-/* PBUF route entry memory chunk is used to allocated a new GRE tnl entry. At the time the packet reaches
- * the tunnel module, the Bridge data will no longer be used. So it is safe to use the same memory. */
-#define M_tnl_get_DMEM_buffer()\
-	((PVOID)(CLASS_ROUTE0_BASE_ADDR))
 
 enum TNL_MODE {
 	TNL_MODE_6O4 = 1,
@@ -40,11 +32,6 @@ enum TNL_MODE {
 	TNL_MODE_GRE_IPV6 = 4,
 };
 
-enum SAM_ID_CONV_TYPE {
-	SAM_ID_CONV_NONE =0,
-	SAM_ID_CONV_DUPSPORT =1,
-	SAM_ID_CONV_PSID =2,
-};
 
 #define TNL_GRE_PROTOCOL	0x6558		// Transparent Ethernet Bridging
 #define TNL_GRE_HDRSIZE		4
@@ -85,13 +72,6 @@ typedef struct _tTNLCommand_delete {
 }TNLCommand_delete, *PTNLCommand_delete;
 
 
-typedef struct _tTNLCommand_ipsec {
-	U8	name[16];
-	U16 	SA_nr;
-	U16	SAReply_nr;
-	U16	SA_handle[4];
-	U16	SAReply_handle[4];
-} TNLCommand_ipsec, *PTNLCommand_ipsec;
 
 typedef struct _tTNLCommand_query{
 	U16     result;
@@ -111,23 +91,7 @@ typedef struct _tTNLCommand_query{
 	U16			pad;
 }TNLCommand_query , *PTNLCommand_query;
 
-typedef struct {
-        int  port_set_id;          /* Port Set ID               */
-        int  port_set_id_length;   /* Port Set ID length        */
-        int  psid_offset;          /* PSID offset               */
-}sam_port_info_t;
 
-typedef struct _tTNLCommand_IdConvDP {
-        U16      IdConvStatus;
-				U16	 Pad;
-}TNLCommand_IdConvDP, *pTNLCommand_IdConvDP;
-
-typedef struct _tTNLCommand_IdConvPsid {
-        U8       name[16];
-				sam_port_info_t sam_port_info;
-        U32      IdConvStatus:1,
-								 unused:31;
-}TNLCommand_IdConvPsid, *pTNLCommand_IdConvPsid;
 
 
 // Structure used by tunnel entries in sw
@@ -152,19 +116,6 @@ typedef struct _tTnlEntry{
 	U32	remote[4];
 	U32 fl;
 	U16 frag_off;
-	U16 SAReply_nr;
-	U16 SA_nr;
-	U16 hSAEntry_in[SA_MAX_OP];
-	U16 hSAEntry_out[SA_MAX_OP];
-	U16 sam_abit;
-	U16 sam_abit_max;
-	U16 sam_kbit;
-	U16 sam_mbit;
-	U16 sam_mbit_max;
-	U8 sam_mbit_len;
-	U8 sam_abit_len;
-	U8 sam_kbit_len;
-	U8 sam_id_conv_enable;
 	U16 tnl_mtu;
 	U8 flags;
 	U8 pad;

@@ -361,29 +361,6 @@ int cmmFeCtUpdate4(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		 * the queue, DSCP marking parameters, and VLAN p-bit settings with the twin connection.
 		 */
 
-#if !defined(LS1043)
-		{
-			qosconnmark_t qmark;
-			qmark.x = cmd.qosconnmark;
-			if ( (qmark.qosmark_ds.ds_flag) &&
-				(((ctEntry->fpp_dir & ORIGINATOR) &&
-				(is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_ORIG_COMCERTO_FP_IIF)) &&
-				!is_wan_port_ifindex(ctEntry->orig.route->oifindex))) ||
-				((ctEntry->fpp_dir & REPLIER) &&
-				(!is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_REPL_COMCERTO_FP_IIF)) &&
-				is_wan_port_ifindex(ctEntry->rep.route->oifindex))))
-				)
-			{
-				qosmark_t qmark_lo, qmark_hi;
-				qmark_lo.x = qmark.x_us;
-				qmark_hi.x = qmark.x_ds;
-				qmark.x_us = qmark_hi.x; qmark.qosmark_us.ds_flag = 0;
-				qmark.x_ds = qmark_lo.x; qmark.qosmark_ds.ds_flag = 1;
-				cmd.qosconnmark = qmark.x;
-			}
-		}
-#endif
-
 #ifdef IPSEC_FLOW_CACHE
 		if (ctEntry->fEntryOrigOut || ctEntry->fEntryOrigFwd)
 		{
@@ -715,29 +692,6 @@ int cmmFeCtUpdate6(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		 * direction is upstream (output port = WAN).  If this is not true, then we must swap
 		 * the queue, DSCP marking parameters, and VLAN p-bit settings with the twin connection.
 		 */
-
-#if !defined(LS1043)
-		{
-			qosconnmark_t qmark;
-			qmark.x = cmd.qosconnmark;
-			if ( (qmark.qosmark_ds.ds_flag) &&
-				(((ctEntry->fpp_dir & ORIGINATOR) &&
-				(is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_ORIG_COMCERTO_FP_IIF)) &&
-				!is_wan_port_ifindex(ctEntry->orig.route->oifindex))) ||
-				((ctEntry->fpp_dir & REPLIER) &&
-				(!is_wan_port_ifindex(nfct_get_attr_u32(ctEntry->ct, ATTR_REPL_COMCERTO_FP_IIF)) &&
-				is_wan_port_ifindex(ctEntry->rep.route->oifindex))))
-				)
-			{
-				qosmark_t qmark_lo, qmark_hi;
-				qmark_lo.x = qmark.x_us;
-				qmark_hi.x = qmark.x_ds;
-				qmark.x_us = qmark_hi.x; qmark.qosmark_us.ds_flag = 0;
-				qmark.x_ds = qmark_lo.x; qmark.qosmark_ds.ds_flag = 1;
-				cmd.qosconnmark = qmark.x;
-			}
-		}
-#endif
 
 #ifdef	IPSEC_FLOW_CACHE
 		if (ctEntry->fEntryOrigFwd || ctEntry->fEntryOrigOut) {
@@ -1382,34 +1336,6 @@ int cmmRtQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 			mac_ntop(rtCmd->dst_mac, dmac, sizeof(dmac)),
 			rtCmd->mtu,"NULL");
 		}
-#else
-		if (is_ipv6)
-		{
-		cmm_print(DEBUG_STDOUT, "%04d: Id: %x, Interface: %s, DST Mac: %s, Mtu: %d Daddr: %s\n",
-			count,
-			rtCmd->id,
-			rtCmd->output_device,
-			mac_ntop(rtCmd->dst_mac, dmac, sizeof(dmac)),
-			rtCmd->mtu,inet_ntop(AF_INET6, &rtCmd->dst_addr, daddr_buf, sizeof(daddr_buf)));
-		}
-		else if (is_ipv4)
-		{
-		cmm_print(DEBUG_STDOUT, "%04d: Id: %x, Interface: %s, DST Mac: %s, Mtu: %d Daddr: %s\n",
-			count,
-			rtCmd->id,
-			rtCmd->output_device,
-			mac_ntop(rtCmd->dst_mac, dmac, sizeof(dmac)),
-			rtCmd->mtu,inet_ntop(AF_INET, &rtCmd->dst_addr, daddr_buf, sizeof(daddr_buf)));
-		}
-		else
-		{
-		cmm_print(DEBUG_STDOUT, "%04d: Id: %x, Interface: %s, DST Mac: %s, Mtu: %d Daddr: %s\n",
-			count,
-			rtCmd->id,
-			rtCmd->output_device,
-			mac_ntop(rtCmd->dst_mac, dmac, sizeof(dmac)),
-			rtCmd->mtu,"NULL");
-		}
 #endif
 
 		count++;
@@ -1438,7 +1364,6 @@ int cmmCtQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
         short rc;
         int count = 0,i,len =0;
         cmmd_ct_ex_cmd_t *ctCmd = (cmmd_ct_ex_cmd_t *)rxbuf.rcvBuffer;
-        struct nf_conntrack *ctTemp;
 	char saddr_buf[INET_ADDRSTRLEN], daddr_buf[INET_ADDRSTRLEN];
        
         ctCmd->action = CMMD_ACTION_QUERY;
@@ -1457,25 +1382,8 @@ int cmmCtQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
             }
             return CLI_OK;
         }
-        ctTemp = nfct_new();
         cmm_print(DEBUG_STDOUT, "IPv4 Connections:\n");
         do {
-            nfct_set_attr_u8(ctTemp, ATTR_ORIG_L4PROTO, ctCmd->protocol);
-
-            nfct_set_attr_u32(ctTemp, ATTR_ORIG_IPV4_SRC, ctCmd->saddr);
-            nfct_set_attr_u32(ctTemp, ATTR_ORIG_IPV4_DST, ctCmd->daddr);
-
-            nfct_set_attr_u32(ctTemp, ATTR_REPL_IPV4_SRC, ctCmd->saddr_reply);
-            nfct_set_attr_u32(ctTemp, ATTR_REPL_IPV4_DST, ctCmd->daddr_reply);
-
-            nfct_set_attr_u16(ctTemp, ATTR_ORIG_PORT_SRC, ctCmd->sport);
-            nfct_set_attr_u16(ctTemp, ATTR_ORIG_PORT_DST, ctCmd->dport);
-            nfct_set_attr_u16(ctTemp, ATTR_REPL_PORT_SRC, ctCmd->sport_reply);
-            nfct_set_attr_u16(ctTemp, ATTR_REPL_PORT_DST, ctCmd->dport_reply);
-            cmmQosmarkSet(ctTemp, ctCmd->qosconnmark);
-
-            //nfct_snprintf(buf, 500, ctTemp, NFCT_T_UNKNOWN, NFCT_O_PLAIN, NFCT_OF_SHOW_LAYER3);
-            //cmm_print(DEBUG_STDOUT, "%04d: %s\n", count, buf);
             cmm_print(DEBUG_STDOUT, "%04d: protocol=%d, qosconnmark=0x%" PRIx64 "\n", count, ctCmd->protocol, ctCmd->qosconnmark);
             cmm_print(DEBUG_STDOUT, "  Init:  Saddr=%s, Daddr=%s, Sport=%d, Dport=%d\n",
                       inet_ntop(AF_INET, &ctCmd->saddr, saddr_buf, sizeof(saddr_buf)),
@@ -1512,7 +1420,6 @@ int cmmCtQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
         } while (rcvBytes >= sizeof(cmmd_ct_ex_cmd_t) + sizeof(unsigned short));
         cmm_print(DEBUG_STDOUT, "Total Connection Entries: %d\n", count);
 
-        nfct_destroy(ctTemp);
         return CLI_OK;
 }
 
@@ -1529,7 +1436,6 @@ int cmmCt6QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
         short rc;
         int count = 0,len=0;
         cmmd_ct6_ex_cmd_t *ctCmd = (cmmd_ct6_ex_cmd_t *)rxbuf.rcvBuffer;
-        struct nf_conntrack *ctTemp;
         char saddr_buf[INET6_ADDRSTRLEN], daddr_buf[INET6_ADDRSTRLEN];
 
         ctCmd->action = CMMD_ACTION_QUERY;
@@ -1553,22 +1459,8 @@ int cmmCt6QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
             }
             return CLI_OK;
         }
-        ctTemp = nfct_new();
         cmm_print(DEBUG_STDOUT, "IPv6 Connections:\n");
         do {
-            nfct_set_attr_u8(ctTemp, ATTR_ORIG_L4PROTO, ctCmd->protocol);
-
-            nfct_set_attr(ctTemp, ATTR_ORIG_IPV6_SRC, &ctCmd->saddr[0]);
-            nfct_set_attr(ctTemp, ATTR_ORIG_IPV6_DST, &ctCmd->daddr[0]);
-
-            nfct_set_attr(ctTemp, ATTR_REPL_IPV6_SRC, &ctCmd->saddr_reply[0]);
-            nfct_set_attr(ctTemp, ATTR_REPL_IPV6_DST, &ctCmd->daddr_reply[0]);
-
-            nfct_set_attr_u16(ctTemp, ATTR_ORIG_PORT_SRC, ctCmd->sport);
-            nfct_set_attr_u16(ctTemp, ATTR_ORIG_PORT_DST, ctCmd->dport);
-            nfct_set_attr_u16(ctTemp, ATTR_REPL_PORT_SRC, ctCmd->sport_reply);
-            nfct_set_attr_u16(ctTemp, ATTR_REPL_PORT_DST, ctCmd->dport_reply);
-            cmmQosmarkSet(ctTemp, ctCmd->qosconnmark);
 
             
             cmm_print(DEBUG_STDOUT, "%04d: protocol=%d, qosconnmark=0x%" PRIx64 "\n", 
@@ -1608,7 +1500,6 @@ int cmmCt6QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 	 } while (rcvBytes >= sizeof(cmmd_ct6_ex_cmd_t) + sizeof(unsigned short));
         cmm_print(DEBUG_STDOUT, "Total Connection Entries: %d\n", count);
 
-        nfct_destroy(ctTemp);
         return CLI_OK;
 }
 #ifdef AUTO_BRIDGE

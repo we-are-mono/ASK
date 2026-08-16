@@ -62,7 +62,7 @@ struct cdx_ipr_info ipr_info;
  *      - Populated exactly once, in cdx_ioc_set_dpa_params() under
  *        dpa_cfg_lock, on the first successful call. A second call
  *        is rejected with -EBUSY. All later readers (dpa_get_tdinfo,
- *        dpa_get_wan_port, cdx_ingress_*, cdx_get_policer_profile_id,
+ *        cdx_ingress_*, cdx_get_policer_profile_id,
  *        etc.) observe a stable pointer and count; they run lock-
  *        free on packet/ioctl paths because the one-time-init
  *        ordering is guaranteed by the CAP_NET_ADMIN-gated ioctl
@@ -271,27 +271,6 @@ static int get_dist_info(struct cdx_port_info *port_info)
 	return 0;
 }
 
-#ifndef CDX_RTP_RELAY // In RTP relay support , need distribution handles for 3tuple tables also
-void *get_ethdist_info_by_fman_params(struct cdx_fman_info *finfo)
-{
-	struct cdx_port_info *port_info;
-	struct cdx_dist_info *dist;
-	uint32_t ii;
-	uint32_t jj;
-
-	port_info = finfo->portinfo;
-	for (ii = 0; ii < finfo->max_ports; ii++) {
-		dist = port_info->dist_info;
-		for (jj = 0; jj < port_info->max_dist; jj++) {
-			if (dist->type == ETHERNET_DIST) {   // dist ++  is  missing in this for loop
-				return (dist->handle);
-			}
-		}
-		port_info++; 
-	}
-	return NULL;
-}
-#else
 static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t table_type)
 {
 	struct cdx_port_info *port_info;
@@ -339,7 +318,6 @@ static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t 
 	}
 	return NULL;
 }
-#endif //CDX_RTP_RELAY
 
 //allocate and copy port releated info from uspace 
 static int get_port_info(struct cdx_fman_info *finfo) 
@@ -484,55 +462,6 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 		DPA_INFO("%s::tbl %s %pK changing miss action\n", __func__,
 				tbl_info->name, tbl_info->id);
 #endif
-#ifndef CDX_RTP_RELAY // if no RTP relay setting of miss-action is same for all tables
-#ifdef DPA_CFG_DEBUG
-		DPA_INFO("%s::RTP relay disabled,  changing miss action\n", __func__);
-#endif
-		if((tbl_info->type != ETHERNET_TABLE) &&
-				(tbl_info->type != PPPOE_RELAY_TABLE) &&
-#ifdef CDX_IP_REASSEMBLY
-				(tbl_info->type != IPV4_REASSM_TABLE) &&
-				(tbl_info->type != IPV6_REASSM_TABLE)
-#endif // CDX_IP_REASSEMBLY
-			) {
-			//adding miss action as KG
-			miss_engine_params.nextEngine = e_FM_PCD_KG;
-			//get ethernet distribution scheme handle
-			miss_engine_params.params.kgParams.h_DirectScheme = 
-				get_ethdist_info_by_fman_params(finfo);
-#if 1//def DPA_CFG_DEBUG
-			DPA_INFO("%s::changing miss action for table %s as KG scheme %pK\n",
-					__func__, tbl_info->name,
-					miss_engine_params.params.kgParams.h_DirectScheme);
-#endif
-			if (miss_engine_params.params.kgParams.h_DirectScheme == NULL) {
-				DPA_ERROR("%s::error finding direct dist for table %s\n",
-						__func__, tbl_info->name);
-				return -1;
-			}
-			printk("%s::found direct dist for %s\n", __func__,
-					tbl_info->name);
-		} else {
-			//adding miss action as policer
-			miss_engine_params.nextEngine = e_FM_PCD_PLCR;
-			//shared profile
-			miss_engine_params.params.plcrParams.sharedProfile = 1;
-			//get policer profile id for CP Ethernet traffic
-			miss_engine_params.params.plcrParams.newRelativeProfileId =
-				CDX_EXPT_ETH_RATELIMIT;
-#if 1//def DPA_CFG_DEBUG
-			DPA_INFO("%s::changing miss action for table %s as policer profile %d\n",
-					__func__, tbl_info->name, 
-					miss_engine_params.params.plcrParams.newRelativeProfileId);
-#endif
-		}
-		if (FM_PCD_HashTableModifyMissNextEngine(tbl_info->id,	
-					&miss_engine_params) != E_OK) {
-			DPA_ERROR("%s::error changing miss action table %s\n",
-					__func__, tbl_info->name);
-			return -1;
-		}
-#else
 		// RTP relay enabled
 #ifdef DPA_CFG_DEBUG
 		DPA_INFO("%s::RTP relay enabled,  changing miss action\n", __func__);
@@ -622,7 +551,6 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 					__func__, tbl_info->name);
 			return -1;
 		}
-#endif //CDX_RTP_RELAY 
 		tbl_info++;
 	}
 	return 0;
@@ -1022,37 +950,6 @@ void *dpa_get_tdinfo(uint32_t fm_index, uint32_t port_idx, uint32_t type)
 	DPA_ERROR("%s::invalid index %d\n", __func__, fm_index);	
 	return NULL;
 }
-#define DPA_PORT_TYPE_10G 10
-
-/* it is assumed only one port will be the wan port and  it is  10G port*/
-int dpa_get_wan_port(uint32_t fm_index, uint32_t *port_idx)
-{
-	struct cdx_fman_info *finfo;
-	uint32_t ii;
-
-	finfo =  fman_info;
-	//loop thru al fmans
-	for (ii = 0; ii < num_fmans; ii++) {
-		if (finfo->index == fm_index) {
-			struct cdx_port_info *port_info;
-			uint32_t jj;
-			port_info = finfo->portinfo;
-			//seach for port in fman structures
-			for (jj = 0; jj < finfo->max_ports; jj++) {
-				if (port_info->type  == DPA_PORT_TYPE_10G) {
-					*port_idx  = (uint32_t)( port_info->portid);
-					return SUCCESS;
-				}
-				port_info++;
-			}
-		}
-		finfo++;
-	}
-	DPA_ERROR("%s::no wan port found fm_index %d\n",
-			__func__, fm_index);
-	return FAILURE;
-}
-
 void *dpa_get_fm_ctx(uint32_t fm_idx)
 {
 	if (fm_idx < num_fmans)

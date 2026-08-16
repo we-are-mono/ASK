@@ -31,7 +31,6 @@ import asyncio
 import os
 import re
 
-import pytest
 import pytest_asyncio
 
 from _topology import (

@@ -166,28 +166,23 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 {
 	cdx_proc_dir_entry_t *proc_entry;
 	struct proc_dir_entry *proc_parent_dir_entry;
-	char parent_dir[16]="";
 
 	switch(type)
 	{
 		case TX_DIR:
 			proc_parent_dir_entry = proc_tx_dir;
-			strscpy(parent_dir, "tx", sizeof(parent_dir));
 			break;
 
 		case RX_DIR:
 			proc_parent_dir_entry = proc_rx_dir;
-			strscpy(parent_dir, "rx", sizeof(parent_dir));
 			break;
 
 		case PCD_DIR:
 			proc_parent_dir_entry = proc_pcd_dir;
-			strscpy(parent_dir, "pcd", sizeof(parent_dir));
 			break;
 
 		case SA_DIR:
 			proc_parent_dir_entry = proc_sa_dir;
-			strscpy(parent_dir, "sa", sizeof(parent_dir));
 			break;
 
 		default:
@@ -210,7 +205,7 @@ int cdx_create_dir_in_procfs(void **proc_dir_entry, char *name,uint32_t type)
 		return -1;
 	}
 #ifdef CDX_DPA_DEBUG
-	printk("/proc/fqid_stats/%s/%s directory created.\n", parent_dir,name);
+	printk("/proc/fqid_stats/%s directory created.\n", name);
 #endif
 	*proc_dir_entry = (void *)proc_entry;
 #ifdef CDX_DPA_DEBUG

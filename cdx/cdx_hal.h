@@ -10,10 +10,7 @@
 #ifndef _CDX_HAL_H_
 #define _CDX_HAL_H_
 
-#define ALIGN64(x)      (((u32)(x)) & ~0x7)
-#define ROUND_UP64(x)   (((u32)(x) + 0x7) & ~0x7)
 
-#define ALIGN32(x)      (((u32)(x)) & ~0x3)
 #define ROUND_UP32(x)   (((u32)(x) + 0x3) & ~0x3)
 
 

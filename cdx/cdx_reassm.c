@@ -298,7 +298,7 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 				__func__);
 		return -1;
 	}
-#ifdef DEVMAN_DEBUG
+#ifdef CDX_IPR_DEBUG
 	CDX_IPR_DPRINT("%s::num_portals %d ::", __func__, num_portals);
 	for (ii = 0; ii < num_portals; ii++)
 		CDX_IPR_DPRINT("%d ", portal_channel[ii]);
@@ -310,7 +310,7 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 				__func__);
 		return -1;
 	}
-#ifdef DEVMAN_DEBUG
+#ifdef CDX_IPR_DEBUG
 	CDX_IPR_DPRINT("%s::fqid_base %x(%d), num %d\n",
 			__func__, fqid_base, fqid_base, num_portals);
 #endif
@@ -354,12 +354,12 @@ static int cdx_create_ipr_fq(uint32_t *base_fqid)
 			}
 			ipr_fqs[ii] = dpa_fq;
 			add_pcd_fq_info(dpa_fq);
-#ifdef DEVMAN_DEBUG
+#ifdef CDX_IPR_DEBUG
 			CDX_IPR_DPRINT("%s::fqid 0x%x created chnl 0x%x\n",
 					__func__, fqid, dpa_fq->channel);
 #endif
 		}
-#ifdef DEVMAN_DEBUG
+#ifdef CDX_IPR_DEBUG
 		else {
 			CDX_IPR_DPRINT("%s::fqid 0x%x already created\n",
 					__func__, fqid);

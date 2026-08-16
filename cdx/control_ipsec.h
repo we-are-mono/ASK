@@ -219,17 +219,6 @@ typedef struct _tSAQueryCommand {
 
 
 
-/* Debugging */
-/*
-Display memory command
-*/
-typedef struct _tDMCommand {
-  unsigned short pad_in_rc_out; /* Padding - retcode */
-  unsigned short length;        /* Lenght of memory to display < 224 bytes 
-				** returns length being displayed in response */
-  unsigned int address;         /* msp address of memory to display 
-			** returns address being displayed in response */
-} DMCommand, *PDMCommand;
 
 /****** IPSEC related common structures *****/
 static __inline U16 HASH_SA(U32 *Daddr, U32 spi, U16 Proto, U8 family)
@@ -245,23 +234,8 @@ static __inline U16 HASH_SA(U32 *Daddr, U32 spi, U16 Proto, U8 family)
 
 #define SA_MAX_OP		2	// maximum of stackable SA (ESP+AH)
 
-typedef  struct  AH_HDR_STRUCT
-{
-        U8  nexthdr;
-        U8  hdrlen;             /* This one is measured in 32 bit units! */
-        U16 reserved;
-        U32 spi;
-        U32 seq_no;             /* Sequence number */
-        U8  auth_data[4];       /* Variable len but >=4. Mind the 64 bit alignment! */
-} ip_ah_hdr ;
 
 
-typedef  struct  ESP_HDR_STRUCT
-{
-        U32 spi;
-        U32 seq_no;
-        U32 enc_data[1];
-} ip_esp_hdr;
 
 
 
@@ -368,9 +342,7 @@ struct auth_params {
 typedef struct dpa_sec_sa_context_s{
 	U32   to_sec_fqid;
 	U32   from_sec_fqid;
-#ifdef UNIQUE_IPSEC_CP_FQID
 	U32   to_cp_fqid;
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
         void  *dpa_ipsecsa_handle;
 	struct cipher_params cipher_data;   /* Encryption parameters          */
@@ -401,9 +373,7 @@ typedef struct dpa_sec_sa_context_s{
 typedef struct _tSAEntry {
 	struct slist_entry      list_spi;
 	struct slist_entry      list_h;
-#ifdef UNIQUE_IPSEC_CP_FQID
 	struct slist_entry      list_fqid;
-#endif /* UNIQUE_IPSEC_CP_FQID */
 	TIMER_ENTRY 		deletion_timer;	/* should be the first member */
 	U32			deletion_iter;	/* A24b: poll count for FQ-retire wait; capped via SA_RELEASE_MAX_ITER */
 	U16			hash_by_h;
@@ -458,73 +428,28 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa);
 extern struct slist_head sa_cache_by_spi[];
 extern struct slist_head sa_cache_by_h[];
 
-/* Fixed mapping between source and destination ddts */
-#define DST_DDTE(src_ddte) (&(src_ddte[ELP_MAX_DDT_PER_PKT]))
 
 
 
-/* SA flags (oxffest 0x7e) bits  */
-#define ESPAH_ENABLED			0x0001
-#define ESPAH_SEQ_ROLL_ALLOWED		0x0002
-#define ESPAH_TTL_ENABLE		0x0004	
-#define ESPAH_TTL_TYPE			0x0008 /* 0:byte 1:time */
-#define ESPAH_AH_MODE			0x0010 /* 0:ESP 1:AH */
-#define ESPAH_ANTI_REPLAY_ENABLE 	0x0080
-#define ESPAH_COFF_EN			0x0400 /* 1:Crypto offload enable */
-#define ESPAH_COFF_MODE			0x0800 /* Crypto offload mode: 0: ECB cypher or raw hash, 1 CBC cypher or HMAC hash */
-#define ESPAH_IPV6_ENABLE 		0x1000 /* 1:IPv6 SA */ 
-#define ESPAH_DST_OP_MODE 		0x2000 /* IPv6 dest opt treatment EDN-0277 page 16 */ 
-#define ESPAH_EXTENDED_SEQNUM   	0x4000
-
-
-/* STAT codes that go into the STAT_RET_CODE  of a register */
-#define ESPAH_STAT_OK          	0
-#define ESPAH_STAT_BUSY       	1
-#define ESPAH_STAT_SOFT_TTL    	2
-#define ESPAH_STAT_HARD_TTL    	3
-#define ESPAH_STAT_SA_INACTIVE 	4
-#define ESPAH_STAT_REPLAY      	5
-#define ESPAH_STAT_ICV_FAIL    	6
-#define ESPAH_STAT_SEQ_ROLL    	7
-#define ESPAH_STAT_MEM_ERROR   	8
-#define ESPAH_STAT_VERS_ERROR  	9
-#define ESPAH_STAT_PROT_ERROR  	10
-#define ESPAH_STAT_PYLD_ERROR  	11
-#define ESPAH_STAT_PAD_ERROR   	12
-#define ESPAH_DUMMY_PKT   	13
 
 
  
 /****** IPSEC HW related common structures *****/
 
-// Dummy ip headers are presently non-cachable hence flushing them is not needed
-// // If they become cachable change flush definition below.
-#define IPSEC_flush_ipv4h(start,end) 
-//#define IPSEC_flush_if_cachable(start,end) L1_dc_flush(start,end)
 
 
 /* SA notifications */
 #define IPSEC_SOFT_EXPIRE 0
 #define IPSEC_HARD_EXPIRE 1
 
-int M_ipsec_ttl_check_time(void);
 
-extern struct tIPSec_hw_context gIpSecHWCtx;
-extern int gIpsec_available;
-void M_ipsec_outbound_entry(void);
-void M_ipsec_outbound_callback(void);
-void M_ipsec_inbound_entry(void);
-void M_ipsec_inbound_callback(void);
 void sa_remove_from_list_fqid(PSAEntry pSA);
 void sa_free(PSAEntry pSA);
-#ifdef UNIQUE_IPSEC_CP_FQID
 struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid, uint16_t *sagd_pkt);
-#endif
 
 
 int ipsec_init(void);
 void ipsec_exit(void);
-void ipsec_standalone_init(void);
 
 int IPsec_get_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len);
 int IPsec_reset_SEC_failure_stats(uint16_t *pcmd, uint16_t cmd_len);

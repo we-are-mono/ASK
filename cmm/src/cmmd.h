@@ -47,7 +47,6 @@
 #define CMMD_SOCKET_TYPE_LANWAN				0
 #define CMMD_SOCKET_TYPE_ACP				1
 #define CMMD_SOCKET_TYPE_MSP				2
-#define CMMD_SOCKET_TYPE_LRO				4
 
 #define CMMD_ERR_SOCK_ALREADY_OPEN			FPP_ERR_SOCK_ALREADY_OPEN	
 #define CMMD_ERR_SOCKID_ALREADY_USED			FPP_ERR_SOCKID_ALREADY_USED
@@ -160,7 +159,6 @@ typedef fpp_ff_ctrl_cmd_t 	cmmd_ff_ctrl_cmd_t;
 // 0x0700 -> 0x07FF : Multicast modules 
 #define CMMD_ERR_MC_ENTRY_NOT_FOUND		FPP_ERR_MC_ENTRY_NOT_FOUND
 #define CMMD_ERR_MC_MAX_LISTENERS                    701
-#define CMMD_ERR_MC_DUP_LISTENER                     702
 #define CMMD_ERR_MC_ENTRY_OVERLAP  		     703 
 #define CMMD_ERR_MC_INVALID_MAC                      704
 #define CMMD_ERR_MC_INTERFACE_NOT_ALLOWED            705
@@ -170,11 +168,8 @@ typedef fpp_ff_ctrl_cmd_t 	cmmd_ff_ctrl_cmd_t;
 #define CMMD_CMD_MC6_MODE               	0x0705
 
 
-#define CMMD_MC6_MAX_LISTENERS_PER_GROUP     	4
-
 #define CMMD_MC6_MODE_BRIDGED			0x0001
 #define CMMD_MC6_MODE_ROUTED         		0x0000
-#define CMMD_MC6_MODE_MASK           		0x0001
 
 typedef struct mc_listener cmmd_mc6_listener_t;
 
@@ -200,12 +195,6 @@ typedef struct cmmd_mc6_entry {
 #define CMMD_MC_ACTION_REMOVE			1
 #define CMMD_MC_ACTION_UPDATE       		2
 #define CMMD_MC_ACTION_REMOVE_LOCAL       	11
-
-#define CMMD_MC4_MODE_BRIDGED     		0x0001
-#define CMMD_MC4_MODE_ROUTED			0x0000
-#define CMMD_MC4_MODE_MASK			0x0001
-
-#define CMMD_MC4_MAX_LISTENERS_PER_GROUP	4
 
 typedef struct mc_listener  cmmd_mc4_listener_t;      
 
@@ -253,7 +242,6 @@ typedef struct cmmd_voice_file_unload_cmd {
 #define CMMD_CMD_TUNNEL_QUERY		FPP_CMD_TUNNEL_QUERY	
 #define CMMD_CMD_TUNNEL_QUERY_CONT	FPP_CMD_TUNNEL_QUERY_CONT	
 #define CMMD_CMD_TUNNEL_SHOW		0x0B09
-#define CMMD_CMD_TUNNEL_SAMREADY	0x0B0a
 
 /* CMM to Deamon message structure */
 typedef struct cmmd_tunnel {
@@ -357,21 +345,6 @@ typedef struct cmmd_saquery_timer {
 #define MAX_QUERY_TIMER_VAL 900
 /*-------------------------------------------*/
 
-/*----------------DPI---------------------------------*/
-#ifdef COMCERTO_2000 
-
-#define CMMD_CMD_DPIENABLE	0x1601
-
-/*-Structure representing the command sent to configure DPI enable/disable Flag */
-typedef struct cmmd_dpi_enable {
-	int32_t		action;
-}cmmd_dpi_enable_t;
-
-#define CMMD_DPIFLAG_ACTION_ENABLE		0
-#define CMMD_DPIFLAG_ACTION_DISABLE		1
-
-#endif /*C2000_DPI*/
-/*----------------DPI---------------------------*/
 
 /*-------------Asymmetric fast forward------------------*/
 #define CMMD_ASYM_FF_ENABLE	0x1701

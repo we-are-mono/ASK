@@ -14,9 +14,6 @@
 #include "misc.h"
 
 
-char IF0_NAME[16] = TOSTR(DEFAULT_NAME_0);
-char IF1_NAME[16] = TOSTR(DEFAULT_NAME_1);
-char IF2_NAME[16] = TOSTR(DEFAULT_NAME_2);
 
 DSCP_Vlan_PCP_Map_context gDscpVlanPcpMapCtx;
 

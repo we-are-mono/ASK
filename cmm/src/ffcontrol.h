@@ -119,7 +119,6 @@ struct wifi_ff_entry
 	unsigned short  direct_path_rx;
 	unsigned short  wifi_guest;
 	unsigned short  no_l2_itf;
-	struct interface *wifi_ff_if;
 };
 #endif
 

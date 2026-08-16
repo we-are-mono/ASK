@@ -32,7 +32,6 @@
 #define NUM_SA_ENTRIES 	16
 #define NUM_SOCK_ENTRIES 	1024
 #define NUM_IPSEC_SOCK_ENTRIES 	16
-#define NUM_L2TP_ENTRIES 		16
 
 /* Actions */
 #define ACTION_REGISTER		0
@@ -45,9 +44,6 @@
 #define ACTION_TCP_FIN		9
 
 /* Actions allowed for multicast entry managment*/
-#define MC_ACTION_ADD		0
-#define MC_ACTION_REMOVE	1
-#define MC_ACTION_REFRESH	2
 
 
 #define 	OUTPUT_ACP		1
@@ -167,14 +163,6 @@ enum return_code {
 	ERR_RTP_STATS_NOT_AVAILABLE = 1236,
 	ERR_RTP_STATS_RESET = 1237,
 
-	ERR_VOICE_BUFFER_UNKNOWN = 1240,
-	ERR_VOICE_BUFFER_USED = 1241,
-	ERR_VOICE_BUFFER_PT = 1242,
-	ERR_VOICE_BUFFER_FRAME_SIZE = 1243,
-	ERR_VOICE_BUFFER_ENTRIES = 1244,
-	ERR_VOICE_BUFFER_SIZE = 1245,
-	ERR_VOICE_BUFFER_STARTED = 1246,
-
 	ERR_ALTCONF_OPTION_NOT_SUPPORTED = 1300,
 	ERR_ALTCONF_MODE_NOT_SUPPORTED = 1301,	
 	ERR_ALTCONF_WRONG_NUM_PARAMS = 1302,
@@ -227,7 +215,6 @@ enum return_code {
 #define SA_TIMER_INTERVAL	(CT_TIMER_INTERVAL *300) 
 #define CT_TIMER_INTERVAL	((CT_TIMER_INTERVAL_MS * HZ) / 1000)
 #define CT_TIMER_TICKS_PER_SECOND	(1000 / CT_TIMER_INTERVAL_MS)
-#define	CT_TIMER_BINSIZE	((NUM_CT_ENTRIES * 1000) / (CT_SCAN_TIME_MS * CT_TIMER_TICKS_PER_SECOND))
 
 #if ((CT_TIMER_TICKS_PER_SECOND * CT_TIMER_INTERVAL) != HZ)
 #	error "HZ has to be multiple of CT_TIMER_INTERVAL_MS"
@@ -249,7 +236,6 @@ enum return_code {
 #define ETHERTYPE_ARP			0x0806	//  ARP
 #define ETHERTYPE_VLAN			0x8100	// 	VLAN 
 #define ETHERTYPE_IPV6			0x86dd	//	IP protocol version 6
-#define ETHERTYPE_MPT			0x889B 	//  IEEE mindspeed packet type
 #define ETHERTYPE_PPPOE			0x8864  //  PPPoE Session packet
 #define ETHERTYPE_PPPOED		0x8863  //  PPPoE Discovery packet
 #define ETHERTYPE_PAE                   0x888E   /* Port Access Entity (IEEE 802.1X) */
@@ -261,7 +247,6 @@ enum return_code {
 #define ETHERTYPE_ARP_END		htons(ETHERTYPE_ARP)
 #define ETHERTYPE_VLAN_END		htons(ETHERTYPE_VLAN)
 #define ETHERTYPE_IPV6_END		htons(ETHERTYPE_IPV6)
-#define ETHERTYPE_MPT_END		htons(ETHERTYPE_MPT)
 #define ETHERTYPE_PPPOE_END		htons(ETHERTYPE_PPPOE)
 #define ETHERTYPE_PPPOED_END		htons(ETHERTYPE_PPPOED)
 #define ETHERTYPE_PAE_END               htons(ETHERTYPE_PAE)
@@ -406,11 +391,7 @@ typedef struct _tSockOpenCommand {
 	U16		dscp;
 	U32		route_id;
 	U16		expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	U16		iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
-#else
 	U16		rsvd;
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	U16		secure;
 	U16 		SA_nr_rx;
 	U16 		SA_handle_rx[4];
@@ -512,11 +493,7 @@ typedef struct _tSock6OpenCommand {
 	U16		dscp;
 	U32		route_id;
 	U16		expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-	U16		iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
-#else
 	U16		rsvd1;
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 	U16		secure;
 	U16 		SA_nr_rx;
 	U16 		SA_handle_rx[4];
@@ -531,10 +508,6 @@ typedef struct _tSock6CloseCommand {
 }__attribute__((__packed__)) Sock6CloseCommand, *PSock6CloseCommand;
 
 
-typedef struct _tFragTimeoutCommand {
-	U16		timeout;
-	U16		mode;
-}__attribute__((__packed__)) FragTimeoutCommand, *PFragTimeoutCommand;
 
 
 typedef struct _tSock6UpdateCommand {
@@ -578,7 +551,6 @@ typedef struct TCP_HDR_STRUCT
 #define TCPFLAGS_SYN	0x0002
 #define TCPFLAGS_RST	0x0004
 #define TCPFLAGS_PSH	0x0008
-#define TCPFLAGS_ACK	0x0010
 #define TCPFLAGS_URG	0x0020
 #define TCPFLAGS_ECE	0x0040
 #define TCPFLAGS_CWR	0x0080
@@ -610,7 +582,6 @@ typedef struct UDP_HDR_STRUCT
 #define IS_IPV4_FLOW(pEntry) ((pEntry->fftype & FFTYPE_IPV4) != 0)
 #define IS_IPV6(pEntry) (pEntry->fftype == FFTYPE_IPV6)
 #define IS_IPV6_FLOW(pEntry) ((pEntry->fftype & FFTYPE_IPV6) != 0)
-#define IS_TUNNEL(pEntry) ((pEntry->fftype & FFTYPE_TUNNEL) != 0)
 static __inline U32 HASH_RT(U32 id)
 {
 	U16 sum;
@@ -622,23 +593,6 @@ static __inline U32 HASH_RT(U32 id)
 
 #define IP6_LO_ADDR	3
 
-static __inline void COPY_MACHEADER(void *pheader, void *pdstmacaddr, void *psrcmacaddr, U16 typeid)
-{
-	U16 *pto_U16;
-	U16 *pdst_U16;
-	U16 *psrc_U16;
-	pto_U16 = (U16 *)pheader;
-	pdst_U16 = (U16 *)pdstmacaddr;
-	psrc_U16 = (U16 *)psrcmacaddr;
-
-	pto_U16[0] = pdst_U16[0];
-	pto_U16[1] = pdst_U16[1];
-	pto_U16[2] = pdst_U16[2];
-	pto_U16[3] = psrc_U16[0];
-	pto_U16[4] = psrc_U16[1];
-	pto_U16[5] = psrc_U16[2];
-	pto_U16[6] = typeid;
-}
 
 static __inline void COPY_MACADDR(void *ptomacaddr, void *pfrommacaddr)
 {

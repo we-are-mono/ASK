@@ -141,7 +141,6 @@ static int M_bridge_expire_l2_flow_entry(struct L2Flow_entry *entry)
 	if (msg_send(pmsg) < 0)
 		goto err;
 
-	//l2flow_remove(entry);
 	return 0;
 
 err:
@@ -625,19 +624,6 @@ static U16 M_bridge_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 }
 
 
-
-int bridge_interface_deregister( U16 phy_port_id )
-{
-	printk(KERN_CRIT "%s\n", __func__);
-	return 0;
-}
-
-int bridge_interface_register( uint8_t *name, U16 phy_port_id )
-{
-
-	printk(KERN_CRIT "%s\n", __func__);
-	return 0;
-}
 
 static int  M_bridge_handle_reset(void)
 {

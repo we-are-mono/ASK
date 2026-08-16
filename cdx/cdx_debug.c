@@ -28,7 +28,6 @@ void display_itf(struct _itf *itf)
 	printk("index		\t%d\n", itf->index);
 	printk("parent		\t%p\n", itf->phys);
 }
-EXPORT_SYMBOL(display_itf);
 
 //display cdx route entry
 void display_route_entry(PRouteEntry entry)
@@ -48,7 +47,6 @@ void display_route_entry(PRouteEntry entry)
 		printk("itf is NULL\n");
 	}
 }
-EXPORT_SYMBOL(display_route_entry);
 
 //display cdx ct entry
 void display_ctentry(PCtEntry entry)
@@ -87,7 +85,6 @@ void display_ctentry(PCtEntry entry)
 	}
 	printk(">>>>>\n");
 }
-EXPORT_SYMBOL(display_ctentry);
 
 void display_buf(void *buf, uint32_t size)
 {

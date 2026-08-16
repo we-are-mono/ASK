@@ -179,8 +179,6 @@ int cdx_rtp_set_hwinfo_fields(PRTPflow pFlow, PSockEntry pFromSocket)
 	if (pFromSocket->SocketFamily == PROTO_IPV4)
 		flags |= RTP_OFFLOAD_IPV4_PACKET;
 
-	if (pFlow->RTPcall->Special_tx_active)
-		flags |= RTP_OFFLOAD_SPECIAL_TX_ACTIVE;
 
 	if (pFromSocket->proto == 17)
 		flags |= RTP_OFFLOAD_UDP_PROTOCOL;
@@ -262,7 +260,7 @@ static int rtp_flow_add(PRTPflow pFlow, U32 hash, PSockEntry pFromSocket, PSockE
 }
 
 /* remove a hardware flow entry from the packet engine hash */
-static void rtp_flow_unlink(struct _thw_rtpflow *hw_flow, U32 hash)
+static void rtp_flow_unlink(struct _thw_rtpflow *hw_flow)
 {
 	if ((hw_flow->eeh_entry_handle) &&
 			(ExternalHashTableDeleteKey(hw_flow->td, 
@@ -285,7 +283,7 @@ static void rtp_flow_remove(PRTPflow pFlow)
 	if ((hw_flow = pFlow->hw_flow))
 	{
 		/* remove it in ucode  */
-		rtp_flow_unlink(hw_flow, 0);
+		rtp_flow_unlink(hw_flow);
 
 	}
 
@@ -331,7 +329,7 @@ static int RTP_change_flow(PRTPflow pFlow, U16 ingress_socketID, U16 egress_sock
 	hash = HASH_RTP(pFlow->ingress_socketID);
 
 	// delete the previous entry in ucode
-	rtp_flow_unlink(hw_flow, hash);
+	rtp_flow_unlink(hw_flow);
 
 	/* now managing changes in software flow */
 	slist_remove(&rtpflow_cache[hash], &pFlow->list);
@@ -1093,9 +1091,6 @@ static U16 RTP_Call_SpecialTx_Control (U16 *p, U16 Length)
 		memcpy(pCall->BtoA_flow->hw_flow->Special_payload2, pCall->Next_Special_payload2, RTP_SPECIAL_PAYLOAD_LEN);
 	}
 
-	//TODO special
-	//	pCall->AtoB_flow->hw_flow->rtp_info->Special_tx_type = RTPCmd.Type;
-	//	pCall->BtoA_flow->hw_flow->rtp_info->Special_tx_type = RTPCmd.Type;
 
 	copy_ddr_to_muram_and_free_ddr((void *)pCall->AtoB_flow->hw_flow->rtp_info, (void **)&pRtp_info_AtoB, sizeof(struct _thw_RTPinfo));
 	copy_ddr_to_muram_and_free_ddr((void *)pCall->BtoA_flow->hw_flow->rtp_info, (void **)&pRtp_info_BtoA, sizeof(struct _thw_RTPinfo));
@@ -1307,22 +1302,6 @@ static U16 RTCP_Query (U16 *p, U16 Length)
 	}
 #endif // CDX_DPA_DEBUG
 	return NO_ERR;
-}
-
-PRTPflow RTP_find_flow(U16 id)
-{
-	PRTPflow flow_entry;
-	struct slist_entry *entry;
-	U32 hash_key;
-
-	hash_key = HASH_RTP(id);
-	slist_for_each(flow_entry, entry, &rtpflow_cache[hash_key], list)
-	{
-		if (id && (flow_entry->ingress_socketID == id))
-			return flow_entry;
-	}
-
-	return NULL;
 }
 
 

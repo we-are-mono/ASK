@@ -11,41 +11,25 @@
 #ifndef _CONTROL_STAT_H_
 #define _CONTROL_STAT_H_
 
-#define	pktstat_t	u32		/* change to u64 when supported in ucode */
-#define	bytestat_t	u64
 
 #define FPP_STAT_RESET  		0x0001
 #define FPP_STAT_QUERY 			0x0002
 #define FPP_STAT_QUERY_RESET   (FPP_STAT_RESET|FPP_STAT_QUERY)
 
-#define FPP_STAT_ENABLE		0x0001
-#define FPP_STAT_DISABLE		0x0000
 
 #define STAT_PPPOE_QUERY_NOT_READY	0
-#define STAT_PPPOE_QUERY_READY	1
 #define STAT_PPPOE_QUERY_RESET      2
 
-#define STAT_BRIDGE_QUERY_NOT_READY	0
-#define STAT_BRIDGE_QUERY_READY	1
-#define STAT_BRIDGE_QUERY_RESET    2
 
-#define STAT_IPSEC_QUERY_NOT_READY	0
-#define STAT_IPSEC_QUERY_READY	1
 #define STAT_IPSEC_QUERY_RESET    2
-#define STAT_VLAN_QUERY_NOT_READY	0
-#define STAT_VLAN_QUERY_READY			1
 #define STAT_VLAN_QUERY_RESET      		2
 
-#define STAT_TUNNEL_QUERY_NOT_READY	0
-#define STAT_TUNNEL_QUERY_READY		1
 #define STAT_TUNNEL_QUERY_RESET      	2
 
 
 /* Definitions of Bit Masks for the features */
-#define STAT_QUEUE_BITMASK 		0x00000001
 #define STAT_INTERFACE_BITMASK 		0x00000002
 #define STAT_PPPOE_BITMASK 		0x00000008
-#define STAT_BRIDGE_BITMASK 		0x00000010
 #define STAT_IPSEC_BITMASK 		0x00000020
 #define STAT_VLAN_BITMASK 		0x00000040
 #define STAT_TUNNEL_BITMASK 		0x00000080
@@ -59,11 +43,6 @@ typedef struct _tStatEnableCmd {
 	U32 bitmask; /* Specifies the feature to be enabled or disabled */ 
 }StatEnableCmd, *PStatEnableCmd;
 
-typedef struct _tStatQueueCmd {
-	unsigned short action; /* Reset, Query, Query & Reset */
-	unsigned short interface;
-	unsigned short queue;
-}StatQueueCmd, *PStatQueueCmd;
 
 typedef struct _tStatInterfaceCmd {
 	unsigned short action; /* Reset, Query, Query & Reset */
@@ -78,9 +57,6 @@ typedef struct _tStatPPPoEStatusCmd {
 	unsigned short action; /* Reset, Query, Query & Reset */
 }StatPPPoEStatusCmd, *PStatPPPoEStatusCmd;
 
-typedef struct _tStatBridgeStatusCmd {
-	unsigned short action; /* Reset, Query, Query & Reset */
-}StatBridgeStatusCmd, *PStatBridgeStatusCmd;
 
 typedef struct _tStatIpsecStatusCmd {
 	unsigned short action; /* Reset, Query, Query & Reset */
@@ -98,14 +74,6 @@ typedef struct _tStatTunnelStatusCmd {
 	char ifname[IF_NAME_SIZE];
 }StatTunnelStatusCmd, *PStatTunnelStatusCmd;
 
-typedef struct _tStatQueueResponse {
-	U16 ackstatus;
-	U16 rsvd1;
-	unsigned int peak_queue_occ; 
-	unsigned int emitted_pkts; 
-	unsigned int dropped_pkts; 
-	
-}StatQueueResponse, *PStatQueueResponse;
 
 typedef struct _tStatInterfacePktResponse {
 	U16 ackstatus;
@@ -133,23 +101,6 @@ typedef struct _tStatPPPoEEntryResponse {
 	U32 total_packets_transmitted; 
 }StatPPPoEEntryResponse, *PStatPPPoEEntryResponse;
 
-typedef struct _tStatBridgeEntryResponse {
-	U16 ackstatus;
-	U16 eof;
-	U16 input_interface;
-	U16 input_svlan; 
-	U16 input_cvlan; 
-	U8 dst_mac[6];
-	U8 src_mac[6];
-	U16 etherType;
-	U16 output_interface;
-	U16 output_svlan; 
-	U16 output_cvlan; 
-	U16 session_id;
-	U32 total_packets_transmitted; 
-	U8 input_name[IF_NAME_SIZE];
-	U8 output_name[IF_NAME_SIZE];
-}StatBridgeEntryResponse, *PStatBridgeEntryResponse;
 
 typedef struct _tStatIpsecEntryResponse {
 	U16 ackstatus;
@@ -231,7 +182,6 @@ typedef struct _tStatFlowEntryResp {
 int statistics_init(void);
 void statistics_exit(void);
 
-extern int gStatBridgeQueryStatus;
 extern U8 gStatPPPoEQueryStatus;
 extern int gStatIpsecQueryStatus;
 extern U8 gStatVlanQueryStatus;

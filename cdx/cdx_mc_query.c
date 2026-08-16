@@ -81,9 +81,7 @@ static int MC4_Get_Hash_Snapshot(int mc4_hash_index, int mc4_tot_entries, PMC4Co
 
 		memset(pMC4Snapshot, 0, sizeof(MC4Command));
 		pMC4Snapshot->src_addr  	= pMcastGrpInfo->ipv4_saddr;
-		//pMC4Snapshot->src_addr_mask	= pMC4Entry->mcdest.src_mask_len;
 		pMC4Snapshot->dst_addr 		= pMcastGrpInfo->ipv4_daddr;
-		//pMC4Snapshot->queue = pMC4Entry->mcdest.queue_base;
 		strncpy((char*)pMC4Snapshot->input_device_str,
 				pMcastGrpInfo->ucIngressIface,IF_NAME_SIZE-1);
 		for(i = 0,j = 0; j < MC_MAX_LISTENERS_PER_GROUP; j++)
@@ -254,9 +252,7 @@ static int MC6_Get_Hash_Snapshot(int mc6_hash_index, int mc6_tot_entries, PMC6Co
 		pMcastGrpInfo = list_entry(ptr,struct mcast_group_info,list);
 		memset(pMC6Snapshot, 0, sizeof(MC6Command));
 		memcpy(pMC6Snapshot->src_addr, pMcastGrpInfo->ipv6_saddr, IPV6_ADDRESS_LENGTH);
-		//pMC6Snapshot->src_mask_len	= pMC6Entry->mcdest.src_mask_len;
 		memcpy(pMC6Snapshot->dst_addr, pMcastGrpInfo->ipv6_daddr, IPV6_ADDRESS_LENGTH);
-		//pMC6Snapshot->queue = pMC6Entry->mcdest.queue_base;
 		strncpy((char*)pMC6Snapshot->input_device_str,
 				pMcastGrpInfo->ucIngressIface,IF_NAME_SIZE-1);
 		for(i = 0,j = 0; j < MC_MAX_LISTENERS_PER_GROUP; j++)

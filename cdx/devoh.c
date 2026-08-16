@@ -67,15 +67,12 @@ static struct oh_port_type ohport_assign[] =
 
 static struct oh_port_info offline_port_info[MAX_FRAME_MANAGERS][MAX_OF_PORTS];
 
-extern struct dpa_iface_info *dpa_interface_info;
-extern spinlock_t dpa_devlist_lock;
 extern int FM_PORT_SetOhPortOfne(uint32_t fmidx, uint32_t portidx, uint32_t nia_val);
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq);
 
 static enum qman_cb_dqrr_result ofport_rx_err(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq);
-extern int FM_PORT_SetOhPortRda(uint32_t fmidx, uint32_t portidx, uint32_t val);
 
 int get_ofport_fman_and_portindex(uint32_t fm_index, uint32_t handle, uint32_t* fm_idx, uint32_t* port_idx,
 		uint32_t *portid)
@@ -212,43 +209,6 @@ int release_offline_port(uint32_t fm_idx, int handle)
 	DPA_ERROR("%s::port was not in use\n", __func__);
 	return -1;
 }
-
-#ifdef DEVOH_DEBUG
-static void display_of_port_info(void) DPA_UNUSED;
-static void display_of_port_info(void)
-{
-	uint32_t ii;
-	uint32_t jj;
-	struct oh_port_info *info;
-
-	DPA_INFO("===================================================\n"
-			"of port info \n"); 
-	for (jj = 0; jj < MAX_FRAME_MANAGERS; jj++) {
-		DPA_INFO("fm	\t%d\nmax of ports	\t%d\n", 
-				jj, MAX_OF_PORTS);
-		for (ii = 0; ii < MAX_OF_PORTS; ii++) {
-			int kk;
-			info = &offline_port_info[jj][ii];
-			if (info->flags & PORT_VALID) {
-				DPA_INFO("fman %d of port\t%d\n", jj, ii);
-				DPA_INFO("defarx_fqid 	\t%x\n",
-						info->ohinfo->fqinfo[RX_DEFA_FQ].fq_base);
-				DPA_INFO("errrx_fqid 	\t%x\n",
-						info->ohinfo->fqinfo[RX_ERR_FQ].fq_base);
-				for( kk = 0; kk < MAX_MATCH_TABLES; kk++) {
-					if (info->flags & (1 << kk))
-						DPA_INFO("td for type %d	\t%d\n", 
-								kk, info->td[kk]);
-				}
-				if (info->flags & IN_USE) 
-					DPA_INFO("in use		\t\n");
-			}
-		}
-	}
-}
-#else
-#define display_of_port_info()
-#endif
 
 void display_ohport_info(struct oh_iface_info *ohinfo)
 {
@@ -603,19 +563,6 @@ int ohport_set_ofne(uint32_t handle, uint32_t nia_val)
 	if (get_ofport_fman_and_portindex(0, handle, &fm_idx, &port_idx, &portid))
 		return -1;
 	if (FM_PORT_SetOhPortOfne(fm_idx, port_idx, nia_val))
-		return -1;
-	return 0;
-}
-
-int ohport_set_dma(uint32_t handle, uint32_t val)
-{
-	uint32_t fm_idx;
-	uint32_t port_idx;
-	uint32_t portid;
-
-	if (get_ofport_fman_and_portindex(0, handle, &fm_idx, &port_idx, &portid))
-		return -1;
-	if (FM_PORT_SetOhPortRda(fm_idx, port_idx, val))
 		return -1;
 	return 0;
 }

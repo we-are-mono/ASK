@@ -141,7 +141,7 @@ int __cmm_l2flow_deregister(FCI_CLIENT* fci_handler, struct l2flow *l2flow_tmp)
 		cmm_print(DEBUG_INFO, "%s L2 entry successfully deleted\n", __func__);
 	}
 	/* In all case it is needed to ack ABM whatever */
-	cmm_l2flow_abm_notify(L2FLOW_ENTRY_DEL, L2FLOW_ACK, l2flow_tmp);
+	cmm_l2flow_abm_notify(L2FLOW_ENTRY_DEL, 0, l2flow_tmp);
 
 	return 0;
 }
@@ -188,9 +188,9 @@ int __cmm_l2flow_register(FCI_CLIENT* fci_handler, char action, struct l2flow *l
 
 	if(allowed){
 		if(!cmmFeL2FlowUpdate(fci_handler, ADD|UPDATE, entry))
-			cmm_l2flow_abm_notify(L2FLOW_ENTRY_UPDATE, L2FLOW_OFFLOADED | L2FLOW_ACK, &entry->l2flow);
+			cmm_l2flow_abm_notify(L2FLOW_ENTRY_UPDATE, L2FLOW_OFFLOADED, &entry->l2flow);
 		else
-			cmm_l2flow_abm_notify(L2FLOW_ENTRY_UPDATE, L2FLOW_DENIED | L2FLOW_ACK, &entry->l2flow);
+			cmm_l2flow_abm_notify(L2FLOW_ENTRY_UPDATE, L2FLOW_DENIED, &entry->l2flow);
 	}
 	else{
 		cmmFeL2FlowUpdate(fci_handler, REMOVE, entry);
@@ -407,7 +407,7 @@ int cmm_l2flow_netlink_rcv(const struct sockaddr_nl *who, struct nlmsghdr *nlh, 
 #endif
 
 #if defined(LS1043)
-int cmmFeBridgedIfUpdate(FCI_CLIENT *fci_handle, int fd, struct interface *itf)
+int cmmFeBridgedIfUpdate(FCI_CLIENT *fci_handle, struct interface *itf)
 {
         struct fpp_bridged_itf_cmd br_cmd;
 
@@ -508,7 +508,7 @@ update all the interfaces part of bridge with bridge mac address
 and is_bridged flag to be set and when bridge interface is down, all the interfaces 
 part of bridge group will reset the is_bridged flag
 */
-int cmmFeUpdateAllBridgedIfs( FCI_CLIENT *fci_handle, int fd, struct interface *bitf)
+int cmmFeUpdateAllBridgedIfs( FCI_CLIENT *fci_handle, struct interface *bitf)
 {
 	struct list_head *entry;
 	struct interface *itf;
@@ -574,7 +574,7 @@ int cmmFeUpdateAllBridgedIfs( FCI_CLIENT *fci_handle, int fd, struct interface *
 						}
 					}
 
-					ret = cmmFeBridgedIfUpdate(fci_handle, fd, itf);
+					ret = cmmFeBridgedIfUpdate(fci_handle, itf);
 				}
 #ifndef VLAN_FILTER
 			}

@@ -30,25 +30,16 @@ static void cmmRTPSetUsage(void)
 			"                                       [ccn {call control number}] \n"
 			"                                       [sock_id {socket ID}]\n"
 			"                                       [seq_nb_base {Sequence number base }]\n"
-#if defined(LS1043)
 			"                                       [ssrc {RTP/RTCP SSRC}]\n"
-#else
-			"                                       [rtp_ssrc {RTP SSRC}]\n"
-#endif //(LS1043)
 			"                                       [rtp_time_base {RTP timestamp base}]\n"
 			"                                       [rtp_time_incr {RTP timestamp increment}]\n"
 			"                                       [rtp_time_incr_mode {0:TS value, 1:Freq HZ}]\n"
 			"                                       [ssrc_mode {0: regular, 1: auto}]\n"
-#if defined(LS1043)
 			"                                       [marker {Marker Bit Configuration Mode}]\n"
 			"                                       [ssrc_1 {RTCP SSRC_1}]\n"
-#endif //(LS1043)
 			"\n"
 			"                                  [control]\n"
 			"                                       [ccn {call control number}] \n"
-#if !defined(LS1043)
-			"                                       [rtp_media_ctrl {0-3}]\n" 
-#else
 			"										[rtp_media_ctrl {0-31}:\n"
 			"											Bit 0 (1/0):socket A to B RTP relayed/discarded\n"
 			"											Bit 1 (1/0):socket B to A RTP relayed/discarded\n"
@@ -60,7 +51,6 @@ static void cmmRTPSetUsage(void)
 			"											Bit 1 (1/0):Enable/disable VLAN P bit value for packets received on Socket B\n"
 			"											Bit 2to4 (0to7):VLAN P bit value for packets received on Socket A\n"
 			"											Bit 5to7 (0to7):VLAN P bit value for packets received on Socket B]\n"
-#endif //(LS1043)
 
 			"\n"
 			"                                  [close]\n"
@@ -88,11 +78,7 @@ int cmmRTPSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 {
 	int cpt = tabStart;
 	unsigned int tmp; 
-#if defined(LS1043)
 	unsigned long tmp1;
-#else
-	unsigned int takeover_mode = 0;
-#endif
 	char * endptr;
 	union u_rxbuf rxbuf;
 
@@ -241,7 +227,6 @@ int cmmRTPSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 		if(!keywords[++cpt])
 			goto print_help;
 
-#if defined(LS1043)
 		do {
 			if((strcasecmp(keywords[cpt], "seq_nb_base") == 0))
 			{
@@ -381,139 +366,6 @@ int cmmRTPSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 				goto keyword_error;
 		}while (keywords[++cpt] != NULL);
 
-#else
-
-		if((strcasecmp(keywords[cpt], "seq_nb_base") == 0))
-		{
-			if(!keywords[++cpt])
-				goto print_help;
-			
-			/*Get an integer from the string*/
-			endptr = NULL;
-			tmp = strtoul(keywords[cpt], &endptr, 0);
-			if ((keywords[cpt] == endptr) ||  (tmp > USHRT_MAX))
-			{
-				cmm_print(DEBUG_CRIT, "rtp ERROR: seq_nb_base parameter must be a number between 0 and %d\n", USHRT_MAX);
-				goto  print_help;
-			}
-			cmd.seq_number_base= tmp;
-		}
-		else
-			goto keyword_error;
-
-		if(!keywords[++cpt])
-			goto print_help;
-		
-		if((strcasecmp(keywords[cpt], "rtp_ssrc") == 0))
-		{
-			if(!keywords[++cpt])
-				goto print_help;
-		
-			/*Get an integer from the string*/
-			endptr = NULL;
-			tmp = strtoul(keywords[cpt], &endptr, 0);
-			if ((keywords[cpt] == endptr) ||  (tmp > ULONG_MAX))
-			{
-				cmm_print(DEBUG_CRIT, "rtp ERROR: sock_id_b parameter must be a number between 0 and %d\n", (unsigned int) ULONG_MAX);
-				goto  print_help;
-			}
-			cmd.ssrc= tmp;
-		}
-		else
-			goto keyword_error;
-
-		if(!keywords[++cpt])
-			goto print_help;
-
-		if((strcasecmp(keywords[cpt], "rtp_time_base") == 0))
-		{
-			if(!keywords[++cpt])
-				goto print_help;
-		
-			/*Get an integer from the string*/
-			endptr = NULL;
-			tmp = strtoul(keywords[cpt], &endptr, 0);
-			if ((keywords[cpt] == endptr) ||  (tmp > ULONG_MAX))
-			{
-				cmm_print(DEBUG_CRIT, "rtp ERROR: rtp_time_base parameter must be a number between 0 and %d\n", (unsigned int) ULONG_MAX);
-				goto  print_help;
-			}
-			cmd.ts_base= tmp;
-		}
-		else
-			goto keyword_error;
-
-		if(!keywords[++cpt])
-			goto send;
-
-		if((strcasecmp(keywords[cpt], "rtp_time_incr") == 0))
-		{
-			if(!keywords[++cpt])
-				goto print_help;
-		
-			/*Get an integer from the string*/
-			endptr = NULL;
-			tmp = strtoul(keywords[cpt], &endptr, 0);
-			if ((keywords[cpt] == endptr) ||  (tmp > ULONG_MAX))
-			{
-				cmm_print(DEBUG_CRIT, "rtp ERROR: rtp_time_incr parameter must be a number between 0 and %d\n", (unsigned int) ULONG_MAX);
-				goto  print_help;
-			}
-			cmd.ts_incr= tmp;
-		}
-		else
-			goto keyword_error;	
-
-		if(!keywords[++cpt])
-			goto send;
-
-		if((strcasecmp(keywords[cpt], "rtp_time_incr_mode") == 0))
-		{
-			if(!keywords[++cpt])
-				goto print_help;
-		
-			/*Get an integer from the string*/
-			endptr = NULL;
-			tmp = strtoul(keywords[cpt], &endptr, 0);
-			if ((keywords[cpt] == endptr) ||  (tmp > 1))
-			{
-				cmm_print(DEBUG_CRIT, "rtp ERROR: rtp_time_incr_mod parameter must be 0 or 1\n");
-				goto  print_help;
-			}
-			if(tmp)
-				takeover_mode = FPP_RTP_TAKEOVER_MODE_TSINCR_FREQ;
-		}
-		else
-			goto keyword_error;
-
-		if(!keywords[++cpt])
-			goto send;
-
-
-		if((strcasecmp(keywords[cpt], "ssrc_mode") == 0))
-		{
-			if(!keywords[++cpt])
-				goto print_help;
-		
-			/*Get an integer from the string*/
-			endptr = NULL;
-			tmp = strtoul(keywords[cpt], &endptr, 0);
-			if ((keywords[cpt] == endptr) ||  (tmp > 1))
-			{
-				cmm_print(DEBUG_CRIT, "rtp ERROR: ssrc_mode parameter must be 0 or 1\n");
-				goto  print_help;
-			}
-			if(tmp)
-				takeover_mode |= FPP_RTP_TAKEOVER_MODE_SSRC;
-		}
-		else
-			goto keyword_error;		
-
-		cmd.mode = takeover_mode;
-
-
-send:
-#endif // #else of  LS1043
 
 		// Send  command
 		if(cmmSendToDaemon(daemon_handle, FPP_CMD_RTP_TAKEOVER, &cmd, sizeof(cmd), &rxbuf.rcvBuffer) == 2)
@@ -527,9 +379,7 @@ send:
 	{
 		fpp_rtp_ctrl_cmd_t cmd;
 		
-#if defined(LS1043)
 		cmd.vlan_p_bit_conf  = 0;
-#endif //LS1043
 
 		if(!keywords[++cpt])
 			goto print_help;
@@ -563,19 +413,11 @@ send:
 			/*Get an integer from the string*/
 			endptr = NULL;
 			tmp = strtoul(keywords[cpt], &endptr, 0);
-#if defined(LS1043)
 			if ((keywords[cpt] == endptr) ||  (tmp > 31))
 			{
 				cmm_print(DEBUG_CRIT, "rtp ERROR: rtp_media_ctrl parameter must be a number between 0 and 31\n");
 				goto  print_help;
 			}
-#else
-			if ((keywords[cpt] == endptr) ||  (tmp > 3))
-			{
-				cmm_print(DEBUG_CRIT, "rtp ERROR: rtp_media_ctrl parameter must be a number between 0 and 3\n");
-				goto  print_help;
-			}
-#endif // LS1043
 			cmd.control_dir= tmp;
 
 		
@@ -583,7 +425,6 @@ send:
 		else
 			goto keyword_error;
 
-#if defined(LS1043)
 		if((keywords[++cpt]) &&
 		   (strcasecmp(keywords[cpt], "vlan_p_bit_conf") == 0))
 		{
@@ -600,7 +441,6 @@ send:
 			}
 			cmd.vlan_p_bit_conf = tmp;
 		}
-#endif //LS1043
 
 		// Send  command
 		if(cmmSendToDaemon(daemon_handle, FPP_CMD_RTP_CONTROL, &cmd, sizeof(cmd), &rxbuf.rcvBuffer) == 2)

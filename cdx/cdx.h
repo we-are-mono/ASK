@@ -25,11 +25,7 @@
 #include "fm_eh_types.h"
 
 
-#ifdef CDX_DEBUG_ENABLE
-#define DPRINT(fmt, args...) printk(KERN_ERR "%s: " fmt, __func__, ##args)
-#else
 #define DPRINT(fmt, args...) do { } while(0)
-#endif
 
 #define DPRINT_ERROR(fmt, args...) printk(KERN_CRIT "%s: " fmt, __func__, ##args)
 
@@ -45,7 +41,6 @@
 #include "layer2.h"
 #include "globals.h"
 #include "devman.h"
-#include "voip.h"
 
 /* ls104x hardware has a single fman */
 #define FMAN_INDEX 0 
@@ -57,7 +52,6 @@ extern atomic_t num_active_connections;
 extern struct cdx_fman_info *fman_info;
 
 /* qosconnmark definitions */
-#define CQID_MASK       0xf     /* class que mask for originator */
 #define CHID_MASK       0xf     /* channel id mask for originator */
 #define REPLIER_CONNMARK_VALID  ((uint64_t)1 << 63) /* valid bit for replier qosconnmark */
 

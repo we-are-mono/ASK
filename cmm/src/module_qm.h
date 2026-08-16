@@ -49,8 +49,6 @@ int cmmQmQueryProcess(char ** keywords, int tabSize, daemon_handle_t daemon_hand
 int cmmQmExptRateQueryProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
 int cmmQmSetProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
 int cmmQmConfigReload(const char *path, daemon_handle_t daemon_handle);
-void cmmQmResetQ2Prio(fpp_qm_reset_cmd_t *cmdp, int cmdlen);
-void cmmQmUpdateQ2Prio(fpp_qm_scheduler_cfg_t *cmdp, int cmdlen);
 #ifdef LS1043
 int cmmQmFFRateQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 int cmmQmDSCPFqMapQueryProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);

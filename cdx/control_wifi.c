@@ -54,8 +54,6 @@ static int wifi_vap_entry( U16 *ptr, U16 len )
 
 			wifiDesc[cmd.VAPID].VAPID = 0xFFFF;
 
-			//bridge_interface_deregister(portid);
-
 			remove_onif_by_index(port->itf.index);
 
 			if ( rxc->users  )
@@ -84,7 +82,6 @@ static int wifi_vap_entry( U16 *ptr, U16 len )
 
 
 			wifiDesc[cmd.VAPID].VAPID = cmd.VAPID;
-			//bridge_interface_register(cmd.ifname, portid);
 
 			memcpy(port->mac_addr, cmd.mac_addr, 6);
 			if ( rxc->users < MAX_WIFI_VAPS )
@@ -120,7 +117,6 @@ static U16 wifi_vap_query_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 
 	(void)cmd_len;
 	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
-	printk("%s:%d\n", __func__, __LINE__);
 
 	for (i = 0; i < MAX_WIFI_VAPS; i++) {
 		vaps[i].vap_id = wifiDesc[i].VAPID;

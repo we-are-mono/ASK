@@ -50,7 +50,6 @@
 
 #ifdef DPA_IPSEC_OFFLOAD 
 //#define DPA_IPSEC_DEBUG  	1
-//#define DPA_IPSEC_TEST_ENABLE	1
 
 #define DPAIPSEC_ERROR(fmt, ...)\
 {\
@@ -65,7 +64,6 @@
 #define DPAIPSEC_INFO(fmt, ...)
 #endif
 
-#define MAX_IPSEC_SA_INFO	16
 #define IPSEC_WQ_ID		2
 
 /*
@@ -92,7 +90,6 @@ struct cgr_priv {
 	struct qman_cgr ingress_cgr;
 };
 /* The following macro is used as default value before introducing module param */
-#define CDX_DPAA_INGRESS_CS_TD	4000/*DPA_FQ_TD_BYTES*/ /*316000000*/
 
 #define SEC_CONGESTION_DISABLE	0
 
@@ -117,7 +114,6 @@ struct ipsec_info {
 	void *ofport_td[MAX_MATCH_TABLES];
 	uint32_t expt_fq_count ;
 	struct dpa_bp *ipsec_bp;
-	struct dpa_fq *pcd_fq;
 	struct dpa_fq		*ipsec_exception_fq;
 	struct port_bman_pool_info parent_pool_info;
 #ifdef CS_TAIL_DROP
@@ -164,12 +160,10 @@ struct qman_fq *get_to_sec_fq(void *handle)
 	return (struct qman_fq *)&(((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_TO_SEC]);
 } 
 
-#ifdef UNIQUE_IPSEC_CP_FQID
 uint32_t ipsec_get_to_cp_fqid(void *handle)
 {
 	return (((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_TO_CP].fqid);
 }
-#endif
 
 /*
  * QMan Enqueue-Reject Notification on FQ_TO_SEC.
@@ -246,10 +240,8 @@ void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state)
 	return;
 }
 
-#ifdef UNIQUE_IPSEC_CP_FQID
 extern 	struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,
 		uint16_t *sagd_pkt);
-#endif /* UNIQUE_IPSEC_CP_FQID */
 static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *qm,
 		struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
@@ -281,7 +273,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	struct sec_path *sp;
 	struct xfrm_state *x;
 	struct timespec64 ktime;
-#ifdef DPA_IPSEC_DEBUG1
+#ifdef DPA_IPSEC_DEBUG
 	unsigned short sagd; 
 #endif
 	bool use_gro;
@@ -291,7 +283,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	gro_result_t gro_result;
 	const struct qman_portal_config *pc;
 	struct dpa_napi_portal *np;
-#ifdef DPA_IPSEC_DEBUG1
+#ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, \n offset %d sts %08x, cnt %d\n", __func__,
 			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
 			dq->fd.offset,dq->fd.status, ipsec_exception_pkt_cnt);
@@ -300,12 +292,12 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr));
 	printk("Dispalying parse result:\n");
 	display_buff_data(ptr, 0x70);
-#endif /* DPA_IPSEC_DEBUG1 */
+#endif /* DPA_IPSEC_DEBUG */
 
 	/* len = (dq->fd.length20 - 4); */
 	len = dq->fd.length20;
 	ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr) + dq->fd.offset);
-#ifdef DPA_IPSEC_DEBUG1
+#ifdef DPA_IPSEC_DEBUG
 	/* for debugging printing packet*/
 	if (len >= 64)
 	{
@@ -315,7 +307,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	{
 		display_buff_data(ptr, len);
 	} 
-#endif /*DPA_IPSEC_DEBUG1 */
+#endif /*DPA_IPSEC_DEBUG */
 	/* 
 	 * extract sagd from the end of packet. That sagd is used for two purpose.
 	 * 1) After the Sec processes since a new buffer is used for decrypted input 
@@ -336,12 +328,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	 *     drop the packet.   
 	 */
 	dpa_bp = dpa_bpid2pool(dq->fd.bpid);
-#ifdef UNIQUE_IPSEC_CP_FQID
 	net_dev = get_netdev_of_SA_by_fqid(dq->fqid, &sagd_pkt);
-#else
-	memcpy(&sagd_pkt,(ptr+(len-2)),2);
-	net_dev = (struct net_device *) M_ipsec_get_sa_netdev(sagd_pkt );
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
 	if(!net_dev ){
 #ifdef DPA_IPSEC_DEBUG
@@ -399,7 +386,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		ptr[13] = 0x00;
 	}
 	protocol =  *((unsigned short*) (ptr + 12));
-#ifdef DPA_IPSEC_DEBUG1
+#ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, offset %d netdev %p dev %s temp_dev =%s addr %llx sts %08x\n", __func__,
 			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
 			dq->fd.offset, net_dev, net_dev->name,net_dev->name, (uint64_t)dq->fd.addr, dq->fd.status);
@@ -459,7 +446,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	}
 	sp->len = 1;
 
-#ifdef DPA_IPSEC_DEBUG1
+#ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::len %d ipsec_exception_pkt_cnt %d\n", 
 			__func__, skb->len, ipsec_exception_pkt_cnt);
 #endif
@@ -709,18 +696,15 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 	int errno;
 	uint32_t flags = 0;
 	uint64_t addr;
-#ifdef UNIQUE_IPSEC_CP_FQID
 	uint32_t portal_channel[NR_CPUS];
 	uint32_t num_portals;
 	uint32_t next_portal_ch_idx;
 	const cpumask_t *affine_cpus;
 	uint32_t fqids_base;
-#endif /* UNIQUE_IPSEC_CP_FQID */
 	int to_sec_fq = 0;
 	uint8_t sa_id_name[8]="";
 
 	//get cpu portal channel info
-#ifdef UNIQUE_IPSEC_CP_FQID
 	num_portals = 0;
 	next_portal_ch_idx = 0;
 	affine_cpus = qman_affine_cpus();
@@ -737,14 +721,13 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 		return -1;
 	}
 
-#ifdef DPA_IPSEC_DEBUG1
+#ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::num_portals %d ::", __func__, num_portals);
 	for (ii = 0; ii < num_portals; ii++)
 		DPAIPSEC_INFO("%d ", portal_channel[ii]);
 	DPAIPSEC_INFO("\n");
 #endif
 
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
 
 	ipsecsa_info->shdesc_mem = 
@@ -759,7 +742,6 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 	ipsecsa_info->shared_desc = (struct sec_descriptor *)
 		PTR_ALIGN(ipsecsa_info->shdesc_mem, PRE_HDR_ALIGN);
 
-#ifdef UNIQUE_IPSEC_CP_FQID
 	errno = qman_alloc_fqid_range(&fqids_base, NUM_FQS_PER_SA, 0, 0);
 	if (errno < NUM_FQS_PER_SA)
 	{
@@ -767,7 +749,6 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 				__func__);
 		goto err_ret1;
 	}
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
 	sprintf(sa_id_name, "0x%x", handle);
 	if (cdx_create_dir_in_procfs(&ipsecsa_info->sa_proc_entry, sa_id_name, SA_DIR)) {
@@ -789,35 +770,23 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 #ifdef DPA_IPSEC_DEBUG
 					printk("%s::handle %x\n", __func__, handle);
 #endif
-#ifdef UNIQUE_IPSEC_CP_FQID
 					flags = QMAN_FQ_FLAG_TO_DCPORTAL;
-#else
-					flags = (QMAN_FQ_FLAG_TO_DCPORTAL | QMAN_FQ_FLAG_DYNAMIC_FQID);
-#endif /* UNIQUE_IPSEC_CP_FQID */
 					dpa_fq->channel = ipsecinfo.ofport_channel;
 					/* setting A1 value to 2 and setting a  bit to copy A1 value in  context A field  */
 					/* setting override frame queue option */
 					opts.fqd.context_a.hi = 
 						(((
-#ifdef UNIQUE_IPSEC_CP_FQID
 							 CDX_FQD_CTX_A_OVERRIDE_FQ |
 							 /*CDX_FQD_CTX_A_B0_FIELD_VALID | */
-#endif /* UNIQUE_IPSEC_CP_FQID */
 							 CDX_FQD_CTX_A_A1_FIELD_VALID) <<
 							CDX_FQD_CTX_A_SHIFT_BITS) |
 						 CDX_FQD_CTX_A_A1_VAL_TO_CHECK_SECERR );
-#ifdef UNIQUE_IPSEC_CP_FQID
 					opts.fqd.context_b = fqids_base + FQ_TO_CP;
-#endif /* UNIQUE_IPSEC_CP_FQID */
 					break;
 				}
 			case FQ_TO_SEC:
 				{
-#ifdef UNIQUE_IPSEC_CP_FQID
 					flags = QMAN_FQ_FLAG_TO_DCPORTAL;
-#else
-					flags = (QMAN_FQ_FLAG_TO_DCPORTAL | QMAN_FQ_FLAG_DYNAMIC_FQID);
-#endif /* UNIQUE_IPSEC_CP_FQID */
 					addr = virt_to_phys(ipsecsa_info->shared_desc);
 					dpa_fq->channel = ipsecinfo.crypto_channel_id;
 					dpa_fq->fq_base.cb.ern = dpa_ipsec_ern_cb;
@@ -827,7 +796,6 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 					to_sec_fq = 1;
 					break;
 				}
-#ifdef UNIQUE_IPSEC_CP_FQID
 			case FQ_TO_CP:
 				{
 					flags = 0;
@@ -842,15 +810,10 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 					dpa_fq->channel = portal_channel[next_portal_ch_idx];
 					break;
 				}
-#endif /* UNIQUE_IPSEC_CP_FQID */
 
 		}
 		dpa_fq->wq = IPSEC_WQ_ID;
-#ifdef UNIQUE_IPSEC_CP_FQID
 		if (qman_create_fq(fqids_base+ii, flags, fq)) 
-#else
-		if (qman_create_fq(dpa_fq->fqid, flags, fq)) 
-#endif /* UNIQUE_IPSEC_CP_FQID */
 		{
 			DPAIPSEC_ERROR("%s::qman_create_fq failed for fqid %d\n",
 					__func__, dpa_fq->fqid);
@@ -861,9 +824,6 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 		opts.count = 1;
 		opts.fqd.dest.channel = dpa_fq->channel;
 		opts.fqd.dest.wq = dpa_fq->wq;
-#ifndef UNIQUE_IPSEC_CP_FQID
-		opts.fqd.fq_ctrl = QM_FQCTRL_CPCSTASH;
-#else
 		if (ii != FQ_TO_CP)
 		{
 			opts.fqd.fq_ctrl = QM_FQCTRL_CPCSTASH;
@@ -876,7 +836,6 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 			opts.fqd.context_a.stashing.data_cl = NUM_PKT_DATA_LINES_IN_CACHE;
 			opts.fqd.context_a.stashing.annotation_cl = NUM_ANN_LINES_IN_CACHE;
 		}
-#endif /* UNIQUE_IPSEC_CP_FQID */
 		if (to_sec_fq == 1)
 		{
 #ifdef FQ_TAIL_DROP
@@ -910,7 +869,6 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 					__func__, dpa_fq->fqid,errno);
 			qman_destroy_fq(fq, 0);
 			goto err_ret4;
-			return FAILURE;
 		}
 
 		ipsec_addfq_to_exceptionfq_list(dpa_fq, &ipsecinfo);
@@ -923,12 +881,10 @@ static int create_ipsec_fqs(struct dpa_ipsec_sainfo *ipsecsa_info, uint32_t sche
 		{
 			cdx_create_type_fqid_info_in_procfs(fq, SA_DIR, ipsecsa_info->sa_proc_entry, "to_sec");
 		}
-#ifdef UNIQUE_IPSEC_CP_FQID
 		else if (ii == FQ_TO_CP)
 		{
 			cdx_create_type_fqid_info_in_procfs(fq, SA_DIR, ipsecsa_info->sa_proc_entry, "to_cp");
 		}
-#endif
 
 #ifdef DPA_IPSEC_DEBUG
 		DPAIPSEC_INFO("%s::created fq %x(%d) for ipsec - type %d "
@@ -963,10 +919,8 @@ err_ret3:
 		ipsecsa_info->sa_proc_entry = NULL;
 	}
 err_ret2:
-#ifdef UNIQUE_IPSEC_CP_FQID
 	/*TODO : qman_release_fqid_range */
 err_ret1:
-#endif
 	kfree(ipsecsa_info->shdesc_mem);
 err_ret0:
 	return FAILURE;
@@ -1327,9 +1281,7 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	 * create_ipsec_fqs frees it on partial-init failure; this is the
 	 * matching free on the normal release path. */
 	kfree(sainfo->shdesc_mem);
-#ifdef  UNIQUE_IPSEC_CP_FQID
 	qman_release_fqid_range(sainfo->sec_fq[FQ_FROM_SEC].fqid, NUM_FQS_PER_SA);
-#endif /* UNIQUE_IPSEC_CP_FQID */
 	kfree(sainfo);
 	return SUCCESS;
 }
@@ -1345,67 +1297,6 @@ int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num)
 	/* if fq is not in retired state, restart timer */
 	return (fq->state != qman_fq_state_retired);
 }
-#ifdef DPA_IPSEC_TEST_ENABLE
-void dpa_ipsec_test(struct ipsec_info *info)
-{
-	void *handle;	
-	struct sec_descriptor *sh_desc;
-	uint32_t tosec_fqid;
-	uint32_t fromsec_fqid;
-	uint32_t portid;
-	void *td;
-
-	if (cdx_dpa_ipsec_wanport_td(info, ESP_IPV4_TABLE, &td)) {
-		return;
-	}	
-	DPAIPSEC_INFO("%s::WAN ESP_IPV4_TABLE %p\n", __func__, td);
-
-	if (cdx_dpa_ipsec_wanport_td(info, ESP_IPV6_TABLE, &td)) {
-		return;
-	}	
-	DPAIPSEC_INFO("%s::WAN ESP_IPV6_TABLE %p\n", __func__, td);
-
-	if (dpa_ipsec_ofport_td(info, IPV4_UDP_TABLE, &td, &portid)) {
-		return;
-	}	
-	DPAIPSEC_INFO("%s::OF IPV4_TCPUDP_TABLE %p\n", __func__, td);
-
-	if (dpa_ipsec_ofport_td(info, IPV6_UDP_TABLE, &td, &portid )) {
-		return;
-	}	
-	DPAIPSEC_INFO("%s::OF IPV6_TCPUDP_TABLE %p\n", __func__, td);
-
-	if (dpa_ipsec_ofport_td(info, ESP_IPV4_TABLE, &td, &portid)) {
-		return;
-	}	
-	DPAIPSEC_INFO("%s::OF ESP_IPV4_TABLE %p, portif = %d\n", __func__, td, portid);
-
-	if (dpa_ipsec_ofport_td(info, ESP_IPV6_TABLE, &td, &portid)) {
-		return;
-	}	
-	DPAIPSEC_INFO("%s::OF ESP_IPV6_TABLE %p\n", __func__, td);
-
-	handle = cdx_dpa_ipsecsa_alloc(info, 0xaa55);
-	if (handle) {
-		sh_desc = get_shared_desc(handle);
-		tosec_fqid = get_fqid_to_sec(handle);	
-		fromsec_fqid = get_fqid_from_sec(handle);	
-		DPAIPSEC_INFO("%s::sh desc %p, tosec fqid %x(%d) from sec fqid %x(%d)\n",
-				__func__, sh_desc, tosec_fqid, tosec_fqid,
-				fromsec_fqid, fromsec_fqid); 
-		if (cdx_dpa_ipsecsa_release(handle)) {
-			DPAIPSEC_ERROR("%s::Failed to release sa %p\n", 
-					__func__, handle);
-			return;
-		}		
-	} else {
-		DPAIPSEC_ERROR("%s::Failed to alloc sa\n", __func__);
-		return;
-	}
-}
-#else
-#define dpa_ipsec_test(x)
-#endif
 
 #ifdef CS_TAIL_DROP
 static void cgr_cb(struct qman_portal *qm, struct qman_cgr *cgr, int congested)
@@ -1507,7 +1398,6 @@ int cdx_dpa_ipsec_init(void)
 	if (create_ipsec_pcd_fqs(&ipsecinfo, 1)) {
 		goto ipsec_pcd_fq_failure;
 	}
-	dpa_ipsec_test(&ipsecinfo);
 	register_cdx_deinit_func(cdx_dpa_ipsec_exit);
 	return SUCCESS;
 

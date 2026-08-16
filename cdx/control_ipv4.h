@@ -15,16 +15,10 @@
 #include"cdx_common.h"
 #include"layer2.h"
 
-#define MAX_L2_HEADER	18
 
 #define SA_MAX_OP		2	// maximum of stackable SA (ESP+AH)
 
-#define GET_L2HDR(mtd)  (mtd->data + mtd->offset)
 
-/* IP flags. */
-#define IP_DF		0x4000		/* Flag: "Don't Fragment"	*/
-#define IP_MF		0x2000		/* Flag: "More Fragments"	*/
-#define IP_OFFSET	0x1FFF		/* "Fragment Offset" part	*/
 
 union ctentry_qosmark {
 	U32 markval;
@@ -107,7 +101,6 @@ typedef struct _ctPair
 
 /* Conntrack status */
 #define CONNTRACK_4O6			0x4000
-#define	CONNTRACK_RTP_STATS		0x2000
 #define CONNTRACK_SEC			0x1000
 #define CONNTRACK_SEC_noSA     		0x800
 #define CONNTRACK_TCP_FIN		0x400
@@ -125,7 +118,6 @@ typedef struct _ctPair
 
 #define	FFTYPE_IPV4	0x01
 #define FFTYPE_IPV6	0x02
-#define FFTYPE_TUNNEL	0x04
 
 
 static inline U8 GET_PROTOCOL(PCtEntry pCtEntry)
@@ -139,8 +131,6 @@ static inline void SET_PROTOCOL(PCtEntry pCtEntry_orig,PCtEntry pCtEntry_rep, U8
 	pCtEntry_rep->proto  = Proto;
 }
 
-#define IS_HASH_ARRAY(ctrl, ct_addr)	(((unsigned long)(ct_addr) >= (unsigned long)(ctrl->hash_array_baseaddr)) \
-	&& ((unsigned long)(ct_addr) < ((unsigned long)(ctrl->hash_array_baseaddr) + (NUM_CT_ENTRIES * CLASS_ROUTE_SIZE))))
 
 #define CT_TWIN(pentry)		(((PCtEntry)(pentry))->twin)
 #define CT_ORIG(pentry)		((((PCtEntry)(pentry))->status & CONNTRACK_ORIG) ? (PCtEntry)(pentry) : ((PCtEntry)(pentry))->twin)
@@ -166,7 +156,6 @@ void ipv4_exit(void);
 
 int IPv4_delete_CTpair(PCtEntry ctEntry);
 void IP_deleteCt_from_onif_index(U32 if_index);
-void IP_MarkSwap(PCtEntry pCtEntry, PCtEntry pCtTwin);
 PRouteEntry IP_Check_Route(PCtEntry pCtEntry);
 void IP_delete_CT_route(PCtEntry pCtEntry);
 U64 IP_get_qosconnmark(PCtEntry pOrigEntry, PCtEntry pReplEntry);
@@ -181,11 +170,7 @@ void display_ctentry(PCtEntry entry);
 void display_route_entry(PRouteEntry entry);
 int add_incoming_iface_info(PCtEntry entry);
 
-#define CT_VALID	(1 << 0)
-#define CT_USED		(1 << 1)
-#define CT_UPDATING	(1 << 2)
 
-extern U32 class_route_table_base;
 extern U32 class_route_table_hash_mask;
 
 #define CRCPOLY_BE 0x04c11db7

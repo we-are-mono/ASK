@@ -688,7 +688,7 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 	int ifindex;
 	struct interface *itf;
 	int rc = 0;
-	int update_connections = 0, update_tnl_flows = 0;
+	int update_tnl_flows = 0;
 
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&ctMutex);
@@ -773,11 +773,7 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 	if(update_tnl_flows)
 		__tunnel_remove_flow(fci_key_handle, itf);
 
-        if(update_connections)
-               __itf_update_connection(fci_handle, itf->ifindex);
-
 err1:
-	__itf_put(itf);
 
 err0:
 #ifdef IPSEC_FLOW_CACHE

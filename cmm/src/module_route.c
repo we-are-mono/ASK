@@ -30,12 +30,6 @@ pthread_mutex_t RouteMutex = PTHREAD_MUTEX_INITIALIZER;
  *
  *
  ************************************************************/
-void cmmRouteShowPrintHelp()
-{
-	cmmRouteSetPrintHelp();
-}
-
-
 /************************************************************
  *
  *
@@ -45,18 +39,6 @@ int cmmRouteShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_h
 {	
 	return 0;
 }
-/************************************************************
- *
- *
- *
- *************************************************************/
-int cmmRouteQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
-{
-	cmmRouteSetPrintHelp();
-		return -1;
-}
-
-
 /************************************************************
  *
  *

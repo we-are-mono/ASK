@@ -70,11 +70,7 @@ int FCODE_TO_EVENT(U32 fcode)
 
 		case FC_IPSEC: eventid = EVENT_IPS_IN; break;
 
-		case FC_TRC: eventid = EVENT_IPS_OUT; break;
-
 		case FC_TNL:eventid = EVENT_TNL_IN; break;
-
-		case FC_MACVLAN: eventid = EVENT_MACVLAN; break;
 
 		case FC_STAT: eventid = EVENT_STAT; break;
 
@@ -82,11 +78,7 @@ int FCODE_TO_EVENT(U32 fcode)
 
 		case FC_WIFI_RX: eventid = EVENT_PKT_WIFIRX; break;
 
-		case FC_PKTCAP: eventid = EVENT_PKTCAP; break;
-
 		case FC_FPPDIAG: eventid = EVENT_IPV4; break;
-
-		case FC_ICC: eventid = EVENT_ICC; break;
 
 		default: eventid = -1; break;
 	}
@@ -100,10 +92,6 @@ void cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf)
 	int eventid;
 
 	eventid = FCODE_TO_EVENT(fcode);
-#ifdef CDX_DEBUG_ENABLE
-	DPRINT("fcode=0x%04x, length=%d\n", fcode, length);
-	print_hex_dump(KERN_DEBUG, "cmd: ", DUMP_PREFIX_NONE, 16, 1, payload, length, 1);
-#endif
 /////////////////////////////////////////////////////////////////////////////
 	// TEMP code to satisfy CMM
 	if (fcode == CMD_VOICE_BUFFER_RESET)
@@ -244,41 +232,6 @@ EXPORT_SYMBOL(comcerto_fpp_send_command);
 
 
 
-/* Drains ctrl->msg_list into comcerto_fpp_send_command. Its only
- * producer (the exported _atomic wrapper) was removed as dead code;
- * the work is INIT_WORK'd but never scheduled today. */
-void comcerto_fpp_workqueue(struct work_struct *work)
-{
-	struct _cdx_ctrl *ctrl = container_of(work, struct _cdx_ctrl, work);
-	struct fpp_msg *msg;
-	unsigned long flags;
-	u16 rbuf[128];
-	u16 rlen;
-	int rc;
-
-	spin_lock_irqsave(&ctrl->lock, flags);
-
-	while (!list_empty(&ctrl->msg_list)) {
-
-		msg = list_entry(ctrl->msg_list.next, struct fpp_msg, list);
-
-		list_del(&msg->list);
-
-		spin_unlock_irqrestore(&ctrl->lock, flags);
-
-		rc = comcerto_fpp_send_command(msg->fcode, msg->length, msg->payload, &rlen, rbuf);
-
-		/* send command response to caller's callback */
-		if (msg->callback != NULL)
-			msg->callback(msg->data, rc, rlen, rbuf);
-
-		kfree(msg);
-
-		spin_lock_irqsave(&ctrl->lock, flags);
-	}
-
-	spin_unlock_irqrestore(&ctrl->lock, flags);
-}
 
 
 

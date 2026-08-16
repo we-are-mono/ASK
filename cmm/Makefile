@@ -60,7 +60,6 @@ SRCS := \
 	voicebuf.c \
 	module_pktcap.c \
 	module_icc.c \
-	third_part.c \
 	cmm_asym_ff.c \
 	module_ipsec.c \
 	module_ipr.c \

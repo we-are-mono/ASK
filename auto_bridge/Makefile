@@ -14,29 +14,12 @@ TOP_DIR := $(shell pwd)
 # Support both KERNEL_SOURCE (original) and KERNEL_SRC (Yocto)
 KERNEL_SOURCE ?= $(KERNEL_SRC)
 
-obj-m:=auto_bridge.o
-
-PLATFORM?=LS1024A
-ifeq ($(PLATFORM),LS1024A)
-TARG_ARCH=arm
-else
-TARG_ARCH=arm64
-endif
-
-#PLATFORM LS1043A refers family of LS104x
-ifeq ($(PLATFORM),LS1043A)
-EXTRA_CFLAGS+=-DLS104X
-endif
-
-#Enable VLAN_FILTER macro to support vlan filter feature on bridge.
-#With vlan filtering, one can avoid creation of multiple vlan interfaces.
-ifeq ($(ENABLE_VLAN_FILTER),y)
-EXTRA_CFLAGS+=-DVLAN_FILTER
-EXTRA_CFLAGS+=-I$(KERNEL_SOURCE)/net/bridge/
-endif
-
+# The module object list and build flags (-DLS104X -DVLAN_FILTER, the bridge
+# include path) live in Kbuild, which the kernel sub-make reads instead of this
+# file. This Makefile is only the out-of-tree kernel-descend wrapper; ARCH is
+# passed by the caller (root Makefile / Yocto recipe).
 all:
-	$(MAKE) -C $(KERNEL_SOURCE) ARCH=$(TARG_ARCH) M=`pwd` modules
+	$(MAKE) -C $(KERNEL_SOURCE) ARCH=$(ARCH) M=`pwd` modules
 
 clean:
-	$(MAKE) -C $(KERNEL_SOURCE) ARCH=$(TARG_ARCH) M=`pwd` clean
+	$(MAKE) -C $(KERNEL_SOURCE) ARCH=$(ARCH) M=`pwd` clean

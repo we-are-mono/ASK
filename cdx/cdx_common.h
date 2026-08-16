@@ -208,10 +208,6 @@ union dpa_key {
 	char key_array[0];
 }DPA_PACKED;
 #define MAX_KEY_SIZE    sizeof(union dpa_key)
-struct iface_stats_info {
-	uint32_t num_stats_entries;
-	uint8_t stats_offsets[1];	//min
-}; 
 
 /* Maximum number of VLAN tags supported by the insert header manipulation */
 #define DPA_CLS_HM_MAX_VLANs					6
@@ -339,12 +335,10 @@ struct ins_entry_info {
 /* hardware connection tracker info */
 struct hw_ct {
 	void *fm_ctx;
-	void *hm_info;	/* used by old hash tables */
 	void *td;
 	void *handle;
 	uint8_t natt_out_refcnt; /* Same NATT conntrack is used by multiple outbound SAs */
 	uint8_t natt_in_refcnt; /* Same NATT conntrack is used by multiple inbound SAs */
-	uint16_t natt_in_spi_arr_mask; /* SPI array mask for inbound SAs is stored here */
 	uint16_t index;
 	uint32_t timestamp;
 	uint64_t pkts;
@@ -367,7 +361,6 @@ struct hw_ct {
 //which time stamp counter to use
 #define EXTERNAL_TIMESTAMP_TIMERID 0
 
-#define PORT_TYPE_10G 10
 
 void display_buf(void *buf, uint32_t size);
 void *dpa_get_pcdhandle(uint32_t fm_index);

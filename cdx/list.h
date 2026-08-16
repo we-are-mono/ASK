@@ -60,10 +60,6 @@ static inline struct slist_entry *slist_next(struct slist_entry *entry)
 * @param next	next pointer value to set
 *
 */
-static inline void slist_set_next(struct slist_entry *entry, struct slist_entry *next)
-{
-	entry->next = next;
-}
 
 
 /** Returns the first element of a simple linked list.
@@ -276,10 +272,6 @@ static inline struct dlist_head *dlist_last(struct dlist_head *list)
 * @param list		pointer to the list head
 * @param member		name of the list entry member in the container data structure
 */
-#define dlist_for_each(container, entry, list, member)	\
-	for ((entry) = dlist_first(list); \
-		((entry) != (list)) && ({(container) = container_of(entry, typeof(*container), member); 1;}); \
-		(entry) = dlist_next(entry))
 
 
 /** Loops over all container data structures in a list.

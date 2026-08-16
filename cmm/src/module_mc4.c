@@ -129,7 +129,6 @@ int cmmMc4QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
         	int i, listener_count = 0;
 		if((ntohl(mc4_entry->dst_addr) & 0xE0000000) == 0xE0000000)
 		{
-#if defined(LS1043)
                 	cmm_print(DEBUG_STDOUT, "%04d: Ingress Interface: %s Src addr: %s src_mask_len: %x   Dst addr: %s	Queue: 0x%x  \n\n", count, 
                           mc4_entry->input_device_str,
 			  inet_ntop(AF_INET, &mc4_entry->src_addr, buf1, INET_ADDRSTRLEN),
@@ -137,15 +136,6 @@ int cmmMc4QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 			  inet_ntop(AF_INET, &mc4_entry->dst_addr, buf2, INET_ADDRSTRLEN),
 			  mc4_entry->queue);
 			count++;
-#else
-                	cmm_print(DEBUG_STDOUT, "%04d: Src addr: %s  src_mask_len: %x   Dst addr: %s	Queue: 0x%x  \n\n",
-			  count,
-			  inet_ntop(AF_INET, &mc4_entry->src_addr, buf1, INET_ADDRSTRLEN),
-			  mc4_entry->src_mask_len,
-			  inet_ntop(AF_INET, &mc4_entry->dst_addr, buf2, INET_ADDRSTRLEN),
-			  mc4_entry->queue);
-			count++;
-#endif
 		}
 		listener_count = mc4_entry->num_output;
 		if(listener_count > MC4_MAX_LISTENERS_IN_QUERY)
@@ -184,8 +174,6 @@ void cmmMc4SetPrintHelp()
 #if defined(COMCERTO_2000) || defined(LS1043)
       #if defined(LS1043)
 	cmm_print(DEBUG_STDOUT, "Usage: set mc4 ingress_interface {if_name} interface {if_name} {add | del | update}\n"
-      #else
-	cmm_print(DEBUG_STDOUT, "Usage: set mc4 interface {if_name} {add | del | update}\n"
       #endif
 									"                 group {bit_mask} {ipv4_src_addr} {ipv4_multicast_dst_addr}\n"
 									"                 [timer {timer_value}]\n"
@@ -194,16 +182,6 @@ void cmmMc4SetPrintHelp()
 									"                 [listener [timer {timer_value1}] [shapers {0..0xFF}][mc | uc {Mac addr1} ] [queue {0..19}] [if {if_name}]] \n"
 									"                 [listener [timer {timer_value2}] [shapers {0..0xFF}][mc | uc {Mac addr2} ] [queue {0..19}] [if {if_name}]] ...\n"
 									"                 [listener [timer {timer_valuen}] [shapers {0..0xFF}][mc | uc {Mac addrn} ] [queue {0..19}] [if {if_name}]] \n");
-#else
-	cmm_print(DEBUG_STDOUT, "Usage: set mc4 interface {if_name} {add | del | update}\n"
-									"                 group {bit_mask} {ipv4_src_addr} {ipv4_multicast_dst_addr}\n"
-									"                 [timer {timer_value}]\n"
-									"                 [mode {bridged | routed}]\n"
-									"                 [queue {0..31}]\n"
-									"                 [listener [timer {timer_value1}] [shapers {0..0xFF}][mc | uc {Mac addr1} ] [queue {0..31}] [if {if_name}]] \n"
-									"                 [listener [timer {timer_value2}] [shapers {0..0xFF}][mc | uc {Mac addr2} ] [queue {0..31}] [if {if_name}]] ...\n"
-									"                 [listener [timer {timer_valuen}] [shapers {0..0xFF}][mc | uc {Mac addrn} ] [queue {0..31}] [if {if_name}]] \n");
-
 #endif									
 }
 
@@ -236,7 +214,6 @@ int cmmMc4SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 
 	if(!keywords[cpt])
 		goto help;
-#if defined(LS1043)
 	if(strcasecmp(keywords[cpt], "ingress_interface") == 0)
 	{
 		if(!keywords[++cpt])
@@ -256,7 +233,6 @@ int cmmMc4SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
         {
            goto keyword_error;
         }
-#endif
 	if(strcasecmp(keywords[cpt], "interface") == 0)
 	{
 		if(!keywords[++cpt])
@@ -415,7 +391,6 @@ int cmmMc4SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 	}
 
 
-#if 1
 		cmm_print(DEBUG_INFO, "action:%x\n",entryCmd->action);
 		cmm_print(DEBUG_INFO, "src addr:%x\n",entryCmd->src_addr);
 		cmm_print(DEBUG_INFO, "src addr:%x\n",entryCmd->dst_addr);
@@ -424,10 +399,7 @@ int cmmMc4SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 		cmm_print(DEBUG_INFO, "timer:%x\n",listener->timer);
 		cmm_print(DEBUG_INFO, "outputstring:%s\n",listener->output_device_str);
 		cmm_print(DEBUG_INFO, "queue:%d\n",entryCmd->queue);
-#if defined(LS1043)
 		cmm_print(DEBUG_INFO, "ingress interface:%s\n",entryCmd->input_device_str);
-#endif
-#endif
 
 	return rc;
 

@@ -18,35 +18,21 @@ extern CmdProc gCmdProcTable[];
 
 enum EVENTS {
 	EVENT_FIRST = 0,
-	EVENT_EXPT = EVENT_FIRST,
-	EVENT_QM,
+	EVENT_QM = EVENT_FIRST,
 	EVENT_PKT_TX,
-	EVENT_TIMER,
 	EVENT_PKT_RX,
 	EVENT_PKT_WIFIRX,
 	EVENT_MC6,
 	EVENT_MC4,
 	EVENT_BRIDGE,
 	EVENT_VLAN,
-	EVENT_MACVLAN,
 	EVENT_PPPOE,
 	EVENT_IPV4,
 	EVENT_IPV6,
 	EVENT_IPS_IN,
-	EVENT_IPS_OUT,
-	EVENT_IPS_IN_CB,
-	EVENT_IPS_OUT_CB,
 	EVENT_TNL_IN,
-	EVENT_TNL_OUT,
 	EVENT_STAT,
-	EVENT_FRAG6,
-	EVENT_FRAG4,
 	EVENT_RTP_RELAY,
-	EVENT_MSP,
-	EVENT_PKTCAP,
-	EVENT_ICC,
-	EVENT_HIDRV,
-	EVENT_MC, 
 	EVENT_MAX
 };
 
@@ -55,11 +41,6 @@ enum EVENTS {
 #define 	FC_RX				0x0000
 #define	CMD_RX_ENABLE		0x0001	
 #define	CMD_RX_DISABLE	0x0002	
-#define CMD_RX_CNG_ENABLE	0x0003
-#define CMD_RX_CNG_DISABLE	0x0004
-#define CMD_RX_CNG_SHOW		0x0005
-#define CMD_RX_FILL_BUFFERPOOL  0x0006
-#define CMD_RX_FILTER_PROMISCUOUS	0x0007
 #define CMD_RX_L2BRIDGE_ENABLE	0x0008
 #define L2BRIDGE_FIRST_COMMAND	CMD_RX_L2BRIDGE_ENABLE
 #define CMD_RX_L2BRIDGE_ADD	0x0009
@@ -81,25 +62,15 @@ enum EVENTS {
 // 0x0200 -> 0x02FF : QM module
 #define 	FC_QM				0x0002
 #define CMD_QM_QOSENABLE			0x0201
-#define CMD_QM_QOSALG				0x0202
-#define CMD_QM_NHIGH				0x0203
-#define CMD_QM_MAX_TXDEPTH			0x0204
-#define CMD_QM_MAX_QDEPTH			0x0205
-#define CMD_QM_MAX_WEIGHT			0x0206
-#define CMD_QM_RATE_LIMIT			0x0207
 #define CMD_QM_FF_RATE				0x0208
 #define CMD_QM_QUERY_FF_RATE			0x0209
 #define CMD_QM_QUERY_IFACE_DSCP_FQID_MAP	0x020a /* This command to returns the DSCP FQID mapping on specific interface*/
 #define CMD_QM_EXPT_RATE			0x020c
 #define CMD_QM_QUERY				0x020d
 #define CMD_QM_QUERY_EXPT_RATE  		0x020e
-#define CMD_QM_QUERY_STATS			0x20f
 
 #define CMD_QM_RESET				0x0210
 #define CMD_QM_SHAPER_CONFIG			0x0211
-#define CMD_QM_SCHEDULER_CONFIG 		0x0212
-#define CMD_QM_DSCP_QM				0x0213
-#define CMD_QM_QUEUE_QOSENABLE			0x0214
 #define CMD_QM_WBFQ_CONFIG			0x0215
 #define CMD_QM_CQ_CONFIG			0x0216
 #define CMD_QM_CHNL_ASSIGN			0x0217
@@ -107,10 +78,7 @@ enum EVENTS {
 #define CMD_QM_DSCP_Q_MAP_CFG			0x0219 /* This command maps one DSCP value to a FQ using the provided configuration. */
 #define CMD_QM_DSCP_Q_MAP_RESET 		0x021a /* This command resets the one DSCP mapping to none. */
 
-#define CMD_QM_QUERY_PORTINFO			0x0220
 #define CMD_QM_QUERY_QUEUE			0x0221
-#define CMD_QM_QUERY_SHAPER			0x0222
-#define CMD_QM_QUERY_SCHED			0x0223
 
 #define CMD_QM_INGRESS_POLICER_ENABLE		0x0224
 #define CMD_QM_INGRESS_POLICER_CONFIG		0x0225
@@ -136,8 +104,6 @@ enum EVENTS {
 #define CMD_IPV4_SOCK_OPEN		0x0330
 #define CMD_IPV4_SOCK_CLOSE		0x0331
 #define CMD_IPV4_SOCK_UPDATE		0x0332
-#define CMD_IPV4_FRAGTIMEOUT		0x0333
-#define CMD_IPV4_SAM_FRAGTIMEOUT	0x0334
 
 
 // 0x0400 -> 0x04FF : IPv6 module
@@ -149,14 +115,12 @@ enum EVENTS {
 #define CMD_IPV6_SOCK_OPEN		0x0430
 #define CMD_IPV6_SOCK_CLOSE		0x0431
 #define CMD_IPV6_SOCK_UPDATE		0x0432
-#define CMD_IPV6_FRAGTIMEOUT		0x0433
 
 
 // 0x0500 -> 0x05FF : Tx module
 #define FC_TX				0x0005
 #define CMD_TX_ENABLE				0x0501
 #define CMD_TX_DISABLE				0x0502
-#define CMD_LINK_UP				0x0504
 #define CMD_PORT_UPDATE				0x0505
 #define CMD_TX_DSCP_VLANPCP_MAP_STATUS		0x0506
 #define CMD_TX_DSCP_VLANPCP_MAP_CFG		0x0507
@@ -176,7 +140,6 @@ enum EVENTS {
 #define	CMD_MC4_RESET				0x0702
 #define	CMD_MC6_MULTICAST		0x0703
 #define	CMD_MC6_RESET				0x0704
-#define CMD_MC6_MODE				0x0705
 
 // 0x0800 -> 0x08FF : RTP relay module
 #define	FC_RTP						0x0008
@@ -189,15 +152,8 @@ enum EVENTS {
 #define	CMD_RTCP_QUERY			0x0807
 #define	CMD_RTP_CLOSE				0x0808
 
-#define CMD_RTP_STATS_ENABLE		0x0810
-#define CMD_RTP_STATS_DISABLE		0x0811
-#define CMD_RTP_STATS_QUERY			0x0812
 #define CMD_RTP_STATS_DTMF_PT		0x0813
 
-#define CMD_VOICE_BUFFER_LOAD		0x0820
-#define CMD_VOICE_BUFFER_UNLOAD		0x0821
-#define CMD_VOICE_BUFFER_START		0x0822
-#define CMD_VOICE_BUFFER_STOP		0x0823
 #define CMD_VOICE_BUFFER_RESET		0x0824
 
 // 0x0900 -> 0x09FF : VLAN module
@@ -242,17 +198,10 @@ enum EVENTS {
 
 // 0x0d00-> 0x0dFF : Packet capture module
 
-#define FC_PKTCAP			0x000d
-#define CMD_PKTCAP_ENABLE		0x0d01
-#define CMD_PKTCAP_IFSTATUS		0x0d02
-#define CMD_PKTCAP_SLICE		0x0d04
-#define CMD_PKTCAP_FLF			0x0d03
-#define CMD_PKTCAP_QUERY		0x0d05
 
 /* 0x0e00 -> 0x0eff : Stat module */
 #define FC_STAT                          	0x000E
 #define CMD_STAT_ENABLE                 	0x0E01 
-#define CMD_STAT_QUEUE                 		0x0E02  
 #define CMD_STAT_INTERFACE_PKT              	0x0E03
 #define CMD_STAT_CONN           		0x0E04
 #define CMD_STAT_PPPOE_STATUS			0x0E05
@@ -271,29 +220,14 @@ enum EVENTS {
 
 // 0x0f00 ->0x0fff : Trace/Profiling/Debugging
 #define         FC_TRC                          	0x000f
-#define CMD_TRC_ON                              0x0f01
-#define CMD_TRC_OFF                             0x0f02
-#define CMD_TRC_SWITCH                          0x0f03
-#define CMD_TRC_DMEM                            0x0f04
-#define CMD_TRC_SETMASK                         0x0f05
-#define CMD_TRC_SHOW                            0x0f06
-#define CMD_TRC_BSYCPU                          0x0f07
-#define CMD_TRC_STATUS                          0x0f08
 /* Command return codes */
-#define CMD_TRC_UNIMPLEMENTED	0x0f7f
-#define CMD_TRC_PARTIAL         0xf00
-#define CMD_TRC_ERR             0xffe
 
 // 0x1000: Alternate Configuration
 #define FC_ALTCONF				0x0010
-#define CMD_ALTCONF_SET			0x1001
-#define CMD_ALTCONF_RESET		0x1002
 
 //0x2000: WiFi Rx module
 #define FC_WIFI_RX			0x0020 
 #define CMD_WIFI_VAP_ENTRY              0x2001
-#define CMD_CFG_WIFI_OFFLOAD                 0x2002
-#define CMD_WIFI_DISABLE                0x2003
 #define CMD_WIFI_VAP_QUERY              0x2004
 #define CMD_WIFI_VAP_RESET              0x2005
 
@@ -303,17 +237,8 @@ enum EVENTS {
 #define 	CMD_MACVLAN_ENTRY_RESET 	0x1402
 // 0x1200: Fppdiag configuration
 #define FC_FPPDIAG					0x0012
-#define CMD_FPPDIAG_ENABLE		0x1201
-#define CMD_FPPDIAG_DISABLE		0x1202
-#define CMD_FPPDIAG_UPDATE		0x1203
-#define CMD_FPPDIAG_DUMP_CTRS 	0x1204
 
 // 0x1500: ICC
-#define FC_ICC						0x0015
-#define CMD_ICC_RESET			0x1500
-#define CMD_ICC_THRESHOLD		0x1501
-#define CMD_ICC_ADD_DELETE		0x1502
-#define CMD_ICC_QUERY			0x1503
 
 // return codes
 #define CMD_OK	0x0000
@@ -321,7 +246,6 @@ enum EVENTS {
 
 int FCODE_TO_EVENT(U32 fcode);
 void cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf);
-void comcerto_fpp_workqueue(struct work_struct *work);
 int cdx_cmdhandler_init(void);
 void cdx_cmdhandler_exit(void);
 

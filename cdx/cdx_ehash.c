@@ -81,7 +81,6 @@
 
 #define MURAM_VIRT_TO_PHYS_ADDR(addr)	((uint32_t)((uint8_t *)addr - (uint8_t *)FmMurambaseAddr) & 0xffffff)
 
-void display_SockEntries(PSockEntry SockA, PSockEntry SockB);
 void cdx_deinit_fragment_bufpool(void);
 
 static int insert_opcodeonly_hm(struct ins_entry_info *info, uint8_t opcode);
@@ -163,7 +162,6 @@ typedef struct cdx_frag_info_s
 {
 	struct dpa_bp 			*frag_bufpool;
 	cdx_ucode_frag_info_t		*muram_frag_params;
-//	uint32_t			muram_frag_params_addr;
 	struct port_bman_pool_info	parent_pool_info;
 	uint8_t				frag_bp_id;
 } cdx_frag_info_t;
@@ -1211,8 +1209,6 @@ static int fill_bridge_actions(struct ins_entry_info *info, POnifDesc ifdesc)
 #endif
 #ifdef VLAN_FILTER
 	if ((entry->l2flow.vlan_flags & VLAN_FILTERED) || info->l2_info.vlan_present)
-#else
-	if (info->l2_info.vlan_present)
 #endif
 	{
 		info->flags |= VLAN_STRIP_HM_VALID;
@@ -1245,8 +1241,6 @@ static int fill_bridge_actions(struct ins_entry_info *info, POnifDesc ifdesc)
 		}
 	}
 	else if (info->l2_info.num_egress_vlan_hdrs)
-#else
-	if (info->l2_info.num_egress_vlan_hdrs)
 #endif
 	{
 
@@ -1276,8 +1270,6 @@ static int fill_bridge_actions(struct ins_entry_info *info, POnifDesc ifdesc)
 		}
 	}
 	else {
-#else
-		{
 #endif
 		if (insert_remove_vlan_hm(info, ifdesc->itf->index, 0 )) {
 			DPA_ERROR("%s::unable to strip vlan header\n", __func__);
@@ -3199,11 +3191,9 @@ void cdx_deinit_frag_module(void)
 		DPA_ERROR("%s(%d) Error in getting MURAM handle\n", __func__,__LINE__);
 		return;
 	}
-	//FM_MURAM_FreeMem(h_FmMuram, (void *)frag_info_g.muram_frag_params_addr);
 	FM_MURAM_FreeMem(h_FmMuram, (void *)dscp_fq_map_ff_g.muram_addr);
 	dscp_fq_map_ff_g.muram_addr = NULL;
 	frag_info_g.muram_frag_params = NULL;
-	//frag_info_g.muram_frag_params_addr = 0;
 	return;
 }
 
@@ -3276,7 +3266,6 @@ void cdx_deinit_fragment_bufpool()
 	return;
 }
 
-int cdx_check_rx_iface_type_vlan(struct _itf *input_itf);
 static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket,
 						PRTPflow pFlow, struct ins_entry_info *info)
 {
@@ -3318,14 +3307,6 @@ static int cdx_rtpflow_fill_actions(PSockEntry pFromSocket, PSockEntry pToSocket
 
 	if(L2_L3_HDR_OPS(info))
 		rebuild_l2_hdr = 1;
-
-	//TODO IPSEC for RTP relay traffic
-#ifdef TODO_IPSEC
-	if((entry->status & CONNTRACK_SEC) && (!info->to_sec_fqid)){ 
-		info->eth_type  = (IS_IPV4(entry)) ? htons(ETHERTYPE_IPV4) : htons(ETHERTYPE_IPV6);
-		//.		info->l2_info.add_eth_type = 1;
-	}
-#endif // TODO_IPSEC
 
 	info->flags |= NAT_HM_REPLACE_SPORT;
 	info->flags |= NAT_HM_REPLACE_DPORT;
@@ -3600,6 +3581,7 @@ static int cdx_rtpflow_fill_key_info(PSockEntry pSocket, uint8_t *keymem, uint32
 	return key_size;
 }
 
+#ifdef CDX_DPA_DEBUG
 //display socket entries
 void display_SockEntries(PSockEntry SockA, PSockEntry SockB)
 {
@@ -3656,153 +3638,8 @@ void display_SockEntries(PSockEntry SockA, PSockEntry SockB)
 	}
 	printk(">>>>>\n");
 }
-EXPORT_SYMBOL(display_SockEntries);
-
-#ifdef VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES
-int cdx_create_rtp_qos_slowpath_flow(PSockEntry pSocket)
-{
-	struct ins_entry_info *info;
-	struct en_exthash_tbl_entry *tbl_entry;
-	struct en_ehash_enqueue_param *param;
-	struct dpa_iface_info *iface_info;
-	/*struct _itf *underlying_input_itf;*/
-	uint32_t uiTblType;
-	uint32_t uiKeySize;
-	uint16_t usFlags;
-	uint8_t *pPtr;
-	uint8_t	ucInPhyPortNum;
-	int iRetVal;
-
-	tbl_entry = NULL;	
-
-	info = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
-	if (!info)
-	{
-		DPA_ERROR("%s(%d)::unable to create memory.\n",__func__, __LINE__);
-		return FAILURE;
-	}
-	ucInPhyPortNum = pSocket->iifindex;
-
-	if ((iface_info = dpa_get_ifinfo_by_itfid(pSocket->iifindex)) == NULL)
-	{
-		DPA_ERROR("%s::%d unable to find the dpa interface for index(%u).\n",
-				__func__, __LINE__, pSocket->iifindex);
-		goto err_ret;
-	}
-
-	if (dpa_get_fm_port_index(ucInPhyPortNum, /*underlying_input_itf->index*/0, &info->fm_idx,
-				&info->port_idx, &info->port_id))
-	{
-		DPA_ERROR("%s(%d)::unable to get fmindex for itfid %d\n",
-				__func__, __LINE__, ucInPhyPortNum);
-		goto err_ret;
-	}
-	DPA_INFO("%s(%d)\n", __func__, __LINE__);
-#ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s(%d) ucInPhyPortNum 0x%x, underlying_input_itf->index %d, fm_idx 0x%x, port_idx %d port_id %d\n",
-			__func__, __LINE__, ucInPhyPortNum, 0/*underlying_input_itf->index*/,
-			info->fm_idx, info->port_idx, info->port_id);
 #endif /* CDX_DPA_DEBUG */
-	/* get pcd handle based on determined fman */
-	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
-	if (!info->fm_pcd)
-	{
-		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",
-				__func__, info->fm_idx);
-		goto err_ret;
-	}
-	if (get_rtp_classif_table_type(pSocket, &uiTblType))
-	{
-		DPA_ERROR("%s::%d unable to get table type\n", __func__, __LINE__);
-		goto err_ret;
-	}
-	info->tbl_type = uiTblType;
 
-	/* get table descriptor based on type and port based on incoming packet Socket */
-	info->td = dpa_get_tdinfo(info->fm_idx, info->port_id, uiTblType);
-	if (info->td == NULL)
-	{
-		DPA_ERROR("%s::%d unable to get td for itfid %d, type %d\n",
-				__func__, __LINE__, ucInPhyPortNum, uiTblType);
-		goto err_ret;
-	}
-	/*info->l2_info.mtu = 1500;*/
-	if (dpa_get_rtp_qos_slowpath_fq(&iface_info->eth_info, 
-				pSocket->hash, &info->l2_info.fqid) < 0)
-	{
-		DPA_ERROR("%s::%d unable to find the frame queue for rtp qos slowpath traffic.\n",
-				__func__, __LINE__);
-		goto err_ret;
-	}
-
-	tbl_entry = ExternalHashTableAllocEntry(info->td);
-	if (!tbl_entry)
-	{
-		DPA_ERROR("%s::%d unable to alloc hash tbl memory\n", __func__, __LINE__);
-		goto err_ret;
-	}
-	/* fill key information from entry */
-	uiKeySize = cdx_rtpflow_fill_key_info(pSocket, &tbl_entry->hashentry.key[0], info->port_id);
-	if (!uiKeySize)
-	{
-		DPA_ERROR("%s::%d unable to compose key.\n", __func__, __LINE__);
-		goto err_ret;
-	}	
-	usFlags = 0;
-	/* round off keysize to next 4 bytes boundary */
-	pPtr = (uint8_t *)&tbl_entry->hashentry.key[0];			
-	pPtr += ALIGN(uiKeySize, TBLENTRY_OPC_ALIGN);
-	/* set start of opcode list */
-	info->opcptr = pPtr;
-	/* pPtr now after opcode section*/
-	pPtr += MAX_OPCODES;
-
-	/* set offset to first opcode */
-	SET_OPC_OFFSET(usFlags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
-	/* set param offset */
-	SET_PARAM_OFFSET(usFlags, (uint32_t)(pPtr - (uint8_t *)tbl_entry));
-	/* param_ptr now points after timestamp location */
-	tbl_entry->hashentry.flags = cpu_to_be16(usFlags);
-	/* param pointer and opcode pointer now valid */
-	info->paramptr = pPtr;
-	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - GET_PARAM_OFFSET(usFlags));
-
-	if (info->opc_count == MAX_OPCODES)
-		goto err_ret;
-	if (sizeof(struct en_ehash_enqueue_param) > info->param_size)
-		goto err_ret;
-	info->enqueue_params = info->paramptr;
-	param = (struct en_ehash_enqueue_param *)info->paramptr;
-	param->mtu = cpu_to_be16(65535/*info->l2_info.mtu*/);
-	param->bpid = frag_info_g.frag_bp_id;
-	param->muram_frag_param_addr = MURAM_VIRT_TO_PHYS_ADDR(dscp_fq_map_ff_g.muram_addr);
-	param->fqid = cpu_to_be32(info->l2_info.fqid);
-	*(info->opcptr) = ENQUEUE_PKT;
-	info->opcptr++;
-	info->param_size -= sizeof(struct en_ehash_enqueue_param);
-	info->paramptr += sizeof(struct en_ehash_enqueue_param);
-	tbl_entry->enqueue_params = info->enqueue_params;
-#ifdef CDX_DPA_DEBUG
-	display_ehash_tbl_entry(&tbl_entry->hashentry, uiKeySize);
-#endif /* CDX_DPA_DEBUG */
-	/* insert entry into hash table */
-	if ((iRetVal = ExternalHashTableAddKey(info->td, uiKeySize, tbl_entry)) == -1) {
-		DPA_ERROR("%s::%d unable to add entry in hash table\n", __func__, __LINE__);
-		goto err_ret;
-	}	
-	pSocket->SktEhTblHdl.eeh_entry_handle = tbl_entry;
-	pSocket->SktEhTblHdl.eeh_entry_index = (uint16_t)iRetVal;
-	pSocket->SktEhTblHdl.td = info->td;
-	kfree(info);
-	return SUCCESS;
-err_ret:
-	/* release all allocated items */
-	if (tbl_entry)
-		ExternalHashTableEntryFree(tbl_entry);
-	kfree(info);
-	return FAILURE;
-}
-#endif/*endif for VOIP_PRIORITY_SLOW_PATH_FRAME_QUEUES */
 
 int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket, PSockEntry pToSocket)
 {
@@ -3901,24 +3738,6 @@ int cdx_create_rtp_conn_in_classif_table (PRTPflow pFlow, PSockEntry pFromSocket
 				tbl_type);
 		goto err_ret;
 	}
-#ifdef TODO_DPA_IPSEC_OFFLOAD
-	/* if the connection is a secure one  and  SA direction is inbound
-	 * then, we should add the entry into offline ports's classification
-	 * table. cdx_ipsec_fill_sec_info()  will check for the SA direction
-	 * and if it is inbound will replace the table id;
-	 * if the SA is outbound direction then it will fill sec_fqid in the 
-	 * info struture.  
-	 */ 
-	if(entry->status & CONNTRACK_SEC)
-	{
-		if(cdx_ipsec_fill_sec_info(entry,info))
-		{
-			DPA_ERROR("%s::unable to get td for offline port, type %d\n",
-					__func__, info->tbl_type);
-			goto err_ret;
-		}
-	}
-#endif
 
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s:: td info :%p\n", __func__, info->td);

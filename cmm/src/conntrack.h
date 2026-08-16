@@ -101,8 +101,6 @@
 
 	#define CONNTRACK_HASH_TABLE_SIZE 16384			/* must be power of 2 */
 
-	#define CT_KERNEL_TIMEOUT_PERMANENT          1000
-
 	#define CONNTRACK_MAX		65536		/* hard limit on the number of conntracks allowed in cmm,
 							   used to avoid consuming too much memory. Should be higher
 							   than or equal to the maximum kernel conntracks configured through
@@ -154,7 +152,6 @@
 	void cmmQosmarkSet(struct nf_conntrack *ct, u_int64_t qosmark);
 
 	struct ctTable *__cmmCtFind(struct nf_conntrack *ctTemp);
-	void __cmmNeighDeregister(FCI_CLIENT *fci_handle, struct NeighborEntry *neigh, const char *dir);
 	void __cmmRouteDeregister(FCI_CLIENT *fci_handle, struct ct_route *rt, const char *dir);
 	void ____cmmRouteDeregister(struct RtEntry *route, const char *dir);
 	void __cmmFPPRouteDeregister(FCI_CLIENT *fci_handle, struct fpp_rt *fpp_route, const char *dir);
@@ -184,43 +181,15 @@ static __inline u_int32_t HASH_CT(int family, const u_int32_t *Saddr, const u_in
 	return jhash_2words(a, b, 0x48375934) % CONNTRACK_HASH_TABLE_SIZE;
 }
 
-#ifdef C2000_DPI
-
-#define DPI_UNKNOWN_CMD     0
-#define DPI_ENABLE_CMD      1
-
-int cmmDPIFlagSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmmDPIEnableShow(struct cli_def * cli, const char *command, char *argv[], int argc);
-int cmmDPIFlagProcessClientCmd(u_int8_t *cmd_buf, u_int16_t *res_buf, u_int16_t *res_len);
-
-#endif /*C2000_DPI*/
-
-#ifdef LS1012A
-#define  CONFIG_IPSEC_PASSTHRU 1
-#endif
-
 #if defined (LS1043)
 #define  CONFIG_IPSEC_ESP_PASSTHRU 1
 #endif
 
 
-#ifdef CONFIG_IPSEC_PASSTHRU
-/**
- *  FIXME : Below macro is origianlly written for local protocol support. And we are using same Macro
- *  for GRE/ESP/AH pass through also. Check if we need to define another Macro for FF protocols
- */
-
-#define SUPPORTED_LOCAL_PROTO(l4proto)  ((l4proto == IPPROTO_IPIP) ||\
-					   (l4proto == IPPROTO_IPV6) ||\
-					    (l4proto == IPPROTO_GRE) || (l4proto == IPPROTO_ESP) || (l4proto == IPPROTO_AH))
-#elif CONFIG_IPSEC_ESP_PASSTHRU
+#ifdef CONFIG_IPSEC_ESP_PASSTHRU
 #define SUPPORTED_LOCAL_PROTO(l4proto)  ((l4proto == IPPROTO_IPIP) ||\
 											  (l4proto == IPPROTO_IPV6) ||\
 											   (l4proto == IPPROTO_GRE) || (l4proto == IPPROTO_ESP))
-#else
-#define SUPPORTED_LOCAL_PROTO(l4proto)  ((l4proto == IPPROTO_IPIP) ||\
-					   (l4proto == IPPROTO_IPV6) ||\
-					    (l4proto == IPPROTO_GRE))
 #endif
 
 #define SET_FLOW_PARAMS(FLOW, SADDR, DADDR, PROTO, FAMILY, IIFINDEX, FLAGS) { \

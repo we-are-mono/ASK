@@ -109,8 +109,6 @@ static const char auto_bridge_version[] = "0.01";
 
 #define SECS * HZ
 #define MINS * 60 SECS
-#define HOURS * 60 MINS
-#define DAYS * 24 HOURS
 
 struct list_head			l2flow_table[L2FLOW_HASH_TABLE_SIZE];
 struct list_head			l2flow_table_by_src_mac[L2FLOW_HASH_BY_MAC_TABLE_SIZE];
@@ -121,8 +119,8 @@ struct list_head			l2flow_list_msg_to_send;
 
 struct list_head			bridge_list_rtevent;
 
-static struct kmem_cache		*l2flow_cache /*__read_mostly*/;
-static struct kmem_cache		*brroute_cache /*__read_mostly*/;
+static struct kmem_cache		*l2flow_cache;
+static struct kmem_cache		*brroute_cache;
 static struct sock			*abm_nl = NULL;
 
 /* Per-boot key used by abm_l2flow_hash{,_mac} (declared extern in
@@ -148,7 +146,7 @@ static DECLARE_WORK(abm_work_send_msg, abm_do_work_send_msg);
 static DECLARE_DELAYED_WORK(abm_work_retransmit, abm_do_work_retransmit);
 
 
-static unsigned int l2flow_timeouts[L2FLOW_STATE_MAX] /*__read_mostly*/ = {
+static unsigned int l2flow_timeouts[L2FLOW_STATE_MAX] = {
 	[L2FLOW_STATE_SEEN]			= 10 SECS,
 	[L2FLOW_STATE_CONFIRMED]		= 2 MINS,
 	[L2FLOW_STATE_LINUX]			= 10 SECS,
@@ -183,7 +181,6 @@ static void abm_do_work_send_msg(struct work_struct *work)
 
 	/* l2flow messages only make sense with an abm_nl listener. */
 	if (netlink_has_listeners(abm_nl, L2FLOW_NL_GRP)) {
-		//TODO : Need to limit the number of messages to sent while holding the lock.
 		list_for_each_safe(entry, tmp, &l2flow_list_msg_to_send){
 			table_entry = container_of(entry, struct l2flowTable, list_msg_to_send);
 			if((table_entry->state == L2FLOW_STATE_SEEN)
@@ -197,7 +194,7 @@ static void abm_do_work_send_msg(struct work_struct *work)
 			else if (table_entry->state == L2FLOW_STATE_DYING){
 				action = L2FLOW_ENTRY_DEL;
 			}
-			if(abm_nl_send_l2flow_msg(abm_nl, action, 0, table_entry) != -ENOTCONN){
+			if(abm_nl_send_l2flow_msg(abm_nl, action, table_entry) != -ENOTCONN){
 				table_entry->flags &= ~L2FLOW_FL_PENDING_MSG;
 				table_entry->flags &= ~L2FLOW_FL_NEEDS_UPDATE;
 				list_del(&table_entry->list_msg_to_send);
@@ -270,7 +267,7 @@ static void abm_do_work_retransmit(struct work_struct *work)
 			else if (table_entry->state == L2FLOW_STATE_DYING){
 				action = L2FLOW_ENTRY_DEL;
 			}
-			if (!abm_nl_send_l2flow_msg(abm_nl, action, 0, table_entry)){
+			if (!abm_nl_send_l2flow_msg(abm_nl, action, table_entry)){
 				/* Success : Update time and continue to next entry */
 				table_entry->time_sent = jiffies;
 			}
@@ -484,7 +481,7 @@ err:
 * Send L2FLOW_MSG_ENTRY msg types to user-space
 * 
 ****************************************************************************/
-static int abm_nl_send_l2flow_msg(struct sock *s, char action, int flags, struct l2flowTable *table_entry)
+static int abm_nl_send_l2flow_msg(struct sock *s, char action, struct l2flowTable *table_entry)
 {
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
@@ -505,7 +502,7 @@ static int abm_nl_send_l2flow_msg(struct sock *s, char action, int flags, struct
 
 	l2flow_msg = nlmsg_data(nlh);
 	l2flow_msg->action = action;
-	l2flow_msg->flags = flags;
+	l2flow_msg->flags = 0;
 	memcpy(l2flow_msg->saddr, table_entry->l2flow.saddr, 6);
 	memcpy(l2flow_msg->daddr, table_entry->l2flow.daddr, 6);
 	l2flow_msg->ethertype = table_entry->l2flow.ethertype;
@@ -625,12 +622,6 @@ static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netl
 	switch(type)
 	{
 		case L2FLOW_MSG_ENTRY:
-			/*Messages must have at least l2flow_msg length */
-			if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(struct l2flow_msg))){
-				err = -EAGAIN;
-				goto out;
-			}
-	
 			memset(&l2flow_temp, 0, sizeof(l2flow_temp));
 			l2flow_msg = NLMSG_DATA(nlh);
 			
@@ -676,8 +667,6 @@ static int abm_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh ,struct netl
 			
 			
 		break;
-		case L2FLOW_MSG_RESET:
-		break;
 		default:
 			err = -EINVAL;
 			break;
@@ -703,7 +692,7 @@ static void __abm_go_dying(struct l2flowTable *table_entry) __must_hold(&abm_loc
 
 		/* Skip Netlink message sending if already pending but if we come from another state send it anyway */
 		if(!(table_entry->flags & L2FLOW_FL_PENDING_MSG)  || (table_entry->state != L2FLOW_STATE_DYING))
-			if(abm_nl_send_l2flow_msg(abm_nl, L2FLOW_ENTRY_DEL, 0, table_entry) != -ENOTCONN){
+			if(abm_nl_send_l2flow_msg(abm_nl, L2FLOW_ENTRY_DEL, table_entry) != -ENOTCONN){
 				/* If message is succesully sent we expect an ack */
 				table_entry->flags |= L2FLOW_FL_WAIT_ACK;
 				list_add(&table_entry->list_wait_for_ack, &l2flow_list_wait_for_ack);
@@ -977,14 +966,10 @@ static inline int abm_build_l2flow(struct sk_buff *skb, struct l2flow *l2flow_te
 #endif
 		if (skb_vlan_tag_present(skb)) {
 			l2flow_temp->svlan_tag = htons(skb_vlan_tag_get(skb));
-			if ((vlan_eth_h = vlan_eth_hdr(skb))!= NULL) {
+			vlan_eth_h = vlan_eth_hdr(skb);
 			/* vlan_eth_h->h_vlan_proto is not matched ETH_P_8021Q then cvlan_tag set to 0 (already initialized to 0)*/
-				if (vlan_eth_h->h_vlan_proto == htons(ETH_P_8021Q)) {
-					l2flow_temp->cvlan_tag = vlan_eth_h->h_vlan_TCI;
-				} 
-			}
-			else {
-				printk(KERN_DEBUG "%s:%d vlan eth header is NULL:\n", __func__, __LINE__);
+			if (vlan_eth_h->h_vlan_proto == htons(ETH_P_8021Q)) {
+				l2flow_temp->cvlan_tag = vlan_eth_h->h_vlan_TCI;
 			}
 		}
 		else {
@@ -1144,7 +1129,7 @@ static unsigned int abm_ebt_hook(void *priv,
 			switch(l2flow_entry->state)
 			{
 				case L2FLOW_STATE_SEEN:
-					if((rc = abm_nl_send_l2flow_msg(abm_nl, L2FLOW_ENTRY_NEW, 0, l2flow_entry)) != -ENOTCONN){
+					if((rc = abm_nl_send_l2flow_msg(abm_nl, L2FLOW_ENTRY_NEW, l2flow_entry)) != -ENOTCONN){
 						l2flow_entry->flags &= ~L2FLOW_FL_NEEDS_UPDATE;
 						l2flow_entry->flags |= L2FLOW_FL_WAIT_ACK;
 						l2flow_entry->time_sent = jiffies;
@@ -1158,7 +1143,7 @@ static unsigned int abm_ebt_hook(void *priv,
 					/* However if we know that there is a pending message don't send it here */
 					if(!(l2flow_entry->flags & L2FLOW_FL_PENDING_MSG) 
 					&& (l2flow_entry->flags & L2FLOW_FL_NEEDS_UPDATE)){
-						if((rc = abm_nl_send_l2flow_msg(abm_nl, L2FLOW_ENTRY_UPDATE, 0, l2flow_entry)) != -ENOTCONN){
+						if((rc = abm_nl_send_l2flow_msg(abm_nl, L2FLOW_ENTRY_UPDATE, l2flow_entry)) != -ENOTCONN){
 							l2flow_entry->flags &= ~L2FLOW_FL_NEEDS_UPDATE;
 							l2flow_entry->time_sent = jiffies;
 
@@ -1184,7 +1169,7 @@ exit0:
 	return NF_ACCEPT;
 }
 
-static struct nf_hook_ops abm_ebt_ops[] /*__read_mostly*/ = {
+static struct nf_hook_ops abm_ebt_ops[] = {
 	{
 		.hook		= abm_ebt_hook,
 		.pf		= NFPROTO_BRIDGE,

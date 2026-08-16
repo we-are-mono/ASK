@@ -24,7 +24,6 @@ static u_int32_t route_ids[ROUTE_MAX_ID / (8 * sizeof(u_int32_t))] = {0, };
 static u_int32_t route_id = 0;
 
 pthread_mutex_t rtMutex = PTHREAD_MUTEX_INITIALIZER;		/*mutex to prevent race condition on the route table*/
-extern unsigned short TunMtu;
 
 static int cmmRouteNetlinkLookupFilter(const struct sockaddr_nl *nladdr, struct nlmsghdr *nlh, void *arg)
 {
@@ -1125,7 +1124,6 @@ static int __cmmRouteIsTnlConn (int family, const unsigned int* daddr,
 	}
 
 free_itf:
-	__itf_put(itf);
 out:
 	return rc;
 }

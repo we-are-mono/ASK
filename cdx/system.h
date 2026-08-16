@@ -27,9 +27,6 @@
 
 #ifdef CFG_WIFI_OFFLOAD
 #define PORT_WIFI_IDX                   WIFI0_PORT
-#define IS_WIFI_PORT(port)              (((port) >= WIFI0_PORT) && ((port) < (WIFI0_PORT + MAX_WIFI_VAPS)))
-#else
-#define IS_WIFI_PORT(port)              0
 #endif
 
 

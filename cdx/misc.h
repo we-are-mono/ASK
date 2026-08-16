@@ -71,8 +71,6 @@ static inline void display_buff_data(uint8_t *ptr, uint32_t len)
 }
 
 //required by dpa_offload ip address
-#define TYPE_IP4	4
-#define TYPE_IPV6	6
 
 #define DPA_UNUSED __attribute__((unused))
 
@@ -82,5 +80,4 @@ static inline void display_buff_data(uint8_t *ptr, uint32_t len)
 #define NUM_ANN_LINES_IN_CACHE          1
 
 
-void*  M_ipsec_get_sa_netdev( U16 handle);
 #endif
