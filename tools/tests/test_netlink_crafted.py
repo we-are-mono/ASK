@@ -51,7 +51,7 @@ def _rtattr(type_: int, payload: bytes) -> bytes:
     return struct.pack("<HH", hdr_len, type_) + payload + b"\x00" * pad
 
 
-# ASK_OVERSIZE picks a size that's BIGGER than the 16-byte union the
+# Each oversize case picks a size BIGGER than the 16-byte union the
 # memcpy target holds. Pre-fix this overflows the stack object; post-fix
 # the nla_policy rejects the message outright.
 C1_CASES = [

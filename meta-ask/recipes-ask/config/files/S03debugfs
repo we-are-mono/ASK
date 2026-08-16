@@ -14,7 +14,7 @@
 # The test harness depends on /sys/kernel/debug being mounted:
 #   * askd-agent's /kmemleak-scan + /kmemleak-clear endpoints (used by
 #     test_reassembly_storm's leak-delta guard)
-#   * future A3a-e failslab fault-injection tests
+#   * failslab fault-injection tests (test_ipsec_failslab.py etc.)
 #   * general debug visibility (ftrace, sched debug, lockdep stats)
 #
 # If we ever switch this image to systemd, delete this script — the mount

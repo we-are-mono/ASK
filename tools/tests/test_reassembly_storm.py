@@ -109,11 +109,10 @@ def _storm_script(duplicate: bool) -> str:
 async def _run_storm(lan_console, duplicate: bool) -> str:
     """Fire the storm on lan via UART, return the script's stdout.
 
-    Depends on system python3 having scapy importable. `make
-    deploy-agent-lan` installs `python3-scapy` via apt on the lan VM
-    exactly to satisfy this; on a fresh lan that hasn't been deployed
-    to, run deploy-agent-lan first (or apt-get install python3-scapy
-    by hand).
+    Depends on system python3 having scapy importable on the lan VM.
+    The lan VM is NAT-isolated (no IP path from the orchestrator), so
+    install it by hand over the UART console:
+    `apt-get install python3-scapy`.
 
     Scapy's pure-Python send() does ~10 kpps; worst case 30k frags
     finishes in ~3 s, but the kernel PTY path adds its own slack.

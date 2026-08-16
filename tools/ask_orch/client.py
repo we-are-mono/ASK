@@ -220,10 +220,10 @@ class Agent:
     ) -> dict:
         """Issue an ioctl on the agent. `uid` drops to an unprivileged
         UID before open. `userns=True` wraps the call in an unmapped
-        new user namespace (covers item 5's non-init userns case).
+        new user namespace (unmapped-userns capability-gate case).
         `drop_cap_net_admin=True` runs capset() between open and ioctl
         so the dispatcher sees a CAP_NET_ADMIN-less effective set on a
-        privileged-opened fd (item 5's mid-flight cap-drop case)."""
+        privileged-opened fd (mid-flight cap-drop case)."""
         body: dict = {
             "device":     device,
             "cmd":        int(cmd),

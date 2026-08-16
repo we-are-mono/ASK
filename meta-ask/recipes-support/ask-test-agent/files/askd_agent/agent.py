@@ -432,8 +432,8 @@ def _enter_unmapped_userns() -> None:
 
     With no mapping, all uids in the namespace map to /proc/sys/kernel/
     overflowuid (typically 65534) and capable() against init_user_ns
-    returns false — exactly what item 5's userns test wants to assert
-    on a CAP_NET_ADMIN-gated ioctl.
+    returns false — exactly what the unmapped-userns capability-gate
+    test wants to assert on a CAP_NET_ADMIN-gated ioctl.
     """
     os.unshare(_CLONE_NEWUSER)
 
@@ -561,10 +561,10 @@ async def ioctl_send(request: web.Request) -> web.Response:
     [timeout_ms]} -> ioctl result.
 
     `uid` drops to an unprivileged UID before open (G1-style). `userns`
-    runs the call inside an unmapped CLONE_NEWUSER namespace (item 5
-    non-init userns case). `drop_cap_net_admin` does capset() between
+    runs the call inside an unmapped CLONE_NEWUSER namespace (the
+    unmapped-userns capability-gate case). `drop_cap_net_admin` does capset() between
     open and ioctl so a privileged-opened fd hits the dispatcher with
-    a stripped effective set (item 5 mid-flight cap-drop case).
+    a stripped effective set (the mid-flight cap-drop case).
     """
     body = await _maybe_json(request)
     try:

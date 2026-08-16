@@ -1,6 +1,7 @@
 """H3 regression — DMA mappings unwound on partial-init failure.
 
-PARKED — synthetic-SA can't reach the H3 fix site. See ISSUES.md A18.
+PARKED — synthetic-SA can't reach the H3 fix site (needs a real-peer
+fixture). The A18 NULL-deref that once blocked the NAT-T variant is fixed.
 
 The H3 fix (613efa3) added a two-label unwind in
 cdx_ipsec_create_shareddescriptor (cdx/cdx_dpa_ipsec.c err_unmap_crypto
@@ -12,11 +13,11 @@ Reaching either site requires the SA's fast-path push to succeed past
 sa->ct allocation. For synthetic SAs (no real iface bound to dst_ip,
 no realistic netdev/route), cdx_ipsec_add_classification_table_entry
 fails earlier at dpa_get_iface_info_by_ipaddress — and on the NAT-T
-variant the failure path NULL-derefs sa->ct (A18, separate bug). The
+variant the failure path once NULL-derefed sa->ct (A18, now fixed). The
 non-NAT-T path returns ERR_CREATION_FAILED cleanly but never reaches
 the DMA-map kmalloc inside cdx_ipsec_create_shareddescriptor.
 
-This regression test is therefore deferred to slice 2's real-peer
+This regression test is therefore deferred to a real-peer
 fixture, where the SA install completes the fast-path push and
 failslab can fault inside the DMA-map kmalloc to exercise the H3
 unwind. The kmemleak filter is already extended in
@@ -28,6 +29,6 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.mark.skip(reason="A18: synthetic-SA can't reach H3 DMA-map site without crashing or short-circuiting; needs slice-2 real-peer fixture")
+@pytest.mark.skip(reason="synthetic-SA can't reach the H3 DMA-map site (short-circuits without a real iface/route); needs a real-peer fixture")
 async def test_ipsec_set_state_dma_balance():
     pass

@@ -18,20 +18,18 @@ and x86_64 produce identical sizes for these layouts):
                                  tnl union at 36 B; ipv4 case is 12 B.
                                  Total = 184 + 36 + 4×8 = 252.
 
-Two surprises worth pinning here so tests don't get blindsided:
+Historical notes — both bugs are now fixed, kept so tests don't
+re-learn the wrong lesson:
 
-  1. The H5 NAT-T SPI bounds check at cdx_dpa_ipsec.c:2369 fires inside
-     cdx_ipsec_process_udp_classification_table_entry, which is called
-     from ipsec_push_sa_to_fast_path (control_ipsec.c:720) — and that
-     caller DISCARDS the return value. So a 17th NAT-T SA in the same
-     flow returns NO_ERR to user-space even though the bounds check
-     prevented an OOB write internally. The regression detector for H5
-     is therefore splat_window/KASAN, not reply_rc.
+  1. ipsec_push_sa_to_fast_path once DISCARDED the classification-entry
+     return, so an H5 NAT-T SPI bounds-check failure surfaced to
+     user-space as NO_ERR. It now propagates ERR_CREATION_FAILED
+     (control_ipsec.c:663), so reply_rc is a usable oracle for that
+     failure once a test can actually reach the bounds-check site.
 
-  2. SA_SET_KEYS dereferences sa before the NULL check (control_ipsec.c:617
-     vs the check at :619). Sending SET_KEYS for a sagd that doesn't exist
-     panics. Tests that exercise SET_KEYS must ensure CREATE succeeded
-     first.
+  2. SA_SET_KEYS once dereferenced sa before the NULL check, so
+     SET_KEYS for a sagd that doesn't exist panicked. It now checks
+     sa == NULL first (control_ipsec.c) and returns ERR_SA_UNKNOWN.
 """
 
 from __future__ import annotations

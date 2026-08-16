@@ -11,10 +11,17 @@ IPv6-in-IPv4 (sit) tunnel. The path:
   FMAN ucode prepends IPv4(proto=41) outer at line rate
   DUT eth3 ──ipv4(proto=41)/ipv6──> orchestrator sit_test → iperf3 -s
 
+NOTE: TX-encap offload is currently blocked in FMAN ucode 210.10.1
+(INSERT_L3_HDR punts every matched packet — ISSUES.md A9), so encap
+runs in the kernel sit path (~9 Gbit/s on the A72s). This is a
+THROUGHPUT + path-truth test, not an offload proof.
+
 Oracles:
-  (i)  iperf3 throughput ≥ OFFLOAD_MIN_GBPS — proves FMAN is doing
-       the encap (Cortex-A72 SW sit-encap caps at ~165 Mbps; on a
-       working FMAN offload we see ~8.8 Gbps).
+  (i)  iperf3 throughput ≥ OFFLOAD_MIN_GBPS — measures the kernel
+       sit-encap path; a kernel-tx tripwire (below) asserts the
+       software path explicitly, so if a future ucode fixes
+       INSERT_L3_HDR this test fails loudly rather than silently
+       changing meaning.
   (ii) The kernel grew at least one IPv6 conntrack entry during the
        run — proves the firewall rules engaged tracking, which is
        the prerequisite for CMM to mirror the flow to FCI.
@@ -58,8 +65,9 @@ DUT_LAN_V6   = "fc00:dead::1"
 TUNNEL_IF    = "sit_test"
 TUNNEL_MTU   = 1480       # 1500 (eth) - 20 (IPv4 outer)
 
-# SW sit-encap on the A72 caps at ~165 Mbps. FMAN offload runs near
-# 10G line rate. 1 Gbps splits the two cleanly.
+# Kernel sit-encap on the A72 sustains ~9 Gbit/s (ISSUES.md A9); the
+# >1 Gbps floor asserts the software path is healthy, not that FMAN
+# offloaded (TX-encap offload is currently blocked in ucode).
 OFFLOAD_MIN_GBPS = float(os.environ.get("ASK_TUNNEL_TX_MIN_GBPS", "1.0"))
 IPERF_DURATION_S = int(os.environ.get("ASK_TUNNEL_TX_DURATION", "8"))
 
@@ -282,8 +290,8 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
     # Oracle (i): throughput must exceed the SW-fallback ceiling.
     assert gbps >= OFFLOAD_MIN_GBPS, (
         f"tunneled iperf3 throughput {gbps:.2f} Gbps below "
-        f"{OFFLOAD_MIN_GBPS} Gbps — FMAN didn't engage; SW sit-encap "
-        f"caps at ~165 Mbps. CT delta: {ct_delta}. iperf3 tail:\n"
+        f"{OFFLOAD_MIN_GBPS} Gbps — kernel sit-encap path unhealthy "
+        f"(normally ~9 Gbit/s). CT delta: {ct_delta}. iperf3 tail:\n"
         f"{log[-600:]}"
     )
 

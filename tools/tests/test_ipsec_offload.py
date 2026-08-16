@@ -11,10 +11,9 @@
       cdx_ipsec_add_classification_table_entry can't populate sa->ct
       without a real route/iface — that's expected and accepted; the SA
       stays in sa_cache_by_h for QUERY to find. The test is **not**
-      driven via NAT-T because the NAT-T fast-path push has a NULL deref
-      in cdx_ipsec_process_udp_classification_table_entry (the else-branch
-      writes sa->ct->natt_in_refcnt without re-checking sa->ct). See
-      ISSUES.md A18.
+      driven via NAT-T because the NAT-T fast-path push needs a real
+      iface/route to populate sa->ct; the else-branch that once NULL-
+      derefed sa->ct->natt_in_refcnt without a real SA (A18) is fixed.
 
   test_ipsec_query_empty_payload
       Sanity-check that an all-zeros 252-byte SAQueryCommand with only
@@ -22,9 +21,9 @@
       assumption query_sa() relies on. If a future change starts
       validating other fields, this trips before any other test.
 
-For real-peer + iperf3 E2E coverage see slice 2 (deferred). Tests that
-need to drive SET_STATE deeper than the current slice-1 reach (H3/H5
-regressions) require real iface/route setup and are also slice-2.
+Real-peer + iperf3 E2E coverage is deferred. Tests that need to drive
+SET_STATE deeper than the current synthetic-SA reach (the H3/H5
+regressions) require real iface/route setup and are deferred too.
 """
 
 from __future__ import annotations

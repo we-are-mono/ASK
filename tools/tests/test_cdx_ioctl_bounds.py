@@ -10,7 +10,7 @@ C9b: CDX_CTRL_DPA_CONNADD was deleted — invoking it must return ENOTTY.
 Only C6 is driven via CDX_CTRL_DPA_SET_PARAMS and thus testable at the
 ioctl layer. C7/C8 are reachable only via specific control_*.c paths
 that would need a valid params setup first — they're covered by the
-FCI fuzzer once we extend payload mutations there. This file just
+FCI fuzzer's payload-mutation pass (test_fci_fuzz.py). This file just
 exercises the ioctl-surface bounds: C6 + C9b.
 """
 
