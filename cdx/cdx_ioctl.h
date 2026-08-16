@@ -171,20 +171,9 @@ struct cdx_fman_info {
 	uint32_t expt_ratelim_burst_size; //bytes or packets
 };
 
-//ipv4 reassembly configuration
-struct cdx_ipr_info {
-	uint32_t timeout;
-	uint32_t max_frags;
-	uint32_t min_frag_size;
-	uint32_t max_contexts;
-	uint32_t ipr_ctx_bsize;
-	uint32_t ipr_frag_bsize;
-};
-
 //structure used by CDX_CTRL_DPA_SET_PARAMS ioctl call
 struct cdx_ctrl_set_dpa_params {
 	struct cdx_fman_info *fman_info; //pointer to array of fman info
-	struct cdx_ipr_info *ipr_info;
 	uint32_t num_fmans;	//number of frame managers
 };
 

@@ -36,14 +36,6 @@
 #define DEFAULT_SP_FILE		(char *)"/etc/cdx_sp.xml"
 #define DEFAULT_PDL_FILE	(char *)"/etc/fmc/config/hxs_pdl_v3.xml"
 
-//IP reassembly default configuration
-#define IPR_TIMEOUT             2000 //milli seconds
-#define IPR_MAX_FRAGS           2
-#define IPR_MIN_FRAG_SIZE       128
-#define IPR_MAX_SESSIONS        128
-#define IPR_CTX_BSIZE           1700
-#define IPR_FRAG_BSIZE          1700
-
 enum dpa_cls_tbl_type {
 	DPA_CLS_TBL_INTERNAL_HASH = 0,	/* HASH table in MURAM */
 	DPA_CLS_TBL_EXTERNAL_HASH,	/* HASH table in DDR */
@@ -110,9 +102,7 @@ static struct ccnode_table_params table_params[] = {
 	{(char *)"cdx_tuple3udp4",	IPV4_3TUPLE_UDP_TABLE},
 	{(char *)"cdx_tuple3tcp4",	IPV4_3TUPLE_TCP_TABLE},
 	{(char *)"cdx_tuple3udp6", IPV6_3TUPLE_UDP_TABLE},
-	{(char *)"cdx_tuple3tcp6", IPV6_3TUPLE_TCP_TABLE},
-	{(char *)"cdx_frag4",   IPV4_REASSM_TABLE},
-    {(char *)"cdx_frag6",   IPV6_REASSM_TABLE}
+	{(char *)"cdx_tuple3tcp6", IPV6_3TUPLE_TCP_TABLE}
 };
 #define MAX_TABLE_PARAMS\
 		(sizeof(table_params) / sizeof(struct ccnode_table_params))
@@ -133,8 +123,6 @@ static struct model_dist_params dist_name[] = {
 	{(char *)"cdx_tup3tcp4_dist", 	IPV4_3TUPLE_TCP_DIST},
 	{(char *)"cdx_tup3udp6_dist", 	IPV6_3TUPLE_UDP_DIST},
 	{(char *)"cdx_tup3tcp6_dist", 	IPV6_3TUPLE_TCP_DIST},
-	{(char *)"cdx_ipv4frag_dist",   IPV4_FRAG_DIST},
-    {(char *)"cdx_ipv6frag_dist",   IPV6_FRAG_DIST},
 };
 #define MAX_DIST_PARAMS\
 		(sizeof(dist_name) / sizeof(struct model_dist_params))
@@ -598,19 +586,19 @@ func_ret:
 	return retval;
 }
 
-static int set_reassembly_params(struct fmc_model_t *model)
+/* Tag every external-hash node in the compiled model with the cdx
+ * table type its name implies. The kernel's FM_PCD_ExternalHashTableSet()
+ * switches on this field to pick the node's microcode class (L2/L3/L4)
+ * and to decide whether per-bucket locks are needed, so it has to be
+ * filled in before fmc_execute(). fmc itself never sets it: table_type
+ * is an ASK extension to t_FmPcdHashTableParams. Unrecognised names
+ * fall back to ETHERNET_TABLE (L2). */
+static int set_table_types(struct fmc_model_t *model)
 {
 	uint32_t index;
-	uint32_t reassm_table_type;
-	
+
 	for (index = 0; index < model->htnode_count; index++) {
-		reassm_table_type = 0;
 		do {
-			if (strstr(model->htnode_name[index], "cdx_frag4")) {
-				model->htnode[index].table_type = IPV4_REASSM_TABLE;
-				reassm_table_type = 1;
-				break;
-			}
 			if (strstr(model->htnode_name[index], "cdx_udp4")) {
 				model->htnode[index].table_type = IPV4_UDP_TABLE;
 				break;
@@ -625,11 +613,6 @@ static int set_reassembly_params(struct fmc_model_t *model)
 			}
 			if (strstr(model->htnode_name[index], "cdx_multicast4")) {
 				model->htnode[index].table_type = IPV4_MULTICAST_TABLE;
-				break;
-			}
-			if (strstr(model->htnode_name[index], "cdx_frag6")) {
-				model->htnode[index].table_type = IPV6_REASSM_TABLE;
-				reassm_table_type = 1;
 				break;
 			}
 			if (strstr(model->htnode_name[index], "cdx_udp6")) {
@@ -671,34 +654,6 @@ static int set_reassembly_params(struct fmc_model_t *model)
 			model->htnode[index].table_type = ETHERNET_TABLE;
 			break;
 		} while(1);
-		if (reassm_table_type) {
-		        model->htnode[index].timeout_val = 
-				IPR_TIMEOUT;
-        		model->htnode[index].timeout_fqid = 
-				0;
-        		model->htnode[index].max_frags = 
-				IPR_MAX_FRAGS;
-        		model->htnode[index].min_frag_size = 									IPR_MIN_FRAG_SIZE;
-        		model->htnode[index].max_sessions = 
-				IPR_MAX_SESSIONS;
-
-#ifdef DPA_C_DEBUG
-			{
-			      uint32_t ii;
-			      uint8_t *ptr;
-
-			        ptr = (uint8_t *)&model->htnode[index];
-				printf("%s::node %s:: %p\n", __func__, model->htnode_name[index],
-					ptr);
-			        for (ii = 0; ii < sizeof(t_FmPcdHashTableParams); ii++) {
-			                if ((ii % 16) == 0)
-                        			printf("\n %02x ", *(ptr + ii));
-                		else
-                        		printf("%02x ", *(ptr + ii));
-        			}
-    			}
-#endif
-		}
 	}
 	return 0;
 }
@@ -779,20 +734,6 @@ int dpa_init(void)
 		goto err_ret;
 	}
 	params.fman_info = fman_info;
-	//pass ip reassembly limits to cdx
-	params.ipr_info = (struct cdx_ipr_info *)
-                calloc (1, (sizeof(struct cdx_ipr_info) * params.num_fmans));
-        if (!params.ipr_info) {
-                printf("%s::unable to allocate mem for ipr info\n",
-                        __func__);
-                goto err_ret;
-        }
-        params.ipr_info->timeout = IPR_TIMEOUT;
-        params.ipr_info->max_frags = IPR_MAX_FRAGS;
-        params.ipr_info->min_frag_size = IPR_MIN_FRAG_SIZE;
-        params.ipr_info->max_contexts = IPR_MAX_SESSIONS;
-        params.ipr_info->ipr_ctx_bsize = IPR_CTX_BSIZE;
-        params.ipr_info->ipr_frag_bsize = IPR_FRAG_BSIZE;
 #ifdef DPA_C_DEBUG
 	printf("%s::fman count %d\n", __func__,
 			cmodel.fman_count);
@@ -813,9 +754,9 @@ int dpa_init(void)
 #ifdef DPA_C_DEBUG
 	printf("%s::executing fman model\n", __func__);
 #endif
-	 //set reassembly parameters for those tables
-        if (set_reassembly_params(&cmodel)) {
-                printf("%s::unable to set reassembly params in FMC Model\n", __func__);
+	//tag each hash table in the model with its cdx table type
+        if (set_table_types(&cmodel)) {
+                printf("%s::unable to set table types in FMC Model\n", __func__);
                 return -1;
         }
 	//load compiled cfg it into the FMAN	
@@ -876,8 +817,6 @@ err_ret:
 		}
 		free(params.fman_info);
 	}
-	if (params.ipr_info)
-    		free(params.ipr_info);
 	//close device in case of any failure.
 	if (retval) {
 	        printf("%s::retval %d\n", __func__, retval);

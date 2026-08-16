@@ -36,8 +36,6 @@ static uint32_t num_fmans;
 struct cdx_fman_info *fman_info;
 //frame queue list created
 static struct dpa_fq *dpa_pcd_fq;
-//ipr info received via ioctl
-struct cdx_ipr_info ipr_info;
 
 /* Sanity caps on user-supplied counts via CDX_CTRL_DPA_SET_PARAMS.
  * Real LS104x config today: 1 FMAN, <=9 ports/FMAN, 16 dist types,
@@ -53,7 +51,7 @@ struct cdx_ipr_info ipr_info;
  * Concurrency:
  *   dpa_cfg_lock (file-local mutex)
  *      - Serializes the one-shot install of the DPA configuration
- *        (fman_info, num_fmans, ipr_info, associated port/table/
+ *        (fman_info, num_fmans, associated port/table/
  *        distribution sub-allocations). Held for the whole body of
  *        cdx_ioc_set_dpa_params(). release_cfg_info() assumes it
  *        is held by the caller.
@@ -67,11 +65,6 @@ struct cdx_ipr_info ipr_info;
  *        free on packet/ioctl paths because the one-time-init
  *        ordering is guaranteed by the CAP_NET_ADMIN-gated ioctl
  *        and the run-once dpa_app boot sequence.
- *
- *   ipr_info (file-scope global)
- *      - Written once in the same set_params call, read by
- *        cdx_reassm.c; see that file for the init-completion
- *        ordering that makes lock-free reads safe.
  *
  * Contexts:
  *   cdx_ioc_set_dpa_params()         - process, ioctl path.
@@ -514,11 +507,7 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 		}
 		//adding miss action 
 		//get ethernet distribution scheme handle
-		if((tbl_info->type != ETHERNET_TABLE) && (tbl_info->type != PPPOE_RELAY_TABLE) 
-#ifdef CDX_IP_REASSEMBLY
-				&& (tbl_info->type != IPV4_REASSM_TABLE) && (tbl_info->type != IPV6_REASSM_TABLE)
-#endif
-			) {
+		if((tbl_info->type != ETHERNET_TABLE) && (tbl_info->type != PPPOE_RELAY_TABLE)) {
 			if (miss_engine_params.params.kgParams.h_DirectScheme == NULL) {
 				DPA_ERROR("%s::error finding direct dist for table %s\n",
 						__func__, tbl_info->name);
@@ -636,13 +625,6 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	if (copy_from_user(fman_info, (void *)params.fman_info,
 				(sizeof(struct cdx_fman_info) * num_fmans))) {
 		DPA_ERROR("%s::Read fman_info failed\n",
-				__func__);
-		retval = -EIO;
-		goto err_ret;
-	}
-	if (copy_from_user(&ipr_info, (void *)params.ipr_info,
-				sizeof(struct cdx_ipr_info))) {
-		DPA_ERROR("%s::Read iprv_info failed\n",
 				__func__);
 		retval = -EIO;
 		goto err_ret;

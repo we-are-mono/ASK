@@ -327,15 +327,6 @@ static int __init cdx_module_init(void)
 	}
 #endif
 
-#ifdef CDX_IP_REASSEMBLY
-	printk("%s::calling cdx_init_ip_reassembly\n", __func__);
-	if (cdx_init_ip_reassembly()) {
-		printk("%s::cdx_init_ip_reassembly failed\n", __func__);
-		rc = -EIO;
-		goto exit;
-	}
-#endif // CDX_IP_REASSEMBLY
-
 exit:
 	if (rc) {
 		printk("<<<<<<<<<<<<<<<<<<<< CDX module failed initialization >>>>>>>>>>>>>>>>>>>>>>>>>\n");

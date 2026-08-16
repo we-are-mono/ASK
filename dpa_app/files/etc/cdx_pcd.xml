@@ -86,18 +86,6 @@
   </key>
 </classification>
 
-<classification name="cdx_frag4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0xf" hashshift="0" keysize="12" aging="no"/>
-  </key>
-</classification>
-
-<classification name="cdx_frag6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0xf" hashshift="0" keysize="38" aging="no"/>
-  </key>
-</classification>
-
 <distribution name="cdx_udp4_dist" shared="true">
   <protocols>
     <protocolref name="udp"/>
@@ -304,34 +292,6 @@
   <action type="classification" name="cdx_tuple3tcp6_cc"/>
 </distribution>
 
-<distribution name="cdx_ipv4frag_dist" shared="true">
-  <protocols>
-    <protocolref name="ipv4"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv4.src"/>
-    <fieldref name="ipv4.dst"/>
-    <fieldref name="ipv4.nextp"/>
-  </key>
-  <queue count="1" base="0x10d0"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_frag4_cc"/>
-</distribution>
-
-<distribution name="cdx_ipv6frag_dist" shared="true">
-  <protocols>
-    <protocolref name="ipv6"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv6.src"/>
-    <fieldref name="ipv6.dst"/>
-    <fieldref name="ipv6.nexthdr"/>
-  </key>
-  <queue count="1" base="0x10e0"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_frag6_cc"/>
-</distribution>
-
 <policy name="cdx_ethport_0_policy">
   <dist_order>
     <distributionref name="cdx_esp4_dist"/>
@@ -346,8 +306,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/ -->
   </dist_order>
 </policy>
 
@@ -365,8 +323,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/-->
  </dist_order>
 </policy>
 
@@ -384,8 +340,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/ -->
   </dist_order>
 </policy>
 
@@ -403,8 +357,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/ -->
   </dist_order>
 </policy>
 
@@ -422,8 +374,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/-->
   </dist_order>
 </policy>
 
@@ -441,8 +391,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/ -->
   </dist_order>
 </policy>
 
@@ -460,8 +408,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/ -->
   </dist_order>
 </policy>
 
@@ -479,8 +425,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/ -->
   </dist_order>
 </policy>
 
@@ -499,8 +443,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/-->
   </dist_order>
 </policy>
 
@@ -518,8 +460,6 @@
     <distributionref name="cdx_tup3udp6_dist"/>
     <distributionref name="cdx_pppoe_dist"/>
     <distributionref name="cdx_ethernet_dist"/>
-    <!-- distributionref name="cdx_ipv4frag_dist"/>
-    <distributionref name="cdx_ipv6frag_dist"/ -->
   </dist_order>
 </policy>
 </netpcd>

@@ -43,16 +43,6 @@ int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index,
 		void *tbl_entry);
 int ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
 		struct en_tbl_entry_stats *stats);
-int ExternalHashSetReasslyPool(uint32_t type, uint32_t ctx_bpid, 
-		uint32_t ctx_bpsize, uint32_t frag_bpid, uint32_t frag_size,
-		uint32_t spare_bpid, uint32_t ipr_timer_freq);
-
-int get_ip_reassem_info(uint32_t type, struct ip_reassembly_info *info);
-
-void ipr_update_timestamp(void);
-int cdx_get_ipr_v4_stats(void *resp);
-int cdx_get_ipr_v6_stats(void *resp);
-
 int cdx_create_port_fqs(void);
 int cdx_add_eth_onif(char *name);
 int cdx_add_oh_iface(char *name);

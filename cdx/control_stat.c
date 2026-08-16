@@ -595,38 +595,6 @@ static U16 stat_flow_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 }
 
 /*
- * FPP_CMD_IPR_V{4,6}_STATS: inner returns -1 on error, otherwise
- * the reply length in bytes (not a status). Pre-migration set
- * acklen = (U16)rc on success and ackstatus = ERR_WRONG_COMMAND_PARAM
- * on rc == -1. Preserve by passing the inner rc through
- * *out_reply_len on success and returning ERR_WRONG_COMMAND_PARAM
- * on failure.
- */
-static U16 stat_ipr_v4_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	int rc;
-
-	(void)cmd_len;
-	rc = cdx_get_ipr_v4_stats((void *)pcmd);
-	if (rc == -1)
-		return ERR_WRONG_COMMAND_PARAM;
-	*out_reply_len = (U16)rc;
-	return NO_ERR;
-}
-
-static U16 stat_ipr_v6_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	int rc;
-
-	(void)cmd_len;
-	rc = cdx_get_ipr_v6_stats((void *)pcmd);
-	if (rc == -1)
-		return ERR_WRONG_COMMAND_PARAM;
-	*out_reply_len = (U16)rc;
-	return NO_ERR;
-}
-
-/*
  * Lower bounds tightened from CDX_CMD_VAR(0, U16_MAX) to
  * sizeof(request struct) for every entry whose handler reads pcmd
  * via memcpy/cast (ISSUES.md A1b item 6). The handlers don't
@@ -637,15 +605,10 @@ static U16 stat_ipr_v6_stats_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
  * compatibility with libfci callers that pre-size the buffer for
  * a larger response struct.
  *
- * Two exceptions:
- *  - CMD_STAT_BRIDGE_{STATUS,ENTRY} route to stat_bridge_disabled_handle
- *    which `(void)pcmd; (void)cmd_len;` — bridge stats aren't built
- *    in this port. No read-uninit risk; left at (0, U16_MAX).
- *  - FPP_CMD_IPR_V{4,6}_STATS write `struct ipr_statistics` into pcmd
- *    but the type is private to cdx_reassm.c. Promoting it to a
- *    shared header just to express the bound is more churn than
- *    the read-of-uninit risk justifies (write-only handler — no
- *    bytes from pcmd are read). Left at (0, U16_MAX).
+ * One exception: CMD_STAT_BRIDGE_{STATUS,ENTRY} route to
+ * stat_bridge_disabled_handle which `(void)pcmd; (void)cmd_len;` —
+ * bridge stats aren't built in this port. No read-uninit risk; left
+ * at (0, U16_MAX).
  */
 static const struct cdx_cmd_spec stat_cmd_table[] = {
 	CDX_CMD_VAR(CMD_STAT_ENABLE,        sizeof(StatEnableCmd),         U16_MAX, NULL, stat_enable_handle),
@@ -665,9 +628,6 @@ static const struct cdx_cmd_spec stat_cmd_table[] = {
 	CDX_CMD_VAR(CMD_STAT_IPSEC_ENTRY,   sizeof(StatIpsecEntryResponse), U16_MAX, NULL, stat_ipsec_entry_handle),
 #endif
 	CDX_CMD_VAR(CMD_STAT_FLOW,          sizeof(StatFlowStatusCmd),     U16_MAX, NULL, stat_flow_handle),
-	/* IPR stats: see comment above re: ipr_statistics privacy. */
-	CDX_CMD_VAR(FPP_CMD_IPR_V4_STATS,   0, U16_MAX, NULL, stat_ipr_v4_stats_handle),
-	CDX_CMD_VAR(FPP_CMD_IPR_V6_STATS,   0, U16_MAX, NULL, stat_ipr_v6_stats_handle),
 };
 
 static U16 M_stat_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)

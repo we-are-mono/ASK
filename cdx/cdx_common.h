@@ -371,7 +371,6 @@ int dpa_add_oh_if(char *name);
 
 int cdx_init_frag_module(void);
 void cdx_deinit_frag_module(void);
-int cdx_init_ip_reassembly(void);
 
 void hw_ct_get_active(struct hw_ct *ct);
 

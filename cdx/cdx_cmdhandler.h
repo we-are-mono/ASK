@@ -209,9 +209,7 @@ enum EVENTS {
 #define CMD_STAT_VLAN_ENTRY			0x0E0C
 #define CMD_STAT_TUNNEL_STATUS			0x0E0D
 #define CMD_STAT_TUNNEL_ENTRY			0x0E0E
-#define CMD_STAT_FLOW				0x0E0F 
-#define FPP_CMD_IPR_V4_STATS                    0x0E10
-#define FPP_CMD_IPR_V6_STATS                    0x0E11
+#define CMD_STAT_FLOW				0x0E0F
 
 // 0x0f00 ->0x0fff : Trace/Profiling/Debugging
 #define         FC_TRC                          	0x000f
