@@ -440,9 +440,9 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 	PCommandIPSecSetState pSA_cmd = (PCommandIPSecSetState)payload;
 	struct SATable *pSAEntry;
 	int rc = 0;
-	if (len != sizeof(PCommandIPSecSetState))
+	if (len != sizeof(CommandIPSecSetState))
 	{
-		cmm_print(DEBUG_ERROR, "%s: command length doesn't match %zu-%d\n", __func__, sizeof(PCommandIPSecSetState), len);
+		cmm_print(DEBUG_ERROR, "%s: command length doesn't match %zu-%d\n", __func__, sizeof(CommandIPSecSetState), len);
 		return -1;
 	}
 	__pthread_mutex_lock(&sa_lock);

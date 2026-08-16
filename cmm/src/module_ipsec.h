@@ -34,7 +34,7 @@ or one encrypted and one decrypted flow */
 /* The following definitions for directions present in "include/net/flow.h" in
  * kernel */
 
-#define IS_TUNNEL_MODE_SA(PSaEntry) ((pSAEntry->SAInfo.proto_family) ? true:false)
+#define IS_TUNNEL_MODE_SA(pSAEntry) ((pSAEntry->SAInfo.proto_family) ? true:false)
 extern struct list_head sa_table[SA_HASH_TABLE_SIZE];
 extern pthread_mutex_t sa_lock;
 

@@ -83,7 +83,7 @@ struct sec_descriptor {
 
 /* For all Buffer pools using the ethernet driver seed routine,
  * we'll be using the same   BPOOL size */
-#define IPSEC_BUFSIZE	dpa_bp_size(x)
+#define IPSEC_BUFSIZE	dpa_bp_size(NULL)
 #define IPSEC_BUFCOUNT  512
 #define	THRESHOLD_IPSEC_BPOOL_REFILL 16
 

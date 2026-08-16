@@ -33,7 +33,7 @@ static struct dpa_bp *gs_dpa_vsp_bp;		/* VSP Buffer pool */
 
 /* For all Buffer pools using the ethernet driver seed routine,
  * we'll be using the same   BPOOL size */
-#define DPAA_VSP_BUF_SIZE dpa_bp_size(x)
+#define DPAA_VSP_BUF_SIZE dpa_bp_size(NULL)
 
 static struct dpa_bp *dpa_vsp_bp_probe(struct net_device *net_dev)
 {

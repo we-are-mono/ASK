@@ -13,10 +13,3 @@ asyncio_default_test_loop_scope    = "function"
 # (comment out when triaging a suite run). --tb=short: compact tracebacks.
 addopts = "-ra -x --tb=short"
 testpaths = ["tests"]
-
-# Slow suite: long-running tests (module-reload failslab, etc.). Run via
-# `make ask-test ASK_TEST_ARGS='-m slow'`; the default run includes them
-# (use `-m "not slow"` to skip).
-markers = [
-    "slow: long-running tests; minutes-scale per case",
-]
