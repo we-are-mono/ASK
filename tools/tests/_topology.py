@@ -166,7 +166,6 @@ ICMP4_FRAG_NEEDED       = "unreachable - need to frag"   # type=3 code=4
 ICMP4_TIME_EXCEEDED     = "time exceeded"                # type=11
 ICMP6_PACKET_TOO_BIG    = "packet too big"               # type=2
 ICMP6_TIME_EXCEEDED     = "time exceeded"                # type=3
-ICMP6_HBH_PARAM_PROBLEM = "parameter problem"            # type=4
 
 
 def _build_icmp_bpf(ip_ver: int, icmp_type: int, icmp_code: int | None) -> str:

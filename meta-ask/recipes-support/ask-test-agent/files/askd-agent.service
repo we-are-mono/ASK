@@ -1,3 +1,7 @@
+# NOTE: no Yocto recipe installs this unit — the meta-ask busybox image uses
+# the sysvinit script S70askd-agent instead. Its only consumer is the root
+# Makefile's `deploy-agents` target, which installs it to /etc/systemd/system
+# on a systemd-based dev board. Kept here beside the agent sources it launches.
 [Unit]
 Description=ASK test harness agent
 After=network.target

@@ -23,7 +23,10 @@ struct list_head socket_table_by_addr[HASH_SOCKET_SIZE];
 
 pthread_mutex_t socket_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static u_int32_t internal_sock_ids[ROUTE_MAX_ID / (8 * sizeof(u_int32_t))] = {0, };
+/* One bit per allocatable private socket ID [1, NUM_INTERNAL_SOCKET_ID],
+ * rounded up to whole u32 words. Sizing by ROUTE_MAX_ID (0x10000) was copied
+ * from route_cache.c and wasted ~8 KB for what is really a 255-ID space. */
+static u_int32_t internal_sock_ids[(NUM_INTERNAL_SOCKET_ID + 8 * sizeof(u_int32_t) - 1) / (8 * sizeof(u_int32_t))] = {0, };
 static u_int32_t internal_sock_id = 0;
 
 u_int32_t new_socket_id(void)

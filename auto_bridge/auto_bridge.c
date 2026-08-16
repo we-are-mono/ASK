@@ -421,13 +421,15 @@ static inline size_t abm_l2flow_msg_size(void)
 		+ nla_total_size(sizeof(u32))		/* L2FLOWA_CVLAN_TAG */
 		+ nla_total_size(sizeof(u32))		/* L2FLOWA_PPP_S_ID */
 		+ nla_total_size(sizeof(u32))		/* L2FLOWA_IIF_IDX */
-		+ nla_total_size(sizeof(u32))		/* L2FLOWA_OIF_DIX */
+		+ nla_total_size(sizeof(u32))		/* L2FLOWA_OIF_IDX */
 		+ nla_total_size(4 * sizeof(u32))		/* L2FLOWA_IP_SRC */
 		+ nla_total_size(4 * sizeof(u32))		/* L2FLOWA_IP_DST */
 		+ nla_total_size(sizeof(u8))		/* L2FLOWA_IP_PROTO */
 		+ nla_total_size(sizeof(u16))		/* L2FLOWA_SPORT */
 		+ nla_total_size(sizeof(u16))		/* L2FLOWA_DPORT */
 		+ nla_total_size(sizeof(u16))		/* L2FLOWA_MARK */
+		+ nla_total_size(sizeof(u16))		/* L2FLOWA_VID */
+		+ nla_total_size(sizeof(u8))		/* L2FLOWA_VLAN_FLAGS */
 		;
 }
 

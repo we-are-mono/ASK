@@ -155,7 +155,12 @@ struct cdx_cmd_spec {
 	  .validate = (VALIDATE),					\
 	  .handle   = (HANDLER) }
 
-/* No-argument command (cmd_len must equal 0). */
+/* No-argument command (cmd_len must equal 0).
+ *
+ * Currently unused by every dispatch table: no-arg commands deliberately keep
+ * CDX_CMD_VAR(0, U16_MAX) to preserve pre-migration permissive lengths for
+ * wire compatibility (see control_vlan.c). These two macros are kept as ready
+ * strict-validation surface. */
 #define CDX_CMD_NOARG(CODE, HANDLER)					\
 	{ .cmd_code = (CODE),						\
 	  .min_len  = 0,						\

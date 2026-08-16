@@ -52,7 +52,7 @@ async def test_iperf_ipv4_tcp_offload(
     await lan_run(
         lan,
         f"nohup iperf3 -c {WAN_IPERF_IP} -t {IPERF_DURATION_S} "
-        f"> /tmp/iperf.log 2>&1 & echo started",
+        f"> /tmp/ask_iperf_offload.log 2>&1 & echo started",
     )
 
     # Give cmm + the FCI offload path a moment to install the flow.
@@ -66,7 +66,7 @@ async def test_iperf_ipv4_tcp_offload(
 
     # Wait for iperf to finish, then fetch the result.
     await asyncio.sleep(IPERF_DURATION_S + 1)
-    log_result = await lan_run(lan, "cat /tmp/iperf.log")
+    log_result = await lan_run(lan, "cat /tmp/ask_iperf_offload.log")
     gbps = _iperf_receiver_gbps(log_result.stdout)
     assert gbps is not None, f"iperf summary missing; log:\n{log_result.stdout}"
     assert gbps >= OFFLOAD_MIN_GBPS, (

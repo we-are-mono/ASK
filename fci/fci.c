@@ -313,7 +313,7 @@ static int fci_fe_register(void)
 {
 	int rc;
 	/* register the FCI module to the FPP Forward Engine */
-	if((rc = comcerto_fpp_register_event_cb((void *)fci_outbound_fe_data)) < 0)
+	if((rc = comcerto_fpp_register_event_cb(fci_outbound_fe_data)) < 0)
 	{
 		printk(KERN_ERR "FCI: fpp_register_event_cb() failed !\n");
 
