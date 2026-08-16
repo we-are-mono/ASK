@@ -1370,34 +1370,24 @@ static void __cmmRouteNew(FCI_CLIENT *fci_handle, struct rtmsg *rtm, unsigned in
 ******************************************************************/
 int cmmRtnlRule(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg)
 {
-	struct fib_rule_hdr *frh;
-	struct rtattr *tb[FRA_MAX + 1];
-
+	/*
+	 * The fib-rule subscription (rth_rule / RTMGRP_IPV4_RULE) exists only to
+	 * drain these messages — policy routing is handled elsewhere via
+	 * cmmPolicyRouting (RT_POLICY). Don't parse attributes we never use; just
+	 * log the message type and continue.
+	 */
 	switch (nlh->nlmsg_type) {
 	case RTM_NEWRULE:
-	case RTM_DELRULE:
+		cmm_print(DEBUG_INFO, "%s: RTM_NEWRULE\n", __func__);
 		break;
-
+	case RTM_DELRULE:
+		cmm_print(DEBUG_INFO, "%s: RTM_DELRULE\n", __func__);
+		break;
 	default:
 		cmm_print(DEBUG_ERROR, "%s: unsupported RULE netlink message %x\n", __func__, nlh->nlmsg_type);
-		goto out;
 		break;
 	}
 
-	frh = NLMSG_DATA(nlh);
-
-	cmm_parse_rtattr(tb, FRA_MAX, FRA_RTA(frh), FRA_PAYLOAD(nlh));
-
-	if (nlh->nlmsg_type == RTM_NEWRULE)
-	{
-		cmm_print(DEBUG_INFO, "%s: RTM_NEWRULE\n", __func__);
-	}
-	else
-	{
-		cmm_print(DEBUG_INFO, "%s: RTM_DELRULE\n", __func__);
-	}
-
-out:
 	return RTNL_CB_CONTINUE;
 }
 

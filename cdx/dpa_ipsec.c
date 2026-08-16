@@ -683,7 +683,12 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 	}
 	return SUCCESS;
 err_ret:
-	/* release FQs allocated so far and mem */
+	/*
+	 * FIXME: leaks the FQs created in the loop above and the associated mem
+	 * on this rare probe-time failure path — no unwind is implemented here
+	 * (unlike the SA setup's err_ret3, which walks sec_fq[] to retire each
+	 * FQ). Filed for a proper unwind; see ISSUES.md.
+	 */
 	return FAILURE;
 }
 

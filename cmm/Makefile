@@ -67,7 +67,7 @@ SRCS := \
 
 OBJS := $(SRCS:%.c=$(BUILDDIR)/%.o)
 
-all: version $(BUILDDIR)/cmm
+all: $(BUILDDIR)/cmm
 
 $(BUILDDIR)/cmm: $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -94,13 +94,8 @@ fuzzer: $(FUZZER_BIN)
 $(FUZZER_BIN): $(FUZZER_SRC) $(SRCDIR)/rtnl_parse.c
 	$(CC) $(FUZZER_CFLAGS) $(LDFLAGS) -o $@ $(FUZZER_SRC) $(SRCDIR)/rtnl_parse.c
 
-version:
-	@if [ -d .git ]; then \
-		V=$$(git describe --always --tags --dirty 2>/dev/null || echo "unknown"); \
-		printf '/* Auto-generated */\n#ifndef VERSION_H\n#define VERSION_H\n#define CMM_VERSION "%s"\n#endif\n' "$$V" > $(SRCDIR)/version.h; \
-	fi
 
 clean:
 	rm -f $(BUILDDIR)/*.o $(BUILDDIR)/cmm $(FUZZER_BIN)
 
-.PHONY: all version clean fuzzer
+.PHONY: all clean fuzzer

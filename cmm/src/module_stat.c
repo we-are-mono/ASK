@@ -845,7 +845,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 	int cmd_type = FPP_STAT_UNKNOWN_CMD;
 	int cpt = tabStart;
 	unsigned int cmdToSend = 0; /* bits field*/
-	char * endptr;
         int rcvBytes = 0;
 	char *pinterface;
 	unsigned short interface;
@@ -994,21 +993,13 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 		if((strcasecmp(keywords[cpt], "maxconn") != 0) &&
 			(strcasecmp(keywords[cpt], "memconn") != 0) )
 			goto help;
-		if(strcasecmp(keywords[cpt], "maxconn") == 0)
-		{
-			if(!keywords[++cpt])
-				goto help;
-
-			strtoul(keywords[cpt], &endptr, 0);
-		}
-		else if ( strcasecmp(keywords[cpt], "memconn") == 0 )
-		{
-			if(!keywords[++cpt])
-				goto help;
-
-			strtoul(keywords[cpt], &endptr, 0);
-		}
-		/* Just Positively acknowledge the command & return without programming FE */
+		/*
+		 * `set stat connection maxconn|memconn <n>` was a Comcerto FPP
+		 * placebo: it parsed the value, discarded it, and positively
+		 * acked without touching the FE (DPAA has no such tunable).
+		 * Report it honestly instead of pretending success.
+		 */
+		cmm_print(DEBUG_STDOUT, "set stat connection: not supported on this platform\n");
 		goto ack_return;
 	}
 #if defined(FLOW_STATS)
