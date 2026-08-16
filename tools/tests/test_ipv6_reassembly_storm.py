@@ -1,12 +1,12 @@
-"""IPv6 reassembly storm — Phase 2 item 2e.
+"""IPv6 reassembly storm.
 
 Mirror of test_reassembly_storm.py for IPv6 fragmentation. Drives a
 storm of IPv6-fragmented UDP packets through the DUT's reassembly
 path; gates on splat_window for sanitizer hits and kmemleak filtered
 to reassembly-symbol needles for in-subsystem leaks.
 
-KASAN-eligible per the Phase 2 plan — same fragment-pool kmalloc
-code path that 1e exercises, just exercised through the IPv6 path.
+KASAN-eligible — same fragment-pool kmalloc code path as the IPv4
+storm, just exercised through the IPv6 path.
 """
 
 from __future__ import annotations

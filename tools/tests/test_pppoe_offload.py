@@ -6,7 +6,7 @@
       end-to-end alive: payload framing matches PPPoECommand layout,
       the kernel pppoe_cache walks correctly, DEREGISTER unwinds without
       splatting. Fast (~3s), no pppd dependency — useful as a smoke
-      test when slice-2's full pppoe_dut_session fixture is unavailable.
+      test when the full pppoe_dut_session fixture is unavailable.
 
 For real-pppd end-to-end + offload coverage see
 [test_pppoe_e2e.py](tools/tests/test_pppoe_e2e.py): Tier A (session

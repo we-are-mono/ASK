@@ -296,7 +296,7 @@ async def test_mcast_8_listener_pagination_roundtrip(
     )
 
 
-# --- Phase 2 item 3d: pagination correctness during live replication -----
+# --- Pagination correctness during live replication -----
 
 async def test_mcast_pagination_during_replication(
     aiohttp_session, target_agent, splat_window,
@@ -315,7 +315,7 @@ async def test_mcast_pagination_during_replication(
     UDP socket sends and netlink chatter, ensuring the cursor's
     behaviour isn't sensitive to incidental kernel/userspace activity
     around it. Concurrent ADD/UPDATE/REMOVE during pagination is
-    already covered by Phase 1's test_concurrent_query_vs_mutator.
+    already covered by test_concurrent_query_vs_mutator.
 
     Traffic shape: one mcast UDP frame every 50 ms for the 2 s window
     around the query. Local scapy from the orchestrator host.
@@ -339,7 +339,7 @@ async def test_mcast_pagination_during_replication(
         def _send_one(seq: int) -> None:
             pkt = (IP(dst=MCAST_DST, ttl=4)
                    / UDP(dport=47210, sport=47211)
-                   / Raw(b"3d_%04d" % seq))
+                   / Raw(b"pg_%04d" % seq))
             send(pkt, count=1, verbose=0)
 
         seq = 0

@@ -54,7 +54,7 @@ ITERS_PER_TASK  = 20
 # on this group, so they all hit MC4_Command_Handler concurrently and
 # the mutex is what keeps members[] consistent.
 SHARED_DST = "239.7.1.1"
-SHARED_SRC = "10.0.0.141"
+SHARED_SRC = os.environ.get("ASK_MCAST_CONCURRENT_SRC", "10.0.0.141")
 
 # Function-name needles in kmemleak backtraces that are unique to the
 # mcast mutation paths (no DPAA softirq baseline overlap).

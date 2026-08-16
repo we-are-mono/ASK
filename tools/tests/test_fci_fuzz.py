@@ -14,7 +14,7 @@ CDX_CMD / CDX_CMD_V / CDX_CMD_NOARG / CDX_CMD_VAR registration in the
 cdx/ tree and cross-references numeric codes from cdx_cmdhandler.h.
 Strict-spec commands (exact-length or bounded-range) get fuzz cases;
 permissive CDX_CMD_VAR(0, U16_MAX) commands are skipped here (ISSUES.md
-A1b item 6 tracks tightening those).
+A1b tracks tightening those).
 
 Error codes (from cdx/fe.h):
     NO_ERR                 = 0

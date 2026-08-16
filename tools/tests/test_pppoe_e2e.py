@@ -1,4 +1,4 @@
-"""Slice-2 end-to-end PPPoE tests via real pppoe-server + pppd.
+"""End-to-end PPPoE tests via real pppoe-server + pppd.
 
 Three tiered tests, each gating on the previous:
 

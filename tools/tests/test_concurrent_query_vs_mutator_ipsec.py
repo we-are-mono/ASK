@@ -35,7 +35,7 @@ async def test_concurrent_query_vs_mutator_ipsec(
         fci_calls=[
             (CMD_IPSEC_SA_ACTION_QUERY, query_sa(ACTION_QUERY)),
             # Mutator-shape: DELETE on a sagd in the test-reserved range
-            # that no slice-1 test creates. Exercises the cache-walk
+            # that no other test creates. Exercises the cache-walk
             # path concurrent with the cursor read.
             (CMD_IPSEC_SA_DELETE, delete_sa(SAGD_BASE + 0x0DEE)),
         ],

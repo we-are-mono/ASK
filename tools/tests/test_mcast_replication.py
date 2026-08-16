@@ -1,4 +1,4 @@
-"""Phase 2 item 3b/3c: multicast data-plane replication correctness.
+"""Multicast data-plane replication correctness.
 
 Asserts that for a multicast group with 3 listeners, *exactly one*
 replicated frame arrives on each listener interface when one
@@ -6,10 +6,10 @@ multicast UDP frame is injected. Tripwire shape: count == 1
 discriminates loudly between drop (0), correct replication (1), and
 double-replication (>=2).
 
-Bug class under test (per the Phase 2 plan): the listeners[]
+Bug class under test: the listeners[]
 iteration loop at cdx/dpa_control_mc.c:443-453 and the uiListenerCnt
 accounting around it. Not asserting multi-physical-port HW
-replication semantics — that's an FMAN/PCD topic outside Phase 2
+replication semantics — that's an FMAN/PCD topic outside this test's
 scope. VLAN-pseudo-ports exercise the listener loop because each
 (target_iface, lan_iface) pair is a distinct entry in
 pMcastGrpInfo->members[].
@@ -54,13 +54,14 @@ from _topology import (
 )
 
 
-# Mcast group + payload conventions
-MCAST_DST_3B = os.environ.get("ASK_MCAST_REPL_DST_3B", "239.7.2.1")
-MCAST_DST_3C = os.environ.get("ASK_MCAST_REPL_DST_3C", "239.7.2.2")
+# Mcast group + payload conventions. The _A/_B env vars fall back to the
+# older _3B/_3C names so existing shell scripts keep working.
+MCAST_DST_A = os.environ.get("ASK_MCAST_REPL_DST_A", os.environ.get("ASK_MCAST_REPL_DST_3B", "239.7.2.1"))
+MCAST_DST_B = os.environ.get("ASK_MCAST_REPL_DST_B", os.environ.get("ASK_MCAST_REPL_DST_3C", "239.7.2.2"))
 MCAST_SRC    = os.environ.get("ASK_WAN_IPERF_IP",      "10.0.0.141")
 MCAST_PORT   = int(os.environ.get("ASK_MCAST_REPL_PORT", "47200"))
-INGRESS_3B   = os.environ.get("ASK_MCAST_INGRESS_WAN", "eth3")
-# 3c's ingress is the source LAN VLAN subif on the DUT — set per
+INGRESS_WAN   = os.environ.get("ASK_MCAST_INGRESS_WAN", "eth3")
+# MCAST_DST_B's ingress is the source LAN VLAN subif on the DUT — set per
 # fixture below since it depends on the listener fixture's vid choice.
 
 # FCI codes/wire layout — same as test_mcast_pagination
@@ -141,7 +142,7 @@ async def mcast_group_wan_ingress(
 
     add = _pack_mc4_command(
         CDX_MC_ACTION_ADD, target_ifaces,
-        dst=MCAST_DST_3B, ingress=INGRESS_3B,
+        dst=MCAST_DST_A, ingress=INGRESS_WAN,
     )
     r = await target_agent.fci_send(
         aiohttp_session, fcode=CMD_MC4_MULTICAST,
@@ -149,7 +150,7 @@ async def mcast_group_wan_ingress(
     )
     assert r.get("reply_rc") == NO_ERR, f"3b mcast ADD failed: {r}"
     await _assert_mc4_has_group(
-        target_agent, aiohttp_session, dst=MCAST_DST_3B,
+        target_agent, aiohttp_session, dst=MCAST_DST_A,
     )
 
     try:
@@ -157,7 +158,7 @@ async def mcast_group_wan_ingress(
     finally:
         rem = _pack_mc4_command(
             CDX_MC_ACTION_REMOVE, target_ifaces,
-            dst=MCAST_DST_3B, ingress=INGRESS_3B,
+            dst=MCAST_DST_A, ingress=INGRESS_WAN,
         )
         r = await target_agent.fci_send(
             aiohttp_session, fcode=CMD_MC4_MULTICAST,
@@ -181,7 +182,7 @@ async def mcast_group_lan_vlan_ingress(
 
     add = _pack_mc4_command(
         CDX_MC_ACTION_ADD, target_ifaces,
-        dst=MCAST_DST_3C, ingress=ingress_iface,
+        dst=MCAST_DST_B, ingress=ingress_iface,
     )
     r = await target_agent.fci_send(
         aiohttp_session, fcode=CMD_MC4_MULTICAST,
@@ -191,7 +192,7 @@ async def mcast_group_lan_vlan_ingress(
         f"3c mcast ADD (ingress={ingress_iface}) failed: {r}"
     )
     await _assert_mc4_has_group(
-        target_agent, aiohttp_session, dst=MCAST_DST_3C,
+        target_agent, aiohttp_session, dst=MCAST_DST_B,
     )
 
     try:
@@ -199,7 +200,7 @@ async def mcast_group_lan_vlan_ingress(
     finally:
         rem = _pack_mc4_command(
             CDX_MC_ACTION_REMOVE, target_ifaces,
-            dst=MCAST_DST_3C, ingress=ingress_iface,
+            dst=MCAST_DST_B, ingress=ingress_iface,
         )
         r = await target_agent.fci_send(
             aiohttp_session, fcode=CMD_MC4_MULTICAST,
@@ -381,7 +382,7 @@ async def test_mcast_replication_one_per_listener_wan_injection(
         await asyncio.sleep(0.4)
         await asyncio.to_thread(
             _send_mcast_from_orchestrator,
-            MCAST_DST_3B, MCAST_PORT, b"mcast_wan",
+            MCAST_DST_A, MCAST_PORT, b"mcast_wan",
         )
         # Wait the rest of the capture window before terminating.
         await asyncio.sleep(2.0)
@@ -438,7 +439,7 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
     )
 
     script = _LAN_INJECT_TEMPLATE.format(
-        src=MCAST_SRC, dst=MCAST_DST_3C, port=MCAST_PORT, lan_if=src_lan_if,
+        src=MCAST_SRC, dst=MCAST_DST_B, port=MCAST_PORT, lan_if=src_lan_if,
     )
 
     await asyncio.sleep(0.3)

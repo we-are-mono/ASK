@@ -1,4 +1,4 @@
-"""Phase 2 topology + counter helpers shared across data-plane edge tests.
+"""Topology + counter helpers shared across data-plane edge tests.
 
 Three concerns colocated here, in order of increasing scope:
 
@@ -11,19 +11,19 @@ Three concerns colocated here, in order of increasing scope:
      assert equality on subsequent runs. A behaviour shift (PCD config
      change, ucode change) fails the test loudly.
 
-  2. ICMP-egress observation. Items 1b / 1c / 2b / 2c assert "the
+  2. ICMP-egress observation. The ICMP edge-case tests assert "the
      kernel emitted an ICMP error" by tcpdumping the DUT's egress
      interface and grep'ing the summary line. tcpdump is already in
      the exec_cmd allowlist; -c 1 + the agent's per-call timeout
      bound the wait without needing a new endpoint.
 
-  3. Multi-listener + multi-port-bridge fixtures. Items 3 and 4 need
-     N parallel VLAN subifs (item 3) and a Linux bridge with N
-     VLAN-pseudo-port members (item 4). Built on the same
+  3. Multi-listener + multi-port-bridge fixtures. These need
+     N parallel VLAN subifs (multi-listener) and a Linux bridge with N
+     VLAN-pseudo-port members (multi-port-bridge). Built on the same
      finalizer-stack discipline as test_vlan_data_plane.py — partial
      setup tears down whatever did come up.
 
-Per the Phase 2 plan: no new agent endpoints, no new exec_cmd allowlist
+By design: no new agent endpoints, no new exec_cmd allowlist
 entries, no /pkt/inject, no pcap storage. Everything here runs on
 existing primitives.
 """
@@ -215,10 +215,8 @@ async def expect_icmp_egress(
     type=3 code=4) that catches mis-tcpdumps where the BPF passes but
     the parsed output reports something unexpected.
 
-    NOTE: signature deviates from the plan's locked
-    expect_icmp_egress(..., icmp_type, icmp_code, ...) form by adding
-    expect_substr alongside (not replacing) the type/code BPF — both
-    layers run for defense-in-depth. See the Phase 2 plan addendum.
+    NOTE: expect_substr runs alongside (not replacing) the
+    icmp_type/icmp_code BPF — both layers run for defense-in-depth.
 
     Returns tcpdump's summary line on success. Raises AssertionError
     if no matching frame is captured within `timeout_s`. The agent-side
@@ -503,7 +501,7 @@ async def lan_run_python(
     return await lan_run(lan, f"python3 {path}", timeout)
 
 
-# DUT and LAN IPv6 addresses for the Phase 2 IPv6 tests. Two ULA /64s
+# DUT and LAN IPv6 addresses for the IPv6 tests. Two ULA /64s
 # (fc00::/7 documentation/private space) — keeps routing self-contained
 # without needing real upstream IPv6 connectivity. ASK_WAN_IPV6 should
 # point into the WAN /64; a destination there has no listener, but the
@@ -517,7 +515,7 @@ TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth3")
 
 @pytest_asyncio.fixture
 async def ipv6_topology(aiohttp_session, target_agent, lan):
-    """Bring up a minimal IPv6 LAN→DUT→WAN topology for Phase 2 item 2
+    """Bring up a minimal IPv6 LAN→DUT→WAN topology for the IPv6
     tests. Tears down all assigned addresses + forwarding flags + routes
     on exit, in reverse order of setup, so partial-setup failures clean
     only what came up.
@@ -660,9 +658,9 @@ async def bridge_with_n_ports(aiohttp_session, target_agent):
     """Linux bridge `br_test_abm` on the DUT with N=2 VLAN-pseudo-port
     members on TARGET_LAN_IF. Yields (bridge_name, [port_iface, ...]).
 
-    Single-physical-link constraint applies — see §Item 4 in the plan
-    for the stimulus-validity gate that must run before this fixture
-    is used to assert anything about BREVENT_PORT_DOWN behaviour.
+    Single-physical-link constraint applies — a stimulus-validity gate
+    must run before this fixture is used to assert anything about
+    BREVENT_PORT_DOWN behaviour.
     """
     bridge = "br_test_abm"
     stack = TopologyStack()
@@ -702,7 +700,7 @@ GOLDEN_DIR = pathlib.Path(__file__).parent / "golden"
 
 
 def golden_for(label_file: str) -> pathlib.Path:
-    """Construct the standard golden path for a Phase 2 test file.
+    """Construct the standard golden path for a test file.
 
     e.g. golden_for('ipv4_edge_options.json') -> tools/tests/golden/ipv4_edge_options.json
     """

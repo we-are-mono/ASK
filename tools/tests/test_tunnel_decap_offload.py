@@ -33,7 +33,7 @@ import pytest_asyncio
 from _topology import lan_run, ipv6_topology  # noqa: F401  (fixture re-export)
 
 DUT_WAN_IPV4 = os.environ.get("ASK_TARGET_IP", "10.0.0.62")
-ORCH_IPV4    = os.environ.get("ASK_WAN_IP", "10.0.0.141")
+ORCH_IPV4    = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
 LAN_NIC      = os.environ.get("ASK_LAN_NIC", "enp4s0")
 # Orchestrator-side NIC that shares the DUT's WAN L2 segment; carries the
 # fc00:beef:: outer for the 4o6 test.

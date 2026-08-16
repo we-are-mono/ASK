@@ -73,7 +73,7 @@ def _payloads() -> list[tuple[str, bytes, int]]:
 
     # Trailing odd byte: parser walks one valid attr, leaves len=1, then
     # the tail `if (len) ... rta->rta_len` reads OOB. This is the bug
-    # class item 8 is locking against — must be a clean exit (the
+    # class under test — must be a clean exit (the
     # fuzzer's volatile read makes ASAN trip).
     out.append(("trailing_byte_after_one_attr",
                 _rtattr(1, b"") + b"\x99", 64))

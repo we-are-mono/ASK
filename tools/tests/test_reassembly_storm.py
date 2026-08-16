@@ -22,7 +22,7 @@ Variants:
 
 Overlapping fragments are intentionally not covered: FMAN's microcode
 behavior under overlap is not contracted and varies by version. The
-pool-saturation scenario from the test plan is folded in via the large
+pool-saturation scenario is folded in via the large
 number of distinct 5-tuples (>= max_contexts for the vendor default
 config of 128), which exercises context eviction under churn.
 """
@@ -165,13 +165,12 @@ async def test_reassembly_fragment_storm(
     )
 
 
-# --- Phase 2 item 1e: fragmentation under concurrent live traffic ---------
+# --- Fragmentation under concurrent live traffic ---------
 #
 # Liveness-only oracle: iperf3 must complete and report non-zero
-# throughput. No Mbps SLA — throughput baselines are deferred to
-# Phase 4 (the roadmap explicitly defers them pending a noise-floor
-# study). The signal here is "the storm doesn't kill the offload path
-# entirely", not "throughput stays at X".
+# throughput. No Mbps SLA — throughput baselines are deferred
+# pending a noise-floor study. The signal here is "the storm doesn't
+# kill the offload path entirely", not "throughput stays at X".
 
 import re as _re
 
@@ -201,7 +200,7 @@ async def test_reassembly_storm_with_concurrent_iperf(
     interleave doesn't collapse the offload path entirely (liveness)
     and doesn't introduce splats or leaks (correctness).
 
-    KASAN-eligible per the Phase 2 plan: the fragment pool kmallocs in
+    KASAN-eligible: the fragment pool kmallocs in
     cdx/cdx_reassm.c are exactly what KASAN catches.
     """
     await target_agent.kmemleak_clear(aiohttp_session)
@@ -214,8 +213,7 @@ async def test_reassembly_storm_with_concurrent_iperf(
     # immediately due to the trailing `&`. iperf3 then runs on the LAN
     # VM concurrently with the storm. We do NOT run two UART commands
     # at once — that would interleave on the serial channel and
-    # corrupt the marker-based exit detection (per Phase 2 plan
-    # §Risks #1).
+    # corrupt the marker-based exit detection.
     await lan_run(
         lan,
         f"nohup iperf3 -c {WAN_IPERF_IP} -t {_IPERF_DURATION_S} "

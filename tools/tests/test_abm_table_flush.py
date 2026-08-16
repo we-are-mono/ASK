@@ -1,10 +1,10 @@
-"""Phase 2 item 4c: L2-flow table flush correctness.
+"""L2-flow table flush correctness.
 
 Toggling /proc/sys/net/abm/abm_l3_filtering between 0 and 1 calls
 abm_l2flow_table_flush() (auto_bridge/auto_bridge.c:1532-1540) which
 walks every l2flow_table[] bucket and unlinks all entries. This is
 the cleanest userspace-driven flush trigger; alternative paths
-(BREVENT_PORT_DOWN per item 4b, abm_max_entries shrink) flush
+(BREVENT_PORT_DOWN, abm_max_entries shrink) flush
 selectively, not whole-table.
 
 Asserts:
@@ -15,8 +15,7 @@ Asserts:
   - kmemleak filtered to abm symbols: zero new leaks from the flush
     or the netlink reset that follows it (abm_nl_send_rst_msg)
 
-KASAN-eligible per the Phase 2 plan — same memory-class teardown
-discipline as 4b.
+KASAN-eligible (memory-class teardown).
 """
 
 from __future__ import annotations

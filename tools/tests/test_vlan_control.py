@@ -145,7 +145,7 @@ async def test_vlan_entry_reset_accepts_empty_payload(
     aiohttp_session, target_agent, splat_window,
 ):
     """CMD_VLAN_ENTRY_RESET (0x0902) uses CDX_CMD_VAR(0, U16_MAX) per
-    ISSUES.md A1b item 6 — accepts any length including 0. Should
+    ISSUES.md A1b — accepts any length including 0. Should
     succeed (NO_ERR) on an empty payload."""
     r = await target_agent.fci_send(
         aiohttp_session,

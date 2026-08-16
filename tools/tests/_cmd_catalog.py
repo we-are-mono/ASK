@@ -15,7 +15,7 @@ Classification:
   PERMISSIVE_CMDS  — CDX_CMD_VAR(0, U16_MAX). Dispatcher doesn't check;
                      handler owns rejection. Skipped by the generic
                      fuzzer — covered by per-subsystem tests instead.
-                     See ISSUES.md A1b item 6.
+                     See ISSUES.md A1b.
 
 The catalog reads from $ASK_SRCROOT (default: two levels up from
 tools/tests/, i.e. the repo root).

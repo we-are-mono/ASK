@@ -51,12 +51,12 @@ from _topology import lan_run, ipv6_topology  # noqa: F401  (fixture re-export)
 
 # Topology constants — defaults match the primary dev site.
 DUT_WAN_IPV4 = os.environ.get("ASK_TARGET_IP",       "10.0.0.62")
-ORCH_IPV4    = os.environ.get("ASK_WAN_IP",          "10.0.0.141")
+ORCH_IPV4    = os.environ.get("ASK_WAN_IPERF_IP",    "10.0.0.141")
 LAN_NIC      = os.environ.get("ASK_LAN_NIC",         "enp4s0")
 
 # Inner-tunnel ULA pair — kept distinct from the LAN/WAN ULAs so the
 # test is identifiable in routing tables and not collide with any
-# Phase 2 ipv6_topology fixture state.
+# ipv6_topology fixture state.
 DUT_TUN_V6   = "fc00:cafe::2"
 ORCH_TUN_V6  = "fc00:cafe::1"
 LAN_V6       = "fc00:dead::2"

@@ -32,7 +32,7 @@ allowlist:
   - name: CMD_RX_L2BRIDGE_QUERY_STATUS
     reason: "cdx-side noop"
   - name: CMD_VLAN_ENTRY_RESET
-    reason: "ISSUES.md A1b item 6; vlan reset accepts any length, handler ignores body"
+    reason: "ISSUES.md A1b; vlan reset accepts any length, handler ignores body"
   - name: CMD_IPV4_RESET
     reason: "wholesale conntrack flush; no body interpretation"
   - name: CMD_IPV6_RESET

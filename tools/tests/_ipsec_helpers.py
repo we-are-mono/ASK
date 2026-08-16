@@ -169,7 +169,7 @@ def create_sa(
 
     dst_ip / src_ip are passed as a single u32 (the v4 case populates
     dst_ip[0]; tests that need v6 should call create_sa_v6 instead — not
-    yet provided since slice-1 v4 coverage is enough).
+    yet provided since v4 coverage is enough).
     """
     return (
         struct.pack("<HH", sagd & 0xFFFF, 0)
@@ -241,7 +241,7 @@ def query_sa(action: int = ACTION_QUERY) -> bytes:
     `action` field to enter the query cursor. The QUERY entry path
     (control_ipsec.c QUERY handler) does not validate other fields before
     walking sa_cache, so an all-zeros payload after the action word is
-    safe — verified empirically at slice-1 implementation time. If a
+    safe — verified empirically. If a
     future kernel change starts validating proto_family or sa_type before
     the cursor walk, tighten this to set the minimal required fields.
     """
@@ -266,7 +266,7 @@ class InstallResult:
 
 
 # Returned by CREATE when CAAM/DPAA infra isn't ready. Empirical — the
-# specific code may need adjustment once we observe slice-1 reality.
+# specific code may need adjustment once we observe real behaviour.
 # ERR_CREATION_FAILED comes from M_ipsec_sa_cache_create returning false,
 # which on this build means the SA cache pool is empty or DPAA isn't up.
 INFRA_CREATE_RC_SET = {ERR_CREATION_FAILED, ERR_NOT_ENOUGH_MEMORY}

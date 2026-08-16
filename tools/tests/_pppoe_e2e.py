@@ -1,4 +1,4 @@
-"""Slice-2 PPPoE end-to-end fixtures.
+"""PPPoE end-to-end fixtures.
 
 Vision-side `pppoe_real_server`: spawns pppoe-server via direct subprocess
 on the orchestrator host. No agent involvement — pppoe-server is too
@@ -11,7 +11,7 @@ assertion message instead of "ppp iface didn't come UP within 20s".
 
 Both fixtures pre-probe their requirements (pppoe-server on vision,
 pppd on DUT) and skip with clear messages if missing — so a fresh dev
-machine or an image without the slice-2 IMAGE_INSTALL change gets a
+machine or an image without the IMAGE_INSTALL change gets a
 graceful skip rather than a confused failure.
 """
 
@@ -60,7 +60,7 @@ async def pppoe_real_server():
     server uselessly when the test image is missing the ppp package.
 
     Yields a config dict; tears down pppoe-server + staged config on
-    exit. Defaults match the slice-2 plan; overridable via env."""
+    exit. Defaults are overridable via env."""
 
     if shutil.which("pppoe-server") is None:
         pytest.skip("pppoe-server not installed on orchestrator")
@@ -205,7 +205,7 @@ async def pppoe_dut_session(pppoe_real_server):
         "nodetach\n"
         "maxfail 3\n"
         "holdoff 2\n"
-        "mtu 1492\n"             # PPPoE overhead — see plan open question 2
+        "mtu 1492\n"             # PPPoE overhead
         "mru 1492\n"
         "lcp-echo-interval 5\n"
         "lcp-echo-failure 3\n"

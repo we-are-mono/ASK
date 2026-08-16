@@ -50,9 +50,9 @@ DST_IP   = 0x0A0A0A02          # 10.10.10.2
 
 # SET_STATE for a synthetic SA fails to push to fast-path (no real iface
 # bound to DST_IP, so cdx_ipsec_add_classification_table_entry can't
-# resolve a netdev). Acceptable for slice-1 — the SA remains in
+# resolve a netdev). Acceptable here — the SA remains in
 # sa_cache_by_h, QUERY finds it, DELETE removes it. Strict-NO_ERR would
-# require slice-2's real-peer fixture.
+# require the real-peer fixture.
 ACCEPTABLE_SET_STATE_RCS = {0, 7}  # NO_ERR, ERR_CREATION_FAILED
 
 

@@ -160,7 +160,7 @@ async def test_ipsec_key_zeroing_after_free(
             f"{CAPTURE_POLL_BUDGET_S}s after DELETE (seq stuck at "
             f"{base_seq}) — final header={header!r}. Either "
             f"cdx_ipsec_sec_sa_context_free was not reached (DELETE handler "
-            f"took an A24b leak path?) or the timer callback did not fire. "
+            f"hit an early-return/leak path?) or the timer callback did not fire."
             f"Inspect dmesg for cdx errors during the run."
         )
 

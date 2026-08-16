@@ -11,8 +11,8 @@ version=15 (also illegal) from LAN. Two oracles run together:
      kernel RX counter). Either outcome is pinned, regression
      catches a future change.
 
-This test is in the KASAN-eligible nightly subset per the Phase 2
-plan: malformed-packet parsers are precisely what KASAN catches.
+This test is in the KASAN-eligible nightly subset: malformed-packet
+parsers are precisely what KASAN catches.
 """
 
 from __future__ import annotations

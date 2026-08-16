@@ -1,4 +1,4 @@
-"""Phase 2 item 4b: bridge port flap under load.
+"""Bridge port flap under load.
 
 Stimulus-validity gate confirmed: br_stp_disable_port emits
 BREVENT_PORT_DOWN under CONFIG_CPE_FAST_PATH (verified =y on the test
@@ -21,7 +21,7 @@ subnet; the DUT's bridge floods the broadcasts to the second pseudo-
 port (eth4.232), which populates l2flow_table[] entries that the
 flap-driven BREVENT walk then sees.
 
-KASAN-eligible per the Phase 2 plan — port-flap teardown is exactly
+KASAN-eligible — port-flap teardown is exactly
 the kind of memory-class code KASAN catches.
 """
 
