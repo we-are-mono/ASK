@@ -20,7 +20,6 @@
 #include "libcmm.h"
 #include "fpp.h"
 #include "cmmd.h"
-#include "voicebuf.h"
 #include "module_tx.h"
 
 int dumpmem(int argc, char *argv[]);
@@ -289,7 +288,7 @@ void cmmClientPrintHelp()
 									"\tmacvlan: Mac-vlan interfaces\n"
 									"\ttunnels: tunnel interfaces\n");
 
-	cmm_print(DEBUG_STDOUT, "\nCommand usage: { msp | dm | prf | tunnel | relay | vlan | pktcapture | icc | ipv4 |ipv6 } <options> \n");
+	cmm_print(DEBUG_STDOUT, "\nCommand usage: { dm | tunnel | relay | vlan | ipv4 |ipv6 } <options> \n");
 
 }
 
@@ -421,11 +420,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 			if(cmmStatSetProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
-		else if (strcasecmp(keywords[1], "expt_queue") == 0)
-		{
-			if(cmmExptSetProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
 		else if (strcasecmp(keywords[1], "ff") == 0)
 		{
 			if(cmmFFControlProcess(keywords, 2, daemon_handle))
@@ -445,12 +439,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		{
 			if(cmmAsymFFSetProcess(keywords, 2, daemon_handle))
 				return -1;
-		}
-		else if (strcasecmp(keywords[1], "config") == 0)
-		{
-			if (cmmAltConfClient(cpt,keywords,2,daemon_handle))
-				return -1;
-
 		}
 		else if (strcasecmp(keywords[1], "ipsec") == 0)
 		{
@@ -475,11 +463,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		else if (strcasecmp(keywords[1], "rtpstats") == 0)
 		{
 			if (cmmRTPStatsSetProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
-		else if (strcasecmp(keywords[1], "voicebuf") == 0)
-		{
-			if (cmmVoiceBufSetProcess(cpt - 2, &keywords[2], daemon_handle))
 				return -1;
 		}
 		else if (strcasecmp(keywords[1], "frag") == 0)
@@ -544,12 +527,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		{
 			/*Call Stat process function*/
 			if(cmmStatShowProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
-		else if (strcasecmp(keywords[1], "expt") == 0)
-		{
-			/*Call QM process function*/
-			if(cmmExptShowProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
 		else if (strcasecmp(keywords[1], "route") == 0)
@@ -715,23 +692,12 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
                 	goto help;
   		}
 	}
-	else if (strncasecmp(keywords[0], "msp",3) ==0)
-	{
-		/* mspmem */
-		if (cmmPrfMem(cpt,keywords,1,daemon_handle))
-			return -1;
-	}
 	else if (strncasecmp(keywords[0], "dm",2) ==0)
 	{
 		if (dumpmem(cpt,keywords))
 			return -1;
 	}
-	else if (strcasecmp(keywords[0],"prf") == 0) 
-	{
-		if (cmmPrfNM(cpt,keywords,1,daemon_handle))
-			return -1;
-	}
-	else if (strcasecmp(keywords[0],"tunnel") == 0) 
+	else if (strcasecmp(keywords[0],"tunnel") == 0)
 	{
 		if (cmm_tunnel_parse_cmd(cpt,keywords,1,daemon_handle))
 			return -1;
@@ -769,70 +735,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 				return -1;
 		}
 	}
-	else if (strcasecmp(keywords[0], "pktcapture") == 0)
-        {
-                if (cpt < 2)
-                        goto help;
-
-                if (strcasecmp(keywords[1], "status") == 0)
-                {
-                        if (PktCapStatProcess(daemon_handle, cpt-2,  &keywords[2]))
-                                return -1;
-                }
-                else if (strcasecmp(keywords[1], "slice") == 0)
-                {
-                        if (PktCapSliceProcess(daemon_handle, cpt-2,&keywords[2]))
-                                return -1;
-                }
-                else if (strcasecmp(keywords[1], "filter") == 0)
-                {
-                        if (PktCapFilterProcess(daemon_handle , cpt-2 , &keywords[2]))
-                                return -1;
-                }
-		else
-		{
-			char buf[128];
-			print_all_gemac_ports(buf, 128);
-			cmm_print(DEBUG_STDOUT, "Command usage: pktcapture [status| slice| filter] [%s] <value>\n", buf);
-		}
-		
-        }
-	else if (strcasecmp(keywords[0], "icc") == 0)
-        {
-                if (cpt < 2)
-                        goto help;
-
-                if (strcasecmp(keywords[1], "reset") == 0)
-                {
-                        if (IccReset(daemon_handle, cpt-2,  &keywords[2]))
-                                return -1;
-                }
-                else if (strcasecmp(keywords[1], "threshold") == 0)
-                {
-                        if (IccThreshold(daemon_handle, cpt-2,&keywords[2]))
-                                return -1;
-                }
-                else if (strcasecmp(keywords[1], "add") == 0)
-                {
-                        if (IccAdd(daemon_handle , cpt-2 , &keywords[2]))
-                                return -1;
-                }
-                else if (strcasecmp(keywords[1], "delete") == 0)
-                {
-                        if (IccDelete(daemon_handle , cpt-2 , &keywords[2]))
-                                return -1;
-                }
-                else if (strcasecmp(keywords[1], "query") == 0)
-                {
-                        if (IccQuery(daemon_handle, cpt-2,&keywords[2]))
-                                return -1;
-                }
-		else
-		{
-			cmm_print(DEBUG_STDOUT, "Command usage: icc [reset | threshold | add | delete | query] <parameters...>\n");
-		}
-		
-        }
 
 	else
 		goto help;
@@ -1094,7 +996,6 @@ int cmmDaemonInit(struct cmm_daemon *ctx)
 		cmm_print(DEBUG_CRIT, "%s::%d: fci_open() failed, %s\n", __func__, __LINE__, strerror(errno));
 		goto err3;
 	}
-	voice_buffer_reset(ctx->fci_handle);
 
 	// Thread for getting cmm client command
 	if (pthread_create(&ctx->pthread, NULL, cmmDaemonThread, ctx) < 0)
@@ -1146,9 +1047,6 @@ void cmmDaemonExit(struct cmm_daemon *ctx)
  *****************************************************************/
 static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len)
 {
-	if ((function_code &  FPP_CMD_TRC_MASK) == FPP_CMD_TRC_VAL)
-		goto FCI_CMD;
-
 	switch (function_code)
 	{
         case CMMD_CMD_IPV4_CONNTRACK:
@@ -1197,12 +1095,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case CMMD_CMD_SOCKET_UPDATE:
 	case CMMD_CMD_SOCKET_SHOW:
 		return socket_daemon(ctx->fci_handle, ctx->fci_key_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
-
-	case CMMD_CMD_VOICE_FILE_LOAD:
-		return voice_file_load(ctx->fci_handle, (cmmd_voice_file_load_cmd_t *)cmd_buf, res_buf, res_len);
-
-	case CMMD_CMD_VOICE_FILE_UNLOAD:
-		return voice_file_unload(ctx->fci_handle, (cmmd_voice_file_unload_cmd_t *)cmd_buf, res_buf, res_len);
 
 	//Bridge commands
 	case FPP_CMD_RX_L2BRIDGE_ENABLE:

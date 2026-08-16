@@ -2217,72 +2217,6 @@ static int cmmMc6Cmd(struct cli_def * cli, const char *command, char *argv[], in
 }
 
 /*****************************************************************
-* cmmMspMem
-*
-*
-******************************************************************/
-static int cmmMspMem(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  /*Call Memory DIsplay function */
-	prfMspMS( globalConf.cli.daemon_handle,argc, argv);
-
-	return CLI_OK;
-}
-/*****************************************************************
-* cmmMspMem
-*
-*
-******************************************************************/
-static int cmmMspMemW(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  /*Call Memory DIsplay function */
-	prfMspMSW( globalConf.cli.daemon_handle,argc, argv);
-
-	return CLI_OK;
-}
-/*****************************************************************
-* cmmMspMem
-******************************************************************/
-static int cmmMspCT(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  /*Call Memory DIsplay function */
-	prfMspCT(globalConf.cli.daemon_handle,argc, argv );
-	return CLI_OK;
-}
-
-/*
-** Performance mesaurement and tracing 
-*/
-/* Busy CPU */
-static int cmmPTBusyCPU(struct cli_def * cli, const char *command, char *argv[], int argc) {
-	prfPTBusyCPU( globalConf.cli.daemon_handle,argc, argv);
-	return CLI_OK;
-}
-/* Tracing/profiling */
-static int cmmPTsetmask(struct cli_def * cli, const char *command, char *argv[], int argc) {
-	prfPTsetmask( globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-static int cmmPTstart(struct cli_def * cli, const char *command, char *argv[], int argc) {
-	prfPTstart(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-static int cmmPTswitch(struct cli_def * cli, const char *command, char *argv[], int argc) {
-	prfPTswitch(globalConf.cli.daemon_handle, argc,argv);
-	return CLI_OK;
-}
-
-static int cmmPTshow(struct cli_def * cli, const char *command, char *argv[], int argc) {
-	prfPTshow(globalConf.cli.daemon_handle, argc,argv);
-	return CLI_OK;
-}
-
-static int cmmPTstatus(struct cli_def * cli, const char *command, char *argv[], int argc) {
-	prfStatus(globalConf.cli.daemon_handle,argc, argv);
-	return CLI_OK;
-}
-
-/*****************************************************************
 * cmmVlan commands
 *
 *
@@ -2301,80 +2235,6 @@ static int cmmVlanCliDelete(struct cli_def *cli, const char *command, char *argv
 
 	return CLI_OK;
 }
-
-
-/*****************************************************************
-* cmmPktCap commands
-*
-*
-******************************************************************/
-static int cmmPktCapSlice(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-	
-  	PktCapSliceProcess(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
-static int cmmPktCapStat(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-  	PktCapStatProcess(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
-
-static int cmmPktCapFilter(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-  	PktCapFilterProcess(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
-
-static int cmmPktCapQuery(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-  	PktCapQueryProcess(cli , globalConf.cli.daemon_handle);
-	return CLI_OK;
-}
-
-
-/*****************************************************************
-* cmmIcc commands
-*
-*
-******************************************************************/
-static int cmmIccReset(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-	
-  	IccReset(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
-static int cmmIccThreshold(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-  	IccThreshold(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
-
-static int cmmIccAdd(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-  	IccAdd(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
-
-static int cmmIccDelete(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-  	IccDelete(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
-
-static int cmmIccQuery(struct cli_def *cli, const char *command, char *argv[], int argc)
-{
-  	IccQuery(globalConf.cli.daemon_handle, argc, argv);
-	return CLI_OK;
-}
-
 
 static int cmmQueryTnlCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
@@ -2498,12 +2358,6 @@ usage:
 	return -1;
 }
 
-int cmmExptCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
-{
-  	/*Call exception path process function*/
- 	cmmExptSetProcess(argv, 0, globalConf.cli.daemon_handle);
-	return CLI_OK;
-}
 
 int cmmRtpCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
 {
@@ -2526,12 +2380,6 @@ int cmmSocket6Cmd(struct cli_def * cli, const char *command, char *argv[], int a
 	return CLI_OK;
 }
 
-int cmmAltConfCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
-{
-  	/*Call AltConf process function*/
- 	cmmAltConfClient(argc, argv, 0, globalConf.cli.daemon_handle);
-	return CLI_OK;
-}
 
 static void cliCallback(struct cli_def *cliHandle, const char *format)
 {
@@ -2680,7 +2528,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 	        cli_register_command(ctx->handle, c, "tx-dscp-to-vlanpcp", cmmDSCPVlanPcpMapQueryCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query DSCP VLAN PCP map configuration");
         	cli_register_command(ctx->handle, c, "secfailstats", cmmSECfailStatsQueryCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query SEC engine failure statistics");
 #endif
-		cli_register_command(ctx->handle, c, "pktcapture", cmmPktCapQuery, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query packet capture config parameters");
 		cli_register_command(ctx->handle, c, "tunnels",cmmQueryTnlCmd , PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query tunnel parameters");
 #ifdef AUTO_BRIDGE
 		cli_register_command(ctx->handle, c, "l2flows", cmmQueryL2FlowCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query L2Flows entries on FPP");
@@ -2707,12 +2554,10 @@ int cmmCliInit(struct cmm_cli *ctx)
 		cli_register_command(ctx->handle, c, "route", cmmSetRouteCLI, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Set Extended Route");
 		cli_register_command(ctx->handle, c, "ff", cmmFFControlCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Enable or disable fast forward");
 		cli_register_command(ctx->handle, c, "stat", cmmStatCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage Statistics (PPPoE, Bridge ...)");
-		cli_register_command(ctx->handle, c, "expt_queue", cmmExptCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage Exception Path Queuing");
 		cli_register_command(ctx->handle, c, "socket", cmmSocketCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage Socket module");
 		cli_register_command(ctx->handle, c, "socket6", cmmSocket6Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage Socket module");
 		cli_register_command(ctx->handle, c, "rtp", cmmRtpCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage RTP-relay module");
 		cli_register_command(ctx->handle, c, "sa_query_timer", cmmDPDSaQueryCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Enable or disable SA query timer");
-		cli_register_command(ctx->handle, c, "config", cmmAltConfCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage Alternate Configuration module");
 		cli_register_command(ctx->handle, c, "bridge", cmmBridgeControlCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage automatic bridging");
 		cli_register_command(ctx->handle, c, "asym_fastforward", cmmAsymFFEnableCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Enable or disable Asymmetric Fast forward");
 	}
@@ -2735,29 +2580,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 	cli_register_command(ctx->handle, NULL, "qm-config", cmmQmConfigCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Reload egress shaper params from <file> (set qm interface/channel; full replace, no assign)");
 #endif /* LS1043 */
 
-	c = cli_register_command(ctx->handle, NULL, "prf",NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
-	if (c)
-	{
-		cli_register_command(ctx->handle, c, "busycpu",cmmPTBusyCPU, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Measure available CPU cycles");
-		cli_register_command(ctx->handle, c, "status", cmmPTstatus, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show status of profiling/CPU measurement");
-		c = cli_register_command(ctx->handle, c, "trace", NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
-		if (c)
-		{
-			cli_register_command(ctx->handle, c, "setmask", cmmPTsetmask, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Set module mask");
-			cli_register_command(ctx->handle, c, "start", cmmPTstart, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Start trace");
-			cli_register_command(ctx->handle, c, "switch", cmmPTswitch, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Stop or switch trace and show inactive trace");
-			cli_register_command(ctx->handle, c, "showtrace", cmmPTshow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show inactive trace");
-		}
-	}
-
-	c = cli_register_command(ctx->handle, NULL, "mspmem",NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
-	if (c)
-	{
-		cli_register_command(ctx->handle, c, "ct", cmmMspCT, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the table of fast forwarded connections");
-		cli_register_command(ctx->handle, c, "bytes", cmmMspMem, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show msp memory in host order");
-		cli_register_command(ctx->handle, c, "words", cmmMspMemW, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show msp memory in network order");
-	}
-
 	c = cli_register_command(ctx->handle, NULL, "vlan",NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
 	if (c)
 	{
@@ -2765,33 +2587,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 		cli_register_command(ctx->handle, c, "delete", cmmVlanCliDelete, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Deregister vlan with fpp");
 		cli_register_command(ctx->handle, c, "show", cmmVlanLocalShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Deregister vlan with fpp");
 	}
-
-	c = cli_register_command(ctx->handle, NULL, "pktcapture", NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
-	if (c)
-	{
-		cli_register_command(ctx->handle, c, "slice", cmmPktCapSlice, PRIVILEGE_UNPRIVILEGED, MODE_EXEC,
-								"Register packet capture size with fpp");
-		cli_register_command(ctx->handle, c, "status", cmmPktCapStat, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, 
-								"Enable/disable packet capture on LAN/WAN with fpp");
-		cli_register_command(ctx->handle, c, "filter", cmmPktCapFilter, PRIVILEGE_UNPRIVILEGED, MODE_EXEC,
-								 "Register first-level-filter string for LAN/WAN with fpp");
-	}
-
-	c = cli_register_command(ctx->handle, NULL, "icc", NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
-	if (c)
-	{
-		cli_register_command(ctx->handle, c, "reset", cmmIccReset, PRIVILEGE_UNPRIVILEGED, MODE_EXEC,
-								"Reset ICC");
-		cli_register_command(ctx->handle, c, "threshold", cmmIccThreshold, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, 
-								"Set ICC threshold values");
-		cli_register_command(ctx->handle, c, "add", cmmIccAdd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC,
-								 "Add ICC table entry");
-		cli_register_command(ctx->handle, c, "delete", cmmIccDelete, PRIVILEGE_UNPRIVILEGED, MODE_EXEC,
-								 "Delete ICC table entry");
-		cli_register_command(ctx->handle, c, "query", cmmIccQuery, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, 
-								"Query ICC table values");
-	}
-
 
 	ctx->sock = socket(AF_INET, SOCK_STREAM, 0);
 	if (ctx->sock < 0)

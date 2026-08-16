@@ -22,12 +22,11 @@ CFLAGS  += -I$(ABM_DIR)/include
 CFLAGS  += -DAUTO_BRIDGE -DLS1043 -DWIFI_ENABLE -DENABLE_EGRESS_QOS
 
 LDFLAGS += -L$(LIBFCI_DIR) -L$(SYSROOT)/lib
-LDLIBS  := -lpthread -lfci -lcli -lpcap $(NFCT_LIBS) -lmnl
+LDLIBS  := -lpthread -lfci -lcli $(NFCT_LIBS) -lmnl
 
 SRCS := \
 	rtnl_parse.c \
 	neighbor_resolution.c \
-	module_expt.c \
 	cmm.c \
 	conntrack.c \
 	ffcontrol.c \
@@ -40,7 +39,6 @@ SRCS := \
 	module_rx.c \
 	module_tx.c \
 	module_qm.c \
-	module_prf.c \
 	module_vlan.c \
 	module_macvlan.c \
 	module_mcast.c \
@@ -56,10 +54,6 @@ SRCS := \
 	module_socket.c \
 	module_rtp.c \
 	module_wifi.c \
-	alt_conf.c \
-	voicebuf.c \
-	module_pktcap.c \
-	module_icc.c \
 	cmm_asym_ff.c \
 	module_ipsec.c \
 	module_ipr.c \

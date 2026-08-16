@@ -214,23 +214,6 @@ typedef struct cmmd_mc4_entry {
 
 
 typedef struct mc_listener  cmmd_mc_listener_t;      
-/*----------------------------------- Voice File ---------------------------------*/
-#define CMMD_CMD_VOICE_FILE_LOAD	0x0820
-#define CMMD_CMD_VOICE_FILE_UNLOAD	0x0821
-
-#define CMMD_VOICE_FILE_MAX_NAMESIZE	240
-
-typedef struct cmmd_voice_file_load_cmd {
-	u_int16_t file_id;
-	u_int16_t payload_type;
-	u_int16_t frame_size;
-	char filename[CMMD_VOICE_FILE_MAX_NAMESIZE];
-} __attribute__((__packed__)) cmmd_voice_file_load_cmd_t;
-
-typedef struct cmmd_voice_file_unload_cmd {
-	u_int16_t file_id;
-} __attribute__((__packed__)) cmmd_voice_file_unload_cmd_t;
-
 /*----------------------------------- Tunnel ---------------------------------*/
 #define CMMD_ERR_TNL_ENTRY_NOT_FOUND	FPP_ERR_TNL_ENTRY_NOT_FOUND
 

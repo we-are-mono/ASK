@@ -10,7 +10,6 @@ echo "Installing cross-compilation toolchain and libraries..."
 sudo apt install -y \
     crossbuild-essential-arm64 \
     libcli-dev:arm64 \
-    libpcap-dev:arm64 \
     libmnl-dev:arm64 \
     libxml2-dev:arm64 \
     libtclap-dev \
