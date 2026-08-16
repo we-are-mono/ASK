@@ -47,8 +47,9 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
 
 # Optional KASAN overlay — flipped on by the user with
 # `KASAN=1 kas build .config.yaml`. The env var is propagated to
-# bitbake via BB_ENV_PASSTHROUGH_ADDITIONS in .config.yaml's
-# local_conf_header. Default builds skip ask-kasan.cfg entirely so
+# bitbake via the kas `env:` block in .config.yaml, which injects it
+# before parse (a local_conf_header assignment would be too late).
+# Default builds skip ask-kasan.cfg entirely so
 # the image stays fast (~13 MB smaller, ~60% faster suite).
 KASAN ??= "0"
 

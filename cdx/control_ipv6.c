@@ -142,7 +142,7 @@ int IPv6_handle_RESET(void)
 {
 	int rc = NO_ERR;
 
-	/* free IPv4 sockets entries */
+	/* free IPv6 sockets entries */
 	SOCKET6_free_entries();
 
 	return rc;

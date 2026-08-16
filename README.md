@@ -103,12 +103,12 @@ The ASK-enabled FMAN microcode (v210.10.1) must be loaded by U-Boot before Linux
 
 | Target | Patch | Purpose |
 |--------|-------|---------|
-| **kernel** | `003-mono-gateway-ask-kernel_linux_6_12.patch` | DPAA/FMAN driver enhancements, IPsec offload, netfilter QoS marking, bridge fast-path, QBMan NAPI |
+| **kernel** | thematic stack `patches/kernel/0[1-9]*.patch` | DPAA/FMAN driver enhancements, IPsec offload, netfilter QoS marking, bridge fast-path, QBMan NAPI |
 | **fmlib** | `01-mono-ask-extensions.patch` | Hash table, IP reassembly, shared scheme support for Frame Manager library |
 | **fmc** | `01-mono-ask-extensions.patch` | Port ID, shared scheme replication, PPPoE field fix, libxml2 compatibility |
 | **libnetfilter-conntrack** | `01-nxp-ask-comcerto-fp-extensions.patch` | Fast-path info attributes and QoS connmark for CMM |
 | **libnfnetlink** | `01-nxp-ask-nonblocking-heap-buffer.patch` | Non-blocking socket mode and heap buffer management for CMM |
-| **iptables** | `001-qosmark-extensions.patch` | QOSMARK/QOSCONNMARK target and match extensions |
+| **iptables** | `iptables-extensions/` sources + kernel patch `060` | QOSMARK/QOSCONNMARK target and match extensions |
 | **ppp** | `01-nxp-ask-ifindex.patch` | Tunnel interface index support for PPP offload |
 | **rp-pppoe** | `01-nxp-ask-cmm-relay.patch` | CMM-aware PPPoE relay |
 

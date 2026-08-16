@@ -1210,8 +1210,8 @@ static  void abm_l2flow_table_flush(void)
 
 /***************************************************************************
 *
-* abm_l2flow_table_flush
-* Small busy loop to wait for already expired timers 
+* abm_l2flow_table_wait_timers
+* Small busy loop to wait for already expired timers
 *
 ****************************************************************************/
 static  __inline void abm_l2flow_table_wait_timers(void)

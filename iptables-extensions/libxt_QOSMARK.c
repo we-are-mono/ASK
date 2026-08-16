@@ -52,7 +52,7 @@ static void qosmark_tg_help(void)
 "  --set-mark value[/mask]   Clear bits in mask and OR value into qosmark\n"
 "  --and-mark bits           Binary AND the qosmark with bits\n"
 "  --or-mark bits            Binary OR the qosmark with bits\n"
-"  --xor-mask bits           Binary XOR the qosmark with bits\n"
+"  --xor-mark bits           Binary XOR the qosmark with bits\n"
 "\n");
 }
 

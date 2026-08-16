@@ -163,7 +163,7 @@ def create_sa(
     mtu: int = 1500,
     dev_mtu: int = 1500,
 ) -> bytes:
-    """Build a 50-byte CommandIPSecCreateSA wire payload.
+    """Build a 48-byte CommandIPSecCreateSA wire payload.
 
     Layout: sagd(U16) rsvd(U16) + IPSec_said{spi(U32) sa_type(U8)
     proto_family(U8) replay_window(U8) flags(U8) dst_ip[4](U32)

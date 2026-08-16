@@ -45,7 +45,7 @@
 #endif
 	#define NEW_IPC		1
 
-/* defining IPSEC_FLOW_CACHE if IPSEC_NO_FLOW_CACHE defined in cmm package makefile */
+/* defining IPSEC_FLOW_CACHE unless IPSEC_NO_FLOW_CACHE is defined in the cmm package makefile */
 #ifndef IPSEC_NO_FLOW_CACHE
 #define	IPSEC_FLOW_CACHE
 #endif

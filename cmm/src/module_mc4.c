@@ -340,7 +340,7 @@ int cmmMc4SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 								sizeof(cmmd_mc4_entry_t) +  (listenerCnt * sizeof(cmmd_mc4_listener_t)), rxbuf.rcvBuffer);	
 							}
 							else
-								showErrorMsg("CMD_MC6_MULTICAST", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
+								showErrorMsg("CMD_MC4_MULTICAST", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
 						}
 
 					}
@@ -386,7 +386,7 @@ int cmmMc4SetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_hand
 				sizeof(cmmd_mc4_entry_t) +  (listenerCnt * sizeof(cmmd_mc4_listener_t)), rxbuf.rcvBuffer);	
 			}
 			else
-				showErrorMsg("CMD_MC6_MULTICAST", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
+				showErrorMsg("CMD_MC4_MULTICAST", ERRMSG_SOURCE_FPP, rxbuf.rcvBuffer);
 		}
 	}
 
