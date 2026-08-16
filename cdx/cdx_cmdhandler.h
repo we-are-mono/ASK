@@ -39,8 +39,6 @@ enum EVENTS {
 // Function codes
 // 0x0000 -> 0x00FF : RX module
 #define 	FC_RX				0x0000
-#define	CMD_RX_ENABLE		0x0001	
-#define	CMD_RX_DISABLE	0x0002	
 #define CMD_RX_L2BRIDGE_ENABLE	0x0008
 #define L2BRIDGE_FIRST_COMMAND	CMD_RX_L2BRIDGE_ENABLE
 #define CMD_RX_L2BRIDGE_ADD	0x0009
@@ -54,7 +52,6 @@ enum EVENTS {
 #define CMD_BRIDGED_ITF_UPDATE			0x0011
 
 #define L2BRIDGE_LAST_COMMAND	CMD_BRIDGED_ITF_UPDATE
-#define CMD_RX_LRO				0x0012
 
 // 0x0100 -> 0x01FF : Ethernet module
 #define 	FC_ETH				0x0001
@@ -119,8 +116,6 @@ enum EVENTS {
 
 // 0x0500 -> 0x05FF : Tx module
 #define FC_TX				0x0005
-#define CMD_TX_ENABLE				0x0501
-#define CMD_TX_DISABLE				0x0502
 #define CMD_PORT_UPDATE				0x0505
 #define CMD_TX_DSCP_VLANPCP_MAP_STATUS		0x0506
 #define CMD_TX_DSCP_VLANPCP_MAP_CFG		0x0507

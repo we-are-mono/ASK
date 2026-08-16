@@ -154,12 +154,11 @@ static void M_tx_port_update(PPortUpdateCommand cmd)
 }
 
 /*
- * CMD_TX_ENABLE / CMD_TX_DISABLE / CMD_PORT_UPDATE share a
- * portid = pcmd[0] and bound-check portid < GEM_PORTS. The
- * dispatcher doesn't pass a group identifier, so each of the
- * three handlers does the check inline. DSCP/VLANPCP-map codes
- * do not use the portid from pcmd[0] and have no such check —
- * matches pre-migration `if (cmd_code < CMD_TX_DSCP_VLANPCP_MAP_STATUS)` gate.
+ * CMD_PORT_UPDATE takes portid = pcmd[0] and bound-checks
+ * portid < GEM_PORTS inline via tx_portid_check() (the dispatcher
+ * passes no group identifier). DSCP/VLANPCP-map codes do not use
+ * the portid from pcmd[0] and have no such check — matches the
+ * pre-migration `if (cmd_code < CMD_TX_DSCP_VLANPCP_MAP_STATUS)` gate.
  */
 static inline U16 tx_portid_check(U16 *pcmd, U32 *portid_out)
 {
@@ -168,36 +167,6 @@ static inline U16 tx_portid_check(U16 *pcmd, U32 *portid_out)
 	if (portid >= GEM_PORTS)
 		return CMD_ERR;
 	*portid_out = portid;
-	return CMD_OK;
-}
-
-static U16 tx_enable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	U32 portid;
-	U16 rc;
-
-	(void)out_reply_len;
-	rc = tx_portid_check((U16 *)pcmd, &portid);
-	if (rc != CMD_OK)
-		return rc;
-	if (cmd_len > 2 && cmd_len > 14) {
-		memcpy(phy_port[portid].mac_addr, &(((U8 *)pcmd)[14]), 6);
-		phy_port[portid].flags |= TX_ENABLED;
-	}
-	return CMD_OK;
-}
-
-static U16 tx_disable_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	U32 portid;
-	U16 rc;
-
-	(void)cmd_len;
-	(void)out_reply_len;
-	rc = tx_portid_check((U16 *)pcmd, &portid);
-	if (rc != CMD_OK)
-		return rc;
-	phy_port[portid].flags &= ~TX_ENABLED;
 	return CMD_OK;
 }
 
@@ -258,8 +227,6 @@ static U16 tx_query_iface_dscp_vlanpcp_map_handle(void *pcmd, U16 cmd_len, U16 *
  * for a larger reply.
  */
 static const struct cdx_cmd_spec tx_cmd_table[] = {
-	CDX_CMD_VAR(CMD_TX_ENABLE,                  sizeof(U16),                    U16_MAX, NULL, tx_enable_handle),
-	CDX_CMD_VAR(CMD_TX_DISABLE,                 sizeof(U16),                    U16_MAX, NULL, tx_disable_handle),
 	CDX_CMD_VAR(CMD_PORT_UPDATE,                sizeof(PortUpdateCommand),      U16_MAX, NULL, tx_port_update_handle),
 	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_STATUS, sizeof(DSCPVlanPCPMapCmd),      U16_MAX, NULL, tx_dscp_vlanpcp_map_status_handle),
 	CDX_CMD_VAR(CMD_TX_DSCP_VLANPCP_MAP_CFG,    sizeof(DSCPVlanPCPMapCmd),      U16_MAX, NULL, tx_dscp_vlanpcp_map_cfg_handle),

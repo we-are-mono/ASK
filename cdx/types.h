@@ -80,9 +80,6 @@ struct physical_port {
 #endif
 };
 
-/*physical_port flags bit fields */
-#define TX_ENABLED		(1 << 0)
-
 #define INLINE	__inline
 
 #if !defined(TRUE)
