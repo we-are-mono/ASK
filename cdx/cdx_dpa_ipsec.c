@@ -52,6 +52,9 @@
 #include "jr.h"
 #include "pdb.h"
 #include "desc_constr.h"
+/* intern.h needs compat.h and regs.h in scope first; pdb.h and
+ * desc_constr.h above already pull them in, so it goes last. */
+#include "intern.h"
 
 #include "misc.h"
 #include "cdx.h"
@@ -445,9 +448,10 @@ static struct notifier_block cdx_ipsec_reboot_nb = {
 
 int cdx_ipsec_init(void)
 {
+	struct caam_drv_private *ctrlpriv;
+
 	printk(KERN_INFO "%s\n", __func__);
 	ipsec_instance = dpa_get_ipsec_instance();
-	sec_era = 4 ;
 	post_sec_out_data_off = ((uint64_t )POST_SEC_OUT_DATA_OFFSET /64);
 	post_sec_in_data_off = ((uint64_t )POST_SEC_IN_DATA_OFFSET / 64);
 	/* get the jr device (caam_jr_alloc returns ERR_PTR, never NULL) */
@@ -456,6 +460,20 @@ int cdx_ipsec_init(void)
 		log_err("Failed to get the job ring device, check the dts\n");
 		jrdev_g = NULL;
 		return -ENODEV;
+	}
+	/* The CAAM controller (the job ring's parent) holds the detected SEC
+	 * era; LS1046A reports era 8. The era gates PDBOPTS_ESP_AOFL in the
+	 * transport-mode decap PDB, a SEC >= 5.3 (era > 4) feature.
+	 * caam_get_era() stores a negative errno when the era cannot be
+	 * discovered, so fall back to the historical value of 4 then. */
+	ctrlpriv = dev_get_drvdata(jrdev_g->parent);
+	sec_era = ctrlpriv->era;
+	if (sec_era < 0) {
+		pr_warn("%s SEC era not reported by CAAM (%d), assuming 4\n",
+				__func__, sec_era);
+		sec_era = 4;
+	} else {
+		printk(KERN_INFO "%s SEC era= %d\n", __func__, sec_era);
 	}
 	register_reboot_notifier(&cdx_ipsec_reboot_nb);
 	printk(KERN_INFO "%s job ring device= %p\n", __func__,jrdev_g);
@@ -1462,8 +1480,7 @@ static void built_decap_extra_material(PSAEntry sa,
 static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma,
-		U32 bytes_to_copy,
-		int sec_era)
+		U32 bytes_to_copy)
 {
 	U32 *desc, *no_sg_jump, *extra_cmds;
 	U32  len, off_b, off_w, opt, stats_off_b, sg_mask;
@@ -1477,15 +1494,9 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 
 	desc = (U32 *)pSec_sa_context->sec_desc->shared_desc;
 
-	if (sec_era == 2) {
-		if (sa->enable_stats)
-			sa->stats_indx = 27;
-		sa->next_cmd_indx = 29;
-	} else {
-		if (sa->enable_stats)
-			sa->stats_indx = 28;
-		sa->next_cmd_indx = 30;
-	}
+	if (sa->enable_stats)
+		sa->stats_indx = 28;
+	sa->next_cmd_indx = 30;
 
 	/* This code only works when SEC is configured to use PTR on 64 bit
 	 * so the Job Descriptor length is 13 words long when DPOWRD is set */
@@ -1520,76 +1531,37 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 	init_sh_desc_pdb(desc, cdx_ipsec_sh_desc_hdr_flags(sa),
 			(sa->next_cmd_indx - 1) * sizeof(uint32_t));
 
-	if (sec_era == 2) {
-		/* disable iNFO FIFO entries for p4080rev2 & ??? */
-		len = 0x10 << LDST_LEN_SHIFT;
-		append_cmd(desc, CMD_LOAD | DISABLE_AUTO_INFO_FIFO | len);
+	/* ????? */
+	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
+	len = 0x10 << LDST_LEN_SHIFT;
+	append_cmd(desc, CMD_LOAD | opt | len);
 
-		/*
-		 * load in IN FIFO the S/G Entry located in the 5th reg after
-		 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
-		 * len = sizeof(S/G entry)
-		 * Offset refers to SRC
-		 */
-		opt   = MOVE_SRC_MATH3 | MOVE_DEST_CLASS1INFIFO;
-		off_b = 127 << MOVE_OFFSET_SHIFT;
-		len   = 49 << MOVE_LEN_SHIFT;
-		append_move(desc, opt | off_b | len);
+	/*
+	 * load in IN FIFO the S/G Entry located in the 5th reg after
+	 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
+	 * len = sizeof(S/G entry)
+	 */
+	opt   = MOVE_SRC_MATH3 | MOVE_DEST_INFIFO_NOINFO;
+	off_b = 127 << MOVE_OFFSET_SHIFT;
+	len   = 49 << MOVE_LEN_SHIFT;
+	append_move(desc, opt | off_b | len);
 
-		/*
-		 * L2 part 1
-		 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
-		 * bytes.
-		 */
-		append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_TYPE_MSG |
-				FIFOLD_CLASS_BOTH | FIFOLD_TYPE_LAST1 |
-				FIFOLD_TYPE_LAST2 | FIFOLD_TYPE_FLUSH1);
+	/*
+	 * L2 part 1
+	 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
+	 * bytes. No information FIFO entry even if automatic
+	 * iNformation FIFO entries are enabled.
+	 */
+	append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_CLASS_BOTH |
+			FIFOLD_TYPE_NOINFOFIFO);
 
-		/*
-		 * Extra word part 1
-		 * Load extra words for this descriptor into the INPUT DATA FIFO
-		 */
-		append_fifo_load(desc, dma_extra_cmds,
-				extra_cmds_len * sizeof(uint32_t),
-				FIFOLD_TYPE_MSG | FIFOLD_CLASS_BOTH |
-				FIFOLD_TYPE_LAST1 | FIFOLD_TYPE_LAST2 |
-				FIFOLD_TYPE_FLUSH1);
-
-		/* enable iNFO FIFO entries */
-		append_cmd(desc, CMD_LOAD | ENABLE_AUTO_INFO_FIFO);
-	} else {
-		/* ????? */
-		opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-		len = 0x10 << LDST_LEN_SHIFT;
-		append_cmd(desc, CMD_LOAD | opt | len);
-
-		/*
-		 * load in IN FIFO the S/G Entry located in the 5th reg after
-		 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
-		 * len = sizeof(S/G entry)
-		 */
-		opt   = MOVE_SRC_MATH3 | MOVE_DEST_INFIFO_NOINFO;
-		off_b = 127 << MOVE_OFFSET_SHIFT;
-		len   = 49 << MOVE_LEN_SHIFT;
-		append_move(desc, opt | off_b | len);
-
-		/*
-		 * L2 part 1
-		 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
-		 * bytes. No information FIFO entry even if automatic
-		 * iNformation FIFO entries are enabled.
-		 */
-		append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_CLASS_BOTH |
-				FIFOLD_TYPE_NOINFOFIFO);
-
-		/*
-		 * Extra word part 1
-		 * Load extra words for this descriptor into the INPUT DATA FIFO
-		 */
-		append_fifo_load(desc, dma_extra_cmds,
-				extra_cmds_len * sizeof(uint32_t),
-				FIFOLD_CLASS_BOTH | FIFOLD_TYPE_NOINFOFIFO);
-	}
+	/*
+	 * Extra word part 1
+	 * Load extra words for this descriptor into the INPUT DATA FIFO
+	 */
+	append_fifo_load(desc, dma_extra_cmds,
+			extra_cmds_len * sizeof(uint32_t),
+			FIFOLD_CLASS_BOTH | FIFOLD_TYPE_NOINFOFIFO);
 
 	/*
 	 * throw away the first part of the S/G table and keep only the buffer
@@ -1700,8 +1672,7 @@ static int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma,
 		uint32_t bytes_to_copy,
-		uint8_t move_size,
-		int sec_era)
+		uint8_t move_size)
 {
 	uint32_t *desc, *no_sg_jump, *extra_cmds;
 	uint32_t len, off_b, off_w, opt, stats_off_b, sg_mask, extra_cmds_len,
@@ -1719,10 +1690,8 @@ static int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
 	if (sa->enable_stats) {
 		sa->stats_indx = sa->next_cmd_indx;
 		sa->next_cmd_indx += 2;
-		if (sec_era != 2) {
-			sa->stats_indx += 1;
-			sa->next_cmd_indx += 1;
-		}
+		sa->stats_indx += 1;
+		sa->next_cmd_indx += 1;
 	}
 
 	/* Set lifetime counter stats offset */
@@ -1745,76 +1714,37 @@ static int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
 	init_sh_desc_pdb(desc, cdx_ipsec_sh_desc_hdr_flags(sa),
 			(sa->next_cmd_indx - 1) * sizeof(uint32_t));
 
-	if (sec_era == 2) {
-		/* disable iNFO FIFO entries for p4080rev2 & ??? */
-		len = 0x10 << LDST_LEN_SHIFT;
-		append_cmd(desc, CMD_LOAD | DISABLE_AUTO_INFO_FIFO | len);
+	/* ????? */
+	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
+	len = 0x10 << LDST_LEN_SHIFT;
+	append_cmd(desc, CMD_LOAD | opt | len);
 
-		/*
-		 * load in IN FIFO the S/G Entry located in the 5th reg after
-		 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
-		 * len = sizeof(S/G entry)
-		 * Offset refers to SRC
-		 */
-		opt   = MOVE_SRC_MATH3 | MOVE_DEST_CLASS1INFIFO;
-		off_b = 127 << MOVE_OFFSET_SHIFT;
-		len   = 49 << MOVE_LEN_SHIFT;
-		append_move(desc, opt | off_b | len);
+	/*
+	 * load in IN FIFO the S/G Entry located in the 5th reg after
+	 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
+	 * len = sizeof(S/G entry)
+	 */
+	opt   = MOVE_SRC_MATH3 | MOVE_DEST_INFIFO_NOINFO;
+	off_b = 127 << MOVE_OFFSET_SHIFT;
+	len   = 49 << MOVE_LEN_SHIFT;
+	append_move(desc, opt | off_b | len);
 
-		/*
-		 * L2 part 1
-		 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
-		 * bytes.
-		 */
-		append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_TYPE_MSG |
-				FIFOLD_CLASS_BOTH | FIFOLD_TYPE_LAST1 |
-				FIFOLD_TYPE_LAST2 | FIFOLD_TYPE_FLUSH1);
+	/*
+	 * L2 part 1
+	 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
+	 * bytes. No information FIFO entry even if automatic
+	 * iNformation FIFO entries are enabled.
+	 */
+	append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_CLASS_BOTH |
+			FIFOLD_TYPE_NOINFOFIFO);
 
-		/*
-		 * Extra word part 1
-		 * Load extra words for this descriptor into the INPUT DATA FIFO
-		 */
-		append_fifo_load(desc, dma_extra_cmds,
-				extra_cmds_len * sizeof(uint32_t),
-				FIFOLD_TYPE_MSG | FIFOLD_CLASS_BOTH |
-				FIFOLD_TYPE_LAST1 | FIFOLD_TYPE_LAST2 |
-				FIFOLD_TYPE_FLUSH1);
-
-		/* enable iNFO FIFO entries */
-		append_cmd(desc, CMD_LOAD | ENABLE_AUTO_INFO_FIFO);
-	} else {
-		/* ????? */
-		opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-		len = 0x10 << LDST_LEN_SHIFT;
-		append_cmd(desc, CMD_LOAD | opt | len);
-
-		/*
-		 * load in IN FIFO the S/G Entry located in the 5th reg after
-		 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
-		 * len = sizeof(S/G entry)
-		 */
-		opt   = MOVE_SRC_MATH3 | MOVE_DEST_INFIFO_NOINFO;
-		off_b = 127 << MOVE_OFFSET_SHIFT;
-		len   = 49 << MOVE_LEN_SHIFT;
-		append_move(desc, opt | off_b | len);
-
-		/*
-		 * L2 part 1
-		 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
-		 * bytes. No information FIFO entry even if automatic
-		 * iNformation FIFO entries are enabled.
-		 */
-		append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_CLASS_BOTH |
-				FIFOLD_TYPE_NOINFOFIFO);
-
-		/*
-		 * Extra word part 1
-		 * Load extra words for this descriptor into the INPUT DATA FIFO
-		 */
-		append_fifo_load(desc, dma_extra_cmds,
-				extra_cmds_len * sizeof(uint32_t),
-				FIFOLD_CLASS_BOTH | FIFOLD_TYPE_NOINFOFIFO);
-	}
+	/*
+	 * Extra word part 1
+	 * Load extra words for this descriptor into the INPUT DATA FIFO
+	 */
+	append_fifo_load(desc, dma_extra_cmds,
+			extra_cmds_len * sizeof(uint32_t),
+			FIFOLD_CLASS_BOTH | FIFOLD_TYPE_NOINFOFIFO);
 
 	/*
 	 * throw away the first part of the S/G table and keep only the buffer
@@ -2375,13 +2305,11 @@ build_extended_shared_desc:
 	if (sa->direction == CDX_DPA_IPSEC_INBOUND)
 		ret = cdx_ipsec_build_extended_decap_shared_descriptor(sa,
 				auth_key_dma,
-				crypto_key_dma, 0, 64,
-				sec_era);
+				crypto_key_dma, 0, 64);
 	else
 		ret = cdx_ipsec_build_extended_encap_shared_descriptor(sa,
 				auth_key_dma,
-				crypto_key_dma, 0 ,
-				sec_era);
+				crypto_key_dma, 0);
 	if (ret < 0) {
 		log_err("Failed to create SEC descriptor for SA with spi %d\n",
 				sa->id.spi);
