@@ -7,14 +7,18 @@ apart from a per-capture cursor dict that lives in app state.
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import platform
 import re
 import secrets
+import select
+import signal
 import socket
 import struct
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from aiohttp import web
@@ -471,15 +475,31 @@ def _run_isolated(
             os._exit(0)
     os.close(w_fd)
     buf = b""
+    deadline = time.monotonic() + timeout_s if timeout_s and timeout_s > 0 else None
+    timed_out = False
     try:
         while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]:
+                    timed_out = True
+                    break
             chunk = os.read(r_fd, 65536)
             if not chunk:
                 break
             buf += chunk
     finally:
         os.close(r_fd)
+    if timed_out:
+        # Child wedged (e.g. stuck in a kernel call) — kill so we neither
+        # block the agent forever nor leak a zombie past the waitpid.
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     os.waitpid(pid, 0)
+    if timed_out:
+        return {"error": f"timed out after {timeout_s}s", "errno": errno.ETIMEDOUT}
     try:
         return pickle.loads(buf)
     except Exception as e:

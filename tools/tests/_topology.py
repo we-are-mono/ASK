@@ -44,15 +44,20 @@ import pytest_asyncio
 
 # ---- VLAN ID conventions -------------------------------------------------
 #
-# Kept out of collision with Phase 1 conventions:
-#   test_vlan_data_plane.py        100  (from ASK_VLAN_ID)
-#   test_vlan_failslab.py          251  (from ASK_VLAN_FAILSLAB_VID)
-#   test_mcast_concurrent.py       241+ (from ASK_MCAST_CONCURRENT_VID)
-#   test_mcast_pagination.py       201..208
+# Every test that creates VLAN subinterfaces on the LAN segment claims its
+# IDs here so they don't collide. pytest runs serially, but teardown races
+# and shared-segment capture still make overlap worth tracking. Claims:
+#   test_vlan_data_plane.py     100          (ASK_VLAN_ID)
+#   test_mcast_pagination.py    201..208     (ASK_MCAST_BASE_VID) + 300 transient
+#   test_mcast_failslab.py      231/232      (ASK_MCAST_FAILSLAB_VID)
+#   test_mcast_concurrent.py    241+         (ASK_MCAST_CONCURRENT_VID)
+#   test_mcast_replication.py   241/242/243  (VLAN_IDS_MCAST)
+#   test_vlan_failslab.py       251          (ASK_VLAN_FAILSLAB_VID)
+#   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
 #
-# Phase 2 uses 241/242/243 (mcast replication — overlaps the concurrent
-# test, but the two never run at the same time and both teardown in
-# their finalizers) and 231/232 (bridge) — both exclusive to this module.
+# Overlaps that are safe only because the pairs never run concurrently and
+# both sides tear down in finalizers: bridge 231/232 vs mcast_failslab
+# 231/232; mcast_replication 241/242/243 vs mcast_concurrent 241+.
 VLAN_IDS_MCAST: tuple[int, int, int]  = (241, 242, 243)
 VLAN_IDS_BRIDGE: tuple[int, int]      = (231, 232)
 

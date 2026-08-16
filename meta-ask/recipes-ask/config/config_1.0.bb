@@ -35,6 +35,18 @@ do_install[file-checksums] += " \
     ${ASK_SRCROOT}/config/fastforward:True \
 "
 
+do_install:prepend() {
+    # sources/fmc/ is gitignored and fetched out-of-band by `make sources`
+    # (the Debian build flow). On a fresh clone that step is easy to miss,
+    # and do_install would otherwise fail deep in an install line with no
+    # hint. Fail early, naming the fix.
+    for f in hxs_pdl_v3.xml cfgdata.xsd netpcd.xsd; do
+        if [ ! -e "${ASK_SRCROOT}/sources/fmc/etc/fmc/config/$f" ]; then
+            bbfatal "config: ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/$f missing — run 'make sources' in the ASK repo first (sources/ is gitignored)."
+        fi
+    done
+}
+
 fakeroot do_install() {
     # Board-specific FMAN port config (consumed by dpa_app / fmc).
     install -d ${D}${sysconfdir}

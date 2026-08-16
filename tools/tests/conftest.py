@@ -117,7 +117,9 @@ async def splat_window(request, aiohttp_session, target_agent, dmesg_allowlist):
     allowlist (golden/dmesg_allowlist.yaml). Test authors should *not*
     add inline filters here — extend the YAML.
     """
-    cap_id = await target_agent.capture_start(aiohttp_session, ifaces=["eth3", "eth4"])
+    wan_if = os.environ.get("ASK_TARGET_WAN_IF", "eth3")
+    lan_if = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
+    cap_id = await target_agent.capture_start(aiohttp_session, ifaces=[wan_if, lan_if])
     yield cap_id
     result = await target_agent.capture_stop(aiohttp_session, cap_id)
     raw = result.get("splats", [])

@@ -1,10 +1,10 @@
 """IPv6 control-plane edge case 2d: extension-header chain.
 
 LAN sends IPv6 packets with a chained sequence of extension headers
-(HopByHop → Routing → Fragment → DestOpt → UDP). Pins the hardware-
-vs-kernel RX-path classification in a golden file; subsequent runs
-assert equality. Tripwire shape — same as 1a/2a — discriminates
-between HW handling and slow-path punt without pre-supposing either.
+(HopByHop, optionally Routing, then DestOpt) ahead of UDP. Pins the
+hardware-vs-kernel RX-path classification in a golden file; subsequent
+runs assert equality. Tripwire shape — discriminates between HW
+handling and slow-path punt without pre-supposing either.
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ def _injection_script(chain_expr: str, n: int) -> str:
         from scapy.all import (
             IPv6, UDP, Raw, send,
             IPv6ExtHdrHopByHop, IPv6ExtHdrRouting,
-            IPv6ExtHdrFragment, IPv6ExtHdrDestOpt, PadN,
+            IPv6ExtHdrDestOpt, PadN,
         )
         pkt = (IPv6(dst="{WAN_IPV6}")
                / {chain_expr}
