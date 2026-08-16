@@ -62,7 +62,6 @@
 	#include "module_qm.h"
 	#include "module_vlan.h"
 	#include "module_mcast.h"
-	#include "module_ipr.h"
 	#include "module_macvlan.h"
 	#include "module_mc4.h"
 	#include "module_mc6.h"

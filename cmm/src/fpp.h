@@ -1202,8 +1202,6 @@ typedef struct fpp_bridged_itf_cmd
 #define FPP_CMD_STAT_TUNNEL_STATUS                      0x0E0D
 #define FPP_CMD_STAT_TUNNEL_ENTRY                       0x0E0E
 #define FPP_CMD_STAT_FLOW                               0x0E0F
-#define FPP_CMD_IPR_V4_STATS                            0x0E10
-#define FPP_CMD_IPR_V6_STATS                            0x0E11
 
 #define FPP_CMM_STAT_RESET                              0x0001
 #define FPP_CMM_STAT_QUERY                              0x0002

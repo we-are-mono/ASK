@@ -56,7 +56,6 @@ SRCS := \
 	module_wifi.c \
 	cmm_asym_ff.c \
 	module_ipsec.c \
-	module_ipr.c \
 	libcmm.c
 
 OBJS := $(SRCS:%.c=$(BUILDDIR)/%.o)

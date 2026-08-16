@@ -2004,24 +2004,6 @@ static int cmmQueryVlanCmd(struct cli_def * cli, const char *command, char *argv
         return CLI_OK;
 }
 
-#if defined(LS1043)
-/*****************************************************************
- * * cmmQueryipr4Cmd
- * *
- * *
- * ******************************************************************/
-static int cmmQueryipr4statsCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  	/*Call ipr process function*/
-	return (cmmIpr4StatsQuery(argv, 0, globalConf.cli.daemon_handle));
-}
-static int cmmQueryipr6statsCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  	/*Call ipr process function*/
-	return (cmmIpr6StatsQuery(argv, 0, globalConf.cli.daemon_handle));
-}
-#endif
-
 /*****************************************************************
  *  * * cmmQueryMc4Cmd
  *   * *
@@ -2514,10 +2496,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 	        cli_register_command(ctx->handle, c, "macvlan", cmmQueryMacVlanCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query Macvlan interfaces on FPP");
 	        cli_register_command(ctx->handle, c, "v6connections", cmmQueryV6CtCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query IPV6Connection entries on FPP");
 	        cli_register_command(ctx->handle, c, "vlan", cmmQueryVlanCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query VLAN entries on FPP");
-#ifdef LS1043
-	        cli_register_command(ctx->handle, c, "ipr4stats", cmmQueryipr4statsCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query ipv4 reassembly statistics");
-	        cli_register_command(ctx->handle, c, "ipr6stats", cmmQueryipr6statsCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query ipv6 reassembly statistics");
-#endif
 	        cli_register_command(ctx->handle, c, "mc4", cmmQueryMc4Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query Multicast IPV4 entries on FPP");
 	        cli_register_command(ctx->handle, c, "mc6", cmmQueryMc6Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query Multicast IPV6 entries on FPP");
         	cli_register_command(ctx->handle, c, "qm", cmmQueryQmCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query QOS configuration on FPP");

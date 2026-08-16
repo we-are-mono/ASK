@@ -636,18 +636,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
                         if(cmmVlanQuery(keywords, 2, daemon_handle))
                                 return -1;
                 }
-#if defined(LS1043)
-                else if (strcasecmp(keywords[1], "ipr4_stats") == 0)
-                {
-                        if(cmmIpr4StatsQuery(keywords, 2, daemon_handle))
-                                return -1;
-                }
-                else if (strcasecmp(keywords[1], "ipr6_stats") == 0)
-                {
-                        if(cmmIpr6StatsQuery(keywords, 2, daemon_handle))
-                                return -1;
-                }
-#endif
 		else if (strcasecmp(keywords[1], "macvlan") == 0)
                 {
                         if(cmmMacVlanQueryProcess(keywords, 2, daemon_handle))
@@ -1078,11 +1066,7 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 
 	case CMMD_CMD_VLAN_ENTRY:
 		return cmmVlanProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
-#if defined (LS1043)
-	case CMMD_CMD_IPR_V4_STATS:
-	case CMMD_CMD_IPR_V6_STATS:
-		return cmmIprStatsProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
-#endif
+
 	case CMMD_CMD_EXTROUTE:
 		return cmmRouteProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, res_buf, res_len);
 								 

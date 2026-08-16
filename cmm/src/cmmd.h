@@ -267,42 +267,6 @@ typedef struct cmmd_vlan_response {
 } __attribute__((__packed__)) cmmd_vlan_response_t;
 
 typedef fpp_vlan_cmd_t cmmd_vlan_cmd_t; 
-/*---------------------------------------- IPR STATS ------------------------------*/
-#define CMMD_CMD_IPR_V4_STATS				FPP_CMD_IPR_V4_STATS
-#define CMMD_CMD_IPR_V6_STATS				FPP_CMD_IPR_V6_STATS
-
-struct ip_reassembly_info {
-	u_int64_t num_frag_pkts;
-        u_int64_t num_reassemblies;
-        u_int64_t num_completed_reassly;
-        u_int64_t num_sess_matches;
-        u_int64_t num_frags_too_small;
-        u_int64_t num_reassm_timeouts;
-        u_int64_t num_overlapping_frags;
-        u_int64_t num_too_many_frags;
-        u_int64_t num_failed_bufallocs;
-        u_int64_t num_failed_ctxallocs;
-        u_int64_t num_fatal_errors;
-        u_int64_t num_failed_ctxdeallocs;
-        u_int32_t table_mask;            //hash mask
-        u_int32_t ipr_timer;             //ipr timer location
-        u_int32_t timeout_val;           //reassembly timeout
-        u_int32_t timeout_fqid;          //fqid for timeout fragments
-        u_int32_t max_frags;             //max allowed sessions per session
-        u_int32_t min_frag_size;         //min frag size other than last
-        u_int32_t max_con_reassm;        //max concurrent reassemblies
-        u_int32_t reassem_bpid;          //buffer pool for re-assembly context
-        u_int32_t reassem_bsize;         //size of buffers in reassem_context
-        u_int32_t frag_bpid;             //buffer pool for re-assembly fragments
-        u_int32_t frag_bsize;            //size of buffers in reassem_bpid
-        u_int32_t timer_tnum;            //timer task number
-        u_int32_t reassly_dbg;           //debug area
-	u_int32_t bucket_base;           //start of hash buckets
-        u_int32_t curr_sessions;         //curr reassembly sessions
-        u_int32_t txc_fqid;              //fqid for handling SG buffers
-};
-
-
 /*---------------------------------------- MACVLAN --------------------------------*/
 #define CMMD_CMD_MACVLAN_ENTRY				FPP_CMD_MACVLAN_ENTRY
 #define CMMD_CMD_MACVLAN_RESET				FPP_CMD_MACVLAN_RESET
