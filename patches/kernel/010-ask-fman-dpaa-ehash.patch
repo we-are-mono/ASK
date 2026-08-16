@@ -1,4 +1,4 @@
-From 05b74379fc515e7b0795b349f5ab51eb73878d4e Mon Sep 17 00:00:00 2001
+From 7185d9c7a867b1fb292207a49ed7274126b51614 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -57,7 +57,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/Makefile      |    7 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 2271 ++++++++++++++---
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |  136 +
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1377 ++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1379 ++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1618 ++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |   13 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 +
@@ -115,7 +115,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 77 files changed, 9775 insertions(+), 561 deletions(-)
+ 77 files changed, 9777 insertions(+), 561 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5030,10 +5030,10 @@ index e3b7016b7f2e..d6a1c9d6b4c9 100644
  #endif /* __FM_CC_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
 new file mode 100644
-index 000000000000..f6d26b9bd6c7
+index 000000000000..a5f9035387ff
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
-@@ -0,0 +1,1377 @@
+@@ -0,0 +1,1379 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5424,8 +5424,9 @@ index 000000000000..f6d26b9bd6c7
 +};
 +
 +extern void *FmMurambaseAddr;
-+static void display_pcd_cc_ad(void *ad);
 +void display_cc_node(void *handle, const char *func_name);
++#if defined(FM_CC_DEBUG) || defined(FM_CC_MURAM_DEBUG)
++static void display_pcd_cc_ad(void *ad);
 +static void display_generic_5_off_ic_gmask(void *ptr);
 +
 +static void display_buf_data(void *dataptr, uint32_t size)
@@ -5444,6 +5445,7 @@ index 000000000000..f6d26b9bd6c7
 +        if (ii % 16)
 +		printk("\n");
 +}
++#endif
 +
 +static inline uint32_t swap_word(uint32_t *ptr)
 +{
