@@ -732,7 +732,7 @@ static int abm_nl_init(void)
 	};
 	abm_nl = netlink_kernel_create(&init_net, NETLINK_L2FLOW, &cfg);
 
-	return 0;
+	return abm_nl ? 0 : -ENOMEM;
 }
 static void abm_nl_exit(void)
 {

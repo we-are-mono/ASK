@@ -1151,7 +1151,7 @@ int cmmRxSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 				        goto help;
 				    endptr = NULL;
 				    tmp = strtoul(keywords[cpt], &endptr, 0);
-				    enableCmd.val1 = tmp;
+				    enableCmd.val2 = tmp;
 				}
 				else
 				    goto help;
@@ -1668,7 +1668,7 @@ static int parse_interface_qinq(char *pstring, unsigned short *pinterface_number
 		{
 			if( !strcmp(interface, glbl_wifi_ff_ifs[i].ifname) &&  glbl_wifi_ff_ifs[i].used )
 			{
-				*pinterface_number = WIFI_PORT0 + 1;
+				*pinterface_number = WIFI_PORT0 + i;
 				break;
 			}
 		}

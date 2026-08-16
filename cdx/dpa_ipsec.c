@@ -611,7 +611,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			}
 
 			/* create FQ for exception packets from ipsec ofline  port */
-			dpa_fq = kzalloc((sizeof(struct dpa_fq)),1);
+			dpa_fq = kzalloc((sizeof(struct dpa_fq)), GFP_KERNEL);
 			if (!dpa_fq) {
 				DPAIPSEC_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
 				return FAILURE;

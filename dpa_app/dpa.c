@@ -283,7 +283,7 @@ static int get_fm_pcd_handle(struct cdx_fman_info *finfo)
 static int get_dist_type(char *name) 
 {
 	uint32_t ii;
-	for (ii = 0; ii < MAX_TABLE_PARAMS; ii++) {
+	for (ii = 0; ii < MAX_DIST_PARAMS; ii++) {
 		if (strstr(name, dist_name[ii].name) == 0)
 			continue;
 		return dist_name[ii].type; 

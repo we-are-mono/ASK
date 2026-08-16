@@ -122,7 +122,6 @@ static int tunnel_parse_cmd(int argc, char ** keywords, daemon_handle_t daemon_h
 	char tnl_type;
 	char ipsec = 0;
 	cmmd_tunnel_t cmmtd_cmd; /* CMM to Deamon command */
-       	char rcvBuffer[1024];
 	union u_rxbuf1024 rxbuf;
 	
 	int rc;
@@ -185,7 +184,7 @@ static int tunnel_parse_cmd(int argc, char ** keywords, daemon_handle_t daemon_h
 		}
 		else if (rxbuf.result != CMMD_ERR_OK) 
 		{
-			showErrorMsg("CMD_TUNNEL_ADD", ERRMSG_SOURCE_CMMD, rcvBuffer);
+			showErrorMsg("CMD_TUNNEL_ADD", ERRMSG_SOURCE_CMMD, rxbuf.rcvBuffer);
 			return -1;
 		}
 

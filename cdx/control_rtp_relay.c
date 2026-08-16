@@ -1177,7 +1177,6 @@ static int RTP_query_stats_common(PRTCPQueryResponse pRTPRep, PRTCPStats pStats)
 static PRTCPStats RTCP_get_stats(PRTCPStats sw_stats, PRTCPStats hw_stats, U32 stats_size)
 {
 	PRTCPStats pStats = NULL;
-	U32 msb32, lsb32 = 0;
 
 	if(hw_stats)
 	{
@@ -1201,8 +1200,7 @@ static PRTCPStats RTCP_get_stats(PRTCPStats sw_stats, PRTCPStats hw_stats, U32 s
 		pStats->num_rx_lost_pkts = be32_to_cpu(pStats->num_rx_lost_pkts);
 		pStats->min_reception_period = be32_to_cpu(pStats->min_reception_period);
 		pStats->max_reception_period = be32_to_cpu(pStats->max_reception_period);
-		msb32 = be32_to_cpu(pStats->average_reception_period << 32); lsb32 = be32_to_cpu(pStats->average_reception_period >> 32);
-		pStats->average_reception_period = msb32 | lsb32;
+		pStats->average_reception_period = be64_to_cpu(pStats->average_reception_period);
 		pStats->num_malformed_pkts = be32_to_cpu(pStats->num_malformed_pkts);
 		pStats->num_expected_pkts = be32_to_cpu(pStats->num_expected_pkts);
 		pStats->num_late_pkts = be32_to_cpu(pStats->num_late_pkts);

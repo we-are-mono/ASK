@@ -929,14 +929,14 @@ static void *cmmDaemonThread(void *data)
 		memset(&res, 0, sizeof(res));
 
 		// msgrcv expects size msgsz as length after msgtype.
-		msgrcv(ctx->queueIdRx, &cmd, (sizeof(cmd) - sizeof(cmd.msg_type)), 0, 0);
+		int rcvd = msgrcv(ctx->queueIdRx, &cmd, (sizeof(cmd) - sizeof(cmd.msg_type)), 0, 0);
 		res.msg_type = cmd.msg_type;
 		dataSize = cmd.length;
 		dataRcvSize = sizeof(res.buf);
 		func = cmd.func;
 		rx_buf = cmd.buf;
 		tx_buf = res.buf;
-		if (dataSize < 0)
+		if (rcvd < 0)
 		{
 			/* Exit if queue id no longer exists */
 			if ((errno == EIDRM) || (errno == ENOENT))

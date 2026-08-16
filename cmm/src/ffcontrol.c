@@ -923,7 +923,7 @@ static int section_vlan_option_hdlr(void *data, int argc, char **argv)
 		{
 		      	globalConf.vlan_policy = PROHIBIT;
 		}
-		else if (strcasecmp(value, "manual"))
+		else if (!strcasecmp(value, "manual"))
 		{
 			globalConf.vlan_policy = MANUAL;
 		}

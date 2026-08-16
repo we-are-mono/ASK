@@ -2071,8 +2071,8 @@ static int insert_remove_l2_hm(struct ins_entry_info *info, uint32_t iif_index, 
 				DPA_ERROR("%s::unable to get stats offset on vlan iface on ingress\n",
 						__func__);
 				return FAILURE;
-				param->stats_offsets[num_entries++] &= ~STATS_WITH_TS;
 			}
+			param->stats_offsets[num_entries++] &= ~STATS_WITH_TS;
 		}
 
 		padding = PAD(num_entries, sizeof(uint32_t));
@@ -2190,7 +2190,7 @@ static int create_nat_hm(struct ins_entry_info *info)
 			return FAILURE;
 		*(info->opcptr) = opcode;
 		info->opcptr++;
-		info->opc_count--;
+		info->opc_count++;
 		natport = (struct en_ehash_update_port *)info->paramptr;
 
 		natport->sport = (info->nat_sport);
@@ -2332,7 +2332,7 @@ static int create_tunnel_insert_hm(struct ins_entry_info *info)
 	ptr->word_1 = cpu_to_be32(word);
 	*(info->opcptr) = INSERT_L3_HDR;
 	info->opcptr++;
-	info->opc_count--;
+	info->opc_count++;
 	info->param_size -= size;
 	info->paramptr += size;
 	return SUCCESS;
@@ -2383,7 +2383,7 @@ static int create_tunnel_remove_hm(struct ins_entry_info *info)
 	//update opcode and param ptr
 	*(info->opcptr) = REMOVE_FIRST_IP_HDR;
 	info->opcptr++;
-	info->opc_count--;
+	info->opc_count++;
 	info->param_size -= sizeof(struct en_ehash_remove_first_ip_hdr);
 	info->paramptr += sizeof(struct en_ehash_remove_first_ip_hdr);
 	return SUCCESS;
@@ -2413,7 +2413,7 @@ static int create_preemptive_checks_hm(struct ins_entry_info *info)
 	param = (struct en_ehash_preempt_op *)info->paramptr;
 	*(info->opcptr) = PREEMPTIVE_CHECKS_ON_PKT;
 	info->opcptr++;
-	info->opc_count--;
+	info->opc_count++;
 	info->preempt_params = info->paramptr;
 	info->param_size -= sizeof(struct en_ehash_preempt_op);
 	info->paramptr += sizeof(struct en_ehash_preempt_op);
@@ -2453,7 +2453,7 @@ static int create_ipsec_preemptive_checks_hm(struct ins_entry_info *info, uint32
 	param->natt_arr_mask = cpu_to_be16(0x1 << 0);
 	*(info->opcptr) = PREEMPTIVE_CHECKS_ON_IPSEC_PKT;
 	info->opcptr++;
-	info->opc_count--;
+	info->opc_count++;
 	info->preempt_params = info->paramptr;
 	info->param_size -= sizeof(struct en_ehash_ipsec_preempt_op);
 	info->paramptr += sizeof(struct en_ehash_ipsec_preempt_op);
@@ -2509,7 +2509,7 @@ static int create_eth_rx_stats_hm(struct ins_entry_info *info, uint32_t iif_inde
 	//update opcode and param ptr
 	*(info->opcptr) = UPDATE_ETH_RX_STATS;
 	info->opcptr++;
-	info->opc_count--;
+	info->opc_count++;
 	info->param_size -= sizeof(struct en_ehash_update_ether_rx_stats);
 	info->paramptr += sizeof(struct en_ehash_update_ether_rx_stats);
 #endif
