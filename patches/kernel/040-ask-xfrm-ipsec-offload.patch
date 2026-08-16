@@ -1,4 +1,4 @@
-From 84b14175a8682ef3bf462b294b80dc9c974d71ea Mon Sep 17 00:00:00 2001
+From 85ae91e7edbc14ae3fd23184ad70b25b6c32abeb Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -28,22 +28,22 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/crypto/caam/pdb.h    |  12 +-
  include/net/ip6_tunnel.h     |   4 +-
  include/net/netns/xfrm.h     |   3 +
- include/net/xfrm.h           |  59 +++
+ include/net/xfrm.h           |  30 ++
  include/uapi/linux/pfkeyv2.h |   1 +
  net/ipv4/Kconfig             |   6 +
  net/ipv4/xfrm4_policy.c      |  13 +
  net/ipv6/Kconfig             |   6 +
  net/ipv6/xfrm6_policy.c      |  10 +
- net/key/af_key.c             | 907 +++++++++++++++++++++++++++++++++++
+ net/key/af_key.c             | 885 +++++++++++++++++++++++++++++++++++
  net/xfrm/Makefile            |   1 +
- net/xfrm/ipsec_flow.c        | 221 +++++++++
+ net/xfrm/ipsec_flow.c        | 231 +++++++++
  net/xfrm/ipsec_flow.h        |  31 ++
  net/xfrm/xfrm_input.c        |  20 +
  net/xfrm/xfrm_output.c       |  95 ++++
  net/xfrm/xfrm_policy.c       |  90 ++++
  net/xfrm/xfrm_state.c        | 218 +++++++++
  net/xfrm/xfrm_user.c         |   4 +
- 18 files changed, 1694 insertions(+), 7 deletions(-)
+ 18 files changed, 1653 insertions(+), 7 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -135,7 +135,7 @@ index 23dd647fe024..9c7c9758e5e1 100644
  	struct hlist_head	 __percpu *state_cache_input;
  	unsigned int		state_hmask;
 diff --git a/include/net/xfrm.h b/include/net/xfrm.h
-index 1484dd15a369..06a0fc04ad66 100644
+index 1484dd15a369..b91a74c0d7d2 100644
 --- a/include/net/xfrm.h
 +++ b/include/net/xfrm.h
 @@ -183,6 +183,12 @@ struct xfrm_state {
@@ -189,42 +189,6 @@ index 1484dd15a369..06a0fc04ad66 100644
  
  /* callback structure passed from either netlink or pfkey */
  struct km_event {
-@@ -1114,6 +1144,35 @@ struct sec_path {
- 
- struct sec_path *secpath_set(struct sk_buff *skb);
- 
-+#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+struct xfrm_input_shared
-+{
-+	struct sk_buff 		*skb;
-+	int 			xfrm_nr, first, xfrm_encap;
-+	struct xfrm_state 	*xfrm_vec[XFRM_MAX_DEPTH];
-+	__u16 			encap_type;
-+	int 			decaps;
-+	u32			seq, spi;
-+	unsigned int   nhoff;
-+	int 			nexthdr;
-+	int 			(*callback)(struct xfrm_input_shared *sh);
-+	atomic_t		refcnt;
-+};
-+
-+
-+static inline void xfrm_shared_get(struct xfrm_input_shared *sh)
-+{
-+	atomic_inc(&sh->refcnt);
-+}
-+
-+static inline void xfrm_shared_put(struct xfrm_input_shared *sh)
-+{
-+	if (atomic_dec_and_test(&sh->refcnt)) {
-+		kfree(sh);
-+	}
-+}
-+#endif
-+
- static inline void
- secpath_reset(struct sk_buff *skb)
- {
 diff --git a/include/uapi/linux/pfkeyv2.h b/include/uapi/linux/pfkeyv2.h
 index 8abae1f6749c..e92494a1ac99 100644
 --- a/include/uapi/linux/pfkeyv2.h
@@ -317,7 +281,7 @@ index 1f19b6f14484..090c1456274f 100644
  
  	err = dst->error;
 diff --git a/net/key/af_key.c b/net/key/af_key.c
-index c56bb4f451e6..25c5fb62195d 100644
+index c56bb4f451e6..2ae30dbcf698 100644
 --- a/net/key/af_key.c
 +++ b/net/key/af_key.c
 @@ -26,8 +26,178 @@
@@ -546,7 +510,7 @@ index c56bb4f451e6..25c5fb62195d 100644
  	if (atomic_read(&net_pfkey->socks_nr) == 0)
  		return 0;
  
-@@ -3863,6 +4052,713 @@ static struct xfrm_mgr pfkeyv2_mgr =
+@@ -3863,6 +4052,691 @@ static struct xfrm_mgr pfkeyv2_mgr =
  	.is_alive	= pfkey_is_alive,
  };
  
@@ -615,13 +579,11 @@ index c56bb4f451e6..25c5fb62195d 100644
 +	msg = (struct nlkey_msg *)NLMSG_DATA(nlh);
 +	payload_len = skb->len - NLMSG_HDRLEN - NLKEY_HDR_LEN;
 +
-+	//printk(KERN_INFO "ipsec_nlkey_rcv fcode: 0x%x length: %d bytes\n",msg->fcode,msg->length);
 +
 +	/* process command received from user space */
 +	switch(msg->fcode)
 +	{
 +		case NLKEY_FLOW_REMOVE:
-+			//printk(KERN_INFO "ipsec_nlkey_rcv NLKEY_FLOW_REMOVE\n");
 +			if (payload_len < sizeof(struct flowi) + 2 * sizeof(unsigned short))
 +				break;
 +			p = msg->payload;
@@ -632,7 +594,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +
 +		case NLKEY_SA_NOTIFY:
-+			//printk(KERN_INFO "ipsec_nlkey_rcv NLKEY_SA_NOTIFY\n");
 +			if (payload_len < sizeof(struct nlkey_sa_notify))
 +				break;
 +			memcpy(&sa_notify_msg, msg->payload, sizeof(struct nlkey_sa_notify));
@@ -691,7 +652,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			}
 +			break;
 +		default:
-+			//printk(KERN_INFO "ipsec_nlkey_rcv fcode 0x%x not supported\n", msg->fcode);
 +			break;
 +	}
 +
@@ -737,7 +697,7 @@ index c56bb4f451e6..25c5fb62195d 100644
 +
 +	tos = xfrm_get_tos(&fl, x->props.family);
 +	if (tos < 0) {
-+		printk(KERN_ERR "%s:%d: FIXME\n",__func__,__LINE__);	
++		pr_err_ratelimited("ipsec_nlkey: xfrm_get_tos failed (family %u)\n", x->props.family);
 +		rc = -1;
 +		goto error;
 +	}
@@ -747,7 +707,7 @@ index c56bb4f451e6..25c5fb62195d 100644
 +		case AF_INET:
 +			if (!__ip_route_output_key(net, &(fl.u.ip4)))
 +			{
-+				printk(KERN_ERR "%s:%d:  FIXME\n",__func__,__LINE__);
++				pr_err_ratelimited("ipsec_nlkey: IPv4 route lookup failed\n");
 +				rc = -1;
 +				goto error;
 +			}
@@ -758,7 +718,7 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			rt = rt6_lookup(net, &fl.u.ip6.daddr, NULL, 0, NULL, 0);
 +			if ((!rt) || (!rt->dst.dev))
 +			{
-+				printk(KERN_ERR "%s:%d: FIXME\n",__func__,__LINE__);
++				pr_err_ratelimited("ipsec_nlkey: IPv6 route lookup failed\n");
 +				rc = -1;
 +				goto error;
 +			}
@@ -778,7 +738,7 @@ index c56bb4f451e6..25c5fb62195d 100644
 +		dst = __xfrm_dst_lookup(x->props.family, &params);
 +	}
 +	if (IS_ERR(dst)) {
-+		printk(KERN_ERR "%s:%d: FIXME\n",__func__,__LINE__);
++		pr_err_ratelimited("ipsec_nlkey: xfrm dst lookup failed (%ld)\n", PTR_ERR(dst));
 +		rc = -1;
 +		goto error;
 +	}
@@ -818,12 +778,10 @@ index c56bb4f451e6..25c5fb62195d 100644
 +	memset(&msg, 0, sizeof(struct nlkey_msg));
 +	msg.fcode = *msg_id;
 +	
-+	//printk(KERN_INFO "\n\nipsec_xfrm2nlkey: processing event 0x%x\n", msg.fcode);
 +
 +	switch (msg.fcode)
 +	{
 +		case NLKEY_SA_CREATE:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SA_CREATE\n");
 +			if(x) {
 +				/* some check before builing message */
 +				if(x->id.proto != IPPROTO_ESP) {
@@ -857,7 +815,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +
 +		case NLKEY_SA_SET_KEYS:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SA_SET_KEYS\n");
 +			if(keys) {
 +				memset(&sa_set_keys_msg, 0, sizeof(struct nlkey_sa_set_keys));
 +
@@ -871,7 +828,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = x->props.aalgo;
 +						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_type = 0;
 +						memcpy(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key, x->aalg->alg_key,(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits / 8));
-+						//printk(KERN_INFO "ipsec_xfrm2nlkey: AUTH - algo %d key %d bits\n", sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg, sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits);
 +						sa_set_keys_msg.num_keys++;
 +					}
 +				}
@@ -883,7 +839,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg = x->props.ealgo;
 +						sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_type = 1;
 +						memcpy(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key, x->ealg->alg_key,(sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits / 8));
-+						//printk(KERN_INFO "ipsec_xfrm2nlkey: ENCRYPT - algo %d key %d bits\n", sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_alg, sa_set_keys_msg.keys[sa_set_keys_msg.num_keys].key_bits);
 +						sa_set_keys_msg.num_keys++;
 +					}
 +				}
@@ -934,7 +889,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +
 +		case NLKEY_SA_SET_TUNNEL:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SA_SET_TUNNEL\n");
 +			if(tunnel && (x->props.mode == XFRM_MODE_TUNNEL)) {
 +				memset(&sa_set_tunnel_msg, 0, sizeof(struct nlkey_sa_set_tunnel));
 +
@@ -960,8 +914,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +					top_iph->hop_limit = 64;
 +					memcpy(&top_iph->daddr, x->id.daddr.a6, sizeof(struct in6_addr));
 +					memcpy(&top_iph->saddr, x->props.saddr.a6, sizeof(struct in6_addr));
-+					//printk(KERN_INFO "ipsec_xfrm2nlkey: IPv6 tunnel\n");
-+					//printk(KERN_INFO "dst: %x %x %x %x\n", x->id.daddr.a6[0], x->id.daddr.a6[1], x->id.daddr.a6[2], x->id.daddr.a6[3]);
 +					//(KERN_INFO "src: %x %x %x %x\n", x->props.saddr.a6[0], x->props.saddr.a6[1], x->props.saddr.a6[2], x->props.saddr.a6[3]);
 +				}
 +				else {
@@ -973,7 +925,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +					top_iph->ttl = 64;
 +					top_iph->saddr = x->props.saddr.a4;
 +					top_iph->daddr = x->id.daddr.a4;
-+					//printk(KERN_INFO "ipsec_xfrm2nlkey: IPv4 tunnel dst:%x - src:%x \n", x->id.daddr.a4, x->props.saddr.a4);
 +				}
 +				memcpy(msg.payload, &sa_set_tunnel_msg, sizeof(struct nlkey_sa_set_tunnel));
 +				msg.length = sizeof(struct nlkey_sa_set_tunnel);
@@ -985,7 +936,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +
 +		case NLKEY_SA_SET_NATT:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SA_SET_NATT\n");
 +			if((natt) && (x->encap)){
 +				memset(&sa_set_natt_msg, 0, sizeof(struct nlkey_sa_set_natt));
 +
@@ -993,7 +943,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +				sa_set_natt_msg.sagd = x->handle; 
 +				sa_set_natt_msg.sport = x->encap->encap_sport;
 +				sa_set_natt_msg.dport = x->encap->encap_dport;
-+				//printk(KERN_INFO "src port: %d  dst port: %d \n", ntohs(sa_set_natt_msg.sport), ntohs( sa_set_natt_msg.dport));
 +				memcpy(msg.payload, &sa_set_natt_msg, sizeof(struct nlkey_sa_set_natt));
 +				msg.length = sizeof(struct nlkey_sa_set_natt);
 +				*msg_id = NLKEY_SA_SET_LIFETIME; /* next message */
@@ -1004,7 +953,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +
 +		case NLKEY_SA_SET_LIFETIME:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SA_SET_LIFETIME\n");
 +			if(lifetime) {
 +				memset(&sa_set_lifetime_msg, 0, sizeof(struct nlkey_sa_set_lifetime));
 +
@@ -1035,7 +983,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +
 +		case NLKEY_SA_SET_STATE:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SET_STATE\n");
 +			if(state) {
 +				memset(&sa_set_state_msg, 0, sizeof(struct nlkey_sa_set_state));
 +				memset(&sa_id_msg, 0, sizeof(struct nlkey_sa_id));
@@ -1045,7 +992,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +				sa_set_state_msg.parent_sa_sagd = x->parent_sa_handle;
 +				/* State */
 +				sa_set_state_msg.state = x->km.state;
-+				// TODO: set the offloaded state once ack received !
 +
 +				memcpy(msg.payload, &sa_set_state_msg, sizeof(struct nlkey_sa_set_state));
 +				msg.length = sizeof(struct nlkey_sa_set_state);
@@ -1057,7 +1003,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +		
 +		case NLKEY_SA_DELETE:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SA_DELETE\n");
 +			memset(&sa_delete_msg, 0, sizeof(struct nlkey_sa_delete));
 +			
 +			/* SA global handler */
@@ -1070,7 +1015,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +			break;
 +
 +		case NLKEY_SA_FLUSH:
-+			//printk(KERN_INFO "ipsec_xfrm2nlkey: NLKEY_SA_FLUSH\n");
 +			/* No data required for flush SA command */
 +
 +			*msg_id = NLKEY_NULL_MSG; /* next message */
@@ -1140,7 +1084,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +	unsigned short *p;
 +	gfp_t allocation = GFP_ATOMIC; //This may called from atomic context
 +
-+	//printk(KERN_INFO "ipsec_nlkey_flow \n");
 +
 +	/* next message to build */
 +	memset(&msg, 0, sizeof(struct nlkey_msg));
@@ -1200,7 +1143,6 @@ index c56bb4f451e6..25c5fb62195d 100644
 +	gfp_t allocation = GFP_ATOMIC; //This may called from atomic context
 +
 +	
-+	//printk(KERN_INFO "ipsec_nlkey_flow_remove\n");
 +
 +	/* next message to build */
 +	memset(&msg, 0, sizeof(struct nlkey_msg));
@@ -1260,7 +1202,7 @@ index c56bb4f451e6..25c5fb62195d 100644
  static int __net_init pfkey_net_init(struct net *net)
  {
  	struct netns_pfkey *net_pfkey = net_generic(net, pfkey_net_id);
-@@ -3897,6 +4793,11 @@ static void __exit ipsec_pfkey_exit(void)
+@@ -3897,6 +4771,11 @@ static void __exit ipsec_pfkey_exit(void)
  	sock_unregister(PF_KEY);
  	unregister_pernet_subsys(&pfkey_net_ops);
  	proto_unregister(&key_proto);
@@ -1272,7 +1214,7 @@ index c56bb4f451e6..25c5fb62195d 100644
  }
  
  static int __init ipsec_pfkey_init(void)
-@@ -3913,6 +4814,12 @@ static int __init ipsec_pfkey_init(void)
+@@ -3913,6 +4792,12 @@ static int __init ipsec_pfkey_init(void)
  	if (err != 0)
  		goto out_unregister_pernet;
  	xfrm_register_km(&pfkeyv2_mgr);
@@ -1296,10 +1238,10 @@ index 512e0b2f8514..e8e13e0fd593 100644
 +obj-$(CONFIG_INET_IPSEC_OFFLOAD) += ipsec_flow.o
 diff --git a/net/xfrm/ipsec_flow.c b/net/xfrm/ipsec_flow.c
 new file mode 100644
-index 000000000000..55f5a3856888
+index 000000000000..61e8b22f23fa
 --- /dev/null
 +++ b/net/xfrm/ipsec_flow.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,231 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/* Maintain IPSec flow table for ASK fast path
 + *
@@ -1453,6 +1395,16 @@ index 000000000000..55f5a3856888
 +	u32 hash;
 +
 +	ft = &ipsec_flow_table_global;
++
++	/*
++	 * The IPsec flow-cache is dead scaffolding: ipsec_flow_init() only runs
++	 * under #ifdef IPSEC_FLOW_CACHE, which is defined nowhere, so hash_table
++	 * stays NULL. NLKEY_FLOW_REMOVE (fcode 0x0A12) is the one caller not
++	 * itself behind that ifdef — guard it so a CAP_NET_ADMIN sender can't
++	 * oops the kernel walking a NULL table.
++	 */
++	if (!ft->hash_table)
++		return 0;
 +
 +
 +	keysize = flow_key_size(family);

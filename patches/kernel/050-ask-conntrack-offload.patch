@@ -1,4 +1,4 @@
-From 695e001527a8aa613f68461aef73307d1bfa7639 Mon Sep 17 00:00:00 2001
+From f5bcdbab7d6cef22357ae27a4838a615b6871185 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 23 Apr 2026 17:55:41 +0200
 Subject: [PATCH] ask: conntrack offload notifications
@@ -14,17 +14,17 @@ UAPI additions: nf_conntrack_common.h, nfnetlink_conntrack.h.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/net/netfilter/nf_conntrack.h          |  52 ++++-
+ include/net/netfilter/nf_conntrack.h          |  50 ++++-
  .../linux/netfilter/nf_conntrack_common.h     |  11 +-
  .../linux/netfilter/nfnetlink_conntrack.h     |  18 ++
- net/netfilter/nf_conntrack_core.c             |  75 +++++++-
- net/netfilter/nf_conntrack_netlink.c          | 181 +++++++++++++++++-
+ net/netfilter/nf_conntrack_core.c             |  28 ++-
+ net/netfilter/nf_conntrack_netlink.c          | 177 +++++++++++++++++-
  net/netfilter/nf_conntrack_proto_tcp.c        |   4 +
  net/netfilter/nf_conntrack_standalone.c       |  13 ++
- 7 files changed, 350 insertions(+), 4 deletions(-)
+ 7 files changed, 297 insertions(+), 4 deletions(-)
 
 diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
-index 8cb70e7485e2..846d19ff054f 100644
+index 8cb70e7485e2..75535c6f57fd 100644
 --- a/include/net/netfilter/nf_conntrack.h
 +++ b/include/net/netfilter/nf_conntrack.h
 @@ -24,6 +24,11 @@
@@ -117,13 +117,11 @@ index 8cb70e7485e2..846d19ff054f 100644
  {
  	return (__s32)(READ_ONCE(ct->timeout) - nfct_time_stamp) <= 0;
  }
-@@ -337,6 +382,11 @@ static inline void nf_ct_offload_timeout(struct nf_conn *ct)
+@@ -337,6 +382,9 @@ static inline void nf_ct_offload_timeout(struct nf_conn *ct)
  
  struct kernel_param;
  
 +#if defined(CONFIG_CPE_FAST_PATH)
-+extern int nf_conntrack_set_dpi_allow_report(struct sk_buff *skb);
-+extern int nf_conntrack_set_dpi_allow_and_mark(struct sk_buff *skb, int mark);
 +#endif
 +
  int nf_conntrack_set_hashsize(const char *val, const struct kernel_param *kp);
@@ -202,19 +200,18 @@ index c2ac7269acf7..977b7ba64b7c 100644
  	CTA_STATS_UNSPEC,
  	CTA_STATS_SEARCHED,	/* no longer used */
 diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
-index f5bde4f13958..cfb67c09add4 100644
+index f5bde4f13958..caad335d9823 100644
 --- a/net/netfilter/nf_conntrack_core.c
 +++ b/net/netfilter/nf_conntrack_core.c
-@@ -10,7 +10,7 @@
+@@ -10,7 +10,6 @@
   */
  
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 -
-+#include <linux/version.h>
  #include <linux/types.h>
  #include <linux/netfilter.h>
  #include <linux/module.h>
-@@ -1696,6 +1696,14 @@ __nf_conntrack_alloc(struct net *net,
+@@ -1696,6 +1695,14 @@ __nf_conntrack_alloc(struct net *net,
  	ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple = *orig;
  	ct->tuplehash[IP_CT_DIR_ORIGINAL].hnnode.pprev = NULL;
  	ct->tuplehash[IP_CT_DIR_REPLY].tuple = *repl;
@@ -229,7 +226,7 @@ index f5bde4f13958..cfb67c09add4 100644
  	/* save hash for reusing when confirming */
  	*(unsigned long *)(&ct->tuplehash[IP_CT_DIR_REPLY].hnnode.pprev) = hash;
  	ct->status = 0;
-@@ -1829,6 +1837,9 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
+@@ -1829,6 +1836,9 @@ init_conntrack(struct net *net, struct nf_conn *tmpl,
  #ifdef CONFIG_NF_CONNTRACK_MARK
  			ct->mark = READ_ONCE(exp->master->mark);
  #endif
@@ -239,60 +236,7 @@ index f5bde4f13958..cfb67c09add4 100644
  #ifdef CONFIG_NF_CONNTRACK_SECMARK
  			ct->secmark = exp->master->secmark;
  #endif
-@@ -2550,6 +2561,52 @@ void *nf_ct_alloc_hashtable(unsigned int *sizep, int nulls)
- }
- EXPORT_SYMBOL_GPL(nf_ct_alloc_hashtable);
- 
-+#ifdef CONFIG_CPE_FAST_PATH
-+int nf_conntrack_set_dpi_allow_report(struct sk_buff *skb)
-+{
-+	int err = 0;
-+	struct nf_conn *ct;
-+	enum ip_conntrack_info ctinfo;
-+
-+	ct = nf_ct_get(skb, &ctinfo);
-+	/*TODO: Dow we need to add any checks here? */
-+
-+	nf_conntrack_get(skb_nfct(skb));
-+
-+	set_bit(IPS_DPI_ALLOWED_BIT, &ct->status);
-+
-+	nf_conntrack_event_cache(IPCT_PROTOINFO, ct);
-+
-+	nf_conntrack_put(skb_nfct(skb));
-+
-+	return err;
-+}
-+EXPORT_SYMBOL(nf_conntrack_set_dpi_allow_report);
-+
-+int nf_conntrack_set_dpi_allow_and_mark(struct sk_buff *skb, int mark)
-+{
-+	int err = 0;
-+	struct nf_conn *ct;
-+	enum ip_conntrack_info ctinfo;
-+
-+	ct = nf_ct_get(skb, &ctinfo);
-+	nf_conntrack_get(skb_nfct(skb));
-+
-+	set_bit(IPS_DPI_ALLOWED_BIT, &ct->status);
-+
-+#ifdef CONFIG_NF_CONNTRACK_MARK
-+	ct->mark = mark;
-+#endif
-+
-+	nf_conntrack_event_cache(IPCT_PROTOINFO, ct);
-+
-+	nf_conntrack_put(skb_nfct(skb));
-+
-+	return err;
-+}
-+EXPORT_SYMBOL(nf_conntrack_set_dpi_allow_and_mark);
-+#endif
-+
- int nf_conntrack_hash_resize(unsigned int hashsize)
- {
- 	int i, bucket;
-@@ -2829,3 +2886,19 @@ int nf_ct_change_status_common(struct nf_conn *ct, unsigned int status)
+@@ -2829,3 +2839,19 @@ int nf_ct_change_status_common(struct nf_conn *ct, unsigned int status)
  	return 0;
  }
  EXPORT_SYMBOL_GPL(nf_ct_change_status_common);
@@ -313,22 +257,20 @@ index f5bde4f13958..cfb67c09add4 100644
 +EXPORT_SYMBOL_GPL(nf_ct_is_expired);
 +#endif
 diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
-index 18a91c031554..b48eeef64023 100644
+index 18a91c031554..71744223e716 100644
 --- a/net/netfilter/nf_conntrack_netlink.c
 +++ b/net/netfilter/nf_conntrack_netlink.c
-@@ -28,6 +28,11 @@
+@@ -28,6 +28,9 @@
  #include <linux/netlink.h>
  #include <linux/spinlock.h>
  #include <linux/interrupt.h>
 +#if defined(CONFIG_CPE_FAST_PATH)
-+#ifndef IPSEC_FLOW_CACHE
 +#include <net/xfrm.h>
-+#endif
 +#endif
  #include <linux/slab.h>
  #include <linux/siphash.h>
  
-@@ -202,9 +207,16 @@ static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
+@@ -202,9 +205,16 @@ static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
  	struct nlattr *nest_proto;
  	int ret;
  
@@ -346,7 +288,7 @@ index 18a91c031554..b48eeef64023 100644
  
  	nest_proto = nla_nest_start(skb, CTA_PROTOINFO);
  	if (!nest_proto)
-@@ -214,9 +226,15 @@ static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
+@@ -214,9 +224,15 @@ static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct,
  
  	nla_nest_end(skb, nest_proto);
  
@@ -362,7 +304,7 @@ index 18a91c031554..b48eeef64023 100644
  	return -1;
  }
  
-@@ -353,6 +371,18 @@ static int ctnetlink_dump_mark(struct sk_buff *skb, const struct nf_conn *ct,
+@@ -353,6 +369,18 @@ static int ctnetlink_dump_mark(struct sk_buff *skb, const struct nf_conn *ct,
  #define ctnetlink_dump_mark(a, b, c) (0)
  #endif
  
@@ -381,7 +323,7 @@ index 18a91c031554..b48eeef64023 100644
  #ifdef CONFIG_NF_CONNTRACK_SECMARK
  static int ctnetlink_dump_secctx(struct sk_buff *skb, const struct nf_conn *ct)
  {
-@@ -413,6 +443,69 @@ ctnetlink_dump_labels(struct sk_buff *skb, const struct nf_conn *ct)
+@@ -413,6 +441,65 @@ ctnetlink_dump_labels(struct sk_buff *skb, const struct nf_conn *ct)
  	return 0;
  }
  
@@ -410,14 +352,12 @@ index 18a91c031554..b48eeef64023 100644
 +	nla_put_u32(skb, CTA_COMCERTO_FP_IIF, ct->fp_info[IP_CT_DIR_ORIGINAL].iif);
 +	nla_put_u32(skb, CTA_COMCERTO_FP_UNDERLYING_IIF, ct->fp_info[IP_CT_DIR_ORIGINAL].underlying_iif);
 +	nla_put_u16(skb, CTA_COMCERTO_FP_UNDERLYING_VID, ct->fp_info[IP_CT_DIR_ORIGINAL].underlying_vlan_id);
-+#ifndef IPSEC_FLOW_CACHE
 +	if ((ct->fp_info[IP_CT_DIR_ORIGINAL].xfrm_handle[0]) ||
 +	    (ct->fp_info[IP_CT_DIR_ORIGINAL].xfrm_handle[MAX_SUPPORTED_XFRMS_PER_DIR]))
 +	{
 +		nla_put(skb, CTA_COMCERTO_FP_XFRM_HANDLE, sizeof(ct->fp_info[IP_CT_DIR_ORIGINAL].xfrm_handle),
 +				ct->fp_info[IP_CT_DIR_ORIGINAL].xfrm_handle);
 +	}
-+#endif /* IPSEC_FLOW_CACHE */
 +	nla_nest_end(skb, nest_count);
 +
 +	nest_count = nla_nest_start(skb, CTA_LAYERSCAPE_FP_REPLY | NLA_F_NESTED);
@@ -429,14 +369,12 @@ index 18a91c031554..b48eeef64023 100644
 +	nla_put_u32(skb, CTA_COMCERTO_FP_IIF, ct->fp_info[IP_CT_DIR_REPLY].iif);
 +	nla_put_u32(skb, CTA_COMCERTO_FP_UNDERLYING_IIF, ct->fp_info[IP_CT_DIR_REPLY].underlying_iif);
 +	nla_put_u16(skb, CTA_COMCERTO_FP_UNDERLYING_VID, ct->fp_info[IP_CT_DIR_REPLY].underlying_vlan_id);
-+#ifndef IPSEC_FLOW_CACHE
 +	if ((ct->fp_info[IP_CT_DIR_REPLY].xfrm_handle[0]) ||
 +	    (ct->fp_info[IP_CT_DIR_REPLY].xfrm_handle[MAX_SUPPORTED_XFRMS_PER_DIR]))
 +	{
 +		nla_put(skb, CTA_COMCERTO_FP_XFRM_HANDLE, sizeof(ct->fp_info[IP_CT_DIR_REPLY].xfrm_handle),
 +			ct->fp_info[IP_CT_DIR_REPLY].xfrm_handle);
 +	}
-+#endif /* IPSEC_FLOW_CACHE */
 +	nla_nest_end(skb, nest_count);
 +
 +	return 0;
@@ -451,7 +389,7 @@ index 18a91c031554..b48eeef64023 100644
  #define master_tuple(ct) &(ct->master->tuplehash[IP_CT_DIR_ORIGINAL].tuple)
  
  static int ctnetlink_dump_master(struct sk_buff *skb, const struct nf_conn *ct)
-@@ -553,7 +646,11 @@ static int ctnetlink_dump_info(struct sk_buff *skb, struct nf_conn *ct)
+@@ -553,7 +640,11 @@ static int ctnetlink_dump_info(struct sk_buff *skb, struct nf_conn *ct)
  {
  	if (ctnetlink_dump_status(skb, ct) < 0 ||
  	    ctnetlink_dump_mark(skb, ct, true) < 0 ||
@@ -463,7 +401,7 @@ index 18a91c031554..b48eeef64023 100644
  	    ctnetlink_dump_id(skb, ct) < 0 ||
  	    ctnetlink_dump_use(skb, ct) < 0 ||
  	    ctnetlink_dump_master(skb, ct) < 0)
-@@ -705,6 +802,13 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
+@@ -705,6 +796,15 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
  	       + nla_total_size(0) /* CTA_HELP */
  	       + nla_total_size(NF_CT_HELPER_NAME_LEN) /* CTA_HELP_NAME */
  	       + ctnetlink_secctx_size(ct)
@@ -473,11 +411,13 @@ index 18a91c031554..b48eeef64023 100644
 +			+ 2 * nla_total_size(sizeof(uint32_t)) /* CTA_COMCERTO_FP_IFINDEX */
 +			+ 2 * nla_total_size(sizeof(uint32_t)) /* CTA_COMCERTO_FP_IIF */
 +			+ 2 * nla_total_size(sizeof(uint32_t)) /* CTA_COMCERTO_FP_UNDERLYING_IIF */
++			+ 2 * nla_total_size(sizeof(u_int16_t)) /* CTA_COMCERTO_FP_UNDERLYING_VID */
++			+ 2 * nla_total_size(sizeof(ct->fp_info[IP_CT_DIR_ORIGINAL].xfrm_handle)) /* CTA_COMCERTO_FP_XFRM_HANDLE (optional) */
 +#endif
  #if IS_ENABLED(CONFIG_NF_NAT)
  	       + 2 * nla_total_size(0) /* CTA_NAT_SEQ_ADJ_ORIG|REPL */
  	       + 6 * nla_total_size(sizeof(u_int32_t)) /* CTA_NAT_SEQ_OFFSET */
-@@ -712,6 +816,9 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
+@@ -712,6 +812,9 @@ static size_t ctnetlink_nlmsg_size(const struct nf_conn *ct)
  #ifdef CONFIG_NF_CONNTRACK_MARK
  	       + nla_total_size(sizeof(u_int32_t)) /* CTA_MARK */
  #endif
@@ -487,7 +427,7 @@ index 18a91c031554..b48eeef64023 100644
  #ifdef CONFIG_NF_CONNTRACK_ZONES
  	       + nla_total_size(sizeof(u_int16_t)) /* CTA_ZONE|CTA_TUPLE_ZONE */
  #endif
-@@ -786,6 +893,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
+@@ -786,6 +889,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
  				   NF_CT_DEFAULT_ZONE_DIR) < 0)
  		goto nla_put_failure;
  
@@ -499,7 +439,7 @@ index 18a91c031554..b48eeef64023 100644
  	if (ctnetlink_dump_id(skb, ct) < 0)
  		goto nla_put_failure;
  
-@@ -837,6 +949,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
+@@ -837,6 +945,11 @@ ctnetlink_conntrack_event(unsigned int events, const struct nf_ct_event *item)
  #ifdef CONFIG_NF_CONNTRACK_MARK
  	if (ctnetlink_dump_mark(skb, ct, events & (1 << IPCT_MARK)))
  		goto nla_put_failure;
@@ -511,7 +451,7 @@ index 18a91c031554..b48eeef64023 100644
  #endif
  	nlmsg_end(skb, nlh);
  	err = nfnetlink_send(skb, net, item->portid, group, item->report,
-@@ -1546,6 +1663,9 @@ static const struct nla_policy ct_nla_policy[CTA_MAX+1] = {
+@@ -1546,6 +1659,9 @@ static const struct nla_policy ct_nla_policy[CTA_MAX+1] = {
  	[CTA_NAT_SRC]		= { .type = NLA_NESTED },
  	[CTA_TIMEOUT] 		= { .type = NLA_U32 },
  	[CTA_MARK]		= { .type = NLA_U32 },
@@ -521,7 +461,7 @@ index 18a91c031554..b48eeef64023 100644
  	[CTA_ID]		= { .type = NLA_U32 },
  	[CTA_NAT_DST]		= { .type = NLA_NESTED },
  	[CTA_TUPLE_MASTER]	= { .type = NLA_NESTED },
-@@ -1900,6 +2020,46 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
+@@ -1900,6 +2016,46 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
  	return nf_ct_change_status_common(ct, ntohl(nla_get_be32(cda[CTA_STATUS])));
  }
  
@@ -568,7 +508,7 @@ index 18a91c031554..b48eeef64023 100644
  static int
  ctnetlink_setup_nat(struct nf_conn *ct, const struct nlattr * const cda[])
  {
-@@ -2204,6 +2364,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
+@@ -2204,6 +2360,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
  			return err;
  	}
  
@@ -580,7 +520,7 @@ index 18a91c031554..b48eeef64023 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2342,6 +2507,11 @@ ctnetlink_create_conntrack(struct net *net,
+@@ -2342,6 +2503,11 @@ ctnetlink_create_conntrack(struct net *net,
  			goto err2;
  	}
  
@@ -592,7 +532,7 @@ index 18a91c031554..b48eeef64023 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2468,6 +2638,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
+@@ -2468,6 +2634,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
  	err = -EEXIST;
  	ct = nf_ct_tuplehash_to_ctrack(h);
  	if (!(info->nlh->nlmsg_flags & NLM_F_EXCL)) {

@@ -1,4 +1,4 @@
-From c4c74e38723bc2bdfdb0d1f40d474d8f2624dab2 Mon Sep 17 00:00:00 2001
+From 05b74379fc515e7b0795b349f5ab51eb73878d4e Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -41,25 +41,24 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  Makefile                                      |    5 +
  .../net/ethernet/freescale/sdk_dpaa/Kconfig   |    6 +-
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    |   46 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   34 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   32 +-
  .../freescale/sdk_dpaa/dpaa_eth_ceetm.c       |    1 +
- .../freescale/sdk_dpaa/dpaa_eth_common.c      |  131 +-
+ .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   43 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  991 ++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  971 ++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
  .../freescale/sdk_dpaa/offline_port.c         |   53 +
- .../net/ethernet/freescale/sdk_fman/Kconfig   |   12 +
- .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |   95 +
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |   94 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
  .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
  .../sdk_fman/Peripherals/FM/Pcd/Makefile      |    7 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 2271 ++++++++++++++---
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |  136 +
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1378 ++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1922 ++++++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1377 ++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1618 ++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |   13 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    |   68 +
@@ -71,31 +70,30 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Port/fm_port.h    |    3 +
  .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   35 +
  .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
- .../freescale/sdk_fman/Peripherals/FM/fm.c    |   77 +-
+ .../freescale/sdk_fman/Peripherals/FM/fm.c    |   20 +-
  .../sdk_fman/Peripherals/FM/fm_muram.c        |   32 +-
  .../sdk_fman/Peripherals/FM/inc/fm_common.h   |  116 +-
  .../sdk_fman/Peripherals/FM/inc/fm_hc.h       |    2 +
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |   19 +
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1609 ++++++++++++
- .../sdk_fman/inc/Peripherals/fm_ext.h         |   47 +
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1608 ++++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
  .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  155 +-
  .../sdk_fman/inc/Peripherals/fm_port_ext.h    |   23 +
  .../sdk_fman/inc/Peripherals/fm_vsp_ext.h     |   14 +
- .../freescale/sdk_fman/inc/flib/fsl_fman.h    |    1 +
  .../sdk_fman/inc/flib/fsl_fman_port.h         |    6 +-
  .../freescale/sdk_fman/inc/stdlib_ext.h       |   47 +-
  .../freescale/sdk_fman/ls1043_dflags.h        |    2 +
  .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   12 +-
  .../src/inc/wrapper/lnxwrp_fsl_fman.h         |    5 +
  .../freescale/sdk_fman/src/system/sys_io.c    |    1 +
- .../sdk_fman/src/wrapper/lnxwrp_fm.c          |   46 +
+ .../sdk_fman/src/wrapper/lnxwrp_fm.c          |   45 +
  .../sdk_fman/src/wrapper/lnxwrp_fm.h          |    3 +-
  .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |    9 +-
- .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |   49 +-
+ .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |   25 +-
  .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |    8 +
  .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c    |  192 ++
  .../src/wrapper/lnxwrp_sysfs_fm_port.c        |    8 +-
@@ -103,21 +101,21 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/staging/fsl_qbman/Kconfig             |    7 +
  drivers/staging/fsl_qbman/fsl_usdpaa.c        |    2 +-
  drivers/staging/fsl_qbman/qman_config.c       |    2 +
- drivers/staging/fsl_qbman/qman_high.c         |  121 +-
+ drivers/staging/fsl_qbman/qman_high.c         |   96 +-
  include/linux/fsl_oh_port.h                   |   26 +
  include/linux/fsl_qman.h                      |    6 +
  include/linux/netdevice.h                     |   43 +
  include/linux/skbuff.h                        |   15 +
  .../uapi/linux/fmd/Peripherals/fm_ioctls.h    |   28 +
  .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   45 +-
- include/uapi/linux/if.h                       |    3 +
+ include/uapi/linux/if.h                       |    1 +
  include/uapi/linux/netlink.h                  |    6 +-
  net/Kconfig                                   |    9 +
  net/core/dev.c                                |  101 +-
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 79 files changed, 10319 insertions(+), 560 deletions(-)
+ 77 files changed, 9775 insertions(+), 561 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -292,7 +290,7 @@ index 010b47239ccc..b00c8e244dc6 100644
  
  	return 0;
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
-index 7109d33419bd..34e9c4885cf9 100644
+index 7109d33419bd..3ed15e1d638a 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
 @@ -37,6 +37,7 @@
@@ -365,7 +363,7 @@ index 7109d33419bd..34e9c4885cf9 100644
  void __hot _dpa_rx(struct net_device *net_dev,
  		struct qman_portal *portal,
  		const struct dpa_priv_s *priv,
-@@ -666,4 +679,17 @@ static inline void _dpa_bp_free_pf(void *addr)
+@@ -666,4 +679,15 @@ static inline void _dpa_bp_free_pf(void *addr)
  #define DPAA_A050385_HEADROOM	256
  #endif  /* FM_ERRATUM_A050385 */
  
@@ -379,8 +377,6 @@ index 7109d33419bd..34e9c4885cf9 100644
 +int skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
 +			  struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd);
 +void print_ipsec_offload_pkt_count(void);
-+void sgt_fraglist_fd_release(const struct net_device *net_dev,
-+			     const struct qm_fd *fd);
 +
  #endif	/* __DPA_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_ceetm.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_ceetm.c
@@ -396,7 +392,7 @@ index f947264bf54d..ab0b34e5713f 100644
  	net_dev = ceetm_fq->net_dev;
  	dpa_priv = netdev_priv(net_dev);
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
-index 515dfb68ed5f..5fb8fb920675 100644
+index 515dfb68ed5f..5bf956c4cc7e 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.c
 @@ -166,6 +166,7 @@ int __cold dpa_start(struct net_device *net_dev)
@@ -491,74 +487,7 @@ index 515dfb68ed5f..5fb8fb920675 100644
  {
  	struct qm_sg_entry	*sgt;
  	struct dpa_bp		*dpa_bp;
-@@ -1600,6 +1630,66 @@ dpa_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
- }
- EXPORT_SYMBOL(dpa_fd_release);
- 
-+// SGT fraglist to be freed
-+//void __attribute__((nonnull))
-+void sgt_fraglist_fd_release(const struct net_device *net_dev, const struct qm_fd *fd)
-+{
-+   struct qm_sg_entry  *sgt;
-+   struct dpa_bp       *dpa_bp;
-+   struct bm_buffer    bmb;
-+   struct sk_buff *skb;
-+   dma_addr_t      addr;
-+   void            *vaddr;
-+   int ii = 0;
-+
-+   bmb.opaque = 0;
-+
-+   if (!qm_fd_addr(fd))
-+   {
-+       printk("%s(%d) NULL addr in fd\n",__func__,__LINE__);
-+       return;
-+   }
-+
-+
-+   char *tmp = (char *) fd;
-+   printk("%s(%d) FD info : \t",__func__,__LINE__);
-+   printk("%0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x %0x\n",
-+   tmp[0],tmp[1],tmp[2],tmp[3],tmp[4],tmp[5],tmp[6],tmp[7],tmp[8],tmp[9],tmp[10],tmp[11],tmp[12],tmp[13],tmp[14],tmp[15]);
-+   bm_buffer_set64(&bmb, qm_fd_addr(fd));
-+   dpa_bp = dpa_bpid2pool(fd->bpid);
-+   DPA_BUG_ON(!dpa_bp);
-+
-+   if (fd->format == qm_fd_sg) {
-+       vaddr = phys_to_virt(qm_fd_addr(fd));
-+       sgt = vaddr;
-+
-+       printk("%s(%d) addr %llx , size %zu, buff pool id %x, fd %p\t",
-+           __func__,__LINE__,(unsigned long long)qm_fd_addr(fd), dpa_bp->size, bmb.bpid, fd);
-+       printk("bpid: %d, netdev name %s, vaddr %p, fd offset %zd\n",
-+           fd->bpid,net_dev->name, vaddr, dpa_fd_offset(fd));
-+
-+       while (!qm_sg_entry_get_final(&sgt[ii]))
-+           ii++;
-+       addr = qm_sg_addr(&sgt[ii+1]);
-+       printk("%s(%d) ii %d, old-skb %p \n",__func__, __LINE__,ii,(void *)addr);
-+       if (addr) // free the old skb
-+       {
-+           skb =  (struct sk_buff *)(addr);
-+           kfree_skb(skb);
-+       }
-+       addr = 0;
-+       qm_sg_entry_set64(&sgt[ii+1], addr);
-+
-+       dma_unmap_single(dpa_bp->dev, qm_fd_addr(fd), (ii+1)*sizeof(struct qm_sg_entry),
-+                DMA_BIDIRECTIONAL);
-+
-+   }
-+
-+   while (bman_release(dpa_bp->pool, &bmb, 1, 0))
-+       cpu_relax();
-+}
-+EXPORT_SYMBOL(sgt_fraglist_fd_release);
-+
- void count_ern(struct dpa_percpu_priv_s *percpu_priv,
- 		      const struct qm_mr_entry *msg)
- {
-@@ -1735,7 +1825,7 @@ int dpa_enable_tx_csum(struct dpa_priv_s *priv,
+@@ -1735,7 +1765,7 @@ int dpa_enable_tx_csum(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(dpa_enable_tx_csum);
  
@@ -567,7 +496,7 @@ index 515dfb68ed5f..5fb8fb920675 100644
  void dpa_enable_ceetm(struct net_device *dev)
  {
  	struct dpa_priv_s *priv = netdev_priv(dev);
-@@ -1750,3 +1840,36 @@ void dpa_disable_ceetm(struct net_device *dev)
+@@ -1750,3 +1780,36 @@ void dpa_disable_ceetm(struct net_device *dev)
  }
  EXPORT_SYMBOL(dpa_disable_ceetm);
  #endif
@@ -698,7 +627,7 @@ index f46c243ff1b8..f2aab2fd806c 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..f5db837fcfc0 100644
+index 4164644d3268..bd0e6c720fe1 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -53,6 +53,78 @@
@@ -1277,7 +1206,7 @@ index 4164644d3268..f5db837fcfc0 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1448,543 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1448,523 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1539,9 +1468,6 @@ index 4164644d3268..f5db837fcfc0 100644
 +}
 +EXPORT_SYMBOL(dpa_add_dummy_eth_hdr);
 +
-+#ifdef UNIT_TEST
-+unsigned char temp_ethhdr[16];
-+#endif
 +/* This function is invoked from xfrm_input.c to submit IPSEC packets
 +   to SEC engine, if the corresponding SA is programmed in ucode
 +*/
@@ -1556,9 +1482,6 @@ index 4164644d3268..f5db837fcfc0 100644
 +	struct net_device *netdev;
 +	struct device* dev;
 +	unsigned char hdroom_realloced = 0;
-+#ifdef UNIT_TEST
-+	unsigned short dev_type = skb->dev->type;
-+#endif
 +	struct net_device *real_dev = NULL;
 +	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
 +	 * concurrently; never read the global twice */
@@ -1576,12 +1499,6 @@ index 4164644d3268..f5db837fcfc0 100644
 +		{
 +			return -1; /* give packet to linux */
 +		}
-+#ifdef UNIT_TEST
-+		{
-+			skb->dev->type = ARPHRD_NONE;
-+			skb->mac_len = 0;
-+		}
-+#endif
 +		if (skb->dev->type == ARPHRD_ETHER) 
 +		{
 +			/* Get the corresponding physical device info, if the skb->dev corresponds to vlan*/
@@ -1647,9 +1564,6 @@ index 4164644d3268..f5db837fcfc0 100644
 +				tmp_len = (skb->data - skb_network_header(skb));
 +				skb->len += tmp_len;
 +				skb->data = skb_network_header(skb);
-+#ifdef UNIT_TEST
-+				memcpy(temp_ethhdr, (skb->data - ETH_HLEN), 12);
-+#endif
 +				/* Add mac_header */
 +				ret = dpa_add_dummy_eth_hdr(&skb, 0, &hdroom_realloced);
 +				if (ret < 0)
@@ -1658,11 +1572,6 @@ index 4164644d3268..f5db837fcfc0 100644
 +				skb->data -= ETH_HLEN;
 +				skb->len += ETH_HLEN;
 +				tmp_len += ETH_HLEN;
-+#ifdef UNIT_TEST
-+				memcpy(skb->data ,temp_ethhdr,12);
-+				skb->dev->type = dev_type;
-+				skb->mac_len = ETH_HLEN;
-+#endif
 +			}
 +		}
 +		else
@@ -1822,7 +1731,7 @@ index 4164644d3268..f5db837fcfc0 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +1996,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +1976,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1833,7 +1742,7 @@ index 4164644d3268..f5db837fcfc0 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1212,13 +2168,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2148,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */
@@ -1999,44 +1908,20 @@ index 000caf70e00e..2ab7e50be763 100644
  
  	/* print of all referenced & created queues */
  	dump_oh_config(dpa_oh_dev, oh_config);
-diff --git a/drivers/net/ethernet/freescale/sdk_fman/Kconfig b/drivers/net/ethernet/freescale/sdk_fman/Kconfig
-index 3a6d1810b525..f977e4526f27 100644
---- a/drivers/net/ethernet/freescale/sdk_fman/Kconfig
-+++ b/drivers/net/ethernet/freescale/sdk_fman/Kconfig
-@@ -25,6 +25,18 @@ config FSL_SDK_FMAN_RTC_API
- 		it is selected for RTC (1588 timer). Neither of them
- 		were not able to be used together.
- 
-+config DBG_UCODE_INFRA
-+	bool "debug infra support for microcode"
-+	default n
-+	help
-+	  Enable/disable debug infra support for microcode.
-+
-+config DMAR_TEST
-+	bool "DMA read test in microcode"
-+	default n
-+	help
-+	  Enable DMA read test in microcode.
-+
- config FSL_FM_MAX_FRAME_SIZE
- 	int "Maximum L2 frame size"
- 	range 64 9600
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 80fb535231b9..16096e67ef5b 100644
+index 80fb535231b9..e44ea8e9e323 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-@@ -79,6 +79,9 @@
+@@ -79,6 +79,8 @@
  #define SIZE_OF_HC_FRAME_PROFILE_CNT        (sizeof(t_HcFrame)-sizeof(t_FmPcdPlcrProfileRegs)+sizeof(uint32_t))
  #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
  
 +
-+#define SIZE_OF_HC_FRAME_READ_DBG_UCODE_CMD 64 //jyos
 +
  #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
  
  #define BUILD_FD(len)                     \
-@@ -113,6 +116,7 @@ typedef struct t_HcFrame {
+@@ -113,6 +115,7 @@ typedef struct t_HcFrame {
          volatile uint32_t                       clsPlanEntries[CLS_PLAN_NUM_PER_GRP];
          t_FmPcdCcCapwapReassmTimeoutParams      ccCapwapReassmTimeout;
          t_FmPcdCcReassmTimeoutParams            ccReassmTimeout;
@@ -2044,7 +1929,7 @@ index 80fb535231b9..16096e67ef5b 100644
      } hcSpecificData;
  } t_HcFrame;
  
-@@ -1195,6 +1199,97 @@ t_Error FmHcPcdCcDoDynamicChange(t_Handle h_FmHc, uint32_t oldAdAddrOffset, uint
+@@ -1195,6 +1198,97 @@ t_Error FmHcPcdCcDoDynamicChange(t_Handle h_FmHc, uint32_t oldAdAddrOffset, uint
      return E_OK;
  }
  
@@ -5145,10 +5030,10 @@ index e3b7016b7f2e..d6a1c9d6b4c9 100644
  #endif /* __FM_CC_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
 new file mode 100644
-index 000000000000..b19e51a4824d
+index 000000000000..f6d26b9bd6c7
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
-@@ -0,0 +1,1378 @@
+@@ -0,0 +1,1377 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5166,9 +5051,8 @@ index 000000000000..b19e51a4824d
 +//enable prints from FMD
 +//#define FM_CC_DEBUG 		1
 +
-+//enable prints from host commands
-+#define FM_CC_MURAM_DEBUG 	1
-+	
++// Host-command MURAM prints are opt-in via this dir's Makefile: set the
++// FMAN_DEBUG env to '-DFM_CC_MURAM_DEBUG=1'. Not hard-enabled here.
 +//table descriptor structure
 +struct generic_5_off_ic_gmask {
 +	union {
@@ -6529,10 +6413,10 @@ index 000000000000..b19e51a4824d
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..6ecbc92fac54
+index 000000000000..ec908c84c6ff
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1922 @@
+@@ -0,0 +1,1618 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -6557,13 +6441,10 @@ index 000000000000..6ecbc92fac54
 +#include "fm_cc.h"
 +#include "endian_ext.h"
 +
-+//#define FM_EHASH_DEBUG 1
-+
-+#ifdef FM_EHASH_DEBUG 
-+#define FM_EHASH_PRINT printk
-+#else
++/* FM_EHASH_DEBUG was a commented-out toggle gating printk dumps that had
++ * bit-rotted (they no longer compiled when enabled). The dumps are removed;
++ * FM_EHASH_PRINT is now an unconditional no-op so its call sites stay valid. */
 +#define FM_EHASH_PRINT(fmt, ...)
-+#endif // CDX_DPA_DEBUG
 +
 +#ifndef EXCLUDE_FMAN_IPR_OFFLOAD
 +#define REASSM_DEBUG_SIZE       128
@@ -6690,59 +6571,6 @@ index 000000000000..6ecbc92fac54
 +
 +
 +#define MAX_HIST_SIZE	15
-+void EhashTableWalk(void *h_HashTbl)
-+{
-+	uint32_t ii;
-+	struct en_exthash_info *info;
-+	struct en_exthash_tbl_entry *entry;
-+	struct en_exthash_bucket *bucket;
-+	uint32_t num_entries;
-+	uint32_t bucket_entries;
-+	uint32_t max_collisions;
-+	uint32_t min_collisions;
-+	uint32_t histo[MAX_HIST_SIZE + 2];
-+	
-+
-+	num_entries = 0;
-+	max_collisions = 0;
-+	min_collisions = 0xffffffff;
-+	memset(&histo[0], 0, (sizeof(uint32_t) * (MAX_HIST_SIZE + 2)));
-+	info = (struct en_exthash_info *)h_HashTbl;
-+	bucket = (struct en_exthash_bucket *)info->table_base;
-+	printk("%s::tbl %p, num buckets %d base %p\n",
-+		__func__, info, (info->hashmask + 1), bucket);
-+	for (ii = 0; ii <= info->hashmask; ii++) {
-+		if (bucket->h) {
-+			bucket_entries = 0;
-+			entry = XX_PhysToVirt(SwapUint64(bucket->h));
-+			while(entry) {
-+				bucket_entries++;
-+				entry = entry->next;
-+			}
-+			num_entries += bucket_entries;
-+			if (bucket_entries > max_collisions)
-+				max_collisions = bucket_entries;
-+			if (bucket_entries < min_collisions)
-+				min_collisions = bucket_entries;
-+			if (max_collisions > MAX_HIST_SIZE)
-+				histo[MAX_HIST_SIZE + 1]++;
-+			else 
-+				histo[max_collisions]++;
-+		} else {
-+			histo[0]++;
-+		}	
-+		bucket++;
-+	}
-+	printk("%s::entries %d, max colls %d, min colls %d\n",
-+			__func__, num_entries, max_collisions, 
-+			min_collisions);
-+	printk("num collisions\t	num_buckets\n");	
-+	for (ii = 0; ii < MAX_HIST_SIZE; ii++) {
-+		printk("%d\t%d\n", ii, histo[ii]);
-+	}
-+	printk(">15\t%d\n", histo[ii]);
-+}
-+EXPORT_SYMBOL(EhashTableWalk); 
 +
 +int ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
 +				struct en_tbl_entry_stats *stats)
@@ -6761,24 +6589,13 @@ index 000000000000..6ecbc92fac54
 +        if (GET_TIMESTAMP_ENABLE(flags)) {
 +		stats->flags |= TIMESTAMP_VALID;
 +		stats->timestamp = cpu_to_be32(entry->timestamp);
-+#ifdef FM_EHASH_DEBUG 
-+                printk("external  timestamp %08x\n",
-+                	 stats->timestamp);
-+#endif // FM_EHASH_DEBUG
 +        }
 +	if (GET_STATS_ENABLE(flags))
 +	{
 +		stats->flags |= STATS_VALID;
 +		stats->pkts = be64_to_cpu(entry->packet_count);
 +		stats->bytes = be64_to_cpu(entry->packet_bytes);
-+#ifdef  FM_EHASH_DEBUG 
-+		printk("%s(%d) stats pkts %lld , bytes %lld \n",
-+			__func__, __LINE__, stats->pkts, stats->bytes);
-+#endif // FM_EHASH_DEBUG 
 +	}
-+#ifdef FM_EHASH_DEBUG 
-+	printk("%s::stats flags %x\n", __func__, stats->flags);
-+#endif
 +	return 0;
 +}
 +EXPORT_SYMBOL(ExternalHashTableEntryGetStatsAndTS);
@@ -6808,21 +6625,10 @@ index 000000000000..6ecbc92fac54
 +
 +	new_entry = (struct en_exthash_tbl_entry *)tbl_entry;
 +	info = (struct en_exthash_info *)h_HashTbl;
-+#ifdef FM_EHASH_DEBUG 
-+	printk("%s::keysize %d, shift %d, mask %x key::\n",
-+		__func__, keySize, info->hashshift,
-+		info->hashmask);
-+	disp_buf(&new_entry->hashentry.key[0], keySize);
-+#endif
 +	get_indexed_hash_bucket(keySize, &new_entry->hashentry.key[0],
 +                                info->hashshift,
 +                                (uint16_t)info->hashmask, &index);
 +	bucket = ((struct en_exthash_bucket *)(info->table_base) + index);
-+#ifdef FM_EHASH_DEBUG 
-+	printk("%s::index %x\n", __func__, index);
-+	printk("%s::table base %p , basePhyAddr %p \n bucket %p, bucket phy %p spinlock %p \n", __func__,
-+		info->table_base, XX_VirtToPhys(info->table_base), bucket, XX_VirtToPhys(bucket), info->pSpinlock);
-+#endif
 +
 +	h_Spinlock = *(info->pSpinlock + index);
 +   	intFlags = XX_LockIntrSpinlock(h_Spinlock);
@@ -6957,40 +6763,6 @@ index 000000000000..6ecbc92fac54
 +					goto func_ret;
 +				}
 +				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
-+#ifdef FM_EHASH_DEBUG 
-+				printk("new cumulative entry phyaddr : %p bucket content value : 0x%lx\n",
-+							(void *)XX_VirtToPhys(cumulative_entry), (long unsigned int)bucket->h);
-+				cumulative_entry = (struct en_cumulative_entry *)XX_PhysToVirt((physAddress_t)SwapUint64(bucket->h));
-+				while (cumulative_entry)
-+				{
-+					printk("cumulative entry : %p \n", cumulative_entry);
-+							
-+						
-+					printk("flags: 0x%x, key-size %d, key_entries: %d, nodes_index: %d, next_entry 0x%lx\n", 
-+							cumulative_entry->flags, 
-+							cumulative_entry->key_size, cumulative_entry->num_key_entries, cumulative_entry->tbl_entry_index,
-+							(long unsigned int)cumulative_entry->next_entry_addr);
-+					printk("cumulative key: \n");
-+					for (ii=0; ii<((cumulative_entry->key_size*cumulative_entry->num_key_entries)+1); ii++)
-+					{
-+						if ((ii % 16) == 0)
-+							printk("\n");
-+						printk("%02x ", cumulative_entry->data[ii]);
-+					}
-+					printk("\n table entries (%d) : \n",cumulative_entry->num_key_entries);
-+					for (ii = 0; ii < cumulative_entry->num_key_entries; ii++) {
-+						phyaddr = *((uint64_t *)(&cumulative_entry->data[cumulative_entry->tbl_entry_index-12+ii*8]));
-+						printk("table_entry ptr[%d]: %p \n", ii, (void *)XX_PhysToVirt((physAddress_t)SwapUint64(phyaddr)));
-+					}
-+					printk("\n");
-+					if (cumulative_entry->flags & EN_NEXT_CUMULATIVE_NODE)
-+					{
-+						cumulative_entry = XX_PhysToVirt(SwapUint64(cumulative_entry->next_entry_addr));
-+					}
-+					else
-+						cumulative_entry = NULL;
-+				}
-+#endif
 +				return retval;
 +			}
 +			else
@@ -7063,62 +6835,8 @@ index 000000000000..6ecbc92fac54
 +			FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		}
 +		
-+#ifdef FM_EHASH_DEBUG 
-+		printk("new cumulative entry phyaddr : %p bucket content value : 0x%lx\n",
-+			(void *)XX_VirtToPhys(cumulative_entry), (long unsigned int)bucket->h);
-+		cumulative_entry = (struct en_cumulative_entry *)XX_PhysToVirt((physAddress_t)SwapUint64(bucket->h));
-+		while (cumulative_entry)
-+		{
-+			printk("cumulative entry : %p \n", cumulative_entry);
-+			
-+//				uint32_t ii;
-+			
-+			printk("flags: 0x%x, key-size %d, key_entries: %d, nodes_index: %d, next_entry 0x%lx\n", 
-+					cumulative_entry->flags, 
-+					cumulative_entry->key_size, cumulative_entry->num_key_entries, cumulative_entry->tbl_entry_index,
-+					(long unsigned int)cumulative_entry->next_entry_addr);
-+			printk("cumulative key: \n");
-+			for (ii=0; ii<((cumulative_entry->key_size*cumulative_entry->num_key_entries)+1); ii++)
-+			{
-+				if ((ii % 16) == 0)
-+					printk("\n");
-+				printk("%02x ", cumulative_entry->data[ii]);
-+			}
-+			printk("\n table entries (%d) : \n",cumulative_entry->num_key_entries);
-+			for (ii = 0; ii < cumulative_entry->num_key_entries; ii++) {
-+				phyaddr = *((uint64_t *)(&cumulative_entry->data[cumulative_entry->tbl_entry_index-12+ii*8]));
-+				printk("table_entry ptr[%d]: %p \n", ii, (void *)XX_PhysToVirt((physAddress_t)SwapUint64(phyaddr)));
-+			}
-+			printk("\n");
-+			if (cumulative_entry->flags & EN_NEXT_CUMULATIVE_NODE)
-+			{
-+				cumulative_entry = XX_PhysToVirt(SwapUint64(cumulative_entry->next_entry_addr));
-+			}
-+			else
-+				cumulative_entry = NULL;
-+		}
-+#endif
 +	}	
 +#endif //NO_CUMULATIVE_ENTRY
-+#ifdef FM_EHASH_DEBUG 
-+	printk("new entry phyaddr : %p bucket content value : 0x%lx\n", phyaddr, bucket->h);
-+	{
-+		uint32_t ii;
-+		uint8_t *ptr;
-+
-+		printk("hash entry::%p, next %p, prev %p\n hashentry %p::\n", 
-+			new_entry, 
-+			new_entry->next, new_entry->prev, &new_entry->hashentry);
-+		ptr = (uint8_t *)&new_entry->hashentry;
-+		for (ii = 0; ii < sizeof(struct en_ehash_entry); ii++) {
-+			if ((ii % 16) == 0)
-+				printk("\n");
-+			printk("%02x ", *ptr);
-+			ptr++;
-+		}
-+		printk("\n");
-+	}
-+#endif
 +func_ret:
 +    	XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +	return retval;	
@@ -7239,10 +6957,6 @@ index 000000000000..6ecbc92fac54
 +	switch (p_Param->table_type) {
 +		case IPV4_REASSM_TABLE:
 +			if (ipv4_reassly_tbl_info) {
-+#ifdef FM_EHASH_DEBUG 
-+				printk("%s::ipv4_reassly_tbl_info already created %p\n",
-+						__func__, ipv4_reassly_tbl_info);
-+#endif
 +				return (t_Handle)ipv4_reassly_tbl_info;
 +			}
 +			gpp_table = 0;
@@ -7252,10 +6966,6 @@ index 000000000000..6ecbc92fac54
 +			break;
 +		case IPV6_REASSM_TABLE:
 +			if (ipv6_reassly_tbl_info) {
-+#ifdef FM_EHASH_DEBUG 
-+				printk("%s::ipv6_reassly_tbl_info already created %p\n",
-+						__func__, ipv6_reassly_tbl_info);
-+#endif
 +				return (t_Handle)ipv6_reassly_tbl_info;
 +			}
 +			table_type = REASSEMBLY_TABLE;
@@ -7296,9 +7006,6 @@ index 000000000000..6ecbc92fac54
 +                	     ("allocation for en_ext_hash_info"));
 +        	return NULL;
 +	}
-+#ifdef FM_EHASH_DEBUG 
-+	printk("%s(%d) info %p \n",__func__,__LINE__,info);
-+#endif
 +	memset(info, 0, sizeof(struct en_exthash_info));
 +		
 +	//determine number of bits set in the hash mask
@@ -7404,11 +7111,6 @@ index 000000000000..6ecbc92fac54
 +		en_global_muram_mem = (en_exthash_global_mem *)
 +			((uint8_t *)(p_FmPcd->pIntMuramPtr)+EN_INTERNAL_BUFF_POOL_SIZE);
 +	}
-+#ifdef FM_EHASH_DEBUG 
-+	printk("%s::table type %d, word_1 0x%x, hashmask+1 0x%x, hashmask bits 0x%x, global mem offset 0x%x\n",
-+	__func__, p_Param->table_type, node->word_1, info->hashmask+1, node->hash_mask_bits,
-+	node->global_mem_offset);
-+#endif
 +	tblphysaddr = XX_VirtToPhys(info->table_base);
 +	node->table_base_hi = ((tblphysaddr >> 32) & 0xffff);	
 +	node->table_base_lo = (tblphysaddr & 0xffffffff);		
@@ -7427,17 +7129,10 @@ index 000000000000..6ecbc92fac54
 +				t_FmPcdCcNextKgParams *kgparams;
 +				kgparams =
 +					&p_Param->ccNextEngineParamsForMiss.params.kgParams;
-+#ifdef FM_EHASH_DEBUG 
-+				printk("%s::Nextengine = KG, kgparams->h_DirectScheme %p\n", 
-+					__func__, kgparams->h_DirectScheme);
-+#endif
 +				node->nia = (NIA_ENG_KG | NIA_KG_DIRECT);
 +				if (kgparams->overrideFqid) 
 +                    			node->nia |= (kgparams->newFqid | NIA_KG_CC_EN);
 +                		node->nia |= FmPcdKgGetSchemeId(kgparams->h_DirectScheme);
-+#ifdef FM_EHASH_DEBUG 
-+				disp_sch_info(kgparams->h_DirectScheme);
-+#endif
 +				node->miss_action_type = EN_EHASH_MISS_ACTION_NIA;
 +				break;
 +		}
@@ -7447,10 +7142,6 @@ index 000000000000..6ecbc92fac54
 +				t_FmPcdCcNextEnqueueParams *enqparams;
 +				enqparams = 
 +					&p_Param->ccNextEngineParamsForMiss.params.enqueueParams;
-+#ifdef FM_EHASH_DEBUG
-+                               printk("%s:: EN_EHASH_MISS_ACTION_NIA %d , ovrdfqid %d\n",
-+                                       __func__, EN_EHASH_MISS_ACTION_NIA,enqparams->overrideFqid);
-+#endif
 +				if (enqparams->overrideFqid)
 +					node->fqid = enqparams->newFqid;
 +				if (enqparams->overrideFqid)
@@ -7459,17 +7150,10 @@ index 000000000000..6ecbc92fac54
 +				}
 +				else
 +					node->miss_action_type = EN_EHASH_MISS_ACTION_DONE;
-+#ifdef FM_EHASH_DEBUG
-+printk("node->fqid : %d \n", node->fqid);
-+#endif
 +				break;
 +		}
 +		default:
 +			node->miss_action_type = EN_EHASH_MISS_ACTION_DROP;
-+#ifdef FM_EHASH_DEBUG
-+			printk("%s::Nextengine type %d not supported, drop case\n", __func__,
-+				p_Param->ccNextEngineParamsForMiss.nextEngine);
-+#endif
 +			break;
 +		}
 +	}
@@ -7516,55 +7200,22 @@ index 000000000000..6ecbc92fac54
 +			info->ip_reassem_info->bucket_lock[ii] = 0;
 +			info->ip_reassem_info->bucket_head[ii] = (uint64_t)0;
 +		}
-+#ifdef FM_EHASH_DEBUG
-+		if (p_Param->table_type == IPV4_REASSM_TABLE)
-+			printk("%s::ipv4 reassem param ", __func__);
-+		else
-+			printk("%s::ipv6 reassem param ", __func__);
-+		printk("%x, size %d dbg %x\n",
-+				node->reassm_param,
-+				(uint32_t)(sizeof(struct ip_reassembly_params) +
-+				REASSM_DEBUG_SIZE),
-+				cpu_to_be32(info->ip_reassem_info->reassly_dbg));
-+		printk(KERN_INFO "%s::en ext hash reassem table created, handle %p\n",
-+				__func__, info);
-+#endif
 +	}
 +#endif
 +
-+#ifdef FM_EHASH_DEBUG
-+	printk(KERN_INFO "%s::en ext hash table created, handle %p\n",
-+			__func__, info);
-+	printk("ad_word_0::%08x\n", node->word_0);
-+	printk("ad_word_1::%08x\n", node->table_base_lo);
-+	printk("ad_word_2::%08x\n", node->word_1);
-+	printk("ad_word_3::%08x\n", node->word_2);
-+#endif //FM_EHASH_DEBUG
 +
 +#ifndef EXCLUDE_FMAN_IPR_OFFLOAD
 +	switch (p_Param->table_type) {
 +		case IPV4_REASSM_TABLE:
 +			ipv4_reassly_tbl_info = info;
-+#ifdef FM_EHASH_DEBUG
-+			printk("%s::saving ipv4_reassly_tbl_info %p\n",
-+					__func__, ipv4_reassly_tbl_info);
-+#endif
 +			break;
 +		case IPV6_REASSM_TABLE:
 +			ipv6_reassly_tbl_info = info;
-+#ifdef FM_EHASH_DEBUG
-+			printk("%s::saving ipv6_reassly_tbl_info %p\n",
-+					__func__, ipv6_reassly_tbl_info);
-+#endif
 +			break;
 +		default:
 +			break;
 +	}
 +#endif
-+#ifdef FM_EHASH_DEBUG
-+	//display_ehashtbl_info(info, __func__);
-+	printk("%s::handle %p\n", __func__, info);
-+#endif //FM_EHASH_DEBUG
 +	return (t_Handle)info;
 +err_ret:
 +	Delete_EnEhashInfo(info);	
@@ -7593,15 +7244,8 @@ index 000000000000..6ecbc92fac54
 +			//Keygen
 +			t_FmPcdCcNextKgParams *kgparams;
 +			kgparams = &p_FmPcdCcNextEngineParams->params.kgParams;
-+#ifdef FM_EHASH_DEBUG
-+			printk("%s::Nextengine = KG, kgparams->h_DirectScheme %p\n",
-+				__func__, kgparams->h_DirectScheme);
-+#endif
 +			node.nia = (NIA_ENG_KG | NIA_KG_DIRECT | NIA_KG_CC_EN);
 +			node.nia |= FmPcdKgGetSchemeId(kgparams->h_DirectScheme);
-+#ifdef FM_EHASH_DEBUG
-+			disp_sch_info(kgparams->h_DirectScheme);
-+#endif
 +			node.miss_action_type = EN_EHASH_MISS_ACTION_NIA;
 +			break;
 +		}
@@ -7611,10 +7255,6 @@ index 000000000000..6ecbc92fac54
 +			t_FmPcdCcNextEnqueueParams *enqparams;
 +			enqparams =
 +				&p_FmPcdCcNextEngineParams->params.enqueueParams;
-+#ifdef FM_EHASH_DEBUG
-+			printk("%s:: EN_EHASH_MISS_ACTION_NIA %d , ovrdfqid %d\n",
-+				__func__, EN_EHASH_MISS_ACTION_NIA,enqparams->overrideFqid);
-+#endif
 +			if (enqparams->overrideFqid)
 +				node.fqid = enqparams->newFqid;
 +			if (enqparams->overrideFqid)
@@ -7641,27 +7281,11 @@ index 000000000000..6ecbc92fac54
 +
 +		default:
 +			node.miss_action_type = EN_EHASH_MISS_ACTION_DROP;
-+#ifdef FM_EHASH_DEBUG
-+			printk("%s::Nextengine type %d not supported, drop case\n", __func__,
-+				p_FmPcdCcNextEngineParams->nextEngine);
-+#endif
 +			break;
 +	}
 +	//write the new params
 +	WRITE_UINT32(((struct en_exthash_node *)info->h_Ad)->word_2, node.word_2);
 +	WRITE_UINT32(((struct en_exthash_node *)info->h_Ad)->word_0, node.word_0);
-+#ifdef FM_EHASH_DEBUG
-+	node.word_0 = GET_UINT32(((struct en_exthash_node *)info->h_Ad)->word_0);
-+	node.table_base_lo = GET_UINT32(((struct en_exthash_node *)info->h_Ad)->table_base_lo);
-+	printk("ad_word_0::%p, %08x\n", &(((struct en_exthash_node *)info->h_Ad)->word_0),
-+                                       node.word_0);
-+	printk("ad_word_1::%p, %08x\n", &(((struct en_exthash_node *)info->h_Ad)->table_base_lo),
-+                                       node.table_base_lo);
-+	printk("ad_word_2::%p, %08x\n", &(((struct en_exthash_node *)info->h_Ad)->word_1),
-+                                       node.word_1);
-+	printk("ad_word_3::%p, %08x\n", &(((struct en_exthash_node *)info->h_Ad)->word_2),
-+                                       node.word_2);
-+#endif
 +	return E_OK;
 +}
 +
@@ -7694,9 +7318,6 @@ index 000000000000..6ecbc92fac54
 +	uint64_t update_entry; 
 +#endif // NO_CUMULATIVE_ENTRY
 +
-+#ifdef FM_EHASH_DEBUG
-+	printk("%s::tbl %p, index %x\n", __func__, h_HashTbl, index);
-+#endif
 +	info = (struct en_exthash_info *)h_HashTbl;
 +	bucket = ((struct en_exthash_bucket *)info->table_base + index);
 +	entry = (struct en_exthash_tbl_entry *)tbl_entry;
@@ -7977,47 +7598,6 @@ index 000000000000..6ecbc92fac54
 +		
 +	}
 +
-+#ifdef FM_EHASH_DEBUG
-+	printk("%s(%d)\n",__func__,__LINE__);
-+	cumulative_entry = XX_PhysToVirt(SwapUint64(bucket->h));
-+	if (!cumulative_entry)
-+		return 0;
-+	if (!(cumulative_entry->flags & EN_CUMULATIVE_NODE))
-+	{
-+		printk("head ptr: %p\n", cumulative_entry);
-+	}
-+	while (cumulative_entry && (cumulative_entry->flags & EN_CUMULATIVE_NODE))
-+	{
-+		printk("cumulative entry : %p \n", cumulative_entry);
-+		{
-+			uint32_t ii;
-+		
-+			printk("flags: 0x%x, key-size %d, key_entries: %d, nodes_index: %d, next_entry 0x%lx\n", 
-+				cumulative_entry->flags, 
-+				cumulative_entry->key_size, cumulative_entry->num_key_entries, cumulative_entry->tbl_entry_index,
-+				(long unsigned int)(cumulative_entry->next_entry_addr));
-+			printk("cumulative key: \n");
-+			for (ii=0; ii<((cumulative_entry->key_size*cumulative_entry->num_key_entries)+1); ii++)
-+			{
-+				if ((ii % 16) == 0)
-+					printk("\n");
-+				printk("%02x ", cumulative_entry->data[ii]);
-+			}
-+			printk(" table entries (%d) : \n",cumulative_entry->num_key_entries);
-+			for (ii = 0; ii < cumulative_entry->num_key_entries; ii++) {
-+				phyaddr = *((uint64_t *)(&cumulative_entry->data[cumulative_entry->tbl_entry_index-12+ii*8]));
-+				printk("table_entry ptr[%d]: %p\n", ii, XX_PhysToVirt(SwapUint64(phyaddr)));
-+			}
-+			printk("\n");
-+		}
-+		if (cumulative_entry->flags & EN_NEXT_CUMULATIVE_NODE)
-+		{
-+			cumulative_entry = XX_PhysToVirt(SwapUint64(cumulative_entry->next_entry_addr));
-+		}
-+		else
-+			cumulative_entry = NULL;
-+	}
-+#endif // FM_EHASH_DEBUG
 +#endif // NO_CUMULATIVE_ENTRY
 +#ifdef NO_CUMULATIVE_ENTRY
 +	XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
@@ -8110,7 +7690,7 @@ index 000000000000..6ecbc92fac54
 +		}
 +	}
 +	sbuf += sprintf(sbuf, "\n");
-+	printk("%s", buf);
++	pr_debug("%s", buf);
 +	kfree(buf);	
 +}
 +
@@ -9399,51 +8979,21 @@ index 5f3e2cd9b05e..60bdf910ee48 100644
 +}
 +EXPORT_SYMBOL(FM_VSP_GetRelativeProfileId);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
-index 01ab5788059a..c9efafafd393 100644
+index 01ab5788059a..2fe770a2e0bc 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
-@@ -49,6 +49,9 @@
- #include "fm_ipc.h"
- #include "fm.h"
- #include "fsl_fman.h"
-+#ifdef AUTO_FIRMWARE_LOAD
-+#include <linux/fsl/ls1043_r2.h>
-+#endif // AUTO_FIRMWARE_LOAD
- 
- #define __ERR_MODULE__  MODULE_FM
- 
-@@ -3270,6 +3273,9 @@ t_Error FmDumpPortRegs (t_Handle h_Fm, uint8_t hardwarePortId)
+@@ -3270,7 +3270,6 @@ t_Error FmDumpPortRegs (t_Handle h_Fm, uint8_t hardwarePortId)
  }
  #endif /* (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0)) */
  
-+#ifdef AUTO_FIRMWARE_LOAD
-+uint32_t fman_firmware[] = LS1043_R1_0_UC_IMG;
-+#endif //AUTO_FIRMWARE_LOAD
- 
+-
  /*****************************************************************************/
  /*                      API Init unit functions                              */
-@@ -3387,6 +3393,7 @@ t_Handle FM_Config(t_FmParams *p_FmParam)
-     p_Fm->resetOnInit = FM_RESET_ON_INIT;
-     p_Fm->f_ResetOnInitOverride = FM_RESET_ON_INIT_OVERRIDE_CALLBACK;
-     p_Fm->fwVerify = FM_VERIFY_UCODE;
-+#ifndef AUTO_FIRMWARE_LOAD
-     p_Fm->firmware.size                        = p_FmParam->firmware.size;
-     if (p_Fm->firmware.size)
-     {
-@@ -3403,6 +3410,23 @@ t_Handle FM_Config(t_FmParams *p_FmParam)
+ /*****************************************************************************/
+@@ -3403,6 +3402,13 @@ t_Handle FM_Config(t_FmParams *p_FmParam)
          }
          memcpy(p_Fm->firmware.p_Code, p_FmParam->firmware.p_Code ,p_Fm->firmware.size);
      }
-+#else
-+    p_Fm->firmware.size                        = 0;
-+    {
-+        p_Fm->firmware.size = sizeof(fman_firmware);
-+        p_Fm->firmware.p_Code = fman_firmware;
-+    }
-+    printk("%s(%d) FMAN version extracted from ls1043_r2.h: (%d.%d.%d) (0x%x) \n",
-+		 __func__,__LINE__, (fman_firmware[1] & 0xffff0000) >> 16, (fman_firmware[1] & 0x0000ff00) >> 8,
-+		fman_firmware[1] & 0x000000ff, fman_firmware[1]);
-+#endif //AUTO_FIRMWARE_LOAD
 +    printk("***************************************************************\n");
 +    printk("%s(%d) FMan-Controller code (ver %d.%d.%d) (0x%x)\n", __func__,__LINE__,
 +               ((p_Fm->firmware.p_Code)[1] & 0xffff0000) >> 16 ,
@@ -9454,7 +9004,7 @@ index 01ab5788059a..c9efafafd393 100644
  
      if (p_Fm->guestId != NCSW_MASTER_ID)
          return p_Fm;
-@@ -3516,6 +3540,11 @@ t_Error FM_Init(t_Handle h_Fm)
+@@ -3516,6 +3522,11 @@ t_Error FM_Init(t_Handle h_Fm)
              RETURN_ERROR(MAJOR, err, NO_MSG);
  #else  /* not FM_UCODE_NOT_RESET_ERRATA_BUGZILLA6173 */
  
@@ -9466,79 +9016,30 @@ index 01ab5788059a..c9efafafd393 100644
          if (p_Fm->f_ResetOnInitOverride)
          {
          	/* Perform user specific FMan reset */
-@@ -3653,12 +3682,13 @@ t_Error FM_Init(t_Handle h_Fm)
+@@ -3653,12 +3664,11 @@ t_Error FM_Init(t_Handle h_Fm)
  
      EnableTimeStamp(p_Fm);
  
 -    if (p_Fm->firmware.p_Code)
 -    {
-+#ifndef AUTO_FIRMWARE_LOAD
 +   if (p_Fm->firmware.p_Code)
 +   {
          XX_Free(p_Fm->firmware.p_Code);
          p_Fm->firmware.p_Code = NULL;
      }
 -
-+#endif //AUTO_FIRMWARE_LOAD
      XX_Free(p_Fm->p_FmDriverParam);
      p_Fm->p_FmDriverParam = NULL;
  
-@@ -3741,8 +3771,10 @@ t_Error FM_Free(t_Handle h_Fm)
- 
+@@ -3742,7 +3752,7 @@ t_Error FM_Free(t_Handle h_Fm)
      if (p_Fm->p_FmDriverParam)
      {
-+#ifndef AUTO_FIRMWARE_LOAD
          if (p_Fm->firmware.p_Code)
 -            XX_Free(p_Fm->firmware.p_Code);
 +           XX_Free(p_Fm->firmware.p_Code);
-+#endif //AUTO_FIRMWARE_LOAD
          XX_Free(p_Fm->p_FmDriverParam);
          p_Fm->p_FmDriverParam = NULL;
      }
-@@ -3757,6 +3789,43 @@ t_Error FM_Free(t_Handle h_Fm)
-     return E_OK;
- }
- 
-+uint32_t FM_ReadTimeStamp(t_Handle h_Fm)
-+{
-+    t_Fm *p_Fm = (t_Fm*)h_Fm;
-+    struct fman_fpm_regs *fpm_reg;
-+
-+    SANITY_CHECK_RETURN_ERROR(p_Fm, 0);
-+
-+    fpm_reg = p_Fm->p_FmFpmRegs;
-+
-+    ASSERT_COND(p_Fm->p_FmStateStruct);
-+
-+    if (!p_Fm->p_FmStateStruct->enabledTimeStamp) {
-+        REPORT_ERROR(MAJOR, E_INVALID_STATE,
-+				("Timestamp not enabled on this FMan"));
-+	return 0;
-+    }
-+
-+    return GET_UINT32(fpm_reg->fmfp_tsp);
-+}
-+
-+uint32_t FM_GetTimeStampIncrementPerUsec(t_Handle h_Fm)
-+{
-+    t_Fm *p_Fm = (t_Fm*)h_Fm;
-+
-+    SANITY_CHECK_RETURN_ERROR(p_Fm, 0);
-+
-+    ASSERT_COND(p_Fm->p_FmStateStruct);
-+
-+    if (!p_Fm->p_FmStateStruct->enabledTimeStamp) {
-+        REPORT_ERROR(MAJOR, E_INVALID_STATE,
-+				("Timestamp not enabled on this FMan"));
-+	return 0;
-+    }
-+
-+    return (uint32_t)0x1 << p_Fm->p_FmStateStruct->count1MicroBit;
-+}
-+
- /*************************************************/
- /*       API Advanced Init unit functions        */
- /*************************************************/
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
 index 8ab81ac69431..948daf8ea03b 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm_muram.c
@@ -9937,10 +9438,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..5592b0812230
+index 000000000000..263145a804da
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1609 @@
+@@ -0,0 +1,1608 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -11536,7 +11037,6 @@ index 000000000000..5592b0812230
 +extern int ExternalHashTableFmPcdHcSync(void *h_HashTbl);
 +extern void *ExternalHashTableAllocCumulativeEntry(void *h_HashTbl);
 +extern void ExternalHashTableCumulativeEntryFree(void *entry);
-+extern void EhashTableWalk(void *h_HashTbl);
 +extern int ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
 +				struct en_tbl_entry_stats *stats);
 +extern int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
@@ -11551,7 +11051,7 @@ index 000000000000..5592b0812230
 +
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ext.h
-index fccf32569a7b..004e4dc8909e 100644
+index fccf32569a7b..2534cce23e49 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ext.h
 @@ -182,6 +182,21 @@ typedef _Packed struct t_FmPrsResult {
@@ -11576,45 +11076,6 @@ index fccf32569a7b..004e4dc8909e 100644
  #define FM_FD_RX_STATUS_ERR_MASK        (FM_FD_ERR_UNSUPPORTED_FORMAT   | \
                                           FM_FD_ERR_LENGTH               | \
                                           FM_FD_ERR_DMA                  | \
-@@ -1478,6 +1493,38 @@ t_Error FM_SetPortsBandwidth(t_Handle h_Fm, t_FmPortsBandwidthParams *p_PortsBan
- *//***************************************************************************/
- t_Handle FM_GetMuramHandle(t_Handle h_Fm);
- 
-+/**************************************************************************//*
-+ @Function      FM_ReadTimeStamp
-+
-+ @Description   Reads the FMan engine's timestamp.
-+
-+ @Param[in]     h_Fm                A handle to an FM Module.
-+
-+ @Return        The indicated engine's timestamp on success; zero otherwise.
-+
-+ @Cautions      Allowed only following FM_Init().
-+                This routine should NOT be called from guest-partition
-+                (i.e. guestId != NCSW_MASTER_ID)
-+*//***************************************************************************/
-+uint32_t FM_ReadTimeStamp(t_Handle h_Fm);
-+
-+/**************************************************************************//*
-+ @Function      FM_GetTimeStampIncrementPerUsec
-+
-+ @Description   Provides the value of the FMan engine's timestamp increment
-+                per microsecond.
-+
-+ @Param[in]     h_Fm                A handle to an FM Module.
-+
-+ @Return        The value the timestamp is incremented with each microsecond
-+                on success; zero otherwise.
-+
-+ @Cautions      Allowed only following FM_Init().
-+                This routine should NOT be called from guest-partition
-+                (i.e. guestId != NCSW_MASTER_ID)
-+*//***************************************************************************/
-+uint32_t FM_GetTimeStampIncrementPerUsec(t_Handle h_Fm);
-+
- /** @} */ /* end of FM_runtime_control_grp group */
- /** @} */ /* end of FM_lib_grp group */
- /** @} */ /* end of FM_grp group */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
 index 16db1a125124..abb0706798b2 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_mac_ext.h
@@ -11939,18 +11400,6 @@ index f9aed0363d7c..741d0ab8a2e7 100644
  
  /** @} */ /* end of FM_VSP_control_grp group */
  /** @} */ /* end of FM_VSP_grp group */
-diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman.h b/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman.h
-index 6136c46e8667..48d9a3e2acd0 100644
---- a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman.h
-+++ b/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman.h
-@@ -35,6 +35,7 @@
- 
- #include "std_ext.h"
- 
-+//#define AUTO_FIRMWARE_LOAD 1  // currently flash the bin file
- struct fman_ext_pool_params {
- 	uint8_t                 id;    /**< External buffer pool id */
- 	uint16_t                size;  /**< External buffer pool buffer size */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_port.h b/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_port.h
 index 080a23e963b9..7432ac2ef09c 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/flib/fsl_fman_port.h
@@ -12122,7 +11571,7 @@ index b52ff95ce9e9..e8cc4b0c21d2 100644
  }
 +EXPORT_SYMBOL(SYS_VirtToPhys);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
-index e10512983b60..7ebc4ecdf6e3 100644
+index e10512983b60..ff447948ff4f 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 @@ -69,6 +69,7 @@
@@ -12176,7 +11625,7 @@ index e10512983b60..7ebc4ecdf6e3 100644
  u64 *fm_port_get_buffer_time_stamp(const struct fm_port *port,
  		const void *data)
  {
-@@ -1610,12 +1640,28 @@ int fm_mac_resume(struct fm_mac_dev *fm_mac_dev)
+@@ -1610,6 +1640,21 @@ int fm_mac_resume(struct fm_mac_dev *fm_mac_dev)
  }
  EXPORT_SYMBOL(fm_mac_resume);
  
@@ -12189,7 +11638,7 @@ index e10512983b60..7ebc4ecdf6e3 100644
 +	err = FM_MAC_SetAllMulti(fm_mac_dev, enable);
 +	_errno = -GET_ERROR_TYPE(err);
 +	if (unlikely(_errno < 0))
-+		pr_err("FM_MAC_SetPromiscuous() = 0x%08x\n", err);
++		pr_err("FM_MAC_SetAllMulti() = 0x%08x\n", err);
 +
 +	return _errno;
 +}
@@ -12198,13 +11647,6 @@ index e10512983b60..7ebc4ecdf6e3 100644
  int fm_mac_set_promiscuous(struct fm_mac_dev *fm_mac_dev,
  		bool enable)
  {
- 	int	_errno;
- 	t_Error	err;
- 
-+        printk("%s::%d \r\n", __func__, __LINE__);
- 	err = FM_MAC_SetPromiscuous(fm_mac_dev, enable);
- 	_errno = -GET_ERROR_TYPE(err);
- 	if (unlikely(_errno < 0))
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h
 index 6e6f07eb499e..8082ab10fb43 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h
@@ -12240,7 +11682,7 @@ index ea4235847686..1aa05d79cfdf 100644
  
      if (CheckNConfigFmPortAdvArgs(p_LnxWrpFmPortDev) != E_OK)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
-index f97c37f06255..3264467869d3 100644
+index f97c37f06255..78fe633948ef 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 @@ -2173,6 +2173,11 @@ Status: not exported
@@ -12314,38 +11756,7 @@ index f97c37f06255..3264467869d3 100644
              RETURN_ERROR(MINOR, E_INVALID_SELECTION,
                  ("invalid ioctl: cmd:0x%08x(type:0x%02x, nr: %d.\n",
                  cmd, _IOC_TYPE(cmd), _IOC_NR(cmd)));
-@@ -3651,6 +3671,30 @@ t_Error LnxwrpFmIOCTL(t_LnxWrpFmDev *p_LnxWrpFmDev, unsigned int cmd, unsigned l
-         }
-         break;
- 
-+        case FM_IOC_READ_TIMESTAMP:
-+        {
-+            uint32_t ts;
-+
-+            ts = FM_ReadTimeStamp(p_LnxWrpFmDev->h_Dev);
-+
-+            if (copy_to_user((uint32_t *)arg, &ts, sizeof(uint32_t)))
-+                err = E_READ_FAILED;
-+
-+        }
-+        break;
-+
-+        case FM_IOC_GET_TIMESTAMP_INCREMENT:
-+        {
-+            uint32_t ts_inc;
-+
-+            ts_inc = FM_GetTimeStampIncrementPerUsec(p_LnxWrpFmDev->h_Dev);
-+
-+            if (copy_to_user((uint32_t *)arg, &ts_inc, sizeof(uint32_t)))
-+                err = E_READ_FAILED;
-+
-+        }
-+        break;
-+
-         default:
-             return LnxwrpFmPcdIOCTL(p_LnxWrpFmDev, cmd, arg, compat);
-     }
-@@ -4612,6 +4656,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4612,6 +4632,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
          }
  
          default:
@@ -12749,7 +12160,7 @@ index 114e2773845b..a44e26aff945 100644
  int qman_ceetm_get_xsfdr(enum qm_dc_portal portal, unsigned int *num)
  {
 diff --git a/drivers/staging/fsl_qbman/qman_high.c b/drivers/staging/fsl_qbman/qman_high.c
-index 4085aa9a2dcb..96c3122e665b 100644
+index 4085aa9a2dcb..11acbb6c461f 100644
 --- a/drivers/staging/fsl_qbman/qman_high.c
 +++ b/drivers/staging/fsl_qbman/qman_high.c
 @@ -34,6 +34,9 @@
@@ -12762,41 +12173,16 @@ index 4085aa9a2dcb..96c3122e665b 100644
  /* Compilation constants */
  #define DQRR_MAXFILL	15
  #define EQCR_ITHRESH	4	/* if EQCR congests, interrupt threshold */
-@@ -69,6 +72,33 @@
+@@ -69,6 +72,8 @@
  			spin_unlock(&__fq478->fqlock); \
  	} while (0)
  
-+#if 1
 +#define display_ceetm_cmd(a,b,c)
-+#else
-+#define display_ceetm_cmd(a, b, c) _display_ceetm_cmd((char *)__func__, a, b, c)
-+static void _display_ceetm_cmd(char *func, uint32_t verb, void *buf, uint32_t size)
-+{
-+	uint8_t *ptr;
-+	uint32_t ii,jj=0;
-+	uint8_t buff[200];
-+
-+	ptr = buf;
-+	jj = sprintf(buff, "%s::\n%02x ", func, verb);
-+	for (ii = 1; ii <= size; ii++) {
-+		if (ii && ((ii % 16) == 0))
-+		{
-+			buff[jj] = 0;
-+			printk("%s\n", buff);
-+			jj = 0;
-+		}
-+		jj += sprintf(buff+jj, "%02x ", *ptr);
-+		ptr++;
-+	}
-+	buff[jj] = 0;
-+	printk("%s\n\n", buff);
-+}
-+#endif
 +
  static inline void fq_set(struct qman_fq *fq, u32 mask)
  {
  	set_bits(mask, &fq->flags);
-@@ -128,6 +158,10 @@ struct qman_portal {
+@@ -128,6 +133,10 @@ struct qman_portal {
  	u8 alloced;
  	/* power management data */
  	u32 save_isdr;
@@ -12807,7 +12193,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
  	/* Keep a shadow copy of the DQRR on LE systems as the SW needs to
  	 * do byte swaps of DQRR read only memory.  First entry must be aligned
-@@ -473,7 +507,16 @@ static irqreturn_t portal_isr(__always_unused int irq, void *ptr)
+@@ -473,7 +482,16 @@ static irqreturn_t portal_isr(__always_unused int irq, void *ptr)
  
  	/* DQRR-handling if it's interrupt-driven */
  	if (is & QM_PIRQ_DQRI) {
@@ -12824,7 +12210,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  		clear = QM_DQAVAIL_MASK | QM_PIRQ_DQRI;
  	}
  
-@@ -575,6 +618,27 @@ struct dev_pm_domain qman_portal_device_pm_domain = {
+@@ -575,6 +593,27 @@ struct dev_pm_domain qman_portal_device_pm_domain = {
  	}
  };
  
@@ -12852,7 +12238,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  struct qman_portal *qman_create_portal(
  			struct qman_portal *portal,
  			const struct qm_portal_config *config,
-@@ -737,6 +801,12 @@ struct qman_portal *qman_create_portal(
+@@ -737,6 +776,12 @@ struct qman_portal *qman_create_portal(
  			goto fail_dqrr_mr_empty;
  		}
  	}
@@ -12865,7 +12251,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	/* Success */
  	portal->config = config;
  	/*
-@@ -832,6 +902,11 @@ void qman_destroy_portal(struct qman_portal *qm)
+@@ -832,6 +877,11 @@ void qman_destroy_portal(struct qman_portal *qm)
  	const struct qm_portal_config *pcfg;
  	int i;
  
@@ -12877,7 +12263,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	/* Stop dequeues on the portal */
  	qm_dqrr_sdqcr_set(&qm->p, 0);
  
-@@ -3170,6 +3245,7 @@ static int qman_ceetm_configure_lfqmt(struct qm_mcc_ceetm_lfqmt_config *opts)
+@@ -3170,6 +3220,7 @@ static int qman_ceetm_configure_lfqmt(struct qm_mcc_ceetm_lfqmt_config *opts)
  	p = get_affine_portal();
  	PORTAL_IRQ_LOCK(p, irqflags);
  
@@ -12885,7 +12271,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	mcc = qm_mc_start(&p->p);
  	mcc->lfqmt_config = *opts;
  	qm_mc_commit(&p->p, QM_CEETM_VERB_LFQMT_CONFIG);
-@@ -3233,6 +3309,7 @@ static int qman_ceetm_configure_cq(struct qm_mcc_ceetm_cq_config *opts)
+@@ -3233,6 +3284,7 @@ static int qman_ceetm_configure_cq(struct qm_mcc_ceetm_cq_config *opts)
  
  	mcc = qm_mc_start(&p->p);
  	mcc->cq_config = *opts;
@@ -12893,7 +12279,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	qm_mc_commit(&p->p, QM_CEETM_VERB_CQ_CONFIG);
  	while (!(mcr = qm_mc_result(&p->p)))
  		cpu_relax();
-@@ -3296,7 +3373,7 @@ static int qman_ceetm_configure_dct(struct qm_mcc_ceetm_dct_config *opts)
+@@ -3296,7 +3348,7 @@ static int qman_ceetm_configure_dct(struct qm_mcc_ceetm_dct_config *opts)
  
  	p = get_affine_portal();
  	PORTAL_IRQ_LOCK(p, irqflags);
@@ -12902,7 +12288,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	mcc = qm_mc_start(&p->p);
  	mcc->dct_config = *opts;
  	qm_mc_commit(&p->p, QM_CEETM_VERB_DCT_CONFIG);
-@@ -3360,6 +3437,8 @@ static int qman_ceetm_configure_class_scheduler(
+@@ -3360,6 +3412,8 @@ static int qman_ceetm_configure_class_scheduler(
  
  	mcc = qm_mc_start(&p->p);
  	mcc->csch_config = *opts;
@@ -12911,7 +12297,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	qm_mc_commit(&p->p, QM_CEETM_VERB_CLASS_SCHEDULER_CONFIG);
  	while (!(mcr = qm_mc_result(&p->p)))
  		cpu_relax();
-@@ -3410,7 +3489,7 @@ static int qman_ceetm_query_class_scheduler(struct qm_ceetm_channel *channel,
+@@ -3410,7 +3464,7 @@ static int qman_ceetm_query_class_scheduler(struct qm_ceetm_channel *channel,
  	return 0;
  }
  
@@ -12920,7 +12306,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  		struct qm_mcc_ceetm_mapping_shaper_tcfc_config *opts)
  {
  	struct qm_mc_command *mcc;
-@@ -3423,6 +3502,8 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(
+@@ -3423,6 +3477,8 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(
  	PORTAL_IRQ_LOCK(p, irqflags);
  
  	mcc = qm_mc_start(&p->p);
@@ -12929,7 +12315,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	mcc->mst_config = *opts;
  	qm_mc_commit(&p->p, QM_CEETM_VERB_MAPPING_SHAPER_TCFC_CONFIG);
  	while (!(mcr = qm_mc_result(&p->p)))
-@@ -3440,6 +3521,7 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(
+@@ -3440,6 +3496,7 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(
  	}
  	return 0;
  }
@@ -12937,7 +12323,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  
  static int qman_ceetm_query_mapping_shaper_tcfc(
  		struct qm_mcc_ceetm_mapping_shaper_tcfc_query *opts,
-@@ -3485,7 +3567,7 @@ static int qman_ceetm_configure_ccgr(struct qm_mcc_ceetm_ccgr_config *opts)
+@@ -3485,7 +3542,7 @@ static int qman_ceetm_configure_ccgr(struct qm_mcc_ceetm_ccgr_config *opts)
  
  	p = get_affine_portal();
  	PORTAL_IRQ_LOCK(p, irqflags);
@@ -12946,7 +12332,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	mcc = qm_mc_start(&p->p);
  	mcc->ccgr_config = *opts;
  
-@@ -3903,6 +3985,7 @@ int qman_ceetm_lni_enable_shaper(struct qm_ceetm_lni *lni, int coupled,
+@@ -3903,6 +3960,7 @@ int qman_ceetm_lni_enable_shaper(struct qm_ceetm_lni *lni, int coupled,
  	lni->shaper_couple = coupled;
  	lni->oal = oal;
  
@@ -12954,7 +12340,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_LNI_SHAPER | lni->idx);
  	config_opts.dcpid = lni->dcp_idx;
  	config_opts.shaper_config.cpl = coupled;
-@@ -3936,7 +4019,8 @@ int qman_ceetm_lni_disable_shaper(struct qm_ceetm_lni *lni)
+@@ -3936,7 +3994,8 @@ int qman_ceetm_lni_disable_shaper(struct qm_ceetm_lni *lni)
  		pr_err("The shaper has been disabled\n");
  		return -EINVAL;
  	}
@@ -12964,7 +12350,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_LNI_SHAPER | lni->idx);
  	config_opts.dcpid = lni->dcp_idx;
  	config_opts.shaper_config.cpl = lni->shaper_couple;
-@@ -4173,6 +4257,7 @@ int qman_ceetm_lni_set_tcfcc(struct qm_ceetm_lni *lni,
+@@ -4173,6 +4232,7 @@ int qman_ceetm_lni_set_tcfcc(struct qm_ceetm_lni *lni,
  		return -EINVAL;
  	}
  
@@ -12972,7 +12358,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	query_opts.cid = cpu_to_be16(CEETM_COMMAND_TCFC | lni->idx);
  	query_opts.dcpid = lni->dcp_idx;
  	if (qman_ceetm_query_mapping_shaper_tcfc(&query_opts, &query_result)) {
-@@ -4254,6 +4339,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
+@@ -4254,6 +4314,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
  	p = kzalloc(sizeof(*p), GFP_KERNEL);
  	if (!p)
  		return -ENOMEM;
@@ -12980,7 +12366,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	p->idx = channel_idx;
  	p->dcp_idx = lni->dcp_idx;
  	p->lni_idx = lni->idx;
-@@ -4264,7 +4350,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
+@@ -4264,7 +4325,7 @@ int qman_ceetm_channel_claim(struct qm_ceetm_channel **channel,
  						channel_idx);
  	config_opts.dcpid = lni->dcp_idx;
  	config_opts.channel_mapping.map_lni_id = lni->idx;
@@ -12989,7 +12375,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	if (qman_ceetm_configure_mapping_shaper_tcfc(&config_opts)) {
  		pr_err("Can't map channel#%d for LNI#%d\n",
  						channel_idx, lni->idx);
-@@ -4296,7 +4382,7 @@ int qman_ceetm_channel_release(struct qm_ceetm_channel *channel)
+@@ -4296,7 +4357,7 @@ int qman_ceetm_channel_release(struct qm_ceetm_channel *channel)
  			channel->dcp_idx);
  		return -EINVAL;
  	}
@@ -12998,7 +12384,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_SHAPER |
  				      channel->idx);
  	config_opts.dcpid = channel->dcp_idx;
-@@ -4334,7 +4420,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
+@@ -4334,7 +4395,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
  		pr_err("This channel shaper has been enabled!\n");
  		return -EINVAL;
  	}
@@ -13007,7 +12393,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	channel->shaper_enable = 1;
  	channel->shaper_couple = coupled;
  
-@@ -4347,6 +4433,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
+@@ -4347,6 +4408,7 @@ int qman_ceetm_channel_enable_shaper(struct qm_ceetm_channel *channel,
  		return -EINVAL;
  	}
  
@@ -13015,7 +12401,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_MAPPING |
  						channel->idx);
  	config_opts.dcpid = channel->dcp_idx;
-@@ -4441,7 +4528,7 @@ int qman_ceetm_channel_set_commit_rate(struct qm_ceetm_channel *channel,
+@@ -4441,7 +4503,7 @@ int qman_ceetm_channel_set_commit_rate(struct qm_ceetm_channel *channel,
  		pr_err("Fail to get the current channel shaper setting\n");
  		return -EINVAL;
  	}
@@ -13024,7 +12410,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	channel->cr_token_rate.whole = token_rate->whole;
  	channel->cr_token_rate.fraction = token_rate->fraction;
  	channel->cr_token_bucket_limit = token_limit;
-@@ -4534,7 +4621,8 @@ int qman_ceetm_channel_set_excess_rate(struct qm_ceetm_channel *channel,
+@@ -4534,7 +4596,8 @@ int qman_ceetm_channel_set_excess_rate(struct qm_ceetm_channel *channel,
  		pr_err("Fail to get the current channel shaper setting\n");
  		return -EINVAL;
  	}
@@ -13034,7 +12420,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	channel->er_token_rate.whole = token_rate->whole;
  	channel->er_token_rate.fraction = token_rate->fraction;
  	channel->er_token_bucket_limit = token_limit;
-@@ -4618,7 +4706,7 @@ int qman_ceetm_channel_set_weight(struct qm_ceetm_channel *channel,
+@@ -4618,7 +4681,7 @@ int qman_ceetm_channel_set_weight(struct qm_ceetm_channel *channel,
  		pr_err("This channel is a shaped one\n");
  		return -EINVAL;
  	}
@@ -13043,7 +12429,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	channel->cr_token_bucket_limit = token_limit;
  	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_SHAPER |
  						channel->idx);
-@@ -4668,7 +4756,7 @@ int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int group_b,
+@@ -4668,7 +4731,7 @@ int qman_ceetm_channel_set_group(struct qm_ceetm_channel *channel, int group_b,
  		pr_err("Can't query channel#%d's scheduler!\n", channel->idx);
  		return -EINVAL;
  	}
@@ -13052,7 +12438,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	config_opts.cqcid = cpu_to_be16(channel->idx);
  	config_opts.dcpid = channel->dcp_idx;
  	config_opts.gpc_combine_flag = !group_b;
-@@ -4759,6 +4847,7 @@ int qman_ceetm_channel_set_group_er_eligibility(struct qm_ceetm_channel
+@@ -4759,6 +4822,7 @@ int qman_ceetm_channel_set_group_er_eligibility(struct qm_ceetm_channel
  						channel->idx);
  		return -EINVAL;
  	}
@@ -13060,7 +12446,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	csch_config.cqcid = cpu_to_be16(channel->idx);
  	csch_config.dcpid = channel->dcp_idx;
  	csch_config.gpc_combine_flag = csch_query.gpc_combine_flag;
-@@ -4806,6 +4895,7 @@ int qman_ceetm_channel_set_cq_cr_eligibility(struct qm_ceetm_channel *channel,
+@@ -4806,6 +4870,7 @@ int qman_ceetm_channel_set_cq_cr_eligibility(struct qm_ceetm_channel *channel,
  						channel->idx);
  		return -EINVAL;
  	}
@@ -13068,7 +12454,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	csch_config.cqcid = cpu_to_be16(channel->idx);
  	csch_config.dcpid = channel->dcp_idx;
  	csch_config.gpc_combine_flag = csch_query.gpc_combine_flag;
-@@ -4889,7 +4979,7 @@ int qman_ceetm_cq_claim(struct qm_ceetm_cq **cq,
+@@ -4889,7 +4954,7 @@ int qman_ceetm_cq_claim(struct qm_ceetm_cq **cq,
  		pr_err("Can't allocate memory for CQ#%d!\n", idx);
  		return -ENOMEM;
  	}
@@ -13077,7 +12463,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	list_add_tail(&p->node, &channel->class_queues);
  	p->idx = idx;
  	p->is_claimed = 1;
-@@ -4938,7 +5028,7 @@ int qman_ceetm_cq_claim_A(struct qm_ceetm_cq **cq,
+@@ -4938,7 +5003,7 @@ int qman_ceetm_cq_claim_A(struct qm_ceetm_cq **cq,
  		pr_err("Can't allocate memory for CQ#%d!\n", idx);
  		return -ENOMEM;
  	}
@@ -13086,7 +12472,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	list_add_tail(&p->node, &channel->class_queues);
  	p->idx = idx;
  	p->is_claimed = 1;
-@@ -4986,7 +5076,7 @@ int qman_ceetm_cq_claim_B(struct qm_ceetm_cq **cq,
+@@ -4986,7 +5051,7 @@ int qman_ceetm_cq_claim_B(struct qm_ceetm_cq **cq,
  		pr_err("Can't allocate memory for CQ#%d!\n", idx);
  		return -ENOMEM;
  	}
@@ -13095,7 +12481,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	list_add_tail(&p->node, &channel->class_queues);
  	p->idx = idx;
  	p->is_claimed = 1;
-@@ -5040,7 +5130,7 @@ int qman_ceetm_set_queue_weight(struct qm_ceetm_cq *cq,
+@@ -5040,7 +5105,7 @@ int qman_ceetm_set_queue_weight(struct qm_ceetm_cq *cq,
  						cq->parent->idx);
  		return -EINVAL;
  	}
@@ -13104,7 +12490,7 @@ index 4085aa9a2dcb..96c3122e665b 100644
  	config_opts.cqcid = cpu_to_be16(cq->parent->idx);
  	config_opts.dcpid = cq->parent->dcp_idx;
  	config_opts.crem = query_result.crem;
-@@ -5257,6 +5347,7 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
+@@ -5257,6 +5322,7 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
  	p = kmalloc(sizeof(*p), GFP_KERNEL);
  	if (!p)
  		return -ENOMEM;
@@ -13369,22 +12755,13 @@ index c24f471bda76..b62619fa3a53 100644
  } ioc_fm_pcd_hash_table_params_t;
  
 diff --git a/include/uapi/linux/if.h b/include/uapi/linux/if.h
-index 797ba2c1562a..ba46e4f8b021 100644
+index 797ba2c1562a..1fd18997282c 100644
 --- a/include/uapi/linux/if.h
 +++ b/include/uapi/linux/if.h
-@@ -104,6 +104,7 @@ enum net_device_flags {
- 	IFF_DORMANT			= 1<<17, /* volatile */
- 	IFF_ECHO			= 1<<18, /* volatile */
- #endif /* __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO */
-+	IFF_WIFI_OFLD		= 1<<19, /*Offload interface */
- };
- #endif /* __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO != 0 || __UAPI_DEF_IF_NET_DEVICE_FLAGS != 0 */
- 
-@@ -133,6 +134,8 @@ enum net_device_flags {
+@@ -133,6 +133,7 @@ enum net_device_flags {
  #define IFF_ECHO			IFF_ECHO
  #endif /* __UAPI_DEF_IF_NET_DEVICE_FLAGS_LOWER_UP_DORMANT_ECHO */
  
-+#define IFF_WIFI_OFLD		IFF_WIFI_OFLD
 +
  #define IFF_VOLATILE	(IFF_LOOPBACK|IFF_POINTOPOINT|IFF_BROADCAST|IFF_ECHO|\
  		IFF_MASTER|IFF_SLAVE|IFF_RUNNING|IFF_LOWER_UP|IFF_DORMANT)

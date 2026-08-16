@@ -1,4 +1,4 @@
-From 8c694c84ada22cb52919f2b05fb5684f11698379 Mon Sep 17 00:00:00 2001
+From 2278c983af4ec02cd9645ddae616d36224278bdd Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] ask: IPv4/IPv6 forwarding-path hook points
@@ -17,28 +17,15 @@ the ip6_tunnel site was dropped during the forward-port when the
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/uapi/linux/if_arp.h   |  1 +
  net/ipv4/ip_output.c          | 38 ++++++++++++++++++++++++++++++++++-
  net/ipv4/ip_tunnel.c          |  3 +++
  net/ipv6/ip6_output.c         | 31 ++++++++++++++++++++++++++--
- net/ipv6/ip6_tunnel.c         | 15 ++++++++++----
+ net/ipv6/ip6_tunnel.c         |  4 ++++
  net/ipv6/netfilter/ip6t_NPT.c | 29 ++++++++++++++++++++++++++
  net/ipv6/output_core.c        | 19 ++++++++++++++++++
  net/ipv6/sit.c                |  3 +++
- 8 files changed, 132 insertions(+), 7 deletions(-)
+ 7 files changed, 124 insertions(+), 3 deletions(-)
 
-diff --git a/include/uapi/linux/if_arp.h b/include/uapi/linux/if_arp.h
-index 4783af9fe520..822e21ba5ebb 100644
---- a/include/uapi/linux/if_arp.h
-+++ b/include/uapi/linux/if_arp.h
-@@ -29,6 +29,7 @@
- /* ARP protocol HARDWARE identifiers. */
- #define ARPHRD_NETROM	0		/* from KA9Q: NET/ROM pseudo	*/
- #define ARPHRD_ETHER 	1		/* Ethernet 10Mbps		*/
-+#define ARPHRD_IPV6_IPV6_TUNNEL		ARPHRD_ETHER
- #define	ARPHRD_EETHER	2		/* Experimental Ethernet	*/
- #define	ARPHRD_AX25	3		/* AX.25 Level 2		*/
- #define	ARPHRD_PRONET	4		/* PROnet token ring		*/
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
 index 49811c9281d4..87b2653bb951 100644
 --- a/net/ipv4/ip_output.c
@@ -203,18 +190,10 @@ index f0e5431c2d46..87fe154cd7ea 100644
  	skb_copy_hash(to, from);
  
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index 5350c9bb2319..263476551f52 100644
+index 5350c9bb2319..81b7ab84e515 100644
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
-@@ -19,6 +19,7 @@
- #include <linux/capability.h>
- #include <linux/errno.h>
- #include <linux/types.h>
-+#include <linux/version.h>
- #include <linux/sockios.h>
- #include <linux/icmp.h>
- #include <linux/if.h>
-@@ -832,6 +833,9 @@ static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
+@@ -832,6 +832,9 @@ static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
  		skb->protocol = eth_type_trans(skb, tunnel->dev);
  		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
  	} else {
@@ -224,25 +203,14 @@ index 5350c9bb2319..263476551f52 100644
  		skb->dev = tunnel->dev;
  		skb_reset_mac_header(skb);
  	}
-@@ -1196,11 +1200,14 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
+@@ -1196,6 +1199,7 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
  		       IPV6_MIN_MTU : IPV4_MIN_MTU);
  
  	skb_dst_update_pmtu_no_confirm(skb, mtu);
 +
  	if (skb->len - t->tun_hlen - eth_hlen > mtu && !skb_is_gso(skb)) {
--		*pmtu = mtu;
--		err = -EMSGSIZE;
--		goto tx_err_dst_release;
--	}
-+			*pmtu = mtu;
-+			err = -EMSGSIZE;
-+			goto tx_err_dst_release;
-+		}
-+
-+	hop_limit = t->parms.hop_limit;
- 
- 	if (t->err_count > 0) {
- 		if (time_before(jiffies,
+ 		*pmtu = mtu;
+ 		err = -EMSGSIZE;
 diff --git a/net/ipv6/netfilter/ip6t_NPT.c b/net/ipv6/netfilter/ip6t_NPT.c
 index 787c74aa85e3..f523f471722a 100644
 --- a/net/ipv6/netfilter/ip6t_NPT.c
