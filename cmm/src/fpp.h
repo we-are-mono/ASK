@@ -133,6 +133,7 @@
 #define FPP_ERR_WRONG_SOCK_FAMILY                       1212
 #define FPP_ERR_WRONG_SOCK_PROTO                        1213
 #define FPP_ERR_WRONG_SOCK_TYPE                         1214
+/* Reserved: the forwarder has no MSP support and never returns this. */
 #define FPP_ERR_MSP_NOT_READY                           1215
 #define FPP_ERR_WRONG_SOCK_MODE                         1216
 #if defined (LS1043)

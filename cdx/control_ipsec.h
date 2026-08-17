@@ -348,14 +348,11 @@ typedef struct dpa_sec_sa_context_s{
                                           * do not free this pointer!         */
         U32  *sec_desc_extra_cmds_unaligned;
         U32   *sec_desc_extra_cmds; /* aligned to CORE cache line size     */
-        BOOL   sec_desc_extended; /* true if SEC descriptor is extended     */
         U32   *rjob_desc_unaligned;
 	U32 *rjob_desc; /* replacement job descriptor address            */
         U8  job_desc_len; /* Number of words CAAM Job Descriptor occupies
                                 * form the CAAM Descriptor length
                                 * MAX_CAAM_DESCSIZE                           */
-
-	U16           	alg_suite;
 
 	/* The descriptor's KEY commands DMA-read these bus addresses on
 	 * every SEC job, so the mappings must live as long as the SA —

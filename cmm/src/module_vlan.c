@@ -209,18 +209,20 @@ void cmmVlanReset(FCI_CLIENT *fci_handle)
 
 /*****************************************************************
 * cmmVlanCheckPolicy
-* check if it is allowable to create device with given name
-* 0 means prohibited
-* non-zero means allowed
+* Decide whether a VLAN interface may be programmed automatically,
+* off the netlink event that announced it.
+* 0 means no, non-zero means yes.
+* Under MANUAL nothing is programmed automatically; the operator
+* does it with the "vlan add" CLI command, which reaches
+* cmmFeVLANUpdate() directly and never comes through here.
+* The "prohibit" policy that used to exist alongside these two was
+* specified but never built -- it was meant to consult a
+* per-interface allow list that does not exist, so it always
+* answered the same as ALLOW. It is now rejected at config parse.
 ******************************************************************/
 int cmmVlanCheckPolicy(struct interface *itf)
 {
-	// Full implementation will query allow list for prohibit policy
-	// and allow list for prohibit policy here
-	if (globalConf.vlan_policy != MANUAL) 
-		return 1;
-
-	return 0;
+	return globalConf.vlan_policy != MANUAL;
 }
 
 /*****************************************************************

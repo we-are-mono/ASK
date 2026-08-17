@@ -1936,7 +1936,6 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 			bytes_to_copy);
 	switch (ret) {
 		case 0:
-			psec_sa_context->sec_desc_extended = false;
 			goto done_shared_desc;
 		case -EPERM:
 			/* The extended builders lack the per-job PDB store
@@ -1970,7 +1969,6 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 				ret = -EFAULT;
 				goto err_unmap_crypto;
 			}
-			psec_sa_context->sec_desc_extended = true;
 			goto build_extended_shared_desc;
 		default:
 			log_err("Failed to create SEC descriptor for SA with   spi %d\n", sa->id.spi);

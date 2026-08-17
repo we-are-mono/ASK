@@ -46,7 +46,9 @@
 
 #define CMMD_SOCKET_TYPE_LANWAN				0
 #define CMMD_SOCKET_TYPE_ACP				1
-#define CMMD_SOCKET_TYPE_MSP				2
+/* Value 2 was MSP. No MSP support was ever built on either side of this
+ * interface, so nothing sends or accepts it; the value stays reserved so
+ * the remaining two keep their wire encoding. */
 
 #define CMMD_ERR_SOCK_ALREADY_OPEN			FPP_ERR_SOCK_ALREADY_OPEN	
 #define CMMD_ERR_SOCKID_ALREADY_USED			FPP_ERR_SOCKID_ALREADY_USED

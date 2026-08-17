@@ -736,11 +736,17 @@ static U16 RTP_Call_Control (U16 *p, U16 Length)
 			DPA_INFO("%s(%d) AtoB flow VLAN learningn feature is enabled\n",__func__,__LINE__);
 		}
 
-		if (RTPCmd.ControlDir & 0x16)
-		{
-			pCall->BtoA_flow->hw_flow->flags |= RTP_RELAY_ENABLE_VLAN_P_BIT_LEARNING;
-			DPA_INFO("%s(%d) BtoA flow VLAN learningn feature is enabled\n",__func__,__LINE__);
-		}
+		/* The inherited ControlDir encoding packs two sub-protocols into
+		 * five bits: VLAN p-bit learning and packet duplication both
+		 * claim bit 0x10, and bit 0x20 is unreachable because the only
+		 * sender caps the value at 31. The BtoA learning test was
+		 * written as "& 0x16", which includes the 0x04 gate bit that is
+		 * necessarily set inside this branch, so it has always been
+		 * true. The original intent is not recoverable from the
+		 * encoding, so codify the behaviour that has actually shipped:
+		 * bit 0x4 set means BtoA learning is on. */
+		pCall->BtoA_flow->hw_flow->flags |= RTP_RELAY_ENABLE_VLAN_P_BIT_LEARNING;
+		DPA_INFO("%s(%d) BtoA flow VLAN learningn feature is enabled\n",__func__,__LINE__);
 	}
 	else
 	{

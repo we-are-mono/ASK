@@ -149,28 +149,25 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa)
 void* M_ipsec_sa_cache_lookup_by_spi(U32 *daddr, U32 spi, U8 proto, U8 family)
 {
 	U32     hash_key_sa;
-	PSAEntry pSA = NULL;
 	PSAEntry pEntry;
 	struct slist_entry *entry;
 
 	hash_key_sa = HASH_SA(daddr, spi, proto, family);
 	slist_for_each(pEntry, entry, &sa_cache_by_spi[hash_key_sa], list_spi)
 	{
+		/* SPI + destination + protocol is the SA identity, so the
+		 * first match is the only match worth reporting. */
 		if ( (pEntry->id.proto == proto) &&
 				(pEntry->id.spi == spi) &&
 				(pEntry->id.daddr.a6[0] == daddr[0]) &&
 				(pEntry->id.daddr.a6[1] == daddr[1]) &&
 				(pEntry->id.daddr.a6[2] == daddr[2]) &&
 				(pEntry->id.daddr.a6[3] == daddr[3])&&
-				(pEntry->family != family))
-		{
-			pSA = pEntry;
-		}
-
-
+				(pEntry->family == family))
+			return pEntry;
 	}
 
-	return pSA;
+	return NULL;
 }
 
 
@@ -212,8 +209,11 @@ static int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 	sa->pSec_sa_context->auth_data.auth_type = algo;
 	sa->pSec_sa_context->auth_data.auth_key_len = (key_bits/8);
 	memcpy(sa->pSec_sa_context->auth_data.auth_key,	key, (key_bits/8));
-	/* Generate the split key from the normal auth key */
-	if (algo != SADB_X_AALG_AES_XCBC_MAC)
+	/* Generate the split key from the normal auth key. XCBC-MAC derives
+	 * its keys inside the SEC program and null auth has no key at all, so
+	 * neither has a split key to compute. Compare in the OP_PCL namespace
+	 * that the switch above produced, not the SADB one it consumed. */
+	if (algo != OP_PCL_IPSEC_AES_XCBC_MAC_96 && algo != OP_PCL_IPSEC_HMAC_NULL)
 		cdx_ipsec_generate_split_key(&sa->pSec_sa_context->auth_data );
 	return 0;
 }

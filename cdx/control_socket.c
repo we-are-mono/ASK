@@ -390,11 +390,11 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 		break;
 
 	case SOCKET_TYPE_MSP:
-		if (SocketCmd.proto != IPPROTOCOL_UDP)
-			return ERR_WRONG_SOCK_PROTO;
-
-		/* FIXME, if MSP support was not compiled in we should return error */
-		break;
+		/* No MSP support is built into this driver: nothing on the
+		 * data or control path treats an MSP socket differently from
+		 * a plain FPP one, so accepting the type would only mislabel
+		 * an ordinary socket. Refuse it rather than pretend. */
+		return ERR_WRONG_SOCK_TYPE;
 
 	default:
 		return ERR_WRONG_SOCK_TYPE;
@@ -450,13 +450,9 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	}
 	
 	DPA_INFO("%s(%d) \n",__func__,__LINE__);
-	if (sizeof(RTCPStats) > SOCKET_STATS_SIZE)
-	{
-		DPA_ERROR("%s(%d) RTCPStats size more than SOCKET_STATS_SIZE. Please update SOCKET_STATS_SIZE properly.\n"
-				, __func__,__LINE__);
-		socket4_free(pEntry);
-		return ERR_NOT_ENOUGH_MEMORY;
-	}
+	/* The MURAM stats block is sized by SOCKET_STATS_SIZE; RTCPStats has
+	 * to fit in it. Both are compile-time constants, so enforce it here. */
+	BUILD_BUG_ON(sizeof(RTCPStats) > SOCKET_STATS_SIZE);
 	pEntry->hw_stats = FM_MURAM_AllocMem(h_FmMuram, SOCKET_STATS_SIZE, 16);
 	if (!pEntry->hw_stats)
 	{
@@ -484,6 +480,7 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 	PSockEntry pEntry, pingress_socket;
 	PRouteEntry pRtEntry;
 	uint8_t update_flow = 0;
+	int route_changed, saddr_changed;
 	int rc = NO_ERR;
 	int i;
 
@@ -506,23 +503,30 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 	    ((SocketCmd.Sport != 0xffff) && (SocketCmd.Sport != pEntry->Sport))))
 		return ERR_SOCK_ALREADY_OPEN;
 
-	if (pEntry->route_id != SocketCmd.route_id) {
-		/* If no route return error */
-		if (!(pRtEntry = L2_route_get(pEntry->route_id)))
-			return ERR_NO_ROUTE_TO_SOCK;
-		L2_route_put(pRtEntry);
-		SOCKET4_delete_route(pEntry);
-		pEntry->route_id = SocketCmd.route_id;
-		update_flow = 1;
-	}
+	route_changed = (pEntry->route_id != SocketCmd.route_id);
+	saddr_changed = (SocketCmd.Saddr != 0xFFFFFFFF) &&
+			(SocketCmd.Saddr != pEntry->Saddr_v4);
 
-	if ((SocketCmd.Saddr != 0xFFFFFFFF) && (SocketCmd.Saddr != pEntry->Saddr_v4)) {
-		/* If no route return error */
-		if (!(pRtEntry = L2_route_get(pEntry->route_id)))
+	/* A route_id change and a source-address change both re-point the
+	 * socket at a route, and when they arrive together they re-point it
+	 * at the same one, so a single lookup validates the pair. Take that
+	 * reference before touching pEntry: dropping the old route first and
+	 * failing afterwards would leave the socket half-updated with no
+	 * route at all. */
+	if (route_changed || saddr_changed) {
+		pRtEntry = L2_route_get(route_changed ? SocketCmd.route_id :
+						       pEntry->route_id);
+		if (!pRtEntry)
 			return ERR_NO_ROUTE_TO_SOCK;
-		L2_route_put(pRtEntry);
+
+		/* Everything is resolved; nothing below can fail. Release the
+		 * old route and hand the socket the reference just taken. */
 		SOCKET4_delete_route(pEntry);
-		pEntry->Saddr_v4 = SocketCmd.Saddr;
+		pEntry->pRtEntry = pRtEntry;
+		if (route_changed)
+			pEntry->route_id = SocketCmd.route_id;
+		if (saddr_changed)
+			pEntry->Saddr_v4 = SocketCmd.Saddr;
 		update_flow = 1;
 	}
 
@@ -719,13 +723,19 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 	switch (SocketCmd.SockType) {
 	case SOCKET_TYPE_FPP:
 	case SOCKET_TYPE_ACP:
-	case SOCKET_TYPE_MSP:
 		break;
+
+	case SOCKET_TYPE_MSP:
+		/* No MSP support is built into this driver: nothing on the
+		 * data or control path treats an MSP socket differently from
+		 * a plain FPP one, so accepting the type would only mislabel
+		 * an ordinary socket. Refuse it rather than pretend. */
+		return ERR_WRONG_SOCK_TYPE;
 
 	default:
 		return ERR_WRONG_SOCK_TYPE;
 	}
-	
+
 	if ((pEntry = socket6_alloc()) == NULL)
 		return ERR_NOT_ENOUGH_MEMORY;
 
@@ -764,13 +774,7 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
 	
-	if (sizeof(RTCPStats) > SOCKET_STATS_SIZE)
-	{
-		DPA_ERROR("%s(%d) RTCPStats size more than SOCKET_STATS_SIZE. Please update SOCKET_STATS_SIZE properly.\n"
-				, __func__,__LINE__);
-		socket6_free(pEntry);
-		return ERR_NOT_ENOUGH_MEMORY;
-	}
+	BUILD_BUG_ON(sizeof(RTCPStats) > SOCKET_STATS_SIZE);
 	pEntry->hw_stats = FM_MURAM_AllocMem(h_FmMuram, SOCKET_STATS_SIZE, 32);
 	if (!pEntry->hw_stats)
 	{
@@ -799,6 +803,7 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 	PSock6Entry pEntry, pingress_socket;
 	PRouteEntry	pRtEntry;
 	uint8_t update_flow = 0;
+	int route_changed, saddr_changed;
 	int i;
 	int rc = NO_ERR;
 	U32 nulladdr[4] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
@@ -823,31 +828,33 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 	    ((SocketCmd.Sport != 0xffff) && (SocketCmd.Sport != pEntry->Sport))))
 		return ERR_SOCK_ALREADY_OPEN;
 
-	if (pEntry->route_id != SocketCmd.route_id)
+	route_changed = (pEntry->route_id != SocketCmd.route_id);
+	saddr_changed = IPV6_CMP(SocketCmd.Saddr, nulladdr) &&
+			IPV6_CMP(SocketCmd.Saddr, pEntry->Saddr_v6);
+
+	/* A route_id change and a source-address change both re-point the
+	 * socket at a route, and when they arrive together they re-point it
+	 * at the same one, so a single lookup validates the pair. Take that
+	 * reference before touching pEntry: dropping the old route first and
+	 * failing afterwards would leave the socket half-updated with no
+	 * route at all. */
+	if (route_changed || saddr_changed)
 	{
-		// If no route return error
-		if (!(pRtEntry = L2_route_get(SocketCmd.route_id)))
+		pRtEntry = L2_route_get(route_changed ? SocketCmd.route_id :
+						       pEntry->route_id);
+		if (!pRtEntry)
 			return ERR_NO_ROUTE_TO_SOCK;
-		L2_route_put(pRtEntry);
 
-		// Route has changed -> delete it
-		update_flow = 1;
+		/* Everything is resolved; nothing below can fail. Release the
+		 * old route and hand the socket the reference just taken. */
 		SOCKET6_delete_route(pEntry);
-		pEntry->route_id = SocketCmd.route_id;
-	}
-
-	if (IPV6_CMP(SocketCmd.Saddr, nulladdr) && IPV6_CMP(SocketCmd.Saddr, pEntry->Saddr_v6))
-	{
-		// If no route return error
-		if (!(pRtEntry = L2_route_get(pEntry->route_id)))
-			return ERR_NO_ROUTE_TO_SOCK;
-		L2_route_put(pRtEntry);
-		// Route has changed -> delete it
+		pEntry->pRtEntry = pRtEntry;
+		if (route_changed)
+			pEntry->route_id = SocketCmd.route_id;
+		if (saddr_changed)
+			memcpy(pEntry->Saddr_v6, SocketCmd.Saddr, IPV6_ADDRESS_LENGTH);
 		update_flow = 1;
-		SOCKET6_delete_route(pEntry);
-		memcpy(pEntry->Saddr_v6, SocketCmd.Saddr, IPV6_ADDRESS_LENGTH);
 	}
-
 
 	if (SocketCmd.Sport != 0xffff)
 	{

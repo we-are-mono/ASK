@@ -76,6 +76,9 @@ struct socket {
 	u_int8_t queue;
 	u_int16_t dscp;
 	struct ct_route rt;
+	/* Only ever set for MSP sockets, which no longer exist. Kept because
+	 * it is still copied into the wire commands, where it now always
+	 * reads as 0 -- the value every non-MSP socket already sent. */
 	int iifindex;
 	int flags;
 	unsigned int fwmark;

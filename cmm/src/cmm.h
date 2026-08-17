@@ -187,9 +187,16 @@
 		int asymff_enable;					/* Asymmetric Fastpath enable/disable*/
 		char debug_level;
 		char log_level;
+		/* How VLAN interfaces reach the forwarder. ALLOW programs them
+		 * automatically from the netlink event that announced them;
+		 * MANUAL programs nothing automatically and leaves it to the
+		 * "vlan add" CLI command, which does not consult the policy.
+		 * A third "prohibit" state was specified but never built: it
+		 * was meant to consult a per-interface allow list that does
+		 * not exist, so it always resolved the same way as ALLOW.
+		 * The values are in-memory only, never stored or sent. */
 		enum _t_vlan_policy {
 		        ALLOW,
-			PROHIBIT,
 		        MANUAL
 		} vlan_policy;
 

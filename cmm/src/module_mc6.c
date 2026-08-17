@@ -612,7 +612,9 @@ out:
 			__pthread_mutex_lock(&mc_lock);
 			
 			res_buf[0] = fci_write(fci_handle, CMMD_CMD_MC6_RESET, 0, NULL);
-			if ( ret == CMMD_ERR_OK )
+			/* Only drop the local mirror once the forwarder has
+			 * actually cleared its table, or the two diverge. */
+			if ( res_buf[0] == CMMD_ERR_OK )
 				mc_reset(AF_INET6);
 
 			__pthread_mutex_unlock(&mc_lock);

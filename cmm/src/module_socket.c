@@ -147,20 +147,6 @@ void __socket_add(struct socket * s)
 static struct socket *socket_add(cmmd_socket_open_cmd_t *cmd)
 {
 	struct socket *s;
-#if defined(LS1043)
-	struct RtEntry *output_route;
-	struct interface *out_itf;
-	/* Copy addresses to aligned local buffers to avoid packed struct alignment issues */
-	unsigned int saddr_aligned[4], daddr_aligned[4];
-	struct flow flow;
-	memcpy(saddr_aligned, cmd->saddr, sizeof(saddr_aligned));
-	memcpy(daddr_aligned, cmd->daddr, sizeof(daddr_aligned));
-	memset(&flow, 0, sizeof(flow));
-	flow.family = cmd->family;
-	flow.sAddr = daddr_aligned;  /* reverse src and dest addrs for input interface */
-	flow.dAddr = saddr_aligned;
-#endif
-
 
 	s = malloc(sizeof(struct socket));
 	if (!s)
@@ -185,33 +171,6 @@ static struct socket *socket_add(cmmd_socket_open_cmd_t *cmd)
 	s->fwmark = cmd->fwmark;
 #if defined(LS1043)
 	s->expt_flag = cmd->expt_flag;
-
-	if (s->type == CMMD_SOCKET_TYPE_MSP)
-	{
-		output_route = __cmmRouteGet(&flow);  /* reverse src and dest addrs for input interface */
-		if (output_route)
-		{
-			out_itf = __itf_find(output_route->oifindex);
-			if (!out_itf)
-			{
-				free(s);
-				return NULL;
-			}
-			if ((s->iifindex = get_port_id(out_itf->ifname)) < 0)
-			{
-				cmm_print(DEBUG_ERROR, "%s()::%d unable to get the interface(%s) portid\n", 
-				__func__, __LINE__, out_itf->ifname);
-				free(s);
-				return NULL;
-			}
-		}
-		else
-		{
-			cmm_print(DEBUG_WARNING, "%s()::%d No input interface found\n", __func__, __LINE__);
-			free(s);
-			return NULL;
-		}
-	}
 #endif //(LS1043)
 	__socket_add(s);
 err:
@@ -220,33 +179,11 @@ err:
 
 void socket_remove(struct socket *s)
 {
-#if defined(LS1043)
-	struct RtEntry *output_route;
-	struct flow flow = {
-		.family = s->family,
-		.sAddr = s->daddr,
-		.dAddr = s->saddr,
-	};
-#endif
 	list_del(&s->list);
 	list_del(&s->list_by_addr);
 
 	if((s->id >= SOCK_ID_PRIVATE_START) && (s->id <=  SOCK_ID_PRIVATE_END))
 		del_socket_id(s->id);
-
-#if defined(LS1043)
-	if (s->type == CMMD_SOCKET_TYPE_MSP)
-	{
-		output_route = __cmmRouteFind(&flow);  /* Get route with reverse src and dest addrs */
-		if (output_route)
-		{
-			__cmmRoutePut(output_route);
-			cmm_print(DEBUG_INFO, "%s()::%d Removed the route\n", __func__, __LINE__);
-		}
-		else
-			cmm_print(DEBUG_WARNING, "%s()::%d Route not found to remove it\n", __func__, __LINE__);
-	}
-#endif
 
 	free(s);
 }
@@ -1020,7 +957,7 @@ static void cmmSocketSetUsage(unsigned char family)
 			"\n"
 			"                                  [open]\n"
 			"                                       [sock_id {socket_id}] \n"
-			"                                       [type {acp | fpp | msp}]\n"
+			"                                       [type {acp | fpp}]\n"
 			"                                       [saddr {IPv4 addr}] \n"
 			"                                       [daddr {IPv4 addr}] \n"
 			"                                       [sport {port number}] \n"
@@ -1060,7 +997,7 @@ static void cmmSocketSetUsage(unsigned char family)
 			"\n"
 			"                                  [open]\n"
 			"                                       [sock_id {socket_id}] \n"
-			"                                       [type {acp | fpp | msp}]\n"
+			"                                       [type {acp | fpp}]\n"
 			"                                       [saddr {IPv6 addr}] \n"
 			"                                       [daddr {IPv6 addr}] \n"
 			"                                       [sport {port number}] \n"
@@ -1160,13 +1097,9 @@ int cmmSocketSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_h
 			{
 				cmd.type = CMMD_SOCKET_TYPE_ACP;
 			}
-			else if(strcasecmp(keywords[cpt], "msp") == 0)
-			{
-				cmd.type = CMMD_SOCKET_TYPE_MSP;
-			}
 			else
 			{
-				cmm_print(DEBUG_CRIT, "socket ERROR: type must be either acp, fpp or msp \n");
+				cmm_print(DEBUG_CRIT, "socket ERROR: type must be either acp or fpp \n");
 				goto  print_help;
 			}
 		}

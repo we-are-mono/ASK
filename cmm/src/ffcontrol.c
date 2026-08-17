@@ -919,13 +919,18 @@ static int section_vlan_option_hdlr(void *data, int argc, char **argv)
 		{
 			globalConf.vlan_policy = ALLOW;
 		}
-		else if (!strcasecmp(value, "prohibit"))
-		{
-		      	globalConf.vlan_policy = PROHIBIT;
-		}
 		else if (!strcasecmp(value, "manual"))
 		{
 			globalConf.vlan_policy = MANUAL;
+		}
+		else if (!strcasecmp(value, "prohibit"))
+		{
+			/* The allow list "prohibit" was supposed to consult was
+			 * never written, so it behaved exactly like "allow" --
+			 * the opposite of its name. Refuse it rather than keep
+			 * silently permitting what it claims to deny. */
+			cmm_print(DEBUG_CRIT, "%s: vlan policy \"prohibit\" was never implemented, use \"allow\" or \"manual\"\n", __func__);
+			goto err;
 		}
 		else
 			goto err;
