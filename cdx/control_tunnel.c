@@ -567,6 +567,15 @@ void tunnel_exit(void)
 	for (i = 0; i < NUM_TUNNEL_ENTRIES; i++)
 	{
 		slist_for_each_safe(pTunnelEntry, entry, &tunnel_name_cache[i], list) {
+			/* Same order as TNL_handle_DELETE: drop the parent
+			 * route reference, then release the onif before the
+			 * TnlEntry (and the struct _itf embedded in it) is
+			 * freed. Skipping the onif removal would leave the
+			 * interface database entry valid and pointing into
+			 * freed memory. */
+			L2_route_put(pTunnelEntry->pRtEntry);
+			pTunnelEntry->pRtEntry = NULL;
+			remove_onif_by_index(pTunnelEntry->itf.index);
 			M_tnl_delete(pTunnelEntry);
 		}
 	}

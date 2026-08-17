@@ -7,6 +7,9 @@
  * included with this distribution or at http://www.gnu.org/licenses/gpl-2.0.html
  *
  */
+#ifndef _DPA_CONTROL_MC_H_
+#define _DPA_CONTROL_MC_H_
+
 #define MC4_NUM_HASH_ENTRIES 16
 #define MC6_NUM_HASH_ENTRIES 16
 #define MC4_MIN_COMMAND_SIZE	32+12 /* with one listener entry using 1 interface name */
@@ -104,6 +107,10 @@ void *dpa_get_pcdhandle(uint32_t fm_index);
 int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 		struct dpa_l3hdr_info *l3_info, PRouteEntry tnl_rt_entry, void *queinfo, uint32_t hash);
 void AddToMcastGrpList(struct mcast_group_info *pMcastGrpInfo);
+/* Clears the references the multicast group routes hold on an interface that
+ * is being removed. Their RouteEntry lives outside rt_cache, so the route walk
+ * in remove_onif_by_index() cannot reach them. Process context only. */
+void cdx_mcast_clear_itf_refs(U32 if_index);
 extern struct list_head mc4_grp_list[MC4_NUM_HASH_ENTRIES];
 extern struct list_head mc6_grp_list[MC6_NUM_HASH_ENTRIES];
 extern spinlock_t *mc4_spinlocks;
@@ -151,3 +158,5 @@ static inline u32 HASH_MC6(void *pdestaddr)  // pass in ptr to IPv6 dest addr
   hash = hash ^ (hash >> 4) ^ (hash >> 8) ^ (hash >> 12);
   return hash & (MC6_NUM_HASH_ENTRIES - 1);
 }
+
+#endif /* _DPA_CONTROL_MC_H_ */

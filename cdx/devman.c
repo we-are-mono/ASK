@@ -469,6 +469,11 @@ int cdx_check_rx_iface_type_vlan(struct _itf *input_itf)
 	struct dpa_iface_info *iface_info, *parent;
 	int num_vlan_entries =0;
 
+	/* Callers pass a route's itf, which is NULL once that route has been
+	 * quarantined by an interface removal: no vlan headers to count. */
+	if (!input_itf)
+		return 0;
+
 	iface_info = dpa_interface_info;
 	while(iface_info) {
 		if (iface_info->itf_id  == input_itf->index){
@@ -1019,6 +1024,15 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 				__func__);
 		return retval;
 	}
+	/* An SA holds its tunnel route across interface removal, which
+	 * quarantines the route (itf cleared); refuse instead of following
+	 * a cleared pointer. */
+	if (!rt_entry->itf)
+	{
+		DPA_ERROR("%s::route %u has no egress interface\n",
+				__func__, rt_entry->id);
+		return retval;
+	}
 	itf_id = rt_entry->itf->index;
 	l2_info->mtu = rt_entry->mtu;
 	spin_lock(&dpa_devlist_lock);
@@ -1274,6 +1288,15 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 		goto err_ret;
 	}
 
+	/* An interface removal clears the itf of a route that is still
+	 * referenced; such a route can no longer describe an egress path. */
+	if (!rt_entry->itf)
+	{
+		DPA_ERROR("%s::route %u has no egress interface\n",
+				__func__, rt_entry->id);
+		goto err_ret;
+	}
+
 	/* input_itf may be NULL for a VLAN-on-bridge ingress that never
 	 * registered as an onif; the physical port (underlying_input_itf) is
 	 * the real classification key, so fall back to it. */
@@ -1441,6 +1464,14 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 			continue;
 		}
 		if (iface_info->if_flags & IF_TYPE_TUNNEL) {
+			/* The tunnel route is a held reference: interface removal
+			 * may have quarantined it (itf cleared) after this entry
+			 * was created, so it cannot be dereferenced blindly. */
+			if (tnl_rt_entry && !tnl_rt_entry->itf) {
+				DPA_ERROR("%s::tunnel route %u has no egress interface\n",
+						__func__, tnl_rt_entry->id);
+				goto err_ret;
+			}
 			if(tnl_rt_entry)
 				parent = dpa_get_ifinfo_by_itfid(tnl_rt_entry->itf->index);
 			else if(iface_info->tunnel_info.parent)

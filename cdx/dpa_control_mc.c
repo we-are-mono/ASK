@@ -349,6 +349,73 @@ struct mcast_group_info* GetMcastGrp( struct mcast_group_info *pMcastGrpInfo)
 	return NULL;
 }
 
+/* Drops every reference the groups in one hash bucket hold on the interface
+ * being removed. Called with the bucket's spinlock held. */
+static void ClearMcastGrpItfRefs(struct list_head *pGrpList, U32 if_index)
+{
+	struct mcast_group_info *tmp;
+	struct list_head *ptr;
+	RouteEntry *pRtEntry;
+
+	list_for_each(ptr, pGrpList)
+	{
+		tmp = list_entry(ptr, struct mcast_group_info, list);
+
+		if (!tmp->pCtEntry)
+			continue;
+		pRtEntry = tmp->pCtEntry->pRtEntry;
+		if (!pRtEntry)
+			continue;
+
+		if (pRtEntry->itf && pRtEntry->itf->index == if_index)
+			pRtEntry->itf = NULL;
+		if (pRtEntry->input_itf &&
+				pRtEntry->input_itf->index == if_index)
+			pRtEntry->input_itf = NULL;
+		if (pRtEntry->underlying_input_itf &&
+				pRtEntry->underlying_input_itf->index == if_index)
+			pRtEntry->underlying_input_itf = NULL;
+	}
+}
+
+/* Called by remove_onif_by_index() while the dying interface is still valid.
+ * A multicast group's RouteEntry is allocated on its own, outside rt_cache,
+ * so the route walk in layer2.c cannot quarantine it; do it here instead.
+ * The bucket spinlocks order us against the ioctl-side query walkers,
+ * mc_mutators_mutex against the ADD / REMOVE / UPDATE handlers. */
+void cdx_mcast_clear_itf_refs(U32 if_index)
+{
+	unsigned int uiHash;
+
+	mutex_lock(&mc_mutators_mutex);
+
+	/* mc{4,6}_exit() frees the bucket lock arrays before the command
+	 * handler teardown reaches the tx and tunnel exits, which also remove
+	 * onifs. Any groups still on the lists at that point are unload-time
+	 * leaks nothing will dereference again, so skipping the walk is safe. */
+	if (mc4_spinlocks)
+	{
+		for (uiHash = 0; uiHash < MC4_NUM_HASH_ENTRIES; uiHash++)
+		{
+			spin_lock(&mc4_spinlocks[uiHash]);
+			ClearMcastGrpItfRefs(&mc4_grp_list[uiHash], if_index);
+			spin_unlock(&mc4_spinlocks[uiHash]);
+		}
+	}
+
+	if (mc6_spinlocks)
+	{
+		for (uiHash = 0; uiHash < MC6_NUM_HASH_ENTRIES; uiHash++)
+		{
+			spin_lock(&mc6_spinlocks[uiHash]);
+			ClearMcastGrpItfRefs(&mc6_grp_list[uiHash], if_index);
+			spin_unlock(&mc6_spinlocks[uiHash]);
+		}
+	}
+
+	mutex_unlock(&mc_mutators_mutex);
+}
+
 static int Cdx_GetMcastMemberId(char *pIn_Info, struct mcast_group_info *pMcastGrpInfo)
 {
 	int ii;

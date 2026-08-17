@@ -814,8 +814,14 @@ int insert_entry_in_classif_table(PCtEntry entry)
 	if (!info)
 		return FAILURE;
 	info->entry = entry;
-	// This can never be NULL for connection routes.
+	/* Set when the route was created, but cleared again if the ingress
+	 * interface has since been removed while the route stayed referenced. */
 	underlying_input_itf = entry->pRtEntry->underlying_input_itf;
+	if (!underlying_input_itf) {
+		DPA_ERROR("%s::route %u has no underlying input interface\n",
+				__func__, entry->pRtEntry->id);
+		goto err_ret1;
+	}
 	//clear hw entry pointer
 	entry->ct = NULL;
 	if (add_incoming_iface_info(entry))
@@ -1017,8 +1023,14 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	info->first_member_flow_addr_lo = cpu_to_be32(first_member_flow_addr  & 0xffffffff);
 	info->num_mcast_members = num_members;
 	info->first_listener_entry = first_listener_entry;
-	// This can never be NULL for connection routes.
+	/* Set when the route was created, but cleared again if the ingress
+	 * interface has since been removed while the route stayed referenced. */
 	underlying_input_itf = entry->pRtEntry->underlying_input_itf;
+	if (!underlying_input_itf) {
+		DPA_ERROR("%s::route %u has no underlying input interface\n",
+				__func__, entry->pRtEntry->id);
+		goto err_ret1;
+	}
 	//clear hw entry pointer
 	entry->ct = NULL;
 	if (add_incoming_iface_info(entry))

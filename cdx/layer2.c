@@ -11,6 +11,7 @@
 
 #include "cdx.h"
 #include "control_ipv4.h"
+#include "dpa_control_mc.h"
 
 /**
  * get_onif_by_name()
@@ -74,7 +75,20 @@ POnifDesc add_onif(U8 *input_itf_name, struct _itf *itf, struct _itf *phys_itf, 
 /**
  * remove_onif_by_index()
  *
- *
+ *	Releases the output interface occupying if_index. The struct _itf is
+ *	embedded in its owner (VlanEntry, PPPoE_Info, TnlEntry, wifi or
+ *	physical port) and the caller frees that owner as soon as we return,
+ *	so nothing may hold a pointer to it afterwards. The order below is
+ *	deliberate:
+ *	  1. sweep the conntracks bound to the interface -- this runs first
+ *	     because its match reads pRtEntry->itf->index, which step 2 may
+ *	     clear,
+ *	  2. remove the routes using the interface; a route that a socket, an
+ *	     SA or a surviving conntrack still references cannot be freed, so
+ *	     it is quarantined instead by clearing its itf pointers,
+ *	  3. clear the same pointers on the multicast group routes, which are
+ *	     allocated outside rt_cache and so are invisible to step 2,
+ *	  4. release the database slot and the device manager entry.
  */
 void remove_onif_by_index(U32 if_index)
 {
@@ -100,13 +114,39 @@ void remove_onif_by_index(U32 if_index)
 		PRouteEntry pRtentry;
 		struct slist_entry *entry;
 
-		// find and delete any routes that still use the interface (use counts should be zero)
+		// remove the routes that still use the interface, quarantine the ones that are still referenced
 		slist_for_each_safe(pRtentry, entry, &rt_cache[i], list)
 		{
-			if (pRtentry->itf->index == if_index)
-				L2_route_remove(pRtentry->id);
+			/* Routes that ingress via the removed interface keep
+			 * working on the egress side, but their input pointers
+			 * would dangle into the owner struct our caller is
+			 * about to free - clear them. */
+			if (pRtentry->input_itf &&
+					pRtentry->input_itf->index == if_index)
+				pRtentry->input_itf = NULL;
+			if (pRtentry->underlying_input_itf &&
+					pRtentry->underlying_input_itf->index == if_index)
+				pRtentry->underlying_input_itf = NULL;
+
+			if (pRtentry->itf && pRtentry->itf->index == if_index) {
+				/* A route pinned by a socket, an SA or a
+				 * conntrack (nbref > 0) survives the remove
+				 * with ERR_RT_ENTRY_LINKED. Clear its itf so
+				 * nothing can follow the pointer into the freed
+				 * owner struct; this is what makes the
+				 * itf == NULL gate in L2_route_get() live. The
+				 * holder keeps its (now interface-less)
+				 * reference and gives it back through its own
+				 * teardown command. */
+				if (L2_route_remove(pRtentry->id) != NO_ERR)
+					pRtentry->itf = NULL;
+			}
 		}
 	}
+
+	/* Multicast group routes live outside rt_cache, so the walk above
+	 * cannot see them; quarantine them separately. */
+	cdx_mcast_clear_itf_refs(if_index);
 
 	memset(&gOnif_DB[if_index], 0, sizeof(OnifDesc));
 	dpa_release_interface(if_index);
@@ -206,6 +246,9 @@ PRouteEntry L2_route_get(U32 id)
 		return NULL;
 	}
 
+	/* Quarantined by remove_onif_by_index(): the route outlived its output
+	 * interface because a holder was still referencing it. Refuse to hand
+	 * out any new reference to it. */
 	if (pRtEntry->itf == NULL)
 	{
 		return NULL;
