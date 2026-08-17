@@ -1,4 +1,4 @@
-From b9c4ae84738da13ca34353d7c6ea52ead2824eec Mon Sep 17 00:00:00 2001
+From e2a62136e4c9d59ca36718d5f07a40cf75b461b3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -53,9 +53,9 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
  .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
  .../sdk_fman/Peripherals/FM/Pcd/Makefile      |    7 +-
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       |  774 ++++-----
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |  106 +-
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1379 +++++++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       |  751 +++-----
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   24 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1211 +++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |    3 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
@@ -70,7 +70,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
  .../freescale/sdk_fman/Peripherals/FM/fm.c    |   19 +-
  .../sdk_fman/Peripherals/FM/fm_muram.c        |   32 +-
- .../sdk_fman/Peripherals/FM/inc/fm_common.h   |   18 +-
+ .../sdk_fman/Peripherals/FM/inc/fm_common.h   |   10 +-
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  299 +---
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
@@ -78,7 +78,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
- .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  123 +-
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  177 +-
  .../sdk_fman/inc/Peripherals/fm_port_ext.h    |   23 +
  .../sdk_fman/inc/Peripherals/fm_vsp_ext.h     |   14 +
  .../sdk_fman/inc/flib/fsl_fman_port.h         |    6 +-
@@ -90,7 +90,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/src/wrapper/lnxwrp_fm.c          |   45 +
  .../sdk_fman/src/wrapper/lnxwrp_fm.h          |    3 +-
  .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |    9 +-
- .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |  180 +-
+ .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |  181 +-
  .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |    8 +
  .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c    |  192 +++
  .../src/wrapper/lnxwrp_sysfs_fm_port.c        |    6 +-
@@ -112,7 +112,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 75 files changed, 6999 insertions(+), 1147 deletions(-)
+ 75 files changed, 6804 insertions(+), 1279 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1947,7 +1947,7 @@ index 6eedcf9de5fb..bcb4567cd5bb 100644
 +##	setenv FMAN_DEBUG '-DFM_CC_MURAM_DEBUG=1'
 +ccflags-y += $(FMAN_DEBUG)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
-index b8d600fa6f25..0c4e3ec165eb 100644
+index b8d600fa6f25..0520ce311223 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 @@ -51,6 +51,8 @@
@@ -1959,46 +1959,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
  
  /****************************************/
  /*       static functions               */
-@@ -339,6 +341,28 @@ static void FillAdOfTypeContLookup(t_Handle h_Ad,
-     /* if (p_AdNewPtr = NULL) --> Done. (case (3)) */
-     if (p_AdNewPtr)
-     {
-+#if (DPAA_VERSION >= 11)
-+        if (p_Node->externalHash) {
-+            tmpReg32 = 0;
-+            tmpReg32 |= FM_PCD_AD_CONT_LOOKUP_TYPE;
-+            if (p_Node->extHashInfo.allocateBuffer)
-+                tmpReg32 |= FM_PCD_AD_FE_ENTER_ALLOCATE;
-+            WRITE_UINT32(p_AdContLookup->ccAdBase, tmpReg32);
-+
-+            tmpReg32 = 0;
-+            WRITE_UINT32(p_AdContLookup->matchTblPtr, tmpReg32);
-+
-+            tmpReg32 = 0;
-+            tmpReg32 |= p_Node->parseCode;
-+            WRITE_UINT32(p_AdContLookup->pcAndOffsets, tmpReg32);
-+
-+            tmpReg32 = 0;
-+            tmpReg32 |=
-+                    (uint32_t)(XX_VirtToPhys(p_Node->extHashInfo.p_FE) - p_FmPcd->physicalMuramBase);
-+            WRITE_UINT32(p_AdContLookup->gmask, tmpReg32);
-+
-+        } else {
-+#endif /* (DPAA_VERSION >= 11) */
-         /* cases (1) & (2) */
-         tmpReg32 = 0;
-         tmpReg32 |= FM_PCD_AD_CONT_LOOKUP_TYPE;
-@@ -366,6 +390,9 @@ static void FillAdOfTypeContLookup(t_Handle h_Ad,
- 
-         MemCpy8((void*)&p_AdContLookup->gmask, p_Node->p_GlblMask,
-                     CC_GLBL_MASK_SIZE);
-+#if (DPAA_VERSION >= 11)
-+        }
-+#endif /* (DPAA_VERSION >= 11) */
-     }
- }
- 
-@@ -934,8 +961,10 @@ static t_Error DynamicChangeHc(
+@@ -934,8 +936,10 @@ static t_Error DynamicChangeHc(
              }
  
              /* Invoke host command to copy from new AD to old AD */
@@ -2010,7 +1971,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
              if (err)
              {
                  ReleaseModifiedDataStructure(h_FmPcd, h_OldPointersLst,
-@@ -1023,7 +1052,7 @@ static t_Error DoDynamicChange(
+@@ -1023,7 +1027,7 @@ static t_Error DoDynamicChange(
  
  			/* HC to copy from the new Ad (old updated structures) to current Ad (uses shadow structures) */
  			err = DynamicChangeHc(h_FmPcd, h_OldPointersLst, h_NewPointersLst,
@@ -2019,7 +1980,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
  			if (err)
  				RETURN_ERROR(MAJOR, err, NO_MSG);
  		}
-@@ -1044,93 +1073,11 @@ static t_Error CcUpdateParam(
+@@ -1044,93 +1048,11 @@ static t_Error CcUpdateParam(
          uint16_t numOfEntries, t_Handle h_Ad, bool validate, uint16_t level,
          t_Handle h_FmTree, bool modify)
  {
@@ -2117,7 +2078,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
  }
  
  static ccPrivateInfo_t IcDefineCode(t_FmPcdCcNodeParams *p_CcNodeParam)
-@@ -1232,6 +1179,17 @@ static void DeleteNode(t_FmPcdCcNode *p_CcNode)
+@@ -1232,6 +1154,17 @@ static void DeleteNode(t_FmPcdCcNode *p_CcNode)
          p_CcNode->h_TmpAd = NULL;
      }
  
@@ -2135,7 +2096,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      if (p_CcNode->h_StatsFLRs)
      {
          FM_MURAM_FreeMem(FmPcdGetMuramHandle(p_CcNode->h_FmPcd),
-@@ -1247,7 +1205,8 @@ static void DeleteNode(t_FmPcdCcNode *p_CcNode)
+@@ -1247,7 +1180,8 @@ static void DeleteNode(t_FmPcdCcNode *p_CcNode)
  
      /* Restore the original counters pointer instead of the mutual pointer (mutual to all hash buckets) */
      if (p_CcNode->isHashBucket
@@ -2145,7 +2106,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
          p_CcNode->keyAndNextEngineParams[p_CcNode->numOfKeys].p_StatsObj->h_StatsCounters =
                  p_CcNode->h_PrivMissStatsCounters;
  
-@@ -1605,14 +1564,10 @@ t_Error ValidateNextEngineParams(
+@@ -1605,14 +1539,10 @@ t_Error ValidateNextEngineParams(
              if (relativeSchemeId == FM_PCD_KG_NUM_OF_SCHEMES)
                  RETURN_ERROR(MAJOR, E_NOT_IN_RANGE, NO_MSG);
              if (!FmPcdKgIsSchemeValidSw(
@@ -2162,7 +2123,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
              break;
  
          case (e_FM_PCD_PLCR):
-@@ -4057,6 +4012,7 @@ static t_Error ModifyNextEngineParamNode(
+@@ -4057,6 +3987,7 @@ static t_Error ModifyNextEngineParamNode(
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
@@ -2170,7 +2131,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, FALSE);
  
-@@ -4526,6 +4482,9 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
+@@ -4526,6 +4457,9 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
      if (p_CcNodeParam->keysParams.keySize != p_CcNode->sizeOfExtraction)
      {
          DeleteNode(p_CcNode);
@@ -2180,7 +2141,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
          RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                       ("keySize has to be equal to sizeOfExtraction"));
      }
-@@ -4839,6 +4798,58 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
+@@ -4839,6 +4773,26 @@ static t_Error MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNode *p_CcNode,
  
      return E_OK;
  }
@@ -2202,44 +2163,12 @@ index b8d600fa6f25..0c4e3ec165eb 100644
 +	*bucket_index = (uint16_t)crc64 & mask;
 +}
 +
-+
-+static void ExternalHashResultSetMonitorAddr(t_ExtHashResult *p_Result, uint16_t dataLiodnOffset, uintptr_t monitorAddr)
-+{
-+	uint64_t tmpReg64;
-+
-+    tmpReg64 = (uint64_t)(XX_VirtToPhys(UINT_TO_PTR(monitorAddr)));
-+    tmpReg64 |= ((uint64_t)(dataLiodnOffset & FM_PCD_FE_T_HASH_LIODN_MASK)
-+            << (uint64_t)FM_PCD_FE_T_HASH_LIODN_SHIFT);
-+    tmpReg64 |= ((uint64_t)(dataLiodnOffset & FM_PCD_FE_T_HASH_ELIODN_MASK)
-+            << (uint64_t)FM_PCD_FE_T_HASH_ELIODN_SHIFT);
-+    WRITE_UINT32(p_Result->liodnMonitorAndMonitorPtrHi, (uint32_t)(tmpReg64 >> 32));
-+    WRITE_UINT32(p_Result->monitorPtrLow, (uint32_t)tmpReg64);
-+}
-+
-+static t_Error ExternalHashTableModifyMissMonitorAddr(t_Handle h_HashTbl, uintptr_t monitorAddr)
-+{
-+    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-+
-+    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-+
-+    /* Free old miss monitor addr if it was automatically allocated by the driver */
-+    if (p_HashTbl->extHashInfo.missMonitorAddr && p_HashTbl->extHashInfo.drvAllocMissMonitorAddr)
-+        XX_FreeSmart((void*)p_HashTbl->extHashInfo.missMonitorAddr);
-+
-+    p_HashTbl->extHashInfo.missMonitorAddr = monitorAddr;
-+    p_HashTbl->extHashInfo.drvAllocMissMonitorAddr = FALSE;
-+
-+    ExternalHashResultSetMonitorAddr(p_HashTbl->extHashInfo.p_MissResult, p_HashTbl->extHashInfo.dataLiodnOffset, monitorAddr);
-+
-+    return E_OK;
-+}
-+
 +#endif /* (DPAA_VERSION >= 11) */
 +
  /************************** End of static functions **************************/
  
  /*****************************************************************************/
-@@ -5341,6 +5352,7 @@ t_Error FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+@@ -5341,6 +5295,7 @@ t_Error FmPcdCcRemoveKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
@@ -2247,7 +2176,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
  
-@@ -5432,6 +5444,7 @@ t_Error FmPcdCcModifyKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+@@ -5432,6 +5387,7 @@ t_Error FmPcdCcModifyKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
@@ -2255,7 +2184,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
  
-@@ -5489,6 +5502,7 @@ t_Error FmPcdCcModifyMissNextEngineParamNode(
+@@ -5489,6 +5445,7 @@ t_Error FmPcdCcModifyMissNextEngineParamNode(
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
@@ -2263,7 +2192,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, FALSE);
  
-@@ -5598,6 +5612,7 @@ t_Error FmPcdCcAddKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+@@ -5598,6 +5555,7 @@ t_Error FmPcdCcAddKey(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
@@ -2271,7 +2200,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
      if (p_CcNode->maxNumOfKeys)
-@@ -5691,6 +5706,7 @@ t_Error FmPcdCcModifyKeyAndNextEngine(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
+@@ -5691,6 +5649,7 @@ t_Error FmPcdCcModifyKeyAndNextEngine(t_Handle h_FmPcd, t_Handle h_FmPcdCcNode,
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
@@ -2279,7 +2208,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      err = DoDynamicChange(p_FmPcd, &h_OldPointersLst, &h_NewPointersLst,
                            p_ModifyKeyParams, useShadowStructs);
  
-@@ -5943,6 +5959,45 @@ void FmPcdCcGetAdTablesThatPointOnReplicGroup(t_Handle h_Node,
+@@ -5943,6 +5902,45 @@ void FmPcdCcGetAdTablesThatPointOnReplicGroup(t_Handle h_Node,
  /*       API Init unit functions        */
  /****************************************/
  
@@ -2325,7 +2254,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
  t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
                              t_FmPcdCcTreeParams *p_PcdGroupsParam)
  {
-@@ -5957,8 +6012,9 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -5957,8 +5955,9 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
      t_NetEnvParams netEnvParams;
      uint8_t lastOne = 0;
      uint32_t requiredAction = 0;
@@ -2337,7 +2266,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
  
      SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
      SANITY_CHECK_RETURN_VALUE(p_PcdGroupsParam, E_INVALID_HANDLE, NULL);
-@@ -6123,76 +6179,136 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
+@@ -6123,76 +6122,136 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd,
              (uint32_t)(FM_PCD_MAX_NUM_OF_CC_GROUPS * FM_PCD_CC_AD_ENTRY_SIZE));
  
      p_CcTreeTmp = UINT_TO_PTR(p_FmPcdCcTree->ccTreeBaseAddr);
@@ -2534,7 +2463,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      p_FmPcdCcTree->p_Lock = FmPcdAcquireLock(p_FmPcd);
      if (!p_FmPcdCcTree->p_Lock)
      {
-@@ -7030,16 +7146,6 @@ t_Error FM_PCD_MatchTableGetIndexedHashBucket(t_Handle h_CcNode,
+@@ -7030,16 +7089,6 @@ t_Error FM_PCD_MatchTableGetIndexedHashBucket(t_Handle h_CcNode,
  
  t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  {
@@ -2551,7 +2480,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
      SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
      SANITY_CHECK_RETURN_VALUE(p_Param, E_NULL_POINTER, NULL);
  
-@@ -7069,211 +7175,22 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+@@ -7069,211 +7118,22 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
          return NULL;
      }
  
@@ -2765,7 +2694,7 @@ index b8d600fa6f25..0c4e3ec165eb 100644
  
      SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
      SANITY_CHECK_RETURN_ERROR(p_KeyParams, E_NULL_POINTER);
-@@ -7283,125 +7200,17 @@ t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
+@@ -7283,185 +7143,14 @@ t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
          RETURN_ERROR(MAJOR, E_INVALID_VALUE,
                       ("Keys masks not supported for hash table"));
  
@@ -2890,73 +2819,71 @@ index b8d600fa6f25..0c4e3ec165eb 100644
  }
  
 -
- t_Error FM_PCD_HashTableGetMissNextEngine(
-         t_Handle h_HashTbl,
-         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
-@@ -7411,6 +7220,9 @@ t_Error FM_PCD_HashTableGetMissNextEngine(
- 
-     SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
- 
-+    if (p_HashTbl->externalHash)
-+        return E_NOT_SUPPORTED;
-+
-     /* Miss next engine of each bucket was initialized with the next engine of the hash table */
-     p_HashBucket =
-             p_HashTbl->keyAndNextEngineParams[0].nextEngineParams.params.ccParams.h_CcNode;
-@@ -7422,6 +7234,23 @@ t_Error FM_PCD_HashTableGetMissNextEngine(
-     return E_OK;
- }
- 
-+t_Error FM_PCD_HashTableModifyMissMonitorAddr(
-+        t_Handle h_HashTbl,
-+        uintptr_t monitorAddr)
-+{
-+    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
-+
-+    SANITY_CHECK_RETURN_ERROR(h_HashTbl, E_INVALID_HANDLE);
-+    SANITY_CHECK_RETURN_ERROR(monitorAddr, E_NULL_POINTER);
-+
-+#if (DPAA_VERSION >= 11)
-+    if (p_HashTbl->externalHash)
-+        return ExternalHashTableModifyMissMonitorAddr(h_HashTbl, monitorAddr);
-+    else
-+#endif /* (DPAA_VERSION >= 11) */
-+        return E_NOT_SUPPORTED;
-+}
-+
- t_Error FM_PCD_HashTableFindNGetKeyStatistics(
-         t_Handle h_HashTbl, uint8_t keySize, uint8_t *p_Key,
-         t_FmPcdCcKeyStatistics *p_KeyStatistics)
-@@ -7436,8 +7265,11 @@ t_Error FM_PCD_HashTableFindNGetKeyStatistics(
-     SANITY_CHECK_RETURN_ERROR(p_Key, E_NULL_POINTER);
-     SANITY_CHECK_RETURN_ERROR(p_KeyStatistics, E_NULL_POINTER);
- 
-+    if (p_HashTbl->externalHash)
-+        return E_NOT_SUPPORTED;
-+
-     err = FM_PCD_MatchTableGetIndexedHashBucket(p_HashTbl, keySize, p_Key,
+-t_Error FM_PCD_HashTableGetMissNextEngine(
+-        t_Handle h_HashTbl,
+-        t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
+-{
+-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
+-    t_FmPcdCcNode *p_HashBucket;
+-
+-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
+-
+-    /* Miss next engine of each bucket was initialized with the next engine of the hash table */
+-    p_HashBucket =
+-            p_HashTbl->keyAndNextEngineParams[0].nextEngineParams.params.ccParams.h_CcNode;
+-
+-    memcpy(p_FmPcdCcNextEngineParams,
+-           &p_HashBucket->keyAndNextEngineParams[p_HashBucket->numOfKeys].nextEngineParams,
+-           sizeof(t_FmPcdCcNextEngineParams));
+-
+-    return E_OK;
+-}
+-
+-t_Error FM_PCD_HashTableFindNGetKeyStatistics(
+-        t_Handle h_HashTbl, uint8_t keySize, uint8_t *p_Key,
+-        t_FmPcdCcKeyStatistics *p_KeyStatistics)
+-{
+-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
+-    t_Handle h_HashBucket;
+-    uint8_t bucketIndex;
+-    uint16_t lastIndex;
+-    t_Error err;
+-
+-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
+-    SANITY_CHECK_RETURN_ERROR(p_Key, E_NULL_POINTER);
+-    SANITY_CHECK_RETURN_ERROR(p_KeyStatistics, E_NULL_POINTER);
+-
+-    err = FM_PCD_MatchTableGetIndexedHashBucket(p_HashTbl, keySize, p_Key,
 -                                                p_HashTbl->kgHashShift,
-+                                                0,
-                                                 &h_HashBucket, &bucketIndex,
-                                                 &lastIndex);
-     if (err)
-@@ -7456,6 +7288,9 @@ t_Error FM_PCD_HashTableGetMissStatistics(
-     SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-     SANITY_CHECK_RETURN_ERROR(p_MissStatistics, E_NULL_POINTER);
- 
-+    if (p_HashTbl->externalHash)
-+        return E_NOT_SUPPORTED;
-+
-     if (!p_HashTbl->statsEnForMiss)
-         RETURN_ERROR(MAJOR, E_INVALID_STATE,
-                      ("Statistics were not enabled for miss"));
-@@ -7465,3 +7300,4 @@ t_Error FM_PCD_HashTableGetMissStatistics(
- 
-     return FM_PCD_MatchTableGetMissStatistics(h_HashBucket, p_MissStatistics);
- }
-+
+-                                                &h_HashBucket, &bucketIndex,
+-                                                &lastIndex);
+-    if (err)
+-        RETURN_ERROR(MAJOR, err, NO_MSG);
+-
+-    return FM_PCD_MatchTableFindNGetKeyStatistics(h_HashBucket, keySize, p_Key,
+-                                                  NULL, p_KeyStatistics);
+-}
+-
+-t_Error FM_PCD_HashTableGetMissStatistics(
+-        t_Handle h_HashTbl, t_FmPcdCcKeyStatistics *p_MissStatistics)
+-{
+-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
+-    t_Handle h_HashBucket;
+-
+-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
+-    SANITY_CHECK_RETURN_ERROR(p_MissStatistics, E_NULL_POINTER);
+-
+-    if (!p_HashTbl->statsEnForMiss)
+-        RETURN_ERROR(MAJOR, E_INVALID_STATE,
+-                     ("Statistics were not enabled for miss"));
+-
+-    h_HashBucket =
+-            p_HashTbl->keyAndNextEngineParams[0].nextEngineParams.params.ccParams.h_CcNode;
+-
+-    return FM_PCD_MatchTableGetMissStatistics(h_HashBucket, p_MissStatistics);
+-}
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h
-index e3b7016b7f2e..5108135ab630 100644
+index e3b7016b7f2e..2bb6fda013de 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h
 @@ -107,7 +107,6 @@
@@ -3005,117 +2932,7 @@ index e3b7016b7f2e..5108135ab630 100644
  /***********************************************************************/
  /*          Memory map                                                 */
  /***********************************************************************/
-@@ -191,6 +203,31 @@ typedef uint32_t ccPrivateInfo_t; /**< private info of CC: */
- #pragma pack(push,1)
- #endif /* defined(__MWERKS__) && ... */
- 
-+#if (DPAA_VERSION >= 11)
-+typedef _Packed struct t_ExtHashFe {
-+    volatile uint32_t misc;
-+    volatile uint16_t hashMask;
-+    volatile uint8_t contextSize;
-+    volatile uint8_t hashShift;
-+    volatile uint32_t liodnTableAndTablePtrHi;
-+    volatile uint32_t tablePtrLow;
-+    volatile uint32_t missResultPtr;
-+    volatile uint32_t nextFEPtr;
-+    volatile uint32_t missNextFEPtr;
-+} _PackedType t_ExtHashFe;
-+
-+typedef struct
-+{
-+    volatile uint32_t general;
-+    volatile uint32_t maskOffset;
-+    volatile uint32_t addrHigh;
-+    volatile uint32_t addrLow;
-+    volatile uint32_t missResultPointer;
-+    volatile uint32_t nextFEPointer;
-+    volatile uint32_t missNextFEPointer;
-+} t_FEOfTypeHash;
-+#endif /* (DPAA_VERSION >= 11) */
-+
- typedef struct
- {
-     volatile uint32_t fqid;
-@@ -230,6 +267,32 @@ typedef union
- /*  Driver's internal structures                                       */
- /***********************************************************************/
- 
-+#pragma pack(push,1)
-+typedef struct
-+{
-+    uint32_t		next_bucket_addr;
-+    uint32_t		prev_last_bucket_ptr;
-+    uint8_t			not_last;
-+    uint8_t			valid_keys;
-+    uint16_t		reserved1[0x3];
-+    uint8_t			key_result[0xF0];
-+} t_FmExtHashBucket;
-+
-+typedef struct {
-+	uint64_t contex_addr;
-+	uint64_t monitoring_addr;
-+} t_FmExtHashResult;
-+
-+#pragma pack(pop)
-+
-+
-+typedef struct
-+{
-+	uint8_t *bucket_pool_base_ptr;
-+	int last_bucket;
-+	t_FmExtHashBucket **bucket_stack;
-+} t_FmExtHashBucketPool;
-+
- typedef struct t_FmPcdStatsObj
- {
-     t_Handle        h_StatsAd;
-@@ -290,6 +353,31 @@ typedef struct
-     t_Handle    h_CcNode;
- } t_CcNextEngineInfo;
- 
-+#if (DPAA_VERSION >= 11)
-+typedef struct
-+{
-+    bool                allocateBuffer;
-+    t_ExtHashFe         *p_FE;
-+    t_Handle            h_MissFE;
-+    t_ExtHashResult     *p_MissResult;
-+    uint8_t             dataMemId;
-+    uint16_t            dataLiodnOffset;
-+    uintptr_t           missMonitorAddr;
-+    bool                drvAllocMissMonitorAddr;
-+    t_List              availableContextLst;
-+    t_List              usedContextLst;
-+ 
-+	t_FmExtHashBucketPool hash_bucket_pool;
-+	t_FmExtHashBucket 	*table_base_ptr;
-+	uint16_t 			hash_mask;
-+	uint8_t 			hash_size;
-+	uint8_t 			crc_shift;
-+	uint8_t 			key_size;
-+	uint8_t 			aligned_key_size;
-+	uint8_t 			max_ways;
-+} t_FmPcdCcNodeExtHashInfo;
-+#endif /* (DPAA_VERSION >= 11) */
-+
- typedef struct
- {
-     uint16_t            numOfKeys;
-@@ -344,6 +432,12 @@ typedef struct
-     uint32_t            shadowAction;
-     uint8_t             userSizeOfExtraction;
-     uint8_t             userOffset;
-+ 
-+#if (DPAA_VERSION >= 11)
-+    bool                externalHash;
-+    t_FmPcdCcNodeExtHashInfo extHashInfo;
-+#endif /* (DPAA_VERSION >= 11) */
-+
-     uint8_t             kgHashShift;            /* used in hash-table */
- 
-     t_Handle            h_Spinlock;
-@@ -391,5 +485,11 @@ t_Error     FmPcdCcNodeTreeTryLock(t_Handle h_FmPcd,t_Handle h_FmPcdCcNode, t_Li
+@@ -391,5 +403,11 @@ t_Error     FmPcdCcNodeTreeTryLock(t_Handle h_FmPcd,t_Handle h_FmPcdCcNode, t_Li
  void        FmPcdCcNodeTreeReleaseLock(t_Handle h_FmPcd, t_List *p_List);
  t_Error     FmPcdUpdateCcShadow (t_FmPcd *p_FmPcd, uint32_t size, uint32_t align);
  
@@ -3129,10 +2946,10 @@ index e3b7016b7f2e..5108135ab630 100644
  #endif /* __FM_CC_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
 new file mode 100644
-index 000000000000..a5f9035387ff
+index 000000000000..d4b8f6671a83
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
-@@ -0,0 +1,1379 @@
+@@ -0,0 +1,1374 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -3804,46 +3621,41 @@ index 000000000000..a5f9035387ff
 +
 +	ccnode = (t_FmPcdCcNode *)handle;
 +	printk(KERN_CRIT ">>>>>>>>\n%s::ccnode %p\n", func_name, ccnode);
-+	if (!ccnode->externalHash) {
-+		if (ccnode->maskSupport)
-+			printk(KERN_CRIT "mask support enabled\n");
-+		else
-+			printk(KERN_CRIT "mask support disabled\n");
-+		printk(KERN_CRIT "statisticsMode \t%d\n", ccnode->statisticsMode);
-+		printk(KERN_CRIT "countersArraySize \t%d\n", ccnode->countersArraySize);
-+		if (ccnode->isHashBucket)
-+			printk(KERN_CRIT "node is a bucket of a hash table\n");
-+		if (ccnode->glblMaskUpdated) {
-+			printk(KERN_CRIT "global mask updated\n");
-+			display_global_mask(ccnode);
-+		} else
-+			printk(KERN_CRIT "global mask not updated\n");
-+		printk(KERN_CRIT "parseCode \t%d\n", ccnode->parseCode);
-+		printk(KERN_CRIT "offset \t%d\n", ccnode->offset);
-+		printk(KERN_CRIT "prsArrayOffset \t%d\n", ccnode->prsArrayOffset);
-+		printk(KERN_CRIT "ccKeySizeAccExtraction \t%d\n", ccnode->ccKeySizeAccExtraction);
-+		printk(KERN_CRIT "sizeOfExtraction \t%d\n", ccnode->sizeOfExtraction);
++	if (ccnode->maskSupport)
++		printk(KERN_CRIT "mask support enabled\n");
++	else
++		printk(KERN_CRIT "mask support disabled\n");
++	printk(KERN_CRIT "statisticsMode \t%d\n", ccnode->statisticsMode);
++	printk(KERN_CRIT "countersArraySize \t%d\n", ccnode->countersArraySize);
++	if (ccnode->isHashBucket)
++		printk(KERN_CRIT "node is a bucket of a hash table\n");
++	if (ccnode->glblMaskUpdated) {
++		printk(KERN_CRIT "global mask updated\n");
++		display_global_mask(ccnode);
++	} else
++		printk(KERN_CRIT "global mask not updated\n");
++	printk(KERN_CRIT "parseCode \t%d\n", ccnode->parseCode);
++	printk(KERN_CRIT "offset \t%d\n", ccnode->offset);
++	printk(KERN_CRIT "prsArrayOffset \t%d\n", ccnode->prsArrayOffset);
++	printk(KERN_CRIT "ccKeySizeAccExtraction \t%d\n", ccnode->ccKeySizeAccExtraction);
++	printk(KERN_CRIT "sizeOfExtraction \t%d\n", ccnode->sizeOfExtraction);
 +
-+		printk(KERN_CRIT "shadowAction %08x\n", ccnode->shadowAction);
-+		printk(KERN_CRIT "userSizeOfExtraction %08x\n", ccnode->userSizeOfExtraction);
-+		printk(KERN_CRIT "userOffset %08x\n", ccnode->userOffset);
-+		printk(KERN_CRIT "kgHashShift %08x\n", ccnode->kgHashShift);
++	printk(KERN_CRIT "shadowAction %08x\n", ccnode->shadowAction);
++	printk(KERN_CRIT "userSizeOfExtraction %08x\n", ccnode->userSizeOfExtraction);
++	printk(KERN_CRIT "userOffset %08x\n", ccnode->userOffset);
++	printk(KERN_CRIT "kgHashShift %08x\n", ccnode->kgHashShift);
 +
-+		if (ccnode->h_KeysMatchTable) {
-+			display_keymatch_table(ccnode);
-+		} else {
-+			printk(KERN_CRIT "No keymatch table\n");
-+		}
-+		if (ccnode->h_AdTable) {
-+			display_adtable(ccnode);
-+		} else {
-+			printk(KERN_CRIT "No ad table\n");
-+		}
-+		display_next_engine_param(ccnode);
-+		printk(KERN_CRIT "not ext hash >???\n");
++	if (ccnode->h_KeysMatchTable) {
++		display_keymatch_table(ccnode);
 +	} else {
-+		printk(KERN_CRIT "ext hash\n");
++		printk(KERN_CRIT "No keymatch table\n");
 +	}
++	if (ccnode->h_AdTable) {
++		display_adtable(ccnode);
++	} else {
++		printk(KERN_CRIT "No ad table\n");
++	}
++	display_next_engine_param(ccnode);
 +}
 +#else
 +#define display_cc_node(x, y)
@@ -6508,7 +6320,7 @@ index 8ab81ac69431..bbd9c0123d78 100644
 +EXPORT_SYMBOL(FmMurambaseAddr);
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h
-index fd9221b525b0..9b95eb6e5065 100644
+index fd9221b525b0..40bb6c830083 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h
 @@ -53,7 +53,8 @@
@@ -6521,7 +6333,7 @@ index fd9221b525b0..9b95eb6e5065 100644
  
  
  
-@@ -185,9 +186,19 @@ typedef _Packed struct t_FmPcdCtrlParamsPage {
+@@ -185,7 +186,9 @@ typedef _Packed struct t_FmPcdCtrlParamsPage {
      volatile uint32_t discardMask;
      volatile uint8_t  reserved3[4];
      volatile uint32_t postBmiFetchNia;
@@ -6531,18 +6343,8 @@ index fd9221b525b0..9b95eb6e5065 100644
 +    volatile uint8_t  reserved4[164];
  } _PackedType t_FmPcdCtrlParamsPage;
  
-+#if (DPAA_VERSION >= 11)
-+typedef _Packed struct t_ExtHashResult {
-+    volatile uint32_t liodnContextAndContextPtrHi;
-+    volatile uint32_t contextPtrLow;
-+    volatile uint32_t liodnMonitorAndMonitorPtrHi;
-+    volatile uint32_t monitorPtrLow;
-+} _PackedType t_ExtHashResult;
-+#endif /* (DPAA_VERSION >= 11) */
  
- 
- #if defined(__MWERKS__) && !defined(__GNUC__)
-@@ -661,7 +672,6 @@ typedef struct t_FmPcdLock {
+@@ -661,7 +664,6 @@ typedef struct t_FmPcdLock {
  typedef t_Error (t_FmPortGetSetCcParamsCallback) (t_Handle                  h_FmPort,
                                                    t_FmPortGetSetCcParams    *p_FmPortGetSetCcParams);
  
@@ -6550,7 +6352,7 @@ index fd9221b525b0..9b95eb6e5065 100644
  /***********************************************************************/
  /*          Common API for FM-PCD module                               */
  /***********************************************************************/
-@@ -789,6 +799,8 @@ typedef enum e_FmPortGprFuncType
+@@ -789,6 +791,8 @@ typedef enum e_FmPortGprFuncType
  } e_FmPortGprFuncType;
  
  t_Error     FmPortSetGprFunc(t_Handle h_FmPort, e_FmPortGprFuncType gprFunc, void **p_Value);
@@ -8516,7 +8318,7 @@ index ef62c8ef28d5..464b539e8c81 100644
  
  #endif /* __FM_MURAM_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
-index 6e5db2aaf500..9dd685ee3f24 100644
+index 6e5db2aaf500..8057c0dbd299 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 @@ -45,7 +45,7 @@
@@ -8656,29 +8458,83 @@ index 6e5db2aaf500..9dd685ee3f24 100644
  
  /**************************************************************************//**
   @Function      FM_PCD_HashTableModifyMissNextEngine
-@@ -3522,6 +3518,21 @@ t_Error FM_PCD_HashTableModifyMissNextEngine(t_Handle                  h_HashTbl
- t_Error FM_PCD_HashTableGetMissNextEngine(t_Handle                     h_HashTbl,
-                                           t_FmPcdCcNextEngineParams    *p_FmPcdCcNextEngineParams);
+@@ -3506,75 +3502,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
+ t_Error FM_PCD_HashTableModifyMissNextEngine(t_Handle                  h_HashTbl,
+                                              t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
  
-+/**************************************************************************//*
-+ @Function      FM_PCD_HashTableModifyMissMonitorAddr
-+
-+ @Description   Modifies the miss monitor address.
-+
-+ @Param[in]     h_HashTbl                   A handle to a hash table
-+ @Param[out]    monitorAddr   				Miss monitor address to be modified
-+
-+ @Return        E_OK on success; Error code otherwise.
-+
-+ @Cautions      Allowed only following FM_PCD_HashTableSet().
-+*//***************************************************************************/
-+t_Error FM_PCD_HashTableModifyMissMonitorAddr(t_Handle h_HashTbl,
-+        									  uintptr_t monitorAddr);
-+
+-/**************************************************************************//*
+- @Function      FM_PCD_HashTableGetMissNextEngine
+-
+- @Description   Gets NextEngine in case of key match miss.
+-
+- @Param[in]     h_HashTbl                   A handle to a hash table
+- @Param[out]    p_FmPcdCcNextEngineParams   Next engine parameters for the specified
+-                                            hash table.
+-
+- @Return        E_OK on success; Error code otherwise.
+-
+- @Cautions      Allowed only following FM_PCD_HashTableSet().
+-*//***************************************************************************/
+-t_Error FM_PCD_HashTableGetMissNextEngine(t_Handle                     h_HashTbl,
+-                                          t_FmPcdCcNextEngineParams    *p_FmPcdCcNextEngineParams);
+-
+-/**************************************************************************//**
+- @Function      FM_PCD_HashTableFindNGetKeyStatistics
+-
+- @Description   This routine may be used to get statistics counters of specific key
+-                in a hash table.
+-
+-                If 'e_FM_PCD_CC_STATS_MODE_FRAME' and
+-                'e_FM_PCD_CC_STATS_MODE_BYTE_AND_FRAME' were set for this node,
+-                these counters reflect how many frames passed that were matched
+-                this key; The total frames count will be returned in the counter
+-                of the first range (as only one frame length range was defined).
+-                If 'e_FM_PCD_CC_STATS_MODE_RMON' was set for this node, the total
+-                frame count will be separated to frame length counters, based on
+-                provided frame length ranges.
+-                Note that this routine will identify the bucket of this key in
+-                the hash table and will search the bucket to locate the index
+-                of the required key based on received key parameters.
+-
+- @Param[in]     h_HashTbl       A handle to a hash table
+- @Param[in]     keySize         Size of the requested key
+- @Param[in]     p_Key           A pointer to the requested key
+- @Param[out]    p_KeyStatistics Key statistics counters
+-
+- @Return        The specific key statistics.
+-
+- @Cautions      Allowed only following FM_PCD_HashTableSet().
+-*//***************************************************************************/
+-t_Error FM_PCD_HashTableFindNGetKeyStatistics(t_Handle                 h_HashTbl,
+-                                              uint8_t                  keySize,
+-                                              uint8_t                  *p_Key,
+-                                              t_FmPcdCcKeyStatistics   *p_KeyStatistics);
+-
+-/**************************************************************************//**
+- @Function      FM_PCD_HashTableGetMissStatistics
+-
+- @Description   This routine may be used to get statistics counters of 'miss'
+-                entry of the a hash table.
+-
+-                If 'e_FM_PCD_CC_STATS_MODE_FRAME' and
+-                'e_FM_PCD_CC_STATS_MODE_BYTE_AND_FRAME' were set for this node,
+-                these counters reflect how many frames were not matched to any
+-                existing key and therefore passed through the miss entry;
+-
+- @Param[in]     h_HashTbl           A handle to a hash table
+- @Param[out]    p_MissStatistics    Statistics counters for 'miss'
+-
+- @Return        The statistics for 'miss'.
+-
+- @Cautions      Allowed only following FM_PCD_HashTableSet().
+-*//***************************************************************************/
+-t_Error FM_PCD_HashTableGetMissStatistics(t_Handle                 h_HashTbl,
+-                                          t_FmPcdCcKeyStatistics   *p_MissStatistics);
+-
  /**************************************************************************//**
-  @Function      FM_PCD_HashTableFindNGetKeyStatistics
+  @Function      FM_PCD_ManipNodeSet
  
-@@ -3697,4 +3708,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
+@@ -3697,4 +3624,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
  /** @} */ /* end of FM_PCD_grp group */
  /** @} */ /* end of FM_grp group */
  
@@ -9044,7 +8900,7 @@ index ea4235847686..1aa05d79cfdf 100644
  
      if (CheckNConfigFmPortAdvArgs(p_LnxWrpFmPortDev) != E_OK)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
-index f97c37f06255..67f9151b88ce 100644
+index f97c37f06255..55dbbd19a2ec 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 @@ -505,7 +505,6 @@ Status: PCD API to fmlib (file: drivers/net/dpa/NetCommSw/inc/Peripherals/fm_pcd
@@ -9055,15 +8911,17 @@ index f97c37f06255..67f9151b88ce 100644
      FM_PCD_MatchTableModifyKey
      FM_PCD_ManipNodeReplace
      FM_PCD_ManipNodeSet
-@@ -527,7 +526,6 @@ Status: not exported
+@@ -527,9 +526,7 @@ Status: not exported
      FM_PCD_MatchTableGetKeyCounter
  
  Status: not exported, would be nice to have
 -    FM_PCD_HashTableModifyNextEngine
      FM_PCD_HashTableModifyMissNextEngine
-     FM_PCD_HashTableGetMissNextEngine
+-    FM_PCD_HashTableGetMissNextEngine
      FM_PCD_ManipGetStatistics
-@@ -2173,71 +2171,9 @@ Status: not exported
+ 
+ Status: not exported
+@@ -2173,71 +2170,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_HASH_TABLE_GET_MISS_STAT:
          {
@@ -9138,7 +8996,7 @@ index f97c37f06255..67f9151b88ce 100644
              break;
          }
  
-@@ -2347,28 +2283,9 @@ Status: not exported
+@@ -2347,28 +2282,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_HASH_TABLE_DELETE:
          {
@@ -9170,7 +9028,7 @@ index f97c37f06255..67f9151b88ce 100644
              break;
          }
  
-@@ -2498,82 +2415,9 @@ Status: not exported
+@@ -2498,82 +2414,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_HASH_TABLE_REMOVE_KEY:
          {
@@ -9256,7 +9114,7 @@ index f97c37f06255..67f9151b88ce 100644
              break;
          }
  
-@@ -3379,6 +3223,9 @@ Status: not exported
+@@ -3379,6 +3222,9 @@ Status: not exported
      }
  
          default:
@@ -9266,7 +9124,7 @@ index f97c37f06255..67f9151b88ce 100644
              RETURN_ERROR(MINOR, E_INVALID_SELECTION,
                  ("invalid ioctl: cmd:0x%08x(type:0x%02x, nr: %d.\n",
                  cmd, _IOC_TYPE(cmd), _IOC_NR(cmd)));
-@@ -4612,6 +4459,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4612,6 +4458,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
          }
  
          default:
