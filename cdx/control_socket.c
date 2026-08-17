@@ -460,7 +460,8 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 		socket4_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
-	memset(pEntry->hw_stats, 0, SOCKET_STATS_SIZE);
+	/* Use memset_io for MURAM - it's device memory on ARM64; plain memset emits dc zva, which faults. */
+	memset_io((void __iomem *)pEntry->hw_stats, 0, SOCKET_STATS_SIZE);
 
 	DPA_INFO("%s(%d) \n",__func__,__LINE__);
 	/* Add software and hardware entry to local and packet engine hash */
@@ -782,7 +783,8 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 		socket6_free(pEntry);
 		return ERR_NOT_ENOUGH_MEMORY;
 	}
-	memset(pEntry->hw_stats, 0, SOCKET_STATS_SIZE);
+	/* Use memset_io for MURAM - it's device memory on ARM64; plain memset emits dc zva, which faults. */
+	memset_io((void __iomem *)pEntry->hw_stats, 0, SOCKET_STATS_SIZE);
 
 	socket6_add(pEntry);  // this func not returning error in any case
 

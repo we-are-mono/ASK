@@ -142,7 +142,8 @@ int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 		pppoe_stats = pppoe_ifstats_freelist;
 		if (pppoe_stats) {
 			pppoe_ifstats_freelist = pppoe_stats->next;
-			memset(pppoe_stats, 0, sizeof(struct cdx_pppoe_iface_ifinfo));
+			/* Use memset_io for MURAM - it's device memory on ARM64; plain memset emits dc zva, which faults. */
+			memset_io((void __iomem *)pppoe_stats, 0, sizeof(struct cdx_pppoe_iface_ifinfo));
 			iface->rxstats_index = (((uint32_t)((uint8_t *)&pppoe_stats->stats.rxstats - 
 					(uint8_t *)stats_mem) /
 					sizeof(struct en_ehash_stats_with_ts)) | STATS_WITH_TS);
@@ -163,7 +164,8 @@ int alloc_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 		ifstats = ifstats_freelist;
 		if (ifstats) {
 			ifstats_freelist = ifstats->next;
-			memset(ifstats, 0, sizeof(struct cdx_iface_ifinfo));
+			/* Use memset_io for MURAM - it's device memory on ARM64; plain memset emits dc zva, which faults. */
+			memset_io((void __iomem *)ifstats, 0, sizeof(struct cdx_iface_ifinfo));
 			iface->rxstats_index = ((uint32_t )((uint8_t *)&ifstats->stats.rxstats - 
 					(uint8_t *)stats_mem) /
 					sizeof(struct en_ehash_stats));

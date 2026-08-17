@@ -1187,7 +1187,8 @@ static PRTCPStats RTCP_get_stats(PRTCPStats sw_stats, PRTCPStats hw_stats, U32 s
 	if(hw_stats)
 	{
 		/* set back statistics from util to host endianess */
-		memcpy(sw_stats, hw_stats, stats_size);
+		/* Use memcpy_fromio for MURAM - hw_stats is device iomem on ARM64. */
+		memcpy_fromio(sw_stats, (const void __iomem *)hw_stats, stats_size);
 		pStats = sw_stats;
 
 		pStats->prev_reception_period = be32_to_cpu(pStats->prev_reception_period);
