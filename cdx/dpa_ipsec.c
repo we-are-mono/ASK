@@ -240,7 +240,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	 * ASK A22 defensive: if the dq'd fd is an IPsec output buffer
 	 * (BPID == ipsec_bp), this is a SEC encrypt result that should have
 	 * been consumed by the OH port hardware (channel 0x80a) and routed
-	 * through the cdx_esp4_cc PCD chain to eth3 TX. It hit our CPU cb
+	 * through the cdx_esp4_cc PCD chain to the WAN eth port's TX. It hit our CPU cb
 	 * instead — meaning the OH-port channel binding is broken (A22).
 	 *
 	 * The default code path below assumes Ethernet-RX-pool semantics

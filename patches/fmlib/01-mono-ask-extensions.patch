@@ -62,7 +62,7 @@ index 3607b86..e6db99a 100644
  /** @} */ /* end of lnx_usr_FM_lib_grp group */
  /** @} */ /* end of lnx_usr_FM_grp group */
 diff --git a/include/fmd/Peripherals/fm_pcd_ext.h b/include/fmd/Peripherals/fm_pcd_ext.h
-index 7f32680..81d2186 100644
+index 7f32680..8bfecfd 100644
 --- a/include/fmd/Peripherals/fm_pcd_ext.h
 +++ b/include/fmd/Peripherals/fm_pcd_ext.h
 @@ -1717,6 +1717,7 @@ typedef struct t_FmPcdKgSchemeParams {
@@ -101,23 +101,38 @@ index 7f32680..81d2186 100644
  typedef struct t_FmPcdHashTableParams {
      uint16_t                    maxNumOfKeys;               /**< Maximum Number Of Keys that will (ever) be used in this Hash-table */
      e_FmPcdCcStatsMode          statisticsMode;             /**< If not e_FM_PCD_CC_STATS_MODE_NONE, the required structures for the
-@@ -1989,6 +2011,14 @@ typedef struct t_FmPcdHashTableParams {
-     uint8_t                     matchKeySize;               /**< Size of the exact match keys held by the hash buckets */
+@@ -1990,6 +2012,29 @@ typedef struct t_FmPcdHashTableParams {
 
      t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
-+    uint32_t    table_type;     /* ip reassembly table */
-+    struct {
-+        uint32_t timeout_val;   //reassembly timeout
-+        uint32_t timeout_fqid;  //fqid for reassmebly failures
-+        uint32_t max_frags;     //max allowed fragments
-+        uint32_t min_frag_size; //min allowed frag size except last frag
-+        uint32_t max_sessions;  //max conn reassembly sessions
-+    };
 
++    bool                        agingSupport;               /**< Reserved; hash-key aging is not implemented. Kept so this struct
++                                                                 stays layout-identical to the driver's t_FmPcdHashTableParams and
++                                                                 to ioc_fm_pcd_hash_table_params_t, which FM_PCD_HashTableSet()
++                                                                 memcpy()s this struct into. */
++
++#if (DPAA_VERSION >= 11)
++    bool                        externalHash;               /**< TRUE to use external hash table */
++
++    uint32_t                    table_type;                 /**< ip reassembly table type */
++    struct {
++        uint32_t                timeout_val;                /**< reassembly timeout */
++        uint32_t                timeout_fqid;               /**< fqid for reassembly failures */
++        uint32_t                max_frags;                  /**< max allowed fragments */
++        uint32_t                min_frag_size;              /**< min allowed frag size except last frag */
++        uint32_t                max_sessions;               /**< max conn reassembly sessions */
++    };
++
++    struct {
++        uint8_t                 dataMemId;                  /**< Memory partition ID for external hash table */
++        uint16_t                dataLiodnOffs;              /**< LIODN offset for external hash access */
++        uintptr_t               missMonitorAddr;            /**< User-allocated miss monitor address */
++    } externalHashParams;
++#endif /* (DPAA_VERSION >= 11) */
  } t_FmPcdHashTableParams;
 
+ /**************************************************************************//**
 diff --git a/src/fm_lib.c b/src/fm_lib.c
-index 4de5168..907d5d4 100644
+index 4de5168..81828d4 100644
 --- a/src/fm_lib.c
 +++ b/src/fm_lib.c
 @@ -317,6 +317,44 @@ t_Error  FM_GetApiVersion(t_Handle h_Fm, ioc_fm_api_version_t *p_version)
@@ -178,3 +193,24 @@ index 4de5168..907d5d4 100644
  t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
  {
      t_Device *p_PcdDev = (t_Device*) h_FmPcd;
+@@ -1191,6 +1235,12 @@ t_Error FM_PCD_MatchTableModifyKeyAndNextEngine(t_Handle            h_CcNode,
+     return E_OK;
+ }
+
++/* The ioctl struct is this struct plus a trailing 'void *id'; the memcpy below
++ * relies on the two being field-for-field identical up to that point. */
++_Static_assert(sizeof(ioc_fm_pcd_hash_table_params_t) ==
++               sizeof(t_FmPcdHashTableParams) + sizeof(void *),
++               "t_FmPcdHashTableParams and ioc_fm_pcd_hash_table_params_t layouts diverged");
++
+ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+ {
+     t_Device *p_PcdDev = (t_Device*) h_FmPcd;
+@@ -1201,6 +1251,7 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+
+     _fml_dbg("Calling...\n");
+
++    memset(&params, 0, sizeof(params));
+     memcpy(&params, p_Param, sizeof(t_FmPcdHashTableParams));
+     params.id = NULL;
+
