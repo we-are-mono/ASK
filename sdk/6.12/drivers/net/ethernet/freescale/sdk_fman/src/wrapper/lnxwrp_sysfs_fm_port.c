@@ -255,16 +255,17 @@ static ssize_t show_fm_port_regs(struct device *dev,
 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
 
 
-	local_irq_save(flags);
-
 	if (!p_LnxWrpFmPortDev->h_Dev) {
 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
 		return n;
-	} else {
-		n = snprintf(buf, PAGE_SIZE,
-				"FM port driver registers dump.\n");
-		n = fm_port_dump_regs(p_LnxWrpFmPortDev->h_Dev, buf, n);
 	}
+
+	n = snprintf(buf, PAGE_SIZE,
+			"FM port driver registers dump.\n");
+
+	local_irq_save(flags);
+
+	n = fm_port_dump_regs(p_LnxWrpFmPortDev->h_Dev, buf, n);
 
 	local_irq_restore(flags);
 
@@ -296,21 +297,23 @@ static ssize_t show_fm_port_ipv4_options(struct device *dev,
 	p_LnxWrpFmPortDev =
 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
 
-	local_irq_save(flags);
-
 	if (!p_LnxWrpFmPortDev->h_Dev) {
 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
 		return n;
-	} else if (((t_FmPort *)p_LnxWrpFmPortDev->h_Dev)->p_ParamsPage
-					== NULL) {
+	}
+
+	if (((t_FmPort *)p_LnxWrpFmPortDev->h_Dev)->p_ParamsPage == NULL) {
 		n = snprintf(buf, PAGE_SIZE,
 			"\tPort: FMan-controller params page not set\n");
 		return n;
-	} else {
-		n = snprintf(buf, PAGE_SIZE,
-			"Counter for fragmented pkt with IP header options\n");
-		n = fm_port_dump_ipv4_opt(p_LnxWrpFmPortDev->h_Dev, buf, n);
 	}
+
+	n = snprintf(buf, PAGE_SIZE,
+		"Counter for fragmented pkt with IP header options\n");
+
+	local_irq_save(flags);
+
+	n = fm_port_dump_ipv4_opt(p_LnxWrpFmPortDev->h_Dev, buf, n);
 
 	local_irq_restore(flags);
 
@@ -342,16 +345,17 @@ static ssize_t show_fm_port_bmi_regs(struct device *dev,
 	p_LnxWrpFmPortDev =
 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
 
-	local_irq_save(flags);
-
 	if (!p_LnxWrpFmPortDev->h_Dev) {
 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
 		return n;
-	} else {
-		n = snprintf(buf, PAGE_SIZE,
-				"FM port driver registers dump.\n");
-		n = fm_port_dump_regs_bmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
 	}
+
+	n = snprintf(buf, PAGE_SIZE,
+			"FM port driver registers dump.\n");
+
+	local_irq_save(flags);
+
+	n = fm_port_dump_regs_bmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
 
 	local_irq_restore(flags);
 
@@ -383,16 +387,17 @@ static ssize_t show_fm_port_qmi_regs(struct device *dev,
 	p_LnxWrpFmPortDev =
 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
 
-	local_irq_save(flags);
-
 	if (!p_LnxWrpFmPortDev->h_Dev) {
 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
 		return n;
-	} else {
-		n = snprintf(buf, PAGE_SIZE,
-				"FM port driver registers dump.\n");
-		n = fm_port_dump_regs_qmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
 	}
+
+	n = snprintf(buf, PAGE_SIZE,
+			"FM port driver registers dump.\n");
+
+	local_irq_save(flags);
+
+	n = fm_port_dump_regs_qmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
 
 	local_irq_restore(flags);
 

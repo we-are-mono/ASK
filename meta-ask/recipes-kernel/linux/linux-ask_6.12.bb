@@ -18,7 +18,6 @@ SRC_URI += "\
            file://080-wext-core-restore-ndo_do_ioctl.patch \
            file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-qbman-kasan-sanitize-off.patch \
-           file://101-sdk_fman-sysfs-restore-irqs-on-early-return.patch \
            file://102-sdk_dpaa-extend-stop-drain-delays.patch \
            file://103-qbman-ceetm-lfq-unwind.patch \
            file://104-sdk_dpaa-rx-stats-before-stack-verdict.patch \
