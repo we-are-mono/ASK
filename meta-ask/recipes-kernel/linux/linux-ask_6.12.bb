@@ -37,7 +37,6 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://092-sdk_fman-FmPcdLockTryLockAll-nest-annotation.patch \
            file://093-netlink-name-L2FLOW-cb-mutex.patch \
            file://094-sdk-fman-dpaa-qbman-kasan-sanitize-off.patch \
-           file://095-sdk_fman-iomem-mem-ops.patch \
            file://096-sdk_fman-mac-hash-alloc-null-check.patch \
            file://097-xfrm-trans-queue-force-dst-refcount.patch \
            file://098-sdk_dpaa-bp-alloc-slab-build-skb.patch \

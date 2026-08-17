@@ -109,7 +109,6 @@ void cdx_dpa_ipsec_exit(void);
 int cdx_init_scatter_gather_bpool(void);
 int cdx_init_skb_2bfreed_bpool(void);
 
-void print_ipsec_offload_pkt_count(void);
 void display_fq_info(void *handle);
 int cdx_init_fqid_procfs(void);
 void cdx_deinit_fqid_procfs(void);
