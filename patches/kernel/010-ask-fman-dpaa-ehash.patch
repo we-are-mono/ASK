@@ -1,4 +1,4 @@
-From e2a62136e4c9d59ca36718d5f07a40cf75b461b3 Mon Sep 17 00:00:00 2001
+From bcf4d9e7d42e9fea0e46c3d32d85ff46a50321e5 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -53,7 +53,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
  .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
  .../sdk_fman/Peripherals/FM/Pcd/Makefile      |    7 +-
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       |  751 +++-----
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       |  766 +++------
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   24 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1211 +++++++++++++
@@ -78,19 +78,19 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
- .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  177 +-
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  201 +--
  .../sdk_fman/inc/Peripherals/fm_port_ext.h    |   23 +
  .../sdk_fman/inc/Peripherals/fm_vsp_ext.h     |   14 +
  .../sdk_fman/inc/flib/fsl_fman_port.h         |    6 +-
  .../freescale/sdk_fman/inc/stdlib_ext.h       |   47 +-
  .../freescale/sdk_fman/ls1043_dflags.h        |    2 +
- .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |    7 +-
+ .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |    8 +-
  .../src/inc/wrapper/lnxwrp_fsl_fman.h         |    5 +
  .../freescale/sdk_fman/src/system/sys_io.c    |    1 +
  .../sdk_fman/src/wrapper/lnxwrp_fm.c          |   45 +
  .../sdk_fman/src/wrapper/lnxwrp_fm.h          |    3 +-
  .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |    9 +-
- .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |  181 +-
+ .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   |  298 +---
  .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |    8 +
  .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c    |  192 +++
  .../src/wrapper/lnxwrp_sysfs_fm_port.c        |    6 +-
@@ -112,7 +112,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 75 files changed, 6804 insertions(+), 1279 deletions(-)
+ 75 files changed, 6806 insertions(+), 1434 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1947,7 +1947,7 @@ index 6eedcf9de5fb..bcb4567cd5bb 100644
 +##	setenv FMAN_DEBUG '-DFM_CC_MURAM_DEBUG=1'
 +ccflags-y += $(FMAN_DEBUG)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
-index b8d600fa6f25..0520ce311223 100644
+index b8d600fa6f25..d276fe8d5e0f 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 @@ -51,6 +51,8 @@
@@ -2480,7 +2480,7 @@ index b8d600fa6f25..0520ce311223 100644
      SANITY_CHECK_RETURN_VALUE(h_FmPcd, E_INVALID_HANDLE, NULL);
      SANITY_CHECK_RETURN_VALUE(p_Param, E_NULL_POINTER, NULL);
  
-@@ -7069,211 +7118,22 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+@@ -7069,399 +7118,22 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
          return NULL;
      }
  
@@ -2646,9 +2646,9 @@ index b8d600fa6f25..0520ce311223 100644
 -    t_Handle *p_HashBuckets, h_MissStatsCounters;
 -    uint16_t i, numOfBuckets;
 -    t_Error err;
- 
-     SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
- 
+-
+-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
+-
 -    /* Store all hash buckets before the hash is freed */
 -    numOfBuckets = p_HashTbl->numOfKeys;
 -
@@ -2680,24 +2680,25 @@ index b8d600fa6f25..0520ce311223 100644
 -        RETURN_ERROR(MAJOR, err, NO_MSG);
 -
 -    return E_OK;
-+    return -1; /* table teardown is not implemented for the external hash */
- }
- 
- t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
-                                t_FmPcdCcKeyParams *p_KeyParams)
- {
-     t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
+-}
+-
+-t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
+-                               t_FmPcdCcKeyParams *p_KeyParams)
+-{
+-    t_FmPcdCcNode *p_HashTbl = (t_FmPcdCcNode *)h_HashTbl;
 -    t_Handle h_HashBucket;
 -    uint8_t bucketIndex;
 -    uint16_t lastIndex;
 -    t_Error err;
- 
-     SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
-     SANITY_CHECK_RETURN_ERROR(p_KeyParams, E_NULL_POINTER);
-@@ -7283,185 +7143,14 @@ t_Error FM_PCD_HashTableAddKey(t_Handle h_HashTbl, uint8_t keySize,
-         RETURN_ERROR(MAJOR, E_INVALID_VALUE,
-                      ("Keys masks not supported for hash table"));
- 
+-
+-    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
+-    SANITY_CHECK_RETURN_ERROR(p_KeyParams, E_NULL_POINTER);
+-    SANITY_CHECK_RETURN_ERROR(p_KeyParams->p_Key, E_NULL_POINTER);
+-
+-    if (p_KeyParams->p_Mask)
+-        RETURN_ERROR(MAJOR, E_INVALID_VALUE,
+-                     ("Keys masks not supported for hash table"));
+-
 -    err = FM_PCD_MatchTableGetIndexedHashBucket(p_HashTbl, keySize,
 -                                                p_KeyParams->p_Key,
 -                                                p_HashTbl->kgHashShift,
@@ -2730,9 +2731,8 @@ index b8d600fa6f25..0520ce311223 100644
 -        RETURN_ERROR(MAJOR, err, NO_MSG);
 -
 -    return FM_PCD_MatchTableFindNRemoveKey(h_HashBucket, keySize, p_Key, NULL);
-+    return ExternalHashTableAddKey(h_HashTbl, keySize, p_KeyParams);
- }
- 
+-}
+-
 -t_Error FM_PCD_HashTableModifyNextEngine(
 -        t_Handle h_HashTbl, uint8_t keySize, uint8_t *p_Key,
 -        t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams)
@@ -2742,8 +2742,8 @@ index b8d600fa6f25..0520ce311223 100644
 -    uint8_t bucketIndex;
 -    uint16_t lastIndex;
 -    t_Error err;
--
--    SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
+ 
+     SANITY_CHECK_RETURN_ERROR(p_HashTbl, E_INVALID_HANDLE);
 -    SANITY_CHECK_RETURN_ERROR(p_Key, E_NULL_POINTER);
 -    SANITY_CHECK_RETURN_ERROR(p_FmPcdCcNextEngineParams, E_NULL_POINTER);
 -
@@ -2753,11 +2753,12 @@ index b8d600fa6f25..0520ce311223 100644
 -                                                &lastIndex);
 -    if (err)
 -        RETURN_ERROR(MAJOR, err, NO_MSG);
--
+ 
 -    return FM_PCD_MatchTableFindNModifyNextEngine(h_HashBucket, keySize, p_Key,
 -                                                  NULL,
 -                                                  p_FmPcdCcNextEngineParams);
--}
++    return -1; /* table teardown is not implemented for the external hash */
+ }
  
  t_Error FM_PCD_HashTableModifyMissNextEngine(
          t_Handle h_HashTbl,
@@ -2815,9 +2816,8 @@ index b8d600fa6f25..0520ce311223 100644
 -    }
 -
 -    return E_OK;
-+    return ExternalHashTableModifyMissNextEngine(h_HashTbl, p_FmPcdCcNextEngineParams);
- }
- 
+-}
+-
 -
 -t_Error FM_PCD_HashTableGetMissNextEngine(
 -        t_Handle h_HashTbl,
@@ -2862,8 +2862,9 @@ index b8d600fa6f25..0520ce311223 100644
 -
 -    return FM_PCD_MatchTableFindNGetKeyStatistics(h_HashBucket, keySize, p_Key,
 -                                                  NULL, p_KeyStatistics);
--}
--
++    return ExternalHashTableModifyMissNextEngine(h_HashTbl, p_FmPcdCcNextEngineParams);
+ }
+ 
 -t_Error FM_PCD_HashTableGetMissStatistics(
 -        t_Handle h_HashTbl, t_FmPcdCcKeyStatistics *p_MissStatistics)
 -{
@@ -4326,7 +4327,7 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..c94dbd89a9c7
+index 000000000000..2ce129461fcf
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 @@ -0,0 +1,1211 @@
@@ -4482,7 +4483,7 @@ index 000000000000..c94dbd89a9c7
 +EXPORT_SYMBOL(ExternalHashTableEntryGetStatsAndTS);
 +
 +int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
-+                                      void *tbl_entry)
++                                      struct en_exthash_tbl_entry *tbl_entry)
 +{
 +	struct en_exthash_info *info;
 +	struct en_exthash_tbl_entry *first_entry;
@@ -6759,7 +6760,7 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..bd16459d5d81
+index 000000000000..47d41ab60807
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 @@ -0,0 +1,1505 @@
@@ -8263,7 +8264,7 @@ index 000000000000..bd16459d5d81
 +extern int ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
 +				struct en_tbl_entry_stats *stats);
 +extern int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
-+				void *tbl_entry);
++				struct en_exthash_tbl_entry *tbl_entry);
 +extern int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index,
 +				void *tbl_entry);
 +
@@ -8318,7 +8319,7 @@ index ef62c8ef28d5..464b539e8c81 100644
  
  #endif /* __FM_MURAM_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
-index 6e5db2aaf500..8057c0dbd299 100644
+index 6e5db2aaf500..30bb3b5b9553 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 @@ -45,7 +45,7 @@
@@ -8410,10 +8411,33 @@ index 6e5db2aaf500..8057c0dbd299 100644
   @Param[out]    p_CcNodeBucketHandle    Pointer to the bucket of the provided key.
   @Param[out]    p_BucketIndex           Index to the bucket of the provided key
   @Param[out]    p_LastIndex             Pointer to last index in the bucket of the
-@@ -3445,47 +3482,6 @@ t_Error FM_PCD_HashTableAddKey(t_Handle            h_HashTbl,
-                                uint8_t             keySize,
-                                t_FmPcdCcKeyParams  *p_KeyParams);
+@@ -3422,71 +3459,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
+ *//***************************************************************************/
+ t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl);
  
+-/**************************************************************************//**
+- @Function      FM_PCD_HashTableAddKey
+-
+- @Description   This routine adds the provided key (including next engine
+-                parameters of this key) to the hash table.
+-                The key is added as the last key of the bucket that it is
+-                mapped to.
+-
+- @Param[in]     h_HashTbl    A handle to a hash table
+- @Param[in]     keySize      Key size of added key
+- @Param[in]     p_KeyParams  A pointer to the parameters includes
+-                             new key with next engine parameters; The pointer
+-                             to the key mask must be NULL, as masks are not
+-                             supported in hash table implementation.
+-
+- @Return        E_OK on success; Error code otherwise.
+-
+- @Cautions      Allowed only following FM_PCD_HashTableSet().
+-*//***************************************************************************/
+-t_Error FM_PCD_HashTableAddKey(t_Handle            h_HashTbl,
+-                               uint8_t             keySize,
+-                               t_FmPcdCcKeyParams  *p_KeyParams);
+-
 -/**************************************************************************//**
 - @Function      FM_PCD_HashTableRemoveKey
 -
@@ -8455,10 +8479,11 @@ index 6e5db2aaf500..8057c0dbd299 100644
 -                                         uint8_t                   keySize,
 -                                         uint8_t                   *p_Key,
 -                                         t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
- 
+-
  /**************************************************************************//**
   @Function      FM_PCD_HashTableModifyMissNextEngine
-@@ -3506,75 +3502,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
+ 
+@@ -3506,75 +3478,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
  t_Error FM_PCD_HashTableModifyMissNextEngine(t_Handle                  h_HashTbl,
                                               t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
  
@@ -8534,7 +8559,7 @@ index 6e5db2aaf500..8057c0dbd299 100644
  /**************************************************************************//**
   @Function      FM_PCD_ManipNodeSet
  
-@@ -3697,4 +3624,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
+@@ -3697,4 +3600,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
  /** @} */ /* end of FM_PCD_grp group */
  /** @} */ /* end of FM_grp group */
  
@@ -8726,17 +8751,17 @@ index 67d96367f075..25af9ed23a19 100644
  #define DEBUG_ERRORS        1
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-index 9667d45d7f75..a90951e8c7fd 100644
+index 9667d45d7f75..fb8ef7f37320 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-@@ -92,18 +92,13 @@ EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyCounter);
+@@ -92,18 +92,12 @@ EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyCounter);
  EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableFindNGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableGetMissStatistics);
 -EXPORT_SYMBOL(FM_PCD_HashTableGetMissStatistics);
  EXPORT_SYMBOL(FM_PCD_HashTableSet);
 -EXPORT_SYMBOL(FM_PCD_HashTableDelete);
- EXPORT_SYMBOL(FM_PCD_HashTableAddKey);
+-EXPORT_SYMBOL(FM_PCD_HashTableAddKey);
 -EXPORT_SYMBOL(FM_PCD_HashTableRemoveKey);
 -EXPORT_SYMBOL(FM_PCD_HashTableModifyNextEngine);
  EXPORT_SYMBOL(FM_PCD_HashTableModifyMissNextEngine);
@@ -8900,18 +8925,19 @@ index ea4235847686..1aa05d79cfdf 100644
  
      if (CheckNConfigFmPortAdvArgs(p_LnxWrpFmPortDev) != E_OK)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
-index f97c37f06255..55dbbd19a2ec 100644
+index f97c37f06255..9d646608e379 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
-@@ -505,7 +505,6 @@ Status: PCD API to fmlib (file: drivers/net/dpa/NetCommSw/inc/Peripherals/fm_pcd
+@@ -504,8 +504,6 @@ Status: PCD API to fmlib (file: drivers/net/dpa/NetCommSw/inc/Peripherals/fm_pcd
+     FM_PCD_MatchTableModifyKeyAndNextEngine
      FM_PCD_HashTableSet
      FM_PCD_HashTableDelete
-     FM_PCD_HashTableAddKey
+-    FM_PCD_HashTableAddKey
 -    FM_PCD_HashTableRemoveKey
      FM_PCD_MatchTableModifyKey
      FM_PCD_ManipNodeReplace
      FM_PCD_ManipNodeSet
-@@ -527,9 +526,7 @@ Status: not exported
+@@ -527,9 +525,7 @@ Status: not exported
      FM_PCD_MatchTableGetKeyCounter
  
  Status: not exported, would be nice to have
@@ -8921,7 +8947,7 @@ index f97c37f06255..55dbbd19a2ec 100644
      FM_PCD_ManipGetStatistics
  
  Status: not exported
-@@ -2173,71 +2170,9 @@ Status: not exported
+@@ -2173,71 +2169,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_HASH_TABLE_GET_MISS_STAT:
          {
@@ -8996,7 +9022,7 @@ index f97c37f06255..55dbbd19a2ec 100644
              break;
          }
  
-@@ -2347,28 +2282,9 @@ Status: not exported
+@@ -2347,28 +2281,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_HASH_TABLE_DELETE:
          {
@@ -9028,7 +9054,130 @@ index f97c37f06255..55dbbd19a2ec 100644
              break;
          }
  
-@@ -2498,82 +2414,9 @@ Status: not exported
+@@ -2377,119 +2292,9 @@ Status: not exported
+ #endif
+         case FM_PCD_IOC_HASH_TABLE_ADD_KEY:
+         {
+-            ioc_fm_pcd_hash_table_add_key_params_t *param = NULL;
+-
+-            param = (ioc_fm_pcd_hash_table_add_key_params_t*) XX_Malloc(
+-                    sizeof(ioc_fm_pcd_hash_table_add_key_params_t));
+-            if (!param)
+-                RETURN_ERROR(MINOR, E_NO_MEMORY, ("IOCTL FM PCD"));
+-
+-            memset(param, 0, sizeof(ioc_fm_pcd_hash_table_add_key_params_t));
+-
+-#if defined(CONFIG_COMPAT)
+-            if (compat)
+-            {
+-                ioc_compat_fm_pcd_hash_table_add_key_params_t *compat_param;
+-
+-                compat_param = (ioc_compat_fm_pcd_hash_table_add_key_params_t*) XX_Malloc(
+-                        sizeof(ioc_compat_fm_pcd_hash_table_add_key_params_t));
+-                if (!compat_param)
+-                {
+-                    XX_Free(param);
+-                    RETURN_ERROR(MINOR, E_NO_MEMORY, ("IOCTL FM PCD"));
+-                }
+-
+-                memset(compat_param, 0, sizeof(ioc_compat_fm_pcd_hash_table_add_key_params_t));
+-                if (copy_from_user(compat_param,
+-                            (ioc_compat_fm_pcd_hash_table_add_key_params_t*) compat_ptr(arg),
+-                            sizeof(ioc_compat_fm_pcd_hash_table_add_key_params_t)))
+-                {
+-                    XX_Free(compat_param);
+-                    XX_Free(param);
+-                    RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
+-                }
+-
+-                if (compat_param->key_size)
+-                {
+-                    param->p_hash_tbl = compat_pcd_id2ptr(compat_param->p_hash_tbl);
+-                    param->key_size   = compat_param->key_size;
+-
+-                    compat_copy_fm_pcd_cc_key(&compat_param->key_params, &param->key_params, COMPAT_US_TO_K);
+-                }
+-                else
+-                {
+-                    XX_Free(compat_param);
+-                    XX_Free(param);
+-                    err = E_INVALID_VALUE;
+-                    break;
+-                }
+-
+-                XX_Free(compat_param);
+-            }
+-            else
+-#endif
+-            {
+-                if (copy_from_user(param, (ioc_fm_pcd_hash_table_add_key_params_t*) arg,
+-                            sizeof(ioc_fm_pcd_hash_table_add_key_params_t)))
+-                {
+-                    XX_Free(param);
+-                    RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
+-                }
+-            }
+-
+-            if (param->key_size)
+-            {
+-                int size = 0;
+-
+-                if (param->key_params.p_key)  size += param->key_size;
+-                if (param->key_params.p_mask) size += param->key_size;
+-
+-                if (size)
+-                {
+-                    uint8_t *p_tmp;
+-
+-                    p_tmp = (uint8_t*) XX_Malloc(size);
+-                    if (!p_tmp)
+-                    {
+-                        XX_Free(param);
+-                        RETURN_ERROR(MINOR, E_NO_MEMORY, ("IOCTL FM PCD key/mask"));
+-                    }
+-
+-                    if (param->key_params.p_key)
+-                    {
+-                        if (copy_from_user(p_tmp, param->key_params.p_key, param->key_size))
+-                        {
+-                            XX_Free(p_tmp);
+-                            XX_Free(param);
+-                            RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
+-                        }
+-
+-                        param->key_params.p_key = p_tmp;
+-                    }
+-
+-                    if (param->key_params.p_mask)
+-                    {
+-                        p_tmp += param->key_size;
+-                        if (copy_from_user(p_tmp, param->key_params.p_mask, param->key_size))
+-                        {
+-                            XX_Free(p_tmp - param->key_size);
+-                            XX_Free(param);
+-                            RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
+-                        }
+-
+-                        param->key_params.p_mask = p_tmp;
+-                    }
+-                }
+-            }
+-
+-            err = FM_PCD_HashTableAddKey(
+-                    param->p_hash_tbl,
+-                    param->key_size,
+-                    (t_FmPcdCcKeyParams*)&param->key_params);
+-
+-            if (param->key_params.p_key)
+-                XX_Free(param->key_params.p_key);
+-            XX_Free(param);
++            RETURN_ERROR(MINOR, E_INVALID_SELECTION,
++                ("invalid ioctl: cmd:0x%08x(type:0x%02x, nr: %d.\n",
++                cmd, _IOC_TYPE(cmd), _IOC_NR(cmd)));
+             break;
+         }
+ 
+@@ -2498,82 +2303,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_HASH_TABLE_REMOVE_KEY:
          {
@@ -9114,7 +9263,7 @@ index f97c37f06255..55dbbd19a2ec 100644
              break;
          }
  
-@@ -3379,6 +3222,9 @@ Status: not exported
+@@ -3379,6 +3111,9 @@ Status: not exported
      }
  
          default:
@@ -9124,7 +9273,7 @@ index f97c37f06255..55dbbd19a2ec 100644
              RETURN_ERROR(MINOR, E_INVALID_SELECTION,
                  ("invalid ioctl: cmd:0x%08x(type:0x%02x, nr: %d.\n",
                  cmd, _IOC_TYPE(cmd), _IOC_NR(cmd)));
-@@ -4612,6 +4458,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4612,6 +4347,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
          }
  
          default:

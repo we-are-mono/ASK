@@ -38,7 +38,7 @@ int dpa_set_bridged_itf(uint8_t* ifname, uint8_t is_bridged, uint8_t* br_mac_add
 void dpa_release_interface(uint32_t itf_id);
 
 int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
-		void *tbl_entry);
+		struct en_exthash_tbl_entry *tbl_entry);
 int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index,
 		void *tbl_entry);
 int ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
