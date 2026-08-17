@@ -174,7 +174,16 @@ int __cmmSATunnelRegister(FCI_CLIENT *fci_handle, struct SATable* SAEntry)
 		goto program;
 
 	cmm_print(DEBUG_INFO, "%s:Neighor resolved \n", __func__);
-	cmmFeRouteUpdate(fci_handle, ADD | UPDATE, SAEntry->tnl_rt.fpp_route);
+
+	if (cmmFeRouteUpdate(fci_handle, ADD | UPDATE, SAEntry->tnl_rt.fpp_route) < 0)
+	{
+		/* Don't point the SA at a route id the forward engine never
+		 * accepted. Record the id we tried so FPP_NEEDS_UPDATE stays
+		 * armed and a later route event retries the whole sequence. */
+		__cmmCheckFPPRouteIdUpdate(&SAEntry->tnl_rt, &SAEntry->flags);
+
+		return -1;
+	}
 
 program:
 
@@ -201,6 +210,8 @@ program:
 static void __cmmSARouteUpdate(FCI_CLIENT *fci_handle, struct SATable *s, struct RtEntry *route)
 {
 	struct ct_route rt = s->tnl_rt;
+	int rollback = 0;
+	int rc;
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
@@ -216,8 +227,37 @@ static void __cmmSARouteUpdate(FCI_CLIENT *fci_handle, struct SATable *s, struct
 	}
 
 	__pthread_mutex_lock(&sa_lock);
-	__cmmSATunnelRegister(fci_handle, s);
+
+	rc = __cmmSATunnelRegister(fci_handle, s);
+
+	if ((rc < 0) && !(route->flags & INVALID))
+	{
+		/* The forward engine kept the old route when it refused the swap.
+		 * Put the old binding back so both sides agree, keep the update
+		 * pending and let a later route event retry it. Deregistering the
+		 * old route here would only be rejected, since it is still
+		 * referenced. */
+		if (s->tnl_rt.fpp_route != rt.fpp_route)
+			__cmmFPPRouteDeregister(fci_handle, s->tnl_rt.fpp_route, "sa");
+		else if (s->tnl_rt.fpp_route)
+		{
+			/* Re-resolution landed on the route entry already held and
+			 * took a second local reference. The forward engine still has
+			 * the route, so drop only the extra count. */
+			__cmmFPPRoutePut(s->tnl_rt.fpp_route);
+		}
+
+		s->tnl_rt.fpp_route = rt.fpp_route;
+		s->tnl_rt.fpp_route_id = rt.fpp_route_id;
+		s->flags |= FPP_NEEDS_UPDATE;
+
+		rollback = 1;
+	}
+
 	__pthread_mutex_unlock(&sa_lock);
+
+	if (rollback)
+		return;
 
 	__cmmRouteDeregister(fci_handle, &rt, "sa");
 }
@@ -248,7 +288,10 @@ int __cmmRouteIsSA(int family, const unsigned int* daddr, struct SATable* sa, in
 	int addr_len = IPADDRLEN(family);
 
 
-	if (sa->tnl_rt.route)
+	/* An SA that already has a route still matches while it owes the
+	 * forward engine an update: its last programming attempt was refused
+	 * and rolled back, so this route event is its retry. */
+	if (sa->tnl_rt.route && !(sa->flags & FPP_NEEDS_UPDATE))
 		goto out;
 
 	if (sa->SAInfo.proto_family != family)

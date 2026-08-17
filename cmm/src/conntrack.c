@@ -1930,7 +1930,14 @@ void __cmmFPPRouteDeregister(FCI_CLIENT *fci_handle, struct fpp_rt *fpp_route, c
 
 	/* In case of a deregister error don't free the route entry, we still need to track the fpp state */
 	if (rc < 0)
-		fpp_route->count--;
+	{
+		if (fpp_route->count > 0)
+			fpp_route->count--;
+
+		cmm_print(DEBUG_ERROR, "%s: %s route id %d deregister rejected by fpp, "
+					"keeping orphaned handle for retry\n",
+					__func__, dir, fpp_route->id);
+	}
 	else
 		__cmmFPPRoutePut(fpp_route);
 }

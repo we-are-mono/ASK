@@ -546,7 +546,17 @@ int __tunnel_add(FCI_CLIENT *fci_handle, struct interface *itf)
 
 		enabled = 1;
 
-		cmmFeRouteUpdate(fci_handle, ADD | UPDATE, itf->rt.fpp_route);
+		if (cmmFeRouteUpdate(fci_handle, ADD | UPDATE, itf->rt.fpp_route) < 0)
+		{
+			/* Don't describe the tunnel with a route id the forward
+			 * engine never accepted. Record the id we tried so
+			 * FPP_NEEDS_UPDATE stays armed and a later route event
+			 * retries the whole sequence. */
+			__cmmCheckFPPRouteIdUpdate(&itf->rt, &itf->flags);
+
+			rc = CMMD_ERR_UNKNOWN;
+			goto err;
+		}
 	}
 	else
 		enabled = 1;
@@ -1116,6 +1126,8 @@ void __cmmTunnelUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route)
 	struct interface *itf;
 	struct list_head *entry;
 	struct fpp_rt *fpp_route;
+	int fpp_route_id;
+	int rollback;
 	int i;
 
 	for (i = 0; i < ITF_HASH_TABLE_SIZE; i++)
@@ -1130,11 +1142,49 @@ void __cmmTunnelUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route)
 			if (itf->rt.route == route)
 			{
 				fpp_route = itf->rt.fpp_route;
+				fpp_route_id = itf->rt.fpp_route_id;
 				itf->rt.fpp_route = NULL;
+				rollback = 0;
 
-				__tunnel_add(fci_handle, itf);
+				if (__tunnel_add(fci_handle, itf) != CMMD_ERR_OK)
+				{
+					/* The programming attempt was refused, so the
+					 * tunnel still owes the forward engine an update.
+					 * Arm the retry whether or not the old binding has
+					 * to be put back. */
+					itf->flags |= FPP_NEEDS_UPDATE;
 
-				__cmmFPPRouteDeregister(fci_handle, fpp_route, "tunnel");
+					/* When the tunnel is not programmed the forward
+					 * engine holds no old binding to stay in step with,
+					 * so the old route can just be released. */
+					if (itf->flags & FPP_PROGRAMMED)
+					{
+						/* The forward engine validates before it
+						 * commits, so it kept the old route. Put the
+						 * old binding back so both sides agree and let
+						 * a later route event retry. Deregistering the
+						 * old route here would only be rejected, since
+						 * it is still referenced. */
+						if (itf->rt.fpp_route != fpp_route)
+							__cmmFPPRouteDeregister(fci_handle, itf->rt.fpp_route, "tunnel");
+						else if (itf->rt.fpp_route)
+						{
+							/* Re-resolution landed on the route entry
+							 * already held and took a second local
+							 * reference. The forward engine still has
+							 * the route, so drop only the extra count. */
+							__cmmFPPRoutePut(itf->rt.fpp_route);
+						}
+
+						itf->rt.fpp_route = fpp_route;
+						itf->rt.fpp_route_id = fpp_route_id;
+
+						rollback = 1;
+					}
+				}
+
+				if (!rollback)
+					__cmmFPPRouteDeregister(fci_handle, fpp_route, "tunnel");
 			}
 		}
 	}

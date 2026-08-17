@@ -519,7 +519,16 @@ int __socket_open(FCI_CLIENT *fci_handle, struct socket *s)
 			goto program;
 		}
 
-		cmmFeRouteUpdate(fci_handle, ADD | UPDATE, s->rt.fpp_route);
+		if (cmmFeRouteUpdate(fci_handle, ADD | UPDATE, s->rt.fpp_route) < 0)
+		{
+			/* Don't describe the socket with a route id the forward
+			 * engine never accepted. Record the id we tried so
+			 * FPP_NEEDS_UPDATE stays armed and a later route event
+			 * retries the whole sequence. */
+			__cmmCheckFPPRouteIdUpdate(&s->rt, &s->flags);
+
+			return CMMD_ERR_UNKNOWN;
+		}
 	}
 
 
@@ -587,8 +596,10 @@ void __cmmSocketUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route)
 	struct socket *s;
 	struct list_head *entry;
 	struct fpp_rt *fpp_route;
+	int fpp_route_id;
+	int rollback;
 	int i;
-	
+
 	__pthread_mutex_lock(&socket_lock);
 
 	for (i = 0; i < HASH_SOCKET_SIZE; i++)
@@ -600,11 +611,49 @@ void __cmmSocketUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route)
 			if (s->rt.route == route)
 			{
 				fpp_route = s->rt.fpp_route;
+				fpp_route_id = s->rt.fpp_route_id;
 				s->rt.fpp_route = NULL;
+				rollback = 0;
 
-				__socket_open(fci_handle, s);
+				if (__socket_open(fci_handle, s) != CMMD_ERR_OK)
+				{
+					/* The programming attempt was refused, so the
+					 * socket still owes the forward engine an update.
+					 * Arm the retry whether or not the old binding has
+					 * to be put back. */
+					s->flags |= FPP_NEEDS_UPDATE;
 
-				__cmmFPPRouteDeregister(fci_handle, fpp_route, "socket");
+					/* When the socket is not programmed the forward
+					 * engine holds no old binding to stay in step with,
+					 * so the old route can just be released. */
+					if (s->flags & FPP_PROGRAMMED)
+					{
+						/* The forward engine validates before it
+						 * commits, so it kept the old route. Put the
+						 * old binding back so both sides agree and let
+						 * a later route event retry. Deregistering the
+						 * old route here would only be rejected, since
+						 * it is still referenced. */
+						if (s->rt.fpp_route != fpp_route)
+							__cmmFPPRouteDeregister(fci_handle, s->rt.fpp_route, "socket");
+						else if (s->rt.fpp_route)
+						{
+							/* Re-resolution landed on the route entry
+							 * already held and took a second local
+							 * reference. The forward engine still has
+							 * the route, so drop only the extra count. */
+							__cmmFPPRoutePut(s->rt.fpp_route);
+						}
+
+						s->rt.fpp_route = fpp_route;
+						s->rt.fpp_route_id = fpp_route_id;
+
+						rollback = 1;
+					}
+				}
+
+				if (!rollback)
+					__cmmFPPRouteDeregister(fci_handle, fpp_route, "socket");
 			}
 		}
 	}
@@ -678,8 +727,15 @@ exit:
 static int socket_update(FCI_CLIENT *fci_handle, cmmd_socket_update_cmd_t *cmd)
 {
 	struct socket *s;
-	unsigned short rc = 0; // rc=2 OK, rc=0 KO, cmm_client error code hack 
+	unsigned short rc = 0; // rc=2 OK, rc=0 KO, cmm_client error code hack
 	struct ct_route old_route;
+	u_int32_t old_saddr[4];
+	u_int16_t old_sport;
+	u_int8_t old_queue;
+	u_int16_t old_dscp;
+#if defined(LS1043)
+	u_int16_t old_expt_flag;
+#endif // LS1043
 	u_int8_t del_old_route=0;
 	u_int32_t null_addr[4] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
 
@@ -706,9 +762,21 @@ static int socket_update(FCI_CLIENT *fci_handle, cmmd_socket_update_cmd_t *cmd)
 	}
 
 
+	/* The forward engine validates a socket update before it commits it, so
+	 * a rejected command leaves the socket running with the values it
+	 * already had. Snapshot everything this command touches so it can be
+	 * put back, keeping both sides on the old state when the update fails. */
+	old_route = s->rt;
+	memcpy(old_saddr, s->saddr, sizeof(old_saddr));
+	old_sport = s->sport;
+	old_queue = s->queue;
+	old_dscp = s->dscp;
+#if defined(LS1043)
+	old_expt_flag = s->expt_flag;
+#endif // LS1043
+
 	if (memcmp(cmd->saddr, null_addr, IPADDRLEN(s->family)) && memcmp(cmd->saddr, s->saddr, IPADDRLEN(s->family))) // source has changed -> new route
 	{
-		old_route = s->rt;
 		memcpy(s->saddr, cmd->saddr, IPADDRLEN(s->family));
 		s->rt.route = NULL;
 		s->rt.fpp_route = NULL;
@@ -733,9 +801,43 @@ static int socket_update(FCI_CLIENT *fci_handle, cmmd_socket_update_cmd_t *cmd)
 
 	rc = __socket_open(fci_handle, s);
 
+	if (rc != CMMD_ERR_OK)
+	{
+		/* Release whatever __socket_open() acquired, restore the snapshot
+		 * and leave the old route registered. FPP_NEEDS_UPDATE stays set
+		 * so a later route event retries the socket. The client gets the
+		 * error, with neither side having moved. */
+		if (s->rt.fpp_route != old_route.fpp_route)
+			__cmmFPPRouteDeregister(fci_handle, s->rt.fpp_route, "socket");
+		else if (del_old_route && s->rt.fpp_route)
+		{
+			/* The re-resolved route landed on the route entry already
+			 * held and took a second local reference. The forward engine
+			 * still has the route, so drop only the extra count. Without
+			 * a new source address nothing was re-resolved, so an equal
+			 * pointer there means untouched. */
+			__cmmFPPRoutePut(s->rt.fpp_route);
+		}
+
+		if (s->rt.route && (s->rt.route != old_route.route))
+			____cmmRouteDeregister(s->rt.route, "socket");
+
+		s->rt = old_route;
+
+		memcpy(s->saddr, old_saddr, sizeof(old_saddr));
+		s->sport = old_sport;
+		s->queue = old_queue;
+		s->dscp = old_dscp;
+#if defined(LS1043)
+		s->expt_flag = old_expt_flag;
+#endif // LS1043
+
+		del_old_route = 0;
+	}
+
 exit:
 
-	if (del_old_route)	
+	if (del_old_route)
 	{
 		cmm_print(DEBUG_INFO, "Removing old socket route entry\n");
 

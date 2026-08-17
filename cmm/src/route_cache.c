@@ -636,6 +636,36 @@ int cmmRtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 }
 
 /*****************************************************************
+* __cmmCtRouteSwapFailed
+*
+*
+******************************************************************/
+
+/* Called when re-registering a conntrack on a changed route was rejected.
+ * The forward engine validates a route swap before it commits it, so a
+ * rejection leaves the conntrack bound to the route it had before. Remove
+ * the conntrack from hardware so those references are dropped, otherwise
+ * the old route deregister that follows is refused and its handle is
+ * orphaned. The conntrack stays in the cmm table and normal conntrack
+ * traffic re-offloads it on the new route later. */
+static void __cmmCtRouteSwapFailed(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
+{
+	if (!(ctEntry->flags & FPP_PROGRAMMED))
+		return;
+
+	if (cmmFeCtUpdate(fci_handle, REMOVE, ctEntry) < 0)
+	{
+		cmm_print(DEBUG_ERROR, "%s: conntrack remove failed, old route stays referenced\n", __func__);
+		return;
+	}
+
+	/* cmmFeCtUpdate() cleared FPP_PROGRAMMED. Forget the programmed
+	 * direction so the next register is seen as a change and re-sent. */
+	ctEntry->flags |= FPP_NEEDS_UPDATE;
+	ctEntry->fpp_dir = 0;
+}
+
+/*****************************************************************
 * __cmmCtTunnelRouteUpdate
 *
 *
@@ -643,6 +673,7 @@ int cmmRtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 static void __cmmCtTunnelRouteUpdate(FCI_CLIENT *fci_handle, struct ctTable *ctEntry, struct RtEntry *route, int dir)
 {
 	struct ct_route rt;
+	int rc;
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
@@ -678,7 +709,9 @@ static void __cmmCtTunnelRouteUpdate(FCI_CLIENT *fci_handle, struct ctTable *ctE
 			ctEntry->rep_tunnel.fpp_route = NULL;
 	}
 
-	____cmmCtRegister(fci_handle, ctEntry);
+	rc = ____cmmCtRegister(fci_handle, ctEntry);
+	if (rc < 0)
+		__cmmCtRouteSwapFailed(fci_handle, ctEntry);
 
 	if (dir == ORIGINATOR)
 	 	__cmmRouteDeregister(fci_handle, &rt, "originator tunnel");
@@ -695,6 +728,7 @@ static void __cmmCtRouteUpdate(FCI_CLIENT *fci_handle, struct ctTable *ctEntry, 
 {
 	struct ct_route rt;
 	struct ct_route tunnel_rt;
+	int rc;
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
@@ -746,7 +780,9 @@ static void __cmmCtRouteUpdate(FCI_CLIENT *fci_handle, struct ctTable *ctEntry, 
 			ctEntry->rep.fpp_route = NULL;
 	}
 
-	____cmmCtRegister(fci_handle, ctEntry);
+	rc = ____cmmCtRegister(fci_handle, ctEntry);
+	if (rc < 0)
+		__cmmCtRouteSwapFailed(fci_handle, ctEntry);
 
 	if (dir == ORIGINATOR)
 	{
@@ -768,6 +804,7 @@ static void __cmmCtRouteUpdate(FCI_CLIENT *fci_handle, struct ctTable *ctEntry, 
 static void __cmmTunnelRouteUpdate(FCI_CLIENT *fci_handle, struct interface *itf, struct RtEntry *route)
 {
 	struct ct_route rt = itf->rt;
+	int rc;
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
@@ -782,7 +819,41 @@ static void __cmmTunnelRouteUpdate(FCI_CLIENT *fci_handle, struct interface *itf
 		itf->rt.fpp_route = NULL;
 	}
 
-	__tunnel_add(fci_handle, itf);
+	rc = __tunnel_add(fci_handle, itf);
+
+	if ((rc != CMMD_ERR_OK) && !(route->flags & INVALID))
+	{
+		/* The programming attempt was refused, so the tunnel still owes the
+		 * forward engine an update. Arm the retry whether or not the old
+		 * binding has to be put back below. */
+		itf->flags |= FPP_NEEDS_UPDATE;
+
+		if (itf->flags & FPP_PROGRAMMED)
+		{
+			/* The forward engine validates before it commits, so it kept
+			 * the old route. Put the old binding back so both sides agree
+			 * and let a later route event retry. Deregistering the old
+			 * route here would only be rejected, since it is still
+			 * referenced. */
+			if (itf->rt.fpp_route != rt.fpp_route)
+				__cmmFPPRouteDeregister(fci_handle, itf->rt.fpp_route, "tunnel");
+			else if (itf->rt.fpp_route)
+			{
+				/* Re-resolution landed on the route entry already held
+				 * and took a second local reference. The forward engine
+				 * still has the route, so drop only the extra count. */
+				__cmmFPPRoutePut(itf->rt.fpp_route);
+			}
+
+			itf->rt.fpp_route = rt.fpp_route;
+			itf->rt.fpp_route_id = rt.fpp_route_id;
+
+			return;
+		}
+
+		/* Not programmed in the forward engine: it holds no old binding to
+		 * stay in step with, so releasing the old route below is safe. */
+	}
 
 	__cmmRouteDeregister(fci_handle, &rt, "tunnel");
 }
@@ -796,6 +867,8 @@ static void __cmmTunnelRouteUpdate(FCI_CLIENT *fci_handle, struct interface *itf
 static void __cmmSocketRouteUpdate(FCI_CLIENT *fci_handle, struct socket *s, struct RtEntry *route)
 {
 	struct ct_route rt = s->rt;
+	int rollback = 0;
+	int rc;
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
@@ -811,8 +884,47 @@ static void __cmmSocketRouteUpdate(FCI_CLIENT *fci_handle, struct socket *s, str
 	}
 
 	__pthread_mutex_lock(&socket_lock);
-	__socket_open(fci_handle, s);
+
+	rc = __socket_open(fci_handle, s);
+
+	if ((rc != CMMD_ERR_OK) && !(route->flags & INVALID))
+	{
+		/* The programming attempt was refused, so the socket still owes the
+		 * forward engine an update. Arm the retry whether or not the old
+		 * binding has to be put back below. */
+		s->flags |= FPP_NEEDS_UPDATE;
+
+		if (s->flags & FPP_PROGRAMMED)
+		{
+			/* The forward engine validates before it commits, so it kept
+			 * the old route. Put the old binding back so both sides agree
+			 * and let a later route event retry. Deregistering the old
+			 * route here would only be rejected, since it is still
+			 * referenced. */
+			if (s->rt.fpp_route != rt.fpp_route)
+				__cmmFPPRouteDeregister(fci_handle, s->rt.fpp_route, "socket");
+			else if (s->rt.fpp_route)
+			{
+				/* Re-resolution landed on the route entry already held
+				 * and took a second local reference. The forward engine
+				 * still has the route, so drop only the extra count. */
+				__cmmFPPRoutePut(s->rt.fpp_route);
+			}
+
+			s->rt.fpp_route = rt.fpp_route;
+			s->rt.fpp_route_id = rt.fpp_route_id;
+
+			rollback = 1;
+		}
+
+		/* Not programmed in the forward engine: it holds no old binding to
+		 * stay in step with, so releasing the old route below is safe. */
+	}
+
 	__pthread_mutex_unlock(&socket_lock);
+
+	if (rollback)
+		return;
 
 	__cmmRouteDeregister(fci_handle, &rt, "socket");
 }
@@ -1034,7 +1146,10 @@ static int __cmmRouteIsTnlItf(int family, const unsigned int* daddr, struct inte
 	if (!__itf_is_tunnel(itf))
 		goto out;
 
-	if (itf->rt.route)
+	/* A tunnel that already has a route still matches while it owes the
+	 * forward engine an update: its last programming attempt was refused
+	 * and rolled back, so this route event is its retry. */
+	if (itf->rt.route && !(itf->flags & FPP_NEEDS_UPDATE))
 		goto out;
 
 	if (itf->tunnel_family != family)
@@ -1345,7 +1460,12 @@ static void __cmmRouteNew(FCI_CLIENT *fci_handle, struct rtmsg *rtm, unsigned in
 		{
 			soc = container_of(entry, struct socket, list);
 
-			if (!soc->rt.route && soc->type == CMMD_SOCKET_TYPE_LANWAN)
+			/* A socket that already has a route still matches while it
+			 * owes the forward engine an update: its last programming
+			 * attempt was refused and rolled back, so this route event
+			 * is its retry. */
+			if ((!soc->rt.route || (soc->flags & FPP_NEEDS_UPDATE)) &&
+			    soc->type == CMMD_SOCKET_TYPE_LANWAN)
 			{
 				if (!flushed)
 				{
