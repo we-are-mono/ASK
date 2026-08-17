@@ -587,7 +587,15 @@ static int cdx_add_mcast_table_entry(void *mcast_cmd,
 			break;
 		}
 	}
-	retval = insert_mcast_entry_in_classif_table(pCtEntry, pMcastGrpInfo->uiListenerCnt, phyaddr, 
+	/* No valid member leaves ii == uiListenerCnt, and members[ii] would
+	 * read past the array when the group is at capacity. */
+	if (ii >= pMcastGrpInfo->uiListenerCnt)
+	{
+		DPA_ERROR("%s::no valid member in mcast group\r\n", __func__);
+		retval = -EINVAL;
+		goto err_ret;
+	}
+	retval = insert_mcast_entry_in_classif_table(pCtEntry, pMcastGrpInfo->uiListenerCnt, phyaddr,
 			pMcastGrpInfo->members[ii].tbl_entry);
 	if(retval)
 	{
@@ -880,6 +888,9 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 
 	memset(&InsEntryInfo, 0, sizeof(struct ins_entry_info));
 	pInsEntryInfo = &InsEntryInfo;
+	/* The create path zeroes its stack RouteEntry; without this the
+	 * vlan_filter_flags read by dpa_get_tx_info_by_itf is stack garbage. */
+	memset(&RtEntry, 0, sizeof(RouteEntry));
 	pRtEntry = &RtEntry;
 	mcast4_group = NULL;
 	mcast6_group = NULL;

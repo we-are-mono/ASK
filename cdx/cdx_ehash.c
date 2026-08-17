@@ -1175,8 +1175,12 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	return SUCCESS;
 err_ret:
 	//release all allocated items
-	if (entry->ct)
+	if (entry->ct) {
 		kfree(entry->ct);
+		/* the non-mcast sibling NULLs this too; a stale pointer here
+		 * is a UAF for any caller that retries or re-inspects entry */
+		entry->ct = NULL;
+	}
 	if (tbl_entry)
 		ExternalHashTableEntryFree(tbl_entry);
 err_ret1:
