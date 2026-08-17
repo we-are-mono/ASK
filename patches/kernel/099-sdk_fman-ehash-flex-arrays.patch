@@ -1,4 +1,4 @@
-From 1fda0f0e9a14cede16a347a2041ce4dfd9ef0858 Mon Sep 17 00:00:00 2001
+From 3607d5c2e2d6ecb6105f0ca27834241e5ad182be Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Fri, 3 Jul 2026 20:34:41 +0200
 Subject: [PATCH] sdk_fman: use C99 flexible arrays in ehash descriptor structs
@@ -25,12 +25,14 @@ Convert all seven zero-length tails (key, stats_offsets x3, l2hdr,
 vlanhdr, l3hdr) to C99 flexible array members. sizeof(struct) is
 unchanged; FORTIFY/UBSAN treat [] tails as unbounded, which matches
 how every caller sizes these buffers.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  .../freescale/sdk_fman/inc/Peripherals/fm_ehash.h  | 14 +++++++-------
  1 file changed, 7 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-index c7a043cc0d59..f255594c20b8 100644
+index bd16459d5d81..8cfb906052be 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 @@ -60,7 +60,7 @@ struct en_ehash_entry {

@@ -1,4 +1,4 @@
-From 31a3bf3023b9760ee2b941f66202bff5730ae2a7 Mon Sep 17 00:00:00 2001
+From 6d17d73d2947ada824919fd7c765876e3e051f78 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 23 Apr 2026 17:55:41 +0200
 Subject: [PATCH] ask: netfilter qosmark/qosconnmark + comcerto_fp module
@@ -15,14 +15,14 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  include/uapi/linux/netfilter/xt_QOSCONNMARK.h |  10 +
  include/uapi/linux/netfilter/xt_QOSMARK.h     |   6 +
- include/uapi/linux/netfilter/xt_qosconnmark.h |  35 ++
- include/uapi/linux/netfilter/xt_qosmark.h     |  19 +
+ include/uapi/linux/netfilter/xt_qosconnmark.h |  36 ++
+ include/uapi/linux/netfilter/xt_qosmark.h     |  20 +
  net/netfilter/Kconfig                         |  26 ++
  net/netfilter/Makefile                        |   3 +
  net/netfilter/comcerto_fp_netfilter.c         | 384 ++++++++++++++++++
  net/netfilter/xt_qosconnmark.c                | 167 ++++++++
  net/netfilter/xt_qosmark.c                    |  85 ++++
- 9 files changed, 735 insertions(+)
+ 9 files changed, 737 insertions(+)
  create mode 100644 include/uapi/linux/netfilter/xt_QOSCONNMARK.h
  create mode 100644 include/uapi/linux/netfilter/xt_QOSMARK.h
  create mode 100644 include/uapi/linux/netfilter/xt_qosconnmark.h
@@ -61,10 +61,11 @@ index 000000000000..45c4795aac12
 +#endif /*_XT_QOSMARK_H_target */
 diff --git a/include/uapi/linux/netfilter/xt_qosconnmark.h b/include/uapi/linux/netfilter/xt_qosconnmark.h
 new file mode 100644
-index 000000000000..22ac46faa670
+index 000000000000..19331b58f0e4
 --- /dev/null
 +++ b/include/uapi/linux/netfilter/xt_qosconnmark.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,36 @@
++/* Keep in sync with ASK iptables-extensions/include/linux/netfilter/xt_qosconnmark.h. */
 +#ifndef _XT_QOSCONNMARK_H
 +#define _XT_QOSCONNMARK_H
 +
@@ -102,10 +103,11 @@ index 000000000000..22ac46faa670
 +
 diff --git a/include/uapi/linux/netfilter/xt_qosmark.h b/include/uapi/linux/netfilter/xt_qosmark.h
 new file mode 100644
-index 000000000000..6f80bd016c40
+index 000000000000..94fdeffb3965
 --- /dev/null
 +++ b/include/uapi/linux/netfilter/xt_qosmark.h
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,20 @@
++/* Keep in sync with ASK iptables-extensions/include/linux/netfilter/xt_qosmark.h. */
 +#ifndef _XT_QOSMARK_H
 +#define _XT_QOSMARK_H
 +

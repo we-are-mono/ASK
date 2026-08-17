@@ -1,3 +1,4 @@
+/* Keep in sync with kernel include/uapi/linux/netfilter/xt_qosconnmark.h (ASK patch 060). */
 #ifndef _XT_QOSCONNMARK_H
 #define _XT_QOSCONNMARK_H
 

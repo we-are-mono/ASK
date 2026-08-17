@@ -10,8 +10,10 @@ SRCREV = "5b9f4b16a864e9dfa58cdcc860be278a7f66ac18"
 
 FILESEXTRAPATHS:prepend := "${ASK_SRCROOT}/patches/fmc:"
 
-# Our patch is shared with the Armbian build; silence Yocto's header QA
-# rather than carry an Upstream-Status line that would break Armbian.
+# Our patch is a bare diff (no commit-message envelope), so it has nowhere
+# to carry an Upstream-Status line; silence Yocto's header QA. The tag itself
+# is not the obstacle -- the sibling ASK patches (fmlib, libnfnetlink,
+# libnetfilter-conntrack) do carry it and Armbian applies them fine.
 ERROR_QA:remove = "patch-status"
 WARN_QA:remove  = "patch-status"
 

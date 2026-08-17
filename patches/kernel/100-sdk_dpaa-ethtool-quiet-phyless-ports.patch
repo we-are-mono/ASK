@@ -1,4 +1,4 @@
-From ca18f807b946b0bbd32231607ccfb1c624af003a Mon Sep 17 00:00:00 2001
+From 04c24d4b516a8a14998225eb5bae4270c886b772 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 12 Aug 2026 14:14:02 +0200
 Subject: [PATCH] sdk_dpaa: quiet benign "phy device not initialized" ethtool
@@ -15,15 +15,17 @@ Two guards in the same file already use netdev_dbg for the identical
 condition and message; make the other six match, so the line is emitted
 only under dynamic debug. No functional change -- same early return and
 return codes.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  .../net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c   | 12 ++++++------
  1 file changed, 6 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-index eeb19fc2c92d..8457ad7119ee 100644
+index a15d31c7bf7b..95f6db29416b 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
-@@ -123,7 +123,7 @@ static int __cold dpa_set_ksettings(struct net_device *net_dev,
+@@ -127,7 +127,7 @@ static int __cold dpa_set_ksettings(struct net_device *net_dev,
  		return -ENODEV;
  	}
  	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
@@ -32,7 +34,7 @@ index eeb19fc2c92d..8457ad7119ee 100644
  		return -ENODEV;
  	}
  
-@@ -178,7 +178,7 @@ static int __cold dpa_nway_reset(struct net_device *net_dev)
+@@ -182,7 +182,7 @@ static int __cold dpa_nway_reset(struct net_device *net_dev)
  		return -ENODEV;
  	}
  	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
@@ -41,7 +43,7 @@ index eeb19fc2c92d..8457ad7119ee 100644
  		return -ENODEV;
  	}
  
-@@ -210,7 +210,7 @@ static void __cold dpa_get_pauseparam(struct net_device *net_dev,
+@@ -214,7 +214,7 @@ static void __cold dpa_get_pauseparam(struct net_device *net_dev,
  
  	phy_dev = mac_dev->phy_dev;
  	if (unlikely(phy_dev == NULL)) {
@@ -50,7 +52,7 @@ index eeb19fc2c92d..8457ad7119ee 100644
  		return;
  	}
  
-@@ -238,7 +238,7 @@ static int __cold dpa_set_pauseparam(struct net_device *net_dev,
+@@ -242,7 +242,7 @@ static int __cold dpa_set_pauseparam(struct net_device *net_dev,
  
  	phy_dev = mac_dev->phy_dev;
  	if (unlikely(phy_dev == NULL)) {
@@ -59,7 +61,7 @@ index eeb19fc2c92d..8457ad7119ee 100644
  		return -ENODEV;
  	}
  
-@@ -325,7 +325,7 @@ static int dpa_get_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
+@@ -329,7 +329,7 @@ static int dpa_get_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
  	}
  
  	if (unlikely(priv->mac_dev->phy_dev == NULL)) {
@@ -68,7 +70,7 @@ index eeb19fc2c92d..8457ad7119ee 100644
  		return -ENODEV;
  	}
  
-@@ -343,7 +343,7 @@ static int dpa_set_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
+@@ -347,7 +347,7 @@ static int dpa_set_eee(struct net_device *net_dev, struct ethtool_keee *et_eee)
  	}
  
  	if (unlikely(priv->mac_dev->phy_dev == NULL)) {

@@ -62,8 +62,9 @@ do_configure[vardeps] += "KASAN"
 
 S = "${WORKDIR}/git"
 
-# The ASK bundle is shared with Armbian which strips Upstream-Status headers;
-# silence the Yocto QA rather than carry a Yocto-only header.
+# The ASK kernel patches are shared verbatim with the Armbian and OpenWrt
+# builds and carry no Yocto Upstream-Status tag; silence the QA rather than
+# add a Yocto-only header to shared patches.
 ERROR_QA:remove = "patch-status"
 WARN_QA:remove  = "patch-status"
 
