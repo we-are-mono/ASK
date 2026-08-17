@@ -114,7 +114,6 @@ int cdx_init_fqid_procfs(void);
 void cdx_deinit_fqid_procfs(void);
 
 /* Exception packet handling */
-void print_ipsec_exception_pkt_cnt(void);
 void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle);
 void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 

@@ -280,14 +280,8 @@ static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t 
 		case IPV4_3TUPLE_UDP_TABLE:
 			table_distrb_type =  IPV4_3TUPLE_UDP_DIST;
 			break;
-		case IPV4_3TUPLE_TCP_TABLE:
-			table_distrb_type =  IPV4_3TUPLE_TCP_DIST;
-			break;
 		case IPV6_3TUPLE_UDP_TABLE:
 			table_distrb_type =  IPV6_3TUPLE_UDP_DIST;
-			break;
-		case IPV6_3TUPLE_TCP_TABLE:
-			table_distrb_type =  IPV6_3TUPLE_TCP_DIST;
 			break;
 		case IPV6_MULTICAST_TABLE:
 			table_distrb_type =  IPV6_MULTICAST_DIST;
@@ -465,22 +459,10 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 				miss_engine_params.params.kgParams.h_DirectScheme = 
 					get_dist_info_by_fman_params(finfo, IPV4_3TUPLE_UDP_TABLE);
 				break;
-#ifdef TCP_3TUPLE_TABLE
-			case IPV4_TCP_TABLE:
-				miss_engine_params.params.kgParams.h_DirectScheme =
-					get_dist_info_by_fman_params(finfo, IPV4_3TUPLE_TCP_TABLE);
-				break;
-#endif // TCP_3TUPLE_TABLE
 			case IPV6_UDP_TABLE:
 				miss_engine_params.params.kgParams.h_DirectScheme = 
 					get_dist_info_by_fman_params(finfo, IPV6_3TUPLE_UDP_TABLE);
 				break;
-#ifdef TCP_3TUPLE_TABLE
-			case IPV6_TCP_TABLE:
-				miss_engine_params.params.kgParams.h_DirectScheme =
-					get_dist_info_by_fman_params(finfo, IPV6_3TUPLE_TCP_TABLE);
-				break;
-#endif // TCP_3TUPLE_TABLE
 			case ESP_IPV4_TABLE:
 				miss_engine_params.params.kgParams.h_DirectScheme =
 					get_dist_info_by_fman_params(finfo, IPV4_MULTICAST_TABLE);
@@ -492,13 +474,8 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 			case IPV4_MULTICAST_TABLE:
 			case IPV6_MULTICAST_TABLE:
 			case IPV4_3TUPLE_UDP_TABLE:
-#ifdef TCP_3TUPLE_TABLE
-			case IPV4_3TUPLE_TCP_TABLE:
-			case IPV6_3TUPLE_TCP_TABLE:
-#else
 			case IPV6_TCP_TABLE:
 			case IPV4_TCP_TABLE:
-#endif // TCP_3TUPLE_TABLE
 			case IPV6_3TUPLE_UDP_TABLE:
 				miss_engine_params.params.kgParams.h_DirectScheme = 
 					get_dist_info_by_fman_params(finfo, ETHERNET_TABLE);

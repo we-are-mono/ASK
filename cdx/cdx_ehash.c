@@ -3210,22 +3210,24 @@ static int get_rtp_classif_table_type(PSockEntry pSocket, uint32_t *type)
 {
 	switch (pSocket->proto) {
 		case IPPROTOCOL_TCP:
+			/* An unconnected socket is classified on the
+			 * destination address, protocol and destination port
+			 * only. The PCD provides such a table for UDP but not
+			 * for TCP, so an unconnected TCP socket cannot be
+			 * offloaded and has to stay on the software path. */
+			if (pSocket->unconnected)
+			{
+				DPA_ERROR("%s::no classification table for "
+						"unconnected TCP sockets\n",
+						__func__);
+				break;
+			}
 			if (pSocket->SocketFamily == PROTO_IPV4)
-			{
-				if (!pSocket->unconnected)
-					*type = IPV4_TCP_TABLE;
-				else
-					*type = IPV4_3TUPLE_TCP_TABLE;
-			}
+				*type = IPV4_TCP_TABLE;
 			else
-			{
-				if (!pSocket->unconnected)
-					*type = IPV6_TCP_TABLE;
-				else
-					*type = IPV6_3TUPLE_TCP_TABLE;
-			}
+				*type = IPV6_TCP_TABLE;
 			return SUCCESS;
-			
+
 		case IPPROTOCOL_UDP:
 			if (pSocket->SocketFamily == PROTO_IPV4)
 			{

@@ -46,9 +46,9 @@ enum {
 	ETHERNET_DIST,
 #ifdef CDX_RTP_RELAY // RTP relay feature
 	IPV4_3TUPLE_UDP_DIST,
-	IPV4_3TUPLE_TCP_DIST,
+	IPV4_3TUPLE_TCP_DIST,	//unused, reserved to keep the numbering stable
 	IPV6_3TUPLE_UDP_DIST,
-	IPV6_3TUPLE_TCP_DIST,
+	IPV6_3TUPLE_TCP_DIST,	//unused, reserved to keep the numbering stable
 #endif //CDX_RTP_RELAY
 	IPV4_FRAG_DIST,
 	IPV6_FRAG_DIST,

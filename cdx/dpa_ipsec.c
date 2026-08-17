@@ -207,15 +207,6 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 
 
 static uint32_t ipsec_exception_pkt_cnt;
-static uint32_t ipsec_exception_drop_cnt;
-void print_ipsec_exception_pkt_cnt(void)
-{
-	printk("%s:: Ipsec offload slow path packet count = %d, SEC error drops = %d\n",
-			__func__, ipsec_exception_pkt_cnt, ipsec_exception_drop_cnt);
-
-	ipsec_exception_pkt_cnt = 0;
-	ipsec_exception_drop_cnt = 0;
-}
 
 void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle)
 {
@@ -338,7 +329,6 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	}
 
 	if (unlikely(dq->fd.status & FM_FD_RX_STATUS_ERR_NON_FM)) {
-		ipsec_exception_drop_cnt++;
 		pr_err_ratelimited(
 			"cdx: IPsec SEC error on %s, fqid=0x%x sagd=0x%x status=0x%08x - dropping\n",
 			net_dev->name, dq->fqid, sagd_pkt, dq->fd.status);

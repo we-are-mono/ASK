@@ -68,21 +68,9 @@
   </key>
 </classification>
 
-<classification name="cdx_tuple3tcp4_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0xf" hashshift="0" keysize="8" aging="yes"/>
-  </key>
-</classification>
-
 <classification name="cdx_tuple3udp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
   <key>
      <hashtable external="yes" mask="0xff" hashshift="0" keysize="20" aging="yes"/>
-  </key>
-</classification>
-
-<classification name="cdx_tuple3tcp6_cc" max="512" masks="yes" shared="true" statistics="byteframe">
-  <key>
-     <hashtable external="yes" mask="0xf" hashshift="0" keysize="20" aging="yes"/>
   </key>
 </classification>
 
@@ -250,20 +238,6 @@
   <action type="classification" name="cdx_tuple3udp4_cc"/>
 </distribution>
 
-<distribution name="cdx_tup3tcp4_dist" shared="true">
-  <protocols>
-    <protocolref name="tcp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv4.dst" header_index="last"/>
-    <fieldref name="ipv4.nextp" header_index="last"/>
-    <fieldref name="tcp.dport"/>
-  </key>
-  <queue count="1" base="0x10a0"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_tuple3tcp4_cc"/>
-</distribution>
-
 <distribution name="cdx_tup3udp6_dist" shared="true">
   <protocols>
     <protocolref name="udp"/>
@@ -276,20 +250,6 @@
   <queue count="1" base="0x10b0"/>
   <combine portid="true" offset="16" mask="0xF"/>
   <action type="classification" name="cdx_tuple3udp6_cc"/>
-</distribution>
-
-<distribution name="cdx_tup3tcp6_dist" shared="true">
-  <protocols>
-    <protocolref name="tcp"/>
-  </protocols>
-  <key>
-    <fieldref name="ipv6.dst" header_index="last"/>
-    <fieldref name="ipv6.nexthdr" header_index="last"/>
-    <fieldref name="tcp.dport"/>
-  </key>
-  <queue count="1" base="0x10c0"/>
-  <combine portid="true" offset="16" mask="0xF"/>
-  <action type="classification" name="cdx_tuple3tcp6_cc"/>
 </distribution>
 
 <policy name="cdx_ethport_0_policy">

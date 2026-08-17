@@ -100,9 +100,7 @@ static struct ccnode_table_params table_params[] = {
 	{(char *)"cdx_esp4", 	ESP_IPV4_TABLE},
 	{(char *)"cdx_esp6", 	ESP_IPV6_TABLE},
 	{(char *)"cdx_tuple3udp4",	IPV4_3TUPLE_UDP_TABLE},
-	{(char *)"cdx_tuple3tcp4",	IPV4_3TUPLE_TCP_TABLE},
-	{(char *)"cdx_tuple3udp6", IPV6_3TUPLE_UDP_TABLE},
-	{(char *)"cdx_tuple3tcp6", IPV6_3TUPLE_TCP_TABLE}
+	{(char *)"cdx_tuple3udp6", IPV6_3TUPLE_UDP_TABLE}
 };
 #define MAX_TABLE_PARAMS\
 		(sizeof(table_params) / sizeof(struct ccnode_table_params))
@@ -120,9 +118,7 @@ static struct model_dist_params dist_name[] = {
 	{(char *)"cdx_pppoe_dist",      PPPOE_DIST},
 	{(char *)"cdx_ethernet_dist", 	ETHERNET_DIST},
 	{(char *)"cdx_tup3udp4_dist", 	IPV4_3TUPLE_UDP_DIST},
-	{(char *)"cdx_tup3tcp4_dist", 	IPV4_3TUPLE_TCP_DIST},
 	{(char *)"cdx_tup3udp6_dist", 	IPV6_3TUPLE_UDP_DIST},
-	{(char *)"cdx_tup3tcp6_dist", 	IPV6_3TUPLE_TCP_DIST},
 };
 #define MAX_DIST_PARAMS\
 		(sizeof(dist_name) / sizeof(struct model_dist_params))
@@ -639,16 +635,8 @@ static int set_table_types(struct fmc_model_t *model)
 				model->htnode[index].table_type = IPV4_3TUPLE_UDP_TABLE;
 				break;
 			}
-			if (strstr(model->htnode_name[index], "cdx_tuple3tcp4")) {
-				model->htnode[index].table_type = IPV4_3TUPLE_TCP_TABLE;
-				break;
-			}
 			if (strstr(model->htnode_name[index], "cdx_tuple3udp6")) {
 				model->htnode[index].table_type = IPV6_3TUPLE_UDP_TABLE;
-				break;
-			}
-			if (strstr(model->htnode_name[index], "cdx_tuple3tcp6")) {
-				model->htnode[index].table_type = IPV6_3TUPLE_TCP_TABLE;
 				break;
 			}
 			model->htnode[index].table_type = ETHERNET_TABLE;
