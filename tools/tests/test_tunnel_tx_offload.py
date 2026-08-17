@@ -22,9 +22,13 @@ Oracles:
        software path explicitly, so if a future ucode fixes
        INSERT_L3_HDR this test fails loudly rather than silently
        changing meaning.
-  (ii) The kernel grew at least one IPv6 conntrack entry during the
-       run — proves the firewall rules engaged tracking, which is
-       the prerequisite for CMM to mirror the flow to FCI.
+  (ii) conntrack holds an entry for THIS tunnel flow after the run —
+       the outer proto-41 sit encapsulation between the tunnel
+       endpoints (or the inner v6 flow) — proving the kernel forward
+       path engaged tracking, the prerequisite for CMM→FCI mirroring.
+       A global conntrack-count delta is deliberately not used: entries
+       left by earlier tests age out mid-run and made it flaky late in
+       the suite.
 
 Both oracles are required: (i) without (ii) could mean the LAN-side
 link is itself the bottleneck (some test harnesses sit on a 10G
@@ -213,15 +217,7 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
     this test fails loudly and gets rewritten rather than silently
     changing meaning.
     """
-    # Conntrack baseline (we want at least ONE new IPv6 entry to appear,
-    # which proves the kernel netfilter conntrack engaged on the
-    # forwarded v6 path — prerequisite for CMM→FCI mirroring).
-    r = await target_agent.exec_cmd(
-        aiohttp_session,
-        ["sysctl", "-n", "net.netfilter.nf_conntrack_count"],
-    )
-    ct_before = int((r.get("stdout") or "0").strip() or "0")
-
+    # Kernel sit-tx baseline for the software-encap tripwire (oracle iii).
     r = await target_agent.exec_cmd(
         aiohttp_session, ["ip", "-s", "-j", "link", "show", TUNNEL_IF])
     sit_tx_before = json.loads(r["stdout"])[0]["stats64"]["tx"]["packets"]
@@ -279,31 +275,42 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
             f"{lan_state.stdout}"
         )
 
-    # Counter snapshot: did the kernel grow any IPv6 conntrack entries?
-    r = await target_agent.exec_cmd(
-        aiohttp_session,
-        ["sysctl", "-n", "net.netfilter.nf_conntrack_count"],
-    )
-    ct_after = int((r.get("stdout") or "0").strip() or "0")
-    ct_delta = ct_after - ct_before
-
     # Oracle (i): throughput must exceed the SW-fallback ceiling.
     assert gbps >= OFFLOAD_MIN_GBPS, (
         f"tunneled iperf3 throughput {gbps:.2f} Gbps below "
         f"{OFFLOAD_MIN_GBPS} Gbps — kernel sit-encap path unhealthy "
-        f"(normally ~9 Gbit/s). CT delta: {ct_delta}. iperf3 tail:\n"
+        f"(normally ~9 Gbit/s). iperf3 tail:\n"
         f"{log[-600:]}"
     )
 
-    # Oracle (ii): conntrack must have grown. If this fires while (i)
-    # passes, the LAN-side link is the bottleneck and the throughput
-    # number is misleading — investigate before treating as a real
-    # offload pass.
-    assert ct_delta >= 1, (
-        f"throughput {gbps:.2f} Gbps but conntrack count didn't grow "
-        f"(before={ct_before}, after={ct_after}). Either ip6tables "
-        f"FORWARD rule isn't engaging conntrack, or traffic bypassed "
-        f"the kernel forward path entirely (LAN-side bottleneck)."
+    # Oracle (ii): the kernel forward path must have tracked THIS flow.
+    # A global nf_conntrack_count delta is unreliable — background entries
+    # left by earlier tests age out during the run and can mask the flow's
+    # own entry (a late-in-suite false negative). Query conntrack for the
+    # tunnel's own flow instead: the outer sit encap appears as a proto-41
+    # entry between the two tunnel endpoints (long timeout, stable), with
+    # the inner v6 TCP flow as a secondary signal that expires sooner.
+    r = await target_agent.exec_cmd(
+        aiohttp_session, ["conntrack", "-L"], timeout_ms=8000)
+    ct_dump = r.get("stdout", "") or ""
+
+    def _is_outer_sit(line):
+        # conntrack row for proto 41: "unknown  41 <timeout> src=.. dst=.."
+        fields = line.split()
+        return (len(fields) > 2 and fields[1] == "41"
+                and DUT_WAN_IPV4 in line and ORCH_IPV4 in line)
+
+    outer_tracked = any(_is_outer_sit(ln) for ln in ct_dump.splitlines())
+    inner_tracked = any(
+        f"dport={IPERF_PORT}" in ln and ORCH_TUN_V6 in ln
+        for ln in ct_dump.splitlines()
+    )
+    assert outer_tracked or inner_tracked, (
+        f"throughput {gbps:.2f} Gbps but no conntrack entry for the tunnel "
+        f"flow (outer proto-41 {DUT_WAN_IPV4}<->{ORCH_IPV4}, or inner v6 "
+        f"dport={IPERF_PORT} to {ORCH_TUN_V6}). Either the ip6tables FORWARD "
+        f"rule isn't engaging conntrack, or traffic bypassed the kernel "
+        f"forward path (LAN-side bottleneck).\nconntrack -L:\n{ct_dump[:1500]}"
     )
 
     # Oracle (iii): software-encap tripwire. Kernel sit tx must have
