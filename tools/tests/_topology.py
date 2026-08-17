@@ -61,7 +61,11 @@ import pytest_asyncio
 VLAN_IDS_MCAST: tuple[int, int, int]  = (241, 242, 243)
 VLAN_IDS_BRIDGE: tuple[int, int]      = (231, 232)
 
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
+# Bench wiring: the DUT's eth3 faces the LAN client VM, eth4 faces the
+# WAN/orchestrator segment. Every test that needs a role-scoped DUT port
+# imports these two symbols rather than hardcoding a netdev name, so a
+# re-cable is a one-line change here (or an env override at run time).
+TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth3")
 LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "enp4s0")
 
 
@@ -292,7 +296,7 @@ async def dut_egress_mtu(target_agent, aiohttp_session):
         r = await target_agent.exec_cmd(
             aiohttp_session, ["ip", "-o", "link", "show", iface],
         )
-        # `ip -o link show eth4` line contains "mtu 1500".
+        # `ip -o link show <iface>` line contains "mtu 1500".
         m = re.search(r"\bmtu\s+(\d+)", r.get("stdout", ""))
         if not m:
             raise RuntimeError(
@@ -510,7 +514,7 @@ async def lan_run_python(
 DUT_IPV6_LAN  = "fc00:dead::1"
 DUT_IPV6_WAN  = "fc00:beef::1"
 LAN_IPV6      = "fc00:dead::2"
-TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth3")
+TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth4")
 
 
 @pytest_asyncio.fixture
@@ -520,8 +524,8 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
     on exit, in reverse order of setup, so partial-setup failures clean
     only what came up.
 
-    DUT eth4  ULA  fc00:dead::1/64  (LAN-facing)
-    DUT eth3  ULA  fc00:beef::1/64  (WAN-facing)
+    DUT eth3  ULA  fc00:dead::1/64  (LAN-facing, TARGET_LAN_IF)
+    DUT eth4  ULA  fc00:beef::1/64  (WAN-facing, TARGET_WAN_IF)
     LAN NIC   ULA  fc00:dead::2/64
     LAN default v6 route via fc00:dead::1
 
@@ -559,7 +563,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
                     f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF)
         r = await _exec("ip", "-6", "addr", "add",
                         f"{DUT_IPV6_LAN}/64", "dev", TARGET_LAN_IF, "nodad")
-        assert r["rc"] == 0, f"DUT eth4 v6 addr: {r}"
+        assert r["rc"] == 0, f"DUT {TARGET_LAN_IF} v6 addr: {r}"
 
         async def _del_dut_lan():
             await _exec("ip", "-6", "addr", "del",
@@ -570,7 +574,7 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
                     f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF)
         r = await _exec("ip", "-6", "addr", "add",
                         f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, "nodad")
-        assert r["rc"] == 0, f"DUT eth3 v6 addr: {r}"
+        assert r["rc"] == 0, f"DUT {TARGET_WAN_IF} v6 addr: {r}"
 
         async def _del_dut_wan():
             await _exec("ip", "-6", "addr", "del",
@@ -626,7 +630,8 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
 
 @pytest_asyncio.fixture
 async def multi_listener_subifs(aiohttp_session, target_agent, lan):
-    """N=3 VLAN subifs on DUT eth4 + matching subifs on the LAN VM.
+    """N=3 VLAN subifs on the DUT's LAN-facing port (TARGET_LAN_IF,
+    eth3 by default) + matching subifs on the LAN VM.
 
     Yields list of (target_iface, lan_iface, vlan_id) tuples. CMM picks
     up the target-side NEWLINK netlink events and registers each VLAN

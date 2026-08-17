@@ -5,8 +5,8 @@ Topology during this test:
     lan (vlan100 = 192.168.100.2/24, tag 100)
         │  VID 100 frames
         ▼
-    target eth4.100 (192.168.100.1/24)
-        │  stripped, routed, NAT'd out eth3
+    target eth3.100 (192.168.100.1/24)
+        │  stripped, routed, NAT'd out eth4
         ▼
     wan (10.0.0.141) iperf3 server
 
@@ -19,7 +19,7 @@ then:
 
 Overridable via env:
     ASK_LAN_NIC             parent NIC on the lan host (default enp4s0)
-    ASK_TARGET_LAN_IF       parent NIC on the target (default eth4)
+    ASK_TARGET_LAN_IF       parent NIC on the target (default eth3)
     ASK_VLAN_ID             VID used for the test (default 100)
     ASK_WAN_IPERF_IP        iperf3 server addr (default 10.0.0.141)
     ASK_IPERF_DURATION      seconds (default 5)
@@ -34,6 +34,7 @@ import re
 import pytest_asyncio
 
 from _topology import (
+    TARGET_LAN_IF,
     TopologyStack,
     dut_vlan_subif,
     lan_run,
@@ -42,7 +43,6 @@ from _topology import (
 
 
 LAN_NIC           = os.environ.get("ASK_LAN_NIC",       "enp4s0")
-TARGET_LAN_IF     = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
 VLAN_ID           = int(os.environ.get("ASK_VLAN_ID",   "100"))
 WAN_IPERF_IP      = os.environ.get("ASK_WAN_IPERF_IP",  "10.0.0.141")
 IPERF_DURATION_S  = int(os.environ.get("ASK_IPERF_DURATION", "5"))
@@ -82,7 +82,7 @@ def _iperf_receiver_gbps(log: str) -> float | None:
 
 @pytest_asyncio.fixture
 async def vlan_100_setup(aiohttp_session, target_agent, lan):
-    """Create eth4.100 on target and vlan100 on lan, both with /24 IPs.
+    """Create <LAN_IF>.100 on target and vlan100 on lan, both with /24 IPs.
     LAN gets a /32 route to WAN_IPERF_IP forcing iperf3 traffic to egress
     via vlan100 — guarantees the frames are VLAN-tagged on the wire.
     """

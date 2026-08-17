@@ -14,6 +14,8 @@ import textwrap
 
 from _topology import (
     ICMP6_PACKET_TOO_BIG,
+    TARGET_LAN_IF,
+    TARGET_WAN_IF,
     dut_egress_mtu,  # noqa: F401  (fixture)
     expect_icmp_egress,
     ipv6_topology,  # noqa: F401  (fixture)
@@ -22,8 +24,6 @@ from _topology import (
 
 
 WAN_IPV6      = os.environ.get("ASK_WAN_IPV6",      "fc00:beef::99")
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
-TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth3")
 LOWERED_MTU   = 1300
 
 

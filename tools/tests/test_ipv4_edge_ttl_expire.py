@@ -14,13 +14,13 @@ import textwrap
 
 from _topology import (
     ICMP4_TIME_EXCEEDED,
+    TARGET_LAN_IF,
     expect_icmp_egress,
     lan_run_python,
 )
 
 
 WAN_IPERF_IP  = os.environ.get("ASK_WAN_IPERF_IP",   "10.0.0.141")
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF",  "eth4")
 
 
 _INJECT_TEMPLATE = textwrap.dedent("""

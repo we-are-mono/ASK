@@ -19,6 +19,8 @@ import asyncio
 import os
 import struct
 
+from _topology import TARGET_WAN_IF
+
 
 CMD_TNL_CREATE = 0x0B01
 CMD_TNL_DELETE = 0x0B02
@@ -53,7 +55,7 @@ def _tnl_create_payload(
     name: bytes = TNL_NAME,
     local_ip: str = "10.0.0.62",
     remote_ip: str = "10.0.0.141",
-    output_device: bytes = b"eth3",
+    output_device: bytes = TARGET_WAN_IF.encode(),
     mode: int = TNL_MODE_6O4,
     secure: int = 0,
     elim: int = 0,

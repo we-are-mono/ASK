@@ -83,7 +83,7 @@ async def test_vlan_unknown_action_rejected(
 ):
     """Action value outside the accepted set {0,1,6,7} → validator returns ERR_UNKNOWN_ACTION,
     handler never runs. Proves the validator callback is wired up."""
-    cmd = _vlan_cmd(action=99, vlan_id=100, vlan_if=b"eth4.100")
+    cmd = _vlan_cmd(action=99, vlan_id=100, vlan_if=b"eth3.100")
     r = await _send_vlan(target_agent, aiohttp_session, cmd)
     assert r.get("reply_rc") == ERR_UNKNOWN_ACTION, (
         f"expected ERR_UNKNOWN_ACTION ({ERR_UNKNOWN_ACTION}), got {r}"

@@ -16,8 +16,6 @@ lifecycle + cmm push), Tier B (DUT-local link liveness), Tier C
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import pytest_asyncio
 
@@ -28,6 +26,7 @@ from _pppoe_helpers import (
     CMD_PPPOE_ENTRY,
     pppoe_cmd,
 )
+from _topology import TARGET_WAN_IF
 
 
 NO_ERR                = 0
@@ -39,14 +38,14 @@ ERR_UNKNOWN_INTERFACE = 5  # cdx/fe.h:66
 # leftover state from those doesn't block the offload fixture's REGISTER.
 SESSION_ID = 0xCA01
 PEER_MAC   = b"\x02\xca\xfe\xba\xbe\x01"
-PHY_INTF   = b"eth3"
+PHY_INTF   = TARGET_WAN_IF.encode()
 LOG_INTF   = b"oflppp"
 
 
 @pytest_asyncio.fixture
 async def pppoe_session(aiohttp_session, target_agent):
     """Register a synthetic PPPoE session for the test, deregister on
-    teardown. Skips the test if eth3 isn't a known onif (REGISTER will
+    teardown. Skips the test if PHY_INTF isn't a known onif (REGISTER will
     return ERR_UNKNOWN_INTERFACE — test would be uninterpretable)."""
 
     register = pppoe_cmd(

@@ -15,8 +15,9 @@ instead of reaching pppoe_alloc.
 
 Note: REGISTER also requires phy_intf to be a known onif
 (cdx/control_pppoe.c:120-122 returns ERR_UNKNOWN_INTERFACE otherwise).
-We pass eth3 because that's the WAN-side iface registered by dpa_app at
-boot. If REGISTER consistently returns ERR_UNKNOWN_INTERFACE, the test
+We pass TARGET_WAN_IF (eth4) because that's the WAN-side iface
+registered by dpa_app at boot. If REGISTER consistently returns
+ERR_UNKNOWN_INTERFACE, the test
 will skip with a clear diagnosis rather than leak the unobservable
 unwind state into a flaky failslab signal.
 """
@@ -35,6 +36,7 @@ from _pppoe_helpers import (
     PPPOE_LEAK_FILTER,
     pppoe_cmd,
 )
+from _topology import TARGET_WAN_IF
 
 
 NO_ERR                              = 0
@@ -49,7 +51,7 @@ ERR_PPPOE_ENTRY_ALREADY_REGISTERED  = 800  # cdx/fe.h:116
 # doesn't ALREADY_REGISTER-block another.
 SESSION_ID  = 0xFA01
 MAC         = b"\x02\xfa\x11\x5b\xab\x01"
-PHY_INTF    = b"eth3"
+PHY_INTF    = TARGET_WAN_IF.encode()
 LOG_INTF    = b"flsppp"
 MODE        = 0
 
@@ -88,7 +90,7 @@ async def test_pppoe_register_failslab_sweep(
             timeout_ms=2000,
         )
 
-    # Probe once unencumbered — if eth3 isn't a known onif, every REGISTER
+    # Probe once unencumbered — if PHY_INTF isn't a known onif, every REGISTER
     # will return ERR_UNKNOWN_INTERFACE and the sweep can't reach
     # pppoe_alloc. Skip with a clear diagnosis rather than emit an
     # uninterpretable empty-faulted-list assertion at the end.
@@ -101,8 +103,8 @@ async def test_pppoe_register_failslab_sweep(
         pytest.skip(
             f"phy_intf={PHY_INTF.decode()} not registered as an onif at boot "
             "— REGISTER can't reach pppoe_alloc; failslab sweep would be "
-            "an empty oracle. Likely cmm/dpa_app didn't run, or eth3 was "
-            "renamed. Investigate before re-enabling."
+            "an empty oracle. Likely cmm/dpa_app didn't run, or the WAN "
+            "port was renamed. Investigate before re-enabling."
         )
     # Probe registered the entry; clear it before the sweep starts.
     await _dereg()

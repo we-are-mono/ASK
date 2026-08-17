@@ -23,7 +23,7 @@
          SEC's encrypted output frames, leaving cdx_esp4_dist's ipsec_esp
          protocolref unmet so OH@2's PCD never matched the OUTBOUND classifier
          entry — encrypted frames fell through to the per-SA TO_CP exception
-         queue instead of routing to eth3 TX. -->
+         queue instead of routing to the WAN eth port's TX. -->
     <port type="OFFLINE" number="1" policy="cdx_port_of2_policy" portid="9"/>
     <port type="OFFLINE" number="2" policy="cdx_port_of3_policy" portid="10"/>
   </engine>

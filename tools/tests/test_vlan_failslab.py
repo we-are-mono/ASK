@@ -18,6 +18,8 @@ import struct
 
 import pytest_asyncio
 
+from _topology import TARGET_LAN_IF
+
 
 CMD_VLAN_ENTRY        = 0x0901
 ACTION_REGISTER       = 0
@@ -48,7 +50,6 @@ def _vlan_cmd(action: int, vlan_id: int = 0,
     )
 
 
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
 VID           = int(os.environ.get("ASK_VLAN_FAILSLAB_VID", "251"))
 LISTENER_IF   = f"{TARGET_LAN_IF}.{VID}"
 

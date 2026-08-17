@@ -33,6 +33,8 @@ import struct
 
 import pytest_asyncio
 
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF
+
 
 # Narrower than ASK_KMEMLEAK_FILTER (which matches module-tag frames and
 # triggers on boot-time `modprobe pid N` allocations in dpaa_vwd_init /
@@ -88,7 +90,7 @@ def _pack_mc4_output(iface: str) -> bytes:
 
 def _pack_mc4_command(action: int, listeners: list[str],
                      dst: str = "239.1.1.7", src: str = "10.0.0.141",
-                     ingress: str = "eth3") -> bytes:
+                     ingress: str = TARGET_WAN_IF) -> bytes:
     n = len(listeners)
     header = (
         struct.pack("<HBB", action, 0, 0)
@@ -104,7 +106,6 @@ def _pack_mc4_command(action: int, listeners: list[str],
     return wire
 
 
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
 VID           = int(os.environ.get("ASK_MCAST_FAILSLAB_VID", "231"))
 LISTENER_IF   = f"{TARGET_LAN_IF}.{VID}"
 
@@ -125,7 +126,7 @@ KMEMLEAK_AGE_GRACE_S = 7.0
 
 @pytest_asyncio.fixture
 async def two_vlan_listeners(aiohttp_session, target_agent):
-    """Two VLAN subifs (`eth4.{VID}` and `eth4.{VID+1}`) for the UPDATE
+    """Two VLAN subifs (`<LAN_IF>.{VID}` and `<LAN_IF>.{VID+1}`) for the UPDATE
     sweep — the group is seeded with the first listener via a clean
     ADD, then each iteration tries to UPDATE in the second listener
     under failslab. CMM picks both up via netlink so get_onif_by_name

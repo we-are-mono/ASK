@@ -14,6 +14,7 @@ import textwrap
 
 from _topology import (
     ICMP6_TIME_EXCEEDED,
+    TARGET_LAN_IF,
     expect_icmp_egress,
     ipv6_topology,  # noqa: F401  (fixture)
     lan_run_python,
@@ -21,7 +22,6 @@ from _topology import (
 
 
 WAN_IPV6      = os.environ.get("ASK_WAN_IPV6",      "fc00:beef::99")
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
 
 
 _INJECT = textwrap.dedent("""

@@ -17,14 +17,14 @@ pMcastGrpInfo->members[].
 Two variants — each registers its OWN mcast group with the right
 ingress for its injection direction:
 
-  3b WAN-side injection (dst=239.7.2.1, ingress=eth3) — orchestrator's
+  3b WAN-side injection (dst=239.7.2.1, ingress=eth4) — orchestrator's
      local scapy sends an untagged mcast frame onto the WAN wire; it
-     ingresses on the DUT's eth3 and matches the group's ingress.
+     ingresses on the DUT's eth4 and matches the group's ingress.
      All 3 listeners must receive exactly 1 frame.
 
-  3c LAN-side VLAN-tagged injection (dst=239.7.2.2, ingress=eth4.241)
+  3c LAN-side VLAN-tagged injection (dst=239.7.2.2, ingress=eth3.241)
      — LAN VM scapy sends a VLAN-tagged mcast frame out vlan241; it
-     ingresses on eth4.241 (a member port matching the group's
+     ingresses on eth3.241 (a member port matching the group's
      ingress). The other 2 listeners must receive exactly 1; the
      source listener's self-echo is recorded as a tripwire constant.
 
@@ -49,6 +49,7 @@ import struct
 import pytest_asyncio
 
 from _topology import (
+    TARGET_WAN_IF,
     lan_run_python,
     multi_listener_subifs,  # noqa: F401  (fixture, imported for resolution)
 )
@@ -60,7 +61,7 @@ MCAST_DST_A = os.environ.get("ASK_MCAST_REPL_DST_A", os.environ.get("ASK_MCAST_R
 MCAST_DST_B = os.environ.get("ASK_MCAST_REPL_DST_B", os.environ.get("ASK_MCAST_REPL_DST_3C", "239.7.2.2"))
 MCAST_SRC    = os.environ.get("ASK_WAN_IPERF_IP",      "10.0.0.141")
 MCAST_PORT   = int(os.environ.get("ASK_MCAST_REPL_PORT", "47200"))
-INGRESS_WAN   = os.environ.get("ASK_MCAST_INGRESS_WAN", "eth3")
+INGRESS_WAN   = os.environ.get("ASK_MCAST_INGRESS_WAN", TARGET_WAN_IF)
 # MCAST_DST_B's ingress is the source LAN VLAN subif on the DUT — set per
 # fixture below since it depends on the listener fixture's vid choice.
 
@@ -136,7 +137,7 @@ async def _assert_mc4_has_group(
 async def mcast_group_wan_ingress(
     aiohttp_session, target_agent, multi_listener_subifs,
 ):
-    """3b group: ingress=eth3 (WAN), all 3 listeners as members."""
+    """3b group: ingress=INGRESS_WAN (eth4), all 3 listeners as members."""
     listeners = multi_listener_subifs
     target_ifaces = [t for t, _, _ in listeners]
 
@@ -178,7 +179,7 @@ async def mcast_group_lan_vlan_ingress(
     Source iface is listeners[0][0] (the first DUT-side VLAN subif)."""
     listeners = multi_listener_subifs
     target_ifaces = [t for t, _, _ in listeners]
-    ingress_iface = listeners[0][0]   # e.g. eth4.241
+    ingress_iface = listeners[0][0]   # e.g. eth3.241
 
     add = _pack_mc4_command(
         CDX_MC_ACTION_ADD, target_ifaces,

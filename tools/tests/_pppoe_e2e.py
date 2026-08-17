@@ -28,6 +28,8 @@ import pytest_asyncio
 
 from ask_orch.uart import Console
 
+from _topology import TARGET_WAN_IF
+
 
 def _stage_file(target, path: str, content: str, *, mode: str = "644") -> None:
     """Write `content` to `path` on the DUT via UART.
@@ -188,9 +190,9 @@ async def pppoe_dut_session(pppoe_real_server):
         # package ships /usr/lib/pppd/<ver>/pppoe.so (named pppoe.so
         # in upstream ppp 2.5.2; older "rp-pppoe.so" is the historical
         # name from rp-pppoe v3 — current ppp tree consolidated it).
-        # eth3 = WAN-facing iface (DUT's L2 path to vision).
+        # The WAN-facing iface (DUT's L2 path to vision) carries PPPoE.
         "plugin pppoe.so\n"
-        "eth3\n"
+        f"{TARGET_WAN_IF}\n"
         f"name {cfg['user']}\n"
         "noauth\n"               # don't demand server auth us back
         "nodefaultroute\n"       # don't replace DUT's default route

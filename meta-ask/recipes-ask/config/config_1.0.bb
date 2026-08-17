@@ -87,7 +87,7 @@ fakeroot do_install() {
     install -m 0755 ${UNPACKDIR}/S05ask-modules ${D}${sysconfdir}/init.d/ask-modules
     ln -sf ../init.d/ask-modules ${D}${sysconfdir}/rcS.d/S05ask-modules
 
-    # Gateway networking (WAN=eth3 DHCP, LAN=eth4 static 192.168.1.1/24,
+    # Gateway networking (WAN=eth4 static 10.0.0.62/24, LAN=eth3 static 192.168.1.1/24,
     # iptables MASQUERADE, dnsmasq DHCP server). Runs in rcS so the board
     # is gateway-ready by the time multi-user services (dropbear) come up.
     install -m 0755 ${UNPACKDIR}/S40gateway-setup ${D}${sysconfdir}/init.d/gateway-setup

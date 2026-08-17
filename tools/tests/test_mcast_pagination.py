@@ -24,6 +24,8 @@ import pytest_asyncio
 
 from ask_orch.client import ASK_KMEMLEAK_FILTER
 
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF
+
 
 # FCI opcode (cdx/cdx_cmdhandler.h)
 CMD_MC4_MULTICAST = 0x0701
@@ -51,9 +53,8 @@ MC4_CMD_SIZE    = MC4_CMD_FIXED + MC4_OUTPUT_SIZE * MC4_MAX_LISTENERS_IN_QUERY  
 
 # --- Test topology ------------------------------------------------------
 
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
 BASE_VID      = int(os.environ.get("ASK_MCAST_BASE_VID", "201"))  # .201 .. .208
-INGRESS_IFACE = os.environ.get("ASK_MCAST_INGRESS", "eth3")       # WAN side
+INGRESS_IFACE = os.environ.get("ASK_MCAST_INGRESS", TARGET_WAN_IF)
 MCAST_DST     = "239.1.1.7"
 MCAST_SRC     = "10.0.0.141"
 

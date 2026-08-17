@@ -3,15 +3,15 @@
 # Provides:          gateway-setup
 # Required-Start:    ask-modules
 # Default-Start:     S
-# Short-Description: Configure gateway networking — WAN=eth3 DHCP, LAN=eth4 static + NAT + DHCP server
+# Short-Description: Configure gateway networking — WAN=eth4, LAN=eth3 static + NAT + DHCP server
 ### END INIT INFO
 
-# eth3 = WAN (DHCP client), eth4 = LAN (static 192.168.1.1/24, NAT out via eth3).
-# Matches the manual Armbian test setup so the board is usable as a gateway on boot.
+# eth4 = WAN (static 10.0.0.62/24), eth3 = LAN (static 192.168.1.1/24, NAT out via eth4).
+# Matches the bench wiring so the board is usable as a gateway on boot.
 
-LAN_IF=eth4
+LAN_IF=eth3
 LAN_ADDR=192.168.1.1/24
-WAN_IF=eth3
+WAN_IF=eth4
 # Test image: pin WAN to a stable static address so the orchestrator has
 # a fixed POST target and installed FMAN offload rules can't go stale
 # under DHCP lease churn. Gateway/DNS come from the WAN-side setup.
@@ -102,7 +102,7 @@ start_filter6() {
     # The rule is intentionally interface-agnostic: scoping it to
     # `-o $WAN_IF` (the obvious analog of the IPv4 NAT rule) misses
     # tunnel egress, which leaves through sit/ipip/gre netdevs not
-    # eth3. Catching all NEW/ESTABLISHED/RELATED forwarded v6 flows
+    # eth4. Catching all NEW/ESTABLISHED/RELATED forwarded v6 flows
     # is the right shape for a routed v6 path with FMAN-offloaded
     # tunnels.
     modprobe ip6_tables    2>/dev/null || true

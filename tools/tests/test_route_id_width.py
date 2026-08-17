@@ -15,8 +15,9 @@ NO_ERR.
 
 from __future__ import annotations
 
-import os
 import struct
+
+from _topology import TARGET_LAN_IF
 
 
 CMD_IP_ROUTE = 0x0313
@@ -92,7 +93,7 @@ ERR_RT_ENTRY_NOT_FOUND = 209  # cdx/fe.h errno for missing route
 async def test_route_id_above_u16_add_remove(
     aiohttp_session, target_agent, splat_window,
 ):
-    out_dev = os.environ.get("ASK_TARGET_LAN_IF", "eth4").encode()
+    out_dev = TARGET_LAN_IF.encode()
 
     add = _pack_rt_command(
         action=ACTION_REGISTER,

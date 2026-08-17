@@ -91,7 +91,7 @@ _INJECT_SCRIPT = textwrap.dedent(f"""
     LAN_NIC = {LAN_NIC!r}
 
     # Seed frame: src=DST_MAC tagged on SECONDARY_VID. The DUT's bridge
-    # learns DST_MAC -> eth4.{SECONDARY_VID} so the subsequent trigger
+    # learns DST_MAC -> eth3.{SECONDARY_VID} so the subsequent trigger
     # resolves in the FDB and takes the br_forward fast path (abm_ff=1).
     seed = (Ether(src={DST_MAC!r}, dst="ff:ff:ff:ff:ff:ff")
             / Dot1Q(vlan={SECONDARY_VID})
@@ -101,8 +101,8 @@ _INJECT_SCRIPT = textwrap.dedent(f"""
     sendp(seed, iface=LAN_NIC, verbose=0)
 
     # Trigger frames: unicast src=SRC_MAC -> dst=DST_MAC tagged on
-    # PRIMARY_VID. Bridge ingresses on eth4.{PRIMARY_VID}, FDB hits
-    # DST_MAC on eth4.{SECONDARY_VID}, fast-path forward sets abm_ff=1.
+    # PRIMARY_VID. Bridge ingresses on eth3.{PRIMARY_VID}, FDB hits
+    # DST_MAC on eth3.{SECONDARY_VID}, fast-path forward sets abm_ff=1.
     # Multiple shots so a lost first one (FDB still settling) doesn't
     # turn the test vacuous.
     pkt = (Ether(src={SRC_MAC!r}, dst={DST_MAC!r})

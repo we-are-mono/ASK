@@ -16,9 +16,9 @@ would surface as kmemleak hits filtered to abm symbols.
 For the walk to do real work — not vacuously walk an empty table —
 the test runs background L2 traffic across the bridge during the
 flap. Topology: a LAN-side VLAN subif matching the primary bridge
-port (eth4.231) blasts ARP requests at an unused IP in the bridge
+port (eth3.231) blasts ARP requests at an unused IP in the bridge
 subnet; the DUT's bridge floods the broadcasts to the second pseudo-
-port (eth4.232), which populates l2flow_table[] entries that the
+port (eth3.232), which populates l2flow_table[] entries that the
 flap-driven BREVENT walk then sees.
 
 KASAN-eligible — port-flap teardown is exactly
@@ -70,7 +70,7 @@ async def test_abm_port_flap_no_splat_no_leak(
     bridge, ports = bridge_with_n_ports
 
     # Set up LAN-side vlan231 with an IP in the bridge subnet, so its
-    # tagged egress ingresses on eth4.231 (a bridge port) on the DUT.
+    # tagged egress ingresses on eth3.231 (a bridge port) on the DUT.
     await lan_run(lan, f"ip link del {LAN_BRIDGE_IF} 2>/dev/null", 5.0)
     r = await lan_run(
         lan,

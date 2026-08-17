@@ -2,7 +2,7 @@
 
 Injects a DF=1 packet from LAN that exceeds the DUT's egress MTU; the
 kernel must emit ICMP fragmentation-needed (type=3, code=4) back to
-the source. Asserted by tcpdump on the LAN-facing interface (eth4 by
+the source. Asserted by tcpdump on the LAN-facing interface (eth3 by
 default), bounded by the agent-side exec timeout.
 """
 
@@ -14,6 +14,8 @@ import textwrap
 
 from _topology import (
     ICMP4_FRAG_NEEDED,
+    TARGET_LAN_IF,
+    TARGET_WAN_IF,
     dut_egress_mtu,  # noqa: F401  (fixture)
     expect_icmp_egress,
     lan_run_python,
@@ -21,8 +23,6 @@ from _topology import (
 
 
 WAN_IPERF_IP    = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
-TARGET_LAN_IF   = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
-TARGET_WAN_IF   = os.environ.get("ASK_TARGET_WAN_IF", "eth3")
 LOWERED_MTU     = 1300
 
 

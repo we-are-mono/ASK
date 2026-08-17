@@ -6,7 +6,7 @@ Three tiered tests, each gating on the previous:
       pppd dialed → ppp iface UP → cmm auto-registered the session via
       its rtnetlink hook on RTM_NEWLINK ARPHRD_PPP. Load-bearing
       positive control: CMD_PPPOE_ENTRY ACTION_QUERY via fci_send
-      returns NO_ERR. If cmm didn't push (or __itf_is_programmed(eth3)
+      returns NO_ERR. If cmm didn't push (or __itf_is_programmed(eth4)
       gate failed), QUERY returns ERR_PPPOE_ENTRY_NOT_FOUND and the
       assertion message names that gate as the suspect.
 
@@ -105,8 +105,8 @@ async def test_pppoe_session_lifecycle(
         f"cmm did NOT push CMD_PPPOE_ENTRY for the dialed session "
         f"within 3s — FCI ACTION_QUERY last returned rc={rc!r} "
         f"(expected NO_ERR=0). Suspect: cmm's rtnetlink hook didn't "
-        f"fire on RTM_NEWLINK ARPHRD_PPP, or __itf_is_programmed(eth3) "
-        f"is False (eth3 not in cmm's iface table — check dpa_app "
+        f"fire on RTM_NEWLINK ARPHRD_PPP, or __itf_is_programmed(eth4) "
+        f"is False (eth4 not in cmm's iface table — check dpa_app "
         f"boot order)."
     )
 

@@ -3,13 +3,13 @@
 Verifies the FMAN data plane accelerates the encap direction of an
 IPv6-in-IPv4 (sit) tunnel. The path:
 
-  LAN VM (fc00:dead::2) ──ipv6──> DUT eth4 (fc00:dead::1)
+  LAN VM (fc00:dead::2) ──ipv6──> DUT eth3 (fc00:dead::1)
   DUT routes inner IPv6 via sit_test (kernel sit netdev)
   CMM observes the netdev's NEWLINK + conntrack flow, pushes
     CMD_TNL_CREATE + CMD_IPV6_CONNTRACK to FCI
   FCI installs an ehash entry with INSERT_L3_HDR action chain
   FMAN ucode prepends IPv4(proto=41) outer at line rate
-  DUT eth3 ──ipv4(proto=41)/ipv6──> orchestrator sit_test → iperf3 -s
+  DUT eth4 ──ipv4(proto=41)/ipv6──> orchestrator sit_test → iperf3 -s
 
 NOTE: TX-encap offload is currently blocked in FMAN ucode 210.10.1
 (INSERT_L3_HDR punts every matched packet — ISSUES.md A9), so encap
@@ -114,7 +114,7 @@ async def sit_tunnel(aiohttp_session, target_agent, lan, ipv6_topology):
     ASK tunnel — that's how the FMAN encap path becomes engaged.
 
     Depends on `ipv6_topology` for the underlying LAN→DUT v6 plumbing
-    (fc00:dead::1/64 on DUT eth4, fc00:dead::2/64 on the LAN NIC,
+    (fc00:dead::1/64 on DUT eth3, fc00:dead::2/64 on the LAN NIC,
     default v6 route on the LAN VM via fc00:dead::1, IPv6 forwarding
     on DUT). Without that, ND for the inner default-route next-hop
     fails and iperf3 reports `No route to host` immediately.

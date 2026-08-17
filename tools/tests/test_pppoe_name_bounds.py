@@ -38,7 +38,13 @@ from _pppoe_helpers import (
     CMD_PPPOE_ENTRY,
     pppoe_cmd,
 )
+from _topology import TARGET_WAN_IF
 
+
+# The WAN-facing physical port — registered as an onif by dpa_app at
+# boot, so REGISTER gets past the ERR_UNKNOWN_INTERFACE gate and
+# actually reaches the name-handling code these cases target.
+_PHY_INTF = TARGET_WAN_IF.encode()
 
 # Per-case unique session_ids start here. Picked above the typical
 # 0..0xFF range CMM allocates from on a real ppp dial-up to avoid
@@ -124,7 +130,7 @@ async def test_pppoe_register_malformed_phy_intf(
 async def test_pppoe_register_malformed_log_intf(
     aiohttp_session, target_agent, splat_window, idx, name_case,
 ):
-    """phy_intf=eth3 is valid → REGISTER may successfully install an
+    """phy_intf=_PHY_INTF is valid → REGISTER may successfully install an
     entry with a malformed log_intf. Each parametrized case uses a
     unique session_id so cache-key collisions don't make subsequent
     cases trip on ERR_PPPOE_ENTRY_ALREADY_REGISTERED, and try/finally
@@ -133,7 +139,7 @@ async def test_pppoe_register_malformed_log_intf(
     sid = _SESSION_BASE + 0x20 + idx
     payload = pppoe_cmd(
         action=ACTION_REGISTER, session_id=sid,
-        mac=_TEST_MAC, phy_intf=b"eth3", log_intf=log,
+        mac=_TEST_MAC, phy_intf=_PHY_INTF, log_intf=log,
     )
     try:
         await _send(target_agent, aiohttp_session, payload)
@@ -141,7 +147,7 @@ async def test_pppoe_register_malformed_log_intf(
         await _dereg_quiet(
             target_agent, aiohttp_session,
             session_id=sid, mac=_TEST_MAC,
-            phy_intf=b"eth3", log_intf=log,
+            phy_intf=_PHY_INTF, log_intf=log,
         )
 
 
@@ -159,7 +165,7 @@ async def test_pppoe_deregister_malformed_log_intf(
     is needed."""
     payload = pppoe_cmd(
         action=ACTION_DEREGISTER, session_id=_SESSION_BASE + 0x30,
-        mac=_TEST_MAC, phy_intf=b"eth3", log_intf=log,
+        mac=_TEST_MAC, phy_intf=_PHY_INTF, log_intf=log,
     )
     await _send(target_agent, aiohttp_session, payload)
 
@@ -177,7 +183,7 @@ async def test_pppoe_register_malformed_mac(
     log = b"bndmac" + str(idx).encode()
     payload = pppoe_cmd(
         action=ACTION_REGISTER, session_id=sid, mac=mac,
-        phy_intf=b"eth3", log_intf=log,
+        phy_intf=_PHY_INTF, log_intf=log,
     )
     try:
         await _send(target_agent, aiohttp_session, payload)
@@ -185,7 +191,7 @@ async def test_pppoe_register_malformed_mac(
         await _dereg_quiet(
             target_agent, aiohttp_session,
             session_id=sid, mac=mac,
-            phy_intf=b"eth3", log_intf=log,
+            phy_intf=_PHY_INTF, log_intf=log,
         )
 
 
@@ -203,7 +209,7 @@ async def test_pppoe_register_malformed_session_id(
     log = b"bndsid" + str(idx).encode()
     payload = pppoe_cmd(
         action=ACTION_REGISTER, session_id=sess,
-        mac=_TEST_MAC, phy_intf=b"eth3", log_intf=log,
+        mac=_TEST_MAC, phy_intf=_PHY_INTF, log_intf=log,
     )
     try:
         await _send(target_agent, aiohttp_session, payload)
@@ -211,7 +217,7 @@ async def test_pppoe_register_malformed_session_id(
         await _dereg_quiet(
             target_agent, aiohttp_session,
             session_id=sess, mac=_TEST_MAC,
-            phy_intf=b"eth3", log_intf=log,
+            phy_intf=_PHY_INTF, log_intf=log,
         )
 
 

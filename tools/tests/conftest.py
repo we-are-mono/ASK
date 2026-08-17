@@ -44,6 +44,7 @@ from ask_orch import client
 from ask_orch.uart import Console
 
 from _dmesg_allowlist import filter_splats, load_allowlist
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 
 
 LAN_USER     = os.environ.get("ASK_LAN_USER",     "root")
@@ -117,9 +118,8 @@ async def splat_window(request, aiohttp_session, target_agent, dmesg_allowlist):
     allowlist (golden/dmesg_allowlist.yaml). Test authors should *not*
     add inline filters here — extend the YAML.
     """
-    wan_if = os.environ.get("ASK_TARGET_WAN_IF", "eth3")
-    lan_if = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
-    cap_id = await target_agent.capture_start(aiohttp_session, ifaces=[wan_if, lan_if])
+    cap_id = await target_agent.capture_start(
+        aiohttp_session, ifaces=[TARGET_WAN_IF, TARGET_LAN_IF])
     yield cap_id
     result = await target_agent.capture_stop(aiohttp_session, cap_id)
     raw = result.get("splats", [])

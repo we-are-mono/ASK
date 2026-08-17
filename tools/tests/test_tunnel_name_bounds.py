@@ -25,6 +25,8 @@ import struct
 
 import pytest
 
+from _topology import TARGET_WAN_IF
+
 
 CMD_TNL_CREATE = 0x0B01
 CMD_TNL_DELETE = 0x0B02
@@ -42,7 +44,7 @@ def _tnl_create_payload(name_field: bytes) -> bytes:
     assert len(name_field) == 16
     local_field  = _ip_be_bytes("10.0.0.62")  + b"\x00" * 12
     remote_field = _ip_be_bytes("10.0.0.141") + b"\x00" * 12
-    output_field = b"eth3".ljust(16, b"\x00")
+    output_field = TARGET_WAN_IF.encode().ljust(16, b"\x00")
     tail = struct.pack(
         "<BBBBIHHIHBB",
         TNL_MODE_6O4, 0, 0, 64,  # mode, secure, elim, hlim

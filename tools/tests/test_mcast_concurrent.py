@@ -33,6 +33,8 @@ import struct
 
 import pytest_asyncio
 
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF
+
 
 CMD_MC4_MULTICAST    = 0x0701
 CDX_MC_ACTION_ADD    = 0
@@ -41,9 +43,8 @@ NO_ERR               = 0
 IF_NAME_SIZE         = 16
 MC4_MIN_COMMAND_SIZE = 44
 
-TARGET_LAN_IF = os.environ.get("ASK_TARGET_LAN_IF", "eth4")
 VID_BASE      = int(os.environ.get("ASK_MCAST_CONCURRENT_VID", "241"))
-INGRESS_IFACE = os.environ.get("ASK_MCAST_INGRESS", "eth3")
+INGRESS_IFACE = os.environ.get("ASK_MCAST_INGRESS", TARGET_WAN_IF)
 
 # Per-task knobs. 4 parallel tasks × 20 iterations = 80 mutator
 # operations, all serialised through mc_mutators_mutex.
