@@ -1,16 +1,26 @@
 """Failslab sweep over CMD_TNL_CREATE.
 
-Drives tunnel_alloc() (cdx/control_tunnel.c:76) into NULL via fork-
-isolated failslab; asserts the unwind in TNL_handle_CREATE leaves no
-leaked TnlEntry allocations behind. The wire payload uses a 6o4-mode
-tunnel whose remote address is unrouteable from the test environment;
-the kernel just walks the hash, allocates, classifies the mode, and
-returns — no real tunnel comes up.
+Drives the tunnel create path into NULL via fork-isolated failslab and
+checks three properties on every faulted iteration:
 
-Pre-iter DELETE lets the same tunnel name be reused: a successful
-CREATE registers an onif with that name, so the next iteration would
-bounce on ERR_TNL_ALREADY_CREATED at get_onif_by_name() instead of
-reaching tunnel_alloc.
+  - no leaked TnlEntry allocations after the unwind (kmemleak), the
+    original leak regression;
+  - A57 structure: a create that did not return NO_ERR leaves no tunnel
+    reachable by name (DELETE returns ERR_TNL_ENTRY_NOT_FOUND). Pre-fix
+    M_tnl_add hash-linked the entry before the fallible dpa_add_tunnel_if
+    and discarded its result, so a faulted add could leave a half-linked
+    entry (and, had the rc been propagated, freed it while still linked);
+  - A57 route discipline: the parent route this create references is
+    never left pinned by a faulted round (DEREGISTER is 0/201, never 202)
+    — the create's err1 arm must L2_route_put the reference it took.
+
+Unlike the route_id=0 variant this used to be, the create here carries a
+real parent route, so the sweep also exercises the L2_route_get/put pair
+on the exact path A57 reordered.
+
+Pre-iter DELETE lets the same tunnel name be reused: a successful CREATE
+registers an onif with that name, so the next iteration would otherwise
+bounce on ERR_TNL_ALREADY_CREATED at get_onif_by_name().
 """
 
 from __future__ import annotations
@@ -19,14 +29,22 @@ import asyncio
 import os
 import struct
 
-from _topology import TARGET_WAN_IF
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 
 
+CMD_IP_ROUTE   = 0x0313
 CMD_TNL_CREATE = 0x0B01
 CMD_TNL_DELETE = 0x0B02
 
-NO_ERR                = 0
-ERR_NOT_ENOUGH_MEMORY = 6   # cdx/fe.h — tunnel_alloc() == NULL → this code
+ACTION_REGISTER   = 0
+ACTION_DEREGISTER = 1
+
+NO_ERR                  = 0
+ERR_NOT_ENOUGH_MEMORY   = 6     # cdx/fe.h — tunnel_alloc() == NULL → this code
+ERR_RT_ENTRY_LINKED     = 202   # route still pinned
+ERR_TNL_ENTRY_NOT_FOUND = 1001  # DELETE of an absent tunnel
+
+TNL_ROUTE_ID = 0x0057_F500
 
 # TNL_MODE_6O4 (control_tunnel.h): IPv6-in-IPv4 outer. Pick the mode
 # with the smallest extra work in the success path so the failslab
@@ -63,7 +81,7 @@ def _tnl_create_payload(
     fl: int = 0,
     frag_off: int = 0,
     enabled: int = 0,
-    route_id: int = 0,
+    route_id: int = TNL_ROUTE_ID,
     mtu: int = 1480,
     flags: int = 0,
 ) -> bytes:
@@ -90,6 +108,14 @@ def _tnl_delete_payload(name: bytes = TNL_NAME) -> bytes:
     return name.ljust(16, b"\x00")[:16]
 
 
+def _rt_payload(action: int, route_id: int = TNL_ROUTE_ID) -> bytes:
+    out = TARGET_LAN_IF.encode().ljust(16, b"\x00")[:16]
+    z16 = b"\x00" * 16
+    return (struct.pack("<HH", action, 1500) + b"\x02\x00\x00\x0a\x11\x00"
+            + struct.pack("<HH", 0, 0) + struct.pack("<H", 0)
+            + out + z16 + z16 + struct.pack("<II", route_id, 0) + b"\x00" * 16)
+
+
 # Sweep walks N from 1..NSWEEP. tunnel_alloc sits past the netlink+fci
 # scaffold and after get_onif_by_name; NSWEEP=100 reaches it consistently
 # (same headroom test_ipv4_ct_failslab uses for ct_alloc).
@@ -103,31 +129,67 @@ async def test_tunnel_create_failslab_sweep(
     create_cmd = _tnl_create_payload()
     delete_cmd = _tnl_delete_payload()
 
-    async def _delete() -> None:
-        await target_agent.fci_send(
-            aiohttp_session, fcode=CMD_TNL_DELETE,
-            length=len(delete_cmd), payload=delete_cmd, timeout_ms=2000,
-        )
+    async def _fci(code, payload, tmo=2000, failslab=None):
+        kw = dict(fcode=code, length=len(payload), payload=payload, timeout_ms=tmo)
+        if failslab is not None:
+            kw["failslab_times"] = failslab
+        return await target_agent.fci_send(aiohttp_session, **kw)
+
+    async def _delete() -> int | None:
+        r = await _fci(CMD_TNL_DELETE, delete_cmd)
+        return r.get("reply_rc")
+
+    # Calibrate the not-found rc for this build against a clean miss, so the
+    # half-linked assertion below can't be defeated by an enum drift.
+    await _delete()
+    miss_rc = await _delete()
+    assert miss_rc == ERR_TNL_ENTRY_NOT_FOUND, (
+        f"DELETE of an absent tunnel returned {miss_rc}, expected "
+        f"{ERR_TNL_ENTRY_NOT_FOUND}"
+    )
+
+    # Parent route the create references — lets the sweep exercise the
+    # L2_route_get/put pair and the route-pin invariant.
+    rc = (await _fci(CMD_IP_ROUTE, _rt_payload(ACTION_REGISTER))).get("reply_rc")
+    assert rc == NO_ERR, f"parent route REGISTER rc={rc}"
 
     await target_agent.kmemleak_clear(aiohttp_session)
     outcomes: list[tuple[int, int | None, str | None]] = []
 
-    for n in range(1, NSWEEP + 1):
-        await _delete()  # clear any leftover from prior iteration
+    try:
+        for n in range(1, NSWEEP + 1):
+            await _delete()  # clear any leftover from prior iteration
 
-        r = await target_agent.fci_send(
-            aiohttp_session, fcode=CMD_TNL_CREATE,
-            length=len(create_cmd), payload=create_cmd,
-            timeout_ms=3000, failslab_times=n,
-        )
-        reply_rc = r.get("reply_rc")
-        send_err = r.get("send_error")
-        outcomes.append((n, reply_rc, send_err))
+            r = await _fci(CMD_TNL_CREATE, create_cmd, tmo=3000, failslab=n)
+            reply_rc = r.get("reply_rc")
+            send_err = r.get("send_error")
+            outcomes.append((n, reply_rc, send_err))
 
-        if reply_rc == NO_ERR and send_err is None:
-            await _delete()
+            faulted_iter = (send_err is not None) or (reply_rc not in (NO_ERR,))
+            del_rc = await _delete()
 
-    await _delete()
+            if faulted_iter:
+                # A57: a faulted create must not leave a name-reachable entry.
+                assert del_rc == ERR_TNL_ENTRY_NOT_FOUND, (
+                    f"n={n}: create faulted (rc={reply_rc}, err={send_err}) but "
+                    f"the tunnel is reachable by name (DELETE rc={del_rc}) — "
+                    f"half-linked entry"
+                )
+            else:
+                assert del_rc == NO_ERR, f"n={n}: create OK but DELETE rc={del_rc}"
+
+            # A57: a faulted round must never leave the parent route pinned.
+            rrc = (await _fci(CMD_IP_ROUTE, _rt_payload(ACTION_DEREGISTER))).get("reply_rc")
+            assert rrc != ERR_RT_ENTRY_LINKED, (
+                f"n={n}: parent route left pinned after a faulted create"
+            )
+            if rrc == NO_ERR:  # re-register for the next iteration
+                rc = (await _fci(CMD_IP_ROUTE, _rt_payload(ACTION_REGISTER))).get("reply_rc")
+                assert rc == NO_ERR, f"n={n}: parent route re-register rc={rc}"
+
+        await _delete()
+    finally:
+        await _fci(CMD_IP_ROUTE, _rt_payload(ACTION_DEREGISTER))
 
     faulted = [n for n, rc, e in outcomes if rc == ERR_NOT_ENOUGH_MEMORY]
     assert faulted, (

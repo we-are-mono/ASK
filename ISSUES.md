@@ -703,23 +703,17 @@ file's git history.
   intact). Residue filed as A63 (mcast unload leak) and A64
   (`add_incoming_iface_info` unwind).
 
-- **A54.** cmm still assumes the pre-A42 "cdx drops the old route on failure"
-  contract: six route-swap sites re-register a new route, ignore the FCI
-  update/re-register return, then unconditionally `__cmmRouteDeregister` the old
-  one (`module_socket.c:600-608` + `socket_update` :738-743,
-  `route_cache.c:768-788`, `:796-818`, `module_tunnel.c:1130-1138`,
-  `module_ipsec.c:201-223`). When cdx rejects the swap (now possible on
-  socket/tunnel/SA paths alike) the old route stays referenced in cdx, the
-  DEREGISTER comes back `ERR_RT_ENTRY_LINKED` (202) which
-  `forward_engine.c:960` treats as fatal-but-ignored: the fpp_rt is kept at
-  count 0 with its id unreleased — recoverable only by tuple-reuse re-ADD or an
-  onif sweep. Also: `socket_update` commits `s->saddr` (:712) before cdx
-  accepts; SA retry unreachable when `sa->tnl_rt.route` is set
-  (`route_cache.c:1326` gate via `__cmmRouteIsSA`); `cmmFeRouteUpdate` rc
-  ignored at `module_ipsec.c:177` / `module_tunnel.c:549` can send cdx a route
-  id it never saw. Fix shape: consult the socket/tunnel/SA update rc before
-  deregistering the old route, and handle 202 on deregister (defer/retry
-  instead of dropping the handle). Open.
+- **A54.** cmm assumed the pre-A42 "cdx drops the old route on failure"
+  contract, so a rejected route swap orphaned the fpp route handle (count 0,
+  id unreleased) while cdx kept forwarding on the dropped route — **fixed**
+  (_733c599_): CTs are torn out of hardware on a rejected re-register (traffic
+  re-offloads them), tunnel/SA/socket holders roll back to the old binding and
+  re-arm `FPP_NEEDS_UPDATE`, the route-event retry gates widened to match
+  needs-update holders, `socket_update` became snapshot-atomic, the update rc
+  is consulted before any deregister, and the orphan-handle path logs the id.
+  Rig-validated (gateway flap under an offloaded flow re-offloads cleanly, no
+  count-0 orphans). Freshness residual filed as A66; the `sa_lock` inversion
+  and two smells surfaced en route as A65/A67/A68.
 
 - **A55.** cmm `module_socket.c` error-code truncation: `unsigned short rc`
   (:642, also :681) receives `-1` from `socket_add` failure (:657) and raw
@@ -729,22 +723,23 @@ file's git history.
   print) instead of taking the errno answer path. Fix: `int rc` + map local
   failures to `CMMD_ERR_MEMORY`/real codes. Low severity, cmm-only. Open.
 
-- **A56.** `ipsec_push_sa_to_fast_path` (`control_ipsec.c:662-689`) installs the
-  hardware classification entry (:669/:674) and only then resolves the xfrm
-  state; on `cdx_get_xfrm_state_of_sa` failure (:679) it returns
-  `ERR_CREATION_FAILED` leaving the HW entry and `sa->ct` live with
-  `SA_ENABLED` never set — hardware classifies into a SEC context with no xfrm
-  state until some later `cdx_ipsec_delete_fp_entry` incidentally cleans it.
-  Same mutate-then-fail family as A50; needs install-last ordering or an
-  unwind. Open.
+- **A56.** `ipsec_push_sa_to_fast_path` installed the HW classification entry
+  before resolving the xfrm state (leaving a live entry classifying into a
+  stateless SEC context on lookup failure) and overwrote `sa->xfrm_state`
+  without putting the prior reference (one xfrm hold leaked per outbound-SA
+  route-update re-push) — **fixed** (_02d4968_): resolve-first is impossible
+  (`sa->netdev` is populated only inside the install), so the install is
+  unwound via `cdx_ipsec_delete_fp_entry` on lookup failure and the old xfrm
+  reference is put before storing the new one. Same commit fixes an adjacent
+  NAT-T arr-index-full path that left `sa->ct` dangling on a shared ct.
 
-- **A57.** `M_tnl_add` (`control_tunnel.c`) discards `dpa_add_tunnel_if`'s
-  return and hardcodes success, so a real fastpath add failure (iface cap,
-  alloc, missing parent) is reported `NO_ERR` to cmm; worse, the create path's
-  `err1` arm on `M_tnl_add` failure is currently dead but is a landmine — the
-  entry is already hash-linked and onif-registered when `M_tnl_add` runs, so
-  propagating the failure without first unlinking + `remove_onif` would make
-  `tunnel_free` a hash-list UAF. Fix ordering before propagating the rc. Open.
+- **A57.** `M_tnl_add` hash-linked the tunnel before the fallible
+  `dpa_add_tunnel_if` and discarded its result (a real add failure reported
+  `NO_ERR`; propagating it would have freed a still-linked entry) — **fixed**
+  (_02d4968_): program hardware first, hash-link only on success, and release
+  the onif + route in the create-failure arm before `tunnel_free`.
+  Rig-validated by a failslab sweep (no half-linked entry, route never pinned;
+  `test_tunnel_failslab.py`).
 
 - **A58.** `M_ipsec_sa_cache_create` (`control_ipsec.c:396`) links the SA onto
   `sa_cache_by_fqid` *before* `sa_add` (:406); the `return NULL` at :411 would
@@ -801,3 +796,36 @@ file's git history.
   it succeeds. Needs a read of what add_incoming_iface_info actually pins
   before designing the unwind (same investigate-first rule as A37). Open
   (investigate).
+
+- **A65.** cmm `sa_lock` ABBA inversion, confirmed by the A54 audit: the
+  keytrack/FCI-callback thread takes `sa_lock → itf_table.lock → (ctMutex) →
+  rtMutex → neighMutex` (`cmmSASetTunnel` module_ipsec.c:533-536,
+  `cmmSASetState` :461-465) while the netlink thread takes the canonical
+  `itf → ct → rt → neigh` chain and then `sa_lock`
+  (route_cache.c:1413, module_ipsec.c:229). Pre-existing, not introduced by
+  A54. Fix shape: hoist the SA-side lock acquisition to the canonical order
+  (or drop sa_lock to a leaf taken last everywhere). Open.
+
+- **A66.** A54 freshness residual (documented by the fix's audit): after a
+  rollback, the next route event re-attaches the OLD fpp route id (holder's
+  `fpp_route` restored → `__cmmFPPRouteRegister` no-ops), cdx accepts the
+  same-id update, and `FPP_NEEDS_UPDATE` clears with no pending convergence
+  event when the refusal was transient and the new gateway's neighbor was
+  already NUD_VALID — stale next-hop persists until unrelated neigh/route
+  churn. Consistent (no orphan, both sides agree) and strictly better than
+  pre-A54, but not fresh. Fix shape: compare the held `fpp_rt` against the
+  RtEntry's current MAC/oif/mtu on retry and stash-and-rebuild on mismatch.
+  Open (low priority).
+
+- **A67.** `route_cache.c:__cmmRouteNew` calls `__cmmRouteIsTnlItf` with the
+  tunnel's own `itf->tunnel_family` as the `family` argument, so the
+  family-mismatch filter can never fire and `IPADDRLEN(family)` follows the
+  tunnel rather than the route event — a v6 tunnel gets prefix-matched
+  against a v4 route's dAddr bytes. `__cmmRouteLocalNew` passes the ct's
+  family correctly. Wrong-family matches only cost a spurious idempotent
+  `__tunnel_add`, so impact is noise, not corruption. Open (cleanup).
+
+- **A68.** `__cmmSATunnelRegister` (module_ipsec.c:168-172) dereferences
+  `__cmmNeighAdd()`'s result (`->count++`) with no NULL check — malloc
+  failure crashes the daemon. Two-line guard; fold into the next
+  module_ipsec.c touch. Open.
