@@ -345,7 +345,6 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	t_Handle h_FmMuram;
 	uint64_t physicalMuramBase;
 	uint32_t MuramSize;
-	PRouteEntry pRtEntry;
 	int i;
 
 	DPA_INFO("%s(%d) length %d, size %lu \n",
@@ -400,14 +399,12 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 		return ERR_WRONG_SOCK_TYPE;
 	}
 
-	{
-		if (!SocketCmd.route_id)
-			return ERR_NO_ROUTE_TO_SOCK;
-
-		pRtEntry = L2_route_get(SocketCmd.route_id);
-		if (pRtEntry == NULL)
-			return ERR_NO_ROUTE_TO_SOCK;
-	}
+	/* Only the presence of an id is checked here: the socket's single
+	 * route reference is taken further down by socket4_add() ->
+	 * SOCKET4_check_route(), and resolving the id twice would leave the
+	 * route holding a reference nothing ever releases. */
+	if (!SocketCmd.route_id)
+		return ERR_NO_ROUTE_TO_SOCK;
 
 	if ((pEntry = (struct _tSockEntry*)socket4_alloc()) == NULL)
 	  	return ERR_NOT_ENOUGH_MEMORY;

@@ -226,6 +226,12 @@ void L2_route_put(PRouteEntry pRtEntry)
 	if (pRtEntry == NULL)
 		return;
 
+	/* nbref is a U16: an unbalanced put wraps 0 to 0xFFFF, which both
+	 * pins the entry against removal forever and makes every later
+	 * L2_route_get() fail its saturation check. Refuse instead. */
+	if (WARN_ON_ONCE(pRtEntry->nbref == 0))
+		return;
+
 	pRtEntry->nbref--;
 }
 

@@ -81,6 +81,11 @@ static PTnlEntry tunnel_alloc(void)
 
 static void tunnel_free(PTnlEntry pEntry)
 {
+	/* The tunnel owns whatever route reference it holds for as long as
+	 * it exists, so the entry can never be freed without handing that
+	 * reference back. L2_route_put() tolerates the NULL left by
+	 * tunnel_alloc() on the paths that never resolved a route. */
+	L2_route_put(pEntry->pRtEntry);
 	kfree(pEntry);
 }
 
@@ -404,6 +409,13 @@ static int TNL_handle_DELETE(U16 *p, U16 Length)
 
 	if((pTunnelEntry = M_tnl_get_by_name(cmd.name, sizeof(cmd.name))) == NULL)
 		return ERR_TNL_ENTRY_NOT_FOUND;
+
+	/* Drop the parent route reference first: when the tunnel egresses
+	 * over its own interface, the route sweep done by the onif removal
+	 * can only reclaim that route once the tunnel is no longer holding a
+	 * reference to it. */
+	L2_route_put(pTunnelEntry->pRtEntry);
+	pTunnelEntry->pRtEntry = NULL;
 
 	/* Tell the Interface Manager to remove the tunnel IF */
 	remove_onif_by_index(pTunnelEntry->itf.index);
