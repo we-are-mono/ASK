@@ -55,10 +55,10 @@ index 4bd05b2..ddefce1 100644
  
  class CGenericError {
 diff --git a/source/FMCPCDModel.cpp b/source/FMCPCDModel.cpp
-index d785eee..7a25f91 100755
+index d785eee..bb6435f 100755
 --- a/source/FMCPCDModel.cpp
 +++ b/source/FMCPCDModel.cpp
-@@ -133,12 +133,131 @@ CFMCModel::CFMCModel()
+@@ -133,12 +133,129 @@ CFMCModel::CFMCModel()
  }
  
  
@@ -70,7 +70,7 @@ index d785eee..7a25f91 100755
 +
 +    for( ii = 0; ii < port.htnodes.size(); ii++) {
 +	if (all_htnodes[port.htnodes[ii]].name == refnode.name) {
-+		return all_htnodes[ii];
++		return all_htnodes[port.htnodes[ii]];
 +	}
 +    }
 +
@@ -113,8 +113,6 @@ index d785eee..7a25f91 100755
 +    htNode.fragOnMiss = refnode.fragOnMiss;
 +    htNode.headerOnMiss = refnode.headerOnMiss;
 +    htNode.port_signature = port.name;
-+
-+    ApplyOrder::Entry root( ApplyOrder::CCTree, port.getIndex() );
 +
 +    port.cctrees.push_back( htNode.getIndex() );
 +    port.cctrees_type.push_back( e_FM_PCD_HASH );
@@ -190,7 +188,7 @@ index d785eee..7a25f91 100755
      assert( pTaskDef );
  
      // For all engines
-@@ -192,6 +311,23 @@ CFMCModel::createModel( CTaskDef* pTaskDef )
+@@ -192,6 +309,23 @@ CFMCModel::createModel( CTaskDef* pTaskDef )
  
                  Scheme& scheme = all_schemes[index];
                  scheme.scheme_index_per_port = scheme_index;
@@ -214,7 +212,7 @@ index d785eee..7a25f91 100755
  
                  // Add scheme's protocols to the port's protocol list
                  std::set< Protocol >::iterator protoIt;
-@@ -1011,6 +1147,7 @@ CFMCModel::createScheme( const CTaskDef* pTaskDef, Port& port, const CDistributi
+@@ -1011,6 +1145,7 @@ CFMCModel::createScheme( const CTaskDef* pTaskDef, Port& port, const CDistributi
      // Add next engine entry
      scheme.nextEngine        = getEngineByType( xmlDist.action );
      scheme.nextEngineStr     = getEngineByTypeStr( xmlDist.action );
@@ -222,7 +220,7 @@ index d785eee..7a25f91 100755
      scheme.doneAction        = e_FM_PCD_ENQ_FRAME;
      scheme.doneActionStr     = "e_FM_PCD_ENQ_FRAME";
      scheme.actionHandleIndex = 0xFFFFFFFF;
-@@ -2920,7 +3057,7 @@ CFMCModel::getNetCommFieldType( std::string fieldname )
+@@ -2920,7 +3055,7 @@ CFMCModel::getNetCommFieldType( std::string fieldname )
      fields["pppoe.code"]          = NET_HEADER_FIELD_PPPoE_CODE;
      fields["pppoe.session_ID"]    = NET_HEADER_FIELD_PPPoE_SID;
      fields["pppoe.hlen"]          = NET_HEADER_FIELD_PPPoE_LEN;
@@ -231,7 +229,7 @@ index d785eee..7a25f91 100755
      fields["minencap.dst"]        = NET_HEADER_FIELD_MINENCAP_DST_IP;
      fields["sctp.sport"]          = NET_HEADER_FIELD_SCTP_PORT_SRC;
      fields["sctp.dport"]          = NET_HEADER_FIELD_SCTP_PORT_DST;
-@@ -3007,7 +3144,7 @@ CFMCModel::getNetCommFieldTypeStr( std::string fieldname )
+@@ -3007,7 +3142,7 @@ CFMCModel::getNetCommFieldTypeStr( std::string fieldname )
      fields["pppoe.code"]          = "NET_HEADER_FIELD_PPPoE_CODE";
      fields["pppoe.session_ID"]    = "NET_HEADER_FIELD_PPPoE_SID";
      fields["pppoe.hlen"]          = "NET_HEADER_FIELD_PPPoE_LEN";

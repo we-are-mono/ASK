@@ -1,0 +1,412 @@
+From dfc6bb3b6db55839a5b69399cdd0cd1d48b7b5d6 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 17 Aug 2026 20:17:28 +0200
+Subject: [PATCH] sdk_fman: restore IRQs on sysfs handler early returns
+
+Nineteen show handlers in the FMan sysfs wrappers take local_irq_save()
+and then return directly from a validity check inside the critical
+section -- device not active, no PCD handle, no params page, or a failed
+sscanf of the attribute name -- leaving hardirqs disabled on the calling
+CPU for the rest of that task's lifetime.
+
+The attributes are all S_IRUGO, so any unprivileged read of an inactive
+port or an unconfigured PCD trips this. Once it fires, the return path
+back through seq_read_iter() -> copy_to_user() faults with hardirqs off
+and splats might_fault(), and every subsequent scheduling decision on
+that CPU runs with interrupts disabled.
+
+Hoist each check -- and the sscanf that parses the attribute index --
+above local_irq_save(), matching the idiom show_fm_risc_load() already
+uses. Nothing being checked is derived inside the critical section, so
+the ordering change is safe; only the register dumps that actually need
+the guarantee stay under it.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c    | 130 +++++++++---------
+ .../src/wrapper/lnxwrp_sysfs_fm_port.c        |  57 ++++----
+ 2 files changed, 95 insertions(+), 92 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
+index ee473326b9e7..809594b02cc4 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
+@@ -528,6 +528,7 @@ static ssize_t show_fm_tnum_dbg(struct device *dev,
+ 	unsigned n = 0;
+ #if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
+ 	t_LnxWrpFmDev *p_wrp_fm_dev = NULL;
++	int tn_s;
+ #endif
+ 
+ 	if (attr == NULL || buf == NULL || dev == NULL)
+@@ -539,19 +540,17 @@ static ssize_t show_fm_tnum_dbg(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
+-
+ 	if (!p_wrp_fm_dev->active)
+ 		return -EIO;
+-	else {
+-		int tn_s;
+ 
+-		if (!sscanf(attr->attr.name, "tnum_dbg_%d", &tn_s))
+-			return -EINVAL;
++	if (!sscanf(attr->attr.name, "tnum_dbg_%d", &tn_s))
++		return -EINVAL;
++
++	local_irq_save(flags);
++
++	n = fm_dump_tnum_dbg(p_wrp_fm_dev->h_Dev,
++				tn_s, tn_s + 15, buf, n);
+ 
+-		n = fm_dump_tnum_dbg(p_wrp_fm_dev->h_Dev,
+-					tn_s, tn_s + 15, buf, n);
+-	}
+ 	local_irq_restore(flags);
+ #else
+ 
+@@ -572,6 +571,7 @@ static ssize_t show_fm_cls_plan(struct device *dev,
+ 	unsigned n = 0;
+ #if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
+ 	t_LnxWrpFmDev *p_wrp_fm_dev = NULL;
++	int cpn;
+ #endif
+ 
+ 	if (attr == NULL || buf == NULL || dev == NULL)
+@@ -582,20 +582,18 @@ static ssize_t show_fm_cls_plan(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
++	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
++		return -EIO;
++
++	if (!sscanf(attr->attr.name, "cls_plan_%d", &cpn))
++		return -EINVAL;
+ 
+ 	n = snprintf(buf, PAGE_SIZE, "\n FM-KG classification plan dump.\n");
+ 
+-	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
+-		return -EIO;
+-	else {
+-		int cpn;
++	local_irq_save(flags);
+ 
+-		if (!sscanf(attr->attr.name, "cls_plan_%d", &cpn))
+-			return -EINVAL;
++	n = fm_dump_cls_plan(p_wrp_fm_dev->h_PcdDev, cpn, buf, n);
+ 
+-		n = fm_dump_cls_plan(p_wrp_fm_dev->h_PcdDev, cpn, buf, n);
+-	}
+ 	local_irq_restore(flags);
+ #else
+ 	local_irq_save(flags);
+@@ -615,6 +613,7 @@ static ssize_t show_fm_profiles(struct device *dev,
+ 	unsigned n = 0;
+ #if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
+ 	t_LnxWrpFmDev *p_wrp_fm_dev = NULL;
++	int pn;
+ #endif
+ 
+ 	if (attr == NULL || buf == NULL || dev == NULL)
+@@ -626,20 +625,18 @@ static ssize_t show_fm_profiles(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
++	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
++		return -EIO;
++
++	if (!sscanf(attr->attr.name, "profile_%d", &pn))
++		return -EINVAL;
+ 
+ 	n = snprintf(buf, PAGE_SIZE, "FM policer profile dump.\n");
+ 
+-	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
+-		return -EIO;
+-	else {
+-		int pn;
++	local_irq_save(flags);
+ 
+-		if (!sscanf(attr->attr.name, "profile_%d", &pn))
+-			return -EINVAL;
++	n = fm_profile_dump_regs(p_wrp_fm_dev->h_PcdDev, pn, buf, n);
+ 
+-		n = fm_profile_dump_regs(p_wrp_fm_dev->h_PcdDev, pn, buf, n);
+-	}
+ 	local_irq_restore(flags);
+ #else
+ 	local_irq_save(flags);
+@@ -659,6 +656,7 @@ static ssize_t show_fm_schemes(struct device *dev,
+ 	unsigned n = 0;
+ #if (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0))
+ 	t_LnxWrpFmDev *p_wrp_fm_dev = NULL;
++	int sn;
+ #endif
+ 
+ 	if (attr == NULL || buf == NULL || dev == NULL)
+@@ -670,20 +668,18 @@ static ssize_t show_fm_schemes(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
++	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
++		return -EIO;
++
++	if (!sscanf(attr->attr.name, "scheme_%d", &sn))
++		return -EINVAL;
+ 
+ 	n = snprintf(buf, PAGE_SIZE, "FM-KG driver schemes dump.\n");
+ 
+-	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
+-		return -EIO;
+-	else {
+-		int sn;
++	local_irq_save(flags);
+ 
+-		if (!sscanf(attr->attr.name, "scheme_%d", &sn))
+-			return -EINVAL;
++	n = fm_dump_scheme(p_wrp_fm_dev->h_PcdDev, sn, buf, n);
+ 
+-		n = fm_dump_scheme(p_wrp_fm_dev->h_PcdDev, sn, buf, n);
+-	}
+ 	local_irq_restore(flags);
+ #else
+ 
+@@ -1251,14 +1247,14 @@ static ssize_t show_fm_regs(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
++	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_Dev)
++		return -EIO;
+ 
+ 	n = snprintf(buf, PAGE_SIZE, "FM driver registers dump.\n");
+ 
+-	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_Dev)
+-		return -EIO;
+-	else
+-		n = fm_dump_regs(p_wrp_fm_dev->h_Dev, buf, n);
++	local_irq_save(flags);
++
++	n = fm_dump_regs(p_wrp_fm_dev->h_Dev, buf, n);
+ 
+ 	local_irq_restore(flags);
+ #else
+@@ -1291,15 +1287,15 @@ static ssize_t show_fm_kg_pe_regs(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
++	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
++		return -EIO;
+ 
+ 	n = snprintf(buf, PAGE_SIZE,
+ 			"\n FM-KG Port Partition Config registers dump.\n");
+ 
+-	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
+-		return -EIO;
+-	else
+-		n = fm_kg_pe_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
++	local_irq_save(flags);
++
++	n = fm_kg_pe_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
+ 
+ 	local_irq_restore(flags);
+ #else
+@@ -1332,14 +1328,14 @@ static ssize_t show_fm_kg_regs(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
++	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
++		return -EIO;
+ 
+ 	n = snprintf(buf, PAGE_SIZE, "FM-KG registers dump.\n");
+ 
+-	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
+-		return -EIO;
+-	else
+-		n = fm_kg_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
++	local_irq_save(flags);
++
++	n = fm_kg_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
+ 
+ 	local_irq_restore(flags);
+ #else
+@@ -1373,14 +1369,14 @@ static ssize_t show_fm_fpm_regs(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
++	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_Dev)
++		return -EIO;
+ 
+ 	n = snprintf(buf, PAGE_SIZE, "FM-FPM registers dump.\n");
+ 
+-	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_Dev)
+-		return -EIO;
+-	else
+-		n = fm_fpm_dump_regs(p_wrp_fm_dev->h_Dev, buf, n);
++	local_irq_save(flags);
++
++	n = fm_fpm_dump_regs(p_wrp_fm_dev->h_Dev, buf, n);
+ 
+ 	local_irq_restore(flags);
+ #else
+@@ -1411,13 +1407,14 @@ static ssize_t show_prs_regs(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
+-	n = snprintf(buf, PAGE_SIZE, "FM Policer registers dump.\n");
+-
+ 	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
+ 		return -EIO;
+-	else
+-		n = fm_prs_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
++
++	n = snprintf(buf, PAGE_SIZE, "FM Policer registers dump.\n");
++
++	local_irq_save(flags);
++
++	n = fm_prs_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
+ 
+ 	local_irq_restore(flags);
+ #else
+@@ -1450,13 +1447,14 @@ static ssize_t show_plcr_regs(struct device *dev,
+ 	if (WARN_ON(p_wrp_fm_dev == NULL))
+ 		return -EINVAL;
+ 
+-	local_irq_save(flags);
+-	n = snprintf(buf, PAGE_SIZE, "FM Policer registers dump.\n");
+-
+ 	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_PcdDev)
+ 		return -EIO;
+-	else
+-		n = fm_plcr_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
++
++	n = snprintf(buf, PAGE_SIZE, "FM Policer registers dump.\n");
++
++	local_irq_save(flags);
++
++	n = fm_plcr_dump_regs(p_wrp_fm_dev->h_PcdDev, buf, n);
+ 
+ 	local_irq_restore(flags);
+ #else
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c
+index ee0ada81f0ea..05a4a6a88438 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c
+@@ -255,17 +255,18 @@ static ssize_t show_fm_port_regs(struct device *dev,
+ 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
+ 
+ 
+-	local_irq_save(flags);
+-
+ 	if (!p_LnxWrpFmPortDev->h_Dev) {
+ 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
+ 		return n;
+-	} else {
+-		n = snprintf(buf, PAGE_SIZE,
+-				"FM port driver registers dump.\n");
+-		n = fm_port_dump_regs(p_LnxWrpFmPortDev->h_Dev, buf, n);
+ 	}
+ 
++	n = snprintf(buf, PAGE_SIZE,
++			"FM port driver registers dump.\n");
++
++	local_irq_save(flags);
++
++	n = fm_port_dump_regs(p_LnxWrpFmPortDev->h_Dev, buf, n);
++
+ 	local_irq_restore(flags);
+ 
+ 	return n;
+@@ -296,22 +297,24 @@ static ssize_t show_fm_port_ipv4_options(struct device *dev,
+ 	p_LnxWrpFmPortDev =
+ 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
+ 
+-	local_irq_save(flags);
+-
+ 	if (!p_LnxWrpFmPortDev->h_Dev) {
+ 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
+ 		return n;
+-	} else if (((t_FmPort *)p_LnxWrpFmPortDev->h_Dev)->p_ParamsPage
+-					== NULL) {
++	}
++
++	if (((t_FmPort *)p_LnxWrpFmPortDev->h_Dev)->p_ParamsPage == NULL) {
+ 		n = snprintf(buf, PAGE_SIZE,
+ 			"\tPort: FMan-controller params page not set\n");
+ 		return n;
+-	} else {
+-		n = snprintf(buf, PAGE_SIZE,
+-			"Counter for fragmented pkt with IP header options\n");
+-		n = fm_port_dump_ipv4_opt(p_LnxWrpFmPortDev->h_Dev, buf, n);
+ 	}
+ 
++	n = snprintf(buf, PAGE_SIZE,
++		"Counter for fragmented pkt with IP header options\n");
++
++	local_irq_save(flags);
++
++	n = fm_port_dump_ipv4_opt(p_LnxWrpFmPortDev->h_Dev, buf, n);
++
+ 	local_irq_restore(flags);
+ 
+ 	return n;
+@@ -342,17 +345,18 @@ static ssize_t show_fm_port_bmi_regs(struct device *dev,
+ 	p_LnxWrpFmPortDev =
+ 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
+ 
+-	local_irq_save(flags);
+-
+ 	if (!p_LnxWrpFmPortDev->h_Dev) {
+ 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
+ 		return n;
+-	} else {
+-		n = snprintf(buf, PAGE_SIZE,
+-				"FM port driver registers dump.\n");
+-		n = fm_port_dump_regs_bmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
+ 	}
+ 
++	n = snprintf(buf, PAGE_SIZE,
++			"FM port driver registers dump.\n");
++
++	local_irq_save(flags);
++
++	n = fm_port_dump_regs_bmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
++
+ 	local_irq_restore(flags);
+ 
+ 	return n;
+@@ -383,17 +387,18 @@ static ssize_t show_fm_port_qmi_regs(struct device *dev,
+ 	p_LnxWrpFmPortDev =
+ 		(t_LnxWrpFmPortDev *) dev_get_drvdata(dev);
+ 
+-	local_irq_save(flags);
+-
+ 	if (!p_LnxWrpFmPortDev->h_Dev) {
+ 		n = snprintf(buf, PAGE_SIZE, "\tFM Port not configured...\n");
+ 		return n;
+-	} else {
+-		n = snprintf(buf, PAGE_SIZE,
+-				"FM port driver registers dump.\n");
+-		n = fm_port_dump_regs_qmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
+ 	}
+ 
++	n = snprintf(buf, PAGE_SIZE,
++			"FM port driver registers dump.\n");
++
++	local_irq_save(flags);
++
++	n = fm_port_dump_regs_qmi(p_LnxWrpFmPortDev->h_Dev, buf, n);
++
+ 	local_irq_restore(flags);
+ 
+ 	return n;
+-- 
+2.47.3
+

@@ -1,4 +1,4 @@
-From 78d242260bdff3a7ca373e40ee3c79b10b1e35fd Mon Sep 17 00:00:00 2001
+From b9c4ae84738da13ca34353d7c6ea52ead2824eec Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -66,7 +66,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h     |    1 +
  .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  152 +-
  .../sdk_fman/Peripherals/FM/Port/fm_port.h    |    3 +
- .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   35 +
+ .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   34 +
  .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
  .../freescale/sdk_fman/Peripherals/FM/fm.c    |   19 +-
  .../sdk_fman/Peripherals/FM/fm_muram.c        |   32 +-
@@ -112,7 +112,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 75 files changed, 7000 insertions(+), 1147 deletions(-)
+ 75 files changed, 6999 insertions(+), 1147 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -594,7 +594,7 @@ index f46c243ff1b8..46816dcda3cb 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..4854edf74d5f 100644
+index 4164644d3268..f1f3b153c882 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -53,6 +53,73 @@
@@ -1001,7 +1001,7 @@ index 4164644d3268..4854edf74d5f 100644
 +	if (nr_frags > (DPA_SGT_MAX_ENTRIES))
 +	{
 +		/* TODO linearize */
-+		pr_err("%s()::%d number of skb frags %d crossed the MAX SGT entries%d", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
++		pr_err_ratelimited("%s()::%d number of skb frags %d crossed the MAX SGT entries%d", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
 +		return -1;
 +	}
 +
@@ -4514,7 +4514,7 @@ index 000000000000..a5f9035387ff
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..bb4147006c89
+index 000000000000..c94dbd89a9c7
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 @@ -0,0 +1,1211 @@
@@ -4802,7 +4802,7 @@ index 000000000000..bb4147006c89
 +				if (FmPcdHcSync(info->pcd)) {
 +					printk("%s::FmPcdHcSync failed\n", __func__);
 +					retval = -1;
-+					goto func_ret;
++					return retval;
 +				}
 +				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
 +				return retval;
@@ -4816,7 +4816,7 @@ index 000000000000..bb4147006c89
 +					REPORT_ERROR(MAJOR, E_NO_MEMORY,
 +								 ("en_cumulative_entry"));
 +					retval = -1;
-+					return retval;
++					goto func_ret;
 +				}
 +				tmp = &tmp_tbl_entry->cumulative_entry;
 +				phyaddr = XX_VirtToPhys(cumulative_tbl_entry);
@@ -4849,8 +4849,8 @@ index 000000000000..bb4147006c89
 +				REPORT_ERROR(MAJOR, E_NO_MEMORY,
 +							 ("en_cumulative_entry"));
 +				retval = -1;
-+				return retval;
-+				
++				goto func_ret;
++
 +			}
 +			cumulative_entry = &cumulative_tbl_entry->cumulative_entry;
 +			cumulative_entry->flags = EN_CUMULATIVE_NODE;
@@ -6265,18 +6265,10 @@ index 2db8365471d5..2f290e3a890f 100644
  } t_FmPort;
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c
-index 17490acd50cd..0faa62647746 100644
+index 17490acd50cd..9a3ce7d48d7b 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fman_port.c
-@@ -101,6 +101,7 @@ static int init_bmi_rx(struct fman_port *port,
-     tmp |= ((uint32_t)cfg->ic_int_offset / FMAN_PORT_IC_OFFSET_UNITS) <<
-             BMI_IC_FROM_INT_SHIFT;
-     tmp |= cfg->ic_size / FMAN_PORT_IC_OFFSET_UNITS;
-+    tmp = 0x00000007;
-     iowrite32be(tmp, &regs->fmbm_ricp);
- 
-     /* Internal buffer offset */
-@@ -526,6 +527,9 @@ static void get_oh_stats_reg(struct fman_port *port,
+@@ -526,6 +526,9 @@ static void get_oh_stats_reg(struct fman_port *port,
      case E_FMAN_PORT_STATS_CNT_DEALLOC_BUF:
          *stats_reg = &regs->fmbm_obdc;
          break;
@@ -6286,7 +6278,7 @@ index 17490acd50cd..0faa62647746 100644
      case E_FMAN_PORT_STATS_CNT_FILTERED_FRAME:
          *stats_reg = &regs->fmbm_offc;
          break;
-@@ -1566,3 +1570,34 @@ int fman_port_remove_congestion_grps(struct fman_port *port,
+@@ -1566,3 +1569,34 @@ int fman_port_remove_congestion_grps(struct fman_port *port,
      }
      return 0;
  }
@@ -9311,7 +9303,7 @@ index 41df9a906b03..448291e32f68 100644
  } ioc_compat_fm_pcd_hash_table_params_t;
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
-index 7329446372b3..e87244ad5758 100644
+index 7329446372b3..ee473326b9e7 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c
 @@ -46,6 +46,14 @@
@@ -9453,15 +9445,15 @@ index 7329446372b3..e87244ad5758 100644
 +	if (WARN_ON(p_wrp_fm_dev == NULL))
 +		return -EINVAL;
 +
-+	local_irq_save(flags);
-+
-+	n = snprintf(buf, PAGE_SIZE, "FM DMA CAM queue dump.\n");
-+
 +	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_Dev)
 +		return -EIO;
 +
 +	if (!sscanf(attr->attr.name, "fm_dma_camq_%d", &start))
-+                        return -EINVAL;
++		return -EINVAL;
++
++	n = snprintf(buf, PAGE_SIZE, "FM DMA CAM queue dump.\n");
++
++	local_irq_save(flags);
 +
 +	n = fm_dump_ccqueue(p_wrp_fm_dev->h_Dev, buf, n,
 +			start, QT_CAM_QUEUE_ENTRY);
@@ -9498,15 +9490,15 @@ index 7329446372b3..e87244ad5758 100644
 +	if (WARN_ON(p_wrp_fm_dev == NULL))
 +		return -EINVAL;
 +
-+	local_irq_save(flags);
-+
-+	n = snprintf(buf, PAGE_SIZE, "FM DMA CMD queue dump.\n");
-+
 +	if (!p_wrp_fm_dev->active || !p_wrp_fm_dev->h_Dev)
 +		return -EIO;
 +
 +	if (!sscanf(attr->attr.name, "fm_dma_cmdq_%d", &start))
-+                        return -EINVAL;
++		return -EINVAL;
++
++	n = snprintf(buf, PAGE_SIZE, "FM DMA CMD queue dump.\n");
++
++	local_irq_save(flags);
 +
 +	n = fm_dump_ccqueue(p_wrp_fm_dev->h_Dev, buf, n,
 +			start, QT_CMD_QUEUE_ENTRY);

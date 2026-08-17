@@ -42,6 +42,7 @@ SRC_URI = "${LINUX_QORIQ_SRC};branch=${LINUX_QORIQ_BRANCH} \
            file://098-sdk_dpaa-bp-alloc-slab-build-skb.patch \
            file://099-sdk_fman-ehash-flex-arrays.patch \
            file://100-sdk_dpaa-ethtool-quiet-phyless-ports.patch \
+           file://101-sdk_fman-sysfs-restore-irqs-on-early-return.patch \
           "
 
 # Optional KASAN overlay — flipped on by the user with
