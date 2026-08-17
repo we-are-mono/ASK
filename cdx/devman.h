@@ -37,12 +37,6 @@ int dpa_add_wlan_if(char *name, struct _itf *itf, uint32_t vap_id, unsigned char
 int dpa_set_bridged_itf(uint8_t* ifname, uint8_t is_bridged, uint8_t* br_mac_addr);
 void dpa_release_interface(uint32_t itf_id);
 
-int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
-		struct en_exthash_tbl_entry *tbl_entry);
-int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index,
-		void *tbl_entry);
-int ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
-		struct en_tbl_entry_stats *stats);
 int cdx_create_port_fqs(void);
 int cdx_add_eth_onif(char *name);
 int cdx_add_oh_iface(char *name);

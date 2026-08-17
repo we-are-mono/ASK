@@ -286,3 +286,16 @@ index 700ce41..0657530 100644
      t_FmPcdNetEnvParams  distinctionUnits;          ///< Port's network env
      t_FmPortPcdParams    pcdParam;
      t_FmPortPcdPrsParams prsParam;
+diff --git a/source/fmc_exec.c b/source/fmc_exec.c
+index c105037..fb766a6 100755
+--- a/source/fmc_exec.c
++++ b/source/fmc_exec.c
+@@ -697,7 +697,7 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
+             err = FM_PCD_HashTableAddKey( model->htnode_handle[index], 
+                                 model->htnode[index].matchKeySize,
+                                 &(model->htentry[index][i]) );
+-            /*CHECK_HANDLE( FM_PCD_HashTableAddKey, model->htnode_name[index], !res ); */
++            CHECK_ERR( FM_PCD_HashTableAddKey, model->htnode_name[index] );
+         }
+     }
+     /* End of adding HT entries */
