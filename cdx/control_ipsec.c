@@ -693,7 +693,7 @@ static int IPsec_handle_SA_SET_TNL_ROUTE(U16 *p, U16 Length)
 {
 	CommandIPSecSetTunnelRoute  cmd;
 	PSAEntry sa;
-	PRouteEntry NewRtEntry;
+	PRouteEntry NewRtEntry = NULL;
 
 	/* Check length */
 	if (Length != sizeof(CommandIPSecSetTunnelRoute))
@@ -713,37 +713,60 @@ static int IPsec_handle_SA_SET_TNL_ROUTE(U16 *p, U16 Length)
 	if (sa->mode != SA_MODE_TUNNEL)
 		return ERR_SA_INVALID_MODE;
 
-	if (sa->pRtEntry)
+	/* Resolve the new route before the SA is touched: the fast path is
+	 * torn down and rebuilt below and cannot be failed out of, so an id
+	 * that cannot be resolved has to be rejected while the SA still holds
+	 * its previous route -- no later command would repair an SA left
+	 * routeless here. The old reference is kept until the new one is in
+	 * hand, because re-taking it on failure can itself fail on a
+	 * saturated reference count. A route id of 0 is how a withdrawn route
+	 * is signalled and detaches the SA by design. */
+	if (cmd.route_id)
 	{
-		/* sa has route already, remove it */
-#ifdef CONTROL_IPSEC_DEBUG
-		printk("%s::removing rtentry %p in sa %p  dir %d\n", 
-				__func__, sa->pRtEntry, sa, sa->direction);
-#endif
-		L2_route_put(sa->pRtEntry);
+		NewRtEntry = L2_route_get(cmd.route_id);
+		if (!NewRtEntry)
+			return ERR_RT_ENTRY_NOT_FOUND;
 	}
 
-	NewRtEntry = L2_route_get(cmd.route_id);
+#ifdef CONTROL_IPSEC_DEBUG
+	printk(KERN_INFO "%s : new route id = %d new route Entry = %p \n ",__func__ ,cmd.route_id,NewRtEntry);
+#endif
+
+	if (NewRtEntry == sa->pRtEntry) {
+		/* Same route as the SA already holds, or a repeated detach:
+		 * hand back the duplicate reference and leave the fast path
+		 * alone, so a re-sent route event costs no traffic. */
+		L2_route_put(NewRtEntry);
+		sa->route_id = cmd.route_id;
+		return NO_ERR;
+	}
+
+#ifdef CONTROL_IPSEC_DEBUG
+	printk("%s::replacing rtentry %p by %p in sa %p  dir %d\n",
+			__func__, sa->pRtEntry, NewRtEntry, sa, sa->direction);
+#endif
+	L2_route_put(sa->pRtEntry);
+	sa->pRtEntry = NewRtEntry; /* changing to new route entry */
 	sa->route_id = cmd.route_id;
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s : new route id = %d new route Entry = %p \n ",__func__ ,sa->route_id,NewRtEntry);
-#endif
 
-	if (NewRtEntry != sa->pRtEntry) {
-		sa->pRtEntry = NewRtEntry; /* changing to new route entry */
-		if (sa->direction == CDX_DPA_IPSEC_INBOUND)
-			return NO_ERR;
-		/* remove the old fastpath entry */
-		if ((sa->ct) && (sa->ct->handle)) 
-			cdx_ipsec_delete_fp_entry(sa);
-		if ((sa->state == SA_STATE_VALID) && (NewRtEntry)) {
+	if (sa->direction == CDX_DPA_IPSEC_INBOUND)
+		return NO_ERR;
+
+	/* remove the old fastpath entry */
+	if ((sa->ct) && (sa->ct->handle))
+		cdx_ipsec_delete_fp_entry(sa);
+
+	/* The push dereferences the route, so it only runs when the SA
+	 * actually has one: a detach legitimately ends here with the fast
+	 * path torn down. */
+	if ((sa->state == SA_STATE_VALID) && (sa->pRtEntry)) {
 #ifdef CONTROL_IPSEC_DEBUG
-			printk("%s::route updated on outbound sa %p, pushing entry to fp\n",
-					__func__, sa);
+		printk("%s::route updated on outbound sa %p, pushing entry to fp\n",
+				__func__, sa);
 #endif
-			return(ipsec_push_sa_to_fast_path(sa));
-		}
+		return(ipsec_push_sa_to_fast_path(sa));
 	}
+
 	return NO_ERR;
 }
 

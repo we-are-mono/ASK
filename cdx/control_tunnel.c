@@ -294,7 +294,19 @@ static int TNL_handle_CREATE(U16 *p, U16 Length)
 	pTunnelEntry->hlim = cmd.hlim;
 	pTunnelEntry->elim = cmd.elim;
 	pTunnelEntry->route_id = cmd.route_id;
-	pTunnelEntry->pRtEntry = L2_route_get(pTunnelEntry->route_id);
+	/* A route id of 0 means the tunnel is created without a parent route
+	 * and is legal; a non-zero id that cannot be resolved is not, so fail
+	 * the create rather than leave a tunnel that silently forwards
+	 * nowhere. */
+	if (cmd.route_id)
+	{
+		pTunnelEntry->pRtEntry = L2_route_get(cmd.route_id);
+		if (!pTunnelEntry->pRtEntry)
+		{
+			rc = ERR_RT_ENTRY_NOT_FOUND;
+			goto err1;
+		}
+	}
 	pTunnelEntry->tnl_mtu  = cmd.mtu;
 	pTunnelEntry->flags = cmd.flags;
 
@@ -339,6 +351,7 @@ static int TNL_handle_UPDATE(U16 *p, U16 Length)
 {
 	TNLCommand_create cmd;
 	PTnlEntry pTunnelEntry;
+	PRouteEntry pNewRtEntry = NULL;
 
 	/* Check length */
 	if (Length != sizeof(TNLCommand_create))
@@ -353,12 +366,24 @@ static int TNL_handle_UPDATE(U16 *p, U16 Length)
 	if (pTunnelEntry->mode != cmd.mode)
 		return ERR_TNL_NOT_SUPPORTED;
 
-	if (pTunnelEntry->pRtEntry)
+	/* Resolve the new route before the tunnel is touched: nothing past
+	 * this point can fail, so an id that cannot be resolved has to be
+	 * rejected while the tunnel still holds its previous binding, rather
+	 * than leaving it routeless and reporting success. The old reference
+	 * is kept until the new one is in hand -- dropping it first and
+	 * re-taking it on failure is not an option, because the re-take can
+	 * itself fail on a saturated reference count. A route id of 0 is how
+	 * a withdrawn route is signalled and detaches the tunnel by design. */
+	if (cmd.route_id)
 	{
-		L2_route_put(pTunnelEntry->pRtEntry);
-
-		pTunnelEntry->pRtEntry = NULL;
+		pNewRtEntry = L2_route_get(cmd.route_id);
+		if (!pNewRtEntry)
+			return ERR_RT_ENTRY_NOT_FOUND;
 	}
+
+	L2_route_put(pTunnelEntry->pRtEntry);
+	pTunnelEntry->pRtEntry = pNewRtEntry;
+	pTunnelEntry->route_id = cmd.route_id;
 
 	pTunnelEntry->state &= ~TNL_STATE_REMOTE_ANY;
 	/* For copy we don't care to copy useless data in IPv4 case */
@@ -374,8 +399,6 @@ static int TNL_handle_UPDATE(U16 *p, U16 Length)
 	pTunnelEntry->fl = cmd.fl;
 	pTunnelEntry->hlim = cmd.hlim;
 	pTunnelEntry->elim = cmd.elim;
-	pTunnelEntry->route_id = cmd.route_id;
-	pTunnelEntry->pRtEntry = L2_route_get(pTunnelEntry->route_id);
 	pTunnelEntry->tnl_mtu  = cmd.mtu;
 	pTunnelEntry->flags = cmd.flags;
 
