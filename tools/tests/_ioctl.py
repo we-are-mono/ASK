@@ -41,12 +41,12 @@ def _IOWR(t, nr, size):   return _IOC(_IOC_READ | _IOC_WRITE, t, nr, size)
 
 CDX_IOC_MAGIC = 0xBE
 
-# struct cdx_ctrl_set_dpa_params layout (see cdx/cdx_ioctl.h:192):
+# struct cdx_ctrl_set_dpa_params layout (see cdx/cdx_ioctl.h; the
+# ipr_info pointer left with the hardware IP-reassembly removal):
 #   void *fman_info          8 B
-#   void *ipr_info           8 B
 #   uint32_t num_fmans       4 B + 4 B tail padding to 8-B alignment
-# = 24 B on 64-bit arm64.
-SIZEOF_CDX_CTRL_SET_DPA_PARAMS = 24
+# = 16 B on 64-bit arm64.
+SIZEOF_CDX_CTRL_SET_DPA_PARAMS = 16
 
 CDX_CTRL_DPA_SET_PARAMS = _IOWR(CDX_IOC_MAGIC, 1, SIZEOF_CDX_CTRL_SET_DPA_PARAMS)
 
