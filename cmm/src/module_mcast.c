@@ -340,9 +340,6 @@ void mc_remove_group(void * entry,unsigned char family)
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_lock(&mc_lock);
 
 	mc = mc_find( entry, family);
@@ -352,9 +349,6 @@ void mc_remove_group(void * entry,unsigned char family)
 		free(mc);
 	}
 	__pthread_mutex_unlock(&mc_lock);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -490,9 +484,6 @@ int mc6_update_entry( cmmd_mc6_entry_t *entry,
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_lock(&mc_lock);
 		
 
@@ -549,9 +540,6 @@ int mc6_update_entry( cmmd_mc6_entry_t *entry,
 	}					
 done:
 	__pthread_mutex_unlock(&mc_lock);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -577,9 +565,6 @@ int mc4_update_entry( cmmd_mc4_entry_t *entry,
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_lock(&mc_lock);
 		
 	cmm_print(DEBUG_INFO, "%s, Check for interface %s index : %d \n", 
@@ -636,9 +621,6 @@ int mc4_update_entry( cmmd_mc4_entry_t *entry,
 				
 done:
 	__pthread_mutex_unlock(&mc_lock);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);

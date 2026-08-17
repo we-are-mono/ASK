@@ -472,85 +472,11 @@ static int tunnel_send_del(FCI_CLIENT *fci_handle, struct interface *itf)
  * __tunnel_remove_flow
  *
  ************************************************************/
-#ifdef IPSEC_FLOW_CACHE
-void __tunnel_remove_flow(FCI_CLIENT *fci_key_handle, struct interface *itf)
-{
-	if (itf->flow_orig)
-		if (!cmmFlowKeyEngineRemove(fci_key_handle, itf->flow_orig))
-		{
-			__cmmFlowPut(itf->flow_orig);
-
-			itf->flow_orig = NULL;
-		}
-
-	if (itf->flow_rep)
-		if (!cmmFlowKeyEngineRemove(fci_key_handle, itf->flow_rep))
-		{
-			__cmmFlowPut(itf->flow_rep);
-
-			itf->flow_rep = NULL;
-		}
-}
-#else
 void __tunnel_remove_flow(FCI_CLIENT *fci_key_handle, struct interface *itf)
 {
 		/* TODO  will be taken when supporting IPSEC for local in packets*/
 }
 
-#endif /* IPSEC_FLOW_CACHE */
-
-
-/************************************************************
- *
- * tunnel_update_sa
- * Role : Update FPP tunnel SA and local cmm copy
- ************************************************************/
-static int tunnel_update_sa(FCI_CLIENT *fci_handle, struct interface *itf, unsigned char orig)
-{
-	fpp_tunnel_sec_cmd_t cmd;
-	int ret;
-
-	if (!(itf->flags & FPP_PROGRAMMED))
-		goto out;
-
-	memset(&cmd, 0, sizeof(cmd));
-
-	if (____itf_get_name(itf, cmd.name, sizeof(cmd.name)) < 0)
-	{
-		cmm_print(DEBUG_ERROR, "%s: ____itf_get_name(%d) failed\n", __func__, itf->ifindex);
-		goto err;
-	}
-
-#ifdef IPSEC_FLOW_CACHE
-	if (orig)
-	{
-		cmd.sa_nr = itf->flow_orig->sa_nr;
-		memcpy(cmd.sa_handle, itf->flow_orig->sa_handle, itf->flow_orig->sa_nr * sizeof(unsigned short));
-	}
-	else
-	{
-		cmd.sa_reply_nr = itf->flow_rep->sa_nr;
-		memcpy(cmd.sa_reply_handle, itf->flow_rep->sa_handle, itf->flow_rep->sa_nr * sizeof(unsigned short));
-	}
-#else
-	/* TODO  will be taken when supporting IPSEC for local in packets*/
-#endif /* IPSEC_FLOW_CACHE */
-
-	//Send message to forward engine
-	cmm_print(DEBUG_COMMAND, "Send CMD_TUNNEL_SEC\n");
-
-	if ((ret = fci_write(fci_handle, FPP_CMD_TUNNEL_SEC, sizeof(fpp_tunnel_sec_cmd_t), &cmd)))
-	{
-		cmm_print(DEBUG_ERROR, "%s: Error %d while sending CMD_TUNNEL_SEC\n", __func__, ret);
-		goto err;
-	}
-
-out:
-	return 0;
-
-err:
-	return -1;
-}
 
 
 /************************************************************
@@ -592,35 +518,11 @@ int __tunnel_add(FCI_CLIENT *fci_handle, struct interface *itf)
 
 		if (itf->tunnel_flags & TNL_IPSEC)
 		{
-#ifdef IPSEC_FLOW_CACHE
-/* 		If TNL_IPSEC flag is enabled and flows are null, then we need to update PFE with the  new flows,
- *		and update the tunnel in PFE, with secure flag enabled */
-			if (!itf->flow_orig)
-			{
-				itf->flow_orig = __cmmFlowGet(itf->tunnel_family, sAddr, dAddr, 0, 0, proto, FLOW_DIR_OUT);
-				itf->flags |= FPP_NEEDS_UPDATE;
-			}
-
-			if (!itf->flow_rep)
-			{
-				itf->flow_rep = __cmmFlowGet(itf->tunnel_family, dAddr, sAddr, 0, 0, proto, FLOW_DIR_IN);
-				itf->flags |= FPP_NEEDS_UPDATE;
-			}
-#else
 			/* TODO  will be taken when supporting IPSEC for local in packets*/
-#endif /* IPSEC_FLOW_CACHE */
 		}
 		else
 		{
-#ifdef IPSEC_FLOW_CACHE
-/* 		If TNL_IPSEC flag is disabled and flows are not null, then we need to update PFE with the secure flag disabled
- *		This will in turn reset the secure flows in PFE), and remove the flows from the ITF (done later in tunnel_add)
- */
-			if(itf->flow_orig || itf->flow_rep )
-				itf->flags |= FPP_NEEDS_UPDATE;
-#else
 					/* TODO  will be taken when supporting IPSEC for local in packets*/
-#endif /* IPSEC_FLOW_CACHE */
 		}
 
 		flow.family = itf->tunnel_family;
@@ -664,14 +566,6 @@ program:
 	if (rc != CMMD_ERR_OK)
 		goto err;
 
-	if (itf->tunnel_flags & TNL_IPSEC)
-	{
-		if (itf->flow_orig)
-			tunnel_update_sa(fci_handle, itf, 1);
-
-		if (itf->flow_rep)
-			tunnel_update_sa(fci_handle, itf, 0);
-	}
 err:
 	return rc;
 }
@@ -693,9 +587,6 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	
 
 	ifindex = if_nametoindex(name);
@@ -775,9 +666,6 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 err1:
 
 err0:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -823,9 +711,6 @@ static int tunnel_del(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	
 
 	ifindex = if_nametoindex(name);
@@ -850,9 +735,6 @@ static int tunnel_del(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 		rc = 0;
 	}
 err:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -926,8 +808,13 @@ static int tunnel_show(FCI_CLIENT *fci_handle, char *name, u_int16_t *res_buf, u
 		pInfo->phys_ifindex = itf->phys_ifindex;
 		pInfo->ipsec = (itf->tunnel_flags & TNL_IPSEC);
 		pInfo->itf_programmed = (itf->flags & FPP_PROGRAMMED) ? 1 : 0;
-		pInfo->neigh_programmed = (itf->rt.route)? 1 : 0; 
-		pInfo->sa_programmed = (itf->flow_rep && itf->flow_orig);
+		pInfo->neigh_programmed = (itf->rt.route)? 1 : 0;
+		/* The per-interface SA pointers this was derived from belonged to
+		   the removed IPsec flow-cache model and were never populated in a
+		   no-flow-cache build, so this has reported 0 in every shipped
+		   binary. Kept explicit to preserve that behaviour; the bitfield
+		   itself stays for struct tunnel_info layout compatibility. */
+		pInfo->sa_programmed = 0;
 		if(itf->tunnel_family == AF_INET6)
 		{
 			memcpy(&pInfo->remote, &itf->tunnel_parm6.raddr.s6_addr, 16);

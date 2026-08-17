@@ -662,17 +662,11 @@ static void updatelink(struct interface_table *ctx, struct ifinfomsg *ifi, struc
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	__updatelink(ctx, ifi, tb, dellink);
 	__itf_update_connection(ctx->fci_handle, ifi->ifi_index);
 	mc_update_table(ctx->fci_handle, tb, ifi);
 
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -826,15 +820,9 @@ static int itf_table_update(struct interface_table *ctx)
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	rc = __itf_table_update(ctx);
 
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -917,9 +905,6 @@ int itf_get_ipaddr(int ifindex, int family, unsigned char scope, unsigned int *i
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	itf = __itf_get(ifindex);
 	if (!itf)
@@ -937,9 +922,6 @@ int itf_get_ipaddr(int ifindex, int family, unsigned char scope, unsigned int *i
 	}
 
 unlock:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -970,9 +952,6 @@ int itf_get_macaddr(int ifindex, unsigned char *macaddr)
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	itf = __itf_get(ifindex);
 	if (!itf)
@@ -982,9 +961,6 @@ int itf_get_macaddr(int ifindex, unsigned char *macaddr)
 
 
 unlock:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -1224,9 +1200,6 @@ int itf_is_programmed(int ifindex)
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	itf = __itf_get(ifindex);
 	if (!itf)
@@ -1235,9 +1208,6 @@ int itf_is_programmed(int ifindex)
 	rc = ____itf_is_programmed(itf);
 
 out:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);

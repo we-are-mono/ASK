@@ -45,11 +45,6 @@
 #endif
 	#define NEW_IPC		1
 
-/* defining IPSEC_FLOW_CACHE unless IPSEC_NO_FLOW_CACHE is defined in the cmm package makefile */
-#ifndef IPSEC_NO_FLOW_CACHE
-#define	IPSEC_FLOW_CACHE
-#endif
-	
 	typedef cmm_handle_t *daemon_handle_t;
 
 	#include "forward_engine.h"
@@ -121,11 +116,9 @@
 
 
 
-#ifndef IPSEC_FLOW_CACHE
 /* this macro indicates how many SAs information can be received per direction in netlink message */
 /* direction can be (FWD or IN) and OUT for originator and replier */
 #define MAX_SAs_INFO_PER_DIR_IN_NL_MSG 2
-#endif /* IPSEC_FLOW_CACHE */
 
 	#define CMM_PID_FILE_PATH "/var/run/cmm.pid"
 

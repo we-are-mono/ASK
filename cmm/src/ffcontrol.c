@@ -2435,9 +2435,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 		cli_register_command(ctx->handle, c, "stat", cmmShowStatCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show Statistics");
 		cli_register_command(ctx->handle, c, "sa_query_timer", cmmSaQueryTimerShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the DPD SA query timer configuration");
 		cli_register_command(ctx->handle, c, "sa", cmmSAShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the SA stored by CMM");
-#ifdef IPSEC_FLOW_CACHE
-		cli_register_command(ctx->handle, c, "sec-connections", cmmFlowLocalShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the local table of secure connections");
-#endif /* IPSEC_FLOW_CACHE */
 		cli_register_command(ctx->handle, c, "mc6", cmmMc6Show, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the table of V6 multicat listeners");
 		cli_register_command(ctx->handle, c, "mc4", cmmMc4Show, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the table of V4 multicat listeners");
 		cli_register_command(ctx->handle, c, "asym_fastforward", cmmAsymFFEnableShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the Asymmetric fast forward status");

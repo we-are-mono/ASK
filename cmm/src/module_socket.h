@@ -83,10 +83,6 @@ struct socket {
 	u_int16_t       expt_flag;
 	u_int16_t       rsvd;
 #endif //(LS1043)
-#if defined(COMCERTO_2000) || defined(LS1043)
-	struct FlowEntry *rx_flow;
-	struct FlowEntry *tx_flow;
-#endif
 };
 
 extern struct list_head socket_table[HASH_SOCKET_SIZE];

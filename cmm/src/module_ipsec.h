@@ -106,11 +106,7 @@ typedef struct _tIPSec_sainfo {
 
 struct SATable {
 	struct list_head 	list_by_h;
-#ifdef IPSEC_FLOW_CACHE
-	struct list_head	flow_list[MAX_SA_PER_FLOW];
-#else
 	struct list_head	ctentry_list[2]; /* originator and replier list */
-#endif /* IPSEC_FLOW_CACHE */
 	IPSec_sainfo		SAInfo;	
 	
 	struct flow 		Sa_flow;

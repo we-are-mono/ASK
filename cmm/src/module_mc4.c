@@ -485,9 +485,6 @@ out:
 			__pthread_mutex_lock(&ctMutex);
 			__pthread_mutex_lock(&rtMutex);
 			__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-			__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 			__pthread_mutex_lock(&mc_lock);
 			
 			res_buf[0] = fci_write(fci_handle, CMMD_CMD_MC4_RESET, 0, NULL);
@@ -495,9 +492,6 @@ out:
 				mc_reset(AF_INET);		
 
 			__pthread_mutex_unlock(&mc_lock);
-#ifdef IPSEC_FLOW_CACHE
-			__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 			__pthread_mutex_unlock(&neighMutex);
 			__pthread_mutex_unlock(&rtMutex);
 			__pthread_mutex_unlock(&ctMutex);

@@ -122,16 +122,10 @@ static struct SATable *__cmmSAAdd(PCommandIPSecCreateSA pSA_info)
 	newEntry->Sa_flow.proto = 0;
 	newEntry->Sa_flow.flow_flags = FLOWFLAG_SA_ROUTE;
 
-#ifdef IPSEC_FLOW_CACHE
-	/* Add it to the hash table */
-	for(i =0; i < MAX_SA_PER_FLOW; i++)
-		list_head_init(&newEntry->flow_list[i]);
-#else
 	/* init ctentries table */
 	for(i =0; i < 2; i++)
 		list_head_init(&newEntry->ctentry_list[i]);
 
-#endif /* IPSEC_FLOW_CACHE */
 	list_add(&sa_table[hash], &newEntry->list_by_h);
 
 err0:
@@ -339,9 +333,6 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	pSAEntry = __cmmSAFind(pSA_cmd->sagd);
 	if (!pSAEntry)
@@ -353,9 +344,7 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 	cmm_print(DEBUG_INFO, "%s(%d) SA %p, XFRM handle %x, SPI %x\n",
 		__func__,__LINE__,pSAEntry, pSA_cmd->sagd,pSAEntry->SAInfo.id.spi);
 	
-#ifndef IPSEC_FLOW_CACHE
 	pSAEntry->flags |= SA_DELETE;
-#endif
 	if(cmmUpdateFlows(pSAEntry) < 0)
 	{
 		rc = -1;
@@ -364,9 +353,6 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 	__cmmSARemove(fci_handle, pSAEntry);	
 
 out:	
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -387,9 +373,6 @@ int cmmSAFlush(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len,
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	
 	for (i = 0; i < SA_HASH_TABLE_SIZE; i++)
 	{
@@ -397,9 +380,7 @@ int cmmSAFlush(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len,
 		{
 			pSAEntry = container_of(entry, struct SATable, list_by_h);
 			entry = list_next(entry);
-#ifndef IPSEC_FLOW_CACHE
 			pSAEntry->flags |= SA_DELETE;
-#endif /* IPSEC_FLOW_CACHE */
 			if(cmmUpdateFlows(pSAEntry) < 0)
 			{
 				cmm_print(DEBUG_INFO,"%s Failed \n", __func__);
@@ -407,9 +388,6 @@ int cmmSAFlush(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len,
 			__cmmSARemove(fci_handle, pSAEntry);
 		}
 	}
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -450,9 +428,6 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	pSAEntry = __cmmSAFind(pSA_cmd->sagd);
 
@@ -476,9 +451,7 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 	pSAEntry->SAInfo.state = pSA_cmd->state;
 	if(pSA_cmd->state == SA_STATE_DYING)
 	{
-#ifndef IPSEC_FLOW_CACHE
 		pSAEntry->flags |= SA_DELETE;
-#endif /* IPSEC_FLOW_CACHE */
 		if(cmmUpdateFlows(pSAEntry) < 0)
 		{
 			rc = -1;
@@ -491,22 +464,17 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 	{
 		*state_valid = 1;
 		*sgid = pSAEntry->SAInfo.sagd;
-#ifndef IPSEC_FLOW_CACHE
 		if (pSA_cmd->parent_sa_sagd)
 		{
 			/* Find flows having rekey_sagd value,
 			update those with sagd value and new SA pointers */
 			cmmUpdateFlowsWithNewSAInfo(pSAEntry, pSA_cmd->parent_sa_sagd);
 		}
-#endif /* IPSEC_FLOW_CACHE */
 	}
 	else
 		*state_valid = 0;
 
 out:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -531,9 +499,6 @@ int cmmSASetTunnel(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short 
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	pSAEntry = __cmmSAFind(pSA_cmd->sagd);
 
 	if (!pSAEntry)
@@ -552,9 +517,6 @@ int cmmSASetTunnel(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short 
 	/* Find the route for tunnel and corresponding neighbor here */
 	rc = __cmmSATunnelRegister(fci_handle, pSAEntry);
 out:	
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&itf_table.lock);

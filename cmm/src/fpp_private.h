@@ -26,14 +26,10 @@
 #define FPP_CMD_IPV6_SOCK_UPDATE		0x0432
 
 
-/*------------- CtEntry/RtEntry/FLowEntry Flags ------------------------------*/
+/*------------- CtEntry/RtEntry Flags ----------------------------------------*/
 #define FPP_PROGRAMMED		(1 << 0)
 #define FPP_NEEDS_UPDATE	(1 << 1)
-/*------------- FlowEntry Flags ----------------------------------------------*/
-#ifndef IPSEC_NO_FLOW_CACHE
-#define	FLOW_NO_SA		(1 << 2)
-#endif
-/*------------- CtEntry/RtEntry Flags ----------------------------------------*/
+/* bit 2 was FLOW_NO_SA, a flag of the removed IPsec flow-cache model */
 #define INVALID			(1 << 3)
 #define RT_POLICY		(1 << 4)
 #define USER_ADDED		(1 << 5)
@@ -45,12 +41,10 @@
 #define LOCAL_CONN		(LOCAL_CONN_ORIG | LOCAL_CONN_REPL)
 
 #define	IS_LOCAL		(1 << 10)
-#ifdef IPSEC_NO_FLOW_CACHE
 #define	FLOW_NO_ORIG_SA		(1 << 11)
 #define	FLOW_NO_REPL_SA		(1 << 12)
 
 #define SA_DELETE			(1 << 13)
-#endif 
 #define SENT_PERMANENT_INFO	(1<<14)
 
 #define ADD             (1 << 0)

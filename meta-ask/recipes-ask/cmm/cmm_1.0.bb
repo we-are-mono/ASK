@@ -23,12 +23,13 @@ RDEPENDS:${PN} += "libasan libubsan"
 # Yocto's pkg-config wrapper + PKG_CONFIG_* env vars are injected by the
 # pkgconfig bbclass through the task environment. We only need to tell
 # cmm's Makefile where the static libfci + auto_bridge include tree are.
-# Extra defines that Armbian passes to CMM — keep identical so behavior
-# matches the production build. Passed via env so cmm/Makefile's
-# CFLAGS += ... appends (rather than its := overriding us).
-export CFLAGS = "-Wno-error -DLS1043 -DFLOW_STATS -DWIFI_ENABLE -DAUTO_BRIDGE \
-                 -DSEC_PROFILE_SUPPORT -DUSE_QOSCONNMARK -DENABLE_INGRESS_QOS \
-                 -DENABLE_EGRESS_QOS -DIPSEC_NO_FLOW_CACHE -DVLAN_FILTER"
+#
+# Deliberately NO `export CFLAGS` here. cmm/Makefile owns the single
+# authoritative feature-define list, so this recipe adds no defines and
+# there is only one list to keep correct. Letting OE's default CFLAGS
+# flow through unmodified also keeps the reproducible-build prefix-maps
+# and -pipe that an override would drop, and cmm/Makefile's `CFLAGS +=`
+# appends its own -O2 -g -Wall -Werror -fPIE on top.
 
 EXTRA_OEMAKE = " \
     CC='${CC}' \

@@ -1479,9 +1479,6 @@ int cmmRtnlRoute(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg)
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	/* Look for connections/tunnels using this route */
 	for (i = 0; i < ROUTE_HASH_TABLE_SIZE * 2; i++)
@@ -1512,9 +1509,6 @@ int cmmRtnlRoute(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg)
 	__cmmRouteNew(ctx->fci_handle, rtm, dAddr, flushed);
 
 unlock:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);

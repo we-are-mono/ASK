@@ -41,9 +41,6 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 {
 	int i;
 	struct ctTable *ctEntry;
-#ifdef IPSEC_FLOW_CACHE
-	struct FlowEntry *FlowEntry;
-#endif /* IPSEC_FLOW_CACHE */
 	struct RtEntry *rtEntry;
 	struct NeighborEntry *neigh;
 	struct socket *socket;
@@ -55,9 +52,6 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_lock(&socket_lock);
 	__pthread_mutex_lock(&brMutex);
 
@@ -87,17 +81,6 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 		}
 	}
 
-#ifdef IPSEC_FLOW_CACHE
-	for (i = 0; i < FLOW_HASH_TABLE_SIZE; i++)
-	{
-		while (!list_empty(&flow_table[i]))
-		{
-			entry = list_first(&flow_table[i]);
-			FlowEntry = container_of(entry, struct FlowEntry, list);
-			__cmmFlowRemove(FlowEntry);
-		}
-	}
-#endif /* IPSEC_FLOW_CACHE */
 
 	for (i = 0; i < 2 * ROUTE_HASH_TABLE_SIZE; i++)
 	{
@@ -135,9 +118,6 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 unlock:
 	__pthread_mutex_unlock(&brMutex);
 	__pthread_mutex_unlock(&socket_lock);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
@@ -361,91 +341,6 @@ int cmmFeCtUpdate4(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		 * the queue, DSCP marking parameters, and VLAN p-bit settings with the twin connection.
 		 */
 
-#ifdef IPSEC_FLOW_CACHE
-		if (ctEntry->fEntryOrigOut || ctEntry->fEntryOrigFwd)
-		{
-			unsigned char sa_nr = 0;
-
-			if (ctEntry->fEntryOrigOut)			
-			{
-				cmd.sa_dir |= FLOW_DIR_OUT_BITVAL;
-				sa_nr += ctEntry->fEntryOrigOut->sa_nr;
-			}
-
-			if (ctEntry->fEntryOrigFwd)			
-			{
-				cmd.sa_dir |= FLOW_DIR_FWD_BITVAL;
-				sa_nr += ctEntry->fEntryOrigFwd->sa_nr;
-			}
-
-			if (sa_nr > MAX_SA_PER_FLOW)
-			{
-				cmm_print(DEBUG_ERROR, "Number of SAs attached to the flow is more than MAX_SA_PER_FLOW: %d\n", sa_nr);
-				goto err;
-			}
-
-			cmd.sa_nr = sa_nr;
-			
-			if ( (cmd.sa_dir & ( FLOW_DIR_OUT_BITVAL | FLOW_DIR_FWD_BITVAL)) == ( FLOW_DIR_OUT_BITVAL | FLOW_DIR_FWD_BITVAL) )
-			{
-				cmd.sa_handle[0] = ctEntry->fEntryOrigFwd->sa_handle[0];
-				cmd.sa_handle[1] = ctEntry->fEntryOrigOut->sa_handle[0];
-				cmm_print(DEBUG_INFO, "Both decrypt and encrypt[%d]: %x-%x\n", sa_nr, cmd.sa_handle[0],cmd.sa_handle[1]);
-			}
-			else if (cmd.sa_dir &  FLOW_DIR_OUT_BITVAL )
-			{
-				memcpy(cmd.sa_handle, ctEntry->fEntryOrigOut->sa_handle, ctEntry->fEntryOrigOut->sa_nr * sizeof(unsigned short));
-				cmm_print(DEBUG_INFO, "Only encrypt[%d]: %x-%x\n", sa_nr, cmd.sa_handle[0],cmd.sa_handle[1]);
-			}
-			else
-			{
-				memcpy(cmd.sa_handle, ctEntry->fEntryOrigFwd->sa_handle, ctEntry->fEntryOrigFwd->sa_nr * sizeof(unsigned short));
-				cmm_print(DEBUG_INFO, "Only decrypt[%d]: %x-%x\n", sa_nr, cmd.sa_handle[0],cmd.sa_handle[1]);
-			}
-			cmd.format |= CT_SECURE;
-		}
-
-		if (ctEntry->fEntryRepOut || ctEntry->fEntryRepFwd)
-		{
-			unsigned char sa_reply_nr = 0;
-
-			if (ctEntry->fEntryRepFwd)
-			{
-				cmd.sa_reply_dir |= FLOW_DIR_FWD_BITVAL;
-				sa_reply_nr += ctEntry->fEntryRepFwd->sa_nr;
-			}
-			if (ctEntry->fEntryRepOut)
-			{
-				cmd.sa_reply_dir |= FLOW_DIR_OUT_BITVAL;
-				sa_reply_nr += ctEntry->fEntryRepOut->sa_nr;
-			}
-
-			if (sa_reply_nr > MAX_SA_PER_FLOW)
-			{
-				cmm_print(DEBUG_ERROR, "sa_reply nr ERRRRROR: %d\n", sa_reply_nr);
-				goto err;
-			}
-			cmd.sa_reply_nr = sa_reply_nr;
-			if ((cmd.sa_reply_dir & (FLOW_DIR_FWD_BITVAL | FLOW_DIR_OUT_BITVAL)) == (FLOW_DIR_OUT_BITVAL | FLOW_DIR_FWD_BITVAL))
-			{
-				cmd.sa_reply_handle[0] = ctEntry->fEntryRepFwd->sa_handle[0];
-				cmd.sa_reply_handle[1] = ctEntry->fEntryRepOut->sa_handle[0];
-				cmm_print(DEBUG_INFO, "Reply: Both decrypt and encrypt[%d]: %x-%x\n", sa_reply_nr, cmd.sa_reply_handle[0],cmd.sa_reply_handle[1]);
-			}
-			else if (cmd.sa_reply_dir & FLOW_DIR_OUT_BITVAL)
-			{
-				memcpy(cmd.sa_reply_handle, ctEntry->fEntryRepOut->sa_handle, ctEntry->fEntryRepOut->sa_nr * sizeof(unsigned short));
-				cmm_print(DEBUG_INFO, "Reply: Only encrypt[%d]: %x-%x\n", sa_reply_nr, cmd.sa_reply_handle[0],cmd.sa_reply_handle[1]);
-			}
-			else
-			{
-				memcpy(cmd.sa_reply_handle, ctEntry->fEntryRepFwd->sa_handle, ctEntry->fEntryRepFwd->sa_nr * sizeof(unsigned short));
-				cmm_print(DEBUG_INFO, "Reply: Only decrypt[%d]: %x-%x\n", sa_reply_nr, cmd.sa_reply_handle[0],cmd.sa_reply_handle[1]);
-			}
-
-			cmd.format |= CT_SECURE;
-		}
-#else
 		if (ctEntry->flags & FLOW_NO_ORIG_SA)
 		{
 			cmm_print(DEBUG_INFO, "%s(%d) NO FLOW SA , not setting SA related info\n",
@@ -497,7 +392,6 @@ proceedv4_if_flow_no_orig_sa:
 		}
 
 proceedv4_if_flow_no_repl_sa:
-#endif /* IPSEC_FLOW_CACHE */
 
 		if (cmd.format & CT_SECURE)
 		{
@@ -539,30 +433,6 @@ proceedv4_if_flow_no_repl_sa:
 
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_ALREADY_REGISTERED))
 		{
-#ifdef	IPSEC_FLOW_CACHE
-			if (ctEntry->fEntryOrigFwd)
-			{
-				ctEntry->fEntryOrigFwd->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryOrigFwd->flags &= ~FPP_NEEDS_UPDATE;
-			}
-			if (ctEntry->fEntryOrigOut)
-			{
-				ctEntry->fEntryOrigOut->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryOrigOut->flags &= ~FPP_NEEDS_UPDATE;
-			}
-
-			if (ctEntry->fEntryRepFwd)
-			{
-				ctEntry->fEntryRepFwd->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryRepFwd->flags &= ~FPP_NEEDS_UPDATE;
-			}
-
-			if (ctEntry->fEntryRepOut)
-			{
-				ctEntry->fEntryRepOut->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryRepOut->flags &= ~FPP_NEEDS_UPDATE;
-			}
-#endif /* IPSEC_FLOW_CACHE */
 			ctEntry->flags |= FPP_PROGRAMMED;
 			ctEntry->flags &= ~FPP_NEEDS_UPDATE;
 		}
@@ -580,17 +450,6 @@ proceedv4_if_flow_no_repl_sa:
 		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, cmd_size, &cmd);
 		if (ret == FPP_ERR_OK)
 		{
-#ifdef	IPSEC_FLOW_CACHE
-			if (ctEntry->fEntryOrigFwd)
-				ctEntry->fEntryOrigFwd->flags &= ~FPP_NEEDS_UPDATE;
-			if (ctEntry->fEntryOrigOut)
-				ctEntry->fEntryOrigOut->flags &= ~FPP_NEEDS_UPDATE;
-
-			if (ctEntry->fEntryRepFwd)
-				ctEntry->fEntryRepFwd->flags &= ~FPP_NEEDS_UPDATE;
-			if (ctEntry->fEntryRepOut)
-				ctEntry->fEntryRepOut->flags &= ~FPP_NEEDS_UPDATE;
-#endif /* IPSEC_FLOW_CACHE */
 			ctEntry->flags &= ~FPP_NEEDS_UPDATE;
 		}
 		else
@@ -609,17 +468,6 @@ proceedv4_if_flow_no_repl_sa:
 		ret = fci_write(fci_handler, FPP_CMD_IPV4_CONNTRACK, sizeof(fpp_ct_cmd_t), &cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_NOT_FOUND))
 		{
-#ifdef	IPSEC_FLOW_CACHE
-			if (ctEntry->fEntryOrigFwd)
-				ctEntry->fEntryOrigFwd->flags &= ~FPP_PROGRAMMED;
-			if (ctEntry->fEntryOrigOut)
-				ctEntry->fEntryOrigOut->flags &= ~FPP_PROGRAMMED;
-
-			if (ctEntry->fEntryRepFwd)
-				ctEntry->fEntryRepFwd->flags &= ~FPP_PROGRAMMED;
-			if (ctEntry->fEntryRepOut)
-				ctEntry->fEntryRepOut->flags &= ~FPP_PROGRAMMED;
-#endif /* IPSEC_FLOW_CACHE */
 
 			ctEntry->flags &= ~FPP_PROGRAMMED;
 		}
@@ -693,91 +541,6 @@ int cmmFeCtUpdate6(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 		 * the queue, DSCP marking parameters, and VLAN p-bit settings with the twin connection.
 		 */
 
-#ifdef	IPSEC_FLOW_CACHE
-		if (ctEntry->fEntryOrigFwd || ctEntry->fEntryOrigOut) {
-			unsigned char sa_nr = 0;
-
-                        if (ctEntry->fEntryOrigOut)
-                        {
-                                cmd.sa_dir |= FLOW_DIR_OUT_BITVAL;
-                                sa_nr += ctEntry->fEntryOrigOut->sa_nr;
-                        }
-
-                        if (ctEntry->fEntryOrigFwd)
-                        {
-                                cmd.sa_dir |= FLOW_DIR_FWD_BITVAL;
-                                sa_nr += ctEntry->fEntryOrigFwd->sa_nr;
-                        }
-
-                        if (sa_nr > MAX_SA_PER_FLOW)
-                        {
-                                cmm_print(DEBUG_ERROR, "Number of SAs attached to the flow is more than MAX_SA_PER_FLOW: %d\n", sa_nr);
-                                goto err;
-                        }
-
-                        cmd.sa_nr = sa_nr;
-
-                        if ( (cmd.sa_dir & ( FLOW_DIR_OUT_BITVAL | FLOW_DIR_FWD_BITVAL)) == ( FLOW_DIR_OUT_BITVAL | FLOW_DIR_FWD_BITVAL) )
-                        {
-                                cmd.sa_handle[0] = ctEntry->fEntryOrigFwd->sa_handle[0];
-                                cmd.sa_handle[1] = ctEntry->fEntryOrigOut->sa_handle[0];
-                                cmm_print(DEBUG_INFO, "Both decrypt and encrypt[%d]: %x-%x\n", sa_nr, cmd.sa_handle[0],cmd.sa_handle[1]);
-                        }
-                        else if (cmd.sa_dir &  FLOW_DIR_OUT_BITVAL )
-                        {
-                                memcpy(cmd.sa_handle, ctEntry->fEntryOrigOut->sa_handle, ctEntry->fEntryOrigOut->sa_nr * sizeof(unsigned short));
-                                cmm_print(DEBUG_INFO, "Only encrypt[%d]: %x-%x\n", sa_nr, cmd.sa_handle[0],cmd.sa_handle[1]);
-                        }
-                        else
-                        {
-                                memcpy(cmd.sa_handle, ctEntry->fEntryOrigFwd->sa_handle, ctEntry->fEntryOrigFwd->sa_nr * sizeof(unsigned short));
-                                cmm_print(DEBUG_INFO, "Only decrypt[%d]: %x-%x\n", sa_nr, cmd.sa_handle[0],cmd.sa_handle[1]);
-                        }
-                        cmd.format |= CT_SECURE;
-
-		}
-
-		if (ctEntry->fEntryRepOut || ctEntry->fEntryRepFwd)
-                {
-                        unsigned char sa_reply_nr = 0;
-
-                        if (ctEntry->fEntryRepFwd)
-                        {
-                                cmd.sa_reply_dir |= FLOW_DIR_FWD_BITVAL;
-                                sa_reply_nr += ctEntry->fEntryRepFwd->sa_nr;
-                        }
-                        if (ctEntry->fEntryRepOut)
-                        {
-                                cmd.sa_reply_dir |= FLOW_DIR_OUT_BITVAL;
-                                sa_reply_nr += ctEntry->fEntryRepOut->sa_nr;
-                        }
-
-                        if (sa_reply_nr > MAX_SA_PER_FLOW)
-                        {
-                                cmm_print(DEBUG_ERROR, "sa_reply nr ERRRRROR: %d\n", sa_reply_nr);
-                                goto err;
-                        }
-                        cmd.sa_reply_nr = sa_reply_nr;
-                        if ((cmd.sa_reply_dir & (FLOW_DIR_FWD_BITVAL | FLOW_DIR_OUT_BITVAL)) == (FLOW_DIR_OUT_BITVAL | FLOW_DIR_FWD_BITVAL))
-                        {
-                                cmd.sa_reply_handle[0] = ctEntry->fEntryRepFwd->sa_handle[0];
-                                cmd.sa_reply_handle[1] = ctEntry->fEntryRepOut->sa_handle[0];
-                                cmm_print(DEBUG_INFO, "Reply: Both decrypt and encrypt[%d]: %x-%x\n", sa_reply_nr, cmd.sa_reply_handle[0],cmd.sa_reply_handle[1]);
-                        }
-                        else if (cmd.sa_reply_dir & FLOW_DIR_OUT_BITVAL)
-                        {
-                                memcpy(cmd.sa_reply_handle, ctEntry->fEntryRepOut->sa_handle, ctEntry->fEntryRepOut->sa_nr * sizeof(unsigned short));
-                                cmm_print(DEBUG_INFO, "Reply: Only encrypt[%d]: %x-%x\n", sa_reply_nr, cmd.sa_reply_handle[0],cmd.sa_reply_handle[1]);
-                        }
-                        else
-                        {
-                                memcpy(cmd.sa_reply_handle, ctEntry->fEntryRepFwd->sa_handle, ctEntry->fEntryRepFwd->sa_nr * sizeof(unsigned short));
-                                cmm_print(DEBUG_INFO, "Reply: Only decrypt[%d]: %x-%x\n", sa_reply_nr, cmd.sa_reply_handle[0],cmd.sa_reply_handle[1]);
-                        }
-
-                        cmd.format |= CT_SECURE;
-                }
-#else
 		if (ctEntry->flags & FLOW_NO_ORIG_SA)
 		{
 			cmm_print(DEBUG_INFO, "%s(%d) NO FLOW SA , not setting SA related info\n",
@@ -830,7 +593,6 @@ proceedv6_if_flow_no_orig_sa:
 		
 
 proceedv6_if_flow_no_repl_sa:
-#endif /* IPSEC_FLOW_CACHE */
 		if (cmd.format & CT_SECURE) {
 			cmm_print(DEBUG_INFO, "IPv6 conntrack secure Orig dir:%x SAh(%d): %x : %x Repl dir:%x SAh(%d): %x : %x\n",
 					cmd.sa_dir, cmd.sa_nr, cmd.sa_handle[0], cmd.sa_handle[1], cmd.sa_reply_dir, cmd.sa_reply_nr, cmd.sa_reply_handle[0], cmd.sa_reply_handle[1]);
@@ -870,29 +632,6 @@ proceedv6_if_flow_no_repl_sa:
 
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_ALREADY_REGISTERED))
 		{
-#ifdef  IPSEC_FLOW_CACHE 
-			if (ctEntry->fEntryOrigOut)
-			{
-				ctEntry->fEntryOrigOut->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryOrigOut->flags &= ~FPP_NEEDS_UPDATE;
-			}
-			if (ctEntry->fEntryOrigFwd)
-			{
-				ctEntry->fEntryOrigFwd->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryOrigFwd->flags &= ~FPP_NEEDS_UPDATE;
-			}
-
-			if (ctEntry->fEntryRepOut)
-			{
-				ctEntry->fEntryRepOut->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryRepOut->flags &= ~FPP_NEEDS_UPDATE;
-			}
-			if (ctEntry->fEntryRepFwd)
-			{
-				ctEntry->fEntryRepFwd->flags |= FPP_PROGRAMMED;
-				ctEntry->fEntryRepFwd->flags &= ~FPP_NEEDS_UPDATE;
-			}
-#endif /* IPSEC_FLOW_CACHE */
 
 			ctEntry->flags |= FPP_PROGRAMMED;
 			ctEntry->flags &= ~FPP_NEEDS_UPDATE;
@@ -911,17 +650,6 @@ proceedv6_if_flow_no_repl_sa:
 		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, cmd_size, &cmd);
 		if (ret == FPP_ERR_OK)
 		{
-#ifdef  IPSEC_FLOW_CACHE 
-			if (ctEntry->fEntryOrigOut)
-				ctEntry->fEntryOrigOut->flags &= ~FPP_NEEDS_UPDATE;
-			if (ctEntry->fEntryOrigFwd)
-				ctEntry->fEntryOrigFwd->flags &= ~FPP_NEEDS_UPDATE;
-
-			if (ctEntry->fEntryRepOut)
-				ctEntry->fEntryRepOut->flags &= ~FPP_NEEDS_UPDATE;
-			if (ctEntry->fEntryRepFwd)
-				ctEntry->fEntryRepFwd->flags &= ~FPP_NEEDS_UPDATE;
-#endif /* IPSEC_FLOW_CACHE */
 
 			ctEntry->flags &= ~FPP_NEEDS_UPDATE;
 		}
@@ -940,17 +668,6 @@ proceedv6_if_flow_no_repl_sa:
 		ret = fci_write(fci_handler, FPP_CMD_IPV6_CONNTRACK, sizeof(fpp_ct6_cmd_t), &cmd);
 		if ((ret == FPP_ERR_OK) || (ret == FPP_ERR_CT_ENTRY_NOT_FOUND))
 		{
-#ifdef  IPSEC_FLOW_CACHE 
-			if (ctEntry->fEntryOrigOut)
-				ctEntry->fEntryOrigOut->flags &= ~FPP_PROGRAMMED;
-			if (ctEntry->fEntryOrigFwd)
-				ctEntry->fEntryOrigFwd->flags &= ~FPP_PROGRAMMED;
-
-			if (ctEntry->fEntryRepOut)
-				ctEntry->fEntryRepOut->flags &= ~FPP_PROGRAMMED;
-			if (ctEntry->fEntryRepFwd)
-				ctEntry->fEntryRepFwd->flags &= ~FPP_PROGRAMMED;
-#endif /* IPSEC_FLOW_CACHE */
 
 			ctEntry->flags &= ~FPP_PROGRAMMED;
 		}

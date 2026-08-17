@@ -15,9 +15,7 @@
 #include <net/if.h>
 #include <sys/time.h>
 #include "cmm.h"
-#ifndef IPSEC_FLOW_CACHE
 #include "linux/xfrm.h"
-#endif /* IPSEC_FLOW_CACHE */
 
 #include "itf.h"
 #include "ffbridge.h"
@@ -31,9 +29,7 @@ struct list_head ct_table_by_orig_route[2 * ROUTE_HASH_TABLE_SIZE];
 struct list_head ct_table_by_rep_route[2 * ROUTE_HASH_TABLE_SIZE];
 struct list_head ct_table_by_orig_tunnel_route[2 * ROUTE_HASH_TABLE_SIZE];
 struct list_head ct_table_by_rep_tunnel_route[2 * ROUTE_HASH_TABLE_SIZE];
-#ifndef IPSEC_FLOW_CACHE
 struct list_head ct_flow_no_sa_list;
-#endif /* IPSEC_FLOW_CACHE */
 
 struct conntrack_stats ct_stats;
 struct nf_conntrack *p_nfconn_clone, *p_nfconn_update;
@@ -210,13 +206,8 @@ int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 
 	for (i = 0 ; i < CONNTRACK_HASH_TABLE_SIZE; i++)
 	{
-#ifndef IPSEC_FLOW_CACHE
 		__pthread_mutex_lock(&sa_lock);
-#endif /* IPSEC_FLOW_CACHE */
         __pthread_mutex_lock(&ctMutex);
-#ifdef IPSEC_FLOW_CACHE
-		__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 		for(entry = list_first(&ct_table[i]); entry != &ct_table[i]; entry = list_next(entry))
 		{
@@ -237,28 +228,6 @@ int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 
 			nfct_set_attr_u32(temp->ct, ATTR_TIMEOUT, orig_timeout);
 
-#ifdef	IPSEC_FLOW_CACHE
-			if (temp->fEntryOrigFwd || temp->fEntryOrigOut)
-			{
-				len += snprintf(buf + len, 1024 - len, " IpSec:");
-				if (temp->fEntryOrigOut)
-					len += snprintf(buf + len, 1024 - len, " Orig OUT(sa_nr:%d H0:%04x)", temp->fEntryOrigOut->sa_nr, temp->fEntryOrigOut->sa_handle[0]);
-
-				if (temp->fEntryOrigFwd)
-					len += snprintf(buf + len, 1024 - len, " Orig FWD(sa_nr:%d H0:%04x)", temp->fEntryOrigFwd->sa_nr, temp->fEntryOrigFwd->sa_handle[0]);
-			}
-
-			if (temp->fEntryRepFwd || temp->fEntryRepOut)
-			{
-				len += snprintf(buf + len, 1024 - len, " IpSec:");
-				if (temp->fEntryRepOut)
-					len += snprintf(buf + len, 1024 - len, " Reply OUT(sa_nr:%d H0:%04x)", temp->fEntryRepOut->sa_nr, temp->fEntryRepOut->sa_handle[0]);
-
-				if (temp->fEntryRepFwd)
-					len += snprintf(buf + len, 1024 - len, " Reply FWD(sa_nr:%d H0:%04x)", temp->fEntryRepFwd->sa_nr, temp->fEntryRepFwd->sa_handle[0]);
-			}
-
-#else
 			if (temp->fEntryOrigFwdSA || temp->fEntryOrigOutSA)
 			{
 				len += snprintf(buf + len, 1024 - len, " IpSec:");
@@ -278,20 +247,14 @@ int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 				if (temp->fEntryRepFwdSA)
 					snprintf(buf + len, 1024 - len, " Reply FWD(sa_nr:1 H0:%04x)", temp->fEntryRepFwdSA->SAInfo.sagd);
 			}
-#endif /* IPSEC_FLOW_CACHE */
 			cli_print(cli, "%s, Flags: %x, n_id: %d, local-conn: %s", buf, temp->flags, temp->n_id, ((temp->flags & LOCAL_CONN) ? "yes" : "no"));
 
 			if (temp->n_id > 1)
 				nb_mult_ids++;
 		}
 
-#ifdef IPSEC_FLOW_CACHE
-		__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 		__pthread_mutex_unlock(&ctMutex);
-#ifndef IPSEC_FLOW_CACHE
 		__pthread_mutex_unlock(&sa_lock);
-#endif /* IPSEC_FLOW_CACHE */
 
 		/* Give a chance to other processes waiting for the lock */
 		if (!(i % 100))
@@ -469,7 +432,6 @@ err0:
 ******************************************************************/
 void __cmmCtRemove(struct ctTable *ctEntry)
 {
-#ifndef IPSEC_FLOW_CACHE
 	int ii;
 
 	/* remove ctEntry from SAs lists */
@@ -485,7 +447,6 @@ void __cmmCtRemove(struct ctTable *ctEntry)
 	ctEntry->fEntryRepFwdSA = NULL;
 	ctEntry->fEntryRepOutSA = NULL;
 	list_del(&ctEntry->flow_no_sa_list_node);
-#endif /* IPSEC_FLOW_CACHE */
 
 	ct_stats.current--;
 
@@ -1260,7 +1221,6 @@ int ____cmmCtLocalRegister(FCI_CLIENT *fci_handle, struct ctTable* ctEntry)
 	return 0;
 }
 
-#ifndef IPSEC_FLOW_CACHE
 
 /* this function is called for each SA_INFO received in conntrack message,
    if there is a matching SA for given SA_INFO, that SA pointer gets
@@ -1387,13 +1347,13 @@ static void cmm_ct_fill_ipsec_info(struct ctTable *ctEntry, uint16_t *orig_xfrm_
 	if (orig_xfrm_handle && ((__cmm_ct_get_num_per_dir_ipsec_SAs(orig_xfrm_handle) > 1 ) ||
 		(__cmm_ct_get_num_per_dir_ipsec_SAs(orig_xfrm_handle+MAX_SAs_INFO_PER_DIR_IN_NL_MSG) > 1 )))
 	{
-		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_SA\n",__func__,__LINE__);
+		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_ORIG_SA\n",__func__,__LINE__);
 		ctEntry->flags |=  FLOW_NO_ORIG_SA;
 	}
 	if (rep_xfrm_handle && ((__cmm_ct_get_num_per_dir_ipsec_SAs(rep_xfrm_handle) > 1 ) ||
 		(__cmm_ct_get_num_per_dir_ipsec_SAs(rep_xfrm_handle+MAX_SAs_INFO_PER_DIR_IN_NL_MSG) > 1 )))
 	{
-		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_SA\n",__func__,__LINE__);
+		cmm_print(DEBUG_ERROR, "%s(%d) multiple SAs per flow, setting flag FLOW_NO_REPL_SA\n",__func__,__LINE__);
 		ctEntry->flags |=  FLOW_NO_REPL_SA;
 	}	
 
@@ -1432,7 +1392,6 @@ uint8_t cmmCheckIfCtEntryWithSGID(struct ctTable *ctEntry, unsigned short sgid)
 	return 0;
 }
 
-#endif /* IPSEC_FLOW_CACHE */
 /*****************************************************************
 * ____cmmCtRegister
 *
@@ -1444,13 +1403,7 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 	struct nf_conntrack *ctTemp = NULL;
 	int dir = ctEntry->dir;
 	const unsigned int *sAddrOrig, *sAddrRepl;
-#ifdef IPSEC_FLOW_CACHE
-	const unsigned int *dAddrOrig, *dAddrRepl;
-	unsigned char proto;
-	unsigned short dPortOrig, dPortRepl, sPortOrig, sPortRepl;
-#else
 	unsigned short	*orig_xfrm_handle, *rep_xfrm_handle;
-#endif
 	struct flow flow;
 	void *tmp;
 	int key;
@@ -1460,35 +1413,18 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 	struct RtEntry *route;
 	struct SATable *SAEntry = NULL;
 
-#ifdef IPSEC_FLOW_CACHE
-	proto = nfct_get_attr_u8(ct, ATTR_ORIG_L4PROTO);
-#endif 
 
 	if (ctEntry->family == AF_INET)
 	{
 		sAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV4_SRC);
 		sAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV4_SRC);
-#ifdef IPSEC_FLOW_CACHE
-		dAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV4_DST);
-		dAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV4_DST);
-#endif
 	}
 	else
 	{
 		sAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV6_SRC);
 		sAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV6_SRC);
-#ifdef IPSEC_FLOW_CACHE
-		dAddrOrig = nfct_get_attr(ct, ATTR_ORIG_IPV6_DST);
-		dAddrRepl = nfct_get_attr(ct, ATTR_REPL_IPV6_DST);
-#endif
 	}
 
-#ifdef IPSEC_FLOW_CACHE
-	sPortOrig = nfct_get_attr_u16(ct, ATTR_ORIG_PORT_SRC);
-	sPortRepl = nfct_get_attr_u16(ct, ATTR_REPL_PORT_SRC);
-	dPortOrig = nfct_get_attr_u16(ct, ATTR_ORIG_PORT_DST);
-	dPortRepl = nfct_get_attr_u16(ct, ATTR_REPL_PORT_DST);
-#endif
 
 	if (dir & ORIGINATOR)
 	{
@@ -1513,7 +1449,6 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 		}
 		
 		// Is this CT secure ?
-#ifndef IPSEC_FLOW_CACHE
 		orig_xfrm_handle = (unsigned short *)nfct_get_attr(ct,ATTR_ORIG_COMCERTO_FP_XFRM_HANDLE);
 		rep_xfrm_handle = (unsigned short *)nfct_get_attr(ct,ATTR_REPL_COMCERTO_FP_XFRM_HANDLE);
 		
@@ -1540,7 +1475,7 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 			if ((ctEntry->flags & FLOW_NO_ORIG_SA)  ||
 				(ctEntry->flags & FLOW_NO_REPL_SA))
 			{
-				/* if ctEntry has FLOW_NO_SA flag set and 
+				/* if ctEntry has FLOW_NO_ORIG_SA or FLOW_NO_REPL_SA set and
 				   this func not called from cmmUpdateCtEntriesInFlowNoSAList,
 				   add it in flow_no_sa_list  */
 				list_add(&ct_flow_no_sa_list, &ctEntry->flow_no_sa_list_node);
@@ -1551,42 +1486,11 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 			ctEntry->fEntryRepFwdSA, ctEntry->fEntryRepOutSA);
 		if ((ctEntry->flags & FLOW_NO_ORIG_SA) == FLOW_NO_ORIG_SA) 
 		{
-			/* if ctEntry has FLOW_NO_SA flag set and 
-			   this func not called from cmmUpdateCtEntriesInFlowNoSAList,
-			   add it in flow_no_sa_list  */
+			/* no usable originator SA — skip the originator direction and
+			   only program the replier */
 			dir &= ~ORIGINATOR;
 			goto replier;
-		} 
-#else
-		/* If a packet is SNATed, then only IPSec policies which are based on the SNATed IP addresses are applied
-		   on the packet. So  IPSec flows with SNATed IP addresses must be looked up if connection is SNATed */
-		// Is this CT secure ?
-		/* If a packet is SNATed, then only IPSec policies which are based on the SNATed IP addresses are applied
-		   on the packet. So  IPSec flows with SNATed IP addresses must be looked up if connection is SNATed */
-		if(memcmp(sAddrOrig, dAddrRepl, IPADDRLEN(ctEntry->family)))
-		{
-			if (!ctEntry->fEntryOrigOut)
-				ctEntry->fEntryOrigOut = __cmmFlowGet(ctEntry->family, dAddrRepl, sAddrRepl, dPortRepl, sPortRepl, proto, FLOW_DIR_OUT);
-
-			if (!ctEntry->fEntryOrigFwd)
-				ctEntry->fEntryOrigFwd = __cmmFlowGet(ctEntry->family, dAddrRepl, sAddrRepl, dPortRepl, sPortRepl, proto, FLOW_DIR_FWD);
 		}
-		else
-		{
-			if (!ctEntry->fEntryOrigOut)
-				ctEntry->fEntryOrigOut = __cmmFlowGet(ctEntry->family, sAddrOrig, dAddrOrig, sPortOrig, dPortOrig, proto, FLOW_DIR_OUT);
-
-			if (!ctEntry->fEntryOrigFwd)
-				ctEntry->fEntryOrigFwd = __cmmFlowGet(ctEntry->family, sAddrOrig, dAddrOrig, sPortOrig, dPortOrig, proto, FLOW_DIR_FWD);
-		}
-
-		if ((ctEntry->fEntryOrigOut && (ctEntry->fEntryOrigOut->flags & FLOW_NO_SA) == FLOW_NO_SA) ||
-		    (ctEntry->fEntryOrigFwd && (ctEntry->fEntryOrigFwd->flags & FLOW_NO_SA) == FLOW_NO_SA)) 
-		{
-			dir &= ~ORIGINATOR;
-			goto replier;
-		} 
-#endif /* IPSEC_FLOW_CACHE */
 		flow.family = ctEntry->family;
 		flow.sAddr = sAddrOrig;
 		flow.dAddr = sAddrRepl;
@@ -1602,24 +1506,11 @@ int ____cmmCtRegister(FCI_CLIENT *fci_handle, struct ctTable *ctEntry)
 		flow.fwmark = nfct_get_attr_u32(ct, ATTR_ORIG_COMCERTO_FP_MARK);
 		flow.flow_flags = 0;
 
-#ifdef IPSEC_FLOW_CACHE
-		if (ctEntry->fEntryOrigOut && ctEntry->fEntryOrigOut->ignore_neigh)
-		{
-			SAEntry = __cmmSAFind(ctEntry->fEntryOrigOut->sa_handle[0]);
-			if(!SAEntry)
-			{
-				dir &= ~ORIGINATOR;
-				goto replier;
-			}
-			flow.flow_flags |= FLOWFLAG_IGNORE_NEIGH;
-		}
-#else
 		if (ctEntry->fEntryOrigOutSA)
 		{
 			SAEntry =  ctEntry->fEntryOrigOutSA;
 			flow.flow_flags |= FLOWFLAG_IGNORE_NEIGH;
 		}
-#endif /* IPSEC_FLOW_CACHE */
 
 		if (__cmmRouteRegister(&ctEntry->orig, &flow, "originator") < 0)
 		{
@@ -1679,40 +1570,11 @@ replier:
 			goto program;
 		}
 
-#ifdef IPSEC_FLOW_CACHE
-		// Is this CT secure ?
-		/* If a packet is DNATed, then only IPSec policies which are based on the DNATed IP addresses are applied
-		   on the packet. So  IPSec flows with DNATed IP addresses must be looked up if connection is DNATed */
-		if(memcmp(sAddrRepl, dAddrOrig, IPADDRLEN(ctEntry->family)))
-		{
-			if (!ctEntry->fEntryRepOut)
-				ctEntry->fEntryRepOut = __cmmFlowGet(ctEntry->family, dAddrOrig, sAddrOrig, dPortOrig, sPortOrig, proto, FLOW_DIR_OUT);
-
-			if (!ctEntry->fEntryRepFwd)
-				ctEntry->fEntryRepFwd = __cmmFlowGet(ctEntry->family, dAddrOrig, sAddrOrig, dPortOrig, sPortOrig, proto, FLOW_DIR_FWD);
-		}
-		else
-		{
-			if (!ctEntry->fEntryRepOut)
-				ctEntry->fEntryRepOut = __cmmFlowGet(ctEntry->family, sAddrRepl, dAddrRepl, sPortRepl, dPortRepl, proto, FLOW_DIR_OUT);
-
-			if (!ctEntry->fEntryRepFwd)
-				ctEntry->fEntryRepFwd = __cmmFlowGet(ctEntry->family, sAddrRepl, dAddrRepl, sPortRepl, dPortRepl, proto, FLOW_DIR_FWD);
-		}
-
-		if ((ctEntry->fEntryRepOut && (ctEntry->fEntryRepOut->flags & FLOW_NO_SA) == FLOW_NO_SA) ||
-		    (ctEntry->fEntryRepFwd && (ctEntry->fEntryRepFwd->flags & FLOW_NO_SA) == FLOW_NO_SA)) 
-		{
-			dir &= ~REPLIER;
-			goto program;
-		}
-#else
 		if ((ctEntry->flags & FLOW_NO_REPL_SA) == FLOW_NO_REPL_SA)
 		{
 			dir &= ~REPLIER;
 			goto program;
 		} 
-#endif /* IPSEC_FLOW_CACHE */
 		flow.family = ctEntry->family;
 		flow.sAddr = sAddrRepl;
 		flow.dAddr = sAddrOrig;
@@ -1728,24 +1590,11 @@ replier:
 		flow.fwmark = nfct_get_attr_u32(ct, ATTR_REPL_COMCERTO_FP_MARK);
 		flow.flow_flags = 0;
 
-#ifdef IPSEC_FLOW_CACHE
-		if (ctEntry->fEntryRepOut && ctEntry->fEntryRepOut->ignore_neigh)
-		{
-			SAEntry = __cmmSAFind(ctEntry->fEntryRepOut->sa_handle[0]);
-			if(!SAEntry)
-			{
-				dir &= ~REPLIER;
-				goto program;
-			}
-			flow.flow_flags |= FLOWFLAG_IGNORE_NEIGH;
-		}
-#else
 		if (ctEntry->fEntryRepOutSA)
 		{
 			SAEntry =  ctEntry->fEntryRepOutSA;
 			flow.flow_flags |= FLOWFLAG_IGNORE_NEIGH;
 		}
-#endif /* IPSEC_FLOW_CACHE */
 
 		if (__cmmRouteRegister(&ctEntry->rep, &flow, "replier") < 0)
 		{
@@ -2026,15 +1875,9 @@ static int __cmmCtRegister(FCI_CLIENT *fci_handle, struct nfct_handle *handle, s
 	ctEntry->dir = dir;
 
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	____cmmCtRegister(fci_handle, ctEntry);
 
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 
@@ -2203,43 +2046,6 @@ int ____cmmCtDeregister(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, stru
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-
-	// Flow cache entry remove
-	if (ctEntry->fEntryOrigOut)
-		if (!cmmFlowKeyEngineRemove(fci_key_handle, ctEntry->fEntryOrigOut))
-		{
-			__cmmFlowPut(ctEntry->fEntryOrigOut);
-
-			ctEntry->fEntryOrigOut = NULL;
-		}
-
-	if (ctEntry->fEntryOrigFwd)
-		if (!cmmFlowKeyEngineRemove(fci_key_handle, ctEntry->fEntryOrigFwd))
-		{
-			__cmmFlowPut(ctEntry->fEntryOrigFwd);
-
-			ctEntry->fEntryOrigFwd = NULL;
-		}
-
-	if (ctEntry->fEntryRepOut)
-		if (!cmmFlowKeyEngineRemove(fci_key_handle, ctEntry->fEntryRepOut))
-		{
-			__cmmFlowPut(ctEntry->fEntryRepOut);
-
-			ctEntry->fEntryRepOut = NULL;
-		}
-
-	if (ctEntry->fEntryRepFwd)
-		if (!cmmFlowKeyEngineRemove(fci_key_handle, ctEntry->fEntryRepFwd))
-		{
-			__cmmFlowPut(ctEntry->fEntryRepFwd);
-
-			ctEntry->fEntryRepFwd = NULL;
-		}
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 ct_remove:
 	if (!rc)
@@ -3087,12 +2893,7 @@ int cmmCtInit(struct cmm_ct *ctx)
 		list_head_init(&ct_table_by_rep[i]);
 	}
 
-#ifdef IPSEC_FLOW_CACHE
-	for (i = 0; i < FLOW_HASH_TABLE_SIZE; i++)
-		list_head_init(&flow_table[i]);
-#else
 	list_head_init(&ct_flow_no_sa_list);
-#endif /* IPSEC_FLOW_CACHE */
 
 	for (i = 0; i < 2 * NEIGHBOR_HASH_TABLE_SIZE; i++)
 	{
@@ -3690,9 +3491,6 @@ static int cmmCtChange(FCI_CLIENT *fci_handle, int function_code, u_int8_t *cmd_
 
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	rc = ____cmmCtRegister(fci_handle, ctEntry);
 	if (rc == 0)
@@ -3701,9 +3499,6 @@ static int cmmCtChange(FCI_CLIENT *fci_handle, int function_code, u_int8_t *cmd_
 		*res_len = 2;
 	}
 
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 

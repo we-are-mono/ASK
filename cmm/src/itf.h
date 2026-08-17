@@ -220,8 +220,6 @@ struct interface {
 
 	struct ct_route rt;		/* Route information if tunnel interface */
 
-	struct FlowEntry *flow_orig;	/* Flow information for outgoing traffic */
-	struct FlowEntry *flow_rep;	/* Flow information for incoming traffic */
 	union {
 		struct ip6_tnl_parm tunnel_parm6;
 		struct ip_tunnel_parm tunnel_parm4;

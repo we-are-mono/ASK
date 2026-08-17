@@ -19,137 +19,6 @@
 
 
 #define MAX_SA_BUNDLE 4
-#ifdef IPSEC_FLOW_CACHE
-#define FLOW_HASH_TABLE_SIZE	CONNTRACK_HASH_TABLE_SIZE	// uses HASH_CT macros for keys
-
-struct flowi_tunnel {
-        __u64                  tun_id;
-};
-
-typedef struct {
-	uid_t val;
-} kuid_t;
-
-struct flowi_common {
-	int	flowic_oif;
-	int	flowic_iif;
-	__u32	flowic_mark;
-	__u8	flowic_tos;
-	__u8	flowic_scope;
-	__u8	flowic_proto;
-	__u8	flowic_flags;
-	#define FLOWI_FLAG_ANYSRC		0x01
-	#define FLOWI_FLAG_KNOWN_NH		0x02
-	#define FLOWI_FLAG_SKIP_NH_OIF          0x04
-	__u32	flowic_secid;
-	struct flowi_tunnel flowic_tun_key;
-	kuid_t  flowic_uid;
-};
-
-union flowi_uli {
-	struct {
-		__be16	dport;
-		__be16	sport;
-	} ports;
-	
-	struct {
-		__u8	type;
-		__u8	code;
-	} icmpt;
-	
-	struct {
-		__le16	dport;
-		__le16	sport;
-	} dnports;
-	
-	__be32		spi;
-	__be32		gre_key;
-	
-	struct {
-		__u8	type;
-	} mht;
-};
-
-struct flowi4 {
-	struct flowi_common	__fl_common;
-	#define flowi4_oif		__fl_common.flowic_oif
-	#define flowi4_iif		__fl_common.flowic_iif
-	#define flowi4_mark		__fl_common.flowic_mark
-	#define flowi4_tos		__fl_common.flowic_tos
-	#define flowi4_scope		__fl_common.flowic_scope
-	#define flowi4_proto		__fl_common.flowic_proto
-	#define flowi4_flags		__fl_common.flowic_flags
-	#define flowi4_secid		__fl_common.flowic_secid
-	#define flowi4_tun_key          __fl_common.flowic_tun_key
-	/* (saddr,daddr) must be grouped, same order as in IP header */
-	__be32			saddr;
-	__be32			daddr;
-	union flowi_uli		uli;
-	#define fl4_sport		uli.ports.sport
-	#define fl4_dport		uli.ports.dport
-	#define fl4_icmp_type		uli.icmpt.type
-	#define fl4_icmp_code		uli.icmpt.code
-	#define fl4_ipsec_spi		uli.spi
-	#define fl4_mh_type		uli.mht.type
-	#define fl4_gre_key		uli.gre_key
-}__attribute__((__aligned__(8)));
-
-struct flowi6 {
-	struct flowi_common	__fl_common;
-	#define flowi6_oif		__fl_common.flowic_oif
-	#define flowi6_iif		__fl_common.flowic_iif
-	#define flowi6_mark		__fl_common.flowic_mark
-	#define flowi6_scope		__fl_common.flowic_scope
-	#define flowi6_proto		__fl_common.flowic_proto
-	#define flowi6_flags		__fl_common.flowic_flags
-	#define flowi6_secid		__fl_common.flowic_secid
-	struct in6_addr		daddr;
-	struct in6_addr		saddr;
-	__be32			flowlabel;
-	union flowi_uli		uli;
-	#define fl6_sport		uli.ports.sport
-	#define fl6_dport		uli.ports.dport
-	#define fl6_icmp_type		uli.icmpt.type
-	#define fl6_icmp_code		uli.icmpt.code
-	#define fl6_ipsec_spi		uli.spi
-	#define fl6_mh_type		uli.mht.type
-	#define fl6_gre_key		uli.gre_key
-	__u32                   mp_hash;
-}__attribute__((__aligned__(8)));
-
-struct flowi {
-	union {
-		struct flowi_common	__fl_common;
-		struct flowi4		ip4;
-		struct flowi6		ip6;
-	} u;
-	#define flowi_oif	u.__fl_common.flowic_oif
-	#define flowi_iif	u.__fl_common.flowic_iif
-	#define flowi_mark	u.__fl_common.flowic_mark
-	#define flowi_tos	u.__fl_common.flowic_tos
-	#define flowi_scope	u.__fl_common.flowic_scope
-	#define flowi_proto	u.__fl_common.flowic_proto
-	#define flowi_flags	u.__fl_common.flowic_flags
-	#define flowi_secid	u.__fl_common.flowic_secid
-};
-
-
-struct FlowEntry
-{
-	struct list_head list;
-	struct list_head list_by_sa[MAX_SA_PER_FLOW];
-	struct flowi  fl;
-	unsigned char sa_nr;
-	unsigned short family;
-	unsigned short dir;
-	unsigned short ignore_neigh;
-	int flags;
-	unsigned short sa_handle[MAX_SA_BUNDLE];
-	unsigned int ref_count;
-};
-
-
-#endif /* IPSEC_FLOW_CACHE */
 typedef struct netkey_sa_update_cmd{
 	unsigned short sagd;
 	unsigned short rsvd;
@@ -211,26 +80,12 @@ typedef struct netkey_sa_update_cmd{
 
 
 extern pthread_mutex_t flowMutex;
-#ifdef IPSEC_FLOW_CACHE
-extern struct  list_head flow_table[FLOW_HASH_TABLE_SIZE];
-#endif
 
 int cmmKeyCatch(unsigned short fcode, unsigned short len, unsigned short *payload);
 int cmmKeyEnginetoIPSec(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, void *payload);
 int cmmIPSectoKeyEngine(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, void *payload);
-#ifdef IPSEC_FLOW_CACHE
-int cmmFlowKeyEngineRemove(FCI_CLIENT *fci_handle, struct FlowEntry *fentry);
-
-struct FlowEntry *__cmmFlowFind(int family, const unsigned int *Saddr, const unsigned int *Daddr, unsigned short Sport, unsigned short Dport, unsigned char proto, unsigned short dir);
-void __cmmFlowRemove(struct FlowEntry *flow);
-struct FlowEntry *__cmmFlowAdd(int family, struct flowi *fl, unsigned char sa_nr, unsigned short *sa_handle, unsigned short dir);
-struct FlowEntry *__cmmFlowGet(int family, const unsigned int *Saddr, const unsigned int *Daddr, unsigned short Sport, unsigned short Dport, unsigned char proto, unsigned short dir);
-void __cmmFlowPut(struct FlowEntry *flow);
-#endif
 int cmmUpdateFlows(struct SATable *pSAEntry);
-#ifndef IPSEC_FLOW_CACHE
 int cmmUpdateFlowsWithNewSAInfo(struct SATable *pNewSAEntry,unsigned short old_xfrm_handle);
-#endif /* IPSEC_FLOW_CACHE */
 
 int cmmDPDSaQuerySetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 int cmmSaQueryTimerShow(struct cli_def * cli, const char *command, char *argv[], int argc);

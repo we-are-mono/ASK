@@ -108,16 +108,6 @@ static inline int cmmFeCtUpdate(FCI_CLIENT *fci_handle, int request, struct ctTa
 			action = FPP_ACTION_REGISTER;
 		else if (ctEntry->flags & FPP_NEEDS_UPDATE)
 			action = FPP_ACTION_UPDATE;
-#ifdef IPSEC_FLOW_CACHE
-		else if (ctEntry->fEntryOrigOut && (!(ctEntry->fEntryOrigOut->flags & FPP_PROGRAMMED) || (ctEntry->fEntryOrigOut->flags & FPP_NEEDS_UPDATE)))
-			action = FPP_ACTION_UPDATE;
-		else if (ctEntry->fEntryOrigFwd && (!(ctEntry->fEntryOrigFwd->flags & FPP_PROGRAMMED) || (ctEntry->fEntryOrigFwd->flags & FPP_NEEDS_UPDATE)))
-			action = FPP_ACTION_UPDATE;
-		else if (ctEntry->fEntryRepOut && (!(ctEntry->fEntryRepOut->flags & FPP_PROGRAMMED) || (ctEntry->fEntryRepOut->flags & FPP_NEEDS_UPDATE)))
-			action = FPP_ACTION_UPDATE;
-		else if (ctEntry->fEntryRepFwd && (!(ctEntry->fEntryRepFwd->flags & FPP_PROGRAMMED) || (ctEntry->fEntryRepFwd->flags & FPP_NEEDS_UPDATE)))
-			action = FPP_ACTION_UPDATE;
-#endif /* IPSEC_FLOW_CACHE */
 		else
 			goto out;
 

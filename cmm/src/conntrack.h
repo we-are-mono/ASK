@@ -43,27 +43,17 @@
 		struct list_head list_by_orig_tunnel_route;
 
 		struct list_head list_by_rep_tunnel_route;
-#ifndef	IPSEC_FLOW_CACHE
 		struct list_head	list_by_sa[4];
 		struct list_head	flow_no_sa_list_node;
 		struct SATable		*fEntryOrigFwdSA;
 		struct SATable		*fEntryOrigOutSA;
 		struct SATable		*fEntryRepFwdSA;
 		struct SATable		*fEntryRepOutSA;
-#endif
 
 		struct nf_conntrack * ct;
 
 		struct ct_route		orig;
-#ifdef	IPSEC_FLOW_CACHE
-		struct FlowEntry	*fEntryOrigOut;
-		struct FlowEntry	*fEntryOrigFwd;
-#endif
 		struct ct_route		rep;
-#ifdef	IPSEC_FLOW_CACHE
-		struct FlowEntry	*fEntryRepOut;
-		struct FlowEntry	*fEntryRepFwd;
-#endif
 		struct ct_route		orig_tunnel;
 
 		struct ct_route		rep_tunnel;
@@ -146,7 +136,6 @@
 	int cmmCtHandle(FCI_CLIENT *fci_handle, int function_code, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);
 
 	int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc);
-	int cmmFlowLocalShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 
 	u_int64_t cmmQosmarkGet(struct nf_conntrack *ct);
 	void cmmQosmarkSet(struct nf_conntrack *ct, u_int64_t qosmark);

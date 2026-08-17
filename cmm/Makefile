@@ -19,7 +19,16 @@ CFLAGS  += $(NFCT_CFLAGS)
 CFLAGS  += -I$(SRCDIR)
 CFLAGS  += -I$(LIBFCI_DIR)/include
 CFLAGS  += -I$(ABM_DIR)/include
-CFLAGS  += -DAUTO_BRIDGE -DLS1043 -DWIFI_ENABLE -DENABLE_EGRESS_QOS
+# Single authoritative feature-define list for cmm. Every build path — the
+# top-level `make userspace` and the OE recipe (meta-ask/recipes-ask/cmm/
+# cmm_1.0.bb) — compiles this exact profile; the recipe intentionally adds
+# no defines of its own, so there is only one list to keep correct.
+# ENABLE_EGRESS_QOS is our deliberate addition to NXP's documented set.
+# The IPsec flow-cache model was removed, so the no-flow-cache behavior is
+# now unconditional and IPSEC_NO_FLOW_CACHE is no longer defined anywhere.
+CFLAGS  += -DAUTO_BRIDGE -DLS1043 -DWIFI_ENABLE -DFLOW_STATS \
+           -DSEC_PROFILE_SUPPORT -DUSE_QOSCONNMARK -DENABLE_INGRESS_QOS \
+           -DENABLE_EGRESS_QOS -DVLAN_FILTER
 
 LDFLAGS += -L$(LIBFCI_DIR) -L$(SYSROOT)/lib
 LDLIBS  := -lpthread -lfci -lcli $(NFCT_LIBS) -lmnl

@@ -199,6 +199,9 @@ typedef struct fpp_socket4_open_cmd {
     u_int16_t	iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
 #endif //LS1043
     u_int16_t   secure;         /* unused, reserved: layout placeholder */
+    /* sa_nr_* / sa_handle_* below are unused, reserved: layout placeholders.
+       They were populated by the removed IPsec flow-cache model; the fields
+       stay because this command's on-the-wire layout is fixed. */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
@@ -221,6 +224,9 @@ typedef struct fpp_socket4_update_cmd {
     u_int16_t       rsvd3;
 #endif //LS1043
     u_int16_t   secure;         /* unused, reserved: layout placeholder */
+    /* sa_nr_* / sa_handle_* below are unused, reserved: layout placeholders.
+       They were populated by the removed IPsec flow-cache model; the fields
+       stay because this command's on-the-wire layout is fixed. */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
@@ -250,6 +256,9 @@ typedef struct fpp_socket6_open_cmd {
     u_int16_t	iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
 #endif //LS1043
     u_int16_t   secure;         /* unused, reserved: layout placeholder */
+    /* sa_nr_* / sa_handle_* below are unused, reserved: layout placeholders.
+       They were populated by the removed IPsec flow-cache model; the fields
+       stay because this command's on-the-wire layout is fixed. */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
@@ -272,6 +281,9 @@ typedef struct fpp_socket6_update_cmd {
     u_int16_t       rsvd3;
 #endif //LS1043
     u_int16_t   secure;         /* unused, reserved: layout placeholder */
+    /* sa_nr_* / sa_handle_* below are unused, reserved: layout placeholders.
+       They were populated by the removed IPsec flow-cache model; the fields
+       stay because this command's on-the-wire layout is fixed. */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;

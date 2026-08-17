@@ -875,9 +875,6 @@ static int cmmNeighborUpdate(struct cmm_ct *ctx, const struct sockaddr_nl *who, 
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_lock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 
 	neigh = __cmmNeighFind(r->ndm_family, ipAddr, r->ndm_ifindex);
 	if (!neigh)
@@ -944,9 +941,6 @@ static int cmmNeighborUpdate(struct cmm_ct *ctx, const struct sockaddr_nl *who, 
 	}
 
 out:
-#ifdef IPSEC_FLOW_CACHE
-	__pthread_mutex_unlock(&flowMutex);
-#endif /* IPSEC_FLOW_CACHE */
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
