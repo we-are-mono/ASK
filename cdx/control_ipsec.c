@@ -41,6 +41,7 @@ struct slist_head sa_cache_by_h[NUM_SA_ENTRIES];
 struct slist_head sa_cache_by_fqid[NUM_SA_ENTRIES];
 
 extern void * cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle);
+extern void cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(void *xfrm_state);
 
 void sa_free(PSAEntry pSA)
 {
@@ -661,6 +662,7 @@ static int IPsec_handle_SA_SET_NATT(U16 *p, U16 Length)
 
 static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 {
+	void *xfrm_state;
 	int rc;
 
 
@@ -676,12 +678,27 @@ static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 			return ERR_CREATION_FAILED;
 	}
 
-	if (!(sa->xfrm_state = cdx_get_xfrm_state_of_sa(sa->netdev, sa->handle)))
+	/* The classification entry install is what resolves sa->netdev, so
+	 * the state lookup can only run after it. If the lookup fails the
+	 * entry just installed has to come back out: leaving it behind would
+	 * classify traffic into a SEC context with no xfrm state to handle
+	 * the exceptions it raises. */
+	xfrm_state = cdx_get_xfrm_state_of_sa(sa->netdev, sa->handle);
+	if (!xfrm_state)
 	{
 		printk(KERN_ERR "%s(%d) : cdx_get_xfrm_state_of_sa failed\n",
 				__func__,__LINE__);
+		cdx_ipsec_delete_fp_entry(sa);
 		return ERR_CREATION_FAILED;
 	}
+
+	/* A route update re-pushes an already VALID SA through here; the
+	 * lookup takes a reference each time, so hand back the one the
+	 * previous push stored before overwriting it. The only other put is
+	 * at final SA release. */
+	if (sa->xfrm_state)
+		cdx_dpa_ipsec_xfrm_state_dec_ref_cnt(sa->xfrm_state);
+	sa->xfrm_state = xfrm_state;
 	sa->flags |= SA_ENABLED;
 	sa->lft_cur.bytes = 0;
 	sa->lft_cur.packets = 0;

@@ -97,16 +97,24 @@ static void tunnel_free(PTnlEntry pEntry)
  */
 static int M_tnl_add(PTnlEntry pTunnelEntry)
 {
-	int rc = 0;
 	U32 hash;
+
+	/* Program the fastpath side first: if it fails the entry must not be
+	 * reachable by name, or the caller's unwind would free an entry that
+	 * is still on the hash list. dpa_add_tunnel_if releases everything it
+	 * allocated on each of its own failure paths, so there is nothing to
+	 * undo here. */
+	if (dpa_add_tunnel_if(&pTunnelEntry->itf,
+			(pTunnelEntry->pRtEntry) ? pTunnelEntry->pRtEntry->itf : NULL,
+			pTunnelEntry) != SUCCESS)
+		return ERR_CREATION_FAILED;
 
 	/* Add to our local hash */
 	hash = HASH_TUNNEL_NAME(pTunnelEntry->tnl_name,
 	                        sizeof(pTunnelEntry->tnl_name));
 	slist_add(&tunnel_name_cache[hash], &pTunnelEntry->list);
 
-	dpa_add_tunnel_if(&pTunnelEntry->itf, (pTunnelEntry->pRtEntry) ? pTunnelEntry->pRtEntry->itf : NULL  , pTunnelEntry);
-	return rc;
+	return NO_ERR;
 }
 
 
@@ -331,7 +339,15 @@ static int TNL_handle_CREATE(U16 *p, U16 Length)
 		pTunnelEntry->state |= TNL_STATE_ENABLED;
 
 	if ((rc = M_tnl_add(pTunnelEntry)) != 0)
+	{
+		/* Mirror the delete path's order: drop the parent route
+		 * reference first so the route sweep done by the onif removal
+		 * can reclaim it, then hand the interface back. */
+		L2_route_put(pTunnelEntry->pRtEntry);
+		pTunnelEntry->pRtEntry = NULL;
+		remove_onif_by_index(pTunnelEntry->itf.index);
 		goto err1;
+	}
 
 	return NO_ERR;
 

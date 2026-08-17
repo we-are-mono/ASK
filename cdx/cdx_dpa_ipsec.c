@@ -2325,7 +2325,14 @@ int cdx_ipsec_process_udp_classification_table_entry(PSAEntry sa)
 			ipsec_preempt_params = (struct en_ehash_ipsec_preempt_op*) natt_tbl_entry->ipsec_preempt_params;
 			arr_index = get_free_natt_arr_index(be16_to_cpu(ipsec_preempt_params->natt_arr_mask));
 			if (arr_index >= MAX_SPI_PER_FLOW)
+			{
+				/* No refcount was taken on the shared ct; leaving
+				 * the pointer set would make a later delete steal a
+				 * reference this SA never held. Callers enter with
+				 * sa->ct NULL, so this restores that invariant. */
+				sa->ct = NULL;
 				goto err_ret;
+			}
 			sa->ct->natt_in_refcnt++;
 			ipsec_preempt_params->spi_param[arr_index].spi = sa->id.spi;
 			ipsec_preempt_params->spi_param[arr_index].fqid = cpu_to_be32(sa->pSec_sa_context->to_sec_fqid);
