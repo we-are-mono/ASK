@@ -67,7 +67,6 @@
 	#include "module_mc6.h"
 	#include "timeout.h" 
 	#include "module_tunnel.h"
-	#include "module_relay.h"
 	#include "module_stat.h"
 	#include "module_route.h"
 	#include "module_socket.h"

@@ -1611,10 +1611,6 @@ typedef struct fpp_sa_query_cmd {
 
 /*-------------------------------- PPPoE -------------------------------------*/
 #define FPP_CMD_PPPOE_ENTRY                             0x0601
-#define FPP_CMD_PPPOE_GET_IDLE                          0x0603
-#define FPP_CMD_PPPOE_RELAY_ENTRY                       0x0610
-#define FPP_CMD_PPPOE_RELAY_ADD                         0x0611
-#define FPP_CMD_PPPOE_RELAY_REMOVE                      0x0612
 
 /* Structure representing the command sent to add or remove a pppoe session */
 typedef struct fpp_pppoe_cmd {
@@ -1625,35 +1621,6 @@ typedef struct fpp_pppoe_cmd {
     char        log_intf[IFNAMSIZ];
     u_int16_t   mode;
 } __attribute__((__packed__)) fpp_pppoe_cmd_t;
-
-typedef struct fpp_pppoe_idle {
-    char        ppp_if[IFNAMSIZ];
-    u_int32_t   xmit_idle;
-    u_int32_t   recv_idle;
-} __attribute__((__packed__)) fpp_pppoe_idle_t;
-
-typedef struct fpp_relay_info {
-    u_int8_t    peermac1[6];
-    u_int8_t    peermac2[6];
-    char        ipifname[IFNAMSIZ];
-    char        opifname[IFNAMSIZ];
-    u_int16_t   sesID;
-    u_int16_t   relaysesID;
-} __attribute__((__packed__)) fpp_relay_info_t;
-
-/* Structure representing the command sent to add or remove a pppoe session */
-typedef struct fpp_pppoe_relay_cmd {
-    u_int16_t   action;      /*Action to perform */
-    u_int8_t    peermac1[6];
-    u_int8_t    peermac2[6];
-    u_int8_t    ipif_mac[6];
-    u_int8_t    opif_mac[6];
-    char        ipifname[IFNAMSIZ];
-    char        opifname[IFNAMSIZ];
-    u_int16_t   sesID;
-    u_int16_t   relaysesID;
-    u_int16_t   pad;
-} __attribute__((__packed__)) fpp_pppoe_relay_cmd_t;
 
 #ifdef WIFI_ENABLE
 /*-------------------------------- WiFi --------------------------------------*/

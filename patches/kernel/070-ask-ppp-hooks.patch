@@ -1,11 +1,11 @@
-From 74b3d63b6c2ad9e71b8bdd9e797714aef31ff7f1 Mon Sep 17 00:00:00 2001
+From e362b2c99dbd8a4ef894cb6d20887de254e0c65f Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:42:47 +0200
 Subject: [PATCH] ask: PPP/PPPoE fast-path hooks
 
 Extends drivers/net/ppp/ppp_generic.c and pppoe.c with hook points for
 PPPoE session offload (session create/destroy notifications, per-session
-data carrying offload state). UAPI surface via ppp-ioctl.h.
+data carrying offload state).
 
 The connect-channel NEWLINK notification is sent after all_ppp_mutex is
 released (device held across the gap): taking rtnl_lock under
@@ -16,27 +16,15 @@ did not change.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/net/ppp/ppp_generic.c  | 26 ++++++++++++++++++++++++++
- drivers/net/ppp/pppoe.c        | 23 +++++++++++++++++++++++
- include/uapi/linux/ppp-ioctl.h |  1 +
- 3 files changed, 50 insertions(+)
+ drivers/net/ppp/ppp_generic.c | 22 ++++++++++++++++++++++
+ drivers/net/ppp/pppoe.c       | 23 +++++++++++++++++++++++
+ 2 files changed, 45 insertions(+)
 
 diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
-index afc1566488b3..754331848cd9 100644
+index afc1566488b3..fd54899c1a6b 100644
 --- a/drivers/net/ppp/ppp_generic.c
 +++ b/drivers/net/ppp/ppp_generic.c
-@@ -54,6 +54,10 @@
- #include <net/net_namespace.h>
- #include <net/netns/generic.h>
- 
-+#if defined(CONFIG_CPE_FAST_PATH)
-+#include <linux/jiffies.h>
-+#endif
-+
- #define PPP_VERSION	"2.4.2"
- 
- /*
-@@ -3482,6 +3486,9 @@ ppp_connect_channel(struct channel *pch, int unit)
+@@ -3482,6 +3482,9 @@ ppp_connect_channel(struct channel *pch, int unit)
  	struct ppp_net *pn;
  	int ret = -ENXIO;
  	int hdrlen;
@@ -46,7 +34,7 @@ index afc1566488b3..754331848cd9 100644
  
  	pn = ppp_pernet(pch->chan_net);
  
-@@ -3519,8 +3526,27 @@ ppp_connect_channel(struct channel *pch, int unit)
+@@ -3519,8 +3522,27 @@ ppp_connect_channel(struct channel *pch, int unit)
  
   outl:
  	write_unlock_bh(&pch->upl);
@@ -126,18 +114,6 @@ index 2ea4f4890d23..454468f3a8d6 100644
  out:
  	return 0;
  }
-diff --git a/include/uapi/linux/ppp-ioctl.h b/include/uapi/linux/ppp-ioctl.h
-index 1cc5ce0ae062..d1869d3f1bd4 100644
---- a/include/uapi/linux/ppp-ioctl.h
-+++ b/include/uapi/linux/ppp-ioctl.h
-@@ -117,6 +117,7 @@ struct pppol2tp_ioc_stats {
- #define PPPIOCGL2TPSTATS _IOR('t', 54, struct pppol2tp_ioc_stats)
- #define PPPIOCBRIDGECHAN _IOW('t', 53, int)	/* bridge one channel to another */
- #define PPPIOCUNBRIDGECHAN _IO('t', 52)	/* unbridge channel */
-+#define PPPIOCSFPPIDLE	_IOW('t', 51, struct ppp_idle)	/* Set the FPP stats */
- 
- #define SIOCGPPPSTATS   (SIOCDEVPRIVATE + 0)
- #define SIOCGPPPVER     (SIOCDEVPRIVATE + 1)	/* NEVER change this!! */
 -- 
 2.47.3
 

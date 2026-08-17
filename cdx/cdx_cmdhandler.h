@@ -125,8 +125,6 @@ enum EVENTS {
 #define FC_PPPOE                    0x0006
 #define CMD_PPPOE_ENTRY             0x0601
 #define CMD_PPPOE_ENTRY_CHANGE    	0x0602
-#define CMD_PPPOE_GET_IDLE			0x0603
-#define CMD_PPPOE_RELAY_ENTRY   	0x0610
 
 
 // 0x0700 -> 0x07FF : MC4 and MC6 modules

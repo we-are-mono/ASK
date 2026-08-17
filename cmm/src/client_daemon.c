@@ -288,7 +288,7 @@ void cmmClientPrintHelp()
 									"\tmacvlan: Mac-vlan interfaces\n"
 									"\ttunnels: tunnel interfaces\n");
 
-	cmm_print(DEBUG_STDOUT, "\nCommand usage: { dm | tunnel | relay | vlan | ipv4 |ipv6 } <options> \n");
+	cmm_print(DEBUG_STDOUT, "\nCommand usage: { dm | tunnel | vlan | ipv4 |ipv6 } <options> \n");
 
 }
 
@@ -690,11 +690,7 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		if (cmm_tunnel_parse_cmd(cpt,keywords,1,daemon_handle))
 			return -1;
 	}
-	else if (strcasecmp(keywords[0],"relay") == 0)
-	{
-		return cmmRelayParseCmd(cpt,keywords,1,daemon_handle);
-	}
-	else if (strncasecmp(keywords[0], "vlan", 4) == 0) 
+	else if (strncasecmp(keywords[0], "vlan", 4) == 0)
 	{
 		if (cmmVlanClient(cpt,keywords, 1, daemon_handle))
 			return -1;
@@ -1059,10 +1055,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case CMMD_CMD_TUNNEL_DEL:
  	case CMMD_CMD_TUNNEL_SHOW:
 		return tunnel_daemon_msg_recv(ctx->fci_handle, ctx->fci_key_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
-
-        case CMMD_CMD_PPPOE_RELAY_ADD:
-        case CMMD_CMD_PPPOE_RELAY_REMOVE:
-		return cmmRelayProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
 
 	case CMMD_CMD_VLAN_ENTRY:
 		return cmmVlanProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);

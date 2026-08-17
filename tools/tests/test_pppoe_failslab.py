@@ -1,6 +1,6 @@
 """Failslab sweep over CMD_PPPOE_ENTRY ACTION_REGISTER.
 
-Drives pppoe_alloc() (cdx/control_pppoe.c:358) into NULL via fork-isolated
+Drives pppoe_alloc() (cdx/control_pppoe.c:130) into NULL via fork-isolated
 failslab; asserts the unwind in PPPoE_Handle_Entry leaves no leaked
 PPPoE_Info allocations behind. The wire payload uses a synthetic session
 whose log_intf name doesn't collide with any onif registered at boot;
@@ -10,11 +10,11 @@ up the iface chain, and either succeeds or unwinds.
 Pre-iter DEREGISTER lets the same session_id+mac+log_intf be reused: a
 successful REGISTER inserts the session into pppoe_cache and registers
 an onif with the log_intf name, so the next iteration would bounce on
-ERR_PPPOE_ENTRY_ALREADY_REGISTERED at cdx/control_pppoe.c:344-355
+ERR_PPPOE_ENTRY_ALREADY_REGISTERED at cdx/control_pppoe.c:114-128
 instead of reaching pppoe_alloc.
 
 Note: REGISTER also requires phy_intf to be a known onif
-(cdx/control_pppoe.c:348-350 returns ERR_UNKNOWN_INTERFACE otherwise).
+(cdx/control_pppoe.c:120-122 returns ERR_UNKNOWN_INTERFACE otherwise).
 We pass eth3 because that's the WAN-side iface registered by dpa_app at
 boot. If REGISTER consistently returns ERR_UNKNOWN_INTERFACE, the test
 will skip with a clear diagnosis rather than leak the unobservable

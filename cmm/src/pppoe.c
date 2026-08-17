@@ -16,16 +16,7 @@
 #include "pppoe.h"
 #include "fpp.h"
 
-#include <sys/ioctl.h>
-#include <linux/ppp_defs.h>
-#include <linux/if_ppp.h>
-
-	#define DEFAULT_AUTO_TIMEOUT    1  // in secs
-
 	#define PPPOE_AUTO_MODE         0x1
-
-	#define PPPIOCSFPPIDLE  _IOW('t', 53, struct ppp_idle)      /* Set the FPP stats */
-
 
 /*****************************************************************
 * __cmmGetPPPoE
@@ -41,7 +32,7 @@ int __cmmGetPPPoESession(FILE *fp, struct interface* ppp_itf)
 	unsigned int session_id;
 	struct interface *itf;
 	int ifindex;
-	int unit;
+	int unit;	/* parsed only to validate the 10-field /proc line */
 
 	if (fseek(fp, 0, SEEK_SET))
 	{
@@ -72,7 +63,6 @@ int __cmmGetPPPoESession(FILE *fp, struct interface* ppp_itf)
                         }
 
 
-			itf->unit = unit;
 			session_id &= 0xFFFF;
 
 			if (itf->session_id != session_id)
@@ -311,134 +301,3 @@ int cmmPPPoEQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_
 
 	return CLI_OK;
 }
-
-
-int cmmPPPoEAutoGetIdle( struct interface* itf , unsigned long* rcv_sec , unsigned long* xmit_sec)
-{
-        fpp_pppoe_idle_t cmd , *rcv_cmd;
-        int ret = -1;
-        unsigned short rcvlen = 0;
-        unsigned char rcvbuf[256];
-
-        if (____itf_get_name(itf, cmd.ppp_if, sizeof(cmd.ppp_if)) < 0)
-        {
-                cmm_print(DEBUG_ERROR, "%s: ____itf_get_name(%d) failed\n", __func__, itf->ifindex);
-
-                goto err;
-        }
-        cmd.xmit_idle = 0;
-        cmd.recv_idle  = 0;
-
-        ret = fci_query(itf_table.fci_handle, FPP_CMD_PPPOE_GET_IDLE, sizeof(fpp_pppoe_idle_t), &cmd, &rcvlen, rcvbuf);
-
-        if (ret != FPP_ERR_OK)
-                goto err;
-
-        rcv_cmd = (fpp_pppoe_idle_t*) &rcvbuf[0];
-        *rcv_sec = rcv_cmd->recv_idle;
-        *xmit_sec = rcv_cmd->xmit_idle;
-        cmm_print(DEBUG_INFO, "%s: Received GET_IDLE time rcv: %d xmit: %d\n", __func__, rcv_cmd->recv_idle, rcv_cmd->xmit_idle);
-        return 0;
-
-err:
-        cmm_print(DEBUG_ERROR, "%s: Error %d while sending CMD_PPPOE_GET_IDLE\n", __func__, ret);
-
-        return -1;
-
-}
-
-int cmmPPPoEUpdateDriv(struct interface* itf, unsigned long rcv_sec, unsigned long xmit_sec)
-{
-        struct ppp_idle cmd;
-        char ifname[IFNAMSIZ];
-        int unit = itf->unit;
-        int fd;
-
-        if (____itf_get_name(itf, ifname, sizeof(ifname)) < 0)
-        {
-                cmm_print(DEBUG_ERROR, "%s: ____itf_get_name(%d) failed\n", __func__, itf->ifindex);
-
-                goto err;
-        }
-
-        if (unit < 0)
-	{
-                cmm_print(DEBUG_ERROR, "%s: unit number not found for %s\n", __func__, ifname);
-                goto err;
-	}
-
-        cmm_print(DEBUG_INFO, "%s: ifname=%s, unit=%d, recv_idle=%lu, xmit_idle=%lu\n", __func__, ifname, unit, rcv_sec, xmit_sec);
-        fd = open ("/dev/ppp", O_RDWR);
-        if (fd < 0)
-        {
-                cmm_print(DEBUG_ERROR, "%s: ( open failed : %d) %s\n", __func__, unit, strerror(errno));
-                goto err;
-        }
-
-        if (ioctl (fd, PPPIOCATTACH, &unit) < 0)
-        {
-                cmm_print(DEBUG_ERROR, "%s: ioctl(PPPIOCATTACH, %d) %s\n", __func__, unit, strerror(errno));
-                close(fd);
-                goto err;
-        }
-        cmd.recv_idle = rcv_sec;
-        cmd.xmit_idle = xmit_sec;
-
-        if (ioctl (fd, PPPIOCSFPPIDLE, &cmd) < 0)
-        {
-                cmm_print(DEBUG_ERROR, "%s: ioctl(PPPIOCSFPPIDLE, %d) %s\n", __func__, unit, strerror(errno));
-                close(fd);
-                goto err;
-        }
-
-        close(fd);
-        return 0;
-
-err:
-        return -1;
-}
-
-void cmmPPPoEAutoKeepAlive(void)
-{
-        static unsigned int gPPPoECurrAutoTimeout = 0;
-        struct list_head *entry;
-        static time_t last_pppoe = 0;
-        double dt;
-        time_t now;
-        unsigned long rcv_sec = 0,xmit_sec = 0;
-        struct interface* itf;
-        int i;
-
-        now = time(NULL);
-
-        dt = now - last_pppoe;
-
-        gPPPoECurrAutoTimeout += (unsigned int) dt;
-
-        if (gPPPoECurrAutoTimeout >= DEFAULT_AUTO_TIMEOUT)
-        {
-                __pthread_mutex_lock(&itf_table.lock);
-                for (i = 0; i < ITF_HASH_TABLE_SIZE; i++)
-                {
-                        entry = list_first(&itf_table.hash[i]);
-                        while (entry != &itf_table.hash[i])
-                        {
-                                itf = container_of(entry, struct interface, list);
-                                if ((itf->itf_flags & ITF_PPPOE_AUTO_MODE) && (itf->flags & FPP_PROGRAMMED))
-                                {
-                                        if (cmmPPPoEAutoGetIdle(itf, &rcv_sec, &xmit_sec) == 0)
-                                        {
-                                                cmmPPPoEUpdateDriv(itf, rcv_sec,xmit_sec);
-                                        }
-
-                                }
-                                 entry = list_next(entry);
-                        }
-                }
-                __pthread_mutex_unlock(&itf_table.lock);
-                gPPPoECurrAutoTimeout = 0;
-
-        }
-        last_pppoe = now;
-}
-

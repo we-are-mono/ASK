@@ -56,33 +56,15 @@ static void pppoe_free(pPPPoE_Info pEntry)
 }
 
 
-static int M_pppoe_timer(TIMER_ENTRY *timer);
-
-static void __pppoe_add(pPPPoE_Info pEntry, U16 hash_key)
+static void pppoe_add(pPPPoE_Info pEntry, U16 hash_key)
 {
 	/* Add to our local hash */
 	slist_add(&pppoe_cache[hash_key], &pEntry->list);
-
-	cdx_timer_init(&pEntry->timer, M_pppoe_timer);
-	cdx_timer_add(&pEntry->timer, PPPOE_TIMER_PERIOD);
 }
 
-static void pppoe_add(pPPPoE_Info pEntry, U16 hash_key)
-{
-	__pppoe_add(pEntry, hash_key);
-}
-
-static void pppoe_add_relay(pPPPoE_Info pEntry, U16 hash_key, pPPPoE_Info pRelayEntry, U16 relay_hash_key)
-{
-	__pppoe_add(pEntry, hash_key);
-	__pppoe_add(pRelayEntry, relay_hash_key);
-}
-
-static void __pppoe_remove(pPPPoE_Info pEntry, U16 hash_key)
+static void pppoe_remove(pPPPoE_Info pEntry, U16 hash_key)
 {
 	struct slist_entry *prev;
-
-	cdx_timer_del(&pEntry->timer);
 
 	prev = slist_prev(&pppoe_cache[hash_key], &pEntry->list);
 
@@ -90,218 +72,6 @@ static void __pppoe_remove(pPPPoE_Info pEntry, U16 hash_key)
 	slist_remove_after(prev);
 
 	pppoe_free(pEntry);
-}
-
-static void pppoe_remove(pPPPoE_Info pEntry, U16 hash_key)
-{
-	__pppoe_remove(pEntry, hash_key);
-}
-
-static void pppoe_remove_relay(pPPPoE_Info pEntry, U16 hash_key, pPPPoE_Info pRelayEntry, U16 relay_hash_key)
-{
-	__pppoe_remove(pEntry, hash_key);
-	__pppoe_remove(pRelayEntry, relay_hash_key);
-}
-
-
-static int M_pppoe_timer(TIMER_ENTRY *timer)
-{
-	pPPPoE_Info pEntry = container_of(timer, PPPoE_Info, timer);
-
-	pEntry->last_pkt_rcvd = JIFFIES32;
-	pEntry->last_pkt_xmit = JIFFIES32;
-	return 1;
-}
-
-static int PPPoE_Handle_Get_Idle(U16* p, U16 Length)
-{
-	pPPPoEIdleTimeCmd cmd;
-	POnifDesc ppp_if;
-	pPPPoE_Info pppoeinfo;
-
-	cmd = (pPPPoEIdleTimeCmd)p;
-	if (Length != sizeof(PPPoEIdleTimeCmd)) 
-		return ERR_WRONG_COMMAND_SIZE;
-
-	ppp_if = get_onif_by_name(cmd->ppp_intf);
-	if (!ppp_if || !ppp_if->itf || !(ppp_if->itf->type & IF_TYPE_PPPOE))
-		return ERR_UNKNOWN_INTERFACE;
-
-	pppoeinfo = (pPPPoE_Info)ppp_if->itf;
-
-	cmd = (pPPPoEIdleTimeCmd)(p+1);
-	memcpy(cmd->ppp_intf,ppp_if->name,sizeof(ppp_if->name));
-	cmd->recv_idle = (JIFFIES32 - pppoeinfo->last_pkt_rcvd) / HZ;
-	cmd->xmit_idle = (JIFFIES32 - pppoeinfo->last_pkt_xmit) / HZ;
-	return NO_ERR;
-}
-
-
-static int PPPoE_Handle_Relay_Entry(U16 *p, U16 Length)
-{
-	pPPPoERelayCommand cmd;
-	pPPPoE_Info pEntry;
-	pPPPoE_Info pRelayEntry;
-	POnifDesc onif,relayonif;
-	U16 hash_key,relay_hash_key;
-	struct slist_entry *entry;
-	int retval;
-
-	cmd = (pPPPoERelayCommand) p;
-	if (Length != sizeof(PPPoERelayCommand))
-		return ERR_WRONG_COMMAND_SIZE;
-
-	cmd->sesID = htons(cmd->sesID);
-	cmd->relaysesID = htons(cmd->relaysesID);
-
-	hash_key = HASH_PPPOE(cmd->sesID, cmd->peermac1);
-	relay_hash_key = HASH_PPPOE(cmd->relaysesID, cmd->peermac2);
-
-	switch (cmd->action)
-	{
-		case ACTION_REGISTER:
-
-			slist_for_each(pEntry, entry, &pppoe_cache[hash_key], list)
-			{
-				if((pEntry->sessionID == cmd->sesID) && TESTEQ_MACADDR(pEntry->DstMAC, cmd->peermac1))
-					return ERR_PPPOE_ENTRY_ALREADY_REGISTERED; //trying to add the same pppoe session
-			}
-
-			slist_for_each(pRelayEntry, entry, &pppoe_cache[relay_hash_key], list)
-			{
-				if((pRelayEntry->sessionID == cmd->relaysesID) && TESTEQ_MACADDR(pRelayEntry->DstMAC, cmd->peermac2))
-					return ERR_PPPOE_ENTRY_ALREADY_REGISTERED; //trying to add the same pppoe session
-			}
-
-			if ((pEntry = pppoe_alloc()) == NULL)
-			{
-				return ERR_NOT_ENOUGH_MEMORY;
-			}
-			pEntry->itf.type = IF_TYPE_PPPOE;
-
-			if ((pRelayEntry = pppoe_alloc()) == NULL)
-			{
-				pppoe_free(pEntry);
-				return ERR_CREATION_FAILED;
-			}
-			pRelayEntry->itf.type = IF_TYPE_PPPOE;
-
-			/* populate relay pairs */
-			pEntry->sessionID = cmd->sesID;
-			COPY_MACADDR(pEntry->DstMAC,cmd->peermac1);
-
-			pRelayEntry->sessionID = cmd->relaysesID;
-			COPY_MACADDR(pRelayEntry->DstMAC,cmd->peermac2);
-
-			DPA_INFO("\r\ncontrol_pppoe.c sesID = %d",cmd->sesID);
-			DPA_INFO("\r\ncontrol_pppoe.c relaysesID = %d",cmd->relaysesID);
-
-			/*Check if the Physical interface is known by the Interface manager*/
-			onif = get_onif_by_name(cmd->ipifname);
-			relayonif = get_onif_by_name(cmd->opifname);
-
-			if ((!onif) || (!relayonif)) {
-				pppoe_free(pEntry);
-				pppoe_free(pRelayEntry);
-				return ERR_UNKNOWN_INTERFACE;
-			}
-
-			pEntry->last_pkt_rcvd = JIFFIES32;
-			pEntry->last_pkt_xmit = JIFFIES32;
-			pRelayEntry->last_pkt_rcvd = JIFFIES32;
-			pRelayEntry->last_pkt_xmit = JIFFIES32;
-
-			pEntry->itf.phys = onif->itf;
-			pRelayEntry->itf.phys = relayonif->itf;
-
-			/*Now link these two entries by relay ptr */
-			pEntry->relay = pRelayEntry;
-			pRelayEntry->relay = pEntry;
-
-			pppoe_add_relay(pEntry, hash_key, pRelayEntry, relay_hash_key);
-
-			/* hw support for pppoe relay entry */
-			COPY_MACADDR(pEntry->hw_entry.SrcMAC,cmd->ipif_mac); /* param source mac for the paired session */
-			COPY_MACADDR(pRelayEntry->hw_entry.SrcMAC,cmd->opif_mac); /* param source mac for the paired session */
-
-			strncpy(&pEntry->hw_entry.in_ifname[0],&cmd->ipifname[0], IF_NAME_SIZE);
-			pEntry->hw_entry.in_ifname[IF_NAME_SIZE - 1] = '\0';
-			DPA_INFO("\r\n incoming interface = %s",cmd->ipifname);
-			DPA_INFO("\r\n %s",pEntry->hw_entry.in_ifname);
-
-			strncpy(&pRelayEntry->hw_entry.in_ifname[0],&cmd->opifname[0], IF_NAME_SIZE);
-			pRelayEntry->hw_entry.in_ifname[IF_NAME_SIZE - 1] = '\0';
-			DPA_INFO("\r\n outgoing interface = %s",cmd->opifname);
-			DPA_INFO("\r\n %s",pRelayEntry->hw_entry.in_ifname);
-
-			/* Add PPPOE Relay entries to HW */
-			retval =  insert_pppoe_relay_entry_in_classif_table(pEntry);
-			if(!retval)
-			{
-				DPA_INFO("\r\nAdding second pppoe relay entry");
-				retval =  insert_pppoe_relay_entry_in_classif_table(pRelayEntry);
-				if(!retval)
-				{
-					DPA_INFO("\r\n Successfully added pppoe relay session entries to HW");
-				} 
-				else
-				{
-					DPA_ERROR("\r\n Unable to add second pppoe relay session entry to HW");
-					delete_pppoe_relay_entry_from_classif_table(pEntry); 
-				}
-			}
-			else
-			{
-				DPA_ERROR("\r\n Unable to add the first pppoe relay session entry itself to HW");
-			}
-			gStatPPPoEQueryStatus = STAT_PPPOE_QUERY_NOT_READY;
-			break;
-
-		case ACTION_DEREGISTER:
-			slist_for_each(pEntry, entry, &pppoe_cache[hash_key], list)
-			{
-				if (pEntry->relay)
-				{
-					if((pEntry->sessionID == cmd->sesID) && TESTEQ_MACADDR(pEntry->DstMAC, cmd->peermac1)
-							&& (pEntry->relay->sessionID == cmd->relaysesID) &&
-							TESTEQ_MACADDR(pEntry->relay->DstMAC, cmd->peermac2))
-						goto found;
-
-				}
-			}
-
-			return ERR_PPPOE_ENTRY_NOT_FOUND;
-
-found:
-			/* Now relay part as we already searched for relay link, just check for peer2mac and relaysesID */
-
-			slist_for_each(pRelayEntry, entry, &pppoe_cache[relay_hash_key], list)
-			{
-				if((pRelayEntry->sessionID == cmd->relaysesID) &&
-						(TESTEQ_MACADDR(pRelayEntry->DstMAC, cmd->peermac2)) &&
-						(pRelayEntry->relay == pEntry))
-					goto found_relay;
-			}
-
-			return ERR_PPPOE_ENTRY_NOT_FOUND;
-
-found_relay:
-			/* remove hw entries first */
-
-			delete_pppoe_relay_entry_from_classif_table(pEntry);
-			delete_pppoe_relay_entry_from_classif_table(pRelayEntry);
-
-			pppoe_remove_relay(pEntry, hash_key, pRelayEntry, relay_hash_key);
-
-			gStatPPPoEQueryStatus = STAT_PPPOE_QUERY_NOT_READY;
-
-			break;
-
-		default :
-			return ERR_UNKNOWN_COMMAND;
-	}
-
-	return NO_ERR;
 }
 
 static int PPPoE_Handle_Entry(U16 *p, U16 Length)
@@ -326,7 +96,7 @@ static int PPPoE_Handle_Entry(U16 *p, U16 Length)
 			slist_for_each(pEntry, entry, &pppoe_cache[hash_key], list)
 			{
 				if ((pEntry->sessionID == cmd->sessionID) && TESTEQ_MACADDR(pEntry->DstMAC, cmd->macAddr) &&
-						(pEntry->relay == NULL)  && !strcmp(get_onif_name(pEntry->itf.index), (char *)cmd->log_intf) )
+						!strcmp(get_onif_name(pEntry->itf.index), (char *)cmd->log_intf) )
 					goto found;
 			}
 
@@ -365,9 +135,6 @@ found:
 			/* populate pppoe_info entry */
 			pEntry->sessionID = cmd->sessionID;
 			COPY_MACADDR(pEntry->DstMAC,cmd->macAddr);
-
-			pEntry->last_pkt_rcvd = JIFFIES32;
-			pEntry->last_pkt_xmit = JIFFIES32;
 
 			if (cmd->mode & PPPOE_AUTO_MODE)
 				pEntry->ppp_flags |= PPPOE_AUTO_MODE;
@@ -434,41 +201,8 @@ static U16 pppoe_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return rc;
 }
 
-/*
- * CMD_PPPOE_RELAY_ENTRY: PPPoE_Handle_Relay_Entry has no QUERY
- * arm (its default: returns ERR_UNKNOWN_COMMAND on unknown
- * actions), so the query-reply bump below is effectively dead
- * on the happy path. Preserve the pre-migration shape anyway
- * to keep behavior bit-exact if a client ever sends QUERY here.
- */
-static U16 pppoe_relay_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	U16 action = *(U16 *)pcmd;
-	U16 rc = (U16)PPPoE_Handle_Relay_Entry(pcmd, cmd_len);
-
-	if (rc == NO_ERR && (action == ACTION_QUERY || action == ACTION_QUERY_CONT))
-		*out_reply_len = sizeof(PPPoECommand);
-	return rc;
-}
-
-/*
- * CMD_PPPOE_GET_IDLE: takes a PPPoEIdleTimeCmd in, writes a
- * PPPoEIdleTimeCmd at pcmd+1 on success. Reply is 2-byte status
- * followed by the struct — total sizeof(U16) + sizeof(PPPoEIdleTimeCmd).
- */
-static U16 pppoe_get_idle_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	U16 rc = (U16)PPPoE_Handle_Get_Idle(pcmd, cmd_len);
-
-	if (rc == NO_ERR)
-		*out_reply_len = sizeof(U16) + sizeof(PPPoEIdleTimeCmd);
-	return rc;
-}
-
 static const struct cdx_cmd_spec pppoe_cmd_table[] = {
-	CDX_CMD(CMD_PPPOE_ENTRY,       PPPoECommand,      pppoe_entry_handle),
-	CDX_CMD(CMD_PPPOE_RELAY_ENTRY, PPPoERelayCommand, pppoe_relay_entry_handle),
-	CDX_CMD(CMD_PPPOE_GET_IDLE,    PPPoEIdleTimeCmd,  pppoe_get_idle_handle),
+	CDX_CMD(CMD_PPPOE_ENTRY, PPPoECommand, pppoe_entry_handle),
 };
 
 static U16 M_pppoe_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
@@ -535,23 +269,12 @@ static int PPPoE_Get_Session_Snapshot(int pppoe_hash_index , int pppoe_tot_entri
 		pPPPoESnapshot->sessionID   = ntohs(pPPPoEEntry->sessionID);
 		COPY_MACADDR(pPPPoESnapshot->macAddr, pPPPoEEntry->DstMAC);
 
-		if (!pPPPoEEntry->relay)
-		{
-			strscpy((char *)pPPPoESnapshot->phy_intf,
-					get_onif_name(pPPPoEEntry->itf.phys->index),
-					sizeof(pPPPoESnapshot->phy_intf));
-			strscpy((char *)pPPPoESnapshot->log_intf,
-					get_onif_name(pPPPoEEntry->itf.index),
-					sizeof(pPPPoESnapshot->log_intf));
-		}
-		else
-		{
-			strscpy((char *)pPPPoESnapshot->phy_intf,
-					get_onif_name(pPPPoEEntry->itf.phys->index),
-					sizeof(pPPPoESnapshot->phy_intf));
-			strscpy((char *)pPPPoESnapshot->log_intf, "relay",
-					sizeof(pPPPoESnapshot->log_intf));
-		}
+		strscpy((char *)pPPPoESnapshot->phy_intf,
+				get_onif_name(pPPPoEEntry->itf.phys->index),
+				sizeof(pPPPoESnapshot->phy_intf));
+		strscpy((char *)pPPPoESnapshot->log_intf,
+				get_onif_name(pPPPoEEntry->itf.index),
+				sizeof(pPPPoESnapshot->log_intf));
 
 		pPPPoESnapshot++;
 		tot_sessions++;

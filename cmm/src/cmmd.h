@@ -240,17 +240,8 @@ typedef fpp_tunnel_del_cmd_t	cmmd_tunnel_del_cmd_t;
 typedef fpp_tunnel_sec_cmd_t	cmmd_tunnel_sec_cmd_t; 
 
 /*--------------------------------------- PPoE --------------------------------*/
-#define CMMD_CMD_PPPOE_RELAY_ENTRY			FPP_CMD_PPPOE_RELAY_ENTRY
-#define CMMD_CMD_PPPOE_RELAY_ADD			FPP_CMD_PPPOE_RELAY_ADD
-#define CMMD_CMD_PPPOE_RELAY_REMOVE			FPP_CMD_PPPOE_RELAY_REMOVE
-
-#define CMMD_ERR_PPPOE_ENTRY_ALREADY_REGISTERED		FPP_ERR_PPPOE_ENTRY_ALREADY_REGISTERED	
+#define CMMD_ERR_PPPOE_ENTRY_ALREADY_REGISTERED		FPP_ERR_PPPOE_ENTRY_ALREADY_REGISTERED
 #define CMMD_ERR_PPPOE_ENTRY_NOT_FOUND			FPP_ERR_PPPOE_ENTRY_NOT_FOUND
-
-typedef fpp_relay_info_t cmmd_relay_info_t;
-
-/* Structure representing the command sent to add or remove a pppoe session */
-typedef fpp_pppoe_relay_cmd_t cmmd_pppoe_relay_cmd_t;
 
 /*---------------------------------------- VLAN --------------------------------*/
 #define CMMD_CMD_VLAN_ENTRY				FPP_CMD_VLAN_ENTRY	

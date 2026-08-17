@@ -109,8 +109,6 @@ The ASK-enabled FMAN microcode (v210.10.1) must be loaded by U-Boot before Linux
 | **libnetfilter-conntrack** | `01-nxp-ask-comcerto-fp-extensions.patch` | Fast-path info attributes and QoS connmark for CMM |
 | **libnfnetlink** | `01-nxp-ask-nonblocking-heap-buffer.patch` | Non-blocking socket mode and heap buffer management for CMM |
 | **iptables** | `iptables-extensions/` sources + kernel patch `060` | QOSMARK/QOSCONNMARK target and match extensions |
-| **ppp** | `01-nxp-ask-ifindex.patch` | Tunnel interface index support for PPP offload |
-| **rp-pppoe** | `01-nxp-ask-cmm-relay.patch` | CMM-aware PPPoE relay |
 
 ### Configuration
 

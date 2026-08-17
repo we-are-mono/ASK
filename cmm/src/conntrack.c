@@ -45,7 +45,6 @@ const unsigned char null_mac[ETH_ALEN] = {0, };
 
 extern void cmmDPDIPsecSAUpdate(struct cmm_ct *ctx);
 extern int cmmNeighSendSolicit(void);
-extern void cmmPPPoEAutoKeepAlive(void);
 
 extern unsigned int nf_conntrack_max;
 
@@ -2882,8 +2881,6 @@ static void *cmmCtThread(void *data)
 	{
 		if (timer_expired)
 		{
-                        cmmPPPoEAutoKeepAlive();
-
 			cmmDPDIPsecSAUpdate(ctx);
 
 			/* Resync if needed and system is idle */

@@ -47,7 +47,6 @@ SRCS := \
 	keytrack.c \
 	timeout.c \
 	module_tunnel.c \
-	module_relay.c \
 	itf.c \
 	module_stat.c \
 	module_route.c \

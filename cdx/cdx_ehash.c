@@ -94,10 +94,8 @@ static int create_strip_eth_hm(struct ins_entry_info *info);
 static int create_enque_hm(struct ins_entry_info *info);
 static int create_replicate_hm(struct ins_entry_info *info);
 static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info *info);
-static int fill_pppoe_relay_actions(struct ins_entry_info *info,pPPPoE_Info entry);
 static int create_tunnel_remove_hm(struct ins_entry_info *info);
 static int create_pppoe_ins_hm(struct ins_entry_info *info);
-static int create_pppoe_relay_hm(struct ins_entry_info *info,pPPPoE_Info entry);
 static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_index);
 #ifdef VLAN_FILTER
 static int insert_remove_outer_vlan_hm(struct ins_entry_info *info, uint32_t iif_index, uint32_t underlying_iif_index);
@@ -492,26 +490,6 @@ int delete_entry_from_classif_table(PCtEntry entry)
 	entry->ct->handle =  NULL;
 	kfree(entry->ct);
 	entry->ct = NULL;
-	return SUCCESS;
-}
-
-int delete_pppoe_relay_entry_from_classif_table(pPPPoE_Info entry)
-{
-	struct hw_ct *ct;
-
-	ct = entry->hw_entry.ct;
-
-	CDX_DPA_DPRINT("\n");
-	if(ExternalHashTableDeleteKey(ct->td,ct->index, ct->handle))
-	{
-		DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
-		return FAILURE;
-	}
-	//free table entry
-	ExternalHashTableEntryFree(ct->handle);
-	ct->handle =  NULL;
-	kfree(ct);
-	ct = NULL;
 	return SUCCESS;
 }
 
@@ -1293,201 +1271,6 @@ static int fill_bridge_actions(struct ins_entry_info *info, POnifDesc ifdesc)
 	return SUCCESS;
 }
 
-int insert_pppoe_relay_entry_in_classif_table(pPPPoE_Info entry)  /* struct _tPPPoE_Info *entry)*/
-{
-	struct en_exthash_tbl_entry *tbl_entry = NULL;
-	union dpa_key *key;
-	struct ins_entry_info *info;
-	uint8_t *ptr;
-	POnifDesc ifdesc;
-	uint32_t portid,flags,key_size;
-	struct hw_ct *ct = NULL;
-	int retval;
-
-	info = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
-	if(!info)
-	{
-		DPA_ERROR("%s::unable to allocate mem for info\n", __func__);
-		goto err_ret;
-	}
-	DPA_INFO("%s(%d) incoming interface %s\n",__func__,__LINE__,&entry->hw_entry.in_ifname[0]);
-	DPA_INFO("%s(%d) outgoing interface %s\n",__func__,__LINE__,&entry->relay->hw_entry.in_ifname[0]);   
-
-	if((ifdesc = get_onif_by_name(&entry->hw_entry.in_ifname[0])) == NULL)
-	{
-		DPA_ERROR("%s::unable to validate incoming iface %s\n", __func__,&entry->hw_entry.in_ifname[0]);
-		goto err_ret;
-	}
-	DPA_INFO("%s(%d) ifdesc->itf->index %d\n",__func__,__LINE__,ifdesc->itf->index);
-
-	if(dpa_get_fm_port_index(ifdesc->itf->index,0, &info->fm_idx,&info->port_idx, &portid))
-	{
-		DPA_ERROR("%s::unable to get fm-index for input iface %s\n",__func__, &entry->hw_entry.in_ifname[0]);
-		goto err_ret;
-	}
-	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__func__,__LINE__,info->fm_idx, info->port_idx, portid);
-
-	info->fm_pcd = dpa_get_pcdhandle(info->fm_idx);
-	if(!info->fm_pcd)
-	{
-		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__func__, info->fm_idx);
-		goto err_ret;
-	}
-	DPA_INFO("%s(%d) fm_pcd %p \n",__func__,__LINE__, info->fm_pcd);
-
-	//get egress FQID
-	if(dpa_get_tx_fqid_by_name(&entry->relay->hw_entry.in_ifname[0], &info->l2_info.fqid, &info->l2_info.is_dscp_fq_map, (uint32_t)entry->sessionID))
-	{
-		DPA_ERROR("%s::unable to get tx params-fqid\n",__func__);
-		goto err_ret;
-	}
-	DPA_INFO("\r\n egress fq_id = %d \r\n",info->l2_info.fqid); 
-
-	//disable frag
-	info->l2_info.mtu = 0xffff;
-
-#ifdef CDX_DPA_DEBUG
-	//     DPA_INFO("%s:: mtu %d\n", __func__, dev->mtu);
-#endif
-
-	//get table descriptor based on type and port
-	info->td = dpa_get_tdinfo(info->fm_idx, portid, PPPOE_RELAY_TABLE);    //ETHERNET_TABLE
-	if(info->td == NULL)
-	{
-		DPA_ERROR("%s::unable to get td for input iface %s\n",__func__, &entry->hw_entry.in_ifname[0]);
-		goto err_ret;
-	}
-	DPA_INFO("%s(%d) td %p \n",__func__,__LINE__, info->td); 
-
-	//allocate hw entry
-	ct = (struct hw_ct *)kzalloc(sizeof(struct hw_ct) , GFP_KERNEL);
-	if(!ct)
-	{
-		DPA_ERROR("%s::unable to alloc mem for hw_ct\n",__func__);
-		goto err_ret;
-	}
-
-	entry->hw_entry.ct = ct;
-	ct->handle = NULL;
-	//save table descriptor for entry release
-	ct->td = info->td;
-
-	//get fm context
-	ct->fm_ctx = dpa_get_fm_ctx(info->fm_idx);
-	if(ct->fm_ctx == NULL)
-	{
-		DPA_ERROR("%s::failed to get ctx from fm idx %d\n", __func__, info->fm_idx);
-		goto err_ret;
-	}
-
-	//Allocate hash table entry
-	tbl_entry = ExternalHashTableAllocEntry(info->td);
-	if(!tbl_entry)
-	{
-		DPA_ERROR("%s::unable to alloc hash tbl memory\n",__func__);
-		goto err_ret;
-	}
-
-#ifdef CDX_DPA_DEBUG
-	printk("%s:: hash tbl entry %p\n", __func__, tbl_entry);
-#endif
-
-	//fill key info
-	key = (union dpa_key *)&tbl_entry->hashentry.key[0];
-	//portid added to key
-	key->portid = portid;
-
-	//fill src mac address,ethtype and pppoe session id
-	memcpy(&key->pppoe_relay_key.ether_sa[0], &entry->DstMAC[0],6);
-	key->pppoe_relay_key.ether_type = cpu_to_be16(0x8864);
-	DPA_INFO("\r\n session id %x",entry->sessionID);
-	DPA_INFO("\r\n relay session id %x",entry->relay->sessionID);
-	key->pppoe_relay_key.session_id = entry->sessionID;
-	key_size = (sizeof(struct pppoe_relay_key) + 1);
-	DPA_INFO("\r\n key size = %d",key_size);
-
-#ifdef CDX_DPA_DEBUG
-	if(key_size)
-	{
-		DPA_INFO("keysize %d\n", key_size);
-		display_buf(key, key_size);
-	}
-#endif
-
-	flags = 0;
-
-	//round off keysize to next 4 bytes boundary
-	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];
-	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);
-
-	info->opcptr = ptr;   //set start of opcode list
-	ptr += MAX_OPCODES;   //ptr now after opcode section
-
-	//set offset to first opcode
-	SET_OPC_OFFSET(flags, (uint32_t)(info->opcptr - (uint8_t *)tbl_entry));
-	//set param offset
-	SET_PARAM_OFFSET(flags, (uint32_t)(ptr - (uint8_t *)tbl_entry));
-
-	//param_ptr now points after timestamp location
-	tbl_entry->hashentry.flags = cpu_to_be16(flags);
-	/* param pointer and opcode pointer now valid */
-	info->paramptr = ptr;
-	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - GET_PARAM_OFFSET(flags));
-
-	/* fill the pppoe relay parameters */
-
-	if(fill_pppoe_relay_actions(info,entry))
-	{
-		DPA_ERROR("%s::unable to fill pppoe relay actions\n", __func__);
-		goto err_ret;
-	}
-	DPA_INFO("\r\ninsert_pppoe_relay_entry_in_classif_table:pppoe relay actions are filled successfully");
-	ct->handle = tbl_entry;
-
-#ifdef CDX_DPA_DEBUG
-	display_ehash_tbl_entry(&tbl_entry->hashentry, key_size);
-#endif 
-
-	//insert entry into hash table
-	retval = ExternalHashTableAddKey(info->td, key_size, tbl_entry);
-	if(retval == -1)
-	{
-		DPA_ERROR("%s::unable to add entry in hash table\n", __func__);
-		goto err_ret;
-	}
-	DPA_INFO("\r\n insert_pppoe_relay_entry_in_classif_table: Added the pppoe relay key successfully");
-	ct->index = (uint16_t)retval;
-	ct->handle = tbl_entry;
-	kfree(info);
-	return SUCCESS;
-
-err_ret:
-	DPA_INFO("%s::unable to add entry in hash table\n", __func__);
-	//release all allocated items
-	if(entry->hw_entry.ct)
-		kfree(entry->hw_entry.ct);
-	if(tbl_entry)
-		ExternalHashTableEntryFree(tbl_entry);
-
-	kfree(info);
-	return FAILURE;
-}     
-
-//fill all opcodes and parameters for pppoe relay functionality.
-static int fill_pppoe_relay_actions(struct ins_entry_info *info,pPPPoE_Info entry) /* struct _tPPPoE_Info *entry) */
-{
-
-#ifdef CDX_DPA_DEBUG
-	// DPA_INFO("%s:: entry %p, opc_ptr %p, param_ptr %p, size %d\n",
-	//          __func__, pRtEntry, info->opcptr, info->paramptr, info->param_size);
-#endif
-
-	DPA_INFO("%s(%d) create_pppoe_relay_hm\n",__func__,__LINE__);
-	if(create_pppoe_relay_hm(info,entry))
-		return FAILURE;  
-	return SUCCESS;
-}
-
 int add_l2flow_to_hw(struct L2Flow_entry *entry)
 {
 	int retval;
@@ -1644,48 +1427,6 @@ err_ret:
 	}
 	kfree(info);
 	return FAILURE;
-}
-
-static int create_pppoe_relay_hm(struct ins_entry_info *info,pPPPoE_Info entry) /* struct _tPPPoE_Info *entry) */
-{
-	struct en_ehash_replace_pppoe_hdr_params *param;
-
-	if(info->opc_count == MAX_OPCODES)
-		return FAILURE;
-	if(sizeof(struct en_ehash_replace_pppoe_hdr_params) > info->param_size)
-		return FAILURE;
-
-	param = (struct en_ehash_replace_pppoe_hdr_params *)info->paramptr;
-	info->paramptr += sizeof(struct en_ehash_replace_pppoe_hdr_params);
-	info->param_size -= sizeof(struct en_ehash_replace_pppoe_hdr_params);
-	*(info->opcptr) = REPLACE_PPPOE_HDR;
-	info->opc_count++;
-	info->opcptr++;
-
-	memcpy(&param->destination_mac[0], &entry->relay->DstMAC[0], ETHER_ADDR_LEN);
-	memcpy(&param->source_mac[0], &entry->relay->hw_entry.SrcMAC[0], ETHER_ADDR_LEN);
-	param->session_id = entry->relay->sessionID;
-	param->fqid = cpu_to_be32(info->l2_info.fqid);
-
-#ifdef INCLUDE_ETHER_IFSTATS
-	{
-		uint8_t offset;
-		uint32_t word;
-
-		offset = info->l2_info.ether_stats_offset;
-		word = ((get_logical_ifstats_base() +
-					(offset * sizeof(struct en_ehash_stats))) & 0xffffff);
-		param->stats_ptr = cpu_to_be32(word);
-
-#ifdef CDX_DPA_DEBUG
-		DPA_INFO("%s::stats ptr %x\n", __func__, (word & 0xffffff));
-#endif
-	}
-#else
-	param->stats_ptr = 0;
-#endif  
-
-	return SUCCESS;
 }
 
 static int create_pppoe_ins_hm(struct ins_entry_info *info)

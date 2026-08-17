@@ -2479,7 +2479,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 #ifdef IPSEC_FLOW_CACHE
 		cli_register_command(ctx->handle, c, "sec-connections", cmmFlowLocalShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the local table of secure connections");
 #endif /* IPSEC_FLOW_CACHE */
-		cli_register_command(ctx->handle, c, "relay", cmmRelayLocalShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show pppoe relay entries used by  the fast forwarded connections");
 		cli_register_command(ctx->handle, c, "mc6", cmmMc6Show, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the table of V6 multicat listeners");
 		cli_register_command(ctx->handle, c, "mc4", cmmMc4Show, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the table of V4 multicat listeners");
 		cli_register_command(ctx->handle, c, "asym_fastforward", cmmAsymFFEnableShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the Asymmetric fast forward status");

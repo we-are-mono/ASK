@@ -91,7 +91,7 @@ async def _dereg_quiet(target_agent, aiohttp_session, *,
                        session_id: int, mac: bytes,
                        phy_intf: bytes, log_intf: bytes) -> None:
     """Best-effort DEREGISTER for fixture cleanup. The cache walk at
-    cdx/control_pppoe.c:323-330 needs all of (session_id, mac, log_intf)
+    cdx/control_pppoe.c:93-100 needs all of (session_id, mac, log_intf)
     to match — calling sites must pass exactly what they REGISTERed."""
     payload = pppoe_cmd(
         action=ACTION_DEREGISTER, session_id=session_id, mac=mac,
@@ -108,7 +108,7 @@ async def test_pppoe_register_malformed_phy_intf(
     aiohttp_session, target_agent, splat_window, phy_label, phy,
 ):
     """Malformed phy_intf can't reach add_onif (the get_onif_by_name
-    lookup at cdx/control_pppoe.c:348 returns NULL → ERR_UNKNOWN_INTERFACE)
+    lookup at cdx/control_pppoe.c:120 returns NULL → ERR_UNKNOWN_INTERFACE)
     so REGISTER never installs an entry. No cleanup needed."""
     payload = pppoe_cmd(
         action=ACTION_REGISTER, session_id=_SESSION_BASE + 0x10,
@@ -152,7 +152,7 @@ async def test_pppoe_register_malformed_log_intf(
 async def test_pppoe_deregister_malformed_log_intf(
     aiohttp_session, target_agent, splat_window, log_label, log,
 ):
-    """DEREGISTER's slist walk at cdx/control_pppoe.c:326-328 calls
+    """DEREGISTER's slist walk at cdx/control_pppoe.c:96-100 calls
     strcmp(_, get_onif_name(...), cmd->log_intf); a non-NUL log_intf
     runs past the 16-byte field if the strcmp() isn't bounded.
     No registration happens here (no matching entry) so no cleanup

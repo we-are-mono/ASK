@@ -212,7 +212,6 @@ struct interface {
 	int phys_ifindex;	/* physical interface index, if vlan/pppoe */
 
 	u_int16_t session_id; /* session id if pppoe interface */
-	int		unit;				/* PPPoE unit number */
 	unsigned char dst_macaddr[ETH_ALEN]; /* peer mac address if pppoe interface */
 
 	u_int16_t vlan_id;	/* vlan id if vlan interface */
