@@ -868,23 +868,6 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 	return pdpa_sec_context;	
 }
 
-static inline int get_cipher_params(U16 cipher_alg,
-                                    uint32_t *iv_length, uint32_t *icv_length,
-                                    uint32_t *max_pad_length)
-{
-	switch (cipher_alg) {
-		default:
-			*iv_length = 0;
-			*icv_length = 0;
-			*max_pad_length = 0;
-			log_err("Unsupported cipher suite %d\n", cipher_alg);
-			return -EINVAL;
-	}
-
-	return 0;
-}
-
-
 static  void build_stats_descriptor_part(PSAEntry sa, size_t pdb_len)
 {
 	uint32_t *desc;
@@ -1389,94 +1372,6 @@ static int built_encap_extra_material(PSAEntry sa,
 	return 0;
 }
 
-/* Move size should be set to 64 bytes */
-static void built_decap_extra_material(PSAEntry sa,
-		dma_addr_t auth_key_dma,
-		dma_addr_t crypto_key_dma)
-{
-	uint32_t *extra_cmds;
-	uint32_t off_b, off_w, data;
-	PDpaSecSAContext pSec_sa_context; 
-
-	pSec_sa_context =sa->pSec_sa_context; 
-
-	/*
-	 * sec_desc_extra_cmds is the address were the first SEC extra command
-	 * is located, from here SEC will overwrite Job descriptor part. Need
-	 * to insert a dummy command because the LINUX CAAM API uses first word
-	 * for storing the length of the descriptor.
-	 */
-	extra_cmds = pSec_sa_context->sec_desc_extra_cmds - 1;
-
-	/*
-	 * Dummy command - will not be executed at all. Only for setting to 1
-	 * the length of the extra_cmds descriptor so that first extra material
-	 * command will be located exactly at sec_desc_extra_cmds address.
-	 */
-	append_cmd(extra_cmds, 0xdead0000);
-
-	data = 16;
-	append_math_rshift_imm_u64(extra_cmds, REG2, REG2, IMM, data);
-
-	/* math: (math1 - math2)->math1 len=8 */
-	append_math_sub(extra_cmds, REG1, REG1, REG2, MATH_LEN_8BYTE);
-
-	/* math: (math0 + 1)->math0 len=8 */
-	append_math_add(extra_cmds, REG0, REG0, ONE, MATH_LEN_8BYTE);
-
-	append_math_ldshift(extra_cmds, REG1, REG0, REG1, MATH_LEN_8BYTE);
-
-	append_math_add(extra_cmds, REG0, REG0, REG1, MATH_LEN_8BYTE);
-
-	append_cmd(extra_cmds, 0x7883c824);
-
-	/* Store in the descriptor but not in external memory */
-	off_b = sa->stats_offset;
-	append_move(extra_cmds, MOVE_SRC_MATH0 | MOVE_DEST_DESCBUF |
-			MOVE_WAITCOMP | (off_b << MOVE_OFFSET_SHIFT) | sizeof(u64));
-
-	append_cmd(extra_cmds, 0xa70040fe);
-
-	append_cmd(extra_cmds, 0xa00000f7);
-
-	/* check whether a split of a normal key is used */
-	if (pSec_sa_context->auth_data.split_key_len)
-		/* Append split authentication key */
-		append_key(extra_cmds, auth_key_dma,
-				pSec_sa_context->auth_data.split_key_len,
-				CLASS_2 | KEY_ENC | KEY_DEST_MDHA_SPLIT);
-	else if (pSec_sa_context->auth_data.auth_key_len)
-		/* Append normal authentication key */
-		append_key(extra_cmds, auth_key_dma, 
-				pSec_sa_context->auth_data.auth_key_len,
-				CLASS_2 | KEY_DEST_CLASS_REG);
-
-	/* Append cipher key */
-	append_key(extra_cmds, crypto_key_dma, 
-			pSec_sa_context->cipher_data.cipher_key_len,
-			CLASS_1 | KEY_DEST_CLASS_REG);
-
-	/* Protocol specific operation */
-	append_operation(extra_cmds, OP_PCLID_IPSEC | OP_TYPE_DECAP_PROTOCOL |
-			pSec_sa_context->cipher_data.cipher_type | 
-			pSec_sa_context->auth_data.auth_type);
-
-	/*
-	 * Store command: in the case of the Descriptor Buffer the length
-	 * is specified in 4-byte words, but in all other cases the length
-	 * is specified in bytes. Offset in 4 byte words
-	 */
-	off_w = sa->stats_indx;
-	append_store(extra_cmds, 0, CDX_DPA_IPSEC_STATS_LEN,
-			LDST_CLASS_DECO | (off_w << LDST_OFFSET_SHIFT) |
-			LDST_SRCDST_WORD_DESCBUF_SHARED);
-
-	append_jump(extra_cmds, JUMP_TYPE_HALT_USER | JUMP_COND_CALM);
-#ifdef PRINT_DESC
-	cdx_ipsec_print_desc ( extra_cmds,__func__,__LINE__);
-#endif
-}
-
 static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 		dma_addr_t auth_key_dma,
 		dma_addr_t crypto_key_dma,
@@ -1664,239 +1559,6 @@ static int cdx_ipsec_build_extended_encap_shared_descriptor(PSAEntry sa,
 
 #ifdef PRINT_DESC
 	cdx_ipsec_print_desc ( desc,__func__,__LINE__);
-#endif
-	return 0;
-}
-
-static int cdx_ipsec_build_extended_decap_shared_descriptor(PSAEntry sa,
-		dma_addr_t auth_key_dma,
-		dma_addr_t crypto_key_dma,
-		uint32_t bytes_to_copy,
-		uint8_t move_size)
-{
-	uint32_t *desc, *no_sg_jump, *extra_cmds;
-	uint32_t len, off_b, off_w, opt, stats_off_b, sg_mask, extra_cmds_len,
-		 esp_length, iv_length, icv_length, max_pad, data;
-	dma_addr_t dma_extra_cmds;
-	PDpaSecSAContext psec_as_context;
-
-	psec_as_context = sa->pSec_sa_context;
-
-	desc = (uint32_t *)psec_as_context->sec_desc->shared_desc;
-
-	/* CAAM hdr cmd + PDB size in words */
-	sa->next_cmd_indx =
-		sizeof(struct ipsec_decap_pdb) / sizeof(uint32_t) + 1;
-	if (sa->enable_stats) {
-		sa->stats_indx = sa->next_cmd_indx;
-		sa->next_cmd_indx += 2;
-		sa->stats_indx += 1;
-		sa->next_cmd_indx += 1;
-	}
-
-	/* Set lifetime counter stats offset */
-	sa->stats_offset = sa->stats_indx * sizeof(uint32_t);
-
-	built_decap_extra_material(sa, auth_key_dma, crypto_key_dma);
-
-	extra_cmds = psec_as_context->sec_desc_extra_cmds - 1;
-	extra_cmds_len = desc_len(extra_cmds) - 1;
-
-
-	dma_extra_cmds = dma_map_single(jrdev_g, psec_as_context->sec_desc_extra_cmds,
-			extra_cmds_len * sizeof(uint32_t),
-			DMA_TO_DEVICE);
-	if (dma_mapping_error(jrdev_g, dma_extra_cmds)) {
-		log_err("Could not DMA map extra CAAM commands\n");
-		return -ENXIO;
-	}
-
-	init_sh_desc_pdb(desc, cdx_ipsec_sh_desc_hdr_flags(sa),
-			(sa->next_cmd_indx - 1) * sizeof(uint32_t));
-
-	/* ????? */
-	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-	len = 0x10 << LDST_LEN_SHIFT;
-	append_cmd(desc, CMD_LOAD | opt | len);
-
-	/*
-	 * load in IN FIFO the S/G Entry located in the 5th reg after
-	 * MATH3 -> offset = sizeof(GT_REG) * 4 + offset_math3_to_GT_REG
-	 * len = sizeof(S/G entry)
-	 */
-	opt   = MOVE_SRC_MATH3 | MOVE_DEST_INFIFO_NOINFO;
-	off_b = 127 << MOVE_OFFSET_SHIFT;
-	len   = 49 << MOVE_LEN_SHIFT;
-	append_move(desc, opt | off_b | len);
-
-	/*
-	 * L2 part 1
-	 * Load from input packet to INPUT DATA FIFO first bytes_to_copy
-	 * bytes. No information FIFO entry even if automatic
-	 * iNformation FIFO entries are enabled.
-	 */
-	append_seq_fifo_load(desc, bytes_to_copy, FIFOLD_CLASS_BOTH |
-			FIFOLD_TYPE_NOINFOFIFO);
-
-	/*
-	 * Extra word part 1
-	 * Load extra words for this descriptor into the INPUT DATA FIFO
-	 */
-	append_fifo_load(desc, dma_extra_cmds,
-			extra_cmds_len * sizeof(uint32_t),
-			FIFOLD_CLASS_BOTH | FIFOLD_TYPE_NOINFOFIFO);
-
-	/*
-	 * throw away the first part of the S/G table and keep only the buffer
-	 * address;
-	 * offset = undefined memory after MATH3; Refers to the destination.
-	 * len = 41 bytes to discard
-	 */
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_MATH3;
-	off_b = 8 << MOVE_OFFSET_SHIFT;
-	len   = 41 << MOVE_LEN_SHIFT;
-	append_move(desc, opt | off_b | len);
-
-	/* put the buffer address (still in the IN FIFO) in MATH2 */
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_MATH3;
-	off_b = 0 << MOVE_OFFSET_SHIFT;
-	len   = 8 << MOVE_LEN_SHIFT;
-	append_move(desc, opt | off_b | len);
-
-	/*
-	 * Copy 15 bytes starting at 4 bytes before the OUT-PTR-CMD in
-	 * the job-desc into math1
-	 * i.e. in the low-part of math1 we have the out-ptr-cmd and
-	 * in the math2 we will have the address of the out-ptr
-	 */
-	opt = MOVE_SRC_DESCBUF | MOVE_DEST_MATH1;
-	off_b = (50 + 1 * PTR_LEN) * sizeof(uint32_t);
-	len = (8 + 4 * PTR_LEN - 1) << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/* Copy 7 bytes of the in-ptr into math0 */
-	opt   = MOVE_SRC_DESCBUF | MOVE_DEST_MATH0;
-	off_w = 50 + 1 + 3 + 2 * PTR_LEN;
-	off_b = off_w * sizeof(uint32_t); /* calculate off in bytes */
-	len   = ALIGNED_PTR_ADDRESS_SZ << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * the SEQ OUT PTR command is now in math reg 1, so the SGF bit can be
-	 * checked using a math command;
-	 */
-	sg_mask = SEQ_OUT_PTR_SGF_MASK;
-	append_math_and_imm_u32(desc, NONE, REG1, IMM, sg_mask);
-
-	opt = CLASS_NONE | JUMP_TYPE_LOCAL | JUMP_COND_MATH_Z | JUMP_TEST_ALL;
-	no_sg_jump = append_jump(desc, opt);
-
-	append_math_add(desc, REG2, ZERO, REG3, MATH_LEN_8BYTE);
-
-	/* update no S/G jump location */
-	set_jump_tgt_here(desc, no_sg_jump);
-
-	/* seqfifostr: msgdata len=4 */
-	append_seq_fifo_store(desc, FIFOST_TYPE_MESSAGE_DATA, bytes_to_copy);
-
-	/* move: ififo->deco-alnblk -> ofifo, len */
-	append_move(desc, MOVE_SRC_INFIFO | MOVE_DEST_OUTFIFO | bytes_to_copy);
-
-	/* Overwrite the job-desc location (word 50) with the first
-	 * group (10 words)*/
-	opt   = MOVE_SRC_INFIFO | MOVE_DEST_DESCBUF;
-	off_w = 50;
-	off_b = off_w * sizeof(uint32_t); /* calculate off in bytes */
-	len   = (10 * sizeof(uint32_t)) << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * Copy the context of math0 (input address) to words 32+33
-	 * They will be used later by the load command.
-	 */
-	opt = MOVE_SRC_MATH0 | MOVE_DEST_DESCBUF;
-	off_w = 32;
-	off_b = off_w * sizeof(uint32_t);
-	len = ALIGNED_PTR_ADDRESS_SZ << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/*
-	 * Copy the context of math2 (output address) to words 56+57 or 58+59
-	 * depending where the Job Descriptor starts.
-	 * They will be used later by the store command.
-	 */
-	opt = MOVE_SRC_MATH2 | MOVE_DEST_DESCBUF | MOVE_WAITCOMP;
-	off_w = 36;
-	off_b = off_w * sizeof(uint32_t);
-	len = ALIGNED_PTR_ADDRESS_SZ << MOVE_LEN_SHIFT;
-	append_move(desc, opt | (off_b << MOVE_OFFSET_SHIFT) | len);
-
-	/* Fix LIODN - OFFSET[0:1] - 01 = SEQ LIODN */
-	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-	off_b = 0x40; /* SEQ LIODN */
-	append_cmd(desc, CMD_LOAD | opt | (off_b << LDST_OFFSET_SHIFT));
-
-	/* Load from the input address 64 bytes into internal register */
-	/* load the data to be moved - insert dummy pointer */
-	opt = LDST_CLASS_2_CCB | LDST_SRCDST_WORD_CLASS_CTX;
-	off_b = 0 << LDST_OFFSET_SHIFT;
-	len = move_size << LDST_LEN_SHIFT;
-	append_load(desc, DUMMY_PTR_VAL, len, opt | off_b);
-
-	/* Wait to finish previous operation */
-	opt = JUMP_COND_CALM | (1 << JUMP_OFFSET_SHIFT);
-	append_jump(desc, opt);
-
-	/* Store the data to the output FIFO - insert dummy pointer */
-	opt = LDST_CLASS_2_CCB | LDST_SRCDST_WORD_CLASS_CTX;
-	off_b = 0 << LDST_OFFSET_SHIFT;
-	len = move_size << LDST_LEN_SHIFT;
-	append_store(desc, DUMMY_PTR_VAL, len, opt | off_b);
-
-	/* Fix LIODN */
-	opt = LDST_IMM | LDST_CLASS_DECO | LDST_SRCDST_WORD_DECOCTRL;
-	off_b = 0x80 << LDST_OFFSET_SHIFT; /* NON_SEQ LIODN */
-	append_cmd(desc, CMD_LOAD | opt | off_b);
-
-	/* Copy from descriptor to MATH REG 0 the current statistics */
-	stats_off_b = sa->stats_indx * CAAM_CMD_SZ;
-	append_move(desc, MOVE_SRC_DESCBUF | MOVE_DEST_MATH0 | MOVE_WAITCOMP |
-			(stats_off_b << MOVE_OFFSET_SHIFT) | sizeof(uint64_t));
-
-	/* Remove unnecessary headers
-	 * MATH1 = 0 - (esp_length + iv_length + icv_length) */
-	esp_length = 8; /* SPI + SEQ NUM */
-	get_cipher_params(psec_as_context->alg_suite, &iv_length, &icv_length, &max_pad);
-	data = (uint32_t) (esp_length + iv_length + icv_length);
-	append_math_sub_imm_u64(desc, REG1, ZERO, IMM, data);
-
-	/* MATH1 += SIL (bytes counter) */
-	append_math_add(desc, REG1, SEQINLEN, REG1, MATH_LEN_8BYTE);
-
-	/* data = outer IP header - should be read from DPOVRD register
-	 * MATH 2 = outer IP header length */
-	data = cpu_to_caam32(20);
-	opt = LDST_CLASS_DECO | LDST_SRCDST_WORD_DECO_MATH2;
-	len = sizeof(data) << LDST_LEN_SHIFT;
-	append_load_as_imm(desc, &data, len, opt);
-
-	off_w = 7;
-	append_jump(desc, (off_w << JUMP_OFFSET_SHIFT));
-
-	/* jump: all-match[] always-jump offset=0 local->[00] */
-	append_jump(desc, (0 << JUMP_OFFSET_SHIFT));
-
-	/* jump: all-match[] always-jump offset=0 local->[00] */
-	append_jump(desc, (0 << JUMP_OFFSET_SHIFT));
-
-	data = 0x00ff0000;
-	append_math_and_imm_u64(desc, REG2, DPOVRD, IMM, data);
-
-	dma_unmap_single(jrdev_g, dma_extra_cmds,
-			extra_cmds_len * sizeof(uint32_t), DMA_TO_DEVICE);
-
-#ifdef PRINT_DESC
-	cdx_ipsec_print_desc ( desc,__func__, __LINE__);
 #endif
 	return 0;
 }
@@ -2292,6 +1954,22 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 				ret = -EFAULT;
 				goto err_unmap_crypto;
 			}
+			/* Decap has no extended path at all. The builder that
+			 * used to serve it sized its header-strip math from a
+			 * per-cipher IV/ICV/max-pad table that NXP shipped
+			 * disabled, so every length it fed the SEC program was
+			 * zero; and it never gained the per-job PDB store the
+			 * normal decap path relies on to keep sequence and ICV
+			 * state coherent across DECOs. Emitting such a
+			 * descriptor would corrupt silently on the wire, so an
+			 * inbound SA that overflows the normal builder is
+			 * refused here and stays on the kernel software path. */
+			if (sa->direction == CDX_DPA_IPSEC_INBOUND) {
+				log_err("Inbound SA spi %d needs an extended descriptor; not supported\n",
+						sa->id.spi);
+				ret = -EFAULT;
+				goto err_unmap_crypto;
+			}
 			psec_sa_context->sec_desc_extended = true;
 			goto build_extended_shared_desc;
 		default:
@@ -2301,15 +1979,11 @@ int  cdx_ipsec_create_shareddescriptor(PSAEntry sa, uint32_t bytes_to_copy)
 	}
 
 build_extended_shared_desc:
-	/* Build the extended shared descriptor */
-	if (sa->direction == CDX_DPA_IPSEC_INBOUND)
-		ret = cdx_ipsec_build_extended_decap_shared_descriptor(sa,
-				auth_key_dma,
-				crypto_key_dma, 0, 64);
-	else
-		ret = cdx_ipsec_build_extended_encap_shared_descriptor(sa,
-				auth_key_dma,
-				crypto_key_dma, 0);
+	/* Build the extended shared descriptor. Outbound only: inbound SAs
+	 * that need it were refused above. */
+	ret = cdx_ipsec_build_extended_encap_shared_descriptor(sa,
+			auth_key_dma,
+			crypto_key_dma, 0);
 	if (ret < 0) {
 		log_err("Failed to create SEC descriptor for SA with spi %d\n",
 				sa->id.spi);
