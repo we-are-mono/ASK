@@ -84,7 +84,6 @@ struct socket {
 	u_int16_t       rsvd;
 #endif //(LS1043)
 #if defined(COMCERTO_2000) || defined(LS1043)
-	u_int16_t secure;
 	struct FlowEntry *rx_flow;
 	struct FlowEntry *tx_flow;
 #endif

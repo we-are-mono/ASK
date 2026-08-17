@@ -70,7 +70,6 @@ typedef struct _tSockEntry{
 			U32 Daddr_v6[4];
 		};
 	};
-	U16 secure;
 	U16 SA_nr_rx;
 	U16 SA_handle_rx[SA_MAX_OP];
 	U16 SA_nr_tx;

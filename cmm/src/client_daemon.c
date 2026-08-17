@@ -440,11 +440,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 			if(cmmAsymFFSetProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
-		else if (strcasecmp(keywords[1], "ipsec") == 0)
-		{
-			if(cmmIPsecSetProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
 		else if (strcasecmp(keywords[1], "rtp") == 0)
 		{
 			if (cmmRTPSetProcess(keywords, 2, daemon_handle))
@@ -1179,7 +1174,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_EXPT_QUEUE_RESET:
 	case FPP_CMD_EXPT_QUEUE_DSCP:
 	case FPP_CMD_EXPT_QUEUE_CONTROL:
-	case FPP_CMD_IPSEC_FRAG_CFG:
 	// Socket and RTP statistics
 	case FPP_CMD_RTP_CLOSE:
 	case FPP_CMD_RTP_CONTROL:

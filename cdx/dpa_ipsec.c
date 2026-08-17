@@ -206,8 +206,6 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 
 
 
-static uint32_t ipsec_exception_pkt_cnt;
-
 void *cdx_get_xfrm_state_of_sa(void *dev, uint16_t handle)
 {
 	struct xfrm_state *x;
@@ -275,9 +273,9 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	const struct qman_portal_config *pc;
 	struct dpa_napi_portal *np;
 #ifdef DPA_IPSEC_DEBUG
-	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, \n offset %d sts %08x, cnt %d\n", __func__,
+	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, \n offset %d sts %08x\n", __func__,
 			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
-			dq->fd.offset,dq->fd.status, ipsec_exception_pkt_cnt);
+			dq->fd.offset, dq->fd.status);
 
 	/* for debugging */
 	ptr = (uint8_t *)(phys_to_virt((uint64_t)dq->fd.addr));
@@ -358,7 +356,6 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 #endif /* CONFIG_FSL_ASK_QMAN_PORTAL_NAPI */
 
 	no_l2_itf_dev = vwd_is_no_l2_itf_device(net_dev);
-	ipsec_exception_pkt_cnt++;
 	percpu_bp_cnt =	raw_cpu_ptr(priv->percpu_count);
 	/*  When V6 SA is applied to v4 packet and vice versa, since ether header is
 	 *  copied from input packet, it will be wrong. Below logic is added just
@@ -437,8 +434,7 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	sp->len = 1;
 
 #ifdef DPA_IPSEC_DEBUG
-	DPAIPSEC_INFO("%s::len %d ipsec_exception_pkt_cnt %d\n", 
-			__func__, skb->len, ipsec_exception_pkt_cnt);
+	DPAIPSEC_INFO("%s::len %d\n", __func__, skb->len);
 #endif
 	/* netif_receive_skb(skb); */
 	if (use_gro)

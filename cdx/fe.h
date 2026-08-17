@@ -392,7 +392,7 @@ typedef struct _tSockOpenCommand {
 	U32		route_id;
 	U16		expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
 	U16		rsvd;
-	U16		secure;
+	U16		secure;		/* unused, reserved: layout placeholder */
 	U16 		SA_nr_rx;
 	U16 		SA_handle_rx[4];
 	U16 		SA_nr_tx;
@@ -418,7 +418,7 @@ typedef struct _tSockUpdateCommand {
 	U32 route_id;
 	U16		expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
 	U16		rsvd3;
-	U16		secure;
+	U16		secure;		/* unused, reserved: layout placeholder */
 	U16 		SA_nr_rx;
 	U16 		SA_handle_rx[4];
 	U16 		SA_nr_tx;
@@ -494,7 +494,7 @@ typedef struct _tSock6OpenCommand {
 	U32		route_id;
 	U16		expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
 	U16		rsvd1;
-	U16		secure;
+	U16		secure;		/* unused, reserved: layout placeholder */
 	U16 		SA_nr_rx;
 	U16 		SA_handle_rx[4];
 	U16 		SA_nr_tx;
@@ -522,7 +522,7 @@ typedef struct _tSock6UpdateCommand {
 	U32	route_id;
 	U16		expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
 	U16		rsvd3;
-	U16		secure;
+	U16		secure;		/* unused, reserved: layout placeholder */
 	U16 		SA_nr_rx;
 	U16 		SA_handle_rx[4];
 	U16 		SA_nr_tx;

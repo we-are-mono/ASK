@@ -157,11 +157,6 @@ typedef struct _tCommandIPSecExpireNotify{
 	unsigned int  action;
 }CommandIPSecExpireNotify, *PCommandIPSecExpireNotify;
 
-typedef struct _tCommandIPSecSetPreFrag {
-		unsigned short pre_frag_en;		
-		unsigned short reserved;
-} CommandIPSecSetPreFrag, *PCommandIPSecSetPreFrag;
-
 typedef struct _tSAQueryCommand {
   unsigned short action;
   unsigned short handle; /* handle */ 

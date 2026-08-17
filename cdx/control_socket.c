@@ -431,7 +431,6 @@ int SOCKET4_HandleIP_Socket_Open (U16 *p, U16 Length)
 	pEntry->expt_flag =  (uint8_t)SocketCmd.expt_flag;
 	pEntry->hw_stats = NULL;
 
-	pEntry->secure = SocketCmd.secure;
 	pEntry->SA_nr_rx = SocketCmd.SA_nr_rx;
 	for (i = 0; i < SocketCmd.SA_nr_rx; i++)
 		pEntry->SA_handle_rx[i] = SocketCmd.SA_handle_rx[i];
@@ -486,6 +485,7 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 	PRouteEntry pRtEntry;
 	uint8_t update_flow = 0;
 	int rc = NO_ERR;
+	int i;
 
 	// Check length
 	if (Length != sizeof(SockUpdateCommand))
@@ -545,17 +545,12 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 	if (SocketCmd.dscp != 0xffff)
 		pEntry->dscp = SocketCmd.dscp;
 
-	if (SocketCmd.secure != 0xffff)
-	{
-		int i;
-		pEntry->secure = SocketCmd.secure;
-		pEntry->SA_nr_rx = SocketCmd.SA_nr_rx;
-		for (i = 0; i < SocketCmd.SA_nr_rx; i++)
-			pEntry->SA_handle_rx[i] = SocketCmd.SA_handle_rx[i];
-		pEntry->SA_nr_tx = SocketCmd.SA_nr_tx;
-		for (i = 0; i < SocketCmd.SA_nr_tx; i++)
-			pEntry->SA_handle_tx[i] = SocketCmd.SA_handle_tx[i];
-	}
+	pEntry->SA_nr_rx = SocketCmd.SA_nr_rx;
+	for (i = 0; i < SocketCmd.SA_nr_rx; i++)
+		pEntry->SA_handle_rx[i] = SocketCmd.SA_handle_rx[i];
+	pEntry->SA_nr_tx = SocketCmd.SA_nr_tx;
+	for (i = 0; i < SocketCmd.SA_nr_tx; i++)
+		pEntry->SA_handle_tx[i] = SocketCmd.SA_handle_tx[i];
 
 	socket4_update(pEntry, SOCKET_UPDATE);
 
@@ -753,7 +748,6 @@ int SOCKET6_HandleIP_Socket_Open(U16 *p, U16 Length)
 
 	pEntry->owner_type = SOCK_OWNER_NONE;
 
-	pEntry->secure = SocketCmd.secure;
 	pEntry->SA_nr_rx = SocketCmd.SA_nr_rx;
 	for (i = 0; i < SocketCmd.SA_nr_rx; i++)
 		pEntry->SA_handle_rx[i] = SocketCmd.SA_handle_rx[i];
@@ -874,7 +868,6 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 		update_flow =  1;
 	}
 
-	pEntry->secure = SocketCmd.secure;
 	pEntry->SA_nr_rx = SocketCmd.SA_nr_rx;
 	for (i = 0; i < SocketCmd.SA_nr_rx; i++)
 		pEntry->SA_handle_rx[i] = SocketCmd.SA_handle_rx[i];

@@ -198,7 +198,7 @@ typedef struct fpp_socket4_open_cmd {
     u_int16_t	expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t	iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
 #endif //LS1043
-    u_int16_t   secure;
+    u_int16_t   secure;         /* unused, reserved: layout placeholder */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
@@ -220,7 +220,7 @@ typedef struct fpp_socket4_update_cmd {
     u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t       rsvd3;
 #endif //LS1043
-    u_int16_t   secure;
+    u_int16_t   secure;         /* unused, reserved: layout placeholder */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
@@ -249,7 +249,7 @@ typedef struct fpp_socket6_open_cmd {
     u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t	iifindex; /* iifindex is required for slow path voice frame queues sockets.*/
 #endif //LS1043
-    u_int16_t   secure;
+    u_int16_t   secure;         /* unused, reserved: layout placeholder */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
@@ -271,7 +271,7 @@ typedef struct fpp_socket6_update_cmd {
     u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
     u_int16_t       rsvd3;
 #endif //LS1043
-    u_int16_t   secure;
+    u_int16_t   secure;         /* unused, reserved: layout placeholder */
     u_int16_t   sa_nr_rx;
     u_int16_t   sa_handle_rx[4];
     u_int16_t   sa_nr_tx;
@@ -459,12 +459,6 @@ typedef struct fpp_rt_cmd {
 #define FPP_VLAN_FILTER_INGRESS_EN			(1<<4)
 #define FPP_VLAN_INGRESS_PVID				(1<<5)
 #endif
-
-/* Structure representing the command sent to enable/disable Ipsec pre-fragmentation */
-typedef struct fpp_ipsec_cmd {
-    u_int16_t   pre_frag_en;        
-    u_int16_t   rsvd;
-} __attribute__((__packed__)) fpp_ipsec_cmd_t;
 
 /* ------------------------------- RTP ---------------------------------------*/
 
@@ -1498,7 +1492,6 @@ typedef struct fpp_macvlan_cmd {
 #define FPP_CMD_IPSEC_SA_ACTION_OFFLOAD			0x0a0d
 #define FPP_CMD_IPSEC_FLOW_ADD                          0x0a11
 #define FPP_CMD_IPSEC_FLOW_REMOVE                       0x0a12
-#define FPP_CMD_IPSEC_FRAG_CFG                          0x0a14
 #define FPP_CMD_IPSEC_SA_TNL_ROUTE                      0x0a15
 #if defined(LS1043)
 #define FPP_CMD_IPSEC_SEC_FAILURE_STATS	                0x0a17

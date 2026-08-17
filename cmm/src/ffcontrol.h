@@ -77,7 +77,6 @@
 	void cmmCliExit(struct cmm_cli *ctx);
 
 	int cmmFFControlProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-	int cmmIPsecSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 
 static inline int cmmFcIsConntrackAllowed(FCI_CLIENT *fci_handle, struct nf_conntrack *ct, struct RtEntry **rtEntryOrig)
 {

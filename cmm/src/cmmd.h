@@ -66,7 +66,6 @@ typedef struct cmmd_socket_open_cmd {
         u_int8_t	queue;
 	u_int16_t	dscp;
 	u_int32_t	fwmark;
-	u_int16_t	secure;
 #if defined(LS1043)
 	u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
 #else
@@ -85,7 +84,6 @@ typedef struct cmmd_socket_update_cmd {
 	u_int16_t	dscp;
 	u_int16_t	pad;
 	u_int32_t	fwmark;
-	u_int16_t	secure;
 #if defined(LS1043)
 	u_int16_t       expt_flag; /* flag use to 1)send first packet to exception path or/and 2)duplicate rtp packets*/
 #else

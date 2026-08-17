@@ -2300,48 +2300,7 @@ usage:
 	return -1;
 }
 
-int cmmIPsecSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
-{
-	int cpt = tabStart;
-	fpp_ipsec_cmd_t cmd;
-	union u_rxbuf rxbuf;
-	char enable;
-
-	if(!keywords[cpt])
-		goto usage;
-
-	else if(strcasecmp(keywords[cpt], "pre-frag") == 0)
-	{
-		if(!keywords[++cpt])
-			goto usage;
-
-		if(strcasecmp(keywords[cpt], "enable") == 0)
-			enable = 1;
-		else if (strcasecmp(keywords[cpt], "disable") == 0)
-			enable = 0;
-		else
-			goto usage;
-
-		cmd.pre_frag_en = enable;
-
-		// Send message to forward engine
-		cmm_print(DEBUG_COMMAND, "Send CMD_IPSEC_FRAG_CFG cmd to daemon len=%zu\n",sizeof(fpp_ipsec_cmd_t));
-		if(cmmSendToDaemon(daemon_handle, FPP_CMD_IPSEC_FRAG_CFG, &cmd, sizeof(fpp_ipsec_cmd_t), rxbuf.rcvBuffer) == 4)
-		{
-			if (rxbuf.result != 0) {
-				showErrorMsg("CMD_IPSEC_FRAG_CFG", ERRMSG_SOURCE_CMMD,rxbuf.rcvBuffer);
-				return (rxbuf.result);
-			}
-		}
-		return 0;
-	}
-usage:
-	cmm_print(DEBUG_ERROR, "Usage: set ipsec pre-frag <enable disable>\n");
-	return -1;
-}
-
-
-int cmmRtpCmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
+int cmmRtpCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
   	/*Call RTP process function*/
  	cmmRTPSetProcess(argv, 0, globalConf.cli.daemon_handle);

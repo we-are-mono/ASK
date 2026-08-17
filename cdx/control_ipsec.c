@@ -36,7 +36,6 @@ static int IPsec_handle_SA_SET_TUNNEL(U16 *p, U16 Length);
 static int IPsec_handle_SA_SET_NATT(U16 *p, U16 Length);
 static int IPsec_handle_SA_SET_STATE(U16 *p, U16 Length);
 static int IPsec_handle_SA_SET_LIFETIME(U16 *p, U16 Length);
-static int IPsec_handle_FRAG_CFG(U16 *p, U16 Length);
 struct slist_head sa_cache_by_spi[NUM_SA_ENTRIES];
 struct slist_head sa_cache_by_h[NUM_SA_ENTRIES];
 struct slist_head sa_cache_by_fqid[NUM_SA_ENTRIES];
@@ -847,24 +846,6 @@ int IPsec_handle_SA_SET_LIFETIME(U16 *p, U16 Length)
 	return NO_ERR;
 }
 
-static int IPsec_handle_FRAG_CFG(U16 *p, U16 Length)
-{
-	CommandIPSecSetPreFrag cmd;
-
-	/* Check length */
-	if (Length != sizeof(CommandIPSecSetPreFrag))
-		return ERR_WRONG_COMMAND_SIZE;
-#ifdef CONTROL_IPSEC_DEBUG
-	printk(KERN_INFO "%s .. Started..\n", __func__);
-#endif
-
-	memset(&cmd, 0, sizeof(CommandIPSecSetPreFrag));
-	memcpy((U8*)&cmd, (U8*)p,  Length);
-	return NO_ERR;
-
-}
-
-
 /**
  * M_ipsec_cmdproc
  *
@@ -956,12 +937,6 @@ static U16 ipsec_query_cont_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return rc;
 }
 
-static U16 ipsec_frag_cfg_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)out_reply_len;
-	return (U16)IPsec_handle_FRAG_CFG(pcmd, cmd_len);
-}
-
 /*
  * CMD_IPSEC_SEC_FAILURE_STATS: inner returns positive stats-buffer
  * length on success (not a U16 status), or ERR_WRONG_COMMAND_SIZE /
@@ -1005,7 +980,6 @@ static const struct cdx_cmd_spec ipsec_cmd_table[] = {
 	 * ensures the buffer is large enough. ISSUES.md A1b item 6. */
 	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY,          sizeof(SAQueryCommand), U16_MAX, NULL,           ipsec_query_handle),
 	CDX_CMD_VAR(CMD_IPSEC_SA_ACTION_QUERY_CONT,     sizeof(SAQueryCommand), U16_MAX, NULL,           ipsec_query_cont_handle),
-	CDX_CMD    (CMD_IPSEC_FRAG_CFG,                 CommandIPSecSetPreFrag,     ipsec_frag_cfg_handle),
 	CDX_CMD_VAR(CMD_IPSEC_SEC_FAILURE_STATS,        0, U16_MAX, NULL,           ipsec_sec_failure_stats_handle),
 	CDX_CMD_VAR(CMD_IPSEC_RESET_SEC_FAILURE_STATS,  0, U16_MAX, NULL,           ipsec_reset_sec_failure_stats_handle),
 };
