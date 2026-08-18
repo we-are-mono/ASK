@@ -797,14 +797,14 @@ file's git history.
   before designing the unwind (same investigate-first rule as A37). Open
   (investigate).
 
-- **A65.** cmm `sa_lock` ABBA inversion, confirmed by the A54 audit: the
-  keytrack/FCI-callback thread takes `sa_lock → itf_table.lock → (ctMutex) →
-  rtMutex → neighMutex` (`cmmSASetTunnel` module_ipsec.c:533-536,
-  `cmmSASetState` :461-465) while the netlink thread takes the canonical
-  `itf → ct → rt → neigh` chain and then `sa_lock`
-  (route_cache.c:1413, module_ipsec.c:229). Pre-existing, not introduced by
-  A54. Fix shape: hoist the SA-side lock acquisition to the canonical order
-  (or drop sa_lock to a leaf taken last everywhere). Open.
+- **A65.** cmm `sa_lock` ABBA inversion — **fixed** (_6b61392_): `sa_lock` is
+  now a leaf taken after the canonical `itf → ct → rt → neigh` chain at every
+  multi-lock site. Topology note: keytrack and rtnl handlers share
+  `cmmCtThread`, so that inversion was latent; the live deadlock pair was the
+  CLI thread in `cmmCtShow` (sa → ct, held across per-entry FCI round-trips)
+  vs the ct thread's route/neigh path (chain → sa). Guarded by the static
+  lock-order test (`test_cmm_lock_order.py`); rig-validated
+  (query-vs-mutator + ipsec subset). Review residue filed as A69–A73.
 
 - **A66.** A54 freshness residual (documented by the fix's audit): after a
   rollback, the next route event re-attaches the OLD fpp route id (holder's
@@ -831,6 +831,44 @@ file's git history.
   is published and the SA waits for the real neighbor event like any other
   unresolved route (every downstream consumer already tolerates a NULL
   `neighEntry`).
+
+- **A69.** cmm `cmmCtShow` stack overflow (surfaced by the A65 review):
+  `nfct_snprintf`/`snprintf` return the would-be output length (negative on
+  error) and the running render offset into the 1024-byte stack buffer was
+  never clamped — truncation walked `buf + len` past the array with a
+  negative remaining size wrapped to a huge `size_t`; an error return wrote
+  at `buf - 1` — **fixed** (_23166a5_): offset clamped back into the buffer
+  after every render call, buffer terminated on render errors.
+
+- **A70.** cmm zombie SA on flow-update failure: `cmmSADelete` and
+  `cmmSASetState` (module_ipsec.c) bail out when `cmmUpdateFlows()` fails
+  after setting `SA_DELETE` but before `__cmmSARemove()`, so the entry leaks
+  in `sa_table` and a later SA_ADD reusing that sagd is rejected ("SA
+  exists") for the daemon's lifetime. Trigger requires an FCI transport
+  failure, so latent in practice. Fix shape: complete the removal on that
+  path (or have `cmmSACreate` treat an `SA_DELETE` entry as absent and
+  replace it). Open.
+
+- **A71.** cmm `cmmSAFlush` cannot report failure: `rc` is initialized to 0
+  and never assigned, and per-entry `cmmUpdateFlows()` failures are only
+  logged at DEBUG_INFO, so the keytrack dispatcher never sees an error for
+  SA_FLUSH. Open (low).
+
+- **A72.** cmm sa_table walk without `sa_lock` from the client-daemon
+  thread: `cmmCtChange` (holding itf/ct/rt/neigh) reaches `cmmSAFind` via
+  `____cmmCtRegister → __cmm_ct_get_SA` (conntrack.c) and walks a hash
+  bucket while the ct thread's `cmmSACreate` — which holds only `sa_lock` —
+  can insert into the same bucket. No common lock, so the walker can observe
+  a half-published node on the Cortex-A72's weak memory model. Reachable via
+  cmmctl conntrack commands. Under the leaf discipline the natural fix is
+  taking `sa_lock` around the walk (or `ctMutex` in `cmmSACreate`);
+  `cmmSAFind()`'s implicit "callers must hold `ctMutex`" lifetime contract
+  should be documented at the same time. Open.
+
+- **A73.** cmm `cmm_print` calls `cli_vabufprint` on the shared libcli
+  handle from any thread; libcli has no internal locking, so concurrent
+  output can interleave or corrupt CLI buffers. Display-only impact. Open
+  (low).
 
 - **A69.** CT register leaked the main-route references on the tunnel-route
   failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of
