@@ -848,13 +848,18 @@ file's git history.
   pre-fix DEREGISTER=202, post-fix=0). Invisible to failslab/kmemleak (a
   stuck nbref is a live ref, not lost memory) — needs the nbref oracle.
 
-- **A70.** *(test-quality, not a code bug.)* The failslab sweep tests
-  (`test_ipv4_ct_failslab`, `test_ipv6_ct_failslab`, …) hard-assert `faulted`
-  — that some N in 1..100 drove the target allocator to NULL. Because
-  failslab counts every kmalloc in the syscall path, cumulative state late in
-  a warm full-suite run drifts the count so the injection lands on
-  netlink-scaffold allocs (errno 105) and never reaches the allocator, giving
-  a spurious failure (observed 2026-08-18; passes on a fresh boot / scoped).
-  Reboot-first is the operational mitigation (runbook updated); a more robust
-  test would target the allocator directly or soften the "did we reach it"
-  guard. Open (low priority).
+- **A70.** Intermittent failslab-sweep failures ("never drove <alloc> to
+  NULL"; hit `test_ipv6_ct_failslab` and `test_vlan_failslab` in full-suite
+  runs, passing scoped minutes later) — root-caused and **fixed** (this
+  round, harness-only): the askd-agent armed fault-eligibility by writing
+  the *global* `failslab/ignore-gfp-wait` debugfs knob to N per request and
+  restoring Y per request, with the arm write wrapped in a silent
+  `except OSError: pass` — one swallowed failure left a whole sweep running
+  with GFP_KERNEL allocations exempt, so only the ~11 atomic netlink-scaffold
+  allocs were faultable (the errno-105 signature) and every register
+  "succeeded". Fix: the knob is set to N once at agent startup and left
+  there (faults nothing at rest — per-task fail-nth is the only trigger),
+  the per-request write/restore flip-flop is deleted, and arming now
+  read-verifies the knob and fails loudly instead of sweeping in the dark.
+  The earlier "warm-run drift / reboot-first" theory in the runbook was a
+  correlate, not the mechanism.

@@ -217,27 +217,30 @@ def _arm_failslab(n: int) -> None:
 
     The wrapper `should_failslab` still filters on `ignore-gfp-wait` BEFORE
     reaching should_fail_ex, so GFP_KERNEL allocations would be exempt
-    under the kernel default (Y). Flip it off here so cdx handler kmallocs
-    (all GFP_KERNEL) become eligible.
+    under the kernel default (Y). The knob is set to N once at agent
+    startup (main()) and left there: with no task's fail-nth armed the
+    setting alone faults nothing, and the old per-request write/restore
+    cycle was a global flip-flop where one silently swallowed write
+    failure made an entire sweep test nothing (the fault never reached
+    any GFP_KERNEL allocator and every register just succeeded). Verify
+    the knob here and fail LOUDLY instead of sweeping in the dark.
     """
-    try:
-        (_FAILSLAB_DIR / "ignore-gfp-wait").write_text("N\n")
-    except OSError:
-        pass
+    knob = (_FAILSLAB_DIR / "ignore-gfp-wait").read_text().strip()
+    if knob != "N":
+        raise RuntimeError(
+            f"failslab ignore-gfp-wait is {knob!r}, expected 'N' "
+            "(startup arming missing?) - GFP_KERNEL faults would be exempt"
+        )
     Path("/proc/self/fail-nth").write_text(f"{n}\n")
 
 
 def _disarm_failslab() -> None:
-    """Best-effort disarm. Call before the child exits so the global
-    `ignore-gfp-wait` knob is back at the kernel default for the next test
-    (a left-on `N` would expose other tests to spurious GFP_KERNEL faults
-    via any latent fail-nth on long-running daemons)."""
+    """Clear the per-task counter before the child exits. The global
+    `ignore-gfp-wait` knob deliberately stays at N (see _arm_failslab);
+    fail-nth is per-task and self-clears when it fires, so nothing else
+    on the system can see a fault from it."""
     try:
         Path("/proc/self/fail-nth").write_text("0\n")
-    except OSError:
-        pass
-    try:
-        (_FAILSLAB_DIR / "ignore-gfp-wait").write_text("Y\n")
     except OSError:
         pass
 
@@ -1082,6 +1085,17 @@ def build_app() -> web.Application:
 def main() -> None:
     host = os.environ.get("ASKD_HOST", "0.0.0.0")
     port = int(os.environ.get("ASKD_PORT", "9110"))
+
+    # One-time failslab eligibility arming (see _arm_failslab): GFP_KERNEL
+    # allocations must pass should_failslab's ignore-gfp-wait filter for
+    # per-task fail-nth injection to reach the cdx handlers. Safe at rest:
+    # nothing faults unless a child arms its own fail-nth.
+    try:
+        (_FAILSLAB_DIR / "ignore-gfp-wait").write_text("N\n")
+    except OSError as e:
+        print(f"askd-agent: failslab ignore-gfp-wait setup failed: {e} "
+              f"- failslab endpoints will refuse to arm", flush=True)
+
     web.run_app(build_app(), host=host, port=port, access_log=None)
 
 

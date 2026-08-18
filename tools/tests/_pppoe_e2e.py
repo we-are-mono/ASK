@@ -55,6 +55,25 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _console_ready(target) -> None:
+    """Get the DUT console to a root shell regardless of its state.
+
+    A bare login() gives up after one Enter + 5s, which times out when
+    the console sits at an already-logged-in shell that happens to be
+    quiet, or has half-typed junk on the line from earlier console
+    traffic (the source of the intermittent
+    'TimeoutError: login timed out on /dev/ttyUSB0' fixture errors in
+    full-suite runs). Clear the line first, then let sync_prompt's
+    multi-try jostle find an existing shell; only fall back to a real
+    login when that fails (fresh getty at a login: prompt, where
+    sync_prompt's Enters just redraw the prompt)."""
+    target.send("\x03")
+    try:
+        target.sync_prompt(tries=3, timeout=2.0)
+    except TimeoutError:
+        target.login("root", timeout=10.0)
+
+
 @pytest_asyncio.fixture
 async def pppoe_real_server():
     """Bring up pppoe-server on the orchestrator (vision) bound to br0
@@ -71,7 +90,7 @@ async def pppoe_real_server():
     # spawning pppoe-server — saves a spin-up + teardown cycle.
     target = Console.target()
     try:
-        target.login("root")
+        _console_ready(target)
         r = target.run("which pppd 2>&1; modinfo pppoe 2>&1 | head -1",
                        timeout=5)
         out = r.stdout
@@ -173,7 +192,7 @@ async def pppoe_dut_session(pppoe_real_server):
     without re-running with extra logging."""
     cfg = pppoe_real_server
     target = Console.target()
-    target.login("root")
+    _console_ready(target)
 
     # Load PPP kernel modules. pppd accesses /dev/ppp which is created
     # by ppp_generic on insmod; pppoe.ko depends on ppp_generic and the
