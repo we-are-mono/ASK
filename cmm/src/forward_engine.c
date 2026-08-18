@@ -44,6 +44,8 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 	struct RtEntry *rtEntry;
 	struct NeighborEntry *neigh;
 	struct socket *socket;
+	struct SATable *pSAEntry;
+	struct interface *itf;
 	struct list_head *entry;
 
 	cmm_print(DEBUG_ERROR, "%s: start\n", __func__);
@@ -54,6 +56,12 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 	__pthread_mutex_lock(&neighMutex);
 	__pthread_mutex_lock(&socket_lock);
 	__pthread_mutex_lock(&brMutex);
+	/* sa_lock guards the sa_table walk below and the list_by_sa unlinks
+	 * done by __cmmCtRemove(). It is the leaf lock, so it goes innermost:
+	 * no code path holds sa_lock while taking socket_lock or brMutex, so
+	 * appending it after them creates the only ordering edge with those
+	 * two and cannot invert any existing acquisition order. */
+	__pthread_mutex_lock(&sa_lock);
 
 	// Send message to forward engine
 	cmm_print(DEBUG_COMMAND, "Send CMD_IPV4_RESET\n");
@@ -70,12 +78,104 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 		goto unlock;
 	}
 
+	/* The drains below free every RtEntry and NeighborEntry wholesale,
+	 * but sa_table and the tunnel interfaces in itf_table survive the
+	 * reset with pointers into both. Detach those holders first, while
+	 * everything they reference is still allocated, so no step here ever
+	 * touches freed memory:
+	 *
+	 * - fpp_route: the holder owns a counted reference on an object in
+	 *   fpp_rt_table, which no drain below empties. Release it with
+	 *   __cmmFPPRoutePut(): the object (and its route id) is freed only
+	 *   when the last reference goes, so a put can never free an entry
+	 *   another holder still uses. A plain NULL would leak the object;
+	 *   __cmmFPPRouteDeregister() would send a per-route FCI delete to
+	 *   an engine that was just reset and no longer has the route.
+	 * - route: the rt_table drain frees all RtEntry objects regardless
+	 *   of refcount, so only NULL the pointer here. Neighbors are
+	 *   reachable from these holders solely via route->neighEntry, so
+	 *   with route NULLed the neighbor drain leaves no dangling path.
+	 * - FPP_NEEDS_UPDATE: armed so the next route event re-resolves and
+	 *   reprograms the holder (the recovery contract of the INVALID
+	 *   arms of __cmmSARouteUpdate()/__cmmTunnelRouteUpdate()).
+	 */
+	for (i = 0; i < SA_HASH_TABLE_SIZE; i++)
+	{
+		for (entry = list_first(&sa_table[i]); entry != &sa_table[i]; entry = list_next(entry))
+		{
+			pSAEntry = container_of(entry, struct SATable, list_by_h);
+
+			if (!pSAEntry->tnl_rt.route && !pSAEntry->tnl_rt.fpp_route)
+				continue;
+
+			if (pSAEntry->tnl_rt.fpp_route)
+			{
+				__cmmFPPRoutePut(pSAEntry->tnl_rt.fpp_route);
+				pSAEntry->tnl_rt.fpp_route = NULL;
+			}
+
+			pSAEntry->tnl_rt.route = NULL;
+			pSAEntry->flags |= FPP_NEEDS_UPDATE;
+		}
+	}
+
+	for (i = 0; i < ITF_HASH_TABLE_SIZE; i++)
+	{
+		for (entry = list_first(&itf_table.hash[i]); entry != &itf_table.hash[i]; entry = list_next(entry))
+		{
+			itf = container_of(entry, struct interface, list);
+
+			if (!__itf_is_tunnel(itf))
+				continue;
+
+			if (!itf->rt.route && !itf->rt.fpp_route)
+				continue;
+
+			if (itf->rt.fpp_route)
+			{
+				__cmmFPPRoutePut(itf->rt.fpp_route);
+				itf->rt.fpp_route = NULL;
+			}
+
+			itf->rt.route = NULL;
+			itf->flags |= FPP_NEEDS_UPDATE;
+		}
+	}
+
 	for (i = 0; i < CONNTRACK_HASH_TABLE_SIZE; i++)
 	{
 		while(!list_empty(&ct_table[i]))
 		{
 			entry = list_first(&ct_table[i]);
 			ctEntry = container_of(entry, struct ctTable, list);
+
+			/* __cmmCtRemove() frees the conntrack without releasing its
+			 * route bindings — on the normal path ____cmmCtDeregister()
+			 * puts them first. Drop each held fpp_route reference here
+			 * (no FCI deregister: the engine was just reset), or the
+			 * fpp_rt_table objects and their route ids leak, and a
+			 * later lookup can find an orphan still flagged programmed
+			 * and skip re-registering a route the engine no longer has. */
+			if (ctEntry->orig.fpp_route)
+			{
+				__cmmFPPRoutePut(ctEntry->orig.fpp_route);
+				ctEntry->orig.fpp_route = NULL;
+			}
+			if (ctEntry->rep.fpp_route)
+			{
+				__cmmFPPRoutePut(ctEntry->rep.fpp_route);
+				ctEntry->rep.fpp_route = NULL;
+			}
+			if (ctEntry->orig_tunnel.fpp_route)
+			{
+				__cmmFPPRoutePut(ctEntry->orig_tunnel.fpp_route);
+				ctEntry->orig_tunnel.fpp_route = NULL;
+			}
+			if (ctEntry->rep_tunnel.fpp_route)
+			{
+				__cmmFPPRoutePut(ctEntry->rep_tunnel.fpp_route);
+				ctEntry->rep_tunnel.fpp_route = NULL;
+			}
 
 			__cmmCtRemove(ctEntry);
 		}
@@ -108,6 +208,18 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 		{
 			entry = list_first(&socket_table[i]);
 			socket = container_of(entry, struct socket, list);
+			/* socket_remove() frees the socket without releasing its
+			 * route binding — on the normal close path __socket_close()
+			 * runs __cmmRouteDeregister() first. Here the RtEntry was
+			 * already freed by the rt_table drain above, but the
+			 * fpp_route reference is on an fpp_rt_table object no drain
+			 * empties and would leak with its route id, so drop it (no
+			 * FCI deregister: the engine was just reset). */
+			if (socket->rt.fpp_route)
+			{
+				__cmmFPPRoutePut(socket->rt.fpp_route);
+				socket->rt.fpp_route = NULL;
+			}
 			socket_remove(socket);
 		}
 	}
@@ -116,6 +228,7 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 #endif
 
 unlock:
+	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&brMutex);
 	__pthread_mutex_unlock(&socket_lock);
 	__pthread_mutex_unlock(&neighMutex);

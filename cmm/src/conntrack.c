@@ -475,6 +475,14 @@ void __cmmCtRemove(struct ctTable *ctEntry)
 	list_del(&ctEntry->list_by_orig_route);
 	list_del(&ctEntry->list_by_rep_route);
 
+	/* The deregister path unlinks these two before calling here (they are
+	 * conditional on a live tunnel route), but callers that free the entry
+	 * directly — the forward-engine reset drain — must not leave it on the
+	 * global tunnel-route hash lists. list_del is a no-op on an already
+	 * unlinked or never-linked node, so this is safe on every path. */
+	list_del(&ctEntry->list_by_orig_tunnel_route);
+	list_del(&ctEntry->list_by_rep_tunnel_route);
+
 	nfct_destroy(ctEntry->ct);
 	free(ctEntry);
 }

@@ -402,11 +402,14 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 		__func__,__LINE__,pSAEntry, pSA_cmd->sagd,pSAEntry->SAInfo.id.spi);
 	
 	pSAEntry->flags |= SA_DELETE;
+	/* cmmUpdateFlows() walks to completion and leaves no conntrack
+	 * referencing the SA whatever it returns, so the removal below is
+	 * always safe and must always run: skipping it would strand a
+	 * SA_DELETE-flagged entry in sa_table that rejects every later
+	 * SA_ADD reusing this sagd until the daemon restarts. Record the
+	 * failure for the caller and remove the SA regardless. */
 	if(cmmUpdateFlows(pSAEntry) < 0)
-	{
 		rc = -1;
-		goto out;
-	}
 	__cmmSARemove(fci_handle, pSAEntry);
 
 out:
@@ -513,11 +516,15 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 	if(pSA_cmd->state == SA_STATE_DYING)
 	{
 		pSAEntry->flags |= SA_DELETE;
+		/* cmmUpdateFlows() walks to completion and leaves no conntrack
+		 * referencing the SA whatever it returns, so the removal below
+		 * is always safe and must always run: skipping it would strand
+		 * a SA_DELETE-flagged entry in sa_table that rejects every
+		 * later SA_ADD reusing this sagd until the daemon restarts.
+		 * Record the failure — like the other failure arms here — and
+		 * remove the SA regardless. */
 		if(cmmUpdateFlows(pSAEntry) < 0)
-		{
 			rc = -1;
-			goto out;
-		}
 		__cmmSARemove(fci_handle, pSAEntry);
 	}
 

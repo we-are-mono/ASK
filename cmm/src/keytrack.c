@@ -129,6 +129,17 @@ void cmmUpdateCtEntriesInFlowNoSAList(unsigned short sgid)
 	return;
 }
 
+/* Detach every conntrack from this SA and reprogram each one without it.
+ *
+ * Contract the SA teardown paths (cmmSADelete/cmmSASetState/cmmSAFlush)
+ * rely on: the walk always runs to completion and cannot bail mid-walk.
+ * Every entry on the SA's ctentry_list has its fEntry*SA back-pointer
+ * cleared and its list_by_sa node unlinked from the SA before the
+ * conntrack is reprogrammed, so on return no conntrack references
+ * pSAEntry regardless of how the individual reprogramming attempts went,
+ * and removing/freeing the SA is unconditionally safe. Any future change
+ * that adds a failure return here must still unlink everything first, or
+ * the callers' unconditional __cmmSARemove() becomes a use-after-free. */
 int cmmUpdateFlows(struct SATable *pSAEntry)
 {
 	struct ctTable *ctEntry; 
