@@ -1244,6 +1244,12 @@ int ____cmmCtLocalRegister(FCI_CLIENT *fci_handle, struct ctTable* ctEntry)
 /* this function is called for each SA_INFO received in conntrack message,
    if there is a matching SA for given SA_INFO, that SA pointer gets
    filled in fEntrySA
+
+   Walks sa_table through cmmSAFind() and links the connection onto the
+   SA. Callers must therefore satisfy cmmSAFind()'s contract: hold sa_lock,
+   or run on cmmCtThread. ctMutex is what keeps the SA alive across the
+   call, and it also serialises the ctentry_list link with the teardown
+   paths that unlink it.
 */
 static void __cmm_ct_get_SA(struct ctTable *ctEntry,
 						unsigned short *xfrm_handle,
@@ -3517,6 +3523,11 @@ static int cmmCtChange(FCI_CLIENT *fci_handle, int function_code, u_int8_t *cmd_
 
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
+	/* Registering a secure connection looks the SA up in sa_table and
+	 * links the connection onto it. Only cmmCtThread ever writes that
+	 * table, and this runs on the client daemon thread, so the walk needs
+	 * sa_lock to be safe. It is the leaf lock, taken last. */
+	__pthread_mutex_lock(&sa_lock);
 
 	rc = ____cmmCtRegister(fci_handle, ctEntry);
 	if (rc == 0)
@@ -3525,6 +3536,7 @@ static int cmmCtChange(FCI_CLIENT *fci_handle, int function_code, u_int8_t *cmd_
 		*res_len = 2;
 	}
 
+	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 

@@ -1419,7 +1419,7 @@ static void __cmmRouteNew(FCI_CLIENT *fci_handle, struct rtmsg *rtm, unsigned in
 		for (entry = list_first(&itf_table.hash[i]); entry != &itf_table.hash[i]; entry = list_next(entry))
 		{
 			itf = container_of(entry, struct interface, list);
-			if(__cmmRouteIsTnlItf(itf->tunnel_family, dAddr, itf, 1, rtm->rtm_dst_len))
+			if(__cmmRouteIsTnlItf(rtm->rtm_family, dAddr, itf, 1, rtm->rtm_dst_len))
 			{
 				if (!flushed)
 				{
@@ -1438,7 +1438,7 @@ static void __cmmRouteNew(FCI_CLIENT *fci_handle, struct rtmsg *rtm, unsigned in
                 for (entry = list_first(&sa_table[i]); entry != &sa_table[i]; entry = list_next(entry))
                 {
                         s = container_of(entry, struct SATable, list_by_h);
-                        if(__cmmRouteIsSA(s->SAInfo.proto_family, dAddr, s, 1, rtm->rtm_dst_len))
+                        if(__cmmRouteIsSA(rtm->rtm_family, dAddr, s, 1, rtm->rtm_dst_len))
                         {
                                 if (!flushed)
                                 {

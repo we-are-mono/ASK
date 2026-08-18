@@ -688,7 +688,11 @@ err:
 static int socket_open(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, cmmd_socket_open_cmd_t *cmd)
 {
 	struct socket *s;
-	unsigned short rc = 0; // rc=2 OK, rc=0 KO, cmm_client error code hack 
+	/* Signed on purpose: a non-negative value is a CMMD_ERR_* code the
+	 * daemon copies into the response slot, a negative one is a transport
+	 * failure the daemon answers with errno. Narrowing this to an unsigned
+	 * short would turn the latter into a bogus positive error code. */
+	int rc = 0;
 
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
@@ -703,7 +707,8 @@ static int socket_open(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, cmmd_
 		s = socket_add(cmd);
 		if (!s)
 		{
-			rc = -1;
+			/* socket_add() only fails on allocation. */
+			rc = CMMD_ERR_MEMORY;
 			goto exit;
 		}
 	}
@@ -727,7 +732,8 @@ exit:
 static int socket_update(FCI_CLIENT *fci_handle, cmmd_socket_update_cmd_t *cmd)
 {
 	struct socket *s;
-	unsigned short rc = 0; // rc=2 OK, rc=0 KO, cmm_client error code hack
+	/* Signed on purpose: see socket_open(). */
+	int rc = 0;
 	struct ct_route old_route;
 	u_int32_t old_saddr[4];
 	u_int16_t old_sport;

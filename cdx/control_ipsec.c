@@ -393,6 +393,24 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 			sa->flags |= SA_ALLOW_EXT_SEQ_NUM;
 		sa->hash_by_spi = hash_key_sa;
 		sa->hash_by_h   =  handle & (NUM_SA_ENTRIES - 1);
+
+		/* The fqid list is what the data path walks to find an SA, so it
+		 * is linked last: until the entry is in the handle and SPI tables
+		 * it cannot be looked up or torn down by the control path, and a
+		 * failure here has to leave nothing behind for either path to
+		 * reach. */
+		if (sa_add(sa) != NO_ERR)
+		{
+#ifdef CONTROL_IPSEC_DEBUG
+			printk(KERN_INFO "%s sa_add failed\n", __func__);
+#endif
+			cdx_ipsec_sec_sa_context_free(sa->pSec_sa_context);
+			sa->pSec_sa_context = NULL;
+			sa_free(sa);
+			return NULL;
+
+		}
+
 		/* maintaining SA table with cp_to_fqids */
 		slist_add(&sa_cache_by_fqid[(sa->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1))],
 				&sa->list_fqid);
@@ -403,15 +421,6 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 		printk("%s::sa %p, context %p handle %d dir %d\n",
 				__func__, sa, sa->pSec_sa_context, sa->hash_by_h, sa->direction);
 #endif
-
-		if (sa_add(sa) != NO_ERR)
-		{
-#ifdef CONTROL_IPSEC_DEBUG
-			printk(KERN_INFO "%s sa_add failed\n", __func__);
-#endif
-			return NULL;
-
-		}
 
 	}
 	return sa;

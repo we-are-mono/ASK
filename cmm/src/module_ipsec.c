@@ -441,6 +441,10 @@ int cmmSAFlush(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len,
 			if(cmmUpdateFlows(pSAEntry) < 0)
 			{
 				cmm_print(DEBUG_INFO,"%s Failed \n", __func__);
+				/* A flush has to empty the table, so keep going and
+				 * remove the remaining entries. Remember the failure
+				 * so the caller still learns the flush was partial. */
+				rc = -1;
 			}
 			__cmmSARemove(fci_handle, pSAEntry);
 		}
@@ -582,6 +586,11 @@ out:
 }
 
 
+/* Walks an sa_table bucket and takes no lock of its own. A caller must
+ * either hold sa_lock, or run on cmmCtThread — the only thread that ever
+ * inserts into or removes from sa_table. The entry that comes back is
+ * only guaranteed to stay allocated while the caller holds ctMutex: every
+ * teardown path unlinks and frees an SA with ctMutex held. */
 struct SATable *cmmSAFind(unsigned short handle)
 {
 	return __cmmSAFind(handle);
