@@ -85,7 +85,16 @@ def _console_ready(target, drain_budget: float = 90.0) -> None:
     try:
         target.sync_prompt(tries=5, timeout=2.0)
     except TimeoutError:
-        target.login("root", timeout=10.0)
+        try:
+            target.login("root", timeout=10.0)
+        except TimeoutError as e:
+            # Show what the console actually produced — a silent line and
+            # a flooded line need different fixes, and the bare timeout
+            # message can't tell them apart.
+            tail = target.buf[-300:].decode(errors="replace")
+            raise TimeoutError(
+                f"{e}; console buffer tail during probe: {tail!r}"
+            ) from None
 
 
 @pytest_asyncio.fixture
