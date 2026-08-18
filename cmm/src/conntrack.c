@@ -206,8 +206,8 @@ int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 
 	for (i = 0 ; i < CONNTRACK_HASH_TABLE_SIZE; i++)
 	{
+		__pthread_mutex_lock(&ctMutex);
 		__pthread_mutex_lock(&sa_lock);
-        __pthread_mutex_lock(&ctMutex);
 
 		for(entry = list_first(&ct_table[i]); entry != &ct_table[i]; entry = list_next(entry))
 		{
@@ -253,8 +253,8 @@ int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 				nb_mult_ids++;
 		}
 
-		__pthread_mutex_unlock(&ctMutex);
 		__pthread_mutex_unlock(&sa_lock);
+		__pthread_mutex_unlock(&ctMutex);
 
 		/* Give a chance to other processes waiting for the lock */
 		if (!(i % 100))

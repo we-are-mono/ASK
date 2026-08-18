@@ -33,6 +33,11 @@ struct nlkey_sa_notify {
 };
 
 struct list_head sa_table[SA_HASH_TABLE_SIZE];
+
+/* sa_lock is a leaf lock: taken after itf_table.lock/ctMutex/rtMutex/neighMutex
+ * when combined with them, never before any of them. The rtnl route/neighbor
+ * paths hold the canonical chain and take sa_lock innermost; every other taker
+ * must match or deadlock against them. Taking sa_lock on its own is fine. */
 pthread_mutex_t sa_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
@@ -380,11 +385,11 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 {
 	struct SATable *pSAEntry;
 	int rc = 0;
-	__pthread_mutex_lock(&sa_lock);
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
+	__pthread_mutex_lock(&sa_lock);
 
 	pSAEntry = __cmmSAFind(pSA_cmd->sagd);
 	if (!pSAEntry)
@@ -402,14 +407,14 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 		rc = -1;
 		goto out;
 	}
-	__cmmSARemove(fci_handle, pSAEntry);	
+	__cmmSARemove(fci_handle, pSAEntry);
 
-out:	
+out:
+	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
 	__pthread_mutex_unlock(&itf_table.lock);
-	__pthread_mutex_unlock(&sa_lock);
 	return rc;
 }
 
@@ -420,12 +425,12 @@ int cmmSAFlush(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len,
 	struct SATable *pSAEntry;
 	struct list_head *entry;
 
-	__pthread_mutex_lock(&sa_lock);
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
-	
+	__pthread_mutex_lock(&sa_lock);
+
 	for (i = 0; i < SA_HASH_TABLE_SIZE; i++)
 	{
 		for(entry = list_first(&sa_table[i]); entry != &sa_table[i]; )	
@@ -440,11 +445,11 @@ int cmmSAFlush(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len,
 			__cmmSARemove(fci_handle, pSAEntry);
 		}
 	}
+	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
 	__pthread_mutex_unlock(&itf_table.lock);
-	__pthread_mutex_unlock(&sa_lock);
 	return rc;
 }
 
@@ -475,11 +480,11 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 		cmm_print(DEBUG_ERROR, "%s: command length doesn't match %zu-%d\n", __func__, sizeof(CommandIPSecSetState), len);
 		return -1;
 	}
-	__pthread_mutex_lock(&sa_lock);
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
+	__pthread_mutex_lock(&sa_lock);
 
 	pSAEntry = __cmmSAFind(pSA_cmd->sagd);
 
@@ -527,11 +532,11 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 		*state_valid = 0;
 
 out:
+	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
 	__pthread_mutex_unlock(&itf_table.lock);
-	__pthread_mutex_unlock(&sa_lock);
 	return rc;
 
 
@@ -547,10 +552,10 @@ int cmmSASetTunnel(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short 
 		cmm_print(DEBUG_ERROR, "%s: command length doesn't match %zu-%d\n", __func__, sizeof(CommandIPSecSetTunnel), len);
 		return -1;
 	}
-	__pthread_mutex_lock(&sa_lock);
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
+	__pthread_mutex_lock(&sa_lock);
 	pSAEntry = __cmmSAFind(pSA_cmd->sagd);
 
 	if (!pSAEntry)
@@ -568,11 +573,11 @@ int cmmSASetTunnel(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short 
 
 	/* Find the route for tunnel and corresponding neighbor here */
 	rc = __cmmSATunnelRegister(fci_handle, pSAEntry);
-out:	
+out:
+	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&itf_table.lock);
-	__pthread_mutex_unlock(&sa_lock);
 	return rc;
 }
 

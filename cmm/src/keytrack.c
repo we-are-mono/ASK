@@ -100,11 +100,11 @@ void cmmUpdateCtEntriesInFlowNoSAList(unsigned short sgid)
 	   those ctEntries are set to FLOW_NO_ORIG_SA / FLOW_NO_REPL_SA and added
 	   to flow_no_sa list; go through those lists and update flows
 	*/
-	__pthread_mutex_lock(&sa_lock);
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&ctMutex);
 	__pthread_mutex_lock(&rtMutex);
 	__pthread_mutex_lock(&neighMutex);
+	__pthread_mutex_lock(&sa_lock);
 
 	for(entry = list_first(&ct_flow_no_sa_list); entry != &ct_flow_no_sa_list; )	
 	{
@@ -120,11 +120,11 @@ void cmmUpdateCtEntriesInFlowNoSAList(unsigned short sgid)
 			__cmmUpdateFlowDependecies(ctEntry);
 		}
 	}
+	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
 	__pthread_mutex_unlock(&ctMutex);
 	__pthread_mutex_unlock(&itf_table.lock);
-	__pthread_mutex_unlock(&sa_lock);
 
 	return;
 }
