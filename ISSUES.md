@@ -834,14 +834,12 @@ file's git history.
   at `buf - 1` — **fixed** (_23166a5_): offset clamped back into the buffer
   after every render call, buffer terminated on render errors.
 
-- **A70.** cmm zombie SA on flow-update failure: `cmmSADelete` and
-  `cmmSASetState` (module_ipsec.c) bail out when `cmmUpdateFlows()` fails
-  after setting `SA_DELETE` but before `__cmmSARemove()`, so the entry leaks
-  in `sa_table` and a later SA_ADD reusing that sagd is rejected ("SA
-  exists") for the daemon's lifetime. Trigger requires an FCI transport
-  failure, so latent in practice. Fix shape: complete the removal on that
-  path (or have `cmmSACreate` treat an `SA_DELETE` entry as absent and
-  replace it). Open.
+- **A70.** cmm zombie SA on flow-update failure — **fixed** (_ae77bad_):
+  `cmmSADelete`/`cmmSASetState` record the failure and still run
+  `__cmmSARemove` (safe: `cmmUpdateFlows` provably unlinks every conntrack
+  before returning — contract now documented at the function). Unreachable
+  armor today (`cmmUpdateFlows` cannot fail); removes the latent
+  wedged-sagd path.
 
 - **A71.** cmm `cmmSAFlush` could not report failure — **fixed** (_42379cb_):
   a per-entry `cmmUpdateFlows()` failure records `rc=-1` while the flush
@@ -864,14 +862,15 @@ file's git history.
   output can interleave or corrupt CLI buffers. Display-only impact. Open
   (low).
 
-- **A74.** `cmmFeReset` (forward_engine.c, CLI `reset` command) frees every
-  RtEntry directly while `SATable.tnl_rt.route` and tunnel `itf->rt.route`
-  may still point at them — dangling route pointers after a CLI reset — and
-  it unlinks the ct→SA `list_by_sa` nodes from the CLI thread under `ctMutex`
-  but without `sa_lock` (the write-side pairing the rest of the tree now
-  keeps). Surfaced by the A72 audits. Fix shape: route teardown must go
-  through the holders (or NULL their references), and the reset path should
-  take `sa_lock` with the rest of its ladder. Open.
+- **A74.** `cmmFeReset` dangling holder references, missing `sa_lock`, and
+  fpp-route reference leaks — **fixed** (_ae77bad_): the reset detaches SA
+  and tunnel holders before the drains (fpp-route put + route NULL +
+  `FPP_NEEDS_UPDATE`), releases ct/socket fpp-route references in the
+  drains, takes `sa_lock` innermost, and `__cmmCtRemove` now unlinks the
+  tunnel-route hash nodes. Audit-confirmed refcount-balanced and
+  order-safe; rig-validated on normal and KASAN images (CLI
+  `set activate 0/1` with live programmed flows: drain → refill of the
+  same flow, zero splats; full suite 291 passed).
 
 - **A75.** cmm client error reporting gaps (A55 residue): `socket_daemon`
   presets `res_buf[0]=CMMD_ERR_WRONG_COMMAND_SIZE`, so on a transport
@@ -884,8 +883,28 @@ file's git history.
   → ____cmmCtRegister` has no progress guard: a hybrid local/non-local
   conntrack whose local destination equals a tunnel's outer remote address
   can recurse while tunnel-route registration keeps failing. Contrived
-  input, but the recursion is stack-unbounded. Fix shape: a visited flag or
-  depth guard on the local-registration hop. Open (low).
+  input, but the recursion is stack-unbounded. Same family: the nested
+  registration can, in a stale-rekey corner, rekey-unlink the node
+  `cmmUpdateFlows`' walk saved as next (or re-link it onto another SA's
+  list), invalidating the iterator. Fix shape: a visited flag or depth
+  guard on the local-registration hop. Open (low).
+
+- **A77.** RT_POLICY routes escape `cmmFeReset`'s rt drain:
+  `cmmPolicyRouting` mallocs per-ct RtEntries linked only on
+  `rt_table_by_gw_ip` (never `rt_table`), and the reset frees the holding
+  ct without a route put — the RtEntry leaks and stays on the by-gw-ip
+  list with a `neighEntry` pointer into the fully drained neighbor table
+  (stale membership; today only pointer-compared, so leak not crash).
+  Relevant only with extroute policy routing configured. Open (low).
+
+- **A78.** Whether the forward engine preserves tunnel objects across
+  `FPP_CMD_IPV4/IPV6_RESET` is unconfirmed: tunnel interfaces keep
+  `FPP_PROGRAMMED` set across a cmm reset (pre-existing, matches the
+  INVALID-arm model), so the first post-reset reprogram sends
+  ACTION_UPDATE; if the engine also wiped tunnel objects, that update
+  targets a missing object. Needs an engine-side check (cdx TNL handler
+  semantics after reset) before deciding whether reset should clear
+  `FPP_PROGRAMMED` on tunnel itfs. Open (investigate).
 
 - **A69.** CT register leaked the main-route references on the tunnel-route
   failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of
