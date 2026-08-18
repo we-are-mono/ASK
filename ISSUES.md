@@ -629,15 +629,14 @@ file's git history.
   validate-then-commit. The confirm pass surfaced four live same-shape route-ref
   bugs → A48-A51 below.
 
-- **A46.** `FM_PCD_HashTableAddKey` (patch 010, fm_cc.c) passes its
-  `t_FmPcdCcKeyParams *` straight into `ExternalHashTableAddKey`'s
-  `void *tbl_entry` parameter, which is cast to `struct en_exthash_tbl_entry *`
-  and dereferenced as `->hashentry.key[0]` — a type confusion on the still-live
-  `FM_PCD_IOC_HASH_TABLE_ADD_KEY` ioctl path. Two audit passes disagree on
-  exposure: one says fmc calls HashTableAddKey at boot (and tables demonstrably
-  work), the other flags the cast as wrong. Needs its own confirm pass — what
-  fmc actually sends on that ioctl, and whether the layouts coincide — before
-  any fix. Open (investigate).
+- **A46.** `FM_PCD_HashTableAddKey` type confusion on the
+  `FM_PCD_IOC_HASH_TABLE_ADD_KEY` ioctl path — **fixed** (_e690063_): the
+  ioctl case body is deleted (falls into the `E_INVALID_SELECTION` stub arm,
+  matching the already-stubbed DELETE/REMOVE_KEY siblings),
+  `FM_PCD_HashTableAddKey` is removed outright (definition, export, header),
+  and `ExternalHashTableAddKey`'s entry parameter is tightened to
+  `struct en_exthash_tbl_entry *` so the confusion is a compile error.
+  Re-verified against the shipped patch 010 hunks before closing.
 
 - **A47.** `show_fm_risc_load` (lnxwrp_sysfs_fm.c) calls `msleep(1000)` with
   hard IRQs disabled — `__schedule()` re-enables them on the context switch, so
@@ -747,11 +746,12 @@ file's git history.
   Dead today (`sa_add` always returns NO_ERR) — latent trap; reorder when the
   file is next touched. Open.
 
-- **A59.** `struct _cdx_ctrl.lock` (`cdx_ctrl.h:15`) is a dead spinlock: only
-  ever `spin_lock_init`'ed (`cdx_main.c:98`), never acquired anywhere; the
-  `cdx_main.c:22-46` concurrency comment still describes it (and a
-  `ctrl->mutex -> ctrl->lock` ordering) as load-bearing. Delete the field and
-  fix the comment on the next cdx_main touch. Cosmetic. Open.
+- **A59.** `struct _cdx_ctrl.lock` was a dead spinlock (init'ed, never
+  acquired; the timer wheels actually run under `ctrl.mutex`) and the
+  `cdx_main.c` concurrency comment described it plus nonexistent
+  `ctrl->work`/`ctrl->msg_list` fields as load-bearing — **fixed**
+  (_6b6d9f2_): field and init deleted, comment rewritten to the real
+  mutex-only discipline.
 
 - **A60.** MURAM `dc zva` oops family: socket-open `memset` of the 128-byte
   MURAM stats block faulted on Device-nGnRE memory and wedged `ctrl.mutex` —
@@ -764,16 +764,16 @@ file's git history.
   live during the A48 runtime confirmation. Comment falsehood in patch 010's
   `memcpy.c` hunk stays tracked as A61.
 
-- **A61.** `patches/kernel/010-ask-fman-dpaa-ehash.patch`'s `etc/memcpy.c` hunk
-  replaces `IO2IOCpy32`/`Mem2IOCpy32`/`IO2MemCpy32` with plain `memcpy()` under
-  the comment "On this platform FMan MURAM/register space is mapped as normal
-  cacheable memory" — which is false (`lnxwrp_fm.c:889,900,914,928` all
-  `devm_ioremap`; `cdx_qos.c:551` states the opposite). No crash today (`memcpy`
-  never emits `dc zva`), but the rationale is unsound and will mislead. Those
-  helpers run on MURAM/register space at `fm_replic.c:318`, `fm.c:488,515`.
-  Reword the comment to the truth and consider whether the conversions should be
-  the `_fromio`/`_toio` forms. (`IOMemSet32` is untouched by the hunk — keeps its
-  `WRITE_UINT32` loop — which is why `FmMuramClear` and friends are safe.) Open.
+- **A61.** Patch 010's `etc/memcpy.c` hunk justified aliasing the IO copy
+  helpers to plain `memcpy()` with a false "MURAM is normal cacheable memory"
+  comment (it is Device-nGnRE iomem) — **comment fixed** (_6b6d9f2_): now
+  states the truth — tolerated only because arm64 `memcpy` never emits
+  `dc zva`, with `memcpy_fromio/_toio` named as the preferable forms. The
+  actual conversion of `IO2IOCpy32`/`Mem2IOCpy32`/`IO2MemCpy32` call sites
+  (`fm_replic.c:318`, `fm.c:488,515`) to the `_fromio`/`_toio` forms remains
+  a candidate for the next patch-010 functional touch; safe today by the
+  absence of `dc zva` in `memcpy`. (`IOMemSet32` keeps its `WRITE_UINT32`
+  loop — why `FmMuramClear` and friends are safe.)
 
 - **A62.** `cdx/cdx_ehash.c:2363-2368` (`create_rtprelay_process_opcode`) stores
   `cpu_to_be32(PTR_TO_UINT(rtpinfo_ptr / in_sockstats_ptr / out_sockstats_ptr))`
@@ -825,10 +825,12 @@ file's git history.
   family correctly. Wrong-family matches only cost a spurious idempotent
   `__tunnel_add`, so impact is noise, not corruption. Open (cleanup).
 
-- **A68.** `__cmmSATunnelRegister` (module_ipsec.c:168-172) dereferences
-  `__cmmNeighAdd()`'s result (`->count++`) with no NULL check — malloc
-  failure crashes the daemon. Two-line guard; fold into the next
-  module_ipsec.c touch. Open.
+- **A68.** `__cmmSATunnelRegister` dereferenced `__cmmNeighAdd()`'s result
+  (`->count++`) with no NULL check — malloc failure crashed the daemon —
+  **fixed** (_6b6d9f2_): result checked; on failure no dummy neighbor entry
+  is published and the SA waits for the real neighbor event like any other
+  unresolved route (every downstream consumer already tolerates a NULL
+  `neighEntry`).
 
 - **A69.** CT register leaked the main-route references on the tunnel-route
   failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of
@@ -839,7 +841,7 @@ file's git history.
   ~766/778, `control_ipv6.c` ~335/346). A53 widened reachability: a
   quarantined tunnel route now returns NULL from `L2_route_get`, so tearing
   down a tunnel's parent iface then registering a CT that names its route
-  hits the leak. **Fixed** (this round): new `ct_free_unresolved()` mirrors
+  hits the leak. **Fixed** (_616db95_): new `ct_free_unresolved()` mirrors
   `ct_add`'s err0 unwind (release both main refs + both tnl refs, then free);
   the four register sites and `ct_add`'s err0 now funnel through it.
   Rig-validated pre→post under KASAN (`test_ct_tunnel_route_leak.py`:
