@@ -195,6 +195,25 @@ int cmmCtNetlinkRemove(struct nfct_handle * handler, struct nf_conntrack *ct)
 *
 *
 ******************************************************************/
+
+/* Clamp a render offset back into buf. nfct_snprintf and snprintf return
+ * the length the full output would have needed (or a negative value on
+ * error), not what was written, so a running offset fed by their return
+ * values must be pulled back inside the buffer before it is used as a
+ * write position again. On error the buffer contents are undefined, so
+ * terminate it. */
+static int cmmCtShowClamp(char *buf, size_t size, int len)
+{
+	if (len < 0)
+	{
+		buf[0] = '\0';
+		return 0;
+	}
+	if ((size_t)len >= size)
+		return (int)(size - 1);
+	return len;
+}
+
 int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 {
 	struct ctTable * temp;
@@ -224,28 +243,28 @@ int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc)
 			
 			nfct_set_attr_u32(temp->ct, ATTR_TIMEOUT, timeout);
 
-			len = nfct_snprintf(buf, 1024, temp->ct, NFCT_T_UNKNOWN, NFCT_O_PLAIN, NFCT_OF_SHOW_LAYER3);
+			len = cmmCtShowClamp(buf, sizeof(buf), nfct_snprintf(buf, sizeof(buf), temp->ct, NFCT_T_UNKNOWN, NFCT_O_PLAIN, NFCT_OF_SHOW_LAYER3));
 
 			nfct_set_attr_u32(temp->ct, ATTR_TIMEOUT, orig_timeout);
 
 			if (temp->fEntryOrigFwdSA || temp->fEntryOrigOutSA)
 			{
-				len += snprintf(buf + len, 1024 - len, " IpSec:");
+				len = cmmCtShowClamp(buf, sizeof(buf), len + snprintf(buf + len, sizeof(buf) - len, " IpSec:"));
 				if (temp->fEntryOrigOutSA)
-					len += snprintf(buf + len, 1024 - len, " Orig OUT(sa_nr:1 H0:%04x)", temp->fEntryOrigOutSA->SAInfo.sagd);
+					len = cmmCtShowClamp(buf, sizeof(buf), len + snprintf(buf + len, sizeof(buf) - len, " Orig OUT(sa_nr:1 H0:%04x)", temp->fEntryOrigOutSA->SAInfo.sagd));
 
 				if (temp->fEntryOrigFwdSA)
-					len += snprintf(buf + len, 1024 - len, " Orig FWD(sa_nr:1 H0:%04x)", temp->fEntryOrigFwdSA->SAInfo.sagd);
+					len = cmmCtShowClamp(buf, sizeof(buf), len + snprintf(buf + len, sizeof(buf) - len, " Orig FWD(sa_nr:1 H0:%04x)", temp->fEntryOrigFwdSA->SAInfo.sagd));
 			}
 
 			if (temp->fEntryRepFwdSA || temp->fEntryRepOutSA)
 			{
-				len += snprintf(buf + len, 1024 - len, " IpSec:");
+				len = cmmCtShowClamp(buf, sizeof(buf), len + snprintf(buf + len, sizeof(buf) - len, " IpSec:"));
 				if (temp->fEntryRepOutSA)
-					len += snprintf(buf + len, 1024 - len, " Reply OUT(sa_nr:1 H0:%04x)", temp->fEntryRepOutSA->SAInfo.sagd);
+					len = cmmCtShowClamp(buf, sizeof(buf), len + snprintf(buf + len, sizeof(buf) - len, " Reply OUT(sa_nr:1 H0:%04x)", temp->fEntryRepOutSA->SAInfo.sagd));
 
 				if (temp->fEntryRepFwdSA)
-					snprintf(buf + len, 1024 - len, " Reply FWD(sa_nr:1 H0:%04x)", temp->fEntryRepFwdSA->SAInfo.sagd);
+					snprintf(buf + len, sizeof(buf) - len, " Reply FWD(sa_nr:1 H0:%04x)", temp->fEntryRepFwdSA->SAInfo.sagd);
 			}
 			cli_print(cli, "%s, Flags: %x, n_id: %d, local-conn: %s", buf, temp->flags, temp->n_id, ((temp->flags & LOCAL_CONN) ? "yes" : "no"));
 

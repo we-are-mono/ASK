@@ -15,8 +15,9 @@ pthread mutexes (`__pthread_mutex_lock` is a straight alias for
 `pthread_mutex_lock`), so both threads wedge permanently and all offload
 event processing stops.
 
-Host-side only: this parses the C sources, no DUT involvement. It is a
-coarse textual model of lock state — good enough because the offending
+This parses the C sources on the host and never talks to the target
+itself (the suite's standard target-reachability gate in conftest still
+applies to the session). It is a coarse textual model of lock state — good enough because the offending
 pattern is a literal ladder of `__pthread_mutex_lock(&x)` calls in a
 single function — and the acquisition-site count below guards against
 the parse silently degrading into a no-op pass.
