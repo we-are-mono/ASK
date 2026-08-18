@@ -287,19 +287,35 @@ def _netlink_send_failslab(
             )
             msg = nlh + body
 
+            # fail-nth counts EVERY should_fail() call this task makes, not
+            # just failslab: with the debug build's full fault-injection
+            # family enabled, the child's own page faults between arming
+            # and the syscall consume counts via fail_page_alloc, and the
+            # burn varies with the (COW-inherited) memory layout — which is
+            # what made whole sweeps land short of the target allocator
+            # (ISSUES.md A70). Pin everything now so the interpreter takes
+            # no page faults after arming, and pre-resolve the bound
+            # methods so the armed window is exactly send+recv.
+            import ctypes
+            MCL_CURRENT, MCL_FUTURE = 1, 2
+            mlockall_rc = ctypes.CDLL(None, use_errno=True).mlockall(
+                MCL_CURRENT | MCL_FUTURE)
+            do_send = sock.send
+            do_recv = sock.recv
+
             _arm_failslab(failslab_times)
             armed = True
 
             send_err = None
             try:
-                sock.send(msg)
+                do_send(msg)
             except OSError as e:
                 send_err = f"send: errno={e.errno} {e.strerror}"
 
             reply = b""
             if send_err is None:
                 try:
-                    reply = sock.recv(8192)
+                    reply = do_recv(8192)
                 except socket.timeout:
                     reply = b""
                 except OSError as e:
@@ -328,6 +344,7 @@ def _netlink_send_failslab(
                 "reply_hex":      reply.hex(),
                 "failslab_times": failslab_times,
                 "fail_nth_residue": fail_nth_residue,
+                "mlockall_rc":    mlockall_rc,
             }
             if send_err:
                 result["send_error"] = send_err

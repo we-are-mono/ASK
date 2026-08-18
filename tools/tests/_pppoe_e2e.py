@@ -21,6 +21,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import time
 
 import pathlib
 import pytest
@@ -55,21 +56,34 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _console_ready(target) -> None:
+def _console_ready(target, drain_budget: float = 90.0) -> None:
     """Get the DUT console to a root shell regardless of its state.
 
-    A bare login() gives up after one Enter + 5s, which times out when
-    the console sits at an already-logged-in shell that happens to be
-    quiet, or has half-typed junk on the line from earlier console
-    traffic (the source of the intermittent
-    'TimeoutError: login timed out on /dev/ttyUSB0' fixture errors in
-    full-suite runs). Clear the line first, then let sync_prompt's
-    multi-try jostle find an existing shell; only fall back to a real
-    login when that fails (fresh getty at a login: prompt, where
-    sync_prompt's Enters just redraw the prompt)."""
+    Two hazards in full-suite runs, both observed:
+      - a printk BACKLOG draining at 115200 baud (~11.5KB/s): the
+        failslab sweeps just dumped hundreds of should_fail stack
+        traces, and quieting kernel.printk stops new messages but not
+        the already-queued minute of output. A prompt probe against
+        that firehose never matches, so first wait for the line to go
+        quiet (no new bytes for 2s, bounded by drain_budget);
+      - an already-logged-in-but-quiet shell, where a bare login()
+        gives up after one Enter + 5s. sync_prompt's multi-try jostle
+        finds it; a real login() is the fallback for a fresh getty."""
+    deadline = time.monotonic() + drain_budget
+    last_len = -1
+    quiet_since = time.monotonic()
+    while time.monotonic() < deadline:
+        target._pump(0.5)
+        if len(target.buf) != last_len:
+            last_len = len(target.buf)
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since >= 2.0:
+            break
+    target.buf = b""
+
     target.send("\x03")
     try:
-        target.sync_prompt(tries=3, timeout=2.0)
+        target.sync_prompt(tries=5, timeout=2.0)
     except TimeoutError:
         target.login("root", timeout=10.0)
 
@@ -117,6 +131,14 @@ async def pppoe_real_server(aiohttp_session, target_agent):
                 "in-kernel pppoe plugin path; if absent, plan fallback "
                 "is to use userspace rp-pppoe (extra fixture step)."
             )
+    except BaseException:
+        # Skip/error exits here never reach the yield's teardown, so the
+        # loglevel restore below would be dead — restore inline. (A missed
+        # restore is only cosmetic: splat detection reads the dmesg ring
+        # via the agent, not the console.)
+        await target_agent.exec_cmd(
+            aiohttp_session, ["sysctl", "-w", "kernel.printk=7 4 1 7"])
+        raise
     finally:
         target.close()
 
