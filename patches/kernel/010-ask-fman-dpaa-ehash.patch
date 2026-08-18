@@ -1,4 +1,4 @@
-From bcf4d9e7d42e9fea0e46c3d32d85ff46a50321e5 Mon Sep 17 00:00:00 2001
+From 0844981499768d04cc3cf4fee01f107d7aa30e88 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -64,15 +64,16 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.h      |   12 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c     |   13 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h     |    1 +
+ .../sdk_fman/Peripherals/FM/Pcd/fm_replic.c   |   14 +-
  .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  152 +-
  .../sdk_fman/Peripherals/FM/Port/fm_port.h    |    3 +
  .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   34 +
  .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
- .../freescale/sdk_fman/Peripherals/FM/fm.c    |   19 +-
+ .../freescale/sdk_fman/Peripherals/FM/fm.c    |   31 +-
  .../sdk_fman/Peripherals/FM/fm_muram.c        |   32 +-
  .../sdk_fman/Peripherals/FM/inc/fm_common.h   |   10 +-
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
- .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  299 +---
+ .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +---
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
  .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1505 +++++++++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
@@ -112,7 +113,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 75 files changed, 6806 insertions(+), 1434 deletions(-)
+ 76 files changed, 6826 insertions(+), 1442 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5847,6 +5848,38 @@ index 2bb8b969956c..e00c6cf0d993 100644
  #define FM_PCD_PLCR_PEMODE_TRA                0x00000004
  #define FM_PCD_PLCR_PEMODE_TRB                0x00000002
  #define FM_PCD_PLCR_PEMODE_TRC                0x00000001
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_replic.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_replic.c
+index 2f89c05f74e8..20390219276f 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_replic.c
++++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_replic.c
+@@ -288,6 +288,7 @@ static t_Error BuildShadowAndModifyDescriptor(t_FmPcdFrmReplicGroup   *p_ReplicG
+     t_FmPcd                 *p_FmPcd;
+     t_FmPcdFrmReplicMember  shadowMember;
+     t_Error                 err;
++    uint8_t                 tmpAd[FM_PCD_CC_AD_ENTRY_SIZE];
+ 
+     ASSERT_COND(p_ReplicGroup);
+     ASSERT_COND(p_ReplicGroup->h_FmPcd);
+@@ -315,9 +316,16 @@ static t_Error BuildShadowAndModifyDescriptor(t_FmPcdFrmReplicGroup   *p_ReplicG
+     }
+     else
+     {
+-        IO2IOCpy32(p_FmPcd->p_CcShadow,
+-                   p_CurrentMember->p_MemberAd,
+-                   FM_PCD_CC_AD_ENTRY_SIZE);
++        /* Both the member AD and the CC shadow are FM_MURAM_AllocMem()
++         * allocations - device memory on ARM64. There is no iomem-to-iomem
++         * copy in the kernel, so bounce through the stack with
++         * memcpy_fromio()/memcpy_toio(). */
++        memcpy_fromio(tmpAd,
++                      (const void __iomem *)p_CurrentMember->p_MemberAd,
++                      FM_PCD_CC_AD_ENTRY_SIZE);
++        memcpy_toio((void __iomem *)p_FmPcd->p_CcShadow,
++                    tmpAd,
++                    FM_PCD_CC_AD_ENTRY_SIZE);
+ 
+         /* update the last bit in the shadow ad */
+         FillReplicAdOfTypeResult(p_FmPcd->p_CcShadow, last);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 index 3662edc25213..428143cb13d8 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
@@ -6177,10 +6210,36 @@ index 5f3e2cd9b05e..60bdf910ee48 100644
 +}
 +EXPORT_SYMBOL(FM_VSP_GetRelativeProfileId);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
-index 01ab5788059a..12c20ef6eca5 100644
+index 01ab5788059a..fd8857077c46 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
-@@ -3270,7 +3270,6 @@ t_Error FmDumpPortRegs (t_Handle h_Fm, uint8_t hardwarePortId)
+@@ -482,9 +482,10 @@ static t_Error FwNotResetErratumBugzilla6173WA(t_Fm *p_Fm)
+     WRITE_UINT32(p_Iram->iready, IRAM_READY);
+     CORE_MemoryBarrier();
+     XX_UDelay(100);
+-    IO2MemCpy32((uint8_t *)savedSpliodn,
+-                (uint8_t *)p_Fm->p_FmBmiRegs->fmbm_spliodn,
+-                63*sizeof(uint32_t));
++    /* Use memcpy_fromio for the BMI register block - it's device memory on ARM64 */
++    memcpy_fromio(savedSpliodn,
++                  (const void __iomem *)p_Fm->p_FmBmiRegs->fmbm_spliodn,
++                  63*sizeof(uint32_t));
+ 
+     /* reset FMAN */
+     WRITE_UINT32(p_Fm->p_FmFpmRegs->fm_rstc, FPM_RSTC_FM_RESET);
+@@ -509,8 +510,9 @@ static t_Error FwNotResetErratumBugzilla6173WA(t_Fm *p_Fm)
+     WRITE_UINT32(p_Fm->p_FmFpmRegs->fm_rstc, FPM_RSTC_FM_RESET);
+     CORE_MemoryBarrier();
+     XX_UDelay(100);
+-    Mem2IOCpy32((uint8_t *)p_Fm->p_FmBmiRegs->fmbm_spliodn,
+-                (uint8_t *)savedSpliodn,
++    /* Use memcpy_toio for the BMI register block - it's device memory on ARM64 */
++    memcpy_toio((void __iomem *)p_Fm->p_FmBmiRegs->fmbm_spliodn,
++                savedSpliodn,
+                 63*sizeof(uint32_t));
+ 
+     if (fman_is_qmi_halt_not_busy_state(p_Fm->p_FmQmiRegs))
+@@ -3270,7 +3272,6 @@ t_Error FmDumpPortRegs (t_Handle h_Fm, uint8_t hardwarePortId)
  }
  #endif /* (defined(DEBUG_ERRORS) && (DEBUG_ERRORS > 0)) */
  
@@ -6188,7 +6247,7 @@ index 01ab5788059a..12c20ef6eca5 100644
  /*****************************************************************************/
  /*                      API Init unit functions                              */
  /*****************************************************************************/
-@@ -3403,6 +3402,12 @@ t_Handle FM_Config(t_FmParams *p_FmParam)
+@@ -3403,6 +3404,12 @@ t_Handle FM_Config(t_FmParams *p_FmParam)
          }
          memcpy(p_Fm->firmware.p_Code, p_FmParam->firmware.p_Code ,p_Fm->firmware.size);
      }
@@ -6201,7 +6260,7 @@ index 01ab5788059a..12c20ef6eca5 100644
  
      if (p_Fm->guestId != NCSW_MASTER_ID)
          return p_Fm;
-@@ -3516,6 +3521,11 @@ t_Error FM_Init(t_Handle h_Fm)
+@@ -3516,6 +3523,11 @@ t_Error FM_Init(t_Handle h_Fm)
              RETURN_ERROR(MAJOR, err, NO_MSG);
  #else  /* not FM_UCODE_NOT_RESET_ERRATA_BUGZILLA6173 */
  
@@ -6213,7 +6272,7 @@ index 01ab5788059a..12c20ef6eca5 100644
          if (p_Fm->f_ResetOnInitOverride)
          {
          	/* Perform user specific FMan reset */
-@@ -3653,12 +3663,11 @@ t_Error FM_Init(t_Handle h_Fm)
+@@ -3653,12 +3665,11 @@ t_Error FM_Init(t_Handle h_Fm)
  
      EnableTimeStamp(p_Fm);
  
@@ -6228,7 +6287,7 @@ index 01ab5788059a..12c20ef6eca5 100644
      XX_Free(p_Fm->p_FmDriverParam);
      p_Fm->p_FmDriverParam = NULL;
  
-@@ -3742,7 +3751,7 @@ t_Error FM_Free(t_Handle h_Fm)
+@@ -3742,7 +3753,7 @@ t_Error FM_Free(t_Handle h_Fm)
      if (p_Fm->p_FmDriverParam)
      {
          if (p_Fm->firmware.p_Code)
@@ -6376,10 +6435,10 @@ index f9dd384bb685..b9cc5aa2bd1e 100644
  #define DEFAULT_FM_SP_bufferPrefixContent_passTimeStamp     FALSE
  #define DEFAULT_FM_SP_bufferPrefixContent_allOtherPCDInfo   FALSE
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/etc/memcpy.c b/drivers/net/ethernet/freescale/sdk_fman/etc/memcpy.c
-index c4552fc4f348..dfd44a4d5ca7 100644
+index c4552fc4f348..a0fa03e8a523 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/etc/memcpy.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/etc/memcpy.c
-@@ -58,311 +58,30 @@ void * MemSet8(void* pDst, int c, uint32_t size)
+@@ -58,311 +58,32 @@ void * MemSet8(void* pDst, int c, uint32_t size)
  
  void * MemCpy32(void* pDst,void* pSrc, uint32_t size)
  {
@@ -6458,7 +6517,9 @@ index c4552fc4f348..dfd44a4d5ca7 100644
  
 +/* FMan MURAM/register space is Device-nGnRE iomem (devm_ioremap), NOT
 + * cacheable memory. Plain memcpy() is tolerated only because arm64 memcpy
-+ * never emits dc zva (unlike memset); memcpy_fromio/_toio stay preferable. */
++ * never emits dc zva (unlike memset); memcpy_fromio/_toio are preferable and
++ * are what the in-tree callers (fm.c, fm_replic.c) now use. These three
++ * helpers remain only for out-of-tree/vendor callers. */
  void * IO2IOCpy32(void* pDst,void* pSrc, uint32_t size)
  {
 -    uint32_t leftAlign;
