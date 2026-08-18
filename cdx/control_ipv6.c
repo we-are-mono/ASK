@@ -332,7 +332,7 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 				pEntry_orig->tnl_route = L2_route_get(Ctcmd.tunnel_route_id);
 				if (IS_NULL_ROUTE(pEntry_orig->tnl_route))
 				{
-					ct_free((PCtEntry)pEntry_orig);
+					ct_free_unresolved((PCtEntry)pEntry_orig);
 					return ERR_RT_LINK_NOT_POSSIBLE;
 				}
 			}
@@ -342,8 +342,7 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 				pEntry_rep->tnl_route = L2_route_get(Ctcmd.tunnel_route_id_reply);
 				if (IS_NULL_ROUTE(pEntry_rep->tnl_route))
 				{
-					L2_route_put(pEntry_orig->tnl_route);
-					ct_free((PCtEntry)pEntry_orig);
+					ct_free_unresolved((PCtEntry)pEntry_orig);
 					return ERR_RT_LINK_NOT_POSSIBLE;
 				}
 			}

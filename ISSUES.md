@@ -829,3 +829,30 @@ file's git history.
   `__cmmNeighAdd()`'s result (`->count++`) with no NULL check — malloc
   failure crashes the daemon. Two-line guard; fold into the next
   module_ipsec.c touch. Open.
+
+- **A69.** CT register leaked the main-route references on the tunnel-route
+  failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of
+  the orig/rep main routes, then an unresolvable `tunnel_route_id` exited via
+  a plain `ct_free()` (kfree only), never releasing them — the routes stayed
+  pinned against removal forever (`L2_route_remove` → `ERR_RT_ENTRY_LINKED`),
+  same family as A48/A49/A50. Both families, four sites (`control_ipv4.c`
+  ~766/778, `control_ipv6.c` ~335/346). A53 widened reachability: a
+  quarantined tunnel route now returns NULL from `L2_route_get`, so tearing
+  down a tunnel's parent iface then registering a CT that names its route
+  hits the leak. **Fixed** (this round): new `ct_free_unresolved()` mirrors
+  `ct_add`'s err0 unwind (release both main refs + both tnl refs, then free);
+  the four register sites and `ct_add`'s err0 now funnel through it.
+  Rig-validated pre→post under KASAN (`test_ct_tunnel_route_leak.py`:
+  pre-fix DEREGISTER=202, post-fix=0). Invisible to failslab/kmemleak (a
+  stuck nbref is a live ref, not lost memory) — needs the nbref oracle.
+
+- **A70.** *(test-quality, not a code bug.)* The failslab sweep tests
+  (`test_ipv4_ct_failslab`, `test_ipv6_ct_failslab`, …) hard-assert `faulted`
+  — that some N in 1..100 drove the target allocator to NULL. Because
+  failslab counts every kmalloc in the syscall path, cumulative state late in
+  a warm full-suite run drifts the count so the injection lands on
+  netlink-scaffold allocs (errno 105) and never reaches the allocator, giving
+  a spurious failure (observed 2026-08-18; passes on a fresh boot / scoped).
+  Reboot-first is the operational mitigation (runbook updated); a more robust
+  test would target the allocator directly or soften the "did we reach it"
+  guard. Open (low priority).

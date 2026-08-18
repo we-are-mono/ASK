@@ -144,6 +144,7 @@ U32 get_timeout_value(U32 Proto,int sam_flag, int bidir_flag);
 
 PCT_PAIR ct_alloc(void);
 void ct_free(PCtEntry pEntry_orig);
+void ct_free_unresolved(PCtEntry pEntry_orig);
 void ct_timer_update(PCT_PAIR ppair);
 int ct_add(PCtEntry pEntry_orig, TIMER_HANDLER handler);
 void ct_update(PCtEntry pEntry_orig);

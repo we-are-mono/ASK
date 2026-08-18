@@ -89,6 +89,31 @@ void ct_free(PCtEntry pEntry_orig)
 	kfree(ppair);
 }
 
+/** Frees a conntrack that was allocated and had its routes resolved but
+ * never added to the hash tables.
+ *
+ * The register handlers resolve the main routes with IP_Check_Route()
+ * (an L2_route_get()) and the tunnel routes with L2_route_get() before
+ * the pair is handed to ct_add(). An error between those steps and a
+ * successful ct_add() must release every reference taken, exactly as
+ * ct_add()'s own err0 unwind does — a plain ct_free() would leak the
+ * route references and pin those routes against removal forever. All
+ * puts are NULL-safe, so this is correct whichever routes were resolved.
+ *
+ * @param pEntry_orig	pointer to the originator conntrack
+ */
+void ct_free_unresolved(PCtEntry pEntry_orig)
+{
+	PCT_PAIR ppair = container_of(pEntry_orig, CT_PAIR, orig);
+	PCtEntry pEntry_rep = &ppair->repl;
+
+	IP_delete_CT_route(pEntry_orig);
+	IP_delete_CT_route(pEntry_rep);
+	L2_route_put(pEntry_orig->tnl_route);
+	L2_route_put(pEntry_rep->tnl_route);
+	ct_free(pEntry_orig);
+}
+
 /**
  * ct_timer_update()
  *
@@ -167,11 +192,7 @@ err1:
 		delete_entry_from_classif_table(pEntry_orig);
 
 err0:
-	IP_delete_CT_route(pEntry_orig);
-	IP_delete_CT_route(pEntry_rep);
-	L2_route_put(pEntry_orig->tnl_route);
-	L2_route_put(pEntry_rep->tnl_route);
-	ct_free(pEntry_orig);
+	ct_free_unresolved(pEntry_orig);
 
 	return rc;
 }
@@ -763,10 +784,10 @@ static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 				pEntry_orig->tnl_route = L2_route_get(Ctcmd.tunnel_route_id);
 				if (IS_NULL_ROUTE(pEntry_orig->tnl_route))
 				{
-					ct_free((PCtEntry)pEntry_orig);
+					ct_free_unresolved((PCtEntry)pEntry_orig);
 					return ERR_RT_LINK_NOT_POSSIBLE;
 				}
-				pEntry_orig->status |= CONNTRACK_4O6;	
+				pEntry_orig->status |= CONNTRACK_4O6;
 			}
 
 			if ((Ctcmd.format & CT_REPL_TUNNEL) && !(Ctcmd.flags & CTCMD_FLAGS_REP_DISABLED))
@@ -774,11 +795,10 @@ static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 				pEntry_rep->tnl_route = L2_route_get(Ctcmd.tunnel_route_id_reply);
 				if (IS_NULL_ROUTE(pEntry_rep->tnl_route))
 				{
-					L2_route_put(pEntry_orig->tnl_route);
-					ct_free((PCtEntry)pEntry_orig);
+					ct_free_unresolved((PCtEntry)pEntry_orig);
 					return ERR_RT_LINK_NOT_POSSIBLE;
 				}
-				pEntry_rep->status |= CONNTRACK_4O6;	
+				pEntry_rep->status |= CONNTRACK_4O6;
 			}
 
 			/* Everything went Ok. We can safely put querier and replier entries in hash tables */
