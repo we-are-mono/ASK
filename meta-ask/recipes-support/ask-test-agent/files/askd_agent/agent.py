@@ -305,6 +305,19 @@ def _netlink_send_failslab(
                 except OSError as e:
                     send_err = f"recv: errno={e.errno} {e.strerror}"
 
+            # Read the residue BEFORE disarming: fail-nth decrements once
+            # per eligible allocation by this task, so residue == armed
+            # value means the syscall path made zero eligible allocations
+            # (the injection tested nothing), residue == 0 means the fault
+            # fired, anything between counts the eligible allocations seen.
+            # This is the discriminator for the "sweep never reached the
+            # allocator" flake (ISSUES.md A70).
+            try:
+                fail_nth_residue = int(
+                    Path("/proc/self/fail-nth").read_text().strip())
+            except (OSError, ValueError):
+                fail_nth_residue = -1
+
             # Disarm ASAP so the subsequent pickle/pipe write doesn't
             # also see faults.
             _disarm_failslab()
@@ -314,6 +327,7 @@ def _netlink_send_failslab(
                 "sent_bytes":     real_len,
                 "reply_hex":      reply.hex(),
                 "failslab_times": failslab_times,
+                "fail_nth_residue": fail_nth_residue,
             }
             if send_err:
                 result["send_error"] = send_err

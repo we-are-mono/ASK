@@ -163,7 +163,10 @@ async def test_tunnel_create_failslab_sweep(
             r = await _fci(CMD_TNL_CREATE, create_cmd, tmo=3000, failslab=n)
             reply_rc = r.get("reply_rc")
             send_err = r.get("send_error")
-            outcomes.append((n, reply_rc, send_err))
+            # 4th field: /proc/self/fail-nth after the syscall — == n means
+            # the path made zero fault-eligible allocations (injection
+            # tested nothing), 0 means the fault fired; see ISSUES.md A70.
+            outcomes.append((n, reply_rc, send_err, r.get("fail_nth_residue")))
 
             faulted_iter = (send_err is not None) or (reply_rc not in (NO_ERR,))
             del_rc = await _delete()
@@ -191,7 +194,7 @@ async def test_tunnel_create_failslab_sweep(
     finally:
         await _fci(CMD_IP_ROUTE, _rt_payload(ACTION_DEREGISTER))
 
-    faulted = [n for n, rc, e in outcomes if rc == ERR_NOT_ENOUGH_MEMORY]
+    faulted = [n for n, rc, e, *_ in outcomes if rc == ERR_NOT_ENOUGH_MEMORY]
     assert faulted, (
         f"failslab sweep never drove tunnel_alloc to NULL across "
         f"times=1..{NSWEEP}; outcomes={outcomes}."
@@ -206,7 +209,7 @@ async def test_tunnel_create_failslab_sweep(
     if leak_count:
         outcome_summary = ", ".join(
             f"{n}={'OK' if rc == NO_ERR and e is None else (f'rc={rc}' if e is None else e)}"
-            for n, rc, e in outcomes
+            for n, rc, e, *_ in outcomes
         )
         raise AssertionError(
             f"failslab CREATE sweep (1..{NSWEEP}) leaked {leak_count} "

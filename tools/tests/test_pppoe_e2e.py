@@ -41,6 +41,7 @@ from _pppoe_helpers import (
     pppoe_cmd,
 )
 from _pppoe_e2e import (  # noqa: F401  (fixture imports for resolution)
+    _console_ready,
     pppoe_real_server,
     pppoe_dut_session,
 )
@@ -64,7 +65,7 @@ async def test_pppoe_session_lifecycle(
     # First: kernel-side state — /proc/net/pppoe should have a session.
     # Format: header line "Id  Address  Device" + N data lines.
     target = Console.target()
-    target.login("root")
+    _console_ready(target)
     try:
         proc_pppoe = target.run("cat /proc/net/pppoe", timeout=3).stdout
     finally:
@@ -122,7 +123,7 @@ async def test_pppoe_dut_ping(
     ppp = pppoe_dut_session
     inner_local = os.environ.get("ASK_PPPOE_INNER_LOCAL", "10.98.0.1")
     target = Console.target()
-    target.login("root")
+    _console_ready(target)
     try:
         r = target.run(f"ping -I {ppp} -c 3 -W 2 {inner_local}", timeout=15)
         # ping -c 3 summary: "3 packets transmitted, 3 received, 0% packet loss"
@@ -165,7 +166,7 @@ async def test_pppoe_lan_through_dut_iperf_offloaded(
     )
 
     target = Console.target()
-    target.login("root")
+    _console_ready(target)
     masq_added = False
     prior_ip_forward: str | None = None
     try:

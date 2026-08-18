@@ -75,7 +75,7 @@ def _console_ready(target) -> None:
 
 
 @pytest_asyncio.fixture
-async def pppoe_real_server():
+async def pppoe_real_server(aiohttp_session, target_agent):
     """Bring up pppoe-server on the orchestrator (vision) bound to br0
     by default. Pre-probes the DUT for pppd so we don't spin up the
     server uselessly when the test image is missing the ppp package.
@@ -85,6 +85,16 @@ async def pppoe_real_server():
 
     if shutil.which("pppoe-server") is None:
         pytest.skip("pppoe-server not installed on orchestrator")
+
+    # Quiet kernel printk to the serial console for the UART work below
+    # (over HTTP, so it works regardless of console state). Directly
+    # before this fixture the failslab sweeps have dumped hundreds of
+    # ~1-2KB should_fail stack traces to the 115200-baud console; the
+    # backlog drains at ~11.5KB/s for the better part of a minute, and a
+    # prompt probe against that firehose never matches (the intermittent
+    # 'no prompt'/'login timed out' fixture errors). Restored on teardown.
+    await target_agent.exec_cmd(
+        aiohttp_session, ["sysctl", "-w", "kernel.printk=1 4 1 7"])
 
     # Pre-probe the DUT for pppd via UART. If absent, skip BEFORE
     # spawning pppoe-server — saves a spin-up + teardown cycle.
@@ -180,6 +190,9 @@ async def pppoe_real_server():
         for p in (pap_path, opt_path):
             try: os.unlink(p)
             except FileNotFoundError: pass
+        # restore default console loglevel (see the quiet at setup)
+        await target_agent.exec_cmd(
+            aiohttp_session, ["sysctl", "-w", "kernel.printk=7 4 1 7"])
 
 
 @pytest_asyncio.fixture

@@ -118,7 +118,10 @@ async def test_vlan_register_failslab_sweep(
         )
         reply_rc = r.get("reply_rc")
         send_err = r.get("send_error")
-        outcomes.append((n, reply_rc, send_err))
+        # 4th field: /proc/self/fail-nth after the syscall — == n means the
+        # path made zero fault-eligible allocations (injection tested
+        # nothing), 0 means the fault fired; see ISSUES.md A70.
+        outcomes.append((n, reply_rc, send_err, r.get("fail_nth_residue")))
 
         # If REGISTER succeeded, drop it so the next pre-iter dereg has
         # something to clear (otherwise pre-iter clears nothing, fine).
@@ -127,7 +130,7 @@ async def test_vlan_register_failslab_sweep(
 
     await _dereg()  # final cleanup
 
-    faulted = [n for n, rc, e in outcomes if rc == ERR_NOT_ENOUGH_MEMORY]
+    faulted = [n for n, rc, e, *_ in outcomes if rc == ERR_NOT_ENOUGH_MEMORY]
     assert faulted, (
         f"failslab sweep never drove vlan_alloc to NULL across "
         f"times=1..{NSWEEP}; outcomes={outcomes}. Either failslab isn't "
@@ -143,7 +146,7 @@ async def test_vlan_register_failslab_sweep(
     if leak_count:
         outcome_summary = ", ".join(
             f"{n}={'OK' if rc == NO_ERR and e is None else (f'rc={rc}' if e is None else e)}"
-            for n, rc, e in outcomes
+            for n, rc, e, *_ in outcomes
         )
         raise AssertionError(
             f"failslab REGISTER sweep (1..{NSWEEP}) leaked {leak_count} "
