@@ -501,12 +501,11 @@ file's git history.
   submit now gated on km.state==XFRM_STATE_VALID and `__xfrm_state_delete`
   clears x->offloaded (patch 040).
 
-- **A29.** af_key.c SET_OFFLOAD handler sets x->offloaded=1 without re-checking
-  km.state, so a lookup_byhandle racing ahead of a concurrent delete's byh
-  unlink can resurrect offloaded=1 on a DEAD SA. Pre-existing; impact
-  neutralized by A28 (VALID gate blocks DEAD inbound, get_ipsec_fq NULL-check
-  blocks outbound). Optional defense-in-depth: set offloaded=1 only when
-  km.state==XFRM_STATE_VALID. Open.
+- **A29.** af_key.c SET_OFFLOAD could re-mark a DEAD SA offloaded (impact
+  already neutralized by A28's gates) — **fixed** (_bad0464_): the handler sets
+  `offloaded=1` only under `km.state==XFRM_STATE_VALID` inside the existing
+  `x->lock` section (the lock that serializes the DEAD transition); clearing
+  stays unconditional.
 
 - **A30.** `ctnetlink_change_permanent()` short-circuited the entire conntrack
   update whenever CTA_STATUS merely carried IPS_PERMANENT, silently dropping
@@ -649,15 +648,11 @@ file's git history.
   IRQ fiction with a real lock (or drop the save entirely where the hardware
   window doesn't need it) on the next sysfs-wrapper touch. Open.
 
-- **A43.** cmm's MSP socket surface now dead-ends: cdx rejects SOCKET_TYPE_MSP
-  on both open paths (it has zero MSP handling anywhere), yet cmm still offers
-  `set socket open ... type msp` (module_socket.c:1160-1167) and runs an
-  LS1043-gated MSP reverse-route pre-check in socket_add (:189-213) before the
-  FCI write that will return FPP_ERR_WRONG_SOCK_TYPE. Delete the cmm-side MSP
-  arms (CLI keyword, CMMD_SOCKET_TYPE_MSP plumbing if cmm-internal, the
-  pre-check) in a follow-up; wire enum values stay reserved per the usual layout
-  rule. Note: the cmm-side deletions this entry anticipated already shipped in
-  _dd96e1d_; only the cdx-side MSP rejection described here remains live. Open.
+- **A43.** cmm MSP socket surface — **closed** (verified 2026-08-18, no code
+  change needed): the cmm-side deletions shipped in _dd96e1d_ (no `msp` CLI
+  keyword, no CMMD_SOCKET_TYPE_MSP plumbing, no reverse-route pre-check), and
+  cdx's `ERR_WRONG_SOCK_TYPE` rejection on both open paths with the wire enum
+  value reserved is the desired terminal state.
 
 - **A48.** cdx v4 socket-open resolved `route_id` twice (orphan `L2_route_get`
   gate + the stored `SOCKET4_check_route` ref), leaking one `nbref` per open —
@@ -714,13 +709,11 @@ file's git history.
   count-0 orphans). Freshness residual filed as A66; the `sa_lock` inversion
   and two smells surfaced en route as A65/A67/A68.
 
-- **A55.** cmm `module_socket.c` error-code truncation: `unsigned short rc`
-  (:642, also :681) receives `-1` from `socket_add` failure (:657) and raw
-  negative `fci_write` transport errors (:664, :734), truncating to 65535; the
-  daemon's `if (rc >= 0)` arms (client path :814/:842) then report OOM/transport
-  failures as a bogus positive "FPP error 65535" (mangled "wn error code"
-  print) instead of taking the errno answer path. Fix: `int rc` + map local
-  failures to `CMMD_ERR_MEMORY`/real codes. Low severity, cmm-only. Open.
+- **A55.** cmm `module_socket.c` error-code truncation (negative rc narrowed
+  to 65535, reported as a bogus positive FPP error) — **fixed** (_42379cb_):
+  `int rc` in socket_open/socket_update, socket_add's allocation failure maps
+  to `CMMD_ERR_MEMORY`, and negative transport errors keep their sign into the
+  daemon's errno answer path. Client-side reporting residue filed as A75.
 
 - **A56.** `ipsec_push_sa_to_fast_path` installed the HW classification entry
   before resolving the xfrm state (leaving a live entry classifying into a
@@ -740,11 +733,11 @@ file's git history.
   Rig-validated by a failslab sweep (no half-linked entry, route never pinned;
   `test_tunnel_failslab.py`).
 
-- **A58.** `M_ipsec_sa_cache_create` (`control_ipsec.c:396`) links the SA onto
-  `sa_cache_by_fqid` *before* `sa_add` (:406); the `return NULL` at :411 would
-  leak the SAEntry while leaving it reachable via `get_netdev_of_SA_by_fqid`.
-  Dead today (`sa_add` always returns NO_ERR) — latent trap; reorder when the
-  file is next touched. Open.
+- **A58.** `M_ipsec_sa_cache_create` linked the SA onto `sa_cache_by_fqid`
+  before the fallible `sa_add` (latent leak-while-reachable trap; dead today
+  since `sa_add` cannot fail) — **fixed** (_42379cb_): `sa_add` first, fqid
+  link only on success, and the failure arm releases the SEC context and frees
+  the unpublished entry.
 
 - **A59.** `struct _cdx_ctrl.lock` was a dead spinlock (init'ed, never
   acquired; the timer wheels actually run under `ctrl.mutex`) and the
@@ -768,12 +761,14 @@ file's git history.
   helpers to plain `memcpy()` with a false "MURAM is normal cacheable memory"
   comment (it is Device-nGnRE iomem) — **comment fixed** (_6b6d9f2_): now
   states the truth — tolerated only because arm64 `memcpy` never emits
-  `dc zva`, with `memcpy_fromio/_toio` named as the preferable forms. The
-  actual conversion of `IO2IOCpy32`/`Mem2IOCpy32`/`IO2MemCpy32` call sites
-  (`fm_replic.c:318`, `fm.c:488,515`) to the `_fromio`/`_toio` forms remains
-  a candidate for the next patch-010 functional touch; safe today by the
-  absence of `dc zva` in `memcpy`. (`IOMemSet32` keeps its `WRITE_UINT32`
-  loop — why `FmMuramClear` and friends are safe.)
+  `dc zva`, with `memcpy_fromio/_toio` named as the preferable forms.
+  **Call-site conversion done** (_bad0464_): fm_replic's member-AD shadow
+  copy goes through a stack bounce (`_fromio` then `_toio`, both sides
+  MURAM) and the `fmbm_spliodn` save/restore pair uses `_fromio`/`_toio`
+  (dead code under a never-defined errata ifdef, converted anyway); the
+  three `IO2*Cpy32` helpers now have zero in-tree callers and remain for
+  out-of-tree users. (`IOMemSet32` keeps its `WRITE_UINT32` loop — why
+  `FmMuramClear` and friends are safe.)
 
 - **A62.** `cdx/cdx_ehash.c:2363-2368` (`create_rtprelay_process_opcode`) stores
   `cpu_to_be32(PTR_TO_UINT(rtpinfo_ptr / in_sockstats_ptr / out_sockstats_ptr))`
@@ -817,13 +812,12 @@ file's git history.
   RtEntry's current MAC/oif/mtu on retry and stash-and-rebuild on mismatch.
   Open (low priority).
 
-- **A67.** `route_cache.c:__cmmRouteNew` calls `__cmmRouteIsTnlItf` with the
-  tunnel's own `itf->tunnel_family` as the `family` argument, so the
-  family-mismatch filter can never fire and `IPADDRLEN(family)` follows the
-  tunnel rather than the route event — a v6 tunnel gets prefix-matched
-  against a v4 route's dAddr bytes. `__cmmRouteLocalNew` passes the ct's
-  family correctly. Wrong-family matches only cost a spurious idempotent
-  `__tunnel_add`, so impact is noise, not corruption. Open (cleanup).
+- **A67.** `__cmmRouteNew` passed the tunnel's (and, same shape, the SA's)
+  own family to the route-match helpers, so the family filters never fired —
+  **fixed** (_42379cb_): both scans now pass the route event's
+  `rtm->rtm_family` (PROTO_FAMILY_* values equal AF_*), mirroring
+  `__cmmRouteLocalNew`. Also stops transport-mode SAs (family 0) from
+  matching every default-route event.
 
 - **A68.** `__cmmSATunnelRegister` dereferenced `__cmmNeighAdd()`'s result
   (`->count++`) with no NULL check — malloc failure crashed the daemon —
@@ -849,26 +843,49 @@ file's git history.
   path (or have `cmmSACreate` treat an `SA_DELETE` entry as absent and
   replace it). Open.
 
-- **A71.** cmm `cmmSAFlush` cannot report failure: `rc` is initialized to 0
-  and never assigned, and per-entry `cmmUpdateFlows()` failures are only
-  logged at DEBUG_INFO, so the keytrack dispatcher never sees an error for
-  SA_FLUSH. Open (low).
+- **A71.** cmm `cmmSAFlush` could not report failure — **fixed** (_42379cb_):
+  a per-entry `cmmUpdateFlows()` failure records `rc=-1` while the flush
+  still removes every entry; keytrack answers FCI_CB_STOP. (Currently
+  unreachable armor — `cmmUpdateFlows` has no failure path today.)
 
-- **A72.** cmm sa_table walk without `sa_lock` from the client-daemon
-  thread: `cmmCtChange` (holding itf/ct/rt/neigh) reaches `cmmSAFind` via
-  `____cmmCtRegister → __cmm_ct_get_SA` (conntrack.c) and walks a hash
-  bucket while the ct thread's `cmmSACreate` — which holds only `sa_lock` —
-  can insert into the same bucket. No common lock, so the walker can observe
-  a half-published node on the Cortex-A72's weak memory model. Reachable via
-  cmmctl conntrack commands. Under the leaf discipline the natural fix is
-  taking `sa_lock` around the walk (or `ctMutex` in `cmmSACreate`);
-  `cmmSAFind()`'s implicit "callers must hold `ctMutex`" lifetime contract
-  should be documented at the same time. Open.
+- **A72.** cmm sa_table walk without `sa_lock` from the client-daemon thread
+  (`cmmCtChange → ____cmmCtRegister → __cmm_ct_get_SA → cmmSAFind` racing
+  `cmmSACreate`'s insert under only `sa_lock`) — **fixed** (_42379cb_):
+  `cmmCtChange` takes `sa_lock` (leaf, innermost) around the registration.
+  Placement note: the lock cannot go inside `__cmm_ct_get_SA` — the SA
+  handlers reach it via `cmmUpdateFlows` with `sa_lock` already held, and
+  `____cmmCtRegister` recurses. Audit walked the full registration subtree:
+  no other mutex acquired inside, and every other caller either holds
+  `sa_lock` or runs on the ct thread. `cmmSAFind`'s locking/lifetime
+  contract is now documented at the function.
 
 - **A73.** cmm `cmm_print` calls `cli_vabufprint` on the shared libcli
   handle from any thread; libcli has no internal locking, so concurrent
   output can interleave or corrupt CLI buffers. Display-only impact. Open
   (low).
+
+- **A74.** `cmmFeReset` (forward_engine.c, CLI `reset` command) frees every
+  RtEntry directly while `SATable.tnl_rt.route` and tunnel `itf->rt.route`
+  may still point at them — dangling route pointers after a CLI reset — and
+  it unlinks the ct→SA `list_by_sa` nodes from the CLI thread under `ctMutex`
+  but without `sa_lock` (the write-side pairing the rest of the tree now
+  keeps). Surfaced by the A72 audits. Fix shape: route teardown must go
+  through the holders (or NULL their references), and the reset path should
+  take `sa_lock` with the rest of its ladder. Open.
+
+- **A75.** cmm client error reporting gaps (A55 residue): `socket_daemon`
+  presets `res_buf[0]=CMMD_ERR_WRONG_COMMAND_SIZE`, so on a transport
+  failure the client prints that stale code (`cmmSendToDaemon` never
+  consults `daemon_errno`), and `getErrorString` has no cases for the
+  32000-range CMMD codes, rendering them "Unknown error code (N)". Open
+  (low, cmm-only).
+
+- **A76.** `____cmmCtRegister → ____cmmCtLocalRegister → __cmmRouteLocalNew
+  → ____cmmCtRegister` has no progress guard: a hybrid local/non-local
+  conntrack whose local destination equals a tunnel's outer remote address
+  can recurse while tunnel-route registration keeps failing. Contrived
+  input, but the recursion is stack-unbounded. Fix shape: a visited flag or
+  depth guard on the local-registration hop. Open (low).
 
 - **A69.** CT register leaked the main-route references on the tunnel-route
   failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of
