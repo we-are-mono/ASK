@@ -167,8 +167,17 @@ int __cmmSATunnelRegister(FCI_CLIENT *fci_handle, struct SATable* SAEntry)
 */
 	if(SAEntry->tnl_rt.route && !SAEntry->tnl_rt.route->neighEntry)
 	{
-		SAEntry->tnl_rt.route->neighEntry = __cmmNeighAdd(SAEntry->tnl_rt.route->family, SAEntry->tnl_rt.route->gwAddr, SAEntry->tnl_rt.route->oifindex);
-		SAEntry->tnl_rt.route->neighEntry->count++;
+		struct NeighborEntry *neigh;
+
+		neigh = __cmmNeighAdd(SAEntry->tnl_rt.route->family, SAEntry->tnl_rt.route->gwAddr, SAEntry->tnl_rt.route->oifindex);
+		/* Allocation failure just means no dummy entry: the next
+		 * re-registration (route or SA event) re-attaches the neighbor
+		 * via __cmmNeighRegister's find-or-add. */
+		if (neigh)
+		{
+			neigh->count++;
+			SAEntry->tnl_rt.route->neighEntry = neigh;
+		}
 	}
 	if (rc < 0)
 		goto program;

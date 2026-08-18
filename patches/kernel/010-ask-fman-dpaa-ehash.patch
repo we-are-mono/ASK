@@ -6456,9 +6456,9 @@ index c4552fc4f348..dfd44a4d5ca7 100644
      return pDst;
  }
  
-+/* On this platform FMan MURAM/register space is mapped as normal cacheable
-+ * memory, so the IO variants intentionally alias plain memcpy() rather than
-+ * doing word-at-a-time accessor loops. */
++/* FMan MURAM/register space is Device-nGnRE iomem (devm_ioremap), NOT
++ * cacheable memory. Plain memcpy() is tolerated only because arm64 memcpy
++ * never emits dc zva (unlike memset); memcpy_fromio/_toio stay preferable. */
  void * IO2IOCpy32(void* pDst,void* pSrc, uint32_t size)
  {
 -    uint32_t leftAlign;

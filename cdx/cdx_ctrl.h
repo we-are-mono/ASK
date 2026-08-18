@@ -12,7 +12,6 @@
 
 struct _cdx_ctrl {
 	struct mutex mutex;
-	spinlock_t lock;
 	struct device *dev;
 	struct task_struct *timer_thread;
 	struct hlist_head *timer_inner_wheel;

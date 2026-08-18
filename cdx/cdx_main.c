@@ -21,20 +21,13 @@
  * Concurrency (module-level):
  *   cdx_info->ctrl.mutex
  *      - Module-global mutex covering the FCI command handler
- *        table (see cdx_cmdhandler.c) and the cmdhandler init/exit
- *        sequence here. Held by cdx_cmdhandler_*() callers and by
- *        the ctrl deinit on module unload.
- *   cdx_info->ctrl.lock (spinlock)
- *      - Guards the cmd timer wheel (see cdx_timer.c) and the
- *        async msg_list used by the FPP workqueue. Taken from
- *        process, softirq, and timer contexts, so callers disable
- *        BH when needed (spin_lock_bh).
+ *        table (see cdx_cmdhandler.c), the cmdhandler init/exit
+ *        sequence here, and the timer wheels (see cdx_timer.c —
+ *        the timer kthread and every wheel mutator take this same
+ *        mutex; there is no separate wheel spinlock).
  *   cdx_info->ctrl.timer_thread
- *      - kthread started under ctrl->mutex in cdx_ctrl_init.
- *        Consumes the timer wheels guarded by ctrl->lock.
- *   cdx_info->ctrl.work / ctrl->msg_list
- *      - Workqueue + queued list for deferred FPP commands;
- *        producers take ctrl->lock to append, the workqueue drains.
+ *      - kthread started under ctrl->mutex in cdx_ctrl_init;
+ *        consumes the timer wheels under ctrl->mutex.
  *   deinit_fn[], init_level
  *      - Written only during module init (single-threaded) and
  *        read only at unload; no runtime concurrency.
@@ -42,8 +35,6 @@
  * Contexts:
  *   cdx_module_{init,exit}  - module load/unload, single-threaded.
  *   cdx_ctrl_{init,deinit}  - called from module init/exit.
- *
- * Lock ordering: ctrl->mutex -> ctrl->lock.
  */
 #define DEFINE_GLOBALS
 #include "portdefs.h"
@@ -95,7 +86,6 @@ static int __init cdx_ctrl_init(struct _cdx_info *cdx_info)
 	int rc;
 
 	mutex_init(&ctrl->mutex);
-	spin_lock_init(&ctrl->lock);
 
 	ctrl->dev = &cdx_info->dev;
 	rc = cdx_ctrl_timer_init(ctrl);
