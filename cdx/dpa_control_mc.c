@@ -864,6 +864,46 @@ int cdx_free_exthash_mcast_members(struct mcast_group_info *pMcastGrpInfo)
 	return 0;
 }
 
+/* Whole-group teardown, shared by the group-DELETE command path and the
+ * module-exit drain so the two can't diverge.
+ *
+ * The caller must already have unlinked pMcastGrpInfo from its bucket list.
+ * delete_entry_from_classif_table() and cdx_free_exthash_mcast_members()
+ * reach ExternalHashTable* helpers that issue FMAN host commands, and
+ * EnQFrm() waits for each completion with an XX_UDelay(100) busy-loop
+ * (sdk_fman .../Peripherals/FM/HC/hc.c) — up to ~10 ms of spinning per
+ * command. That is legal under a spinlock (FmPcdLock is spin_lock_irqsave,
+ * not a sleeping lock) but wasteful, and the group-DELETE path already runs
+ * this teardown unlocked. Once the node is off the list no reader
+ * (cdx_mc_query.c) can find it, which is what makes that safe.
+ *
+ * Order is load-bearing: the classifier entry leaves the hardware table
+ * first, then the listener table entries, then the CT/route backing memory.
+ * Freeing in the other direction would leave the ucode replicating through
+ * entries whose memory has already been handed back to the allocator. */
+static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
+{
+	uint8_t mac[ETH_ALEN];
+
+	/* Delete entry in ct table */
+	delete_entry_from_classif_table(pMcastGrpInfo->pCtEntry);
+	cdx_free_exthash_mcast_members(pMcastGrpInfo);
+	if (pMcastGrpInfo->pCtEntry)
+	{
+		if (pMcastGrpInfo->pCtEntry->pRtEntry)
+			kfree(pMcastGrpInfo->pCtEntry->pRtEntry);
+		kfree(pMcastGrpInfo->pCtEntry);
+		pMcastGrpInfo->pCtEntry = NULL;
+	}
+	/* Undo the dev_mc_add() from the create path so the FMAN MAC's
+	 * hardware multicast filter doesn't keep accepting frames for a
+	 * now-gone group. dev_mc_add/del refcount, so groups sharing a MAC
+	 * (IPv4 32→23-bit collisions) decrement cleanly. */
+	cdx_mcast_compute_mac(pMcastGrpInfo, mac);
+	cdx_mcast_unsubscribe_ingress_mac(pMcastGrpInfo->ucIngressIface, mac);
+	kfree(pMcastGrpInfo);
+}
+
 void cdx_exthash_update_first_mcast_member_addr(struct en_exthash_tbl_entry *temp_entry,
 		uint64_t listener_phyaddri,
 		struct en_exthash_tbl_entry *listener);
@@ -1193,27 +1233,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 			spin_unlock(&mc6_spinlocks[uiHash]);
 		}
 
-		//Delete entry in ct table;
-		delete_entry_from_classif_table(pMcastGrpInfo->pCtEntry);
-		cdx_free_exthash_mcast_members(pMcastGrpInfo);
-		if(pMcastGrpInfo->pCtEntry)
-		{
-			if(pMcastGrpInfo->pCtEntry->pRtEntry)
-				kfree(pMcastGrpInfo->pCtEntry->pRtEntry);
-			kfree(pMcastGrpInfo->pCtEntry);
-		}
-		/* Undo the dev_mc_add() from the create path so the FMAN
-		 * MAC's hardware multicast filter doesn't keep accepting
-		 * frames for a now-gone group. dev_mc_add/del refcount, so
-		 * groups sharing a MAC (IPv4 32→23-bit collisions) decrement
-		 * cleanly. */
-		{
-			uint8_t mac[ETH_ALEN];
-			cdx_mcast_compute_mac(pMcastGrpInfo, mac);
-			cdx_mcast_unsubscribe_ingress_mac(
-				pMcastGrpInfo->ucIngressIface, mac);
-		}
-		kfree(pMcastGrpInfo);
+		cdx_mcast_group_destroy(pMcastGrpInfo);
 		return 0;
 	}
 
@@ -1605,23 +1625,75 @@ int mc6_init(void)
 	return 0;
 }
 
+/* Tears down every group still linked on a bucket array at module exit.
+ *
+ * Locking: concurrent FCI access is already excluded here — cdx_ctrl_deinit()
+ * holds ctrl->mutex across the whole of cdx_cmdhandler_exit(), and
+ * comcerto_fpp_send_command(), the only way into cdx_cmd_handler, takes that
+ * same mutex. So the query walkers in cdx_mc_query.c cannot run against these
+ * lists while the drain does. The bucket spinlocks are taken anyway: it keeps
+ * the drain structurally identical to the group-DELETE path (unlink locked,
+ * destroy unlocked) and leaves it correct without depending on that outer
+ * exclusion, which nothing here enforces locally.
+ *
+ * Sibling exits (tunnel_exit, vlan_exit, pppoe_exit) drain their caches
+ * lock-free only because those caches have no per-bucket lock at all; they
+ * set no precedent for skipping one that exists.
+ *
+ * Must run before the caller frees the spinlock and group-id arrays:
+ * cdx_free_exthash_mcast_members() releases each group's id back into
+ * mc{4,6}grp_ids[]. */
+static void cdx_mcast_drain_grp_lists(struct list_head *pGrpList,
+				      spinlock_t *pLocks,
+				      unsigned int uiNumBuckets)
+{
+	struct mcast_group_info *pMcastGrpInfo;
+	unsigned int ii;
+
+	if (!pLocks)
+		return;
+
+	for (ii = 0; ii < uiNumBuckets; ii++)
+	{
+		for (;;)
+		{
+			spin_lock(&pLocks[ii]);
+			if (list_empty(&pGrpList[ii]))
+			{
+				spin_unlock(&pLocks[ii]);
+				break;
+			}
+			pMcastGrpInfo = list_first_entry(&pGrpList[ii],
+					struct mcast_group_info, list);
+			list_del(&pMcastGrpInfo->list);
+			spin_unlock(&pLocks[ii]);
+
+			cdx_mcast_group_destroy(pMcastGrpInfo);
+		}
+	}
+}
+
 void mc4_exit(void)
 {
+	cdx_mcast_drain_grp_lists(mc4_grp_list, mc4_spinlocks,
+				  MC4_NUM_HASH_ENTRIES);
 	if (mc4_spinlocks)
 	{
 		kfree(mc4_spinlocks);
 		mc4_spinlocks = NULL;
-	} 
+	}
 	if (mc4grp_ids)
 	{
 		kfree(mc4grp_ids);
 		mc4grp_ids = NULL;
 	}
-	return; 
+	return;
 }
 
 void mc6_exit(void)
 {
+	cdx_mcast_drain_grp_lists(mc6_grp_list, mc6_spinlocks,
+				  MC6_NUM_HASH_ENTRIES);
 	if (mc6_spinlocks)
 	{
 		kfree(mc6_spinlocks);

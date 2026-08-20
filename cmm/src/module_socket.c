@@ -899,6 +899,10 @@ int socket_daemon(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int fc, u_
  	
 	cmm_print(DEBUG_INFO, "%s\n", __func__);
 
+	/* Preset answer for the "command size too small" checks below, which
+	 * break out of their case with rc still 0 and rely on this value being
+	 * in place. Every other arm overwrites it; the negative-rc paths are
+	 * fixed up after the switch. */
 	res_buf[0] = CMMD_ERR_WRONG_COMMAND_SIZE;
 
 	switch (fc)
@@ -1051,6 +1055,22 @@ end:
 		res_buf[0] = CMMD_ERR_UNKNOWN_COMMAND;
 		*res_len = 2;
 		break;
+	}
+
+	/* A handler that returned a negative rc (an FCI transport failure —
+	 * socket_open/update/close only ever pass through what socket_send_cmd
+	 * got from the forward engine) never touched res_buf, so the status
+	 * word would still carry the WRONG_COMMAND_SIZE preset above: a
+	 * transport failure reported as a malformed request. cmmDaemonThread
+	 * turns the negative rc into a non-zero daemon_errno, so a client that
+	 * honours that field already sees a failure — but the status word it
+	 * may also read must not contradict it. CMMD_ERR_UNKNOWN is the same
+	 * code __socket_open uses for an engine-side refusal it cannot
+	 * classify. */
+	if (rc < 0)
+	{
+		res_buf[0] = CMMD_ERR_UNKNOWN;
+		*res_len = 2;
 	}
 
 	return rc;

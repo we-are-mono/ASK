@@ -32,6 +32,15 @@ int dumpmem(int argc, char *argv[]);
 #define ERR_CODE_PREFIX_LENGTH (8) /* FPP_ERR_ */
 #endif
 
+/* caseretstr for cmmd.h's own codes. showErrorMsg() strips a fixed
+ * ERR_CODE_PREFIX_LENGTH characters, sized for "FPP_ERR_"; "CMMD_ERR_" is one
+ * character longer, so skipping the leading 'C' leaves exactly that many
+ * characters in front of the name and the strip yields the bare error name,
+ * the same as it does for every FPP code. */
+#ifndef caseretstr_cmmd
+#define caseretstr_cmmd(x) case x: return #x + 1
+#endif
+
 char * getErrorString(unsigned short error)
 {
 	switch (error)
@@ -186,6 +195,17 @@ char * getErrorString(unsigned short error)
 	/*-------------------------------- WiFi ----------------------------------*/
 	caseretstr(FPP_ERR_WIFI_DUPLICATE_OPERATION);
 
+	/*-------------------------------- CMM daemon ----------------------------*/
+	/* Codes the daemon raises itself, outside the FPP numbering space
+	 * (cmmd.h, 32000+). Every other CMMD_ERR_* in cmmd.h is an alias of an
+	 * FPP_ERR_* handled above, so these five are the whole set that used to
+	 * render as "Unknown error code". */
+	caseretstr_cmmd(CMMD_ERR_UNKNOWN);
+	caseretstr_cmmd(CMMD_ERR_NOT_FOUND);
+	caseretstr_cmmd(CMMD_ERR_NOT_CONFIGURED);
+	caseretstr_cmmd(CMMD_ERR_DUPLICATE);
+	caseretstr_cmmd(CMMD_ERR_MEMORY);
+
 	default:
 		return (char *) "Unknown error code";
 	}
@@ -315,10 +335,23 @@ int cmmSendToDaemon(daemon_handle_t handle, unsigned short commandCode, void * d
 		return -1;
 	}
 
+	/* cmm_recv() returns -1 for two different things: the message never
+	 * arrived, or it arrived carrying a non-zero daemon_errno (the daemon's
+	 * encoding of "the handler returned a negative rc"). Only res.daemon_errno
+	 * tells them apart, and it is only meaningful if the receive actually
+	 * wrote it — so zero the response first and report accordingly. Without
+	 * this every daemon-side failure is announced as a receive failure, which
+	 * sends the reader looking at the IPC queue instead of the command. */
+	memset(&res, 0, sizeof(res));
+
 	rcvBytes = cmm_recv(handle, &res, 0);
 	if (rcvBytes < 0)
 	{
-		cmm_print(DEBUG_STDERR, "%s: cmm_recv failed, %s\n", __func__, strerror(errno));
+		if (res.daemon_errno)
+			cmm_print(DEBUG_STDERR, "%s: command 0x%04x failed in cmm daemon, %s\n",
+				  __func__, commandCode, strerror(res.daemon_errno));
+		else
+			cmm_print(DEBUG_STDERR, "%s: cmm_recv failed, %s\n", __func__, strerror(errno));
 		return rcvBytes;
 	}
 
@@ -893,7 +926,12 @@ answer:
 		}
 
 		res.length = dataRcvSize;
-		if (msgsnd(ctx->queueIdTx, &res, sizeof(res) - sizeof(res.buf) + res.length, 0) < 0)
+		/* msgsnd/msgrcv size the message by its mtext only — the leading
+		 * msg_type is excluded — so drop both msg_type and the fixed buf
+		 * array and add back the bytes actually used. Counting msg_type
+		 * here made every reply 8 bytes too long, overrunning the peer's
+		 * response buffer for payloads past its mtext capacity. */
+		if (msgsnd(ctx->queueIdTx, &res, sizeof(res) - sizeof(res.msg_type) - sizeof(res.buf) + res.length, 0) < 0)
 		{
 			cmm_print(DEBUG_WARNING, "%s: msgsnd() failed, %s\n", __func__, strerror(errno));
 			break;

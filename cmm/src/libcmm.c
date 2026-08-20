@@ -150,18 +150,25 @@ int cmm_send(cmm_handle_t *handle, cmm_command_t* cmd, int nonblocking)
 {
 	cmd->msg_type = handle->uniqueid;
 
-        return msgsnd(handle->queue_id_tx, 
-		      cmd, 
-		      sizeof(cmm_command_t) - sizeof(cmd->buf) + cmd->length, 
+        /* Size by mtext only: exclude the leading msg_type, drop the fixed
+	 * buf array, add back the used bytes. Counting msg_type made every
+	 * command 8 bytes too long, over-reading past the caller's cmd. */
+        return msgsnd(handle->queue_id_tx,
+		      cmd,
+		      sizeof(cmm_command_t) - sizeof(cmd->msg_type) - sizeof(cmd->buf) + cmd->length,
 		      nonblocking ? IPC_NOWAIT : 0);
 }
 
 int cmm_recv(cmm_handle_t *handle, cmm_response_t* res, int nonblocking)
 {
-        int len = msgrcv(handle->queue_id_rx, 
-			 res, 
-			 sizeof(cmm_response_t), 
-			 handle->uniqueid, 
+        /* Cap by mtext capacity (msg_type excluded), matching how the sender
+	 * sizes the message. Passing the full struct size let the kernel write
+	 * msg_type-worth of extra bytes past res's mtext on a max-payload
+	 * reply. */
+        int len = msgrcv(handle->queue_id_rx,
+			 res,
+			 sizeof(cmm_response_t) - sizeof(res->msg_type),
+			 handle->uniqueid,
 			 nonblocking ? IPC_NOWAIT : 0);
 	if (len < 0)
                 return len;

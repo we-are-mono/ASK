@@ -177,6 +177,38 @@ void cmmFeReset(FCI_CLIENT *fci_handle)
 				ctEntry->rep_tunnel.fpp_route = NULL;
 			}
 
+			/* Policy routes (cmmPolicyRouting) are linked only on
+			 * rt_table_by_gw_ip, never on rt_table, so the rt_table
+			 * drain below cannot reach them: freeing the conntrack
+			 * that holds the single counted reference cmmPolicyRouting
+			 * took would leak the RtEntry and leave it on the by-gw-ip
+			 * list with a neighEntry pointing into the neighbor table
+			 * the next drain empties. Release it the way the normal
+			 * teardown does (____cmmCtDeregister → __cmmRouteDeregister
+			 * → ____cmmRouteDeregister): neighbor put, then route put,
+			 * which unlinks list_by_gw_ip and frees. ____ is called
+			 * directly because the RT_POLICY test above already needs
+			 * rt->route in hand; going through __cmmRouteDeregister()
+			 * would be equivalent, since its only FCI call is gated on
+			 * rt->fpp_route and that was put and NULLed just above.
+			 * Ordinary routes are deliberately left to the wholesale
+			 * rt_table drain, same as the SA and tunnel holders above.
+			 * A policy route belongs to exactly one
+			 * conntrack in one direction — __cmmRouteFind() only ever
+			 * searches rt_table, so one is never shared or reused. */
+			if (ctEntry->orig.route &&
+			    (ctEntry->orig.route->flags & RT_POLICY))
+			{
+				____cmmRouteDeregister(ctEntry->orig.route, "originator");
+				ctEntry->orig.route = NULL;
+			}
+			if (ctEntry->rep.route &&
+			    (ctEntry->rep.route->flags & RT_POLICY))
+			{
+				____cmmRouteDeregister(ctEntry->rep.route, "replier");
+				ctEntry->rep.route = NULL;
+			}
+
 			__cmmCtRemove(ctEntry);
 		}
 	}

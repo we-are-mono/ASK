@@ -1235,6 +1235,15 @@ void __cmmCheckFPPRouteIdUpdate(struct ct_route *rt, int *flags)
 	}
 }
 
+/* Depth ceiling for the local-registration recursion below. Legitimate
+ * nesting is 1: a local conntrack's registration fans out to the forwarded
+ * conntracks whose tunnel outer remote is that local address, and those, being
+ * forwarded in both directions, never re-enter this hop. Depth 2+ needs a
+ * conntrack that is local in one direction and forwarded in the other, which
+ * only stacked tunnels produce. 4 leaves room for any real topology while
+ * still capping the stack. */
+#define CT_LOCAL_REGISTER_MAX_DEPTH	4
+
 /*****************************************************************
 * ____cmmCtLocalRegister
 *
@@ -1242,9 +1251,44 @@ void __cmmCheckFPPRouteIdUpdate(struct ct_route *rt, int *flags)
 ******************************************************************/
 int ____cmmCtLocalRegister(FCI_CLIENT *fci_handle, struct ctTable* ctEntry)
 {
+	/* Closes the cycle ____cmmCtRegister → ____cmmCtLocalRegister →
+	 * __cmmRouteLocalNew → ____cmmCtRegister. __cmmRouteLocalNew skips
+	 * conntracks already flagged LOCAL_CONN, so each level marks one more
+	 * entry and the chain does terminate -- but only after as many nested
+	 * ct_table walks as there are conntracks, which is both quadratic and
+	 * deep enough to overflow the stack on a busy box.
+	 *
+	 * A plain function-static counter is enough: every path into
+	 * ____cmmCtRegister holds ctMutex -- the conntrack netlink handler, the
+	 * rtnl route handler, keytrack's cmmUpdateFlows and
+	 * cmmUpdateCtEntriesInFlowNoSAList (reached from the SA handlers, which
+	 * take ctMutex before sa_lock), and cmmCtChange on the client-daemon
+	 * thread. No two threads are ever inside the counter at once, so it
+	 * needs neither thread-local storage nor atomics.
+	 *
+	 * Below the ceiling nothing changes. At it, the walk is skipped and this
+	 * conntrack's dependants stay unprogrammed -- degraded, not broken:
+	 * traffic keeps flowing through the slow path and the next conntrack,
+	 * route or neighbour event re-enters ____cmmCtRegister from the top with
+	 * the counter back at zero and re-registers them. Returning 0 keeps the
+	 * caller's contract identical to the unconditional success this function
+	 * has always reported. */
+	static int depth;
+
+	if (depth >= CT_LOCAL_REGISTER_MAX_DEPTH)
+	{
+		cmm_print(DEBUG_ERROR, "%s: local registration nested past %d levels, "
+			"skipping the dependant walk for this conntrack\n",
+			__func__, CT_LOCAL_REGISTER_MAX_DEPTH);
+		return 0;
+	}
+
+	depth++;
 	/* Update all dynamic connections/ tunnel routes for which tunnel route
 	is not attached */
 	__cmmRouteLocalNew(fci_handle, ctEntry);
+	depth--;
+
 	return 0;
 }
 
