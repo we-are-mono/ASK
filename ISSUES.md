@@ -923,22 +923,38 @@ file's git history.
   after `__cmmUpdateFlowDependecies`, or snapshot the walk. Open (low,
   contrived trigger).
 
-- **A80.** cdx `dpa_control_mc.c` (~:1300) clears mcast member state before
-  checking the `ExternalHashTableFmPcdHcSync` result; on sync failure it
-  returns -1 having already clobbered the state, permanently leaking that
-  `tbl_entry` and abandoning the rest of the batch. Reorder to check-then-
-  clear, weighed against the HC-sync semantics. Open (low).
+- **A80.** cdx `dpa_control_mc.c` per-listener REMOVE clears member state
+  (`bIsValidEntry=0`, `tbl_entry=NULL`, count--) BEFORE checking the
+  `ExternalHashTableFmPcdHcSync` result, so a sync failure leaks the
+  `tbl_entry` and mis-decrements `uiListenerCnt` (latent: the query walker
+  was hardened to re-scan `bIsValidEntry` and ignore the counter).
+  **Investigated (2026-08-20): the obvious check-then-clear reorder is
+  unsafe and was NOT applied.** HC-sync can fail transiently (HC frame-pool
+  exhaustion, not just a wedge), so the fix must keep the entry reclaimable
+  on failure — but leaving `bIsValidEntry=1` lets a re-REMOVE re-enter the
+  first-listener surgery after `first_listener_entry` already advanced,
+  hitting a NULL `temp_entry->next` deref (:1295) → handler oops → orphaned
+  `ctrl.mutex` → all FCI hangs → reboot (worse than the leak). The
+  two-field state has no localized assignment satisfying
+  {no-leak, no-unsafe-free, no-crash-on-retry}. A correct fix needs a
+  quarantine/pending-free list drained when the HC channel recovers (the
+  in-tree `ExternalHashTableDeleteKey` sync-then-free discipline can't be
+  applied here because the surgery is destructive before the sync). The
+  current `return -1` abort-the-batch behavior is correct and unchanged (a
+  wedged HC fails every later member too). Open (investigate — needs the
+  pending-free design). Adjacent: cmmd.h/getErrorString lack the
+  `FPP_ERR_MC_DUP_LISTENER` (702) case, so a 702 renders as "unknown".
 
-- **A81.** cmm `cmmd.h` hard-codes the wire values 701/703/704/705 for the
-  `CMMD_ERR_MC_*` codes instead of aliasing the `FPP_ERR_MC_*` constants
-  they mirror — silent drift if the FPP side ever renumbers, with no
-  compile-time signal. Alias them (or static-assert equality). Open
-  (cleanup).
+- **A81.** cmm `cmmd.h` hard-coded MC error wire values — **fixed**
+  (_eb594f0_): the `CMMD_ERR_MC_*` codes now alias the `FPP_ERR_MC_*`
+  constants (fpp.h already included; sibling `ENTRY_NOT_FOUND` already did),
+  so drift is a compile error. Numerically identical (701/703/704/705
+  verified equal), no behavior change.
 
-- **A82.** cmm `CMMD_CMD_SOCKET_SHOW` is the only `socket_daemon` command
-  arm with no `cmd_len` check; bounded today only because
-  `cmmDaemonThread` memsets the command buffer before receive. Add the
-  guard for parity with the other arms. Open (low, defensive).
+- **A82.** cmm `CMMD_CMD_SOCKET_SHOW` missing length check — **fixed**
+  (_eb594f0_): added a `cmd_len < sizeof(*cmd)` guard matching the sibling
+  arms' shape before the first deref. Purely additive (was bounded only by
+  the pre-receive memset).
 
 - **A69.** CT register leaked the main-route references on the tunnel-route
   failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of
