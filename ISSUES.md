@@ -777,12 +777,13 @@ file's git history.
   `cdx_ifstats.c:94` does). Suspected, not confirmed — needs a read of what the
   ucode expects in those fields before any fix. Open (investigate).
 
-- **A63.** `mc4_exit`/`mc6_exit` (`dpa_control_mc.c`) free the bucket spinlock
-  arrays but never walk `mc{4,6}_grp_list[]`, so live groups and their
-  kzalloc'd `pCtEntry`/`pRtEntry` leak on module unload (surfaced by the A53
-  audit; unload-only, cdx is persistent in production). A drain would mirror
-  the group-DELETE path (classif-table remove + frees) before the lock arrays
-  go. Open (low priority).
+- **A63.** `mc4_exit`/`mc6_exit` leaked every live mcast group on module
+  unload — **fixed** (_f9afea9_): the group-DELETE teardown is extracted to
+  a shared `cdx_mcast_group_destroy()` (classif-table evict before any
+  backing-memory free) and both the DELETE arm and a new exit drain call it,
+  so the two stay in lockstep; the drain runs before the spinlock and
+  grp-id arrays are freed. Unload-only path — cdx is persistent in
+  production, so audit-confirmed rather than rig-exercised.
 
 - **A64.** Neither `insert_entry_in_classif_table` nor
   `insert_mcast_entry_in_classif_table` (`cdx_ehash.c`) unwinds
@@ -872,30 +873,36 @@ file's git history.
   `set activate 0/1` with live programmed flows: drain → refill of the
   same flow, zero splats; full suite 291 passed).
 
-- **A75.** cmm client error reporting gaps (A55 residue): `socket_daemon`
-  presets `res_buf[0]=CMMD_ERR_WRONG_COMMAND_SIZE`, so on a transport
-  failure the client prints that stale code (`cmmSendToDaemon` never
-  consults `daemon_errno`), and `getErrorString` has no cases for the
-  32000-range CMMD codes, rendering them "Unknown error code (N)". Open
-  (low, cmm-only).
+- **A75.** cmm client error reporting gaps (A55 residue) — **fixed**
+  (_f9afea9_): a daemon-side failure now reports as one (the daemon puts
+  `CMMD_ERR_UNKNOWN` on the wire for a transport `rc<0` instead of a
+  "malformed request" code, and `cmmSendToDaemon` zeroes the response and
+  distinguishes a real msgrcv failure from a `daemon_errno` failure), and
+  `getErrorString` names the five 32000-range CMMD codes. The audit found
+  the original "client never consults daemon_errno" premise was already
+  false (`cmm_recv` did); the real defects were the on-wire lie and the
+  missing strings. cmm-only, reporting path.
 
-- **A76.** `____cmmCtRegister → ____cmmCtLocalRegister → __cmmRouteLocalNew
-  → ____cmmCtRegister` has no progress guard: a hybrid local/non-local
-  conntrack whose local destination equals a tunnel's outer remote address
-  can recurse while tunnel-route registration keeps failing. Contrived
-  input, but the recursion is stack-unbounded. Same family: the nested
-  registration can, in a stale-rekey corner, rekey-unlink the node
-  `cmmUpdateFlows`' walk saved as next (or re-link it onto another SA's
-  list), invalidating the iterator. Fix shape: a visited flag or depth
-  guard on the local-registration hop. Open (low).
+- **A76.** unbounded local-registration recursion — **fixed** (_f9afea9_):
+  a function-static depth counter in `____cmmCtLocalRegister` saturates at
+  4 (legitimate nesting is 1), logging and returning without re-registering
+  at the bound; safe as a static because every entry into the recursion
+  holds `ctMutex` (non-recursive), so at most one thread is ever in it.
+  Below the bound behavior is bit-identical. Note the recursion terminates
+  on its own today (`__cmmRouteLocalNew` skips `LOCAL_CONN`) — the guard
+  bounds stack depth, not a live hang. **Residue (A79):** the iterator-
+  invalidation half of this entry (nested registration rekey-unlinking the
+  node `cmmUpdateFlows` saved as next) is not addressed by the depth guard.
 
-- **A77.** RT_POLICY routes escape `cmmFeReset`'s rt drain:
-  `cmmPolicyRouting` mallocs per-ct RtEntries linked only on
-  `rt_table_by_gw_ip` (never `rt_table`), and the reset frees the holding
-  ct without a route put — the RtEntry leaks and stays on the by-gw-ip
-  list with a `neighEntry` pointer into the fully drained neighbor table
-  (stale membership; today only pointer-compared, so leak not crash).
-  Relevant only with extroute policy routing configured. Open (low).
+- **A77.** RT_POLICY routes escaped `cmmFeReset`'s rt drain — **fixed**
+  (_f9afea9_): the reset's ct drain now releases each conntrack's
+  policy-route reference per direction (`orig/rep.route`) the same way the
+  normal `____cmmCtDeregister` path does — one route put per counted
+  reference, the `rt_table_by_gw_ip` unlink handled inside
+  `__cmmRouteRemove`, no FCI traffic (engine already reset). Audit-confirmed
+  no double-put with the adjacent fpp-route puts. Rig exercise of the reset
+  path under KASAN with policy routing configured deferred to the next DUT
+  window.
 
 - **A78.** Whether the forward engine preserves tunnel objects across
   `FPP_CMD_IPV4/IPV6_RESET` is unconfirmed: tunnel interfaces keep
@@ -905,6 +912,33 @@ file's git history.
   targets a missing object. Needs an engine-side check (cdx TNL handler
   semantics after reset) before deciding whether reset should clear
   `FPP_PROGRAMMED` on tunnel itfs. Open (investigate).
+
+- **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
+  `____cmmCtRegister` recursion can, in a stale-rekey corner (a conntrack
+  UPDATE rewriting ct attrs to a new sagd while still linked to the old
+  SA), rekey-unlink the `list_by_sa` node the outer walk saved as `next`,
+  or re-link it onto another SA's list — walking the saved iterator into
+  foreign memory. Distinct from the A76 stack-depth concern (that guard
+  does not cover this). Fix shape: re-validate or re-fetch the next node
+  after `__cmmUpdateFlowDependecies`, or snapshot the walk. Open (low,
+  contrived trigger).
+
+- **A80.** cdx `dpa_control_mc.c` (~:1300) clears mcast member state before
+  checking the `ExternalHashTableFmPcdHcSync` result; on sync failure it
+  returns -1 having already clobbered the state, permanently leaking that
+  `tbl_entry` and abandoning the rest of the batch. Reorder to check-then-
+  clear, weighed against the HC-sync semantics. Open (low).
+
+- **A81.** cmm `cmmd.h` hard-codes the wire values 701/703/704/705 for the
+  `CMMD_ERR_MC_*` codes instead of aliasing the `FPP_ERR_MC_*` constants
+  they mirror — silent drift if the FPP side ever renumbers, with no
+  compile-time signal. Alias them (or static-assert equality). Open
+  (cleanup).
+
+- **A82.** cmm `CMMD_CMD_SOCKET_SHOW` is the only `socket_daemon` command
+  arm with no `cmd_len` check; bounded today only because
+  `cmmDaemonThread` memsets the command buffer before receive. Add the
+  guard for parity with the other arms. Open (low, defensive).
 
 - **A69.** CT register leaked the main-route references on the tunnel-route
   failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of
