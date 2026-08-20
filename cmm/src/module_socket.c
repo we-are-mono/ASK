@@ -993,6 +993,13 @@ int socket_daemon(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int fc, u_
 		struct socket *s;
 		cmmd_socket_show_cmd_t *cmd = (cmmd_socket_show_cmd_t *)cmd_buf;
 
+		if (cmd_len < sizeof(*cmd))
+		{
+			cmm_print(DEBUG_ERROR, "%s: socket show command size too small(%d, %zu)\n", __func__, cmd_len, sizeof(*cmd));
+			*res_len = 2;
+			break;
+		}
+
 		cmm_print(DEBUG_INFO, "reserve start and end(%d, %d)\n", SOCK_ID_PRIVATE_START, SOCK_ID_PRIVATE_END);
 
 		__pthread_mutex_lock(&socket_lock);

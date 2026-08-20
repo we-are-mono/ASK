@@ -157,11 +157,16 @@ typedef fpp_ff_ctrl_cmd_t 	cmmd_ff_ctrl_cmd_t;
  
 /*---------------------------------- Multicast -------------------------------*/
 // 0x0700 -> 0x07FF : Multicast modules 
+/* Alias the FPP constants (fpp.h is included above) rather than repeating
+ * their wire values, so a future change to either side is a compile error
+ * instead of a silent divergence that would make getErrorString() mislabel
+ * these codes. FPP spells 704 "INVALID_ADDR"; CMM's historical name for the
+ * same value is kept. */
 #define CMMD_ERR_MC_ENTRY_NOT_FOUND		FPP_ERR_MC_ENTRY_NOT_FOUND
-#define CMMD_ERR_MC_MAX_LISTENERS                    701
-#define CMMD_ERR_MC_ENTRY_OVERLAP  		     703 
-#define CMMD_ERR_MC_INVALID_MAC                      704
-#define CMMD_ERR_MC_INTERFACE_NOT_ALLOWED            705
+#define CMMD_ERR_MC_MAX_LISTENERS		FPP_ERR_MC_MAX_LISTENERS
+#define CMMD_ERR_MC_ENTRY_OVERLAP		FPP_ERR_MC_ENTRY_OVERLAP
+#define CMMD_ERR_MC_INVALID_MAC			FPP_ERR_MC_INVALID_ADDR
+#define CMMD_ERR_MC_INTERFACE_NOT_ALLOWED	FPP_ERR_MC_INTERFACE_NOT_ALLOWED
 
 #define CMMD_CMD_MC6_MULTICAST			0x0703
 #define CMMD_CMD_MC6_RESET			0x0704
