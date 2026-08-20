@@ -785,13 +785,15 @@ file's git history.
   grp-id arrays are freed. Unload-only path — cdx is persistent in
   production, so audit-confirmed rather than rig-exercised.
 
-- **A64.** Neither `insert_entry_in_classif_table` nor
-  `insert_mcast_entry_in_classif_table` (`cdx_ehash.c`) unwinds
-  `add_incoming_iface_info()` on their later error paths — whatever ingress
-  iface state that call acquires is left behind on every `goto err_ret` after
-  it succeeds. Needs a read of what add_incoming_iface_info actually pins
-  before designing the unwind (same investigate-first rule as A37). Open
-  (investigate).
+- **A64.** ~~`insert_entry_in_classif_table`/`insert_mcast_entry_in_classif_table`
+  don't unwind `add_incoming_iface_info()` on error paths.~~ **Closed
+  (2026-08-20, not a bug):** `add_incoming_iface_info` (`cdx_dpa.c:96-172`)
+  has exactly one success side effect — `entry->inPhyPortNum = iif->index`
+  (`:170`), a scalar int copy. No alloc, no refcount, no list link; it reads
+  `pRtEntry->input_itf` as a borrowed pointer and returns on both failure
+  modes before that write. There is nothing to unwind; the existing
+  `err_ret` paths are correct. (Cosmetic residue: the `add_*` name
+  misleadingly implies acquisition.)
 
 - **A65.** cmm `sa_lock` ABBA inversion — **fixed** (_6b61392_): `sa_lock` is
   now a leaf taken after the canonical `itf → ct → rt → neigh` chain at every
@@ -904,14 +906,16 @@ file's git history.
   path under KASAN with policy routing configured deferred to the next DUT
   window.
 
-- **A78.** Whether the forward engine preserves tunnel objects across
-  `FPP_CMD_IPV4/IPV6_RESET` is unconfirmed: tunnel interfaces keep
-  `FPP_PROGRAMMED` set across a cmm reset (pre-existing, matches the
-  INVALID-arm model), so the first post-reset reprogram sends
-  ACTION_UPDATE; if the engine also wiped tunnel objects, that update
-  targets a missing object. Needs an engine-side check (cdx TNL handler
-  semantics after reset) before deciding whether reset should clear
-  `FPP_PROGRAMMED` on tunnel itfs. Open (investigate).
+- **A78.** ~~Whether the forward engine preserves tunnel objects across
+  `FPP_CMD_IPV4/IPV6_RESET` is unconfirmed.~~ **Closed (2026-08-20, not a
+  bug):** the cdx reset handlers tear down only conntracks, sockets and
+  routes — `IPv4_HandleIP_RESET` (`control_ipv4.c:1126-1163`: `ct_remove`,
+  `SOCKET4_free_entries`, `L2_route_remove`) and `IPv6_handle_RESET`
+  (`SOCKET6_free_entries` only); a grep of both for tunnel/SA/ipsec teardown
+  is empty. Tunnels are freed solely via `TNL_handle_DELETE`. So the engine
+  preserves tunnel objects across reset, cmm keeping `FPP_PROGRAMMED` on
+  tunnel itfs is correct, and the first post-reset `ACTION_UPDATE` targets a
+  live object. No change needed.
 
 - **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
   local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
