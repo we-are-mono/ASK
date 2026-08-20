@@ -914,14 +914,28 @@ file's git history.
   `FPP_PROGRAMMED` on tunnel itfs. Open (investigate).
 
 - **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
-  `____cmmCtRegister` recursion can, in a stale-rekey corner (a conntrack
-  UPDATE rewriting ct attrs to a new sagd while still linked to the old
-  SA), rekey-unlink the `list_by_sa` node the outer walk saved as `next`,
-  or re-link it onto another SA's list — walking the saved iterator into
-  foreign memory. Distinct from the A76 stack-depth concern (that guard
-  does not cover this). Fix shape: re-validate or re-fetch the next node
-  after `__cmmUpdateFlowDependecies`, or snapshot the walk. Open (low,
-  contrived trigger).
+  local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
+  → ____cmmCtRegister`) reaches `__cmm_ct_get_SA`, which on an SPI-mismatch
+  rekey `list_del`s (and may head-`list_add` onto another SA) the
+  `list_by_sa` node the outer walk saved as `next` — so the next
+  `container_of` walks a moved/foreign node. **Investigated (2026-08-20):
+  no safe localized fix.** ct *objects* are pointer-stable (the reprogram
+  path never frees a ctTable — only the deregister path does), so this is
+  list-node movement, not UAF. The current node is already `list_del`'d
+  before the reprogram; the hazard is the saved-next. Exposed walks:
+  `cmmUpdateFlows` and `cmmUpdateCtEntriesInFlowNoSAList` (both hold a
+  saved-next across the reprogram); `cmmUpdateFlowsWithNewSAInfo`'s own loop
+  is safe (touches no list) but funnels into `cmmUpdateFlows`. "Re-fetch
+  next from the head" fails: `list_add` is head-insert, so a ct re-added by
+  the recursion is re-read — terminates for the three `SA_DELETE` paths
+  (the `SA_DELETE` gate refuses re-link) but infinite-loops the two
+  non-delete cases (flow_no_sa re-add, rekey-to-old-SA). A snapshot needs
+  per-node re-validation that it still references this SA/direction plus a
+  dynamically-sized copy of an unbounded list. Fix shape (design): a
+  per-pass generation/visited marker on `ctTable`, or a walk-in-progress
+  guard that stops the A76 recursion from re-entering a list being walked —
+  new struct field, deliberate change. Open (investigate; contrived
+  trigger, low priority).
 
 - **A80.** cdx `dpa_control_mc.c` per-listener REMOVE clears member state
   (`bIsValidEntry=0`, `tbl_entry=NULL`, count--) BEFORE checking the
@@ -942,8 +956,7 @@ file's git history.
   applied here because the surgery is destructive before the sync). The
   current `return -1` abort-the-batch behavior is correct and unchanged (a
   wedged HC fails every later member too). Open (investigate — needs the
-  pending-free design). Adjacent: cmmd.h/getErrorString lack the
-  `FPP_ERR_MC_DUP_LISTENER` (702) case, so a 702 renders as "unknown".
+  pending-free design).
 
 - **A81.** cmm `cmmd.h` hard-coded MC error wire values — **fixed**
   (_eb594f0_): the `CMMD_ERR_MC_*` codes now alias the `FPP_ERR_MC_*`
