@@ -561,15 +561,10 @@ file's git history.
 - **A36.** Five audit smells confirmed + **fixed** (_051b8c4_): ehash lock leaks,
   sysfs IRQ-off returns (new patch 101), RICP clobber, libnfnetlink UAF, fmc dedup.
 
-- **A37.** Two IPsec-FQ setup leaks in cdx `dpa_ipsec.c` (report-only, from the
-  leftover audit). (a) The expt/wlan FQ-setup loop's `err_ret` path returns
-  FAILURE without releasing the FQs it created in earlier iterations or the
-  associated mem (the comment claimed it did — corrected to an honest FIXME).
-  Unlike the SA path's `err_ret3`, there is no tracked per-iteration FQ list to
-  walk here. (b) `err_ret2` carries `/*TODO: qman_release_fqid_range*/` — the
-  reserved fqid range leaks on the proc-dir failure path. Both are rare
-  probe/setup-time failures; a correct unwind must avoid double-retire, so
-  filed rather than guessed. Open.
+- **A37.** Two IPsec-FQ setup leaks in cdx `dpa_ipsec.c` — **fixed**
+  (_dd37089_): `err_ret` unwinds the exception FQs (add moved after procfs so
+  the failing FQ is never double-retired); `err_ret2` releases the fqid
+  range. Probe-only path, compile-validated.
 
 - **A38.** Wire macvlan hardware offload in cdx (planned). cmm sends
   FPP_CMD_MACVLAN_ENTRY/RESET automatically on macvlan interface events
@@ -770,12 +765,10 @@ file's git history.
   out-of-tree users. (`IOMemSet32` keeps its `WRITE_UINT32` loop — why
   `FmMuramClear` and friends are safe.)
 
-- **A62.** `cdx/cdx_ehash.c:2363-2368` (`create_rtprelay_process_opcode`) stores
-  `cpu_to_be32(PTR_TO_UINT(rtpinfo_ptr / in_sockstats_ptr / out_sockstats_ptr))`
-  — truncating a 64-bit kernel VA to 32 bits for fields the ucode consumes as
-  MURAM addresses. The correct form subtracts the MURAM base first (as
-  `cdx_ifstats.c:94` does). Suspected, not confirmed — needs a read of what the
-  ucode expects in those fields before any fix. Open (investigate).
+- **A62.** cdx RTP-relay opcode wrote truncated 64-bit VAs where the ucode
+  expects MURAM offsets — **fixed** (_dd37089_): convert via
+  `MURAM_VIRT_TO_PHYS_ADDR` (rtp_info non-NULL by construction, socket-stats
+  guarded NULL→0). Confirmed real; CLI-only path, compile-validated.
 
 - **A63.** `mc4_exit`/`mc6_exit` leaked every live mcast group on module
   unload — **fixed** (_f9afea9_): the group-DELETE teardown is extracted to
@@ -972,6 +965,11 @@ file's git history.
   (_eb594f0_): added a `cmd_len < sizeof(*cmd)` guard matching the sibling
   arms' shape before the first deref. Purely additive (was bounded only by
   the pre-receive memset).
+
+- **A83.** cdx `rtp_flow_free` (`control_rtp_relay.c:68-84`) leaks the MURAM
+  `rtp_info` carve if `dpa_get_fm_MURAM_handle` returns NULL — it frees
+  `hw_flow` but not `rtp_info`, losing its only pointer. Latent (the MURAM
+  handle is a stable init-time global). Surfaced by the A62 trace. Open (low).
 
 - **A69.** CT register leaked the main-route references on the tunnel-route
   failure path: `IP_Check_Route()` took an `L2_route_get` nbref on each of

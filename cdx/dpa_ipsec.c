@@ -600,7 +600,9 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			dpa_fq = kzalloc((sizeof(struct dpa_fq)), GFP_KERNEL);
 			if (!dpa_fq) {
 				DPAIPSEC_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
-				return FAILURE;
+				/* nothing to free for this iteration (dpa_fq is NULL);
+				 * err_ret unwinds the FQs from earlier iterations. */
+				goto err_ret;
 			}
 
 			/* set FQ parameters */
@@ -618,7 +620,6 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			else
 				next_portal_ch_idx++;
 			dpa_fq->wq = DEFA_WQ_ID;
-			ipsec_addfq_to_exceptionfq_list(dpa_fq,info);
 			/* set options similar to ethernet driver */
 			memset(&opts, 0, sizeof(struct qm_mcc_initfq));
 			opts.fqd.fq_ctrl = (QM_FQCTRL_PREFERINCACHE | QM_FQCTRL_HOLDACTIVE);
@@ -633,6 +634,9 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 					DPAIPSEC_ERROR("%s::qman_create_fq failed for fqid 0x%x (%d): err=%d, dist=%d\n",
 							__func__, dpa_fq->fqid, dpa_fq->fqid,
 							qrc, jj);
+					/* not on the exception-fq list yet; free the
+					 * wrapper here so err_ret doesn't have to. */
+					kfree(dpa_fq);
 					goto err_ret;
 				}
 			}
@@ -653,10 +657,17 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 							__func__, dpa_fq->fqid, dpa_fq->fqid,
 							qrc, jj, fqbase & 0xFFFF, portid, dpa_fq->channel);
 					qman_destroy_fq(fq, 0);
+					/* not on the exception-fq list yet; the FQ is
+					 * already destroyed, so just free the wrapper. */
+					kfree(dpa_fq);
 					goto err_ret;
 				}
 			}
 			cdx_create_type_fqid_info_in_procfs(fq, PCD_DIR, oh_iface_info->pcd_proc_entry, NULL);
+			/* FQ is fully created, initialised and registered in procfs;
+			 * only now put it on the exception-fq list so err_ret never
+			 * walks a half-built or already-destroyed FQ. */
+			ipsec_addfq_to_exceptionfq_list(dpa_fq, info);
 #ifdef DPA_IPSEC_DEBUG
 			DPAIPSEC_INFO("%s::created pcd fq %x(%d) for wlan packets "
 					"channel 0x%x\n", __func__,
@@ -670,11 +681,34 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 	return SUCCESS;
 err_ret:
 	/*
-	 * FIXME: leaks the FQs created in the loop above and the associated mem
-	 * on this rare probe-time failure path — no unwind is implemented here
-	 * (unlike the SA setup's err_ret3, which walks sec_fq[] to retire each
-	 * FQ). Filed for a proper unwind; see ISSUES.md.
+	 * Unwind every FQ that an earlier iteration fully set up and placed on
+	 * the exception-fq list. The current (failing) FQ is never on the list
+	 * — it is added only after procfs registration — so it can't be double-
+	 * retired or double-freed here; its wrapper is already freed at the goto
+	 * site. Mirrors the SA-path err_ret3 teardown, plus the kfree these
+	 * kzalloc'd wrappers need (the SA path uses a fixed sec_fq[] array). A
+	 * retire/oos failure leaves the FQ un-OOS, so we must not destroy it
+	 * (QMan would keep a dangling pointer for later callbacks — UAF); bail
+	 * out and leak the remainder deliberately, as the SA teardown does.
 	 */
+	while (info->ipsec_exception_fq) {
+		dpa_fq = info->ipsec_exception_fq;
+		fq = &dpa_fq->fq_base;
+		ipsec_delfq_from_exceptionfq_list(dpa_fq->fqid, info);
+		if (qman_retire_fq(fq, NULL)) {
+			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
+					__func__, fq->fqid, fq->fqid);
+			return FAILURE;
+		}
+		if (qman_oos_fq(fq)) {
+			DPAIPSEC_ERROR("%s::Failed to oos FQ %x(%d)\n",
+					__func__, fq->fqid, fq->fqid);
+			return FAILURE;
+		}
+		cdx_remove_fqid_info_in_procfs(fq->fqid);
+		qman_destroy_fq(fq, 0);
+		kfree(dpa_fq);
+	}
 	return FAILURE;
 }
 
@@ -910,7 +944,11 @@ err_ret3:
 		ipsecsa_info->sa_proc_entry = NULL;
 	}
 err_ret2:
-	/*TODO : qman_release_fqid_range */
+	/* Reached only after the qman_alloc_fqid_range above succeeded (the
+	 * alloc-failure path jumps straight to err_ret1); the range is released
+	 * nowhere else in this function, and the normal SA teardown releases it
+	 * only for SAs that reached SUCCESS — so this is an exactly-once release. */
+	qman_release_fqid_range(fqids_base, NUM_FQS_PER_SA);
 err_ret1:
 	kfree(ipsecsa_info->shdesc_mem);
 err_ret0:

@@ -2376,11 +2376,17 @@ static int create_rtprelay_process_opcode(struct ins_entry_info *info,
 	if (sizeof(struct en_ehash_rtprelay_param) > info->param_size)
 		return FAILURE;
 	param = (struct en_ehash_rtprelay_param *)info->paramptr;
-	ptr_val = PTR_TO_UINT(rtpinfo_ptr);
+	/* These are MURAM offsets consumed by the ucode, not kernel VAs: convert
+	 * via the MURAM base instead of truncating the 64-bit pointer. rtpinfo_ptr
+	 * is non-NULL by construction (its MURAM alloc is NULL-checked before the
+	 * flow is programmed); the two socket-stats pointers can be NULL (stats
+	 * disabled) and must map to 0 so the ucode reads "no pointer" —
+	 * MURAM_VIRT_TO_PHYS_ADDR(NULL) would yield a bogus non-zero offset. */
+	ptr_val = MURAM_VIRT_TO_PHYS_ADDR(rtpinfo_ptr);
 	param->rtpinfo_ptr =  cpu_to_be32(ptr_val);
-	ptr_val = PTR_TO_UINT(in_sockstats_ptr);
+	ptr_val = in_sockstats_ptr ? MURAM_VIRT_TO_PHYS_ADDR(in_sockstats_ptr) : 0;
 	param->in_sock_stats_ptr =  cpu_to_be32(ptr_val);
-	ptr_val = PTR_TO_UINT(out_sockstats_ptr);
+	ptr_val = out_sockstats_ptr ? MURAM_VIRT_TO_PHYS_ADDR(out_sockstats_ptr) : 0;
 	param->out_sock_stats_ptr =  cpu_to_be32(ptr_val);
 	*(info->opcptr) = opcode;
 	info->opcptr++;
@@ -3683,7 +3689,9 @@ void cdx_ehash_update_rtp_info_params(uint8_t *rtp_relay_param, uint32_t *rtpinf
 	uint32_t ptr_val;
 	
 	param = (struct en_ehash_rtprelay_param *)rtp_relay_param;
-	ptr_val = PTR_TO_UINT(rtpinfo_ptr);
+	/* MURAM offset for the ucode, not a kernel VA; rtpinfo_ptr is non-NULL by
+	 * construction (allocated and NULL-checked before this update runs). */
+	ptr_val = MURAM_VIRT_TO_PHYS_ADDR(rtpinfo_ptr);
 	param->rtpinfo_ptr =  cpu_to_be32(ptr_val);
 	return;
 }
