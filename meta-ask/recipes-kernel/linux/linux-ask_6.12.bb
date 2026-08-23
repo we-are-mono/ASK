@@ -40,15 +40,15 @@ KERNEL_BRANCH = "linux-6.12.y"
 KERNEL_SRCREV = "25c09b42358e73e1476e517b296edb6344f2e4bd"
 
 # --- Pin 2: NXP DPAA/FMan/QBMan SDK overlay ---
-# This is the SINGLE authoritative SDK pin. OpenWrt's kernel-side sync
-# (scripts/mono-sync-ask-kernel.sh) currently keeps its own NXP_SDK_REF as a
-# second hand-synced pin; its TODO is to fetch ASK and READ this
-# NXP_SDK_SRCREV as the one SDK pin so the two can never drift. Keep this
-# variable name greppable: NXP_SDK_SRCREV.
+# The SDK SRCREV lives in a canonical, format-neutral pin file
+# (pins/nxp-sdk-srcrev.inc) so every consumer reads ONE source and nobody parses
+# another's format: this recipe `require`s it (bitbake tracks the file's checksum,
+# so a pin bump re-triggers the fetch); OpenWrt's sync and the Armbian build
+# extract the value with a one-line sed. ASK_VERSION stays the single pin — the
+# SDK ref rides inside the pinned ASK tree.
 NXP_SDK_SRC = "git://github.com/nxp-qoriq/linux.git;protocol=https"
 NXP_SDK_BRANCH = "lf-6.12.y"
-# NXP tag lf-6.12.49-2.2.0.
-NXP_SDK_SRCREV = "df24f9428e38740256a410b983003a478e72a7c0"
+require ${ASK_SRCROOT}/pins/nxp-sdk-srcrev.inc
 
 SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            ${NXP_SDK_SRC};branch=${NXP_SDK_BRANCH};name=nxpsdk;destsuffix=nxp-sdk \

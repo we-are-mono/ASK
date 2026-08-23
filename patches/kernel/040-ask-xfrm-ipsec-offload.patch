@@ -1,4 +1,4 @@
-From 3aaf13e5259f5c34a4756f69676534b5106ab76c Mon Sep 17 00:00:00 2001
+From 7295bd43fe80d558589769cb5316987d356b317c Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -1560,7 +1560,7 @@ index 5d3633ce6ba3..8e4f6b42c6fb 100644
  		spin_lock(&x->lock);
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index a5b5d82bd755..a5453e2e0d1f 100644
+index a5b5d82bd755..7986169033d7 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
 @@ -67,6 +67,10 @@ static int xfrm4_transport_output(struct xfrm_state *x, struct sk_buff *skb)
@@ -1626,7 +1626,7 @@ index a5b5d82bd755..a5453e2e0d1f 100644
 +		if (x->offloaded) {
 +			if (xfrm_nr == XFRM_MAX_DEPTH) {
 +				err = -ENOBUFS;
-+				goto out;
++				goto error_nolock;
 +			}
 +
 +			if (!x->curlft.use_time)

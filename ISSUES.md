@@ -138,14 +138,17 @@ stale line refs) are folded into the archive one-liners.
   (untreated) — benign on LS1046A coherent DMA, would matter under an IOMMU.
   Apply the A89 unwind for consistency. Surfaced by the A89 audit. Open (low).
 
-- [ ] **A92.** `xfrm_output_one()` offload error path leaks state refs + skb.
-  In `net/xfrm/xfrm_output.c` (patch 040) the offload block's
-  `if (xfrm_nr == XFRM_MAX_DEPTH) { err = -ENOBUFS; goto out; }` jumps to `out:`,
-  which skips `error_nolock:` — the up-to-6 `xfrm_state` refs already collected in
-  `xfrm[]` and the skb are never released. Should be `goto error_nolock`.
-  Byte-identical to the NXP original (not a regen regression); reachable only with
-  ≥6 stacked offloaded transforms, so latent. Surfaced by the mainline-regen audit.
-  Fix + a stacked-transform test. Open (low).
+- [ ] **A94.** `xfrm_output_one()` async-crypto exit leaks the offload vec refs.
+  In `net/xfrm/xfrm_output.c` (patch 040) the collected `xfrm_vec[]` offload refs are
+  released only at `error_nolock`. Mainline's async path — `x->type->output` returning
+  `-EINPROGRESS` — does `goto out`, skipping that put loop, so up to `xfrm_nr`
+  `xfrm_state` refs leak when a bundle is heterogeneous (inner offloaded SA + outer
+  software SA that goes async). Unreachable under valid config: the whole-flow offload
+  model doesn't produce mixed offloaded/software bundles, such a bundle is already
+  functionally broken by the sticky `skb->ipsec_offload` flag, and all-software bundles
+  keep `xfrm_nr==0` so the path is a no-op. Byte-identical to the NXP reference (not a
+  regen regression); sibling of A92, surfaced by its fix audit. Minimal hardening:
+  release/transfer the vec on the `-EINPROGRESS` exit, or reject mixed bundles. Open (low).
 
 ---
 
@@ -772,6 +775,14 @@ file's git history.
 - [x] **A91.** `ip_output()` ipsec-offload early-return leaked `rcu_read_lock` on
   mainline 6.12.103 (rcu-wraps `ip_output`, unlike NXP 6.12.49) — fixed (patch 030):
   unlock before the offload return. Surfaced by the mainline-regen audit.
+
+- [x] **A92.** `xfrm_output_one()` overflow guard leaked ≤6 `xfrm_state` refs + the skb
+  on ≥6-transform bundles — fixed (patch 040): `goto out` → `goto error_nolock`. Latent,
+  inherited verbatim from NXP; sibling A94 (async path) left open.
+
+- [x] **A93.** mcast failslab sweeps flaked under KASAN — `fail-nth` counted page-alloc
+  faults (`CONFIG_FAIL_PAGE_ALLOC`), burning the sweep window before the cdx allocs —
+  fixed (ask.cfg): dropped `FAIL_PAGE_ALLOC` so `fail-nth` counts slab only. A70 residual.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning
