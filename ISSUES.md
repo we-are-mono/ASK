@@ -90,15 +90,6 @@ stale line refs) are folded into the archive one-liners.
   add a transport-mode case to the rig suite and validate both the pre-existing
   path and the AOFL-adjusted lengths. Open.
 
-- [ ] **A41.** The kas/Yocto build of dpa_app compiles with neither `-Wall` nor
-  `-Werror`: `dpa-app_1.0.bb` overrides CFLAGS wholesale with Yocto's default
-  `-O2 -g -pipe` plus its define/include set (confirmed: zero `-Wall`/`-Werror`
-  in a fresh `log.do_compile`), while the top-level `make userspace` path does
-  build it `-Wall -Werror`. So the shipped dpa_app binary is the one built
-  without warning enforcement — against the repo's warning-free policy. Fix is a
-  recipe CFLAGS append, but enabling may surface latent warnings in dpa_app that
-  need cleaning first; do it as its own validated change, not a drive-by. Open.
-
 - [ ] **A47.** `show_fm_risc_load` (lnxwrp_sysfs_fm.c) calls `msleep(1000)` with
   hard IRQs disabled — `__schedule()` re-enables them on the context switch, so
   the intended IRQ-off protection of the FM_CtrlMon start/stop window is
@@ -604,6 +595,10 @@ file's git history.
 - [x] **A40.** fmc's `fmc_exec_htnode` marshalled fmlib's 88-byte struct into the
   120-byte uapi ioc struct, so every ehash node got `table_type=0` (wrong ucode
   AD class) — fixed (_953051c_): struct made layout-identical + ioc buffer memset.
+
+- [x] **A41.** The kas dpa_app build didn't enforce `-Wall -Werror` (its recipe
+  CFLAGS override dropped them), so the shipped binary escaped the warning-free
+  policy — fixed (`dpa-app_1.0.bb` CFLAGS append).
 
 - [x] **A44.** `ipv4/ipv6_reassly_offset` in `FM_PCD_CcRootBuild` were declared
   uninitialized yet written into every non-ETHERNET table's AD (stack residue

@@ -12,7 +12,7 @@ DEPENDS = "fmlib fmc libxml2 libxcrypt"
 # The Yocto fmlib recipe installs include/fmd; fmc installs libfmc.a + headers.
 EXTRA_OEMAKE = " \
     CC='${CC}' \
-    CFLAGS='${CFLAGS} \
+    CFLAGS='${CFLAGS} -Wall -Werror \
             -DENDIAN_LITTLE -DLS1043 -DNCSW_LINUX \
             -DSEC_PROFILE_SUPPORT -DVLAN_FILTER \
             -I${ASK_SRCROOT}/cdx \
