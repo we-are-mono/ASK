@@ -82,11 +82,6 @@ stale line refs) are folded into the archive one-liners.
   RtEntry's current MAC/oif/mtu on retry and stash-and-rebuild on mismatch.
   Open (low priority).
 
-- [ ] **A73.** cmm `cmm_print` calls `cli_vabufprint` on the shared libcli
-  handle from any thread; libcli has no internal locking, so concurrent
-  output can interleave or corrupt CLI buffers. Display-only impact. Open
-  (low).
-
 - [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
   local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
   → ____cmmCtRegister`) reaches `__cmm_ct_get_SA`, which on an SPI-mismatch
@@ -708,6 +703,11 @@ file's git history.
 - [x] **A72.** cmm sa_table walk without `sa_lock` from the client-daemon thread
   (`cmmCtChange → … → cmmSAFind` racing `cmmSACreate`'s insert) — fixed
   (_42379cb_): `cmmCtChange` takes `sa_lock` (leaf) around the registration.
+
+- [x] **A73.** cmm `cmm_print` called libcli's `cli_vabufprint` on the shared CLI
+  handle from four threads unlocked, corrupting the buffer — fixed: the existing
+  leaf `logMutex` now spans the whole output block, and is init'd unconditionally
+  at startup (was gated on a logfile being configured). Lock-order test green.
 
 - [x] **A74.** `cmmFeReset` dangling holder refs, missing `sa_lock`, fpp-route
   leaks — fixed (_ae77bad_): reset detaches SA/tunnel holders before the drains,

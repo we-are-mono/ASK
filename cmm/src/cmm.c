@@ -95,6 +95,20 @@ void cmm_print_func(int level, const char *format, ...)
 
 	va_start(args, format);
 
+	/*
+	 * Serialize all of cmm_print's output under logMutex. The console/CLI
+	 * path calls cli_vabufprint() on the shared libcli buffer
+	 * (globalConf.cli.handle), which has no internal locking; without this
+	 * lock the ct/daemon/cli threads can interleave or corrupt that buffer
+	 * (e.g. a background debug message landing in the middle of a "show"
+	 * command's output). logMutex is a leaf lock -- it is only ever taken
+	 * here and nothing is acquired under it, and neither cli_vabufprint()
+	 * nor its flush callback (cliCallback) take any cmm lock -- so holding
+	 * it across the output cannot deadlock against the itf/ct/rt/neigh/
+	 * sa_lock chain.
+	 */
+	pthread_mutex_lock(&globalConf.logMutex);
+
 	if (level & DEBUG_CRIT)
 	{
 		if (globalConf.cli.handle)
@@ -114,7 +128,6 @@ void cmm_print_func(int level, const char *format, ...)
 
 	if (globalConf.logFile && (level & globalConf.log_level))
 	{
-		pthread_mutex_lock(&globalConf.logMutex);
 		if (!(level & DEBUG_NOTIMESTAMP))
 		{
 			time_t now;
@@ -128,8 +141,9 @@ void cmm_print_func(int level, const char *format, ...)
 		}
 
 		vfprintf(globalConf.logFile, format, args);
-		pthread_mutex_unlock(&globalConf.logMutex);
 	}
+
+	pthread_mutex_unlock(&globalConf.logMutex);
 
 	va_end(args);
 }
@@ -316,6 +330,11 @@ int main (int argc, char ** argv)
 	globalConf.asymff_enable = 0;
 	globalConf.logFile = NULL;
 	globalConf.log_level = 0;
+	/* logMutex serializes all cmm_print output (shared libcli buffer and
+	 * logfile) across the ct/daemon/cli threads. Initialize it here,
+	 * unconditionally and before any cmm_print() or thread is created: the
+	 * CLI-output path is taken even when no logfile is configured. */
+	pthread_mutex_init(&globalConf.logMutex, NULL);
 	globalConf.tun_proto = IPPROTO_IPIP; /* Current default handling of TUN interface is an 4o6 tunnel*/
 	globalConf.tun_family = AF_INET6;
 	globalConf.enable_sam_itfs = 0; /* by default , this option will be disabled */

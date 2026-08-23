@@ -874,8 +874,7 @@ static int section_logging_option_hdlr(void *data, int argc, char **argv)
 
 		globalConf.log_level |= DEBUG_STDERR;
 
-		pthread_mutex_init(&globalConf.logMutex, NULL);
-
+		/* logMutex is initialized unconditionally at startup in main(). */
 		setlinebuf(globalConf.logFile);
 	}
 	else if (!strcasecmp(option, "command"))
