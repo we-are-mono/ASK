@@ -83,17 +83,38 @@ static const enet_mode_t _1000[] = {
 	[PHY_INTERFACE_MODE_RGMII_ID]	= e_ENET_MODE_RGMII_1000,
 	[PHY_INTERFACE_MODE_RGMII_RXID]	= e_ENET_MODE_RGMII_1000,
 	[PHY_INTERFACE_MODE_RGMII_TXID]	= e_ENET_MODE_RGMII_1000,
-	[PHY_INTERFACE_MODE_RTBI]	= e_ENET_MODE_RTBI_1000
+	[PHY_INTERFACE_MODE_RTBI]	= e_ENET_MODE_RTBI_1000,
+	[PHY_INTERFACE_MODE_1000BASEX]	= e_ENET_MODE_SGMII_BASEX_1000
 };
+
+/* The tables are indexed by mainline's phy_interface_t, which has outgrown
+ * them; a mode they do not list is not one this driver can set up. */
+static enet_mode_t mode_lookup(const enet_mode_t *table, size_t size,
+			       phy_interface_t phy_if)
+{
+	return phy_if < size ? table[phy_if] : e_ENET_MODE_INVALID;
+}
 
 static enet_mode_t __cold __attribute__((nonnull))
 macdev2enetinterface(const struct mac_device *mac_dev)
 {
+	enet_mode_t mode;
+
 	switch (mac_dev->max_speed) {
 	case SPEED_100:
-		return _100[mac_dev->phy_if];
+		return mode_lookup(_100, ARRAY_SIZE(_100), mac_dev->phy_if);
 	case SPEED_1000:
-		return _1000[mac_dev->phy_if];
+		mode = mode_lookup(_1000, ARRAY_SIZE(_1000), mac_dev->phy_if);
+		/* A 10G MAC at 1G keeps speed 10000 in its mode, as memac
+		 * expects ("speed=10000 is provided for SGMII ports"): the FMan
+		 * files its interrupts and frame limits by that speed, and as
+		 * a 1G MAC it would take over MAC1's or MAC2's. Only the speed
+		 * changes: ENET_INTERFACE_FROM_MODE() would drop the
+		 * ENET_IF_SGMII_BASEX flag that selects 1000BASE-X. */
+		if (mac_dev->mac_10g && mode != e_ENET_MODE_INVALID)
+			mode = (enet_mode_t)((mode & ~ENET_SPEED_FROM_MODE(mode)) |
+					     e_ENET_SPEED_10000);
+		return mode;
 	case SPEED_2500:
 		return e_ENET_MODE_SGMII_2500;
 	case SPEED_10000:
@@ -132,6 +153,12 @@ static int __cold memac_init(struct mac_device *mac_dev)
 	param.baseAddr =  (typeof(param.baseAddr))(uintptr_t)devm_ioremap(
 		mac_dev->dev, mac_dev->res->start, 0x2000);
 	param.enetMode	= macdev2enetinterface(mac_dev);
+	if (unlikely(param.enetMode == e_ENET_MODE_INVALID)) {
+		dev_err(mac_dev->dev, "unsupported interface mode %s\n",
+			phy_modes(mac_dev->phy_if));
+		_errno = -EINVAL;
+		goto _return;
+	}
 	memcpy(&param.addr, mac_dev->addr, sizeof(mac_dev->addr));
 	param.macId		= mac_dev->cell_index;
 	param.h_Fm		= (handle_t)mac_dev->fm;
@@ -148,8 +175,8 @@ static int __cold memac_init(struct mac_device *mac_dev)
 	}
 
 	fm_mac_set_handle(mac_dev->fm_dev, priv->fm_mac,
-		(macdev2enetinterface(mac_dev) != e_ENET_MODE_XGMII_10000) ?
-			param.macId : param.macId + FM_MAX_NUM_OF_1G_MACS);
+		mac_dev->mac_10g ?
+			param.macId + FM_MAX_NUM_OF_1G_MACS : param.macId);
 
 	/* The FMan-wide maximum is only the starting point: the net device
 	 * narrows it to its MTU once registered (see dpa_set_mac_max_frame()).

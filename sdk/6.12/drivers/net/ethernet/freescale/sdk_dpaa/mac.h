@@ -43,6 +43,9 @@ struct mac_device {
 	struct device		*dev;
 	void			*priv;
 	uint8_t			 cell_index;
+	/* One of the MACs that can run at 10G (MAC9, MAC10), whatever its link
+	 * mode: its cell_index then counts within the 10G MACs. */
+	bool			 mac_10g;
 	struct resource		*res;
 	void __iomem		*vaddr;
 	uint8_t			 addr[ETH_ALEN];
