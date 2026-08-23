@@ -1,4 +1,4 @@
-From 6ed51dced7f564df8a56439817624a13d5c1f98b Mon Sep 17 00:00:00 2001
+From cf4735b7ecac7c1491185c40df8d5a86bf001d78 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -43,7 +43,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   31 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   36 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  900 +++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  920 +++++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
@@ -113,7 +113,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   24 +-
- 76 files changed, 6974 insertions(+), 2295 deletions(-)
+ 76 files changed, 6994 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -595,7 +595,7 @@ index f46c243ff1b8..46816dcda3cb 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..f1f3b153c882 100644
+index 4164644d3268..631570b8b398 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -53,6 +53,73 @@
@@ -899,7 +899,7 @@ index 4164644d3268..f1f3b153c882 100644
  					   struct dpa_priv_s *priv)
  {
  	int trans_offset = skb_transport_offset(skb);
-@@ -882,8 +1046,209 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
+@@ -882,8 +1046,229 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
  	put_page(npage);
  	return NULL;
  }
@@ -1001,9 +1001,29 @@ index 4164644d3268..f1f3b153c882 100644
 +	/* The below condition covers nr_frags + 1(This is to store skb address in opaque variable at the end.)*/
 +	if (nr_frags > (DPA_SGT_MAX_ENTRIES))
 +	{
-+		/* TODO linearize */
-+		pr_err_ratelimited("%s()::%d number of skb frags %d crossed the MAX SGT entries%d", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
-+		return -1;
++		/* Too many fragments for a single SGT: collapse the skb into one
++		 * contiguous buffer and rebuild the count instead of dropping the
++		 * frame. This TX/offload path owns an unshared skb (ndo_start_xmit
++		 * and xfrm_input both hand over skb->users == 1, and this code
++		 * already rewrites skb->data in place), so skb_linearize() may
++		 * realloc its data. Only drop if the collapse itself fails (OOM). */
++		if (skb_linearize(skb))
++		{
++			pr_err_ratelimited("%s()::%d skb frags %d crossed the MAX SGT entries %d and linearize failed", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
++			return -1;
++		}
++		/* recompute after linearize -- a linear skb is a single buffer */
++		nr_frags = 1 + skb_shinfo(skb)->nr_frags;
++		skb_walk_frags(skb, list_skb)
++		{
++			nr_frags += 1 + skb_shinfo(list_skb)->nr_frags;
++		}
++		if (nr_frags > (DPA_SGT_MAX_ENTRIES))
++		{
++			/* defensive: a linearized skb should collapse to a single entry */
++			pr_err_ratelimited("%s()::%d number of skb frags %d crossed the MAX SGT entries%d", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
++			return -1;
++		}
 +	}
 +
 +	fd->format = qm_fd_sg;
@@ -1109,7 +1129,7 @@ index 4164644d3268..f1f3b153c882 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1395,501 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1415,501 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1612,7 +1632,7 @@ index 4164644d3268..f1f3b153c882 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +1901,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +1921,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1623,7 +1643,7 @@ index 4164644d3268..f1f3b153c882 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1212,13 +2073,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2093,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */

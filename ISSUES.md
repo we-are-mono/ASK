@@ -54,16 +54,13 @@ stale line refs) are folded into the archive one-liners.
   fix would mirror A32 (physical-port fallback in `dpa_control_mc.c` /
   `insert_mcast_entry_in_classif_table`). Open (low priority).
 
-- [ ] **A35.** Two live TODO markers in shipped patch 010 (report-only, from the
-  leftover audit). (a) `skb_fraglist_to_sg_fd` (~010:1168) silently drops
-  frames with more than `DPA_SGT_MAX_ENTRIES` fragments ("TODO linearize") and
-  logs an *unratelimited* `pr_err` per drop — a burst of oversized-SGT frames
-  floods the log. Fix: linearize/bounce instead of drop, and ratelimit the
-  print. (b) `skb_scrub_packet` (~010:13680) carries an `sp`-init workaround
-  note for work not done elsewhere. Neither is a correctness bug today; filed
-  so the ratelimit + the linearize path aren't lost. The pr_err ratelimit
-  landed (_051b8c4_); the linearize/bounce path and the scrub note remain.
-  Open.
+- [ ] **A35.** Two TODO markers in shipped patch 010. (a) `skb_fraglist_to_sg_fd`
+  dropped frames with more than `DPA_SGT_MAX_ENTRIES` fragments — the ratelimited
+  print landed (_051b8c4_) and the linearize path landed (patch 010:
+  `skb_linearize` then drop only on OOM; skb ownership audit-confirmed at all
+  three callers). **(a) done.** (b) `skb_scrub_packet` (~010:13680) still carries
+  an `sp`-init workaround note for work not done elsewhere — not a correctness
+  bug, kept so it isn't lost. Open (only (b) remains).
 
 - [ ] **A38.** Wire macvlan hardware offload in cdx (planned). cmm sends
   FPP_CMD_MACVLAN_ENTRY/RESET automatically on macvlan interface events
@@ -172,6 +169,15 @@ stale line refs) are folded into the archive one-liners.
   a KASLR pointer info-leak from the 0600 `/dev/fmX-pcd` node. Real fix is opaque
   handle cookies (type+generation tokens) instead of raw pointers. Open (low;
   root-only).
+
+- [ ] **A86.** cdx sdk_dpaa `dpaa_submit_{outb,inb}_pkt_to_SEC` rewrite
+  `skb->data` in place (outbound L2-shift, inbound PPPoE/proto bytes) before
+  handing the skb to the FMAN offload — if a tap holds a live clone (tcpdump on
+  the offload iface: `skb_cloned()`, `users==1`), the shared data buffer is
+  mutated and the capture shows corrupted bytes. Pre-existing, orthogonal to
+  A35a (whose `skb_linearize` is itself COW-correct); surfaced by the A35a
+  audit. Diagnostic-only (the forwarded packet is fine). Fix: `skb_cow_head`/
+  `skb_ensure_writable` before the in-place header edits. Open (low).
 
 ---
 
