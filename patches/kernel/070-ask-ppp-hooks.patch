@@ -1,4 +1,4 @@
-From e362b2c99dbd8a4ef894cb6d20887de254e0c65f Mon Sep 17 00:00:00 2001
+From 2ec08415e9e516422d2e8d43351ff8f11db8e74e Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:42:47 +0200
 Subject: [PATCH] ask: PPP/PPPoE fast-path hooks
@@ -21,10 +21,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  2 files changed, 45 insertions(+)
 
 diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
-index afc1566488b3..fd54899c1a6b 100644
+index 5d6d69632c84..cf1ebc51781e 100644
 --- a/drivers/net/ppp/ppp_generic.c
 +++ b/drivers/net/ppp/ppp_generic.c
-@@ -3482,6 +3482,9 @@ ppp_connect_channel(struct channel *pch, int unit)
+@@ -3498,6 +3498,9 @@ ppp_connect_channel(struct channel *pch, int unit)
  	struct ppp_net *pn;
  	int ret = -ENXIO;
  	int hdrlen;
@@ -34,7 +34,7 @@ index afc1566488b3..fd54899c1a6b 100644
  
  	pn = ppp_pernet(pch->chan_net);
  
-@@ -3519,8 +3522,27 @@ ppp_connect_channel(struct channel *pch, int unit)
+@@ -3539,8 +3542,27 @@ ppp_connect_channel(struct channel *pch, int unit)
  
   outl:
  	write_unlock_bh(&pch->upl);
@@ -63,10 +63,10 @@ index afc1566488b3..fd54899c1a6b 100644
  }
  
 diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
-index 2ea4f4890d23..454468f3a8d6 100644
+index 8ff2024dde60..ded3afb250b0 100644
 --- a/drivers/net/ppp/pppoe.c
 +++ b/drivers/net/ppp/pppoe.c
-@@ -948,6 +948,14 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
+@@ -956,6 +956,14 @@ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb)
  
  	skb->protocol = cpu_to_be16(ETH_P_PPP_SES);
  	skb->dev = dev;
@@ -81,7 +81,7 @@ index 2ea4f4890d23..454468f3a8d6 100644
  
  	dev_hard_header(skb, dev, ETH_P_PPP_SES,
  			po->pppoe_pa.remote, NULL, data_len);
-@@ -1030,17 +1038,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
+@@ -1038,17 +1046,32 @@ static int pppoe_seq_show(struct seq_file *seq, void *v)
  {
  	struct pppox_sock *po;
  	char *dev_name;

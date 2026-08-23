@@ -1,4 +1,4 @@
-From dac7223835074c655c218d2933c31d03a4854b0e Mon Sep 17 00:00:00 2001
+From ece8fef3dc79b652576969fc37905ec807e5bcb1 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 23 Apr 2026 17:55:40 +0200
 Subject: [PATCH] ask: bridge FDB/brevent notifier wiring
@@ -24,12 +24,12 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  8 files changed, 171 insertions(+), 2 deletions(-)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
-index 3ff96ae31bf6..c3097859102e 100644
+index c5fe3b2a53e8..13f4363917da 100644
 --- a/include/linux/if_bridge.h
 +++ b/include/linux/if_bridge.h
-@@ -71,6 +71,23 @@ void brioctl_set(int (*hook)(struct net *net, struct net_bridge *br,
- int br_ioctl_call(struct net *net, struct net_bridge *br, unsigned int cmd,
- 		  struct ifreq *ifr, void __user *uarg);
+@@ -69,6 +69,23 @@ void brioctl_set(int (*hook)(struct net *net, unsigned int cmd,
+ 			     void __user *uarg));
+ int br_ioctl_call(struct net *net, unsigned int cmd, void __user *uarg);
  
 +#if defined(CONFIG_CPE_FAST_PATH)
 +struct brevent_fdb_update{
@@ -52,10 +52,10 @@ index 3ff96ae31bf6..c3097859102e 100644
  int br_multicast_list_adjacent(struct net_device *dev,
  			       struct list_head *br_ip_list);
 diff --git a/net/bridge/br.c b/net/bridge/br.c
-index ed08717541fe..346524427218 100644
+index 35e9842f4203..440cf3cf957d 100644
 --- a/net/bridge/br.c
 +++ b/net/bridge/br.c
-@@ -474,6 +474,60 @@ static void __exit br_deinit(void)
+@@ -479,6 +479,60 @@ static void __exit br_deinit(void)
  	br_fdb_fini();
  }
  
@@ -117,7 +117,7 @@ index ed08717541fe..346524427218 100644
  module_exit(br_deinit)
  MODULE_LICENSE("GPL");
 diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
-index 642b8ccaae8e..5241742af696 100644
+index 39cc761012d4..5d3d90ef1a5f 100644
 --- a/net/bridge/br_fdb.c
 +++ b/net/bridge/br_fdb.c
 @@ -14,6 +14,10 @@
@@ -143,7 +143,7 @@ index 642b8ccaae8e..5241742af696 100644
  int __init br_fdb_init(void)
  {
  	br_fdb_cache = KMEM_CACHE(net_bridge_fdb_entry, SLAB_HWCACHE_ALIGN);
-@@ -567,6 +576,17 @@ void br_fdb_cleanup(struct work_struct *work)
+@@ -571,6 +580,17 @@ void br_fdb_cleanup(struct work_struct *work)
  			continue;
  		}
  
@@ -161,7 +161,7 @@ index 642b8ccaae8e..5241742af696 100644
  		if (time_after(this_timer, now)) {
  			work_delay = min(work_delay, this_timer - now);
  		} else {
-@@ -915,6 +935,14 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+@@ -925,6 +945,14 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
  			/* fastpath: update of existing entry */
  			if (unlikely(source != READ_ONCE(fdb->dst) &&
  				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
@@ -176,7 +176,7 @@ index 642b8ccaae8e..5241742af696 100644
  				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
  				WRITE_ONCE(fdb->dst, source);
  				fdb_modified = true;
-@@ -1554,3 +1582,21 @@ void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
+@@ -1566,3 +1594,21 @@ void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
  	spin_unlock_bh(&p->br->hash_lock);
  }
  EXPORT_SYMBOL_GPL(br_fdb_clear_offload);
@@ -199,7 +199,7 @@ index 642b8ccaae8e..5241742af696 100644
 +EXPORT_SYMBOL(br_fdb_deregister_can_expire_cb);
 +#endif
 diff --git a/net/bridge/br_forward.c b/net/bridge/br_forward.c
-index e19b583ff2c6..52de8201979d 100644
+index e9f09cdb9848..53eafbc8bccd 100644
 --- a/net/bridge/br_forward.c
 +++ b/net/bridge/br_forward.c
 @@ -33,7 +33,11 @@ static inline int should_deliver(const struct net_bridge_port *p,
@@ -216,7 +216,7 @@ index e19b583ff2c6..52de8201979d 100644
  
  	br_drop_fake_rtable(skb);
 diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
-index ceaa5a89b947..9d9e3b229b61 100644
+index e22088b07e70..1ba67e7bbb33 100644
 --- a/net/bridge/br_input.c
 +++ b/net/bridge/br_input.c
 @@ -65,6 +65,10 @@ static int br_pass_frame_up(struct sk_buff *skb, bool promisc)
@@ -243,8 +243,8 @@ index ceaa5a89b947..9d9e3b229b61 100644
  	     skb->protocol == htons(ETH_P_RARP))) {
 @@ -209,6 +217,10 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
  
- 		if (now != dst->used)
- 			dst->used = now;
+ 		if (now != READ_ONCE(dst->used))
+ 			WRITE_ONCE(dst->used, now);
 +#if defined(CONFIG_CPE_FAST_PATH)
 +			/* Used by ABM module */
 +			skb->abm_ff = 1;
@@ -253,10 +253,10 @@ index ceaa5a89b947..9d9e3b229b61 100644
  	} else {
  		if (!mcast_hit)
 diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
-index 5026a256bf92..2b66abe5e104 100644
+index 3854ea1a5154..eaa949a77904 100644
 --- a/net/bridge/br_private.h
 +++ b/net/bridge/br_private.h
-@@ -618,6 +618,11 @@ struct br_input_skb_cb {
+@@ -619,6 +619,11 @@ struct br_input_skb_cb {
  #endif
  
  	u32 backup_nhid;
@@ -268,7 +268,7 @@ index 5026a256bf92..2b66abe5e104 100644
  };
  
  #define BR_INPUT_SKB_CB(__skb)	((struct br_input_skb_cb *)(__skb)->cb)
-@@ -854,6 +859,11 @@ int br_fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
+@@ -855,6 +860,11 @@ int br_fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
  void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
  		   const unsigned char *addr, u16 vid, unsigned long flags);
  
@@ -296,10 +296,10 @@ index 75204d36d7f9..0ee39d723422 100644
  
  static int br_stp_call_user(struct net_bridge *br, char *arg)
 diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
-index dae576a6d026..3ab461d7f582 100644
+index 1aa383035294..88cd613ccf70 100644
 --- a/net/bridge/br_vlan.c
 +++ b/net/bridge/br_vlan.c
-@@ -520,9 +520,21 @@ struct sk_buff *br_handle_vlan(struct net_bridge *br,
+@@ -517,9 +517,21 @@ struct sk_buff *br_handle_vlan(struct net_bridge *br,
  	 * hardware on each egress port as appropriate. So only strip the VLAN
  	 * header if forwarding offload is not being used.
  	 */
@@ -322,7 +322,7 @@ index dae576a6d026..3ab461d7f582 100644
  
  	if (p && (p->flags & BR_VLAN_TUNNEL) &&
  	    br_handle_egress_vlan_tunnel(skb, v)) {
-@@ -603,6 +615,11 @@ static bool __allowed_ingress(const struct net_bridge *br,
+@@ -600,6 +612,11 @@ static bool __allowed_ingress(const struct net_bridge *br,
  			 */
  			skb->vlan_tci |= pvid;
  
@@ -334,7 +334,7 @@ index dae576a6d026..3ab461d7f582 100644
  		/* if snooping and stats are disabled we can avoid the lookup */
  		if (!br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED) &&
  		    !br_opt_get(br, BROPT_VLAN_STATS_ENABLED)) {
-@@ -632,6 +649,11 @@ static bool __allowed_ingress(const struct net_bridge *br,
+@@ -629,6 +646,11 @@ static bool __allowed_ingress(const struct net_bridge *br,
  		u64_stats_update_end(&stats->syncp);
  	}
  

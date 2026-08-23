@@ -1,4 +1,4 @@
-From 2278c983af4ec02cd9645ddae616d36224278bdd Mon Sep 17 00:00:00 2001
+From cee994bcbf122913dc661963528ca4088927ea24 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] ask: IPv4/IPv6 forwarding-path hook points
@@ -17,17 +17,17 @@ the ip6_tunnel site was dropped during the forward-port when the
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- net/ipv4/ip_output.c          | 38 ++++++++++++++++++++++++++++++++++-
+ net/ipv4/ip_output.c          | 41 ++++++++++++++++++++++++++++++++++-
  net/ipv4/ip_tunnel.c          |  3 +++
- net/ipv6/ip6_output.c         | 31 ++++++++++++++++++++++++++--
+ net/ipv6/ip6_output.c         | 31 ++++++++++++++++++++++++--
  net/ipv6/ip6_tunnel.c         |  4 ++++
- net/ipv6/netfilter/ip6t_NPT.c | 29 ++++++++++++++++++++++++++
- net/ipv6/output_core.c        | 19 ++++++++++++++++++
+ net/ipv6/netfilter/ip6t_NPT.c | 29 +++++++++++++++++++++++++
+ net/ipv6/output_core.c        | 19 ++++++++++++++++
  net/ipv6/sit.c                |  3 +++
- 7 files changed, 124 insertions(+), 3 deletions(-)
+ 7 files changed, 127 insertions(+), 3 deletions(-)
 
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
-index 49811c9281d4..87b2653bb951 100644
+index 41031c5c4303..bbe8475c5a82 100644
 --- a/net/ipv4/ip_output.c
 +++ b/net/ipv4/ip_output.c
 @@ -102,6 +102,17 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -66,7 +66,7 @@ index 49811c9281d4..87b2653bb951 100644
 +	else
 +#endif /* endif for CONFIG_INET_IPSEC_OFFLOAD */
  	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
- 		       net, sk, skb, NULL, skb_dst(skb)->dev,
+ 		       net, sk, skb, NULL, skb_dst_dev(skb),
  		       dst_output);
 @@ -308,7 +330,11 @@ static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *
  	if (skb_is_gso(skb))
@@ -81,7 +81,7 @@ index 49811c9281d4..87b2653bb951 100644
  		return ip_fragment(net, sk, skb, mtu, ip_finish_output2);
  
  	return ip_finish_output2(net, sk, skb);
-@@ -431,6 +457,13 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+@@ -434,6 +460,16 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
  	skb->dev = dev;
  	skb->protocol = htons(ETH_P_IP);
  
@@ -89,13 +89,16 @@ index 49811c9281d4..87b2653bb951 100644
 +	/* Bypass invoking post routing hooks since the tunnel header and ESP
 +	 * processing is not done in slow path for IPSec offloaded cases
 +	 */
-+	if (skb->ipsec_offload)
-+		return ip_finish_output(net, sk, skb);
++	if (skb->ipsec_offload) {
++		ret_val = ip_finish_output(net, sk, skb);
++		rcu_read_unlock();
++		return ret_val;
++	}
 +#endif
- 	return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
- 			    net, sk, skb, indev, dev,
- 			    ip_finish_output,
-@@ -561,6 +594,9 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
+ 	ret_val = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
+ 				net, sk, skb, indev, dev,
+ 				ip_finish_output,
+@@ -566,6 +602,9 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
  	skb_dst_copy(to, from);
  	to->dev = from->dev;
  	to->mark = from->mark;
@@ -106,7 +109,7 @@ index 49811c9281d4..87b2653bb951 100644
  	skb_copy_hash(to, from);
  
 diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
-index 09b73acf037a..1083fe44416d 100644
+index 7c77d06372d1..708663706279 100644
 --- a/net/ipv4/ip_tunnel.c
 +++ b/net/ipv4/ip_tunnel.c
 @@ -438,6 +438,9 @@ int ip_tunnel_rcv(struct ip_tunnel *tunnel, struct sk_buff *skb,
@@ -120,7 +123,7 @@ index 09b73acf037a..1083fe44416d 100644
  	}
  
 diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index f0e5431c2d46..87fe154cd7ea 100644
+index 5d17982cb994..dd2b5b549e26 100644
 --- a/net/ipv6/ip6_output.c
 +++ b/net/ipv6/ip6_output.c
 @@ -83,6 +83,13 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
@@ -179,7 +182,7 @@ index f0e5431c2d46..87fe154cd7ea 100644
  	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
  			    net, sk, skb, indev, dev,
  			    ip6_finish_output,
-@@ -686,6 +710,9 @@ static void ip6_copy_metadata(struct sk_buff *to, struct sk_buff *from)
+@@ -694,6 +718,9 @@ static void ip6_copy_metadata(struct sk_buff *to, struct sk_buff *from)
  	skb_dst_set(to, dst_clone(skb_dst(from)));
  	to->dev = from->dev;
  	to->mark = from->mark;
@@ -190,10 +193,10 @@ index f0e5431c2d46..87fe154cd7ea 100644
  	skb_copy_hash(to, from);
  
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index 5350c9bb2319..81b7ab84e515 100644
+index b788a06bd3a5..09964b40f0d2 100644
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
-@@ -832,6 +832,9 @@ static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
+@@ -837,6 +837,9 @@ static int __ip6_tnl_rcv(struct ip6_tnl *tunnel, struct sk_buff *skb,
  		skb->protocol = eth_type_trans(skb, tunnel->dev);
  		skb_postpull_rcsum(skb, eth_hdr(skb), ETH_HLEN);
  	} else {
@@ -203,7 +206,7 @@ index 5350c9bb2319..81b7ab84e515 100644
  		skb->dev = tunnel->dev;
  		skb_reset_mac_header(skb);
  	}
-@@ -1196,6 +1199,7 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
+@@ -1201,6 +1204,7 @@ int ip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev, __u8 dsfield,
  		       IPV6_MIN_MTU : IPV4_MIN_MTU);
  
  	skb_dst_update_pmtu_no_confirm(skb, mtu);
@@ -266,7 +269,7 @@ index 787c74aa85e3..f523f471722a 100644
  }
  
 diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
-index 806d4b5dd1e6..f27467e8e51d 100644
+index 90a178dd24aa..34e96333bd44 100644
 --- a/net/ipv6/output_core.c
 +++ b/net/ipv6/output_core.c
 @@ -128,7 +128,18 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -304,7 +307,7 @@ index 806d4b5dd1e6..f27467e8e51d 100644
  		       net, sk, skb, NULL, skb_dst(skb)->dev,
  		       dst_output);
 diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
-index 3c15a0ae228e..338f3d6674c3 100644
+index 78e685011382..710d66374c57 100644
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
 @@ -694,6 +694,9 @@ static int ipip6_rcv(struct sk_buff *skb)

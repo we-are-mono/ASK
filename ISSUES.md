@@ -138,6 +138,15 @@ stale line refs) are folded into the archive one-liners.
   (untreated) — benign on LS1046A coherent DMA, would matter under an IOMMU.
   Apply the A89 unwind for consistency. Surfaced by the A89 audit. Open (low).
 
+- [ ] **A92.** `xfrm_output_one()` offload error path leaks state refs + skb.
+  In `net/xfrm/xfrm_output.c` (patch 040) the offload block's
+  `if (xfrm_nr == XFRM_MAX_DEPTH) { err = -ENOBUFS; goto out; }` jumps to `out:`,
+  which skips `error_nolock:` — the up-to-6 `xfrm_state` refs already collected in
+  `xfrm[]` and the skb are never released. Should be `goto error_nolock`.
+  Byte-identical to the NXP original (not a regen regression); reachable only with
+  ≥6 stacked offloaded transforms, so latent. Surfaced by the mainline-regen audit.
+  Fix + a stacked-transform test. Open (low).
+
 ---
 
 <a name="archive"></a>
@@ -759,6 +768,10 @@ file's git history.
   skb `opaque` + unreleased DMA maps — fixed (patch 010): unmap + clear opaque
   before recycle. Defensive hygiene (audit: opaque was dangling-but-shadowed,
   unmaps no-op on this coherent-DMA SoC); sibling paths → A90.
+
+- [x] **A91.** `ip_output()` ipsec-offload early-return leaked `rcu_read_lock` on
+  mainline 6.12.103 (rcu-wraps `ip_output`, unlike NXP 6.12.49) — fixed (patch 030):
+  unlock before the offload return. Surfaced by the mainline-regen audit.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning
