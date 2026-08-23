@@ -133,13 +133,10 @@ stale line refs) are folded into the archive one-liners.
   handle cookies (type+generation tokens) instead of raw pointers. Open (low;
   root-only).
 
-- [ ] **A89.** cdx sdk_dpaa: on a `qman_enqueue` failure after
-  `skb_fraglist_to_sg_fd` built the SGT, `dpaa_submit_inb_pkt_to_SEC` releases
-  the SGT buffer and returns the skb to Linux without `dma_unmap` — the
-  DMA_TO_DEVICE mapping leaks and the skb goes back still mapped (the device may
-  still touch it), and the released pool buffer keeps a stale skb `opaque`.
-  Error-path (enqueue exhaustion under congestion). Fix: `dma_unmap` + clear the
-  opaque before giveback. Surfaced by the A88 work. Open.
+- [ ] **A90.** cdx sdk_dpaa `dpaa_submit_outb_pkt_to_SEC` and `dpa_ipsec_ern_cb`
+  share A89's SGT-recycle-with-stale-`opaque` / unreleased-DMA-map pattern
+  (untreated) — benign on LS1046A coherent DMA, would matter under an IOMMU.
+  Apply the A89 unwind for consistency. Surfaced by the A89 audit. Open (low).
 
 ---
 
@@ -757,6 +754,11 @@ file's git history.
   `skb->data`/inflated `len` on its post-shift give-to-linux failure returns —
   fixed (patch 010): a shared `err_giveback` path restores data/len (delta form,
   realloc-safe) on all three post-shift returns. Error-path only.
+
+- [x] **A89.** cdx sdk_dpaa enqueue-failure recycled the SGT buffer with a stale
+  skb `opaque` + unreleased DMA maps — fixed (patch 010): unmap + clear opaque
+  before recycle. Defensive hygiene (audit: opaque was dangling-but-shadowed,
+  unmaps no-op on this coherent-DMA SoC); sibling paths → A90.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning

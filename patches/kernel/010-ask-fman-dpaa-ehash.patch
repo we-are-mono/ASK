@@ -1,4 +1,4 @@
-From 6f09e274c12b33bb1a246b45106fbc01b1fa1d5a Mon Sep 17 00:00:00 2001
+From ca4824c25fa2ccdf7aa5484c7165ce88b5302604 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -43,7 +43,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   31 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   36 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  964 ++++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  991 ++++++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
@@ -113,7 +113,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 76 files changed, 7052 insertions(+), 2295 deletions(-)
+ 76 files changed, 7079 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -595,7 +595,7 @@ index f46c243ff1b8..46816dcda3cb 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..fde532bbd005 100644
+index 4164644d3268..73dfba23c3c8 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -53,6 +53,73 @@
@@ -1129,7 +1129,7 @@ index 4164644d3268..fde532bbd005 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1415,545 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1415,572 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1534,11 +1534,38 @@ index 4164644d3268..fde532bbd005 100644
 +		if (unlikely(err < 0)) {
 +			struct bm_buffer bmb;
 +			dma_addr_t addr;
++			struct qm_sg_entry *sgt;
++			struct sk_buff *list_skb;
++			int sgt_entries, sgt_size;
 +
 +			printk("%s(%d) qman_enqueue failed\n",
 +					__func__,__LINE__);
-+			/* put the buffer back to sg pool */
++			/* The frame was never handed to hardware, so the driver
++			 * still owns the fully-built SGT FD and must unwind
++			 * everything skb_fraglist_to_sg_fd() mapped before the
++			 * buffer is recycled and the skb is returned to Linux --
++			 * otherwise the DMA_TO_DEVICE mappings leak and the skb
++			 * goes back to the stack still mapped for the device.
++			 * Recompute the entry count / SGT size by re-walking the
++			 * (possibly linearized) skb exactly as the builder did so
++			 * they match the mappings actually created. Unmap the SGT
++			 * buffer itself, then each per-fragment mapping, and clear
++			 * the skb pointer stashed in the trailing opaque slot so
++			 * the recycled pool buffer carries no stale reference.
++			 * Unlike skb_fraglist_to_sg_fd()'s own mid-build error
++			 * paths (which fail before the SGT buffer is mapped and so
++			 * only undo fragment maps), a fully-built SGT additionally
++			 * needs the sg_addr unmap done here. */
 +			addr = qm_fd_addr(&fd);
++			sgt = (struct qm_sg_entry *)phys_to_virt(addr);
++			sgt_entries = 1 + skb_shinfo(skb)->nr_frags;
++			skb_walk_frags(skb, list_skb)
++				sgt_entries += 1 + skb_shinfo(list_skb)->nr_frags;
++			sgt_size = sizeof(struct qm_sg_entry) * (sgt_entries + 1);
++			dma_unmap_single(dev, addr, sgt_size, DMA_TO_DEVICE);
++			dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_entries);
++			sgt[sgt_entries].opaque = 0;
++			/* put the buffer back to sg pool */
 +			bm_buffer_set64(&bmb, addr);
 +			while (bman_release(sg_bpool_g->pool, &bmb, 1, 0))
 +				cpu_relax();
@@ -1676,7 +1703,7 @@ index 4164644d3268..fde532bbd005 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +1965,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +1992,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1687,7 +1714,7 @@ index 4164644d3268..fde532bbd005 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1212,13 +2137,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2164,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */
