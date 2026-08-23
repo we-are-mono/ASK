@@ -79,17 +79,6 @@ stale line refs) are folded into the archive one-liners.
   add a transport-mode case to the rig suite and validate both the pre-existing
   path and the AOFL-adjusted lengths. Open.
 
-- [ ] **A47.** `show_fm_risc_load` (lnxwrp_sysfs_fm.c) calls `msleep(1000)` with
-  hard IRQs disabled — `__schedule()` re-enables them on the context switch, so
-  the intended IRQ-off protection of the FM_CtrlMon start/stop window is
-  illusory, and a world-readable sysfs read blocks for a full second. More
-  broadly the sysfs dump handlers hold IRQs off across hundreds of MMIO
-  accesses (plus a register write per iteration in `fm_dump_ccqueue`) —
-  `local_irq_save` used as a pseudo-lock with zero cross-CPU effect. Latency +
-  design smell, not a leak (patch 101 fixed those). Candidate fix: replace the
-  IRQ fiction with a real lock (or drop the save entirely where the hardware
-  window doesn't need it) on the next sysfs-wrapper touch. Open.
-
 - [ ] **A66.** A54 freshness residual (documented by the fix's audit): after a
   rollback, the next route event re-attaches the OLD fpp route id (holder's
   `fpp_route` restored → `__cmmFPPRouteRegister` no-ops), cdx accepts the
@@ -609,6 +598,12 @@ file's git history.
 - [x] **A46.** `FM_PCD_HashTableAddKey` type confusion on the
   `FM_PCD_IOC_HASH_TABLE_ADD_KEY` path — fixed (_e690063_): ioctl case deleted,
   function removed, entry param tightened so the confusion is a compile error.
+
+- [x] **A47.** FMan sysfs handlers used `local_irq_save` as an illusory
+  pseudo-lock; `show_fm_risc_load` even slept 1s under it — fixed (_this
+  commit_): removed the illegal sleep-with-IRQs-off and dropped the guard from
+  15 read-only/inner-locked handlers. 3 debug-only register-select handlers keep
+  a documented weak guard (a real FM-level lock is deferred, near-zero payoff).
 
 - [x] **A52.** `/dev/fmX` FM_PCD modify/query ioctls dereferenced a user-supplied
   `param->id` as a kernel `t_Handle` (NXP-labelled "Security Hole") — fixed
