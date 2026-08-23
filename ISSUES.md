@@ -54,14 +54,6 @@ stale line refs) are folded into the archive one-liners.
   fix would mirror A32 (physical-port fallback in `dpa_control_mc.c` /
   `insert_mcast_entry_in_classif_table`). Open (low priority).
 
-- [ ] **A35.** Two TODO markers in shipped patch 010. (a) `skb_fraglist_to_sg_fd`
-  dropped frames with more than `DPA_SGT_MAX_ENTRIES` fragments — the ratelimited
-  print landed (_051b8c4_) and the linearize path landed (patch 010:
-  `skb_linearize` then drop only on OOM; skb ownership audit-confirmed at all
-  three callers). **(a) done.** (b) `skb_scrub_packet` (~010:13680) still carries
-  an `sp`-init workaround note for work not done elsewhere — not a correctness
-  bug, kept so it isn't lost. Open (only (b) remains).
-
 - [ ] **A38.** Wire macvlan hardware offload in cdx (planned). cmm sends
   FPP_CMD_MACVLAN_ENTRY/RESET automatically on macvlan interface events
   (`itf.c` cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx has no
@@ -591,6 +583,11 @@ file's git history.
 - [x] **A34.** cmm `VLAN_FILTER` build asymmetry (`make cmm` omitted it, the
   recipe defined it) — fixed (_25f85e8_): `cmm/Makefile` carries the single
   authoritative define list; also fixed a short netlink attribute space.
+
+- [x] **A35.** Two patch-010 TODOs — fixed: (a) `skb_fraglist_to_sg_fd`
+  linearizes oversized-fragment frames instead of dropping (_8ffdd9c_); (b) the
+  `skb_scrub_packet` ipsec_offload secpath exemption proven correct, TODO
+  replaced with a rationale (_639ca25_).
 
 - [x] **A36.** Five audit smells confirmed + **fixed** (_051b8c4_): ehash lock leaks,
   sysfs IRQ-off returns (new patch 101), RICP clobber, libnfnetlink UAF, fmc dedup.

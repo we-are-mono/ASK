@@ -1,4 +1,4 @@
-From cf4735b7ecac7c1491185c40df8d5a86bf001d78 Mon Sep 17 00:00:00 2001
+From 0ba5991665f27aa03437ea595f7e62de3f93a428 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -112,8 +112,8 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/dev.c                                |  101 +-
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
- net/core/skbuff.c                             |   24 +-
- 76 files changed, 6994 insertions(+), 2295 deletions(-)
+ net/core/skbuff.c                             |   38 +-
+ 76 files changed, 7008 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -11681,7 +11681,7 @@ index 28ef506b10b0..6cb079932c23 100644
  
  	if (!valid) {
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index 578513eb738e..1c5f45d1c0dd 100644
+index 578513eb738e..e78754b2ed98 100644
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
 @@ -1552,18 +1552,32 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
@@ -11717,17 +11717,31 @@ index 578513eb738e..1c5f45d1c0dd 100644
  	CHECK_SKB_FIELD(vlan_proto);
  	CHECK_SKB_FIELD(vlan_tci);
  	CHECK_SKB_FIELD(transport_header);
-@@ -6133,7 +6147,15 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+@@ -6133,7 +6147,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
  	skb->skb_iif = 0;
  	skb->ignore_df = 0;
  	skb_dst_drop(skb);
 -	skb_ext_reset(skb);
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+	/* TODO ***
-+	skb->sp is getting initialized to NULL, which is getting used in ethernet driver
-+	for ipsec_offload cases. 
-+	Need to revisit for a proper fix.
-+	*/
++	/*
++	 * ASK IPsec offload: preserve the skb extensions on an offloaded skb
++	 * instead of scrubbing them. xfrm_output_one() sets ->ipsec_offload
++	 * and attaches the secpath (SKB_EXT_SEC_PATH); the DPAA egress driver
++	 * later reads sp->xvec[0] in dpaa_submit_outb_pkt_to_SEC() to find the
++	 * CAAM frame queue for this SA. On a PPPoE/tunnel WAN the packet
++	 * crosses a scrub boundary (e.g. ppp_start_xmit()) between that point
++	 * and the driver read, so a plain skb_ext_reset() here would drop the
++	 * secpath and the offload would silently free the packet.
++	 *
++	 * Skipping the whole reset (rather than surgically preserving just the
++	 * secpath) is safe: in this configuration the only other extension is
++	 * nf_bridge_info, which is read only by br_netfilter hooks that never
++	 * run on the egress-to-CAAM path, pins no counted netdev reference,
++	 * and is freed with the skb. br_netfilter has no IP forward/post-
++	 * routing hook to strip it, so stock already carries it out to any
++	 * non-scrubbing egress device. Every other scrub action below still
++	 * runs for offloaded skbs.
++	 */
 +	if (!skb->ipsec_offload)
 +#endif
 +		skb_ext_reset(skb);
