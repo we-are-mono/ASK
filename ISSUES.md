@@ -133,12 +133,13 @@ stale line refs) are folded into the archive one-liners.
   handle cookies (type+generation tokens) instead of raw pointers. Open (low;
   root-only).
 
-- [ ] **A88.** cdx sdk_dpaa inbound-offload failure paths
-  (`dpaa_submit_inb_pkt_to_SEC`, the `mac_len==0` and PPP branches) shift
-  `skb->data`/`skb->len` before `dpa_add_dummy_eth_hdr`/`skb_fraglist_to_sg_fd`
-  and don't restore them on the `< 0` return, so the packet handed back to Linux
-  can carry shifted data / inflated len. Pre-existing, often benign (`tmp_len`
-  frequently 0). Fix: restore `skb->data`/`len` on the failure return. Open (low).
+- [ ] **A89.** cdx sdk_dpaa: on a `qman_enqueue` failure after
+  `skb_fraglist_to_sg_fd` built the SGT, `dpaa_submit_inb_pkt_to_SEC` releases
+  the SGT buffer and returns the skb to Linux without `dma_unmap` — the
+  DMA_TO_DEVICE mapping leaks and the skb goes back still mapped (the device may
+  still touch it), and the released pool buffer keeps a stale skb `opaque`.
+  Error-path (enqueue exhaustion under congestion). Fix: `dma_unmap` + clear the
+  opaque before giveback. Surfaced by the A88 work. Open.
 
 ---
 
@@ -751,6 +752,11 @@ file's git history.
   wrote a dummy Ethernet header into a possibly-shared head — fixed (patch 010):
   `skb_cow_head` before the in-place write (after the existing realloc, no
   double-realloc; audit-confirmed). Same class as A86.
+
+- [x] **A88.** cdx sdk_dpaa `dpaa_submit_inb_pkt_to_SEC` handed Linux a shifted
+  `skb->data`/inflated `len` on its post-shift give-to-linux failure returns —
+  fixed (patch 010): a shared `err_giveback` path restores data/len (delta form,
+  realloc-safe) on all three post-shift returns. Error-path only.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning
