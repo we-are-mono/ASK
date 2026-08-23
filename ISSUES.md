@@ -146,11 +146,12 @@ stale line refs) are folded into the archive one-liners.
   handle cookies (type+generation tokens) instead of raw pointers. Open (low;
   root-only).
 
-- [ ] **A87.** cdx sdk_dpaa `dpa_add_dummy_eth_hdr` (cellular/`wifi_offload`
-  inbound, `dpaa_eth_sg.c`) writes a dummy Ethernet header in place when headroom
-  suffices — the same clone-corruption class as A86, on the cellular xfrm-inbound
-  path A86's scope didn't cover. Pre-existing, niche (needs a tap on that path).
-  Fix: COW before the in-place write. Open (low).
+- [ ] **A88.** cdx sdk_dpaa inbound-offload failure paths
+  (`dpaa_submit_inb_pkt_to_SEC`, the `mac_len==0` and PPP branches) shift
+  `skb->data`/`skb->len` before `dpa_add_dummy_eth_hdr`/`skb_fraglist_to_sg_fd`
+  and don't restore them on the `< 0` return, so the packet handed back to Linux
+  can carry shifted data / inflated len. Pre-existing, often benign (`tmp_len`
+  frequently 0). Fix: restore `skb->data`/`len` on the failure return. Open (low).
 
 ---
 
@@ -746,8 +747,13 @@ file's git history.
 
 - [x] **A86.** cdx sdk_dpaa `dpaa_submit_{outb,inb}_pkt_to_SEC` rewrote
   `skb->data` in place, corrupting a live tcpdump clone on the offload iface —
-  fixed (_this commit_): `skb_cow_head` before the in-place writes (net-header
+  fixed (_99013a7_): `skb_cow_head` before the in-place writes (net-header
   pointer re-derived after; audit-confirmed COW-safe). Diagnostic-only.
+
+- [x] **A87.** cdx sdk_dpaa `dpa_add_dummy_eth_hdr` (cellular offload inbound)
+  wrote a dummy Ethernet header into a possibly-shared head — fixed (_this
+  commit_): `skb_cow_head` before the in-place write (after the existing realloc,
+  no double-realloc; audit-confirmed). Same class as A86.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning

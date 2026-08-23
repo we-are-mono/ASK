@@ -1,4 +1,4 @@
-From 0b5b4e935d7a8ba595d32a8df2ed5ce84d21d94a Mon Sep 17 00:00:00 2001
+From 10b93c4953f501f4bdc6c1ca3d337c80d75acb10 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -43,7 +43,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   31 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   36 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  939 +++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  952 ++++++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
@@ -113,7 +113,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 76 files changed, 7027 insertions(+), 2295 deletions(-)
+ 76 files changed, 7040 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -595,7 +595,7 @@ index f46c243ff1b8..46816dcda3cb 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..bdd5bb125c66 100644
+index 4164644d3268..449aa867da4c 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -53,6 +53,73 @@
@@ -1129,7 +1129,7 @@ index 4164644d3268..bdd5bb125c66 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1415,520 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1415,533 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1367,6 +1367,19 @@ index 4164644d3268..bdd5bb125c66 100644
 +		skb = new_skb;
 +		*hdroom_realloc = 1;
 +	}
++
++	/* The skb_push()/memset() below writes the dummy Ethernet header in
++	 * place into the head buffer. If that buffer is shared with a clone
++	 * (e.g. a tcpdump tap on the cellular offload interface), COW it first
++	 * so the capture is not corrupted. skb_cow_head() is a cheap
++	 * skb_header_cloned() branch when the skb is not cloned; the realloc
++	 * path above already yields a private head, so this never double-
++	 * reallocs. It may reallocate skb->head, but leaves the skb struct
++	 * pointer (and thus *skb_in) unchanged, so no propagation is needed.
++	 * On failure return -ENOMEM like the realloc path; the caller then
++	 * hands the packet back to Linux. */
++	if (skb_cow_head(skb, 0))
++		return -ENOMEM;
 +
 +	/* Determine IP version from first byte of packet */
 +	ipv = (skb->data[0] >> 4) & 0xf;
@@ -1651,7 +1664,7 @@ index 4164644d3268..bdd5bb125c66 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +1940,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +1953,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1662,7 +1675,7 @@ index 4164644d3268..bdd5bb125c66 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1212,13 +2112,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2125,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */
