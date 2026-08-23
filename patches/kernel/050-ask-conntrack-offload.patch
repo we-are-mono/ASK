@@ -1,4 +1,4 @@
-From f5bcdbab7d6cef22357ae27a4838a615b6871185 Mon Sep 17 00:00:00 2001
+From ea501282d17c13ea6157c3bbd5b0c45107b7980f Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Thu, 23 Apr 2026 17:55:41 +0200
 Subject: [PATCH] ask: conntrack offload notifications
@@ -18,10 +18,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../linux/netfilter/nf_conntrack_common.h     |  11 +-
  .../linux/netfilter/nfnetlink_conntrack.h     |  18 ++
  net/netfilter/nf_conntrack_core.c             |  28 ++-
- net/netfilter/nf_conntrack_netlink.c          | 177 +++++++++++++++++-
+ net/netfilter/nf_conntrack_netlink.c          | 186 +++++++++++++++++-
  net/netfilter/nf_conntrack_proto_tcp.c        |   4 +
  net/netfilter/nf_conntrack_standalone.c       |  13 ++
- 7 files changed, 297 insertions(+), 4 deletions(-)
+ 7 files changed, 306 insertions(+), 4 deletions(-)
 
 diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
 index 8cb70e7485e2..75535c6f57fd 100644
@@ -257,7 +257,7 @@ index f5bde4f13958..caad335d9823 100644
 +EXPORT_SYMBOL_GPL(nf_ct_is_expired);
 +#endif
 diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
-index 18a91c031554..71744223e716 100644
+index 18a91c031554..fb02bdc03870 100644
 --- a/net/netfilter/nf_conntrack_netlink.c
 +++ b/net/netfilter/nf_conntrack_netlink.c
 @@ -28,6 +28,9 @@
@@ -461,7 +461,7 @@ index 18a91c031554..71744223e716 100644
  	[CTA_ID]		= { .type = NLA_U32 },
  	[CTA_NAT_DST]		= { .type = NLA_NESTED },
  	[CTA_TUPLE_MASTER]	= { .type = NLA_NESTED },
-@@ -1900,6 +2016,46 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
+@@ -1900,6 +2016,55 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
  	return nf_ct_change_status_common(ct, ntohl(nla_get_be32(cda[CTA_STATUS])));
  }
  
@@ -474,6 +474,15 @@ index 18a91c031554..71744223e716 100644
 + * mark/NAT/protoinfo/... attributes bundled in the same message.
 + * Returns 0 on a handled pin/unpin, -ENOENT if CTA_ID does not match this
 + * conntrack, or -1 to let the normal update path run.
++ *
++ * Acting on the unpin edge (want==0 while the ct is currently pinned) is safe:
++ * the sole controller always echoes the full status word for a pinned
++ * conntrack. It copies the complete status the kernel reported and toggles
++ * only IPS_PERMANENT, clearing the bit solely on a deliberate teardown; a
++ * routine update on a pinned ct carries no CTA_STATUS at all and so falls
++ * through here. A status word that reaches this handler with IPS_PERMANENT
++ * absent therefore always encodes an intentional unpin, never an accidentally
++ * dropped bit.
 + */
 +static int
 +ctnetlink_change_permanent(struct nf_conn *ct, const struct nlattr * const cda[])
@@ -508,7 +517,7 @@ index 18a91c031554..71744223e716 100644
  static int
  ctnetlink_setup_nat(struct nf_conn *ct, const struct nlattr * const cda[])
  {
-@@ -2204,6 +2360,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
+@@ -2204,6 +2369,11 @@ ctnetlink_change_conntrack(struct nf_conn *ct,
  			return err;
  	}
  
@@ -520,7 +529,7 @@ index 18a91c031554..71744223e716 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2342,6 +2503,11 @@ ctnetlink_create_conntrack(struct net *net,
+@@ -2342,6 +2512,11 @@ ctnetlink_create_conntrack(struct net *net,
  			goto err2;
  	}
  
@@ -532,7 +541,7 @@ index 18a91c031554..71744223e716 100644
  #if defined(CONFIG_NF_CONNTRACK_MARK)
  	if (cda[CTA_MARK])
  		ctnetlink_change_mark(ct, cda);
-@@ -2468,6 +2634,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
+@@ -2468,6 +2643,15 @@ static int ctnetlink_new_conntrack(struct sk_buff *skb,
  	err = -EEXIST;
  	ct = nf_ct_tuplehash_to_ctrack(h);
  	if (!(info->nlh->nlmsg_flags & NLM_F_EXCL)) {

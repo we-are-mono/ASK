@@ -36,14 +36,6 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
-- [ ] **A31.** ctnetlink_change_permanent()'s unpin trigger is "CTA_STATUS present
-  but omitting IPS_PERMANENT on a pinned ct" (the bit going 1->0): a routine
-  update that merely omits the bit silently unpins the ct and short-circuits
-  (dropping bundled attrs). Pre-existing (A30 preserves it per the "don't break
-  unpin" constraint); benign as long as the controller always echoes the full
-  status of a pinned ct. Open (defense-in-depth: gate unpin on an explicit
-  signal rather than bit-absence).
-
 - [ ] **A33.** *(Static inference, untested — deprioritized.)* The **routed**-
   multicast offload path resolves interfaces via `get_onif_by_name`, which
   returns NULL for `br-lan.N`, so routed mcast through a vlan-aware bridge
@@ -558,6 +550,11 @@ file's git history.
   when CTA_STATUS carried IPS_PERMANENT, dropping bundled attrs — fixed (patch
   050): gates on the IPS_PERMANENT *delta*, pin via atomic set_bit.
 
+- [x] **A31.** `ctnetlink_change_permanent` unpin-on-IPS_PERMANENT-absence looked
+  unsafe — proven safe (patch 050): the sole controller (cmm) always echoes full
+  status and clears the bit only on a deliberate teardown; routine updates send
+  no CTA_STATUS. Invariant documented in the handler, no behavior change.
+
 - [x] **A32.** Forwarded NATed flows through a vlan-aware bridge (`br-lan.N`) ran
   on the CPU (not a cdx onif → ingress/egress resolution failed) — fixed
   (_d85724d_): physical-port substitution + `underlying_input_itf` fallback.
@@ -751,9 +748,9 @@ file's git history.
   pointer re-derived after; audit-confirmed COW-safe). Diagnostic-only.
 
 - [x] **A87.** cdx sdk_dpaa `dpa_add_dummy_eth_hdr` (cellular offload inbound)
-  wrote a dummy Ethernet header into a possibly-shared head — fixed (_this
-  commit_): `skb_cow_head` before the in-place write (after the existing realloc,
-  no double-realloc; audit-confirmed). Same class as A86.
+  wrote a dummy Ethernet header into a possibly-shared head — fixed (patch 010):
+  `skb_cow_head` before the in-place write (after the existing realloc, no
+  double-realloc; audit-confirmed). Same class as A86.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning
