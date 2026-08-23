@@ -157,14 +157,11 @@ stale line refs) are folded into the archive one-liners.
   handle cookies (type+generation tokens) instead of raw pointers. Open (low;
   root-only).
 
-- [ ] **A86.** cdx sdk_dpaa `dpaa_submit_{outb,inb}_pkt_to_SEC` rewrite
-  `skb->data` in place (outbound L2-shift, inbound PPPoE/proto bytes) before
-  handing the skb to the FMAN offload — if a tap holds a live clone (tcpdump on
-  the offload iface: `skb_cloned()`, `users==1`), the shared data buffer is
-  mutated and the capture shows corrupted bytes. Pre-existing, orthogonal to
-  A35a (whose `skb_linearize` is itself COW-correct); surfaced by the A35a
-  audit. Diagnostic-only (the forwarded packet is fine). Fix: `skb_cow_head`/
-  `skb_ensure_writable` before the in-place header edits. Open (low).
+- [ ] **A87.** cdx sdk_dpaa `dpa_add_dummy_eth_hdr` (cellular/`wifi_offload`
+  inbound, `dpaa_eth_sg.c`) writes a dummy Ethernet header in place when headroom
+  suffices — the same clone-corruption class as A86, on the cellular xfrm-inbound
+  path A86's scope didn't cover. Pre-existing, niche (needs a tap on that path).
+  Fix: COW before the in-place write. Open (low).
 
 ---
 
@@ -751,6 +748,11 @@ file's git history.
 - [x] **A83.** cdx `rtp_flow_free`'s NULL-MURAM-handle leak branch is provably
   unreachable (fm0 handle is a write-once init global, non-NULL whenever
   `rtp_info` exists) — invariant documented in-code, no behavior change.
+
+- [x] **A86.** cdx sdk_dpaa `dpaa_submit_{outb,inb}_pkt_to_SEC` rewrote
+  `skb->data` in place, corrupting a live tcpdump clone on the offload iface —
+  fixed (_this commit_): `skb_cow_head` before the in-place writes (net-header
+  pointer re-derived after; audit-confirmed COW-safe). Diagnostic-only.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning
