@@ -67,7 +67,19 @@ static void rtp_flow_free(PRTPflow pFlow)
 	{
 		if (pFlow->hw_flow->rtp_info)
 		{
-			// allocate MURAM memory for the RTP info, which is required to be accessed and modified by ucode
+			/*
+			 * The fm_idx-0 MURAM handle is a write-once init-time global
+			 * (fman_info[0].muram_handle in dpa_cfg.c, set in
+			 * cdx_ioc_set_dpa_params, cleared only by the config-failure
+			 * rollback that runs before any RTP flow exists and never at
+			 * module exit). rtp_info is non-NULL only because
+			 * cdx_rtp_alloc_muram_rtpinfo() obtained that same handle to
+			 * carve it, so the fetch here returns the identical non-NULL
+			 * handle and the free always runs. The NULL-handle else is thus
+			 * unreachable while rtp_info is set; it is kept only because
+			 * FM_MURAM_FreeMem must not be passed a NULL handle (and the
+			 * carve cannot be freed without it in any case).
+			 */
 			h_FmMuram = dpa_get_fm_MURAM_handle(0, &physicalMuramBase, &MuramSize);
 			if (h_FmMuram)
 			{

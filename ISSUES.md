@@ -151,11 +151,6 @@ stale line refs) are folded into the archive one-liners.
   wedged HC fails every later member too). Open (investigate — needs the
   pending-free design).
 
-- [ ] **A83.** cdx `rtp_flow_free` (`control_rtp_relay.c:68-84`) leaks the MURAM
-  `rtp_info` carve if `dpa_get_fm_MURAM_handle` returns NULL — it frees
-  `hw_flow` but not `rtp_info`, losing its only pointer. Latent (the MURAM
-  handle is a stable init-time global). Surfaced by the A62 trace. Open (low).
-
 - [ ] **A85.** The FM_PCD `*Set`/`*Build` ioctls copy the raw kernel `t_Handle`
   pointer back to userspace in the reply (the value later handed to `*Delete`) —
   a KASLR pointer info-leak from the 0600 `/dev/fmX-pcd` node. Real fix is opaque
@@ -752,6 +747,10 @@ file's git history.
 
 - [x] **A82.** cmm `CMMD_CMD_SOCKET_SHOW` missing length check — fixed
   (_eb594f0_): added a `cmd_len < sizeof(*cmd)` guard before the first deref.
+
+- [x] **A83.** cdx `rtp_flow_free`'s NULL-MURAM-handle leak branch is provably
+  unreachable (fm0 handle is a write-once init global, non-NULL whenever
+  `rtp_info` exists) — invariant documented in-code, no behavior change.
 
 - [x] **A69.** CT register leaked the main-route refs on the tunnel-route failure
   path (`ct_free()` never released the orig/rep `L2_route_get` nbrefs, pinning
