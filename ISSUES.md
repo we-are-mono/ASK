@@ -110,19 +110,6 @@ stale line refs) are folded into the archive one-liners.
   IRQ fiction with a real lock (or drop the save entirely where the hardware
   window doesn't need it) on the next sysfs-wrapper touch. Open.
 
-- [ ] **A52.** `/dev/fmX` FM_PCD ioctl family passes user-supplied `param->id`
-  straight through as a kernel `t_Handle` with no validation — NXP documents it
-  verbatim as a "Security Hole" in `lnxwrp_ioctls_fm.c` (~:2501, above
-  `FM_PCD_ManipNodeReplace((t_Handle)param->id, ...)`). ~11 live sibling sites
-  share the shape: KgSchemeGetCounter, CcRootModifyNextEngine, MatchTableModify
-  {,Miss}NextEngine, MatchTableRemoveKey, MatchTableModifyKeyAndNextEngine,
-  MatchTableGet{Key,Miss}Statistics, MatchTableModifyKey, ManipGetStatistics. A
-  root-only (0600 /dev node) arbitrary-kernel-pointer-deref primitive; the A46
-  stub removed the one `p_hash_tbl` instance but the pattern persists on
-  `param->id`. Not cleanup — needs a handle-validation design (registry of
-  live LLD handles, or reject the affected ioctls if no legit userspace uses
-  them; fmlib/fmc call-surface audit first). Own concern. Open (investigate).
-
 - [ ] **A66.** A54 freshness residual (documented by the fix's audit): after a
   rollback, the next route event re-attaches the OLD fpp route id (holder's
   `fpp_route` restored → `__cmmFPPRouteRegister` no-ops), cdx accepts the
@@ -188,6 +175,12 @@ stale line refs) are folded into the archive one-liners.
   `rtp_info` carve if `dpa_get_fm_MURAM_handle` returns NULL — it frees
   `hw_flow` but not `rtp_info`, losing its only pointer. Latent (the MURAM
   handle is a stable init-time global). Surfaced by the A62 trace. Open (low).
+
+- [ ] **A85.** The FM_PCD `*Set`/`*Build` ioctls copy the raw kernel `t_Handle`
+  pointer back to userspace in the reply (the value later handed to `*Delete`) —
+  a KASLR pointer info-leak from the 0600 `/dev/fmX-pcd` node. Real fix is opaque
+  handle cookies (type+generation tokens) instead of raw pointers. Open (low;
+  root-only).
 
 ---
 
@@ -626,6 +619,15 @@ file's git history.
 - [x] **A46.** `FM_PCD_HashTableAddKey` type confusion on the
   `FM_PCD_IOC_HASH_TABLE_ADD_KEY` path — fixed (_e690063_): ioctl case deleted,
   function removed, entry param tightened so the confusion is a compile error.
+
+- [x] **A52.** `/dev/fmX` FM_PCD modify/query ioctls dereferenced a user-supplied
+  `param->id` as a kernel `t_Handle` (NXP-labelled "Security Hole") — fixed
+  (patch 010): the 12 runtime modify/query verbs are stubbed to
+  `E_INVALID_SELECTION` (A46 pattern), re-verified caller-free against the shipped
+  fmc (build tree, not the incomplete `sources/fmc`). The six `*Delete` verbs are
+  deliberately left live — fmc's teardown calls them, so stubbing them would
+  break PCD teardown (don't "finish the family"); accepted unvalidated given the
+  0600-root node and dormant delete path. DUT-boot (PCD still builds) is the gate.
 
 - [x] **A43.** cmm MSP socket surface — closed (verified 2026-08-18, no code
   change needed): cmm-side deletions shipped in _dd96e1d_, cdx's
