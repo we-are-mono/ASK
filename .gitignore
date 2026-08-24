@@ -47,6 +47,10 @@ build/*.log
 build/conf/
 meta-ask/build/
 
+# Local, machine-specific build-site config — `make setup` seeds it from
+# meta-ask/site.conf.example
+meta-ask/site.conf
+
 # Claude Code / MCP tooling + local project instructions
 .claude/
 .playwright-mcp/

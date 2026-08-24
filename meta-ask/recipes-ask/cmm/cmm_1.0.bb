@@ -43,10 +43,10 @@ EXTRA_OEMAKE = " \
 inherit pkgconfig
 
 fakeroot do_compile() {
-    # externalsrc shares the source tree with the Debian "make userspace"
-    # path. Wipe any stale Debian-toolchain objects before recompiling
+    # externalsrc builds in-place in the shared cmm source tree. Wipe any
+    # stale objects from a prior or other-toolchain build before recompiling
     # against the Yocto sysroot — otherwise make decides "nothing to do"
-    # and we ship the Debian binary.
+    # and we ship a stale binary.
     oe_runmake clean || true
     oe_runmake all
     # Fuzz harness for the RTNL parser (cmm/test/cmm_rtnl_fuzzer.c).

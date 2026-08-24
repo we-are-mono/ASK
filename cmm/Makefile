@@ -19,10 +19,10 @@ CFLAGS  += $(NFCT_CFLAGS)
 CFLAGS  += -I$(SRCDIR)
 CFLAGS  += -I$(LIBFCI_DIR)/include
 CFLAGS  += -I$(ABM_DIR)/include
-# Single authoritative feature-define list for cmm. Every build path — the
-# top-level `make userspace` and the OE recipe (meta-ask/recipes-ask/cmm/
-# cmm_1.0.bb) — compiles this exact profile; the recipe intentionally adds
-# no defines of its own, so there is only one list to keep correct.
+# Single authoritative feature-define list for cmm. Every build path that
+# compiles cmm — the meta-ask OE recipe (meta-ask/recipes-ask/cmm/cmm_1.0.bb),
+# OpenWrt, Armbian — uses this exact profile; the recipes intentionally add no
+# defines of their own, so there is only one list to keep correct.
 # ENABLE_EGRESS_QOS is our deliberate addition to NXP's documented set.
 # The IPsec flow-cache model was removed, so the no-flow-cache behavior is
 # now unconditional and IPSEC_NO_FLOW_CACHE is no longer defined anywhere.

@@ -1,0 +1,29 @@
+# ASK meta-ask build-site configuration — TEMPLATE.
+#
+# `make setup` copies this file to meta-ask/site.conf (which is gitignored: it
+# is your local, machine-specific copy). You MUST edit site.conf before the
+# first build — at minimum set DL_DIR and SSTATE_DIR to directories that
+# already exist and are writable by your build user (see below).
+
+# Build parallelism — set to match your CPU. Run `nproc` to see how many
+# threads you can allocate to Yocto/bitbake.
+PARALLEL_MAKE = "-j 24"
+BB_NUMBER_THREADS = "24"
+
+# Shared cache locations. Keep these OUTSIDE the repo so a reclone doesn't wipe
+# them and they can be reused across builds. Create them first and give your
+# build user write access, e.g.:
+#
+#     sudo mkdir -p /srv/yocto/dl /srv/yocto/sstate
+#     sudo chown "$(id -u):$(id -g)" /srv/yocto/dl /srv/yocto/sstate
+#
+# then point these at the paths you created:
+DL_DIR = "/path/to/yocto-dl"
+SSTATE_DIR = "/path/to/yocto-sstate"
+
+# Test image: CONFIG_DEBUG_INFO_DWARF5 bakes absolute build paths into the
+# kernel + ko files, which trips the default buildpaths QA check. We ship
+# these to a lab board, not to customers — downgrade the check to a warning
+# so debug-info can land without breaking the build.
+WARN_QA:append = " buildpaths"
+ERROR_QA:remove = "buildpaths"
