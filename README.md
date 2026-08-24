@@ -1,126 +1,173 @@
-# NXP ASK (Application Solutions Kit) for LS1046A
+# ASK (Application Solutions Kit) for LS1046A
 
-Hardware-accelerated packet processing for NXP Layerscape LS1046A (and LS1043A) processors. This repository contains the kernel modules, userspace daemons, build patches, and configuration files needed to enable DPAA fast-path offloading.
+Hardware-accelerated packet processing for NXP Layerscape LS1046A (and LS1043A)
+processors. This repository contains the kernel modules, userspace daemons,
+kernel patch stack, board device tree, and configuration needed to enable DPAA1
+/ FMAN fast-path offloading — turning a Linux router into a hardware-offloading
+one.
 
-## Building
+Together with the ASK-enabled FMAN microcode (a proprietary NXP binary, **not
+included**, v210.10.1, loaded by U-Boot before Linux boots) it offloads L2
+bridging, L3 forwarding/NAT, QoS, and IPsec to the DPAA/FMAN hardware. Without
+the microcode the standard FMAN driver still works, but CDX will not initialize.
 
-Builds on Debian trixie (or newer) targeting aarch64. Everything is cross-compiled — no target hardware needed.
+## How ASK is consumed
 
-### One-time setup
+ASK is **not a standalone product** — it is the set of components that enable
+DPAA1/FMAN hardware offloading on the NXP LS1046A, meant to be **integrated into
+a Linux distribution's build system**. OpenWrt, Armbian, Debian, or any Yocto
+image pulls ASK in as a kernel patch stack plus a handful of packages; there is
+no "ASK distro" and nothing here runs on its own.
 
-```sh
-make setup    # installs crossbuild-essential-arm64 and arm64 library packages (needs sudo)
-```
+The components:
 
-### Build
+- **Kernel modules** — `cdx` (the core offload engine: hardware flow tables,
+  IPsec offload, and QoS via DPAA/FMAN), `fci` (control channel to the CMM
+  daemon), `auto_bridge` (L2 bridge flow detection).
+- **Userspace** — `cmm` (offloads netfilter conntrack flows to the classifier),
+  `dpa_app` (loads the FMAN classification rules), `fmc` (NXP's FMAN config
+  compiler).
+- **Supporting libraries** — `libfci`, `fmlib`, `libcli`, and ASK-patched
+  `libnfnetlink` / `libnetfilter_conntrack` (CMM's fast-path conntrack).
+- **Kernel side** — the `patches/kernel/` stack (`010`–`110`: the vendored
+  DPAA/FMAN SDK and ASK's hooks, applied onto stock mainline 6.12) and the board
+  device tree in `dts/`.
+- **Runtime config** — FMAN port maps, PCD / soft-parser XML, module load order,
+  and init scripts (`config/`, `dpa_app/files/`).
 
-```sh
-make          # fetches all dependencies into sources/, patches them, builds everything
-```
+### Reference recipes
 
-This produces:
+Each component's **bitbake recipe** is the authoritative, self-contained
+description of how to build and package it — flags, dependencies, install layout.
+Anyone integrating ASK into another build system should read these as the
+reference:
 
-| Artifact | Type |
-|----------|------|
-| `cdx/cdx.ko` | Kernel module — core fast-path offload engine |
-| `fci/fci.ko` | Kernel module — CMM-to-CDX communication |
-| `auto_bridge/auto_bridge.ko` | Kernel module — L2 bridge flow detection |
-| `sources/fmc/source/fmc` | Userspace — FMAN configuration tool |
-| `cmm/src/cmm` | Userspace — connection manager daemon |
-| `dpa_app/dpa_app` | Userspace — FMAN classification rule loader |
+| Component | Recipe |
+|-----------|--------|
+| `cdx`, `fci`, `auto_bridge` (kernel modules) | `meta-ask/recipes-ask/{cdx,fci,auto-bridge}/` |
+| `cmm`, `dpa_app`, `fmc` (userspace) | `meta-ask/recipes-ask/{cmm,dpa-app,fmc}/` |
+| `libfci`, `fmlib`, `libcli` (libraries) | `meta-ask/recipes-ask/{libfci,fmlib,libcli}/` |
+| patched `libnfnetlink` / `libnetfilter-conntrack` | `meta-ask/recipes-ask/{libnfnetlink,libnetfilter-conntrack}/` |
+| kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.12.bb` |
+| bootable showcase image | `meta-ask/recipes-core/images/ask-image.bb` |
 
-### Other targets
+For example, OpenWrt consumes ASK by mirroring these as `package/ask/*` Makefiles
+plus a committed copy of the kernel patch series — the same components, packaged
+its own way.
 
-```sh
-make modules    # kernel modules only
-make userspace  # userspace binaries only
-make sources    # fetch + patch + build all dependencies (fmlib, fmc, libfci, libnfnetlink, libnetfilter_conntrack)
-make kernel     # build kernel Image + in-tree modules (requires kernel source at KDIR)
-make dist       # stage all artifacts into dist/
-make serve      # HTTP server on dist/ for target deployment
-make clean      # clean build artifacts (keeps fetched sources)
-make clean-all  # clean everything including fetched sources
-```
+### The Yocto layer is a showcase
+
+`meta-ask` is **not a production distro** — it exists to demonstrate how all the
+components build and fit together. It wires every one of them into a single
+**bootable image that is served over the network and booted entirely in RAM**
+(kernel + initramfs over TFTP). That means the full ASK stack comes up on a board
+**without touching eMMC**: nothing is flashed, the installed on-board system is
+left undisturbed, and a power-cycle returns the board to it. It is both the
+reference for how the pieces integrate and a fast, non-destructive way to test
+them on real hardware.
+
+## Building the showcase image
+
+The `meta-ask` layer builds that in-RAM image. It is self-contained: it fetches
+its own BitBake, OpenEmbedded-core, and meta-openembedded, then builds the
+kernel, the ASK modules, the userspace, and an initramfs into one bootable image.
+Verified from scratch on a clean Debian 13 (trixie) amd64 host.
 
 ### Requirements
 
-- Debian trixie or newer (amd64 host)
-- `make setup` installs everything else
-- Kernel source tree at `~/Mono/linux` (override with `make KDIR=/path/to/kernel`)
-- The kernel must be configured (`.config` present) — use `make kernel` or copy `config/kernel/defconfig`
+- Debian 13 (trixie) or newer, amd64.
+- **Disk:** an empty-sstate build uses roughly **85 GB** — about 70 GB for the
+  build tree (`meta-ask/build/tmp`), 13 GB of downloads, and a few GB of sstate.
+  Provision **≥100 GB free** on the build filesystem.
+- **RAM:** 16 GB minimum, 32 GB comfortable for a parallel build. Note that a
+  default systemd `/tmp` is a tmpfs sized to half of RAM; a heavily parallel
+  native compile can exhaust a small `/tmp`. If you hit `No space left on
+  device` while `df` still shows free disk, that tmpfs is the cause — grow it, or
+  point `TMPDIR` at real disk.
 
-### How it works
-
-`make` automatically:
-1. Clones NXP fmlib and fmc from GitHub at tag `lf-6.12.49-2.2.0`, applies ASK extension patches, cross-compiles them
-2. Downloads libnfnetlink and libnetfilter_conntrack tarballs, applies NXP ASK patches, cross-compiles into a local sysroot
-3. Builds libfci (in-tree, single source file)
-4. Builds kernel modules against the configured kernel tree
-5. Builds CMM, FMC, and dpa_app against the patched libraries
-
-All fetched sources go into `sources/` (gitignored). `make clean-all` removes them for a fully fresh rebuild.
-
-### Note for other build systems
-
-CMM requires **patched** versions of libnfnetlink and libnetfilter_conntrack. The stock upstream libraries do not have the NXP ASK extensions (fast-path conntrack attributes, QoS connmark, `IPS_PERMANENT`) and CMM will not compile against them. The patches are in `patches/libnfnetlink/` and `patches/libnetfilter-conntrack/`. If you are building outside this Makefile (e.g., Yocto, OpenWrt, or manually), you must apply these patches to your copies of these libraries.
-
-## Deploying to target
+### 1. Host setup (one-time)
 
 ```sh
-make dist       # copies all artifacts to dist/
-make serve      # starts HTTP server on port 8000
-
-# On the target (Armbian):
-wget http://<host>:8000/cdx.ko -P /lib/modules/$(uname -r)/extra/
-# ... etc
+make setup
 ```
 
-## Overview
+Installs `kas` and BitBake's host dependencies and generates the `en_US.UTF-8`
+locale BitBake requires (needs sudo). `kas` 4.8.x from Debian trixie is
+known-good; `pipx install kas` also works if you want a newer release.
 
-Together with the ASK-enabled FMAN microcode (a proprietary NXP binary, not included), this repository provides everything needed to turn any Linux-based distribution or routing system into a hardware-offloading-capable router on LS1046A/LS1043A platforms.
+### 2. Cache directories (required)
 
-The ASK-enabled FMAN microcode (v210.10.1) must be loaded by U-Boot before Linux boots. Without it, the standard FMAN driver operates normally but CDX will not initialize.
+`make setup` seeds `meta-ask/site.conf` from `site.conf.example` — the real
+`site.conf` is gitignored, so it's your local, machine-specific copy. **You must
+edit it before building.** Create the cache directories first and give your build
+user write access:
 
-## Components
+```sh
+sudo mkdir -p /srv/yocto/dl /srv/yocto/sstate
+sudo chown "$(id -u):$(id -g)" /srv/yocto/dl /srv/yocto/sstate
+```
 
-### Kernel Modules
+Then point `site.conf` at the paths you created (and set the parallelism to your
+`nproc`):
 
-| Module | Description |
-|--------|-------------|
-| **cdx** | Control Data Exchange — core fast-path offload engine. Manages hardware flow tables, IPsec offload, and QoS via DPAA/FMAN. |
-| **fci** | Fast-path Control Interface — communication channel between CDX and the CMM daemon. Depends on CDX. |
-| **auto_bridge** | Automatic L2 bridge flow detection. Monitors bridge ports and notifies CDX of flows eligible for hardware offload. |
+```sh
+# meta-ask/site.conf
+DL_DIR            = "/srv/yocto/dl"       # downloaded tarballs (reusable)
+SSTATE_DIR        = "/srv/yocto/sstate"   # shared state cache (reusable)
+PARALLEL_MAKE     = "-j 24"                # set to your `nproc`
+BB_NUMBER_THREADS = "24"                   # set to your `nproc`
+```
 
-### Userspace
+Keep the caches **outside** the repo so a reclone doesn't wipe them; a warm
+sstate cache turns a ~40-minute build into minutes.
 
-| Component | Description |
-|-----------|-------------|
-| **cmm** | Connection Manager daemon. Monitors netfilter conntrack and offloads eligible flows to CDX. |
-| **dpa_app** | Programs FMAN classification rules from XML policy files via FMC. Called by CDX at module load. |
-| **fci/lib** (libfci) | Userspace library for communicating with the FCI kernel module. Used by CMM. |
+### 3. Build
 
-### Patches
+```sh
+make ask-image        # = cd meta-ask && kas build .config.yaml
+```
 
-| Target | Patch | Purpose |
-|--------|-------|---------|
-| **kernel** | thematic stack `patches/kernel/0[1-9]*.patch` | DPAA/FMAN driver enhancements, IPsec offload, netfilter QoS marking, bridge fast-path, QBMan NAPI |
-| **fmlib** | `01-mono-ask-extensions.patch` | Hash table, IP reassembly, shared scheme support for Frame Manager library |
-| **fmc** | `01-mono-ask-extensions.patch` | Port ID, shared scheme replication, PPPoE field fix, libxml2 compatibility |
-| **libnetfilter-conntrack** | `01-nxp-ask-comcerto-fp-extensions.patch` | Fast-path info attributes and QoS connmark for CMM |
-| **libnfnetlink** | `01-nxp-ask-nonblocking-heap-buffer.patch` | Non-blocking socket mode and heap buffer management for CMM |
-| **iptables** | `iptables-extensions/` sources + kernel patch `060` | QOSMARK/QOSCONNMARK target and match extensions |
+The image lands in `meta-ask/build/tmp/deploy/images/ask-ls1046a/` as
+`Image.gz-initramfs-ask-ls1046a.bin` (kernel + initramfs, ~104 MB). From an empty
+sstate cache the build takes ~40 minutes.
 
-### Configuration
+For the KASAN sanitizer (memory-error instrumentation, off by default):
 
-| File | Description |
-|------|-------------|
-| `config/ask-modules.conf` | Module load order for systemd |
-| `config/cmm.service` | Systemd service for CMM (guarded by `/dev/cdx_ctrl`) |
-| `config/fastforward` | CMM traffic exclusion rules (FTP, SIP, PPTP bypass fast path) |
-| `config/gateway-dk/cdx_cfg.xml` | FMAN port mapping for Mono Gateway DK |
-| `config/kernel/defconfig` | Kernel defconfig for LS1046A with ASK |
-| `dpa_app/files/etc/cdx_pcd.xml` | Packet classification rules for FMAN hash tables |
+```sh
+KASAN=1 make ask-image
+```
+
+### Deploying to the board
+
+The image boots in RAM over TFTP from U-Boot on the lab board:
+
+```sh
+make stage-image      # copy the image into $TFTP_ROOT (default /srv/tftp)
+```
+
+Then, at the DUT's U-Boot prompt: `tftpboot ${loadaddr} <name>; booti ${loadaddr} - ${fdtaddr}`.
+
+### Make targets
+
+The top-level `Makefile` is a thin wrapper around the kas build and the test
+harness — it does not build ASK components standalone.
+
+| Target | Does |
+|--------|------|
+| `make setup` | install host build deps + locale (one-time, sudo) |
+| `make ask-image` | build the test image via kas |
+| `make stage-image` | copy the built image into the TFTP root |
+| `make deploy-agents` | install the askd test agent on the WAN/LAN hosts |
+| `make ask-test` | run the end-to-end pytest suite |
+
+## Versioning and branches
+
+ASK is versioned per kernel-compatibility line. In short: `master` is active
+development for the newest supported kernel; `mono-6.12` is the 6.12 maintenance
+line; releases are tagged (`mono-1.0.0`). See [docs/VERSIONING.md](docs/VERSIONING.md)
+for the full branch model.
 
 ## License
 
-Kernel modules and ASK components are licensed under GPL-2.0+. See individual `COPYING.GPL` files in each component directory.
+Kernel modules and ASK components are licensed under GPL-2.0+. See the individual
+`COPYING.GPL` files in each component directory and the top-level `LICENSE`.
