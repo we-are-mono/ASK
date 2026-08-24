@@ -46,9 +46,18 @@ do_install() {
     install -m 0644 ${B}/libfmc.a ${D}${libdir}/libfmc.a
     install -d ${D}${includedir}/fmc
     install -m 0644 ${B}/*.h ${D}${includedir}/fmc/
+
+    # FMAN header-parser PDL + XSD schemas, read from /etc/fmc/config/ at
+    # runtime (by fmc and by dpa_app's embedded fmc_compile). They ship in the
+    # fmc source tree, so install them here — the image gets them from the
+    # recipe that already fetches fmc, not from an out-of-band source checkout.
+    install -d ${D}${sysconfdir}/fmc/config
+    install -m 0644 ${S}/etc/fmc/config/hxs_pdl_v3.xml ${D}${sysconfdir}/fmc/config/
+    install -m 0644 ${S}/etc/fmc/config/cfgdata.xsd    ${D}${sysconfdir}/fmc/config/
+    install -m 0644 ${S}/etc/fmc/config/netpcd.xsd     ${D}${sysconfdir}/fmc/config/
 }
 
-FILES:${PN} = "${bindir}/fmc"
+FILES:${PN} = "${bindir}/fmc ${sysconfdir}/fmc/config"
 FILES:${PN}-dev = "${includedir}/fmc"
 FILES:${PN}-staticdev = "${libdir}/libfmc.a"
 

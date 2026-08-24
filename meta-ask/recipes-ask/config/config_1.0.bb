@@ -28,24 +28,9 @@ do_install[file-checksums] += " \
     ${ASK_SRCROOT}/config/gateway-dk/cdx_cfg.xml:True \
     ${ASK_SRCROOT}/dpa_app/files/etc/cdx_pcd.xml:True \
     ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml:True \
-    ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/hxs_pdl_v3.xml:True \
-    ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/cfgdata.xsd:True \
-    ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/netpcd.xsd:True \
     ${ASK_SRCROOT}/config/ask-modules.conf:True \
     ${ASK_SRCROOT}/config/fastforward:True \
 "
-
-do_install:prepend() {
-    # sources/fmc/ is gitignored and fetched out-of-band by `make sources`
-    # (the Debian build flow). On a fresh clone that step is easy to miss,
-    # and do_install would otherwise fail deep in an install line with no
-    # hint. Fail early, naming the fix.
-    for f in hxs_pdl_v3.xml cfgdata.xsd netpcd.xsd; do
-        if [ ! -e "${ASK_SRCROOT}/sources/fmc/etc/fmc/config/$f" ]; then
-            bbfatal "config: ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/$f missing — run 'make sources' in the ASK repo first (sources/ is gitignored)."
-        fi
-    done
-}
 
 fakeroot do_install() {
     # Board-specific FMAN port config (consumed by dpa_app / fmc).
@@ -55,16 +40,6 @@ fakeroot do_install() {
     # PCD + soft-parser XML that dpa_app hands to fmc.
     install -m 0644 ${ASK_SRCROOT}/dpa_app/files/etc/cdx_pcd.xml ${D}${sysconfdir}/cdx_pcd.xml
     install -m 0644 ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml  ${D}${sysconfdir}/cdx_sp.xml
-
-    # fmc's header-parser PDL and XSD schemas — fmc opens these relative to
-    # /etc/fmc/config/ by default.
-    install -d ${D}${sysconfdir}/fmc/config
-    install -m 0644 ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/hxs_pdl_v3.xml \
-        ${D}${sysconfdir}/fmc/config/hxs_pdl_v3.xml
-    install -m 0644 ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/cfgdata.xsd \
-        ${D}${sysconfdir}/fmc/config/cfgdata.xsd
-    install -m 0644 ${ASK_SRCROOT}/sources/fmc/etc/fmc/config/netpcd.xsd \
-        ${D}${sysconfdir}/fmc/config/netpcd.xsd
 
     install -d ${D}${sysconfdir}/modules-load.d
     install -m 0644 ${ASK_SRCROOT}/config/ask-modules.conf \
@@ -109,7 +84,6 @@ FILES:${PN} = " \
     ${sysconfdir}/cdx_cfg.xml \
     ${sysconfdir}/cdx_pcd.xml \
     ${sysconfdir}/cdx_sp.xml \
-    ${sysconfdir}/fmc/config/* \
     ${sysconfdir}/modules-load.d/ask.conf \
     ${sysconfdir}/config/fastforward \
     ${sysconfdir}/init.d/debugfs \
