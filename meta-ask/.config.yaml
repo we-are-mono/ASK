@@ -30,6 +30,8 @@ repos:
 
   meta-ask:
     path: ..
+    layers:
+      meta-ask:
 
 target:
   - ask-image
