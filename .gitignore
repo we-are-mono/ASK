@@ -38,3 +38,16 @@ __pycache__/
 
 # Local setup notes — environment-specific, not part of the codebase
 IPSEC.md
+
+# OpenEmbedded / kas build output (oe-logs/oe-workdir are symlinks into the
+# bitbake work tree — no trailing slash so the symlinks match too)
+oe-logs
+oe-workdir
+build/*.log
+build/conf/
+meta-ask/build/
+
+# Claude Code / MCP tooling + local project instructions
+.claude/
+.playwright-mcp/
+CLAUDE.md
