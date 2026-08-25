@@ -164,7 +164,7 @@ harness — it does not build ASK components standalone.
 
 ASK is versioned per kernel-compatibility line. In short: `master` is active
 development for the newest supported kernel; `mono-6.12` is the 6.12 maintenance
-line; releases are tagged (`mono-1.0.0`). See [docs/VERSIONING.md](docs/VERSIONING.md)
+line; releases are tagged (`mono-1.0.0`). See [docs/versioning.md](docs/versioning.md)
 for the full branch model.
 
 ## License
