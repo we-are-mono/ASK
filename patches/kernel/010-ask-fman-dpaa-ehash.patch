@@ -1,4 +1,4 @@
-From ff09904b2ee4a1cece2fa83fb700a3d3e288ec01 Mon Sep 17 00:00:00 2001
+From d514b4abd1a738ad0c8f40d6327d1a047a982e3e Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -43,7 +43,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   31 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   36 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 1043 +++++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 1043 ++++++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
@@ -57,7 +57,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       |  766 +++------
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   24 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1304 ++++++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1313 ++++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |    3 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    |   68 +
@@ -76,7 +76,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +---
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1517 +++++++++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1525 +++++++++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -114,7 +114,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 77 files changed, 7247 insertions(+), 2295 deletions(-)
+ 77 files changed, 7264 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -4494,10 +4494,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..68a163faed1f
+index 000000000000..81d15e9e0224
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1304 @@
+@@ -0,0 +1,1313 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -4872,8 +4872,17 @@ index 000000000000..68a163faed1f
 +				info = (struct en_exthash_info *)h_HashTbl;
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +				if (FmPcdHcSync(info->pcd)) {
-+					printk("%s::FmPcdHcSync failed\n", __func__);
-+					retval = -1;
++					/* The replacement cumulative node - with the
++					 * caller's entry inside it - is already
++					 * published, so the add stands regardless of
++					 * the barrier: report success (the bucket
++					 * index), or the caller would free an entry
++					 * the ucode can reach. Only the REPLACED
++					 * node's free needed the barrier; without one
++					 * it must leak, the same discipline as the
++					 * DeleteKey sync-failure arms. */
++					printk("%s::FmPcdHcSync failed; add stands, leaking the replaced cumulative node\n",
++					       __func__);
 +					return retval;
 +				}
 +				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
@@ -7080,10 +7089,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..2d35f57a9d7b
+index 000000000000..1953111b94a4
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1517 @@
+@@ -0,0 +1,1525 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -8583,6 +8592,14 @@ index 000000000000..2d35f57a9d7b
 +extern void ExternalHashTableCumulativeEntryFree(void *entry);
 +extern int ExternalHashTableEntryGetStatsAndTS(void *tbl_entry,
 +				struct en_tbl_entry_stats *stats);
++/* ExternalHashTableAddKey() return contract. >= 0 (the bucket index)
++ * means the entry IS linked into the table and owned by it -- including
++ * when a post-publish host-command sync failed (the add stands; only
++ * the internally replaced cumulative node needed that barrier, and it
++ * is leaked and logged inside). -1 means the entry was NEVER linked
++ * (duplicate key, allocation failure): the caller keeps ownership and
++ * may free it. Freeing on any >= 0 return hands the ucode freed
++ * memory. */
 +extern int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
 +				struct en_exthash_tbl_entry *tbl_entry);
 +/* ExternalHashTableDeleteKey() return contract. 0 means the key was

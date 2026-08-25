@@ -106,15 +106,6 @@ stale line refs) are folded into the archive one-liners.
   new struct field, deliberate change. Open (investigate; contrived
   trigger, low priority).
 
-- [ ] **A98.** `ExternalHashTableAddKey` (patch 010) publishes the replacement
-  cumulative node into the live bucket BEFORE its HC sync, then returns -1 on
-  sync failure with the caller's `tbl_entry` already linked — and every cdx
-  caller treats -1 as "not added" and `ExternalHashTableEntryFree`s it
-  (cdx_ehash.c ×5, cdx_dpa_ipsec.c ×1): a hardware UAF, the exact class A80/A95
-  fixed on the delete side. -1 is also indistinguishable from the never-linked
-  `E_ALREADY_EXISTS` case. Fix shape: tri-state AddKey like DeleteKey +
-  quarantine on the unsynced arm. Surfaced by the A95 audit. Open (high).
-
 - [ ] **A99.** Re-add-after-failed-delete duplicate-key residuals: the CT path
   (DEL_FAILED latch) and the L2 bridge (tombstone) now refuse to re-add a key
   whose delete failed pre-unlink, but control_socket.c's two update flows
@@ -819,7 +810,12 @@ file's git history.
   chains. Residue filed as A95-A97.
 
 - [x] **A95.** Free-after-failed-DeleteKey on the non-mcast paths (ct_remove,
-  socket, rtp, ipsec, l2br) — fixed (_this commit_): quarantine generalized to
+  socket, rtp, ipsec, l2br) — fixed (_42ad324_): quarantine generalized to
   cdx_ehash.c, a central `cdx_ehash_delete_entry()` owns handle disposition,
   CT gets a no-reoffload latch and the bridge a tombstone on pre-unlink
   failures. Residue filed as A98-A101.
+
+- [x] **A98.** AddKey published the replacement cumulative node before its sync,
+  then returned -1 on sync failure — every caller freed the still-linked entry
+  (hardware UAF) — fixed (_this commit_): the add stands (returns the index),
+  the replaced node leaks loudly; -1 now strictly means never-linked.
