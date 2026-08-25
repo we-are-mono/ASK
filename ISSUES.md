@@ -127,11 +127,38 @@ stale line refs) are folded into the archive one-liners.
   an error — cmm retry semantics against a software-gone group — is a design
   decision. Surfaced by the A80 audit. Open (low).
 
-- [ ] **A85.** The FM_PCD `*Set`/`*Build` ioctls copy the raw kernel `t_Handle`
-  pointer back to userspace in the reply (the value later handed to `*Delete`) —
-  a KASLR pointer info-leak from the 0600 `/dev/fmX-pcd` node. Real fix is opaque
-  handle cookies (type+generation tokens) instead of raw pointers. Open (low;
-  root-only).
+- [ ] **A102.** The FM_VSP ioctl family (`FM_IOC_VSP_CONFIG`/`INIT`/`FREE`/
+  `CONFIG_POOL_DEPLETION`/`CONFIG_BUFFER_PREFIX_CONTENT`/`CONFIG_NO_SG`/
+  `GET_BUFFER_PRS_RESULT`, and `FM_PORT_IOC_VSP_ALLOC`'s OH-port `p_fm_tx_port`)
+  still copies raw kernel VSP handles to/from userspace — the same leak/deref
+  class A85 closed for PCD objects, but a VSP is a distinct object type not in
+  `enum fm_pcd_cookie_type`. cdx drives VSP entirely in-kernel (`vsp_cfg.c`), so
+  this is dead-but-reachable attack surface on the 0600 node. Fix: a 9th cookie
+  type. Surfaced by the A85 audit. Open (low; root-only).
+
+- [ ] **A103.** fmlib omits the `DEV_TO_ID` handle→id conversion at several sites,
+  so a userspace library `t_Device *` is sent into the ioctl where the kernel
+  expects a handle: `FM_PCD_CcRootBuild`/`FrmReplicSetGroup`/`AddMember` FR arm
+  (`frm_replic_id`), `PlcrProfileSet` modify-arm `p_profile`, `ManipNodeReplace`
+  `p_next_manip`, and the three PORT modify verbs
+  (`PcdKgModifyInitialScheme`/`PcdPlcrModifyInitialProfile`/`PcdCcModifyTree`) +
+  `VSPAlloc`. Pre-A85 these reached a kernel deref; post-A85 the kernel's cookie
+  lookup rejects them cleanly (`E_INVALID_SELECTION`), so the affected features
+  are now unusable until fmlib is fixed to convert them. No rig config exercises
+  any of them today. Fix: add the missing `DEV_TO_ID`/loop-bound conversions in
+  `sources/fmlib/src/fm_lib.c` (userspace, `patches/fmlib/`). Surfaced by the A85
+  audit. Open.
+
+- [ ] **A104.** cdx `dpa_cfg.c:cdxdrv_set_miss_action` calls
+  `FM_PCD_HashTableModifyMissNextEngine(tbl_info->id, …)` for every table with no
+  `dpa_type` guard, but `get_cctbl_info` classified each as HASH_TABLE or CC_NODE;
+  feeding a CC-node handle to the hash-table miss-engine path reads `h_Ad` at the
+  wrong offset (a near-NULL MMIO read). Latent — the rig boots, so the ASK fmc
+  most likely reports these under `htnode_count` with `ccnode_count==0`; **confirm
+  on the DUT with one `ccnode_count` printk in dpa_app**, then skip the call for
+  `dpa_type ∈ {INDEXED, EXACT_MATCH}` (cdx already computes that split). NXP-
+  inherited, but the cookie work gives cdx the info to guard it. Surfaced by the
+  A85 audit. Open.
 
 ---
 
@@ -784,6 +811,14 @@ file's git history.
 - [x] **A94.** `xfrm_output_one()` async `-EINPROGRESS` exit leaked the collected
   offload vec refs — fixed (_466d0e7_, patch 040); unreachable under valid
   config, hardening only.
+
+- [x] **A85.** Raw kernel `t_Handle`s crossing the FM_PCD ioctl + cdx
+  `SET_PARAMS` boundaries — fixed (_this commit_): generation-tagged cookie
+  registry in the FMD wrapper, translation on both boundaries (fmc/dpa_app
+  unchanged). Folded in from the audit: a MATCH_TABLE_SET heap overflow
+  (toothless `ASSERT_COND` → hard reject), the `pcd_handle` fd type check
+  (`fm_file_is_pcd`), and a `release_cfg_info` kfree-of-userspace-pointer on
+  error unwinds. Residue A102-A104.
 
 - [x] **A80.** mcast REMOVE clear-before-HC-sync leak — fixed (_5261828_):
   pending-free quarantine drained on the next successful sync; DeleteKey gained a

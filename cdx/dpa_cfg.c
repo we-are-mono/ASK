@@ -47,6 +47,16 @@ static struct dpa_fq *dpa_pcd_fq;
 #define CDX_MAX_DIST		256
 #define CDX_MAX_TABLES		256
 
+/* table_info.dpa_type, as dpa_app fills it (enum dpa_cls_tbl_type in
+ * dpa_app/dpa.c). The two hash flavours are FM_PCD_HashTableSet objects;
+ * indexed and exact-match tables are FM_PCD_MatchTableSet CC nodes. That
+ * split is what picks the cookie type when the id is resolved. Mirrored
+ * rather than shared because dpa_app declares the enum itself. */
+#define CDX_DPA_TBL_INTERNAL_HASH	0
+#define CDX_DPA_TBL_EXTERNAL_HASH	1
+#define CDX_DPA_TBL_INDEXED		2
+#define CDX_DPA_TBL_EXACT_MATCH		3
+
 /*
  * Concurrency:
  *   dpa_cfg_lock (file-local mutex)
@@ -229,21 +239,33 @@ static void release_cfg_info(void) __must_hold(&dpa_cfg_lock)
 	num_fmans = 0;
 }
 
-//allocate and copy distribution info from uspace 
-static int get_dist_info(struct cdx_port_info *port_info)
+//allocate and copy distribution info from uspace
+// The caller has NULLed port_info->dist_info; the userspace source pointer
+// is re-read from the original userspace port array (uspace_ports[idx]) so
+// this field is only ever NULL or kernel-owned -- never a userspace address
+// release_cfg_info() could kfree() on an error unwind.
+static int get_dist_info(struct cdx_port_info *port_info,
+		void __user *uspace_ports, uint32_t idx)
 {
+	struct cdx_port_info __user *up = uspace_ports;
 	uint32_t mem_size;
+	uint32_t ii;
 	struct cdx_dist_info *dist_info;
-	void *uspace_info;
+	struct cdx_dist_info *uspace_info;
 
 #ifdef DPA_CFG_DEBUG
-	DPA_INFO("%s::port %s dist %d\n", __func__, 
+	DPA_INFO("%s::port %s dist %d\n", __func__,
 			port_info->name, port_info->max_dist);
 #endif
 	if (port_info->max_dist > CDX_MAX_DIST) {
 		DPA_ERROR("%s::invalid max_dist %u (cap %u)\n",
 				__func__, port_info->max_dist, CDX_MAX_DIST);
 		return -EINVAL;
+	}
+	if (get_user(uspace_info, &up[idx].dist_info)) {
+		DPA_ERROR("%s::fetch dist_info ptr failed port %s\n",
+				__func__, port_info->name);
+		return -EFAULT;
 	}
 	mem_size = sizeof(struct cdx_dist_info) * port_info->max_dist;
 	dist_info = kcalloc(port_info->max_dist, sizeof(struct cdx_dist_info),
@@ -253,13 +275,30 @@ static int get_dist_info(struct cdx_port_info *port_info)
 				__func__);
 		return -ENOMEM;
 	}
-	uspace_info = port_info->dist_info;
 	port_info->dist_info = dist_info;
-	if (copy_from_user(dist_info, uspace_info, 
+	if (copy_from_user(dist_info, uspace_info,
 				mem_size)) {
 		DPA_ERROR("%s::Read dist_info failed port %s\n",
 				__func__, port_info->name);
 		return -EIO;
+	}
+	/* dpa_app relays the ids the FMD wrapper handed to fmc, so each
+	 * handle here is an FM_PCD cookie, not a kernel pointer. Resolve
+	 * every one before it is stored: these end up in KG next-engine
+	 * params (cdxdrv_set_miss_action) and must never be a value cdx
+	 * took on trust from userspace. */
+	for (ii = 0; ii < port_info->max_dist; ii++) {
+		t_Handle handle;
+
+		handle = fm_pcd_cookie_lookup(
+				(uint64_t)(uintptr_t)dist_info[ii].handle,
+				FM_PCD_COOKIE_SCHEME);
+		if (!handle) {
+			DPA_ERROR("%s::port %s dist %u: not a KG scheme cookie\n",
+					__func__, port_info->name, ii);
+			return -EINVAL;
+		}
+		dist_info[ii].handle = handle;
 	}
 	return 0;
 }
@@ -307,13 +346,25 @@ static void *get_dist_info_by_fman_params(struct cdx_fman_info *finfo, uint32_t 
 }
 
 //allocate and copy port releated info from uspace 
-static int get_port_info(struct cdx_fman_info *finfo) 
-{	
+static int get_port_info(struct cdx_fman_info *finfo,
+		void __user *uspace_fmans, uint32_t fm_idx)
+{
+	struct cdx_fman_info __user *uf = uspace_fmans;
 	struct cdx_port_info *port_info;
-	void *uspace_info;
+	struct cdx_port_info *uspace_info;
 	uint32_t mem_size;
 	uint32_t ii;
+	int retval;
 
+	/* finfo->portinfo was NULLed by the caller; re-read the userspace
+	 * port-array base from the original userspace fman entry so this
+	 * field is only ever NULL or kernel-owned as release_cfg_info()
+	 * sees it. */
+	if (get_user(uspace_info, &uf[fm_idx].portinfo)) {
+		DPA_ERROR("%s::fetch portinfo ptr failed fman %u\n",
+				__func__, fm_idx);
+		return -EFAULT;
+	}
 	if (finfo->max_ports > CDX_MAX_PORTS) {
 		DPA_ERROR("%s::invalid max_ports %u (cap %u)\n",
 				__func__, finfo->max_ports, CDX_MAX_PORTS);
@@ -332,9 +383,18 @@ static int get_port_info(struct cdx_fman_info *finfo)
 				__func__);
 		return -ENOMEM;
 	}
-	uspace_info = finfo->portinfo;
 	finfo->portinfo = port_info;
-	if (copy_from_user(port_info, uspace_info, mem_size)) {
+	retval = copy_from_user(port_info, uspace_info, mem_size);
+	/* NULL the userspace dist_info pointers the copy brought in -- and do
+	 * it unconditionally, since a partial fault leaves the copied prefix
+	 * holding userspace values (the rest stays kcalloc-zeroed). This
+	 * keeps release_cfg_info() from ever kfree'ing a userspace address on
+	 * any later unwind: this -EIO, the find_osdev failure below, or a
+	 * get_dist_info failure. get_dist_info() re-reads each source from
+	 * the userspace array. */
+	for (ii = 0; ii < finfo->max_ports; ii++)
+		port_info[ii].dist_info = NULL;
+	if (retval) {
 		DPA_ERROR("%s::Read port_info failed\n",
 				__func__);
 		return -EIO;
@@ -342,6 +402,11 @@ static int get_port_info(struct cdx_fman_info *finfo)
 	//put the linux name for the port
 	for (ii = 0; ii < finfo->max_ports; ii++) {
 		struct net_device *dev;
+
+		/* An OH port keeps the userspace-supplied name, which is
+		 * printed with %s and handed to cdx_add_oh_iface(); userspace
+		 * need not have terminated it. */
+		port_info->name[CDX_CTRL_PORT_NAME_LEN - 1] = '\0';
 
 		if (port_info->type) {
 			dev = find_osdev_by_fman_params(port_info->fm_index,
@@ -363,25 +428,34 @@ static int get_port_info(struct cdx_fman_info *finfo)
 #endif
 		port_info++;
 	}
-	port_info = finfo->portinfo;
 	for (ii = 0; ii < finfo->max_ports; ii++) {
 		int retval;
 		//get dist info for this port
-		retval = get_dist_info(port_info);
+		retval = get_dist_info(&finfo->portinfo[ii], uspace_info, ii);
 		if (retval)
 			return retval;
-		port_info++;
 	}
 	return 0;
-}	
+}
 
 //allocate and copy cc table infor from uspace
-static int get_cctbl_info(struct cdx_fman_info *finfo) 
-{	
+static int get_cctbl_info(struct cdx_fman_info *finfo,
+		void __user *uspace_fmans, uint32_t fm_idx)
+{
+	struct cdx_fman_info __user *uf = uspace_fmans;
 	struct table_info *tbl_info;
 	uint32_t mem_size;
-	void *uspace_info;
+	uint32_t ii;
+	struct table_info *uspace_info;
 
+	/* finfo->tbl_info was NULLed by the caller; re-read the userspace
+	 * base from the original userspace fman entry (same reasoning as
+	 * get_port_info). */
+	if (get_user(uspace_info, &uf[fm_idx].tbl_info)) {
+		DPA_ERROR("%s::fetch tbl_info ptr failed fman %u\n",
+				__func__, fm_idx);
+		return -EFAULT;
+	}
 	if (finfo->num_tables > CDX_MAX_TABLES) {
 		DPA_ERROR("%s::invalid num_tables %u (cap %u)\n",
 				__func__, finfo->num_tables, CDX_MAX_TABLES);
@@ -396,13 +470,38 @@ static int get_cctbl_info(struct cdx_fman_info *finfo)
 				__func__);
 		return -ENOMEM;
 	}
-	uspace_info = finfo->tbl_info;
 	finfo->tbl_info = tbl_info;
-	//copy table related info from user space	
-	if (copy_from_user(tbl_info, (void *)uspace_info, mem_size)) {
+	//copy table related info from user space
+	if (copy_from_user(tbl_info, uspace_info, mem_size)) {
 		DPA_ERROR("%s::Read tbl_info failed\n",
 				__func__);
 		return -EIO;
+	}
+	/* Same as the distributions: tbl_info->id arrives as an FM_PCD
+	 * cookie, and dpa_type says which kind of node it names. Resolve
+	 * before storing: these ids are later handed to
+	 * FM_PCD_HashTableModifyMissNextEngine() and to the ExternalHash*
+	 * helpers via dpa_get_tdinfo(). */
+	for (ii = 0; ii < finfo->num_tables; ii++) {
+		uint32_t dpa_type = tbl_info[ii].dpa_type;
+		enum fm_pcd_cookie_type type =
+			((dpa_type == CDX_DPA_TBL_INTERNAL_HASH) ||
+			 (dpa_type == CDX_DPA_TBL_EXTERNAL_HASH)) ?
+				FM_PCD_COOKIE_HASH_TABLE : FM_PCD_COOKIE_CC_NODE;
+		t_Handle handle;
+
+		/* name[] is copied verbatim and several callers print it
+		 * with %s; userspace need not have terminated it. */
+		tbl_info[ii].name[TABLE_NAME_SIZE - 1] = '\0';
+
+		handle = fm_pcd_cookie_lookup(
+				(uint64_t)(uintptr_t)tbl_info[ii].id, type);
+		if (!handle) {
+			DPA_ERROR("%s::table %s: not a live type-%d cookie\n",
+					__func__, tbl_info[ii].name, (int)type);
+			return -EINVAL;
+		}
+		tbl_info[ii].id = handle;
 	}
 	return 0;
 }
@@ -536,6 +635,17 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 				__func__, finfo->pcd_handle);
 		return -1;
 	}
+	/* fget() only proves the fd is open. Confirm it is actually this
+	 * FMAN driver's /dev/fmX-pcd node before treating private_data as a
+	 * t_LnxWrpFmDev -- otherwise a foreign fd (socket, eventfd, a port
+	 * minor) would have its private_data reinterpreted at FMAN offsets
+	 * and read out as PCD/MURAM handles. */
+	if (!fm_file_is_pcd(fm_pcd_file)) {
+		DPA_ERROR("%s::fd %ld is not an fm-pcd device\n",
+				__func__, (unsigned long)finfo->pcd_handle);
+		fput(fm_pcd_file);
+		return -1;
+	}
 	//map it to wrapper dev
 	fm_wrapper_dev = (t_LnxWrpFmDev *)fm_pcd_file->private_data;
 	if (!fm_wrapper_dev) {
@@ -599,8 +709,21 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	DPA_INFO("%s::num fmans %d\n", __func__, num_fmans);
 #endif
 	//get fman info
-	if (copy_from_user(fman_info, (void *)params.fman_info,
-				(sizeof(struct cdx_fman_info) * num_fmans))) {
+	retval = copy_from_user(fman_info, (void *)params.fman_info,
+				(sizeof(struct cdx_fman_info) * num_fmans));
+	/* NULL every fman's portinfo/tbl_info sub-pointer now -- whether or
+	 * not the copy fully succeeded (a partial fault leaves some holding
+	 * userspace values). From here on release_cfg_info() only ever sees
+	 * NULL or kernel-owned pointers, no matter which err_ret fires:
+	 * before the per-fman loops, on a failure in one fman while later
+	 * fmans are unprocessed, or after get_port_info fails leaving the
+	 * same fman's tbl_info unset. get_port_info()/get_cctbl_info()
+	 * re-source each base from the userspace array (params.fman_info). */
+	for (ii = 0; ii < num_fmans; ii++) {
+		fman_info[ii].portinfo = NULL;
+		fman_info[ii].tbl_info = NULL;
+	}
+	if (retval) {
 		DPA_ERROR("%s::Read fman_info failed\n",
 				__func__);
 		retval = -EIO;
@@ -624,11 +747,11 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 
 	for (ii = 0; ii < num_fmans; ii++) {
 		//get port info
-		retval = get_port_info(finfo);
+		retval = get_port_info(finfo, params.fman_info, ii);
 		if (retval)
 			goto err_ret;
 		//get cc table info
-		retval = get_cctbl_info(finfo);
+		retval = get_cctbl_info(finfo, params.fman_info, ii);
 		if (retval)
 			goto err_ret;
 		finfo++;
