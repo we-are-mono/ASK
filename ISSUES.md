@@ -106,26 +106,29 @@ stale line refs) are folded into the archive one-liners.
   new struct field, deliberate change. Open (investigate; contrived
   trigger, low priority).
 
-- [ ] **A80.** cdx `dpa_control_mc.c` per-listener REMOVE clears member state
-  (`bIsValidEntry=0`, `tbl_entry=NULL`, count--) BEFORE checking the
-  `ExternalHashTableFmPcdHcSync` result, so a sync failure leaks the
-  `tbl_entry` and mis-decrements `uiListenerCnt` (latent: the query walker
-  was hardened to re-scan `bIsValidEntry` and ignore the counter).
-  **Investigated (2026-08-20): the obvious check-then-clear reorder is
-  unsafe and was NOT applied.** HC-sync can fail transiently (HC frame-pool
-  exhaustion, not just a wedge), so the fix must keep the entry reclaimable
-  on failure — but leaving `bIsValidEntry=1` lets a re-REMOVE re-enter the
-  first-listener surgery after `first_listener_entry` already advanced,
-  hitting a NULL `temp_entry->next` deref (:1295) → handler oops → orphaned
-  `ctrl.mutex` → all FCI hangs → reboot (worse than the leak). The
-  two-field state has no localized assignment satisfying
-  {no-leak, no-unsafe-free, no-crash-on-retry}. A correct fix needs a
-  quarantine/pending-free list drained when the HC channel recovers (the
-  in-tree `ExternalHashTableDeleteKey` sync-then-free discipline can't be
-  applied here because the surgery is destructive before the sync). The
-  current `return -1` abort-the-batch behavior is correct and unchanged (a
-  wedged HC fails every later member too). Open (investigate — needs the
-  pending-free design).
+- [ ] **A95.** Free-after-failed-DeleteKey sweep (A80's class on the non-mcast
+  paths): `ct_remove` (control_ipv4.c) frees both directions' `ct->handle`
+  unconditionally after a failed classifier delete, control_socket.c (2 sites)
+  and control_rtp_relay.c free the table entry after logging the failure, and
+  `delete_l2br_entry_classif_table` flattens `EN_EHASH_DELETE_UNSYNCED` to
+  FAILURE, losing the recoverable/unrecoverable distinction. Fix shape:
+  generalize the A80 quarantine out of `dpa_control_mc.c` (natural home
+  cdx_ehash.c) and make each caller tri-state-aware. Surfaced by the A80
+  audit. Open.
+
+- [ ] **A96.** `ExternalHashTableDeleteKey` (patch 010) sets
+  `EN_INVALID_CUMULATIVE_NODE` on a still-linked cumulative node before its
+  pre-unlink bail-outs (E_NO_MEMORY on the replacement node, the no-sibling
+  invalid case), leaving a permanently flagged live node; if the ucode honors
+  the bit, every co-resident key silently blackholes. Unwind the flag on the
+  bail paths (or prove the ucode ignores it and say so in-code). Pre-existing
+  NXP defect, surfaced by the A80 audit. Open (low).
+
+- [ ] **A97.** `cdx_delete_mcast_group_member`'s count-match full-delete path
+  returns NO_ERR even when `cdx_mcast_group_destroy` took a failure arm (the
+  destroy is void; failures are log-only). Whether the FCI caller should see
+  an error — cmm retry semantics against a software-gone group — is a design
+  decision. Surfaced by the A80 audit. Open (low).
 
 - [ ] **A85.** The FM_PCD `*Set`/`*Build` ioctls copy the raw kernel `t_Handle`
   pointer back to userspace in the reply (the value later handed to `*Delete`) —
@@ -782,5 +785,10 @@ file's git history.
   ERN cb fully unwinds software SGT FDs; bman-release scrub + bounded walks folded in.
 
 - [x] **A94.** `xfrm_output_one()` async `-EINPROGRESS` exit leaked the collected
-  offload vec refs — fixed (_this commit_, patch 040); unreachable under valid
+  offload vec refs — fixed (_466d0e7_, patch 040); unreachable under valid
   config, hardening only.
+
+- [x] **A80.** mcast REMOVE clear-before-HC-sync leak — fixed (_this commit_):
+  pending-free quarantine drained on the next successful sync; DeleteKey gained a
+  tri-state so pre-unlink failures leak loudly instead of deferred-freeing live
+  chains. Residue filed as A95-A97.

@@ -1,4 +1,4 @@
-From e4e579c4e0f2d2f4d644555dd84098a0e2979711 Mon Sep 17 00:00:00 2001
+From e38fa8874dc06783cde8d9bbe1acc202563c57d3 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -75,7 +75,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +---
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1505 +++++++++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1517 +++++++++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -113,7 +113,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 76 files changed, 7131 insertions(+), 2295 deletions(-)
+ 76 files changed, 7143 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -4471,7 +4471,7 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..2ce129461fcf
+index 000000000000..da8b8864b00f
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 @@ -0,0 +1,1211 @@
@@ -5289,7 +5289,7 @@ index 000000000000..2ce129461fcf
 +		XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +		if (FmPcdHcSync(info->pcd)) {
 +			printk("%s::FmPcdHcSync failed\n", __func__);
-+			return -1;
++			return EN_EHASH_DELETE_UNSYNCED;
 +		}
 +		return 0;
 +	}
@@ -5398,7 +5398,7 @@ index 000000000000..2ce129461fcf
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +				if (FmPcdHcSync(info->pcd)) {
 +					printk("%s::FmPcdHcSync failed\n", __func__);
-+					return -1;
++					return EN_EHASH_DELETE_UNSYNCED;
 +				}
 +				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
 +			}
@@ -5452,7 +5452,7 @@ index 000000000000..2ce129461fcf
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +					if (FmPcdHcSync(info->pcd)) {
 +						printk("%s::FmPcdHcSync failed\n", __func__);
-+						return -1;
++						return EN_EHASH_DELETE_UNSYNCED;
 +					}
 +					if (tmp_tbl_entry)
 +						ExternalHashTableCumulativeEntryFree(tmp_tbl_entry);
@@ -5470,9 +5470,9 @@ index 000000000000..2ce129461fcf
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +						if (FmPcdHcSync(info->pcd)) {
 +							printk("%s::FmPcdHcSync failed\n", __func__);
-+							return -1;
++							return EN_EHASH_DELETE_UNSYNCED;
 +						}
-+						ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);						
++						ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
 +					}
 +					else // no next node , no prev node , only table entry in node ==> invalid case
 +					{
@@ -5505,9 +5505,9 @@ index 000000000000..2ce129461fcf
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +					if (FmPcdHcSync(info->pcd)) {
 +						printk("%s::FmPcdHcSync failed\n", __func__);
-+						return -1;
++						return EN_EHASH_DELETE_UNSYNCED;
 +					}
-+					ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);						
++					ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
 +				}
 +			}
 +		}// match not found
@@ -6964,10 +6964,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..47d41ab60807
+index 000000000000..2d35f57a9d7b
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1505 @@
+@@ -0,0 +1,1517 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -8469,6 +8469,18 @@ index 000000000000..47d41ab60807
 +				struct en_tbl_entry_stats *stats);
 +extern int ExternalHashTableAddKey(void *h_HashTbl, uint8_t keySize,
 +				struct en_exthash_tbl_entry *tbl_entry);
++/* ExternalHashTableDeleteKey() return contract. 0 means the key was
++ * unlinked AND a host-command sync completed, so no ucode walker can
++ * still reach the entry -- the caller may free it. -1 means the key
++ * was NOT provably unlinked (invalid table state, allocation failure
++ * for a replacement cumulative node, or no matching node): the entry
++ * memory may still be referenced by a live chain and must be leaked,
++ * never freed -- not even later. EN_EHASH_DELETE_UNSYNCED means the
++ * unlink surgery completed but the sync failed (transient HC-channel
++ * exhaustion): the entry is out of the software chain but a walker
++ * that entered before the unlink is not proven gone, so the caller
++ * must defer the free until a later sync on the same PCD succeeds. */
++#define EN_EHASH_DELETE_UNSYNCED	(-2)
 +extern int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index,
 +				void *tbl_entry);
 +

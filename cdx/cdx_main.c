@@ -52,6 +52,16 @@ int  cdx_ipsec_init_key_zeroing_probe(void);
 void cdx_ipsec_remove_key_zeroing_probe(void);
 #endif
 
+#ifdef CDX_DEBUG_MC_HCSYNC_FAIL
+/* Multicast HC-sync fault-injection knob — see dpa_control_mc.c for
+ * design rationale. Forward-declared for the same reason as above:
+ * dpa_control_mc.h needs types this translation unit has not pulled in
+ * at this point in the include order.
+ */
+int  cdx_mc_init_hcsync_fail_probe(void);
+void cdx_mc_remove_hcsync_fail_probe(void);
+#endif
+
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -273,6 +283,12 @@ static int __init cdx_module_init(void)
 		register_cdx_deinit_func(cdx_ipsec_remove_key_zeroing_probe);
 	else
 		printk(KERN_WARNING "%s::cdx_ipsec_init_key_zeroing_probe failed\n", __func__);
+#endif
+#ifdef CDX_DEBUG_MC_HCSYNC_FAIL
+	if (cdx_mc_init_hcsync_fail_probe() == 0)
+		register_cdx_deinit_func(cdx_mc_remove_hcsync_fail_probe);
+	else
+		printk(KERN_WARNING "%s::cdx_mc_init_hcsync_fail_probe failed\n", __func__);
 #endif
 #ifdef START_DPA_APP
 	rc = start_dpa_app();

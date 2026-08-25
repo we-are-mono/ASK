@@ -53,6 +53,7 @@ import pytest_asyncio
 #   test_mcast_concurrent.py    241+         (ASK_MCAST_CONCURRENT_VID)
 #   test_mcast_replication.py   241/242/243  (VLAN_IDS_MCAST)
 #   test_vlan_failslab.py       251          (ASK_VLAN_FAILSLAB_VID)
+#   test_mcast_hcsync_quarantine.py 261..264 (ASK_MCAST_HCSYNC_BASE_VID)
 #   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
 #
 # Overlaps that are safe only because the pairs never run concurrently and

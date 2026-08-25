@@ -473,6 +473,8 @@ void hw_ct_get_active(struct hw_ct *ct)
 /* delete classif entry from table */
 int delete_entry_from_classif_table(PCtEntry entry)
 {
+	int rc;
+
 	if (!entry)
 	{
 		DPA_ERROR("%s:: Ct entry is NULL\n", __func__);
@@ -480,10 +482,19 @@ int delete_entry_from_classif_table(PCtEntry entry)
 	}
 
 	CDX_DPA_DPRINT("\n");
-	if (ExternalHashTableDeleteKey(entry->ct->td, 
-			entry->ct->index, entry->ct->handle)) {
+	rc = ExternalHashTableDeleteKey(entry->ct->td,
+			entry->ct->index, entry->ct->handle);
+	if (rc) {
                 DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
-		return FAILURE;
+		/* Propagate the DeleteKey contract (fm_ehash.h): FAILURE (-1)
+		 * means the key was not provably unlinked and the entry must be
+		 * leaked, never freed; EN_EHASH_DELETE_UNSYNCED means the
+		 * unlink happened but the HC barrier failed, so the free may be
+		 * deferred to a later successful sync. Both are nonzero, so
+		 * boolean callers are unaffected. On either, ct->handle and ct
+		 * stay allocated (this function's long-standing abort
+		 * discipline). */
+		return rc;
 	}
 	//free table entry
 	ExternalHashTableEntryFree(entry->ct->handle);

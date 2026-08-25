@@ -141,6 +141,16 @@ void mc6_exit(void);
 U16 M_mc4_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
 U16 M_mc6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd);
 
+#ifdef CDX_DEBUG_MC_HCSYNC_FAIL
+/* HC-sync fault-injection knob - see dpa_control_mc.c for the design
+ * rationale. Both functions exist only when CDX_DEBUG_MC_HCSYNC_FAIL is
+ * defined; the meta-ask test image sets it via CFG_FLAGS, production
+ * builds do not.
+ */
+int  cdx_mc_init_hcsync_fail_probe(void);
+void cdx_mc_remove_hcsync_fail_probe(void);
+#endif
+
 static inline u32 HASH_MC4(u32 destaddr)  // pass in IPv4 dest addr
 {
   u32 hash;

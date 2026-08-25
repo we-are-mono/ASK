@@ -16,12 +16,18 @@ PROVIDES = "kernel-module-cdx"
 # so olddefconfig strips it from .config — force it here.
 EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX=m"
 
-# H2 regression tripwire (test image only; production Armbian build never
-# sets this). cdx/Makefile forwards CFG_FLAGS into ccflags-y, so the macro
-# reaches the cdx_dpa_ipsec.c capture probe + the cdx_main.c init hook.
-# Without it, the probe code compiles to empty inlines and no procfs file
-# is created. See tools/tests/test_ipsec_key_zeroing.py.
-EXTRA_OEMAKE += "CFG_FLAGS=-DCDX_DEBUG_KEY_ZEROING=1"
+# Debug tripwires (test image only; production Armbian build never sets
+# these). cdx/Makefile forwards CFG_FLAGS into ccflags-y, so the macros
+# reach the probe bodies + their cdx_main.c init hooks. Without them the
+# probe code compiles out entirely and no procfs file is created.
+#   CDX_DEBUG_KEY_ZEROING    - cdx_dpa_ipsec.c freed-key snapshot;
+#                              see tools/tests/test_ipsec_key_zeroing.py
+#   CDX_DEBUG_MC_HCSYNC_FAIL - dpa_control_mc.c HC-sync fault injection;
+#                              see tools/tests/test_mcast_hcsync_quarantine.py
+# Single quotes are load-bearing: bitbake inlines EXTRA_OEMAKE verbatim
+# into the generated shell command, so without them the space would split
+# CFG_FLAGS across two make arguments and the second define would be lost.
+EXTRA_OEMAKE += "CFG_FLAGS='-DCDX_DEBUG_KEY_ZEROING=1 -DCDX_DEBUG_MC_HCSYNC_FAIL=1'"
 
 # Silence the [buildpaths] QA warning on the split kernel-module sub-package.
 # cdx.ko embeds a handful of TMPDIR-prefixed header paths in its .rodata
