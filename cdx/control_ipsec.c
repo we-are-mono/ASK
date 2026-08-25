@@ -57,30 +57,61 @@ static PSAEntry sa_alloc(void)
 	return (pSA);
 }
 
+/* Two SA-cache readers run OUTSIDE ctrl.mutex, both in atomic context:
+ * get_netdev_of_SA_by_fqid() walks by_fqid from the QMan portal dqrr
+ * callback (softirq, or hardirq via the portal ISR when portal NAPI is
+ * off), and cdx_get_to_sec_fq_handler() — the registered datapath hook —
+ * walks by_h from the DPAA submit paths (softirq). Both race the SA
+ * add/remove sites, which run in process context under ctrl.mutex and
+ * free the SAEntry right after unlinking. This irqsave spinlock closes
+ * both races: writers take it around every list mutation (by_h, by_spi,
+ * by_fqid — the by_spi wrap costs nothing at those sites and keeps the
+ * rule simple), the two atomic readers take it across their walk and
+ * copy out what they need before unlocking. Walkers already under
+ * ctrl.mutex are serialized against the writers by the mutex and stay
+ * lock-free. Never nests inside another lock; contention is nil
+ * (writers are SA install/teardown only). */
+static DEFINE_SPINLOCK(sa_cache_lock);
+
 static int sa_add(PSAEntry pSA)
 {
-	/* TODO
-	 * We should alloc A DPA Sec SA context here. - Rajendran 6 Oct  2016
-	 */
+	unsigned long irqflags;
+
+	spin_lock_irqsave(&sa_cache_lock, irqflags);
 	slist_add(&sa_cache_by_h[pSA->hash_by_h], &pSA->list_h);
 	slist_add(&sa_cache_by_spi[pSA->hash_by_spi], &pSA->list_spi);
+	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 
 	return NO_ERR;
 }
 
 void sa_remove_from_list_fqid(PSAEntry pSA)
 {
+	unsigned long irqflags;
 	U16 hash;
+
 	hash = (pSA->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1));
+	/* Once unlinked under the lock, no atomic walker can reach the
+	 * entry, so the frees that follow in the callers need no grace
+	 * period. */
+	spin_lock_irqsave(&sa_cache_lock, irqflags);
 	slist_remove(&sa_cache_by_fqid[hash], &pSA->list_fqid);
+	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 }
 static void sa_remove(PSAEntry pSA, U32 hash_by_h, U32 hash_by_spi)
 {
+	unsigned long irqflags;
+
 	L2_route_put(pSA->pRtEntry);
 	pSA->pRtEntry = NULL;
 
+	/* Unlink under the lock so the softirq by_h walker
+	 * (cdx_get_to_sec_fq_handler) can never hold this entry across the
+	 * release/free chain that follows. */
+	spin_lock_irqsave(&sa_cache_lock, irqflags);
 	slist_remove(&sa_cache_by_h[hash_by_h], &pSA->list_h);
 	slist_remove(&sa_cache_by_spi[hash_by_spi], &pSA->list_spi);
+	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 
 	/*
 	 * remove the table entry and free the Sec_SA context
@@ -417,9 +448,17 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 
 		}
 
-		/* maintaining SA table with cp_to_fqids */
-		slist_add(&sa_cache_by_fqid[(sa->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1))],
-				&sa->list_fqid);
+		/* maintaining SA table with cp_to_fqids; published under
+		 * sa_cache_lock so the dqrr walker never sees a half-linked
+		 * node. */
+		{
+			unsigned long irqflags;
+
+			spin_lock_irqsave(&sa_cache_lock, irqflags);
+			slist_add(&sa_cache_by_fqid[(sa->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1))],
+					&sa->list_fqid);
+			spin_unlock_irqrestore(&sa_cache_lock, irqflags);
+		}
 #ifdef CONTROL_IPSEC_DEBUG
 		printk("%s(%d) SA pointer %p, FQID hash %d, fqid %d(%x)\n",__func__,__LINE__,sa,
 				(sa->pSec_sa_context->to_cp_fqid & (NUM_SA_ENTRIES - 1)), sa->pSec_sa_context->to_cp_fqid,
@@ -509,29 +548,45 @@ static int IPsec_handle_DELETE_SA(U16 *p, U16 Length)
 
 }
 
+/* Called from the QMan portal dqrr callback (atomic context) — one of
+ * the two SA-cache readers outside ctrl.mutex (see sa_cache_lock's
+ * definition). The lock spans the whole walk: every SAEntry field read
+ * here (flags, pSec_sa_context, handle, netdev) is on memory the
+ * teardown path frees right after its locked unlink, so the values must
+ * be copied out before unlocking. The returned net_device's own
+ * lifetime is the SA teardown discipline's concern (NETDEV_UNREGISTER
+ * handling), not this lock's. */
 struct net_device *get_netdev_of_SA_by_fqid(uint32_t fqid,uint16_t *sagd_pkt)
 {
 	PSAEntry sa_ptr;
 	struct slist_entry *tmp;
+	struct net_device *netdev = NULL;
+	unsigned long irqflags;
 	uint16_t fqid_hash = (fqid & (NUM_SA_ENTRIES - 1));
 
+	spin_lock_irqsave(&sa_cache_lock, irqflags);
 	slist_for_each(sa_ptr,tmp,&sa_cache_by_fqid[fqid_hash],list_fqid)
 	{
 		if (sa_ptr->flags & SA_DELETE)
 		{
-			printk("%s(%d) SA marked for deletion , fqid %x, handle %x\n",
+			/* Skip just this SA: it is mid-teardown and its frame
+			 * queues are being retired. Other SAs sharing the
+			 * bucket must still resolve (aborting the whole walk
+			 * here used to drop unrelated SAs' packets for the
+			 * length of a neighbor's teardown). */
+			printk_ratelimited("%s(%d) SA marked for deletion , fqid %x, handle %x\n",
 					__func__,__LINE__,fqid, sa_ptr->handle);
-			return NULL;
+			continue;
 		}
-		/*printk("%s(%d) hash %d  fqid sa %d, arg fqid %d \n",
-			__func__,__LINE__,fqid_hash, sa_ptr->pSec_sa_context->to_cp_fqid , fqid); */
 		if (sa_ptr->pSec_sa_context->to_cp_fqid ==  fqid)
 		{
 			*sagd_pkt = sa_ptr->handle;
-			return sa_ptr->netdev;
+			netdev = sa_ptr->netdev;
+			break;
 		}
 	}
-	return NULL;
+	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
+	return netdev;
 }
 
 
@@ -555,8 +610,18 @@ static int IPsec_handle_FLUSH_SA(U16 *p, U16 Length)
 			sa_remove(pEntry, hash_key_sa_by_h, hash_key_sa_by_spi);
 		}
 	}
-	memset(sa_cache_by_h, 0, sizeof(struct slist_head)*NUM_SA_ENTRIES);
-	memset(sa_cache_by_spi, 0, sizeof(struct slist_head)*NUM_SA_ENTRIES);
+	{
+		unsigned long irqflags;
+
+		/* The per-SA removes above already emptied the lists; this
+		 * re-zero of the heads is belt-and-braces and still follows
+		 * the sa_cache_lock rule for list mutation so the softirq
+		 * walkers never observe an unlocked write. */
+		spin_lock_irqsave(&sa_cache_lock, irqflags);
+		memset(sa_cache_by_h, 0, sizeof(struct slist_head)*NUM_SA_ENTRIES);
+		memset(sa_cache_by_spi, 0, sizeof(struct slist_head)*NUM_SA_ENTRIES);
+		spin_unlock_irqrestore(&sa_cache_lock, irqflags);
+	}
 	return NO_ERR;
 }
 
@@ -1168,28 +1233,35 @@ static int M_ipsec_sa_timer(struct timer_entry_t *timer_node)
 }
 
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+/* The registered datapath hook (dpa_register_ipsec_fq_handler): called
+ * from the DPAA submit paths in softirq — the second SA-cache reader
+ * outside ctrl.mutex. The walk and every SAEntry deref happen under
+ * sa_cache_lock, and the fq pointer is copied out before unlocking. A
+ * teardown that wins the race after the unlock can still retire the
+ * frame queue while the caller is enqueuing; QMan then rejects the
+ * enqueue and the ERN/enqueue-failure unwinds handle the FRAME. The fq
+ * POINTER itself aims into the sainfo, whose free is deferred a full
+ * second behind the unlink (SA_CTX_RELEASE_TIMER_VAL) — that deferral,
+ * not a refcount, is what keeps a microsecond-scale post-unlock enqueue
+ * off freed memory. The SA_DELETE gate keeps mid-teardown SAs from
+ * being offered at all. */
 static struct qman_fq *cdx_get_to_sec_fq_handler(uint32_t handle)
 {
 	PSAEntry sa;
-	PDpaSecSAContext pSec_sa_context; 
+	struct qman_fq *fq = NULL;
+	unsigned long irqflags;
 
-#ifdef CDX_DPA_DEBUG	
+#ifdef CDX_DPA_DEBUG
 	net_crit_ratelimited("%s:: handle %d \n", __func__, handle);
-#endif 
+#endif
 
-	if ((sa = M_ipsec_sa_cache_lookup_by_h(handle ))== NULL) {
-		/* net_crit_ratelimited("%s:: could not find a SA with handle %d\n",__func__,handle); */
-		return NULL;
-	}
+	spin_lock_irqsave(&sa_cache_lock, irqflags);
+	sa = M_ipsec_sa_cache_lookup_by_h(handle);
+	if (sa && !(sa->flags & SA_DELETE) && sa->pSec_sa_context)
+		fq = get_to_sec_fq(sa->pSec_sa_context->dpa_ipsecsa_handle);
+	spin_unlock_irqrestore(&sa_cache_lock, irqflags);
 
-	pSec_sa_context =sa->pSec_sa_context; 
-#ifdef CDX_DPA_DEBUG	
-	net_crit_ratelimited("%s::SA %p context %p handle %d encryption Sec fqid is %d \n",__func__, 
-			sa, pSec_sa_context, handle, pSec_sa_context->to_sec_fqid) ; 
-#endif 
-
-	return get_to_sec_fq(pSec_sa_context->dpa_ipsecsa_handle); 
-
+	return fq;
 }
 #endif
 int ipsec_init(void)
@@ -1200,6 +1272,7 @@ int ipsec_init(void)
 	{
 		slist_head_init(&sa_cache_by_h[i]);
 		slist_head_init(&sa_cache_by_spi[i]);
+		slist_head_init(&sa_cache_by_fqid[i]);
 	}
 	/* TODO
 	 *  Here We need to add logic for following 

@@ -115,14 +115,6 @@ stale line refs) are folded into the archive one-liners.
   and re-add. Gating them needs per-path FCI reply-semantics decisions.
   Surfaced by the A95 audit. Open (low).
 
-- [ ] **A100.** `get_netdev_of_SA_by_fqid` (control_ipsec.c) walks the SA
-  caches from dqrr-callback (atomic) context without `ctrl.mutex`, racing SA
-  add/remove from the FCI/timer paths. A mutex can't be taken there — the fix
-  needs RCU or a spinlock conversion for the cache lists. (The other three
-  bullets originally filed here — the dead `SA_FREE_HASH_ENTRY` path, the
-  `M_ipsec_sa_timer` stats reuse, the NATT operand — are fixed.) Surfaced by
-  the A95 audit. Open.
-
 - [ ] **A101.** L2 bridge reset paths are stubs: `M_bridge_handle_reset` is a
   bare printk, `CMD_RX_L2BRIDGE_FLOW_RESET` is wired to `bridge_noop_handle`,
   and module exit never flushes the l2flow table (flows + hw entries leak on
@@ -810,6 +802,12 @@ file's git history.
   the replaced node leaks loudly; -1 now strictly means never-linked.
 
 - [x] **A96.** DeleteKey's pre-unlink bails left `EN_INVALID_CUMULATIVE_NODE`
-  set on a still-linked node — fixed (_this commit_): both arms restore the
+  set on a still-linked node — fixed (_2a13911_): both arms restore the
   flag before returning; the unsynced arms keep it on the replaced (unlinked)
   node, where it belongs.
+
+- [x] **A100.** SA caches walked from atomic context (dqrr `by_fqid`, the
+  datapath hook on `by_h`) racing `ctrl.mutex` writers — fixed (_this commit_,
+  a/b/d bullets in _2a13911_): one irqsave `sa_cache_lock` around every list
+  mutation and both atomic readers, copy-out before unlock; per-SA skip
+  replaces the bucket-wide SA_DELETE abort.
