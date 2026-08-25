@@ -619,6 +619,7 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 	struct hw_ct *hwct;
 	struct en_exthash_tbl_entry *natt_tbl_entry;
 	struct en_ehash_ipsec_preempt_op *ipsec_preempt_params;
+	int rc;
 
 	DPA_INFO("%s(%d) dir: %s , handle %x fqid %x\n",
 		__func__,__LINE__,(pSA->direction)?"INBOUND":"OUTBOUND",
@@ -647,20 +648,41 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 			
 	}
 	if ((pSA->ct) && (pSA->ct->handle)) {
-		if (ExternalHashTableDeleteKey(pSA->ct->td, 
-			pSA->ct->index, pSA->ct->handle)) {
+		/* The table entry belongs to cdx_ehash_delete_entry() on every
+		 * arm of the DeleteKey contract, so the teardown below runs
+		 * unconditionally instead of bailing out with the entry still
+		 * owned by nobody (ISSUES.md A95). hw_ct is pure software with
+		 * no hardware reference, so releasing it after a failed delete
+		 * is safe and leaves no stale pointer to a handle this SA no
+		 * longer owns.
+		 *
+		 * The rc is still reported as failure so the caller keeps its
+		 * contract: cdx_ipsec_release_sa_resources() sets
+		 * SA_FREE_HASH_ENTRY, whose deferred
+		 * cdx_ipsec_delete_fp_hash_entry() is now a guaranteed no-op
+		 * (pSA->ct is NULL), and the two control_ipsec.c callers ignore
+		 * the value. */
+		rc = cdx_ehash_delete_entry(pSA->ct->td, pSA->ct->index,
+				pSA->ct->handle);
+		if (rc)
 			DPA_ERROR("%s::unable to remove entry from hash table\n", __func__);
-			return -1;
-		}
-		ExternalHashTableEntryFree(pSA->ct->handle);
 		pSA->ct->handle =  NULL;
 		hwct = pSA->ct;
 		pSA->ct = NULL;
 		kfree(hwct);
-	}	 
+		/* Propagate the tri-state (negative on failure) rather than
+		 * flattening to -1; today's callers only test truthiness, so
+		 * this only preserves information. */
+		if (rc)
+			return rc;
+	}
 	return 0;
 }
 
+/* Deferred twin of the teardown above, for the SA release path that had
+ * to give up on the delete. cdx_ipsec_delete_fp_entry() now always
+ * clears pSA->ct, so this only ever fires for an SA that never reached
+ * that function. */
 static void cdx_ipsec_delete_fp_hash_entry(PSAEntry pSA)
 {
 	struct hw_ct *hwct;
@@ -671,7 +693,7 @@ static void cdx_ipsec_delete_fp_hash_entry(PSAEntry pSA)
 		hwct = pSA->ct;
 		pSA->ct = NULL;
 		kfree(hwct);
-	}	 
+	}
 	return;
 }
 

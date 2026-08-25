@@ -106,23 +106,48 @@ stale line refs) are folded into the archive one-liners.
   new struct field, deliberate change. Open (investigate; contrived
   trigger, low priority).
 
-- [ ] **A95.** Free-after-failed-DeleteKey sweep (A80's class on the non-mcast
-  paths): `ct_remove` (control_ipv4.c) frees both directions' `ct->handle`
-  unconditionally after a failed classifier delete, control_socket.c (2 sites)
-  and control_rtp_relay.c free the table entry after logging the failure, and
-  `delete_l2br_entry_classif_table` flattens `EN_EHASH_DELETE_UNSYNCED` to
-  FAILURE, losing the recoverable/unrecoverable distinction. Fix shape:
-  generalize the A80 quarantine out of `dpa_control_mc.c` (natural home
-  cdx_ehash.c) and make each caller tri-state-aware. Surfaced by the A80
-  audit. Open.
+- [ ] **A98.** `ExternalHashTableAddKey` (patch 010) publishes the replacement
+  cumulative node into the live bucket BEFORE its HC sync, then returns -1 on
+  sync failure with the caller's `tbl_entry` already linked — and every cdx
+  caller treats -1 as "not added" and `ExternalHashTableEntryFree`s it
+  (cdx_ehash.c ×5, cdx_dpa_ipsec.c ×1): a hardware UAF, the exact class A80/A95
+  fixed on the delete side. -1 is also indistinguishable from the never-linked
+  `E_ALREADY_EXISTS` case. Fix shape: tri-state AddKey like DeleteKey +
+  quarantine on the unsynced arm. Surfaced by the A95 audit. Open (high).
+
+- [ ] **A99.** Re-add-after-failed-delete duplicate-key residuals: the CT path
+  (DEL_FAILED latch) and the L2 bridge (tombstone) now refuse to re-add a key
+  whose delete failed pre-unlink, but control_socket.c's two update flows
+  (which also disagree on delete/create ordering between v4 and v6 — v6
+  transiently duplicates the key by design), `RTP_change_flow`, and
+  `IPsec_handle_SA_SET_TNL_ROUTE`'s unconditional re-push all discard the rc
+  and re-add. Gating them needs per-path FCI reply-semantics decisions.
+  Surfaced by the A95 audit. Open (low).
+
+- [ ] **A100.** IPsec control-path residuals from the A95 audit: (a)
+  `SA_FREE_HASH_ENTRY` + `cdx_ipsec_delete_fp_hash_entry` are provably dead
+  (the delete path always clears `pSA->ct` first) and the dead body would
+  double-dispose a helper-owned handle — delete both; (b) `M_ipsec_sa_timer`
+  ignores the stats rc and reuses one uninitialized `stats` across the walk
+  (can expire an SA off the previous SA's counters); (c)
+  `get_netdev_of_SA_by_fqid` walks the SA caches from dqrr-callback context
+  without `ctrl.mutex`; (d) `M_ipsec_get_matched_natt_tunnel` tests
+  `IS_NATT_SA(sa)` — the argument — where it means to test `pEntry`. Open.
+
+- [ ] **A101.** L2 bridge reset paths are stubs: `M_bridge_handle_reset` is a
+  bare printk, `CMD_RX_L2BRIDGE_FLOW_RESET` is wired to `bridge_noop_handle`,
+  and module exit never flushes the l2flow table (flows + hw entries leak on
+  unload). Open (low).
 
 - [ ] **A96.** `ExternalHashTableDeleteKey` (patch 010) sets
   `EN_INVALID_CUMULATIVE_NODE` on a still-linked cumulative node before its
   pre-unlink bail-outs (E_NO_MEMORY on the replacement node, the no-sibling
   invalid case), leaving a permanently flagged live node; if the ucode honors
   the bit, every co-resident key silently blackholes. Unwind the flag on the
-  bail paths (or prove the ucode ignores it and say so in-code). Pre-existing
-  NXP defect, surfaced by the A80 audit. Open (low).
+  bail paths (or prove the ucode ignores it and say so in-code). Because these
+  arms return -1 (not the unsynced -2), the A95 quarantine never engages and
+  the fault knob cannot surface them. Pre-existing NXP defect, surfaced by the
+  A80 audit. Open (low).
 
 - [ ] **A97.** `cdx_delete_mcast_group_member`'s count-match full-delete path
   returns NO_ERR even when `cdx_mcast_group_destroy` took a failure arm (the
@@ -788,7 +813,13 @@ file's git history.
   offload vec refs — fixed (_466d0e7_, patch 040); unreachable under valid
   config, hardening only.
 
-- [x] **A80.** mcast REMOVE clear-before-HC-sync leak — fixed (_this commit_):
+- [x] **A80.** mcast REMOVE clear-before-HC-sync leak — fixed (_5261828_):
   pending-free quarantine drained on the next successful sync; DeleteKey gained a
   tri-state so pre-unlink failures leak loudly instead of deferred-freeing live
   chains. Residue filed as A95-A97.
+
+- [x] **A95.** Free-after-failed-DeleteKey on the non-mcast paths (ct_remove,
+  socket, rtp, ipsec, l2br) — fixed (_this commit_): quarantine generalized to
+  cdx_ehash.c, a central `cdx_ehash_delete_entry()` owns handle disposition,
+  CT gets a no-reoffload latch and the bridge a tombstone on pre-unlink
+  failures. Residue filed as A98-A101.

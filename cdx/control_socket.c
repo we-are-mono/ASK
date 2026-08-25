@@ -595,15 +595,15 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 		pFlow->hw_flow->eeh_entry_handle =  NULL;
 		pFlow->hw_flow->eeh_entry_index = 0;
 
-		if (ExternalHashTableDeleteKey(td, 
-				eeh_entry_index, 
+		/* The table entry belongs to cdx_ehash_delete_entry() on
+		 * every arm of the DeleteKey contract - freeing it here after
+		 * a failed delete was a use-after-free (ISSUES.md A95). */
+		if (cdx_ehash_delete_entry(td, eeh_entry_index,
 				eeh_entry_handle)) {
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
 				__func__, __LINE__);
 		}
-		//free table entry
-		ExternalHashTableEntryFree(eeh_entry_handle);
-		
+
 		/* reflect changes to hardware flow */
 		// create an entry in ehash table
 		if(cdx_create_rtp_conn_in_classif_table(pFlow, pingress_socket, pEntry))
@@ -928,21 +928,30 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 		if(cdx_create_rtp_conn_in_classif_table(pFlow, pingress_socket, pEntry))
 		{
 			DPA_ERROR("%s(%d) error in creating eehash table entry\n", __func__, __LINE__);
+			/* The old entry was detached from the flow at the top of
+			 * this block, so this early return is the last chance to
+			 * dispose of it - bailing out straight to the caller
+			 * would leave it linked in the table with nothing left
+			 * pointing at it (ISSUES.md A95). */
+			if (cdx_ehash_delete_entry(td, eeh_entry_index,
+					eeh_entry_handle))
+			{
+				DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
+					__func__, __LINE__);
+			}
 			return ERR_SOCK_UPDATE_ERR;
 		}
 
-
-		if (ExternalHashTableDeleteKey(td, 
-				eeh_entry_index, 
+		/* The table entry belongs to cdx_ehash_delete_entry() on
+		 * every arm of the DeleteKey contract - freeing it here after
+		 * a failed delete was a use-after-free (ISSUES.md A95). */
+		if (cdx_ehash_delete_entry(td, eeh_entry_index,
 				eeh_entry_handle))
 		{
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
 				__func__, __LINE__);
 		}
-		//free table entry
-		ExternalHashTableEntryFree(eeh_entry_handle);
 
-		
 		if (cdx_rtp_set_hwinfo_fields(pFlow, pingress_socket) != 0)
 		{
 			DPA_ERROR("%s(%d) Error in setting rtp hwinfo fields.\n", __func__,__LINE__);

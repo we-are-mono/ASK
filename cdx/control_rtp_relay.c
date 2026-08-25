@@ -274,15 +274,16 @@ static int rtp_flow_add(PRTPflow pFlow, U32 hash, PSockEntry pFromSocket, PSockE
 /* remove a hardware flow entry from the packet engine hash */
 static void rtp_flow_unlink(struct _thw_rtpflow *hw_flow)
 {
-	if ((hw_flow->eeh_entry_handle) &&
-			(ExternalHashTableDeleteKey(hw_flow->td, 
-																	hw_flow->eeh_entry_index, hw_flow->eeh_entry_handle))) 
+	/* The table entry belongs to cdx_ehash_delete_entry() on every arm
+	 * of the DeleteKey contract (it tolerates a NULL handle); freeing it
+	 * here after a failed delete was a use-after-free (ISSUES.md A95).
+	 * The flow's own pointer is cleared regardless, so nothing can reach
+	 * the entry through software again. */
+	if (cdx_ehash_delete_entry(hw_flow->td, hw_flow->eeh_entry_index,
+			hw_flow->eeh_entry_handle))
 	{
 		DPA_ERROR("%s(%d)::unable to remove entry from hash table\n", __func__, __LINE__);
 	}
-	//free table entry
-	if (hw_flow->eeh_entry_handle)
-		ExternalHashTableEntryFree(hw_flow->eeh_entry_handle);
 	hw_flow->eeh_entry_handle =  NULL;
 }
 

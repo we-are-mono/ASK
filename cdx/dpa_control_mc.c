@@ -46,14 +46,15 @@ typedef union ucode_phyaddr_u {
  *   mc{4,6}grp_ids, max_mc{4,6}grp_ids
  *      - Allocated once at init, not mutated on the datapath;
  *        read-only after init.
- *   mc_pending_frees, mc_pending_free_cnt
- *      - Quarantine of listener table entries that are already out
- *        of the FMAN replication chain but not yet provably
- *        walker-free. No lock of its own: every touch happens from
- *        a mcast mutator - serialized by the FCI ctrl.mutex plus
- *        mc_mutators_mutex below - or from mc{4,6}_exit(), which
- *        runs at module unload with no handler in flight. The query
- *        walkers never see it, so no softirq-safe variant is needed.
+ *   cdx_ehash quarantine (cdx_ehash.c)
+ *      - Shared, cdx-wide backlog of table entries that are already
+ *        out of the FMAN replication chain but not yet provably
+ *        walker-free. This file only places entries into it and
+ *        retires them; the lock discipline (none of its own; the
+ *        mcast callers hold the FCI ctrl.mutex plus
+ *        mc_mutators_mutex below, mc{4,6}_exit() runs at module
+ *        unload with no handler in flight) is documented at the
+ *        implementation.
  *
  * Contexts:
  *   AddToMcastGrpList(), GetMcastGrp(), cdx_delete_mcast_group_*()
@@ -103,19 +104,22 @@ static inline bool mcast_action_is_mutator(uint16_t action)
 /*
  * HC-sync fault injection — DEBUG-ONLY, NOT FOR PRODUCTION.
  *
- * The quarantine below only ever engages when a host-command sync
- * fails, which on real hardware means a transient HC frame-pool
- * shortage or a wedged HC channel — neither reproducible on demand.
- * This knob makes the failure arm reachable from user space: write a
- * decimal count to /proc/cdx_mc_hcsync_fail and that many subsequent
- * HC barriers issued by this file report failure without touching the
- * hardware. Reading the file back reports the remaining armed count
- * and the number of entries currently quarantined.
+ * The quarantine only ever engages when a host-command sync fails,
+ * which on real hardware means a transient HC frame-pool shortage or a
+ * wedged HC channel — neither reproducible on demand. This knob makes
+ * the failure arm reachable from user space: write a decimal count to
+ * /proc/cdx_mc_hcsync_fail and that many subsequent HC barriers issued
+ * by this file report failure without touching the hardware. Reading
+ * the file back reports the remaining armed count and the current
+ * quarantine depth — the latter is cdx-wide, not mcast-only, since the
+ * backlog is shared (cdx_ehash.c); the sibling knob at
+ * /proc/fm_ehash_hcsync_fail arms the barriers inside
+ * ExternalHashTableDeleteKey and reads back only its own armed count.
  *
- * Only this file's barriers are affected; the ones inside
- * ExternalHashTableDeleteKey and the rest of cdx run untouched, so an
- * armed knob cannot corrupt classifier state that this file does not
- * own.
+ * Only this file's hand-issued barriers are affected here; the ones
+ * inside ExternalHashTableDeleteKey and the rest of cdx run untouched,
+ * so an armed knob cannot corrupt classifier state that this file does
+ * not own.
  *
  * Production (Armbian) builds DO NOT define CDX_DEBUG_MC_HCSYNC_FAIL.
  * The flag is set only in the meta-ask test image, and the probe
@@ -132,7 +136,11 @@ static atomic_t mc_hcsync_fail_countdown = ATOMIC_INIT(0);
 static struct proc_dir_entry *mc_hcsync_fail_proc;
 #endif /* CDX_DEBUG_MC_HCSYNC_FAIL */
 
-/* Single funnel for every FMAN host-command barrier this file issues.
+/* Single funnel for every FMAN host-command barrier this file issues by
+ * hand - i.e. the one that follows the open-coded listener splice.
+ * Barriers issued inside the shared ehash helpers (DeleteKey's internal
+ * sync, cdx_ehash_quarantine_drain()) are not routed through here and
+ * are not affected by this file's knob.
  * Returns 0 when the sync completed, non-zero when it did not. */
 static int mc_hcsync(void *td)
 {
@@ -149,125 +157,30 @@ static int mc_hcsync(void *td)
 	return ExternalHashTableFmPcdHcSync(td);
 }
 
-/* Pending-free quarantine (ISSUES.md A80).
+/* The pending-free quarantine this file used to own now lives in
+ * cdx_ehash.c (ISSUES.md A80, generalized by A95) - every classifier
+ * path needs the same backlog, and one successful sync on the single
+ * LS1046A PCD is a barrier for all of them, so a per-file backlog would
+ * be strictly worse. cdx_ehash_quarantine_entry() / _free_all() /
+ * _drain() / _abandon() are the entry points; the rationale and the
+ * lock discipline are documented there. Mcast semantics are unchanged:
+ * the listener splice below still parks on a failed barrier and still
+ * reclaims on the next successful one.
  *
- * A listener's en_exthash_tbl_entry is spliced out of the live FMAN
- * replication chain under the bucket spinlock, i.e. destructively and
- * before any barrier. ExternalHashTableFmPcdHcSync() is what proves
- * that a ucode walker which entered the chain before the splice has
- * left it; until one succeeds, the unlinked memory may still be
- * dereferenced by hardware, so it must not go back to the allocator.
- *
- * A failed sync therefore leaves an entry that can neither be freed
- * nor re-unlinked (the surgery is not idempotent - replaying it would
- * walk pointers that have already been advanced). Park it here
- * instead: software state for the member is cleared as usual, the
- * memory stays allocated but unreachable, and the backlog is released
- * the next time any sync on this PCD succeeds.
- *
- * One successful sync clears the whole backlog:
- * ExternalHashTableFmPcdHcSync() syncs the table handle's PCD, and
- * LS1046A runs a single FMAN PCD, so a success reached via any table
- * or any group is a valid barrier for every entry unlinked before it.
- */
-struct mc_pending_free {
-	struct list_head list;
-	void *tbl_entry;
-};
-
-static LIST_HEAD(mc_pending_frees);
-static unsigned int mc_pending_free_cnt;
-
-static void mc_quarantine_entry(void *tbl_entry)
-{
-	struct mc_pending_free *node;
-
-	if (!tbl_entry)
-		return;
-
-	node = kmalloc(sizeof(*node), GFP_KERNEL);
-	if (!node)
-	{
-		/* No safe alternative: the entry is already out of the
-		 * chain, so it can neither be freed without a barrier nor
-		 * reached again through members[]. Leak it - the same
-		 * outcome the code had before the quarantine existed - and
-		 * make the leak visible in the log. */
-		DPA_ERROR("%s::quarantine alloc failed, leaking tbl_entry %p\n",
-			  __func__, tbl_entry);
-		return;
-	}
-	node->tbl_entry = tbl_entry;
-	list_add_tail(&node->list, &mc_pending_frees);
-	/* WRITE_ONCE pairs with the debug proc reader's READ_ONCE - the
-	 * count is advisory there, but the store should not tear. */
-	WRITE_ONCE(mc_pending_free_cnt, mc_pending_free_cnt + 1);
-}
-
-/* Release the whole backlog. Callers must have just observed a
- * successful HC sync on this PCD, or be running at module exit where
- * the PCD teardown has already quiesced the FMAN. Calling it without
- * such a barrier reintroduces the use-after-free the quarantine
- * exists to prevent. */
-static void mc_quarantine_free_all(void)
-{
-	struct mc_pending_free *node, *tmp;
-
-	list_for_each_entry_safe(node, tmp, &mc_pending_frees, list)
-	{
-		list_del(&node->list);
-		ExternalHashTableEntryFree(node->tbl_entry);
-		kfree(node);
-	}
-	WRITE_ONCE(mc_pending_free_cnt, 0);
-}
-
-/* Module-exit disposition of a backlog no drain could clear. cdx does
- * NOT tear down the FMAN PCD on unload (sdk_fman owns it and stays
- * loaded), so there is no barrier here either: by this point every
- * group teardown has already retried the sync and failed, meaning the
- * HC channel is wedged and the ucode may still be walking the parked
- * memory. Leaking a handful of entries at rmmod (test images only;
- * cdx is never unloaded in production) is the only safe terminal
- * state. */
-static void mc_quarantine_abandon(void)
-{
-	if (mc_pending_free_cnt)
-		DPA_ERROR("%s::HC channel never recovered, leaking %u quarantined entries\n",
-			  __func__, mc_pending_free_cnt);
-}
-
-/* Retry the barrier for entries parked by an earlier failed sync. HC
- * failures are frequently transient (frame-pool exhaustion rather than
- * a wedged channel), so the reclaim attempt belongs on the next
- * mutator that touches the same PCD; a freshly created group never
- * issues one (its ADD path has no post-resolution hook), so a backlog
- * can outlive an ADD-only workload until the next UPDATE, REMOVE, or
- * DELETE - bounded and safe. No-op when nothing is pending, which is
- * the common case. */
-static void mc_quarantine_drain(void *td)
-{
-	if (list_empty(&mc_pending_frees))
-		return;
-
-	if (mc_hcsync(td))
-	{
-		DPA_ERROR("%s::FmPcdHcSync failed, %u entries still quarantined\n",
-			  __func__, mc_pending_free_cnt);
-		return;
-	}
-	mc_quarantine_free_all();
-}
+ * Note the drain barrier is issued by the shared helper, i.e. it is not
+ * routed through mc_hcsync() and the knob below cannot force it to
+ * fail. */
 
 #ifdef CDX_DEBUG_MC_HCSYNC_FAIL
 static int mc_hcsync_fail_show(struct seq_file *m, void *v)
 {
-	/* mc_pending_free_cnt is written only under the mutator
-	 * serialization; this reader is outside it, and an aligned
-	 * unsigned int cannot tear, so a plain snapshot is enough. */
+	/* The quarantine depth is cdx-wide, not mcast-only, and is written
+	 * only under the mutator serialization; this reader is outside it,
+	 * and an aligned unsigned int cannot tear, so a plain snapshot is
+	 * enough. */
 	seq_printf(m, "armed=%d pending=%u\n",
 		   atomic_read(&mc_hcsync_fail_countdown),
-		   READ_ONCE(mc_pending_free_cnt));
+		   cdx_ehash_quarantine_pending());
 	return 0;
 }
 
@@ -1113,7 +1026,7 @@ static void mc_quarantine_members(struct mcast_group_info *pMcastGrpInfo)
 	{
 		if (!pMcastGrpInfo->members[ii].bIsValidEntry)
 			continue;
-		mc_quarantine_entry(pMcastGrpInfo->members[ii].tbl_entry);
+		cdx_ehash_quarantine_entry(pMcastGrpInfo->members[ii].tbl_entry);
 		pMcastGrpInfo->members[ii].tbl_entry = NULL;
 		pMcastGrpInfo->members[ii].bIsValidEntry = 0;
 	}
@@ -1152,7 +1065,7 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		 * clear the quarantine backlog on the strength of that same
 		 * barrier. */
 		cdx_free_exthash_mcast_members(pMcastGrpInfo);
-		mc_quarantine_free_all();
+		cdx_ehash_quarantine_free_all();
 	}
 	else if (rc == EN_EHASH_DELETE_UNSYNCED)
 	{
@@ -1165,17 +1078,11 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 		 * (skipped here) is where it normally happens.
 		 *
 		 * The classifier's own table entry is in the same
-		 * unlinked-but-unsynced state as the members, so it is parked
-		 * the same way instead of being orphaned; the hw_ct wrapper is
-		 * pure software with no hardware reference and can go now. */
+		 * unlinked-but-unsynced state as the members; parking it, and
+		 * releasing its software-only hw_ct wrapper, is
+		 * delete_entry_from_classif_table()'s job (ISSUES.md A95). */
 		FreeMcastGrpID(pMcastGrpInfo->mctype, pMcastGrpInfo->grpid);
 		mc_quarantine_members(pMcastGrpInfo);
-		if (pMcastGrpInfo->pCtEntry->ct)
-		{
-			mc_quarantine_entry(pMcastGrpInfo->pCtEntry->ct->handle);
-			kfree(pMcastGrpInfo->pCtEntry->ct);
-			pMcastGrpInfo->pCtEntry->ct = NULL;
-		}
 	}
 	else
 	{
@@ -1198,14 +1105,10 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 			pMcastGrpInfo->members[ii].bIsValidEntry = 0;
 			leaked++;
 		}
-		/* The classifier's table entry leaks with the members (it may
-		 * still be linked); its software-only hw_ct wrapper does not
-		 * need to. */
-		if (pMcastGrpInfo->pCtEntry->ct)
-		{
-			kfree(pMcastGrpInfo->pCtEntry->ct);
-			pMcastGrpInfo->pCtEntry->ct = NULL;
-		}
+		/* The classifier's own table entry leaks with the members (it
+		 * may still be linked); delete_entry_from_classif_table()
+		 * already abandoned it and released its software-only hw_ct
+		 * wrapper. */
 		DPA_ERROR("%s::classifier delete failed pre-unlink (rc %d), leaking %u listener entries + the classifier entry\n",
 			  __func__, rc, leaked);
 	}
@@ -1304,7 +1207,7 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 	/* Reclaim anything a previous failed barrier left parked before
 	 * touching the chain again. Cheap: no-op unless something is
 	 * pending, and the group is resolved so the PCD handle is valid. */
-	mc_quarantine_drain(pMcastGrpInfo->pCtEntry->ct->td);
+	cdx_ehash_quarantine_drain(pMcastGrpInfo->pCtEntry->ct->td);
 
 	if((uiNoOfListeners +  pMcastGrpInfo->uiListenerCnt) > MC_MAX_LISTENERS_PER_GROUP)
 	{
@@ -1493,7 +1396,7 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 	/* Reclaim anything a previous failed barrier left parked before
 	 * touching the chain again. Cheap: no-op unless something is
 	 * pending, and the group is resolved so the PCD handle is valid. */
-	mc_quarantine_drain(pMcastGrpInfo->pCtEntry->ct->td);
+	cdx_ehash_quarantine_drain(pMcastGrpInfo->pCtEntry->ct->td);
 
 	mcast_grpd = pMcastGrpInfo->grpid;
 
@@ -1650,14 +1553,14 @@ int cdx_delete_mcast_group_member( void *mcast_cmd, int bIsIPv6)
 			 * property of the HC channel, not of this listener,
 			 * so every remaining member would fail the same way
 			 * and pile up more quarantined entries. */
-			mc_quarantine_entry(tbl_entry);
+			cdx_ehash_quarantine_entry(tbl_entry);
 			return -1;
 		}
 		ExternalHashTableEntryFree(tbl_entry);
 		/* That sync is a barrier for the whole PCD, not just this
 		 * entry - anything parked by an earlier failure is now
 		 * provably walker-free too, with no second round-trip. */
-		mc_quarantine_free_all();
+		cdx_ehash_quarantine_free_all();
 	}
 
 	tbl_entry = (struct en_exthash_tbl_entry *)pMcastGrpInfo->pCtEntry->ct->handle;
@@ -2027,7 +1930,9 @@ void mc4_exit(void)
 {
 	cdx_mcast_drain_grp_lists(mc4_grp_list, mc4_spinlocks,
 				  MC4_NUM_HASH_ENTRIES);
-	mc_quarantine_abandon();
+	/* No abandon here: later exits in the chain (ipsec/socket/ipv4/ipv6
+	 * resets) can still park entries, so the terminal disposition runs
+	 * once from cdx_ctrl_deinit() after the whole chain. */
 	if (mc4_spinlocks)
 	{
 		kfree(mc4_spinlocks);
@@ -2045,7 +1950,7 @@ void mc6_exit(void)
 {
 	cdx_mcast_drain_grp_lists(mc6_grp_list, mc6_spinlocks,
 				  MC6_NUM_HASH_ENTRIES);
-	mc_quarantine_abandon();
+	/* Terminal disposition runs once from cdx_ctrl_deinit(); see mc4_exit. */
 	if (mc6_spinlocks)
 	{
 		kfree(mc6_spinlocks);

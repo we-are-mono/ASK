@@ -62,6 +62,10 @@ int  cdx_mc_init_hcsync_fail_probe(void);
 void cdx_mc_remove_hcsync_fail_probe(void);
 #endif
 
+/* Quarantine terminal disposition (cdx_ehash.c) — forward-declared for the
+ * include-order reason above; the full contract lives in cdx_common.h. */
+void cdx_ehash_quarantine_abandon(void);
+
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -87,6 +91,11 @@ static void cdx_ctrl_deinit(void)
 
 	mutex_lock(&ctrl->mutex);
 	cdx_cmdhandler_exit();
+	/* Last on purpose: the exit chain above (ipsec/socket/ipv4/ipv6
+	 * resets included) can still park entries whose delete failed, so
+	 * the abandon must run after every subsystem's teardown, not from
+	 * an individual _exit hook partway down the chain. */
+	cdx_ehash_quarantine_abandon();
 	mutex_unlock(&ctrl->mutex);
 }
 

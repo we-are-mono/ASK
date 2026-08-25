@@ -95,9 +95,15 @@ static void l2flow_remove(struct L2Flow_entry *entry)
 #ifdef CONTROL_BRIDGE_DEBUG
 	display_flow_entry(entry);
 #endif
-	/* remove from hw tables */
-	if (delete_l2br_entry_classif_table(entry)) {
-		DPA_ERROR("%s::failed to remove entry\n",
+	/* remove from hw tables. On SUCCESS and on the unsynced-delete arm
+	 * the callee unlinks and frees the software flow (ISSUES.md A95),
+	 * so the bucket count drops with it. A hard FAILURE means the key
+	 * was not provably unlinked: the callee then leaves the flow fully
+	 * intact as a tombstone (blocks re-REGISTER of the same tuple, lets
+	 * a later DEREGISTER retry) - it is still in the bucket list, so
+	 * the count must NOT drop or the query snapshot sizing drifts. */
+	if (delete_l2br_entry_classif_table(entry) == FAILURE) {
+		DPA_ERROR("%s::hardware delete failed, flow retained as tombstone\n",
 				__func__);
 		return;
 	}

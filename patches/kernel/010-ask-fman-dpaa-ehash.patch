@@ -1,4 +1,4 @@
-From e38fa8874dc06783cde8d9bbe1acc202563c57d3 Mon Sep 17 00:00:00 2001
+From ff09904b2ee4a1cece2fa83fb700a3d3e288ec01 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -48,6 +48,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
  .../freescale/sdk_dpaa/offline_port.c         |   51 +
+ .../net/ethernet/freescale/sdk_fman/Kconfig   |   11 +
  .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |    9 +-
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
  .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
@@ -56,7 +57,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       |  766 +++------
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   24 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1211 +++++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1304 ++++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |    3 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    |   68 +
@@ -113,7 +114,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 76 files changed, 7143 insertions(+), 2295 deletions(-)
+ 77 files changed, 7247 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1930,6 +1931,28 @@ index 000caf70e00e..9332eb1259b9 100644
  
  	/* print of all referenced & created queues */
  	dump_oh_config(dpa_oh_dev, oh_config);
+diff --git a/drivers/net/ethernet/freescale/sdk_fman/Kconfig b/drivers/net/ethernet/freescale/sdk_fman/Kconfig
+index 3a6d1810b525..dee624569b48 100644
+--- a/drivers/net/ethernet/freescale/sdk_fman/Kconfig
++++ b/drivers/net/ethernet/freescale/sdk_fman/Kconfig
+@@ -16,6 +16,17 @@ config FSL_SDK_FMAN_TEST
+ 	help
+ 		This option compiles test code for FMan.
+ 
++config FSL_SDK_FMAN_EHASH_SYNC_FAULT
++	bool "Fault injection for external-hash DeleteKey HC syncs"
++	default n
++	help
++		Adds /proc/fm_ehash_hcsync_fail: writing a decimal N makes the
++		next N host-command syncs issued inside ExternalHashTableDeleteKey
++		report failure without touching hardware, so the
++		unlinked-but-unsynced delete paths and their caller-side
++		quarantine handling can be exercised deterministically.
++		Test images only; never enable in production.
++
+ config FSL_SDK_FMAN_RTC_API
+ 	bool "FMan RTC (1588 timer) APIs"
+ 	default n
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 index 80fb535231b9..69481886ea3a 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
@@ -4471,10 +4494,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..da8b8864b00f
+index 000000000000..68a163faed1f
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1211 @@
+@@ -0,0 +1,1304 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -4513,9 +4536,101 @@ index 000000000000..da8b8864b00f
 +extern void get_indexed_hash_bucket(uint8_t key_size,  uint8_t *key_ptr,
 +	        uint8_t crc_shift, uint16_t mask, uint16_t *bucket_index);
 +
++#ifdef CONFIG_FSL_SDK_FMAN_EHASH_SYNC_FAULT
++#include <linux/atomic.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/uaccess.h>
 +
++/* Test-only fault injection. /proc/fm_ehash_hcsync_fail arms a countdown
++ * of DeleteKey-internal HC syncs to report failure without touching
++ * hardware, so the unlinked-but-unsynced (EN_EHASH_DELETE_UNSYNCED)
++ * paths and the caller-side quarantine handling can be driven
++ * deterministically from a rig test. Scoped to the syncs
++ * ExternalHashTableDeleteKey issues itself - the standalone
++ * ExternalHashTableFmPcdHcSync() barrier is deliberately NOT covered, so
++ * a quarantine reclaim drain keeps working while the knob is armed.
++ * Compiled out unless the ASK test image's config fragment enables it. */
++static atomic_t ehash_hcsync_fail_countdown = ATOMIC_INIT(0);
++static struct proc_dir_entry *ehash_hcsync_fail_proc;
 +
-+static inline struct en_exthash_tbl_entry *find_entry_in_bucket(struct en_exthash_tbl_entry *entry, 
++static int ehash_hcsync_fail_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "armed=%d\n", atomic_read(&ehash_hcsync_fail_countdown));
++	return 0;
++}
++
++static int ehash_hcsync_fail_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, ehash_hcsync_fail_show, NULL);
++}
++
++static ssize_t ehash_hcsync_fail_write(struct file *file,
++		const char __user *buf, size_t len, loff_t *ppos)
++{
++	char kbuf[16];
++	unsigned int n;
++
++	if (len == 0 || len >= sizeof(kbuf))
++		return -EINVAL;
++	if (copy_from_user(kbuf, buf, len))
++		return -EFAULT;
++	kbuf[len] = '\0';
++	if (kstrtouint(strim(kbuf), 10, &n))
++		return -EINVAL;
++	if (n > (unsigned int)INT_MAX)
++		return -EINVAL;
++	atomic_set(&ehash_hcsync_fail_countdown, (int)n);
++	return len;
++}
++
++static const struct proc_ops ehash_hcsync_fail_proc_ops = {
++	.proc_open    = ehash_hcsync_fail_open,
++	.proc_read    = seq_read,
++	.proc_write   = ehash_hcsync_fail_write,
++	.proc_lseek   = seq_lseek,
++	.proc_release = single_release,
++};
++
++/* Lazily registered from ExternalHashTableSet. That is reached only via
++ * the FM_PCD_IOC_HASH_TABLE_SET ioctl, whose dispatch fm_ioctl() wraps
++ * in the global lnxwrp mutex - THAT serialization, not bring-up timing,
++ * is what makes the check-then-create below race-free (an in-kernel
++ * caller of the exported FM_PCD_HashTableSet would bypass it; none
++ * exists). sdk_fman is built-in and never unloads, so there is no
++ * removal path. */
++static void ehash_hcsync_fault_proc_init(void)
++{
++	if (ehash_hcsync_fail_proc)
++		return;
++	pr_warn_once("fm_ehash: CONFIG_FSL_SDK_FMAN_EHASH_SYNC_FAULT is on - /proc/fm_ehash_hcsync_fail can force DeleteKey sync failures; do not ship\n");
++	ehash_hcsync_fail_proc = proc_create("fm_ehash_hcsync_fail", 0600,
++					     NULL, &ehash_hcsync_fail_proc_ops);
++	if (!ehash_hcsync_fail_proc)
++		pr_err("fm_ehash: hcsync fault knob proc_create failed; injection unavailable\n");
++}
++
++static int ehash_delete_hcsync(struct en_exthash_info *info)
++{
++	/* atomic_dec_if_positive() returns the post-decrement value, so
++	 * >= 0 means a fail credit was consumed. */
++	if (atomic_dec_if_positive(&ehash_hcsync_fail_countdown) >= 0) {
++		printk("%s::injected DeleteKey HC-sync failure, %d left armed\n",
++		       __func__, atomic_read(&ehash_hcsync_fail_countdown));
++		return -1;
++	}
++	return FmPcdHcSync(info->pcd);
++}
++#else
++static inline void ehash_hcsync_fault_proc_init(void) {}
++
++static inline int ehash_delete_hcsync(struct en_exthash_info *info)
++{
++	return FmPcdHcSync(info->pcd);
++}
++#endif /* CONFIG_FSL_SDK_FMAN_EHASH_SYNC_FAULT */
++
++static inline struct en_exthash_tbl_entry *find_entry_in_bucket(struct en_exthash_tbl_entry *entry,
 +		uint8_t *key, uint32_t size)
 +{
 +	struct en_cumulative_tbl_entry *cumulative_tbl_node = (struct en_cumulative_tbl_entry *)entry;
@@ -4932,6 +5047,7 @@ index 000000000000..da8b8864b00f
 +	uint32_t gpp_table;
 +	uint32_t table_type;
 +
++	ehash_hcsync_fault_proc_init();
 +	p_Param->table_type &= TABLE_TYPE_MASK;
 +	switch (p_Param->table_type) {
 +		case IPV4_REASSM_TABLE:
@@ -5287,7 +5403,7 @@ index 000000000000..da8b8864b00f
 +		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		bucket->h = 0;
 +		XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+		if (FmPcdHcSync(info->pcd)) {
++		if (ehash_delete_hcsync(info)) {
 +			printk("%s::FmPcdHcSync failed\n", __func__);
 +			return EN_EHASH_DELETE_UNSYNCED;
 +		}
@@ -5396,7 +5512,7 @@ index 000000000000..da8b8864b00f
 +					bucket->h = phyaddr;
 +				}
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+				if (FmPcdHcSync(info->pcd)) {
++				if (ehash_delete_hcsync(info)) {
 +					printk("%s::FmPcdHcSync failed\n", __func__);
 +					return EN_EHASH_DELETE_UNSYNCED;
 +				}
@@ -5450,7 +5566,7 @@ index 000000000000..da8b8864b00f
 +							XX_PhysToVirt(SwapUint64(phyaddr)));
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+					if (FmPcdHcSync(info->pcd)) {
++					if (ehash_delete_hcsync(info)) {
 +						printk("%s::FmPcdHcSync failed\n", __func__);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}
@@ -5468,7 +5584,7 @@ index 000000000000..da8b8864b00f
 +						phyaddr = SwapUint64(XX_VirtToPhys(cumulative_tbl_entry->next_entry));
 +						bucket->h = phyaddr;
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+						if (FmPcdHcSync(info->pcd)) {
++						if (ehash_delete_hcsync(info)) {
 +							printk("%s::FmPcdHcSync failed\n", __func__);
 +							return EN_EHASH_DELETE_UNSYNCED;
 +						}
@@ -5503,7 +5619,7 @@ index 000000000000..da8b8864b00f
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.next_entry_addr = 0;
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+					if (FmPcdHcSync(info->pcd)) {
++					if (ehash_delete_hcsync(info)) {
 +						printk("%s::FmPcdHcSync failed\n", __func__);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}

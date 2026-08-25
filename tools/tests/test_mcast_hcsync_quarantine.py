@@ -28,6 +28,13 @@ barriers issued by dpa_control_mc.c report failure, read it back for the
 remaining armed count and the current quarantine depth. The test skips
 when the knob is absent, so it degrades gracefully on a production
 kernel build.
+
+Known exposure: since A95 the quarantine is cdx-wide, not mcast-only, so
+`pending` can be retired by any successful DeleteKey in the driver —
+including one from the CT aging kthread, which is ordered against these
+commands by ctrl.mutex but not against the /proc reads between them. A
+failure claiming an empty backlog where entries were expected is worth
+one re-run before being believed. See test_ct_hcsync_quarantine.py.
 """
 
 from __future__ import annotations
@@ -83,7 +90,7 @@ MCAST_LEAK_FILTER = [
     "cdx_add_mcast_table_entry",
     "cdx_free_exthash_mcast_members",
     "create_exthash_entry4mcast_member",
-    "mc_quarantine_entry",
+    "cdx_ehash_quarantine_entry",
 ]
 
 
@@ -218,10 +225,12 @@ async def test_mcast_hcsync_failure_quarantines_listener_entry(
     r = await _mc4(target_agent, aiohttp_session, CDX_MC_ACTION_ADD, listeners)
     assert r.get("reply_rc") == NO_ERR, f"seed ADD failed: {r!r}"
 
-    # Baseline. A backlog carried in from an earlier test would let the
-    # armed REMOVE below spend its fail credit on the recovery drain
-    # instead of on the surgery's own barrier, so establish pending=0
-    # with a REMOVE that is allowed to succeed. Group: 4 -> 3 members.
+    # Baseline. A backlog carried in from an earlier test would make the
+    # absolute pending assertions below meaningless, so establish
+    # pending=0 with a REMOVE that is allowed to succeed. (Since A95 the
+    # drain's barrier comes from the shared helper and is no longer
+    # routed through this file's knob, so it cannot spend a fail credit.)
+    # Group: 4 -> 3 members.
     r = await _mc4(target_agent, aiohttp_session,
                    CDX_MC_ACTION_REMOVE, [listeners[0]])
     assert r.get("reply_rc") == NO_ERR, f"baseline REMOVE failed: {r!r}"
