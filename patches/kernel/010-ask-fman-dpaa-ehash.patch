@@ -1,4 +1,4 @@
-From d514b4abd1a738ad0c8f40d6327d1a047a982e3e Mon Sep 17 00:00:00 2001
+From a7d9d895d08d17c340d65771c1993d209326782b Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -57,7 +57,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       |  766 +++------
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   24 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1313 ++++++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1323 ++++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |    3 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    |   68 +
@@ -114,7 +114,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 77 files changed, 7264 insertions(+), 2295 deletions(-)
+ 77 files changed, 7274 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -4494,10 +4494,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..81d15e9e0224
+index 000000000000..6ec1d9e082cc
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1313 @@
+@@ -0,0 +1,1323 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5473,6 +5473,12 @@ index 000000000000..81d15e9e0224
 +				{
 +					REPORT_ERROR(MAJOR, E_NO_MEMORY,
 +								 ("en_cumulative_entry"));
++					/* The invalid flag was applied above to a node
++					 * that stays linked on this bail-out; leaving
++					 * it set would blackhole every co-resident key
++					 * if the ucode honors the bit. Restore the
++					 * live state before returning. */
++					cumulative_entry->flags &= ~EN_INVALID_CUMULATIVE_NODE;
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +					return -1;
 +				}
@@ -5604,6 +5610,10 @@ index 000000000000..81d15e9e0224
 +						FM_EHASH_PRINT("%s(%d)no next node , no prev node , only table entry in node ==> invalid case\n",__func__,__LINE__);
 +						REPORT_ERROR(MAJOR, E_INVALID_STATE,
 +									 ("Invalid state"));
++						/* Same restore as the E_NO_MEMORY bail: the
++						 * node stays linked, so the invalid flag set
++						 * on entry to the match arm must not stick. */
++						cumulative_entry->flags &= ~EN_INVALID_CUMULATIVE_NODE;
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
 +						return -1;
 +					}

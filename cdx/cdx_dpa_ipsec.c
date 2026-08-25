@@ -656,12 +656,9 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 		 * is safe and leaves no stale pointer to a handle this SA no
 		 * longer owns.
 		 *
-		 * The rc is still reported as failure so the caller keeps its
-		 * contract: cdx_ipsec_release_sa_resources() sets
-		 * SA_FREE_HASH_ENTRY, whose deferred
-		 * cdx_ipsec_delete_fp_hash_entry() is now a guaranteed no-op
-		 * (pSA->ct is NULL), and the two control_ipsec.c callers ignore
-		 * the value. */
+		 * The rc is still reported (negative on failure) so callers can
+		 * log; none takes a different action on it - since the teardown
+		 * here is complete, there is nothing left to defer. */
 		rc = cdx_ehash_delete_entry(pSA->ct->td, pSA->ct->index,
 				pSA->ct->handle);
 		if (rc)
@@ -678,25 +675,6 @@ int cdx_ipsec_delete_fp_entry(PSAEntry pSA)
 	}
 	return 0;
 }
-
-/* Deferred twin of the teardown above, for the SA release path that had
- * to give up on the delete. cdx_ipsec_delete_fp_entry() now always
- * clears pSA->ct, so this only ever fires for an SA that never reached
- * that function. */
-static void cdx_ipsec_delete_fp_hash_entry(PSAEntry pSA)
-{
-	struct hw_ct *hwct;
-
-	if ((pSA->ct) && (pSA->ct->handle)) {
-		ExternalHashTableEntryFree(pSA->ct->handle);
-		pSA->ct->handle =  NULL;
-		hwct = pSA->ct;
-		pSA->ct = NULL;
-		kfree(hwct);
-	}
-	return;
-}
-
 
 static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 {
@@ -752,11 +730,6 @@ static int cdx_ipsec_release_sa_ctx_cbk(struct timer_entry_t *entry)
 		sa_remove_from_list_fqid(pSA);
 		return 0;
 	}
-	/* free hash table entry if rqd */
-	if (pSA->flags & SA_FREE_HASH_ENTRY)
-	{
-		cdx_ipsec_delete_fp_hash_entry(pSA);
-	}
 	/* delete from list_fq */
 	sa_remove_from_list_fqid(pSA);
 
@@ -775,11 +748,11 @@ void cdx_ipsec_release_sa_resources(PSAEntry pSA)
 {
 	int ii,ret;
 	pSA->flags |= SA_DELETE;
-	/* delete hash table entry */
-	if (cdx_ipsec_delete_fp_entry(pSA) ) {
-		/* if fails free hash entry memory in timer context */
-		pSA->flags |= SA_FREE_HASH_ENTRY;
-	}
+	/* Delete the hash table entry. On failure the callee has already
+	 * disposed of ct/handle under the ehash tri-state (quarantine or
+	 * loud leak) and cleared pSA->ct - nothing is deferred to the
+	 * release timer any more. */
+	cdx_ipsec_delete_fp_entry(pSA);
 
 	/* change frame queues states */
 	if ((pSA->pSec_sa_context) &&

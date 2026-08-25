@@ -110,15 +110,21 @@ void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa)
 	struct slist_entry *entry;
 	PSAEntry pEntry;
 
+	/* Only a NAT-T SA can have a NAT-T twin. */
+	if (!IS_NATT_SA(sa))
+		return NULL;
+
 	for (i = 0; i < NUM_SA_ENTRIES; i++)
 	{
 		slist_for_each(pEntry, entry, &sa_cache_by_h[i], list_h)
 		{
-			if (!IS_NATT_SA(sa))
+			/* Filter the CANDIDATE: a non-NAT-T entry's natt
+			 * fields are never initialized, so comparing them
+			 * below would read meaningless bytes. (This test
+			 * previously named `sa`, re-checking the argument
+			 * on every iteration and never filtering entries.) */
+			if (!IS_NATT_SA(pEntry))
 				continue;
-			/* This SA is under release process */
-			if (pEntry->flags & SA_FREE_HASH_ENTRY)
-				continue; 
 #ifdef CONTROL_IPSEC_DEBUG
 			printk("%x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x - %x:%x\n", \
 				pEntry->natt.sport,  sa->natt.sport, pEntry->natt.dport,  \
@@ -1084,13 +1090,25 @@ static int M_ipsec_sa_timer(struct timer_entry_t *timer_node)
 
 		slist_for_each(pEntry, entry, &sa_cache_by_h[i], list_h)
 		{
-			if ((pEntry->ct) && 
+			if ((pEntry->ct) &&
 					(pEntry->lft_conf.hard_byte_limit ||
 					 pEntry->lft_conf.hard_packet_limit ||
-					 pEntry->lft_conf.soft_packet_limit || 
+					 pEntry->lft_conf.soft_packet_limit ||
 					 pEntry->lft_conf.soft_byte_limit))
 			{
-				ExternalHashTableEntryGetStatsAndTS(pEntry->ct->handle, &stats);
+				/* stats is reused across the walk and the getter
+				 * only writes pkts/bytes when the entry has stats
+				 * enabled - without this reset an SA could be
+				 * expired off the PREVIOUS entry's counters (or
+				 * stack garbage on the first pass). Zeroed
+				 * counters make every limit comparison below
+				 * false, so a failed or stats-less read enforces
+				 * nothing - and the notify retry at the tail of
+				 * this loop still runs for every entry, which a
+				 * skip here would break. */
+				memset(&stats, 0, sizeof(stats));
+				ExternalHashTableEntryGetStatsAndTS(
+						pEntry->ct->handle, &stats);
 
 				if ((pEntry->state == SA_STATE_VALID ||
 							pEntry->state == SA_STATE_DYING) && 

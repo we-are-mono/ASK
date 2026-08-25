@@ -115,30 +115,19 @@ stale line refs) are folded into the archive one-liners.
   and re-add. Gating them needs per-path FCI reply-semantics decisions.
   Surfaced by the A95 audit. Open (low).
 
-- [ ] **A100.** IPsec control-path residuals from the A95 audit: (a)
-  `SA_FREE_HASH_ENTRY` + `cdx_ipsec_delete_fp_hash_entry` are provably dead
-  (the delete path always clears `pSA->ct` first) and the dead body would
-  double-dispose a helper-owned handle — delete both; (b) `M_ipsec_sa_timer`
-  ignores the stats rc and reuses one uninitialized `stats` across the walk
-  (can expire an SA off the previous SA's counters); (c)
-  `get_netdev_of_SA_by_fqid` walks the SA caches from dqrr-callback context
-  without `ctrl.mutex`; (d) `M_ipsec_get_matched_natt_tunnel` tests
-  `IS_NATT_SA(sa)` — the argument — where it means to test `pEntry`. Open.
+- [ ] **A100.** `get_netdev_of_SA_by_fqid` (control_ipsec.c) walks the SA
+  caches from dqrr-callback (atomic) context without `ctrl.mutex`, racing SA
+  add/remove from the FCI/timer paths. A mutex can't be taken there — the fix
+  needs RCU or a spinlock conversion for the cache lists. (The other three
+  bullets originally filed here — the dead `SA_FREE_HASH_ENTRY` path, the
+  `M_ipsec_sa_timer` stats reuse, the NATT operand — are fixed.) Surfaced by
+  the A95 audit. Open.
 
 - [ ] **A101.** L2 bridge reset paths are stubs: `M_bridge_handle_reset` is a
   bare printk, `CMD_RX_L2BRIDGE_FLOW_RESET` is wired to `bridge_noop_handle`,
   and module exit never flushes the l2flow table (flows + hw entries leak on
   unload). Open (low).
 
-- [ ] **A96.** `ExternalHashTableDeleteKey` (patch 010) sets
-  `EN_INVALID_CUMULATIVE_NODE` on a still-linked cumulative node before its
-  pre-unlink bail-outs (E_NO_MEMORY on the replacement node, the no-sibling
-  invalid case), leaving a permanently flagged live node; if the ucode honors
-  the bit, every co-resident key silently blackholes. Unwind the flag on the
-  bail paths (or prove the ucode ignores it and say so in-code). Because these
-  arms return -1 (not the unsynced -2), the A95 quarantine never engages and
-  the fault knob cannot surface them. Pre-existing NXP defect, surfaced by the
-  A80 audit. Open (low).
 
 - [ ] **A97.** `cdx_delete_mcast_group_member`'s count-match full-delete path
   returns NO_ERR even when `cdx_mcast_group_destroy` took a failure arm (the
@@ -817,5 +806,10 @@ file's git history.
 
 - [x] **A98.** AddKey published the replacement cumulative node before its sync,
   then returned -1 on sync failure — every caller freed the still-linked entry
-  (hardware UAF) — fixed (_this commit_): the add stands (returns the index),
+  (hardware UAF) — fixed (_334bb26_): the add stands (returns the index),
   the replaced node leaks loudly; -1 now strictly means never-linked.
+
+- [x] **A96.** DeleteKey's pre-unlink bails left `EN_INVALID_CUMULATIVE_NODE`
+  set on a still-linked node — fixed (_this commit_): both arms restore the
+  flag before returning; the unsynced arms keep it on the replaced (unlinked)
+  node, where it belongs.
