@@ -133,11 +133,6 @@ stale line refs) are folded into the archive one-liners.
   handle cookies (type+generation tokens) instead of raw pointers. Open (low;
   root-only).
 
-- [ ] **A90.** cdx sdk_dpaa `dpaa_submit_outb_pkt_to_SEC` and `dpa_ipsec_ern_cb`
-  share A89's SGT-recycle-with-stale-`opaque` / unreleased-DMA-map pattern
-  (untreated) — benign on LS1046A coherent DMA, would matter under an IOMMU.
-  Apply the A89 unwind for consistency. Surfaced by the A89 audit. Open (low).
-
 - [ ] **A94.** `xfrm_output_one()` async-crypto exit leaks the offload vec refs.
   In `net/xfrm/xfrm_output.c` (patch 040) the collected `xfrm_vec[]` offload refs are
   released only at `error_nolock`. Mainline's async path — `x->type->output` returning
@@ -793,3 +788,7 @@ file's git history.
   NULL") — root-caused and fixed (harness-only): the askd-agent's per-request
   flip of the *global* `failslab/ignore-gfp-wait` knob left sweeps running with
   GFP_KERNEL exempt. Fix: set it once at startup, arming read-verifies + fails loud.
+
+- [x] **A90.** A89's SGT-recycle siblings (`dpaa_submit_outb_pkt_to_SEC`,
+  `dpa_ipsec_ern_cb`) — fixed (_this commit_): outbound mirrors the A89 unwind, the
+  ERN cb fully unwinds software SGT FDs; bman-release scrub + bounded walks folded in.

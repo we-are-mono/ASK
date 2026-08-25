@@ -165,6 +165,9 @@ uint32_t ipsec_get_to_cp_fqid(void *handle)
 	return (((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_TO_CP].fqid);
 }
 
+extern struct dpa_bp *sg_bpool_g; // buffer reqd to frame SG list for skb fraglist
+extern struct dpa_bp *skb_2bfreed_bpool_g; //if no recyclable skbs exist in skb fraglist, those should be freed back, SEC engine will add to this bman pool
+
 /*
  * QMan Enqueue-Reject Notification on FQ_TO_SEC.
  *
@@ -177,7 +180,8 @@ uint32_t ipsec_get_to_cp_fqid(void *handle)
  *
  * Recycle the buffer back to its pool, count the rejection, and emit a
  * rate-gated dmesg line so the wedge is observable. Runs in QMan
- * portal-poll (softirq, no-sleep) — bman_release spinloops, no allocation.
+ * portal-poll (softirq, no-sleep) — bman_release spinloops, no allocation,
+ * and the skb free below uses the any-context variant.
  */
 static atomic_t dpa_ipsec_ern_count = ATOMIC_INIT(0);
 
@@ -195,6 +199,64 @@ static void dpa_ipsec_ern_cb(struct qman_portal *qm, struct qman_fq *fq,
 			fq->fqid, msg->ern.rc, fd->bpid,
 			(unsigned long long)qm_fd_addr_get64(fd), n);
 
+	/*
+	 * Software-built SGT FDs (dpaa_submit_{inb,outb}_pkt_to_SEC) carry
+	 * the skb_2bfreed pool's bpid and still own their skb and DMA
+	 * mappings when the enqueue is rejected: skb_fraglist_to_sg_fd()
+	 * stashed the skb pointer in the SGT's trailing opaque slot for
+	 * deferred freeing after SEC consumption, and mapped the SGT plus
+	 * every data segment DMA_TO_DEVICE. Hardware never consumed this
+	 * frame, so unwind it all here like the submitters' synchronous
+	 * enqueue-failure paths do: unmap, free the skb now (leaving it to
+	 * the deferred protocol would pin it in the pool buffer until the
+	 * next builder acquire, which may never come once traffic stops),
+	 * clear the opaque slot, and return the buffer to the clean SG pool.
+	 */
+	if (fd->format == qm_fd_sg && skb_2bfreed_bpool_g && sg_bpool_g &&
+	    fd->bpid == skb_2bfreed_bpool_g->bpid) {
+		struct qm_sg_entry *sgt = phys_to_virt(qm_fd_addr(fd));
+		struct device *dev = skb_2bfreed_bpool_g->dev;
+		struct sk_buff *skb;
+		int i, idx = 0;
+
+		/* Bounded walk to the final data entry. The builder caps data
+		 * entries at DPA_SGT_MAX_ENTRIES (final bit at most at index
+		 * DPA_SGT_MAX_ENTRIES - 1, opaque skb slot right after it), so
+		 * a final bit not found below that bound means a malformed
+		 * SGT whose opaque slot cannot be trusted. */
+		while (idx < DPA_SGT_MAX_ENTRIES &&
+		       !qm_sg_entry_get_final(&sgt[idx]))
+			idx++;
+		if (idx >= DPA_SGT_MAX_ENTRIES)
+			goto plain_release;
+
+		/* Builder mapped the SGT for (data entries + opaque) slots.
+		 * Unmap it first, then each data mapping straight from the
+		 * SGT's recorded addr/len (head entries were mapped with
+		 * dma_map_single, page frags with skb_frag_dma_map; the
+		 * unmap is the same operation for both). The exact mapping
+		 * device isn't recoverable per-frame here; the pool's dev
+		 * is the same coherent-DMA parent the submitters map with.
+		 */
+		dma_unmap_single(dev, qm_fd_addr(fd),
+				 sizeof(struct qm_sg_entry) * (idx + 2),
+				 DMA_TO_DEVICE);
+		for (i = 0; i <= idx; i++)
+			dma_unmap_page(dev, qm_sg_addr(&sgt[i]),
+				       qm_sg_entry_get_len(&sgt[i]),
+				       DMA_TO_DEVICE);
+		skb = (struct sk_buff *)sgt[idx + 1].opaque;
+		if (skb)
+			dev_kfree_skb_any(skb);
+		sgt[idx + 1].opaque = 0;
+		bmb.opaque = 0;
+		bm_buffer_set64(&bmb, qm_fd_addr(fd));
+		while (unlikely(bman_release(sg_bpool_g->pool, &bmb, 1, 0)))
+			cpu_relax();
+		return;
+	}
+
+plain_release:
 	bp = dpa_bpid2pool(fd->bpid);
 	if (bp) {
 		bmb.opaque = 0;
@@ -1051,9 +1113,6 @@ extern int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp,
 		uint32_t nbuffs, bool act_skb);
 #define CDX_MAX_SG_BUFF_SIZE 1024
 #define CDX_MAX_SG_BUFF_COUNT 512
-extern struct dpa_bp *sg_bpool_g; // buffer reqd to frame SG list for skb fraglist
-extern struct dpa_bp *skb_2bfreed_bpool_g; //if no recyclable skbs exist in skb fraglist, those should be freed back, SEC engine will add to this bman pool
-
 int cdx_init_skb_2bfreed_bpool(void)
 {
 	struct dpa_bp *bp, *bp_parent;

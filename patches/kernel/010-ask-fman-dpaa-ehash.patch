@@ -1,4 +1,4 @@
-From ca4824c25fa2ccdf7aa5484c7165ce88b5302604 Mon Sep 17 00:00:00 2001
+From e4e579c4e0f2d2f4d644555dd84098a0e2979711 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -43,7 +43,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   31 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
  .../freescale/sdk_dpaa/dpaa_eth_common.h      |   36 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  991 ++++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 1043 +++++++++++-
  .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
  .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
@@ -113,7 +113,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 76 files changed, 7079 insertions(+), 2295 deletions(-)
+ 76 files changed, 7131 insertions(+), 2295 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -121,7 +121,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  create mode 100644 include/linux/fsl_oh_port.h
 
 diff --git a/Makefile b/Makefile
-index 66ae67c52da8..a1d4113d3f65 100644
+index f3bacdc021a4..6a9fd1893b8f 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -130,6 +130,11 @@ export KBUILD_CLIPPY
@@ -595,7 +595,7 @@ index f46c243ff1b8..46816dcda3cb 100644
  
  #endif /* __DPAA_ETH_COMMON_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4164644d3268..73dfba23c3c8 100644
+index 4164644d3268..e2ecbf9ca2e8 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -53,6 +53,73 @@
@@ -899,7 +899,7 @@ index 4164644d3268..73dfba23c3c8 100644
  					   struct dpa_priv_s *priv)
  {
  	int trans_offset = skb_transport_offset(skb);
-@@ -882,8 +1046,229 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
+@@ -882,8 +1046,245 @@ static struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
  	put_page(npage);
  	return NULL;
  }
@@ -1031,21 +1031,37 @@ index 4164644d3268..73dfba23c3c8 100644
 +	   if any entries in skb_2bfreed_bpool_g, acquire and free skb and use the SG buffer */
 +	if (bman_acquire(skb_2bfreed_bpool_g->pool, &bmb, 1, 0) == 1)
 +	{
++		/* Scrub the acquire response's bpid/reserved high bits down to
++		 * the bare address: __bman_release() ORs the pool id into bits
++		 * 48-55 rather than overwriting them, so a mid-build error
++		 * release below would misroute the buffer to a foreign pool if
++		 * they came back nonzero. */
++		bmb.opaque = bmb.addr;
 +		sgt =  (struct qm_sg_entry *)phys_to_virt(bmb.addr);
-+		while (!qm_sg_entry_get_final(&sgt[sgt_index]))
++		/* Bounded walk: the builder never sets final past index
++		 * DPA_SGT_MAX_ENTRIES - 1. No final bit inside that bound
++		 * means a malformed layout whose opaque slot cannot be
++		 * trusted -- reuse the buffer (memset below) and skip the
++		 * deferred free. */
++		while (sgt_index < DPA_SGT_MAX_ENTRIES &&
++		       !qm_sg_entry_get_final(&sgt[sgt_index]))
 +			sgt_index++;
-+		addr = sgt[sgt_index+1].opaque;
-+		if (addr) /* free the old skb */
++		if (sgt_index < DPA_SGT_MAX_ENTRIES)
 +		{
-+			list_skb =  (struct sk_buff *)(addr);
-+			kfree_skb(list_skb);
++			addr = sgt[sgt_index+1].opaque;
++			if (addr) /* free the old skb */
++			{
++				list_skb =  (struct sk_buff *)(addr);
++				kfree_skb(list_skb);
++			}
++			sgt[sgt_index+1].opaque = 0; /* set to 0*/
 +		}
-+		sgt[sgt_index+1].opaque = 0; /* set to 0*/
 +	}
 +	else if (bman_acquire(sg_bpool_g->pool, &bmb, 1, 0) == 1)
 +	{
++		bmb.opaque = bmb.addr;	/* scrub high bits; see above */
 +		sgt =  (struct qm_sg_entry *)phys_to_virt(bmb.addr);
-+	} 
++	}
 +	else
 +	{
 +		printk("%s(%d) bman_acquire of SG bman buffer failed\n",
@@ -1129,7 +1145,7 @@ index 4164644d3268..73dfba23c3c8 100644
  int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  		       struct sk_buff *skb, struct qm_fd *fd)
  {
-@@ -1030,9 +1415,572 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
+@@ -1030,9 +1431,608 @@ int __hot skb_to_sg_fd(struct dpa_priv_s *priv,
  }
  EXPORT_SYMBOL(skb_to_sg_fd);
  
@@ -1312,10 +1328,41 @@ index 4164644d3268..73dfba23c3c8 100644
 +		if (unlikely(err < 0)) {
 +			struct bm_buffer bmb;
 +			dma_addr_t addr;
++			struct qm_sg_entry *sgt;
++			struct sk_buff *list_skb;
++			int sgt_entries, sgt_size;
 +
 +			printk("%s(%d) dpa_xmit failed\n",__func__,__LINE__);
-+			/* put the buffer back to sg pool */
++			/* The frame was never handed to hardware, so the driver
++			 * still owns the fully-built SGT FD and must unwind
++			 * everything skb_fraglist_to_sg_fd() mapped before the
++			 * buffer is recycled and the skb is freed below --
++			 * otherwise the DMA_TO_DEVICE mappings leak and the
++			 * skb data is freed while still mapped for the device.
++			 * Recompute the entry count / SGT size by re-walking
++			 * the (possibly linearized) skb exactly as the builder
++			 * did so they match the mappings actually created.
++			 * Unmap the SGT buffer itself, then each per-fragment
++			 * mapping, and clear the skb pointer stashed in the
++			 * trailing opaque slot so the recycled pool buffer
++			 * carries no stale reference. Same unwind as the
++			 * enqueue-failure path in dpaa_submit_inb_pkt_to_SEC().
++			 */
 +			addr = qm_fd_addr(&fd);
++			sgt = (struct qm_sg_entry *)phys_to_virt(addr);
++			sgt_entries = 1 + skb_shinfo(skb)->nr_frags;
++			skb_walk_frags(skb, list_skb)
++				sgt_entries += 1 + skb_shinfo(list_skb)->nr_frags;
++			sgt_size = sizeof(struct qm_sg_entry) * (sgt_entries + 1);
++			dma_unmap_single(dpa_bp->dev, addr, sgt_size, DMA_TO_DEVICE);
++			dma_unmap_skb_sg_addrs(dpa_bp->dev, skb, sgt, sgt_entries);
++			sgt[sgt_entries].opaque = 0;
++			/* put the buffer back to sg pool; zero bmb first --
++			 * __bman_release() ORs the pool id into the high bits
++			 * of the release command rather than overwriting them,
++			 * so stack garbage there would misroute the buffer to
++			 * a foreign pool. */
++			bmb.opaque = 0;
 +			bm_buffer_set64(&bmb, addr);
 +			while (bman_release(sg_bpool_g->pool, &bmb, 1, 0))
 +				cpu_relax();
@@ -1565,7 +1612,12 @@ index 4164644d3268..73dfba23c3c8 100644
 +			dma_unmap_single(dev, addr, sgt_size, DMA_TO_DEVICE);
 +			dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_entries);
 +			sgt[sgt_entries].opaque = 0;
-+			/* put the buffer back to sg pool */
++			/* put the buffer back to sg pool; zero bmb first --
++			 * __bman_release() ORs the pool id into the high bits
++			 * of the release command rather than overwriting them,
++			 * so stack garbage there would misroute the buffer to
++			 * a foreign pool. */
++			bmb.opaque = 0;
 +			bm_buffer_set64(&bmb, addr);
 +			while (bman_release(sg_bpool_g->pool, &bmb, 1, 0))
 +				cpu_relax();
@@ -1703,7 +1755,7 @@ index 4164644d3268..73dfba23c3c8 100644
  	int queue_mapping = dpa_get_queue_mapping(skb);
  	struct qman_fq *egress_fq, *conf_fq;
  
-@@ -1044,6 +1992,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1044,6 +2044,10 @@ int __hot dpa_tx(struct sk_buff *skb, struct net_device *net_dev)
  		return NETDEV_TX_OK;
  #endif
  
@@ -1714,7 +1766,7 @@ index 4164644d3268..73dfba23c3c8 100644
  	priv = netdev_priv(net_dev);
  
  #ifdef CONFIG_FSL_DPAA_CEETM
-@@ -1212,13 +2164,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
+@@ -1212,13 +2216,18 @@ int __hot dpa_tx_extended(struct sk_buff *skb, struct net_device *net_dev,
  		 * but we need the skb to look as if returned by build_skb().
  		 * We need to manually adjust the tailptr as well.
  		 */
@@ -10816,7 +10868,7 @@ index 12471f6f8597..ee0ada81f0ea 100644
  			"fmbm_rprai");
  		for (i = 0; i < FM_PORT_PRS_RESULT_NUM_OF_WORDS; ++i) {
 diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
-index ccf45ca2feb5..93bf0481c7ce 100644
+index 30585ef53ae3..b3109ef2d5b2 100644
 --- a/drivers/net/usb/usbnet.c
 +++ b/drivers/net/usb/usbnet.c
 @@ -31,6 +31,15 @@
@@ -11259,10 +11311,10 @@ index c42bde697436..68225db4d865 100644
  }
  #endif
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index 35b886385f32..44c1346c0077 100644
+index ea9b40b196de..c658c038556d 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
-@@ -2071,6 +2071,10 @@ struct net_device {
+@@ -2075,6 +2075,10 @@ struct net_device {
  	__cacheline_group_begin(net_device_read_rx);
  	struct bpf_prog __rcu	*xdp_prog;
  	struct list_head	ptype_specific;
@@ -11273,7 +11325,7 @@ index 35b886385f32..44c1346c0077 100644
  	int			ifindex;
  	unsigned int		real_num_rx_queues;
  	struct netdev_rx_queue	*_rx;
-@@ -3097,10 +3101,41 @@ u16 dev_pick_tx_zero(struct net_device *dev, struct sk_buff *skb,
+@@ -3102,10 +3106,41 @@ u16 dev_pick_tx_zero(struct net_device *dev, struct sk_buff *skb,
  int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev);
  int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id);
  
@@ -11315,7 +11367,7 @@ index 35b886385f32..44c1346c0077 100644
  
  static inline int dev_queue_xmit_accel(struct sk_buff *skb,
  				       struct net_device *sb_dev)
-@@ -5271,6 +5306,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
+@@ -5311,6 +5346,14 @@ extern struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
  
  extern struct net_device *blackhole_netdev;
  
@@ -11331,10 +11383,10 @@ index 35b886385f32..44c1346c0077 100644
  #define DEV_STATS_INC(DEV, FIELD) atomic_long_inc(&(DEV)->stats.__##FIELD)
  #define DEV_STATS_ADD(DEV, FIELD, VAL) 	\
 diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-index 7cf21f8ce51b..a5aaed9677f5 100644
+index 107a8c3ff07f..46498bc4a9b2 100644
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
-@@ -1034,6 +1034,13 @@ struct sk_buff {
+@@ -1028,6 +1028,13 @@ struct sk_buff {
  	};
  	__u32			priority;
  	int			skb_iif;
@@ -11348,7 +11400,7 @@ index 7cf21f8ce51b..a5aaed9677f5 100644
  	__u32			hash;
  	union {
  		u32		vlan_all;
-@@ -1057,6 +1064,14 @@ struct sk_buff {
+@@ -1051,6 +1058,14 @@ struct sk_buff {
  		__u32		reserved_tailroom;
  	};
  
@@ -11525,7 +11577,7 @@ index f87aaf28a649..b21fa5669175 100644
  struct sockaddr_nl {
  	__kernel_sa_family_t	nl_family;	/* AF_NETLINK	*/
 diff --git a/net/Kconfig b/net/Kconfig
-index 5b3c54974d06..f41e7658b445 100644
+index a629f92dc86b..020d6dd73bca 100644
 --- a/net/Kconfig
 +++ b/net/Kconfig
 @@ -125,6 +125,15 @@ config INET
@@ -11545,7 +11597,7 @@ index 5b3c54974d06..f41e7658b445 100644
  source "net/ipv6/Kconfig"
  source "net/netlabel/Kconfig"
 diff --git a/net/core/dev.c b/net/core/dev.c
-index cfd32bd02a69..33389c965fe1 100644
+index ce5a1ab86ab5..1aab6f06d9eb 100644
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -172,6 +172,10 @@ static int call_netdevice_notifiers_extack(unsigned long val,
@@ -11559,7 +11611,7 @@ index cfd32bd02a69..33389c965fe1 100644
  static DEFINE_MUTEX(ifalias_mutex);
  
  /* protects napi_hash addition/deletion and napi_gen_id */
-@@ -3758,10 +3762,17 @@ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device
+@@ -3788,10 +3792,17 @@ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device
  			skb = segs;
  		}
  	} else {
@@ -11581,7 +11633,7 @@ index cfd32bd02a69..33389c965fe1 100644
  		/* If packet is not checksummed and device does not
  		 * support checksumming for this protocol, complete
  		 * checksumming here.
-@@ -4544,6 +4555,44 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
+@@ -4587,6 +4598,44 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
  }
  EXPORT_SYMBOL(__dev_queue_xmit);
  
@@ -11626,7 +11678,7 @@ index cfd32bd02a69..33389c965fe1 100644
  int __dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
  {
  	struct net_device *dev = skb->dev;
-@@ -5552,6 +5601,14 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
+@@ -5595,6 +5644,14 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
  
  	trace_netif_receive_skb(skb);
  
@@ -11641,7 +11693,7 @@ index cfd32bd02a69..33389c965fe1 100644
  	orig_dev = skb->dev;
  
  	skb_reset_network_header(skb);
-@@ -6893,8 +6950,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
+@@ -6936,8 +6993,6 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
  		napi_gro_flush(n, HZ >= 1000);
  	}
  
@@ -11650,7 +11702,7 @@ index cfd32bd02a69..33389c965fe1 100644
  	/* Some drivers may have called napi_schedule
  	 * prior to exhausting their budget.
  	 */
-@@ -11045,10 +11100,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
+@@ -11093,10 +11148,44 @@ struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev,
  			storage->rx_otherhost_dropped += READ_ONCE(core_stats->rx_otherhost_dropped);
  		}
  	}
@@ -11696,10 +11748,10 @@ index cfd32bd02a69..33389c965fe1 100644
   *	dev_fetch_sw_netstats - get per-cpu network device statistics
   *	@s: place to store stats
 diff --git a/net/core/gro.c b/net/core/gro.c
-index 0ad549b07e03..6e1c5724b7f5 100644
+index 1a239b44916e..189744f7d9c3 100644
 --- a/net/core/gro.c
 +++ b/net/core/gro.c
-@@ -648,6 +648,11 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
+@@ -664,6 +664,11 @@ static void napi_reuse_skb(struct napi_struct *napi, struct sk_buff *skb)
  	__vlan_hwaccel_clear_tag(skb);
  	skb->dev = napi->dev;
  	skb->skb_iif = 0;
@@ -11712,10 +11764,10 @@ index 0ad549b07e03..6e1c5724b7f5 100644
  	/* eth_type_trans() assumes pkt_type is PACKET_HOST */
  	skb->pkt_type = PACKET_HOST;
 diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
-index 28ef506b10b0..6cb079932c23 100644
+index 625f273aeeed..a13e87558d0e 100644
 --- a/net/core/rtnetlink.c
 +++ b/net/core/rtnetlink.c
-@@ -800,9 +800,17 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
+@@ -884,9 +884,17 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
  	struct nlattr *mx;
  	int i, valid = 0;
  
@@ -11733,7 +11785,7 @@ index 28ef506b10b0..6cb079932c23 100644
  
  	mx = nla_nest_start_noflag(skb, RTA_METRICS);
  	if (mx == NULL)
-@@ -832,6 +840,17 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
+@@ -916,6 +924,17 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
  			}
  			valid++;
  		}
@@ -11752,10 +11804,10 @@ index 28ef506b10b0..6cb079932c23 100644
  
  	if (!valid) {
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index 578513eb738e..e78754b2ed98 100644
+index dcb5d025dc08..b76f9c813689 100644
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -1552,18 +1552,32 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+@@ -1529,18 +1529,32 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
  	skb_dst_copy(new, old);
  	__skb_ext_copy(new, old);
  	__nf_copy(new, old, false);
@@ -11788,7 +11840,7 @@ index 578513eb738e..e78754b2ed98 100644
  	CHECK_SKB_FIELD(vlan_proto);
  	CHECK_SKB_FIELD(vlan_tci);
  	CHECK_SKB_FIELD(transport_header);
-@@ -6133,7 +6147,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+@@ -6157,7 +6171,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
  	skb->skb_iif = 0;
  	skb->ignore_df = 0;
  	skb_dst_drop(skb);
