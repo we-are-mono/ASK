@@ -1,4 +1,4 @@
-From 7295bd43fe80d558589769cb5316987d356b317c Mon Sep 17 00:00:00 2001
+From f2d1e600520fe10bcf08893ddf084c5164c470ae Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -39,11 +39,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/ipsec_flow.c        | 231 +++++++++
  net/xfrm/ipsec_flow.h        |  31 ++
  net/xfrm/xfrm_input.c        |  20 +
- net/xfrm/xfrm_output.c       |  95 ++++
+ net/xfrm/xfrm_output.c       | 114 +++++
  net/xfrm/xfrm_policy.c       |  90 ++++
  net/xfrm/xfrm_state.c        | 218 +++++++++
  net/xfrm/xfrm_user.c         |   4 +
- 18 files changed, 1664 insertions(+), 7 deletions(-)
+ 18 files changed, 1683 insertions(+), 7 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -1560,7 +1560,7 @@ index 5d3633ce6ba3..8e4f6b42c6fb 100644
  		spin_lock(&x->lock);
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index a5b5d82bd755..7986169033d7 100644
+index a5b5d82bd755..be5729975dfd 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
 @@ -67,6 +67,10 @@ static int xfrm4_transport_output(struct xfrm_state *x, struct sk_buff *skb)
@@ -1648,7 +1648,35 @@ index a5b5d82bd755..7986169033d7 100644
  		err = xfrm_skb_check_space(skb);
  		if (err) {
  			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-@@ -561,6 +606,9 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
+@@ -551,8 +596,27 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
+ 			skb->encapsulation = 0;
+ 
+ 			err = x->type->output(x, skb);
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++			if (err == -EINPROGRESS) {
++				/* Async crypto suspends the walk here and the
++				 * completion re-enters xfrm_output_one() with a
++				 * fresh invocation whose xfrm_vec starts empty,
++				 * so any offload refs collected by THIS
++				 * invocation would leak. Such a mixed bundle
++				 * (offloaded inner SA + software outer SA going
++				 * async) cannot occur under the whole-flow
++				 * offload model, so releasing the refs -- not
++				 * transferring them to the sec_path -- is the
++				 * correct hardening for the invalid case.
++				 */
++				for (i = 0; i < xfrm_nr; i++)
++					xfrm_state_put(xfrm_vec[i]);
++				goto out;
++			}
++#else
+ 			if (err == -EINPROGRESS)
+ 				goto out;
++#endif
+ 		}
+ 
+ resume:
+@@ -561,6 +625,9 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
  			goto error_nolock;
  		}
  
@@ -1658,7 +1686,7 @@ index a5b5d82bd755..7986169033d7 100644
  		dst = skb_dst_pop(skb);
  		if (!dst) {
  			XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-@@ -571,11 +619,40 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
+@@ -571,11 +638,40 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
  		x = dst->xfrm;
  	} while (x && !(x->outer_mode.flags & XFRM_MODE_FLAG_TUNNEL));
  
@@ -1699,7 +1727,7 @@ index a5b5d82bd755..7986169033d7 100644
  	kfree_skb(skb);
  out:
  	return err;
-@@ -866,10 +943,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -866,10 +962,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  
@@ -1720,7 +1748,7 @@ index a5b5d82bd755..7986169033d7 100644
  }
  
  #if IS_ENABLED(CONFIG_IPV6)
-@@ -914,10 +1001,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -914,10 +1020,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  
