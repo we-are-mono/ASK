@@ -848,7 +848,7 @@ void *dpa_get_pcdhandle(uint32_t fm_index)
 	uint32_t ii;
 
 	finfo =  fman_info;
-	for (ii = 0; ii < num_fmans; ii++) {
+	for (ii = 0; ii < num_fmans; ii++, finfo++) {
 		if (finfo->index == fm_index) {
 			return finfo->pcd_handle;
 		}
