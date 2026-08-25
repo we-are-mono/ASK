@@ -740,6 +740,57 @@ static int IPsec_handle_SA_SET_NATT(U16 *p, U16 Length)
 }
 
 
+#ifdef CDX_DEBUG_IPSEC_TEST_XFRM
+#include <linux/socket.h>	/* AF_INET / AF_INET6 */
+#include <linux/in.h>		/* IPPROTO_ESP */
+#include <linux/netdevice.h>	/* struct net_device */
+#include <net/net_namespace.h>	/* dev_net */
+#include <net/xfrm.h>		/* xfrm_state_lookup, xfrm_address_t */
+
+/*
+ * TEST-ONLY, NOT FOR PRODUCTION (meta-ask test image only; ISSUES.md H5).
+ *
+ * Production resolves an SA's kernel xfrm_state by handle alone
+ * (cdx_get_xfrm_state_of_sa -> xfrm_state_lookup_byhandle), the handle
+ * being the sagd strongSwan stamped into the state. A synthetic FCI SA
+ * (no strongSwan) has no such state, so its push always fails the gate
+ * below and cdx_ipsec_delete_fp_entry nulls its ct -- which makes the
+ * NAT-T per-flow SPI-array path (cdx_dpa_ipsec.c:2290..2322) unreachable
+ * to a host-only test: no same-flow SA ever keeps a populated ct for the
+ * next to accumulate against.
+ *
+ * This fallback lets a test that pre-created a matching `ip xfrm state`
+ * (same daddr + spi, proto ESP) clear the gate with a genuine, ref-held
+ * xfrm_state, so the SPI-array fill and the :2322 bounds check run as
+ * real code under a real ref. Nothing else changes: the bounds check and
+ * all NAT-T bookkeeping remain the production paths.
+ *
+ * Byte order: sa->id.spi is host-order (the CREATE spi copied verbatim
+ * on LE; cf. the un-converted spi_param[].spi store at
+ * cdx_dpa_ipsec.c:2332), whereas xfrm_state_lookup matches x->id.spi
+ * which the kernel holds as the on-wire __be32 -- hence cpu_to_be32().
+ * sa->id.daddr already holds the address network-order (its union aliases
+ * xfrm_address_t). Inbound only: the if-branch reaching :2322 is inbound
+ * (cdx_dpa_ipsec.c:2316), keyed on daddr.
+ *
+ * Ref discipline: xfrm_state_lookup takes a reference
+ * (__xfrm_state_lookup -> xfrm_state_hold_rcu), exactly like the
+ * by-handle path, so the existing puts (route-repush put below, final
+ * release via cdx_dpa_ipsec_xfrm_state_dec_ref_cnt) stay balanced.
+ */
+static void *cdx_test_xfrm_lookup_by_sa(PSAEntry sa)
+{
+	unsigned short family;
+
+	if (!sa->netdev)
+		return NULL;
+	family = (sa->family == PROTO_IPV4) ? AF_INET : AF_INET6;
+	return xfrm_state_lookup(dev_net((struct net_device *)sa->netdev), 0,
+				 (const xfrm_address_t *)&sa->id.daddr,
+				 cpu_to_be32(sa->id.spi), IPPROTO_ESP, family);
+}
+#endif /* CDX_DEBUG_IPSEC_TEST_XFRM */
+
 static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 {
 	void *xfrm_state;
@@ -764,6 +815,14 @@ static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 	 * classify traffic into a SEC context with no xfrm state to handle
 	 * the exceptions it raises. */
 	xfrm_state = cdx_get_xfrm_state_of_sa(sa->netdev, sa->handle);
+#ifdef CDX_DEBUG_IPSEC_TEST_XFRM
+	/* Test image only: fall back to a real by-SPI xfrm lookup so a
+	 * synthetic NAT-T SA whose matching `ip xfrm state` was pre-created
+	 * clears this gate with a ref-held state, making the H5 SPI-array
+	 * path reachable. See cdx_test_xfrm_lookup_by_sa above. */
+	if (!xfrm_state)
+		xfrm_state = cdx_test_xfrm_lookup_by_sa(sa);
+#endif
 	if (!xfrm_state)
 	{
 		printk(KERN_ERR "%s(%d) : cdx_get_xfrm_state_of_sa failed\n",

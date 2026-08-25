@@ -34,6 +34,9 @@ re-learn the wrong lesson:
 
 from __future__ import annotations
 
+import json
+import os
+import socket
 import struct
 from dataclasses import dataclass
 
@@ -347,3 +350,134 @@ async def cleanup_sa(target_agent, aiohttp_session, sagd: int) -> None:
         aiohttp_session, fcode=CMD_IPSEC_SA_DELETE,
         length=4, payload=delete_sa(sagd), timeout_ms=2000,
     )
+
+
+# ---------------------------------------------------------------- DUT-local addr
+
+def ipv4_to_daddr_int(ip_str: str) -> int:
+    """Convert a dotted-quad IPv4 string to the integer create_sa() expects
+    as `dst_ip` so the SA's daddr matches a DUT-local interface address.
+
+    The match is dpa_get_iface_info_by_ipaddress → devman.c:830
+    `if (if_info->ifa_local == *daddr)`. `ifa_local` is a __be32 held in
+    kernel memory; on the little-endian ARM64 target that word read back as
+    a host u32 is the network-order bytes in little-endian order. create_sa()
+    packs dst_ip with struct.pack("<I", dst_ip) and the kernel reads it back
+    as a host u32 into sa->id.daddr.a6[0], so passing the network-order bytes
+    interpreted little-endian makes sa->id.daddr.a6[0] == ifa_local bit-for-bit.
+
+    i.e. dst_ip = int.from_bytes(inet_aton(ip), "little").  For 10.0.0.62:
+    inet_aton -> b'\\x0a\\x00\\x00\\x3e'; read little-endian -> 0x3e00000a,
+    which is exactly the u32 value the kernel holds for ifa_local on LE ARM64.
+    """
+    return struct.unpack("<I", socket.inet_aton(ip_str))[0]
+
+
+async def resolve_dut_local_ipv4(target_agent, aiohttp_session, iface: str) -> tuple[str, int]:
+    """Return (dotted_quad, daddr_int) for a DUT-local IPv4 address usable as
+    an SA daddr so the fast-path install clears dpa_get_iface_info_by_ipaddress.
+
+    ASK_IPSEC_LOCAL_IP overrides the query (dotted-quad); otherwise the address
+    is read live from `ip -4 -j addr show dev <iface>` on the DUT. Returns the
+    first global-scope inet address found. Raises if none is present so the
+    caller can skip rather than silently install an unmatched (synthetic) daddr
+    that would short-circuit before the guarded sites.
+    """
+    override = os.environ.get("ASK_IPSEC_LOCAL_IP")
+    if override:
+        return override, ipv4_to_daddr_int(override)
+
+    r = await target_agent.exec_cmd(
+        aiohttp_session, ["ip", "-4", "-j", "addr", "show", "dev", iface],
+        timeout_ms=3000,
+    )
+    if r.get("rc") != 0:
+        raise RuntimeError(
+            f"`ip -4 -j addr show dev {iface}` failed on DUT: rc={r.get('rc')!r}, "
+            f"stderr={r.get('stderr', '')!r}"
+        )
+    try:
+        links = json.loads(r.get("stdout", "") or "[]")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"couldn't parse `ip -4 -j addr show dev {iface}` output: {e}; "
+            f"stdout={r.get('stdout', '')[:200]!r}"
+        )
+    for link in links:
+        for ai in link.get("addr_info", []):
+            if ai.get("family") == "inet" and ai.get("local"):
+                # Prefer a global-scope address; fall back to any inet if the
+                # iface only carries a non-global one.
+                if ai.get("scope") == "global":
+                    ip = ai["local"]
+                    return ip, ipv4_to_daddr_int(ip)
+    # No global-scope inet — retry accepting any inet address.
+    for link in links:
+        for ai in link.get("addr_info", []):
+            if ai.get("family") == "inet" and ai.get("local"):
+                ip = ai["local"]
+                return ip, ipv4_to_daddr_int(ip)
+    raise RuntimeError(
+        f"no IPv4 address on DUT iface {iface}; set ASK_IPSEC_LOCAL_IP to a "
+        f"DUT-local address, or assign one to {iface}"
+    )
+
+
+# ---------------------------------------------------------------- xfrm state (test hook)
+# These drive the kernel's `ip xfrm` table directly so the
+# CDX_DEBUG_IPSEC_TEST_XFRM fallback (cdx/control_ipsec.c, compiled only
+# into the meta-ask test image) can resolve a synthetic NAT-T SA to a
+# real, ref-held xfrm_state by (daddr, spi, proto ESP) and let the H5
+# per-flow SPI-array path run. xfrm_state_lookup keys only on
+# daddr+spi+proto+family+mark; `src`, mode, reqid, the crypto keys and the
+# espinudp ports are required by `ip xfrm state add` syntax but do not
+# affect the match — cdx never uses this state to process a packet.
+
+# Fixed literal keys — any value works; the state is only ever matched by
+# the by-SPI lookup, never used for crypto. 16B enc (aes-cbc-128), 24B auth.
+_XFRM_ENC_KEY  = "0x000102030405060708090a0b0c0d0e0f"
+_XFRM_AUTH_KEY = "0x000102030405060708090a0b0c0d0e0f1011121314151617"
+
+
+async def add_xfrm_state_natt(
+    target_agent,
+    aiohttp_session,
+    *,
+    spi: int,
+    daddr_ip: str,
+    src_ip: str,
+    sport: int,
+    dport: int,
+    timeout_ms: int = 3000,
+) -> dict:
+    """Add one inbound NAT-T ESP xfrm state (dst=daddr_ip, given spi) on the
+    DUT via the agent's `ip` exec (argv form). Returns the exec reply dict
+    (rc/stdout/stderr).
+
+    `encap espinudp <sport> <dport> 0.0.0.0` mirrors the SA's NAT-T ports;
+    the trailing 0.0.0.0 is espinudp's original-address arg, unused for the
+    lookup. `src_ip` is likewise irrelevant to the by-SPI match — it only
+    satisfies the command syntax.
+    """
+    return await target_agent.exec_cmd(
+        aiohttp_session,
+        [
+            "ip", "xfrm", "state", "add",
+            "src", src_ip, "dst", daddr_ip,
+            "proto", "esp", "spi", f"0x{spi:08x}",
+            "mode", "tunnel", "reqid", "1",
+            "enc", "cbc(aes)", _XFRM_ENC_KEY,
+            "auth", "hmac(sha256)", _XFRM_AUTH_KEY,
+            "encap", "espinudp", str(sport), str(dport), "0.0.0.0",
+        ],
+        timeout_ms=timeout_ms,
+    )
+
+
+async def flush_xfrm(target_agent, aiohttp_session, timeout_ms: int = 3000) -> None:
+    """Best-effort `ip xfrm state flush` + `ip xfrm policy flush` on the DUT.
+    Used in fixture finalizers to clear the pre-created test states."""
+    for sub in (["state", "flush"], ["policy", "flush"]):
+        await target_agent.exec_cmd(
+            aiohttp_session, ["ip", "xfrm", *sub], timeout_ms=timeout_ms,
+        )

@@ -11,8 +11,8 @@ ccflags-y += -Werror -I$(src) -DENDIAN_LITTLE -DGCC_TOOLCHAIN
 # (kbuild prefers Kbuild over Makefile when both exist, so the latter's
 # ccflags-y += $(CFG_FLAGS) line never runs in this build path).
 # meta-ask's recipe sets CFG_FLAGS to the debug tripwire defines
-# (CDX_DEBUG_KEY_ZEROING, CDX_DEBUG_MC_HCSYNC_FAIL) that the rig tests
-# need; production builds leave it empty.
+# (CDX_DEBUG_KEY_ZEROING, CDX_DEBUG_MC_HCSYNC_FAIL, CDX_DEBUG_IPSEC_TEST_XFRM)
+# that the rig tests need; production builds leave it empty.
 ccflags-y += $(CFG_FLAGS)
 
 obj-$(CONFIG_ASK_CDX) += cdx.o
