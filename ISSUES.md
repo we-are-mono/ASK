@@ -36,41 +36,6 @@ stale line refs) are folded into the archive one-liners.
   Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
   and decap is hardware-offloaded. Keep open as the tracking anchor.
 
-- [ ] **A33.** *(Static inference, untested — deprioritized.)* The **routed**-
-  multicast offload path resolves interfaces via `get_onif_by_name`, which
-  returns NULL for `br-lan.N`, so routed mcast through a vlan-aware bridge
-  would fail like the unicast A32 case. **Not applicable to the Mono Gateway
-  deployment, which does not route multicast** — IPTV is bridged at L2
-  (`br-iptv`: `eth0.3999` ↔ `br-lan.3999`, IGMP snooping), a separate
-  ABM/L2-flow path. Left unfixed unless a routed-mcast use case appears; the
-  fix would mirror A32 (physical-port fallback in `dpa_control_mc.c` /
-  `insert_mcast_entry_in_classif_table`). Open (low priority).
-
-- [ ] **A38.** Wire macvlan hardware offload in cdx (planned). cmm sends
-  FPP_CMD_MACVLAN_ENTRY/RESET automatically on macvlan interface events
-  (`itf.c` cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx has no
-  FC_MACVLAN/EVENT_MACVLAN handler, so every send returns ERR_UNKNOWN_COMMAND
-  and logs an error whenever a macvlan interface exists. The gateway doesn't
-  currently create macvlan netdevs (CONFIG_MACVLAN is built but nothing creates
-  one), so it's latent today. Decision (2026-08-16): **keep the cmm sender** and
-  wire a cdx handler when macvlan forwarding is added to the product — mirror
-  the A32 physical-port approach (FC_MACVLAN → EVENT_MACVLAN dispatch + program
-  the classifier / insert into the classif table). The sibling dead command
-  families (module_prf/pktcap/icc/expt/alt_conf/voicebuf) were deleted; macvlan
-  is the one kept for future wiring. Open (planned).
-
-- [ ] **A39.** Transport-mode ESP offload is reachable but untested end-to-end. cdx
-  SAs default to transport mode (SA_MODE_TUNNEL is set only by
-  FPP_CMD_IPSEC_SA_SET_TUNNEL, which cmm sends for tunnel-mode xfrm states),
-  yet the product config and the entire rig suite exercise tunnel mode
-  exclusively. The SEC-era fix (_7cfd157_) means the CAAM-reported era 8 now
-  enables PDBOPTS_ESP_AOFL in the transport-mode decap PDB (SEC >= 5.3
-  output-length adjustment; under the old hardcoded era 4 it was off, likely
-  counting ESP trailer bytes in the output length) — tunnel mode is unaffected
-  by era entirely. Before transport-mode offload ever becomes a product path,
-  add a transport-mode case to the rig suite and validate both the pre-existing
-  path and the AOFL-adjusted lengths. Open.
-
 - [ ] **A66.** A54 freshness residual (documented by the fix's audit): after a
   rollback, the next route event re-attaches the OLD fpp route id (holder's
   `fpp_route` restored → `__cmmFPPRouteRegister` no-ops), cdx accepts the
@@ -121,19 +86,6 @@ stale line refs) are folded into the archive one-liners.
   an error — cmm retry semantics against a software-gone group — is a design
   decision. Surfaced by the A80 audit. Open (low).
 
-- [ ] **A103.** fmlib omits the `DEV_TO_ID` handle→id conversion at several sites,
-  so a userspace library `t_Device *` is sent into the ioctl where the kernel
-  expects a handle: `FM_PCD_CcRootBuild`/`FrmReplicSetGroup`/`AddMember` FR arm
-  (`frm_replic_id`), `PlcrProfileSet` modify-arm `p_profile`, `ManipNodeReplace`
-  `p_next_manip`, and the three PORT modify verbs
-  (`PcdKgModifyInitialScheme`/`PcdPlcrModifyInitialProfile`/`PcdCcModifyTree`) +
-  `VSPAlloc`. Pre-A85 these reached a kernel deref; post-A85 the kernel's cookie
-  lookup rejects them cleanly (`E_INVALID_SELECTION`), so the affected features
-  are now unusable until fmlib is fixed to convert them. No rig config exercises
-  any of them today. Fix: add the missing `DEV_TO_ID`/loop-bound conversions in
-  `sources/fmlib/src/fm_lib.c` (userspace, `patches/fmlib/`). Surfaced by the A85
-  audit. Open.
-
 - [ ] **A104.** cdx `dpa_cfg.c:cdxdrv_set_miss_action` calls
   `FM_PCD_HashTableModifyMissNextEngine(tbl_info->id, …)` for every table with no
   `dpa_type` guard, but `get_cctbl_info` classified each as HASH_TABLE or CC_NODE;
@@ -152,6 +104,51 @@ stale line refs) are folded into the archive one-liners.
   root node; the A102 cookie lookups run only on the success path, so it stays
   latent. Fix: return `E_WRITE_FAILED` on the copy fault and sweep the sibling
   VSP verbs for the same pattern. Surfaced by the A102 audit. Open (low).
+
+## Feature enablement (not bugs)
+
+Config-gated capabilities that are OFF in the current product — not defects.
+Each path either never executes in this deployment or fails cleanly if invoked
+(no corruption), so there is nothing to fix; each becomes a work item only when
+the product decides to enable that feature. The enabling recipe is kept with
+each so the open bug list stays honest.
+
+- [ ] **A33 — routed multicast through a vlan-aware bridge.** The routed-mcast
+  offload path resolves interfaces via `get_onif_by_name`, which returns NULL
+  for `br-lan.N`, so routed mcast through a vlan-aware bridge would fail like the
+  unicast A32 case. Not applicable to the Mono Gateway, which does not route
+  multicast — IPTV is L2-bridged (`br-iptv`: `eth0.3999` ↔ `br-lan.3999`, IGMP
+  snooping), a separate ABM/L2-flow path. To enable: mirror A32 (physical-port
+  fallback in `dpa_control_mc.c` / `insert_mcast_entry_in_classif_table`).
+
+- [ ] **A38 — macvlan hardware offload.** cmm already sends
+  FPP_CMD_MACVLAN_ENTRY/RESET on macvlan interface events (`itf.c`
+  cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx has no
+  FC_MACVLAN/EVENT_MACVLAN handler, so a send returns ERR_UNKNOWN_COMMAND. The
+  gateway creates no macvlan netdevs today (CONFIG_MACVLAN built but unused), so
+  it is inert; the cmm sender is deliberately kept. To enable: add the cdx
+  handler mirroring the A32 physical-port approach (FC_MACVLAN → EVENT_MACVLAN
+  dispatch + program the classifier).
+
+- [ ] **A39 — transport-mode ESP offload.** cdx can run transport-mode SAs
+  (SA_MODE_TUNNEL is set only by FPP_CMD_IPSEC_SA_SET_TUNNEL), but the product
+  config and the whole rig suite exercise tunnel mode exclusively, so the
+  transport path never runs. The SEC-era fix (_7cfd157_) means era 8 now enables
+  PDBOPTS_ESP_AOFL in the transport-mode decap PDB (tunnel mode is unaffected by
+  era). To enable: add a transport-mode rig case and validate the path plus the
+  AOFL-adjusted lengths before it ships.
+
+- [ ] **A103 — fmlib PCD-modify / FrmReplic / VSPAlloc verbs.** fmlib omits the
+  `DEV_TO_ID` handle→id conversion at several sites, so a userspace `t_Device *`
+  is sent where the kernel now expects a cookie:
+  `FM_PCD_CcRootBuild`/`FrmReplicSetGroup`/`AddMember` FR arm (`frm_replic_id`),
+  `PlcrProfileSet` modify-arm `p_profile`, `ManipNodeReplace` `p_next_manip`, the
+  three PORT modify verbs
+  (`PcdKgModifyInitialScheme`/`PcdPlcrModifyInitialProfile`/`PcdCcModifyTree`) +
+  `VSPAlloc`. Post-A85 the kernel rejects these cleanly (`E_INVALID_SELECTION`) —
+  no corruption, the features are simply unusable until fixed. No rig config
+  exercises any of them. To enable: add the missing `DEV_TO_ID`/loop-bound
+  conversions in `sources/fmlib/src/fm_lib.c` (`patches/fmlib/`).
 
 ---
 
