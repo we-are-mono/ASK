@@ -68,14 +68,11 @@ stale line refs) are folded into the archive one-liners.
   dynamically-sized copy of an unbounded list. Fix shape (design): a
   per-pass generation/visited marker on `ctTable`, or a walk-in-progress
   guard that stops the A76 recursion from re-entering a list being walked —
-  new struct field, deliberate change. Open (investigate; contrived
-  trigger, low priority).
-
-- [ ] **A97.** `cdx_delete_mcast_group_member`'s count-match full-delete path
-  returns NO_ERR even when `cdx_mcast_group_destroy` took a failure arm (the
-  destroy is void; failures are log-only). Whether the FCI caller should see
-  an error — cmm retry semantics against a software-gone group — is a design
-  decision. Surfaced by the A80 audit. Open (low).
+  new struct field, deliberate change. **Decision (2026-09-01): keep open and
+  documented, do not fix** — a rare, non-UAF mis-iteration behind a contrived
+  trigger does not justify a deliberate hot-path change with its own regression
+  risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
+  only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
 ## Feature enablement (not bugs)
 
@@ -832,3 +829,8 @@ file's git history.
   refuse the re-add on hard FAILURE (tombstone for retry); v6's make-before-break
   keeps its intentional transient duplicate, logging a failed trailing delete
   without failing the command.
+
+- [-] **A97 (not a bug).** `cdx_delete_mcast_group_member` returning NO_ERR on
+  `cdx_mcast_group_destroy`'s hard-FAILURE arm is by design — that arm is the
+  accepted A95-class leak (abandoned + logged loudly) and the group is already
+  software-gone, so an error return buys nothing but a compounding retry.
