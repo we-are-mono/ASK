@@ -449,7 +449,10 @@ async def lan_vlan_subif(
     assert r.rc == 0, f"LAN vlan up {iface}: {r.stdout!r}"
 
     for spec in (routes or []):
-        await lan_run(lan, f"ip route add {spec}", 5.0)
+        # `replace`, not `add`: a leftover route from a crashed prior run
+        # (same prefix, stale nexthop) would make `add` fail "File exists"
+        # and keep the stale route; replace keeps setup idempotent.
+        await lan_run(lan, f"ip route replace {spec}", 5.0)
         async def _del_route(_first=spec.split()[0]):
             await lan_run(lan, f"ip route del {_first} 2>/dev/null", 5.0)
         stack.push(_del_route)
@@ -594,9 +597,13 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
             await _lan(f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null")
         cleanups.append(_del_lan_addr)
 
-        await _lan(f"ip -6 route del default via {DUT_IPV6_LAN} 2>/dev/null")
+        # `replace`, not `add`: loki may already carry a v6 default route
+        # from the DUT's router advertisements (via a link-local next-hop),
+        # so a plain `add` fails with "File exists". replace is idempotent —
+        # it adds when absent and overwrites any existing default regardless
+        # of its next-hop.
         r = await _lan(
-            f"ip -6 route add default via {DUT_IPV6_LAN} dev {LAN_NIC}"
+            f"ip -6 route replace default via {DUT_IPV6_LAN} dev {LAN_NIC}"
         )
         assert r.rc == 0, f"LAN v6 default route: {r.stdout!r}"
 
