@@ -22,15 +22,17 @@
  *        L2Flow_{hash_index,snapshot_entries,snapshot_index,
  *        snapshot_buf_entries}).
  *
- * KNOWN GAP: the l2flow_hash_table itself is lock-free on both
- * mutator (control_bridge.c) and reader (here) sides. A concurrent
- * delete during a walk can UAF. Fixing requires adding a lock to
- * the whole bridge subsystem (hlist walk + insert + delete + free),
- * which is out of scope for the query path alone. Entries here are
- * only freed from process-context paths that also hold no
- * synchronization today, so in practice the race triggers only when
- * bridge events fire concurrently with a stats query; it's a real
- * bug but orthogonal to this cursor serialization.
+ *   l2flow_hash_table itself
+ *      - The live walk here (rx_Get_Hash_Snapshot_L2FlowEntries) runs
+ *        under cdx_info->ctrl.mutex, which comcerto_fpp_send_command()
+ *        holds across the whole FCI dispatch - the same mutex the
+ *        control_bridge.c mutators and the L2Bridge timer hold. That
+ *        serializes every mutator and reader, so the snapshot walk
+ *        never races a delete/free: matching entries are copied out
+ *        under the mutex and later pagination calls read the copy,
+ *        not the live list. ctrl.mutex is dropped between those
+ *        calls, which is exactly why the cursor needs its own
+ *        l2flow_query_mutex above.
  *
  * Contexts: rx_Get_Next_Hash_L2FlowEntry runs in process context
  * from the ioctl dispatcher.

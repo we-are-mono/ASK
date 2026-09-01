@@ -115,12 +115,6 @@ stale line refs) are folded into the archive one-liners.
   and re-add. Gating them needs per-path FCI reply-semantics decisions.
   Surfaced by the A95 audit. Open (low).
 
-- [ ] **A101.** L2 bridge reset paths are stubs: `M_bridge_handle_reset` is a
-  bare printk, `CMD_RX_L2BRIDGE_FLOW_RESET` is wired to `bridge_noop_handle`,
-  and module exit never flushes the l2flow table (flows + hw entries leak on
-  unload). Open (low).
-
-
 - [ ] **A97.** `cdx_delete_mcast_group_member`'s count-match full-delete path
   returns NO_ERR even when `cdx_mcast_group_destroy` took a failure arm (the
   destroy is void; failures are log-only). Whether the FCI caller should see
@@ -846,3 +840,7 @@ file's git history.
   a/b/d bullets in _2a13911_): one irqsave `sa_cache_lock` around every list
   mutation and both atomic readers, copy-out before unlock; per-SA skip
   replaces the bucket-wide SA_DELETE abort.
+
+- [x] **A101.** L2 bridge flows leaked on unload (`M_bridge_handle_reset` was a
+  stub, `CMD_RX_L2BRIDGE_FLOW_RESET` a no-op) — fixed (_this commit_): reset
+  flushes all buckets via `l2flow_remove()` under `ctrl.mutex`, command wired.

@@ -36,16 +36,17 @@ static hsiphash_key_t l2flow_hashkey __read_mostly;
  * Concurrency:
  *   l2flow_hash_table[] (NUM_BT_ENTRIES buckets of hlist_head)
  *      - Mutated by M_bridge_cmdproc() on CMD_BRIDGE_L2FLOW_*
- *        commands and walked by l2flow_find_entry() from the same
- *        dispatcher and by query_Rx.c. LOCK-FREE on both sides
- *        today; a concurrent delete during a walk is UAF.
- *
- *        KNOWN GAP: adding a subsystem lock here requires matching
- *        walkers in query_Rx.c and any other reader paths in a
- *        single coordinated change. The attack surface is gated
- *        behind the cdx ioctl dispatch (CAP_NET_ADMIN, G1), so all
- *        callers today are trusted, but the race is real under
- *        concurrent ioctls.
+ *        commands, walked by l2flow_find_entry() from the same
+ *        dispatcher, walked by query_Rx.c's snapshot pass, and
+ *        aged by the L2Bridge timer. Every one of those runs under
+ *        cdx_info->ctrl.mutex: comcerto_fpp_send_command() holds it
+ *        across the whole FCI dispatch, and the timer kthread holds
+ *        it across each wheel tick. That single mutex serializes all
+ *        mutators and readers, so a delete never runs concurrently
+ *        with a walk and the table needs no lock of its own.
+ *        (query_Rx.c keeps a separate mutex only for its static
+ *        pagination cursor, which spans several dispatches and so
+ *        outlives any single mutex hold - see the note there.)
  *   l2flow_hashkey (hsiphash_key_t)
  *      - Set once in bridge_init() via get_random_bytes(); never
  *        mutated at runtime. Lock-free reads are safe.
@@ -56,6 +57,9 @@ static hsiphash_key_t l2flow_hashkey __read_mostly;
  *   bridge_init()        - module load.
  *   M_bridge_cmdproc()   - process, ioctl dispatcher.
  *   l2flow_*() helpers   - process, called under the dispatcher.
+ *   M_bridge_handle_reset() - process; the FLOW_RESET command handler
+ *                          and the bridge_exit() unload flush, both
+ *                          under ctrl->mutex like the dispatcher.
  */
 
 /* flow timer infrastructure */
@@ -519,10 +523,48 @@ static int M_bridged_itf_update(U16 code, U16 *p, U16 Length)
 }
 
 /*
- * CMD_RX_L2BRIDGE_{ENABLE,ADD,REMOVE,QUERY_STATUS,FLOW_RESET}: the
- * old cmdproc just `break`'d for these, so the reply is status-only
- * with CMD_OK (= NO_ERR = 0). Preserve exactly. No length check in
- * the old code either -> CDX_CMD_VAR(0, U16_MAX).
+ * Tear down every L2 bridge flow. Walk all NUM_BT_ENTRIES buckets and
+ * run each flow through l2flow_remove(), which stops the flow timer,
+ * deletes the hardware ehash entry, and - on a successful delete or the
+ * unsynced-delete arm - unlinks and frees the software flow and drops
+ * the bucket count. The walk is node-safe because that arm frees the
+ * node under us: hlist_for_each_entry_safe() stashes the next node
+ * before the body runs. A hardware-delete failure instead leaves the
+ * flow parked in its bucket as a tombstone (not freed) - that entry is
+ * meant to outlive the reset rather than be force-freed over a chain the
+ * hardware may still walk, so a tombstoned flow surviving here is
+ * expected, not a leak.
+ *
+ * Both entry points run under cdx_info->ctrl.mutex: the runtime
+ * CMD_RX_L2BRIDGE_FLOW_RESET command arrives through the command
+ * dispatcher, and the module-unload flush runs from bridge_exit() inside
+ * cdx_ctrl_deinit(), which holds the mutex across cdx_cmdhandler_exit().
+ * That is the same mutex the timer thread holds across its wheel walk,
+ * so the cdx_timer_del() inside l2flow_remove() cannot race it and needs
+ * no lock of its own. The mutex is sleepable, so the GFP_KERNEL/free
+ * work in the teardown path is safe under it.
+ */
+static int M_bridge_handle_reset(void)
+{
+	struct L2Flow_entry *entry;
+	struct hlist_node *tmp;
+	int hash_index;
+
+	for (hash_index = 0; hash_index < NUM_BT_ENTRIES; hash_index++) {
+		hlist_for_each_entry_safe(entry, tmp,
+				&l2flow_hash_table[hash_index].flowlist, node) {
+			l2flow_remove(entry);
+		}
+	}
+
+	return CMD_OK;
+}
+
+/*
+ * CMD_RX_L2BRIDGE_{ENABLE,ADD,REMOVE,QUERY_STATUS}: the old cmdproc
+ * just `break`'d for these, so the reply is status-only with CMD_OK
+ * (= NO_ERR = 0). Preserve exactly. No length check in the old code
+ * either -> CDX_CMD_VAR(0, U16_MAX).
  */
 static U16 bridge_noop_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
@@ -593,8 +635,22 @@ static U16 bridged_itf_update_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len
 	return (U16)M_bridged_itf_update(CMD_BRIDGED_ITF_UPDATE, pcmd, cmd_len);
 }
 
+/*
+ * CMD_RX_L2BRIDGE_FLOW_RESET: flush every L2 bridge flow. No argument,
+ * status-only reply. M_bridge_handle_reset() returns CMD_OK (= NO_ERR)
+ * and its status is mapped straight through as the command status.
+ */
+static U16 bridge_flow_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
+{
+	(void)pcmd;
+	(void)cmd_len;
+	(void)out_reply_len;
+
+	return (U16)M_bridge_handle_reset();
+}
+
 static const struct cdx_cmd_spec bridge_cmd_table[] = {
-	/* The five noop entries route to bridge_noop_handle which
+	/* The four noop entries route to bridge_noop_handle which
 	 * `(void)pcmd; (void)cmd_len;` and just returns NO_ERR — no
 	 * read-of-uninit risk, kept permissive.
 	 *
@@ -612,7 +668,7 @@ static const struct cdx_cmd_spec bridge_cmd_table[] = {
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_ADD,          0, U16_MAX, NULL, bridge_noop_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_REMOVE,       0, U16_MAX, NULL, bridge_noop_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_STATUS, 0, U16_MAX, NULL, bridge_noop_handle),
-	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_RESET,   0, U16_MAX, NULL, bridge_noop_handle),
+	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_RESET,   0, U16_MAX, NULL, bridge_flow_reset_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_ENTRY,  sizeof(L2BridgeQueryEntryResponse), U16_MAX, NULL, bridge_query_entry_handle),
 	CDX_CMD    (CMD_RX_L2BRIDGE_FLOW_ENTRY,   L2BridgeL2FlowEntryCommand, bridge_flow_entry_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_TIMEOUT, 0, U16_MAX, NULL, bridge_flow_timeout_handle),
@@ -627,15 +683,6 @@ static U16 M_bridge_cmdproc(U16 cmd_code, U16 cmd_len, U16 *p)
 #endif
 	return cdx_dispatch_cmd(bridge_cmd_table, ARRAY_SIZE(bridge_cmd_table),
 				cmd_code, cmd_len, p);
-}
-
-
-
-static int  M_bridge_handle_reset(void)
-{
-	U16 ackstatus = CMD_OK;
-	printk("%s::implement this\n", __func__);
-	return ackstatus;
 }
 
 int bridge_init(void)
