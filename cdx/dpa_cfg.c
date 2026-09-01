@@ -543,6 +543,21 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 #endif
 	for (ii = 0; ii < finfo->num_tables; ii++) {
 		t_FmPcdCcNextEngineParams miss_engine_params;
+
+		/*
+		 * FM_PCD_HashTableModifyMissNextEngine() below is a hash-table
+		 * only op: it treats the handle as an FM_PCD_HashTableSet object
+		 * and reads h_Ad from it. INDEXED / EXACT_MATCH tables are CC
+		 * nodes (FM_PCD_MatchTableSet); passing one of their handles here
+		 * would dereference at the wrong offset -- a near-NULL MMIO read
+		 * that can fault at boot. Only internal/external hash tables carry
+		 * this miss action, so skip everything else.
+		 */
+		if ((tbl_info->dpa_type != CDX_DPA_TBL_INTERNAL_HASH) &&
+		    (tbl_info->dpa_type != CDX_DPA_TBL_EXTERNAL_HASH)) {
+			tbl_info++;
+			continue;
+		}
 		memset(&miss_engine_params, 0, sizeof(t_FmPcdCcNextEngineParams));
 #ifdef DPA_CFG_DEBUG
 		DPA_INFO("%s::tbl %s %pK changing miss action\n", __func__,

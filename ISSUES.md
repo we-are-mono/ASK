@@ -86,17 +86,6 @@ stale line refs) are folded into the archive one-liners.
   an error — cmm retry semantics against a software-gone group — is a design
   decision. Surfaced by the A80 audit. Open (low).
 
-- [ ] **A104.** cdx `dpa_cfg.c:cdxdrv_set_miss_action` calls
-  `FM_PCD_HashTableModifyMissNextEngine(tbl_info->id, …)` for every table with no
-  `dpa_type` guard, but `get_cctbl_info` classified each as HASH_TABLE or CC_NODE;
-  feeding a CC-node handle to the hash-table miss-engine path reads `h_Ad` at the
-  wrong offset (a near-NULL MMIO read). Latent — the rig boots, so the ASK fmc
-  most likely reports these under `htnode_count` with `ccnode_count==0`; **confirm
-  on the DUT with one `ccnode_count` printk in dpa_app**, then skip the call for
-  `dpa_type ∈ {INDEXED, EXACT_MATCH}` (cdx already computes that split). NXP-
-  inherited, but the cookie work gives cdx the info to guard it. Surfaced by the
-  A85 audit. Open.
-
 - [ ] **A105.** `FM_IOC_VSP_INIT`/`FM_IOC_VSP_FREE` (sdk_fman
   `lnxwrp_ioctls_fm.c`) do a bare `break;` on a `copy_from_user` failure, which
   falls through to the function tail and returns `E_OK` — a faulting userspace
@@ -844,3 +833,8 @@ file's git history.
 - [x] **A102.** FM_VSP ioctl family leaked/deref'd raw kernel VSP handles over
   /dev/fmX — fixed (_this commit_): 9th cookie class `FM_PCD_COOKIE_VSP` through
   the seven VSP verbs; non-Rx `p_fm_tx_port` rejected (A103-coupled). Residue A105.
+
+- [x] **A104.** `cdxdrv_set_miss_action` fed CC-node (EXACT_MATCH) handles to the
+  hash-only `FM_PCD_HashTableModifyMissNextEngine` (wrong-offset near-NULL MMIO
+  read, exercised for any PCD with CC-nodes) — fixed (_this commit_): skip non-hash
+  `dpa_type`s via the `get_cctbl_info` predicate.
