@@ -121,15 +121,6 @@ stale line refs) are folded into the archive one-liners.
   an error — cmm retry semantics against a software-gone group — is a design
   decision. Surfaced by the A80 audit. Open (low).
 
-- [ ] **A102.** The FM_VSP ioctl family (`FM_IOC_VSP_CONFIG`/`INIT`/`FREE`/
-  `CONFIG_POOL_DEPLETION`/`CONFIG_BUFFER_PREFIX_CONTENT`/`CONFIG_NO_SG`/
-  `GET_BUFFER_PRS_RESULT`, and `FM_PORT_IOC_VSP_ALLOC`'s OH-port `p_fm_tx_port`)
-  still copies raw kernel VSP handles to/from userspace — the same leak/deref
-  class A85 closed for PCD objects, but a VSP is a distinct object type not in
-  `enum fm_pcd_cookie_type`. cdx drives VSP entirely in-kernel (`vsp_cfg.c`), so
-  this is dead-but-reachable attack surface on the 0600 node. Fix: a 9th cookie
-  type. Surfaced by the A85 audit. Open (low; root-only).
-
 - [ ] **A103.** fmlib omits the `DEV_TO_ID` handle→id conversion at several sites,
   so a userspace library `t_Device *` is sent into the ioctl where the kernel
   expects a handle: `FM_PCD_CcRootBuild`/`FrmReplicSetGroup`/`AddMember` FR arm
@@ -153,6 +144,14 @@ stale line refs) are folded into the archive one-liners.
   `dpa_type ∈ {INDEXED, EXACT_MATCH}` (cdx already computes that split). NXP-
   inherited, but the cookie work gives cdx the info to guard it. Surfaced by the
   A85 audit. Open.
+
+- [ ] **A105.** `FM_IOC_VSP_INIT`/`FM_IOC_VSP_FREE` (sdk_fman
+  `lnxwrp_ioctls_fm.c`) do a bare `break;` on a `copy_from_user` failure, which
+  falls through to the function tail and returns `E_OK` — a faulting userspace
+  pointer is reported as success. Pre-existing NXP-vendored quirk on the 0600
+  root node; the A102 cookie lookups run only on the success path, so it stays
+  latent. Fix: return `E_WRITE_FAILED` on the copy fault and sweep the sibling
+  VSP verbs for the same pattern. Surfaced by the A102 audit. Open (low).
 
 ---
 
@@ -844,3 +843,7 @@ file's git history.
 - [x] **A101.** L2 bridge flows leaked on unload (`M_bridge_handle_reset` was a
   stub, `CMD_RX_L2BRIDGE_FLOW_RESET` a no-op) — fixed (_this commit_): reset
   flushes all buckets via `l2flow_remove()` under `ctrl.mutex`, command wired.
+
+- [x] **A102.** FM_VSP ioctl family leaked/deref'd raw kernel VSP handles over
+  /dev/fmX — fixed (_this commit_): 9th cookie class `FM_PCD_COOKIE_VSP` through
+  the seven VSP verbs; non-Rx `p_fm_tx_port` rejected (A103-coupled). Residue A105.
