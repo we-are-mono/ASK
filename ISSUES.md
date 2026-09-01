@@ -71,15 +71,6 @@ stale line refs) are folded into the archive one-liners.
   new struct field, deliberate change. Open (investigate; contrived
   trigger, low priority).
 
-- [ ] **A99.** Re-add-after-failed-delete duplicate-key residuals: the CT path
-  (DEL_FAILED latch) and the L2 bridge (tombstone) now refuse to re-add a key
-  whose delete failed pre-unlink, but control_socket.c's two update flows
-  (which also disagree on delete/create ordering between v4 and v6 — v6
-  transiently duplicates the key by design), `RTP_change_flow`, and
-  `IPsec_handle_SA_SET_TNL_ROUTE`'s unconditional re-push all discard the rc
-  and re-add. Gating them needs per-path FCI reply-semantics decisions.
-  Surfaced by the A95 audit. Open (low).
-
 - [ ] **A97.** `cdx_delete_mcast_group_member`'s count-match full-delete path
   returns NO_ERR even when `cdx_mcast_group_destroy` took a failure arm (the
   destroy is void; failures are log-only). Whether the FCI caller should see
@@ -835,3 +826,9 @@ file's git history.
   `FM_PCD_IOC_FRM_REPLIC_GROUP_DELETE`, compat+native each) returned `E_OK` on a
   `copy_from_user` fault (bare `break` → E_OK tail) — fixed (_this commit_): all
   now `RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG)`, whole class closed.
+
+- [x] **A99.** Re-add-after-failed-delete duplicate-key residuals (socket v4/v6,
+  RTP, ipsec) — fixed (_this commit_): v4/RTP/ipsec capture the delete rc and
+  refuse the re-add on hard FAILURE (tombstone for retry); v6's make-before-break
+  keeps its intentional transient duplicate, logging a failed trailing delete
+  without failing the command.

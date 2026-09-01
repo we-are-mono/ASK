@@ -563,6 +563,7 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 		void 				*td;
 		void				*eeh_entry_handle;
 		uint16_t			 eeh_entry_index;
+		int				 del_rc;
 
 		// egress rtp flow should be modified with route info, etc.
 		// deleting old entry and creating new one
@@ -595,11 +596,27 @@ int SOCKET4_HandleIP_Socket_Update (U16 *p, U16 Length)
 		pFlow->hw_flow->eeh_entry_handle =  NULL;
 		pFlow->hw_flow->eeh_entry_index = 0;
 
-		/* The table entry belongs to cdx_ehash_delete_entry() on
-		 * every arm of the DeleteKey contract - freeing it here after
-		 * a failed delete was a use-after-free (ISSUES.md A95). */
-		if (cdx_ehash_delete_entry(td, eeh_entry_index,
-				eeh_entry_handle)) {
+		/* Break-before-make: the old key is deleted before the updated
+		 * one is added. The table entry belongs to cdx_ehash_delete_entry()
+		 * on every arm of the DeleteKey contract - freeing it here after a
+		 * failed delete was a use-after-free (ISSUES.md A95).
+		 *
+		 * If the delete did not provably unlink the key, adding it again
+		 * would build a duplicate-key bucket for this flow. Refuse the
+		 * re-add, hand the flow back its reference to the still-live entry
+		 * so a later update retries the delete, and fail the command. The
+		 * success and unsynced arms leave the key provably out, so the
+		 * re-add is safe there. */
+		del_rc = cdx_ehash_delete_entry(td, eeh_entry_index,
+				eeh_entry_handle);
+		if (del_rc && del_rc != EN_EHASH_DELETE_UNSYNCED) {
+			DPA_ERROR("%s(%d)::classifier key not provably unlinked; refusing re-add to avoid a duplicate-key bucket\n",
+				__func__, __LINE__);
+			pFlow->hw_flow->eeh_entry_handle = eeh_entry_handle;
+			pFlow->hw_flow->eeh_entry_index = eeh_entry_index;
+			return ERR_SOCK_UPDATE_ERR;
+		}
+		if (del_rc) {
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
 				__func__, __LINE__);
 		}
@@ -890,6 +907,7 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 		void				*td;
 		void				*eeh_entry_handle;
 		uint16_t		eeh_entry_index;
+		int				del_rc;
 
 		// egress rtp flow should be modified with route info, etc.
 		// deleting old entry and creating new one
@@ -942,12 +960,27 @@ int SOCKET6_HandleIP_Socket_Update(U16 *p, U16 Length)
 			return ERR_SOCK_UPDATE_ERR;
 		}
 
-		/* The table entry belongs to cdx_ehash_delete_entry() on
-		 * every arm of the DeleteKey contract - freeing it here after
-		 * a failed delete was a use-after-free (ISSUES.md A95). */
-		if (cdx_ehash_delete_entry(td, eeh_entry_index,
-				eeh_entry_handle))
-		{
+		/* Make-before-break: unlike the v4 path, v6 adds the updated key
+		 * while the old one is still live, so a running RTP socket is
+		 * never left without a classifier entry mid-update. The old key is
+		 * only deleted once the new one is in place; the two coexist for
+		 * that window by design.
+		 *
+		 * The re-add has therefore already happened by the time the delete
+		 * runs, so the v4-style "refuse the re-add on a failed delete" gate
+		 * cannot apply here - there is no re-add left to withhold. A hard
+		 * delete failure leaves the old key as a leaked duplicate of the
+		 * new one; report it loudly but do not fail the command, because
+		 * the new entry is in place and correct and failing would only
+		 * invite a retry that adds yet another copy of the same key. The
+		 * table entry itself belongs to cdx_ehash_delete_entry() on every
+		 * arm - freeing it here would be the A95 use-after-free. */
+		del_rc = cdx_ehash_delete_entry(td, eeh_entry_index,
+				eeh_entry_handle);
+		if (del_rc && del_rc != EN_EHASH_DELETE_UNSYNCED) {
+			DPA_ERROR("%s(%d)::old classifier key not provably unlinked; leaked as a duplicate of the updated key\n",
+				__func__, __LINE__);
+		} else if (del_rc) {
 			DPA_ERROR("%s(%d)::unable to remove entry from hash table\n",
 				__func__, __LINE__);
 		}

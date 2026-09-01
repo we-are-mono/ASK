@@ -909,8 +909,22 @@ static int IPsec_handle_SA_SET_TNL_ROUTE(U16 *p, U16 Length)
 		return NO_ERR;
 
 	/* remove the old fastpath entry */
-	if ((sa->ct) && (sa->ct->handle))
-		cdx_ipsec_delete_fp_entry(sa);
+	if ((sa->ct) && (sa->ct->handle)) {
+		int del_rc = cdx_ipsec_delete_fp_entry(sa);
+
+		/* If the old classifier key was not provably unlinked, the
+		 * re-push below would add the same key again and build a
+		 * duplicate-key bucket that no later delete can fully clear.
+		 * Refuse the re-push and report it: the stale entry is
+		 * abandoned (not provably unlinked, so it cannot be freed) and
+		 * keeps classifying with its previous route, but a second copy
+		 * could not improve that and would make it unrecoverable. The unsynced arm leaves the key
+		 * provably out (parked in the quarantine), so the re-push is
+		 * safe there; the non-delete arms (nothing installed, or a
+		 * shared NAT-T entry only dropping a reference) return 0. */
+		if (del_rc && del_rc != EN_EHASH_DELETE_UNSYNCED)
+			return ERR_CREATION_FAILED;
+	}
 
 	/* The push dereferences the route, so it only runs when the SA
 	 * actually has one: a detach legitimately ends here with the fast
