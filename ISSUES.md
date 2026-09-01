@@ -86,14 +86,6 @@ stale line refs) are folded into the archive one-liners.
   an error — cmm retry semantics against a software-gone group — is a design
   decision. Surfaced by the A80 audit. Open (low).
 
-- [ ] **A105.** `FM_IOC_VSP_INIT`/`FM_IOC_VSP_FREE` (sdk_fman
-  `lnxwrp_ioctls_fm.c`) do a bare `break;` on a `copy_from_user` failure, which
-  falls through to the function tail and returns `E_OK` — a faulting userspace
-  pointer is reported as success. Pre-existing NXP-vendored quirk on the 0600
-  root node; the A102 cookie lookups run only on the success path, so it stays
-  latent. Fix: return `E_WRITE_FAILED` on the copy fault and sweep the sibling
-  VSP verbs for the same pattern. Surfaced by the A102 audit. Open (low).
-
 ## Feature enablement (not bugs)
 
 Config-gated capabilities that are OFF in the current product — not defects.
@@ -838,3 +830,8 @@ file's git history.
   hash-only `FM_PCD_HashTableModifyMissNextEngine` (wrong-offset near-NULL MMIO
   read, exercised for any PCD with CC-nodes) — fixed (_this commit_): skip non-hash
   `dpa_type`s via the `get_cctbl_info` predicate.
+
+- [x] **A105.** Six `LnxwrpFmPcdIOCTL` arms (VSP `INIT`/`FREE` +
+  `FM_PCD_IOC_FRM_REPLIC_GROUP_DELETE`, compat+native each) returned `E_OK` on a
+  `copy_from_user` fault (bare `break` → E_OK tail) — fixed (_this commit_): all
+  now `RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG)`, whole class closed.
