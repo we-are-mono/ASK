@@ -586,8 +586,7 @@ void cmmQmSetPrintHelp(void)
  * Only the set path (the "if (cmmQmSend(...) == 2)" sites) routes through
  * cmmQmSend; the query handlers keep calling cmmSendToDaemon directly since
  * they are never dry-run and inspect their own replies. FPP reply status is
- * left to each handler (they already log/tolerate it as they see fit) -- the
- * wrapper does not reinterpret it as a command failure.
+ * logged by each handler. The wrapper also records rejected writes.
  *
  * Defined outside the LS1043 guard because both cmmQmSetProcess variants
  * route their sends through cmmQmSend, and it only depends on the
@@ -599,13 +598,19 @@ void cmmQmSetPrintHelp(void)
  * "cmm -c" is a one-shot client, so this holds.
  */
 static int cmmQmValidateOnly;
+static int cmmQmCommandFailed;
 
 static int cmmQmSend(daemon_handle_t daemon_handle, unsigned short cmd,
 		void *snd, int sz, void *rcv)
 {
+	int rc;
+
 	if (cmmQmValidateOnly)
 		return 0;	/* != 2: the caller's "== 2" result check is skipped */
-	return cmmSendToDaemon(daemon_handle, cmd, snd, sz, rcv);
+	rc = cmmSendToDaemon(daemon_handle, cmd, snd, sz, rcv);
+	if (rc < (int)sizeof(unsigned short) || cmmDaemonCmdRC(rcv) != 0)
+		cmmQmCommandFailed = 1;
+	return rc;
 }
 
 #ifdef LS1043
@@ -1558,6 +1563,7 @@ int cmmQmSetProcess(char **keywords, int tabStart, daemon_handle_t daemon_handle
 	int cpt;
 	int retval;
 
+	cmmQmCommandFailed = 0;
 	cpt = tabStart;
 	if (!keywords[cpt])  {
 		retval = QM_ERROR;
@@ -1619,10 +1625,7 @@ err_ret:
 			cmmQmSetPrintHelp();
 			break;
 		default:
-			/* parsed OK (0 in validate-only mode too, where nothing was
-			 * sent). FPP reply status is handled per-directive by the
-			 * sub-handlers, not reinterpreted here. */
-			return 0;
+			return cmmQmCommandFailed ? -1 : 0;
 	}
 	return -1;
 }
@@ -1673,7 +1676,7 @@ err_ret:
  *      intentionally not inspected.
  *   3. APPLY -- each directive is applied through cmmQmSetProcess (the FPP
  *      protocol is not reimplemented). Per-directive FPP reply status is
- *      logged by the handlers, exactly as an interactive "set qm" would.
+ *      logged by the handlers and returned to the caller.
  *
  * Not atomic: phase 2 flushes before phase 3 re-applies, so there is a brief
  * window where egress QoS is cleared. <file> is read once up front so
@@ -1683,9 +1686,7 @@ err_ret:
  *
  * Reachable from the live CLI ("qm-config <file>") and "cmm -c 'qm-config
  * <file>'". Returns 0 once a validated file is flushed and applied; returns
- * -1 (a nonzero exit under "cmm -c") on a validation or I/O failure -- a file
- * that could not be accepted, not a runtime fast-path rejection of a single
- * directive.
+ * -1 (a nonzero exit under "cmm -c") on a validation, I/O, or FPP failure.
  *****************************************************************/
 #define QM_RELOAD_LINE_MAX	512
 #define QM_RELOAD_MAX_TOKENS	64
@@ -1882,13 +1883,8 @@ int cmmQmConfigReload(const char *path, daemon_handle_t daemon_handle)
 	/* Phase 2: flush current QoS/shaper state (validated file). */
 	cmmQmReloadFlush(daemon_handle);
 
-	/* Phase 3: apply. Every directive already passed the identical parse in
-	 * phase 1 (same bytes, same parser), so cmmQmSetProcess re-parses cleanly
-	 * and its return conveys nothing new. Per-directive FPP reply status is
-	 * logged by the handlers, exactly as an interactive "set qm" would; it is
-	 * not reflected in the reload's result. The exit code therefore reports a
-	 * rejected file (validation) or an I/O error, not a runtime fast-path
-	 * rejection of an individual directive. */
+	/* Phase 3: apply. Stop and report an FPP rejection. The reset has already
+	 * happened, so the caller must not treat a partial apply as success. */
 	lineno = 0;
 	for (p = buf; p < end; ) {
 		p = cmmQmReloadNextLine(p, end, scratch, sizeof(scratch), &overlong);
@@ -1896,7 +1892,12 @@ int cmmQmConfigReload(const char *path, daemon_handle_t daemon_handle)
 		n = cmmQmReloadTokenize(scratch, kw);
 		if (n == 0)
 			continue;
-		cmmQmSetProcess(kw, 2, daemon_handle);
+		if (cmmQmSetProcess(kw, 2, daemon_handle) != 0) {
+			cmm_print(DEBUG_CRIT, "qm-config: %s:%d: FPP rejected directive\n",
+					path, lineno);
+			free(buf);
+			return -1;
+		}
 	}
 	free(buf);
 

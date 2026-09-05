@@ -429,7 +429,7 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		{
 			/*Call QM process function*/
 			if(cmmQmSetProcess(keywords, 2, daemon_handle))
-				return -1;
+				return CMM_CLIENT_EXIT_FAIL;
 		}
 		else if (strcasecmp(keywords[1], "mc6") == 0)
 		{
@@ -766,9 +766,7 @@ help:
  *      cmm client main function
  *
  *****************************************************************/
-/* qm-config opts into exit-code reporting (see CMM_CLIENT_EXIT_FAIL): a
- * reload that never reaches the daemon must fail, not silently exit 0. Match
- * the whole first token of the raw "-c" string so "qm-configXYZ" does not. */
+/* QM commands opt into exit-code reporting (see CMM_CLIENT_EXIT_FAIL). */
 static int cmmClientDaemonDownRc(const char *command)
 {
 	/* Mirror the dispatch's tokenization (strtok on ' '): skip leading
@@ -778,6 +776,9 @@ static int cmmClientDaemonDownRc(const char *command)
 			command++;
 		if (strncasecmp(command, "qm-config", 9) == 0 &&
 				(command[9] == '\0' || command[9] == ' '))
+			return CMM_CLIENT_EXIT_FAIL;
+		if (strncasecmp(command, "set qm", 6) == 0 &&
+				(command[6] == '\0' || command[6] == ' '))
 			return CMM_CLIENT_EXIT_FAIL;
 	}
 	return -1;

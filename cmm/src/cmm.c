@@ -386,7 +386,7 @@ int main (int argc, char ** argv)
 			case 'c':	// Launch cmm as a client communicating with the cmm daemon
 				/* Historically -c always exited 0. Keep that for every
 				 * subcommand except those that opt in by returning
-				 * CMM_CLIENT_EXIT_FAIL (currently qm-config), so a caller
+				 * CMM_CLIENT_EXIT_FAIL, so a caller
 				 * can detect a bad reload without changing any other
 				 * command's exit-code ABI. */
 				return cmmClient(optarg, argc-optind, &argv[optind])
