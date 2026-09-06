@@ -43,7 +43,7 @@ static inline u_int32_t testbit_in_array(u_int8_t *pbits, u_int32_t bitindex)
  * process-exit-code propagation: cmm.c maps ONLY this to a nonzero exit. A
  * plain -1 (usage/help/other command errors) keeps the historical "cmm -c
  * always exits 0" behaviour, so exit-code reporting stays limited to the
- * commands that ask for it (currently qm-config). */
+ * commands that ask for it (qm-config and set qm). */
 #define CMM_CLIENT_EXIT_FAIL		(2)
 
 	int cmmClient(char * command, int argc, char **argv);
