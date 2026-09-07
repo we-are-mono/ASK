@@ -29,9 +29,10 @@ The components:
   compiler).
 - **Supporting libraries** — `libfci`, `fmlib`, `libcli`, and ASK-patched
   `libnfnetlink` / `libnetfilter_conntrack` (CMM's fast-path conntrack).
-- **Kernel side** — the `patches/kernel/` stack (`010`–`110`: the vendored
-  DPAA/FMAN SDK and ASK's hooks, applied onto stock mainline 6.12) and the board
-  device tree in `dts/`.
+- **Kernel side** — the `patches/kernel/` stack (`010`–`130`: the vendored
+  DPAA/FMAN SDK, ASK's hooks, and board drivers, applied onto stock mainline
+  6.12) and the board device tree in `dts/`. See
+  [fan control](docs/fan-control.md) for the EMC2305 kernel interface and testing.
 - **Runtime config** — FMAN port maps, PCD / soft-parser XML, module load order,
   and init scripts (`config/`, `dpa_app/files/`).
 
@@ -142,10 +143,12 @@ KASAN=1 make ask-image
 The image boots in RAM over TFTP from U-Boot on the lab board:
 
 ```sh
-make stage-image      # copy the image into $TFTP_ROOT (default /srv/tftp)
+make stage-image      # copy image + matching DTB into $TFTP_ROOT (default /srv/tftp)
 ```
 
 Then, at the DUT's U-Boot prompt: `tftpboot ${loadaddr} <name>; booti ${loadaddr} - ${fdtaddr}`.
+Also load the staged `mono-gateway-dk.dtb` into the DTB RAM buffer passed to
+`booti`; it contains the board's fan curve configuration.
 
 ### Make targets
 
@@ -156,7 +159,7 @@ harness — it does not build ASK components standalone.
 |--------|------|
 | `make setup` | install host build deps + locale (one-time, sudo) |
 | `make ask-image` | build the test image via kas |
-| `make stage-image` | copy the built image into the TFTP root |
+| `make stage-image` | copy the built image and matching DTB into the TFTP root |
 | `make deploy-agents` | install the askd test agent on the WAN/LAN hosts |
 | `make ask-test` | run the end-to-end pytest suite |
 

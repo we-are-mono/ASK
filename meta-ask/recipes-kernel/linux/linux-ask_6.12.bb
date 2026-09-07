@@ -76,6 +76,8 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://100-sdk_dpaa-ethtool-quiet-phyless-ports.patch \
            file://101-sdk_fman-sysfs-restore-irqs-on-early-return.patch \
            file://110-sdk-mainline-build-compat.patch \
+           file://120-emc2305-dt-fan-control.patch \
+           file://130-thermal-linear-governor.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

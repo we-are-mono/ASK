@@ -58,8 +58,7 @@ IMAGE_INSTALL = " \
     fmc \
     \
     \
-    lmsensors-fancontrol \
-    lmsensors-config-fancontrol \
+    lmsensors-sensors \
 "
 
 # Test harness (agent + python fuzzing/orchestration tooling + stress tools).

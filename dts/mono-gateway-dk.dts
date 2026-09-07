@@ -408,17 +408,20 @@
 				#size-cells = <0>;
 				#pwm-cells = <3>;
 
+				/* PWM requests: 0..255, with an unconditional 20% floor. */
 				fan0: fan@0 {
 					reg = <0>;
 					label = "System Fan 1";
-					pwms = <&fan_controller 26000 1 1>;
+					pwms = <&fan_controller 26000 PWM_POLARITY_INVERTED 1>;
+					microchip,pwm-min = <51>;
 					#cooling-cells = <2>;
 				};
 
 				fan1: fan@1 {
 					reg = <1>;
 					label = "System Fan 2";
-					pwms = <&fan_controller 26000 1 1>;
+					pwms = <&fan_controller 26000 PWM_POLARITY_INVERTED 1>;
+					microchip,pwm-min = <51>;
 					#cooling-cells = <2>;
 				};
 			};
@@ -1095,4 +1098,36 @@
 
 &fsldpaa {
 	dma-coherent;
+};
+
+/* Always run at least 20%; ramp from PWM 51 at 40 C to PWM 255 at 80 C. */
+&{/thermal-zones/cluster-thermal} {
+	polling-delay = <1000>;
+
+	trips {
+		fan_curve_start: fan-curve-start {
+			temperature = <40000>;
+			hysteresis = <0>;
+			type = "active";
+		};
+
+		fan_curve_full: fan-curve-full {
+			temperature = <80000>;
+			hysteresis = <0>;
+			type = "active";
+		};
+	};
+
+	/* The inherited map0 retains CPU throttling at 85 C. */
+	cooling-maps {
+		map-fan-start {
+			trip = <&fan_curve_start>;
+			cooling-device = <&fan0 51 255>, <&fan1 51 255>;
+		};
+
+		map-fan-full {
+			trip = <&fan_curve_full>;
+			cooling-device = <&fan0 255 255>, <&fan1 255 255>;
+		};
+	};
 };

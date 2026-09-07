@@ -59,14 +59,18 @@ ask-image:
 IMAGE_DEPLOY_DIR := $(CURDIR)/meta-ask/build/tmp/deploy/images/ask-ls1046a
 IMAGE_ARTIFACT   := $(IMAGE_DEPLOY_DIR)/Image.gz-initramfs-ask-ls1046a.bin
 IMAGE_BASENAME   := $(notdir $(IMAGE_ARTIFACT))
+IMAGE_DTB        := $(IMAGE_DEPLOY_DIR)/mono-gateway-dk.dtb
 stage-image:
 	@test -f $(IMAGE_ARTIFACT) || { echo "no image — run 'make ask-image' first" >&2; exit 1; }
+	@test -f $(IMAGE_DTB) || { echo "no device tree — run 'make ask-image' first" >&2; exit 1; }
 	sudo install -d $(TFTP_ROOT)
 	sudo install -m 0644 $(IMAGE_ARTIFACT) $(TFTP_ROOT)/$(TFTP_IMAGE_NAME)
+	sudo install -m 0644 $(IMAGE_DTB) $(TFTP_ROOT)/mono-gateway-dk.dtb
 	# Also stage under the Yocto artifact name so a U-Boot env set to fetch
 	# the raw filename keeps working. Hard link avoids the double-copy cost.
 	sudo ln -f $(TFTP_ROOT)/$(TFTP_IMAGE_NAME) $(TFTP_ROOT)/$(IMAGE_BASENAME)
 	@echo "==> staged $(TFTP_IMAGE_NAME) and $(IMAGE_BASENAME) ($$(stat -Lc%s $(TFTP_ROOT)/$(TFTP_IMAGE_NAME)) B)"
+	@echo "    matching device tree: mono-gateway-dk.dtb"
 	@echo "    at U-Boot: tftpboot \$${loadaddr} <name>; booti ..."
 
 # Install askd-agent onto the WAN host (local) and the LAN host (SSH over
