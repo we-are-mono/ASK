@@ -75,6 +75,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://099-sdk_fman-ehash-flex-arrays.patch \
            file://100-sdk_dpaa-ethtool-quiet-phyless-ports.patch \
            file://101-sdk_fman-sysfs-restore-irqs-on-early-return.patch \
+           file://102-sdk_dpaa-extend-stop-drain-delays.patch \
            file://110-sdk-mainline-build-compat.patch \
            file://120-emc2305-dt-fan-control.patch \
            file://130-thermal-linear-governor.patch \
