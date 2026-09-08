@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/dts-v1/;
+
+/ {
+	sfp-led-kunit;
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	i2c: i2c {
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pcs: ethernet-phy@0 {
+			reg = <0>;
+		};
+	};
+
+	sfp: sfp {
+		i2c-bus = <&i2c>;
+	};
+
+	mac: mac {
+		compatible = "fsl,fman-memac";
+		sfp = <&sfp>;
+		phy-connection-type = "xgmii";
+		pcs-handle = <&pcs>;
+		pcs-handle-names = "xfi";
+	};
+
+	dpaa {
+		fsl,fman-mac = <&mac>;
+	};
+
+	link: link-led {};
+	activity: activity-led {};
+	late: late-led {};
+
+	controller {
+		port0 {
+			sfp = <&sfp>;
+			leds = <&link>, <&activity>;
+		};
+		port1 {
+			sfp = <&sfp>;
+			leds = <&link>, <&late>;
+		};
+	};
+};

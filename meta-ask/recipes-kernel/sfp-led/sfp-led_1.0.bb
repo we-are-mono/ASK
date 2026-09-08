@@ -1,5 +1,5 @@
 SUMMARY = "SFP LED Control Kernel Module"
-DESCRIPTION = "Controls SFP port LEDs based on module presence and optical signal state"
+DESCRIPTION = "Controls SFP port LEDs using module presence, XFI PCS link state and packet counters"
 LICENSE = "GPL-2.0-or-later"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/GPL-2.0-or-later;md5=fed54355545ffd980b814dab4a3b312c"
 
