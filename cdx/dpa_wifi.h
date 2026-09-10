@@ -41,8 +41,6 @@
 #define NUM_ANN_LINES_IN_CACHE          1
 
 #define VAPDEV_BUFSIZE  1700
-#define VAPDEV_BUFCOUNT 1024
-#define VAPBUF_HEADROOM 128
 #define CDX_VWD_FWD_FQ_MAX (1 << 6)
 
 //values for state
@@ -56,6 +54,7 @@ struct vap_desc_s {
 	struct net_device 			*wifi_dev;
 	unsigned int				ifindex;
 	unsigned int				state;
+	u32					generation;
 	char								ifname[IFNAMSIZ];
 	unsigned char  				macaddr[ETH_ALEN];
 	unsigned short 				vapid;
@@ -86,6 +85,7 @@ struct vap_stats_s {
 	u32                                pkts_tx_no_head;
 	u32                                pkts_tx_non_linear;
 	u32                                pkts_tx_realign;
+	u32                                pkts_tx_copied;
 	u32                                pkts_tx_route;
 	u32                                pkts_tx_bridge;
 	u32                                pkts_direct_rx;
@@ -121,7 +121,6 @@ struct dpaa_vwd_priv_s {
 	struct device 				*vwd_device;
 	struct dpa_priv_s			*eth_priv;
 	struct dpa_bp 				*txconf_bp;
-	struct dpa_bp 				*tx_bp;
 	struct port_bman_pool_info		parent_pool_info;
 	uint32_t						oh_port_handle;
 	struct dpa_fq				*wlan_exception_fq;
@@ -140,6 +139,7 @@ struct dpaa_vwd_priv_s {
 struct vwd_global_stats_s {
 	u32 					pkts_total_local_tx;
 	u32 					pkts_slow_fail;
+	u32 					pkts_tx_errors;
 	u32 					pkts_dev_down_drop;
 };
 

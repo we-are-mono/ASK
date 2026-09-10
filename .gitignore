@@ -39,6 +39,9 @@ __pycache__/
 # Local setup notes — environment-specific, not part of the codebase
 IPSEC.md
 
+# Private NXP documentation and investigation notes
+/pdf/
+
 # OpenEmbedded / kas build output (oe-logs/oe-workdir are symlinks into the
 # bitbake work tree — no trailing slash so the symlinks match too)
 oe-logs

@@ -6,147 +6,79 @@
  * included with this distribution or at http://www.gnu.org/licenses/gpl-2.0.html
  *
  */
-#include <linux/module.h>
-#include <linux/kernel.h>
-//#include <linux/gfp.h>
-//#include <linux/slab.h>
-#include <linux/fsl_qman.h>
-#include <linux/fsl_bman.h>
 #include <linux/netdevice.h>
-#include <linux/inetdevice.h>
-//#include <net/if_inet6.h>
-//#include <uapi/linux/in6.h> 
-#include <linux/spinlock.h>
-//#include <linux/if_arp.h>
+
 #include "fm_vsp_ext.h"
 #include "lnxwrp_fm.h"
-#include <linux/fsl_oh_port.h>
 #include "dpaa_eth.h"
 #include "dpaa_eth_common.h"
 #include "mac.h"
 #include "portdefs.h"
-#include "cdx_defs.h"
 #include "misc.h"
-static struct dpa_bp *gs_dpa_vsp_bp;		/* VSP Buffer pool */
-
-#define DPAA_VSP_MAX_BUF_COUNT 512
-
-/* For all Buffer pools using the ethernet driver seed routine,
- * we'll be using the same   BPOOL size */
-#define DPAA_VSP_BUF_SIZE dpa_bp_size(NULL)
-
-static struct dpa_bp *dpa_vsp_bp_probe(struct net_device *net_dev)
-{
-	struct dpa_bp		*dpa_vsp_bp;
-	dpa_vsp_bp = devm_kzalloc(net_dev->dev.parent, sizeof(*dpa_vsp_bp), GFP_KERNEL);
-	if (unlikely(dpa_vsp_bp == NULL)) {
-		dev_err(net_dev->dev.parent, "devm_kzalloc() failed\n");
-		goto out;
-	}
-
-	dpa_vsp_bp->config_count = DPAA_VSP_MAX_BUF_COUNT;
-	dpa_vsp_bp->size = DPAA_VSP_BUF_SIZE;
-	dpa_vsp_bp->free_buf_cb = _dpa_bp_free_pf;
-	dpa_vsp_bp->dev = net_dev->dev.parent;
-	if (dpa_bp_alloc(dpa_vsp_bp, dpa_vsp_bp->dev)) {
-		dev_err(net_dev->dev.parent,"%s::dpa_bp_alloc failed for VSP\n", __func__);
-		devm_kfree(net_dev->dev.parent,dpa_vsp_bp);
-		goto out;
-	}
-	gs_dpa_vsp_bp = dpa_vsp_bp;
-#ifdef CDX_DPA_DEBUG
-	pr_info("%s:: VSP BPID %d created config_count %d \n",__func__,dpa_vsp_bp->bpid, dpa_vsp_bp->config_count);
-#endif
-	return dpa_vsp_bp;
-out:
-	return NULL;
-}
+#include "cdx_defs.h"
 
 int dpa_remove_virt_storage_profile(struct eth_iface_info *eth_info)
 {
-	if(eth_info->vsp_h)
-	{
+	if (eth_info->vsp_h) {
 		FM_VSP_Free(eth_info->vsp_h);
 		eth_info->vsp_h = NULL;
-		_dpa_bp_free(gs_dpa_vsp_bp);
 	}
 	return 0;
 }
 
 int dpa_add_virt_storage_profile(struct net_device *net_dev,
-			        struct eth_iface_info *eth_info)
+				struct eth_iface_info *eth_info)
 {
+	struct dpa_priv_s *priv = netdev_priv(net_dev);
+	t_LnxWrpFmPortDev *port =
+		(t_LnxWrpFmPortDev *)priv->mac_dev->port_dev[RX];
+	t_LnxWrpFmDev *fman = port->h_LnxWrpFmDev;
+	t_FmVspParams params = { 0 };
+	struct dpa_bp *bp;
+	t_Handle profile;
+	int err;
 
-	t_FmVspParams           fmVspParams;
-	t_LnxWrpFmDev           *p_LnxWrpFmDev;
-	t_LnxWrpFmPortDev *port = NULL;
-	struct dpa_priv_s	*priv;
+	if (!port->h_DfltVsp || !priv->dpa_bp)
+		return -EINVAL;
+	bp = dpa_bpid2pool(priv->dpa_bp->bpid);
+	if (!bp)
+		return -ENODEV;
 
-	int			 _errno;
+	/* Wi-Fi egress selects this profile when FMan copies a frame back
+	 * to the CPU. Use the Ethernet RX pool: it already contains skb-backed
+	 * buffers and VWD refills it through the Ethernet per-CPU accounting.
+	 * A separate unseeded pool drops every accelerated downlink packet;
+	 * seeding it alone still leaves refill accounting shared across pools.
+	 * The Ethernet driver owns the pool throughout this port's lifetime.
+	 */
+	params.h_Fm = fman->h_Dev;
+	params.portParams.portType = port->settings.param.portType;
+	params.portParams.portId = port->settings.param.portId;
+	params.relativeProfileId = 1;
+	params.extBufPools.numOfPoolsUsed = 1;
+	params.extBufPools.extBufPool[0].id = bp->bpid;
+	params.extBufPools.extBufPool[0].size = bp->size;
 
-	priv = netdev_priv(net_dev);
-	port = (t_LnxWrpFmPortDev *)priv->mac_dev->port_dev[RX];
-	if(!port->h_DfltVsp)
-	{
-		_errno = -EINVAL;
-		goto out;
-	}	
-
-	memset(&fmVspParams, 0, sizeof(fmVspParams));
-	p_LnxWrpFmDev = ((t_LnxWrpFmDev *)port->h_LnxWrpFmDev);
-	fmVspParams.h_Fm = p_LnxWrpFmDev->h_Dev;
-	fmVspParams.portParams.portType = port->settings.param.portType;
-	fmVspParams.portParams.portId   = port->settings.param.portId;
-	fmVspParams.relativeProfileId   = 1;
-	fmVspParams.extBufPools.numOfPoolsUsed = 1;
-
-	if(!gs_dpa_vsp_bp)
-	{
-		if(!dpa_vsp_bp_probe(net_dev))
-		{
-			_errno = -ENOMEM;
-			goto out;
-		}
+	profile = FM_VSP_Config(&params);
+	if (!profile) {
+		netdev_err(net_dev, "FM_VSP_Config failed\n");
+		return -EINVAL;
+	}
+	err = FM_VSP_ConfigBufferPrefixContent(profile, &port->buffPrefixContent);
+	if (err) {
+		netdev_err(net_dev, "FM_VSP_ConfigBufferPrefixContent failed\n");
+		goto free_profile;
+	}
+	err = FM_VSP_Init(profile);
+	if (err) {
+		netdev_err(net_dev, "FM_VSP_Init failed\n");
+		goto free_profile;
 	}
 
-	fmVspParams.extBufPools.extBufPool[0].id = gs_dpa_vsp_bp->bpid; 
-	fmVspParams.extBufPools.extBufPool[0].size = DPAA_VSP_BUF_SIZE;
-
-
-	eth_info->vsp_h = FM_VSP_Config(&fmVspParams);
-	if (!eth_info->vsp_h) {
-		_errno = -EINVAL;
-		netdev_err(net_dev, "FM_VSP_Config failed %d\n",
-				_errno);
-		goto out;
-	}
-
-	_errno = FM_VSP_ConfigBufferPrefixContent(eth_info->vsp_h, &port->buffPrefixContent);
-	if (_errno) {
-		_errno = -EINVAL;
-		netdev_err(net_dev, "FM_VSP_ConfigBufferPrefixContent failed %d\n",
-				_errno);
-		goto out;
-	}
-
-	_errno = FM_VSP_Init(eth_info->vsp_h);
-	if (_errno) {
-		_errno = -EINVAL;
-		netdev_err(net_dev, "FM_VSP_Init failed %d\n", _errno);
-		goto out;
-	}
-#ifdef CDX_DPA_DEBUG
-	pr_info("%s:Configured storage profile -relative id %u bpid %u size %u for %s\n",
-			__func__,
-			1,
-			fmVspParams.extBufPools.extBufPool[0].id ,
-			fmVspParams.extBufPools.extBufPool[0].size,
-			net_dev->name);
-#endif
+	eth_info->vsp_h = profile;
 	return 0;
 
-out:
-	dpa_remove_virt_storage_profile(eth_info);
-	return _errno;
+free_profile:
+	FM_VSP_Free(profile);
+	return -EINVAL;
 }
-

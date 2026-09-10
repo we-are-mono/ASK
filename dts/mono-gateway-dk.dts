@@ -149,7 +149,10 @@
 			fman0_oh_0x4-extended-args {
 				cell-index = <0x02>;  /* matches port@84000 SDK cell-index */
 				compatible = "fsl,fman-port-op-extended-args";
-				fifo-size = <0x900 0x00>;
+				/* Wi-Fi frames need room for the offline-port pipeline
+				 * and internal context as well as the frame itself.
+				 */
+				fifo-size = <0x3200 0x00>;
 				buffer-layout = <0x60 0x40>;
 			};
 
