@@ -525,7 +525,7 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 	 * A24b: if cdx_dpa_ipsecsa_release fails (qman_oos_fq did not move
 	 * the FQ to OOS), QMan still owns the sainfo memory and may invoke
 	 * dqrr/ern callbacks on it. Freeing the per-SA crypto material below
-	 * — cipher_key, auth_key, split_key, extra_cmds, rjob_desc — would
+	 * — cipher_key, auth_key, split_key, extra_cmds — would
 	 * UAF those buffers from the SEC pipeline (they are DMA-mapped while
 	 * any in-flight op is still resident). Leak the sec_context entirely
 	 * and let the operator restart to recover the resources. The leak is
@@ -579,8 +579,6 @@ void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context )
 		kfree_sensitive(pdpa_sec_context->auth_data.split_key);
 	if(pdpa_sec_context->sec_desc_extra_cmds_unaligned)
 		kfree(pdpa_sec_context->sec_desc_extra_cmds_unaligned);
-	if(pdpa_sec_context->rjob_desc_unaligned)
-		kfree(pdpa_sec_context->rjob_desc_unaligned);
 	kfree(pdpa_sec_context);
 }
 
@@ -830,29 +828,12 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 			pdpa_sec_context->sec_desc_extra_cmds)
 		pdpa_sec_context->sec_desc_extra_cmds += L1_CACHE_BYTES / 4;
 
-	/*
-	 * Allocate space for the SEC replacement job descriptor
-	 * Required 64 byte alignment
-	 */
-	pdpa_sec_context->rjob_desc_unaligned =
-		kzalloc(MAX_CAAM_DESCSIZE * sizeof(U32) + 64,
-				GFP_KERNEL);
-	if (!pdpa_sec_context->rjob_desc_unaligned) {
-		log_err("No memory for replacement job descriptor\n");
-		cdx_ipsec_sec_sa_context_free(pdpa_sec_context); 
-		return NULL;
-	}
-	memset(pdpa_sec_context->rjob_desc_unaligned, 0,(MAX_CAAM_DESCSIZE * sizeof(U32)+64));
-	pdpa_sec_context->rjob_desc = 
-		PTR_ALIGN(pdpa_sec_context->rjob_desc_unaligned, 64);
 	pdpa_sec_context->dpa_ipsecsa_handle  = cdx_dpa_ipsecsa_alloc(NULL, handle);
 	if(pdpa_sec_context->dpa_ipsecsa_handle){
 		pdpa_sec_context->sec_desc =
 			get_shared_desc(pdpa_sec_context->dpa_ipsecsa_handle);
 		pdpa_sec_context->to_sec_fqid =
 			get_fqid_to_sec(pdpa_sec_context->dpa_ipsecsa_handle);
-		pdpa_sec_context->from_sec_fqid =
-			get_fqid_from_sec(pdpa_sec_context->dpa_ipsecsa_handle);
 		pdpa_sec_context->to_cp_fqid =
 			ipsec_get_to_cp_fqid(pdpa_sec_context->dpa_ipsecsa_handle);
 	}

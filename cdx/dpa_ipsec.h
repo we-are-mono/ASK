@@ -94,7 +94,6 @@ int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td,
 			uint32_t* portid);
 int cdx_dpa_ipsecsa_release(void *handle) ;
 uint32_t get_fqid_to_sec(void *handle);
-uint32_t get_fqid_from_sec(void *handle);
 uint32_t ipsec_get_to_cp_fqid(void *handle);
 
 struct sec_descriptor *get_shared_desc(void *handle);

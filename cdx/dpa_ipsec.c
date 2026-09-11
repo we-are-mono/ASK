@@ -147,10 +147,6 @@ uint32_t get_fqid_to_sec(void *handle)
 	return (((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_TO_SEC].fqid);
 }
 
-uint32_t get_fqid_from_sec(void *handle)
-{
-	return (((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_FROM_SEC].fqid);
-}
 struct qman_fq *get_to_sec_fq(void *handle)
 {
 	return (struct qman_fq *)&(((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_TO_SEC]);

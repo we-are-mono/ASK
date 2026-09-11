@@ -335,7 +335,6 @@ struct auth_params {
 #define SA_RELEASE_MAX_ITER 30
 typedef struct dpa_sec_sa_context_s{
 	U32   to_sec_fqid;
-	U32   from_sec_fqid;
 	U32   to_cp_fqid;
 
         void  *dpa_ipsecsa_handle;
@@ -347,8 +346,6 @@ typedef struct dpa_sec_sa_context_s{
                                           * do not free this pointer!         */
         U32  *sec_desc_extra_cmds_unaligned;
         U32   *sec_desc_extra_cmds; /* aligned to CORE cache line size     */
-        U32   *rjob_desc_unaligned;
-	U32 *rjob_desc; /* replacement job descriptor address            */
         U8  job_desc_len; /* Number of words CAAM Job Descriptor occupies
                                 * form the CAAM Descriptor length
                                 * MAX_CAAM_DESCSIZE                           */

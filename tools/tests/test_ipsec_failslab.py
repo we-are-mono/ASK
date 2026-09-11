@@ -1,10 +1,10 @@
 """Failslab sweep over CMD_IPSEC_SA_CREATE — M7-class regression net.
 
 Drives cdx_ipsec_sec_sa_context_alloc (cdx/cdx_dpa_ipsec.c) into NULL via
-fork-isolated failslab. The five kzalloc(GFP_KERNEL) sites are reached
+fork-isolated failslab. The key and descriptor allocations are reached
 during CREATE — invoked from M_ipsec_sa_cache_create immediately after
-sa_alloc(). On NULL the allocator's unwind unmaps prior DMA maps and
-frees prior key buffers; the caller then sa_free()s the SA struct.
+sa_alloc(). On NULL the allocator frees the buffers allocated so far;
+the caller then sa_free()s the SA struct.
 
 Oracles:
   - splat_window — no oops/lockdep/UBSAN/KASAN reports during the sweep.
