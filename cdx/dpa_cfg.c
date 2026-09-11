@@ -27,6 +27,7 @@
 #include "misc.h"
 #include "lnxwrp_fm.h"
 #include "cdx_ceetm_gdef.h"
+#include "layer2.h"
 
 //#define DPA_CFG_DEBUG 	1
 
@@ -59,6 +60,10 @@ static struct dpa_fq *dpa_pcd_fq;
 
 /*
  * Concurrency:
+ *   cdx_info->ctrl.mutex, then dpa_cfg_lock
+ *      - Excludes FCI commands and timers while startup publishes or
+ *        unwinds interfaces and classifier metadata.
+ *
  *   dpa_cfg_lock (file-local mutex)
  *      - Serializes the one-shot install of the DPA configuration
  *        (fman_info, num_fmans, associated port/table/
@@ -83,6 +88,26 @@ static struct dpa_fq *dpa_pcd_fq;
  *   dpa_get_*() readers              - any context, lock-free after init.
  */
 static DEFINE_MUTEX(dpa_cfg_lock);
+
+#ifdef CDX_DEBUG_DPA_INIT
+static unsigned int dpa_init_fail_step;
+static unsigned int dpa_init_step;
+static char *dpa_init_fail_site;
+module_param(dpa_init_fail_step, uint, 0400);
+module_param(dpa_init_fail_site, charp, 0400);
+MODULE_PARM_DESC(dpa_init_fail_step, "Fail the selected CDX startup acquisition (test image)");
+MODULE_PARM_DESC(dpa_init_fail_site, "Restrict startup fault counting to this function (test image)");
+
+bool cdx_dpa_init_fault_at(const char *site)
+{
+	if (dpa_init_fail_site && strcmp(site, dpa_init_fail_site))
+		return false;
+	if (++dpa_init_step != dpa_init_fail_step)
+		return false;
+	pr_info("cdx: injecting DPA startup failure at %s step %u\n", site, dpa_init_step);
+	return true;
+}
+#endif
 
 #ifdef DPA_CFG_DEBUG
 //show port related info
@@ -637,7 +662,8 @@ static int cdxdrv_set_miss_action(uint32_t fm_index)
 }
 
 //initialize fman handles and init iface stats
-static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
+static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo,
+		t_LnxWrpFmDev **wrapper)
 {
 	//translate pcd handle from uspace
 	struct file *fm_pcd_file;
@@ -681,8 +707,114 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 	finfo->muram_handle = fm_wrapper_dev->h_MuramDev;
 	finfo->physicalMuramBase = fm_wrapper_dev->fmMuramPhysBaseAddr;
 	finfo->fmMuramMemSize = fm_wrapper_dev->fmMuramMemSize;
+	*wrapper = fm_wrapper_dev;
 	fput(fm_pcd_file);
 	return 0;
+}
+
+struct dpa_init_ports {
+	t_Handle *handles;
+	uint32_t count;
+};
+
+/* Resolve every port before stopping any of them. These are the same port
+ * indices used by FMC's device nodes; the OH host-command port is excluded. */
+static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
+		struct dpa_init_ports *ports)
+{
+	uint32_t ii, jj, count = 0;
+
+	for (ii = 0; ii < num_fmans; ii++)
+		count += fman_info[ii].max_ports;
+	ports->handles = kcalloc(count, sizeof(*ports->handles), GFP_KERNEL);
+	if (!ports->handles)
+		return -ENOMEM;
+	for (ii = 0; ii < num_fmans; ii++) {
+		t_LnxWrpFmDev *fm = wrappers[ii];
+
+		for (jj = 0; jj < fman_info[ii].max_ports; jj++) {
+			struct cdx_port_info *info = &fman_info[ii].portinfo[jj];
+			t_LnxWrpFmPortDev *port;
+			uint32_t index = info->index;
+
+			if (info->fm_index != fm->id)
+				return -EINVAL;
+			switch (info->type) {
+			case 0:
+				if (!index || index > ARRAY_SIZE(fm->opPorts))
+					return -EINVAL;
+				port = &fm->opPorts[index - 1];
+				break;
+			case 10:
+				if (index >= FM_MAX_NUM_OF_10G_RX_PORTS)
+					return -EINVAL;
+				port = &fm->rxPorts[index + FM_MAX_NUM_OF_1G_RX_PORTS];
+				break;
+			case 1:
+				if (index >= FM_MAX_NUM_OF_1G_RX_PORTS)
+					return -EINVAL;
+				port = &fm->rxPorts[index];
+				break;
+			default:
+				return -EINVAL;
+			}
+			if (!port->active || !port->h_Dev)
+				return -ENODEV;
+			ports->handles[ports->count++] = port->h_Dev;
+		}
+	}
+	return 0;
+}
+
+static int dpa_set_ports_enabled(struct dpa_init_ports *ports, bool enabled)
+{
+	uint32_t ii;
+	int ret = 0;
+
+	for (ii = 0; ii < ports->count; ii++) {
+		t_Error err = enabled ? FM_PORT_Enable(ports->handles[ii]) :
+			FM_PORT_Disable(ports->handles[ii]);
+
+		if (err) {
+			DPA_ERROR("%s::cannot %s port %u\n", __func__,
+					enabled ? "enable" : "disable", ii);
+			ret = -EIO;
+		}
+	}
+	return ret;
+}
+
+static void dpa_release_pcd_fqs(void)
+{
+	cdx_destroy_fq_list(&dpa_pcd_fq);
+	cdx_reset_offline_ports();
+}
+
+/* Ports remain stopped until the loader removes FMC's classifier objects.
+ * Keep FMAN/MURAM metadata alive until all dependent resources are gone. */
+static int dpa_rollback_resources(void)
+{
+	uint32_t ii;
+	int ret;
+
+	dpa_release_pcd_fqs();
+	for (ii = 0; ii < MAX_PHY_PORTS; ii++) {
+		if (phy_port[ii].flags) {
+			remove_onif_by_index(phy_port[ii].itf.index);
+			memset(&phy_port[ii], 0, sizeof(phy_port[ii]));
+			phy_port[ii].id = ii;
+		}
+	}
+	ret = cdxdrv_release_port_policer_slots();
+#ifdef ENABLE_EGRESS_QOS
+	if (ceetm_exit_cq_plcr())
+		ret = -EIO;
+#endif
+	for (ii = 0; ii < num_fmans; ii++)
+		if (cdxdrv_release_shared_policers(&fman_info[ii]))
+			ret = -EIO;
+	dpa_release_iflist();
+	return ret;
 }
 
 
@@ -703,6 +835,9 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 {
 	struct cdx_ctrl_set_dpa_params params;
 	struct cdx_fman_info *finfo;
+	t_LnxWrpFmDev *wrappers[CDX_MAX_FMANS];
+	struct dpa_init_ports ports = { 0 };
+	bool resources_started = false;
 	uint32_t ii;
 	int retval;
 
@@ -717,10 +852,12 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 				__func__, params.num_fmans, CDX_MAX_FMANS);
 		return -EINVAL;
 	}
+	mutex_lock(&cdx_info->ctrl.mutex);
 	mutex_lock(&dpa_cfg_lock);
 	if (fman_info) {
 		DPA_ERROR("%s::dpa params already set\n", __func__);
 		mutex_unlock(&dpa_cfg_lock);
+		mutex_unlock(&cdx_info->ctrl.mutex);
 		return -EBUSY;
 	}
 	fman_info = kcalloc(params.num_fmans, sizeof(struct cdx_fman_info),
@@ -729,6 +866,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		DPA_ERROR("%s::unable to allocate mem for fman_info\n",
 				__func__);
 		mutex_unlock(&dpa_cfg_lock);
+		mutex_unlock(&cdx_info->ctrl.mutex);
 		return -ENOMEM;
 	}
 	num_fmans = params.num_fmans;
@@ -747,8 +885,16 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	 * same fman's tbl_info unset. get_port_info()/get_cctbl_info()
 	 * re-source each base from the userspace array (params.fman_info). */
 	for (ii = 0; ii < num_fmans; ii++) {
+		uint32_t jj;
+
 		fman_info[ii].portinfo = NULL;
 		fman_info[ii].tbl_info = NULL;
+		fman_info[ii].fm_handle = NULL;
+		fman_info[ii].muram_handle = NULL;
+		for (jj = 0; jj < CDX_EXPT_MAX_EXPT_LIMIT_TYPES; jj++)
+			fman_info[ii].expt_rate_limit_info[jj].handle = NULL;
+		for (jj = 0; jj < INGRESS_ALL_POLICER_QUEUES; jj++)
+			fman_info[ii].ingress_policer_info[jj].handle = NULL;
 	}
 	if (retval) {
 		DPA_ERROR("%s::Read fman_info failed\n",
@@ -759,19 +905,13 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	//init the fman handles
 	finfo = fman_info;
 	for (ii = 0; ii < num_fmans; ii++) {
-		if (cdxdrv_get_fman_handles(finfo)) {
+		if (cdxdrv_get_fman_handles(finfo, &wrappers[ii])) {
 			retval = -EIO;
 			goto err_ret;
 		}
 		finfo++;
 	}
 	finfo = fman_info;
-	//init interface stats module
-	if (cdxdrv_init_stats(finfo->muram_handle)) {
-		retval = -EIO;
-		goto err_ret;
-	}
-
 	for (ii = 0; ii < num_fmans; ii++) {
 		//get port info
 		retval = get_port_info(finfo, params.fman_info, ii);
@@ -782,6 +922,19 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		if (retval)
 			goto err_ret;
 		finfo++;
+	}
+	retval = dpa_prepare_ports(wrappers, &ports);
+	if (retval)
+		goto err_ret;
+	retval = dpa_set_ports_enabled(&ports, false);
+	if (retval) {
+		dpa_set_ports_enabled(&ports, true);
+		goto err_ret;
+	}
+	resources_started = true;
+	if (cdxdrv_init_stats(fman_info->muram_handle) || cdx_dpa_init_fault()) {
+		retval = -EIO;
+		goto err_ret;
 	}
 	finfo = fman_info;
 	//loop thru all fmans
@@ -796,7 +949,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 #ifdef DPA_CFG_DEBUG
 				DPA_INFO("%s::oh port %s found\n", __func__, port_info->name);
 #endif
-				if (cdx_add_oh_iface(port_info->name)) {
+				if (cdx_add_oh_iface(port_info->name) || cdx_dpa_init_fault()) {
 					DPA_ERROR("%s::port %s add failed\n",
 							__func__, port_info->name);
 					retval = -EIO;
@@ -813,7 +966,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 #ifdef DPA_CFG_DEBUG
 				DPA_INFO("%s::adding port %s\n", __func__, port_info->name);
 #endif
-				if (cdx_add_eth_onif(port_info->name)) {
+				if (cdx_add_eth_onif(port_info->name) || cdx_dpa_init_fault()) {
 					DPA_ERROR("%s::port %s add failed\n", 
 							__func__, port_info->name);
 					retval = -EIO;
@@ -841,27 +994,37 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	}
 #endif
 #ifdef ENABLE_EGRESS_QOS
-	if (ceetm_init_cq_plcr()) {
+	if (ceetm_init_cq_plcr() || cdx_dpa_init_fault()) {
 		retval = -EIO;
 		goto err_ret;
 	}
 #endif
 	//init the fman and its ports
 	for (ii = 0; ii < num_fmans; ii++) {
-		if (cdxdrv_set_miss_action(ii)) {
+		if (cdxdrv_set_miss_action(ii) || cdx_dpa_init_fault()) {
 			retval = -EIO;
 			goto err_ret;
 		}
 	}
+	retval = dpa_set_ports_enabled(&ports, true);
+	if (retval) {
+		dpa_set_ports_enabled(&ports, false);
+		goto err_ret;
+	}
 	display_dpa_cfg();
+	kfree(ports.handles);
 	mutex_unlock(&dpa_cfg_lock);
+	mutex_unlock(&cdx_info->ctrl.mutex);
 	return 0;
 err_ret:
-#ifdef ENABLE_EGRESS_QOS
-	ceetm_exit_cq_plcr();
-#endif
+	if (resources_started && dpa_rollback_resources()) {
+		pr_err("cdx: DPA resource cleanup failed; reboot before retrying\n");
+		retval = -EUCLEAN;
+	}
+	kfree(ports.handles);
 	release_cfg_info();
 	mutex_unlock(&dpa_cfg_lock);
+	mutex_unlock(&cdx_info->ctrl.mutex);
 	return retval;
 }
 

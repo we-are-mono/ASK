@@ -138,7 +138,6 @@ static DEVICE_ATTR(vwd_fast_path_enable, 0644, vwd_show_fast_path_enable, vwd_se
 static struct device_attribute dev_attr_vap[MAX_WIFI_VAPS];
 static DEVICE_ATTR(vwd_oh_buff_limit, 0644, vwd_show_oh_buff_limit, vwd_set_oh_buff_limit);
 static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq, const struct qm_dqrr_entry *dq);
-static void vwd_fq_destroy(struct qman_fq *fq);
 static void vwd_release_pcd_fqs(struct dpaa_vwd_priv_s *priv);
 void drain_bp_tx_done_bpool(struct dpa_bp *bp);
 
@@ -1856,51 +1855,6 @@ static int create_vap_fqs(struct vap_desc_s *vap)
 	return 0;
 }
 
-/* Destroys Frame Queues */
-static void vwd_fq_destroy(struct qman_fq *fq)
-{
-	enum qman_fq_state state;
-	u32 flags;
-	int ret;
-
-	/* Retirement may be asynchronous. Keep the FQ and its callback data
-	 * alive until QMan has returned every frame and accepted OOS.
-	 */
-	for (;;) {
-		qman_fq_state(fq, &state, &flags);
-		if (state == qman_fq_state_oos)
-			break;
-		if (flags & (QMAN_FQ_STATE_CHANGING | QMAN_FQ_STATE_ORL))
-			goto wait;
-		if (state != qman_fq_state_retired) {
-			ret = qman_retire_fq(fq, NULL);
-			if (ret < 0)
-				pr_warn_ratelimited("vwd: cannot retire FQ %u: %d\n",
-						    fq->fqid, ret);
-			goto wait;
-		}
-		if (flags & QMAN_FQ_STATE_NE) {
-			ret = qman_volatile_dequeue(fq,
-					QMAN_VOLATILE_FLAG_WAIT |
-					QMAN_VOLATILE_FLAG_FINISH,
-					QM_VDQCR_NUMFRAMES_TILLEMPTY);
-			if (ret)
-				goto wait;
-		}
-		ret = qman_oos_fq(fq);
-		if (!ret)
-			break;
-		pr_warn_ratelimited("vwd: cannot take FQ %u out of service: %d\n",
-				    fq->fqid, ret);
-wait:
-		usleep_range(1000, 2000);
-	}
-
-	/* The portal updates its FQ state before returning from the callback. */
-	synchronize_net();
-	cdx_remove_fqid_info_in_procfs(fq->fqid);
-	qman_destroy_fq(fq, 0);
-}
 
 
 static int release_vap_fqs(struct vap_desc_s *vap)
@@ -1919,7 +1873,7 @@ static int release_vap_fqs(struct vap_desc_s *vap)
 #ifdef DPA_WIFI_DEBUG
 			DPAWIFI_INFO("%s:: releasing fq from fman :%d\n", __func__, vap->wlan_fq_from_fman[i]->fqid);
 #endif
-			vwd_fq_destroy(&vap->wlan_fq_from_fman[i]->fq_base);
+			cdx_destroy_fq(&vap->wlan_fq_from_fman[i]->fq_base);
 			kfree(vap->wlan_fq_from_fman[i]);
 			vap->wlan_fq_from_fman[i] = NULL;
 		}
@@ -1930,7 +1884,7 @@ static int release_vap_fqs(struct vap_desc_s *vap)
 #ifdef DPA_WIFI_DEBUG
 		DPAWIFI_INFO("%s:: releasing fq to fman :%d\n", __func__, vap->wlan_fq_to_fman->fqid);
 #endif
-		vwd_fq_destroy(&vap->wlan_fq_to_fman->fq_base);
+		cdx_destroy_fq(&vap->wlan_fq_to_fman->fq_base);
 		kfree(vap->wlan_fq_to_fman);
 		vap->wlan_fq_to_fman = NULL;
 	}
@@ -2519,7 +2473,7 @@ static void vwd_release_pcd_fqs(struct dpaa_vwd_priv_s *priv)
 		for (i = 0; i < priv->expt_fq_count; i++)
 		{
 			fq= &dpafq->fq_base;
-			vwd_fq_destroy(fq);
+			cdx_destroy_fq(fq);
 			dpafq++;
 		}
 		kfree(priv->wlan_exception_fq);

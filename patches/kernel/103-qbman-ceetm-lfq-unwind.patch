@@ -11,15 +11,19 @@ consume pending MR entries before destroying the FQ lookup entries.
 Poll the MR directly: disabling its IRQ source clears the status bit,
 so the normal status-driven slow poll cannot serve as this barrier.
 
+Read the hardware enqueue consumer index when checking for an empty
+ring: CI stashing can leave the cached index behind the final completion.
+Keep cached enqueue accounting unchanged so subsequent enqueues cannot
+misinterpret a stale cache value as consumer wraparound.
+
 Upstream-Status: Pending
 
 --- a/drivers/staging/fsl_qbman/qman_high.c
 +++ b/drivers/staging/fsl_qbman/qman_high.c
-@@ -1538,6 +1538,27 @@
- 	return ret;
+@@ -1539,6 +1539,27 @@ u32 qman_poll_slow(void)
  }
  EXPORT_SYMBOL(qman_poll_slow);
-+
+ 
 +void qman_drain_ern(void)
 +{
 +	struct qman_portal *p = get_raw_affine_portal();
@@ -40,10 +44,20 @@ Upstream-Status: Pending
 +	put_affine_portal();
 +}
 +EXPORT_SYMBOL(qman_drain_ern);
- 
++
  /* Legacy wrapper */
  void qman_p_poll(struct qman_portal *p)
-@@ -5308,8 +5308,10 @@
+ {
+@@ -2533,7 +2554,7 @@ int qman_eqcr_is_empty(void)
+ 
+ 	PORTAL_IRQ_LOCK(p, irqflags);
+ 	update_eqcr_ci(p, 0);
+-	avail = qm_eqcr_get_fill(&p->p);
++	avail = qm_eqcr_get_hw_fill(&p->p);
+ 	PORTAL_IRQ_UNLOCK(p, irqflags);
+ 	put_affine_portal();
+ 	return avail == 0;
+@@ -5308,8 +5329,10 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
  		return -ENODEV;
  	}
  	p = kmalloc(sizeof(*p), GFP_KERNEL);
@@ -56,7 +70,7 @@ Upstream-Status: Pending
  	memset(&lfqmt_config, 0, sizeof(struct qm_mcc_ceetm_lfqmt_config));
  	p->idx = lfqid;
  	p->dctidx = (u16)(lfqid & CEETM_LFQMT_LFQID_LSB);
-@@ -5326,10 +5328,18 @@
+@@ -5326,10 +5349,18 @@ int qman_ceetm_lfq_claim(struct qm_ceetm_lfq **lfq,
  				lfqid, cq->idx);
  		list_del(&p->node);
  		kfree(p);
@@ -94,3 +108,23 @@ Upstream-Status: Pending
  
  /**
   * qman_poll - legacy wrapper for qman_poll_dqrr() and qman_poll_slow()
+--- a/drivers/staging/fsl_qbman/qman_low.h
++++ b/drivers/staging/fsl_qbman/qman_low.h
+@@ -517,6 +517,17 @@ static inline u8 qm_eqcr_get_avail(struct qm_portal *portal)
+ 	return eqcr->available;
+ }
+ 
++/* CI stashing can leave the cached index behind the final one or two
++ * completions. Teardown must read the hardware consumer index without
++ * advancing the cached accounting used by later enqueue operations. */
++static inline u8 qm_eqcr_get_hw_fill(struct qm_portal *portal)
++{
++	struct qm_eqcr *eqcr = &portal->eqcr;
++	u8 ci = qm_in(EQCR_CI_CINH) & (QM_EQCR_SIZE - 1);
++
++	return qm_cyc_diff(QM_EQCR_SIZE, ci, EQCR_PTR2IDX(eqcr->cursor));
++}
++
+ static inline u8 qm_eqcr_get_fill(struct qm_portal *portal)
+ {
+ 	register struct qm_eqcr *eqcr = &portal->eqcr;

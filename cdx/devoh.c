@@ -67,6 +67,11 @@ static struct oh_port_type ohport_assign[] =
 
 static struct oh_port_info offline_port_info[MAX_FRAME_MANAGERS][MAX_OF_PORTS];
 
+void cdx_reset_offline_ports(void)
+{
+	memset(offline_port_info, 0, sizeof(offline_port_info));
+}
+
 extern int FM_PORT_SetOhPortOfne(uint32_t fmidx, uint32_t portidx, uint32_t nia_val);
 static enum qman_cb_dqrr_result ofport_rx_defa(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq);
@@ -296,6 +301,9 @@ int dpa_add_oh_if(char *name)
 #endif
 	return SUCCESS;
 err_ret:
+	cdx_remove_dir_in_procfs(&iface_info->tx_proc_entry);
+	cdx_remove_dir_in_procfs(&iface_info->rx_proc_entry);
+	cdx_remove_dir_in_procfs(&iface_info->pcd_proc_entry);
 	kfree(iface_info);
 	return FAILURE;
 }
@@ -484,6 +492,8 @@ int cdxdrv_create_of_fqs(struct dpa_iface_info *dpa_oh_iface_info)
 			return -1;
 		}
 		add_pcd_fq_info(dpa_fq);
+		if (cdx_dpa_init_fault())
+			return -EIO;
 #ifdef DEVOH_DEBUG
 		DPA_INFO("%s::%d, fqid 0x%x created chnl 0x%x\n",
 				__func__, ii, dpa_fq->fqid, dpa_fq->channel);

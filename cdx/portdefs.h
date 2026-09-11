@@ -193,6 +193,9 @@ struct dpa_iface_info {
 
 int find_pcd_fq_info(uint32_t fqid);
 void add_pcd_fq_info(struct dpa_fq *fq_info);
+void cdx_destroy_fq(struct qman_fq *fq);
+void cdx_destroy_fq_list(struct dpa_fq **head);
+void cdx_reset_offline_ports(void);
 int get_dpa_eth_iface_info(struct eth_iface_info *iface_info, char *name);
 int cdxdrv_create_of_fqs(struct dpa_iface_info *iface_info);
 int get_ofport_fman_and_portindex(uint32_t fm_index, uint32_t handle, uint32_t* fm_idx, uint32_t* port_idx,

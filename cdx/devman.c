@@ -14,6 +14,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/gfp.h>
 #include <linux/slab.h>
@@ -141,7 +142,7 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 	struct eth_iface_info *eth_info = &(iface_info->eth_info);
 	struct qman_fq *fq;
 	struct qm_mcc_initfq opts;
-	uint32_t ii;
+	uint32_t ii, created = 0;
 
 	fq = &eth_info->fwd_tx_fqinfo[0];
 	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
@@ -179,6 +180,9 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 		}
 		/* creating /proc/fqid_stats dir for listing fqids */
 		cdx_create_type_fqid_info_in_procfs(fq, TX_DIR, iface_info->tx_proc_entry, NULL);
+		created++;
+		if (cdx_dpa_init_fault())
+			goto err_ret;
 #ifdef DEVMAN_DEBUG
 		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n", 
 				__func__, fq->fqid, eth_info->tx_channel_id);
@@ -188,26 +192,8 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 	return 0;
 
 err_ret:
-	/* Present ii index fq already deleted, so it is checking with ii > 0 
-	 * instead of ii >= 0 */
-	for (; ii > 0; ii--, fq--) {
-		if (qman_retire_fq(fq, NULL)) {
-			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		if (qman_oos_fq(fq)) {
-			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		cdx_remove_fqid_info_in_procfs(fq->fqid);
-		qman_destroy_fq(fq, 0);
-#ifdef DEVMAN_DEBUG
-		DPA_INFO("%s::created fq 0x%x chnl id 0x%x\n", 
-				__func__, fq->fqid, eth_info->tx_channel_id);
-#endif
-	}
+	while (created)
+		cdx_destroy_fq(&eth_info->fwd_tx_fqinfo[--created]);
 	return FAILURE;
 }
 
@@ -1691,15 +1677,10 @@ check_parent:
 
 static void free_stats(struct dpa_iface_info *info);
 
-/* Last-gasp deinit sweep: free whatever is still on the interface
- * list. On a clean teardown the FCI tx_exit path has already released
- * every onif-tracked interface through dpa_release_interface, so what
- * remains are the injection-created OFPORT fixtures; the eth arm is a
- * backstop for nodes tx_exit's onif sweep missed, whose leaked
- * dev_get_by_name refs would hang unregister_netdevice forever.
- * No FMan HW teardown here: this runs last in the LIFO
- * deinit chain, when the HW state is already torn down or was never
- * fully up. Unpublish, drop refs, free memory. */
+/* Free the remaining interface records and their statistics pool after
+ * onif teardown. Startup rollback also uses this sweep, after stopping
+ * ports and draining queues. FMAN metadata must remain available until
+ * the MURAM allocation has been returned. */
 void dpa_release_iflist(void)
 {
 	struct dpa_iface_info *iface_info;
@@ -2074,11 +2055,6 @@ err_ret6:
 	dpa_bman_restore_discard_mask(iface_info);
 err_ret5:
 #endif
-	/* Note: dpa_remove_ethport_ff_policier_profile() leaks the
-	 * one alloc-profile slot intentionally — FM_PORT_PcdPlcrFreeProfiles
-	 * is only legal before FM_PORT_SetPCD(), and the DPAA driver has
-	 * already called SetPCD by the time we run. See the helper's
-	 * comment for details. */
 	dpa_remove_ethport_ff_policier_profile(iface_info);
 err_ret4:
 	dpa_remove_virt_storage_profile(&iface_info->eth_info);
@@ -2095,9 +2071,9 @@ err_stats:
 	}
 #endif
 err_ret2:
-	proc_remove(((cdx_proc_dir_entry_t *)(iface_info->pcd_proc_entry))->proc_dir);
+	cdx_remove_dir_in_procfs(&iface_info->pcd_proc_entry);
 err_ret1:
-	proc_remove(((cdx_proc_dir_entry_t *)(iface_info->tx_proc_entry))->proc_dir);
+	cdx_remove_dir_in_procfs(&iface_info->tx_proc_entry);
 err_ret:
 	/* get_eth_iface_info holds a dev_get_by_name ref once net_dev is
 	 * set; released on no other error path (normal release is in
@@ -2652,6 +2628,77 @@ int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq)
 	return -1;
 }
 
+/* The producer must be stopped before draining a queue. */
+static void cdx_drain_fq(struct qman_fq *fq)
+{
+	enum qman_fq_state state;
+	u32 flags;
+	int ret;
+
+	/* Retirement may be asynchronous. Keep the FQ and its callback data
+	 * alive until QMan has returned every frame and accepted OOS.
+	 */
+	for (;;) {
+		qman_fq_state(fq, &state, &flags);
+		if (state == qman_fq_state_oos)
+			break;
+		if (flags & (QMAN_FQ_STATE_CHANGING | QMAN_FQ_STATE_ORL))
+			goto wait;
+		if (state != qman_fq_state_retired) {
+			ret = qman_retire_fq(fq, NULL);
+			if (ret < 0)
+				pr_warn_ratelimited("cdx: cannot retire FQ %u: %d\n",
+						    fq->fqid, ret);
+			goto wait;
+		}
+		if (flags & QMAN_FQ_STATE_NE) {
+			ret = qman_volatile_dequeue(fq,
+					QMAN_VOLATILE_FLAG_WAIT |
+					QMAN_VOLATILE_FLAG_FINISH,
+					QM_VDQCR_NUMFRAMES_TILLEMPTY);
+			if (ret)
+				goto wait;
+		}
+		ret = qman_oos_fq(fq);
+		if (!ret)
+			break;
+		pr_warn_ratelimited("cdx: cannot take FQ %u out of service: %d\n",
+				    fq->fqid, ret);
+wait:
+		usleep_range(1000, 2000);
+	}
+}
+
+void cdx_destroy_fq(struct qman_fq *fq)
+{
+	cdx_drain_fq(fq);
+	/* The portal updates its FQ state before returning from the callback. */
+	synchronize_net();
+	cdx_remove_fqid_info_in_procfs(fq->fqid);
+	qman_destroy_fq(fq, 0);
+}
+
+void cdx_destroy_fq_list(struct dpa_fq **head)
+{
+	struct dpa_fq *fq;
+
+	if (!*head)
+		return;
+	for (fq = *head; fq; fq = (struct dpa_fq *)fq->list.next)
+		cdx_drain_fq(&fq->fq_base);
+	/* All queues are out of service. Finish outstanding callbacks before
+	 * freeing any of their context; one grace period covers the whole list. */
+	synchronize_net();
+	while (*head) {
+		fq = *head;
+		*head = (struct dpa_fq *)fq->list.next;
+		cdx_remove_fqid_info_in_procfs(fq->fq_base.fqid);
+		qman_destroy_fq(&fq->fq_base, 0);
+		kfree(fq);
+	}
+}
+
+
 //create pcd
 int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry)
 {
@@ -2779,6 +2826,8 @@ static int cdxdrv_create_pcd_fqs(struct dpa_iface_info *iface_info)
 					return -1;
 				}
 				add_pcd_fq_info(dpa_fq);
+				if (cdx_dpa_init_fault())
+					return -EIO;
 #ifdef DEVMAN_DEBUG
 				DPA_INFO("%s::netdev %s fqid 0x%x created chnl 0x%x\n", 
 						__func__, dpa_fq->net_dev->name, fqid, dpa_fq->channel);

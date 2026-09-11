@@ -286,6 +286,28 @@ and delete unused hash tables, reject stale cookies, and check that failed
 copy-out does not exhaust the cookie registry. Startup fault injection
 requires a dedicated boot before CDX is loaded.
 
+CDX startup rollback has a separate hardware test because it needs an
+unconfigured FMAN. Boot the staged test image with `rdinit=/bin/sh`, mount
+proc, sysfs, devtmpfs and debugfs, then run:
+
+```sh
+sudo env PYTHONPATH=tools pytest -c tools/pyproject.toml tools/startup_tests
+```
+
+The cases use the Gateway DK's five Ethernet and two offline ports. They
+inject failures after statistics allocation, interface creation, private
+policer allocation, partial transmit/receive queue creation, shared
+policer creation and the final classifier setup. Each failure must remove
+CDX and its proc entries and restore the original MURAM free-space count.
+The test checks kmemleak and kernel diagnostics, then loads CDX normally
+in the same boot. Reboot normally afterwards to run traffic tests.
+
+The fault controls `dpa_init_fail_site` and `dpa_init_fail_step` are built
+only into the test image. Production builds omit them. Host coverage in
+`tools/host_tests/test_cdx_startup.py` exercises the SET_PARAMS transaction,
+partial userspace copies, allocation failures and asynchronous queue
+retirement under ASan/UBSan.
+
 The ESP traffic tests use the WAN host as a kernel XFRM peer. They drive
 CMM's normal SA installation and verify payload delivery plus SEC packet
 and byte counters for both encryption and decryption. The WAN host needs

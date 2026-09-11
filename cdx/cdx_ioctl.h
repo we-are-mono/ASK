@@ -196,9 +196,18 @@ struct muram_data {
 int cdx_ioc_set_dpa_params(unsigned long args);
 long cdx_ioc_dpa_init_check(unsigned long args);
 
+#ifdef CDX_DEBUG_DPA_INIT
+bool cdx_dpa_init_fault_at(const char *site);
+#define cdx_dpa_init_fault() cdx_dpa_init_fault_at(__func__)
+#else
+#define cdx_dpa_init_fault() false
+#endif
+
 int cdx_driver_init(void);
 int cdxdrv_init_stats(void *muram_handle);
 int cdxdrv_create_missaction_policer_profiles(struct cdx_fman_info *finfo);
+int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo);
+int cdxdrv_release_port_policer_slots(void);
 int cdxdrv_modify_missaction_policer_profile(struct cdx_fman_info *finfo, uint32_t type);
 
 #ifdef ENABLE_INGRESS_QOS	

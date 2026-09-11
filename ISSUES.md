@@ -20,20 +20,6 @@ stale line refs) are folded into the archive one-liners.
 
 ## Open
 
-- [ ] **A106. CDX late SET_PARAMS failure leaves kernel-owned resources.**
-  `cdx_ioc_set_dpa_params()` creates interfaces, PCD frame queues, interface
-  statistics and shared policers before completing initialization. Its error
-  path releases CEETM policers and FMAN metadata, but does not unwind all those
-  earlier acquisitions. `dpa_pcd_fq` has no list teardown; the later
-  `dpa_release_iflist()` also loses access to the MURAM handle after
-  `release_cfg_info()` clears `fman_info`, preventing interface-stat frees.
-  DPA/FMC rollback can detach the classifier and release its own objects;
-  it does not release these separately owned CDX resources. Reboot after a
-  failure inside the kernel SET_PARAMS handler. Fix by tracking completed
-  acquisitions, detaching traffic before queue release, and keeping FMAN/MURAM
-  handles alive until all dependent cleanup finishes. Validate failures in
-  each kernel initialization stage followed by a successful module reload.
-
 - [ ] **A9. Tunnel TX encap never offloads — ucode 210.10.1 `INSERT_L3_HDR`
   punts unconditionally.**
   The completed A9 work (RX decap offload for 6o4+4o6, the `ip6_tunnel.c`
@@ -848,3 +834,9 @@ file's git history.
   `cdx_mcast_group_destroy`'s hard-FAILURE arm is by design — that arm is the
   accepted A95-class leak (abandoned + logged loudly) and the group is already
   software-gone, so an error return buys nothing but a compounding retry.
+
+- [x] **A106.** Late CDX SET_PARAMS failures leaked queues, interfaces,
+  policers and MURAM statistics — fixed (_this commit_): stop producer ports,
+  drain queues and release dependents before FMAN metadata; targeted hardware
+  checks cover 15 failure points, unchanged MURAM, empty kmemleak and a
+  successful load in the same boot.

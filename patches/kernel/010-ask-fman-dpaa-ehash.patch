@@ -9185,10 +9185,17 @@ index 67d96367f075..25af9ed23a19 100644
  #define DEBUG_ERRORS        1
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-index 9667d45d7f75..fb8ef7f37320 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-@@ -92,18 +92,12 @@ EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyCounter);
+@@ -49,6 +49,7 @@
+ EXPORT_SYMBOL(FM_PORT_Enable);
+ EXPORT_SYMBOL(FM_PORT_SetPCD);
+ EXPORT_SYMBOL(FM_PORT_DeletePCD);
++EXPORT_SYMBOL(FM_PORT_PcdPlcrFreeProfiles);
+ 
+ /* Runtime PCD exported routines */
+ EXPORT_SYMBOL(FM_PCD_Enable);
+@@ -92,18 +93,12 @@
  EXPORT_SYMBOL(FM_PCD_MatchTableGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableFindNGetKeyStatistics);
  EXPORT_SYMBOL(FM_PCD_MatchTableGetMissStatistics);

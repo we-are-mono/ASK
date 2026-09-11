@@ -54,6 +54,7 @@
 struct port_ff_rate_lim_info {
 	void *handle;
 	t_Handle h_FmPcd;
+	t_Handle port_handle;
 	uint32_t cir_value;
 	uint32_t pir_value;
 };
@@ -216,6 +217,8 @@ int cdxdrv_create_missaction_policer_profiles(struct cdx_fman_info *finfo)
 				Params.nonPassthroughAlgParams.peakOrExcessBurstSize);
 #endif
 		finfo->expt_rate_limit_info[ii].handle = handle;
+		if (cdx_dpa_init_fault())
+			return FAILURE;
 	}
 	return 0;
 }
@@ -264,6 +267,9 @@ static int dpa_add_port_ff_policier_profile(struct dpa_iface_info *iface_info,
 				__func__, iface_info->name);
 		return FAILURE;
 	}
+	port_rate_lim_mode[hardwarePortId].port_handle = profhandle;
+	if (cdx_dpa_init_fault())
+		return FAILURE;
 	memset(&Params, 0, sizeof(t_FmPcdPlcrProfileParams));
 	Params.id.newParams.profileType = e_FM_PCD_PLCR_PORT_PRIVATE;
 	Params.id.newParams.h_FmPort = profhandle;
@@ -332,24 +338,7 @@ int dpa_add_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
 
 }
 
-/*
- * Undo dpa_add_ethport_ff_policier_profile() on the err-path
- * unwind of dpa_add_eth_if(). Deletes the PlcrProfile created via
- * FM_PCD_PlcrProfileSet() and clears the cached handle so later
- * cdx_{set,get}_ff_rate() calls don't chase a dangling pointer.
- *
- * Known residual leak: the one-slot allocation that
- * FM_PORT_PcdPlcrAllocProfiles() reserved on this port's private
- * profile partition is NOT released. The matching
- * FM_PORT_PcdPlcrFreeProfiles() is documented to be legal only
- * before FM_PORT_SetPCD(), and by the time we're on this unwind
- * path the DPAA driver has long since brought the port up and
- * done its own SetPCD. Releasing the slot safely would require
- * coordinating with the DPAA ndo_close path; out of scope here.
- * One leaked profile slot per failed dpa_add_eth_if — the
- * hardware has 64 slots per FMan partition, so this is
- * tolerable in practice.
- */
+/* Delete the profile before releasing its port's allocation. */
 void dpa_remove_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
 {
 	int hardwarePortId = iface_info->eth_info.hardwarePortId;
@@ -365,6 +354,61 @@ void dpa_remove_ethport_ff_policier_profile(struct dpa_iface_info *iface_info)
 
 	port_rate_lim_mode[hardwarePortId].handle = NULL;
 	port_rate_lim_mode[hardwarePortId].h_FmPcd = NULL;
+}
+
+/* Startup rollback calls this after stopping the ports and removing all
+ * interfaces, including a port whose profile SET failed after allocation. */
+int cdxdrv_release_port_policer_slots(void)
+{
+	uint32_t ii;
+	int ret = 0;
+
+	for (ii = 0; ii < MAX_PHYS_PORTS; ii++) {
+		struct port_ff_rate_lim_info *info = &port_rate_lim_mode[ii];
+
+		if (!info->port_handle)
+			continue;
+		if (FM_PORT_PcdPlcrFreeProfiles(info->port_handle)) {
+			DPA_ERROR("%s::cannot free profiles for port %u\n", __func__, ii);
+			ret = -EIO;
+			continue;
+		}
+		memset(info, 0, sizeof(*info));
+	}
+	return ret;
+}
+
+int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo)
+{
+	uint32_t ii;
+	int ret = 0;
+
+#ifdef ENABLE_INGRESS_QOS
+	for (ii = 0; ii < INGRESS_ALL_POLICER_QUEUES; ii++) {
+		void **handle = &finfo->ingress_policer_info[ii].handle;
+
+		if (*handle) {
+			if (FM_PCD_PlcrProfileDelete(*handle)) {
+				DPA_ERROR("%s::cannot delete ingress profile %u\n", __func__, ii);
+				ret = -EIO;
+			}
+			/* The SDK releases the profile lock even on an HC error. */
+			*handle = NULL;
+		}
+	}
+#endif
+	for (ii = 0; ii < CDX_EXPT_MAX_EXPT_LIMIT_TYPES; ii++) {
+		void **handle = &finfo->expt_rate_limit_info[ii].handle;
+
+		if (*handle) {
+			if (FM_PCD_PlcrProfileDelete(*handle)) {
+				DPA_ERROR("%s::cannot delete exception profile %u\n", __func__, ii);
+				ret = -EIO;
+			}
+			*handle = NULL;
+		}
+	}
+	return ret;
 }
 
 /* api to modify port specific policer profile to reserver bandwidth for incoming control packets */
@@ -636,6 +680,8 @@ int cdxdrv_create_ingress_qos_policer_profiles(struct cdx_fman_info *finfo)
 			return FAILURE;
 		}
 		finfo->ingress_policer_info[queue_no].handle = handle;
+		if (cdx_dpa_init_fault())
+			return FAILURE;
 		finfo->ingress_policer_info[queue_no].profile_id = FmPcdPlcrProfileGetAbsoluteId(finfo->ingress_policer_info[queue_no].handle);
 #ifdef QOS_DEBUG
 		printk("%s::Ingress plcr profile created for  queue_no %d, handle %p,profile_id %d\n",
