@@ -15,19 +15,22 @@ from __future__ import annotations
 
 import errno
 
-from _ioctl import CDX_CTRL_DPA_SET_PARAMS, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
+import pytest
+
+from _ioctl import CDX_CTRL_DPA_SET_PARAMS, CDX_CTRL_DPA_INIT_CHECK, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
 
 
 DEVICE = "/dev/cdx_ctrl"
 
 
+@pytest.mark.parametrize("command", [CDX_CTRL_DPA_SET_PARAMS, CDX_CTRL_DPA_INIT_CHECK])
 async def test_g1_capability_drop_between_open_and_ioctl(
-    aiohttp_session, target_agent, splat_window,
+    aiohttp_session, target_agent, splat_window, command,
 ):
     data = b"\x00" * SIZEOF_CDX_CTRL_SET_DPA_PARAMS
     r = await target_agent.ioctl_send(
         aiohttp_session,
-        device=DEVICE, cmd=CDX_CTRL_DPA_SET_PARAMS, data=data,
+        device=DEVICE, cmd=command, data=data,
         drop_cap_net_admin=True,
     )
     assert r.get("errno") == errno.EPERM, (

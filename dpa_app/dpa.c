@@ -14,6 +14,7 @@
  */
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -69,9 +70,6 @@ char *sp_file = DEFAULT_SP_FILE;
 
 //fmc model from xml files
 static struct fmc_model_t cmodel;
-
-//handle to cdx device
-int cdx_dev_handle;
 
 //mapping CC tables names to types
 static struct ccnode_table_params table_params[] = {
@@ -205,49 +203,35 @@ static void display_model(struct fmc_model_t *model)
 
 /* advance features like HMs are not enabled by default, 
    enable them before executing fmc */
-static int set_fm_adv_options(struct cdx_fman_info *finfo)
+static int set_fm_adv_options(uint32_t index)
 {
-	void *handle;
-	void *fdev;
-	t_FmPcdParams fm_pcd_params;
-	
-	//open FM device and PCD
-	fdev = FM_Open(finfo->index);
-	if (!fdev) {
-		printf("%s::could not opem fm device\n",
-			__func__);
+	t_FmPcdParams params = {0};
+	t_Handle fm, pcd;
+	int retval = -1;
+
+	fm = FM_Open(index);
+	if (!fm) {
+		fprintf(stderr, "%s: could not open fm%u\n", __func__, index);
 		return -1;
 	}
-	memset(&fm_pcd_params, 0, sizeof(t_FmPcdParams));
-	fm_pcd_params.h_Fm = fdev;
-	handle = FM_PCD_Open(&fm_pcd_params);
-	//Disable PCD before we set advanced features
-	if (FM_PCD_Disable(handle) != E_OK) {
- 		printf("%s::could not disable pcd fm %d\n",
-                        __func__, finfo->index);
-                return -1;
-        }
-	//enable Advanced pcd function before fmc_execute enables PCD
-	if (FM_PCD_SetAdvancedOffloadSupport(handle) != E_OK) {
-		printf("%s::could not enbl adv offload fm %d\n",
-			__func__, finfo->index); 
-		return -1; 
+	params.h_Fm = fm;
+	pcd = FM_PCD_Open(&params);
+	if (!pcd) {
+		fprintf(stderr, "%s: could not open fm%u PCD\n", __func__, index);
+		goto close_fm;
 	}
-	finfo->fm_handle = handle;
-	return 0;
-}
-
-
-/* fill FM-PCD device handle into finfo, required for all pcd 
-  operations */
-static int get_fm_pcd_handle(struct cdx_fman_info *finfo)
-{
-	struct t_Device *dev;
-	
-	//exract and pass device handles to kernel
-	dev = (struct t_Device *)finfo->fm_handle;
-	finfo->pcd_handle = (void *)((uint64_t)dev->fd);
-	return 0;
+	if (FM_PCD_Disable(pcd) != E_OK ||
+	    FM_PCD_SetAdvancedOffloadSupport(pcd) != E_OK) {
+		fprintf(stderr, "%s: could not enable fm%u advanced offload\n",
+			__func__, index);
+		goto close_pcd;
+	}
+	retval = 0;
+close_pcd:
+	FM_PCD_Close(pcd);
+close_fm:
+	FM_Close(fm);
+	return retval;
 }
 
 static int get_dist_type(char *name) 
@@ -469,7 +453,7 @@ static int get_table_info(struct cdx_fman_info *fman_info)
 		retval = -1;
 		goto func_ret;
 	}
-	fman_info->num_tables = count;
+	fman_info->num_tables = 0;
 	fman_info->tbl_info = info;
 	num_tables = 0;
 	retval = 0;
@@ -555,6 +539,7 @@ static int get_table_info(struct cdx_fman_info *fman_info)
 			num_tables++;
 		}
 	}
+	fman_info->num_tables = num_tables;
 	if (!num_tables) {
 		printf("%s::fm %d, no tables defined\n", __func__, 
 			fman_info->index);	
@@ -670,131 +655,84 @@ void set_exptrate_policer_defaults(struct cdx_fman_info *fman_info)
 
 int dpa_init(void)
 {
+	struct cdx_ctrl_set_dpa_params params = {0};
+	struct cdx_fman_info *finfo;
+	bool executed = false;
 	uint32_t ii;
-	struct cdx_fman_info *fman_info;
-	struct cdx_ctrl_set_dpa_params params;
-	char devname[64];
-	int retval;
+	int fd, retval = -1;
 
-	//open cdx control device
-        sprintf(devname, "/dev/%s", CDX_CTRL_CDEVNAME);
-        cdx_dev_handle = open(devname, O_RDWR);
-        if (cdx_dev_handle < 0) {
-                printf("%s:unable to open dev %s\n", __func__,
-                        devname);
-                return -1;
-        }
-	//compile the FMC PCD model	
-   	retval = fmc_compile(&cmodel, cfg_file, pcd_file, pdl_file, sp_file,  SP_OFFSET, 0, 
-			NULL);
-	if (retval) {
-		printf("%s::unable to compile fmc input files, err %d: %s\n",
-			__func__, retval, fmc_get_error());
-                return -1;
-	}
-	retval = -1;
-	//fill dpaa config info for ioctl
-	memset(&params, 0, sizeof(struct cdx_ctrl_set_dpa_params));
-	params.num_fmans = cmodel.fman_count;
-	if (!cmodel.fman_count) {
-		printf("%s::no cfg info in model\n", __func__);
+	fd = open("/dev/" CDX_CTRL_CDEVNAME, O_RDWR);
+	if (fd < 0) {
+		perror("dpa_init: open " CDX_CTRL_CDEVNAME);
 		return -1;
 	}
-	fman_info = (struct cdx_fman_info *)
-		calloc (1, (sizeof(struct cdx_fman_info) * params.num_fmans));
-	if (!fman_info) {
-		printf("%s::unable to allocate mem for fman info\n",
-			__func__);
-		goto err_ret;
+	/* Keep the exclusive fd until programming and any rollback finish. */
+	if (ioctl(fd, CDX_CTRL_DPA_INIT_CHECK)) {
+		perror("dpa_init: initialization refused");
+		goto out;
 	}
-	params.fman_info = fman_info;
-#ifdef DPA_C_DEBUG
-	printf("%s::fman count %d\n", __func__,
-			cmodel.fman_count);
-#endif
-	for (ii = 0; ii < cmodel.fman_count; ii++) {	
-		fman_info->index = cmodel.fman[ii].number ;
-#ifdef DPA_C_DEBUG
-		printf("%s::fman index %d\n", __func__,
-			cmodel.fman[ii].number);
-#endif
-		fman_info->max_ports = cmodel.fman[ii].port_count;
-		if (get_port_info(fman_info))
-			goto err_ret;
-		if (set_fm_adv_options(fman_info))
-			goto err_ret;
-		fman_info++;
+	if (fmc_compile(&cmodel, cfg_file, pcd_file, pdl_file, sp_file,
+			SP_OFFSET, 0, NULL)) {
+		fprintf(stderr, "dpa_init: unable to compile FMC input: %s\n",
+			fmc_get_error());
+		goto out;
 	}
-#ifdef DPA_C_DEBUG
-	printf("%s::executing fman model\n", __func__);
-#endif
-	//tag each hash table in the model with its cdx table type
-        if (set_table_types(&cmodel)) {
-                printf("%s::unable to set table types in FMC Model\n", __func__);
-                return -1;
-        }
-	//load compiled cfg it into the FMAN	
+	if (!cmodel.fman_count || cmodel.fman_count > FMC_FMAN_NUM) {
+		fprintf(stderr, "dpa_init: invalid FMAN count %u\n", cmodel.fman_count);
+		goto out;
+	}
+	params.num_fmans = cmodel.fman_count;
+	params.fman_info = calloc(params.num_fmans, sizeof(*params.fman_info));
+	if (!params.fman_info)
+		goto out;
+
+	for (ii = 0; ii < params.num_fmans; ii++) {
+		finfo = &params.fman_info[ii];
+		finfo->index = cmodel.fman[ii].number;
+		finfo->max_ports = cmodel.fman[ii].port_count;
+		if (get_port_info(finfo))
+			goto out;
+	}
+	if (set_table_types(&cmodel))
+		goto out;
+	for (ii = 0; ii < params.num_fmans; ii++) {
+		if (set_fm_adv_options(params.fman_info[ii].index))
+			goto out;
+	}
+
+	/* FMC may have acquired resources even when execution fails. */
+	executed = true;
 	if (fmc_execute(&cmodel)) {
-                printf("%s::unable to execute the FMC Model\n", __func__);
-                return -1;
-        }
-	fman_info = params.fman_info;
-	for (ii = 0; ii < cmodel.fman_count; ii++) {	
-		if (update_port_dist_info(fman_info)) {
-#ifdef DPA_C_DEBUG
-			printf("%s::cmodel.fman_count failed fman index %d\n", __func__,
-				cmodel.fman[ii].number);
-#endif
-			goto err_ret;
-		}
-		fman_info++;
+		fprintf(stderr, "dpa_init: unable to execute FMC model\n");
+		goto out;
 	}
 #ifdef DPA_C_DEBUG
-	printf("%s::fmc_execute complete\n", __func__);
 	display_model(&cmodel);
-	sleep(3);
 #endif
-	fman_info = params.fman_info;
-	for (ii = 0; ii < cmodel.fman_count; ii++) {	
-		//fill fm pcd handle needed by kernel
-		if (get_fm_pcd_handle(fman_info))
-			goto err_ret;	
-		//get cctable infor
-		if (get_table_info(fman_info))
-			goto err_ret;
-		fman_info++;
+	for (ii = 0; ii < params.num_fmans; ii++) {
+		struct t_Device *pcd = cmodel.fman[ii].pcd_handle;
+
+		finfo = &params.fman_info[ii];
+		if (!pcd || update_port_dist_info(finfo) || get_table_info(finfo))
+			goto out;
+		finfo->pcd_handle = (void *)(uintptr_t)pcd->fd;
+		set_exptrate_policer_defaults(finfo);
 	}
-	//set default for exception packet rate limiting
-        fman_info = params.fman_info;
-        for (ii = 0; ii < cmodel.fman_count; ii++) {
-                set_exptrate_policer_defaults(fman_info);
-                fman_info++;
-        }
-#ifdef DPA_C_DEBUG
-	sleep(3);
-#endif
-	//pass config infor to kernel module
-        retval = ioctl(cdx_dev_handle, CDX_CTRL_DPA_SET_PARAMS,
-                        &params);
-	if (retval) 
-        	printf("%s:set params ioctl failed\n", __func__);
-err_ret:
-	//release resources allocated
-	fman_info = params.fman_info;
-	if (fman_info) {
-		for (ii = 0; ii < cmodel.fman_count; ii++) {
-			if (fman_info->tbl_info)
-				free(fman_info->tbl_info);
-			if (fman_info->portinfo)
-				free(fman_info->portinfo);
-			fman_info++;
+	retval = ioctl(fd, CDX_CTRL_DPA_SET_PARAMS, &params);
+	if (retval)
+		perror("dpa_init: set params");
+out:
+	if (retval && executed && fmc_clean(&cmodel))
+		fprintf(stderr, "dpa_init: FMC rollback failed; reboot before retrying\n");
+	if (params.fman_info) {
+		for (ii = 0; ii < params.num_fmans; ii++) {
+			free(params.fman_info[ii].tbl_info);
+			free(params.fman_info[ii].portinfo);
 		}
 		free(params.fman_info);
 	}
-	//close device in case of any failure.
-	if (retval) {
-	        printf("%s::retval %d\n", __func__, retval);
-		close(cdx_dev_handle);
-	}
+	/* Successful FMC objects remain installed for CDX. Their userspace
+	 * wrappers and descriptors are reclaimed when this one-shot app exits. */
+	close(fd);
 	return retval;
 }

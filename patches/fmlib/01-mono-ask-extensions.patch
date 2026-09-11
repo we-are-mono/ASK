@@ -25,7 +25,7 @@ index 3607b86..e6db99a 100644
 @@ -581,6 +581,38 @@ t_Error FM_CtrlMonGetCounters(t_Handle h_Fm, uint8_t fmCtrlIndex, t_FmCtrlMon *p
  *//***************************************************************************/
  t_Error FM_ForceIntr (t_Handle h_Fm, e_FmExceptions exception);
-
+ 
 +/**************************************************************************//*
 + @Function      FM_ReadTimeStamp
 +
@@ -102,9 +102,9 @@ index 7f32680..8bfecfd 100644
      uint16_t                    maxNumOfKeys;               /**< Maximum Number Of Keys that will (ever) be used in this Hash-table */
      e_FmPcdCcStatsMode          statisticsMode;             /**< If not e_FM_PCD_CC_STATS_MODE_NONE, the required structures for the
 @@ -1990,6 +2012,29 @@ typedef struct t_FmPcdHashTableParams {
-
+ 
      t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
-
+ 
 +    bool                        agingSupport;               /**< Reserved; hash-key aging is not implemented. Kept so this struct
 +                                                                 stays layout-identical to the driver's t_FmPcdHashTableParams and
 +                                                                 to ioc_fm_pcd_hash_table_params_t, which FM_PCD_HashTableSet()
@@ -129,16 +129,16 @@ index 7f32680..8bfecfd 100644
 +    } externalHashParams;
 +#endif /* (DPAA_VERSION >= 11) */
  } t_FmPcdHashTableParams;
-
+ 
  /**************************************************************************//**
 diff --git a/src/fm_lib.c b/src/fm_lib.c
-index 4de5168..81828d4 100644
+index 4de5168..bc95c7f 100644
 --- a/src/fm_lib.c
 +++ b/src/fm_lib.c
 @@ -317,6 +317,44 @@ t_Error  FM_GetApiVersion(t_Handle h_Fm, ioc_fm_api_version_t *p_version)
      return E_OK;
  }
-
+ 
 +uint32_t FM_ReadTimeStamp(t_Handle h_Fm)
 +{
 +    t_Device    *p_Dev = (t_Device*) h_Fm;
@@ -180,10 +180,36 @@ index 4de5168..81828d4 100644
  /********************************************************************************************/
  /*  FM_PCD FUNCTIONS                                                                        */
  /********************************************************************************************/
-@@ -624,6 +662,12 @@ t_Error FM_PCD_AllowHcUsage(t_Handle h_FmPcd, bool allow)
+@@ -556,18 +594,20 @@ t_Handle FM_PCD_NetEnvCharacteristicsSet(t_Handle h_FmPcd, t_FmPcdNetEnvParams *
+     memcpy(&params, p_NetEnvParams, sizeof(t_FmPcdNetEnvParams));
+     params.id = NULL;
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_NET_ENV_CHARACTERISTICS_SET, &params))
++    p_Dev = (t_Device *)malloc(sizeof(t_Device));
++    if (!p_Dev)
+     {
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD NetEnv Chrs device!!"));
+         return NULL;
+     }
+ 
+-    p_Dev = (t_Device *)malloc(sizeof(t_Device));
+-    if (!p_Dev)
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_NET_ENV_CHARACTERISTICS_SET, &params))
+     {
+-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD NetEnv Chrs device!!"));
++        free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+         return NULL;
+     }
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     p_PcdDev->owners++;
+@@ -624,6 +664,12 @@ t_Error FM_PCD_AllowHcUsage(t_Handle h_FmPcd, bool allow)
      return E_OK;
  }
-
+ 
 +void *FM_PCD_Get_Sch_handle(t_Handle h_Scheme)
 +{
 +    t_Device *p_Dev = (t_Device*) h_Scheme;
@@ -193,10 +219,94 @@ index 4de5168..81828d4 100644
  t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
  {
      t_Device *p_PcdDev = (t_Device*) h_FmPcd;
-@@ -1191,6 +1235,12 @@ t_Error FM_PCD_MatchTableModifyKeyAndNextEngine(t_Handle            h_CcNode,
+@@ -657,19 +703,25 @@ t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
+         params.kg_next_engine_params.cc.tree_id)
+             DEV_TO_ID(params.kg_next_engine_params.cc.tree_id);
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_KG_SCHEME_SET, &params))
++    if (params.modify)
++        p_Dev = (t_Device *)p_Scheme->id.h_Scheme;
++    else
++        p_Dev = (t_Device *)malloc(sizeof(t_Device));
++    if (!p_Dev)
+     {
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD KG Scheme device!!"));
+         return NULL;
+     }
+ 
+-    p_Dev = (t_Device *)malloc(sizeof(t_Device));
+-    if (!p_Dev)
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_KG_SCHEME_SET, &params))
+     {
+-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD KG Scheme device!!"));
++        if (!params.modify)
++            free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+         return NULL;
+     }
+ 
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     /* increase owners only if a new scheme is created */
+@@ -765,19 +817,21 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd, t_FmPcdCcTreeParams *p_PcdTreePara
+             }
+         }
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_CC_ROOT_BUILD, &params))
++    p_Dev = (t_Device *)malloc(sizeof(t_Device));
++    if (!p_Dev)
+     {
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD CC Root device!!"));
+         return NULL;
+     }
+ 
+-    p_Dev = (t_Device *)malloc(sizeof(t_Device));
+-    if (!p_Dev)
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_CC_ROOT_BUILD, &params))
+     {
+-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD CC Root device!!"));
++        free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+         return NULL;
+     }
+ 
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     p_PcdDev->owners++;
+@@ -865,18 +919,20 @@ t_Handle FM_PCD_MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNodeParams *p_CcNodePar
+ 
+ #endif /* DPAA_VERSION >= 11 */
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_MATCH_TABLE_SET, &params))
++    p_Dev = (t_Device *)malloc(sizeof(t_Device));
++    if (!p_Dev)
+     {
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD Match Table device!!"));
+         return NULL;
+     }
+ 
+-    p_Dev = (t_Device *)malloc(sizeof(t_Device));
+-    if (!p_Dev)
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_MATCH_TABLE_SET, &params))
+     {
+-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD Match Table device!!"));
++        free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+         return NULL;
+     }
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     p_PcdDev->owners++;
+@@ -1191,6 +1247,12 @@ t_Error FM_PCD_MatchTableModifyKeyAndNextEngine(t_Handle            h_CcNode,
      return E_OK;
  }
-
+ 
 +/* The ioctl struct is this struct plus a trailing 'void *id'; the memcpy below
 + * relies on the two being field-for-field identical up to that point. */
 +_Static_assert(sizeof(ioc_fm_pcd_hash_table_params_t) ==
@@ -206,11 +316,116 @@ index 4de5168..81828d4 100644
  t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  {
      t_Device *p_PcdDev = (t_Device*) h_FmPcd;
-@@ -1201,6 +1251,7 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
-
+@@ -1201,6 +1263,7 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+ 
      _fml_dbg("Calling...\n");
-
+ 
 +    memset(&params, 0, sizeof(params));
      memcpy(&params, p_Param, sizeof(t_FmPcdHashTableParams));
      params.id = NULL;
-
+ 
+@@ -1222,18 +1285,20 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+ 
+ #endif /* DPAA_VERSION >= 11 */
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_HASH_TABLE_SET, &params))
++    p_Dev = (t_Device *)malloc(sizeof(t_Device));
++    if (!p_Dev)
+     {
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD Hash Table device!!"));
+         return NULL;
+     }
+ 
+-    p_Dev = (t_Device *)malloc(sizeof(t_Device));
+-    if (!p_Dev)
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_HASH_TABLE_SET, &params))
+     {
+-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD Hash Table device!!"));
++        free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+         return NULL;
+     }
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     p_PcdDev->owners++;
+@@ -1423,19 +1488,21 @@ t_Handle FM_PCD_PlcrProfileSet(t_Handle h_FmPcd, t_FmPcdPlcrProfileParams *p_Pro
+     if (params.next_engine_on_red == e_IOC_FM_PCD_KG && params.params_on_red.p_direct_scheme)
+         DEV_TO_ID(params.params_on_red.p_direct_scheme);
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_PLCR_PROFILE_SET, &params))
++    p_Dev = (t_Device *)malloc(sizeof(t_Device));
++    if (!p_Dev)
+     {
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD Policer Profile device!!"));
+         return NULL;
+     }
+ 
+-    p_Dev = (t_Device *)malloc(sizeof(t_Device));
+-    if (!p_Dev)
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_PLCR_PROFILE_SET, &params))
+     {
+-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD Policer Profile device!!"));
++        free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+         return NULL;
+     }
+ 
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     p_PcdDev->owners++;
+@@ -1489,11 +1556,6 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+         params.p_next_manip = UINT_TO_PTR(p_Dev->id);
+     }
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_MANIP_NODE_SET, &params)){
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+-        return NULL;
+-    }
+-
+     p_Dev = (t_Device *)malloc(sizeof(t_Device));
+     if (!p_Dev)
+     {
+@@ -1501,6 +1563,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+         return NULL;
+     }
+ 
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_MANIP_NODE_SET, &params)){
++        free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        return NULL;
++    }
++
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     p_PcdDev->owners++;
+@@ -2127,18 +2196,20 @@ t_Handle FM_PCD_FrmReplicSetGroup(t_Handle h_FmPcd, t_FmPcdFrmReplicGroupParams
+         }
+     }
+ 
+-    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_FRM_REPLIC_GROUP_SET, &params))
++    p_Dev = (t_Device *)malloc(sizeof(t_Device));
++    if (!p_Dev)
+     {
+-        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
++        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD NetEnv Chrs device!!"));
+         return NULL;
+     }
+ 
+-    p_Dev = (t_Device *)malloc(sizeof(t_Device));
+-    if (!p_Dev)
++    if (ioctl(p_PcdDev->fd, FM_PCD_IOC_FRM_REPLIC_GROUP_SET, &params))
+     {
+-        REPORT_ERROR(MAJOR, E_NO_MEMORY, ("FM PCD NetEnv Chrs device!!"));
++        free(p_Dev);
++        REPORT_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+         return NULL;
+     }
++
+     memset(p_Dev, 0, sizeof(t_Device));
+     p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
+     p_PcdDev->owners++;

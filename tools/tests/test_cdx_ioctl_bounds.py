@@ -33,12 +33,9 @@ from _ioctl import (
 
 DEVICE = "/dev/cdx_ctrl"
 
-# struct cdx_ctrl_set_dpa_params layout:
-#   void *fman_info    at offset 0 (8 B)
-#   void *ipr_info     at offset 8 (8 B)
-#   uint32_t num_fmans at offset 16 (4 B) + 4 B tail pad
-def _set_params_struct(num_fmans: int, fman_ptr: int = 0, ipr_ptr: int = 0) -> bytes:
-    return struct.pack("<QQI4x", fman_ptr, ipr_ptr, num_fmans)
+# struct cdx_ctrl_set_dpa_params: pointer at 0, count at 8, tail pad at 12.
+def _set_params_struct(num_fmans: int, fman_ptr: int = 0) -> bytes:
+    return struct.pack("<QI4x", fman_ptr, num_fmans)
 
 
 CDX_MAX_FMANS = 16
@@ -58,14 +55,8 @@ async def test_c6_num_fmans_above_cap_rejected(
         aiohttp_session,
         device=DEVICE, cmd=CDX_CTRL_DPA_SET_PARAMS, data=data,
     )
-    # Pre-fix: kernel would kcalloc(num_fmans * sizeof(...)) and either
-    # OOM or (if somehow succeeding) overrun later. Post-fix: EINVAL
-    # from the bound check. ENOMEM is also acceptable evidence that
-    # the size reached the allocator with a validated bound; the key
-    # invariant is "no kernel splat, dispatcher rejected cleanly."
-    assert r.get("errno") in (errno.EINVAL, errno.ENOMEM, errno.EFAULT), (
-        f"num_fmans={num_fmans}: expected rejection (EINVAL/ENOMEM/EFAULT), "
-        f"got {r}"
+    assert r.get("errno") == errno.EINVAL, (
+        f"num_fmans={num_fmans}: expected EINVAL before allocation, got {r}"
     )
 
 

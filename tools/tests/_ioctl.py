@@ -49,6 +49,7 @@ CDX_IOC_MAGIC = 0xBE
 SIZEOF_CDX_CTRL_SET_DPA_PARAMS = 16
 
 CDX_CTRL_DPA_SET_PARAMS = _IOWR(CDX_IOC_MAGIC, 1, SIZEOF_CDX_CTRL_SET_DPA_PARAMS)
+CDX_CTRL_DPA_INIT_CHECK = _IO(CDX_IOC_MAGIC, 5)
 
 # Number 3 was CDX_CTRL_DPA_CONNADD pre-C9b. Post-removal the dispatcher
 # table has no entry for it — any invocation must return -ENOTTY.

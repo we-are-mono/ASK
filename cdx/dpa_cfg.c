@@ -686,6 +686,18 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo)
 }
 
 
+/* /dev/cdx_ctrl admits one opener. The loader keeps that fd open until
+ * SET_PARAMS completes, so another loader cannot race this check. */
+long cdx_ioc_dpa_init_check(unsigned long args)
+{
+	long retval;
+
+	mutex_lock(&dpa_cfg_lock);
+	retval = fman_info ? -EBUSY : 0;
+	mutex_unlock(&dpa_cfg_lock);
+	return retval;
+}
+
 //ioctl handler for set dpa configuration
 int cdx_ioc_set_dpa_params(unsigned long args)
 {

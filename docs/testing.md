@@ -266,6 +266,26 @@ including 160, 161 and 65535 bytes, then verify that control and RTCP queries
 still work. CMM IPC tests cover unsupported-command replies; Wi-Fi tests
 exercise VAP reset and repeated VWD character-device open/close.
 
+The DPA host lifecycle test compiles the pinned FMC and FMLIB sources with
+our patches and the production loader under ASan/UBSan. It injects startup
+allocation/device failures and cleanup failures, checks retries and shared
+object ownership, and exercises saved-model compatibility and one/two-FMAN
+table counts. The companion SDK test exercises external-table teardown,
+root ownership, shared reassembly cookies, busy refusals, and stale handles.
+These tests require the fetched vendor Git repositories and the patched ASK
+kernel source. Run them with:
+
+```sh
+pytest -c tools/pyproject.toml tools/host_tests/test_dpa_lifecycle.py
+```
+
+On the DUT, DPA tests verify that repeated loader invocations stop at the
+initialization check, that the control device excludes a second opener,
+and that the new check obeys the per-ioctl capability gate. They also create
+and delete unused hash tables, reject stale cookies, and check that failed
+copy-out does not exhaust the cookie registry. Startup fault injection
+requires a dedicated boot before CDX is loaded.
+
 The ESP traffic tests use the WAN host as a kernel XFRM peer. They drive
 CMM's normal SA installation and verify payload delivery plus SEC packet
 and byte counters for both encryption and decryption. The WAN host needs

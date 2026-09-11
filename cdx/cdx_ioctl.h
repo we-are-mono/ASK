@@ -180,6 +180,9 @@ struct cdx_ctrl_set_dpa_params {
 #define CDX_CTRL_DPA_SET_PARAMS\
         _IOWR(CDX_IOC_MAGIC, 1, struct cdx_ctrl_set_dpa_params)
 
+/* Hold the exclusive control fd from this check through SET_PARAMS. */
+#define CDX_CTRL_DPA_INIT_CHECK _IO(CDX_IOC_MAGIC, 5)
+
 #ifdef DPAA_DEBUG_ENABLE
 struct muram_data {
         uint8_t *buff;
@@ -191,6 +194,7 @@ struct muram_data {
 #endif
 
 int cdx_ioc_set_dpa_params(unsigned long args);
+long cdx_ioc_dpa_init_check(unsigned long args);
 
 int cdx_driver_init(void);
 int cdxdrv_init_stats(void *muram_handle);

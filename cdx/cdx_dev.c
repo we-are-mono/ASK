@@ -141,6 +141,7 @@ static long cdx_ioc_set_dpa_params_wrap(unsigned long args)
 
 static const struct cdx_ioctl_spec cdx_ioctl_table[] = {
 	{ CDX_CTRL_DPA_SET_PARAMS,      cdx_ioc_set_dpa_params_wrap },
+	{ CDX_CTRL_DPA_INIT_CHECK,      cdx_ioc_dpa_init_check },
 #ifdef DPAA_DEBUG_ENABLE
 	{ CDX_CTRL_DPA_GET_MURAM_DATA,  cdx_get_muram_data },
 #endif
@@ -211,6 +212,5 @@ int cdx_driver_init(void)
 	register_cdx_deinit_func(cdx_driver_deinit);
 	return 0;
 }
-
 
 
