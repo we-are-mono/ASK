@@ -1309,7 +1309,12 @@ void __cmmRouteLocalNew(FCI_CLIENT *fci_handle, struct ctTable* localctEntry)
 		{
 			itf = container_of(entry, struct interface, list);
 			if(__cmmRouteIsTnlItf(localctEntry->family, daddr, itf,0,0))
-				 __tunnel_add(fci_handle, itf);
+			{
+				if (itf->rt.route)
+					__cmmTunnelRouteUpdate(fci_handle, itf, itf->rt.route);
+				else
+					__tunnel_add(fci_handle, itf);
+			}
 		}
 
 	}
@@ -1427,7 +1432,13 @@ static void __cmmRouteNew(FCI_CLIENT *fci_handle, struct rtmsg *rtm, unsigned in
 					flushed = 1;
 				}
 
-				__tunnel_add(fci_handle, itf);
+				/* A pending holder may still own its pre-rollback FPP
+				 * binding. Rebuild it through the route-swap transaction
+				 * before registration can clear FPP_NEEDS_UPDATE. */
+				if (itf->rt.route)
+					__cmmTunnelRouteUpdate(fci_handle, itf, itf->rt.route);
+				else
+					__tunnel_add(fci_handle, itf);
 			}
 		}
 	}
@@ -1446,9 +1457,14 @@ static void __cmmRouteNew(FCI_CLIENT *fci_handle, struct rtmsg *rtm, unsigned in
                                         flushed = 1;
                                 }
 
-                                __pthread_mutex_lock(&sa_lock);
-                                __cmmSATunnelRegister(fci_handle, s);
-                                __pthread_mutex_unlock(&sa_lock);
+                                if (s->tnl_rt.route)
+                                        __cmmSARouteUpdate(fci_handle, s, s->tnl_rt.route);
+                                else
+                                {
+                                        __pthread_mutex_lock(&sa_lock);
+                                        __cmmSATunnelRegister(fci_handle, s);
+                                        __pthread_mutex_unlock(&sa_lock);
+                                }
 
                         }
                 }
@@ -1473,9 +1489,14 @@ static void __cmmRouteNew(FCI_CLIENT *fci_handle, struct rtmsg *rtm, unsigned in
 					flushed = 1;
 				}
 
-				__pthread_mutex_lock(&socket_lock);
-				__socket_open(fci_handle, soc);
-				__pthread_mutex_unlock(&socket_lock);
+				if (soc->rt.route)
+					__cmmSocketRouteUpdate(fci_handle, soc, soc->rt.route);
+				else
+				{
+					__pthread_mutex_lock(&socket_lock);
+					__socket_open(fci_handle, soc);
+					__pthread_mutex_unlock(&socket_lock);
+				}
 			}
 		}
 	}

@@ -308,6 +308,27 @@ only into the test image. Production builds omit them. Host coverage in
 partial userspace copies, allocation failures and asynchronous queue
 retirement under ASan/UBSan.
 
+CMM route retries have host coverage in
+`tools/host_tests/test_cmm_route_retry.py`: IPv4/IPv6 tunnel, socket and SA
+holders retry changed MAC, output interface and MTU after allocation or
+programming failures, including shared bindings and local tunnel events.
+
+The dedicated hardware regression restarts CMM with a temporary
+`LD_PRELOAD` library that rejects selected FCI sends before they reach
+CDX. It tests gateway and MTU changes with permanent neighbors, repeated
+failures and recovery on a notification with unchanged forwarding data.
+The library is built on the host and is never included in the image.
+Run this separately from traffic tests on a normally booted DUT:
+
+```sh
+sudo env PYTHONPATH=tools pytest -c tools/pyproject.toml tools/route_tests
+```
+
+It requires `aarch64-linux-gnu-gcc` on the host (override with
+`ASK_AARCH64_CC`). The fixture restores normal CMM startup and removes its
+routes, neighbors and holders. SA cleanup explicitly detaches the test's
+hardware route before XFRM deletion because of the separate A107 issue.
+
 The ESP traffic tests use the WAN host as a kernel XFRM peer. They drive
 CMM's normal SA installation and verify payload delivery plus SEC packet
 and byte counters for both encryption and decryption. The WAN host needs

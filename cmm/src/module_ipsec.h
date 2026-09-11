@@ -175,6 +175,7 @@ typedef struct _tCommandIPSecSetLifetime{
 
 
 int __cmmSATunnelRegister(FCI_CLIENT *fci_handle, struct SATable* SAEntry);
+void __cmmSARouteUpdate(FCI_CLIENT *fci_handle, struct SATable *s, struct RtEntry *route);
 void __cmmSAUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route);
 int cmmSAShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 int cmmSACreate(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, unsigned short *payload);

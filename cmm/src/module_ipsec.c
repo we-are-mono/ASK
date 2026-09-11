@@ -221,7 +221,7 @@ program:
 }
 
 
-static void __cmmSARouteUpdate(FCI_CLIENT *fci_handle, struct SATable *s, struct RtEntry *route)
+void __cmmSARouteUpdate(FCI_CLIENT *fci_handle, struct SATable *s, struct RtEntry *route)
 {
 	struct ct_route rt = s->tnl_rt;
 	int rollback = 0;
