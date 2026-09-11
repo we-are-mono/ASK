@@ -1914,20 +1914,6 @@ static int cmmShowStatCmd(struct cli_def * cli, const char *command, char *argv[
 
 
 /*****************************************************************
-* cmmQueryRxCmd
-*
-*
-******************************************************************/
-static int cmmQueryRxCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  /*Call RX process function*/
-  cmmRxQueryProcess(argv, 0, globalConf.cli.daemon_handle);
-
-	return CLI_OK;
-}
-
-
-/*****************************************************************
 * cmmQueryRtCmd
 *
 *
@@ -2449,7 +2435,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 	if (c)
 	{
 	        cli_register_command(ctx->handle, c, "pppoe", cmmQueryPPPoECmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query PPPoE entries on FPP");
-        	cli_register_command(ctx->handle, c, "rx", cmmQueryRxCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query Bridge entries on FPP");
 	        cli_register_command(ctx->handle, c, "route", cmmQueryRtCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query Route entries on FPP");
         	cli_register_command(ctx->handle, c, "connections", cmmQueryCtCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query Connection entries on FPP");
 	        cli_register_command(ctx->handle, c, "macvlan", cmmQueryMacVlanCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Query Macvlan interfaces on FPP");
@@ -2480,7 +2465,7 @@ int cmmCliInit(struct cmm_cli *ctx)
 	{
 		cli_register_command(ctx->handle, c, "activate", cmmFcActivate, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Activate or desactivate fast forwarding");
 		cli_register_command(ctx->handle, c, "debug", cmmFcDebug, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Debug level");
-		cli_register_command(ctx->handle, c, "rx", cmmRxCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage RX module (ICC, Bridge ...)");
+		cli_register_command(ctx->handle, c, "rx", cmmRxCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage RX module (ICC)");
 #ifdef LS1043
 		cli_register_command(ctx->handle, c, "tx", cmmTxCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage TX module (DSCP VLAN P bit map)");
 #endif
@@ -2490,7 +2475,7 @@ int cmmCliInit(struct cmm_cli *ctx)
 		cli_register_command(ctx->handle, c, "timeout", cmmSetTimeoutCLI, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Set UDP/TCP/IPIP timeout value in FPP");
 		cli_register_command(ctx->handle, c, "route", cmmSetRouteCLI, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Set Extended Route");
 		cli_register_command(ctx->handle, c, "ff", cmmFFControlCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Enable or disable fast forward");
-		cli_register_command(ctx->handle, c, "stat", cmmStatCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage Statistics (PPPoE, Bridge ...)");
+		cli_register_command(ctx->handle, c, "stat", cmmStatCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage Statistics (PPPoE, VLAN, IPsec ...)");
 		cli_register_command(ctx->handle, c, "socket", cmmSocketCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage Socket module");
 		cli_register_command(ctx->handle, c, "socket6", cmmSocket6Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage Socket module");
 		cli_register_command(ctx->handle, c, "rtp", cmmRtpCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage RTP-relay module");

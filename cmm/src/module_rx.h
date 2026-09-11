@@ -71,10 +71,8 @@ struct l2flowTable
 
 int parse_icc_interface(char *pstring, unsigned short *pinterface_number, int num_interfaces);
 
-int cmmL2BridgeProcessClientCmd(FCI_CLIENT* fci_handle, int fc, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);
 int cmmRxSetProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
 int cmmRxShowProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
-int cmmRxQueryProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
 int parse_macaddr(char *pstring, unsigned char *pmacaddr);
 
 extern struct list_head l2flow_table[L2FLOW_HASH_TABLE_SIZE];

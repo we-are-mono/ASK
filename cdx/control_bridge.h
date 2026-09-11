@@ -91,29 +91,6 @@ typedef struct _tL2BridgeL2FlowEntryCommand {
 } L2BridgeL2FlowEntryCommand, *PL2BridgeL2FlowEntryCommand;
 
 
-/* L2 Bridging Query Entry response */
-typedef struct _tL2BridgeQueryEntryResponse {
-        U16 ackstatus;
-        U16 eof;
-        U16 input_interface;
-        U16 input_svlan;
-        U16 input_cvlan;
-        U8 destaddr[6];
-        U8 srcaddr[6];
-        U16 ethertype;
-        U16 output_interface;
-        U16 output_svlan;
-        U16 output_cvlan;
-        U16 pkt_priority;
-        U16 svlan_priority;
-        U16 cvlan_priority;
-        U8 input_name[16];
-        U8 output_name[16];
-        U16 qmod;
-        U16 session_id;
-}L2BridgeQueryEntryResponse, *PL2BridgeQueryEntryResponse;
-
-
 /* L2 Bridging Control command */
 typedef struct _tL2BridgeControlCommand {
 	U16 mode_timeout;		/* Either set bridge mode or set timeout for flow entries */

@@ -15,7 +15,6 @@
 #include "control_ipv4.h"
 #include "control_ipv6.h"
 #include "control_socket.h"
-#include "control_bridge.h"
 #include "control_tunnel.h"
 #include "control_ipsec.h"
 #include "control_pppoe.h"
@@ -385,14 +384,6 @@ static U16 stat_pppoe_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return NO_ERR;
 }
 
-static U16 stat_bridge_disabled_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)pcmd;
-	(void)cmd_len;
-	(void)out_reply_len;
-	return ERR_STAT_FEATURE_NOT_ENABLED;
-}
-
 static U16 stat_vlan_status_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 {
 	int x;
@@ -604,11 +595,6 @@ static U16 stat_flow_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
  * before they reach the handler. Max stays at U16_MAX to preserve
  * compatibility with libfci callers that pre-size the buffer for
  * a larger response struct.
- *
- * One exception: CMD_STAT_BRIDGE_{STATUS,ENTRY} route to
- * stat_bridge_disabled_handle which `(void)pcmd; (void)cmd_len;` —
- * bridge stats aren't built in this port. No read-uninit risk; left
- * at (0, U16_MAX).
  */
 static const struct cdx_cmd_spec stat_cmd_table[] = {
 	CDX_CMD_VAR(CMD_STAT_ENABLE,        sizeof(StatEnableCmd),         U16_MAX, NULL, stat_enable_handle),
@@ -616,9 +602,6 @@ static const struct cdx_cmd_spec stat_cmd_table[] = {
 	CDX_CMD_VAR(CMD_STAT_CONN,          sizeof(StatConnectionCmd),     U16_MAX, NULL, stat_conn_handle),
 	CDX_CMD_VAR(CMD_STAT_PPPOE_STATUS,  sizeof(StatPPPoEStatusCmd),    U16_MAX, NULL, stat_pppoe_status_handle),
 	CDX_CMD_VAR(CMD_STAT_PPPOE_ENTRY,   sizeof(StatPPPoEEntryResponse), U16_MAX, NULL, stat_pppoe_entry_handle),
-	/* bridge stats not built — handlers ignore pcmd entirely. */
-	CDX_CMD_VAR(CMD_STAT_BRIDGE_STATUS, 0, U16_MAX, NULL, stat_bridge_disabled_handle),
-	CDX_CMD_VAR(CMD_STAT_BRIDGE_ENTRY,  0, U16_MAX, NULL, stat_bridge_disabled_handle),
 	CDX_CMD_VAR(CMD_STAT_VLAN_STATUS,   sizeof(StatVlanStatusCmd),     U16_MAX, NULL, stat_vlan_status_handle),
 	CDX_CMD_VAR(CMD_STAT_VLAN_ENTRY,    sizeof(StatVlanEntryResponse), U16_MAX, NULL, stat_vlan_entry_handle),
 	CDX_CMD_VAR(CMD_STAT_TUNNEL_STATUS, sizeof(StatTunnelStatusCmd),   U16_MAX, NULL, stat_tunnel_status_handle),

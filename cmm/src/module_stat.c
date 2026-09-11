@@ -33,7 +33,6 @@ void cmmStatShowPrintHelp()
 				"       show stat vlan query|query_reset\n"
 				"       show stat connection query\n"
 				"       show stat pppoe query|query_reset\n"
-				"       show stat bridge query|query_reset\n"
 				"       show stat tunnel [name {tnl-name}] query|query_reset\n"
 				"       show stat ipsec query|query_reset\n"
 #if defined(FLOW_STATS)
@@ -189,7 +188,6 @@ int cmmStatShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 	fpp_stat_interface_cmd_t interfaceShowCmd;
 	fpp_stat_connection_cmd_t connShowCmd;
 	fpp_stat_pppoe_status_cmd_t pppoeStatusCmd;
-	fpp_stat_bridge_status_cmd_t bridgeStatusCmd;
 	fpp_stat_ipsec_status_cmd_t ipsecStatusCmd;
 	fpp_stat_vlan_status_cmd_t vlanStatusCmd;
 	fpp_stat_tunnel_status_cmd_t tunnelStatusCmd;
@@ -266,24 +264,6 @@ int cmmStatShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 			goto keyword_error;
 
  		cmdToSend |= CMD_BIT(FPP_CMD_STAT_PPPOE_STATUS);
-	}
-	else if(strcasecmp(keywords[cpt], "bridge") == 0)
-	{
-		if(!keywords[++cpt])
-			goto help;
-
-		if(strcasecmp(keywords[cpt], "query") == 0) 
-		{
-			bridgeStatusCmd.action = FPP_CMM_STAT_QUERY;
-		}
-		else if(strcasecmp(keywords[cpt], "query_reset") == 0) 
-		{
-			bridgeStatusCmd.action = FPP_CMM_STAT_QUERY_RESET;
- 		}
-		else
-			goto keyword_error;
-
- 		cmdToSend |= CMD_BIT(FPP_CMD_STAT_BRIDGE_STATUS);
 	}
 	else if(strcasecmp(keywords[cpt], "ipsec") == 0)
 	{
@@ -489,74 +469,6 @@ int cmmStatShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
 			count++;
 		}
 		cmm_print(DEBUG_STDOUT, "\n Statistics of %d PPPoE Sessions displayed \n", count);
-	}
-
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_BRIDGE_STATUS))
-	{
-		int count = 0;
-		char input_interface[IFNAMSIZ];
-		char output_interface[IFNAMSIZ];
-		fpp_stat_bridge_entry_response_t *pEntryResponse = (fpp_stat_bridge_entry_response_t *)rxbuf.rcvBuffer;
-		/* Send CMD_STAT_BRIDGE_STATUS command */
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_STAT_BRIDGE_STATUS, &bridgeStatusCmd, sizeof(bridgeStatusCmd), rxbuf.rcvBuffer);
-		if (rcvBytes != 2)
-		{
-			cmm_print(DEBUG_STDERR, "ERROR: Unexpected result returned from FPP rc:%04x\n",
-				  (rcvBytes < sizeof(unsigned short) ) ? 0 : rxbuf.result 
-			  );
-			goto exit;
-		}
-
-		while (1)
-		{
-			rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_STAT_BRIDGE_ENTRY, NULL, 0, rxbuf.rcvBuffer);
-			if (rcvBytes != sizeof(fpp_stat_bridge_entry_response_t))
-			{
-				cmm_print(DEBUG_STDERR, "ERROR: Unexpected result returned from FPP rc:%04x\n",
-				  	(rcvBytes < sizeof(unsigned short) ) ? 0 : rxbuf.result 
-			  	);
-				goto exit;
-			}
-			if (pEntryResponse->eof)
-			    	break;
-
-			if (pEntryResponse->input_interface >= GEM_PORTS)
-				strcpy(input_interface, pEntryResponse->input_name);
-			else
-				get_port_name(pEntryResponse->input_interface, input_interface, IFNAMSIZ);
-
-			if ((pEntryResponse->input_svlan != 0xFFFF) && (pEntryResponse->input_cvlan != 0xFFFF))
-				sprintf(input_interface + strlen(input_interface), ".%d.%d", pEntryResponse->input_svlan, pEntryResponse->input_cvlan);
-			else if (pEntryResponse->input_svlan != 0xFFFF)
-				sprintf(input_interface + strlen(input_interface), ".%d", pEntryResponse->input_svlan);
-
-			if (pEntryResponse->output_interface >= GEM_PORTS)
-				strcpy(output_interface, pEntryResponse->output_name);	
-			else	
-				get_port_name(pEntryResponse->output_interface, output_interface, IFNAMSIZ);
-
-			if ((pEntryResponse->output_svlan != 0xFFFF) && (pEntryResponse->output_cvlan != 0xFFFF))
-				sprintf(output_interface + strlen(output_interface), ".%d.%d", pEntryResponse->output_svlan, pEntryResponse->output_cvlan);
-			else if (pEntryResponse->output_svlan != 0xFFFF)
-				sprintf(output_interface + strlen(output_interface), ".%d", pEntryResponse->output_svlan);
-
-			cmm_print(DEBUG_STDOUT, "Input=%-6s "
-				                "DA=%02X:%02X:%02X:%02X:%02X:%02X "
-				                "SA=%02X:%02X:%02X:%02X:%02X:%02X "
-						"Type=%04X "
-						"Output=%s "
-						"SessionId=%d "
-						"Packets Transmitted = 0x%0x\n",
-						    input_interface,
-						    pEntryResponse->dst_mac[0], pEntryResponse->dst_mac[1], pEntryResponse->dst_mac[2],
-						    pEntryResponse->dst_mac[3], pEntryResponse->dst_mac[4], pEntryResponse->dst_mac[5],
-						    pEntryResponse->src_mac[0], pEntryResponse->src_mac[1], pEntryResponse->src_mac[2],
-						    pEntryResponse->src_mac[3], pEntryResponse->src_mac[4], pEntryResponse->src_mac[5],
-						    pEntryResponse->ether_type, output_interface,pEntryResponse->session_id,
-						    pEntryResponse->total_packets_transmitted);
-			count++;
-		}
-		cmm_print(DEBUG_STDOUT, "\n Statistics of %d Bridge Table Entries displayed \n", count);
 	}
 
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_IPSEC_STATUS))
@@ -779,11 +691,11 @@ void cmmStatSetPrintHelp(int cmd_type)
 	if (cmd_type == FPP_STAT_UNKNOWN_CMD || cmd_type == FPP_STAT_ENABLE_CMD)
 	{
 #if defined(FLOW_STATS)
-	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {interface|vlan|pppoe|bridge|ipsec|tunnel|flow}\n"
-		                     "      set stat disable {interface|vlan|pppoe|bridge|ipsec|tunnel|flow}\n");
+	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {interface|vlan|pppoe|ipsec|tunnel|flow}\n"
+		                     "      set stat disable {interface|vlan|pppoe|ipsec|tunnel|flow}\n");
 #else
-	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {interface|vlan|pppoe|bridge|ipsec|tunnel}\n"
-		                     "      set stat disable {interface|vlan|pppoe|bridge|ipsec|tunnel}\n");
+	    cmm_print(DEBUG_STDOUT, "Usage: set stat enable {interface|vlan|pppoe|ipsec|tunnel}\n"
+		                     "      set stat disable {interface|vlan|pppoe|ipsec|tunnel}\n");
 #endif
 	}
 	if (cmd_type == FPP_STAT_UNKNOWN_CMD || cmd_type == FPP_STAT_INTERFACE_PKT_CMD)
@@ -800,11 +712,6 @@ void cmmStatSetPrintHelp(int cmd_type)
 	{
 	    cmm_print(DEBUG_STDOUT, 
                   "Usage: set stat pppoe reset\n");
-	}
-	if (cmd_type == FPP_STAT_UNKNOWN_CMD || cmd_type == FPP_STAT_BRIDGE_CMD)
-	{
-	    cmm_print(DEBUG_STDOUT, 
-                  "Usage: set stat bridge reset\n");
 	}
 	if (cmd_type == FPP_STAT_UNKNOWN_CMD || cmd_type == FPP_STAT_IPSEC_CMD)
 	{
@@ -852,7 +759,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 	fpp_stat_enable_cmd_t statEnableCmd;
 	fpp_stat_interface_cmd_t interfaceResetCmd;
 	fpp_stat_pppoe_status_cmd_t pppoeResetCmd;
-	fpp_stat_bridge_status_cmd_t bridgeResetCmd;
 	fpp_stat_ipsec_status_cmd_t ipsecResetCmd;
 	fpp_stat_vlan_status_cmd_t vlanResetCmd;
 	fpp_stat_tunnel_status_cmd_t tunnelResetCmd;
@@ -881,8 +787,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 			statEnableCmd.bitmask = FPP_STAT_INTERFACE_BITMASK;
 		else if(strcasecmp(keywords[cpt], "pppoe") == 0)
 			statEnableCmd.bitmask = FPP_STAT_PPPOE_BITMASK;
-		else if(strcasecmp(keywords[cpt], "bridge") == 0)
-			statEnableCmd.bitmask = FPP_STAT_BRIDGE_BITMASK;
 		else if(strcasecmp(keywords[cpt], "ipsec") == 0)
 			statEnableCmd.bitmask = FPP_STAT_IPSEC_BITMASK;
 		else if(strcasecmp(keywords[cpt], "vlan") == 0)
@@ -933,18 +837,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 
 		pppoeResetCmd.action = FPP_CMM_STAT_RESET;
 		cmdToSend |= CMD_BIT(FPP_CMD_STAT_PPPOE_STATUS);
-	}
-	else if(strcasecmp(keywords[cpt], "bridge") == 0)
-	{
-		cmd_type = FPP_STAT_BRIDGE_CMD;
-		if(!keywords[++cpt])
-			goto help;
-
-		if(strcasecmp(keywords[cpt], "reset") != 0)
-			goto help;
-
-		bridgeResetCmd.action = FPP_CMM_STAT_RESET;
-		cmdToSend |= CMD_BIT(FPP_CMD_STAT_BRIDGE_STATUS);
 	}
 	else if(strcasecmp(keywords[cpt], "ipsec") == 0)
 	{
@@ -1039,12 +931,6 @@ int cmmStatSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
 	{
 		// Send CMD_STAT_PPPOE_STATUS command
 		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_STAT_PPPOE_STATUS, &pppoeResetCmd, sizeof(pppoeResetCmd), rxbuf.rcvBuffer);
-	}
-
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_BRIDGE_STATUS))
-	{
-		// Send CMD_STAT_BRIDGE_STATUS command
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_STAT_BRIDGE_STATUS, &bridgeResetCmd, sizeof(bridgeResetCmd), rxbuf.rcvBuffer);
 	}
 
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_STAT_IPSEC_STATUS))

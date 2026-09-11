@@ -2,10 +2,6 @@
   "_cmd_catalog": {
     "bounded": [
       [
-        "CMD_RX_L2BRIDGE_QUERY_ENTRY",
-        12
-      ],
-      [
         "CMD_QM_QOSENABLE",
         513
       ],
@@ -195,9 +191,9 @@
       ]
     ],
     "counts": {
-      "bounded": 48,
+      "bounded": 47,
       "exact": 25,
-      "permissive": 28
+      "permissive": 22
     },
     "exact": [
       [
@@ -303,22 +299,6 @@
     ],
     "permissive": [
       [
-        "CMD_RX_L2BRIDGE_ENABLE",
-        8
-      ],
-      [
-        "CMD_RX_L2BRIDGE_ADD",
-        9
-      ],
-      [
-        "CMD_RX_L2BRIDGE_REMOVE",
-        10
-      ],
-      [
-        "CMD_RX_L2BRIDGE_QUERY_STATUS",
-        11
-      ],
-      [
         "CMD_RX_L2BRIDGE_MODE",
         14
       ],
@@ -401,14 +381,6 @@
       [
         "CMD_IPSEC_RESET_SEC_FAILURE_STATS",
         2584
-      ],
-      [
-        "CMD_STAT_BRIDGE_STATUS",
-        3591
-      ],
-      [
-        "CMD_STAT_BRIDGE_ENTRY",
-        3592
       ],
       [
         "CMD_WIFI_VAP_RESET",

@@ -17,20 +17,12 @@
 allowlist:
   - name: CMD_BRIDGED_ITF_UPDATE
     reason: "auto_bridge bridged-iface notification; pcmd passed through to abm with own validation"
-  - name: CMD_RX_L2BRIDGE_ADD
-    reason: "cdx-side noop (real logic in auto_bridge via netfilter)"
-  - name: CMD_RX_L2BRIDGE_REMOVE
-    reason: "cdx-side noop (real logic in auto_bridge via netfilter)"
-  - name: CMD_RX_L2BRIDGE_ENABLE
-    reason: "cdx-side noop"
   - name: CMD_RX_L2BRIDGE_MODE
     reason: "cdx-side noop"
   - name: CMD_RX_L2BRIDGE_FLOW_TIMEOUT
     reason: "cdx-side noop"
   - name: CMD_RX_L2BRIDGE_FLOW_RESET
-    reason: "cdx-side noop"
-  - name: CMD_RX_L2BRIDGE_QUERY_STATUS
-    reason: "cdx-side noop"
+    reason: "flushes all L2 bridge flows; no body interpretation"
   - name: CMD_VLAN_ENTRY_RESET
     reason: "ISSUES.md A1b; vlan reset accepts any length, handler ignores body"
   - name: CMD_IPV4_RESET
@@ -71,9 +63,5 @@ allowlist:
     reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
   - name: CMD_RTP_STATS_DTMF_PT
     reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
-  - name: CMD_STAT_BRIDGE_ENTRY
-    reason: "STAT bridge query; cdx-side noop"
-  - name: CMD_STAT_BRIDGE_STATUS
-    reason: "STAT bridge query; cdx-side noop"
   - name: CMD_WIFI_VAP_RESET
     reason: "WIFI VAP reset; gated by CDX_TODO_WIFI in production"

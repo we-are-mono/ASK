@@ -16,14 +16,6 @@
 #include <string.h>
 #include <ctype.h>
 
-#define UNKNOWN_CMD	0
-#define ICC_CMD		1
-#define	BRIDGE_CMD	2
-
-#ifdef WIFI_ENABLE
-extern struct wifi_ff_entry glbl_wifi_ff_ifs[MAX_WIFI_FF_IFS];
-#endif
-
 struct list_head l2flow_table[L2FLOW_HASH_TABLE_SIZE];
 pthread_mutex_t brMutex = PTHREAD_MUTEX_INITIALIZER;		/*mutex to prevent race condition on the route table*/
 
@@ -679,211 +671,9 @@ void cmmRxShowPrintHelp()
 
 	print_all_gemac_ports(buf, 128);
   //	cmm_print(DEBUG_STDOUT, "show rx not yet supported\n");
-	cmm_print(DEBUG_STDOUT, "Usage: show rx interface {%s} icc\n"
-				"       query rx bridge\n", buf);
+	cmm_print(DEBUG_STDOUT, "Usage: show rx interface {%s} icc\n", buf);
 }
 
-
-/************************************************************
- *
- *
- *
- ************************************************************/
-int cmmRxQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
-{
-	int cpt = tabStart;
-	unsigned int cmdToSend = 0; /* bits field*/
-	int rcvBytes = 0;
-	union u_rxbuf rxbuf;
- 	char null_mac[6] = {0,0,0,0,0,0};
-
-	//goto help
-	if(!keywords[cpt])
-		goto help;
-	if(strcasecmp(keywords[cpt], "bridge") == 0)
-	{
-		cmdToSend |= CMD_BIT(FPP_CMD_RX_L2BRIDGE_QUERY_STATUS);
-	}
-	else
-		goto keyword_error;
-
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_RX_L2BRIDGE_QUERY_STATUS))
-	{
-		int count = 0;
-		char input_interface[IFNAMSIZ];
-		char output_interface[IFNAMSIZ];
-		char pkt_priority[16];
-		char svlan_priority[16];
-		char cvlan_priority[16];
-		char queue_modifier[16];
-		fpp_l2_bridge_query_status_response_t *pStatusResponse = (fpp_l2_bridge_query_status_response_t *)rxbuf.rcvBuffer;
-		fpp_l2_bridge_query_entry_response_t *pEntryResponse = (fpp_l2_bridge_query_entry_response_t *)rxbuf.rcvBuffer;
-
-		while( 1 )
-		{
-			// Send CMD_RX_L2BRIDGE_QUERY_STATUS command
-			rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_QUERY_STATUS, NULL, 0, rxbuf.rcvBuffer);
-			if ( rcvBytes != sizeof(fpp_l2_bridge_query_status_response_t) )
-			{
-				cmm_print(DEBUG_STDERR, "ERROR: Unexpected result returned from FPP rc:%04x\n",
-					  (rcvBytes < sizeof(unsigned short) ) ? 
-								0 : rxbuf.result
-				  );
-				goto exit;
-			}
-			
-			if (pStatusResponse->eof)
-			    	break;
-
-			cmm_print(DEBUG_STDOUT, "Interface %s Status: %s\n", 
-					pStatusResponse->ifname, pStatusResponse->status ? "ON":"OFF");
-		}
-		while (1)
-		{
-			char sessionid_buf[32];
-			rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_QUERY_ENTRY, NULL, 0, rxbuf.rcvBuffer);
-			if (rcvBytes != sizeof(fpp_l2_bridge_query_entry_response_t))
-			{
-				cmm_print(DEBUG_STDERR, "ERROR: CMD_RX_L2BRIDGE_QUERY_ENTRY Unexpected result returned from FPP rc:%04x - received %d - expected %zu\n",
-				  	(rcvBytes < sizeof(unsigned short) ) ? 0 : rxbuf.result,
-					rcvBytes,
-					sizeof(fpp_l2_bridge_query_entry_response_t)
-			  	);
-				goto exit;
-			}
-			if (pEntryResponse->eof)
-			    	break;
-			if (pEntryResponse->input_interface >= GEM_PORTS)
-				strcpy(input_interface, pEntryResponse->input_name);	
-			else	
-				get_port_name(pEntryResponse->input_interface, input_interface, IFNAMSIZ);
-			
-			if ((pEntryResponse->input_svlan != 0xFFFF) && (pEntryResponse->input_cvlan != 0xFFFF))
-				sprintf(input_interface + strlen(input_interface), ".%d.%d", pEntryResponse->input_svlan, pEntryResponse->input_cvlan);
-			else if (pEntryResponse->input_svlan != 0xFFFF)
-				sprintf(input_interface + strlen(input_interface), ".%d", pEntryResponse->input_svlan);
-
-			if (pEntryResponse->output_interface >= GEM_PORTS)
-				strcpy(output_interface, pEntryResponse->output_name);	
-			else	
-				get_port_name(pEntryResponse->output_interface, output_interface, IFNAMSIZ);
-			
-			if ((pEntryResponse->output_svlan != 0xFFFF) && (pEntryResponse->output_cvlan != 0xFFFF))
-				sprintf(output_interface + strlen(output_interface), ".%d.%d", pEntryResponse->output_svlan, pEntryResponse->output_cvlan);
-			else if (pEntryResponse->output_svlan != 0xFFFF)
-				sprintf(output_interface + strlen(output_interface), ".%d", pEntryResponse->output_svlan);
-
-			if (pEntryResponse->pkt_priority == 0x8000)
-				strcpy(pkt_priority, "vlan");
-			else
-				sprintf(pkt_priority, "%d", pEntryResponse->pkt_priority);
-
-			if (pEntryResponse->svlan_priority == 0x8000)
-				strcpy(svlan_priority, "copy");
-			else
-				sprintf(svlan_priority, "%d", pEntryResponse->svlan_priority);
-			
-			if (pEntryResponse->cvlan_priority == 0x8000)
-				strcpy(cvlan_priority, "copy");
-			else
-				sprintf(cvlan_priority, "%d", pEntryResponse->cvlan_priority);
-			
-			if (pEntryResponse->session_id != 0)
-				sprintf(sessionid_buf, "SessionId=%d ", pEntryResponse->session_id);
-			else
-				sessionid_buf[0] = '\0';
-
-			if(pEntryResponse->queue_modifier == FPP_BRIDGE_QMOD_DSCP)
-				strcpy(queue_modifier, "dscp");
-			else
-				strcpy(queue_modifier, "none");	
-
-
-			if ((!memcmp(pEntryResponse->srcaddr, null_mac, 6)) && (pEntryResponse->ethertype == 0))
-				cmm_print(DEBUG_STDOUT, "Input=%-6s "
-				                "DA=%02X:%02X:%02X:%02X:%02X:%02X "
-				                "SA=       *          "
-						  "Type=  *  "
-						  "Queue=%-s "
-						  "Qmod=%-s "
-						  "SVLANPrio=%-s "
-						  "CVLANPrio=%-s "
-						  "%s"
-						  "Output=%s\n",
-						    input_interface,
-						    pEntryResponse->destaddr[0], pEntryResponse->destaddr[1], pEntryResponse->destaddr[2],
-						    pEntryResponse->destaddr[3], pEntryResponse->destaddr[4], pEntryResponse->destaddr[5],
-						    pkt_priority, queue_modifier, svlan_priority, cvlan_priority,sessionid_buf,
-						    output_interface);
-			else if (!memcmp(pEntryResponse->srcaddr, null_mac, 6))
-				cmm_print(DEBUG_STDOUT, "Input=%-6s "
-				                "DA=%02X:%02X:%02X:%02X:%02X:%02X "
-				                "SA=       *          "
-						  "Type=%04X "
-						  "Queue=%-s "
-						  "Qmod=%-s "
-						  "SVLANPrio=%-s "
-						  "CVLANPrio=%-s "
-						  "%s"
-						  "Output=%s\n",
-						    input_interface,
-						    pEntryResponse->destaddr[0], pEntryResponse->destaddr[1], pEntryResponse->destaddr[2],
-						    pEntryResponse->destaddr[3], pEntryResponse->destaddr[4], pEntryResponse->destaddr[5],
-						    pEntryResponse->ethertype, pkt_priority, queue_modifier, svlan_priority, cvlan_priority,
-						    sessionid_buf, output_interface);
-			else if (pEntryResponse->ethertype == 0)
-				cmm_print(DEBUG_STDOUT, "Input=%-6s "
-				                "DA=%02X:%02X:%02X:%02X:%02X:%02X "
-				                "SA=%02X:%02X:%02X:%02X:%02X:%02X "
-						  "Type=  *  "
-						  "Queue=%-s "
-						  "Qmod=%-s "
-						  "SVLANPrio=%-s "
-						  "CVLANPrio=%-s "
-						  "%s"
-						  "Output=%s\n",
-						    input_interface,
-						    pEntryResponse->destaddr[0], pEntryResponse->destaddr[1], pEntryResponse->destaddr[2],
-						    pEntryResponse->destaddr[3], pEntryResponse->destaddr[4], pEntryResponse->destaddr[5],
-						    pEntryResponse->srcaddr[0], pEntryResponse->srcaddr[1], pEntryResponse->srcaddr[2],
-						    pEntryResponse->srcaddr[3], pEntryResponse->srcaddr[4], pEntryResponse->srcaddr[5],
-						    pkt_priority, queue_modifier, svlan_priority, cvlan_priority,sessionid_buf,
-						    output_interface);
-
-			else	
-			cmm_print(DEBUG_STDOUT, "Input=%-6s "
-				                "DA=%02X:%02X:%02X:%02X:%02X:%02X "
-				                "SA=%02X:%02X:%02X:%02X:%02X:%02X "
-						  "Type=%04X "
-						  "Queue=%-s "
-						  "Qmod=%-s "
-						  "SVLANPrio=%-s "
-						  "CVLANPrio=%-s "
-						  "%s"
-						  "Output=%s\n",
-						    input_interface,
-						    pEntryResponse->destaddr[0], pEntryResponse->destaddr[1], pEntryResponse->destaddr[2],
-						    pEntryResponse->destaddr[3], pEntryResponse->destaddr[4], pEntryResponse->destaddr[5],
-						    pEntryResponse->srcaddr[0], pEntryResponse->srcaddr[1], pEntryResponse->srcaddr[2],
-						    pEntryResponse->srcaddr[3], pEntryResponse->srcaddr[4], pEntryResponse->srcaddr[5],
-						    pEntryResponse->ethertype, pkt_priority, queue_modifier, svlan_priority, cvlan_priority,
-						    sessionid_buf, output_interface);
-			count++;
-		}
-		cmm_print(DEBUG_STDOUT, "\n%d Bridge Table Entries found\n", count);
-	}
-
-        return 0;
-
-keyword_error:
-	cmm_print(DEBUG_STDERR, "ERROR: Unknown keyword %s\n", keywords[cpt]);
-
-help:
-	cmmRxShowPrintHelp();
-
-exit:
-	return -1;
-}
 
 /************************************************************
  *
@@ -964,76 +754,23 @@ exit:
  *
  *
  ************************************************************/
-void cmmRxSetPrintHelp(int cmd_type)
+static void cmmRxSetPrintHelp(void)
 {
 	char buf[128];
 
-
-	print_all_gemac_ports(buf, 128);
-
-	if (cmd_type == UNKNOWN_CMD || cmd_type == ICC_CMD)
-	{
-	    cmm_print(DEBUG_STDOUT, 
-                  "Usage: set rx interface {%s} [icc {on|off}]\n"
-                  "                             [acc {acc_value}]\n"
-                  "                             [on_thr {on_thr value}]\n"
-                  "                             [off_thr {off_thr value}]\n"
-                  "                             [flag {flag value}]\n"
-                  "                             [val1 {val1 value}]\n"
-                  "                             [val2 {val2 value}]\n", buf);
-	}
-	if (cmd_type == UNKNOWN_CMD)
-	{
-	    cmm_print(DEBUG_STDOUT, "\n");
-	}
-	if (cmd_type == UNKNOWN_CMD || cmd_type == BRIDGE_CMD)
-	{
-#ifdef WIFI_ENABLE
-	    //FIXME : Now interface names are hardcoded to ath0/ath1. Need to 
-	    //        find solution to get interface names from config file.	
-	    cmm_print(DEBUG_STDOUT, 
-                  "Usage: set rx interface {%s|<wi-fi interface>} [bridge {on|off|add|remove}]\n"
-                  "                add / remove options:\n"
-                  "                                      [da {dest_addr value}]\n"
-                  "                                      [sa {src_addr value}]\n"
-                  "                                      [type {ethertype value}]\n"
-                  "                add options:\n"
-                  "                                      [queue {output queue base value 0-31|vlan}]\n"
-                  "                                      [svlanprio {priority value|copy}]\n"
-                  "                                      [cvlanprio {priority value|copy}]\n"
-                  "                                      [sessionid {session id value}]\n"
-                  "                                      [output {interface}]\n"
-		  "                                      [qmod {output queue modifier dscp|none}]\n", buf);
-#else
-	    cmm_print(DEBUG_STDOUT, 
-                  "Usage: set rx interface {%s} [bridge {on|off|add|remove}]\n"
-                  "                add / remove options:\n"
-                  "                                      [da {dest_addr value}]\n"
-                  "                                      [sa {src_addr value}]\n"
-                  "                                      [type {ethertype value}]\n"
-                  "                add options:\n"
-                  "                                      [queue {output queue base value 0-31|vlan}]\n"
-                  "                                      [svlanprio {priority value|copy}]\n"
-                  "                                      [cvlanprio {priority value|copy}]\n"
-                  "                                      [sessionid {session id value}]\n"
-                  "                                      [output {interface}]\n"
-		  "                                      [qmod {output queue modifier dscp|none}]\n", buf);
-#endif
-	}
+	print_all_gemac_ports(buf, sizeof(buf));
+	cmm_print(DEBUG_STDOUT,
+		  "Usage: set rx interface {%s} [icc {on|off}]\n"
+		  "                             [acc {acc_value}]\n"
+		  "                             [on_thr {on_thr value}]\n"
+		  "                             [off_thr {off_thr value}]\n"
+		  "                             [flag {flag value}]\n"
+		  "                             [val1 {val1 value}]\n"
+		  "                             [val2 {val2 value}]\n", buf);
 }
-
-
-/************************************************************
- *
- *
- *
- ************************************************************/
-static int parse_interface(char *pstring, unsigned short *pinterface_number );
-static int parse_interface_qinq(char *pstring, unsigned short *pinterface_number, unsigned short *svlan_id, unsigned short *cvlan_id);
 
 int cmmRxSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
 {
-	int cmd_type = UNKNOWN_CMD;
 	int cpt = tabStart;
 	unsigned int cmdToSend = 0; /* bits field*/
 	char * endptr;
@@ -1044,10 +781,6 @@ int cmmRxSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 
 	fpp_rx_icc_enable_cmd_t enableCmd;
 	fpp_rx_icc_disable_cmd_t disableCmd;
-
-	fpp_l2_bridge_enable_cmd_t bridgeEnableCmd;
-	fpp_l2_bridge_add_entry_cmd_t bridgeAddCmd;
-	fpp_l2_bridge_remove_entry_cmd_t bridgeRemoveCmd;
 
 	union u_rxbuf rxbuf;
 
@@ -1068,7 +801,6 @@ int cmmRxSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 
    if(strcasecmp(keywords[cpt], "icc") == 0)
    {		
-       		cmd_type = ICC_CMD;
 		if(!keywords[++cpt])
 			goto help;
 
@@ -1170,254 +902,6 @@ int cmmRxSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 		else
 			goto keyword_error;
    }
-   else if(strcasecmp(keywords[cpt], "bridge") == 0)
-   {		
-       		cmd_type = BRIDGE_CMD;
-		if(!keywords[++cpt])
-			goto help;
-
-		if(strcasecmp(keywords[cpt], "on") == 0)
-		{
-			if (keywords[++cpt])
-				goto help;
-			cmdToSend |= CMD_BIT(FPP_CMD_RX_L2BRIDGE_ENABLE);
-			memset(&bridgeEnableCmd, 0, sizeof(bridgeEnableCmd));
-			bridgeEnableCmd.enable_flag = 1;
-			bridgeEnableCmd.interface = 0xffff;
-		
-			strncpy (&bridgeEnableCmd.input_name[0], pinterface, sizeof(bridgeEnableCmd.input_name));
-			STR_TRUNC_END(bridgeEnableCmd.input_name, sizeof(bridgeEnableCmd.input_name));
-		}
-		else if(strcasecmp(keywords[cpt], "off") == 0)
-		{
-			if (keywords[++cpt])
-				goto help;
-			cmdToSend |= CMD_BIT(FPP_CMD_RX_L2BRIDGE_ENABLE);
-			memset(&bridgeEnableCmd, 0, sizeof(bridgeEnableCmd));
-			bridgeEnableCmd.enable_flag = 0;
-			bridgeEnableCmd.interface = 0xffff;
-			strncpy (&bridgeEnableCmd.input_name[0], pinterface, sizeof(bridgeEnableCmd.input_name));
-			STR_TRUNC_END(bridgeEnableCmd.input_name, sizeof(bridgeEnableCmd.input_name));
-		}
-		else if(strcasecmp(keywords[cpt], "add") == 0)
-		{
-			cmdToSend |= CMD_BIT(FPP_CMD_RX_L2BRIDGE_ADD);
-			memset(&bridgeAddCmd, 0, sizeof(bridgeAddCmd));
-			strncpy(bridgeAddCmd.input_name, pinterface, sizeof(bridgeAddCmd.input_name));
-			STR_TRUNC_END(bridgeAddCmd.input_name, sizeof(bridgeAddCmd.input_name));
-			bridgeAddCmd.input_interface = 0xffff;
-			bridgeAddCmd.input_svlan = 0xffff;
-			bridgeAddCmd.input_cvlan = 0xffff;
-			bridgeAddCmd.output_interface = 0xffff;
-			bridgeAddCmd.output_svlan = 0xFFFF;
-			bridgeAddCmd.output_cvlan = 0xFFFF;
-			while (keywords[++cpt] != NULL)
-			{
-				if(strcasecmp(keywords[cpt], "da") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (!parse_macaddr(keywords[cpt], bridgeAddCmd.destaddr))
-					{
-						cmm_print(DEBUG_CRIT, "bridge ERROR: bad MAC address: %s\n", keywords[cpt]);
-						goto help;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "sa") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (!parse_macaddr(keywords[cpt], bridgeAddCmd.srcaddr))
-					{
-						cmm_print(DEBUG_CRIT, "bridge ERROR: bad MAC address: %s\n", keywords[cpt]);
-						goto help;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "type") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					tmp = strtoul(keywords[cpt], &endptr, 0);
-					if ((keywords[cpt] == endptr) || (tmp > 0xFFFF))
-					{
-					    cmm_print(DEBUG_CRIT, "bridge ERROR: bad ETHERTYPE value: %s\n", keywords[cpt]);
-					    goto help;
-					}
-					bridgeAddCmd.ethertype = (unsigned short)tmp;
-				}
-				else if(strcasecmp(keywords[cpt], "prio") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (strcasecmp(keywords[cpt], "vlan") == 0)
-						bridgeAddCmd.pkt_priority = 0x8000;
-					else
-					{
-						tmp = strtoul(keywords[cpt], &endptr, 0);
-						if ((keywords[cpt] == endptr) || (tmp > 7))
-						{
-					    		cmm_print(DEBUG_CRIT, "bridge ERROR: bad PRIORITY value: %s\n", keywords[cpt]);
-					    		goto help;
-						}
-						bridgeAddCmd.pkt_priority = (unsigned short)tmp;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "queue") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (strcasecmp(keywords[cpt], "vlan") == 0)
-						bridgeAddCmd.pkt_priority = 0x8000;
-					else
-					{
-						tmp = strtoul(keywords[cpt], &endptr, 0);
-						if ((keywords[cpt] == endptr) || (tmp >= FPP_NUM_QUEUES))
-						{
-					    		cmm_print(DEBUG_CRIT, "bridge ERROR: bad QUEUE value: %s\n", keywords[cpt]);
-					    		goto help;
-						}
-						bridgeAddCmd.pkt_priority = (unsigned short)tmp;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "svlanprio") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (strcasecmp(keywords[cpt], "copy") == 0)
-						bridgeAddCmd.svlan_priority = 0x8000;
-					else
-					{
-						tmp = strtoul(keywords[cpt], &endptr, 0);
-						if ((keywords[cpt] == endptr) || (tmp > 7))
-						{
-					    		cmm_print(DEBUG_CRIT, "bridge ERROR: bad SVLAN PRIORITY value: %s\n", keywords[cpt]);
-					    		goto help;
-						}
-						bridgeAddCmd.svlan_priority = (unsigned short)tmp;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "cvlanprio") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (strcasecmp(keywords[cpt], "copy") == 0)
-						bridgeAddCmd.cvlan_priority = 0x8000;
-					else
-					{
-						tmp = strtoul(keywords[cpt], &endptr, 0);
-						if ((keywords[cpt] == endptr) || (tmp > 7))
-						{
-					    		cmm_print(DEBUG_CRIT, "bridge ERROR: bad CVLAN PRIORITY value: %s\n", keywords[cpt]);
-					    		goto help;
-						}
-						bridgeAddCmd.cvlan_priority = (unsigned short)tmp;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "sessionid") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					tmp = strtoul(keywords[cpt], &endptr, 0);
-					if ((keywords[cpt] == endptr) || (tmp > 0xFFFF))
-					{
-					    cmm_print(DEBUG_CRIT, "bridge ERROR: bad SESSION ID value: %s\n", keywords[cpt]);
-					    goto help;
-					}
-					bridgeAddCmd.session_id = (unsigned short)tmp;
-				}
-				else if(strcasecmp(keywords[cpt], "output") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					bridgeAddCmd.output_interface = 0xFFFF;
-					bridgeAddCmd.input_interface  = 0xFFFF;
-					bridgeAddCmd.output_svlan = 0xFFFF;
-					bridgeAddCmd.output_cvlan = 0xFFFF;
-					strncpy(bridgeAddCmd.output_name, keywords[cpt], sizeof(bridgeAddCmd.output_name));
-					STR_TRUNC_END(bridgeAddCmd.output_name,sizeof(bridgeAddCmd.output_name));
-					strncpy(bridgeAddCmd.input_name, pinterface, sizeof(bridgeAddCmd.input_name));
-					STR_TRUNC_END(bridgeAddCmd.input_name,sizeof(bridgeAddCmd.input_name));
-				}
-				else if(strcasecmp(keywords[cpt], "qmod") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (strcasecmp(keywords[cpt], "dscp") == 0)
-						bridgeAddCmd.queue_modifier = FPP_BRIDGE_QMOD_DSCP;
-					else if(strcasecmp(keywords[cpt], "none") == 0)
-						bridgeAddCmd.queue_modifier = FPP_BRIDGE_QMOD_NONE;
-					else {
-						bridgeAddCmd.queue_modifier = FPP_BRIDGE_QMOD_NONE;
-						cmm_print(DEBUG_CRIT, "bridge ERROR: bad QUEUE MODIFIER  value: %s\n", keywords[cpt]);
-					    	goto help;
-					}
-				}
-				else
-				    goto help;
-			}
-		}
-		else if(strcasecmp(keywords[cpt], "remove") == 0)
-		{
-			cmdToSend |= CMD_BIT(FPP_CMD_RX_L2BRIDGE_REMOVE);
-			memset(&bridgeRemoveCmd, 0, sizeof(bridgeRemoveCmd));
-			strncpy(bridgeRemoveCmd.input_name, pinterface, sizeof(bridgeRemoveCmd.input_name));
-			STR_TRUNC_END(bridgeRemoveCmd.input_name,sizeof(bridgeRemoveCmd.input_name));
-			bridgeRemoveCmd.input_interface = 0xffff;
-			bridgeRemoveCmd.input_svlan = 0xffff;
-			bridgeRemoveCmd.input_cvlan = 0xffff;
-			while (keywords[++cpt] != NULL)
-			{
-				if(strcasecmp(keywords[cpt], "da") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (!parse_macaddr(keywords[cpt], bridgeRemoveCmd.destaddr))
-					{
-						cmm_print(DEBUG_CRIT, "bridge ERROR: bad MAC address: %s\n", keywords[cpt]);
-						goto help;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "sa") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					if (!parse_macaddr(keywords[cpt], bridgeRemoveCmd.srcaddr))
-					{
-						cmm_print(DEBUG_CRIT, "bridge ERROR: bad MAC address: %s\n", keywords[cpt]);
-						goto help;
-					}
-				}
-				else if(strcasecmp(keywords[cpt], "type") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					tmp = strtoul(keywords[cpt], &endptr, 0);
-					if ((keywords[cpt] == endptr) || (tmp > 0xFFFF))
-					{
-					    cmm_print(DEBUG_CRIT, "bridge ERROR: bad ETHERTYPE value: %s\n", keywords[cpt]);
-					    goto help;
-					}
-					bridgeRemoveCmd.ethertype = (unsigned short)tmp;
-				}
-				else if(strcasecmp(keywords[cpt], "sessionid") == 0)
-				{
-					if(!keywords[++cpt])
-						goto help;
-					tmp = strtoul(keywords[cpt], &endptr, 0);
-					if ((keywords[cpt] == endptr) || (tmp > 0xFFFF))
-					{
-					    cmm_print(DEBUG_CRIT, "bridge ERROR: bad SESSION ID value: %s\n", keywords[cpt]);
-					    goto help;
-					}
-					bridgeRemoveCmd.session_id = (unsigned short)tmp;
-				}
-				else
-				    goto help;
-			}
-		}
-		else
-			goto keyword_error;
-   }
    else
        goto keyword_error;
 
@@ -1425,24 +909,6 @@ int cmmRxSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handl
 	 * Parsing have been performed
 	 * Now send the right commands
 	 */
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_RX_L2BRIDGE_ENABLE))
-	{
-		// Send CMD_RX_L2BRIDGE_ENABLE command
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_ENABLE, & bridgeEnableCmd, sizeof(bridgeEnableCmd), rxbuf.rcvBuffer);
-	}
-        
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_RX_L2BRIDGE_ADD))
-	{
-		// Send CMD_RX_L2BRIDGE_ADD command
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_ADD, & bridgeAddCmd, sizeof(bridgeAddCmd), rxbuf.rcvBuffer);
-	}
-        
-	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_RX_L2BRIDGE_REMOVE))
-	{
-		// Send CMD_RX_L2BRIDGE_REMOVE command
-		rcvBytes = cmmSendToDaemon(daemon_handle, FPP_CMD_RX_L2BRIDGE_REMOVE, & bridgeRemoveCmd, sizeof(bridgeRemoveCmd), rxbuf.rcvBuffer);
-	}
-        
 	if(TEST_CMD_BIT(cmdToSend, FPP_CMD_RX_CNG_DISABLE))
 	{
 		// Send CMD_RX_CNG_DISABLE command
@@ -1468,126 +934,10 @@ keyword_error:
 	cmm_print(DEBUG_CRIT, "ERROR: Unknown keyword %s\n", keywords[cpt]);
 
 help:
-	cmmRxSetPrintHelp(cmd_type);
+	cmmRxSetPrintHelp();
 	return -1;
 }
 
-/*********************************************************************************
- *
- *
- *
- ********************************************************************************/
-int cmmL2BridgeProcessClientCmd(FCI_CLIENT* fci_handle, int fc, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len)
-{
-	fpp_l2_bridge_enable_cmd_t *bridgeEnableCmd;
-	fpp_l2_bridge_add_entry_cmd_t *bridgeAddCmd;
-	fpp_l2_bridge_remove_entry_cmd_t *bridgeRemoveCmd;
-	unsigned short svlan_id, cvlan_id, interface;
-	
-	cmm_print(DEBUG_INFO, "%s\n", __func__);
-
-	res_buf[0] = CMMD_ERR_WRONG_COMMAND_SIZE;
-
-	switch(fc)
-	{
-		case FPP_CMD_RX_L2BRIDGE_ENABLE:
-			cmm_print(DEBUG_INFO, "2 %s\n", __func__);
-			bridgeEnableCmd = (fpp_l2_bridge_enable_cmd_t *)cmd_buf;
-			*res_len = 2;
-			if( cmd_len < sizeof(fpp_l2_bridge_enable_cmd_t) )
-			{
-				cmm_print(DEBUG_ERROR, "%s: Bridge enable command size too small(%d, %zu)\n", 
-						__func__, cmd_len, sizeof(fpp_l2_bridge_enable_cmd_t));
-				return 0;
-			}
-			
-			if( parse_interface(bridgeEnableCmd->input_name, &interface) < 0 )
-			{
-				cmm_print(DEBUG_ERROR, "%s: Bridge enable command with unknown interface: %s\n",
-						__func__, bridgeEnableCmd->input_name);
-				res_buf[0] = CMMD_ERR_NOT_CONFIGURED;
-				return 0; 
-			}
-			bridgeEnableCmd->interface = interface;
-			
-			goto FCI_CMD; 
-
-		case FPP_CMD_RX_L2BRIDGE_ADD:
-			bridgeAddCmd = (fpp_l2_bridge_add_entry_cmd_t *)cmd_buf;
-			*res_len = 2;
-			if( cmd_len < sizeof(fpp_l2_bridge_add_entry_cmd_t) )
-			{
-				cmm_print(DEBUG_ERROR, "%s: Bridge add command size too small(%d, %zu)\n", 
-						__func__, cmd_len, sizeof(fpp_l2_bridge_add_entry_cmd_t));
-				return 0;
-			}
-			
-			if( parse_interface_qinq(bridgeAddCmd->input_name, &interface, &svlan_id, &cvlan_id) < 0 )
-			{
-				cmm_print(DEBUG_ERROR, "%s: Bridge add command with unknown interface: %s\n",
-						__func__, bridgeAddCmd->input_name);
-				res_buf[0] = CMMD_ERR_NOT_CONFIGURED;
-				return 0; 
-			}
-			bridgeAddCmd->input_interface = interface;
-			bridgeAddCmd->input_svlan = svlan_id;
-			bridgeAddCmd->input_cvlan = cvlan_id;
-
-		/* FIXME : output interface should be provided by the user */
-		//	bridgeAddCmd->output_interface = interface == GEMAC0_PORT ? GEMAC1_PORT : GEMAC0_PORT;
-		//	bridgeAddCmd->output_vlan = 0xFFFF;
-
-		//	if (!strlen(bridgeAddCmd->output_name))
-		//		goto FCI_CMD;
-
-			if( parse_interface_qinq(bridgeAddCmd->output_name, &interface, &svlan_id, &cvlan_id) == 0 )
-			{
-				bridgeAddCmd->output_interface = interface;
-				bridgeAddCmd->output_svlan = svlan_id;
-				bridgeAddCmd->output_cvlan = cvlan_id;
-			}
-			else
-			{
-				bridgeAddCmd->output_interface = 0xFFFF;
-				bridgeAddCmd->input_interface  = 0xFFFF;
-				bridgeAddCmd->output_svlan = 0xFFFF;
-				bridgeAddCmd->output_cvlan = 0xFFFF;
-			}	
-			goto FCI_CMD;
- 
-		case FPP_CMD_RX_L2BRIDGE_REMOVE:
-			bridgeRemoveCmd = (fpp_l2_bridge_remove_entry_cmd_t *)cmd_buf;
-			*res_len = 2;
-			if( cmd_len < sizeof(fpp_l2_bridge_remove_entry_cmd_t) )
-			{
-				cmm_print(DEBUG_ERROR, "%s: Bridge remove command size too small(%d, %zu)\n", 
-						__func__, cmd_len, sizeof(fpp_l2_bridge_remove_entry_cmd_t));
-				return 0;
-			}
-			
-			if( parse_interface_qinq(bridgeRemoveCmd->input_name, &interface, &svlan_id, &cvlan_id) < 0 )
-			{
-				cmm_print(DEBUG_ERROR, "%s: Bridge remove command with unknown interface: %s\n",
-						__func__, bridgeRemoveCmd->input_name);
-				res_buf[0] = CMMD_ERR_NOT_CONFIGURED;
-				return 0; 
-			}
-			
-			bridgeRemoveCmd->input_interface = interface;
-			bridgeRemoveCmd->input_svlan = svlan_id;
-			bridgeRemoveCmd->input_cvlan = cvlan_id;
-					
-			goto FCI_CMD;
-
-		case FPP_CMD_RX_L2BRIDGE_QUERY_STATUS:
-		case FPP_CMD_RX_L2BRIDGE_QUERY_ENTRY:
-			goto FCI_CMD;
-	}
-FCI_CMD:
-	return fci_cmd(fci_handle, fc, (u_int16_t*)cmd_buf, cmd_len, res_buf, res_len);
-	
-}
-  
 int parse_icc_interface(char *pstring, unsigned short *pinterface_number, int num_interfaces)
 {
 	u_int32_t interface;
@@ -1605,104 +955,6 @@ int parse_icc_interface(char *pstring, unsigned short *pinterface_number, int nu
 	}
 
 	return 0;	
-}
-
-static int parse_interface(char *pstring, unsigned short *pinterface_number)
-{
-	if ((short)(*pinterface_number = get_port_id(pstring)) < 0)
-	{
-#ifdef WIFI_ENABLE
-		int i, ret;
-
-		__pthread_mutex_lock(&itf_table.lock);
-		ret = __itf_is_programmed(if_nametoindex(pstring));
-		__pthread_mutex_unlock(&itf_table.lock);
-
-		if( ret <= 0 )
-			return -1;
-
-		for (i = 0; i < MAX_WIFI_FF_IFS; i++)	
-		{
-			if( !strcmp(pstring, glbl_wifi_ff_ifs[i].ifname) && glbl_wifi_ff_ifs[i].used )
-			{
-				*pinterface_number = WIFI_PORT0 + i;
-				break;
-			}
-		}
-	
-		if( i >= MAX_WIFI_FF_IFS )
-#endif
-			return -1;
-	}
-	return 0;
-}
-
-static int parse_interface_qinq(char *pstring, unsigned short *pinterface_number, unsigned short *psvlan_id, unsigned short *pcvlan_id)
-{
-	char interface[16];
-	char *pperiod;
-	char *peos;
-	unsigned long vlan_id;
-
-	*psvlan_id = 0xFFFF;
-	*pcvlan_id = 0xFFFF;
-	strncpy(interface, pstring, sizeof(interface) - 1);
-	STR_TRUNC_END(interface, sizeof(interface));
-
-	pperiod = strchr(interface, '.');
-	if (pperiod)
-	    	*pperiod++ = '\0';
-	if ((short)(*pinterface_number = get_port_id(interface)) < 0)
-	{
-#ifdef WIFI_ENABLE
-		int i, ret;
-		
-		__pthread_mutex_lock(&itf_table.lock);
-		ret = __itf_is_programmed(if_nametoindex(interface));
-		__pthread_mutex_unlock(&itf_table.lock);
-
-		if( ret <= 0 )
-			return -1;
-
-		for (i = 0; i < MAX_WIFI_FF_IFS; i++)	
-		{
-			if( !strcmp(interface, glbl_wifi_ff_ifs[i].ifname) &&  glbl_wifi_ff_ifs[i].used )
-			{
-				*pinterface_number = WIFI_PORT0 + i;
-				break;
-			}
-		}
-		
-		if( i >= MAX_WIFI_FF_IFS )
-#endif
-			return -1;
-	}
-
-	if (pperiod)
-	{
-		vlan_id = strtoul(pperiod, &peos, 10);
-		if (peos == pperiod || vlan_id > 4094)
-		{
-			cmm_print(DEBUG_CRIT, "ERROR: Invalid SVLAN specification: %s\n", pstring);
-			return -1;
-		}
-		*psvlan_id = (unsigned short)vlan_id;
-		if (*peos == '\0')
-		{
-			return 0;
-		}
-
-		pperiod = peos + 1;
-		vlan_id = strtoul(pperiod, &peos, 10);
-		if (peos == pperiod || *peos != '\0' || vlan_id > 4094)
-		{
-			cmm_print(DEBUG_CRIT, "ERROR: Invalid CVLAN specification: %s\n", pstring);
-			return -1;
-		}
-		*pcvlan_id = (unsigned short)vlan_id;
-	}
-
-	return 0;
 }
 
 int parse_macaddr(char *pstring, unsigned char *pmacaddr)

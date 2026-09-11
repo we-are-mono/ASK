@@ -248,7 +248,7 @@ void cmmClientPrintHelp()
 	 */
 
 	cmm_print(DEBUG_STDOUT, "Command usage: set <module_name> [option ...]\n"
-									"\trx: Manage RX module (ICC, Bridging  ...)\n"
+									"\trx: Manage RX module (ICC)\n"
 									"\ttx: Manage TX module (DSCP VLAN PCP mapping)\n"
 									"\tqm: Manage QM module (QOS, Rate Limiting ,Ingress QOS ...)\n"
 									"\tmc6:	Manage IPv6 Multicast module\n"
@@ -270,7 +270,7 @@ void cmmClientPrintHelp()
 									"\tvoicebuf: manage voicebuf control \n"
 									"\tfrag: manage ipv4/ipv6 fragmentation configurations\n");
 	cmm_print(DEBUG_STDOUT, "\nCommand usage: show <module_name> [option ...]\n"
-									"\trx: show RX module (ICC, Bridging  ...)\n"
+									"\trx: show RX module (ICC)\n"
 									"\tqm: show QM module (QOS, Rate Limiting....)\n"
 									"\tmc6:	show IPv6 Multicast module\n"
 									"\tmc4:	show  IPv4 Multicast module\n"
@@ -279,7 +279,6 @@ void cmmClientPrintHelp()
 									"\tsocket: show Socket module\n"
 									"\tsocket6: show V6 socket module\n");
 	cmm_print(DEBUG_STDOUT, "\nCommand usage: query < module_name> \n"
-                              						"\trx: Receive (bridge)\n"
                               						"\tvlan: VLAN devices\n"
                               						"\tpppoe: PPPoE Sessions\n"
                               						"\tsa: SA Entries\n"
@@ -575,13 +574,7 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 	  	if(cpt < 2)
 	    		goto help;
 		
-		if (strcasecmp(keywords[1], "rx") == 0)
-		{
-			/*Call Rx process function*/
-			if (cmmRxQueryProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
-		else if (strcasecmp(keywords[1], "qm") == 0)
+		if (strcasecmp(keywords[1], "qm") == 0)
 		{
 			/*Call QM process function*/
 			if(cmmQmQueryProcess(keywords, 2, daemon_handle))
@@ -1106,14 +1099,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case CMMD_CMD_SOCKET_SHOW:
 		return socket_daemon(ctx->fci_handle, ctx->fci_key_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
 
-	//Bridge commands
-	case FPP_CMD_RX_L2BRIDGE_ENABLE:
-	case FPP_CMD_RX_L2BRIDGE_ADD:
-	case FPP_CMD_RX_L2BRIDGE_REMOVE:
-	case FPP_CMD_RX_L2BRIDGE_QUERY_STATUS:
-	case FPP_CMD_RX_L2BRIDGE_QUERY_ENTRY:
-		return cmmL2BridgeProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len); 
-
 #ifdef LS1043
         case FPP_CMD_QM_QUERY_FF_RATE:
         case FPP_CMD_QM_FF_RATE:
@@ -1195,8 +1180,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
         case FPP_CMD_STAT_CONNECTION:
         case FPP_CMD_STAT_PPPOE_STATUS:
         case FPP_CMD_STAT_PPPOE_ENTRY:
-        case FPP_CMD_STAT_BRIDGE_STATUS:
-        case FPP_CMD_STAT_BRIDGE_ENTRY:
         case FPP_CMD_STAT_IPSEC_STATUS:
         case FPP_CMD_STAT_IPSEC_ENTRY:
         case FPP_CMD_STAT_VLAN_STATUS:

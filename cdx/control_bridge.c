@@ -561,39 +561,6 @@ static int M_bridge_handle_reset(void)
 }
 
 /*
- * CMD_RX_L2BRIDGE_{ENABLE,ADD,REMOVE,QUERY_STATUS}: the old cmdproc
- * just `break`'d for these, so the reply is status-only with CMD_OK
- * (= NO_ERR = 0). Preserve exactly. No length check in the old code
- * either -> CDX_CMD_VAR(0, U16_MAX).
- */
-static U16 bridge_noop_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	(void)pcmd;
-	(void)cmd_len;
-	(void)out_reply_len;
-	return NO_ERR;
-}
-
-/*
- * CMD_RX_L2BRIDGE_QUERY_ENTRY: old cmdproc always wrote
- * L2BridgeQueryEntryResponse{eof=1} into pcmd and returned
- * acklen = sizeof(L2BridgeQueryEntryResponse), ackstatus = CMD_OK.
- * The dispatcher stamps pcmd[0] = NO_ERR after this handler, which
- * overwrites the eof byte's low U16 slot — but the old code did
- * the exact same thing via *p = ackstatus after writing prsp->eof,
- * so the net wire layout is identical.
- */
-static U16 bridge_query_entry_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
-{
-	PL2BridgeQueryEntryResponse prsp = (PL2BridgeQueryEntryResponse)pcmd;
-
-	(void)cmd_len;
-	prsp->eof = 1;
-	*out_reply_len = sizeof(L2BridgeQueryEntryResponse);
-	return NO_ERR;
-}
-
-/*
  * CMD_RX_L2BRIDGE_FLOW_ENTRY: action snapshot at entry; query-
  * success reply uses the VLAN/IPv4-style sizeof(U16) + sizeof(
  * L2BridgeL2FlowEntryCommand) layout (NOT the PPPoE/tunnel
@@ -650,26 +617,13 @@ static U16 bridge_flow_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 }
 
 static const struct cdx_cmd_spec bridge_cmd_table[] = {
-	/* The four noop entries route to bridge_noop_handle which
-	 * `(void)pcmd; (void)cmd_len;` and just returns NO_ERR — no
-	 * read-of-uninit risk, kept permissive.
-	 *
-	 * QUERY_ENTRY writes prsp->eof = 1 and sets reply length to
-	 * sizeof(L2BridgeQueryEntryResponse); the buffer must hold
-	 * that, so min == sizeof(...).
-	 *
-	 * FLOW_TIMEOUT, MODE, BRIDGED_ITF_UPDATE pass pcmd through to
+	/* FLOW_TIMEOUT, MODE, BRIDGED_ITF_UPDATE pass pcmd through to
 	 * inner M_bridge_handle_control / M_bridged_itf_update wrappers
 	 * that don't length-check either. Kept permissive (CDX_CMD_VAR
 	 * 0..U16_MAX) to preserve pre-migration behaviour; tightening
 	 * those would require auditing each inner's expected struct
 	 * shape across cmd_codes. */
-	CDX_CMD_VAR(CMD_RX_L2BRIDGE_ENABLE,       0, U16_MAX, NULL, bridge_noop_handle),
-	CDX_CMD_VAR(CMD_RX_L2BRIDGE_ADD,          0, U16_MAX, NULL, bridge_noop_handle),
-	CDX_CMD_VAR(CMD_RX_L2BRIDGE_REMOVE,       0, U16_MAX, NULL, bridge_noop_handle),
-	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_STATUS, 0, U16_MAX, NULL, bridge_noop_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_RESET,   0, U16_MAX, NULL, bridge_flow_reset_handle),
-	CDX_CMD_VAR(CMD_RX_L2BRIDGE_QUERY_ENTRY,  sizeof(L2BridgeQueryEntryResponse), U16_MAX, NULL, bridge_query_entry_handle),
 	CDX_CMD    (CMD_RX_L2BRIDGE_FLOW_ENTRY,   L2BridgeL2FlowEntryCommand, bridge_flow_entry_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_FLOW_TIMEOUT, 0, U16_MAX, NULL, bridge_flow_timeout_handle),
 	CDX_CMD_VAR(CMD_RX_L2BRIDGE_MODE,         0, U16_MAX, NULL, bridge_mode_handle),

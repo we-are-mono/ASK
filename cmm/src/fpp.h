@@ -1038,11 +1038,6 @@ typedef struct fpp_qm_dscp_queue_mod {
 #define FPP_CMD_RX_CNG_DISABLE                          0x0004
 #define FPP_CMD_RX_CNG_SHOW                             0x0005
 
-#define FPP_CMD_RX_L2BRIDGE_ENABLE                      0x0008
-#define FPP_CMD_RX_L2BRIDGE_ADD                         0x0009
-#define FPP_CMD_RX_L2BRIDGE_REMOVE                      0x000a
-#define FPP_CMD_RX_L2BRIDGE_QUERY_STATUS                0x000b
-#define FPP_CMD_RX_L2BRIDGE_QUERY_ENTRY                 0x000c
 #define FPP_CMD_RX_L2FLOW_ENTRY                         0x000d
 #define FPP_CMD_RX_L2BRIDGE_MODE                        0x000e
 #define FPP_CMD_RX_L2BRIDGE_FLOW_TIMEOUT                0x000f
@@ -1052,8 +1047,6 @@ typedef struct fpp_qm_dscp_queue_mod {
 #define FPP_CMD_BRIDGED_ITF_UPDATE                  	0x0011
 #endif
 
-#define FPP_BRIDGE_QMOD_NONE                            0
-#define FPP_BRIDGE_QMOD_DSCP                            1
 
 #define FPP_L2_BRIDGE_MODE_MANUAL                       0
 #define FPP_L2_BRIDGE_MODE_AUTO                         1
@@ -1079,76 +1072,6 @@ typedef struct fpp_rx_icc_show_return_cmd {
     u_int16_t   on_thr;
     u_int16_t   off_thr;
 } __attribute__((__packed__)) fpp_rx_icc_show_return_cmd_t;
-
-/* L2 Bridging Enable command */
-typedef struct fpp_l2_bridge_enable_cmd {
-    u_int16_t   interface;
-    u_int16_t   enable_flag;
-    char        input_name[IFNAMSIZ];
-} __attribute__((__packed__)) fpp_l2_bridge_enable_cmd_t;
-
-/* L2 Bridging Add Entry command */
-typedef struct fpp_l2_bridge_add_entry_cmd {
-    u_int16_t   input_interface;
-    u_int16_t   input_svlan;
-    u_int16_t   input_cvlan;
-    u_int8_t    destaddr[6];
-    u_int8_t    srcaddr[6];
-    u_int16_t   ethertype;
-    u_int16_t   output_interface;
-    u_int16_t   output_svlan;
-    u_int16_t   output_cvlan;
-    u_int16_t   pkt_priority;
-    u_int16_t   svlan_priority;
-    u_int16_t   cvlan_priority;
-    char        input_name[IFNAMSIZ];
-    char        output_name[IFNAMSIZ];
-    u_int16_t   queue_modifier;
-    u_int16_t   session_id;
-} __attribute__((__packed__)) fpp_l2_bridge_add_entry_cmd_t;
-
-/* L2 Bridging Remove Entry command */
-typedef struct fpp_l2_bridge_remove_entry_cmd {
-    u_int16_t   input_interface;
-    u_int16_t   input_svlan;
-    u_int16_t   input_cvlan;
-    u_int8_t    destaddr[6];
-    u_int8_t    srcaddr[6];
-    u_int16_t   ethertype;
-    u_int16_t   session_id;
-    u_int16_t   reserved;
-    char        input_name[IFNAMSIZ];
-} __attribute__((__packed__)) fpp_l2_bridge_remove_entry_cmd_t;
-
-/* L2 Bridging Query Status response */
-typedef struct fpp_l2_bridge_query_status_response {
-    u_int16_t   ackstatus;
-    u_int16_t   status;
-    u_int8_t    ifname[IFNAMSIZ];
-    u_int32_t   eof;
-} __attribute__((__packed__)) fpp_l2_bridge_query_status_response_t;
-
-/* L2 Bridging Query Entry response */
-typedef struct fpp_l2_bridge_query_entry_response {
-    u_int16_t   ackstatus;
-    u_int16_t   eof;
-    u_int16_t   input_interface;
-    u_int16_t   input_svlan;
-    u_int16_t   input_cvlan;
-    u_int8_t    destaddr[6];
-    u_int8_t    srcaddr[6];
-    u_int16_t   ethertype;
-    u_int16_t   output_interface;
-    u_int16_t   output_svlan;
-    u_int16_t   output_cvlan;
-    u_int16_t   pkt_priority;
-    u_int16_t   svlan_priority;
-    u_int16_t   cvlan_priority;
-    char        input_name[IFNAMSIZ];
-    char        output_name[IFNAMSIZ];
-    u_int16_t   queue_modifier;
-    u_int16_t   session_id;
-} __attribute__((__packed__)) fpp_l2_bridge_query_entry_response_t;
 
 /* L2 Bridging  Flow entry command */
 typedef struct fpp_l2_bridge_flow_entry_cmd {
@@ -1200,8 +1123,6 @@ typedef struct fpp_bridged_itf_cmd
 #define FPP_CMD_STAT_CONNECTION                         0x0E04
 #define FPP_CMD_STAT_PPPOE_STATUS                       0x0E05
 #define FPP_CMD_STAT_PPPOE_ENTRY                        0x0E06
-#define FPP_CMD_STAT_BRIDGE_STATUS                      0x0E07
-#define FPP_CMD_STAT_BRIDGE_ENTRY                       0x0E08
 #define FPP_CMD_STAT_IPSEC_STATUS                       0x0E09
 #define FPP_CMD_STAT_IPSEC_ENTRY                        0x0E0A
 #define FPP_CMD_STAT_VLAN_STATUS                        0x0E0B
@@ -1221,7 +1142,6 @@ typedef struct fpp_bridged_itf_cmd
 #define FPP_STAT_QUEUE_BITMASK                          0x00000001
 #define FPP_STAT_INTERFACE_BITMASK                      0x00000002
 #define FPP_STAT_PPPOE_BITMASK                          0x00000008
-#define FPP_STAT_BRIDGE_BITMASK                         0x00000010
 #define FPP_STAT_IPSEC_BITMASK                          0x00000020
 #define FPP_STAT_VLAN_BITMASK                           0x00000040
 #define FPP_STAT_TUNNEL_BITMASK                         0x00000080
@@ -1233,7 +1153,6 @@ typedef struct fpp_bridged_itf_cmd
 #define FPP_STAT_INTERFACE_PKT_CMD                      3
 #define FPP_STAT_CONNECTION_CMD                         4
 #define FPP_STAT_PPPOE_CMD                              5
-#define FPP_STAT_BRIDGE_CMD                             6
 #define FPP_STAT_IPSEC_CMD                              7
 #define FPP_STAT_VLAN_CMD                               8
 #define FPP_STAT_TUNNEL_CMD                             9
@@ -1266,11 +1185,6 @@ typedef struct fpp_stat_pppoe_status_cmd {
     u_int16_t   action; /* Reset, Query, Query & Reset */
     u_int16_t   pad;
 } __attribute__((__packed__)) fpp_stat_pppoe_status_cmd_t;
-
-typedef struct fpp_stat_bridge_status_cmd {
-    u_int16_t   action; /* Reset, Query, Query & Reset */
-    u_int16_t   pad;
-} __attribute__((__packed__)) fpp_stat_bridge_status_cmd_t;
 
 typedef struct fpp_stat_ipsec_status_cmd {
     u_int16_t    action; /* Reset, Query, Query & Reset */
@@ -1342,24 +1256,6 @@ typedef struct fpp_stat_pppoe_entry_response {
     u_int32_t   total_packets_received;  
     u_int32_t   total_packets_transmitted; 
 } __attribute__((__packed__)) fpp_stat_pppoe_entry_response_t;
-
-typedef struct fpp_stat_bridge_entry_response {
-    u_int16_t   ackstatus;
-    u_int16_t   eof;
-    u_int16_t   input_interface;
-    u_int16_t   input_svlan; 
-    u_int16_t   input_cvlan; 
-    u_int8_t    dst_mac[6];
-    u_int8_t    src_mac[6];
-    u_int16_t   ether_type;
-    u_int16_t   output_interface;
-    u_int16_t   output_svlan; 
-    u_int16_t   output_cvlan; 
-    u_int16_t   session_id;
-    u_int32_t   total_packets_transmitted; 
-    char        input_name[IFNAMSIZ];
-    char        output_name[IFNAMSIZ];
-} __attribute__((__packed__)) fpp_stat_bridge_entry_response_t;
 
 typedef struct fpp_stat_ipsec_entry_response {
     u_int16_t   ackstatus;
