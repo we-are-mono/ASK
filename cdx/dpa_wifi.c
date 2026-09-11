@@ -41,10 +41,6 @@
 #include "cdx.h"
 #include "procfs.h"
 
-#ifdef DPA_WIFI_DEBUG
-static char disp_data[1024];
-#endif
-
 //uncomment to allow debug prints
 //#define DPA_WIFI_DEBUG  1
 
@@ -124,7 +120,6 @@ extern struct dpa_bp *dpa_bpid2pool(int bpid);
 extern struct dpa_priv_s* get_eth_priv(unsigned char* name);
 
 static int dpaa_vwd_open(struct inode *inode, struct file *file);
-static int dpaa_vwd_close(struct inode * inode, struct file * file);
 static long dpaa_vwd_ioctl(struct file * file, unsigned int cmd, unsigned long arg);
 
 // nf_hookfn modified in netfilter.h //const struct nf_hook_ops *ops,
@@ -190,7 +185,6 @@ static const struct file_operations vwd_fops = {
 	.owner                  = THIS_MODULE,
 	.open                   = dpaa_vwd_open,
 	.unlocked_ioctl         = dpaa_vwd_ioctl,
-	.release                = dpaa_vwd_close
 };
 
 /* IPV4 route hook , recieve the packet and forward to VWD driver*/
@@ -2451,16 +2445,6 @@ static int dpaa_vwd_open(struct inode *inode, struct file *file)
 out:
 	return result;
 }
-
-/** vwd_close
- *
- */
-static int dpaa_vwd_close(struct inode * inode, struct file * file)
-{
-	DPAWIFI_INFO("%s TODO \n", __func__);
-	return 0;
-}
-
 
 #define SIOCVAPUPDATE  ( 0x6401 )
 

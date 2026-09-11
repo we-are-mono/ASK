@@ -60,13 +60,6 @@ struct vap_desc_s {
 	unsigned short 				vapid;
 	unsigned short  			direct_rx_path;          /* Direct path support from offload device=>VWD */
 	unsigned short				no_l2_itf;
-#ifdef DPAA_VWD_TX_STATS
-	unsigned int 				stop_queue_total[VWD_TXQ_CNT];
-	unsigned int 				stop_queue_hif[VWD_TXQ_CNT];
-	unsigned int 				stop_queue_hif_client[VWD_TXQ_CNT];
-	unsigned int 				clean_fail[VWD_TXQ_CNT];
-	unsigned int 				was_stopped[VWD_TXQ_CNT];
-#endif
 	uint32_t						channel;
 	struct dpa_fq				*wlan_fq_to_fman;
 	struct dpa_fq				*wlan_fq_from_fman[CDX_VWD_FWD_FQ_MAX];
@@ -130,8 +123,6 @@ struct dpaa_vwd_priv_s {
 	spinlock_t 				vaplock;
 	spinlock_t 				txlock;
 	int 					fast_path_enable;
-	int 					fast_bridging_enable;
-	int 					fast_routing_enable;
 	struct vwd_global_stats_s  __percpu         	*vwd_global_stats;
 };
 

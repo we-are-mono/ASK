@@ -59,7 +59,6 @@ struct classque_info {
 	uint32_t qdepth;		/* CQ depths */
 	uint32_t shaper_rate;	/* shaper rate in Kbps */
 	uint32_t cq_shaper_enable;	/* cq shaper */
-	uint32_t shaper_bsize;	/* bucket size */
 	uint8_t  pp_num;		/* policer profile number */
 	void     *pp_handle;	/* policer profile handle */
 	void     *pcd_handle;       /* handle to fm_pcd device for this fman */

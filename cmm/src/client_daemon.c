@@ -127,11 +127,6 @@ char * getErrorString(unsigned short error)
 	/*-------------------------------- Stat ----------------------------------*/
 	caseretstr(FPP_ERR_STAT_FEATURE_NOT_ENABLED );
 
-	/*-------------------------------- Exceptions ----------------------------*/
-	caseretstr(FPP_ERR_EXPT_QUEUE_OUT_OF_RANGE);
-	caseretstr(FPP_ERR_EXPT_NUM_DSCP_OUT_OF_RANGE);
-	caseretstr(FPP_ERR_EXPT_DSCP_OUT_OF_RANGE);
-
 	/*-------------------------------- Sockets -------------------------------*/
 	caseretstr(FPP_ERR_SOCK_ALREADY_OPEN);
 	caseretstr(FPP_ERR_SOCKID_ALREADY_USED);
@@ -155,25 +150,8 @@ char * getErrorString(unsigned short error)
 #endif //LS1043
 
 	/* ------------------------------- RTP -----------------------------------*/
-	caseretstr(FPP_ERR_RTP_STATS_MAX_ENTRIES);
-	caseretstr(FPP_ERR_RTP_STATS_STREAMID_ALREADY_USED);
 	caseretstr(FPP_ERR_RTP_STATS_STREAMID_UNKNOWN);
-	caseretstr(FPP_ERR_RTP_STATS_DUPLICATED);
-	caseretstr(FPP_ERR_RTP_STATS_WRONG_DTMF_PT);
-	caseretstr(FPP_ERR_RTP_STATS_WRONG_TYPE);
 	caseretstr(FPP_ERR_RTP_STATS_NOT_AVAILABLE );
-
-
-	/*-------------------------------- Altconf -------------------------------*/
-	caseretstr(FPP_ERR_ALTCONF_OPTION_NOT_SUPPORTED);
-	caseretstr(FPP_ERR_ALTCONF_MODE_NOT_SUPPORTED);
-	caseretstr(FPP_ERR_ALTCONF_WRONG_NUM_PARAMS);
-
-	/*-------------------------------- PKTCAP --------------------------------*/
-	caseretstr(FPP_ERR_PKTCAP_ALREADY_ENABLED);
-	caseretstr(FPP_ERR_PKTCAP_NOT_ENABLED);
-	caseretstr(FPP_ERR_PKTCAP_FLF_RESET);
-
 
 	caseretstr(FPP_ERR_FLOW_ENTRY_NOT_FOUND);
 	caseretstr(FPP_ERR_INVALID_IP_FAMILY);
@@ -240,19 +218,16 @@ void cmmClientPrintHelp()
 									"\tmc4:	Manage IPv4 Multicast module\n"
                                     					"\tstat: Manage Statistics module\n"
 									"\troute: Manage Extended Route module\n"
-									"\tconfig: Manage Alternate Configurations\n"
 									"\tsocket: Manage Socket module\n"
 									"\tsocket6: Manage V6 socket module\n"
 									"\trtp: Manage RTP Relay module\n"
 									"\tsa_query_timer: Manage IPsec SA query timer module\n"
 									"\tasym_fastforward: Manage Asymmetric Fastforward Enable/disable\n"
-									"\trtpstats: Manage RTP Stats for Fast Forwarded connections\n"
+									"\trtpstats: Set RTP relay DTMF payload types\n"
 									"\tbridge: Manage bridge (timeout)\n"
 									"\ttimeout: set timeout for udp/tc flows\n"
-									"\texpt_queue: manage queue configurations\n"
 									"\tff: manage fast forwarding control\n"
-									"\tipsec: manage ipsec configurations\n"
-									"\tfrag: manage ipv4/ipv6 fragmentation configurations\n");
+									"\tipsec: manage ipsec configurations\n");
 	cmm_print(DEBUG_STDOUT, "\nCommand usage: show <module_name> [option ...]\n"
 									"\tqm: show QM module (QOS, Rate Limiting....)\n"
 									"\tmc6:	show IPv6 Multicast module\n"
@@ -284,7 +259,6 @@ void cmmClientPrintHelp()
                               						"\tv6connections: IPV6 Connections\n"
 									"\tsocket: IPV4 sockets\n"
 									"\trtcp: RTP relay statistics\n"
-									"\trtpstats: RTP statistics for Fast Forwarded connections\n"
 				  					"\tl2flows: L2 and L3-4 flows Entries\n"
 									"\tmacvlan: Mac-vlan interfaces\n"
 									"\ttunnels: tunnel interfaces\n");
@@ -469,11 +443,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 			if (cmmRTPStatsSetProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
-		else if (strcasecmp(keywords[1], "frag") == 0)
-		{
-			if (cmmFragTimeoutSet(keywords, 2, daemon_handle))
-				return -1;
-		}
 		else if (strcasecmp(keywords[1], "bridge") == 0)
 		{
 			if (cmmBridgeControlProcess(keywords, 2, daemon_handle))
@@ -644,11 +613,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
                 {
                         if(cmmRTCPQueryProcess(keywords, 2, daemon_handle))
                         		return -1;
-                }
-                else if (strcasecmp(keywords[1], "rtpstats") == 0)
-                {
-                        if(cmmRTPStatsQueryProcess(keywords, 2, daemon_handle))
-		  				return -1;
                 }
                 else if (strcasecmp(keywords[1], "tunnels") == 0)
                 {
@@ -1059,7 +1023,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
         case FPP_CMD_QM_FF_RATE:
 	case FPP_CMD_QM_WBFQ_CFG:
 	case FPP_CMD_QM_CQ_CFG:
-	case FPP_CMD_QM_CQ_STATS:
 	case FPP_CMD_QM_CHNL_ASSIGN:
 	case FPP_CMD_QM_DSCP_FQ_MAP_STATUS:
 	case FPP_CMD_QM_DSCP_FQ_MAP_CFG:
@@ -1084,29 +1047,18 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_QUERY_IFACE_DSCP_VLANPCP_MAP:
 #endif
 	case FPP_CMD_QM_QOSENABLE:
-	case FPP_CMD_QM_QOSALG:
-	case FPP_CMD_QM_NHIGH:
-	case FPP_CMD_QM_MAX_TXDEPTH:
-	case FPP_CMD_QM_MAX_QDEPTH:
-	case FPP_CMD_QM_MAX_WEIGHT:
-	case FPP_CMD_QM_RATE_LIMIT:
 	case FPP_CMD_QM_EXPT_RATE:
 	case FPP_CMD_QM_QUERY:
 	case FPP_CMD_QM_QUERY_EXPT_RATE:
 	case FPP_CMD_QM_SHAPER_CFG:
-	case FPP_CMD_QM_DSCP_MAP:
-	case FPP_CMD_QM_QUEUE_QOSENABLE:
 	case FPP_CMD_QM_QUERY_QUEUE:
 	// Accept some RX commands
 	case FPP_CMD_RX_L2FLOW_ENTRY:
 	case FPP_CMD_RX_L2BRIDGE_FLOW_TIMEOUT:	
 	// Accept timeout set command
 	case FPP_CMD_IPV4_SET_TIMEOUT:
-	case FPP_CMD_IPV4_FRAGTIMEOUT:
-	case FPP_CMD_IPV4_SAMFRAGTIMEOUT:
 	case FPP_CMD_IPV4_GET_TIMEOUT:
 	case FPP_CMD_IPV6_GET_TIMEOUT:
-	case FPP_CMD_IPV6_FRAGTIMEOUT:
         // accept for ACTION_QUERY
         case FPP_CMD_IP_ROUTE:
         case FPP_CMD_PPPOE_ENTRY:
@@ -1119,7 +1071,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 
 	// accept stat commands
         case FPP_CMD_STAT_ENABLE:
-	case FPP_CMD_STAT_QUEUE:
         case FPP_CMD_STAT_INTERFACE_PKT:
         case FPP_CMD_STAT_CONNECTION:
         case FPP_CMD_STAT_PPPOE_STATUS:
@@ -1133,13 +1084,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 #if defined(FLOW_STATS)
 	case FPP_CMD_STAT_FLOW:
 #endif
-	// accept alternate Configuration commands
-	case FPP_CMD_ALTCONF_SET:
-	case FPP_CMD_ALTCONF_RESET:
-	// Expt
-	case FPP_CMD_EXPT_QUEUE_RESET:
-	case FPP_CMD_EXPT_QUEUE_DSCP:
-	case FPP_CMD_EXPT_QUEUE_CONTROL:
 	// Socket and RTP statistics
 	case FPP_CMD_RTP_CLOSE:
 	case FPP_CMD_RTP_CONTROL:
@@ -1149,14 +1093,7 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_RTP_TAKEOVER:
 	case FPP_CMD_RTP_UPDATE:
 	case FPP_CMD_RTCP_QUERY:
-	case FPP_CMD_RTP_STATS_ENABLE:
-	case FPP_CMD_RTP_STATS_DISABLE:
-	case FPP_CMD_RTP_STATS_QUERY:
 	case FPP_CMD_RTP_STATS_DTMF_PT:
-	case FPP_CMD_PKTCAP_IFSTATUS:
-	case FPP_CMD_PKTCAP_SLICE:
-	case FPP_CMD_PKTCAP_FLF:
-	case FPP_CMD_PKTCAP_QUERY:
 	case FPP_CMD_MACVLAN_ENTRY:
 	case FPP_CMD_TUNNEL_QUERY:
 	case FPP_CMD_TUNNEL_QUERY_CONT:

@@ -79,7 +79,6 @@ typedef struct netkey_sa_update_cmd{
 #define SADB_EALG_MAX                   253 /* last EALG */
 
 
-extern pthread_mutex_t flowMutex;
 
 int cmmKeyCatch(unsigned short fcode, unsigned short len, unsigned short *payload);
 int cmmKeyEnginetoIPSec(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short len, void *payload);

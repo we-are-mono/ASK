@@ -172,7 +172,6 @@ void display_route_entry(PRouteEntry entry);
 int add_incoming_iface_info(PCtEntry entry);
 
 
-extern U32 class_route_table_hash_mask;
 
 #define CRCPOLY_BE 0x04c11db7
 static inline U32 cdx_crc32_be(U8 *data)

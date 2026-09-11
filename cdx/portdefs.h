@@ -66,7 +66,6 @@ struct eth_iface_info {
 	uint32_t port_idx;		//port index within fman
 	uint32_t portid;		//identification provided in xml pcd file
 	uint32_t hardwarePortId;	//hardware port id
-	uint32_t tx_index;		//transmit que to use next
 	t_Handle *vsp_h;			//VSP info for given eth interface
 	struct port_fq_info fqinfo[MAX_FQ_TYPES];	//fq info for defa types
 	struct port_fq_info eth_tx_fqinfo[DPAA_ETH_TX_QUEUES];	//ethdrv TX FQs 

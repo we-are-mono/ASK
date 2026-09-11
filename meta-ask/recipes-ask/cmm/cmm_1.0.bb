@@ -9,7 +9,7 @@ inherit externalsrc
 EXTERNALSRC = "${ASK_SRCROOT}/cmm"
 EXTERNALSRC_BUILD = "${ASK_SRCROOT}/cmm"
 
-DEPENDS = "libfci libcli libnetfilter-conntrack libnfnetlink libmnl libpcap libxcrypt auto-bridge \
+DEPENDS = "libfci libcli libnetfilter-conntrack libnfnetlink libmnl libxcrypt auto-bridge \
            gcc-sanitizers"
 
 # Runtime sanitizer libs for cmm_rtnl_fuzzer (ASAN+UBSAN-instrumented).
@@ -37,7 +37,7 @@ EXTRA_OEMAKE = " \
     LIBFCI_DIR=${STAGING_DIR_TARGET}${prefix} \
     ABM_DIR=${STAGING_DIR_TARGET}${prefix} \
     SYSROOT=${STAGING_DIR_TARGET}${prefix} \
-    LDLIBS='-lpthread -lfci -lcli -lpcap -lnetfilter_conntrack -lnfnetlink -lmnl -lcrypt' \
+    LDLIBS='-lpthread -lfci -lcli -lnetfilter_conntrack -lnfnetlink -lmnl -lcrypt' \
 "
 
 inherit pkgconfig
@@ -64,9 +64,9 @@ fakeroot do_install() {
 
 FILES:${PN} = "${bindir}/cmm ${bindir}/cmm_rtnl_fuzzer"
 
-# Yocto's file-rdeps scanner auto-detects the shared-lib packages (libpcap1,
-# libmnl0, libcli, libnetfilter-conntrack3, libnfnetlink0) — don't duplicate
-# here or we race against parse order.
+# Yocto's file-rdeps scanner auto-detects the shared-lib packages (libmnl0,
+# libcli, libnetfilter-conntrack3, libnfnetlink0). Don't duplicate them here
+# or we race against parse order.
 
 
 INHIBIT_PACKAGE_DEBUG_SPLIT = "1"

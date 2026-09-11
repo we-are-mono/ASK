@@ -261,6 +261,20 @@ assignments and out-of-range queries leave port configuration unchanged.
 These checks do not reload the module. Unload/reload under traffic still
 requires a dedicated board run with the updated kernel and CDX module.
 
+The RTP regressions open a relay call and check special-payload boundaries,
+including 160, 161 and 65535 bytes, then verify that control and RTCP queries
+still work. CMM IPC tests cover unsupported-command replies; Wi-Fi tests
+exercise VAP reset and repeated VWD character-device open/close.
+
+The ESP traffic tests use the WAN host as a kernel XFRM peer. They drive
+CMM's normal SA installation and verify payload delivery plus SEC packet
+and byte counters for both encryption and decryption. The WAN host needs
+`iproute2` and kernel support for AES-CBC/HMAC-SHA256 XFRM tunnels.
+`ASK_WAN_IPERF_IP` must name an address on that host's DUT-facing interface.
+The fixture creates temporary inner addresses, routes, SAs, policies and a
+scoped NAT exception, and removes them on exit. These tests also need the
+DUT console logged in as root; the test image uses an empty password.
+
 `make ask-test` runs pytest under `sudo` (it needs the serial PTYs and the
 USB-serial node) against the source tree, so test edits are picked up
 without a redeploy. An autouse fixture fail-fasts the whole run if the DUT

@@ -8,7 +8,7 @@
 #
 # Required fields per entry:
 #   name    - exact CMD_* identifier as it appears in cdx headers
-#   reason  - short justification (e.g. "noop handler", "RTP gated", ...)
+#   reason  - short justification (e.g. "body ignored", "inner handler validates length")
 #
 # When A1c migrates a command, drop its entry here. The validator-coverage
 # test fails if the source has a permissive command not listed below — at
@@ -30,38 +30,33 @@ allowlist:
   - name: CMD_IPV6_RESET
     reason: "wholesale conntrack flush; no body interpretation"
 
-  # Subsystems gated under CDX_TODO_* in the .c registrations are
-  # already filtered out of PERMISSIVE_CMDS by _cmd_catalog. The entries
-  # below are PERMISSIVE because their CMD_* defines exist in headers
-  # but the registrations live in feature-flagged blocks; if a future
-  # build flips that flag on, we want explicit acknowledgement.
   - name: CMD_IPSEC_RESET_SEC_FAILURE_STATS
-    reason: "IPSec stats reset; gated by CDX_TODO_IPSEC in production"
+    reason: "SEC stats reset validates its selector in the inner handler"
   - name: CMD_IPSEC_SA_FLUSH
-    reason: "IPSec SA flush; gated by CDX_TODO_IPSEC in production"
+    reason: "Flushes all SAs; handler ignores the body"
   - name: CMD_IPSEC_SEC_FAILURE_STATS
-    reason: "IPSec stats query; gated by CDX_TODO_IPSEC in production"
+    reason: "SEC stats query validates its selector and preserves the existing byte-count reply"
   - name: CMD_QM_INGRESS_POLICER_RESET
     reason: "QM policer reset; no body interpretation"
   - name: CMD_QM_SEC_POLICER_RESET
     reason: "QM SEC policer reset; no body interpretation"
   - name: CMD_RTCP_QUERY
-    reason: "RTP/RTCP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "RTCP query checks the minimum command length; covered by test_rtp_control.py"
   - name: CMD_RTP_OPEN
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Inner handler validates command length; covered by test_rtp_control.py"
   - name: CMD_RTP_CLOSE
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Inner handler validates command length; covered by test_rtp_control.py"
   - name: CMD_RTP_CONTROL
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Inner handler validates command length; covered by test_rtp_control.py"
   - name: CMD_RTP_UPDATE
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Inner handler validates command length; covered by test_rtp_control.py"
   - name: CMD_RTP_TAKEOVER
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Inner handler validates command length; covered by test_rtp_control.py"
   - name: CMD_RTP_SPECTX_PLD
-    reason: "Handler checks command and payload lengths; covered by host_tests/test_rtp_payload.py"
+    reason: "Command and payload bounds covered by test_rtp_control.py and host_tests/test_rtp_payload.py"
   - name: CMD_RTP_SPECTX_CTRL
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Inner handler validates command length; covered by test_rtp_control.py"
   - name: CMD_RTP_STATS_DTMF_PT
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Inner handler validates command length; covered by test_rtp_control.py"
   - name: CMD_WIFI_VAP_RESET
-    reason: "WIFI VAP reset; gated by CDX_TODO_WIFI in production"
+    reason: "Handler ignores the body and resets VAP state; covered by test_wifi_control.py"

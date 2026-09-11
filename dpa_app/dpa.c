@@ -58,20 +58,6 @@ struct model_dist_params
 	uint32_t type;		//internal table type
 };
 
-//cctable infor associated with a fman instance
-struct ccnode_tbl_info {
-        char name[64];          //table name
-        uint32_t port_map;      //port sharing info
-        uint32_t key_size;      //size of key
-        uint32_t dpa_type;      //table type
-        uint32_t max_keys;      //max keys allowed for table
-	struct {
-		uint32_t num_sets; //max bucktets for int/ext table
-		uint32_t max_ways; //max collisions for int table
-	};
-        void *handle;           //driver handle
-};
-
 
 extern void * FM_PCD_Open(t_FmPcdParams *p_FmPcdParams);     
 void *FM_PCD_Get_Sch_handle(t_Handle pDev);

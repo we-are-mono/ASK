@@ -129,10 +129,6 @@ enum return_code {
 
 	ERR_STAT_FEATURE_NOT_ENABLED = 1100,
 
-	ERR_EXPT_QUEUE_OUT_OF_RANGE = 1101,
-	ERR_EXPT_NUM_DSCP_OUT_OF_RANGE = 1102,
-	ERR_EXPT_DSCP_OUT_OF_RANGE = 1103,
-
 	ERR_STAT_FEATURE_NOT_ALLOWED_TO_DISABLE = 1110,
 
 	ERR_SOCK_ALREADY_OPEN	= 1200,
@@ -153,31 +149,11 @@ enum return_code {
 	ERR_WRONG_SOCK_MODE = 1216,
 	ERR_NO_ROUTE_TO_SOCK = 1217,
 	ERR_SOCK_UPDATE_ERR = 1218,
-
-	ERR_RTP_STATS_MAX_ENTRIES = 1230,
-	ERR_RTP_STATS_STREAMID_ALREADY_USED = 1231,
 	ERR_RTP_STATS_STREAMID_UNKNOWN = 1232,
-	ERR_RTP_STATS_DUPLICATED = 1233,
-	ERR_RTP_STATS_WRONG_DTMF_PT = 1234,
-	ERR_RTP_STATS_WRONG_TYPE = 1235,
 	ERR_RTP_STATS_NOT_AVAILABLE = 1236,
 	ERR_RTP_STATS_RESET = 1237,
 
-	ERR_ALTCONF_OPTION_NOT_SUPPORTED = 1300,
-	ERR_ALTCONF_MODE_NOT_SUPPORTED = 1301,	
-	ERR_ALTCONF_WRONG_NUM_PARAMS = 1302,
-
 	ERR_WLAN_DUPLICATE_OPERATION = 2001,
-
-	ERR_PKTCAP_ALREADY_ENABLED = 1400,
-	ERR_PKTCAP_NOT_ENABLED	= 1401,
-	ERR_PKTCAP_FLF_RESET	= 1402,
-
-	ERR_ICC_TOO_MANY_ENTRIES = 1500,
-	ERR_ICC_ENTRY_ALREADY_EXISTS = 1501,
-	ERR_ICC_ENTRY_NOT_FOUND = 1502,
-	ERR_ICC_THRESHOLD_OUT_OF_RANGE = 1503,
-	ERR_ICC_INVALID_MASKLEN = 1504,
 
 	ERR_FLOW_ENTRY_NOT_FOUND = 1600,
 	ERR_INVALID_IP_FAMILY = 1601,
@@ -250,33 +226,6 @@ enum return_code {
 #define ETHERTYPE_PPPOE_END		htons(ETHERTYPE_PPPOE)
 #define ETHERTYPE_PPPOED_END		htons(ETHERTYPE_PPPOED)
 #define ETHERTYPE_PAE_END               htons(ETHERTYPE_PAE)
-
-typedef struct _tETHVLANHDR
-{
-	U8	DstMAC[6];				// Ethernet EMAC Destionation address
-	U8	SrcMAC[6];				// Ethernet EMAC Source address
-	U16	TPID;					// Tag Protocol Identifier or Ethernet Packet Type if packet not tagged
-	U16	TCI;					// Tag Control Identifier
-	U16	PacketType;				// Ethernet Packet Type / Length
-	U16	RC;						// E-RIF Route Control
-} ETHVLANHdr, *PETHVLANHdr;
-
-typedef struct tEthernetFrame {
-	union {
-		struct {
-			U8		DstMAC[ETHER_ADDR_LEN];
-			U8		SrcMAC[ETHER_ADDR_LEN];
-		};
-		U32	dst_src_x[3];
-	};
-	U16		PacketType;
-	U8		Payload[0];
-} EthernetFrame, *PEthernetFrame;
-
-typedef struct tEthernetHdr {
-	U8	Header[ETH_MAX_HEADER_SIZE];
-	U8	Length;
-}EthernetHdr, *PEthernetHdr;
 
 /******************************
 * IPv4 API Command and Entry strutures
@@ -529,49 +478,6 @@ typedef struct _tSock6UpdateCommand {
 	U16 		SA_handle_tx[4];
 	U16 		pad2;
 }__attribute__((__packed__)) Sock6UpdateCommand, *PSock6UpdateCommand;
-
-/******************************
-* TCP definitions
-*
-******************************/
-typedef struct TCP_HDR_STRUCT
-{
-	unsigned short 	SourcePort;
-	unsigned short 	DestinationPort;
-	unsigned int	SequenceNumber;
-	unsigned int	AckNumber;
-	unsigned short	TcpFlags;
-#ifdef ENDIAN_LITTLE
-#define TCPFLAGS_FIN	htons(0x0001)
-#define TCPFLAGS_SYN	htons(0x0002)
-#define TCPFLAGS_RST	htons(0x0004)
-#define TCPFLAGS_PSH	htons(0x0008)
-#else
-#define TCPFLAGS_FIN	0x0001
-#define TCPFLAGS_SYN	0x0002
-#define TCPFLAGS_RST	0x0004
-#define TCPFLAGS_PSH	0x0008
-#define TCPFLAGS_URG	0x0020
-#define TCPFLAGS_ECE	0x0040
-#define TCPFLAGS_CWR	0x0080
-#define TCPFLAGS_DOFF(flags)	((flags & 0xF000) >> 12)
-#endif
-	unsigned short 	Window;
-	unsigned short	Checksum;
-	unsigned short 	UrgentPtr;
-} tcp_hdr_t;
-
-/******************************
-* UDP definitions
-*
-******************************/
-typedef struct UDP_HDR_STRUCT
-{
-	unsigned short SourcePort;
-	unsigned short DestinationPort;
-	unsigned short Length;
-	unsigned short Chksum;
-} udp_hdr_t;
 
 /******************************
 * Macros

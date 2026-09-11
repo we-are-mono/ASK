@@ -175,15 +175,6 @@ enum EVENTS {
 #define CMD_TNL_4o6_ID_CONVERSION_dupsport 0x0B07
 #define CMD_TNL_4o6_ID_CONVERSION_psid  0x0B08
 
-// 0x0c00 -> 0x0cFF : QM module
-#define 	FC_EXPT					0x000c
-#define  CMD_EXPT_QUEUE_DSCP		0x0c01
-#define  CMD_EXPT_QUEUE_CTRL		0x0c02
-#define  CMD_EXPT_QUEUE_RESET		0x0c03
-
-// 0x0d00-> 0x0dFF : Packet capture module
-
-
 /* 0x0e00 -> 0x0eff : Stat module */
 #define FC_STAT                          	0x000E
 #define CMD_STAT_ENABLE                 	0x0E01 
@@ -203,9 +194,6 @@ enum EVENTS {
 #define         FC_TRC                          	0x000f
 /* Command return codes */
 
-// 0x1000: Alternate Configuration
-#define FC_ALTCONF				0x0010
-
 //0x2000: WiFi Rx module
 #define FC_WIFI_RX			0x0020 
 #define CMD_WIFI_VAP_ENTRY              0x2001
@@ -216,8 +204,6 @@ enum EVENTS {
 #define   	FC_MACVLAN		        0x0014
 #define 	CMD_MACVLAN_ENTRY		0x1401	
 #define 	CMD_MACVLAN_ENTRY_RESET 	0x1402
-// 0x1200: Fppdiag configuration
-#define FC_FPPDIAG					0x0012
 
 // return codes
 #define CMD_OK	0x0000

@@ -21,11 +21,6 @@ struct _cdx_ctrl {
 };
 
 struct _cdx_info {
-	unsigned long ddr_phys_baseaddr;
-	void *ddr_baseaddr;
-	unsigned int ddr_size;
-	void *cbus_baseaddr;
-	void *apb_baseaddr;
 	struct device dev;
 	struct _cdx_ctrl ctrl;
 };

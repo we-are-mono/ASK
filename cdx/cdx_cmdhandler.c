@@ -74,11 +74,7 @@ int FCODE_TO_EVENT(U32 fcode)
 
 		case FC_STAT: eventid = EVENT_STAT; break;
 
-		case FC_ALTCONF: eventid = EVENT_IPV4; break;
-
 		case FC_WIFI_RX: eventid = EVENT_PKT_WIFIRX; break;
-
-		case FC_FPPDIAG: eventid = EVENT_IPV4; break;
 
 		default: eventid = -1; break;
 	}

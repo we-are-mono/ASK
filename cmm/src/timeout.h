@@ -15,7 +15,6 @@
 int timeoutSet(daemon_handle_t daemon_handle, char *argv[], int argc);
 int cmmtimeoutSet(daemon_handle_t daemon_handle, char *argv[], int argc, int tab);
 int cmmFeGetTimeout(FCI_CLIENT *fci_handle, struct ctTable *ctEntry, unsigned int *timeout);
-int cmmFragTimeoutSet(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 unsigned long long cmm_convert_to_numeric(char *str );
 
 #define MAX_TIMEOUT_STR_LEN 10

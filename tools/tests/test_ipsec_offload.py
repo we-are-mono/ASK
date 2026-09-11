@@ -21,9 +21,8 @@
       assumption query_sa() relies on. If a future change starts
       validating other fields, this trips before any other test.
 
-Real-peer + iperf3 E2E coverage is deferred. Tests that need to drive
-SET_STATE deeper than the current synthetic-SA reach (the H3/H5
-regressions) require real iface/route setup and are deferred too.
+Live tunnel traffic is covered by test_ipsec_esp_traffic.py; allocation
+unwinds and NAT-T SPI bounds have dedicated hardware regressions.
 """
 
 from __future__ import annotations

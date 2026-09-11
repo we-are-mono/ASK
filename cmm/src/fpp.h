@@ -13,8 +13,9 @@
 #ifndef __FPP__
 #define __FPP__
 
-#include <pcap-bpf.h>
-#include <pcap.h>
+#include <stdint.h>
+#include <sys/types.h>
+
 #ifndef IFNAMSIZ
 #define IFNAMSIZ	16
 #endif
@@ -113,10 +114,6 @@
 /*-------------------------------- Stat --------------------------------------*/
 #define FPP_ERR_STAT_FEATURE_NOT_ENABLED                1100
 
-/*-------------------------------- Exceptions --------------------------------*/
-#define FPP_ERR_EXPT_QUEUE_OUT_OF_RANGE                 1101
-#define FPP_ERR_EXPT_NUM_DSCP_OUT_OF_RANGE              1102
-#define FPP_ERR_EXPT_DSCP_OUT_OF_RANGE                  1103
 
 /*-------------------------------- Sockets -----------------------------------*/
 #define FPP_ERR_SOCK_ALREADY_OPEN                       1200
@@ -142,24 +139,11 @@
 #endif //LS1043
 
 /* ------------------------------- RTP ---------------------------------------*/
-#define FPP_ERR_RTP_STATS_MAX_ENTRIES                   1230
-#define FPP_ERR_RTP_STATS_STREAMID_ALREADY_USED         1231 
 #define FPP_ERR_RTP_STATS_STREAMID_UNKNOWN              1232
-#define FPP_ERR_RTP_STATS_DUPLICATED                    1233
-#define FPP_ERR_RTP_STATS_WRONG_DTMF_PT                 1234
-#define FPP_ERR_RTP_STATS_WRONG_TYPE                    1235
 #define FPP_ERR_RTP_STATS_NOT_AVAILABLE                 1236
 
 
-/*-------------------------------- Altconf -----------------------------------*/
-#define FPP_ERR_ALTCONF_OPTION_NOT_SUPPORTED            1300
-#define FPP_ERR_ALTCONF_MODE_NOT_SUPPORTED              1301
-#define FPP_ERR_ALTCONF_WRONG_NUM_PARAMS                1302
 
-/*-------------------------------- PKTCAP ------------------------------------*/
-#define FPP_ERR_PKTCAP_ALREADY_ENABLED                  1400
-#define FPP_ERR_PKTCAP_NOT_ENABLED                      1401
-#define FPP_ERR_PKTCAP_FLF_RESET                        1402
 
 
 #define FPP_ERR_FLOW_ENTRY_NOT_FOUND                    1600
@@ -318,19 +302,6 @@ typedef union
 	};
 } qosmark_t;
 #endif
-
-typedef union
-{
-	u_int64_t x;
-	struct {
-		u_int32_t x_us;
-		u_int32_t x_ds;
-	};
-	struct {
-		qosmark_t qosmark_us;
-		qosmark_t qosmark_ds;
-	};
-} qosconnmark_t;
 
 /*Structure representing the command sent to add or remove a Conntrack*/
 typedef struct fpp_ct_cmd {
@@ -568,69 +539,17 @@ typedef struct fpp_rtcp_query_res {
 
 
 
-/*-------------------------------- RTP QoS Measurement -----------------------*/
-#define FPP_CMD_RTP_STATS_ENABLE                        0x0810
-#define FPP_CMD_RTP_STATS_DISABLE                       0x0811
-#define FPP_CMD_RTP_STATS_QUERY                         0x0812
+/*-------------------------------- RTP DTMF Payload Types -----------------------*/
 #define FPP_CMD_RTP_STATS_DTMF_PT                       0x0813
 
-#define FPP_RTPSTATS_TYPE_IP4                           0
-#define FPP_RTPSTATS_TYPE_IP6                           1      
-#define FPP_RTPSTATS_TYPE_MC4                           2
-#define FPP_RTPSTATS_TYPE_MC6                           3
-#define FPP_RTPSTATS_TYPE_RLY                           4
-#define FPP_RTPSTATS_TYPE_RLY6                          5
-
-typedef struct fpp_rtp_stat_enable_cmd {
-    u_int16_t   stream_id;
-    u_int16_t   stream_type;
-    u_int32_t   saddr[4];
-    u_int32_t   daddr[4];
-    u_int16_t   sport;
-    u_int16_t   dport;
-    u_int16_t   proto;
-    u_int16_t   mode;
-} __attribute__((__packed__)) fpp_rtp_stat_enable_cmd_t;
-
-typedef struct fpp_rtp_stat_disable_cmd {
-    u_int16_t   stream_id;
-} __attribute__((__packed__)) fpp_rtp_stat_disable_cmd_t;
 
 typedef struct  fpp_rtp_stat_dtmf_pt_cmd {
     u_int16_t   pt; /* 2 payload types coded on 8bits */
 } __attribute__((__packed__)) fpp_rtp_stat_dtmf_pt_cmd_t;
 
-/*-------------------------------- Exceptions --------------------------------*/
-#define FPP_CMD_EXPT_QUEUE_DSCP                         0x0C01
-#define FPP_CMD_EXPT_QUEUE_CONTROL                      0x0C02
-#define FPP_CMD_EXPT_QUEUE_RESET                        0x0C03
-
-#define FPP_EXPT_Q3                                     3
-#define FPP_EXPT_MAX_QUEUE                              FPP_EXPT_Q3
-
-#define FPP_EXPT_MAX_DSCP                               63
-
-typedef struct fpp_expt_queue_dscp_cmd {
-    u_int16_t   queue;
-    u_int16_t   num_dscp;
-    u_int8_t    dscp[FPP_EXPT_MAX_DSCP + 1];
-    u_int8_t    pad;
-} __attribute__((__packed__)) fpp_expt_queue_dscp_cmd_t;
-
-typedef struct fpp_expt_queue_control_cmd {
-    u_int16_t   queue;
-    u_int16_t   pad;
-} __attribute__((__packed__)) fpp_expt_queue_control_cmd_t;
-
 /*-------------------------------- QM ----------------------------------------*/
 // 0x0200 -> 0x02FF : QM module
 #define FPP_CMD_QM_QOSENABLE                            0x0201
-#define FPP_CMD_QM_QOSALG                               0x0202
-#define FPP_CMD_QM_NHIGH                                0x0203
-#define FPP_CMD_QM_MAX_TXDEPTH                          0x0204
-#define FPP_CMD_QM_MAX_QDEPTH                           0x0205
-#define FPP_CMD_QM_MAX_WEIGHT                           0x0206
-#define FPP_CMD_QM_RATE_LIMIT                           0x0207
 #ifdef LS1043
 #define FPP_CMD_QM_FF_RATE                              0x0208
 #define FPP_CMD_QM_QUERY_FF_RATE                        0x0209
@@ -639,13 +558,9 @@ typedef struct fpp_expt_queue_control_cmd {
 #define FPP_CMD_QM_EXPT_RATE                            0x020c
 #define FPP_CMD_QM_QUERY                                0x020d
 #define FPP_CMD_QM_QUERY_EXPT_RATE                      0x020e
-#define FPP_CMD_QM_CQ_STATS				0x020f
                 
 #define FPP_CMD_QM_RESET                                0x0210 
 #define FPP_CMD_QM_SHAPER_CFG                           0x0211 
-#define FPP_CMD_QM_SCHED_CFG                            0x0212 
-#define FPP_CMD_QM_DSCP_MAP                             0x0213 
-#define FPP_CMD_QM_QUEUE_QOSENABLE                      0x0214
 #ifdef LS1043
 #define FPP_CMD_QM_WBFQ_CFG				0x0215
 #define FPP_CMD_QM_CQ_CFG				0x0216
@@ -655,10 +570,7 @@ typedef struct fpp_expt_queue_control_cmd {
 #define FPP_CMD_QM_DSCP_FQ_MAP_RESET			0x021a
 #endif
 
-#define FPP_CMD_QM_QUERY_PORTINFO                       0x0220
 #define FPP_CMD_QM_QUERY_QUEUE                          0x0221    
-#define FPP_CMD_QM_QUERY_SHAPER                         0x0222
-#define FPP_CMD_QM_QUERY_SCHED                          0x0223
 
 
 #define FPP_CMD_QM_INGRESS_POLICER_ENABLE               0x0224
@@ -679,56 +591,13 @@ typedef struct fpp_expt_queue_control_cmd {
 #define FPP_NUM_DSCP                                    64
 
 #define FPP_NUM_QUEUES                                  16
-#define FPP_PORT_SHAPER_NUM                             0xffff
 #define FPP_NUM_INGRESS_POLICER_QUEUES                  8
 
 #define FPP_NUM_SHAPERS                                 8
-#define FPP_NUM_SCHEDULERS                              8
 
 #define FPP_EXPT_TYPE_ETH                               0x0
-#define FPP_EXPT_TYPE_WIFI                              0x1
-#define FPP_EXPT_TYPE_ARP                               0x2
-#define FPP_EXPT_TYPE_PCAP                              0x3
 
-typedef struct fpp_qm_queue_qos_enable_cmd {
-    u_int16_t   interface;
-    u_int16_t   enable_flag;
-    u_int32_t   queue_qosenable_mask; // Bit mask of queues on which Qos is enabled
-} __attribute__((__packed__)) fpp_qm_queue_qos_enable_cmd_t;
-
-typedef struct fpp_qm_qos_alg_cmd {
-    u_int16_t   interface;
-    u_int16_t   scheduler;
-} __attribute__((__packed__)) fpp_qm_qos_alg_cmd_t;
             
-typedef struct fpp_qm_nhigh_cmd {
-    u_int16_t   interface;
-    u_int16_t   number_high_queues;
-} __attribute__((__packed__)) fpp_qm_nhigh_cmd_t;
-
-typedef struct fpp_qm_max_txdepth_cmd_t {
-    u_int16_t   interface;
-    u_int16_t   max_bytes;
-} __attribute__((__packed__)) fpp_qm_max_txdepth_cmd_t;
-
-typedef struct fpp_qm_max_qdepth_cmd {
-    u_int16_t   interface;
-    u_int16_t    qtxdepth[FPP_NUM_QUEUES];
-} __attribute__((__packed__)) fpp_qm_max_qdepth_cmd_t;
-
-typedef struct fpp_qm_max_weight_cmd {
-    u_int16_t   interface;
-    u_int16_t   qxweight[FPP_NUM_QUEUES];
-} __attribute__((__packed__)) fpp_qm_max_weight_cmd_t;
-
-typedef struct fpp_qm_rate_limit_cmd {
-    u_int16_t   interface;
-    u_int16_t   enable;
-    u_int32_t   queues;
-    u_int32_t   rate;
-    u_int32_t   bucket_size;
-} __attribute__((__packed__)) fpp_qm_rate_limit_cmd_t;
-
 enum ratelim_counter {
 	RED_TOTAL,
 	YELLOW_TOTAL,
@@ -967,21 +836,6 @@ typedef struct fpp_qm_dscp_chnl_clsq_map {
 } __attribute__((__packed__)) fpp_qm_dscp_chnl_clsq_map_t;
 #endif
 
-typedef struct fpp_qm_scheduler_cfg {
-    u_int16_t   interface;
-    u_int16_t   scheduler;
-    u_int8_t    algo;
-    u_int8_t    algo_change_flag;
-    u_int16_t   pad;
-    u_int32_t   queues;
-} __attribute__((__packed__)) fpp_qm_scheduler_cfg_t;
-
-typedef struct fpp_qm_dscp_queue_mod {
-    u_int16_t   queue;
-    u_int16_t   num_dscp;
-    u_int8_t    dscp[FPP_NUM_DSCP];
-} __attribute__((__packed__)) fpp_qm_dscp_queue_mod_t;
-
 /*-------------------------------- RX module ---------------------------------*/
 /*Function codes*/
 /* 0x00xx : Rx module */
@@ -1044,7 +898,6 @@ typedef struct fpp_bridged_itf_cmd
 /*Function codes*/
 /* 0x00xx : Stat module */
 #define FPP_CMD_STAT_ENABLE                             0x0E01 
-#define FPP_CMD_STAT_QUEUE                              0x0E02  
 #define FPP_CMD_STAT_INTERFACE_PKT                      0x0E03
 #define FPP_CMD_STAT_CONNECTION                         0x0E04
 #define FPP_CMD_STAT_PPPOE_STATUS                       0x0E05
@@ -1089,13 +942,6 @@ typedef struct fpp_stat_enable_cmd {
     u_int16_t   pad;
     u_int32_t   bitmask; /* Specifies the feature to be enabled or disabled */
 } __attribute__((__packed__)) fpp_stat_enable_cmd_t;
-
-typedef struct fpp_stat_queue_cmd {
-    u_int16_t   action; /* Reset, Query, Query & Reset */
-    u_int16_t   interface;
-    u_int16_t   queue;
-    u_int16_t   pad;
-} __attribute__((__packed__)) fpp_stat_queue_cmd_t;
 
 typedef struct fpp_stat_interface_cmd {
     u_int16_t   action; /* Reset, Query, Query & Reset */
@@ -1149,14 +995,6 @@ typedef struct fpp_stat_flow_status_cmd {
         };
     };
 } __attribute__((__packed__)) fpp_stat_flow_status_cmd_t;
-
-typedef struct fpp_stat_queue_response {
-    u_int16_t   ackstatus; 
-    u_int16_t   rsvd1;
-    u_int32_t   peak_queue_occ; 
-    u_int32_t   emitted_pkts; 
-    u_int32_t   dropped_pkts; 
-} __attribute__((__packed__)) fpp_stat_queue_response_t;
 
 typedef struct fpp_stat_interface_pkt_response {
     u_int16_t   ackstatus;
@@ -1242,37 +1080,6 @@ typedef struct fpp_stat_flow_entry_response {
     u_int64_t   TotalPackets;
     u_int64_t   TotalBytes;
 } __attribute__((__packed__)) fpp_stat_flow_entry_response_t;
-
-/*-------------------------------- Altconf -----------------------------------*/
-#define FPP_CMD_ALTCONF_SET                             0x1001
-#define FPP_CMD_ALTCONF_RESET                           0x1002
-
-/* option IDs */
-#define FPP_ALTCONF_OPTION_MCTTL                        0x0001 /* Multicast TTL option */
-#define FPP_ALTCONF_OPTION_IPSECRL                      0x0002 /* IPSEC Rate Limiting option */
-#define FPP_ALTCONF_OPTION_ALL                          0xFFFF
-
-#define FPP_ALTCONF_MODE_DEFAULT                        0 /* Same default value used for all options */
-#define FPP_ALTCONF_OPTION_MAX_PARAMS                   3 /* IPSEC Rate Limiting has 3 parameters. */
-                                                          /* To be updated if a new option is add with more 32bits params */
-/* ALL options */
-#define FPP_ALTCONF_ALL_NUM_PARAMS                      1
-
-/* Multicast TTL Configuration definitions */
-#define FPP_ALTCONF_MCTTL_MODE_DEFAULT                  FPP_ALTCONF_MODE_DEFAULT
-#define FPP_ALTCONF_MCTTL_MODE_IGNORE                   1
-#define FPP_ALTCONF_MCTTL_NUM_PARAMS                    1 /* Maximum number of u32 allowed for this option */
-
-/* IPSEC Rate Limiting Configuration definitions */
-#define FPP_ALTCONF_IPSECRL_OFF                         0
-#define FPP_ALTCONF_IPSECRL_ON                          1
-#define FPP_ALTCONF_IPSECRL_NUM_PARAMS                  3 /* Maximum number of u32 allowed for this option */
-
-typedef struct fpp_alt_set_cmd {
-    u_int16_t   option_id;
-    u_int16_t   num_params;
-    u_int32_t   params[FPP_ALTCONF_OPTION_MAX_PARAMS];
-} __attribute__((__packed__)) fpp_alt_set_cmd_t;
 
 /*-------------------------------- Fast Forwarding ---------------------------*/
 #define FPP_CMD_IPV4_FF_CONTROL                         0x0321
@@ -1532,10 +1339,7 @@ typedef struct fpp_tunnel_query_cmd {
 /*-------------------------------- Timeout -----------------------------------*/
 #define FPP_CMD_IPV4_SET_TIMEOUT                        0x0319
 #define FPP_CMD_IPV4_GET_TIMEOUT                        0x0320
-#define FPP_CMD_IPV4_FRAGTIMEOUT                        0x0333
-#define FPP_CMD_IPV4_SAMFRAGTIMEOUT                     0x0334
 #define FPP_CMD_IPV6_GET_TIMEOUT                        0x0420
-#define FPP_CMD_IPV6_FRAGTIMEOUT                        0x0433
 
 /* Timeout Update command */
 typedef struct fpp_timeout_cmd {
@@ -1545,48 +1349,6 @@ typedef struct fpp_timeout_cmd {
     u_int32_t   timeout_value2;
 } __attribute__((__packed__)) fpp_timeout_cmd_t;
 
-typedef struct fpp_frag_timeout_cmd {
-    u_int16_t   timeout;
-    u_int16_t   mode;
-} __attribute__((__packed__)) fpp_frag_timeout_cmd_t;
-
-/*-------------------------------- PKTCAP ------------------------------------*/
-#define FPP_CMD_PKTCAP_IFSTATUS                         0x0d02
-#define FPP_CMD_PKTCAP_FLF                              0x0d03
-#define FPP_CMD_PKTCAP_SLICE                            0x0d04
-#define FPP_CMD_PKTCAP_QUERY                            0x0d05
-
-#define FPP_PKTCAP_STATUS                               0x1
-#define FPP_PKTCAP_SLICE                                0x2
-#define MAX_FLF_INSTRUCTIONS                            30
-
-typedef struct fpp_pktcap_status_cmd{
-    u_int16_t   action;
-    u_int8_t    ifindex;
-    u_int8_t    status;
-}__attribute__((__packed__)) fpp_pktcap_status_cmd_t;
-
-typedef struct fpp_pktcap_slice_cmd{
-    u_int16_t   action;
-    u_int8_t    ifindex;
-    u_int8_t    rsvd;
-    u_int16_t   slice;
-}__attribute__((__packed__)) fpp_pktcap_slice_cmd_t;
-
-typedef struct fpp_pktcap_query_cmd{
-    u_int16_t   slice;
-    u_int16_t   status;
-}__attribute__((__packed__)) fpp_pktcap_query_cmd_t;
-
-typedef struct fpp_pktcap_flf_cmd { /* First level filter */
-    u_int16_t flen; /* filter length */
-    unsigned char   ifindex;
-    unsigned char   mfg; /*  The most significant bit tells fpp if more fragments are expected.
-                            The least significant 3 bits give the sequence no of the fragment.  */
-    struct bpf_insn filter[MAX_FLF_INSTRUCTIONS];
-}__attribute__((__packed__)) fpp_pktcap_flf_cmd_t;
-
-/*-------------------------------- PKTCAP ------------------------------------*/
 /*-------------------------------- TX BEGIN ---------------------------*/
 /* 0x0500 - 0x05FF */
 /* TX commands - begin */

@@ -29,7 +29,6 @@ struct _thw_RTPinfo * cdx_rtp_alloc_muram_rtpinfo(void);
 
 
 struct slist_head rtpflow_cache[NUM_RTPFLOW_ENTRIES] __attribute__((aligned(32)));
-extern TIMER_ENTRY rtpflow_timer;
 
 struct slist_head rtpcall_list[NUM_RTPFLOW_ENTRIES];
 

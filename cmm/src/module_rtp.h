@@ -17,9 +17,6 @@
 int cmmRTPSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 int cmmRTCPQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 
-/******************************** RTP Stats QoS Measurement **********************/
-
 int cmmRTPStatsSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmmRTPStatsQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 
 #endif
