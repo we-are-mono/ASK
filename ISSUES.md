@@ -84,9 +84,13 @@ each so the open bug list stays honest.
   cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx has no
   FC_MACVLAN/EVENT_MACVLAN handler, so a send returns ERR_UNKNOWN_COMMAND. The
   gateway creates no macvlan netdevs today (CONFIG_MACVLAN built but unused), so
-  it is inert; the cmm sender is deliberately kept. To enable: add the cdx
-  handler mirroring the A32 physical-port approach (FC_MACVLAN → EVENT_MACVLAN
-  dispatch + program the classifier).
+  it is inert; the cmm sender is deliberately kept.
+  **Decision (2026-09-11): defer.** Traffic terminating on a local macvlan
+  endpoint still needs kernel and application processing; a separate MAC
+  does not make it an offloadable forwarding path. No concrete forwarding
+  use case has been established. Revisit only after identifying one and
+  confirming that CDX can accelerate it while preserving required kernel
+  processing. Adding a command handler alone would not establish that.
 
 - [ ] **A39 — transport-mode ESP offload.** cdx can run transport-mode SAs
   (SA_MODE_TUNNEL is set only by FPP_CMD_IPSEC_SA_SET_TUNNEL), but the product
