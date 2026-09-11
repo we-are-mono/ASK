@@ -20,7 +20,6 @@ int dpa_check_for_logical_iface_types(struct _itf *input_itf,
 			struct _itf *underlying_input_itf,
 			struct dpa_l2hdr_info *l2_info,
 			struct dpa_l3hdr_info *l3_info);
-int dpa_get_tx_fqid_by_name(char *name, uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t hash);
 int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry , 
 				struct dpa_l2hdr_info *l2_info,
 				struct dpa_l3hdr_info *l3_info);

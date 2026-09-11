@@ -100,7 +100,6 @@ uint32_t ipsec_get_to_cp_fqid(void *handle);
 struct sec_descriptor *get_shared_desc(void *handle);
 
 struct qman_fq *get_to_sec_fq(void *handle);
-struct qman_fq *get_from_sec_fq(void *handle);
 
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size);
 int cdx_dpa_ipsec_init(void);
@@ -109,7 +108,6 @@ void cdx_dpa_ipsec_exit(void);
 int cdx_init_scatter_gather_bpool(void);
 int cdx_init_skb_2bfreed_bpool(void);
 
-void display_fq_info(void *handle);
 int cdx_init_fqid_procfs(void);
 void cdx_deinit_fqid_procfs(void);
 
@@ -122,4 +120,3 @@ int cdx_dpa_ipsec_retire_fq(void *handle, int fq_num);
 int cdx_ipsec_sa_fq_check_if_retired_state(void *dpa_ipsecsa_handle, int fq_num);
 
 #endif
-

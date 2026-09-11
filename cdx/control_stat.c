@@ -620,16 +620,7 @@ static U16 M_stat_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 }
 
 
-int statistics_init(void)
+void statistics_init(void)
 {
 	set_cmd_handler(EVENT_STAT, M_stat_cmdproc);
-
-	return 0;
 }
-
-void statistics_exit(void)
-{
-
-}
-
-

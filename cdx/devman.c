@@ -1548,32 +1548,6 @@ err_ret:
 	return retval;
 }
 
-int dpa_get_tx_fqid_by_name(char *name, uint32_t *fqid, uint8_t *is_dscp_fq_map, uint32_t hash)
-{
-	struct dpa_iface_info *iface_info;
-	spin_lock(&dpa_devlist_lock);
-	iface_info = dpa_interface_info;
-	while(1) {
-		if (!iface_info)
-			break;
-		if (strcmp(name, iface_info->name) == 0)
-		{
-			/* Get tx fqid*/
-			if (dpa_get_tx_fqid_devinfo_by_iface(iface_info, fqid, is_dscp_fq_map,
-						NULL, NULL, hash)) {
-				spin_unlock(&dpa_devlist_lock);
-				DPA_ERROR("%s::faied to get tx fqid iface(%s)\n",
-						__func__, iface_info->name);
-				return FAILURE;
-			}
-			spin_unlock(&dpa_devlist_lock);
-			return SUCCESS;
-		}
-		iface_info = iface_info->next;
-	}
-	spin_unlock(&dpa_devlist_lock);
-	return -1;
-}
 
 /* return interface information by name and type */
 struct dpa_iface_info *dpa_get_iface_by_name(char *name)
@@ -2955,4 +2929,3 @@ int devman_init_linux_stats(void)
 	atomic_set(&num_active_connections, 0);
 	return 0;
 }
-

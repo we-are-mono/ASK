@@ -586,7 +586,7 @@ static void __updatelink(struct interface_table *ctx, struct ifinfomsg *ifi, str
 			if (__itf_is_up(itf))
 				__tunnel_add(ctx->fci_handle, itf);
 			else if(dellink)
-				__tunnel_del(ctx->fci_handle, ctx->fci_key_handle, itf);
+				__tunnel_del(ctx->fci_handle, itf);
 			else
 				__tunnel_update(ctx->fci_handle, itf);
 	}
@@ -1190,32 +1190,6 @@ out:
 	return rc;
 }
 
-
-int itf_is_programmed(int ifindex)
-{
-	struct interface *itf;
-	int rc = -1;
-
-	__pthread_mutex_lock(&itf_table.lock);
-	__pthread_mutex_lock(&ctMutex);
-	__pthread_mutex_lock(&rtMutex);
-	__pthread_mutex_lock(&neighMutex);
-
-	itf = __itf_get(ifindex);
-	if (!itf)
-		goto out;
-
-	rc = ____itf_is_programmed(itf);
-
-out:
-	__pthread_mutex_unlock(&neighMutex);
-	__pthread_mutex_unlock(&rtMutex);
-	__pthread_mutex_unlock(&ctMutex);
-	__pthread_mutex_unlock(&itf_table.lock);
-
-	return rc;
-}
-
 int __itf_is_macvlan(struct interface *itf)
 {
 	if (itf->itf_flags & ITF_MACVLAN)
@@ -1239,43 +1213,6 @@ int ____itf_is_floating_sit_tunnel(struct interface *itf)
 		return 0;
 	else
 		return 1;
-}
-
-
-int __itf_is_floating_sit_tunnel(int ifindex)
-{
-	struct interface *itf;
-	int rc = -1;
-
-	itf = __itf_find(ifindex);
-	if (!itf)
-		goto out;
-
-	rc = ____itf_is_floating_sit_tunnel(itf);
-
-out:
-	return rc;
-}
-
-int itf_name_update(FCI_CLIENT *fci_handle, struct gemac_port *port)
-{
-	/* Send a message to FPP to set the interface name associated with  each GEM Port */
-	fpp_port_update_cmd_t cmd;
-	int ret;
-
-	cmd.port_id = port->port_id;
-	strncpy(cmd.ifname, port->ifname, sizeof(cmd.ifname));
-	cmd.ifname[sizeof(cmd.ifname) - 1] = '\0';
-
-	cmm_print(DEBUG_INFO, "%s: port mapping %d <=> %s\n", __func__, cmd.port_id, cmd.ifname);
-
-	if (FPP_ERR_OK != (ret = fci_write(fci_handle, FPP_CMD_PORT_UPDATE , sizeof(cmd), &cmd)))
-	{
-		cmm_print(DEBUG_CRIT, "%s: Port update failed in FPP %d \n", __func__, ret);
-		return -1;
-	}
-
-	return 0;
 }
 
 int itf_table_init(struct interface_table *ctx)
@@ -1320,13 +1257,6 @@ int itf_table_init(struct interface_table *ctx)
 	{
 		cmm_print(DEBUG_ERROR, "%s::%d: fci_open() %s\n", __func__, __LINE__, strerror(errno));
 		goto err3;
-	}
-
-	ctx->fci_key_handle = fci_open(FCILIB_KEY_TYPE, 0);
-	if (!ctx->fci_key_handle)
-	{
-		cmm_print(DEBUG_ERROR, "%s::%d: fci_open() %s\n", __func__, __LINE__, strerror(errno));
-		goto err4;
 	}
 
 #ifdef WIFI_ENABLE

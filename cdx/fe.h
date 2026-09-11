@@ -608,34 +608,4 @@ static __inline int TESTEQ_MACADDR(void *pmacaddr1, void *pmacaddr2)
 					((U16 *)pmacaddr1)[2] == ((U16 *)pmacaddr2)[2];
 }
 
-static __inline int TESTEQ_NULL_MACADDR(void *pmacaddr1)
-{
-	return ((U16 *)pmacaddr1)[0] == 0 && ((U16 *)pmacaddr1)[1] == 0 && ((U16 *)pmacaddr1)[2] == 0;
-}
-
-static __inline void COPY_MACADDR2(void *ptomacaddr, void *pfrommacaddr)
-{
-	U16 *pto;
-	U16 *pfrom;
-	pto = (U16 *)ptomacaddr;
-	pfrom = (U16 *)pfrommacaddr;
-	pto[0] = pfrom[0];
-	pto[1] = pfrom[1];
-	pto[2] = pfrom[2];
-	pto[3] = pfrom[3];
-	pto[4] = pfrom[4];
-	pto[5] = pfrom[5];
-}
-
-static __inline int TESTEQ_MACADDR2(void *pmacaddr1, void *pmacaddr2)
-{
-	U16 *p1;
-	U16 *p2;
-	p1 = (U16 *)pmacaddr1;
-	p2 = (U16 *)pmacaddr2;
-	return p1[0] == p2[0] && p1[1] == p2[1] && p1[2] == p2[2] &&
-					p1[3] == p2[3] && p1[4] == p2[4] && p1[5] == p2[5];
-}
-
-
 #endif /* _FE_H_ */

@@ -23,8 +23,7 @@
 int ipv6_cmp(void *src, void *dst);
 #define IPV6_CMP(addr1, addr2) ipv6_cmp(addr1, addr2)
 
-int ipv6_init(void);
-void ipv6_exit(void);
+void ipv6_init(void);
 
 int IPv6_delete_CTpair(PCtEntry pCtEntry);
 int IPv6_Get_Next_Hash_CTEntry(PCtExCommandIPv6 pV6CtCmd, int reset_action);

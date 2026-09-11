@@ -15,7 +15,6 @@
 #define __MODULE_RTP_H__
 
 int cmmRTPSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-int cmmRTPQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 int cmmRTCPQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 
 /******************************** RTP Stats QoS Measurement **********************/

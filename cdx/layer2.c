@@ -178,13 +178,6 @@ U16 itf_get_phys_port(struct _itf *itf)
 	return ((struct physical_port *)itf)->id;
 }
 
-struct _itf *itf_get_phys_itf(struct _itf *itf)
-{
-	while (itf->phys)
-		itf = itf->phys;
-
-	return itf;
-}
 
 /**
  * __L2_route_remove()
@@ -308,4 +301,3 @@ PRouteEntry L2_route_add(U32 id)
 
 	return pRtEntry;
 }
-

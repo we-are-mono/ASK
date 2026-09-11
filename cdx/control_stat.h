@@ -179,8 +179,7 @@ typedef struct _tStatFlowEntryResp {
 	U64	TotalBytes;
 } StatFlowEntryResp, *PStatFlowEntryResp;
 
-int statistics_init(void);
-void statistics_exit(void);
+void statistics_init(void);
 
 extern U8 gStatPPPoEQueryStatus;
 extern int gStatIpsecQueryStatus;

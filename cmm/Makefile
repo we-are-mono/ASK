@@ -24,8 +24,6 @@ CFLAGS  += -I$(ABM_DIR)/include
 # OpenWrt, Armbian — uses this exact profile; the recipes intentionally add no
 # defines of their own, so there is only one list to keep correct.
 # ENABLE_EGRESS_QOS is our deliberate addition to NXP's documented set.
-# The IPsec flow-cache model was removed, so the no-flow-cache behavior is
-# now unconditional and IPSEC_NO_FLOW_CACHE is no longer defined anywhere.
 CFLAGS  += -DAUTO_BRIDGE -DLS1043 -DWIFI_ENABLE -DFLOW_STATS \
            -DSEC_PROFILE_SUPPORT -DUSE_QOSCONNMARK -DENABLE_INGRESS_QOS \
            -DENABLE_EGRESS_QOS -DVLAN_FILTER

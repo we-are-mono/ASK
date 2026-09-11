@@ -178,7 +178,7 @@ static U16 M_wifi_rx_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 
 
 
-static void M_wifi_init_rx(void)
+void wifi_init(void)
 {
 	int i;
 	struct physical_port	*port;
@@ -194,14 +194,5 @@ static void M_wifi_init_rx(void)
 	}
 }
 
-int wifi_init(void)
-{
-	M_wifi_init_rx();
 
-	return 0;
-}
-
-void wifi_exit(void)
-{
-}
 #endif /* CFG_WIFI_OFFLOAD */

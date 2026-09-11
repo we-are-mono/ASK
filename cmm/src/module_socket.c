@@ -19,49 +19,8 @@
 #include "cmmd.h"
 
 struct list_head socket_table[HASH_SOCKET_SIZE];
-struct list_head socket_table_by_addr[HASH_SOCKET_SIZE];
 
 pthread_mutex_t socket_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* One bit per allocatable private socket ID [1, NUM_INTERNAL_SOCKET_ID],
- * rounded up to whole u32 words. Sizing by ROUTE_MAX_ID (0x10000) was copied
- * from route_cache.c and wasted ~8 KB for what is really a 255-ID space. */
-static u_int32_t internal_sock_ids[(NUM_INTERNAL_SOCKET_ID + 8 * sizeof(u_int32_t) - 1) / (8 * sizeof(u_int32_t))] = {0, };
-static u_int32_t internal_sock_id = 0;
-
-u_int32_t new_socket_id(void)
-{
-	int offset, mask;
-	int i = 0;
-
-	for ( ;i < NUM_INTERNAL_SOCKET_ID; i++, internal_sock_id++)
-	{
-		if (internal_sock_id >= NUM_INTERNAL_SOCKET_ID)
-			internal_sock_id = 0;
-
-		offset = internal_sock_id / (8 * sizeof(u_int32_t));
-		mask = 1 << (internal_sock_id & 0x1f);
-		if (!(internal_sock_ids[offset] & mask))
-			goto found;
-
-	}
-	/* we're running in circles, return zero, we've exhausted all of our reserved sockets */
-	return 0;
-
-found:
-	internal_sock_ids[offset] |= mask;
-
-	return internal_sock_id + SOCK_ID_PRIVATE_START;
-}
-
-void del_socket_id(u_int32_t sock_id_ext)
-{
-	int sock_id = sock_id_ext - SOCK_ID_PRIVATE_START;
-	int offset = sock_id / (8 * sizeof(u_int32_t));
-	int mask = 1 << (sock_id & 0x1f);
-
-	internal_sock_ids[offset] &= ~mask;
-}
 
 struct socket *socket_find(u_int16_t id)
 {
@@ -90,44 +49,6 @@ found:
 	return s;
 }
 
-struct socket *socket_find_by_addr(int family, const u_int32_t *saddr, const u_int32_t *daddr, u_int16_t sport, u_int16_t dport, u_int8_t proto)
-{
-	char saddr_buf[INET6_ADDRSTRLEN], daddr_buf[INET6_ADDRSTRLEN];
-	struct socket *s;
-	int key;
-	struct list_head *entry;
-	int ip_len = IPADDRLEN(family);
-
-	cmm_print(DEBUG_INFO, "%s(%d, %s, %s, %d, %d, %d)\n", __func__, family,
-		inet_ntop(family, saddr, saddr_buf, INET6_ADDRSTRLEN),
-		inet_ntop(family, daddr, daddr_buf, INET6_ADDRSTRLEN),
-		ntohs(sport), ntohs(dport), proto);
-
-	key= HASH_SOCK_ADDR(family, saddr, daddr, sport, dport, proto);
-
-	entry = list_first(&socket_table_by_addr[key]);
-
-	while (entry != &socket_table_by_addr[key])
-	{
-		s = container_of(entry, struct socket, list_by_addr);
-
-		if ((family == s->family) && (proto == s->proto) && (sport == s->sport) && (dport == s->dport) && 
-			!memcmp(saddr, s->saddr, ip_len) && !memcmp(daddr, s->daddr, ip_len))
-			goto found;
-
-		entry = list_next(entry);
-	}
-
-	return NULL;
-
-found:
-	cmm_print(DEBUG_INFO, "socket(%d, %s, %s, %d, %d, %d)\n", s->family,
-			inet_ntop(s->family, s->saddr, saddr_buf, INET6_ADDRSTRLEN),
-			inet_ntop(s->family, s->daddr, daddr_buf, INET6_ADDRSTRLEN),
-			ntohs(s->sport), ntohs(s->dport), s->proto);
-
-	return s;
-}
 
 void __socket_add(struct socket * s)
 {
@@ -136,11 +57,7 @@ void __socket_add(struct socket * s)
 	key = HASH_SOCKET(s->id);
 	list_add(&socket_table[key], &s->list);
 
-	key= HASH_SOCK_ADDR(s->family, s->saddr, s->daddr, s->sport, s->dport, s->proto);
-	list_add(&socket_table_by_addr[key], &s->list_by_addr);
 
-#if defined(COMCERTO_2000) || defined(LS1043)
-#endif
 
 }
 
@@ -180,10 +97,6 @@ err:
 void socket_remove(struct socket *s)
 {
 	list_del(&s->list);
-	list_del(&s->list_by_addr);
-
-	if((s->id >= SOCK_ID_PRIVATE_START) && (s->id <=  SOCK_ID_PRIVATE_END))
-		del_socket_id(s->id);
 
 	free(s);
 }
@@ -223,10 +136,8 @@ static int socket4_send_cmd(FCI_CLIENT *fci_handle, int action, struct socket *s
 		cmd.route_id = s->rt.fpp_route_id;
 #if defined(LS1043)
 		cmd.expt_flag = s->expt_flag;
-		cmd.iifindex = s->iifindex;
+		cmd.iifindex = 0;
 #endif //(LS1043)
-#if defined(COMCERTO_2000) || defined(LS1043)
-#endif
 
 		//Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV4_SOCK_OPEN\n");
@@ -263,8 +174,6 @@ static int socket4_send_cmd(FCI_CLIENT *fci_handle, int action, struct socket *s
 		cmd.route_id = s->rt.fpp_route_id;
 #if defined(LS1043)
 		cmd.expt_flag = s->expt_flag;
-#endif
-#if defined(COMCERTO_2000) || defined(LS1043)
 #endif
 
 		//Send message to forward engine
@@ -351,9 +260,7 @@ static int socket6_send_cmd(FCI_CLIENT *fci_handle, int action, struct socket *s
 		cmd.route_id = s->rt.fpp_route_id;
 #if defined(LS1043)
 		cmd.expt_flag = s->expt_flag;
-		cmd.iifindex = s->iifindex;
-#endif
-#if defined(COMCERTO_2000) || defined(LS1043)
+		cmd.iifindex = 0;
 #endif
 
 		//Send message to forward engine
@@ -392,8 +299,6 @@ static int socket6_send_cmd(FCI_CLIENT *fci_handle, int action, struct socket *s
 #if defined(LS1043)
 		cmd.expt_flag = s->expt_flag;
 #endif // LS1043
-#if defined(COMCERTO_2000) || defined(LS1043)
-#endif
 
 		//Send message to forward engine
 		cmm_print(DEBUG_COMMAND, "Send CMD_IPV6_SOCK_UPDATE\n");
@@ -510,7 +415,7 @@ int __socket_open(FCI_CLIENT *fci_handle, struct socket *s)
 					.sAddr = s->daddr,
 					.dAddr = s->saddr,
 					.fwmark = s->fwmark,
-					.iifindex = s->iifindex,
+					.iifindex = 0,
 					.flow_flags = FLOWFLAG_SOCKET_ROUTE,
 				};
 
@@ -535,9 +440,6 @@ int __socket_open(FCI_CLIENT *fci_handle, struct socket *s)
 program:
 	__cmmCheckFPPRouteIdUpdate(&s->rt, &s->flags);
 
-#if defined(COMCERTO_2000) || defined(LS1043)
-			/* TODO  will be taken when supporting IPSEC for local in packets*/
-#endif
 
 	rc = socket_send_cmd(fci_handle, ADD | UPDATE, s);
 
@@ -545,46 +447,6 @@ program:
 }
 
 
-#if defined(COMCERTO_2000) || defined(LS1043)
-/************************************************************
- *
- * __cmmSocketFindFromFlow
- *
- ************************************************************/
-struct socket *__cmmSocketFindFromFlow(int family, unsigned int *saddr, unsigned int *daddr, unsigned char proto, char *orig)
-{
-	struct socket *s;
-	struct list_head *entry;
-	int i;
-
-	for (i = 0; i < HASH_SOCKET_SIZE; i++)
-	{
-		for (entry = list_first(&socket_table[i]); entry != &socket_table[i]; entry = list_next(entry))
-		{
-			s = container_of(entry, struct socket, list);
-			if (s->family == family && s->proto == proto)
-			{
-				if (!memcmp(s->saddr, saddr, IPADDRLEN(family)) && !memcmp(s->daddr, daddr, IPADDRLEN(family)))
-				{
-					*orig = 1;
-					goto found;
-				}
-
-				if (!memcmp(s->saddr, daddr, IPADDRLEN(family)) && !memcmp(s->daddr, saddr, IPADDRLEN(family)))
-				{
-					*orig = 0;
-					goto found;
-				}
-			}
-		}
-	}
-
-	s = NULL;
-
-found:
-	return s;
-}
-#endif	//  defined(COMCERTO_2000) || defined(LS1043)
 
 /************************************************************
  *
@@ -662,7 +524,7 @@ void __cmmSocketUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route)
 }
 
 
-int __socket_close(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, struct socket *s)
+int __socket_close(FCI_CLIENT *fci_handle, struct socket *s)
 {
 	int rc = socket_send_cmd(fci_handle, REMOVE, s);
 	if (rc != CMMD_ERR_OK)
@@ -670,9 +532,6 @@ int __socket_close(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, struct so
 
 	__cmmRouteDeregister(fci_handle, &s->rt, "socket");
 
-#if defined(COMCERTO_2000) || defined(LS1043)
-		/* TODO  will be taken when supporting IPSEC for local in packets*/
-#endif
 
 	/* In case of error the socket may still be programmed in fpp,
 	   so don't remove it */
@@ -685,7 +544,7 @@ err:
 	return rc;
 }
 
-static int socket_open(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, cmmd_socket_open_cmd_t *cmd)
+static int socket_open(FCI_CLIENT *fci_handle, cmmd_socket_open_cmd_t *cmd)
 {
 	struct socket *s;
 	/* Signed on purpose: a non-negative value is a CMMD_ERR_* code the
@@ -717,7 +576,7 @@ static int socket_open(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, cmmd_
 
 	rc = __socket_open(fci_handle, s);
 	if(rc != CMMD_ERR_OK)
-		__socket_close(fci_handle, fci_key_handle, s);
+		__socket_close(fci_handle, s);
 
 exit:
 	__pthread_mutex_unlock(&socket_lock);
@@ -800,8 +659,6 @@ static int socket_update(FCI_CLIENT *fci_handle, cmmd_socket_update_cmd_t *cmd)
 		s->expt_flag = cmd->expt_flag;
 #endif // LS1043
 
-#if defined(COMCERTO_2000) || defined(LS1043)
-#endif
 
 	s->flags |= FPP_NEEDS_UPDATE;
 
@@ -859,7 +716,7 @@ exit:
 }
 
 
-static int socket_close(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, cmmd_socket_close_cmd_t *cmd)
+static int socket_close(FCI_CLIENT *fci_handle, cmmd_socket_close_cmd_t *cmd)
 {
 	struct socket *s;
 	int ret = 0;
@@ -879,7 +736,7 @@ static int socket_close(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, cmmd
 		goto out;
 	}
 
-	ret = __socket_close(fci_handle, fci_key_handle, s);
+	ret = __socket_close(fci_handle, s);
 	
 out:
 	__pthread_mutex_unlock(&socket_lock);
@@ -893,7 +750,7 @@ out:
 
 
 /* CMM server side socket control */
-int socket_daemon(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int fc, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len)
+int socket_daemon(FCI_CLIENT *fci_handle, int fc, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len)
 {
 	int rc = 0, skipcount;
  	
@@ -923,7 +780,7 @@ int socket_daemon(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int fc, u_
 			break;
 		}
 
-		rc = socket_open(fci_handle, fci_key_handle, cmd);
+		rc = socket_open(fci_handle, cmd);
 		if (rc >= 0)
 		{
 			res_buf[0] = rc;
@@ -977,7 +834,7 @@ int socket_daemon(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int fc, u_
 			break;
 		}
 
-		rc = socket_close(fci_handle, fci_key_handle, cmd);
+		rc = socket_close(fci_handle, cmd);
 		if (rc >= 0)
 		{
 			res_buf[0] = rc;

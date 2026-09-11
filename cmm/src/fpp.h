@@ -150,14 +150,6 @@
 #define FPP_ERR_RTP_STATS_WRONG_TYPE                    1235
 #define FPP_ERR_RTP_STATS_NOT_AVAILABLE                 1236
 
-/*-------------------------------- Voice Buffer ------------------------------*/
-#define FPP_ERR_VOICE_BUFFER_UNKNOWN                    1240
-#define FPP_ERR_VOICE_BUFFER_USED                       1241
-#define FPP_ERR_VOICE_BUFFER_PT                         1242
-#define FPP_ERR_VOICE_BUFFER_FRAME_SIZE                 1243
-#define FPP_ERR_VOICE_BUFFER_ENTRIES                    1244
-#define FPP_ERR_VOICE_BUFFER_SIZE                       1245
-#define FPP_ERR_VOICE_BUFFER_STARTED                    1246
 
 /*-------------------------------- Altconf -----------------------------------*/
 #define FPP_ERR_ALTCONF_OPTION_NOT_SUPPORTED            1300
@@ -169,12 +161,6 @@
 #define FPP_ERR_PKTCAP_NOT_ENABLED                      1401
 #define FPP_ERR_PKTCAP_FLF_RESET                        1402
 
-/*-------------------------------- ICC ---------------------------------------*/
-#define FPP_ERR_ICC_TOO_MANY_ENTRIES                    1500
-#define FPP_ERR_ICC_ENTRY_ALREADY_EXISTS                1501
-#define FPP_ERR_ICC_ENTRY_NOT_FOUND                     1502
-#define FPP_ERR_ICC_THRESHOLD_OUT_OF_RANGE              1503
-#define FPP_ERR_ICC_INVALID_MASKLEN                     1504
 
 #define FPP_ERR_FLOW_ENTRY_NOT_FOUND                    1600
 #define FPP_ERR_INVALID_IP_FAMILY                       1601
@@ -614,41 +600,6 @@ typedef struct  fpp_rtp_stat_dtmf_pt_cmd {
     u_int16_t   pt; /* 2 payload types coded on 8bits */
 } __attribute__((__packed__)) fpp_rtp_stat_dtmf_pt_cmd_t;
 
-/*-------------------------------- Voice Buffer ------------------------------*/
-#define FPP_CMD_VOICE_BUFFER_LOAD                       0x0820 
-#define FPP_CMD_VOICE_BUFFER_UNLOAD                     0x0821
-#define FPP_CMD_VOICE_BUFFER_START                      0x0822
-#define FPP_CMD_VOICE_BUFFER_STOP                       0x0823
-#define FPP_CMD_VOICE_BUFFER_RESET                      0x0824
-
-#define FPP_VOICE_BUFFER_SCATTER_MAX                    48
-
-typedef struct fpp_voice_buffer_load_cmd {
-    u_int16_t   buffer_id;
-    u_int16_t   payload_type;
-    u_int16_t   frame_size;
-    u_int16_t   entries;
-    u_int32_t   data_len;
-    u_int8_t    page_order[FPP_VOICE_BUFFER_SCATTER_MAX];
-    u_int32_t   addr[FPP_VOICE_BUFFER_SCATTER_MAX];
-} __attribute__((__packed__)) fpp_voice_buffer_load_cmd_t;
-
-typedef struct fpp_voice_buffer_unload_cmd {
-    u_int16_t   buffer_id;
-} __attribute__((__packed__)) fpp_voice_buffer_unload_cmd_t;
-
-typedef struct fpp_voice_buffer_start_cmd {
-    u_int16_t   socket_id;
-    u_int16_t   buffer_id;
-    u_int16_t   seq_number_base;
-    u_int16_t   padding;
-    u_int32_t   ssrc;
-    u_int32_t   timestamp_base;
-} __attribute__((__packed__)) fpp_voice_buffer_start_cmd_t;
-
-typedef struct fpp_voice_buffer_stop_cmd {
-    u_int16_t   socket_id;
-} __attribute__((__packed__)) fpp_voice_buffer_stop_cmd_t;
 /*-------------------------------- Exceptions --------------------------------*/
 #define FPP_CMD_EXPT_QUEUE_DSCP                         0x0C01
 #define FPP_CMD_EXPT_QUEUE_CONTROL                      0x0C02
@@ -1034,9 +985,6 @@ typedef struct fpp_qm_dscp_queue_mod {
 /*-------------------------------- RX module ---------------------------------*/
 /*Function codes*/
 /* 0x00xx : Rx module */
-#define FPP_CMD_RX_CNG_ENABLE                           0x0003
-#define FPP_CMD_RX_CNG_DISABLE                          0x0004
-#define FPP_CMD_RX_CNG_SHOW                             0x0005
 
 #define FPP_CMD_RX_L2FLOW_ENTRY                         0x000d
 #define FPP_CMD_RX_L2BRIDGE_MODE                        0x000e
@@ -1050,28 +998,6 @@ typedef struct fpp_qm_dscp_queue_mod {
 
 #define FPP_L2_BRIDGE_MODE_MANUAL                       0
 #define FPP_L2_BRIDGE_MODE_AUTO                         1
-
-typedef struct fpp_rx_icc_enable_cmd {
-    u_int16_t   interface;
-    u_int16_t   acc_value;
-    u_int16_t   on_thr;
-    u_int16_t   off_thr;
-    u_int32_t   flag;
-    u_int32_t   val1;
-    u_int32_t   val2;
-} __attribute__((__packed__)) fpp_rx_icc_enable_cmd_t;
-
-typedef struct fpp_rx_icc_disable_cmd {
-    u_int16_t   interface;
-} __attribute__((__packed__)) fpp_rx_icc_disable_cmd_t;
-
-typedef struct fpp_rx_icc_show_return_cmd {
-    u_int16_t   padding_in_rc_out;
-    u_int16_t   state;
-    u_int16_t   acc_value;
-    u_int16_t   on_thr;
-    u_int16_t   off_thr;
-} __attribute__((__packed__)) fpp_rx_icc_show_return_cmd_t;
 
 /* L2 Bridging  Flow entry command */
 typedef struct fpp_l2_bridge_flow_entry_cmd {
@@ -1664,7 +1590,6 @@ typedef struct fpp_pktcap_flf_cmd { /* First level filter */
 /*-------------------------------- TX BEGIN ---------------------------*/
 /* 0x0500 - 0x05FF */
 /* TX commands - begin */
-#define FPP_CMD_PORT_UPDATE				0x0505
 #ifdef LS1043
 #define FPP_CMD_DSCP_VLANPCP_MAP_STATUS			0x0506
 #define FPP_CMD_DSCP_VLANPCP_MAP_CFG			0x0507
@@ -1673,11 +1598,6 @@ typedef struct fpp_pktcap_flf_cmd { /* First level filter */
 
 #define MAX_VLAN_PCP	7
 #endif
-typedef struct fpp_port_update_cmd {
-    u_int16_t   port_id;
-    char        ifname[IFNAMSIZ];
-}__attribute__((__packed__)) fpp_port_update_cmd_t;
-
 #ifdef LS1043
 /*
  * This structure to map the dscp with vlan p bit on an interface.
@@ -1704,102 +1624,5 @@ typedef struct fpp_query_dscp_vlanpcp_map_cmd_s {
 #endif
 
 /*-------------------------------- TX END ---------------------------*/
-
-/*-------------------------------- ICC ---------------------------------------*/
-#define FPP_CMD_ICC_RESET                               0x1500
-#define FPP_CMD_ICC_THRESHOLD                           0x1501
-#define FPP_CMD_ICC_ADD_DELETE                          0x1502
-#define FPP_CMD_ICC_QUERY                               0x1503     
-
-typedef struct fpp_icc_reset_cmd {
-    u_int16_t   reserved1;
-    u_int16_t   reserved2;
-} __attribute__((__packed__)) fpp_icc_reset_cmd_t;
-
-typedef struct fpp_icc_threshold_cmd {
-    u_int16_t   bmu1_threshold;
-    u_int16_t   bmu2_threshold;
-} __attribute__((__packed__)) fpp_icc_threshold_cmd_t;
-
-typedef struct fpp_icc_add_delete_cmd {
-    u_int16_t   action;
-    u_int8_t    interface;
-    u_int8_t    table_type;
-    union {
-        struct {
-            u_int16_t type;
-        } ethertype;
-        struct {
-            u_int8_t ipproto[256 / 8];
-        } protocol;
-        struct {
-            u_int8_t dscp_value[64 / 8];
-        } dscp;
-        struct {
-            u_int32_t v4_addr;
-            u_int8_t v4_masklen;
-        } ipaddr;
-        struct {
-            u_int32_t v6_addr[4];
-            u_int8_t v6_masklen;
-        } ipv6addr;
-        struct {
-            u_int16_t sport_from;
-            u_int16_t sport_to;
-            u_int16_t dport_from;
-            u_int16_t dport_to;
-        } port;
-        struct {
-            u_int16_t vlan_from;
-            u_int16_t vlan_to;
-            u_int16_t prio_from;
-            u_int16_t prio_to;
-        } vlan;
-    };
-} __attribute__((__packed__)) fpp_icc_add_delete_cmd_t;
-
-typedef struct fpp_icc_query_cmd {
-    u_int16_t   action;
-    u_int8_t    interface;
-    u_int8_t    reserved;
-} __attribute__((__packed__)) fpp_icc_query_cmd_t;
-
-typedef struct fpp_icc_query_reply {
-    u_int16_t   rtncode;
-    u_int16_t    query_result;
-    u_int8_t    interface;
-    u_int8_t    table_type;
-    union {
-        struct {
-            u_int16_t type;
-        } ethertype;
-        struct {
-            u_int8_t ipproto[256 / 8];
-        } protocol;
-        struct {
-            u_int8_t dscp_value[64 / 8];
-        } dscp;
-        struct {
-            u_int32_t v4_addr;
-            u_int8_t v4_masklen;
-        } ipaddr;
-        struct {
-            u_int32_t v6_addr[4];
-            u_int8_t v6_masklen;
-        } ipv6addr;
-        struct {
-            u_int16_t sport_from;
-            u_int16_t sport_to;
-            u_int16_t dport_from;
-            u_int16_t dport_to;
-        } port;
-        struct {
-            u_int16_t vlan_from;
-            u_int16_t vlan_to;
-            u_int16_t prio_from;
-            u_int16_t prio_to;
-        } vlan;
-    };
-} __attribute__((__packed__)) fpp_icc_query_reply_t;
 
 #endif /* __FPP__ */

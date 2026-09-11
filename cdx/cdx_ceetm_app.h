@@ -112,7 +112,6 @@ int ceetm_get_qos_cfg(struct tQM_context_ctl *qm_ctx, pQosQueryCmd cmd);
 int ceetm_get_cq_query(pQosCqQueryCmd cmd);
 int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint8_t channel_num, uint8_t clsqueue_num);
 int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp);
-int cdx_dscp_fq_map_on_iface_update_status(struct tQM_context_ctl *qm_ctx, uint8_t status);
 #ifdef ENABLE_EGRESS_QOS
 int ceetm_exit(void);
 #endif

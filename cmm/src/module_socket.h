@@ -21,23 +21,6 @@
 #define HASH_SOCKET_SIZE	32
 #define HASH_SOCKET(id)		((id) & (HASH_SOCKET_SIZE - 1))
 
-static __inline u_int32_t HASH_SOCK_ADDR(int family, const u_int32_t *Saddr, const u_int32_t *Daddr, u_int16_t Sport, u_int16_t Dport, u_int16_t Proto)
-{
-	unsigned int a, b;
-
-	if (family == AF_INET)
-	{
-		a = jhash((void *)Saddr, 4, (Proto << 16) | Proto);
-		b = jhash((void *)Daddr, 4, (Sport << 16) | Dport);
-	}
-	else
-	{
-        	a = jhash((void *)Saddr, 16, (Proto << 16) | Proto);
-        	b = jhash((void *)Daddr, 16, (Sport << 16) | Dport);
-	}
-
-	return jhash_2words(a, b, 0x48375934) % HASH_SOCKET_SIZE;
-}
 
 #if defined(LS1043)
 #define SOCKET_UNCONNECTED	1
@@ -59,11 +42,9 @@ static __inline u_int32_t HASH_SOCK_ADDR(int family, const u_int32_t *Saddr, con
 #if (SOCK_ID_PRIVATE_END > 65535)
 	#error SOCK_ID_PRIVATE_END cannot be greater than 65535
 #endif
-#define NUM_INTERNAL_SOCKET_ID	(SOCK_ID_PRIVATE_END - SOCK_ID_PRIVATE_START + 1)
 
 struct socket {
 	struct list_head list;
-	struct list_head list_by_addr;
 	u_int8_t family;
 	u_int16_t id;
 	u_int8_t type;
@@ -76,10 +57,6 @@ struct socket {
 	u_int8_t queue;
 	u_int16_t dscp;
 	struct ct_route rt;
-	/* Only ever set for MSP sockets, which no longer exist. Kept because
-	 * it is still copied into the wire commands, where it now always
-	 * reads as 0 -- the value every non-MSP socket already sent. */
-	int iifindex;
 	int flags;
 	unsigned int fwmark;
 #if defined(LS1043)
@@ -89,24 +66,15 @@ struct socket {
 };
 
 extern struct list_head socket_table[HASH_SOCKET_SIZE];
-extern struct list_head socket_table_by_addr[HASH_SOCKET_SIZE];
 extern pthread_mutex_t socket_lock;
 
-int socket_daemon(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int fc, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);
+int socket_daemon(FCI_CLIENT *fci_handle, int fc, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len);
 int cmmSocketSetProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle, int family);
 int cmmSocketShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 int __socket_open(FCI_CLIENT *fci_handle, struct socket *s);
 void socket_remove(struct socket *s);
 void __cmmSocketUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route);
-struct socket *socket_find_by_addr(int family, const u_int32_t *saddr, const u_int32_t *daddr, u_int16_t sport, u_int16_t dport, u_int8_t proto);
-int __socket_close(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, struct socket *s);
+int __socket_close(FCI_CLIENT *fci_handle, struct socket *s);
 void __socket_add(struct socket * s);
-u_int32_t new_socket_id(void);
-void del_socket_id(u_int32_t sock_id_ext);
-
-#if defined(COMCERTO_2000) || defined(LS1043)
-struct socket *__cmmSocketFindFromFlow(int family, unsigned int *saddr, unsigned int *daddr, unsigned char proto, char *orig);
-#endif
-
 
 #endif

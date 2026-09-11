@@ -10,7 +10,7 @@ the agent's /fci/send endpoint. Every case asserts:
      fixture — UBSAN / KASAN / lockdep / WARN / BUG / PROVE_LOCKING).
 
 The command list is source-driven via _cmd_catalog: it parses every
-CDX_CMD / CDX_CMD_V / CDX_CMD_NOARG / CDX_CMD_VAR registration in the
+CDX_CMD / CDX_CMD_V / CDX_CMD_VAR registration in the
 cdx/ tree and cross-references numeric codes from cdx_cmdhandler.h.
 Strict-spec commands (exact-length or bounded-range) get fuzz cases;
 permissive CDX_CMD_VAR(0, U16_MAX) commands are skipped here (ISSUES.md
@@ -50,7 +50,10 @@ _KNOWN_CODES = {c for _, c in EXACT_CMDS} | {c for _, c in BOUNDED_CMDS} | {c fo
 UNKNOWN_CMD_CODES = [
     c for c in (
         0x0000, 0x00FF, 0x01FF, 0x02FF,       # just below subsystem blocks
+        0x0003, 0x0004, 0x0005,
         0x0008, 0x0009, 0x000A, 0x000B, 0x000C,
+        0x0820, 0x0821, 0x0822, 0x0823, 0x0824,
+        0x1500, 0x1501, 0x1502, 0x1503,
         0x0E07, 0x0E08,
         0x0200, 0x0300, 0x0400, 0x0500,
         0x0800, 0x0A00, 0x7777, 0xABCD, 0xFFFE, 0xFFFF,
@@ -81,7 +84,7 @@ async def test_fci_unknown_cmd_code(
 # ------------------------------------------------------------------
 # Mutation class 2: exact-spec command + wrong length.
 #
-# CDX_CMD / CDX_CMD_V / CDX_CMD_NOARG all enforce `length == arg_size`.
+# CDX_CMD / CDX_CMD_V all enforce `length == arg_size`.
 # We test length=1 and length=509 — both odd, both small enough to
 # stay under FCI_MSG_MAX_PAYLOAD (512) so the fci.c length-validation
 # layer doesn't reject first.

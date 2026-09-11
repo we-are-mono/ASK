@@ -649,15 +649,11 @@ static U16 M_ipv6_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
 }
 
 
-int ipv6_init(void)
+void ipv6_init(void)
 {
 	set_cmd_handler(EVENT_IPV6, M_ipv6_cmdproc);
-	return 0;
 }
 
-void ipv6_exit(void)
-{
-}
 
 /* This function returns total ipv6 conntrack entries 
 	 configured in a given hash index */

@@ -210,48 +210,6 @@ int release_offline_port(uint32_t fm_idx, int handle)
 	return -1;
 }
 
-void display_ohport_info(struct oh_iface_info *ohinfo)
-{
-#ifdef DEVOH_DEBUG
-	uint32_t ii;
-
-	DPA_INFO("fman_idx      \t%d\n", ohinfo->fman_idx);
-	DPA_INFO("port_idx      \t%d\n", ohinfo->port_idx);
-	DPA_INFO("channel_id    \t%d\n", ohinfo->channel_id);
-	for (ii = 0; ii < MAX_FQ_TYPES; ii++) {
-		switch(ii) {
-			case TX_ERR_FQ:
-				if (ohinfo->fqinfo[ii].num_fqs)
-					DPA_INFO("TX_ERR_FQ     \t0x%x\n", ohinfo->fqinfo[ii].fq_base);
-				break;
-			case TX_CFM_FQ:
-				if (ohinfo->fqinfo[ii].num_fqs)
-					DPA_INFO("TX_CFM_FQ     \t0x%x\n", ohinfo->fqinfo[ii].fq_base);
-				break;
-			case RX_ERR_FQ:
-				if (ohinfo->fqinfo[ii].num_fqs)
-					DPA_INFO("RX_ERR_FQ     \t0x%x\n", ohinfo->fqinfo[ii].fq_base);
-				break;
-			case RX_DEFA_FQ:
-				if (ohinfo->fqinfo[ii].num_fqs)
-					DPA_INFO("RX_DEFA_FQ    \t0x%x\n", ohinfo->fqinfo[ii].fq_base);
-				break;
-		}
-	}
-	DPA_INFO("max_dist      \t%d\n", ohinfo->max_dist);
-	if (ohinfo->max_dist) {
-		struct cdx_dist_info *dist_info;
-		DPA_INFO("PCD Fqs\n");
-		dist_info = ohinfo->dist_info;
-		for (ii = 0; ii < ohinfo->max_dist; ii++) {
-			printk("fq_base         \t0x%x\n", dist_info->base_fqid);
-			printk("fq_count        \t%d\n", dist_info->count);
-			printk("dist_type       \t%d\n", dist_info->type);
-			dist_info++;
-		}
-	}
-#endif
-}
 
 int dpa_add_oh_if(char *name)
 {
@@ -581,4 +539,3 @@ int dpaa_is_oh_port(uint32_t portid)
 	}
 	return 0;
 }
-

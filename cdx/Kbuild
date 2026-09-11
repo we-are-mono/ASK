@@ -18,7 +18,7 @@ ccflags-y += $(CFG_FLAGS)
 obj-$(CONFIG_ASK_CDX) += cdx.o
 
 cdx-y += cdx_main.o cdx_hal.o cdx_timer.o cdx_cmdhandler.o layer2.o \
-	control_tx.o control_rx.o control_ipv4.o control_ipv6.o \
+	control_tx.o control_ipv4.o control_ipv6.o \
 	control_vlan.o control_pppoe.o control_socket.o control_bridge.o \
 	control_stat.o control_ipsec.o query_Rx.o control_tunnel.o \
 	control_qm.o control_wifi.o \

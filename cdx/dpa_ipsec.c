@@ -151,10 +151,6 @@ uint32_t get_fqid_from_sec(void *handle)
 {
 	return (((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_FROM_SEC].fqid);
 }
-struct qman_fq *get_from_sec_fq(void *handle)
-{
-	return (struct qman_fq *)&(((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_FROM_SEC]);
-} 
 struct qman_fq *get_to_sec_fq(void *handle)
 {
 	return (struct qman_fq *)&(((struct dpa_ipsec_sainfo *)handle)->sec_fq[FQ_TO_SEC]);
@@ -1017,52 +1013,6 @@ err_ret0:
 	return FAILURE;
 }
 
-void display_fq_info(void *handle)
-{
-	struct dpa_ipsec_sainfo *ipsecsa_info;
-	struct dpa_fq *dpa_fq;
-	struct qman_fq *fq;
-	struct qm_mcr_queryfq_np *np;
-	struct qm_fqd *fqd;
-	uint32_t ii;
-
-	ipsecsa_info = (struct dpa_ipsec_sainfo *)handle;
-	np = kzalloc(sizeof(struct qm_mcr_queryfq_np), GFP_KERNEL);
-	if (!np) {
-		printk("%s::error allocating fqnp\n", __func__);
-		return;
-	}
-	fqd = kzalloc(sizeof(struct qm_fqd), GFP_KERNEL);
-	if (!fqd) {
-		printk("%s::error allocating fqd\n", __func__);
-		kfree(np);
-		return;
-	}
-
-	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
-		dpa_fq = &ipsecsa_info->sec_fq[ii];
-		fq = &dpa_fq->fq_base;
-		printk("===========================================\n%s::fqid %x(%d\n", __func__, fq->fqid, fq->fqid);
-		if (qman_query_fq(fq, fqd)) {
-			printk("%s::error getting fq fields\n", __func__);
-			break;
-		}
-		printk("fqctrl\t%x\n", fqd->fq_ctrl);
-		printk("channel\t%x\n", fqd->dest.channel);
-		printk("Wq\t%d\n", fqd->dest.wq);
-		printk("contextb\t%x\n", fqd->context_b);
-		printk("contexta\t%p\n", (void *)fqd->context_a.opaque);
-		if (qman_query_fq_np(fq, np)) {
-			printk("%s::error getting fqnp fields\n", __func__);
-			break;
-		}
-		printk("state\t%d\n", np->state);
-		printk("byte count\t%d\n", np->byte_cnt);
-		printk("frame count\t%d\n", np->frm_cnt);
-	}
-	kfree(np);
-	kfree(fqd);
-}
 
 
 static int ipsec_init_ohport(struct ipsec_info *info)
@@ -1514,5 +1464,3 @@ struct dpa_bp* get_ipsec_bp(void)
 	return NULL;
 }
 #endif
-
-

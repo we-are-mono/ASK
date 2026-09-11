@@ -3004,7 +3004,6 @@ int cmmCtInit(struct cmm_ct *ctx)
 
 	for (i = 0; i < HASH_SOCKET_SIZE ; i++) {
 		list_head_init(&socket_table[i]);
-		list_head_init(&socket_table_by_addr[i]);
 	}
 
 	for (i = 0; i < MC_NUM_HASH_ENTRIES ; i++)

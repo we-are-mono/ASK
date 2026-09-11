@@ -102,7 +102,6 @@ POnifDesc get_onif_by_name(U8 *itf_name);
 POnifDesc add_onif(U8 *input_itf_name, struct _itf *itf, struct _itf *phys_itf, U8 type);
 void remove_onif_by_index(U32 if_index);
 U16 itf_get_phys_port(struct _itf *itf);
-struct _itf *itf_get_phys_itf(struct _itf *itf);
 
 
 
@@ -145,4 +144,3 @@ static __inline void rte_set_mtu(PRouteEntry prte,U16 mtu) {
 void display_itf(struct _itf *itf);
 
 #endif /* _LAYER2_H_ */
-

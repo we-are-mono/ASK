@@ -35,15 +35,6 @@ pthread_mutex_t RouteMutex = PTHREAD_MUTEX_INITIALIZER;
  *
  *
  ************************************************************/
-int cmmRouteShowProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
-{	
-	return 0;
-}
-/************************************************************
- *
- *
- *
- ************************************************************/
 void cmmRouteSetPrintHelp()
 {
 	cmm_print(DEBUG_STDOUT, "Usage: set route interface {if_name} {add | del | query}\n"

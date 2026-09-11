@@ -347,12 +347,6 @@ static __inline U32 HASH_RTP(U16 socketID)
 	return (((socketID & 0xff) ^ (socketID >> 8)) & (NUM_RTPFLOW_ENTRIES - 1));
 }
 
-static inline U32 x1000(U32 x)
-{
-    U32 x125;
-    x125 = x + (x << 7) - (x << 2);  // x + 128*x - 4*x => 125*x
-    return x125 << 3;                // 8*(125*x) => 1000*x
-}
 
 
 

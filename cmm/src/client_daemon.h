@@ -19,23 +19,6 @@
 	  return *( (unsigned short *) rspbuf);
 	}
 
-static inline void setbit_in_array(u_int8_t *pbits, u_int32_t bitindex, u_int32_t bitval)
-{
-	if (bitval)
-		pbits[bitindex >> 3] |= 1 << (bitindex & 0x07);
-	else
-		pbits[bitindex >> 3] &= ~(1 << (bitindex & 0x07));
-}
-
-static inline u_int32_t testbit_in_array(u_int8_t *pbits, u_int32_t bitindex)
-{
-	u_int8_t x;
-	u_int32_t bitmask;
-	x = pbits[bitindex >> 3];
-	bitmask = 1 << (bitindex & 0x07);
-	return (x & bitmask);
-}
-
 #define ERRMSG_SOURCE_FPP		(0)
 #define ERRMSG_SOURCE_CMMD		(1)
 
@@ -57,8 +40,5 @@ static inline u_int32_t testbit_in_array(u_int8_t *pbits, u_int32_t bitindex)
 	int cmmDaemonInit(struct cmm_daemon *ctx);
 	void cmmDaemonExit(struct cmm_daemon *ctx);
 
-	int parse_value(char *p, u_int32_t *value, u_int32_t maxval);
-	int parse_range(char *p, u_int32_t *from, u_int32_t *to, u_int32_t maxval);
 
 #endif
-

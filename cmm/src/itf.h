@@ -58,15 +58,6 @@ static inline int is_wan_port_ifindex(int ifindex)
 	return 0;
 }
 
-static inline int is_wan_port_id(int port_id)
-{
-	int ii;
-
-	for (ii = 0; ii < GEM_PORTS; ii++)
-		if ((port_table[ii].port_id == port_id) && (port_table[ii].type == GEMAC_PORT_TYPE_WAN))
-			return 1;
-	return 0;
-}
 
 static inline void print_all_gemac_ports(char *buf, int buf_len)
 {
@@ -109,18 +100,6 @@ static inline int get_port_id(char *name)
 	return -1;
 }
 
-static inline int get_port_ifindex(char *name)
-{
-	int ii;
-
-	for (ii = 0; ii < GEM_PORTS; ii++)
-	{
-		if (!strcmp(name, port_table[ii].ifname) || !strcmp(name, port_table[ii].logical_name))
-			return port_table[ii].ifindex;
-	}
-
-	return -1;
-}
 
 static inline char *get_port_name(int port_id, char *buf, int buf_size)
 {
@@ -246,7 +225,6 @@ struct interface_table {
 	int fd;
 	struct rtnl_handle rth;
 	FCI_CLIENT *fci_handle;
-	FCI_CLIENT *fci_key_handle;
 };
 
 extern struct interface_table itf_table;
@@ -275,11 +253,8 @@ int __itf_is_tunnel(struct interface *itf);
 int __itf_get_from_bridge_port(int ifindex, int port);
 int ____itf_is_programmed(struct interface *itf);
 int __itf_is_programmed(int ifindex);
-int itf_is_programmed(int ifindex);
  int ____itf_is_4o6_tunnel(struct interface *itf);
 int ____itf_is_floating_sit_tunnel(struct interface *itf);
-int __itf_is_floating_sit_tunnel(int ifindex);
-int itf_name_update(FCI_CLIENT *fci_handle, struct gemac_port *port);
 int itf_match_src_ipaddr(int ifindex, int family, unsigned int *ipaddr);
 
 int cmmRtnlLink(const struct sockaddr_nl *who, struct nlmsghdr *nlh, void *arg);
@@ -296,7 +271,6 @@ struct interface_bridge_vlan_info *vinfo_find_by_vid(int ifindex, u_int16_t vid)
 #endif
 
 #ifdef WIFI_ENABLE
-int __itf_is_wifi_ff_if(struct interface *itf);
 int __itf_is_wifi(struct interface *itf);
 #else
 static inline int __itf_is_wifi(struct interface *itf){ return 0;}

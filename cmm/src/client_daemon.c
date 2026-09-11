@@ -163,14 +163,6 @@ char * getErrorString(unsigned short error)
 	caseretstr(FPP_ERR_RTP_STATS_WRONG_TYPE);
 	caseretstr(FPP_ERR_RTP_STATS_NOT_AVAILABLE );
 
-	/*-------------------------------- Voice Buffer --------------------------*/
-	caseretstr(FPP_ERR_VOICE_BUFFER_UNKNOWN);
-	caseretstr(FPP_ERR_VOICE_BUFFER_USED);
-	caseretstr(FPP_ERR_VOICE_BUFFER_PT);
-	caseretstr(FPP_ERR_VOICE_BUFFER_FRAME_SIZE);
-	caseretstr(FPP_ERR_VOICE_BUFFER_ENTRIES);
-	caseretstr(FPP_ERR_VOICE_BUFFER_SIZE);
-	caseretstr(FPP_ERR_VOICE_BUFFER_STARTED);
 
 	/*-------------------------------- Altconf -------------------------------*/
 	caseretstr(FPP_ERR_ALTCONF_OPTION_NOT_SUPPORTED);
@@ -182,12 +174,6 @@ char * getErrorString(unsigned short error)
 	caseretstr(FPP_ERR_PKTCAP_NOT_ENABLED);
 	caseretstr(FPP_ERR_PKTCAP_FLF_RESET);
 
-	/*-------------------------------- ICC -----------------------------------*/
-	caseretstr(FPP_ERR_ICC_TOO_MANY_ENTRIES);
-	caseretstr(FPP_ERR_ICC_ENTRY_ALREADY_EXISTS);
-	caseretstr(FPP_ERR_ICC_ENTRY_NOT_FOUND);
-	caseretstr(FPP_ERR_ICC_THRESHOLD_OUT_OF_RANGE);
-	caseretstr(FPP_ERR_ICC_INVALID_MASKLEN);
 
 	caseretstr(FPP_ERR_FLOW_ENTRY_NOT_FOUND);
 	caseretstr(FPP_ERR_INVALID_IP_FAMILY);
@@ -248,7 +234,6 @@ void cmmClientPrintHelp()
 	 */
 
 	cmm_print(DEBUG_STDOUT, "Command usage: set <module_name> [option ...]\n"
-									"\trx: Manage RX module (ICC)\n"
 									"\ttx: Manage TX module (DSCP VLAN PCP mapping)\n"
 									"\tqm: Manage QM module (QOS, Rate Limiting ,Ingress QOS ...)\n"
 									"\tmc6:	Manage IPv6 Multicast module\n"
@@ -267,15 +252,12 @@ void cmmClientPrintHelp()
 									"\texpt_queue: manage queue configurations\n"
 									"\tff: manage fast forwarding control\n"
 									"\tipsec: manage ipsec configurations\n"
-									"\tvoicebuf: manage voicebuf control \n"
 									"\tfrag: manage ipv4/ipv6 fragmentation configurations\n");
 	cmm_print(DEBUG_STDOUT, "\nCommand usage: show <module_name> [option ...]\n"
-									"\trx: show RX module (ICC)\n"
 									"\tqm: show QM module (QOS, Rate Limiting....)\n"
 									"\tmc6:	show IPv6 Multicast module\n"
 									"\tmc4:	show  IPv4 Multicast module\n"
                                     					"\tstat: show Statistics module\n"
-									"\troute: show Extended Route module\n"
 									"\tsocket: show Socket module\n"
 									"\tsocket6: show V6 socket module\n");
 	cmm_print(DEBUG_STDOUT, "\nCommand usage: query < module_name> \n"
@@ -410,21 +392,16 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 	{
 	  	if(cpt < 2)
 	    		goto help;
-		if (strcasecmp(keywords[1], "rx") == 0)
-		{
-			/*Call Rx process function*/
-			if (cmmRxSetProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
 #ifdef LS1043
-		else if (strcasecmp(keywords[1], "tx") == 0)
+		if (strcasecmp(keywords[1], "tx") == 0)
 		{
 			/*Call TX process function*/
 			if(cmmTxSetProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
+		else
 #endif
-		else if (strcasecmp(keywords[1], "qm") == 0)
+		if (strcasecmp(keywords[1], "qm") == 0)
 		{
 			/*Call QM process function*/
 			if(cmmQmSetProcess(keywords, 2, daemon_handle))
@@ -526,13 +503,7 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 	  	if(cpt < 2)
 	    		goto help;
 		
-		if (strcasecmp(keywords[1], "rx") == 0)
-		{
-			/*Call Rx process function*/
-			if (cmmRxShowProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
-		else if (strcasecmp(keywords[1], "qm") == 0)
+		if (strcasecmp(keywords[1], "qm") == 0)
 		{
 			/*Call QM process function*/
 			if(cmmQmShowProcess(keywords, 2, daemon_handle))
@@ -554,11 +525,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		{
 			/*Call Stat process function*/
 			if(cmmStatShowProcess(keywords, 2, daemon_handle))
-				return -1;
-		}
-		else if (strcasecmp(keywords[1], "route") == 0)
-		{
-			if(cmmRouteShowProcess(keywords, 2, daemon_handle))
 				return -1;
 		}
 		else if (!strcasecmp(keywords[1], "socket") || !strcasecmp(keywords[1], "socket6"))
@@ -1001,24 +967,14 @@ int cmmDaemonInit(struct cmm_daemon *ctx)
 		goto err2;
 	}
 
-	ctx->fci_key_handle = fci_open(FCILIB_KEY_TYPE, 0);
-	if (!ctx->fci_key_handle)
-	{
-		cmm_print(DEBUG_CRIT, "%s::%d: fci_open() failed, %s\n", __func__, __LINE__, strerror(errno));
-		goto err3;
-	}
-
 	// Thread for getting cmm client command
 	if (pthread_create(&ctx->pthread, NULL, cmmDaemonThread, ctx) < 0)
 	{
 		cmm_print(DEBUG_CRIT, "%s: pthread_create() failed, %s\n", __func__, strerror(errno));
-		goto err4;
+		goto err3;
 	}
 
 	return 0;
-
-err4:
-	fci_close(ctx->fci_key_handle);
 
 err3:
 	fci_close(ctx->fci_handle);
@@ -1042,7 +998,6 @@ void cmmDaemonExit(struct cmm_daemon *ctx)
 	pthread_join(ctx->pthread, NULL);
 
 	fci_close(ctx->fci_handle);
-	fci_close(ctx->fci_key_handle);
 	msgctl(ctx->queueIdTx, IPC_RMID, NULL);
 	msgctl(ctx->queueIdRx, IPC_RMID, NULL);
 
@@ -1081,7 +1036,7 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case CMMD_CMD_TUNNEL_ADD:
 	case CMMD_CMD_TUNNEL_DEL:
  	case CMMD_CMD_TUNNEL_SHOW:
-		return tunnel_daemon_msg_recv(ctx->fci_handle, ctx->fci_key_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
+		return tunnel_daemon_msg_recv(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
 
 	case CMMD_CMD_VLAN_ENTRY:
 		return cmmVlanProcessClientCmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
@@ -1097,7 +1052,7 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case CMMD_CMD_SOCKET_CLOSE:
 	case CMMD_CMD_SOCKET_UPDATE:
 	case CMMD_CMD_SOCKET_SHOW:
-		return socket_daemon(ctx->fci_handle, ctx->fci_key_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
+		return socket_daemon(ctx->fci_handle, function_code, cmd_buf, cmd_len, res_buf, res_len);
 
 #ifdef LS1043
         case FPP_CMD_QM_QUERY_FF_RATE:
@@ -1142,15 +1097,7 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_QM_DSCP_MAP:
 	case FPP_CMD_QM_QUEUE_QOSENABLE:
 	case FPP_CMD_QM_QUERY_QUEUE:
-	// Accept ICC commands
-	case FPP_CMD_ICC_RESET:
-	case FPP_CMD_ICC_THRESHOLD:
-	case FPP_CMD_ICC_ADD_DELETE:
-	case FPP_CMD_ICC_QUERY:
 	// Accept some RX commands
-	case FPP_CMD_RX_CNG_ENABLE:
-	case FPP_CMD_RX_CNG_DISABLE:
-	case FPP_CMD_RX_CNG_SHOW:
 	case FPP_CMD_RX_L2FLOW_ENTRY:
 	case FPP_CMD_RX_L2BRIDGE_FLOW_TIMEOUT:	
 	// Accept timeout set command
@@ -1170,9 +1117,6 @@ static int cmmCommandParse(struct cmm_daemon *ctx, int function_code, u_int8_t *
 	case FPP_CMD_IPSEC_RESET_SEC_FAILURE_STATS:
 #endif /* LS1043 */
 
-	// Voice Buffer
-	case FPP_CMD_VOICE_BUFFER_START:
-	case FPP_CMD_VOICE_BUFFER_STOP:
 	// accept stat commands
         case FPP_CMD_STAT_ENABLE:
 	case FPP_CMD_STAT_QUEUE:
@@ -1231,41 +1175,6 @@ FCI_CMD:
 	return fci_cmd(ctx->fci_handle, function_code, cmd_buf, cmd_len, (unsigned short *)res_buf, res_len);
 }
 
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-int parse_value(char *p, u_int32_t *value, u_int32_t maxval)
-{
-	char *endp;
-	u_int32_t val;
-	val = strtoul(p, &endp, 0);
-	if (*endp || val > maxval)
-		return -1;
-	*value = val;
-	return 0;
-}
-
-
-int parse_range(char *p, u_int32_t *from, u_int32_t *to, u_int32_t maxval)
-{
-	char *endp;
-	u_int32_t fromval, toval;
-	fromval = strtoul(p, &endp, 0);
-	if (*endp)
-	{
-		if (*endp++ != '-')
-			return -1;
-		if (parse_value(endp, &toval, maxval) < 0)
-			return -1;
-	}
-	else
-		toval = fromval;
-	if (toval < fromval || toval > maxval)
-		return -1;
-	*from = fromval;
-	*to = toval;
-	return 0;
-}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 

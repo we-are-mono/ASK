@@ -469,18 +469,6 @@ static int tunnel_send_del(FCI_CLIENT *fci_handle, struct interface *itf)
 
 /************************************************************
  *
- * __tunnel_remove_flow
- *
- ************************************************************/
-void __tunnel_remove_flow(FCI_CLIENT *fci_key_handle, struct interface *itf)
-{
-		/* TODO  will be taken when supporting IPSEC for local in packets*/
-}
-
-
-
-/************************************************************
- *
  * __tunnel_add
  * 
  ************************************************************/
@@ -515,15 +503,6 @@ int __tunnel_add(FCI_CLIENT *fci_handle, struct interface *itf)
 	if (((itf->type != ARPHRD_SIT) && (itf->tunnel_parm6.proto != IPPROTO_IPIP)) || dAddr[0])
 	{
 		struct flow flow;
-
-		if (itf->tunnel_flags & TNL_IPSEC)
-		{
-			/* TODO  will be taken when supporting IPSEC for local in packets*/
-		}
-		else
-		{
-					/* TODO  will be taken when supporting IPSEC for local in packets*/
-		}
 
 		flow.family = itf->tunnel_family;
 		flow.sAddr = sAddr;
@@ -586,12 +565,11 @@ err:
  * tunnel_add
  *
  ************************************************************/
-static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *name, unsigned char ipsec, char tnl_type, u_int16_t *res_buf, u_int16_t *res_len)
+static int tunnel_add(FCI_CLIENT *fci_handle, char *name, unsigned char ipsec, char tnl_type, u_int16_t *res_buf, u_int16_t *res_len)
 {
 	int ifindex;
 	struct interface *itf;
 	int rc = 0;
-	int update_tnl_flows = 0;
 
 	__pthread_mutex_lock(&itf_table.lock);
 	__pthread_mutex_lock(&ctMutex);
@@ -642,7 +620,6 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 			if(itf->tunnel_flags & TNL_IPSEC)
 				itf->flags |= FPP_NEEDS_UPDATE;
 			itf->tunnel_flags &= ~TNL_IPSEC;
-			update_tnl_flows = 1;
 		}
 		break;
 
@@ -670,8 +647,6 @@ static int tunnel_add(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 		rc = 0;
 	}
 
-	if(update_tnl_flows)
-		__tunnel_remove_flow(fci_key_handle, itf);
 
 err1:
 
@@ -691,14 +666,13 @@ err0:
  * __tunnel_del
  *
  ************************************************************/
-int __tunnel_del(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, struct interface *itf)
+int __tunnel_del(FCI_CLIENT *fci_handle, struct interface *itf)
 {
 	int rc = tunnel_send_del(fci_handle, itf);
 
 
 	__cmmRouteDeregister(fci_handle, &itf->rt, "tunnel");
 
-	__tunnel_remove_flow(fci_key_handle, itf);
 
 	return rc;
 }
@@ -709,7 +683,7 @@ int __tunnel_del(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, struct inte
  * tunnel_del
  *
  ************************************************************/
-static int tunnel_del(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *name, u_int16_t *res_buf, u_int16_t *res_len)
+static int tunnel_del(FCI_CLIENT *fci_handle, char *name, u_int16_t *res_buf, u_int16_t *res_len)
 {
 	int ifindex;
 	struct interface *itf;
@@ -738,7 +712,7 @@ static int tunnel_del(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, char *
 		goto err;
 	}
 
-	rc = __tunnel_del(fci_handle, fci_key_handle, itf);
+	rc = __tunnel_del(fci_handle, itf);
 	if (rc >= 0)
 	{
 		res_buf[0] = rc;
@@ -852,17 +826,17 @@ err:
  * tunnel_daemon_msg_recv
  * Role: Parse CMM to deamon messages
  ************************************************************/
-int tunnel_daemon_msg_recv(FCI_CLIENT *fci_handle, FCI_CLIENT *fci_key_handle, int function_code, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len)
+int tunnel_daemon_msg_recv(FCI_CLIENT *fci_handle, int function_code, u_int8_t *cmd_buf, u_int16_t cmd_len, u_int16_t *res_buf, u_int16_t *res_len)
 {
 	cmmd_tunnel_t *tnl = (cmmd_tunnel_t *) cmd_buf;
 
 	switch (function_code)
 	{
 	case CMMD_CMD_TUNNEL_ADD:
-		return tunnel_add(fci_handle, fci_key_handle, tnl->name, tnl->ipsec, tnl->tunnel_type, res_buf, res_len);
+		return tunnel_add(fci_handle, tnl->name, tnl->ipsec, tnl->tunnel_type, res_buf, res_len);
 
 	case CMMD_CMD_TUNNEL_DEL:
-		return tunnel_del(fci_handle, fci_key_handle, tnl->name, res_buf, res_len);
+		return tunnel_del(fci_handle, tnl->name, res_buf, res_len);
 
 	case CMMD_CMD_TUNNEL_SHOW:
 		return tunnel_show(fci_handle, tnl->name, res_buf, res_len);
@@ -1190,77 +1164,6 @@ void __cmmTunnelUpdateWithRoute(FCI_CLIENT *fci_handle, struct RtEntry *route)
 	}
 }
 
-/************************************************************
- *
- * __cmmTunnelFindFromFlow
- * Role : Finds tunnel entry that matches flow
- ************************************************************/
-struct interface *__cmmTunnelFindFromFlow(int family, unsigned int *saddr, unsigned int *daddr, unsigned char proto, char *orig)
-{
-	struct interface *itf;
-	struct list_head *entry;
-	int i;
-
-	for (i = 0; i < ITF_HASH_TABLE_SIZE; i++)
-	{
-		for (entry = list_first(&itf_table.hash[i]); entry != &itf_table.hash[i]; entry = list_next(entry))
-		{
-			itf = container_of(entry, struct interface, list);
-
-			if (!__itf_is_tunnel(itf))
-				continue;
-
-			if (itf->tunnel_family != family)
-				continue;
-
-			if (!(itf->tunnel_flags & TNL_IPSEC))
-				continue;
-
-			if (family == AF_INET6)
-			{
-				if (!memcmp(saddr, itf->tunnel_parm6.laddr.s6_addr, 16)
-				    && !memcmp(daddr, itf->tunnel_parm6.raddr.s6_addr, 16)
-				    && (proto == itf->tunnel_parm6.proto))
-				{
-					*orig = 1;
-					goto found;
-				}
-
-				if (!memcmp(daddr, itf->tunnel_parm6.laddr.s6_addr, 16)
-				    && !memcmp(saddr, itf->tunnel_parm6.raddr.s6_addr, 16)
-				    && (proto == itf->tunnel_parm6.proto))
-				{
-					*orig = 0;
-					goto found;
-				}
-			}
-			else
-			{
-				if((saddr[0] == itf->tunnel_parm4.iph.saddr) &&
-					(daddr[0] == itf->tunnel_parm4.iph.daddr) &&
-					(proto == itf->tunnel_parm4.iph.protocol))
-				{
-					*orig = 1;
-					goto found;
-				}
-
-				if((daddr[0] == itf->tunnel_parm4.iph.saddr) &&
-					(saddr[0] == itf->tunnel_parm4.iph.daddr) &&
-					(proto == itf->tunnel_parm4.iph.protocol))
-				{
-					*orig = 0;
-					goto found;
-				}
-
-			}
-		}
-	}
-
-	itf = NULL;
-
-found:
-	return itf;
-}
 
 
 int cmmTnlQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)

@@ -1819,18 +1819,6 @@ int cmmFcParser(char *confFilePath)
 	return ret;
 }
 
-/*****************************************************************
-* cmmRxCmd
-*
-*
-******************************************************************/
-static int cmmRxCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  /*Call RX process function*/
-  cmmRxSetProcess(argv, 0, globalConf.cli.daemon_handle);
-
-	return CLI_OK;
-}
 
 #ifdef LS1043
 /*****************************************************************
@@ -1886,18 +1874,6 @@ static int cmmAsymFFEnableCmd(struct cli_def * cli, const char *command, char *a
 	return CLI_OK;
 }
 
-/*****************************************************************
-* cmmShowRxCmd
-*
-*
-******************************************************************/
-static int cmmShowRxCmd(struct cli_def * cli, const char *command, char *argv[], int argc)
-{
-  /*Call RX process function*/
-  cmmRxShowProcess(argv, 0, globalConf.cli.daemon_handle);
-
-	return CLI_OK;
-}
 
 /*****************************************************************
 * cmmShowStatCmd
@@ -2421,7 +2397,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 		cli_register_command(ctx->handle, c, "pppoe", cmmPPPoELocalShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the pppoe entries used by the fast forwarded connections");
 		cli_register_command(ctx->handle, c, "vlan", cmmVlanLocalShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the vlan entries programmmed");
 		cli_register_command(ctx->handle, c, "macvlan", cmmMacVlanLocalShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the macvlan entries programmmed");
-		cli_register_command(ctx->handle, c, "rx", cmmShowRxCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show ICC, Bridge status");
 		cli_register_command(ctx->handle, c, "stat", cmmShowStatCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show Statistics");
 		cli_register_command(ctx->handle, c, "sa_query_timer", cmmSaQueryTimerShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the DPD SA query timer configuration");
 		cli_register_command(ctx->handle, c, "sa", cmmSAShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the SA stored by CMM");
@@ -2459,13 +2434,11 @@ int cmmCliInit(struct cmm_cli *ctx)
 #endif
 	}
 
-	//	cli_register_command(ctx->handle, pshow, "eth_icc", cmmEthIccShow, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Show the pppoe entries used by the fast forwarded connections");
 	c = cli_register_command(ctx->handle, NULL, "set", NULL, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
 	if (c)
 	{
 		cli_register_command(ctx->handle, c, "activate", cmmFcActivate, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Activate or desactivate fast forwarding");
 		cli_register_command(ctx->handle, c, "debug", cmmFcDebug, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Debug level");
-		cli_register_command(ctx->handle, c, "rx", cmmRxCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage RX module (ICC)");
 #ifdef LS1043
 		cli_register_command(ctx->handle, c, "tx", cmmTxCmd, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Manage TX module (DSCP VLAN P bit map)");
 #endif

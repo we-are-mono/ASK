@@ -23,6 +23,5 @@
 	/* Functions */
 	void __cmmGetBridges(int fd);
 	int cmmBrToFF(struct RtEntry *route);
-	int cmmBrGetPhysItf(int br_ifindex, unsigned char* fdb_mac);
 
 #endif

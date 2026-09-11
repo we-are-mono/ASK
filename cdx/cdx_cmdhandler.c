@@ -45,7 +45,7 @@ int FCODE_TO_EVENT(U32 fcode)
 			if (fcode >= L2BRIDGE_FIRST_COMMAND && fcode <= L2BRIDGE_LAST_COMMAND)
 				eventid = EVENT_BRIDGE;
 			else
-				eventid = EVENT_PKT_RX;
+				eventid = -1;
 			break;
 
 		case FC_IPV4: eventid = EVENT_IPV4; break;
@@ -92,15 +92,6 @@ void cdx_cmd_handler(U16 fcode, U16 length, U16 *payload, U16 *rlen, U16 *rbuf)
 	int eventid;
 
 	eventid = FCODE_TO_EVENT(fcode);
-/////////////////////////////////////////////////////////////////////////////
-	// TEMP code to satisfy CMM
-	if (fcode == CMD_VOICE_BUFFER_RESET)
-	{
-		rbuf[0] = NO_ERR;
-		*rlen = 2;
-	}
-	else
-/////////////////////////////////////////////////////////////////////////////
 	if (eventid >= 0 && (cmdproc = gCmdProcTable[eventid]) != NULL)
 	{
 		memcpy(rbuf, payload, length);
@@ -139,46 +130,46 @@ void xx##_exit(void);		\
 	} while (0)
 
 CMD_DECLARE(tx)
-CMD_DECLARE(rx)
 CMD_DECLARE(pppoe)
 CMD_DECLARE(vlan)
 CMD_DECLARE(ipv4)
-CMD_DECLARE(ipv6)
 CMD_DECLARE(socket)
 CMD_DECLARE(tunnel)
 CMD_DECLARE(bridge)
 CMD_DECLARE(qm)
-CMD_DECLARE(statistics)
 #ifdef DPA_IPSEC_OFFLOAD 
 CMD_DECLARE(ipsec)
-#endif
-#ifdef WIFI_ENABLE
-CMD_DECLARE(wifi)
 #endif
 CMD_DECLARE(mc4)
 CMD_DECLARE(mc6)
 CMD_DECLARE(rtp_relay)
+
+void ipv6_init(void);
+void statistics_init(void);
+#ifdef WIFI_ENABLE
+void wifi_init(void);
+#endif
 
 int __init cdx_cmdhandler_init(void)
 {
 	int rc = 0;
 
 	CMD_INIT(tx);
-	CMD_INIT(rx);
+	ff_enable = 1;
 	CMD_INIT(pppoe);
 	CMD_INIT(vlan);
 	CMD_INIT(ipv4);
-	CMD_INIT(ipv6);
+	ipv6_init();
 	CMD_INIT(socket);
 	CMD_INIT(tunnel);
 	CMD_INIT(bridge);
 	CMD_INIT(qm);
-	CMD_INIT(statistics);
+	statistics_init();
 #ifdef DPA_IPSEC_OFFLOAD 
 	CMD_INIT(ipsec);
 #endif
 #ifdef WIFI_ENABLE
-	CMD_INIT(wifi);
+	wifi_init();
 #endif
 	CMD_INIT(mc4);
 	CMD_INIT(mc6);
@@ -197,21 +188,15 @@ void cdx_cmdhandler_exit(void)
 	CMD_EXIT(rtp_relay);
 	CMD_EXIT(mc6);
 	CMD_EXIT(mc4);
-#ifdef WIFI_ENABLE
-	CMD_EXIT(wifi);
-#endif
 #ifdef DPA_IPSEC_OFFLOAD 
 	CMD_EXIT(ipsec);
 #endif
-	CMD_EXIT(statistics);
 	CMD_EXIT(bridge);
 	CMD_EXIT(tunnel);
 	CMD_EXIT(socket);
-	CMD_EXIT(ipv6);
 	CMD_EXIT(ipv4);
 	CMD_EXIT(vlan);
 	CMD_EXIT(pppoe);
-	CMD_EXIT(rx);
 	CMD_EXIT(qm);
 	CMD_EXIT(tx);
 }
@@ -250,6 +235,3 @@ int comcerto_fpp_register_event_cb(int (*event_cb)(u16, u16, u16*))
 	return 0;
 }
 EXPORT_SYMBOL(comcerto_fpp_register_event_cb);
-
-
-

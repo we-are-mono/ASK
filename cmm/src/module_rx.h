@@ -69,10 +69,7 @@ struct l2flowTable
 	struct l2flow l2flow;
 };
 
-int parse_icc_interface(char *pstring, unsigned short *pinterface_number, int num_interfaces);
 
-int cmmRxSetProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
-int cmmRxShowProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
 int parse_macaddr(char *pstring, unsigned char *pmacaddr);
 
 extern struct list_head l2flow_table[L2FLOW_HASH_TABLE_SIZE];
@@ -95,4 +92,3 @@ void cmm_l2flow_print(int level, struct l2flow *l2flow_tmp, char nl);
 int cmmBridgeInit(struct cmm_ct *ctx);
 int cmmBridgeControlProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 #endif
-

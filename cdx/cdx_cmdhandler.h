@@ -20,7 +20,6 @@ enum EVENTS {
 	EVENT_FIRST = 0,
 	EVENT_QM = EVENT_FIRST,
 	EVENT_PKT_TX,
-	EVENT_PKT_RX,
 	EVENT_PKT_WIFIRX,
 	EVENT_MC6,
 	EVENT_MC4,
@@ -142,7 +141,6 @@ enum EVENTS {
 
 #define CMD_RTP_STATS_DTMF_PT		0x0813
 
-#define CMD_VOICE_BUFFER_RESET		0x0824
 
 // 0x0900 -> 0x09FF : VLAN module
 #define FC_VLAN                     0x0009
@@ -220,8 +218,6 @@ enum EVENTS {
 #define 	CMD_MACVLAN_ENTRY_RESET 	0x1402
 // 0x1200: Fppdiag configuration
 #define FC_FPPDIAG					0x0012
-
-// 0x1500: ICC
 
 // return codes
 #define CMD_OK	0x0000

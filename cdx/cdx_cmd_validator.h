@@ -57,7 +57,7 @@
  *
  *     static const struct cdx_cmd_spec vlan_cmd_table[] = {
  *         CDX_CMD  (CMD_VLAN_ENTRY,       VlanCommand, vlan_entry_handle),
- *         CDX_CMD_NOARG(CMD_VLAN_ENTRY_RESET,         vlan_reset_handle),
+ *         CDX_CMD_VAR(CMD_VLAN_ENTRY_RESET, 0, U16_MAX, NULL, vlan_reset_handle),
  *     };
  *
  *     static U16 M_vlan_cmdproc(U16 cmd_code, U16 cmd_len, U16 *pcmd)
@@ -117,7 +117,7 @@ typedef U16 (*cdx_cmd_handle_fn)(void *pcmd, U16 cmd_len,
  *     sizeof(struct ...) via CDX_CMD).
  *   - min_len <= max_len: variable-length command in the given
  *     inclusive byte range (CDX_CMD_VAR).
- *   - min_len == max_len == 0: no-argument command (CDX_CMD_NOARG).
+ *   - min_len == max_len == 0: command accepting only an empty payload.
  *
  * The dispatcher enforces cmd_len in [min_len, max_len] and
  * returns ERR_WRONG_COMMAND_SIZE if it falls outside. 0-length
@@ -152,28 +152,6 @@ struct cdx_cmd_spec {
 	{ .cmd_code = (CODE),						\
 	  .min_len  = (MIN),						\
 	  .max_len  = (MAX),						\
-	  .validate = (VALIDATE),					\
-	  .handle   = (HANDLER) }
-
-/* No-argument command (cmd_len must equal 0).
- *
- * Currently unused by every dispatch table: no-arg commands deliberately keep
- * CDX_CMD_VAR(0, U16_MAX) to preserve pre-migration permissive lengths for
- * wire compatibility (see control_vlan.c). These two macros are kept as ready
- * strict-validation surface. */
-#define CDX_CMD_NOARG(CODE, HANDLER)					\
-	{ .cmd_code = (CODE),						\
-	  .min_len  = 0,						\
-	  .max_len  = 0,						\
-	  .validate = NULL,						\
-	  .handle   = (HANDLER) }
-
-/* No-argument command with a semantic validator (e.g. to gate on
- * module state before allowing a reset). */
-#define CDX_CMD_NOARG_V(CODE, VALIDATE, HANDLER)			\
-	{ .cmd_code = (CODE),						\
-	  .min_len  = 0,						\
-	  .max_len  = 0,						\
 	  .validate = (VALIDATE),					\
 	  .handle   = (HANDLER) }
 

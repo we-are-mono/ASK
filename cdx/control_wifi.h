@@ -44,8 +44,7 @@ struct wifiCmd
 #define WIFI_REMOVE_VAP    1
 
 
-int wifi_init(void);
-void wifi_exit(void);
+void wifi_init(void);
 
 //void wifi_tx_generate_csum(struct tMetadata *mtd);
 //void wifi_rx_validate_csum(struct tMetadata *mtd);

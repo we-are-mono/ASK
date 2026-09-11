@@ -146,7 +146,6 @@
 	struct cmm_daemon {
 		pthread_t pthread;
 		FCI_CLIENT *fci_handle;				/* fci library Handler used by msg daemon thread*/
-		FCI_CLIENT *fci_key_handle;
 		int queueIdRx;
 		int queueIdTx;
 	};

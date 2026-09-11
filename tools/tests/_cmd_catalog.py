@@ -6,7 +6,7 @@ The fuzzer uses this to parametrize across the full ~120-code surface
 without maintaining a hand-curated list.
 
 Classification:
-  EXACT_CMDS       — CDX_CMD, CDX_CMD_V, CDX_CMD_NOARG.
+  EXACT_CMDS       — CDX_CMD, CDX_CMD_V.
                      Dispatcher enforces length == spec->arg_size.
                      Any other length → ERR_WRONG_COMMAND_SIZE.
   BOUNDED_CMDS     — CDX_CMD_VAR(min, max) with min > 0 OR max < U16_MAX.
@@ -36,8 +36,6 @@ _CMD_DEFINE_RE = re.compile(
 )
 _CDX_CMD_RE       = re.compile(r"\bCDX_CMD\s*\(\s*(CMD_\w+)\s*,\s*([A-Za-z_]\w*)")
 _CDX_CMD_V_RE     = re.compile(r"\bCDX_CMD_V\s*\(\s*(CMD_\w+)\s*,\s*([A-Za-z_]\w*)")
-_CDX_CMD_NOARG_RE = re.compile(r"\bCDX_CMD_NOARG\s*\(\s*(CMD_\w+)\b")
-_CDX_CMD_NOARG_V_RE = re.compile(r"\bCDX_CMD_NOARG_V\s*\(\s*(CMD_\w+)\b")
 _CDX_CMD_VAR_RE   = re.compile(
     r"\bCDX_CMD_VAR\s*\(\s*(CMD_\w+)\s*,\s*([^,]+?)\s*,\s*([^,]+?)\s*,",
 )
@@ -89,8 +87,7 @@ def _scan_sources(src_files: list[Path], code_map: dict[str, int]):
     """Yield (kind, name, code, extra) tuples for every CDX_CMD* site.
 
     For exact-spec entries with a payload type (CDX_CMD / CDX_CMD_V),
-    extra carries the type name; for noarg / var entries it's None or
-    the (lo, hi) tuple respectively.
+    extra carries the type name; variable-length entries carry (lo, hi).
     """
     for f in src_files:
         try:
@@ -98,14 +95,6 @@ def _scan_sources(src_files: list[Path], code_map: dict[str, int]):
         except OSError:
             continue
         txt = raw
-        for m in _CDX_CMD_NOARG_V_RE.finditer(txt):
-            name = m.group(1)
-            if name in code_map:
-                yield ("exact", name, code_map[name], None)
-        for m in _CDX_CMD_NOARG_RE.finditer(txt):
-            name = m.group(1)
-            if name in code_map:
-                yield ("exact", name, code_map[name], None)
         for m in _CDX_CMD_V_RE.finditer(txt):
             name, type_name = m.group(1), m.group(2)
             if name in code_map:
@@ -172,9 +161,8 @@ def build_catalogs() -> tuple[list[tuple[str, int]], list[tuple[str, int]], list
 def exact_payload_types() -> dict[str, str]:
     """Map cmd_name -> payload type-name for CDX_CMD / CDX_CMD_V sites.
 
-    Only covers entries that carry a TYPE arg (so CDX_CMD_NOARG is
-    omitted — it has no payload). Used by the payload-mutation fuzzer
-    to look up sizeof(TYPE) via _payload_structs.
+    Used by the payload-mutation fuzzer to look up sizeof(TYPE)
+    via _payload_structs.
     """
     root = _repo_root()
     header_paths = [

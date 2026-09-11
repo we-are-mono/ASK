@@ -263,15 +263,7 @@ static U16 vlan_reset_handle(void *pcmd, U16 cmd_len, U16 *out_reply_len)
 	return Vlan_handle_reset();
 }
 
-/*
- * CMD_VLAN_ENTRY_RESET uses CDX_CMD_VAR(0, U16_MAX) rather than
- * CDX_CMD_NOARG to preserve the pre-migration permissive length
- * contract: the old M_vlan_cmdproc did not length-check RESET at
- * all. Canonical callers (CMM) send zero, but tightening here
- * would be a behavior change smuggled into a mechanical
- * refactor. Hardening this to strict 0-length is a separate
- * follow-up.
- */
+/* Reset accepts any payload length for compatibility with FCI callers. */
 static const struct cdx_cmd_spec vlan_cmd_table[] = {
 	CDX_CMD_V  (CMD_VLAN_ENTRY,       VlanCommand, vlan_entry_validate, vlan_entry_handle),
 	CDX_CMD_VAR(CMD_VLAN_ENTRY_RESET, 0, U16_MAX,  NULL,                vlan_reset_handle),
