@@ -1051,6 +1051,9 @@ static U16 RTP_Call_SpecialTx_Payload (U16 *p, U16 Length)
 	// Ensure alignment
 	memcpy((U8*)&RTPCmd, (U8*)p, sizeof(RTPSpecTxPayloadCommand));
 
+	if (RTPCmd.payloadLength > sizeof(RTPCmd.payload))
+		return ERR_RTP_SPECIAL_PKT_LEN;
+
 	if ((pCall = RTP_find_call(RTPCmd.CallID)) == NULL)
 		return ERR_RTP_UNKNOWN_CALL;
 

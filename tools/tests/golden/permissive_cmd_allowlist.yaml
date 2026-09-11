@@ -58,7 +58,7 @@ allowlist:
   - name: CMD_RTP_TAKEOVER
     reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
   - name: CMD_RTP_SPECTX_PLD
-    reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
+    reason: "Handler checks command and payload lengths; covered by host_tests/test_rtp_payload.py"
   - name: CMD_RTP_SPECTX_CTRL
     reason: "RTP subsystem; gated by CDX_TODO_RTP in production"
   - name: CMD_RTP_STATS_DTMF_PT
