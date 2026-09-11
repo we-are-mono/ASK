@@ -99,6 +99,7 @@ Structure and Macro definitions
 int ceetm_create_lni(struct tQM_context_ctl *qm_ctx);
 int ceetm_init_channels(void);
 int ceetm_release_lni(void *handle, void *sp_handle);
+int ceetm_release_iface(struct tQM_context_ctl *qm_ctx);
 int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info);
 int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx);

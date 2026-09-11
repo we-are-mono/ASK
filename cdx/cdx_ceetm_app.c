@@ -10,6 +10,9 @@
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
 #include <mac.h>
+#include <linux/cpu.h>
+#include <linux/delay.h>
+#include <linux/jiffies.h>
 #include "cdx.h"
 #include "control_ipv4.h"
 #include "lnxwrp_fm.h"
@@ -20,6 +23,9 @@
 #include "cdx_common.h"
 
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
+static bool ceetm_callbacks_registered;
+
+static int ceetm_release_channels(void);
 
 
 static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t classque, uint32_t ff)
@@ -33,23 +39,18 @@ static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t 
 		return NULL;
 	if (classque >= CDX_CEETM_MAX_QUEUES_PER_CHANNEL)
 		return NULL;
+	qm_ctx = ctx;
+	if (!qm_ctx || !qm_ctx->chnl_map)
+		return NULL;
 	if (!channel) {
-		qm_ctx = (struct tQM_context_ctl *)ctx;
-		if (!qm_ctx) {
-			ceetm_err("%s::invalid channel context\n", __func__);
-			return NULL;
-		}
 		/* get least prio channel on this interface */
-		channel = (CDX_CEETM_MAX_CHANNELS - 1);
-		while (1) {
-			if (qm_ctx->chnl_map & (1 << channel)) 
-				break;
-			channel--;
-		}
+		channel = fls(qm_ctx->chnl_map) - 1;
 		ceetm_dbg("%s::incoming channel reassigned as %d\n", __func__, channel);
 	} else
 		channel--;
 	chnl_ctx = &qm_chnl_info[channel];
+	if (chnl_ctx->qm_ctx != qm_ctx || !chnl_ctx->cq_info[classque].fq_created)
+		return NULL;
 	fq =  &chnl_ctx->cq_info[classque].ceetmfq.egress_fq;
 	if(chnl_ctx->cq_info[classque].cq_shaper_enable && ff) {
 		pp_no = ((chnl_ctx->cq_info[classque].pp_num) << 24);
@@ -134,29 +135,18 @@ static struct qman_fq *ceetm_get_dscp_fq(void *ctx, uint8_t dscp)
 /* get count of frames on a CEETM class queue */
 static int ceetm_get_fqcount(struct ceetm_chnl_info *chnl_ctx, uint32_t classque, uint32_t *fqcount)
 {
-	struct qm_mcr_ceetm_cq_query *query;
+	struct qm_mcr_ceetm_cq_query query;
 	struct qm_ceetm_cq *cq;
-	struct tQM_context_ctl *qm_ctx;
 
-	qm_ctx = chnl_ctx->qm_ctx;
-	if (!qm_ctx) {
-		ceetm_err("%s::invalid channel context\n", __func__);
+	cq = chnl_ctx->cq_info[classque].cq;
+	if (!cq)
 		return CEETM_FAILURE;
-	}
-	query = kzalloc(sizeof(struct qm_mcr_ceetm_cq_query), GFP_KERNEL);
-	if (!query) {
-		ceetm_err("%s::error allocating query\n", __func__);
-		return CEETM_FAILURE;
-	}
-	cq = (struct qm_ceetm_cq *)chnl_ctx->cq_info[classque].cq;
-	qm_ctx = chnl_ctx->qm_ctx;
-	if (qman_ceetm_query_cq(cq->idx, qm_ctx->port_info->fm_index, query)) {
+	if (qman_ceetm_query_cq((cq->parent->idx << 4) | cq->idx,
+			      cq->parent->dcp_idx, &query)) {
 		ceetm_err("%s::error getting ceetm cq fields\n", __func__);
-		kfree(query);
 		return CEETM_FAILURE;
 	}
-	*fqcount = query->frm_cnt;
-	kfree(query);
+	*fqcount = query.frm_cnt;
 	return CEETM_SUCCESS;
 }
 
@@ -368,24 +358,23 @@ int ceetm_release_lni(void *handle, void *sp_handle)
 	struct qm_ceetm_lni *lni;
 	struct qm_ceetm_sp *sp;
 	uint32_t lni_index;
+	int ret = CEETM_SUCCESS;
 
-	if (!handle)
-		return CEETM_FAILURE;
 	lni = (struct qm_ceetm_lni *)handle;
 	sp = (struct qm_ceetm_sp *)sp_handle;
-	lni_index = lni->idx;
+	lni_index = lni ? lni->idx : 0;
 	ceetm_dbg("%s::releasing lni %p index %d sp %p\n", __func__, lni,
 			lni_index, sp);
-	if (qman_ceetm_lni_release(lni)) {
+	if (lni && qman_ceetm_lni_release(lni)) {
 		ceetm_err("%s:lni %p(%d) release failed\n", __func__, handle, lni_index);
-		return CEETM_FAILURE;
+		ret = CEETM_FAILURE;
 	}
 	if (sp && qman_ceetm_sp_release(sp)) {
 		ceetm_err("%s:sp release failed on lni %p(%d)\n",
 			__func__, lni, lni_index);
-		return CEETM_FAILURE;
+		ret = CEETM_FAILURE;
 	}
-	return CEETM_SUCCESS;
+	return ret;
 }
 
 static int ceetm_create_ccg_for_class_queue(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
@@ -413,7 +402,7 @@ static void ceetm_num_to_2powN_multiple(uint32_t num_in, uint32_t *num, uint32_t
 
 	msbbit = 0;
 	for(ii = 0; ii < (sizeof(ii) * 8); ii++) {
-		if(num_in & (1 << ii))
+		if(num_in & (1U << ii))
 			msbbit = ii;
 	}
 
@@ -533,6 +522,7 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
 				__func__, classque, channel, channel->idx);
 			return CEETM_FAILURE;
 		}
+		cqinfo->cq = cq;
 		cqinfo->ch_shaper_enable = 0;
 		ceetm_dbg("%s::setting CR eligibility\n", __func__);
 		/* no CR eligibility */
@@ -558,6 +548,7 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
 				__func__, channel->idx);
 			return CEETM_FAILURE;
 		}
+		cqinfo->cq = cq;
 		/* set shaper eligiblity */
 		if (qman_ceetm_channel_set_group_cr_eligibility(channel, 0, 0)) {
 			ceetm_err("%s::Failed to set group cr eligibility of cq %d chnl %p(%d)\n", __func__,
@@ -584,7 +575,6 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
 			return CEETM_FAILURE;
 		}
 	}
-	cqinfo->cq = cq;
 	ceetm_dbg("%s::claimed cq %p, channel %p(%d), cqid %d\n", __func__, cq, channel,
 			channel->idx, classque);
 	/* Claim a LFQ */
@@ -613,6 +603,7 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
 			lfq); 
 		goto err_ret;
 	}
+	cqinfo->fq_created = true;
 	ceetm_dbg("%s::created fq %p, fqid %x(%d) for lfq %p, classque %d, channel %d\n", 
 			__func__, &cqinfo->ceetmfq, 
 			cqinfo->ceetmfq.egress_fq.fqid, 
@@ -620,14 +611,6 @@ static int ceetm_create_cq(struct ceetm_chnl_info *chnl_ctx, uint32_t classque)
 			lfq, classque, channel->idx);
 	return CEETM_SUCCESS;
 err_ret:
-	if (cqinfo->lfq) {
-		if (!qman_ceetm_lfq_release(cqinfo->lfq))
-			cqinfo->lfq = NULL;
-	}
-	if (cqinfo->cq) {
-		if (!qman_ceetm_cq_release(cqinfo->cq))
-			cqinfo->cq = NULL;
-	}
 	return CEETM_FAILURE;
 }
 
@@ -787,6 +770,7 @@ static int ceetm_create_channel(struct ceetm_chnl_info *qm_channel)
 		kfree(channel);
 		return CEETM_FAILURE;
 	}
+	INIT_LIST_HEAD(&channel->node);
 	INIT_LIST_HEAD(&channel->class_queues);
         INIT_LIST_HEAD(&channel->ccgs);
 	qm_channel->channel = channel;
@@ -848,16 +832,21 @@ int ceetm_init_channels(void)
 			cqinfo++;
 		}
 		if (ceetm_create_channel(chinfo))
-			return CEETM_FAILURE;
+			goto err_release;
 		chinfo++;
 	}
 	/* register functions to return CEETM egress FQID */
 	if (dpa_register_ceetm_get_egress_fq(ceetm_get_egressfq, ceetm_get_dscp_fq)) {
 		ceetm_err("%s::unable to register ceetmFq functions\n", __func__);
-		return CEETM_FAILURE;
+		goto err_release;
 	}
+	ceetm_callbacks_registered = true;
 	ceetm_dbg("%s::registered ceetmFq functions\n", __func__);
 	return CEETM_SUCCESS;
+
+err_release:
+	ceetm_release_channels();
+	return CEETM_FAILURE;
 }
 
 int ceetm_init_cq_plcr(void)
@@ -881,14 +870,45 @@ int ceetm_init_cq_plcr(void)
 		cqinfo = &chinfo->cq_info[0];
 		chinfo->pcd_handle = pcd_handle;
 		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
-			if(ceetm_create_cq_policer_profiles(chinfo->pcd_handle,cqinfo,profile))
-				return CEETM_FAILURE;
+			if (ceetm_create_cq_policer_profiles(chinfo->pcd_handle, cqinfo, profile))
+				goto err_release;
 			cqinfo++;
 			profile++;
 		}
 		chinfo++;
 	}
 	return CEETM_SUCCESS;
+
+err_release:
+	ceetm_exit_cq_plcr();
+	return CEETM_FAILURE;
+}
+
+int ceetm_exit_cq_plcr(void)
+{
+	int ii, jj;
+	int ret = CEETM_SUCCESS;
+
+	for (ii = CDX_CEETM_MAX_CHANNELS - 1; ii >= 0; ii--) {
+		for (jj = MAX_SCHEDULER_QUEUES - 1; jj >= 0; jj--) {
+			struct classque_info *cqinfo = &qm_chnl_info[ii].cq_info[jj];
+
+			if (!cqinfo->pp_handle)
+				continue;
+			if (FM_PCD_PlcrProfileDelete(cqinfo->pp_handle)) {
+				ceetm_err("unable to delete policer for channel %d queue %d\n",
+					  ii, jj);
+				ret = CEETM_FAILURE;
+			}
+			/* The SDK invalidates the profile and releases its lock
+			 * even when the hardware command fails. */
+			cqinfo->pp_handle = NULL;
+			cqinfo->pp_num = 0;
+			cqinfo->cq_shaper_enable = DISABLE_POLICER;
+		}
+		qm_chnl_info[ii].pcd_handle = NULL;
+	}
+	return ret;
 }
 
 
@@ -1310,13 +1330,9 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 	lni = qm_ctx->lni;
 	ceetm_dbg("%s::assigning channel %d(%d) to iface %s\n", __func__, 
 			channel_num, chnl_ctx->idx, qm_ctx->iface_info->name);
-	chnl_ctx->qm_ctx = qm_ctx;
 	memset(&config_opts, 0, sizeof(struct qm_mcc_ceetm_mapping_shaper_tcfc_config));
-	channel->dcp_idx = lni->dcp_idx;
-	channel->lni_idx = lni->idx;
-	list_add_tail(&channel->node, &lni->channels);
 	config_opts.cid = cpu_to_be16(CEETM_COMMAND_CHANNEL_MAPPING |
-				channel_num);
+				channel->idx);
 	config_opts.dcpid = lni->dcp_idx;
 	config_opts.channel_mapping.map_lni_id = lni->idx;
 	config_opts.channel_mapping.map_shaped = 1;
@@ -1325,6 +1341,10 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 			channel_num, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
+	channel->dcp_idx = lni->dcp_idx;
+	channel->lni_idx = lni->idx;
+	list_add_tail(&channel->node, &lni->channels);
+	chnl_ctx->qm_ctx = qm_ctx;
 	qm_ctx->chnl_map |= (1 << chnl_ctx->idx);
 	ceetm_dbg("%s::lni %d, dcp %d, chnl_map %x\n", __func__, lni->idx, lni->dcp_idx, qm_ctx->chnl_map);
 	/* if qos is enabled on port and channel shaper is on program values into shaper */
@@ -1726,31 +1746,193 @@ int ceetm_get_cq_query(pQosCqQueryCmd cmd)
 	return CEETM_SUCCESS;
 }
 
+static void ceetm_sync_portal(void *arg)
+{
+	atomic_t *ret = arg;
+	int ii;
+
+	/* The IPI stops this CPU's producers while QMan consumes their
+	 * enqueue ring. Process pending ERNs before releasing their FQs. */
+	for (ii = 0; ii < 1000; ii++) {
+		if (qman_eqcr_is_empty())
+			break;
+		udelay(1);
+	}
+	if (ii == 1000) {
+		ceetm_err("QMan enqueue ring did not drain\n");
+		atomic_set(ret, -ETIMEDOUT);
+	}
+	qman_drain_ern();
+}
+
+static int ceetm_sync_portals(void)
+{
+	atomic_t ret = ATOMIC_INIT(0);
+
+	cpus_read_lock();
+	on_each_cpu_mask(qman_affine_cpus(), ceetm_sync_portal, &ret, 1);
+	cpus_read_unlock();
+	return atomic_read(&ret);
+}
+
+static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
+	uint32_t count;
+	int jj;
+	int ret = CEETM_SUCCESS;
+
+	for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
+		if (!chinfo->cq_info[jj].cq)
+			continue;
+		/* Let queued traffic finish before the SDK discards any
+		 * remaining descriptors when releasing the class queue. */
+		for (;;) {
+			if (ceetm_get_fqcount(chinfo, jj, &count)) {
+				ret = CEETM_FAILURE;
+				break;
+			}
+			if (!count)
+				break;
+			if (time_after_eq(jiffies, timeout)) {
+				ceetm_err("channel %u queue %d did not drain\n", chinfo->idx, jj);
+				ret = CEETM_FAILURE;
+				break;
+			}
+			usleep_range(1000, 2000);
+		}
+		if (ret && qman_ceetm_drain_cq(chinfo->cq_info[jj].cq))
+			ceetm_err("unable to drain channel %u queue %d\n", chinfo->idx, jj);
+	}
+	return ret;
+}
+
+int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
+{
+	int ii, jj;
+	int ret = CEETM_SUCCESS;
+	uint32_t detached = 0;
+
+	if (qm_ctx->net_dev) {
+		dpa_disable_ceetm(qm_ctx->net_dev);
+		/* Finish TX readers before changing their context or queues. */
+		synchronize_net();
+		if (ceetm_sync_portals())
+			ret = CEETM_FAILURE;
+	}
+	if (qm_ctx->qos_enabled && ceetm_enable_or_disable_qos(qm_ctx, 0))
+		ret = CEETM_FAILURE;
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+		struct ceetm_chnl_info *chinfo = &qm_chnl_info[ii];
+
+		if (chinfo->qm_ctx != qm_ctx)
+			continue;
+		if (ceetm_drain_channel(chinfo))
+			ret = CEETM_FAILURE;
+		list_del_init(&chinfo->channel->node);
+		chinfo->qm_ctx = NULL;
+		detached |= 1U << ii;
+	}
+	if (qm_ctx->net_dev) {
+		struct dpa_priv_s *priv = netdev_priv(qm_ctx->net_dev);
+
+		if (ceetm_sync_portals())
+			ret = CEETM_FAILURE;
+		synchronize_net();
+		priv->qm_ctx = NULL;
+	}
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+		if (!(detached & (1U << ii)))
+			continue;
+		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++)
+			qm_chnl_info[ii].cq_info[jj].ceetmfq.net_dev = NULL;
+	}
+	if (qm_ctx->dscp_fq_map) {
+		if (disable_dscp_fqid_map(qm_ctx - gQMCtx))
+			ret = CEETM_FAILURE;
+		kfree(qm_ctx->dscp_fq_map);
+	}
+	if (ceetm_release_lni(qm_ctx->lni, qm_ctx->sp))
+		ret = CEETM_FAILURE;
+	memset(qm_ctx, 0, sizeof(*qm_ctx));
+	return ret;
+}
+
+static int ceetm_release_queue(struct classque_info *cqinfo)
+{
+	int ret = CEETM_SUCCESS;
+
+	if (cqinfo->fq_created) {
+		qman_destroy_fq(&cqinfo->ceetmfq.egress_fq, 0);
+		cqinfo->fq_created = false;
+	}
+	if (cqinfo->lfq) {
+		if (qman_ceetm_lfq_release(cqinfo->lfq))
+			return CEETM_FAILURE;
+		cqinfo->lfq = NULL;
+	}
+	if (cqinfo->cq) {
+		if (qman_ceetm_cq_release(cqinfo->cq))
+			return CEETM_FAILURE;
+		cqinfo->cq = NULL;
+	}
+	if (cqinfo->ccg) {
+		if (qman_ceetm_ccg_release(cqinfo->ccg))
+			ret = CEETM_FAILURE;
+		/* CCG release frees the object even on a hardware error. */
+		cqinfo->ccg = NULL;
+	}
+	return ret;
+}
+
+static int ceetm_release_channels(void)
+{
+	int ii, jj;
+	int ret = CEETM_SUCCESS;
+
+	for (ii = CDX_CEETM_MAX_CHANNELS - 1; ii >= 0; ii--) {
+		struct ceetm_chnl_info *chinfo = &qm_chnl_info[ii];
+
+		if (!chinfo->channel)
+			continue;
+		for (jj = MAX_SCHEDULER_QUEUES - 1; jj >= 0; jj--) {
+			if (ceetm_release_queue(&chinfo->cq_info[jj])) {
+				ceetm_err("unable to release channel %d queue %d\n", ii, jj);
+				ret = CEETM_FAILURE;
+			}
+		}
+		if (qman_ceetm_channel_release(chinfo->channel)) {
+			ceetm_err("unable to release channel %d\n", ii);
+			ret = CEETM_FAILURE;
+		} else {
+			chinfo->channel = NULL;
+		}
+	}
+	return ret;
+}
+
 #ifdef ENABLE_EGRESS_QOS
 int ceetm_exit(void)
 {
-	/* deregister functions to return CEETM egress FQID */
-	dpa_unregister_ceetm_get_egress_fq();
-	ceetm_dbg("%s::deregistered ceetmFq functions\n", __func__);
+	int ii;
+	int ret = CEETM_SUCCESS;
 
-	/* TODO: Implement proper cleanup for module unload. Currently leaks:
-	 * - 8 channel structures (kzalloc'd in ceetm_create_channel)
-	 * - 8 hardware channels (qman_alloc_ceetm0_channel)
-	 * - 128 class queues (qman_ceetm_cq_claim)
-	 * - 128 logical FQIDs (qman_ceetm_lfq_claim)
-	 * - 128 CCGs (qman_ceetm_ccg_claim)
-	 * - 128 policer profiles (FM_PCD_PlcrProfileSet)
-	 *
-	 * Release order must be: LFQ -> CQ -> CCG -> channel (per kernel API).
-	 * For each channel in qm_chnl_info[0..7]:
-	 *   for each cq_info[0..15]:
-	 *     qman_ceetm_lfq_release(cqinfo->lfq)
-	 *     qman_ceetm_cq_release(cqinfo->cq)
-	 *     release CCG
-	 *   qman_release_ceetm0_channelid(channel->idx)
-	 *   kfree(channel)
-	 */
-
-	return CEETM_SUCCESS;
+	for (ii = 0; ii < ARRAY_SIZE(gQMCtx); ii++) {
+		if (gQMCtx[ii].net_dev)
+			dpa_disable_ceetm(gQMCtx[ii].net_dev);
+	}
+	if (ceetm_callbacks_registered) {
+		dpa_unregister_ceetm_get_egress_fq();
+		ceetm_callbacks_registered = false;
+	}
+	for (ii = 0; ii < ARRAY_SIZE(gQMCtx); ii++) {
+		if (ceetm_release_iface(&gQMCtx[ii]))
+			ret = CEETM_FAILURE;
+	}
+	if (ceetm_release_channels())
+		ret = CEETM_FAILURE;
+	if (ceetm_exit_cq_plcr())
+		ret = CEETM_FAILURE;
+	return ret;
 }
 #endif

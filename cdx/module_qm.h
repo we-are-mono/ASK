@@ -47,6 +47,7 @@ struct shaper_info {
 
 struct classque_info {
 	struct ceetm_fq ceetmfq;
+	bool fq_created;
 	uint32_t ceetm_idx;
 	void *ccg;			
 	void *cq;

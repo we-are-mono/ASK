@@ -1,0 +1,96 @@
+Subject: [PATCH] qbman: unwind CEETM LFQ claims and drain pending ERNs
+
+The LFQ claim reserves an ID before allocating its software object and
+programming the mapping. Return the ID on either failure so a failed
+QoS initialization does not exhaust the hardware pool on retry.
+
+Expose a portal drain for pending enqueue rejections. CEETM queues have
+no ordinary FQ retirement notification to synchronize against. Once
+producers and their enqueue rings are quiesced, the owning CPU must
+consume pending MR entries before destroying the FQ lookup entries.
+Poll the MR directly: disabling its IRQ source clears the status bit,
+so the normal status-driven slow poll cannot serve as this barrier.
+
+Upstream-Status: Pending
+
+--- a/drivers/staging/fsl_qbman/qman_high.c
++++ b/drivers/staging/fsl_qbman/qman_high.c
+@@ -1538,6 +1538,27 @@
+ 	return ret;
+ }
+ EXPORT_SYMBOL(qman_poll_slow);
++
++void qman_drain_ern(void)
++{
++	struct qman_portal *p = get_raw_affine_portal();
++	unsigned long irqflags;
++
++#ifdef CONFIG_FSL_DPA_PORTAL_SHARE
++	if (p->sharing_redirect)
++		goto out;
++#endif
++	/* The owner normally consumes MR entries from its IRQ handler. */
++	local_irq_save(irqflags);
++	__poll_portal_slow(p, QM_PIRQ_MRI);
++	qm_isr_status_clear(&p->p, QM_PIRQ_MRI);
++	local_irq_restore(irqflags);
++#ifdef CONFIG_FSL_DPA_PORTAL_SHARE
++out:
++#endif
++	put_affine_portal();
++}
++EXPORT_SYMBOL(qman_drain_ern);
+ 
+ /* Legacy wrapper */
+ void qman_p_poll(struct qman_portal *p)
+@@ -5308,8 +5308,10 @@
+ 		return -ENODEV;
+ 	}
+ 	p = kmalloc(sizeof(*p), GFP_KERNEL);
+-	if (!p)
+-		return -ENOMEM;
++	if (!p) {
++		ret = -ENOMEM;
++		goto release_lfqid;
++	}
+ 	memset(&lfqmt_config, 0, sizeof(struct qm_mcc_ceetm_lfqmt_config));
+ 	p->idx = lfqid;
+ 	p->dctidx = (u16)(lfqid & CEETM_LFQMT_LFQID_LSB);
+@@ -5326,10 +5328,18 @@
+ 				lfqid, cq->idx);
+ 		list_del(&p->node);
+ 		kfree(p);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto release_lfqid;
+ 	}
+ 	*lfq = p;
+ 	return 0;
++
++release_lfqid:
++	if (cq->parent->dcp_idx == qm_dc_portal_fman0)
++		qman_release_ceetm0_lfqid(lfqid);
++	else
++		qman_release_ceetm1_lfqid(lfqid);
++	return ret;
+ }
+ EXPORT_SYMBOL(qman_ceetm_lfq_claim);
+ 
+--- a/include/linux/fsl_qman.h
++++ b/include/linux/fsl_qman.h
+@@ -2152,6 +2152,15 @@
+  * indicating what interrupt sources were actually processed by the call.
+  */
+ u32 qman_poll_slow(void);
++
++/**
++ * qman_drain_ern - consume pending enqueue rejection notifications
++ *
++ * Call on the owning CPU of each affine portal after stopping producers
++ * and draining their enqueue rings. The MR must normally be IRQ-driven;
++ * concurrent polling of the same portal is not permitted.
++ */
++void qman_drain_ern(void);
+ 
+ /**
+  * qman_poll - legacy wrapper for qman_poll_dqrr() and qman_poll_slow()

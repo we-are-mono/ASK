@@ -845,6 +845,9 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	mutex_unlock(&dpa_cfg_lock);
 	return 0;
 err_ret:
+#ifdef ENABLE_EGRESS_QOS
+	ceetm_exit_cq_plcr();
+#endif
 	release_cfg_info();
 	mutex_unlock(&dpa_cfg_lock);
 	return retval;

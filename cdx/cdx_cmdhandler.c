@@ -192,7 +192,7 @@ void cdx_cmdhandler_exit(void)
 {
 	DPRINT("\n");
 
-	// EXIT routines must be in reverse order from the INIT routines
+	/* Remove forwarding entries before their QoS queues and interfaces. */
 
 	CMD_EXIT(rtp_relay);
 	CMD_EXIT(mc6);
@@ -204,7 +204,6 @@ void cdx_cmdhandler_exit(void)
 	CMD_EXIT(ipsec);
 #endif
 	CMD_EXIT(statistics);
-	CMD_EXIT(qm);
 	CMD_EXIT(bridge);
 	CMD_EXIT(tunnel);
 	CMD_EXIT(socket);
@@ -213,6 +212,7 @@ void cdx_cmdhandler_exit(void)
 	CMD_EXIT(vlan);
 	CMD_EXIT(pppoe);
 	CMD_EXIT(rx);
+	CMD_EXIT(qm);
 	CMD_EXIT(tx);
 }
 

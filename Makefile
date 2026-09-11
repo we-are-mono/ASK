@@ -118,7 +118,7 @@ ASK_ENV := $(shell env | grep -E '^ASK_[A-Za-z0-9_]+=[^ ]*$$' | grep -v '^ASK_TE
 ask-test:
 	sudo $(ASK_ENV) PYTHONPATH=$(CURDIR)/tools $(WAN_PREFIX)/venv/bin/pytest \
 	    -c $(CURDIR)/tools/pyproject.toml \
-	    $(CURDIR)/tools/tests $(ASK_TEST_ARGS)
+	    $(CURDIR)/tools/host_tests $(CURDIR)/tools/tests $(ASK_TEST_ARGS)
 
 # ============================================================================
 #  Help

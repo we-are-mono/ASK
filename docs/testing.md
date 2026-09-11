@@ -237,7 +237,29 @@ ASK_WAN_IP=<wan-host> ASK_WAN_IPERF_IP=<wan-iperf> make ask-test
 
 # a scoped subset while iterating
 make ask-test ASK_TEST_ARGS='-k "ipsec or mcast"'
+
+# QoS allocation, cleanup, and command regressions
+make ask-test ASK_TEST_ARGS='-k qos'
 ```
+
+The QoS host tests compile the production lifecycle functions with
+AddressSanitizer and UndefinedBehaviorSanitizer, inject each startup
+failure, and check resource balance, retries, interface reassignment,
+queue selection, and pending rejection notifications. They require a host
+C compiler and run without the board:
+
+```sh
+pytest -c tools/pyproject.toml tools/host_tests -k qos
+```
+
+The SDK regression uses the patched kernel source from the build tree.
+Set `ASK_KERNEL_SOURCE` to test another patched tree; this check skips if
+the source is unavailable. The CDX host regression always runs.
+
+On the DUT, the QoS tests query all 128 queues and verify that rejected
+assignments and out-of-range queries leave port configuration unchanged.
+These checks do not reload the module. Unload/reload under traffic still
+requires a dedicated board run with the updated kernel and CDX module.
 
 `make ask-test` runs pytest under `sudo` (it needs the serial PTYs and the
 USB-serial node) against the source tree, so test edits are picked up

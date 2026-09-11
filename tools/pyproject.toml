@@ -12,4 +12,4 @@ asyncio_default_test_loop_scope    = "function"
 # -ra: summary of non-passing results. -x: stop after first failure
 # (comment out when triaging a suite run). --tb=short: compact tracebacks.
 addopts = "-ra -x --tb=short"
-testpaths = ["tests"]
+testpaths = ["host_tests", "tests"]
