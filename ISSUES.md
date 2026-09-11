@@ -20,16 +20,6 @@ stale line refs) are folded into the archive one-liners.
 
 ## Open
 
-- [ ] **A107. SA deletion can orphan its last FPP route.**
-  `cmmKeyCatch(FPP_CMD_NETKEY_SA_DELETE)` calls `cmmSADelete()` before
-  forwarding the deletion to CDX. `__cmmSARemove()` therefore deregisters
-  the route while the hardware SA still pins it; CDX returns
-  `ERR_RT_ENTRY_LINKED` and CMM leaves the handle at count zero. The later
-  CDX SA deletion releases the pin, but nothing retries route deletion.
-  Exposed by the A66 hardware regression after successful route recovery;
-  the ordering predates A66. Keep the route reference through hardware SA
-  deletion, while preserving the existing flow-dependency cleanup order.
-
 - [ ] **A9. Tunnel TX encap never offloads — ucode 210.10.1 `INSERT_L3_HDR`
   punts unconditionally.**
   The completed A9 work (RX decap offload for 6o4+4o6, the `ip6_tunnel.c`
@@ -845,3 +835,9 @@ file's git history.
   fixed (_this commit_): retry through the existing route-swap transactions,
   including local tunnel events; host fault coverage and six hardware
   gateway/MTU recovery cases preserve references across repeated refusals.
+
+- [x] **A107.** SA deletion and hard expiry left the last FPP route behind —
+  fixed (_this commit_): detach flows, delete the CDX SA, then release its
+  counted route. Expiry route deletion now uses the CDX connection instead
+  of the key-engine connection. Host error/ordering coverage and repeated
+  hardware deletion/expiry checks cover sole and shared routes.

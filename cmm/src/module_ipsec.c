@@ -396,7 +396,7 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 	{
 		cmm_print(DEBUG_ERROR, "%s: SA doesn't exist :%x \n", __func__, pSA_cmd->sagd);
 		rc = -1;
-		goto out;
+		goto send;
 	}
 	cmm_print(DEBUG_INFO, "%s(%d) SA %p, XFRM handle %x, SPI %x\n",
 		__func__,__LINE__,pSAEntry, pSA_cmd->sagd,pSAEntry->SAInfo.id.spi);
@@ -410,9 +410,16 @@ int cmmSADelete(FCI_CLIENT *fci_handle, PCommandIPSecDeleteSA pSA_cmd)
 	 * failure for the caller and remove the SA regardless. */
 	if(cmmUpdateFlows(pSAEntry) < 0)
 		rc = -1;
-	__cmmSARemove(fci_handle, pSAEntry);
 
-out:
+send:
+	/* Detach dependent flows first, but retain our route reference until
+	 * CDX has released the SA's pin. Forward even without a local entry. */
+	if (cmmKeyEnginetoIPSec(fci_handle, FPP_CMD_NETKEY_SA_DELETE,
+			       sizeof(*pSA_cmd), pSA_cmd) < 0)
+		rc = -1;
+	if (pSAEntry)
+		__cmmSARemove(fci_handle, pSAEntry);
+
 	__pthread_mutex_unlock(&sa_lock);
 	__pthread_mutex_unlock(&neighMutex);
 	__pthread_mutex_unlock(&rtMutex);
@@ -525,7 +532,6 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 		 * remove the SA regardless. */
 		if(cmmUpdateFlows(pSAEntry) < 0)
 			rc = -1;
-		__cmmSARemove(fci_handle, pSAEntry);
 	}
 
 	if (pSA_cmd->state == SA_STATE_VALID)
@@ -541,6 +547,14 @@ int cmmSASetState(FCI_CLIENT *fci_handle, unsigned short fcode, unsigned short l
 	}
 	else
 		*state_valid = 0;
+
+	/* A dying state deletes the CDX SA too. Keep its route counted until
+	 * that command completes, even when flow cleanup reported an error.
+	 * fci_handle is the key-engine connection used for offload status. */
+	if (cmmKeyEnginetoIPSec(globalConf.ct.fci_handle, fcode, len, payload) < 0)
+		rc = -1;
+	if (pSA_cmd->state == SA_STATE_DYING)
+		__cmmSARemove(globalConf.ct.fci_handle, pSAEntry);
 
 out:
 	__pthread_mutex_unlock(&sa_lock);

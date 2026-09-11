@@ -113,6 +113,7 @@ async def test_cmm_route_recovery(rig, kind, change):
         result, found = await fci(6), []
         for _ in range(256):
             if result.get("reply_rc") != 0:
+                assert result.get("reply_rc") == 201, result
                 return found
             data = bytes.fromhex(result["payload_hex"])
             if data[4:10] in MACS:
@@ -132,25 +133,6 @@ async def test_cmm_route_recovery(rig, kind, change):
     async def ipc(command, payload):
         run(f"python3 /tmp/ask-route-ipc.py {command} {shlex.quote(payload.hex())}")
 
-    async def remove_sa(state):
-        # A107: CMM deletes its route before the hardware SA on normal
-        # XFRM deletion. Detach this test SA first so its route can be freed.
-        await write("/tmp/ask-route-fault", "0")
-        try:
-            result = await TARGET.fci_send(session, 0x0a0a, 252, bytes(252))
-            for _ in range(256):
-                if result.get("reply_rc") != 0:
-                    raise AssertionError("test SA disappeared before cleanup")
-                data = bytes.fromhex(result["payload_hex"])
-                if struct.unpack_from("!I", data, 8)[0] == int(SPI, 0):
-                    handle = struct.unpack_from("<H", data, 2)[0]
-                    reply = await TARGET.fci_send(session, 0x0a15, 4, struct.pack("<HH", handle, 0))
-                    assert reply.get("reply_rc") == 0, reply
-                    return
-                result = await TARGET.fci_send(session, 0x0a0b, 252, bytes(252))
-            raise AssertionError("SA query did not terminate")
-        finally:
-            await ip("xfrm", "state", "delete", *state)
 
     try:
         async with AsyncExitStack() as cleanup:
@@ -170,7 +152,7 @@ async def test_cmm_route_recovery(rig, kind, change):
                 await ip("xfrm", "state", "add", *state, "mode", "tunnel", "reqid", "16666",
                          "enc", "cbc(aes)", "0x" + "a5" * 16,
                          "auth-trunc", "hmac(sha256)", "0x" + "5a" * 32, "128")
-                cleanup.push_async_callback(remove_sa, state)
+                cleanup.push_async_callback(ip, "xfrm", "state", "delete", *state)
             else:
                 await ip("tunnel", "add", "ask-a66", "mode", "sit", "local", "0.0.0.0", "remote", REMOTE, "ttl", "64")
                 cleanup.push_async_callback(ip, "link", "del", "ask-a66")
@@ -215,5 +197,132 @@ async def test_cmm_route_recovery(rig, kind, change):
             raise AssertionError("test routes leaked after holder removal")
     finally:
         await write("/tmp/ask-route-fault", "0")
+        result = await TARGET.capture_stop(session, capture)
+        assert not result.get("splats"), result.get("splats")
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.parametrize("shared", [False, True], ids=["sole", "shared"])
+@pytest.mark.parametrize("expire", [False, True], ids=["delete", "expire"])
+async def test_cmm_sa_teardown(rig, shared, expire):
+    """Normal XFRM deletion and hard expiry must release the last SA route."""
+    session, run, read, write, local, artifacts = rig
+    capture = await TARGET.capture_start(session, ifaces=[WAN])
+    spis = {int(SPI, 0), int(SPI, 0) + 1}
+
+    async def ip(*args):
+        result = await TARGET.exec_cmd(session, ["ip", *args])
+        assert result["rc"] == 0, result
+        return result["stdout"]
+
+    async def query(code, length, key):
+        found = []
+        result = await TARGET.fci_send(session, code, length, bytes(length))
+        for _ in range(256):
+            if result.get("reply_rc") != 0:
+                assert result.get("reply_rc") == 909, result
+                return found
+            value = key(bytes.fromhex(result["payload_hex"]))
+            if value is not None:
+                found.append(value)
+            result = await TARGET.fci_send(session, code + 1, length, bytes(length))
+        raise AssertionError("hardware query did not terminate")
+
+    async def routes():
+        payload = bytearray(88)
+        struct.pack_into("<H", payload, 0, 6)
+        found = []
+        for _ in range(256):
+            result = await TARGET.fci_send(session, 0x0313, 88, payload)
+            if result.get("reply_rc") != 0:
+                assert result.get("reply_rc") == 201, result
+                return found
+            data = bytes.fromhex(result["payload_hex"])
+            if data[4:10] == MACS[0]:
+                found.append(struct.unpack_from("<I", data, 64)[0])
+            struct.pack_into("<H", payload, 0, 7)
+        raise AssertionError("route query did not terminate")
+
+    async def sas():
+        return dict(await query(0x0a0a, 252, lambda data:
+                    (struct.unpack_from("!I", data, 8)[0], struct.unpack_from("<H", data, 2)[0])
+                    if struct.unpack_from("!I", data, 8)[0] in spis else None))
+
+    async def wait_sas(expected):
+        for _ in range(120):
+            found = await sas()
+            if set(found) == expected:
+                return found
+            await asyncio.sleep(0.1)
+        raise AssertionError(("unexpected hardware SAs", found, expected))
+
+    async def delete(spi):
+        await ip("xfrm", "state", "delete", "src", local, "dst", REMOTE,
+                 "proto", "esp", "spi", hex(spi))
+
+    async def cleanup_states():
+        for spi in spis:
+            result = await TARGET.exec_cmd(session, ["ip", "xfrm", "state", "delete",
+                          "src", local, "dst", REMOTE, "proto", "esp", "spi", hex(spi)])
+            assert result["rc"] == 0 or (result["rc"] == 2 and
+                   "No such process" in result["stderr"]), result
+
+    try:
+        async with AsyncExitStack() as cleanup:
+            await write("/tmp/ask-route-fault", "0")
+            await ip("neigh", "add", GATEWAYS[0], "lladdr", MACS[0].hex(":"), "nud", "permanent", "dev", WAN)
+            cleanup.push_async_callback(ip, "neigh", "del", GATEWAYS[0], "dev", WAN)
+            await ip("route", "add", REMOTE + "/32", "via", GATEWAYS[0], "dev", WAN, "onlink")
+            cleanup.push_async_callback(ip, "route", "del", REMOTE + "/32")
+            cleanup.push_async_callback(cleanup_states)
+            # Repeat after a complete teardown to catch stale local bindings.
+            for cycle in range(2):
+                expected = set()
+                before = len(await read("/tmp/ask-route-fault.log"))
+                for index in range(1 + shared):
+                    spi = int(SPI, 0) + index
+                    expected.add(spi)
+                    await ip("xfrm", "state", "add", "src", local, "dst", REMOTE,
+                             "proto", "esp", "spi", hex(spi), "mode", "tunnel",
+                             "reqid", str(16666 + index),
+                             "enc", "cbc(aes)", "0x" + "a5" * 16,
+                             "auth-trunc", "hmac(sha256)", "0x" + "5a" * 32, "128",
+                             *(["limit", "time-hard", "6"] if expire and index == shared else []))
+                handles = await wait_sas(expected)
+                for _ in range(30):
+                    original = await routes()
+                    if len(original) == 1:
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    raise AssertionError(("missing shared hardware route", original))
+                if shared:
+                    await delete(int(SPI, 0))
+                    expected.remove(int(SPI, 0))
+                    await wait_sas(expected)
+                    assert await routes() == original, "shared SA lost its route"
+                    payload = bytearray(88)
+                    struct.pack_into("<H", payload, 0, 1)
+                    struct.pack_into("<I", payload, 64, original[0])
+                    result = await TARGET.fci_send(session, 0x0313, 88, payload)
+                    assert result.get("reply_rc") == 202, result
+                last = next(iter(expected))
+                if not expire:
+                    await delete(last)
+                await wait_sas(set())
+                for _ in range(30):
+                    if not await routes():
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    raise AssertionError("last SA left an orphaned route")
+                log = (await read("/tmp/ask-route-fault.log"))[before:]
+                command = (f"send 0a07 {struct.pack('<HHHH', handles[last], 0, 5, 0).hex()}"
+                           if expire else f"send 0a02 {struct.pack('<HH', handles[last], 0).hex()}")
+                assert command in log, ("expected teardown command", command, log)
+                (artifacts / f"sa-{'expire' if expire else 'delete'}-{shared}-{cycle}.json").write_text(
+                    json.dumps({"handles": handles, "route": original[0], "commands": log,
+                                "last_route_released": True}, indent=2))
+    finally:
         result = await TARGET.capture_stop(session, capture)
         assert not result.get("splats"), result.get("splats")

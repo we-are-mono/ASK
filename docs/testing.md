@@ -312,6 +312,10 @@ CMM route retries have host coverage in
 `tools/host_tests/test_cmm_route_retry.py`: IPv4/IPv6 tunnel, socket and SA
 holders retry changed MAC, output interface and MTU after allocation or
 programming failures, including shared bindings and local tunnel events.
+`tools/host_tests/test_cmm_sa_delete.py` covers SA deletion and dying-state
+ordering, shared route references, flow-update and command failures,
+missing entries, malformed commands and valid-state/rekey handling under
+ASan/UBSan for generic and LS1043 builds.
 
 The dedicated hardware regression restarts CMM with a temporary
 `LD_PRELOAD` library that rejects selected FCI sends before they reach
@@ -326,8 +330,10 @@ sudo env PYTHONPATH=tools pytest -c tools/pyproject.toml tools/route_tests
 
 It requires `aarch64-linux-gnu-gcc` on the host (override with
 `ASK_AARCH64_CC`). The fixture restores normal CMM startup and removes its
-routes, neighbors and holders. SA cleanup explicitly detaches the test's
-hardware route before XFRM deletion because of the separate A107 issue.
+routes, neighbors and holders. SA cleanup uses normal XFRM deletion and
+asserts that the last hardware route disappears. Additional cases repeat
+normal deletion and timed hard expiry with sole and shared SA routes,
+checking that the surviving SA retains its route until it too is removed.
 
 The ESP traffic tests use the WAN host as a kernel XFRM peer. They drive
 CMM's normal SA installation and verify payload delivery plus SEC packet

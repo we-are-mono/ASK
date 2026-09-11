@@ -34,7 +34,8 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
     memcpy(&code, (char *)msg->msg_iov[0].iov_base + 16, sizeof(code));
     memcpy(&len, (char *)msg->msg_iov[0].iov_base + 18, sizeof(len));
     if (len != msg->msg_iov[1].iov_len || len > 200
-            || (code != 0x0313 && code != 0x0332 && code != 0x0b03 && code != 0x0a15))
+            || (code != 0x0313 && code != 0x0332 && code != 0x0b03
+                && code != 0x0a15 && code != 0x0a02 && code != 0x0a07))
         return send_message(fd, msg, flags);
 
     file = open("/tmp/ask-route-fault", O_RDONLY | O_CLOEXEC);

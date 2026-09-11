@@ -307,8 +307,6 @@ int cmmKeyCatch(unsigned short fcode, unsigned short len, unsigned short *payloa
 
 				if(cmmSADelete(globalConf.ct.fci_handle, pSA_cmd) < 0)
 					rc = FCI_CB_STOP;
-				if(cmmKeyEnginetoIPSec(globalConf.ct.fci_handle, fcode, len, payload) < 0)
-					rc = FCI_CB_STOP;
 			}
 			break;
 		case FPP_CMD_NETKEY_SA_FLUSH:
@@ -334,10 +332,6 @@ int cmmKeyCatch(unsigned short fcode, unsigned short len, unsigned short *payloa
 		case FPP_CMD_NETKEY_SA_SET_STATE:
 			if(cmmSASetState(globalConf.ct.fci_key_handle, fcode, len, payload, &state_valid, &sgid)< 0)
 				rc = FCI_CB_STOP;
-			else if (cmmKeyEnginetoIPSec(globalConf.ct.fci_handle, fcode, len, payload) < 0)
-			{
-				rc = FCI_CB_STOP;
-			}
 			/* if SA cmd state valid received, check if any ctEntries can be offloaded */
 			else if (state_valid)
 				cmmUpdateCtEntriesInFlowNoSAList(sgid);
