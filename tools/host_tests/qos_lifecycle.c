@@ -34,6 +34,7 @@ static int atomic_read(atomic_t *p) { return p->value; }
 #define printk(...) ((void)0)
 #define ceetm_err(...) ((void)0)
 #define ceetm_dbg(...) ((void)0)
+#define pr_warn_ratelimited(...) ((void)0)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define cpu_to_be16(x) (x)
 #define CEETM_COMMAND_CHANNEL_MAPPING 0x1000
@@ -92,6 +93,23 @@ struct qm_mcc_ceetm_mapping_shaper_tcfc_config {
 };
 struct dpa_priv_s { void *qm_ctx; bool ceetm_en; };
 struct net_device { struct dpa_priv_s priv; };
+struct qm_fd { unsigned bpid, id; };
+struct sk_buff { unsigned id; };
+static struct sk_buff packets[4];
+static bool packet_live[4], hold_frames, fail_query;
+static unsigned pop_calls, pop_errors, pool_releases, skb_releases;
+static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
+{
+    assert(dev && dev->priv.qm_ctx && fd->bpid != 0xff);
+    assert(packet_live[fd->id]); packet_live[fd->id] = false; pool_releases++;
+}
+static struct sk_buff *_dpa_cleanup_tx_fd(const struct dpa_priv_s *priv, const struct qm_fd *fd)
+{
+    assert(priv && priv->qm_ctx && fd->bpid == 0xff && packet_live[fd->id]);
+    return &packets[fd->id];
+}
+static void dev_kfree_skb_any(struct sk_buff *skb)
+{ assert(packet_live[skb->id]); packet_live[skb->id] = false; skb_releases++; }
 struct cdx_port_info { unsigned fm_index, portid; };
 struct dpa_iface_info {
     char name[16];
@@ -118,7 +136,7 @@ enum { e_FM_PCD_PLCR_RFC_2698, e_FM_PCD_PLCR_COLOR_BLIND, e_FM_PCD_PLCR_RED,
        e_FM_PCD_DONE, e_FM_PCD_ENQ_FRAME, e_FM_PCD_DROP_FRAME, e_FM_PCD_PLCR_SHARED };
 
 static unsigned fail_at, step, allocations, channels, lfqs, fqs, profiles;
-static unsigned next_channel, mapping_id, drain_calls;
+static unsigned next_channel, mapping_id;
 static unsigned pending_enqueues, pending_frames, pending_erns, queries;
 static unsigned long jiffies;
 static bool callbacks, command_handler, release_error;
@@ -171,7 +189,16 @@ static int qman_ceetm_cq_claim(struct qm_ceetm_cq **out, struct qm_ceetm_channel
     list_add_tail(&p->node, &ch->class_queues); *out = p; return 0;
 }
 #define qman_ceetm_cq_claim_A qman_ceetm_cq_claim
-static int qman_ceetm_drain_cq(struct qm_ceetm_cq *p) { drain_calls++; return 0; }
+static int qman_ceetm_cq_pop(struct qm_ceetm_cq *p, struct qm_fd *fd)
+{
+    pop_calls++;
+    if (pop_errors) return --pop_errors ? -EIO : -EAGAIN;
+    if (!pending_frames) return 0;
+    unsigned id = --pending_frames;
+    assert(packet_live[id]);
+    *fd = (struct qm_fd){.bpid = id & 1 ? 0xff : 7, .id = id};
+    return 1;
+}
 static int qman_ceetm_cq_release(struct qm_ceetm_cq *p)
 {
     assert(list_empty(&p->bound_lfqids));
@@ -247,9 +274,10 @@ static int qman_ceetm_query_cq(unsigned id, unsigned fm, struct qm_mcr_ceetm_cq_
 {
     assert(id >= (32 << 4));
     queries++;
+    if (fail_query) { fail_query = false; return -EIO; }
     if (hw_step()) return -EIO;
     query->frm_cnt = pending_frames;
-    if (pending_frames) pending_frames--;
+    if (pending_frames && !hold_frames) pending_frames--;
     return 0;
 }
 static bool qman_eqcr_is_empty(void)
@@ -354,13 +382,32 @@ int main(void)
     assert(!dev.priv.ceetm_en && !dev.priv.qm_ctx && !ctx->chnl_map);
     assert(!qm_chnl_info[0].qm_ctx && list_empty(&qm_chnl_info[0].channel->node));
     assert(!ceetm_get_egressfq(ctx, 0, 0, 0));
-    assert(!drain_calls && queries >= MAX_SCHEDULER_QUEUES);
+    assert(!pop_calls && queries >= MAX_SCHEDULER_QUEUES);
     assert(!pending_enqueues && !pending_frames && !pending_erns);
     for (unsigned i = 0; i < MAX_SCHEDULER_QUEUES; i++)
         assert(!qm_chnl_info[0].cq_info[i].ceetmfq.net_dev);
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     assert(ceetm_assign_chnl(ctx, 0) == 0);
+    for (unsigned query_failure = 0; query_failure < 2; query_failure++) {
+        ctx->qos_enabled = dev.priv.ceetm_en = true;
+        hold_frames = true; fail_query = query_failure; pop_errors = 2;
+        pending_frames = ARRAY_SIZE(packets);
+        for (unsigned i = 0; i < ARRAY_SIZE(packets); i++) {
+            packets[i].id = i; packet_live[i] = true;
+        }
+        /* Report the drain timeout/query failure, but reclaim every packet
+         * before the interface context or its netdev reference is released. */
+        assert(cdx_disable_ceetm_on_iface(&iface) < 0);
+        assert(!pending_frames && !pop_errors && pop_calls);
+        for (unsigned i = 0; i < ARRAY_SIZE(packets); i++) assert(!packet_live[i]);
+        assert(pool_releases == 2 * (query_failure + 1));
+        assert(skb_releases == 2 * (query_failure + 1));
+        assert(!dev.priv.qm_ctx);
+        hold_frames = false;
+        assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+        assert(ceetm_assign_chnl(ctx, 0) == 0);
+    }
     qm_exit(); empty();
     assert(!dev.priv.qm_ctx && !dev.priv.ceetm_en);
     assert(start() == 0);

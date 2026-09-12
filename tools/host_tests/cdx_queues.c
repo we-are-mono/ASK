@@ -95,8 +95,10 @@ int main(void)
         assert(create_fwd_tx_fqs(&iface)); assert(!live);
         calls = pauses = fail = 0;
         assert(!create_fwd_tx_fqs(&iface)); assert(live == DPAA_FWD_TX_QUEUES);
-        for (unsigned i = 0; i < DPAA_FWD_TX_QUEUES; i++) cdx_destroy_fq(&iface.eth_info.fwd_tx_fqinfo[i]);
-        assert(!live);
+        unsigned before = syncs;
+        destroy_fwd_tx_fqs(&iface);
+        assert(!live && syncs == before + 1);
+        for (unsigned i = 0; i < DPAA_FWD_TX_QUEUES; i++) assert(!proc_fqs[i]);
     }
     struct dpa_fq *head = NULL;
     unsigned before = syncs;

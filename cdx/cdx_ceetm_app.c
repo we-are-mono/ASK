@@ -455,29 +455,27 @@ static int ceetm_cfg_td_on_class_queue(struct ceetm_chnl_info *chnl_ctx, uint32_
 	return CEETM_SUCCESS;
 }
 
-/* enqueue rejection notification handler */
-static void egress_ern_handler(struct qman_portal *portal, struct qman_fq *fq, const struct qm_mr_entry *msg)
+static void ceetm_release_fd(struct net_device *net_dev, const struct qm_fd *fd)
 {
-	const struct qm_fd *fd;
-	struct ceetm_fq *pceetm_fq;
 	struct sk_buff *skb;
 	const struct dpa_priv_s *priv;
-	uint32_t offset;
 
-	fd = &(msg->ern.fd);
-	offset = offsetof(struct ceetm_fq, egress_fq);
-	pceetm_fq = (struct ceetm_fq *)((char *)fq - offset); 
-	/* use BPID here */
-	ceetm_dbg("%s::fqid %d(%x), bpid %d, rc %d\n", __func__,
-			fq->fqid, fq->fqid, fd->bpid, msg->ern.rc); 
 	if (fd->bpid != 0xff) {
-		dpa_fd_release(pceetm_fq->net_dev, fd);
+		dpa_fd_release(net_dev, fd);
 	} else {
 		/* release SKB */
-		priv = netdev_priv(pceetm_fq->net_dev);
+		priv = netdev_priv(net_dev);
 		skb = _dpa_cleanup_tx_fd(priv, fd);
 		dev_kfree_skb_any(skb); 
 	}
+}
+
+/* enqueue rejection notification handler */
+static void egress_ern_handler(struct qman_portal *portal, struct qman_fq *fq, const struct qm_mr_entry *msg)
+{
+	struct ceetm_fq *ceetmfq = container_of(fq, struct ceetm_fq, egress_fq);
+
+	ceetm_release_fd(ceetmfq->net_dev, &msg->ern.fd);
 }
 
 /* configure any of the prio or wbfq class queue of a channel */
@@ -1775,6 +1773,29 @@ static int ceetm_sync_portals(void)
 	return atomic_read(&ret);
 }
 
+static void ceetm_drain_queue(struct classque_info *cqinfo)
+{
+	struct qm_fd fd;
+	int ret;
+
+	/* A CQ pop transfers ownership to us; it does not generate a TX
+	 * confirmation or return buffers to BMan. Keep the interface alive
+	 * until every descriptor has been reclaimed, including the last one. */
+	for (;;) {
+		ret = qman_ceetm_cq_pop(cqinfo->cq, &fd);
+		if (!ret)
+			return;
+		if (ret == 1) {
+			ceetm_release_fd(cqinfo->ceetmfq.net_dev, &fd);
+			continue;
+		}
+		if (ret != -EAGAIN)
+			pr_warn_ratelimited("cdx: cannot pop CEETM FQ %u: %d\n",
+					    cqinfo->ceetmfq.egress_fq.fqid, ret);
+		usleep_range(1000, 2000);
+	}
+}
+
 static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 {
 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
@@ -1785,8 +1806,7 @@ static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 	for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
 		if (!chinfo->cq_info[jj].cq)
 			continue;
-		/* Let queued traffic finish before the SDK discards any
-		 * remaining descriptors when releasing the class queue. */
+		/* Prefer normal transmission, then reclaim any stranded frames. */
 		for (;;) {
 			if (ceetm_get_fqcount(chinfo, jj, &count)) {
 				ret = CEETM_FAILURE;
@@ -1801,8 +1821,8 @@ static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 			}
 			usleep_range(1000, 2000);
 		}
-		if (ret && qman_ceetm_drain_cq(chinfo->cq_info[jj].cq))
-			ceetm_err("unable to drain channel %u queue %d\n", chinfo->idx, jj);
+		if (ret)
+			ceetm_drain_queue(&chinfo->cq_info[jj]);
 	}
 	return ret;
 }

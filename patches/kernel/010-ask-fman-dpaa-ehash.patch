@@ -35,6 +35,10 @@ headers (fm_ehash.h, fm_cc.h, fm_kg.h, fm_port_ext.h, fsl_fman_port.h,
 fm_muram_ext.h, lnxwrp_fsl_fman.h, dpaa_eth.h), single-TU helpers are
 static, and the stray format specifiers / unused locals are fixed.
 
+Roll back completed port PCD bindings on partial setup failures. Publish
+classification-plan groups only after allocation and count port owners
+only after a successful bind, preserving shared groups on failed setup.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  Makefile                                      |    5 +
@@ -58,7 +62,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   24 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 +++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1323 ++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |    3 +
+ .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |   57 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    |   68 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.c      |   57 +-
@@ -66,7 +70,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c     |   13 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h     |    1 +
  .../sdk_fman/Peripherals/FM/Pcd/fm_replic.c   |   14 +-
- .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  152 +-
+ .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  228 +-
  .../sdk_fman/Peripherals/FM/Port/fm_port.h    |    3 +
  .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   34 +
  .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
@@ -114,7 +118,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   38 +-
- 77 files changed, 8159 insertions(+), 2302 deletions(-)
+ 77 files changed, 8332 insertions(+), 2340 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5896,7 +5900,7 @@ index 0000000..fe00745
 +EXPORT_SYMBOL(ExternalHashGetDscpVlanpcpMapCfg);
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
-index 7c5cf467380f..40ea1bb70c84 100644
+index 7c5cf46..2138375 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 @@ -1243,6 +1243,7 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
@@ -5916,6 +5920,114 @@ index 7c5cf467380f..40ea1bb70c84 100644
          p_SchemeRegs->kgse_ekfc = knownTmp;
  
          selectTmp = 0;
+@@ -1843,7 +1846,7 @@ static t_Error BuildSchemeRegs(t_FmPcdKgScheme            *p_Scheme,
+ t_Error FmPcdKgBuildClsPlanGrp(t_Handle h_FmPcd, t_FmPcdKgInterModuleClsPlanGrpParams *p_Grp, t_FmPcdKgInterModuleClsPlanSet *p_ClsPlanSet)
+ {
+     t_FmPcd                         *p_FmPcd = (t_FmPcd*)h_FmPcd;
+-    t_FmPcdKgClsPlanGrp             *p_ClsPlanGrp;
++    t_FmPcdKgClsPlanGrp              group = {0}, *p_ClsPlanGrp = &group;
+     t_FmPcdIpcKgClsPlanParams       kgAlloc;
+     t_Error                         err = E_OK;
+     uint32_t                        oredVectors = 0;
+@@ -1860,19 +1863,8 @@ t_Error FmPcdKgBuildClsPlanGrp(t_Handle h_FmPcd, t_FmPcdKgInterModuleClsPlanGrpP
+     if (i == FM_MAX_NUM_OF_PORTS)
+         RETURN_ERROR(MAJOR, E_FULL,("No classification plan groups available."));
+ 
+-    p_FmPcd->p_FmPcdKg->clsPlanGrps[i].used = TRUE;
+-
+     p_Grp->clsPlanGrpId = (uint8_t)i;
+-
+-    if (p_Grp->numOfOptions == 0)
+-        p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId = (uint8_t)i;
+-
+-    p_ClsPlanGrp = &p_FmPcd->p_FmPcdKg->clsPlanGrps[i];
+     p_ClsPlanGrp->netEnvId = p_Grp->netEnvId;
+-    p_ClsPlanGrp->owners = 0;
+-    FmPcdSetClsPlanGrpId(p_FmPcd, p_Grp->netEnvId, p_Grp->clsPlanGrpId);
+-    if (p_Grp->numOfOptions != 0)
+-        FmPcdIncNetEnvOwners(p_FmPcd, p_Grp->netEnvId);
+ 
+     p_ClsPlanGrp->sizeOfGrp = (uint16_t)(1 << p_Grp->numOfOptions);
+     /* a minimal group of 8 is required */
+@@ -1965,6 +1957,16 @@ t_Error FmPcdKgBuildClsPlanGrp(t_Handle h_FmPcd, t_FmPcdKgInterModuleClsPlanGrpP
+         }
+     }
+ 
++    /* Publish the group and its environment reference only after all
++     * fallible allocations have completed. */
++    p_ClsPlanGrp->used = TRUE;
++    p_FmPcd->p_FmPcdKg->clsPlanGrps[p_Grp->clsPlanGrpId] = group;
++    FmPcdSetClsPlanGrpId(p_FmPcd, p_Grp->netEnvId, p_Grp->clsPlanGrpId);
++    if (p_Grp->numOfOptions == 0)
++        p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId = p_Grp->clsPlanGrpId;
++    else
++        FmPcdIncNetEnvOwners(p_FmPcd, p_Grp->netEnvId);
++
+     return E_OK;
+ }
+ 
+@@ -2481,6 +2483,7 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
+     t_FmPcdKgClsPlanGrp                     *p_ClsPlanGrp;
+     t_FmPcdKgInterModuleClsPlanSet          *p_ClsPlanSet;
+     t_Error                                 err;
++    bool                                    newGroup = FALSE;
+ 
+     /* This function is issued only from FM_PORT_SetPcd which locked all PCD modules,
+        so no need for lock here */
+@@ -2516,6 +2519,7 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
+             RETURN_ERROR(MINOR, err, NO_MSG);
+         }
+         *p_ClsPlanGrpId = p_GrpParams->clsPlanGrpId;
++        newGroup = TRUE;
+ 
+         if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
+         {
+@@ -2524,6 +2528,7 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
+             if (err)
+             {
+                 XX_Free(p_ClsPlanSet);
++                FmPcdKgDestroyClsPlanGrp(h_FmPcd, *p_ClsPlanGrpId);
+                 RETURN_ERROR(MAJOR, err, NO_MSG);
+             }
+         }
+@@ -2534,26 +2539,20 @@ t_Error FmPcdKgSetOrBindToClsPlanGrp(t_Handle h_FmPcd, uint8_t hardwarePortId, u
+         XX_Free(p_ClsPlanSet);
+     }
+ 
+-    /* Set caller parameters     */
+-
+-    /* mark if this is an empty classification group */
+-    if (*p_ClsPlanGrpId == p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId)
+-        *p_IsEmptyClsPlanGrp = TRUE;
+-    else
+-        *p_IsEmptyClsPlanGrp = FALSE;
+-
+-    p_ClsPlanGrp = &p_FmPcd->p_FmPcdKg->clsPlanGrps[*p_ClsPlanGrpId];
+-
+-   /* increment owners number */
+-    p_ClsPlanGrp->owners++;
+-
+-    /* copy options array for port */
+-    memcpy(p_OptArray, &p_FmPcd->p_FmPcdKg->clsPlanGrps[*p_ClsPlanGrpId].optArray, FM_PCD_MAX_NUM_OF_OPTIONS(FM_PCD_MAX_NUM_OF_CLS_PLANS)*sizeof(protocolOpt_t));
+-
+-    /* bind port to the new or existing group */
++    /* Bind before publishing a port owner. A refused bind must leave a
++     * shared group alone and release a group created by this attempt. */
+     err = BindPortToClsPlanGrp(p_FmPcd, hardwarePortId, p_GrpParams->clsPlanGrpId);
+     if (err)
++    {
++        if (newGroup)
++            FmPcdKgDestroyClsPlanGrp(h_FmPcd, *p_ClsPlanGrpId);
+         RETURN_ERROR(MINOR, err, NO_MSG);
++    }
++
++    *p_IsEmptyClsPlanGrp = (*p_ClsPlanGrpId == p_FmPcd->p_FmPcdKg->emptyClsPlanGrpId);
++    p_ClsPlanGrp = &p_FmPcd->p_FmPcdKg->clsPlanGrps[*p_ClsPlanGrpId];
++    p_ClsPlanGrp->owners++;
++    memcpy(p_OptArray, p_ClsPlanGrp->optArray, sizeof(p_ClsPlanGrp->optArray));
+ 
+     return E_OK;
+ }
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.h
 index f55fe8bb0bb4..29c01bd97627 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.h
@@ -6233,7 +6345,7 @@ index 2f89c05f74e8..20390219276f 100644
          /* update the last bit in the shadow ad */
          FillReplicAdOfTypeResult(p_FmPcd->p_CcShadow, last);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
-index 3662edc25213..428143cb13d8 100644
+index 3662edc..7d281da 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 @@ -53,6 +53,11 @@
@@ -6279,7 +6391,127 @@ index 3662edc25213..428143cb13d8 100644
              return TRUE;
          case (e_FM_PORT_COUNTERS_RX_FILTER_FRAME):
              if (p_FmPort->portType == e_FM_PORT_TYPE_OH_HOST_COMMAND)
-@@ -2154,6 +2167,89 @@ t_Error FmPortGetSetCcParams(t_Handle h_FmPort,
+@@ -1093,7 +1106,14 @@ static void FmPortCheckNApplyMacsec(t_Handle h_FmPort)
+     }
+ }
+ 
+-static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
++struct fm_port_pcd_bindings {
++    bool cc;
++    bool clsPlan;
++    bool schemes;
++};
++
++static t_Error ConfigurePcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams,
++                           struct fm_port_pcd_bindings *bindings)
+ {
+     t_Error err = E_OK;
+     uint32_t tmpReg;
+@@ -1184,14 +1204,6 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+             RETURN_ERROR(MAJOR, E_INVALID_STATE, ("invalid pcdSupport"));
+     }
+ 
+-    if ((p_FmPort->pcdEngines & FM_PCD_PRS)
+-            && (p_PcdParams->p_PrsParams->numOfHdrsWithAdditionalParams
+-                    > FM_PCD_PRS_NUM_OF_HDRS))
+-        RETURN_ERROR(
+-                MAJOR,
+-                E_INVALID_VALUE,
+-                ("Port parser numOfHdrsWithAdditionalParams may not exceed %d", FM_PCD_PRS_NUM_OF_HDRS));
+-
+     /* check that parameters exist for each and only each defined engine */
+     if ((!!(p_FmPort->pcdEngines & FM_PCD_PRS) != !!p_PcdParams->p_PrsParams)
+             || (!!(p_FmPort->pcdEngines & FM_PCD_KG)
+@@ -1203,6 +1215,14 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+                 E_INVALID_STATE,
+                 ("PCD initialization structure is not consistent with pcdSupport"));
+ 
++    if ((p_FmPort->pcdEngines & FM_PCD_PRS)
++            && (p_PcdParams->p_PrsParams->numOfHdrsWithAdditionalParams
++                    > FM_PCD_PRS_NUM_OF_HDRS))
++        RETURN_ERROR(
++                MAJOR,
++                E_INVALID_VALUE,
++                ("Port parser numOfHdrsWithAdditionalParams may not exceed %d", FM_PCD_PRS_NUM_OF_HDRS));
++
+     /* get PCD registers pointers */
+     switch (p_FmPort->portType)
+     {
+@@ -1236,6 +1256,7 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+ 
+         WRITE_UINT32(*p_BmiCcBase, ccTreePhysOffset);
+         p_FmPort->ccTreeId = p_PcdParams->p_CcParams->h_CcTree;
++        bindings->cc = TRUE;
+     }
+ 
+     if (p_FmPort->pcdEngines & FM_PCD_KG)
+@@ -1256,6 +1277,7 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+             RETURN_ERROR(MAJOR, E_INVALID_VALUE,
+                          ("FmPcdKgSetOrBindToClsPlanGrp failed. "));
+ 
++        bindings->clsPlan = TRUE;
+         p_FmPort->useClsPlan = !isEmptyClsPlanGrp;
+ 
+         schemeBind.netEnvId = p_FmPort->netEnvId;
+@@ -1284,6 +1306,7 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+         err = FmPcdKgBindPortToSchemes(p_FmPort->h_FmPcd, &schemeBind);
+         if (err)
+             RETURN_ERROR(MAJOR, err, NO_MSG);
++        bindings->schemes = TRUE;
+     }
+ 
+     /***************************/
+@@ -1621,6 +1644,49 @@ static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
+     return E_OK;
+ }
+ 
++/* FM_PORT_SetPCD has not attached the port or counted its net environment
++ * yet. Undo only completed bindings; DeletePcd assumes all were acquired. */
++static t_Error SetPcd(t_FmPort *p_FmPort, t_FmPortPcdParams *p_PcdParams)
++{
++    struct fm_port_pcd_bindings bindings = {0};
++    t_FmPcdKgInterModuleBindPortToSchemes schemeBind;
++    t_Error err, cleanupErr;
++
++    if (p_FmPort->pcdEngines)
++        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD is already configured"));
++
++    err = ConfigurePcd(p_FmPort, p_PcdParams, &bindings);
++    if (!err)
++        return E_OK;
++
++    if (bindings.schemes)
++    {
++        GetPortSchemeBindParams(p_FmPort, &schemeBind);
++        cleanupErr = FmPcdKgUnbindPortToSchemes(p_FmPort->h_FmPcd, &schemeBind);
++        if (cleanupErr)
++            REPORT_ERROR(MAJOR, cleanupErr, ("Failed to roll back port schemes"));
++    }
++    if (bindings.clsPlan)
++    {
++        cleanupErr = FmPcdKgDeleteOrUnbindPortToClsPlanGrp(p_FmPort->h_FmPcd,
++                            p_FmPort->hardwarePortId, p_FmPort->clsPlanGrpId);
++        if (cleanupErr)
++            REPORT_ERROR(MAJOR, cleanupErr, ("Failed to roll back classification plan"));
++    }
++    if (bindings.cc)
++    {
++        cleanupErr = FmPcdCcUnbindTree(p_FmPort->h_FmPcd, p_FmPort->ccTreeId);
++        if (cleanupErr)
++            REPORT_ERROR(MAJOR, cleanupErr, ("Failed to roll back classifier root"));
++    }
++    p_FmPort->pcdEngines = 0;
++    p_FmPort->schemesPerPortVector = 0;
++    p_FmPort->ccTreeId = NULL;
++    p_FmPort->useClsPlan = FALSE;
++    memset(p_FmPort->optArray, 0, sizeof(p_FmPort->optArray));
++    return err;
++}
++
+ static t_Error DeletePcd(t_FmPort *p_FmPort)
+ {
+     t_Error err = E_OK;
+@@ -2154,6 +2220,89 @@ t_Error FmPortGetSetCcParams(t_Handle h_FmPort,
  
      return E_OK;
  }
@@ -6369,7 +6601,7 @@ index 3662edc25213..428143cb13d8 100644
  /*********************** End of inter-module routines ************************/
  
  /****************************************/
-@@ -3939,6 +4035,21 @@ t_Error FM_PORT_SetErrorsRoute(t_Handle h_FmPort, fmPortFrameErrSelect_t errs)
+@@ -3939,6 +4088,21 @@ t_Error FM_PORT_SetErrorsRoute(t_Handle h_FmPort, fmPortFrameErrSelect_t errs)
      return E_OK;
  }
  
@@ -6391,7 +6623,7 @@ index 3662edc25213..428143cb13d8 100644
  t_Error FM_PORT_SetAllocBufCounter(t_Handle h_FmPort, uint8_t poolId,
                                     bool enable)
  {
-@@ -4490,6 +4601,8 @@ t_Error FM_PORT_PcdPlcrAllocProfiles(t_Handle h_FmPort, uint16_t numOfProfiles)
+@@ -4490,6 +4654,8 @@ t_Error FM_PORT_PcdPlcrAllocProfiles(t_Handle h_FmPort, uint16_t numOfProfiles)
  
      return E_OK;
  }
@@ -6400,7 +6632,19 @@ index 3662edc25213..428143cb13d8 100644
  
  t_Error FM_PORT_PcdPlcrFreeProfiles(t_Handle h_FmPort)
  {
-@@ -5240,7 +5353,14 @@ t_Error FM_PORT_DeletePCD(t_Handle h_FmPort)
+@@ -4919,6 +5085,11 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
+ 		return ERROR_CODE(E_BUSY);
+ 	}
+ 
++	if (p_FmPort->pcdEngines) {
++		RELEASE_LOCK(p_FmPort->lock);
++		RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD is already configured"));
++	}
++
+ 	p_FmPort->h_FmPcd = FmGetPcdHandle(p_FmPort->h_Fm);
+ 	ASSERT_COND(p_FmPort->h_FmPcd);
+ 
+@@ -5240,7 +5411,14 @@ t_Error FM_PORT_DeletePCD(t_Handle h_FmPort)
              RETURN_ERROR(MAJOR, err, NO_MSG);
          }
          p_FmPort->h_ReassemblyTree = NULL;
@@ -6416,7 +6660,7 @@ index 3662edc25213..428143cb13d8 100644
  
      return err;
  }
-@@ -5482,3 +5602,31 @@ t_Error FM_PORT_GetIPv4OptionsCount(t_Handle h_FmPort,
+@@ -5482,3 +5660,31 @@ t_Error FM_PORT_GetIPv4OptionsCount(t_Handle h_FmPort,
  
      return E_OK;
  }

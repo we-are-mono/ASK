@@ -255,6 +255,11 @@ pytest -c tools/pyproject.toml tools/host_tests -k qos
 The SDK regression uses the patched kernel source from the build tree.
 Set `ASK_KERNEL_SOURCE` to test another patched tree; this check skips if
 the source is unavailable. The CDX host regression always runs.
+Forced-drain cases hold frames in a queue until timeout or fail its query,
+then verify that pool buffers and skb-backed frames are reclaimed before
+the interface context is released. The SDK CQ-pop test checks command and
+descriptor byte order, portal-result lifetime, prefetch retries, errors,
+and a final response containing both a frame and the empty-queue flag.
 
 On the DUT, the QoS tests query all 128 queues and verify that rejected
 assignments and out-of-range queries leave port configuration unchanged.
@@ -278,6 +283,13 @@ kernel source. Run them with:
 ```sh
 pytest -c tools/pyproject.toml tools/host_tests/test_dpa_lifecycle.py
 ```
+
+`tools/host_tests/test_sdk_port_pcd.py` also compiles the SDK port-setup and
+classification-plan functions with their real private types. It checks
+failures after classifier-root, plan and scheme binding, parser validation,
+plan allocation and programming, shared owners, and retry on the same port.
+These failures happen inside the SDK operations, beyond the ioctl boundary
+mocked by the loader lifecycle test.
 
 On the DUT, DPA tests verify that repeated loader invocations stop at the
 initialization check, that the control device excludes a second opener,
@@ -306,7 +318,9 @@ The fault controls `dpa_init_fail_site` and `dpa_init_fail_step` are built
 only into the test image. Production builds omit them. Host coverage in
 `tools/host_tests/test_cdx_startup.py` exercises the SET_PARAMS transaction,
 partial userspace copies, allocation failures and asynchronous queue
-retirement under ASan/UBSan.
+retirement under ASan/UBSan. Both partial-creation rollback and complete
+interface teardown must drain all transmit queues and finish callbacks
+before releasing their embedded FQ storage.
 
 CMM route retries have host coverage in
 `tools/host_tests/test_cmm_route_retry.py`: IPv4/IPv6 tunnel, socket and SA

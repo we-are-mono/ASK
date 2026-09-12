@@ -197,24 +197,22 @@ err_ret:
 	return FAILURE;
 }
 
-static int destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
+static void cdx_drain_fq(struct qman_fq *fq);
+
+static void destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 {
 	struct eth_iface_info *eth_info = &(iface_info->eth_info);
 	struct qman_fq *fq;
 	uint32_t ii;
 
+	/* Keep the embedded FQs alive through asynchronous retirement and
+	 * the final callbacks before the caller frees the interface. */
+	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++)
+		cdx_drain_fq(&eth_info->fwd_tx_fqinfo[ii]);
+	synchronize_net();
+
 	fq = &eth_info->fwd_tx_fqinfo[0];
 	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
-		if (qman_retire_fq(fq, NULL)) {
-			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		if (qman_oos_fq(fq)) {
-			DPA_ERROR("%s::Failed to retire FQ %x(%d)\n", 
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 #ifdef DEVMAN_DEBUG
@@ -223,7 +221,6 @@ static int destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 #endif
 		fq++;
 	}
-	return 0;
 }
 
 struct net_device *find_osdev_by_fman_params(uint32_t fm_idx, uint32_t port_idx,

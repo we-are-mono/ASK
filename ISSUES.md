@@ -63,6 +63,18 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
+- [ ] **A111. SDK outer PCD API error paths remain non-transactional.**
+  Pre-existing in `sdk_fman/Peripherals/FM/Port/fm_port.c`: several
+  `FM_PORT_SetPCD` validation/allocation exits after `TRY_LOCK` omit its
+  release; errors after parser-statistics registration or the net-environment
+  owner increment call `DeletePcd`, which does not undo those acquisitions.
+  `FM_PORT_DeletePCD` also decrements the environment owner before attempting
+  the global PCD lock, so a refused lock makes a subsequent retry unbalanced.
+  A108 covers failures within `SetPcd` and classification-plan acquisition;
+  these outer paths need a separate transaction audit, including reassembly
+  tree/manipulation state, lock ownership, and cleanup failures. Add tests
+  through the public APIs before restructuring them.
+
 ## Feature enablement (not bugs)
 
 Config-gated capabilities that are OFF in the current product — not defects.
@@ -845,3 +857,12 @@ file's git history.
   counted route. Expiry route deletion now uses the CDX connection instead
   of the key-engine connection. Host error/ordering coverage and repeated
   hardware deletion/expiry checks cover sole and shared routes.
+
+- [x] **A108.** Partial SDK `SetPcd` failures pinned classifier bindings —
+  fixed (_this commit_): unwind completed stages and failed classification-plan acquisition.
+
+- [x] **A109.** Forced CEETM draining discarded descriptors and leaked buffers —
+  fixed (_this commit_): preserve portal results and reclaim every returned FD in CDX.
+
+- [x] **A110.** Interface removal freed TX FQs during asynchronous retirement —
+  fixed (_this commit_): drain every queue and finish callbacks before destroying storage.
