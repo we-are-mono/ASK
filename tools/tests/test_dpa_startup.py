@@ -187,3 +187,63 @@ print('reassembly creation and attachment rejected on %d ports' % checked)
         con.login("root", None)
         result = con.run("python3 -c " + shlex.quote(script), timeout=20)
         assert result.rc == 0, result.stdout
+
+
+async def test_dpa_unused_scheme_teardown(splat_window):
+    # Native arm64 layouts are checked by sdk_port_ioctl.c. Scheme 31 is
+    # outside the shipped FMC configuration; this test never binds it.
+    # Use ordinary schemes: A119 tracks the public ioctl's direct-flag
+    # layout mismatch. Direct scheme deletion is covered by the SDK host test.
+    script = """
+import ctypes, os, struct
+libc = ctypes.CDLL(None, use_errno=True)
+fd = os.open('/dev/fm0-pcd', os.O_RDWR)
+
+def command(number, data, succeeds=True):
+    buffer = (ctypes.c_ubyte * len(data)).from_buffer(data)
+    rc = libc.ioctl(fd, ctypes.c_ulong(number), ctypes.byref(buffer))
+    if succeeds:
+        assert rc == 0, (hex(number), ctypes.get_errno())
+    else:
+        assert rc == -1, ('unexpected success', hex(number))
+
+scheme = env = None
+try:
+    for cycle in range(64):
+        params = bytearray(976)
+        params[0] = 1
+        struct.pack_into('<I', params, 4, 2)  # One Ethernet distinction unit.
+        command(0xc3d0e128, params)
+        env = params[968:976]
+        assert any(env)
+        params = bytearray(1368)
+        params[8] = 31
+        params[24:32] = env
+        params[32] = 1
+        struct.pack_into('<I', params, 1080, 1)  # Nonzero base FQID; never used.
+        struct.pack_into('<I', params, 1320, 1)  # DONE
+        struct.pack_into('<I', params, 1328, 1)  # DROP
+        command(0xc558e12c, params)
+        scheme = params[1360:1368]
+        assert any(scheme)
+        command(0x4008e129, env, succeeds=False)  # Still owned by the scheme.
+        command(0x4008e12d, scheme)
+        stale = scheme
+        scheme = None
+        command(0x4008e12d, stale, succeeds=False)
+        command(0x4008e129, env)
+        env = None
+    print('64 unused scheme teardown cycles passed, including netenv ownership and stale cookies')
+finally:
+    try:
+        if scheme is not None:
+            command(0x4008e12d, scheme)
+        if env is not None:
+            command(0x4008e129, env)
+    finally:
+        os.close(fd)
+"""
+    with Console.target() as con:
+        con.login("root", None)
+        result = con.run("python3 -c " + shlex.quote(script), timeout=45)
+        assert result.rc == 0, result.stdout

@@ -45,6 +45,24 @@ static t_Error LnxwrpFmIOCTL(t_LnxWrpFmDev *dev, unsigned cmd, unsigned long arg
 int main(void)
 {
     struct file file = {.private_data = (void *)1};
+    /* Native arm64 layouts used by the unused-scheme teardown test. */
+    assert(FM_PCD_IOC_KG_SCHEME_SET == 0xc558e12c && FM_PCD_IOC_KG_SCHEME_DELETE == 0x4008e12d);
+    assert(sizeof(ioc_fm_pcd_kg_scheme_params_t) == 1368);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, scm_id) == 8);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, always_direct) == 16);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, net_env_params.net_env_id) == 24);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, net_env_params.num_of_distinction_units) == 32);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, net_env_params.unit_ids) == 33);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, base_fqid) == 1080);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, next_engine) == 1320);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, kg_next_engine_params.done_action) == 1328);
+    assert(offsetof(ioc_fm_pcd_kg_scheme_params_t, id) == 1360);
+    assert(FM_PCD_IOC_NET_ENV_CHARACTERISTICS_SET == 0xc3d0e128);
+    assert(FM_PCD_IOC_NET_ENV_CHARACTERISTICS_DELETE == 0x4008e129);
+    assert(sizeof(ioc_fm_pcd_net_env_params_t) == 976);
+    assert(offsetof(ioc_fm_pcd_net_env_params_t, units) == 4);
+    assert(offsetof(ioc_fm_pcd_net_env_params_t, id) == 968);
+    assert(e_IOC_FM_PCD_DONE == 1 && e_IOC_FM_PCD_DROP_FRAME == 1 && e_IOC_NET_HEADER_TYPE_ETH == 2);
     /* These native layouts also drive the UART hardware rejection test. */
     assert(FM_PCD_IOC_MANIP_NODE_SET == 0xc1d0e13f && sizeof(ioc_fm_pcd_manip_params_t) == 464);
     assert(e_IOC_FM_PCD_MANIP_REASSEM == 1);

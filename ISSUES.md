@@ -63,16 +63,44 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A116. SDK scheme deletion commits software teardown before HC success.**
-  Pre-existing in `fm_kg.c`: `FM_PCD_KgSchemeDelete` clears required-action
-  state before checking owners, then `InvalidateSchemeSw` drops the netenv
-  reference and marks the scheme invalid before the fallible host command.
-  The HC path returns the scheme lock to the pool even on failure and leaves
-  its pointer set. Retrying can repeat the owner decrement and lock release
-  while hardware may still contain the scheme. This affects ordinary schemes
-  independently of the removed reassembly feature. Make failed deletion
-  preserve software ownership and lock state; test busy refusal, HC failure
-  and retry against the actual scheme helpers.
+- [ ] **A117. SDK host-command failures recycle buffers still marked in flight.**
+  Pre-existing in `hc.c`: `EnQFrm` sets `enqueued[seq]` before enqueue but
+  does not clear it when enqueue fails. On completion timeout, HC callers
+  still call `PutBuf`, allowing `GetBuf` to reuse the frame and sequence while
+  hardware may own them. Retry can assert or overwrite an in-flight command;
+  a late confirmation can then complete the wrong operation. This affects
+  shared HC transport, beyond A116's scheme software ownership fix. Clear
+  state on rejected enqueue; retain timed-out buffers until confirmation or
+  a proven drain/reset, and define caller recovery before reusing affected
+  hardware objects. Test enqueue refusal, timeout, pool exhaustion, late
+  confirmation and retry against the actual transport helpers. Fault-path
+  control-plane issue; normal confirmed commands are unaffected.
+
+- [ ] **A118. SDK scheme creation/modification does not unwind programming failures.**
+  Pre-existing in `fm_kg.c`: `FM_PCD_KgSchemeSet` only reports a missing
+  scheme lock and continues; failed new-scheme construction or HC programming
+  returns its lock without clearing the saved pointer. The direct-register
+  path ignores `WriteKgarWait` errors and publishes the scheme anyway.
+  Modification also lets `BuildSchemeRegs` change live software fields before
+  the fallible HC update, so a rejected command leaves the old hardware and
+  changed software. Make creation fail closed, retire failed acquisitions
+  once, and preserve the prior scheme on failed modification. Test lock
+  allocation failure, construction/programming failure and retry; coordinate
+  ambiguous HC timeout recovery with A117. Separate from A116's deletion fix.
+
+- [ ] **A119. Public KG scheme ioctl misinterprets the direct-scheme flag.**
+  Confirmed on the KASAN DUT during A116 validation: native arm64
+  `ioc_fm_pcd_kg_scheme_params_t.always_direct` is at byte 16, while SDK
+  `t_FmPcdKgSchemeParams` has `shared` there and `alwaysDirect` at byte 17.
+  `LnxwrpFmPcdIOCTL` casts the public structure directly to the SDK type.
+  A zero-filled public direct-scheme request with no netenv therefore enters
+  `BuildSchemeRegs` as non-direct and NULL-dereferences in `FmPcdGetNetEnvId`.
+  Both layouts and the cast predate A116. Explicitly translate the flag at
+  the kernel/fmlib boundaries, preserve the native/compat ABI, and reject a
+  missing netenv for ordinary schemes. Check fmlib's SDK-structure copy and
+  compat translation together; test both flag values and missing-netenv
+  rejection through the actual ioctl path. Ordinary schemes with a valid
+  netenv work; always-direct SDK deletion is covered by the host fixture.
 
 ## Feature enablement (not bugs)
 
@@ -882,3 +910,6 @@ file's git history.
 
 - [x] **A115.** FM port allocation left partial charges and locked error exits —
   fixed (_this commit_): validate before committing resources; serialize updates and preserve failed FIFO resize state.
+
+- [x] **A116.** Scheme deletion discarded live software ownership before hardware success —
+  fixed (_this commit_): preserve refused/failed deletion state; commit once and retire the scheme lock atomically.
