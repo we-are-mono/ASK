@@ -48,8 +48,9 @@ static void prepare_sdk(void)
     kg.numOfSchemes = 8;
     kg.schemesIds[7] = 7;
     SCHEME->h_FmPcd = &pcd;
-    SCHEME->p_Lock = &scheme_lock;
+    SCHEME->p_Lock = want_modify ? &scheme_lock : NULL;
     SCHEME->valid = want_modify;
+    SCHEME->netEnvId = want_direct ? ILLEGAL_NETENV : 0;
     lock_calls = hardware_calls = 0;
 }
 void *XX_Malloc(uint32_t size)
@@ -76,7 +77,9 @@ static t_Error BuildSchemeRegs(t_Handle scheme, t_FmPcdKgSchemeParams *params,
                                struct fman_kg_scheme_regs *regs)
 {
     sdk_calls++;
-    assert(scheme == SCHEME && SCHEME->h_FmPcd == &pcd);
+    t_FmPcdKgScheme *candidate = scheme;
+    assert(candidate != SCHEME && candidate->h_FmPcd == &pcd);
+    assert(candidate->p_Lock == &scheme_lock && scheme_lock.flag);
     assert(!params->shared && params->alwaysDirect == want_direct && params->modify == want_modify);
     assert(params->netEnvParams.h_NetEnv == (want_direct ? NULL : &pcd.netEnvs[0]));
     assert(params->baseFqid == want_fqid && (int)params->nextEngine == (int)want_engine);
@@ -85,13 +88,22 @@ static t_Error BuildSchemeRegs(t_Handle scheme, t_FmPcdKgSchemeParams *params,
     if (want_engine == e_IOC_FM_PCD_CC) assert(params->kgNextEngineParams.cc.h_CcTree == &cc_tree);
     else assert(params->kgNextEngineParams.doneAction == e_FM_PCD_DROP_FRAME);
     memset(regs, 0, sizeof(*regs));
+    candidate->netEnvId = want_direct ? ILLEGAL_NETENV : 0;
     return refuse_sdk ? E_INVALID_VALUE : E_OK;
 }
+void XX_Print(char *format, ...) { assert(!"unexpected SDK assertion"); }
+void XX_Exit(int status) { assert(!"unexpected SDK exit"); }
+uint32_t XX_LockIntrSpinlock(t_Handle handle) { return 0; }
+void XX_UnlockIntrSpinlock(t_Handle handle, uint32_t flags) {}
+uint32_t FmPcdLock(t_Handle handle) { assert(handle == &pcd); return 0; }
+void FmPcdUnlock(t_Handle handle, uint32_t flags) { assert(handle == &pcd); }
+void FmPcdIncNetEnvOwners(t_Handle handle, uint8_t id) { assert(handle == &pcd && !id); }
+void FmPcdDecNetEnvOwners(t_Handle handle, uint8_t id) { assert(handle == &pcd && !id); }
 bool FmPcdKgIsSchemeValidSw(t_Handle scheme) { return ((t_FmPcdKgScheme *)scheme)->valid; }
 t_FmPcdLock *FmPcdAcquireLock(t_Handle handle)
 { assert(handle == &pcd); lock_calls++; return &scheme_lock; }
 void FmPcdReleaseLock(t_Handle handle, t_FmPcdLock *lock)
-{ assert(handle == &pcd && lock == &scheme_lock); lock_calls++; }
+{ assert(handle == &pcd && lock == &scheme_lock); lock_calls++; lock->flag = false; }
 static bool KgSchemeFlagTryLock(t_FmPcdKgScheme *scheme)
 { assert(scheme == SCHEME && !scheme_lock.flag); lock_calls++; scheme_lock.flag = true; return true; }
 static void KgSchemeFlagUnlock(t_FmPcdKgScheme *scheme)

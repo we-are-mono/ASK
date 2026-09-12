@@ -247,6 +247,13 @@ try:
         assert params[1360:1368] == scheme
         assert params[8:16] == scheme  # Copy-out retains public cookies.
         assert params[24:32] == (env if env is not None else bytes(8))
+        # Fail at the end of register construction, after it has built the
+        # candidate netenv/match vector. Delete immediately afterward: an
+        # in-place builder would lose the original netenv reference here.
+        invalid = bytearray(params)
+        invalid[16] = 1  # Candidate is direct even for an ordinary live scheme.
+        struct.pack_into('<I', invalid, 1080, 0x1000000)  # FQID exceeds 24 bits.
+        command(0xc558e12c, invalid, succeeds=False)
         if env is not None:
             command(0x4008e129, env, succeeds=False)  # Still owned by the scheme.
         command(0x4008e12d, scheme)

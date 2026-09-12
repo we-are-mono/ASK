@@ -407,8 +407,9 @@ switch to direct register programming. A late confirmation releases the
 frame only; it does not reconcile caller software state or reopen transport.
 FMan sysfs bind/unbind is disabled because this built-in driver has no proven
 DMA drain/reset path and its remove callback cannot veto devres cleanup.
-This recovery contract does not provide higher-level operation rollback;
-scheme creation/modification rollback remains tracked in A118.
+Failed scheme modification preserves the previous software state; failed
+creation leaves the scheme invalid. This does not establish hardware
+rollback after an HC timeout; the board-reset requirement still applies.
 
 `tools/host_tests/test_sdk_hc_transport.py` compiles the actual SDK pool,
 enqueue, completion and cleanup helpers together with the Linux QMan wrapper
@@ -418,3 +419,28 @@ allocation failure. Set `ASK_KERNEL_SOURCE` to a patched kernel tree, or use
 the default build tree, and run it with the other host tests. Hardware smoke,
 scheme lifecycle and offload tests cover normal confirmed commands; the
 transport timeout injections run on the host.
+
+## SDK scheme programming failures
+
+`tools/host_tests/test_sdk_scheme_set.py` compiles the production register
+builder, scheme set/delete paths, lock pool, netenv references and HC
+transport under ASan/UBSan. It exercises lock/spinlock allocation failure,
+early and late construction errors, extraction allocation failure, rejected
+HC enqueues, direct-register errors and retry. Failed new schemes must leave
+no saved lock or ownership; failed modifications must leave the existing
+scheme and netenv references intact. A lock reassigned after failure must
+remain untouched by stale deletion or retry.
+
+Successful replacement transfers netenv ownership once, preserves bindings
+and required-action bookkeeping, and publishes the newly built configuration
+only after programming succeeds. The tests also overlap a second creator,
+modification and binding attempt with programming. Accepted commands with
+missing or late confirmations exercise the A117 reset requirement using the
+actual HC transport; the fixture allows hardware to have changed despite
+the timeout and verifies that retries cannot submit another command.
+
+On the DUT, the ordinary/direct scheme lifecycle regression in
+`tools/tests/test_dpa_startup.py` includes a late construction failure with
+an out-of-range FQID. For an ordinary scheme the rejected candidate changes
+to direct mode; deleting the original immediately afterward must still
+release its original netenv reference. These are private, unbound schemes.

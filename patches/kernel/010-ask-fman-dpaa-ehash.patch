@@ -72,6 +72,10 @@ Track HC buffer ownership through enqueue rejection, completion and
 timeout. Quarantine accepted unconfirmed frames and latch timeout failure
 until board reset; keep QMan acceptance separate from SDK completion.
 
+Build KG scheme changes in a private candidate, publish only after
+successful programming, and balance failed lock acquisitions. Preserve
+existing scheme ownership on failure and transfer netenv references on commit.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  Makefile                                           |    5 
@@ -95,7 +99,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h  |   26 
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h        | 1374 ++++++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c         | 1211 ++++++++++
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c  |  142 +
+ .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c  |  247 +-
  .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.h  |    1 
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c         | 1439 +-----------
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.h         |  111 -
@@ -119,7 +123,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/inc/Peripherals/fm_ext.h    |   15 
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h          |    1 
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h        |    1 
- .../sdk_fman/inc/Peripherals/fm_pcd_ext.h          |  210 +-
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h          |  215 +-
  .../sdk_fman/inc/Peripherals/fm_port_ext.h         |   42 
  .../sdk_fman/inc/Peripherals/fm_vsp_ext.h          |   14 
  .../freescale/sdk_fman/inc/flib/fsl_fman_port.h    |    6 
@@ -155,7 +159,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                     |    5 
  net/core/rtnetlink.c                               |   19 
  net/core/skbuff.c                                  |   38 
- 81 files changed, 9048 insertions(+), 5024 deletions(-)
+ 81 files changed, 9122 insertions(+), 5060 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -6388,7 +6392,7 @@ index 0000000..ab643e7
 +EXPORT_SYMBOL(ExternalHashGetDscpVlanpcpMapCfg);
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
-index 7c5cf46..8da5559 100644
+index 7c5cf46..2740a54 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 @@ -873,9 +873,9 @@ static t_Error BindPortToClsPlanGrp(t_FmPcd *p_FmPcd, uint8_t hardwarePortId, ui
@@ -6577,21 +6581,169 @@ index 7c5cf46..8da5559 100644
                  RETURN_ERROR(MAJOR, E_NO_MEMORY, ("Classification plan set"));
              }
              memset(p_ClsPlanSet, 0, sizeof(t_FmPcdKgInterModuleClsPlanSet));
-@@ -2957,6 +2960,13 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
+@@ -2955,17 +2958,26 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
+     uint32_t                            tmpKgarReg;
+     uint32_t                            intFlags;
      uint8_t                             physicalSchemeId, relativeSchemeId = 0;
-     t_FmPcdKgScheme                     *p_Scheme;
- 
+-    t_FmPcdKgScheme                     *p_Scheme;
++    t_FmPcdKgScheme                     *p_Scheme, candidate = {0};
++    t_FmPcdLock                         *p_Lock;
++
 +    SANITY_CHECK_RETURN_VALUE(p_SchemeParams, E_INVALID_HANDLE, NULL);
 +    if (!p_SchemeParams->alwaysDirect && !p_SchemeParams->netEnvParams.h_NetEnv)
 +    {
 +        REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("Ordinary scheme requires a network environment"));
 +        return NULL;
 +    }
-+
+ 
      if (p_SchemeParams->modify)
      {
          p_Scheme = (t_FmPcdKgScheme *)p_SchemeParams->id.h_Scheme;
-@@ -3085,44 +3095,52 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
++        SANITY_CHECK_RETURN_VALUE(p_Scheme, E_INVALID_HANDLE, NULL);
+         p_FmPcd = p_Scheme->h_FmPcd;
+ 
+         SANITY_CHECK_RETURN_VALUE(p_FmPcd, E_INVALID_HANDLE, NULL);
+         SANITY_CHECK_RETURN_VALUE(p_FmPcd->p_FmPcdKg, E_INVALID_HANDLE, NULL);
+ 
+-        if (!FmPcdKgIsSchemeValidSw(p_Scheme))
++        if (!FmPcdKgIsSchemeValidSw(p_Scheme) || !p_Scheme->p_Lock)
+         {
+             REPORT_ERROR(MAJOR, E_ALREADY_EXISTS,
+                          ("Scheme is invalid"));
+@@ -2996,34 +3008,47 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
+         }
+ 
+         p_Scheme = &p_FmPcd->p_FmPcdKg->schemes[relativeSchemeId];
+-        if (FmPcdKgIsSchemeValidSw(p_Scheme))
++        p_Lock = FmPcdAcquireLock(p_FmPcd);
++        if (!p_Lock)
+         {
+-            REPORT_ERROR(MAJOR, E_ALREADY_EXISTS,
+-                         ("Scheme id (%d)!", relativeSchemeId));
++            REPORT_ERROR(MAJOR, E_NOT_AVAILABLE, ("FM KG Scheme lock obj!"));
++            return NULL;
++        }
++        if (!FmPcdLockTryLock(p_Lock))
++        {
++            FmPcdReleaseLock(p_FmPcd, p_Lock);
+             return NULL;
+         }
+-        /* Clear all fields, scheme may have beed previously used */
+-        memset(p_Scheme, 0, sizeof(t_FmPcdKgScheme));
+ 
++        /* Reserve the slot before building. A second creator must not clear
++         * an invalid but still owned scheme or steal its operation lock. */
++        intFlags = FmPcdLock(p_FmPcd);
++        if (p_Scheme->valid || p_Scheme->p_Lock)
++        {
++            FmPcdUnlock(p_FmPcd, intFlags);
++            FmPcdReleaseLock(p_FmPcd, p_Lock);
++            REPORT_ERROR(MAJOR, E_ALREADY_EXISTS, ("Scheme id (%d)!", relativeSchemeId));
++            return NULL;
++        }
++        memset(p_Scheme, 0, sizeof(*p_Scheme));
+         p_Scheme->schemeId = p_FmPcd->p_FmPcdKg->schemesIds[relativeSchemeId];
+         p_Scheme->h_FmPcd = p_FmPcd;
+-
+-        p_Scheme->p_Lock = FmPcdAcquireLock(p_FmPcd);
+-        if (!p_Scheme->p_Lock)
+-            REPORT_ERROR(MAJOR, E_NOT_AVAILABLE, ("FM KG Scheme lock obj!"));
++        p_Scheme->p_Lock = p_Lock;
++        FmPcdUnlock(p_FmPcd, intFlags);
+     }
+ 
+-    err = BuildSchemeRegs((t_Handle)p_Scheme, p_SchemeParams, &schemeRegs);
++    /* Build configuration separately; retain identity, bindings and pending
++     * required-action bookkeeping until programming has succeeded. */
++    candidate.h_FmPcd = p_FmPcd;
++    candidate.schemeId = p_Scheme->schemeId;
++    candidate.p_Lock = p_Scheme->p_Lock;
++    candidate.valid = p_Scheme->valid;
++    candidate.owners = p_Scheme->owners;
++    candidate.requiredActionFlag = p_Scheme->requiredActionFlag;
++    candidate.requiredAction = p_Scheme->requiredAction;
++    err = BuildSchemeRegs(&candidate, p_SchemeParams, &schemeRegs);
+     if (err)
+-    {
+-        REPORT_ERROR(MAJOR, err, NO_MSG);
+-        if (p_SchemeParams->modify)
+-            KgSchemeFlagUnlock(p_Scheme);
+-        if (!p_SchemeParams->modify &&
+-            p_Scheme->p_Lock)
+-            FmPcdReleaseLock(p_FmPcd, p_Scheme->p_Lock);
+-        return NULL;
+-    }
++        goto failed;
+ 
+     if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
+     {
+@@ -3031,18 +3056,9 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
+                                  (t_Handle)p_Scheme,
+                                  &schemeRegs,
+                                  p_SchemeParams->schemeCounter.update);
+-        if (p_SchemeParams->modify)
+-            KgSchemeFlagUnlock(p_Scheme);
+         if (err)
+-        {
+-            if (!p_SchemeParams->modify &&
+-                p_Scheme->p_Lock)
+-                FmPcdReleaseLock(p_FmPcd, p_Scheme->p_Lock);
+-            return NULL;
+-        }
+-        if (!p_SchemeParams->modify)
+-            ValidateSchemeSw(p_Scheme);
+-        return (t_Handle)p_Scheme;
++            goto failed;
++        goto programmed;
+     }
+ 
+     physicalSchemeId = p_Scheme->schemeId;
+@@ -3071,58 +3087,93 @@ t_Handle FM_PCD_KgSchemeSet(t_Handle h_FmPcd,  t_FmPcdKgSchemeParams *p_SchemePa
+     /* call indirect command for scheme write */
+     tmpKgarReg = FmPcdKgBuildWriteSchemeActionReg(physicalSchemeId, p_SchemeParams->schemeCounter.update);
+ 
+-    WriteKgarWait(p_FmPcd, tmpKgarReg);
++    err = WriteKgarWait(p_FmPcd, tmpKgarReg);
+     KgHwUnlock(p_FmPcd->p_FmPcdKg, intFlags);
++    if (err)
++        goto failed;
+ 
++programmed:
++    /* Transfer the netenv reference only after hardware accepts the new
++     * configuration. Keep the old reference throughout a failed modify. */
++    if (p_SchemeParams->modify && candidate.netEnvId != p_Scheme->netEnvId)
++    {
++        if (candidate.netEnvId != ILLEGAL_NETENV)
++            FmPcdIncNetEnvOwners(p_FmPcd, candidate.netEnvId);
++        if (p_Scheme->netEnvId != ILLEGAL_NETENV)
++            FmPcdDecNetEnvOwners(p_FmPcd, p_Scheme->netEnvId);
++    }
++    *p_Scheme = candidate;
+     if (!p_SchemeParams->modify)
+         ValidateSchemeSw(p_Scheme);
+-    else
+-        KgSchemeFlagUnlock(p_Scheme);
+-
++    KgSchemeFlagUnlock(p_Scheme);
+     return (t_Handle)p_Scheme;
++
++failed:
++    /* E_TIMEOUT does not prove hardware rollback. A117's HC failure latch
++     * blocks further programming (including direct fallback) until reset. */
++    REPORT_ERROR(MAJOR, err, NO_MSG);
++    if (p_SchemeParams->modify)
++        KgSchemeFlagUnlock(p_Scheme);
++    else
++    {
++        intFlags = FmPcdLock(p_FmPcd);
++        p_Lock = p_Scheme->p_Lock;
++        p_Scheme->p_Lock = NULL;
++        FmPcdUnlock(p_FmPcd, intFlags);
++        FmPcdReleaseLock(p_FmPcd, p_Lock);
++    }
++    return NULL;
+ }
+ 
  t_Error  FM_PCD_KgSchemeDelete(t_Handle h_Scheme)
  {
      t_FmPcd             *p_FmPcd;
@@ -13019,7 +13171,7 @@ index ef62c8ef28d5..464b539e8c81 100644
  
  #endif /* __FM_MURAM_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
-index 6e5db2a..4146313 100644
+index 6e5db2a..d271ec2 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 @@ -45,7 +45,7 @@
@@ -13124,7 +13276,19 @@ index 6e5db2a..4146313 100644
  } t_FmPcdHashTableParams;
  
  /**************************************************************************//**
-@@ -3362,8 +3407,7 @@ t_Error FM_PCD_MatchTableGetNextEngine(t_Handle                     h_CcNode,
+@@ -2802,6 +2847,11 @@ t_Error FM_PCD_NetEnvCharacteristicsDelete(t_Handle h_NetEnv);
+                 p_SchemeParams->id.h_Scheme will return NULL if action fails due to scheme
+                 BUSY state.
+ 
++                Failed construction or programming does not publish candidate
++                software state. An unconfirmed HC timeout does not prove that
++                hardware is unchanged; the HC transport remains failed until
++                board reset, even if a late confirmation arrives.
++
+  @Cautions      Allowed only following FM_PCD_Init().
+ *//***************************************************************************/
+ t_Handle FM_PCD_KgSchemeSet(t_Handle                h_FmPcd,
+@@ -3362,8 +3412,7 @@ t_Error FM_PCD_MatchTableGetNextEngine(t_Handle                     h_CcNode,
   @Param[in]     p_KgKey                 Pointer to the key; must be like the key
                                          that the KG is generated, i.e. the same
                                          extraction and with mask if exist.
@@ -13134,7 +13298,7 @@ index 6e5db2a..4146313 100644
   @Param[out]    p_CcNodeBucketHandle    Pointer to the bucket of the provided key.
   @Param[out]    p_BucketIndex           Index to the bucket of the provided key
   @Param[out]    p_LastIndex             Pointer to last index in the bucket of the
-@@ -3422,71 +3466,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
+@@ -3422,71 +3471,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
  *//***************************************************************************/
  t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl);
  
@@ -13206,7 +13370,7 @@ index 6e5db2a..4146313 100644
  /**************************************************************************//**
   @Function      FM_PCD_HashTableModifyMissNextEngine
  
-@@ -3506,75 +3485,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
+@@ -3506,75 +3490,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
  t_Error FM_PCD_HashTableModifyMissNextEngine(t_Handle                  h_HashTbl,
                                               t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
  
@@ -13282,7 +13446,7 @@ index 6e5db2a..4146313 100644
  /**************************************************************************//**
   @Function      FM_PCD_ManipNodeSet
  
-@@ -3697,4 +3607,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
+@@ -3697,4 +3612,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
  /** @} */ /* end of FM_PCD_grp group */
  /** @} */ /* end of FM_grp group */
  

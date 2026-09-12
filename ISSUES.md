@@ -63,18 +63,6 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A118. SDK scheme creation/modification does not unwind programming failures.**
-  Pre-existing in `fm_kg.c`: `FM_PCD_KgSchemeSet` only reports a missing
-  scheme lock and continues; failed new-scheme construction or HC programming
-  returns its lock without clearing the saved pointer. The direct-register
-  path ignores `WriteKgarWait` errors and publishes the scheme anyway.
-  Modification also lets `BuildSchemeRegs` change live software fields before
-  the fallible HC update, so a rejected command leaves the old hardware and
-  changed software. Make creation fail closed, retire failed acquisitions
-  once, and preserve the prior scheme on failed modification. Test lock
-  allocation failure, construction/programming failure and retry; coordinate
-  ambiguous HC timeout recovery with A117. Separate from A116's deletion fix.
-
 ## Feature enablement (not bugs)
 
 Config-gated capabilities that are OFF in the current product — not defects.
@@ -899,3 +887,12 @@ file's git history.
   prevent direct-register fallback and unsupported FMan unbind recovery.
   Actual SDK/wrapper fault tests pass under ASan/UBSan; 29 host tests and
   12 KASAN DUT checks pass, including 128 scheme lifecycle cycles and offload.
+
+- [x] **A118.** Scheme creation/modification published partial state on failure —
+  fixed (_this commit_): build a private candidate, reserve and hold the scheme
+  lock through programming, clear failed acquisitions before release, and
+  honor direct-register errors. Commit netenv references only on success;
+  retain A117's board-reset requirement after ambiguous HC timeout.
+  Actual builder/lock/HC fault coverage passes under ASan/UBSan: 30 host tests
+  and 12 KASAN DUT checks pass, including 128 lifecycle cycles with late
+  construction failures followed by deletion of the original scheme.
