@@ -16,6 +16,39 @@ items below. Every reopening is static-conclusive — none needs on-DUT
 verification. Bookkeeping corrections from that audit (wrong commit hashes,
 stale line refs) are folded into the archive one-liners.
 
+## Latest full validation — 2026-09-12
+
+Built commit `12f7318b37395513de434d91ed37913bdbecbcc7` with
+`KASAN=1 make ask-image`, staged it with `make stage-image`, and booted the
+DUT over TFTP. KASAN (generic), kmemleak, lockdep and FAILSLAB were enabled.
+Kernel/CDX build IDs and dpa_app/CMM hashes matched the build before and
+after testing. Image SHA-256:
+`144bbe9f2a53868b9e3fce40832c0ed9bd7c3496895a803f3fa9e06cb18ebd98`.
+
+| Suite | Passed | Duration |
+| --- | ---: | ---: |
+| Main: 30 host + 377 DUT tests | 407 | 78m 57s |
+| Dedicated startup rollback: 15 injected checkpoints | 1 | 10m 43s |
+| Dedicated route recovery and SA teardown | 10 | 1m 17s |
+| **Total** | **418** | **90m 57s** |
+
+Zero failures, errors or skips. No KASAN, UBSAN, kernel BUG/WARN or lockdep
+findings were reported; the final kernel log scan was clean. Startup rollback
+restored baseline MURAM at all 15 checkpoints and allowed normal CDX loading
+in the same boot. Its leak scan found no unexpected objects after the existing
+test policy excluded 12,783 known DPAA boot-pool objects.
+
+After startup testing, the DUT was rebooted normally. The main and route
+suites then passed without another reboot; normal CMM was restored, fault
+controls were disarmed, and DUT/WAN agents were healthy. The build completed
+with three existing BitBake warnings for previously forced CDX, CMM and
+dpa_app compile tasks.
+
+Bench artifacts on `vision`: `/tmp/ask-full-20260912-205415/` contains
+`report.md`, `build-manifest.json`, the three `*-suite.xml` reports and logs,
+per-test captures, and `validation.json`. This dated record preserves the
+result independently of those temporary files.
+
 ---
 
 ## Open
@@ -767,7 +800,7 @@ file's git history.
   config, hardening only.
 
 - [x] **A85.** Raw kernel `t_Handle`s crossing the FM_PCD ioctl + cdx
-  `SET_PARAMS` boundaries — fixed (_this commit_): generation-tagged cookie
+  `SET_PARAMS` boundaries — fixed (_6781310_): generation-tagged cookie
   registry in the FMD wrapper, translation on both boundaries (fmc/dpa_app
   unchanged). Folded in from the audit: a MATCH_TABLE_SET heap overflow
   (toothless `ASSERT_COND` → hard reject), the `pcd_handle` fd type check
@@ -796,31 +829,31 @@ file's git history.
   node, where it belongs.
 
 - [x] **A100.** SA caches walked from atomic context (dqrr `by_fqid`, the
-  datapath hook on `by_h`) racing `ctrl.mutex` writers — fixed (_this commit_,
+  datapath hook on `by_h`) racing `ctrl.mutex` writers — fixed (_3bc8a5e_,
   a/b/d bullets in _2a13911_): one irqsave `sa_cache_lock` around every list
   mutation and both atomic readers, copy-out before unlock; per-SA skip
   replaces the bucket-wide SA_DELETE abort.
 
 - [x] **A101.** L2 bridge flows leaked on unload (`M_bridge_handle_reset` was a
-  stub, `CMD_RX_L2BRIDGE_FLOW_RESET` a no-op) — fixed (_this commit_): reset
+  stub, `CMD_RX_L2BRIDGE_FLOW_RESET` a no-op) — fixed (_402c01b_): reset
   flushes all buckets via `l2flow_remove()` under `ctrl.mutex`, command wired.
 
 - [x] **A102.** FM_VSP ioctl family leaked/deref'd raw kernel VSP handles over
-  /dev/fmX — fixed (_this commit_): 9th cookie class `FM_PCD_COOKIE_VSP` through
+  /dev/fmX — fixed (_d564bb5_): 9th cookie class `FM_PCD_COOKIE_VSP` through
   the seven VSP verbs; non-Rx `p_fm_tx_port` rejected (A103-coupled). Residue A105.
 
 - [x] **A104.** `cdxdrv_set_miss_action` fed CC-node (EXACT_MATCH) handles to the
   hash-only `FM_PCD_HashTableModifyMissNextEngine` (wrong-offset near-NULL MMIO
-  read, exercised for any PCD with CC-nodes) — fixed (_this commit_): skip non-hash
+  read, exercised for any PCD with CC-nodes) — fixed (_876d051_): skip non-hash
   `dpa_type`s via the `get_cctbl_info` predicate.
 
 - [x] **A105.** Six `LnxwrpFmPcdIOCTL` arms (VSP `INIT`/`FREE` +
   `FM_PCD_IOC_FRM_REPLIC_GROUP_DELETE`, compat+native each) returned `E_OK` on a
-  `copy_from_user` fault (bare `break` → E_OK tail) — fixed (_this commit_): all
+  `copy_from_user` fault (bare `break` → E_OK tail) — fixed (_1d21c8f_): all
   now `RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG)`, whole class closed.
 
 - [x] **A99.** Re-add-after-failed-delete duplicate-key residuals (socket v4/v6,
-  RTP, ipsec) — fixed (_this commit_): v4/RTP/ipsec capture the delete rc and
+  RTP, ipsec) — fixed (_ceaa861_): v4/RTP/ipsec capture the delete rc and
   refuse the re-add on hard FAILURE (tombstone for retry); v6's make-before-break
   keeps its intentional transient duplicate, logging a failed trailing delete
   without failing the command.
@@ -831,19 +864,19 @@ file's git history.
   software-gone, so an error return buys nothing but a compounding retry.
 
 - [x] **A106.** Late CDX SET_PARAMS failures leaked queues, interfaces,
-  policers and MURAM statistics — fixed (_this commit_): stop producer ports,
+  policers and MURAM statistics — fixed (_2cf97d1_): stop producer ports,
   drain queues and release dependents before FMAN metadata; targeted hardware
   checks cover 15 failure points, unchanged MURAM, empty kmemleak and a
   successful load in the same boot.
 
 - [x] **A66.** Route-event retries reused rolled-back tunnel/socket/SA
   bindings and cleared `FPP_NEEDS_UPDATE` without refreshing the next-hop —
-  fixed (_this commit_): retry through the existing route-swap transactions,
+  fixed (_1e02d82_): retry through the existing route-swap transactions,
   including local tunnel events; host fault coverage and six hardware
   gateway/MTU recovery cases preserve references across repeated refusals.
 
 - [x] **A107.** SA deletion and hard expiry left the last FPP route behind —
-  fixed (_this commit_): detach flows, delete the CDX SA, then release its
+  fixed (_81155da_): detach flows, delete the CDX SA, then release its
   counted route. Expiry route deletion now uses the CDX connection instead
   of the key-engine connection. Host error/ordering coverage and repeated
   hardware deletion/expiry checks cover sole and shared routes.
@@ -858,30 +891,30 @@ file's git history.
   fixed (_cf1e3a7_): drain every queue and finish callbacks before destroying storage.
 
 - [x] **A111.** Public SDK PCD setup/delete leaked locks and ownership on errors —
-  fixed (_this commit_): track completed acquisitions, preserve unfinished cleanup and balance retries.
+  fixed (_9a15ccf_): track completed acquisitions, preserve unfinished cleanup and balance retries.
 
 - [x] **A112.** SDK port destruction dereferenced discarded initialization parameters —
-  fixed (_this commit_): retain charged dequeue depth and release successfully acquired FM resources once.
+  fixed (_8f1063b_): retain charged dequeue depth and release successfully acquired FM resources once.
 
 - [x] **A113.** Whole-tree replacement leaked bindings and omitted PCD locks —
-  resolved (_this commit_): remove the implementation; retain APIs/ioctl numbers with explicit unsupported errors.
+  resolved (_37534e1_): remove the implementation; retain APIs/ioctl numbers with explicit unsupported errors.
 
 - [x] **A114.** Reassembly scheme teardown retained stale handles and hid failures —
-  resolved (_this commit_): remove unsupported SDK/ASK reassembly; reject creation and attachment at API/ioctl boundaries.
+  resolved (_1685a5a_): remove unsupported SDK/ASK reassembly; reject creation and attachment at API/ioctl boundaries.
 
 - [x] **A115.** FM port allocation left partial charges and locked error exits —
-  fixed (_this commit_): validate before committing resources; serialize updates and preserve failed FIFO resize state.
+  fixed (_ee9e210_): validate before committing resources; serialize updates and preserve failed FIFO resize state.
 
 - [x] **A116.** Scheme deletion discarded live software ownership before hardware success —
-  fixed (_this commit_): preserve refused/failed deletion state; commit once and retire the scheme lock atomically.
+  fixed (_42c8b34_): preserve refused/failed deletion state; commit once and retire the scheme lock atomically.
 
 - [x] **A119.** Public KG scheme flags were interpreted using the SDK layout —
-  fixed (_this commit_): translate kernel/fmlib flags without changing the ABI,
+  fixed (_bada8ce_): translate kernel/fmlib flags without changing the ABI,
   preserve public cookies on copy-out, and reject missing netenvs before scheme
   mutation. Native/compat host coverage and 128 KASAN DUT lifecycle cycles pass.
 
 - [x] **A117.** SDK HC failures recycled frames still owned by hardware —
-  fixed (_this commit_): separate QMan acceptance from per-frame completion,
+  fixed (_bd99777_): separate QMan acceptance from per-frame completion,
   restore rejected frames, quarantine timed-out frames until confirmation,
   and latch failure until board reset. Guard pool replacement and PCD cleanup;
   prevent direct-register fallback and unsupported FMan unbind recovery.
@@ -889,7 +922,7 @@ file's git history.
   12 KASAN DUT checks pass, including 128 scheme lifecycle cycles and offload.
 
 - [x] **A118.** Scheme creation/modification published partial state on failure —
-  fixed (_this commit_): build a private candidate, reserve and hold the scheme
+  fixed (_12f7318_): build a private candidate, reserve and hold the scheme
   lock through programming, clear failed acquisitions before release, and
   honor direct-register errors. Commit netenv references only on success;
   retain A117's board-reset requirement after ambiguous HC timeout.
