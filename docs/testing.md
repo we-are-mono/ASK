@@ -392,3 +392,29 @@ serial and runs it (`lan_run_python` for Python; backgrounded shell
 processes coordinated through the client's filesystem for parallel-shape
 work). Do not look for an HTTP agent on the client — there isn't one, by
 design.
+
+## SDK host-command failure recovery
+
+An enqueue rejection leaves the HC frame with the caller, restores its CPU
+byte order, and permits another transport attempt. Acceptance and completion
+are separate: the SDK waits up to one second for that command's confirmation.
+
+`HC confirmation timed out; board reset required` means completion is
+unknown. Stop PCD management operations and reboot the board before reusing
+any affected hardware objects. The transport retains an unconfirmed frame,
+rejects further commands, and refuses buffer replacement, teardown, or a
+switch to direct register programming. A late confirmation releases the
+frame only; it does not reconcile caller software state or reopen transport.
+FMan sysfs bind/unbind is disabled because this built-in driver has no proven
+DMA drain/reset path and its remove callback cannot veto devres cleanup.
+This recovery contract does not provide higher-level operation rollback;
+scheme creation/modification rollback remains tracked in A118.
+
+`tools/host_tests/test_sdk_hc_transport.py` compiles the actual SDK pool,
+enqueue, completion and cleanup helpers together with the Linux QMan wrapper
+under ASan/UBSan. It injects rejection, missing and late confirmations,
+completion at the deadline, overlapping commands, pool exhaustion and partial
+allocation failure. Set `ASK_KERNEL_SOURCE` to a patched kernel tree, or use
+the default build tree, and run it with the other host tests. Hardware smoke,
+scheme lifecycle and offload tests cover normal confirmed commands; the
+transport timeout injections run on the host.

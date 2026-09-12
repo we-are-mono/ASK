@@ -109,7 +109,7 @@ int main(void)
                            .h_HwSpinlock = &kg_spin};
             t_FmPcd pcd = {.p_FmPcdKg = &kg, .h_Spinlock = &pcd_spin};
             t_FmPcdLock lock = {.h_Spinlock = &scheme_spin};
-            t_FmHc hc = {.h_FmPcd = &pcd};
+            t_FmHc hc = {.h_FmPcd = &pcd, .h_Spinlock = &pcd_spin};
             /* DPAA FDs hold 40-bit physical addresses; non-PIE static storage
              * fits the identity-mapped host address boundary used here. */
             static t_HcFrame frames[HC_CMD_POOL_SIZE];

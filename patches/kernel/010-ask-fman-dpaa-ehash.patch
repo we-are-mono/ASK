@@ -68,6 +68,10 @@ Translate the public keygen direct-scheme flag to the SDK layout and
 reject ordinary schemes without a network environment. Preserve the
 native and compat ioctl layouts and return compat next-engine data.
 
+Track HC buffer ownership through enqueue rejection, completion and
+timeout. Quarantine accepted unconfirmed frames and latch timeout failure
+until board reset; keep QMan acceptance separate from SDK completion.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  Makefile                                           |    5 
@@ -82,7 +86,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  drivers/net/ethernet/freescale/sdk_dpaa/mac.h      |    2 
  .../net/ethernet/freescale/sdk_dpaa/offline_port.c |   51 
  drivers/net/ethernet/freescale/sdk_fman/Kconfig    |   11 
- .../freescale/sdk_fman/Peripherals/FM/HC/hc.c      |   77 -
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c      |  296 ++-
  .../freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c |   14 
  .../freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h |    1 
  .../freescale/sdk_fman/Peripherals/FM/MAC/memac.c  |   58 
@@ -95,7 +99,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.h  |    1 
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c         | 1439 +-----------
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.h         |  111 -
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c |   95 -
+ .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c |  109 +
  .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h |   17 
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c          |   13 
  .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h          |    1 
@@ -107,7 +111,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/Peripherals/FM/fm.c         |  539 ++---
  .../freescale/sdk_fman/Peripherals/FM/fm_muram.c   |   32 
  .../sdk_fman/Peripherals/FM/inc/fm_common.h        |   24 
- .../freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h  |    2 
+ .../freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h  |    9 
  .../sdk_fman/Peripherals/FM/inc/fm_sp_common.h     |    2 
  .../net/ethernet/freescale/sdk_fman/etc/memcpy.c   |  301 ---
  .../sdk_fman/inc/Peripherals/fm_eh_types.h         |   52 
@@ -115,7 +119,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../freescale/sdk_fman/inc/Peripherals/fm_ext.h    |   15 
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h          |    1 
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h        |    1 
- .../sdk_fman/inc/Peripherals/fm_pcd_ext.h          |  203 +-
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h          |  210 +-
  .../sdk_fman/inc/Peripherals/fm_port_ext.h         |   42 
  .../sdk_fman/inc/Peripherals/fm_vsp_ext.h          |   14 
  .../freescale/sdk_fman/inc/flib/fsl_fman_port.h    |    6 
@@ -124,9 +128,9 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h      |    9 
  .../sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h     |    5 
  .../freescale/sdk_fman/src/system/sys_io.c         |    1 
- .../freescale/sdk_fman/src/wrapper/lnxwrp_fm.c     |   45 
+ .../freescale/sdk_fman/src/wrapper/lnxwrp_fm.c     |   76 +
  .../freescale/sdk_fman/src/wrapper/lnxwrp_fm.h     |   36 
- .../sdk_fman/src/wrapper/lnxwrp_fm_port.c          |    9 
+ .../sdk_fman/src/wrapper/lnxwrp_fm_port.c          |   76 -
  .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c        | 2347 ++++++++++----------
  .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.c |   18 
  .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.h |   13 
@@ -151,7 +155,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                     |    5 
  net/core/rtnetlink.c                               |   19 
  net/core/skbuff.c                                  |   38 
- 81 files changed, 8809 insertions(+), 4918 deletions(-)
+ 81 files changed, 9048 insertions(+), 5024 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -1991,7 +1995,7 @@ index 3a6d1810b525..dee624569b48 100644
  	bool "FMan RTC (1588 timer) APIs"
  	default n
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 80fb535..211b2e2 100644
+index 80fb535..7111fb0 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 @@ -50,20 +50,7 @@
@@ -2015,16 +2019,20 @@ index 80fb535..211b2e2 100644
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_CMD_SHIFT       24
  #define HC_HCOR_ACTION_REG_IP_FRAG_SCRATCH_POOL_BPID            16
  
-@@ -79,6 +66,8 @@
+@@ -79,7 +66,12 @@
  #define SIZE_OF_HC_FRAME_PROFILE_CNT        (sizeof(t_HcFrame)-sizeof(t_FmPcdPlcrProfileRegs)+sizeof(uint32_t))
  #define SIZE_OF_HC_FRAME_READ_OR_CC_DYNAMIC 16
  
 +
 +
  #define HC_CMD_POOL_SIZE                    (INTG_MAX_NUM_OF_CORES)
++/* Preserve the Linux wrapper's former one-second confirmation allowance. */
++#define HC_CONFIRM_POLLS                    10000
++#define HC_CONFIRM_POLL_US                  100
  
  #define BUILD_FD(len)                     \
-@@ -111,8 +100,6 @@ typedef struct t_HcFrame {
+ do {                                      \
+@@ -111,8 +103,6 @@ typedef struct t_HcFrame {
          volatile uint32_t                       singleRegForWrite;    /* for writing SP, CPP, profile counter */
          t_FmPcdKgPortRegs                       portRegsForRead;
          volatile uint32_t                       clsPlanEntries[CLS_PLAN_NUM_PER_GRP];
@@ -2033,7 +2041,323 @@ index 80fb535..211b2e2 100644
      } hcSpecificData;
  } t_HcFrame;
  
-@@ -704,32 +691,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
+@@ -121,6 +111,13 @@ typedef struct t_HcFrame {
+ #endif /* defined(__MWERKS__) && ... */
+ 
+ 
++typedef enum e_HcBufState {
++    e_HC_BUF_FREE,
++    e_HC_BUF_READY,       /* Borrowed by a command builder or confirmed caller. */
++    e_HC_BUF_IN_FLIGHT,   /* Hardware may access the frame; caller still owns it. */
++    e_HC_BUF_ORPHANED     /* Caller returned after timeout; confirmation owns it. */
++} e_HcBufState;
++
+ typedef struct t_FmHc {
+     t_Handle                    h_FmPcd;
+     t_Handle                    h_HcPortDev;
+@@ -132,11 +129,31 @@ typedef struct t_FmHc {
+     uint32_t                    seqNum[HC_CMD_POOL_SIZE];   /* FIFO of seqNum to use when
+                                                                taking buffer */
+     uint32_t                    nextSeqNumLocation;         /* seqNum location in seqNum[] for next buffer */
+-    volatile bool               enqueued[HC_CMD_POOL_SIZE]; /* HC is active - frame is enqueued
+-                                                               and not confirmed yet */
++    t_Handle                    h_Spinlock;
++    e_HcBufState                bufState[HC_CMD_POOL_SIZE];
++    bool                        failed;       /* Ambiguous completion: reset required. */
++    bool                        quiescing;    /* No new borrowers during teardown. */
+     t_HcFrame                   *p_Frm[HC_CMD_POOL_SIZE];
+ } t_FmHc;
+ 
++static uint32_t HcLock(t_FmHc *p_FmHc)
++{
++    return XX_LockIntrSpinlock(p_FmHc->h_Spinlock);
++}
++
++static void HcUnlock(t_FmHc *p_FmHc, uint32_t flags)
++{
++    XX_UnlockIntrSpinlock(p_FmHc->h_Spinlock, flags);
++}
++
++/* Caller holds the HC lock. Both the borrower and hardware are finished. */
++static void ReturnBuf(t_FmHc *p_FmHc, uint32_t seqNum)
++{
++    ASSERT_COND(p_FmHc->nextSeqNumLocation);
++    p_FmHc->bufState[seqNum] = e_HC_BUF_FREE;
++    p_FmHc->seqNum[--p_FmHc->nextSeqNumLocation] = seqNum;
++}
++
+ 
+ static t_Error FillBufPool(t_FmHc *p_FmHc)
+ {
+@@ -163,6 +180,7 @@ static t_Error FillBufPool(t_FmHc *p_FmHc)
+     for (i = 0; i < HC_CMD_POOL_SIZE; i++)
+     {
+         p_FmHc->seqNum[i] = i;
++        p_FmHc->bufState[i] = e_HC_BUF_FREE;
+     }
+     p_FmHc->nextSeqNumLocation = 0;
+ 
+@@ -175,19 +193,21 @@ static __inline__ t_HcFrame * GetBuf(t_FmHc *p_FmHc, uint32_t *p_SeqNum)
+ 
+     ASSERT_COND(p_FmHc);
+ 
+-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
++    intFlags = HcLock(p_FmHc);
+ 
+-    if (p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
++    if (p_FmHc->quiescing || p_FmHc->nextSeqNumLocation == HC_CMD_POOL_SIZE)
+     {
+         /* No more buffers */
+-        FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
++        HcUnlock(p_FmHc, intFlags);
+         return NULL;
+     }
+ 
+     *p_SeqNum = p_FmHc->seqNum[p_FmHc->nextSeqNumLocation];
++    ASSERT_COND(p_FmHc->bufState[*p_SeqNum] == e_HC_BUF_FREE);
++    p_FmHc->bufState[*p_SeqNum] = e_HC_BUF_READY;
+     p_FmHc->nextSeqNumLocation++;
+ 
+-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
++    HcUnlock(p_FmHc, intFlags);
+     return p_FmHc->p_Frm[*p_SeqNum];
+ }
+ 
+@@ -195,40 +215,66 @@ static __inline__ void PutBuf(t_FmHc *p_FmHc, t_HcFrame *p_Buf, uint32_t seqNum)
+ {
+     uint32_t    intFlags;
+ 
+-    UNUSED(p_Buf);
+-
+-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+-    ASSERT_COND(p_FmHc->nextSeqNumLocation);
+-    p_FmHc->nextSeqNumLocation--;
+-    p_FmHc->seqNum[p_FmHc->nextSeqNumLocation] = seqNum;
+-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
++    intFlags = HcLock(p_FmHc);
++    ASSERT_COND(seqNum < HC_CMD_POOL_SIZE && p_Buf == p_FmHc->p_Frm[seqNum]);
++    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY ||
++                p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT);
++    if (p_FmHc->bufState[seqNum] == e_HC_BUF_IN_FLIGHT)
++        p_FmHc->bufState[seqNum] = e_HC_BUF_ORPHANED;
++    else
++        ReturnBuf(p_FmHc, seqNum);
++    HcUnlock(p_FmHc, intFlags);
+ }
+ 
+ static __inline__ t_Error EnQFrm(t_FmHc *p_FmHc, t_DpaaFD *p_FmFd, uint32_t seqNum)
+ {
+     t_Error     err = E_OK;
+     uint32_t    intFlags;
+-    uint32_t    timeout=100;
++    uint32_t    timeout = HC_CONFIRM_POLLS;
+ 
+-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
+-    ASSERT_COND(!p_FmHc->enqueued[seqNum]);
+-    p_FmHc->enqueued[seqNum] = TRUE;
+-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
++    intFlags = HcLock(p_FmHc);
++    if (p_FmHc->failed || p_FmHc->quiescing)
++    {
++        HcUnlock(p_FmHc, intFlags);
++        RETURN_ERROR(MINOR, E_INVALID_STATE, ("HC unavailable; reset required after timeout"));
++    }
++    ASSERT_COND(p_FmHc->bufState[seqNum] == e_HC_BUF_READY);
++    p_FmHc->bufState[seqNum] = e_HC_BUF_IN_FLIGHT;
++    HcUnlock(p_FmHc, intFlags);
+     DBG(TRACE, ("Send Hc, SeqNum %d, buff@0x%p, fd offset 0x%x",
+                 seqNum,
+                 DPAA_FD_GET_ADDR(p_FmFd),
+                 DPAA_FD_GET_OFFSET(p_FmFd)));
+     err = p_FmHc->f_QmEnqueue(p_FmHc->h_QmArg, (void *)p_FmFd);
+     if (err)
++    {
++        /* Enqueue errors mean rejection, never an accepted-command timeout. */
++        intFlags = HcLock(p_FmHc);
++        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
++        HcUnlock(p_FmHc, intFlags);
+         RETURN_ERROR(MINOR, err, ("HC enqueue failed"));
++    }
+ 
+-    while (p_FmHc->enqueued[seqNum] && --timeout)
+-        XX_UDelay(100);
+-
+-    if (!timeout)
+-        RETURN_ERROR(MINOR, E_TIMEOUT, ("HC Callback, timeout exceeded"));
+-
+-    return err;
++    for (;;)
++    {
++        intFlags = HcLock(p_FmHc);
++        if (p_FmHc->bufState[seqNum] == e_HC_BUF_READY)
++        {
++            HcUnlock(p_FmHc, intFlags);
++            return E_OK;
++        }
++        if (!timeout--)
++        {
++            /* A late confirmation can reclaim the frame, but cannot repair
++             * caller software state. Do not reopen HC or permit a switch to
++             * direct-register programming; recovery requires a board reset. */
++            p_FmHc->failed = TRUE;
++            HcUnlock(p_FmHc, intFlags);
++            RETURN_ERROR(MINOR, E_TIMEOUT, ("HC confirmation timed out; board reset required"));
++        }
++        HcUnlock(p_FmHc, intFlags);
++        XX_UDelay(HC_CONFIRM_POLL_US);
++    }
+ }
+ 
+ 
+@@ -251,6 +297,12 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+     p_FmHc->h_QmArg             = p_FmHcParams->params.h_QmArg;
+     p_FmHc->dataMemId           = DEFAULT_dataMemId;
+     p_FmHc->usageAllowed		= TRUE;
++    p_FmHc->h_Spinlock = XX_InitSpinlock();
++    if (!p_FmHc->h_Spinlock)
++    {
++        XX_Free(p_FmHc);
++        return NULL;
++    }
+ 
+     err = FillBufPool(p_FmHc);
+     if (err != E_OK)
+@@ -278,7 +330,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+     if (!p_FmHc->h_HcPortDev)
+     {
+         REPORT_ERROR(MAJOR, E_INVALID_HANDLE, ("FM HC port!"));
+-        XX_Free(p_FmHc);
++        FmHcFree(p_FmHc);
+         return NULL;
+     }
+ 
+@@ -312,13 +364,43 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
+     return (t_Handle)p_FmHc;
+ }
+ 
+-void FmHcFree(t_Handle h_FmHc)
++t_Error FmHcQuiesce(t_Handle h_FmHc)
++{
++    t_FmHc *p_FmHc = (t_FmHc *)h_FmHc;
++    uint32_t flags;
++    t_Error err = E_OK;
++
++    if (!p_FmHc)
++        return E_OK;
++    flags = HcLock(p_FmHc);
++    if (p_FmHc->failed)
++        err = ERROR_CODE(E_INVALID_STATE);
++    else if (p_FmHc->nextSeqNumLocation)
++        err = ERROR_CODE(E_BUSY);
++    else
++        p_FmHc->quiescing = TRUE;
++    HcUnlock(p_FmHc, flags);
++    return err;
++}
++
++t_Error FmHcFree(t_Handle h_FmHc)
+ {
+     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
++    t_Error err;
+     int     i;
+ 
+     if (!p_FmHc)
+-        return;
++        return E_OK;
++
++    err = FmHcQuiesce(p_FmHc);
++    if (err)
++        return err;
++    if (p_FmHc->h_HcPortDev)
++    {
++        err = FM_PORT_Free(p_FmHc->h_HcPortDev);
++        if (err)
++            return err;
++    }
+ 
+     for (i=0; i<HC_CMD_POOL_SIZE; i++)
+         if (p_FmHc->p_Frm[i])
+@@ -326,10 +408,9 @@ void FmHcFree(t_Handle h_FmHc)
+         else
+             break;
+ 
+-    if (p_FmHc->h_HcPortDev)
+-        FM_PORT_Free(p_FmHc->h_HcPortDev);
+-
++    XX_FreeSpinlock(p_FmHc->h_Spinlock);
+     XX_Free(p_FmHc);
++    return E_OK;
+ }
+ 
+ /*****************************************************************************/
+@@ -338,16 +419,30 @@ t_Error FmHcSetFramesDataMemory(t_Handle h_FmHc,
+ {
+     t_FmHc  *p_FmHc = (t_FmHc*)h_FmHc;
+     int     i;
++    t_Error err;
+ 
+     SANITY_CHECK_RETURN_ERROR(p_FmHc, E_INVALID_HANDLE);
+ 
++    err = FmHcQuiesce(p_FmHc);
++    if (err)
++        return err;
+     p_FmHc->dataMemId            = memId;
+ 
+     for (i=0; i<HC_CMD_POOL_SIZE; i++)
+         if (p_FmHc->p_Frm[i])
++        {
+             XX_FreeSmart(p_FmHc->p_Frm[i]);
++            p_FmHc->p_Frm[i] = NULL;
++        }
+ 
+-    return FillBufPool(p_FmHc);
++    err = FillBufPool(p_FmHc);
++    if (!err)
++    {
++        uint32_t flags = HcLock(p_FmHc);
++        p_FmHc->quiescing = FALSE;
++        HcUnlock(p_FmHc, flags);
++    }
++    return err;
+ }
+ 
+ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
+@@ -355,20 +450,27 @@ void FmHcTxConf(t_Handle h_FmHc, t_DpaaFD *p_Fd)
+     t_FmHc      *p_FmHc = (t_FmHc*)h_FmHc;
+     t_HcFrame   *p_HcFrame;
+     uint32_t    intFlags;
++    uint32_t    seqNum;
+ 
+     ASSERT_COND(p_FmHc);
+ 
+-    intFlags = FmPcdLock(p_FmHc->h_FmPcd);
++    intFlags = HcLock(p_FmHc);
+     p_HcFrame  = (t_HcFrame *)PTR_MOVE(DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd));
+ 
+-    DBG(TRACE, ("Hc Conf, SeqNum %d, FD@0x%p, fd offset 0x%x",
+-                p_HcFrame->commandSequence, DPAA_FD_GET_ADDR(p_Fd), DPAA_FD_GET_OFFSET(p_Fd)));
+-
+-    if (!(p_FmHc->enqueued[p_HcFrame->commandSequence]))
++    /* Match an owned buffer before reading an untrusted sequence index. */
++    for (seqNum = 0; seqNum < HC_CMD_POOL_SIZE; seqNum++)
++        if (p_HcFrame == p_FmHc->p_Frm[seqNum])
++            break;
++    if (!p_HcFrame || seqNum == HC_CMD_POOL_SIZE ||
++        p_HcFrame->commandSequence != seqNum ||
++        (p_FmHc->bufState[seqNum] != e_HC_BUF_IN_FLIGHT &&
++         p_FmHc->bufState[seqNum] != e_HC_BUF_ORPHANED))
+         REPORT_ERROR(MINOR, E_INVALID_FRAME, ("Not an Host-Command frame received!"));
++    else if (p_FmHc->bufState[seqNum] == e_HC_BUF_ORPHANED)
++        ReturnBuf(p_FmHc, seqNum);
+     else
+-        p_FmHc->enqueued[p_HcFrame->commandSequence] = FALSE;
+-    FmPcdUnlock(p_FmHc->h_FmPcd, intFlags);
++        p_FmHc->bufState[seqNum] = e_HC_BUF_READY;
++    HcUnlock(p_FmHc, intFlags);
+ }
+ 
+ t_Error FmHcPcdKgSetScheme(t_Handle                    h_FmHc,
+@@ -704,32 +806,6 @@ t_Error FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t  grpId)
      return E_OK;
  }
  
@@ -2066,7 +2390,7 @@ index 80fb535..211b2e2 100644
  t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragScratchPoolCmdParams *p_FmPcdCcFragScratchPoolCmdParams)
  {
      t_FmHc                              *p_FmHc = (t_FmHc*)h_FmHc;
-@@ -768,40 +729,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
+@@ -768,40 +844,6 @@ t_Error FmHcPcdCcIpFragScratchPollCmd(t_Handle h_FmHc, bool fill, t_FmPcdCcFragS
      return E_OK;
  }
  
@@ -2107,6 +2431,48 @@ index 80fb535..211b2e2 100644
  t_Error FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId, uint32_t requiredAction)
  {
      t_FmHc              *p_FmHc = (t_FmHc*)h_FmHc;
+@@ -1233,20 +1275,36 @@ t_Handle    FmHcGetPort(t_Handle h_FmHc)
+     return p_FmHc->h_HcPortDev;
+ }
+ 
+-void FmAllowHcUsage(t_Handle h_FmHc, bool allow)
++t_Error FmAllowHcUsage(t_Handle h_FmHc, bool allow)
+ {
+-	t_FmHc *p_FmHc = (t_FmHc*)h_FmHc;
++    t_FmHc *p_FmHc = (t_FmHc*)h_FmHc;
++    uint32_t flags;
++    t_Error err = E_OK;
+ 
+-	if (p_FmHc)
+-		p_FmHc->usageAllowed = allow;
++    if (!p_FmHc)
++        return E_OK;
++    flags = HcLock(p_FmHc);
++    if (p_FmHc->failed || p_FmHc->quiescing)
++        err = ERROR_CODE(E_INVALID_STATE);
++    else if (p_FmHc->nextSeqNumLocation)
++        err = ERROR_CODE(E_BUSY);
++    else
++        p_FmHc->usageAllowed = allow;
++    HcUnlock(p_FmHc, flags);
++    return err;
+ }
+ 
+ bool FmIsHcUsageAllowed(t_Handle h_FmHc)
+ {
+ 	t_FmHc *p_FmHc = (t_FmHc*)h_FmHc;
++	uint32_t flags;
++	bool allowed;
+ 
+ 	if (p_FmHc == NULL)
+ 		return FALSE;
+ 
+-	return p_FmHc->usageAllowed;
++	flags = HcLock(p_FmHc);
++	allowed = p_FmHc->usageAllowed || p_FmHc->failed;
++	HcUnlock(p_FmHc, flags);
++	return allowed;
+ }
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
 index 5ef579872a3b..ce7b97605c7c 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c
@@ -8048,7 +8414,7 @@ index 241703a..f0f48e5 100644
      bool                    cnia;
 
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
-index 5d96727..6dfedc1 100644
+index 5d96727..69ad0b9 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 @@ -55,6 +55,12 @@
@@ -8195,7 +8561,18 @@ index 5d96727..6dfedc1 100644
      return E_OK;
  }
  
-@@ -1037,6 +1054,9 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
+@@ -1031,12 +1048,20 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
+     t_FmPcd                             *p_FmPcd =(t_FmPcd *)h_FmPcd;
+     t_Error                             err = E_OK;
+ 
++    /* HC confirmations can still use this PCD and its resources. Refuse
++     * before any teardown, and prevent new frame borrowers once idle. */
++    if (p_FmPcd->h_Hc && (err = FmHcQuiesce(p_FmPcd->h_Hc)) != E_OK)
++        RETURN_ERROR(MINOR, err, ("HC still owned or timed out; reset required"));
++
+     if (p_FmPcd->ipv6FrameIdAddr)
+         FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, UINT_TO_PTR(p_FmPcd->ipv6FrameIdAddr));
+ 
      if (p_FmPcd->capwapFrameIdAddr)
          FM_MURAM_FreeMem(p_FmPcd->h_FmMuram, UINT_TO_PTR(p_FmPcd->capwapFrameIdAddr));
  
@@ -8205,7 +8582,21 @@ index 5d96727..6dfedc1 100644
      if (p_FmPcd->enabled)
          FM_PCD_Disable(p_FmPcd);
  
-@@ -1572,7 +1592,8 @@ t_Error FM_PCD_SetAdvancedOffloadSupport(t_Handle h_FmPcd)
+@@ -1069,9 +1094,11 @@ t_Error FM_PCD_Free(t_Handle h_FmPcd)
+         p_FmPcd->p_FmPcdPrs = NULL;
+     }
+ 
+-    if (FmIsHcUsageAllowed(p_FmPcd->h_Hc))
++    if (p_FmPcd->h_Hc)
+     {
+-        FmHcFree(p_FmPcd->h_Hc);
++        err = FmHcFree(p_FmPcd->h_Hc);
++        if (err)
++            RETURN_ERROR(MINOR, err, NO_MSG);
+         p_FmPcd->h_Hc = NULL;
+     }
+ 
+@@ -1572,7 +1599,8 @@ t_Error FM_PCD_SetAdvancedOffloadSupport(t_Handle h_FmPcd)
          revInfo.packageRev = IP_OFFLOAD_PACKAGE_NUMBER;
      }
      if (!IS_OFFLOAD_PACKAGE(revInfo.packageRev))
@@ -8215,6 +8606,20 @@ index 5d96727..6dfedc1 100644
  
      if (!p_FmPcd->h_Hc)
          RETURN_ERROR(MAJOR, E_INVALID_HANDLE, ("HC must be initialized in this mode"));
+@@ -1973,7 +2001,7 @@ t_Error FM_PCD_AllowHcUsage(t_Handle h_FmPcd, uint8_t allow)
+         RETURN_ERROR(MAJOR, E_NOT_SUPPORTED, ("FM_PCD_AllowHcUsage - guest mode!"));
+ 
+     if (p_FmPcd->h_Hc)
+-    	FmAllowHcUsage(p_FmPcd->h_Hc, allow);
++        return FmAllowHcUsage(p_FmPcd->h_Hc, allow);
+ 
+     return E_OK;
+ }
+@@ -2114,4 +2142,3 @@ t_Handle FM_PCD_GetHcPort(t_Handle h_FmPcd)
+     t_FmPcd *p_FmPcd = (t_FmPcd*)h_FmPcd;
+     return FmHcGetPort(p_FmPcd->h_Hc);
+ }
+-
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
 index 9d78c8d..b1b7151 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
@@ -10659,10 +11064,22 @@ index fd9221b..5a5c75a 100644
  t_Error     FmPortGetSetCcParams(t_Handle h_FmPort, t_FmPortGetSetCcParams *p_FmPortGetSetCcParams);
  uint8_t     FmPortGetNetEnvId(t_Handle h_FmPort);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
-index 56f3ab8..5490105 100644
+index 56f3ab8..5617795 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
-@@ -59,9 +59,7 @@ t_Error     FmHcPcdKgSetScheme(t_Handle                   h_FmHc,
+@@ -47,7 +47,10 @@ typedef struct t_FmHcParams {
+ 
+ 
+ t_Handle    FmHcConfigAndInit(t_FmHcParams *p_FmHcParams);
+-void        FmHcFree(t_Handle h_FmHc);
++/* Stop new borrowers only when no frame is owned. A timeout permanently
++ * refuses teardown/reconfiguration: reset the board to recover PCD state. */
++t_Error     FmHcQuiesce(t_Handle h_FmHc);
++t_Error     FmHcFree(t_Handle h_FmHc);
+ t_Error     FmHcSetFramesDataMemory(t_Handle h_FmHc,
+                                     uint8_t  memId);
+ t_Error     FmHcDumpRegs(t_Handle h_FmHc);
+@@ -59,9 +62,7 @@ t_Error     FmHcPcdKgSetScheme(t_Handle                   h_FmHc,
                                 struct fman_kg_scheme_regs *p_SchemeRegs,
                                 bool                       updateCounter);
  t_Error     FmHcPcdKgDeleteScheme(t_Handle h_FmHc, t_Handle h_Scheme);
@@ -10671,6 +11088,15 @@ index 56f3ab8..5490105 100644
 -t_Error     FmHcPcdCcTimeoutReassm(t_Handle h_FmHc, t_FmPcdCcReassmTimeoutParams *p_CcReassmTimeoutParams, uint8_t *p_Result);
  t_Error     FmHcPcdKgSetClsPlan(t_Handle h_FmHc, t_FmPcdKgInterModuleClsPlanSet *p_Set);
  t_Error     FmHcPcdKgDeleteClsPlan(t_Handle h_FmHc, uint8_t clsPlanGrpId);
+ 
+@@ -85,7 +86,7 @@ t_Error     FmHcPcdPlcrCcGetSetParams(t_Handle h_FmHc,uint16_t absoluteProfileId
+ t_Error     FmHcPcdSync(t_Handle h_FmHc);
+ t_Handle    FmHcGetPort(t_Handle h_FmHc);
+ 
+-void     	FmAllowHcUsage(t_Handle h_FmHc, bool allow);
++t_Error     FmAllowHcUsage(t_Handle h_FmHc, bool allow);
+ bool     	FmIsHcUsageAllowed(t_Handle h_FmHc);
+ 
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_sp_common.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_sp_common.h
 index f9dd384bb685..b9cc5aa2bd1e 100644
@@ -12593,7 +13019,7 @@ index ef62c8ef28d5..464b539e8c81 100644
  
  #endif /* __FM_MURAM_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
-index 6e5db2a..9da406a 100644
+index 6e5db2a..4146313 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 @@ -45,7 +45,7 @@
@@ -12605,7 +13031,21 @@ index 6e5db2a..9da406a 100644
  
  /**************************************************************************//**
   @Group         FM_grp Frame Manager API
-@@ -508,6 +508,22 @@ t_Error FM_PCD_Disable(t_Handle h_FmPcd);
+@@ -185,6 +185,13 @@ typedef void (t_FmPcdIdExceptionCallback) ( t_Handle           h_App,
+ /**************************************************************************//**
+  @Description   A callback for enqueuing frame onto a QM queue.
+ 
++                E_OK transfers ownership until FM_PCD_HcTxConf. An error
++                means the frame was rejected and remains in CPU byte order;
++                the callback must not return an error after accepting it.
++                Completion waiting belongs to the HC transport. A timeout
++                does not establish whether the hardware operation ran: do
++                not reuse affected PCD objects; board reset is required.
++
+  @Param[in]     h_QmArg         - Application's handle passed to QM module on enqueue.
+  @Param[in]     p_Fd            - Frame descriptor for the frame.
+ 
+@@ -508,6 +515,22 @@ t_Error FM_PCD_Disable(t_Handle h_FmPcd);
  *//***************************************************************************/
  uint32_t FM_PCD_GetCounter(t_Handle h_FmPcd, e_FmPcdCounters counter);
  
@@ -12628,7 +13068,7 @@ index 6e5db2a..9da406a 100644
  /**************************************************************************//**
  @Function       FM_PCD_PrsLoadSw
  
-@@ -1244,7 +1260,7 @@ typedef enum e_FmPcdManipReassemWaysNumber {
+@@ -1244,7 +1267,7 @@ typedef enum e_FmPcdManipReassemWaysNumber {
  *//***************************************************************************/
  typedef enum e_FmPcdManipType {
      e_FM_PCD_MANIP_HDR = 0,             /**< Header manipulation */
@@ -12637,7 +13077,7 @@ index 6e5db2a..9da406a 100644
      e_FM_PCD_MANIP_FRAG,                /**< Fragmentation */
      e_FM_PCD_MANIP_SPECIAL_OFFLOAD      /**< Special Offloading */
  } e_FmPcdManipType;
-@@ -1699,6 +1715,7 @@ typedef struct t_FmPcdKgSchemeParams {
+@@ -1699,6 +1722,7 @@ typedef struct t_FmPcdKgSchemeParams {
          uint8_t                         relativeSchemeId;       /**< if modify=FALSE:Partition relative scheme id */
          t_Handle                        h_Scheme;               /**< if modify=TRUE: a handle of the existing scheme */
      } id;
@@ -12645,7 +13085,7 @@ index 6e5db2a..9da406a 100644
      bool                                alwaysDirect;           /**< This scheme is reached only directly, i.e. no need
                                                                       for match vector; KeyGen will ignore it when matching */
      struct {                                                    /**< HL Relevant only if alwaysDirect = FALSE */
-@@ -1944,8 +1961,7 @@ typedef struct t_FmPcdHashTableParams {
+@@ -1944,8 +1968,7 @@ typedef struct t_FmPcdHashTableParams {
      uint16_t                    maxNumOfKeys;               /**< Maximum Number Of Keys that will (ever) be used in this Hash-table */
      e_FmPcdCcStatsMode          statisticsMode;             /**< If not e_FM_PCD_CC_STATS_MODE_NONE, the required structures for the
                                                                   requested statistics mode will be allocated according to maxNumOfKeys. */
@@ -12655,7 +13095,7 @@ index 6e5db2a..9da406a 100644
      uint16_t                    hashResMask;                /**< Mask that will be used on the hash-result;
                                                                   The number-of-sets for this hash will be calculated
                                                                   as (2^(number of bits set in 'hashResMask'));
-@@ -1956,6 +1972,28 @@ typedef struct t_FmPcdHashTableParams {
+@@ -1956,6 +1979,28 @@ typedef struct t_FmPcdHashTableParams {
  
      t_FmPcdCcNextEngineParams   ccNextEngineParamsForMiss;  /**< Parameters for defining the next engine when a key is not matched */
  
@@ -12684,7 +13124,7 @@ index 6e5db2a..9da406a 100644
  } t_FmPcdHashTableParams;
  
  /**************************************************************************//**
-@@ -3362,8 +3400,7 @@ t_Error FM_PCD_MatchTableGetNextEngine(t_Handle                     h_CcNode,
+@@ -3362,8 +3407,7 @@ t_Error FM_PCD_MatchTableGetNextEngine(t_Handle                     h_CcNode,
   @Param[in]     p_KgKey                 Pointer to the key; must be like the key
                                          that the KG is generated, i.e. the same
                                          extraction and with mask if exist.
@@ -12694,7 +13134,7 @@ index 6e5db2a..9da406a 100644
   @Param[out]    p_CcNodeBucketHandle    Pointer to the bucket of the provided key.
   @Param[out]    p_BucketIndex           Index to the bucket of the provided key
   @Param[out]    p_LastIndex             Pointer to last index in the bucket of the
-@@ -3422,71 +3459,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
+@@ -3422,71 +3466,6 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param);
  *//***************************************************************************/
  t_Error FM_PCD_HashTableDelete(t_Handle h_HashTbl);
  
@@ -12766,7 +13206,7 @@ index 6e5db2a..9da406a 100644
  /**************************************************************************//**
   @Function      FM_PCD_HashTableModifyMissNextEngine
  
-@@ -3506,75 +3478,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
+@@ -3506,75 +3485,6 @@ t_Error FM_PCD_HashTableModifyNextEngine(t_Handle                  h_HashTbl,
  t_Error FM_PCD_HashTableModifyMissNextEngine(t_Handle                  h_HashTbl,
                                               t_FmPcdCcNextEngineParams *p_FmPcdCcNextEngineParams);
  
@@ -12842,7 +13282,7 @@ index 6e5db2a..9da406a 100644
  /**************************************************************************//**
   @Function      FM_PCD_ManipNodeSet
  
-@@ -3697,4 +3600,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
+@@ -3697,4 +3607,24 @@ t_Error FM_PCD_FrmReplicRemoveMember(t_Handle h_FrmReplicGroup,
  /** @} */ /* end of FM_PCD_grp group */
  /** @} */ /* end of FM_grp group */
  
@@ -13139,7 +13579,7 @@ index b52ff95ce9e9..e8cc4b0c21d2 100644
  }
 +EXPORT_SYMBOL(SYS_VirtToPhys);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
-index e10512983b60..ff447948ff4f 100644
+index e105129..707f11f 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 @@ -69,6 +69,7 @@
@@ -13150,7 +13590,79 @@ index e10512983b60..ff447948ff4f 100644
  #include "lnxwrp_fm_port.h"
  #include "lnxwrp_resources.h"
  #include "lnxwrp_sysfs_fm.h"
-@@ -1287,6 +1288,26 @@ void * fm_get_handle(struct fm *fm)
+@@ -1066,10 +1067,16 @@ static void FqFree(struct qman_fq *fq)
+ 	XX_Free((t_FmTestFq *) fq);
+ }
+ 
+-static void FreeFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
++static t_Error FreeFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+ {
+-	if (p_LnxWrpFmDev->h_PcdDev)
+-		FM_PCD_Free(p_LnxWrpFmDev->h_PcdDev);
++	t_Error err;
++
++	if (p_LnxWrpFmDev->h_PcdDev) {
++		err = FM_PCD_Free(p_LnxWrpFmDev->h_PcdDev);
++		if (err)
++			return err;
++		p_LnxWrpFmDev->h_PcdDev = NULL;
++	}
+ 
+ 	if (p_LnxWrpFmDev->hc_tx_err_fq)
+ 		FqFree(p_LnxWrpFmDev->hc_tx_err_fq);
+@@ -1079,14 +1086,20 @@ static void FreeFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+ 
+ 	if (p_LnxWrpFmDev->hc_tx_fq)
+ 		FqFree(p_LnxWrpFmDev->hc_tx_fq);
++
++	return E_OK;
+ }
+ 
+-static void FreeFmDev(t_LnxWrpFmDev  *p_LnxWrpFmDev)
++static t_Error FreeFmDev(t_LnxWrpFmDev  *p_LnxWrpFmDev)
+ {
++    t_Error err;
++
+     if (!p_LnxWrpFmDev->active)
+-        return;
++        return E_OK;
+ 
+-    FreeFmPcdDev(p_LnxWrpFmDev);
++    err = FreeFmPcdDev(p_LnxWrpFmDev);
++    if (err)
++        RETURN_ERROR(MAJOR, err, ("FMan HC cleanup refused; board reset required"));
+ 
+ #ifdef CONFIG_FSL_SDK_FMAN_RTC_API
+     if (p_LnxWrpFmDev->h_RtcDev)
+@@ -1118,6 +1131,7 @@ static void FreeFmDev(t_LnxWrpFmDev  *p_LnxWrpFmDev)
+     }
+ 
+     devm_free_irq(p_LnxWrpFmDev->dev, p_LnxWrpFmDev->irq, p_LnxWrpFmDev);
++    return E_OK;
+ }
+ 
+ /* FMan character device file operations */
+@@ -1210,7 +1224,8 @@ static void fm_remove(struct platform_device *of_dev)
+     /* Destroy chardev */
+     unregister_chrdev(p_LnxWrpFmDev->major, p_LnxWrpFmDev->name);
+ 
+-    FreeFmDev(p_LnxWrpFmDev);
++    if (FreeFmDev(p_LnxWrpFmDev) != E_OK)
++        return;
+ 
+     DestroyFmDev(p_LnxWrpFmDev);
+ 
+@@ -1232,6 +1247,9 @@ static struct platform_driver fm_driver = {
+         .name           = "fsl-fman",
+         .of_match_table    = fm_match,
+         .owner          = THIS_MODULE,
++        /* Built-in FMan has no DMA drain/reset path for a timed-out HC.
++         * A void remove cannot veto devres cleanup: require a board reset. */
++        .suppress_bind_attrs = true,
+     },
+     .probe          = fm_probe,
+     .remove         = fm_remove
+@@ -1287,6 +1305,26 @@ void * fm_get_handle(struct fm *fm)
  }
  EXPORT_SYMBOL(fm_get_handle);
  
@@ -13177,7 +13689,7 @@ index e10512983b60..ff447948ff4f 100644
  #ifdef CONFIG_FSL_SDK_FMAN_RTC_API
  void * fm_get_rtc_handle(struct fm *fm)
  {
-@@ -1319,6 +1340,15 @@ void *fm_port_get_handle(const struct fm_port *port)
+@@ -1319,6 +1357,15 @@ void *fm_port_get_handle(const struct fm_port *port)
  }
  EXPORT_SYMBOL(fm_port_get_handle);
  
@@ -13193,7 +13705,7 @@ index e10512983b60..ff447948ff4f 100644
  u64 *fm_port_get_buffer_time_stamp(const struct fm_port *port,
  		const void *data)
  {
-@@ -1610,6 +1640,21 @@ int fm_mac_resume(struct fm_mac_dev *fm_mac_dev)
+@@ -1610,6 +1657,21 @@ int fm_mac_resume(struct fm_mac_dev *fm_mac_dev)
  }
  EXPORT_SYMBOL(fm_mac_resume);
  
@@ -13270,10 +13782,110 @@ index 6e6f07eb499e..912261b63ca2 100644
  t_Error  LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd, unsigned long arg, bool compat);
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
-index ea4235847686..1aa05d79cfdf 100644
+index ea42358..eac7c22 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
-@@ -792,11 +792,10 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
+@@ -77,34 +77,29 @@ do {\
+ 	} \
+ } while (0)
+ 
+-static volatile int hcFrmRcv/* = 0 */;
+-static spinlock_t lock;
+-
+-static enum qman_cb_dqrr_result qm_tx_conf_dqrr_cb(struct qman_portal *portal,
+-						   struct qman_fq *fq,
+-						   const struct qm_dqrr_entry
+-						   *dq)
++static void hc_swap_frame(struct qm_fd *fd)
+ {
+-	t_LnxWrpFmDev *p_LnxWrpFmDev = ((t_FmTestFq *) fq)->h_Arg;
+-	unsigned long flags;
+-
+ #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+-{
+ 	/* extract the HC frame address */
+-	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr((struct qm_fd *)&dq->fd));
+-	int hcf_l = ((struct qm_fd *)&dq->fd)->length20;
++	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr(fd));
++	int hcf_l = fd->length20;
+ 	int i;
+ 
+ 	/* 32b byteswap of all data in the HC Frame */
+ 	for(i = 0; i < hcf_l / 4; ++i)
+ 		hcf_va[i] =
+ 			___constant_swab32(hcf_va[i]);
+-}
+ #endif
++}
++
++static enum qman_cb_dqrr_result qm_tx_conf_dqrr_cb(struct qman_portal *portal,
++                                                   struct qman_fq *fq,
++                                                   const struct qm_dqrr_entry *dq)
++{
++	t_LnxWrpFmDev *p_LnxWrpFmDev = ((t_FmTestFq *) fq)->h_Arg;
++
++	hc_swap_frame((struct qm_fd *)&dq->fd);
+ 	FM_PCD_HcTxConf(p_LnxWrpFmDev->h_PcdDev, (t_DpaaFD *)&dq->fd);
+-	spin_lock_irqsave(&lock, flags);
+-	hcFrmRcv--;
+-	spin_unlock_irqrestore(&lock, flags);
+ 
+ 	return qman_cb_dqrr_consume;
+ }
+@@ -187,46 +182,22 @@ static struct qman_fq *FqAlloc(t_LnxWrpFmDev * p_LnxWrpFmDev,
+ static t_Error QmEnqueueCB(t_Handle h_Arg, void *p_Fd)
+ {
+ 	t_LnxWrpFmDev *p_LnxWrpFmDev = (t_LnxWrpFmDev *) h_Arg;
+-	int _errno, timeout = 1000000;
+-	unsigned long flags;
++	int _errno;
+ 
+ 	ASSERT_COND(p_LnxWrpFmDev);
+ 
+-	spin_lock_irqsave(&lock, flags);
+-	hcFrmRcv++;
+-	spin_unlock_irqrestore(&lock, flags);
+-
+-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+-{
+-	/* extract the HC frame address */
+-	uint32_t *hcf_va = XX_PhysToVirt(qm_fd_addr((struct qm_fd *) p_Fd));
+-	int hcf_l = ((struct qm_fd *)p_Fd)->length20;
+-	int i;
+-
+-	/* 32b byteswap of all data in the HC Frame */
+-	for(i = 0; i < hcf_l / 4; ++i)
+-		hcf_va[i] =
+-			___constant_swab32(hcf_va[i]);
+-}
+-#endif
++	hc_swap_frame((struct qm_fd *)p_Fd);
+ 
+ 	_errno = qman_enqueue(p_LnxWrpFmDev->hc_tx_fq, (struct qm_fd *) p_Fd,
+ 			      0);
+-	if (_errno)
++	if (_errno) {
++		/* Rejection leaves ownership with the caller, in CPU byte order. */
++		hc_swap_frame((struct qm_fd *)p_Fd);
+ 		RETURN_ERROR(MINOR, E_INVALID_STATE,
+ 			     ("qman_enqueue() failed"));
+-
+-	while (hcFrmRcv && --timeout) {
+-		udelay(1);
+-		cpu_relax();
+-	}
+-	if (timeout == 0) {
+-		dump_stack();
+-		RETURN_ERROR(MINOR, E_WRITE_FAILED,
+-			     ("timeout waiting for Tx confirmation"));
+-		return E_WRITE_FAILED;
+ 	}
+ 
++	/* Accepted: the SDK waits for this frame's confirmation. */
+ 	return E_OK;
+ }
+ 
+@@ -792,11 +763,10 @@ static t_Error InitFmPortDev(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev)
  
  
      if ((p_LnxWrpFmPortDev->settings.param.portType != e_FM_PORT_TYPE_TX) &&
@@ -13289,6 +13901,15 @@ index ea4235847686..1aa05d79cfdf 100644
      }
  
      if (CheckNConfigFmPortAdvArgs(p_LnxWrpFmPortDev) != E_OK)
+@@ -999,8 +969,6 @@ static void LnxwrpFmPcdDevIndexedExceptionsCb(t_Handle h_App,
+ 
+ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
+ {
+-	spin_lock_init(&lock);
+-
+ 	if (p_LnxWrpFmDev->pcdActive) {
+ 		t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = &p_LnxWrpFmDev->hcPort;
+ 		t_FmPcdParams fmPcdParams;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 index f97c37f..497f0a2 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c

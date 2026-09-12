@@ -63,19 +63,6 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A117. SDK host-command failures recycle buffers still marked in flight.**
-  Pre-existing in `hc.c`: `EnQFrm` sets `enqueued[seq]` before enqueue but
-  does not clear it when enqueue fails. On completion timeout, HC callers
-  still call `PutBuf`, allowing `GetBuf` to reuse the frame and sequence while
-  hardware may own them. Retry can assert or overwrite an in-flight command;
-  a late confirmation can then complete the wrong operation. This affects
-  shared HC transport, beyond A116's scheme software ownership fix. Clear
-  state on rejected enqueue; retain timed-out buffers until confirmation or
-  a proven drain/reset, and define caller recovery before reusing affected
-  hardware objects. Test enqueue refusal, timeout, pool exhaustion, late
-  confirmation and retry against the actual transport helpers. Fault-path
-  control-plane issue; normal confirmed commands are unaffected.
-
 - [ ] **A118. SDK scheme creation/modification does not unwind programming failures.**
   Pre-existing in `fm_kg.c`: `FM_PCD_KgSchemeSet` only reports a missing
   scheme lock and continues; failed new-scheme construction or HC programming
@@ -904,3 +891,11 @@ file's git history.
   fixed (_this commit_): translate kernel/fmlib flags without changing the ABI,
   preserve public cookies on copy-out, and reject missing netenvs before scheme
   mutation. Native/compat host coverage and 128 KASAN DUT lifecycle cycles pass.
+
+- [x] **A117.** SDK HC failures recycled frames still owned by hardware —
+  fixed (_this commit_): separate QMan acceptance from per-frame completion,
+  restore rejected frames, quarantine timed-out frames until confirmation,
+  and latch failure until board reset. Guard pool replacement and PCD cleanup;
+  prevent direct-register fallback and unsupported FMan unbind recovery.
+  Actual SDK/wrapper fault tests pass under ASan/UBSan; 29 host tests and
+  12 KASAN DUT checks pass, including 128 scheme lifecycle cycles and offload.
