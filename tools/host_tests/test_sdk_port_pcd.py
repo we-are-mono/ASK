@@ -21,14 +21,20 @@ def function(source, name):
     return source[match.start():end] + "\n"
 
 
-@pytest.mark.parametrize("unit", ["port_pcd", "port_api", "kg_plan"])
+@pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_free", "port_free_legacy", "kg_plan"])
 def test_sdk_port_pcd(tmp_path, unit):
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
         pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
-    if unit in ("port_pcd", "port_api"):
+    if unit.startswith("port_free"):
+        source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
+        production = "\n".join(function(source, name) for name in [
+            "FmPortDriverParamFree", "FM_PORT_Init", "FM_PORT_Free",
+            "FM_PORT_ConfigFifoDeqPipelineDepth",
+        ])
+    elif unit in ("port_pcd", "port_api"):
         source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
         production = function(source, "GetPortSchemeBindParams")
         production += source[source.index("static t_Error DeletePcd(t_FmPort *p_FmPort);"):
@@ -48,7 +54,8 @@ def test_sdk_port_pcd(tmp_path, unit):
             "UnbindPortToClsPlanGrp", "FmPcdKgBuildClsPlanGrp", "FmPcdKgDestroyClsPlanGrp", "FmPcdKgSetOrBindToClsPlanGrp",
             "FmPcdKgDeleteOrUnbindPortToClsPlanGrp",
         ])
-    (tmp_path / f"{unit}_production.inc").write_text(production)
+    fixture = "port_free" if unit.startswith("port_free") else unit
+    (tmp_path / f"{fixture}_production.inc").write_text(production)
     shutil.copyfile(Path(__file__).with_name("sdk_types_linux.h"), tmp_path / "types_linux.h")
     binary = tmp_path / unit
     command = [os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
@@ -59,7 +66,9 @@ def test_sdk_port_pcd(tmp_path, unit):
     for inc in ["inc", "inc/etc", "inc/Peripherals", "inc/flib", "inc/integrations/LS1043",
                 "Peripherals/FM/inc", "Peripherals/FM/Port", "Peripherals/FM/Pcd"]:
         command.extend(["-I", str(sdk / inc)])
-    command.extend([str(Path(__file__).with_name(f"sdk_{unit}.c")), "-o", str(binary)])
+    if unit == "port_free_legacy":
+        command.append("-DTEST_LEGACY_DEQ")
+    command.extend([str(Path(__file__).with_name(f"sdk_{fixture}.c")), "-o", str(binary)])
     subprocess.run(command, check=True)
     subprocess.run([str(binary)], check=True, timeout=30,
                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",

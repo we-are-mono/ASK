@@ -63,15 +63,6 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A112. SDK port destruction dereferences freed initialization parameters.**
-  Pre-existing in `fm_port.c`: `FM_PORT_Free` calls `FmPortDriverParamFree`
-  (which clears the pointer), then reads `p_FmPortDriverParam->dfltCfg` for
-  `deqPipelineDepth`. Successful `FM_PORT_Init` already freed that structure.
-  Cache the effective depth in persistent port state when assigning FM
-  resources, including the revision override, and use it during destruction.
-  Cover both initialized-port destruction and construction-failure cleanup.
-  Ordinary PCD delete/retry keeps the port object alive and does not hit this.
-
 - [ ] **A113. SDK CC-tree replacement loses the old binding and lacks PCD locks.**
   Pre-existing in `fm_port.c`: `FM_PORT_PcdCcModifyTree` binds the replacement
   and overwrites `ccTreeId` without unbinding the previous root, including
@@ -93,6 +84,16 @@ stale line refs) are folded into the archive one-liners.
   handles after successful deletion, propagate failures before destroying
   the root, and preserve shared schemes. Cover delete/rebuild with the
   same manipulation and HC failures in the actual scheme/root helpers.
+
+- [ ] **A115. SDK FM port-resource allocation leaves partial state on failure.**
+  Pre-existing in `fm.c`: `FmGetSetPortParams` publishes the port type and
+  HC-initialized flag, then acquires tasks, dequeue budget, FIFO and DMA
+  resources in stages without rollback. A later failure retains earlier
+  charges; the MTU-check error exits also retain the FM spinlock. Make this
+  helper transactional, including shared pool accounting and all lock exits.
+  `FmFreePortParams` assumes complete allocation and cannot safely unwind
+  an arbitrary partial acquisition. A112 tracks successful acquisition at
+  the port boundary; internal allocator failures need separate fault tests.
 
 ## Feature enablement (not bugs)
 
@@ -888,3 +889,6 @@ file's git history.
 
 - [x] **A111.** Public SDK PCD setup/delete leaked locks and ownership on errors —
   fixed (_this commit_): track completed acquisitions, preserve unfinished cleanup and balance retries.
+
+- [x] **A112.** SDK port destruction dereferenced discarded initialization parameters —
+  fixed (_this commit_): retain charged dequeue depth and release successfully acquired FM resources once.
