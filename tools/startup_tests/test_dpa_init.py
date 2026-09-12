@@ -4,6 +4,8 @@ Run separately from tools/tests: these cases require an unconfigured FMAN.
 The final check loads CDX successfully in the same boot.
 """
 
+import base64
+import gzip
 import json
 import re
 import shlex
@@ -75,9 +77,23 @@ def test_dpa_init_rollback(tmp_path):
                 results.append({"site": site, "step": step, "muram": muram_before})
                 print(f"rollback passed: {site}:{step}", flush=True)
             run("echo scan > /sys/kernel/debug/kmemleak")
-            leaks = run("cat /sys/kernel/debug/kmemleak")
-            (tmp_path / "kmemleak.txt").write_text(leaks)
-            assert not leaks, leaks
+            # X3's hardware-owned boot pool can age into kmemleak after the
+            # initial clear. Transfer the complete report compressed: dumping
+            # thousands of these objects verbatim exceeds the UART timeout.
+            encoded = run("cat /sys/kernel/debug/kmemleak | gzip -c | base64 -w0", timeout=120)
+            raw_leaks = gzip.decompress(base64.b64decode(encoded)).decode()
+            (tmp_path / "kmemleak.txt").write_text(raw_leaks)
+            objects = re.findall(r"unreferenced object .*?(?=unreferenced object |\Z)",
+                                 raw_leaks, re.S)
+            assert "".join(objects).strip() == raw_leaks.strip(), "Unrecognized kmemleak report"
+            known_pool = {obj for obj in objects
+                          if 'comm "swapper/0", pid 1,' in obj
+                          and "dpaa_eth_priv_probe+" in obj
+                          and "dpaa_eth_refill_bpools+" in obj}
+            leaks = [obj for obj in objects if obj not in known_pool]
+            (tmp_path / "kmemleak-unexpected.txt").write_text("".join(leaks))
+            assert not leaks, "".join(leaks)
+            print(f"kmemleak: no unexpected objects; {len(known_pool)} known X3 boot-pool objects", flush=True)
             result = con.run("modprobe cdx", timeout=90)
             assert result.rc == 0, result.stdout + run("cat /tmp/dpa-startup.log")
             assert re.search(r"^cdx ", run("cat /proc/modules"), re.M)
@@ -85,7 +101,8 @@ def test_dpa_init_rollback(tmp_path):
             kernel = run("dmesg")
             assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
             (tmp_path / "results.json").write_text(json.dumps({"boot_id": boot, "faults": results,
-                "same_boot_retry": True, "kernel_splats": False, "kmemleak": []}, indent=2))
+                "same_boot_retry": True, "kernel_splats": False, "kmemleak": [],
+                "known_boot_pool_objects": len(known_pool)}, indent=2))
             print("normal initialization passed in the same boot", flush=True)
         finally:
             run("mv /usr/bin/dpa_app.startup-test /usr/bin/dpa_app")

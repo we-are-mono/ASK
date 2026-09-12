@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?(?:t_Error|void|uint32_t) " + name
+    match = re.search(r"^(?:static )?(?:t_Error|void|uint32_t|int) " + name
                       + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     end, depth = match.end(), 1
@@ -21,22 +21,32 @@ def function(source, name):
     return source[match.start():end] + "\n"
 
 
-@pytest.mark.parametrize("unit", ["port_pcd", "kg_plan"])
+@pytest.mark.parametrize("unit", ["port_pcd", "port_api", "kg_plan"])
 def test_sdk_port_pcd(tmp_path, unit):
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
         pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
-    if unit == "port_pcd":
+    if unit in ("port_pcd", "port_api"):
         source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
         production = function(source, "GetPortSchemeBindParams")
-        production += source[source.index("struct fm_port_pcd_bindings"):
+        production += source[source.index("static t_Error DeletePcd(t_FmPort *p_FmPort);"):
                              source.index("static t_Error AttachPCD")]
+        if unit == "port_api":
+            production += function(source, "FmPortGetSetCcParams").replace(
+                "t_Error FmPortGetSetCcParams(", "static t_Error RealGetSetCcParams(")
+            production += "\n".join(function(source, name) for name in [
+                "FmPortSetGprFunc", "FmPortSetFESupport", "FmPortDeleteFESupport",
+                "FM_PORT_Free", "AttachPCD", "DetachPCD", "FM_PORT_AttachPCD", "FM_PORT_DetachPCD",
+                "FM_PORT_ConfigureMuramPage", "DeletePortPcd", "FM_PORT_SetPCD", "FM_PORT_DeletePCD",
+                "FM_PORT_PcdKgBindSchemes", "FM_PORT_PcdKgUnbindSchemes",
+            ])
     else:
         source = (sdk / "Peripherals/FM/Pcd/fm_kg.c").read_text()
         production = "\n".join(function(source, name) for name in [
-            "FmPcdKgBuildClsPlanGrp", "FmPcdKgDestroyClsPlanGrp", "FmPcdKgSetOrBindToClsPlanGrp",
+            "UnbindPortToClsPlanGrp", "FmPcdKgBuildClsPlanGrp", "FmPcdKgDestroyClsPlanGrp", "FmPcdKgSetOrBindToClsPlanGrp",
+            "FmPcdKgDeleteOrUnbindPortToClsPlanGrp",
         ])
     (tmp_path / f"{unit}_production.inc").write_text(production)
     shutil.copyfile(Path(__file__).with_name("sdk_types_linux.h"), tmp_path / "types_linux.h")

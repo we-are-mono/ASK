@@ -48,15 +48,21 @@ t_Error FmHcPcdKgSetClsPlan(t_Handle handle, t_FmPcdKgInterModuleClsPlanSet *set
 { assert(entries && set->baseEntry == 8); return failure == 3 ? E_NO_MEMORY : E_OK; }
 void KgSetClsPlan(t_Handle pcd, t_FmPcdKgInterModuleClsPlanSet *set)
 { assert(entries && set->baseEntry == 8); }
+static t_Error KgWriteCpp(t_FmPcd *pcd, uint8_t port, uint32_t cpp)
+{ assert(!cpp); return failure == 5 ? E_BUSY : E_OK; }
+t_Error FmHcPcdKgDeleteClsPlan(t_Handle handle, uint8_t id)
+{
+    if (failure == 6) return E_NO_MEMORY;
+    FmPcdKgDestroyClsPlanGrp(handle, id);
+    return E_OK;
+}
 static t_Error BindPortToClsPlanGrp(t_FmPcd *pcd, uint8_t port, uint8_t id)
 { assert(entries && pcd->p_FmPcdKg->clsPlanGrps[id].used); return failure == 4 ? E_NO_MEMORY : E_OK; }
 #include "kg_plan_production.inc"
 
 static void release(t_FmPcd *pcd, uint8_t id)
 {
-    t_FmPcdKgClsPlanGrp *grp = &pcd->p_FmPcdKg->clsPlanGrps[id];
-    assert(grp->owners);
-    if (!--grp->owners) FmPcdKgDestroyClsPlanGrp(pcd, id);
+    assert(FmPcdKgDeleteOrUnbindPortToClsPlanGrp(pcd, 2, id) == E_OK);
 }
 
 int main(void)
@@ -68,6 +74,7 @@ int main(void)
                     if ((shared && fault && fault != 4) || (!host_command && fault == 3)) continue;
                     t_FmPcdKg kg = {.emptyClsPlanGrpId = ILLEGAL_CLS_PLAN};
                     t_FmPcd pcd = {.guestId = NCSW_MASTER_ID, .p_FmPcdKg = &kg};
+                    pcd.h_Hc = &pcd;
                     pcd.netEnvs[0].clsPlanGrpId = ILLEGAL_CLS_PLAN;
                     protocolOpt_t opts[FM_PCD_MAX_NUM_OF_OPTIONS(FM_PCD_MAX_NUM_OF_CLS_PLANS)] = {0};
                     uint8_t id = ILLEGAL_CLS_PLAN; bool empty = false;
@@ -88,6 +95,15 @@ int main(void)
                     assert(shared || (kg.emptyClsPlanGrpId == ILLEGAL_CLS_PLAN && pcd.netEnvs[0].clsPlanGrpId == ILLEGAL_CLS_PLAN));
                     failure = 0;
                     assert(FmPcdKgSetOrBindToClsPlanGrp(&pcd, 2, 0, opts, &id, &empty) == E_OK);
+                    /* Unbind refusal and last-owner cleanup failure retain the owner. */
+                    for (unsigned cleanup = 0; cleanup < 2; cleanup++) {
+                        if (shared && cleanup) continue;
+                        failure = cleanup ? (hc ? 6 : 1) : 5;
+                        assert(FmPcdKgDeleteOrUnbindPortToClsPlanGrp(&pcd, 2, id) != E_OK);
+                        assert(kg.clsPlanGrps[id].owners == shared + 1 && kg.clsPlanGrps[id].used);
+                        assert(entries && !allocations);
+                    }
+                    failure = 0;
                     release(&pcd, id);
                     if (shared) release(&pcd, id);
                     assert(!entries && !allocations && !pcd.netEnvs[0].owners);

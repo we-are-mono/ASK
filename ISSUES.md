@@ -63,17 +63,36 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A111. SDK outer PCD API error paths remain non-transactional.**
-  Pre-existing in `sdk_fman/Peripherals/FM/Port/fm_port.c`: several
-  `FM_PORT_SetPCD` validation/allocation exits after `TRY_LOCK` omit its
-  release; errors after parser-statistics registration or the net-environment
-  owner increment call `DeletePcd`, which does not undo those acquisitions.
-  `FM_PORT_DeletePCD` also decrements the environment owner before attempting
-  the global PCD lock, so a refused lock makes a subsequent retry unbalanced.
-  A108 covers failures within `SetPcd` and classification-plan acquisition;
-  these outer paths need a separate transaction audit, including reassembly
-  tree/manipulation state, lock ownership, and cleanup failures. Add tests
-  through the public APIs before restructuring them.
+- [ ] **A112. SDK port destruction dereferences freed initialization parameters.**
+  Pre-existing in `fm_port.c`: `FM_PORT_Free` calls `FmPortDriverParamFree`
+  (which clears the pointer), then reads `p_FmPortDriverParam->dfltCfg` for
+  `deqPipelineDepth`. Successful `FM_PORT_Init` already freed that structure.
+  Cache the effective depth in persistent port state when assigning FM
+  resources, including the revision override, and use it during destruction.
+  Cover both initialized-port destruction and construction-failure cleanup.
+  Ordinary PCD delete/retry keeps the port object alive and does not hit this.
+
+- [ ] **A113. SDK CC-tree replacement loses the old binding and lacks PCD locks.**
+  Pre-existing in `fm_port.c`: `FM_PORT_PcdCcModifyTree` binds the replacement
+  and overwrites `ccTreeId` without unbinding the previous root, including
+  same-tree replacement. It also omits the all-PCD lock required by
+  `FmPcdCcBindTree`. Audit replacement as a transaction: preserve the old
+  tree and port actions on failure, serialize both trees, and transfer the
+  counted binding once. Cover repeated same-tree calls, shared roots and
+  bind/lock failures. This API is outside the normal startup path and its
+  fmlib wrapper is still gated by A103.
+
+- [ ] **A114. Reassembly scheme deletion leaves stale handles and hides errors.**
+  Pre-existing in `fm_manip.c`: `FmPcdManipDeleteIpReassmSchemes` and the
+  CAPWAP equivalent ignore `FM_PCD_KgSchemeDelete` failures and retain
+  their scheme handles after successful deletion. The build helpers treat
+  those non-null handles as an existing scheme, so reusing a manipulation
+  after its last root is deleted can skip rebuilding an invalid scheme.
+  `FM_PCD_CcRootDelete` also ignores the helpers' return values. Audit this
+  lower-level lifetime separately from A111's public port ownership: clear
+  handles after successful deletion, propagate failures before destroying
+  the root, and preserve shared schemes. Cover delete/rebuild with the
+  same manipulation and HC failures in the actual scheme/root helpers.
 
 ## Feature enablement (not bugs)
 
@@ -859,10 +878,13 @@ file's git history.
   hardware deletion/expiry checks cover sole and shared routes.
 
 - [x] **A108.** Partial SDK `SetPcd` failures pinned classifier bindings —
-  fixed (_this commit_): unwind completed stages and failed classification-plan acquisition.
+  fixed (_cf1e3a7_): unwind completed stages and failed classification-plan acquisition.
 
 - [x] **A109.** Forced CEETM draining discarded descriptors and leaked buffers —
-  fixed (_this commit_): preserve portal results and reclaim every returned FD in CDX.
+  fixed (_cf1e3a7_): preserve portal results and reclaim every returned FD in CDX.
 
 - [x] **A110.** Interface removal freed TX FQs during asynchronous retirement —
-  fixed (_this commit_): drain every queue and finish callbacks before destroying storage.
+  fixed (_cf1e3a7_): drain every queue and finish callbacks before destroying storage.
+
+- [x] **A111.** Public SDK PCD setup/delete leaked locks and ownership on errors —
+  fixed (_this commit_): track completed acquisitions, preserve unfinished cleanup and balance retries.
