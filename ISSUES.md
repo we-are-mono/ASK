@@ -63,16 +63,6 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A115. SDK FM port-resource allocation leaves partial state on failure.**
-  Pre-existing in `fm.c`: `FmGetSetPortParams` publishes the port type and
-  HC-initialized flag, then acquires tasks, dequeue budget, FIFO and DMA
-  resources in stages without rollback. A later failure retains earlier
-  charges; the MTU-check error exits also retain the FM spinlock. Make this
-  helper transactional, including shared pool accounting and all lock exits.
-  `FmFreePortParams` assumes complete allocation and cannot safely unwind
-  an arbitrary partial acquisition. A112 tracks successful acquisition at
-  the port boundary; internal allocator failures need separate fault tests.
-
 - [ ] **A116. SDK scheme deletion commits software teardown before HC success.**
   Pre-existing in `fm_kg.c`: `FM_PCD_KgSchemeDelete` clears required-action
   state before checking owners, then `InvalidateSchemeSw` drops the netenv
@@ -889,3 +879,6 @@ file's git history.
 
 - [x] **A114.** Reassembly scheme teardown retained stale handles and hid failures —
   resolved (_this commit_): remove unsupported SDK/ASK reassembly; reject creation and attachment at API/ioctl boundaries.
+
+- [x] **A115.** FM port allocation left partial charges and locked error exits —
+  fixed (_this commit_): validate before committing resources; serialize updates and preserve failed FIFO resize state.

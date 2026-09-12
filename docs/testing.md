@@ -293,6 +293,14 @@ plan allocation and programming, shared owners, and retry on the same port.
 These failures happen inside the SDK operations, beyond the ioctl boundary
 mocked by the loader lifecycle test.
 
+`tools/host_tests/test_sdk_port_resources.py` runs the actual FM allocator,
+resource setters and register helpers under ASan/UBSan. It rejects exhausted
+task/FIFO/DMA and dequeue budgets, checks MTU error exits, preserves another
+port's allocations, and exercises retry, release, reset-derived DMA counts,
+runtime FIFO resizing and guest failures. Every refusal must leave accounting,
+registers and caller parameters unchanged, with the original interrupt state
+restored. Both LS104x and legacy resource-accounting variants are compiled.
+
 On the DUT, DPA tests verify that repeated loader invocations stop at the
 initialization check, that the control device excludes a second opener,
 and that the new check obeys the per-ioctl capability gate. They also create
