@@ -6,7 +6,8 @@ Add FM_ReadTimeStamp() and FM_GetTimeStampIncrementPerUsec() functions
 for timestamp reading from FMan engine.
 
 Add hash table type enumeration and extended t_FmPcdHashTableParams
-structure fields for IP reassembly table support.
+structure fields for external tables. Keep former reassembly fields
+reserved for ABI compatibility.
 
 Add FM_PCD_Get_Sch_handle() function for scheme handle access.
 
@@ -17,6 +18,9 @@ functionality on the Mono Gateway.
 
 Retain the whole-tree replacement API as an unsupported operation in
 Mono, returning before accessing handles or issuing an ioctl.
+
+Reject unsupported hardware reassembly at the public API boundary,
+before accessing object handles or sending ioctls.
 
 Upstream-Status: Inappropriate [vendor-specific extension]
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
@@ -65,9 +69,18 @@ index 3607b86..e6db99a 100644
  /** @} */ /* end of lnx_usr_FM_lib_grp group */
  /** @} */ /* end of lnx_usr_FM_grp group */
 diff --git a/include/fmd/Peripherals/fm_pcd_ext.h b/include/fmd/Peripherals/fm_pcd_ext.h
-index 7f32680..8bfecfd 100644
+index 7f32680..ea02334 100644
 --- a/include/fmd/Peripherals/fm_pcd_ext.h
 +++ b/include/fmd/Peripherals/fm_pcd_ext.h
+@@ -1254,7 +1254,7 @@ typedef enum e_FmPcdStatsType {
+ *//***************************************************************************/
+ typedef enum e_FmPcdManipType {
+     e_FM_PCD_MANIP_HDR = 0,             /**< Header manipulation */
+-    e_FM_PCD_MANIP_REASSEM,             /**< Reassembly */
++    e_FM_PCD_MANIP_REASSEM,            /**< Reserved in Mono; hardware reassembly is unsupported. */
+     e_FM_PCD_MANIP_FRAG,                /**< Fragmentation */
+     e_FM_PCD_MANIP_SPECIAL_OFFLOAD      /**< Special Offloading */
+ } e_FmPcdManipType;
 @@ -1717,6 +1717,7 @@ typedef struct t_FmPcdKgSchemeParams {
          uint8_t                         relativeSchemeId;       /**< if modify=FALSE:Partition relative scheme id */
          t_Handle                        h_Scheme;               /**< if modify=TRUE: a handle of the existing scheme */
@@ -135,9 +148,21 @@ index 7f32680..8bfecfd 100644
  
  /**************************************************************************//**
 diff --git a/include/fmd/Peripherals/fm_port_ext.h b/include/fmd/Peripherals/fm_port_ext.h
-index df72794..22e46d7 100644
+index df72794..dd79279 100644
 --- a/include/fmd/Peripherals/fm_port_ext.h
 +++ b/include/fmd/Peripherals/fm_port_ext.h
+@@ -2270,9 +2270,9 @@ typedef struct t_FmPortPcdParams {
+                                                      or if any flow uses a KG scheme were policer
+                                                      profile is not generated
+                                                      ('bypassPlcrProfileGeneration selected'). */
+-    t_Handle                h_IpReassemblyManip;    /**< IP Reassembly manipulation */
++    t_Handle                h_IpReassemblyManip; /**< Reserved in Mono; must be NULL. */
+ #if (DPAA_VERSION >= 11)
+-    t_Handle                h_CapwapReassemblyManip;/**< CAPWAP Reassembly manipulation */
++    t_Handle                h_CapwapReassemblyManip; /**< Reserved in Mono; must be NULL. */
+ #endif /* (DPAA_VERSION >= 11) */
+ } t_FmPortPcdParams;
+ 
 @@ -2462,18 +2462,13 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
  /**************************************************************************//**
   @Function      FM_PORT_PcdCcModifyTree
@@ -163,7 +188,7 @@ index df72794..22e46d7 100644
  t_Error FM_PORT_PcdCcModifyTree (t_Handle h_FmPort, t_Handle h_CcTree);
  
 diff --git a/src/fm_lib.c b/src/fm_lib.c
-index 4de5168..e1be611 100644
+index 4de5168..d8af00f 100644
 --- a/src/fm_lib.c
 +++ b/src/fm_lib.c
 @@ -317,6 +317,44 @@ t_Error  FM_GetApiVersion(t_Handle h_Fm, ioc_fm_api_version_t *p_version)
@@ -334,10 +359,13 @@ index 4de5168..e1be611 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -1191,6 +1247,12 @@ t_Error FM_PCD_MatchTableModifyKeyAndNextEngine(t_Handle            h_CcNode,
+@@ -1191,6 +1247,15 @@ t_Error FM_PCD_MatchTableModifyKeyAndNextEngine(t_Handle            h_CcNode,
      return E_OK;
  }
  
++/* The SDK masks external-hash types to the low four bits. */
++#define FM_PCD_HASH_TABLE_TYPE_MASK 0xf
++
 +/* The ioctl struct is this struct plus a trailing 'void *id'; the memcpy below
 + * relies on the two being field-for-field identical up to that point. */
 +_Static_assert(sizeof(ioc_fm_pcd_hash_table_params_t) ==
@@ -347,15 +375,25 @@ index 4de5168..e1be611 100644
  t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  {
      t_Device *p_PcdDev = (t_Device*) h_FmPcd;
-@@ -1201,6 +1263,7 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+@@ -1199,8 +1264,17 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  
+     SANITY_CHECK_RETURN_VALUE(p_PcdDev, E_INVALID_HANDLE, NULL);
+ 
++    SANITY_CHECK_RETURN_VALUE(p_Param, E_NULL_POINTER, NULL);
++    if ((p_Param->table_type & FM_PCD_HASH_TABLE_TYPE_MASK) == IPV4_REASSM_TABLE ||
++        (p_Param->table_type & FM_PCD_HASH_TABLE_TYPE_MASK) == IPV6_REASSM_TABLE)
++    {
++        REPORT_ERROR(MAJOR, E_NOT_SUPPORTED, ("Hardware reassembly is unsupported in Mono"));
++        return NULL;
++    }
++
      _fml_dbg("Calling...\n");
  
 +    memset(&params, 0, sizeof(params));
      memcpy(&params, p_Param, sizeof(t_FmPcdHashTableParams));
      params.id = NULL;
  
-@@ -1222,18 +1285,20 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+@@ -1222,18 +1296,20 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  
  #endif /* DPAA_VERSION >= 11 */
  
@@ -381,7 +419,7 @@ index 4de5168..e1be611 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -1423,19 +1488,21 @@ t_Handle FM_PCD_PlcrProfileSet(t_Handle h_FmPcd, t_FmPcdPlcrProfileParams *p_Pro
+@@ -1423,19 +1499,21 @@ t_Handle FM_PCD_PlcrProfileSet(t_Handle h_FmPcd, t_FmPcdPlcrProfileParams *p_Pro
      if (params.next_engine_on_red == e_IOC_FM_PCD_KG && params.params_on_red.p_direct_scheme)
          DEV_TO_ID(params.params_on_red.p_direct_scheme);
  
@@ -408,7 +446,21 @@ index 4de5168..e1be611 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -1489,11 +1556,6 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+@@ -1479,6 +1557,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+ 
+     SANITY_CHECK_RETURN_VALUE(p_PcdDev, E_INVALID_HANDLE, NULL);
+ 
++    SANITY_CHECK_RETURN_VALUE(p_FmPcdManipParams, E_NULL_POINTER, NULL);
++    if (p_FmPcdManipParams->type == e_FM_PCD_MANIP_REASSEM)
++    {
++        REPORT_ERROR(MAJOR, E_NOT_SUPPORTED, ("Hardware reassembly is unsupported in Mono"));
++        return NULL;
++    }
++
+     _fml_dbg("Calling...\n");
+ 
+     memset(&params, 0, sizeof(ioc_fm_pcd_manip_params_t));
+@@ -1489,11 +1574,6 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
          params.p_next_manip = UINT_TO_PTR(p_Dev->id);
      }
  
@@ -420,7 +472,7 @@ index 4de5168..e1be611 100644
      p_Dev = (t_Device *)malloc(sizeof(t_Device));
      if (!p_Dev)
      {
-@@ -1501,6 +1563,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+@@ -1501,6 +1581,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
          return NULL;
      }
  
@@ -434,7 +486,35 @@ index 4de5168..e1be611 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -2013,23 +2082,12 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
+@@ -1830,6 +1917,12 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_FmPortPcd)
+     ASSERT_COND(sizeof(t_FmPortPcdParams) == sizeof(ioc_fm_port_pcd_params_t));
+     SANITY_CHECK_RETURN_ERROR(p_Dev, E_INVALID_HANDLE);
+ 
++    SANITY_CHECK_RETURN_ERROR(p_FmPortPcd, E_NULL_POINTER);
++    if (p_FmPortPcd->h_IpReassemblyManip || p_FmPortPcd->h_CapwapReassemblyManip)
++    {
++        return ERROR_CODE(E_NOT_SUPPORTED);
++    }
++
+     _fml_dbg("Calling...\n");
+ 
+     memcpy(&params, p_FmPortPcd, sizeof(t_FmPortPcdParams));
+@@ -1881,14 +1974,6 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_FmPortPcd)
+         }
+     }
+ 
+-    if (params.p_ip_reassembly_manip)
+-        DEV_TO_ID(params.p_ip_reassembly_manip);
+-
+-#if (DPAA_VERSION >= 11)
+-    if (params.p_capwap_reassembly_manip)
+-	DEV_TO_ID(params.p_capwap_reassembly_manip);
+-#endif
+-
+     if (ioctl(p_Dev->fd, FM_PORT_IOC_SET_PCD, &params))
+         RETURN_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+ 
+@@ -2013,23 +2098,12 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
      return E_OK;
  }
  
@@ -463,7 +543,7 @@ index 4de5168..e1be611 100644
  }
  
  t_Error FM_PORT_PcdKgBindSchemes (t_Handle h_FmPort, t_FmPcdPortSchemesParams *p_PortScheme)
-@@ -2127,18 +2185,20 @@ t_Handle FM_PCD_FrmReplicSetGroup(t_Handle h_FmPcd, t_FmPcdFrmReplicGroupParams
+@@ -2127,18 +2201,20 @@ t_Handle FM_PCD_FrmReplicSetGroup(t_Handle h_FmPcd, t_FmPcdFrmReplicGroupParams
          }
      }
  

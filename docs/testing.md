@@ -276,7 +276,9 @@ our patches and the production loader under ASan/UBSan. It injects startup
 allocation/device failures and cleanup failures, checks retries and shared
 object ownership, and exercises saved-model compatibility and one/two-FMAN
 table counts. The companion SDK test exercises external-table teardown,
-root ownership, shared reassembly cookies, busy refusals, and stale handles.
+root ownership, shared cookies, busy refusals, and stale handles. SDK and
+fmlib tests reject hardware-reassembly creation/attachment before allocations
+or nested-handle access; native and compat ioctl tests cover reserved inputs.
 These tests require the fetched vendor Git repositories and the patched ASK
 kernel source. Run them with:
 

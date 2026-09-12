@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?(?:t_Error|void|uint32_t|int) " + name
+    match = re.search(r"^(?:static )?(?:t_Error|t_Handle|void|uint32_t|int) " + name
                       + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     end, depth = match.end(), 1
@@ -22,7 +22,7 @@ def function(source, name):
 
 
 @pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_ioctl", "port_ioctl_native",
-                                  "port_free", "port_free_legacy", "kg_plan"])
+                                  "port_free", "port_free_legacy", "kg_plan", "reassembly"])
 def test_sdk_port_pcd(tmp_path, unit):
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
@@ -32,15 +32,17 @@ def test_sdk_port_pcd(tmp_path, unit):
     if unit.startswith("port_ioctl"):
         source = (sdk / "src/wrapper/lnxwrp_ioctls_fm.c").read_text()
         uapi = kernel / "include/uapi/linux/fmd"
-        definitions = "\n".join((uapi / name).read_text() for name in [
-            "ioctls.h", "integrations/integration_ioctls.h", "Peripherals/fm_ioctls.h",
-            "Peripherals/fm_port_ioctls.h",
-        ])
-        definitions = re.sub(r"/\*.*?\*/", "", definitions, flags=re.S)
-        production = "\n".join(re.findall(
-            r"^#define\s+(?:DEV_FM_\w*MINOR\w*|NCSW_IOC_TYPE_BASE|FM_IOC_TYPE_BASE|"
-            r"FM_PORT_IOC_NUM|FM_PORT_IOC_PCD_CC_MODIFY_TREE(?:_COMPAT)?)\b[^\n]*",
-            definitions, re.M)) + "\n" + function(source, "fm_ioctls")
+        production = function(source, "fm_reassembly_ioctl") + function(source, "fm_ioctls")
+        (tmp_path / "linux").mkdir()
+        (tmp_path / "linux/compat.h").write_text(
+            "#include <stdint.h>\ntypedef uint32_t compat_uptr_t;\n"
+            "#define compat_ptr(p) ((void *)(uintptr_t)(p))\n")
+    elif unit == "reassembly":
+        layout = (sdk / "inc/Peripherals/fm_ehash.h").read_text().split("static inline void display_mcast_member_tbl_entry", 1)[0]
+        (tmp_path / "ehash_layout.h").write_text(layout + "\n#endif\n")
+        production = function((sdk / "Peripherals/FM/Pcd/fm_manip.c").read_text(), "FM_PCD_ManipNodeSet")
+        production += function((sdk / "Peripherals/FM/Pcd/fm_ehash.c").read_text(), "ExternalHashTableSet")
+        production += function((sdk / "Peripherals/FM/Pcd/fm_cc.c").read_text(), "FM_PCD_HashTableSet")
     elif unit.startswith("port_free"):
         source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
         production = "\n".join(function(source, name) for name in [
@@ -81,6 +83,9 @@ def test_sdk_port_pcd(tmp_path, unit):
     for inc in ["inc", "inc/etc", "inc/Peripherals", "inc/flib", "inc/integrations/LS1043",
                 "Peripherals/FM/inc", "Peripherals/FM/Port", "Peripherals/FM/Pcd"]:
         command.extend(["-I", str(sdk / inc)])
+    if unit.startswith("port_ioctl"):
+        for inc in [uapi, uapi / "Peripherals", uapi / "integrations", sdk / "src/wrapper"]:
+            command.extend(["-I", str(inc)])
     if unit == "port_free_legacy":
         command.append("-DTEST_LEGACY_DEQ")
     if unit == "port_ioctl_native":

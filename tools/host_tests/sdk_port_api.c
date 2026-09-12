@@ -2,10 +2,10 @@
 #define TEST_PUBLIC_API
 #include "sdk_port_fixture.h"
 
-static bool all_locked, private_tree, use_fe;
+static bool all_locked, use_fe;
 static unsigned env_owners, heap_allocs, muram_allocs, muram_calls, muram_fail;
-static unsigned settings_calls, settings_fail, reassembly_calls, cases;
-static int pcd_token, tree_token;
+static unsigned settings_calls, settings_fail, cases;
+static int pcd_token;
 static t_Error RealGetSetCcParams(t_Handle port, t_FmPortGetSetCcParams *params);
 static bool port_try_lock(volatile bool *lock)
 { if (*lock || failure == PORT_LOCK) return false; *lock = true; return true; }
@@ -20,7 +20,7 @@ void FmPcdLockUnlockAll(t_Handle pcd) { assert(all_locked); all_locked = false; 
 void FmPcdIncNetEnvOwners(t_Handle pcd, uint8_t env) { env_owners++; }
 void FmPcdDecNetEnvOwners(t_Handle pcd, uint8_t env) { assert(env_owners); env_owners--; }
 void *XX_Malloc(uint32_t size)
-{ if (failure == ROOT_ALLOC) return NULL; void *p = malloc(size); assert(p); heap_allocs++; return p; }
+{ void *p = malloc(size); assert(p); heap_allocs++; return p; }
 void XX_Free(void *p) { assert(p && heap_allocs); heap_allocs--; free(p); }
 void *FM_MURAM_AllocMem(t_Handle muram, uint32_t size, uint32_t align)
 {
@@ -32,25 +32,6 @@ t_Error FM_MURAM_FreeMem(t_Handle muram, void *p)
 physAddress_t XX_VirtToPhys(void *p) { return (physAddress_t)(uintptr_t)p; }
 void *IOMemSet32(void *p, uint8_t value, uint32_t size) { return memset(p, value, size); }
 
-t_Handle FM_PCD_CcRootBuild(t_Handle pcd, t_FmPcdCcTreeParams *params)
-{
-    assert(!all_locked && env_owners && !private_tree);
-    if (failure == ROOT_BUILD) return NULL;
-    private_tree = true; env_owners++; return &tree_token;
-}
-t_Error FM_PCD_CcRootDelete(t_Handle tree)
-{
-    /* ReleaseLock returns the tree/scheme locks to the pool without clearing
-     * their flags. They must be unlocked before those objects are deleted. */
-    assert(!all_locked);
-    assert(tree == &tree_token && private_tree);
-    if (cleanup_failure == ROOT_DELETE) return E_BUSY;
-    private_tree = false; assert(env_owners); env_owners--; return E_OK;
-}
-t_Error FmPcdCcTreeAddIPR(t_Handle pcd, t_Handle tree, t_Handle env, t_Handle manip, bool create)
-{ reassembly_calls++; assert(!all_locked && tree && manip); return failure == REASSEMBLY ? E_NO_MEMORY : E_OK; }
-t_Error FmPcdCcTreeAddCPR(t_Handle pcd, t_Handle tree, t_Handle env, t_Handle manip, bool create)
-{ return FmPcdCcTreeAddIPR(pcd, tree, env, manip, create); }
 bool FmPcdIsHcUsageAllowed(t_Handle pcd) { return true; }
 t_Error FmPcdHcSync(t_Handle pcd) { return failure == HC_SYNC ? E_BUSY : E_OK; }
 t_Error FmSetNumOfRiscsPerPort(t_Handle fm, uint8_t id, uint8_t count, t_FmFmanCtrl ctrl)
@@ -87,9 +68,9 @@ struct fixture {
     t_FmPortPcdCcParams cc;
     t_FmPortPcdParams params;
 };
-static void init(struct fixture *f, bool oh, unsigned reassembly, bool stats)
+static void init(struct fixture *f, bool oh, bool stats)
 {
-    assert(!all_locked && !env_owners && !private_tree && !muram_allocs && !heap_allocs);
+    assert(!all_locked && !env_owners && !muram_allocs && !heap_allocs);
     assert(!roots && !plans && !schemes && !statistics);
     memset(f, 0, sizeof(*f));
     failure = cleanup_failure = NONE; muram_calls = muram_fail = settings_calls = settings_fail = 0;
@@ -105,22 +86,13 @@ static void init(struct fixture *f, bool oh, unsigned reassembly, bool stats)
     f->cc.h_CcTree = (void *)2;
     f->params = (t_FmPortPcdParams){.pcdSupport = e_FM_PORT_PCD_SUPPORT_PRS_AND_KG_AND_CC,
         .h_NetEnv = &pcd_token, .p_PrsParams = &f->prs, .p_KgParams = &f->kg, .p_CcParams = &f->cc};
-    if (reassembly) {
-        if (oh) f->params.h_CapwapReassemblyManip = (void *)3;
-        else f->params.h_IpReassemblyManip = (void *)3;
-        if (reassembly == 1) {
-            f->params.p_CcParams = NULL;
-            f->params.pcdSupport = e_FM_PORT_PCD_SUPPORT_PRS_AND_KG;
-        }
-    }
 }
 static void unlocked(struct fixture *f) { assert(!f->port.lock && !all_locked && !heap_allocs); }
 static void clean(struct fixture *f)
 {
     unlocked(f);
-    assert(!env_owners && !private_tree && !roots && !plans && !schemes && !statistics);
+    assert(!env_owners && !roots && !plans && !schemes && !statistics);
     assert(!f->port.pcdEngines && !f->port.pcdConfigured && !f->port.pcdNetEnvOwner);
-    assert(!f->port.h_ReassemblyTree && !f->port.h_IpReassemblyManip && !f->port.h_CapwapReassemblyManip);
     assert(!f->port.requiredAction && !f->port.supportFE);
     assert(!f->port.pcdBindings.cc && !f->port.pcdBindings.clsPlan && !f->port.pcdBindings.schemes);
     assert(muram_allocs == !!f->port.p_ParamsPage); /* page belongs to port lifetime */
@@ -147,34 +119,54 @@ int main(void)
 {
     struct fixture f;
     /* Reserved replacement API must not inspect handles or change a live
-     * classifier, including reassembly roots and already-held locks. */
+     * classifier, including already-held locks. */
     for (unsigned oh = 0; oh < 2; oh++) {
-        for (unsigned reassembly = 0; reassembly < 3; reassembly++) {
-            for (unsigned detached = 0; detached < 2; detached++) {
-                init(&f, oh, reassembly, true);
-                assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
-                if (detached) assert(FM_PORT_DetachPCD(&f.port) == E_OK);
-                f.port.lock = all_locked = true;
-                struct fixture before; memcpy(&before, &f, sizeof(f));
-                unsigned r = roots, rb = root_binds, owners = env_owners;
-                unsigned reasm = reassembly_calls, settings = settings_calls;
-                t_Handle trees[] = {f.port.ccTreeId, (void *)1, NULL};
-                for (unsigned i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
-                    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(&f.port, trees[i])) == E_NOT_SUPPORTED);
-                    assert(!memcmp(&before, &f, sizeof(f)));
-                    assert(roots == r && root_binds == rb && env_owners == owners);
-                    assert(reassembly_calls == reasm && settings_calls == settings && all_locked);
-                }
-                f.port.lock = all_locked = false;
-                assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
+        for (unsigned detached = 0; detached < 2; detached++) {
+            init(&f, oh, true);
+            assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
+            if (detached) assert(FM_PORT_DetachPCD(&f.port) == E_OK);
+            f.port.lock = all_locked = true;
+            struct fixture before; memcpy(&before, &f, sizeof(f));
+            unsigned r = roots, rb = root_binds, owners = env_owners;
+            unsigned settings = settings_calls;
+            t_Handle trees[] = {f.port.ccTreeId, (void *)1, NULL};
+            for (unsigned i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+                assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(&f.port, trees[i])) == E_NOT_SUPPORTED);
+                assert(!memcmp(&before, &f, sizeof(f)));
+                assert(roots == r && root_binds == rb && env_owners == owners);
+                assert(settings_calls == settings && all_locked);
             }
+            f.port.lock = all_locked = false;
+            assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
         }
     }
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(NULL, NULL)) == E_NOT_SUPPORTED);
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree((void *)1, (void *)1)) == E_NOT_SUPPORTED);
+    /* Reassembly requests cannot change an unconfigured or live port, even
+     * when their nested CC pointer is unreadable and the port lock is held. */
+    for (unsigned configured = 0; configured < 2; configured++) {
+        for (unsigned type = 1; type < 4; type++) {
+            init(&f, false, true);
+            if (configured) assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
+            t_FmPortPcdParams valid = f.params;
+            f.params.h_IpReassemblyManip = (type & 1) ? (void *)1 : NULL;
+            f.params.h_CapwapReassemblyManip = (type & 2) ? (void *)1 : NULL;
+            f.params.p_CcParams = (void *)1;
+            f.port.lock = true;
+            struct fixture before = f;
+            unsigned owners = env_owners, binds = root_binds, calls = settings_calls;
+            assert(GET_ERROR_TYPE(FM_PORT_SetPCD(&f.port, &f.params)) == E_NOT_SUPPORTED);
+            assert(!memcmp(&f, &before, sizeof(f)));
+            assert(owners == env_owners && binds == root_binds && calls == settings_calls);
+            f.port.lock = false; f.params = valid;
+            if (configured) assert(FM_PORT_DeletePCD(&f.port) == E_OK);
+            else retry(&f);
+            finish(&f);
+        }
+    }
     /* Real API validation failures must leave the same port available. */
     for (unsigned invalid = 0; invalid < 6; invalid++) {
-        init(&f, false, 0, true);
+        init(&f, false, true);
         t_FmPortPcdParams valid = f.params;
         if (invalid == 0) f.cc.h_CcTree = NULL;
         if (invalid == 1) f.params.h_IpReassemblyManip = f.params.h_CapwapReassemblyManip = (void *)3;
@@ -188,75 +180,70 @@ int main(void)
     for (unsigned offload = 0; offload < 2; offload++) {
         advanced = offload;
         for (unsigned oh = 0; oh < 2; oh++) {
-            for (unsigned reassembly = 0; reassembly < 3; reassembly++) {
-                for (enum fault fault = CC_BIND; fault <= RISC_ATTACH; fault++) {
-                    if (fault == PARSER || fault == SETTINGS) continue;
-                    if ((fault == ROOT_ALLOC || fault == ROOT_BUILD) && reassembly != 1) continue;
-                    if (fault == REASSEMBLY && !reassembly) continue;
-                    init(&f, oh, reassembly, true); failure = fault;
+            for (enum fault fault = CC_BIND; fault <= RISC_ATTACH; fault++) {
+                if (fault == PARSER || fault == SETTINGS) continue;
+                init(&f, oh, true); failure = fault;
+                assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
+                retry(&f); finish(&f);
+            }
+            /* Fail each post-binding settings call, including the last MURAM setup. */
+            for (unsigned call = 1; call <= (offload ? (oh ? 3 : 2) : 1); call++) {
+                init(&f, oh, true); settings_fail = call;
+                assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
+                retry(&f); finish(&f);
+            }
+            for (unsigned fe = 0; fe < 2; fe++) {
+                for (unsigned allocation = 1; allocation <= (fe ? 3 : 1); allocation++) {
+                    init(&f, oh, true); use_fe = fe; muram_fail = allocation;
                     assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
                     retry(&f); finish(&f);
                 }
-                /* Fail each post-binding settings call, including the last MURAM setup. */
-                for (unsigned call = 1; call <= (offload ? (oh ? 4 : 3) + !!reassembly : 1); call++) {
-                    init(&f, oh, reassembly, true); settings_fail = call;
-                    assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
-                    retry(&f); finish(&f);
-                }
-                for (unsigned fe = 0; fe < 2; fe++) {
-                    for (unsigned allocation = 1; allocation <= (fe ? 3 : 1); allocation++) {
-                        init(&f, oh, reassembly, true); use_fe = fe; muram_fail = allocation;
-                        assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK); clean(&f);
+            }
+            for (enum fault cleanup = STATS_DISABLE; cleanup <= CC_UNBIND; cleanup++) {
+                for (unsigned setup_fail = 0; setup_fail < 2; setup_fail++) {
+                    for (unsigned next_set = 0; next_set < 2; next_set++) {
+                        init(&f, oh, true); use_fe = true;
+                        cleanup_failure = cleanup;
+                        if (setup_fail) {
+                            failure = RISC_ATTACH;
+                            assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK);
+                        } else {
+                            assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
+                            assert(FM_PORT_DeletePCD(&f.port) != E_OK);
+                        }
+                        unlocked(&f); assert(env_owners && f.port.pcdNetEnvOwner && !f.port.pcdConfigured);
+                        unsigned owners = env_owners, r = roots, p = plans, s = schemes;
+                        assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
+                        assert(env_owners == owners && roots == r && plans == p && schemes == s);
+                        assert(FM_PORT_AttachPCD(&f.port) != E_OK); unlocked(&f);
+                        assert(FM_PORT_Free(&f.port) != E_OK); unlocked(&f);
+                        t_FmPcdPortSchemesParams bind = {.numOfSchemes = 1, .h_Schemes = {(void *)1}};
+                        assert(FM_PORT_PcdKgBindSchemes(&f.port, &bind) != E_OK); unlocked(&f);
+                        failure = cleanup_failure = NONE;
+                        if (!next_set) { assert(FM_PORT_DeletePCD(&f.port) == E_OK); clean(&f); }
                         retry(&f); finish(&f);
                     }
                 }
-                for (enum fault cleanup = STATS_DISABLE; cleanup <= ROOT_DELETE; cleanup++) {
-                    if (cleanup == ROOT_DELETE && reassembly != 1) continue;
-                    for (unsigned setup_fail = 0; setup_fail < 2; setup_fail++) {
-                        for (unsigned next_set = 0; next_set < 2; next_set++) {
-                            init(&f, oh, reassembly, true); use_fe = true;
-                            cleanup_failure = cleanup;
-                            if (setup_fail) {
-                                failure = RISC_ATTACH;
-                                assert(FM_PORT_SetPCD(&f.port, &f.params) != E_OK);
-                            } else {
-                                assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
-                                assert(FM_PORT_DeletePCD(&f.port) != E_OK);
-                            }
-                            unlocked(&f); assert(env_owners && f.port.pcdNetEnvOwner && !f.port.pcdConfigured);
-                            unsigned owners = env_owners, r = roots, p = plans, s = schemes;
-                            assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
-                            assert(env_owners == owners && roots == r && plans == p && schemes == s);
-                            assert(FM_PORT_AttachPCD(&f.port) != E_OK); unlocked(&f);
-                            assert(FM_PORT_Free(&f.port) != E_OK); unlocked(&f);
-                            t_FmPcdPortSchemesParams bind = {.numOfSchemes = 1, .h_Schemes = {(void *)1}};
-                            assert(FM_PORT_PcdKgBindSchemes(&f.port, &bind) != E_OK); unlocked(&f);
-                            failure = cleanup_failure = NONE;
-                            if (!next_set) { assert(FM_PORT_DeletePCD(&f.port) == E_OK); clean(&f); }
-                            retry(&f); finish(&f);
-                        }
-                    }
-                }
-                /* A refused global delete lock changes neither registers nor owners. */
-                init(&f, oh, reassembly, false); assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
-                t_FmPort saved = f.port; union fman_port_bmi_regs bmi = f.bmi; unsigned owners = env_owners;
-                failure = ALL_LOCK;
-                assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
-                assert(env_owners == owners && !memcmp(&saved, &f.port, sizeof(saved)) && !memcmp(&bmi, &f.bmi, sizeof(bmi)));
-                failure = HC_SYNC;
-                assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
-                assert(env_owners == owners && f.port.pcdConfigured && roots == 1 && schemes == 1 && plans == 1);
-                failure = RISC_DETACH;
-                assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f); assert(env_owners == owners);
-                failure = NONE;
-                assert(FM_PORT_DetachPCD(&f.port) == E_OK);
-                assert(FM_PORT_DeletePCD(&f.port) == E_OK); clean(&f); retry(&f); finish(&f);
             }
+            /* A refused global delete lock changes neither registers nor owners. */
+            init(&f, oh, false); assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
+            t_FmPort saved = f.port; union fman_port_bmi_regs bmi = f.bmi; unsigned owners = env_owners;
+            failure = ALL_LOCK;
+            assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
+            assert(env_owners == owners && !memcmp(&saved, &f.port, sizeof(saved)) && !memcmp(&bmi, &f.bmi, sizeof(bmi)));
+            failure = HC_SYNC;
+            assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
+            assert(env_owners == owners && f.port.pcdConfigured && roots == 1 && schemes == 1 && plans == 1);
+            failure = RISC_DETACH;
+            assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f); assert(env_owners == owners);
+            failure = NONE;
+            assert(FM_PORT_DetachPCD(&f.port) == E_OK);
+            assert(FM_PORT_DeletePCD(&f.port) == E_OK); clean(&f); retry(&f); finish(&f);
         }
     }
     /* Inner rollback can fail too; the outer retry must retain its remainder. */
     for (unsigned test = 0; test < 3; test++) {
-        init(&f, false, 1, true);
+        init(&f, false, true);
         failure = test == 0 ? PLAN_BIND : test == 1 ? SCHEME_BIND : PARSER;
         if (test == 2) { f.prs.numOfHdrsWithAdditionalParams = 1; f.prs.additionalParams[0].hdr = HEADER_TYPE_ETH; }
         cleanup_failure = test == 0 ? CC_UNBIND : test == 1 ? PLAN_UNBIND : SCHEME_UNBIND;
@@ -266,7 +253,7 @@ int main(void)
     }
     /* Dynamic scheme removal/rebinding must agree with later port deletion. */
     for (unsigned rebind = 0; rebind < 2; rebind++) {
-        init(&f, false, 0, true);
+        init(&f, false, true);
         assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
         t_FmPcdPortSchemesParams bind = {.numOfSchemes = 1, .h_Schemes = {(void *)1}};
         assert(FM_PORT_PcdKgUnbindSchemes(&f.port, &bind) == E_OK);
@@ -282,7 +269,7 @@ int main(void)
         e_FM_PORT_PCD_SUPPORT_CC_ONLY, e_FM_PORT_PCD_SUPPORT_PLCR_ONLY,
         e_FM_PORT_PCD_SUPPORT_PRS_AND_PLCR, e_FM_PORT_PCD_SUPPORT_PRS_AND_KG};
     for (unsigned mode = 0; mode < sizeof(modes) / sizeof(modes[0]); mode++) {
-        init(&f, mode == 1, 0, true);
+        init(&f, mode == 1, true);
         t_FmPortPcdPlcrParams plcr = {.h_Profile = (void *)4};
         f.params.pcdSupport = modes[mode];
         if (mode != 1) f.params.p_CcParams = NULL;

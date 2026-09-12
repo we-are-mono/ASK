@@ -135,3 +135,55 @@ finally:
         con.login("root", None)
         result = con.run("python3 -c " + shlex.quote(script), timeout=45)
         assert result.rc == 0, result.stdout
+
+
+async def test_hardware_reassembly_unsupported(splat_window):
+    # Native arm64 UAPI values/layouts are asserted by sdk_port_ioctl.c.
+    # Invalid nested pointers ensure rejection precedes cookie resolution.
+    script = """
+import errno, fcntl, glob, os, struct
+
+def rejected(fd, command, data):
+    before = bytes(data)
+    try:
+        fcntl.ioctl(fd, command, data)
+    except OSError as error:
+        assert error.errno == errno.EOPNOTSUPP, (hex(command), error)
+    else:
+        raise AssertionError('hardware reassembly accepted')
+    assert bytes(data) == before, 'rejected request changed its arguments'
+
+fd = os.open('/dev/fm0-pcd', os.O_RDWR)
+try:
+    data = bytearray(b'\\xff' * 464)
+    struct.pack_into('<I', data, 0, 1)  # MANIP_REASSEM; all headers unsupported.
+    rejected(fd, 0xc1d0e13f, data)
+    for table_type in (14, 15, 0xfffffffe, 0xffffffff):
+        data = bytearray(b'\\xff' * 120)
+        struct.pack_into('<I', data, 68, table_type)
+        rejected(fd, 0xc078e139, data)
+finally:
+    os.close(fd)
+checked = 0
+for device in sorted(glob.glob('/dev/fm0-port-*')):
+    try:
+        fd = os.open(device, os.O_RDWR)
+    except OSError as error:
+        if error.errno == errno.ENODEV:
+            continue
+        raise
+    try:
+        for ip, capwap in ((1, 0), (0, 1), (1, 1)):
+            data = bytearray(b'\\xff' * 64)
+            struct.pack_into('<QQ', data, 48, ip, capwap)
+            rejected(fd, 0x4040e15a, data)
+        checked += 1
+    finally:
+        os.close(fd)
+assert checked, 'no active FMAN ports'
+print('reassembly creation and attachment rejected on %d ports' % checked)
+"""
+    with Console.target() as con:
+        con.login("root", None)
+        result = con.run("python3 -c " + shlex.quote(script), timeout=20)
+        assert result.rc == 0, result.stdout

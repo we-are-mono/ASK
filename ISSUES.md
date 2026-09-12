@@ -63,18 +63,6 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A114. Reassembly scheme deletion leaves stale handles and hides errors.**
-  Pre-existing in `fm_manip.c`: `FmPcdManipDeleteIpReassmSchemes` and the
-  CAPWAP equivalent ignore `FM_PCD_KgSchemeDelete` failures and retain
-  their scheme handles after successful deletion. The build helpers treat
-  those non-null handles as an existing scheme, so reusing a manipulation
-  after its last root is deleted can skip rebuilding an invalid scheme.
-  `FM_PCD_CcRootDelete` also ignores the helpers' return values. Audit this
-  lower-level lifetime separately from A111's public port ownership: clear
-  handles after successful deletion, propagate failures before destroying
-  the root, and preserve shared schemes. Cover delete/rebuild with the
-  same manipulation and HC failures in the actual scheme/root helpers.
-
 - [ ] **A115. SDK FM port-resource allocation leaves partial state on failure.**
   Pre-existing in `fm.c`: `FmGetSetPortParams` publishes the port type and
   HC-initialized flag, then acquires tasks, dequeue budget, FIFO and DMA
@@ -84,6 +72,17 @@ stale line refs) are folded into the archive one-liners.
   `FmFreePortParams` assumes complete allocation and cannot safely unwind
   an arbitrary partial acquisition. A112 tracks successful acquisition at
   the port boundary; internal allocator failures need separate fault tests.
+
+- [ ] **A116. SDK scheme deletion commits software teardown before HC success.**
+  Pre-existing in `fm_kg.c`: `FM_PCD_KgSchemeDelete` clears required-action
+  state before checking owners, then `InvalidateSchemeSw` drops the netenv
+  reference and marks the scheme invalid before the fallible host command.
+  The HC path returns the scheme lock to the pool even on failure and leaves
+  its pointer set. Retrying can repeat the owner decrement and lock release
+  while hardware may still contain the scheme. This affects ordinary schemes
+  independently of the removed reassembly feature. Make failed deletion
+  preserve software ownership and lock state; test busy refusal, HC failure
+  and retry against the actual scheme helpers.
 
 ## Feature enablement (not bugs)
 
@@ -887,3 +886,6 @@ file's git history.
 
 - [x] **A113.** Whole-tree replacement leaked bindings and omitted PCD locks —
   resolved (_this commit_): remove the implementation; retain APIs/ioctl numbers with explicit unsupported errors.
+
+- [x] **A114.** Reassembly scheme teardown retained stale handles and hid failures —
+  resolved (_this commit_): remove unsupported SDK/ASK reassembly; reject creation and attachment at API/ioctl boundaries.

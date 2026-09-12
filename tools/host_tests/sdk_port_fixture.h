@@ -18,9 +18,9 @@
 #define fallthrough __attribute__((fallthrough))
 
 enum fault { NONE, CC_BIND, PLAN_BIND, SCHEME_BIND, VSPE, PARSER,
-    PORT_LOCK, ALL_LOCK, ROOT_ALLOC, ROOT_BUILD, REASSEMBLY, STATS_ENABLE,
+    PORT_LOCK, ALL_LOCK, STATS_ENABLE,
     SETTINGS, RISC_ATTACH, RISC_DETACH, STATS_DISABLE, SCHEME_UNBIND,
-    PLAN_UNBIND, CC_UNBIND, ROOT_DELETE, HC_SYNC };
+    PLAN_UNBIND, CC_UNBIND, HC_SYNC };
 static enum fault failure, cleanup_failure;
 static unsigned reports, statistics;
 static bool advanced;

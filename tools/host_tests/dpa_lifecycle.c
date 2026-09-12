@@ -293,6 +293,34 @@ int main(void)
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(NULL, NULL)) == E_NOT_SUPPORTED);
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree((void *)1, (void *)1)) == E_NOT_SUPPORTED);
     assert(step == steps && hardware_calls == calls);
+    unsigned live_allocations = allocated;
+    e_NetHeaderType headers[] = {HEADER_TYPE_IPv4, HEADER_TYPE_IPv6, HEADER_TYPE_CAPWAP};
+    for (unsigned h = 0; h < sizeof(headers) / sizeof(headers[0]); h++) {
+        t_FmPcdManipParams manip = {.type = e_FM_PCD_MANIP_REASSEM,
+            .h_NextManip = (void *)1};
+        manip.u.reassem.hdr = headers[h];
+        t_FmPcdManipParams before = manip;
+        assert(FM_PCD_ManipNodeSet((void *)1, &manip) == NULL);
+        assert(!memcmp(&before, &manip, sizeof(manip)));
+    }
+    for (unsigned type = IPV4_REASSM_TABLE; type <= IPV6_REASSM_TABLE; type++) {
+        t_FmPcdHashTableParams hash = {.table_type = type | 0x80000000};
+        hash.ccNextEngineParamsForMiss.h_Manip = (void *)1;
+        t_FmPcdHashTableParams before = hash;
+        assert(FM_PCD_HashTableSet((void *)1, &hash) == NULL);
+        assert(!memcmp(&before, &hash, sizeof(hash)));
+    }
+    for (unsigned type = 1; type < 4; type++) {
+        t_FmPortPcdParams port;
+        memset(&port, 0xff, sizeof(port));
+        port.h_IpReassemblyManip = (void *)(uintptr_t)(type & 1);
+        port.h_CapwapReassemblyManip = (void *)(uintptr_t)(type & 2);
+        t_FmPortPcdParams before = port;
+        assert(GET_ERROR_TYPE(FM_PORT_SetPCD((void *)1, &port)) == E_NOT_SUPPORTED);
+        assert(!memcmp(&before, &port, sizeof(port)));
+    }
+    assert(step == steps && hardware_calls == calls && allocated == live_allocations);
+
     assert(dpa_init() != 0 && hardware_calls == calls && compile_calls == compiles);
     cleaning = true;
     assert(fmc_clean(&cmodel) == 0);

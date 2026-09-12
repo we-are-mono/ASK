@@ -1,30 +1,9 @@
-"""IP-reassembly stress tests covering C3/C4 (cdx/cdx_reassm.c).
+"""Stress Linux IPv4 fragment handling while normal ASK forwarding continues.
 
-The `ipr_buff_release_dqrr` path reads `num_entries` and `ref_count`
-from a reassembly context that FMAN microcode populates. Userspace
-can't forge those fields directly, so the only way to regression-test
-C3 (unbounded num_entries) and C4 (ref_count underflow) is to drive
-enough real fragmented traffic through the hardware reassembly path
-that a regression trips the sanitizer shelf (UBSAN/KFENCE/WARN/BUG,
-all gated by `splat_window`) or kmemleak (deltaed via kmemleak_clear
-at test entry + filtered scan at exit).
-
-Traffic shape:
-  lan  --- fragmented UDP -->  target (FMAN reassembles)  ---->  wan
-         scapy send_frags            hardware reassembly            iperf3
-                                     ipr_buff_release_dqrr
-
-Variants:
-  A1 plain — one pass over many 5-tuples, out-of-order fragments.
-  A2 duplicates — every fragment sent twice back-to-back. Stresses
-     the same-context ref_count increment path (C4 regression would
-     show as underflow WARN or bman_release on a stale ctx).
-
-Overlapping fragments are intentionally not covered: FMAN's microcode
-behavior under overlap is not contracted and varies by version. The
-pool-saturation scenario is folded in via the large
-number of distinct 5-tuples (>= max_contexts for the vendor default
-config of 128), which exercises context eviction under churn.
+Mono sends fragmented traffic through the software path. These tests exercise
+out-of-order and duplicate fragments, with sanitizer and allocation checks;
+they do not exercise the removed SDK/CDX hardware-reassembly implementation.
+The concurrent iperf variant also checks that normal forwarding remains live.
 """
 
 from __future__ import annotations
@@ -37,34 +16,17 @@ import pytest
 
 from _topology import lan_run, lan_run_python
 
-# ISSUES.md X3 calls out the broad ASK_KMEMLEAK_FILTER as too coarse:
-# `dpaa_eth_refill_bpools` allocations carry [cdx]/[auto_bridge] tags
-# but aren't real leaks (skb addresses live in HW descriptor rings,
-# kmemleak's pointer scanner can't see them). Those baseline objects
-# can age into "suspected" between this test's clear and scan, so the
-# broad filter trips intermittently. Narrow to reassembly-handler
-# function needles instead — they only match leaks rooted in the
-# code path under test here.
-REASSM_LEAK_FILTER = [
-    "cdx_init_ip_reassembly",
-    "cdx_create_ipr_fq",
-    "replenish_ipr_frag_pool",
-    "cdx_get_ipr_v4_stats",
-    "cdx_get_ipr_v6_stats",
-    "ip_reassembly_frag_list",
+# Limit kmemleak matching to the software fragment path. Hardware-owned DPAA
+# buffers are invisible to its pointer scanner and produce unrelated reports.
+FRAGMENT_LEAK_FILTER = [
+    "inet_frag_alloc", "inet_frag_create", "ip_frag_queue", "ip_frag_reasm", "ip_defrag",
 ]
 
 
 WAN_IPERF_IP = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
 
-# Knobs chosen so the whole test runs in well under a minute:
-#   - 1500 pre-fragmentation packets, each 2-5 KB → ~4-10 fragments each,
-#     so ~6000-15000 actual frame sends.
-#   - 150 distinct source ports → 150 distinct 5-tuples, above the
-#     default 128 reassembly contexts on this platform. Forces pool
-#     churn; any C3 regression on context reuse trips the sanitizer.
-#   - fragsize=500 B keeps per-fragment size well under the PCD's
-#     typical frame-size threshold so they all hit the reassembly path.
+# Interleave many datagrams across flows, with several fragments per datagram.
+# The shuffled and duplicate variants exercise incomplete queues and expiry.
 N_PACKETS       = 1500
 N_SOURCE_PORTS  = 150
 UDP_SPORT_BASE  = 30000
@@ -89,8 +51,7 @@ def _storm_script(duplicate: bool) -> str:
             frags = fragment(pkt, fragsize={FRAGSIZE})
             if {int(bool(duplicate))}:
                 # Interleave the duplicate after the original so the
-                # target sees two-in-a-row for each fragment — the
-                # ref_count wrap scenario from C4.
+                # list contains two copies of every fragment before shuffling.
                 doubled = []
                 for f in frags:
                     doubled.append(f)
@@ -98,7 +59,7 @@ def _storm_script(duplicate: bool) -> str:
                 frags = doubled
             all_frags.extend(frags)
         # Shuffle across the whole storm so different contexts interleave;
-        # this creates the churn C3 needs under pool pressure.
+        # this creates many simultaneously incomplete datagrams.
         random.shuffle(all_frags)
         # Batch-send to keep per-packet sendto() overhead manageable.
         send(all_frags, verbose=0, inter=0)
@@ -128,15 +89,15 @@ async def _run_storm(lan_console, duplicate: bool) -> str:
 @pytest.mark.parametrize(
     "duplicate,label",
     [
-        (False, "plain"),        # C3-oriented: pool-churn + list walk
-        (True,  "duplicates"),   # C4-oriented: ref_count increment path
+        (False, "plain"),
+        (True,  "duplicates"),
     ],
     ids=["plain", "duplicates"],
 )
 async def test_reassembly_fragment_storm(
     aiohttp_session, target_agent, lan, splat_window, duplicate, label,
 ):
-    """Fragment storm from lan through target's FMAN reassembly.
+    """Fragment storm from lan through target's Linux reassembly.
 
     splat_window gates UBSAN/KFENCE/lockdep/WARN/BUG during the storm.
     kmemleak delta (cleared pre-storm, filtered post-storm) catches any
@@ -156,10 +117,10 @@ async def test_reassembly_fragment_storm(
     await asyncio.sleep(3.0)
 
     report = await target_agent.kmemleak(
-        aiohttp_session, filter_substrs=REASSM_LEAK_FILTER,
+        aiohttp_session, filter_substrs=FRAGMENT_LEAK_FILTER,
     )
     assert report.get("leak_count", 0) == 0, (
-        f"kmemleak found {report['leak_count']} new leak(s) in ASK code "
+        f"kmemleak found {report['leak_count']} new leak(s) in the software fragment path "
         f"after {label} storm ({out.strip().splitlines()[-1]}):\n"
         + report.get("report", "")[:4000]
     )
@@ -195,13 +156,10 @@ async def test_reassembly_storm_with_concurrent_iperf(
 ):
     """Fragment storm AND iperf3 in parallel through the DUT.
 
-    The storm exercises FMAN reassembly (memory-class). iperf3 exercises
+    The storm exercises software fragment handling. iperf3 exercises
     the offloaded fast path. Running both at once verifies the
     interleave doesn't collapse the offload path entirely (liveness)
     and doesn't introduce splats or leaks (correctness).
-
-    KASAN-eligible: the fragment pool kmallocs in
-    cdx/cdx_reassm.c are exactly what KASAN catches.
     """
     await target_agent.kmemleak_clear(aiohttp_session)
 
@@ -220,7 +178,7 @@ async def test_reassembly_storm_with_concurrent_iperf(
         f"> {log_path} 2>&1 & echo started",
     )
     # Brief warm-up so the TCP handshake completes before fragments
-    # start hammering the reassembly pool.
+    # start sending fragmented traffic.
     await asyncio.sleep(0.5)
 
     # Storm runs synchronously on the UART. iperf3 keeps running in
@@ -247,7 +205,7 @@ async def test_reassembly_storm_with_concurrent_iperf(
     # kmemleak grace then scan, same shape as the standalone variant.
     await asyncio.sleep(3.0)
     report = await target_agent.kmemleak(
-        aiohttp_session, filter_substrs=REASSM_LEAK_FILTER,
+        aiohttp_session, filter_substrs=FRAGMENT_LEAK_FILTER,
     )
     assert report.get("leak_count", 0) == 0, (
         f"kmemleak found {report['leak_count']} new leak(s) after "
