@@ -22,6 +22,9 @@ Mono, returning before accessing handles or issuing an ioctl.
 Reject unsupported hardware reassembly at the public API boundary,
 before accessing object handles or sending ioctls.
 
+Serialize the SDK direct-scheme flag into the public ioctl field; keep
+the software-only shared flag out of the ioctl payload.
+
 Upstream-Status: Inappropriate [vendor-specific extension]
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
@@ -188,7 +191,7 @@ index df72794..dd79279 100644
  t_Error FM_PORT_PcdCcModifyTree (t_Handle h_FmPort, t_Handle h_CcTree);
  
 diff --git a/src/fm_lib.c b/src/fm_lib.c
-index 4de5168..d8af00f 100644
+index 4de5168..c622713 100644
 --- a/src/fm_lib.c
 +++ b/src/fm_lib.c
 @@ -317,6 +317,44 @@ t_Error  FM_GetApiVersion(t_Handle h_Fm, ioc_fm_api_version_t *p_version)
@@ -275,7 +278,22 @@ index 4de5168..d8af00f 100644
  t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
  {
      t_Device *p_PcdDev = (t_Device*) h_FmPcd;
-@@ -657,19 +703,25 @@ t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
+@@ -634,8 +680,12 @@ t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
+ 
+     _fml_dbg("Calling...\n");
+ 
+-    memcpy(&params, p_Scheme, sizeof(t_FmPcdKgSchemeParams));
+-    params.id = NULL;
++    /* shared belongs to the SDK/FMC model, not the public ioctl. */
++    memset(&params, 0, sizeof(params));
++    memcpy(&params, p_Scheme, offsetof(t_FmPcdKgSchemeParams, shared));
++    params.always_direct = p_Scheme->alwaysDirect;
++    memcpy(&params.net_env_params, &p_Scheme->netEnvParams,
++           sizeof(*p_Scheme) - offsetof(t_FmPcdKgSchemeParams, netEnvParams));
+ 
+     if (params.modify)
+     {
+@@ -657,19 +707,25 @@ t_Handle FM_PCD_KgSchemeSet (t_Handle h_FmPcd, t_FmPcdKgSchemeParams *p_Scheme)
          params.kg_next_engine_params.cc.tree_id)
              DEV_TO_ID(params.kg_next_engine_params.cc.tree_id);
  
@@ -306,7 +324,7 @@ index 4de5168..d8af00f 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      /* increase owners only if a new scheme is created */
-@@ -765,19 +817,21 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd, t_FmPcdCcTreeParams *p_PcdTreePara
+@@ -765,19 +821,21 @@ t_Handle FM_PCD_CcRootBuild(t_Handle h_FmPcd, t_FmPcdCcTreeParams *p_PcdTreePara
              }
          }
  
@@ -333,7 +351,7 @@ index 4de5168..d8af00f 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -865,18 +919,20 @@ t_Handle FM_PCD_MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNodeParams *p_CcNodePar
+@@ -865,18 +923,20 @@ t_Handle FM_PCD_MatchTableSet(t_Handle h_FmPcd, t_FmPcdCcNodeParams *p_CcNodePar
  
  #endif /* DPAA_VERSION >= 11 */
  
@@ -359,7 +377,7 @@ index 4de5168..d8af00f 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -1191,6 +1247,15 @@ t_Error FM_PCD_MatchTableModifyKeyAndNextEngine(t_Handle            h_CcNode,
+@@ -1191,6 +1251,15 @@ t_Error FM_PCD_MatchTableModifyKeyAndNextEngine(t_Handle            h_CcNode,
      return E_OK;
  }
  
@@ -375,7 +393,7 @@ index 4de5168..d8af00f 100644
  t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  {
      t_Device *p_PcdDev = (t_Device*) h_FmPcd;
-@@ -1199,8 +1264,17 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+@@ -1199,8 +1268,17 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  
      SANITY_CHECK_RETURN_VALUE(p_PcdDev, E_INVALID_HANDLE, NULL);
  
@@ -393,7 +411,7 @@ index 4de5168..d8af00f 100644
      memcpy(&params, p_Param, sizeof(t_FmPcdHashTableParams));
      params.id = NULL;
  
-@@ -1222,18 +1296,20 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
+@@ -1222,18 +1300,20 @@ t_Handle FM_PCD_HashTableSet(t_Handle h_FmPcd, t_FmPcdHashTableParams *p_Param)
  
  #endif /* DPAA_VERSION >= 11 */
  
@@ -419,7 +437,7 @@ index 4de5168..d8af00f 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -1423,19 +1499,21 @@ t_Handle FM_PCD_PlcrProfileSet(t_Handle h_FmPcd, t_FmPcdPlcrProfileParams *p_Pro
+@@ -1423,19 +1503,21 @@ t_Handle FM_PCD_PlcrProfileSet(t_Handle h_FmPcd, t_FmPcdPlcrProfileParams *p_Pro
      if (params.next_engine_on_red == e_IOC_FM_PCD_KG && params.params_on_red.p_direct_scheme)
          DEV_TO_ID(params.params_on_red.p_direct_scheme);
  
@@ -446,7 +464,7 @@ index 4de5168..d8af00f 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -1479,6 +1557,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+@@ -1479,6 +1561,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
  
      SANITY_CHECK_RETURN_VALUE(p_PcdDev, E_INVALID_HANDLE, NULL);
  
@@ -460,7 +478,7 @@ index 4de5168..d8af00f 100644
      _fml_dbg("Calling...\n");
  
      memset(&params, 0, sizeof(ioc_fm_pcd_manip_params_t));
-@@ -1489,11 +1574,6 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+@@ -1489,11 +1578,6 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
          params.p_next_manip = UINT_TO_PTR(p_Dev->id);
      }
  
@@ -472,7 +490,7 @@ index 4de5168..d8af00f 100644
      p_Dev = (t_Device *)malloc(sizeof(t_Device));
      if (!p_Dev)
      {
-@@ -1501,6 +1581,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
+@@ -1501,6 +1585,13 @@ t_Handle FM_PCD_ManipNodeSet(t_Handle h_FmPcd, t_FmPcdManipParams *p_FmPcdManipP
          return NULL;
      }
  
@@ -486,7 +504,7 @@ index 4de5168..d8af00f 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -1830,6 +1917,12 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_FmPortPcd)
+@@ -1830,6 +1921,12 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_FmPortPcd)
      ASSERT_COND(sizeof(t_FmPortPcdParams) == sizeof(ioc_fm_port_pcd_params_t));
      SANITY_CHECK_RETURN_ERROR(p_Dev, E_INVALID_HANDLE);
  
@@ -499,7 +517,7 @@ index 4de5168..d8af00f 100644
      _fml_dbg("Calling...\n");
  
      memcpy(&params, p_FmPortPcd, sizeof(t_FmPortPcdParams));
-@@ -1881,14 +1974,6 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_FmPortPcd)
+@@ -1881,14 +1978,6 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_FmPortPcd)
          }
      }
  
@@ -514,7 +532,7 @@ index 4de5168..d8af00f 100644
      if (ioctl(p_Dev->fd, FM_PORT_IOC_SET_PCD, &params))
          RETURN_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
  
-@@ -2013,23 +2098,12 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
+@@ -2013,23 +2102,12 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
      return E_OK;
  }
  
@@ -543,7 +561,7 @@ index 4de5168..d8af00f 100644
  }
  
  t_Error FM_PORT_PcdKgBindSchemes (t_Handle h_FmPort, t_FmPcdPortSchemesParams *p_PortScheme)
-@@ -2127,18 +2201,20 @@ t_Handle FM_PCD_FrmReplicSetGroup(t_Handle h_FmPcd, t_FmPcdFrmReplicGroupParams
+@@ -2127,18 +2205,20 @@ t_Handle FM_PCD_FrmReplicSetGroup(t_Handle h_FmPcd, t_FmPcdFrmReplicGroupParams
          }
      }
  

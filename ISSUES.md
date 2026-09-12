@@ -88,20 +88,6 @@ stale line refs) are folded into the archive one-liners.
   allocation failure, construction/programming failure and retry; coordinate
   ambiguous HC timeout recovery with A117. Separate from A116's deletion fix.
 
-- [ ] **A119. Public KG scheme ioctl misinterprets the direct-scheme flag.**
-  Confirmed on the KASAN DUT during A116 validation: native arm64
-  `ioc_fm_pcd_kg_scheme_params_t.always_direct` is at byte 16, while SDK
-  `t_FmPcdKgSchemeParams` has `shared` there and `alwaysDirect` at byte 17.
-  `LnxwrpFmPcdIOCTL` casts the public structure directly to the SDK type.
-  A zero-filled public direct-scheme request with no netenv therefore enters
-  `BuildSchemeRegs` as non-direct and NULL-dereferences in `FmPcdGetNetEnvId`.
-  Both layouts and the cast predate A116. Explicitly translate the flag at
-  the kernel/fmlib boundaries, preserve the native/compat ABI, and reject a
-  missing netenv for ordinary schemes. Check fmlib's SDK-structure copy and
-  compat translation together; test both flag values and missing-netenv
-  rejection through the actual ioctl path. Ordinary schemes with a valid
-  netenv work; always-direct SDK deletion is covered by the host fixture.
-
 ## Feature enablement (not bugs)
 
 Config-gated capabilities that are OFF in the current product — not defects.
@@ -913,3 +899,8 @@ file's git history.
 
 - [x] **A116.** Scheme deletion discarded live software ownership before hardware success —
   fixed (_this commit_): preserve refused/failed deletion state; commit once and retire the scheme lock atomically.
+
+- [x] **A119.** Public KG scheme flags were interpreted using the SDK layout —
+  fixed (_this commit_): translate kernel/fmlib flags without changing the ABI,
+  preserve public cookies on copy-out, and reject missing netenvs before scheme
+  mutation. Native/compat host coverage and 128 KASAN DUT lifecycle cycles pass.

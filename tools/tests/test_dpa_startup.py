@@ -3,6 +3,8 @@
 import errno
 import shlex
 
+import pytest
+
 from ask_orch.uart import Console
 from _ioctl import CDX_CTRL_DPA_INIT_CHECK
 
@@ -189,51 +191,73 @@ print('reassembly creation and attachment rejected on %d ports' % checked)
         assert result.rc == 0, result.stdout
 
 
-async def test_dpa_unused_scheme_teardown(splat_window):
+@pytest.mark.parametrize("direct", [False, True], ids=["ordinary", "direct"])
+async def test_dpa_unused_scheme_teardown(splat_window, direct):
     # Native arm64 layouts are checked by sdk_port_ioctl.c. Scheme 31 is
     # outside the shipped FMC configuration; this test never binds it.
-    # Use ordinary schemes: A119 tracks the public ioctl's direct-flag
-    # layout mismatch. Direct scheme deletion is covered by the SDK host test.
-    script = """
+    script = "direct = " + repr(direct) + "\n" + """
 import ctypes, os, struct
 libc = ctypes.CDLL(None, use_errno=True)
 fd = os.open('/dev/fm0-pcd', os.O_RDWR)
 
 def command(number, data, succeeds=True):
+    before = bytes(data)
     buffer = (ctypes.c_ubyte * len(data)).from_buffer(data)
     rc = libc.ioctl(fd, ctypes.c_ulong(number), ctypes.byref(buffer))
     if succeeds:
         assert rc == 0, (hex(number), ctypes.get_errno())
     else:
         assert rc == -1, ('unexpected success', hex(number))
+        assert bytes(data) == before, 'rejected request changed its arguments'
 
 scheme = env = None
 try:
     for cycle in range(64):
-        params = bytearray(976)
-        params[0] = 1
-        struct.pack_into('<I', params, 4, 2)  # One Ethernet distinction unit.
-        command(0xc3d0e128, params)
-        env = params[968:976]
-        assert any(env)
+        if not direct:
+            params = bytearray(976)
+            params[0] = 1
+            struct.pack_into('<I', params, 4, 2)  # One Ethernet distinction unit.
+            command(0xc3d0e128, params)
+            env = params[968:976]
+            assert any(env)
         params = bytearray(1368)
         params[8] = 31
-        params[24:32] = env
-        params[32] = 1
         struct.pack_into('<I', params, 1080, 1)  # Nonzero base FQID; never used.
         struct.pack_into('<I', params, 1320, 1)  # DONE
         struct.pack_into('<I', params, 1328, 1)  # DROP
+        # An ordinary scheme without a netenv must fail before acquisition.
+        command(0xc558e12c, params, succeeds=False)
+        params[16] = int(direct)
+        params[17] = int(not direct)  # SDK flag padding is not a public flag.
+        if env is not None:
+            params[24:32] = env
+            params[32] = 1
         command(0xc558e12c, params)
         scheme = params[1360:1368]
         assert any(scheme)
-        command(0x4008e129, env, succeeds=False)  # Still owned by the scheme.
+        assert params[24:32] == (env if env is not None else bytes(8))
+        # Rejected modification must leave the existing scheme usable.
+        params[0] = 1
+        params[8:16] = scheme
+        invalid = bytearray(params)
+        invalid[16] = 0
+        invalid[24:32] = bytes(8)
+        command(0xc558e12c, invalid, succeeds=False)
+        command(0xc558e12c, params)
+        assert params[1360:1368] == scheme
+        assert params[8:16] == scheme  # Copy-out retains public cookies.
+        assert params[24:32] == (env if env is not None else bytes(8))
+        if env is not None:
+            command(0x4008e129, env, succeeds=False)  # Still owned by the scheme.
         command(0x4008e12d, scheme)
         stale = scheme
         scheme = None
         command(0x4008e12d, stale, succeeds=False)
-        command(0x4008e129, env)
-        env = None
-    print('64 unused scheme teardown cycles passed, including netenv ownership and stale cookies')
+        if env is not None:
+            command(0x4008e129, env)
+            env = None
+    print('64 %s scheme create/modify/delete cycles passed, including missing-netenv rejection and stale cookies'
+          % ('direct' if direct else 'ordinary'))
 finally:
     try:
         if scheme is not None:
