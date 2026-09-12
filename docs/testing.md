@@ -444,3 +444,15 @@ On the DUT, the ordinary/direct scheme lifecycle regression in
 an out-of-range FQID. For an ordinary scheme the rejected candidate changes
 to direct mode; deleting the original immediately afterward must still
 release its original netenv reference. These are private, unbound schemes.
+
+`tools/host_tests/test_sdk_scheme_ioctl.py` checks native/compat conversion and
+fmlib serialization under ASan/UBSan, with compiler member-bound checks on
+every `memcpy`. It covers DONE, CC and policer next engines, the trailing
+scheme counter, public cookies, direct/shared flags and allocation failures.
+Reverting either enclosing-object tail copy or the compat source-union bound
+must fail compilation, even when the host libc only checks whole objects.
+
+Kernel compilation must also be checked with `CONFIG_FORTIFY_SOURCE=y`,
+warnings treated as errors, and KASAN disabled. On arm64, a KASAN build routes
+uninstrumented SDK objects through `__memcpy` and disables FORTIFY for those
+objects; the KASAN hardware run does not cover this compiler check.

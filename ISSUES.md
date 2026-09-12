@@ -49,6 +49,16 @@ Bench artifacts on `vision`: `/tmp/ask-full-20260912-205415/` contains
 per-test captures, and `validation.json`. This dated record preserves the
 result independently of those temporary files.
 
+**FORTIFY follow-up (2026-09-12):** A119's kernel and fmlib scheme-tail copies
+now address their containing objects, preserving compiler bounds checks and
+the layout assertion. The compat non-CC union copy uses its smaller source
+size; the reserved reassembly conversion exits explicitly. The native ioctl
+wrapper (with and without compat) and the compat conversion file compile
+with real kernel FORTIFY checks and `-Werror`, with KASAN disabled. All 30 host
+tests pass; reverting any of the three copy fixes fails the new member-bound
+regression. These checks follow the full run above; its image hash and 418
+results describe the earlier build, before this FORTIFY correction.
+
 ---
 
 ## Open

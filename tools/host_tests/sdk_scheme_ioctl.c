@@ -25,6 +25,23 @@
 #define RETURN_ERROR(level, err, msg) return ERROR_CODE(err)
 #define DBG(level, msg) ((void)0)
 #define BUILD_BUG_ON(condition) _Static_assert(!(condition), #condition)
+
+/* libc's fortified memcpy checks the enclosing object, while the kernel
+ * also checks individual members. Keep that stricter compiler check active
+ * for the extracted ioctl and fmlib code in this ASan/UBSan fixture. */
+extern void memcpy_field_overflow(void)
+    __attribute__((error("memcpy exceeds the declared source or destination field")));
+static inline __attribute__((always_inline))
+void *checked_memcpy(void *dest, const void *src, size_t size,
+                     size_t dest_size, size_t src_size)
+{
+    if (__builtin_constant_p(size) && (size > dest_size || size > src_size))
+        memcpy_field_overflow();
+    return memcpy(dest, src, size);
+}
+#define memcpy(dest, src, size) checked_memcpy(dest, src, size, \
+    __builtin_object_size(dest, 1), __builtin_object_size(src, 1))
+
 typedef struct { t_Handle h_PcdDev; } t_LnxWrpFmDev;
 typedef struct { uintptr_t id; int fd; t_Handle h_UserPriv; uint32_t owners; } t_Device;
 #define DEV_TO_ID(p) do { t_Device *dev = (p); (p) = UINT_TO_PTR(dev->id); } while (0)
@@ -83,9 +100,14 @@ static t_Error BuildSchemeRegs(t_Handle scheme, t_FmPcdKgSchemeParams *params,
     assert(!params->shared && params->alwaysDirect == want_direct && params->modify == want_modify);
     assert(params->netEnvParams.h_NetEnv == (want_direct ? NULL : &pcd.netEnvs[0]));
     assert(params->baseFqid == want_fqid && (int)params->nextEngine == (int)want_engine);
+    assert(params->schemeCounter.update && params->schemeCounter.value == 0x76543210);
     if (want_modify) assert(params->id.h_Scheme == SCHEME);
     else assert(params->id.relativeSchemeId == 7);
     if (want_engine == e_IOC_FM_PCD_CC) assert(params->kgNextEngineParams.cc.h_CcTree == &cc_tree);
+    else if (want_engine == e_IOC_FM_PCD_PLCR) {
+        assert(params->kgNextEngineParams.plcrProfile.direct);
+        assert(params->kgNextEngineParams.plcrProfile.profileSelect.directRelativeProfileId == 0x2468);
+    }
     else assert(params->kgNextEngineParams.doneAction == e_FM_PCD_DROP_FRAME);
     memset(regs, 0, sizeof(*regs));
     candidate->netEnvId = want_direct ? ILLEGAL_NETENV : 0;
@@ -141,9 +163,11 @@ int main(void)
     assert(offsetof(t_FmPcdKgSchemeParams, shared) == 16 && offsetof(t_FmPcdKgSchemeParams, alwaysDirect) == 17);
     for (unsigned direct = 0; direct < 2; direct++) {
         for (unsigned modify = 0; modify < 2; modify++) {
-            for (unsigned cc = 0; cc < 2; cc++) {
+            for (unsigned engine = 0; engine < 3; engine++) {
+                bool cc = engine == 1, plcr = engine == 2;
                 want_direct = direct; want_modify = modify;
-                want_fqid = 0x12345; want_engine = cc ? e_IOC_FM_PCD_CC : e_IOC_FM_PCD_DONE;
+                want_fqid = 0x12345;
+                want_engine = cc ? e_IOC_FM_PCD_CC : plcr ? e_IOC_FM_PCD_PLCR : e_IOC_FM_PCD_DONE;
                 for (unsigned compat = 0; compat < 2; compat++) {
                     static ioc_fm_pcd_kg_scheme_params_t p;
                     static ioc_compat_fm_pcd_kg_scheme_params_t cp;
@@ -152,7 +176,12 @@ int main(void)
                     p.scm_id.scheme_id = (void *)(uintptr_t)(modify ? 2 : 7);
                     p.net_env_params.net_env_id = direct ? NULL : (void *)1;
                     p.base_fqid = want_fqid; p.next_engine = want_engine;
+                    p.scheme_counter.update = true; p.scheme_counter.value = 0x76543210;
                     if (cc) p.kg_next_engine_params.cc.tree_id = (void *)3;
+                    else if (plcr) {
+                        p.kg_next_engine_params.plcr_profile.direct = true;
+                        p.kg_next_engine_params.plcr_profile.profile_select.direct_relative_profile_id = 0x2468;
+                    }
                     else p.kg_next_engine_params.done_action = e_IOC_FM_PCD_DROP_FRAME;
                     if (compat) compat_copy_fm_pcd_kg_scheme(&cp, &p, COMPAT_K_TO_US);
                     /* Poison SDK flag padding: only the public flag counts. */
@@ -167,7 +196,9 @@ int main(void)
                     assert(compat ? cp.always_direct == direct : p.always_direct == direct);
                     assert(compat ? cp.net_env_params.net_env_id == !direct : p.net_env_params.net_env_id == (void *)(uintptr_t)!direct);
                     if (cc) assert(compat ? cp.kg_next_engine_params.cc.tree_id == 3 : p.kg_next_engine_params.cc.tree_id == (void *)3);
+                    else if (plcr) assert(compat ? cp.kg_next_engine_params.plcr_profile.profile_select.direct_relative_profile_id == 0x2468 : p.kg_next_engine_params.plcr_profile.profile_select.direct_relative_profile_id == 0x2468);
                     else assert(compat ? cp.kg_next_engine_params.done_action == 1 : p.kg_next_engine_params.done_action == 1);
+                    assert(compat ? cp.scheme_counter.value == 0x76543210 : p.scheme_counter.value == 0x76543210);
                     refuse_sdk = true;
                     prepare_sdk();
                     assert(scheme_ioctl(&device, cmd, (uintptr_t)arg, compat) != E_OK);
@@ -195,10 +226,15 @@ int main(void)
                 for (unsigned shared = 0; shared < 2; shared++) {
                     t_Device pcd = {.fd = 10}, env = {.id = 1}, scheme = {.id = 2}, tree = {.id = 3};
                     t_FmPcdKgSchemeParams p = {.modify = modify, .shared = shared, .alwaysDirect = direct,
-                        .baseFqid = want_fqid, .nextEngine = (e_FmPcdEngine)want_engine};
+                        .baseFqid = want_fqid, .nextEngine = (e_FmPcdEngine)want_engine,
+                        .schemeCounter = {.update = true, .value = 0x76543210}};
                     if (modify) p.id.h_Scheme = &scheme; else p.id.relativeSchemeId = 7;
                     p.netEnvParams.h_NetEnv = direct ? NULL : &env;
                     if (cc) p.kgNextEngineParams.cc.h_CcTree = &tree;
+                    else if (plcr) {
+                        p.kgNextEngineParams.plcrProfile.direct = true;
+                        p.kgNextEngineParams.plcrProfile.profileSelect.directRelativeProfileId = 0x2468;
+                    }
                     else p.kgNextEngineParams.doneAction = e_FM_PCD_DROP_FRAME;
                     t_Device *result = LibrarySchemeSet(&pcd, &p);
                     assert(result && result->id == 2 && !allocations);
