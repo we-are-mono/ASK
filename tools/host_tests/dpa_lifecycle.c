@@ -286,6 +286,13 @@ int main(void)
     unsigned startup_steps = step;
     unsigned calls = hardware_calls;
     unsigned compiles = compile_calls;
+    /* Unsupported fmlib replacement must not issue an ioctl or touch handles. */
+    unsigned steps = step;
+    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(cmodel.port[0].handle,
+                          cmodel.port[0].cctree_handle)) == E_NOT_SUPPORTED);
+    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(NULL, NULL)) == E_NOT_SUPPORTED);
+    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree((void *)1, (void *)1)) == E_NOT_SUPPORTED);
+    assert(step == steps && hardware_calls == calls);
     assert(dpa_init() != 0 && hardware_calls == calls && compile_calls == compiles);
     cleaning = true;
     assert(fmc_clean(&cmodel) == 0);

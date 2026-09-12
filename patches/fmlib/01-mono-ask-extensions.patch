@@ -15,6 +15,9 @@ Add 'shared' field to t_FmPcdKgSchemeParams for shared scheme support.
 These extensions are required for the CMM daemon and fast path offload
 functionality on the Mono Gateway.
 
+Retain the whole-tree replacement API as an unsupported operation in
+Mono, returning before accessing handles or issuing an ioctl.
+
 Upstream-Status: Inappropriate [vendor-specific extension]
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
@@ -131,8 +134,36 @@ index 7f32680..8bfecfd 100644
  } t_FmPcdHashTableParams;
  
  /**************************************************************************//**
+diff --git a/include/fmd/Peripherals/fm_port_ext.h b/include/fmd/Peripherals/fm_port_ext.h
+index df72794..22e46d7 100644
+--- a/include/fmd/Peripherals/fm_port_ext.h
++++ b/include/fmd/Peripherals/fm_port_ext.h
+@@ -2462,18 +2462,13 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
+ /**************************************************************************//**
+  @Function      FM_PORT_PcdCcModifyTree
+ 
+- @Description   This routine may be called for ports that use coarse classification tree
+-                if the user wishes to replace the tree. The routine may not be called while port
+-                receives packets using the PCD functionalities, therefor port must be first detached
+-                from the PCD, only than the routine may be called, and than port be attached to PCD again.
++ @Description   Whole-tree replacement is unsupported in Mono. This entry point
++                is retained for API compatibility and does not access either handle.
+ 
+- @Param[in]     h_FmPort            A handle to a FM Port module.
+- @Param[in]     h_CcTree            A CC tree that was already built. The tree id as returned from
+-                                    the BuildTree routine.
+-
+- @Return        E_OK on success; Error code otherwise.
++ @Param[in]     h_FmPort            Unused port handle.
++ @Param[in]     h_CcTree            Unused tree handle.
+ 
+- @Cautions      Allowed only following FM_PORT_Init(), FM_PORT_SetPCD() and FM_PORT_DetachPCD()
++ @Return        E_NOT_SUPPORTED.
+ *//***************************************************************************/
+ t_Error FM_PORT_PcdCcModifyTree (t_Handle h_FmPort, t_Handle h_CcTree);
+ 
 diff --git a/src/fm_lib.c b/src/fm_lib.c
-index 4de5168..bc95c7f 100644
+index 4de5168..e1be611 100644
 --- a/src/fm_lib.c
 +++ b/src/fm_lib.c
 @@ -317,6 +317,44 @@ t_Error  FM_GetApiVersion(t_Handle h_Fm, ioc_fm_api_version_t *p_version)
@@ -403,7 +434,36 @@ index 4de5168..bc95c7f 100644
      memset(p_Dev, 0, sizeof(t_Device));
      p_Dev->h_UserPriv = (t_Handle)p_PcdDev;
      p_PcdDev->owners++;
-@@ -2127,18 +2196,20 @@ t_Handle FM_PCD_FrmReplicSetGroup(t_Handle h_FmPcd, t_FmPcdFrmReplicGroupParams
+@@ -2013,23 +2082,12 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
+     return E_OK;
+ }
+ 
+-t_Error FM_PORT_PcdCcModifyTree (t_Handle h_FmPort, t_Handle h_CcTree)
++t_Error FM_PORT_PcdCcModifyTree(t_Handle h_FmPort, t_Handle h_CcTree)
+ {
+-    t_Device *p_Dev = (t_Device*) h_FmPort;
+-    ioc_fm_obj_t id;
+-
+-    SANITY_CHECK_RETURN_ERROR(p_Dev, E_INVALID_HANDLE);
+-
+-    _fml_dbg("Calling...\n");
+-
+-    id.obj = h_CcTree;
+-
+-    if (ioctl(p_Dev->fd, FM_PORT_IOC_PCD_CC_MODIFY_TREE, &id))
+-        RETURN_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+-
+-    _fml_dbg("Called.\n");
+-
+-    return E_OK;
++    /* Keep the API entry point, but never mutate a tree or port. */
++    (void)h_FmPort;
++    (void)h_CcTree;
++    return ERROR_CODE(E_NOT_SUPPORTED);
+ }
+ 
+ t_Error FM_PORT_PcdKgBindSchemes (t_Handle h_FmPort, t_FmPcdPortSchemesParams *p_PortScheme)
+@@ -2127,18 +2185,20 @@ t_Handle FM_PCD_FrmReplicSetGroup(t_Handle h_FmPcd, t_FmPcdFrmReplicGroupParams
          }
      }
  

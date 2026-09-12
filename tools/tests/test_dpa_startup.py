@@ -14,6 +14,42 @@ async def test_dpa_init_check(aiohttp_session, target_agent, splat_window):
     assert result.get("errno") == errno.EBUSY, result
 
 
+async def test_port_tree_replacement_unsupported(splat_window):
+    # Reserved native (8-byte object) and compat (4-byte object) command
+    # numbers. Even unreadable arguments must be rejected before decoding.
+    script = """
+import errno, fcntl, glob, os
+devices = sorted(glob.glob('/dev/fm0-port-*'))
+assert devices, 'no FMAN port devices'
+checked = 0
+for device in devices:
+    try:
+        fd = os.open(device, os.O_RDWR)
+    except OSError as error:
+        if error.errno == errno.ENODEV:  # Static node for an inactive port.
+            continue
+        raise
+    try:
+        for command in (0x4008e162, 0x4004e162):
+            for argument in (0, 1):
+                try:
+                    fcntl.ioctl(fd, command, argument)
+                except OSError as error:
+                    assert error.errno == errno.EOPNOTSUPP, (device, hex(command), error)
+                else:
+                    raise AssertionError('whole-tree replacement accepted')
+        checked += 1
+    finally:
+        os.close(fd)
+assert checked, 'no active FMAN port devices'
+print('whole-tree replacement rejected on %d ports' % checked)
+"""
+    with Console.target() as con:
+        con.login("root", None)
+        result = con.run("python3 -c " + shlex.quote(script), timeout=20)
+        assert result.rc == 0, result.stdout
+
+
 async def test_dpa_duplicate_startup(splat_window):
     with Console.target() as con:
         con.login("root", None)

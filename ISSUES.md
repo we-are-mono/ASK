@@ -63,16 +63,6 @@ stale line refs) are folded into the archive one-liners.
   risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
   only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
-- [ ] **A113. SDK CC-tree replacement loses the old binding and lacks PCD locks.**
-  Pre-existing in `fm_port.c`: `FM_PORT_PcdCcModifyTree` binds the replacement
-  and overwrites `ccTreeId` without unbinding the previous root, including
-  same-tree replacement. It also omits the all-PCD lock required by
-  `FmPcdCcBindTree`. Audit replacement as a transaction: preserve the old
-  tree and port actions on failure, serialize both trees, and transfer the
-  counted binding once. Cover repeated same-tree calls, shared roots and
-  bind/lock failures. This API is outside the normal startup path and its
-  fmlib wrapper is still gated by A103.
-
 - [ ] **A114. Reassembly scheme deletion leaves stale handles and hides errors.**
   Pre-existing in `fm_manip.c`: `FmPcdManipDeleteIpReassmSchemes` and the
   CAPWAP equivalent ignore `FM_PCD_KgSchemeDelete` failures and retain
@@ -137,12 +127,14 @@ each so the open bug list stays honest.
   is sent where the kernel now expects a cookie:
   `FM_PCD_CcRootBuild`/`FrmReplicSetGroup`/`AddMember` FR arm (`frm_replic_id`),
   `PlcrProfileSet` modify-arm `p_profile`, `ManipNodeReplace` `p_next_manip`, the
-  three PORT modify verbs
-  (`PcdKgModifyInitialScheme`/`PcdPlcrModifyInitialProfile`/`PcdCcModifyTree`) +
+  two PORT modify verbs
+  (`PcdKgModifyInitialScheme`/`PcdPlcrModifyInitialProfile`) +
   `VSPAlloc`. Post-A85 the kernel rejects these cleanly (`E_INVALID_SELECTION`) —
   no corruption, the features are simply unusable until fixed. No rig config
   exercises any of them. To enable: add the missing `DEV_TO_ID`/loop-bound
   conversions in `sources/fmlib/src/fm_lib.c` (`patches/fmlib/`).
+  Whole-tree replacement (`PcdCcModifyTree`) is deliberately unsupported
+  under A113 and is excluded from this enablement work.
 
 ---
 
@@ -892,3 +884,6 @@ file's git history.
 
 - [x] **A112.** SDK port destruction dereferenced discarded initialization parameters —
   fixed (_this commit_): retain charged dequeue depth and release successfully acquired FM resources once.
+
+- [x] **A113.** Whole-tree replacement leaked bindings and omitted PCD locks —
+  resolved (_this commit_): remove the implementation; retain APIs/ioctl numbers with explicit unsupported errors.

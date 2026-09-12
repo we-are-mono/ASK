@@ -21,14 +21,27 @@ def function(source, name):
     return source[match.start():end] + "\n"
 
 
-@pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_free", "port_free_legacy", "kg_plan"])
+@pytest.mark.parametrize("unit", ["port_pcd", "port_api", "port_ioctl", "port_ioctl_native",
+                                  "port_free", "port_free_legacy", "kg_plan"])
 def test_sdk_port_pcd(tmp_path, unit):
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
         pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
-    if unit.startswith("port_free"):
+    if unit.startswith("port_ioctl"):
+        source = (sdk / "src/wrapper/lnxwrp_ioctls_fm.c").read_text()
+        uapi = kernel / "include/uapi/linux/fmd"
+        definitions = "\n".join((uapi / name).read_text() for name in [
+            "ioctls.h", "integrations/integration_ioctls.h", "Peripherals/fm_ioctls.h",
+            "Peripherals/fm_port_ioctls.h",
+        ])
+        definitions = re.sub(r"/\*.*?\*/", "", definitions, flags=re.S)
+        production = "\n".join(re.findall(
+            r"^#define\s+(?:DEV_FM_\w*MINOR\w*|NCSW_IOC_TYPE_BASE|FM_IOC_TYPE_BASE|"
+            r"FM_PORT_IOC_NUM|FM_PORT_IOC_PCD_CC_MODIFY_TREE(?:_COMPAT)?)\b[^\n]*",
+            definitions, re.M)) + "\n" + function(source, "fm_ioctls")
+    elif unit.startswith("port_free"):
         source = (sdk / "Peripherals/FM/Port/fm_port.c").read_text()
         production = "\n".join(function(source, name) for name in [
             "FmPortDriverParamFree", "FM_PORT_Init", "FM_PORT_Free",
@@ -47,6 +60,7 @@ def test_sdk_port_pcd(tmp_path, unit):
                 "FM_PORT_Free", "AttachPCD", "DetachPCD", "FM_PORT_AttachPCD", "FM_PORT_DetachPCD",
                 "FM_PORT_ConfigureMuramPage", "DeletePortPcd", "FM_PORT_SetPCD", "FM_PORT_DeletePCD",
                 "FM_PORT_PcdKgBindSchemes", "FM_PORT_PcdKgUnbindSchemes",
+                "FM_PORT_PcdCcModifyTree",
             ])
     else:
         source = (sdk / "Peripherals/FM/Pcd/fm_kg.c").read_text()
@@ -54,7 +68,8 @@ def test_sdk_port_pcd(tmp_path, unit):
             "UnbindPortToClsPlanGrp", "FmPcdKgBuildClsPlanGrp", "FmPcdKgDestroyClsPlanGrp", "FmPcdKgSetOrBindToClsPlanGrp",
             "FmPcdKgDeleteOrUnbindPortToClsPlanGrp",
         ])
-    fixture = "port_free" if unit.startswith("port_free") else unit
+    fixture = ("port_free" if unit.startswith("port_free") else
+               "port_ioctl" if unit.startswith("port_ioctl") else unit)
     (tmp_path / f"{fixture}_production.inc").write_text(production)
     shutil.copyfile(Path(__file__).with_name("sdk_types_linux.h"), tmp_path / "types_linux.h")
     binary = tmp_path / unit
@@ -68,6 +83,8 @@ def test_sdk_port_pcd(tmp_path, unit):
         command.extend(["-I", str(sdk / inc)])
     if unit == "port_free_legacy":
         command.append("-DTEST_LEGACY_DEQ")
+    if unit == "port_ioctl_native":
+        command.append("-DTEST_NO_COMPAT")
     command.extend([str(Path(__file__).with_name(f"sdk_{fixture}.c")), "-o", str(binary)])
     subprocess.run(command, check=True)
     subprocess.run([str(binary)], check=True, timeout=30,

@@ -4,7 +4,7 @@
 
 static bool all_locked, private_tree, use_fe;
 static unsigned env_owners, heap_allocs, muram_allocs, muram_calls, muram_fail;
-static unsigned settings_calls, settings_fail, cases;
+static unsigned settings_calls, settings_fail, reassembly_calls, cases;
 static int pcd_token, tree_token;
 static t_Error RealGetSetCcParams(t_Handle port, t_FmPortGetSetCcParams *params);
 static bool port_try_lock(volatile bool *lock)
@@ -48,7 +48,7 @@ t_Error FM_PCD_CcRootDelete(t_Handle tree)
     private_tree = false; assert(env_owners); env_owners--; return E_OK;
 }
 t_Error FmPcdCcTreeAddIPR(t_Handle pcd, t_Handle tree, t_Handle env, t_Handle manip, bool create)
-{ assert(!all_locked && tree && manip); return failure == REASSEMBLY ? E_NO_MEMORY : E_OK; }
+{ reassembly_calls++; assert(!all_locked && tree && manip); return failure == REASSEMBLY ? E_NO_MEMORY : E_OK; }
 t_Error FmPcdCcTreeAddCPR(t_Handle pcd, t_Handle tree, t_Handle env, t_Handle manip, bool create)
 { return FmPcdCcTreeAddIPR(pcd, tree, env, manip, create); }
 bool FmPcdIsHcUsageAllowed(t_Handle pcd) { return true; }
@@ -146,6 +146,32 @@ static void retry(struct fixture *f)
 int main(void)
 {
     struct fixture f;
+    /* Reserved replacement API must not inspect handles or change a live
+     * classifier, including reassembly roots and already-held locks. */
+    for (unsigned oh = 0; oh < 2; oh++) {
+        for (unsigned reassembly = 0; reassembly < 3; reassembly++) {
+            for (unsigned detached = 0; detached < 2; detached++) {
+                init(&f, oh, reassembly, true);
+                assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
+                if (detached) assert(FM_PORT_DetachPCD(&f.port) == E_OK);
+                f.port.lock = all_locked = true;
+                struct fixture before; memcpy(&before, &f, sizeof(f));
+                unsigned r = roots, rb = root_binds, owners = env_owners;
+                unsigned reasm = reassembly_calls, settings = settings_calls;
+                t_Handle trees[] = {f.port.ccTreeId, (void *)1, NULL};
+                for (unsigned i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+                    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(&f.port, trees[i])) == E_NOT_SUPPORTED);
+                    assert(!memcmp(&before, &f, sizeof(f)));
+                    assert(roots == r && root_binds == rb && env_owners == owners);
+                    assert(reassembly_calls == reasm && settings_calls == settings && all_locked);
+                }
+                f.port.lock = all_locked = false;
+                assert(FM_PORT_DeletePCD(&f.port) == E_OK); finish(&f);
+            }
+        }
+    }
+    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(NULL, NULL)) == E_NOT_SUPPORTED);
+    assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree((void *)1, (void *)1)) == E_NOT_SUPPORTED);
     /* Real API validation failures must leave the same port available. */
     for (unsigned invalid = 0; invalid < 6; invalid++) {
         init(&f, false, 0, true);
