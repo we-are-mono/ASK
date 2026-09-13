@@ -57,7 +57,7 @@ def test_qos_lifecycle(tmp_path):
         "int ceetm_exit_cq_plcr(void);\n"
         + "\n".join(function(source, name) for name in names)
         + "\n".join(function(control, name) for name in [
-            "qm_init", "qm_exit", "cdx_enable_ceetm_on_iface", "cdx_disable_ceetm_on_iface",
+            "qm_init", "qm_quiesce", "qm_exit", "cdx_enable_ceetm_on_iface", "cdx_disable_ceetm_on_iface",
         ])
     )
     binary = tmp_path / "qos_lifecycle"

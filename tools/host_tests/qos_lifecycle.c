@@ -101,6 +101,8 @@ static struct sk_buff packets[4];
 static bool packet_live[4], hold_frames, fail_query;
 static unsigned pop_calls, pop_errors, pool_releases, skb_releases;
 static int persistent_pop_error;
+static bool recover_on_shutdown_wait;
+static unsigned shutdown_waits;
 static unsigned pop_by_queue[16], query_by_queue[16];
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
 {
@@ -300,6 +302,14 @@ static void cpus_read_lock(void) {}
 static void cpus_read_unlock(void) {}
 static void udelay(unsigned delay) {}
 static void usleep_range(unsigned low, unsigned high) { jiffies++; }
+static void msleep(unsigned ms)
+{
+    assert(recover_on_shutdown_wait && persistent_pop_error);
+    assert(packet_live[0]);
+    shutdown_waits++;
+    persistent_pop_error = 0;
+    jiffies += ms;
+}
 #define msecs_to_jiffies(ms) (ms)
 #define time_after_eq(a, b) ((a) >= (b))
 static int disable_dscp_fqid_map(unsigned id) { assert(id < MAX_PHY_PORTS); return 0; }
@@ -475,9 +485,11 @@ int main(void)
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
     assert(ceetm_exit_cq_plcr() < 0 && profiles);
     assert(ceetm_exit() < 0 && dev.refs && packet_live[0]);
-    persistent_pop_error = 0; hold_frames = false;
+    recover_on_shutdown_wait = true;
+    qm_quiesce();
+    assert(shutdown_waits == 1 && !dev.refs && !packet_live[0]);
+    recover_on_shutdown_wait = false; hold_frames = false;
     qm_exit(); empty();
-    assert(!dev.refs && !packet_live[0]);
     /* Late pool-backed ERNs need no device; malformed late SKB ERNs must
      * not dereference a detached interface. */
     struct qm_fd late = {.bpid = 7, .id = 0};

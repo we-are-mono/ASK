@@ -71,7 +71,7 @@ for path in sorted(glob.glob('/dev/fm0-port-*')):
 assert states
 print(json.dumps(states, sort_keys=True))
 """
-        port_state_command = "python3 -c " + shlex.quote(port_state_code)
+        port_state_command = "python3 -c " + shlex.quote("exec(" + repr(port_state_code) + ")")
         ports_before = json.loads(run(port_state_command))
         dmesg_before = run("dmesg")
         run("echo scan > /sys/kernel/debug/kmemleak")

@@ -9,6 +9,7 @@
  */
 
 
+#include <linux/delay.h>
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
 
@@ -442,16 +443,26 @@ int qm_init(void)
 	set_cmd_handler(EVENT_QM, M_qm_cmdproc);
 	return NO_ERR;
 }
+/* Module init failure/unload only: returning with registered FQs would
+ * leave QMan callbacks pointing into freed module text and static storage.
+ * Ordinary interface/control drains remain bounded and report failure. */
+void qm_quiesce(void)
+{
+#ifdef ENABLE_EGRESS_QOS
+	while (ceetm_exit()) {
+		pr_warn_ratelimited("cdx: waiting for QoS shutdown; reboot if hardware cannot recover\n");
+		msleep(1000);
+	}
+#endif
+}
+
 /** QOS exit function.
  */
 void qm_exit(void)
 {
 	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
 	set_cmd_handler(EVENT_QM, NULL);
-#ifdef ENABLE_EGRESS_QOS	
-	if (ceetm_exit())
-		ceetm_err("unable to release all QoS resources\n");
-#endif
+	qm_quiesce();
 	return;
 }
 

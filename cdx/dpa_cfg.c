@@ -722,6 +722,7 @@ struct dpa_init_ports {
 	struct dpa_init_port *entries;
 	uint32_t count;
 	bool stopped;
+	bool quiesced;
 };
 
 static struct dpa_init_ports dpa_active_ports;
@@ -852,6 +853,8 @@ int dpa_cfg_quiesce(void)
 	int ret = 0;
 
 	mutex_lock(&dpa_cfg_lock);
+	if (ports->quiesced)
+		goto out;
 	if (!ports->stopped) {
 		for (ii = 0; ii < ports->count; ii++) {
 			if (FM_PORT_GetEnabled(ports->entries[ii].handle, &ports->entries[ii].enabled)) {
@@ -868,6 +871,7 @@ int dpa_cfg_quiesce(void)
 	/* Wi-Fi still holds these FQ pointers until its exit callback restores
 	 * their drain callbacks. Reclaim frames now, retain storage until then. */
 	cdx_drain_fq_list(dpa_pcd_fq);
+	ports->quiesced = true;
 out:
 	mutex_unlock(&dpa_cfg_lock);
 	return ret;

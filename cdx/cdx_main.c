@@ -39,6 +39,7 @@
 #define DEFINE_GLOBALS
 #include "portdefs.h"
 #include <linux/rtnetlink.h>
+#include <linux/delay.h>
 #include "cdx.h"
 #include "cdx_cmdhandler.h"
 #include "dpa_ipsec.h"
@@ -198,8 +199,12 @@ static void cdx_module_deinit(void)
 	if (fman_info) {
 		mutex_lock(&cdx_info->ctrl.mutex);
 		rtnl_lock();
-		if (dpa_cfg_quiesce())
-			pr_err("cdx: cannot quiesce DPA ports before module teardown\n");
+		while (dpa_cfg_quiesce()) {
+			pr_warn_ratelimited("cdx: waiting for DPA port shutdown; reboot if hardware cannot recover\n");
+			msleep(1000);
+		}
+		/* Reclaim queued TX frames while dependent pools are still alive. */
+		qm_quiesce();
 		rtnl_unlock();
 		mutex_unlock(&cdx_info->ctrl.mutex);
 	}
