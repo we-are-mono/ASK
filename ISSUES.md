@@ -16,14 +16,52 @@ items below. Every reopening is static-conclusive — none needs on-DUT
 verification. Bookkeeping corrections from that audit (wrong commit hashes,
 stale line refs) are folded into the archive one-liners.
 
+## Latest full validation — 2026-09-13
+
+Release `mono-1.0.7` contains the production source tested at commit
+`3d412fe39c6497b1201a32de8aa962b94487bb0c`; the release bookkeeping changes
+only this ledger. Built with `KASAN=1 make ask-image`, staged with
+`make stage-image`, and booted explicitly over TFTP.
+
+| Suite | Passed | Duration |
+| --- | ---: | ---: |
+| Main: 33 host + 377 DUT tests | 410 | 79m 28s |
+| Startup rollback: 15 checkpoints and normal unload | 1 | 11m 02s |
+| Route recovery and SA teardown | 10 | 1m 12s |
+| **Total** | **421** | **91m 41s** |
+
+Zero failures, errors or skips. KASAN (generic), kmemleak, lockdep and
+FAILSLAB were enabled; no KASAN/UBSAN/kernel BUG/WARN/lockdep findings.
+Every startup checkpoint restored MURAM and port state, followed by normal
+CDX initialization and unload. The leak scan found no unexpected objects
+after excluding 12,798 known DPAA boot-pool objects under the existing policy.
+
+Kernel/CDX build IDs and dpa_app/CMM/FMC hashes matched the build before and
+after runtime testing. Main and route suites ran in the same normal boot.
+Normal CMM was restored, test shims removed, fault controls disarmed, and
+the DUT and WAN agents were healthy. The DUT remains on the tested image.
+
+Image SHA-256: `03696b8ca2b5945562aa49e51bdbdd05162856ee96feaab26cbac79b3f8dc727`.
+Kernel build ID: `406562256ec79675a08c3bfef8260c28b13157ed`.
+CDX build ID: `6e5014fea8f0e26dec7b4e95613a9a6fd665d5fe`.
+
+Build notices comprised three existing forced-task markers and three
+embedded-build-path QA warnings. Pytest reported two JUnit property-format
+warnings. The PPPoE traffic/offload test passed, but its optional CPU-usage
+sample could not be parsed.
+
+Artifacts on `vision`: `/tmp/ask-full-20260913-124324/` contains `report.md`,
+`build-manifest.json`, all three suite XML/logs, per-test captures, initial
+and final image identities, kernel diagnostics and `validation.json`.
+
 ## Teardown follow-up validation — 2026-09-13
 
 Validated A133–A134 with 33 host ASan/UBSan tests (8.54s), all passing.
 ARM64 compile checks for `cdx_main.c`, `control_qm.c` and SDK `fm_port.c`
 passed with `-Werror` and no warnings. Each regression fails against its
 previous implementation. The regenerated SDK patch applies to the pinned
-vendor base and reproduces the tested source. This follow-up has not been
-built into a new image or tested on the DUT.
+vendor base and reproduces the tested source. The full image and DUT
+validation above subsequently covered these changes.
 
 Artifacts on `vision`: `/tmp/ask-teardown-followup-pt93edh9/` contains
 `host.xml`, compiler commands/logs, patch verification and negative checks.
@@ -53,7 +91,7 @@ Artifacts on `vision`: `/tmp/ask-review-eytntij1/` (`validation.json`,
 `build-manifest.json`, compiler logs, suite XML and per-test captures).
 The full-suite record below describes the earlier September 12 image.
 
-## Latest full validation — 2026-09-12
+## Previous full validation — 2026-09-12
 
 Built commit `12f7318b37395513de434d91ed37913bdbecbcc7` with
 `KASAN=1 make ask-image`, staged it with `make stage-image`, and booted the
@@ -985,7 +1023,7 @@ file's git history.
   fixed (_555acd9_): describe actual fixed-buffer reads and remove the nonexistent set-ipsec branch.
 
 - [x] **A133.** Terminal port and QoS retries held RTNL throughout hardware-fault waits —
-  fixed (_:/^fix: handle teardown retries and ports without PCD_).
+  fixed (_3d412fe_).
 
 - [x] **A134.** Detaching an initialized port without PCD made rollback and unload fail —
-  fixed (_:/^fix: handle teardown retries and ports without PCD_).
+  fixed (_3d412fe_).
