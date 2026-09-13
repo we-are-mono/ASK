@@ -261,7 +261,10 @@ then verify that pool buffers and skb-backed frames are reclaimed before
 the interface context is released. Persistent hardware errors and prefetch
 retries must return within the drain deadline. Undrained queues retain their
 device references and policers until cleanup succeeds, and a failed queue
-must not force-pop later queues that can drain normally.
+must not force-pop later queues that can drain normally. Terminal module
+cleanup waits for hardware to release retained queues before unloading their
+callbacks or freeing dependent pools; a permanent hardware failure requires
+a board reset. This terminal wait is separate from bounded interface drains.
 The SDK CQ-pop test checks command and
 descriptor byte order, portal-result lifetime, prefetch retries, errors,
 and a final response containing both a frame and the empty-queue flag.
@@ -328,9 +331,13 @@ The cases use the Gateway DK's five Ethernet and two offline ports. They
 inject failures after statistics allocation, interface creation, private
 policer allocation, partial transmit/receive queue creation, shared
 policer creation and the final classifier setup. Each failure must remove
-CDX and its proc entries and restore the original MURAM free-space count.
-The test checks kmemleak and kernel diagnostics, then loads CDX normally
-in the same boot. Reboot normally afterwards to run traffic tests.
+CDX and its proc entries, restore the original MURAM free-space count,
+and preserve the enable state of every active FMAN port.
+The test checks kmemleak and kernel diagnostics, then loads and unloads CDX
+normally in the same boot, checking port-state restoration and teardown
+diagnostics. This is a quiescent unload. Afterwards, boot the staged image
+again over TFTP with `rdinit=/bin/sh` removed from the boot arguments, then
+run traffic tests. A plain reboot may select the board's installed firmware.
 
 The fault controls `dpa_init_fail_site` and `dpa_init_fail_step` are built
 only into the test image. Production builds omit them. Host coverage in

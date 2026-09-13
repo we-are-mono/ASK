@@ -16,6 +16,31 @@ items below. Every reopening is static-conclusive — none needs on-DUT
 verification. Bookkeeping corrections from that audit (wrong commit hashes,
 stale line refs) are folded into the archive one-liners.
 
+## Review follow-up validation — 2026-09-13
+
+Validated A120–A132 on KASAN image commit `7636537`.
+All 53 tests passed with zero failures, errors or skips:
+
+| Suite | Passed | Duration |
+| --- | ---: | ---: |
+| Host ASan/UBSan | 32 | 8.53s |
+| DUT startup rollback and unload | 1 | 11m 03s |
+| Targeted runtime and ABI | 20 | 1m 55s |
+
+Every one of the 15 startup failure checkpoints restored baseline MURAM
+and port state, followed by successful normal load/unload in the same boot.
+The leak scan found no unexpected objects after excluding 12,798 known DPAA
+boot-pool objects. Runtime checks included 128 scheme lifecycle cycles,
+all 128 QoS queues and forwarding offload. Kernel/CDX build IDs and userspace
+hashes matched the build; final KASAN/UBSAN/BUG/WARN/lockdep checks were clean.
+Native/compat ioctl wrappers and compat conversion also compile with active
+kernel FORTIFY and `-Werror`, with KASAN disabled for those compiler checks.
+
+Image SHA-256: `0831c0ee7920850b6aa6e90a61e8a5bb17931038260ec032c2de79aad1fc0f88`.
+Artifacts on `vision`: `/tmp/ask-review-eytntij1/` (`validation.json`,
+`build-manifest.json`, compiler logs, suite XML and per-test captures).
+The full-suite record below describes the earlier September 12 image.
+
 ## Latest full validation — 2026-09-12
 
 Built commit `12f7318b37395513de434d91ed37913bdbecbcc7` with
@@ -48,16 +73,6 @@ Bench artifacts on `vision`: `/tmp/ask-full-20260912-205415/` contains
 `report.md`, `build-manifest.json`, the three `*-suite.xml` reports and logs,
 per-test captures, and `validation.json`. This dated record preserves the
 result independently of those temporary files.
-
-**FORTIFY follow-up (2026-09-12):** A119's kernel and fmlib scheme-tail copies
-now address their containing objects, preserving compiler bounds checks and
-the layout assertion. The compat non-CC union copy uses its smaller source
-size; the reserved reassembly conversion exits explicitly. The native ioctl
-wrapper (with and without compat) and the compat conversion file compile
-with real kernel FORTIFY checks and `-Werror`, with KASAN disabled. All 30 host
-tests pass; reverting any of the three copy fixes fails the new member-bound
-regression. These checks follow the full run above; its image hash and 418
-results describe the earlier build, before this FORTIFY correction.
 
 ---
 
@@ -873,23 +888,14 @@ file's git history.
   accepted A95-class leak (abandoned + logged loudly) and the group is already
   software-gone, so an error return buys nothing but a compounding retry.
 
-- [x] **A106.** Late CDX SET_PARAMS failures leaked queues, interfaces,
-  policers and MURAM statistics — fixed (_2cf97d1_): stop producer ports,
-  drain queues and release dependents before FMAN metadata; targeted hardware
-  checks cover 15 failure points, unchanged MURAM, empty kmemleak and a
-  successful load in the same boot.
+- [x] **A106.** Late CDX SET_PARAMS failures leaked queues, interfaces, policers and statistics —
+  fixed (_2cf97d1_): stop producers, drain queues and unwind dependents; 15 KASAN hardware checkpoints pass.
 
-- [x] **A66.** Route-event retries reused rolled-back tunnel/socket/SA
-  bindings and cleared `FPP_NEEDS_UPDATE` without refreshing the next-hop —
-  fixed (_1e02d82_): retry through the existing route-swap transactions,
-  including local tunnel events; host fault coverage and six hardware
-  gateway/MTU recovery cases preserve references across repeated refusals.
+- [x] **A66.** Route-event retries reused rolled-back tunnel/socket/SA bindings and stale next-hops —
+  fixed (_1e02d82_): retry through route-swap transactions; host faults and six hardware recovery cases pass.
 
-- [x] **A107.** SA deletion and hard expiry left the last FPP route behind —
-  fixed (_81155da_): detach flows, delete the CDX SA, then release its
-  counted route. Expiry route deletion now uses the CDX connection instead
-  of the key-engine connection. Host error/ordering coverage and repeated
-  hardware deletion/expiry checks cover sole and shared routes.
+- [x] **A107.** SA deletion and hard expiry retained the last FPP route —
+  fixed (_81155da_): detach flows and delete the SA before its counted route; use CDX for expiry route deletion.
 
 - [x] **A108.** Partial SDK `SetPcd` failures pinned classifier bindings —
   fixed (_cf1e3a7_): unwind completed stages and failed classification-plan acquisition.
@@ -918,24 +924,50 @@ file's git history.
 - [x] **A116.** Scheme deletion discarded live software ownership before hardware success —
   fixed (_42c8b34_): preserve refused/failed deletion state; commit once and retire the scheme lock atomically.
 
-- [x] **A119.** Public KG scheme flags were interpreted using the SDK layout —
-  fixed (_bada8ce_): translate kernel/fmlib flags without changing the ABI,
-  preserve public cookies on copy-out, and reject missing netenvs before scheme
-  mutation. Native/compat host coverage and 128 KASAN DUT lifecycle cycles pass.
+- [x] **A119.** Public KG scheme flags used the SDK layout and mishandled cookies/missing netenvs —
+  fixed (_bada8ce_): translate kernel/fmlib flags and validate before mutation; native/compat and KASAN lifecycle tests pass.
 
-- [x] **A117.** SDK HC failures recycled frames still owned by hardware —
-  fixed (_bd99777_): separate QMan acceptance from per-frame completion,
-  restore rejected frames, quarantine timed-out frames until confirmation,
-  and latch failure until board reset. Guard pool replacement and PCD cleanup;
-  prevent direct-register fallback and unsupported FMan unbind recovery.
-  Actual SDK/wrapper fault tests pass under ASan/UBSan; 29 host tests and
-  12 KASAN DUT checks pass, including 128 scheme lifecycle cycles and offload.
+- [x] **A117.** SDK HC failures recycled hardware-owned frames —
+  fixed (_bd99777_): separate acceptance/completion, quarantine timeouts and require board reset; guard pool/PCD recovery.
 
 - [x] **A118.** Scheme creation/modification published partial state on failure —
-  fixed (_12f7318_): build a private candidate, reserve and hold the scheme
-  lock through programming, clear failed acquisitions before release, and
-  honor direct-register errors. Commit netenv references only on success;
-  retain A117's board-reset requirement after ambiguous HC timeout.
-  Actual builder/lock/HC fault coverage passes under ASan/UBSan: 30 host tests
-  and 12 KASAN DUT checks pass, including 128 lifecycle cycles with late
-  construction failures followed by deletion of the original scheme.
+  fixed (_12f7318_): program a locked private candidate and commit netenv ownership only on success; host/KASAN tests pass.
+
+- [x] **A120.** FORTIFY rejected intentional kernel/fmlib scheme-tail copies and an oversized compat union copy —
+  fixed (_5326829_): copy through enclosing objects with correct bounds; real ARM64 FORTIFY/`-Werror` and 30 host tests pass.
+
+- [x] **A121.** Forwarding TX queue teardown volatile-dequeued through a NULL callback —
+  fixed (_86326e5_): register a drain-only callback; native descriptor/empty-completion tests cover 8 and 16 queues.
+
+- [x] **A122.** CEETM fallback drains retried forever and one failure force-popped later queues —
+  fixed (_555acd9_, _7636537_): bound each drain, retain failed CQs/device refs for retry and guard late NULL-device skb notifications.
+
+- [x] **A123.** CDX/FMC setup and cleanup forced port enable state or left the Linux path stopped —
+  fixed (_555acd9_, _7636537_): query/save/restore actual state; detach failed PCD before rollback and preserve initially down ports.
+
+- [x] **A124.** Legacy SDK root retargeting could corrupt external-hash ownership —
+  resolved (_555acd9_): reject both SDK entry points and fmlib; the native/compat ioctls were already blocked.
+
+- [x] **A125.** Scheme publication could overwrite dynamic owners; failed create locking could clear another operation —
+  fixed (_555acd9_): publish under the scheme spinlock and acquire the operation flag atomically; userspace was already serialized.
+
+- [x] **A126.** Missing SDK sources silently skipped host regressions and EQCR lacked UBSan halt-on-error —
+  fixed (_555acd9_): fail missing dependencies explicitly and enable the same sanitizer environment for EQCR.
+
+- [x] **A127.** The fmlib scheme serializer depended on an unchecked cross-struct tail layout —
+  fixed (_555acd9_): add a compile-time layout assertion alongside the enclosing-object FORTIFY copy.
+
+- [x] **A128.** Compat hash copy-out failures leaked cookies and busy deletes discarded mappings —
+  fixed (_555acd9_): release failed creations and retire mappings only on the last accepted delete; shared aliases remain valid.
+
+- [x] **A129.** Normal CDX unload omitted PCD queues and private/shared policer cleanup —
+  fixed (_555acd9_, _7636537_): quiesce before subsystem teardown and release resources before FMAN metadata; host retry and KASAN unload checks pass.
+
+- [x] **A130.** FM_PORT_SetPCD dereferenced a missing netenv —
+  fixed (_555acd9_): reject NULL before locking or mutating port state; RX/offline host cases pass.
+
+- [x] **A131.** The loader shifted signed 1 by an unchecked config port ID —
+  fixed (_555acd9_): reject IDs outside the bitmap and use `1U`; boundary tests include bits 0/31 and invalid 32.
+
+- [x] **A132.** Bridge command allowlist reasons and CMM help described nonexistent behavior —
+  fixed (_555acd9_): describe actual fixed-buffer reads and remove the nonexistent set-ipsec branch.

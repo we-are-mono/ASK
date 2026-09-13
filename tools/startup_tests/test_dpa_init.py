@@ -1,7 +1,7 @@
 """CDX startup rollback on a dedicated rdinit=/bin/sh boot, before CDX loads.
 
 Run separately from tools/tests: these cases require an unconfigured FMAN.
-The final check loads CDX successfully in the same boot.
+The final checks load and unload CDX successfully in the same boot.
 """
 
 import base64
@@ -32,7 +32,9 @@ FAULTS = [
 ]
 SPLATS = re.compile(r"BUG:|WARNING: CPU:|Oops:|Kernel panic|possible circular locking|"
                     r"inconsistent lock state|sleeping function called|did not drain|"
-                    r"cannot delete .*profile|cannot free profiles|PlcrProfileDelete failed")
+                    r"cannot delete .*profile|cannot free profiles|PlcrProfileDelete failed|"
+                    r"cannot quiesce|DPA resource cleanup failed|cannot restore port state|"
+                    r"unable to release|Error in releasing")
 
 
 def test_dpa_init_rollback(tmp_path):
@@ -123,11 +125,23 @@ print(json.dumps(states, sort_keys=True))
             assert json.loads(run(port_state_command)) == ports_before
             kernel = run("dmesg")
             assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
+            print("normal initialization passed in the same boot", flush=True)
+            muram_loaded = run(muram_command)
+            run("modprobe -r cdx", timeout=90)
+            assert not re.search(r"^cdx ", run("cat /proc/modules"), re.M)
+            run("test ! -e /proc/fqid_stats")
+            assert json.loads(run(port_state_command)) == ports_before
+            muram_unloaded = run(muram_command)
+            kernel = run("dmesg")
+            assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
+            (tmp_path / "unload-dmesg.txt").write_text(kernel)
+            print("normal unload preserved port state without kernel diagnostics", flush=True)
             (tmp_path / "results.json").write_text(json.dumps({"boot_id": boot, "faults": results,
-                "same_boot_retry": True, "kernel_splats": False, "kmemleak": [],
+                "same_boot_retry": True, "module_unloaded": True,
+                "muram_loaded": muram_loaded, "muram_unloaded": muram_unloaded,
+                "kernel_splats": False, "kmemleak": [],
                 "known_boot_pool_objects": len(known_pool),
                 "port_states_restored": ports_before}, indent=2))
-            print("normal initialization passed in the same boot", flush=True)
         finally:
             run("mv /usr/bin/dpa_app.startup-test /usr/bin/dpa_app")
             run("stty echo")
