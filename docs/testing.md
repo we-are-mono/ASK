@@ -331,6 +331,10 @@ partial userspace copies, allocation failures and asynchronous queue
 retirement under ASan/UBSan. Both partial-creation rollback and complete
 interface teardown must drain all transmit queues and finish callbacks
 before releasing their embedded FQ storage.
+The queue model invokes the registered dequeue callback for contiguous and
+scatter/gather frames and for completions without a valid frame descriptor.
+It checks that every returned frame is released once and empty completions
+release nothing, for both 8- and 16-queue configurations.
 
 CMM route retries have host coverage in
 `tools/host_tests/test_cmm_route_retry.py`: IPv4/IPv6 tunnel, socket and SA

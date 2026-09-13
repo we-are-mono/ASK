@@ -136,6 +136,18 @@ uint8_t iface_pppoe_count;
 #define display_iface_info(x)
 
 
+static enum qman_cb_dqrr_result fwd_tx_drain_dqrr(struct qman_portal *portal,
+		struct qman_fq *fq, const struct qm_dqrr_entry *dq)
+{
+	/* These FQs carry pool-backed forwarding frames normally freed by
+	 * FMan (EBD). Retirement returns any unsent frames to software.
+	 * No interface or NAPI state is needed to return them to BMan.
+	 */
+	if (dq->stat & QM_DQRR_STAT_FD_VALID)
+		dpa_fd_release(NULL, &dq->fd);
+	return qman_cb_dqrr_consume;
+}
+
 //create frame queues for the port used to transmit packets from ENQ action
 static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 {
@@ -147,6 +159,7 @@ static int create_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 	fq = &eth_info->fwd_tx_fqinfo[0];
 	for (ii = 0; ii < DPAA_FWD_TX_QUEUES; ii++) {
 		memset(fq, 0, sizeof(struct qman_fq));
+		fq->cb.dqrr = fwd_tx_drain_dqrr;
 		//FQ for egress
 		if (qman_create_fq(0, 
 					(QMAN_FQ_FLAG_DYNAMIC_FQID | QMAN_FQ_FLAG_TO_DCPORTAL),

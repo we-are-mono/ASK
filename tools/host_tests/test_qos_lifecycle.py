@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?(?:int |void |U16 |struct qman_fq \*)" + name + r"\([^;]*?\)\s*\{", source, re.M)
+    match = re.search(r"^(?:static )?(?:int |void |U16 |struct qman_fq \*|enum qman_cb_dqrr_result )"
+                      + name + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     start = match.start()
     end = match.end()

@@ -21,13 +21,29 @@
 #define QMAN_VOLATILE_FLAG_WAIT 1
 #define QMAN_VOLATILE_FLAG_FINISH 2
 #define QM_VDQCR_NUMFRAMES_TILLEMPTY 1
+#define QM_DQRR_STAT_FD_VALID 0x10
+#define QM_DQRR_STAT_UNSCHEDULED 0x02
+#define QM_DQRR_STAT_FQ_EMPTY 0x80
+#define QM_DQRR_STAT_DQCR_EXPIRED 0x01
 #define TX_DIR 1
 #define FAILURE 1
 #define DPA_ERROR(...) do { } while (0)
 #define pr_warn_ratelimited(...) do { } while (0)
 typedef uint32_t u32;
 enum qman_fq_state { qman_fq_state_oos, qman_fq_state_sched, qman_fq_state_retired };
-struct qman_fq { unsigned fqid; bool acquired, proc; enum qman_fq_state state; u32 flags; };
+enum qman_cb_dqrr_result { qman_cb_dqrr_consume, qman_cb_dqrr_stop };
+enum qm_fd_format { qm_fd_contig, qm_fd_sg };
+struct qm_fd { enum qm_fd_format format; unsigned bpid; uint64_t addr; };
+struct qm_dqrr_entry { unsigned stat; struct qm_fd fd; };
+struct qman_portal { unsigned unused; };
+struct net_device;
+struct qman_fq {
+    unsigned fqid; bool acquired, proc; enum qman_fq_state state; u32 flags;
+    struct {
+        enum qman_cb_dqrr_result (*dqrr)(struct qman_portal *, struct qman_fq *,
+                                       const struct qm_dqrr_entry *);
+    } cb;
+};
 struct list_head { struct list_head *next; };
 struct dpa_fq { struct qman_fq fq_base; struct list_head list; };
 struct qm_mcc_initfq {
@@ -39,7 +55,23 @@ struct eth_iface_info { struct qman_fq fwd_tx_fqinfo[DPAA_FWD_TX_QUEUES]; unsign
 struct dpa_iface_info { struct eth_iface_info eth_info; void *tx_proc_entry; };
 static struct dpa_iface_info iface;
 static unsigned calls, fail, live, pending, syncs, drains, pauses;
+static unsigned returned_frames, released_frames, empty_completions;
+static const struct qm_fd *expected_fd;
 static struct qman_fq *proc_fqs[DPAA_FWD_TX_QUEUES];
+static void dpa_fd_release(const struct net_device *dev, const struct qm_fd *fd)
+{
+    (void)dev;
+    assert(expected_fd && fd == expected_fd);
+    assert(fd->addr && fd->bpid < 64);
+    released_frames++;
+}
+static enum qman_cb_dqrr_result rx_drain(struct qman_portal *portal,
+        struct qman_fq *fq, const struct qm_dqrr_entry *dq)
+{
+    (void)portal; (void)fq;
+    if (dq->stat & QM_DQRR_STAT_FD_VALID) dpa_fd_release(NULL, &dq->fd);
+    return qman_cb_dqrr_consume;
+}
 static void kfree(struct dpa_fq *fq)
 {
     assert(!fq->fq_base.acquired);
@@ -82,7 +114,48 @@ static void qman_fq_state(struct qman_fq *fq, enum qman_fq_state *state, u32 *fl
 static int qman_retire_fq(struct qman_fq *fq, void *flags)
 { (void)flags; assert(fq->acquired); fq->flags = QMAN_FQ_STATE_CHANGING | QMAN_FQ_STATE_NE; pending = 1; return 1; }
 static int qman_volatile_dequeue(struct qman_fq *fq, unsigned flags, unsigned vdqcr)
-{ (void)flags; (void)vdqcr; assert(fq->flags & QMAN_FQ_STATE_NE); fq->flags &= ~QMAN_FQ_STATE_NE; drains++; return 0; }
+{
+    struct qman_portal portal = {0};
+    unsigned frames = drains % 3;
+
+    assert(flags == (QMAN_VOLATILE_FLAG_WAIT | QMAN_VOLATILE_FLAG_FINISH));
+    assert(vdqcr == QM_VDQCR_NUMFRAMES_TILLEMPTY);
+    assert(fq->state == qman_fq_state_retired && (fq->flags & QMAN_FQ_STATE_NE));
+    /* QMan invokes this callback even for an empty VDQCR completion. */
+    assert(fq->cb.dqrr);
+    for (unsigned i = 0; i < frames; i++) {
+        struct qm_dqrr_entry dq = {
+            .stat = QM_DQRR_STAT_UNSCHEDULED | QM_DQRR_STAT_FD_VALID,
+            .fd = { .format = i ? qm_fd_sg : qm_fd_contig,
+                    .bpid = (fq->fqid + i) % 64, .addr = ++returned_frames },
+        };
+        unsigned before = released_frames;
+
+        if (i + 1 == frames && drains % 2) {
+            dq.stat |= QM_DQRR_STAT_FQ_EMPTY | QM_DQRR_STAT_DQCR_EXPIRED;
+            fq->flags &= ~QMAN_FQ_STATE_NE;
+        }
+        expected_fd = &dq.fd;
+        assert(fq->cb.dqrr(&portal, fq, &dq) == qman_cb_dqrr_consume);
+        assert(released_frames == before + 1);
+        expected_fd = NULL;
+    }
+    if (!frames || !(drains % 2)) {
+        struct qm_dqrr_entry dq;
+        unsigned before = released_frames;
+
+        /* A completion without FD_VALID must never release its garbage FD. */
+        memset(&dq, 0xff, sizeof(dq));
+        dq.stat = QM_DQRR_STAT_UNSCHEDULED | QM_DQRR_STAT_FQ_EMPTY
+                  | QM_DQRR_STAT_DQCR_EXPIRED;
+        fq->flags &= ~QMAN_FQ_STATE_NE;
+        assert(fq->cb.dqrr(&portal, fq, &dq) == qman_cb_dqrr_consume);
+        assert(released_frames == before);
+        empty_completions++;
+    }
+    drains++;
+    return 0;
+}
 static int qman_oos_fq(struct qman_fq *fq)
 { assert(fq->state == qman_fq_state_retired && !fq->flags); fq->state = qman_fq_state_oos; return 0; }
 static void synchronize_net(void) { syncs++; }
@@ -106,7 +179,7 @@ int main(void)
         struct dpa_fq *fq = calloc(1, sizeof(*fq));
         assert(fq);
         fq->fq_base = (struct qman_fq){ .fqid = i, .acquired = true,
-            .proc = true, .state = qman_fq_state_sched };
+            .proc = true, .state = qman_fq_state_sched, .cb.dqrr = rx_drain };
         proc_fqs[i] = &fq->fq_base; live++;
         fq->list.next = (struct list_head *)head; head = fq;
     }
@@ -114,7 +187,9 @@ int main(void)
     assert(!head && !live && syncs == before + 1);
     cdx_destroy_fq_list(&head);
     assert(syncs == before + 1);
-    assert(drains && syncs);
-    printf("CDX queues: %u partial-creation faults, asynchronous retirement, drain and retry passed\n", DPAA_FWD_TX_QUEUES * 3);
+    assert(drains && syncs && empty_completions && released_frames);
+    assert(returned_frames == released_frames);
+    printf("CDX queues: %u partial-creation faults, %u frames released, %u empty completions; asynchronous retirement, drain and retry passed\n",
+           DPAA_FWD_TX_QUEUES * 3, released_frames, empty_completions);
     return 0;
 }

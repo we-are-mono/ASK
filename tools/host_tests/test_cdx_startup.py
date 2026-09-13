@@ -40,7 +40,8 @@ def test_cdx_startup(tmp_path):
 def test_cdx_startup_queues(tmp_path, queues):
     source = (ROOT / "cdx/devman.c").read_text()
     (tmp_path / "cdx_queues.inc").write_text(
-        function(source, "cdx_drain_fq") + function(source, "cdx_destroy_fq")
+        function(source, "fwd_tx_drain_dqrr")
+        + function(source, "cdx_drain_fq") + function(source, "cdx_destroy_fq")
         + function(source, "cdx_destroy_fq_list") + function(source, "create_fwd_tx_fqs")
         + function(source, "destroy_fwd_tx_fqs"))
     binary = tmp_path / "cdx_queues"
