@@ -16,6 +16,18 @@ items below. Every reopening is static-conclusive — none needs on-DUT
 verification. Bookkeeping corrections from that audit (wrong commit hashes,
 stale line refs) are folded into the archive one-liners.
 
+## Teardown follow-up validation — 2026-09-13
+
+Validated A133–A134 with 33 host ASan/UBSan tests (8.54s), all passing.
+ARM64 compile checks for `cdx_main.c`, `control_qm.c` and SDK `fm_port.c`
+passed with `-Werror` and no warnings. Each regression fails against its
+previous implementation. The regenerated SDK patch applies to the pinned
+vendor base and reproduces the tested source. This follow-up has not been
+built into a new image or tested on the DUT.
+
+Artifacts on `vision`: `/tmp/ask-teardown-followup-pt93edh9/` contains
+`host.xml`, compiler commands/logs, patch verification and negative checks.
+
 ## Review follow-up validation — 2026-09-13
 
 Validated A120–A132 on KASAN image commit `7636537`.
@@ -971,3 +983,9 @@ file's git history.
 
 - [x] **A132.** Bridge command allowlist reasons and CMM help described nonexistent behavior —
   fixed (_555acd9_): describe actual fixed-buffer reads and remove the nonexistent set-ipsec branch.
+
+- [x] **A133.** Terminal port and QoS retries held RTNL throughout hardware-fault waits —
+  fixed (_:/^fix: handle teardown retries and ports without PCD_).
+
+- [x] **A134.** Detaching an initialized port without PCD made rollback and unload fail —
+  fixed (_:/^fix: handle teardown retries and ports without PCD_).

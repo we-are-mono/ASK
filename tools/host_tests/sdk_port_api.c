@@ -118,6 +118,24 @@ static void retry(struct fixture *f)
 int main(void)
 {
     struct fixture f;
+    /* Policy-less and fully cleaned ports are already detached. Do not
+     * touch registers or attempt HC operations for either case. */
+    for (unsigned oh = 0; oh < 2; oh++) {
+        init(&f, oh, false);
+        for (unsigned cleaned = 0; cleaned < 2; cleaned++) {
+            if (cleaned) {
+                assert(FM_PORT_SetPCD(&f.port, &f.params) == E_OK);
+                assert(FM_PORT_DeletePCD(&f.port) == E_OK);
+            }
+            struct fixture before;
+            memcpy(&before, &f, sizeof(f));
+            failure = HC_SYNC;
+            assert(FM_PORT_DetachPCD(&f.port) == E_OK);
+            assert(!memcmp(&before, &f, sizeof(f)));
+            failure = NONE;
+        }
+        finish(&f);
+    }
     for (unsigned oh = 0; oh < 2; oh++) {
         init(&f, oh, true);
         f.params.h_NetEnv = NULL;
@@ -224,6 +242,7 @@ int main(void)
                         assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
                         assert(env_owners == owners && roots == r && plans == p && schemes == s);
                         assert(FM_PORT_AttachPCD(&f.port) != E_OK); unlocked(&f);
+                        assert(GET_ERROR_TYPE(FM_PORT_DetachPCD(&f.port)) == E_INVALID_STATE); unlocked(&f);
                         assert(FM_PORT_Free(&f.port) != E_OK); unlocked(&f);
                         t_FmPcdPortSchemesParams bind = {.numOfSchemes = 1, .h_Schemes = {(void *)1}};
                         assert(FM_PORT_PcdKgBindSchemes(&f.port, &bind) != E_OK); unlocked(&f);
@@ -240,9 +259,11 @@ int main(void)
             assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
             assert(env_owners == owners && !memcmp(&saved, &f.port, sizeof(saved)) && !memcmp(&bmi, &f.bmi, sizeof(bmi)));
             failure = HC_SYNC;
+            assert(GET_ERROR_TYPE(FM_PORT_DetachPCD(&f.port)) == E_BUSY); unlocked(&f);
             assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f);
             assert(env_owners == owners && f.port.pcdConfigured && roots == 1 && schemes == 1 && plans == 1);
             failure = RISC_DETACH;
+            assert(GET_ERROR_TYPE(FM_PORT_DetachPCD(&f.port)) == E_INVALID_STATE); unlocked(&f);
             assert(FM_PORT_DeletePCD(&f.port) != E_OK); unlocked(&f); assert(env_owners == owners);
             failure = NONE;
             assert(FM_PORT_DetachPCD(&f.port) == E_OK);

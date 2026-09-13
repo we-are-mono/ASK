@@ -103,6 +103,10 @@ static unsigned pop_calls, pop_errors, pool_releases, skb_releases;
 static int persistent_pop_error;
 static bool recover_on_shutdown_wait;
 static unsigned shutdown_waits;
+static bool rtnl;
+static void rtnl_lock(void) { assert(!rtnl); rtnl = true; }
+static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
+#define ASSERT_RTNL() assert(rtnl)
 static unsigned pop_by_queue[16], query_by_queue[16];
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
 {
@@ -304,6 +308,9 @@ static void udelay(unsigned delay) {}
 static void usleep_range(unsigned low, unsigned high) { jiffies++; }
 static void msleep(unsigned ms)
 {
+    assert(!rtnl);
+    /* A netlink operation can acquire RTNL while hardware is still wedged. */
+    rtnl_lock(); rtnl_unlock();
     assert(recover_on_shutdown_wait && persistent_pop_error);
     assert(packet_live[0]);
     shutdown_waits++;
@@ -335,6 +342,14 @@ static void set_cmd_handler(unsigned event, void *handler)
 }
 #include "qos_production.inc"
 
+static void shutdown_qos(void)
+{
+    rtnl_lock();
+    qm_exit();
+    assert(rtnl);
+    rtnl_unlock();
+}
+
 static void empty(void)
 {
     assert(!allocations && !channels && !lfqs && !fqs && !profiles);
@@ -356,7 +371,7 @@ static unsigned cycle(unsigned failure)
     int ret = start();
     total = step;
     assert(failure ? ret < 0 : ret == 0);
-    qm_exit(); qm_exit(); empty();
+    shutdown_qos(); shutdown_qos(); empty();
     return total;
 }
 int main(void)
@@ -429,19 +444,19 @@ int main(void)
         assert(cdx_enable_ceetm_on_iface(&iface) == 0);
         assert(ceetm_assign_chnl(ctx, 0) == 0);
     }
-    qm_exit(); empty();
+    shutdown_qos(); empty();
     assert(!dev.priv.qm_ctx && !dev.priv.ceetm_en && !dev.refs);
     assert(start() == 0);
     release_error = true;
     assert(ceetm_exit() < 0);
     release_error = false;
-    qm_exit(); empty();
+    shutdown_qos(); empty();
     for (unsigned failure = 1; failure <= 3; failure++) {
         assert(start() == 0);
         release_fail_at = failure;
         assert(ceetm_exit() < 0);
         assert(allocations);
-        qm_exit(); empty();
+        shutdown_qos(); empty();
     }
     /* Persistent pop errors return within the deadline, retaining the CQ
      * and its netdev until a later cleanup can reclaim the descriptors. */
@@ -468,7 +483,7 @@ int main(void)
         for (unsigned i = 0; i < 16; i++)
             assert(query_by_queue[i] == 1 && (i == first_cq || !pop_by_queue[i]));
         hold_frames = false;
-        qm_exit(); empty();
+        shutdown_qos(); empty();
     }
     /* A failed interface drain may outlive the interface context. Keep the
      * CQ device references and policers until a later successful cleanup. */
@@ -486,10 +501,13 @@ int main(void)
     assert(ceetm_exit_cq_plcr() < 0 && profiles);
     assert(ceetm_exit() < 0 && dev.refs && packet_live[0]);
     recover_on_shutdown_wait = true;
+    rtnl_lock();
     qm_quiesce();
+    assert(rtnl);
+    rtnl_unlock();
     assert(shutdown_waits == 1 && !dev.refs && !packet_live[0]);
     recover_on_shutdown_wait = false; hold_frames = false;
-    qm_exit(); empty();
+    shutdown_qos(); empty();
     /* Late pool-backed ERNs need no device; malformed late SKB ERNs must
      * not dereference a detached interface. */
     struct qm_fd late = {.bpid = 7, .id = 0};

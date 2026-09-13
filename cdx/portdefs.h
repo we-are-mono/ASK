@@ -224,6 +224,7 @@ int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry);
 void dpa_release_iflist(void);
 int dpa_cfg_quiesce(void);
 void dpa_cfg_deinit(void);
+/* Caller holds the control mutex and RTNL; RTNL is dropped during retry waits. */
 void qm_quiesce(void);
 uint32_t get_logical_ifstats_base(void);
 void *dpa_get_fm_MURAM_handle(uint32_t fm_idx, uint64_t *phyBaseAddr,

@@ -195,13 +195,16 @@ static void cdx_module_deinit(void)
 	int ii;
 
 	/* Stop classification before any dependent subsystem releases queues.
-	 * Do not hold RTNL across callbacks which unregister netdevices. */
+	 * Keep RTNL available between retries and release it before callbacks
+	 * which unregister netdevices. The control mutex excludes FCI updates. */
 	if (fman_info) {
 		mutex_lock(&cdx_info->ctrl.mutex);
 		rtnl_lock();
 		while (dpa_cfg_quiesce()) {
+			rtnl_unlock();
 			pr_warn_ratelimited("cdx: waiting for DPA port shutdown; reboot if hardware cannot recover\n");
 			msleep(1000);
+			rtnl_lock();
 		}
 		/* Reclaim queued TX frames while dependent pools are still alive. */
 		qm_quiesce();

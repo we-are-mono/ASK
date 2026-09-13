@@ -265,6 +265,9 @@ must not force-pop later queues that can drain normally. Terminal module
 cleanup waits for hardware to release retained queues before unloading their
 callbacks or freeing dependent pools; a permanent hardware failure requires
 a board reset. This terminal wait is separate from bounded interface drains.
+Both port and QoS shutdown release RTNL between attempts while retaining the
+control mutex. Host faults verify that an unrelated netlink operation can
+take RTNL during every retry wait and resources survive until recovery.
 The SDK CQ-pop test checks command and
 descriptor byte order, portal-result lifetime, prefetch retries, errors,
 and a final response containing both a frame and the empty-queue flag.
@@ -346,6 +349,8 @@ partial userspace copies, allocation failures and asynchronous queue
 retirement under ASan/UBSan. It also checks all initial port enable-state
 combinations, state restoration after rollback and unload, and the production
 unload cleanup of PCD queues, private/shared policers and FMAN metadata.
+The SDK port API cases cover detach on policy-less and fully cleaned ports,
+while incomplete setup and real hardware detach errors must still fail.
 The FMC lifecycle test preserves initially disabled ports on both successful
 cleanup and failed loads. `test_sdk_port_state.py` compiles the port-state
 query API and ioctl dispatch for native and compat callers, checking the

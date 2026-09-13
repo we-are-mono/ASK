@@ -11,6 +11,23 @@ from test_qos_lifecycle import function
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_cdx_shutdown(tmp_path):
+    main = (ROOT / "cdx/cdx_main.c").read_text()
+    qos = (ROOT / "cdx/control_qm.c").read_text()
+    (tmp_path / "cdx_shutdown.inc").write_text(
+        function(qos, "qm_quiesce") + function(main, "cdx_module_deinit"))
+    binary = tmp_path / "cdx_shutdown"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        "-Werror=implicit-function-declaration", "-I", str(tmp_path),
+        str(Path(__file__).with_name("cdx_shutdown.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30,
+                   env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+                        "UBSAN_OPTIONS": "halt_on_error=1"})
+
+
 def test_cdx_startup(tmp_path):
     source = (ROOT / "cdx/dpa_cfg.c").read_text()
     names = ["release_cfg_info", "dpa_prepare_ports", "dpa_set_ports_enabled",

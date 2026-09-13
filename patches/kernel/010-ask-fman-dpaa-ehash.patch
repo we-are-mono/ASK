@@ -9063,7 +9063,7 @@ index 2f89c05f74e8..20390219276f 100644
          /* update the last bit in the shadow ad */
          FillReplicAdOfTypeResult(p_FmPcd->p_CcShadow, last);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
-index 3662edc..1726a9c 100644
+index 3662edc..145b7b8 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 @@ -53,6 +53,11 @@
@@ -9736,20 +9736,26 @@ index 3662edc..1726a9c 100644
  
      err = AttachPCD(h_FmPort);
      RELEASE_LOCK(p_FmPort->lock);
-@@ -4811,6 +4924,12 @@ t_Error FM_PORT_DetachPCD(t_Handle h_FmPort)
+@@ -4811,6 +4924,18 @@ t_Error FM_PORT_DetachPCD(t_Handle h_FmPort)
          return ERROR_CODE(E_BUSY);
      }
  
 +    if (!p_FmPort->pcdConfigured)
 +    {
++        /* A port without a policy already uses its default path. Keep
++         * incomplete setup/cleanup failures distinct from this no-op. */
++        bool unconfigured = !p_FmPort->pcdEngines && !p_FmPort->pcdNetEnvOwner;
++
 +        RELEASE_LOCK(p_FmPort->lock);
++        if (unconfigured)
++            return E_OK;
 +        RETURN_ERROR(MAJOR, E_INVALID_STATE, ("PCD setup is not complete"));
 +    }
 +
      err = DetachPCD(h_FmPort);
      if (err != E_OK)
      {
-@@ -4818,8 +4937,6 @@ t_Error FM_PORT_DetachPCD(t_Handle h_FmPort)
+@@ -4818,8 +4943,6 @@ t_Error FM_PORT_DetachPCD(t_Handle h_FmPort)
          RETURN_ERROR(MAJOR, err, NO_MSG);
      }
  
@@ -9758,7 +9764,7 @@ index 3662edc..1726a9c 100644
      RELEASE_LOCK(p_FmPort->lock);
  
      return E_OK;
-@@ -4853,11 +4970,11 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
+@@ -4853,11 +4976,11 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
  	if (err)
  		return err;
  
@@ -9774,7 +9780,7 @@ index 3662edc..1726a9c 100644
  	ASSERT_COND(p_ParamsPage);
  
  	if (FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)) {
-@@ -4866,18 +4983,6 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
+@@ -4866,18 +4989,6 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
  			     FM_CTL_PARAMS_PAGE_OFFLOAD_SUPPORT_EN);
  	}
  
@@ -9793,7 +9799,7 @@ index 3662edc..1726a9c 100644
  #ifdef FM_ERROR_VSP_NO_MATCH_SW006
  	if (p_FmPort->vspe) {
  		WRITE_UINT32(p_ParamsPage->misc,
-@@ -4889,166 +4994,112 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
+@@ -4889,166 +5000,112 @@ static int FM_PORT_ConfigureMuramPage(t_Handle h_FmPort)
  	return 0;
  }
  
@@ -10060,7 +10066,7 @@ index 3662edc..1726a9c 100644
  
  	if (FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)) {
  		memset(&fmPortGetSetCcParams, 0, sizeof(t_FmPortGetSetCcParams));
-@@ -5070,8 +5121,10 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
+@@ -5070,8 +5127,10 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
  			}
  #endif /* FM_KG_ERASE_FLOW_ID_ERRATA_FMAN_SW004 */
  
@@ -10072,7 +10078,7 @@ index 3662edc..1726a9c 100644
  			ASSERT_COND(p_ParamsPage);
  			WRITE_UINT32(p_ParamsPage->postBmiFetchNia, p_FmPort->savedBmiNia);
  
-@@ -5085,163 +5138,83 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
+@@ -5085,163 +5144,83 @@ t_Error FM_PORT_SetPCD(t_Handle h_FmPort, t_FmPortPcdParams *p_PcdParam)
  							       NIA_ENG_FM_CTL;
  
  			err = FmPortGetSetCcParams(p_FmPort, &fmPortGetSetCcParams);
@@ -10284,7 +10290,7 @@ index 3662edc..1726a9c 100644
      return err;
  }
  
-@@ -5277,9 +5250,18 @@ t_Error FM_PORT_PcdKgBindSchemes(t_Handle h_FmPort,
+@@ -5277,9 +5256,18 @@ t_Error FM_PORT_PcdKgBindSchemes(t_Handle h_FmPort,
          return ERROR_CODE(E_BUSY);
      }
  
@@ -10303,7 +10309,7 @@ index 3662edc..1726a9c 100644
  
  #ifdef FM_KG_ERASE_FLOW_ID_ERRATA_FMAN_SW004
      if ((FmPcdIsAdvancedOffloadSupported(p_FmPort->h_FmPcd)) &&
-@@ -5327,9 +5309,18 @@ t_Error FM_PORT_PcdKgUnbindSchemes(t_Handle h_FmPort,
+@@ -5327,9 +5315,18 @@ t_Error FM_PORT_PcdKgUnbindSchemes(t_Handle h_FmPort,
          return ERROR_CODE(E_BUSY);
      }
  
@@ -10322,7 +10328,7 @@ index 3662edc..1726a9c 100644
      RELEASE_LOCK(p_FmPort->lock);
  
      return err;
-@@ -5482,3 +5473,31 @@ t_Error FM_PORT_GetIPv4OptionsCount(t_Handle h_FmPort,
+@@ -5482,3 +5479,31 @@ t_Error FM_PORT_GetIPv4OptionsCount(t_Handle h_FmPort,
  
      return E_OK;
  }
@@ -13658,7 +13664,7 @@ index 6e5db2a..d271ec2 100644
 +
  #endif /* __FM_PCD_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
-index 259d194..76f410c 100644
+index 259d194..7ec1dab 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
 @@ -1413,6 +1413,9 @@ t_Error FM_PORT_Disable(t_Handle h_FmPort);
@@ -13719,7 +13725,26 @@ index 259d194..76f410c 100644
  } t_FmPortPcdParams;
  
  /**************************************************************************//**
-@@ -2136,18 +2162,13 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
+@@ -2039,14 +2065,15 @@ t_Error FM_PORT_AttachPCD(t_Handle h_FmPort);
+  @Description   Calling this routine detaches the port from its PCD functionality.
+                 The port returns to its default flow which is BMI to BMI.
+ 
+-                May be used for Rx and OP ports which are
+-                in PCD mode only
++                May be used for Rx and OP ports. An initialized port without
++                PCD configuration is already detached and returns E_OK;
++                incomplete PCD setup or cleanup still returns an error.
+ 
+  @Param[in]     h_FmPort        A handle to a FM Port module.
+ 
+  @Return        E_OK on success; Error code otherwise.
+ 
+- @Cautions      Allowed only following FM_PORT_AttachPCD().
++ @Cautions      Allowed only following FM_PORT_Init().
+ *//***************************************************************************/
+ t_Error FM_PORT_DetachPCD(t_Handle h_FmPort);
+ 
+@@ -2136,18 +2163,13 @@ t_Error FM_PORT_PcdPlcrModifyInitialProfile (t_Handle h_FmPort, t_Handle h_Profi
  /**************************************************************************//**
   @Function      FM_PORT_PcdCcModifyTree
  
@@ -13727,13 +13752,13 @@ index 259d194..76f410c 100644
 -                if the user wishes to replace the tree. The routine may not be called while port
 -                receives packets using the PCD functionalities, therefor port must be first detached
 -                from the PCD, only than the routine may be called, and than port be attached to PCD again.
-+ @Description   Whole-tree replacement is unsupported in Mono. This entry point
-+                is retained for API compatibility and does not access either handle.
- 
+-
 - @Param[in]     h_FmPort            A handle to a FM Port module.
 - @Param[in]     h_CcTree            A CC tree that was already built. The tree id as returned from
 -                                    the BuildTree routine.
--
++ @Description   Whole-tree replacement is unsupported in Mono. This entry point
++                is retained for API compatibility and does not access either handle.
+ 
 - @Return        E_OK on success; Error code otherwise.
 + @Param[in]     h_FmPort            Unused port handle.
 + @Param[in]     h_CcTree            Unused tree handle.

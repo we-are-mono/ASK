@@ -10,6 +10,7 @@
 
 
 #include <linux/delay.h>
+#include <linux/rtnetlink.h>
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
 
@@ -445,13 +446,18 @@ int qm_init(void)
 }
 /* Module init failure/unload only: returning with registered FQs would
  * leave QMan callbacks pointing into freed module text and static storage.
- * Ordinary interface/control drains remain bounded and report failure. */
+ * Ordinary interface/control drains remain bounded and report failure.
+ * Caller holds the control mutex and RTNL; keep the mutex throughout but
+ * drop RTNL between attempts so a hardware fault cannot pin it forever. */
 void qm_quiesce(void)
 {
 #ifdef ENABLE_EGRESS_QOS
+	ASSERT_RTNL();
 	while (ceetm_exit()) {
+		rtnl_unlock();
 		pr_warn_ratelimited("cdx: waiting for QoS shutdown; reboot if hardware cannot recover\n");
 		msleep(1000);
+		rtnl_lock();
 	}
 #endif
 }
