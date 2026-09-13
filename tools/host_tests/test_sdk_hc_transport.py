@@ -14,7 +14,7 @@ def test_sdk_hc_transport(tmp_path):
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", default))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
     hc = (sdk / "Peripherals/FM/HC/hc.c").read_text()
     wrapper = (sdk / "src/wrapper/lnxwrp_fm_port.c").read_text()
     qman_path = kernel / "include/linux/fsl_qman.h"

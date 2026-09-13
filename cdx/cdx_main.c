@@ -38,6 +38,7 @@
  */
 #define DEFINE_GLOBALS
 #include "portdefs.h"
+#include <linux/rtnetlink.h>
 #include "cdx.h"
 #include "cdx_cmdhandler.h"
 #include "dpa_ipsec.h"
@@ -90,12 +91,16 @@ static void cdx_ctrl_deinit(void)
 	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
 
 	mutex_lock(&ctrl->mutex);
+	rtnl_lock();
+	if (dpa_cfg_quiesce())
+		pr_err("cdx: cannot quiesce DPA ports before control teardown\n");
 	cdx_cmdhandler_exit();
 	/* Last on purpose: the exit chain above (ipsec/socket/ipv4/ipv6
 	 * resets included) can still park entries whose delete failed, so
 	 * the abandon must run after every subsystem's teardown, not from
 	 * an individual _exit hook partway down the chain. */
 	cdx_ehash_quarantine_abandon();
+	rtnl_unlock();
 	mutex_unlock(&ctrl->mutex);
 }
 
@@ -188,6 +193,17 @@ static void cdx_module_deinit(void)
 {
 	int ii;
 
+	/* Stop classification before any dependent subsystem releases queues.
+	 * Do not hold RTNL across callbacks which unregister netdevices. */
+	if (fman_info) {
+		mutex_lock(&cdx_info->ctrl.mutex);
+		rtnl_lock();
+		if (dpa_cfg_quiesce())
+			pr_err("cdx: cannot quiesce DPA ports before module teardown\n");
+		rtnl_unlock();
+		mutex_unlock(&cdx_info->ctrl.mutex);
+	}
+
 	for (ii = init_level - 1; ii >= 0; ii--) {
 		if (deinit_fn[ii])
 			deinit_fn[ii]();
@@ -263,12 +279,8 @@ static int __init cdx_module_init(void)
 		printk("%s::cdx_init_device failed\n", __func__);
 		goto exit;
 	}
-	/* registered before cdx_ctrl_init so the LIFO deinit chain runs
-	 * it after cdx_ctrl_deinit (whose tx_exit releases all
-	 * onif-tracked interfaces) — the sweep then frees the remaining
-	 * OFPORT fixtures, or, on a failed init after the dpa_app
-	 * injection, the eth nodes still holding netdev refs */
-	register_cdx_deinit_func(dpa_release_iflist);
+	/* Run after control teardown, while FMAN metadata is still available. */
+	register_cdx_deinit_func(dpa_cfg_deinit);
 	rc = cdx_ctrl_init(cdx_info);
 	if (rc != 0) {
 		printk("%s::cdx_ctrl_init failed\n", __func__);

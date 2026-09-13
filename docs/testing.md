@@ -253,11 +253,16 @@ pytest -c tools/pyproject.toml tools/host_tests -k qos
 ```
 
 The SDK regression uses the patched kernel source from the build tree.
-Set `ASK_KERNEL_SOURCE` to test another patched tree; this check skips if
-the source is unavailable. The CDX host regression always runs.
+Set `ASK_KERNEL_SOURCE` to test another patched tree. Missing SDK or vendor
+sources fail the host suite with an actionable error; no SDK tests silently
+skip. Build the image first to fetch and patch the required sources.
 Forced-drain cases hold frames in a queue until timeout or fail its query,
 then verify that pool buffers and skb-backed frames are reclaimed before
-the interface context is released. The SDK CQ-pop test checks command and
+the interface context is released. Persistent hardware errors and prefetch
+retries must return within the drain deadline. Undrained queues retain their
+device references and policers until cleanup succeeds, and a failed queue
+must not force-pop later queues that can drain normally.
+The SDK CQ-pop test checks command and
 descriptor byte order, portal-result lifetime, prefetch retries, errors,
 and a final response containing both a frame and the empty-queue flag.
 
@@ -276,7 +281,10 @@ our patches and the production loader under ASan/UBSan. It injects startup
 allocation/device failures and cleanup failures, checks retries and shared
 object ownership, and exercises saved-model compatibility and one/two-FMAN
 table counts. The companion SDK test exercises external-table teardown,
-root ownership, shared cookies, busy refusals, and stale handles. SDK and
+root ownership, shared cookies, busy refusals, and stale handles. Compat hash
+copy-out failures release new cookies; refused deletes and shared handles
+retain their mappings. Legacy root retargeting is rejected at the SDK and
+fmlib boundaries, as it already was at the ioctl boundary. SDK and
 fmlib tests reject hardware-reassembly creation/attachment before allocations
 or nested-handle access; native and compat ioctl tests cover reserved inputs.
 These tests require the fetched vendor Git repositories and the patched ASK
@@ -328,7 +336,15 @@ The fault controls `dpa_init_fail_site` and `dpa_init_fail_step` are built
 only into the test image. Production builds omit them. Host coverage in
 `tools/host_tests/test_cdx_startup.py` exercises the SET_PARAMS transaction,
 partial userspace copies, allocation failures and asynchronous queue
-retirement under ASan/UBSan. Both partial-creation rollback and complete
+retirement under ASan/UBSan. It also checks all initial port enable-state
+combinations, state restoration after rollback and unload, and the production
+unload cleanup of PCD queues, private/shared policers and FMAN metadata.
+The FMC lifecycle test preserves initially disabled ports on both successful
+cleanup and failed loads. `test_sdk_port_state.py` compiles the port-state
+query API and ioctl dispatch for native and compat callers, checking the
+one-byte result and error propagation. The new `FM_PORT_IOC_GET_ENABLED`
+command uses port ioctl slot 44; existing encodings are unchanged. FMC saved
+models use format version `0x108` to include the saved enable-state flags. Both partial-creation rollback and complete
 interface teardown must drain all transmit queues and finish callbacks
 before releasing their embedded FQ storage.
 The queue model invokes the registered dequeue callback for contiguous and

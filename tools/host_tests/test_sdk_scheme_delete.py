@@ -28,7 +28,7 @@ def test_sdk_scheme_delete(tmp_path):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
     pcd = (sdk / "Peripherals/FM/Pcd/fm_pcd.c").read_text()
     kg = (sdk / "Peripherals/FM/Pcd/fm_kg.c").read_text()
     hc = (sdk / "Peripherals/FM/HC/hc.c").read_text()

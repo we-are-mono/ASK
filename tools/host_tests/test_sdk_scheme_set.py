@@ -14,7 +14,7 @@ def test_sdk_scheme_set(tmp_path):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
     pcd = (sdk / "Peripherals/FM/Pcd/fm_pcd.c").read_text()
     kg = (sdk / "Peripherals/FM/Pcd/fm_kg.c").read_text()
     hc = (sdk / "Peripherals/FM/HC/hc.c").read_text()
@@ -24,7 +24,8 @@ def test_sdk_scheme_set(tmp_path):
         "NetEnvLock", "NetEnvUnlock", "FmPcdIncNetEnvOwners", "FmPcdDecNetEnvOwners",
         "FmPcdGetNetEnvId", "PcdGetUnitsVector", "FmPcdLock", "FmPcdUnlock",
         "EnqueueLockToFreeLst", "DequeueLockFromFreeLst", "EnqueueLockToAcquiredLst",
-        "FillFreeLocksLst", "ReleaseFreeLocksLst", "FmPcdAcquireLock", "FmPcdReleaseLock",
+        "FillFreeLocksLst", "ReleaseFreeLocksLst", "AcquireLock", "FmPcdAcquireLock",
+        "FmPcdAcquireLockedLock", "FmPcdReleaseLock",
         "FmPcdLockTryLockAll", "FmPcdLockUnlockAll",
     ])
     production += "\n".join(function(hc, name) for name in [
@@ -34,7 +35,7 @@ def test_sdk_scheme_set(tmp_path):
     production += kg[kg.index("static e_FmPcdKgExtractDfltSelect GetGenericSwDefault"):
                      kg.index("static void IncSchemeOwners")]
     production += "\n".join(function(kg, name) for name in [
-        "KgHwLock", "KgHwUnlock", "KgSchemeFlagTryLock", "KgSchemeFlagUnlock",
+        "KgHwLock", "KgHwUnlock", "KgSchemeLock", "KgSchemeUnlock", "KgSchemeFlagTryLock", "KgSchemeFlagUnlock",
         "WriteKgarWait", "UpdateRequiredActionFlag", "ValidateSchemeSw", "InvalidateSchemeSw",
         "BuildSchemeRegs", "FmPcdKgIsSchemeValidSw", "FmPcdKgGetSchemeId",
         "FmPcdKgBuildWriteSchemeActionReg", "FM_PCD_KgSchemeSet", "FM_PCD_KgSchemeDelete",

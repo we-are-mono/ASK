@@ -226,8 +226,7 @@ void cmmClientPrintHelp()
 									"\trtpstats: Set RTP relay DTMF payload types\n"
 									"\tbridge: Manage bridge (timeout)\n"
 									"\ttimeout: set timeout for udp/tc flows\n"
-									"\tff: manage fast forwarding control\n"
-									"\tipsec: manage ipsec configurations\n");
+									"\tff: manage fast forwarding control\n");
 	cmm_print(DEBUG_STDOUT, "\nCommand usage: show <module_name> [option ...]\n"
 									"\tqm: show QM module (QOS, Rate Limiting....)\n"
 									"\tmc6:	show IPv6 Multicast module\n"

@@ -397,7 +397,7 @@ static int get_tbl_params(struct table_info *info)
 }
 
 
-static void create_tbl_portmap(struct table_info *tbl_info, uint32_t tbl_index)
+static int create_tbl_portmap(struct table_info *tbl_info, uint32_t tbl_index)
 {
 	uint32_t ii;
 	uint32_t jj;
@@ -417,7 +417,11 @@ static void create_tbl_portmap(struct table_info *tbl_info, uint32_t tbl_index)
 		}
 		for (jj = 0; jj < count; jj++) {
 			if (*tblref == tbl_index) {
-				tbl_info->port_idx |= (1 << port->portid);
+				if (port->portid >= sizeof(tbl_info->port_idx) * 8) {
+					printf("%s::port id %u exceeds table bitmap\n", __func__, port->portid);
+					return -1;
+				}
+				tbl_info->port_idx |= (1U << port->portid);
 				break;
 			}
 			tblref++;
@@ -428,6 +432,7 @@ static void create_tbl_portmap(struct table_info *tbl_info, uint32_t tbl_index)
 	printf("%s::tbl %s portmap %08x\n", __func__,
 			tbl_info->name, tbl_info->port_idx);
 #endif
+	return 0;
 }
 
 static int get_table_info(struct cdx_fman_info *fman_info)
@@ -528,7 +533,8 @@ static int get_table_info(struct cdx_fman_info *fman_info)
 			//get and fill fd ref to table 
 			info->id = (void *)((struct t_Device *)handle)->id;
 			//create port map for this table
-			create_tbl_portmap(info, ii);
+			if (create_tbl_portmap(info, ii))
+				return -1;
 			//fill app table type
 			if (get_tbl_params(info)) {
 				printf("%s::unable to get params for table %s\n", 

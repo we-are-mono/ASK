@@ -21,7 +21,7 @@ def vendor_tree(name, tmp_path):
                   ROOT / f"meta-ask/build/tmp/work/cortexa72-oe-linux/{name}/git/git"]
     source = next((p for p in candidates if (p / ".git").exists()), None)
     if source is None:
-        pytest.skip(f"build the ASK image to fetch the pinned {name} source")
+        pytest.fail(f"build the ASK image to fetch the pinned {name} source")
     archive = subprocess.check_output(["git", "-C", str(source), "archive", revision])
     target = tmp_path / name
     target.mkdir()
@@ -40,7 +40,7 @@ def test_dpa_lifecycle(tmp_path):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     uapi = kernel / "include/uapi/linux/fmd"
     if not uapi.exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE for its FMD headers")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE for its FMD headers")
     includes = [ROOT / "cdx", fmc / "source", fmlib / "include/fmd",
                 fmlib / "include/fmd/Peripherals", fmlib / "include/fmd/integrations",
                 uapi, uapi / "Peripherals", uapi / "integrations"]
@@ -77,7 +77,7 @@ def test_dpa_lifecycle(tmp_path):
     result = subprocess.run([str(binary)], cwd=tmp_path, capture_output=True, text=True, timeout=180,
                             env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
                                  "UBSAN_OPTIONS": "halt_on_error=1"})
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     assert "DPA lifecycle fault points passed" in result.stdout
     print(result.stdout.strip().splitlines()[-1])
 
@@ -87,7 +87,7 @@ def test_ehash_teardown(tmp_path):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not sdk.exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
 
     def function(source, name):
         match = re.search(r"^(?:static )?(?:void|t_Error|uint32_t) " + name
@@ -105,9 +105,17 @@ def test_ehash_teardown(tmp_path):
     (tmp_path / "ehash_production.inc").write_text(
         function(ehash, "FreeEnEhashInfo") + function(ehash, "FM_PCD_HashTableDelete")
         + function(cc, "copy_td_to_ccbase") + function(cc, "FM_PCD_CcRootDelete")
+        + function(cc, "FM_PCD_CcRootModifyNextEngine")
+        + function(cc, "FmPcdCcModifyNextEngineParamTree")
         + wrapper[wrapper.index("#define FM_PCD_COOKIE_SLOTS"):
                   wrapper.index("static t_Error fm_pcd_cookie_to_handle")]
     )
+    start = wrapper.index("#if defined(CONFIG_COMPAT)\n        case FM_PCD_IOC_HASH_TABLE_SET_COMPAT:")
+    end = wrapper.index("#if defined(CONFIG_COMPAT)\n        case FM_PCD_IOC_HASH_TABLE_ADD_KEY_COMPAT:", start)
+    (tmp_path / "hash_ioctl.inc").write_text(
+        function(wrapper, "fm_pcd_compat_hash_put")
+        + "static t_Error hash_ioctl(t_LnxWrpFmDev *p_LnxWrpFmDev, unsigned cmd, unsigned long arg, bool compat) { t_Error err = E_OK; switch (cmd) {\n"
+        + wrapper[start:end] + "default: return E_INVALID_SELECTION; } return err; }\n")
     binary = tmp_path / "ehash_lifecycle"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

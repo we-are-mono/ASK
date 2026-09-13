@@ -28,7 +28,7 @@ def test_sdk_port_pcd(tmp_path, unit):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     if unit.startswith("port_ioctl"):
         source = (sdk / "src/wrapper/lnxwrp_ioctls_fm.c").read_text()
         uapi = kernel / "include/uapi/linux/fmd"

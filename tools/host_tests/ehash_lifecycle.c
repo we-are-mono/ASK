@@ -14,6 +14,7 @@ typedef int t_Error;
 #define E_INVALID_HANDLE 2
 #define E_INVALID_STATE 3
 #define E_INVALID_SELECTION 4
+#define E_NOT_SUPPORTED 5
 #define SANITY_CHECK_RETURN_ERROR(p, e) do { if (!(p)) return (e); } while (0)
 #define RETURN_ERROR(level, e, msg) return (e)
 #define ASSERT_COND(p) assert(p)
@@ -58,6 +59,7 @@ typedef struct {
     uintptr_t ccTreeBaseAddr;
     struct { struct next_engine nextEngineParams; } keyAndNextEngineParams[2];
 } t_FmPcdCcTree;
+typedef struct next_engine t_FmPcdCcNextEngineParams;
 static unsigned allocations;
 static void *allocate(size_t size) { void *p = calloc(1, size); assert(p); allocations++; return p; }
 static void release(void *p) { assert(p && allocations); allocations--; free(p); }
@@ -94,6 +96,56 @@ static t_FmPcdCcTree *root(t_FmPcd *pcd, struct en_exthash_info *t)
     assert(ad->ipv4_ad_offset == 0xff && (ad->word_2 >> 24) == 0xff);
     return r;
 }
+/* The registry and ioctl arms are production code. User copies and the
+ * legacy compat pointer/id map are fault-injected boundaries. */
+#define CONFIG_COMPAT
+#define COMPAT_US_TO_K 0
+#define COMPAT_K_TO_US 1
+#define FM_MAP_TYPE_PCD_NODE 1
+#define __user
+#define compat_ptr(arg) ((void *)(uintptr_t)(arg))
+#define E_NO_MEMORY 6
+#define E_READ_FAILED 7
+#define E_WRITE_FAILED 8
+#define E_INVALID_VALUE 9
+#define XX_Free release
+#define FM_PCD_IOC_HASH_TABLE_SET 10
+#define FM_PCD_IOC_HASH_TABLE_SET_COMPAT 11
+#define FM_PCD_IOC_HASH_TABLE_DELETE 12
+#define FM_PCD_IOC_HASH_TABLE_DELETE_COMPAT 13
+typedef struct { void *h_PcdDev; } t_LnxWrpFmDev;
+typedef struct { void *id; struct next_engine cc_next_engine_params_for_miss; } ioc_fm_pcd_hash_table_params_t;
+typedef ioc_fm_pcd_hash_table_params_t t_FmPcdHashTableParams;
+typedef struct { uint32_t id; } ioc_compat_fm_pcd_hash_table_params_t;
+typedef struct { void *obj; } ioc_fm_obj_t;
+typedef struct { uint32_t obj; } ioc_compat_fm_obj_t;
+static void *mapping;
+static struct en_exthash_info *requested_table;
+static unsigned malloc_calls, malloc_fail;
+static bool copy_out_fail, map_fail;
+static void *XX_Malloc(size_t size)
+{ return ++malloc_calls == malloc_fail ? NULL : allocate(size); }
+static int copy_from_user(void *to, const void *from, size_t size)
+{ memcpy(to, from, size); return 0; }
+static int copy_to_user(void *to, const void *from, size_t size)
+{ if (copy_out_fail) return 1; memcpy(to, from, size); return 0; }
+static void *compat_pcd_id2ptr(uint32_t id) { return id == 1 ? mapping : NULL; }
+static void compat_del_ptr2id(void *ptr, unsigned type)
+{ assert(type == FM_MAP_TYPE_PCD_NODE); if (mapping == ptr) mapping = NULL; }
+static void compat_obj_delete(ioc_compat_fm_obj_t *from, ioc_fm_obj_t *to)
+{ to->obj = compat_pcd_id2ptr(from->obj); compat_del_ptr2id(to->obj, FM_MAP_TYPE_PCD_NODE); }
+static void compat_copy_fm_pcd_hash_table(ioc_compat_fm_pcd_hash_table_params_t *comp,
+                                       ioc_fm_pcd_hash_table_params_t *param, unsigned direction)
+{
+    if (direction == COMPAT_US_TO_K) param->id = compat_pcd_id2ptr(comp->id);
+    else if (map_fail) comp->id = 0;
+    else { assert(!mapping || mapping == param->id); mapping = param->id; comp->id = 1; }
+}
+static t_Error fm_pcd_cookie_next_engine(struct next_engine *engine) { return E_OK; }
+static void *FM_PCD_HashTableSet(void *pcd, t_FmPcdHashTableParams *params)
+{ assert(pcd); if (!requested_table) requested_table = table(pcd); return requested_table; }
+#include "hash_ioctl.inc"
+
 int main(void)
 {
     t_FmPcd pcd = {0};
@@ -142,5 +194,33 @@ int main(void)
     }
     FreeEnEhashInfo(table(&pcd));
     assert(!allocations);
-    puts("EHASH teardown ownership and shared-cookie checks passed");
+    t_LnxWrpFmDev wrapper = {.h_PcdDev = &pcd};
+    for (unsigned mode = 0; mode < 3; mode++) {
+        ioc_compat_fm_pcd_hash_table_params_t param = {0};
+        requested_table = NULL; malloc_calls = 0;
+        copy_out_fail = mode == 0; malloc_fail = mode == 1 ? 3 : 0;
+        map_fail = mode == 2;
+        assert(hash_ioctl(&wrapper, FM_PCD_IOC_HASH_TABLE_SET_COMPAT,
+                          (unsigned long)&param, true) != E_OK);
+        assert(!allocations && !mapping);
+    }
+    copy_out_fail = map_fail = false; malloc_fail = 0;
+    requested_table = NULL;
+    ioc_compat_fm_pcd_hash_table_params_t param = {0}, second = {0};
+    assert(hash_ioctl(&wrapper, FM_PCD_IOC_HASH_TABLE_SET_COMPAT, (unsigned long)&param, true) == E_OK);
+    assert(param.id && mapping);
+    requested_table->tree_owners = 1;
+    ioc_compat_fm_obj_t id = {.obj = param.id};
+    assert(hash_ioctl(&wrapper, FM_PCD_IOC_HASH_TABLE_DELETE_COMPAT, (unsigned long)&id, true) == E_BUSY);
+    assert(mapping && fm_pcd_cookie_lookup((uintptr_t)mapping, FM_PCD_COOKIE_HASH_TABLE) == requested_table);
+    requested_table->tree_owners = 0;
+    assert(hash_ioctl(&wrapper, FM_PCD_IOC_HASH_TABLE_SET_COMPAT, (unsigned long)&second, true) == E_OK);
+    assert(second.id == param.id);
+    assert(hash_ioctl(&wrapper, FM_PCD_IOC_HASH_TABLE_DELETE_COMPAT, (unsigned long)&id, true) == E_OK);
+    assert(mapping && allocations); /* The second shared reference still owns the mapping. */
+    assert(hash_ioctl(&wrapper, FM_PCD_IOC_HASH_TABLE_DELETE_COMPAT, (unsigned long)&id, true) == E_OK);
+    assert(!mapping && !allocations);
+    assert(FM_PCD_CcRootModifyNextEngine((void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
+    assert(FmPcdCcModifyNextEngineParamTree((void *)1, (void *)1, 0, 0, (void *)1) == E_NOT_SUPPORTED);
+    puts("EHASH teardown, unsupported retargeting and native/compat cookie ownership checks passed");
 }

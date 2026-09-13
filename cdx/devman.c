@@ -2688,17 +2688,23 @@ void cdx_destroy_fq(struct qman_fq *fq)
 	qman_destroy_fq(fq, 0);
 }
 
+void cdx_drain_fq_list(struct dpa_fq *head)
+{
+	struct dpa_fq *fq;
+
+	if (!head)
+		return;
+	for (fq = head; fq; fq = (struct dpa_fq *)fq->list.next)
+		cdx_drain_fq(&fq->fq_base);
+	/* Finish callbacks while retaining queue storage for dependent teardown. */
+	synchronize_net();
+}
+
 void cdx_destroy_fq_list(struct dpa_fq **head)
 {
 	struct dpa_fq *fq;
 
-	if (!*head)
-		return;
-	for (fq = *head; fq; fq = (struct dpa_fq *)fq->list.next)
-		cdx_drain_fq(&fq->fq_base);
-	/* All queues are out of service. Finish outstanding callbacks before
-	 * freeing any of their context; one grace period covers the whole list. */
-	synchronize_net();
+	cdx_drain_fq_list(*head);
 	while (*head) {
 		fq = *head;
 		*head = (struct dpa_fq *)fq->list.next;

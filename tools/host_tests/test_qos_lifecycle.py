@@ -84,7 +84,7 @@ def test_qos_sdk_lifecycle(tmp_path):
     ))
     path = kernel / "drivers/staging/fsl_qbman/qman_high.c"
     if not path.exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     source = path.read_text()
     (tmp_path / "lfq_production.inc").write_text(
         function(source, "qman_ceetm_lfq_claim")
@@ -110,7 +110,7 @@ def test_qos_sdk_cq_pop(tmp_path):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     path = kernel / "drivers/staging/fsl_qbman/qman_high.c"
     if not path.exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     source = path.read_text()
     start = source.index("static inline void hw_fd_to_cpu(")
     end = source.index("\n}", start) + 3

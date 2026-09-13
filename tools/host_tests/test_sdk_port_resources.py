@@ -27,7 +27,7 @@ def test_sdk_port_resources(tmp_path, legacy):
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     sdk = kernel / "drivers/net/ethernet/freescale/sdk_fman"
     if not (sdk / "inc").exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE")
     source = (sdk / "Peripherals/FM/fm.c").read_text()
     marker = "/* All shared resource accounting is protected by the FM lock."
     production = source[source.index(marker):source.index("t_Error FmGetSetPortParams(")] if marker in source else ""

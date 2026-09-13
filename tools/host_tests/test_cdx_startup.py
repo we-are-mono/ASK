@@ -14,8 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_cdx_startup(tmp_path):
     source = (ROOT / "cdx/dpa_cfg.c").read_text()
     names = ["release_cfg_info", "dpa_prepare_ports", "dpa_set_ports_enabled",
-             "dpa_release_pcd_fqs", "dpa_rollback_resources", "cdx_ioc_set_dpa_params"]
-    (tmp_path / "cdx_startup.inc").write_text("\n".join(function(source, n) for n in names))
+             "dpa_release_pcd_fqs", "dpa_rollback_resources", "dpa_detach_ports",
+             "dpa_cfg_quiesce", "dpa_cfg_deinit", "cdx_ioc_set_dpa_params"]
+    (tmp_path / "cdx_startup.inc").write_text(
+        source[source.index("struct dpa_init_port {"):source.index("/* Resolve every port")]
+        + "\n".join(function(source, n) for n in names))
     qos = (ROOT / "cdx/cdx_qos.c").read_text()
     (tmp_path / "cdx_policers.inc").write_text(
         function(qos, "cdxdrv_release_port_policer_slots")
@@ -42,7 +45,7 @@ def test_cdx_startup_queues(tmp_path, queues):
     (tmp_path / "cdx_queues.inc").write_text(
         function(source, "fwd_tx_drain_dqrr")
         + function(source, "cdx_drain_fq") + function(source, "cdx_destroy_fq")
-        + function(source, "cdx_destroy_fq_list") + function(source, "create_fwd_tx_fqs")
+        + function(source, "cdx_drain_fq_list") + function(source, "cdx_destroy_fq_list") + function(source, "create_fwd_tx_fqs")
         + function(source, "destroy_fwd_tx_fqs"))
     binary = tmp_path / "cdx_queues"
     subprocess.run([
@@ -63,7 +66,7 @@ def test_cdx_startup_eqcr(tmp_path):
     high = kernel / "drivers/staging/fsl_qbman/qman_high.c"
     low = high.with_name("qman_low.h")
     if not high.exists():
-        pytest.skip("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE to its patched source")
     text = low.read_text()
     start = text.index("static inline u8 qm_eqcr_get_hw_fill(")
     end = text.index("\n}", start) + 3
@@ -77,4 +80,6 @@ def test_cdx_startup_eqcr(tmp_path):
         "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("cdx_eqcr.c")), "-o", str(binary),
     ], check=True)
-    subprocess.run([str(binary)], check=True, timeout=30)
+    subprocess.run([str(binary)], check=True, timeout=30,
+                   env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+                        "UBSAN_OPTIONS": "halt_on_error=1"})

@@ -52,6 +52,27 @@ def test_dpa_init_rollback(tmp_path):
         assert muram_paths, "FMAN MURAM accounting is required"
         muram_command = "cat " + " ".join(shlex.quote(p) for p in muram_paths)
         muram_before = run(muram_command)
+        port_state_code = """import errno, fcntl, glob, json, os
+states = {}
+for path in sorted(glob.glob('/dev/fm0-port-*')):
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as error:
+        if error.errno == errno.ENODEV:
+            continue
+        raise
+    try:
+        enabled = bytearray(1)
+        fcntl.ioctl(fd, 0x8001e172, enabled)
+        assert enabled[0] in (0, 1)
+        states[path] = enabled[0]
+    finally:
+        os.close(fd)
+assert states
+print(json.dumps(states, sort_keys=True))
+"""
+        port_state_command = "python3 -c " + shlex.quote(port_state_code)
+        ports_before = json.loads(run(port_state_command))
         dmesg_before = run("dmesg")
         run("echo scan > /sys/kernel/debug/kmemleak")
         run("echo clear > /sys/kernel/debug/kmemleak")
@@ -73,6 +94,7 @@ def test_dpa_init_rollback(tmp_path):
                 assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
                 assert not re.search(r"^cdx ", run("cat /proc/modules"), re.M)
                 assert run(muram_command) == muram_before, (site, step, "MURAM leaked")
+                assert json.loads(run(port_state_command)) == ports_before, (site, step, "port state changed")
                 run("test ! -e /proc/fqid_stats")
                 results.append({"site": site, "step": step, "muram": muram_before})
                 print(f"rollback passed: {site}:{step}", flush=True)
@@ -98,11 +120,13 @@ def test_dpa_init_rollback(tmp_path):
             assert result.rc == 0, result.stdout + run("cat /tmp/dpa-startup.log")
             assert re.search(r"^cdx ", run("cat /proc/modules"), re.M)
             assert run("cat /proc/sys/kernel/random/boot_id") == boot
+            assert json.loads(run(port_state_command)) == ports_before
             kernel = run("dmesg")
             assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
             (tmp_path / "results.json").write_text(json.dumps({"boot_id": boot, "faults": results,
                 "same_boot_retry": True, "kernel_splats": False, "kmemleak": [],
-                "known_boot_pool_objects": len(known_pool)}, indent=2))
+                "known_boot_pool_objects": len(known_pool),
+                "port_states_restored": ports_before}, indent=2))
             print("normal initialization passed in the same boot", flush=True)
         finally:
             run("mv /usr/bin/dpa_app.startup-test /usr/bin/dpa_app")

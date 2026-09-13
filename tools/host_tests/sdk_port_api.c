@@ -118,6 +118,14 @@ static void retry(struct fixture *f)
 int main(void)
 {
     struct fixture f;
+    for (unsigned oh = 0; oh < 2; oh++) {
+        init(&f, oh, true);
+        f.params.h_NetEnv = NULL;
+        struct fixture before = f;
+        assert(GET_ERROR_TYPE(FM_PORT_SetPCD(&f.port, &f.params)) == E_INVALID_HANDLE);
+        assert(!memcmp(&before, &f, sizeof(f)) && !env_owners && !settings_calls);
+        finish(&f);
+    }
     /* Reserved replacement API must not inspect handles or change a live
      * classifier, including already-held locks. */
     for (unsigned oh = 0; oh < 2; oh++) {

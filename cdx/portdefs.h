@@ -194,6 +194,7 @@ struct dpa_iface_info {
 int find_pcd_fq_info(uint32_t fqid);
 void add_pcd_fq_info(struct dpa_fq *fq_info);
 void cdx_destroy_fq(struct qman_fq *fq);
+void cdx_drain_fq_list(struct dpa_fq *head);
 void cdx_destroy_fq_list(struct dpa_fq **head);
 void cdx_reset_offline_ports(void);
 int get_dpa_eth_iface_info(struct eth_iface_info *iface_info, char *name);
@@ -221,6 +222,8 @@ void display_iface_info(struct dpa_iface_info *iface_info);
 int cdx_copy_eth_rx_channel_info(uint32_t fman_idx, struct dpa_fq *dpa_fq);
 int cdx_create_fq(struct dpa_fq *dpa_fq, uint32_t flags, void *pcd_proc_entry);
 void dpa_release_iflist(void);
+int dpa_cfg_quiesce(void);
+void dpa_cfg_deinit(void);
 uint32_t get_logical_ifstats_base(void);
 void *dpa_get_fm_MURAM_handle(uint32_t fm_idx, uint64_t *phyBaseAddr,
 					uint32_t *MuramSize);

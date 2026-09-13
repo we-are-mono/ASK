@@ -92,20 +92,24 @@ struct qm_mcc_ceetm_mapping_shaper_tcfc_config {
     struct { unsigned map_lni_id, map_shaped; } channel_mapping;
 };
 struct dpa_priv_s { void *qm_ctx; bool ceetm_en; };
-struct net_device { struct dpa_priv_s priv; };
+struct net_device { struct dpa_priv_s priv; unsigned refs; };
+static void dev_hold(struct net_device *dev) { assert(dev); dev->refs++; }
+static void dev_put(struct net_device *dev) { assert(dev && dev->refs); dev->refs--; }
 struct qm_fd { unsigned bpid, id; };
 struct sk_buff { unsigned id; };
 static struct sk_buff packets[4];
 static bool packet_live[4], hold_frames, fail_query;
 static unsigned pop_calls, pop_errors, pool_releases, skb_releases;
+static int persistent_pop_error;
+static unsigned pop_by_queue[16], query_by_queue[16];
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)
 {
-    assert(dev && dev->priv.qm_ctx && fd->bpid != 0xff);
+    assert(fd->bpid != 0xff);
     assert(packet_live[fd->id]); packet_live[fd->id] = false; pool_releases++;
 }
 static struct sk_buff *_dpa_cleanup_tx_fd(const struct dpa_priv_s *priv, const struct qm_fd *fd)
 {
-    assert(priv && priv->qm_ctx && fd->bpid == 0xff && packet_live[fd->id]);
+    assert(priv && fd->bpid == 0xff && packet_live[fd->id]);
     return &packets[fd->id];
 }
 static void dev_kfree_skb_any(struct sk_buff *skb)
@@ -192,6 +196,8 @@ static int qman_ceetm_cq_claim(struct qm_ceetm_cq **out, struct qm_ceetm_channel
 static int qman_ceetm_cq_pop(struct qm_ceetm_cq *p, struct qm_fd *fd)
 {
     pop_calls++;
+    pop_by_queue[p->idx]++;
+    if (persistent_pop_error) return persistent_pop_error;
     if (pop_errors) return --pop_errors ? -EIO : -EAGAIN;
     if (!pending_frames) return 0;
     unsigned id = --pending_frames;
@@ -224,7 +230,11 @@ static int qman_ceetm_create_fq(struct qm_ceetm_lfq *lfq, struct qman_fq *fq)
 }
 static void qman_destroy_fq(struct qman_fq *fq, unsigned flags)
 {
-    assert(!pending_enqueues && !pending_frames && !pending_erns);
+    assert(!pending_enqueues && !pending_erns);
+    /* Injected frames belong to the first channel; other channels may be
+     * freed while that channel remains quarantined after a failed drain. */
+    if (fq->fqid < 0xf00000 + MAX_SCHEDULER_QUEUES)
+        assert(!pending_frames);
     assert(fq->created && fqs); fq->created = false; fqs--;
 }
 static int qman_ceetm_tokenrate2bps(struct qm_ceetm_rate *rate, uint64_t *bps, int rounding)
@@ -274,6 +284,7 @@ static int qman_ceetm_query_cq(unsigned id, unsigned fm, struct qm_mcr_ceetm_cq_
 {
     assert(id >= (32 << 4));
     queries++;
+    query_by_queue[id & 15]++;
     if (fail_query) { fail_query = false; return -EIO; }
     if (hw_step()) return -EIO;
     query->frm_cnt = pending_frames;
@@ -409,7 +420,7 @@ int main(void)
         assert(ceetm_assign_chnl(ctx, 0) == 0);
     }
     qm_exit(); empty();
-    assert(!dev.priv.qm_ctx && !dev.priv.ceetm_en);
+    assert(!dev.priv.qm_ctx && !dev.priv.ceetm_en && !dev.refs);
     assert(start() == 0);
     release_error = true;
     assert(ceetm_exit() < 0);
@@ -422,6 +433,59 @@ int main(void)
         assert(allocations);
         qm_exit(); empty();
     }
-    printf("%u startup fault points passed, with successful retries, repeated cleanup, interface reassignment and release errors\n", count);
+    /* Persistent pop errors return within the deadline, retaining the CQ
+     * and its netdev until a later cleanup can reclaim the descriptors. */
+    for (unsigned error = 0; error < 2; error++) {
+        assert(start() == 0);
+        assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+        assert(ceetm_assign_chnl(ctx, 0) == 0);
+        persistent_pop_error = error ? -EIO : -EAGAIN;
+        hold_frames = true; fail_query = true;
+        pending_frames = 1; packets[0].id = 0; packet_live[0] = true;
+        unsigned long before = jiffies;
+        struct classque_info *cq = &qm_chnl_info[0].cq_info[0];
+        assert(ceetm_drain_queue(cq) < 0);
+        assert(jiffies - before <= 1000 && cq->drain_failed);
+        assert(ceetm_release_queue(cq) < 0);
+        assert(cq->cq && cq->lfq && cq->fq_created && packet_live[0]);
+        persistent_pop_error = 0;
+        memset(pop_by_queue, 0, sizeof(pop_by_queue));
+        memset(query_by_queue, 0, sizeof(query_by_queue));
+        assert(cdx_disable_ceetm_on_iface(&iface) < 0);
+        assert(!cq->drain_failed && !dev.refs && !packet_live[0]);
+        unsigned first_cq = ((struct qm_ceetm_cq *)cq->cq)->idx;
+        assert(pop_by_queue[first_cq] == 2);
+        for (unsigned i = 0; i < 16; i++)
+            assert(query_by_queue[i] == 1 && (i == first_cq || !pop_by_queue[i]));
+        hold_frames = false;
+        qm_exit(); empty();
+    }
+    /* A failed interface drain may outlive the interface context. Keep the
+     * CQ device references and policers until a later successful cleanup. */
+    assert(start() == 0);
+    assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    assert(ceetm_assign_chnl(ctx, 0) == 0);
+    persistent_pop_error = -EIO; hold_frames = true;
+    pending_frames = 1; packets[0].id = 0; packet_live[0] = true;
+    assert(cdx_disable_ceetm_on_iface(&iface) < 0);
+    assert(!ctx->net_dev && !dev.priv.qm_ctx && dev.refs == MAX_SCHEDULER_QUEUES);
+    assert(packet_live[0] && qm_chnl_info[0].cq_info[0].drain_failed);
+    assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    assert(ceetm_assign_chnl(ctx, 0) < 0);
+    assert(cdx_disable_ceetm_on_iface(&iface) == 0);
+    assert(ceetm_exit_cq_plcr() < 0 && profiles);
+    assert(ceetm_exit() < 0 && dev.refs && packet_live[0]);
+    persistent_pop_error = 0; hold_frames = false;
+    qm_exit(); empty();
+    assert(!dev.refs && !packet_live[0]);
+    /* Late pool-backed ERNs need no device; malformed late SKB ERNs must
+     * not dereference a detached interface. */
+    struct qm_fd late = {.bpid = 7, .id = 0};
+    packet_live[0] = true;
+    ceetm_release_fd(NULL, &late);
+    assert(!packet_live[0]);
+    late.bpid = 0xff;
+    ceetm_release_fd(NULL, &late);
+    printf("%u startup fault points passed, with bounded drain errors, callback lifetimes, retries and release errors\n", count);
     return 0;
 }

@@ -16,7 +16,7 @@ def test_sdk_scheme_ioctl(tmp_path):
     fmlib = Path(os.environ.get("ASK_FMLIB_SOURCE", ROOT /
         "meta-ask/build/tmp/work/cortexa72-oe-linux/fmlib/git/git"))
     if not (sdk / "inc").exists() or not (fmlib / "src/fm_lib.c").exists():
-        pytest.skip("build the ASK kernel/fmlib or set their source overrides")
+        pytest.fail("build the ASK kernel/fmlib or set their source overrides")
     source = (sdk / "src/wrapper/lnxwrp_ioctls_fm.c").read_text()
     marker = "#if defined(CONFIG_COMPAT)\n        case FM_PCD_IOC_KG_SCHEME_SET_COMPAT:"
     start = source.index(marker)

@@ -122,8 +122,10 @@ void FmPcdUnlock(t_Handle handle, uint32_t flags) { assert(handle == &pcd); }
 void FmPcdIncNetEnvOwners(t_Handle handle, uint8_t id) { assert(handle == &pcd && !id); }
 void FmPcdDecNetEnvOwners(t_Handle handle, uint8_t id) { assert(handle == &pcd && !id); }
 bool FmPcdKgIsSchemeValidSw(t_Handle scheme) { return ((t_FmPcdKgScheme *)scheme)->valid; }
-t_FmPcdLock *FmPcdAcquireLock(t_Handle handle)
-{ assert(handle == &pcd); lock_calls++; return &scheme_lock; }
+t_FmPcdLock *FmPcdAcquireLockedLock(t_Handle handle)
+{ assert(handle == &pcd); lock_calls++; scheme_lock.flag = true; return &scheme_lock; }
+static uint32_t KgSchemeLock(t_FmPcdKgScheme *scheme) { assert(scheme->p_Lock); return 0; }
+static void KgSchemeUnlock(t_FmPcdKgScheme *scheme, uint32_t flags) { assert(!flags); }
 void FmPcdReleaseLock(t_Handle handle, t_FmPcdLock *lock)
 { assert(handle == &pcd && lock == &scheme_lock); lock_calls++; lock->flag = false; }
 static bool KgSchemeFlagTryLock(t_FmPcdKgScheme *scheme)

@@ -275,7 +275,7 @@ index f8eb076..a7970a4 100644
      LIBXML_TEST_VERSION;
      xmlSetStructuredErrorFunc( &error, errorFuncHandler );
 diff --git a/source/fmc.h b/source/fmc.h
-index 700ce41..18b72ca 100644
+index 700ce41..5baf366 100644
 --- a/source/fmc.h
 +++ b/source/fmc.h
 @@ -42,7 +42,7 @@ extern "C"
@@ -283,7 +283,7 @@ index 700ce41..18b72ca 100644
  #include <Peripherals/fm_port_ext.h>
  
 -#define FMC_OUTPUT_FORMAT_VER 0x106
-+#define FMC_OUTPUT_FORMAT_VER 0x107
++#define FMC_OUTPUT_FORMAT_VER 0x108
  
  #define FMC_NAME_LEN             64
  #define FMC_FMAN_NUM              2
@@ -295,7 +295,7 @@ index 700ce41..18b72ca 100644
      t_FmPcdNetEnvParams  distinctionUnits;          ///< Port's network env
      t_FmPortPcdParams    pcdParam;
      t_FmPortPcdPrsParams prsParam;
-@@ -110,6 +111,10 @@ typedef struct fmc_port_t {
+@@ -110,6 +111,12 @@ typedef struct fmc_port_t {
      char                 name[FMC_NAME_LEN];
      char                 cctree_name[FMC_NAME_LEN];
      t_Handle             handle;
@@ -303,11 +303,13 @@ index 700ce41..18b72ca 100644
 +    unsigned int         pcd_set;
 +    unsigned int         port_disabled;
 +    unsigned int         tx_port_disabled;
++    bool                 port_was_enabled;
++    bool                 tx_port_was_enabled;
      t_Handle             env_id_handle;
      t_Handle             env_id_devId; 				///< handle to net environment allocated by the driver in kernel
      t_Handle             cctree_handle;
 diff --git a/source/fmc_exec.c b/source/fmc_exec.c
-index c105037..94e5e3d 100755
+index c105037..e44f227 100755
 --- a/source/fmc_exec.c
 +++ b/source/fmc_exec.c
 @@ -271,6 +271,14 @@ fmc_clean( fmc_model* model )
@@ -355,7 +357,7 @@ index c105037..94e5e3d 100755
  
  		    model->scheme_devId[index] = GetDeviceId(model->scheme_handle[index]);
  
-@@ -697,7 +708,7 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
+@@ -697,21 +708,25 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
              err = FM_PCD_HashTableAddKey( model->htnode_handle[index], 
                                  model->htnode[index].matchKeySize,
                                  &(model->htentry[index][i]) );
@@ -364,43 +366,57 @@ index c105037..94e5e3d 100755
          }
      }
      /* End of adding HT entries */
-@@ -705,6 +716,7 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
-     LOG_FMD_CALL( FM_PORT_Disable, pport->name );
-     err = FM_PORT_Disable( pport->handle );
-     CHECK_ERR( FM_PORT_Disable, model->port[port].name );
+ 
+-    LOG_FMD_CALL( FM_PORT_Disable, pport->name );
++    err = FM_PORT_GetEnabled( pport->handle, &pport->port_was_enabled );
++    CHECK_ERR( FM_PORT_GetEnabled, pport->name );
 +    pport->port_disabled = 1;
+     err = FM_PORT_Disable( pport->handle );
+-    CHECK_ERR( FM_PORT_Disable, model->port[port].name );
++    CHECK_ERR( FM_PORT_Disable, pport->name );
  
  #if (DPAA_VERSION >= 11)
      if (pport->vspParam.numOfProfiles > 0) {
-@@ -712,6 +724,7 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
-             LOG_FMD_CALL( FM_PORT_Disable, pport->name );
-             err = FM_PORT_Disable( pport->vspParam.h_FmTxPort );
-             CHECK_ERR( FM_PORT_Disable, model->port[port].name );
+         if (pport->type != e_FM_PORT_TYPE_OH_OFFLINE_PARSING) {
+-            LOG_FMD_CALL( FM_PORT_Disable, pport->name );
++            err = FM_PORT_GetEnabled( pport->vspParam.h_FmTxPort, &pport->tx_port_was_enabled );
++            CHECK_ERR( FM_PORT_GetEnabled, pport->name );
 +            pport->tx_port_disabled = 1;
+             err = FM_PORT_Disable( pport->vspParam.h_FmTxPort );
+-            CHECK_ERR( FM_PORT_Disable, model->port[port].name );
++            CHECK_ERR( FM_PORT_Disable, pport->name );
          }
      LOG_FMD_CALL( FM_PORT_VSPAlloc, pport->name );
      err = FM_PORT_VSPAlloc( pport->handle, &pport->vspParam );
-@@ -722,9 +735,11 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
+@@ -722,16 +737,21 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
      LOG_FMD_CALL( FM_PORT_SetPCD, pport->name );
      err = FM_PORT_SetPCD( pport->handle, &pport->pcdParam );
      CHECK_ERR( FM_PORT_SetPCD, model->port[port].name );
+-    LOG_FMD_CALL( FM_PORT_Enable, pport->name );
+-    err = FM_PORT_Enable( pport->handle );
+-    CHECK_ERR( FM_PORT_Enable, model->port[port].name );
 +    pport->pcd_set = 1;
-     LOG_FMD_CALL( FM_PORT_Enable, pport->name );
-     err = FM_PORT_Enable( pport->handle );
-     CHECK_ERR( FM_PORT_Enable, model->port[port].name );
++    if ( pport->port_was_enabled ) {
++        err = FM_PORT_Enable( pport->handle );
++        CHECK_ERR( FM_PORT_Enable, pport->name );
++    }
 +    pport->port_disabled = 0;
  
  #if (DPAA_VERSION >= 11)
      if (pport->vspParam.numOfProfiles > 0) {
-@@ -732,6 +747,7 @@ fmc_exec_port_end( fmc_model* model, unsigned int engine, unsigned int port )
-             LOG_FMD_CALL( FM_PORT_Enable, pport->name );
-             err = FM_PORT_Enable( pport->vspParam.h_FmTxPort );
-             CHECK_ERR( FM_PORT_Enable, model->port[port].name );
+         if (pport->type != e_FM_PORT_TYPE_OH_OFFLINE_PARSING) {
+-            LOG_FMD_CALL( FM_PORT_Enable, pport->name );
+-            err = FM_PORT_Enable( pport->vspParam.h_FmTxPort );
+-            CHECK_ERR( FM_PORT_Enable, model->port[port].name );
++            if ( pport->tx_port_was_enabled ) {
++                err = FM_PORT_Enable( pport->vspParam.h_FmTxPort );
++                CHECK_ERR( FM_PORT_Enable, pport->name );
++            }
 +            pport->tx_port_disabled = 0;
          }
      }
  #endif /* (DPAA_VERSION >= 11) */
-@@ -1146,6 +1162,7 @@ fmc_clean_engine_start( fmc_model* model, unsigned int index )
+@@ -1146,6 +1166,7 @@ fmc_clean_engine_start( fmc_model* model, unsigned int index )
              LOG_FMD_CALL( FM_PCD_ManipNodeDelete, model->fman[index].frag_name[model->fman[index].frag_count - i - 1] );
              err = FM_PCD_ManipNodeDelete( model->fman[index].frag_handle[model->fman[index].frag_count - i - 1] );
              CHECK_ERR( FM_PCD_ManipNodeDelete, model->fman[index].frag_name[model->fman[index].frag_count - i - 1] );
@@ -408,7 +424,7 @@ index c105037..94e5e3d 100755
          }
      }
  
-@@ -1154,26 +1171,26 @@ fmc_clean_engine_start( fmc_model* model, unsigned int index )
+@@ -1154,26 +1175,26 @@ fmc_clean_engine_start( fmc_model* model, unsigned int index )
              LOG_FMD_CALL( FM_PCD_ManipNodeDelete, model->fman[index].reasm_name[model->fman[index].reasm_count - i - 1] );
              err = FM_PCD_ManipNodeDelete( model->fman[index].reasm_handle[model->fman[index].reasm_count - i - 1] );
              CHECK_ERR( FM_PCD_ManipNodeDelete, model->fman[index].reasm_name[model->fman[index].reasm_count - i - 1] );
@@ -441,7 +457,7 @@ index c105037..94e5e3d 100755
      }
  
      return 0;
-@@ -1186,6 +1203,9 @@ fmc_clean_engine_end( fmc_model* model, unsigned int index )
+@@ -1186,6 +1207,9 @@ fmc_clean_engine_end( fmc_model* model, unsigned int index )
  {
      t_Error err;
  
@@ -451,7 +467,7 @@ index c105037..94e5e3d 100755
      /* fmc_clean_engine_end is called first:
       * Temporary Deny HC usage
       * to avoid crash of certain HC operations performed under heavy traffic */
-@@ -1206,20 +1226,34 @@ static int
+@@ -1206,20 +1230,34 @@ static int
  fmc_clean_port_start( fmc_model* model, unsigned int engine, unsigned int port )
  {
      fmc_port* pport = &model->port[port];
@@ -496,16 +512,20 @@ index c105037..94e5e3d 100755
      return 0;
  }
  
-@@ -1231,19 +1265,28 @@ fmc_clean_port_end( fmc_model* model, unsigned int engine, unsigned int port )
+@@ -1231,19 +1269,36 @@ fmc_clean_port_end( fmc_model* model, unsigned int engine, unsigned int port )
      t_Error err;
      fmc_port* pport = &model->port[port];
  
 -    if ( pport->handle == 0 ) {
 -        return 0;
 +    if ( pport->pcd_set ) {
++        if ( !pport->port_disabled ) {
++            err = FM_PORT_GetEnabled( pport->handle, &pport->port_was_enabled );
++            CHECK_ERR( FM_PORT_GetEnabled, pport->name );
++            pport->port_disabled = 1;
++        }
 +        err = FM_PORT_Disable( pport->handle );
 +        CHECK_ERR( FM_PORT_Disable, pport->name );
-+        pport->port_disabled = 1;
 +        err = FM_PORT_DeletePCD( pport->handle );
 +        CHECK_ERR( FM_PORT_DeletePCD, pport->name );
 +        pport->pcd_set = 0;
@@ -520,24 +540,28 @@ index c105037..94e5e3d 100755
 -    CHECK_ERR( FM_PORT_DeletePCD, pport->name );
 -    if ( err ) { return 6; }
 -
-+    /* A failed load must leave the port able to receive through its
-+     * default path, including failures between Disable and SetPCD. */
++    /* Restore the state captured before this load or cleanup stopped the
++     * port. A port held down by the stack must remain down. */
 +    if ( pport->port_disabled ) {
-+        err = FM_PORT_Enable( pport->handle );
-+        CHECK_ERR( FM_PORT_Enable, pport->name );
++        if ( pport->port_was_enabled ) {
++            err = FM_PORT_Enable( pport->handle );
++            CHECK_ERR( FM_PORT_Enable, pport->name );
++        }
 +        pport->port_disabled = 0;
 +    }
 +#if (DPAA_VERSION >= 11)
 +    if ( pport->tx_port_disabled ) {
-+        err = FM_PORT_Enable( pport->vspParam.h_FmTxPort );
-+        CHECK_ERR( FM_PORT_Enable, pport->name );
++        if ( pport->tx_port_was_enabled ) {
++            err = FM_PORT_Enable( pport->vspParam.h_FmTxPort );
++            CHECK_ERR( FM_PORT_Enable, pport->name );
++        }
 +        pport->tx_port_disabled = 0;
 +    }
 +#endif
      return 0;
  }
  
-@@ -1258,6 +1301,7 @@ fmc_clean_scheme( fmc_model* model,  unsigned int engine,
+@@ -1258,6 +1313,7 @@ fmc_clean_scheme( fmc_model* model,  unsigned int engine,
          LOG_FMD_CALL( FM_PCD_KgSchemeDelete, model->scheme_name[index] );
          err = FM_PCD_KgSchemeDelete( model->scheme_handle[index] );
          CHECK_ERR( FM_PCD_KgSchemeDelete, model->scheme_name[index] );
@@ -545,7 +569,7 @@ index c105037..94e5e3d 100755
      }
  
      return 0;
-@@ -1274,6 +1318,7 @@ fmc_clean_ccnode( fmc_model* model, unsigned int engine,
+@@ -1274,6 +1330,7 @@ fmc_clean_ccnode( fmc_model* model, unsigned int engine,
          LOG_FMD_CALL( FM_PCD_MatchTableDelete, model->ccnode_name[index] );
          err = FM_PCD_MatchTableDelete( model->ccnode_handle[index] );
          CHECK_ERR( FM_PCD_MatchTableDelete, model->ccnode_name[index] );
@@ -553,7 +577,7 @@ index c105037..94e5e3d 100755
      }
  
      return 0;
-@@ -1289,6 +1334,7 @@ fmc_clean_htnode( fmc_model* model, unsigned int engine,
+@@ -1289,6 +1346,7 @@ fmc_clean_htnode( fmc_model* model, unsigned int engine,
          LOG_FMD_CALL( FM_PCD_HashTableDelete, model->htnode_name[index] );
          err = FM_PCD_HashTableDelete( model->htnode_handle[index] );
          CHECK_ERR( FM_PCD_HashTableDelete, model->htnode_name[index] );
@@ -561,7 +585,7 @@ index c105037..94e5e3d 100755
      }
  
      return 0;
-@@ -1305,6 +1351,7 @@ fmc_clean_cctree( fmc_model* model, unsigned int engine,
+@@ -1305,6 +1363,7 @@ fmc_clean_cctree( fmc_model* model, unsigned int engine,
          LOG_FMD_CALL( FM_PCD_CcRootDelete, model->port[port].name );
          err = FM_PCD_CcRootDelete( model->port[port].cctree_handle );
          CHECK_ERR( FM_PCD_CcRootDelete, model->port[port].name );
@@ -569,7 +593,7 @@ index c105037..94e5e3d 100755
      }
  
      return 0;
-@@ -1321,6 +1368,7 @@ fmc_clean_policer( fmc_model* model, unsigned int engine,
+@@ -1321,6 +1380,7 @@ fmc_clean_policer( fmc_model* model, unsigned int engine,
          LOG_FMD_CALL( FM_PCD_PlcrProfileDelete, model->policer_name[index] );
          err = FM_PCD_PlcrProfileDelete( model->policer_handle[index] );
          CHECK_ERR( FM_PCD_PlcrProfileDelete, model->policer_name[index] );
@@ -577,7 +601,7 @@ index c105037..94e5e3d 100755
      }
  
      return 0;
-@@ -1337,6 +1385,7 @@ fmc_clean_manip( fmc_model* model, unsigned int engine,
+@@ -1337,6 +1397,7 @@ fmc_clean_manip( fmc_model* model, unsigned int engine,
          LOG_FMD_CALL( FM_PCD_ManipNodeDelete, model->fman[engine].hdr_name[index] );
          err = FM_PCD_ManipNodeDelete( model->fman[engine].hdr_handle[index] );
          CHECK_ERR( FM_PCD_ManipNodeDelete, model->fman[engine].hdr_name[index] );
@@ -585,7 +609,7 @@ index c105037..94e5e3d 100755
      }
  #endif /* P1023 */
  
-@@ -1354,6 +1403,7 @@ fmc_clean_replicator( fmc_model* model, unsigned int engine,
+@@ -1354,6 +1415,7 @@ fmc_clean_replicator( fmc_model* model, unsigned int engine,
          LOG_FMD_CALL( FM_PCD_FrmReplicDeleteGroup, model->replicator_name[index] );
          err = FM_PCD_FrmReplicDeleteGroup( model->replicator_handle[index] );
          CHECK_ERR( FM_PCD_FrmReplicDeleteGroup, model->replicator_name[index] );

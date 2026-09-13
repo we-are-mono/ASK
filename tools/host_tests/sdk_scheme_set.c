@@ -39,7 +39,7 @@ static bool fail_alloc, fail_spin, reject_command, omit_confirmation, reenter;
 static uint32_t fail_size;
 static t_DpaaFD pending;
 static t_FmPcdKgScheme before_programming;
-static bool check_live;
+static bool check_live, bind_during_program, probe_new_lock;
 #define SCHEME (&kg.schemes[0])
 
 void XX_Print(char *format, ...) { assert(!"unexpected SDK assertion"); }
@@ -62,7 +62,17 @@ uint32_t XX_LockIntrSpinlock(t_Handle p)
 uint32_t XX_LockIntrSpinlockNested(t_Handle p, int subclass)
 { assert(subclass == SINGLE_DEPTH_NESTING); return XX_LockIntrSpinlock(p); }
 void XX_UnlockIntrSpinlock(t_Handle p, uint32_t flags)
-{ struct spin *s = p; assert(s && s->held && irq_depth == flags + 1); s->held = false; irq_depth = flags; }
+{
+    struct spin *s = p;
+    assert(s && s->held && irq_depth == flags + 1); s->held = false; irq_depth = flags;
+    if (p == &pcd_spin && probe_new_lock && !LIST_IsEmpty(&pcd.acquiredLocksLst)) {
+        probe_new_lock = false;
+        t_FmPcdLock *lock = FM_PCD_LOCK_OBJ(pcd.acquiredLocksLst.p_Next);
+        assert(lock->flag); /* The lock is already held when first visible to TryLockAll. */
+        assert(!FmPcdLockTryLockAll(&pcd));
+        assert(lock->flag);
+    }
+}
 physAddress_t XX_VirtToPhys(void *p) { return (uintptr_t)p; }
 void *XX_PhysToVirt(physAddress_t p) { return (void *)(uintptr_t)p; }
 void XX_UDelay(uint32_t usecs) { assert(usecs == HC_CONFIRM_POLL_US && !irq_depth); }
@@ -97,6 +107,13 @@ static void entering_hardware(void)
     hardware_calls++;
     assert(SCHEME->p_Lock && SCHEME->p_Lock->flag);
     if (check_live) assert(!memcmp(SCHEME, &before_programming, sizeof(*SCHEME)));
+    if (bind_during_program) {
+        bind_during_program = false;
+        uint32_t flags = KgSchemeLock(SCHEME);
+        SCHEME->owners++;
+        SCHEME->requiredAction ^= 0x80;
+        KgSchemeUnlock(SCHEME, flags);
+    }
     if (reenter) {
         assert(!irq_depth);
         reenter = false;
@@ -236,11 +253,11 @@ static void failed_and_successful_modification(bool use_hc)
         assert(!FM_PCD_KgSchemeSet(&pcd, &p));
         unchanged(&original, &old_regs);
     }
-    fail_size = 0; reject_command = false; reenter = use_hc;
+    fail_size = 0; reject_command = false; reenter = use_hc; bind_during_program = true;
     assert(FM_PCD_KgSchemeSet(&pcd, &p) == SCHEME);
     check_live = false;
-    assert(SCHEME->vspe && SCHEME->owners == 2 && SCHEME->p_Lock == original.p_Lock);
-    assert(SCHEME->requiredActionFlag && SCHEME->requiredAction == 0x1234);
+    assert(SCHEME->vspe && SCHEME->owners == 3 && SCHEME->p_Lock == original.p_Lock);
+    assert(SCHEME->requiredActionFlag && SCHEME->requiredAction == (0x1234 ^ 0x80));
     assert(SCHEME->netEnvId == 1 && pcd.netEnvs[0].owners == 1 && pcd.netEnvs[1].owners == 2);
     assert(hardware.kgse_mv == pcd.netEnvs[1].unitsVectors[0]);
     p = parameters(-1, true);
@@ -280,6 +297,12 @@ int main(void)
         failed_creation(mode);
         failed_and_successful_modification(mode);
     }
+    setup(true);
+    probe_new_lock = true;
+    t_FmPcdLock *lock = FmPcdAcquireLockedLock(&pcd);
+    assert(lock && !probe_new_lock && lock->flag);
+    FmPcdReleaseLock(&pcd, lock);
+    cleanup();
     ambiguous_timeout(false); ambiguous_timeout(true);
     puts("SDK scheme set: allocation/build/programming failures, ownership, retry and HC timeout passed");
     return 0;

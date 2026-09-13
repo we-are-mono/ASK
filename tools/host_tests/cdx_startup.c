@@ -25,7 +25,7 @@
 typedef void *t_Handle;
 typedef int t_Error;
 
-struct port { bool enabled; };
+struct port { bool enabled, detached; };
 typedef struct { bool active; t_Handle h_Dev; } t_LnxWrpFmPortDev;
 typedef struct {
     unsigned id;
@@ -34,15 +34,17 @@ typedef struct {
 struct list_head { struct list_head *next; };
 struct qman_fq { unsigned id; };
 struct dpa_fq { struct qman_fq fq_base; struct list_head list; };
-struct dpa_init_ports { t_Handle *handles; uint32_t count; };
 struct { unsigned flags, id; struct { unsigned index; } itf; } phy_port[MAX_PHY_PORTS];
 struct port_ff_rate_lim_info { void *handle, *h_FmPcd, *port_handle; };
 static struct port_ff_rate_lim_info port_rate_lim_mode[MAX_PHYS_PORTS];
 static unsigned num_fmans;
 static struct cdx_fman_info *fman_info;
 static struct dpa_fq *dpa_pcd_fq;
-static int dpa_cfg_lock;
+static int dpa_cfg_lock, rtnl;
+static unsigned port_up_mask = 15;
 static struct { struct { int mutex; } ctrl; } cdx_instance, *cdx_info = &cdx_instance;
+static void rtnl_lock(void) { assert(!rtnl && cdx_info->ctrl.mutex); rtnl = 1; }
+static void rtnl_unlock(void) { assert(rtnl); rtnl = 0; }
 static struct cdx_fman_info input[2];
 static struct cdx_ctrl_set_dpa_params request = { input, 2 };
 static t_LnxWrpFmDev wrappers[2];
@@ -76,10 +78,14 @@ static bool stopped(void)
     for (unsigned i = 0; i < 4; i++) if (ports[i].enabled) return false;
     return true;
 }
+static int FM_PORT_GetEnabled(void *p, bool *enabled)
+{ assert(rtnl); *enabled = ((struct port *)p)->enabled; return 0; }
+static int FM_PORT_DetachPCD(void *p)
+{ assert(!((struct port *)p)->enabled); ((struct port *)p)->detached = true; return 0; }
 static int FM_PORT_Disable(void *p) { ((struct port *)p)->enabled = false; return 0; }
 static int FM_PORT_Enable(void *p)
 {
-    if (!restoring && (!stats || !ceetm || queues != 4)) unsafe_enable = true;
+    if (!((struct port *)p)->detached && (!stats || !ceetm || queues != 4)) unsafe_enable = true;
     ((struct port *)p)->enabled = true; return 0;
 }
 static int cdxdrv_get_fman_handles(struct cdx_fman_info *f, t_LnxWrpFmDev **wrapper)
@@ -136,6 +142,12 @@ static void dpa_release_iflist(void)
     kfree(stats); stats = NULL;
 }
 static void cdx_destroy_fq(struct qman_fq *fq) { (void)fq; assert(stopped() && queues); queues--; }
+static void cdx_drain_fq_list(struct dpa_fq *head)
+{
+    assert(stopped());
+    for (struct dpa_fq *fq = head; fq; fq = (struct dpa_fq *)fq->list.next)
+        fq->fq_base.id = 1;
+}
 static void cdx_destroy_fq_list(struct dpa_fq **head)
 {
     while (*head) {
@@ -192,22 +204,32 @@ static void setup(void)
         wrappers[i].id = i;
         wrappers[i].opPorts[0] = (t_LnxWrpFmPortDev){ true, &ports[2 * i] };
         wrappers[i].rxPorts[2] = (t_LnxWrpFmPortDev){ true, &ports[2 * i + 1] };
-        ports[2 * i].enabled = ports[2 * i + 1].enabled = true;
+        ports[2 * i] = (struct port){.enabled = !!(port_up_mask & (1U << (2 * i)))};
+        ports[2 * i + 1] = (struct port){.enabled = !!(port_up_mask & (1U << (2 * i + 1)))};
     }
 }
 static void clean_success(void)
 {
-    struct dpa_init_ports p = { 0 };
-    t_LnxWrpFmDev *w[] = { &wrappers[0], &wrappers[1] };
-    assert(!dpa_prepare_ports(w, &p));
-    assert(!dpa_set_ports_enabled(&p, false));
-    dpa_rollback_resources(); kfree(p.handles); release_cfg_info();
+    /* The module/control exit hooks quiesce before the final config hook. */
+    mutex_lock(&cdx_info->ctrl.mutex); rtnl_lock();
+    assert(!dpa_cfg_quiesce() && stopped() && queues == 4);
+    for (struct dpa_fq *fq = dpa_pcd_fq; fq; fq = (struct dpa_fq *)fq->list.next)
+        assert(fq->fq_base.id == 1);
+    assert(!dpa_cfg_quiesce());
+    rtnl_unlock(); mutex_unlock(&cdx_info->ctrl.mutex);
+    dpa_cfg_deinit();
+    assert(!fman_info && !rtnl && !dpa_cfg_lock && !cdx_info->ctrl.mutex);
+    for (unsigned i = 0; i < 4; i++)
+        assert(ports[i].enabled == !!(port_up_mask & (1U << i)));
     assert(!live_allocs && !slots && !queues);
 }
 static void retry(void)
 {
     assert(!fman_info && !live_allocs && !slots && !queues);
-    assert(!cdx_info->ctrl.mutex && !dpa_cfg_lock);
+    assert(!cdx_info->ctrl.mutex && !dpa_cfg_lock && !rtnl);
+    assert(!unsafe_enable);
+    for (unsigned i = 0; i < 4; i++)
+        assert(ports[i].enabled == !!(port_up_mask & (1U << i)));
     fail_alloc = fail_step = fail_copy = 0;
     setup(); assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
     assert(!unsafe_enable);
@@ -239,6 +261,20 @@ int main(void)
     setup(); fail_step = steps; fail_delete = true;
     assert(cdx_ioc_set_dpa_params((unsigned long)&request) == -EUCLEAN);
     retry();
+    for (port_up_mask = 0; port_up_mask < 16; port_up_mask++) {
+        setup(); assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
+        for (unsigned i = 0; i < 4; i++)
+            assert(ports[i].enabled == !!(port_up_mask & (1U << i)));
+        /* Stack changes after SET_PARAMS are the state unload must restore. */
+        port_up_mask ^= 15;
+        for (unsigned i = 0; i < 4; i++)
+            ports[i].enabled = !!(port_up_mask & (1U << i));
+        clean_success();
+        port_up_mask ^= 15;
+        setup(); fail_step = steps;
+        assert(cdx_ioc_set_dpa_params((unsigned long)&request));
+        retry();
+    }
     printf("CDX startup fault points passed: %u allocations, %u stages, partial copies and retry\n", allocations, steps);
     return 0;
 }

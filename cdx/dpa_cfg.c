@@ -16,6 +16,7 @@
 #include <linux/ioctl.h>
 #include <linux/compat.h>
 #include <linux/mutex.h>
+#include <linux/rtnetlink.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/fdtable.h>
@@ -60,7 +61,7 @@ static struct dpa_fq *dpa_pcd_fq;
 
 /*
  * Concurrency:
- *   cdx_info->ctrl.mutex, then dpa_cfg_lock
+ *   cdx_info->ctrl.mutex, then RTNL, then dpa_cfg_lock
  *      - Excludes FCI commands and timers while startup publishes or
  *        unwinds interfaces and classifier metadata.
  *
@@ -712,10 +713,18 @@ static int cdxdrv_get_fman_handles(struct cdx_fman_info *finfo,
 	return 0;
 }
 
-struct dpa_init_ports {
-	t_Handle *handles;
-	uint32_t count;
+struct dpa_init_port {
+	t_Handle handle;
+	bool enabled;
 };
+
+struct dpa_init_ports {
+	struct dpa_init_port *entries;
+	uint32_t count;
+	bool stopped;
+};
+
+static struct dpa_init_ports dpa_active_ports;
 
 /* Resolve every port before stopping any of them. These are the same port
  * indices used by FMC's device nodes; the OH host-command port is excluded. */
@@ -726,8 +735,8 @@ static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
 
 	for (ii = 0; ii < num_fmans; ii++)
 		count += fman_info[ii].max_ports;
-	ports->handles = kcalloc(count, sizeof(*ports->handles), GFP_KERNEL);
-	if (!ports->handles)
+	ports->entries = kcalloc(count, sizeof(*ports->entries), GFP_KERNEL);
+	if (!ports->entries)
 		return -ENOMEM;
 	for (ii = 0; ii < num_fmans; ii++) {
 		t_LnxWrpFmDev *fm = wrappers[ii];
@@ -760,7 +769,10 @@ static int dpa_prepare_ports(t_LnxWrpFmDev **wrappers,
 			}
 			if (!port->active || !port->h_Dev)
 				return -ENODEV;
-			ports->handles[ports->count++] = port->h_Dev;
+			ports->entries[ports->count].handle = port->h_Dev;
+			if (FM_PORT_GetEnabled(port->h_Dev, &ports->entries[ports->count].enabled))
+				return -EIO;
+			ports->count++;
 		}
 	}
 	return 0;
@@ -772,8 +784,9 @@ static int dpa_set_ports_enabled(struct dpa_init_ports *ports, bool enabled)
 	int ret = 0;
 
 	for (ii = 0; ii < ports->count; ii++) {
-		t_Error err = enabled ? FM_PORT_Enable(ports->handles[ii]) :
-			FM_PORT_Disable(ports->handles[ii]);
+		bool restore_enabled = enabled && ports->entries[ii].enabled;
+		t_Error err = restore_enabled ? FM_PORT_Enable(ports->entries[ii].handle) :
+			FM_PORT_Disable(ports->entries[ii].handle);
 
 		if (err) {
 			DPA_ERROR("%s::cannot %s port %u\n", __func__,
@@ -790,7 +803,7 @@ static void dpa_release_pcd_fqs(void)
 	cdx_reset_offline_ports();
 }
 
-/* Ports remain stopped until the loader removes FMC's classifier objects.
+/* Producer ports must be stopped and detached from PCD before this runs.
  * Keep FMAN/MURAM metadata alive until all dependent resources are gone. */
 static int dpa_rollback_resources(void)
 {
@@ -818,6 +831,72 @@ static int dpa_rollback_resources(void)
 }
 
 
+/* Detach the classifier before releasing its FQs. Restored ports can then
+ * use the Linux default path while FMC removes the failed configuration. */
+static int dpa_detach_ports(struct dpa_init_ports *ports)
+{
+	uint32_t ii;
+	int ret = 0;
+
+	for (ii = 0; ii < ports->count; ii++)
+		if (FM_PORT_DetachPCD(ports->entries[ii].handle))
+			ret = -EIO;
+	return ret;
+}
+
+/* Caller holds RTNL and the control mutex; preserve current stack state. */
+int dpa_cfg_quiesce(void)
+{
+	struct dpa_init_ports *ports = &dpa_active_ports;
+	uint32_t ii;
+	int ret = 0;
+
+	mutex_lock(&dpa_cfg_lock);
+	if (!ports->stopped) {
+		for (ii = 0; ii < ports->count; ii++) {
+			if (FM_PORT_GetEnabled(ports->entries[ii].handle, &ports->entries[ii].enabled)) {
+				ret = -EIO;
+				goto out;
+			}
+		}
+		ports->stopped = true;
+	}
+	if (dpa_set_ports_enabled(ports, false) || dpa_detach_ports(ports)) {
+		ret = -EIO;
+		goto out;
+	}
+	/* Wi-Fi still holds these FQ pointers until its exit callback restores
+	 * their drain callbacks. Reclaim frames now, retain storage until then. */
+	cdx_drain_fq_list(dpa_pcd_fq);
+out:
+	mutex_unlock(&dpa_cfg_lock);
+	return ret;
+}
+
+void dpa_cfg_deinit(void)
+{
+	mutex_lock(&cdx_info->ctrl.mutex);
+	rtnl_lock();
+	if (dpa_cfg_quiesce()) {
+		pr_err("cdx: cannot quiesce DPA resources; reboot required\n");
+		goto out;
+	}
+	mutex_lock(&dpa_cfg_lock);
+	if (fman_info) {
+		if (dpa_rollback_resources())
+			pr_err("cdx: DPA resource cleanup failed\n");
+		if (dpa_set_ports_enabled(&dpa_active_ports, true))
+			pr_err("cdx: cannot restore port state\n");
+		release_cfg_info();
+	}
+	kfree(dpa_active_ports.entries);
+	memset(&dpa_active_ports, 0, sizeof(dpa_active_ports));
+	mutex_unlock(&dpa_cfg_lock);
+out:
+	rtnl_unlock();
+	mutex_unlock(&cdx_info->ctrl.mutex);
+}
+
 /* /dev/cdx_ctrl admits one opener. The loader keeps that fd open until
  * SET_PARAMS completes, so another loader cannot race this check. */
 long cdx_ioc_dpa_init_check(unsigned long args)
@@ -837,7 +916,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	struct cdx_fman_info *finfo;
 	t_LnxWrpFmDev *wrappers[CDX_MAX_FMANS];
 	struct dpa_init_ports ports = { 0 };
-	bool resources_started = false;
+	bool resources_started = false, ports_stopped = false;
 	uint32_t ii;
 	int retval;
 
@@ -853,10 +932,12 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		return -EINVAL;
 	}
 	mutex_lock(&cdx_info->ctrl.mutex);
+	rtnl_lock();
 	mutex_lock(&dpa_cfg_lock);
 	if (fman_info) {
 		DPA_ERROR("%s::dpa params already set\n", __func__);
 		mutex_unlock(&dpa_cfg_lock);
+		rtnl_unlock();
 		mutex_unlock(&cdx_info->ctrl.mutex);
 		return -EBUSY;
 	}
@@ -866,6 +947,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		DPA_ERROR("%s::unable to allocate mem for fman_info\n",
 				__func__);
 		mutex_unlock(&dpa_cfg_lock);
+		rtnl_unlock();
 		mutex_unlock(&cdx_info->ctrl.mutex);
 		return -ENOMEM;
 	}
@@ -926,11 +1008,10 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	retval = dpa_prepare_ports(wrappers, &ports);
 	if (retval)
 		goto err_ret;
+	ports_stopped = true;
 	retval = dpa_set_ports_enabled(&ports, false);
-	if (retval) {
-		dpa_set_ports_enabled(&ports, true);
+	if (retval)
 		goto err_ret;
-	}
 	resources_started = true;
 	if (cdxdrv_init_stats(fman_info->muram_handle) || cdx_dpa_init_fault()) {
 		retval = -EIO;
@@ -1007,23 +1088,36 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		}
 	}
 	retval = dpa_set_ports_enabled(&ports, true);
-	if (retval) {
-		dpa_set_ports_enabled(&ports, false);
+	if (retval)
 		goto err_ret;
-	}
 	display_dpa_cfg();
-	kfree(ports.handles);
+	dpa_active_ports = ports;
 	mutex_unlock(&dpa_cfg_lock);
+	rtnl_unlock();
 	mutex_unlock(&cdx_info->ctrl.mutex);
 	return 0;
 err_ret:
-	if (resources_started && dpa_rollback_resources()) {
-		pr_err("cdx: DPA resource cleanup failed; reboot before retrying\n");
-		retval = -EUCLEAN;
+	if (resources_started) {
+		/* Some ports may already have resumed before an enable error. */
+		if (dpa_set_ports_enabled(&ports, false) || dpa_detach_ports(&ports)) {
+			pr_err("cdx: cannot detach failed DPA setup; reboot required\n");
+			dpa_active_ports = ports;
+			dpa_active_ports.stopped = true;
+			retval = -EUCLEAN;
+			goto unlock;
+		}
+		if (dpa_rollback_resources()) {
+			pr_err("cdx: DPA resource cleanup failed; reboot before retrying\n");
+			retval = -EUCLEAN;
+		}
 	}
-	kfree(ports.handles);
+	if (ports_stopped && dpa_set_ports_enabled(&ports, true))
+		retval = -EUCLEAN;
+	kfree(ports.entries);
 	release_cfg_info();
+unlock:
 	mutex_unlock(&dpa_cfg_lock);
+	rtnl_unlock();
 	mutex_unlock(&cdx_info->ctrl.mutex);
 	return retval;
 }

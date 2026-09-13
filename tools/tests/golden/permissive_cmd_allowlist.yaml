@@ -18,9 +18,9 @@ allowlist:
   - name: CMD_BRIDGED_ITF_UPDATE
     reason: "auto_bridge bridged-iface notification; pcmd passed through to abm with own validation"
   - name: CMD_RX_L2BRIDGE_MODE
-    reason: "cdx-side noop"
+    reason: "bridge handler reads mode_timeout from the fixed kernel command buffer"
   - name: CMD_RX_L2BRIDGE_FLOW_TIMEOUT
-    reason: "cdx-side noop"
+    reason: "bridge handler reads mode_timeout from the fixed kernel command buffer"
   - name: CMD_RX_L2BRIDGE_FLOW_RESET
     reason: "flushes all L2 bridge flows; no body interpretation"
   - name: CMD_VLAN_ENTRY_RESET

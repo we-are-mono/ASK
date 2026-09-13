@@ -18,7 +18,7 @@
 static unsigned step, fail_at, cleanup_step, cleanup_fail_at;
 static unsigned allocated, open_fds, objects, next_cookie, next_fd;
 static unsigned hardware_calls, compile_calls, set_calls;
-static bool cleaning, configured, reject_set, reject_compile;
+static bool cleaning, configured, reject_set, reject_compile, ports_start_down;
 static unsigned engines = 2;
 static void *allocations[4096];
 enum kind { FM, PCD, PORT, CONTROL, ENV, SCHEME, TABLE, TREE, MANIP, POLICER, REPLIC };
@@ -80,13 +80,15 @@ int __wrap_open(const char *name, int flags, ...)
     devices[fd].open = true;
     devices[fd].kind = strstr(name, "cdx_ctrl") ? CONTROL :
         strstr(name, "-pcd") ? PCD : strstr(name, "-port-") ? PORT : FM;
+    if (devices[fd].kind == PORT && ports_start_down)
+        devices[fd].disabled = true;
     open_fds++;
     return fd;
 }
 int __wrap_close(int fd)
 {
     assert(fd > 0 && devices[fd].open);
-    assert(!devices[fd].disabled);
+    assert(devices[fd].disabled == (devices[fd].kind == PORT && ports_start_down));
     assert(!devices[fd].hc_denied);
     devices[fd].open = false;
     open_fds--;
@@ -160,6 +162,7 @@ int __wrap_ioctl(int fd, unsigned long cmd, ...)
         assert(devices[fd].kind == PCD); return 0;
     case FM_PCD_IOC_ALLOW_HC_USAGE:
         devices[fd].hc_denied = !*(uint8_t *)arg; return 0;
+    case FM_PORT_IOC_GET_ENABLED: *(uint8_t *)arg = !devices[fd].disabled; return 0;
     case FM_PORT_IOC_DISABLE: devices[fd].disabled = true; return 0;
     case FM_PORT_IOC_ENABLE: devices[fd].disabled = false; return 0;
     case FM_PORT_IOC_VSP_ALLOC: return 0;
@@ -276,8 +279,11 @@ static void reset(void)
 static void empty(void)
 {
     assert(allocated == 0 && open_fds == 0 && objects == 0);
-    for (unsigned i = 0; i < 256; i++)
-        assert(!devices[i].attached && !devices[i].disabled && !devices[i].hc_denied);
+    for (unsigned i = 0; i < 256; i++) {
+        assert(!devices[i].attached && !devices[i].hc_denied);
+        if (devices[i].name[0])
+            assert(devices[i].disabled == (devices[i].kind == PORT && ports_start_down));
+    }
 }
 int main(void)
 {
@@ -292,6 +298,8 @@ int main(void)
                           cmodel.port[0].cctree_handle)) == E_NOT_SUPPORTED);
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree(NULL, NULL)) == E_NOT_SUPPORTED);
     assert(GET_ERROR_TYPE(FM_PORT_PcdCcModifyTree((void *)1, (void *)1)) == E_NOT_SUPPORTED);
+    assert(GET_ERROR_TYPE(FM_PCD_CcRootModifyNextEngine(NULL, 0, 0, NULL)) == E_NOT_SUPPORTED);
+    assert(GET_ERROR_TYPE(FM_PCD_CcRootModifyNextEngine((void *)1, 0, 0, (void *)1)) == E_NOT_SUPPORTED);
     assert(step == steps && hardware_calls == calls);
     unsigned live_allocations = allocated;
     e_NetHeaderType headers[] = {HEADER_TYPE_IPv4, HEADER_TYPE_IPv6, HEADER_TYPE_CAPWAP};
@@ -369,6 +377,28 @@ int main(void)
     reset(); engines = 1;
     assert(dpa_init() == 0);
     cleaning = true; assert(fmc_clean(&cmodel) == 0); empty();
+    unsigned down_steps = startup_steps;
+    for (unsigned fail = 0; fail <= down_steps; fail++) {
+        reset(); ports_start_down = true; fail_at = fail;
+        int ret = dpa_init();
+        if (!fail) down_steps = step;
+        assert(fail ? ret != 0 : ret == 0);
+        if (!ret) { cleaning = true; assert(fmc_clean(&cmodel) == 0); }
+        empty();
+        ports_start_down = false;
+    }
+    /* The highest bitmap bit is unsigned; larger configured IDs are rejected. */
+    reset();
+    memset(&cmodel, 0, sizeof(cmodel));
+    cmodel.port_count = 1; cmodel.port[0].htnodes_count = 1;
+    cmodel.port[0].htnodes[0] = 7;
+    struct table_info table = {.dpa_type = DPA_CLS_TBL_EXTERNAL_HASH};
+    for (unsigned port = 0; port <= 32; port++) {
+        cmodel.port[0].portid = port; table.port_idx = 0;
+        int ret = create_tbl_portmap(&table, 7);
+        assert(port == 32 ? ret < 0 : ret == 0);
+        assert(table.port_idx == (port < 32 ? 1U << port : 0));
+    }
     printf("DPA lifecycle fault points passed: %u startup, %u cleanup; retry, shared objects, one/two FMANs\n",
            startup_steps, cleanup_steps);
     return 0;
