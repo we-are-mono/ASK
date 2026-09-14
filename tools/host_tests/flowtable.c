@@ -42,10 +42,30 @@ struct list_head { struct list_head *next, *prev; };
 static void list_add_tail(struct list_head *e, struct list_head *h)
 { e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
 static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
+static void list_init(struct list_head *h) { h->next = h->prev = h; }
+#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
+#define PTR_ERR(p) ((int)(intptr_t)(p))
+#define ERR_PTR(e) ((void *)(intptr_t)(e))
+#define lockdep_assert_held(p) assert(*(p))
+enum tc_setup_type { TC_SETUP_FT };
+enum { FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS, FLOW_BLOCK_BIND, FLOW_BLOCK_UNBIND };
+struct Qdisc { int unused; };
+struct flow_block { struct list_head cb_list; };
+struct flow_block_offload {
+    struct flow_block *block;
+    struct net *net;
+    int binder_type, command;
+    struct list_head *driver_block_list, cb_list;
+};
+struct flow_block_cb {
+    struct list_head list, driver_list;
+    void *ident, *priv;
+    void (*release)(void *);
+};
 struct net { int id; };
 static struct net init_net;
 struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; };
-struct nf_flowtable { int unused; };
+struct nf_flowtable { struct { int nelems; } rhashtable; };
 struct nf_conn { struct net *net; unsigned zone[2], mark, status; };
 #define nf_ct_net(c) ((c)->net)
 #define nf_ct_zone(c) ((c)->zone)
@@ -104,33 +124,66 @@ struct work_struct { int unused; };
 static int ft_work;
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
-static unsigned ft_count, ft_fail_stage;
-static u64 ft_installs, ft_deletes, ft_errors, ft_validated;
-static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done;
+static LIST_HEAD(ft_block_list);
+static unsigned ft_count, ft_bound, ft_fail_stage;
+static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms;
+static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
 static unsigned long jiffies = 1000;
 static unsigned allocated, live_hw, flushed, scheduled;
 static bool allocation_fail, hardware_fail, invalidate_on_add, physical_ok = true, neigh_ok = true;
 static int deletion_error;
 static bool rtnl_busy, rtnl, quiesce_fail;
+static bool callback_allocation_fail, invalidate_on_bind;
+static unsigned private_pending, legacy_pending;
+static int retry_error;
+static void (*cleanup_hook)(void);
 static struct { struct { bool mutex; } ctrl; } instance, *cdx_info = &instance;
 static void mutex_lock(bool *m) { assert(!*m); *m = true; }
 static void mutex_unlock(bool *m) { assert(*m); *m = false; }
 static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static int dpa_cfg_quiesce(void) { assert(rtnl && cdx_info->ctrl.mutex); return quiesce_fail ? -EIO : 0; }
-static int cdx_ft_hw_retry(void) { return 0; }
+static int cdx_ft_hw_retry(void) { return retry_error; }
+static unsigned cdx_ft_hw_pending(void) { return private_pending; }
+static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
 static void cdx_ft_hw_quiesced(void) { assert(cdx_info->ctrl.mutex && !quiesce_fail); }
 static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
-static void nf_flow_table_cleanup(struct net_device *dev) { assert(!cdx_info->ctrl.mutex); flushed++; }
+static void nf_flow_table_cleanup(struct net_device *dev)
+{ assert(!cdx_info->ctrl.mutex); flushed++; if (cleanup_hook) cleanup_hook(); }
 static void dev_hold(struct net_device *d) { d->refs++; }
 static void dev_put(struct net_device *d) { assert(d->refs > 0); d->refs--; }
 static int atomic_read(int *v) { return *v; }
+static void atomic_set(int *v, int n) { *v = n; }
 static void ft_invalidate(void) { ft_invalid = 1; }
 static bool ft_physical(struct net_device *d) { return d && physical_ok; }
 static bool ft_permanent_neigh(struct net_device *d, __be32 dst, const u8 *mac) { return neigh_ok; }
 static void *kzalloc(size_t n, int flags) { if (allocation_fail) return NULL; allocated++; return calloc(1, n); }
 static void kfree(void *p) { assert(allocated); allocated--; free(p); }
+static int ft_rule_callback(enum tc_setup_type t, void *data, void *priv) { return 0; }
+typedef int (*rule_callback_t)(enum tc_setup_type, void *, void *);
+static struct flow_block_cb *flow_indr_block_cb_alloc(rule_callback_t fn, void *ident,
+    void *priv, void (*release)(void *), struct flow_block_offload *bo,
+    struct net_device *dev, struct Qdisc *sch, void *table, void *driver,
+    void (*cleanup)(struct flow_block_cb *))
+{
+    if (callback_allocation_fail) return ERR_PTR(-ENOMEM);
+    struct flow_block_cb *cb = kzalloc(sizeof(*cb), GFP_KERNEL); assert(cb);
+    cb->ident = ident; cb->priv = priv; cb->release = release;
+    if (invalidate_on_bind) { assert(ft_bound); ft_invalidate(); }
+    return cb;
+}
+static void flow_block_cb_add(struct flow_block_cb *cb, struct flow_block_offload *bo)
+{ list_add_tail(&cb->list, &bo->cb_list); }
+static struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
+                                                 rule_callback_t fn, void *ident)
+{
+    struct flow_block_cb *cb;
+    list_for_each_entry(cb, &block->cb_list, list) if (cb->ident == ident) return cb;
+    return NULL;
+}
+static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_block_offload *bo)
+{ list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list); }
 static int cdx_ft_hw_add(const struct cdx_ft_rule *r, struct cdx_ft_hw **hw)
 {
     if (hardware_fail) return -EIO;
@@ -189,6 +242,123 @@ static void fixture(void)
     physical_ok = neigh_ok = true;
 }
 #define REJECT(change) do { fixture(); change; assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP); } while (0)
+
+/* Model Netfilter's callback-list commit/free after the driver returns. In
+ * particular, release must not run while ft_bind holds the control mutex. */
+static struct flow_block block;
+static struct nf_flowtable table;
+static int bind_device(struct net_device *dev, int command)
+{
+    struct flow_block_offload bo = { .block = &block, .net = &init_net,
+        .binder_type = FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS, .command = command };
+    list_init(&bo.cb_list);
+    int rc = ft_bind(dev, NULL, NULL, TC_SETUP_FT, &bo, &table, NULL);
+    while (bo.cb_list.next != &bo.cb_list) {
+        struct flow_block_cb *cb = list_entry(bo.cb_list.next, struct flow_block_cb, list);
+        list_del(&cb->list);
+        if (command == FLOW_BLOCK_BIND) list_add_tail(&cb->list, &block.cb_list);
+        else { cb->release(cb->priv); kfree(cb); }
+    }
+    return rc;
+}
+static bool can_rearm(void)
+{
+    mutex_lock(&cdx_info->ctrl.mutex);
+    bool ready = ft_can_rearm();
+    mutex_unlock(&cdx_info->ctrl.mutex);
+    return ready;
+}
+static void detach_during_cleanup(void)
+{
+    cleanup_hook = NULL;
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+    assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+    assert(!ft_bound && !ft_count && !ft_invalid_done);
+    assert(!can_rearm());
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+}
+static void test_rearm(void)
+{
+    list_init(&block.cb_list);
+    assert(ft_invalid && ft_fatal && ft_invalid_done);
+    assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+    /* The fatal latch independently prevents admission, even if another
+     * path were to clear the ordinary invalidation flag accidentally. */
+    ft_invalid = 0;
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+    assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
+    ft_fatal = false; /* Simulated fresh module/boot, never a recovery action. */
+    ft_invalid_done = false;
+    deletion_error = 0;
+    u64 errors = ft_errors, installs = ft_installs, deletes = ft_deletes;
+    for (unsigned cycle = 0; cycle < 8; cycle++) {
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+        invalidate_on_bind = true;
+        assert(bind_device(&out, FLOW_BLOCK_BIND) == 0);
+        invalidate_on_bind = false;
+        assert(ft_invalid && !ft_invalid_done && ft_rearms == cycle);
+        assert(ft_bound == 2 && allocated == 4 && in.refs == 1 && out.refs == 1);
+        ft_invalidate();
+        /* A failed retirement barrier cannot be bypassed by detachment. */
+        retry_error = -EAGAIN;
+        ft_invalidate_work(NULL);
+        assert(!ft_invalid_done && !can_rearm());
+        if (cycle % 3 == 0) {
+            assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+            assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+            assert(!ft_bound && !can_rearm());
+            assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        }
+        retry_error = 0;
+        if (cycle % 3 == 0) {
+            ft_invalidate_work(NULL);
+        } else if (cycle & 1) {
+            cleanup_hook = detach_during_cleanup;
+            ft_invalidate_work(NULL);
+        } else {
+            ft_invalidate_work(NULL);
+            assert(ft_invalid_done && !can_rearm());
+            assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+            assert(!can_rearm());
+            assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+            assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+        }
+        assert(!ft_bound && !ft_count && !allocated && !in.refs && !out.refs);
+        assert(can_rearm());
+        table.rhashtable.nelems = 2;
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        assert(ft_invalid && ft_invalid_done && !allocated && ft_rearms == cycle);
+        table.rhashtable.nelems = 0;
+        private_pending = 1;
+        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        private_pending = 0; legacy_pending = 1;
+        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        legacy_pending = 0; ft_stopping = true;
+        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        ft_stopping = false; ft_ready = false;
+        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        ft_ready = true; allocation_fail = true;
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == -ENOMEM);
+        allocation_fail = false; callback_allocation_fail = true;
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == -ENOMEM);
+        callback_allocation_fail = false;
+        assert(ft_invalid && ft_invalid_done && can_rearm() && !allocated);
+        assert(ft_rearms == cycle);
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+        assert(!ft_invalid && !ft_invalid_done && !can_rearm() && ft_rearms == cycle + 1);
+        assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && ft_rearms == cycle + 1);
+        fixture();
+        struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
+        assert(cb && ft_replace(cb->priv, &cls) == 0);
+        assert(ft_count == 1 && live_hw == 1);
+        assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0); /* Real entry retirement. */
+        assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
+        assert(!ft_count && !ft_bound && !live_hw && !allocated && !in.refs && !out.refs);
+        assert(ft_installs == installs + cycle + 1 && ft_deletes == deletes + cycle + 1);
+        assert(ft_errors == errors && !ft_invalid && !ft_invalid_done && !ft_fatal);
+        assert(ft_bindings.next == &ft_bindings && ft_block_list.next == &ft_block_list);
+    }
+}
 int main(void)
 {
     struct cdx_ft_rule decoded;
@@ -255,5 +425,6 @@ int main(void)
     assert(flushed == 1 && ft_invalid_done && !in.refs && !out.refs);
     list_del(&binding.list);
     assert(ft_installs == ft_deletes);
-    puts("Flowtable: decoder, references, deltas, wrap, rollback, invalidation and fatal retry passed");
+    test_rearm();
+    puts("Flowtable: decoder, references, deltas, wrap, rollback, invalidation, rearm and fatal retry passed");
 }

@@ -441,11 +441,38 @@ declined.
 
 Relevant initial-netns IPv4 route and ARP-neighbour changes, or interface down,
 unregister, MTU, MAC, rename, or upper-device changes conservatively disable new
-hardware admission until reboot. The current notifier scope includes unrelated
+hardware admission until the recovery boundary below. The notifier scope includes unrelated
 IPv4 routes/neighbours in that namespace: conservative invalidation can reduce
 availability but must not retain stale forwarding. Configure routes and permanent
 neighbours before binding the table. Invalidation is asynchronous; inspect
 `invalidation_done` before claiming retirement is complete.
+
+Healthy invalidation can recover by deleting and recreating the flowtable after
+configuration has settled. Admission remains closed while any old binding or
+entry exists, invalidation work is incomplete, or either retirement quarantine
+contains storage. With all of these cleared, `rearm_ready=1` reports that the
+driver can accept recovery. The candidate Linux table must also be empty: a
+table with its hooks removed can still contain cached flows and queued callbacks.
+The first successful binding to an empty table clears `invalidated` and
+`invalidation_done`.
+That binding increments `rearms`; adding the second port does not. Allocation
+failure leaves the recovery state untouched. Install, delete and error counters
+remain cumulative. Every new rule still passes the full Linux-context validation.
+
+The control mutex protects this transition. The worker publishes completion as
+its last state change, after hardware retirement and Linux flow cleanup. Binding
+never waits for the worker: Netfilter locks held by a binding operation can be
+needed by the cleanup being awaited. Recovery depends on complete withdrawal of
+the old bindings, not a comparison of opaque table pointers, which can be reused.
+The `TC_SETUP_FT` setup call borrows a live `struct nf_flowtable` from Netfilter;
+only this call reads its hash population. The retained table pointer is used
+solely for identity in other paths. This check is against the exact downstream
+kernel interface and must be reviewed when porting the adapter.
+Keeping an invalidated table bound does not re-enable it automatically. Fully
+detaching and reattaching its devices is refused while cached flows remain;
+deleting and recreating the table provides an empty candidate. Fatal
+state independently refuses binding and installation, even with empty quarantine;
+there is no runtime command to clear the fatal latch.
 
 Deletion has three outcomes: synchronized removal, unlinked storage retained for
 a barrier, or unproven unlink. All outcomes consume the adapter's software
@@ -478,14 +505,25 @@ acceptance uses the real classifier and endpoint traffic.
 neighbours, a WAN host return route, and a numbered echo server, then restores
 the fixture. It uses the LAN UART and target/WAN agents without CMM helpers.
 Runs can set `ASK_FLOWTABLE_ARTIFACTS` to retain measurements and packet captures.
-The last test invalidates the experiment until the next boot.
+The rearm test exercises three recovery cycles without rebooting. It changes the
+LAN endpoint's actual MAC and its permanent DUT neighbour while traffic runs,
+then changes a direct host-route MTU, then injects two retirement-barrier failures.
+Each cycle proves software forwarding during invalidation and fresh hardware
+forwarding after table recreation. Strict delivery checks use the NIC's normal
+receive filter. Software TX enqueues distinguish software forwarding from
+hardware delivery. The SDK RX statistic alone cannot do so: with GRO disabled,
+software flowtable forwarding can consume an skb and return before the driver
+increments RX. The test also refuses reattachment of a populated table whose
+hooks have all been withdrawn. The separate invalidation-only test leaves
+admission closed.
 
 `ASK_FLOWTABLE_TERMINAL=unload|unlink` separately selects a terminal lifecycle
 test with `-k flowtable_offload_terminal`. Use a fresh experimental boot for
 each variant. The test removes the inactive FCI module dependency, verifies
 both hardware directions under traffic, and then unloads CDX or injects an
 unproven unlink. The latter checks fatal status and disabled FMan receive ports,
-then removes CDX for cleanup. Both variants finish by checking 64 ordinary UDP
+refuses hardware bindings for a newly created flowtable, then removes CDX for
+cleanup. Both variants finish by checking 64 ordinary UDP
 exchanges with CDX absent. A continuous sender spans the intentional datapath
 stop and validates every received payload; interruption during that stop is
 recorded separately from the normal zero-loss forwarding oracle. DUT control
@@ -507,13 +545,25 @@ ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=<WAN-address> make ask-test \
   ASK_TEST_ARGS='-k flowtable_offload -x -q'
 ```
 
-The ordinary run selects four PoC scenarios: reference/forwarding/lifecycle,
-same-tuple exceptions, installation rollback, and neighbour invalidation. The
+The ordinary run selects five PoC scenarios: reference/forwarding/lifecycle,
+same-tuple exceptions, installation rollback, recovery, and neighbour invalidation. The
 optional long-exchange diagnostic skips by default. The lifecycle includes a
 512-packet hardware measurement, minimum-size packets, three removals under
 traffic, 65 seconds of activity refresh, and a bounded idle-expiry wait. Tests
 validate payloads and Ethernet/IP behaviour; they never equate classifier hits
 or Linux's hardware flag with successful delivery.
+
+For the recovery increment alone, select just the recovery and fatal-refusal
+checks on a fresh experimental boot:
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_FLOWTABLE_TERMINAL=unlink \
+  ASK_WAN_IPERF_IP=<WAN-address> make ask-test \
+  ASK_TEST_ARGS='-k "flowtable_offload_rearm or flowtable_offload_terminal" -x -q'
+```
+
+The terminal test removes CDX, so reboot in experimental mode afterward. The
+recovery test itself needs no reboot or return to CMM between its cycles.
 
 On a separate experimental boot, exercise failed retirement barriers with:
 
@@ -677,7 +727,8 @@ remains documented; the operator explicitly deferred further dedicated loss
 diagnosis so work could continue on this foundation.
 
 For subsequent work, keep the DUT in experimental ownership between tests.
-Reboot within that mode when a test latches invalidation or removes CDX; return
+Recreate the table after healthy invalidation; reboot within that mode after a
+fatal failure or a test that removes CDX. Return
 to CMM only when the compatibility test itself requires it. The operator has
 made the DUT available for continued development.
 
@@ -687,3 +738,61 @@ fatal and quarantine all zero. CMM and auto_bridge are absent, both fault knobs
 are clear, and no experimental nftables table remains. The ready boot has no
 kernel splats or I2C stuck messages. Persistent boot settings and flash remain
 unchanged.
+
+## Healthy invalidation recovery verified (2026-09-14)
+
+The first follow-on increment is complete: healthy invalidation can restore
+hardware admission after full detachment and binding an empty Linux flowtable.
+Fatal retirement remains latched. Work stops at this increment; ordinary ARP,
+gateway routes and selective invalidation are subsequent work.
+
+The KASAN image was rebuilt and staged, and live kernel/CDX build notes matched
+the built artifacts before both hardware checks. KASAN, lockdep and FAILSLAB
+were enabled; the full KASAN suite was not run. The build had no compiler
+warnings; its three BitBake warnings concerned previously forced recipe tasks.
+
+| Identity | Value |
+| --- | --- |
+| Staged image SHA-256 | `50d8b8510421e8f6998e423baa1f99c958f66731ac06f2c7a1eba5039362af9a` |
+| Kernel build ID | `2da28a7c60a44c08886618dfa4bda39e3eeb363b` |
+| CDX build ID | `3f04f3e1c4082d88053ddb2c9cbe7dbfc063ec3a` |
+| Recovery test boot | `724fcb2a-5349-4580-836e-9fed961aeb1e` |
+| Successful fatal test boot | `45bb4344-a8ae-4e36-b604-641b69216e98` |
+
+| Check | Confirmed result |
+| --- | --- |
+| Focused host checks | 11 passed in 0.48 seconds. Production adapter/backend lifecycle and shutdown checks use ASan/UBSan; counter-parser checks cover both directions. |
+| Recovery admission guards | Host checks exercise incomplete cleanup, failed barriers, both quarantine lists, partial detachment, populated Linux tables, allocation failures, shutdown and fatal state. A notifier arriving during ordinary bind allocation remains latched. Eight recovery cycles preserve references and cumulative counters. |
+| Healthy DUT recovery | Passed in 24.17 seconds. MAC change, host-route MTU change and two injected retirement-barrier failures each completed invalidation and recovered after table recreation, all within one boot. `rearms` advanced exactly once per cycle, from 0 to 3. |
+| Closed admission | Each cycle delivered 64 strict echoes through software with no new hardware installs and exactly 64 LAN software TX enqueues. Existing bindings did not reopen admission. Reattaching the populated, fully detached table returned `Operation not supported`. |
+| Recovered forwarding | Each cycle delivered 512 strict echoes with the normal LAN receive filter, exactly 512 hardware hits per direction, and software TX deltas of 0 on eth3 and 8 on eth4. The changed destination MAC was accepted by the endpoint; after the MTU change, the reply rule used 1100 and the original direction retained 1200. |
+| Barrier history | Both injected delete-barrier failures were consumed, quarantine drained, and recovery retained the cumulative error count of 2. No fatal condition was raised. |
+| Fatal refusal | Passed in 25.64 seconds on the same image. Unproven unlink raised one error, completed fatal invalidation and disabled FMan receive ports 6 and 7. Creating a hardware flowtable returned `Operation not supported`; bindings, entries, `rearm_ready` and `rearms` remained zero. |
+| Fatal cleanup | WAN delivery ceased while the finite sender continued attempting traffic. After explicit CDX removal, all 64 ordinary software echoes passed. Neither the worker nor flowtable recreation cleared the fatal latch. |
+| Sanitizers | Neither successful DUT check reported a KASAN, UBSan or lockdep splat. |
+
+Transition measurements remain separate from stable forwarding acceptance. The
+MAC transition received 980 of 997 datagrams during the deliberate address
+mismatch. The successful fatal observation sent 1,158 datagrams, received 687
+and recorded 20 send timeouts across the intentional stop. The finite sender
+records backpressure and keeps attempting sends; every received payload is
+validated. These are not lossless-transition or throughput claims.
+
+The first recovery attempt exposed an unsuitable RX-counter assertion, not a
+delivery failure. The SDK counter excludes some software flowtable traffic when
+GRO is disabled; the recovered-forwarding proof now uses software TX counters.
+Earlier fatal attempts are excluded: malformed nft syntax, a corrupted UART
+script, LAN unavailability before the first flow, an already removed FCI module,
+and unhandled send backpressure prevented full acceptance. The harness now
+requires the specific offload-refusal error, verifies chunked UART scripts by
+SHA-256 before execution, tolerates an absent inactive FCI dependency, and records
+send timeouts only in the intentional-stop traffic helper. Strict exchange
+checks retain their zero-loss requirement.
+
+Artifacts are in `/tmp/ask-flowtable-rearm/`, with the build log at
+`/tmp/ask-flowtable-rearm-build.log`. `focused.xml` contains the successful
+recovery case and the excluded earlier terminal case; `terminal.xml` contains
+the successful replacement terminal run. Separate manifests identify both
+boots. Excluded attempts and raw UART logs are retained in subdirectories.
+The DUT is restored to a clean boot of this image in experimental ownership;
+no return to CMM is needed between healthy recovery cycles.

@@ -50,7 +50,7 @@ MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocatio
 struct cdx_ft_binding {
 	struct list_head list;
 	struct net_device *dev;
-	struct nf_flowtable *table; /* identity only; never dereferenced */
+	struct nf_flowtable *table; /* retained as identity; borrowed in bind only */
 };
 
 struct cdx_ft_entry {
@@ -67,6 +67,7 @@ static LIST_HEAD(ft_entries);
 static LIST_HEAD(ft_block_list);
 static unsigned int ft_bound, ft_count;
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
+static u64 ft_rearms;
 static bool ft_ready, ft_stopping, ft_fatal;
 static atomic_t ft_invalid = ATOMIC_INIT(0);
 static bool ft_invalid_done;
@@ -270,7 +271,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	rc = ft_parse(binding, cls, &rule);
 	if (!rc)
 		ft_validated++;
-	if (rc || ft_observe || atomic_read(&ft_invalid) || ft_stopping) {
+	if (rc || ft_observe || atomic_read(&ft_invalid) || ft_stopping || ft_fatal) {
 		if (entry)
 			ft_remove(entry);
 		return rc ? rc : -EOPNOTSUPP;
@@ -404,24 +405,49 @@ static void ft_release(void *priv)
 	kfree(binding);
 }
 
+/* All previous callbacks must have lost their bindings, and the worker must
+ * have finished both hardware retirement and Linux flow cleanup. Completion
+ * is published as its last action under ctrl.mutex, so an old worker cannot
+ * change a newly admitted table. Never reset the fatal latch or error history.
+ */
+static bool ft_can_rearm(void)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	return ft_ready && !ft_stopping && !ft_fatal &&
+		atomic_read(&ft_invalid) && ft_invalid_done &&
+		!ft_bound && !ft_count && !cdx_ft_hw_pending() &&
+		!cdx_ehash_quarantine_pending();
+}
+
 static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 		   enum tc_setup_type type, void *data, void *table,
 		   void (*cleanup)(struct flow_block_cb *))
 {
 	struct flow_block_offload *bo = data;
+	struct nf_flowtable *flowtable = table;
 	struct cdx_ft_binding *binding, *other;
 	struct flow_block_cb *cb;
+	bool rearm;
 	int rc = 0;
 
-	if (type != TC_SETUP_FT || sch || !bo || !bo->block || !bo->net || !dev ||
+	if (type != TC_SETUP_FT || sch || !bo || !bo->block || !bo->net || !dev || !table ||
 	    !net_eq(bo->net, &init_net) ||
 	    bo->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
 		return -EOPNOTSUPP;
 	bo->driver_block_list = &ft_block_list;
 	mutex_lock(&cdx_info->ctrl.mutex);
 	if (bo->command == FLOW_BLOCK_BIND) {
-		if (!ft_ready || ft_stopping || !ft_physical(dev) || ft_bound >= 2 ||
-		    atomic_read(&ft_invalid)) {
+		rearm = atomic_read(&ft_invalid);
+		if (!ft_ready || ft_stopping || ft_fatal || !ft_physical(dev) ||
+		    ft_bound >= 2 || (rearm && !ft_can_rearm())) {
+			rc = -EOPNOTSUPP;
+			goto out;
+		}
+		/* TC_SETUP_FT borrows this live table from Netfilter. A table
+		 * whose hooks were detached can still contain cached flows and
+		 * queued callbacks. Only an empty table may start recovery; its
+		 * pointer value alone cannot distinguish reuse from recreation. */
+		if (rearm && atomic_read(&flowtable->rhashtable.nelems)) {
 			rc = -EOPNOTSUPP;
 			goto out;
 		}
@@ -443,6 +469,16 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 			kfree(binding);
 			rc = PTR_ERR(cb);
 			goto out;
+		}
+		/* Commit recovery only after allocating a binding successfully.
+		 * While ft_bound is zero, a notifier cannot invalidate new entries:
+		 * none exist yet. A normal bind must not clear an invalidation
+		 * raised during allocation. Rules validate fresh Linux context. */
+		if (rearm) {
+			ft_invalid_done = false;
+			atomic_set(&ft_invalid, 0);
+			ft_rearms++;
+			pr_info("cdx flowtable: admission rearmed for a new binding\n");
 		}
 		dev_hold(dev);
 		list_add_tail(&binding->list, &ft_bindings);
@@ -514,9 +550,11 @@ static void ft_invalidate_work(struct work_struct *work)
 		dev_put(devices[i]);
 	}
 	mutex_lock(&cdx_info->ctrl.mutex);
+	pr_info("cdx flowtable: invalidated; hardware admission disabled\n");
+	/* No state changes or deferred work after publishing completion. A
+	 * later first bind may now recover if every old binding has gone. */
 	ft_invalid_done = true;
 	mutex_unlock(&cdx_info->ctrl.mutex);
-	pr_info("cdx flowtable: invalidated; hardware admission disabled until reboot\n");
 }
 
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
@@ -569,11 +607,13 @@ static int ft_show(struct seq_file *seq, void *unused)
 	mutex_lock(&cdx_info->ctrl.mutex);
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
-		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n",
+		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
+		   "rearm_ready %u\nrearms %llu\n",
 		   offload_owner, ft_observe, ft_bound, ft_count, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, ft_fatal,
-		   cdx_ft_hw_pending() + cdx_ehash_quarantine_pending());
+		   cdx_ft_hw_pending() + cdx_ehash_quarantine_pending(),
+		   ft_can_rearm(), ft_rearms);
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_hw_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u mtu=%u packets=%llu bytes=%llu lastused=%u\n",

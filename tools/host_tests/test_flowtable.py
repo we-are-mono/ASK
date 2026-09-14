@@ -29,7 +29,8 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
     )
     names = ["ft_fault", "ft_find", "ft_remove", "ft_parse", "ft_same_key",
-             "ft_replace", "ft_stats", "ft_invalidate_work"]
+             "ft_replace", "ft_stats", "ft_release", "ft_can_rearm", "ft_bind",
+             "ft_invalidate_work"]
     (tmp_path / "flowtable_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"
