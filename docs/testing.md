@@ -227,6 +227,24 @@ across the `sudo` boundary automatically (use space-free values).
 
 ## Running the suite
 
+### Interpreting packet counters
+
+ASK adds FMAN interface statistics to `dev_get_stats()`. Consequently,
+`ip -s link`, `ifconfig`, `/proc/net/dev`, and sysfs netdev statistics include
+both software and hardware traffic. Use those totals for volume and header
+length accounting, not to decide which path forwarded a packet.
+
+The SDK DPAA driver's `ethtool -S <physical-ingress-port>` counter
+`rx packets [TOTAL]` contains software RX only. The harness reads this
+counter explicitly and fails if it is absent. Tunnel tests require successful
+delivery alongside a small software RX delta; decap tests also require tunnel
+RX totals to advance, covering hardware statistics encoding. Edge-case
+goldens pin software RX visibility: a low count alone does not distinguish
+forwarding from an early drop. Queue occupancy, CPU idle time, conntrack
+presence and encapsulation overhead alone do not prove offload.
+
+### Suite invocation
+
 Prerequisites: the DUT is on the test image with its agent responding, the
 WAN agent is deployed, the WAN iperf3 server is up, and no manual session is
 holding either serial console.

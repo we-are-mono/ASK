@@ -16,6 +16,30 @@ items below. Every reopening is static-conclusive — none needs on-DUT
 verification. Bookkeeping corrections from that audit (wrong commit hashes,
 stale line refs) are folded into the archive one-liners.
 
+## A135–A136 targeted validation — 2026-09-14
+
+The A135–A136 fixes passed 43 host tests (including ASan/UBSan) and 13
+DUT tests on a newly built, staged and TFTP-booted KASAN image. Zero failures
+or skips in the final runs. The tunnel HM harness also passed under ARM64
+QEMU with interface statistics enabled and disabled; the SDK header patch
+sequence applies cleanly and reproduces the compiled header.
+
+The old image delivered 300 6o4 echoes while tunnel RX increased by only 1,
+failing the new accounting regression. With the fix, 300 echoes produced
+300 tunnel RX packets and 12 software ingress packets. The 4o6 window
+counted 300 tunnel RX packets and 13 software ingress packets. TX reached
+9.13 Gbit/s with 39 software RX packets out of 6,489,126 ingress packets
+and 20.00 bytes/packet encapsulation overhead. All ten edge goldens remained
+unchanged when read through software-only counters.
+
+Loaded kernel/CDX build IDs and userspace hashes matched the build. No
+KASAN/UBSAN/BUG/WARN/lockdep findings; the DUT remains on the tested image.
+This was targeted validation, not a rerun of the full suite below. The build
+reported six existing forced-task/build-path notices and no compiler warnings.
+Artifacts: `/tmp/ask-a135-a136/` on `vision` (report, XML, build/boot logs,
+source manifest and image identity). Image SHA-256:
+`8dc5959edbf7747a42e0cb3a584f6da2d36d3455e5b63bc06f9df1d9e82addd0`.
+
 ## Latest full validation — 2026-09-13
 
 Release `mono-1.0.7` contains the production source tested at commit
@@ -127,33 +151,6 @@ result independently of those temporary files.
 ---
 
 ## Open
-
-- [ ] **A135. Tunnel-decap HM params byteswapped into sub-word bitfields.**
-  `create_tunnel_remove_hm` writes `param->stats_ptr = cpu_to_be32(word)` and,
-  under `DSCP_COPY`, `param->flags = cpu_to_be32(word)` (`cdx/cdx_ehash.c:2368`)
-  into `struct en_ehash_remove_first_ip_hdr { uint32_t flags:8; uint32_t
-  stats_ptr:24; }` (`fm_ehash.h:470`). A 32-bit byteswapped value truncated into
-  a 24-bit bitfield lands at the wrong offset, so the ucode reads a garbage
-  MURAM pointer: the tunnel RX interface counter never increments (observed on
-  the rig — `sit_a9` RX flat at 104 packets while 1.84M frames were decapped),
-  and DSCP copy outer→inner is silently never enabled. The encap path in the
-  same file does it correctly (`ptr->word_1 = cpu_to_be32(word)`, line 2323).
-  The display helper is equally wrong: `fm_ehash.h:979` reads
-  `(param->flags >> 24) & 1` on an 8-bit field, always 0. Present verbatim in
-  the NXP reference (`cdx-5.03.1/cdx_ehash.c:2442`), so it has never worked
-  anywhere. Fix: build and store the whole word, as the encap path does.
-
-- [ ] **A136. Netdev counters are not an offload oracle.** ASK patches
-  `dev_get_stats()` to fold the FMAN ehash per-interface stats into the netdev
-  counters (`patches/kernel/010-ask-fman-dpaa-ehash.patch:18556` →
-  `virt_iface_stats_callback`, `cdx/devman.c:2966`, registered for
-  ETHERNET|VLAN|TUNNEL|PPPOE). Anything reading `ifconfig`, `ip -s link` or
-  `/proc/net/dev` therefore sees software *plus* hardware summed, and cannot
-  distinguish an offloaded flow from a kernel-forwarded one. This is what
-  produced A9's false diagnosis. Sound oracles: CPU idle under load (`mpstat`),
-  and the per-packet byte delta between ingress and egress ports (+20 B/pkt for
-  6o4 encap). Sweep the remaining tests and tools for any offload claim still
-  keyed on a netdev counter.
 
 - [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
   local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
@@ -1042,3 +1039,9 @@ file's git history.
 
 - [x] **A134.** Detaching an initialized port without PCD made rollback and unload fail —
   fixed (_3d412fe_).
+
+- [x] **A135.** Tunnel-decap stats pointers were shifted and the DSCP display was false —
+  fixed (this commit): serialize/decode the whole BE word; DSCP enable encoding was already correct on ARM64.
+
+- [x] **A136.** Tests mistook combined netdev statistics for software counters —
+  fixed (this commit): use SDK ethtool software RX plus delivery; retain totals for accounting and preserve capture names.

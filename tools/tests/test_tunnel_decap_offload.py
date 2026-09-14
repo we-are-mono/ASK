@@ -5,25 +5,14 @@ NEWLINK, real conntrack forms from real traffic, and cmm programs the
 FMAN entries two-phase (originator at CONFIRMED, both directions once
 the flow is ASSURED — allow a few seconds of programming latency).
 
-Oracle: the DUT's kernel tunnel-netdev RX counter. Decapped-in-hardware
-frames never touch the kernel tunnel, so once the flow is programmed
-the counter goes flat while echoes keep flowing end-to-end. The first
-few packets of any flow legitimately take the kernel path.
+Oracle: end-to-end delivery with few packets entering the physical WAN
+port's software RX path (SDK DPAA ethtool counters). Tunnel-netdev RX totals
+must also grow with the delivered traffic, checking the REMOVE_FIRST_IP_HDR
+stats pointer (A135). Netdev totals include hardware activity (A136), so
+only the separate driver counter is used to detect software forwarding.
 
-The old synthetic-FCI variant of this test installed an outer-keyed
-proto-41 conntrack, which cdx rightly rejects — the design keys decap
-on the *inner* tuple (PCD dists parse to the innermost L3 header).
-
-CAUTION — this oracle is only sound while ISSUES.md A135 is open. ASK
-folds the FMAN per-interface stats into netdev counters (A136), which
-would normally make a tunnel-netdev counter useless as an offload
-signal; the tunnel *RX* ifstat happens to be dead because cdx writes
-its MURAM pointer into the wrong bitfield (A135), leaving this counter
-software-only by accident. Fixing A135 will start feeding hardware
-decaps into `rx_packets` here and this test will begin failing. When
-that happens, re-oracle it the way the TX test is done — CPU idle
-under load plus the per-packet byte delta across the DUT's ports —
-rather than loosening the threshold.
+The old synthetic-FCI variant installed an outer-keyed proto-41 conntrack,
+which cdx rightly rejects: decap is keyed on the inner tuple.
 
 The encap direction is covered by test_tunnel_tx_offload.py.
 """
@@ -40,7 +29,9 @@ import threading
 
 import pytest_asyncio
 
-from _topology import lan_run, ipv6_topology  # noqa: F401  (fixture re-export)
+from _topology import (  # noqa: F401 (fixture re-export)
+    lan_run, ipv6_topology, kernel_rx_packets, TARGET_WAN_IF,
+)
 
 DUT_WAN_IPV4 = os.environ.get("ASK_TARGET_IP", "10.0.0.62")
 ORCH_IPV4    = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
@@ -67,8 +58,10 @@ def _sh(cmd: str) -> subprocess.CompletedProcess:
 
 
 async def _tun_rx(target_agent, session, ifname: str) -> int:
+    """Tunnel RX total, including hardware decaps; an accounting check only."""
     r = await target_agent.exec_cmd(
         session, ["ip", "-s", "-j", "link", "show", ifname])
+    assert r.get("rc") == 0, f"read tunnel stats for {ifname}: {r}"
     return json.loads(r["stdout"])[0]["stats64"]["rx"]["packets"]
 
 
@@ -178,18 +171,22 @@ async def test_tunnel_6o4_decap_offloaded(
     await asyncio.sleep(PROGRAM_S)
 
     rx0 = await _tun_rx(target_agent, aiohttp_session, tun)
+    sw0 = await kernel_rx_packets(target_agent, aiohttp_session, TARGET_WAN_IF)
     got = await asyncio.to_thread(
         _udp_echo_burst, LAN_V6, ECHO_PORT_6O4, int(WINDOW_S / 0.02), 0.02)
+    sw1 = await kernel_rx_packets(target_agent, aiohttp_session, TARGET_WAN_IF)
     rx1 = await _tun_rx(target_agent, aiohttp_session, tun)
 
-    kernel_rx = rx1 - rx0
+    kernel_rx = sw1 - sw0
+    print(f"6o4: delivered {got}, tunnel RX +{rx1 - rx0}, software RX +{kernel_rx}")
     assert got >= 100, f"echo flow collapsed during measurement: {got}"
-    assert kernel_rx <= got * 0.1, (
-        f"6o4 decap not offloaded: kernel sit rx +{kernel_rx} for {got} "
-        f"delivered echoes (expected ~0 once cmm programs the flow). "
-        f"If ISSUES.md A135 was just fixed, this counter now includes "
-        f"hardware decaps and the test needs re-oracling — see the "
-        f"module docstring."
+    assert rx1 - rx0 >= got * 0.9, (
+        f"tunnel RX accounting lost hardware decaps: total +{rx1 - rx0} "
+        f"for {got} delivered echoes (A135)"
+    )
+    assert 0 <= kernel_rx <= got * 0.1, (
+        f"6o4 decap not offloaded: {TARGET_WAN_IF} software RX +{kernel_rx} "
+        f"for {got} delivered echoes (expected ~0 after CMM programs the flow)."
     )
 
 
@@ -287,7 +284,9 @@ async def test_tunnel_4o6_decap_offloaded(
 
         await asyncio.sleep(3 + PROGRAM_S)
         rx0 = await _tun_rx(target_agent, aiohttp_session, tun)
+        sw0 = await kernel_rx_packets(target_agent, aiohttp_session, TARGET_WAN_IF)
         await asyncio.sleep(WINDOW_S)
+        sw1 = await kernel_rx_packets(target_agent, aiohttp_session, TARGET_WAN_IF)
         rx1 = await _tun_rx(target_agent, aiohttp_session, tun)
         await asyncio.sleep(5)
 
@@ -311,18 +310,22 @@ async def test_tunnel_4o6_decap_offloaded(
             f"last read: {r.stdout!r}"
         )
         echoed = int(m.group(1))
-        kernel_rx = rx1 - rx0
+        kernel_rx = sw1 - sw0
         window_rate = echoed / total_s   # ~echoes per second
         expected_in_window = window_rate * WINDOW_S
+        print(f"4o6: delivered {echoed}, expected in window {expected_in_window:.0f}, "
+              f"tunnel RX +{rx1 - rx0}, software RX +{kernel_rx}")
 
         assert echoed >= 200, f"4o6 path broken: only {echoed} echoes total"
-        assert kernel_rx <= expected_in_window * 0.1, (
-            f"4o6 decap not offloaded: kernel {tun} rx +{kernel_rx} during a "
+        assert rx1 - rx0 >= expected_in_window * 0.8, (
+            f"tunnel RX accounting lost hardware decaps: total +{rx1 - rx0} "
+            f"for ~{expected_in_window:.0f} echoes during the window (A135)"
+        )
+        assert 0 <= kernel_rx <= expected_in_window * 0.1, (
+            f"4o6 decap not offloaded: {TARGET_WAN_IF} software RX +{kernel_rx} during a "
             f"{WINDOW_S:.0f}s window with ~{expected_in_window:.0f} frames "
             f"flowing (expected ~0). The ip6_tunnel.c underlying_iif stamp "
-            f"(kernel patch 030) may have regressed — or ISSUES.md A135 was "
-            f"fixed and this counter now includes hardware decaps, in which "
-            f"case re-oracle per the module docstring."
+            f"(kernel patch 030) may have regressed."
         )
     finally:
         stop.set()

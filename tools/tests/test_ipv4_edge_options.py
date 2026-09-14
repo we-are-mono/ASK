@@ -2,7 +2,7 @@
 
 Injects packets carrying record-route and source-route options via scapy
 on the LAN VM. Classifies whether the DUT handled them in hardware or
-punted them to the kernel (ingress netdev kernel RX counter) and pins
+punted them to the kernel (ingress driver's ethtool software RX counter) and pins
 the classification in a golden file (regen with ASK_REGEN_GOLDEN=1);
 subsequent runs assert equality.
 

@@ -5,10 +5,9 @@ Three concerns colocated here, in order of increasing scope:
   1. RX-path classification + golden-file tripwires. The edge-case
      tests don't know in advance whether HW silently drops, punts to
      the kernel slow path, or fast-paths the edge-case packet — so
-     they classify what *did* happen (via the ingress netdev's kernel
-     RX counter: FMAN-handled frames never tick it, punted frames tick
-     it 1:1), pin the classification in a golden on first run, and
-     assert equality on subsequent runs. A behaviour shift (PCD config
+     they classify what *did* happen via the physical ingress driver's
+     software RX counter from ethtool, pin the classification in a golden,
+     and assert equality on subsequent runs. A behaviour shift (PCD config
      change, ucode change) fails the test loudly.
 
   2. ICMP-egress observation. The ICMP edge-case tests assert "the
@@ -40,6 +39,8 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 import pytest_asyncio
+
+from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 
 
 # ---- VLAN ID conventions -------------------------------------------------
@@ -76,33 +77,27 @@ LAN_NIC       = os.environ.get("ASK_LAN_NIC",       "enp4s0")
 # "frame count" deltas. That counter is *instantaneous queue occupancy*,
 # not cumulative: queues drain between the before/after snapshots, every
 # delta was zero, and all recorded goldens were vacuous {} — the
-# tripwire could never fire. The DPAA ethtool stats are no alternative
-# tripwire source either: they are kernel-side per-CPU counters, i.e.
-# they tick only for frames that reached the kernel, and their names
-# ("rx packets [TOTAL]") don't survive the agent's stat-name parser.
+# tripwire could never fire. Netdev totals are also unsuitable: ASK adds
+# hardware interface counts to them in dev_get_stats() (ISSUES.md A136).
 #
-# The question the tripwire actually needs answered — did the DUT
-# handle this packet shape in hardware, or punt it to the kernel? — is
-# answered by the ingress netdev's kernel RX packet counter alone:
-# FMAN-handled frames (fast-pathed or dropped) never tick it, punted
-# frames tick it 1:1. classify_rx_path() reduces the delta to a stable
-# label the goldens can pin. Injection counts must be large enough to
-# dominate background chatter on the segment (ND, mDNS): use >= 20.
-
-async def kernel_rx_packets(target_agent, session, iface: str) -> int:
-    """Cumulative kernel-side RX packet count for `iface` on the DUT."""
-    r = await target_agent.exec_cmd(
-        session, ["ip", "-s", "-j", "link", "show", iface])
-    assert r["rc"] == 0, f"ip -s link show {iface}: {r}"
-    return json.loads(r["stdout"])[0]["stats64"]["rx"]["packets"]
+# kernel_rx_packets reads the SDK driver's private "rx packets [TOTAL]"
+# directly from ethtool -S. It excludes hardware interface counts and
+# fails if the driver does not expose that exact counter. A low delta
+# alone does not distinguish hardware forwarding from an early drop;
+# these edge goldens pin software-RX visibility, not successful delivery.
+# Injection counts must dominate background traffic (ND, mDNS): use >= 20.
 
 
 def classify_rx_path(kernel_rx_delta: int, injected: int) -> str:
-    """Classify where injected frames went: 'kernel' if ~all reached
-    the kernel (punt / slow path), 'hardware' if ~none did (FMAN drop
-    or fast-path). An in-between delta is asserted on rather than
-    returned — pinning a noise-dependent value in a golden would make
-    the tripwire flaky in both directions."""
+    """Return historical golden labels for software RX visibility.
+
+    'kernel' means ~all frames were counted by software RX; 'hardware'
+    means ~none were. The latter also includes early drops, so delivery
+    needs a separate check when testing forwarding. Reject intermediate
+    deltas rather than recording a noise-dependent golden.
+    """
+    assert injected > 0, "RX classification requires injected traffic"
+    assert kernel_rx_delta >= 0, "software RX counter reset during measurement"
     if kernel_rx_delta >= injected:
         return "kernel"
     if kernel_rx_delta <= injected // 4:

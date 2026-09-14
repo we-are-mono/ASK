@@ -123,7 +123,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/inc/fm_sp_common.h     |    2 
  .../net/ethernet/freescale/sdk_fman/etc/memcpy.c   |  301 ---
  .../sdk_fman/inc/Peripherals/fm_eh_types.h         |   52 
- .../freescale/sdk_fman/inc/Peripherals/fm_ehash.h  | 1467 ++++++++++++
+ .../freescale/sdk_fman/inc/Peripherals/fm_ehash.h  | 1468 ++++++++++++
  .../freescale/sdk_fman/inc/Peripherals/fm_ext.h    |   15 
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h          |    1 
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h        |    1 
@@ -163,7 +163,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                     |    5 
  net/core/rtnetlink.c                               |   19 
  net/core/skbuff.c                                  |   38 
- 81 files changed, 9129 insertions(+), 5061 deletions(-)
+ 81 files changed, 9130 insertions(+), 5061 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -11842,10 +11842,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 0000000..2816fe8
+index 0000000..28e20cb
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1467 @@
+@@ -0,0 +1,1468 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -12312,12 +12312,12 @@ index 0000000..2816fe8
 +        uint8_t l3hdr[0];               //l3 hdr padded to next 4 bytes boundary
 +}__attribute__ ((packed));
 +
-+#define COPY_DSCP_OUTER_INNER (1<<24)
++#define COPY_DSCP_OUTER_INNER (1U << 24)
 +
 +//remove tunnel header
 +struct en_ehash_remove_first_ip_hdr {
-+	uint32_t flags:8; /* currently only one bit is used for dscp copy */
-+	uint32_t stats_ptr:24;
++	/* Big-endian word: flags [31:24], MURAM stats offset [23:0]. */
++	uint32_t word;
 +}__attribute__ ((packed));
 +
 +
@@ -12823,8 +12823,9 @@ index 0000000..2816fe8
 +
 +	param = (struct en_ehash_remove_first_ip_hdr *)ptr;
 +	printk("opcode : REMOVE_FIRST_IP_HDR\n");
-+	printk("stats ptr %x\n", cpu_to_be32(param->stats_ptr));
-+	printk("dscp prpagation from outer to inner%d\n",cpu_to_be32((param->flags >> 24) & 1));
++	printk("stats ptr %x\n", be32_to_cpu(param->word) & 0xffffff);
++	printk("dscp propagation from outer to inner %u\n",
++			!!(be32_to_cpu(param->word) & COPY_DSCP_OUTER_INNER));
 +	return (param + 1);
 +}
 +

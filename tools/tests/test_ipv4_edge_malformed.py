@@ -7,8 +7,8 @@ version=15 (also illegal) from LAN. Two oracles run together:
      the high-value assertion. Malformed input parsing is exactly
      where memory bugs hide.
   2. RX-path golden tripwire records what *did* happen (hardware
-     handled vs punted to the kernel, read off the ingress netdev's
-     kernel RX counter). Either outcome is pinned, regression
+     handled vs punted to the kernel, read off the ingress driver's
+     ethtool software RX counter). Either outcome is pinned, regression
      catches a future change.
 
 This test is in the KASAN-eligible nightly subset: malformed-packet

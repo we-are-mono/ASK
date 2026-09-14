@@ -97,7 +97,7 @@ index bd16459d5d81..8cfb906052be 100644
 +        uint8_t l3hdr[];               //l3 hdr padded to next 4 bytes boundary
  }__attribute__ ((packed));
  
- #define COPY_DSCP_OUTER_INNER (1<<24)
+ #define COPY_DSCP_OUTER_INNER (1U << 24)
 -- 
 2.47.3
 

@@ -1,9 +1,9 @@
 """Snapshot /proc/ASK, /proc/fqid_stats, and ethtool counters.
 
-Used by the orchestrator's offload-engagement oracle: snapshot pre-traffic,
-run traffic, snapshot post-traffic, assert the PCD counter bumped. Without
-this, a forwarded packet does not prove FMAN offload — the kernel would
-have softirq-forwarded it too.
+Diagnostic snapshots accompany each test. Counter meanings depend on their
+source: FQ frame counts are queue occupancy, SDK DPAA ethtool RX packets are
+software counts, and netdev totals include hardware counts. A generic
+positive delta does not prove offload.
 """
 
 from __future__ import annotations
@@ -45,14 +45,14 @@ def _ethtool_stats(iface: str) -> dict[str, int]:
         return {}
     stats: dict[str, int] = {}
     for line in r.stdout.splitlines():
-        m = re.match(r"\s*([A-Za-z0-9_\-]+):\s*(-?\d+)\s*$", line)
+        m = re.fullmatch(r"\s*([^:]+?):\s*(-?\d+)\s*", line)
         if m:
-            stats[m.group(1)] = int(m.group(2))
+            stats[m.group(1).strip()] = int(m.group(2))
     return stats
 
 
 def snapshot(interfaces: list[str] | None = None) -> dict:
-    """Return a dict covering every counter surface the oracle cares about."""
+    """Return diagnostic counters without inferring where packets ran."""
     return {
         "fqid_stats": _walk_procdir(FQID_STATS_ROOT),
         "ask_proc":   _walk_procdir(ASK_PROC_ROOT),

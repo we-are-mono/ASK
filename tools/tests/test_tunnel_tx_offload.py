@@ -22,14 +22,12 @@ Oracles:
        A global conntrack-count delta is deliberately not used: entries
        left by earlier tests age out mid-run and made it flaky late in
        the suite.
-  (iii) the DUT's CPUs stay below MAX_CPU_BUSY_FRAC while carrying the
-       run. Software sit-encap of this load costs whole cores; FMAN
-       doing it leaves the A72s near idle. This is the primary offload
-       proof, and the only one immune to counter contamination.
-  (iv) WAN egress frames average exactly IPV4_HDR_LEN bytes more than
-       LAN ingress frames — the outer header really was prepended, and
-       (iii) was idle because FMAN forwarded, not because no traffic
-       arrived.
+  (iii) the physical LAN port's software RX count (SDK DPAA ethtool)
+        stays below 10% of received frames. This distinguishes hardware
+        forwarding from the Linux tunnel path even when CPUs are idle.
+  (iv) WAN egress frames average IPV4_HDR_LEN bytes more than LAN
+       ingress frames, confirming the expected encapsulation. CPU busy
+       time is reported as a diagnostic, not used as an offload proof.
 
 Do NOT re-introduce a tunnel-netdev counter oracle here. ASK folds the
 FMAN per-interface stats into the netdev counters (ISSUES.md A136), so
@@ -50,7 +48,7 @@ import pytest
 import pytest_asyncio
 
 from _topology import (  # noqa: F401  (fixture re-export)
-    lan_run, ipv6_topology, TARGET_LAN_IF, TARGET_WAN_IF,
+    lan_run, ipv6_topology, TARGET_LAN_IF, TARGET_WAN_IF, kernel_rx_packets,
 )
 
 
@@ -72,16 +70,12 @@ TUNNEL_MTU   = 1480       # 1500 (eth) - 20 (IPv4 outer)
 
 # Offloaded 6o4 encap runs the LAN link out at ~9 Gbit/s. The floor stays
 # well under that so link-speed variation between benches doesn't flake it;
-# the CPU and byte-delta oracles are what prove offload.
+# the separate software RX counter determines whether Linux forwarded it.
 OFFLOAD_MIN_GBPS = float(os.environ.get("ASK_TUNNEL_TX_MIN_GBPS", "1.0"))
 IPERF_DURATION_S = int(os.environ.get("ASK_TUNNEL_TX_DURATION", "8"))
 
-# Offloaded, the four A72s idle through the run (measured 3.6% busy at
-# 9.14 Gbit/s). Software encap of the same load costs whole cores, so the
-# two regimes are an order of magnitude apart — 25% leaves room for the
-# iperf control connection, the ACK path and test-harness noise without
-# coming close to the software regime.
-MAX_CPU_BUSY_FRAC = float(os.environ.get("ASK_TUNNEL_TX_MAX_CPU", "0.25"))
+# At most 10% of received frames may enter software, including flow setup.
+MAX_SOFTWARE_RX_FRAC = 0.1
 
 # A 6o4 outer header is 20 bytes. Tolerance absorbs the few unencapsulated
 # frames (ARP/ND, the iperf control socket) mixed into the port counters.
@@ -113,9 +107,8 @@ async def _proc_read(target_agent, session, path: str) -> str:
 async def _port_counters(target_agent, session, ifname: str) -> dict:
     """RX/TX bytes+packets for one DUT port, from /proc/net/dev.
 
-    Deliberately not `ip -s link`: both read the same contaminated
-    stats (ISSUES.md A136), but these counters are used for a *ratio*
-    between two ports, where the hardware contribution cancels out.
+    These totals include software and hardware forwarding. Use them for
+    traffic volume and packet lengths; ethtool supplies software RX alone.
     """
     for line in (await _proc_read(
             target_agent, session, "/proc/net/dev")).splitlines():
@@ -137,7 +130,8 @@ async def _cpu_jiffies(target_agent, session) -> tuple[int, int]:
     vals = [int(x) for x in f[1:11]]
     # user nice system idle iowait irq softirq steal guest guest_nice
     idle = vals[3] + vals[4]
-    return idle, sum(vals)
+    # guest and guest_nice are already included in user and nice.
+    return idle, sum(vals[:8])
 
 
 def _busy_fraction(before: tuple[int, int], after: tuple[int, int]) -> float:
@@ -265,11 +259,9 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
 ):
     """LAN→WAN IPv6 iperf3 over a sit tunnel — proves FMAN does the encap.
 
-    The encap direction IS hardware-offloaded. The two oracles that can
-    actually show it are CPU idle under load and the per-packet byte delta
-    across the DUT; both are below. Tunnel-netdev counters cannot be used —
-    ASK folds the FMAN per-interface stats into them (ISSUES.md A136), so a
-    hardware encap is indistinguishable from a kernel one there.
+    End-to-end delivery with few software ingress packets proves offload.
+    Port byte/packet totals verify encapsulation and CPU time is diagnostic.
+    Tunnel-netdev totals alone cannot distinguish the two paths (A136).
     """
     # Baselines for the offload oracles: per-port byte/packet counters and
     # the CPU jiffie vector. Both are read again after the run.
@@ -278,6 +270,7 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
     wan_before = await _port_counters(
         target_agent, aiohttp_session, TARGET_WAN_IF)
     cpu_before = await _cpu_jiffies(target_agent, aiohttp_session)
+    sw_before = await kernel_rx_packets(target_agent, aiohttp_session, TARGET_LAN_IF)
 
     # iperf3 client on LAN VM, target = orchestrator's tunnel-side v6.
     # TCP so SYN+SYNACK marks the flow assured-equivalent enough for
@@ -288,6 +281,11 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
         f"iperf3 -c {ORCH_TUN_V6} -p {IPERF_PORT} -t {IPERF_DURATION_S} 2>&1",
         timeout=IPERF_DURATION_S + 15,
     )
+    # End all measurement windows before querying conntrack or diagnostics.
+    sw_after = await kernel_rx_packets(target_agent, aiohttp_session, TARGET_LAN_IF)
+    cpu_after = await _cpu_jiffies(target_agent, aiohttp_session)
+    wan_after = await _port_counters(target_agent, aiohttp_session, TARGET_WAN_IF)
+    lan_after = await _port_counters(target_agent, aiohttp_session, TARGET_LAN_IF)
     log = r.stdout
     gbps = _iperf_receiver_gbps(log)
     if gbps is None:
@@ -332,11 +330,10 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
             f"{lan_state.stdout}"
         )
 
-    # Oracle (i): throughput must exceed the SW-fallback ceiling.
+    # Oracle (i): enough delivered traffic for the path measurement.
     assert gbps >= OFFLOAD_MIN_GBPS, (
         f"tunneled iperf3 throughput {gbps:.2f} Gbps below "
-        f"{OFFLOAD_MIN_GBPS} Gbps — kernel sit-encap path unhealthy "
-        f"(normally ~9 Gbit/s). iperf3 tail:\n"
+        f"{OFFLOAD_MIN_GBPS} Gbps — tunnel path throughput too low. iperf3 tail:\n"
         f"{log[-600:]}"
     )
 
@@ -370,28 +367,9 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
         f"forward path (LAN-side bottleneck).\nconntrack -L:\n{ct_dump[:1500]}"
     )
 
-    # Oracle (iii): the DUT's CPUs stayed idle while carrying the run.
-    # Software sit-encap of this load would consume whole cores; FMAN
-    # doing it leaves the A72s near idle. This is the one offload signal
-    # no counter contamination can reach (ISSUES.md A136).
-    cpu_after = await _cpu_jiffies(target_agent, aiohttp_session)
     busy_frac = _busy_fraction(cpu_before, cpu_after)
-    assert busy_frac <= MAX_CPU_BUSY_FRAC, (
-        f"DUT CPUs {busy_frac * 100:.1f}% busy during a {gbps:.2f} Gbps "
-        f"tunnelled run (limit {MAX_CPU_BUSY_FRAC * 100:.0f}%) — the encap "
-        f"is running in software, not in FMAN. Check that the tunnel and "
-        f"the v6 flow are programmed: `cmm -c query tunnels` should show "
-        f"enabled=3 and `cmm -c query v6connections` the inner flow."
-    )
 
-    # Oracle (iv): egress frames are exactly one IPv4 header longer than
-    # ingress frames. Confirms the +20B outer header was actually prepended
-    # on the offloaded path, and that oracle (iii) was idle *because* FMAN
-    # forwarded rather than because traffic never arrived.
-    wan_after = await _port_counters(
-        target_agent, aiohttp_session, TARGET_WAN_IF)
-    lan_after = await _port_counters(
-        target_agent, aiohttp_session, TARGET_LAN_IF)
+    # The software counter excludes hardware RX; the totals below include it.
     lan_pkts  = lan_after["rx_packets"] - lan_before["rx_packets"]
     wan_pkts  = wan_after["tx_packets"] - wan_before["tx_packets"]
     lan_bytes = lan_after["rx_bytes"] - lan_before["rx_bytes"]
@@ -400,7 +378,17 @@ async def test_tunnel_tx_ipv6_in_ipv4_offload(
         f"too little traffic to measure: {TARGET_LAN_IF} rx +{lan_pkts} pkt, "
         f"{TARGET_WAN_IF} tx +{wan_pkts} pkt during a {gbps:.2f} Gbps run"
     )
+    software_rx = sw_after - sw_before
+    assert 0 <= software_rx <= lan_pkts * MAX_SOFTWARE_RX_FRAC, (
+        f"{TARGET_LAN_IF} software RX +{software_rx} of {lan_pkts} received "
+        f"frames: too much tunnel traffic entered Linux (limit "
+        f"{MAX_SOFTWARE_RX_FRAC:.0%}). CPU busy {busy_frac:.1%}, "
+        f"throughput {gbps:.2f} Gbps."
+    )
+    # Packet lengths establish encapsulation, independently of which path ran.
     encap_overhead = (wan_bytes / wan_pkts) - (lan_bytes / lan_pkts)
+    print(f"tunnel TX: {gbps:.2f} Gbps, software RX {software_rx}/{lan_pkts}, "
+          f"CPU busy {busy_frac:.1%}, overhead {encap_overhead:.2f} B/packet")
     assert abs(encap_overhead - IPV4_HDR_LEN) <= ENCAP_OVERHEAD_TOL, (
         f"egress frames are {encap_overhead:.2f} B/pkt larger than ingress, "
         f"expected {IPV4_HDR_LEN} ± {ENCAP_OVERHEAD_TOL} for a 6o4 outer "
