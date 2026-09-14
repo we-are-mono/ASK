@@ -128,21 +128,32 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A9. Tunnel TX encap never offloads — ucode 210.10.1 `INSERT_L3_HDR`
-  punts unconditionally.**
-  The completed A9 work (RX decap offload for 6o4+4o6, the `ip6_tunnel.c`
-  underlying_iif RX stamp in patch 030, the second 10G port in
-  `cdx_cfg.xml`, patch 099 shipped, the honest TX tripwire test, the
-  occupancy-golden re-oracle) is archived. The residual is external: the
-  encap ehash entry is byte-perfect in DDR and matches in hardware (per-entry
-  stats count the packets), but the HM chain aborts at `INSERT_L3_HDR(0x44)`
-  and punts every frame to the exception path. Every other opcode in the
-  chain is proven working in live decap/forward chains; `create_tunnel_insert_hm`
-  is line-identical to the NXP reference and the ucode is md5-identical to
-  NXP's ASK release, so the reference shipped the same untested path.
-  **Disposition: NXP-support ticket** (memory `a9-insert-l3-hdr-ucode-blocked`).
-  Practical impact is CPU headroom only — kernel sit encap sustains 9.15 Gbit/s
-  and decap is hardware-offloaded. Keep open as the tracking anchor.
+- [ ] **A135. Tunnel-decap HM params byteswapped into sub-word bitfields.**
+  `create_tunnel_remove_hm` writes `param->stats_ptr = cpu_to_be32(word)` and,
+  under `DSCP_COPY`, `param->flags = cpu_to_be32(word)` (`cdx/cdx_ehash.c:2368`)
+  into `struct en_ehash_remove_first_ip_hdr { uint32_t flags:8; uint32_t
+  stats_ptr:24; }` (`fm_ehash.h:470`). A 32-bit byteswapped value truncated into
+  a 24-bit bitfield lands at the wrong offset, so the ucode reads a garbage
+  MURAM pointer: the tunnel RX interface counter never increments (observed on
+  the rig — `sit_a9` RX flat at 104 packets while 1.84M frames were decapped),
+  and DSCP copy outer→inner is silently never enabled. The encap path in the
+  same file does it correctly (`ptr->word_1 = cpu_to_be32(word)`, line 2323).
+  The display helper is equally wrong: `fm_ehash.h:979` reads
+  `(param->flags >> 24) & 1` on an 8-bit field, always 0. Present verbatim in
+  the NXP reference (`cdx-5.03.1/cdx_ehash.c:2442`), so it has never worked
+  anywhere. Fix: build and store the whole word, as the encap path does.
+
+- [ ] **A136. Netdev counters are not an offload oracle.** ASK patches
+  `dev_get_stats()` to fold the FMAN ehash per-interface stats into the netdev
+  counters (`patches/kernel/010-ask-fman-dpaa-ehash.patch:18556` →
+  `virt_iface_stats_callback`, `cdx/devman.c:2966`, registered for
+  ETHERNET|VLAN|TUNNEL|PPPOE). Anything reading `ifconfig`, `ip -s link` or
+  `/proc/net/dev` therefore sees software *plus* hardware summed, and cannot
+  distinguish an offloaded flow from a kernel-forwarded one. This is what
+  produced A9's false diagnosis. Sound oracles: CPU idle under load (`mpstat`),
+  and the per-packet byte delta between ingress and egress ports (+20 B/pkt for
+  6o4 encap). Sweep the remaining tests and tools for any offload claim still
+  keyed on a netdev counter.
 
 - [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
   local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
@@ -481,6 +492,10 @@ file's git history.
 
 - [-] **X3.** "dpaa_eth_refill_bpools suspected leaks" — wontfix: the skb
   backpointer lives in the BMan hardware-owned frag pool; error paths free clean.
+
+- [-] **A9 (not a bug).** "Tunnel TX encap never offloads — ucode `INSERT_L3_HDR`
+  punts" — the oracle was wrong, not the ucode; rig re-test measured encap
+  offloaded at 9.14 Gbit/s with the A72s 96.4% idle. Residue filed as A135-A136.
 
 - [-] **A12.** "PPPoE RX-decap missing classifier install" — wontfix: the PPPoE
   strip is an HM chained on the inner CT entry, not a table.
