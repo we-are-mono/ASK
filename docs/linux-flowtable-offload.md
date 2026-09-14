@@ -1,6 +1,7 @@
 # Linux flowtable offload: design and first proof of concept
 
-Status: IPv4 UDP and TCP offload implemented; controlled lifecycle demonstrated.
+Status: IPv4 UDP and TCP offload implemented; ordinary ARP ageing, invalidation
+and recovery demonstrated on directly connected peers.
 The earlier intermittent UDP loss remains unresolved and deferred; its scope and
 evidence are recorded separately below.
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
@@ -311,7 +312,7 @@ counters, diagnostics, and test results needed to reproduce each acceptance run.
 After the first lifecycle is accepted, broaden dynamic route/neighbour/device
 behaviour and exception coverage. Exercise the same small feature on a second
 kernel version early to test whether the compatibility boundary is useful.
-After the TCP increment described below, candidate expansions are dynamic ARP,
+After the ordinary ARP increment described below, candidate expansions are
 gateway next hops, selective invalidation, IPv4 NAT, IPv6, additional interface types,
 bridging, QoS, tunnels, and IPsec, each with separate eligibility and verification
 criteria. This is a suggested sequence, not a fixed roadmap or a claim that one
@@ -370,10 +371,12 @@ ifindex, four Ethernet rewrite words, and a redirect. TCP additionally requires
 an assured, established Linux conntrack and the exact FIN/RST exclusion generated
 by Netfilter; the parser contract and teardown semantics are described below.
 The protocol participates in private hardware encoding and duplicate-key checks.
-NAT, nondefault conntrack zones,
-conntrack marks, unsupported devices, and other action lists are rejected. A
-permanent neighbour for the destination on the egress port must match the
-requested destination MAC. The current source MAC must equal the physical port's
+NAT, nondefault conntrack zones, conntrack marks, unsupported devices, and other
+action lists are rejected. An alive, resolved ARP neighbour for the destination
+on the egress port must match the requested destination MAC. Permanent entries
+remain supported; ordinary REACHABLE, STALE, DELAY and PROBE entries are also
+eligible. NOARP, unresolved, failed and detached entries are declined.
+The current source MAC must equal the physical port's
 permanent MAC. This first implementation therefore requires directly reachable
 hosts; gateway next-hop resolution is not generalized yet.
 
@@ -434,7 +437,9 @@ measurement facility; it is outside this PoC's contract.
 The control mutex serializes list changes and all firmware operations. Netfilter
 rule callbacks execute in workqueue context. Binding release runs after the flow
 block excludes its callbacks. Notifiers latch invalidation and queue work; they
-never acquire the control mutex. Invalidation deletes the experimental entries
+never acquire the control mutex. ARP callbacks inspect pinned, immutable
+dependencies under a separate spinlock, nested inside the neighbour lock.
+Invalidation deletes the experimental entries
 before flushing Linux flowtable work, releasing the control mutex before that
 flush. Module exit removes the proc entry and notifiers, cancels invalidation
 work, and unregisters indirect callbacks before global CDX teardown acquires its
@@ -447,10 +452,12 @@ declined.
 
 Relevant initial-netns IPv4 route and ARP-neighbour changes, or interface down,
 unregister, MTU, MAC, rename, or upper-device changes conservatively disable new
-hardware admission until the recovery boundary below. The notifier scope includes unrelated
-IPv4 routes/neighbours in that namespace: conservative invalidation can reduce
-availability but must not retain stale forwarding. Configure routes and permanent
-neighbours before binding the table. Invalidation is asynchronous; inspect
+hardware admission until the recovery boundary below. IPv4 route events remain
+namespace-wide. ARP invalidation now follows watched neighbours: a changed MAC,
+unusable state or detached object retires the whole table, while same-MAC NUD
+progress and unrelated ARP updates do not. Configure routes before binding;
+neighbours may resolve through ordinary ARP after binding. Invalidation is
+asynchronous; inspect
 `invalidation_done` before claiming retirement is complete.
 
 Healthy invalidation can recover by deleting and recreating the flowtable after
@@ -896,3 +903,135 @@ Artifacts are in `/tmp/ask-flowtable-tcp/`: `tcp.xml`, `final-fin-udp.xml`,
 `/tmp/ask-flowtable-tcp-build.log`. The DUT remains in experimental ownership
 with test tables, routes, neighbours, NAT exemptions and timeout changes cleaned
 up. Stop at this increment; dynamic ARP and gateway support remain future work.
+
+## Ordinary ARP increment (2026-09-14)
+
+The direct-route topology now supports ordinary ARP neighbours for both UDP and
+TCP. Routing, two physical ports, the two-direction limit and explicit
+flowtable recreation remain the boundaries. This does not add gateway next-hop
+resolution or per-flow invalidation.
+
+Each installed direction pins its actual Linux neighbour and publishes a watch
+before hardware insertion. Publication rechecks the address and state under the
+neighbour lock; a notification during insertion can therefore latch invalidation
+and force rollback. The watch contains immutable dependency data, protected by
+`ft_neigh_lock` against removal. Lock ordering is control mutex, neighbour lock,
+then watch lock. The notifier never acquires the control mutex or calls firmware.
+Removal withdraws the watch before releasing the reference and entry storage.
+`neighbour_refs` in `/proc/cdx_flowtable` exposes the reference count, including
+zero after failed installation, invalidation and table removal. Recovery also
+requires that count to be zero.
+
+An alive neighbour with an unchanged address can progress through REACHABLE,
+STALE, DELAY and PROBE without interrupting hardware forwarding. PERMANENT
+continues to work. An unusable state, changed MAC or detached neighbour object
+latches whole-table invalidation. Unrelated ARP notifications do not invalidate
+the table; route and device invalidation retain their conservative scope.
+
+Positive hardware counter deltas call `neigh_event_send(neigh, NULL)` through
+the existing Netfilter statistics work. This records use and lets Linux's own
+timers send ARP probes. It does not call `neigh_confirm()`: classifier activity,
+including reverse traffic, is not treated as proof of reachability. Idle counter
+samples do not refresh neighbour use. A valid cache entry remains usable during
+probing, as in ordinary Linux output; failed resolution retires hardware.
+
+This increment also fixes the software fallback contract. Native hardware
+flowtables can select `FLOW_OFFLOAD_XMIT_DIRECT`, caching Ethernet addresses even
+when hardware admission is rejected. A focused counter-enabled-table test
+reproduced lost replies after Linux had learned the peer's changed MAC, with
+zero hardware entries. That path bypassed normal neighbour output.
+
+Patch 140 now lets CDX request neighbour output for ASK-owned tables. The
+kernel initializes this request to false; CDX sets it only on a successful bind,
+and it remains set for that table after unbinding. Routed software tuples keep
+their route reference and use native `FLOW_OFFLOAD_XMIT_NEIGH`, including when
+the hardware request is declined. Hardware rule generation remains available.
+A DIRECT tuple constructed concurrently with binding is retired before packet
+rewriting in either IP family; its union contains no retained route pointer and
+must never be reinterpreted as a NEIGH tuple. Initial binding, like recovery,
+requires an empty table. Other tables and the default CMM mode retain their
+existing policy. This is a downstream kernel-internal extension, not a new
+userspace interface.
+
+The tests in `tools/tests/test_flowtable_arp.py` exercise cold ARP resolution
+after binding, sustained forwarding through natural ageing, a real endpoint
+MAC change announced through ARP, unsuccessful probes and recovery. Failure
+injection suppresses only LAN ARP replies while leaving IP traffic possible.
+Starting that bounded failure from STALE avoids depending on a randomized
+reachable timer; the preceding steady phase exercises natural ageing. The TCP
+peer restores ARP after a finite local lease, allowing the same TCP connection
+to recover without relying on an unreachable control path. Packet capture uses
+the endpoint's normal receive filter. Temporary parameters, addresses and
+capture processes are restored after each case.
+
+One early test used an incorrectly formed gratuitous ARP reply, which Linux
+could ignore during its neighbour locktime. The helper now sends a proper ARP
+announcement request. That test attempt and the pre-fix software fallback
+failure are excluded from complete acceptance and retained as development
+evidence in `/tmp/ask-flowtable-arp/initial-image/`.
+
+The first run on the final image encountered RTNL contention during a short
+admission burst: every attempted installation returned the existing busy result.
+No decoder rejection or hardware error occurred. The warmup now keeps verified
+traffic moving across Linux's hardware-refresh interval, with a bounded admission
+wait, instead of sending a sub-second burst and only polling state afterward.
+The failed warmup is retained in `admission-attempt/`; steady measurement still
+requires exact UDP delivery and hardware packet deltas without retries.
+
+The final KASAN image was rebuilt, staged and booted. Live kernel/CDX GNU build
+notes and userspace hashes matched the built files. KASAN, lockdep, FAILSLAB and
+kmemleak instrumentation remained enabled. There were no compiler warnings.
+The final incremental image build reported three previously forced task warnings;
+the preceding full kernel rebuild also reported three packaging `buildpaths`
+QA warnings for `auto_bridge.ko`, `raid6_pq.ko.zst` and `vmlinux`. These concern
+embedded build paths. Only focused tests ran; neither the full KASAN suite nor
+a kmemleak scan was run.
+
+| Identity | Value |
+| --- | --- |
+| Staged image SHA-256 | `cc67474f04cecd330cd7669949fb1eaff24aa096ea6c07dbd8d25c7a23c5fcb4` |
+| Kernel build ID | `ddfbd362fefc78efc2174f8f296692fe526e4ff1` |
+| CDX build ID | `c5cdb78e7c1d6b3605c3293a28eeb85c8a77e8cb` |
+| Test boot | `47987f94-671e-4953-83c3-f6f4c68a94b0` |
+
+| Check | Confirmed result |
+| --- | --- |
+| Focused host checks | 12 passed in 0.65 seconds. ASan/UBSan cover neighbour state and reference ownership, changes before publication and during insertion, shared dependencies, invalidation/rearm, and the production kernel's DIRECT-union guard. Existing decoder/backend/failure/shutdown checks remain included. |
+| Software fallback | Counter-enabled hardware table declined all hardware installation. After a real peer MAC change, all 128 further UDP echoes arrived with the new MAC; LAN software TX increased by 129. Passed in 10.57 seconds. |
+| ARP lifecycle | UDP and TCP cases both passed in 73.26 seconds. Each invalidation retired both hardware entries and all neighbour references; explicit table recreation restored hardware admission. No CMM restart or reboot occurred between transitions. |
+| UDP ageing | 1,024 exact echoes produced 1,024 additional hardware hits in each direction, with LAN software TX increasing by 8. Capture recorded 8 unicast ARP probes answered by the original peer MAC. The accelerated natural NUD cycle did not reinstall or invalidate hardware. |
+| UDP recovery | After MAC replacement and again after failed reachability, 512 exact echoes produced 512 hardware hits per direction. LAN software TX deltas were 2 and 1 respectively. The reachability fault exhausted 3 unanswered probes and reached FAILED. |
+| TCP ageing | One connection delivered and verified 64 MiB upload in 8.00 seconds, with 59,393 data-direction hardware hits and no retransmissions. Software TX deltas were eth3 3 / eth4 72. Aggregate CPU was 4.99%, softirq 1.04%, while polling neighbour state every half-second. Capture recorded 3 answered unicast ARP probes. |
+| TCP MAC recovery | The same connection delivered through software after the MAC change, then offloaded after table recreation. A verified 64 MiB download in 8.00 seconds produced 59,394 data-direction hardware hits; software TX deltas eth3 3 / eth4 12, CPU 2.05%, softirq 0.44%. |
+| TCP reachability recovery | ARP reply suppression reached FAILED and removed hardware. A queued command and verified 1 MiB transfer survived until the peer's eight-second local lease restored ARP. The capture's six-second fault window contained 16 unanswered probes and no replies. After explicit rearm, that same connection delivered another verified 64 MiB upload: 59,393 data-direction hardware hits, software TX eth3 2 / eth4 12, CPU 1.86%, softirq 0.41%. FIN then removed both entries and references. |
+| Permanent-neighbour regressions | Reference/lifecycle passed in 112.81 seconds, including removal under traffic and idle expiry. UDP TTL/MTU/options/fragment exceptions and TCP expiry/reuse/FIN checks both passed in 40.87 seconds. |
+| Sanitizers | No KASAN, UBSan or lockdep splats during the successful focused hardware tests. |
+
+CPU includes management polling, ARP and other background work; the ageing
+measurement has more observer traffic than the recovery measurements. Delivery,
+hardware deltas and software TX counters together establish the forwarding path.
+These paced tests do not claim maximum throughput or close the earlier unrelated
+UDP-loss investigation. The ARP timers were shortened for testing; the production
+adapter changes no NUD parameters and grants no synthetic reachability confirmation.
+
+On an experimental boot, select only the three ordinary-ARP cases with:
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=<WAN-address> make ask-test \
+  ASK_TEST_ARGS='-k flowtable_arp -x -q'
+```
+
+Canonical acceptance artifacts are in `/tmp/ask-flowtable-arp/`: `host.xml`,
+`software.xml`, `lifecycle.xml`, `regression.xml`, `permanent-lifecycle.log`,
+per-case JSON, `arp-udp.pcap`, `arp-tcp.pcap`, `arp-software.pcap`,
+`image-identity.json` and `final-state.json`. The final build log is
+`/tmp/ask-flowtable-arp-candidate-build.log`; the full kernel rebuild log is
+`/tmp/ask-flowtable-arp-final-build.log`.
+
+Final runtime state: experimental ownership, CMM and auto_bridge absent, both
+fault controls disabled, 26 installs matched by 26 deletes, and entries,
+bindings, neighbour references, errors, invalidation, fatal and quarantine all
+zero. Four explicit rearms completed. Test tables, host routes and NAT exemptions
+are gone; the LAN MAC and ARP response policy and both DUT ports' NUD parameters
+are restored. The DUT remains in flowtable mode. Stop at this proven increment;
+gateway routes and selective invalidation remain future work.

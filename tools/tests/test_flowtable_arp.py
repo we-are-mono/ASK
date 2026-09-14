@@ -1,0 +1,295 @@
+"""Ordinary ARP on the direct-route flowtable topology, without CMM."""
+from __future__ import annotations
+
+import asyncio
+import base64
+from contextlib import asynccontextmanager
+import json
+import os
+from pathlib import Path
+import time
+
+import pytest
+
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
+from test_flowtable_tcp import BLOCK, connection, hardware_transfer, installed, software_tx
+
+pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
+                               reason="requires an explicit experimental boot")
+CHANGED_MAC = "02:9d:99:b2:33:02"
+PEER = Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
+
+
+async def lan_neighbour(r, **changes):
+    script = PEER + f"\nimport json\nprint(json.dumps(configure_neighbour({LAN_NIC!r}, {r.lan_ip!r}, **{changes!r})))\n"
+    result = await lan_run_python(r.lan, script, label="flowtable_arp_config", timeout=20)
+    assert result.rc == 0, result.stdout
+    return json.loads(result.stdout.strip())
+
+
+async def neighbours(r):
+    result = await command(r.target, r.session, "ip", "-j", "-s", "neigh", "show")
+    return {n["dst"]: n for n in json.loads(result["stdout"])
+            if n["dst"] in {r.lan_ip, WAN_IP}}
+
+
+async def wait_neighbour(r, predicate, timeout=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        entries = await neighbours(r)
+        if predicate(entries):
+            return entries
+        await asyncio.sleep(0.1)
+    pytest.fail(f"neighbour state did not converge: {entries}")
+
+
+async def observe(r, operation, label):
+    task = asyncio.create_task(operation)
+    samples = []
+    try:
+        while not task.done():
+            samples.append({"neighbours": await neighbours(r), "offload": await r.state()})
+            await asyncio.sleep(0.5)
+    finally:
+        result = await task
+        r.record(f"arp-{r.proto}-{label}-samples", samples)
+    return result
+
+
+async def recover(r):
+    await r.delete_table()
+    await r.wait(lambda s: s["rearm_ready"] == 1 and s["neighbour_refs"] == 0)
+    before = await r.state()
+    if r.proto == "udp":
+        await r.clear_ct()
+    await r.table()
+    after = await r.state()
+    assert after["rearms"] == before["rearms"] + 1 and after["invalidated"] == 0, (before, after)
+
+
+async def invalidated(r, before, label):
+    state = await r.wait(lambda s: s["invalidation_done"] == 1 and s["entries"] == 0)
+    assert state["invalidated"] == 1 and state["bindings"] == 2, state
+    assert state["neighbour_refs"] == state["errors"] == state["fatal"] == state["quarantine"] == 0, state
+    assert state["installs"] == before["installs"] and state["rearms"] == before["rearms"], (before, state)
+    r.record(f"arp-{r.proto}-{label}", {"before": before, "after": state, "neighbours": await neighbours(r)})
+    return state
+
+
+@asynccontextmanager
+async def arp_environment(r):
+    tag = getattr(r, "arp_tag", r.proto)
+    original_mac = r.lan_mac
+    assert original_mac != CHANGED_MAC
+    ignore = await console_command(r.lan, "sysctl", "-n", f"net.ipv4.conf.{LAN_NIC}.arp_ignore")
+    old_ignore = int(ignore["stdout"].strip())
+    assert old_ignore == 0, "ARP test requires normal initial LAN responses"
+    base = f"/tmp/ask_flowtable_arp_{time.monotonic_ns()}"
+    start = f'''
+import json, pathlib, subprocess, time
+base = {base!r}
+with open(base + '.err', 'wb') as log:
+    proc = subprocess.Popen(['timeout', '180', 'tcpdump', '-p', '-U', '-n', '-i', {LAN_NIC!r},
+                             '-w', base + '.pcap', 'arp'], stdout=subprocess.DEVNULL,
+                            stderr=log, start_new_session=True)
+for _ in range(50):
+    assert proc.poll() is None, pathlib.Path(base + '.err').read_text()
+    if 'listening on' in pathlib.Path(base + '.err').read_text(): break
+    time.sleep(0.1)
+else: raise AssertionError('ARP capture did not start')
+print(json.dumps({{'pid': proc.pid}}))
+'''
+    result = await lan_run_python(r.lan, start, label="flowtable_arp_capture", timeout=15)
+    assert result.rc == 0, result.stdout
+    pid = json.loads(result.stdout.strip())["pid"]
+    saved = []
+    try:
+        assert (await r.state())["neighbour_refs"] == 0
+        for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+            for name, value in [("base_reachable_time_ms", 1000), ("delay_first_probe_time", 1),
+                                ("retrans_time_ms", 200), ("ucast_solicit", 3),
+                                ("mcast_solicit", 3), ("app_solicit", 0)]:
+                key = f"net.ipv4.neigh.{dev}.{name}"
+                old = (await read(r.target, r.session, "/proc/sys/" + key.replace(".", "/"))).strip()
+                await command(r.target, r.session, "sysctl", "-w", f"{key}={value}")
+                saved.append((key, old))
+        for ip, dev in [(r.lan_ip, TARGET_LAN_IF), (WAN_IP, TARGET_WAN_IF)]:
+            await command(r.target, r.session, "ip", "neigh", "del", ip, "dev", dev)
+        yield
+    finally:
+        try:
+            r.record(f"arp-{tag}-before-cleanup", await r.state())
+            await r.delete_table()
+            assert (await r.state())["neighbour_refs"] == 0
+        finally:
+            try:
+                await lan_neighbour(r, arp_ignore=old_ignore,
+                                    **({"mac": original_mac} if r.lan_mac != original_mac else {}))
+                r.lan_mac = original_mac
+                for key, value in reversed(saved):
+                    await command(r.target, r.session, "sysctl", "-w", f"{key}={value}")
+            finally:
+                stop = f'''
+import base64, json, os, pathlib, signal, time
+try: os.killpg({pid}, signal.SIGINT)
+except ProcessLookupError: pass
+time.sleep(0.3)
+base = pathlib.Path({base!r})
+pcap = base.with_suffix('.pcap'); log = base.with_suffix('.err')
+print(json.dumps({{'pcap': base64.b64encode(pcap.read_bytes()).decode(), 'log': log.read_text()}}))
+pcap.unlink(); log.unlink()
+'''
+                result = await lan_run_python(r.lan, stop, label="flowtable_arp_capture_stop", timeout=10)
+                assert result.rc == 0, result.stdout
+                report = json.loads(result.stdout.strip())
+                ARTIFACTS.mkdir(parents=True, exist_ok=True)
+                (ARTIFACTS / f"arp-{tag}.pcap").write_bytes(base64.b64decode(report.pop("pcap")))
+                r.record(f"arp-{tag}-capture", report)
+
+
+def check_arp_trace(r, original_mac, failure_start, failure_end):
+    from scapy.all import ARP, Ether, rdpcap
+    packets = rdpcap(str(ARTIFACTS / f"arp-{r.proto}.pcap"))
+    probes = [p for p in packets if ARP in p and p[ARP].op == 1 and
+              p[ARP].psrc == r.lan_gateway and p[ARP].pdst == r.lan_ip]
+    healthy = [p for p in probes if p[Ether].dst == original_mac]
+    assert len(healthy) >= 2, "no repeated unicast ARP probes during hardware use"
+    answered = [probe for probe in healthy if any(
+        ARP in reply and reply[ARP].op == 2 and reply[ARP].hwsrc == original_mac and
+        reply[ARP].psrc == r.lan_ip and reply[ARP].hwdst == r.dut_lan_mac and
+        0 <= float(reply.time - probe.time) <= 1 for reply in packets)]
+    assert len(answered) >= 2, "no repeated successful ARP probes during hardware use"
+    failed = [p for p in probes if failure_start <= float(p.time) < failure_end]
+    assert len(failed) >= 3, "failure did not exhaust ordinary ARP probes"
+    assert not any(ARP in p and p[ARP].op == 2 and p[ARP].psrc == r.lan_ip and
+                   failure_start <= float(p.time) < failure_end for p in packets), "ARP replied during fault"
+    r.record(f"arp-{r.proto}-proof", {"healthy_unicast_probes": len(healthy),
+                                     "answered_unicast_probes": len(answered),
+                                     "unanswered_failure_probes": len(failed),
+                                     "failure_start": failure_start, "failure_end": failure_end})
+
+
+async def udp_hardware(r, count=512, interval=0.003, label="forwarding"):
+    # Admission can legitimately lose RTNL trylock. Linux retries hardware
+    # from software traffic when its flow timeout advances by more than HZ;
+    # keep verified traffic moving instead of idly polling after a short burst.
+    warmup = []
+    for _ in range(5):
+        await r.exchange(128, interval=0.01, promiscuous=False)
+        before = await r.state()
+        warmup.append(before)
+        if before["entries"] == before["neighbour_refs"] == 2:
+            break
+    else:
+        pytest.fail(f"UDP did not install during admission traffic: {warmup}")
+    r.record(f"arp-udp-{label}-admission", warmup)
+    tx_before = await software_tx(r)
+    result = await observe(r, r.exchange(count, interval=interval, promiscuous=False), label)
+    after, tx_after = await r.state(), await software_tx(r)
+    old = {f["in"]: int(f["packets"]) for f in before["flows"]}
+    assert after["entries"] == after["neighbour_refs"] == 2 and not after["invalidated"], after
+    assert after["installs"] == before["installs"], (before, after)
+    for flow in after["flows"]:
+        assert flow["proto"] == "17" and int(flow["packets"]) - old[flow["in"]] == count, (before, after)
+    assert 0 <= tx_after[TARGET_LAN_IF] - tx_before[TARGET_LAN_IF] <= 32, (tx_before, tx_after)
+    r.record(f"arp-udp-{label}", {"before": before, "after": after, "exchange": result,
+                                 "software_tx_before": tx_before, "software_tx_after": tx_after})
+    return after
+
+
+async def test_flowtable_arp_udp(rig):
+    r = rig
+    original_mac = r.lan_mac
+    async with arp_environment(r):
+        await r.table()  # ARP is allowed to resolve after binding.
+        before = await udp_hardware(r, count=1024, interval=0.01, label="ageing")
+        learned = await neighbours(r)
+        assert set(learned) == {r.lan_ip, WAN_IP}, learned
+        assert all("PERMANENT" not in n["state"] for n in learned.values()), learned
+        r.record("arp-udp-learned", learned)
+        r.lan_mac = CHANGED_MAC  # Cleanup must restore even if the command fails.
+        await lan_neighbour(r, mac=CHANGED_MAC)
+        await invalidated(r, before, "mac-invalidated")
+        await wait_neighbour(r, lambda ns: ns.get(r.lan_ip, {}).get("lladdr") == CHANGED_MAC)
+        tx_before = await software_tx(r)
+        await r.exchange(64, promiscuous=False)
+        assert (await software_tx(r))[TARGET_LAN_IF] - tx_before[TARGET_LAN_IF] >= 64
+        await recover(r)
+        before = await udp_hardware(r, label="mac-recovered")
+        failure = await lan_neighbour(r, arp_ignore=8)
+        # Start from STALE to bound the fault window; the preceding sustained
+        # phase proves natural ageing. No address or reachability is fabricated.
+        await command(r.target, r.session, "ip", "neigh", "change", r.lan_ip,
+                      "dev", TARGET_LAN_IF, "nud", "stale")
+        await r.exchange(32, promiscuous=False)
+        failed = await wait_neighbour(r, lambda ns: "FAILED" in ns.get(r.lan_ip, {}).get("state", []), timeout=6)
+        await invalidated(r, before, "unreachable")
+        restored = await lan_neighbour(r, arp_ignore=0)
+        r.record("arp-udp-fault", {"start": failure, "restored": restored, "failed": failed})
+        await r.exchange(64, promiscuous=False)  # Resolves through ARP in software.
+        await recover(r)
+        await udp_hardware(r, label="reachability-recovered")
+    check_arp_trace(r, original_mac, failure["time"], restored["time"])
+
+
+async def test_flowtable_arp_software_fallback(rig):
+    r = rig
+    r.arp_tag = "software"
+    async with arp_environment(r):
+        await r.exchange(32, promiscuous=False)  # Resolve both next hops first.
+        await r.clear_ct()
+        before = await r.state()
+        await r.table(counter=True)  # Hardware accounting is deliberately unsupported.
+        await r.exchange(128, promiscuous=False)
+        declined = await r.wait(lambda s: s["rejects"] > before["rejects"])
+        assert declined["entries"] == declined["neighbour_refs"] == 0, declined
+        r.lan_mac = CHANGED_MAC
+        await lan_neighbour(r, mac=CHANGED_MAC)
+        learned = await wait_neighbour(r, lambda ns: ns.get(r.lan_ip, {}).get("lladdr") == CHANGED_MAC)
+        tx_before = await software_tx(r)
+        await r.exchange(128, promiscuous=False)
+        tx_after = await software_tx(r)
+        state = await r.state()
+        assert state["entries"] == state["neighbour_refs"] == 0, state
+        assert tx_after[TARGET_LAN_IF] - tx_before[TARGET_LAN_IF] >= 128, (tx_before, tx_after)
+        r.record("arp-software-fallback", {"declined": declined, "learned": learned,
+                 "after": state, "software_tx_before": tx_before, "software_tx_after": tx_after})
+
+
+@pytest.mark.parametrize("rig", ["tcp"], indirect=True)
+async def test_flowtable_arp_tcp(rig):
+    r = rig
+    original_mac = r.lan_mac
+    async with arp_environment(r):
+        await r.table()
+        async with connection(r) as conn:
+            await installed(r, conn)
+            await observe(r, hardware_transfer(r, conn, "upload", label="arp-tcp-ageing"), "ageing")
+            before = await r.state()
+            assert before["neighbour_refs"] == 2, before
+            r.lan_mac = CHANGED_MAC
+            await conn.configure_neighbour(LAN_NIC, mac=CHANGED_MAC)
+            await invalidated(r, before, "mac-invalidated")
+            await wait_neighbour(r, lambda ns: ns.get(r.lan_ip, {}).get("lladdr") == CHANGED_MAC)
+            await conn.transfer("download")  # Same connection, fresh MAC, software path.
+            await recover(r)
+            await installed(r, conn)
+            await hardware_transfer(r, conn, "download", label="arp-tcp-mac-recovered")
+            before = await r.state()
+            failure = await conn.configure_neighbour(LAN_NIC, arp_ignore=8, restore_after=8)
+            await command(r.target, r.session, "ip", "neigh", "change", r.lan_ip,
+                          "dev", TARGET_LAN_IF, "nud", "stale")
+            await conn.transfer("upload", size=len(BLOCK))
+            failed = await wait_neighbour(r, lambda ns: "FAILED" in ns.get(r.lan_ip, {}).get("state", []), timeout=6)
+            await invalidated(r, before, "unreachable")
+            # The LAN lease restores ARP independently of this TCP connection.
+            # Its queued command and transfer must survive the unreachable interval.
+            report = await conn.transfer("upload")
+            r.record("arp-tcp-fault", {"start": failure, "failed": failed, "resumed": report})
+            await recover(r)
+            await installed(r, conn)
+            await hardware_transfer(r, conn, "upload", label="arp-tcp-reachability-recovered")
+            await conn.close("fin")
+            await r.wait(lambda s: s["entries"] == s["neighbour_refs"] == 0, timeout=3)
+    check_arp_trace(r, original_mac, failure["time"], failure["time"] + 6)

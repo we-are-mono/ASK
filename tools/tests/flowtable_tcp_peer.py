@@ -37,6 +37,11 @@ def main():
                     raise AssertionError("controller closed without a close command")
                 command = json.loads(line)
                 op = command["op"]
+                if op == "neighbour":
+                    changes = {key: value for key, value in command.items() if key != "op"}
+                    report = configure_neighbour(address=LAN_IP, **changes)
+                    sock.sendall(json.dumps(report).encode() + b"\n")
+                    continue
                 if op == "fin":
                     sock.shutdown(socket.SHUT_WR)
                     assert reader.read() == b"", "unexpected data after FIN"

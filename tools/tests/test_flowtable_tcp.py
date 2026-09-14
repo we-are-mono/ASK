@@ -34,6 +34,12 @@ class Connection:
         self.writer.write(json.dumps({"op": op, **kwargs}).encode() + b"\n")
         await self.writer.drain()
 
+    async def configure_neighbour(self, iface, **changes):
+        await self.send("neighbour", iface=iface, **changes)
+        report = json.loads(await asyncio.wait_for(self.reader.readline(), 15))
+        assert report["op"] == "neighbour", report
+        return report
+
     async def transfer(self, op, size=MIB, rate=8 * MIB):
         async with asyncio.timeout(45):
             await self.send(op, size=size, rate=rate)
@@ -81,6 +87,7 @@ async def connection(r):
     accepted = asyncio.Queue()
     server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT)
     script = (f"LAN_IP={r.lan_ip!r}; WAN_IP={WAN_IP!r}; SPORT={SPORT}; DPORT={DPORT}\n" +
+              Path(__file__).with_name("flowtable_neighbour_peer.py").read_text() + "\n" +
               Path(__file__).with_name("flowtable_tcp_peer.py").read_text())
     peer = asyncio.create_task(lan_run_python(r.lan, script, timeout=180, label="flowtable_tcp"))
     writer = None

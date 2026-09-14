@@ -19,6 +19,7 @@ typedef uint64_t u64;
 #define BIT(n) (1UL << (n))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 #define GFP_KERNEL 0
 #define HZ 100
 #define WARN_ON_ONCE(x) (x)
@@ -34,6 +35,16 @@ typedef uint64_t u64;
 #define TCPHDR_FIN 1
 #define TCPHDR_RST 4
 #define TCP_CONNTRACK_ESTABLISHED 3
+#define NUD_PERMANENT 128
+#define NUD_NOARP 64
+#define NUD_FAILED 32
+#define NUD_PROBE 16
+#define NUD_DELAY 8
+#define NUD_STALE 4
+#define NUD_REACHABLE 2
+#define NUD_INCOMPLETE 1
+#define NETEVENT_NEIGH_UPDATE 1
+#define NOTIFY_DONE 0
 #define cmpxchg(p, old, new) ({ typeof(*(p)) v = *(p); if (v == (old)) *(p) = (new); v; })
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
@@ -69,7 +80,25 @@ struct flow_block_cb {
 struct net { int id; };
 static struct net init_net;
 struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; };
-struct nf_flowtable { struct { int nelems; } rhashtable; };
+#define dev_net(d) (&init_net)
+struct neigh_table { int unused; };
+static struct neigh_table arp_tbl;
+struct neighbour {
+    struct neigh_table *tbl;
+    struct net_device *dev;
+    unsigned refs, nud_state;
+    bool dead, lock;
+    u8 ha[6];
+};
+struct notifier_block { int unused; };
+static struct neighbour neighbour;
+static void read_lock_bh(bool *lock) { assert(!*lock); *lock = true; }
+static void read_unlock_bh(bool *lock) { assert(*lock); *lock = false; }
+#define spin_lock read_lock_bh
+#define spin_unlock read_unlock_bh
+#define spin_lock_bh read_lock_bh
+#define spin_unlock_bh read_unlock_bh
+struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh; };
 struct nf_conn { struct net *net; unsigned zone[2], mark, status, protonum, tcp_state; };
 #define nf_ct_protonum(c) ((c)->protonum)
 static bool nf_conntrack_tcp_established(const struct nf_conn *c)
@@ -135,14 +164,20 @@ struct work_struct { int unused; };
 static int ft_work;
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
+static LIST_HEAD(ft_neigh_entries);
+static bool ft_neigh_lock;
 static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage;
+static unsigned ft_neighbour_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms;
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
 static unsigned long jiffies = 1000;
 static unsigned allocated, live_hw, flushed, scheduled;
 static bool allocation_fail, hardware_fail, invalidate_on_add, physical_ok = true, neigh_ok = true;
+static bool change_neigh_on_add, change_neigh_on_lookup;
+static unsigned neigh_lookups, neigh_uses;
+static int neigh_send_error;
 static int deletion_error;
 static bool rtnl_busy, rtnl, quiesce_fail;
 static bool callback_allocation_fail, invalidate_on_bind;
@@ -168,10 +203,26 @@ static int atomic_read(int *v) { return *v; }
 static void atomic_set(int *v, int n) { *v = n; }
 static void ft_invalidate(void) { ft_invalid = 1; }
 static bool ft_physical(struct net_device *d) { return d && physical_ok; }
-static bool ft_permanent_neigh(struct net_device *d, __be32 dst, const u8 *mac) { return neigh_ok; }
+static struct neighbour *neigh_lookup(struct neigh_table *table, const __be32 *dst, struct net_device *dev)
+{
+    neigh_lookups++;
+    if (change_neigh_on_lookup && neigh_lookups == 2) neighbour.ha[5]++;
+    if (!neigh_ok) return NULL;
+    assert(table == &arp_tbl);
+    neighbour.dev = dev; neighbour.refs++;
+    return &neighbour;
+}
+static void neigh_release(struct neighbour *n) { assert(n->refs); n->refs--; }
+static int neigh_event_send(struct neighbour *n, void *skb)
+{
+    assert(n->refs && !n->lock && !ft_neigh_lock && !skb);
+    neigh_uses++;
+    return neigh_send_error;
+}
 static void *kzalloc(size_t n, int flags) { if (allocation_fail) return NULL; allocated++; return calloc(1, n); }
 static void kfree(void *p) { assert(allocated); allocated--; free(p); }
 static int ft_rule_callback(enum tc_setup_type t, void *data, void *priv) { return 0; }
+static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *ptr);
 typedef int (*rule_callback_t)(enum tc_setup_type, void *, void *);
 static struct flow_block_cb *flow_indr_block_cb_alloc(rule_callback_t fn, void *ident,
     void *priv, void (*release)(void *), struct flow_block_offload *bo,
@@ -201,6 +252,10 @@ static int cdx_ft_hw_add(const struct cdx_ft_rule *r, struct cdx_ft_hw **hw)
     *hw = calloc(1, sizeof(**hw)); assert(*hw); live_hw++;
     (*hw)->stats.lastused = (u32)jiffies;
     if (invalidate_on_add) ft_invalidate();
+    if (change_neigh_on_add) {
+        neighbour.ha[5]++;
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+    }
     return 0;
 }
 static int cdx_ft_hw_del(struct cdx_ft_hw **hw)
@@ -223,6 +278,10 @@ static struct ports pk, pm;
 static struct tcp tk, tm;
 static void fixture(void)
 {
+    assert(!neighbour.refs && !ft_neighbour_refs && ft_neigh_entries.next == &ft_neigh_entries);
+    neighbour = (struct neighbour){ .tbl = &arp_tbl, .nud_state = NUD_PERMANENT,
+                                  .ha = {2,0x11,0x22,0x33,0x44,0x55} };
+    neigh_lookups = 0;
     ct = (struct nf_conn){ .net = &init_net, .protonum = IPPROTO_UDP };
     dissector.used_keys = 31;
     mk = (struct meta){ .ingress_ifindex = 5 }; mm = (struct meta){ .ingress_ifindex = -1 };
@@ -311,9 +370,13 @@ static void test_rearm(void)
     ft_fatal = false; /* Simulated fresh module/boot, never a recovery action. */
     ft_invalid_done = false;
     deletion_error = 0;
+    table.rhashtable.nelems = 2;
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP && !table.use_neigh);
+    table.rhashtable.nelems = 0;
     u64 errors = ft_errors, installs = ft_installs, deletes = ft_deletes;
     for (unsigned cycle = 0; cycle < 8; cycle++) {
         assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+        assert(table.use_neigh);
         invalidate_on_bind = true;
         assert(bind_device(&out, FLOW_BLOCK_BIND) == 0);
         invalidate_on_bind = false;
@@ -350,6 +413,9 @@ static void test_rearm(void)
         assert(bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
         assert(ft_invalid && ft_invalid_done && !allocated && ft_rearms == cycle);
         table.rhashtable.nelems = 0;
+        ft_neighbour_refs = 1;
+        assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
+        ft_neighbour_refs = 0;
         private_pending = 1;
         assert(!can_rearm() && bind_device(&in, FLOW_BLOCK_BIND) == -EOPNOTSUPP);
         private_pending = 0; legacy_pending = 1;
@@ -379,6 +445,80 @@ static void test_rearm(void)
         assert(ft_errors == errors && !ft_invalid && !ft_invalid_done && !ft_fatal);
         assert(ft_bindings.next == &ft_bindings && ft_block_list.next == &ft_block_list);
     }
+}
+
+static void test_neighbours(void)
+{
+    const unsigned valid[] = {NUD_PERMANENT, NUD_REACHABLE, NUD_STALE, NUD_DELAY, NUD_PROBE};
+    const unsigned invalid[] = {0, NUD_INCOMPLETE, NUD_FAILED, NUD_NOARP,
+                               NUD_NOARP | NUD_REACHABLE, NUD_FAILED | NUD_REACHABLE};
+    struct cdx_ft_rule decoded;
+    for (unsigned i = 0; i < ARRAY_SIZE(valid); i++) {
+        fixture(); neighbour.nud_state = valid[i];
+        assert(ft_replace(&binding, &cls) == 0);
+        struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+        assert(e && neighbour.refs == 1 && ft_neighbour_refs == 1);
+        unsigned uses = neigh_uses;
+        assert(ft_stats(e, &cls) == 0 && neigh_uses == uses); /* Idle is not use. */
+        e->hw->stats.packets++;
+        assert(ft_stats(e, &cls) == 0 && neigh_uses == uses + 1);
+        assert(ft_stats(e, &cls) == 0 && neigh_uses == uses + 1); /* No double use. */
+        for (unsigned j = 0; j < ARRAY_SIZE(valid); j++) {
+            neighbour.nud_state = valid[j];
+            ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+            assert(!ft_invalid && ft_count == 1);
+        }
+        struct neighbour unrelated = neighbour;
+        unrelated.nud_state = NUD_FAILED;
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &unrelated);
+        assert(!ft_invalid);
+        neighbour.ha[5]++;
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+        assert(ft_invalid && ft_count == 1); /* Atomic callback only latches. */
+        assert(ft_remove(e) == 0 && !neighbour.refs && !ft_neighbour_refs);
+        ft_invalid = 0;
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+        assert(!ft_invalid); /* Removed entries cannot be dereferenced. */
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(invalid); i++) {
+        fixture(); neighbour.nud_state = invalid[i];
+        assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP && !neighbour.refs);
+        neighbour.nud_state = NUD_REACHABLE;
+        assert(ft_replace(&binding, &cls) == 0);
+        struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+        neighbour.nud_state = invalid[i];
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+        assert(ft_invalid);
+        unsigned uses = neigh_uses;
+        e->hw->stats.packets++;
+        assert(ft_stats(e, &cls) == -EOPNOTSUPP && neigh_uses == uses);
+        assert(ft_remove(e) == 0); ft_invalid = 0;
+    }
+    fixture(); neighbour.dead = true;
+    assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP && !neighbour.refs);
+    fixture(); change_neigh_on_lookup = true; /* Decoder/publication race. */
+    assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
+    assert(!neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
+    change_neigh_on_lookup = false;
+    fixture(); change_neigh_on_add = true; /* Watch precedes hardware insertion. */
+    assert(ft_replace(&binding, &cls) == -EIO && ft_invalid);
+    assert(!neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
+    change_neigh_on_add = false; ft_invalid = 0;
+    fixture(); assert(ft_replace(&binding, &cls) == 0);
+    struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+    neigh_send_error = 1; e->hw->stats.packets++;
+    assert(ft_stats(e, &cls) == -EOPNOTSUPP && ft_invalid);
+    assert(ft_remove(e) == 0); neigh_send_error = 0; ft_invalid = 0;
+    fixture(); assert(ft_replace(&binding, &cls) == 0);
+    cls.cookie++; pk.src = htons(10001);
+    assert(ft_replace(&binding, &cls) == 0 && ft_neighbour_refs == 2 && neighbour.refs == 2);
+    neighbour.dead = true;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+    assert(ft_invalid && ft_count == 2);
+    ft_invalidate_work(NULL);
+    assert(!ft_count && !live_hw && !allocated && !ft_neighbour_refs && !neighbour.refs);
+    assert(ft_neigh_entries.next == &ft_neigh_entries && !out.refs);
+    assert(ft_installs == ft_deletes);
 }
 int main(void)
 {
@@ -461,5 +601,6 @@ int main(void)
     list_del(&binding.list);
     assert(ft_installs == ft_deletes);
     test_rearm();
-    puts("Flowtable: decoder, references, deltas, wrap, rollback, invalidation, rearm and fatal retry passed");
+    test_neighbours();
+    puts("Flowtable: decoder, references, deltas, wrap, rollback, neighbours, invalidation, rearm and fatal retry passed");
 }

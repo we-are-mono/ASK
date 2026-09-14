@@ -1,23 +1,42 @@
+From 73919d8b90010e60141f20d1a082fe56bee85760 Mon Sep 17 00:00:00 2001
 From: ASK maintainers <ask@localhost>
-Subject: [PATCH] netfilter: expose borrowed flow context to hardware adapters
+Date: Mon, 14 Sep 2026 23:03:32 +0200
+Subject: [PATCH] netfilter: provide hardware context and neighbour-aware
+ flowtable fallback
 
-A hardware adapter must be able to reject unsupported conntrack zones and
-honour the effective route MTU and accounting requirements. The directional cookie is an opaque identity,
-not an interface for recovering the parent flow. Supply context explicitly for
-Netfilter callbacks; other flow_cls_offload producers leave it zero initialized.
+Expose borrowed conntrack context, effective MTU and accounting requirements
+to hardware adapters without recovering a flow from its opaque cookie.
 
-This is a downstream kernel-internal interface. No userspace ABI changes.
+Allow an adapter to request neighbour output for routed software fallback.
+Native DIRECT tuples cache Ethernet addresses and bypass neighbour output,
+including when hardware admission fails. They can continue using an old MAC
+after ARP has learned a replacement. Keep routed tuples on XMIT_NEIGH for
+opted-in tables while retaining normal hardware rule generation. Retire any
+DIRECT tuple built concurrently with binding before packet rewriting, for
+both IPv4 and IPv6. The request is monotonic and survives device unbinding.
+
+The default remains unchanged. This is a downstream kernel-internal
+interface; no userspace ABI changes.
+---
+ include/net/flow_offload.h            |  6 ++++++
+ include/net/netfilter/nf_flow_table.h |  3 +++
+ net/netfilter/nf_flow_table_core.c    |  1 +
+ net/netfilter/nf_flow_table_ip.c      | 14 +++++++++++---
+ net/netfilter/nf_flow_table_offload.c |  6 +++++-
+ net/netfilter/nft_flow_offload.c      |  1 +
+ 6 files changed, 27 insertions(+), 4 deletions(-)
 
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
+index 292cd8f..6ea989c 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,13 @@
+@@ -688,7 +688,13 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
 +/* Netfilter context is borrowed for the duration of a callback. It is NULL
 + * for other producers. Drivers must not retain the conntrack pointer. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 1
++#define FLOW_CLS_HAS_NF_CONTEXT 2
  struct flow_cls_offload {
 +	const struct nf_conn *nf_ct;
 +	u16 nf_mtu;
@@ -25,10 +44,77 @@ diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
  	struct flow_cls_common_offload common;
  	enum flow_cls_command command;
  	bool use_act_stats;
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+index 1a6fca0..e4409e9 100644
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -84,6 +84,9 @@ struct nf_flowtable {
+ 	struct flow_block		flow_block;
+ 	struct rw_semaphore		flow_block_lock; /* Guards flow_block */
+ 	possible_net_t			net;
++	/* A hardware adapter may request neighbour output for routed software
++	 * fallback at bind. Set monotonically; retained until table destruction. */
++	bool				use_neigh;
+ };
+ 
+ static inline bool nf_flowtable_hw_offload(struct nf_flowtable *flowtable)
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index df72b03..b943473 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -542,6 +542,7 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
+ {
+ 	int err;
+ 
++	flowtable->use_neigh = false;
+ 	INIT_DELAYED_WORK(&flowtable->gc_work, nf_flow_offload_work_gc);
+ 	flow_block_init(&flowtable->flow_block);
+ 	init_rwsem(&flowtable->flow_block_lock);
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index 98edcaa..632a92b 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -254,8 +254,16 @@ static bool nf_flow_exceeds_mtu(const struct sk_buff *skb, unsigned int mtu)
+ 	return true;
+ }
+ 
+-static inline bool nf_flow_dst_check(struct flow_offload_tuple *tuple)
++static inline bool nf_flow_dst_check(const struct nf_flowtable *flowtable,
++				    struct flow_offload_tuple *tuple)
+ {
++	/* A DIRECT flow may have been constructed concurrently with adapter
++	 * binding. It has no retained dst/neighbor context: retire it before
++	 * rewriting the packet and let the ordinary stack resolve the route.
++	 * Subsequent routed flows retain their dst and use neighbour output. */
++	if (READ_ONCE(flowtable->use_neigh) &&
++	    tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
++		return false;
+ 	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH &&
+ 	    tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
+ 		return true;
+@@ -385,7 +393,7 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 	if (nf_flow_state_check(flow, iph->protocol, skb, thoff))
+ 		return 0;
+ 
+-	if (!nf_flow_dst_check(&tuplehash->tuple)) {
++	if (!nf_flow_dst_check(flow_table, &tuplehash->tuple)) {
+ 		flow_offload_teardown(flow);
+ 		return 0;
+ 	}
+@@ -664,7 +672,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+ 	if (nf_flow_state_check(flow, ip6h->nexthdr, skb, thoff))
+ 		return 0;
+ 
+-	if (!nf_flow_dst_check(&tuplehash->tuple)) {
++	if (!nf_flow_dst_check(flow_table, &tuplehash->tuple)) {
+ 		flow_offload_teardown(flow);
+ 		return 0;
+ 	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index 4f346f5..cfb0169 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -904,7 +904,11 @@
+@@ -904,7 +904,11 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
@@ -41,3 +127,18 @@ diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table
  	struct netlink_ext_ack extack = {};
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index 7dbbd89..c807cb3 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -171,6 +171,7 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 	info->hw_outdev = info->indev;
+ 
+ 	if (nf_flowtable_hw_offload(flowtable) &&
++	    !READ_ONCE(flowtable->use_neigh) &&
+ 	    nft_is_valid_ether_device(info->indev))
+ 		info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+ }
+-- 
+2.47.3
+

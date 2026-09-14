@@ -28,7 +28,9 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("int cdx_ft_hw_add")]
         + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
     )
-    names = ["ft_fault", "ft_find", "ft_remove", "ft_parse", "ft_same_key",
+    names = ["ft_fault", "ft_find", "ft_neigh_matches", "ft_neigh_check",
+             "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used", "ft_neigh_event",
+             "ft_remove", "ft_parse", "ft_same_key",
              "ft_replace", "ft_stats", "ft_release", "ft_can_rearm", "ft_bind",
              "ft_invalidate_work"]
     (tmp_path / "flowtable_production.inc").write_text(
@@ -58,6 +60,23 @@ def test_flowtable_hardware_ownership(tmp_path):
         "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
         "-fno-pie", "-no-pie", "-I", str(tmp_path),
         str(Path(__file__).with_name("flowtable_hw.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+
+def test_flowtable_neighbour_fallback(tmp_path):
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    source = (kernel / "net/netfilter/nf_flow_table_ip.c").read_text()
+    (tmp_path / "neigh_fallback_production.inc").write_text(function(source, "nf_flow_dst_check"))
+    binary = tmp_path / "flowtable_neigh"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
+        "-Werror", "-fsanitize=address,undefined", "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("flowtable_neigh.c")), "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=30, env={
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",

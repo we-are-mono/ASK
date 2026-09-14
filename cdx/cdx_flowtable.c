@@ -4,7 +4,8 @@
  * Hardware operations and lists: cdx_info->ctrl.mutex. Rule callbacks are
  * process-context NF workqueue callbacks. Binding release runs after the
  * flow-block core excludes callbacks. Notifiers only latch invalidation and
- * queue work; they never take the control mutex or dereference rule objects.
+ * queue work; they never take the control mutex. Neighbour notifications inspect
+ * immutable watched dependencies under ft_neigh_lock, nested inside neigh->lock.
  * Invalidation releases the mutex before flushing Netfilter work. Installation
  * and fatal recovery use RTNL trylock under the mutex, never a blocking acquire.
  * Each binding pins its ingress device; each installed direction pins egress.
@@ -14,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <net/arp.h>
 #include <net/fib_notifier.h>
@@ -31,7 +33,7 @@
 #include "cdx_flowtable_hw.h"
 #include "devman.h"
 
-#ifndef FLOW_CLS_HAS_NF_CONTEXT
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 2
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
 
@@ -57,6 +59,8 @@ struct cdx_ft_binding {
 
 struct cdx_ft_entry {
 	struct list_head list;
+	struct list_head neigh_list;
+	struct neighbour *neigh;
 	struct cdx_ft_binding *binding;
 	unsigned long cookie;
 	struct cdx_ft_rule rule;
@@ -66,8 +70,14 @@ struct cdx_ft_entry {
 
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
+/* Watch publication/removal is serialized by ctrl.mutex. The atomic notifier
+ * shares only neigh and rule.dst_mac, protected against entry removal by this
+ * lock. Never acquire a neighbour lock while holding ft_neigh_lock. */
+static LIST_HEAD(ft_neigh_entries);
+static DEFINE_SPINLOCK(ft_neigh_lock);
 static LIST_HEAD(ft_block_list);
 static unsigned int ft_bound, ft_count;
+static unsigned int ft_neighbour_refs;
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping, ft_fatal;
@@ -75,6 +85,7 @@ static atomic_t ft_invalid = ATOMIC_INIT(0);
 static bool ft_invalid_done;
 static struct proc_dir_entry *ft_proc;
 static void ft_invalidate_work(struct work_struct *work);
+static void ft_neigh_detach(struct cdx_ft_entry *entry);
 static DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
 
 bool cdx_flowtable_enabled(void)
@@ -134,6 +145,7 @@ static int ft_remove(struct cdx_ft_entry *entry)
 		ft_invalidate();
 	}
 	list_del(&entry->list);
+	ft_neigh_detach(entry);
 	dev_put(entry->rule.out);
 	kfree(entry);
 	ft_count--;
@@ -160,7 +172,26 @@ static bool ft_physical(struct net_device *dev)
 	return iface && iface->eth_info.net_dev == dev;
 }
 
-static bool ft_permanent_neigh(struct net_device *dev, __be32 dst, const u8 *mac)
+/* Caller holds neigh->lock. STALE/DELAY/PROBE still have usable L2 addresses;
+ * NOARP is outside this physical Ethernet/ARP contract. Do not keep using a
+ * detached object even if its address and NUD state still look usable. */
+static bool ft_neigh_matches(struct neighbour *neigh, const u8 *mac)
+{
+	if (neigh->dead || !ether_addr_equal(neigh->ha, mac))
+		return false;
+	switch (neigh->nud_state) {
+	case NUD_PERMANENT:
+	case NUD_REACHABLE:
+	case NUD_STALE:
+	case NUD_DELAY:
+	case NUD_PROBE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool ft_neigh_check(struct net_device *dev, __be32 dst, const u8 *mac)
 {
 	struct neighbour *neigh = neigh_lookup(&arp_tbl, &dst, dev);
 	bool valid;
@@ -168,11 +199,73 @@ static bool ft_permanent_neigh(struct net_device *dev, __be32 dst, const u8 *mac
 	if (!neigh)
 		return false;
 	read_lock_bh(&neigh->lock);
-	valid = neigh->nud_state == NUD_PERMANENT &&
-		ether_addr_equal(neigh->ha, mac);
+	valid = ft_neigh_matches(neigh, mac);
 	read_unlock_bh(&neigh->lock);
 	neigh_release(neigh);
 	return valid;
+}
+
+static int ft_neigh_attach(struct cdx_ft_entry *entry)
+{
+	struct neighbour *neigh;
+	bool valid;
+
+	neigh = neigh_lookup(&arp_tbl, &entry->rule.dst, entry->rule.out);
+	if (!neigh)
+		return -EOPNOTSUPP;
+	/* Recheck at watch publication: the mapping may have changed after the
+	 * decoder validated it. Publish before hardware insertion so a notifier
+	 * during insertion latches invalidation and forces the normal rollback. */
+	read_lock_bh(&neigh->lock);
+	valid = ft_neigh_matches(neigh, entry->rule.dst_mac);
+	if (valid) {
+		spin_lock(&ft_neigh_lock);
+		entry->neigh = neigh;
+		list_add_tail(&entry->neigh_list, &ft_neigh_entries);
+		spin_unlock(&ft_neigh_lock);
+		ft_neighbour_refs++;
+	}
+	read_unlock_bh(&neigh->lock);
+	if (!valid)
+		neigh_release(neigh);
+	return valid ? 0 : -EOPNOTSUPP;
+}
+
+static void ft_neigh_detach(struct cdx_ft_entry *entry)
+{
+	struct neighbour *neigh = entry->neigh;
+
+	if (!neigh)
+		return;
+	spin_lock_bh(&ft_neigh_lock);
+	list_del(&entry->neigh_list);
+	spin_unlock_bh(&ft_neigh_lock);
+	entry->neigh = NULL;
+	ft_neighbour_refs--;
+	neigh_release(neigh);
+}
+
+static bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
+{
+	struct neighbour *neigh = entry->neigh;
+	bool valid;
+
+	read_lock_bh(&neigh->lock);
+	valid = ft_neigh_matches(neigh, entry->rule.dst_mac);
+	read_unlock_bh(&neigh->lock);
+	if (!valid) {
+		ft_invalidate();
+		return false;
+	}
+	/* Classifier hits establish use, not reachability. Let Linux advance
+	 * STALE -> DELAY -> PROBE and solicit ARP using its own timers. Never
+	 * call neigh_confirm() based on hardware activity, including reverse
+	 * traffic. No neighbour/watch lock may be held across the protocol call. */
+	if (active && neigh_event_send(neigh, NULL)) {
+		ft_invalidate();
+		return false;
+	}
+	return true;
 }
 
 /* Exact masks ensure that no selector which hardware cannot enforce is lost.
@@ -265,7 +358,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    !ft_physical(binding->dev) || action->dev == binding->dev ||
 	    !is_valid_ether_addr(ethernet) ||
 	    !ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr) ||
-	    !ft_permanent_neigh(action->dev, ipv4.key->dst, ethernet) ||
+	    !ft_neigh_check(action->dev, ipv4.key->dst, ethernet) ||
 	    cls->nf_mtu > action->dev->mtu || cls->nf_mtu < 68)
 		return -EOPNOTSUPP;
 	memset(out, 0, sizeof(*out));
@@ -323,8 +416,11 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	entry->binding = binding;
 	entry->cookie = cls->cookie;
 	dev_hold(rule.out);
-	rc = ft_fault(2) ? -EIO : cdx_ft_hw_add(&rule, &entry->hw);
+	rc = ft_neigh_attach(entry);
+	if (!rc)
+		rc = ft_fault(2) ? -EIO : cdx_ft_hw_add(&rule, &entry->hw);
 	if (rc) {
+		ft_neigh_detach(entry);
 		dev_put(rule.out);
 		kfree(entry);
 		return rc;
@@ -364,6 +460,8 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	}
 	packets = now.packets - entry->reported.packets;
 	bytes = now.bytes - entry->reported.bytes;
+	if (!ft_neigh_used(entry, packets != 0))
+		return -EOPNOTSUPP;
 	/* These are classifier hits, including some later punts, and Ethernet
 	 * bytes including padding but excluding FCS. Only tables without native
 	 * counter accounting are admitted. Linux uses lastused for ageing; proc
@@ -441,7 +539,7 @@ static bool ft_can_rearm(void)
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	return ft_ready && !ft_stopping && !ft_fatal &&
 		atomic_read(&ft_invalid) && ft_invalid_done &&
-		!ft_bound && !ft_count && !cdx_ft_hw_pending() &&
+		!ft_bound && !ft_count && !ft_neighbour_refs && !cdx_ft_hw_pending() &&
 		!cdx_ehash_quarantine_pending();
 }
 
@@ -473,7 +571,7 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 		 * whose hooks were detached can still contain cached flows and
 		 * queued callbacks. Only an empty table may start recovery; its
 		 * pointer value alone cannot distinguish reuse from recreation. */
-		if (rearm && atomic_read(&flowtable->rhashtable.nelems)) {
+		if (!ft_bound && atomic_read(&flowtable->rhashtable.nelems)) {
 			rc = -EOPNOTSUPP;
 			goto out;
 		}
@@ -496,6 +594,11 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 			rc = PTR_ERR(cb);
 			goto out;
 		}
+		/* Hardware rejection must leave neighbour-aware software routing,
+		 * not a DIRECT tuple with a stale Ethernet rewrite. This request
+		 * is monotonic for the table, including after unbind. Patch 140
+		 * also retires DIRECT flows constructed concurrently with bind. */
+		WRITE_ONCE(flowtable->use_neigh, true);
 		/* Commit recovery only after allocating a binding successfully.
 		 * While ft_bound is zero, a notifier cannot invalidate new entries:
 		 * none exist yet. A normal bind must not clear an invalidation
@@ -605,10 +708,24 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct neighbour *neigh = ptr;
+	struct cdx_ft_entry *entry;
 
-	if (event == NETEVENT_NEIGH_UPDATE && neigh->tbl == &arp_tbl &&
-	    net_eq(dev_net(neigh->dev), &init_net))
-		ft_invalidate();
+	if (event != NETEVENT_NEIGH_UPDATE || neigh->tbl != &arp_tbl ||
+	    !net_eq(dev_net(neigh->dev), &init_net))
+		return NOTIFY_DONE;
+	read_lock_bh(&neigh->lock);
+	spin_lock(&ft_neigh_lock);
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+		if (entry->neigh == neigh &&
+		    !ft_neigh_matches(neigh, entry->rule.dst_mac)) {
+			/* Still invalidate the whole table. A normal NUD transition
+			 * or ARP confirmation with the same MAC needs no retirement. */
+			ft_invalidate();
+			break;
+		}
+	}
+	spin_unlock(&ft_neigh_lock);
+	read_unlock_bh(&neigh->lock);
 	return NOTIFY_DONE;
 }
 
@@ -634,12 +751,12 @@ static int ft_show(struct seq_file *seq, void *unused)
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
-		   "rearm_ready %u\nrearms %llu\n",
+		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\n",
 		   offload_owner, ft_observe, ft_bound, ft_count, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, ft_fatal,
 		   cdx_ft_hw_pending() + cdx_ehash_quarantine_pending(),
-		   ft_can_rearm(), ft_rearms);
+		   ft_can_rearm(), ft_rearms, ft_neighbour_refs);
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_hw_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u packets=%llu bytes=%llu lastused=%u\n",
