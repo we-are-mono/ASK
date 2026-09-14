@@ -8,6 +8,7 @@
  *
  */
 #include "cdx.h"
+#include "cdx_flowtable.h"
 
 /*
  * Concurrency:
@@ -162,7 +163,8 @@ int __init cdx_cmdhandler_init(void)
 	CMD_INIT(qm);
 	statistics_init();
 #ifdef DPA_IPSEC_OFFLOAD 
-	CMD_INIT(ipsec);
+	if (!cdx_flowtable_enabled())
+		CMD_INIT(ipsec);
 #endif
 #ifdef WIFI_ENABLE
 	wifi_init();
@@ -200,6 +202,13 @@ void cdx_cmdhandler_exit(void)
 int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u16 *rbuf)
 {
 	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
+
+	/* All FCI command families can reach shared state. Experimental
+	 * diagnostics use /proc/cdx_flowtable, never the inactive controller. */
+	if (cdx_flowtable_enabled()) {
+		*rlen = 0;
+		return -EOPNOTSUPP;
+	}
 
 	mutex_lock(&ctrl->mutex);
 

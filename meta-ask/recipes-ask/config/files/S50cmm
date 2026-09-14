@@ -16,6 +16,10 @@ PIDFILE=/var/run/cmm.pid
 
 case "$1" in
     start|"")
+        if [ "$(cat /sys/module/cdx/parameters/offload_owner 2>/dev/null)" = flowtable ]; then
+            echo "CMM disabled: Linux flowtable owns ASK hardware (boot selection)"
+            exit 0
+        fi
         [ -x "$CMM" ] || { echo "cmm not installed" >&2; exit 1; }
         [ -e /dev/cdx_ctrl ] || { echo "/dev/cdx_ctrl missing — is cdx.ko loaded?" >&2; exit 1; }
         # Never use `pidof cmm` here: invoked as /etc/init.d/cmm this

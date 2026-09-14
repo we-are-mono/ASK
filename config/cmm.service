@@ -6,6 +6,7 @@ ConditionPathExists=/dev/cdx_ctrl
 
 [Service]
 Type=forking
+ExecCondition=/bin/sh -c 'test "$(cat /sys/module/cdx/parameters/offload_owner 2>/dev/null)" != flowtable'
 ExecStartPre=-/bin/sh -c 'test -e /sys/class/vwd/vwd0/vwd_fast_path_enable && echo 1 > /sys/class/vwd/vwd0/vwd_fast_path_enable'
 # -n 131072 sets conntrack table size (per OpenWrt/NXP defaults)
 ExecStart=/usr/bin/cmm -f /etc/config/fastforward -n 131072

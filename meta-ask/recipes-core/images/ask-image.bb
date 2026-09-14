@@ -47,6 +47,10 @@ IMAGE_INSTALL = " \
     lp5812-driver \
     config \
     kernel-module-nf-conntrack-netlink \
+    kernel-module-nft-flow-offload \
+    kernel-module-nf-flow-table-inet \
+    kernel-module-nft-ct \
+    kernel-module-xt-tcpudp \
     kernel-module-xt-conntrack \
     kernel-module-xt-masquerade \
     kernel-module-ip6-tables \

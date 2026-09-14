@@ -41,6 +41,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/delay.h>
 #include "cdx.h"
+#include "cdx_flowtable.h"
 #include "cdx_cmdhandler.h"
 #include "dpa_ipsec.h"
 
@@ -194,6 +195,9 @@ static void cdx_module_deinit(void)
 {
 	int ii;
 
+	/* Unregistering flow blocks flushes callbacks which need ctrl.mutex. */
+	cdx_flowtable_exit();
+
 	/* Stop classification before any dependent subsystem releases queues.
 	 * Keep RTNL available between retries and release it before callbacks
 	 * which unregister netdevices. The control mutex excludes FCI updates. */
@@ -206,6 +210,7 @@ static void cdx_module_deinit(void)
 			msleep(1000);
 			rtnl_lock();
 		}
+		cdx_flowtable_quiesced();
 		/* Reclaim queued TX frames while dependent pools are still alive. */
 		qm_quiesce();
 		rtnl_unlock();
@@ -267,6 +272,10 @@ static int __init cdx_module_init(void)
 	int ii;
 
 	printk(KERN_INFO "%s\n", __func__);
+
+	rc = cdx_flowtable_mode_check();
+	if (rc)
+		return rc;
 
 	rc = cdx_check_fman_firmware();
 	if (rc)
@@ -330,7 +339,7 @@ static int __init cdx_module_init(void)
 	printk("%s::start_dpa_app successful\n", __func__);
 #endif
 #ifdef CFG_WIFI_OFFLOAD
-	rc = dpaa_vwd_init();
+	rc = cdx_flowtable_enabled() ? 0 : dpaa_vwd_init();
 	if (rc != 0)  {
 		printk("%s::vwd_driver_init failed\n", __func__);
 		goto exit;
@@ -344,6 +353,8 @@ static int __init cdx_module_init(void)
 	}
 
 #ifdef DPA_IPSEC_OFFLOAD
+	if (cdx_flowtable_enabled())
+		goto flowtable;
 	if (cdx_dpa_ipsec_init()) {
 		printk("%s::dpa_ipsec start failed\n", __func__);
 		rc = -EIO;
@@ -360,7 +371,9 @@ static int __init cdx_module_init(void)
 		rc = -ENOMEM;
 		goto exit;
 	}
+flowtable:
 #endif
+	rc = cdx_flowtable_init();
 
 exit:
 	if (rc) {

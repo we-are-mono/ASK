@@ -80,6 +80,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://110-sdk-mainline-build-compat.patch \
            file://120-emc2305-dt-fan-control.patch \
            file://130-thermal-linear-governor.patch \
+           file://140-ask-flowtable-context.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"

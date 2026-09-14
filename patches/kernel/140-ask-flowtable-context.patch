@@ -1,0 +1,43 @@
+From: ASK maintainers <ask@localhost>
+Subject: [PATCH] netfilter: expose borrowed flow context to hardware adapters
+
+A hardware adapter must be able to reject unsupported conntrack zones and
+honour the effective route MTU and accounting requirements. The directional cookie is an opaque identity,
+not an interface for recovering the parent flow. Supply context explicitly for
+Netfilter callbacks; other flow_cls_offload producers leave it zero initialized.
+
+This is a downstream kernel-internal interface. No userspace ABI changes.
+
+diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -688,7 +688,13 @@
+ 	struct netlink_ext_ack *extack;
+ };
+ 
++/* Netfilter context is borrowed for the duration of a callback. It is NULL
++ * for other producers. Drivers must not retain the conntrack pointer. */
++#define FLOW_CLS_HAS_NF_CONTEXT 1
+ struct flow_cls_offload {
++	const struct nf_conn *nf_ct;
++	u16 nf_mtu;
++	bool nf_counter;
+ 	struct flow_cls_common_offload common;
+ 	enum flow_cls_command command;
+ 	bool use_act_stats;
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -904,7 +904,11 @@
+ 				 struct flow_stats *stats,
+ 				 struct list_head *block_cb_list)
+ {
+-	struct flow_cls_offload cls_flow = {};
++	struct flow_cls_offload cls_flow = {
++		.nf_ct = flow->ct,
++		.nf_mtu = flow->tuplehash[dir].tuple.mtu,
++		.nf_counter = !!(READ_ONCE(flowtable->flags) & NF_FLOWTABLE_COUNTER),
++	};
+ 	struct netlink_ext_ack extack = {};
+ 	struct flow_block_cb *block_cb;
+ 	__be16 proto = ETH_P_ALL;

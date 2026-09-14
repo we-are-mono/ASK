@@ -648,7 +648,7 @@ async def ioctl_send(request: web.Request) -> web.Response:
 
 _EXEC_ARGV0_ALLOWED = {
     "ip", "ethtool", "iptables", "modprobe", "rmmod", "insmod",
-    "sysctl", "conntrack", "bridge", "tcpdump",
+    "sysctl", "conntrack", "bridge", "tcpdump", "nft",
     # Fuzz harness for cmm's RTNL parser; built from cmm/test/ via
     # `make -C cmm fuzzer`, packaged into the test image alongside cmm.
     "cmm_rtnl_fuzzer",

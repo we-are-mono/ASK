@@ -24,6 +24,7 @@
 #include "portdefs.h"
 #include "misc.h"
 #include "cdx.h"
+#include "cdx_flowtable.h"
 #include "cdx_ioctl.h"
 #include "lnxwrp_fm.h"
 
@@ -136,6 +137,8 @@ struct cdx_ioctl_spec {
 
 static long cdx_ioc_set_dpa_params_wrap(unsigned long args)
 {
+	if (cdx_flowtable_enabled() && cdx_flowtable_ready())
+		return -EOPNOTSUPP;
 	return cdx_ioc_set_dpa_params(args);
 }
 
@@ -212,5 +215,4 @@ int cdx_driver_init(void)
 	register_cdx_deinit_func(cdx_driver_deinit);
 	return 0;
 }
-
 

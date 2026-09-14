@@ -14,9 +14,28 @@ CONF=/etc/modules-load.d/ask.conf
 case "$1" in
     start|"")
         [ -r "$CONF" ] || exit 0
-        grep -v '^[[:space:]]*#' "$CONF" | grep -v '^[[:space:]]*$' | while read mod; do
-            modprobe "$mod"
+        owner=cmm
+        observe=0
+        for arg in $(cat /proc/cmdline); do
+            case "$arg" in
+                ask.offload=*) owner=${arg#ask.offload=} ;;
+                ask.flowtable_observe=*) observe=${arg#ask.flowtable_observe=} ;;
+            esac
         done
+        case "$owner:$observe" in
+            cmm:0|flowtable:0|flowtable:1) ;;
+            *) echo "Invalid ASK offload boot selection: $owner:$observe" >&2; exit 1 ;;
+        esac
+        while read -r mod; do
+            case "$mod" in ''|'#'*) continue ;; esac
+            if [ "$mod" = cdx ]; then
+                modprobe cdx offload_owner="$owner" flowtable_observe="$observe" || exit 1
+            elif [ "$mod" = auto_bridge ] && [ "$owner" = flowtable ]; then
+                continue
+            else
+                modprobe "$mod" || exit 1
+            fi
+        done < "$CONF"
         ;;
     stop)
         # Deliberate no-op: unloading ASK modules at shutdown is risky on a
