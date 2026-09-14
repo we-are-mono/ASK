@@ -32,15 +32,19 @@ int main(void)
     struct flow_offload_tuple tuple = { .xmit_type = FLOW_OFFLOAD_XMIT_DIRECT,
                                        .direct = {1, 2} };
     assert(nf_flow_dst_check(&table, &tuple) && !checks); /* Legacy unchanged. */
+    assert(nf_flow_offload_dst(&tuple) == NULL);
     table.use_neigh = true; /* DIRECT construction overlapped with binding. */
     assert(!nf_flow_dst_check(&table, &tuple) && !checks);
     tuple.xmit_type = FLOW_OFFLOAD_XMIT_TC;
+    assert(nf_flow_offload_dst(&tuple) == NULL);
     assert(nf_flow_dst_check(&table, &tuple) && !checks);
     for (unsigned mode = 0; mode < 2; mode++) {
         table.use_neigh = mode;
         for (unsigned type = FLOW_OFFLOAD_XMIT_NEIGH; type <= FLOW_OFFLOAD_XMIT_XFRM; type++) {
             tuple.xmit_type = type;
             tuple.dst_cache = &destination; tuple.dst_cookie = 42;
+            assert(nf_flow_offload_dst(&tuple) ==
+                   (type == FLOW_OFFLOAD_XMIT_NEIGH ? &destination : NULL));
             assert(nf_flow_dst_check(&table, &tuple));
             tuple.dst_cookie = 41;
             assert(!nf_flow_dst_check(&table, &tuple));

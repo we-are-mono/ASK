@@ -146,14 +146,26 @@ class Rig:
                       "--orig-src", self.lan_ip, "--orig-dst", WAN_IP,
                       "--sport", str(SPORT), "--dport", str(DPORT), check=False)
 
+    async def run_peer(self, script, **kwargs):
+        netns = getattr(self, "peer_netns", None)
+        if netns:
+            script = ("import os\n" +
+                      f"with open('/var/run/netns/' + {netns!r}, 'rb') as ns:\n" +
+                      "    os.setns(ns.fileno(), os.CLONE_NEWNET)\n" + script)
+        return await lan_run_python(self.lan, script, **kwargs)
+
     async def exchange(self, count=64, interval=0.003, payload_size=256, promiscuous=True):
         assert payload_size >= 8
+        peer_if = getattr(self, "peer_if", LAN_NIC)
+        peer_mac = getattr(self, "peer_mac", self.lan_mac)
+        gateway_mac = getattr(self, "peer_gateway_mac", self.dut_lan_mac)
+        ttl = 64 - getattr(self, "forward_hops", 1)
         first = self.sequence
         self.sequence += count
         script = f'''
 import json, socket, struct, subprocess, time
 def link_stats():
-    text = subprocess.check_output(['ethtool', '-S', {LAN_NIC!r}], text=True)
+    text = subprocess.check_output(['ethtool', '-S', {peer_if!r}], text=True)
     return {{k.strip(): int(v.strip()) for line in text.splitlines() if ':' in line
             for k, v in [line.split(':', 1)] if v.strip().isdigit() and
             any(word in k for word in ('error', 'dropped', 'no_buffer', 'no_dma', 'timeout'))}}
@@ -164,9 +176,9 @@ s.setsockopt(socket.SOL_IP, getattr(socket, "IP_RECVTTL", 12), 1)
 s.settimeout(2)
 s.bind(({self.lan_ip!r}, {SPORT}))
 raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
-raw.bind(({LAN_NIC!r}, 0)); raw.settimeout(2)
+raw.bind(({peer_if!r}, 0)); raw.settimeout(2)
 if {promiscuous!r}:
-    raw.setsockopt(263, 1, struct.pack('IHH8s', socket.if_nametoindex({LAN_NIC!r}), 1, 0, b''))
+    raw.setsockopt(263, 1, struct.pack('IHH8s', socket.if_nametoindex({peer_if!r}), 1, 0, b''))
 received = []
 for n in range({first}, {first + count}):
     payload = struct.pack('!Q', n) + b'ASK-flowtable'.ljust({payload_size - 8}, b'.')[:{payload_size - 8}]
@@ -187,7 +199,7 @@ for n in range({first}, {first + count}):
         raise AssertionError(('echo timeout', n)) from error
     assert data == payload and addr == ({WAN_IP!r}, {DPORT}), (n, data, addr)
     ttl = [struct.unpack('i', v)[0] for level, kind, v in ancillary if level == socket.SOL_IP and kind == socket.IP_TTL]
-    assert ttl == [63], (n, ttl)
+    assert ttl == [{ttl}], (n, ttl)
     while True:
         frame = raw.recv(65535)
         if len(frame) < 42 or frame[23] != socket.IPPROTO_UDP or frame[26:30] != socket.inet_aton({WAN_IP!r}):
@@ -197,9 +209,9 @@ for n in range({first}, {first + count}):
         if struct.unpack('!HH', frame[start:start+4]) != ({DPORT}, {SPORT}):
             continue
         assert frame[start+8:start+8+len(payload)] == payload, (n, 'duplicate or unexpected frame')
-        assert frame[:6] == bytes.fromhex({self.lan_mac.replace(':', '')!r})
-        assert frame[6:12] == bytes.fromhex({self.dut_lan_mac.replace(':', '')!r})
-        assert ihl == 20 and frame[22] == 63
+        assert frame[:6] == bytes.fromhex({peer_mac.replace(':', '')!r})
+        assert frame[6:12] == bytes.fromhex({gateway_mac.replace(':', '')!r})
+        assert ihl == 20 and frame[22] == {ttl}
         break
     received.append(n)
     time.sleep({interval})
@@ -207,7 +219,7 @@ s.close()
 raw.close()
 print(json.dumps({{'first': received[0], 'last': received[-1], 'count': len(received)}}))
 '''
-        result = await lan_run_python(self.lan, script, timeout=max(15, count * interval + 10), label="flowtable_echo")
+        result = await self.run_peer(script, timeout=max(15, count * interval + 10), label="flowtable_echo")
         if result.rc:
             state = await self.state()
             received = [struct.unpack("!Q", p[:8])[0] for p in self.echo.received if len(p) >= 8]

@@ -87,6 +87,7 @@ async def connection(r):
     accepted = asyncio.Queue()
     server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT)
     script = (f"LAN_IP={r.lan_ip!r}; WAN_IP={WAN_IP!r}; SPORT={SPORT}; DPORT={DPORT}\n" +
+              f"PEER_NETNS={getattr(r, 'peer_netns', None)!r}\n" +
               Path(__file__).with_name("flowtable_neighbour_peer.py").read_text() + "\n" +
               Path(__file__).with_name("flowtable_tcp_peer.py").read_text())
     peer = asyncio.create_task(lan_run_python(r.lan, script, timeout=180, label="flowtable_tcp"))

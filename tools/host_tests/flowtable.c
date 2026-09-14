@@ -81,17 +81,33 @@ struct net { int id; };
 static struct net init_net;
 struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; };
 #define dev_net(d) (&init_net)
+struct dst_ops { unsigned family; };
+struct dst_entry {
+    struct dst_ops *ops;
+    struct net_device *dev;
+    void *xfrm, *lwtstate;
+    bool valid;
+};
+struct rtable { struct dst_entry dst; unsigned rt_type, rt_gw_family; __be32 rt_gw4; };
+#define RTN_UNICAST 1
+#define dst_xfrm(d) ((d)->xfrm)
+#define dst_rtable(d) ((struct rtable *)(d))
+static struct dst_entry *dst_check(struct dst_entry *d, unsigned cookie)
+{ assert(!cookie); return d->valid ? d : NULL; }
+static __be32 rt_nexthop(const struct rtable *r, __be32 address)
+{ return r->rt_gw_family == AF_INET ? r->rt_gw4 : address; }
 struct neigh_table { int unused; };
 static struct neigh_table arp_tbl;
 struct neighbour {
     struct neigh_table *tbl;
     struct net_device *dev;
     unsigned refs, nud_state;
+    __be32 primary_key;
     bool dead, lock;
     u8 ha[6];
 };
 struct notifier_block { int unused; };
-static struct neighbour neighbour;
+static struct neighbour neighbour, gateway, alternate_gateway;
 static void read_lock_bh(bool *lock) { assert(!*lock); *lock = true; }
 static void read_unlock_bh(bool *lock) { assert(*lock); *lock = false; }
 #define spin_lock read_lock_bh
@@ -149,6 +165,7 @@ GETMATCH(tcp)
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
 struct flow_cls_offload {
     const struct nf_conn *nf_ct;
+    struct dst_entry *nf_dst;
     u16 nf_mtu;
     bool nf_counter;
     struct { unsigned chain_index, protocol; } common;
@@ -206,11 +223,17 @@ static bool ft_physical(struct net_device *d) { return d && physical_ok; }
 static struct neighbour *neigh_lookup(struct neigh_table *table, const __be32 *dst, struct net_device *dev)
 {
     neigh_lookups++;
-    if (change_neigh_on_lookup && neigh_lookups == 2) neighbour.ha[5]++;
     if (!neigh_ok) return NULL;
     assert(table == &arp_tbl);
-    neighbour.dev = dev; neighbour.refs++;
-    return &neighbour;
+    struct neighbour *all[] = {&neighbour, &gateway, &alternate_gateway};
+    for (unsigned i = 0; i < ARRAY_SIZE(all); i++) {
+        struct neighbour *n = all[i];
+        if (n->primary_key != *dst || n->dev != dev) continue;
+        if (change_neigh_on_lookup && neigh_lookups == 2) n->ha[5]++;
+        n->refs++;
+        return n;
+    }
+    return NULL;
 }
 static void neigh_release(struct neighbour *n) { assert(n->refs); n->refs--; }
 static int neigh_event_send(struct neighbour *n, void *skb)
@@ -266,6 +289,9 @@ static void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 static struct net_device in = { .ifindex = 5, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1} };
 static struct net_device out = { .ifindex = 6, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2} };
 static struct cdx_ft_binding binding = { .dev = &in };
+static struct dst_ops ipv4_ops = { .family = AF_INET };
+static struct rtable route;
+static __be32 next_hop;
 static struct nf_conn ct;
 static struct flow_dissector dissector;
 static struct flow_rule rule;
@@ -278,9 +304,15 @@ static struct ports pk, pm;
 static struct tcp tk, tm;
 static void fixture(void)
 {
-    assert(!neighbour.refs && !ft_neighbour_refs && ft_neigh_entries.next == &ft_neigh_entries);
+    assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && ft_neigh_entries.next == &ft_neigh_entries);
     neighbour = (struct neighbour){ .tbl = &arp_tbl, .nud_state = NUD_PERMANENT,
-                                  .ha = {2,0x11,0x22,0x33,0x44,0x55} };
+                                  .ha = {2,0x11,0x22,0x33,0x44,0x55}, .dev = &out,
+                                  .primary_key = htonl(0xc6336402) };
+    gateway = alternate_gateway = neighbour;
+    gateway.primary_key = htonl(0xc6336401);
+    alternate_gateway.primary_key = htonl(0xc6336403);
+    route = (struct rtable){ .dst = { .ops = &ipv4_ops, .dev = &out, .valid = true },
+                             .rt_type = RTN_UNICAST };
     neigh_lookups = 0;
     ct = (struct nf_conn){ .net = &init_net, .protonum = IPPROTO_UDP };
     dissector.used_keys = 31;
@@ -308,7 +340,7 @@ static void fixture(void)
     }
     rule.action.entries[4].id = FLOW_ACTION_REDIRECT;
     rule.action.entries[4].dev = &out;
-    cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_mtu = 1492,
+    cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1492,
         .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
 }
@@ -321,7 +353,7 @@ static void tcp_fixture(void)
     tk.flags = 0; tm.flags = htons(5);
     rule.tcp = (struct flow_match_tcp){ &tk, &tm };
 }
-#define REJECT(change) do { fixture(); change; assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP); } while (0)
+#define REJECT(change) do { fixture(); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
 
 /* Model Netfilter's callback-list commit/free after the driver returns. In
  * particular, release must not run while ft_bind holds the control mutex. */
@@ -447,6 +479,57 @@ static void test_rearm(void)
     }
 }
 
+static void test_gateways(void)
+{
+    struct cdx_ft_rule decoded;
+    REJECT(cls.nf_dst = NULL);
+    struct dst_ops ipv6_ops = {.family = AF_INET6};
+    REJECT(route.dst.ops = &ipv6_ops);
+    REJECT(route.dst.dev = &in);
+    REJECT(route.dst.valid = false);
+    REJECT(route.dst.xfrm = &route);
+    REJECT(route.dst.lwtstate = &route);
+    REJECT(route.rt_type = 2); /* Local route, not forwarded unicast. */
+    REJECT(route.rt_gw_family = AF_INET6);
+    REJECT(route.rt_gw_family = AF_INET; route.rt_gw4 = 0);
+    REJECT(route.rt_gw_family = AF_INET; route.rt_gw4 = htonl(0xe0000001));
+    REJECT(route.rt_gw_family = AF_INET; route.rt_gw4 = htonl(0x7f000001));
+    REJECT(route.rt_gw_family = AF_INET; route.rt_gw4 = 0xffffffff);
+    for (unsigned cycle = 0; cycle < 32; cycle++) {
+        if (cycle & 1) tcp_fixture(); else fixture();
+        route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(decoded.dst == ik.dst && next_hop != decoded.dst);
+        assert(next_hop == gateway.primary_key && !gateway.refs && !neighbour.refs);
+        assert(ft_replace(&binding, &cls) == 0);
+        struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+        assert(e->next_hop == gateway.primary_key && e->neigh == &gateway);
+        assert(gateway.refs == 1 && !neighbour.refs);
+        neighbour.nud_state = NUD_FAILED; /* Remote endpoint is not the dependency. */
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+        assert(!ft_invalid && ft_count == 1);
+        u64 installs = ft_installs;
+        assert(ft_replace(&binding, &cls) == 0 && ft_installs == installs);
+        /* Even an identical Ethernet rewrite must move its watch when the
+         * selected gateway changes. Never deduplicate by the HW rule alone. */
+        route.rt_gw4 = alternate_gateway.primary_key;
+        assert(ft_replace(&binding, &cls) == 0 && ft_installs == installs + 1);
+        e = ft_find(&binding, cls.cookie);
+        assert(e->neigh == &alternate_gateway && !gateway.refs && alternate_gateway.refs == 1);
+        gateway.dead = true;
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
+        assert(!ft_invalid);
+        alternate_gateway.ha[5]++;
+        ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &alternate_gateway);
+        assert(ft_invalid && ft_remove(e) == 0);
+        ft_invalid = 0;
+    }
+    fixture(); route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+    gateway.nud_state = NUD_FAILED;
+    assert(ft_replace(&binding, &cls) == -EOPNOTSUPP && !ft_count);
+    assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs);
+}
+
 static void test_neighbours(void)
 {
     const unsigned valid[] = {NUD_PERMANENT, NUD_REACHABLE, NUD_STALE, NUD_DELAY, NUD_PROBE};
@@ -482,7 +565,7 @@ static void test_neighbours(void)
     }
     for (unsigned i = 0; i < ARRAY_SIZE(invalid); i++) {
         fixture(); neighbour.nud_state = invalid[i];
-        assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP && !neighbour.refs);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP && !neighbour.refs);
         neighbour.nud_state = NUD_REACHABLE;
         assert(ft_replace(&binding, &cls) == 0);
         struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
@@ -495,14 +578,14 @@ static void test_neighbours(void)
         assert(ft_remove(e) == 0); ft_invalid = 0;
     }
     fixture(); neighbour.dead = true;
-    assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP && !neighbour.refs);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP && !neighbour.refs);
     fixture(); change_neigh_on_lookup = true; /* Decoder/publication race. */
     assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
-    assert(!neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
+    assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
     change_neigh_on_lookup = false;
     fixture(); change_neigh_on_add = true; /* Watch precedes hardware insertion. */
     assert(ft_replace(&binding, &cls) == -EIO && ft_invalid);
-    assert(!neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
+    assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
     change_neigh_on_add = false; ft_invalid = 0;
     fixture(); assert(ft_replace(&binding, &cls) == 0);
     struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
@@ -524,7 +607,7 @@ int main(void)
 {
     struct cdx_ft_rule decoded;
     fixture();
-    assert(ft_parse(&binding, &cls, &decoded) == 0);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.src == ik.src && decoded.dst == ik.dst && decoded.sport == htons(10000));
     assert(decoded.mtu == 1492 && decoded.in == &in && decoded.out == &out);
     assert(!memcmp(decoded.dst_mac, (u8[]){2,0x11,0x22,0x33,0x44,0x55}, 6));
@@ -544,11 +627,11 @@ int main(void)
     REJECT(rule.action.entries[4].dev = &in); REJECT(neigh_ok = false); REJECT(physical_ok = false);
     REJECT(dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_TCP));
     REJECT(bk.ip_proto = ct.protonum = IPPROTO_ICMP);
-    fixture(); assert(ft_parse(&binding, &cls, &decoded) == 0);
+    fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     struct cdx_ft_rule udp = decoded;
-    tcp_fixture(); assert(ft_parse(&binding, &cls, &decoded) == 0 && decoded.proto == IPPROTO_TCP);
+    tcp_fixture(); assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.proto == IPPROTO_TCP);
     assert(!ft_same_key(&udp, &decoded));
-#define TCP_REJECT(change) do { tcp_fixture(); change; assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP); } while (0)
+#define TCP_REJECT(change) do { tcp_fixture(); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
     TCP_REJECT(ct.protonum = IPPROTO_UDP);
     TCP_REJECT(ct.tcp_state = 2); TCP_REJECT(ct.tcp_state = 4); TCP_REJECT(ct.status = 0);
     TCP_REJECT(dissector.used_keys &= ~BIT(FLOW_DISSECTOR_KEY_TCP));
@@ -601,6 +684,7 @@ int main(void)
     list_del(&binding.list);
     assert(ft_installs == ft_deletes);
     test_rearm();
+    test_gateways();
     test_neighbours();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, neighbours, invalidation, rearm and fatal retry passed");
 }

@@ -6,6 +6,7 @@ the connection is alive.
 """
 import hashlib
 import json
+import os
 import socket
 import struct
 import time
@@ -22,8 +23,22 @@ def retransmits(sock):
     return struct.unpack_from("=I", info, 100)[0]
 
 
+def peer_socket():
+    # A socket retains the namespace where it was created. Return the process
+    # to loki's namespace so gateway ARP controls remain available over the
+    # same tested TCP connection, even when the endpoint sits behind loki.
+    if PEER_NETNS is None:
+        return socket.socket()
+    with open('/proc/self/ns/net', 'rb') as original, open('/var/run/netns/' + PEER_NETNS, 'rb') as peer:
+        os.setns(peer.fileno(), os.CLONE_NEWNET)
+        try:
+            return socket.socket()
+        finally:
+            os.setns(original.fileno(), os.CLONE_NEWNET)
+
+
 def main():
-    with socket.socket() as sock:
+    with peer_socket() as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(30)
@@ -39,7 +54,8 @@ def main():
                 op = command["op"]
                 if op == "neighbour":
                     changes = {key: value for key, value in command.items() if key != "op"}
-                    report = configure_neighbour(address=LAN_IP, **changes)
+                    changes.setdefault("address", LAN_IP)
+                    report = configure_neighbour(**changes)
                     sock.sendall(json.dumps(report).encode() + b"\n")
                     continue
                 if op == "fin":

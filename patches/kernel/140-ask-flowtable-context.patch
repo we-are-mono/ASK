@@ -1,4 +1,4 @@
-From 73919d8b90010e60141f20d1a082fe56bee85760 Mon Sep 17 00:00:00 2001
+From 81e12893790c9f08605aaf5a1f9148f0a53819dd Mon Sep 17 00:00:00 2001
 From: ASK maintainers <ask@localhost>
 Date: Mon, 14 Sep 2026 23:03:32 +0200
 Subject: [PATCH] netfilter: provide hardware context and neighbour-aware
@@ -18,27 +18,29 @@ both IPv4 and IPv6. The request is monotonic and survives device unbinding.
 The default remains unchanged. This is a downstream kernel-internal
 interface; no userspace ABI changes.
 ---
- include/net/flow_offload.h            |  6 ++++++
+ include/net/flow_offload.h            |  8 ++++++++
  include/net/netfilter/nf_flow_table.h |  3 +++
  net/netfilter/nf_flow_table_core.c    |  1 +
  net/netfilter/nf_flow_table_ip.c      | 14 +++++++++++---
- net/netfilter/nf_flow_table_offload.c |  6 +++++-
+ net/netfilter/nf_flow_table_offload.c | 16 +++++++++++++++-
  net/netfilter/nft_flow_offload.c      |  1 +
- 6 files changed, 27 insertions(+), 4 deletions(-)
+ 6 files changed, 39 insertions(+), 4 deletions(-)
 
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f..6ea989c 100644
+index 292cd8f..e22fcfe 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,13 @@ struct flow_cls_common_offload {
+@@ -688,7 +688,15 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
 +/* Netfilter context is borrowed for the duration of a callback. It is NULL
-+ * for other producers. Drivers must not retain the conntrack pointer. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 2
++ * for other producers. Drivers must not retain either pointer. nf_dst is the selected
++ * routed NEIGH destination; other transmit types provide NULL. */
++#define FLOW_CLS_HAS_NF_CONTEXT 3
  struct flow_cls_offload {
 +	const struct nf_conn *nf_ct;
++	struct dst_entry *nf_dst;
 +	u16 nf_mtu;
 +	bool nf_counter;
  	struct flow_cls_common_offload common;
@@ -111,16 +113,33 @@ index 98edcaa..632a92b 100644
  		return 0;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f5..cfb0169 100644
+index 4f346f5..a79b703 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -904,7 +904,11 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -896,6 +896,15 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
+ 	cls_flow->cookie = (unsigned long)tuple;
+ }
+ 
++/* DIRECT and TC share this union with non-pointer data. XFRM destinations
++ * are deliberately excluded from the routed-neighbour adapter contract. */
++static struct dst_entry *nf_flow_offload_dst(const struct flow_offload_tuple *tuple)
++{
++	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH)
++		return NULL;
++	return tuple->dst_cache;
++}
++
+ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+ 				 struct flow_offload *flow,
+ 				 struct nf_flow_rule *flow_rule,
+@@ -904,7 +913,12 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
 -	struct flow_cls_offload cls_flow = {};
 +	struct flow_cls_offload cls_flow = {
 +		.nf_ct = flow->ct,
++		.nf_dst = nf_flow_offload_dst(&flow->tuplehash[dir].tuple),
 +		.nf_mtu = flow->tuplehash[dir].tuple.mtu,
 +		.nf_counter = !!(READ_ONCE(flowtable->flags) & NF_FLOWTABLE_COUNTER),
 +	};

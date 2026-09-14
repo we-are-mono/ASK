@@ -21,6 +21,7 @@
 #include <net/fib_notifier.h>
 #include <net/flow_offload.h>
 #include <net/netevent.h>
+#include <net/route.h>
 #include <net/tcp.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_l4proto.h>
@@ -33,7 +34,7 @@
 #include "cdx_flowtable_hw.h"
 #include "devman.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 2
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 3
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
 
@@ -61,6 +62,7 @@ struct cdx_ft_entry {
 	struct list_head list;
 	struct list_head neigh_list;
 	struct neighbour *neigh;
+	__be32 next_hop;
 	struct cdx_ft_binding *binding;
 	unsigned long cookie;
 	struct cdx_ft_rule rule;
@@ -205,12 +207,34 @@ static bool ft_neigh_check(struct net_device *dev, __be32 dst, const u8 *mac)
 	return valid;
 }
 
+/* Borrow the route selected by Netfilter, not a second FIB lookup which could
+ * lose its policy/ingress context. Patch 140 supplies only retained NEIGH dsts.
+ * No route pointer escapes the callback. IPv6 gateways and transformed routes
+ * need separate contracts even when the matched packet itself is IPv4. */
+static bool ft_next_hop(const struct flow_cls_offload *cls,
+			struct net_device *dev, __be32 daddr, __be32 *next_hop)
+{
+	struct dst_entry *dst = cls->nf_dst;
+	const struct rtable *rt;
+
+	if (!dst || dst->ops->family != AF_INET || dst->dev != dev ||
+	    dst_xfrm(dst) || dst->lwtstate || !dst_check(dst, 0))
+		return false;
+	rt = dst_rtable(dst);
+	if (rt->rt_type != RTN_UNICAST ||
+	    (rt->rt_gw_family && rt->rt_gw_family != AF_INET))
+		return false;
+	*next_hop = rt_nexthop(rt, daddr);
+	return !ipv4_is_multicast(*next_hop) && !ipv4_is_zeronet(*next_hop) &&
+		!ipv4_is_loopback(*next_hop) && !ipv4_is_lbcast(*next_hop);
+}
+
 static int ft_neigh_attach(struct cdx_ft_entry *entry)
 {
 	struct neighbour *neigh;
 	bool valid;
 
-	neigh = neigh_lookup(&arp_tbl, &entry->rule.dst, entry->rule.out);
+	neigh = neigh_lookup(&arp_tbl, &entry->next_hop, entry->rule.out);
 	if (!neigh)
 		return -EOPNOTSUPP;
 	/* Recheck at watch publication: the mapping may have changed after the
@@ -272,7 +296,8 @@ static bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
  * nf_flowtable supplies the routing semantics (including TTL decrement); its
  * Ethernet rewrites are four native-endian mangle words and a final redirect. */
 static int ft_parse(struct cdx_ft_binding *binding,
-		    const struct flow_cls_offload *cls, struct cdx_ft_rule *out)
+		    const struct flow_cls_offload *cls, struct cdx_ft_rule *out,
+		    __be32 *next_hop)
 {
 	const unsigned long keys = BIT(FLOW_DISSECTOR_KEY_META) |
 		BIT(FLOW_DISSECTOR_KEY_CONTROL) | BIT(FLOW_DISSECTOR_KEY_BASIC) |
@@ -358,7 +383,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    !ft_physical(binding->dev) || action->dev == binding->dev ||
 	    !is_valid_ether_addr(ethernet) ||
 	    !ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr) ||
-	    !ft_neigh_check(action->dev, ipv4.key->dst, ethernet) ||
+	    !ft_next_hop(cls, action->dev, ipv4.key->dst, next_hop) ||
+	    !ft_neigh_check(action->dev, *next_hop, ethernet) ||
 	    cls->nf_mtu > action->dev->mtu || cls->nf_mtu < 68)
 		return -EOPNOTSUPP;
 	memset(out, 0, sizeof(*out));
@@ -385,9 +411,10 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 {
 	struct cdx_ft_entry *entry = ft_find(binding, cls->cookie), *other;
 	struct cdx_ft_rule rule;
+	__be32 next_hop;
 	int rc;
 
-	rc = ft_parse(binding, cls, &rule);
+	rc = ft_parse(binding, cls, &rule, &next_hop);
 	if (!rc)
 		ft_validated++;
 	if (rc || ft_observe || atomic_read(&ft_invalid) || ft_stopping || ft_fatal) {
@@ -396,7 +423,8 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		return rc ? rc : -EOPNOTSUPP;
 	}
 	if (entry) {
-		if (!memcmp(&entry->rule, &rule, sizeof(rule)))
+		if (entry->next_hop == next_hop &&
+		    !memcmp(&entry->rule, &rule, sizeof(rule)))
 			return 0;
 		rc = ft_remove(entry);
 		if (rc)
@@ -413,6 +441,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	if (!entry)
 		return -ENOMEM;
 	entry->rule = rule;
+	entry->next_hop = next_hop;
 	entry->binding = binding;
 	entry->cookie = cls->cookie;
 	dev_hold(rule.out);
@@ -759,11 +788,11 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   ft_can_rearm(), ft_rearms, ft_neighbour_refs);
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_hw_stats(entry->hw, &stats);
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u packets=%llu bytes=%llu lastused=%u\n",
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 			   &entry->rule.src, ntohs(entry->rule.sport),
 			   &entry->rule.dst, ntohs(entry->rule.dport), entry->rule.proto, entry->rule.mtu,
-			   stats.packets, stats.bytes, stats.lastused);
+			   &entry->next_hop, stats.packets, stats.bytes, stats.lastused);
 	}
 	mutex_unlock(&cdx_info->ctrl.mutex);
 	return 0;

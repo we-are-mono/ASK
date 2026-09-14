@@ -22,16 +22,21 @@ PEER = Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
 
 
 async def lan_neighbour(r, **changes):
-    script = PEER + f"\nimport json\nprint(json.dumps(configure_neighbour({LAN_NIC!r}, {r.lan_ip!r}, **{changes!r})))\n"
+    address = getattr(r, "arp_address", r.lan_ip)
+    script = PEER + f"\nimport json\nprint(json.dumps(configure_neighbour({LAN_NIC!r}, {address!r}, **{changes!r})))\n"
     result = await lan_run_python(r.lan, script, label="flowtable_arp_config", timeout=20)
     assert result.rc == 0, result.stdout
     return json.loads(result.stdout.strip())
 
 
+def neighbour_targets(r):
+    return getattr(r, "arp_neighbours", [(r.lan_ip, TARGET_LAN_IF), (WAN_IP, TARGET_WAN_IF)])
+
+
 async def neighbours(r):
     result = await command(r.target, r.session, "ip", "-j", "-s", "neigh", "show")
     return {n["dst"]: n for n in json.loads(result["stdout"])
-            if n["dst"] in {r.lan_ip, WAN_IP}}
+            if n["dst"] in {ip for ip, _ in neighbour_targets(r)}}
 
 
 async def wait_neighbour(r, predicate, timeout=8):
@@ -114,7 +119,7 @@ print(json.dumps({{'pid': proc.pid}}))
                 old = (await read(r.target, r.session, "/proc/sys/" + key.replace(".", "/"))).strip()
                 await command(r.target, r.session, "sysctl", "-w", f"{key}={value}")
                 saved.append((key, old))
-        for ip, dev in [(r.lan_ip, TARGET_LAN_IF), (WAN_IP, TARGET_WAN_IF)]:
+        for ip, dev in neighbour_targets(r):
             await command(r.target, r.session, "ip", "neigh", "del", ip, "dev", dev)
         yield
     finally:
@@ -150,21 +155,23 @@ pcap.unlink(); log.unlink()
 
 def check_arp_trace(r, original_mac, failure_start, failure_end):
     from scapy.all import ARP, Ether, rdpcap
-    packets = rdpcap(str(ARTIFACTS / f"arp-{r.proto}.pcap"))
+    tag = getattr(r, "arp_tag", r.proto)
+    packets = rdpcap(str(ARTIFACTS / f"arp-{tag}.pcap"))
+    addresses = {ip for ip, dev in neighbour_targets(r) if dev == TARGET_LAN_IF}
     probes = [p for p in packets if ARP in p and p[ARP].op == 1 and
-              p[ARP].psrc == r.lan_gateway and p[ARP].pdst == r.lan_ip]
+              p[ARP].psrc == r.lan_gateway and p[ARP].pdst in addresses]
     healthy = [p for p in probes if p[Ether].dst == original_mac]
     assert len(healthy) >= 2, "no repeated unicast ARP probes during hardware use"
     answered = [probe for probe in healthy if any(
         ARP in reply and reply[ARP].op == 2 and reply[ARP].hwsrc == original_mac and
-        reply[ARP].psrc == r.lan_ip and reply[ARP].hwdst == r.dut_lan_mac and
+        reply[ARP].psrc == probe[ARP].pdst and reply[ARP].hwdst == r.dut_lan_mac and
         0 <= float(reply.time - probe.time) <= 1 for reply in packets)]
     assert len(answered) >= 2, "no repeated successful ARP probes during hardware use"
     failed = [p for p in probes if failure_start <= float(p.time) < failure_end]
     assert len(failed) >= 3, "failure did not exhaust ordinary ARP probes"
-    assert not any(ARP in p and p[ARP].op == 2 and p[ARP].psrc == r.lan_ip and
+    assert not any(ARP in p and p[ARP].op == 2 and p[ARP].psrc in addresses and
                    failure_start <= float(p.time) < failure_end for p in packets), "ARP replied during fault"
-    r.record(f"arp-{r.proto}-proof", {"healthy_unicast_probes": len(healthy),
+    r.record(f"arp-{tag}-proof", {"healthy_unicast_probes": len(healthy),
                                      "answered_unicast_probes": len(answered),
                                      "unanswered_failure_probes": len(failed),
                                      "failure_start": failure_start, "failure_end": failure_end})
