@@ -19,7 +19,7 @@ typedef uint64_t u64;
 #define CONNTRACK_ORIG 1
 #define GFP_KERNEL 0
 #define EN_EHASH_DELETE_UNSYNCED -2
-#define HASH_CT(s,d,sp,dp,proto) 123
+#define HASH_CT(s,d,sp,dp,proto) ((proto) * 13)
 #define ether_addr_copy(a,b) memcpy(a,b,6)
 #define lockdep_assert_held(m) assert(*(m))
 #define pr_err(...) ((void)0)
@@ -60,11 +60,13 @@ static struct { struct { bool mutex; } ctrl; } instance = {{true}}, *cdx_info = 
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
 static int delete_result;
+static unsigned expected_proto = IPPROTO_UDP;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
 static int insert_entry_in_classif_table(PCtEntry ct)
 {
-    assert(ct->fftype == FFTYPE_IPV4 && ct->proto == IPPROTO_UDP);
+    assert(ct->fftype == FFTYPE_IPV4 && ct->proto == expected_proto);
+    assert(ct->hash == expected_proto * 13 && ct->twin->proto == expected_proto);
     assert(ct->Saddr_v4 == htonl(0xc0000201) && ct->Daddr_v4 == htonl(0xc6336401));
     assert(ct->Sport == htons(1234) && ct->Dport == htons(5678));
     assert(ct->twin_Saddr == ct->Daddr_v4 && ct->twin_Daddr == ct->Saddr_v4);
@@ -99,13 +101,15 @@ int main(void)
 {
     struct net_device in = {"in"}, out = {"out"};
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
-        .sport=htons(1234), .dport=htons(5678), .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+        .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
     struct cdx_ft_hw *hw;
     struct cdx_ft_counters counters;
     fail_alloc = true; assert(cdx_ft_hw_add(&rule,&hw) == -ENOMEM && !hw); fail_alloc=false;
     fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
     out_itf.type = 2; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP); out_itf.type=129;
+    rule.proto = IPPROTO_ICMP; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP && !hw);
     for(unsigned i=0; i<128; i++) {
+        rule.proto = expected_proto = (i & 1) ? IPPROTO_TCP : IPPROTO_UDP;
         assert(cdx_ft_hw_add(&rule,&hw) == 0);
         cdx_ft_hw_stats(hw,&counters); assert(counters.packets==99 && counters.bytes==12345 && counters.lastused==321);
         /* No allocation is possible once deletion starts. */

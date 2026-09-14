@@ -30,6 +30,10 @@ typedef uint64_t u64;
 #define IP_CT_DIR_ORIGINAL 0
 #define IP_CT_DIR_REPLY 1
 #define IPS_NAT_MASK 0x30
+#define IPS_ASSURED 4
+#define TCPHDR_FIN 1
+#define TCPHDR_RST 4
+#define TCP_CONNTRACK_ESTABLISHED 3
 #define cmpxchg(p, old, new) ({ typeof(*(p)) v = *(p); if (v == (old)) *(p) = (new); v; })
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
@@ -66,7 +70,10 @@ struct net { int id; };
 static struct net init_net;
 struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; };
 struct nf_flowtable { struct { int nelems; } rhashtable; };
-struct nf_conn { struct net *net; unsigned zone[2], mark, status; };
+struct nf_conn { struct net *net; unsigned zone[2], mark, status, protonum, tcp_state; };
+#define nf_ct_protonum(c) ((c)->protonum)
+static bool nf_conntrack_tcp_established(const struct nf_conn *c)
+{ return c->tcp_state == TCP_CONNTRACK_ESTABLISHED && (c->status & IPS_ASSURED); }
 #define nf_ct_net(c) ((c)->net)
 #define nf_ct_zone(c) ((c)->zone)
 #define nf_ct_zone_id(z, dir) ((z)[dir])
@@ -80,15 +87,17 @@ static bool is_valid_ether_addr(const u8 *a)
 #define ipv4_is_loopback(a) ((ntohl(a) & 0xff000000) == 0x7f000000)
 #define ipv4_is_lbcast(a) ((a) == htonl(0xffffffff))
 enum { FLOW_DISSECTOR_KEY_META, FLOW_DISSECTOR_KEY_CONTROL, FLOW_DISSECTOR_KEY_BASIC,
-       FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_PORTS };
+       FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_PORTS, FLOW_DISSECTOR_KEY_TCP };
 struct flow_dissector { unsigned long used_keys; };
 struct meta { int ingress_ifindex; u16 ingress_iftype; u8 l2_miss; };
 struct control { u16 thoff, addr_type; u32 flags; };
 struct basic { __be16 n_proto; u8 ip_proto, padding; };
 struct ipv4_addrs { __be32 src, dst; };
 struct ports { __be16 src, dst; };
+struct tcp { __be16 flags; };
 #define MATCH(t) struct flow_match_##t { struct t *key, *mask; }
 MATCH(meta); MATCH(control); MATCH(basic); MATCH(ipv4_addrs); MATCH(ports);
+MATCH(tcp);
 enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
 struct flow_action_entry {
     unsigned id;
@@ -103,9 +112,11 @@ struct flow_rule {
     struct flow_match_basic basic;
     struct flow_match_ipv4_addrs ipv4_addrs;
     struct flow_match_ports ports;
+    struct flow_match_tcp tcp;
 };
 #define GETMATCH(t) static void flow_rule_match_##t(struct flow_rule *r, struct flow_match_##t *m) { *m = r->t; }
 GETMATCH(meta) GETMATCH(control) GETMATCH(basic) GETMATCH(ipv4_addrs) GETMATCH(ports)
+GETMATCH(tcp)
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
 struct flow_cls_offload {
     const struct nf_conn *nf_ct;
@@ -209,9 +220,10 @@ static struct control ck, cm;
 static struct basic bk, bm;
 static struct ipv4_addrs ik, im;
 static struct ports pk, pm;
+static struct tcp tk, tm;
 static void fixture(void)
 {
-    ct = (struct nf_conn){ .net = &init_net };
+    ct = (struct nf_conn){ .net = &init_net, .protonum = IPPROTO_UDP };
     dissector.used_keys = 31;
     mk = (struct meta){ .ingress_ifindex = 5 }; mm = (struct meta){ .ingress_ifindex = -1 };
     ck = (struct control){ .addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS };
@@ -240,6 +252,15 @@ static void fixture(void)
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_mtu = 1492,
         .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
+}
+static void tcp_fixture(void)
+{
+    fixture();
+    ct.protonum = bk.ip_proto = IPPROTO_TCP;
+    ct.tcp_state = TCP_CONNTRACK_ESTABLISHED; ct.status = IPS_ASSURED;
+    dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_TCP);
+    tk.flags = 0; tm.flags = htons(5);
+    rule.tcp = (struct flow_match_tcp){ &tk, &tm };
 }
 #define REJECT(change) do { fixture(); change; assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP); } while (0)
 
@@ -381,8 +402,22 @@ int main(void)
     REJECT(rule.action.num_entries = 4); REJECT(rule.action.entries[0].mangle.offset = 0);
     REJECT(rule.action.entries[0].mangle.val |= 1); REJECT(rule.action.entries[0].mangle.mask = 0);
     REJECT(rule.action.entries[4].dev = &in); REJECT(neigh_ok = false); REJECT(physical_ok = false);
+    REJECT(dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_TCP));
+    REJECT(bk.ip_proto = ct.protonum = IPPROTO_ICMP);
+    fixture(); assert(ft_parse(&binding, &cls, &decoded) == 0);
+    struct cdx_ft_rule udp = decoded;
+    tcp_fixture(); assert(ft_parse(&binding, &cls, &decoded) == 0 && decoded.proto == IPPROTO_TCP);
+    assert(!ft_same_key(&udp, &decoded));
+#define TCP_REJECT(change) do { tcp_fixture(); change; assert(ft_parse(&binding, &cls, &decoded) == -EOPNOTSUPP); } while (0)
+    TCP_REJECT(ct.protonum = IPPROTO_UDP);
+    TCP_REJECT(ct.tcp_state = 2); TCP_REJECT(ct.tcp_state = 4); TCP_REJECT(ct.status = 0);
+    TCP_REJECT(dissector.used_keys &= ~BIT(FLOW_DISSECTOR_KEY_TCP));
+    TCP_REJECT(tk.flags = htons(1)); TCP_REJECT(tm.flags = 0);
+    TCP_REJECT(tm.flags = htons(1)); TCP_REJECT(tm.flags = htons(4));
+    TCP_REJECT(tm.flags = htons(7)); TCP_REJECT(tm.flags = htons(0x15));
     for (unsigned cycle = 0; cycle < 128; cycle++) {
-        fixture(); assert(ft_replace(&binding, &cls) == 0);
+        if (cycle & 1) tcp_fixture(); else fixture();
+        assert(ft_replace(&binding, &cls) == 0);
         assert(ft_count == 1 && allocated == 1 && live_hw == 1 && out.refs == 1);
         assert(ft_replace(&binding, &cls) == 0); /* exact duplicate is idempotent */
         cls.cookie++; assert(ft_replace(&binding, &cls) == -EEXIST); cls.cookie--;

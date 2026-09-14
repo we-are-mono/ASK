@@ -16,6 +16,7 @@ struct cdx_ft_rule {
 	struct net_device *out;
 	__be32 src, dst;
 	__be16 sport, dport;
+	u8 proto;
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];
 	u16 mtu;

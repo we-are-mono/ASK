@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Linux flowtable adapter, initially limited to two IPv4/UDP directions.
+/* Linux flowtable adapter, limited to two IPv4 TCP or UDP directions.
  *
  * Hardware operations and lists: cdx_info->ctrl.mutex. Rule callbacks are
  * process-context NF workqueue callbacks. Binding release runs after the
@@ -19,7 +19,9 @@
 #include <net/fib_notifier.h>
 #include <net/flow_offload.h>
 #include <net/netevent.h>
+#include <net/tcp.h>
 #include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
 #include "portdefs.h"
@@ -188,6 +190,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	struct flow_match_basic basic;
 	struct flow_match_ipv4_addrs ipv4;
 	struct flow_match_ports ports;
+	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
 	static const u32 offsets[4] = { 4, 8, 0, 4 };
 	static const u32 masks[4] = { 0x0000ffff, 0, 0, 0xffff0000 };
@@ -202,7 +205,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    READ_ONCE(cls->nf_ct->mark) ||
 	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) ||
 	    cls->common.chain_index || cls->common.protocol != ETH_P_ALL ||
-	    rule->match.dissector->used_keys != keys)
+	    (rule->match.dissector->used_keys != keys &&
+	     rule->match.dissector->used_keys != (keys | BIT(FLOW_DISSECTOR_KEY_TCP))))
 		return -EOPNOTSUPP;
 	flow_rule_match_meta(rule, &meta);
 	flow_rule_match_control(rule, &control);
@@ -214,7 +218,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    control.mask->addr_type != 0xffff || control.mask->flags ||
 	    control.mask->thoff || control.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
 	    basic.mask->n_proto != htons(0xffff) || basic.mask->ip_proto != 0xff ||
-	    basic.key->n_proto != htons(ETH_P_IP) || basic.key->ip_proto != IPPROTO_UDP ||
+	    basic.key->n_proto != htons(ETH_P_IP) ||
+	    basic.key->ip_proto != nf_ct_protonum(cls->nf_ct) ||
 	    ipv4.mask->src != htonl(0xffffffff) || ipv4.mask->dst != htonl(0xffffffff) ||
 	    ports.mask->src != htons(0xffff) || ports.mask->dst != htons(0xffff) ||
 	    !ports.key->src || !ports.key->dst ||
@@ -224,6 +229,26 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    ipv4_is_lbcast(ipv4.key->src) || ipv4_is_lbcast(ipv4.key->dst) ||
 	    rule->action.num_entries != 5)
 		return -EOPNOTSUPP;
+	switch (basic.key->ip_proto) {
+	case IPPROTO_TCP:
+		if (rule->match.dissector->used_keys !=
+		    (keys | BIT(FLOW_DISSECTOR_KEY_TCP)) ||
+		    !nf_conntrack_tcp_established(cls->nf_ct))
+			return -EOPNOTSUPP;
+		flow_rule_match_tcp(rule, &tcp);
+		/* cdx_sp.xml punts SYN/FIN/RST before TCP hash lookup. Accept
+		 * precisely Netfilter's FIN/RST exclusion; never discard an
+		 * additional selector which that parser cannot enforce. */
+		if (tcp.key->flags || tcp.mask->flags != htons(TCPHDR_FIN | TCPHDR_RST))
+			return -EOPNOTSUPP;
+		break;
+	case IPPROTO_UDP:
+		if (rule->match.dissector->used_keys != keys)
+			return -EOPNOTSUPP;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
 	for (i = 0; i < 4; i++) {
 		action = &rule->action.entries[i];
 		if (action->id != FLOW_ACTION_MANGLE ||
@@ -250,6 +275,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	out->dst = ipv4.key->dst;
 	out->sport = ports.key->src;
 	out->dport = ports.key->dst;
+	out->proto = basic.key->ip_proto;
 	out->mtu = cls->nf_mtu;
 	ether_addr_copy(out->dst_mac, ethernet);
 	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
@@ -259,7 +285,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 static bool ft_same_key(const struct cdx_ft_rule *a, const struct cdx_ft_rule *b)
 {
 	return a->in == b->in && a->src == b->src && a->dst == b->dst &&
-		a->sport == b->sport && a->dport == b->dport;
+		a->sport == b->sport && a->dport == b->dport && a->proto == b->proto;
 }
 
 static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *cls)
@@ -616,10 +642,10 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   ft_can_rearm(), ft_rearms);
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_hw_stats(entry->hw, &stats);
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u mtu=%u packets=%llu bytes=%llu lastused=%u\n",
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u packets=%llu bytes=%llu lastused=%u\n",
 			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 			   &entry->rule.src, ntohs(entry->rule.sport),
-			   &entry->rule.dst, ntohs(entry->rule.dport), entry->rule.mtu,
+			   &entry->rule.dst, ntohs(entry->rule.dport), entry->rule.proto, entry->rule.mtu,
 			   stats.packets, stats.bytes, stats.lastused);
 	}
 	mutex_unlock(&cdx_info->ctrl.mutex);

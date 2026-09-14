@@ -109,6 +109,8 @@ class Echo(asyncio.DatagramProtocol):
 
 
 class Rig:
+    proto = "udp"
+
     async def state(self):
         return status_text(await read(self.target, self.session, "/proc/cdx_flowtable"))
 
@@ -129,7 +131,7 @@ class Rig:
  flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }};
  {"flags offload;" if hardware else ""} {"counter;" if counter else ""} }}
  chain forward {{ type filter hook forward priority 0; policy accept;
- ip saddr {self.lan_ip} ip daddr {WAN_IP} udp sport {SPORT} udp dport {DPORT} flow add @fast
+ ip saddr {self.lan_ip} ip daddr {WAN_IP} {self.proto} sport {SPORT} {self.proto} dport {DPORT} flow add @fast
  }}
 }}''')
         if hardware:
@@ -140,7 +142,7 @@ class Rig:
         return await self.wait(lambda s: not s["bindings"] and not s["entries"])
 
     async def clear_ct(self):
-        await command(self.target, self.session, "conntrack", "-D", "-p", "udp",
+        await command(self.target, self.session, "conntrack", "-D", "-p", self.proto,
                       "--orig-src", self.lan_ip, "--orig-dst", WAN_IP,
                       "--sport", str(SPORT), "--dport", str(DPORT), check=False)
 
@@ -226,8 +228,10 @@ print(json.dumps({{'first': received[0], 'last': received[-1], 'count': len(rece
 
 
 @pytest_asyncio.fixture
-async def rig(target_agent, aiohttp_session, lan, splat_window):
+async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     r = Rig()
+    r.proto = getattr(request, "param", "udp")
+    assert r.proto in {"udp", "tcp"}
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     initial = await r.state()
@@ -282,16 +286,18 @@ async def rig(target_agent, aiohttp_session, lan, splat_window):
             assert not routes, ("fixture requires unused host routes", routes)
             await command(r.target, r.session, "ip", "route", "add", f"{ip}/32", "dev", dev, "mtu", "1200")
             cleanup.append((r.target, ["ip", "route", "del", f"{ip}/32", "dev", dev]))
-        nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", "udp", "--sport", str(SPORT), "--dport", str(DPORT), "-j", "ACCEPT"]
+        nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", r.proto, "--sport", str(SPORT), "--dport", str(DPORT), "-j", "ACCEPT"]
         await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
         cleanup.append((r.target, ["iptables", "-t", "nat", "-D", *nat]))
         await r.clear_ct()
         old_acct = (await read(r.target, r.session, "/proc/sys/net/netfilter/nf_conntrack_acct")).strip()
         await command(r.target, r.session, "sysctl", "-w", "net.netfilter.nf_conntrack_acct=1")
         cleanup.append((r.target, ["sysctl", "-w", f"net.netfilter.nf_conntrack_acct={old_acct}"]))
-        transport, r.echo = await asyncio.get_running_loop().create_datagram_endpoint(Echo, local_addr=(WAN_IP, DPORT))
+        if r.proto == "udp":
+            transport, r.echo = await asyncio.get_running_loop().create_datagram_endpoint(Echo, local_addr=(WAN_IP, DPORT))
         r.record("fixture", {"lan": r.lan_ip, "wan": WAN_IP, "sport": SPORT, "dport": DPORT,
                              "lan_mac": lan_mac, "wan_mac": wan_mac, "initial": initial,
+                             "protocol": r.proto,
                              "boot_id": await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")})
         yield r
     finally:
@@ -308,7 +314,7 @@ async def rig(target_agent, aiohttp_session, lan, splat_window):
         if hasattr(r, "lan_ip"):
             try:
                 if r.recovery_console:
-                    await console_command(r.recovery_console, "conntrack", "-D", "-p", "udp",
+                    await console_command(r.recovery_console, "conntrack", "-D", "-p", r.proto,
                                           "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
                                           "--sport", str(SPORT), "--dport", str(DPORT), check=False)
                 else:

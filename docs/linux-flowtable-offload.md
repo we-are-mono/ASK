@@ -1,7 +1,8 @@
 # Linux flowtable offload: design and first proof of concept
 
-Status: PoC implemented; controlled lifecycle demonstrated. Acceptance remains
-open pending investigation of intermittent UDP loss observed during development.
+Status: IPv4 UDP and TCP offload implemented; controlled lifecycle demonstrated.
+The earlier intermittent UDP loss remains unresolved and deferred; its scope and
+evidence are recorded separately below.
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
 This document records the direction, initial scope, and acceptance requirements.
 Concrete implementation contracts and the remaining acceptance work appear below.
@@ -310,7 +311,8 @@ counters, diagnostics, and test results needed to reproduce each acceptance run.
 After the first lifecycle is accepted, broaden dynamic route/neighbour/device
 behaviour and exception coverage. Exercise the same small feature on a second
 kernel version early to test whether the compatibility boundary is useful.
-Candidate expansions are TCP, IPv4 NAT, IPv6, additional interface types,
+After the TCP increment described below, candidate expansions are dynamic ARP,
+gateway next hops, selective invalidation, IPv4 NAT, IPv6, additional interface types,
 bridging, QoS, tunnels, and IPsec, each with separate eligibility and verification
 criteria. This is a suggested sequence, not a fixed roadmap or a claim that one
 Linux API covers every feature.
@@ -363,8 +365,12 @@ itself is currently implemented by the test initramfs, not a production installe
 `TC_SETUP_CLSFLOWER` requests. It accepts one flowtable, at most two initial-netns
 physical Ethernet ports, and at most two directional entries. Cookies are opaque
 and local to a binding. Unsupported selectors and actions fail before insertion.
-The admitted rule has exactly IPv4/UDP addresses and ports, an ingress ifindex,
-four Ethernet rewrite words, and a redirect. NAT, nondefault conntrack zones,
+The admitted rule has exact IPv4 TCP or UDP addresses and ports, an ingress
+ifindex, four Ethernet rewrite words, and a redirect. TCP additionally requires
+an assured, established Linux conntrack and the exact FIN/RST exclusion generated
+by Netfilter; the parser contract and teardown semantics are described below.
+The protocol participates in private hardware encoding and duplicate-key checks.
+NAT, nondefault conntrack zones,
 conntrack marks, unsupported devices, and other action lists are rejected. A
 permanent neighbour for the destination on the egress port must match the
 requested destination MAC. The current source MAC must equal the physical port's
@@ -501,9 +507,10 @@ with fault-injected kernel/firmware boundaries under ASan and UBSan; hardware
 acceptance uses the real classifier and endpoint traffic.
 
 `tools/tests/test_flowtable_offload.py` is explicitly gated by
-`ASK_FLOWTABLE_TESTS=1`. It supplies a selected-UDP NAT exemption, permanent DUT
+`ASK_FLOWTABLE_TESTS=1`. It supplies a selected-protocol NAT exemption, permanent DUT
 neighbours, a WAN host return route, and a numbered echo server, then restores
-the fixture. It uses the LAN UART and target/WAN agents without CMM helpers.
+the fixture. TCP tests reuse the topology with a TCP peer instead of the echo
+server. It uses the LAN UART and target/WAN agents without CMM helpers.
 Runs can set `ASK_FLOWTABLE_ARTIFACTS` to retain measurements and packet captures.
 The rearm test exercises three recovery cycles without rebooting. It changes the
 LAN endpoint's actual MAC and its permanent DUT neighbour while traffic runs,
@@ -796,3 +803,96 @@ the successful replacement terminal run. Separate manifests identify both
 boots. Excluded attempts and raw UART logs are retained in subdirectories.
 The DUT is restored to a clean boot of this image in experimental ownership;
 no return to CMM is needed between healthy recovery cycles.
+
+## TCP increment and validation (2026-09-14)
+
+This increment admits one IPv4 TCP connection using the same physical ports,
+direct host routes, permanent neighbours and two-direction limit. CMM remains
+absent. It adds no NAT, dynamic ARP or gateway resolution. The backend carries
+the protocol through both private tuple objects, hashing and classifier table
+selection; the existing TCP encoder provides the forwarding actions. UDP and
+TCP tuples with identical addresses and ports are distinct keys. Hardware
+ownership, retirement, quarantine and healthy rearm mechanisms are unchanged.
+
+Admission requires the rule protocol to match its borrowed conntrack context.
+TCP requires `nf_conntrack_tcp_established()` (ESTABLISHED plus ASSURED) and
+exactly Netfilter's TCP flags key zero with mask FIN|RST. Missing flags, extra
+selectors, different masks and unsupported protocols are declined before
+allocation. No TCP sequence/window tracker is added to CDX.
+
+This relies on a concrete parser contract: the `tcpschema` section of
+`dpa_app/files/etc/cdx_sp.xml` exits to the host when `tcp.flags & 7` is nonzero,
+before TCP hash lookup. SYN, FIN and RST therefore cannot bypass Linux through
+an installed TCP entry. The live soft-parser and PCD XML files were compared
+byte-for-byte with this repository. Any change to that parser or firmware
+requires revalidation of this contract; merely accepting a flags selector in
+the adapter would not establish hardware support.
+
+Linux's observable conntrack state during offloaded teardown is asynchronous:
+
+- A FIN punts and marks the flow for teardown immediately. The flowtable GC
+  queues hardware deletion separately. A final pure ACK can cross hardware
+  before deletion, leaving conntrack in LAST_ACK even though both endpoints
+  completed closure. The test requires both FINs at Linux's forward hook, the
+  final ACK in a WAN packet capture, prompt hardware removal, no OFFLOAD flag,
+  and eventual conntrack expiry.
+- After offloaded data, Linux's saved sequence/ACK state can be stale. The
+  RST handling in `nf_conntrack_proto_tcp.c` deliberately permits ESTABLISHED
+  to remain while allowing a possible RFC5961 challenge ACK, but applies the
+  short CLOSE timeout. The test requires the receiving socket to report reset,
+  RST at Linux's forward hook, prompt hardware removal, no OFFLOAD flag, a
+  bounded CLOSE timeout and eventual conntrack expiry. It does not require a
+  particular intermediate state label.
+
+These are Linux flowtable/conntrack semantics, not new CDX timeout policy.
+The two initial test runs stopped on overly strict TIME_WAIT and CLOSE label
+assertions respectively. Those runs are excluded from complete acceptance;
+the replacement assertions establish delivery, visibility and bounded cleanup.
+
+`tools/tests/test_flowtable_tcp.py` uses a TCP variant of the shared fixture.
+The staged `flowtable_tcp_peer.py` keeps a single LAN console operation alive
+while commands and payloads travel over the tested TCP connection. Each payload
+block is checked and the complete transfer is hashed. Test-only endpoint packet
+loss and sysctl changes are restored in cleanup. The FIN test temporarily uses
+a four-second flowtable timeout and ten-second LAST_ACK/TIME_WAIT timeouts;
+the latter leave time to inspect state after asynchronous retirement.
+
+The KASAN image was rebuilt and staged. Live kernel/CDX build notes and userspace
+hashes matched the built files; KASAN, lockdep and FAILSLAB remained enabled.
+There were no compiler warnings. The three BitBake warnings concerned previously
+forced recipe tasks. Only focused tests were run, not the full KASAN suite.
+
+| Identity | Value |
+| --- | --- |
+| Staged image SHA-256 | `d49400be27012f9498278f1b38380c330e88acf0b8647911bda240a34dd852fe` |
+| Kernel build ID | `c1a3c3ef605c24e3a3bda6dfc45f2c0a4e79d7d6` |
+| CDX build ID | `8dac0662d4e27299d067083fb017be7d8f8af907` |
+| Test boot | `346ef62e-bfc2-4242-8790-444373f1d214` |
+
+| Check | Confirmed result |
+| --- | --- |
+| Focused host checks | 11 passed. ASan/UBSan checks cover protocol/state/flag rejection, protocol-separated keys, 128 alternating TCP/UDP adapter and backend lifecycle cycles, and existing failure/shutdown guards. |
+| TCP lifecycle | Both TCP tests passed in 57.32 seconds. After increasing the FIN inspection timeout margin, the FIN/expiry test and UDP exception regression passed in 41.94 seconds. |
+| Admission | Both handshake SYN packets reached Linux; hardware entries reported protocol 6. Both installed directions remained live through transfers lasting twice the configured idle timeout. |
+| Sustained upload | 64 MiB delivered and verified in 8.00 seconds; 59,393 data-direction hardware hits. Software TX deltas: eth3 0, eth4 11. Aggregate DUT CPU 1.80%, versus 2.01% idle; softirq 0.38%. |
+| Sustained download | 64 MiB delivered and verified in 8.00 seconds; 59,394 data-direction hardware hits. Software TX deltas: eth3 0, eth4 10. Aggregate DUT CPU 1.80%; softirq 0.35%. |
+| Idle and reuse | Both hardware entries expired while the TCP socket remained open. Sending again installed exactly two new entries on the same connection. |
+| Retransmission | An exact-tuple WAN INPUT drop rule counted 4 dropped packets. The LAN sender reported 22 retransmissions; all 8 MiB arrived correctly. The temporary rule was removed. |
+| Withdrawal during traffic | Deleting the flowtable during a 16 MiB download preserved correct delivery. Entries/bindings/quarantine reached zero; LAN software TX increased by 12,587, demonstrating software forwarding. |
+| Recreated table | The same TCP connection offloaded again and delivered another verified 64 MiB, with 59,393 data-direction hits and software TX deltas eth3 0/eth4 10. No CMM restart or reboot was needed. |
+| FIN | Both FINs reached Linux, the final ACK appeared on the wire, both sockets closed, hardware entries disappeared within the three-second check, and LAST_ACK expired without an OFFLOAD flag. |
+| RST | The WAN socket reported reset, Linux counted RST, hardware entries disappeared within the three-second check, and conntrack expired within the native ten-second CLOSE timeout plus polling margin. |
+| UDP regression | Same-tuple TTL expiry, MTU/DF ICMP, IPv4 options, fragments and ordinary echo checks passed. |
+| Sanitizers | No KASAN, UBSan or lockdep splats in the successful focused hardware tests. |
+
+These are paced forwarding and lifecycle results, not a maximum-throughput
+claim. CPU readings include background work and management traffic; endpoint
+delivery together with hardware hits and software TX counters identifies the
+forwarding path. The previous unexplained UDP loss is not closed by these tests.
+
+Artifacts are in `/tmp/ask-flowtable-tcp/`: `tcp.xml`, `final-fin-udp.xml`,
+`host.xml`, per-case JSON, `tcp-fin.pcap`, image/parser identities and UART logs.
+`attempt1.xml` and `attempt2.xml` preserve the excluded runs. The build log is
+`/tmp/ask-flowtable-tcp-build.log`. The DUT remains in experimental ownership
+with test tables, routes, neighbours, NAT exemptions and timeout changes cleaned
+up. Stop at this increment; dynamic ARP and gateway support remain future work.

@@ -43,6 +43,8 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	*result = NULL;
+	if (rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP)
+		return -EOPNOTSUPP;
 	in = get_onif_by_name(rule->in->name);
 	out = get_onif_by_name(rule->out->name);
 	if (!in || !out || in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
@@ -62,7 +64,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	ct->pRtEntry = &hw->route;
 	ct->fftype = FFTYPE_IPV4;
 	ct->status = CONNTRACK_ORIG;
-	ct->proto = IPPROTO_UDP;
+	ct->proto = rule->proto;
 	ct->Saddr_v4 = rule->src;
 	ct->Daddr_v4 = rule->dst;
 	ct->Sport = rule->sport;
@@ -75,9 +77,9 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	hw->twin.Daddr_v4 = rule->src;
 	hw->twin.Sport = rule->dport;
 	hw->twin.Dport = rule->sport;
-	hw->twin.proto = IPPROTO_UDP;
+	hw->twin.proto = rule->proto;
 	ct->hash = HASH_CT(rule->src, rule->dst, rule->sport, rule->dport,
-			   IPPROTO_UDP);
+			   rule->proto);
 	if (insert_entry_in_classif_table(ct)) {
 		kfree(hw);
 		return -EIO;
