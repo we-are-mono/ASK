@@ -603,6 +603,96 @@ static void test_neighbours(void)
     assert(ft_neigh_entries.next == &ft_neigh_entries && !out.refs);
     assert(ft_installs == ft_deletes);
 }
+/* Same addresses and ports across protocols must remain distinct. Keep the
+ * fixture's neighbour alive while changing the borrowed rule for each request.
+ */
+static void connection_rule(unsigned n)
+{
+    cls.cookie = 1000 + n;
+    cls.stats = (struct flow_stats){0};
+    pk.src = htons(10000 + n / 2);
+    ct.protonum = bk.ip_proto = n & 1 ? IPPROTO_TCP : IPPROTO_UDP;
+    ct.tcp_state = TCP_CONNTRACK_ESTABLISHED;
+    ct.status = IPS_ASSURED;
+    dissector.used_keys = 31 | (n & 1 ? BIT(FLOW_DISSECTOR_KEY_TCP) : 0);
+    tk.flags = 0; tm.flags = htons(TCPHDR_FIN | TCPHDR_RST);
+    rule.tcp = (struct flow_match_tcp){ &tk, &tm };
+}
+
+static void test_connections(void)
+{
+    struct cdx_ft_entry *entries[CDX_FT_MAX_ENTRIES];
+    u64 installs = ft_installs, deletes = ft_deletes, errors = ft_errors;
+
+    fixture();
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+        connection_rule(i);
+        assert(ft_replace(&binding, &cls) == 0);
+        entries[i] = ft_find(&binding, cls.cookie);
+        assert(entries[i] && entries[i]->neigh == &neighbour);
+        entries[i]->hw->stats = (struct cdx_ft_counters){
+            .packets = 100 + i, .bytes = 10000 + i * 100, .lastused = 990 };
+        assert(ft_stats(entries[i], &cls) == 0);
+        assert(cls.stats.pkts == 100 + i && cls.stats.bytes == 10000 + i * 100);
+    }
+    assert(ft_count == ARRAY_SIZE(entries) && live_hw == ft_count);
+    assert(allocated == ft_count && neighbour.refs == ft_count);
+    assert(ft_neighbour_refs == ft_count && out.refs == (int)ft_count);
+
+    /* Full admission must preserve idempotent updates and reject duplicate
+     * keys without disturbing the existing owner or resetting its counters. */
+    connection_rule(10);
+    assert(ft_replace(&binding, &cls) == 0);
+    cls.cookie += 10000;
+    assert(ft_replace(&binding, &cls) == -EEXIST);
+    connection_rule(ARRAY_SIZE(entries));
+    assert(ft_replace(&binding, &cls) == -ENOSPC);
+    assert(ft_installs == installs + ARRAY_SIZE(entries) && ft_deletes == deletes);
+
+    /* Retire and reuse a middle key with a new opaque cookie. Other owners,
+     * hardware handles and previously reported deltas must survive intact. */
+    connection_rule(17);
+    assert(ft_remove(entries[17]) == 0 && !ft_find(&binding, cls.cookie));
+    cls.cookie += 10000;
+    assert(ft_replace(&binding, &cls) == 0);
+    entries[17] = ft_find(&binding, cls.cookie);
+    assert(!entries[17]->reported.packets && !entries[17]->hw->stats.packets);
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+        connection_rule(i);
+        if (i == 17) cls.cookie += 10000;
+        assert(ft_find(&binding, cls.cookie) == entries[i]);
+        entries[i]->hw->stats.packets += i + 1;
+        entries[i]->hw->stats.bytes += (i + 1) * 100;
+        assert(ft_stats(entries[i], &cls) == 0);
+        assert(cls.stats.pkts == i + 1 && cls.stats.bytes == (i + 1) * 100);
+    }
+    /* Different removal order exercises list head, middle and tail; sharing
+     * a neighbour cannot tie one connection's lifetime to another's. */
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+        unsigned n = i & 1 ? ARRAY_SIZE(entries) - 1 - i / 2 : i / 2;
+        assert(ft_remove(entries[n]) == 0);
+        assert(ft_count == ARRAY_SIZE(entries) - 1 - i && neighbour.refs == ft_count);
+        assert(ft_neighbour_refs == ft_count && out.refs == (int)ft_count);
+    }
+    assert(!live_hw && !allocated && ft_installs == ft_deletes);
+    assert(ft_installs == installs + ARRAY_SIZE(entries) + 1 && ft_errors == errors);
+    assert(!ft_invalid && !ft_fatal);
+
+    /* The next increment will make invalidation selective. At this increment
+     * a dependency change still drains the entire admitted set safely. */
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+        connection_rule(i);
+        assert(ft_replace(&binding, &cls) == 0);
+    }
+    neighbour.dead = true;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+    assert(ft_invalid && ft_count == ARRAY_SIZE(entries));
+    ft_invalidate_work(NULL);
+    assert(!ft_count && !live_hw && !allocated && !ft_neighbour_refs && !neighbour.refs);
+    assert(!out.refs && ft_installs == ft_deletes && ft_errors == errors);
+    ft_invalid = 0; ft_invalid_done = false;
+}
+
 int main(void)
 {
     struct cdx_ft_rule decoded;
@@ -685,6 +775,7 @@ int main(void)
     assert(ft_installs == ft_deletes);
     test_rearm();
     test_gateways();
+    test_connections();
     test_neighbours();
-    puts("Flowtable: decoder, references, deltas, wrap, rollback, neighbours, invalidation, rearm and fatal retry passed");
+    puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

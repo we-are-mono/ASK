@@ -312,8 +312,8 @@ counters, diagnostics, and test results needed to reproduce each acceptance run.
 After the first lifecycle is accepted, broaden dynamic route/neighbour/device
 behaviour and exception coverage. Exercise the same small feature on a second
 kernel version early to test whether the compatibility boundary is useful.
-After the gateway increment described below, candidate expansions are
-multiple connections, selective invalidation, IPv4 NAT, IPv6, additional interface types,
+After the bounded multiple-connection increment described below, candidate expansions are
+selective invalidation, IPv4 NAT, IPv6, additional interface types,
 bridging, QoS, tunnels, and IPsec, each with separate eligibility and verification
 criteria. This is a suggested sequence, not a fixed roadmap or a claim that one
 Linux API covers every feature.
@@ -364,7 +364,12 @@ itself is currently implemented by the test initramfs, not a production installe
 
 `cdx_flowtable.c` uses Linux's indirect `TC_SETUP_FT` binding callbacks and
 `TC_SETUP_CLSFLOWER` requests. It accepts one flowtable, at most two initial-netns
-physical Ethernet ports, and at most two directional entries. Cookies are opaque
+physical Ethernet ports, and at most 64 directional entries (up to 32 two-way
+connections). This is a conservative adapter admission bound, not a firmware
+capacity claim; it bounds the list walks under the control mutex and neighbour
+spinlock. `/proc/cdx_flowtable` exposes it as `max_entries`. Directions consume
+slots independently; existing owners are not evicted to admit another flow.
+Cookies are opaque
 and local to a binding. Unsupported selectors and actions fail before insertion.
 The admitted rule has exact IPv4 TCP or UDP addresses and ports, an ingress
 ifindex, four Ethernet rewrite words, and a redirect. TCP additionally requires
@@ -1130,3 +1135,104 @@ NAT exemptions are removed; loki's forwarding setting, physical MAC and ARP
 policy and the DUT's NUD parameters are restored. The DUT remains in experimental
 flowtable mode. Stop at this increment; connection scaling, selective invalidation
 and NAT remain subsequent work.
+
+## Bounded multiple connections — 2026-09-15
+
+The adapter now admits 64 independent hardware directions, enough for 32
+two-way IPv4 TCP/UDP connections in the existing one-table, two-physical-port
+topology. The previous two-entry limit was an explicit admission restriction;
+the binding/cookie ownership, per-direction hardware objects, statistics and
+neighbour references already supported independent lifetimes. The firmware
+encoder, kernel patch and CMM ownership boundary did not need changes.
+
+`CDX_FT_MAX_ENTRIES` bounds both control-mutex list walks and the atomic
+neighbour-notifier walk. The diagnostic `max_entries` reports the bound. It is
+not the hardware's capacity and makes no throughput or large-scale claim.
+Admission never evicts another direction. Duplicate updates remain idempotent
+at the limit; a distinct owner of the same hardware key is refused, and a new
+key beyond the bound receives `-ENOSPC`. Directions are admitted independently;
+this increment does not introduce paired reservations or capacity fairness.
+
+Individual connection deletion, TCP close and idle expiry leave other owners
+intact. Route/device/dependency changes still invalidate the whole table and
+require explicit table recreation. Selective invalidation is the next separate
+increment, followed by further resource-pressure and concurrent lifecycle work.
+NAT, IPv6 and additional interface types remain outside the admitted contract.
+
+### Verification
+
+The production-code host test fills all 64 directional slots with alternating
+TCP/UDP rules sharing addresses, port pairs and a neighbour. It verifies
+independent counter deltas, full-capacity idempotency and refusal, removal and
+reuse of a middle key, arbitrary deletion order, balanced references and
+conservative invalidation of the full set. Host sanitizers cover the existing
+decoder, backend ownership and neighbour fallback as well.
+
+The DUT test admits 16 TCP and 16 UDP connections simultaneously. Each TCP/UDP
+pair shares addresses and ports, so protocol separation is tested on actual
+hardware. The endpoint checks every echoed record's connection ID, serial and
+payload. TCP records are also checked independently by the WAN echo server.
+The test uses permanent neighbours and the established direct-route fixture;
+gateway/ordinary-ARP behaviour is covered by the focused regression below.
+
+A separate, unoffloaded TCP connection controls one concurrent LAN peer through
+the existing console transport. Individual streams can stop while others
+continue. Cleanup closes the sockets, drains the console operation, deletes the
+table and conntracks, and restores NAT exemptions and timeout settings. The
+multi-connection source ports use a separate range from the single-connection
+tests; TCP sockets set `SO_REUSEADDR` for repeat runs.
+
+| Item | Evidence |
+| --- | --- |
+| Kernel / firmware | Linux `6.12.103`; existing ASK FMAN firmware `210.10.1` |
+| Test boot | `8dadf05e-e894-47e1-9c5f-a7240e3ad9fa` |
+| Staged image SHA-256 | `ea09a6e73d93d8fdcd78170a234fedb57d84e4456a7c73fa33a6bb9d43c1dea8` |
+| Kernel GNU build ID | `8d242ae536a60881a990c8fa89b17a1abd0036d6` |
+| CDX GNU build ID | `2a84a70c05075f8bb490f8bbc12048d2586bf20f` |
+| Instrumentation | KASAN generic, lockdep, kmemleak tracking and failslab enabled; taint `4096` only |
+| Build | Successful KASAN image build and staging. No compiler warnings; three existing forced-task warnings. Running module/kernel identities matched the image. |
+| Focused host tests | 5 passed in 0.87 seconds under ASan/UBSan, including CDX shutdown and ehash teardown. |
+| Mixed connection acceptance | Passed in 66.16 seconds on the final harness. All 64 directions and 64 neighbour references were present. |
+| Full set traffic | Over eight seconds, 16 TCP connections sent and received verified echoes of 64 MiB in total; each of 16 UDP connections exchanged 256 verified datagrams. All 32 UDP directions counted exactly 256 packets and the expected bytes. Hardware recorded 141,269 classifier hits; software TX was eth3 4 / eth4 23. |
+| Explicit UDP deletion | Deleting one conntrack reduced entries/references from 64 to 62 and added exactly two deletes. Every other cookie and counter remained intact. |
+| TCP close | FIN reduced entries/references from 62 to 60, adding exactly two more deletes while other traffic continued. |
+| Independent idle expiry | Stopping one UDP stream reduced entries/references from 60 to 58. All remaining directions kept their cookies and increased their counters despite sharing the same two neighbours. |
+| Tuple reuse and refresh | Sending again on the explicitly deleted UDP tuple and the idle UDP connection added exactly four new directions, with fresh counters; the other owners remained unchanged. |
+| Surviving set traffic | A further eight-second window verified 60 MiB of TCP data and its echoes, plus 256 datagrams on each UDP connection. Hardware recorded 133,836 classifier hits; software TX was eth3 5 / eth4 15. |
+| CPU | Unloaded baseline 1.83% busy / 0.44% softirq; full set 2.29% / 0.41%; surviving set 2.17% / 0.35%. Raw per-CPU ticks are retained. |
+| UDP delivery | 18,595 unique records across warmup, steady traffic, concurrent retirement and reuse; no duplicated records. |
+| Focused DUT regressions | IPv4 gateway UDP lifecycle and single-connection TCP transfer/expiry/FIN both passed, in 77.94 seconds combined. |
+| Cleanup | Final cumulative installs/deletes both 148, with zero entries, bindings, neighbour references, errors, fatal state, quarantine or invalidation. Three earlier regression rearms; none needed during either mixed-connection lifecycle. |
+
+The first mixed lifecycle also passed, in 62.94 seconds, but total CPU was
+21.44–24.75% despite similarly low software forwarding counts. Those early-boot
+samples are retained, not used as the performance baseline. The boot's kmemleak
+scanner had accumulated 25.51 CPU seconds before the later measurement and was
+then asleep; the repeat above measured the quiet baseline and active traffic
+without changing instrumentation. This is consistent with background load
+affecting the early samples, rather than evidence of sustained forwarding cost.
+An intervening rerun stopped before admission on a test-harness TCP bind conflict
+with the preceding single-connection regression. The separate source-port range
+and socket reuse fix are included in the verified harness.
+
+These are paced correctness and CPU measurements, not a line-rate benchmark.
+Only the focused tests were run; no full KASAN suite or forced kmemleak scan was
+requested. CMM remained disabled throughout, with no reboot between tests.
+
+Reproduce the focused acceptance on an experimental boot with:
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 \
+  ASK_FLOWTABLE_ARTIFACTS=/tmp/ask-flowtable-connections \
+  make ask-test ASK_TEST_ARGS='-k flowtable_connections -x -q'
+```
+
+Artifacts are under `/tmp/ask-flowtable-connections/`: `host.xml`, `dut.xml`,
+`regression.xml`, `verified.xml`, matching logs, `verified/connections-*.json`,
+image and source identities, boot logs and final restoration evidence. The
+excluded harness attempt is retained under `steady/` with its log/XML. The build
+log is `/tmp/ask-flowtable-connections-build.log`.
+
+Stop at this increment. The DUT remains available in experimental flowtable
+ownership with the test configuration and traffic removed. Selective
+invalidation has not been implemented.

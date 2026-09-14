@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Linux flowtable adapter, limited to two IPv4 TCP or UDP directions.
+/* Linux flowtable adapter for bounded IPv4 TCP and UDP offload.
  *
  * Hardware operations and lists: cdx_info->ctrl.mutex. Rule callbacks are
  * process-context NF workqueue callbacks. Binding release runs after the
@@ -69,6 +69,12 @@ struct cdx_ft_entry {
 	struct cdx_ft_hw *hw;
 	struct cdx_ft_counters reported;
 };
+
+/* Bound the control-mutex and atomic neighbour-list walks while proving
+ * independent connection lifetimes. This is an adapter admission limit, not
+ * firmware capacity; directions consume slots independently, without eviction.
+ */
+#define CDX_FT_MAX_ENTRIES 64U
 
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
@@ -433,7 +439,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	list_for_each_entry(other, &ft_entries, list)
 		if (ft_same_key(&other->rule, &rule))
 			return -EEXIST;
-	if (ft_count >= 2)
+	if (ft_count >= CDX_FT_MAX_ENTRIES)
 		return -ENOSPC;
 	if (ft_fault(1))
 		return -ENOMEM;
@@ -777,11 +783,11 @@ static int ft_show(struct seq_file *seq, void *unused)
 	struct cdx_ft_counters stats;
 
 	mutex_lock(&cdx_info->ctrl.mutex);
-	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\n"
+	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\n",
-		   offload_owner, ft_observe, ft_bound, ft_count, ft_installs,
+		   offload_owner, ft_observe, ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, ft_fatal,
 		   cdx_ft_hw_pending() + cdx_ehash_quarantine_pending(),
