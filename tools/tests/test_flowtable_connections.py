@@ -62,8 +62,9 @@ async def delete_connection(r, ident):
 
 
 class Peer:
-    def __init__(self, reader, writer):
+    def __init__(self, reader, writer, flows):
         self.reader, self.writer = reader, writer
+        self.flows = {f["id"]: f for f in flows}
 
     async def rpc(self, op, ids=None, **kwargs):
         async with asyncio.timeout(25):
@@ -73,21 +74,22 @@ class Peer:
             assert line, f"LAN peer disconnected during {op}; see connections-peer.json"
             response = json.loads(line)
             assert response["op"] == op, response
-            return {int(k): v for k, v in response["result"].items()}
+            return response["result"]
 
     async def batch(self, ids, count=32, interval=0.005):
         await self.rpc("start", ids, count=count, interval=interval)
-        result = await self.rpc("wait", ids)
+        result = {int(k): v for k, v in (await self.rpc("wait", ids)).items()}
         assert set(result) == set(ids), result
         for ident, report in result.items():
             assert report["count"] == count, report
-            size = TCP_SIZE if FLOWS[ident]["proto"] == "tcp" else UDP_SIZE
+            size = TCP_SIZE if self.flows[ident]["proto"] == "tcp" else UDP_SIZE
             assert report["bytes"] == count * size, report
         return result
 
 
 @asynccontextmanager
-async def peer(r):
+async def peer(r, flows=FLOWS):
+    specs = {f["id"]: f for f in flows}
     accepted = asyncio.Queue()
     tasks, writers, errors, tcp_counts = set(), set(), [], {}
     control_server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT + 1)
@@ -98,8 +100,8 @@ async def peer(r):
         ident = None
         try:
             ident = json.loads(await asyncio.wait_for(reader.readline(), 10))["id"]
-            assert ident in ALL and FLOWS[ident]["proto"] == "tcp"
-            assert writer.get_extra_info("peername") == (r.lan_ip, FLOWS[ident]["sport"])
+            assert ident in specs and specs[ident]["proto"] == "tcp"
+            assert writer.get_extra_info("peername") == (specs[ident].get("lan", r.lan_ip), specs[ident]["sport"])
             assert ident not in tcp_counts
             tcp_counts[ident] = 0
             while True:
@@ -127,14 +129,15 @@ async def peer(r):
     try:
         server = await asyncio.start_server(accept, WAN_IP, DPORT)
         config = {"lan": r.lan_ip, "wan": WAN_IP, "dport": DPORT,
-                  "control_port": DPORT + 1, "flows": FLOWS, "token": secrets.token_hex(16)}
-        script = f"CONFIG={config!r}\n" + Path(__file__).with_name("flowtable_connections_peer.py").read_text()
+                  "control_port": DPORT + 1, "flows": flows, "token": secrets.token_hex(16)}
+        script = (f"CONFIG={config!r}\n" + Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
+                  + "\n" + Path(__file__).with_name("flowtable_connections_peer.py").read_text())
         task = asyncio.create_task(lan_run_python(r.lan, script, timeout=200, label="flowtable_connections"))
         reader, writer = await asyncio.wait_for(accepted.get(), 15)
-        controller = Peer(reader, writer)
+        controller = Peer(reader, writer, flows)
         ready = json.loads(await asyncio.wait_for(reader.readline(), 5))
         assert ready == {"ready": config["token"]}, ready
-        await controller.rpc("open", ALL)
+        await controller.rpc("open", list(specs))
         yield controller
     finally:
         try:

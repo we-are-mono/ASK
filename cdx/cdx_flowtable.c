@@ -34,7 +34,7 @@
 #include "cdx_flowtable_hw.h"
 #include "devman.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 3
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 4
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
 
@@ -62,6 +62,7 @@ struct cdx_ft_entry {
 	struct list_head list;
 	struct list_head neigh_list;
 	struct neighbour *neigh;
+	struct nf_flow_offload_handle *handle;
 	__be32 next_hop;
 	struct cdx_ft_binding *binding;
 	unsigned long cookie;
@@ -79,13 +80,15 @@ struct cdx_ft_entry {
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
 /* Watch publication/removal is serialized by ctrl.mutex. The atomic notifier
- * shares only neigh and rule.dst_mac, protected against entry removal by this
- * lock. Never acquire a neighbour lock while holding ft_neigh_lock. */
+ * shares neigh, rule.dst_mac and handle, protected against entry removal by
+ * this lock. Never acquire a neighbour lock while holding ft_neigh_lock. */
 static LIST_HEAD(ft_neigh_entries);
 static DEFINE_SPINLOCK(ft_neigh_lock);
 static LIST_HEAD(ft_block_list);
 static unsigned int ft_bound, ft_count;
 static unsigned int ft_neighbour_refs;
+static unsigned int ft_handle_refs;
+static atomic64_t ft_neigh_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping, ft_fatal;
@@ -94,7 +97,9 @@ static bool ft_invalid_done;
 static struct proc_dir_entry *ft_proc;
 static void ft_invalidate_work(struct work_struct *work);
 static void ft_neigh_detach(struct cdx_ft_entry *entry);
+static void ft_neigh_invalidate_work(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
+static DECLARE_WORK(ft_neigh_work, ft_neigh_invalidate_work);
 
 bool cdx_flowtable_enabled(void)
 {
@@ -142,6 +147,19 @@ static struct cdx_ft_entry *ft_find(struct cdx_ft_binding *binding,
 	return NULL;
 }
 
+/* Called with either ctrl.mutex or the notifier's ft_neigh_lock held. The
+ * handle is immutable, owned before watch publication and shared by both
+ * directions. Marking it also excludes Linux's cached flow immediately;
+ * native GC later retires that generation without flushing unrelated flows.
+ */
+static void ft_neigh_invalidate(struct cdx_ft_entry *entry)
+{
+	if (nf_flow_offload_handle_invalidate(entry->handle))
+		atomic64_inc(&ft_neigh_invalidations);
+	if (!READ_ONCE(ft_stopping))
+		schedule_work(&ft_neigh_work);
+}
+
 static int ft_remove(struct cdx_ft_entry *entry)
 {
 	int rc = cdx_ft_hw_del(&entry->hw);
@@ -154,11 +172,30 @@ static int ft_remove(struct cdx_ft_entry *entry)
 	}
 	list_del(&entry->list);
 	ft_neigh_detach(entry);
+	nf_flow_offload_handle_put(entry->handle);
+	ft_handle_refs--;
 	dev_put(entry->rule.out);
 	kfree(entry);
 	ft_count--;
 	ft_deletes++;
 	return rc;
+}
+
+static void ft_neigh_invalidate_work(struct work_struct *work)
+{
+	struct cdx_ft_entry *entry, *next;
+
+	mutex_lock(&cdx_info->ctrl.mutex);
+	list_for_each_entry_safe(entry, next, &ft_entries, list) {
+		/* A failed retirement escalates to the existing global recovery.
+		 * That worker proves a barrier or quiesces the datapath before
+		 * reporting completion. Never rearm a terminal hardware failure. */
+		if (ft_stopping || atomic_read(&ft_invalid))
+			break;
+		if (!nf_flow_offload_handle_valid(entry->handle))
+			ft_remove(entry);
+	}
+	mutex_unlock(&cdx_info->ctrl.mutex);
 }
 
 static bool ft_physical(struct net_device *dev)
@@ -284,7 +321,7 @@ static bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
 	valid = ft_neigh_matches(neigh, entry->rule.dst_mac);
 	read_unlock_bh(&neigh->lock);
 	if (!valid) {
-		ft_invalidate();
+		ft_neigh_invalidate(entry);
 		return false;
 	}
 	/* Classifier hits establish use, not reachability. Let Linux advance
@@ -292,7 +329,7 @@ static bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
 	 * call neigh_confirm() based on hardware activity, including reverse
 	 * traffic. No neighbour/watch lock may be held across the protocol call. */
 	if (active && neigh_event_send(neigh, NULL)) {
-		ft_invalidate();
+		ft_neigh_invalidate(entry);
 		return false;
 	}
 	return true;
@@ -323,6 +360,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	int i;
 
 	if (!rule || !cls->nf_ct || !cls->nf_mtu || cls->nf_counter ||
+	    !nf_flow_offload_handle_valid(cls->nf_handle) ||
 	    !net_eq(nf_ct_net(cls->nf_ct), &init_net) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_ORIGINAL) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_REPLY) ||
@@ -420,6 +458,10 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	__be32 next_hop;
 	int rc;
 
+	/* A delayed request must never replace a different flow generation
+	 * merely because its opaque directional cookie has the same value. */
+	if (entry && entry->handle != cls->nf_handle)
+		return -ESTALE;
 	rc = ft_parse(binding, cls, &rule, &next_hop);
 	if (!rc)
 		ft_validated++;
@@ -450,12 +492,17 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	entry->next_hop = next_hop;
 	entry->binding = binding;
 	entry->cookie = cls->cookie;
+	entry->handle = cls->nf_handle;
+	nf_flow_offload_handle_get(entry->handle);
+	ft_handle_refs++;
 	dev_hold(rule.out);
 	rc = ft_neigh_attach(entry);
 	if (!rc)
 		rc = ft_fault(2) ? -EIO : cdx_ft_hw_add(&rule, &entry->hw);
 	if (rc) {
 		ft_neigh_detach(entry);
+		nf_flow_offload_handle_put(entry->handle);
+		ft_handle_refs--;
 		dev_put(rule.out);
 		kfree(entry);
 		return rc;
@@ -463,7 +510,8 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	list_add_tail(&entry->list, &ft_entries);
 	ft_count++;
 	ft_installs++;
-	if (ft_fault(3) || atomic_read(&ft_invalid)) {
+	if (ft_fault(3) || atomic_read(&ft_invalid) ||
+	    !nf_flow_offload_handle_valid(entry->handle)) {
 		ft_remove(entry);
 		return -EIO;
 	}
@@ -476,6 +524,10 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	u64 packets, bytes;
 	unsigned long lastused;
 
+	if (!nf_flow_offload_handle_valid(entry->handle)) {
+		ft_neigh_invalidate(entry);
+		return -EOPNOTSUPP;
+	}
 	/* A table can enable counters after installation. Its matching frames
 	 * may already have been counted again on a punt to Linux. Retire all
 	 * directions and leave accounting to software; never publish hit counts
@@ -521,6 +573,8 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 		return -EOPNOTSUPP;
 	mutex_lock(&cdx_info->ctrl.mutex);
 	entry = ft_find(binding, cls->cookie);
+	if (entry && entry->handle != cls->nf_handle)
+		entry = NULL;
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:
 		/* Never wait for RTNL here: device teardown under RTNL may be
@@ -574,7 +628,7 @@ static bool ft_can_rearm(void)
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	return ft_ready && !ft_stopping && !ft_fatal &&
 		atomic_read(&ft_invalid) && ft_invalid_done &&
-		!ft_bound && !ft_count && !ft_neighbour_refs && !cdx_ft_hw_pending() &&
+		!ft_bound && !ft_count && !ft_neighbour_refs && !ft_handle_refs && !cdx_ft_hw_pending() &&
 		!cdx_ehash_quarantine_pending();
 }
 
@@ -634,6 +688,7 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 		 * is monotonic for the table, including after unbind. Patch 140
 		 * also retires DIRECT flows constructed concurrently with bind. */
 		WRITE_ONCE(flowtable->use_neigh, true);
+		WRITE_ONCE(flowtable->use_hw_handles, true);
 		/* Commit recovery only after allocating a binding successfully.
 		 * While ft_bound is zero, a notifier cannot invalidate new entries:
 		 * none exist yet. A normal bind must not clear an invalidation
@@ -753,10 +808,10 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
 		if (entry->neigh == neigh &&
 		    !ft_neigh_matches(neigh, entry->rule.dst_mac)) {
-			/* Still invalidate the whole table. A normal NUD transition
-			 * or ARP confirmation with the same MAC needs no retirement. */
-			ft_invalidate();
-			break;
+			/* Ordinary NUD ageing with a usable MAC needs no retirement.
+			 * Every connection sharing the bad neighbour is marked, and
+			 * its other direction observes the same handle invalidation. */
+			ft_neigh_invalidate(entry);
 		}
 	}
 	spin_unlock(&ft_neigh_lock);
@@ -786,12 +841,14 @@ static int ft_show(struct seq_file *seq, void *unused)
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
-		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\n",
+		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
+		   "neighbour_invalidations %lld\n",
 		   offload_owner, ft_observe, ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, ft_fatal,
 		   cdx_ft_hw_pending() + cdx_ehash_quarantine_pending(),
-		   ft_can_rearm(), ft_rearms, ft_neighbour_refs);
+		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
+		   atomic64_read(&ft_neigh_invalidations));
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_hw_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
@@ -847,10 +904,15 @@ void cdx_flowtable_exit(void)
 	ft_proc = NULL;
 	if (!ft_ready)
 		return;
+	/* Serialize with rule callbacks which may queue either worker. Atomic
+	 * notifiers are then unregistered synchronously before cancellation. */
+	mutex_lock(&cdx_info->ctrl.mutex);
 	WRITE_ONCE(ft_stopping, true);
+	mutex_unlock(&cdx_info->ctrl.mutex);
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
 	unregister_netdevice_notifier(&ft_netdev_nb);
+	cancel_work_sync(&ft_neigh_work);
 	cancel_delayed_work_sync(&ft_work);
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	WRITE_ONCE(ft_ready, false);

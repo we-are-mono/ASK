@@ -570,40 +570,30 @@ async def test_flowtable_offload_add_failures(rig):
 
 
 async def test_flowtable_offload_rearm(rig):
-    """Recover fresh rules after MAC/MTU changes and a retried delete barrier."""
+    """Recover after device/route MTU changes and a retried delete barrier."""
     r = rig
     initial = await r.state()
     if initial["observe"]:
         pytest.skip("rearm proof requires installed hardware")
-    original_mac = r.lan_mac
-    # A unicast, locally administered address, unique to this isolated test.
-    changed_mac = "02:9d:99:b2:33:02"
-    assert original_mac != changed_mac
+    original_mtu = (await read(r.target, r.session, f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip()
     boot_id = await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")
     await r.table()
     await r.exchange(128, promiscuous=False)
     await r.wait(lambda s: s["entries"] == 2)
     try:
-        for cycle, trigger in enumerate(("neighbour", "route", "barrier"), 1):
+        for cycle, trigger in enumerate(("device", "route", "barrier"), 1):
             before = await r.state()
             traffic = None
             knob = "/proc/fm_ehash_hcsync_fail"
             try:
-                if trigger == "neighbour":
-                    # Change the endpoint's real receive filter as well as
-                    # Linux's neighbour. No promiscuous socket may conceal a
-                    # stale destination MAC in newly installed hardware.
-                    await console_command(r.lan, "ip", "link", "set", "dev", LAN_NIC,
-                                          "address", changed_mac)
-                    r.lan_mac = changed_mac
+                if trigger == "device":
                     received = len(r.echo.received)
                     traffic = asyncio.create_task(terminal_stream(r, duration=6))
                     deadline = time.monotonic() + 5
                     while len(r.echo.received) < received + 16:
                         assert not traffic.done() and time.monotonic() < deadline
                         await asyncio.sleep(0.02)
-                    await command(r.target, r.session, "ip", "neigh", "replace", r.lan_ip,
-                                  "lladdr", changed_mac, "nud", "permanent", "dev", TARGET_LAN_IF)
+                    await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", "1400")
                 elif trigger == "route":
                     await command(r.target, r.session, "ip", "route", "replace", f"{r.lan_ip}/32",
                                   "dev", TARGET_LAN_IF, "mtu", "1100")
@@ -620,8 +610,6 @@ async def test_flowtable_offload_rearm(rig):
                 assert invalid["bindings"] == (0 if trigger == "barrier" else 2)
                 assert invalid["rearm_ready"] == (1 if trigger == "barrier" else 0)
             finally:
-                # The stream deliberately spans a MAC mismatch. Stable phases
-                # below retain the strict zero-loss and packet-content checks.
                 if traffic:
                     r.record("rearm-transition", await traffic)
                 if trigger == "barrier":
@@ -634,7 +622,7 @@ async def test_flowtable_offload_rearm(rig):
             assert software_after - software_before >= 64
             assert blocked["entries"] == 0 and blocked["installs"] == before["installs"]
             assert blocked["invalidated"] == 1 and blocked["rearms"] == before["rearms"]
-            if trigger == "neighbour":
+            if trigger == "device":
                 # Hook removal alone leaves cached Linux flows. Such a table
                 # must not reopen hardware admission, even with zero bindings.
                 await r.nft(f"delete flowtable inet {TABLE} fast {{ "
@@ -683,15 +671,10 @@ async def test_flowtable_offload_rearm(rig):
                      "software_tx_before": tx_before, "software_tx_after": tx_after,
                      "exchange": report, "boot_id": boot_id})
     finally:
-        # Withdraw hardware before restoring the original receive address.
         try:
             await r.delete_table()
         finally:
-            await console_command(r.lan, "ip", "link", "set", "dev", LAN_NIC,
-                                  "address", original_mac)
-            r.lan_mac = original_mac
-            await command(r.target, r.session, "ip", "neigh", "replace", r.lan_ip,
-                          "lladdr", original_mac, "nud", "permanent", "dev", TARGET_LAN_IF)
+            await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", original_mtu)
 
 
 @pytest.mark.parametrize("trigger", [os.environ.get("ASK_FLOWTABLE_INVALIDATION", "neighbour")])
@@ -718,11 +701,15 @@ async def test_flowtable_offload_invalidation(rig, trigger):
                     f"devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; counter; }}")
     else:
         await command(r.target, r.session, "ip", "neigh", "del", WAN_IP, "dev", TARGET_WAN_IF)
-    state = await r.wait(lambda s: s["invalidation_done"] == 1 and s["entries"] == 0)
-    assert state["invalidated"] == 1 and state["fatal"] == state["quarantine"] == 0
+    state = await r.wait(lambda s: s["entries"] == 0 and (
+        s["neighbour_invalidations"] > before["neighbour_invalidations"] if trigger == "neighbour"
+        else s["invalidation_done"] == 1))
+    assert state["invalidated"] == int(trigger != "neighbour") and state["fatal"] == state["quarantine"] == 0
+    assert state["handle_refs"] == state["neighbour_refs"] == 0, state
     assert state["errors"] - before["errors"] == (2 if trigger == "barrier" else 0)
     await r.exchange()
-    assert (await r.state())["entries"] == 0
+    if trigger != "neighbour":
+        assert (await r.state())["entries"] == 0
     r.record(f"invalidation-{trigger}", state)
 
 

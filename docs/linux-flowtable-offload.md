@@ -1,7 +1,8 @@
 # Linux flowtable offload: design and first proof of concept
 
-Status: IPv4 UDP and TCP offload implemented; ordinary ARP and IPv4 gateway
-routing, invalidation and recovery demonstrated on the DUT.
+Status: bounded multiple-connection IPv4 UDP/TCP offload, ordinary ARP and IPv4
+gateway routing demonstrated on the DUT. Neighbour invalidation is selective
+with automatic recovery; route/device changes retain whole-table invalidation.
 The earlier intermittent UDP loss remains unresolved and deferred; its scope and
 evidence are recorded separately below.
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
@@ -387,8 +388,11 @@ supported through the route supplied by Linux. IPv6 gateways remain excluded.
 
 Patch `140-ask-flowtable-context.patch` supplies borrowed conntrack and selected
 route context, the directional effective MTU, and the table's accounting
-requirement to callbacks. Neither borrowed pointer nor a Linux flow object is
-retained. This explicit, downstream, kernel-internal
+requirement to callbacks. Context version 4 also supplies an opaque, reference
+counted invalidation handle shared by a flow's two directions. The driver owns
+one reference per installed direction; the handle retains no flow, conntrack,
+route, table or namespace pointer. Neither borrowed context pointer nor a Linux
+flow object is retained. This explicit, downstream, kernel-internal
 interface avoids recovering a parent flow by casting its cookie. The adapter
 must be built against this patch; the test image includes the native flowtable
 and nftables modules it needs.
@@ -444,9 +448,10 @@ rule callbacks execute in workqueue context. Binding release runs after the flow
 block excludes its callbacks. Notifiers latch invalidation and queue work; they
 never acquire the control mutex. ARP callbacks inspect pinned, immutable
 dependencies under a separate spinlock, nested inside the neighbour lock.
-Invalidation deletes the experimental entries
-before flushing Linux flowtable work, releasing the control mutex before that
-flush. Module exit removes the proc entry and notifiers, cancels invalidation
+Global invalidation deletes the experimental entries before flushing Linux
+flowtable work, releasing the control mutex before that flush. Selective
+neighbour work removes entries sharing an invalid handle and leaves Linux
+teardown to native GC. Module exit removes the proc entry and notifiers, cancels invalidation
 work, and unregisters indirect callbacks before global CDX teardown acquires its
 locks. Installation and fatal recovery use RTNL trylock under the control mutex,
 because RTNL holders can wait for Netfilter callbacks. A busy RTNL lock declines
@@ -455,17 +460,20 @@ must also match the netdevice recorded by CDX, not merely its name. Flowtables
 must be bound after CDX initializes; incomplete indirect replay requests are
 declined.
 
-Relevant initial-netns IPv4 route and ARP-neighbour changes, or interface down,
-unregister, MTU, MAC, rename, or upper-device changes conservatively disable new
-hardware admission until the recovery boundary below. IPv4 route events remain
-namespace-wide. ARP invalidation now follows watched neighbours: a changed MAC,
-unusable state or detached object retires the whole table, while same-MAC NUD
-progress and unrelated ARP updates do not. Configure routes before binding;
-neighbours may resolve through ordinary ARP after binding. Invalidation is
-asynchronous; inspect
-`invalidation_done` before claiming retirement is complete.
+Relevant initial-netns IPv4 route changes, or interface down, unregister, MTU,
+MAC, rename, or upper-device changes conservatively disable hardware admission
+until the recovery boundary below. IPv4 route events remain namespace-wide.
+A watched neighbour's changed MAC, unusable state or detached object instead
+invalidates only dependent flow generations, including both directions. Their
+cached Linux lookup stops immediately and native GC tears them down. Once
+resolution is valid, fresh traffic can return to hardware without recreating
+the table. Same-MAC NUD progress and unrelated ARP updates need no retirement.
+Configure routes before binding; neighbours may resolve through ordinary ARP
+after binding. Both retirement paths are asynchronous: inspect the affected
+entries and reference counts for selective retirement, or `invalidation_done`
+for global retirement. A hardware retirement error escalates to global recovery.
 
-Healthy invalidation can recover by deleting and recreating the flowtable after
+Healthy global invalidation can recover by deleting and recreating the flowtable after
 configuration has settled. Admission remains closed while any old binding or
 entry exists, invalidation work is incomplete, or either retirement quarantine
 contains storage. With all of these cleared, `rearm_ready=1` reports that the
@@ -525,16 +533,16 @@ the fixture. TCP tests reuse the topology with a TCP peer instead of the echo
 server. It uses the LAN UART and target/WAN agents without CMM helpers.
 Runs can set `ASK_FLOWTABLE_ARTIFACTS` to retain measurements and packet captures.
 The rearm test exercises three recovery cycles without rebooting. It changes the
-LAN endpoint's actual MAC and its permanent DUT neighbour while traffic runs,
-then changes a direct host-route MTU, then injects two retirement-barrier failures.
+DUT LAN device MTU, then a direct host-route MTU, then injects two
+retirement-barrier failures.
 Each cycle proves software forwarding during invalidation and fresh hardware
 forwarding after table recreation. Strict delivery checks use the NIC's normal
 receive filter. Software TX enqueues distinguish software forwarding from
 hardware delivery. The SDK RX statistic alone cannot do so: with GRO disabled,
 software flowtable forwarding can consume an skb and return before the driver
 increments RX. The test also refuses reattachment of a populated table whose
-hooks have all been withdrawn. The separate invalidation-only test leaves
-admission closed.
+hooks have all been withdrawn. The separate invalidation test covers selective
+neighbour deletion and global counter-policy or retirement-barrier failures.
 
 `ASK_FLOWTABLE_TERMINAL=unload|unlink` separately selects a terminal lifecycle
 test with `-k flowtable_offload_terminal`. Use a fresh experimental boot for
@@ -1236,3 +1244,103 @@ log is `/tmp/ask-flowtable-connections-build.log`.
 Stop at this increment. The DUT remains available in experimental flowtable
 ownership with the test configuration and traffic removed. Selective
 invalidation has not been implemented.
+
+
+## Selective neighbour invalidation verified (2026-09-15)
+
+This increment narrows neighbour invalidation to the connections that actually
+use that neighbour. A changed MAC, unusable NUD state or detached neighbour
+invalidates the connection's two directions, even when only one direction uses
+the changed dependency. Other connections retain their hardware entries and
+counters. Valid resolution and fresh traffic restore offload automatically,
+without deleting conntrack, reconnecting TCP or recreating the flowtable.
+Route and device changes still use the conservative global recovery boundary.
+
+Patch 140 context version 4 provides the lifetime contract. Before admission,
+CDX opts the table into allocation of an opaque handle per cached Linux flow.
+Both directions borrow that handle during callbacks and each installed CDX
+direction takes a reference. The handle contains only a reference count, an
+atomic invalid bit and RCU reclamation state. It cannot pin or dereference a
+flow, table, conntrack, route or namespace. Tables that do not opt in allocate
+no handles. Allocation failure follows the existing flow-add failure path and
+leaves ordinary stack forwarding available.
+
+The neighbour notifier atomically invalidates every dependent handle under the
+watch lock and queues selective work. Cached software lookup declines the
+invalid generation immediately; native Netfilter GC performs its usual teardown
+and hardware-delete callbacks. The CDX worker independently removes every
+installed direction sharing that invalid handle. It does not flush a table or
+retain borrowed Linux pointers. Handles are immutable identities until their
+last reference is released, and RCU reclamation protects existing lockless
+lookups. A stale callback with a reused directional cookie cannot remove,
+update or replace an entry belonging to another handle.
+
+Hardware retirement still uses the existing consuming deletion contract. A
+barrier failure or unproven unlink escalates to the global worker; selective
+recovery cannot bypass quarantine or clear fatal state. Module exit serializes
+the stopping flag with callbacks, unregisters notifiers synchronously and
+cancels both workers before releasing bindings. `/proc/cdx_flowtable` now
+reports `handle_refs` for installed adapter references and
+`neighbour_invalidations` for distinct handles first invalidated by neighbour
+handling. Ordinary selective recovery leaves `invalidated`, `invalidation_done`
+and `rearms` unchanged. The driver reference count does not count Linux's own
+references or objects awaiting an RCU grace period.
+
+The acceptance fixture creates two macvlan peers in separate loki network
+namespaces, with distinct IPs and real receive MACs on the existing X550 port.
+Each peer runs one TCP and one UDP connection; both protocols use the same
+source/destination ports. A separate control socket permits ARP restoration
+while the affected data path is unavailable. Every data record includes its
+connection identity and serial; the WAN TCP server refuses reconnects. Peer B
+keeps sending throughout peer A's MAC change, ARP failure and neighbour-object
+deletion. The fixture removes its namespaces, addresses, routes, NAT exemptions,
+conntracks, table and NUD tuning on exit.
+
+| Check | Observed result |
+| --- | --- |
+| Host ownership and failure checks | Four focused ASan/UBSan tests passed in 0.81 seconds. They compile production adapter and kernel handle/add/lookup/GC paths, covering allocation/hash rollback, shared references, deferred reclamation, stale callbacks, tuple/cookie reuse, selective retirement and global escalation. Shutdown and ehash teardown checks also passed, two tests in 0.21 seconds. |
+| Two-peer acceptance | Passed in 33.94 seconds. Each of three faults reduced entries, neighbour references and adapter handle references from eight to four, preserving all four peer-B cookies and their counters. Recovered traffic restored eight entries without any rearm or unexpected error. |
+| Persistent TCP | The original peer-A socket completed verified records across a 3.54-second ARP suppression window. Peer B continued on its original TCP/UDP sockets. No TCP reconnect was accepted. |
+| Steady forwarding after recovery | Both TCP connections each sent and received 4 MiB of verified payload over eight seconds. Both UDP connections exchanged 256 verified echoes, with exactly 256 hardware hits and 76,288 hardware bytes in each direction. Software TX was eth3 8 / eth4 15; aggregate CPU was 2.13%, softirq 0.41%. |
+| Earlier steady window | The same packet and counter checks passed before faults, with software TX eth3 8 / eth4 16. CPU was 8.85%, softirq 0.44%; retain this separate sample rather than treating either paced window as a line-rate benchmark. |
+| Multiple-connection and gateway regressions | Both passed, 104.17 seconds combined. The 64-direction mixed TCP/UDP lifecycle retained independent ownership. Gateway MAC/ARP recovery became selective; next-hop route replacement still required explicit table recreation. |
+| Selective retirement failure | Passed in 11.57 seconds. Two injected barrier failures during peer-A neighbour deletion escalated to global invalidation: all eight directions retired, both reference counts and quarantine drained to zero, fatal remained clear, and verified traffic continued in software. Hardware admission remained closed until explicit table recreation. |
+| Global recovery regression | Passed in 22.76 seconds. Device MTU change under traffic, route MTU change and two injected barrier failures each recovered after table recreation. Rebinding a populated table remained refused. |
+| Final restoration | Cumulative installs/deletes both 134; entries, bindings, neighbour/handle references, quarantine, fatal and invalidation all zero. Four cumulative errors were the four deliberately injected barrier failures. Five global rearms came from route/device/failure checks; the selective acceptance needed none. Test routes, addresses, namespaces, NAT rules, traffic and NUD tuning were removed/restored. |
+| Instrumentation | No KASAN, lockdep, Oops or panic reports in the test windows or final dmesg; taint remained 4096 for the existing out-of-tree modules. |
+
+Two earlier acceptance attempts stopped on harness assumptions: sysfs still
+represented the original namespace after `setns()`, and a TCP ARP retry could
+advance FAILED to INCOMPLETE before the diagnostic read. The helper now queries
+links through namespace-aware Netlink, and the fault check accepts either
+unusable resolution state. Those logs remain under `proof/` and `proof2/`;
+`proof3/` is the complete successful lifecycle. No forwarding-loss tolerance
+or hardware counter assertion was relaxed.
+
+The KASAN image was built and staged. Live kernel build ID is
+`d8cf2f0ee1cecbb8f51c718edccf422285e17059`; CDX build ID is
+`6b35e016d661b58fd677721adeb708a48aefad48`. The final rebuild after a comment-only
+clarification produced the same binaries and staged image SHA-256:
+`83c134b98e8305747baf910891248a6afde662c89d32cee80192cb6f4af478e4`.
+KASAN, lockdep, kmemleak and failslab remained enabled. Only focused tests ran;
+there was no full KASAN suite or forced kmemleak scan. CMM stayed disabled and
+there was no reboot between acceptance and regression tests.
+
+From a clean experimental boot, reproduce the two new checks with:
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 \
+  ASK_FLOWTABLE_ARTIFACTS=/tmp/ask-flowtable-selective \
+  make ask-test ASK_TEST_ARGS='-k selective_neighbour -x -q'
+```
+
+Artifacts are under `/tmp/ask-flowtable-selective/`: successful `proof3/`,
+`regression/`, `barrier/` and `rearm/` measurements, matching logs/XML, host logs,
+image/source identities and restoration evidence. Initial and final build logs
+are `/tmp/ask-flowtable-selective-build.log` and
+`/tmp/ask-flowtable-selective-final-build.log`.
+
+Stop at this increment. This proves selective neighbour recovery for the
+existing bounded IPv4 TCP/UDP scope. Selective route/device handling and further
+foundation work remain separate increments; no additional encapsulation,
+forwarding feature or firmware capability is introduced here.

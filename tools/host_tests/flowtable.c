@@ -62,7 +62,8 @@ static void list_init(struct list_head *h) { h->next = h->prev = h; }
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define ERR_PTR(e) ((void *)(intptr_t)(e))
 #define lockdep_assert_held(p) assert(*(p))
-enum tc_setup_type { TC_SETUP_FT };
+enum tc_setup_type { TC_SETUP_FT, TC_SETUP_CLSFLOWER };
+enum { FLOW_CLS_REPLACE, FLOW_CLS_DESTROY, FLOW_CLS_STATS };
 enum { FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS, FLOW_BLOCK_BIND, FLOW_BLOCK_UNBIND };
 struct Qdisc { int unused; };
 struct flow_block { struct list_head cb_list; };
@@ -114,7 +115,7 @@ static void read_unlock_bh(bool *lock) { assert(*lock); *lock = false; }
 #define spin_unlock read_unlock_bh
 #define spin_lock_bh read_lock_bh
 #define spin_unlock_bh read_unlock_bh
-struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh; };
+struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh, use_hw_handles; };
 struct nf_conn { struct net *net; unsigned zone[2], mark, status, protonum, tcp_state; };
 #define nf_ct_protonum(c) ((c)->protonum)
 static bool nf_conntrack_tcp_established(const struct nf_conn *c)
@@ -163,9 +164,21 @@ struct flow_rule {
 GETMATCH(meta) GETMATCH(control) GETMATCH(basic) GETMATCH(ipv4_addrs) GETMATCH(ports)
 GETMATCH(tcp)
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
+struct nf_flow_offload_handle { unsigned refs; bool invalid; };
+static struct nf_flow_offload_handle handle;
+static bool nf_flow_offload_handle_valid(const struct nf_flow_offload_handle *h)
+{ return h && !h->invalid; }
+static bool nf_flow_offload_handle_invalidate(struct nf_flow_offload_handle *h)
+{ bool old = h->invalid; h->invalid = true; return !old; }
+static void nf_flow_offload_handle_get(struct nf_flow_offload_handle *h)
+{ assert(h->refs); h->refs++; }
+static void nf_flow_offload_handle_put(struct nf_flow_offload_handle *h)
+{ assert(h->refs > 1); h->refs--; }
 struct flow_cls_offload {
     const struct nf_conn *nf_ct;
     struct dst_entry *nf_dst;
+    struct nf_flow_offload_handle *nf_handle;
+    unsigned command;
     u16 nf_mtu;
     bool nf_counter;
     struct { unsigned chain_index, protocol; } common;
@@ -178,15 +191,17 @@ static void flow_stats_update(struct flow_stats *s, u64 b, u64 p, u64 d, unsigne
 #include "flowtable_types.inc"
 struct cdx_ft_hw { struct cdx_ft_counters stats; };
 struct work_struct { int unused; };
-static int ft_work;
+static int ft_work, ft_neigh_work;
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
 static LIST_HEAD(ft_neigh_entries);
 static bool ft_neigh_lock;
 static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage;
-static unsigned ft_neighbour_refs;
-static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms;
+static unsigned ft_neighbour_refs, ft_handle_refs;
+static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
+static u64 ft_neigh_invalidations;
+static void atomic64_inc(u64 *v) { (*v)++; }
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
 static unsigned long jiffies = 1000;
@@ -212,6 +227,8 @@ static unsigned cdx_ft_hw_pending(void) { return private_pending; }
 static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
 static void cdx_ft_hw_quiesced(void) { assert(cdx_info->ctrl.mutex && !quiesce_fail); }
 static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
+static unsigned neigh_scheduled;
+static void schedule_work(int *work) { assert(work == &ft_neigh_work); neigh_scheduled++; }
 static void nf_flow_table_cleanup(struct net_device *dev)
 { assert(!cdx_info->ctrl.mutex); flushed++; if (cleanup_hook) cleanup_hook(); }
 static void dev_hold(struct net_device *d) { d->refs++; }
@@ -244,7 +261,7 @@ static int neigh_event_send(struct neighbour *n, void *skb)
 }
 static void *kzalloc(size_t n, int flags) { if (allocation_fail) return NULL; allocated++; return calloc(1, n); }
 static void kfree(void *p) { assert(allocated); allocated--; free(p); }
-static int ft_rule_callback(enum tc_setup_type t, void *data, void *priv) { return 0; }
+static int ft_rule_callback(enum tc_setup_type t, void *data, void *priv);
 static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *ptr);
 typedef int (*rule_callback_t)(enum tc_setup_type, void *, void *);
 static struct flow_block_cb *flow_indr_block_cb_alloc(rule_callback_t fn, void *ident,
@@ -304,6 +321,8 @@ static struct ports pk, pm;
 static struct tcp tk, tm;
 static void fixture(void)
 {
+    assert(!ft_handle_refs && handle.refs <= 1);
+    handle = (struct nf_flow_offload_handle){ .refs = 1 };
     assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && ft_neigh_entries.next == &ft_neigh_entries);
     neighbour = (struct neighbour){ .tbl = &arp_tbl, .nud_state = NUD_PERMANENT,
                                   .ha = {2,0x11,0x22,0x33,0x44,0x55}, .dev = &out,
@@ -341,7 +360,7 @@ static void fixture(void)
     rule.action.entries[4].id = FLOW_ACTION_REDIRECT;
     rule.action.entries[4].dev = &out;
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1492,
-        .cookie = 123, .common.protocol = ETH_P_ALL };
+        .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
 }
 static void tcp_fixture(void)
@@ -408,7 +427,7 @@ static void test_rearm(void)
     u64 errors = ft_errors, installs = ft_installs, deletes = ft_deletes;
     for (unsigned cycle = 0; cycle < 8; cycle++) {
         assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
-        assert(table.use_neigh);
+        assert(table.use_neigh && table.use_hw_handles);
         invalidate_on_bind = true;
         assert(bind_device(&out, FLOW_BLOCK_BIND) == 0);
         invalidate_on_bind = false;
@@ -521,7 +540,7 @@ static void test_gateways(void)
         assert(!ft_invalid);
         alternate_gateway.ha[5]++;
         ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &alternate_gateway);
-        assert(ft_invalid && ft_remove(e) == 0);
+        assert(!ft_invalid && handle.invalid && ft_remove(e) == 0);
         ft_invalid = 0;
     }
     fixture(); route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
@@ -557,7 +576,7 @@ static void test_neighbours(void)
         assert(!ft_invalid);
         neighbour.ha[5]++;
         ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
-        assert(ft_invalid && ft_count == 1); /* Atomic callback only latches. */
+        assert(!ft_invalid && handle.invalid && ft_count == 1); /* Atomic callback only latches. */
         assert(ft_remove(e) == 0 && !neighbour.refs && !ft_neighbour_refs);
         ft_invalid = 0;
         ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
@@ -571,7 +590,7 @@ static void test_neighbours(void)
         struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
         neighbour.nud_state = invalid[i];
         ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
-        assert(ft_invalid);
+        assert(!ft_invalid && handle.invalid);
         unsigned uses = neigh_uses;
         e->hw->stats.packets++;
         assert(ft_stats(e, &cls) == -EOPNOTSUPP && neigh_uses == uses);
@@ -584,21 +603,21 @@ static void test_neighbours(void)
     assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
     change_neigh_on_lookup = false;
     fixture(); change_neigh_on_add = true; /* Watch precedes hardware insertion. */
-    assert(ft_replace(&binding, &cls) == -EIO && ft_invalid);
+    assert(ft_replace(&binding, &cls) == -EIO && !ft_invalid && handle.invalid);
     assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && !live_hw && !allocated);
     change_neigh_on_add = false; ft_invalid = 0;
     fixture(); assert(ft_replace(&binding, &cls) == 0);
     struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
     neigh_send_error = 1; e->hw->stats.packets++;
-    assert(ft_stats(e, &cls) == -EOPNOTSUPP && ft_invalid);
+    assert(ft_stats(e, &cls) == -EOPNOTSUPP && !ft_invalid && handle.invalid);
     assert(ft_remove(e) == 0); neigh_send_error = 0; ft_invalid = 0;
     fixture(); assert(ft_replace(&binding, &cls) == 0);
     cls.cookie++; pk.src = htons(10001);
     assert(ft_replace(&binding, &cls) == 0 && ft_neighbour_refs == 2 && neighbour.refs == 2);
     neighbour.dead = true;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
-    assert(ft_invalid && ft_count == 2);
-    ft_invalidate_work(NULL);
+    assert(!ft_invalid && handle.invalid && ft_count == 2);
+    ft_neigh_invalidate_work(NULL);
     assert(!ft_count && !live_hw && !allocated && !ft_neighbour_refs && !neighbour.refs);
     assert(ft_neigh_entries.next == &ft_neigh_entries && !out.refs);
     assert(ft_installs == ft_deletes);
@@ -678,19 +697,96 @@ static void test_connections(void)
     assert(ft_installs == installs + ARRAY_SIZE(entries) + 1 && ft_errors == errors);
     assert(!ft_invalid && !ft_fatal);
 
-    /* The next increment will make invalidation selective. At this increment
-     * a dependency change still drains the entire admitted set safely. */
+    /* Every entry here shares the changed dependency; all must be drained. */
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
         connection_rule(i);
         assert(ft_replace(&binding, &cls) == 0);
     }
     neighbour.dead = true;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
-    assert(ft_invalid && ft_count == ARRAY_SIZE(entries));
-    ft_invalidate_work(NULL);
+    assert(!ft_invalid && handle.invalid && ft_count == ARRAY_SIZE(entries));
+    ft_neigh_invalidate_work(NULL);
     assert(!ft_count && !live_hw && !allocated && !ft_neighbour_refs && !neighbour.refs);
     assert(!out.refs && ft_installs == ft_deletes && ft_errors == errors);
     ft_invalid = 0; ft_invalid_done = false;
+}
+
+static void test_selective_neighbours(void)
+{
+    struct nf_flow_offload_handle contexts[3] = { {1, false}, {1, false}, {1, false} };
+    struct cdx_ft_entry *entries[4];
+    u64 invalidations = ft_neigh_invalidations, errors = ft_errors;
+
+    fixture();
+    for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
+        cls.nf_handle = &contexts[i / 2];
+        cls.cookie = 5000 + i;
+        pk.src = htons(11000 + i);
+        route.rt_gw_family = i & 1 ? 0 : AF_INET;
+        route.rt_gw4 = i < 2 ? gateway.primary_key : alternate_gateway.primary_key;
+        assert(ft_replace(&binding, &cls) == 0);
+        entries[i] = ft_find(&binding, cls.cookie);
+        entries[i]->hw->stats.packets = 100 + i;
+    }
+    assert(contexts[0].refs == 3 && contexts[1].refs == 3 && ft_handle_refs == 4);
+    gateway.nud_state = NUD_FAILED;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
+    assert(contexts[0].invalid && !contexts[1].invalid);
+    assert(ft_neigh_invalidations == invalidations + 1 && !ft_invalid && ft_count == 4);
+    ft_neigh_invalidate_work(NULL);
+    assert(ft_count == 2 && ft_handle_refs == 2 && ft_neighbour_refs == 2);
+    assert(contexts[0].refs == 1 && contexts[1].refs == 3);
+    assert(!ft_find(&binding, 5000) && !ft_find(&binding, 5001));
+    assert(ft_find(&binding, 5002) == entries[2] && ft_find(&binding, 5003) == entries[3]);
+    assert(entries[2]->hw->stats.packets == 102 && entries[3]->hw->stats.packets == 103);
+
+    /* Even after resolution, a queued add for the invalid generation fails.
+     * A fresh Linux generation can reuse its cookie without inheriting state. */
+    gateway.nud_state = NUD_PERMANENT;
+    cls.nf_handle = &contexts[0]; cls.cookie = 5000; pk.src = htons(11000);
+    route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+    assert(ft_replace(&binding, &cls) == -EOPNOTSUPP && ft_count == 2);
+    cls.nf_handle = &contexts[2];
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 3);
+    struct cdx_ft_entry *fresh = ft_find(&binding, cls.cookie);
+    assert(!fresh->reported.packets && !fresh->hw->stats.packets);
+    cls.nf_handle = &contexts[0];
+    cls.command = FLOW_CLS_DESTROY;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+    assert(ft_find(&binding, cls.cookie) == fresh);
+    cls.command = FLOW_CLS_STATS;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ENOENT);
+    cls.command = FLOW_CLS_REPLACE;
+    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ESTALE);
+    assert(ft_count == 3 && !ft_invalid && ft_errors == errors);
+
+    /* A retirement error must escalate globally, including the unaffected
+     * connection, before recovery can be announced. */
+    gateway.nud_state = NUD_FAILED;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
+    deletion_error = -EAGAIN;
+    ft_neigh_invalidate_work(NULL);
+    deletion_error = 0;
+    assert(ft_invalid && !ft_fatal && ft_errors == errors + 1 && ft_count == 2);
+    ft_invalidate_work(NULL);
+    assert(ft_invalid_done && !ft_count && !ft_handle_refs && !ft_neighbour_refs);
+    assert(!live_hw && !allocated && !out.refs && ft_installs == ft_deletes);
+    for (unsigned i = 0; i < ARRAY_SIZE(contexts); i++) assert(contexts[i].refs == 1);
+    ft_invalid = 0; ft_invalid_done = false;
+
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    unsigned queued = neigh_scheduled;
+    ft_stopping = true;
+    neighbour.dead = true;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+    assert(neigh_scheduled == queued && handle.invalid);
+    ft_neigh_invalidate_work(NULL);
+    assert(ft_count == 1); /* Shutdown's binding release owns this retirement. */
+    assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
+    ft_stopping = false;
+    assert(!ft_handle_refs && handle.refs == 1 && !allocated);
 }
 
 int main(void)
@@ -703,7 +799,8 @@ int main(void)
     assert(!memcmp(decoded.dst_mac, (u8[]){2,0x11,0x22,0x33,0x44,0x55}, 6));
     assert(!memcmp(decoded.src_mac, out.dev_addr, 6));
     REJECT(cls.nf_ct = NULL); REJECT(ct.net = NULL); REJECT(ct.zone[0] = 1); REJECT(ct.zone[1] = 1);
-    REJECT(cls.nf_counter = true);
+    REJECT(cls.nf_counter = true); REJECT(cls.nf_handle = NULL);
+    REJECT(handle.invalid = true);
     REJECT(ct.mark = 1); REJECT(ct.status = IPS_NAT_MASK); REJECT(cls.nf_mtu = 0);
     REJECT(cls.nf_mtu = 67); REJECT(cls.nf_mtu = 1501); REJECT(cls.common.chain_index = 1);
     REJECT(cls.common.protocol = 0); REJECT(dissector.used_keys |= BIT(10));
@@ -777,5 +874,6 @@ int main(void)
     test_gateways();
     test_connections();
     test_neighbours();
+    test_selective_neighbours();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

@@ -62,7 +62,11 @@ async def observe(r, operation, label):
     return result
 
 
-async def recover(r):
+async def recover(r, *, global_invalidation=False):
+    if not global_invalidation:
+        state = await r.state()
+        assert state["invalidated"] == 0 and state["bindings"] == 2, state
+        return  # Linux retires the old generation and admits fresh traffic.
     await r.delete_table()
     await r.wait(lambda s: s["rearm_ready"] == 1 and s["neighbour_refs"] == 0)
     before = await r.state()
@@ -73,10 +77,12 @@ async def recover(r):
     assert after["rearms"] == before["rearms"] + 1 and after["invalidated"] == 0, (before, after)
 
 
-async def invalidated(r, before, label):
-    state = await r.wait(lambda s: s["invalidation_done"] == 1 and s["entries"] == 0)
-    assert state["invalidated"] == 1 and state["bindings"] == 2, state
-    assert state["neighbour_refs"] == state["errors"] == state["fatal"] == state["quarantine"] == 0, state
+async def invalidated(r, before, label, *, global_invalidation=False):
+    state = await r.wait(lambda s: s["entries"] == 0 and (
+        s["invalidation_done"] == 1 if global_invalidation else
+        s["neighbour_invalidations"] > before["neighbour_invalidations"]))
+    assert state["invalidated"] == int(global_invalidation) and state["bindings"] == 2, state
+    assert state["handle_refs"] == state["neighbour_refs"] == state["errors"] == state["fatal"] == state["quarantine"] == 0, state
     assert state["installs"] == before["installs"] and state["rearms"] == before["rearms"], (before, state)
     r.record(f"arp-{r.proto}-{label}", {"before": before, "after": state, "neighbours": await neighbours(r)})
     return state
@@ -221,7 +227,7 @@ async def test_flowtable_arp_udp(rig):
         await wait_neighbour(r, lambda ns: ns.get(r.lan_ip, {}).get("lladdr") == CHANGED_MAC)
         tx_before = await software_tx(r)
         await r.exchange(64, promiscuous=False)
-        assert (await software_tx(r))[TARGET_LAN_IF] - tx_before[TARGET_LAN_IF] >= 64
+        assert (await software_tx(r))[TARGET_LAN_IF] > tx_before[TARGET_LAN_IF]
         await recover(r)
         before = await udp_hardware(r, label="mac-recovered")
         failure = await lan_neighbour(r, arp_ignore=8)

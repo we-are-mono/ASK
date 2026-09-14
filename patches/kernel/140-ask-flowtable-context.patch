@@ -1,74 +1,212 @@
-From 81e12893790c9f08605aaf5a1f9148f0a53819dd Mon Sep 17 00:00:00 2001
+From 0b75c78ff12a3f569ef92aa1b8243c24ca626268 Mon Sep 17 00:00:00 2001
 From: ASK maintainers <ask@localhost>
 Date: Mon, 14 Sep 2026 23:03:32 +0200
-Subject: [PATCH] netfilter: provide hardware context and neighbour-aware
- flowtable fallback
+Subject: [PATCH] netfilter: provide hardware context and selective flow
+ invalidation
 
-Expose borrowed conntrack context, effective MTU and accounting requirements
+Expose borrowed conntrack, selected NEIGH route, MTU and accounting context
 to hardware adapters without recovering a flow from its opaque cookie.
 
-Allow an adapter to request neighbour output for routed software fallback.
-Native DIRECT tuples cache Ethernet addresses and bypass neighbour output,
-including when hardware admission fails. They can continue using an old MAC
-after ARP has learned a replacement. Keep routed tuples on XMIT_NEIGH for
-opted-in tables while retaining normal hardware rule generation. Retire any
-DIRECT tuple built concurrently with binding before packet rewriting, for
-both IPv4 and IPv6. The request is monotonic and survives device unbinding.
+Allow adapters to request neighbour-aware software fallback and explicit
+invalidation handles before admission. Each opted-in flow owns one handle,
+shared by both directions. Drivers may retain it with get/put without
+pinning a flow, table, conntrack or namespace. Atomic invalidation excludes
+cached lookup immediately; native GC performs ordinary flow teardown.
+Detaching the Linux flow invalidates its handle too. RCU reclamation
+protects lockless lookups, and retained handles cannot name a replacement
+flow after tuple or cookie reuse. Handle allocation failure leaves normal
+stack forwarding available through the existing flow-add error path.
 
-The default remains unchanged. This is a downstream kernel-internal
-interface; no userspace ABI changes.
+Native DIRECT tuples cache Ethernet addresses and bypass neighbour output.
+Keep routed software tuples on XMIT_NEIGH for opted-in tables and retire
+DIRECT tuples built concurrently with binding before packet rewriting.
+Both requests are monotonic for the table and survive device unbinding.
+
+Other tables retain their existing behaviour and allocate no handles.
+This is a downstream kernel-internal interface; no userspace ABI changes.
 ---
- include/net/flow_offload.h            |  8 ++++++++
- include/net/netfilter/nf_flow_table.h |  3 +++
- net/netfilter/nf_flow_table_core.c    |  1 +
- net/netfilter/nf_flow_table_ip.c      | 14 +++++++++++---
- net/netfilter/nf_flow_table_offload.c | 16 +++++++++++++++-
+ include/net/flow_offload.h            | 12 ++++++
+ include/net/netfilter/nf_flow_table.h | 20 +++++++++
+ net/netfilter/nf_flow_table_core.c    | 62 ++++++++++++++++++++++++++-
+ net/netfilter/nf_flow_table_ip.c      | 14 ++++--
+ net/netfilter/nf_flow_table_offload.c | 17 +++++++-
  net/netfilter/nft_flow_offload.c      |  1 +
- 6 files changed, 39 insertions(+), 4 deletions(-)
+ 6 files changed, 120 insertions(+), 6 deletions(-)
 
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f..e22fcfe 100644
+index 292cd8f..ee17a6b 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,15 @@ struct flow_cls_common_offload {
+@@ -688,7 +688,19 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
-+/* Netfilter context is borrowed for the duration of a callback. It is NULL
-+ * for other producers. Drivers must not retain either pointer. nf_dst is the selected
-+ * routed NEIGH destination; other transmit types provide NULL. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 3
++struct nf_flow_offload_handle;
++
++/* Context is borrowed for the callback and NULL for other producers. Drivers
++ * must not retain nf_ct or nf_dst. nf_dst is the selected NEIGH destination;
++ * other transmit types provide NULL. nf_handle may be retained only through
++ * nf_flow_offload_handle_get/put; it carries no flow/table/conntrack pointer. */
++#define FLOW_CLS_HAS_NF_CONTEXT 4
  struct flow_cls_offload {
 +	const struct nf_conn *nf_ct;
 +	struct dst_entry *nf_dst;
++	struct nf_flow_offload_handle *nf_handle;
 +	u16 nf_mtu;
 +	bool nf_counter;
  	struct flow_cls_common_offload common;
  	enum flow_cls_command command;
  	bool use_act_stats;
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 1a6fca0..e4409e9 100644
+index 1a6fca0..0b81c9f 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
-@@ -84,6 +84,9 @@ struct nf_flowtable {
+@@ -84,6 +84,12 @@ struct nf_flowtable {
  	struct flow_block		flow_block;
  	struct rw_semaphore		flow_block_lock; /* Guards flow_block */
  	possible_net_t			net;
 +	/* A hardware adapter may request neighbour output for routed software
 +	 * fallback at bind. Set monotonically; retained until table destruction. */
 +	bool				use_neigh;
++	/* Request explicit hardware invalidation handles before first admission.
++	 * Monotonic for this table, including after device unbinding. */
++	bool				use_hw_handles;
  };
  
  static inline bool nf_flowtable_hw_offload(struct nf_flowtable *flowtable)
+@@ -180,6 +186,7 @@ enum flow_offload_type {
+ struct flow_offload {
+ 	struct flow_offload_tuple_rhash		tuplehash[FLOW_OFFLOAD_DIR_MAX];
+ 	struct nf_conn				*ct;
++	struct nf_flow_offload_handle		*hw_handle;
+ 	unsigned long				flags;
+ 	u16					type;
+ 	u32					timeout;
+@@ -221,6 +228,19 @@ struct nf_flow_route {
+ struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
+ void flow_offload_free(struct flow_offload *flow);
+ 
++/* A callback borrows a handle for one flow generation, shared by both
++ * directions. get/put permit retention without pinning any flow, conntrack,
++ * table, route or namespace. Invalidate is atomic-context safe and monotonic:
++ * lookup immediately declines this cached flow and native GC tears it down.
++ * The driver remains responsible for removing its hardware directions.
++ * Detaching the Linux flow also invalidates the handle; it cannot name a
++ * replacement flow even if its tuple or cookie is reused.
++ */
++void nf_flow_offload_handle_get(struct nf_flow_offload_handle *handle);
++void nf_flow_offload_handle_put(struct nf_flow_offload_handle *handle);
++bool nf_flow_offload_handle_valid(const struct nf_flow_offload_handle *handle);
++bool nf_flow_offload_handle_invalidate(struct nf_flow_offload_handle *handle);
++
+ static inline int
+ nf_flow_table_offload_add_cb(struct nf_flowtable *flow_table,
+ 			     flow_setup_cb_t *cb, void *cb_priv)
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index df72b03..b943473 100644
+index df72b03..452ff72 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -542,6 +542,7 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
+@@ -17,6 +17,55 @@
+ static DEFINE_MUTEX(flowtable_lock);
+ static LIST_HEAD(flowtables);
+ 
++struct nf_flow_offload_handle {
++	refcount_t refs;
++	atomic_t invalid;
++	struct rcu_head rcu_head;
++};
++
++static struct nf_flow_offload_handle *nf_flow_offload_handle_alloc(void)
++{
++	struct nf_flow_offload_handle *handle;
++
++	handle = kzalloc(sizeof(*handle), GFP_ATOMIC);
++	if (handle) {
++		refcount_set(&handle->refs, 1);
++		atomic_set(&handle->invalid, 0);
++	}
++	return handle;
++}
++
++void nf_flow_offload_handle_get(struct nf_flow_offload_handle *handle)
++{
++	refcount_inc(&handle->refs);
++}
++EXPORT_SYMBOL_GPL(nf_flow_offload_handle_get);
++
++void nf_flow_offload_handle_put(struct nf_flow_offload_handle *handle)
++{
++	/* Flowtable lookups borrow the handle under RCU, without a reference. */
++	if (handle && refcount_dec_and_test(&handle->refs))
++		kfree_rcu(handle, rcu_head);
++}
++EXPORT_SYMBOL_GPL(nf_flow_offload_handle_put);
++
++bool nf_flow_offload_handle_valid(const struct nf_flow_offload_handle *handle)
++{
++	return handle && !atomic_read(&handle->invalid);
++}
++EXPORT_SYMBOL_GPL(nf_flow_offload_handle_valid);
++
++bool nf_flow_offload_handle_invalidate(struct nf_flow_offload_handle *handle)
++{
++	return handle && !atomic_xchg(&handle->invalid, 1);
++}
++EXPORT_SYMBOL_GPL(nf_flow_offload_handle_invalidate);
++
++static bool flow_offload_hw_invalid(const struct flow_offload *flow)
++{
++	return flow->hw_handle && !nf_flow_offload_handle_valid(flow->hw_handle);
++}
++
+ static void
+ flow_offload_fill_dir(struct flow_offload *flow,
+ 		      enum flow_offload_tuple_dir dir)
+@@ -207,6 +256,8 @@ static void flow_offload_route_release(struct flow_offload *flow)
+ 
+ void flow_offload_free(struct flow_offload *flow)
+ {
++	nf_flow_offload_handle_invalidate(flow->hw_handle);
++	nf_flow_offload_handle_put(flow->hw_handle);
+ 	switch (flow->type) {
+ 	case NF_FLOW_OFFLOAD_ROUTE:
+ 		flow_offload_route_release(flow);
+@@ -276,6 +327,11 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+ {
+ 	int err;
+ 
++	if (READ_ONCE(flow_table->use_hw_handles) && !flow->hw_handle) {
++		flow->hw_handle = nf_flow_offload_handle_alloc();
++		if (!flow->hw_handle)
++			return -ENOMEM;
++	}
+ 	flow->timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
+ 
+ 	err = rhashtable_insert_fast(&flow_table->rhashtable,
+@@ -363,7 +419,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
+-	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
++	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags) || flow_offload_hw_invalid(flow))
+ 		return NULL;
+ 
+ 	if (unlikely(nf_ct_is_dying(flow->ct)))
+@@ -417,7 +473,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 				    struct flow_offload *flow, void *data)
+ {
+-	if (nf_flow_has_expired(flow) ||
++	if (flow_offload_hw_invalid(flow) || nf_flow_has_expired(flow) ||
+ 	    nf_ct_is_dying(flow->ct) ||
+ 	    nf_flow_custom_gc(flow_table, flow))
+ 		flow_offload_teardown(flow);
+@@ -542,6 +598,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
  {
  	int err;
  
 +	flowtable->use_neigh = false;
++	flowtable->use_hw_handles = false;
  	INIT_DELAYED_WORK(&flowtable->gc_work, nf_flow_offload_work_gc);
  	flow_block_init(&flowtable->flow_block);
  	init_rwsem(&flowtable->flow_block_lock);
@@ -113,7 +251,7 @@ index 98edcaa..632a92b 100644
  		return 0;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f5..a79b703 100644
+index 4f346f5..e06f28c 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -896,6 +896,15 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
@@ -132,7 +270,7 @@ index 4f346f5..a79b703 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +913,12 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +913,13 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
@@ -140,6 +278,7 @@ index 4f346f5..a79b703 100644
 +	struct flow_cls_offload cls_flow = {
 +		.nf_ct = flow->ct,
 +		.nf_dst = nf_flow_offload_dst(&flow->tuplehash[dir].tuple),
++		.nf_handle = flow->hw_handle,
 +		.nf_mtu = flow->tuplehash[dir].tuple.mtu,
 +		.nf_counter = !!(READ_ONCE(flowtable->flags) & NF_FLOWTABLE_COUNTER),
 +	};

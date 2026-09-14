@@ -5,7 +5,9 @@ controls the workload while the single console operation remains in flight.
 Every exchange carries its connection ID and a monotonically increasing serial.
 """
 import asyncio
+from contextlib import contextmanager
 import json
+import os
 import socket
 import struct
 import time
@@ -18,6 +20,21 @@ def payload(ident, serial, size):
     return struct.pack("!IQ", ident, serial) + bytes([ident % 251]) * (size - 12)
 
 
+@contextmanager
+def namespace(spec):
+    # No await is permitted in this context: other tasks share this thread.
+    # Sockets retain their creation namespace after the thread returns.
+    if "netns" not in spec:
+        yield
+        return
+    with open('/proc/self/ns/net', 'rb') as original, open('/var/run/netns/' + spec["netns"], 'rb') as peer:
+        os.setns(peer.fileno(), os.CLONE_NEWNET)
+        try:
+            yield
+        finally:
+            os.setns(original.fileno(), os.CLONE_NEWNET)
+
+
 class Flow:
     def __init__(self, spec):
         self.spec = spec
@@ -26,10 +43,11 @@ class Flow:
         self.stop = asyncio.Event()
 
     async def open(self, config):
-        local = (config["lan"], self.spec["sport"])
+        local = (self.spec.get("lan", config["lan"]), self.spec["sport"])
         remote = (config["wan"], config["dport"])
         if self.spec["proto"] == "tcp":
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            with namespace(self.spec):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -43,7 +61,8 @@ class Flow:
             self.writer.write(json.dumps({"id": self.spec["id"]}).encode() + b"\n")
             await self.writer.drain()
         else:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            with namespace(self.spec):
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.setblocking(False)
             self.sock.bind(local)
             self.sock.connect(remote)
@@ -57,7 +76,7 @@ class Flow:
         started = time.monotonic()
         while not self.stop.is_set() and (not count or self.serial - first < count):
             data = payload(self.spec["id"], self.serial, size)
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(20 if self.writer else 5):
                 if self.writer:
                     self.writer.write(data)
                     await self.writer.drain()
@@ -113,7 +132,13 @@ async def main(config):
                 op, ids = command["op"], command.get("ids", [])
                 result = {}
                 if op == "open":
-                    await asyncio.gather(*(flows[i].open(config) for i in ids))
+                    async with asyncio.TaskGroup() as group:
+                        for ident in ids:
+                            group.create_task(flows[ident].open(config))
+                elif op == "neighbour":
+                    flow = flows[command["ident"]]
+                    with namespace(flow.spec):
+                        result = configure_neighbour(flow.spec["iface"], flow.spec["lan"], **command["changes"])
                 elif op == "start":
                     for ident in ids:
                         assert ident not in running

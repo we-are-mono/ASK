@@ -6,14 +6,21 @@ Nothing changes until configure_neighbour is explicitly called by the test.
 
 
 def configure_neighbour(iface, address, mac=None, arp_ignore=None, restore_after=None):
+    import json
     import pathlib
     import subprocess
     import threading
     import time
 
-    interface = pathlib.Path("/sys/class/net") / iface
+    def link():
+        # Netlink follows setns(); the caller's existing sysfs mount may still
+        # describe its original namespace.
+        return json.loads(subprocess.check_output(
+            ["ip", "-j", "link", "show", "dev", iface], text=True))[0]
+
+    link()
     ignore = pathlib.Path("/proc/sys/net/ipv4/conf") / iface / "arp_ignore"
-    assert interface.is_dir() and ignore.is_file()
+    assert ignore.is_file()
     if restore_after is not None:
         assert arp_ignore == 8 and 0 < restore_after <= 15
     if arp_ignore is not None:
@@ -38,6 +45,6 @@ def configure_neighbour(iface, address, mac=None, arp_ignore=None, restore_after
               ARP(op=1, hwsrc=mac, psrc=address,
                   hwdst="00:00:00:00:00:00", pdst=address),
               iface=iface, count=2, inter=0.05, verbose=False)
-    return {"op": "neighbour", "mac": (interface / "address").read_text().strip(),
+    return {"op": "neighbour", "mac": link()["address"],
             "arp_ignore": int(ignore.read_text()), "time": time.time(),
             "restore_after": restore_after}
