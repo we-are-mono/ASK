@@ -152,6 +152,40 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A138 — external hash tables cannot be released, so the classifier
+  cannot be reinstalled without a reboot.** Under `USE_ENHANCED_EHASH` —
+  ASK's build mode — `FM_PCD_HashTableSet()` unconditionally routes to
+  `ExternalHashTableSet()`, but the matching delete was never written:
+
+  ```c
+  /* sdk_fman/Peripherals/FM/Pcd/fm_cc.c, FM_PCD_HashTableDelete() */
+  #else
+          return -1; /* delete table code not added for USE_ENHANCED_EHASH */
+  #endif
+  ```
+
+  `lnxwrp_exp_sym.h` also drops the `EXPORT_SYMBOL` for it inside
+  `#ifndef USE_ENHANCED_EHASH`, so kernel modules cannot even link against the
+  stub. The consequences are all visible in today's code and were inherited,
+  not introduced: `fmc_clean()` reaches the same stub through the ioctl shim,
+  which is why `dpa_app` prints *"FMC rollback failed; reboot before retrying"*;
+  `cdx_ioc_dpa_init_check()` refuses a second install outright; and
+  `dpa_cfg_deinit()` frees only the metadata, never the hardware tables. It is
+  also why cdx is a load-once module rather than one you can unload and reload.
+
+  A failed or torn-down install therefore leaks 84 tables' worth of DDR and
+  MURAM, and the only recovery is a reboot. `cdx_pcd_teardown()` releases the
+  ports, schemes, trees and network environment and logs the tables it has to
+  abandon.
+
+  The work is bounded: `InternalHashTableDelete()` and the non-enhanced
+  `ExternalHashTableDelete()` both exist and show the shape — walk the buckets,
+  release each cumulative entry and its MURAM AD, free the DDR table allocated
+  by `XX_MallocSmart()` in `ExternalHashTableSet()`, then drop the node. Doing
+  it would make the classifier reinstallable in place and remove the reboot from
+  every failure path above. Fixing it needs KASAN and rig validation, since it
+  is a free path over hardware-visible memory.
+
 - [ ] **A137 — `find_osdev_by_fman_params` trusts `netdev_priv` on any Ethernet
   device.** `cdx/devman.c:239` walks every netdev in `init_net`, filters on
   `dev->type == ARPHRD_ETHER`, then immediately does
