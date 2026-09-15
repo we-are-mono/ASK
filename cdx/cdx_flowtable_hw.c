@@ -47,10 +47,6 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	*result = NULL;
 	if (rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP)
 		return -EOPNOTSUPP;
-	if (rule->proto != IPPROTO_UDP &&
-	    (rule->new_src != rule->src || rule->new_dst != rule->dst ||
-	     rule->new_sport != rule->sport || rule->new_dport != rule->dport))
-		return -EOPNOTSUPP;
 	in_iface = dpa_get_ifinfo_by_netdev(rule->in);
 	out_iface = dpa_get_ifinfo_by_netdev(rule->out);
 	if (!in_iface || !out_iface || in_iface->itf_id >= L2_MAX_ONIF ||

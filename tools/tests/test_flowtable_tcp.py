@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -94,6 +95,7 @@ async def connection(r):
     writer = None
     try:
         reader, writer = await asyncio.wait_for(accepted.get(), 15)
+        assert writer.get_extra_info("peername") == getattr(r, "tcp_remote", (r.lan_ip, SPORT))
         assert json.loads(await asyncio.wait_for(reader.readline(), 5)) == {"ready": True}
         yield Connection(reader, writer, peer)
     finally:
@@ -169,7 +171,7 @@ async def software_tx(r):
 async def conntrack(r):
     return await command(r.target, r.session, "conntrack", "-L", "-p", "tcp",
                          "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
-                         "--sport", str(SPORT), "--dport", str(DPORT))
+                         "--sport", str(SPORT), "--dport", str(DPORT), "-o", "id")
 
 
 @asynccontextmanager
@@ -190,9 +192,10 @@ async def tcp_timeouts(r):
 
 async def capture_fin(r, conn):
     from scapy.all import AsyncSniffer, IP, TCP, wrpcap
+    remote, port = getattr(r, "tcp_remote", (r.lan_ip, SPORT))
     ready = threading.Event()
     sniffer = AsyncSniffer(iface=r.wan_if, store=True, started_callback=ready.set,
-                          filter=f"tcp and host {r.lan_ip} and port {SPORT} and port {DPORT}")
+                          filter=f"tcp and host {remote} and port {port} and port {DPORT}")
     sniffer.start()
     try:
         assert await asyncio.to_thread(ready.wait, 5), "TCP close capture did not start"
@@ -203,9 +206,9 @@ async def capture_fin(r, conn):
         ARTIFACTS.mkdir(parents=True, exist_ok=True)
         wrpcap(str(ARTIFACTS / "tcp-fin.pcap"), packets)
     fins = [p for p in packets if TCP in p and int(p[TCP].flags) & 1]
-    assert {p[IP].src for p in fins} == {r.lan_ip, WAN_IP}, fins
+    assert {p[IP].src for p in fins} == {remote, WAN_IP}, fins
     wan_fin = next(p for p in fins if p[IP].src == WAN_IP)
-    assert any(p[IP].src == r.lan_ip and int(p[TCP].flags) == 16 and
+    assert any(p[IP].src == remote and int(p[TCP].flags) == 16 and
                p[TCP].ack == (wan_fin[TCP].seq + 1) % (1 << 32)
                for p in packets if TCP in p), "endpoint's final ACK missing"
 
@@ -280,7 +283,8 @@ async def test_flowtable_tcp_retransmit_withdraw_rst(rig):
         await installed(r, conn)
         # Drop only this connection's inbound data at its WAN endpoint. ACKs
         # and management traffic remain usable. The sender must retransmit.
-        drop = ["INPUT", "-s", r.lan_ip, "-d", WAN_IP, "-p", "tcp", "--sport", str(SPORT),
+        remote, port = getattr(r, "tcp_remote", (r.lan_ip, SPORT))
+        drop = ["INPUT", "-s", remote, "-d", WAN_IP, "-p", "tcp", "--sport", str(port),
                 "--dport", str(DPORT), "-m", "length", "--length", "200:65535",
                 "-m", "comment", "--comment", "ask-flowtable-tcp-retransmit", "-j", "DROP"]
         await command(wan, r.session, "iptables", "-I", *drop)
@@ -295,6 +299,7 @@ async def test_flowtable_tcp_retransmit_withdraw_rst(rig):
         assert len(rows) == 1 and int(rows[0][0]) > 0, dropped
         assert report["retransmits"] > 0, report
         r.record("tcp-retransmit", {"transfer": report, "dropped_packets": int(rows[0][0]), "state": await r.state()})
+        ct_before = await conntrack(r)
         tx_before = await software_tx(r)
         traffic = asyncio.create_task(conn.transfer("download", size=16 * MIB))
         try:
@@ -302,10 +307,12 @@ async def test_flowtable_tcp_retransmit_withdraw_rst(rig):
             removed = await r.delete_table()
         finally:
             report = await traffic
+        ct_after = await conntrack(r)
+        assert re.findall(r"\bid=\d+", ct_before["stdout"]) == re.findall(r"\bid=\d+", ct_after["stdout"]) != []
         tx_after = await software_tx(r)
         assert tx_after[TARGET_LAN_IF] - tx_before[TARGET_LAN_IF] > 100, (tx_before, tx_after)
         assert removed["entries"] == removed["bindings"] == removed["quarantine"] == 0, removed
-        r.record("tcp-withdraw", {"transfer": report, "state": removed, "software_tx_before": tx_before, "software_tx_after": tx_after})
+        r.record("tcp-withdraw", {"transfer": report, "state": removed, "software_tx_before": tx_before, "software_tx_after": tx_after, "ct_before": ct_before, "ct_after": ct_after})
         await tcp_table(r)
         await installed(r, conn)
         await hardware_transfer(r, conn, "upload", label="tcp-hardware-after-withdraw")

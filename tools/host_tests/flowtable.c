@@ -38,6 +38,7 @@ typedef uint64_t u64, atomic64_t;
 #define IPS_SRC_NAT_DONE 0x80
 #define IS_ENABLED(x) 1
 #define TCA_CSUM_UPDATE_FLAG_IPV4HDR 1
+#define TCA_CSUM_UPDATE_FLAG_TCP 8
 #define TCA_CSUM_UPDATE_FLAG_UDP 16
 struct iphdr { u8 prefix[12]; __be32 saddr, daddr; };
 #define IPS_ASSURED 4
@@ -174,7 +175,7 @@ struct tcp { __be16 flags; };
 #define MATCH(t) struct flow_match_##t { struct t *key, *mask; }
 MATCH(meta); MATCH(control); MATCH(basic); MATCH(ipv4_addrs); MATCH(ports);
 MATCH(tcp);
-enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACTION_CSUM, FLOW_ACT_MANGLE_HDR_TYPE_IP4, FLOW_ACT_MANGLE_HDR_TYPE_UDP, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
+enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACTION_CSUM, FLOW_ACT_MANGLE_HDR_TYPE_IP4, FLOW_ACT_MANGLE_HDR_TYPE_UDP, FLOW_ACT_MANGLE_HDR_TYPE_TCP, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
 struct flow_action_entry {
     unsigned id, csum_flags;
     struct { unsigned htype, offset; u32 mask, val; } mangle;
@@ -488,10 +489,17 @@ static void fixture(void)
         .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
 }
-static void snat_fixture(bool forward)
+static void snat_fixture(bool forward, bool tcp)
 {
     fixture();
     ct.status = IPS_SRC_NAT | IPS_SRC_NAT_DONE;
+    if (tcp) {
+        ct.protonum = bk.ip_proto = IPPROTO_TCP;
+        ct.tcp_state = TCP_CONNTRACK_ESTABLISHED; ct.status |= IPS_ASSURED;
+        dissector.used_keys |= BIT(FLOW_DISSECTOR_KEY_TCP);
+        tk.flags = 0; tm.flags = htons(5);
+        rule.tcp = (struct flow_match_tcp){ &tk, &tm };
+    }
     ct.tuplehash[0].tuple = (struct nf_conntrack_tuple){
         .src = { .u3.ip = ik.src, .u.all = pk.src },
         .dst = { .u3.ip = ik.dst, .u.all = pk.dst } };
@@ -507,10 +515,10 @@ static void snat_fixture(bool forward)
     const u8 values[2][4] = {{0,0,0x27,0x10}, {0x9c,0x40,0,0}};
     const u8 masks[2][4] = {{0xff,0xff,0,0}, {0,0,0xff,0xff}};
     rule.action.entries[5] = (struct flow_action_entry){ .id = FLOW_ACTION_MANGLE,
-        .mangle.htype = FLOW_ACT_MANGLE_HDR_TYPE_UDP };
+        .mangle.htype = tcp ? FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP };
     memcpy(&rule.action.entries[5].mangle.val, values[forward], 4);
     memcpy(&rule.action.entries[5].mangle.mask, masks[forward], 4);
-    rule.action.entries[6] = (struct flow_action_entry){ .id = FLOW_ACTION_CSUM, .csum_flags = 17 };
+    rule.action.entries[6] = (struct flow_action_entry){ .id = FLOW_ACTION_CSUM, .csum_flags = tcp ? 9 : 17 };
     if (!forward) {
         ik = (struct ipv4_addrs){ htonl(0xc6336402), htonl(0xcb007104) };
         pk = (struct ports){ htons(20000), htons(40000) };
@@ -521,8 +529,9 @@ static void test_snat(void)
 {
     struct cdx_ft_rule decoded;
     struct nf_conn_nat nat = { .masq_index = 7 };
-    for (unsigned forward = 0; forward < 2; forward++) {
-        snat_fixture(forward);
+    for (unsigned variant = 0; variant < 4; variant++) {
+        bool forward = variant & 1, tcp = variant & 2;
+        snat_fixture(forward, tcp);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
         assert(decoded.src == ik.src && decoded.dst == ik.dst);
         assert(decoded.new_src == htonl(forward ? 0xcb007104 : 0xc6336402));
@@ -530,12 +539,20 @@ static void test_snat(void)
         assert(decoded.new_sport == htons(forward ? 40000 : 20000));
         assert(decoded.new_dport == htons(forward ? 20000 : 10000));
         assert(next_hop == decoded.new_dst);
-#define NAT_REJECT(change) do { snat_fixture(forward); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+#define NAT_REJECT(change) do { snat_fixture(forward, tcp); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
         NAT_REJECT(ct.status = IPS_NAT_MASK | IPS_SRC_NAT_DONE);
         NAT_REJECT(ct.status = IPS_SRC_NAT);
         NAT_REJECT(ct.status = 0);
         NAT_REJECT(ct.nat = &nat);
-        NAT_REJECT(ct.protonum = bk.ip_proto = IPPROTO_TCP);
+        NAT_REJECT(ct.protonum = bk.ip_proto = IPPROTO_ICMP);
+        NAT_REJECT(rule.action.entries[5].mangle.htype = tcp ? FLOW_ACT_MANGLE_HDR_TYPE_UDP : FLOW_ACT_MANGLE_HDR_TYPE_TCP);
+        NAT_REJECT(rule.action.entries[6].csum_flags = tcp ? 17 : 9);
+        if (tcp) {
+            NAT_REJECT(ct.status &= ~IPS_ASSURED);
+            NAT_REJECT(ct.tcp_state = 0);
+            NAT_REJECT(tk.flags = htons(TCPHDR_FIN));
+            NAT_REJECT(tm.flags = 0);
+        }
         NAT_REJECT(ik.src ^= htonl(1)); NAT_REJECT(pk.dst ^= htons(1));
         NAT_REJECT(ct.tuplehash[0].tuple.dst.u3.ip ^= htonl(1));
         NAT_REJECT(ct.tuplehash[0].tuple.dst.u.all ^= htons(1));
@@ -555,19 +572,19 @@ static void test_snat(void)
 #undef NAT_REJECT
         /* Native SNAT emits both edits even when address or port is unchanged.
          * Validate those identity edits without inventing another action shape. */
-        snat_fixture(forward);
+        snat_fixture(forward, tcp);
         ct.tuplehash[1].tuple.dst.u3.ip = ct.tuplehash[0].tuple.src.u3.ip;
         if (!forward) ik.dst = ct.tuplehash[1].tuple.dst.u3.ip;
         rule.action.entries[4].mangle.val = htonl(0xc0000202);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
         assert(decoded.src == decoded.new_src && decoded.dst == decoded.new_dst);
-        snat_fixture(forward);
+        snat_fixture(forward, tcp);
         ct.tuplehash[1].tuple.dst.u.all = ct.tuplehash[0].tuple.src.u.all;
         if (!forward) pk.dst = htons(10000);
         rule.action.entries[5].mangle.val = forward ? htonl(10000U << 16) : htonl(10000);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
         assert(decoded.sport == decoded.new_sport && decoded.dport == decoded.new_dport);
-        snat_fixture(forward);
+        snat_fixture(forward, tcp);
         for (unsigned stage = 1; stage <= 3; stage++) {
             ft_fail_stage = stage; assert(ft_replace(&binding, &cls) < 0);
             assert(!ft_fail_stage && !ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);

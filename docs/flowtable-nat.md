@@ -1,12 +1,12 @@
 # Linux flowtable NAT
 
-The first NAT increment supports static IPv4 UDP source NAT on the foundation's
+Static IPv4 TCP and UDP source NAT are supported on the foundation's
 two physical ports. Linux conntrack and nftables own the mapping. The adapter
 validates Linux's native actions and CDX encodes the resolved translation using
 the existing proprietary firmware interface. No CMM or per-flow FCI call is
 involved, and the shared legacy encoder is unchanged.
 
-TCP NAT, MASQUERADE, destination NAT, hairpin/double NAT and IPv6 remain outside
+MASQUERADE, destination NAT, hairpin/double NAT and IPv6 remain outside
 hardware eligibility. Those need separate increments and lifecycle proofs.
 The [foundation](flowtable-foundation.md) still supplies the capacity, device,
 route, neighbour, retirement and policy contracts. NAT does not lift those limits.
@@ -20,9 +20,9 @@ For a client `A:a` reaching server `B:b` through source translation `C:c`:
 | Original | `A:a → B:b` | `C:c → B:b` | `B` |
 | Reply | `B:b → C:c` | `B:b → A:a` | `A` |
 
-The adapter requires completed source NAT, a UDP match identical to one of the
+The adapter requires completed source NAT, a TCP/UDP match identical to one of the
 conntrack tuples, and consistent opposite tuple endpoints. It accepts exactly
-four Ethernet edits, one IPv4 edit, one UDP port edit, the native IPv4/UDP
+four Ethernet edits, one IPv4 edit, one transport port edit, the matching native IPv4/TCP or IPv4/UDP
 checksum action and a redirect. Masks, offsets and values must agree with the
 resolved mapping. Identity address or port edits are permitted; arbitrary flower
 rewrites, additional actions, DNAT and masquerade mappings are refused.
@@ -83,7 +83,20 @@ ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55100 \
   make ask-test ASK_TEST_ARGS='-q -k test_flowtable_startup_without_cmm_or_fci'
 ```
 
-The [UDP SNAT validation record](flowtable/history/udp-snat.md) contains measured
+The TCP SNAT tests reuse the established TCP lifetime proofs with forced source
+address and port translation. They check both decoded directions, 64 MiB bulk
+transfers, low software TX, idle expiration and reinstallation, SYN/FIN/RST
+visibility in Linux, retransmission after deliberate loss, and native close
+expiry. The production policy tool stops and reapplies acceleration during an
+active transfer; the socket and conntrack ID must survive.
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55200 \
+  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_tcp_snat'
+```
+
+The [TCP SNAT validation record](flowtable/history/tcp-snat.md) records the measured
+TCP results. The [UDP SNAT validation record](flowtable/history/udp-snat.md) contains measured
 results and image identities. This increment does not establish arbitrary NAT
 feature combinations, sustained scale, every exception path, or production-image
 parity.

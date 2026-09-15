@@ -1,7 +1,7 @@
 # Linux flowtable architecture
 
-This is the current implementation contract as of the static UDP SNAT increment
-(`cc34cef`). The [project overview](linux-flowtable-offload.md) gives supported
+This is the current implementation contract after static TCP/UDP SNAT
+(2026-09-15). The [project overview](linux-flowtable-offload.md) gives supported
 scope and direction; the [history index](flowtable/history/README.md) retains
 earlier designs, superseded restrictions and dated verification evidence.
 Update this document when a contract changes, and record the proof separately.
@@ -79,14 +79,14 @@ conntrack or destination pointer survives the callback.
 
 Admission requires exact supported masks and actions, default conntrack zones,
 zero conntrack mark and a table without native `counter` accounting. Supported
-packets are routed unicast IPv4 TCP/UDP and static UDP SNAT. TCP additionally
+packets are routed unicast IPv4 TCP/UDP and static TCP/UDP SNAT. TCP additionally
 requires an assured, established conntrack and precisely Netfilter's FIN/RST
 exclusion. Helpers and sequence-adjusted connections are excluded by native
 flowtable eligibility. Other protocols, encapsulations and NAT types require
 separate contracts and proofs.
 
 Rules contain four native Ethernet mangle words and a redirect, with the exact
-translation/checksum sequence for admitted [UDP SNAT](flowtable-nat.md). Ports
+translation/checksum sequence for admitted [TCP/UDP SNAT](flowtable-nat.md). Ports
 must be distinct, registered physical CDX devices, running with carrier, and
 outside bridge/L3-slave configurations. Physical lookup uses the device object,
 not its name or a recyclable interface index. The requested source MAC must
@@ -130,7 +130,7 @@ Packet restrictions must hold for later packets with the same tuple, not just
 the admission packet. The existing parser/preemptive checks and Linux fallback
 have focused routed-UDP evidence for TTL/MTU exceptions, options and fragments.
 Each new feature combination still needs its own exception proof; the first
-static UDP SNAT increment does not establish every NAT exception combination.
+static TCP/UDP SNAT increment does not establish every NAT exception combination.
 
 ## References and directional resources
 

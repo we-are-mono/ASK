@@ -65,8 +65,8 @@ invalid types and configurations over 64 KiB are rejected. Each list permits
 at most 256 objects. There is no arbitrary nftables text in this format.
 
 Admission requires established original-direction IPv4 TCP/UDP traffic and a
-zero conntrack mark. Routed TCP/UDP and static UDP source NAT are eligible;
-TCP NAT, destination NAT and MASQUERADE remain outside hardware support. Linux
+zero conntrack mark. Routed TCP/UDP and static TCP/UDP source NAT are eligible;
+destination NAT and MASQUERADE remain outside hardware support. Linux
 additionally refuses helper and sequence-adjusted connections. See the
 [NAT contract](flowtable-nat.md) for mapping and reply-tuple semantics. Nonzero mark
 selectors are representable for policy migration but cannot broaden the

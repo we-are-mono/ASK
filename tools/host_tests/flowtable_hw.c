@@ -301,7 +301,9 @@ int main(void)
         unsigned old=deletes; assert(cdx_ft_hw_del(&hw)==0 && deletes==old);
     }
     rule.proto = expected_proto = IPPROTO_UDP;
-    for (unsigned variant = 0; variant < 6; variant++) {
+    for (unsigned i = 0; i < 12; i++) {
+        unsigned variant = i % 6;
+        rule.proto = expected_proto = i < 6 ? IPPROTO_UDP : IPPROTO_TCP;
         rule.new_src = expected_src = variant == 0 || variant == 4 ? htonl(0xcb007104) : rule.src;
         rule.new_dst = expected_dst = variant == 1 || variant == 5 ? htonl(0xcb007104) : rule.dst;
         rule.new_sport = expected_sport = variant == 2 || variant == 4 ? htons(40000) : rule.sport;
@@ -309,8 +311,6 @@ int main(void)
         assert(cdx_ft_hw_add(&rule,&hw) == 0);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
         fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
-        rule.proto=IPPROTO_TCP; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP && !hw);
-        rule.proto=IPPROTO_UDP;
     }
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;

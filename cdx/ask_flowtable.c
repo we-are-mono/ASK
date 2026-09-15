@@ -331,7 +331,7 @@ static bool ft_tuple_matches(const struct cdx_ft_rule *rule,
 }
 
 /* Linux owns allocation and lifetime of the resolved NAT mapping. Accept only
- * the exact native UDP SNAT action sequence, including its inverse in replies.
+ * the exact native TCP/UDP SNAT action sequence, including its inverse in replies.
  * Do not interpret arbitrary flower edits as a conntrack NAT operation. */
 static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rule *out)
 {
@@ -351,7 +351,7 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	if (!(status & IPS_NAT_MASK))
 		return actions->num_entries == 5;
 	if ((status & IPS_NAT_MASK) != IPS_SRC_NAT || !(status & IPS_SRC_NAT_DONE) ||
-	    out->proto != IPPROTO_UDP || actions->num_entries != 8)
+	    (out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) || actions->num_entries != 8)
 		return false;
 #if IS_ENABLED(CONFIG_NF_NAT_MASQUERADE)
 	/* WAN-address/masquerade lifecycle is outside the static SNAT contract. */
@@ -381,10 +381,12 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	return ip->id == FLOW_ACTION_MANGLE && ip->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_IP4 &&
 		ip->mangle.offset == (forward ? offsetof(struct iphdr, saddr) : offsetof(struct iphdr, daddr)) &&
 		!ip->mangle.mask && ip->mangle.val == (forward ? out->new_src : out->new_dst) &&
-		port->id == FLOW_ACTION_MANGLE && port->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_UDP &&
+		port->id == FLOW_ACTION_MANGLE && port->mangle.htype == (out->proto == IPPROTO_TCP ?
+			FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP) &&
 		!port->mangle.offset && port->mangle.mask == port_mask && port->mangle.val == port_value &&
 		csum->id == FLOW_ACTION_CSUM &&
-		csum->csum_flags == (TCA_CSUM_UPDATE_FLAG_IPV4HDR | TCA_CSUM_UPDATE_FLAG_UDP);
+		csum->csum_flags == (TCA_CSUM_UPDATE_FLAG_IPV4HDR | (out->proto == IPPROTO_TCP ?
+			TCA_CSUM_UPDATE_FLAG_TCP : TCA_CSUM_UPDATE_FLAG_UDP));
 }
 
 /* Exact masks preserve every selector. Native flowtables supply routing
