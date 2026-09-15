@@ -28,9 +28,9 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("int cdx_ft_hw_add")]
         + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
     )
-    names = ["ft_fault", "ft_find", "ft_neigh_invalidate", "ft_neigh_matches", "ft_neigh_check",
-             "ft_next_hop", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used", "ft_neigh_event",
-             "ft_remove", "ft_neigh_invalidate_work", "ft_parse", "ft_same_key",
+    names = ["ft_fault", "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches", "ft_neigh_check",
+             "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used", "ft_route_event", "ft_neigh_event", "ft_fib_event",
+             "ft_remove", "ft_retire_workfn", "ft_parse", "ft_same_key",
              "ft_replace", "ft_stats", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_bind",
              "ft_invalidate_work"]
     (tmp_path / "flowtable_production.inc").write_text(

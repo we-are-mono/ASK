@@ -1,4 +1,4 @@
-From 0b75c78ff12a3f569ef92aa1b8243c24ca626268 Mon Sep 17 00:00:00 2001
+From ddacd8d5239a3973f746b90bc39e04605ebb3b4f Mon Sep 17 00:00:00 2001
 From: ASK maintainers <ask@localhost>
 Date: Mon, 14 Sep 2026 23:03:32 +0200
 Subject: [PATCH] netfilter: provide hardware context and selective flow
@@ -24,39 +24,121 @@ Both requests are monotonic for the table and survive device unbinding.
 
 Other tables retain their existing behaviour and allocate no handles.
 This is a downstream kernel-internal interface; no userspace ABI changes.
+
+Publish a non-vetoing netevent for every committed IPv4 FIB alias mutation,
+including non-selected DSCP/metric aliases and table flushes. The existing
+FIB notifier intentionally reports selected aliases and is not sufficient
+for complete flow invalidation. RTNL excludes adapter admission until the
+mutation and route-cache updates finish. Event data is borrowed and holds
+only the namespace and destination prefix.
+
+Supply both directional NEIGH destinations to callbacks so admission can
+recheck both under RTNL and reject a generation queued before a change.
+
+Opted-in flowtables require successful IPv4 FIB lookup for the reverse
+route. A forced output interface otherwise allows ip_route_output to
+synthesize an on-link unicast route after any FIB error, bypassing route
+withdrawal or blackhole policy. Keep that legacy fallback for other callers;
+reject flow creation on the experimental path until routing succeeds.
 ---
- include/net/flow_offload.h            | 12 ++++++
+ include/net/flow.h                    |  2 +
+ include/net/flow_offload.h            | 14 ++++++
+ include/net/netevent.h                | 15 +++++++
  include/net/netfilter/nf_flow_table.h | 20 +++++++++
+ net/ipv4/fib_trie.c                   | 20 +++++++++
+ net/ipv4/route.c                      |  3 +-
  net/netfilter/nf_flow_table_core.c    | 62 ++++++++++++++++++++++++++-
  net/netfilter/nf_flow_table_ip.c      | 14 ++++--
- net/netfilter/nf_flow_table_offload.c | 17 +++++++-
- net/netfilter/nft_flow_offload.c      |  1 +
- 6 files changed, 120 insertions(+), 6 deletions(-)
+ net/netfilter/nf_flow_table_offload.c | 18 +++++++-
+ net/netfilter/nft_flow_offload.c      |  6 +++
+ 10 files changed, 167 insertions(+), 7 deletions(-)
 
+diff --git a/include/net/flow.h b/include/net/flow.h
+index 335bbc5..5e373db 100644
+--- a/include/net/flow.h
++++ b/include/net/flow.h
+@@ -38,6 +38,8 @@ struct flowi_common {
+ 	__u8	flowic_flags;
+ #define FLOWI_FLAG_ANYSRC		0x01
+ #define FLOWI_FLAG_KNOWN_NH		0x02
++/* Require FIB success even with an explicitly selected output interface. */
++#define FLOWI_FLAG_NO_OIF_FALLBACK	0x04
+ 	__u32	flowic_secid;
+ 	kuid_t  flowic_uid;
+ 	__u32		flowic_multipath_hash;
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f..ee17a6b 100644
+index 292cd8f..b17fc4a 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,19 @@ struct flow_cls_common_offload {
+@@ -688,7 +688,21 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
 +struct nf_flow_offload_handle;
 +
 +/* Context is borrowed for the callback and NULL for other producers. Drivers
-+ * must not retain nf_ct or nf_dst. nf_dst is the selected NEIGH destination;
++ * must not retain nf_ct or either dst. nf_dst is this direction's selected
++ * NEIGH destination; nf_dst_reverse is the other direction's destination;
 + * other transmit types provide NULL. nf_handle may be retained only through
 + * nf_flow_offload_handle_get/put; it carries no flow/table/conntrack pointer. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 4
++#define FLOW_CLS_HAS_NF_CONTEXT 5
  struct flow_cls_offload {
 +	const struct nf_conn *nf_ct;
 +	struct dst_entry *nf_dst;
++	struct dst_entry *nf_dst_reverse;
 +	struct nf_flow_offload_handle *nf_handle;
 +	u16 nf_mtu;
 +	bool nf_counter;
  	struct flow_cls_common_offload common;
  	enum flow_cls_command command;
  	bool use_act_stats;
+diff --git a/include/net/netevent.h b/include/net/netevent.h
+index 1be3757..e58d10b 100644
+--- a/include/net/netevent.h
++++ b/include/net/netevent.h
+@@ -2,6 +2,8 @@
+ #ifndef _NET_EVENT_H
+ #define _NET_EVENT_H
+ 
++#include <linux/types.h>
++
+ /*
+  *	Generic netevent notifiers
+  *
+@@ -12,6 +14,7 @@
+  * 	Changes:
+  */
+ 
++struct net;
+ struct dst_entry;
+ struct neighbour;
+ struct notifier_block ;
+@@ -23,6 +26,17 @@ struct netevent_redirect {
+ 	const void *daddr;
+ };
+ 
++/* A committed IPv4 FIB alias change, including aliases omitted from the
++ * selected-route FIB notifier. Called under RTNL, with borrowed stack data.
++ * Consumers must not veto the change or retain the event. Match all tables
++ * conservatively unless the complete policy lookup context is available.
++ */
++struct netevent_ipv4_route {
++	struct net *net;
++	__be32 dst;
++	u8 prefixlen;
++};
++
+ enum netevent_notif_type {
+ 	NETEVENT_NEIGH_UPDATE = 1, /* arg is struct neighbour ptr */
+ 	NETEVENT_REDIRECT,	   /* arg is struct netevent_redirect ptr */
+@@ -30,6 +44,7 @@ enum netevent_notif_type {
+ 	NETEVENT_IPV4_MPATH_HASH_UPDATE, /* arg is struct net ptr */
+ 	NETEVENT_IPV6_MPATH_HASH_UPDATE, /* arg is struct net ptr */
+ 	NETEVENT_IPV4_FWD_UPDATE_PRIORITY_UPDATE, /* arg is struct net ptr */
++	NETEVENT_IPV4_ROUTE_UPDATE, /* arg is struct netevent_ipv4_route ptr */
+ };
+ 
+ int register_netevent_notifier(struct notifier_block *nb);
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
 index 1a6fca0..0b81c9f 100644
 --- a/include/net/netfilter/nf_flow_table.h
@@ -102,6 +184,75 @@ index 1a6fca0..0b81c9f 100644
  static inline int
  nf_flow_table_offload_add_cb(struct nf_flowtable *flow_table,
  			     flow_setup_cb_t *cb, void *cb_priv)
+diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
+index 3d2df1d..a9f5bbc 100644
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -70,9 +70,26 @@
+ #include <net/sock.h>
+ #include <net/ip_fib.h>
+ #include <net/fib_notifier.h>
++#include <net/netevent.h>
+ #include <trace/events/fib.h>
+ #include "fib_lookup.h"
+ 
++/* Report every committed alias, not only the first alias at each prefix.
++ * RTNL excludes hardware admission until the FIB and cache changes finish.
++ * Failed/no-op insertions must not publish a change.
++ */
++static void fib_notify_route_change(struct net *net, u32 key, u8 prefixlen)
++{
++	struct netevent_ipv4_route event = {
++		.net = net,
++		.dst = htonl(key),
++		.prefixlen = prefixlen,
++	};
++
++	ASSERT_RTNL();
++	call_netevent_notifiers(NETEVENT_IPV4_ROUTE_UPDATE, &event);
++}
++
+ static int call_fib_entry_notifier(struct notifier_block *nb,
+ 				   enum fib_event_type event_type, u32 dst,
+ 				   int dst_len, struct fib_alias *fa,
+@@ -1386,6 +1403,7 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
+ 	rtmsg_fib(RTM_NEWROUTE, htonl(key), new_fa, plen, new_fa->tb_id,
+ 		  &cfg->fc_nlinfo, nlflags);
+ succeeded:
++	fib_notify_route_change(net, key, plen);
+ 	return 0;
+ 
+ out_remove_new_fa:
+@@ -1754,6 +1772,7 @@ int fib_table_delete(struct net *net, struct fib_table *tb,
+ 	if (READ_ONCE(fa_to_delete->fa_state) & FA_S_ACCESSED)
+ 		rt_cache_flush(cfg->fc_nlinfo.nl_net);
+ 
++	fib_notify_route_change(net, key, plen);
+ 	fib_release_info(fa_to_delete->fa_info);
+ 	alias_free_mem_rcu(fa_to_delete);
+ 	return 0;
+@@ -2074,6 +2093,7 @@ int fib_table_flush(struct net *net, struct fib_table *tb, bool flush_all)
+ 				rtmsg_fib(RTM_DELROUTE, htonl(n->key), fa,
+ 					  KEYLENGTH - fa->fa_slen, tb->tb_id, &info, 0);
+ 			hlist_del_rcu(&fa->fa_list);
++			fib_notify_route_change(net, n->key, KEYLENGTH - fa->fa_slen);
+ 			fib_release_info(fa->fa_info);
+ 			alias_free_mem_rcu(fa);
+ 			found++;
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 2b8c29a..e96b8d0 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2771,7 +2771,8 @@ struct rtable *ip_route_output_key_hash_rcu(struct net *net, struct flowi4 *fl4,
+ 	if (err) {
+ 		res->fi = NULL;
+ 		res->table = NULL;
+-		if (fl4->flowi4_oif &&
++		if (!(fl4->flowi4_flags & FLOWI_FLAG_NO_OIF_FALLBACK) &&
++		    fl4->flowi4_oif &&
+ 		    (ipv4_is_multicast(fl4->daddr) || !fl4->flowi4_l3mdev)) {
+ 			/* Apparently, routing tables are wrong. Assume,
+ 			 * that the destination is on link.
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
 index df72b03..452ff72 100644
 --- a/net/netfilter/nf_flow_table_core.c
@@ -251,7 +402,7 @@ index 98edcaa..632a92b 100644
  		return 0;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f5..e06f28c 100644
+index 4f346f5..f287150 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -896,6 +896,15 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
@@ -270,7 +421,7 @@ index 4f346f5..e06f28c 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +913,13 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +913,14 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
@@ -278,6 +429,7 @@ index 4f346f5..e06f28c 100644
 +	struct flow_cls_offload cls_flow = {
 +		.nf_ct = flow->ct,
 +		.nf_dst = nf_flow_offload_dst(&flow->tuplehash[dir].tuple),
++		.nf_dst_reverse = nf_flow_offload_dst(&flow->tuplehash[!dir].tuple),
 +		.nf_handle = flow->hw_handle,
 +		.nf_mtu = flow->tuplehash[dir].tuple.mtu,
 +		.nf_counter = !!(READ_ONCE(flowtable->flags) & NF_FLOWTABLE_COUNTER),
@@ -286,7 +438,7 @@ index 4f346f5..e06f28c 100644
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 7dbbd89..c807cb3 100644
+index 7dbbd89..4afb01d 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
 @@ -171,6 +171,7 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
@@ -297,6 +449,18 @@ index 7dbbd89..c807cb3 100644
  	    nft_is_valid_ether_device(info->indev))
  		info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  }
+@@ -246,6 +247,11 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+ 		fl.u.ip4.flowi4_tos = ip_hdr(pkt->skb)->tos & INET_DSCP_MASK;
+ 		fl.u.ip4.flowi4_mark = pkt->skb->mark;
+ 		fl.u.ip4.flowi4_flags = FLOWI_FLAG_ANYSRC;
++		/* A forced reverse oif normally permits on-link fallback even
++		 * after a failed FIB lookup. An ASK-owned table must respect
++		 * withdrawal and blackhole/prohibit routes in software too. */
++		if (READ_ONCE(ft->data.use_neigh))
++			fl.u.ip4.flowi4_flags |= FLOWI_FLAG_NO_OIF_FALLBACK;
+ 		break;
+ 	case NFPROTO_IPV6:
+ 		fl.u.ip6.daddr = ct->tuplehash[dir].tuple.src.u3.in6;
 -- 
 2.47.3
 

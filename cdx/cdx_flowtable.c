@@ -34,7 +34,7 @@
 #include "cdx_flowtable_hw.h"
 #include "devman.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 4
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 5
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
 
@@ -79,9 +79,9 @@ struct cdx_ft_entry {
 
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
-/* Watch publication/removal is serialized by ctrl.mutex. The atomic notifier
- * shares neigh, rule.dst_mac and handle, protected against entry removal by
- * this lock. Never acquire a neighbour lock while holding ft_neigh_lock. */
+/* Watch publication/removal is serialized by ctrl.mutex. Atomic neighbour and
+ * route notifiers share the immutable rule, neigh and handle, protected against
+ * entry removal here. Never take a neighbour lock while holding this lock. */
 static LIST_HEAD(ft_neigh_entries);
 static DEFINE_SPINLOCK(ft_neigh_lock);
 static LIST_HEAD(ft_block_list);
@@ -89,6 +89,7 @@ static unsigned int ft_bound, ft_count;
 static unsigned int ft_neighbour_refs;
 static unsigned int ft_handle_refs;
 static atomic64_t ft_neigh_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_route_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping, ft_fatal;
@@ -97,9 +98,9 @@ static bool ft_invalid_done;
 static struct proc_dir_entry *ft_proc;
 static void ft_invalidate_work(struct work_struct *work);
 static void ft_neigh_detach(struct cdx_ft_entry *entry);
-static void ft_neigh_invalidate_work(struct work_struct *work);
+static void ft_retire_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
-static DECLARE_WORK(ft_neigh_work, ft_neigh_invalidate_work);
+static DECLARE_WORK(ft_retire_work, ft_retire_workfn);
 
 bool cdx_flowtable_enabled(void)
 {
@@ -152,12 +153,18 @@ static struct cdx_ft_entry *ft_find(struct cdx_ft_binding *binding,
  * directions. Marking it also excludes Linux's cached flow immediately;
  * native GC later retires that generation without flushing unrelated flows.
  */
+static void ft_handle_invalidate(struct nf_flow_offload_handle *handle,
+				 atomic64_t *counter)
+{
+	if (nf_flow_offload_handle_invalidate(handle))
+		atomic64_inc(counter);
+	if (!READ_ONCE(ft_stopping))
+		schedule_work(&ft_retire_work);
+}
+
 static void ft_neigh_invalidate(struct cdx_ft_entry *entry)
 {
-	if (nf_flow_offload_handle_invalidate(entry->handle))
-		atomic64_inc(&ft_neigh_invalidations);
-	if (!READ_ONCE(ft_stopping))
-		schedule_work(&ft_neigh_work);
+	ft_handle_invalidate(entry->handle, &ft_neigh_invalidations);
 }
 
 static int ft_remove(struct cdx_ft_entry *entry)
@@ -181,7 +188,7 @@ static int ft_remove(struct cdx_ft_entry *entry)
 	return rc;
 }
 
-static void ft_neigh_invalidate_work(struct work_struct *work)
+static void ft_retire_workfn(struct work_struct *work)
 {
 	struct cdx_ft_entry *entry, *next;
 
@@ -270,6 +277,17 @@ static bool ft_next_hop(const struct flow_cls_offload *cls,
 	*next_hop = rt_nexthop(rt, daddr);
 	return !ipv4_is_multicast(*next_hop) && !ipv4_is_zeronet(*next_hop) &&
 		!ipv4_is_loopback(*next_hop) && !ipv4_is_lbcast(*next_hop);
+}
+
+/* Admission holds RTNL. Check both borrowed destinations after taking it:
+ * a callback queued before a route change must not install even its otherwise
+ * valid direction. The invalid handle makes Linux retire that generation.
+ * Never re-resolve a route here with an incomplete policy/ingress context.
+ */
+static bool ft_routes_valid(const struct flow_cls_offload *cls)
+{
+	return cls->nf_dst && cls->nf_dst_reverse &&
+		dst_check(cls->nf_dst, 0) && dst_check(cls->nf_dst_reverse, 0);
 }
 
 static int ft_neigh_attach(struct cdx_ft_entry *entry)
@@ -462,6 +480,8 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	 * merely because its opaque directional cookie has the same value. */
 	if (entry && entry->handle != cls->nf_handle)
 		return -ESTALE;
+	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
+		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
 	rc = ft_parse(binding, cls, &rule, &next_hop);
 	if (!rc)
 		ft_validated++;
@@ -795,11 +815,39 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 	return NOTIFY_DONE;
 }
 
+static int ft_route_event(const struct netevent_ipv4_route *event)
+{
+	struct cdx_ft_entry *entry;
+	__be32 mask;
+
+	if (!net_eq(event->net, &init_net))
+		return NOTIFY_DONE;
+	if (event->prefixlen > 32) {
+		ft_invalidate();
+		return NOTIFY_DONE;
+	}
+	mask = inet_make_mask(event->prefixlen);
+	spin_lock_bh(&ft_neigh_lock);
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+		/* No NAT is admitted, so source is the reverse route destination.
+		 * Check both endpoints even if only one direction installed. Match
+		 * all tables/DSCP aliases conservatively: a new more-specific route
+		 * can supersede a route which never emitted a deletion event. */
+		if (!((entry->rule.dst ^ event->dst) & mask) ||
+		    !((entry->rule.src ^ event->dst) & mask))
+			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+	}
+	spin_unlock_bh(&ft_neigh_lock);
+	return NOTIFY_DONE;
+}
+
 static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct neighbour *neigh = ptr;
 	struct cdx_ft_entry *entry;
 
+	if (event == NETEVENT_IPV4_ROUTE_UPDATE)
+		return ft_route_event(ptr);
 	if (event != NETEVENT_NEIGH_UPDATE || neigh->tbl != &arp_tbl ||
 	    !net_eq(dev_net(neigh->dev), &init_net))
 		return NOTIFY_DONE;
@@ -823,8 +871,21 @@ static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *pt
 {
 	struct fib_notifier_info *info = ptr;
 
-	if (info->family == AF_INET)
+	if (info->family != AF_INET)
+		return NOTIFY_DONE;
+	switch (event) {
+	case FIB_EVENT_ENTRY_REPLACE:
+	case FIB_EVENT_ENTRY_APPEND:
+	case FIB_EVENT_ENTRY_ADD:
+	case FIB_EVENT_ENTRY_DEL:
+		/* These selected-alias notifications can precede commit and omit
+		 * other aliases. Patch 140 reports every committed prefix through
+		 * NETEVENT_IPV4_ROUTE_UPDATE, including table flushes. */
+		break;
+	default:
+		/* Rule/nexthop changes have no safe destination-prefix scope. */
 		ft_invalidate();
+	}
 	return NOTIFY_DONE;
 }
 
@@ -842,13 +903,14 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\n",
 		   offload_owner, ft_observe, ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, ft_fatal,
 		   cdx_ft_hw_pending() + cdx_ehash_quarantine_pending(),
 		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
-		   atomic64_read(&ft_neigh_invalidations));
+		   atomic64_read(&ft_neigh_invalidations),
+		   atomic64_read(&ft_route_invalidations));
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_hw_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
@@ -912,7 +974,7 @@ void cdx_flowtable_exit(void)
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
 	unregister_netdevice_notifier(&ft_netdev_nb);
-	cancel_work_sync(&ft_neigh_work);
+	cancel_work_sync(&ft_retire_work);
 	cancel_delayed_work_sync(&ft_work);
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	WRITE_ONCE(ft_ready, false);

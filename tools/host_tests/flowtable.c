@@ -12,7 +12,7 @@
 typedef uint8_t u8;
 typedef uint16_t u16, __be16;
 typedef uint32_t u32, __be32;
-typedef uint64_t u64;
+typedef uint64_t u64, atomic64_t;
 #define ETH_ALEN 6
 #define ETH_P_IP 0x0800
 #define ETH_P_ALL 3
@@ -44,6 +44,12 @@ typedef uint64_t u64;
 #define NUD_REACHABLE 2
 #define NUD_INCOMPLETE 1
 #define NETEVENT_NEIGH_UPDATE 1
+#define NETEVENT_IPV4_ROUTE_UPDATE 7
+enum { FIB_EVENT_ENTRY_REPLACE, FIB_EVENT_ENTRY_APPEND, FIB_EVENT_ENTRY_ADD,
+       FIB_EVENT_ENTRY_DEL, FIB_EVENT_RULE_ADD, FIB_EVENT_RULE_DEL, FIB_EVENT_NH_ADD, FIB_EVENT_NH_DEL };
+struct fib_notifier_info { int family; };
+struct netevent_ipv4_route { struct net *net; __be32 dst; u8 prefixlen; };
+static __be32 inet_make_mask(unsigned plen) { assert(plen <= 32); return htonl(plen ? ~0U << (32 - plen) : 0); }
 #define NOTIFY_DONE 0
 #define cmpxchg(p, old, new) ({ typeof(*(p)) v = *(p); if (v == (old)) *(p) = (new); v; })
 struct list_head { struct list_head *next, *prev; };
@@ -176,7 +182,7 @@ static void nf_flow_offload_handle_put(struct nf_flow_offload_handle *h)
 { assert(h->refs > 1); h->refs--; }
 struct flow_cls_offload {
     const struct nf_conn *nf_ct;
-    struct dst_entry *nf_dst;
+    struct dst_entry *nf_dst, *nf_dst_reverse;
     struct nf_flow_offload_handle *nf_handle;
     unsigned command;
     u16 nf_mtu;
@@ -191,7 +197,7 @@ static void flow_stats_update(struct flow_stats *s, u64 b, u64 p, u64 d, unsigne
 #include "flowtable_types.inc"
 struct cdx_ft_hw { struct cdx_ft_counters stats; };
 struct work_struct { int unused; };
-static int ft_work, ft_neigh_work;
+static int ft_work, ft_retire_work;
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
 static LIST_HEAD(ft_neigh_entries);
@@ -200,7 +206,7 @@ static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
@@ -228,7 +234,7 @@ static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
 static void cdx_ft_hw_quiesced(void) { assert(cdx_info->ctrl.mutex && !quiesce_fail); }
 static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
 static unsigned neigh_scheduled;
-static void schedule_work(int *work) { assert(work == &ft_neigh_work); neigh_scheduled++; }
+static void schedule_work(int *work) { assert(work == &ft_retire_work); neigh_scheduled++; }
 static void nf_flow_table_cleanup(struct net_device *dev)
 { assert(!cdx_info->ctrl.mutex); flushed++; if (cleanup_hook) cleanup_hook(); }
 static void dev_hold(struct net_device *d) { d->refs++; }
@@ -307,7 +313,7 @@ static struct net_device in = { .ifindex = 5, .mtu = 1500, .dev_addr = {2, 0, 0,
 static struct net_device out = { .ifindex = 6, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2} };
 static struct cdx_ft_binding binding = { .dev = &in };
 static struct dst_ops ipv4_ops = { .family = AF_INET };
-static struct rtable route;
+static struct rtable route, reverse_route;
 static __be32 next_hop;
 static struct nf_conn ct;
 static struct flow_dissector dissector;
@@ -332,6 +338,8 @@ static void fixture(void)
     alternate_gateway.primary_key = htonl(0xc6336403);
     route = (struct rtable){ .dst = { .ops = &ipv4_ops, .dev = &out, .valid = true },
                              .rt_type = RTN_UNICAST };
+    reverse_route = route;
+    reverse_route.dst.dev = &in;
     neigh_lookups = 0;
     ct = (struct nf_conn){ .net = &init_net, .protonum = IPPROTO_UDP };
     dissector.used_keys = 31;
@@ -360,7 +368,7 @@ static void fixture(void)
     rule.action.entries[4].id = FLOW_ACTION_REDIRECT;
     rule.action.entries[4].dev = &out;
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1492,
-        .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
+        .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
 }
 static void tcp_fixture(void)
@@ -617,7 +625,7 @@ static void test_neighbours(void)
     neighbour.dead = true;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
     assert(!ft_invalid && handle.invalid && ft_count == 2);
-    ft_neigh_invalidate_work(NULL);
+    ft_retire_workfn(NULL);
     assert(!ft_count && !live_hw && !allocated && !ft_neighbour_refs && !neighbour.refs);
     assert(ft_neigh_entries.next == &ft_neigh_entries && !out.refs);
     assert(ft_installs == ft_deletes);
@@ -705,7 +713,7 @@ static void test_connections(void)
     neighbour.dead = true;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
     assert(!ft_invalid && handle.invalid && ft_count == ARRAY_SIZE(entries));
-    ft_neigh_invalidate_work(NULL);
+    ft_retire_workfn(NULL);
     assert(!ft_count && !live_hw && !allocated && !ft_neighbour_refs && !neighbour.refs);
     assert(!out.refs && ft_installs == ft_deletes && ft_errors == errors);
     ft_invalid = 0; ft_invalid_done = false;
@@ -734,7 +742,7 @@ static void test_selective_neighbours(void)
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
     assert(contexts[0].invalid && !contexts[1].invalid);
     assert(ft_neigh_invalidations == invalidations + 1 && !ft_invalid && ft_count == 4);
-    ft_neigh_invalidate_work(NULL);
+    ft_retire_workfn(NULL);
     assert(ft_count == 2 && ft_handle_refs == 2 && ft_neighbour_refs == 2);
     assert(contexts[0].refs == 1 && contexts[1].refs == 3);
     assert(!ft_find(&binding, 5000) && !ft_find(&binding, 5001));
@@ -766,7 +774,7 @@ static void test_selective_neighbours(void)
     gateway.nud_state = NUD_FAILED;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
     deletion_error = -EAGAIN;
-    ft_neigh_invalidate_work(NULL);
+    ft_retire_workfn(NULL);
     deletion_error = 0;
     assert(ft_invalid && !ft_fatal && ft_errors == errors + 1 && ft_count == 2);
     ft_invalidate_work(NULL);
@@ -782,11 +790,96 @@ static void test_selective_neighbours(void)
     neighbour.dead = true;
     ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
     assert(neigh_scheduled == queued && handle.invalid);
-    ft_neigh_invalidate_work(NULL);
+    ft_retire_workfn(NULL);
     assert(ft_count == 1); /* Shutdown's binding release owns this retirement. */
     assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
     ft_stopping = false;
     assert(!ft_handle_refs && handle.refs == 1 && !allocated);
+}
+
+static void test_selective_routes(void)
+{
+    struct nf_flow_offload_handle contexts[2] = {{1, false}, {1, false}};
+    struct cdx_ft_entry *entries[4];
+    struct net other_net;
+    struct netevent_ipv4_route event = { .net = &init_net, .dst = htonl(0xc0000202), .prefixlen = 32 };
+    struct fib_notifier_info info = { .family = AF_INET };
+    u64 invalidations = ft_route_invalidations, errors = ft_errors;
+
+    fixture();
+    for (unsigned i = 0; i < 4; i++) {
+        __be32 address = htonl(i < 2 ? 0xc0000202 : 0xcb007102);
+        ik.src = i & 1 ? htonl(0xc6336402) : address;
+        ik.dst = i & 1 ? address : htonl(0xc6336402);
+        cls.nf_handle = &contexts[i / 2]; cls.cookie = 6000 + i;
+        route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+        assert(ft_replace(&binding, &cls) == 0);
+        entries[i] = ft_find(&binding, cls.cookie);
+        entries[i]->hw->stats.packets = 20 + i;
+    }
+    for (unsigned e = FIB_EVENT_ENTRY_REPLACE; e <= FIB_EVENT_ENTRY_DEL; e++)
+        assert(ft_fib_event(NULL, e, &info) == NOTIFY_DONE && !ft_invalid);
+    event.net = &other_net;
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
+    event.net = &init_net; event.dst = htonl(0xc0000203);
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
+    assert(!contexts[0].invalid && !contexts[1].invalid);
+    /* A more-specific addition has no old-route pointer. It still marks both
+     * directions, including the opposite direction's destination. */
+    event.dst = htonl(0xc0000202);
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
+    assert(contexts[0].invalid && !contexts[1].invalid && !ft_invalid);
+    assert(ft_route_invalidations == invalidations + 1);
+    ft_retire_workfn(NULL);
+    assert(ft_count == 2 && contexts[0].refs == 1 && contexts[1].refs == 3);
+    for (unsigned i = 2; i < 4; i++) {
+        assert(ft_find(&binding, 6000 + i) == entries[i]);
+        assert(entries[i]->hw->stats.packets == 20 + i);
+    }
+    /* Partial hardware admission must also match its missing reverse route. */
+    assert(ft_remove(entries[3]) == 0);
+    event.dst = htonl(0xcb007100); event.prefixlen = 24;
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
+    assert(contexts[1].invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && ft_errors == errors);
+    assert(ft_route_invalidations == invalidations + 2);
+    assert(contexts[1].refs == 1);
+
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    event.dst = 0; event.prefixlen = 0;
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
+    ft_retire_workfn(NULL);
+    assert(handle.invalid && !ft_count && !ft_invalid);
+    event.prefixlen = 33;
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &event);
+    assert(ft_invalid); ft_invalid = 0;
+    for (unsigned e = FIB_EVENT_RULE_ADD; e <= FIB_EVENT_NH_DEL; e++) {
+        ft_fib_event(NULL, e, &info); assert(ft_invalid); ft_invalid = 0;
+    }
+    info.family = AF_INET6;
+    ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &info); assert(!ft_invalid);
+
+    /* Queued admission may carry one current and one stale route. Refuse and
+     * invalidate the entire generation before any hardware allocation. */
+    for (unsigned which = 0; which < 4; which++) {
+        fixture();
+        if (which == 0) route.dst.valid = false;
+        if (which == 1) reverse_route.dst.valid = false;
+        if (which == 2) cls.nf_dst = NULL;
+        if (which == 3) cls.nf_dst_reverse = NULL;
+        assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
+        assert(handle.invalid && handle.refs == 1 && !ft_handle_refs && !allocated && !live_hw);
+    }
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    reverse_route.dst.valid = false;
+    assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
+    ft_retire_workfn(NULL);
+    assert(handle.invalid && !ft_count && !ft_handle_refs && !ft_neighbour_refs && !out.refs);
+    assert(ft_installs == ft_deletes && ft_errors == errors);
 }
 
 int main(void)
@@ -875,5 +968,6 @@ int main(void)
     test_connections();
     test_neighbours();
     test_selective_neighbours();
+    test_selective_routes();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

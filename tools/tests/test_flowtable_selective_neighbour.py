@@ -24,21 +24,21 @@ A, B, ALL = [0, 1], [2, 3], [0, 1, 2, 3]
 CHANGED_MAC = "02:9d:99:b2:33:a2"
 
 
-def keys(ids):
+def keys(ids, flows=FLOWS):
     result = set()
     for ident in ids:
-        spec = FLOWS[ident]
+        spec = flows[ident]
         proto = "6" if spec["proto"] == "tcp" else "17"
         src, dst = f"{spec['lan']}:{spec['sport']}", f"{WAN_IP}:{DPORT}"
         result.update(((TARGET_LAN_IF, proto, src, dst), (TARGET_WAN_IF, proto, dst, src)))
     return result
 
 
-def unchanged(before, after, ids):
+def unchanged(before, after, ids, flows=FLOWS):
     healthy(after)
     assert after["handle_refs"] == after["entries"], after
     old, new = by_key(before), by_key(after)
-    for key in keys(ids):
+    for key in keys(ids, flows):
         assert new[key]["cookie"] == old[key]["cookie"], (key, before, after)
         for field in ("packets", "bytes"):
             assert int(new[key][field]) >= int(old[key][field]), (key, before, after)
@@ -145,32 +145,33 @@ assert not errors, errors
         assert not failures, failures
 
 
-async def warm(r, p, ids, label):
+async def warm(r, p, ids, label, flows=FLOWS):
     samples = []
     for _ in range(8):
         await p.batch(ids, count=128, interval=0.01)
         state = await r.state()
         samples.append(state)
-        if state["entries"] == 8:
+        if state["entries"] == 2 * len(flows):
             healthy(state)
-            assert state["handle_refs"] == 8 and by_key(state).keys() == keys(ALL), state
+            assert state["handle_refs"] == 2 * len(flows) and by_key(state).keys() == keys(range(len(flows)), flows), state
             r.record(label, samples)
             return state
     pytest.fail(f"automatic hardware admission failed: {samples}")
 
 
-async def hardware(r, p, label):
+async def hardware(r, p, label, flows=FLOWS):
+    ids = list(range(len(flows)))
     before = await r.state()
     tx_before, cpu_before = await software_tx(r), await cpu(r)
-    reports = await p.batch(ALL, count=256, interval=0.03125)
+    reports = await p.batch(ids, count=256, interval=0.03125)
     after, tx_after, cpu_after = await r.state(), await software_tx(r), await cpu(r)
-    unchanged(before, after, ALL)
+    unchanged(before, after, ids, flows)
     assert before["installs"] == after["installs"] and before["deletes"] == after["deletes"], (before, after)
     old, new = by_key(before), by_key(after)
-    for ident in ALL:
-        for key in keys([ident]):
+    for ident in ids:
+        for key in keys([ident], flows):
             packets = int(new[key]["packets"]) - int(old[key]["packets"])
-            if FLOWS[ident]["proto"] == "udp":
+            if flows[ident]["proto"] == "udp":
                 assert packets == 256, (key, packets)
                 assert int(new[key]["bytes"]) - int(old[key]["bytes"]) == 256 * (256 + 42), (key, old, new)
             else:

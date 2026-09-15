@@ -77,10 +77,10 @@ async def recover(r, *, global_invalidation=False):
     assert after["rearms"] == before["rearms"] + 1 and after["invalidated"] == 0, (before, after)
 
 
-async def invalidated(r, before, label, *, global_invalidation=False):
+async def invalidated(r, before, label, *, global_invalidation=False, counter="neighbour_invalidations"):
     state = await r.wait(lambda s: s["entries"] == 0 and (
         s["invalidation_done"] == 1 if global_invalidation else
-        s["neighbour_invalidations"] > before["neighbour_invalidations"]))
+        s[counter] > before[counter]))
     assert state["invalidated"] == int(global_invalidation) and state["bindings"] == 2, state
     assert state["handle_refs"] == state["neighbour_refs"] == state["errors"] == state["fatal"] == state["quarantine"] == 0, state
     assert state["installs"] == before["installs"] and state["rearms"] == before["rearms"], (before, state)

@@ -570,18 +570,22 @@ async def test_flowtable_offload_add_failures(rig):
 
 
 async def test_flowtable_offload_rearm(rig):
-    """Recover after device/route MTU changes and a retried delete barrier."""
+    """Recover after device MTU and routing-policy changes and a retried delete barrier."""
     r = rig
     initial = await r.state()
     if initial["observe"]:
         pytest.skip("rearm proof requires installed hardware")
     original_mtu = (await read(r.target, r.session, f"/sys/class/net/{TARGET_LAN_IF}/mtu")).strip()
+    rule_priority = "32001"
+    rules = json.loads((await command(r.target, r.session, "ip", "-j", "rule", "show"))["stdout"])
+    assert not any(rule.get("priority") == int(rule_priority) for rule in rules), rules
+    rule_added = False
     boot_id = await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")
     await r.table()
     await r.exchange(128, promiscuous=False)
     await r.wait(lambda s: s["entries"] == 2)
     try:
-        for cycle, trigger in enumerate(("device", "route", "barrier"), 1):
+        for cycle, trigger in enumerate(("device", "rule", "barrier"), 1):
             before = await r.state()
             traffic = None
             knob = "/proc/fm_ehash_hcsync_fail"
@@ -594,9 +598,10 @@ async def test_flowtable_offload_rearm(rig):
                         assert not traffic.done() and time.monotonic() < deadline
                         await asyncio.sleep(0.02)
                     await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", "1400")
-                elif trigger == "route":
-                    await command(r.target, r.session, "ip", "route", "replace", f"{r.lan_ip}/32",
-                                  "dev", TARGET_LAN_IF, "mtu", "1100")
+                elif trigger == "rule":
+                    await command(r.target, r.session, "ip", "rule", "add", "pref", rule_priority,
+                                  "from", "198.18.254.0/24", "table", "main")
+                    rule_added = True
                 else:
                     result = await r.target.fs_write(r.session, knob, "2")
                     assert result["errno"] == 0, result
@@ -649,7 +654,7 @@ async def test_flowtable_offload_rearm(rig):
             await r.exchange(128, promiscuous=False)
             installed = await r.wait(lambda s: s["entries"] == 2)
             for flow in installed["flows"]:
-                expected_mtu = 1100 if cycle >= 2 and flow["out"] == TARGET_LAN_IF else 1200
+                expected_mtu = 1200
                 assert int(flow["mtu"]) == expected_mtu, installed
             tx_before = {d: await kernel_tx_packets(r.target, r.session, d)
                          for d in (TARGET_LAN_IF, TARGET_WAN_IF)}
@@ -674,6 +679,9 @@ async def test_flowtable_offload_rearm(rig):
         try:
             await r.delete_table()
         finally:
+            if rule_added:
+                await command(r.target, r.session, "ip", "rule", "del", "pref", rule_priority,
+                              "from", "198.18.254.0/24", "table", "main")
             await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", original_mtu)
 
 

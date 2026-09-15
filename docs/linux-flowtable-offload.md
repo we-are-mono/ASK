@@ -2,7 +2,9 @@
 
 Status: bounded multiple-connection IPv4 UDP/TCP offload, ordinary ARP and IPv4
 gateway routing demonstrated on the DUT. Neighbour invalidation is selective
-with automatic recovery; route/device changes retain whole-table invalidation.
+with automatic recovery. IPv4 route-prefix changes now use the same selective
+retirement path and have passed their focused DUT proof. Device and
+routing-policy changes retain whole-table invalidation.
 The earlier intermittent UDP loss remains unresolved and deferred; its scope and
 evidence are recorded separately below.
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
@@ -387,12 +389,12 @@ permanent MAC. Both directly reachable destinations and IPv4 gateways are
 supported through the route supplied by Linux. IPv6 gateways remain excluded.
 
 Patch `140-ask-flowtable-context.patch` supplies borrowed conntrack and selected
-route context, the directional effective MTU, and the table's accounting
-requirement to callbacks. Context version 4 also supplies an opaque, reference
-counted invalidation handle shared by a flow's two directions. The driver owns
+route context for both directions, the directional effective MTU, and the
+table's accounting requirement to callbacks. Context version 5 includes an
+opaque, reference counted invalidation handle shared by a flow's two directions. The driver owns
 one reference per installed direction; the handle retains no flow, conntrack,
-route, table or namespace pointer. Neither borrowed context pointer nor a Linux
-flow object is retained. This explicit, downstream, kernel-internal
+route, table or namespace pointer. No borrowed context pointer or Linux flow
+object is retained. This explicit, downstream, kernel-internal
 interface avoids recovering a parent flow by casting its cookie. The adapter
 must be built against this patch; the test image includes the native flowtable
 and nftables modules it needs.
@@ -460,18 +462,38 @@ must also match the netdevice recorded by CDX, not merely its name. Flowtables
 must be bound after CDX initializes; incomplete indirect replay requests are
 declined.
 
-Relevant initial-netns IPv4 route changes, or interface down, unregister, MTU,
+Initial-netns routing-policy/nexthop events and interface down, unregister, MTU,
 MAC, rename, or upper-device changes conservatively disable hardware admission
-until the recovery boundary below. IPv4 route events remain namespace-wide.
-A watched neighbour's changed MAC, unusable state or detached object instead
-invalidates only dependent flow generations, including both directions. Their
+until the recovery boundary below. Committed IPv4 route changes invalidate
+connections with either endpoint in the changed prefix, conservatively across
+all tables and DSCP aliases. A watched neighbour's changed MAC, unusable state
+or detached object invalidates only dependent flow generations, including both directions. Their
 cached Linux lookup stops immediately and native GC tears them down. Once
 resolution is valid, fresh traffic can return to hardware without recreating
 the table. Same-MAC NUD progress and unrelated ARP updates need no retirement.
-Configure routes before binding; neighbours may resolve through ordinary ARP
-after binding. Both retirement paths are asynchronous: inspect the affected
+Routes may change and neighbours may resolve through ordinary ARP after binding.
+Both retirement paths are asynchronous: inspect the affected
 entries and reference counts for selective retirement, or `invalidation_done`
 for global retirement. A hardware retirement error escalates to global recovery.
+
+The committed-prefix netevent covers every IPv4 FIB alias insertion, replacement,
+deletion and flush. The native FIB notifier reports selected aliases only and
+can run before commit, so its entry notifications are not used for retirement.
+Identical replacements and failed insertions emit no committed event. Both
+endpoints are checked even when only one hardware direction exists; this relies
+on the current no-NAT admission contract. CDX rechecks both borrowed destinations
+under RTNL before admission to reject work queued before a route change. Linux's
+existing route generation and expiry checks remain intact; unrelated software
+cache entries may still expire under those native rules.
+
+For opted-in flowtables, reverse IPv4 lookup also requires FIB success. The
+normal forced-output-interface lookup permits an on-link route after a FIB
+error, which could otherwise bypass withdrawal or a blackhole route through
+software and hardware offload. The new internal lookup flag disables that
+fallback for these tables; ordinary callers retain their existing behaviour.
+The driver neither repeats policy routing with incomplete packet context nor
+retains FIB objects. `route_invalidations` counts newly invalidated flow
+generations, once per shared handle, including stale admission context.
 
 Healthy global invalidation can recover by deleting and recreating the flowtable after
 configuration has settled. Admission remains closed while any old binding or
@@ -533,7 +555,7 @@ the fixture. TCP tests reuse the topology with a TCP peer instead of the echo
 server. It uses the LAN UART and target/WAN agents without CMM helpers.
 Runs can set `ASK_FLOWTABLE_ARTIFACTS` to retain measurements and packet captures.
 The rearm test exercises three recovery cycles without rebooting. It changes the
-DUT LAN device MTU, then a direct host-route MTU, then injects two
+DUT LAN device MTU, then adds a routing-policy rule, then injects two
 retirement-barrier failures.
 Each cycle proves software forwarding during invalidation and fresh hardware
 forwarding after table recreation. Strict delivery checks use the NIC's normal
@@ -1344,3 +1366,96 @@ Stop at this increment. This proves selective neighbour recovery for the
 existing bounded IPv4 TCP/UDP scope. Selective route/device handling and further
 foundation work remain separate increments; no additional encapsulation,
 forwarding feature or firmware capability is introduced here.
+
+## Selective IPv4 route retirement — verified 2026-09-15
+
+This increment extends the existing shared invalidation handle and retirement
+worker to committed IPv4 route-prefix changes. It keeps the 64-direction limit,
+the no-NAT IPv4 TCP/UDP admission contract, and the existing firmware interface.
+CDX matches both endpoints against the changed prefix across all routing tables
+and DSCP aliases. This is deliberately conservative within a prefix and does
+not claim complete policy-routing or device dependency tracking. Policy,
+nexthop-object and device events retain whole-table invalidation.
+
+`test_flowtable_routes_selective` creates two routed LAN peers, each with UDP
+and a persistent TCP connection, for eight hardware directions. It proves:
+
+- Replacing peer A's route changes its return MTU from 1200 to 1100; adding a
+  more-specific host route changes it to 1000; deleting that route returns to
+  1100. Each transition retires A's four directions and admits fresh ones.
+- Withdrawing A's route leaves a covering blackhole. A's hardware directions
+  stay absent while its original TCP socket attempts traffic. Restoring the
+  route allows that socket and UDP to return to hardware automatically.
+- Adding and deleting a non-selected DSCP alias also retires A, although the
+  native selected-alias FIB notifier omits that alias. Default-TOS traffic
+  returns using its 1100-byte route. An identical replacement and rejected
+  duplicate insertion leave all entries unchanged.
+- Peer B keeps the same four cookies and increasing hardware counters throughout
+  all six changes, with continuous validated UDP/TCP exchanges. The table is
+  never recreated: `rearms=0`, twelve shared generations invalidated, and final
+  cleanup has 32 installs/deletes, zero errors and zero retained references.
+
+The first hardware run exposed a reverse-route lookup problem: forcing an
+output interface let Linux synthesize an on-link route after the blackhole FIB
+failure. A's TCP flow was admitted again during withdrawal. The corrected
+kernel requires successful FIB lookup for the opted-in reverse path, before
+creating either a software or hardware cached flow. The failed run is retained
+under `proof/`; the complete passing run is under `proof-strict/`. The withdrawal
+assertion and packet-delivery checks were not relaxed.
+
+Initial and final eight-second steady windows validate 256 echoes per flow.
+UDP hardware deltas are exactly 256 packets and 76,288 bytes in each direction;
+each TCP connection transfers 4 MiB and advances its hardware counters. Software
+TX deltas are 6/16 packets initially and 3/15 finally on LAN/WAN, with aggregate
+softirq time 0.31% in both windows. Total measured CPU busy time is 27.28% and
+23.76% respectively; these are instrumented-system measurements, not an idle-CPU
+claim or a throughput benchmark.
+
+Seven focused host tests pass with ASan/UBSan. They compile production driver,
+handle, lookup and teardown functions and cover prefix boundaries, other
+namespaces, partial directional admission, stale or absent routes in either
+direction, shared references, policy/nexthop global fallback, and strict FIB
+failure handling. The strict lookup test also verifies that successful routes
+and ordinary callers' existing fallback behaviour remain intact.
+
+Five focused DUT tests pass: the new route lifecycle and route retirement-failure
+tests, selective neighbour recovery, UDP gateway recovery, and global rearm.
+Gateway replacement now recovers without table recreation. The rearm test uses
+a routing-policy rule for its global routing trigger, alongside device MTU
+change and an injected barrier failure. A failed selective route retirement
+correctly escalates to global invalidation, drains all eight directions and
+their references, preserves software forwarding, and permits healthy rearm.
+
+Final state is 76 installs and 76 deletes, four expected errors from the two
+deliberate two-failure barrier injections, and four rearms. Entries, bindings,
+neighbour references, handle references, quarantine, fatal and invalidation
+state are all zero. Test routes, policy rule, namespaces, NAT exemptions and
+fault knobs are removed; endpoint configuration and NUD settings are restored.
+There are no KASAN, lockdep, warning or oops reports, and taint remains 4096.
+
+The corrected KASAN image was built, staged and verified against the running
+kernel/module and userspace binaries. Kernel build ID is
+`3492e3327a061c274ca163522edfe1a33dec0bc5`; CDX build ID is
+`2a5741b965312b93386f8460960532080d7eb936`. Staged image SHA-256 is
+`2c185dbdc67ab43ab0d89dcd1c69f4450e3dc245829c2ceb99bc233fe5f964b8`.
+KASAN, lockdep, kmemleak and failslab stayed enabled. Only focused tests ran;
+there was no full KASAN suite or forced kmemleak scan. All five passing DUT tests
+ran on the same experimental boot with CMM disabled.
+
+From a clean experimental boot, reproduce the two new tests with:
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 \
+  ASK_FLOWTABLE_ARTIFACTS=/tmp/ask-flowtable-routes \
+  make ask-test ASK_TEST_ARGS='-k flowtable_routes -x -q'
+```
+
+Artifacts are under `/tmp/ask-flowtable-routes/`: `proof-strict/`, `regression/`,
+`barrier/` and `rearm/`, corresponding logs/XML, host results, image/source
+identities and final restoration evidence. The initial failing route proof is
+under `proof/`. Build logs are `/tmp/ask-flowtable-routes-build.log` and
+`/tmp/ask-flowtable-routes-strict-build.log`.
+
+Stop at this increment. Selective device dependencies and broader foundation
+coverage remain separate work. This does not add NAT, IPv6, encapsulation or a
+new firmware capability, and does not change the chosen per-boot owner.

@@ -163,7 +163,7 @@ async def assert_gateway(r, address):
 async def switch_gateway(r, before):
     await command(r.target, r.session, "ip", "route", "replace", PEER_IP + "/32",
                   "via", ALTERNATE_GW, "dev", TARGET_LAN_IF, "mtu", "1200")
-    await invalidated(r, before, "gateway-route-invalidated", global_invalidation=True)
+    await invalidated(r, before, "gateway-route-invalidated", counter="route_invalidations")
     r.arp_address = ALTERNATE_GW
     r.arp_neighbours.append((ALTERNATE_GW, TARGET_LAN_IF))
     r.record(f"gateway-{r.proto}-route-changed", await command(r.target, r.session, "ip", "-j", "route", "get", PEER_IP))
@@ -187,7 +187,7 @@ async def test_flowtable_gateway_udp(rig):
             before = await assert_gateway(r, gateway)
             await switch_gateway(r, before)
             await r.exchange(64, promiscuous=False)
-            await recover(r, global_invalidation=True)
+            await recover(r)
             await udp_hardware(r, label="gateway-route-recovered")
             before = await assert_gateway(r, ALTERNATE_GW)
             failure = await lan_neighbour(r, arp_ignore=8)
@@ -226,7 +226,7 @@ async def test_flowtable_gateway_tcp(rig):
                 before = await assert_gateway(r, gateway)
                 await switch_gateway(r, before)
                 await conn.transfer("upload")
-                await recover(r, global_invalidation=True)
+                await recover(r)
                 await installed(r, conn)
                 before = await assert_gateway(r, ALTERNATE_GW)
                 failure = await conn.configure_neighbour(LAN_NIC, address=ALTERNATE_GW, arp_ignore=8, restore_after=8)
