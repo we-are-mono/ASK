@@ -216,7 +216,7 @@ static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_admission_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
@@ -896,6 +896,52 @@ static void test_selective_neighbours(void)
     assert(!ft_handle_refs && handle.refs == 1 && !allocated);
 }
 
+static void test_transient_admission(void)
+{
+    struct cdx_ft_binding other_binding = { .dev = &out };
+    for (unsigned tcp = 0; tcp < 2; tcp++) {
+        if (tcp) tcp_fixture(); else fixture();
+        cls.command = FLOW_CLS_REPLACE;
+        u64 invalidations = ft_admission_invalidations, busy = ft_busy;
+        ft_fail_stage = 4;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        assert(ft_fail_stage == 4 && ft_count == 1 && !handle.invalid);
+        /* Visiting a different ingress cannot consume the fault or retire
+         * the successfully installed direction, even during real contention. */
+        rtnl_busy = true;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &other_binding) == -EOPNOTSUPP);
+        assert(ft_fail_stage == 4 && ft_busy == busy && !handle.invalid);
+        rtnl_busy = false;
+        cls.cookie++; pk.src++;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
+        assert(!ft_fail_stage && handle.invalid && ft_count == 1);
+        assert(ft_busy == busy + 1 && ft_admission_invalidations == invalidations + 1);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && handle.refs == 1);
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EOPNOTSUPP);
+        /* Fresh generation after native GC; the same table stays eligible. */
+        handle = (struct nf_flow_offload_handle){ .refs = 1 };
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+        assert(!ft_invalid && !handle.invalid && ft_count == 1);
+        rtnl_busy = true;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
+        assert(handle.invalid && ft_admission_invalidations == invalidations + 2);
+        rtnl_busy = false;
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated && !live_hw);
+    }
+    for (unsigned excluded = 0; excluded < 4; excluded++) {
+        fixture(); cls.command = FLOW_CLS_REPLACE;
+        u64 invalidations = ft_admission_invalidations;
+        ft_observe = excluded == 0; ft_stopping = excluded == 1;
+        ft_invalid = excluded == 2; ft_fatal = excluded == 3;
+        rtnl_busy = true;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -EAGAIN);
+        assert(!handle.invalid && ft_admission_invalidations == invalidations);
+        rtnl_busy = false; ft_observe = ft_stopping = ft_fatal = false; ft_invalid = 0;
+    }
+}
+
 static void test_selective_routes(void)
 {
     struct nf_flow_offload_handle contexts[2] = {{1, false}, {1, false}};
@@ -1321,6 +1367,7 @@ int main(void)
     test_selective_routes();
     test_device_dependencies();
     test_device_recovery();
+    test_transient_admission();
     test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

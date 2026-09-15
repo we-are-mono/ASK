@@ -518,8 +518,11 @@ neighbour work removes entries sharing an invalid handle and leaves Linux
 teardown to native GC. Module exit removes the proc entry and notifiers, cancels invalidation
 work, and unregisters indirect callbacks before global CDX teardown acquires its
 locks. The backend uses RTNL trylock for installation and fatal recovery,
-because RTNL holders can wait for Netfilter callbacks. A busy RTNL lock declines
-installation to software; fatal recovery ends the transaction and retries. A port
+because RTNL holders can wait for Netfilter callbacks. A busy RTNL lock on the
+request's matching ingress retires that shared generation. Native GC and fresh
+traffic can then retry through the same table. Requests visiting the other bound
+port are declined before RTNL and cannot invalidate a successful direction.
+Fatal recovery ends the transaction and retries. A port
 must also match the netdevice recorded by CDX, not merely its name. Flowtables
 must be bound after CDX initializes; incomplete indirect replay requests are
 declined.
@@ -2096,3 +2099,65 @@ contention: one direction installed and its peer stayed in software. This is a
 separate foundation recovery gap, retained in `partial-admission-before-fault/`.
 Transient admission recovery will be addressed next; the terminal guard proof
 subsequently passed with both initial directions installed.
+
+
+## Transient admission recovery — verified 2026-09-15
+
+RTNL contention during one directional ADD could leave the peer direction
+installed indefinitely: native hardware statistics kept that generation active,
+while the rejected direction remained in software. A matching busy request now
+invalidates its shared handle and schedules selective retirement. Native GC
+releases the old generation, and fresh traffic can retry without replacing the
+flowtable or socket. This does not clear global/fatal state and is inactive in
+observe or stopping state. Unsupported and capacity refusals retain their
+existing software-fallback contract.
+
+Native work visits every bound device for each direction. The adapter first
+checks immutable META ingress identity, so a visit to the other port cannot
+consume the fault hook, contend unnecessarily for RTNL, or invalidate a valid
+connection. `admission_invalidations` reports retired generations. Debug failure
+stage 4 is consumed only after another directional cookie for the same handle
+already owns an entry; it exercises the actual busy-recovery path without
+blocking a kernel lock.
+
+Five focused ASan/UBSan host checks pass in 1.16 seconds. They prove UDP/TCP
+partial retirement, real and injected contention, wrong-ingress rejection,
+refusal of the obsolete generation, balanced references, fresh admission, and
+preservation of observe/global/fatal/stopping states. The two DUT transient
+admission cases pass in 104.75 seconds. Each fault retires one installed
+direction and recovers two fresh directions on the same socket/table. The UDP
+window delivers 256 exact echoes with 256 hardware hits per direction; TCP
+transfers 4 MiB per direction. Software TX is 4/17 packets for UDP and 3/15 for
+TCP. Aggregate softirq is 0.82% and 0.34%; total busy CPU is 27.69% and 2.06%,
+respectively. The UDP busy spike is retained in the raw measurements without
+attributing it to an unmeasured background task.
+
+The existing bounded 32-connection regression passes in 69.93 seconds. It
+proves 64 installed directions, selective conntrack deletion, TCP FIN, idle
+expiry, unaffected surviving flows and resource reuse. Idle CPU is 1.89%; the
+full-set hardware window is 2.23% busy / 0.41% softirq with 4/17 software TX
+packets. Surviving flows use 2.14% busy / 0.38% softirq with 4/16 software TX.
+No full suite was run.
+
+The first hardware attempt ended before admission because loki's X550 had no
+physical carrier after reboot. Peer/DUT administrative cycling and X550
+renegotiation did not restore it. The SFP core reports no attached upstream
+controller and asserted TX_DISABLE; temporarily releasing that pin did not
+restore carrier either, so no causality is claimed. Its original driver/GPIO
+ownership was restored. Restricting X550 advertisement to 1 Gb/s restored the
+link. Its default route, removed during administrative cycling, was also
+restored. Initial diagnostic pings did not pass, but the subsequent TCP control
+connections and strict UDP/TCP hardware proofs above did. The remaining tests
+use that 1 Gb/s link, as authorized; line-rate throughput is not the criterion.
+
+Kernel build ID is `eee2d20d6df912752efb8e414fe83c8cfc57f8d9`, CDX
+`ed4251e6275e1ecbe06998b28203deb1a659b67a`, and adapter
+`ffa21d2010260477d080a0895d0e78e3192ae0bb`. The KASAN image was built and staged;
+SHA-256 is `931805066a369cba022afd588cc85b2bcd7039ce132ecc07325278980858f437`.
+Build log is `/tmp/ask-flowtable-admission-build.log` (no compiler warnings,
+three existing forced-task warnings). Artifacts in `/tmp/ask-flowtable-admission/`
+retain host/DUT logs, image identities, all failed pre-traffic diagnostics and
+passing hardware/connection evidence.
+KASAN/lockdep diagnostics remain clean, `debug_locks` is 1 and taint is 4096.
+All entries/bindings/references are drained, installs equal deletes, and no
+backend error or quarantine remains. SFP driver/GPIO ownership is restored.

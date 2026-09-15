@@ -41,7 +41,7 @@ static unsigned int ft_init_fail_stage;
 module_param_named(init_fail_stage, ft_init_fail_stage, uint, 0444);
 MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration");
 module_param_named(flowtable_fail_stage, ft_fail_stage, uint, 0600);
-MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocation, 2 before hardware, 3 after hardware");
+MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocation, 2 before hardware, 3 after hardware, 4 busy after peer direction");
 #endif
 
 struct cdx_ft_binding {
@@ -89,6 +89,7 @@ static atomic64_t ft_route_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mtu_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_link_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mac_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_admission_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping;
@@ -544,6 +545,36 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	return 0;
 }
 
+/* Native flowtable work visits all bound devices for each direction. Decline
+ * the other ingress before taking RTNL or attributing a transient failure to
+ * its shared generation. These immutable match fields need no RTNL. */
+static bool ft_request_targets(const struct cdx_ft_binding *binding,
+			       const struct flow_cls_offload *cls)
+{
+	struct flow_match_meta meta;
+
+	if (!cls->rule ||
+	    !(cls->rule->match.dissector->used_keys & BIT(FLOW_DISSECTOR_KEY_META)))
+		return false;
+	flow_rule_match_meta(cls->rule, &meta);
+	return meta.mask->ingress_ifindex == -1 &&
+	       meta.key->ingress_ifindex == binding->dev->ifindex;
+}
+
+static bool ft_admission_fault(const struct flow_cls_offload *cls)
+{
+#ifdef CDX_DEBUG_FLOWTABLE
+	struct cdx_ft_entry *entry;
+
+	if (READ_ONCE(ft_fail_stage) != 4)
+		return false;
+	list_for_each_entry(entry, &ft_entries, list)
+		if (entry->handle == cls->nf_handle && entry->cookie != cls->cookie)
+			return ft_fault(4);
+#endif
+	return false;
+}
+
 static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 {
 	struct cdx_ft_binding *binding = priv;
@@ -560,9 +591,16 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:
 		/* Never wait for RTNL here: device teardown under RTNL may be
-		 * flushing this workqueue. A busy configuration uses software. */
-		if (cdx_ft_admission_begin()) {
+		 * flushing this workqueue. Retire a busy generation so fresh
+		 * traffic retries after native GC, rather than retaining one
+		 * accelerated direction indefinitely. */
+		if (!ft_request_targets(binding, cls)) {
+			rc = -EOPNOTSUPP;
+		} else if (ft_admission_fault(cls) || cdx_ft_admission_begin()) {
 			ft_busy++;
+			if (!cdx_ft_observing() && !ft_stopping &&
+			    !atomic_read(&ft_invalid) && !cdx_ft_failed())
+				ft_handle_invalidate(cls->nf_handle, &ft_admission_invalidations);
 			rc = -EAGAIN;
 		} else {
 			rc = ft_replace(binding, cls);
@@ -927,7 +965,7 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nadmission_invalidations %lld\n",
 		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -937,7 +975,8 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   atomic64_read(&ft_route_invalidations),
 		   atomic64_read(&ft_mtu_invalidations),
 		   atomic64_read(&ft_link_invalidations),
-		   atomic64_read(&ft_mac_invalidations));
+		   atomic64_read(&ft_mac_invalidations),
+		   atomic64_read(&ft_admission_invalidations));
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
