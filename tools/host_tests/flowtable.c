@@ -213,7 +213,7 @@ static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations, ft_route_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
@@ -991,7 +991,7 @@ static void test_device_dependencies(void)
     struct net other_net;
     /* The same ifindex on another object must not match the bound port. */
     struct net_device unrelated = { .ifindex = in.ifindex };
-    unsigned long events[] = { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU,
+    unsigned long events[] = { NETDEV_GOING_DOWN, NETDEV_UNREGISTER,
                               NETDEV_CHANGEADDR, NETDEV_CHANGEUPPER, NETDEV_CHANGENAME };
     fixture();
     assert(!ft_bound && !ft_count && !ft_invalid);
@@ -1003,7 +1003,7 @@ static void test_device_dependencies(void)
         device_event(&unrelated, events[i], false);
     }
     in.net = &other_net;
-    device_event(&in, NETDEV_CHANGEMTU, false);
+    device_event(&in, NETDEV_CHANGENAME, false);
     in.net = NULL;
     device_event(&in, NETDEV_REGISTER, false);
     struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
@@ -1014,16 +1014,16 @@ static void test_device_dependencies(void)
         device_event(&in, events[i], true);
         device_event(&unrelated, events[i], false);
     }
-    device_event(&out, NETDEV_CHANGEMTU, true);
+    device_event(&out, NETDEV_CHANGENAME, true);
     ft_invalidate_work(NULL);
     assert(ft_invalid_done && !ft_count && !ft_handle_refs && !ft_neighbour_refs && !out.refs);
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
     assert(!ft_bound && !in.refs && !allocated && !live_hw);
     /* No stale watch can follow the released binding into its replacement. */
     assert(bind_device(&unrelated, FLOW_BLOCK_BIND) == 0);
-    device_event(&in, NETDEV_CHANGEMTU, false);
-    device_event(&out, NETDEV_CHANGEMTU, false);
-    device_event(&unrelated, NETDEV_CHANGEMTU, true);
+    device_event(&in, NETDEV_CHANGENAME, false);
+    device_event(&out, NETDEV_CHANGENAME, false);
+    device_event(&unrelated, NETDEV_CHANGENAME, true);
     ft_invalid = 0;
     assert(bind_device(&unrelated, FLOW_BLOCK_UNBIND) == 0);
     assert(!unrelated.refs && !ft_bound && !allocated);
@@ -1038,6 +1038,100 @@ static void test_device_dependencies(void)
     }
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
     assert(!ft_bound && !in.refs && !allocated && ft_installs == ft_deletes);
+}
+
+static void test_mtu_recovery(void)
+{
+    struct net other_net;
+    struct net_device unrelated = { .ifindex = in.ifindex };
+    struct netdev_notifier_info info = { .dev = &unrelated };
+    struct fib_notifier_info policy = { .family = AF_INET };
+    u64 rearms = ft_rearms;
+
+    for (unsigned tcp = 0; tcp < 2; tcp++) {
+        for (unsigned egress = 0; egress < 2; egress++) {
+            struct nf_flow_offload_handle queued = {1, false}, fresh = {1, false};
+            u64 invalidations = ft_mtu_invalidations;
+            if (tcp) tcp_fixture(); else fixture();
+            assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+            struct cdx_ft_binding *b = list_entry(ft_bindings.next, struct cdx_ft_binding, list);
+            info.dev = &in;
+            ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+            assert(!ft_invalid && ft_mtu_invalidations == invalidations); /* Empty binding. */
+            assert(ft_replace(b, &cls) == 0);
+            cls.cookie++; pk.src++;
+            assert(ft_replace(b, &cls) == 0); /* Two entries share one flow generation. */
+            info.dev = &unrelated;
+            ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+            info.dev = &in; in.net = &other_net;
+            ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+            in.net = NULL;
+            assert(!handle.invalid && ft_mtu_invalidations == invalidations);
+            info.dev = egress ? &out : &in; /* Egress has no binding of its own. */
+            ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+            ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+            assert(handle.invalid && ft_mtu_invalidations == invalidations + 1);
+            assert(!ft_invalid && !ft_invalid_done && ft_count == 2 && handle.refs == 3);
+            ft_retire_workfn(NULL);
+            assert(ft_bound == 1 && !ft_count && !ft_handle_refs && !ft_neighbour_refs);
+            assert(handle.refs == 1 && in.refs == 1 && !out.refs && !live_hw);
+
+            /* IPv4 invalidates both cached dsts on MTU change. Even a queued
+             * request whose own egress is unchanged must reject the old
+             * reverse route, before allocation, and invalidate its handle. */
+            cls.nf_handle = &queued; reverse_route.dst.valid = false;
+            assert(ft_replace(b, &cls) == -EOPNOTSUPP && queued.invalid && queued.refs == 1);
+            assert(!ft_count && !ft_invalid);
+            reverse_route.dst.valid = true; cls.nf_handle = &fresh;
+            out.mtu = cls.nf_mtu = 1400;
+            assert(ft_replace(b, &cls) == 0);
+            assert(ft_find(b, cls.cookie)->rule.mtu == 1400 && ft_bound == 1);
+            assert(ft_rearms == rearms); /* No table recreation or global rearm. */
+
+            /* MTU recovery must not reopen admission after a policy event. */
+            ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &policy);
+            ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+            ft_retire_workfn(NULL);
+            assert(ft_invalid && !ft_invalid_done && ft_count == 1 && fresh.invalid);
+            ft_invalidate_work(NULL);
+            assert(ft_invalid_done && ft_invalid && !ft_count);
+            ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+            assert(ft_invalid_done && ft_invalid && ft_rearms == rearms);
+            assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+            assert(!allocated && !in.refs && !out.refs && fresh.refs == 1);
+            ft_invalid = 0; ft_invalid_done = false; out.mtu = 1500;
+        }
+    }
+    for (unsigned fatal = 0; fatal < 2; fatal++) {
+        fixture();
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+        struct cdx_ft_binding *b = list_entry(ft_bindings.next, struct cdx_ft_binding, list);
+        assert(ft_replace(b, &cls) == 0);
+        info.dev = &out;
+        ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+        deletion_error = fatal ? -EIO : -EAGAIN;
+        ft_retire_workfn(NULL);
+        deletion_error = 0;
+        assert(ft_invalid && ft_fatal == !!fatal && !ft_count);
+        ft_invalidate_work(NULL);
+        ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+        assert(ft_invalid && ft_invalid_done && ft_fatal == !!fatal);
+        assert(ft_rearms == rearms && handle.refs == 1);
+        assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+        assert(!allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
+        ft_invalid = 0; ft_invalid_done = ft_fatal = false;
+    }
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    unsigned scheduled_before = neigh_scheduled;
+    ft_stopping = true; info.dev = &out;
+    ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+    assert(handle.invalid && neigh_scheduled == scheduled_before);
+    ft_retire_workfn(NULL);
+    assert(ft_count == 1); /* Unload owns this entry now. */
+    assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
+    ft_stopping = false;
+    assert(ft_installs == ft_deletes && !allocated);
 }
 
 static void test_registration(void)
@@ -1177,6 +1271,7 @@ int main(void)
     test_selective_neighbours();
     test_selective_routes();
     test_device_dependencies();
+    test_mtu_recovery();
     test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

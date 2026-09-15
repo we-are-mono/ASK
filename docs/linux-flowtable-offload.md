@@ -2,9 +2,10 @@
 
 Status: bounded multiple-connection IPv4 UDP/TCP offload, ordinary ARP and IPv4
 gateway routing demonstrated on the DUT. Neighbour invalidation is selective
-with automatic recovery. IPv4 route-prefix changes now use the same selective
-retirement path and have passed their focused DUT proof. Device and
-routing-policy changes retain whole-table invalidation.
+with automatic recovery. IPv4 route-prefix and physical-port MTU changes use
+the same selective retirement path and have passed their focused DUT proofs.
+Other recognized changes to relevant devices and routing-policy changes retain
+whole-table invalidation; unrelated devices leave hardware entries alone.
 The earlier intermittent UDP loss remains unresolved and deferred; its scope and
 evidence are recorded separately below.
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
@@ -427,9 +428,17 @@ installed direction's ingress/egress. Empty bindings remain watched, and egress
 devices need not have their own binding. Matching uses pinned device objects,
 not names or interface indices. `ft_watch_lock` protects binding publication,
 removal and the existing flow dependency watches; a notifier latches invalidation
-under that lock without taking a backend transaction. Recognized events on a
-relevant device still invalidate the whole table and require table recreation
-after recovery. Unrelated device events leave existing hardware flows alone.
+under that lock without taking a backend transaction. MTU changes invalidate
+affected per-flow handles and retire their hardware directions, leaving bindings
+available for automatic admission of fresh Linux flow generations. Both routes
+are revalidated under RTNL: the IPv4 MTU notifier flushes route caches under the
+same lock, so an older queued request cannot install stale context. Empty
+bindings need no MTU recovery. `mtu_invalidations` counts affected generations,
+once per handle, rather than directions or notifications. Other recognized
+events on relevant devices still invalidate the whole table and require table
+recreation after recovery. Unrelated device events leave hardware flows alone.
+MTU handling never clears a global invalidation or terminal hardware latch;
+retirement errors escalate through the existing global recovery path.
 
 Releasing a claim requires zero live directions. CDX keeps any retired storage,
 the terminal failure latch and the sealed configuration gate independently of
@@ -515,17 +524,19 @@ must also match the netdevice recorded by CDX, not merely its name. Flowtables
 must be bound after CDX initializes; incomplete indirect replay requests are
 declined.
 
-Initial-netns routing-policy/nexthop events and interface down, unregister, MTU,
+Initial-netns routing-policy/nexthop events and relevant interface down, unregister,
 MAC, rename, or upper-device changes conservatively disable hardware admission
 until the recovery boundary below. Committed IPv4 route changes invalidate
 connections with either endpoint in the changed prefix, conservatively across
-all tables and DSCP aliases. A watched neighbour's changed MAC, unusable state
+all tables and DSCP aliases. Physical-port MTU changes invalidate generations
+with that device as ingress or egress, preserving the table for automatic
+readmission with current route MTUs. A watched neighbour's changed MAC, unusable state
 or detached object invalidates only dependent flow generations, including both directions. Their
 cached Linux lookup stops immediately and native GC tears them down. Once
 resolution is valid, fresh traffic can return to hardware without recreating
 the table. Same-MAC NUD progress and unrelated ARP updates need no retirement.
 Routes may change and neighbours may resolve through ordinary ARP after binding.
-Both retirement paths are asynchronous: inspect the affected
+Selective and global retirement are asynchronous: inspect the affected
 entries and reference counts for selective retirement, or `invalidation_done`
 for global retirement. A hardware retirement error escalates to global recovery.
 
@@ -1788,3 +1799,90 @@ Stop at this increment. Recognized changes to a relevant device still retire
 the whole table and require recreation; automatic recovery after real-port
 changes and down/up cycles remains a separate increment. This adds no VLAN,
 bridge, tunnel or other traffic support, and does not change owner selection.
+
+## Automatic physical-port MTU recovery — verified 2026-09-15
+
+MTU changes now invalidate only installed flow generations using the changed
+device as ingress or egress. The existing shared handle invalidation and
+retirement worker remove both hardware directions, stop cached Linux lookup,
+and let native flowtable GC retire that generation. Bindings remain available;
+fresh packets on the same connection can create a generation with current
+routes and MTUs. This needs no table recreation, adapter reload, new recovery
+gate or additional kernel patch. Other relevant device events remain global.
+
+The pinned kernel's IPv4 `fib_netdev_event()` handles `NETDEV_CHANGEMTU` by
+synchronizing route MTUs and flushing the route cache under RTNL. Admission
+already revalidates both borrowed destinations after obtaining RTNL. A queued
+request with stale context is therefore refused before allocation, including
+when only its reverse route became stale. This dependency must be retained or
+replaced explicitly when updating the kernel. Empty bindings have no installed
+MTU state to retire. Diagnostics add `mtu_invalidations`, counting a shared
+generation once even when both directions match or notifications repeat.
+
+The handler never clears global invalidation or CDX's fatal latch. A retirement
+barrier failure still escalates to the existing global recovery boundary; an
+unproven unlink still stops classification and requires a hardware reset.
+
+Five focused host tests pass in 1.12 seconds. ASan/UBSan exercise the production
+adapter and hardware lifecycle, handle ownership and kernel route checks.
+New cases cover UDP/TCP, ingress and unbound egress dependencies, empty bindings,
+same-ifindex objects and other namespaces, repeated notification, stale reverse
+routes, fresh MTU admission, global/fatal latch preservation, retirement errors
+and shutdown without queuing new retirement work.
+
+Three focused tests pass on the staged KASAN image:
+
+| Proof | Result |
+|---|---|
+| Automatic MTU recovery | `test_flowtable_mtu_recovery`, 88.41 seconds. One persistent TCP connection and one UDP tuple survive 1500 → 1400 → 1500 on each real port. The nft flowtable object and handle remain unchanged throughout. Each transition retires exactly four hardware directions, invalidates two generations, installs four current directions and leaves global rearm at zero. |
+| Global recovery boundary | `test_flowtable_offload_rearm`, 23.17 seconds. Rename, routing-policy change and injected retirement-barrier failures retain their global recovery boundary. MTU decrease/restore cannot reopen any of them. Table recreation then restores hardware forwarding, with 512 strict echoes and exactly 512 hardware hits per direction in each cycle. |
+| Fatal retirement boundary | `test_flowtable_offload_terminal` with `ASK_FLOWTABLE_TERMINAL=unlink`, 26.89 seconds. MTU decrease/restore on each physical port leaves the fatal latch set and both physical receive ports disabled while traffic is active. Table rearm and adapter reload remain refused. CDX unload completes and 64 software echoes pass afterward. |
+
+The MTU proof uses fixture-owned routes without a fixed MTU override. After
+each transition, an eight-second hardware window delivers 256 UDP echoes and
+4 MiB of validated TCP data in each direction. Each UDP hardware counter
+advances exactly 256 packets and 76,288 bytes. Software TX advances only three
+LAN packets and fourteen WAN packets per window; aggregate softirq usage is
+0.31–0.41% and total busy usage is 2.18–4.07% on this instrumented image.
+The TCP socket stays open across all four transitions; its serial payload
+validation and the unchanged flowtable identity rule out reconnect/recreation
+as the recovery mechanism.
+
+The same table and UDP tuple then verify actual firmware packet-size limits.
+At WAN MTU 1400, 256 datagrams with IP length 1400 advance each hardware
+direction by exactly 256 packets and 361,984 Ethernet bytes. A same-tuple DF
+packet with IP length 1401 produces ICMP type 3/code 4 advertising MTU 1400 and
+never reaches the WAN echo endpoint. After restoring WAN MTU 1500, IP length
+1460 advances each direction by 256 packets and 377,344 bytes. Both size windows
+have zero LAN software TX and eight WAN software TX packets.
+
+The first run failed the final large-packet raw-frame check despite successful
+UDP payload delivery, consistent with endpoint PMTU/fragmentation affecting the
+measurement. The boundary phase now uses `IP_PMTUDISC_PROBE` on both endpoint
+sockets, restoring the WAN option afterward, so the full packet reaches the DUT
+for the test. Exact payload, frame, hardware-counter and software-TX assertions
+remain intact. No adapter change was needed for this test correction. The first
+run and its endpoint observations are preserved separately from the passing run.
+
+The KASAN image build succeeded and was staged. Kernel build ID is
+`117089510f6f135400e45aedd59310562fd041bf`, CDX
+`c6c0f308d581d77ef1047ea1dcc68ab53b1802d5`, and adapter
+`0d210167e781b632321aaf9992aaf0f3589ded2e`. Staged image SHA-256 is
+`0fc6173ec1c3d751cfe014d7819a60087fce2ff357c230bfebd9e39d4584d85e`.
+There are no CDX compiler warnings; the build reports three existing forced-task
+warnings. KASAN, lockdep, kmemleak and failslab remain enabled. The full KASAN
+suite was not run.
+
+Artifacts are under `/tmp/ask-flowtable-mtu/`: `host.log`, the `proof/`, `rearm/`
+and `terminal/` directories and their logs/XML, image identities, post-unload
+diagnostics, and `endpoint-pmtu-before-fix/`. The build log is
+`/tmp/ask-flowtable-mtu-build.log`. Post-unload and final fresh-boot diagnostics
+have no KASAN, lockdep, warning or oops reports; `debug_locks` remains 1 and taint
+remains 4096. The final boot matches the staged image with CMM stopped, CDX and
+the adapter loaded, zero counters/references/bindings and cleared fault controls.
+Both MTUs are 1500, test routes/interfaces/firewall rules are gone, and host/LAN
+settings are restored. `final-state.json` records the checked restoration.
+
+Stop at this increment. Real-port down/up recovery remains a separately proved
+step. The bounded IPv4 TCP/UDP, no-NAT admission contract, capacity limit and
+owner selection are unchanged; this does not introduce further traffic features.

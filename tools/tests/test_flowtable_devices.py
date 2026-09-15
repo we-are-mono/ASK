@@ -9,7 +9,7 @@ import pytest
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import FLOWS, by_key, connections, peer  # noqa: F401
 from test_flowtable_module import table
-from test_flowtable_offload import command, read, rig  # noqa: F401
+from test_flowtable_offload import command, rename_roundtrip, rig  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_tcp import software_tx
 
@@ -24,9 +24,6 @@ async def test_flowtable_device_dependencies(connections):
     ids = [0, 1]
     links = json.loads((await command(r.target, r.session, "ip", "-j", "link", "show"))["stdout"])
     assert not {DUMMY, RENAMED, BRIDGE} & {i["ifname"] for i in links}, links
-    mtus = {dev: (await read(r.target, r.session, f"/sys/class/net/{dev}/mtu")).strip()
-            for dev in (TARGET_LAN_IF, TARGET_WAN_IF)}
-    assert all(int(mtu) >= 1400 for mtu in mtus.values()), mtus
     await command(r.target, r.session, "modprobe", "dummy", "numdummies=0")
     try:
         async with peer(r, flows) as p:
@@ -70,13 +67,12 @@ async def test_flowtable_device_dependencies(connections):
             r.record("devices-unrelated-transfers", reports)
             await hardware(r, p, "devices-unrelated-hardware", flows)
 
-            # Both ports must remain dependencies. The route MTU is 1200;
-            # changing the port to 1300 still exercises conservative teardown
-            # without making the validated traffic itself oversized.
-            for dev, original in mtus.items():
+            # Rename remains a conservative event on either real port. MTU
+            # changes have a separate automatic recovery proof.
+            for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
                 before = await r.state()
                 await p.rpc("start", ids, count=0, interval=0.01)
-                await command(r.target, r.session, "ip", "link", "set", "dev", dev, "mtu", "1300")
+                await rename_roundtrip(r, dev)
                 retired = await r.wait(lambda s: s["invalidation_done"] == 1 and not s["entries"])
                 assert retired["invalidated"] == 1 and retired["bindings"] == 2, retired
                 assert retired["handle_refs"] == retired["neighbour_refs"] == retired["quarantine"] == 0, retired
@@ -91,7 +87,6 @@ async def test_flowtable_device_dependencies(connections):
                 assert all(tx[d] >= 128 for d in (TARGET_LAN_IF, TARGET_WAN_IF)), tx
                 blocked = await r.state()
                 assert blocked["entries"] == 0 and blocked["installs"] == before["installs"], blocked
-                await command(r.target, r.session, "ip", "link", "set", "dev", dev, "mtu", original)
                 await r.delete_table()
                 await table(r)
                 await warm(r, p, ids, "devices-" + dev + "-readmitted", flows)
@@ -101,8 +96,7 @@ async def test_flowtable_device_dependencies(connections):
                                            "transition": transition, "software_transfers": reports,
                                            "software_tx": tx, "after": after})
     finally:
-        # Remove only names checked absent before the test. Restore MTUs after
-        # detachment so cleanup cannot invalidate an otherwise empty binding.
+        # Remove only names checked absent before the test.
         try:
             await r.delete_table()
         finally:
@@ -114,8 +108,4 @@ async def test_flowtable_device_dependencies(connections):
                     result = await command(r.target, r.session, "ip", "link", "del", "dev", name, check=False)
                     if result["rc"]:
                         failures.append(result)
-            for dev, mtu in mtus.items():
-                result = await command(r.target, r.session, "ip", "link", "set", "dev", dev, "mtu", mtu, check=False)
-                if result["rc"]:
-                    failures.append(result)
             assert not failures, failures

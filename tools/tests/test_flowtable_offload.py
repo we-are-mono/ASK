@@ -52,6 +52,19 @@ async def command(agent, session, *argv, check=True):
     return result
 
 
+async def rename_roundtrip(r, dev):
+    """Trigger a conservative device event without dropping link or changing MAC."""
+    temporary = "askftrename"
+    links = json.loads((await command(r.target, r.session, "ip", "-j", "link", "show"))["stdout"])
+    assert temporary not in {i["ifname"] for i in links}, links
+    try:
+        return await command(r.target, r.session, "ip", "link", "set", "dev", dev, "name", temporary)
+    finally:
+        links = json.loads((await command(r.target, r.session, "ip", "-j", "link", "show"))["stdout"])
+        if temporary in {i["ifname"] for i in links}:
+            await command(r.target, r.session, "ip", "link", "set", "dev", temporary, "name", dev)
+
+
 async def console_command(console, *argv, check=True, timeout=20):
     # BusyBox line editing can wrap and redraw the echoed command. Frame
     # actual output rather than relying on the console's echo stripping.
@@ -154,7 +167,8 @@ class Rig:
                       "    os.setns(ns.fileno(), os.CLONE_NEWNET)\n" + script)
         return await lan_run_python(self.lan, script, **kwargs)
 
-    async def exchange(self, count=64, interval=0.003, payload_size=256, promiscuous=True):
+    async def exchange(self, count=64, interval=0.003, payload_size=256, promiscuous=True,
+                       sport=SPORT, ignore_pmtu=False):
         assert payload_size >= 8
         peer_if = getattr(self, "peer_if", LAN_NIC)
         peer_mac = getattr(self, "peer_mac", self.lan_mac)
@@ -173,8 +187,10 @@ link_before = link_stats()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_IP, socket.IP_TTL, 64)
 s.setsockopt(socket.SOL_IP, getattr(socket, "IP_RECVTTL", 12), 1)
+if {ignore_pmtu!r}:
+    s.setsockopt(socket.SOL_IP, getattr(socket, "IP_MTU_DISCOVER", 10), 3)  # IP_PMTUDISC_PROBE
 s.settimeout(2)
-s.bind(({self.lan_ip!r}, {SPORT}))
+s.bind(({self.lan_ip!r}, {sport}))
 raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
 raw.bind(({peer_if!r}, 0)); raw.settimeout(2)
 if {promiscuous!r}:
@@ -206,9 +222,9 @@ for n in range({first}, {first + count}):
             continue
         ihl = (frame[14] & 15) * 4
         start = 14 + ihl
-        if struct.unpack('!HH', frame[start:start+4]) != ({DPORT}, {SPORT}):
+        if struct.unpack('!HH', frame[start:start+4]) != ({DPORT}, {sport}):
             continue
-        assert frame[start+8:start+8+len(payload)] == payload, (n, 'duplicate or unexpected frame')
+        assert frame[start+8:start+8+len(payload)] == payload, (n, 'duplicate or unexpected frame', frame.hex())
         assert frame[:6] == bytes.fromhex({peer_mac.replace(':', '')!r})
         assert frame[6:12] == bytes.fromhex({gateway_mac.replace(':', '')!r})
         assert ihl == 20 and frame[22] == {ttl}
@@ -570,7 +586,7 @@ async def test_flowtable_offload_add_failures(rig):
 
 
 async def test_flowtable_offload_rearm(rig):
-    """Recover after device MTU and routing-policy changes and a retried delete barrier."""
+    """Recover after device rename and routing-policy changes and a retried delete barrier."""
     r = rig
     initial = await r.state()
     if initial["observe"]:
@@ -597,7 +613,7 @@ async def test_flowtable_offload_rearm(rig):
                     while len(r.echo.received) < received + 16:
                         assert not traffic.done() and time.monotonic() < deadline
                         await asyncio.sleep(0.02)
-                    await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", "1400")
+                    await rename_roundtrip(r, TARGET_LAN_IF)
                 elif trigger == "rule":
                     await command(r.target, r.session, "ip", "rule", "add", "pref", rule_priority,
                                   "from", "198.18.254.0/24", "table", "main")
@@ -620,6 +636,15 @@ async def test_flowtable_offload_rearm(rig):
                 if trigger == "barrier":
                     result = await r.target.fs_write(r.session, knob, "0")
                     assert result["errno"] == 0, result
+            # An MTU event must not turn an unrelated global invalidation into
+            # automatic recovery, including after all directions have drained.
+            try:
+                await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", "1400")
+            finally:
+                await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", original_mtu)
+            held = await r.state()
+            assert held["invalidated"] == held["invalidation_done"] == 1, held
+            assert held["installs"] == before["installs"] and held["rearms"] == before["rearms"], held
             software_before = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
             await r.exchange(64, promiscuous=False)
             software_after = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
@@ -682,7 +707,6 @@ async def test_flowtable_offload_rearm(rig):
             if rule_added:
                 await command(r.target, r.session, "ip", "rule", "del", "pref", rule_priority,
                               "from", "198.18.254.0/24", "table", "main")
-            await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", original_mtu)
 
 
 @pytest.mark.parametrize("trigger", [os.environ.get("ASK_FLOWTABLE_INVALIDATION", "neighbour")])
@@ -853,6 +877,21 @@ print(json.dumps(states))
             assert log.count("retaining possibly linked key") == 1, log
             assert "hardware stopped after unproven deletion; reboot required" in log
             r.record("unlink-stopped", {"state": stopped, "ports": json.loads(ports["stdout"]), "dmesg": log})
+            mtu_checks = []
+            for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+                original_mtu = (await console_command(con, "cat", f"/sys/class/net/{dev}/mtu"))["stdout"].strip()
+                try:
+                    await console_command(con, "ip", "link", "set", "dev", dev, "mtu", "1400")
+                finally:
+                    await console_command(con, "ip", "link", "set", "dev", dev, "mtu", original_mtu)
+                held = status_text((await console_command(con, "cat", "/proc/cdx_flowtable"))["stdout"].strip())
+                for field in ("fatal", "invalidated", "invalidation_done", "rearm_ready", "entries", "bindings",
+                              "installs", "deletes", "rearms", "errors", "quarantine"):
+                    assert held[field] == stopped[field], (field, held, stopped)
+                ports = json.loads((await console_python(con, port_script))["stdout"])
+                assert ports == {"6": 0, "7": 0}, ports
+                mtu_checks.append({"dev": dev, "state": held, "ports": ports})
+            r.record("unlink-mtu-refused", mtu_checks)
             # Allow already queued datagrams to arrive, then prove ingress
             # remains stopped while the LAN sender is still running.
             await asyncio.sleep(0.2)
