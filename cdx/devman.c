@@ -450,6 +450,26 @@ struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev)
 	return NULL;
 }
 
+/* Notifier-safe identity check: never retain storage after dropping the lock
+ * or take the control mutex while the caller owns RTNL. */
+bool dpa_netdev_is_physical(const struct net_device *dev)
+{
+	struct dpa_iface_info *iface;
+	bool found = false;
+
+	spin_lock(&dpa_devlist_lock);
+	for (iface = dpa_interface_info; iface; iface = iface->next) {
+		if ((iface->if_flags & (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL)) ==
+		    (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) &&
+		    iface->eth_info.net_dev == dev) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&dpa_devlist_lock);
+	return found;
+}
+
 /* get dpa_info by portid */
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid)
 {

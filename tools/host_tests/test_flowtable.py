@@ -54,7 +54,8 @@ def test_flowtable_hardware_ownership(tmp_path):
     (tmp_path / "hardware_types.inc").write_text(
         hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("/* Process-context transactions")])
     (tmp_path / "physical_production.inc").write_text(
-        function((ROOT / "cdx/devman.c").read_text(), "dpa_get_ifinfo_by_netdev"))
+        function((ROOT / "cdx/devman.c").read_text(), "dpa_get_ifinfo_by_netdev") +
+        function((ROOT / "cdx/devman.c").read_text(), "dpa_netdev_is_physical"))
     (tmp_path / "hardware_production.inc").write_text(source[source.index("struct cdx_ft_hw {"):])
     backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()
     (tmp_path / "backend_production.inc").write_text(backend[backend.index("static char *offload_owner"):])

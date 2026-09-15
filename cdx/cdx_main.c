@@ -314,6 +314,12 @@ static int __init cdx_module_init(void)
 		printk("%s::cdx_init_device failed\n", __func__);
 		goto exit;
 	}
+	rc = cdx_flowtable_guard_init();
+	if (rc)
+		goto exit;
+	/* Keep the failed-port guard until the configuration cleanup below has
+	 * detached PCD and released physical interface records. */
+	register_cdx_deinit_func(cdx_flowtable_guard_exit);
 	/* Run after control teardown, while FMAN metadata is still available. */
 	register_cdx_deinit_func(dpa_cfg_deinit);
 	rc = cdx_ctrl_init(cdx_info);

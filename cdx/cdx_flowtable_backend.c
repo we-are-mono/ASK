@@ -50,6 +50,44 @@ int cdx_flowtable_mode_check(void)
 	return 0;
 }
 
+/* The SDK's normal ndo_open enables FMAN ports. A failed hardware unlink
+ * belongs to the provider even after adapter detach, so guard that restart
+ * here until provider teardown has detached PCD and released its ports. */
+static int cdx_ft_netdev_event(struct notifier_block *nb, unsigned long event,
+			     void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+
+	if (event != NETDEV_PRE_UP || !READ_ONCE(ft_failed) ||
+	    !dpa_netdev_is_physical(dev))
+		return NOTIFY_DONE;
+	netdev_err(dev, "CDX hardware retirement failed; unload CDX before restarting the port\n");
+	return notifier_from_errno(-EIO);
+}
+
+static struct notifier_block ft_guard_nb = { .notifier_call = cdx_ft_netdev_event };
+static bool ft_guard_registered;
+
+int cdx_flowtable_guard_init(void)
+{
+	int rc;
+
+	if (!cdx_flowtable_enabled())
+		return 0;
+	rc = register_netdevice_notifier(&ft_guard_nb);
+	if (!rc)
+		ft_guard_registered = true;
+	return rc;
+}
+
+void cdx_flowtable_guard_exit(void)
+{
+	if (ft_guard_registered) {
+		unregister_netdevice_notifier(&ft_guard_nb);
+		ft_guard_registered = false;
+	}
+}
+
 void cdx_ft_begin(void)
 {
 	mutex_lock(&cdx_info->ctrl.mutex);
@@ -180,7 +218,7 @@ int cdx_ft_del(struct cdx_ft_hw **hw)
 	rc = cdx_ft_hw_del(hw);
 	ft_live--;
 	if (rc == -EIO)
-		ft_failed = true;
+		WRITE_ONCE(ft_failed, true);
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_del, ASK_CDX_FLOWTABLE);

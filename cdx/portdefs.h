@@ -218,6 +218,7 @@ int  get_tableInfo_by_portid( int fm_index, int portid,  void **td,  int * flags
 int dpa_add_port_to_list(struct dpa_iface_info *iface_info);
 struct dpa_iface_info *dpa_get_ifinfo_by_itfid(uint32_t itf_id);
 struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev);
+bool dpa_netdev_is_physical(const struct net_device *dev);
 extern spinlock_t dpa_devlist_lock;
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid);
 void display_iface_info(struct dpa_iface_info *iface_info);

@@ -53,6 +53,18 @@ struct net_device {
 #define netif_is_l3_slave(d) ((d)->l3_slave)
 #define netif_running(d) ((d)->running)
 #define netif_carrier_ok(d) ((d)->carrier)
+#define NETDEV_PRE_UP 1
+#define NOTIFY_DONE 0
+#define netdev_err(...) ((void)0)
+struct notifier_block { int (*notifier_call)(struct notifier_block *, unsigned long, void *); };
+struct netdev_notifier_info { struct net_device *dev; };
+#define netdev_notifier_info_to_dev(i) (((struct netdev_notifier_info *)(i))->dev)
+static bool notifier_registered, fail_notifier;
+static int notifier_from_errno(int error) { return error; }
+static int register_netdevice_notifier(struct notifier_block *nb)
+{ assert(!notifier_registered); if (fail_notifier) return -ENOMEM; notifier_registered=true; return 0; }
+static void unregister_netdevice_notifier(struct notifier_block *nb)
+{ assert(notifier_registered); notifier_registered=false; }
 struct dpa_iface_info {
     struct dpa_iface_info *next;
     unsigned if_flags, itf_id;
@@ -167,6 +179,15 @@ static void test_backend(void)
     assert(cdx_flowtable_mode_check() == 0);
     ft_observe=true; assert(cdx_flowtable_mode_check() == -EINVAL); ft_observe=false;
     offload_owner="wrong"; assert(cdx_flowtable_mode_check() == -EINVAL); offload_owner="cmm";
+    assert(cdx_flowtable_guard_init() == 0 && !notifier_registered);
+    cdx_flowtable_guard_exit();
+    offload_owner="flowtable"; fail_notifier=true;
+    assert(cdx_flowtable_guard_init() == -ENOMEM && !ft_guard_registered);
+    cdx_flowtable_guard_exit(); fail_notifier=false;
+    assert(cdx_flowtable_guard_init() == 0 && notifier_registered);
+    struct netdev_notifier_info info = {&out};
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
+    offload_owner="cmm";
     cdx_ft_begin();
     assert(cdx_ft_claim() == -EOPNOTSUPP && !cdx_flowtable_config_sealed());
     offload_owner="flowtable";
@@ -229,6 +250,22 @@ static void test_backend(void)
     cdx_flowtable_quiesced();
     cdx_ft_end();
     assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
+    /* A released adapter cannot bypass the provider's terminal guard.
+     * The callback runs without a backend transaction and uses object identity. */
+    strcpy(out.name,"renamed");
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == -EIO);
+    assert(cdx_ft_netdev_event(NULL, 999, &info) == NOTIFY_DONE);
+    struct net_device unrelated = out;
+    info.dev=&unrelated;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
+    info.dev=&in;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == -EIO);
+    dpa_interface_info=NULL;
+    assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
+    dpa_interface_info=&in_iface;
+    cdx_flowtable_guard_exit();
+    assert(!notifier_registered && !ft_guard_registered);
+    cdx_flowtable_guard_exit();
     free(key); key=NULL; /* Only simulated hardware reset reclaims the live key. */
 }
 

@@ -816,7 +816,7 @@ async def test_flowtable_offload_terminal(rig):
     initial = await r.wait(lambda s: s["entries"] == 2)
     assert all(int(f["packets"]) > 0 for f in initial["flows"]), initial
     baseline = len(r.echo.received)
-    traffic = asyncio.create_task(terminal_stream(r, duration=16 if kind == "unlink" else 12))
+    traffic = asyncio.create_task(terminal_stream(r, duration=24 if kind == "unlink" else 12))
     unloaded = False
     try:
         deadline = time.monotonic() + 5
@@ -897,6 +897,17 @@ print(json.dumps(states))
                 assert ports == {"6": 0, "7": 0}, ports
                 mtu_checks.append({"dev": dev, "state": held, "ports": ports})
             r.record("unlink-mtu-refused", mtu_checks)
+            restart_checks = []
+            for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+                await console_command(con, "ip", "link", "set", "dev", dev, "down")
+                restart = await console_command(con, "ip", "link", "set", "dev", dev, "up", check=False)
+                assert restart["rc"] != 0 and "Input/output error" in restart["stdout"], restart
+                link = json.loads((await console_command(con, "ip", "-j", "link", "show", "dev", dev))["stdout"])[0]
+                assert "UP" not in link["flags"], link
+                ports = json.loads((await console_python(con, port_script))["stdout"])
+                assert ports == {"6": 0, "7": 0}, ports
+                restart_checks.append({"dev": dev, "restart": restart, "ports": ports})
+            r.record("unlink-port-restart-refused", restart_checks)
             # Allow already queued datagrams to arrive, then prove ingress
             # remains stopped while the LAN sender is still running.
             await asyncio.sleep(0.2)
@@ -925,8 +936,23 @@ print(json.dumps(states))
                              "/sys/module/cdx/holders/ask_flowtable"):
                     assert (await console_command(con, "test", "-e", path, check=False))["rc"] == 1, path
                 r.record("unlink-module-reload-refused", refused)
+                for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+                    restart = await console_command(con, "ip", "link", "set", "dev", dev, "up", check=False)
+                    assert restart["rc"] != 0 and "Input/output error" in restart["stdout"], restart
+                ports = json.loads((await console_python(con, port_script))["stdout"])
+                assert ports == {"6": 0, "7": 0}, ports
+                r.record("unlink-provider-guard-retained", {"ports": ports, "adapter_absent": True})
                 await console_command(con, "rmmod", "cdx", timeout=25)
                 unloaded = True
+    for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+        await console_command(con, "ip", "link", "set", "dev", dev, "up")
+    # DOWN can discard the fixture's /32 routes and permanent neighbours.
+    # Restore these before its normal undo actions and software proof.
+    for address, mac, dev in ((r.lan_ip, r.lan_mac, TARGET_LAN_IF),
+                              (WAN_IP, r.wan_mac, TARGET_WAN_IF)):
+        await console_command(con, "ip", "route", "replace", address + "/32", "dev", dev, "mtu", "1200")
+        await console_command(con, "ip", "neigh", "replace", address, "lladdr", mac,
+                              "nud", "permanent", "dev", dev)
     absent = await console_command(con, "test", "-e", "/sys/module/cdx", check=False)
     assert absent["rc"] == 1, absent
     assert (await console_command(con, "test", "-e", "/proc/cdx_flowtable", check=False))["rc"] == 1

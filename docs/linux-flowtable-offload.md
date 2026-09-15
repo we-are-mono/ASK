@@ -2036,3 +2036,63 @@ interruption. Rule invalidation, rejected reuse of a populated table, and
 recovery after retried deletion barriers remain verified. KASAN and lockdep
 diagnostics are clean, `debug_locks` is 1, taint is 4096, and both original port
 names, MACs, MTUs and UP states are restored. No full suite was run.
+
+
+## Physical removal and terminal restart guard — verified 2026-09-15
+
+An unproven hardware unlink now prevents `NETDEV_PRE_UP` on every physical
+port still owned by the failed CDX provider. The SDK's ordinary open method
+otherwise enables FMAN ports independently of the adapter. The guard belongs
+to CDX, survives adapter unload and uses device identity under the interface
+list lock; it never takes the control mutex from an RTNL notifier. CDX publishes
+its fatal latch with WRITE_ONCE. The guard is absent in default CMM mode and
+is unregistered only after provider configuration teardown has detached PCD
+and released physical interface records. Full provider teardown allows Linux
+port operation again; restarting hardware offload still requires a fresh boot.
+
+Physical driver removal is an explicit maintenance operation. Native netdevice
+teardown removes ingress hooks, flushes flowtable work and retires dependent
+hardware. CDX also holds physical configuration and queue references, which
+outlive adapter bindings. A blocking `fsl_dpa` unbind therefore needs full
+provider teardown to release those pins. The preferred maintenance sequence is
+to remove the flowtable, unload `ask_flowtable` and any inactive dependent FCI
+module, unload CDX, then unbind the physical driver. Do not force module removal
+or drop CDX's device references while its queues/classifier still use them.
+Recovery to offload uses a fresh boot with the intended physical topology.
+
+The focused terminal unlink test passes in 38.14 seconds. After injected hard
+unlink, both physical receive ports are stopped. Administrative DOWN followed
+by UP returns EIO for both ports, and actual FMAN receive-port state remains
+disabled. The same restart attempts are refused after unloading the adapter;
+loading a fresh adapter also remains refused. Full CDX unload followed by UP
+restores software forwarding, verified with 64 exact echoes. DOWN discards the
+fixture's host routes; its cleanup now restores those before normal undo actions.
+
+The physical unregister test passes in 34.01 seconds. It starts real LAN driver
+unbind during an active UDP hardware flow. Both directions and their handle/
+neighbour references drain to zero, the removed ingress binding disappears,
+and the pending unbind remains pinned by CDX. Full adapter/provider teardown
+then completes the unbind. Driver rebind restores the original interface and
+IPv4 state; 256 exact software echoes pass afterward. The intentional 24-second
+transition reports 2,795 sends and 2,377 validated echoes. The private unbind
+worker publishes completion atomically and its result directory is removed.
+
+Five ASan/UBSan flowtable host checks pass in 1.15 seconds, including failed
+guard registration, legacy no-op, both physical ports, renamed identity,
+unrelated same-name objects, and retained fatal state after consumer release.
+Five startup/shutdown host checks also pass. Both DUT runs leave clean KASAN
+and lockdep diagnostics, debug_locks 1 and taint 4096 after full provider unload.
+The KASAN image was built and staged without compiler warnings (three existing
+forced-task warnings). Kernel build ID is
+`f29af715ee88846a3abd8ef3ef6b819ae8495de7`, CDX
+`ed4251e6275e1ecbe06998b28203deb1a659b67a`, and adapter
+`71dc918ea3cdbcde2b765c358321927a35f0795c`. Staged SHA-256 is
+`964e1ca377e1d1f330f25e0f5d75c06e9c0bcb796f2c37a4b979efd1dd20f93b`.
+Evidence is in `/tmp/ask-flowtable-lifecycle/`; build log is
+`/tmp/ask-flowtable-lifecycle-build.log`. No full suite was run.
+
+One attempt stopped before fault injection because admission encountered RTNL
+contention: one direction installed and its peer stayed in software. This is a
+separate foundation recovery gap, retained in `partial-admission-before-fault/`.
+Transient admission recovery will be addressed next; the terminal guard proof
+subsequently passed with both initial directions installed.
