@@ -173,8 +173,8 @@ struct cdx_fman_info {
 
 /* Command numbers 1 (DPA_SET_PARAMS) and 5 (DPA_INIT_CHECK) are retired. cdx
  * builds the classifier itself now; nothing programs it from userspace. Leave
- * them unassigned so an old dpa_app binary fails cleanly rather than landing on
- * whatever takes the number next. */
+ * them unassigned so a stale userspace binary fails cleanly rather than landing
+ * on whatever takes the number next. */
 
 #ifdef DPAA_DEBUG_ENABLE
 struct muram_data {

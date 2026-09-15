@@ -86,11 +86,10 @@
  *        dpa_get_iface_stats_entries. The former non-FCI lock-free
  *        walkers (dpa_get_ohifinfo_by_portid,
  *        cdx_copy_eth_rx_channel_info) now take the spinlock.
- *        The boot injection ioctl (set_dpa_params) adds entries
- *        outside the ctrl mutex, but it runs exactly once,
- *        synchronously inside cdx module init (dpa_app via
- *        UMH_WAIT_PROC, re-runs rejected with -EBUSY) — before
- *        fci.ko can even load — so injection adds cannot overlap
+ *        Classifier startup (dpa_cfg_install) adds entries outside
+ *        the ctrl mutex, but it runs exactly once, synchronously
+ *        inside cdx module init (re-runs rejected with -EBUSY) —
+ *        before fci.ko can even load — so those adds cannot overlap
  *        FCI dispatch. (The ctrl timer thread does run during
  *        injection, under ctrl->mutex, but its handlers touch only
  *        the then-empty SA/CT tables, not this list.) The u8 iface

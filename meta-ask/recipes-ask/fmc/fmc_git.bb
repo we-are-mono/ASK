@@ -41,16 +41,14 @@ do_install() {
     install -d ${D}${bindir}
     install -m 0755 ${B}/fmc ${D}${bindir}/fmc
 
-    # Static archive + headers consumed by dpa_app at link time.
-    install -d ${D}${libdir}
-    install -m 0644 ${B}/libfmc.a ${D}${libdir}/libfmc.a
-    install -d ${D}${includedir}/fmc
-    install -m 0644 ${B}/*.h ${D}${includedir}/fmc/
+    # libfmc.a and its headers are deliberately not installed: nothing links
+    # against them. cdx builds the PCD itself, and the host-mode fmc used to
+    # regenerate cdx_softparse.h and the PCD golden builds from this source
+    # tree rather than from a staged library. See docs/in-kernel-pcd.md.
 
-    # FMAN header-parser PDL + XSD schemas, read from /etc/fmc/config/ at
-    # runtime (by fmc and by dpa_app's embedded fmc_compile). They ship in the
-    # fmc source tree, so install them here — the image gets them from the
-    # recipe that already fetches fmc, not from an out-of-band source checkout.
+    # FMAN header-parser PDL + XSD schemas, read from /etc/fmc/config/ by fmc
+    # itself. They ship in the fmc source tree, so install them here — from the
+    # recipe that already fetches fmc, not an out-of-band source checkout.
     install -d ${D}${sysconfdir}/fmc/config
     install -m 0644 ${S}/etc/fmc/config/hxs_pdl_v3.xml ${D}${sysconfdir}/fmc/config/
     install -m 0644 ${S}/etc/fmc/config/cfgdata.xsd    ${D}${sysconfdir}/fmc/config/

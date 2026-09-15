@@ -48,11 +48,10 @@ static struct dpa_fq *dpa_pcd_fq;
 #define CDX_MAX_DIST		256
 #define CDX_MAX_TABLES		256
 
-/* table_info.dpa_type, as dpa_app fills it (enum dpa_cls_tbl_type in
- * dpa_app/dpa.c). The two hash flavours are FM_PCD_HashTableSet objects;
- * indexed and exact-match tables are FM_PCD_MatchTableSet CC nodes. That
- * split is what picks the cookie type when the id is resolved. Mirrored
- * rather than shared because dpa_app declares the enum itself. */
+/* table_info.dpa_type. The two hash flavours are FM_PCD_HashTableSet objects;
+ * indexed and exact-match tables are FM_PCD_MatchTableSet CC nodes. cdx only
+ * builds external hash tables, but the field is part of the descriptor the
+ * classifier readers see, so keep the full set. */
 #define CDX_DPA_TBL_INTERNAL_HASH	0
 #define CDX_DPA_TBL_EXTERNAL_HASH	1
 #define CDX_DPA_TBL_INDEXED		2
@@ -68,21 +67,21 @@ static struct dpa_fq *dpa_pcd_fq;
  *      - Serializes the one-shot install of the DPA configuration
  *        (fman_info, num_fmans, associated port/table/
  *        distribution sub-allocations). Held for the whole body of
- *        cdx_ioc_set_dpa_params(). release_cfg_info() assumes it
- *        is held by the caller.
+ *        dpa_cfg_install(). release_cfg_info() assumes it is held
+ *        by the caller.
  *
  *   fman_info, num_fmans (file-scope globals)
- *      - Populated exactly once, in cdx_ioc_set_dpa_params() under
+ *      - Populated exactly once, in dpa_cfg_install() under
  *        dpa_cfg_lock, on the first successful call. A second call
  *        is rejected with -EBUSY. All later readers (dpa_get_tdinfo,
  *        cdx_ingress_*, cdx_get_policer_profile_id,
  *        etc.) observe a stable pointer and count; they run lock-
- *        free on packet/ioctl paths because the one-time-init
- *        ordering is guaranteed by the CAP_NET_ADMIN-gated ioctl
- *        and the run-once dpa_app boot sequence.
+ *        free on packet paths because the install runs exactly once,
+ *        synchronously inside cdx module init, before anything that
+ *        reads them can be reached.
  *
  * Contexts:
- *   cdx_ioc_set_dpa_params()         - process, ioctl path.
+ *   dpa_cfg_install()                - process, cdx module init.
  *   display_dpa_cfg(), release_cfg_info()
  *                                    - process, called under lock.
  *   dpa_get_*() readers              - any context, lock-free after init.
