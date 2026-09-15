@@ -140,13 +140,19 @@ async def peer(r, flows=FLOWS):
         await controller.rpc("open", list(specs))
         yield controller
     finally:
+        shutdown_error = None
         try:
             if controller:
                 await controller.rpc("shutdown")
+        except Exception as error:
+            shutdown_error = error
         finally:
             if controller:
                 controller.writer.close()
-                await controller.writer.wait_closed()
+                try:
+                    await controller.writer.wait_closed()
+                except (ConnectionError, OSError) as error:
+                    shutdown_error = shutdown_error or error
             if server:
                 server.close()
                 await server.wait_closed()
@@ -161,6 +167,8 @@ async def peer(r, flows=FLOWS):
                 r.record("connections-peer", {"rc": result.rc, "stdout": result.stdout,
                                                 "server_errors": errors, "tcp_records": tcp_counts})
                 assert result.rc == 0 and not errors, (result.stdout, errors)
+        if shutdown_error:
+            raise shutdown_error
 
 
 @pytest_asyncio.fixture

@@ -2,8 +2,8 @@
 
 Status: bounded multiple-connection IPv4 UDP/TCP offload, ordinary ARP and IPv4
 gateway routing demonstrated on the DUT. Neighbour invalidation is selective
-with automatic recovery. IPv4 route-prefix and physical-port MTU changes use
-the same selective retirement path and have passed their focused DUT proofs.
+with automatic recovery. IPv4 route-prefix, physical-port MTU and administrative
+down/up changes use flow-generation retirement and have passed focused DUT proofs.
 Other recognized changes to relevant devices and routing-policy changes retain
 whole-table invalidation; unrelated devices leave hardware entries alone.
 The earlier intermittent UDP loss remains unresolved and deferred; its scope and
@@ -428,7 +428,7 @@ installed direction's ingress/egress. Empty bindings remain watched, and egress
 devices need not have their own binding. Matching uses pinned device objects,
 not names or interface indices. `ft_watch_lock` protects binding publication,
 removal and the existing flow dependency watches; a notifier latches invalidation
-under that lock without taking a backend transaction. MTU changes invalidate
+under that lock without taking a backend transaction. MTU and going-down events invalidate
 affected per-flow handles and retire their hardware directions, leaving bindings
 available for automatic admission of fresh Linux flow generations. Both routes
 are revalidated under RTNL: the IPv4 MTU notifier flushes route caches under the
@@ -437,7 +437,7 @@ bindings need no MTU recovery. `mtu_invalidations` counts affected generations,
 once per handle, rather than directions or notifications. Other recognized
 events on relevant devices still invalidate the whole table and require table
 recreation after recovery. Unrelated device events leave hardware flows alone.
-MTU handling never clears a global invalidation or terminal hardware latch;
+Device recovery never clears a global invalidation or terminal hardware latch;
 retirement errors escalate through the existing global recovery path.
 
 Releasing a claim requires zero live directions. CDX keeps any retired storage,
@@ -524,13 +524,20 @@ must also match the netdevice recorded by CDX, not merely its name. Flowtables
 must be bound after CDX initializes; incomplete indirect replay requests are
 declined.
 
-Initial-netns routing-policy/nexthop events and relevant interface down, unregister,
+Initial-netns routing-policy events and relevant interface unregister,
 MAC, rename, or upper-device changes conservatively disable hardware admission
 until the recovery boundary below. Committed IPv4 route changes invalidate
 connections with either endpoint in the changed prefix, conservatively across
 all tables and DSCP aliases. Physical-port MTU changes invalidate generations
 with that device as ingress or egress, preserving the table for automatic
-readmission with current route MTUs. A watched neighbour's changed MAC, unusable state
+readmission with current route MTUs. Going-down notifications use the same
+per-device generation retirement; native DOWN also flushes Linux flowtable work.
+The backend refuses admission while either port is down or lacks carrier.
+IPv4's built-in nexthop ADD/DEL notifications arise during device/address
+synchronization. They conservatively retire all installed generations, since a
+revived alternative can change a route through another port. They preserve
+bindings and are distinct from the nexthop-object API.
+A watched neighbour's changed MAC, unusable state
 or detached object invalidates only dependent flow generations, including both directions. Their
 cached Linux lookup stops immediately and native GC tears them down. Once
 resolution is valid, fresh traffic can return to hardware without recreating
@@ -1886,3 +1893,73 @@ settings are restored. `final-state.json` records the checked restoration.
 Stop at this increment. Real-port down/up recovery remains a separately proved
 step. The bounded IPv4 TCP/UDP, no-NAT admission contract, capacity limit and
 owner selection are unchanged; this does not introduce further traffic features.
+
+## Administrative port recovery — verified 2026-09-15
+
+`NETDEV_GOING_DOWN` now invalidates dependent flow generations without latching
+global failure. Native DOWN flushes flowtable work; hardware admission remains
+conditional on both ports running with carrier and both routes still valid.
+UP never clears a failure latch. Fresh packets can re-enter hardware through the
+existing bindings after Linux networking becomes usable again.
+
+The first DUT run identified another notification in the same transition:
+IPv4 emits `FIB_EVENT_NH_DEL`/`ADD` while synchronizing built-in route nexthops.
+These previously entered the global policy-invalidation case. They now retire
+all installed generations conservatively, preserving the table; a newly usable
+alternative may affect routing even through another device. RTNL and both
+destination checks exclude stale queued admission. These notifications do not
+cover the separate nexthop-object API, which remains foundation audit work.
+
+`test_flowtable_link_recovery` passes in 106.39 seconds. It performs two down/up
+cycles on each real port while keeping one TCP connection, one UDP socket and
+the same nft flowtable object alive. Each DOWN returns four hardware directions
+and all flow references to zero, keeps both bindings, and prevents further UDP
+delivery during the measured one-second down window. Each completed cycle
+installs four fresh directions without global rearm. TCP serial delivery remains
+exact with no reconnect; each outage records 26 lost UDP attempts explicitly.
+Only outage windows permit UDP loss. The reusable peer now completes console
+cleanup even when its control connection resets, preserving failure evidence.
+
+The control connection is exempt from NAT just like the measured traffic:
+MASQUERADE legitimately deletes its conntracks on WAN DOWN, so leaving the test
+controller on that path interrupted the original harness. Fixture-owned host
+routes/neighbours are restored after UP if the transition discarded them.
+Traffic can briefly use the connected route before the lower-MTU host route is
+restored; the test accounts for additional retired generations in that window
+and requires balanced installs/deletes, four current directions and MTU 1200.
+The passing run needed exactly four new directions per cycle.
+
+After every recovery, eight seconds of strict traffic validates 256 UDP echoes
+and 4 MiB TCP data in each direction. UDP hardware counters advance exactly
+256 packets and 76,288 bytes per direction. Software TX increases by three LAN
+packets and 15–17 WAN packets; aggregate softirq usage is 0.38–0.47% and total
+busy usage 2.10–2.19%. The table identity, TCP socket and boot remain unchanged.
+
+Five focused ASan/UBSan host checks pass in 1.11 seconds. They cover shared
+generation retirement, stale-route and unavailable-port admission, reference
+drain, IPv4 nexthop synchronization and preservation of policy/failure state.
+The existing global rearm test passes in 23.62 seconds, and terminal unproven
+unlink in 27.42 seconds. Post-unload KASAN/lockdep diagnostics are clean,
+`debug_locks` remains 1 and taint 4096. Terminal teardown releases the adapter
+and CDX, and 64 software echoes succeed afterward. A fresh boot is required
+before the following hardware increment.
+
+Both KASAN builds succeeded and were staged. The corrected kernel build ID is
+`e732d7ef9f004085a27a2e28febbf80532e1e317`, CDX
+`c6c0f308d581d77ef1047ea1dcc68ab53b1802d5`, and adapter
+`63ba4408b9237f40b1d6d337faf6c58379eaa077`. Staged SHA-256 is
+`259f20701f7f51910703d8d0529dbabdc0b4438e5fa404e87c9d757b28b926a5`.
+The adapter source matches the proved image. Builds have no CDX compiler
+warnings and three existing forced-task warnings; the full KASAN suite was not
+run. Artifacts are in `/tmp/ask-flowtable-link/`, including host/DUT logs/XML,
+image identity and post-unload diagnostics. `first-global-stop/` preserves the
+initial notification finding; `route-restoration-window/` and
+`masqueraded-control/` preserve harness failures. Build logs are
+`/tmp/ask-flowtable-link-build.log` and `/tmp/ask-flowtable-link-rebuild.log`.
+
+The authorized continuation completes the remaining device lifecycle, useful
+configuration and policy integration, startup independence, concurrent
+reconfiguration and resource-pressure acceptance. Each increment is proved and
+committed separately. Validation on a second kernel version is explicitly
+excluded from this foundation work at the user's request. NAT, IPv6 and broader
+traffic features remain subsequent work.

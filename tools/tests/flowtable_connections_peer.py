@@ -6,6 +6,7 @@ Every exchange carries its connection ID and a monotonically increasing serial.
 """
 import asyncio
 from contextlib import contextmanager
+import errno
 import json
 import os
 import socket
@@ -67,8 +68,12 @@ class Flow:
             self.sock.bind(local)
             self.sock.connect(remote)
 
-    async def run(self, count, interval):
+    async def run(self, count, interval, allow_loss=False):
+        # Only explicit UDP outage windows may lose datagrams. TCP and all
+        # steady-state windows retain exact serial delivery requirements.
+        assert not (allow_loss and self.writer)
         first = self.serial
+        received = lost = late = 0
         size = TCP_SIZE if self.writer else UDP_SIZE
         loop = asyncio.get_running_loop()
         # Spread the streams within each pacing interval.
@@ -76,21 +81,37 @@ class Flow:
         started = time.monotonic()
         while not self.stop.is_set() and (not count or self.serial - first < count):
             data = payload(self.spec["id"], self.serial, size)
-            async with asyncio.timeout(20 if self.writer else 5):
-                if self.writer:
-                    self.writer.write(data)
-                    await self.writer.drain()
-                    reply = await self.reader.readexactly(size)
-                else:
-                    await loop.sock_sendall(self.sock, data)
-                    reply = await loop.sock_recv(self.sock, size + 1)
-            assert reply == data, (self.spec, self.serial, "corrupt, duplicate or misdirected echo")
+            try:
+                async with asyncio.timeout(20 if self.writer else 0.1 if allow_loss else 5):
+                    if self.writer:
+                        self.writer.write(data)
+                        await self.writer.drain()
+                        reply = await self.reader.readexactly(size)
+                    else:
+                        await loop.sock_sendall(self.sock, data)
+                        while True:
+                            reply = await loop.sock_recv(self.sock, size + 1)
+                            if not allow_loss or reply == data:
+                                break
+                            assert len(reply) == size, (self.spec, reply)
+                            ident, serial = struct.unpack('!IQ', reply[:12])
+                            assert ident == self.spec['id'] and first <= serial < self.serial
+                            assert reply == payload(ident, serial, size)
+                            late += 1
+                assert reply == data, (self.spec, self.serial, "corrupt, duplicate or misdirected echo")
+                received += 1
+            except (TimeoutError, OSError) as error:
+                if not allow_loss or (isinstance(error, OSError) and not isinstance(error, TimeoutError)
+                                      and error.errno not in {errno.EHOSTUNREACH, errno.ENETUNREACH,
+                                                              errno.ECONNREFUSED}):
+                    raise
+                lost += 1
             self.serial += 1
             delay = (self.serial - first) * interval - (time.monotonic() - started)
             if delay > 0:
                 await asyncio.sleep(delay)
         return {"first": first, "count": self.serial - first,
-                "bytes": (self.serial - first) * size,
+                "bytes": received * size, "received": received, "lost": lost, "late": late,
                 "seconds": time.monotonic() - started}
 
     async def close(self):
@@ -144,7 +165,8 @@ async def main(config):
                         assert ident not in running
                         flow = flows[ident]
                         flow.stop.clear()
-                        running[ident] = asyncio.create_task(flow.run(command["count"], command["interval"]))
+                        running[ident] = asyncio.create_task(flow.run(command["count"], command["interval"],
+                                                                     command.get("allow_loss", False)))
                 elif op in {"wait", "stop"}:
                     result = await finish(ids, stop=op == "stop")
                 elif op == "close":

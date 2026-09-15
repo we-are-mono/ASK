@@ -87,6 +87,7 @@ static unsigned int ft_handle_refs;
 static atomic64_t ft_neigh_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_route_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mtu_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_link_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping;
@@ -774,19 +775,23 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
 	switch (event) {
+	case NETDEV_GOING_DOWN:
 	case NETDEV_CHANGEMTU:
 		/* Retire the affected generations, leaving bindings available for
-		 * fresh Linux flows. IPv4 flushes route caches under this event's
+		 * fresh Linux flows. DOWN also flushes native flowtable work; the
+		 * backend refuses admission while either port is not running.
+		 * IPv4 flushes route caches under the MTU event's
 		 * RTNL; admission rechecks both dsts after taking RTNL, so queued
 		 * pre-change requests cannot publish stale MTUs. Empty bindings
 		 * need no recovery. Never clear a global or fatal invalidation. */
 		spin_lock_bh(&ft_watch_lock);
 		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
 			if (entry->rule.in == dev || entry->rule.out == dev)
-				ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
+				ft_handle_invalidate(entry->handle,
+					event == NETDEV_CHANGEMTU ? &ft_mtu_invalidations :
+					&ft_link_invalidations);
 		spin_unlock_bh(&ft_watch_lock);
 		break;
-	case NETDEV_GOING_DOWN:
 	case NETDEV_UNREGISTER:
 	case NETDEV_CHANGEADDR:
 	case NETDEV_CHANGEUPPER:
@@ -857,6 +862,7 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct fib_notifier_info *info = ptr;
+	struct cdx_ft_entry *entry;
 
 	if (info->family != AF_INET)
 		return NOTIFY_DONE;
@@ -869,8 +875,21 @@ static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *pt
 		 * other aliases. Patch 140 reports every committed prefix through
 		 * NETEVENT_IPV4_ROUTE_UPDATE, including table flushes. */
 		break;
+	case FIB_EVENT_NH_ADD:
+	case FIB_EVENT_NH_DEL:
+		/* IPv4 emits these while synchronizing built-in nexthops on
+		 * device/address transitions. A revived alternative can change
+		 * routing even for flows not using that device. Retire all flow
+		 * generations without closing bindings; RTNL/dst revalidation
+		 * excludes queued routes from before the completed transition.
+		 * These are not notifications from the nexthop-object API. */
+		spin_lock_bh(&ft_watch_lock);
+		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
+			ft_handle_invalidate(entry->handle, &ft_link_invalidations);
+		spin_unlock_bh(&ft_watch_lock);
+		break;
 	default:
-		/* Rule/nexthop changes have no safe destination-prefix scope. */
+		/* Policy changes and unknown events require explicit recovery. */
 		ft_invalidate();
 	}
 	return NOTIFY_DONE;
@@ -890,7 +909,7 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\n",
 		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -898,7 +917,8 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
 		   atomic64_read(&ft_neigh_invalidations),
 		   atomic64_read(&ft_route_invalidations),
-		   atomic64_read(&ft_mtu_invalidations));
+		   atomic64_read(&ft_mtu_invalidations),
+		   atomic64_read(&ft_link_invalidations));
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
