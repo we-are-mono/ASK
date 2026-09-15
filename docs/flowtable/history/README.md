@@ -3,7 +3,7 @@
 [Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md)
 
 These records preserve the consolidated document at `cc34cef`, through the
-DNAT proof on 2026-09-15. They are historical evidence, including
+hairpin/double NAT proof on 2026-09-15. They are historical evidence, including
 superseded contracts and failed attempts. Current operating guidance lives in the
 [foundation](../../flowtable-foundation.md), [policy](../../flowtable-policy.md)
 and [NAT](../../flowtable-nat.md) guides.
@@ -27,6 +27,7 @@ original bench records; they are not a promise of permanent artifact storage.
 | [Backend and adapter module](backend-and-module.md) | Provider extraction, module lifetime, dependency filtering and lock-order corrections. |
 | [Physical device lifecycle](device-lifecycle.md) | MTU, administrative state, MAC, rename, unregister and terminal restart safety. |
 | [Policy, startup and foundation acceptance](policy-and-startup.md) | Configuration/revocation, CMM/FCI-free startup and final legacy compatibility. |
+| [Double NAT and hairpin](double-nat.md) | Combined translations across ports and same-port routing between separate LAN endpoints. |
 | [DNAT](dnat.md) | WAN-initiated TCP/UDP port forwarding, checksums, route retirement and live software fallback. |
 | [MASQUERADE](masquerade.md) | Source translation and retirement across WAN address replacement and interface down/up. |
 | [Static TCP SNAT](tcp-snat.md) | Bulk transfers, idle expiry, retransmission, live policy withdrawal and FIN/RST. |
@@ -68,6 +69,7 @@ with the UDP proof.
 | Foundation closure and legacy return — 2026-09-15 | [Evidence](policy-and-startup.md#foundation-closure-and-legacy-return--2026-09-15) |
 | Static UDP source NAT — 2026-09-15 | [Evidence](udp-snat.md#static-udp-source-nat--2026-09-15) |
 | Static TCP source NAT — 2026-09-15 | [Evidence](tcp-snat.md) |
+| Double NAT and hairpin — 2026-09-15 | [Evidence](double-nat.md) |
 | DNAT — 2026-09-15 | [Evidence](dnat.md) |
 | MASQUERADE — 2026-09-15 | [Evidence](masquerade.md) |
 

@@ -88,37 +88,46 @@ async def hardware(r, clients, expected, label):
 
 
 @pytest.mark.parametrize("zero_checksum", [False, True], ids=["checksum", "zero-checksum"])
-async def test_flowtable_dnat(rig, zero_checksum):
+async def test_flowtable_dnat(rig, zero_checksum, double_nat=False):
     r = rig
     case = "zero-checksum" if zero_checksum else "checksum"
+    if double_nat:
+        case = "double-" + case
     record = r.record
     r.record = lambda name, data: record(f"{case}-{name}", data)
     addresses = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show",
                                          "dev", TARGET_WAN_IF))["stdout"])
     external = next(a["local"] for a in addresses[0]["addr_info"] if a["family"] == "inet")
     sport = SPORT + int(zero_checksum)
-    nat_table = "ask_dnat_test"
+    nat_table = "ask_double_nat_test" if double_nat else "ask_dnat_test"
+    server_peer = [r.lan_gateway, sport + 1024] if double_nat else [WAN_IP, sport]
     flows, expected = [], {}
     for ident, proto in enumerate(("udp", "tcp")):
         spec = {"id": ident, "proto": proto, "sport": sport, "lan": WAN_IP,
                 "connect_ip": external, "connect_port": PUBLIC_PORT,
-                "server_peer": [WAN_IP, sport]}
+                "server_peer": server_peer}
         if proto == "udp":
             spec.update(iface=r.wan_if, wire={"source_ip": external, "destination_ip": WAN_IP,
                 "source_port": PUBLIC_PORT, "destination_port": sport,
                 "source_mac": r.dut_wan_mac, "destination_mac": r.wan_mac, "zero_checksum": zero_checksum},
-                server_wire={"source_ip": WAN_IP, "destination_ip": r.lan_ip,
-                "source_port": sport, "destination_port": DPORT,
+                server_wire={"source_ip": server_peer[0], "destination_ip": r.lan_ip,
+                "source_port": server_peer[1], "destination_port": DPORT,
                 "source_mac": r.dut_lan_mac, "destination_mac": r.lan_mac, "zero_checksum": zero_checksum})
         flows.append(spec)
         protocol = "17" if proto == "udp" else "6"
         client, public, server = f"{WAN_IP}:{sport}", f"{external}:{PUBLIC_PORT}", f"{r.lan_ip}:{DPORT}"
-        expected[(TARGET_WAN_IF, protocol, client, public)] = (client, server, r.lan_ip)
-        expected[(TARGET_LAN_IF, protocol, server, client)] = (public, client, WAN_IP)
+        translated = f"{server_peer[0]}:{server_peer[1]}"
+        expected[(TARGET_WAN_IF, protocol, client, public)] = (translated, server, r.lan_ip)
+        expected[(TARGET_LAN_IF, protocol, server, translated)] = (public, client, WAN_IP)
     servers = [{"address": r.lan_ip, "port": DPORT, "iface": LAN_NIC, "zero_checksum": zero_checksum}]
     rules = " ".join(f"ip saddr {WAN_IP} ip daddr {external} {p} sport {sport} {p} dport {PUBLIC_PORT} "
                      f"dnat to {r.lan_ip}:{DPORT};" for p in ("udp", "tcp"))
-    nat = f"table ip {nat_table} {{ chain prerouting {{ type nat hook prerouting priority -110; {rules} }}; }}"
+    source_rules = ""
+    if double_nat:
+        translations = " ".join(f"ip saddr {WAN_IP} ip daddr {r.lan_ip} {p} sport {sport} {p} dport {DPORT} "
+                                f"snat to {server_peer[0]}:{server_peer[1]};" for p in ("udp", "tcp"))
+        source_rules = f"chain postrouting {{ type nat hook postrouting priority 90; {translations} }};"
+    nat = f"table ip {nat_table} {{ chain prerouting {{ type nat hook prerouting priority -110; {rules} }}; {source_rules} }}"
     policy = candidate(r)
     policy["scope"] = [{"source": WAN_IP, "destination": external,
                         "source_port": sport, "destination_port": PUBLIC_PORT}]

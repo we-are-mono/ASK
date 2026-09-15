@@ -659,6 +659,86 @@ static void test_dnat(void)
         assert(!ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
     }
 }
+static void double_nat_fixture(bool forward, bool tcp, bool hairpin)
+{
+    snat_fixture(forward, tcp);
+    ct.status |= IPS_DST_NAT | IPS_DST_NAT_DONE;
+    /* Original 192.0.2.2:10000 -> 198.51.100.2:20000 becomes
+     * 203.0.113.4:40000 -> 203.0.113.5:30000. */
+    ct.tuplehash[1].tuple.src.u3.ip = htonl(0xcb007105);
+    ct.tuplehash[1].tuple.src.u.all = htons(30000);
+    if (!forward) { ik.src = htonl(0xcb007105); pk.src = htons(30000); }
+    rule.action.num_entries = 10;
+    rule.action.entries[9] = rule.action.entries[7];
+    rule.action.entries[8] = rule.action.entries[6];
+    rule.action.entries[6] = (struct flow_action_entry){ .id = FLOW_ACTION_MANGLE,
+        .mangle = { .htype = FLOW_ACT_MANGLE_HDR_TYPE_IP4, .offset = forward ? 16 : 12,
+                    .val = forward ? htonl(0xcb007105) : htonl(0xc6336402) } };
+    const u8 values[2][4] = {{0x4e,0x20,0,0}, {0,0,0x75,0x30}};
+    const u8 masks[2][4] = {{0,0,0xff,0xff}, {0xff,0xff,0,0}};
+    rule.action.entries[7] = (struct flow_action_entry){ .id = FLOW_ACTION_MANGLE,
+        .mangle.htype = tcp ? FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP };
+    memcpy(&rule.action.entries[7].mangle.val, values[forward], 4);
+    memcpy(&rule.action.entries[7].mangle.mask, masks[forward], 4);
+    neighbour.primary_key = htonl(forward ? 0xcb007105 : 0xc0000202);
+    if (hairpin) {
+        rule.action.entries[9].dev = &in;
+        route.dst.dev = neighbour.dev = &in;
+        memcpy(&rule.action.entries[1].mangle.val, (u8[]){0,0,0,1}, 4);
+    }
+}
+static void test_double_nat(void)
+{
+    struct cdx_ft_rule decoded;
+    for (unsigned variant = 0; variant < 8; variant++) {
+        bool forward = variant & 1, tcp = variant & 2, hairpin = variant & 4;
+        double_nat_fixture(forward, tcp, hairpin);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(decoded.src == ik.src && decoded.dst == ik.dst);
+        assert(decoded.new_src == htonl(forward ? 0xcb007104 : 0xc6336402));
+        assert(decoded.new_dst == htonl(forward ? 0xcb007105 : 0xc0000202));
+        assert(decoded.new_sport == htons(forward ? 40000 : 20000));
+        assert(decoded.new_dport == htons(forward ? 30000 : 10000));
+        assert(next_hop == decoded.new_dst && decoded.in == &in);
+        assert(decoded.out == (hairpin ? &in : &out));
+#define DOUBLE_REJECT(change) do { double_nat_fixture(forward, tcp, hairpin); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+        DOUBLE_REJECT(ct.status &= ~IPS_SRC_NAT_DONE);
+        DOUBLE_REJECT(ct.status &= ~IPS_DST_NAT_DONE);
+        DOUBLE_REJECT(ct.status &= ~IPS_SRC_NAT);
+        DOUBLE_REJECT(ct.status &= ~IPS_DST_NAT);
+        DOUBLE_REJECT(rule.action.num_entries = 8);
+        DOUBLE_REJECT(rule.action.entries[6].mangle.offset ^= 4);
+        DOUBLE_REJECT(rule.action.entries[6].mangle.val ^= htonl(1));
+        DOUBLE_REJECT(rule.action.entries[7].mangle.mask ^= htonl(1));
+        DOUBLE_REJECT(rule.action.entries[7].mangle.val ^= htonl(1));
+        DOUBLE_REJECT(rule.action.entries[8].csum_flags = tcp ? 17 : 9);
+        DOUBLE_REJECT(rule.action.entries[6] = rule.action.entries[4]);
+        DOUBLE_REJECT(ct.tuplehash[1].tuple.src.u3.ip = htonl(0xe0000001));
+        DOUBLE_REJECT(ct.tuplehash[1].tuple.src.u.all = 0);
+#undef DOUBLE_REJECT
+        double_nat_fixture(forward, tcp, hairpin);
+        for (unsigned stage = 1; stage <= 3; stage++) {
+            ft_fail_stage = stage; assert(ft_replace(&binding, &cls) < 0);
+            assert(!ft_fail_stage && !ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
+        }
+        assert(ft_replace(&binding, &cls) == 0);
+        /* Even one installed direction retains both routed dependencies. */
+        struct netevent_ipv4_route event = { &init_net, htonl(0xcb007105), 32 };
+        ft_route_event(&event); assert(handle.invalid);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
+    }
+    /* Same-port source-only/destination-only NAT is still outside the
+     * supported boundary, even with otherwise valid route and MAC context. */
+    for (unsigned kind = 0; kind < 2; kind++) {
+        if (kind) dnat_fixture(true, true); else snat_fixture(true, true);
+        rule.action.entries[7].dev = &in;
+        route.dst.dev = neighbour.dev = &in;
+        memcpy(&rule.action.entries[1].mangle.val, (u8[]){0,0,0,1}, 4);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    }
+}
+
 static void tcp_fixture(void)
 {
     fixture();
@@ -1570,6 +1650,7 @@ int main(void)
     test_selective_routes();
     test_snat();
     test_dnat();
+    test_double_nat();
     test_device_dependencies();
     test_device_recovery();
     test_transient_admission();

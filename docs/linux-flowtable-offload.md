@@ -2,14 +2,14 @@
 
 # Linux flowtable offload
 
-The bounded CMM-retirement foundation and IPv4 TCP/UDP SNAT/MASQUERADE/DNAT
+The bounded CMM-retirement foundation and IPv4 TCP/UDP NAT
 increments are implemented and verified. Native Linux flowtables and the loadable
 `ask_flowtable` adapter control CDX hardware without starting CMM or loading FCI.
 This is a maintained development path with a defined feature boundary; it does
 not yet replace every feature available through CMM.
 
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
-Current feature checkpoint: TCP/UDP SNAT, MASQUERADE and DNAT (2026-09-15).
+Current feature checkpoint: TCP/UDP SNAT, MASQUERADE, DNAT and hairpin/double NAT (2026-09-15).
 The documentation split changes no implementation or acceptance result.
 
 ## Reading guide
@@ -36,7 +36,7 @@ configuration instructions.
 | Kernel and hardware | Repository Linux 6.12.103 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
 | Topology and capacity | One hardware flowtable, two initial-netns physical Ethernet ports, at most 64 directional entries |
 | Routed traffic | Unicast IPv4 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
-| NAT | TCP/UDP static source NAT, MASQUERADE and destination NAT, including address/port translation and inverse reply translation |
+| NAT | TCP/UDP static source NAT, MASQUERADE, destination and hairpin/double NAT, including address/port translation and inverse reply translation |
 | Routing and neighbours | Direct routes, IPv4 gateways, permanent neighbours and ordinary ARP |
 | Automatic recovery | Dependent route, neighbour, physical MTU/MAC and link-state retirement followed by fresh admission |
 | Lifetime and policy | Conntrack/flow expiry and deletion, safe adapter unload, explicit global recovery, live policy revocation, bounded capacity fallback |
@@ -49,7 +49,7 @@ explicit partial-generation recovery. Hardware flags alone do not establish
 that both directions are offloaded.
 
 Counter-enabled hardware tables are refused because firmware counters include
-classifier hits that can later be punted to Linux. Hairpin/double NAT, IPv6, VLAN/bridge/PPPoE, multicast, IPsec, tunnels and Wi-Fi
+classifier hits that can later be punted to Linux. IPv6, VLAN/bridge/PPPoE, multicast, IPsec, tunnels and Wi-Fi
 need their own eligibility contracts and proofs. Unsupported hardware traffic
 remains governed by Linux forwarding and firewall policy.
 
@@ -116,10 +116,13 @@ TCP, including bulk transfers, retransmission, policy withdrawal and FIN/RST.
 The [DNAT evidence](flowtable/history/dnat.md) covers WAN-initiated TCP/UDP port
 forwarding, receive checksums, route retirement and live software fallback.
 
+The [combined NAT evidence](flowtable/history/double-nat.md) covers simultaneous
+source/destination translation and same-port hairpin routing through the DUT.
+
 ## Next work and longer-term direction
 
-The remaining NAT increment is hairpin/double NAT. After its focused proof,
-run the full-rate Loki → Vision NAT test with both links negotiated at 10 Gb/s.
+The four bounded IPv4 TCP/UDP NAT increments are complete. Next, run the
+full-rate Loki → Vision NAT test with both links negotiated at 10 Gb/s.
 Prove each increment before expanding its supported boundary. The
 [foundation checkpoint](flowtable-foundation.md) remains the base for further
 interface and protocol features.

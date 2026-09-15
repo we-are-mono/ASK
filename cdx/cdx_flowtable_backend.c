@@ -189,10 +189,11 @@ int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	cdx_ft_assert_held();
 	ASSERT_RTNL();
 	*result = NULL;
+	/* The adapter validates tuple/NAT eligibility, including same-port
+	 * hairpin routing. The provider rechecks physical device state. */
 	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||
 	    !cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out) ||
-	    !ether_addr_equal(rule->src_mac, rule->out->dev_addr) ||
-	    rule->in == rule->out)
+	    !ether_addr_equal(rule->src_mac, rule->out->dev_addr))
 		return -EOPNOTSUPP;
 	rc = cdx_ft_hw_add(rule, result);
 	if (!rc)

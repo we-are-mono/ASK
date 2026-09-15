@@ -119,11 +119,12 @@ static int delete_result;
 static __be32 expected_src, expected_dst;
 static __be16 expected_sport, expected_dport;
 static unsigned expected_proto = IPPROTO_UDP;
+static bool expected_hairpin;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
 static int insert_entry_in_classif_table(PCtEntry ct)
 {
-    assert(!memcmp(out_iface.eth_info.mac_addr, (u8[]){2,0,0,0,0,0}, 6));
+    assert(!memcmp((expected_hairpin ? in_iface : out_iface).eth_info.mac_addr, (u8[]){2,0,0,0,0,0}, 6));
     assert(ct->fftype == FFTYPE_IPV4 && ct->proto == expected_proto);
     assert(ct->hash == expected_proto * 13 && ct->twin->proto == expected_proto);
     assert(ct->Saddr_v4 == htonl(0xc0000201) && ct->Daddr_v4 == htonl(0xc6336401));
@@ -135,7 +136,7 @@ static int insert_entry_in_classif_table(PCtEntry ct)
     bool nat = expected_src != ct->Saddr_v4 || expected_dst != ct->Daddr_v4 ||
                expected_sport != ct->Sport || expected_dport != ct->Dport;
     assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0)));
-    assert(ct->pRtEntry->itf == &out_itf && ct->pRtEntry->input_itf == &in_itf);
+    assert(ct->pRtEntry->itf == (expected_hairpin ? &in_itf : &out_itf) && ct->pRtEntry->input_itf == &in_itf);
     assert(ct->pRtEntry->underlying_input_itf == &in_itf && ct->pRtEntry->mtu == 1200);
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
     if (fail_insert) return -1;
@@ -225,6 +226,18 @@ static void test_backend(void)
     out_iface.itf_id=L2_MAX_ONIF; assert(!cdx_ft_port_supported(&out)); out_iface.itf_id=2;
     out_iface.eth_info.net_dev=&in; assert(!cdx_ft_port_supported(&out)); out_iface.eth_info.net_dev=&out;
     ft_observe=true; assert(cdx_ft_add(&rule,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
+    /* Exercise same-port translation through the provider's real admission
+     * entry point as well as the lower encoder and adapter decoder. */
+    rule.out = &in; expected_hairpin = true;
+    rule.new_src = expected_src = htonl(0xcb007104);
+    rule.new_dst = expected_dst = htonl(0xcb007105);
+    rule.new_sport = expected_sport = htons(40000);
+    rule.new_dport = expected_dport = htons(30000);
+    assert(cdx_ft_add(&rule,&hw) == 0 && ft_live == 1);
+    assert(cdx_ft_del(&hw) == 0 && !hw && !ft_live && !allocations);
+    rule.out = &out; expected_hairpin = false;
+    rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
+    rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     fail_insert=true; assert(cdx_ft_add(&rule,&hw) == -EIO && !ft_live); fail_insert=false;
     assert(cdx_ft_add(&rule,&hw) == 0 && ft_live == 1);
     assert(cdx_ft_release() == -EBUSY && ft_claimed);
@@ -301,17 +314,20 @@ int main(void)
         unsigned old=deletes; assert(cdx_ft_hw_del(&hw)==0 && deletes==old);
     }
     rule.proto = expected_proto = IPPROTO_UDP;
-    for (unsigned i = 0; i < 12; i++) {
-        unsigned variant = i % 6;
-        rule.proto = expected_proto = i < 6 ? IPPROTO_UDP : IPPROTO_TCP;
-        rule.new_src = expected_src = variant == 0 || variant == 4 ? htonl(0xcb007104) : rule.src;
-        rule.new_dst = expected_dst = variant == 1 || variant == 5 ? htonl(0xcb007104) : rule.dst;
-        rule.new_sport = expected_sport = variant == 2 || variant == 4 ? htons(40000) : rule.sport;
-        rule.new_dport = expected_dport = variant == 3 || variant == 5 ? htons(40000) : rule.dport;
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned variant = i % 8;
+        expected_hairpin = variant == 7;
+        rule.out = expected_hairpin ? &in : &out;
+        rule.proto = expected_proto = i < 8 ? IPPROTO_UDP : IPPROTO_TCP;
+        rule.new_src = expected_src = variant == 0 || variant == 4 || variant >= 6 ? htonl(0xcb007104) : rule.src;
+        rule.new_dst = expected_dst = variant == 1 || variant == 5 || variant >= 6 ? htonl(0xcb007104) : rule.dst;
+        rule.new_sport = expected_sport = variant == 2 || variant == 4 || variant >= 6 ? htons(40000) : rule.sport;
+        rule.new_dport = expected_dport = variant == 3 || variant == 5 || variant >= 6 ? htons(40000) : rule.dport;
         assert(cdx_ft_hw_add(&rule,&hw) == 0);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
         fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
     }
+    expected_hairpin = false; rule.out = &out;
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     assert(cdx_ft_hw_add(&rule,&hw)==0);

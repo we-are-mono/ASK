@@ -1,12 +1,15 @@
 # Linux flowtable NAT
 
-Static IPv4 TCP/UDP source NAT, MASQUERADE and destination NAT are supported on the foundation's
-two physical ports. Linux conntrack and nftables own the mapping. The adapter
+IPv4 TCP/UDP static source NAT, MASQUERADE, destination NAT and combined
+source/destination translation are supported on the foundation's physical ports.
+Combined NAT also permits routing back out the ingress port for hairpin traffic.
+Linux conntrack and nftables own the mapping. The adapter
 validates Linux's native actions and CDX encodes the resolved translation using
 the existing proprietary firmware interface. No CMM or per-flow FCI call is
 involved, and the shared legacy encoder is unchanged.
 
-Hairpin/double NAT and IPv6 remain outside hardware eligibility. Those need separate increments and lifecycle proofs.
+IPv6 and other protocols remain outside hardware eligibility. They need separate
+increments and lifecycle proofs.
 The [foundation](flowtable-foundation.md) still supplies the capacity, device,
 route, neighbour, retirement and policy contracts. NAT does not lift those limits.
 
@@ -26,12 +29,21 @@ For a WAN client `A:a` reaching public endpoint `P:p`, forwarded to `B:b`:
 | Original | `A:a → P:p` | `A:a → B:b` | `B` |
 | Reply | `B:b → A:a` | `P:p → A:a` | `A` |
 
-The adapter requires completed source or destination NAT, a TCP/UDP match identical to one of the
+For combined NAT, `A:a → P:p` becomes `G:g → B:b`; replies match
+`B:b → G:g` and become `P:p → A:a`. Linux allocates both mappings. The same
+contract supports two physical ports or hairpin routing on one physical port.
+Same-port admission currently requires both SNAT and DNAT; it does not admit
+arbitrary same-port routing or make a bridge eligible. Physical identity, live
+routes, per-direction next hops, neighbour MACs and MTU checks still apply.
+
+The adapter requires completed NAT, a TCP/UDP match identical to one of the
 conntrack tuples, and consistent opposite tuple endpoints. It accepts exactly
-four Ethernet edits, one IPv4 edit, one transport port edit, the matching native IPv4/TCP or IPv4/UDP
-checksum action and a redirect. Masks, offsets and values must agree with the
-resolved mapping. Identity address or port edits are permitted; arbitrary flower
-rewrites, additional actions and combined SNAT/DNAT mappings are refused.
+four Ethernet edits, one IPv4/transport edit pair per resolved NAT type, the
+matching native IPv4/TCP or IPv4/UDP checksum action and a redirect. Combined NAT
+requires both completion flags and both edit pairs in native SNAT-then-DNAT order.
+Masks, offsets and values must agree with the resolved mapping. Identity address or port edits are permitted; arbitrary flower
+rewrites and additional actions are refused. The translated tuple is always the
+inverse of the opposite conntrack tuple.
 
 The private backend rule carries complete match and translated tuples. The
 classifier key uses the match; the existing encoder's synthetic twin describes
@@ -155,3 +167,20 @@ ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55500 \
 ```
 
 See the [DNAT validation record](flowtable/history/dnat.md).
+
+`test_flowtable_double_nat` repeats the WAN-initiated proof with simultaneous
+source and destination address/port rewrites. `test_flowtable_hairpin` places two
+separate MAC/IP endpoints in Loki network namespaces. Both TCP/UDP directions
+enter and leave the DUT's LAN port, with both NAT mappings preventing a direct
+LAN reply. Every received UDP frame must have the DUT's source MAC and one TTL
+decrement. Both tests cover ordinary and zero UDP checksums, insertion rollback,
+route retirement, live policy withdrawal, software forwarding, readmission and
+native TCP FIN processing. Temporary namespaces, addresses, routes and rules
+are removed automatically.
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55600 \
+  make ask-test ASK_TEST_ARGS='-q -k "test_flowtable_double_nat or test_flowtable_hairpin"'
+```
+
+See the [double NAT and hairpin validation record](flowtable/history/double-nat.md).

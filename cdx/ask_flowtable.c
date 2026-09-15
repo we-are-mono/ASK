@@ -329,8 +329,26 @@ static bool ft_tuple_matches(const struct cdx_ft_rule *rule,
 		rule->sport == tuple->src.u.all && rule->dport == tuple->dst.u.all;
 }
 
-/* Linux owns allocation and lifetime of the resolved NAT mapping. Accept only
- * a native source or destination translation and its inverse in replies. */
+/* Validate one native address/port edit pair against the resolved conntrack
+ * mapping. Netfilter orders SNAT before DNAT, including inverse reply edits. */
+static bool ft_nat_edit(const struct flow_action_entry *ip,
+			const struct cdx_ft_rule *out, bool source)
+{
+	const struct flow_action_entry *port = ip + 1;
+	u32 value = source ? htonl((u32)ntohs(out->new_sport) << 16) :
+			     htonl(ntohs(out->new_dport));
+	u32 mask = source ? ~htonl(0xffff0000) : ~htonl(0x0000ffff);
+
+	return ip->id == FLOW_ACTION_MANGLE && ip->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_IP4 &&
+		ip->mangle.offset == (source ? offsetof(struct iphdr, saddr) : offsetof(struct iphdr, daddr)) &&
+		!ip->mangle.mask && ip->mangle.val == (source ? out->new_src : out->new_dst) &&
+		port->id == FLOW_ACTION_MANGLE && port->mangle.htype == (out->proto == IPPROTO_TCP ?
+			FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP) &&
+		!port->mangle.offset && port->mangle.mask == mask && port->mangle.val == value;
+}
+
+/* Linux owns allocation and lifetime of every resolved NAT mapping. No
+ * arbitrary flower edit or partly resolved translation is admissible. */
 static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rule *out)
 {
 	const struct nf_conn *ct = cls->nf_ct;
@@ -338,10 +356,10 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	const struct nf_conntrack_tuple *reply = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
 	const struct nf_conntrack_tuple *opposite;
 	const struct flow_action *actions = &cls->rule->action;
-	const struct flow_action_entry *ip, *port, *csum;
+	const struct flow_action_entry *csum;
 	unsigned long status = READ_ONCE(ct->status), nat = status & IPS_NAT_MASK;
-	bool forward, source;
-	u32 port_value, port_mask;
+	unsigned int edits = !!(nat & IPS_SRC_NAT) + !!(nat & IPS_DST_NAT), offset = 4;
+	bool forward;
 
 	out->new_src = out->src;
 	out->new_dst = out->dst;
@@ -349,21 +367,21 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	out->new_dport = out->dport;
 	if (!nat)
 		return actions->num_entries == 5;
-	if ((nat != IPS_SRC_NAT && nat != IPS_DST_NAT) ||
-	    !(status & (nat == IPS_SRC_NAT ? IPS_SRC_NAT_DONE : IPS_DST_NAT_DONE)) ||
-	    (out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) || actions->num_entries != 8)
+	if (((nat & IPS_SRC_NAT) && !(status & IPS_SRC_NAT_DONE)) ||
+	    ((nat & IPS_DST_NAT) && !(status & IPS_DST_NAT_DONE)) ||
+	    (out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) ||
+	    actions->num_entries != 6 + 2 * edits)
 		return false;
 	forward = ft_tuple_matches(out, orig);
 	if (forward == ft_tuple_matches(out, reply))
 		return false;
-	/* The endpoint without translation must agree in both conntrack tuples.
-	 * This also excludes hidden double NAT from a single-edit action list. */
-	if (nat == IPS_SRC_NAT) {
-		if (orig->dst.u3.ip != reply->src.u3.ip || orig->dst.u.all != reply->src.u.all)
-			return false;
-	} else if (orig->src.u3.ip != reply->dst.u3.ip || orig->src.u.all != reply->dst.u.all) {
+	/* Every endpoint without translation must agree in both tuples. */
+	if (!(nat & IPS_DST_NAT) &&
+	    (orig->dst.u3.ip != reply->src.u3.ip || orig->dst.u.all != reply->src.u.all))
 		return false;
-	}
+	if (!(nat & IPS_SRC_NAT) &&
+	    (orig->src.u3.ip != reply->dst.u3.ip || orig->src.u.all != reply->dst.u.all))
+		return false;
 	opposite = forward ? reply : orig;
 	out->new_src = opposite->dst.u3.ip;
 	out->new_dst = opposite->src.u3.ip;
@@ -372,20 +390,18 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	if (!ft_unicast(out->new_src) || !ft_unicast(out->new_dst) ||
 	    !out->new_sport || !out->new_dport)
 		return false;
-	source = (nat == IPS_SRC_NAT) == forward;
-	ip = &actions->entries[4];
-	port = &actions->entries[5];
-	csum = &actions->entries[6];
-	port_value = source ? htonl((u32)ntohs(out->new_sport) << 16) :
-			     htonl(ntohs(out->new_dport));
-	port_mask = source ? ~htonl(0xffff0000) : ~htonl(0x0000ffff);
-	return ip->id == FLOW_ACTION_MANGLE && ip->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_IP4 &&
-		ip->mangle.offset == (source ? offsetof(struct iphdr, saddr) : offsetof(struct iphdr, daddr)) &&
-		!ip->mangle.mask && ip->mangle.val == (source ? out->new_src : out->new_dst) &&
-		port->id == FLOW_ACTION_MANGLE && port->mangle.htype == (out->proto == IPPROTO_TCP ?
-			FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP) &&
-		!port->mangle.offset && port->mangle.mask == port_mask && port->mangle.val == port_value &&
-		csum->id == FLOW_ACTION_CSUM &&
+	if (nat & IPS_SRC_NAT) {
+		if (!ft_nat_edit(&actions->entries[offset], out, forward))
+			return false;
+		offset += 2;
+	}
+	if (nat & IPS_DST_NAT) {
+		if (!ft_nat_edit(&actions->entries[offset], out, !forward))
+			return false;
+		offset += 2;
+	}
+	csum = &actions->entries[offset];
+	return csum->id == FLOW_ACTION_CSUM &&
 		csum->csum_flags == (TCA_CSUM_UPDATE_FLAG_IPV4HDR | (out->proto == IPPROTO_TCP ?
 			TCA_CSUM_UPDATE_FLAG_TCP : TCA_CSUM_UPDATE_FLAG_UDP));
 }
@@ -482,7 +498,9 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	}
 	action = &rule->action.entries[rule->action.num_entries - 1];
 	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_port_supported(action->dev) ||
-	    !cdx_ft_port_supported(binding->dev) || action->dev == binding->dev ||
+	    !cdx_ft_port_supported(binding->dev) ||
+	    (action->dev == binding->dev &&
+	     (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK) ||
 	    !is_valid_ether_addr(ethernet) ||
 	    !ft_next_hop(cls, action->dev, out->new_dst, next_hop) ||
 	    !ft_neigh_check(action->dev, *next_hop, ethernet) ||

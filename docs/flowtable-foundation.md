@@ -10,8 +10,8 @@ repository's Linux 6.12.103 kernel and existing proprietary NXP firmware. It
 does not imply feature parity with CMM. The [architecture](flowtable-architecture.md)
 defines current implementation contracts; the [history index](flowtable/history/README.md)
 links the dated evidence. Subsequent
-feature increments extend this checkpoint; [static UDP SNAT](flowtable-nat.md)
-is the first such addition.
+feature increments extend this checkpoint. The [NAT guide](flowtable-nat.md)
+describes current IPv4 TCP/UDP SNAT, MASQUERADE, DNAT and hairpin/double NAT support.
 
 ## Supported boundary
 
@@ -30,8 +30,8 @@ and firewall policy.
 
 This is sufficient to build subsequent CMM-retirement features on a proved
 ownership and lifecycle boundary. Features beyond that checkpoint need separate
-implementations and proofs: the first static UDP SNAT increment is documented
-above; further NAT types, IPv6, VLAN/bridge/PPPoE, multicast, IPsec, tunnels,
+implementations and proofs. The NAT increments are documented above; IPv6,
+VLAN/bridge/PPPoE, multicast, IPsec, tunnels,
 Wi-Fi and asymmetric acceleration remain future work. Their legacy availability
 does not establish support in the new path.
 eBPF/XDP is an optional later consumer or policy mechanism, not a prerequisite
