@@ -152,9 +152,9 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A138 — external hash tables cannot be released, so the classifier
-  cannot be reinstalled without a reboot.** Under `USE_ENHANCED_EHASH` —
-  ASK's build mode — `FM_PCD_HashTableSet()` unconditionally routes to
+- [ ] **A138 — every classifier install leaks ~930k allocations, one per hash
+  bucket, and nothing can reclaim them.** Under `USE_ENHANCED_EHASH` — ASK's
+  build mode — `FM_PCD_HashTableSet()` unconditionally routes to
   `ExternalHashTableSet()`, but the matching delete was never written:
 
   ```c
@@ -164,27 +164,56 @@ result independently of those temporary files.
   #endif
   ```
 
-  `lnxwrp_exp_sym.h` also drops the `EXPORT_SYMBOL` for it inside
-  `#ifndef USE_ENHANCED_EHASH`, so kernel modules cannot even link against the
-  stub. The consequences are all visible in today's code and were inherited,
-  not introduced: `fmc_clean()` reaches the same stub through the ioctl shim,
-  which is why `dpa_app` prints *"FMC rollback failed; reboot before retrying"*;
-  `cdx_ioc_dpa_init_check()` refuses a second install outright; and
-  `dpa_cfg_deinit()` frees only the metadata, never the hardware tables. It is
-  also why cdx is a load-once module rather than one you can unload and reload.
+  `lnxwrp_exp_sym.h` also drops the `EXPORT_SYMBOL` inside
+  `#ifndef USE_ENHANCED_EHASH`, so modules cannot link against even the stub.
+  Inherited, not introduced: `fmc_clean()` reached the same stub through the
+  ioctl shim, which is why `dpa_app` printed *"FMC rollback failed; reboot
+  before retrying"*.
 
-  A failed or torn-down install therefore leaks 84 tables' worth of DDR and
-  MURAM, and the only recovery is a reboot. `cdx_pcd_teardown()` releases the
-  ports, schemes, trees and network environment and logs the tables it has to
-  abandon.
+  **Measured on the rig (2026-09-15).** The cost is not 84 tables, it is the
+  per-bucket spinlocks — `fm_ehash.c:806` allocates one `XX_InitSpinlock()` for
+  every bucket of every table:
 
-  The work is bounded: `InternalHashTableDelete()` and the non-enhanced
-  `ExternalHashTableDelete()` both exist and show the shape — walk the buckets,
-  release each cumulative entry and its MURAM AD, free the DDR table allocated
-  by `XX_MallocSmart()` in `ExternalHashTableSet()`, then drop the node. Doing
-  it would make the classifier reinstallable in place and remove the reboot from
-  every failure path above. Fixing it needs KASAN and rig validation, since it
-  is a free path over hardware-visible memory.
+  ```
+  4 tables/port @ 32768 buckets (tcp4 tcp6 udp4 udp6) = 131,072
+  7 tables/port @   256 buckets                       =   1,792
+  1 table /port @    16 buckets (pppoe)               =      16
+                                per port = 132,880  x 7 ports = 930,160
+  ```
+
+  kmemleak reports `929,571 new suspected memory leaks` per failed install —
+  within 0.1% of that. Each cycle adds ~6s to a kmemleak scan (5s baseline,
+  linear, no object-pool exhaustion through ~4.6M objects).
+
+  **Corrections to the original filing, both established by experiment:**
+  - *Reinstalling works.* After five failed installs a plain `modprobe cdx`
+    still reports `classifier installed on 7 ports, 84 tables` and completes.
+    This is a leak, not a wedge; the reboot reclaims memory, it is not needed to
+    retry. `cdx_pcd_teardown()`'s message was corrected to match.
+  - *MURAM is not leaked.* `fm_muram_free_size` returns to baseline after every
+    rollback — the leak is the DDR-side bucket allocations.
+
+  **Scope is smaller than it looks: most of the teardown already exists.**
+  `Delete_EnEhashInfo()` (`fm_ehash.c:594`) already walks and frees every bucket
+  spinlock, the handle array and the info struct; it is called today only from
+  `ExternalHashTableSet()`'s init-failure path. What is missing:
+
+  1. `XX_FreeSmart(info->table_base)` — the DDR table. `Delete_EnEhashInfo()`
+     does not free it, so today's init-failure path leaks it too.
+  2. A public `ExternalHashTableDelete()`. `fm_cc.c:8539` already calls one in
+     the non-enhanced branch, so the call site and signature exist.
+  3. Wire `FM_PCD_HashTableDelete()` to it, replacing `return -1`.
+  4. Move the `EXPORT_SYMBOL` out of the `#ifndef USE_ENHANCED_EHASH` block.
+
+  Open questions to settle before writing it: whether the delete walks and
+  releases live key entries or requires an emptied table (after a failed install
+  `htentry_count` is 0, but a normal unload may hold entries); freeing the MURAM
+  AD (`info->h_Ad`); and removing the node from the lazy registry the ASK patch
+  adds, or the next lookup finds freed memory.
+
+  Needs KASAN and a rig sweep — it is a free path over hardware-visible memory.
+  Do it on its own branch: it is SDK code in patch 010 and wants its own
+  validation cycle.
 
 - [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
   local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew

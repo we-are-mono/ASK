@@ -293,7 +293,7 @@ static int cdx_pcd_attach_port(struct cdx_pcd_state *state, unsigned int idx)
 
 void cdx_pcd_teardown(struct cdx_pcd_state *state)
 {
-	unsigned int i, grp, leaked;
+	unsigned int i, grp, leaked, tables = 0;
 
 	if (!state->h_pcd)
 		return;
@@ -329,15 +329,21 @@ void cdx_pcd_teardown(struct cdx_pcd_state *state)
 		 * USE_ENHANCED_EHASH the SDK's FM_PCD_HashTableDelete() is a
 		 * stub that returns an error ("delete table code not added"),
 		 * and it is not exported to modules in that build either. See
-		 * ISSUES.md A138. Say so rather than pretending the teardown
-		 * was complete.
+		 * ISSUES.md A138.
+		 *
+		 * Report the allocation count, not just the table count: each
+		 * table takes one spinlock per hash bucket, so the real cost is
+		 * ~930k allocations for the twelve groups across seven ports,
+		 * which a table count of 84 does not convey.
 		 */
-		leaked += ps->num_tables;
+		for (grp = 0; grp < ps->num_tables; grp++)
+			leaked += cdx_pcd_groups[grp].hash_res_mask + 1;
+		tables += ps->num_tables;
 		ps->num_tables = 0;
 	}
-	if (leaked)
-		pr_err("cdx: %u hash tables cannot be reclaimed in this build; reboot before installing the classifier again\n",
-		       leaked);
+	if (tables)
+		pr_err("cdx: leaked %u hash tables (%u bucket allocations); this build cannot reclaim them, only a reboot can\n",
+		       tables, leaked);
 
 	if (state->net_env &&
 	    FM_PCD_NetEnvCharacteristicsDelete(state->net_env) != E_OK)
