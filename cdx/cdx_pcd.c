@@ -34,7 +34,6 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include "lnxwrp_fm.h"
-#include "portdefs.h"
 #include "cdx_pcd.h"
 #include "cdx_softparse.h"
 

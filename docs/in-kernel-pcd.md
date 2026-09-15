@@ -185,6 +185,29 @@ coupling.
 **Phase 4 — validation.** Full `make ask-test`, plus a KASAN sweep: this
 touches allocation and struct-cast paths.
 
+## Checking the builder without a board
+
+`tools/host_tests/test_cdx_pcd_build.py` compiles `cdx_pcd.c` and
+`cdx_pcd_desc.c` unmodified on the host, replaces only the FMan entry points
+with stubs that record their parameters, runs `cdx_pcd_build()`, and compares
+what it programmed against `tools/host_tests/golden/cdx_pcd_model.json` — fmc's
+own compiled model, distilled by `tools/gen_cdx_pcd_golden.py`. Port discovery
+is stubbed with the gateway-dk port set, since it needs netdevs and the
+offline-port registry.
+
+It checks the object counts, the distinction units and their order, each CC root
+tree holding its own tables in group order, every table shape, every scheme's
+FQ base, unit list and extract fields (resolved to their numeric
+`NET_HEADER_FIELD_*` values, not just their names), the port-id OR into FQID
+bits 16-19, the per-port `prsResultPrivateInfo`, and the scheme match priority.
+
+That last one is the reason the harness exists. `relativeSchemeId` is the
+KeyGen's match order — lowest wins — and fmc derives it from the policy
+`dist_order`, which is the reverse of group order. Numbering schemes by group id
+instead puts the catch-all L2 scheme ahead of every specific one, which no
+compiler diagnoses and which a board would show only as traffic quietly taking
+the bridge path. The golden records fmc's apply order so the test fails on it.
+
 ## External hash tables cannot be released
 
 Under `USE_ENHANCED_EHASH` the SDK's `FM_PCD_HashTableDelete()` is a stub that
