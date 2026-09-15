@@ -447,17 +447,17 @@ int qm_init(void)
 /* Module init failure/unload only: returning with registered FQs would
  * leave QMan callbacks pointing into freed module text and static storage.
  * Ordinary interface/control drains remain bounded and report failure.
- * Caller holds the control mutex and RTNL; keep the mutex throughout but
- * drop RTNL between attempts so a hardware fault cannot pin it forever. */
+ * Caller holds the control mutex and RTNL, with the timer stopped and external
+ * users gone. Release both between attempts, before reacquiring either. */
 void qm_quiesce(void)
 {
 #ifdef ENABLE_EGRESS_QOS
 	ASSERT_RTNL();
 	while (ceetm_exit()) {
-		rtnl_unlock();
+		cdx_ctrl_unlock_with_rtnl();
 		pr_warn_ratelimited("cdx: waiting for QoS shutdown; reboot if hardware cannot recover\n");
 		msleep(1000);
-		rtnl_lock();
+		cdx_ctrl_lock_with_rtnl();
 	}
 #endif
 }

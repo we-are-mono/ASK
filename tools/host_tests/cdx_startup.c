@@ -42,10 +42,11 @@ static struct cdx_fman_info *fman_info;
 static struct dpa_fq *dpa_pcd_fq;
 static int dpa_cfg_lock, rtnl;
 static bool config_sealed, seal_on_lock;
+static unsigned lock_contention, lock_waits;
 static bool cdx_flowtable_config_sealed(void) { return config_sealed; }
 static unsigned port_up_mask = 15;
 static struct { struct { int mutex; } ctrl; } cdx_instance, *cdx_info = &cdx_instance;
-static void rtnl_lock(void) { assert(!rtnl && cdx_info->ctrl.mutex); rtnl = 1; }
+static void rtnl_lock(void) { assert(!rtnl && !cdx_info->ctrl.mutex); rtnl = 1; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = 0; }
 static struct cdx_fman_info input[2];
 static struct cdx_ctrl_set_dpa_params request = { input, 2 };
@@ -58,8 +59,17 @@ static bool restoring, unsafe_enable, fail_delete;
 
 static void mutex_lock(int *lock)
 {
+    if (lock == &cdx_info->ctrl.mutex) { assert(!rtnl); lock_waits++; }
     assert(!*lock); *lock = 1;
     if (lock == &cdx_info->ctrl.mutex && seal_on_lock) config_sealed = true;
+}
+static int mutex_trylock(int *lock)
+{
+    assert(lock == &cdx_info->ctrl.mutex && rtnl && !*lock);
+    if (lock_contention) { lock_contention--; return 0; }
+    *lock = 1;
+    if (seal_on_lock) config_sealed = true;
+    return 1;
 }
 static void mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
 static void *kcalloc(size_t n, size_t size, int flags)
@@ -217,12 +227,12 @@ static void setup(void)
 static void clean_success(void)
 {
     /* The module/control exit hooks quiesce before the final config hook. */
-    mutex_lock(&cdx_info->ctrl.mutex); rtnl_lock();
+    cdx_ctrl_lock_with_rtnl();
     assert(!dpa_cfg_quiesce() && stopped() && queues == 4);
     for (struct dpa_fq *fq = dpa_pcd_fq; fq; fq = (struct dpa_fq *)fq->list.next)
         assert(fq->fq_base.id == 1);
     assert(!dpa_cfg_quiesce());
-    rtnl_unlock(); mutex_unlock(&cdx_info->ctrl.mutex);
+    cdx_ctrl_unlock_with_rtnl();
     dpa_cfg_deinit();
     assert(!fman_info && !rtnl && !dpa_cfg_lock && !cdx_info->ctrl.mutex);
     for (unsigned i = 0; i < 4; i++)
@@ -245,13 +255,17 @@ static void retry(void)
 int main(void)
 {
     /* Claim can seal configuration while an already validated ioctl waits
-     * for the control transaction. Refuse before any RTNL/hardware work. */
-    setup(); seal_on_lock = true;
+     * for the control transaction. Drop RTNL to let that claimant run, then
+     * recheck ownership before any allocation or hardware work. */
+    setup(); seal_on_lock = true; lock_contention = 3;
     assert(cdx_ioc_set_dpa_params((unsigned long)&request) == -EOPNOTSUPP);
     assert(!cdx_info->ctrl.mutex && !rtnl && !live_allocs && !fman_info);
     assert(!step && !alloc_step);
+    assert(lock_waits == 3 && !lock_contention);
     seal_on_lock = config_sealed = false;
-    setup(); assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
+    setup(); lock_contention = 2;
+    assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
+    assert(lock_waits == 5 && !lock_contention);
     unsigned allocations = alloc_step, steps = step;
     assert(!unsafe_enable); clean_success();
     for (unsigned n = 1; n <= allocations; n++) {

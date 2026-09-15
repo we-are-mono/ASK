@@ -106,6 +106,9 @@ static unsigned shutdown_waits;
 static bool rtnl;
 static void rtnl_lock(void) { assert(!rtnl); rtnl = true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
+/* The control-lock contention contract is covered by cdx_shutdown.c. */
+static void cdx_ctrl_lock_with_rtnl(void) { rtnl_lock(); }
+static void cdx_ctrl_unlock_with_rtnl(void) { rtnl_unlock(); }
 #define ASSERT_RTNL() assert(rtnl)
 static unsigned pop_by_queue[16], query_by_queue[16];
 static void dpa_fd_release(struct net_device *dev, const struct qm_fd *fd)

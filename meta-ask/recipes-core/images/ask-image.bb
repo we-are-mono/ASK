@@ -70,6 +70,7 @@ IMAGE_INSTALL = " \
 # Kept separate so it's obvious what the test image adds on top of the base.
 IMAGE_INSTALL:append = " \
     ask-test-agent \
+    kernel-module-dummy \
     python3-core \
     python3-aiohttp \
     python3-pyroute2 \

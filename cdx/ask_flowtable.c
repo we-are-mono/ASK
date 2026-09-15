@@ -4,8 +4,9 @@
  * Backend transactions serialize hardware operations and adapter lists. Rule callbacks are
  * process-context NF workqueue callbacks. Binding release runs after the
  * flow-block core excludes callbacks. Notifiers only latch invalidation and
- * queue work; they never start a backend transaction. Neighbour notifications inspect
- * immutable watched dependencies under ft_neigh_lock, nested inside neigh->lock.
+ * queue work; they never start a backend transaction. Dependency notifications inspect
+ * bound devices and immutable flow dependencies under ft_watch_lock. Neighbour
+ * notifications nest this lock inside neigh->lock.
  * Invalidation ends its transaction before flushing Netfilter work. The backend
  * uses RTNL trylock for admission and fatal recovery, never a blocking acquire.
  * Each binding pins its ingress device; each installed direction pins egress.
@@ -68,13 +69,17 @@ struct cdx_ft_entry {
  */
 #define CDX_FT_MAX_ENTRIES 64U
 
+/* Binding mutations hold both the backend transaction and ft_watch_lock.
+ * Transaction readers and device notifiers can therefore use their own lock.
+ * The binding's existing device reference covers its entire watch lifetime. */
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
-/* Watch publication/removal is serialized by the backend transaction. Atomic neighbour and
- * route notifiers share the immutable rule, neigh and handle, protected against
- * entry removal here. Never take a neighbour lock while holding this lock. */
+/* Flow watch publication/removal is serialized by the backend transaction.
+ * Neighbour, route and device notifiers share the immutable rule, neigh and
+ * handle, protected against entry removal here. Never take a neighbour lock
+ * or start a backend transaction while holding this lock. */
 static LIST_HEAD(ft_neigh_entries);
-static DEFINE_SPINLOCK(ft_neigh_lock);
+static DEFINE_SPINLOCK(ft_watch_lock);
 static LIST_HEAD(ft_block_list);
 static unsigned int ft_bound, ft_count;
 static unsigned int ft_neighbour_refs;
@@ -120,7 +125,7 @@ static struct cdx_ft_entry *ft_find(struct cdx_ft_binding *binding,
 	return NULL;
 }
 
-/* Called with either the backend transaction or the notifier's ft_neigh_lock held. The
+/* Called with either the backend transaction or the notifier's ft_watch_lock held. The
  * handle is immutable, owned before watch publication and shared by both
  * directions. Marking it also excludes Linux's cached flow immediately;
  * native GC later retires that generation without flushing unrelated flows.
@@ -255,10 +260,10 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	read_lock_bh(&neigh->lock);
 	valid = ft_neigh_matches(neigh, entry->rule.dst_mac);
 	if (valid) {
-		spin_lock(&ft_neigh_lock);
+		spin_lock(&ft_watch_lock);
 		entry->neigh = neigh;
 		list_add_tail(&entry->neigh_list, &ft_neigh_entries);
-		spin_unlock(&ft_neigh_lock);
+		spin_unlock(&ft_watch_lock);
 		ft_neighbour_refs++;
 	}
 	read_unlock_bh(&neigh->lock);
@@ -273,9 +278,9 @@ static void ft_neigh_detach(struct cdx_ft_entry *entry)
 
 	if (!neigh)
 		return;
-	spin_lock_bh(&ft_neigh_lock);
+	spin_lock_bh(&ft_watch_lock);
 	list_del(&entry->neigh_list);
-	spin_unlock_bh(&ft_neigh_lock);
+	spin_unlock_bh(&ft_watch_lock);
 	entry->neigh = NULL;
 	ft_neighbour_refs--;
 	neigh_release(neigh);
@@ -582,8 +587,10 @@ static void ft_release(void *priv)
 	list_for_each_entry_safe(entry, next, &ft_entries, list)
 		if (entry->binding == binding)
 			ft_remove(entry);
+	spin_lock_bh(&ft_watch_lock);
 	list_del(&binding->list);
 	ft_bound--;
+	spin_unlock_bh(&ft_watch_lock);
 	cdx_ft_end();
 	dev_put(binding->dev);
 	kfree(binding);
@@ -678,8 +685,10 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 			pr_info("cdx flowtable: admission rearmed for a new binding\n");
 		}
 		dev_hold(dev);
+		spin_lock_bh(&ft_watch_lock);
 		list_add_tail(&binding->list, &ft_bindings);
 		ft_bound++;
+		spin_unlock_bh(&ft_watch_lock);
 		flow_block_cb_add(cb, bo);
 		list_add_tail(&cb->driver_list, &ft_block_list);
 	} else if (bo->command == FLOW_BLOCK_UNBIND) {
@@ -738,6 +747,24 @@ static void ft_invalidate_work(struct work_struct *work)
 	cdx_ft_end();
 }
 
+static bool ft_device_used(const struct net_device *dev)
+{
+	struct cdx_ft_binding *binding;
+	struct cdx_ft_entry *entry;
+
+	lockdep_assert_held(&ft_watch_lock);
+	/* Bindings matter before the first flow arrives, and a directional
+	 * flow's egress need not have an ingress binding of its own. Compare
+	 * pinned device objects, never names or recyclable interface indices. */
+	list_for_each_entry(binding, &ft_bindings, list)
+		if (binding->dev == dev)
+			return true;
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
+		if (entry->rule.in == dev || entry->rule.out == dev)
+			return true;
+	return false;
+}
+
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
@@ -751,7 +778,12 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 	case NETDEV_CHANGEADDR:
 	case NETDEV_CHANGEUPPER:
 	case NETDEV_CHANGENAME:
-		ft_invalidate();
+		spin_lock_bh(&ft_watch_lock);
+		/* Latch before releasing the watch lock: a concurrent last unbind
+		 * and fresh bind must not redirect this event to a new table. */
+		if (ft_device_used(dev))
+			ft_invalidate();
+		spin_unlock_bh(&ft_watch_lock);
 		break;
 	}
 	return NOTIFY_DONE;
@@ -769,7 +801,7 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 		return NOTIFY_DONE;
 	}
 	mask = inet_make_mask(event->prefixlen);
-	spin_lock_bh(&ft_neigh_lock);
+	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
 		/* No NAT is admitted, so source is the reverse route destination.
 		 * Check both endpoints even if only one direction installed. Match
@@ -779,7 +811,7 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 		    !((entry->rule.src ^ event->dst) & mask))
 			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
 	}
-	spin_unlock_bh(&ft_neigh_lock);
+	spin_unlock_bh(&ft_watch_lock);
 	return NOTIFY_DONE;
 }
 
@@ -794,7 +826,7 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 	    !net_eq(dev_net(neigh->dev), &init_net))
 		return NOTIFY_DONE;
 	read_lock_bh(&neigh->lock);
-	spin_lock(&ft_neigh_lock);
+	spin_lock(&ft_watch_lock);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
 		if (entry->neigh == neigh &&
 		    !ft_neigh_matches(neigh, entry->rule.dst_mac)) {
@@ -804,7 +836,7 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 			ft_neigh_invalidate(entry);
 		}
 	}
-	spin_unlock(&ft_neigh_lock);
+	spin_unlock(&ft_watch_lock);
 	read_unlock_bh(&neigh->lock);
 	return NOTIFY_DONE;
 }

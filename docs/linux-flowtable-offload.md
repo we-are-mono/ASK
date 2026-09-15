@@ -414,6 +414,23 @@ Indirect UNBIND takes the flowtable's write lock before the CDX transaction.
 Moving a published callback to the temporary unbind list must exclude native
 statistics/add/delete walkers; Netfilter's later locked free alone is insufficient.
 
+CDX configuration and final teardown acquire RTNL, try the control mutex, and
+release RTNL before waiting for a busy control mutex and retrying. Neither lock
+is waited on while holding the other. This matters even for an unrelated device:
+Linux's DOWN notifier flushes native flowtable work, whose callbacks need the
+control mutex. Final CDX shutdown stops its timer before releasing both locks
+between hardware cleanup retries; external users have already released their
+module references. Timer storage survives until the normal teardown callback.
+
+Device events are relevant only when the device is bound or appears as an
+installed direction's ingress/egress. Empty bindings remain watched, and egress
+devices need not have their own binding. Matching uses pinned device objects,
+not names or interface indices. `ft_watch_lock` protects binding publication,
+removal and the existing flow dependency watches; a notifier latches invalidation
+under that lock without taking a backend transaction. Recognized events on a
+relevant device still invalidate the whole table and require table recreation
+after recovery. Unrelated device events leave existing hardware flows alone.
+
 Releasing a claim requires zero live directions. CDX keeps any retired storage,
 the terminal failure latch and the sealed configuration gate independently of
 the adapter. A fresh claim cannot bypass fatal failure or pending retirement.
@@ -1673,3 +1690,101 @@ Stop at this increment. Healthy reload requires flowtable recreation to resume
 hardware admission; fatal hardware failure still requires reset. This extraction
 adds no new traffic features or runtime ownership switching. Selective device
 dependencies and broader foundation coverage remain separate increments.
+
+### 2026-09-15: device dependency filtering
+
+Unrelated interface changes no longer disable hardware admission. The adapter
+watches every binding, including an empty one, and both physical devices of
+each installed direction. An egress device remains a dependency even without
+its own ingress binding. Matching compares referenced device objects, so reused
+names or interface indices cannot inherit a previous device's dependency.
+Binding mutations now share the existing dependency watch lock with notifiers;
+event selection and invalidation happen in the same critical section, without
+taking a backend transaction from a notifier. No new lock or backend ABI is added.
+
+The first DUT run passed the forwarding assertions but failed its diagnostic
+check: bringing an unrelated dummy interface down exposed a lockdep cycle.
+Linux's DOWN notifier holds RTNL while flushing native flowtable work. That
+work needs the flow-block lock and CDX control mutex, while CDX's existing
+SET_PARAMS startup path had established the opposite control-mutex-to-RTNL
+dependency. The new dependency watch lock was not part of this cycle.
+
+Configuration and final teardown now acquire RTNL and try the control mutex.
+On contention they drop RTNL, wait for the control mutex with no other lock
+held, release it, and retry before changing state. This also accommodates the
+legacy FCI control-to-RTNL path without introducing a blocking reverse edge.
+The authoritative configuration gate is checked after both locks are acquired,
+so a claim during the wait still seals the ioctl. Final shutdown stops the CDX
+timer first, retaining its storage until its normal exit callback; port and
+QoS cleanup retries then release both locks. The adapter's runtime admission
+and recovery continue to use the existing backend transaction and RTNL trylock.
+
+Thirteen focused host tests pass in 2.29 seconds, covering device selection,
+unbound egress dependencies, object identity, rollback, ownership sealing during
+lock contention, and shutdown retries with the timer stopped and both locks
+available. Existing decoder, handle, route, startup and QoS lifecycle coverage
+also passes. The test image now includes the already configured dummy module
+for isolated interface-event tests.
+
+On the rebuilt KASAN image, `test_flowtable_device_dependencies` passes in
+83.89 seconds. One TCP connection and one UDP flow retain their four hardware
+cookies through twelve unrelated changes: dummy creation, up, MTU, MAC,
+bridge creation, upper attach/detach, down, rename, up under the new name,
+unregistration while up, and bridge deletion. Every step advances all four
+hardware packet counters without installation, deletion or rearm changes.
+The TCP socket remains connected throughout the test.
+
+Changing each real port's MTU separately retires all four hardware directions
+and releases their handle/neighbour references. Both protocols continue through
+Linux; restoring MTU and recreating the table resumes hardware admission.
+Across the four measured hardware windows, each UDP direction advances exactly
+256 packets and 76,288 bytes, and TCP hardware counters cover the validated
+4 MiB transfers in each direction. Software TX advances only four LAN packets
+and 15–16 WAN packets per window; the software fallback windows advance roughly
+2,900 packets per port. Sampled aggregate softirq usage is 0.28–0.67%. Total CPU
+busy usage varies from 2.28% to 27.01% on this instrumented image, so this proof
+does not claim zero CPU usage; hardware counters and software TX establish where
+the measured traffic was forwarded.
+
+`test_flowtable_module_lifecycle` passes in 110.74 seconds. It covers all five
+adapter initialization failures, provider pinning and persistent configuration
+sealing, live healthy and barrier-failure unloads, software continuation and
+readmission after table recreation, and eight live UNBIND/rebind cycles. Device
+watches and all other adapter references drain on each removal. Both focused
+DUT tests finish without KASAN or lockdep reports.
+
+The third focused DUT test, `test_flowtable_offload_terminal` with
+`ASK_FLOWTABLE_TERMINAL=unlink`, passes in 27.18 seconds. An injected unproven
+deletion stops both physical receive ports, refuses table rearm and adapter
+reload, and retains the fatal latch until CDX unload. Final provider shutdown
+completes with the timer stopped, and 64 software echoes pass afterward.
+Post-unload dmesg has no KASAN, lockdep, warning or oops reports, lockdep remains
+enabled (`debug_locks: 1`), and taint remains 4096 for the out-of-tree modules.
+
+Both KASAN image builds succeeded and were staged. The corrected image's kernel
+build ID is `d320991b5e8736f0f657bd3224a298f74e405a1a`, CDX
+`c6c0f308d581d77ef1047ea1dcc68ab53b1802d5`, and adapter
+`498b29824dd5837f4254e3e93d82fb68d55fa1ab`. Staged image SHA-256 is
+`93571aeea152a56f7b2fed6758d4a8c1689bb6b1f2602fbbfa4879cc7886d6a1`.
+KASAN, lockdep, kmemleak and failslab remain enabled. The build has no CDX
+compiler warnings and three existing forced-task warnings. Only focused tests
+ran; the full KASAN suite was not run.
+
+Artifacts are under `/tmp/ask-flowtable-devices/`: `host-locks.log`, `proof/`,
+`module/`, `terminal/`, their logs/XML, image identities, and post-unload
+diagnostics. `first-image-lockdep/` preserves the failed diagnostic run and its
+full dependency report. Build logs are
+`/tmp/ask-flowtable-devices-build.log` and
+`/tmp/ask-flowtable-devices-rebuild.log`.
+
+The final fresh flowtable boot matches the staged kernel, modules and userspace
+binaries. CDX and the adapter are loaded, CMM remains stopped, and counters,
+bindings, references, quarantine and fault controls are clear. Both physical
+MTUs are restored to 1500; test interfaces, routes and firewall rules are gone,
+and host/LAN settings are restored. Final diagnostics remain clean with lockdep
+enabled and taint 4096. `final-state.json` and `final-dmesg.txt` record this state.
+
+Stop at this increment. Recognized changes to a relevant device still retire
+the whole table and require recreation; automatic recovery after real-port
+changes and down/up cycles remains a separate increment. This adds no VLAN,
+bridge, tunnel or other traffic support, and does not change owner selection.

@@ -32,7 +32,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used", "ft_route_event", "ft_neigh_event", "ft_fib_event",
              "ft_remove", "ft_retire_workfn", "ft_parse", "ft_same_key",
              "ft_replace", "ft_stats", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_bind",
-             "ft_invalidate_work", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit"]
+             "ft_invalidate_work", "ft_device_used", "ft_netdev_event", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit"]
     (tmp_path / "flowtable_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"

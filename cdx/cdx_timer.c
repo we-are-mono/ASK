@@ -185,13 +185,21 @@ int cdx_ctrl_timer(void *data)
 	return 0;
 }
 
+void cdx_ctrl_timer_stop(void)
+{
+	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
+
+	if (ctrl->timer_thread) {
+		kthread_stop(ctrl->timer_thread);
+		ctrl->timer_thread = NULL;
+	}
+}
+
 static void cdx_ctrl_timer_exit(void)
 {
-	struct _cdx_ctrl *ctrl;
+	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
 
-	ctrl = &cdx_info->ctrl;
-	if (ctrl->timer_thread)
-		kthread_stop(ctrl->timer_thread);
+	cdx_ctrl_timer_stop();
 	if (ctrl->timer_inner_wheel) kfree(ctrl->timer_inner_wheel);
 	if (ctrl->timer_outer_wheel) kfree(ctrl->timer_outer_wheel);
 	ctrl->timer_inner_wheel = NULL;
@@ -228,4 +236,3 @@ error:
 	register_cdx_deinit_func(cdx_ctrl_timer_exit);
 	return rc;
 }
-

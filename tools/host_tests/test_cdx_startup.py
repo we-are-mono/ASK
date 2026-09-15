@@ -11,11 +11,19 @@ from test_qos_lifecycle import function
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def control_locks():
+    source = (ROOT / "cdx/cdx_main.c").read_text()
+    return (function(source, "cdx_ctrl_lock_with_rtnl")
+            + function(source, "cdx_ctrl_unlock_with_rtnl"))
+
+
 def test_cdx_shutdown(tmp_path):
     main = (ROOT / "cdx/cdx_main.c").read_text()
     qos = (ROOT / "cdx/control_qm.c").read_text()
+    timer = (ROOT / "cdx/cdx_timer.c").read_text()
     (tmp_path / "cdx_shutdown.inc").write_text(
-        function(qos, "qm_quiesce") + function(main, "cdx_module_deinit"))
+        control_locks() + function(timer, "cdx_ctrl_timer_stop")
+        + function(qos, "qm_quiesce") + function(main, "cdx_module_deinit"))
     binary = tmp_path / "cdx_shutdown"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
@@ -34,7 +42,8 @@ def test_cdx_startup(tmp_path):
              "dpa_release_pcd_fqs", "dpa_rollback_resources", "dpa_detach_ports",
              "dpa_cfg_quiesce", "dpa_cfg_deinit", "cdx_ioc_set_dpa_params"]
     (tmp_path / "cdx_startup.inc").write_text(
-        source[source.index("struct dpa_init_port {"):source.index("/* Resolve every port")]
+        control_locks()
+        + source[source.index("struct dpa_init_port {"):source.index("/* Resolve every port")]
         + "\n".join(function(source, n) for n in names))
     qos = (ROOT / "cdx/cdx_qos.c").read_text()
     (tmp_path / "cdx_policers.inc").write_text(

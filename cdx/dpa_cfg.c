@@ -62,7 +62,9 @@ static struct dpa_fq *dpa_pcd_fq;
 
 /*
  * Concurrency:
- *   cdx_info->ctrl.mutex, then RTNL, then dpa_cfg_lock
+ *   cdx_ctrl_lock_with_rtnl(), then dpa_cfg_lock
+ *      - Acquires RTNL and ctrl.mutex without waiting on one while
+ *        holding the other; contention restarts before any state change.
  *      - Excludes FCI commands and timers while startup publishes or
  *        unwinds interfaces and classifier metadata.
  *
@@ -880,8 +882,7 @@ out:
 
 void dpa_cfg_deinit(void)
 {
-	mutex_lock(&cdx_info->ctrl.mutex);
-	rtnl_lock();
+	cdx_ctrl_lock_with_rtnl();
 	if (dpa_cfg_quiesce()) {
 		pr_err("cdx: cannot quiesce DPA resources; reboot required\n");
 		goto out;
@@ -898,8 +899,7 @@ void dpa_cfg_deinit(void)
 	memset(&dpa_active_ports, 0, sizeof(dpa_active_ports));
 	mutex_unlock(&dpa_cfg_lock);
 out:
-	rtnl_unlock();
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ctrl_unlock_with_rtnl();
 }
 
 /* /dev/cdx_ctrl admits one opener. The loader keeps that fd open until
@@ -936,20 +936,18 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 				__func__, params.num_fmans, CDX_MAX_FMANS);
 		return -EINVAL;
 	}
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ctrl_lock_with_rtnl();
 	/* Serialize the authoritative ownership check with backend claim. An
 	 * ioctl may have passed the wrapper before the first claim sealed it. */
 	if (cdx_flowtable_config_sealed()) {
-		mutex_unlock(&cdx_info->ctrl.mutex);
+		cdx_ctrl_unlock_with_rtnl();
 		return -EOPNOTSUPP;
 	}
-	rtnl_lock();
 	mutex_lock(&dpa_cfg_lock);
 	if (fman_info) {
 		DPA_ERROR("%s::dpa params already set\n", __func__);
 		mutex_unlock(&dpa_cfg_lock);
-		rtnl_unlock();
-		mutex_unlock(&cdx_info->ctrl.mutex);
+		cdx_ctrl_unlock_with_rtnl();
 		return -EBUSY;
 	}
 	fman_info = kcalloc(params.num_fmans, sizeof(struct cdx_fman_info),
@@ -958,8 +956,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		DPA_ERROR("%s::unable to allocate mem for fman_info\n",
 				__func__);
 		mutex_unlock(&dpa_cfg_lock);
-		rtnl_unlock();
-		mutex_unlock(&cdx_info->ctrl.mutex);
+		cdx_ctrl_unlock_with_rtnl();
 		return -ENOMEM;
 	}
 	num_fmans = params.num_fmans;
@@ -1104,8 +1101,7 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 	display_dpa_cfg();
 	dpa_active_ports = ports;
 	mutex_unlock(&dpa_cfg_lock);
-	rtnl_unlock();
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ctrl_unlock_with_rtnl();
 	return 0;
 err_ret:
 	if (resources_started) {
@@ -1128,8 +1124,7 @@ err_ret:
 	release_cfg_info();
 unlock:
 	mutex_unlock(&dpa_cfg_lock);
-	rtnl_unlock();
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ctrl_unlock_with_rtnl();
 	return retval;
 }
 

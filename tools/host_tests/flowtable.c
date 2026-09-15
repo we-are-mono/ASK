@@ -50,6 +50,8 @@ typedef uint64_t u64, atomic64_t;
 #define NETEVENT_IPV4_ROUTE_UPDATE 7
 enum { FIB_EVENT_ENTRY_REPLACE, FIB_EVENT_ENTRY_APPEND, FIB_EVENT_ENTRY_ADD,
        FIB_EVENT_ENTRY_DEL, FIB_EVENT_RULE_ADD, FIB_EVENT_RULE_DEL, FIB_EVENT_NH_ADD, FIB_EVENT_NH_DEL };
+enum { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU, NETDEV_CHANGEADDR,
+       NETDEV_CHANGEUPPER, NETDEV_CHANGENAME, NETDEV_REGISTER };
 struct fib_notifier_info { int family; };
 struct netevent_ipv4_route { struct net *net; __be32 dst; u8 prefixlen; };
 static __be32 inet_make_mask(unsigned plen) { assert(plen <= 32); return htonl(plen ? ~0U << (32 - plen) : 0); }
@@ -89,8 +91,10 @@ struct flow_block_cb {
 };
 struct net { int id; };
 static struct net init_net;
-struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; };
-#define dev_net(d) (&init_net)
+struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; };
+#define dev_net(d) ((d)->net ? (d)->net : &init_net)
+struct netdev_notifier_info { struct net_device *dev; };
+#define netdev_notifier_info_to_dev(p) (((struct netdev_notifier_info *)(p))->dev)
 struct dst_ops { unsigned family; };
 struct dst_entry {
     struct dst_ops *ops;
@@ -204,7 +208,7 @@ static int ft_work, ft_retire_work;
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
 static LIST_HEAD(ft_neigh_entries);
-static bool ft_neigh_lock;
+static bool ft_watch_lock;
 static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
@@ -231,8 +235,8 @@ static void mutex_unlock(bool *m) { assert(*m); *m = false; }
 static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static int dpa_cfg_quiesce(void) { assert(rtnl && cdx_info->ctrl.mutex); return quiesce_fail ? -EIO : 0; }
-static void cdx_ft_begin(void) { mutex_lock(&cdx_info->ctrl.mutex); }
-static void cdx_ft_end(void) { mutex_unlock(&cdx_info->ctrl.mutex); }
+static void cdx_ft_begin(void) { assert(!ft_watch_lock); mutex_lock(&cdx_info->ctrl.mutex); }
+static void cdx_ft_end(void) { assert(!ft_watch_lock); mutex_unlock(&cdx_info->ctrl.mutex); }
 static void cdx_ft_assert_held(void) { assert(cdx_info->ctrl.mutex); }
 static bool *block_write_lock;
 static void down_write(bool *lock)
@@ -283,7 +287,7 @@ static struct neighbour *neigh_lookup(struct neigh_table *table, const __be32 *d
 static void neigh_release(struct neighbour *n) { assert(n->refs); n->refs--; }
 static int neigh_event_send(struct neighbour *n, void *skb)
 {
-    assert(n->refs && !n->lock && !ft_neigh_lock && !skb);
+    assert(n->refs && !n->lock && !ft_watch_lock && !skb);
     neigh_uses++;
     return neigh_send_error;
 }
@@ -974,6 +978,68 @@ static void test_selective_routes(void)
     assert(ft_installs == ft_deletes && ft_errors == errors);
 }
 
+static void device_event(struct net_device *dev, unsigned long event, bool invalid)
+{
+    struct netdev_notifier_info info = { .dev = dev };
+    ft_invalid = 0; /* Isolate selection of each event without running work. */
+    assert(ft_netdev_event(NULL, event, &info) == NOTIFY_DONE);
+    assert(ft_invalid == invalid && !cdx_info->ctrl.mutex && !ft_watch_lock);
+}
+
+static void test_device_dependencies(void)
+{
+    struct net other_net;
+    /* The same ifindex on another object must not match the bound port. */
+    struct net_device unrelated = { .ifindex = in.ifindex };
+    unsigned long events[] = { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU,
+                              NETDEV_CHANGEADDR, NETDEV_CHANGEUPPER, NETDEV_CHANGENAME };
+    fixture();
+    assert(!ft_bound && !ft_count && !ft_invalid);
+    for (unsigned i = 0; i < ARRAY_SIZE(events); i++) device_event(&in, events[i], false);
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
+        device_event(&in, events[i], true); /* Empty binding still matters. */
+        device_event(&out, events[i], false);
+        device_event(&unrelated, events[i], false);
+    }
+    in.net = &other_net;
+    device_event(&in, NETDEV_CHANGEMTU, false);
+    in.net = NULL;
+    device_event(&in, NETDEV_REGISTER, false);
+    struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
+    assert(cb && ft_replace(cb->priv, &cls) == 0);
+    assert(ft_bound == 1 && in.refs == 1 && out.refs == 1);
+    for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
+        device_event(&out, events[i], true); /* Egress has no binding. */
+        device_event(&in, events[i], true);
+        device_event(&unrelated, events[i], false);
+    }
+    device_event(&out, NETDEV_CHANGEMTU, true);
+    ft_invalidate_work(NULL);
+    assert(ft_invalid_done && !ft_count && !ft_handle_refs && !ft_neighbour_refs && !out.refs);
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+    assert(!ft_bound && !in.refs && !allocated && !live_hw);
+    /* No stale watch can follow the released binding into its replacement. */
+    assert(bind_device(&unrelated, FLOW_BLOCK_BIND) == 0);
+    device_event(&in, NETDEV_CHANGEMTU, false);
+    device_event(&out, NETDEV_CHANGEMTU, false);
+    device_event(&unrelated, NETDEV_CHANGEMTU, true);
+    ft_invalid = 0;
+    assert(bind_device(&unrelated, FLOW_BLOCK_UNBIND) == 0);
+    assert(!unrelated.refs && !ft_bound && !allocated);
+    /* Installation rollback must also remove the egress watch. */
+    fixture();
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
+    cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
+    for (unsigned stage = 2; stage <= 3; stage++) {
+        ft_fail_stage = stage;
+        assert(ft_replace(cb->priv, &cls) < 0 && !ft_count && !out.refs);
+        device_event(&out, NETDEV_CHANGEMTU, false);
+    }
+    assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
+    assert(!ft_bound && !in.refs && !allocated && ft_installs == ft_deletes);
+}
+
 static void test_registration(void)
 {
     for (registration_failure = 0; registration_failure <= 6; registration_failure++) {
@@ -1110,6 +1176,7 @@ int main(void)
     test_neighbours();
     test_selective_neighbours();
     test_selective_routes();
+    test_device_dependencies();
     test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

@@ -77,6 +77,27 @@ void cdx_ehash_quarantine_abandon(void);
 static uint32_t init_level;
 static cdx_deinit_func deinit_fn[MAX_CDX_INIT_FUNCTIONS];
 
+/* Configuration and final teardown need both locks. RTNL holders may flush
+ * flowtable callbacks which need ctrl.mutex; legacy FCI can take RTNL with
+ * ctrl.mutex held. Never wait for either lock while holding the other. */
+void cdx_ctrl_lock_with_rtnl(void)
+{
+	for (;;) {
+		rtnl_lock();
+		if (mutex_trylock(&cdx_info->ctrl.mutex))
+			return;
+		rtnl_unlock();
+		mutex_lock(&cdx_info->ctrl.mutex);
+		mutex_unlock(&cdx_info->ctrl.mutex);
+	}
+}
+
+void cdx_ctrl_unlock_with_rtnl(void)
+{
+	mutex_unlock(&cdx_info->ctrl.mutex);
+	rtnl_unlock();
+}
+
 void register_cdx_deinit_func(cdx_deinit_func func)
 {
 	if (init_level == MAX_CDX_INIT_FUNCTIONS) {
@@ -90,10 +111,7 @@ void register_cdx_deinit_func(cdx_deinit_func func)
 
 static void cdx_ctrl_deinit(void)
 {
-	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
-
-	mutex_lock(&ctrl->mutex);
-	rtnl_lock();
+	cdx_ctrl_lock_with_rtnl();
 	if (dpa_cfg_quiesce())
 		pr_err("cdx: cannot quiesce DPA ports before control teardown\n");
 	cdx_cmdhandler_exit();
@@ -102,8 +120,7 @@ static void cdx_ctrl_deinit(void)
 	 * the abandon must run after every subsystem's teardown, not from
 	 * an individual _exit hook partway down the chain. */
 	cdx_ehash_quarantine_abandon();
-	rtnl_unlock();
-	mutex_unlock(&ctrl->mutex);
+	cdx_ctrl_unlock_with_rtnl();
 }
 
 static int __init cdx_ctrl_init(struct _cdx_info *cdx_info)
@@ -197,24 +214,25 @@ static void cdx_module_deinit(void)
 
 	/* A loaded flowtable adapter pins CDX. Its callbacks and hardware
 	 * have drained before provider shutdown can run. */
+	/* Stop the remaining internal writer before terminal retries release
+	 * both locks. Timer storage survives until its normal exit callback. */
+	cdx_ctrl_timer_stop();
 
 	/* Stop classification before any dependent subsystem releases queues.
-	 * Keep RTNL available between retries and release it before callbacks
-	 * which unregister netdevices. The control mutex excludes FCI updates. */
+	 * Keep both locks available between retries and release them before
+	 * callbacks which unregister netdevices. External users pin the module. */
 	if (fman_info) {
-		mutex_lock(&cdx_info->ctrl.mutex);
-		rtnl_lock();
+		cdx_ctrl_lock_with_rtnl();
 		while (dpa_cfg_quiesce()) {
-			rtnl_unlock();
+			cdx_ctrl_unlock_with_rtnl();
 			pr_warn_ratelimited("cdx: waiting for DPA port shutdown; reboot if hardware cannot recover\n");
 			msleep(1000);
-			rtnl_lock();
+			cdx_ctrl_lock_with_rtnl();
 		}
 		cdx_flowtable_quiesced();
 		/* Reclaim queued TX frames while dependent pools are still alive. */
 		qm_quiesce();
-		rtnl_unlock();
-		mutex_unlock(&cdx_info->ctrl.mutex);
+		cdx_ctrl_unlock_with_rtnl();
 	}
 
 	for (ii = init_level - 1; ii >= 0; ii--) {

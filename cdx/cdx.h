@@ -48,6 +48,10 @@
 #define MAX_CDX_INIT_FUNCTIONS  16
 typedef void (*cdx_deinit_func)(void);
 void register_cdx_deinit_func(cdx_deinit_func func);
+/* Enter/leave a configuration or terminal teardown transaction; entry must
+ * hold neither RTNL nor ctrl.mutex. Runtime callbacks use the backend API. */
+void cdx_ctrl_lock_with_rtnl(void);
+void cdx_ctrl_unlock_with_rtnl(void);
 extern atomic_t num_active_connections;
 extern struct cdx_fman_info *fman_info;
 
