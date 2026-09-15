@@ -547,7 +547,10 @@ no longer registered.
 IPv4's built-in nexthop ADD/DEL notifications arise during device/address
 synchronization. They conservatively retire all installed generations, since a
 revived alternative can change a route through another port. They preserve
-bindings and are distinct from the nexthop-object API.
+bindings and are distinct from the nexthop-object API. Object replacement,
+member/bucket changes and deletion conservatively invalidate the whole table;
+statistics queries do not. Recovery requires table recreation after routing
+has settled. Registration dumps before binding and teardown dumps are ignored.
 A watched neighbour's changed MAC, unusable state
 or detached object invalidates only dependent flow generations, including both directions. Their
 cached Linux lookup stops immediately and native GC tears them down. Once
@@ -2161,3 +2164,43 @@ passing hardware/connection evidence.
 KASAN/lockdep diagnostics remain clean, `debug_locks` is 1 and taint is 4096.
 All entries/bindings/references are drained, installs equal deletes, and no
 backend error or quarantine remains. SFP driver/GPIO ownership is restored.
+
+
+## Nexthop-object retirement — verified 2026-09-15
+
+Linux's nexthop-object notifier is separate from built-in FIB nexthop events.
+The adapter now subscribes in init_net and treats every event except the
+read-only hardware statistics query as global invalidation. This covers shared
+objects and resilient groups conservatively, without claiming selective
+member tracking. Registration and unregistration dump existing objects; the
+binding/stopping guards prevent these dumps from poisoning a fresh adapter.
+Initialization failure stage 6 covers this registration, preserving stage 5's
+existing indirect-registration meaning. Unwind and unload remove the notifier
+before releasing the provider claim.
+
+Five focused host checks passed in 1.17 seconds. The DUT object test passed in
+65.51 seconds: reload with an existing object, two-direction UDP and TCP hardware
+forwarding, replace the WAN object with a blackhole, retire all four directions
+and references, and verify no subsequent UDP delivery. Restoring the object
+leaves both existing sockets forwarding in software with global admission still
+closed. Explicit table recreation readmits those same connections. Each hardware
+window verifies 256 exact UDP hits per direction and 4 MiB of TCP per direction.
+Software TX deltas were 4/15 before replacement and 5/15 after recovery. Softirq
+was 0.37%/0.38%; total busy CPU was 18.00%/24.85%, retained without attributing
+that background load. Hardware counters and software TX independently establish
+execution in the hardware path.
+
+The module lifecycle regression passed in 113.01 seconds, including all six
+failed-load stages, provider pinning, healthy and barrier-recovery unload,
+persistent sockets, fresh binding, and eight live-traffic unbind cycles. Final
+KASAN/lockdep diagnostics are clean, debug_locks is 1 and taint is 4096. Bindings,
+entries and references drain to zero, installs equal deletes, and no backend
+errors or quarantine remain. CMM stayed disabled. No full suite was run.
+
+The KASAN image was built and staged, then running IDs were verified: kernel
+`20956f5977ed9aaf15874a317e61941a4d816772`, CDX
+`ed4251e6275e1ecbe06998b28203deb1a659b67a`, adapter
+`a085496c134eedd293fe2a87a438e33a7bac5cb0`. Image SHA-256 is
+`9735596756cd0b54240384386ef45940d177e57d2ed1fe605f17453e047490a6`.
+Artifacts and focused test logs are in `/tmp/ask-flowtable-nexthop/`; build log
+is `/tmp/ask-flowtable-nexthop-build.log` (three existing forced-task warnings).

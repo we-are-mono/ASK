@@ -52,6 +52,8 @@ enum { FIB_EVENT_ENTRY_REPLACE, FIB_EVENT_ENTRY_APPEND, FIB_EVENT_ENTRY_ADD,
        FIB_EVENT_ENTRY_DEL, FIB_EVENT_RULE_ADD, FIB_EVENT_RULE_DEL, FIB_EVENT_NH_ADD, FIB_EVENT_NH_DEL };
 enum { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU, NETDEV_CHANGEADDR,
        NETDEV_CHANGEUPPER, NETDEV_CHANGENAME, NETDEV_REGISTER, NETDEV_CHANGE };
+enum { NEXTHOP_EVENT_DEL, NEXTHOP_EVENT_REPLACE, NEXTHOP_EVENT_RES_TABLE_PRE_REPLACE,
+       NEXTHOP_EVENT_BUCKET_REPLACE, NEXTHOP_EVENT_HW_STATS_REPORT_DELTA };
 struct fib_notifier_info { int family; };
 struct netevent_ipv4_route { struct net *net; __be32 dst; u8 prefixlen; };
 static __be32 inet_make_mask(unsigned plen) { assert(plen <= 32); return htonl(plen ? ~0U << (32 - plen) : 0); }
@@ -347,9 +349,9 @@ static void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats) { 
 struct proc_dir_entry { int unused; };
 static struct proc_dir_entry proc_entry, *ft_proc;
 static int ft_proc_ops;
-static struct notifier_block ft_netdev_nb, ft_neigh_nb, ft_fib_nb;
+static struct notifier_block ft_netdev_nb, ft_neigh_nb, ft_fib_nb, ft_nexthop_nb;
 static unsigned registration_step, registration_failure, canceled;
-static bool backend_claimed, netdev_registered, neigh_registered, fib_registered, indirect_registered;
+static bool backend_claimed, netdev_registered, neigh_registered, fib_registered, nexthop_registered, indirect_registered;
 static bool owner_enabled = true;
 static bool registration_fails(void) { return ++registration_step == registration_failure; }
 static struct proc_dir_entry *proc_create(const char *name, int mode, void *parent, void *ops)
@@ -373,6 +375,10 @@ static int register_netevent_notifier(struct notifier_block *nb)
 { if (registration_fails()) return -ENOMEM; neigh_registered=true; return 0; }
 static int register_fib_notifier(struct net *net, struct notifier_block *nb, void *cb, void *extack)
 { if (registration_fails()) return -ENOMEM; fib_registered=true; return 0; }
+static int register_nexthop_notifier(struct net *net, struct notifier_block *nb, void *extack)
+{ assert(net == &init_net && !cdx_info->ctrl.mutex); if (registration_fails()) return -ENOMEM; nexthop_registered=true; return 0; }
+static void unregister_nexthop_notifier(struct net *net, struct notifier_block *nb)
+{ assert(net == &init_net && nexthop_registered && !cdx_info->ctrl.mutex); nexthop_registered=false; }
 static void unregister_netdevice_notifier(struct notifier_block *nb)
 { assert(netdev_registered); netdev_registered=false; }
 static void unregister_netevent_notifier(struct notifier_block *nb)
@@ -386,7 +392,7 @@ static int register_indirect(void)
 static void unregister_indirect(void)
 {
     assert(indirect_registered && canceled == 2 && !cdx_info->ctrl.mutex);
-    assert(!netdev_registered && !neigh_registered && !fib_registered);
+    assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered);
     while (ft_block_list.next != &ft_block_list) {
         struct flow_block_cb *cb = list_entry(ft_block_list.next, struct flow_block_cb, driver_list);
         list_del(&cb->driver_list); list_del(&cb->list);
@@ -1229,9 +1235,22 @@ static void test_device_recovery(void)
     assert(ft_installs == ft_deletes && !allocated);
 }
 
+static void test_nexthop_objects(void)
+{
+    unsigned long events[] = {NEXTHOP_EVENT_DEL, NEXTHOP_EVENT_REPLACE,
+        NEXTHOP_EVENT_RES_TABLE_PRE_REPLACE, NEXTHOP_EVENT_BUCKET_REPLACE, 999};
+    ft_invalid = 0;
+    assert(ft_nexthop_event(NULL, NEXTHOP_EVENT_HW_STATS_REPORT_DELTA, NULL) == NOTIFY_DONE);
+    assert(!ft_invalid);
+    for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
+        assert(ft_nexthop_event(NULL, events[i], NULL) == NOTIFY_DONE);
+        assert(ft_invalid); ft_invalid = 0;
+    }
+}
+
 static void test_registration(void)
 {
-    for (registration_failure = 0; registration_failure <= 6; registration_failure++) {
+    for (registration_failure = 0; registration_failure <= 7; registration_failure++) {
         /* A fresh adapter instance, backed by an independently owned CDX. */
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         fixture();
@@ -1250,16 +1269,16 @@ static void test_registration(void)
             assert(handle.invalid && unload_sleeps == 2);
         }
         assert(!ft_proc && !ft_ready && !backend_claimed && !live_hw && !allocated);
-        assert(!netdev_registered && !neigh_registered && !fib_registered && !indirect_registered);
+        assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
         assert(!ft_count && !ft_bound && !ft_neighbour_refs && !ft_handle_refs);
         assert(!in.refs && !out.refs && !cdx_info->ctrl.mutex);
     }
     registration_failure=0;
-    for (ft_init_fail_stage=1; ft_init_fail_stage<=5; ft_init_fail_stage++) {
+    for (ft_init_fail_stage=1; ft_init_fail_stage<=6; ft_init_fail_stage++) {
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         assert(ask_flowtable_init() == -ENOMEM);
         assert(!ft_ready && !ft_proc && !backend_claimed && !cdx_info->ctrl.mutex);
-        assert(!netdev_registered && !neigh_registered && !fib_registered && !indirect_registered);
+        assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
     }
     ft_init_fail_stage=0;
     /* Fatal deletion on exit still waits for quiescence. Reload is refused. */
@@ -1368,6 +1387,7 @@ int main(void)
     test_device_dependencies();
     test_device_recovery();
     test_transient_admission();
+    test_nexthop_objects();
     test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

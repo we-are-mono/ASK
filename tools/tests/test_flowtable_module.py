@@ -58,7 +58,7 @@ async def test_flowtable_module_lifecycle(connections):
             assert reply["errno"] == errno.EOPNOTSUPP, reply
 
         failures = []
-        for stage in range(1, 6):
+        for stage in range(1, 7):
             result = await console_command(con, "modprobe", "ask_flowtable", f"init_fail_stage={stage}", check=False)
             assert result["rc"] != 0, result
             await absent()

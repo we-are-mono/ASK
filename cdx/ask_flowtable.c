@@ -23,6 +23,7 @@
 #include <net/fib_notifier.h>
 #include <net/flow_offload.h>
 #include <net/netevent.h>
+#include <net/nexthop.h>
 #include <net/route.h>
 #include <net/tcp.h>
 #include <net/netfilter/nf_conntrack.h>
@@ -39,7 +40,7 @@
 static unsigned int ft_fail_stage;
 static unsigned int ft_init_fail_stage;
 module_param_named(init_fail_stage, ft_init_fail_stage, uint, 0444);
-MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration");
+MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration, 6 nexthop objects");
 module_param_named(flowtable_fail_stage, ft_fail_stage, uint, 0600);
 MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocation, 2 before hardware, 3 after hardware, 4 busy after peer direction");
 #endif
@@ -951,9 +952,23 @@ static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *pt
 	return NOTIFY_DONE;
 }
 
+static int ft_nexthop_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	/* The nexthop-object API is separate from FIB_EVENT_NH_*. Replacing
+	 * a shared member or resilient bucket can redirect installed flows
+	 * without changing a FIB alias. Until these dependencies are tracked,
+	 * require full table recreation. Statistics queries change no route.
+	 * Registration/unregistration dumps are harmless before first bind or
+	 * after ft_stopping; ft_invalidate() enforces those lifetime guards. */
+	if (event != NEXTHOP_EVENT_HW_STATS_REPORT_DELTA)
+		ft_invalidate();
+	return NOTIFY_DONE;
+}
+
 static struct notifier_block ft_netdev_nb = { .notifier_call = ft_netdev_event };
 static struct notifier_block ft_neigh_nb = { .notifier_call = ft_neigh_event };
 static struct notifier_block ft_fib_nb = { .notifier_call = ft_fib_event };
+static struct notifier_block ft_nexthop_nb = { .notifier_call = ft_nexthop_event };
 
 static int ft_show(struct seq_file *seq, void *unused)
 {
@@ -1025,11 +1040,16 @@ static int __init ask_flowtable_init(void)
 	rc = ft_init_fault(4) ? -ENOMEM : register_fib_notifier(&init_net, &ft_fib_nb, NULL, NULL);
 	if (rc)
 		goto neigh;
+	rc = ft_init_fault(6) ? -ENOMEM : register_nexthop_notifier(&init_net, &ft_nexthop_nb, NULL);
+	if (rc)
+		goto fib;
 	WRITE_ONCE(ft_ready, true);
 	rc = ft_init_fault(5) ? -ENOMEM : flow_indr_dev_register(ft_bind, NULL);
 	if (!rc)
 		return 0;
 	WRITE_ONCE(ft_ready, false);
+	unregister_nexthop_notifier(&init_net, &ft_nexthop_nb);
+fib:
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 neigh:
 	unregister_netevent_notifier(&ft_neigh_nb);
@@ -1060,6 +1080,7 @@ static void __exit ask_flowtable_exit(void)
 	list_for_each_entry(entry, &ft_entries, list)
 		nf_flow_offload_handle_invalidate(entry->handle);
 	cdx_ft_end();
+	unregister_nexthop_notifier(&init_net, &ft_nexthop_nb);
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
 	unregister_netdevice_notifier(&ft_netdev_nb);
