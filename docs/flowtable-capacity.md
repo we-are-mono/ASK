@@ -112,3 +112,79 @@ not substitute for a long-duration soak or capacity proofs for future features.
 An unpaced simultaneous restart after full route retirement produced material
 UDP loss during readmission; see the [development evidence](flowtable/history/capacity.md#development-failures-and-link-observations).
 Lossless recovery under that burst is outside the accepted paced workload.
+The software-flowtable control reproduced the loss with hardware admission
+disabled; investigation is deferred as **A139** in [ISSUES.md](../ISSUES.md).
+
+## Sustained connection churn
+
+The separate opt-in churn test holds 16,384 mixed TCP/UDP connections through
+native MASQUERADE, with CMM off. It keeps 256 connections alive throughout and
+rotates the other 16,128 in groups of 256. Each round retires 64 TCP connections
+through FIN, 64 through RST and 128 UDP connections, then reopens the exact
+tuples. Every eighth round waits for idle UDP **flowtable** expiry; other rounds
+delete the exact UDP conntracks through acknowledged netlink requests. Idle
+flowtable expiry does not imply that the Linux conntrack has expired.
+
+The full hardware budget stays at 32,768 directions. Each round must free
+exactly 512 directions and return to full occupancy, preserving every unaffected
+cookie and accounting for any documented provisional-admission recovery.
+The permanent survivors must advance their hardware counters each round.
+These counters see software flowtable transmission as well as ordinary routed
+transmission; initial software exchanges must hit both to validate the matches.
+The ordinary forward-hook counter is recorded separately. Ten-second
+windows before and after churn verify hardware progress for every direction,
+software TX and CPU. TCP FIN/RST forward-hook counters independently verify
+the expected close operations reached Linux.
+
+Linux owns flow lifetime, and it can retire a live flow this round never
+touched. A hardware-owned flow keeps its deadline only through a stats round
+trip, which the flowtable core queues in the last tenth of the flow timeout and
+skips while any offload work for that flow is still pending; every such read
+shares one hardware transaction with this workload's installs and retirements.
+A starved refresh therefore retires a healthy flow, which forwards in software
+and returns to hardware with a fresh cookie on its next packet. The test does
+not assert a race-free window. It requires the adapter to have retired nothing
+on its own initiative — every counter describing an adapter-driven retirement is
+frozen across the retirement — attributes each unrequested install to exactly
+one surviving tuple whose identity changed, and bounds that turnover per round
+and across the run. A survivor is entitled to forward-hook packets only when it
+is one of those tuples, and only a fixed number per readmission; with none, both
+its forward-hook and netdev egress counters stay exact. `/proc/net/stat/nf_flowtable`
+(`CONFIG_NF_FLOW_TABLE_PROCFS`) records the offload backlog each round.
+The underlying refresh cost is tracked separately as an open issue.
+
+The offload timeouts are raised for the run — TCP to 120 seconds, UDP to 30 —
+so the refresh window is not routinely starved. A conntrack Linux has already
+reclaimed when the test goes to delete it reaches the same postcondition and is
+counted rather than treated as a failed deletion.
+
+The traffic peer carries its payload serial forward when reconnecting and checks
+it against the receiver's previous count. Overlapping TCP generations are
+rejected. Every received payload is checked for identity and contents. The UDP
+loss allowance is the same explicit bound used by the capacity test. Both
+endpoints retain bounded per-connection bookkeeping; the long-running UDP echo
+receiver counts packets without retaining every complete datagram.
+
+Each completed round records ownership, delivery, CPU, software TX, offload
+backlog, turnover, conntrack count, memory and allocator data. The test bounds conntracks to the workload
+plus 1,024 background entries and flags more than 32 MiB of unreclaimable-slab
+growth between settled sample groups. That coarse memory guard is supplemented
+by exact backend ownership checks and a scoped kmemleak scan after closing peers
+and deleting test conntracks. Warm allocator caches need not return every page
+to the free list. Final hardware installs/deletes must balance, with zero
+entries, bindings, neighbour/shared-handle references, errors or quarantine.
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_FLOWTABLE_CHURN=1 ASK_WAN_IPERF_IP=10.0.0.232 \
+  ASK_FLOWTABLE_SPORT=54900 \
+  ASK_FLOWTABLE_ARTIFACTS=/tmp/ask-flowtable-churn/proof \
+  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_sustained_churn'
+```
+
+The default is **900 seconds of churn**, plus setup, final hardware verification,
+teardown and leak scanning. Every rotating tuple must be visited in the default
+run. `ASK_FLOWTABLE_CHURN_SECONDS=60` selects a development smoke check and does
+not satisfy that acceptance duration or coverage. Rounds are paced, taking at
+least four seconds each; expiry and hardware convergence can take longer.
+This is a bounded lifecycle proof, not a maximum connection-admission-rate
+benchmark or a multi-day endurance claim.

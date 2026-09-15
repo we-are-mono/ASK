@@ -64,7 +64,7 @@ class Flow:
             except BaseException:
                 sock.close()
                 raise
-            self.writer.write(json.dumps({"id": self.spec["id"]}).encode() + b"\n")
+            self.writer.write(json.dumps({"id": self.spec["id"], "serial": self.serial}).encode() + b"\n")
             await self.writer.drain()
         else:
             with namespace(self.spec):

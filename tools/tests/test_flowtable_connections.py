@@ -89,22 +89,30 @@ class Peer:
 
 
 @asynccontextmanager
-async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_size=TCP_SIZE):
+async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_size=TCP_SIZE,
+               reconnect=False):
     specs = {f["id"]: f for f in flows}
     accepted = asyncio.Queue()
     tasks, writers, errors, tcp_counts = set(), set(), [], {}
+    active_ids = set()
     control_server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT + 1, limit=8 << 20)
     server = task = controller = None
 
     async def echo(reader, writer):
         writers.add(writer)
         ident = None
+        owns_id = False
         try:
-            ident = json.loads(await asyncio.wait_for(reader.readline(), 10))["id"]
+            hello = json.loads(await asyncio.wait_for(reader.readline(), 10))
+            ident = hello["id"]
             assert ident in specs and specs[ident]["proto"] == "tcp"
             assert writer.get_extra_info("peername") == tuple(specs[ident].get("remote", (specs[ident].get("lan", r.lan_ip), specs[ident]["sport"])))
-            assert ident not in tcp_counts
-            tcp_counts[ident] = 0
+            assert ident not in active_ids, (ident, "overlapping TCP generations")
+            assert reconnect or ident not in tcp_counts
+            assert hello["serial"] == tcp_counts.get(ident, 0), (ident, hello, tcp_counts.get(ident))
+            tcp_counts.setdefault(ident, 0)
+            active_ids.add(ident)
+            owns_id = True
             while True:
                 try:
                     data = await reader.readexactly(tcp_size)
@@ -128,6 +136,8 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
                 if ident not in specs or not specs[ident].get("abort"):
                     errors.append((ident, "unexpected reset on close"))
             writers.discard(writer)
+            if owns_id:
+                active_ids.remove(ident)
 
     def accept(reader, writer):
         job = asyncio.create_task(echo(reader, writer))

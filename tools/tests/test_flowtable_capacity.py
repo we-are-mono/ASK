@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 from pathlib import Path
@@ -36,7 +37,7 @@ def socket_drops(sock):
     raise AssertionError(("UDP socket missing", inode))
 
 
-async def delete_udp(r, sport):
+async def delete_udp(r, sport, *, allow_missing=False):
     # conntrack(8)'s filtered deletion dumps the entire table per invocation.
     # Use the existing agent's raw netlink transport for an exact original
     # tuple deletion (nfnetlink_conntrack.h), checking its kernel ACK.
@@ -52,7 +53,14 @@ async def delete_udp(r, sport):
     result = await r.target.netlink_send(r.session, 12, body, nlmsg_type=0x102, nlmsg_flags=5)
     reply = bytes.fromhex(result["reply_hex"])
     assert len(reply) >= 20 and struct.unpack_from("=H", reply, 4)[0] == 2, result
-    assert struct.unpack_from("=i", reply, 16)[0] == 0, (sport, result)
+    error = struct.unpack_from("=i", reply, 16)[0]
+    # A conntrack Linux has already reclaimed leaves the intended postcondition
+    # in place. Callers that accept that must still count how often it happens;
+    # silently tolerating it everywhere would hide a table that never filled.
+    if allow_missing and error == -errno.ENOENT:
+        return False
+    assert error == 0, (sport, result)
+    return True
 
 
 async def lan_counters(r):
@@ -138,18 +146,37 @@ def record_delivery(r, p, label, reports):
     r.record(label, {"reports": reports, **delivery(p, reports)})
 
 
-async def hardware_window(r, before, label):
+async def hardware_window(r, before, label, *, turnover=0):
+    # Linux can retire and readmit a live flow on its own initiative; `turnover`
+    # is how many directions this window tolerates doing so. It defaults to none,
+    # so a caller that expects a completely static table still gets that.
     tx0, cpu0 = await software_tx(r), await cpu(r)
     await asyncio.sleep(10)
     cpu1, tx1 = await cpu(r), await software_tx(r)
     after = await r.state()
-    unchanged(before, after)
-    assert after["installs"] == before["installs"] and after["deletes"] == before["deletes"]
-    old = by_key(before)
-    assert all(int(f["packets"]) > int(old[k]["packets"]) for k, f in by_key(after).items())
+    old, new = by_key(before), by_key(after)
+    # A recycled cookie cannot identify a new generation on its own; a restarted
+    # packet count can. See the same reasoning in the churn proof.
+    regenerated = {k for k in new.keys() & old.keys()
+                   if new[k]["cookie"] != old[k]["cookie"]
+                   or int(new[k]["packets"]) < int(old[k]["packets"])}
     tx = {dev: tx1[dev] - tx0[dev] for dev in tx0}
+    # Record before asserting: a window that loses or turns over a flow is
+    # exactly the one whose evidence is worth keeping.
+    r.record(label, {"state": after, "software_tx": tx, "cpu": cpu_delta(cpu0, cpu1),
+                     "regenerated": sorted(regenerated),
+                     "missing": sorted(old.keys() - new.keys()),
+                     "unexpected": sorted(new.keys() - old.keys()),
+                     "installs": after["installs"] - before["installs"],
+                     "deletes": after["deletes"] - before["deletes"]})
+    assert new.keys() == old.keys(), sorted(set(new) ^ set(old))
+    assert len(regenerated) <= turnover, sorted(regenerated)
+    unchanged(before, after, excluded={old[k]["cookie"] for k in regenerated})
+    assert after["installs"] - before["installs"] == len(regenerated), (before, after)
+    assert after["deletes"] - before["deletes"] == len(regenerated), (before, after)
+    assert all(int(f["packets"]) > int(old[k]["packets"])
+               for k, f in new.items() if k not in regenerated)
     assert all(0 <= n <= 128 for n in tx.values()), tx
-    r.record(label, {"state": after, "software_tx": tx, "cpu": cpu_delta(cpu0, cpu1)})
     return after
 
 

@@ -119,12 +119,16 @@ def status_text(text):
 class Echo(asyncio.DatagramProtocol):
     def __init__(self):
         self.received = Counter()
+        self.record_payloads = True
+        self.packets = 0
 
     def connection_made(self, transport):
         self.transport = transport
 
     def datagram_received(self, data, addr):
-        self.received[data] += 1
+        self.packets += 1
+        if self.record_payloads:
+            self.received[data] += 1
         self.transport.sendto(data, addr)
 
 
