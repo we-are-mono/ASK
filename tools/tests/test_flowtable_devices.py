@@ -9,7 +9,7 @@ import pytest
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import FLOWS, by_key, connections, peer  # noqa: F401
 from test_flowtable_module import table
-from test_flowtable_offload import command, rename_roundtrip, rig  # noqa: F401
+from test_flowtable_offload import command, upper_roundtrip, rig  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_tcp import software_tx
 
@@ -67,12 +67,14 @@ async def test_flowtable_device_dependencies(connections):
             r.record("devices-unrelated-transfers", reports)
             await hardware(r, p, "devices-unrelated-hardware", flows)
 
-            # Rename remains a conservative event on either real port. MTU
-            # changes have a separate automatic recovery proof.
+            # Upper-device changes remain conservative on either real port.
+            # MTU, MAC and link recovery have separate proofs.
             for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
                 before = await r.state()
-                await p.rpc("start", ids, count=0, interval=0.01)
-                await rename_roundtrip(r, dev)
+                # Enslaving the port temporarily removes its routed path.
+                await p.rpc("start", [0], count=0, interval=0.01, allow_loss=True)
+                await p.rpc("start", [1], count=0, interval=0.01)
+                await upper_roundtrip(r, dev)
                 retired = await r.wait(lambda s: s["invalidation_done"] == 1 and not s["entries"])
                 assert retired["invalidated"] == 1 and retired["bindings"] == 2, retired
                 assert retired["handle_refs"] == retired["neighbour_refs"] == retired["quarantine"] == 0, retired

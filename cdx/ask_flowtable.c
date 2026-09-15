@@ -88,6 +88,7 @@ static atomic64_t ft_neigh_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_route_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mtu_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_link_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_mac_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping;
@@ -402,11 +403,12 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_port_supported(action->dev) ||
 	    !cdx_ft_port_supported(binding->dev) || action->dev == binding->dev ||
 	    !is_valid_ether_addr(ethernet) ||
-	    !ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr) ||
 	    !ft_next_hop(cls, action->dev, ipv4.key->dst, next_hop) ||
 	    !ft_neigh_check(action->dev, *next_hop, ethernet) ||
 	    cls->nf_mtu > action->dev->mtu || cls->nf_mtu < 68)
 		return -EOPNOTSUPP;
+	if (!ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr))
+		return -ESTALE;
 	memset(out, 0, sizeof(*out));
 	out->in = binding->dev;
 	out->out = action->dev;
@@ -441,6 +443,8 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
 		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
 	rc = ft_parse(binding, cls, &rule, &next_hop);
+	if (rc == -ESTALE)
+		ft_handle_invalidate(cls->nf_handle, &ft_mac_invalidations);
 	if (!rc)
 		ft_validated++;
 	if (rc || cdx_ft_observing() || atomic_read(&ft_invalid) || ft_stopping || cdx_ft_failed()) {
@@ -767,35 +771,49 @@ static bool ft_device_used(const struct net_device *dev)
 	return false;
 }
 
+static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
+{
+	struct cdx_ft_entry *entry;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
+		if (entry->rule.in == dev || entry->rule.out == dev)
+			ft_handle_invalidate(entry->handle, counter);
+	spin_unlock_bh(&ft_watch_lock);
+}
+
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
-	struct cdx_ft_entry *entry;
 
 	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
 	switch (event) {
+	case NETDEV_CHANGE:
+		if (netif_running(dev) && netif_carrier_ok(dev))
+			break;
+		fallthrough;
 	case NETDEV_GOING_DOWN:
+		/* Native DOWN also flushes flowtable work. Admission rechecks
+		 * both ports under RTNL; UP never clears failure state. */
+		ft_device_retire(dev, &ft_link_invalidations);
+		break;
 	case NETDEV_CHANGEMTU:
-		/* Retire the affected generations, leaving bindings available for
-		 * fresh Linux flows. DOWN also flushes native flowtable work; the
-		 * backend refuses admission while either port is not running.
-		 * IPv4 flushes route caches under the MTU event's
-		 * RTNL; admission rechecks both dsts after taking RTNL, so queued
-		 * pre-change requests cannot publish stale MTUs. Empty bindings
-		 * need no recovery. Never clear a global or fatal invalidation. */
-		spin_lock_bh(&ft_watch_lock);
-		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-			if (entry->rule.in == dev || entry->rule.out == dev)
-				ft_handle_invalidate(entry->handle,
-					event == NETDEV_CHANGEMTU ? &ft_mtu_invalidations :
-					&ft_link_invalidations);
-		spin_unlock_bh(&ft_watch_lock);
+		/* IPv4 flushes route caches under this event's RTNL. Admission
+		 * rechecks both destinations before publishing queued context. */
+		ft_device_retire(dev, &ft_mtu_invalidations);
+		break;
+	case NETDEV_CHANGEADDR:
+		/* NEIGH software output uses the current MAC. Reject a queued
+		 * stale hardware source too, invalidating its entire generation. */
+		ft_device_retire(dev, &ft_mac_invalidations);
+		break;
+	case NETDEV_CHANGENAME:
+		/* Names carry no forwarding semantics; backend lookup uses the
+		 * pinned physical device, including after table recreation. */
 		break;
 	case NETDEV_UNREGISTER:
-	case NETDEV_CHANGEADDR:
 	case NETDEV_CHANGEUPPER:
-	case NETDEV_CHANGENAME:
 		spin_lock_bh(&ft_watch_lock);
 		/* Latch before releasing the watch lock: a concurrent last unbind
 		 * and fresh bind must not redirect this event to a new table. */
@@ -909,7 +927,7 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\n",
 		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -918,7 +936,8 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   atomic64_read(&ft_neigh_invalidations),
 		   atomic64_read(&ft_route_invalidations),
 		   atomic64_read(&ft_mtu_invalidations),
-		   atomic64_read(&ft_link_invalidations));
+		   atomic64_read(&ft_link_invalidations),
+		   atomic64_read(&ft_mac_invalidations));
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",

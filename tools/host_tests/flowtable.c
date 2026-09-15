@@ -51,7 +51,7 @@ typedef uint64_t u64, atomic64_t;
 enum { FIB_EVENT_ENTRY_REPLACE, FIB_EVENT_ENTRY_APPEND, FIB_EVENT_ENTRY_ADD,
        FIB_EVENT_ENTRY_DEL, FIB_EVENT_RULE_ADD, FIB_EVENT_RULE_DEL, FIB_EVENT_NH_ADD, FIB_EVENT_NH_DEL };
 enum { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU, NETDEV_CHANGEADDR,
-       NETDEV_CHANGEUPPER, NETDEV_CHANGENAME, NETDEV_REGISTER };
+       NETDEV_CHANGEUPPER, NETDEV_CHANGENAME, NETDEV_REGISTER, NETDEV_CHANGE };
 struct fib_notifier_info { int family; };
 struct netevent_ipv4_route { struct net *net; __be32 dst; u8 prefixlen; };
 static __be32 inet_make_mask(unsigned plen) { assert(plen <= 32); return htonl(plen ? ~0U << (32 - plen) : 0); }
@@ -91,7 +91,10 @@ struct flow_block_cb {
 };
 struct net { int id; };
 static struct net init_net;
-struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; };
+struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down; };
+#define netif_carrier_ok(d) (!(d)->carrier_lost)
+#define netif_running(d) (!(d)->down)
+#define fallthrough __attribute__((fallthrough))
 #define dev_net(d) ((d)->net ? (d)->net : &init_net)
 struct netdev_notifier_info { struct net_device *dev; };
 #define netdev_notifier_info_to_dev(p) (((struct netdev_notifier_info *)(p))->dev)
@@ -213,7 +216,7 @@ static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
@@ -1011,8 +1014,7 @@ static void test_device_dependencies(void)
     struct net other_net;
     /* The same ifindex on another object must not match the bound port. */
     struct net_device unrelated = { .ifindex = in.ifindex };
-    unsigned long events[] = { NETDEV_UNREGISTER,
-                              NETDEV_CHANGEADDR, NETDEV_CHANGEUPPER, NETDEV_CHANGENAME };
+    unsigned long events[] = { NETDEV_UNREGISTER, NETDEV_CHANGEUPPER };
     fixture();
     assert(!ft_bound && !ft_count && !ft_invalid);
     for (unsigned i = 0; i < ARRAY_SIZE(events); i++) device_event(&in, events[i], false);
@@ -1023,7 +1025,7 @@ static void test_device_dependencies(void)
         device_event(&unrelated, events[i], false);
     }
     in.net = &other_net;
-    device_event(&in, NETDEV_CHANGENAME, false);
+    device_event(&in, NETDEV_CHANGEUPPER, false);
     in.net = NULL;
     device_event(&in, NETDEV_REGISTER, false);
     struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
@@ -1034,16 +1036,16 @@ static void test_device_dependencies(void)
         device_event(&in, events[i], true);
         device_event(&unrelated, events[i], false);
     }
-    device_event(&out, NETDEV_CHANGENAME, true);
+    device_event(&out, NETDEV_CHANGEUPPER, true);
     ft_invalidate_work(NULL);
     assert(ft_invalid_done && !ft_count && !ft_handle_refs && !ft_neighbour_refs && !out.refs);
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
     assert(!ft_bound && !in.refs && !allocated && !live_hw);
     /* No stale watch can follow the released binding into its replacement. */
     assert(bind_device(&unrelated, FLOW_BLOCK_BIND) == 0);
-    device_event(&in, NETDEV_CHANGENAME, false);
-    device_event(&out, NETDEV_CHANGENAME, false);
-    device_event(&unrelated, NETDEV_CHANGENAME, true);
+    device_event(&in, NETDEV_CHANGEUPPER, false);
+    device_event(&out, NETDEV_CHANGEUPPER, false);
+    device_event(&unrelated, NETDEV_CHANGEUPPER, true);
     ft_invalid = 0;
     assert(bind_device(&unrelated, FLOW_BLOCK_UNBIND) == 0);
     assert(!unrelated.refs && !ft_bound && !allocated);
@@ -1068,10 +1070,11 @@ static void test_device_recovery(void)
     struct fib_notifier_info policy = { .family = AF_INET };
     u64 rearms = ft_rearms;
 
-    unsigned long events[] = {NETDEV_CHANGEMTU, NETDEV_GOING_DOWN};
+    unsigned long events[] = {NETDEV_CHANGEMTU, NETDEV_GOING_DOWN, NETDEV_CHANGEADDR};
     for (unsigned e = 0; e < ARRAY_SIZE(events); e++) {
         unsigned long event = events[e];
-        u64 *counter = event == NETDEV_CHANGEMTU ? &ft_mtu_invalidations : &ft_link_invalidations;
+        u64 *counter = event == NETDEV_CHANGEMTU ? &ft_mtu_invalidations :
+                       event == NETDEV_CHANGEADDR ? &ft_mac_invalidations : &ft_link_invalidations;
         for (unsigned tcp = 0; tcp < 2; tcp++) {
             for (unsigned egress = 0; egress < 2; egress++) {
                 struct nf_flow_offload_handle queued = {1, false}, fresh = {1, false};
@@ -1085,6 +1088,10 @@ static void test_device_recovery(void)
                 assert(ft_replace(b, &cls) == 0);
                 cls.cookie++; pk.src++;
                 assert(ft_replace(b, &cls) == 0); /* Two entries share one flow generation. */
+                info.dev = &out;
+                ft_netdev_event(NULL, NETDEV_CHANGENAME, &info);
+                ft_netdev_event(NULL, NETDEV_CHANGE, &info);
+                assert(!handle.invalid && !ft_invalid); /* Same object, healthy carrier. */
                 info.dev = &unrelated;
                 ft_netdev_event(NULL, event, &info);
                 info.dev = &in; in.net = &other_net;
@@ -1130,6 +1137,20 @@ static void test_device_recovery(void)
             }
         }
     }
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    info.dev = &out; out.carrier_lost = true;
+    ft_netdev_event(NULL, NETDEV_CHANGE, &info);
+    assert(handle.invalid && !ft_invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ft_handle_refs && !allocated);
+    out.carrier_lost = false;
+    fixture();
+    out.dev_addr[5] ^= 1;
+    u64 macs = ft_mac_invalidations;
+    assert(ft_replace(&binding, &cls) == -ESTALE && handle.invalid);
+    assert(!ft_count && !ft_invalid && ft_mac_invalidations == macs + 1);
+    out.dev_addr[5] ^= 1;
     for (unsigned fatal = 0; fatal < 2; fatal++) {
         fixture();
         assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);

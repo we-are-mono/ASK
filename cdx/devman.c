@@ -436,6 +436,20 @@ struct dpa_iface_info *dpa_get_ifinfo_by_itfid(uint32_t itf_id)
 	return iface_info;
 }
 
+/* Physical identity survives an OS rename. The control transaction prevents
+ * interface removal; all physical records exist before adapter claim. */
+struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev)
+{
+	struct dpa_iface_info *iface;
+
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+	for (iface = dpa_interface_info; iface; iface = iface->next)
+		if ((iface->if_flags & IF_TYPE_ETHERNET) &&
+		    iface->eth_info.net_dev == dev)
+			return iface;
+	return NULL;
+}
+
 /* get dpa_info by portid */
 struct dpa_iface_info *dpa_get_ohifinfo_by_portid(uint32_t portid)
 {
@@ -2946,7 +2960,9 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 		if (!iface_info)
 			break;		
 		//check if this the iface we want
-		if (strcmp(dev->name, iface_info->name)) {
+		if ((iface_info->if_flags & IF_TYPE_ETHERNET) ?
+		    iface_info->eth_info.net_dev != dev :
+		    strcmp(dev->name, iface_info->name)) {
 			iface_info = iface_info->next;
 			continue;
 		}

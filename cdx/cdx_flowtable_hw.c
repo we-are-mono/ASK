@@ -3,6 +3,7 @@
  * hash, route hash, CMM notification, or ageing timer owns these objects. */
 #include <linux/etherdevice.h>
 #include <linux/module.h>
+#include "portdefs.h"
 #include "cdx.h"
 #include "control_ipv4.h"
 #include "fm_ehash.h"
@@ -38,6 +39,7 @@ static bool ft_unlink_fault(void)
 int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 {
 	POnifDesc in, out;
+	struct dpa_iface_info *in_iface, *out_iface;
 	struct cdx_ft_hw *hw;
 	PCtEntry ct;
 
@@ -45,11 +47,26 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	*result = NULL;
 	if (rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP)
 		return -EOPNOTSUPP;
-	in = get_onif_by_name(rule->in->name);
-	out = get_onif_by_name(rule->out->name);
-	if (!in || !out || in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
+	in_iface = dpa_get_ifinfo_by_netdev(rule->in);
+	out_iface = dpa_get_ifinfo_by_netdev(rule->out);
+	if (!in_iface || !out_iface || in_iface->itf_id >= L2_MAX_ONIF ||
+	    out_iface->itf_id >= L2_MAX_ONIF)
+		return -EOPNOTSUPP;
+	in = get_onif_by_index(in_iface->itf_id);
+	out = get_onif_by_index(out_iface->itf_id);
+	if (!(in->flags & ENTRY_VALID) || !(out->flags & ENTRY_VALID) ||
+	    !in->itf || !out->itf ||
+	    in->itf->index != in_iface->itf_id || out->itf->index != out_iface->itf_id ||
+	    in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
 	    out->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
 		return -EOPNOTSUPP;
+	/* The legacy encoder obtains its Ethernet source from this cache.
+	 * Admission validated the requested MAC under RTNL; synchronize the
+	 * cache under its reader lock before encoding the new direction.
+	 * Legacy control is sealed throughout this ownership mode. */
+	spin_lock(&dpa_devlist_lock);
+	ether_addr_copy(out_iface->eth_info.mac_addr, rule->src_mac);
+	spin_unlock(&dpa_devlist_lock);
 	hw = kzalloc(sizeof(*hw), GFP_KERNEL);
 	if (!hw)
 		return -ENOMEM;

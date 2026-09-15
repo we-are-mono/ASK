@@ -128,16 +128,19 @@ bool cdx_ft_port_supported(struct net_device *dev)
 	cdx_ft_assert_held();
 	if (!dev || !net_eq(dev_net(dev), &init_net) ||
 	    dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN ||
+	    dev->reg_state != NETREG_REGISTERED ||
 	    netif_is_bridge_port(dev) || netif_is_l3_slave(dev) ||
-	    !netif_running(dev) || !netif_carrier_ok(dev) ||
-	    !ether_addr_equal(dev->dev_addr, dev->perm_addr))
+	    !netif_running(dev) || !netif_carrier_ok(dev))
 		return false;
-	onif = get_onif_by_name(dev->name);
-	if (!onif || onif->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
+	iface = dpa_get_ifinfo_by_netdev(dev);
+	if (!iface || iface->itf_id >= L2_MAX_ONIF)
 		return false;
-	/* A reused name does not establish physical-port identity. */
-	iface = dpa_get_ifinfo_by_itfid(onif->itf->index);
-	return iface && iface->eth_info.net_dev == dev;
+	onif = get_onif_by_index(iface->itf_id);
+	if (!(onif->flags & ENTRY_VALID) || !onif->itf ||
+	    onif->itf->index != iface->itf_id ||
+	    onif->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
+		return false;
+	return true;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_port_supported, ASK_CDX_FLOWTABLE);
 
@@ -150,6 +153,7 @@ int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	*result = NULL;
 	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||
 	    !cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out) ||
+	    !ether_addr_equal(rule->src_mac, rule->out->dev_addr) ||
 	    rule->in == rule->out)
 		return -EOPNOTSUPP;
 	rc = cdx_ft_hw_add(rule, result);

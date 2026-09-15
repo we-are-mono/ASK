@@ -524,15 +524,23 @@ must also match the netdevice recorded by CDX, not merely its name. Flowtables
 must be bound after CDX initializes; incomplete indirect replay requests are
 declined.
 
-Initial-netns routing-policy events and relevant interface unregister,
-MAC, rename, or upper-device changes conservatively disable hardware admission
+Initial-netns routing-policy events and relevant interface unregister or
+upper-device changes conservatively disable hardware admission
 until the recovery boundary below. Committed IPv4 route changes invalidate
 connections with either endpoint in the changed prefix, conservatively across
 all tables and DSCP aliases. Physical-port MTU changes invalidate generations
 with that device as ingress or egress, preserving the table for automatic
 readmission with current route MTUs. Going-down notifications use the same
 per-device generation retirement; native DOWN also flushes Linux flowtable work.
-The backend refuses admission while either port is down or lacks carrier.
+Carrier loss also retires dependent generations. Physical MAC changes retire
+both directions for automatic readmission with the current source address.
+Queued requests with a stale source MAC invalidate their generation. The
+firmware encoder's physical source cache is synchronized under its reader lock
+within the admission transaction and RTNL. An OS rename preserves existing
+entries and fresh binding because physical lookup and statistics use the pinned
+device object, independent of its current name.
+The backend refuses admission while either port is down, lacks carrier, or is
+no longer registered.
 IPv4's built-in nexthop ADD/DEL notifications arise during device/address
 synchronization. They conservatively retire all installed generations, since a
 revived alternative can change a route through another port. They preserve
@@ -1963,3 +1971,68 @@ reconfiguration and resource-pressure acceptance. Each increment is proved and
 committed separately. Validation on a second kernel version is explicitly
 excluded from this foundation work at the user's request. NAT, IPv6 and broader
 traffic features remain subsequent work.
+
+
+## Physical MAC and rename recovery — verified 2026-09-15
+
+Physical-port lookup and statistics now use the retained kernel device object.
+Renaming a port leaves installed hardware generations intact and permits a
+fresh binding under the new OS name. The physical interface index and valid
+CDX onif entry still have to agree; an unregistering device is inadmissible.
+
+MAC changes retire dependent shared handles without disabling their bindings.
+The decoder invalidates queued generations carrying an obsolete source MAC.
+Admission checks the current address under RTNL and the backend transaction,
+then synchronizes the legacy encoder's source cache under `dpa_devlist_lock`.
+Linux's NEIGH fallback uses the live address. Carrier-loss notifications also
+retire affected generations. None of these events clears a global/fatal stop.
+
+Five focused ASan/UBSan host checks pass in 1.13 seconds. The two DUT identity
+tests pass in 180.00 seconds: MAC recovery 103.31 seconds and rename identity
+76.59 seconds. MAC recovery changes and restores each real port while retaining
+one TCP connection, UDP socket and nft flowtable. Every recovered window checks
+256 exact UDP hardware hits and 76,288 bytes per direction, 4 MiB TCP data per
+direction, and 256 WAN Ethernet frames carrying the current source MAC. A raw
+LAN receive test also verifies 256 hardware echoes using the changed LAN MAC.
+Software TX is 3–4 LAN packets and 15 WAN packets per eight-second window;
+aggregate softirq is 0.37–0.44% and busy CPU 2.10–2.31%. TCP remains connected
+with exact serial delivery. Intentional MAC-transition windows report 0–1 UDP
+losses each in the passing run; steady windows retain exact delivery checks.
+
+Each port is then renamed while UP. Existing generations retain their cookies,
+counters and table identity. Deleting and recreating the table while the port
+is renamed admits fresh TCP/UDP hardware entries on the same sockets. Each
+retained/rebound window verifies exact UDP counters, TCP payload delivery and
+small software TX deltas. Both original port names and MACs are restored.
+
+ARP's CHANGEADDR notifier can retire the shared handle before the adapter's MAC
+notifier; the first invalidator owns the diagnostic counter. CHANGEADDR also
+evicts fixture-owned permanent neighbours. The tests account for this ordering
+and restore those records before normal fixture cleanup. These were two harness
+corrections. A separate repeat received one UDP ENETUNREACH during a recovered
+window, after successful admission; TCP stayed connected. A following run with
+ARP/ICMP capture passed unchanged strict traffic checks and did not reproduce
+that error. Its cause is unconfirmed; the failure evidence is retained rather
+than silently counted as a passing run or weakening steady-state assertions.
+
+The KASAN image was built and staged. Running kernel build ID is
+`ccb4027552dba75cfd057f215fa8810f30e0f80f`, CDX
+`39b4e97367935f61d634be70e24658e5d80e2357`, and adapter
+`71dc918ea3cdbcde2b765c358321927a35f0795c`. Staged SHA-256 is
+`1d741690933e2096dca08566902611627c93afecdddb8e8276e934e2a9ede21c`.
+Artifacts live in `/tmp/ask-flowtable-mac/`: host and DUT logs/XML, image identity,
+MAC/name evidence, and ARP/ICMP captures. `first-invalidator/`,
+`mac-pass-neighbour-cleanup/`, and `delayed-udp-error/` retain the earlier runs.
+The successful build log is `/tmp/ask-flowtable-mac-rebuild.log`; the earlier
+build caught and corrected an SDK header include-order problem. The successful
+build has no compiler warnings and three existing forced-task warnings.
+
+The updated device-dependency and global rearm regressions pass together in
+106.29 seconds. Twelve unrelated dummy/bridge events preserve established
+hardware entries; attaching/removing an upper device on either real port
+retires both connections and keeps admission stopped until explicit table
+recreation. UDP loss is allowed only during that intentional routed-path
+interruption. Rule invalidation, rejected reuse of a populated table, and
+recovery after retried deletion barriers remain verified. KASAN and lockdep
+diagnostics are clean, `debug_locks` is 1, taint is 4096, and both original port
+names, MACs, MTUs and UP states are restored. No full suite was run.

@@ -15,6 +15,9 @@ typedef uint64_t u64;
 #define ETH_ALEN 6
 #define IF_TYPE_ETHERNET 1
 #define IF_TYPE_PHYSICAL 128
+#define L2_MAX_ONIF 8
+#define ENTRY_VALID 1
+#define NETREG_REGISTERED 1
 #define FFTYPE_IPV4 1
 #define CONNTRACK_ORIG 1
 #define GFP_KERNEL 0
@@ -40,7 +43,7 @@ static struct net init_net, other_net;
 struct net_device {
     char name[8];
     struct net *net;
-    unsigned type, addr_len;
+    unsigned type, addr_len, reg_state;
     bool bridge, l3_slave, running, carrier;
     u8 dev_addr[6], perm_addr[6];
 };
@@ -50,11 +53,17 @@ struct net_device {
 #define netif_is_l3_slave(d) ((d)->l3_slave)
 #define netif_running(d) ((d)->running)
 #define netif_carrier_ok(d) ((d)->carrier)
-struct dpa_iface_info { struct { struct net_device *net_dev; } eth_info; };
-static struct dpa_iface_info in_iface, out_iface;
-static bool no_iface;
-static struct dpa_iface_info *dpa_get_ifinfo_by_itfid(unsigned id)
-{ return no_iface ? NULL : id == 1 ? &in_iface : &out_iface; }
+struct dpa_iface_info {
+    struct dpa_iface_info *next;
+    unsigned if_flags, itf_id;
+    struct { struct net_device *net_dev; u8 mac_addr[6]; } eth_info;
+};
+static struct dpa_iface_info out_iface = { .if_flags=129, .itf_id=2 };
+static struct dpa_iface_info in_iface = { .next=&out_iface, .if_flags=129, .itf_id=1 };
+static struct dpa_iface_info *dpa_interface_info = &in_iface;
+static bool dpa_devlist_lock;
+static void spin_lock(bool *l) { assert(!*l); *l=true; }
+static void spin_unlock(bool *l) { assert(*l); *l=false; }
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
 #define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
@@ -80,9 +89,9 @@ typedef struct CtEntry {
     __be16 Sport, Dport, twin_Sport, twin_Dport;
 } CtEntry, *PCtEntry;
 static struct itf in_itf = {129, 1}, out_itf = {129, 2};
-typedef struct { struct itf *itf; } OnifDesc, *POnifDesc;
-static OnifDesc in_onif = {&in_itf}, out_onif = {&out_itf};
-static POnifDesc get_onif_by_name(const char *name) { return !strcmp(name,"in") ? &in_onif : !strcmp(name,"out") ? &out_onif : NULL; }
+typedef struct { struct itf *itf; unsigned flags; } OnifDesc, *POnifDesc;
+static OnifDesc in_onif = {&in_itf, ENTRY_VALID}, out_onif = {&out_itf, ENTRY_VALID};
+static POnifDesc get_onif_by_index(unsigned id) { assert(id==1 || id==2); return id==1 ? &in_onif : &out_onif; }
 static struct { struct { bool mutex; } ctrl; } instance = {{true}}, *cdx_info = &instance;
 static bool rtnl, rtnl_busy, quiesce_fail;
 static unsigned legacy_pending, quiesces;
@@ -99,6 +108,7 @@ static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocati
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
 static int insert_entry_in_classif_table(PCtEntry ct)
 {
+    assert(!memcmp(out_iface.eth_info.mac_addr, (u8[]){2,0,0,0,0,0}, 6));
     assert(ct->fftype == FFTYPE_IPV4 && ct->proto == expected_proto);
     assert(ct->hash == expected_proto * 13 && ct->twin->proto == expected_proto);
     assert(ct->Saddr_v4 == htonl(0xc0000201) && ct->Daddr_v4 == htonl(0xc6336401));
@@ -136,6 +146,7 @@ static int dpa_cfg_quiesce(void)
     stopped = true;
     return 0;
 }
+#include "physical_production.inc"
 #include "hardware_types.inc"
 #include "hardware_production.inc"
 #include "backend_production.inc"
@@ -143,12 +154,12 @@ static int dpa_cfg_quiesce(void)
 static void test_backend(void)
 {
     struct net_device in = { .name="in", .net=&init_net, .type=ARPHRD_ETHER,
-        .addr_len=ETH_ALEN, .running=true, .carrier=true, .dev_addr={2}, .perm_addr={2} };
+        .addr_len=ETH_ALEN, .reg_state=NETREG_REGISTERED, .running=true, .carrier=true, .dev_addr={2}, .perm_addr={2} };
     struct net_device out = in;
     strcpy(out.name, "out");
     in_iface.eth_info.net_dev = &in; out_iface.eth_info.net_dev = &out;
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
-        .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+        .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
     struct cdx_ft_hw *hw = NULL;
     expected_proto = IPPROTO_UDP;
     cdx_info->ctrl.mutex = false;
@@ -172,12 +183,16 @@ static void test_backend(void)
     out.l3_slave=true; assert(!cdx_ft_port_supported(&out)); out.l3_slave=false;
     out.carrier=false; assert(!cdx_ft_port_supported(&out)); out.carrier=true;
     out.running=false; assert(!cdx_ft_port_supported(&out)); out.running=true;
-    out.dev_addr[5]=1; assert(!cdx_ft_port_supported(&out)); out.dev_addr[5]=0;
+    out.dev_addr[5]=1; assert(cdx_ft_port_supported(&out));
+    assert(cdx_ft_add(&rule,&hw)==-EOPNOTSUPP && !hw); out.dev_addr[5]=0;
+    out.reg_state=0; assert(!cdx_ft_port_supported(&out)); out.reg_state=NETREG_REGISTERED;
     out.type=0; assert(!cdx_ft_port_supported(&out)); out.type=ARPHRD_ETHER;
     out.addr_len=0; assert(!cdx_ft_port_supported(&out)); out.addr_len=ETH_ALEN;
-    strcpy(out.name,"missing"); assert(!cdx_ft_port_supported(&out)); strcpy(out.name,"out");
+    strcpy(out.name,"renamed"); assert(cdx_ft_port_supported(&out)); strcpy(out.name,"out");
     out_itf.type=2; assert(!cdx_ft_port_supported(&out)); out_itf.type=129;
-    no_iface=true; assert(!cdx_ft_port_supported(&out)); no_iface=false;
+    in_iface.next=NULL; assert(!cdx_ft_port_supported(&out)); in_iface.next=&out_iface;
+    out_onif.flags=0; assert(!cdx_ft_port_supported(&out)); out_onif.flags=ENTRY_VALID;
+    out_iface.itf_id=L2_MAX_ONIF; assert(!cdx_ft_port_supported(&out)); out_iface.itf_id=2;
     out_iface.eth_info.net_dev=&in; assert(!cdx_ft_port_supported(&out)); out_iface.eth_info.net_dev=&out;
     ft_observe=true; assert(cdx_ft_add(&rule,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
     fail_insert=true; assert(cdx_ft_add(&rule,&hw) == -EIO && !ft_live); fail_insert=false;
@@ -221,9 +236,10 @@ int main(void)
 {
     struct net_device in = { .name = "in" }, out = { .name = "out" };
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
-        .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+        .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
     struct cdx_ft_hw *hw;
     struct cdx_ft_counters counters;
+    in_iface.eth_info.net_dev=&in; out_iface.eth_info.net_dev=&out;
     fail_alloc = true; assert(cdx_ft_hw_add(&rule,&hw) == -ENOMEM && !hw); fail_alloc=false;
     fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
     out_itf.type = 2; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP); out_itf.type=129;

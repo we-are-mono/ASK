@@ -52,17 +52,22 @@ async def command(agent, session, *argv, check=True):
     return result
 
 
-async def rename_roundtrip(r, dev):
-    """Trigger a conservative device event without dropping link or changing MAC."""
-    temporary = "askftrename"
-    links = json.loads((await command(r.target, r.session, "ip", "-j", "link", "show"))["stdout"])
-    assert temporary not in {i["ifname"] for i in links}, links
-    try:
-        return await command(r.target, r.session, "ip", "link", "set", "dev", dev, "name", temporary)
-    finally:
-        links = json.loads((await command(r.target, r.session, "ip", "-j", "link", "show"))["stdout"])
-        if temporary in {i["ifname"] for i in links}:
-            await command(r.target, r.session, "ip", "link", "set", "dev", temporary, "name", dev)
+async def upper_roundtrip(r, dev):
+    """Exercise unsupported upper-device topology, restoring it through UART."""
+    temporary = "askftupper"
+    with Console.target(log_path=str(ARTIFACTS / "upper-uart.log")) as con:
+        await asyncio.to_thread(con.login, "root", None)
+        links = json.loads((await console_command(con, "ip", "-j", "link", "show"))["stdout"])
+        assert temporary not in {i["ifname"] for i in links}, links
+        assert "master" not in next(i for i in links if i["ifname"] == dev), links
+        await console_command(con, "ip", "link", "add", "name", temporary, "type", "bridge")
+        try:
+            return await console_command(con, "ip", "link", "set", "dev", dev, "master", temporary)
+        finally:
+            try:
+                await console_command(con, "ip", "link", "set", "dev", dev, "nomaster")
+            finally:
+                await console_command(con, "ip", "link", "del", "dev", temporary)
 
 
 async def console_command(console, *argv, check=True, timeout=20):
@@ -586,7 +591,7 @@ async def test_flowtable_offload_add_failures(rig):
 
 
 async def test_flowtable_offload_rearm(rig):
-    """Recover after device rename and routing-policy changes and a retried delete barrier."""
+    """Recover after upper-device and routing-policy changes and a retried delete barrier."""
     r = rig
     initial = await r.state()
     if initial["observe"]:
@@ -613,7 +618,7 @@ async def test_flowtable_offload_rearm(rig):
                     while len(r.echo.received) < received + 16:
                         assert not traffic.done() and time.monotonic() < deadline
                         await asyncio.sleep(0.02)
-                    await rename_roundtrip(r, TARGET_LAN_IF)
+                    await upper_roundtrip(r, TARGET_LAN_IF)
                 elif trigger == "rule":
                     await command(r.target, r.session, "ip", "rule", "add", "pref", rule_priority,
                                   "from", "198.18.254.0/24", "table", "main")
