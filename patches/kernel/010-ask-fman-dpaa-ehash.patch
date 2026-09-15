@@ -1,4 +1,4 @@
-From e292c43b5d8998edd833cfd9196fb6d328e44abf Mon Sep 17 00:00:00 2001
+From e055cbf1e3dd10b3d187e719aecf97c8f1e5cb5a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -82,88 +82,88 @@ union copies by the source member and reject reserved reassembly conversion.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- Makefile                                           |    5 
- drivers/net/ethernet/freescale/sdk_dpaa/Kconfig    |    6 
- drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c |   43 
- drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h |   31 
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_common.c  |   71 +
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_common.h  |   36 
- .../net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c  | 1043 +++++++++
- .../net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c |   11 
- drivers/net/ethernet/freescale/sdk_dpaa/mac-api.c  |    1 
- drivers/net/ethernet/freescale/sdk_dpaa/mac.h      |    2 
- .../net/ethernet/freescale/sdk_dpaa/offline_port.c |   51 
- drivers/net/ethernet/freescale/sdk_fman/Kconfig    |   11 
- .../freescale/sdk_fman/Peripherals/FM/HC/hc.c      |  296 ++-
- .../freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.c |   14 
- .../freescale/sdk_fman/Peripherals/FM/MAC/fm_mac.h |    1 
- .../freescale/sdk_fman/Peripherals/FM/MAC/memac.c  |   58 
- .../freescale/sdk_fman/Peripherals/FM/Pcd/Makefile |    7 
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c  |  929 +-------
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h  |   26 
- .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h        | 1374 ++++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c         | 1211 ++++++++++
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c  |  247 +-
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.h  |    1 
- .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c         | 1439 +-----------
- .../sdk_fman/Peripherals/FM/Pcd/fm_manip.h         |  111 -
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c |  109 +
- .../freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h |   17 
- .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c          |   13 
- .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h          |    1 
- .../sdk_fman/Peripherals/FM/Pcd/fm_replic.c        |   14 
- .../sdk_fman/Peripherals/FM/Port/fm_port.c         |  900 ++++----
- .../sdk_fman/Peripherals/FM/Port/fm_port.h         |   21 
- .../sdk_fman/Peripherals/FM/Port/fman_port.c       |   34 
- .../freescale/sdk_fman/Peripherals/FM/SP/fm_sp.c   |   14 
- .../freescale/sdk_fman/Peripherals/FM/fm.c         |  539 ++---
- .../freescale/sdk_fman/Peripherals/FM/fm_muram.c   |   32 
- .../sdk_fman/Peripherals/FM/inc/fm_common.h        |   24 
- .../freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h  |    9 
- .../sdk_fman/Peripherals/FM/inc/fm_sp_common.h     |    2 
- .../net/ethernet/freescale/sdk_fman/etc/memcpy.c   |  301 ---
- .../sdk_fman/inc/Peripherals/fm_eh_types.h         |   52 
- .../freescale/sdk_fman/inc/Peripherals/fm_ehash.h  | 1468 ++++++++++++
- .../freescale/sdk_fman/inc/Peripherals/fm_ext.h    |   15 
- .../sdk_fman/inc/Peripherals/fm_mac_ext.h          |    1 
- .../sdk_fman/inc/Peripherals/fm_muram_ext.h        |    1 
- .../sdk_fman/inc/Peripherals/fm_pcd_ext.h          |  215 +-
- .../sdk_fman/inc/Peripherals/fm_port_ext.h         |   42 
- .../sdk_fman/inc/Peripherals/fm_vsp_ext.h          |   14 
- .../freescale/sdk_fman/inc/flib/fsl_fman_port.h    |    6 
- .../ethernet/freescale/sdk_fman/inc/stdlib_ext.h   |   47 
- .../ethernet/freescale/sdk_fman/ls1043_dflags.h    |    2 
- .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h      |    9 
- .../sdk_fman/src/inc/wrapper/lnxwrp_fsl_fman.h     |    5 
- .../freescale/sdk_fman/src/system/sys_io.c         |    1 
- .../freescale/sdk_fman/src/wrapper/lnxwrp_fm.c     |   76 +
- .../freescale/sdk_fman/src/wrapper/lnxwrp_fm.h     |   36 
- .../sdk_fman/src/wrapper/lnxwrp_fm_port.c          |   76 -
- .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c        | 2350 ++++++++++----------
- .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.c |   23
- .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.h |   13 
- .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c         |  192 ++
- .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm_port.c    |    6 
- drivers/net/usb/usbnet.c                           |   23 
- drivers/staging/fsl_qbman/Kconfig                  |    7 
- drivers/staging/fsl_qbman/fsl_usdpaa.c             |    1 
- drivers/staging/fsl_qbman/qman_config.c            |    2 
- drivers/staging/fsl_qbman/qman_high.c              |   84 +
- include/linux/fsl_oh_port.h                        |   26 
- include/linux/fsl_qman.h                           |    6 
- include/linux/netdevice.h                          |   43 
- include/linux/skbuff.h                             |   15 
- include/uapi/linux/fmd/Peripherals/fm_ioctls.h     |   28 
- include/uapi/linux/fmd/Peripherals/fm_pcd_ioctls.h |   57 
- .../uapi/linux/fmd/Peripherals/fm_port_ioctls.h    |   15 
- include/uapi/linux/if.h                            |    1 
- include/uapi/linux/netlink.h                       |    6 
- net/Kconfig                                        |    9 
- net/core/dev.c                                     |  101 +
- net/core/gro.c                                     |    5 
- net/core/rtnetlink.c                               |   19 
- net/core/skbuff.c                                  |   38 
- 81 files changed, 9130 insertions(+), 5061 deletions(-)
+ Makefile                                      |    5 +
+ .../net/ethernet/freescale/sdk_dpaa/Kconfig   |    6 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    |   43 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   31 +-
+ .../freescale/sdk_dpaa/dpaa_eth_common.c      |   71 +-
+ .../freescale/sdk_dpaa/dpaa_eth_common.h      |   36 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 1043 +++++++-
+ .../freescale/sdk_dpaa/dpaa_ethtool.c         |   11 +
+ .../net/ethernet/freescale/sdk_dpaa/mac-api.c |    1 +
+ drivers/net/ethernet/freescale/sdk_dpaa/mac.h |    2 +
+ .../freescale/sdk_dpaa/offline_port.c         |   51 +
+ .../net/ethernet/freescale/sdk_fman/Kconfig   |   11 +
+ .../freescale/sdk_fman/Peripherals/FM/HC/hc.c |  296 +-
+ .../sdk_fman/Peripherals/FM/MAC/fm_mac.c      |   14 +
+ .../sdk_fman/Peripherals/FM/MAC/fm_mac.h      |    1 +
+ .../sdk_fman/Peripherals/FM/MAC/memac.c       |   58 +
+ .../sdk_fman/Peripherals/FM/Pcd/Makefile      |    7 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 ++-----
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 ++++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1211 +++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
+ .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +---------
+ .../sdk_fman/Peripherals/FM/Pcd/fm_manip.h    |  111 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.c      |  127 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_pcd.h      |   18 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.c     |   13 +-
+ .../sdk_fman/Peripherals/FM/Pcd/fm_plcr.h     |    1 +
+ .../sdk_fman/Peripherals/FM/Pcd/fm_replic.c   |   14 +-
+ .../sdk_fman/Peripherals/FM/Port/fm_port.c    |  919 +++----
+ .../sdk_fman/Peripherals/FM/Port/fm_port.h    |   21 +-
+ .../sdk_fman/Peripherals/FM/Port/fman_port.c  |   34 +
+ .../sdk_fman/Peripherals/FM/SP/fm_sp.c        |   14 +
+ .../freescale/sdk_fman/Peripherals/FM/fm.c    |  539 ++--
+ .../sdk_fman/Peripherals/FM/fm_muram.c        |   32 +-
+ .../sdk_fman/Peripherals/FM/inc/fm_common.h   |   24 +-
+ .../sdk_fman/Peripherals/FM/inc/fm_hc.h       |    9 +-
+ .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
+ .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +--
+ .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1468 ++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
+ .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
+ .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
+ .../sdk_fman/inc/Peripherals/fm_pcd_ext.h     |  215 +-
+ .../sdk_fman/inc/Peripherals/fm_port_ext.h    |   52 +-
+ .../sdk_fman/inc/Peripherals/fm_vsp_ext.h     |   14 +
+ .../sdk_fman/inc/flib/fsl_fman_port.h         |    6 +-
+ .../freescale/sdk_fman/inc/stdlib_ext.h       |   47 +-
+ .../freescale/sdk_fman/ls1043_dflags.h        |    2 +
+ .../sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h |   11 +-
+ .../src/inc/wrapper/lnxwrp_fsl_fman.h         |    5 +
+ .../freescale/sdk_fman/src/system/sys_io.c    |    1 +
+ .../sdk_fman/src/wrapper/lnxwrp_fm.c          |   76 +-
+ .../sdk_fman/src/wrapper/lnxwrp_fm.h          |   25 +-
+ .../sdk_fman/src/wrapper/lnxwrp_fm_port.c     |   76 +-
+ .../sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c   | 2379 +++++++++--------
+ .../src/wrapper/lnxwrp_ioctls_fm_compat.c     |   23 +-
+ .../src/wrapper/lnxwrp_ioctls_fm_compat.h     |   13 +-
+ .../sdk_fman/src/wrapper/lnxwrp_sysfs_fm.c    |  192 ++
+ .../src/wrapper/lnxwrp_sysfs_fm_port.c        |    6 +-
+ drivers/net/usb/usbnet.c                      |   23 +-
+ drivers/staging/fsl_qbman/Kconfig             |    7 +
+ drivers/staging/fsl_qbman/fsl_usdpaa.c        |    1 -
+ drivers/staging/fsl_qbman/qman_config.c       |    2 +
+ drivers/staging/fsl_qbman/qman_high.c         |   84 +-
+ include/linux/fsl_oh_port.h                   |   26 +
+ include/linux/fsl_qman.h                      |    6 +
+ include/linux/netdevice.h                     |   43 +
+ include/linux/skbuff.h                        |   15 +
+ .../uapi/linux/fmd/Peripherals/fm_ioctls.h    |   28 +
+ .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   57 +-
+ .../linux/fmd/Peripherals/fm_port_ioctls.h    |   18 +-
+ include/uapi/linux/if.h                       |    1 +
+ include/uapi/linux/netlink.h                  |    6 +-
+ net/Kconfig                                   |    9 +
+ net/core/dev.c                                |  101 +-
+ net/core/gro.c                                |    5 +
+ net/core/rtnetlink.c                          |   19 +
+ net/core/skbuff.c                             |   38 +-
+ 81 files changed, 9199 insertions(+), 5158 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -2003,7 +2003,7 @@ index 3a6d1810b525..dee624569b48 100644
  	bool "FMan RTC (1588 timer) APIs"
  	default n
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
-index 80fb535..7111fb0 100644
+index 80fb535231b9..7111fb02da8b 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/HC/hc.c
 @@ -50,20 +50,7 @@
@@ -2610,7 +2610,7 @@ index 6eedcf9de5fb..bcb4567cd5bb 100644
 +##	setenv FMAN_DEBUG '-DFM_CC_MURAM_DEBUG=1'
 +ccflags-y += $(FMAN_DEBUG)
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
-index b8d600f..f9b84e5 100644
+index b8d600fa6f25..f9b84e5dc59b 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.c
 @@ -51,6 +51,8 @@
@@ -3833,7 +3833,7 @@ index b8d600f..f9b84e5 100644
 -    return FM_PCD_MatchTableGetMissStatistics(h_HashBucket, p_MissStatistics);
 -}
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h
-index e3b7016..0a4d9cf 100644
+index e3b7016b7f2e..0a4d9cf4ed6c 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc.h
 @@ -107,7 +107,6 @@
@@ -5285,7 +5285,7 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 0000000..ab643e7
+index 000000000000..ab643e703257
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 @@ -0,0 +1,1211 @@
@@ -6501,7 +6501,7 @@ index 0000000..ab643e7
 +EXPORT_SYMBOL(ExternalHashGetDscpVlanpcpMapCfg);
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
-index 7c5cf46..5865418 100644
+index 7c5cf467380f..5865418cbb15 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_kg.c
 @@ -873,9 +873,9 @@ static t_Error BindPortToClsPlanGrp(t_FmPcd *p_FmPcd, uint8_t hardwarePortId, ui
@@ -6945,7 +6945,7 @@ index f55fe8bb0bb4..29c01bd97627 100644
 -
  #endif /* __FM_KG_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c
-index b8c18e0..23439ed 100644
+index b8c18e0edf83..23439eda6601 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.c
 @@ -1363,510 +1363,6 @@ static t_Error CreateManipActionBackToOrig(
@@ -8525,7 +8525,7 @@ index b8c18e0..23439ed 100644
  		return CapwapFragmentationStats(
  			p_Manip, &p_FmPcdManipStats->u.frag.u.capwapFrag);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.h
-index 241703a..f0f48e5 100644
+index 241703a05e59..f0f48e5be914 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_manip.h
 @@ -55,10 +55,8 @@
@@ -8677,9 +8677,8 @@ index 241703a..f0f48e5 100644
      uint8_t                 icOffset;
      uint16_t                ownerTmp;
      bool                    cnia;
-
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
-index 5d96727..816a444 100644
+index 5d96727f7251..816a444eae54 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.c
 @@ -55,6 +55,12 @@
@@ -8931,7 +8930,7 @@ index 5d96727..816a444 100644
  }
 -
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
-index 9d78c8d..9420a85 100644
+index 9d78c8d76029..9420a85c87b6 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_pcd.h
 @@ -368,6 +368,8 @@ typedef struct {
@@ -9063,7 +9062,7 @@ index 2f89c05f74e8..20390219276f 100644
          /* update the last bit in the shadow ad */
          FillReplicAdOfTypeResult(p_FmPcd->p_CcShadow, last);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
-index 3662edc..145b7b8 100644
+index 3662edc25213..145b7b818d47 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.c
 @@ -53,6 +53,11 @@
@@ -10361,7 +10360,7 @@ index 3662edc..145b7b8 100644
 +}
 +EXPORT_SYMBOL(FM_PORT_SetOhPortRda);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.h
-index 2db8365..4803269 100644
+index 2db8365471d5..480326961ded 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Port/fm_port.h
 @@ -168,12 +168,10 @@ typedef uint32_t fmPcdEngines_t; /**< options as defined below: */
@@ -10527,7 +10526,7 @@ index 5f3e2cd9b05e..60bdf910ee48 100644
 +}
 +EXPORT_SYMBOL(FM_VSP_GetRelativeProfileId);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
-index 01ab578..a9657f3 100644
+index 01ab5788059a..a9657f3f9fc4 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/fm.c
 @@ -482,9 +482,10 @@ static t_Error FwNotResetErratumBugzilla6173WA(t_Fm *p_Fm)
@@ -11324,7 +11323,7 @@ index 8ab81ac69431..bbd9c0123d78 100644
 +EXPORT_SYMBOL(FmMurambaseAddr);
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h
-index fd9221b..5a5c75a 100644
+index fd9221b525b0..5a5c75a8b9b5 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_common.h
 @@ -53,7 +53,8 @@
@@ -11408,7 +11407,7 @@ index fd9221b..5a5c75a 100644
  t_Error     FmPortGetSetCcParams(t_Handle h_FmPort, t_FmPortGetSetCcParams *p_FmPortGetSetCcParams);
  uint8_t     FmPortGetNetEnvId(t_Handle h_FmPort);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
-index 56f3ab8..5617795 100644
+index 56f3ab8ee8e4..561779517473 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/inc/fm_hc.h
 @@ -47,7 +47,10 @@ typedef struct t_FmHcParams {
@@ -11842,7 +11841,7 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 0000000..28e20cb
+index 000000000000..28e20cb1b43b
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 @@ -0,0 +1,1468 @@
@@ -13364,7 +13363,7 @@ index ef62c8ef28d5..464b539e8c81 100644
  
  #endif /* __FM_MURAM_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
-index 6e5db2a..d271ec2 100644
+index 6e5db2aaf500..d271ec2374d1 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_pcd_ext.h
 @@ -45,7 +45,7 @@
@@ -13665,7 +13664,7 @@ index 6e5db2a..d271ec2 100644
 +
  #endif /* __FM_PCD_EXT */
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
-index 259d194..7ec1dab 100644
+index 259d194b44d3..7ec1daba439d 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_port_ext.h
 @@ -1413,6 +1413,9 @@ t_Error FM_PORT_Disable(t_Handle h_FmPort);
@@ -13895,7 +13894,7 @@ index 67d96367f075..25af9ed23a19 100644
  #define DEBUG_ERRORS        1
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
-index 9667d45..de9fb20 100644
+index 9667d45d7f75..de9fb2034cb7 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/inc/wrapper/lnxwrp_exp_sym.h
 @@ -47,8 +47,11 @@
@@ -13970,7 +13969,7 @@ index b52ff95ce9e9..e8cc4b0c21d2 100644
  }
 +EXPORT_SYMBOL(SYS_VirtToPhys);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
-index e105129..707f11f 100644
+index e10512983b60..707f11fcd62a 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.c
 @@ -69,6 +69,7 @@
@@ -14119,7 +14118,7 @@ index e105129..707f11f 100644
  		bool enable)
  {
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h
-index 6e6f07eb499e..912261b63ca2 100644
+index 6e6f07eb499e..ef4b3f5a707c 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm.h
 @@ -52,7 +52,8 @@
@@ -14132,7 +14131,7 @@ index 6e6f07eb499e..912261b63ca2 100644
  
  #if defined(CONFIG_FMAN_DISABLE_OH_TO_REUSE_RESOURCES)
  #define FM_10G_OPENDMA_MIN_TRESHOLD 8 /* 10g minimum treshold if only HC is enabled and no OH port enabled */
-@@ -247,6 +248,39 @@ typedef struct {
+@@ -247,6 +248,28 @@ typedef struct {
  #define LNXWRP_FM_OBJECT(ptr)   LIST_OBJECT(ptr, t_LnxWrpFm, fms[((t_LnxWrpFmDev *)ptr)->id])
  
  
@@ -14157,23 +14156,12 @@ index 6e6f07eb499e..912261b63ca2 100644
 +    FM_PCD_COOKIE_VSP
 +};
 +
-+/* Resolve a cookie handed out over /dev/fmX-pcd back to the kernel handle it
-+ * names, or NULL if it is not a live cookie of that class. Exported because
-+ * cdx receives the same cookies second-hand, via dpa_app's
-+ * CDX_CTRL_DPA_SET_PARAMS, and must not store an untranslated value. */
-+t_Handle fm_pcd_cookie_lookup(uint64_t cookie, enum fm_pcd_cookie_type type);
-+
-+/* True iff filp is this driver's /dev/fmX-pcd node, so a consumer that
-+ * resolved an fd can trust filp->private_data is the t_LnxWrpFmDev this
-+ * driver stored. Exported for cdx, which resolves the pcd fd handed over
-+ * via CDX_CTRL_DPA_SET_PARAMS. */
-+bool fm_file_is_pcd(struct file *filp);
 +
  t_Error  LnxwrpFmIOCTL(t_LnxWrpFmDev *p_LnxWrpFmDev, unsigned int cmd, unsigned long arg, bool compat);
  t_Error  LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd, unsigned long arg, bool compat);
  
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
-index ea42358..eac7c22 100644
+index ea4235847686..eac7c22f0a17 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_fm_port.c
 @@ -77,34 +77,29 @@ do {\
@@ -14302,7 +14290,7 @@ index ea42358..eac7c22 100644
  		t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = &p_LnxWrpFmDev->hcPort;
  		t_FmPcdParams fmPcdParams;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
-index f97c37f..c4fb490 100644
+index f97c37f06255..6bbf115d4a07 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm.c
 @@ -52,6 +52,8 @@
@@ -14314,7 +14302,7 @@ index f97c37f..c4fb490 100644
  #include <linux/uaccess.h>
  #include <asm/errno.h>
  
-@@ -302,6 +304,434 @@
+@@ -302,6 +304,433 @@
  #error Error: please synchronize IOC_ defines!
  #endif
  
@@ -14456,7 +14444,7 @@ index f97c37f..c4fb490 100644
 +    return cookie;
 +}
 +
-+t_Handle fm_pcd_cookie_lookup(uint64_t cookie, enum fm_pcd_cookie_type type)
++static t_Handle fm_pcd_cookie_lookup(uint64_t cookie, enum fm_pcd_cookie_type type)
 +{
 +    struct fm_pcd_cookie_slot *p_Slot;
 +    unsigned long flags;
@@ -14470,7 +14458,6 @@ index f97c37f..c4fb490 100644
 +
 +    return handle;
 +}
-+EXPORT_SYMBOL(fm_pcd_cookie_lookup);
 +
 +static t_Handle fm_pcd_cookie_retire(uint64_t cookie, enum fm_pcd_cookie_type type)
 +{
@@ -14749,7 +14736,7 @@ index f97c37f..c4fb490 100644
  void LnxWrpPCDIOCTLTypeChecking(void)
  {
      /* fm_ext.h == fm_ioctls.h */
-@@ -470,6 +900,60 @@ void LnxWrpPCDIOCTLEnumChecking(void)
+@@ -470,6 +899,60 @@ void LnxWrpPCDIOCTLEnumChecking(void)
      return;
  }
  
@@ -14810,7 +14797,7 @@ index f97c37f..c4fb490 100644
  static t_Error LnxwrpFmPcdIOCTL(t_LnxWrpFmDev *p_LnxWrpFmDev, unsigned int cmd, unsigned long arg, bool compat)
  {
      t_Error err = E_OK;
-@@ -504,8 +988,6 @@ Status: PCD API to fmlib (file: drivers/net/dpa/NetCommSw/inc/Peripherals/fm_pcd
+@@ -504,8 +987,6 @@ Status: PCD API to fmlib (file: drivers/net/dpa/NetCommSw/inc/Peripherals/fm_pcd
      FM_PCD_MatchTableModifyKeyAndNextEngine
      FM_PCD_HashTableSet
      FM_PCD_HashTableDelete
@@ -14819,7 +14806,7 @@ index f97c37f..c4fb490 100644
      FM_PCD_MatchTableModifyKey
      FM_PCD_ManipNodeReplace
      FM_PCD_ManipNodeSet
-@@ -527,9 +1009,7 @@ Status: not exported
+@@ -527,9 +1008,7 @@ Status: not exported
      FM_PCD_MatchTableGetKeyCounter
  
  Status: not exported, would be nice to have
@@ -14829,7 +14816,7 @@ index f97c37f..c4fb490 100644
      FM_PCD_ManipGetStatistics
  
  Status: not exported
-@@ -839,6 +1319,19 @@ Status: not exported
+@@ -839,6 +1318,19 @@ Status: not exported
                  break;
              }
  
@@ -14849,7 +14836,7 @@ index f97c37f..c4fb490 100644
  #if defined(CONFIG_COMPAT)
              if (compat)
              {
-@@ -881,6 +1374,7 @@ Status: not exported
+@@ -881,6 +1373,7 @@ Status: not exported
          case FM_PCD_IOC_NET_ENV_CHARACTERISTICS_DELETE:
          {
              ioc_fm_obj_t id;
@@ -14857,7 +14844,7 @@ index f97c37f..c4fb490 100644
  
              memset(&id, 0 , sizeof(ioc_fm_obj_t));
  
-@@ -901,7 +1395,18 @@ Status: not exported
+@@ -901,7 +1394,18 @@ Status: not exported
                      RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
              }
  
@@ -14877,7 +14864,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -956,7 +1461,7 @@ Status: not exported
+@@ -956,7 +1460,7 @@ Status: not exported
                  }
              }
  
@@ -14886,7 +14873,7 @@ index f97c37f..c4fb490 100644
  
              if (!param->id)
              {
-@@ -968,6 +1473,19 @@ Status: not exported
+@@ -968,6 +1472,19 @@ Status: not exported
                  break;
              }
  
@@ -14906,7 +14893,7 @@ index f97c37f..c4fb490 100644
  #if defined(CONFIG_COMPAT)
              if (compat)
              {
-@@ -1008,86 +1526,9 @@ Status: not exported
+@@ -1008,86 +1525,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_KG_SCHEME_GET_CNTR:
          {
@@ -14996,7 +14983,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -1097,6 +1538,7 @@ Status: not exported
+@@ -1097,6 +1537,7 @@ Status: not exported
          case FM_PCD_IOC_KG_SCHEME_DELETE:
          {
              ioc_fm_obj_t id;
@@ -15004,7 +14991,7 @@ index f97c37f..c4fb490 100644
  
              memset(&id, 0 , sizeof(ioc_fm_obj_t));
  
-@@ -1117,7 +1559,15 @@ Status: not exported
+@@ -1117,7 +1558,15 @@ Status: not exported
                      RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
              }
  
@@ -15021,7 +15008,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -1183,8 +1633,19 @@ Status: not exported
+@@ -1183,8 +1632,19 @@ Status: not exported
                  }
              }
  
@@ -15043,7 +15030,7 @@ index f97c37f..c4fb490 100644
  
              /* support for indexed lookup */
              if( !(param->extract_cc_params.type == e_IOC_FM_PCD_EXTRACT_NON_HDR &&
-@@ -1224,6 +1685,12 @@ Status: not exported
+@@ -1224,6 +1684,12 @@ Status: not exported
                  }
              }
  
@@ -15056,7 +15043,7 @@ index f97c37f..c4fb490 100644
              param->id = FM_PCD_MatchTableSet(p_LnxWrpFmDev->h_PcdDev, (t_FmPcdCcNodeParams*)param);
  
              if (!param->id) {
-@@ -1235,6 +1702,19 @@ Status: not exported
+@@ -1235,6 +1701,19 @@ Status: not exported
                  break;
              }
  
@@ -15076,7 +15063,7 @@ index f97c37f..c4fb490 100644
  #if defined(CONFIG_COMPAT)
              if (compat)
              {
-@@ -1278,6 +1758,7 @@ Status: not exported
+@@ -1278,6 +1757,7 @@ Status: not exported
          case FM_PCD_IOC_MATCH_TABLE_DELETE:
          {
              ioc_fm_obj_t id;
@@ -15084,7 +15071,7 @@ index f97c37f..c4fb490 100644
  
              memset(&id, 0 , sizeof(ioc_fm_obj_t));
  
-@@ -1298,7 +1779,15 @@ Status: not exported
+@@ -1298,7 +1778,15 @@ Status: not exported
                      RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
              }
  
@@ -15101,7 +15088,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -1353,6 +1842,12 @@ Status: not exported
+@@ -1353,6 +1841,12 @@ Status: not exported
                  }
              }
  
@@ -15114,7 +15101,7 @@ index f97c37f..c4fb490 100644
              param->id = FM_PCD_CcRootBuild(p_LnxWrpFmDev->h_PcdDev, (t_FmPcdCcTreeParams*)param);
  
              if (!param->id) {
-@@ -1364,6 +1859,19 @@ Status: not exported
+@@ -1364,6 +1858,19 @@ Status: not exported
                  break;
              }
  
@@ -15134,7 +15121,7 @@ index f97c37f..c4fb490 100644
  #if defined(CONFIG_COMPAT)
              if (compat)
              {
-@@ -1406,6 +1914,7 @@ Status: not exported
+@@ -1406,6 +1913,7 @@ Status: not exported
          case FM_PCD_IOC_CC_ROOT_DELETE:
          {
              ioc_fm_obj_t id;
@@ -15142,7 +15129,7 @@ index f97c37f..c4fb490 100644
  
              memset(&id, 0 , sizeof(ioc_fm_obj_t));
  
-@@ -1426,7 +1935,15 @@ Status: not exported
+@@ -1426,7 +1934,15 @@ Status: not exported
                      RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
              }
  
@@ -15159,7 +15146,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -1538,6 +2055,28 @@ invalid_port_id:
+@@ -1538,6 +2054,28 @@ Status: not exported
                  XX_Free(port_params);
              }
  
@@ -15188,7 +15175,7 @@ index f97c37f..c4fb490 100644
              param->id = FM_PCD_PlcrProfileSet(p_LnxWrpFmDev->h_PcdDev, (t_FmPcdPlcrProfileParams*)param);
  
              if (!param->id) {
-@@ -1549,6 +2088,20 @@ invalid_port_id:
+@@ -1549,6 +2087,20 @@ Status: not exported
                  break;
              }
  
@@ -15209,7 +15196,7 @@ index f97c37f..c4fb490 100644
  #if defined(CONFIG_COMPAT)
              if (compat)
              {
-@@ -1590,6 +2143,7 @@ invalid_port_id:
+@@ -1590,6 +2142,7 @@ Status: not exported
          case FM_PCD_IOC_PLCR_PROFILE_DELETE:
          {
              ioc_fm_obj_t id;
@@ -15217,7 +15204,7 @@ index f97c37f..c4fb490 100644
  
              memset(&id, 0 , sizeof(ioc_fm_obj_t));
  
-@@ -1610,7 +2164,15 @@ invalid_port_id:
+@@ -1610,7 +2163,15 @@ Status: not exported
                      RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
              }
  
@@ -15234,7 +15221,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -1619,58 +2181,9 @@ invalid_port_id:
+@@ -1619,58 +2180,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_CC_ROOT_MODIFY_NEXT_ENGINE:
          {
@@ -15296,7 +15283,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -1679,57 +2192,9 @@ invalid_port_id:
+@@ -1679,57 +2191,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_MATCH_TABLE_MODIFY_NEXT_ENGINE:
          {
@@ -15357,7 +15344,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -1738,952 +2203,268 @@ invalid_port_id:
+@@ -1738,952 +2202,268 @@ Status: not exported
  #endif
          case FM_PCD_IOC_MATCH_TABLE_MODIFY_MISS_NEXT_ENGINE:
          {
@@ -16322,7 +16309,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
- #if defined(CONFIG_COMPAT)
+-#if defined(CONFIG_COMPAT)
 -        case FM_PCD_IOC_MATCH_TABLE_MODIFY_KEY_COMPAT:
 -#endif
 -        case FM_PCD_IOC_MATCH_TABLE_MODIFY_KEY:
@@ -16402,6 +16389,7 @@ index f97c37f..c4fb490 100644
 -
 -                        param->p_key = p_tmp;
 -                    }
++#if defined(CONFIG_COMPAT)
 +        case FM_PCD_IOC_HASH_TABLE_DELETE_COMPAT:
 +#endif
 +        case FM_PCD_IOC_HASH_TABLE_DELETE:
@@ -16487,7 +16475,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -2764,24 +2545,31 @@ invalid_port_id:
+@@ -2764,24 +2544,31 @@ Status: not exported
                  param->u.hdr.insrt_params.u.generic.p_data = p_data;
              }
  
@@ -16532,7 +16520,7 @@ index f97c37f..c4fb490 100644
                  param->id = FM_PCD_ManipNodeSet(
                          p_LnxWrpFmDev->h_PcdDev,
                          (t_FmPcdManipParams*) param);
-@@ -2796,6 +2584,18 @@ invalid_port_id:
+@@ -2796,6 +2583,18 @@ Status: not exported
                         a generic E_INVALID_VALUE */
                      break;
                  }
@@ -16551,7 +16539,7 @@ index f97c37f..c4fb490 100644
              }
  
  #if defined(CONFIG_COMPAT)
-@@ -2844,6 +2644,7 @@ invalid_port_id:
+@@ -2844,6 +2643,7 @@ Status: not exported
          case FM_PCD_IOC_MANIP_NODE_DELETE:
          {
              ioc_fm_obj_t id;
@@ -16559,7 +16547,7 @@ index f97c37f..c4fb490 100644
  
              memset(&id, 0, sizeof(ioc_fm_obj_t));
  #if defined(CONFIG_COMPAT)
-@@ -2863,7 +2664,15 @@ invalid_port_id:
+@@ -2863,7 +2663,15 @@ Status: not exported
                      RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
              }
  
@@ -16576,7 +16564,7 @@ index f97c37f..c4fb490 100644
              break;
          }
  
-@@ -2872,69 +2681,9 @@ invalid_port_id:
+@@ -2872,69 +2680,9 @@ Status: not exported
  #endif
          case FM_PCD_IOC_MANIP_GET_STATS:
  	{
@@ -16649,7 +16637,7 @@ index f97c37f..c4fb490 100644
              break;
  	}
  
-@@ -2995,6 +2744,28 @@ invalid_port_id:
+@@ -2995,6 +2743,28 @@ Status: not exported
  			}
  		}
  
@@ -16678,7 +16666,7 @@ index f97c37f..c4fb490 100644
  		param->id = FM_PCD_FrmReplicSetGroup(p_LnxWrpFmDev->h_PcdDev,
  				(t_FmPcdFrmReplicGroupParams*)param);
  
-@@ -3009,6 +2780,20 @@ invalid_port_id:
+@@ -3009,6 +2779,20 @@ Status: not exported
  			break;
  		}
  
@@ -16699,7 +16687,7 @@ index f97c37f..c4fb490 100644
  #if defined(CONFIG_COMPAT)
  		if (compat)
  		{
-@@ -3058,6 +2843,7 @@ invalid_port_id:
+@@ -3058,6 +2842,7 @@ Status: not exported
  	case FM_PCD_IOC_FRM_REPLIC_GROUP_DELETE:
  	{
  		ioc_fm_obj_t id;
@@ -16707,7 +16695,7 @@ index f97c37f..c4fb490 100644
  
  		memset(&id, 0, sizeof(ioc_fm_obj_t));
  #if defined(CONFIG_COMPAT)
-@@ -3068,7 +2854,7 @@ invalid_port_id:
+@@ -3068,7 +2853,7 @@ Status: not exported
  			if (copy_from_user(&compat_id,
  					(ioc_compat_fm_obj_t *) compat_ptr(arg),
  					sizeof(ioc_compat_fm_obj_t)))
@@ -16716,7 +16704,7 @@ index f97c37f..c4fb490 100644
  			compat_obj_delete(&compat_id, &id);
  		}
  		else
-@@ -3076,10 +2862,20 @@ invalid_port_id:
+@@ -3076,10 +2861,20 @@ Status: not exported
  		{
  			if (copy_from_user(&id, (ioc_fm_obj_t *) arg,
  					sizeof(ioc_fm_obj_t)))
@@ -16739,7 +16727,7 @@ index f97c37f..c4fb490 100644
  	}
  	break;
  
-@@ -3089,6 +2885,7 @@ invalid_port_id:
+@@ -3089,6 +2884,7 @@ Status: not exported
  	case FM_PCD_IOC_FRM_REPLIC_MEMBER_ADD:
  	{
  		ioc_fm_pcd_frm_replic_member_params_t param;
@@ -16747,7 +16735,7 @@ index f97c37f..c4fb490 100644
  
  #if defined(CONFIG_COMPAT)
  		if (compat)
-@@ -3105,7 +2902,15 @@ invalid_port_id:
+@@ -3105,7 +2901,15 @@ Status: not exported
  			if (copy_from_user(&param, (void *)arg, sizeof(param)))
  				RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
@@ -16764,7 +16752,7 @@ index f97c37f..c4fb490 100644
  			param.member.member_index,
  			(t_FmPcdCcNextEngineParams*)&param.next_engine_params);
  	}
-@@ -3117,6 +2922,7 @@ invalid_port_id:
+@@ -3117,6 +2921,7 @@ Status: not exported
  	case FM_PCD_IOC_FRM_REPLIC_MEMBER_REMOVE:
  	{
  		ioc_fm_pcd_frm_replic_member_t param;
@@ -16772,7 +16760,7 @@ index f97c37f..c4fb490 100644
  
  #if defined(CONFIG_COMPAT)
  		if (compat)
-@@ -3133,7 +2939,14 @@ invalid_port_id:
+@@ -3133,7 +2938,14 @@ Status: not exported
  			if (copy_from_user(&param, (void *)arg, sizeof(param)))
  				RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
@@ -16788,7 +16776,7 @@ index f97c37f..c4fb490 100644
  	}
  	break;
  
-@@ -3166,6 +2979,26 @@ invalid_port_id:
+@@ -3166,6 +2978,26 @@ Status: not exported
          param.p_fm = p_LnxWrpFmDev->h_Dev;
          param.id = FM_VSP_Config((t_FmVspParams *)&param);
  
@@ -16815,7 +16803,7 @@ index f97c37f..c4fb490 100644
  #if defined(CONFIG_COMPAT)
          if (compat)
          {
-@@ -3190,6 +3023,7 @@ invalid_port_id:
+@@ -3190,6 +3022,7 @@ Status: not exported
      case FM_IOC_VSP_INIT:
      {
          ioc_fm_obj_t id;
@@ -16823,7 +16811,7 @@ index f97c37f..c4fb490 100644
  
          memset(&id, 0, sizeof(ioc_fm_obj_t));
  #if defined(CONFIG_COMPAT)
-@@ -3200,7 +3034,7 @@ invalid_port_id:
+@@ -3200,7 +3033,7 @@ Status: not exported
              if (copy_from_user(&compat_id,
                      (ioc_compat_fm_obj_t *) compat_ptr(arg),
                      sizeof(ioc_compat_fm_obj_t)))
@@ -16832,7 +16820,7 @@ index f97c37f..c4fb490 100644
              id.obj = compat_pcd_id2ptr(compat_id.obj);
          }
          else
-@@ -3208,10 +3042,15 @@ invalid_port_id:
+@@ -3208,10 +3041,15 @@ Status: not exported
          {
              if (copy_from_user(&id, (ioc_fm_obj_t *) arg,
                      sizeof(ioc_fm_obj_t)))
@@ -16850,7 +16838,7 @@ index f97c37f..c4fb490 100644
      }
  
  #if defined(CONFIG_COMPAT)
-@@ -3220,6 +3059,7 @@ invalid_port_id:
+@@ -3220,6 +3058,7 @@ Status: not exported
      case FM_IOC_VSP_FREE:
      {
          ioc_fm_obj_t id;
@@ -16858,7 +16846,7 @@ index f97c37f..c4fb490 100644
  
          memset(&id, 0, sizeof(ioc_fm_obj_t));
  #if defined(CONFIG_COMPAT)
-@@ -3230,7 +3070,7 @@ invalid_port_id:
+@@ -3230,7 +3069,7 @@ Status: not exported
              if (copy_from_user(&compat_id,
                      (ioc_compat_fm_obj_t *) compat_ptr(arg),
                      sizeof(ioc_compat_fm_obj_t)))
@@ -16867,7 +16855,7 @@ index f97c37f..c4fb490 100644
              compat_obj_delete(&compat_id, &id);
          }
          else
-@@ -3238,10 +3078,23 @@ invalid_port_id:
+@@ -3238,10 +3077,23 @@ Status: not exported
          {
              if (copy_from_user(&id, (ioc_fm_obj_t *) arg,
                      sizeof(ioc_fm_obj_t)))
@@ -16893,7 +16881,7 @@ index f97c37f..c4fb490 100644
      }
  
  #if defined(CONFIG_COMPAT)
-@@ -3250,6 +3103,7 @@ invalid_port_id:
+@@ -3250,6 +3102,7 @@ Status: not exported
      case FM_IOC_VSP_CONFIG_POOL_DEPLETION:
      {
          ioc_fm_buf_pool_depletion_params_t param;
@@ -16901,7 +16889,7 @@ index f97c37f..c4fb490 100644
  
  #if defined(CONFIG_COMPAT)
          if (compat)
-@@ -3266,7 +3120,15 @@ invalid_port_id:
+@@ -3266,7 +3119,15 @@ Status: not exported
              if (copy_from_user(&param, (void *)arg, sizeof(param)))
                  RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
@@ -16918,7 +16906,7 @@ index f97c37f..c4fb490 100644
                      (t_FmBufPoolDepletion *)&param.fm_buf_pool_depletion))
              RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
-@@ -3280,6 +3142,7 @@ invalid_port_id:
+@@ -3280,6 +3141,7 @@ Status: not exported
      case FM_IOC_VSP_CONFIG_BUFFER_PREFIX_CONTENT:
      {
          ioc_fm_buffer_prefix_content_params_t param;
@@ -16926,7 +16914,7 @@ index f97c37f..c4fb490 100644
  
  #if defined(CONFIG_COMPAT)
          if (compat)
-@@ -3296,7 +3159,15 @@ invalid_port_id:
+@@ -3296,7 +3158,15 @@ Status: not exported
              if (copy_from_user(&param, (void *)arg, sizeof(param)))
                  RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
@@ -16943,7 +16931,7 @@ index f97c37f..c4fb490 100644
                  (t_FmBufferPrefixContent *)&param.fm_buffer_prefix_content))
              RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
-@@ -3309,6 +3180,7 @@ invalid_port_id:
+@@ -3309,6 +3179,7 @@ Status: not exported
      case FM_IOC_VSP_CONFIG_NO_SG:
      {
          ioc_fm_vsp_config_no_sg_params_t param;
@@ -16951,7 +16939,7 @@ index f97c37f..c4fb490 100644
  
  #if defined(CONFIG_COMPAT)
          if (compat)
-@@ -3325,7 +3197,15 @@ invalid_port_id:
+@@ -3325,7 +3196,15 @@ Status: not exported
              if (copy_from_user(&param, (void *)arg, sizeof(param)))
                  RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
@@ -16968,7 +16956,7 @@ index f97c37f..c4fb490 100644
              RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
          break;
-@@ -3337,6 +3217,7 @@ invalid_port_id:
+@@ -3337,6 +3216,7 @@ Status: not exported
      case FM_IOC_VSP_GET_BUFFER_PRS_RESULT:
      {
          ioc_fm_vsp_prs_result_params_t param;
@@ -16976,7 +16964,7 @@ index f97c37f..c4fb490 100644
  
  #if defined(CONFIG_COMPAT)
          if (compat)
-@@ -3353,8 +3234,16 @@ invalid_port_id:
+@@ -3353,8 +3233,16 @@ Status: not exported
              if (copy_from_user(&param, (void *)arg, sizeof(param)))
                  RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
  
@@ -16994,7 +16982,7 @@ index f97c37f..c4fb490 100644
  
          if (!param.p_data)
              RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
-@@ -3379,6 +3268,9 @@ invalid_port_id:
+@@ -3379,6 +3267,9 @@ Status: not exported
      }
  
          default:
@@ -17004,7 +16992,7 @@ index f97c37f..c4fb490 100644
              RETURN_ERROR(MINOR, E_INVALID_SELECTION,
                  ("invalid ioctl: cmd:0x%08x(type:0x%02x, nr: %d.\n",
                  cmd, _IOC_TYPE(cmd), _IOC_NR(cmd)));
-@@ -3671,14 +3563,28 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -3671,14 +3562,28 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
      switch (cmd)
      {
          case FM_PORT_IOC_DISABLE:
@@ -17038,7 +17026,7 @@ index f97c37f..c4fb490 100644
  
          case FM_PORT_IOC_SET_ERRORS_ROUTE:
          {
-@@ -4035,6 +3941,12 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4035,6 +3940,12 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
                  }
              }
  
@@ -17051,7 +17039,7 @@ index f97c37f..c4fb490 100644
              if (!err)
                  err = FM_PORT_SetPCD(p_LnxWrpFmPortDev->h_Dev, (t_FmPortPcdParams*) port_pcd_params);
  
-@@ -4098,6 +4010,14 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4098,6 +4009,14 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
                  }
              }
  
@@ -17066,7 +17054,7 @@ index f97c37f..c4fb490 100644
              err =  FM_PORT_PcdKgModifyInitialScheme(p_LnxWrpFmPortDev->h_Dev, (t_FmPcdKgSchemeSelect *)param);
  
              XX_Free(param);
-@@ -4130,6 +4050,10 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4130,6 +4049,10 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
                      RETURN_ERROR(MINOR, E_WRITE_FAILED, NO_MSG);
              }
  
@@ -17077,7 +17065,7 @@ index f97c37f..c4fb490 100644
              err = FM_PORT_PcdPlcrModifyInitialProfile(p_LnxWrpFmPortDev->h_Dev, id.obj);
              break;
          }
-@@ -4174,6 +4098,12 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4174,6 +4097,12 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
                  }
              }
  
@@ -17090,7 +17078,7 @@ index f97c37f..c4fb490 100644
              err = FM_PORT_PcdKgBindSchemes(p_LnxWrpFmPortDev->h_Dev, (t_FmPcdPortSchemesParams *)param);
  
              XX_Free(param);
-@@ -4220,6 +4150,12 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4220,6 +4149,12 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
                  }
              }
  
@@ -17103,7 +17091,7 @@ index f97c37f..c4fb490 100644
              err =  FM_PORT_PcdKgUnbindSchemes(p_LnxWrpFmPortDev->h_Dev, (t_FmPcdPortSchemesParams *)param);
  
              XX_Free(param);
-@@ -4248,36 +4184,6 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4248,36 +4183,6 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
              err = FM_PORT_AttachPCD(p_LnxWrpFmPortDev->h_Dev);
              break;
  
@@ -17140,7 +17128,7 @@ index f97c37f..c4fb490 100644
          case FM_PORT_IOC_ADD_CONGESTION_GRPS:
          case FM_PORT_IOC_REMOVE_CONGESTION_GRPS:
          {
-@@ -4511,6 +4417,22 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4511,6 +4416,22 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
                  p_LnxWrpFmTxPortDev = &p_LnxWrpFmDev->txPorts[p_LnxWrpFmPortDev->id];
                  param->p_fm_tx_port = p_LnxWrpFmTxPortDev->h_Dev;
              }
@@ -17163,7 +17151,7 @@ index f97c37f..c4fb490 100644
  
              if (FM_PORT_VSPAlloc(p_LnxWrpFmPortDev->h_Dev, (t_FmPortVSPAllocParams *)param))
              {
-@@ -4612,6 +4534,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
+@@ -4612,6 +4533,9 @@ t_Error LnxwrpFmPortIOCTL(t_LnxWrpFmPortDev *p_LnxWrpFmPortDev, unsigned int cmd
          }
  
          default:
@@ -17173,7 +17161,7 @@ index f97c37f..c4fb490 100644
              RETURN_ERROR(MINOR, E_INVALID_SELECTION,
                  ("invalid ioctl: cmd:0x%08x(type:0x%02x, nr:0x%02x.\n",
                  cmd, _IOC_TYPE(cmd), _IOC_NR(cmd)));
-@@ -4725,6 +4650,79 @@ static int fm_close(struct inode *inode, struct file *file)
+@@ -4725,6 +4649,79 @@ static int fm_close(struct inode *inode, struct file *file)
      return err;
  }
  
@@ -17253,7 +17241,7 @@ index f97c37f..c4fb490 100644
  static int fm_ioctls(unsigned int minor, struct file *file, unsigned int cmd, unsigned long arg, bool compat)
  {
      DBG(TRACE, ("IOCTL minor - %u, cmd - 0x%08x, arg - 0x%08lx \n", minor, cmd, arg));
-@@ -4733,8 +4731,12 @@ static int fm_ioctls(unsigned int minor, struct file *file, unsigned int cmd, un
+@@ -4733,8 +4730,12 @@ static int fm_ioctls(unsigned int minor, struct file *file, unsigned int cmd, un
          (minor == DEV_FM_PCD_MINOR_BASE))
      {
          t_LnxWrpFmDev *p_LnxWrpFmDev = ((t_LnxWrpFmDev*)file->private_data);
@@ -17266,7 +17254,7 @@ index f97c37f..c4fb490 100644
          if (LnxwrpFmIOCTL(p_LnxWrpFmDev, cmd, arg, compat))
              return -EFAULT;
      }
-@@ -4743,8 +4745,17 @@ static int fm_ioctls(unsigned int minor, struct file *file, unsigned int cmd, un
+@@ -4743,8 +4744,17 @@ static int fm_ioctls(unsigned int minor, struct file *file, unsigned int cmd, un
               ((minor >= DEV_FM_TX_PORTS_MINOR_BASE) && (minor < DEV_FM_MAX_MINORS)))
      {
          t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = ((t_LnxWrpFmPortDev*)file->private_data);
@@ -17284,27 +17272,13 @@ index f97c37f..c4fb490 100644
          if (LnxwrpFmPortIOCTL(p_LnxWrpFmPortDev, cmd, arg, compat))
              return -EFAULT;
      }
-@@ -4794,3 +4805,18 @@ struct file_operations fm_fops =
+@@ -4794,3 +4804,4 @@ struct file_operations fm_fops =
      .open =             fm_open,
      .release =          fm_close,
  };
 +
-+/* Confirm a struct file is THIS driver's /dev/fmX-pcd node. fget() proves
-+ * only that an fd is open; a consumer that resolves an fd to reach
-+ * file->private_data (cdx, via CDX_CTRL_DPA_SET_PARAMS) must also know the
-+ * file is an FMAN device AND specifically the PCD minor, since fm_open()
-+ * stores a t_LnxWrpFmDev* only for the FM and PCD minors and a different
-+ * struct (t_LnxWrpFmPortDev*) for the port minors. Without this a foreign
-+ * fd's private_data would be reinterpreted as a t_LnxWrpFmDev and its
-+ * fields dereferenced as FMAN handles. */
-+bool fm_file_is_pcd(struct file *filp)
-+{
-+    return filp && filp->f_op == &fm_fops &&
-+           iminor(file_inode(filp)) == DEV_FM_PCD_MINOR_BASE;
-+}
-+EXPORT_SYMBOL(fm_file_is_pcd);
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.c b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.c
-index 6453395..1d2eeed 100644
+index 6453395d94d7..1d2eeed80220 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.c
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.c
 @@ -621,7 +621,7 @@ void compat_copy_fm_pcd_kg_scheme(
@@ -17313,7 +17287,7 @@ index 6453395..1d2eeed 100644
                     &compat_param->kg_next_engine_params,
 -                   sizeof(param->kg_next_engine_params));
 +                   sizeof(compat_param->kg_next_engine_params));
-
+ 
          memcpy(&param->scheme_counter,
                 &compat_param->scheme_counter,
 @@ -668,7 +668,7 @@ void compat_copy_fm_pcd_kg_scheme(
@@ -17369,7 +17343,7 @@ index 6453395..1d2eeed 100644
                  memcpy(&param->u.frag, &compat_param->u.frag, sizeof(param->u.frag));
                  break;
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.h b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.h
-index 41df9a9..0ac90d5 100644
+index 41df9a906b03..0ac90d5890f7 100644
 --- a/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.h
 +++ b/drivers/net/ethernet/freescale/sdk_fman/src/wrapper/lnxwrp_ioctls_fm_compat.h
 @@ -236,6 +236,7 @@ typedef struct ioc_compat_fm_pcd_cc_key_params_t {
@@ -18347,7 +18321,7 @@ index c24f471bda76..716c42d16550 100644
  #if defined(FM_COMPAT)
  #define FM_PCD_IOC_HASH_TABLE_REMOVE_KEY_COMPAT _IOW(FM_IOC_TYPE_BASE, FM_PCD_IOC_NUM(40), ioc_compat_fm_pcd_hash_table_remove_key_params_t)
 diff --git a/include/uapi/linux/fmd/Peripherals/fm_port_ioctls.h b/include/uapi/linux/fmd/Peripherals/fm_port_ioctls.h
-index de57525..5259aaf 100644
+index de57525c2aa3..5259aaf10fed 100644
 --- a/include/uapi/linux/fmd/Peripherals/fm_port_ioctls.h
 +++ b/include/uapi/linux/fmd/Peripherals/fm_port_ioctls.h
 @@ -249,6 +249,9 @@ typedef struct ioc_fm_port_congestion_groups_t {
@@ -18712,3 +18686,4 @@ index dcb5d025dc08..b76f9c813689 100644
  
 -- 
 2.47.3
+
