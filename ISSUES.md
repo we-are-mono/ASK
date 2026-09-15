@@ -276,7 +276,7 @@ file's git history.
 
 - [x] **A137.** `find_osdev_by_fman_params` typed `netdev_priv` off any Ethernet
   device and picked 10G by a fixed-link heuristic — deleted with its only caller
-  when cdx took over classifier startup (_8305904_).
+  when cdx took over classifier startup (_70f7085_).
 
 ## Gating
 
