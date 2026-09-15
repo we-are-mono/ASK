@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* CDX ownership and hardware services for the Linux flowtable adapter. */
+#include <linux/etherdevice.h>
+#include <linux/if_arp.h>
+#include <linux/module.h>
+#include <linux/rtnetlink.h>
+#include "portdefs.h"
+#include "cdx.h"
+#include "cdx_flowtable.h"
+#include "cdx_flowtable_backend.h"
+#include "cdx_flowtable_hw.h"
+#include "devman.h"
+
+static char *offload_owner = "cmm";
+module_param(offload_owner, charp, 0444);
+MODULE_PARM_DESC(offload_owner, "Hardware flow owner: cmm (default) or flowtable; boot selection only");
+
+static bool ft_observe;
+module_param_named(flowtable_observe, ft_observe, bool, 0444);
+MODULE_PARM_DESC(flowtable_observe, "Validate requests but decline hardware installation");
+
+/* These belong to CDX, not the adapter. Detach/reclaim must neither change the
+ * selected owner nor forget an unproven hardware deletion. Configuration stays
+ * sealed after the first claim, even if registration subsequently fails. */
+static bool ft_claimed, ft_config_sealed, ft_failed;
+static unsigned int ft_live;
+
+bool cdx_flowtable_enabled(void)
+{
+	return !strcmp(offload_owner, "flowtable");
+}
+
+bool cdx_ft_observing(void)
+{
+	return ft_observe;
+}
+
+bool cdx_flowtable_config_sealed(void)
+{
+	return READ_ONCE(ft_config_sealed);
+}
+
+int cdx_flowtable_mode_check(void)
+{
+	if (strcmp(offload_owner, "cmm") && strcmp(offload_owner, "flowtable"))
+		return -EINVAL;
+	if (ft_observe && !cdx_flowtable_enabled())
+		return -EINVAL;
+	return 0;
+}
+
+void cdx_ft_begin(void)
+{
+	mutex_lock(&cdx_info->ctrl.mutex);
+}
+
+void cdx_ft_end(void)
+{
+	mutex_unlock(&cdx_info->ctrl.mutex);
+}
+
+void cdx_ft_assert_held(void)
+{
+	lockdep_assert_held(&cdx_info->ctrl.mutex);
+}
+
+bool cdx_ft_failed(void)
+{
+	cdx_ft_assert_held();
+	return ft_failed;
+}
+
+unsigned int cdx_ft_pending(void)
+{
+	cdx_ft_assert_held();
+	return cdx_ft_hw_pending() + cdx_ehash_quarantine_pending();
+}
+
+int cdx_ft_claim(void)
+{
+	cdx_ft_assert_held();
+	if (!cdx_flowtable_enabled() || ft_failed)
+		return -EOPNOTSUPP;
+	if (ft_claimed || ft_live || cdx_ft_pending())
+		return -EBUSY;
+	ft_claimed = true;
+	WRITE_ONCE(ft_config_sealed, true);
+	return 0;
+}
+
+int cdx_ft_release(void)
+{
+	cdx_ft_assert_held();
+	if (ft_live)
+		return -EBUSY;
+	ft_claimed = false;
+	return 0;
+}
+
+int cdx_ft_admission_begin(void)
+{
+	cdx_ft_assert_held();
+	/* RTNL holders can wait for callbacks needing this transaction. */
+	return rtnl_trylock() ? 0 : -EAGAIN;
+}
+
+void cdx_ft_admission_end(void)
+{
+	cdx_ft_assert_held();
+	rtnl_unlock();
+}
+
+bool cdx_ft_port_supported(struct net_device *dev)
+{
+	POnifDesc onif;
+	struct dpa_iface_info *iface;
+
+	cdx_ft_assert_held();
+	if (!dev || !net_eq(dev_net(dev), &init_net) ||
+	    dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN ||
+	    netif_is_bridge_port(dev) || netif_is_l3_slave(dev) ||
+	    !netif_running(dev) || !netif_carrier_ok(dev) ||
+	    !ether_addr_equal(dev->dev_addr, dev->perm_addr))
+		return false;
+	onif = get_onif_by_name(dev->name);
+	if (!onif || onif->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
+		return false;
+	/* A reused name does not establish physical-port identity. */
+	iface = dpa_get_ifinfo_by_itfid(onif->itf->index);
+	return iface && iface->eth_info.net_dev == dev;
+}
+
+int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
+{
+	int rc;
+
+	cdx_ft_assert_held();
+	ASSERT_RTNL();
+	*result = NULL;
+	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||
+	    !cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out) ||
+	    rule->in == rule->out)
+		return -EOPNOTSUPP;
+	rc = cdx_ft_hw_add(rule, result);
+	if (!rc)
+		ft_live++;
+	return rc;
+}
+
+void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
+{
+	cdx_ft_assert_held();
+	cdx_ft_hw_stats(hw, stats);
+}
+
+int cdx_ft_del(struct cdx_ft_hw **hw)
+{
+	int rc;
+
+	cdx_ft_assert_held();
+	if (!*hw)
+		return 0;
+	rc = cdx_ft_hw_del(hw);
+	ft_live--;
+	if (rc == -EIO)
+		ft_failed = true;
+	return rc;
+}
+
+int cdx_ft_recover(void)
+{
+	int rc;
+
+	cdx_ft_assert_held();
+	/* Never wait for RTNL while a callback transaction is held. CDX owns
+	 * this terminal latch even after the adapter releases its claim. */
+	if (ft_failed) {
+		if (!rtnl_trylock())
+			return -EAGAIN;
+		rc = dpa_cfg_quiesce();
+		rtnl_unlock();
+		if (rc) {
+			pr_err_ratelimited("cdx flowtable: waiting for hardware quiescence; reboot required\n");
+			return -EAGAIN;
+		}
+		pr_err("cdx flowtable: hardware stopped after unproven deletion; reboot required\n");
+		cdx_ft_hw_quiesced();
+	}
+	return cdx_ft_hw_retry();
+}
+
+/* CDX's final shutdown has already stopped and detached every classifier port.
+ * It can reclaim backend storage after the adapter and its work are gone. */
+void cdx_flowtable_quiesced(void)
+{
+	cdx_ft_hw_quiesced();
+}

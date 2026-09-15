@@ -29,6 +29,7 @@
 #include "lnxwrp_fm.h"
 #include "cdx_ceetm_gdef.h"
 #include "layer2.h"
+#include "cdx_flowtable.h"
 
 //#define DPA_CFG_DEBUG 	1
 
@@ -936,6 +937,12 @@ int cdx_ioc_set_dpa_params(unsigned long args)
 		return -EINVAL;
 	}
 	mutex_lock(&cdx_info->ctrl.mutex);
+	/* Serialize the authoritative ownership check with backend claim. An
+	 * ioctl may have passed the wrapper before the first claim sealed it. */
+	if (cdx_flowtable_config_sealed()) {
+		mutex_unlock(&cdx_info->ctrl.mutex);
+		return -EOPNOTSUPP;
+	}
 	rtnl_lock();
 	mutex_lock(&dpa_cfg_lock);
 	if (fman_info) {

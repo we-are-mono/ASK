@@ -41,6 +41,8 @@ static unsigned num_fmans;
 static struct cdx_fman_info *fman_info;
 static struct dpa_fq *dpa_pcd_fq;
 static int dpa_cfg_lock, rtnl;
+static bool config_sealed, seal_on_lock;
+static bool cdx_flowtable_config_sealed(void) { return config_sealed; }
 static unsigned port_up_mask = 15;
 static struct { struct { int mutex; } ctrl; } cdx_instance, *cdx_info = &cdx_instance;
 static void rtnl_lock(void) { assert(!rtnl && cdx_info->ctrl.mutex); rtnl = 1; }
@@ -54,7 +56,11 @@ static void *stats, *oh[2], *eth[MAX_PHY_PORTS], *ceetm;
 static unsigned slots, queues;
 static bool restoring, unsafe_enable, fail_delete;
 
-static void mutex_lock(int *lock) { assert(!*lock); *lock = 1; }
+static void mutex_lock(int *lock)
+{
+    assert(!*lock); *lock = 1;
+    if (lock == &cdx_info->ctrl.mutex && seal_on_lock) config_sealed = true;
+}
 static void mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
 static void *kcalloc(size_t n, size_t size, int flags)
 {
@@ -238,6 +244,13 @@ static void retry(void)
 }
 int main(void)
 {
+    /* Claim can seal configuration while an already validated ioctl waits
+     * for the control transaction. Refuse before any RTNL/hardware work. */
+    setup(); seal_on_lock = true;
+    assert(cdx_ioc_set_dpa_params((unsigned long)&request) == -EOPNOTSUPP);
+    assert(!cdx_info->ctrl.mutex && !rtnl && !live_allocs && !fman_info);
+    assert(!step && !alloc_step);
+    seal_on_lock = config_sealed = false;
     setup(); assert(!cdx_ioc_set_dpa_params((unsigned long)&request));
     unsigned allocations = alloc_step, steps = step;
     assert(!unsafe_enable); clean_success();

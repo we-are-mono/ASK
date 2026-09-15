@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    match = re.search(r"^static [^\n]+\b" + name + r"\([^;]*?\)\s*\{", source, re.M)
+    match = re.search(r"^(?:static )?[^\n]+\b" + name + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     end, depth = match.end(), 1
     while depth:
@@ -23,16 +23,16 @@ def function(source, name):
 
 def test_flowtable_decoder_and_lifecycle(tmp_path):
     source = (ROOT / "cdx/cdx_flowtable.c").read_text()
-    hardware = (ROOT / "cdx/cdx_flowtable_hw.h").read_text()
+    hardware = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     (tmp_path / "flowtable_types.inc").write_text(
-        hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("int cdx_ft_hw_add")]
+        hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("/* Process-context transactions")]
         + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
     )
     names = ["ft_fault", "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches", "ft_neigh_check",
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used", "ft_route_event", "ft_neigh_event", "ft_fib_event",
              "ft_remove", "ft_retire_workfn", "ft_parse", "ft_same_key",
              "ft_replace", "ft_stats", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_bind",
-             "ft_invalidate_work"]
+             "ft_invalidate_work", "cdx_flowtable_init", "cdx_flowtable_exit"]
     (tmp_path / "flowtable_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"
@@ -49,11 +49,13 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
 
 
 def test_flowtable_hardware_ownership(tmp_path):
-    hardware = (ROOT / "cdx/cdx_flowtable_hw.h").read_text()
+    hardware = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     source = (ROOT / "cdx/cdx_flowtable_hw.c").read_text()
     (tmp_path / "hardware_types.inc").write_text(
-        hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("int cdx_ft_hw_add")])
+        hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("/* Process-context transactions")])
     (tmp_path / "hardware_production.inc").write_text(source[source.index("struct cdx_ft_hw {"):])
+    backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()
+    (tmp_path / "backend_production.inc").write_text(backend[backend.index("static char *offload_owner"):])
     binary = tmp_path / "flowtable_hw"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",

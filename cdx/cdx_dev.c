@@ -137,7 +137,7 @@ struct cdx_ioctl_spec {
 
 static long cdx_ioc_set_dpa_params_wrap(unsigned long args)
 {
-	if (cdx_flowtable_enabled() && cdx_flowtable_ready())
+	if (cdx_flowtable_enabled() && cdx_flowtable_config_sealed())
 		return -EOPNOTSUPP;
 	return cdx_ioc_set_dpa_params(args);
 }

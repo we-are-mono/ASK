@@ -399,8 +399,24 @@ interface avoids recovering a parent flow by casting its cookie. The adapter
 must be built against this patch; the test image includes the native flowtable
 and nftables modules it needs.
 
-`cdx_flowtable_hw.c` presents install, statistics, and consuming deletion
-operations. Each installed direction owns a private CDX encoding object, a dummy
+`cdx_flowtable_backend.h` defines the private adapter/CDX interface. Its CDX
+implementation owns transactions, physical-port identity, an exclusive adapter
+claim, hardware admission, statistics, retirement, quarantine recovery and the
+terminal failure latch. Immutable owner/observe parameters remain on `cdx.ko`.
+The adapter uses no CDX device, control or firmware structures. Transactions
+currently use the existing CDX control mutex and also serialize adapter state;
+they expose no mutex or internal structure to the adapter. Each transaction
+must end before a Netfilter flush. Admission tries RTNL inside a transaction;
+bind-time port checks are provisional and admission repeats them under RTNL.
+
+Releasing a claim requires zero live directions. CDX keeps any retired storage,
+the terminal failure latch and the sealed configuration gate independently of
+the adapter. A fresh claim cannot bypass fatal failure or pending retirement.
+The configuration ioctl rechecks the gate under the same transaction lock, so
+a request already waiting when ownership is claimed cannot mutate configuration.
+
+`cdx_flowtable_hw.c` is the CDX-internal firmware encoder behind this interface.
+Each installed direction owns a private CDX encoding object, a dummy
 reverse tuple, and an embedded route. These objects never enter the legacy
 connection hash, route hash, CMM notification path, or ageing wheel. The existing
 classifier encoder supplies routing actions, preemptive checks, and hardware
@@ -445,19 +461,19 @@ hardware accounting contributions when the native `counter` flag is absent.
 Accurate hardware accounting requires a separately verified post-punt firmware
 measurement facility; it is outside this PoC's contract.
 
-The control mutex serializes list changes and all firmware operations. Netfilter
+Backend transactions serialize list changes and all firmware operations. Netfilter
 rule callbacks execute in workqueue context. Binding release runs after the flow
 block excludes its callbacks. Notifiers latch invalidation and queue work; they
-never acquire the control mutex. ARP callbacks inspect pinned, immutable
+never enter a backend transaction. ARP callbacks inspect pinned, immutable
 dependencies under a separate spinlock, nested inside the neighbour lock.
 Global invalidation deletes the experimental entries before flushing Linux
-flowtable work, releasing the control mutex before that flush. Selective
+flowtable work, ending the transaction before that flush. Selective
 neighbour work removes entries sharing an invalid handle and leaves Linux
 teardown to native GC. Module exit removes the proc entry and notifiers, cancels invalidation
 work, and unregisters indirect callbacks before global CDX teardown acquires its
-locks. Installation and fatal recovery use RTNL trylock under the control mutex,
+locks. The backend uses RTNL trylock for installation and fatal recovery,
 because RTNL holders can wait for Netfilter callbacks. A busy RTNL lock declines
-installation to software; fatal recovery releases the mutex and retries. A port
+installation to software; fatal recovery ends the transaction and retries. A port
 must also match the netdevice recorded by CDX, not merely its name. Flowtables
 must be bound after CDX initializes; incomplete indirect replay requests are
 declined.
@@ -1459,3 +1475,93 @@ under `proof/`. Build logs are `/tmp/ask-flowtable-routes-build.log` and
 Stop at this increment. Selective device dependencies and broader foundation
 coverage remain separate work. This does not add NAT, IPv6, encapsulation or a
 new firmware capability, and does not change the chosen per-boot owner.
+
+## CDX backend interface — verified 2026-09-15
+
+The adapter now calls the private interface in `cdx_flowtable_backend.h`.
+`cdx_flowtable_backend.c` remains inside `cdx.ko` with the firmware encoder;
+`cdx_flowtable.c` remains linked there for this increment too. Kernel patch 140
+and firmware behaviour are unchanged. The next separately proved increment is
+extracting `ask_flowtable.ko`, including module references and load/unload rules.
+No separate module or runtime owner switching is provided by this increment.
+
+CDX now owns the immutable owner/observe options, exclusive adapter claim,
+physical-port validation, live hardware count, retirement quarantine and the
+terminal failure latch. Releasing a claim cannot reopen configuration or clear
+fatal failure. A claim is refused in CMM mode, while another claim exists,
+while retirement is pending, or after terminal failure. Release is refused
+while live hardware directions remain. The adapter keeps Linux flow decoding,
+route/neighbour dependency tracking, per-flow handles, counters and invalidation
+work. It no longer reaches CDX control/device structures or firmware functions.
+
+Explicit begin/end operations delimit transactions, using the same CDX control
+mutex and lock order as the proved implementation. They also serialize adapter
+state, so this extraction adds no second mutex or new nested lock ordering.
+Admission tries RTNL while the transaction is held; recovery does the same
+before quiescing hardware. Netfilter flushing happens outside a transaction.
+Backend operations never call back into the adapter. This is a private source
+interface which can evolve with the repository, not a frozen binary ABI.
+
+The configuration gate becomes permanent after the first successful claim.
+The ioctl wrapper rejects new requests early, and `cdx_ioc_set_dpa_params`
+rechecks under the control mutex before acquiring RTNL or changing hardware.
+This covers a request which passed the wrapper before the claim and then waited
+for the same mutex. Adapter initialization failure releases its claim and all
+acquired registrations; successful teardown releases the claim only after work,
+callbacks and live directions have drained. CDX final shutdown owns any retained
+hardware storage after adapter teardown.
+
+Eight focused ASan/UBSan host tests pass. The production backend and firmware
+encoder are compiled together to check ownership, port identity, observe mode,
+live-direction accounting, failed barriers, quiescence and fatal refusal across
+release/reclaim. Production adapter initialization/exit is tested with every
+acquisition failing in turn, plus active-flow teardown and CMM-mode initialization.
+The production configuration ioctl test seals ownership while a request acquires
+the mutex and verifies rejection before allocation or hardware work. Existing
+flow decoding, selective retirement, handle lifetime and CDX shutdown checks pass.
+
+Four focused DUT tests pass on the KASAN image:
+
+- Mixed TCP/UDP selective route recovery, including withdrawal/restoration and
+  preservation of the other peer's cookies and hardware counters.
+- Mixed TCP/UDP selective neighbour recovery, including MAC change, unreachable
+  neighbour and neighbour-object replacement, with the other peer preserved.
+- Global rearm after device and routing-policy changes, plus two deliberately
+  failed retirement barriers. Cleanup finishes at 60 installs/deletes, two
+  expected errors, three rearms and no entries, bindings or retained references.
+- Unproven deletion during traffic. The CDX backend stops receive ports 6 and 7,
+  preserves the fatal latch and rejects rearm. State reaches 62 installs/deletes
+  and three expected errors, with no retained adapter references or quarantine.
+  The possibly linked hardware key is deliberately retained until reset. CDX
+  unload succeeds and all 64 subsequent software echoes pass.
+
+The final steady route and neighbour windows each deliver 256 echoes per flow.
+UDP hardware deltas remain exactly 256 packets and 76,288 bytes per direction;
+each TCP connection transfers 4 MiB with advancing hardware counters. Software
+TX deltas on LAN/WAN are 3/15 and 14/15; aggregate softirq time is 0.28% and
+0.41% respectively. Raw total CPU busy measurements remain in the artifacts;
+these are forwarding checks, not a throughput or idle-CPU benchmark.
+
+All four tests ran on one experimental boot with CMM disabled. There were no
+KASAN, lockdep, warning or oops reports, including after terminal CDX unload;
+taint remained 4096. The DUT was then rebooted into the same flowtable image to
+restore hardware after the intentionally terminal test. No CMM-mode DUT test
+or full KASAN suite was run, and no forced kmemleak scan was requested.
+
+The image was built and staged with KASAN, lockdep, kmemleak and failslab enabled.
+Live kernel/CDX and userspace identities matched the build. Kernel build ID is
+`9cd99ee30eac7bfaeddb55944d89328674f0c831`; CDX build ID is
+`6ddf22b19d33e8e5d08cc57b8194643c3d955661`. Staged image SHA-256 is
+`b2417573622aa24a4acd6480152b29c66dd6b051cff0b3f27bc9b9316554e439`.
+The build emitted no compiler warnings; its four warnings were existing
+forced-task/build-path packaging diagnostics.
+
+Artifacts are under `/tmp/ask-flowtable-backend/`: host logs/XML, `healthy/`,
+`rearm/` and `terminal/` measurements and corresponding logs/XML, verified image
+identities, pre-terminal restoration evidence and post-unload diagnostics. The
+final boot's identity and restoration checks are recorded separately from the
+acceptance boot. Build log: `/tmp/ask-flowtable-backend-build.log`.
+
+Stop at this increment. The next step extracts the adapter into
+`ask_flowtable.ko` and proves provider references, loading, unloading and recovery
+using this interface. The code remains in `cdx.ko` until that separate proof.

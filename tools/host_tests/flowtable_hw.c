@@ -23,11 +23,37 @@ typedef uint64_t u64;
 #define ether_addr_copy(a,b) memcpy(a,b,6)
 #define lockdep_assert_held(m) assert(*(m))
 #define pr_err(...) ((void)0)
+#define pr_err_ratelimited(...) ((void)0)
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, value) ((x) = (value))
+#define ASSERT_RTNL() assert(rtnl)
+#define ARPHRD_ETHER 1
+#define ether_addr_equal(a,b) (!memcmp(a,b,6))
 #define CDX_DEBUG_FLOWTABLE 1
+#define module_param(...)
 #define module_param_named(...)
 #define MODULE_PARM_DESC(...)
 #define xchg(p, value) ({ __typeof__(*(p)) old = *(p); *(p) = (value); old; })
-struct net_device { char name[8]; };
+struct net { int unused; };
+static struct net init_net, other_net;
+struct net_device {
+    char name[8];
+    struct net *net;
+    unsigned type, addr_len;
+    bool bridge, l3_slave, running, carrier;
+    u8 dev_addr[6], perm_addr[6];
+};
+#define dev_net(d) ((d)->net)
+#define net_eq(a,b) ((a) == (b))
+#define netif_is_bridge_port(d) ((d)->bridge)
+#define netif_is_l3_slave(d) ((d)->l3_slave)
+#define netif_running(d) ((d)->running)
+#define netif_carrier_ok(d) ((d)->carrier)
+struct dpa_iface_info { struct { struct net_device *net_dev; } eth_info; };
+static struct dpa_iface_info in_iface, out_iface;
+static bool no_iface;
+static struct dpa_iface_info *dpa_get_ifinfo_by_itfid(unsigned id)
+{ return no_iface ? NULL : id == 1 ? &in_iface : &out_iface; }
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
 #define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
@@ -42,7 +68,7 @@ static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->pr
 struct key { bool linked, safe; };
 static struct key *key;
 struct hw_ct { void *td; unsigned index; struct key *handle; u64 pkts, bytes; u32 timestamp; };
-struct itf { unsigned type; };
+struct itf { unsigned type, index; };
 typedef struct { struct itf *itf, *input_itf, *underlying_input_itf; unsigned mtu; u8 dstmac[6]; } RouteEntry;
 typedef struct CtEntry {
     struct CtEntry *twin;
@@ -52,11 +78,18 @@ typedef struct CtEntry {
     __be32 Saddr_v4, Daddr_v4, twin_Saddr, twin_Daddr;
     __be16 Sport, Dport, twin_Sport, twin_Dport;
 } CtEntry, *PCtEntry;
-static struct itf in_itf = {129}, out_itf = {129};
+static struct itf in_itf = {129, 1}, out_itf = {129, 2};
 typedef struct { struct itf *itf; } OnifDesc, *POnifDesc;
 static OnifDesc in_onif = {&in_itf}, out_onif = {&out_itf};
-static POnifDesc get_onif_by_name(const char *name) { return !strcmp(name,"in") ? &in_onif : &out_onif; }
+static POnifDesc get_onif_by_name(const char *name) { return !strcmp(name,"in") ? &in_onif : !strcmp(name,"out") ? &out_onif : NULL; }
 static struct { struct { bool mutex; } ctrl; } instance = {{true}}, *cdx_info = &instance;
+static bool rtnl, rtnl_busy, quiesce_fail;
+static unsigned legacy_pending, quiesces;
+static void mutex_lock(bool *m) { assert(!*m); *m = true; }
+static void mutex_unlock(bool *m) { assert(*m); *m = false; }
+static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
+static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
+static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
 static int delete_result;
@@ -94,12 +127,98 @@ static int ExternalHashTableFmPcdHcSync(void *td)
 static void ExternalHashTableEntryFree(struct key *handle)
 { assert(handle == key && !key->linked && (key->safe || stopped)); free(key); key = NULL; }
 static void hw_ct_get_active(struct hw_ct *ct) { ct->pkts = 99; ct->bytes = 12345; ct->timestamp = 321; }
+static int dpa_cfg_quiesce(void)
+{
+    assert(rtnl && cdx_info->ctrl.mutex);
+    quiesces++;
+    if (quiesce_fail) return -EIO;
+    stopped = true;
+    return 0;
+}
 #include "hardware_types.inc"
 #include "hardware_production.inc"
+#include "backend_production.inc"
+
+static void test_backend(void)
+{
+    struct net_device in = { .name="in", .net=&init_net, .type=ARPHRD_ETHER,
+        .addr_len=ETH_ALEN, .running=true, .carrier=true, .dev_addr={2}, .perm_addr={2} };
+    struct net_device out = in;
+    strcpy(out.name, "out");
+    in_iface.eth_info.net_dev = &in; out_iface.eth_info.net_dev = &out;
+    struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
+        .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+    struct cdx_ft_hw *hw = NULL;
+    expected_proto = IPPROTO_UDP;
+    cdx_info->ctrl.mutex = false;
+    assert(!cdx_flowtable_enabled() && !cdx_flowtable_config_sealed());
+    assert(cdx_flowtable_mode_check() == 0);
+    ft_observe=true; assert(cdx_flowtable_mode_check() == -EINVAL); ft_observe=false;
+    offload_owner="wrong"; assert(cdx_flowtable_mode_check() == -EINVAL); offload_owner="cmm";
+    cdx_ft_begin();
+    assert(cdx_ft_claim() == -EOPNOTSUPP && !cdx_flowtable_config_sealed());
+    offload_owner="flowtable";
+    assert(cdx_flowtable_mode_check() == 0 && !cdx_ft_observing());
+    legacy_pending=1; assert(cdx_ft_claim() == -EBUSY); legacy_pending=0;
+    assert(cdx_ft_claim() == 0 && cdx_flowtable_config_sealed());
+    assert(cdx_ft_claim() == -EBUSY);
+    rtnl_busy=true; assert(cdx_ft_admission_begin() == -EAGAIN && !rtnl && cdx_info->ctrl.mutex);
+    rtnl_busy=false; assert(cdx_ft_admission_begin() == 0);
+    assert(cdx_ft_port_supported(&in) && cdx_ft_port_supported(&out));
+    assert(!cdx_ft_port_supported(NULL));
+    out.net=&other_net; assert(!cdx_ft_port_supported(&out)); out.net=&init_net;
+    out.bridge=true; assert(!cdx_ft_port_supported(&out)); out.bridge=false;
+    out.l3_slave=true; assert(!cdx_ft_port_supported(&out)); out.l3_slave=false;
+    out.carrier=false; assert(!cdx_ft_port_supported(&out)); out.carrier=true;
+    out.running=false; assert(!cdx_ft_port_supported(&out)); out.running=true;
+    out.dev_addr[5]=1; assert(!cdx_ft_port_supported(&out)); out.dev_addr[5]=0;
+    out.type=0; assert(!cdx_ft_port_supported(&out)); out.type=ARPHRD_ETHER;
+    out.addr_len=0; assert(!cdx_ft_port_supported(&out)); out.addr_len=ETH_ALEN;
+    strcpy(out.name,"missing"); assert(!cdx_ft_port_supported(&out)); strcpy(out.name,"out");
+    out_itf.type=2; assert(!cdx_ft_port_supported(&out)); out_itf.type=129;
+    no_iface=true; assert(!cdx_ft_port_supported(&out)); no_iface=false;
+    out_iface.eth_info.net_dev=&in; assert(!cdx_ft_port_supported(&out)); out_iface.eth_info.net_dev=&out;
+    ft_observe=true; assert(cdx_ft_add(&rule,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
+    fail_insert=true; assert(cdx_ft_add(&rule,&hw) == -EIO && !ft_live); fail_insert=false;
+    assert(cdx_ft_add(&rule,&hw) == 0 && ft_live == 1);
+    assert(cdx_ft_release() == -EBUSY && ft_claimed);
+    struct cdx_ft_counters counters;
+    cdx_ft_stats(hw,&counters); assert(counters.packets == 99);
+    cdx_ft_admission_end();
+    delete_result=EN_EHASH_DELETE_UNSYNCED;
+    assert(cdx_ft_del(&hw) == -EAGAIN && !hw && !ft_live && !cdx_ft_failed());
+    assert(cdx_ft_pending() == 1);
+    fail_sync=true; assert(cdx_ft_recover() == -EAGAIN && key && !key->safe);
+    assert(cdx_ft_release() == 0 && cdx_flowtable_config_sealed());
+    assert(cdx_ft_claim() == -EBUSY);
+    fail_sync=false; assert(cdx_ft_recover() == 0 && !key && !cdx_ft_pending());
+    assert(cdx_ft_claim() == 0 && cdx_flowtable_config_sealed());
+    assert(cdx_ft_admission_begin() == 0);
+    assert(cdx_ft_add(&rule,&hw) == 0);
+    cdx_ft_admission_end();
+    delete_result=-EIO;
+    assert(cdx_ft_del(&hw) == -EIO && !hw && !ft_live && cdx_ft_failed());
+    assert(cdx_ft_del(&hw) == 0 && cdx_ft_failed());
+    rtnl_busy=true; assert(cdx_ft_recover() == -EAGAIN && !quiesces && key->linked);
+    rtnl_busy=false; quiesce_fail=true;
+    assert(cdx_ft_recover() == -EAGAIN && quiesces == 1 && !stopped && key->linked);
+    quiesce_fail=false;
+    assert(cdx_ft_recover() == 0 && stopped && quiesces == 2 && key->linked);
+    assert(!allocations && !cdx_ft_pending() && cdx_ft_failed());
+    assert(cdx_ft_release() == 0 && cdx_flowtable_config_sealed());
+    assert(cdx_ft_claim() == -EOPNOTSUPP && cdx_ft_failed());
+    assert(cdx_ft_admission_begin() == 0);
+    assert(cdx_ft_add(&rule,&hw) == -EOPNOTSUPP && !hw);
+    cdx_ft_admission_end();
+    cdx_flowtable_quiesced();
+    cdx_ft_end();
+    assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
+    free(key); key=NULL; /* Only simulated hardware reset reclaims the live key. */
+}
 
 int main(void)
 {
-    struct net_device in = {"in"}, out = {"out"};
+    struct net_device in = { .name = "in" }, out = { .name = "out" };
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
     struct cdx_ft_hw *hw;
@@ -142,5 +261,6 @@ int main(void)
     free(key); key=NULL; stopped=false;
     assert(cdx_ft_hw_add(&rule,&hw)==0);
     assert(cdx_ft_hw_del(&hw)==0 && !hw && !key && !allocations);
+    test_backend();
     puts("Flowtable hardware: encoding, consuming delete, allocation-free retirement, barrier retry and quiescence passed");
 }

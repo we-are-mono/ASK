@@ -228,10 +228,24 @@ static void mutex_unlock(bool *m) { assert(*m); *m = false; }
 static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static int dpa_cfg_quiesce(void) { assert(rtnl && cdx_info->ctrl.mutex); return quiesce_fail ? -EIO : 0; }
-static int cdx_ft_hw_retry(void) { return retry_error; }
-static unsigned cdx_ft_hw_pending(void) { return private_pending; }
-static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
-static void cdx_ft_hw_quiesced(void) { assert(cdx_info->ctrl.mutex && !quiesce_fail); }
+static void cdx_ft_begin(void) { mutex_lock(&cdx_info->ctrl.mutex); }
+static void cdx_ft_end(void) { mutex_unlock(&cdx_info->ctrl.mutex); }
+static void cdx_ft_assert_held(void) { assert(cdx_info->ctrl.mutex); }
+static int cdx_ft_admission_begin(void) { return rtnl_trylock() ? 0 : -EAGAIN; }
+static void cdx_ft_admission_end(void) { rtnl_unlock(); }
+static bool cdx_ft_failed(void) { return ft_fatal; }
+static bool cdx_ft_observing(void) { return ft_observe; }
+static unsigned cdx_ft_pending(void) { return private_pending + legacy_pending; }
+static int cdx_ft_recover(void)
+{
+    assert(cdx_info->ctrl.mutex);
+    if (ft_fatal) {
+        if (!rtnl_trylock()) return -EAGAIN;
+        int rc = dpa_cfg_quiesce(); rtnl_unlock();
+        if (rc) return -EAGAIN;
+    }
+    return retry_error;
+}
 static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
 static unsigned neigh_scheduled;
 static void schedule_work(int *work) { assert(work == &ft_retire_work); neigh_scheduled++; }
@@ -242,7 +256,7 @@ static void dev_put(struct net_device *d) { assert(d->refs > 0); d->refs--; }
 static int atomic_read(int *v) { return *v; }
 static void atomic_set(int *v, int n) { *v = n; }
 static void ft_invalidate(void) { ft_invalid = 1; }
-static bool ft_physical(struct net_device *d) { return d && physical_ok; }
+static bool cdx_ft_port_supported(struct net_device *d) { return d && physical_ok; }
 static struct neighbour *neigh_lookup(struct neigh_table *table, const __be32 *dst, struct net_device *dev)
 {
     neigh_lookups++;
@@ -292,7 +306,7 @@ static struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
 }
 static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_block_offload *bo)
 { list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list); }
-static int cdx_ft_hw_add(const struct cdx_ft_rule *r, struct cdx_ft_hw **hw)
+static int cdx_ft_add(const struct cdx_ft_rule *r, struct cdx_ft_hw **hw)
 {
     if (hardware_fail) return -EIO;
     *hw = calloc(1, sizeof(**hw)); assert(*hw); live_hw++;
@@ -304,9 +318,64 @@ static int cdx_ft_hw_add(const struct cdx_ft_rule *r, struct cdx_ft_hw **hw)
     }
     return 0;
 }
-static int cdx_ft_hw_del(struct cdx_ft_hw **hw)
-{ assert(*hw && live_hw); live_hw--; free(*hw); *hw = NULL; return deletion_error; }
-static void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats) { *stats = hw->stats; }
+static int cdx_ft_del(struct cdx_ft_hw **hw)
+{ assert(*hw && live_hw); live_hw--; free(*hw); *hw = NULL; if (deletion_error == -EIO) ft_fatal = true; return deletion_error; }
+static void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats) { *stats = hw->stats; }
+
+/* Registration infrastructure; backend claim semantics are exercised against
+ * production CDX in flowtable_hw.c. Here each acquisition can fail in turn. */
+struct proc_dir_entry { int unused; };
+static struct proc_dir_entry proc_entry, *ft_proc;
+static int ft_proc_ops;
+static struct notifier_block ft_netdev_nb, ft_neigh_nb, ft_fib_nb;
+static unsigned registration_step, registration_failure, canceled;
+static bool backend_claimed, netdev_registered, neigh_registered, fib_registered, indirect_registered;
+static bool owner_enabled = true;
+static bool cdx_flowtable_enabled(void) { return owner_enabled; }
+static bool registration_fails(void) { return ++registration_step == registration_failure; }
+static struct proc_dir_entry *proc_create(const char *name, int mode, void *parent, void *ops)
+{ assert(!strcmp(name,"cdx_flowtable") && mode == 0400 && !parent); return registration_fails() ? NULL : &proc_entry; }
+static void proc_remove(struct proc_dir_entry *entry) { assert(entry == &proc_entry); }
+static int cdx_ft_claim(void)
+{
+    assert(cdx_info->ctrl.mutex && !backend_claimed);
+    if (registration_fails()) return -EBUSY;
+    backend_claimed = true; return 0;
+}
+static int cdx_ft_release(void)
+{
+    assert(cdx_info->ctrl.mutex && backend_claimed && !live_hw);
+    backend_claimed = false; return 0;
+}
+static int register_netdevice_notifier(struct notifier_block *nb)
+{ if (registration_fails()) return -ENOMEM; netdev_registered=true; return 0; }
+static int register_netevent_notifier(struct notifier_block *nb)
+{ if (registration_fails()) return -ENOMEM; neigh_registered=true; return 0; }
+static int register_fib_notifier(struct net *net, struct notifier_block *nb, void *cb, void *extack)
+{ if (registration_fails()) return -ENOMEM; fib_registered=true; return 0; }
+static void unregister_netdevice_notifier(struct notifier_block *nb)
+{ assert(netdev_registered); netdev_registered=false; }
+static void unregister_netevent_notifier(struct notifier_block *nb)
+{ assert(neigh_registered); neigh_registered=false; }
+static void unregister_fib_notifier(struct net *net, struct notifier_block *nb)
+{ assert(fib_registered); fib_registered=false; }
+static void cancel_work_sync(int *work) { assert(work == &ft_retire_work); canceled++; }
+static void cancel_delayed_work_sync(int *work) { assert(work == &ft_work); canceled++; }
+static int register_indirect(void)
+{ assert(ft_ready); if (registration_fails()) return -ENOMEM; indirect_registered=true; return 0; }
+static void unregister_indirect(void)
+{
+    assert(indirect_registered && canceled == 2 && !cdx_info->ctrl.mutex);
+    assert(!netdev_registered && !neigh_registered && !fib_registered);
+    while (ft_block_list.next != &ft_block_list) {
+        struct flow_block_cb *cb = list_entry(ft_block_list.next, struct flow_block_cb, driver_list);
+        list_del(&cb->driver_list); list_del(&cb->list);
+        cb->release(cb->priv); kfree(cb);
+    }
+    indirect_registered=false;
+}
+#define flow_indr_dev_register(fn, priv) register_indirect()
+#define flow_indr_dev_unregister(fn, priv, release) unregister_indirect()
 #include "flowtable_production.inc"
 
 static struct net_device in = { .ifindex = 5, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1} };
@@ -882,6 +951,34 @@ static void test_selective_routes(void)
     assert(ft_installs == ft_deletes && ft_errors == errors);
 }
 
+static void test_registration(void)
+{
+    for (registration_failure = 0; registration_failure <= 6; registration_failure++) {
+        /* A fresh adapter instance, backed by an independently owned CDX. */
+        ft_ready=ft_stopping=false; registration_step=canceled=0;
+        fixture();
+        int rc=cdx_flowtable_init();
+        if (registration_failure) {
+            assert(rc < 0 && !ft_ready && !ft_proc && !backend_claimed);
+        } else {
+            assert(!rc && ft_ready && backend_claimed);
+            assert(bind_device(&in,FLOW_BLOCK_BIND) == 0);
+            assert(bind_device(&out,FLOW_BLOCK_BIND) == 0);
+            struct cdx_ft_binding *b=list_entry(ft_bindings.next,struct cdx_ft_binding,list);
+            assert(b->dev == &in);
+            assert(ft_replace(b,&cls) == 0 && live_hw == 1);
+        }
+        cdx_flowtable_exit();
+        assert(!ft_proc && !ft_ready && !backend_claimed && !live_hw && !allocated);
+        assert(!netdev_registered && !neigh_registered && !fib_registered && !indirect_registered);
+        assert(!ft_count && !ft_bound && !ft_neighbour_refs && !ft_handle_refs);
+        assert(!in.refs && !out.refs && !cdx_info->ctrl.mutex);
+    }
+    owner_enabled=false; registration_failure=registration_step=0;
+    assert(cdx_flowtable_init() == 0 && !ft_ready && !backend_claimed && registration_step == 1);
+    cdx_flowtable_exit(); assert(!ft_proc && !cdx_info->ctrl.mutex);
+}
+
 int main(void)
 {
     struct cdx_ft_rule decoded;
@@ -969,5 +1066,6 @@ int main(void)
     test_neighbours();
     test_selective_neighbours();
     test_selective_routes();
+    test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
 }

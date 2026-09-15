@@ -2,32 +2,10 @@
 #ifndef CDX_FLOWTABLE_HW_H
 #define CDX_FLOWTABLE_HW_H
 
-#include <linux/types.h>
-#include <linux/if_ether.h>
+#include "cdx_flowtable_backend.h"
 
-struct net_device;
-struct cdx_ft_hw;
-
-/* All addresses and ports are in network byte order. No borrowed Linux flow
- * object or cookie crosses this boundary. The caller pins both netdevices and
- * serializes operations with cdx_info->ctrl.mutex. */
-struct cdx_ft_rule {
-	struct net_device *in;
-	struct net_device *out;
-	__be32 src, dst;
-	__be16 sport, dport;
-	u8 proto;
-	u8 src_mac[ETH_ALEN];
-	u8 dst_mac[ETH_ALEN];
-	u16 mtu;
-};
-
-struct cdx_ft_counters {
-	u64 packets;
-	u64 bytes;
-	u32 lastused;
-};
-
+/* CDX-internal firmware encoder. Only the backend and final CDX shutdown
+ * call these operations, with cdx_info->ctrl.mutex held. */
 int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result);
 void cdx_ft_hw_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. 0: removed and synchronized. -EAGAIN: unlinked but

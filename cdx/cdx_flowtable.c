@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Linux flowtable adapter for bounded IPv4 TCP and UDP offload.
  *
- * Hardware operations and lists: cdx_info->ctrl.mutex. Rule callbacks are
+ * Backend transactions serialize hardware operations and adapter lists. Rule callbacks are
  * process-context NF workqueue callbacks. Binding release runs after the
  * flow-block core excludes callbacks. Notifiers only latch invalidation and
- * queue work; they never take the control mutex. Neighbour notifications inspect
+ * queue work; they never start a backend transaction. Neighbour notifications inspect
  * immutable watched dependencies under ft_neigh_lock, nested inside neigh->lock.
- * Invalidation releases the mutex before flushing Netfilter work. Installation
- * and fatal recovery use RTNL trylock under the mutex, never a blocking acquire.
+ * Invalidation ends its transaction before flushing Netfilter work. The backend
+ * uses RTNL trylock for admission and fatal recovery, never a blocking acquire.
  * Each binding pins its ingress device; each installed direction pins egress.
  */
 #include <linux/etherdevice.h>
@@ -27,24 +27,12 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
-#include "portdefs.h"
-#include "cdx.h"
-#include "control_ipv4.h"
 #include "cdx_flowtable.h"
-#include "cdx_flowtable_hw.h"
-#include "devman.h"
+#include "cdx_flowtable_backend.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 5
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
-
-static char *offload_owner = "cmm";
-module_param(offload_owner, charp, 0444);
-MODULE_PARM_DESC(offload_owner, "Hardware flow owner: cmm (default) or flowtable; boot selection only");
-
-static bool ft_observe;
-module_param_named(flowtable_observe, ft_observe, bool, 0444);
-MODULE_PARM_DESC(flowtable_observe, "Validate requests but decline hardware installation");
 
 #ifdef CDX_DEBUG_FLOWTABLE
 static unsigned int ft_fail_stage;
@@ -71,7 +59,7 @@ struct cdx_ft_entry {
 	struct cdx_ft_counters reported;
 };
 
-/* Bound the control-mutex and atomic neighbour-list walks while proving
+/* Bound the backend transaction and atomic neighbour-list walks while proving
  * independent connection lifetimes. This is an adapter admission limit, not
  * firmware capacity; directions consume slots independently, without eviction.
  */
@@ -79,7 +67,7 @@ struct cdx_ft_entry {
 
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
-/* Watch publication/removal is serialized by ctrl.mutex. Atomic neighbour and
+/* Watch publication/removal is serialized by the backend transaction. Atomic neighbour and
  * route notifiers share the immutable rule, neigh and handle, protected against
  * entry removal here. Never take a neighbour lock while holding this lock. */
 static LIST_HEAD(ft_neigh_entries);
@@ -92,7 +80,7 @@ static atomic64_t ft_neigh_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_route_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
-static bool ft_ready, ft_stopping, ft_fatal;
+static bool ft_ready, ft_stopping;
 static atomic_t ft_invalid = ATOMIC_INIT(0);
 static bool ft_invalid_done;
 static struct proc_dir_entry *ft_proc;
@@ -101,25 +89,6 @@ static void ft_neigh_detach(struct cdx_ft_entry *entry);
 static void ft_retire_workfn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
 static DECLARE_WORK(ft_retire_work, ft_retire_workfn);
-
-bool cdx_flowtable_enabled(void)
-{
-	return !strcmp(offload_owner, "flowtable");
-}
-
-bool cdx_flowtable_ready(void)
-{
-	return READ_ONCE(ft_ready);
-}
-
-int cdx_flowtable_mode_check(void)
-{
-	if (strcmp(offload_owner, "cmm") && strcmp(offload_owner, "flowtable"))
-		return -EINVAL;
-	if (ft_observe && !cdx_flowtable_enabled())
-		return -EINVAL;
-	return 0;
-}
 
 static bool ft_fault(unsigned int stage)
 {
@@ -148,7 +117,7 @@ static struct cdx_ft_entry *ft_find(struct cdx_ft_binding *binding,
 	return NULL;
 }
 
-/* Called with either ctrl.mutex or the notifier's ft_neigh_lock held. The
+/* Called with either the backend transaction or the notifier's ft_neigh_lock held. The
  * handle is immutable, owned before watch publication and shared by both
  * directions. Marking it also excludes Linux's cached flow immediately;
  * native GC later retires that generation without flushing unrelated flows.
@@ -169,12 +138,10 @@ static void ft_neigh_invalidate(struct cdx_ft_entry *entry)
 
 static int ft_remove(struct cdx_ft_entry *entry)
 {
-	int rc = cdx_ft_hw_del(&entry->hw);
+	int rc = cdx_ft_del(&entry->hw);
 
 	if (rc) {
 		ft_errors++;
-		if (rc == -EIO)
-			ft_fatal = true;
 		ft_invalidate();
 	}
 	list_del(&entry->list);
@@ -192,7 +159,7 @@ static void ft_retire_workfn(struct work_struct *work)
 {
 	struct cdx_ft_entry *entry, *next;
 
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	list_for_each_entry_safe(entry, next, &ft_entries, list) {
 		/* A failed retirement escalates to the existing global recovery.
 		 * That worker proves a barrier or quiesces the datapath before
@@ -202,26 +169,7 @@ static void ft_retire_workfn(struct work_struct *work)
 		if (!nf_flow_offload_handle_valid(entry->handle))
 			ft_remove(entry);
 	}
-	mutex_unlock(&cdx_info->ctrl.mutex);
-}
-
-static bool ft_physical(struct net_device *dev)
-{
-	POnifDesc onif;
-	struct dpa_iface_info *iface;
-
-	if (!dev || !net_eq(dev_net(dev), &init_net) ||
-	    dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN ||
-	    netif_is_bridge_port(dev) || netif_is_l3_slave(dev) ||
-	    !netif_running(dev) || !netif_carrier_ok(dev) ||
-	    !ether_addr_equal(dev->dev_addr, dev->perm_addr))
-		return false;
-	onif = get_onif_by_name(dev->name);
-	if (!onif || onif->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
-		return false;
-	/* A name reused after a rename is not proof of physical-port identity. */
-	iface = dpa_get_ifinfo_by_itfid(onif->itf->index);
-	return iface && iface->eth_info.net_dev == dev;
+	cdx_ft_end();
 }
 
 /* Caller holds neigh->lock. STALE/DELAY/PROBE still have usable L2 addresses;
@@ -441,8 +389,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		memcpy(ethernet + offsets[i], &word, sizeof(word));
 	}
 	action = &rule->action.entries[4];
-	if (action->id != FLOW_ACTION_REDIRECT || !ft_physical(action->dev) ||
-	    !ft_physical(binding->dev) || action->dev == binding->dev ||
+	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_port_supported(action->dev) ||
+	    !cdx_ft_port_supported(binding->dev) || action->dev == binding->dev ||
 	    !is_valid_ether_addr(ethernet) ||
 	    !ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr) ||
 	    !ft_next_hop(cls, action->dev, ipv4.key->dst, next_hop) ||
@@ -485,7 +433,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	rc = ft_parse(binding, cls, &rule, &next_hop);
 	if (!rc)
 		ft_validated++;
-	if (rc || ft_observe || atomic_read(&ft_invalid) || ft_stopping || ft_fatal) {
+	if (rc || cdx_ft_observing() || atomic_read(&ft_invalid) || ft_stopping || cdx_ft_failed()) {
 		if (entry)
 			ft_remove(entry);
 		return rc ? rc : -EOPNOTSUPP;
@@ -518,7 +466,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	dev_hold(rule.out);
 	rc = ft_neigh_attach(entry);
 	if (!rc)
-		rc = ft_fault(2) ? -EIO : cdx_ft_hw_add(&rule, &entry->hw);
+		rc = ft_fault(2) ? -EIO : cdx_ft_add(&rule, &entry->hw);
 	if (rc) {
 		ft_neigh_detach(entry);
 		nf_flow_offload_handle_put(entry->handle);
@@ -556,7 +504,7 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 		ft_invalidate();
 		return -EOPNOTSUPP;
 	}
-	cdx_ft_hw_stats(entry->hw, &now);
+	cdx_ft_stats(entry->hw, &now);
 	/* 64-bit counters cannot wrap during this PoC's lifetime. A backwards
 	 * sample means hardware state was reset or could not be read reliably;
 	 * never turn it into an enormous unsigned delta or activity refresh. */
@@ -591,7 +539,7 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 
 	if (type != TC_SETUP_CLSFLOWER)
 		return -EOPNOTSUPP;
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	entry = ft_find(binding, cls->cookie);
 	if (entry && entry->handle != cls->nf_handle)
 		entry = NULL;
@@ -599,12 +547,12 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	case FLOW_CLS_REPLACE:
 		/* Never wait for RTNL here: device teardown under RTNL may be
 		 * flushing this workqueue. A busy configuration uses software. */
-		if (!rtnl_trylock()) {
+		if (cdx_ft_admission_begin()) {
 			ft_busy++;
 			rc = -EAGAIN;
 		} else {
 			rc = ft_replace(binding, cls);
-			rtnl_unlock();
+			cdx_ft_admission_end();
 		}
 		if (rc)
 			ft_rejects++;
@@ -618,7 +566,7 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 	default:
 		rc = -EOPNOTSUPP;
 	}
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ft_end();
 	return rc;
 }
 
@@ -627,29 +575,28 @@ static void ft_release(void *priv)
 	struct cdx_ft_binding *binding = priv;
 	struct cdx_ft_entry *entry, *next;
 
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	list_for_each_entry_safe(entry, next, &ft_entries, list)
 		if (entry->binding == binding)
 			ft_remove(entry);
 	list_del(&binding->list);
 	ft_bound--;
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ft_end();
 	dev_put(binding->dev);
 	kfree(binding);
 }
 
 /* All previous callbacks must have lost their bindings, and the worker must
  * have finished both hardware retirement and Linux flow cleanup. Completion
- * is published as its last action under ctrl.mutex, so an old worker cannot
+ * is published as its last action under the backend transaction, so an old worker cannot
  * change a newly admitted table. Never reset the fatal latch or error history.
  */
 static bool ft_can_rearm(void)
 {
-	lockdep_assert_held(&cdx_info->ctrl.mutex);
-	return ft_ready && !ft_stopping && !ft_fatal &&
+	cdx_ft_assert_held();
+	return ft_ready && !ft_stopping && !cdx_ft_failed() &&
 		atomic_read(&ft_invalid) && ft_invalid_done &&
-		!ft_bound && !ft_count && !ft_neighbour_refs && !ft_handle_refs && !cdx_ft_hw_pending() &&
-		!cdx_ehash_quarantine_pending();
+		!ft_bound && !ft_count && !ft_neighbour_refs && !ft_handle_refs && !cdx_ft_pending();
 }
 
 static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
@@ -668,10 +615,10 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 	    bo->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
 		return -EOPNOTSUPP;
 	bo->driver_block_list = &ft_block_list;
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	if (bo->command == FLOW_BLOCK_BIND) {
 		rearm = atomic_read(&ft_invalid);
-		if (!ft_ready || ft_stopping || ft_fatal || !ft_physical(dev) ||
+		if (!ft_ready || ft_stopping || cdx_ft_failed() || !cdx_ft_port_supported(dev) ||
 		    ft_bound >= 2 || (rearm && !ft_can_rearm())) {
 			rc = -EOPNOTSUPP;
 			goto out;
@@ -736,7 +683,7 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 		rc = -EOPNOTSUPP;
 	}
 out:
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ft_end();
 	return rc;
 }
 
@@ -747,31 +694,13 @@ static void ft_invalidate_work(struct work_struct *work)
 	struct cdx_ft_entry *entry, *next;
 	unsigned int n = 0, i;
 
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	list_for_each_entry_safe(entry, next, &ft_entries, list)
 		ft_remove(entry);
-	/* RTNL holders may flush Netfilter callbacks waiting for ctrl.mutex.
-	 * Never block acquiring RTNL under that mutex. Retry quiescence until
-	 * proven; software fallback is not declared while a key may be live. */
-	if (ft_fatal) {
-		int rc = -EAGAIN;
-
-		if (rtnl_trylock()) {
-			rc = dpa_cfg_quiesce();
-			rtnl_unlock();
-		}
-		if (rc) {
-			mutex_unlock(&cdx_info->ctrl.mutex);
-			pr_err_ratelimited("cdx flowtable: waiting for hardware quiescence; reboot required\n");
-			if (!READ_ONCE(ft_stopping))
-				schedule_delayed_work(&ft_work, HZ);
-			return;
-		}
-		pr_err("cdx flowtable: hardware stopped after unproven deletion; reboot required\n");
-		cdx_ft_hw_quiesced();
-	}
-	if (cdx_ft_hw_retry()) {
-		mutex_unlock(&cdx_info->ctrl.mutex);
+	/* CDX retains failed deletions and owns the terminal hardware latch.
+	 * Retry until a barrier or datapath quiescence makes retirement safe. */
+	if (cdx_ft_recover()) {
+		cdx_ft_end();
 		if (!READ_ONCE(ft_stopping))
 			schedule_delayed_work(&ft_work, HZ);
 		return;
@@ -782,18 +711,18 @@ static void ft_invalidate_work(struct work_struct *work)
 		devices[n++] = binding->dev;
 		dev_hold(binding->dev);
 	}
-	mutex_unlock(&cdx_info->ctrl.mutex);
-	/* This flush waits for rule callbacks: never hold the control mutex. */
+	cdx_ft_end();
+	/* This flush waits for rule callbacks: end the backend transaction first. */
 	for (i = 0; i < n; i++) {
 		nf_flow_table_cleanup(devices[i]);
 		dev_put(devices[i]);
 	}
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	pr_info("cdx flowtable: invalidated; hardware admission disabled\n");
 	/* No state changes or deferred work after publishing completion. A
 	 * later first bind may now recover if every old binding has gone. */
 	ft_invalid_done = true;
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ft_end();
 }
 
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
@@ -898,28 +827,28 @@ static int ft_show(struct seq_file *seq, void *unused)
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
 
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
 		   "neighbour_invalidations %lld\nroute_invalidations %lld\n",
-		   offload_owner, ft_observe, ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
+		   cdx_flowtable_enabled() ? "flowtable" : "cmm", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
-		   ft_invalid_done, ft_fatal,
-		   cdx_ft_hw_pending() + cdx_ehash_quarantine_pending(),
+		   ft_invalid_done, cdx_ft_failed(),
+		   cdx_ft_pending(),
 		   ft_can_rearm(), ft_rearms, ft_neighbour_refs, ft_handle_refs,
 		   atomic64_read(&ft_neigh_invalidations),
 		   atomic64_read(&ft_route_invalidations));
 	list_for_each_entry(entry, &ft_entries, list) {
-		cdx_ft_hw_stats(entry->hw, &stats);
+		cdx_ft_stats(entry->hw, &stats);
 		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 			   &entry->rule.src, ntohs(entry->rule.sport),
 			   &entry->rule.dst, ntohs(entry->rule.dport), entry->rule.proto, entry->rule.mtu,
 			   &entry->next_hop, stats.packets, stats.bytes, stats.lastused);
 	}
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ft_end();
 	return 0;
 }
 DEFINE_PROC_SHOW_ATTRIBUTE(ft);
@@ -933,9 +862,14 @@ int cdx_flowtable_init(void)
 		return -ENOMEM;
 	if (!cdx_flowtable_enabled())
 		return 0;
-	rc = register_netdevice_notifier(&ft_netdev_nb);
+	cdx_ft_begin();
+	rc = cdx_ft_claim();
+	cdx_ft_end();
 	if (rc)
 		goto proc;
+	rc = register_netdevice_notifier(&ft_netdev_nb);
+	if (rc)
+		goto release;
 	rc = register_netevent_notifier(&ft_neigh_nb);
 	if (rc)
 		goto netdev;
@@ -952,6 +886,10 @@ neigh:
 	unregister_netevent_notifier(&ft_neigh_nb);
 netdev:
 	unregister_netdevice_notifier(&ft_netdev_nb);
+release:
+	cdx_ft_begin();
+	WARN_ON_ONCE(cdx_ft_release());
+	cdx_ft_end();
 proc:
 	proc_remove(ft_proc);
 	ft_proc = NULL;
@@ -968,9 +906,9 @@ void cdx_flowtable_exit(void)
 		return;
 	/* Serialize with rule callbacks which may queue either worker. Atomic
 	 * notifiers are then unregistered synchronously before cancellation. */
-	mutex_lock(&cdx_info->ctrl.mutex);
+	cdx_ft_begin();
 	WRITE_ONCE(ft_stopping, true);
-	mutex_unlock(&cdx_info->ctrl.mutex);
+	cdx_ft_end();
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
 	unregister_netdevice_notifier(&ft_netdev_nb);
@@ -978,9 +916,7 @@ void cdx_flowtable_exit(void)
 	cancel_delayed_work_sync(&ft_work);
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	WRITE_ONCE(ft_ready, false);
-}
-
-void cdx_flowtable_quiesced(void)
-{
-	cdx_ft_hw_quiesced();
+	cdx_ft_begin();
+	WARN_ON_ONCE(cdx_ft_release());
+	cdx_ft_end();
 }
