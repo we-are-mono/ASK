@@ -1,16 +1,18 @@
 # Linux flowtable offload: design and first proof of concept
 
-Status: bounded multiple-connection IPv4 UDP/TCP offload, ordinary ARP and IPv4
-gateway routing demonstrated on the DUT. Neighbour invalidation is selective
-with automatic recovery. IPv4 route-prefix, physical-port MTU and administrative
-down/up changes use flow-generation retirement and have passed focused DUT proofs.
-Other recognized changes to relevant devices and routing-policy changes retain
-whole-table invalidation; unrelated devices leave hardware entries alone.
-The earlier intermittent UDP loss remains unresolved and deferred; its scope and
-evidence are recorded separately below.
+Status: the bounded CMM-retirement foundation is implemented and verified for
+routed IPv4 TCP/UDP on two physical ports, with up to 64 hardware directions.
+Linux flowtables and the loadable adapter operate without CMM or FCI. Device,
+route and neighbour recovery, safe teardown, live policy revocation, capacity
+fallback/reuse and concurrent reconfiguration have focused DUT evidence.
+The [foundation checkpoint](flowtable-foundation.md) defines the accepted scope,
+remaining feature work and verification limits; the [policy guide](flowtable-policy.md)
+covers operation and useful CMM setting migration. Previously observed intermittent
+link loss remains documented and deferred, without claiming an unrelated fix.
+
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
-This document records the direction, initial scope, and acceptance requirements.
-Concrete implementation contracts and the remaining acceptance work appear below.
+This document retains the architectural direction, implementation contracts and
+dated evidence. Later increments supersede the earlier scope limits where stated.
 
 ## Purpose and constraints
 
@@ -2336,3 +2338,58 @@ They ran on the already verified/staged startup image, without another build or
 an alternative kernel. Artifacts are in `/tmp/ask-flowtable-pressure/`, including
 `capacity/`, `concurrent-final/` and the retained earlier probes. No full suite
 was run.
+
+
+## Foundation closure and legacy return — 2026-09-15
+
+The planned foundation increments are complete within the bounded IPv4 TCP/UDP
+scope. This includes automatic device/route/neighbour recovery, physical identity
+and removal, provider terminal safety, partial-admission recovery, nexthop-object
+retirement, policy/configuration migration with live revocation, CMM/FCI-free
+startup, and concurrent reconfiguration/resource-pressure acceptance. The
+[checkpoint](flowtable-foundation.md) separates those supported contracts from
+future CMM feature parity. Existing proprietary firmware and initial FMC hardware
+setup remain in use. No eBPF/XDP implementation or alternative-kernel work was
+required to establish this boundary.
+
+The final image was booted once into default CMM ownership for compatibility.
+CMM/FCI/auto_bridge loaded, the experimental adapter stayed absent, and its policy
+startup hook made no change. Both paced TCP hardware forwarding and unsupported
+CMM control replies passed in 17.41 seconds. TCP delivered 500,170,752 bytes at
+799.95 Mb/s; CMM's hardware connection table grew from zero to two identifiable
+TCP connections. Software LAN RX increased by 428 packets versus at least 333,447
+data frames. Idle/traffic busy CPU was 1.76%/3.44%, with traffic softirq 1.38%.
+This proof uses hardware entries and software packet counts without requiring a
+10 Gb/s link or a throughput threshold.
+
+The first CMM traffic attempt ended before connection establishment with
+"No route to host" and an empty hardware table. The LAN gateway neighbour was
+FAILED while the 1 Gb/s link reported carrier. Ordinary ARP during a two-packet
+gateway ping recovered the neighbour and both pings succeeded. The same CMM boot
+then passed the two tests without configuration, reset or code changes. The
+failure and connectivity observations remain in the artifacts; no cause or
+network fix is inferred. Default-mode KASAN/lockdep diagnostics were clean,
+debug_locks was 1 and taint was 4096.
+
+Compatibility evidence is in `/tmp/ask-flowtable-acceptance/cmm/`, with the
+successful run in `retry/`. This is the same staged KASAN image identified in
+the startup increment above. The full KASAN suite and alternative kernel were
+explicitly excluded. Each implementation or proved acceptance increment was
+committed separately; no persistent boot environment, flash deployment or branch
+push is part of this work.
+
+
+A final fresh flowtable boot then passed the independent UDP/TCP startup proof
+in 53.76 seconds, with CMM never started and FCI/auto_bridge absent. The hardware
+window again delivered 256 exact UDP hits and 4 MiB TCP per direction. Software
+TX was 4/15; aggregate busy CPU was
+2.27% and softirq 0.41%.
+The running kernel/module IDs match the staged image. Final state has
+4 installs and 4 deletes, zero bindings/entries/handles/neighbour references,
+zero invalidation/fatal/quarantine/errors, and all fault controls clear. KASAN and
+lockdep remain clean with debug_locks 1 and taint 4096. Test tables, host routes,
+NAT exemptions and temporary devices are removed; physical MTUs, NUD settings
+and endpoint configuration are restored. The shipped policy remains disabled.
+The LAN retains its verified 1 Gb/s link and default gateway. Final image,
+traffic, cleanup and diagnostics evidence is in
+`/tmp/ask-flowtable-acceptance/final/`.
