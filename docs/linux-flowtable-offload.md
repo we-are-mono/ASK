@@ -2295,3 +2295,44 @@ The KASAN image was built and staged. Verified kernel ID is
 Logs, dependency evidence and traffic records are in `/tmp/ask-flowtable-startup/`;
 build log is `/tmp/ask-flowtable-startup-build.log` (three existing forced-task
 warnings). Default-CMM compatibility is a separate final acceptance check.
+
+## Resource pressure and concurrent reconfiguration — verified 2026-09-15
+
+The capacity test passes in 72.02 seconds. It fills all 64 hardware directions
+with 32 independent UDP/TCP connections, then opens one additional UDP and TCP
+connection. Both overflow connections deliver exact data in software while all
+existing hardware cookies/counters remain valid and the 64-direction bound holds.
+Their software TX window counts 5900/5854 packets. Deleting one original UDP
+conntrack and closing one original TCP socket releases four directions. Native
+software refresh then admits the same overflow sockets/conntracks into those
+slots, without disturbing the 30 survivors. The overflow hardware window verifies
+256 UDP hits per direction and 4 MiB TCP per direction, with software TX 4/10.
+The initial full-set hardware window has software TX 4/17, busy CPU 2.29% and
+softirq 0.44%. All connections and references drain after the test.
+
+The concurrent test passes in 75.25 seconds. Three workers each launch
+three controller calls with alternating policies while another performs twelve real
+route-metric replacements and twelve physical MTU changes. All nine policies
+complete their proven drain boundary; all 24 network operations succeed. The
+same UDP and TCP sockets each complete 1,447 numbered records without loss or
+late delivery (23,707,648 bytes in each TCP direction). Route retirement advances
+by four generations and MTU retirement by two. An explicit final desired policy
+then admits both sockets into stable hardware: 256 exact UDP hits per direction,
+4 MiB TCP per direction, software TX 4/15, busy CPU 2.19% and softirq 0.47%.
+
+The first concurrent run passed with identical route replacement and real MTU
+changes, but it did not establish a route-metric change. The strengthened probe
+initially overrequired both cause counters to advance: route retirement can
+invalidate a shared generation before the paired MTU notification arrives, so
+only the first cause is counted. That failed test assertion is preserved with
+its source and logs. The corrected test requires observed route retirement,
+successful MTU changes and balanced lifecycle state without double-counting a
+coalesced generation. No product change was needed for either pressure proof.
+
+KASAN/lockdep diagnostics are clean, debug_locks is 1, taint is 4096, all backend
+references and bindings drain, installs equal deletes, and no backend error or
+quarantine remains. CMM stayed stopped and FCI absent throughout these proofs.
+They ran on the already verified/staged startup image, without another build or
+an alternative kernel. Artifacts are in `/tmp/ask-flowtable-pressure/`, including
+`capacity/`, `concurrent-final/` and the retained earlier probes. No full suite
+was run.

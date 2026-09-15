@@ -88,7 +88,7 @@ class Peer:
 
 
 @asynccontextmanager
-async def peer(r, flows=FLOWS):
+async def peer(r, flows=FLOWS, *, initial_ids=None):
     specs = {f["id"]: f for f in flows}
     accepted = asyncio.Queue()
     tasks, writers, errors, tcp_counts = set(), set(), [], {}
@@ -137,7 +137,7 @@ async def peer(r, flows=FLOWS):
         controller = Peer(reader, writer, flows)
         ready = json.loads(await asyncio.wait_for(reader.readline(), 5))
         assert ready == {"ready": config["token"]}, ready
-        await controller.rpc("open", list(specs))
+        await controller.rpc("open", list(specs) if initial_ids is None else initial_ids)
         yield controller
     finally:
         shutdown_error = None
