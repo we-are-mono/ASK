@@ -195,13 +195,32 @@ ASK `fmc` patch added `FM_PORT_GetEnabled` calls to `fmc_exec.c` without
 stubbing the symbol in `FMCDummyDriver.c`, so host mode needs that one stub
 added before it links.
 
+## The soft-parser `$ccbase` offset
+
+`cdx_sp.xml` reaches the PPPoE relay table by a hardcoded offset from the CC
+base, and its own comment warns the value must be rechecked whenever a table is
+added:
+
+```xml
+<if-false>  <!-- PPPoE session packet -->
+  <assign-variable name="$ccbase" value="$ccbase + 0x30"/>
+```
+
+The builder reproduces fmc's group ordering exactly, so the offset lands where it
+always did. That holds on hardware: `test_pppoe_e2e.py` passes all three tiers,
+including `test_pppoe_lan_through_dut_iperf_offloaded`, whose second oracle
+requires the flow to appear in cmm's connections table with `STRIP_PPPoE_HDR` —
+which only happens if ingress PPPoE session frames actually reached the relay
+table. That test exists to catch the case where throughput looks fine but FMAN
+never engaged.
+
+What has *not* been done is reading the numeric relationship back: nobody has
+printed the CC root AD base and each group's AD address to confirm why `0x30`
+selects the PPPoE group when it is group 1. The behaviour it controls is
+verified; the arithmetic behind it is still folklore. Worth an instrumented boot
+before anyone reorders `cdx_pcd_groups[]` or adds a thirteenth group.
+
 ## Open
 
-**The soft-parser `$ccbase` offset.** `cdx_sp.xml` computes the PPPoE relay
-table address as `$ccbase + 0x30`, and its own comment warns the value must be
-rechecked whenever a table is added. Group 1 is PPPoE but `0x30` is three entries
-in, so either the addressing is not 16 bytes per group or `$ccbase` is not the CC
-root base. The builder reproduces the group ordering exactly, which is the
-conservative answer, but the coupling has not been confirmed on hardware:
-instrument a boot, print the CC root AD base and each group's AD address, and
-pin it down.
+Nothing blocking. See ISSUES.md A138 for the missing external-hash delete, which
+makes a failed or torn-down install need a reboot.
