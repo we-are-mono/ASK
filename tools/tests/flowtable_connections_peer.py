@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import errno
 import json
 import os
+import resource
 import socket
 import struct
 import time
@@ -79,21 +80,24 @@ class Flow:
                 if self.spec["wire"].get("zero_checksum"):
                     self.sock.setsockopt(socket.SOL_SOCKET, 11, 1)  # Linux SO_NO_CHECK
 
-    async def run(self, count, interval, allow_loss=False):
-        # Only explicit UDP outage windows may lose datagrams. TCP and all
-        # steady-state windows retain exact serial delivery requirements.
+    async def run(self, count, interval, allow_loss=False, udp_timeout=None):
+        # Loss-tolerant UDP windows validate every received payload. Their
+        # controller supplies the loss budget; TCP always requires delivery.
         assert not (allow_loss and self.writer)
+        deadline = 20 if self.writer else (udp_timeout if udp_timeout is not None
+                                           else 0.1 if allow_loss else 5)
+        assert deadline > 0
         first = self.serial
         received = lost = late = 0
         size = TCP_SIZE if self.writer else UDP_SIZE
         loop = asyncio.get_running_loop()
         # Spread the streams within each pacing interval.
-        await asyncio.sleep(self.spec["id"] * interval / 32)
+        await asyncio.sleep((self.spec["id"] % 256) * interval / 256)
         started = time.monotonic()
         while not self.stop.is_set() and (not count or self.serial - first < count):
             data = payload(self.spec["id"], self.serial, size)
             try:
-                async with asyncio.timeout(20 if self.writer else 0.1 if allow_loss else 5):
+                async with asyncio.timeout(deadline):
                     if self.writer:
                         self.writer.write(data)
                         await self.writer.drain()
@@ -122,6 +126,7 @@ class Flow:
                 if not allow_loss or (isinstance(error, OSError) and not isinstance(error, TimeoutError)
                                       and error.errno not in {errno.EHOSTUNREACH, errno.ENETUNREACH,
                                                               errno.ECONNREFUSED}):
+                    error.add_note(f"flow={self.spec} serial={self.serial} first={first}")
                     if self.wire:
                         packets, drops = struct.unpack("II", self.wire.getsockopt(263, 6, 8))
                         error.add_note(f"receive capture: {packets} packets, {drops} socket drops; serial={self.serial}")
@@ -156,12 +161,13 @@ class Flow:
 
 
 async def main(config):
-    flows = {spec["id"]: Flow(spec, udp_wire_payload, udp_capture_socket) for spec in config["flows"]}
+    global TCP_SIZE
+    TCP_SIZE = config["tcp_size"]
+    flows = {}
     running = {}
     control = None
     reports = []
-    servers = EchoServers(config.get("servers", []), config["flows"], namespace, payload,
-                          udp_wire_payload, udp_capture_socket)
+    servers = None
 
     async def finish(ids, stop=False):
         if stop:
@@ -174,12 +180,27 @@ async def main(config):
         return result
 
     try:
-        await servers.start()
         # A local lease also ends traffic if the controller disappears.
-        async with asyncio.timeout(180):
-            reader, control = await asyncio.open_connection(config["wan"], config["control_port"])
+        async with asyncio.timeout(config["lease"]):
+            reader, control = await asyncio.open_connection(config["wan"], config["control_port"], limit=8 << 20)
             control.write(json.dumps({"ready": config["token"]}).encode() + b"\n")
             await control.drain()
+            workload = json.loads(await asyncio.wait_for(reader.readline(), 15))
+            specs = workload["flows"]
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            needed = len(specs) * 2 + 256
+            assert needed <= hard, (needed, hard)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, needed), hard))
+            flows = {spec["id"]: Flow(spec, udp_wire_payload, udp_capture_socket) for spec in specs}
+            servers = EchoServers(config.get("servers", []), specs, namespace, payload,
+                                  udp_wire_payload, udp_capture_socket)
+            await servers.start()
+            opening = asyncio.Semaphore(32)
+
+            async def open_one(ident):
+                async with opening:
+                    await flows[ident].open(config)
+
             while line := await asyncio.wait_for(reader.readline(), 35):
                 command = json.loads(line)
                 op, ids = command["op"], command.get("ids", [])
@@ -187,7 +208,11 @@ async def main(config):
                 if op == "open":
                     async with asyncio.TaskGroup() as group:
                         for ident in ids:
-                            group.create_task(flows[ident].open(config))
+                            group.create_task(open_one(ident))
+                elif op == "status":
+                    result = {"running": len(running), "errors": {
+                        ident: repr(task.exception()) for ident, task in running.items()
+                        if task.done() and not task.cancelled() and task.exception()}}
                 elif op == "neighbour":
                     flow = flows[command["ident"]]
                     with namespace(flow.spec):
@@ -200,7 +225,8 @@ async def main(config):
                         flow = flows[ident]
                         flow.stop.clear()
                         running[ident] = asyncio.create_task(flow.run(command["count"], command["interval"],
-                                                                     command.get("allow_loss", False)))
+                                                                     command.get("allow_loss", False),
+                                                                     command.get("udp_timeout")))
                 elif op in {"wait", "stop"}:
                     result = await finish(ids, stop=op == "stop")
                 elif op == "close":
@@ -215,7 +241,9 @@ async def main(config):
                 await control.drain()
                 if op == "shutdown":
                     assert not servers.errors, servers.errors
-                    print(json.dumps({"reports": reports, "closed": True, "servers": servers.status()}), flush=True)
+                    print(json.dumps({"reports": reports if len(flows) <= 64 else None,
+                                      "report_groups": len(reports), "flows": len(flows),
+                                      "closed": True, "servers": servers.status()}), flush=True)
                     return
             raise AssertionError("controller disconnected without shutdown")
     finally:
@@ -230,7 +258,8 @@ async def main(config):
                 flow.sock.close()
             if flow.wire:
                 flow.wire.close()
-        await servers.close()
+        if servers:
+            await servers.close()
         if control:
             control.close()
             await control.wait_closed()

@@ -1,4 +1,4 @@
-"""Prove independent connection lifetimes at the bounded admission limit."""
+"""Prove independent connection lifetimes within the admission budget."""
 from __future__ import annotations
 
 import asyncio
@@ -40,8 +40,8 @@ def keys(r, ids):
 
 
 def healthy(state):
-    assert state["bindings"] == 2 and state["max_entries"] == 64, state
-    assert state["entries"] == state["neighbour_refs"] == len(state["flows"]), state
+    assert state["bindings"] == 2 and state["max_entries"] == 32768, state
+    assert state["entries"] == state["neighbour_refs"] == state["handle_refs"] == len(state["flows"]), state
     assert state["invalidated"] == state["fatal"] == state["quarantine"] == state["errors"] == 0, state
 
 
@@ -62,8 +62,9 @@ async def delete_connection(r, ident):
 
 
 class Peer:
-    def __init__(self, reader, writer, flows):
+    def __init__(self, reader, writer, flows, tcp_size=TCP_SIZE):
         self.reader, self.writer = reader, writer
+        self.tcp_size = tcp_size
         self.flows = {f["id"]: f for f in flows}
 
     async def rpc(self, op, ids=None, **kwargs):
@@ -82,17 +83,17 @@ class Peer:
         assert set(result) == set(ids), result
         for ident, report in result.items():
             assert report["count"] == count, report
-            size = TCP_SIZE if self.flows[ident]["proto"] == "tcp" else UDP_SIZE
+            size = self.tcp_size if self.flows[ident]["proto"] == "tcp" else UDP_SIZE
             assert report["bytes"] == count * size, report
         return result
 
 
 @asynccontextmanager
-async def peer(r, flows=FLOWS, *, initial_ids=None, servers=()):
+async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_size=TCP_SIZE):
     specs = {f["id"]: f for f in flows}
     accepted = asyncio.Queue()
     tasks, writers, errors, tcp_counts = set(), set(), [], {}
-    control_server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT + 1)
+    control_server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT + 1, limit=8 << 20)
     server = task = controller = None
 
     async def echo(reader, writer):
@@ -106,11 +107,11 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=()):
             tcp_counts[ident] = 0
             while True:
                 try:
-                    data = await reader.readexactly(TCP_SIZE)
+                    data = await reader.readexactly(tcp_size)
                 except asyncio.IncompleteReadError as error:
                     assert not error.partial, (ident, "partial TCP record", len(error.partial))
                     break
-                assert data == payload(ident, tcp_counts[ident], TCP_SIZE), (ident, tcp_counts[ident])
+                assert data == payload(ident, tcp_counts[ident], tcp_size), (ident, tcp_counts[ident])
                 tcp_counts[ident] += 1
                 writer.write(data)
                 await writer.drain()
@@ -136,16 +137,21 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=()):
     try:
         server = await asyncio.start_server(accept, WAN_IP, DPORT)
         config = {"lan": r.lan_ip, "wan": WAN_IP, "dport": DPORT,
-                  "control_port": DPORT + 1, "flows": flows, "servers": list(servers), "token": secrets.token_hex(16)}
+                  "control_port": DPORT + 1, "servers": list(servers), "token": secrets.token_hex(16),
+                  "lease": lease, "tcp_size": tcp_size}
         script = (f"CONFIG={config!r}\n" + Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_udp_wire.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_echo_peer.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_connections_peer.py").read_text())
-        task = asyncio.create_task(lan_run_python(r.lan, script, timeout=200, label="flowtable_connections"))
+        task = asyncio.create_task(lan_run_python(r.lan, script, timeout=lease + 20, label="flowtable_connections"))
         reader, writer = await asyncio.wait_for(accepted.get(), 15)
-        controller = Peer(reader, writer, flows)
+        controller = Peer(reader, writer, flows, tcp_size)
         ready = json.loads(await asyncio.wait_for(reader.readline(), 5))
         assert ready == {"ready": config["token"]}, ready
+        # Transfer the potentially large workload over the control connection,
+        # keeping the console staging command independent of connection count.
+        writer.write(json.dumps({"flows": flows}).encode() + b"\n")
+        await writer.drain()
         await controller.rpc("open", list(specs) if initial_ids is None else initial_ids)
         yield controller
     finally:
@@ -196,7 +202,7 @@ async def connections(rig):
     cleanup = []
     try:
         initial = await r.state()
-        assert not initial["observe"] and initial["max_entries"] == 64, initial
+        assert not initial["observe"] and initial["max_entries"] == 32768, initial
         for proto in ("udp", "tcp"):
             nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", proto,
                    "--sport", f"{SPORT}:{SPORT + 15}", "--dport", str(DPORT), "-j", "ACCEPT"]

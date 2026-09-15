@@ -129,7 +129,7 @@ recovery boundary.
 | Global acceleration enable/disable | `enabled` and `apply`/`stop` |
 | Hardware UDP/TCP inactivity policy | Linux `net.netfilter.nf_flowtable_udp_timeout` / `nf_flowtable_tcp_timeout`; verify hardware behaviour when changing lifetime policy |
 | Connection table limits and protocol state timeouts | Native `net.netfilter.nf_conntrack_max` and protocol-specific conntrack sysctls |
-| Backend hardware capacity | Current bounded 64-direction implementation; no invented sysctl or live resize guarantee |
+| Backend hardware capacity | 32,768-direction admission budget; see [capacity](flowtable-capacity.md); no live resize guarantee |
 | Owner and observe mode | Explicit boot selection / immutable provider parameters |
 | CMM logging and CLI listener | Retired with the daemon; CLI errors, Linux diagnostics and backend counters replace them |
 | VLAN, tunnel, Wi-Fi and asymmetric feature settings | Feature-specific future increments; unsupported traffic continues through Linux |

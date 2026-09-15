@@ -145,7 +145,15 @@ def render(policy):
 
 def backend_state():
     try:
-        text = PROC.read_text()
+        # Only the header is needed for policy decisions. A populated table
+        # can have megabytes of per-flow diagnostics after it.
+        with PROC.open() as stream:
+            lines = []
+            for line in stream:
+                if line.startswith("flow "):
+                    break
+                lines.append(line)
+        text = "".join(lines)
     except FileNotFoundError:
         require(not Path("/sys/module/ask_flowtable").exists(), "adapter teardown is still in progress")
         return None

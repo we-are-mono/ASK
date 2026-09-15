@@ -142,3 +142,20 @@ and four deletes, with entries, bindings, errors, invalidated, fatal and
 quarantine all zero. No nftables table or LAN echo generator remained. The LAN
 NIC had promiscuity zero, `rx-all off`, and a 10 Gb/s link. The experimental
 boot's captured kernel log contained no splats or I2C stuck messages.
+
+## Capacity-run observation — 2026-09-15
+
+During later mixed TCP/UDP capacity testing, one 10 Gb/s UDP failure coincided
+with two new X550 receive CRC errors (2785 → 2787). The generator UDP socket
+had no drops and DUT port error/drop counters remained zero. This occurred
+after the operator's cable replacement; it neither identifies a faulty
+component nor establishes that the cable replacement had no benefit.
+
+The operator requested that isolated errors in the cable-heavy homelab not
+displace the main work. The capacity test therefore records a small explicit
+UDP loss allowance while retaining exact payload checks, per-connection
+delivery, advancing hardware counters and lifecycle requirements. Its
+separate loss during unpaced bulk readmission is not attributed to these
+CRC events. See the [capacity record](flowtable/history/capacity.md) for the
+measurements, failed attempts and acceptance boundary. No new component
+isolation was performed and this investigation remains open.

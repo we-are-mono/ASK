@@ -40,7 +40,9 @@ ARTIFACTS = Path(os.environ.get("ASK_FLOWTABLE_ARTIFACTS", "/tmp/ask-flowtable")
 
 
 async def read(agent, session, path):
-    result = await agent.fs_read(session, path)
+    limit = 16 << 20 if path == "/proc/cdx_flowtable" else 1 << 20
+    result = await agent.fs_read(session, path, max_bytes=limit)
+    assert result.get("size", 0) < limit, (path, "truncated diagnostics")
     assert result["errno"] == 0, (path, result)
     return bytes.fromhex(result["content_hex"]).decode()
 

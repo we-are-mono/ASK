@@ -23,6 +23,12 @@ def function(source, name):
 
 def test_flowtable_decoder_and_lifecycle(tmp_path):
     source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    hashes = (kernel / "include/linux/jhash.h").read_text()
+    (tmp_path / "flowtable_hash.inc").write_text(
+        hashes[hashes.index("#define __jhash_final"):hashes.index("/* jhash -")]
+        + function(hashes, "__jhash_nwords") + function(hashes, "jhash_3words"))
     hardware = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     (tmp_path / "flowtable_types.inc").write_text(
         hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("/* Process-context transactions")]
@@ -30,9 +36,9 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
     )
     names = ["ft_fault", "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches", "ft_neigh_check",
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used", "ft_route_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
-             "ft_remove", "ft_retire_workfn", "ft_unicast", "ft_tuple_matches", "ft_nat_edit", "ft_translation", "ft_parse", "ft_same_key",
+             "ft_remove", "ft_retire_workfn", "ft_unicast", "ft_tuple_matches", "ft_nat_edit", "ft_translation", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_stats", "ft_request_targets", "ft_admission_fault", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_bind",
-             "ft_invalidate_work", "ft_device_used", "ft_device_retire", "ft_netdev_event", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit"]
+             "ft_invalidate_work", "ft_device_used", "ft_device_retire", "ft_netdev_event", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]
     (tmp_path / "flowtable_production.inc").write_text(
         "\n".join(function(source, name) for name in names))
     binary = tmp_path / "flowtable"

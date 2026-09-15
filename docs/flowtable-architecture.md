@@ -67,9 +67,17 @@ seal, quarantine or terminal latch.
 ## Native context and admission
 
 One hardware flowtable may bind at most two physical Ethernet ports in the
-initial network namespace. The adapter admits at most 64 directions, sufficient
-for 32 fully accelerated connections. This bounds its list walks; it is not a
-firmware capacity claim. Directions consume slots independently without eviction.
+initial network namespace. The adapter admits at most 32,768 directions, sufficient
+for 16,384 fully accelerated connections. This is an admission budget, not a
+firmware capacity claim. The [capacity guide](flowtable-capacity.md) describes
+resource reasoning and the focused proof. Directions consume slots independently without eviction.
+
+Binding/cookie and ingress/tuple lookups use separate fixed hash indexes, each
+with 16,384 buckets, under the existing backend transaction. Full key comparison
+resolves collisions; the tuple hash has a seed chosen at adapter load. Index
+publication follows successful hardware installation and index removal shares
+the entry's list lifetime. Dependency notifications still walk the bounded
+watch list: a single prefix, neighbour or device change can affect every flow.
 
 Patch 140 supplies borrowed conntrack, both selected destinations, effective
 directional MTU and the table's accounting requirement. Context version 5 also
@@ -264,6 +272,14 @@ dependent modules, unload CDX, then unbind the physical driver. Do not force
 removal or release references while hardware still uses the device.
 
 ## Statistics, diagnostics and verification
+
+`/proc/cdx_flowtable` streams its header and flow rows through `seq_file`, so
+reading policy status does not require rendering the entire table. Paged
+iteration resumes by hash bucket and offset, without retaining an entry pointer
+between transactions or rescanning all preceding entries. Policy
+commands stop reading at the first flow row. Each iterator invocation holds the
+backend transaction; separate reads of a changing table are not an atomic
+snapshot. Diagnostics consumers must allow for several megabytes at capacity.
 
 Hardware packet/byte counters are monotonic 64-bit classifier-hit totals. Bytes
 include Ethernet headers and minimum padding but exclude FCS: a 256-byte UDP

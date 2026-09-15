@@ -12,6 +12,8 @@ defines current implementation contracts; the [history index](flowtable/history/
 links the dated evidence. Subsequent
 feature increments extend this checkpoint. The [NAT guide](flowtable-nat.md)
 describes current IPv4 TCP/UDP SNAT, MASQUERADE, DNAT and hairpin/double NAT support.
+The [capacity guide](flowtable-capacity.md) covers the subsequent increase from
+this checkpoint’s 64 directions to a 32,768-direction admission budget.
 
 ## Supported boundary
 

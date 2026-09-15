@@ -13,10 +13,13 @@
  */
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
+#include <linux/hashtable.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
+#include <linux/jhash.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
+#include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/tc_act/tc_csum.h>
@@ -55,6 +58,8 @@ struct cdx_ft_binding {
 
 struct cdx_ft_entry {
 	struct list_head list;
+	struct hlist_node cookie_node;
+	struct hlist_node key_node;
 	struct list_head neigh_list;
 	struct neighbour *neigh;
 	struct nf_flow_offload_handle *handle;
@@ -66,17 +71,24 @@ struct cdx_ft_entry {
 	struct cdx_ft_counters reported;
 };
 
-/* Bound the backend transaction and atomic neighbour-list walks while proving
- * independent connection lifetimes. This is an adapter admission limit, not
- * firmware capacity; directions consume slots independently, without eviction.
+/* Admission budget, not a firmware maximum. Directions consume slots
+ * independently without eviction. The deployed IPv4 TCP/UDP classifiers each
+ * have 32768 buckets and dynamically allocated entries. Keep software indexes
+ * at a maximum average load of two; dependency invalidation remains a bounded
+ * walk because a single route/device/neighbour event can affect every flow.
  */
-#define CDX_FT_MAX_ENTRIES 64U
+#define CDX_FT_MAX_ENTRIES 32768U
+#define CDX_FT_HASH_BITS 14
 
 /* Binding mutations hold both the backend transaction and ft_watch_lock.
  * Transaction readers and device notifiers can therefore use their own lock.
  * The binding's existing device reference covers its entire watch lifetime. */
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
+/* Both indexes share the backend transaction and the entry's list lifetime. */
+static DEFINE_HASHTABLE(ft_cookies, CDX_FT_HASH_BITS);
+static DEFINE_HASHTABLE(ft_keys, CDX_FT_HASH_BITS);
+static u32 ft_hash_seed;
 /* Flow watch publication/removal is serialized by the backend transaction.
  * Neighbour, route and device notifiers share the immutable rule, neigh and
  * handle, protected against entry removal here. Never take a neighbour lock
@@ -126,7 +138,8 @@ static struct cdx_ft_entry *ft_find(struct cdx_ft_binding *binding,
 {
 	struct cdx_ft_entry *entry;
 
-	list_for_each_entry(entry, &ft_entries, list)
+	hash_for_each_possible(ft_cookies, entry, cookie_node,
+			       cookie ^ (unsigned long)binding)
 		if (entry->binding == binding && entry->cookie == cookie)
 			return entry;
 	return NULL;
@@ -160,6 +173,8 @@ static int ft_remove(struct cdx_ft_entry *entry)
 		ft_invalidate();
 	}
 	list_del(&entry->list);
+	hash_del(&entry->cookie_node);
+	hash_del(&entry->key_node);
 	ft_neigh_detach(entry);
 	nf_flow_offload_handle_put(entry->handle);
 	ft_handle_refs--;
@@ -522,6 +537,14 @@ static bool ft_same_key(const struct cdx_ft_rule *a, const struct cdx_ft_rule *b
 		a->sport == b->sport && a->dport == b->dport && a->proto == b->proto;
 }
 
+static u32 ft_key_hash(const struct cdx_ft_rule *rule)
+{
+	return jhash_3words((__force u32)rule->src, (__force u32)rule->dst,
+			   (u32)(__force u16)rule->sport << 16 |
+			   (__force u16)rule->dport,
+			   ft_hash_seed ^ hash_ptr(rule->in, 32) ^ rule->proto);
+}
+
 static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *cls)
 {
 	struct cdx_ft_entry *entry = ft_find(binding, cls->cookie), *other;
@@ -553,7 +576,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		if (rc)
 			return rc;
 	}
-	list_for_each_entry(other, &ft_entries, list)
+	hash_for_each_possible(ft_keys, other, key_node, ft_key_hash(&rule))
 		if (ft_same_key(&other->rule, &rule))
 			return -EEXIST;
 	if (ft_count >= CDX_FT_MAX_ENTRIES)
@@ -583,6 +606,9 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		return rc;
 	}
 	list_add_tail(&entry->list, &ft_entries);
+	hash_add(ft_cookies, &entry->cookie_node,
+		 entry->cookie ^ (unsigned long)entry->binding);
+	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
 	ft_count++;
 	ft_installs++;
 	if (ft_fault(3) || atomic_read(&ft_invalid) ||
@@ -1061,12 +1087,77 @@ static struct notifier_block ft_neigh_nb = { .notifier_call = ft_neigh_event };
 static struct notifier_block ft_fib_nb = { .notifier_call = ft_fib_event };
 static struct notifier_block ft_nexthop_nb = { .notifier_call = ft_nexthop_event };
 
-static int ft_show(struct seq_file *seq, void *unused)
+/* seq_file retains the transaction throughout each read iteration, including
+ * the header and its rows. It resumes by position after releasing the lock;
+ * userspace doing multiple reads must tolerate intervening flow changes. */
+/* Position zero is the header. Other positions encode bucket+1 in the upper
+ * word and the entry offset within that bucket in the lower word. Resuming a
+ * paged read therefore walks only its bucket, not all preceding flow entries.
+ * No entry pointer survives release of the transaction between reads. */
+static void *ft_position(loff_t *pos)
+{
+	unsigned int bucket = (*pos >> 32) - 1, skip = (u32)*pos;
+	struct cdx_ft_entry *entry;
+
+	for (; bucket < HASH_SIZE(ft_cookies); bucket++) {
+		hlist_for_each_entry(entry, &ft_cookies[bucket], cookie_node) {
+			if (skip) {
+				skip--;
+				continue;
+			}
+			return &entry->list;
+		}
+		*pos = (loff_t)(bucket + 2) << 32;
+		skip = 0;
+	}
+	return NULL;
+}
+
+static void *ft_start(struct seq_file *seq, loff_t *pos)
+{
+	cdx_ft_begin();
+	return *pos ? ft_position(pos) : &ft_entries;
+}
+
+static void *ft_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	struct cdx_ft_entry *entry;
+
+	if (v != &ft_entries) {
+		entry = list_entry(v, struct cdx_ft_entry, list);
+		if (entry->cookie_node.next) {
+			(*pos)++;
+			entry = hlist_entry(entry->cookie_node.next,
+					    struct cdx_ft_entry, cookie_node);
+			return &entry->list;
+		}
+	}
+	*pos = ((*pos >> 32) + 1) << 32;
+	return ft_position(pos);
+}
+
+static void ft_stop(struct seq_file *seq, void *v)
+{
+	cdx_ft_end();
+}
+
+static int ft_show(struct seq_file *seq, void *v)
 {
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
 
-	cdx_ft_begin();
+	if (v != &ft_entries) {
+		entry = list_entry(v, struct cdx_ft_entry, list);
+		cdx_ft_stats(entry->hw, &stats);
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+			   &entry->rule.src, ntohs(entry->rule.sport),
+			   &entry->rule.dst, ntohs(entry->rule.dport),
+			   &entry->rule.new_src, ntohs(entry->rule.new_sport),
+			   &entry->rule.new_dst, ntohs(entry->rule.new_dport), entry->rule.proto, entry->rule.mtu,
+			   &entry->next_hop, stats.packets, stats.bytes, stats.lastused);
+		return 0;
+	}
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
@@ -1083,20 +1174,26 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   atomic64_read(&ft_link_invalidations),
 		   atomic64_read(&ft_mac_invalidations),
 		   atomic64_read(&ft_admission_invalidations));
-	list_for_each_entry(entry, &ft_entries, list) {
-		cdx_ft_stats(entry->hw, &stats);
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
-			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-			   &entry->rule.src, ntohs(entry->rule.sport),
-			   &entry->rule.dst, ntohs(entry->rule.dport),
-			   &entry->rule.new_src, ntohs(entry->rule.new_sport),
-			   &entry->rule.new_dst, ntohs(entry->rule.new_dport), entry->rule.proto, entry->rule.mtu,
-			   &entry->next_hop, stats.packets, stats.bytes, stats.lastused);
-	}
-	cdx_ft_end();
 	return 0;
 }
-DEFINE_PROC_SHOW_ATTRIBUTE(ft);
+
+static const struct seq_operations ft_seq_ops = {
+	.start = ft_start,
+	.next = ft_next,
+	.stop = ft_stop,
+	.show = ft_show,
+};
+static int ft_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &ft_seq_ops);
+}
+
+static const struct proc_ops ft_proc_ops = {
+	.proc_open = ft_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = seq_release,
+};
 
 static bool ft_init_fault(unsigned int stage)
 {
@@ -1111,6 +1208,7 @@ static int __init ask_flowtable_init(void)
 {
 	int rc;
 
+	ft_hash_seed = get_random_u32();
 	/* Exported symbol dependencies pin a fully initialized CDX throughout
 	 * this module's lifetime, including failed initialization and exit. */
 	cdx_ft_begin();

@@ -13,6 +13,10 @@ typedef uint8_t u8;
 typedef uint16_t u16, __be16;
 typedef uint32_t u32, __be32;
 typedef uint64_t u64, atomic64_t;
+#define __force
+static u32 rol32(u32 v, unsigned n) { return (v << n) | (v >> (32 - n)); }
+#include "flowtable_hash.inc"
+static u32 get_random_u32(void) { return 0x87654321; }
 #define ETH_ALEN 6
 #define ETH_P_IP 0x0800
 #define ETH_P_ALL 3
@@ -80,6 +84,26 @@ static void list_add_tail(struct list_head *e, struct list_head *h)
 { e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
 static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
 static void list_init(struct list_head *h) { h->next = h->prev = h; }
+struct hlist_node { struct hlist_node *next, **pprev; };
+struct hlist_head { struct hlist_node *first; };
+struct seq_file { int unused; };
+#define HASH_SIZE(t) ARRAY_SIZE(t)
+#define hlist_entry list_entry
+#define hlist_for_each_entry(p, h, m) \
+    for (struct hlist_node *node_ = (h)->first; \
+         node_ && ((p) = list_entry(node_, typeof(*(p)), m), 1); node_ = node_->next)
+#define DEFINE_HASHTABLE(n, bits) struct hlist_head n[1 << (bits)]
+static unsigned long hash_ptr(const void *p, unsigned bits)
+{ return ((uintptr_t)p * UINT64_C(0x61c8864680b583eb)) >> (64 - bits); }
+#define hash_slot(t, k) (((uint64_t)(k) * UINT64_C(0x61c8864680b583eb)) >> (64 - __builtin_ctz(ARRAY_SIZE(t))))
+static void hlist_add(struct hlist_head *h, struct hlist_node *n)
+{ n->next = h->first; if (n->next) n->next->pprev = &n->next; h->first = n; n->pprev = &h->first; }
+static void hash_del(struct hlist_node *n)
+{ assert(n->pprev); *n->pprev = n->next; if (n->next) n->next->pprev = n->pprev; n->next = NULL; n->pprev = NULL; }
+#define hash_add(t, n, k) hlist_add(&(t)[hash_slot(t, k)], n)
+#define hash_for_each_possible(t, p, m, k) \
+    for (struct hlist_node *node_ = (t)[hash_slot(t, k)].first; \
+         node_ && ((p) = list_entry(node_, typeof(*(p)), m), 1); node_ = node_->next)
 #define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define ERR_PTR(e) ((void *)(intptr_t)(e))
@@ -228,6 +252,9 @@ struct work_struct { int unused; };
 static int ft_work, ft_retire_work;
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
+static DEFINE_HASHTABLE(ft_cookies, CDX_FT_HASH_BITS);
+static DEFINE_HASHTABLE(ft_keys, CDX_FT_HASH_BITS);
+static u32 ft_hash_seed;
 static LIST_HEAD(ft_neigh_entries);
 static bool ft_watch_lock;
 static LIST_HEAD(ft_block_list);
@@ -1015,6 +1042,31 @@ static void connection_rule(unsigned n)
     rule.tcp = (struct flow_match_tcp){ &tk, &tm };
 }
 
+/* Complete and fragmented proc iteration must enumerate every live owner once,
+ * including collisions, empty buckets and a resumed read at the current row. */
+static void test_iterator(unsigned expected)
+{
+    bool seen[CDX_FT_MAX_ENTRIES] = {0};
+    loff_t pos = 0;
+    void *row = ft_start(NULL, &pos);
+    unsigned count = 0;
+
+    assert(row == &ft_entries);
+    while ((row = ft_next(NULL, row, &pos))) {
+        struct cdx_ft_entry *entry = list_entry(row, struct cdx_ft_entry, list);
+        unsigned index = (entry->cookie - 1000) % 100000;
+        assert(index < CDX_FT_MAX_ENTRIES && !seen[index]);
+        seen[index] = true;
+        count++;
+        if (!(count % 17)) {
+            ft_stop(NULL, row);
+            assert(ft_start(NULL, &pos) == row);
+        }
+    }
+    ft_stop(NULL, row);
+    assert(count == expected);
+}
+
 static void test_connections(void)
 {
     struct cdx_ft_entry *entries[CDX_FT_MAX_ENTRIES];
@@ -1031,6 +1083,7 @@ static void test_connections(void)
         assert(ft_stats(entries[i], &cls) == 0);
         assert(cls.stats.pkts == 100 + i && cls.stats.bytes == 10000 + i * 100);
     }
+    test_iterator(ARRAY_SIZE(entries));
     assert(ft_count == ARRAY_SIZE(entries) && live_hw == ft_count);
     assert(allocated == ft_count && neighbour.refs == ft_count);
     assert(ft_neighbour_refs == ft_count && out.refs == (int)ft_count);
@@ -1039,7 +1092,7 @@ static void test_connections(void)
      * keys without disturbing the existing owner or resetting its counters. */
     connection_rule(10);
     assert(ft_replace(&binding, &cls) == 0);
-    cls.cookie += 10000;
+    cls.cookie += 100000;
     assert(ft_replace(&binding, &cls) == -EEXIST);
     connection_rule(ARRAY_SIZE(entries));
     assert(ft_replace(&binding, &cls) == -ENOSPC);
@@ -1049,19 +1102,20 @@ static void test_connections(void)
      * hardware handles and previously reported deltas must survive intact. */
     connection_rule(17);
     assert(ft_remove(entries[17]) == 0 && !ft_find(&binding, cls.cookie));
-    cls.cookie += 10000;
+    cls.cookie += 100000;
     assert(ft_replace(&binding, &cls) == 0);
     entries[17] = ft_find(&binding, cls.cookie);
     assert(!entries[17]->reported.packets && !entries[17]->hw->stats.packets);
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
         connection_rule(i);
-        if (i == 17) cls.cookie += 10000;
+        if (i == 17) cls.cookie += 100000;
         assert(ft_find(&binding, cls.cookie) == entries[i]);
         entries[i]->hw->stats.packets += i + 1;
         entries[i]->hw->stats.bytes += (i + 1) * 100;
         assert(ft_stats(entries[i], &cls) == 0);
         assert(cls.stats.pkts == i + 1 && cls.stats.bytes == (i + 1) * 100);
     }
+    test_iterator(ARRAY_SIZE(entries));
     /* Different removal order exercises list head, middle and tail; sharing
      * a neighbour cannot tie one connection's lifetime to another's. */
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
@@ -1074,6 +1128,7 @@ static void test_connections(void)
     assert(ft_installs == installs + ARRAY_SIZE(entries) + 1 && ft_errors == errors);
     assert(!ft_invalid && !ft_fatal);
 
+    test_iterator(0);
     /* Every entry here shares the changed dependency; all must be drained. */
     for (unsigned i = 0; i < ARRAY_SIZE(entries); i++) {
         connection_rule(i);

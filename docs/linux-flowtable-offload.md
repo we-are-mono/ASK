@@ -9,8 +9,7 @@ This is a maintained development path with a defined feature boundary; it does
 not yet replace every feature available through CMM.
 
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
-Current feature checkpoint: TCP/UDP SNAT, MASQUERADE, DNAT and hairpin/double NAT (2026-09-15).
-The documentation split changes no implementation or acceptance result.
+Current checkpoint: IPv4 TCP/UDP NAT and 32,768-direction capacity (2026-09-15).
 
 ## Reading guide
 
@@ -20,6 +19,7 @@ The documentation split changes no implementation or acceptance result.
 | Accepted foundation, recovery matrix and verification limits | [Foundation checkpoint](flowtable-foundation.md) |
 | Configure scope/exclusions, revoke active flows, migrate CMM settings | [Policy guide](flowtable-policy.md) |
 | Supported NAT mappings and their focused proof | [NAT guide](flowtable-nat.md) |
+| Admission budget, pressure and resource reuse | [Capacity guide](flowtable-capacity.md) |
 | Original proposal, implementation snapshots and dated measurements | [History by topic and chronology](flowtable/history/README.md) |
 | Remaining intermittent UDP/link observations | [UDP loss investigation](flowtable-udp-loss-investigation.md) |
 | Bench setup and packet-counter interpretation | [Testing guide](testing.md) |
@@ -34,7 +34,7 @@ configuration instructions.
 | Area | Current boundary |
 | --- | --- |
 | Kernel and hardware | Repository Linux 6.12.103 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
-| Topology and capacity | One hardware flowtable, two initial-netns physical Ethernet ports, at most 64 directional entries |
+| Topology and capacity | One hardware flowtable, two initial-netns physical Ethernet ports, at most 32,768 directional entries |
 | Routed traffic | Unicast IPv4 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
 | Throughput | Loki → Vision TCP NAT: 9.414 Gb/s receive, 1.84% aggregate DUT CPU on the KASAN image |
 | NAT | TCP/UDP static source NAT, MASQUERADE, destination and hairpin/double NAT, including address/port translation and inverse reply translation |
@@ -43,7 +43,7 @@ configuration instructions.
 | Lifetime and policy | Conntrack/flow expiry and deletion, safe adapter unload, explicit global recovery, live policy revocation, bounded capacity fallback |
 | Ownership | CMM remains the default boot path; flowtable ownership is explicit and immutable for the boot |
 
-The bound is 64 **directions**, sufficient for 32 fully accelerated connections.
+The bound is 32,768 **directions**, sufficient for 16,384 fully accelerated connections.
 Admission is directional: a capacity or unsupported-direction refusal can leave
 the other direction accelerated. Matching transient admission contention has
 explicit partial-generation recovery. Hardware flags alone do not establish
@@ -99,7 +99,8 @@ ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55000 \
 
 The [foundation](flowtable-foundation.md#focused-reproduction) and
 [NAT](flowtable-nat.md#focused-verification) guides give focused reproduction
-commands. Failure tests can stop the datapath or require a fresh boot; follow
+commands; the [capacity guide](flowtable-capacity.md#focused-verification) covers
+full occupancy, overflow and resource reuse. Failure tests can stop the datapath or require a fresh boot; follow
 their documented boundaries. The full KASAN suite and alternative-kernel exercise
 were explicitly excluded from the foundation work.
 
@@ -120,11 +121,19 @@ forwarding, receive checksums, route retirement and live software fallback.
 The [combined NAT evidence](flowtable/history/double-nat.md) covers simultaneous
 source/destination translation and same-port hairpin routing through the DUT.
 
+The [capacity evidence](flowtable/history/capacity.md) proves 16,384 fully
+accelerated mixed TCP/UDP connections, overflow fallback, slot reuse and paced
+recovery after full route retirement. Its small explicit UDP loss allowance
+does not change the earlier delivery proofs.
+
 ## Next work and longer-term direction
 
 The four bounded IPv4 TCP/UDP NAT increments and the
 [full-rate Loki → Vision benchmark](flowtable/history/nat-throughput.md) are complete:
 9.414 Gb/s TCP receive throughput with 1.84% aggregate DUT CPU.
+The full 32,768-direction capacity proof also passes. Admission-rate stress,
+simultaneous recovery bursts and longer soaks remain distinct work: an unpaced
+restart after full route retirement produced material UDP loss during readmission.
 Prove each increment before expanding its supported boundary. The
 [foundation checkpoint](flowtable-foundation.md) remains the base for further
 interface and protocol features.

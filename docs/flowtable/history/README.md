@@ -3,10 +3,11 @@
 [Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md)
 
 These records preserve the consolidated document at `cc34cef`, through the
-full-rate TCP NAT proof on 2026-09-15. They are historical evidence, including
+full-rate TCP NAT and connection-capacity proofs on 2026-09-15. They are historical evidence, including
 superseded contracts and failed attempts. Current operating guidance lives in the
 [foundation](../../flowtable-foundation.md), [policy](../../flowtable-policy.md)
-and [NAT](../../flowtable-nat.md) guides.
+and [NAT](../../flowtable-nat.md) guides, with the current admission budget in
+the [capacity guide](../../flowtable-capacity.md).
 
 The split preserves every original section from “Purpose and constraints”
 onward, with only relative Markdown links rebased. The former overview is
@@ -28,6 +29,7 @@ original bench records; they are not a promise of permanent artifact storage.
 | [Physical device lifecycle](device-lifecycle.md) | MTU, administrative state, MAC, rename, unregister and terminal restart safety. |
 | [Policy, startup and foundation acceptance](policy-and-startup.md) | Configuration/revocation, CMM/FCI-free startup and final legacy compatibility. |
 | [Full-rate TCP NAT](nat-throughput.md) | 9.414 Gb/s Loki → Vision receive throughput, hardware counters and DUT CPU evidence. |
+| [Connection capacity](capacity.md) | 32,768 directions, mixed TCP/UDP overflow and reuse, full route retirement, and paced recovery. |
 | [Double NAT and hairpin](double-nat.md) | Combined translations across ports and same-port routing between separate LAN endpoints. |
 | [DNAT](dnat.md) | WAN-initiated TCP/UDP port forwarding, checksums, route retirement and live software fallback. |
 | [MASQUERADE](masquerade.md) | Source translation and retirement across WAN address replacement and interface down/up. |
@@ -74,6 +76,7 @@ with the UDP proof.
 | Double NAT and hairpin — 2026-09-15 | [Evidence](double-nat.md) |
 | DNAT — 2026-09-15 | [Evidence](dnat.md) |
 | MASQUERADE — 2026-09-15 | [Evidence](masquerade.md) |
+| Connection capacity — 2026-09-15 | [Evidence](capacity.md) |
 
 ## Maintaining the records
 
