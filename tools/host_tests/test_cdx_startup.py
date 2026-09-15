@@ -1,4 +1,4 @@
-"""Exercise the production CDX SET_PARAMS transaction under ASan/UBSan."""
+"""Exercise the production CDX startup transaction under ASan/UBSan."""
 
 from pathlib import Path
 import os
@@ -32,7 +32,8 @@ def test_cdx_startup(tmp_path):
     source = (ROOT / "cdx/dpa_cfg.c").read_text()
     names = ["release_cfg_info", "dpa_prepare_ports", "dpa_set_ports_enabled",
              "dpa_release_pcd_fqs", "dpa_rollback_resources", "dpa_detach_ports",
-             "dpa_cfg_quiesce", "dpa_cfg_deinit", "cdx_ioc_set_dpa_params"]
+             "dpa_cfg_quiesce", "dpa_cfg_deinit", "dpa_cfg_set_expt_defaults",
+             "dpa_cfg_publish", "dpa_cfg_install"]
     (tmp_path / "cdx_startup.inc").write_text(
         source[source.index("struct dpa_init_port {"):source.index("/* Resolve every port")]
         + "\n".join(function(source, n) for n in names))
