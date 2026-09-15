@@ -23,7 +23,7 @@ pytestmark = [
 
 
 @pytest_asyncio.fixture
-async def tcp_snat(rig):
+async def tcp_snat(rig, request):
     r = rig
     addresses = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show",
                                          "dev", TARGET_WAN_IF))["stdout"])
@@ -34,9 +34,12 @@ async def tcp_snat(rig):
               "scope": [{"protocol": "tcp", "source": r.lan_ip, "destination": WAN_IP,
                          "source_port": SPORT, "destination_port": DPORT}], "exclude": []}
     nat_table = "ask_tcp_snat_test"
+    kind = getattr(request, "param", "snat")
+    assert kind in {"snat", "masquerade"}
+    translation = f"snat to {external}:{port}" if kind == "snat" else f"masquerade to :{port}"
     nat = (f"table ip {nat_table} {{ chain postrouting {{ type nat hook postrouting priority 90; "
            f"ip saddr {r.lan_ip} ip daddr {WAN_IP} tcp sport {SPORT} tcp dport {DPORT} "
-           f"snat to {external}:{port}; }}; }}")
+           f"{translation}; }}; }}")
     table, delete_table, state = r.table, r.delete_table, r.state
     with Console.target(log_path=str(ARTIFACTS / "tcp-snat-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)

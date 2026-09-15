@@ -95,16 +95,18 @@ async def snat_hardware(r, p, external, port, zero_checksum, label):
 
 
 @pytest.mark.parametrize("zero_checksum", [False, True], ids=["checksum", "zero-checksum"])
-async def test_flowtable_udp_snat(connections, zero_checksum):
+async def test_flowtable_udp_snat(connections, zero_checksum, nat_kind="snat"):
     r = connections
     addresses = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show",
                                          "dev", TARGET_WAN_IF))["stdout"])
     external = next(a["local"] for a in addresses[0]["addr_info"] if a["family"] == "inet")
     port = FLOWS[0]["sport"] + 1024
     nat_table = "ask_snat_test"
+    assert nat_kind in {"snat", "masquerade"}
+    translation = f"snat to {external}:{port}" if nat_kind == "snat" else f"masquerade to :{port}"
     nat = (f"table ip {nat_table} {{ chain postrouting {{ type nat hook postrouting priority 90; "
            f"ip saddr {r.lan_ip} ip daddr {WAN_IP} udp sport {FLOWS[0]['sport']} udp dport {DPORT} "
-           f"snat to {external}:{port}; }}; }}")
+           f"{translation}; }}; }}")
     flow = {**FLOWS[0], "iface": LAN_NIC, "wire": {
         "source_ip": WAN_IP, "destination_ip": r.lan_ip, "source_port": DPORT,
         "destination_port": FLOWS[0]["sport"], "source_mac": r.dut_lan_mac,

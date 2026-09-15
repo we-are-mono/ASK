@@ -101,7 +101,7 @@ async def peer(r, flows=FLOWS, *, initial_ids=None):
         try:
             ident = json.loads(await asyncio.wait_for(reader.readline(), 10))["id"]
             assert ident in specs and specs[ident]["proto"] == "tcp"
-            assert writer.get_extra_info("peername") == (specs[ident].get("lan", r.lan_ip), specs[ident]["sport"])
+            assert writer.get_extra_info("peername") == tuple(specs[ident].get("remote", (specs[ident].get("lan", r.lan_ip), specs[ident]["sport"])))
             assert ident not in tcp_counts
             tcp_counts[ident] = 0
             while True:
@@ -114,11 +114,18 @@ async def peer(r, flows=FLOWS, *, initial_ids=None):
                 tcp_counts[ident] += 1
                 writer.write(data)
                 await writer.drain()
+        except ConnectionError as error:
+            if ident not in specs or not specs[ident].get("abort"):
+                errors.append((ident, repr(error)))
         except Exception as error:
             errors.append((ident, repr(error)))
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except ConnectionError:
+                if ident not in specs or not specs[ident].get("abort"):
+                    errors.append((ident, "unexpected reset on close"))
             writers.discard(writer)
 
     def accept(reader, writer):
@@ -151,17 +158,27 @@ async def peer(r, flows=FLOWS, *, initial_ids=None):
             if controller:
                 controller.writer.close()
                 try:
-                    await controller.writer.wait_closed()
+                    waiter = asyncio.create_task(controller.writer.wait_closed())
+                    try:
+                        await asyncio.wait_for(asyncio.shield(waiter), 5)
+                    except TimeoutError:
+                        controller.writer.transport.abort()
+                        await asyncio.wait_for(waiter, 5)
                 except (ConnectionError, OSError) as error:
                     shutdown_error = shutdown_error or error
             if server:
                 server.close()
-                await server.wait_closed()
             control_server.close()
-            await control_server.wait_closed()
             for writer in list(writers):
-                writer.close()
+                # NAT lifecycle tests can destroy a mapping before its peer
+                # closes. Cleanup must not wait for an unreachable TCP tuple.
+                writer.transport.abort()
             await asyncio.gather(*list(tasks), return_exceptions=True)
+            # Python 3.13 Server.wait_closed also waits for accepted clients.
+            # Close their transports before waiting for the listening servers.
+            if server:
+                await server.wait_closed()
+            await control_server.wait_closed()
             # Always finish the sole LAN console operation before fixture cleanup.
             if task:
                 result = await task

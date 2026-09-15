@@ -1,6 +1,6 @@
 # Linux flowtable architecture
 
-This is the current implementation contract after static TCP/UDP SNAT
+This is the current implementation contract after static TCP/UDP SNAT and MASQUERADE
 (2026-09-15). The [project overview](linux-flowtable-offload.md) gives supported
 scope and direction; the [history index](flowtable/history/README.md) retains
 earlier designs, superseded restrictions and dated verification evidence.
@@ -79,7 +79,7 @@ conntrack or destination pointer survives the callback.
 
 Admission requires exact supported masks and actions, default conntrack zones,
 zero conntrack mark and a table without native `counter` accounting. Supported
-packets are routed unicast IPv4 TCP/UDP and static TCP/UDP SNAT. TCP additionally
+packets are routed unicast IPv4 TCP/UDP and TCP/UDP source NAT (static or MASQUERADE). TCP additionally
 requires an assured, established conntrack and precisely Netfilter's FIN/RST
 exclusion. Helpers and sequence-adjusted connections are excluded by native
 flowtable eligibility. Other protocols, encapsulations and NAT types require

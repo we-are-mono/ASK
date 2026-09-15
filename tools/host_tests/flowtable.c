@@ -543,7 +543,10 @@ static void test_snat(void)
         NAT_REJECT(ct.status = IPS_NAT_MASK | IPS_SRC_NAT_DONE);
         NAT_REJECT(ct.status = IPS_SRC_NAT);
         NAT_REJECT(ct.status = 0);
-        NAT_REJECT(ct.nat = &nat);
+        /* MASQUERADE is a Linux-owned source mapping with the same native
+         * actions. Its device/address teardown uses native conntrack GC. */
+        snat_fixture(forward, tcp); ct.nat = &nat;
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
         NAT_REJECT(ct.protonum = bk.ip_proto = IPPROTO_ICMP);
         NAT_REJECT(rule.action.entries[5].mangle.htype = tcp ? FLOW_ACT_MANGLE_HDR_TYPE_UDP : FLOW_ACT_MANGLE_HDR_TYPE_TCP);
         NAT_REJECT(rule.action.entries[6].csum_flags = tcp ? 17 : 9);

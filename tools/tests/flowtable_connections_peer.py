@@ -131,8 +131,13 @@ class Flow:
 
     async def close(self):
         if self.writer:
-            self.writer.write_eof()
-            assert await asyncio.wait_for(self.reader.read(), 5) == b""
+            if self.spec.get("abort"):
+                self.writer.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                                               struct.pack("ii", 1, 0))
+                self.writer.transport.abort()
+            else:
+                self.writer.write_eof()
+                assert await asyncio.wait_for(self.reader.read(), 5) == b""
             self.writer.close()
             await self.writer.wait_closed()
             self.writer = None

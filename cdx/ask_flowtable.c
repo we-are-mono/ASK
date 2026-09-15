@@ -32,7 +32,6 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
-#include <net/netfilter/nf_nat.h>
 #include "cdx_flowtable_backend.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 5
@@ -353,11 +352,6 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	if ((status & IPS_NAT_MASK) != IPS_SRC_NAT || !(status & IPS_SRC_NAT_DONE) ||
 	    (out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) || actions->num_entries != 8)
 		return false;
-#if IS_ENABLED(CONFIG_NF_NAT_MASQUERADE)
-	/* WAN-address/masquerade lifecycle is outside the static SNAT contract. */
-	if (nfct_nat(ct) && READ_ONCE(nfct_nat(ct)->masq_index))
-		return false;
-#endif
 	forward = ft_tuple_matches(out, orig);
 	if (forward == ft_tuple_matches(out, reply) ||
 	    orig->dst.u3.ip != reply->src.u3.ip || orig->dst.u.all != reply->src.u.all)

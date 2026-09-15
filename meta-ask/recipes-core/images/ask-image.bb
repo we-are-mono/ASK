@@ -52,6 +52,7 @@ IMAGE_INSTALL = " \
     kernel-module-nf-flow-table-inet \
     kernel-module-nft-ct \
     kernel-module-nft-nat \
+    kernel-module-nft-masq \
     kernel-module-nft-chain-nat \
     kernel-module-xt-tcpudp \
     kernel-module-xt-conntrack \

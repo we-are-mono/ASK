@@ -172,7 +172,7 @@ for the full branch model.
 
 The `feat/linux-flowtable-offload` branch develops an opt-in alternative to CMM
 flow management. The [project overview](docs/linux-flowtable-offload.md) links
-the current architecture, supported foundation and static TCP/UDP SNAT, operating
+the current architecture, supported foundation and TCP/UDP SNAT/MASQUERADE, operating
 guides, and historical validation evidence. The default CMM mode is preserved.
 
 ## License

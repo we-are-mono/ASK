@@ -1,12 +1,12 @@
 # Linux flowtable NAT
 
-Static IPv4 TCP and UDP source NAT are supported on the foundation's
+Static IPv4 TCP/UDP source NAT and MASQUERADE are supported on the foundation's
 two physical ports. Linux conntrack and nftables own the mapping. The adapter
 validates Linux's native actions and CDX encodes the resolved translation using
 the existing proprietary firmware interface. No CMM or per-flow FCI call is
 involved, and the shared legacy encoder is unchanged.
 
-MASQUERADE, destination NAT, hairpin/double NAT and IPv6 remain outside
+Destination NAT, hairpin/double NAT and IPv6 remain outside
 hardware eligibility. Those need separate increments and lifecycle proofs.
 The [foundation](flowtable-foundation.md) still supplies the capacity, device,
 route, neighbour, retirement and policy contracts. NAT does not lift those limits.
@@ -25,7 +25,7 @@ conntrack tuples, and consistent opposite tuple endpoints. It accepts exactly
 four Ethernet edits, one IPv4 edit, one transport port edit, the matching native IPv4/TCP or IPv4/UDP
 checksum action and a redirect. Masks, offsets and values must agree with the
 resolved mapping. Identity address or port edits are permitted; arbitrary flower
-rewrites, additional actions, DNAT and masquerade mappings are refused.
+rewrites, additional actions and DNAT mappings are refused.
 
 The private backend rule carries complete match and translated tuples. The
 classifier key uses the match; the existing encoder's synthetic twin describes
@@ -47,7 +47,7 @@ allocate NAT mappings or duplicate NAT rules. Original and reply selectors keep
 their conntrack meanings: under SNAT, `reply_destination` and
 `reply_destination_port` select the translated source endpoint.
 
-The test image packages `nft_nat` and `nft_chain_nat` so native nftables static
+The test image packages `nft_nat`, `nft_chain_nat` and `nft_masq` so native nftables static
 NAT works after a clean boot. The kernel configuration already enables them.
 The default policy remains disabled and existing gateway setup is unchanged.
 
@@ -56,6 +56,22 @@ mapping and socket. As with ordinary Linux NAT, editing a NAT rule affects new
 connections; it does not retroactively replace mappings of existing conntracks.
 To revoke forwarding immediately, use the documented
 [firewall revocation sequence](flowtable-policy.md#firewall-ordering-and-revocation).
+
+## MASQUERADE lifetime
+
+MASQUERADE uses the same validated source translation actions as static SNAT.
+Linux chooses the current output address and source port; the adapter does not
+allocate mappings or mirror interface address state. Native Linux masquerade
+notifiers remove affected conntracks when their address is removed or the
+interface is taken down. Native flowtable cleanup and the existing route/device
+retirement mechanisms remove the associated hardware directions.
+
+This differs from policy stop/apply: WAN address removal intentionally destroys
+the old mapping. Established sockets cannot be promised to survive an address
+change. Fresh connections acquire the new address and can be accelerated again.
+Removal follows Linux's asynchronous cleanup, not an instantaneous firewall
+revocation guarantee. Use the policy drain sequence when a configuration change
+requires forwarding to stop before mutation.
 
 ## Focused verification
 
@@ -100,3 +116,18 @@ TCP results. The [UDP SNAT validation record](flowtable/history/udp-snat.md) con
 results and image identities. This increment does not establish arbitrary NAT
 feature combinations, sustained scale, every exception path, or production-image
 parity.
+
+`test_flowtable_udp_masquerade` and `test_flowtable_tcp_masquerade` repeat the
+translation/lifetime proofs with native masquerade rules. The separate
+`test_flowtable_masquerade_wan_lifecycle` uses a temporary WAN subnet to remove
+an active address, replace it, and take the WAN interface down/up. Both live TCP
+and UDP conntracks and hardware directions must disappear at each destructive
+transition. Fresh connections must use the replacement address and offload
+without recreating the policy table. Its setup requires this endpoint address:
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=198.18.40.2 ASK_FLOWTABLE_SPORT=55400 \
+  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_masquerade_wan_lifecycle'
+```
+
+See the [MASQUERADE validation record](flowtable/history/masquerade.md).
