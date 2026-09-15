@@ -22,6 +22,8 @@ Current checkpoint: IPv4 TCP/UDP NAT and 32,768-direction capacity (2026-09-15).
 | Admission budget, pressure and resource reuse | [Capacity guide](flowtable-capacity.md) |
 | Original proposal, implementation snapshots and dated measurements | [History by topic and chronology](flowtable/history/README.md) |
 | Remaining intermittent UDP/link observations | [UDP loss investigation](flowtable-udp-loss-investigation.md) |
+| Why live UDP flows are spuriously retired, and what it is not | [Retirement investigation](flowtable-retirement-investigation.md) |
+| What CMM still owns, and the order to absorb it | [CMM retirement roadmap](flowtable-cmm-porting-roadmap.md) |
 | Bench setup and packet-counter interpretation | [Testing guide](testing.md) |
 
 The architecture and feature guides describe current behaviour. Historical
