@@ -377,7 +377,8 @@ int cdx_pcd_build(u8 fm_index, struct cdx_pcd_state *state)
 	state->h_fm = fm->h_Dev;
 	state->h_pcd = fm->h_PcdDev;
 	if (!state->h_fm || !state->h_pcd) {
-		pr_err("cdx: fm%u is not ready\n", fm_index);
+		pr_err("cdx: fm%u is not ready (fm_dev %p, h_Dev %p, h_PcdDev %p)\n",
+		       fm_index, fm, state->h_fm, state->h_pcd);
 		state->h_pcd = NULL;
 		return -ENODEV;
 	}

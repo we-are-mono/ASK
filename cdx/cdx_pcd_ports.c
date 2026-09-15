@@ -107,7 +107,10 @@ static int cdx_pcd_add_eth_ports(u8 fm_index, struct cdx_pcd_port *ports,
 		mac_dev = priv->mac_dev;
 		if (!mac_dev)
 			continue;
-		fm_dev = (t_LnxWrpFmDev *)mac_dev->fm;
+		/* mac_dev->fm is fm_get_handle()'s result -- the FMD object,
+		 * not the Linux wrapper. The wrapper, which is what carries the
+		 * PCD and MURAM handles, is mac_dev->fm_dev. */
+		fm_dev = (t_LnxWrpFmDev *)mac_dev->fm_dev;
 		if (!fm_dev || fm_dev->id != fm_index)
 			continue;
 
