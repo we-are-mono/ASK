@@ -88,7 +88,7 @@ class Peer:
 
 
 @asynccontextmanager
-async def peer(r, flows=FLOWS, *, initial_ids=None):
+async def peer(r, flows=FLOWS, *, initial_ids=None, servers=()):
     specs = {f["id"]: f for f in flows}
     accepted = asyncio.Queue()
     tasks, writers, errors, tcp_counts = set(), set(), [], {}
@@ -136,9 +136,10 @@ async def peer(r, flows=FLOWS, *, initial_ids=None):
     try:
         server = await asyncio.start_server(accept, WAN_IP, DPORT)
         config = {"lan": r.lan_ip, "wan": WAN_IP, "dport": DPORT,
-                  "control_port": DPORT + 1, "flows": flows, "token": secrets.token_hex(16)}
+                  "control_port": DPORT + 1, "flows": flows, "servers": list(servers), "token": secrets.token_hex(16)}
         script = (f"CONFIG={config!r}\n" + Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_udp_wire.py").read_text()
+                  + "\n" + Path(__file__).with_name("flowtable_echo_peer.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_connections_peer.py").read_text())
         task = asyncio.create_task(lan_run_python(r.lan, script, timeout=200, label="flowtable_connections"))
         reader, writer = await asyncio.wait_for(accepted.get(), 15)

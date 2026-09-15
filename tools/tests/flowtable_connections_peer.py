@@ -37,8 +37,10 @@ def namespace(spec):
 
 
 class Flow:
-    def __init__(self, spec):
+    def __init__(self, spec, validate_udp=None, capture_udp=None):
         self.spec = spec
+        self.validate_udp = validate_udp
+        self.capture_udp = capture_udp
         self.serial = 0
         self.reader = self.writer = self.sock = None
         self.wire = None
@@ -46,7 +48,8 @@ class Flow:
 
     async def open(self, config):
         local = (self.spec.get("lan", config["lan"]), self.spec["sport"])
-        remote = (config["wan"], config["dport"])
+        remote = (self.spec.get("connect_ip", config["wan"]),
+                  self.spec.get("connect_port", config["dport"]))
         if self.spec["proto"] == "tcp":
             with namespace(self.spec):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -70,7 +73,7 @@ class Flow:
             self.sock.connect(remote)
             if "wire" in self.spec:
                 with namespace(self.spec):
-                    self.wire = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x800))
+                    self.wire = self.capture_udp(self.spec["sport"])
                 self.wire.bind((self.spec["iface"], 0))
                 self.wire.setblocking(False)
                 if self.spec["wire"].get("zero_checksum"):
@@ -109,7 +112,7 @@ class Flow:
                         if self.wire:
                             while True:
                                 frame = await loop.sock_recv(self.wire, 65536)
-                                wire_payload = udp_wire_payload(frame, **self.spec["wire"])
+                                wire_payload = self.validate_udp(frame, **self.spec["wire"])
                                 if wire_payload is not None:
                                     assert wire_payload == data, (self.spec, self.serial, frame.hex())
                                     break
@@ -119,6 +122,9 @@ class Flow:
                 if not allow_loss or (isinstance(error, OSError) and not isinstance(error, TimeoutError)
                                       and error.errno not in {errno.EHOSTUNREACH, errno.ENETUNREACH,
                                                               errno.ECONNREFUSED}):
+                    if self.wire:
+                        packets, drops = struct.unpack("II", self.wire.getsockopt(263, 6, 8))
+                        error.add_note(f"receive capture: {packets} packets, {drops} socket drops; serial={self.serial}")
                     raise
                 lost += 1
             self.serial += 1
@@ -150,10 +156,12 @@ class Flow:
 
 
 async def main(config):
-    flows = {spec["id"]: Flow(spec) for spec in config["flows"]}
+    flows = {spec["id"]: Flow(spec, udp_wire_payload, udp_capture_socket) for spec in config["flows"]}
     running = {}
     control = None
     reports = []
+    servers = EchoServers(config.get("servers", []), config["flows"], namespace, payload,
+                          udp_wire_payload, udp_capture_socket)
 
     async def finish(ids, stop=False):
         if stop:
@@ -166,6 +174,7 @@ async def main(config):
         return result
 
     try:
+        await servers.start()
         # A local lease also ends traffic if the controller disappears.
         async with asyncio.timeout(180):
             reader, control = await asyncio.open_connection(config["wan"], config["control_port"])
@@ -183,6 +192,8 @@ async def main(config):
                     flow = flows[command["ident"]]
                     with namespace(flow.spec):
                         result = configure_neighbour(flow.spec["iface"], flow.spec["lan"], **command["changes"])
+                elif op == "servers":
+                    result = servers.status()
                 elif op == "start":
                     for ident in ids:
                         assert ident not in running
@@ -203,7 +214,8 @@ async def main(config):
                 control.write(json.dumps({"op": op, "result": result}).encode() + b"\n")
                 await control.drain()
                 if op == "shutdown":
-                    print(json.dumps({"reports": reports, "closed": True}), flush=True)
+                    assert not servers.errors, servers.errors
+                    print(json.dumps({"reports": reports, "closed": True, "servers": servers.status()}), flush=True)
                     return
             raise AssertionError("controller disconnected without shutdown")
     finally:
@@ -218,6 +230,7 @@ async def main(config):
                 flow.sock.close()
             if flow.wire:
                 flow.wire.close()
+        await servers.close()
         if control:
             control.close()
             await control.wait_closed()

@@ -36,6 +36,8 @@ typedef uint64_t u64, atomic64_t;
 #define IPS_NAT_MASK 0x30
 #define IPS_SRC_NAT 0x10
 #define IPS_SRC_NAT_DONE 0x80
+#define IPS_DST_NAT 0x20
+#define IPS_DST_NAT_DONE 0x100
 #define IS_ENABLED(x) 1
 #define TCA_CSUM_UPDATE_FLAG_IPV4HDR 1
 #define TCA_CSUM_UPDATE_FLAG_TCP 8
@@ -599,6 +601,60 @@ static void test_snat(void)
         ft_route_event(&event); assert(!handle.invalid);
         event.dst = htonl(0xc0000202);
         ft_route_event(&event); assert(handle.invalid && !ft_invalid);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
+    }
+}
+static void dnat_fixture(bool forward, bool tcp)
+{
+    snat_fixture(forward, tcp);
+    ct.status = (ct.status & ~(IPS_SRC_NAT | IPS_SRC_NAT_DONE)) | IPS_DST_NAT | IPS_DST_NAT_DONE;
+    for (unsigned i = 0; i < 2; i++) {
+        struct nf_conntrack_tuple *t = &ct.tuplehash[i].tuple;
+        __be32 address = t->src.u3.ip; t->src.u3.ip = t->dst.u3.ip; t->dst.u3.ip = address;
+        __be16 port = t->src.u.all; t->src.u.all = t->dst.u.all; t->dst.u.all = port;
+    }
+    __be32 address = ik.src; ik.src = ik.dst; ik.dst = address;
+    __be16 port = pk.src; pk.src = pk.dst; pk.dst = port;
+    rule.action.entries[4].mangle.offset = forward ? 16 : 12;
+    const u8 values[2][4] = {{0x27,0x10,0,0}, {0,0,0x9c,0x40}};
+    const u8 masks[2][4] = {{0,0,0xff,0xff}, {0xff,0xff,0,0}};
+    memcpy(&rule.action.entries[5].mangle.val, values[forward], 4);
+    memcpy(&rule.action.entries[5].mangle.mask, masks[forward], 4);
+    neighbour.primary_key = htonl(forward ? 0xcb007104 : 0xc6336402);
+}
+static void test_dnat(void)
+{
+    struct cdx_ft_rule decoded;
+    for (unsigned variant = 0; variant < 4; variant++) {
+        bool forward = variant & 1, tcp = variant & 2;
+        dnat_fixture(forward, tcp);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(decoded.src == ik.src && decoded.dst == ik.dst);
+        assert(decoded.new_src == htonl(forward ? 0xc6336402 : 0xc0000202));
+        assert(decoded.new_dst == htonl(forward ? 0xcb007104 : 0xc6336402));
+        assert(decoded.new_sport == htons(forward ? 20000 : 10000));
+        assert(decoded.new_dport == htons(forward ? 40000 : 20000));
+        assert(next_hop == decoded.new_dst);
+#define DNAT_REJECT(change) do { dnat_fixture(forward, tcp); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+        DNAT_REJECT(ct.status &= ~IPS_DST_NAT_DONE);
+        DNAT_REJECT(ct.status |= IPS_SRC_NAT | IPS_SRC_NAT_DONE);
+        DNAT_REJECT(ct.tuplehash[0].tuple.src.u3.ip ^= htonl(1));
+        DNAT_REJECT(ct.tuplehash[0].tuple.src.u.all ^= htons(1));
+        DNAT_REJECT(rule.action.entries[4].mangle.offset ^= 4);
+        DNAT_REJECT(rule.action.entries[4].mangle.val ^= htonl(1));
+        DNAT_REJECT(rule.action.entries[5].mangle.mask ^= htonl(1));
+        DNAT_REJECT(rule.action.entries[5].mangle.val ^= htonl(1));
+        DNAT_REJECT(rule.action.entries[6].csum_flags = tcp ? 17 : 9);
+#undef DNAT_REJECT
+        dnat_fixture(forward, tcp);
+        for (unsigned stage = 1; stage <= 3; stage++) {
+            ft_fail_stage = stage; assert(ft_replace(&binding, &cls) < 0);
+            assert(!ft_fail_stage && !ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
+        }
+        assert(ft_replace(&binding, &cls) == 0);
+        struct netevent_ipv4_route event = { &init_net, htonl(0xcb007104), 32 };
+        ft_route_event(&event); assert(handle.invalid);
         ft_retire_workfn(NULL);
         assert(!ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
     }
@@ -1513,6 +1569,7 @@ int main(void)
     test_selective_neighbours();
     test_selective_routes();
     test_snat();
+    test_dnat();
     test_device_dependencies();
     test_device_recovery();
     test_transient_admission();

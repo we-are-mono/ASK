@@ -1,13 +1,12 @@
 # Linux flowtable NAT
 
-Static IPv4 TCP/UDP source NAT and MASQUERADE are supported on the foundation's
+Static IPv4 TCP/UDP source NAT, MASQUERADE and destination NAT are supported on the foundation's
 two physical ports. Linux conntrack and nftables own the mapping. The adapter
 validates Linux's native actions and CDX encodes the resolved translation using
 the existing proprietary firmware interface. No CMM or per-flow FCI call is
 involved, and the shared legacy encoder is unchanged.
 
-Destination NAT, hairpin/double NAT and IPv6 remain outside
-hardware eligibility. Those need separate increments and lifecycle proofs.
+Hairpin/double NAT and IPv6 remain outside hardware eligibility. Those need separate increments and lifecycle proofs.
 The [foundation](flowtable-foundation.md) still supplies the capacity, device,
 route, neighbour, retirement and policy contracts. NAT does not lift those limits.
 
@@ -20,12 +19,19 @@ For a client `A:a` reaching server `B:b` through source translation `C:c`:
 | Original | `A:a → B:b` | `C:c → B:b` | `B` |
 | Reply | `B:b → C:c` | `B:b → A:a` | `A` |
 
-The adapter requires completed source NAT, a TCP/UDP match identical to one of the
+For a WAN client `A:a` reaching public endpoint `P:p`, forwarded to `B:b`:
+
+| Direction | Hardware match | Packet after translation | Routed destination |
+| --- | --- | --- | --- |
+| Original | `A:a → P:p` | `A:a → B:b` | `B` |
+| Reply | `B:b → A:a` | `P:p → A:a` | `A` |
+
+The adapter requires completed source or destination NAT, a TCP/UDP match identical to one of the
 conntrack tuples, and consistent opposite tuple endpoints. It accepts exactly
 four Ethernet edits, one IPv4 edit, one transport port edit, the matching native IPv4/TCP or IPv4/UDP
 checksum action and a redirect. Masks, offsets and values must agree with the
 resolved mapping. Identity address or port edits are permitted; arbitrary flower
-rewrites, additional actions and DNAT mappings are refused.
+rewrites, additional actions and combined SNAT/DNAT mappings are refused.
 
 The private backend rule carries complete match and translated tuples. The
 classifier key uses the match; the existing encoder's synthetic twin describes
@@ -45,7 +51,9 @@ Configure NAT through ordinary Linux nftables or iptables support. The
 `ask-flowtable` JSON controls acceleration scope and exclusions; it does not
 allocate NAT mappings or duplicate NAT rules. Original and reply selectors keep
 their conntrack meanings: under SNAT, `reply_destination` and
-`reply_destination_port` select the translated source endpoint.
+`reply_destination_port` select the translated source endpoint. Under DNAT,
+`reply_source` and `reply_source_port` select the internal server endpoint. An
+original destination selector still names the public endpoint before DNAT.
 
 The test image packages `nft_nat`, `nft_chain_nat` and `nft_masq` so native nftables static
 NAT works after a clean boot. The kernel configuration already enables them.
@@ -131,3 +139,19 @@ ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=198.18.40.2 ASK_FLOWTABLE_SPORT=55400 \
 ```
 
 See the [MASQUERADE validation record](flowtable/history/masquerade.md).
+
+`test_flowtable_dnat` initiates TCP and UDP on the WAN host and runs the echo
+servers on Loki. It forces both destination address and port changes, checks
+both translated hardware directions, and independently validates UDP receive
+frames at both endpoints with ordinary and zero checksums. Exact TCP records
+exercise Linux endpoint checksum handling. The same sockets cross insertion
+rollback, dependent route replacement and policy stop/apply; software forwarding
+must preserve both conntrack IDs. Native TCP FIN processing removes both TCP
+hardware directions while the UDP mapping remains active.
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55500 \
+  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_dnat'
+```
+
+See the [DNAT validation record](flowtable/history/dnat.md).

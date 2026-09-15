@@ -135,7 +135,7 @@ def render(policy):
              " chain admit {", "  type filter hook forward priority 10; policy accept;",
              "  meta nfproto != ipv4 return", "  meta l4proto != { tcp, udp } return",
              "  ct direction != original return", "  ct state != established return",
-             "  ct mark != 0 return", "  ct status dnat return"]
+             "  ct mark != 0 return"]
     for field, action in (("exclude", "return"), ("scope", "flow add @fast")):
         for rule in policy[field]:
             for expression in match(rule, exclusion=field == "exclude"):

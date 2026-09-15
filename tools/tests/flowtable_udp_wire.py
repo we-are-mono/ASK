@@ -1,6 +1,34 @@
 """Independent Ethernet/IPv4/UDP receive validation, also staged on the LAN VM."""
+import ctypes
 import socket
 import struct
+
+
+def udp_capture_socket(destination_port):
+    """Capture the test UDP port without queueing TCP or unrelated host traffic."""
+    class Instruction(ctypes.Structure):
+        _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                    ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint32)]
+
+    class Program(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ushort), ("instructions", ctypes.POINTER(Instruction))]
+
+    # ETH_P_IP sockets have an Ethernet header. Classic socket BPF selects
+    # IPPROTO_UDP and destination port using the actual IPv4 header length;
+    # the independent validator still checks every tuple and checksum field.
+    assert 0 < destination_port <= 65535
+    instructions = (Instruction * 7)(
+        (0x30, 0, 0, 23), (0x15, 0, 4, 17), (0xb1, 0, 0, 14),
+        (0x48, 0, 0, 16), (0x15, 0, 1, destination_port),
+        (0x06, 0, 0, 0xffffffff), (0x06, 0, 0, 0))
+    program = Program(7, instructions)
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x800))
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, 26, bytes(program))  # SO_ATTACH_FILTER
+        return sock
+    except BaseException:
+        sock.close()
+        raise
 
 
 def wire_checksum(data):
