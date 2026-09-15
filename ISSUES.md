@@ -152,6 +152,72 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A140.** A retiring flow clears `IPS_OFFLOAD` on a conntrack a newer
+  flow already owns, and the conntrack then dies under the live flow. Root
+  caused 2026-09-16 with kernel patch 142 (diagnostic printks at the offload
+  lifecycle transitions); 78 of 82 deaths in one run match the pattern exactly,
+  with no rate-limited output and full coverage of all 16,384 connections:
+
+  ```
+  teardown  86332 -> 90     old flow retires, conntrack cut to 90s
+  admit       119 -> 86400  new flow on the same tuple restores NF_CT_DAY
+  teardown  86399 -> 90     old flow's teardown clears IPS_OFFLOAD again
+  reap                      113s later, conntrack dead, live flow retired
+  ```
+
+  Closing and immediately reopening a tuple leaves two flows sharing one
+  conntrack for 0.22-2.59 seconds (median 0.48). `flow_offload_teardown`
+  (`net/netfilter/nf_flow_table_core.c`) clears `IPS_OFFLOAD_BIT` and calls
+  `flow_offload_fixup_ct` against `flow->ct` without checking whether that
+  conntrack still belongs to the flow being retired. The surviving flow is then
+  running on a conntrack `gc_worker` will not refresh — it tests bit 14, now
+  clear — and that traffic cannot refresh either, because the flow is forwarded
+  in hardware and no packet reaches `nft_flow_offload` to set the bit again. It
+  expires and `gc_dying` retires the live flow, which is why that cause
+  outweighed every other three to one.
+
+  Upstream defect, not ASK: no adapter code participates, and `gc_hw_invalid`,
+  `add_fail` and `del_blocked` are all zero or negligible. UDP-only because
+  `flow_offload_fixup_ct` leaves established TCP 431,880 seconds against UDP's
+  90, so a poisoned TCP conntrack is re-offloaded long before it expires.
+  Reproduces on any workload that reopens a tuple while its predecessor is
+  still retiring, which a client reconnecting from the same source port does.
+
+  Fix direction: make the conntrack offload bit owned. Record on the flow
+  whether its own admission set `IPS_OFFLOAD_BIT` (`nft_flow_offload`'s
+  `test_and_set_bit` returning zero), and let only that flow clear it and apply
+  the fixup. Raising `nf_conntrack_udp_timeout_stream` only widens the window
+  and is a mitigation, not a fix. Instrumentation, eliminated explanations and
+  the measurement traps are in
+  [the retirement investigation](docs/flowtable-retirement-investigation.md).
+  Artifacts: `/tmp/ask-flowtable-churn/askdbg3.txt` on `vision`.
+
+- [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
+  16,384 connections. **Investigated (2026-09-15), deferred at user request:**
+  outside the CMM-retirement work; no fix or tuning retained. On the KASAN
+  image for `507c404`, restart 8,192 TCP and 8,192 UDP connections together
+  after a route-MTU change retires their flow entries. With CMM off throughout,
+  hardware flow offload lost 5,953 of 197,970 UDP exchanges (3.01%); the
+  software-only Linux flowtable control lost 8,739 of 206,479 (4.23%), with
+  zero hardware flow entries installed. TCP records arrived intact and the
+  WAN UDP receiver reported no socket drops. Hardware occupancy recovered to
+  all 32,768 directions in 16.6 seconds. This establishes that the loss does
+  not require hardware-flow admission; a legacy-CMM comparison was not run.
+  Follow-up measurements found FMan RX buffer-exhaustion and filter counters
+  increasing without MAC errors. The existing Ethernet miss policer is active
+  at 195,312 packets/s with a 64-packet burst (`dpa_app/dpa.c`,
+  `cdx/cdx_qos.c`); receive-buffer exhaustion has its own
+  `port_rx_out_of_buffers_discard` counter and can occur with
+  `port_discard_frame` and Linux drop traces nearly silent. These observations
+  identify slow-path constraints, but their individual contributions to the
+  UDP loss were not isolated. RPS across four CPUs and serializing the flow
+  admission workqueue did not resolve it; both settings were restored.
+  The accepted paced-capacity result remains recorded in
+  [capacity validation](docs/flowtable-capacity.md). If revisited, measure RX
+  buffer and miss-policer drops separately before changing either mechanism.
+  Captures, image identity and diagnostic scripts:
+  `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
+
 - [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
   local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
   → ____cmmCtRegister`) reaches `__cmm_ct_get_SA`, which on an SPI-mismatch

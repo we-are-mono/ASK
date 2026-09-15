@@ -1,0 +1,60 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] netfilter: hand the conntrack back only once per flow
+
+flow_offload_teardown() returns the conntrack to software every time it is
+called: it clears IPS_OFFLOAD and reinstates the short protocol timeout. The
+collector calls it on every pass while a flow waits for its hardware
+retirement, so a single stale flow does this once per second.
+
+A tuple reopened while its predecessor is still retiring leaves two flows
+pointing at one conntrack. The newer flow's admission re-takes IPS_OFFLOAD and
+restores NF_CT_DAY, and the older flow's next teardown takes both away again
+from the conntrack the live flow is now using. That conntrack cannot recover:
+gc_worker only refreshes conntracks carrying IPS_OFFLOAD, and the surviving
+flow is forwarded in hardware, so no packet reaches nft_flow_offload to set
+the bit again. It expires, and the collector then retires the live flow
+because its conntrack is dying.
+
+Guard the hand-back with the teardown bit so it happens once per flow.
+
+Measured on the sustained churn proof at 16384 offloaded connections. Before:
+82 conntracks reaped, 78 of them matching teardown/admit/teardown with the
+repeat landing 0.22-2.59s after the admission, and the proof failing on
+unrequested flow turnover. After: zero reaped and the proof passing, with
+flow retirements themselves unchanged at ~1200 per run. Only UDP was ever
+affected, because flow_offload_fixup_ct leaves established TCP 431880 seconds
+against UDP's 90.
+
+Upstream fixes the same defect in d2d31ea8cd80 ("netfilter: conntrack: fix
+erronous removal of offload bit"). That commit does not apply here: it repairs
+03428ca5cee9 ("netfilter: conntrack: rework offload nf_conn timeout extension
+logic"), which this tree predates and which moved the IPS_OFFLOAD clear inside
+flow_offload_fixup_ct(). This is the same guard applied to the older shape, so
+a kernel bump past d2d31ea8cd80 drops this patch rather than conflicting.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -416,9 +416,18 @@
+ 	struct nf_conn *ct = flow->ct;
+ 	unsigned int before = nf_ct_expires(ct);
+ 
+-	clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
+-	set_bit(NF_FLOW_TEARDOWN, &flow->flags);
+-	flow_offload_fixup_ct(flow->ct);
++	/* Hand the conntrack back only on the first teardown of this flow. The
++	 * collector calls this again on every pass while the flow waits for its
++	 * hardware retirement, and a tuple reopened in the meantime has already
++	 * given the conntrack to a new flow, which the repeat would rob of the
++	 * only refresh it can get: gc_worker skips conntracks without
++	 * IPS_OFFLOAD, and the new flow is forwarded in hardware, so no packet
++	 * reaches the software path to set the bit again.
++	 */
++	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
++		clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
++		flow_offload_fixup_ct(flow->ct);
++	}
+ 	/* Clearing IPS_OFFLOAD also ends the gc_worker refresh, so the timeout
+ 	 * installed here is the whole remaining life of the conntrack. Print it
+ 	 * rather than reconstructing it from successive samples.

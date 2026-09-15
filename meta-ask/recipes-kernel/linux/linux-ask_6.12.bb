@@ -81,6 +81,9 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://120-emc2305-dt-fan-control.patch \
            file://130-thermal-linear-governor.patch \
            file://140-ask-flowtable-context.patch \
+           file://141-ask-flowtable-teardown-attribution.patch \
+           file://142-ask-flowtable-refresh-tracing.patch \
+           file://143-ask-flowtable-teardown-handback-once.patch \
           "
 
 SRCREV_kernel = "${KERNEL_SRCREV}"
