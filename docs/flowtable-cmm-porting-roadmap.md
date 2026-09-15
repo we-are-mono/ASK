@@ -48,6 +48,41 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
 | 13 | MACVLAN (`module_macvlan`) | 202 | 2 | Partial — path type exists | Low | Likely falls out of the VLAN and bridge work. |
 
+## IPv6 implementation plan
+
+Scoped 2026-09-16 by reading the adapter and the classifier rather than
+estimating. The hardware is ready and Linux is ready; the adapter is IPv4 by
+construction rather than by a flag, so the work is threading an address family
+through its key.
+
+Already available, needing no work:
+
+- `CtEntry` carries both families in a union, `Saddr_v4` and `Saddr_v6[4]`
+  (`cdx/control_ipv4.h`), and `insert_entry_in_classif_table` is shared.
+- `FFTYPE_IPV6` and `HASH_CT6` exist and are exercised by `control_ipv6.c`.
+- The Linux flowtable has complete IPv6 hooks in `nf_flow_table_ip.c`.
+
+What has to change:
+
+| Site | Change |
+| --- | --- |
+| `struct cdx_ft_rule` (`cdx/cdx_flowtable_backend.h`) | Widen the four addresses to a family union. This struct is the adapter's key, so the change reaches `ft_parse`, `ft_key_hash`, `ft_same_key`, `ft_find`, `ft_replace`, `cdx_ft_hw_add` and the proc output together. |
+| `ft_parse` (`cdx/ask_flowtable.c`) | Accept `FLOW_DISSECTOR_KEY_IPV6_ADDRS` and `ETH_P_IPV6` beside the v4 keys, and carry the family into the rule. |
+| `ft_key_hash` | Hash a v6 address rather than a `u32`. |
+| `cdx_ft_hw_add` (`cdx/cdx_flowtable_hw.c`) | Set `FFTYPE_IPV6`, use `HASH_CT6`, fill `Saddr_v6`/`Daddr_v6`. |
+| Route and neighbour validation | `ft_routes_valid` and the neighbour path use IPv4 helpers throughout and need v6 equivalents. |
+| `/proc/cdx_flowtable` | Family-aware address formatting instead of `%pI4`. |
+| Tests | A v6 counterpart to the NAT tests, v6 support in the connection peer, and v6 addressing on the loki and vision topology. |
+
+Decide before starting: **whether v6 NAT is in scope.** Declining it keeps the
+twin and inverse-translation encoding out of the first increment and matches
+how IPv6 is normally deployed, but it must be an explicit boundary in the
+supported scope rather than an unstated omission. Recommend excluding it from
+the first increment and admitting v6 routed traffic only.
+
+Do this as one increment with its own proof, not as filler work: a partially
+threaded address family compiles and silently mis-keys flows.
+
 ## Sequencing
 
 **Items 1 to 4 are the natural next increments.** Linux supplies the mechanism,
