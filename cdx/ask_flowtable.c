@@ -14,10 +14,12 @@
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
+#include <linux/ip.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
+#include <linux/tc_act/tc_csum.h>
 #include <linux/workqueue.h>
 #include <net/arp.h>
 #include <net/fib_notifier.h>
@@ -30,6 +32,7 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
+#include <net/netfilter/nf_nat.h>
 #include "cdx_flowtable_backend.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 5
@@ -314,9 +317,79 @@ static bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
 	return true;
 }
 
-/* Exact masks ensure that no selector which hardware cannot enforce is lost.
- * nf_flowtable supplies the routing semantics (including TTL decrement); its
- * Ethernet rewrites are four native-endian mangle words and a final redirect. */
+static bool ft_unicast(__be32 address)
+{
+	return !ipv4_is_multicast(address) && !ipv4_is_zeronet(address) &&
+		!ipv4_is_loopback(address) && !ipv4_is_lbcast(address);
+}
+
+static bool ft_tuple_matches(const struct cdx_ft_rule *rule,
+			     const struct nf_conntrack_tuple *tuple)
+{
+	return rule->src == tuple->src.u3.ip && rule->dst == tuple->dst.u3.ip &&
+		rule->sport == tuple->src.u.all && rule->dport == tuple->dst.u.all;
+}
+
+/* Linux owns allocation and lifetime of the resolved NAT mapping. Accept only
+ * the exact native UDP SNAT action sequence, including its inverse in replies.
+ * Do not interpret arbitrary flower edits as a conntrack NAT operation. */
+static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rule *out)
+{
+	const struct nf_conn *ct = cls->nf_ct;
+	const struct nf_conntrack_tuple *orig = &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple;
+	const struct nf_conntrack_tuple *reply = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
+	const struct flow_action *actions = &cls->rule->action;
+	const struct flow_action_entry *ip, *port, *csum;
+	unsigned long status = READ_ONCE(ct->status);
+	bool forward;
+	u32 port_value, port_mask;
+
+	out->new_src = out->src;
+	out->new_dst = out->dst;
+	out->new_sport = out->sport;
+	out->new_dport = out->dport;
+	if (!(status & IPS_NAT_MASK))
+		return actions->num_entries == 5;
+	if ((status & IPS_NAT_MASK) != IPS_SRC_NAT || !(status & IPS_SRC_NAT_DONE) ||
+	    out->proto != IPPROTO_UDP || actions->num_entries != 8)
+		return false;
+#if IS_ENABLED(CONFIG_NF_NAT_MASQUERADE)
+	/* WAN-address/masquerade lifecycle is outside the static SNAT contract. */
+	if (nfct_nat(ct) && READ_ONCE(nfct_nat(ct)->masq_index))
+		return false;
+#endif
+	forward = ft_tuple_matches(out, orig);
+	if (forward == ft_tuple_matches(out, reply) ||
+	    orig->dst.u3.ip != reply->src.u3.ip || orig->dst.u.all != reply->src.u.all)
+		return false;
+	if (forward) {
+		out->new_src = reply->dst.u3.ip;
+		out->new_sport = reply->dst.u.all;
+	} else {
+		out->new_dst = orig->src.u3.ip;
+		out->new_dport = orig->src.u.all;
+	}
+	if (!ft_unicast(out->new_src) || !ft_unicast(out->new_dst) ||
+	    !out->new_sport || !out->new_dport)
+		return false;
+	ip = &actions->entries[4];
+	port = &actions->entries[5];
+	csum = &actions->entries[6];
+	port_value = forward ? htonl((u32)ntohs(out->new_sport) << 16) :
+			      htonl(ntohs(out->new_dport));
+	port_mask = forward ? ~htonl(0xffff0000) : ~htonl(0x0000ffff);
+	return ip->id == FLOW_ACTION_MANGLE && ip->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_IP4 &&
+		ip->mangle.offset == (forward ? offsetof(struct iphdr, saddr) : offsetof(struct iphdr, daddr)) &&
+		!ip->mangle.mask && ip->mangle.val == (forward ? out->new_src : out->new_dst) &&
+		port->id == FLOW_ACTION_MANGLE && port->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_UDP &&
+		!port->mangle.offset && port->mangle.mask == port_mask && port->mangle.val == port_value &&
+		csum->id == FLOW_ACTION_CSUM &&
+		csum->csum_flags == (TCA_CSUM_UPDATE_FLAG_IPV4HDR | TCA_CSUM_UPDATE_FLAG_UDP);
+}
+
+/* Exact masks preserve every selector. Native flowtables supply routing
+ * semantics (including TTL decrement), four Ethernet mangle words, optional
+ * translation/checksum actions and a final redirect. */
 static int ft_parse(struct cdx_ft_binding *binding,
 		    const struct flow_cls_offload *cls, struct cdx_ft_rule *out,
 		    __be32 *next_hop)
@@ -344,7 +417,6 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_ORIGINAL) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_REPLY) ||
 	    READ_ONCE(cls->nf_ct->mark) ||
-	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) ||
 	    cls->common.chain_index || cls->common.protocol != ETH_P_ALL ||
 	    (rule->match.dissector->used_keys != keys &&
 	     rule->match.dissector->used_keys != (keys | BIT(FLOW_DISSECTOR_KEY_TCP))))
@@ -364,11 +436,15 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    ipv4.mask->src != htonl(0xffffffff) || ipv4.mask->dst != htonl(0xffffffff) ||
 	    ports.mask->src != htons(0xffff) || ports.mask->dst != htons(0xffff) ||
 	    !ports.key->src || !ports.key->dst ||
-	    ipv4_is_multicast(ipv4.key->src) || ipv4_is_multicast(ipv4.key->dst) ||
-	    ipv4_is_zeronet(ipv4.key->src) || ipv4_is_zeronet(ipv4.key->dst) ||
-	    ipv4_is_loopback(ipv4.key->src) || ipv4_is_loopback(ipv4.key->dst) ||
-	    ipv4_is_lbcast(ipv4.key->src) || ipv4_is_lbcast(ipv4.key->dst) ||
-	    rule->action.num_entries != 5)
+	    !ft_unicast(ipv4.key->src) || !ft_unicast(ipv4.key->dst))
+		return -EOPNOTSUPP;
+	memset(out, 0, sizeof(*out));
+	out->src = ipv4.key->src;
+	out->dst = ipv4.key->dst;
+	out->sport = ports.key->src;
+	out->dport = ports.key->dst;
+	out->proto = basic.key->ip_proto;
+	if (!ft_translation(cls, out))
 		return -EOPNOTSUPP;
 	switch (basic.key->ip_proto) {
 	case IPPROTO_TCP:
@@ -401,24 +477,18 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		word = (word & masks[i]) | action->mangle.val;
 		memcpy(ethernet + offsets[i], &word, sizeof(word));
 	}
-	action = &rule->action.entries[4];
+	action = &rule->action.entries[rule->action.num_entries - 1];
 	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_port_supported(action->dev) ||
 	    !cdx_ft_port_supported(binding->dev) || action->dev == binding->dev ||
 	    !is_valid_ether_addr(ethernet) ||
-	    !ft_next_hop(cls, action->dev, ipv4.key->dst, next_hop) ||
+	    !ft_next_hop(cls, action->dev, out->new_dst, next_hop) ||
 	    !ft_neigh_check(action->dev, *next_hop, ethernet) ||
 	    cls->nf_mtu > action->dev->mtu || cls->nf_mtu < 68)
 		return -EOPNOTSUPP;
 	if (!ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr))
 		return -ESTALE;
-	memset(out, 0, sizeof(*out));
 	out->in = binding->dev;
 	out->out = action->dev;
-	out->src = ipv4.key->src;
-	out->dst = ipv4.key->dst;
-	out->sport = ports.key->src;
-	out->dport = ports.key->dst;
-	out->proto = basic.key->ip_proto;
 	out->mtu = cls->nf_mtu;
 	ether_addr_copy(out->dst_mac, ethernet);
 	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
@@ -878,11 +948,11 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 	mask = inet_make_mask(event->prefixlen);
 	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
-		/* No NAT is admitted, so source is the reverse route destination.
+		/* After NAT, current egress uses new_dst; reverse egress uses src.
 		 * Check both endpoints even if only one direction installed. Match
 		 * all tables/DSCP aliases conservatively: a new more-specific route
 		 * can supersede a route which never emitted a deletion event. */
-		if (!((entry->rule.dst ^ event->dst) & mask) ||
+		if (!((entry->rule.new_dst ^ event->dst) & mask) ||
 		    !((entry->rule.src ^ event->dst) & mask))
 			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
 	}
@@ -994,10 +1064,12 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   atomic64_read(&ft_admission_invalidations));
 	list_for_each_entry(entry, &ft_entries, list) {
 		cdx_ft_stats(entry->hw, &stats);
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 			   &entry->rule.src, ntohs(entry->rule.sport),
-			   &entry->rule.dst, ntohs(entry->rule.dport), entry->rule.proto, entry->rule.mtu,
+			   &entry->rule.dst, ntohs(entry->rule.dport),
+			   &entry->rule.new_src, ntohs(entry->rule.new_sport),
+			   &entry->rule.new_dst, ntohs(entry->rule.new_dport), entry->rule.proto, entry->rule.mtu,
 			   &entry->next_hop, stats.packets, stats.bytes, stats.lastused);
 	}
 	cdx_ft_end();

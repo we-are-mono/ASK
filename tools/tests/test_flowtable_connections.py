@@ -131,6 +131,7 @@ async def peer(r, flows=FLOWS, *, initial_ids=None):
         config = {"lan": r.lan_ip, "wan": WAN_IP, "dport": DPORT,
                   "control_port": DPORT + 1, "flows": flows, "token": secrets.token_hex(16)}
         script = (f"CONFIG={config!r}\n" + Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
+                  + "\n" + Path(__file__).with_name("flowtable_udp_wire.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_connections_peer.py").read_text())
         task = asyncio.create_task(lan_run_python(r.lan, script, timeout=200, label="flowtable_connections"))
         reader, writer = await asyncio.wait_for(accepted.get(), 15)

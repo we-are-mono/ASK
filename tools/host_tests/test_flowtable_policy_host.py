@@ -53,6 +53,8 @@ def test_policy_json_and_tuple_semantics(tmp_path):
         assert "meta l4proto tcp " + expression + " return" in rules
     assert "ct reply ip daddr 203.0.113.4/32 ct original proto-src 1000-2000 ct mark & 0x3 == 0x2 return" in rules
     assert "ct original ip saddr 192.0.2.0/24 ct original ip daddr 198.51.100.2/32 flow add @fast" in rules
+    assert "ct status snat meta l4proto != udp return" in rules
+    assert "ct status dnat return" in rules
     assert "counter" not in rules and "flush" not in rules
     assert policy.MARKER + policy.policy_hash(candidate) in rules
     assert candidate == original, "render mutated the candidate"

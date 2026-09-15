@@ -34,6 +34,12 @@ typedef uint64_t u64, atomic64_t;
 #define IP_CT_DIR_ORIGINAL 0
 #define IP_CT_DIR_REPLY 1
 #define IPS_NAT_MASK 0x30
+#define IPS_SRC_NAT 0x10
+#define IPS_SRC_NAT_DONE 0x80
+#define IS_ENABLED(x) 1
+#define TCA_CSUM_UPDATE_FLAG_IPV4HDR 1
+#define TCA_CSUM_UPDATE_FLAG_UDP 16
+struct iphdr { u8 prefix[12]; __be32 saddr, daddr; };
 #define IPS_ASSURED 4
 #define TCPHDR_FIN 1
 #define TCPHDR_RST 4
@@ -134,7 +140,13 @@ static void read_unlock_bh(bool *lock) { assert(*lock); *lock = false; }
 #define spin_lock_bh read_lock_bh
 #define spin_unlock_bh read_unlock_bh
 struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh, use_hw_handles, flow_block_lock; };
-struct nf_conn { struct net *net; unsigned zone[2], mark, status, protonum, tcp_state; };
+struct nf_conntrack_tuple {
+    struct { struct { __be32 ip; } u3; union { __be16 all; } u; } src, dst;
+};
+struct nf_conn_nat { int masq_index; };
+struct nf_conn { struct net *net; unsigned zone[2], mark, status, protonum, tcp_state;
+    struct { struct nf_conntrack_tuple tuple; } tuplehash[2]; struct nf_conn_nat *nat; };
+#define nfct_nat(c) ((c)->nat)
 #define nf_ct_protonum(c) ((c)->protonum)
 static bool nf_conntrack_tcp_established(const struct nf_conn *c)
 { return c->tcp_state == TCP_CONNTRACK_ESTABLISHED && (c->status & IPS_ASSURED); }
@@ -162,15 +174,16 @@ struct tcp { __be16 flags; };
 #define MATCH(t) struct flow_match_##t { struct t *key, *mask; }
 MATCH(meta); MATCH(control); MATCH(basic); MATCH(ipv4_addrs); MATCH(ports);
 MATCH(tcp);
-enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
+enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACTION_CSUM, FLOW_ACT_MANGLE_HDR_TYPE_IP4, FLOW_ACT_MANGLE_HDR_TYPE_UDP, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
 struct flow_action_entry {
-    unsigned id;
+    unsigned id, csum_flags;
     struct { unsigned htype, offset; u32 mask, val; } mangle;
     struct net_device *dev;
 };
+struct flow_action { unsigned num_entries; struct flow_action_entry entries[10]; };
 struct flow_rule {
     struct { struct flow_dissector *dissector; } match;
-    struct { unsigned num_entries; struct flow_action_entry entries[6]; } action;
+    struct flow_action action;
     struct flow_match_meta meta;
     struct flow_match_control control;
     struct flow_match_basic basic;
@@ -474,6 +487,101 @@ static void fixture(void)
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1492,
         .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
+}
+static void snat_fixture(bool forward)
+{
+    fixture();
+    ct.status = IPS_SRC_NAT | IPS_SRC_NAT_DONE;
+    ct.tuplehash[0].tuple = (struct nf_conntrack_tuple){
+        .src = { .u3.ip = ik.src, .u.all = pk.src },
+        .dst = { .u3.ip = ik.dst, .u.all = pk.dst } };
+    ct.tuplehash[1].tuple = (struct nf_conntrack_tuple){
+        .src = { .u3.ip = ik.dst, .u.all = pk.dst },
+        .dst = { .u3.ip = htonl(0xcb007104), .u.all = htons(40000) } };
+    rule.action.num_entries = 8;
+    rule.action.entries[7] = rule.action.entries[4];
+    rule.action.entries[4] = (struct flow_action_entry){ .id = FLOW_ACTION_MANGLE,
+        .mangle = { .htype = FLOW_ACT_MANGLE_HDR_TYPE_IP4, .offset = forward ? 12 : 16,
+                    .val = forward ? htonl(0xcb007104) : htonl(0xc0000202) } };
+    /* Independent wire bytes: source 40000 or destination 10000. */
+    const u8 values[2][4] = {{0,0,0x27,0x10}, {0x9c,0x40,0,0}};
+    const u8 masks[2][4] = {{0xff,0xff,0,0}, {0,0,0xff,0xff}};
+    rule.action.entries[5] = (struct flow_action_entry){ .id = FLOW_ACTION_MANGLE,
+        .mangle.htype = FLOW_ACT_MANGLE_HDR_TYPE_UDP };
+    memcpy(&rule.action.entries[5].mangle.val, values[forward], 4);
+    memcpy(&rule.action.entries[5].mangle.mask, masks[forward], 4);
+    rule.action.entries[6] = (struct flow_action_entry){ .id = FLOW_ACTION_CSUM, .csum_flags = 17 };
+    if (!forward) {
+        ik = (struct ipv4_addrs){ htonl(0xc6336402), htonl(0xcb007104) };
+        pk = (struct ports){ htons(20000), htons(40000) };
+        neighbour.primary_key = htonl(0xc0000202);
+    }
+}
+static void test_snat(void)
+{
+    struct cdx_ft_rule decoded;
+    struct nf_conn_nat nat = { .masq_index = 7 };
+    for (unsigned forward = 0; forward < 2; forward++) {
+        snat_fixture(forward);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(decoded.src == ik.src && decoded.dst == ik.dst);
+        assert(decoded.new_src == htonl(forward ? 0xcb007104 : 0xc6336402));
+        assert(decoded.new_dst == htonl(forward ? 0xc6336402 : 0xc0000202));
+        assert(decoded.new_sport == htons(forward ? 40000 : 20000));
+        assert(decoded.new_dport == htons(forward ? 20000 : 10000));
+        assert(next_hop == decoded.new_dst);
+#define NAT_REJECT(change) do { snat_fixture(forward); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+        NAT_REJECT(ct.status = IPS_NAT_MASK | IPS_SRC_NAT_DONE);
+        NAT_REJECT(ct.status = IPS_SRC_NAT);
+        NAT_REJECT(ct.status = 0);
+        NAT_REJECT(ct.nat = &nat);
+        NAT_REJECT(ct.protonum = bk.ip_proto = IPPROTO_TCP);
+        NAT_REJECT(ik.src ^= htonl(1)); NAT_REJECT(pk.dst ^= htons(1));
+        NAT_REJECT(ct.tuplehash[0].tuple.dst.u3.ip ^= htonl(1));
+        NAT_REJECT(ct.tuplehash[0].tuple.dst.u.all ^= htons(1));
+        NAT_REJECT(rule.action.num_entries = 5); NAT_REJECT(rule.action.num_entries = 9);
+        NAT_REJECT(rule.action.entries[4].mangle.offset ^= 4);
+        NAT_REJECT(rule.action.entries[4].mangle.mask = 1);
+        NAT_REJECT(rule.action.entries[4].mangle.val ^= htonl(1));
+        NAT_REJECT(rule.action.entries[4].mangle.htype = FLOW_ACT_MANGLE_HDR_TYPE_ETH);
+        NAT_REJECT(rule.action.entries[5].mangle.offset = 2);
+        NAT_REJECT(rule.action.entries[5].mangle.mask ^= htonl(1));
+        NAT_REJECT(rule.action.entries[5].mangle.val ^= htonl(1));
+        NAT_REJECT(rule.action.entries[5].mangle.htype = FLOW_ACT_MANGLE_HDR_TYPE_IP4);
+        NAT_REJECT(rule.action.entries[6].id = FLOW_ACTION_REDIRECT);
+        NAT_REJECT(rule.action.entries[6].csum_flags = 1);
+        NAT_REJECT(rule.action.entries[7].id = FLOW_ACTION_CSUM);
+        NAT_REJECT(ct.tuplehash[forward ? 1 : 0].tuple.dst.u3.ip = 0);
+#undef NAT_REJECT
+        /* Native SNAT emits both edits even when address or port is unchanged.
+         * Validate those identity edits without inventing another action shape. */
+        snat_fixture(forward);
+        ct.tuplehash[1].tuple.dst.u3.ip = ct.tuplehash[0].tuple.src.u3.ip;
+        if (!forward) ik.dst = ct.tuplehash[1].tuple.dst.u3.ip;
+        rule.action.entries[4].mangle.val = htonl(0xc0000202);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(decoded.src == decoded.new_src && decoded.dst == decoded.new_dst);
+        snat_fixture(forward);
+        ct.tuplehash[1].tuple.dst.u.all = ct.tuplehash[0].tuple.src.u.all;
+        if (!forward) pk.dst = htons(10000);
+        rule.action.entries[5].mangle.val = forward ? htonl(10000U << 16) : htonl(10000);
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+        assert(decoded.sport == decoded.new_sport && decoded.dport == decoded.new_dport);
+        snat_fixture(forward);
+        for (unsigned stage = 1; stage <= 3; stage++) {
+            ft_fail_stage = stage; assert(ft_replace(&binding, &cls) < 0);
+            assert(!ft_fail_stage && !ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
+        }
+        assert(ft_replace(&binding, &cls) == 0);
+        /* An unrelated translated-address prefix is not a routed endpoint.
+         * The client route must retire even a lone reply direction. */
+        struct netevent_ipv4_route event = { &init_net, htonl(0xcb007104), 32 };
+        ft_route_event(&event); assert(!handle.invalid);
+        event.dst = htonl(0xc0000202);
+        ft_route_event(&event); assert(handle.invalid && !ft_invalid);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !allocated && !live_hw && !ft_handle_refs && !ft_neighbour_refs);
+    }
 }
 static void tcp_fixture(void)
 {
@@ -1384,6 +1492,7 @@ int main(void)
     test_neighbours();
     test_selective_neighbours();
     test_selective_routes();
+    test_snat();
     test_device_dependencies();
     test_device_recovery();
     test_transient_admission();

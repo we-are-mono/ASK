@@ -61,9 +61,11 @@ Prefixes must have their host bits clear. Unknown fields, duplicate JSON keys,
 invalid types and configurations over 64 KiB are rejected. Each list permits
 at most 256 objects. There is no arbitrary nftables text in this format.
 
-The current foundation admits only established original-direction IPv4 TCP/UDP
-traffic, with zero conntrack mark and no source or destination NAT. Linux
-additionally refuses helper and sequence-adjusted connections. Nonzero mark
+Admission requires established original-direction IPv4 TCP/UDP traffic and a
+zero conntrack mark. Routed TCP/UDP and static UDP source NAT are eligible;
+TCP NAT, destination NAT and MASQUERADE remain outside hardware support. Linux
+additionally refuses helper and sequence-adjusted connections. See the
+[NAT contract](flowtable-nat.md) for mapping and reply-tuple semantics. Nonzero mark
 selectors are representable for policy migration but cannot broaden the
 backend's zero-mark contract. This tool creates no routes, firewall permissions,
 NAT exemptions, helpers or feature-specific acceleration.
@@ -134,5 +136,6 @@ Use normal persistent Linux sysctl configuration for native scalar settings.
 There is no need to duplicate those controls in the policy file or send them
 through FCI. A Linux conntrack capacity setting does not resize CDX hardware.
 Existing hardware lifetime changes should be applied across a policy stop/apply
-boundary when immediate retirement is required. IPv6, NAT, PPPoE, bridge/VLAN,
-multicast, IPsec and tunnel acceleration remain outside this foundation.
+boundary when immediate retirement is required. IPv6, further NAT types,
+PPPoE, bridge/VLAN, multicast, IPsec and tunnel acceleration need their own
+feature increments.

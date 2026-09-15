@@ -47,6 +47,10 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	*result = NULL;
 	if (rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP)
 		return -EOPNOTSUPP;
+	if (rule->proto != IPPROTO_UDP &&
+	    (rule->new_src != rule->src || rule->new_dst != rule->dst ||
+	     rule->new_sport != rule->sport || rule->new_dport != rule->dport))
+		return -EOPNOTSUPP;
 	in_iface = dpa_get_ifinfo_by_netdev(rule->in);
 	out_iface = dpa_get_ifinfo_by_netdev(rule->out);
 	if (!in_iface || !out_iface || in_iface->itf_id >= L2_MAX_ONIF ||
@@ -81,19 +85,20 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	ct->pRtEntry = &hw->route;
 	ct->fftype = FFTYPE_IPV4;
 	ct->status = CONNTRACK_ORIG;
+	if (rule->new_src != rule->src || rule->new_dst != rule->dst ||
+	    rule->new_sport != rule->sport || rule->new_dport != rule->dport)
+		ct->status |= CONNTRACK_NAT;
 	ct->proto = rule->proto;
 	ct->Saddr_v4 = rule->src;
 	ct->Daddr_v4 = rule->dst;
 	ct->Sport = rule->sport;
 	ct->Dport = rule->dport;
-	ct->twin_Saddr = rule->dst;
-	ct->twin_Daddr = rule->src;
-	ct->twin_Sport = rule->dport;
-	ct->twin_Dport = rule->sport;
-	hw->twin.Saddr_v4 = rule->dst;
-	hw->twin.Daddr_v4 = rule->src;
-	hw->twin.Sport = rule->dport;
-	hw->twin.Dport = rule->sport;
+	/* The shared encoder derives rewrites from the inverse translated tuple.
+	 * Only the original match participates in classifier key/hash creation. */
+	ct->twin_Saddr = hw->twin.Saddr_v4 = rule->new_dst;
+	ct->twin_Daddr = hw->twin.Daddr_v4 = rule->new_src;
+	ct->twin_Sport = hw->twin.Sport = rule->new_dport;
+	ct->twin_Dport = hw->twin.Dport = rule->new_sport;
 	hw->twin.proto = rule->proto;
 	ct->hash = HASH_CT(rule->src, rule->dst, rule->sport, rule->dport,
 			   rule->proto);

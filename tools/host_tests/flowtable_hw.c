@@ -20,6 +20,7 @@ typedef uint64_t u64;
 #define NETREG_REGISTERED 1
 #define FFTYPE_IPV4 1
 #define CONNTRACK_ORIG 1
+#define CONNTRACK_NAT 0x20
 #define GFP_KERNEL 0
 #define EN_EHASH_DELETE_UNSYNCED -2
 #define HASH_CT(s,d,sp,dp,proto) ((proto) * 13)
@@ -115,6 +116,8 @@ static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
 static int delete_result;
+static __be32 expected_src, expected_dst;
+static __be16 expected_sport, expected_dport;
 static unsigned expected_proto = IPPROTO_UDP;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
@@ -125,9 +128,13 @@ static int insert_entry_in_classif_table(PCtEntry ct)
     assert(ct->hash == expected_proto * 13 && ct->twin->proto == expected_proto);
     assert(ct->Saddr_v4 == htonl(0xc0000201) && ct->Daddr_v4 == htonl(0xc6336401));
     assert(ct->Sport == htons(1234) && ct->Dport == htons(5678));
-    assert(ct->twin_Saddr == ct->Daddr_v4 && ct->twin_Daddr == ct->Saddr_v4);
-    assert(ct->twin_Sport == ct->Dport && ct->twin_Dport == ct->Sport);
-    assert(ct->twin->Sport == ct->Dport && ct->twin->Dport == ct->Sport && ct->twin->twin == ct);
+    assert(ct->twin_Saddr == expected_dst && ct->twin_Daddr == expected_src);
+    assert(ct->twin_Sport == expected_dport && ct->twin_Dport == expected_sport);
+    assert(ct->twin->Saddr_v4 == expected_dst && ct->twin->Daddr_v4 == expected_src);
+    assert(ct->twin->Sport == expected_dport && ct->twin->Dport == expected_sport && ct->twin->twin == ct);
+    bool nat = expected_src != ct->Saddr_v4 || expected_dst != ct->Daddr_v4 ||
+               expected_sport != ct->Sport || expected_dport != ct->Dport;
+    assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0)));
     assert(ct->pRtEntry->itf == &out_itf && ct->pRtEntry->input_itf == &in_itf);
     assert(ct->pRtEntry->underlying_input_itf == &in_itf && ct->pRtEntry->mtu == 1200);
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
@@ -172,6 +179,8 @@ static void test_backend(void)
     in_iface.eth_info.net_dev = &in; out_iface.eth_info.net_dev = &out;
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+    rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
+    rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     struct cdx_ft_hw *hw = NULL;
     expected_proto = IPPROTO_UDP;
     cdx_info->ctrl.mutex = false;
@@ -274,6 +283,8 @@ int main(void)
     struct net_device in = { .name = "in" }, out = { .name = "out" };
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+    rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
+    rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     struct cdx_ft_hw *hw;
     struct cdx_ft_counters counters;
     in_iface.eth_info.net_dev=&in; out_iface.eth_info.net_dev=&out;
@@ -289,6 +300,20 @@ int main(void)
         fail_alloc=true; assert(cdx_ft_hw_del(&hw) == 0 && !hw && !key && !allocations); fail_alloc=false;
         unsigned old=deletes; assert(cdx_ft_hw_del(&hw)==0 && deletes==old);
     }
+    rule.proto = expected_proto = IPPROTO_UDP;
+    for (unsigned variant = 0; variant < 6; variant++) {
+        rule.new_src = expected_src = variant == 0 || variant == 4 ? htonl(0xcb007104) : rule.src;
+        rule.new_dst = expected_dst = variant == 1 || variant == 5 ? htonl(0xcb007104) : rule.dst;
+        rule.new_sport = expected_sport = variant == 2 || variant == 4 ? htons(40000) : rule.sport;
+        rule.new_dport = expected_dport = variant == 3 || variant == 5 ? htons(40000) : rule.dport;
+        assert(cdx_ft_hw_add(&rule,&hw) == 0);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+        fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
+        rule.proto=IPPROTO_TCP; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP && !hw);
+        rule.proto=IPPROTO_UDP;
+    }
+    rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
+    rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     assert(cdx_ft_hw_add(&rule,&hw)==0);
     delete_result=EN_EHASH_DELETE_UNSYNCED; fail_alloc=true;
     assert(cdx_ft_hw_del(&hw)==-EAGAIN && !hw && key && !key->linked && allocations==2);

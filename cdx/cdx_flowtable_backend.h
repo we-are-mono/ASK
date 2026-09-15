@@ -17,6 +17,9 @@ struct cdx_ft_rule {
 	struct net_device *out;
 	__be32 src, dst;
 	__be16 sport, dport;
+	/* Complete tuple after translation; identical to the match without NAT. */
+	__be32 new_src, new_dst;
+	__be16 new_sport, new_dport;
 	u8 proto;
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];

@@ -41,6 +41,7 @@ class Flow:
         self.spec = spec
         self.serial = 0
         self.reader = self.writer = self.sock = None
+        self.wire = None
         self.stop = asyncio.Event()
 
     async def open(self, config):
@@ -67,6 +68,13 @@ class Flow:
             self.sock.setblocking(False)
             self.sock.bind(local)
             self.sock.connect(remote)
+            if "wire" in self.spec:
+                with namespace(self.spec):
+                    self.wire = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x800))
+                self.wire.bind((self.spec["iface"], 0))
+                self.wire.setblocking(False)
+                if self.spec["wire"].get("zero_checksum"):
+                    self.sock.setsockopt(socket.SOL_SOCKET, 11, 1)  # Linux SO_NO_CHECK
 
     async def run(self, count, interval, allow_loss=False):
         # Only explicit UDP outage windows may lose datagrams. TCP and all
@@ -98,6 +106,13 @@ class Flow:
                             assert ident == self.spec['id'] and first <= serial < self.serial
                             assert reply == payload(ident, serial, size)
                             late += 1
+                        if self.wire:
+                            while True:
+                                frame = await loop.sock_recv(self.wire, 65536)
+                                wire_payload = udp_wire_payload(frame, **self.spec["wire"])
+                                if wire_payload is not None:
+                                    assert wire_payload == data, (self.spec, self.serial, frame.hex())
+                                    break
                 assert reply == data, (self.spec, self.serial, "corrupt, duplicate or misdirected echo")
                 received += 1
             except (TimeoutError, OSError) as error:
@@ -124,6 +139,9 @@ class Flow:
         if self.sock:
             self.sock.close()
             self.sock = None
+        if self.wire:
+            self.wire.close()
+            self.wire = None
 
 
 async def main(config):
@@ -193,6 +211,8 @@ async def main(config):
                 flow.writer.close()
             if flow.sock:
                 flow.sock.close()
+            if flow.wire:
+                flow.wire.close()
         if control:
             control.close()
             await control.wait_closed()

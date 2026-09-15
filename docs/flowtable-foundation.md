@@ -8,7 +8,9 @@ proofs. Each increment is committed in the development branch.
 This checkpoint covers the maintained Linux flowtable/CDX foundation on the
 repository's Linux 6.12.103 kernel and existing proprietary NXP firmware. It
 does not imply feature parity with CMM. The detailed implementation and dated
-evidence remain in [the design record](linux-flowtable-offload.md).
+evidence remain in [the design record](linux-flowtable-offload.md). Subsequent
+feature increments extend this checkpoint; [static UDP SNAT](flowtable-nat.md)
+is the first such addition.
 
 ## Supported boundary
 
@@ -18,7 +20,7 @@ callbacks; CDX owns hardware encoding, resources and safe retirement. The
 adapter uses a kernel backend interface, with no per-flow FCI commands.
 dpa_app/FMC still initialize the hardware once at provider startup.
 
-The current backend supports one hardware flowtable over two initial-network-
+The accepted foundation supports one hardware flowtable over two initial-network-
 namespace physical ports, at most 64 directional entries, and routed IPv4
 TCP/UDP without NAT. Addresses can resolve through ordinary ARP and IPv4 gateway
 routes. The controller starts disabled and applies explicit nftables scope and
