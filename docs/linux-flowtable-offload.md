@@ -36,6 +36,7 @@ configuration instructions.
 | Kernel and hardware | Repository Linux 6.12.103 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
 | Topology and capacity | One hardware flowtable, two initial-netns physical Ethernet ports, at most 64 directional entries |
 | Routed traffic | Unicast IPv4 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
+| Throughput | Loki → Vision TCP NAT: 9.414 Gb/s receive, 1.84% aggregate DUT CPU on the KASAN image |
 | NAT | TCP/UDP static source NAT, MASQUERADE, destination and hairpin/double NAT, including address/port translation and inverse reply translation |
 | Routing and neighbours | Direct routes, IPv4 gateways, permanent neighbours and ordinary ARP |
 | Automatic recovery | Dependent route, neighbour, physical MTU/MAC and link-state retirement followed by fresh admission |
@@ -121,8 +122,9 @@ source/destination translation and same-port hairpin routing through the DUT.
 
 ## Next work and longer-term direction
 
-The four bounded IPv4 TCP/UDP NAT increments are complete. Next, run the
-full-rate Loki → Vision NAT test with both links negotiated at 10 Gb/s.
+The four bounded IPv4 TCP/UDP NAT increments and the
+[full-rate Loki → Vision benchmark](flowtable/history/nat-throughput.md) are complete:
+9.414 Gb/s TCP receive throughput with 1.84% aggregate DUT CPU.
 Prove each increment before expanding its supported boundary. The
 [foundation checkpoint](flowtable-foundation.md) remains the base for further
 interface and protocol features.

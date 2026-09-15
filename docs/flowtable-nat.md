@@ -184,3 +184,23 @@ ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55600 \
 ```
 
 See the [double NAT and hairpin validation record](flowtable/history/double-nat.md).
+
+## Full-rate TCP verification
+
+The separate opt-in `test_flowtable_nat_throughput` runs four TCP streams from
+Loki through native MASQUERADE to Vision. It checks translated hardware tuples,
+stable cookies, classifier activity, receiver throughput and low software TX,
+while recording DUT CPU. Explicit temporary MTU 1500 routes avoid stale PMTU
+from exception tests and are removed automatically. It requires 10 Gb/s on Loki
+and at least 9 Gb/s receive throughput by default.
+
+```sh
+ASK_FLOWTABLE_TESTS=1 ASK_FLOWTABLE_THROUGHPUT=1 \
+  ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55700 \
+  make ask-test ASK_TEST_ARGS='-q -k test_flowtable_nat_throughput'
+```
+
+The [recorded result](flowtable/history/nat-throughput.md) is 9.414 Gb/s TCP
+receive throughput with 1.84% aggregate DUT CPU, software TX 0 LAN / 10 WAN,
+and no increase in Vision NIC error/drop counters. This is a focused TCP NAT
+throughput proof; correctness and lifecycle acceptance remain separate tests.
