@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "enabled": false,
+  "devices": ["eth3", "eth4"],
+  "scope": [{}],
+  "exclude": [
+    {"name": "FTP control", "protocol": "tcp", "port": 21},
+    {"name": "SIP", "protocol": "udp", "port": 5060},
+    {"name": "PPTP control", "protocol": "tcp", "port": 1723}
+  ]
+}

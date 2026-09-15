@@ -9,6 +9,7 @@ SRC_URI = "file://S03debugfs \
            file://S20status-leds \
            file://S40gateway-setup \
            file://S50cmm \
+           file://S50ask-flowtable \
            file://dnsmasq-gateway.conf \
           "
 
@@ -16,7 +17,7 @@ SRC_URI = "file://S03debugfs \
 # Point S at UNPACKDIR so bitbake doesn't warn about a missing ${BP}.
 S = "${UNPACKDIR}"
 
-RDEPENDS:${PN} += "dnsmasq iptables iproute2 cmm"
+RDEPENDS:${PN} += "dnsmasq iptables iproute2 cmm nftables python3-core python3-json python3-crypt python3-fcntl"
 
 # These files are installed from ${ASK_SRCROOT} (outside SRC_URI's reach).
 # Without listing them as task input checksums, bitbake's sstate signature for
@@ -30,6 +31,8 @@ do_install[file-checksums] += " \
     ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml:True \
     ${ASK_SRCROOT}/config/ask-modules.conf:True \
     ${ASK_SRCROOT}/config/fastforward:True \
+    ${ASK_SRCROOT}/config/flowtable.json:True \
+    ${ASK_SRCROOT}/tools/ask_flowtable.py:True \
 "
 
 fakeroot do_install() {
@@ -47,6 +50,10 @@ fakeroot do_install() {
 
     install -d ${D}${sysconfdir}/config
     install -m 0644 ${ASK_SRCROOT}/config/fastforward ${D}${sysconfdir}/config/fastforward
+
+    install -d ${D}${sysconfdir}/ask ${D}${sbindir}
+    install -m 0644 ${ASK_SRCROOT}/config/flowtable.json ${D}${sysconfdir}/ask/flowtable.json
+    install -m 0755 ${ASK_SRCROOT}/tools/ask_flowtable.py ${D}${sbindir}/ask-flowtable
 
     install -d ${D}${sysconfdir}/init.d
     install -d ${D}${sysconfdir}/rcS.d
@@ -73,6 +80,9 @@ fakeroot do_install() {
     install -m 0755 ${UNPACKDIR}/S50cmm ${D}${sysconfdir}/init.d/cmm
     ln -sf ../init.d/cmm ${D}${sysconfdir}/rcS.d/S50cmm
 
+    install -m 0755 ${UNPACKDIR}/S50ask-flowtable ${D}${sysconfdir}/init.d/ask-flowtable
+    ln -sf ../init.d/ask-flowtable ${D}${sysconfdir}/rcS.d/S50ask-flowtable
+
     # Status LED config — runs after modules-load.d brings up leds-lp5812
     # (S05ask-modules), but before the gateway/CMM bring-up so the cue is
     # visible from early boot.
@@ -86,6 +96,8 @@ FILES:${PN} = " \
     ${sysconfdir}/cdx_sp.xml \
     ${sysconfdir}/modules-load.d/ask.conf \
     ${sysconfdir}/config/fastforward \
+    ${sysconfdir}/ask/flowtable.json \
+    ${sbindir}/ask-flowtable \
     ${sysconfdir}/init.d/debugfs \
     ${sysconfdir}/rcS.d/S03debugfs \
     ${sysconfdir}/init.d/ask-modules \
@@ -95,6 +107,8 @@ FILES:${PN} = " \
     ${sysconfdir}/dnsmasq-gateway.conf \
     ${sysconfdir}/init.d/cmm \
     ${sysconfdir}/rcS.d/S50cmm \
+    ${sysconfdir}/init.d/ask-flowtable \
+    ${sysconfdir}/rcS.d/S50ask-flowtable \
     ${sysconfdir}/init.d/status-leds \
     ${sysconfdir}/rcS.d/S20status-leds \
 "

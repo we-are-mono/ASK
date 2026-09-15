@@ -1,0 +1,17 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ask-flowtable
+# Required-Start:    ask-modules gateway-setup
+# Default-Start:     S
+# Short-Description: Apply Linux flowtable admission policy
+### END INIT INFO
+
+# The legacy boot owns its own policy. This file never changes ownership.
+[ "$(cat /sys/module/cdx/parameters/offload_owner 2>/dev/null)" = flowtable ] || exit 0
+
+case "$1" in
+    start|reload|restart|"") exec /usr/sbin/ask-flowtable apply ;;
+    stop) exec /usr/sbin/ask-flowtable stop ;;
+    status) exec /usr/sbin/ask-flowtable status ;;
+    *) echo "Usage: $0 {start|reload|restart|stop|status}" >&2; exit 1 ;;
+esac

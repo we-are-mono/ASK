@@ -2204,3 +2204,54 @@ The KASAN image was built and staged, then running IDs were verified: kernel
 `9735596756cd0b54240384386ef45940d177e57d2ed1fe605f17453e047490a6`.
 Artifacts and focused test logs are in `/tmp/ask-flowtable-nexthop/`; build log
 is `/tmp/ask-flowtable-nexthop-build.log` (three existing forced-task warnings).
+
+## Configuration and live exclusion replacement — verified 2026-09-15
+
+`ask-flowtable` now provides validated JSON admission/exclusion policy and a
+serialized delete/drain/check/drain/install boundary. It owns one named nftables
+table, preserves conntracks and sockets, refuses foreign ownership, and reports
+failed cleanup rather than claiming an unproved software fallback. The lock
+survives controller death while an nft child can still commit. The applied hash
+lives in the kernel table comment; status distinguishes installed policy from
+healthy admission. No mutable backend sysctl or CMM restart is introduced.
+
+The image installs the controller, a disabled default policy carrying the three
+existing ALG-control exclusions, and a flowtable-only boot hook after gateway
+setup. External source checksums make policy/script edits invalidate the recipe's
+install signature. Python dependencies follow this repository's package manifest.
+[Policy operations and CMM setting migration](flowtable-policy.md) document
+scope, tuple selectors, native sysctls, firewall ordering, revocation, failure
+semantics and remaining feature limits.
+
+Thirty focused host tests pass in 0.16 seconds, including invalid configuration,
+asynchronous retirement, kernel rejection cleanup, foreign ownership, fatal and
+timeout refusal, startup ownership/error propagation, and an actual orphaned
+child process retaining the controller lease. Generated tuple selectors also
+passed nftables syntax validation on the DUT.
+
+Two DUT cases pass in 135.29 seconds. With persistent UDP and TCP sockets,
+applying a UDP port exclusion retires all four existing hardware entries; TCP
+readmits while UDP remains in software. A 256-record UDP measurement produces
+260/266 software TX packets, while a separate 4 MiB TCP transfer produces only
+3/10 software TX packets with increasing hardware counters. Invalid JSON leaves
+the installed TCP generation unchanged. Removing the exclusion restores both
+connections to hardware without deleting either conntrack. Before/after hardware
+windows each verify 256 exact UDP hits and 4 MiB TCP per direction, 4/15 software
+TX packets, and aggregate busy CPU 2.10%/2.22% (softirq 0.50%).
+
+A structurally valid candidate using loopback as an offload device is rejected
+by the kernel after old hardware drains. No policy/bindings/entries/references
+remain, and both sockets continue in software (128 records, software TX
+2947/2957). Separate foreign-binding and unmarked-table collisions are refused
+without modifying the foreign table. KASAN/lockdep remain clean, debug_locks is
+1, taint is 4096, installs equal deletes and all backend resources drain. CMM
+stays disabled; no full suite was run.
+
+The KASAN image was built/staged and installed controller/config/init-script
+hashes were checked on the DUT. Kernel ID is
+`3f9b9232f4cc77786b6d358bf81518cdbc251c90`, with CDX
+`ed4251e6275e1ecbe06998b28203deb1a659b67a` and adapter
+`a085496c134eedd293fe2a87a438e33a7bac5cb0`. Image SHA-256 is
+`2699569ab2a26ffb613ce6cdfd16c1ab7729b29493695a67648d089a0514b9f3`.
+Evidence is in `/tmp/ask-flowtable-policy/`; the build log is
+`/tmp/ask-flowtable-policy-build.log` (three existing forced-task warnings).
