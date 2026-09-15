@@ -10,7 +10,7 @@ component nor establishes that all losses have the same cause.
 ## Configuration and observation points
 
 The image, kernel and CDX identities are those in the
-[PoC validation record](linux-flowtable-offload.md#validation-record--2026-09-14):
+[PoC validation record](flowtable/history/udp-poc.md#validation-record--2026-09-14):
 image SHA-256
 `dfcdbc950f5bb3a84f8982a16e360f0d673602f4454da28a44ae13de006600c5`.
 KASAN and lockdep remained enabled. No forwarding implementation changed during

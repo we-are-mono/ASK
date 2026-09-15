@@ -7,8 +7,9 @@ proofs. Each increment is committed in the development branch.
 
 This checkpoint covers the maintained Linux flowtable/CDX foundation on the
 repository's Linux 6.12.103 kernel and existing proprietary NXP firmware. It
-does not imply feature parity with CMM. The detailed implementation and dated
-evidence remain in [the design record](linux-flowtable-offload.md). Subsequent
+does not imply feature parity with CMM. The [architecture](flowtable-architecture.md)
+defines current implementation contracts; the [history index](flowtable/history/README.md)
+links the dated evidence. Subsequent
 feature increments extend this checkpoint; [static UDP SNAT](flowtable-nat.md)
 is the first such addition.
 
@@ -28,9 +29,11 @@ exclusions. Unsupported traffic remains subject to ordinary Linux forwarding
 and firewall policy.
 
 This is sufficient to build subsequent CMM-retirement features on a proved
-ownership and lifecycle boundary. NAT, IPv6, VLAN/bridge/PPPoE, multicast, IPsec,
-tunnels, Wi-Fi and asymmetric acceleration need their own implementations and
-proofs. Their legacy availability does not establish support in the new path.
+ownership and lifecycle boundary. Features beyond that checkpoint need separate
+implementations and proofs: the first static UDP SNAT increment is documented
+above; further NAT types, IPv6, VLAN/bridge/PPPoE, multicast, IPsec, tunnels,
+Wi-Fi and asymmetric acceleration remain future work. Their legacy availability
+does not establish support in the new path.
 eBPF/XDP is an optional later consumer or policy mechanism, not a prerequisite
 for operating the supported flowtable/CDX path.
 
@@ -69,7 +72,9 @@ balanced references. A conntrack hardware flag or throughput alone is not proof.
 The bounded connection test verifies independent conntrack deletion, FIN, idle
 expiry, unaffected surviving cookies and resource reuse. The pressure and
 concurrent-policy results, plus final legacy compatibility and return-to-
-flowtable verification, are recorded in the dated design log.
+flowtable verification, are recorded in the
+[connection/admission](flowtable/history/connections-and-admission.md) and
+[policy/startup](flowtable/history/policy-and-startup.md) histories.
 
 Hardware counters report classifier hits, including packets subsequently punted
 for exceptions. Exact Linux post-punt conntrack accounting remains outside the
@@ -117,5 +122,5 @@ ASK_CMM_COMPAT=1 ASK_WAN_IPERF_IP=10.0.0.232 \
 
 Return to a fresh flowtable boot afterward if continuing development. These
 commands select specific tests; omitting `-k` would collect and run unrelated
-tests. The detailed design record contains the individual recovery/fault probes
-and their required boot boundaries.
+tests. The [history index](flowtable/history/README.md) links the individual
+recovery/fault probes and their required boot boundaries.

@@ -83,6 +83,7 @@ ASK_FLOWTABLE_TESTS=1 ASK_WAN_IPERF_IP=10.0.0.232 ASK_FLOWTABLE_SPORT=55100 \
   make ask-test ASK_TEST_ARGS='-q -k test_flowtable_startup_without_cmm_or_fci'
 ```
 
-The dated [design record](linux-flowtable-offload.md) records measured results
-and image identities. This increment does not establish arbitrary NAT feature
-combinations, sustained scale, every exception path, or production-image parity.
+The [UDP SNAT validation record](flowtable/history/udp-snat.md) contains measured
+results and image identities. This increment does not establish arbitrary NAT
+feature combinations, sustained scale, every exception path, or production-image
+parity.

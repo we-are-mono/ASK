@@ -171,9 +171,9 @@ line; releases are tagged (`mono-1.0.0`). See [docs/versioning.md](docs/versioni
 for the full branch model.
 
 The `feat/linux-flowtable-offload` branch develops an opt-in alternative to CMM
-flow management. The [design and PoC requirements](docs/linux-flowtable-offload.md)
-describe the planned Linux integration, preservation of the default CMM mode,
-and the evidence required before expanding the initial implementation.
+flow management. The [project overview](docs/linux-flowtable-offload.md) links
+the current architecture, supported foundation and static UDP SNAT, operating
+guides, and historical validation evidence. The default CMM mode is preserved.
 
 ## License
 

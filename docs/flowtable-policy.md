@@ -5,6 +5,9 @@ backend. Linux still owns connection tracking, routing, firewall decisions and
 flow lifetimes. CDX supplies the hardware implementation. Select ownership at
 boot with `ask.offload=flowtable`; this tool cannot change the owner.
 
+See the [project overview](linux-flowtable-offload.md) for supported scope and
+the [architecture](flowtable-architecture.md) for provider and lifetime contracts.
+
 The installed `/etc/ask/flowtable.json` starts disabled. Its FTP, SIP and PPTP
 control exclusions carry over the repository's existing fastforward policy.
 The legacy `/etc/config/fastforward` remains the input for CMM boots.
