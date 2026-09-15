@@ -112,9 +112,61 @@ struct cdx_pcd_port {
 
 /*
  * Enumerate the classification ports of FMan @fm_index into @ports (at most
- * CDX_PCD_MAX_PORTS). Returns the number found, or negative on error.
+ * CDX_PCD_MAX_PORTS), sorted by port class then cell-index. On success also
+ * stores the FMan wrapper device the ports belong to in @fm_dev.
+ *
+ * Caller holds RTNL. Returns the number of ports, or negative on error.
  */
 int cdx_pcd_enumerate_ports(u8 fm_index, struct cdx_pcd_port *ports,
-			    unsigned int max_ports);
+			    unsigned int max_ports, void **fm_dev);
+
+/* Everything the builder created, and everything teardown needs to undo. */
+struct cdx_pcd_port_state {
+	t_Handle	h_port;
+	t_Handle	tables[CDX_PCD_NUM_GROUPS];
+	unsigned int	num_tables;
+	t_Handle	cctree;
+	bool		was_enabled;
+	bool		pcd_set;
+	/* FM_PORT_SetPCD() is handed pointers to these, so they outlive the
+	 * call rather than living on the builder's stack. */
+	t_FmPortPcdParams	pcd;
+	t_FmPortPcdPrsParams	prs;
+	t_FmPortPcdKgParams	kg;
+	t_FmPortPcdCcParams	cc;
+};
+
+/* Several kilobytes of FMan parameter blocks -- allocate it, never a local. */
+struct cdx_pcd_state {
+	u8			fm_index;
+	void			*fm_dev;	/* t_LnxWrpFmDev * */
+	t_Handle		h_fm;
+	t_Handle		h_pcd;
+	t_Handle		net_env;
+	t_Handle		schemes[CDX_PCD_NUM_GROUPS];
+	unsigned int		num_schemes;
+	unsigned int		num_ports;
+	struct cdx_pcd_port	ports[CDX_PCD_MAX_PORTS];
+	struct cdx_pcd_port_state port_state[CDX_PCD_MAX_PORTS];
+};
+
+/*
+ * Install the whole PCD on FMan @fm_index: soft parser, network environment,
+ * one hash table per group per port, a CC root tree per port, the shared
+ * KeyGen schemes, and FM_PORT_SetPCD on every port. On failure everything
+ * already created is released before returning.
+ *
+ * Caller holds RTNL and the cdx control mutex. Returns 0, or negative.
+ */
+int cdx_pcd_build(u8 fm_index, struct cdx_pcd_state *state);
+
+/*
+ * Detach and release what can be released: ports, schemes, trees, net env.
+ * The external hash tables are not reclaimable -- the SDK has no working delete
+ * for them under USE_ENHANCED_EHASH -- so a failed or torn-down build leaks
+ * them and the FMan needs a reboot before the classifier can be installed
+ * again. That was equally true of the dpa_app path this replaces.
+ */
+void cdx_pcd_teardown(struct cdx_pcd_state *state);
 
 #endif /* CDX_PCD_H */

@@ -75,8 +75,11 @@ would need byte offsets from the 82 KB NetPDL. The NetPDL is required only by
 the soft-parser assembler, which moves to build time.
 
 `external="yes"` and `aging="yes"` on the `<hashtable>` elements are ignored by
-`fmc`, which warns `Unknown attribute`. Tables become external because of the
-`USE_ENHANCED_EHASH` kernel build mode, not because of the XML.
+`fmc`, which warns `Unknown attribute`. Tables become external because
+`FM_PCD_HashTableSet()` returns `ExternalHashTableSet()` unconditionally under
+`USE_ENHANCED_EHASH` (`sdk_fman/Peripherals/FM/Pcd/fm_cc.c`), never consulting
+the `externalHash` field. `agingSupport` is likewise only read on the internal
+path, which that build mode never takes.
 
 All ten `<policy>` elements are byte-identical, so the per-port `policy`
 attribute in `cdx_cfg.xml` carries no information.
@@ -169,12 +172,38 @@ rollback — becomes a directly called `dpa_cfg_install()`. The `dpa-app`
 package, the `81_cdx_cfg_select` preinit hook and the libxml2, libstdc++ and
 libcli runtime dependencies go with it.
 
-`cdxdrv_set_miss_action()` currently issues 84 `FM_PCD_HashTableModifyMissNextEngine`
-host commands after the fact; those fold into the initial `FM_PCD_HashTableSet`
-parameters.
+`cdxdrv_set_miss_action()` stays as it is. An earlier draft of this plan expected
+its 84 `FM_PCD_HashTableModifyMissNextEngine` host commands to fold into the
+initial `FM_PCD_HashTableSet` parameters; they cannot. A table's miss action names
+a scheme, a scheme names a CC tree, and the tree names the tables, so no creation
+order has the scheme handle available when the table is created. fmc solves the
+same knot for `alwaysDirect` schemes by creating them twice; doing that here would
+trade 84 host commands for 12 scheme re-sets but change the creation order that
+the soft-parser offset depends on. Not worth it before Phase 0 resolves that
+coupling.
 
 **Phase 4 — validation.** Full `make ask-test`, plus a KASAN sweep: this
 touches allocation and struct-cast paths.
+
+## External hash tables cannot be released
+
+Under `USE_ENHANCED_EHASH` the SDK's `FM_PCD_HashTableDelete()` is a stub that
+returns an error — `/* delete table code not added for USE_ENHANCED_EHASH */` in
+`sdk_fman/Peripherals/FM/Pcd/fm_cc.c` — and `lnxwrp_exp_sym.h` does not export it
+to modules in that build. There is no external-hash counterpart.
+
+So a torn-down or failed classifier install leaks its 84 tables, and the FMan
+needs a reboot before another attempt. This is not a regression: `fmc_clean()`
+reached the same stub through the ioctl shim, which is why `dpa_app` printed
+*"FMC rollback failed; reboot before retrying"* and why
+`cdx_ioc_dpa_init_check()` refuses a second install outright. `cdx_pcd_teardown()`
+releases the ports, schemes, trees and network environment, and logs the tables
+it cannot reclaim.
+
+Worth revisiting separately: the delete path exists for internal hash tables and
+for the non-enhanced external ones, so writing the enhanced-ehash version is a
+bounded piece of SDK work that would make the classifier reinstallable without a
+reboot.
 
 ## Risks
 

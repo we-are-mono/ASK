@@ -90,7 +90,8 @@ static bool cdx_pcd_is_dpa_netdev(const struct net_device *dev)
  * asking "which netdev is this FMan port", ask every DPAA netdev which FMan
  * port it is. Caller holds RTNL. */
 static int cdx_pcd_add_eth_ports(u8 fm_index, struct cdx_pcd_port *ports,
-				 unsigned int max_ports, unsigned int count)
+				 unsigned int max_ports, unsigned int count,
+				 void **fm_dev_out)
 {
 	struct net_device *dev;
 
@@ -130,6 +131,7 @@ static int cdx_pcd_add_eth_ports(u8 fm_index, struct cdx_pcd_port *ports,
 			return portid;
 		port->portid = portid;
 		strscpy(port->name, dev->name, sizeof(port->name));
+		*fm_dev_out = fm_dev;
 		count++;
 	}
 	return count;
@@ -206,12 +208,13 @@ static int cdx_pcd_port_cmp(const void *a, const void *b)
 }
 
 int cdx_pcd_enumerate_ports(u8 fm_index, struct cdx_pcd_port *ports,
-			    unsigned int max_ports)
+			    unsigned int max_ports, void **fm_dev)
 {
 	unsigned int i, j;
 	int count;
 
-	count = cdx_pcd_add_eth_ports(fm_index, ports, max_ports, 0);
+	*fm_dev = NULL;
+	count = cdx_pcd_add_eth_ports(fm_index, ports, max_ports, 0, fm_dev);
 	if (count < 0)
 		return count;
 	count = cdx_pcd_add_oh_ports(fm_index, ports, max_ports, count);
@@ -219,6 +222,13 @@ int cdx_pcd_enumerate_ports(u8 fm_index, struct cdx_pcd_port *ports,
 		return count;
 	if (!count) {
 		pr_err("cdx: fm%u has no classification ports\n", fm_index);
+		return -ENODEV;
+	}
+	/* The FMan wrapper comes from a MAC's back-pointer, so an FMan with
+	 * only offline ports would leave it unset. No such configuration
+	 * exists, and the classifier would have nothing to receive from. */
+	if (!*fm_dev) {
+		pr_err("cdx: fm%u has no ethernet ports\n", fm_index);
 		return -ENODEV;
 	}
 

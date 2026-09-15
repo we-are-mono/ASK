@@ -28,4 +28,4 @@ cdx-y += cdx_main.o cdx_hal.o cdx_timer.o cdx_cmdhandler.o layer2.o \
 	dpa_control_mc.o cdx_mc_query.o dpa_ipsec.o cdx_dpa_ipsec.o \
 	query_ipsec.o cdx_ifstats.o control_rtp_relay.o \
 	dpa_wifi.o cdx_qos.o vsp_cfg.o procfs.o \
-	cdx_cmd_validator.o cdx_pcd_desc.o cdx_pcd_ports.o
+	cdx_cmd_validator.o cdx_pcd_desc.o cdx_pcd_ports.o cdx_pcd.o
