@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * Build the ASK FMan PCD in kernel.
+ * Build the ASK FMan PCD.
  *
- * This is the half of dpa_app that actually touched hardware. fmc compiled
- * cdx_pcd.xml into a model and walked it, calling the FM_PCD and FM_PORT entry
- * points through the userspace ioctl shim; cdx_pcd_desc.c is that model as data
- * and this walks it calling the same functions directly.
- *
- * The call order reproduces fmc's, because two things depend on it: the CC root
- * group layout the soft parser addresses by offset, and the tree a shared scheme
- * binds to. Per FMan:
+ * Walks the classification groups in cdx_pcd_desc.c, programming each one
+ * through the FM_PCD and FM_PORT entry points. Per FMan:
  *
  *	FM_PCD_Disable, FM_PCD_SetAdvancedOffloadSupport
  *	FM_PCD_PrsLoadSw, FM_PCD_Enable
@@ -18,15 +12,20 @@
  *	FM_PCD_KgSchemeSet x12				(bound to port 0's tree)
  *	per port: FM_PORT_Disable, FM_PORT_SetPCD, FM_PORT_Enable
  *
- * Twelve schemes serve seven ports. They cannot be per-port: the KeyGen has 32
- * schemes and 7x12 is 84. A scheme names a group id, and the CC root tree it
- * dispatches into comes from the port's own FM_PORT_SetPCD, so one scheme can
- * serve every port even though its h_CcTree names only the first.
+ * That order is load bearing twice over: the CC root group layout is what
+ * cdx_sp.xml addresses by a fixed offset, and a shared scheme can only be bound
+ * once its tree exists.
+ *
+ * Twelve schemes serve every port. They cannot be per-port: the KeyGen has 32
+ * schemes and seven ports would need 84. A scheme names a group id, and the CC
+ * root tree it dispatches into comes from the receiving port's own
+ * FM_PORT_SetPCD, so one scheme serves every port even though its h_CcTree
+ * names only the first.
  *
  * Miss actions are not set here. A table's miss action points at a scheme, a
  * scheme points at a tree, and a tree points at the tables, so the miss action
  * cannot be filled in before the scheme exists. cdxdrv_set_miss_action() patches
- * them afterwards with FM_PCD_HashTableModifyMissNextEngine(), as it always has.
+ * them in afterwards with FM_PCD_HashTableModifyMissNextEngine().
  */
 #include <linux/errno.h>
 #include <linux/kernel.h>
@@ -329,11 +328,9 @@ void cdx_pcd_teardown(struct cdx_pcd_state *state)
 		 * The external hash tables cannot be released. Under
 		 * USE_ENHANCED_EHASH the SDK's FM_PCD_HashTableDelete() is a
 		 * stub that returns an error ("delete table code not added"),
-		 * and it is not even exported to modules in that build. This is
-		 * not new -- fmc_clean() hit the same wall through the ioctl
-		 * shim, which is why dpa_app told the operator to reboot before
-		 * retrying. Say so rather than pretending the teardown was
-		 * complete.
+		 * and it is not exported to modules in that build either. See
+		 * ISSUES.md A138. Say so rather than pretending the teardown
+		 * was complete.
 		 */
 		leaked += ps->num_tables;
 		ps->num_tables = 0;

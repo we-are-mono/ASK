@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0+ */
 /*
- * In-kernel description of the ASK FMan PCD.
+ * Description of the ASK FMan PCD.
  *
- * This replaces the cdx_pcd.xml / cdx_cfg.xml pair that fmc used to compile in
- * userspace. The shape is fixed by the microcode and by cdx_sp.xml, not by
- * board layout: twelve classification groups, one KeyGen scheme per group
- * shared by every port, and one external hash table per group per port.
+ * The shape is fixed by the microcode and by cdx_sp.xml, not by board layout:
+ * twelve classification groups, one KeyGen scheme per group shared by every
+ * port, and one external hash table per group per port.
  *
  * Group order is load bearing. A scheme's kgNextEngineParams.cc.grpId selects
  * a group in the port's CC root tree, and cdx_sp.xml addresses the PPPoE relay
@@ -163,9 +162,9 @@ int cdx_pcd_build(u8 fm_index, struct cdx_pcd_state *state);
 /*
  * Detach and release what can be released: ports, schemes, trees, net env.
  * The external hash tables are not reclaimable -- the SDK has no working delete
- * for them under USE_ENHANCED_EHASH -- so a failed or torn-down build leaks
- * them and the FMan needs a reboot before the classifier can be installed
- * again. That was equally true of the dpa_app path this replaces.
+ * for them under USE_ENHANCED_EHASH (ISSUES.md A138) -- so a failed or
+ * torn-down build leaks them and the FMan needs a reboot before the classifier
+ * can be installed again.
  */
 void cdx_pcd_teardown(struct cdx_pcd_state *state);
 

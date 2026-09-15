@@ -128,37 +128,38 @@ func_ret:
  * in/out buffer. What we do preserve is the single lookup
  * surface so adding, removing, or gating a new ioctl is a
  * single-line table edit.
+ *
+ * Production builds have no ioctls at all -- nothing programs the classifier
+ * from userspace. The table is empty unless a debug build adds one, so it is
+ * compiled away entirely rather than declared zero-length.
  */
+#ifdef DPAA_DEBUG_ENABLE
 struct cdx_ioctl_spec {
 	unsigned int cmd;
 	long (*handle)(unsigned long args);
 };
 
-static long cdx_ioc_set_dpa_params_wrap(unsigned long args)
-{
-	return cdx_ioc_set_dpa_params(args);
-}
-
 static const struct cdx_ioctl_spec cdx_ioctl_table[] = {
-	{ CDX_CTRL_DPA_SET_PARAMS,      cdx_ioc_set_dpa_params_wrap },
-	{ CDX_CTRL_DPA_INIT_CHECK,      cdx_ioc_dpa_init_check },
-#ifdef DPAA_DEBUG_ENABLE
 	{ CDX_CTRL_DPA_GET_MURAM_DATA,  cdx_get_muram_data },
-#endif
 };
+#endif
 
 long cdx_ctrl_ioctl(struct file *filp, unsigned int cmd,
                 unsigned long args)
 {
-	size_t i;
-
 	if (!capable(CAP_NET_ADMIN))
 		return -EPERM;
 
-	for (i = 0; i < ARRAY_SIZE(cdx_ioctl_table); i++) {
-		if (cdx_ioctl_table[i].cmd == cmd)
-			return cdx_ioctl_table[i].handle(args);
+#ifdef DPAA_DEBUG_ENABLE
+	{
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(cdx_ioctl_table); i++) {
+			if (cdx_ioctl_table[i].cmd == cmd)
+				return cdx_ioctl_table[i].handle(args);
+		}
 	}
+#endif
 
 	DPA_ERROR("%s::unsupported ioctl cmd %x\n", __func__, cmd);
 	/* Linux convention: ENOTTY means "fd doesn't recognize this ioctl",

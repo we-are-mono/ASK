@@ -24,17 +24,19 @@ The components:
 - **Kernel modules** — `cdx` (the core offload engine: hardware flow tables,
   IPsec offload, and QoS via DPAA/FMAN), `fci` (control channel to the CMM
   daemon), `auto_bridge` (L2 bridge flow detection).
-- **Userspace** — `cmm` (offloads netfilter conntrack flows to the classifier),
-  `dpa_app` (loads the FMAN classification rules), `fmc` (NXP's FMAN config
-  compiler).
+- **Userspace** — `cmm` (offloads netfilter conntrack flows to the classifier).
+  `fmc` (NXP's FMAN config compiler) is a build-time tool only: `cdx` builds the
+  FMAN classification rules itself, and `fmc` is used to regenerate the
+  checked-in artifacts under `config/pcd/`. See
+  [in-kernel PCD](docs/in-kernel-pcd.md).
 - **Supporting libraries** — `libfci`, `fmlib`, `libcli`, and ASK-patched
   `libnfnetlink` / `libnetfilter_conntrack` (CMM's fast-path conntrack).
 - **Kernel side** — the `patches/kernel/` stack (`010`–`130`: the vendored
   DPAA/FMAN SDK, ASK's hooks, and board drivers, applied onto stock mainline
   6.12) and the board device tree in `dts/`. See
   [fan control](docs/fan-control.md) for the EMC2305 kernel interface and testing.
-- **Runtime config** — FMAN port maps, PCD / soft-parser XML, module load order,
-  and init scripts (`config/`, `dpa_app/files/`).
+- **Runtime config** — module load order and init scripts (`config/`). The PCD /
+  soft-parser XML in `config/pcd/` is a build-time input, not shipped.
 
 ### Reference recipes
 
@@ -46,7 +48,7 @@ reference:
 | Component | Recipe |
 |-----------|--------|
 | `cdx`, `fci`, `auto_bridge` (kernel modules) | `meta-ask/recipes-ask/{cdx,fci,auto-bridge}/` |
-| `cmm`, `dpa_app`, `fmc` (userspace) | `meta-ask/recipes-ask/{cmm,dpa-app,fmc}/` |
+| `cmm` (userspace), `fmc` (build-time tool) | `meta-ask/recipes-ask/{cmm,fmc}/` |
 | `libfci`, `fmlib`, `libcli` (libraries) | `meta-ask/recipes-ask/{libfci,fmlib,libcli}/` |
 | patched `libnfnetlink` / `libnetfilter-conntrack` | `meta-ask/recipes-ask/{libnfnetlink,libnetfilter-conntrack}/` |
 | kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.12.bb` |

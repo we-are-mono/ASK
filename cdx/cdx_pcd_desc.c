@@ -2,10 +2,8 @@
 /*
  * The ASK FMan PCD, as data.
  *
- * Every value here was previously produced by compiling cdx_pcd.xml with fmc.
- * The table is a transcription of that compiler's output, not a reinterpretation
- * of it: docs/in-kernel-pcd.md records how to regenerate the reference model and
- * diff against it.
+ * config/pcd/cdx_pcd.xml is the human-readable statement of the same thing, and
+ * tools/host_tests/test_cdx_pcd_build.py checks this table against it.
  *
  * Two orderings are load bearing and must not be tidied:
  *
@@ -13,10 +11,6 @@
  *     its own index, and cdx_sp.xml reaches the PPPoE relay table by a hardcoded
  *     offset from the CC base.
  *   - cdx_pcd_units[] is indexed by the unit ids in cdx_pcd_group.units[].
- *
- * Both reproduce what fmc derived (group order is the reverse of the policy
- * dist_order; unit order is protocol name order). They are spelled out rather
- * than recomputed so the coupling is greppable.
  */
 #include <linux/errno.h>
 #include "cdx_pcd.h"

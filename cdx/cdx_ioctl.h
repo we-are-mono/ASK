@@ -171,17 +171,10 @@ struct cdx_fman_info {
 	uint32_t expt_ratelim_burst_size; //bytes or packets
 };
 
-//structure used by CDX_CTRL_DPA_SET_PARAMS ioctl call
-struct cdx_ctrl_set_dpa_params {
-	struct cdx_fman_info *fman_info; //pointer to array of fman info
-	uint32_t num_fmans;	//number of frame managers
-};
-
-#define CDX_CTRL_DPA_SET_PARAMS\
-        _IOWR(CDX_IOC_MAGIC, 1, struct cdx_ctrl_set_dpa_params)
-
-/* Hold the exclusive control fd from this check through SET_PARAMS. */
-#define CDX_CTRL_DPA_INIT_CHECK _IO(CDX_IOC_MAGIC, 5)
+/* Command numbers 1 (DPA_SET_PARAMS) and 5 (DPA_INIT_CHECK) are retired. cdx
+ * builds the classifier itself now; nothing programs it from userspace. Leave
+ * them unassigned so an old dpa_app binary fails cleanly rather than landing on
+ * whatever takes the number next. */
 
 #ifdef DPAA_DEBUG_ENABLE
 struct muram_data {
@@ -193,8 +186,7 @@ struct muram_data {
         _IOWR(CDX_IOC_MAGIC, 4, struct muram_data)
 #endif
 
-int cdx_ioc_set_dpa_params(unsigned long args);
-long cdx_ioc_dpa_init_check(unsigned long args);
+int dpa_cfg_install(void);
 
 #ifdef CDX_DEBUG_DPA_INIT
 bool cdx_dpa_init_fault_at(const char *site);

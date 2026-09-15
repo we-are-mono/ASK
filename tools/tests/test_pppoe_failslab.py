@@ -16,7 +16,7 @@ instead of reaching pppoe_alloc.
 Note: REGISTER also requires phy_intf to be a known onif
 (cdx/control_pppoe.c:120-122 returns ERR_UNKNOWN_INTERFACE otherwise).
 We pass TARGET_WAN_IF (eth4) because that's the WAN-side iface
-registered by dpa_app at boot. If REGISTER consistently returns
+registered by cdx at boot. If REGISTER consistently returns
 ERR_UNKNOWN_INTERFACE, the test
 will skip with a clear diagnosis rather than leak the unobservable
 unwind state into a flaky failslab signal.
@@ -103,7 +103,7 @@ async def test_pppoe_register_failslab_sweep(
         pytest.skip(
             f"phy_intf={PHY_INTF.decode()} not registered as an onif at boot "
             "— REGISTER can't reach pppoe_alloc; failslab sweep would be "
-            "an empty oracle. Likely cmm/dpa_app didn't run, or the WAN "
+            "an empty oracle. Likely cmm didn't run, or the WAN "
             "port was renamed. Investigate before re-enabling."
         )
     # Probe registered the entry; clear it before the sweep starts.

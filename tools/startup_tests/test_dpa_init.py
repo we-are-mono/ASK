@@ -14,12 +14,12 @@ from ask_orch.uart import Console
 
 # Check each resource class, partial queue batches and the final handoff.
 FAULTS = [
-    ("cdx_ioc_set_dpa_params", 1),        # MURAM statistics
-    ("cdx_ioc_set_dpa_params", 2),        # first offline interface
+    ("dpa_cfg_install", 1),        # MURAM statistics
+    ("dpa_cfg_install", 2),        # first offline interface
     ("dpa_add_port_ff_policier_profile", 1),  # private slot, before profile SET
     ("create_fwd_tx_fqs", 1),
     ("create_fwd_tx_fqs", 16),
-    ("cdx_ioc_set_dpa_params", 4),        # first complete Ethernet interface
+    ("dpa_cfg_install", 4),        # first complete Ethernet interface
     ("dpa_add_port_ff_policier_profile", 5),
     ("cdxdrv_create_pcd_fqs", 1),
     ("cdxdrv_create_pcd_fqs", 128),
@@ -27,8 +27,8 @@ FAULTS = [
     ("cdxdrv_create_of_fqs", 4),
     ("cdxdrv_create_missaction_policer_profiles", 1),
     ("cdxdrv_create_ingress_qos_policer_profiles", 9),
-    ("cdx_ioc_set_dpa_params", 9),        # all CEETM policers
-    ("cdx_ioc_set_dpa_params", 10),       # classifier miss actions
+    ("dpa_cfg_install", 9),        # all CEETM policers
+    ("dpa_cfg_install", 10),       # classifier miss actions
 ]
 SPLATS = re.compile(r"BUG:|WARNING: CPU:|Oops:|Kernel panic|possible circular locking|"
                     r"inconsistent lock state|sleeping function called|did not drain|"
@@ -78,21 +78,15 @@ print(json.dumps(states, sort_keys=True))
         dmesg_before = run("dmesg")
         run("echo scan > /sys/kernel/debug/kmemleak")
         run("echo clear > /sys/kernel/debug/kmemleak")
-        run("mv /usr/bin/dpa_app /usr/bin/dpa_app.startup-test")
         results = []
         try:
-            wrapper = "#!/bin/sh\nexec /usr/bin/dpa_app.startup-test > /tmp/dpa-startup.log 2>&1\n"
-            run("printf %s " + shlex.quote(wrapper) + " > /usr/bin/dpa_app")
-            run("chmod +x /usr/bin/dpa_app")
             for site, step in FAULTS:
                 command = f"modprobe cdx dpa_init_fail_site={site} dpa_init_fail_step={step}"
                 result = con.run(command, timeout=90)
-                log = run("cat /tmp/dpa-startup.log")
                 kernel = run("dmesg")
-                (tmp_path / f"{site}-{step}.log").write_text(result.stdout + log + kernel)
+                (tmp_path / f"{site}-{step}.log").write_text(result.stdout + kernel)
                 assert result.rc != 0, f"fault checkpoint not reached: {site}:{step}"
                 assert f"injecting DPA startup failure at {site} step {step}" in result.stdout
-                assert "FMC rollback failed" not in log, log
                 assert not SPLATS.search(kernel[len(dmesg_before):]), kernel
                 assert not re.search(r"^cdx ", run("cat /proc/modules"), re.M)
                 assert run(muram_command) == muram_before, (site, step, "MURAM leaked")
@@ -119,7 +113,7 @@ print(json.dumps(states, sort_keys=True))
             assert not leaks, "".join(leaks)
             print(f"kmemleak: no unexpected objects; {len(known_pool)} known X3 boot-pool objects", flush=True)
             result = con.run("modprobe cdx", timeout=90)
-            assert result.rc == 0, result.stdout + run("cat /tmp/dpa-startup.log")
+            assert result.rc == 0, result.stdout + run("dmesg")
             assert re.search(r"^cdx ", run("cat /proc/modules"), re.M)
             assert run("cat /proc/sys/kernel/random/boot_id") == boot
             assert json.loads(run(port_state_command)) == ports_before
@@ -143,5 +137,4 @@ print(json.dumps(states, sort_keys=True))
                 "known_boot_pool_objects": len(known_pool),
                 "port_states_restored": ports_before}, indent=2))
         finally:
-            run("mv /usr/bin/dpa_app.startup-test /usr/bin/dpa_app")
             run("stty echo")

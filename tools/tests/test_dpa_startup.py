@@ -1,19 +1,10 @@
-"""A running classifier must reject another loader before hardware changes."""
+"""A running classifier must reject changes to the hardware underneath it."""
 
-import errno
 import shlex
 
 import pytest
 
 from ask_orch.uart import Console
-from _ioctl import CDX_CTRL_DPA_INIT_CHECK
-
-
-async def test_dpa_init_check(aiohttp_session, target_agent, splat_window):
-    result = await target_agent.ioctl_send(
-        aiohttp_session, device="/dev/cdx_ctrl", cmd=CDX_CTRL_DPA_INIT_CHECK, data=b"",
-    )
-    assert result.get("errno") == errno.EBUSY, result
 
 
 async def test_port_tree_replacement_unsupported(splat_window):
@@ -52,16 +43,6 @@ print('whole-tree replacement rejected on %d ports' % checked)
         assert result.rc == 0, result.stdout
 
 
-async def test_dpa_duplicate_startup(splat_window):
-    with Console.target() as con:
-        con.login("root", None)
-        for _ in range(3):
-            result = con.run("/usr/bin/dpa_app", timeout=15)
-            assert result.rc != 0, result.stdout
-            assert "initialization refused" in result.stdout, result.stdout
-            assert "Device or resource busy" in result.stdout, result.stdout
-
-
 async def test_dpa_exclusive_control_fd(splat_window):
     script = """
 import errno, os
@@ -74,7 +55,7 @@ try:
             assert error.errno == errno.EBUSY, error
         else:
             os.close(second)
-            raise AssertionError('second opener admitted during DPA startup ownership')
+            raise AssertionError('second opener admitted to the control device')
 finally:
     os.close(fd)
 os.close(os.open('/dev/cdx_ctrl', os.O_RDWR))

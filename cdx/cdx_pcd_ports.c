@@ -3,10 +3,9 @@
  * Which FMan ports take part in classification, and what logical port id each
  * one carries.
  *
- * This replaces cdx_cfg.xml. Nothing in that file was board data the kernel did
- * not already have: the port set is whatever the device tree enabled, `number`
- * is the DT cell-index, `policy` was identical for every port, and `portid` is
- * a formula over the SoC's port counts. See docs/in-kernel-pcd.md.
+ * None of this is board-specific input: the port set is whatever the device
+ * tree enabled, the port number is its cell-index, and the logical port id is a
+ * formula over the SoC's port counts. See docs/in-kernel-pcd.md.
  *
  * The logical port id ends up in prsResultPrivateInfo, which cdx_sp.xml reads as
  * $logicalportid and tests against 9 to tell ethernet ports from offline ports.
@@ -86,9 +85,7 @@ static bool cdx_pcd_is_dpa_netdev(const struct net_device *dev)
 				       "fsl,dpa-ethernet");
 }
 
-/* Mirrors find_osdev_by_fman_params() in the opposite direction: instead of
- * asking "which netdev is this FMan port", ask every DPAA netdev which FMan
- * port it is. Caller holds RTNL. */
+/* Ask every DPAA netdev which FMan port it is. Caller holds RTNL. */
 static int cdx_pcd_add_eth_ports(u8 fm_index, struct cdx_pcd_port *ports,
 				 unsigned int max_ports, unsigned int count,
 				 void **fm_dev_out)

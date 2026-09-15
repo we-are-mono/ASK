@@ -72,7 +72,7 @@ async def pppoe_session(aiohttp_session, target_agent):
     if r.get("reply_rc") == ERR_UNKNOWN_INTERFACE:
         pytest.skip(
             f"phy_intf={PHY_INTF.decode()} not registered as an onif "
-            "— REGISTER returned ERR_UNKNOWN_INTERFACE. Likely the dpa_app "
+            "— REGISTER returned ERR_UNKNOWN_INTERFACE. Likely the classifier "
             "boot-time onif install didn't complete; investigate before "
             "re-enabling."
         )

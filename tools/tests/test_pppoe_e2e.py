@@ -107,7 +107,7 @@ async def test_pppoe_session_lifecycle(
         f"within 3s — FCI ACTION_QUERY last returned rc={rc!r} "
         f"(expected NO_ERR=0). Suspect: cmm's rtnetlink hook didn't "
         f"fire on RTM_NEWLINK ARPHRD_PPP, or __itf_is_programmed(eth4) "
-        f"is False (eth4 not in cmm's iface table — check dpa_app "
+        f"is False (eth4 not in cmm's iface table — check cdx startup "
         f"boot order)."
     )
 

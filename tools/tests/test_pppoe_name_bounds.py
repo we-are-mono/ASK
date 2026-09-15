@@ -41,7 +41,7 @@ from _pppoe_helpers import (
 from _topology import TARGET_WAN_IF
 
 
-# The WAN-facing physical port — registered as an onif by dpa_app at
+# The WAN-facing physical port — registered as an onif by cdx at
 # boot, so REGISTER gets past the ERR_UNKNOWN_INTERFACE gate and
 # actually reaches the name-handling code these cases target.
 _PHY_INTF = TARGET_WAN_IF.encode()

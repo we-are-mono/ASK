@@ -39,8 +39,6 @@ void dpa_release_interface(uint32_t itf_id);
 int cdx_create_port_fqs(void);
 int cdx_add_eth_onif(char *name);
 int cdx_add_oh_iface(char *name);
-struct net_device *find_osdev_by_fman_params(uint32_t fm_idx, uint32_t port_idx,
-				uint32_t speed);
 
 void *create_ddr_and_copy_from_muram(void *muramptr, void **ddrptr, U32 size);
 void copy_ddr_to_muram_and_free_ddr(void *muramptr, void **ddrptr, U32 size);

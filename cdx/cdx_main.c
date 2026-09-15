@@ -8,8 +8,6 @@
  *
  */
 
-//uncomment to start dpa_app from cdx module
-#define START_DPA_APP 1
 
 /*
  * Minimum FMAN microcode package the ASK data path requires.
@@ -128,41 +126,6 @@ error:
 }
 
 
-#ifdef START_DPA_APP
-static void cdx_free_modprobe_argv(struct subprocess_info *info)
-{
-	kfree(info->argv);
-}
-
-
-static int start_dpa_app(void)
-{
-	int retval;
-	struct subprocess_info *info;
-	static char *envp[] = {
-		"HOME=/",
-		"TERM=linux",
-		"PATH=/sbin:/usr/sbin:/bin:/usr/bin",
-		NULL
-	};
-	static char *modprobe_path = "/usr/bin/dpa_app";
-
-	char **argv = kmalloc(sizeof(char *[3]), GFP_KERNEL);
-	if (!argv)
-		return -ENOMEM;
-
-	argv[0] = modprobe_path;
-	argv[1] = NULL;
-	retval = 0;
-	printk("%s::calling dpa_app argv %p\n", __func__, argv);
-	info = call_usermodehelper_setup(modprobe_path, argv, envp, GFP_KERNEL,
-			NULL, cdx_free_modprobe_argv, NULL);
-	if (info) {
-		retval = call_usermodehelper_exec(info, (UMH_WAIT_PROC | UMH_KILLABLE));
-	}
-	return retval;
-}
-#endif
 
 static void cdx_deinit_device(void)
 {
@@ -319,16 +282,12 @@ static int __init cdx_module_init(void)
 	else
 		printk(KERN_WARNING "%s::cdx_mc_init_hcsync_fail_probe failed\n", __func__);
 #endif
-#ifdef START_DPA_APP
-	rc = start_dpa_app();
+	/* Build the FMan classifier and everything that hangs off it. */
+	rc = dpa_cfg_install();
 	if (rc != 0)  {
-		printk("%s::start_dpa_app failed rc %d\n", __func__, rc);
-		/* cant pass error code from start_dpa_app */
-		rc = -EIO;
+		printk("%s::dpa_cfg_install failed rc %d\n", __func__, rc);
 		goto exit;
 	}
-	printk("%s::start_dpa_app successful\n", __func__);
-#endif
 #ifdef CFG_WIFI_OFFLOAD
 	rc = dpaa_vwd_init();
 	if (rc != 0)  {

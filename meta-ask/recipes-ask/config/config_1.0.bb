@@ -25,21 +25,13 @@ RDEPENDS:${PN} += "dnsmasq iptables iproute2 cmm"
 # entry is "<path>:True" so bitbake hashes the file and the task re-runs on
 # any content change.
 do_install[file-checksums] += " \
-    ${ASK_SRCROOT}/config/gateway-dk/cdx_cfg.xml:True \
-    ${ASK_SRCROOT}/dpa_app/files/etc/cdx_pcd.xml:True \
-    ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml:True \
     ${ASK_SRCROOT}/config/ask-modules.conf:True \
     ${ASK_SRCROOT}/config/fastforward:True \
 "
 
 fakeroot do_install() {
-    # Board-specific FMAN port config (consumed by dpa_app / fmc).
     install -d ${D}${sysconfdir}
-    install -m 0644 ${ASK_SRCROOT}/config/gateway-dk/cdx_cfg.xml ${D}${sysconfdir}/cdx_cfg.xml
 
-    # PCD + soft-parser XML that dpa_app hands to fmc.
-    install -m 0644 ${ASK_SRCROOT}/dpa_app/files/etc/cdx_pcd.xml ${D}${sysconfdir}/cdx_pcd.xml
-    install -m 0644 ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml  ${D}${sysconfdir}/cdx_sp.xml
 
     install -d ${D}${sysconfdir}/modules-load.d
     install -m 0644 ${ASK_SRCROOT}/config/ask-modules.conf \
@@ -81,9 +73,6 @@ fakeroot do_install() {
 }
 
 FILES:${PN} = " \
-    ${sysconfdir}/cdx_cfg.xml \
-    ${sysconfdir}/cdx_pcd.xml \
-    ${sysconfdir}/cdx_sp.xml \
     ${sysconfdir}/modules-load.d/ask.conf \
     ${sysconfdir}/config/fastforward \
     ${sysconfdir}/init.d/debugfs \

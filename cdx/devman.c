@@ -236,44 +236,6 @@ static void destroy_fwd_tx_fqs(struct dpa_iface_info *iface_info)
 	}
 }
 
-struct net_device *find_osdev_by_fman_params(uint32_t fm_idx, uint32_t port_idx,
-		uint32_t speed)
-{
-	struct net_device *device;
-	struct dpa_priv_s *priv;	
-	struct mac_device *macdev;
-
-	device = first_net_device(&init_net);
-	while(1) {
-		if (!device) 
-			break;
-		if (device->type == ARPHRD_ETHER) {
-			t_LnxWrpFmDev *p_LnxWrpFmDev;
-			priv = netdev_priv(device);
-			macdev = priv->mac_dev;
-			if (macdev) {
-				p_LnxWrpFmDev = (t_LnxWrpFmDev*)macdev->fm;
-				if (speed == 10) {
-					//10 gig interfaces upports only SUPPORTED_10000baseT_Full
-					/*DGW board has 2 fixed-link interfaces 
-						1 - (eth2)(xDSL)1G Fixed link interface linked to rgmii-txid
-						2 - eth5(G.fast)- 1G Fixed link interface linked to sgmii and
-						connected to 10G link of the board.
-						sgmii - considered as 1000baseT_Full and this has cell_index = 0*/
-
-					if ( (!macdev->fixed_link) && (macdev->if_support != SUPPORTED_10000baseT_Full) )
-						goto next_device; 
-				}
-				if ((fm_idx == p_LnxWrpFmDev->id) && 
-						(port_idx == macdev->cell_index))
-					return device;
-			}
-		}
-next_device:
-		device = next_net_device(device);
-	}
-	return device;
-}
 
 
 //get interface information from OS device priv structure

@@ -7,7 +7,7 @@ initialiser with the assembled bytecode as a compound literal. cdx wants the
 same data as a plain array plus a small descriptor it can hand to
 FM_PCD_PrsLoadSw, so this rewrites it.
 
-Regenerate after any change to cdx_sp.xml -- see docs/in-kernel-pcd.md for how
+Regenerate after any change to config/pcd/cdx_sp.xml -- see docs/in-kernel-pcd.md for how
 to build the host-mode fmc that produces the input.
 
     tools/gen_cdx_softparse.py <softparse.h> cdx/cdx_softparse.h
@@ -98,7 +98,7 @@ def main():
     with open(sys.argv[1]) as handle:
         sp = parse(handle.read())
     with open(sys.argv[2], "w") as handle:
-        handle.write(emit(sp, "dpa_app/files/etc/cdx_sp.xml"))
+        handle.write(emit(sp, "config/pcd/cdx_sp.xml"))
     print("%s: %u bytes of code at base %s, %u labels"
           % (sys.argv[2], sp["size"], sp["base"], len(sp["labels"])))
 

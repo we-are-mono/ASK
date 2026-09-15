@@ -186,31 +186,6 @@ result independently of those temporary files.
   every failure path above. Fixing it needs KASAN and rig validation, since it
   is a free path over hardware-visible memory.
 
-- [ ] **A137 — `find_osdev_by_fman_params` trusts `netdev_priv` on any Ethernet
-  device.** `cdx/devman.c:239` walks every netdev in `init_net`, filters on
-  `dev->type == ARPHRD_ETHER`, then immediately does
-  `priv = netdev_priv(device); macdev = priv->mac_dev;`. Bridges, VLANs, veth,
-  macvlan and every other soft device are also `ARPHRD_ETHER`, so on those the
-  cast reads whatever the owning driver keeps at that offset and dereferences
-  it as a `struct mac_device *`. It survives today because the value is almost
-  always NULL or unmapped, not because the check is sound. The sound test is
-  the parent binding: `dev->dev.parent->of_node` compatible with
-  `fsl,dpa-ethernet`, which is what `dpa_probe()` set.
-
-  Second defect in the same function: the 10G discriminator is
-  `(!macdev->fixed_link) && (macdev->if_support != SUPPORTED_10000baseT_Full)`
-  as a *rejection* filter, so a 1G fixed-link MAC passes the 10G test and can
-  be returned for a 10G lookup at the same cell-index. `mac_dev->max_speed`
-  (populated from `phylink_interface_max_speed()`, `sdk_dpaa/mac.c:273`) says
-  this unambiguously.
-
-  `cdx/cdx_pcd_ports.c` already avoids both. **The only caller is
-  `cdx/dpa_cfg.c:438`**, inside the `get_port_info` half of the SET_PARAMS
-  ioctl, so the function goes dead when the in-kernel PCD builder retires that
-  path — delete it and its `devman.h` declaration then. This entry exists so
-  the defect is tracked rather than depending on that removal landing; if the
-  builder work stalls, fix it in place instead.
-
 - [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
   local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
   → ____cmmCtRegister`) reaches `__cmm_ct_get_SA`, which on an SPI-mismatch
@@ -296,6 +271,12 @@ each so the open bug list stays honest.
 
 Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
+
+## Startup
+
+- [x] **A137.** `find_osdev_by_fman_params` typed `netdev_priv` off any Ethernet
+  device and picked 10G by a fixed-link heuristic — deleted with its only caller
+  when cdx took over classifier startup (_8305904_).
 
 ## Gating
 
