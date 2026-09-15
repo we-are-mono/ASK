@@ -26,6 +26,9 @@ typedef uint64_t u64, atomic64_t;
 #define pr_err(...) ((void)0)
 #define pr_info(...) ((void)0)
 #define pr_err_ratelimited(...) ((void)0)
+#define pr_warn_ratelimited(...) ((void)0)
+#define __init
+#define __exit
 #define CDX_DEBUG_FLOWTABLE
 #define FLOW_ACTION_HW_STATS_DELAYED 1
 #define IP_CT_DIR_ORIGINAL 0
@@ -121,7 +124,7 @@ static void read_unlock_bh(bool *lock) { assert(*lock); *lock = false; }
 #define spin_unlock read_unlock_bh
 #define spin_lock_bh read_lock_bh
 #define spin_unlock_bh read_unlock_bh
-struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh, use_hw_handles; };
+struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh, use_hw_handles, flow_block_lock; };
 struct nf_conn { struct net *net; unsigned zone[2], mark, status, protonum, tcp_state; };
 #define nf_ct_protonum(c) ((c)->protonum)
 static bool nf_conntrack_tcp_established(const struct nf_conn *c)
@@ -203,7 +206,7 @@ static LIST_HEAD(ft_entries);
 static LIST_HEAD(ft_neigh_entries);
 static bool ft_neigh_lock;
 static LIST_HEAD(ft_block_list);
-static unsigned ft_count, ft_bound, ft_fail_stage;
+static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
 static u64 ft_neigh_invalidations, ft_route_invalidations;
@@ -231,6 +234,11 @@ static int dpa_cfg_quiesce(void) { assert(rtnl && cdx_info->ctrl.mutex); return 
 static void cdx_ft_begin(void) { mutex_lock(&cdx_info->ctrl.mutex); }
 static void cdx_ft_end(void) { mutex_unlock(&cdx_info->ctrl.mutex); }
 static void cdx_ft_assert_held(void) { assert(cdx_info->ctrl.mutex); }
+static bool *block_write_lock;
+static void down_write(bool *lock)
+{ assert(!cdx_info->ctrl.mutex && !*lock && !block_write_lock); *lock = true; block_write_lock = lock; }
+static void up_write(bool *lock)
+{ assert(!cdx_info->ctrl.mutex && *lock && block_write_lock == lock); *lock = false; block_write_lock = NULL; }
 static int cdx_ft_admission_begin(void) { return rtnl_trylock() ? 0 : -EAGAIN; }
 static void cdx_ft_admission_end(void) { rtnl_unlock(); }
 static bool cdx_ft_failed(void) { return ft_fatal; }
@@ -305,7 +313,12 @@ static struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
     return NULL;
 }
 static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_block_offload *bo)
-{ list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list); }
+{
+    /* Moving a published callback must exclude native stats walkers before
+     * it reaches the temporary list; protecting only its free is too late. */
+    assert(block_write_lock && *block_write_lock);
+    list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
+}
 static int cdx_ft_add(const struct cdx_ft_rule *r, struct cdx_ft_hw **hw)
 {
     if (hardware_fail) return -EIO;
@@ -331,7 +344,6 @@ static struct notifier_block ft_netdev_nb, ft_neigh_nb, ft_fib_nb;
 static unsigned registration_step, registration_failure, canceled;
 static bool backend_claimed, netdev_registered, neigh_registered, fib_registered, indirect_registered;
 static bool owner_enabled = true;
-static bool cdx_flowtable_enabled(void) { return owner_enabled; }
 static bool registration_fails(void) { return ++registration_step == registration_failure; }
 static struct proc_dir_entry *proc_create(const char *name, int mode, void *parent, void *ops)
 { assert(!strcmp(name,"cdx_flowtable") && mode == 0400 && !parent); return registration_fails() ? NULL : &proc_entry; }
@@ -339,6 +351,7 @@ static void proc_remove(struct proc_dir_entry *entry) { assert(entry == &proc_en
 static int cdx_ft_claim(void)
 {
     assert(cdx_info->ctrl.mutex && !backend_claimed);
+    if (!owner_enabled || ft_fatal) return -EOPNOTSUPP;
     if (registration_fails()) return -EBUSY;
     backend_claimed = true; return 0;
 }
@@ -376,6 +389,15 @@ static void unregister_indirect(void)
 }
 #define flow_indr_dev_register(fn, priv) register_indirect()
 #define flow_indr_dev_unregister(fn, priv, release) unregister_indirect()
+static unsigned unload_sleeps, unload_failures;
+static void msleep(unsigned ms)
+{
+    assert(ms == 1000 && backend_claimed && !cdx_info->ctrl.mutex && !rtnl);
+    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 2);
+    assert(unload_failures);
+    unload_sleeps++;
+    if (!--unload_failures) { retry_error=0; quiesce_fail=false; }
+}
 #include "flowtable_production.inc"
 
 static struct net_device in = { .ifindex = 5, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1} };
@@ -461,6 +483,7 @@ static int bind_device(struct net_device *dev, int command)
         .binder_type = FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS, .command = command };
     list_init(&bo.cb_list);
     int rc = ft_bind(dev, NULL, NULL, TC_SETUP_FT, &bo, &table, NULL);
+    assert(!table.flow_block_lock && !block_write_lock && !cdx_info->ctrl.mutex);
     while (bo.cb_list.next != &bo.cb_list) {
         struct flow_block_cb *cb = list_entry(bo.cb_list.next, struct flow_block_cb, list);
         list_del(&cb->list);
@@ -957,7 +980,7 @@ static void test_registration(void)
         /* A fresh adapter instance, backed by an independently owned CDX. */
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         fixture();
-        int rc=cdx_flowtable_init();
+        int rc=ask_flowtable_init();
         if (registration_failure) {
             assert(rc < 0 && !ft_ready && !ft_proc && !backend_claimed);
         } else {
@@ -967,16 +990,37 @@ static void test_registration(void)
             struct cdx_ft_binding *b=list_entry(ft_bindings.next,struct cdx_ft_binding,list);
             assert(b->dev == &in);
             assert(ft_replace(b,&cls) == 0 && live_hw == 1);
+            unload_failures=2; retry_error=-EAGAIN;
+            ask_flowtable_exit();
+            assert(handle.invalid && unload_sleeps == 2);
         }
-        cdx_flowtable_exit();
         assert(!ft_proc && !ft_ready && !backend_claimed && !live_hw && !allocated);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !indirect_registered);
         assert(!ft_count && !ft_bound && !ft_neighbour_refs && !ft_handle_refs);
         assert(!in.refs && !out.refs && !cdx_info->ctrl.mutex);
     }
-    owner_enabled=false; registration_failure=registration_step=0;
-    assert(cdx_flowtable_init() == 0 && !ft_ready && !backend_claimed && registration_step == 1);
-    cdx_flowtable_exit(); assert(!ft_proc && !cdx_info->ctrl.mutex);
+    registration_failure=0;
+    for (ft_init_fail_stage=1; ft_init_fail_stage<=5; ft_init_fail_stage++) {
+        ft_ready=ft_stopping=false; registration_step=canceled=0;
+        assert(ask_flowtable_init() == -ENOMEM);
+        assert(!ft_ready && !ft_proc && !backend_claimed && !cdx_info->ctrl.mutex);
+        assert(!netdev_registered && !neigh_registered && !fib_registered && !indirect_registered);
+    }
+    ft_init_fail_stage=0;
+    /* Fatal deletion on exit still waits for quiescence. Reload is refused. */
+    registration_step=canceled=0; fixture();
+    assert(ask_flowtable_init() == 0);
+    assert(bind_device(&in,FLOW_BLOCK_BIND) == 0);
+    struct cdx_ft_binding *b=list_entry(ft_bindings.next,struct cdx_ft_binding,list);
+    assert(ft_replace(b,&cls) == 0);
+    deletion_error=-EIO; quiesce_fail=true; unload_failures=1;
+    ask_flowtable_exit();
+    assert(ft_fatal && !backend_claimed && !live_hw && !allocated && handle.invalid);
+    assert(unload_sleeps == 3 && !ft_proc);
+    assert(ask_flowtable_init() == -EOPNOTSUPP && !backend_claimed && !ft_proc);
+    owner_enabled=false; ft_fatal=false; registration_failure=registration_step=0;
+    assert(ask_flowtable_init() == -EOPNOTSUPP && !backend_claimed && !registration_step);
+    assert(!ft_proc && !cdx_info->ctrl.mutex);
 }
 
 int main(void)

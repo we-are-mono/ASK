@@ -34,6 +34,7 @@ bool cdx_ft_observing(void)
 {
 	return ft_observe;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_observing, ASK_CDX_FLOWTABLE);
 
 bool cdx_flowtable_config_sealed(void)
 {
@@ -53,28 +54,33 @@ void cdx_ft_begin(void)
 {
 	mutex_lock(&cdx_info->ctrl.mutex);
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_begin, ASK_CDX_FLOWTABLE);
 
 void cdx_ft_end(void)
 {
 	mutex_unlock(&cdx_info->ctrl.mutex);
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_end, ASK_CDX_FLOWTABLE);
 
 void cdx_ft_assert_held(void)
 {
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_assert_held, ASK_CDX_FLOWTABLE);
 
 bool cdx_ft_failed(void)
 {
 	cdx_ft_assert_held();
 	return ft_failed;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_failed, ASK_CDX_FLOWTABLE);
 
 unsigned int cdx_ft_pending(void)
 {
 	cdx_ft_assert_held();
 	return cdx_ft_hw_pending() + cdx_ehash_quarantine_pending();
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_pending, ASK_CDX_FLOWTABLE);
 
 int cdx_ft_claim(void)
 {
@@ -87,6 +93,7 @@ int cdx_ft_claim(void)
 	WRITE_ONCE(ft_config_sealed, true);
 	return 0;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_claim, ASK_CDX_FLOWTABLE);
 
 int cdx_ft_release(void)
 {
@@ -96,6 +103,7 @@ int cdx_ft_release(void)
 	ft_claimed = false;
 	return 0;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_release, ASK_CDX_FLOWTABLE);
 
 int cdx_ft_admission_begin(void)
 {
@@ -103,12 +111,14 @@ int cdx_ft_admission_begin(void)
 	/* RTNL holders can wait for callbacks needing this transaction. */
 	return rtnl_trylock() ? 0 : -EAGAIN;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_begin, ASK_CDX_FLOWTABLE);
 
 void cdx_ft_admission_end(void)
 {
 	cdx_ft_assert_held();
 	rtnl_unlock();
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_end, ASK_CDX_FLOWTABLE);
 
 bool cdx_ft_port_supported(struct net_device *dev)
 {
@@ -129,6 +139,7 @@ bool cdx_ft_port_supported(struct net_device *dev)
 	iface = dpa_get_ifinfo_by_itfid(onif->itf->index);
 	return iface && iface->eth_info.net_dev == dev;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_port_supported, ASK_CDX_FLOWTABLE);
 
 int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 {
@@ -146,12 +157,14 @@ int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 		ft_live++;
 	return rc;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_add, ASK_CDX_FLOWTABLE);
 
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 {
 	cdx_ft_assert_held();
 	cdx_ft_hw_stats(hw, stats);
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats, ASK_CDX_FLOWTABLE);
 
 int cdx_ft_del(struct cdx_ft_hw **hw)
 {
@@ -166,6 +179,7 @@ int cdx_ft_del(struct cdx_ft_hw **hw)
 		ft_failed = true;
 	return rc;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_del, ASK_CDX_FLOWTABLE);
 
 int cdx_ft_recover(void)
 {
@@ -188,6 +202,7 @@ int cdx_ft_recover(void)
 	}
 	return cdx_ft_hw_retry();
 }
+EXPORT_SYMBOL_NS_GPL(cdx_ft_recover, ASK_CDX_FLOWTABLE);
 
 /* CDX's final shutdown has already stopped and detached every classifier port.
  * It can reclaim backend storage after the adapter and its work are gone. */

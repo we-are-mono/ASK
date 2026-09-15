@@ -14,12 +14,6 @@ static unsigned port_failures, queue_failures, port_attempts, queue_attempts;
 static unsigned sleeps, netlink_operations;
 static unsigned init_level = 1;
 
-static void cdx_flowtable_exit(void)
-{
-    /* The adapter must flush its callbacks before the global lock/teardown. */
-    assert(!rtnl && !cdx_info->ctrl.mutex);
-}
-
 static void mutex_lock(bool *lock) { assert(!*lock); *lock = true; }
 static void mutex_unlock(bool *lock) { assert(*lock); *lock = false; }
 static void rtnl_lock(void) { assert(!rtnl); rtnl = true; }

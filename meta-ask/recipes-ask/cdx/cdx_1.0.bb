@@ -1,4 +1,4 @@
-SUMMARY = "ASK CDX data-plane kernel module (cdx.ko)"
+SUMMARY = "ASK CDX hardware backend and Linux flowtable adapter modules"
 LICENSE = "GPL-2.0-only"
 LIC_FILES_CHKSUM = "file://${ASK_SRCROOT}/LICENSE;md5=b234ee4d69f5fce4486a80fdaf4a4263"
 
@@ -65,7 +65,7 @@ do_compile:prepend() {
 
 fakeroot do_install() {
     install -d ${D}${nonarch_base_libdir}/modules/${KERNEL_VERSION}/extra/ask
-    install -m 0644 ${S}/cdx.ko \
+    install -m 0644 ${S}/cdx.ko ${S}/ask_flowtable.ko \
         ${D}${nonarch_base_libdir}/modules/${KERNEL_VERSION}/extra/ask/
 
     # Publish Module.symvers under the name module.bbclass looks for

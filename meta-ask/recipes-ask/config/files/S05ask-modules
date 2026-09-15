@@ -30,6 +30,9 @@ case "$1" in
             case "$mod" in ''|'#'*) continue ;; esac
             if [ "$mod" = cdx ]; then
                 modprobe cdx offload_owner="$owner" flowtable_observe="$observe" || exit 1
+                if [ "$owner" = flowtable ]; then
+                    modprobe ask_flowtable || exit 1
+                fi
             elif [ "$mod" = auto_bridge ] && [ "$owner" = flowtable ]; then
                 continue
             else

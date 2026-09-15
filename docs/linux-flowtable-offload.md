@@ -360,12 +360,14 @@ parameters `offload_owner` and `flowtable_observe`. Selecting a mode requires a
 clean boot. The experimental init script skips `auto_bridge` and CMM; CDX skips
 the Wi-Fi and IPsec runtime offload hooks. All FCI commands return
 `-EOPNOTSUPP` in experimental mode, including queries. Initial `dpa_app` setup is
-shared, and subsequent SET_PARAMS requests are rejected. Read-only hardware
-inspection remains available through `/proc/cdx_flowtable`, independently of CMM.
+shared, and subsequent SET_PARAMS requests are rejected. The boot script loads
+`ask_flowtable.ko` after `cdx.ko` only for flowtable ownership. Read-only hardware
+inspection is available through `/proc/cdx_flowtable` while the adapter is loaded,
+independently of CMM.
 The systemd CMM service also checks ownership; the kernel-command-line selector
 itself is currently implemented by the test initramfs, not a production installer.
 
-`cdx_flowtable.c` uses Linux's indirect `TC_SETUP_FT` binding callbacks and
+`cdx/ask_flowtable.c` uses Linux's indirect `TC_SETUP_FT` binding callbacks and
 `TC_SETUP_CLSFLOWER` requests. It accepts one flowtable, at most two initial-netns
 physical Ethernet ports, and at most 64 directional entries (up to 32 two-way
 connections). This is a conservative adapter admission bound, not a firmware
@@ -408,12 +410,30 @@ currently use the existing CDX control mutex and also serialize adapter state;
 they expose no mutex or internal structure to the adapter. Each transaction
 must end before a Netfilter flush. Admission tries RTNL inside a transaction;
 bind-time port checks are provisional and admission repeats them under RTNL.
+Indirect UNBIND takes the flowtable's write lock before the CDX transaction.
+Moving a published callback to the temporary unbind list must exclude native
+statistics/add/delete walkers; Netfilter's later locked free alone is insufficient.
 
 Releasing a claim requires zero live directions. CDX keeps any retired storage,
 the terminal failure latch and the sealed configuration gate independently of
 the adapter. A fresh claim cannot bypass fatal failure or pending retirement.
 The configuration ioctl rechecks the gate under the same transaction lock, so
 a request already waiting when ownership is claimed cannot mutate configuration.
+
+The interface uses GPL-only exports in the `ASK_CDX_FLOWTABLE` namespace.
+`ask_flowtable.ko` depends on `cdx.ko` and `nf_flow_table.ko`; CDX itself has no
+flowtable-module dependency. Normal module references prevent unloading CDX
+while the adapter is loaded. Adapter exit invalidates its Linux flow handles,
+unregisters notifiers, drains work and indirect callbacks, and completes hardware
+retirement before releasing its claim. It retries with the transaction lock
+released between attempts if a barrier or hardware quiescence is not yet proven.
+Unload can therefore wait indefinitely for safe retirement.
+
+Healthy adapter reload preserves CDX configuration and ownership. Existing nft
+flowtables continue in software; recreate the table to bind the new adapter and
+resume hardware admission. Adapter diagnostic counters reset on reload, while
+CDX's sealed configuration and terminal failure latch persist. Reload is not a
+recovery mechanism for a fatal hardware failure and cannot switch owners.
 
 `cdx_flowtable_hw.c` is the CDX-internal firmware encoder behind this interface.
 Each installed direction owns a private CDX encoding object, a dummy
@@ -553,10 +573,13 @@ unlinked storage only after global datapath quiescence is proven. Healthy
 invalidation waits for retirement barriers and flushes the affected software
 flowtables, allowing ordinary forwarding.
 
-The test build exposes a one-shot `flowtable_fail_stage` parameter: 1 before
+The test build exposes a one-shot `ask_flowtable.flowtable_fail_stage` parameter: 1 before
 adapter allocation, 2 before hardware installation, and 3 after installation,
 forcing rollback through the real delete path. Production builds omit this
-parameter. A separate test-only `flowtable_fail_unlink` boolean consumes one
+parameter. The load-only `ask_flowtable.init_fail_stage` parameter injects adapter
+initialization failure after claim: 1 proc creation, 2 netdev notifier,
+3 neighbour notifier, 4 FIB notifier, 5 indirect registration. A separate
+test-only `cdx.flowtable_fail_unlink` boolean consumes one
 delete attempt before destructive unlink, leaving the real key linked and
 forcing fatal retirement. It exercises stopped classifier ports and retained
 storage; it does not simulate a recoverable synchronization failure.
@@ -1565,3 +1588,88 @@ acceptance boot. Build log: `/tmp/ask-flowtable-backend-build.log`.
 Stop at this increment. The next step extracts the adapter into
 `ask_flowtable.ko` and proves provider references, loading, unloading and recovery
 using this interface. The code remains in `cdx.ko` until that separate proof.
+
+## Loadable flowtable adapter — verified 2026-09-15
+
+`cdx/ask_flowtable.c` now builds as `ask_flowtable.ko`. The firmware encoder and
+backend stay in `cdx.ko`; the adapter imports only the private backend exports,
+in the GPL-only `ASK_CDX_FLOWTABLE` namespace. Module metadata confirms dependencies
+on `cdx` and `nf_flow_table`, while CDX has no flowtable-module dependency. The
+image installs both modules and loads the adapter only for flowtable ownership.
+Kernel patch 140 and the firmware encoding are unchanged.
+
+Initialization claims CDX before publishing procfs or registering callbacks.
+Every failure unwinds its acquired registrations and releases the claim. Exit
+invalidates installed Linux flow handles, unregisters notifiers, cancels work,
+drains indirect callbacks and completes hardware retirement before releasing
+CDX. Recovery retries release the transaction between attempts. CDX's immutable
+owner/observe options, configuration seal and fatal latch survive adapter reload.
+Adapter counters are per module instance, so save diagnostics before unloading.
+
+Verification exposed an existing race in ordinary indirect UNBIND: the callback
+was moved from the live list to Netfilter's temporary list without excluding a
+concurrent statistics worker. The worker followed that temporary list head and
+attempted to call `ft_block_list` as code. The adapter now takes the flowtable
+write lock before moving the callback, ahead of the CDX transaction, matching
+the statistics path's lock order. Netfilter's later locked free alone did not
+protect the move. The host regression asserts this exclusion; removing the new
+lock reproduces its failure. The DUT regression recreates a live table eight
+times while the same TCP and UDP sockets keep sending.
+
+Sixteen focused host cases pass under the applicable ASan/UBSan harnesses. They
+cover decoder/backend/handle/route behavior, CDX startup/shutdown, initialization
+unwind, retirement retries, fatal reload refusal and six boot-loader cases.
+The boot-loader cases cover CMM, flowtable, observe mode, invalid selection and
+module load failures. Three focused DUT tests pass on the corrected KASAN image:
+
+| Test | Verified result |
+| --- | --- |
+| `test_flowtable_module_lifecycle` | With inactive FCI removed, CDX unload is refused solely because `ask_flowtable` holds it. All five injected initialization failures leave no adapter, proc node or holder; the provider reference count returns to zero and a healthy load succeeds each time. SET_PARAMS remains rejected while the adapter is absent. |
+| Same lifecycle test, live traffic | TCP and UDP continue across healthy unload/reload and a second cycle failing all four directional deletion barriers. The same TCP socket survives both. Software TX advances while the adapter is absent. Reload leaves the existing table in software; recreating it restores four hardware directions. Eight further live UNBIND/rebind cycles pass. |
+| `test_flowtable_routes_selective` | Mixed TCP/UDP selective route replacement, more/less-specific routes, DSCP aliases and withdrawal/restoration still work. The unaffected peer retains its cookies and hardware counters. |
+| `test_flowtable_offload_terminal`, `ASK_FLOWTABLE_TERMINAL=unlink` | An unproven deletion stops receive ports 6/7 and rejects rearm. Unloading the adapter succeeds, but reloading it returns `EOPNOTSUPP` while the same CDX remains loaded. CDX unload then restores ordinary forwarding; all 64 subsequent echoes pass. |
+
+Steady hardware windows transfer 256 UDP echoes and 4 MiB over TCP per connection.
+UDP hardware deltas remain exactly 256 packets and 76,288 bytes per direction.
+After both reloads and the repeated UNBIND exercise, software TX deltas are
+4 LAN / 15 WAN packets per window, with aggregate softirq time 0.37–0.44%.
+During the two adapter-absent windows, software TX instead advances by thousands
+of packets. Total CPU busy time varies and is retained in the artifacts; these
+measurements establish the forwarding path, not a throughput or idle-CPU result.
+
+Before the terminal test, the last adapter instance has 68 installs/deletes,
+zero errors and no entries, bindings, neighbour/handle references or quarantine.
+Terminal retirement reaches 70 installs/deletes and one deliberately injected
+error, with no retained adapter references or quarantine. The possibly linked
+hardware key remains intentionally retained until reset. The corrected image
+has no KASAN, lockdep, warning or oops reports through post-unload inspection;
+taint remains 4096. The three final tests use one experimental boot with CMM
+disabled. No CMM-mode DUT test, full KASAN suite or forced kmemleak scan was run.
+
+After terminal testing, the DUT was rebooted into the same verified flowtable
+image. CDX, the adapter and inactive FCI are loaded; all adapter counters,
+references and fault controls are clear. CMM remains stopped. DUT and host
+routes, nftables rules, neighbour settings and LAN test resources are restored.
+
+Both image builds succeeded and were staged. The final image has KASAN, lockdep,
+kmemleak and failslab enabled; live kernel/module and userspace identities match
+the build. Kernel build ID is `61857ba9b3856d272b47440a1d3ee777678bae8d`, CDX
+`1c4d4bdbf8e81af9e88303923dec8f9035fd54ac`, adapter
+`0d06de0feb46477172f1e5463c842ebd66d7d7b0`. Staged image SHA-256 is
+`8668fe993aae99bf763f7cc0e35ab7a48e9154d8f3ecb045c2d285fa24cf067f`.
+The final build has no compiler warnings and three existing forced-task warnings.
+
+Artifacts are under `/tmp/ask-flowtable-module/`: `host-fixed.log`, `lifecycle/`,
+`routes/`, `terminal/`, their logs/XML, image identities, provider metadata and
+restoration checks. `*-before-unbind-fix` preserves the earlier run and kernel
+fault; `unbind-negative/` preserves the host regression with the lock removed.
+The first lifecycle attempt also records a corrected test setup error: the
+injection hook applies only to deletion, so four directions consume four armed
+failures; recovery syncs are real. Build logs are
+`/tmp/ask-flowtable-module-build.log` and
+`/tmp/ask-flowtable-module-fixed-build.log`.
+
+Stop at this increment. Healthy reload requires flowtable recreation to resume
+hardware admission; fatal hardware failure still requires reset. This extraction
+adds no new traffic features or runtime ownership switching. Selective device
+dependencies and broader foundation coverage remain separate increments.

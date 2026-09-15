@@ -47,6 +47,7 @@ IMAGE_INSTALL = " \
     lp5812-driver \
     config \
     kernel-module-nf-conntrack-netlink \
+    kernel-module-ask-flowtable \
     kernel-module-nft-flow-offload \
     kernel-module-nf-flow-table-inet \
     kernel-module-nft-ct \

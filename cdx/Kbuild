@@ -16,7 +16,7 @@ ccflags-y += -Werror -I$(src) -DENDIAN_LITTLE -DGCC_TOOLCHAIN
 # that the rig tests need; production builds leave it empty.
 ccflags-y += $(CFG_FLAGS)
 
-obj-$(CONFIG_ASK_CDX) += cdx.o
+obj-$(CONFIG_ASK_CDX) += cdx.o ask_flowtable.o
 
 cdx-y += cdx_main.o cdx_hal.o cdx_timer.o cdx_cmdhandler.o layer2.o \
 	control_tx.o control_ipv4.o control_ipv6.o \
@@ -28,4 +28,4 @@ cdx-y += cdx_main.o cdx_hal.o cdx_timer.o cdx_cmdhandler.o layer2.o \
 	dpa_control_mc.o cdx_mc_query.o dpa_ipsec.o cdx_dpa_ipsec.o \
 	query_ipsec.o cdx_ifstats.o control_rtp_relay.o \
 	dpa_wifi.o cdx_qos.o vsp_cfg.o procfs.o \
-	cdx_cmd_validator.o cdx_flowtable.o cdx_flowtable_backend.o cdx_flowtable_hw.o
+	cdx_cmd_validator.o cdx_flowtable_backend.o cdx_flowtable_hw.o

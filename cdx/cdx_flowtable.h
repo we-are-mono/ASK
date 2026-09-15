@@ -6,8 +6,6 @@
 
 bool cdx_flowtable_enabled(void);
 int cdx_flowtable_mode_check(void);
-int cdx_flowtable_init(void);
-void cdx_flowtable_exit(void);
 void cdx_flowtable_quiesced(void);
 /* Once claimed, adapter detach must never reopen configuration mutation. */
 bool cdx_flowtable_config_sealed(void);

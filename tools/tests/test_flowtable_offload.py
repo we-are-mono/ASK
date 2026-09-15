@@ -339,13 +339,13 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
                 # Restoration must not depend on its procfs or HTTP.
                 await console_python(r.recovery_console, """
 from pathlib import Path
-for name in ('flowtable_fail_stage', 'flowtable_fail_unlink'):
-    path = Path('/sys/module/cdx/parameters') / name
+for module, name in [('ask_flowtable', 'flowtable_fail_stage'), ('cdx', 'flowtable_fail_unlink')]:
+    path = Path('/sys/module') / module / 'parameters' / name
     if path.exists():
         path.write_text('0')
 """)
             else:
-                result = await r.target.fs_write(r.session, "/sys/module/cdx/parameters/flowtable_fail_stage", "0")
+                result = await r.target.fs_write(r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage", "0")
                 if result["errno"]:
                     failures.append(result)
         except Exception as error:
@@ -542,13 +542,13 @@ async def test_flowtable_offload_add_failures(rig):
     if (await r.state())["observe"]:
         pytest.skip("installation faults require hardware mode")
     for stage in [1, 2, 3]:
-        result = await r.target.fs_write(r.session, "/sys/module/cdx/parameters/flowtable_fail_stage", str(stage))
+        result = await r.target.fs_write(r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage", str(stage))
         assert result["errno"] == 0, result
         for attempt in range(3):
             before = await r.state()
             await r.table()
             await r.exchange()
-            remaining = (await read(r.target, r.session, "/sys/module/cdx/parameters/flowtable_fail_stage")).strip()
+            remaining = (await read(r.target, r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip()
             if remaining == "0":
                 break
             # RTNL contention deliberately declines admission before fault
@@ -562,7 +562,7 @@ async def test_flowtable_offload_add_failures(rig):
         # Native Netfilter may install the other direction: each accepted
         # direction is independent. The rejected request leaves no owned object.
         await r.wait(lambda s: s["rejects"] > before["rejects"])
-        assert (await read(r.target, r.session, "/sys/module/cdx/parameters/flowtable_fail_stage")).strip() == "0"
+        assert (await read(r.target, r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip() == "0"
         state = await r.delete_table()
         assert state["errors"] == state["quarantine"] == 0 and state["installs"] == state["deletes"], state
         await r.clear_ct()
@@ -861,6 +861,7 @@ print(json.dumps(states))
             await asyncio.sleep(1)
             assert len(r.echo.received) == received, "traffic passed stopped classifier ports"
         else:
+            await console_command(con, "rmmod", "ask_flowtable", timeout=25)
             await console_command(con, "rmmod", "cdx", timeout=25)
             unloaded = True
         r.record(f"{kind}-traffic", await traffic)
@@ -870,6 +871,16 @@ print(json.dumps(states))
             await traffic
         finally:
             if kind == "unlink" and not unloaded:
+                await console_command(con, "rmmod", "ask_flowtable", timeout=25)
+                # The fatal latch belongs to the still-loaded provider. A
+                # fresh consumer must not turn an unproven deletion healthy.
+                refused = await console_command(con, "modprobe", "ask_flowtable", check=False)
+                assert refused["rc"] != 0 and "Operation not supported" in refused["stdout"], refused
+                await console_command(con, "test", "-e", "/sys/module/cdx")
+                for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
+                             "/sys/module/cdx/holders/ask_flowtable"):
+                    assert (await console_command(con, "test", "-e", path, check=False))["rc"] == 1, path
+                r.record("unlink-module-reload-refused", refused)
                 await console_command(con, "rmmod", "cdx", timeout=25)
                 unloaded = True
     absent = await console_command(con, "test", "-e", "/sys/module/cdx", check=False)

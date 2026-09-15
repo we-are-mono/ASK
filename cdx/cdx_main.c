@@ -195,8 +195,8 @@ static void cdx_module_deinit(void)
 {
 	int ii;
 
-	/* Unregistering flow blocks flushes callbacks which need ctrl.mutex. */
-	cdx_flowtable_exit();
+	/* A loaded flowtable adapter pins CDX. Its callbacks and hardware
+	 * have drained before provider shutdown can run. */
 
 	/* Stop classification before any dependent subsystem releases queues.
 	 * Keep RTNL available between retries and release it before callbacks
@@ -354,7 +354,7 @@ static int __init cdx_module_init(void)
 
 #ifdef DPA_IPSEC_OFFLOAD
 	if (cdx_flowtable_enabled())
-		goto flowtable;
+		goto initialized;
 	if (cdx_dpa_ipsec_init()) {
 		printk("%s::dpa_ipsec start failed\n", __func__);
 		rc = -EIO;
@@ -371,9 +371,9 @@ static int __init cdx_module_init(void)
 		rc = -ENOMEM;
 		goto exit;
 	}
-flowtable:
+initialized:
 #endif
-	rc = cdx_flowtable_init();
+	return 0;
 
 exit:
 	if (rc) {

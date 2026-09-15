@@ -10,6 +10,7 @@
  * uses RTNL trylock for admission and fatal recovery, never a blocking acquire.
  * Each binding pins its ingress device; each installed direction pins egress.
  */
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
 #include <linux/module.h>
@@ -27,7 +28,6 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
-#include "cdx_flowtable.h"
 #include "cdx_flowtable_backend.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 5
@@ -36,6 +36,9 @@
 
 #ifdef CDX_DEBUG_FLOWTABLE
 static unsigned int ft_fail_stage;
+static unsigned int ft_init_fail_stage;
+module_param_named(init_fail_stage, ft_init_fail_stage, uint, 0444);
+MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration");
 module_param_named(flowtable_fail_stage, ft_fail_stage, uint, 0600);
 MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocation, 2 before hardware, 3 after hardware");
 #endif
@@ -615,6 +618,14 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 	    bo->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
 		return -EOPNOTSUPP;
 	bo->driver_block_list = &ft_block_list;
+	/* The indirect Netfilter path invokes us before block_setup takes its
+	 * write lock. UNBIND moves a live callback onto bo's temporary list:
+	 * exclude statistics/replace/delete walkers for that move as well as
+	 * for the later free. Otherwise a walker can follow the temporary list
+	 * head as if it were a callback. Take this before the CDX transaction,
+	 * matching the order used by rule callbacks under the read lock. */
+	if (bo->command == FLOW_BLOCK_UNBIND)
+		down_write(&flowtable->flow_block_lock);
 	cdx_ft_begin();
 	if (bo->command == FLOW_BLOCK_BIND) {
 		rearm = atomic_read(&ft_invalid);
@@ -684,6 +695,8 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 	}
 out:
 	cdx_ft_end();
+	if (bo->command == FLOW_BLOCK_UNBIND)
+		up_write(&flowtable->flow_block_lock);
 	return rc;
 }
 
@@ -833,7 +846,7 @@ static int ft_show(struct seq_file *seq, void *unused)
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
 		   "neighbour_invalidations %lld\nroute_invalidations %lld\n",
-		   cdx_flowtable_enabled() ? "flowtable" : "cmm", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
+		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
 		   cdx_ft_pending(),
@@ -853,31 +866,43 @@ static int ft_show(struct seq_file *seq, void *unused)
 }
 DEFINE_PROC_SHOW_ATTRIBUTE(ft);
 
-int cdx_flowtable_init(void)
+static bool ft_init_fault(unsigned int stage)
+{
+#ifdef CDX_DEBUG_FLOWTABLE
+	return ft_init_fail_stage == stage;
+#else
+	return false;
+#endif
+}
+
+static int __init ask_flowtable_init(void)
 {
 	int rc;
 
-	ft_proc = proc_create("cdx_flowtable", 0400, NULL, &ft_proc_ops);
-	if (!ft_proc)
-		return -ENOMEM;
-	if (!cdx_flowtable_enabled())
-		return 0;
+	/* Exported symbol dependencies pin a fully initialized CDX throughout
+	 * this module's lifetime, including failed initialization and exit. */
 	cdx_ft_begin();
 	rc = cdx_ft_claim();
 	cdx_ft_end();
 	if (rc)
-		goto proc;
-	rc = register_netdevice_notifier(&ft_netdev_nb);
-	if (rc)
+		return rc;
+	ft_proc = ft_init_fault(1) ? NULL :
+		proc_create("cdx_flowtable", 0400, NULL, &ft_proc_ops);
+	if (!ft_proc) {
+		rc = -ENOMEM;
 		goto release;
-	rc = register_netevent_notifier(&ft_neigh_nb);
+	}
+	rc = ft_init_fault(2) ? -ENOMEM : register_netdevice_notifier(&ft_netdev_nb);
+	if (rc)
+		goto proc;
+	rc = ft_init_fault(3) ? -ENOMEM : register_netevent_notifier(&ft_neigh_nb);
 	if (rc)
 		goto netdev;
-	rc = register_fib_notifier(&init_net, &ft_fib_nb, NULL, NULL);
+	rc = ft_init_fault(4) ? -ENOMEM : register_fib_notifier(&init_net, &ft_fib_nb, NULL, NULL);
 	if (rc)
 		goto neigh;
 	WRITE_ONCE(ft_ready, true);
-	rc = flow_indr_dev_register(ft_bind, NULL);
+	rc = ft_init_fault(5) ? -ENOMEM : flow_indr_dev_register(ft_bind, NULL);
 	if (!rc)
 		return 0;
 	WRITE_ONCE(ft_ready, false);
@@ -886,28 +911,30 @@ neigh:
 	unregister_netevent_notifier(&ft_neigh_nb);
 netdev:
 	unregister_netdevice_notifier(&ft_netdev_nb);
+proc:
+	proc_remove(ft_proc);
+	ft_proc = NULL;
 release:
 	cdx_ft_begin();
 	WARN_ON_ONCE(cdx_ft_release());
 	cdx_ft_end();
-proc:
-	proc_remove(ft_proc);
-	ft_proc = NULL;
 	return rc;
 }
 
-void cdx_flowtable_exit(void)
+static void __exit ask_flowtable_exit(void)
 {
-	if (!ft_proc)
-		return;
+	struct cdx_ft_entry *entry;
+	int rc;
+
 	proc_remove(ft_proc);
 	ft_proc = NULL;
-	if (!ft_ready)
-		return;
-	/* Serialize with rule callbacks which may queue either worker. Atomic
-	 * notifiers are then unregistered synchronously before cancellation. */
+	/* Exclude cached Linux lookup before draining hardware. Unregistering
+	 * indirect blocks then performs native flow cleanup and excludes all
+	 * callbacks before releasing their binding storage. */
 	cdx_ft_begin();
 	WRITE_ONCE(ft_stopping, true);
+	list_for_each_entry(entry, &ft_entries, list)
+		nf_flow_offload_handle_invalidate(entry->handle);
 	cdx_ft_end();
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
@@ -916,7 +943,25 @@ void cdx_flowtable_exit(void)
 	cancel_delayed_work_sync(&ft_work);
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	WRITE_ONCE(ft_ready, false);
-	cdx_ft_begin();
-	WARN_ON_ONCE(cdx_ft_release());
-	cdx_ft_end();
+	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
+	 * before releasing CDX. Release the transaction between retries so
+	 * configuration and other kernel work can progress. Fatal state stays
+	 * in CDX and a subsequent adapter load cannot clear it. */
+	do {
+		cdx_ft_begin();
+		rc = cdx_ft_recover();
+		if (!rc)
+			rc = cdx_ft_release();
+		cdx_ft_end();
+		if (rc) {
+			pr_warn_ratelimited("ask_flowtable: waiting for safe hardware retirement before unload\n");
+			msleep(1000);
+		}
+	} while (rc);
 }
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("ASK Linux flowtable adapter using the CDX hardware backend");
+MODULE_IMPORT_NS(ASK_CDX_FLOWTABLE);
+module_init(ask_flowtable_init);
+module_exit(ask_flowtable_exit);

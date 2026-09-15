@@ -30,6 +30,7 @@ typedef uint64_t u64;
 #define ARPHRD_ETHER 1
 #define ether_addr_equal(a,b) (!memcmp(a,b,6))
 #define CDX_DEBUG_FLOWTABLE 1
+#define EXPORT_SYMBOL_NS_GPL(...)
 #define module_param(...)
 #define module_param_named(...)
 #define MODULE_PARM_DESC(...)
