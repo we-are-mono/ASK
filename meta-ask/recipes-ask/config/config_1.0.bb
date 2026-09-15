@@ -17,7 +17,7 @@ SRC_URI = "file://S03debugfs \
 # Point S at UNPACKDIR so bitbake doesn't warn about a missing ${BP}.
 S = "${UNPACKDIR}"
 
-RDEPENDS:${PN} += "dnsmasq iptables iproute2 cmm nftables python3-core python3-json python3-crypt python3-fcntl"
+RDEPENDS:${PN} += "dnsmasq iptables iproute2 nftables python3-core python3-json python3-crypt python3-fcntl"
 
 # These files are installed from ${ASK_SRCROOT} (outside SRC_URI's reach).
 # Without listing them as task input checksums, bitbake's sstate signature for

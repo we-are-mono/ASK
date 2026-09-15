@@ -85,7 +85,7 @@ async def console_command(console, *argv, check=True, timeout=20):
     return {"rc": result.rc, "stdout": stdout}
 
 
-async def console_python(console, script):
+async def console_python(console, script, *, timeout=20):
     # The physical UART can lose characters in long input lines. Stage short
     # chunks and verify the exact script before executing any test operation.
     encoded = base64.b64encode(script.encode()).decode()
@@ -98,7 +98,7 @@ async def console_python(console, script):
                                   f"base64 -d {redirect} {shlex.quote(path)}")
         digest = await console_command(console, "sha256sum", path)
         assert digest["stdout"].split()[0] == hashlib.sha256(script.encode()).hexdigest(), digest
-        return await console_command(console, "python3", path)
+        return await console_command(console, "python3", path, timeout=timeout)
     finally:
         await console_command(console, "rm", "-f", path)
 
@@ -404,9 +404,21 @@ async def test_flowtable_offload_reference_and_lifecycle(rig):
     r = rig
     from _ioctl import CDX_CTRL_DPA_SET_PARAMS, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
     from test_fci_netlink_caps import _nl_header_and_err
-    for fcode in [0xFFFF, 0x0316]:  # unknown command and IPv4 reset
-        reply = await r.target.fci_send(r.session, fcode=fcode, length=0)
-        assert _nl_header_and_err(reply) == (2, -errno.EOPNOTSUPP), reply
+    # Flowtable boots do not load FCI. Load it only for the negative legacy
+    # ownership check, then restore the boot's module state before traffic.
+    fci_present = any(line.startswith("fci ") for line in
+                      (await read(r.target, r.session, "/proc/modules")).splitlines())
+    with Console.target(log_path=str(ARTIFACTS / "reference-fci-uart.log")) as con:
+        await asyncio.to_thread(con.login, "root", None)
+        try:
+            if not fci_present:
+                await console_command(con, "modprobe", "fci")
+            for fcode in [0xFFFF, 0x0316]:  # unknown command and IPv4 reset
+                reply = await r.target.fci_send(r.session, fcode=fcode, length=0)
+                assert _nl_header_and_err(reply) == (2, -errno.EOPNOTSUPP), reply
+        finally:
+            if not fci_present:
+                await console_command(con, "rmmod", "fci")
     reply = await r.target.ioctl_send(r.session, "/dev/cdx_ctrl", CDX_CTRL_DPA_SET_PARAMS,
                                      bytes(SIZEOF_CDX_CTRL_SET_DPA_PARAMS))
     assert reply["errno"] == errno.EOPNOTSUPP, reply

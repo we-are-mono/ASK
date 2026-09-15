@@ -33,7 +33,7 @@ case "$1" in
                 if [ "$owner" = flowtable ]; then
                     modprobe ask_flowtable || exit 1
                 fi
-            elif [ "$mod" = auto_bridge ] && [ "$owner" = flowtable ]; then
+            elif [ "$owner" = flowtable ] && { [ "$mod" = fci ] || [ "$mod" = auto_bridge ]; }; then
                 continue
             else
                 modprobe "$mod" || exit 1

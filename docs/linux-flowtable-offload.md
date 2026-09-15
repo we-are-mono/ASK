@@ -358,9 +358,10 @@ The test initramfs reads `ask.offload=cmm|flowtable` from the kernel command lin
 absence selects CMM. `ask.flowtable_observe=1` with flowtable ownership validates
 requests but refuses hardware installation. CDX exposes these as read-only module
 parameters `offload_owner` and `flowtable_observe`. Selecting a mode requires a
-clean boot. The experimental init script skips `auto_bridge` and CMM; CDX skips
-the Wi-Fi and IPsec runtime offload hooks. All FCI commands return
-`-EOPNOTSUPP` in experimental mode, including queries. Initial `dpa_app` setup is
+clean boot. The experimental init script skips `fci`, `auto_bridge` and CMM;
+CDX skips the Wi-Fi and IPsec runtime offload hooks. If FCI is explicitly loaded
+for a compatibility probe, all its commands return `-EOPNOTSUPP` in experimental
+mode, including queries. Initial `dpa_app` setup is
 shared, and subsequent SET_PARAMS requests are rejected. The boot script loads
 `ask_flowtable.ko` after `cdx.ko` only for flowtable ownership. Read-only hardware
 inspection is available through `/proc/cdx_flowtable` while the adapter is loaded,
@@ -2255,3 +2256,42 @@ hashes were checked on the DUT. Kernel ID is
 `2699569ab2a26ffb613ce6cdfd16c1ab7729b29493695a67648d089a0514b9f3`.
 Evidence is in `/tmp/ask-flowtable-policy/`; the build log is
 `/tmp/ask-flowtable-policy-build.log` (three existing forced-task warnings).
+
+
+## Startup independence — verified 2026-09-15
+
+Flowtable and observe boots now omit FCI as well as automatic bridging and CMM.
+The configuration package no longer requires the CMM package; the combined test
+image still explicitly ships legacy components so a normal boot remains possible.
+The flowtable controller has no legacy per-flow command dependency. CDX imports
+no FCI module symbols; the adapter depends on CDX and nf_flow_table. dpa_app and
+FMC import no CMM/FCI library. Their shared one-shot hardware initialization uses
+FMC and the exclusive CDX configuration ioctls before the adapter claims/seals
+configuration. This hardware setup remains part of the provider, not a retired
+connection-manager responsibility.
+
+Thirty-six focused host checks pass in 0.17 seconds: both active/observe boot
+selections omit FCI, legacy mode retains its order, and ownership/failure/policy
+contracts remain covered. The new clean-boot DUT test passes in 54.15 seconds.
+CMM has never started and FCI/auto_bridge are absent; requesting CMM startup is
+gated, and the shipped disabled policy hook completes with no bindings. UDP and
+TCP then offload without either legacy component: 256 exact UDP hits per
+direction, 4 MiB TCP per direction, software TX 4/15, aggregate busy CPU 2.03%
+and softirq 0.41%.
+
+The reference/lifecycle regression passes in 113.54 seconds. It explicitly loads
+FCI just for unknown/reset rejection probes, then removes it before any traffic.
+Counter-enabled hardware refusal, wire MAC/TTL/checksum/padding checks, three
+live unbind/rebind cycles, active lifetime refresh and idle expiry all pass.
+Final bindings, entries and references are zero; installs equal deletes, errors
+and quarantine are zero. KASAN/lockdep diagnostics are clean, debug_locks is 1,
+and taint is 4096. No full suite or alternative kernel was used.
+
+The KASAN image was built and staged. Verified kernel ID is
+`0b87e8d7167d903063914ad76d34bd2e6078ecd4`, CDX
+`ed4251e6275e1ecbe06998b28203deb1a659b67a`, adapter
+`a085496c134eedd293fe2a87a438e33a7bac5cb0`, and image SHA-256
+`ad701fa10ff4f2fd3365cca2305634fa40d71cc0dd1845813f884b7ac7b5409a`.
+Logs, dependency evidence and traffic records are in `/tmp/ask-flowtable-startup/`;
+build log is `/tmp/ask-flowtable-startup-build.log` (three existing forced-task
+warnings). Default-CMM compatibility is a separate final acceptance check.
