@@ -118,7 +118,18 @@ every packet of the measurement burst:
 | Routed UDP | 64 | 64 echoed, zero lost |
 | Source NAT | 64 | the WAN endpoint observed the translated source address and port |
 | Destination NAT | 64 | replies arrived from the pre-translation destination |
+| MASQUERADE | 64 | the address is pinned to the egress interface's own and the port is read back from the rule, then required of the wire |
+| Hairpin double NAT | 64 | both translations at once, both directions entering and leaving by the LAN port |
 | TCP | ≥100 segments | half a megabyte each way on one connection, cookies unchanged |
+
+Two further cases assert behaviour rather than a packet count. A device MTU
+change retires the connection and lets it come back describing the new path:
+each direction carries the MTU of the interface *it* leaves by, so reducing
+the WAN port moves only the forward direction, and one connection is one
+retirement because both directions share an invalidation handle. Twenty-four
+concurrent IPv6 connections then consume forty-eight directions with matching
+handle and neighbour references, which is what makes the shared 32,768 budget
+observable — accounting at a readable scale rather than a capacity fill.
 
 Throughput was measured with `iperf3` over the routed IPv6 path on the KASAN
 image: 9.173 Gb/s forward and 9.260 Gb/s reverse, against 97.9 Mb/s for the
