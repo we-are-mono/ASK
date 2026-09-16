@@ -1,11 +1,17 @@
-# UDP loss investigation — 2026-09-14
+# UDP loss investigation — 2026-09-14, closed 2026-09-16
 
-Acceptance remains open. The final PoC image reproduces intermittent missing
+**Closed.** The loss was in the LAN endpoint's physical receive path, not in
+forwarding. See [resolution](#resolution--2026-09-16) for the measurement that
+localised it; the sections below are the original investigation, kept for the
+discriminating checks they record and because most of them remain the right
+way to approach a recurrence.
+
+The original finding: the final PoC image reproduces intermittent missing
 UDP replies. One ordinary-routing failure coincided with exactly one receive
 CRC error at the LAN endpoint. Two hardware failures reached the DUT's LAN
 transmit MAC counters without a corresponding LAN reply or endpoint error
-increment. This narrows the observation gap, but neither identifies a failed
-component nor establishes that all losses have the same cause.
+increment. This narrowed the observation gap, but neither identified a failed
+component nor established that all losses had the same cause.
 
 ## Configuration and observation points
 
@@ -159,3 +165,41 @@ separate loss during unpaced bulk readmission is not attributed to these
 CRC events. See the [capacity record](flowtable/history/capacity.md) for the
 measurements, failed attempts and acceptance boundary. No new component
 isolation was performed and this investigation remains open.
+
+## Resolution — 2026-09-16
+
+The asymmetry the earlier sections kept circling turned out to be the answer.
+Counted on the same day, on a boot that had forwarded 1,105,229 frames:
+
+| Counter | DUT `eth3` | LAN endpoint `enp4s0` |
+| --- | ---: | ---: |
+| rx_packets | 1,105,229 | 200,539,440 |
+| rx_crc_errors | 0 | 2,865 |
+| rx_errors | 0 | 2,910 |
+| rx_length_errors | 0 | 45 |
+
+Every corrupted frame was counted at one end of one link, in the direction
+that loses echo replies, while the DUT's own port recorded no receive error
+of any kind. A forwarding defect cannot produce that shape: it would have to
+corrupt frames after the transmitting MAC counted them and before the
+receiving PHY checked them, which is the medium, not the code.
+
+After re-terminating that run, 303,418 frames produced no new CRC, error or
+length increment, and the four tests whose failures had been attributed to
+this loss — `test_flowtable_connections_independent_lifetimes`,
+`test_flowtable_policy_revokes_live_connections`,
+`test_flowtable_selective_neighbour` and its barrier variant, along with both
+`test_flowtable_hairpin` parameters — passed in one run with no retries.
+
+A counter that does not advance over 303,418 frames is evidence rather than
+proof, and the earlier replacement recorded above did not settle it. What has
+changed is that the losses are now attributable, the one-sided counter is the
+cheap check that distinguishes this class from a forwarding fault, and the
+harness no longer mistakes it for one. Reopen if `rx_crc_errors` advances at
+either end.
+
+Nothing in the forwarding implementation was changed for this. The one test
+change it did justify was removing an unrelated assumption it had exposed:
+health checks compared a cumulative error counter against an absolute zero,
+so a deliberate injection early in the suite failed every test collected
+after it and masked which failures were real.
