@@ -36,10 +36,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -416,9 +416,18 @@
- 	struct nf_conn *ct = flow->ct;
- 	unsigned int before = nf_ct_expires(ct);
+@@ -398,9 +398,18 @@
  
+ void flow_offload_teardown(struct flow_offload *flow)
+ {
 -	clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
 -	set_bit(NF_FLOW_TEARDOWN, &flow->flags);
 -	flow_offload_fixup_ct(flow->ct);
@@ -55,6 +55,6 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 +		clear_bit(IPS_OFFLOAD_BIT, &flow->ct->status);
 +		flow_offload_fixup_ct(flow->ct);
 +	}
- 	/* Clearing IPS_OFFLOAD also ends the gc_worker refresh, so the timeout
- 	 * installed here is the whole remaining life of the conntrack. Print it
- 	 * rather than reconstructing it from successive samples.
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 

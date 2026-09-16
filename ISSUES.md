@@ -154,8 +154,8 @@ result independently of those temporary files.
 
 - [ ] **A140.** A retiring flow clears `IPS_OFFLOAD` on a conntrack a newer
   flow already owns, and the conntrack then dies under the live flow. Root
-  caused 2026-09-16 with kernel patch 142 (diagnostic printks at the offload
-  lifecycle transitions); 78 of 82 deaths in one run match the pattern exactly,
+  caused 2026-09-16 with temporary diagnostic printks at the offload
+  lifecycle transitions; 78 of 82 deaths in one run match the pattern exactly,
   with no rate-limited output and full coverage of all 16,384 connections:
 
   ```

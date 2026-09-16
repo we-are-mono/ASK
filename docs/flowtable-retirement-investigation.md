@@ -151,7 +151,9 @@ closing it.
 
 ## Measured cause — 2026-09-15, tracing image
 
-Kernel patch 142 prints at the three transitions. It settles the mechanism.
+Temporary printks at the three offload lifecycle transitions settle the
+mechanism. They were removed once the cause was fixed; the per-cause
+retirement counters in patch 141 remain.
 
 `flow_offload_teardown` cuts the conntrack's remaining life from a full day to
 ninety seconds and, in the same function, clears `IPS_OFFLOAD` — the bit whose
