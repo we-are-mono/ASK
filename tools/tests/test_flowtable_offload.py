@@ -90,22 +90,36 @@ async def console_command(console, *argv, check=True, timeout=20):
     return {"rc": result.rc, "stdout": stdout}
 
 
-async def console_python(console, script, *, timeout=20):
-    # The physical UART can lose characters in long input lines. Stage short
+async def console_python(console, script, *, timeout=20, attempts=3):
+    # The physical UART can lose characters in long input lines, so stage short
     # chunks and verify the exact script before executing any test operation.
+    # A dropped character corrupts the staged text, not the console, so retry
+    # the staging rather than failing the test on the line noise: decoding each
+    # chunk as it arrived turned one lost character into "base64: invalid
+    # input" and lost the whole test. Accumulate the encoded text, decode once,
+    # and let the digest decide whether it survived.
     encoded = base64.b64encode(script.encode()).decode()
+    wanted = hashlib.sha256(script.encode()).hexdigest()
     path = f"/tmp/ask_ft_{time.monotonic_ns()}.py"
+    staged = f"{path}.b64"
     try:
-        for offset in range(0, len(encoded), 144):
-            redirect = ">>" if offset else ">"
-            await console_command(console, "sh", "-c",
-                                  f"printf %s {shlex.quote(encoded[offset:offset + 144])} | "
-                                  f"base64 -d {redirect} {shlex.quote(path)}")
-        digest = await console_command(console, "sha256sum", path)
-        assert digest["stdout"].split()[0] == hashlib.sha256(script.encode()).hexdigest(), digest
+        for attempt in range(attempts):
+            await console_command(console, "rm", "-f", path, staged)
+            for offset in range(0, len(encoded), 144):
+                await console_command(console, "sh", "-c",
+                                      f"printf %s {shlex.quote(encoded[offset:offset + 144])} "
+                                      f">> {shlex.quote(staged)}")
+            decoded = await console_command(console, "sh", "-c",
+                                            f"base64 -d {shlex.quote(staged)} > {shlex.quote(path)}",
+                                            check=False)
+            digest = await console_command(console, "sha256sum", path, check=False)
+            if not decoded["rc"] and not digest["rc"] and digest["stdout"].split()[:1] == [wanted]:
+                break
+        else:
+            pytest.fail(f"UART staging corrupted {attempts} times: {decoded}, {digest}")
         return await console_command(console, "python3", path, timeout=timeout)
     finally:
-        await console_command(console, "rm", "-f", path)
+        await console_command(console, "rm", "-f", path, staged)
 
 
 def status_text(text):
