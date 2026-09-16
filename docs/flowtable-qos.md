@@ -240,24 +240,23 @@ everything it needs already: `priv->qm_ctx` is stashed at netdev registration
 `(channel, classque)` index pair. The FCI handlers do nothing but resolve an
 ifname and call them.
 
-Two real constraints, and the first is not yet resolved.
+Two real constraints.
 
-**HTB offload binds a leaf class to a netdev TX queue, and this driver does not
-use them.** `TC_HTB_LEAF_ALLOC_QUEUE` returns a `qid` that `sch_htb` turns
-straight into `netdev_get_tx_queue(dev, qid)` and grafts a qdisc onto
-(`net/sched/sch_htb.c:1909`). The model assumes frames reach hardware by being
-queued on that TX queue after a `tc` filter sets the queue mapping. Neither ASK
-path works that way: an offloaded flow produces no skb at all, and `cpe_fp_tx()`
-picks its FQ from the conntrack mark while ignoring `skb_get_queue_mapping()`
-entirely. `DPAA_ETH_TX_QUEUES` is `NR_CPUS`, and the existing build already
-asserts `MAX_SCHEDULER_QUEUES <= DPAA_ETH_TX_QUEUES` (`cdx/control_qm.c:475`),
-so enough queue slots exist for a one-to-one `qid` ↔ class-queue mapping — but
-making it mean anything requires teaching `cpe_fp_tx()` to honour the queue
-mapping, and the hardware path still needs the mark regardless, because there
-is no skb to carry a mapping. Settle this before planning the increment. The
-alternative is a classful qdisc of ASK's own, which is what the SDK's `ceetm`
-qdisc is and what a device whose queues are not netdev TX queues normally
-needs — option A's model backed by cdx's hardened layer instead of the SDK's.
+**HTB offload binds a leaf class to a netdev TX queue, and this driver has no
+per-queue plumbing at all.** `TC_HTB_LEAF_ALLOC_QUEUE` returns a `qid` that
+`sch_htb` turns straight into `netdev_get_tx_queue(dev, qid)` and grafts a
+pfifo onto (`net/sched/sch_htb.c:1909`); there is no bounds check on that path,
+so a bad qid is out-of-bounds memory rather than an error. The driver must
+therefore own a dense, exclusively-allocated range below
+`real_num_tx_queues` and resize it on every leaf add and delete. Today
+`sdk_dpaa` has none of the machinery that implies: no `ndo_setup_tc`, no
+`NETIF_F_HW_TC`, no `ndo_select_queue` (the one in `dpaa_eth.c:696` is
+`#ifdef CONFIG_FMAN_PFC`, which is off in every build), no
+`netif_set_real_num_tx_queues` call, no per-queue stop/wake, no BQL and no XPS
+maps. `real_num_tx_queues` is fixed at probe to `DPAA_ETH_TX_QUEUES`, which is
+literally `NR_CPUS` — 64 under OpenWrt, 16 under meta-ask. A leaf budget that
+varies with a distribution's kernel config is not a contract, so that has to be
+decoupled from `NR_CPUS` regardless of which control plane wins.
 
 **Only eight weighted classes are available**, because cdx claims WBFS group A
 only and never group B (`qman_ceetm_cq_claim_A`, `cdx/cdx_ceetm_app.c:548`). A
@@ -274,17 +273,65 @@ The QM command family is *not* sealed in flowtable mode; only
 writing the same `CMD_QM_*` structures to `/dev/cdx_ctrl` removes CMM from the
 QoS path with no kernel change whatsoever.
 
-**Recommendation: B, directly.** C looks attractive because it needs no kernel
-change, but that advantage does not survive contact with how the product is
-built. ASK is a dependency of the OpenWrt image, not a peer of it: OpenWrt
-consumes whatever ASK exposes, and it has to be adapted to the flowtable
-regardless, since `package/ask/ask-modules` ships only `cdx`, `auto_bridge` and
-`fci` today. Landing C would therefore buy no earlier product capability and
-would cost the OpenWrt side two adaptations — one to C's bespoke tool, one to
-`tc` — for the same feature. C keeps its value only as a bench fixture for
-exercising CEETM on the test image before the `ndo_setup_tc` work lands.
+**Recommendation: B, with the mark kept as the single classification key.**
+
+C looks attractive because it needs no kernel change, but that advantage does
+not survive contact with how the product is built. ASK is a dependency of its
+distributions, not a peer of them: each consumes whatever ASK exposes, and each
+has to be adapted to the flowtable regardless. Landing C would buy no earlier
+product capability and would cost every consumer two adaptations — one to C's
+bespoke tool, one to `tc` — for the same feature. C keeps its value only as a
+bench fixture for exercising CEETM before the `ndo_setup_tc` work lands, which
+is exactly how the increment-1 proof below uses it.
 
 A is not worth its risk at any point.
+
+### Why HTB offload does not classify
+
+The obvious reading of B is wrong, and it is worth stating so nobody
+re-discovers it. HTB offload's own model is "a leaf class *is* a netdev TX
+queue": a `tc` filter sets the queue mapping, the packet lands on that queue's
+pfifo, and the driver reads `skb_get_queue_mapping()`. Adopting that model
+wholesale would classify the *software* path by tc filter while the hardware
+path continues to classify by the conntrack mark — two sources of truth for one
+flow's class, silently disagreeing whenever an operator updates one and not the
+other, and switching over at the moment a flow gets offloaded.
+
+The mark is the only key the two paths can share, because an offloaded flow
+produces no skb, reaches no qdisc and touches no TX queue. So the mark stays
+the classifier and HTB offload supplies only the *tree*: rates, priorities,
+weights, and a stable classid per leaf.
+
+Concretely, `ndo_select_queue` resolves the conntrack mark to the leaf's TX
+queue — the same decode `pfe_eth_get_queuenum()` already performs, moved
+earlier and expressed as a queue index. `cpe_fp_tx()` then reads
+`skb_get_queue_mapping()` and looks up the CEETM FQ through the same
+`txq → (channel, class queue)` map that leaf allocation built. The hardware path
+resolves the identical pair from the identical mark. One source of truth, two
+consumers.
+
+This is also why NXP's own `ceetm` qdisc ignores the TX queue for egress
+selection and classifies in `ceetm_tx()` instead. The difference is that a
+bespoke qdisc needs `TCA_CEETM_*` attributes that no upstream iproute2 knows,
+which fails the portability requirement above. HTB offload's vocabulary ships
+everywhere.
+
+### What HTB offload cannot tell you
+
+It has no statistics command. `struct tc_htb_qopt_offload` carries no stats
+member and `enum tc_htb_command` has no stats verb; per-class counters come
+from the software pfifo sitting on the leaf's TX queue
+(`htb_dump_class_stats`, `net/sched/sch_htb.c:1341`). Hardware-offloaded flows
+never enqueue there, so `tc -s class show` would read approximately zero for
+precisely the traffic being accelerated.
+
+Expose the real counters through `ethtool -S` instead. cdx already reads them
+(`qman_ceetm_cq_get_dequeue_statistics` and
+`qman_ceetm_ccg_get_reject_statistics`, `cdx/cdx_ceetm_app.c:1732` and `:1741`),
+the netdev already implements `get_strings`/`get_sset_count`/
+`get_ethtool_stats` (`sdk_dpaa/dpaa_ethtool.c:564`), and `ethtool` is as
+portable as `tc`. `tc -s class show` then honestly reports the software share
+and `ethtool -S` reports what the hardware actually dequeued and rejected.
 
 ### Policing
 
@@ -304,34 +351,188 @@ One thing not to copy forward: CMM validates ingress `cir`/`pir` against
 in `e_FM_PCD_PLCR_BYTE_MODE`, where the unit is Kbit/s. The replacement should
 fix the range rather than reproduce it.
 
-## Sequencing
+## Implementation plan
 
-Everything here is ASK-side. OpenWrt consumes the result and is adapted once,
-at the end, rather than tracking intermediate control planes.
+Eight increments, each with its own proof. Everything is ASK-side; consumers
+are adapted once, after increment 5, rather than tracking intermediate control
+planes. Estimates assume rig access and are for the increment's own work, not
+for review or for a release sweep.
 
-1. **Classification.** `cdx_ft_rule.qos`, the mark decode with a configurable
-   mask, the direction split, the default-class contract, and a hardware proof
-   that two flows with different marks land in different class queues under
-   load. Cannot start before a default class is chosen, or admitted flows
-   silently land on the lowest-priority queue.
-2. **Control channel B.** `ndo_setup_tc` HTB offload over the existing
-   `cdx_ceetm_app.c`. Deletes `cmm/src/module_qm.c`, most of
-   `cdx/control_qm.c` and 23 command codes.
-3. **WRED.** Expose the per-colour WRED parameters the CCG already has
-   (`wr_en_g/y/r`, `wr_parm_g/y/r` in `qm_ceetm_ccg_params`) and that cdx
-   configures nowhere. Without it the offered QoS is strict priority plus
-   shapers over a tail-drop of eight frames, which is not competitive with the
-   `cake`/`fq_codel` behaviour an OpenWrt user expects from the word "QoS".
-   This is a configuration gap, not a hardware one.
-4. **Retire the ASK mark.** Drop patch 060, the iptables extensions and their
-   two Kconfig symbols once nothing reads `ct->qosconnmark`. Note that
-   `pfe_eth_get_queuenum()` reads it on the software TX path, so this step also
-   has to convert `cpe_fp_tx()` to `ct->mark`.
-5. **Ingress policing, if wanted.** Extend the mark decode with `iqid`, argue
-   the bit budget, and prove a policed flow drops at its configured rate.
-   Unconfigured in the product today.
+### 1. Classification — the mark reaches hardware
 
-Steps 1, 2 and 3 are independent. Step 4 depends on 1. Step 5 depends on 1.
+The only increment that is fully traced today, and the only one that delivers
+observable behaviour on its own.
+
+`struct cdx_ft_rule` gains `u32 qos`. Two properties fall out of the existing
+code with no extra work: `ft_same_key()` (`cdx/ask_flowtable.c:655`) is an
+explicit field list, so `qos` stays out of flow identity and two marks cannot
+collide as duplicate keys; and `ft_replace()` compares whole rules with
+`memcmp`, so a mark change reinstalls the flow. `ft_parse()` already
+`memset`s the struct (`:582`), so the added field is padding-safe.
+
+- `cdx/cdx_flowtable_backend.h` — add the field, document it as the decoded
+  `(channel, class queue)` pair rather than the raw mark.
+- `cdx/ask_flowtable.c` — drop `READ_ONCE(cls->nf_ct->mark)` from the refusal
+  conjunction at `:562`; decode under the mask after `ft_translation()`
+  succeeds, taking the direction from
+  `ft_tuple_matches(out, &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple)`; add the
+  value to the proc row near `:1320`.
+- `cdx/cdx_flowtable_hw.c` — write `ct->qosmark.chnl_id` and `.queue` in
+  `cdx_ft_hw_add()`.
+- `tools/ask_flowtable.py` — relax `ct mark != 0 return` at `:138` to the
+  configured mask, and validate the policy's own `mark` selectors against the
+  kernel's mask rather than allowing them to contradict it.
+
+Two decisions belong to this increment. The **mask** is a `0444` module
+param, matching `offload_owner`'s boot-immutable shape and the per-boot
+ownership model; the controller reads it back from
+`/sys/module/ask_flowtable/parameters/`. The **default class** must be
+explicit: an unmarked flow currently resolves to CEETM queue 7, the lowest
+strict priority, and leaving that implicit means every unclassified flow
+silently lands in the worst queue.
+
+*Proof.* Buildable on the rig today. `tools/tests/test_qos_control.py` already
+queries all 128 class queues over `CMD_QM_QUERY_QUEUE` and reads back their
+fqids; the same reply carries `deque_pkts` and `frm_count`. The test enables
+CEETM over FCI — the bench use of option C — assigns a channel, drives two
+differently-marked flows, and asserts the dequeue counters split. Add a
+negative case: a mark outside the mask must not change the class.
+
+*Effort: 2–3 days including rig time.*
+
+### 2. TX queue foundation
+
+Nothing in `sdk_dpaa` supports a per-queue model yet, and the gaps are
+structural rather than incidental.
+
+- Decouple the queue count from `NR_CPUS`. `DPAA_ETH_TX_QUEUES` is literally
+  `NR_CPUS` (`dpaa_eth.h:201`), giving 64 queues under OpenWrt and 16 under
+  meta-ask. A leaf budget that varies with a distribution's kernel config is
+  not a contract. Allocate `online CPUs + CEETM leaf budget` explicitly in the
+  `alloc_etherdev_mq()` call at `dpaa_eth.c:956`.
+- Add `NETIF_F_HW_TC` to `hw_features`, without which `tc_can_offload()`
+  refuses the qdisc outright.
+- Add an `ndo_setup_tc` that dispatches to cdx through a registered callback,
+  the same indirection `dpa_register_ceetm_get_egress_fq()` already uses
+  (`dpaa_eth_sg.c:80`) so the out-of-tree module stays out of tree.
+- Call `netif_set_real_num_tx_queues()`, which the driver never does today.
+- Untangle `cdx/control_qm.c:475`, which asserts the CEETM class-queue count
+  against `DPAA_ETH_TX_QUEUES` because the two index spaces are currently
+  conflated.
+
+*Proof.* Queue count is correct and identical across both kernel configs;
+`tc qdisc add … htb offload` is accepted and rejected for the right reasons.
+
+*Effort: 1 week.*
+
+### 3. HTB offload commands
+
+Implement the command set over `cdx_ceetm_app.c`'s existing setters, all of
+which are already thin functions over a `(channel, class queue)` pair.
+
+- `TC_HTB_CREATE` latches the qdisc handle major and default class.
+- `TC_HTB_LEAF_ALLOC_QUEUE` claims a channel and class queue, returns a dense
+  qid, and records the `txq → (channel, class queue)` map.
+- `TC_HTB_LEAF_TO_INNER`, `LEAF_DEL`, `LEAF_DEL_LAST`, `NODE_MODIFY`,
+  `LEAF_QUERY_QUEUE`.
+- Map `rate`/`ceil` to the LNI and channel shapers, `prio` to the strict
+  priority queue, `quantum` to the WBFS weight.
+
+Three sharp edges from the `sch_htb` contract. `LEAF_DEL` may write back a
+different classid to report that the driver moved a qid, which is how the
+range stays dense; skipping it means fragmenting the budget. `TC_HTB_DESTROY`
+and `LEAF_DEL_LAST_FORCE` have their return values **discarded**, so teardown
+must always succeed — the same class of problem A21, A109, A122 and A133 were
+about, in the same file, so budget for it. And every leaf add or delete wraps
+a full `dev_deactivate()`/`dev_activate()` cycle, so building a wide tree
+quiesces the netdev once per class.
+
+Only eight weighted leaves per channel are available until WBFS group B is
+claimed (`qman_ceetm_cq_claim_A`, `cdx/cdx_ceetm_app.c:548`).
+
+*Proof.* Build a tree with `tc`, read it back with `tc class show`, and
+confirm against `CMD_QM_QUERY_QUEUE` that the hardware matches what was asked
+for. Tear it down and confirm every claim is released.
+
+*Effort: 1.5–2 weeks.*
+
+### 4. The software path agrees with hardware
+
+- `ndo_select_queue` resolves the conntrack mark to the leaf's TX queue,
+  reusing the decode `pfe_eth_get_queuenum()` performs today.
+- `cpe_fp_tx()` selects its CEETM FQ from `skb_get_queue_mapping()` through
+  the increment-3 map instead of resolving the mark itself.
+- Fix the `conf_fq` index while here. `dpaa_eth_sg.c:1999` indexes
+  `conf_fqs[]` with a class-queue id in the CEETM branch, so every
+  DSCP-classified frame confirms on `conf_fqs[0]`. That is a live bug, not a
+  consequence of this work.
+
+*Proof.* One flow, forced through software and then offloaded, lands in the
+same class queue both times.
+
+*Effort: 3–4 days.*
+
+### 5. Hardware statistics through ethtool
+
+Extend the existing `get_strings`/`get_sset_count`/`get_ethtool_stats`
+(`sdk_dpaa/dpaa_ethtool.c:564`) with per-class dequeued frames, dequeued bytes
+and rejected frames, read from the counters cdx already calls
+(`cdx/cdx_ceetm_app.c:1732`, `:1741`).
+
+*Proof.* `ethtool -S` accounts for offloaded traffic that `tc -s class show`
+cannot see, and the two together account for the whole link.
+
+*Effort: 2–3 days.*
+
+**Consumers can be adapted from here.** Everything after this point improves
+the offering rather than enabling it.
+
+### 6. WRED
+
+The CCG already carries `wr_en_g/y/r` and `wr_parm_g/y/r`
+(`include/linux/fsl_qman.h:3748`); cdx configures none of it, so today's
+offering is strict priority and shapers over a tail-drop of eight frames.
+Expose the parameters and pick defaults that behave under load.
+
+Note that cdx also disables congestion-state notification entirely
+(`cscn_en = 0`, `cdx/cdx_ceetm_app.c:436`), so overload is invisible to
+software. Decide in this increment whether that stays true.
+
+*Proof.* A saturating flow and a sparse one share a class; latency for the
+sparse flow stays bounded where tail-drop alone would not keep it so.
+
+*Effort: 1 week.*
+
+### 7. Retire the ASK mark
+
+Drop `patches/kernel/060`, the four files in `iptables-extensions/`, and
+`CONFIG_NETFILTER_XT_QOSMARK`/`_QOSCONNMARK`, once nothing reads
+`ct->qosconnmark`. Increment 4 already moved the software path, so this is
+mostly deletion. Worth doing early rather than late: the extension is not
+packaged for OpenWrt at all, so `ct->qosconnmark` is permanently zero there
+and the path is already dead in production.
+
+*Effort: 3–4 days.*
+
+### 8. Ingress policing
+
+Extend the decode with `iqid`, argue the bit budget against the mask, and
+prove a policed flow drops at its configured rate. Fix the unit error while
+here: CMM validates `cir`/`pir` against a packets-per-second range while
+`cdx_qos.c` programs the profile in byte mode, where the unit is Kbit/s.
+
+*Effort: 1 week.*
+
+### Order and total
+
+Increments 1 and 2 are independent. 3 depends on 2; 4 on 3; 5 on 3. 6, 7 and 8
+each depend only on 1. Roughly **six to eight weeks** of focused work to the
+end of increment 5, where the feature becomes consumable, plus three weeks for
+6 to 8.
+
+The largest single risk is increment 3's teardown paths, because `sch_htb`
+discards the return value of the two destroy commands and the file they land
+in has a history of exactly that failure mode.
 
 ## The consumer contract
 
