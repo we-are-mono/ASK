@@ -228,11 +228,10 @@ A21, A109, A122 and A133 all live in `cdx_ceetm_app.c` — in favour of 55k of
 SDK code that is compiled out of every current build.
 
 **B — keep `cdx_ceetm_app.c`, replace FCI with `ndo_setup_tc` HTB offload.**
-`TC_SETUP_QDISC_HTB` is the mainline-blessed verb for exactly this shape and is
-what mlx5 uses for hardware queue trees. The mapping is direct: root
-`rate`/`ceil` → LNI commit/excess shaper; `TC_HTB_LEAF_ALLOC_QUEUE` → claim a
-channel and class queue and hand back the binding; leaf `rate`/`ceil` → channel
-shaper; leaf `prio` → strict-priority class queue; leaf `quantum` → WBFS weight.
+`TC_SETUP_QDISC_HTB` is the mainline-blessed verb for this shape and is what
+mlx5 uses for hardware queue trees. The parameter mapping is clean: root
+`rate`/`ceil` → LNI commit/excess shaper; leaf `rate`/`ceil` → channel shaper;
+leaf `prio` → strict-priority class queue; leaf `quantum` → WBFS weight.
 Tail-drop depth has no HTB field and stays a per-port default. The callback has
 everything it needs already: `priv->qm_ctx` is stashed at netdev registration
 (`cdx/control_qm.c:518`), and every cdx setter — `ceetm_configure_shaper`,
@@ -241,10 +240,28 @@ everything it needs already: `priv->qm_ctx` is stashed at netdev registration
 `(channel, classque)` index pair. The FCI handlers do nothing but resolve an
 ifname and call them.
 
-One real constraint: only eight weighted classes are available, because cdx
-claims WBFS group A only and never group B (`qman_ceetm_cq_claim_A`,
-`cdx/cdx_ceetm_app.c:548`). An HTB tree wider than eight weighted leaves per
-channel needs group B claimed first.
+Two real constraints, and the first is not yet resolved.
+
+**HTB offload binds a leaf class to a netdev TX queue, and this driver does not
+use them.** `TC_HTB_LEAF_ALLOC_QUEUE` returns a `qid` that `sch_htb` turns
+straight into `netdev_get_tx_queue(dev, qid)` and grafts a qdisc onto
+(`net/sched/sch_htb.c:1909`). The model assumes frames reach hardware by being
+queued on that TX queue after a `tc` filter sets the queue mapping. Neither ASK
+path works that way: an offloaded flow produces no skb at all, and `cpe_fp_tx()`
+picks its FQ from the conntrack mark while ignoring `skb_get_queue_mapping()`
+entirely. `DPAA_ETH_TX_QUEUES` is `NR_CPUS`, and the existing build already
+asserts `MAX_SCHEDULER_QUEUES <= DPAA_ETH_TX_QUEUES` (`cdx/control_qm.c:475`),
+so enough queue slots exist for a one-to-one `qid` ↔ class-queue mapping — but
+making it mean anything requires teaching `cpe_fp_tx()` to honour the queue
+mapping, and the hardware path still needs the mark regardless, because there
+is no skb to carry a mapping. Settle this before planning the increment. The
+alternative is a classful qdisc of ASK's own, which is what the SDK's `ceetm`
+qdisc is and what a device whose queues are not netdev TX queues normally
+needs — option A's model backed by cdx's hardened layer instead of the SDK's.
+
+**Only eight weighted classes are available**, because cdx claims WBFS group A
+only and never group B (`qman_ceetm_cq_claim_A`, `cdx/cdx_ceetm_app.c:548`). A
+tree wider than eight weighted leaves per channel needs group B claimed first.
 
 Every hardened path survives; only the transport changes. The control plane
 becomes `tc class add dev eth3 parent 1: classid 1:10 htb rate 100mbit ceil
