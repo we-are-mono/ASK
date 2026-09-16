@@ -45,6 +45,7 @@
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
 #include <net/switchdev.h>
+#include <dpaa_eth_common.h>
 #include "cdx_flowtable_backend.h"
 #include "cdx_flowtable.h"
 
@@ -68,7 +69,7 @@ static_assert(CDX_FT_VLAN_MAX == NF_FLOW_TABLE_ENCAP_MAX);
 static unsigned int ft_fail_stage;
 static unsigned int ft_init_fail_stage;
 module_param_named(init_fail_stage, ft_init_fail_stage, uint, 0444);
-MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration, 6 nexthop objects, 7 bridge FDB, 8 bridge VLAN configuration");
+MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration, 6 nexthop objects, 7 bridge FDB, 8 bridge VLAN configuration, 9 direct registration");
 module_param_named(flowtable_fail_stage, ft_fail_stage, uint, 0600);
 MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocation, 2 before hardware, 3 after hardware, 4 busy after peer direction");
 #endif
@@ -2350,8 +2351,16 @@ static int __init ask_flowtable_init(void)
 		goto fdb;
 	WRITE_ONCE(ft_ready, true);
 	rc = ft_init_fault(5) ? -ENOMEM : flow_indr_dev_register(ft_bind, NULL);
+	if (rc)
+		goto not_ready;
+	/* Both routes stay registered. Which one Netfilter uses is the driver's
+	 * choice, not ours, and a kernel without the ndo has only the indirect
+	 * one -- so the adapter has to serve whichever arrives. */
+	rc = ft_init_fault(9) ? -EBUSY : dpa_register_setup_tc(cdx_ft_setup_tc);
 	if (!rc)
 		return 0;
+	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
+not_ready:
 	WRITE_ONCE(ft_ready, false);
 	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
 fdb:
@@ -2397,6 +2406,9 @@ static void __exit ask_flowtable_exit(void)
 	unregister_netdevice_notifier(&ft_netdev_nb);
 	cancel_work_sync(&ft_retire_work);
 	cancel_delayed_work_sync(&ft_work);
+	/* Direct first: it is the route a DPAA port actually takes, so closing
+	 * it stops new binds before the indirect one is torn down. */
+	dpa_unregister_setup_tc();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
