@@ -81,7 +81,7 @@ async def test_flowtable_policy_revokes_live_connections(connections):
                 state = await r.state()
                 assert by_key(state).keys() == keys([1], flows), state
                 before_tcp = await software_tx(r)
-                tcp = await p.batch([1], 256, 0.03125)
+                tcp = await p.batch([1], 256, 0.015625)
                 after_tcp, accelerated = await software_tx(r), await r.state()
                 tcp_tx = {d: after_tcp[d] - before_tcp[d] for d in before_tcp}
                 assert tcp_tx[TARGET_LAN_IF] <= 64 and tcp_tx[TARGET_WAN_IF] <= 512, tcp_tx

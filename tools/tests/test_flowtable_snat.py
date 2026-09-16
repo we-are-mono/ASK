@@ -70,7 +70,7 @@ async def snat_hardware(r, p, external, port, zero_checksum, label):
 
     task = asyncio.create_task(capture())
     try:
-        reports = await p.batch([0], 256, 0.03125)
+        reports = await p.batch([0], 256, 0.015625)
         packets = await task
     finally:
         task.cancel()

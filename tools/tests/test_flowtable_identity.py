@@ -155,7 +155,7 @@ async def test_flowtable_rename_identity(connections):
                 before = await r.state()
                 healthy(before)
                 tx_before = {d: await kernel_tx_packets(r.target, r.session, n) for d, n in names.items()}
-                transfers = await p.batch([0, 1], 256, 0.03125)
+                transfers = await p.batch([0, 1], 256, 0.015625)
                 after = await r.state()
                 healthy(after)
                 assert before["installs"] == after["installs"] and before["deletes"] == after["deletes"]

@@ -68,7 +68,13 @@ async def hardware(r, clients, expected, label):
     before = await r.state()
     old = translation_rows(before, expected)
     tx_before, cpu_before = await software_tx(r), await cpu(r)
-    reports = await clients.batch([0, 1], 256, 0.03125)
+    # 256 packets is the assertion below; the spacing only has to keep some
+    # wall-clock in the window so an event-driven retirement would have room
+    # to fire. It does not soak against a timer: nothing time-driven can
+    # retire a flow carrying continuous traffic, since idle expiry needs 30s
+    # and the spurious-retirement defect needs ninety plus a competing flow on
+    # the same tuple. Four seconds at 64/s, not eight at 32/s.
+    reports = await clients.batch([0, 1], 256, 0.015625)
     cpu_after, tx_after = await cpu(r), await software_tx(r)
     after = await r.state()
     new = translation_rows(after, expected)
