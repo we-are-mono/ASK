@@ -19,11 +19,35 @@ typedef uint64_t u64;
 #define ENTRY_VALID 1
 #define NETREG_REGISTERED 1
 #define FFTYPE_IPV4 1
+#define FFTYPE_IPV6 2
 #define CONNTRACK_ORIG 1
+#define CONNTRACK_DNAT 0x10
 #define CONNTRACK_NAT 0x20
+#define CONNTRACK_SNAT CONNTRACK_NAT
 #define GFP_KERNEL 0
 #define EN_EHASH_DELETE_UNSYNCED -2
 #define HASH_CT(s,d,sp,dp,proto) ((proto) * 13)
+#define HASH_CT6(s,d,sp,dp,proto) ((proto) * 17)
+union nf_inet_addr {
+    u32 all[4];
+    __be32 ip;
+    __be32 ip6[4];
+    struct in_addr in;
+    struct in6_addr in6;
+};
+static bool ipv6_addr_equal(const struct in6_addr *a, const struct in6_addr *b)
+{ return !memcmp(a, b, sizeof(*a)); }
+static bool nf_inet_addr_cmp_local(const union nf_inet_addr *a, const union nf_inet_addr *b)
+{ return !memcmp(a->all, b->all, sizeof(a->all)); }
+static union nf_inet_addr v4(__be32 address)
+{ union nf_inet_addr a; memset(&a, 0, sizeof(a)); a.ip = address; return a; }
+static union nf_inet_addr v6(u32 tail)
+{
+    union nf_inet_addr a;
+    memset(&a, 0, sizeof(a));
+    a.ip6[0] = htonl(0xfc00dead); a.ip6[3] = htonl(tail);
+    return a;
+}
 #define ether_addr_copy(a,b) memcpy(a,b,6)
 #define lockdep_assert_held(m) assert(*(m))
 #define pr_err(...) ((void)0)
@@ -98,8 +122,20 @@ typedef struct CtEntry {
     RouteEntry *pRtEntry;
     struct hw_ct *ct;
     unsigned fftype, status, proto, hash;
-    __be32 Saddr_v4, Daddr_v4, twin_Saddr, twin_Daddr;
-    __be16 Sport, Dport, twin_Sport, twin_Dport;
+    __be16 Sport, Dport;
+    /* The real hardware-visible overlay, byte for byte: an IPv6 destination
+     * occupies exactly the words IPv4 uses for its twin mirror, so writing any
+     * twin_* field on an IPv6 entry corrupts its own destination address.
+     * Reproducing the overlap here is the point -- a harness with separate
+     * fields would let that bug through. */
+    union {
+        struct {
+            __be32 Saddr_v4, Daddr_v4, unused1, unused2, twin_Saddr, twin_Daddr;
+            __be16 twin_Sport, twin_Dport;
+            __be32 unused3;
+        };
+        struct { __be32 Saddr_v6[4], Daddr_v6[4]; };
+    };
 } CtEntry, *PCtEntry;
 static struct itf in_itf = {129, 1}, out_itf = {129, 2};
 typedef struct { struct itf *itf; unsigned flags; } OnifDesc, *POnifDesc;
@@ -116,7 +152,8 @@ static unsigned cdx_ehash_quarantine_pending(void) { return legacy_pending; }
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
 static int delete_result;
-static __be32 expected_src, expected_dst;
+static union nf_inet_addr expected_src, expected_dst;
+static u8 expected_family = AF_INET;
 static __be16 expected_sport, expected_dport;
 static unsigned expected_proto = IPPROTO_UDP;
 static bool expected_hairpin;
@@ -125,17 +162,36 @@ static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
 static int insert_entry_in_classif_table(PCtEntry ct)
 {
     assert(!memcmp((expected_hairpin ? in_iface : out_iface).eth_info.mac_addr, (u8[]){2,0,0,0,0,0}, 6));
-    assert(ct->fftype == FFTYPE_IPV4 && ct->proto == expected_proto);
-    assert(ct->hash == expected_proto * 13 && ct->twin->proto == expected_proto);
-    assert(ct->Saddr_v4 == htonl(0xc0000201) && ct->Daddr_v4 == htonl(0xc6336401));
+    assert(ct->proto == expected_proto && ct->twin->proto == expected_proto);
     assert(ct->Sport == htons(1234) && ct->Dport == htons(5678));
-    assert(ct->twin_Saddr == expected_dst && ct->twin_Daddr == expected_src);
-    assert(ct->twin_Sport == expected_dport && ct->twin_Dport == expected_sport);
-    assert(ct->twin->Saddr_v4 == expected_dst && ct->twin->Daddr_v4 == expected_src);
+    /* Ports always come from the twin object, in both families. */
     assert(ct->twin->Sport == expected_dport && ct->twin->Dport == expected_sport && ct->twin->twin == ct);
-    bool nat = expected_src != ct->Saddr_v4 || expected_dst != ct->Daddr_v4 ||
-               expected_sport != ct->Sport || expected_dport != ct->Dport;
-    assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0)));
+    if (expected_family == AF_INET6) {
+        union nf_inet_addr source = v6(0x201), destination = v6(0x401);
+
+        assert(ct->fftype == FFTYPE_IPV6 && ct->hash == expected_proto * 17);
+        assert(!memcmp(ct->Saddr_v6, source.ip6, 16));
+        /* The overlay trap: an intact destination proves no twin_* field was
+         * written over its second half. */
+        assert(!memcmp(ct->Daddr_v6, destination.ip6, 16));
+        assert(!memcmp(ct->twin->Saddr_v6, expected_dst.ip6, 16));
+        assert(!memcmp(ct->twin->Daddr_v6, expected_src.ip6, 16));
+        unsigned expected_status = CONNTRACK_ORIG;
+        if (!nf_inet_addr_cmp_local(&expected_src, &source) || expected_sport != ct->Sport)
+            expected_status |= CONNTRACK_SNAT;
+        if (!nf_inet_addr_cmp_local(&expected_dst, &destination) || expected_dport != ct->Dport)
+            expected_status |= CONNTRACK_DNAT;
+        assert(ct->status == expected_status);
+    } else {
+        assert(ct->fftype == FFTYPE_IPV4 && ct->hash == expected_proto * 13);
+        assert(ct->Saddr_v4 == htonl(0xc0000201) && ct->Daddr_v4 == htonl(0xc6336401));
+        assert(ct->twin_Saddr == expected_dst.ip && ct->twin_Daddr == expected_src.ip);
+        assert(ct->twin_Sport == expected_dport && ct->twin_Dport == expected_sport);
+        assert(ct->twin->Saddr_v4 == expected_dst.ip && ct->twin->Daddr_v4 == expected_src.ip);
+        bool nat = expected_src.ip != ct->Saddr_v4 || expected_dst.ip != ct->Daddr_v4 ||
+                   expected_sport != ct->Sport || expected_dport != ct->Dport;
+        assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0)));
+    }
     assert(ct->pRtEntry->itf == (expected_hairpin ? &in_itf : &out_itf) && ct->pRtEntry->input_itf == &in_itf);
     assert(ct->pRtEntry->underlying_input_itf == &in_itf && ct->pRtEntry->mtu == 1200);
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
@@ -178,7 +234,7 @@ static void test_backend(void)
     struct net_device out = in;
     strcpy(out.name, "out");
     in_iface.eth_info.net_dev = &in; out_iface.eth_info.net_dev = &out;
-    struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
+    struct cdx_ft_rule rule = { .in=&in, .out=&out, .family=AF_INET, .src.ip=htonl(0xc0000201), .dst.ip=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
@@ -229,8 +285,8 @@ static void test_backend(void)
     /* Exercise same-port translation through the provider's real admission
      * entry point as well as the lower encoder and adapter decoder. */
     rule.out = &in; expected_hairpin = true;
-    rule.new_src = expected_src = htonl(0xcb007104);
-    rule.new_dst = expected_dst = htonl(0xcb007105);
+    rule.new_src = expected_src = v4(htonl(0xcb007104));
+    rule.new_dst = expected_dst = v4(htonl(0xcb007105));
     rule.new_sport = expected_sport = htons(40000);
     rule.new_dport = expected_dport = htons(30000);
     assert(cdx_ft_add(&rule,&hw) == 0 && ft_live == 1);
@@ -294,7 +350,7 @@ static void test_backend(void)
 int main(void)
 {
     struct net_device in = { .name = "in" }, out = { .name = "out" };
-    struct cdx_ft_rule rule = { .in=&in, .out=&out, .src=htonl(0xc0000201), .dst=htonl(0xc6336401),
+    struct cdx_ft_rule rule = { .in=&in, .out=&out, .family=AF_INET, .src.ip=htonl(0xc0000201), .dst.ip=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
@@ -319,8 +375,8 @@ int main(void)
         expected_hairpin = variant == 7;
         rule.out = expected_hairpin ? &in : &out;
         rule.proto = expected_proto = i < 8 ? IPPROTO_UDP : IPPROTO_TCP;
-        rule.new_src = expected_src = variant == 0 || variant == 4 || variant >= 6 ? htonl(0xcb007104) : rule.src;
-        rule.new_dst = expected_dst = variant == 1 || variant == 5 || variant >= 6 ? htonl(0xcb007104) : rule.dst;
+        rule.new_src = expected_src = variant == 0 || variant == 4 || variant >= 6 ? v4(htonl(0xcb007104)) : rule.src;
+        rule.new_dst = expected_dst = variant == 1 || variant == 5 || variant >= 6 ? v4(htonl(0xcb007104)) : rule.dst;
         rule.new_sport = expected_sport = variant == 2 || variant == 4 || variant >= 6 ? htons(40000) : rule.sport;
         rule.new_dport = expected_dport = variant == 3 || variant == 5 || variant >= 6 ? htons(40000) : rule.dport;
         assert(cdx_ft_hw_add(&rule,&hw) == 0);
@@ -328,6 +384,27 @@ int main(void)
         fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
     }
     expected_hairpin = false; rule.out = &out;
+    /* The same translation matrix one family over. The encoder gates each
+     * IPv6 rewrite on its own status bit instead of comparing addresses, and
+     * every twin_* field it must not touch overlays the destination address,
+     * so both halves are checked on each variant by the insert callback. */
+    expected_family = rule.family = AF_INET6;
+    rule.src = v6(0x201); rule.dst = v6(0x401);
+    for (unsigned i = 0; i < 16; i++) {
+        unsigned variant = i % 8;
+        rule.proto = expected_proto = i < 8 ? IPPROTO_UDP : IPPROTO_TCP;
+        rule.new_src = expected_src = variant == 0 || variant == 4 || variant >= 6 ? v6(0x104) : rule.src;
+        rule.new_dst = expected_dst = variant == 1 || variant == 5 || variant >= 6 ? v6(0x105) : rule.dst;
+        rule.new_sport = expected_sport = variant == 2 || variant == 4 || variant >= 6 ? htons(40000) : rule.sport;
+        rule.new_dport = expected_dport = variant == 3 || variant == 5 || variant >= 6 ? htons(40000) : rule.dport;
+        assert(cdx_ft_hw_add(&rule,&hw) == 0);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    }
+    /* An unrecognised family is refused rather than silently encoded as IPv4. */
+    rule.family = AF_UNSPEC; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP && !hw);
+    expected_family = rule.family = AF_INET;
+    rule.src = v4(htonl(0xc0000201)); rule.dst = v4(htonl(0xc6336401));
+    rule.proto = expected_proto = IPPROTO_UDP;
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     assert(cdx_ft_hw_add(&rule,&hw)==0);

@@ -15,12 +15,70 @@ typedef uint32_t u32, __be32;
 typedef uint64_t u64, atomic64_t;
 #define __force
 static u32 rol32(u32 v, unsigned n) { return (v << n) | (v >> (32 - n)); }
+#define fallthrough __attribute__((fallthrough))
 #include "flowtable_hash.inc"
 static u32 get_random_u32(void) { return 0x87654321; }
 #define ETH_ALEN 6
 #define ETH_P_IP 0x0800
+#define ETH_P_IPV6 0x86dd
 #define ETH_P_ALL 3
+#define IPV6_MIN_MTU 1280
 #define BIT(n) (1UL << (n))
+#define BIT_ULL(n) (1ULL << (n))
+/* struct in6_addr and in_addr come from <arpa/inet.h>, with the same field
+ * names the kernel uses. Same shape as the kernel's UAPI union, which is what
+ * makes a conntrack tuple and a cdx_ft_rule address comparable without
+ * transcription. */
+union nf_inet_addr {
+    u32 all[4];
+    __be32 ip;
+    __be32 ip6[4];
+    struct in_addr in;
+    struct in6_addr in6;
+};
+static bool nf_inet_addr_cmp(const union nf_inet_addr *a, const union nf_inet_addr *b)
+{ return !memcmp(a->all, b->all, sizeof(a->all)); }
+/* An IPv4 value in the union always leaves the remaining words zero, and the
+ * assertions below check that rather than only the first word: a decoder that
+ * left stale bytes in the unused arm would mis-key every flow. */
+static union nf_inet_addr v4(__be32 address)
+{ union nf_inet_addr a; memset(&a, 0, sizeof(a)); a.ip = address; return a; }
+static bool is4(const union nf_inet_addr *a, __be32 address)
+{ union nf_inet_addr expected = v4(address); return nf_inet_addr_cmp(a, &expected); }
+#define IPV6_ADDR_ANY 0x0000U
+#define IPV6_ADDR_UNICAST 0x0001U
+#define IPV6_ADDR_MULTICAST 0x0002U
+#define IPV6_ADDR_LOOPBACK 0x0010U
+#define IPV6_ADDR_LINKLOCAL 0x0020U
+#define IPV6_ADDR_COMPATv4 0x0080U
+#define IPV6_ADDR_MAPPED 0x1000U
+/* The subset of __ipv6_addr_type() the decoder can actually observe. */
+static int ipv6_addr_type(const struct in6_addr *a)
+{
+    if (a->s6_addr[0] == 0xff) return IPV6_ADDR_MULTICAST;
+    if ((a->s6_addr[0] == 0xfe) && ((a->s6_addr[1] & 0xc0) == 0x80))
+        return IPV6_ADDR_UNICAST | IPV6_ADDR_LINKLOCAL;
+    if (!a->s6_addr32[0] && !a->s6_addr32[1] && !a->s6_addr32[2]) {
+        if (!a->s6_addr32[3]) return IPV6_ADDR_ANY;
+        if (a->s6_addr32[3] == htonl(1))
+            return IPV6_ADDR_UNICAST | IPV6_ADDR_LOOPBACK;
+        return IPV6_ADDR_UNICAST | IPV6_ADDR_COMPATv4;
+    }
+    if (!a->s6_addr32[0] && !a->s6_addr32[1] && a->s6_addr32[2] == htonl(0xffff))
+        return IPV6_ADDR_UNICAST | IPV6_ADDR_MAPPED;
+    return IPV6_ADDR_UNICAST;
+}
+static bool ipv6_prefix_equal(const struct in6_addr *a, const struct in6_addr *b,
+                              unsigned prefixlen)
+{
+    unsigned whole = prefixlen / 8, bits = prefixlen & 7;
+
+    assert(prefixlen <= 128);
+    if (whole && memcmp(a->s6_addr, b->s6_addr, whole)) return false;
+    if (bits && ((a->s6_addr[whole] ^ b->s6_addr[whole]) >> (8 - bits))) return false;
+    return true;
+}
+struct ipv6hdr { u8 prefix[8]; struct in6_addr saddr, daddr; };
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -61,6 +119,7 @@ struct iphdr { u8 prefix[12]; __be32 saddr, daddr; };
 #define NUD_INCOMPLETE 1
 #define NETEVENT_NEIGH_UPDATE 1
 #define NETEVENT_IPV4_ROUTE_UPDATE 7
+#define NETEVENT_IPV6_ROUTE_UPDATE 8
 enum { FIB_EVENT_ENTRY_REPLACE, FIB_EVENT_ENTRY_APPEND, FIB_EVENT_ENTRY_ADD,
        FIB_EVENT_ENTRY_DEL, FIB_EVENT_RULE_ADD, FIB_EVENT_RULE_DEL, FIB_EVENT_NH_ADD, FIB_EVENT_NH_DEL };
 enum { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU, NETDEV_CHANGEADDR,
@@ -69,6 +128,7 @@ enum { NEXTHOP_EVENT_DEL, NEXTHOP_EVENT_REPLACE, NEXTHOP_EVENT_RES_TABLE_PRE_REP
        NEXTHOP_EVENT_BUCKET_REPLACE, NEXTHOP_EVENT_HW_STATS_REPORT_DELTA };
 struct fib_notifier_info { int family; };
 struct netevent_ipv4_route { struct net *net; __be32 dst; u8 prefixlen; };
+struct netevent_ipv6_route { struct net *net; struct in6_addr dst; u8 prefixlen; };
 static __be32 inet_make_mask(unsigned plen) { assert(plen <= 32); return htonl(plen ? ~0U << (32 - plen) : 0); }
 #define NOTIFY_DONE 0
 #define cmpxchg(p, old, new) ({ typeof(*(p)) v = *(p); if (v == (old)) *(p) = (new); v; })
@@ -138,23 +198,45 @@ struct dst_entry {
     struct dst_ops *ops;
     struct net_device *dev;
     void *xfrm, *lwtstate;
+    int error;
+    u32 cookie;
     bool valid;
 };
 struct rtable { struct dst_entry dst; unsigned rt_type, rt_gw_family; __be32 rt_gw4; };
+/* Only the fields the decoder reads; rt6i_dst is what an RTF_CACHE route
+ * names as its own next hop. */
+struct rt6_info { struct dst_entry dst; unsigned rt6i_flags;
+    struct in6_addr rt6i_gateway; struct { struct in6_addr addr; } rt6i_dst; };
 #define RTN_UNICAST 1
+#define RTF_GATEWAY 0x0002
+#define RTF_REJECT 0x0200
+#define RTF_ANYCAST 0x00100000
+#define RTF_CACHE 0x01000000
+#define RTF_LOCAL 0x80000000
 #define dst_xfrm(d) ((d)->xfrm)
 #define dst_rtable(d) ((struct rtable *)(d))
-static struct dst_entry *dst_check(struct dst_entry *d, unsigned cookie)
-{ assert(!cookie); return d->valid ? d : NULL; }
+#define dst_rt6_info(d) ((struct rt6_info *)(d))
+/* IPv4 ignores the cookie; IPv6 pins the destination to one FIB generation
+ * and a mismatch must reject it, which is the whole reason the adapter has
+ * to be handed the cookie its route was selected under. */
+static struct dst_entry *dst_check(struct dst_entry *d, u32 cookie)
+{ return d->valid && d->cookie == cookie ? d : NULL; }
 static __be32 rt_nexthop(const struct rtable *r, __be32 address)
 { return r->rt_gw_family == AF_INET ? r->rt_gw4 : address; }
-struct neigh_table { int unused; };
-static struct neigh_table arp_tbl;
+static const struct in6_addr *rt6_nexthop(const struct rt6_info *r,
+                                          const struct in6_addr *address)
+{
+    if (r->rt6i_flags & RTF_GATEWAY) return &r->rt6i_gateway;
+    if (r->rt6i_flags & RTF_CACHE) return &r->rt6i_dst.addr;
+    return address;
+}
+struct neigh_table { unsigned key_len; };
+static struct neigh_table arp_tbl = { .key_len = 4 }, nd_tbl = { .key_len = 16 };
 struct neighbour {
     struct neigh_table *tbl;
     struct net_device *dev;
     unsigned refs, nud_state;
-    __be32 primary_key;
+    union nf_inet_addr primary_key;
     bool dead, lock;
     u8 ha[6];
 };
@@ -168,13 +250,15 @@ static void read_unlock_bh(bool *lock) { assert(*lock); *lock = false; }
 #define spin_unlock_bh read_unlock_bh
 struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh, use_hw_handles, flow_block_lock; };
 struct nf_conntrack_tuple {
-    struct { struct { __be32 ip; } u3; union { __be16 all; } u; } src, dst;
+    struct { union nf_inet_addr u3; union { __be16 all; } u; u16 l3num; } src;
+    struct { union nf_inet_addr u3; union { __be16 all; } u; } dst;
 };
 struct nf_conn_nat { int masq_index; };
 struct nf_conn { struct net *net; unsigned zone[2], mark, status, protonum, tcp_state;
     struct { struct nf_conntrack_tuple tuple; } tuplehash[2]; struct nf_conn_nat *nat; };
 #define nfct_nat(c) ((c)->nat)
 #define nf_ct_protonum(c) ((c)->protonum)
+#define nf_ct_l3num(c) ((c)->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num)
 static bool nf_conntrack_tcp_established(const struct nf_conn *c)
 { return c->tcp_state == TCP_CONNTRACK_ESTABLISHED && (c->status & IPS_ASSURED); }
 #define nf_ct_net(c) ((c)->net)
@@ -190,24 +274,37 @@ static bool is_valid_ether_addr(const u8 *a)
 #define ipv4_is_loopback(a) ((ntohl(a) & 0xff000000) == 0x7f000000)
 #define ipv4_is_lbcast(a) ((a) == htonl(0xffffffff))
 enum { FLOW_DISSECTOR_KEY_META, FLOW_DISSECTOR_KEY_CONTROL, FLOW_DISSECTOR_KEY_BASIC,
-       FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_PORTS, FLOW_DISSECTOR_KEY_TCP };
-struct flow_dissector { unsigned long used_keys; };
+       FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_IPV6_ADDRS,
+       FLOW_DISSECTOR_KEY_PORTS, FLOW_DISSECTOR_KEY_TCP };
+struct flow_dissector { unsigned long long used_keys; };
+/* Spelled out rather than a literal: adding a dissector key shifts every bit
+ * above it, and a stale literal would quietly describe a different key set. */
+#define FT_KEYS(addrs) (BIT_ULL(FLOW_DISSECTOR_KEY_META) | BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | \
+                        BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) | BIT_ULL(addrs) | \
+                        BIT_ULL(FLOW_DISSECTOR_KEY_PORTS))
+#define FT_KEYS4 FT_KEYS(FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+#define FT_KEYS6 FT_KEYS(FLOW_DISSECTOR_KEY_IPV6_ADDRS)
 struct meta { int ingress_ifindex; u16 ingress_iftype; u8 l2_miss; };
 struct control { u16 thoff, addr_type; u32 flags; };
 struct basic { __be16 n_proto; u8 ip_proto, padding; };
 struct ipv4_addrs { __be32 src, dst; };
+struct ipv6_addrs { struct in6_addr src, dst; };
 struct ports { __be16 src, dst; };
 struct tcp { __be16 flags; };
 #define MATCH(t) struct flow_match_##t { struct t *key, *mask; }
-MATCH(meta); MATCH(control); MATCH(basic); MATCH(ipv4_addrs); MATCH(ports);
-MATCH(tcp);
-enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACTION_CSUM, FLOW_ACT_MANGLE_HDR_TYPE_IP4, FLOW_ACT_MANGLE_HDR_TYPE_UDP, FLOW_ACT_MANGLE_HDR_TYPE_TCP, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
+MATCH(meta); MATCH(control); MATCH(basic); MATCH(ipv4_addrs); MATCH(ipv6_addrs);
+MATCH(ports); MATCH(tcp);
+enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACTION_CSUM };
+enum flow_action_mangle_base { FLOW_ACT_MANGLE_HDR_TYPE_IP4, FLOW_ACT_MANGLE_HDR_TYPE_IP6,
+       FLOW_ACT_MANGLE_HDR_TYPE_UDP, FLOW_ACT_MANGLE_HDR_TYPE_TCP, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
 struct flow_action_entry {
     unsigned id, csum_flags;
     struct { unsigned htype, offset; u32 mask, val; } mangle;
     struct net_device *dev;
 };
-struct flow_action { unsigned num_entries; struct flow_action_entry entries[10]; };
+/* An IPv6 translation spends five actions per edit, so both edits plus the
+ * Ethernet rewrites and the redirect need more room than IPv4 ever did. */
+struct flow_action { unsigned num_entries; struct flow_action_entry entries[16]; };
 struct flow_rule {
     struct { struct flow_dissector *dissector; } match;
     struct flow_action action;
@@ -215,12 +312,13 @@ struct flow_rule {
     struct flow_match_control control;
     struct flow_match_basic basic;
     struct flow_match_ipv4_addrs ipv4_addrs;
+    struct flow_match_ipv6_addrs ipv6_addrs;
     struct flow_match_ports ports;
     struct flow_match_tcp tcp;
 };
 #define GETMATCH(t) static void flow_rule_match_##t(struct flow_rule *r, struct flow_match_##t *m) { *m = r->t; }
-GETMATCH(meta) GETMATCH(control) GETMATCH(basic) GETMATCH(ipv4_addrs) GETMATCH(ports)
-GETMATCH(tcp)
+GETMATCH(meta) GETMATCH(control) GETMATCH(basic) GETMATCH(ipv4_addrs)
+GETMATCH(ipv6_addrs) GETMATCH(ports) GETMATCH(tcp)
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
 struct nf_flow_offload_handle { unsigned refs; bool invalid; };
 static struct nf_flow_offload_handle handle;
@@ -236,6 +334,7 @@ struct flow_cls_offload {
     const struct nf_conn *nf_ct;
     struct dst_entry *nf_dst, *nf_dst_reverse;
     struct nf_flow_offload_handle *nf_handle;
+    u32 nf_dst_cookie, nf_dst_reverse_cookie;
     unsigned command;
     u16 nf_mtu;
     bool nf_counter;
@@ -317,15 +416,18 @@ static int atomic_read(int *v) { return *v; }
 static void atomic_set(int *v, int n) { *v = n; }
 static void ft_invalidate(void) { ft_invalid = 1; }
 static bool cdx_ft_port_supported(struct net_device *d) { return d && physical_ok; }
-static struct neighbour *neigh_lookup(struct neigh_table *table, const __be32 *dst, struct net_device *dev)
+/* Both tables read key_len bytes from the front of the address union, so the
+ * caller hands over the same pointer for either family. */
+static struct neighbour *neigh_lookup(struct neigh_table *table, const void *dst, struct net_device *dev)
 {
     neigh_lookups++;
     if (!neigh_ok) return NULL;
-    assert(table == &arp_tbl);
+    assert(table == &arp_tbl || table == &nd_tbl);
     struct neighbour *all[] = {&neighbour, &gateway, &alternate_gateway};
     for (unsigned i = 0; i < ARRAY_SIZE(all); i++) {
         struct neighbour *n = all[i];
-        if (n->primary_key != *dst || n->dev != dev) continue;
+        if (n->tbl != table || memcmp(&n->primary_key, dst, table->key_len) ||
+            n->dev != dev) continue;
         if (change_neigh_on_lookup && neigh_lookups == 2) n->ha[5]++;
         n->refs++;
         return n;
@@ -460,8 +562,20 @@ static struct net_device in = { .ifindex = 5, .mtu = 1500, .dev_addr = {2, 0, 0,
 static struct net_device out = { .ifindex = 6, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2} };
 static struct cdx_ft_binding binding = { .dev = &in };
 static struct dst_ops ipv4_ops = { .family = AF_INET };
+static struct dst_ops ipv6_ops6 = { .family = AF_INET6 };
 static struct rtable route, reverse_route;
-static __be32 next_hop;
+static struct rt6_info route6, reverse_route6;
+static struct ipv6_addrs i6k, i6m;
+static struct in6_addr addr6(u32 prefix, u32 tail)
+{
+    struct in6_addr a;
+
+    memset(&a, 0, sizeof(a));
+    a.s6_addr32[0] = htonl(prefix);
+    a.s6_addr32[3] = htonl(tail);
+    return a;
+}
+static union nf_inet_addr next_hop;
 static struct nf_conn ct;
 static struct flow_dissector dissector;
 static struct flow_rule rule;
@@ -479,17 +593,20 @@ static void fixture(void)
     assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && ft_neigh_entries.next == &ft_neigh_entries);
     neighbour = (struct neighbour){ .tbl = &arp_tbl, .nud_state = NUD_PERMANENT,
                                   .ha = {2,0x11,0x22,0x33,0x44,0x55}, .dev = &out,
-                                  .primary_key = htonl(0xc6336402) };
+                                  .primary_key.ip = htonl(0xc6336402) };
     gateway = alternate_gateway = neighbour;
-    gateway.primary_key = htonl(0xc6336401);
-    alternate_gateway.primary_key = htonl(0xc6336403);
+    gateway.primary_key.ip = htonl(0xc6336401);
+    alternate_gateway.primary_key.ip = htonl(0xc6336403);
     route = (struct rtable){ .dst = { .ops = &ipv4_ops, .dev = &out, .valid = true },
                              .rt_type = RTN_UNICAST };
     reverse_route = route;
     reverse_route.dst.dev = &in;
     neigh_lookups = 0;
-    ct = (struct nf_conn){ .net = &init_net, .protonum = IPPROTO_UDP };
-    dissector.used_keys = 31;
+    /* l3num on both tuples: the decoder requires the conntrack's family to
+     * agree with the one the dissector described. */
+    ct = (struct nf_conn){ .net = &init_net, .protonum = IPPROTO_UDP,
+        .tuplehash = { { .tuple.src.l3num = AF_INET }, { .tuple.src.l3num = AF_INET } } };
+    dissector.used_keys = FT_KEYS4;
     mk = (struct meta){ .ingress_ifindex = 5 }; mm = (struct meta){ .ingress_ifindex = -1 };
     ck = (struct control){ .addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS };
     cm = (struct control){ .addr_type = 0xffff };
@@ -518,6 +635,212 @@ static void fixture(void)
         .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
 }
+/* The IPv4 fixture converted one family over: same devices, same Ethernet
+ * rewrites and redirect, but IPv6 selectors, an rt6 destination carrying the
+ * cookie it was selected under, and a neighbour-discovery next hop. */
+#define V6_LAN 0x202
+#define V6_WAN 0x401
+#define V6_NAT 0x104
+static void fixture6(void)
+{
+    fixture();
+    dissector.used_keys = FT_KEYS6;
+    ck.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
+    bk.n_proto = htons(ETH_P_IPV6);
+    i6k = (struct ipv6_addrs){ addr6(0xfc00dead, V6_LAN), addr6(0xfc00beef, V6_WAN) };
+    memset(&i6m, 0xff, sizeof(i6m));
+    rule.ipv6_addrs = (struct flow_match_ipv6_addrs){ &i6k, &i6m };
+    ct.tuplehash[0].tuple = (struct nf_conntrack_tuple){
+        .src = { .u3.in6 = i6k.src, .u.all = pk.src, .l3num = AF_INET6 },
+        .dst = { .u3.in6 = i6k.dst, .u.all = pk.dst } };
+    ct.tuplehash[1].tuple = (struct nf_conntrack_tuple){
+        .src = { .u3.in6 = i6k.dst, .u.all = pk.dst, .l3num = AF_INET6 },
+        .dst = { .u3.in6 = i6k.src, .u.all = pk.src } };
+    route6 = (struct rt6_info){ .dst = { .ops = &ipv6_ops6, .dev = &out, .valid = true,
+                                         .cookie = 0x5e1 } };
+    reverse_route6 = route6;
+    reverse_route6.dst.dev = &in;
+    cls.nf_dst = &route6.dst; cls.nf_dst_reverse = &reverse_route6.dst;
+    cls.nf_dst_cookie = cls.nf_dst_reverse_cookie = 0x5e1;
+    neighbour.tbl = &nd_tbl;
+    neighbour.primary_key = (union nf_inet_addr){ .in6 = i6k.dst };
+    gateway = alternate_gateway = neighbour;
+    /* A real IPv6 gateway is link-local, which a flow endpoint may never be. */
+    gateway.primary_key.in6 = addr6(0xfe800000, 1);
+    alternate_gateway.primary_key.in6 = addr6(0xfe800000, 2);
+}
+
+/* Lay out one native IPv6 source translation: four address words then the
+ * port, where IPv4 spends one word and appends a checksum action. */
+static void nat6_fixture(void)
+{
+    union nf_inet_addr translated = { .in6 = addr6(0xfc00beef, V6_NAT) };
+
+    fixture6();
+    ct.status = IPS_SRC_NAT | IPS_SRC_NAT_DONE;
+    ct.tuplehash[1].tuple.dst = (typeof(ct.tuplehash[1].tuple.dst)){
+        .u3 = translated, .u.all = htons(40000) };
+    for (unsigned i = 0; i < 4; i++) {
+        rule.action.entries[4 + i] = (struct flow_action_entry){
+            .id = FLOW_ACTION_MANGLE,
+            .mangle = { .htype = FLOW_ACT_MANGLE_HDR_TYPE_IP6,
+                        .offset = offsetof(struct ipv6hdr, saddr) + i * 4,
+                        .val = translated.all[i] } };
+    }
+    rule.action.entries[8] = (struct flow_action_entry){
+        .id = FLOW_ACTION_MANGLE,
+        .mangle = { .htype = FLOW_ACT_MANGLE_HDR_TYPE_UDP,
+                    .mask = ~htonl(0xffff0000), .val = htonl(40000u << 16) } };
+    rule.action.entries[9] = (struct flow_action_entry){ .id = FLOW_ACTION_REDIRECT, .dev = &out };
+    rule.action.num_entries = 10;
+}
+
+static void test_ipv6(void)
+{
+    struct cdx_ft_rule decoded;
+    union nf_inet_addr expected;
+
+    fixture6();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.family == AF_INET6 && decoded.proto == IPPROTO_UDP);
+    expected = (union nf_inet_addr){ .in6 = i6k.src };
+    assert(nf_inet_addr_cmp(&decoded.src, &expected));
+    expected = (union nf_inet_addr){ .in6 = i6k.dst };
+    assert(nf_inet_addr_cmp(&decoded.dst, &expected) &&
+           nf_inet_addr_cmp(&decoded.new_dst, &expected));
+    /* On-link: the destination is its own next hop. Without NAT the
+     * translated tuple must equal the match in every word. */
+    assert(nf_inet_addr_cmp(&next_hop, &expected));
+    assert(nf_inet_addr_cmp(&decoded.src, &decoded.new_src));
+    assert(decoded.new_sport == pk.src && decoded.new_dport == pk.dst);
+    assert(decoded.mtu == 1492 && decoded.in == &in && decoded.out == &out);
+
+    /* An IPv6 destination is only valid for the FIB generation it was chosen
+     * in. Admission is handed that cookie; a zero one rejects every route. */
+    fixture6(); cls.nf_dst_cookie = 0;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    fixture6(); route6.dst.cookie = 0x5e2;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    fixture6(); cls.nf_dst_reverse_cookie = 0;
+    assert(!ft_routes_valid(&cls));
+
+    /* A link-local gateway is a usable next hop even though it could never be
+     * a flow endpoint. */
+    fixture6(); route6.rt6i_flags = RTF_GATEWAY;
+    route6.rt6i_gateway = gateway.primary_key.in6;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(nf_inet_addr_cmp(&next_hop, &gateway.primary_key) && !gateway.refs);
+    for (unsigned flag = 0; flag < 3; flag++) {
+        fixture6();
+        route6.rt6i_flags = (unsigned[]){RTF_REJECT, RTF_LOCAL, RTF_ANYCAST}[flag];
+        assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    }
+    fixture6(); route6.dst.error = -ENETUNREACH;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    fixture6(); route6.dst.ops = &ipv4_ops;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+
+#define V6_REJECT(...) do { fixture6(); __VA_ARGS__; \
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+    /* Endpoints must be routable between the two ports. */
+    V6_REJECT(i6k.src = addr6(0xfe800000, 3));
+    V6_REJECT(i6k.dst = addr6(0xff020000, 1));
+    V6_REJECT(memset(&i6k.src, 0, sizeof(i6k.src)));
+    V6_REJECT(i6k.dst = (struct in6_addr){ .s6_addr32 = { 0, 0, htonl(0xffff), htonl(1) } });
+    /* Exact masks only, in every word. */
+    for (unsigned word = 0; word < 4; word++) {
+        V6_REJECT(i6m.src.s6_addr32[word] = 0);
+        V6_REJECT(i6m.dst.s6_addr32[word] = 0);
+    }
+    /* IPv6 cannot be described by the IPv4 selectors, or the other way round. */
+    V6_REJECT(dissector.used_keys = FT_KEYS4);
+    V6_REJECT(dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS));
+    V6_REJECT(ck.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS);
+    V6_REJECT(bk.n_proto = htons(ETH_P_IP));
+    V6_REJECT(ct.tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num = AF_INET);
+    /* IPv6 never fragments in transit, so the floor is its minimum link MTU. */
+    V6_REJECT(cls.nf_mtu = IPV6_MIN_MTU - 1);
+    fixture6(); cls.nf_mtu = IPV6_MIN_MTU;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == IPV6_MIN_MTU);
+    /* The neighbour must be discovered in the IPv6 table. */
+    V6_REJECT(neighbour.tbl = &arp_tbl);
+#undef V6_REJECT
+
+    /* Translation: five actions per edit and no checksum action. */
+    nat6_fixture();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    expected = (union nf_inet_addr){ .in6 = addr6(0xfc00beef, V6_NAT) };
+    assert(nf_inet_addr_cmp(&decoded.new_src, &expected));
+    assert(decoded.new_sport == htons(40000) && decoded.new_dport == pk.dst);
+#define NAT6_REJECT(...) do { nat6_fixture(); __VA_ARGS__; \
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+    /* An IPv4-shaped translation, one word plus a checksum action, is not it. */
+    NAT6_REJECT(rule.action.entries[5] = rule.action.entries[8];
+                rule.action.entries[6] = (struct flow_action_entry){
+                    .id = FLOW_ACTION_CSUM, .csum_flags = 17 };
+                rule.action.entries[7] = rule.action.entries[9];
+                rule.action.num_entries = 8);
+    NAT6_REJECT(rule.action.entries[4].mangle.htype = FLOW_ACT_MANGLE_HDR_TYPE_IP4);
+    NAT6_REJECT(rule.action.entries[6].mangle.offset += 4);
+    NAT6_REJECT(rule.action.entries[7].mangle.val ^= 1);
+    NAT6_REJECT(rule.action.entries[4].mangle.mask = 1);
+    NAT6_REJECT(rule.action.num_entries = 9);
+#undef NAT6_REJECT
+
+    /* Installed IPv6 flows answer their own route notifications. */
+    fixture6();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    struct netevent_ipv6_route event = { .net = &init_net, .prefixlen = 64,
+                                        .dst = addr6(0xfc00beef, 0) };
+    struct net foreign_net;
+    u64 invalidations = ft_route_invalidations;
+    event.net = &foreign_net;
+    ft_neigh_event(NULL, NETEVENT_IPV6_ROUTE_UPDATE, &event);
+    event.net = &init_net;
+    event.dst = addr6(0xfc00cafe, 0);
+    ft_neigh_event(NULL, NETEVENT_IPV6_ROUTE_UPDATE, &event);
+    /* An IPv4 notification can never match an IPv6 flow, whatever it says. */
+    struct netevent_ipv4_route legacy = { .net = &init_net, .dst = 0, .prefixlen = 0 };
+    ft_neigh_event(NULL, NETEVENT_IPV4_ROUTE_UPDATE, &legacy);
+    assert(!handle.invalid && ft_route_invalidations == invalidations);
+    /* The current egress destination, matched on its prefix rather than whole. */
+    event.dst = addr6(0xfc00beef, 0);
+    ft_neigh_event(NULL, NETEVENT_IPV6_ROUTE_UPDATE, &event);
+    assert(handle.invalid && ft_route_invalidations == invalidations + 1 && !ft_invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs);
+
+    /* The reverse direction's egress is this flow's source, so a route change
+     * there retires it too even though only one direction is installed. */
+    fixture6();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    event.dst = addr6(0xfc00dead, 0);
+    ft_neigh_event(NULL, NETEVENT_IPV6_ROUTE_UPDATE, &event);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count);
+
+    /* A prefix length no address can have means the event cannot be matched
+     * selectively, so everything is retired. */
+    fixture6();
+    assert(ft_replace(&binding, &cls) == 0);
+    event.prefixlen = 129;
+    ft_neigh_event(NULL, NETEVENT_IPV6_ROUTE_UPDATE, &event);
+    assert(ft_invalid); ft_invalid = 0;
+    ft_remove(ft_find(&binding, cls.cookie));
+    assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated);
+
+    /* Neighbour discovery retires a flow exactly as ARP does. */
+    fixture6();
+    assert(ft_replace(&binding, &cls) == 0);
+    neighbour.ha[5]++;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated);
+    neighbour.tbl = &arp_tbl;
+}
+
 static void snat_fixture(bool forward, bool tcp)
 {
     fixture();
@@ -530,10 +853,10 @@ static void snat_fixture(bool forward, bool tcp)
         rule.tcp = (struct flow_match_tcp){ &tk, &tm };
     }
     ct.tuplehash[0].tuple = (struct nf_conntrack_tuple){
-        .src = { .u3.ip = ik.src, .u.all = pk.src },
+        .src = { .u3.ip = ik.src, .u.all = pk.src, .l3num = AF_INET },
         .dst = { .u3.ip = ik.dst, .u.all = pk.dst } };
     ct.tuplehash[1].tuple = (struct nf_conntrack_tuple){
-        .src = { .u3.ip = ik.dst, .u.all = pk.dst },
+        .src = { .u3.ip = ik.dst, .u.all = pk.dst, .l3num = AF_INET },
         .dst = { .u3.ip = htonl(0xcb007104), .u.all = htons(40000) } };
     rule.action.num_entries = 8;
     rule.action.entries[7] = rule.action.entries[4];
@@ -551,7 +874,7 @@ static void snat_fixture(bool forward, bool tcp)
     if (!forward) {
         ik = (struct ipv4_addrs){ htonl(0xc6336402), htonl(0xcb007104) };
         pk = (struct ports){ htons(20000), htons(40000) };
-        neighbour.primary_key = htonl(0xc0000202);
+        neighbour.primary_key.ip = htonl(0xc0000202);
     }
 }
 static void test_snat(void)
@@ -562,12 +885,12 @@ static void test_snat(void)
         bool forward = variant & 1, tcp = variant & 2;
         snat_fixture(forward, tcp);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-        assert(decoded.src == ik.src && decoded.dst == ik.dst);
-        assert(decoded.new_src == htonl(forward ? 0xcb007104 : 0xc6336402));
-        assert(decoded.new_dst == htonl(forward ? 0xc6336402 : 0xc0000202));
+        assert(is4(&decoded.src, ik.src) && is4(&decoded.dst, ik.dst));
+        assert(is4(&decoded.new_src, htonl(forward ? 0xcb007104 : 0xc6336402)));
+        assert(is4(&decoded.new_dst, htonl(forward ? 0xc6336402 : 0xc0000202)));
         assert(decoded.new_sport == htons(forward ? 40000 : 20000));
         assert(decoded.new_dport == htons(forward ? 20000 : 10000));
-        assert(next_hop == decoded.new_dst);
+        assert(nf_inet_addr_cmp(&next_hop, &decoded.new_dst));
 #define NAT_REJECT(change) do { snat_fixture(forward, tcp); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
         NAT_REJECT(ct.status = IPS_NAT_MASK | IPS_SRC_NAT_DONE);
         NAT_REJECT(ct.status = IPS_SRC_NAT);
@@ -609,7 +932,7 @@ static void test_snat(void)
         if (!forward) ik.dst = ct.tuplehash[1].tuple.dst.u3.ip;
         rule.action.entries[4].mangle.val = htonl(0xc0000202);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-        assert(decoded.src == decoded.new_src && decoded.dst == decoded.new_dst);
+        assert(nf_inet_addr_cmp(&decoded.src, &decoded.new_src) && nf_inet_addr_cmp(&decoded.dst, &decoded.new_dst));
         snat_fixture(forward, tcp);
         ct.tuplehash[1].tuple.dst.u.all = ct.tuplehash[0].tuple.src.u.all;
         if (!forward) pk.dst = htons(10000);
@@ -648,7 +971,7 @@ static void dnat_fixture(bool forward, bool tcp)
     const u8 masks[2][4] = {{0,0,0xff,0xff}, {0xff,0xff,0,0}};
     memcpy(&rule.action.entries[5].mangle.val, values[forward], 4);
     memcpy(&rule.action.entries[5].mangle.mask, masks[forward], 4);
-    neighbour.primary_key = htonl(forward ? 0xcb007104 : 0xc6336402);
+    neighbour.primary_key.ip = htonl(forward ? 0xcb007104 : 0xc6336402);
 }
 static void test_dnat(void)
 {
@@ -657,12 +980,12 @@ static void test_dnat(void)
         bool forward = variant & 1, tcp = variant & 2;
         dnat_fixture(forward, tcp);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-        assert(decoded.src == ik.src && decoded.dst == ik.dst);
-        assert(decoded.new_src == htonl(forward ? 0xc6336402 : 0xc0000202));
-        assert(decoded.new_dst == htonl(forward ? 0xcb007104 : 0xc6336402));
+        assert(is4(&decoded.src, ik.src) && is4(&decoded.dst, ik.dst));
+        assert(is4(&decoded.new_src, htonl(forward ? 0xc6336402 : 0xc0000202)));
+        assert(is4(&decoded.new_dst, htonl(forward ? 0xcb007104 : 0xc6336402)));
         assert(decoded.new_sport == htons(forward ? 20000 : 10000));
         assert(decoded.new_dport == htons(forward ? 40000 : 20000));
-        assert(next_hop == decoded.new_dst);
+        assert(nf_inet_addr_cmp(&next_hop, &decoded.new_dst));
 #define DNAT_REJECT(change) do { dnat_fixture(forward, tcp); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
         DNAT_REJECT(ct.status &= ~IPS_DST_NAT_DONE);
         DNAT_REJECT(ct.status |= IPS_SRC_NAT | IPS_SRC_NAT_DONE);
@@ -707,7 +1030,7 @@ static void double_nat_fixture(bool forward, bool tcp, bool hairpin)
         .mangle.htype = tcp ? FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP };
     memcpy(&rule.action.entries[7].mangle.val, values[forward], 4);
     memcpy(&rule.action.entries[7].mangle.mask, masks[forward], 4);
-    neighbour.primary_key = htonl(forward ? 0xcb007105 : 0xc0000202);
+    neighbour.primary_key.ip = htonl(forward ? 0xcb007105 : 0xc0000202);
     if (hairpin) {
         rule.action.entries[9].dev = &in;
         route.dst.dev = neighbour.dev = &in;
@@ -721,12 +1044,12 @@ static void test_double_nat(void)
         bool forward = variant & 1, tcp = variant & 2, hairpin = variant & 4;
         double_nat_fixture(forward, tcp, hairpin);
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-        assert(decoded.src == ik.src && decoded.dst == ik.dst);
-        assert(decoded.new_src == htonl(forward ? 0xcb007104 : 0xc6336402));
-        assert(decoded.new_dst == htonl(forward ? 0xcb007105 : 0xc0000202));
+        assert(is4(&decoded.src, ik.src) && is4(&decoded.dst, ik.dst));
+        assert(is4(&decoded.new_src, htonl(forward ? 0xcb007104 : 0xc6336402)));
+        assert(is4(&decoded.new_dst, htonl(forward ? 0xcb007105 : 0xc0000202)));
         assert(decoded.new_sport == htons(forward ? 40000 : 20000));
         assert(decoded.new_dport == htons(forward ? 30000 : 10000));
-        assert(next_hop == decoded.new_dst && decoded.in == &in);
+        assert(nf_inet_addr_cmp(&next_hop, &decoded.new_dst) && decoded.in == &in);
         assert(decoded.out == (hairpin ? &in : &out));
 #define DOUBLE_REJECT(change) do { double_nat_fixture(forward, tcp, hairpin); change; assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
         DOUBLE_REJECT(ct.status &= ~IPS_SRC_NAT_DONE);
@@ -920,13 +1243,13 @@ static void test_gateways(void)
     REJECT(route.rt_gw_family = AF_INET; route.rt_gw4 = 0xffffffff);
     for (unsigned cycle = 0; cycle < 32; cycle++) {
         if (cycle & 1) tcp_fixture(); else fixture();
-        route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+        route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key.ip;
         assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-        assert(decoded.dst == ik.dst && next_hop != decoded.dst);
-        assert(next_hop == gateway.primary_key && !gateway.refs && !neighbour.refs);
+        assert(is4(&decoded.dst, ik.dst) && !nf_inet_addr_cmp(&next_hop, &decoded.dst));
+        assert(nf_inet_addr_cmp(&next_hop, &gateway.primary_key) && !gateway.refs && !neighbour.refs);
         assert(ft_replace(&binding, &cls) == 0);
         struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
-        assert(e->next_hop == gateway.primary_key && e->neigh == &gateway);
+        assert(nf_inet_addr_cmp(&e->next_hop, &gateway.primary_key) && e->neigh == &gateway);
         assert(gateway.refs == 1 && !neighbour.refs);
         neighbour.nud_state = NUD_FAILED; /* Remote endpoint is not the dependency. */
         ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
@@ -935,7 +1258,7 @@ static void test_gateways(void)
         assert(ft_replace(&binding, &cls) == 0 && ft_installs == installs);
         /* Even an identical Ethernet rewrite must move its watch when the
          * selected gateway changes. Never deduplicate by the HW rule alone. */
-        route.rt_gw4 = alternate_gateway.primary_key;
+        route.rt_gw4 = alternate_gateway.primary_key.ip;
         assert(ft_replace(&binding, &cls) == 0 && ft_installs == installs + 1);
         e = ft_find(&binding, cls.cookie);
         assert(e->neigh == &alternate_gateway && !gateway.refs && alternate_gateway.refs == 1);
@@ -947,7 +1270,7 @@ static void test_gateways(void)
         assert(!ft_invalid && handle.invalid && ft_remove(e) == 0);
         ft_invalid = 0;
     }
-    fixture(); route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+    fixture(); route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key.ip;
     gateway.nud_state = NUD_FAILED;
     assert(ft_replace(&binding, &cls) == -EOPNOTSUPP && !ft_count);
     assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs);
@@ -1037,7 +1360,7 @@ static void connection_rule(unsigned n)
     ct.protonum = bk.ip_proto = n & 1 ? IPPROTO_TCP : IPPROTO_UDP;
     ct.tcp_state = TCP_CONNTRACK_ESTABLISHED;
     ct.status = IPS_ASSURED;
-    dissector.used_keys = 31 | (n & 1 ? BIT(FLOW_DISSECTOR_KEY_TCP) : 0);
+    dissector.used_keys = FT_KEYS4 | (n & 1 ? BIT_ULL(FLOW_DISSECTOR_KEY_TCP) : 0);
     tk.flags = 0; tm.flags = htons(TCPHDR_FIN | TCPHDR_RST);
     rule.tcp = (struct flow_match_tcp){ &tk, &tm };
 }
@@ -1155,7 +1478,7 @@ static void test_selective_neighbours(void)
         cls.cookie = 5000 + i;
         pk.src = htons(11000 + i);
         route.rt_gw_family = i & 1 ? 0 : AF_INET;
-        route.rt_gw4 = i < 2 ? gateway.primary_key : alternate_gateway.primary_key;
+        route.rt_gw4 = i < 2 ? gateway.primary_key.ip : alternate_gateway.primary_key.ip;
         assert(ft_replace(&binding, &cls) == 0);
         entries[i] = ft_find(&binding, cls.cookie);
         entries[i]->hw->stats.packets = 100 + i;
@@ -1177,7 +1500,7 @@ static void test_selective_neighbours(void)
      * A fresh Linux generation can reuse its cookie without inheriting state. */
     gateway.nud_state = NUD_PERMANENT;
     cls.nf_handle = &contexts[0]; cls.cookie = 5000; pk.src = htons(11000);
-    route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+    route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key.ip;
     assert(ft_replace(&binding, &cls) == -EOPNOTSUPP && ft_count == 2);
     cls.nf_handle = &contexts[2];
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 3);
@@ -1282,7 +1605,7 @@ static void test_selective_routes(void)
         ik.src = i & 1 ? htonl(0xc6336402) : address;
         ik.dst = i & 1 ? address : htonl(0xc6336402);
         cls.nf_handle = &contexts[i / 2]; cls.cookie = 6000 + i;
-        route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key;
+        route.rt_gw_family = AF_INET; route.rt_gw4 = gateway.primary_key.ip;
         assert(ft_replace(&binding, &cls) == 0);
         entries[i] = ft_find(&binding, cls.cookie);
         entries[i]->hw->stats.packets = 20 + i;
@@ -1329,7 +1652,11 @@ static void test_selective_routes(void)
     for (unsigned e = FIB_EVENT_RULE_ADD; e <= FIB_EVENT_RULE_DEL; e++) {
         ft_fib_event(NULL, e, &info); assert(ft_invalid); ft_invalid = 0;
     }
+    /* Policy changes need explicit recovery in either family, not just IPv4. */
     info.family = AF_INET6;
+    ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &info); assert(ft_invalid); ft_invalid = 0;
+    /* A family this adapter forwards for neither of is still ignored outright. */
+    info.family = AF_BRIDGE;
     ft_fib_event(NULL, FIB_EVENT_RULE_ADD, &info); assert(!ft_invalid);
 
     for (unsigned e = FIB_EVENT_NH_ADD; e <= FIB_EVENT_NH_DEL; e++) {
@@ -1349,7 +1676,7 @@ static void test_selective_routes(void)
         ft_retire_workfn(NULL);
         assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated);
         assert(handle.refs == 1 && other.refs == 1);
-        info.family = AF_INET6;
+        info.family = AF_BRIDGE;
     }
 
     /* Queued admission may carry one current and one stale route. Refuse and
@@ -1621,7 +1948,7 @@ int main(void)
     struct cdx_ft_rule decoded;
     fixture();
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
-    assert(decoded.src == ik.src && decoded.dst == ik.dst && decoded.sport == htons(10000));
+    assert(is4(&decoded.src, ik.src) && is4(&decoded.dst, ik.dst) && decoded.sport == htons(10000));
     assert(decoded.mtu == 1492 && decoded.in == &in && decoded.out == &out);
     assert(!memcmp(decoded.dst_mac, (u8[]){2,0x11,0x22,0x33,0x44,0x55}, 6));
     assert(!memcmp(decoded.src_mac, out.dev_addr, 6));
@@ -1703,6 +2030,7 @@ int main(void)
     test_neighbours();
     test_selective_neighbours();
     test_selective_routes();
+    test_ipv6();
     test_snat();
     test_dnat();
     test_double_nat();

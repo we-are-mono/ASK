@@ -513,6 +513,12 @@ async def lan_run_python(
 DUT_IPV6_LAN  = "fc00:dead::1"
 DUT_IPV6_WAN  = "fc00:beef::1"
 LAN_IPV6      = "fc00:dead::2"
+# The offload tests give the WAN host this address for real bidirectional
+# traffic, so their endpoint answers rather than only provoking an ICMPv6
+# error. VIRT_IPV6 is an unassigned address in the same /64, used as the
+# pre-translation destination of a DNAT flow.
+WAN_IPV6      = os.environ.get("ASK_WAN_IPV6", "fc00:beef::99")
+VIRT_IPV6     = os.environ.get("ASK_VIRT_IPV6", "fc00:beef::dd")
 TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth4")
 
 

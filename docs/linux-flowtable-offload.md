@@ -19,6 +19,7 @@ Current checkpoint: IPv4 TCP/UDP NAT and 32,768-direction capacity (2026-09-15).
 | Accepted foundation, recovery matrix and verification limits | [Foundation checkpoint](flowtable-foundation.md) |
 | Configure scope/exclusions, revoke active flows, migrate CMM settings | [Policy guide](flowtable-policy.md) |
 | Supported NAT mappings and their focused proof | [NAT guide](flowtable-nat.md) |
+| IPv6 eligibility, what the family really changes, and its proof | [IPv6 guide](flowtable-ipv6.md) |
 | Admission budget, pressure and resource reuse | [Capacity guide](flowtable-capacity.md) |
 | Original proposal, implementation snapshots and dated measurements | [History by topic and chronology](flowtable/history/README.md) |
 | Remaining intermittent UDP/link observations | [UDP loss investigation](flowtable-udp-loss-investigation.md) |
@@ -37,10 +38,10 @@ configuration instructions.
 | --- | --- |
 | Kernel and hardware | Repository Linux 6.12.103 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
 | Topology and capacity | One hardware flowtable, two initial-netns physical Ethernet ports, at most 32,768 directional entries |
-| Routed traffic | Unicast IPv4 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
-| Throughput | Loki → Vision TCP NAT: 9.414 Gb/s receive, 1.84% aggregate DUT CPU on the KASAN image |
-| NAT | TCP/UDP static source NAT, MASQUERADE, destination and hairpin/double NAT, including address/port translation and inverse reply translation |
-| Routing and neighbours | Direct routes, IPv4 gateways, permanent neighbours and ordinary ARP |
+| Routed traffic | Unicast IPv4 and IPv6 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
+| Throughput | Loki → Vision TCP NAT: 9.414 Gb/s receive, 1.84% aggregate DUT CPU on the KASAN image. Routed IPv6 TCP: 9.173 Gb/s forward and 9.260 Gb/s reverse on the same image, against 97.9 Mb/s with the same flow forwarded in software |
+| NAT | TCP/UDP static source NAT, MASQUERADE, destination and hairpin/double NAT in IPv4, including address/port translation and inverse reply translation. IPv6 source and destination NAT, with the full 128-bit address rewrite and its inverse |
+| Routing and neighbours | Direct routes, IPv4 gateways, IPv6 gateways including link-local next hops, permanent neighbours, ordinary ARP and neighbour discovery |
 | Automatic recovery | Dependent route, neighbour, physical MTU/MAC and link-state retirement followed by fresh admission |
 | Lifetime and policy | Conntrack/flow expiry and deletion, safe adapter unload, explicit global recovery, live policy revocation, bounded capacity fallback |
 | Ownership | CMM remains the default boot path; flowtable ownership is explicit and immutable for the boot |
@@ -52,9 +53,22 @@ explicit partial-generation recovery. Hardware flags alone do not establish
 that both directions are offloaded.
 
 Counter-enabled hardware tables are refused because firmware counters include
-classifier hits that can later be punted to Linux. IPv6, VLAN/bridge/PPPoE, multicast, IPsec, tunnels and Wi-Fi
+classifier hits that can later be punted to Linux. VLAN/bridge/PPPoE, multicast, IPsec, tunnels and Wi-Fi
 need their own eligibility contracts and proofs. Unsupported hardware traffic
 remains governed by Linux forwarding and firewall policy.
+
+Both families share one admission budget and one set of adapter indexes, so
+the 32,768 bound counts IPv4 and IPv6 directions together. Within IPv6 the
+boundary is narrower than IPv4's in three respects, each a stated exclusion
+rather than an omission: a flow endpoint may not be link-local, because such an
+address is scoped to one link and cannot be forwarded between the two ports (a
+*gateway* may be, and normally is); the accepted MTU floor is the IPv6 minimum
+link MTU of 1280 rather than 68; and extension headers have no eligibility
+contract, so only packets whose transport header follows the fixed header are
+described by an admitted rule. IPv6 has no hairpin/double-NAT proof of its own,
+and no MTU/PTB, capacity or sustained-churn proof of its own — those exercise
+machinery both families share, and the IPv6-specific parts of it are the
+neighbour table, the address width and that MTU floor.
 
 ## How the components fit
 

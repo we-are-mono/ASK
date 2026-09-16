@@ -29,12 +29,12 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | `keytrack.c` | 1,021 | adapter cookie and key hash indexes |
 | `module_route.c` | 597 | Linux routing and nexthop retirement |
 | `module_rx.c`, `module_tx.c` | 907 | flowtable ingress and egress hooks |
+| unicast half of `control_ipv6.c` | ~400 | the same adapter, with the address family threaded through its key |
 
 ## Remaining work
 
 | # | Subsystem | Lines | FCI cmds | Linux mechanism | Effort | Notes |
 | ---: | --- | ---: | ---: | --- | --- | --- |
-| 1 | IPv6 (`module_mc6`, `control_ipv6`) | 641 | 7 | Yes — full v6 hooks in `nf_flow_table_ip.c` | Low | The adapter is IPv4-only by choice; `ft_parse` declines v6. Encoder and eligibility work, not new architecture. |
 | 2 | VLAN (`module_vlan`) | 556 | 2 | Yes — `DEV_PATH_VLAN`, `encap[]` | Low-Med | The kernel already fills the encap stack; needs FMAN VLAN key encoding. |
 | 3 | PPPoE (`pppoe.c`, `control_pppoe`) | 303 | 2 | Yes — `DEV_PATH_PPPOE` | Low-Med | The relay offset is already confirmed on hardware. |
 | 4 | Bridge / auto_bridge (`ffbridge.c`) | 276 | — | Yes — `DEV_PATH_BRIDGE` | Medium | CDX already falls back to the physical ingress port for `br-lan.N`. |
@@ -48,47 +48,29 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
 | 13 | MACVLAN (`module_macvlan`) | 202 | 2 | Partial — path type exists | Low | Likely falls out of the VLAN and bridge work. |
 
-## IPv6 implementation plan
+## IPv6, delivered
 
-Scoped 2026-09-16 by reading the adapter and the classifier rather than
-estimating. The hardware is ready and Linux is ready; the adapter is IPv4 by
-construction rather than by a flag, so the work is threading an address family
-through its key.
+Scoped and landed 2026-09-16, NAT included. It cost one increment because the
+adapter's key is one struct: widening it reached the decoder, both indexes, the
+hardware encoder and the proc output at once. The mechanism, the two places
+where the family is not cosmetic, and the hardware proof are in the
+[IPv6 guide](flowtable-ipv6.md).
 
-Already available, needing no work:
-
-- `CtEntry` carries both families in a union, `Saddr_v4` and `Saddr_v6[4]`
-  (`cdx/control_ipv4.h`), and `insert_entry_in_classif_table` is shared.
-- `FFTYPE_IPV6` and `HASH_CT6` exist and are exercised by `control_ipv6.c`.
-- The Linux flowtable has complete IPv6 hooks in `nf_flow_table_ip.c`.
-
-What has to change:
-
-| Site | Change |
-| --- | --- |
-| `struct cdx_ft_rule` (`cdx/cdx_flowtable_backend.h`) | Widen the four addresses to a family union. This struct is the adapter's key, so the change reaches `ft_parse`, `ft_key_hash`, `ft_same_key`, `ft_find`, `ft_replace`, `cdx_ft_hw_add` and the proc output together. |
-| `ft_parse` (`cdx/ask_flowtable.c`) | Accept `FLOW_DISSECTOR_KEY_IPV6_ADDRS` and `ETH_P_IPV6` beside the v4 keys, and carry the family into the rule. |
-| `ft_key_hash` | Hash a v6 address rather than a `u32`. |
-| `cdx_ft_hw_add` (`cdx/cdx_flowtable_hw.c`) | Set `FFTYPE_IPV6`, use `HASH_CT6`, fill `Saddr_v6`/`Daddr_v6`. |
-| Route and neighbour validation | `ft_routes_valid` and the neighbour path use IPv4 helpers throughout and need v6 equivalents. |
-| `/proc/cdx_flowtable` | Family-aware address formatting instead of `%pI4`. |
-| Tests | A v6 counterpart to the NAT tests, v6 support in the connection peer, and v6 addressing on the loki and vision topology. |
-
-Decide before starting: **whether v6 NAT is in scope.** Declining it keeps the
-twin and inverse-translation encoding out of the first increment and matches
-how IPv6 is normally deployed, but it must be an explicit boundary in the
-supported scope rather than an unstated omission. Recommend excluding it from
-the first increment and admitting v6 routed traffic only.
-
-Do this as one increment with its own proof, not as filler work: a partially
-threaded address family compiles and silently mis-keys flows.
+Two findings were not visible from reading alone, and are worth carrying into
+the remaining increments. An IPv6 destination is valid only for the FIB
+generation it was selected in, so a borrowed route has to arrive with its
+cookie or `dst_check()` rejects all of them. And the `CtEntry` union means an
+IPv6 entry's destination address occupies the bytes IPv4 uses for its twin
+mirror, so the legacy twin fields must be left untouched. Both are the kind of
+defect that admits flows and then misroutes them, rather than failing loudly.
 
 ## Sequencing
 
-**Items 1 to 4 are the natural next increments.** Linux supplies the mechanism,
+**Items 2 to 4 are the natural next increments.** Linux supplies the mechanism,
 so each is an encoder and an eligibility contract with its own focused proof,
-exactly like the NAT increments. IPv6 is the best first target: the widest
-capability gain for the least new architecture.
+exactly like the NAT and IPv6 increments already delivered. VLAN is the best
+next target: the kernel already fills the encap stack, so the work is FMAN key
+encoding rather than new architecture.
 
 **Items 5 to 8 need feature-specific contracts.** Each expresses behaviour a
 unicast flowtable tuple cannot carry, and each needs its own hardware

@@ -4,22 +4,27 @@
 
 #include <linux/types.h>
 #include <linux/if_ether.h>
+#include <linux/netfilter.h>
 
 struct net_device;
 struct cdx_ft_hw;
 
 /* Private in-repository interface. No CDX, firmware or borrowed Netfilter
- * objects cross it. Addresses and ports are in network byte order. The adapter
+ * objects cross it; the address union is a plain UAPI value type shared with
+ * conntrack so no tuple has to be transcribed. Addresses and ports are in
+ * network byte order. family selects the arm of every address, and the unused
+ * bytes of each are always zero, so whole rules compare bytewise. The adapter
  * pins both devices until the installed direction has been retired.
  */
 struct cdx_ft_rule {
 	struct net_device *in;
 	struct net_device *out;
-	__be32 src, dst;
+	union nf_inet_addr src, dst;
 	__be16 sport, dport;
 	/* Complete tuple after translation; identical to the match without NAT. */
-	__be32 new_src, new_dst;
+	union nf_inet_addr new_src, new_dst;
 	__be16 new_sport, new_dport;
+	u8 family;
 	u8 proto;
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];

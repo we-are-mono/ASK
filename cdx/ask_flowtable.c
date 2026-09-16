@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* Linux flowtable adapter for bounded IPv4 TCP and UDP offload.
+/* Linux flowtable adapter for bounded IPv4 and IPv6 TCP and UDP offload.
  *
  * Backend transactions serialize hardware operations and adapter lists. Rule callbacks are
  * process-context NF workqueue callbacks. Binding release runs after the
@@ -16,6 +16,7 @@
 #include <linux/hashtable.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/jhash.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
@@ -27,6 +28,9 @@
 #include <net/arp.h>
 #include <net/fib_notifier.h>
 #include <net/flow_offload.h>
+#include <net/ip6_route.h>
+#include <net/ipv6.h>
+#include <net/ndisc.h>
 #include <net/netevent.h>
 #include <net/nexthop.h>
 #include <net/route.h>
@@ -37,7 +41,7 @@
 #include <net/netfilter/nf_flow_table.h>
 #include "cdx_flowtable_backend.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 5
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 6
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
 
@@ -63,7 +67,7 @@ struct cdx_ft_entry {
 	struct list_head neigh_list;
 	struct neighbour *neigh;
 	struct nf_flow_offload_handle *handle;
-	__be32 next_hop;
+	union nf_inet_addr next_hop;
 	struct cdx_ft_binding *binding;
 	unsigned long cookie;
 	struct cdx_ft_rule rule;
@@ -72,10 +76,12 @@ struct cdx_ft_entry {
 };
 
 /* Admission budget, not a firmware maximum. Directions consume slots
- * independently without eviction. The deployed IPv4 TCP/UDP classifiers each
- * have 32768 buckets and dynamically allocated entries. Keep software indexes
- * at a maximum average load of two; dependency invalidation remains a bounded
- * walk because a single route/device/neighbour event can affect every flow.
+ * independently without eviction. The deployed TCP/UDP classifiers each have
+ * 32768 buckets and dynamically allocated entries, one pair per family, so
+ * this single budget is the more conservative bound once both are in use.
+ * Keep software indexes at a maximum average load of two; dependency
+ * invalidation remains a bounded walk because a single route/device/neighbour
+ * event can affect every flow.
  */
 #define CDX_FT_MAX_ENTRIES 32768U
 #define CDX_FT_HASH_BITS 14
@@ -221,9 +227,17 @@ static bool ft_neigh_matches(struct neighbour *neigh, const u8 *mac)
 	}
 }
 
-static bool ft_neigh_check(struct net_device *dev, __be32 dst, const u8 *mac)
+/* Both tables key on the leading bytes of the address union, so the same
+ * pointer resolves an ARP and a neighbour-discovery entry. */
+static struct neigh_table *ft_neigh_table(u8 family)
 {
-	struct neighbour *neigh = neigh_lookup(&arp_tbl, &dst, dev);
+	return family == AF_INET6 ? &nd_tbl : &arp_tbl;
+}
+
+static bool ft_neigh_check(u8 family, struct net_device *dev,
+			   const union nf_inet_addr *dst, const u8 *mac)
+{
+	struct neighbour *neigh = neigh_lookup(ft_neigh_table(family), dst, dev);
 	bool valid;
 
 	if (!neigh)
@@ -235,37 +249,68 @@ static bool ft_neigh_check(struct net_device *dev, __be32 dst, const u8 *mac)
 	return valid;
 }
 
+/* A gateway is normally link-local, which a flow endpoint may never be, so
+ * this is deliberately weaker than the endpoint test. */
+static bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
+{
+	int type;
+
+	if (family != AF_INET6)
+		return !ipv4_is_multicast(next_hop->ip) && !ipv4_is_zeronet(next_hop->ip) &&
+			!ipv4_is_loopback(next_hop->ip) && !ipv4_is_lbcast(next_hop->ip);
+	type = ipv6_addr_type(&next_hop->in6);
+	return (type & IPV6_ADDR_UNICAST) && !(type & IPV6_ADDR_LOOPBACK);
+}
+
 /* Borrow the route selected by Netfilter, not a second FIB lookup which could
- * lose its policy/ingress context. Patch 140 supplies only retained NEIGH dsts.
- * No route pointer escapes the callback. IPv6 gateways and transformed routes
- * need separate contracts even when the matched packet itself is IPv4. */
+ * lose its policy/ingress context. Patch 140 supplies only retained NEIGH dsts
+ * with the cookie they were selected under: an IPv6 destination belongs to one
+ * FIB generation and dst_check() rejects every one of them against a zero
+ * cookie. No route pointer escapes the callback. Transformed routes need a
+ * separate contract in either family. */
 static bool ft_next_hop(const struct flow_cls_offload *cls,
-			struct net_device *dev, __be32 daddr, __be32 *next_hop)
+			struct net_device *dev, u8 family,
+			const union nf_inet_addr *daddr,
+			union nf_inet_addr *next_hop)
 {
 	struct dst_entry *dst = cls->nf_dst;
-	const struct rtable *rt;
 
-	if (!dst || dst->ops->family != AF_INET || dst->dev != dev ||
-	    dst_xfrm(dst) || dst->lwtstate || !dst_check(dst, 0))
+	if (!dst || dst->ops->family != family || dst->dev != dev ||
+	    dst_xfrm(dst) || dst->lwtstate || dst->error ||
+	    !dst_check(dst, cls->nf_dst_cookie))
 		return false;
-	rt = dst_rtable(dst);
-	if (rt->rt_type != RTN_UNICAST ||
-	    (rt->rt_gw_family && rt->rt_gw_family != AF_INET))
-		return false;
-	*next_hop = rt_nexthop(rt, daddr);
-	return !ipv4_is_multicast(*next_hop) && !ipv4_is_zeronet(*next_hop) &&
-		!ipv4_is_loopback(*next_hop) && !ipv4_is_lbcast(*next_hop);
+	memset(next_hop, 0, sizeof(*next_hop));
+	if (family == AF_INET6) {
+		const struct rt6_info *rt = dst_rt6_info(dst);
+
+		/* RTF_CACHE routes name their own destination as the next hop,
+		 * which is correct, but a local/anycast route is not forwarding. */
+		if (rt->rt6i_flags & (RTF_REJECT | RTF_LOCAL | RTF_ANYCAST))
+			return false;
+		next_hop->in6 = *rt6_nexthop(rt, &daddr->in6);
+	} else {
+		const struct rtable *rt = dst_rtable(dst);
+
+		if (rt->rt_type != RTN_UNICAST ||
+		    (rt->rt_gw_family && rt->rt_gw_family != AF_INET))
+			return false;
+		next_hop->ip = rt_nexthop(rt, daddr->ip);
+	}
+	return ft_nexthop_usable(family, next_hop);
 }
 
 /* Admission holds RTNL. Check both borrowed destinations after taking it:
  * a callback queued before a route change must not install even its otherwise
  * valid direction. The invalid handle makes Linux retire that generation.
+ * RTNL does not exclude an IPv6 route change, which router advertisements
+ * commit from softirq, so this is also repeated once the entry is published.
  * Never re-resolve a route here with an incomplete policy/ingress context.
  */
 static bool ft_routes_valid(const struct flow_cls_offload *cls)
 {
 	return cls->nf_dst && cls->nf_dst_reverse &&
-		dst_check(cls->nf_dst, 0) && dst_check(cls->nf_dst_reverse, 0);
+		dst_check(cls->nf_dst, cls->nf_dst_cookie) &&
+		dst_check(cls->nf_dst_reverse, cls->nf_dst_reverse_cookie);
 }
 
 static int ft_neigh_attach(struct cdx_ft_entry *entry)
@@ -273,7 +318,8 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	struct neighbour *neigh;
 	bool valid;
 
-	neigh = neigh_lookup(&arp_tbl, &entry->next_hop, entry->rule.out);
+	neigh = neigh_lookup(ft_neigh_table(entry->rule.family), &entry->next_hop,
+			     entry->rule.out);
 	if (!neigh)
 		return -EOPNOTSUPP;
 	/* Recheck at watch publication: the mapping may have changed after the
@@ -331,33 +377,71 @@ static bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
 	return true;
 }
 
-static bool ft_unicast(__be32 address)
+/* A flow endpoint must be globally routable between the two ports: an IPv6
+ * link-local address is scoped to one link and cannot be forwarded off it. */
+static bool ft_endpoint(u8 family, const union nf_inet_addr *address)
 {
-	return !ipv4_is_multicast(address) && !ipv4_is_zeronet(address) &&
-		!ipv4_is_loopback(address) && !ipv4_is_lbcast(address);
+	int type;
+
+	if (family != AF_INET6)
+		return !ipv4_is_multicast(address->ip) && !ipv4_is_zeronet(address->ip) &&
+			!ipv4_is_loopback(address->ip) && !ipv4_is_lbcast(address->ip);
+	type = ipv6_addr_type(&address->in6);
+	return (type & IPV6_ADDR_UNICAST) &&
+		!(type & (IPV6_ADDR_LOOPBACK | IPV6_ADDR_LINKLOCAL |
+			  IPV6_ADDR_MAPPED | IPV6_ADDR_COMPATv4));
 }
 
+static bool ft_exact6(const struct in6_addr *mask)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		if (mask->s6_addr32[i] != htonl(0xffffffff))
+			return false;
+	return true;
+}
+
+/* Conntrack zeroes the whole address union, so does ft_parse: the unused arm
+ * never carries stale bytes and both families compare with one helper. */
 static bool ft_tuple_matches(const struct cdx_ft_rule *rule,
 			     const struct nf_conntrack_tuple *tuple)
 {
-	return rule->src == tuple->src.u3.ip && rule->dst == tuple->dst.u3.ip &&
+	return nf_inet_addr_cmp(&rule->src, &tuple->src.u3) &&
+		nf_inet_addr_cmp(&rule->dst, &tuple->dst.u3) &&
 		rule->sport == tuple->src.u.all && rule->dport == tuple->dst.u.all;
 }
 
-/* Validate one native address/port edit pair against the resolved conntrack
- * mapping. Netfilter orders SNAT before DNAT, including inverse reply edits. */
+/* Validate one native address/port edit group against the resolved conntrack
+ * mapping. Netfilter orders SNAT before DNAT, including inverse reply edits.
+ * IPv4 rewrites its address in a single mangle word; IPv6 emits one word per
+ * quarter, in address order, and the port edit follows the last of them. */
 static bool ft_nat_edit(const struct flow_action_entry *ip,
 			const struct cdx_ft_rule *out, bool source)
 {
-	const struct flow_action_entry *port = ip + 1;
+	bool v6 = out->family == AF_INET6;
+	const union nf_inet_addr *addr = source ? &out->new_src : &out->new_dst;
+	unsigned int words = v6 ? 4 : 1;
+	unsigned int offset = v6 ?
+		(source ? offsetof(struct ipv6hdr, saddr) : offsetof(struct ipv6hdr, daddr)) :
+		(source ? offsetof(struct iphdr, saddr) : offsetof(struct iphdr, daddr));
+	enum flow_action_mangle_base htype = v6 ? FLOW_ACT_MANGLE_HDR_TYPE_IP6 :
+						  FLOW_ACT_MANGLE_HDR_TYPE_IP4;
+	const struct flow_action_entry *port = ip + words;
 	u32 value = source ? htonl((u32)ntohs(out->new_sport) << 16) :
 			     htonl(ntohs(out->new_dport));
 	u32 mask = source ? ~htonl(0xffff0000) : ~htonl(0x0000ffff);
+	unsigned int i;
 
-	return ip->id == FLOW_ACTION_MANGLE && ip->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_IP4 &&
-		ip->mangle.offset == (source ? offsetof(struct iphdr, saddr) : offsetof(struct iphdr, daddr)) &&
-		!ip->mangle.mask && ip->mangle.val == (source ? out->new_src : out->new_dst) &&
-		port->id == FLOW_ACTION_MANGLE && port->mangle.htype == (out->proto == IPPROTO_TCP ?
+	for (i = 0; i < words; i++) {
+		const struct flow_action_entry *word = ip + i;
+
+		if (word->id != FLOW_ACTION_MANGLE || word->mangle.htype != htype ||
+		    word->mangle.offset != offset + i * sizeof(u32) ||
+		    word->mangle.mask || word->mangle.val != addr->all[i])
+			return false;
+	}
+	return port->id == FLOW_ACTION_MANGLE && port->mangle.htype == (out->proto == IPPROTO_TCP ?
 			FLOW_ACT_MANGLE_HDR_TYPE_TCP : FLOW_ACT_MANGLE_HDR_TYPE_UDP) &&
 		!port->mangle.offset && port->mangle.mask == mask && port->mangle.val == value;
 }
@@ -374,6 +458,11 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	const struct flow_action_entry *csum;
 	unsigned long status = READ_ONCE(ct->status), nat = status & IPS_NAT_MASK;
 	unsigned int edits = !!(nat & IPS_SRC_NAT) + !!(nat & IPS_DST_NAT), offset = 4;
+	/* Four Ethernet mangles and a redirect surround the translation. IPv4
+	 * spends two actions per edit and appends one checksum action; IPv6
+	 * spends five and has no header checksum to recompute. */
+	unsigned int per_edit = out->family == AF_INET6 ? 5 : 2;
+	unsigned int fixed = out->family == AF_INET6 ? 5 : 6;
 	bool forward;
 
 	out->new_src = out->src;
@@ -385,36 +474,41 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	if (((nat & IPS_SRC_NAT) && !(status & IPS_SRC_NAT_DONE)) ||
 	    ((nat & IPS_DST_NAT) && !(status & IPS_DST_NAT_DONE)) ||
 	    (out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) ||
-	    actions->num_entries != 6 + 2 * edits)
+	    actions->num_entries != fixed + per_edit * edits)
 		return false;
 	forward = ft_tuple_matches(out, orig);
 	if (forward == ft_tuple_matches(out, reply))
 		return false;
 	/* Every endpoint without translation must agree in both tuples. */
 	if (!(nat & IPS_DST_NAT) &&
-	    (orig->dst.u3.ip != reply->src.u3.ip || orig->dst.u.all != reply->src.u.all))
+	    (!nf_inet_addr_cmp(&orig->dst.u3, &reply->src.u3) ||
+	     orig->dst.u.all != reply->src.u.all))
 		return false;
 	if (!(nat & IPS_SRC_NAT) &&
-	    (orig->src.u3.ip != reply->dst.u3.ip || orig->src.u.all != reply->dst.u.all))
+	    (!nf_inet_addr_cmp(&orig->src.u3, &reply->dst.u3) ||
+	     orig->src.u.all != reply->dst.u.all))
 		return false;
 	opposite = forward ? reply : orig;
-	out->new_src = opposite->dst.u3.ip;
-	out->new_dst = opposite->src.u3.ip;
+	out->new_src = opposite->dst.u3;
+	out->new_dst = opposite->src.u3;
 	out->new_sport = opposite->dst.u.all;
 	out->new_dport = opposite->src.u.all;
-	if (!ft_unicast(out->new_src) || !ft_unicast(out->new_dst) ||
+	if (!ft_endpoint(out->family, &out->new_src) ||
+	    !ft_endpoint(out->family, &out->new_dst) ||
 	    !out->new_sport || !out->new_dport)
 		return false;
 	if (nat & IPS_SRC_NAT) {
 		if (!ft_nat_edit(&actions->entries[offset], out, forward))
 			return false;
-		offset += 2;
+		offset += per_edit;
 	}
 	if (nat & IPS_DST_NAT) {
 		if (!ft_nat_edit(&actions->entries[offset], out, !forward))
 			return false;
-		offset += 2;
+		offset += per_edit;
 	}
+	if (out->family == AF_INET6)
+		return true;
 	csum = &actions->entries[offset];
 	return csum->id == FLOW_ACTION_CSUM &&
 		csum->csum_flags == (TCA_CSUM_UPDATE_FLAG_IPV4HDR | (out->proto == IPPROTO_TCP ?
@@ -426,55 +520,82 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
  * translation/checksum actions and a final redirect. */
 static int ft_parse(struct cdx_ft_binding *binding,
 		    const struct flow_cls_offload *cls, struct cdx_ft_rule *out,
-		    __be32 *next_hop)
+		    union nf_inet_addr *next_hop)
 {
-	const unsigned long keys = BIT(FLOW_DISSECTOR_KEY_META) |
-		BIT(FLOW_DISSECTOR_KEY_CONTROL) | BIT(FLOW_DISSECTOR_KEY_BASIC) |
-		BIT(FLOW_DISSECTOR_KEY_IPV4_ADDRS) | BIT(FLOW_DISSECTOR_KEY_PORTS);
+	const unsigned long long common = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
+		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
+		BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
+	const unsigned long long keys4 = common | BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS);
+	const unsigned long long keys6 = common | BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS);
+	unsigned long long used, keys;
 	struct flow_rule *rule = cls->rule;
 	struct flow_match_meta meta;
 	struct flow_match_control control;
 	struct flow_match_basic basic;
 	struct flow_match_ipv4_addrs ipv4;
+	struct flow_match_ipv6_addrs ipv6;
 	struct flow_match_ports ports;
 	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
 	static const u32 offsets[4] = { 4, 8, 0, 4 };
 	static const u32 masks[4] = { 0x0000ffff, 0, 0, 0xffff0000 };
 	u8 ethernet[12] = {};
+	u8 family;
 	u32 word;
 	int i;
 
-	if (!rule || !cls->nf_ct || !cls->nf_mtu || cls->nf_counter ||
+	if (!rule)
+		return -EOPNOTSUPP;
+	used = rule->match.dissector->used_keys;
+	if (used == keys4 || used == (keys4 | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)))
+		family = AF_INET;
+	else if (used == keys6 || used == (keys6 | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)))
+		family = AF_INET6;
+	else
+		return -EOPNOTSUPP;
+	keys = family == AF_INET6 ? keys6 : keys4;
+	if (!cls->nf_ct || !cls->nf_mtu || cls->nf_counter ||
 	    !nf_flow_offload_handle_valid(cls->nf_handle) ||
 	    !net_eq(nf_ct_net(cls->nf_ct), &init_net) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_ORIGINAL) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_REPLY) ||
 	    READ_ONCE(cls->nf_ct->mark) ||
-	    cls->common.chain_index || cls->common.protocol != ETH_P_ALL ||
-	    (rule->match.dissector->used_keys != keys &&
-	     rule->match.dissector->used_keys != (keys | BIT(FLOW_DISSECTOR_KEY_TCP))))
+	    cls->common.chain_index || cls->common.protocol != ETH_P_ALL)
 		return -EOPNOTSUPP;
 	flow_rule_match_meta(rule, &meta);
 	flow_rule_match_control(rule, &control);
 	flow_rule_match_basic(rule, &basic);
-	flow_rule_match_ipv4_addrs(rule, &ipv4);
 	flow_rule_match_ports(rule, &ports);
 	if (meta.mask->ingress_ifindex != -1 || meta.mask->ingress_iftype ||
 	    meta.mask->l2_miss || meta.key->ingress_ifindex != binding->dev->ifindex ||
 	    control.mask->addr_type != 0xffff || control.mask->flags ||
-	    control.mask->thoff || control.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
+	    control.mask->thoff ||
+	    control.key->addr_type != (family == AF_INET6 ? FLOW_DISSECTOR_KEY_IPV6_ADDRS :
+						           FLOW_DISSECTOR_KEY_IPV4_ADDRS) ||
 	    basic.mask->n_proto != htons(0xffff) || basic.mask->ip_proto != 0xff ||
-	    basic.key->n_proto != htons(ETH_P_IP) ||
+	    basic.key->n_proto != htons(family == AF_INET6 ? ETH_P_IPV6 : ETH_P_IP) ||
 	    basic.key->ip_proto != nf_ct_protonum(cls->nf_ct) ||
-	    ipv4.mask->src != htonl(0xffffffff) || ipv4.mask->dst != htonl(0xffffffff) ||
+	    nf_ct_l3num(cls->nf_ct) != family ||
 	    ports.mask->src != htons(0xffff) || ports.mask->dst != htons(0xffff) ||
-	    !ports.key->src || !ports.key->dst ||
-	    !ft_unicast(ipv4.key->src) || !ft_unicast(ipv4.key->dst))
+	    !ports.key->src || !ports.key->dst)
 		return -EOPNOTSUPP;
 	memset(out, 0, sizeof(*out));
-	out->src = ipv4.key->src;
-	out->dst = ipv4.key->dst;
+	out->family = family;
+	if (family == AF_INET6) {
+		flow_rule_match_ipv6_addrs(rule, &ipv6);
+		if (!ft_exact6(&ipv6.mask->src) || !ft_exact6(&ipv6.mask->dst))
+			return -EOPNOTSUPP;
+		out->src.in6 = ipv6.key->src;
+		out->dst.in6 = ipv6.key->dst;
+	} else {
+		flow_rule_match_ipv4_addrs(rule, &ipv4);
+		if (ipv4.mask->src != htonl(0xffffffff) || ipv4.mask->dst != htonl(0xffffffff))
+			return -EOPNOTSUPP;
+		out->src.ip = ipv4.key->src;
+		out->dst.ip = ipv4.key->dst;
+	}
+	if (!ft_endpoint(family, &out->src) || !ft_endpoint(family, &out->dst))
+		return -EOPNOTSUPP;
 	out->sport = ports.key->src;
 	out->dport = ports.key->dst;
 	out->proto = basic.key->ip_proto;
@@ -482,8 +603,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		return -EOPNOTSUPP;
 	switch (basic.key->ip_proto) {
 	case IPPROTO_TCP:
-		if (rule->match.dissector->used_keys !=
-		    (keys | BIT(FLOW_DISSECTOR_KEY_TCP)) ||
+		if (used != (keys | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)) ||
 		    !nf_conntrack_tcp_established(cls->nf_ct))
 			return -EOPNOTSUPP;
 		flow_rule_match_tcp(rule, &tcp);
@@ -494,7 +614,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 			return -EOPNOTSUPP;
 		break;
 	case IPPROTO_UDP:
-		if (rule->match.dissector->used_keys != keys)
+		if (used != keys)
 			return -EOPNOTSUPP;
 		break;
 	default:
@@ -517,9 +637,10 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    (action->dev == binding->dev &&
 	     (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK) ||
 	    !is_valid_ether_addr(ethernet) ||
-	    !ft_next_hop(cls, action->dev, out->new_dst, next_hop) ||
-	    !ft_neigh_check(action->dev, *next_hop, ethernet) ||
-	    cls->nf_mtu > action->dev->mtu || cls->nf_mtu < 68)
+	    !ft_next_hop(cls, action->dev, family, &out->new_dst, next_hop) ||
+	    !ft_neigh_check(family, action->dev, next_hop, ethernet) ||
+	    cls->nf_mtu > action->dev->mtu ||
+	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return -EOPNOTSUPP;
 	if (!ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr))
 		return -ESTALE;
@@ -533,15 +654,22 @@ static int ft_parse(struct cdx_ft_binding *binding,
 
 static bool ft_same_key(const struct cdx_ft_rule *a, const struct cdx_ft_rule *b)
 {
-	return a->in == b->in && a->src == b->src && a->dst == b->dst &&
+	return a->in == b->in && a->family == b->family &&
+		nf_inet_addr_cmp(&a->src, &b->src) && nf_inet_addr_cmp(&a->dst, &b->dst) &&
 		a->sport == b->sport && a->dport == b->dport && a->proto == b->proto;
 }
 
+/* The unused arm of each address is zero, so hashing all four words keeps one
+ * expression for both families without collapsing distinct IPv6 keys. */
 static u32 ft_key_hash(const struct cdx_ft_rule *rule)
 {
-	return jhash_3words((__force u32)rule->src, (__force u32)rule->dst,
+	u32 addresses = jhash2(rule->src.all, ARRAY_SIZE(rule->src.all),
+			       jhash2(rule->dst.all, ARRAY_SIZE(rule->dst.all),
+				      ft_hash_seed));
+
+	return jhash_3words(addresses,
 			   (u32)(__force u16)rule->sport << 16 |
-			   (__force u16)rule->dport,
+			   (__force u16)rule->dport, rule->family,
 			   ft_hash_seed ^ hash_ptr(rule->in, 32) ^ rule->proto);
 }
 
@@ -549,7 +677,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 {
 	struct cdx_ft_entry *entry = ft_find(binding, cls->cookie), *other;
 	struct cdx_ft_rule rule;
-	__be32 next_hop;
+	union nf_inet_addr next_hop;
 	int rc;
 
 	/* A delayed request must never replace a different flow generation
@@ -569,7 +697,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		return rc ? rc : -EOPNOTSUPP;
 	}
 	if (entry) {
-		if (entry->next_hop == next_hop &&
+		if (nf_inet_addr_cmp(&entry->next_hop, &next_hop) &&
 		    !memcmp(&entry->rule, &rule, sizeof(rule)))
 			return 0;
 		rc = ft_remove(entry);
@@ -611,6 +739,13 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
 	ft_count++;
 	ft_installs++;
+	/* IPv6 commits routes from softirq without RTNL, so a change between
+	 * the validation above and publication here reaches neither: the entry
+	 * was not yet watched, and RTNL did not exclude it. Recheck once the
+	 * notifier can see this entry; an invalid handle then retires it below
+	 * through the same path as a change observed during insertion. */
+	if (!ft_routes_valid(cls))
+		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
 	if (ft_fault(3) || atomic_read(&ft_invalid) ||
 	    !nf_flow_offload_handle_valid(entry->handle)) {
 		ft_remove(entry);
@@ -999,8 +1134,35 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 		 * Check both endpoints even if only one direction installed. Match
 		 * all tables/DSCP aliases conservatively: a new more-specific route
 		 * can supersede a route which never emitted a deletion event. */
-		if (!((entry->rule.new_dst ^ event->dst) & mask) ||
-		    !((entry->rule.src ^ event->dst) & mask))
+		if (entry->rule.family != AF_INET)
+			continue;
+		if (!((entry->rule.new_dst.ip ^ event->dst) & mask) ||
+		    !((entry->rule.src.ip ^ event->dst) & mask))
+			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+	}
+	spin_unlock_bh(&ft_watch_lock);
+	return NOTIFY_DONE;
+}
+
+/* The same contract one family over. This one can arrive in softirq under the
+ * FIB table lock, so it must stay non-blocking; ft_watch_lock never nests the
+ * other way round. */
+static int ft_route6_event(const struct netevent_ipv6_route *event)
+{
+	struct cdx_ft_entry *entry;
+
+	if (!net_eq(event->net, &init_net))
+		return NOTIFY_DONE;
+	if (event->prefixlen > 128) {
+		ft_invalidate();
+		return NOTIFY_DONE;
+	}
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+		if (entry->rule.family != AF_INET6)
+			continue;
+		if (ipv6_prefix_equal(&entry->rule.new_dst.in6, &event->dst, event->prefixlen) ||
+		    ipv6_prefix_equal(&entry->rule.src.in6, &event->dst, event->prefixlen))
 			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
 	}
 	spin_unlock_bh(&ft_watch_lock);
@@ -1014,7 +1176,10 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 
 	if (event == NETEVENT_IPV4_ROUTE_UPDATE)
 		return ft_route_event(ptr);
-	if (event != NETEVENT_NEIGH_UPDATE || neigh->tbl != &arp_tbl ||
+	if (event == NETEVENT_IPV6_ROUTE_UPDATE)
+		return ft_route6_event(ptr);
+	if (event != NETEVENT_NEIGH_UPDATE ||
+	    (neigh->tbl != &arp_tbl && neigh->tbl != &nd_tbl) ||
 	    !net_eq(dev_net(neigh->dev), &init_net))
 		return NOTIFY_DONE;
 	read_lock_bh(&neigh->lock);
@@ -1038,7 +1203,7 @@ static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *pt
 	struct fib_notifier_info *info = ptr;
 	struct cdx_ft_entry *entry;
 
-	if (info->family != AF_INET)
+	if (info->family != AF_INET && info->family != AF_INET6)
 		return NOTIFY_DONE;
 	switch (event) {
 	case FIB_EVENT_ENTRY_REPLACE:
@@ -1046,8 +1211,9 @@ static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *pt
 	case FIB_EVENT_ENTRY_ADD:
 	case FIB_EVENT_ENTRY_DEL:
 		/* These selected-alias notifications can precede commit and omit
-		 * other aliases. Patch 140 reports every committed prefix through
-		 * NETEVENT_IPV4_ROUTE_UPDATE, including table flushes. */
+		 * other aliases. Patch 140 reports every committed prefix in both
+		 * families through NETEVENT_IPV[46]_ROUTE_UPDATE, including table
+		 * flushes. This also absorbs the registration dump. */
 		break;
 	case FIB_EVENT_NH_ADD:
 	case FIB_EVENT_NH_DEL:
@@ -1149,13 +1315,26 @@ static int ft_show(struct seq_file *seq, void *v)
 	if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
 		cdx_ft_stats(entry->hw, &stats);
-		seq_printf(seq, "flow cookie=%lx in=%s out=%s src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
-			   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-			   &entry->rule.src, ntohs(entry->rule.sport),
-			   &entry->rule.dst, ntohs(entry->rule.dport),
-			   &entry->rule.new_src, ntohs(entry->rule.new_sport),
-			   &entry->rule.new_dst, ntohs(entry->rule.new_dport), entry->rule.proto, entry->rule.mtu,
-			   &entry->next_hop, stats.packets, stats.bytes, stats.lastused);
+		/* One row shape per family. Brackets keep an IPv6 address and its
+		 * port a single whitespace-free token, as the IPv4 rows already are. */
+		if (entry->rule.family == AF_INET6)
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+				   &entry->rule.src.in6, ntohs(entry->rule.sport),
+				   &entry->rule.dst.in6, ntohs(entry->rule.dport),
+				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
+				   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
+				   entry->rule.proto, entry->rule.mtu,
+				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
+		else
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+				   &entry->rule.src.ip, ntohs(entry->rule.sport),
+				   &entry->rule.dst.ip, ntohs(entry->rule.dport),
+				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
+				   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
+				   entry->rule.proto, entry->rule.mtu,
+				   &entry->next_hop.ip, stats.packets, stats.bytes, stats.lastused);
 		return 0;
 	}
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"

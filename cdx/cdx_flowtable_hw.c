@@ -3,6 +3,7 @@
  * hash, route hash, CMM notification, or ageing timer owns these objects. */
 #include <linux/etherdevice.h>
 #include <linux/module.h>
+#include <net/ipv6.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "control_ipv4.h"
@@ -45,7 +46,8 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	*result = NULL;
-	if (rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP)
+	if ((rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP) ||
+	    (rule->family != AF_INET && rule->family != AF_INET6))
 		return -EOPNOTSUPP;
 	in_iface = dpa_get_ifinfo_by_netdev(rule->in);
 	out_iface = dpa_get_ifinfo_by_netdev(rule->out);
@@ -79,25 +81,51 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	ct->twin = &hw->twin;
 	hw->twin.twin = ct;
 	ct->pRtEntry = &hw->route;
-	ct->fftype = FFTYPE_IPV4;
 	ct->status = CONNTRACK_ORIG;
-	if (rule->new_src != rule->src || rule->new_dst != rule->dst ||
-	    rule->new_sport != rule->sport || rule->new_dport != rule->dport)
-		ct->status |= CONNTRACK_NAT;
 	ct->proto = rule->proto;
-	ct->Saddr_v4 = rule->src;
-	ct->Daddr_v4 = rule->dst;
 	ct->Sport = rule->sport;
 	ct->Dport = rule->dport;
 	/* The shared encoder derives rewrites from the inverse translated tuple.
-	 * Only the original match participates in classifier key/hash creation. */
-	ct->twin_Saddr = hw->twin.Saddr_v4 = rule->new_dst;
-	ct->twin_Daddr = hw->twin.Daddr_v4 = rule->new_src;
-	ct->twin_Sport = hw->twin.Sport = rule->new_dport;
-	ct->twin_Dport = hw->twin.Dport = rule->new_sport;
+	 * Only the original match participates in classifier key/hash creation.
+	 * Ports always come from the twin object; addresses come from the twin
+	 * for IPv6 and from the entry's own twin_* fields for IPv4. Those fields
+	 * overlay the second half of Daddr_v6, so an IPv6 entry must leave every
+	 * one of them alone or it corrupts its own destination address. */
+	hw->twin.Sport = rule->new_dport;
+	hw->twin.Dport = rule->new_sport;
 	hw->twin.proto = rule->proto;
-	ct->hash = HASH_CT(rule->src, rule->dst, rule->sport, rule->dport,
-			   rule->proto);
+	if (rule->family == AF_INET6) {
+		ct->fftype = FFTYPE_IPV6;
+		memcpy(ct->Saddr_v6, rule->src.ip6, sizeof(ct->Saddr_v6));
+		memcpy(ct->Daddr_v6, rule->dst.ip6, sizeof(ct->Daddr_v6));
+		memcpy(hw->twin.Saddr_v6, rule->new_dst.ip6, sizeof(hw->twin.Saddr_v6));
+		memcpy(hw->twin.Daddr_v6, rule->new_src.ip6, sizeof(hw->twin.Daddr_v6));
+		/* The IPv6 encoder rewrites each address whenever its bit is set
+		 * and never compares the two, and it gates the port rewrite on
+		 * either bit. Mark a direction translated when its address or its
+		 * port moved, exactly as the legacy IPv6 control path does. */
+		if (!ipv6_addr_equal(&rule->new_src.in6, &rule->src.in6) ||
+		    rule->new_sport != rule->sport)
+			ct->status |= CONNTRACK_SNAT;
+		if (!ipv6_addr_equal(&rule->new_dst.in6, &rule->dst.in6) ||
+		    rule->new_dport != rule->dport)
+			ct->status |= CONNTRACK_DNAT;
+		ct->hash = HASH_CT6(ct->Saddr_v6, ct->Daddr_v6, rule->sport,
+				    rule->dport, rule->proto);
+	} else {
+		ct->fftype = FFTYPE_IPV4;
+		ct->Saddr_v4 = rule->src.ip;
+		ct->Daddr_v4 = rule->dst.ip;
+		ct->twin_Saddr = hw->twin.Saddr_v4 = rule->new_dst.ip;
+		ct->twin_Daddr = hw->twin.Daddr_v4 = rule->new_src.ip;
+		ct->twin_Sport = rule->new_dport;
+		ct->twin_Dport = rule->new_sport;
+		if (rule->new_src.ip != rule->src.ip || rule->new_dst.ip != rule->dst.ip ||
+		    rule->new_sport != rule->sport || rule->new_dport != rule->dport)
+			ct->status |= CONNTRACK_NAT;
+		ct->hash = HASH_CT(rule->src.ip, rule->dst.ip, rule->sport,
+				   rule->dport, rule->proto);
+	}
 	if (insert_entry_in_classif_table(ct)) {
 		kfree(hw);
 		return -EIO;
