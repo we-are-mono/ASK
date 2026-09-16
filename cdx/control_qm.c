@@ -472,8 +472,14 @@ void qm_exit(void)
 	return;
 }
 
-#if MAX_SCHEDULER_QUEUES > DPAA_ETH_TX_QUEUES
-#error MAX_SCHEDULER_QUEUES exceeds DPAA_ETH_TX_QUEUES
+/* CEETM class queues and netdev Tx queues are separate index spaces. This
+ * used to compare the scheduler's queue count against DPAA_ETH_TX_QUEUES,
+ * which held only because both happened to be sized from NR_CPUS; the Tx path
+ * masks a class-queue id into conf_fqs[] regardless, so nothing was actually
+ * protected. What has to hold is that the netdev reserves a queue slot for
+ * every class a hardware qdisc could give away. */
+#if MAX_SCHEDULER_QUEUES > DPAA_ETH_CEETM_LEAF_QUEUES
+#error MAX_SCHEDULER_QUEUES exceeds the reserved leaf-class queue headroom
 #endif
 
 int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
