@@ -35,7 +35,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 
 | # | Subsystem | Lines | FCI cmds | Linux mechanism | Effort | Notes |
 | ---: | --- | ---: | ---: | --- | --- | --- |
-| 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | High | Largest command surface and the most likely blocker: `USE_QOSCONNMARK`, `ENABLE_INGRESS_QOS` and `ENABLE_EGRESS_QOS` are all in the shipping build. Shaping has no flowtable concept. |
+| 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Partial — `FLOW_OFFLOAD_XMIT_XFRM` | High | The xmit type exists, but SA handling, rekey and ESN live entirely in CDX. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | The flowtable is unicast-conntrack by construction. Needs a parallel replication path rather than a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
@@ -330,6 +330,12 @@ what it holds.
 offload have no Linux counterpart at all, so the question is whether the
 product still needs them, not how to port them.
 
-**QoS is the critical path.** It has the largest command surface of anything
-remaining, and all three of its build features ship today, so CMM cannot be
-retired while it is outstanding regardless of how the other items progress.
+**QoS is no longer the critical path.** Its three build features are compiled
+in, but `/etc/config/cmmqos` ships with `enabled '0'` and nothing sends
+`CMD_QM_QOSENABLE`, so the plane is dormant end to end and CEETM is bypassed on
+every port. The scoping work found that only one of its three planes —
+per-flow classification — needs a new mechanism, and that mechanism is a `u32`
+on `cdx_ft_rule` fed from the standard `ct->mark`. The scheduler and policer
+planes are a control-transport swap over hardware that is already built
+unconditionally at module load. See the [QoS design](flowtable-qos.md) for the
+mechanism, the three control-plane options and the sequencing.
