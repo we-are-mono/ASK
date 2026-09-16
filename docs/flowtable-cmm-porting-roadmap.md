@@ -64,6 +64,35 @@ IPv6 entry's destination address occupies the bytes IPv4 uses for its twin
 mirror, so the legacy twin fields must be left untouched. Both are the kind of
 defect that admits flows and then misroutes them, rather than failing loudly.
 
+## Parity measurements
+
+Retirement requires parity, not just capability, so every feature ported needs
+a like-for-like comparison against the owner it replaces. The two owners are
+exclusive per boot, so each row is a paired boot: same image, same NAT rule,
+same traffic, same CPU accounting, only the owner differs.
+
+**IPv4 TCP masquerade, 4 streams, 30 s, non-KASAN image — 2026-09-16**
+
+| Direction | Flowtable | CMM |
+| --- | --- | --- |
+| LAN to WAN | 9.41 Gb/s, 1.33% DUT CPU | 9.41 Gb/s, 1.42% DUT CPU |
+| WAN to LAN | 9.40 Gb/s, 14.29% DUT CPU | 9.40 Gb/s, 14.56% DUT CPU |
+
+Both owners were confirmed to have actually offloaded rather than reaching the
+rate in software: the flowtable adapter held ten directional entries, and the
+CMM connection table held the five connections with the masqueraded reply
+tuple. Software forwarding on this SoC does not exceed roughly 0.5 Gb/s, so
+the rate alone also excludes a fallback.
+
+The rates are identical and the CPU difference is within run-to-run noise in
+both directions. The reverse direction costs an order of magnitude more CPU
+than the forward one under *both* owners, so that asymmetry belongs to the
+path rather than to either owner; it is unexplained and worth its own look,
+but it is not a flowtable regression.
+
+This covers one feature. The remaining subsystems each need their own paired
+measurement before the retirement claim can be made for them.
+
 ## Sequencing
 
 **Items 2 to 4 are the natural next increments.** Linux supplies the mechanism,
