@@ -670,6 +670,24 @@ static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_bloc
     assert(block_write_lock && *block_write_lock);
     list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
 }
+/* The direct route's pair. Netfilter holds flow_block_lock across the whole of
+ * ndo_setup_tc there, so the exclusion the indirect move asserts has to hold
+ * here too -- it is just the caller who established it. No case reaches these
+ * yet: nothing registers the direct entry point. */
+static struct flow_block_cb *flow_block_cb_alloc(rule_callback_t fn, void *ident,
+    void *priv, void (*release)(void *))
+{
+    if (callback_allocation_fail) return ERR_PTR(-ENOMEM);
+    struct flow_block_cb *cb = kzalloc(sizeof(*cb), GFP_KERNEL); assert(cb);
+    cb->ident = ident; cb->priv = priv; cb->release = release;
+    if (invalidate_on_bind) { assert(ft_bound); ft_invalidate(); }
+    return cb;
+}
+static void flow_block_cb_remove(struct flow_block_cb *cb, struct flow_block_offload *bo)
+{
+    assert(block_write_lock && *block_write_lock);
+    list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
+}
 /* What the encoder would write into the two PPPoE opcodes, recorded so a test
  * can require the index rather than the slot pointer: a direction that strips
  * counts into its session's receive half, one that inserts into the transmit

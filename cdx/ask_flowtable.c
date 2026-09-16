@@ -46,6 +46,7 @@
 #include <net/netfilter/nf_flow_table.h>
 #include <net/switchdev.h>
 #include "cdx_flowtable_backend.h"
+#include "cdx_flowtable.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 8
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
@@ -1555,29 +1556,43 @@ static bool ft_can_rearm(void)
 		!ft_bound && !ft_count && !ft_neighbour_refs && !ft_handle_refs && !cdx_ft_pending();
 }
 
-static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
-		   enum tc_setup_type type, void *data, void *table,
-		   void (*cleanup)(struct flow_block_cb *))
+/* Netfilter reaches a driver by one of two routes, and they disagree about two
+ * things that no build can check.
+ *
+ * nf_flow_table_offload_setup() picks between them purely on whether the netdev
+ * has an ndo_setup_tc, so which route runs is a property of the driver rather
+ * than of this adapter, and it can change underneath it.
+ *
+ * The indirect route calls us before block_setup takes flow_block_lock, so
+ * UNBIND has to take it here. The direct route already holds it across
+ * ndo_setup_tc, for both commands, so taking it there would deadlock on a
+ * non-recursive rwsem at the first unbind. The callback also has to be
+ * allocated and removed with the matching pair of helpers.
+ *
+ * Everything else is identical, so both routes share this body and differ only
+ * in the two places named above.
+ */
+static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
+			  struct nf_flowtable *flowtable, bool indirect,
+			  struct Qdisc *sch, void (*cleanup)(struct flow_block_cb *))
 {
-	struct flow_block_offload *bo = data;
-	struct nf_flowtable *flowtable = table;
 	struct cdx_ft_binding *binding, *other;
 	struct flow_block_cb *cb;
 	bool rearm;
 	int rc = 0;
 
-	if (type != TC_SETUP_FT || sch || !bo || !bo->block || !bo->net || !dev || !table ||
+	if (!bo || !bo->block || !bo->net || !dev || !flowtable ||
 	    !net_eq(bo->net, &init_net) ||
 	    bo->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
 		return -EOPNOTSUPP;
 	bo->driver_block_list = &ft_block_list;
-	/* The indirect Netfilter path invokes us before block_setup takes its
-	 * write lock. UNBIND moves a live callback onto bo's temporary list:
-	 * exclude statistics/replace/delete walkers for that move as well as
-	 * for the later free. Otherwise a walker can follow the temporary list
-	 * head as if it were a callback. Take this before the CDX transaction,
-	 * matching the order used by rule callbacks under the read lock. */
-	if (bo->command == FLOW_BLOCK_UNBIND)
+	/* UNBIND moves a live callback onto bo's temporary list: exclude
+	 * statistics/replace/delete walkers for that move as well as for the
+	 * later free. Otherwise a walker can follow the temporary list head as
+	 * if it were a callback. Take this before the CDX transaction, matching
+	 * the order used by rule callbacks under the read lock. On the direct
+	 * route the caller has already taken it. */
+	if (indirect && bo->command == FLOW_BLOCK_UNBIND)
 		down_write(&flowtable->flow_block_lock);
 	cdx_ft_begin();
 	if (bo->command == FLOW_BLOCK_BIND) {
@@ -1596,7 +1611,7 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 			goto out;
 		}
 		list_for_each_entry(other, &ft_bindings, list)
-			if (other->table != table || other->dev == dev) {
+			if (other->table != flowtable || other->dev == dev) {
 				rc = -EBUSY;
 				goto out;
 			}
@@ -1606,9 +1621,11 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 			goto out;
 		}
 		binding->dev = dev;
-		binding->table = table;
-		cb = flow_indr_block_cb_alloc(ft_rule_callback, dev, binding,
-			ft_release, bo, dev, sch, table, NULL, cleanup);
+		binding->table = flowtable;
+		cb = indirect ?
+			flow_indr_block_cb_alloc(ft_rule_callback, dev, binding,
+				ft_release, bo, dev, sch, flowtable, NULL, cleanup) :
+			flow_block_cb_alloc(ft_rule_callback, dev, binding, ft_release);
 		if (IS_ERR(cb)) {
 			kfree(binding);
 			rc = PTR_ERR(cb);
@@ -1643,17 +1660,48 @@ static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
 			rc = -ENOENT;
 			goto out;
 		}
-		flow_indr_block_cb_remove(cb, bo);
+		if (indirect)
+			flow_indr_block_cb_remove(cb, bo);
+		else
+			flow_block_cb_remove(cb, bo);
 		list_del(&cb->driver_list);
 	} else {
 		rc = -EOPNOTSUPP;
 	}
 out:
 	cdx_ft_end();
-	if (bo->command == FLOW_BLOCK_UNBIND)
+	if (indirect && bo->command == FLOW_BLOCK_UNBIND)
 		up_write(&flowtable->flow_block_lock);
 	return rc;
 }
+
+/* The indirect route. Netfilter hands the flowtable across as its own argument
+ * here, and a Qdisc is never expected on a TC_SETUP_FT bind. */
+static int ft_bind(struct net_device *dev, struct Qdisc *sch, void *priv,
+		   enum tc_setup_type type, void *data, void *table,
+		   void (*cleanup)(struct flow_block_cb *))
+{
+	if (type != TC_SETUP_FT || sch)
+		return -EOPNOTSUPP;
+	return ft_block_setup(dev, data, table, true, sch, cleanup);
+}
+
+/* The direct route, for a netdev that has grown an ndo_setup_tc. Netfilter
+ * passes no flowtable here, but it set bo->block to that flowtable's own
+ * embedded block, so the owner is recoverable rather than absent. Nothing
+ * calls this until a driver registers it, and that registration is what moves
+ * every bind on the device from the indirect route to this one. */
+int cdx_ft_setup_tc(struct net_device *dev, enum tc_setup_type type, void *type_data)
+{
+	struct flow_block_offload *bo = type_data;
+
+	if (type != TC_SETUP_FT || !bo || !bo->block)
+		return -EOPNOTSUPP;
+	return ft_block_setup(dev, bo,
+			      container_of(bo->block, struct nf_flowtable, flow_block),
+			      false, NULL, NULL);
+}
+EXPORT_SYMBOL(cdx_ft_setup_tc);
 
 static void ft_invalidate_work(struct work_struct *work)
 {
