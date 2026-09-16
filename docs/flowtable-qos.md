@@ -372,24 +372,32 @@ collide as duplicate keys; and `ft_replace()` compares whole rules with
 
 - `cdx/cdx_flowtable_backend.h` — add the field, document it as the decoded
   `(channel, class queue)` pair rather than the raw mark.
-- `cdx/ask_flowtable.c` — drop `READ_ONCE(cls->nf_ct->mark)` from the refusal
-  conjunction at `:562`; decode under the mask after `ft_translation()`
-  succeeds, taking the direction from
-  `ft_tuple_matches(out, &ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple)`; add the
-  value to the proc row near `:1320`.
+- `cdx/ask_flowtable.c` — narrow the refusal from "any mark" to "any bit
+  outside the mask", decode under the mask after `ft_translation()` succeeds,
+  and report the class in the proc row.
+
+  No direction split is needed. Each direction is admitted as its own rule, so
+  the value is already per-direction; both directions simply read one mark. A
+  channel nibble of zero resolves to whichever channel the egress port owns, so
+  a single class index means "this priority, on whatever port this direction
+  leaves by" — which is what a per-port tree wants. Asymmetric classes would
+  need a second field and are not in this increment.
 - `cdx/cdx_flowtable_hw.c` — write `ct->qosmark.chnl_id` and `.queue` in
   `cdx_ft_hw_add()`.
-- `tools/ask_flowtable.py` — relax `ct mark != 0 return` at `:138` to the
-  configured mask, and validate the policy's own `mark` selectors against the
-  kernel's mask rather than allowing them to contradict it.
+- `tools/ask_flowtable.py` — render the guard from the mask the running
+  adapter reports rather than restating a constant, which moves the render
+  inside the lock because only a live backend knows the mask. Policy `mark`
+  selectors keep their existing "representable for migration" status; making a
+  dead selector an error would regress that.
 
-Two decisions belong to this increment. The **mask** is a `0444` module
-param, matching `offload_owner`'s boot-immutable shape and the per-boot
-ownership model; the controller reads it back from
-`/sys/module/ask_flowtable/parameters/`. The **default class** must be
-explicit: an unmarked flow currently resolves to CEETM queue 7, the lowest
-strict priority, and leaving that implicit means every unclassified flow
-silently lands in the worst queue.
+Two decisions belong to this increment. The **mask** is a `0444` module param,
+matching `offload_owner`'s boot-immutable shape, and zero means classification
+is off and every marked flow is refused — the historical contract, byte for
+byte. The **default class** is explicit: an unmarked flow resolves to CEETM
+queue 7, the lowest strict priority. That is the right answer for best-effort
+traffic, but only once it is chosen rather than inherited from `kzalloc`.
+Both are validated at load, because a boot-immutable parameter has exactly one
+moment to be rejected out loud.
 
 *Proof.* Buildable on the rig today. `tools/tests/test_qos_control.py` already
 queries all 128 class queues over `CMD_QM_QUERY_QUEUE` and reads back their

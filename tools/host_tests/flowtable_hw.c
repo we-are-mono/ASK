@@ -170,6 +170,10 @@ typedef struct CtEntry {
         };
         struct { __be32 Saddr_v6[4], Daddr_v6[4]; };
     };
+    /* Only the two fields the backend writes. The production union carries
+     * ingress-policer and DSCP-marking bits as well; leaving them out keeps a
+     * case honest about which ones this path is responsible for. */
+    struct { unsigned queue : 4; unsigned chnl_id : 4; } qosmark;
 } CtEntry, *PCtEntry;
 static struct itf in_itf = {129, 1}, out_itf = {129, 2};
 typedef struct { struct itf *itf; unsigned flags; } OnifDesc, *POnifDesc;

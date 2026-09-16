@@ -167,6 +167,17 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		encap.ingress_stats_index = stats->in_session->rx_index;
 	if (stats->out_session)
 		encap.egress_stats_index = stats->out_session->tx_index;
+	/* The shared encoder reads this on its way to cdx_get_txfq(), which
+	 * resolves the pair to a CEETM logical FQ and bakes that FQID into the
+	 * classifier action. Leaving it zero, as this backend did before, asks
+	 * for class queue zero of the port's least-priority channel — which
+	 * GET_CEETM_PRIORITY inverts to the *lowest* strict priority. That is a
+	 * defensible best-effort default, but only when it is chosen rather
+	 * than inherited from kzalloc, which is why the adapter always supplies
+	 * a class and names the default explicitly. */
+	ct->qosmark.queue = rule->qos & CDX_FT_QOS_QUEUE_MASK;
+	ct->qosmark.chnl_id = (rule->qos & CDX_FT_QOS_CHANNEL_MASK) >>
+			      CDX_FT_QOS_CHANNEL_SHIFT;
 	/* A flow with no encapsulation asks for no override, and takes exactly
 	 * the path it took before tags existed. The override refuses a
 	 * description the interfaces already filled in -- a DSCP-to-PCP egress

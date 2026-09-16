@@ -126,16 +126,22 @@ def policy_hash(policy):
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def render(policy):
+def render(policy, qos_mark_mask=0):
     validate(policy)
     require(policy["enabled"], "disabled policy has no nftables table to render")
     devices = ", ".join(json.dumps(d) for d in policy["devices"])
+    # Mirror the adapter's own admission test rather than restating it. Bits
+    # inside the mask carry the egress class and are decoded; every other bit
+    # still means something the backend cannot honour, so the flow stays in
+    # software. With no mask that is the whole word, which is the historical
+    # "ct mark != 0 return" exactly.
+    refused = ~qos_mark_mask & 0xffffffff
     lines = [f"table inet {TABLE} {{", f' comment "{MARKER}{policy_hash(policy)}"',
              f" flowtable fast {{ hook ingress priority 0; devices = {{ {devices} }}; flags offload; }}",
              " chain admit {", "  type filter hook forward priority 10; policy accept;",
              "  meta nfproto != ipv4 return", "  meta l4proto != { tcp, udp } return",
              "  ct direction != original return", "  ct state != established return",
-             "  ct mark != 0 return"]
+             f"  ct mark & {refused:#x} != 0x0 return"]
     for field, action in (("exclude", "return"), ("scope", "flow add @fast")):
         for rule in policy[field]:
             for expression in match(rule, exclusion=field == "exclude"):
@@ -242,7 +248,7 @@ class Runtime:
 
     def apply(self, policy):
         validate(policy)
-        script = render(policy) if policy["enabled"] else None
+        script = None
         with self.locked():
             owned, state = self.table(), self.state()
             require(owned or not state or not state["bindings"], "another flowtable owns the backend bindings")
@@ -251,6 +257,10 @@ class Runtime:
                 require(not state["fatal"], "hardware retirement failed; fresh boot required")
                 for device in policy["devices"]:
                     self.require_device(device)
+                # Rendered here, not before the lock: the admission test has to
+                # agree with the mask the running adapter was loaded with, and
+                # only a live backend can report it.
+                script = render(policy, state.get("qos_mark_mask", 0))
             drained = self.remove()
             if not script:
                 return {"enabled": False, "drained": drained}
@@ -297,7 +307,8 @@ def main(argv=None):
         if args.command in ("check", "render", "apply"):
             policy = load_policy(args.config)
             if args.command == "render":
-                print(render(policy), end="")
+                state = backend_state()
+                print(render(policy, state.get("qos_mark_mask", 0) if state else 0), end="")
                 return 0
             result = ({"valid": True, "policy_hash": policy_hash(policy)} if args.command == "check"
                       else runtime.apply(policy))

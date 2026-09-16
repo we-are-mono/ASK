@@ -83,6 +83,8 @@ static bool ipv6_prefix_equal(const struct in6_addr *a, const struct in6_addr *b
 }
 struct ipv6hdr { u8 prefix[8]; struct in6_addr saddr, daddr; };
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
+#define U8_MAX 0xffU
+#define __ffs(x) ((unsigned long)__builtin_ctzl(x))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define GFP_KERNEL 0
@@ -490,6 +492,9 @@ static bool ft_watch_lock;
 static LIST_HEAD(ft_block_list);
 static LIST_HEAD(ft_session_stats);
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
+/* Module parameters in production; plain globals here so a case can set the
+ * mask, drive ft_parse, and read the class back off the rule. */
+static unsigned int ft_qos_mark_mask, ft_qos_default_class;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_admission_invalidations;

@@ -21,6 +21,16 @@
 #include "cdx_ceetm_app.h"
 #include "cdx_ceetm_gdef.h"
 #include "cdx_common.h"
+#include "cdx_flowtable_backend.h"
+
+/* The flowtable adapter decodes a conntrack mark into a channel and class
+ * queue, and bounds the channel with its own constant because it must not
+ * include CEETM headers. The number belongs to this file, so the check does
+ * too: widening the channel count here fails the build until the rule's
+ * encoding is widened to match, rather than silently admitting flows onto a
+ * channel the adapter would have rejected. */
+static_assert(CDX_FT_QOS_MAX_CHANNEL == CDX_CEETM_MAX_CHANNELS,
+	      "cdx_ft_rule.qos channel bound must track CEETM's channel count");
 
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
 static bool ceetm_callbacks_registered;
