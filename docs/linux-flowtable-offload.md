@@ -9,7 +9,7 @@ This is a maintained development path with a defined feature boundary; it does
 not yet replace every feature available through CMM.
 
 Development branch: `feat/linux-flowtable-offload`, starting at `7603f11`.
-Current checkpoint: IPv6, 802.1Q VLAN, bridging, IPv4 TCP/UDP NAT and
+Current checkpoint: IPv6, 802.1Q VLAN, bridging, PPPoE, IPv4 TCP/UDP NAT and
 32,768-direction capacity (2026-09-16).
 
 ## Reading guide
@@ -23,6 +23,7 @@ Current checkpoint: IPv6, 802.1Q VLAN, bridging, IPv4 TCP/UDP NAT and
 | IPv6 eligibility, what the family really changes, and its proof | [IPv6 guide](flowtable-ipv6.md) |
 | Where VLAN tags come from, the logical/physical split, and its proof | [VLAN guide](flowtable-vlan.md) |
 | Why a bridged flow keeps its destination, where its tags come from, and its proof | [Bridge guide](flowtable-bridge.md) |
+| Why a PPPoE session is handed over rather than derived, what stands in for its neighbour, and its proof | [PPPoE guide](flowtable-pppoe.md) |
 | Admission budget, pressure and resource reuse | [Capacity guide](flowtable-capacity.md) |
 | Original proposal, implementation snapshots and dated measurements | [History by topic and chronology](flowtable/history/README.md) |
 | Remaining intermittent UDP/link observations | [UDP loss investigation](flowtable-udp-loss-investigation.md) |
@@ -42,12 +43,13 @@ configuration instructions.
 | Kernel and hardware | Repository Linux 6.12.103 with its pinned SDK, LS1046A DPAA/FMAN and existing proprietary NXP firmware |
 | Topology and capacity | One hardware flowtable, two initial-netns physical Ethernet ports, at most 32,768 directional entries |
 | Routed traffic | Unicast IPv4 and IPv6 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
-| Encapsulation | 802.1Q VLAN subinterfaces on either port, up to two stacked tags per direction, ingress and egress independently. The tag stack is derived from the devices Linux routed through and the pop/push actions must agree with it. 802.1ad, a VLAN device overriding its parent's MAC, and any upper device that is neither an 802.1Q VLAN nor a bridge (PPPoE, bond, MACVLAN) are declined |
+| Encapsulation | 802.1Q VLAN subinterfaces on either port, up to two stacked tags per direction, ingress and egress independently. The tag stack is derived from the devices Linux routed through and the pop/push actions must agree with it. 802.1ad, a VLAN device overriding its parent's MAC, and any upper device that is neither an 802.1Q VLAN, a bridge nor a PPPoE session (bond, MACVLAN) are declined |
+| PPPoE | One IPv4 session per direction, outermost, over a physical port or over the VLAN device or bridge below it. The session is not derived but carried from the kernel's own forwarding-path walk through patch 140, because a ppp device registers no lower neighbour and the session lives in a pppox socket; the push action's sid must agree with it. A session spends one of the two encapsulation slots, so it admits one tag alongside and PPPoE over QinQ is declined. A session egress has no neighbour and no Ethernet destination — Netfilter writes zeros, and the concentrator the session names is required instead. IPv6 over a session is declined: the insert opcode carries no PPP protocol id and the firmware's choice is unverified |
 | Bridging | One bridge master per direction, which must be the physical port's own master. Its effective tag stack is derived from the bridge's VLAN groups exactly as `br_vlan_fill_forward_path_*()` derives it, so a vlan-aware bridge over a tagged or an untagged port and a plain bridge are all described. A bridge port that is itself a stacked device, a port reporting a switchdev parent, and a bridge whose MAC differs from the egress port's are declined. Transmit stays NEIGH: patch 140 keeps the borrowed destination on a bridged path so the routed contract applies unchanged |
 | Throughput | Loki → Vision TCP NAT: 9.414 Gb/s receive, 1.84% aggregate DUT CPU on the KASAN image. Routed IPv6 TCP: 9.173 Gb/s forward and 9.260 Gb/s reverse on the same image, against 97.9 Mb/s with the same flow forwarded in software |
 | NAT | TCP/UDP static source NAT, MASQUERADE, destination and hairpin/double NAT in IPv4, including address/port translation and inverse reply translation. IPv6 source and destination NAT, with the full 128-bit address rewrite and its inverse |
 | Routing and neighbours | Direct routes, IPv4 gateways, IPv6 gateways including link-local next hops, permanent neighbours, ordinary ARP and neighbour discovery |
-| Automatic recovery | Dependent route, neighbour, physical MTU/MAC and link-state retirement followed by fresh admission. A bridged flow additionally retires when the FDB entry that chose its egress port moves, ages out or is deleted, and when the bridge's per-port VLAN membership is reconfigured |
+| Automatic recovery | Dependent route, neighbour, physical MTU/MAC and link-state retirement followed by fresh admission. A bridged flow additionally retires when the FDB entry that chose its egress port moves, ages out or is deleted, and when the bridge's per-port VLAN membership is reconfigured. A PPPoE session dropping retires selectively through the route watch, leaving the bindings up and admission enabled, so a redial readmits without the table being touched |
 | Lifetime and policy | Conntrack/flow expiry and deletion, safe adapter unload, explicit global recovery, live policy revocation, bounded capacity fallback |
 | Ownership | CMM remains the default boot path; flowtable ownership is explicit and immutable for the boot |
 
@@ -58,9 +60,18 @@ explicit partial-generation recovery. Hardware flags alone do not establish
 that both directions are offloaded.
 
 Counter-enabled hardware tables are refused because firmware counters include
-classifier hits that can later be punted to Linux. PPPoE, MACVLAN, multicast, IPsec, tunnels and Wi-Fi
+classifier hits that can later be punted to Linux. MACVLAN, multicast, IPsec, tunnels and Wi-Fi
 need their own eligibility contracts and proofs. Unsupported hardware traffic
 remains governed by Linux forwarding and firewall policy.
+
+A PPPoE session renegotiated under a `pppN` device that never disappears is not
+detected. Every change to the device a session runs over destroys the session,
+which pppd turns into the ppp device going away and the adapter retires on; a
+reconnection that keeps the unit changes the id and the concentrator under a
+device that stayed. The failure mode is loss rather than misdelivery, and no
+exported interface reports a session change. Neither does any session carry
+per-session byte counters, for the same reason a tagged flow carries no
+per-VLAN-interface ones.
 
 A tagged flow carries no per-VLAN-interface byte counters. CMM maintains those
 in firmware against a registered VLAN interface and returns them over FCI,
@@ -165,7 +176,7 @@ Prove each increment before expanding its supported boundary. The
 [foundation checkpoint](flowtable-foundation.md) remains the base for further
 interface and protocol features.
 
-PPPoE, MACVLAN, multicast, IPsec and tunnels need feature-specific Linux
+MACVLAN, multicast, IPsec and tunnels need feature-specific Linux
 integration and firmware eligibility; they should not be forced through a
 unicast flowtable contract that cannot express their behaviour. Scheduling those
 features depends on product needs and evidence from the preceding increments.

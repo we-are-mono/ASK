@@ -33,10 +33,18 @@ typedef uint64_t u64;
 /* Host order in this description, as the header manipulation expects: it
  * applies cpu_to_be16/32 itself when it lays the tags out. */
 struct vlan_header { uint16_t tpid, tci; };
+#define ETHER_ADDR_LEN 6
 struct cdx_l2_encap {
     u32 num_ingress, num_egress;
     struct vlan_header ingress[DPA_CLS_HM_MAX_VLANs];
     struct vlan_header egress[DPA_CLS_HM_MAX_VLANs];
+    /* A session needs no reversal and no ordering of its own: there is at
+     * most one per direction and it is always the innermost header. The
+     * ingress side carries no identity because the strip validates none. */
+    u8 ingress_pppoe;
+    u8 egress_pppoe;
+    u16 egress_session_id;
+    u8 egress_session_mac[ETHER_ADDR_LEN];
 };
 union nf_inet_addr {
     u32 all[4];
@@ -189,7 +197,8 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     memset(&observed_encap, 0, sizeof(observed_encap));
     observed_encap_given = encap != NULL;
     if (encap) {
-        assert(encap->num_ingress || encap->num_egress);
+        assert(encap->num_ingress || encap->num_egress ||
+               encap->ingress_pppoe || encap->egress_pppoe);
         observed_encap = *encap;
     }
     assert(!memcmp((expected_hairpin ? in_iface : out_iface).eth_info.mac_addr, (u8[]){2,0,0,0,0,0}, 6));
@@ -467,6 +476,37 @@ int main(void)
     rule.in_vlans = rule.out_vlans = 0;
     memset(rule.in_vlan, 0, sizeof(rule.in_vlan));
     memset(rule.out_vlan, 0, sizeof(rule.out_vlan));
+
+    /* A PPPoE session on its own asks for an override even though it carries
+     * no tag at all, which is the one shape a tag-count test would miss. The
+     * egress side passes its id and the concentrator's address through
+     * untouched; the ingress side is a bare flag, because the strip opcode
+     * takes no identity. */
+    rule.out_session = (struct cdx_ft_session){ .mac = {2,0xac,0,0,0,1},
+                                                .id = 0x1234, .present = true };
+    rule.in_session = (struct cdx_ft_session){ .present = true };
+    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(observed_encap_given);
+    assert(!observed_encap.num_ingress && !observed_encap.num_egress);
+    assert(observed_encap.egress_pppoe && observed_encap.ingress_pppoe);
+    assert(observed_encap.egress_session_id == 0x1234);
+    assert(!memcmp(observed_encap.egress_session_mac, (u8[]){2,0xac,0,0,0,1}, 6));
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    /* A session inside a tag: both descriptions travel together, and the tag
+     * still reverses while the session does not. */
+    rule.out_vlans = 1;
+    rule.out_vlan[0] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 100 };
+    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(observed_encap.num_egress == 1 && observed_encap.egress[0].tci == 100);
+    assert(observed_encap.egress_pppoe && observed_encap.egress_session_id == 0x1234);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    rule.out_vlans = 0;
+    memset(rule.out_vlan, 0, sizeof(rule.out_vlan));
+    rule.in_session = rule.out_session = (struct cdx_ft_session){};
+    /* And with neither, the override is withheld again. */
+    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(!observed_encap_given);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     assert(cdx_ft_hw_add(&rule,&hw)==0);

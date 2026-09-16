@@ -57,13 +57,21 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_mcast_hcsync_quarantine.py 261..264 (ASK_MCAST_HCSYNC_BASE_VID)
 #   test_flowtable_vlan.py      271/272      (ASK_FLOWTABLE_VLAN_ID, +1 inner)
 #   test_flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
+#   test_flowtable_pppoe.py     276          (ASK_FLOWTABLE_PPPOE_LAN_VID)
 #   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
+#
+# 3900 is not a claim on that segment but a standing bench VLAN: the
+# orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
+# concentrator binds to it, so test_flowtable_pppoe.py builds eth4.3900 on the
+# DUT to meet it and never creates or deletes anything on the orchestrator
+# side. Do not reuse 3900 for a test that does.
 #
 # Overlaps that are safe only because the pairs never run concurrently and
 # both sides tear down in finalizers: bridge 231/232 vs mcast_failslab
 # 231/232; mcast_replication 241/242/243 vs mcast_concurrent 241+.
 VLAN_IDS_MCAST: tuple[int, int, int]  = (241, 242, 243)
 VLAN_IDS_BRIDGE: tuple[int, int]      = (231, 232)
+VLAN_ID_PPPOE_WAN: int                = 3900
 
 # Bench wiring: the DUT's eth3 faces the LAN client VM, eth4 faces the
 # WAN/orchestrator segment. Every test that needs a role-scoped DUT port

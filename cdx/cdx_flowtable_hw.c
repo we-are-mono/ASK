@@ -145,17 +145,25 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 				   rule->dport, rule->proto);
 	}
 	/* Both ports are physical, so the interface walk describes no
-	 * encapsulation at all; the tags admission derived from the devices
-	 * Linux routed through are the whole description. */
+	 * encapsulation at all; the tags and sessions admission derived from
+	 * the devices Linux routed through are the whole description. A session
+	 * needs no reversal: there is at most one per direction, and it is
+	 * always the innermost header, which is where the opcode order already
+	 * puts it. */
 	ft_encap(rule->in_vlan, rule->in_vlans, encap.ingress, &encap.num_ingress);
 	ft_encap(rule->out_vlan, rule->out_vlans, encap.egress, &encap.num_egress);
-	/* A flow with no tags asks for no override, and takes exactly the path
-	 * it took before tags existed. The override refuses a description the
-	 * interfaces already filled in -- a DSCP-to-PCP egress map is the one
-	 * thing that does so -- and that refusal must not reach a flow that is
-	 * not asking to replace anything. */
+	encap.ingress_pppoe = rule->in_session.present;
+	encap.egress_pppoe = rule->out_session.present;
+	encap.egress_session_id = rule->out_session.id;
+	ether_addr_copy(encap.egress_session_mac, rule->out_session.mac);
+	/* A flow with no encapsulation asks for no override, and takes exactly
+	 * the path it took before tags existed. The override refuses a
+	 * description the interfaces already filled in -- a DSCP-to-PCP egress
+	 * map is the one thing that does so -- and that refusal must not reach
+	 * a flow that is not asking to replace anything. */
 	if (insert_entry_in_classif_table_encap(
-		    ct, encap.num_ingress || encap.num_egress ? &encap : NULL)) {
+		    ct, encap.num_ingress || encap.num_egress ||
+			encap.ingress_pppoe || encap.egress_pppoe ? &encap : NULL)) {
 		kfree(hw);
 		return -EIO;
 	}

@@ -21,6 +21,19 @@ struct cdx_ft_vlan {
 	u16 id;
 };
 
+/* One PPPoE session on a direction's path. present says the direction carries
+ * one; id and mac describe it, and are recorded for either direction because
+ * both come from the same path walk. Only an egress session reaches the
+ * hardware: the ingress side is a strip, and a strip validates nothing -- it
+ * removes whatever session header the frame arrived with. A session occupies
+ * one of the encapsulation slots a direction has, so it bounds the tag stack
+ * that can accompany it. */
+struct cdx_ft_session {
+	u8 mac[ETH_ALEN];
+	u16 id;
+	bool present;
+};
+
 /* Private in-repository interface. No CDX, firmware or borrowed Netfilter
  * objects cross it; the address union is a plain UAPI value type shared with
  * conntrack so no tuple has to be transcribed. Addresses and ports are in
@@ -60,6 +73,13 @@ struct cdx_ft_rule {
 	 * the header manipulation rather than by the lookup. */
 	struct cdx_ft_vlan in_vlan[CDX_FT_VLAN_MAX];
 	struct cdx_ft_vlan out_vlan[CDX_FT_VLAN_MAX];
+	/* The PPPoE session each direction crosses, inside every tag above it.
+	 * in_session is stripped on ingress and out_session inserted on egress.
+	 * An egress session also decides dst_mac: a ppp device has no Ethernet
+	 * address and no neighbour, so the concentrator named here is the only
+	 * destination such a direction has. */
+	struct cdx_ft_session in_session;
+	struct cdx_ft_session out_session;
 	u8 in_vlans;
 	u8 out_vlans;
 	u8 family;

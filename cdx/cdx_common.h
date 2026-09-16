@@ -229,6 +229,17 @@ struct dpa_l2hdr_info {
 		uint32_t pppoe_present:1;
 		uint32_t is_wlan_iface:1;
 		uint32_t add_pppoe_hdr:1;
+		/* The two PPPoE header manipulations index the logical
+		 * statistics area by an offset a registered PPPoE interface
+		 * owns. A session described by a flow has no such interface
+		 * and therefore no offset, and the unallocated offset zero
+		 * aims the ucode's counter update at another interface's slot.
+		 * Set this to emit a null statistics pointer instead, which is
+		 * what the vendor's own INCLUDE_PPPoE_IFSTATS-disabled arms
+		 * write. Same purpose vlan_filtering serves for the egress
+		 * VLAN insert, whose field the SDK header documents as "null
+		 * no stats"; the PPPoE opcodes carry no such documentation. */
+		uint32_t pppoe_no_ifstats:1;
 		uint32_t add_eth_type:1;
 		uint32_t dscp_vlanpcp_map_enable:1;
 	};

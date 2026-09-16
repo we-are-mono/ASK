@@ -47,7 +47,7 @@
 #include <net/switchdev.h>
 #include "cdx_flowtable_backend.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 7
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 8
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
 
@@ -374,6 +374,20 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	struct neighbour *neigh;
 	bool valid;
 
+	/* A PPPoE egress has no neighbour to attach. Its Ethernet destination
+	 * is the session's concentrator, which no neighbour ever names: a ppp
+	 * device is NOARP, arp_constructor() rewrites the key of every
+	 * neighbour on it to INADDR_ANY and leaves the hardware address zero,
+	 * so there is nothing to validate against and nothing to keep warm.
+	 * Publish the entry on the watch list all the same -- that list is what
+	 * every device and route notifier scans, and an entry missing from it
+	 * is retired by nothing at all. */
+	if (entry->rule.out_session.present) {
+		spin_lock_bh(&ft_watch_lock);
+		list_add_tail(&entry->neigh_list, &ft_neigh_entries);
+		spin_unlock_bh(&ft_watch_lock);
+		return 0;
+	}
 	/* Neighbours belong to the device the route names, which is the VLAN
 	 * subinterface for a tagged flow; the physical port never sees them. */
 	neigh = neigh_lookup(ft_neigh_table(entry->rule.family), &entry->next_hop,
@@ -398,15 +412,20 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	return valid ? 0 : -EOPNOTSUPP;
 }
 
+/* Watch-list membership and neighbour ownership are no longer the same thing:
+ * a PPPoE egress is published with no neighbour at all. Unlink by the list's
+ * own emptiness, which admission initialises, so this stays correct both for
+ * an entry that never reached the list and for one holding no neighbour. */
 static void ft_neigh_detach(struct cdx_ft_entry *entry)
 {
 	struct neighbour *neigh = entry->neigh;
 
+	spin_lock_bh(&ft_watch_lock);
+	if (!list_empty(&entry->neigh_list))
+		list_del_init(&entry->neigh_list);
+	spin_unlock_bh(&ft_watch_lock);
 	if (!neigh)
 		return;
-	spin_lock_bh(&ft_watch_lock);
-	list_del(&entry->neigh_list);
-	spin_unlock_bh(&ft_watch_lock);
 	entry->neigh = NULL;
 	ft_neighbour_refs--;
 	neigh_release(neigh);
@@ -417,6 +436,12 @@ static bool ft_neigh_used(struct cdx_ft_entry *entry, bool active)
 	struct neighbour *neigh = entry->neigh;
 	bool valid;
 
+	/* Nothing to revalidate for a PPPoE egress, and nothing to solicit:
+	 * the ppp device answers no ARP. What replaces the neighbour as this
+	 * direction's dependency is the ppp device itself, which the netdev
+	 * watch already covers through out_logical. */
+	if (!neigh)
+		return true;
 	read_lock_bh(&neigh->lock);
 	valid = ft_neigh_matches(neigh, entry->rule.dst_mac);
 	read_unlock_bh(&neigh->lock);
@@ -519,8 +544,11 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	/* Four Ethernet mangles, then one action per ingress tag popped and
 	 * per egress tag pushed, then the translation, then the redirect. IPv4
 	 * spends two actions per edit and appends one checksum action; IPv6
-	 * spends five and has no header checksum to recompute. */
-	unsigned int encaps = out->in_vlans + out->out_vlans, offset = 4 + encaps;
+	 * spends five and has no header checksum to recompute. An egress
+	 * session adds one push; an ingress session adds nothing, because
+	 * Linux emits no pop for one. */
+	unsigned int encaps = out->in_vlans + out->out_vlans +
+			      out->out_session.present, offset = 4 + encaps;
 	unsigned int per_edit = out->family == AF_INET6 ? 5 : 2;
 	unsigned int fixed = out->family == AF_INET6 ? 5 : 6;
 	bool forward;
@@ -661,18 +689,29 @@ static int ft_bridge_vlan(struct net_device *bridge, struct net_device *port,
 }
 
 /* Derive the encapsulation Linux would add between a logical device and its
- * physical port, outermost first, and name the bridge the path crosses, if
- * any. Netfilter also describes this stack in its POP/PUSH actions, but the
- * devices are the authority and the actions are checked against them, exactly
- * as a NAT mangle is checked against its conntrack. Stopping on anything that
- * is neither an 802.1Q VLAN device nor a bridge master is what declines a
- * PPPoE session, a bond or a MACVLAN here, rather than admitting a flow whose
- * encapsulation the hardware would not reproduce.
+ * physical port, outermost first, and name the bridge and the PPPoE session
+ * the path crosses, if any. Netfilter also describes this stack in its
+ * POP/PUSH actions, but the devices are the authority and the actions are
+ * checked against them, exactly as a NAT mangle is checked against its
+ * conntrack. Stopping on anything that is neither an 802.1Q VLAN device, a
+ * bridge master nor a ppp device is what declines a bond or a MACVLAN here,
+ * rather than admitting a flow whose encapsulation the hardware would not
+ * reproduce.
+ *
+ * The PPPoE hop is the one part not derived here, because it cannot be: a ppp
+ * device registers no lower neighbour, so there is nothing to descend to, and
+ * the session id and the concentrator's address live in a pppox socket this
+ * module has no view of. session carries what the kernel's own forwarding-path
+ * walk resolved, and that walk is the single authority for the hop -- a second
+ * walk could disagree with the one the rule was built from and then describe
+ * something Netfilter never did. Everything below the hop is walked here as
+ * usual, so a session over a VLAN device or a bridge is still derived.
  * Returns the tag count, or -EOPNOTSUPP for a path this contract excludes.
  */
 static int ft_path_stack(struct net_device *logical, struct net_device *physical,
+			 const struct nf_flow_session *session,
 			 struct cdx_ft_vlan *stack, struct net_device **bridge,
-			 u16 *bridge_vid)
+			 u16 *bridge_vid, struct cdx_ft_session *out_session)
 {
 	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX];
 	unsigned int count = 0, i;
@@ -680,8 +719,41 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 
 	*bridge = NULL;
 	*bridge_vid = 0;
-	if (!logical || !physical)
+	memset(out_session, 0, sizeof(*out_session));
+	if (!logical || !physical || !session)
 		return -EOPNOTSUPP;
+	/* The session hop is taken before the walk rather than inside it, which
+	 * is what makes "at most one, and outermost" structural instead of
+	 * guarded: the loop never comes back here, so a second ppp device, or
+	 * one beneath a tag, is declined by the loop exactly as any other
+	 * unsupported upper device is. That is also what the wire says, since a
+	 * session sits inside every tag. */
+	if (logical->type == ARPHRD_PPP) {
+		struct net_device *lower;
+
+		/* A session that has not completed discovery names no
+		 * concentrator and no usable id; the hardware would insert a
+		 * header nothing answers. Session id 0 is reserved for
+		 * discovery itself. */
+		if (!session->id || !is_valid_ether_addr(session->h_dest))
+			return -EOPNOTSUPP;
+		lower = __dev_get_by_index(&init_net, session->lower_ifindex);
+		if (!lower)
+			return -EOPNOTSUPP;
+		/* The rule the VLAN increment imposes on a logical device,
+		 * applied to the one device a session hides: the Ethernet
+		 * source of a neighbour-output flow is the port's and the
+		 * encoder caches one address per port, so a device below the
+		 * session that overrides it would have software and hardware
+		 * disagree. A ppp device carries no address of its own, so this
+		 * is where that rule has to be stated. */
+		if (!ether_addr_equal(lower->dev_addr, physical->dev_addr))
+			return -EOPNOTSUPP;
+		out_session->present = true;
+		out_session->id = session->id;
+		ether_addr_copy(out_session->mac, session->h_dest);
+		logical = lower;
+	}
 	/* Each step strictly descends and the tag count is bounded, so a path
 	 * that never reaches the port terminates at the bound. The bridge hop
 	 * is terminal, which is what bounds it there. */
@@ -714,6 +786,19 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 		if (!logical)
 			return -EOPNOTSUPP;
 	}
+	/* A session the kernel's walk crossed but this one did not reach is a
+	 * path shape this contract does not describe, and the hardware would be
+	 * asked to forward it with no session header at all. Refuse rather than
+	 * silently drop the hop. */
+	if (session->lower_ifindex && !out_session->present)
+		return -EOPNOTSUPP;
+	/* A session spends one of the encapsulation slots a direction has, so a
+	 * session and a full tag stack together exceed what a tuple can
+	 * describe. Netfilter refuses such a path first, leaving this
+	 * unreachable through it; state the budget anyway rather than let the
+	 * bound be an accident of somebody else's loop. */
+	if (count + out_session->present > CDX_FT_VLAN_MAX)
+		return -EOPNOTSUPP;
 	for (i = 0; i < count; i++)
 		stack[i] = inner[count - 1 - i];
 	return count;
@@ -749,12 +834,20 @@ static bool ft_vlan_match(struct flow_rule *rule, const struct cdx_ft_rule *out)
 }
 
 /* The encapsulation block sits between the Ethernet rewrites and the
- * translation: one POP per ingress tag, then one PUSH per egress tag, each
- * outermost first. A POP carries no identity, so the ingress stack is proven
- * by the devices and the selectors above; a PUSH carries its own and must
- * agree with the stack. An action of any other kind here is a capability this
- * contract does not describe -- a PPPoE session, a tunnel -- and is declined
- * rather than dropped on the floor. */
+ * translation: one POP per ingress tag, then one PUSH per egress tag and one
+ * more for an egress session, each outermost first. A POP carries no identity,
+ * so the ingress stack is proven by the devices and the selectors above; a
+ * PUSH carries its own and must agree with the stack. An action of any other
+ * kind here is a capability this contract does not describe -- a tunnel -- and
+ * is declined rather than dropped on the floor.
+ *
+ * An ingress session contributes nothing to this block, which is the one place
+ * the two sides are not mirror images: nf_flow_rule_route_common() emits a POP
+ * for an 802.1Q tag only, and Linux has no PPPoE pop action to emit. So an
+ * ingress session is proven by the devices alone, and this arithmetic counts
+ * the egress one only. The session push comes last because the session is the
+ * innermost header and the pushes are emitted outermost first.
+ */
 static bool ft_vlan_actions(const struct flow_action *actions,
 			    const struct cdx_ft_rule *out)
 {
@@ -770,6 +863,16 @@ static bool ft_vlan_actions(const struct flow_action *actions,
 		    push->vlan.vid != out->out_vlan[i].id ||
 		    push->vlan.proto != out->out_vlan[i].proto ||
 		    push->vlan.prio)
+			return false;
+	}
+	if (out->out_session.present) {
+		const struct flow_action_entry *push = &actions->entries[at];
+
+		/* The one thing about the hop the rule does describe, so it is
+		 * the one thing that can be cross-checked against the walk the
+		 * session came from. */
+		if (push->id != FLOW_ACTION_PPPOE_PUSH ||
+		    push->pppoe.sid != out->out_session.id)
 			return false;
 	}
 	return true;
@@ -888,30 +991,50 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * neither of which this contract describes. */
 	out->out_logical = cls->nf_dst->dev;
 	out->in_logical = cls->nf_dst_reverse->dev;
-	vlans = ft_path_stack(out->out_logical, out->out, out->out_vlan,
-			      &out->out_bridge, &out->out_bridge_vid);
+	/* The two sessions are named the way the two destinations are: the one
+	 * paired with this direction's destination is what it inserts, and the
+	 * one paired with the reverse destination is what it strips. */
+	vlans = ft_path_stack(out->out_logical, out->out, cls->nf_session,
+			      out->out_vlan, &out->out_bridge,
+			      &out->out_bridge_vid, &out->out_session);
 	if (vlans < 0)
 		return vlans;
 	out->out_vlans = vlans;
-	vlans = ft_path_stack(out->in_logical, out->in, out->in_vlan,
-			      &out->in_bridge, &out->in_bridge_vid);
+	vlans = ft_path_stack(out->in_logical, out->in, cls->nf_session_reverse,
+			      out->in_vlan, &out->in_bridge,
+			      &out->in_bridge_vid, &out->in_session);
 	if (vlans < 0)
 		return vlans;
 	out->in_vlans = vlans;
+	/* IPv6 over PPPoE is declined. The insert opcode's parameter carries a
+	 * version, a type, a code and a session id, and no PPP protocol id at
+	 * all, so the firmware chooses between 0x0021 and 0x0057 on its own and
+	 * nothing has shown that it picks the IPv6 one for an IPv6 flow. A
+	 * wrong protocol id is a header the peer discards, which is a silent
+	 * loss rather than a loud refusal, so it is excluded until proven. */
+	if (family == AF_INET6 &&
+	    (out->out_session.present || out->in_session.present))
+		return -EOPNOTSUPP;
 	/* The Ethernet source a neighbour-output flow carries is the physical
 	 * port's, and the encoder caches exactly one address per port. A logical
 	 * device that does not share that address would have software emit one
 	 * source MAC and hardware another for the same flow, so it is declined
 	 * rather than left silently divergent. A VLAN device normally inherits
 	 * its parent's address; a bridge normally takes its lowest port's, so
-	 * this also decides which ports of a multi-port bridge are eligible. */
-	if (!ether_addr_equal(out->out_logical->dev_addr, out->out->dev_addr))
+	 * this also decides which ports of a multi-port bridge are eligible.
+	 * A ppp device has no address at all -- addr_len is zero -- so where a
+	 * session is present the same rule is imposed by the walk, on the
+	 * device below it, which is the one that does have one. */
+	if (!out->out_session.present &&
+	    !ether_addr_equal(out->out_logical->dev_addr, out->out->dev_addr))
 		return -EOPNOTSUPP;
 	/* Re-entering the port a frame arrived on is a hairpin, and needs full
 	 * NAT to be a distinct path -- unless the two stacks differ, which is
-	 * ordinary routing between VLANs carried on one trunk. */
+	 * ordinary routing between VLANs carried on one trunk, or the two
+	 * sessions do, which is the same thing one layer down. */
 	if (out->out == out->in && out->out_vlans == out->in_vlans &&
 	    !memcmp(out->out_vlan, out->in_vlan, sizeof(out->out_vlan)) &&
+	    out->out_session.present == out->in_session.present &&
 	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK)
 		return -EOPNOTSUPP;
 	if (!ft_translation(cls, out))
@@ -960,16 +1083,32 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * port's, because that is the address Netfilter writes for a
 	 * neighbour-output flow and the only one the encoder can cache. */
 	if (!ft_vlan_actions(&rule->action, out) ||
-	    !is_valid_ether_addr(ethernet) ||
 	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop) ||
-	    !ft_neigh_check(family, out->out_logical, next_hop, ethernet) ||
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return -EOPNOTSUPP;
+	if (out->out_session.present) {
+		/* A ppp device resolves no Ethernet destination and Netfilter
+		 * writes none: flow_offload_eth_dst() reads the NOARP neighbour
+		 * arp_constructor() built on it, whose hardware address is the
+		 * zero one a device with no address length leaves behind. So
+		 * the four mangle words must be exactly that, and the real
+		 * destination is the concentrator the session names. Requiring
+		 * the zero rather than ignoring the words is what keeps a
+		 * future kernel that starts writing something here from being
+		 * silently overridden. */
+		if (!is_zero_ether_addr(ethernet))
+			return -EOPNOTSUPP;
+		ether_addr_copy(out->dst_mac, out->out_session.mac);
+	} else {
+		if (!is_valid_ether_addr(ethernet) ||
+		    !ft_neigh_check(family, out->out_logical, next_hop, ethernet))
+			return -EOPNOTSUPP;
+		ether_addr_copy(out->dst_mac, ethernet);
+	}
 	if (!ether_addr_equal(ethernet + ETH_ALEN, out->out->dev_addr))
 		return -ESTALE;
 	out->mtu = cls->nf_mtu;
-	ether_addr_copy(out->dst_mac, ethernet);
 	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
 	return 0;
 }
@@ -1036,6 +1175,10 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
 		return -ENOMEM;
+	/* ft_neigh_detach() unlinks by emptiness, because an entry can reach
+	 * the watch list holding no neighbour, and a kzalloc'd list head is
+	 * not an empty one. */
+	INIT_LIST_HEAD(&entry->neigh_list);
 	entry->rule = rule;
 	entry->next_hop = next_hop;
 	entry->binding = binding;
@@ -1763,6 +1906,21 @@ static void ft_vlan_text(const struct cdx_ft_vlan *stack, u8 count, char *text, 
 		at += scnprintf(text + at, size - at, i ? ".%u" : "%u", stack[i].id);
 }
 
+/* The PPPoE session, as the id and the concentrator the path walk resolved.
+ * Both are shown for either direction even though only an egress session is
+ * inserted: the two come from the same walk, so a direction that strips and
+ * one that inserts naming the same pair is what shows the connection agrees
+ * with itself. Both match one line of /proc/net/pppoe, which is where the
+ * negotiated session can be read back independently. */
+static void ft_session_text(const struct cdx_ft_session *session, char *text,
+			    size_t size)
+{
+	if (!session->present)
+		strscpy(text, "-", size);
+	else
+		scnprintf(text, size, "%u@%pM", session->id, session->mac);
+}
+
 /* The bridge, and the VID its FDB lookup was keyed on. That VID is not always
  * one of the tags: on an untagged egress port the frame carries none at all,
  * which is exactly the configuration a vlan-aware bridge ships with. */
@@ -1783,6 +1941,7 @@ static int ft_show(struct seq_file *seq, void *v)
 	struct cdx_ft_counters stats;
 	char in_vlan[16], out_vlan[16];
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
+	char in_ppp[26], out_ppp[26];
 
 	if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
@@ -1794,12 +1953,14 @@ static int ft_show(struct seq_file *seq, void *v)
 			       sizeof(in_br));
 		ft_bridge_text(entry->rule.out_bridge, entry->rule.out_bridge_vid, out_br,
 			       sizeof(out_br));
+		ft_session_text(&entry->rule.in_session, in_ppp, sizeof(in_ppp));
+		ft_session_text(&entry->rule.out_session, out_ppp, sizeof(out_ppp));
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-				   in_vlan, out_vlan, in_br, out_br,
+				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
 				   &entry->rule.dst.in6, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
@@ -1807,9 +1968,9 @@ static int ft_show(struct seq_file *seq, void *v)
 				   entry->rule.proto, entry->rule.mtu,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-				   in_vlan, out_vlan, in_br, out_br,
+				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),
 				   &entry->rule.dst.ip, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),

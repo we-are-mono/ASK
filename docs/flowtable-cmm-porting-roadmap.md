@@ -35,12 +35,11 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 
 | # | Subsystem | Lines | FCI cmds | Linux mechanism | Effort | Notes |
 | ---: | --- | ---: | ---: | --- | --- | --- |
-| 3 | PPPoE (`pppoe.c`, `control_pppoe`) | 303 | 2 | Yes — `DEV_PATH_PPPOE` | Low-Med | The relay offset is already confirmed on hardware. |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | High | Largest command surface and the most likely blocker: `USE_QOSCONNMARK`, `ENABLE_INGRESS_QOS` and `ENABLE_EGRESS_QOS` are all in the shipping build. Shaping has no flowtable concept. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Partial — `FLOW_OFFLOAD_XMIT_XFRM` | High | The xmit type exists, but SA handling, rekey and ESN live entirely in CDX. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | The flowtable is unicast-conntrack by construction. Needs a parallel replication path rather than a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
-| 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow counters exist. Treat carefully: the stats path is where A140 lived. Now also owes the per-VLAN-interface counters, see below. |
+| 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow counters exist. Treat carefully: the stats path is where A140 lived. Now also owes the per-VLAN-interface and per-session counters, see below. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
 | 11 | Wi-Fi (`module_wifi`, `dpa_wifi`) | 345 | 3 | No | High | Needs driver-side `dev_fill_forward_path` support that does not exist. |
 | 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
@@ -82,10 +81,10 @@ maintains them in the microcode's logical statistics area and returns them
 through an FCI query. This ownership mode loads no FCI, and the microcode
 needs an interface index to allocate the counters against, which only a
 registered VLAN interface has. Both halves belong to item 9, which has to
-cover physical ports, VLANs and per-flow read-back in one design rather than
-grow a VLAN-shaped allocator here. Until it lands, the flowtable path reports
-per-flow counters and the physical ports' own MAC counters, and nothing
-per-VLAN.
+cover physical ports, VLANs, PPPoE sessions and per-flow read-back in one
+design rather than grow a VLAN-shaped allocator here. Until it lands, the
+flowtable path reports per-flow counters and the physical ports' own MAC
+counters, and nothing per-VLAN or per-session.
 
 ## Bridge, delivered
 
@@ -114,6 +113,53 @@ behaviour was the thing being corrected rather than followed.
 Item 13 (MACVLAN) did **not** fall out of this work as expected. A MACVLAN is
 neither an 802.1Q VLAN nor a bridge master, so the widened walk still declines
 it; it needs its own arm and its own eligibility rules.
+
+## PPPoE, delivered
+
+Item 3, scoped and landed 2026-09-16, both halves: a session is inserted on
+egress and stripped on ingress, and the bench proves each direction separately
+because the ingress half is the one nothing in a rule describes. The mechanism,
+what stands in for the neighbour and the Ethernet destination a ppp device does
+not have, and the hardware proof are in the
+[PPPoE guide](flowtable-pppoe.md). `pppoe.c` and `control_pppoe` are replaced
+rather than shared with; the PPPoE *relay* they once also carried was deleted
+as dead code before this work and is not reintroduced by it.
+
+**The first finding is a warning about a source we had been reading as an
+oracle.** The FMC-emitted soft parser in `cdx_sp.xml` ends the parse at the
+PPPoE header — `nextproto="end_parse"` on both arms of `pppoeschema`, which
+compiles to a real `END_PARSE`, with the frame redirected to the PPPoE relay
+table at `$ccbase + 0x30`. Read literally, that says an encapsulated frame
+never reaches the IPv4 or IPv6 5-tuple tables and only the egress half of a
+PPPoE flow could ever be offloaded. It was read that way, carefully, and it is
+**wrong**: measured on the rig under CMM before any of this was written, both
+directions offload at roughly 9 Gb/s with the ppp device's own byte counters
+confirming the tunnel carried it. The v210.10.1 microcode does not do what the
+FMC-emitted parser says. So `cdx_sp.xml` describes the compiled soft parser and
+not the classifier's reachable behaviour, and any future increment that reasons
+from it about what the hardware can match must measure before it believes —
+the cost of not measuring here would have been an increment scoped to half its
+real capability. (`ISSUES.md` A12 closed this question in the other direction
+and the measurement vindicates it.)
+
+**The second is that a session drop retires selectively, through the route.**
+The expectation was full invalidation: the ppp device unregisters, and
+unregistration of a device a flow depends on is the one netdev event the
+adapter escalates. It never fires. pppd's peer route dies with the device
+first, the flow borrowed that destination, and the route watch retires both
+directions before the unregistration arrives — by which time nothing references
+the device and it was never a binding. The bindings stay up, admission is never
+disabled, nothing re-arms, and a redial readmits on the next packet with the
+table untouched. Worth carrying into any later increment whose path type has a
+route of its own: the route watch gets there first, and the coarser netdev
+escalation is a backstop rather than the mechanism.
+
+One capability does not come across, and it is the same one VLAN left behind:
+**per-session byte counters**, which CMM keeps in the microcode's logical
+statistics area against a registered PPPoE interface. Item 9 owes them
+alongside the per-VLAN ones. The residual gap that is PPPoE's own is a session
+renegotiated under a `pppN` device that never disappears; the failure mode is
+loss rather than misdelivery, and no exported interface reports it.
 
 ## Parity measurements
 
@@ -186,23 +232,46 @@ measurement above shows, not a regression. This boot's discarded first CMM run
 recorded 23.98% on the reverse direction against 1.25% and 1.66% once settled,
 which is the artefact below and the reason each cell is two runs.
 
+**IPv4 TCP masquerade through a PPPoE session, 4 streams, 30 s — 2026-09-16**
+
+The session rides VLAN 3900 on the WAN side, so every frame spends both
+encapsulation slots — a tag and a session on one path.
+
+| Direction | Flowtable | CMM |
+| --- | --- | --- |
+| LAN to WAN | 8.948 and 8.936 Gb/s, 2.92% and 2.00% DUT CPU | 8.984 and 8.931 Gb/s, 2.74% and 3.21% DUT CPU |
+| WAN to LAN | 9.309 and 9.314 Gb/s, 2.09% and 3.09% DUT CPU | 9.278 and 9.323 Gb/s, 3.23% and 2.20% DUT CPU |
+
+Two settled runs per cell, both owners sampled mid-transfer. The flowtable
+adapter held ten directional entries, each naming the session id and
+concentrator the kernel had negotiated; the CMM connection table held the five
+connections. The rates agree to within a percent and the CPU difference
+changes sign between runs of the same owner, so it is run-to-run noise rather
+than a difference between owners.
+
+Both directions are offloaded, which is the result that decided the increment's
+scope: the reverse direction is PPPoE *ingress*, and the compiled soft parser
+had suggested it could not be classified at all.
+
 **The first measurement after a boot is contaminated under both owners** —
 23.47% and 25.48% on the reverse direction against roughly 2% once settled.
 Discard a boot's first run rather than reporting it; a single pair of runs
 cannot tell that artefact from a real difference between owners, which is why
 every cell above is two settled runs.
 
-These cover three features. The remaining subsystems each need their own paired
+These cover four features. The remaining subsystems each need their own paired
 measurement before the retirement claim can be made for them.
 
 ## Sequencing
 
-**Items 3 and 13 are the natural next increments.** Linux supplies the
-mechanism for both, so each is an encoder arm and an eligibility contract with
-its own focused proof, exactly like the NAT, IPv6, VLAN and bridge increments
-already delivered. Both extend the same device walk; neither needs new
-architecture in the encoder. Item 13 is no longer expected to fall out of
+**Item 13 is the natural next increment**, and the last of the shape that has
+worked five times now: Linux supplies the mechanism, so it is an arm of the
+device walk plus an eligibility contract with its own focused proof, as NAT,
+IPv6, VLAN, bridge and PPPoE each were. It is not expected to fall out of
 another increment — a MACVLAN is its own path type and the walk declines it.
+PPPoE is the one to model it on rather than VLAN: a MACVLAN, like a session,
+may need something carrying over from the kernel's own path walk that a device
+walk cannot re-derive.
 
 **Items 5 to 8 need feature-specific contracts.** Each expresses behaviour a
 unicast flowtable tuple cannot carry, and each needs its own hardware

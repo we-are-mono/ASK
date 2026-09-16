@@ -1,4 +1,4 @@
-From 0cdaf2170e755f6a96d55eca573cb2379c7685cf Mon Sep 17 00:00:00 2001
+From 415b118456dc75bbe55dee02f3c3a8400a96166c Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 14 Sep 2026 23:03:32 +0200
 Subject: [PATCH] netfilter: provide hardware context and selective flow
@@ -53,19 +53,40 @@ route. A forced output interface otherwise allows ip_route_output to
 synthesize an on-link unicast route after any FIB error, bypassing route
 withdrawal or blackhole policy. Keep that legacy fallback for other callers;
 reject flow creation on the experimental path until routing succeeds.
+
+Pair each destination with the PPPoE session its path crosses. A ppp device
+registers no lower neighbour, so an adapter walking devices cannot descend
+past one; the session id reaches a rule only as an egress push action, and
+the concentrator's Ethernet address reaches it not at all on neighbour
+output, where the union member that would carry it holds the route instead.
+Record the hop whole -- the device the session runs over, the id and that
+address -- against the direction that transmits over it, and hand both
+directions' records to the callback the way both destinations already are.
+
+Make a path this walk cannot describe stay unoffloaded. Every Ethernet, DSA,
+VLAN and PPPoE entry assigns the ingress device unconditionally and a walk
+always ends on an Ethernet entry, so clearing that device in place and
+continuing restored it one entry later: an encapsulation deeper than a tuple
+can hold, or an unknown path type, was admitted with a truncated description
+while the wire still carried the whole of it. Leave the loop instead.
+
+Zero the Ethernet address the walk is seeded with. It stays untouched for a
+destination that is not a valid Ethernet device, which is what a ppp device
+is, and is then copied into the path context a bridge resolves its FDB
+against.
 ---
  include/net/flow.h                    |  2 +
- include/net/flow_offload.h            | 22 ++++++++++
- include/net/netevent.h                | 29 +++++++++++++
- include/net/netfilter/nf_flow_table.h | 20 +++++++++
- net/ipv4/fib_trie.c                   | 20 +++++++++
+ include/net/flow_offload.h            | 31 ++++++++++
+ include/net/netevent.h                | 29 +++++++++
+ include/net/netfilter/nf_flow_table.h | 44 ++++++++++++++
+ net/ipv4/fib_trie.c                   | 20 ++++++
  net/ipv4/route.c                      |  3 +-
- net/ipv6/ip6_fib.c                    | 23 ++++++++++
- net/netfilter/nf_flow_table_core.c    | 62 ++++++++++++++++++++++++++-
- net/netfilter/nf_flow_table_ip.c      | 14 ++++--
- net/netfilter/nf_flow_table_offload.c | 28 +++++++++++-
- net/netfilter/nft_flow_offload.c      | 18 +++++++-
- 11 files changed, 233 insertions(+), 8 deletions(-)
+ net/ipv6/ip6_fib.c                    | 23 +++++++
+ net/netfilter/nf_flow_table_core.c    | 66 +++++++++++++++++++-
+ net/netfilter/nf_flow_table_ip.c      | 14 ++++-
+ net/netfilter/nf_flow_table_offload.c | 33 +++++++++-
+ net/netfilter/nft_flow_offload.c      | 87 +++++++++++++++++++++------
+ 11 files changed, 328 insertions(+), 24 deletions(-)
 
 diff --git a/include/net/flow.h b/include/net/flow.h
 index 335bbc52171c..5e373dbaa397 100644
@@ -81,18 +102,20 @@ index 335bbc52171c..5e373dbaa397 100644
  	kuid_t  flowic_uid;
  	__u32		flowic_multipath_hash;
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f4b762..06ed867d557b 100644
+index 292cd8f4b762..c619bb1cb63f 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,29 @@ struct flow_cls_common_offload {
+@@ -688,7 +688,38 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
 +struct nf_flow_offload_handle;
++struct nf_flow_session;
 +
 +/* Context is borrowed for the callback and NULL for other producers. Drivers
-+ * must not retain nf_ct or either dst. nf_dst is this direction's selected
-+ * NEIGH destination; nf_dst_reverse is the other direction's destination;
++ * must not retain nf_ct, either dst or either session. nf_dst is this
++ * direction's selected NEIGH destination; nf_dst_reverse is the other
++ * direction's destination;
 + * other transmit types provide NULL. nf_handle may be retained only through
 + * nf_flow_offload_handle_get/put; it carries no flow/table/conntrack pointer.
 + * Each destination carries the cookie it was selected with: an IPv6 route is
@@ -100,12 +123,19 @@ index 292cd8f4b762..06ed867d557b 100644
 + * zero cookie rejects every IPv6 destination. IPv4 ignores it.
 + * Version 7 also keeps a bridged path on NEIGH output for such a table, so a
 + * flow whose egress port the bridge FDB resolved arrives with a destination
-+ * instead of cached Ethernet addresses. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 7
++ * instead of cached Ethernet addresses.
++ * Version 8 pairs each destination with the PPPoE session its path crosses,
++ * if any: nf_session belongs to nf_dst and nf_session_reverse to
++ * nf_dst_reverse, so a direction's egress and ingress sessions are named the
++ * same way its two destinations are. Both are always non-NULL; a path with no
++ * session reports a zero lower_ifindex. */
++#define FLOW_CLS_HAS_NF_CONTEXT 8
  struct flow_cls_offload {
 +	const struct nf_conn *nf_ct;
 +	struct dst_entry *nf_dst;
 +	struct dst_entry *nf_dst_reverse;
++	const struct nf_flow_session *nf_session;
++	const struct nf_flow_session *nf_session_reverse;
 +	struct nf_flow_offload_handle *nf_handle;
 +	u32 nf_dst_cookie;
 +	u32 nf_dst_reverse_cookie;
@@ -176,7 +206,7 @@ index 1be3757a8b7f..6fb27a2ca8a9 100644
  
  int register_netevent_notifier(struct notifier_block *nb);
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 1a6fca013165..0b81c9f74a4f 100644
+index 1a6fca013165..3764c26d19ba 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -84,6 +84,12 @@ struct nf_flowtable {
@@ -192,7 +222,41 @@ index 1a6fca013165..0b81c9f74a4f 100644
  };
  
  static inline bool nf_flowtable_hw_offload(struct nf_flowtable *flowtable)
-@@ -180,6 +186,7 @@ enum flow_offload_type {
+@@ -107,6 +113,23 @@ enum flow_offload_xmit_type {
+ 
+ #define NF_FLOW_TABLE_ENCAP_MAX		2
+ 
++/* One PPPoE session on the path a direction transmits over, as
++ * dev_fill_forward_path() resolved it. A hardware adapter cannot re-derive
++ * any of it: a ppp device registers no lower neighbour, so a device walk
++ * cannot descend past one, and the concentrator's address has nowhere else to
++ * live on a neighbour-output flow -- the union member that carries a cached
++ * Ethernet destination is the route itself on that transmit type. The session
++ * id also reaches the rule for an egress path only, as FLOW_ACTION_PPPOE_PUSH;
++ * an ingress one has neither an action nor a dissector key.
++ * lower_ifindex is the device the session runs over and is zero when the path
++ * crosses no session, which is what makes the whole record meaningless.
++ */
++struct nf_flow_session {
++	int				lower_ifindex;
++	u16				id;
++	u8				h_dest[ETH_ALEN];
++};
++
+ struct flow_offload_tuple {
+ 	union {
+ 		struct in_addr		src_v4;
+@@ -138,6 +161,9 @@ struct flow_offload_tuple {
+ 					encap_num:2,
+ 					in_vlan_ingress:2;
+ 	u16				mtu;
++	/* Below __hash, so it never widens a lookup key, and outside the
++	 * union below, which a NEIGH tuple spends on its destination. */
++	struct nf_flow_session		session;
+ 	union {
+ 		struct {
+ 			struct dst_entry *dst_cache;
+@@ -180,6 +206,7 @@ enum flow_offload_type {
  struct flow_offload {
  	struct flow_offload_tuple_rhash		tuplehash[FLOW_OFFLOAD_DIR_MAX];
  	struct nf_conn				*ct;
@@ -200,7 +264,18 @@ index 1a6fca013165..0b81c9f74a4f 100644
  	unsigned long				flags;
  	u16					type;
  	u32					timeout;
-@@ -221,6 +228,19 @@ struct nf_flow_route {
+@@ -214,6 +241,10 @@ struct nf_flow_route {
+ 			u8			h_source[ETH_ALEN];
+ 			u8			h_dest[ETH_ALEN];
+ 		} out;
++		/* The PPPoE session this direction's egress path crosses, which
++		 * out.h_dest would otherwise be the only record of -- and that
++		 * member is not carried over to a NEIGH tuple. */
++		struct nf_flow_session		session;
+ 		enum flow_offload_xmit_type	xmit_type;
+ 	} tuple[FLOW_OFFLOAD_DIR_MAX];
+ };
+@@ -221,6 +252,19 @@ struct nf_flow_route {
  struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
  void flow_offload_free(struct flow_offload *flow);
  
@@ -345,7 +420,7 @@ index 5b94cb8df8d8..2c1b9df1937a 100644
  }
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index df72b0376970..452ff721add2 100644
+index df72b0376970..d2efb4da17d3 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -17,6 +17,55 @@
@@ -404,7 +479,18 @@ index df72b0376970..452ff721add2 100644
  static void
  flow_offload_fill_dir(struct flow_offload *flow,
  		      enum flow_offload_tuple_dir dir)
-@@ -207,6 +256,8 @@ static void flow_offload_route_release(struct flow_offload *flow)
+@@ -119,6 +168,10 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+ 		j++;
+ 	}
+ 	flow_tuple->encap_num = route->tuple[dir].in.num_encaps;
++	/* Outside the transmit-type switch below: the session belongs to the
++	 * path, not to how the path is transmitted, and a DIRECT tuple has no
++	 * room for it once the union holds its cached addresses. */
++	flow_tuple->session = route->tuple[dir].session;
+ 
+ 	switch (route->tuple[dir].xmit_type) {
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+@@ -207,6 +260,8 @@ static void flow_offload_route_release(struct flow_offload *flow)
  
  void flow_offload_free(struct flow_offload *flow)
  {
@@ -413,7 +499,7 @@ index df72b0376970..452ff721add2 100644
  	switch (flow->type) {
  	case NF_FLOW_OFFLOAD_ROUTE:
  		flow_offload_route_release(flow);
-@@ -276,6 +327,11 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+@@ -276,6 +331,11 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
  {
  	int err;
  
@@ -425,7 +511,7 @@ index df72b0376970..452ff721add2 100644
  	flow->timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
  
  	err = rhashtable_insert_fast(&flow_table->rhashtable,
-@@ -363,7 +419,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
+@@ -363,7 +423,7 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
  
  	dir = tuplehash->tuple.dir;
  	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
@@ -434,7 +520,7 @@ index df72b0376970..452ff721add2 100644
  		return NULL;
  
  	if (unlikely(nf_ct_is_dying(flow->ct)))
-@@ -417,7 +473,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+@@ -417,7 +477,7 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
  static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  				    struct flow_offload *flow, void *data)
  {
@@ -443,7 +529,7 @@ index df72b0376970..452ff721add2 100644
  	    nf_ct_is_dying(flow->ct) ||
  	    nf_flow_custom_gc(flow_table, flow))
  		flow_offload_teardown(flow);
-@@ -542,6 +598,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
+@@ -542,6 +602,8 @@ int nf_flow_table_init(struct nf_flowtable *flowtable)
  {
  	int err;
  
@@ -493,7 +579,7 @@ index 98edcaa37b38..632a92be3ef6 100644
  		return 0;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f51d7d7..0759c372c66f 100644
+index 4f346f51d7d7..6c1f8eba1027 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -896,6 +896,23 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
@@ -520,7 +606,7 @@ index 4f346f51d7d7..0759c372c66f 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +921,16 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +921,21 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
@@ -529,6 +615,11 @@ index 4f346f51d7d7..0759c372c66f 100644
 +		.nf_ct = flow->ct,
 +		.nf_dst = nf_flow_offload_dst(&flow->tuplehash[dir].tuple),
 +		.nf_dst_reverse = nf_flow_offload_dst(&flow->tuplehash[!dir].tuple),
++		/* Paired with the two destinations above, and unguarded by
++		 * transmit type: a session is a property of the path, and a
++		 * record naming no session is already self-describing. */
++		.nf_session = &flow->tuplehash[dir].tuple.session,
++		.nf_session_reverse = &flow->tuplehash[!dir].tuple.session,
 +		.nf_handle = flow->hw_handle,
 +		.nf_dst_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[dir].tuple),
 +		.nf_dst_reverse_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[!dir].tuple),
@@ -539,10 +630,83 @@ index 4f346f51d7d7..0759c372c66f 100644
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 7dbbd892e197..dd0748aad17d 100644
+index 7dbbd892e197..d71edfa36e95 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -158,7 +158,17 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+@@ -89,6 +89,10 @@ struct nft_forward_info {
+ 	u8 ingress_vlans;
+ 	u8 h_source[ETH_ALEN];
+ 	u8 h_dest[ETH_ALEN];
++	/* The one PPPoE hop this walk crossed, recorded whole rather than left
++	 * implicit in h_dest and the encap slot: a hardware adapter cannot
++	 * re-derive any of it, and h_dest is not carried to a NEIGH tuple. */
++	struct nf_flow_session session;
+ 	enum flow_offload_xmit_type xmit_type;
+ };
+ 
+@@ -120,17 +124,35 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			}
+ 
+ 			/* DEV_PATH_VLAN and DEV_PATH_PPPOE */
+-			if (info->num_encaps >= NF_FLOW_TABLE_ENCAP_MAX) {
+-				info->indev = NULL;
+-				break;
+-			}
++			if (info->num_encaps >= NF_FLOW_TABLE_ENCAP_MAX)
++				goto refuse;
+ 			if (!info->outdev)
+ 				info->outdev = path->dev;
+ 			info->encap[info->num_encaps].id = path->encap.id;
+ 			info->encap[info->num_encaps].proto = path->encap.proto;
+ 			info->num_encaps++;
+-			if (path->type == DEV_PATH_PPPOE)
++			if (path->type == DEV_PATH_PPPOE) {
+ 				memcpy(info->h_dest, path->encap.h_dest, ETH_ALEN);
++				/* Record the hop whole. h_dest reaches a rule
++				 * only on DIRECT output, the session id only as
++				 * an egress push action, and the device the
++				 * session runs over not at all -- a ppp device
++				 * registers no lower neighbour, so nothing
++				 * downstream can walk past one. Every path entry
++				 * names its own device, and the bridge entry
++				 * names the bridge, so the next one is that
++				 * device in each case. One hop per path: a
++				 * second would overwrite the first, so refuse
++				 * instead. */
++				if (info->session.lower_ifindex ||
++				    i + 1 >= stack->num_paths)
++					goto refuse;
++				info->session.lower_ifindex =
++					stack->path[i + 1].dev->ifindex;
++				info->session.id = path->encap.id;
++				memcpy(info->session.h_dest, path->encap.h_dest,
++				       ETH_ALEN);
++			}
+ 			break;
+ 		case DEV_PATH_BRIDGE:
+ 			if (is_zero_ether_addr(info->h_source))
+@@ -141,28 +163,33 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 				info->ingress_vlans |= BIT(info->num_encaps - 1);
+ 				break;
+ 			case DEV_PATH_BR_VLAN_TAG:
+-				if (info->num_encaps >= NF_FLOW_TABLE_ENCAP_MAX) {
+-					info->indev = NULL;
+-					break;
+-				}
++				if (info->num_encaps >= NF_FLOW_TABLE_ENCAP_MAX)
++					goto refuse;
+ 				info->encap[info->num_encaps].id = path->bridge.vlan_id;
+ 				info->encap[info->num_encaps].proto = path->bridge.vlan_proto;
+ 				info->num_encaps++;
+ 				break;
+ 			case DEV_PATH_BR_VLAN_UNTAG:
+-				if (WARN_ON_ONCE(info->num_encaps-- == 0)) {
+-					info->indev = NULL;
+-					break;
+-				}
++				if (WARN_ON_ONCE(info->num_encaps-- == 0))
++					goto refuse;
+ 				break;
  			case DEV_PATH_BR_VLAN_KEEP:
  				break;
  			}
@@ -560,16 +724,59 @@ index 7dbbd892e197..dd0748aad17d 100644
 +				info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;
  		default:
- 			info->indev = NULL;
-@@ -171,6 +181,7 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+-			info->indev = NULL;
+-			break;
++			goto refuse;
+ 		}
+ 	}
+ 	if (!info->outdev)
+@@ -171,8 +198,20 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
  	info->hw_outdev = info->indev;
  
  	if (nf_flowtable_hw_offload(flowtable) &&
 +	    !READ_ONCE(flowtable->use_neigh) &&
  	    nft_is_valid_ether_device(info->indev))
  		info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
++	return;
++refuse:
++	/* Leaving the loop is what makes a refusal stick. Every Ethernet, DSA,
++	 * VLAN and PPPoE entry assigns info->indev unconditionally, and a walk
++	 * always ends on an Ethernet entry, so clearing it in place and
++	 * continuing restored it one entry later and admitted the flow with
++	 * whatever partial encapsulation had been accumulated -- an
++	 * encapsulation the wire still carries in full. A path this function
++	 * cannot describe must not be offloaded at all.
++	 */
++	info->indev = NULL;
  }
-@@ -246,6 +257,11 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+ 
+ static bool nft_flowtable_find_dev(const struct net_device *dev,
+@@ -200,7 +239,12 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+ 	const struct dst_entry *dst = route->tuple[dir].dst;
+ 	struct net_device_path_stack stack;
+ 	struct nft_forward_info info = {};
+-	unsigned char ha[ETH_ALEN];
++	/* nft_dev_fill_forward_path() leaves this untouched for a destination
++	 * that is not a valid Ethernet device -- a ppp device is exactly that
++	 * -- and then seeds the walk with it, so it must not start as whatever
++	 * the stack held. A PPPoE hop overwrites it before anything reads it,
++	 * but only because it is always the first hop. */
++	unsigned char ha[ETH_ALEN] = {};
+ 	int i;
+ 
+ 	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
+@@ -209,6 +253,10 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+ 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
+ 		return;
+ 
++	/* Belongs to this direction's egress path, as out.h_dest does, and
++	 * unlike out.h_dest it survives NEIGH output. */
++	route->tuple[dir].session = info.session;
++
+ 	route->tuple[!dir].in.ifindex = info.indev->ifindex;
+ 	for (i = 0; i < info.num_encaps; i++) {
+ 		route->tuple[!dir].in.encap[i].id = info.encap[i].id;
+@@ -246,6 +294,11 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
  		fl.u.ip4.flowi4_tos = ip_hdr(pkt->skb)->tos & INET_DSCP_MASK;
  		fl.u.ip4.flowi4_mark = pkt->skb->mark;
  		fl.u.ip4.flowi4_flags = FLOWI_FLAG_ANYSRC;

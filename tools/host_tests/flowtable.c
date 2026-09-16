@@ -147,6 +147,9 @@ static void list_add_tail(struct list_head *e, struct list_head *h)
 { e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
 static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
 static void list_init(struct list_head *h) { h->next = h->prev = h; }
+#define INIT_LIST_HEAD(h) list_init(h)
+static bool list_empty(const struct list_head *h) { return h->next == h; }
+static void list_del_init(struct list_head *e) { list_del(e); list_init(e); }
 struct hlist_node { struct hlist_node *next, **pprev; };
 struct hlist_head { struct hlist_node *first; };
 struct seq_file { int unused; };
@@ -201,8 +204,16 @@ struct bridge_vlan_info { u16 vid, flags; };
 /* real_dev is what makes a device a VLAN here, exactly as vlan_dev_priv's
  * presence does in the kernel; a physical port leaves it NULL. A bridge is
  * not a VLAN however its lower list is filled in, which is what lets the
- * bridge below carry a decoy first lower device. */
+ * bridge below carry a decoy first lower device.
+ *
+ * type separates a ppp device from every other one, as ARPHRD_PPP does in the
+ * kernel. A ppp device has no real_dev on purpose: ppp_generic registers no
+ * netdev adjacency, so there is nothing for a lower-device walk to find, which
+ * is the whole reason the session hop has to be handed in from outside. */
+#define ARPHRD_ETHER 1
+#define ARPHRD_PPP 512
 struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
+                    unsigned short type;
                     struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
                     bool bridge, vlan_filtering; struct net_device *master;
                     u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
@@ -362,6 +373,7 @@ static bool nf_conntrack_tcp_established(const struct nf_conn *c)
 #define net_eq(a, b) ((a) == (b))
 static bool is_valid_ether_addr(const u8 *a)
 { return !(a[0] & 1) && memcmp(a, (u8[6]){0}, 6); }
+static bool is_zero_ether_addr(const u8 *a) { return !memcmp(a, (u8[6]){0}, 6); }
 #define ether_addr_equal(a, b) (!memcmp(a, b, 6))
 #define ether_addr_copy(a, b) memcpy(a, b, 6)
 #define ipv4_is_multicast(a) ((ntohl(a) & 0xf0000000) == 0xe0000000)
@@ -401,6 +413,10 @@ struct flow_action_entry {
     unsigned id, csum_flags;
     struct { unsigned htype, offset; u32 mask, val; } mangle;
     struct { u16 vid; __be16 proto; u8 prio; } vlan;
+    /* Everything FLOW_ACTION_PPPOE_PUSH carries. There is no pop counterpart
+     * and no dissector key, which is why an ingress session is invisible in a
+     * rule and has to be proven by the devices alone. */
+    struct { u16 sid; } pppoe;
     struct net_device *dev;
 };
 /* NF_FLOW_RULE_ACTION_MAX, which is what Netfilter allocates and refuses to
@@ -436,9 +452,15 @@ static void nf_flow_offload_handle_get(struct nf_flow_offload_handle *h)
 { assert(h->refs); h->refs++; }
 static void nf_flow_offload_handle_put(struct nf_flow_offload_handle *h)
 { assert(h->refs > 1); h->refs--; }
+/* Same shape as patch 140's, and filled the same way: nf_session belongs to
+ * nf_dst and nf_session_reverse to nf_dst_reverse, so a direction's egress and
+ * ingress sessions are named the way its two destinations are. A path with no
+ * session reports a zero lower_ifindex rather than a null record. */
+struct nf_flow_session { int lower_ifindex; u16 id; u8 h_dest[6]; };
 struct flow_cls_offload {
     const struct nf_conn *nf_ct;
     struct dst_entry *nf_dst, *nf_dst_reverse;
+    const struct nf_flow_session *nf_session, *nf_session_reverse;
     struct nf_flow_offload_handle *nf_handle;
     u32 nf_dst_cookie, nf_dst_reverse_cookie;
     unsigned command;
@@ -518,6 +540,10 @@ static void nf_flow_table_cleanup(struct net_device *dev)
 { assert(!cdx_info->ctrl.mutex); flushed++; if (cleanup_hook) cleanup_hook(); }
 static void dev_hold(struct net_device *d) { d->refs++; }
 static void dev_put(struct net_device *d) { assert(d->refs > 0); d->refs--; }
+/* Resolves the one device a session hop names. Defined past the device
+ * declarations, which the production decoder is included ahead of. Takes no
+ * reference, exactly as the kernel's does under RTNL. */
+static struct net_device *__dev_get_by_index(struct net *net, int ifindex);
 static int atomic_read(int *v) { return *v; }
 static void atomic_set(int *v, int n) { *v = n; }
 static void ft_invalidate(void) { ft_invalid = 1; }
@@ -675,25 +701,37 @@ static void msleep(unsigned ms)
 }
 #include "flowtable_production.inc"
 
-static struct net_device in = { .ifindex = 5, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1} };
-static struct net_device out = { .ifindex = 6, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2} };
+static struct net_device in = { .ifindex = 5, .mtu = 1500, .type = ARPHRD_ETHER,
+                                .dev_addr = {2, 0, 0, 0, 0, 1} };
+static struct net_device out = { .ifindex = 6, .mtu = 1500, .type = ARPHRD_ETHER,
+                                 .dev_addr = {2, 0, 0, 0, 0, 2} };
 /* A bridge over each physical port, and a VLAN device on top of one of them:
  * what OpenWrt spells br-lan and br-lan.N. `decoy` is each bridge's first
  * lower device and deliberately not the port a flow leaves by -- a walk that
  * descended a bridge through its adjacency list would land there, because a
  * bridge has many lower devices and the first is whichever was enslaved
  * first, never the one the FDB chose. */
-static struct net_device decoy = { .ifindex = 11, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 9} };
-static struct net_device br = { .ifindex = 12, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+static struct net_device decoy = { .ifindex = 11, .mtu = 1500, .type = ARPHRD_ETHER,
+                                   .dev_addr = {2, 0, 0, 0, 0, 9} };
+static struct net_device br = { .ifindex = 12, .mtu = 1500, .type = ARPHRD_ETHER,
+                                .dev_addr = {2, 0, 0, 0, 0, 2},
                                 .real_dev = &decoy, .bridge = true };
-static struct net_device br_tag = { .ifindex = 13, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+static struct net_device br_tag = { .ifindex = 13, .mtu = 1500, .type = ARPHRD_ETHER,
+                                    .dev_addr = {2, 0, 0, 0, 0, 2},
                                     .real_dev = &br, .vlan_id = 100 };
-static struct net_device in_br = { .ifindex = 14, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1},
+static struct net_device in_br = { .ifindex = 14, .mtu = 1500, .type = ARPHRD_ETHER,
+                                   .dev_addr = {2, 0, 0, 0, 0, 1},
                                    .real_dev = &decoy, .bridge = true };
 /* br-lan.100.300: a second tag inside the bridge's own, so the bridge resolves
  * on an outermost tag that is not the only one. */
-static struct net_device br_qinq = { .ifindex = 15, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+static struct net_device br_qinq = { .ifindex = 15, .mtu = 1500, .type = ARPHRD_ETHER,
+                                     .dev_addr = {2, 0, 0, 0, 0, 2},
                                      .real_dev = &br_tag, .vlan_id = 300 };
+/* Two ppp devices, one per direction. No address (addr_len is zero in the
+ * kernel, so dev_addr stays the zero one arp_constructor leaves behind), no
+ * lower device, and the reduced MTU pppd negotiates for a session. */
+static struct net_device ppp = { .ifindex = 16, .mtu = 1492, .type = ARPHRD_PPP };
+static struct net_device in_ppp = { .ifindex = 17, .mtu = 1492, .type = ARPHRD_PPP };
 static struct cdx_ft_binding binding = { .dev = &in };
 static struct dst_ops ipv4_ops = { .family = AF_INET };
 static struct dst_ops ipv6_ops6 = { .family = AF_INET6 };
@@ -710,6 +748,9 @@ static struct in6_addr addr6(u32 prefix, u32 tail)
     return a;
 }
 static union nf_inet_addr next_hop;
+/* What patch 140 hands the callback: one record per direction, always present
+ * and describing no session until a fixture fills one in. */
+static struct nf_flow_session egress_session, ingress_session;
 static struct nf_conn ct;
 static struct flow_dissector dissector;
 static struct flow_rule rule;
@@ -765,8 +806,10 @@ static void fixture(void)
     }
     rule.action.entries[4].id = FLOW_ACTION_REDIRECT;
     rule.action.entries[4].dev = &out;
+    egress_session = ingress_session = (struct nf_flow_session){};
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1492,
-        .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
+        .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL,
+        .nf_session = &egress_session, .nf_session_reverse = &ingress_session };
     physical_ok = neigh_ok = true;
     /* Unbridged by default. A leftover master or VLAN membership from a
      * bridged case would change the path every later one walks. */
@@ -984,13 +1027,31 @@ static void test_ipv6(void)
  * what the wire carries as an outer 100 and an inner 300. A device that is
  * neither a VLAN, a bridge nor a physical port stands in for every other
  * upper device: a bond, a MACVLAN, a PPPoE session. */
-static struct net_device out_tag = { .ifindex = 7, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+static struct net_device out_tag = { .ifindex = 7, .mtu = 1500, .type = ARPHRD_ETHER,
+                                     .dev_addr = {2, 0, 0, 0, 0, 2},
                                      .real_dev = &out, .vlan_id = 100 };
-static struct net_device in_tag = { .ifindex = 8, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1},
+static struct net_device in_tag = { .ifindex = 8, .mtu = 1500, .type = ARPHRD_ETHER,
+                                    .dev_addr = {2, 0, 0, 0, 0, 1},
                                     .real_dev = &in, .vlan_id = 200 };
-static struct net_device out_qinq = { .ifindex = 9, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+static struct net_device out_qinq = { .ifindex = 9, .mtu = 1500, .type = ARPHRD_ETHER,
+                                      .dev_addr = {2, 0, 0, 0, 0, 2},
                                       .real_dev = &out_tag, .vlan_id = 300 };
-static struct net_device upper = { .ifindex = 10, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2} };
+static struct net_device upper = { .ifindex = 10, .mtu = 1500, .type = ARPHRD_ETHER,
+                                   .dev_addr = {2, 0, 0, 0, 0, 2} };
+/* Every device the fixtures build with, so a session hop can name any of them
+ * -- and an index naming none of them resolves to nothing, which is the case a
+ * hop pointing at a device that has since gone away produces. */
+static struct net_device *all_devices[] = { &in, &out, &out_tag, &in_tag, &out_qinq,
+                                            &upper, &decoy, &br, &br_tag, &in_br,
+                                            &br_qinq, &ppp, &in_ppp };
+static struct net_device *__dev_get_by_index(struct net *net, int ifindex)
+{
+    assert(net == &init_net);
+    for (unsigned i = 0; i < ARRAY_SIZE(all_devices); i++)
+        if (all_devices[i]->ifindex == ifindex)
+            return all_devices[i];
+    return NULL;
+}
 static struct vlan vk[2], vm[2];
 static void snat_fixture(bool forward, bool tcp);
 
@@ -1701,6 +1762,249 @@ static void test_bridge_fdb(void)
     ft_handle_invalidate(&handle, &ft_mac_invalidations);
     ft_retire_workfn(NULL);
     assert(!ft_count && !allocated);
+}
+
+/* The concentrator's address, which is the Ethernet destination a session
+ * imposes and the one thing about the hop that no action, selector or device
+ * can be cross-checked against. */
+static const u8 AC_MAC[6] = { 2, 0xac, 0, 0, 0, 1 };
+#define SESSION_ID 0x1234
+
+/* Zero the two Ethernet-destination mangle words, which is what Netfilter
+ * really writes for a session: flow_offload_eth_dst() resolves the NOARP
+ * neighbour arp_constructor() builds on a ppp device, and that neighbour's
+ * hardware address is the zero one a device with no address length leaves
+ * behind. Entries 0 and 1 carry the source and are untouched. */
+static void zero_ethernet_dest(void)
+{
+    rule.action.entries[2].mangle.val = 0;
+    rule.action.entries[3].mangle.val = 0;
+}
+
+/* Append one PPPoE push after whatever encapsulation actions are already
+ * there, which is where nf_flow_rule_route_common() puts it: the pushes are
+ * emitted outermost first and the session is the innermost header, so it
+ * comes after every tag. */
+static void session_push(u16 sid)
+{
+    unsigned at = rule.action.num_entries - 1;
+
+    assert(rule.action.num_entries + 1 <= ARRAY_SIZE(rule.action.entries));
+    rule.action.entries[at + 1] = rule.action.entries[at];
+    rule.action.entries[at] = (struct flow_action_entry){
+        .id = FLOW_ACTION_PPPOE_PUSH, .pppoe = { .sid = sid } };
+    rule.action.num_entries++;
+}
+
+/* A session on the egress path, running straight on the physical port. The
+ * route names the ppp device, the redirect still names the port, and the
+ * session is what lies between. No neighbour moves to the ppp device: there
+ * is none to move, which is half the point. */
+static void pppoe_out_fixture(void)
+{
+    vlan_fixture();
+    assert(!ppp.refs && !in_ppp.refs);
+    route.dst.dev = &ppp;
+    egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex,
+                                               .id = SESSION_ID };
+    memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
+    zero_ethernet_dest();
+    session_push(SESSION_ID);
+}
+
+/* A session on the ingress path. The rule is indistinguishable from an
+ * unencapsulated one -- no pop action, no dissector key, the same action count
+ * -- so the devices are the only thing that says the frames arrive
+ * encapsulated at all. */
+static void pppoe_in_fixture(void)
+{
+    vlan_fixture();
+    assert(!ppp.refs && !in_ppp.refs);
+    reverse_route.dst.dev = &in_ppp;
+    ingress_session = (struct nf_flow_session){ .lower_ifindex = in.ifindex,
+                                                .id = SESSION_ID + 1 };
+    memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
+}
+
+#define PPPOE_REJECT(...) do { pppoe_out_fixture(); __VA_ARGS__; \
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+#define PPPOE_IN_REJECT(...) do { pppoe_in_fixture(); __VA_ARGS__; \
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+
+static void test_pppoe(void)
+{
+    struct cdx_ft_rule decoded;
+    const u16 push_one[] = { 100 };
+
+    /* Egress session on the port itself. The destination comes from the
+     * session, not from the rule, because the rule carries zeros. */
+    pppoe_out_fixture();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_session.present && decoded.out_session.id == SESSION_ID);
+    assert(!memcmp(decoded.out_session.mac, AC_MAC, ETH_ALEN));
+    assert(!memcmp(decoded.dst_mac, AC_MAC, ETH_ALEN));
+    assert(!decoded.in_session.present && !decoded.out_vlans && !decoded.in_vlans);
+    assert(decoded.out_logical == &ppp && decoded.out == &out && decoded.in == &in);
+    /* The Ethernet source is still the port's, exactly as for a tagged flow. */
+    assert(!memcmp(decoded.src_mac, out.dev_addr, ETH_ALEN));
+    /* The MTU is the ppp device's, which already accounts for the eight bytes
+     * the session header costs; nothing here has to subtract them. */
+    assert(decoded.mtu == 1492 && ppp.mtu == 1492);
+
+    /* No neighbour is consulted at all. Making every lookup fail leaves the
+     * decode untouched, which an ordinary flow would not survive. */
+    pppoe_out_fixture();
+    neigh_ok = false;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    neigh_ok = true;
+
+    /* Ingress session. Netfilter describes it with nothing: no pop, no key,
+     * five actions -- the same rule an unencapsulated flow produces. */
+    pppoe_in_fixture();
+    assert(rule.action.num_entries == 5);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.in_session.present && !decoded.out_session.present);
+    assert(decoded.in_logical == &in_ppp && decoded.in == &in);
+    /* An ingress session carries no identity into the rule, because the strip
+     * validates none. What it must not do is disturb the egress destination. */
+    assert(!memcmp(decoded.dst_mac, neighbour.ha, ETH_ALEN));
+
+    /* The shape the bench runs: the session over a VLAN device over the port.
+     * The tag below the session is still derived by the walk, and its push
+     * comes before the session's. */
+    pppoe_out_fixture();
+    egress_session.lower_ifindex = out_tag.ifindex;
+    encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_session.present && decoded.out_vlans == 1 &&
+           decoded.out_vlan[0].id == 100);
+    assert(rule.action.entries[4].id == FLOW_ACTION_VLAN_PUSH &&
+           rule.action.entries[5].id == FLOW_ACTION_PPPOE_PUSH);
+
+    /* And over a bridge, where the device below the session has no tag of its
+     * own but does have a bridge hop the walk must still cross. */
+    bridge_fixture();
+    route.dst.dev = &ppp;
+    egress_session = (struct nf_flow_session){ .lower_ifindex = br.ifindex,
+                                               .id = SESSION_ID };
+    memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
+    zero_ethernet_dest();
+    session_push(SESSION_ID);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_session.present && decoded.out_bridge == &br &&
+           !decoded.out_vlans);
+
+    /* Both directions over sessions, with different ids, which is what a
+     * router between two PPPoE accesses looks like. */
+    pppoe_out_fixture();
+    reverse_route.dst.dev = &in_ppp;
+    ingress_session = (struct nf_flow_session){ .lower_ifindex = in.ifindex,
+                                                .id = SESSION_ID + 1 };
+    memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_session.present && decoded.in_session.present);
+    assert(decoded.out_session.id == SESSION_ID &&
+           decoded.in_session.id == SESSION_ID + 1);
+
+    /* Re-entering the port a frame arrived on, with a session on one side
+     * only: two distinct paths, exactly as two different tag stacks are, so
+     * the hairpin rule must not collapse them into one. */
+    pppoe_out_fixture();
+    rule.action.entries[rule.action.num_entries - 1].dev = &in;
+    source_mac(&in);
+    egress_session.lower_ifindex = in.ifindex;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out == &in && decoded.in == &in && decoded.out_session.present);
+
+    /* Every way the hop can fail to describe something the hardware could
+     * reproduce. */
+    PPPOE_REJECT(egress_session.lower_ifindex = 0);      /* device named none */
+    PPPOE_REJECT(egress_session.lower_ifindex = 9999);   /* named one that is gone */
+    PPPOE_REJECT(egress_session.lower_ifindex = ppp.ifindex); /* named itself */
+    /* A second session below the first: one record for the path means the
+     * hop below resolves to the device this one already named. */
+    PPPOE_REJECT(egress_session.lower_ifindex = in_ppp.ifindex);
+    /* A session below a tag, which is the wrong way round on the wire. */
+    PPPOE_REJECT(route.dst.dev = &out_tag; out_tag.real_dev = &ppp;
+                 encap_actions(0, push_one, ARRAY_SIZE(push_one)));
+    out_tag.real_dev = &out;
+    /* Session zero is reserved for discovery. The pushed sid is zeroed to
+     * agree with it, so the id test is the only thing left that can decline
+     * this -- without that, the action cross-check refuses it instead and the
+     * case passes while the guard it names does nothing. */
+    PPPOE_REJECT(egress_session.id = 0;
+                 rule.action.entries[4].pppoe.sid = 0);
+    PPPOE_REJECT(memset(egress_session.h_dest, 0, ETH_ALEN));
+    PPPOE_REJECT(egress_session.h_dest[0] |= 1);         /* multicast concentrator */
+    PPPOE_REJECT(cls.nf_session = NULL);
+    /* The push must agree with the walk, which is the only cross-check the
+     * hop has. */
+    PPPOE_REJECT(rule.action.entries[4].pppoe.sid = SESSION_ID + 1);
+    PPPOE_REJECT(rule.action.entries[4].id = FLOW_ACTION_VLAN_PUSH);
+    PPPOE_REJECT(rule.action.entries[4].id = FLOW_ACTION_VLAN_POP);
+    /* A push where the walk found no session, and a session where the rule
+     * pushed nothing. */
+    PPPOE_REJECT(route.dst.dev = &out);
+    PPPOE_REJECT(rule.action.entries[4] = rule.action.entries[5];
+                 rule.action.num_entries--);
+    /* The Ethernet destination must be the zero one Netfilter writes. A
+     * kernel that started resolving something there would otherwise be
+     * silently overridden by the session's address. */
+    PPPOE_REJECT(rule.action.entries[2].mangle.val = 0x33221102);
+    /* The device below the session may not override the port's address: the
+     * hardware emits the port's and software would emit the override. */
+    PPPOE_REJECT(egress_session.lower_ifindex = out_tag.ifindex;
+                 out_tag.dev_addr[5]++;
+                 encap_actions(0, push_one, ARRAY_SIZE(push_one)));
+    ether_addr_copy(out_tag.dev_addr, out.dev_addr);
+    /* A session plus a full tag stack exceeds the encapsulation budget. */
+    PPPOE_REJECT(egress_session.lower_ifindex = out_qinq.ifindex;
+                 encap_actions(0, (const u16[]){ 100, 300 }, 2));
+    /* Netfilter named a session on a path this walk never crossed one on. */
+    PPPOE_IN_REJECT(reverse_route.dst.dev = &in);
+    PPPOE_IN_REJECT(cls.nf_session_reverse = NULL);
+    PPPOE_IN_REJECT(ingress_session.lower_ifindex = 0);
+    /* An ingress session must not be given a pop the kernel never emits. */
+    PPPOE_IN_REJECT(encap_actions(1, NULL, 0));
+
+    /* IPv6 over a session is excluded: the insert opcode carries no PPP
+     * protocol id, so nothing establishes that the firmware writes 0x0057. */
+    fixture6();
+    route6.dst.dev = &ppp;
+    egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex,
+                                               .id = SESSION_ID };
+    memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
+    zero_ethernet_dest();
+    session_push(SESSION_ID);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+
+    /* Lifecycle. A session direction holds no neighbour, so it has to reach
+     * the watch list by another route -- and a device event has to find it
+     * there. The reference counts prove the ppp device is pinned like any
+     * other logical device, and the teardown proves the unlink happens even
+     * with nothing to release. */
+    pppoe_out_fixture();
+    u64 links = ft_link_invalidations;
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(!ft_neighbour_refs && ppp.refs == 1 && out.refs == 1);
+    assert(ft_neigh_entries.next != &ft_neigh_entries);
+    ft_device_retire(&ppp, &ft_link_invalidations);
+    assert(handle.invalid && ft_link_invalidations == links + 1);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !ppp.refs && !out.refs && !allocated);
+    assert(ft_neigh_entries.next == &ft_neigh_entries);
+
+    /* Statistics on a session direction must not reach for a neighbour that
+     * is not there, and must not report the flow as unused. */
+    pppoe_out_fixture();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    struct cdx_ft_entry *entry = ft_find(&binding, cls.cookie);
+    assert(entry && !entry->neigh);
+    cls.command = FLOW_CLS_STATS;
+    assert(ft_stats(entry, &cls) == 0);
+    cls.command = FLOW_CLS_REPLACE;
+    assert(ft_remove(entry) == 0 && !ft_count);
+    assert(!ppp.refs && !out.refs && !allocated);
 }
 
 static void snat_fixture(bool forward, bool tcp)
@@ -2898,6 +3202,7 @@ int main(void)
     test_vlan();
     test_bridge();
     test_bridge_fdb();
+    test_pppoe();
     test_snat();
     test_dnat();
     test_double_nat();

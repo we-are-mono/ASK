@@ -1021,21 +1021,28 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 	return FAILURE;
 }
 
-/* Apply a caller-supplied VLAN stack to the L2 description derived from the
- * interfaces. Only the Linux flowtable owner uses this: its egress is a
- * physical port with tags named by the flow, so dpa_get_tx_info_by_itf() has
- * no VLAN interface to walk and returns an untagged description.
+/* Apply a caller-supplied VLAN stack and PPPoE session to the L2 description
+ * derived from the interfaces. Only the Linux flowtable owner uses this: its
+ * egress is a physical port with the encapsulation named by the flow, so
+ * dpa_get_tx_info_by_itf() has no VLAN or PPPoE interface to walk and returns
+ * a bare description.
  *
  * vlan_filtering suppresses the per-VLAN-interface statistics pointer in
  * create_vlan_ins_hm(), exactly as the bridge path does for tags that come
- * from bridge VLAN filtering rather than from a netdev. Without it the
- * unallocated offset 0 would aim the ucode's counter update at another
- * interface's statistics slot.
+ * from bridge VLAN filtering rather than from a netdev, and pppoe_no_ifstats
+ * does the same for both PPPoE opcodes. Without them the unallocated offset 0
+ * would aim the ucode's counter update at another interface's statistics slot.
  *
- * Refusing a description that already carries tags is deliberate: the only
- * way that happens here is a DSCP-to-VLAN-PCP egress map, which belongs to a
- * QoS configuration this owner does not implement, and silently replacing its
- * priority tag would lose it.
+ * The session's Ethernet destination is written to ac_mac_addr because that is
+ * where create_ethernet_hm() reads a PPPoE flow's destination from. It is the
+ * same address the route already carries in l2hdr, since a flow reaching here
+ * has the concentrator as its destination MAC; writing both keeps this path
+ * exercising exactly the branch the legacy one does.
+ *
+ * Refusing a description that already carries tags or a session is deliberate:
+ * the only way that happens here is a DSCP-to-VLAN-PCP egress map, which
+ * belongs to a QoS configuration this owner does not implement, and silently
+ * replacing its priority tag would lose it.
  */
 static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap *encap)
 {
@@ -1062,6 +1069,16 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 	if (encap->num_egress)
 		l2_info->vlan_filtering = 1;
 #endif
+	if (encap->ingress_pppoe)
+		l2_info->pppoe_present = 1;
+	if (encap->egress_pppoe) {
+		l2_info->add_pppoe_hdr = 1;
+		l2_info->pppoe_sess_id = encap->egress_session_id;
+		memcpy(l2_info->ac_mac_addr, encap->egress_session_mac,
+		       ETHER_ADDR_LEN);
+	}
+	if (encap->ingress_pppoe || encap->egress_pppoe)
+		l2_info->pppoe_no_ifstats = 1;
 	return SUCCESS;
 }
 
@@ -1749,16 +1766,21 @@ static int create_pppoe_ins_hm(struct ins_entry_info *info)
 	/* Update the Ethertype now PPPoE is the outermost header  */
 	info->eth_type = ETHERTYPE_PPPOE;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	{
+	/* A session described by a flow owns no statistics slot, so the only
+	 * offset available would be the unallocated zero. Emit the same null
+	 * pointer the statistics-disabled build below emits. */
+	if (info->l2_info.pppoe_no_ifstats) {
+		param->stats_ptr = 0;
+	} else {
 		uint8_t offset;
 
 		offset = (info->l2_info.pppoe_stats_offset & ~STATS_WITH_TS);
-		word = (get_logical_ifstats_base() + 
+		word = (get_logical_ifstats_base() +
 				(offset * sizeof(struct en_ehash_stats_with_ts)));
 		param->stats_ptr = cpu_to_be32(word);
 	}
 #else
-	param->stats_ptr = 0;	
+	param->stats_ptr = 0;
 #endif
 	word = ((PPPoE_VERSION << 28) | (PPPoE_TYPE << 24) | (PPPoE_CODE << 16) | 
 			(info->l2_info.pppoe_sess_id));
@@ -1911,15 +1933,19 @@ static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_inde
 	uint32_t param_size;
 	struct en_ehash_strip_pppoe_hdr *param;
 	uint32_t stats_ptr;
-	PCtEntry ctentry;
 
 	param = (struct en_ehash_strip_pppoe_hdr *)info->paramptr;
 	param_size = sizeof(struct en_ehash_strip_pppoe_hdr);
 	if (param_size > info->param_size)
 		return FAILURE;
-	ctentry = info->entry;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	{
+	/* The lookup below resolves a registered PPPoE interface, which a
+	 * session described by a flow does not have -- itf_index names the
+	 * physical port and the lookup would fail outright. Emit the null
+	 * pointer the statistics-disabled build emits, as the insert does. */
+	if (info->l2_info.pppoe_no_ifstats) {
+		stats_ptr = 0;
+	} else {
 		uint8_t offset;
 
 		if (dpa_get_iface_stats_entries(itf_index, 0, &offset, RX_IFSTATS, IF_TYPE_PPPOE)) {
