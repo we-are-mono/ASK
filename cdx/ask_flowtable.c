@@ -6,7 +6,10 @@
  * flow-block core excludes callbacks. Notifiers only latch invalidation and
  * queue work; they never start a backend transaction. Dependency notifications inspect
  * bound devices and immutable flow dependencies under ft_watch_lock. Neighbour
- * notifications nest this lock inside neigh->lock.
+ * notifications nest this lock inside neigh->lock, and bridge FDB
+ * notifications nest it inside the bridge's own hash lock, from softirq.
+ * Nothing takes a neighbour or bridge lock while holding ft_watch_lock, so
+ * neither nesting has an opposite order.
  * Invalidation ends its transaction before flushing Netfilter work. The backend
  * uses RTNL trylock for admission and fatal recovery, never a blocking acquire.
  * Each binding pins its ingress device; each installed direction pins egress.
@@ -14,6 +17,7 @@
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/hashtable.h>
+#include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
@@ -40,10 +44,19 @@
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
+#include <net/switchdev.h>
 #include "cdx_flowtable_backend.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 6
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 7
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
+#endif
+
+/* The bridge FDB pins a bridged flow's egress port, and this is the only
+ * chain a plain bridge reports FDB and VLAN-membership changes on. Building
+ * without it would offload bridged flows and never retire a stale one, which
+ * is a silent misforward rather than a missing feature. */
+#if !IS_ENABLED(CONFIG_NET_SWITCHDEV)
+#error "CDX flowtable requires CONFIG_NET_SWITCHDEV for bridge FDB invalidation"
 #endif
 
 /* A rule must be able to describe every encapsulation a tuple can carry;
@@ -54,7 +67,7 @@ static_assert(CDX_FT_VLAN_MAX == NF_FLOW_TABLE_ENCAP_MAX);
 static unsigned int ft_fail_stage;
 static unsigned int ft_init_fail_stage;
 module_param_named(init_fail_stage, ft_init_fail_stage, uint, 0444);
-MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration, 6 nexthop objects");
+MODULE_PARM_DESC(init_fail_stage, "Fail adapter load: 1 proc, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration, 6 nexthop objects, 7 bridge FDB, 8 bridge VLAN configuration");
 module_param_named(flowtable_fail_stage, ft_fail_stage, uint, 0600);
 MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocation, 2 before hardware, 3 after hardware, 4 busy after peer direction");
 #endif
@@ -115,6 +128,7 @@ static atomic64_t ft_route_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mtu_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_link_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mac_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_fdb_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_admission_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
@@ -185,10 +199,24 @@ static void ft_devices_hold(const struct cdx_ft_rule *rule)
 		dev_hold(rule->out_logical);
 	if (rule->in_logical != rule->in)
 		dev_hold(rule->in_logical);
+	/* A bridge is a device of its own, and is the logical device itself
+	 * when the route is through the bridge rather than a VLAN on it. One
+	 * bridge can also carry both directions, when a flow is routed between
+	 * two VLANs of the same bridge. Count each object once. */
+	if (rule->out_bridge && rule->out_bridge != rule->out_logical)
+		dev_hold(rule->out_bridge);
+	if (rule->in_bridge && rule->in_bridge != rule->in_logical &&
+	    rule->in_bridge != rule->out_bridge)
+		dev_hold(rule->in_bridge);
 }
 
 static void ft_devices_put(const struct cdx_ft_rule *rule)
 {
+	if (rule->in_bridge && rule->in_bridge != rule->in_logical &&
+	    rule->in_bridge != rule->out_bridge)
+		dev_put(rule->in_bridge);
+	if (rule->out_bridge && rule->out_bridge != rule->out_logical)
+		dev_put(rule->out_bridge);
 	if (rule->in_logical != rule->in)
 		dev_put(rule->in_logical);
 	if (rule->out_logical != rule->out)
@@ -563,26 +591,119 @@ static struct net_device *ft_vlan_lower(struct net_device *dev)
 	return NULL;
 }
 
-/* Derive the VLAN stack Linux would add between a logical device and its
- * physical port, outermost first. Netfilter also describes this stack in its
- * POP/PUSH actions, but the devices are the authority and the actions are
- * checked against them, exactly as a NAT mangle is checked against its
- * conntrack. Stopping on anything that is not an 802.1Q VLAN device is what
- * declines a bridge, a PPPoE session, a bond or a MACVLAN here, rather than
- * admitting a flow whose encapsulation the hardware would not reproduce.
+/* A vlan-aware bridge transforms the tag stack itself, through its own VLAN
+ * groups rather than through any netdev, so the devices above it do not
+ * describe what the wire carries. Mirror the two functions that made that
+ * decision -- br_vlan_fill_forward_path_pvid() and its _mode() companion --
+ * through the same bridge state they read, so the devices and the bridge
+ * configuration together remain the authority and the rule's POP/PUSH actions
+ * are still checked against the result rather than read as truth.
+ *
+ * stack holds the tags found above the bridge, innermost first, and count is
+ * updated in place: the bridge acts on the outermost tag, which is the last
+ * element, exactly as br_fill_forward_path() acts on ctx->vlan[num_vlans - 1].
+ * Returns the VID its FDB lookup was keyed on, or -EOPNOTSUPP.
+ *
+ * DEV_PATH_BR_VLAN_UNTAG_HW has no counterpart here and needs none: the
+ * bridge chooses it only for a VLAN a switchdev driver accepted, and
+ * cdx_ft_port_supported() admits no port belonging to a switch ASIC. It is
+ * the one shape whose tag is on the wire while the rule describes neither a
+ * selector nor a POP for it, so it must not be derivable as an ordinary
+ * untagged port.
+ */
+static int ft_bridge_vlan(struct net_device *bridge, struct net_device *port,
+			  struct cdx_ft_vlan *stack, unsigned int *count)
+{
+	struct bridge_vlan_info vinfo;
+	bool push = false;
+	u16 proto, vid;
+
+	if (!br_vlan_enabled(bridge))
+		return 0;
+	/* Only 802.1Q, for the reason the VLAN-device arm gives: the kernel
+	 * describes no selector for an 802.1ad tag and emits no push action for
+	 * one, so it is a tag the hardware would be asked to reproduce blind. A
+	 * bridge filtering in 802.1ad currently fails further down for want of
+	 * those, which is the right answer arrived at by accident; say it here
+	 * instead. */
+	if (br_vlan_get_proto(bridge, &proto) || proto != ETH_P_8021Q)
+		return -EOPNOTSUPP;
+	if (*count && stack[*count - 1].proto == htons(proto)) {
+		/* The frame already carries a tag in the bridge's protocol, so
+		 * the bridge forwards within that VLAN and adds nothing. */
+		vid = stack[*count - 1].id;
+	} else {
+		/* Otherwise it enters on the bridge's PVID, and leaves tagged
+		 * with it unless the egress port is untagged for it. */
+		if (*count == CDX_FT_VLAN_MAX || br_vlan_get_pvid(bridge, &vid))
+			return -EOPNOTSUPP;
+		push = true;
+	}
+	/* A port that is not a member of the resolved VLAN would have made the
+	 * path walk fail outright, so Netfilter would never have described this
+	 * flow; decline it for the same reason. */
+	if (br_vlan_get_info(port, vid, &vinfo))
+		return -EOPNOTSUPP;
+	if (vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED) {
+		/* push is false only where the frame already carried a tag in
+		 * this bridge's protocol, so there is always one to remove. */
+		if (push)
+			push = false;
+		else
+			(*count)--;
+	}
+	if (push) {
+		stack[*count].proto = htons(proto);
+		stack[*count].id = vid;
+		(*count)++;
+	}
+	return vid;
+}
+
+/* Derive the encapsulation Linux would add between a logical device and its
+ * physical port, outermost first, and name the bridge the path crosses, if
+ * any. Netfilter also describes this stack in its POP/PUSH actions, but the
+ * devices are the authority and the actions are checked against them, exactly
+ * as a NAT mangle is checked against its conntrack. Stopping on anything that
+ * is neither an 802.1Q VLAN device nor a bridge master is what declines a
+ * PPPoE session, a bond or a MACVLAN here, rather than admitting a flow whose
+ * encapsulation the hardware would not reproduce.
  * Returns the tag count, or -EOPNOTSUPP for a path this contract excludes.
  */
-static int ft_vlan_stack(struct net_device *logical, const struct net_device *physical,
-			 struct cdx_ft_vlan *stack)
+static int ft_path_stack(struct net_device *logical, struct net_device *physical,
+			 struct cdx_ft_vlan *stack, struct net_device **bridge,
+			 u16 *bridge_vid)
 {
 	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX];
 	unsigned int count = 0, i;
+	int vid;
 
+	*bridge = NULL;
+	*bridge_vid = 0;
 	if (!logical || !physical)
 		return -EOPNOTSUPP;
 	/* Each step strictly descends and the tag count is bounded, so a path
-	 * that never reaches the port terminates at the bound. */
+	 * that never reaches the port terminates at the bound. The bridge hop
+	 * is terminal, which is what bounds it there. */
 	while (logical != physical) {
+		if (netif_is_bridge_master(logical)) {
+			/* Which port a bridged flow leaves by was decided by
+			 * the FDB, and Netfilter already resolved that into the
+			 * redirect and the binding; a bridge has many lower
+			 * devices and descending by adjacency would pick an
+			 * arbitrary one. So require the port to be this
+			 * bridge's own, and stop. A bridge port that is itself
+			 * a stacked device hides a tag from this walk and is
+			 * declined by the same requirement. */
+			if (netdev_master_upper_dev_get(physical) != logical)
+				return -EOPNOTSUPP;
+			vid = ft_bridge_vlan(logical, physical, inner, &count);
+			if (vid < 0)
+				return vid;
+			*bridge = logical;
+			*bridge_vid = vid;
+			break;
+		}
 		if (!is_vlan_dev(logical) || count == CDX_FT_VLAN_MAX ||
 		    vlan_dev_vlan_proto(logical) != htons(ETH_P_8021Q))
 			return -EOPNOTSUPP;
@@ -767,19 +888,23 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * neither of which this contract describes. */
 	out->out_logical = cls->nf_dst->dev;
 	out->in_logical = cls->nf_dst_reverse->dev;
-	vlans = ft_vlan_stack(out->out_logical, out->out, out->out_vlan);
+	vlans = ft_path_stack(out->out_logical, out->out, out->out_vlan,
+			      &out->out_bridge, &out->out_bridge_vid);
 	if (vlans < 0)
 		return vlans;
 	out->out_vlans = vlans;
-	vlans = ft_vlan_stack(out->in_logical, out->in, out->in_vlan);
+	vlans = ft_path_stack(out->in_logical, out->in, out->in_vlan,
+			      &out->in_bridge, &out->in_bridge_vid);
 	if (vlans < 0)
 		return vlans;
 	out->in_vlans = vlans;
 	/* The Ethernet source a neighbour-output flow carries is the physical
-	 * port's, and the encoder caches exactly one address per port. A VLAN
-	 * device that overrides its parent's address would have software emit
-	 * one source MAC and hardware another for the same flow, so it is
-	 * declined rather than left silently divergent. */
+	 * port's, and the encoder caches exactly one address per port. A logical
+	 * device that does not share that address would have software emit one
+	 * source MAC and hardware another for the same flow, so it is declined
+	 * rather than left silently divergent. A VLAN device normally inherits
+	 * its parent's address; a bridge normally takes its lowest port's, so
+	 * this also decides which ports of a multi-port bridge are eligible. */
 	if (!ether_addr_equal(out->out_logical->dev_addr, out->out->dev_addr))
 		return -EOPNOTSUPP;
 	/* Re-entering the port a frame arrived on is a hairpin, and needs full
@@ -1241,6 +1366,18 @@ static void ft_invalidate_work(struct work_struct *work)
 	cdx_ft_end();
 }
 
+/* Every device a flow's forwarding depends on: both physical ports, both
+ * logical devices, and any bridge between them. A VLAN device carries its own
+ * MTU and administrative state, and a bridge carries both plus the FDB that
+ * chose the egress port, so a flow depends on each exactly as it depends on
+ * the physical port underneath. */
+static bool ft_entry_uses(const struct cdx_ft_entry *entry, const struct net_device *dev)
+{
+	return entry->rule.in == dev || entry->rule.out == dev ||
+		entry->rule.in_logical == dev || entry->rule.out_logical == dev ||
+		entry->rule.in_bridge == dev || entry->rule.out_bridge == dev;
+}
+
 static bool ft_device_used(const struct net_device *dev)
 {
 	struct cdx_ft_binding *binding;
@@ -1254,8 +1391,7 @@ static bool ft_device_used(const struct net_device *dev)
 		if (binding->dev == dev)
 			return true;
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-		if (entry->rule.in == dev || entry->rule.out == dev ||
-		    entry->rule.in_logical == dev || entry->rule.out_logical == dev)
+		if (ft_entry_uses(entry, dev))
 			return true;
 	return false;
 }
@@ -1265,12 +1401,8 @@ static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
 	struct cdx_ft_entry *entry;
 
 	spin_lock_bh(&ft_watch_lock);
-	/* A VLAN device carries its own MTU and administrative state, and a
-	 * flow tagged through it depends on both exactly as it depends on the
-	 * physical port underneath. */
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-		if (entry->rule.in == dev || entry->rule.out == dev ||
-		    entry->rule.in_logical == dev || entry->rule.out_logical == dev)
+		if (ft_entry_uses(entry, dev))
 			ft_handle_invalidate(entry->handle, counter);
 	spin_unlock_bh(&ft_watch_lock);
 }
@@ -1450,7 +1582,114 @@ static int ft_nexthop_event(struct notifier_block *nb, unsigned long event, void
 	return NOTIFY_DONE;
 }
 
+/* The bridge FDB is the fifth dependency class, and the only one Linux does
+ * not already retire a software flow for. br_fill_forward_path() picked this
+ * flow's egress port with br_fdb_find_rcu(bridge, destination MAC, VID), so
+ * the hardware entry is pinned to whichever port that entry named at
+ * admission; a station that roams, or an entry that ages out and is relearned
+ * elsewhere, otherwise keeps forwarding to the old port until something
+ * unrelated retires the flow. Nothing in net/bridge/ consults a flowtable, so
+ * an upstream bridged flow caches the same port in its DIRECT tuple and is
+ * stale for exactly as long in software.
+ *
+ * fdb_notify() reaches this chain for a plain, non-switchdev bridge too, and
+ * covers every way the pinning can change: a roam emits a delete against the
+ * old port and then an add against the new one, ageing and explicit deletion
+ * emit a delete, and a port leaving the bridge deletes everything it learned.
+ * The chain is atomic -- br_fdb_update() learns from softirq -- so this only
+ * latches invalidation, like every other notifier here.
+ *
+ * Matching on the destination MAC and VID alone is deliberately broader than
+ * the bridge membership this cannot check without RTNL: a same-address event
+ * on an unrelated bridge costs one retirement and readmission, where missing
+ * a real move costs silent misforwarding.
+ */
+static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	const struct switchdev_notifier_fdb_info *info = ptr;
+	struct net_device *port = switchdev_notifier_info_to_dev(ptr);
+	struct cdx_ft_entry *entry;
+
+	if ((event != SWITCHDEV_FDB_ADD_TO_DEVICE &&
+	     event != SWITCHDEV_FDB_DEL_TO_DEVICE) ||
+	    !port || !net_eq(dev_net(port), &init_net))
+		return NOTIFY_DONE;
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+		/* Only the egress direction is chosen by an FDB entry, and the
+		 * address it was looked up under is this rule's destination
+		 * MAC. An add naming the port the flow already leaves by
+		 * re-states the pinning rather than changing it. */
+		if (!entry->rule.out_bridge ||
+		    entry->rule.out_bridge_vid != info->vid ||
+		    !ether_addr_equal(entry->rule.dst_mac, info->addr) ||
+		    (event == SWITCHDEV_FDB_ADD_TO_DEVICE && port == entry->rule.out))
+			continue;
+		ft_handle_invalidate(entry->handle, &ft_fdb_invalidations);
+	}
+	spin_unlock_bh(&ft_watch_lock);
+	return NOTIFY_DONE;
+}
+
+/* ft_bridge_vlan() reads three pieces of bridge configuration: whether the
+ * bridge filters by VLAN at all, which protocol it filters in, and each
+ * port's membership. A flow's tag stack depends on all three exactly as it
+ * depends on a VLAN device, and none of them emits a netdev event: the ports
+ * stay up across every one of these changes, so nothing else here would
+ * notice. Each arrives on this chain instead -- memberships as PORT_VLAN
+ * objects against the port, the two bridge-wide settings as attributes
+ * against the bridge -- and each is administrative and rare, so a device this
+ * adapter depends on takes the same coarse route as a nexthop-object change
+ * rather than pricing a per-entry match into a blocking chain.
+ *
+ * The scope test is not optional. Every bridge installs its default PVID on a
+ * port the moment that port is enslaved, whatever its VLAN filtering setting,
+ * so without it enslaving any device anywhere would retire every flow on the
+ * hardware.
+ *
+ * Never set handled: the bridge treats a handled object or attribute as
+ * installed in hardware, and for a port VLAN it then skips vlan_vid_add(),
+ * which would leave the port filtering that VLAN out. This is an observer,
+ * and an observer must leave -EOPNOTSUPP to be the chain's answer.
+ */
+static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
+{
+	const struct switchdev_notifier_port_attr_info *attr;
+	const struct switchdev_notifier_port_obj_info *obj;
+	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
+
+	switch (event) {
+	case SWITCHDEV_PORT_OBJ_ADD:
+	case SWITCHDEV_PORT_OBJ_DEL:
+		obj = ptr;
+		if (!obj->obj || obj->obj->id != SWITCHDEV_OBJ_ID_PORT_VLAN)
+			return NOTIFY_DONE;
+		break;
+	case SWITCHDEV_PORT_ATTR_SET:
+		attr = ptr;
+		if (!attr->attr ||
+		    (attr->attr->id != SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING &&
+		     attr->attr->id != SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL))
+			return NOTIFY_DONE;
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
+	if (!dev)
+		return NOTIFY_DONE;
+	spin_lock_bh(&ft_watch_lock);
+	/* Latch before releasing the watch lock, exactly as the netdev
+	 * upper-device event does: a concurrent last unbind and fresh bind must
+	 * not redirect this event to a new table. */
+	if (ft_device_used(dev))
+		ft_invalidate();
+	spin_unlock_bh(&ft_watch_lock);
+	return NOTIFY_DONE;
+}
+
 static struct notifier_block ft_netdev_nb = { .notifier_call = ft_netdev_event };
+static struct notifier_block ft_fdb_nb = { .notifier_call = ft_fdb_event };
+static struct notifier_block ft_swdev_nb = { .notifier_call = ft_swdev_event };
 static struct notifier_block ft_neigh_nb = { .notifier_call = ft_neigh_event };
 static struct notifier_block ft_fib_nb = { .notifier_call = ft_fib_event };
 static struct notifier_block ft_nexthop_nb = { .notifier_call = ft_nexthop_event };
@@ -1524,11 +1763,26 @@ static void ft_vlan_text(const struct cdx_ft_vlan *stack, u8 count, char *text, 
 		at += scnprintf(text + at, size - at, i ? ".%u" : "%u", stack[i].id);
 }
 
+/* The bridge, and the VID its FDB lookup was keyed on. That VID is not always
+ * one of the tags: on an untagged egress port the frame carries none at all,
+ * which is exactly the configuration a vlan-aware bridge ships with. */
+static void ft_bridge_text(const struct net_device *bridge, u16 vid, char *text,
+			   size_t size)
+{
+	if (!bridge)
+		strscpy(text, "-", size);
+	else if (vid)
+		scnprintf(text, size, "%s.%u", bridge->name, vid);
+	else
+		strscpy(text, bridge->name, size);
+}
+
 static int ft_show(struct seq_file *seq, void *v)
 {
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
 	char in_vlan[16], out_vlan[16];
+	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
 
 	if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
@@ -1536,12 +1790,16 @@ static int ft_show(struct seq_file *seq, void *v)
 		ft_vlan_text(entry->rule.in_vlan, entry->rule.in_vlans, in_vlan, sizeof(in_vlan));
 		ft_vlan_text(entry->rule.out_vlan, entry->rule.out_vlans, out_vlan,
 			     sizeof(out_vlan));
+		ft_bridge_text(entry->rule.in_bridge, entry->rule.in_bridge_vid, in_br,
+			       sizeof(in_br));
+		ft_bridge_text(entry->rule.out_bridge, entry->rule.out_bridge_vid, out_br,
+			       sizeof(out_br));
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-				   in_vlan, out_vlan,
+				   in_vlan, out_vlan, in_br, out_br,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
 				   &entry->rule.dst.in6, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
@@ -1549,9 +1807,9 @@ static int ft_show(struct seq_file *seq, void *v)
 				   entry->rule.proto, entry->rule.mtu,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
-				   in_vlan, out_vlan,
+				   in_vlan, out_vlan, in_br, out_br,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),
 				   &entry->rule.dst.ip, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
@@ -1564,7 +1822,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nadmission_invalidations %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\n",
 		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -1575,6 +1833,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_mtu_invalidations),
 		   atomic64_read(&ft_link_invalidations),
 		   atomic64_read(&ft_mac_invalidations),
+		   atomic64_read(&ft_fdb_invalidations),
 		   atomic64_read(&ft_admission_invalidations));
 	return 0;
 }
@@ -1636,11 +1895,21 @@ static int __init ask_flowtable_init(void)
 	rc = ft_init_fault(6) ? -ENOMEM : register_nexthop_notifier(&init_net, &ft_nexthop_nb, NULL);
 	if (rc)
 		goto fib;
+	rc = ft_init_fault(7) ? -ENOMEM : register_switchdev_notifier(&ft_fdb_nb);
+	if (rc)
+		goto nexthop;
+	rc = ft_init_fault(8) ? -ENOMEM : register_switchdev_blocking_notifier(&ft_swdev_nb);
+	if (rc)
+		goto fdb;
 	WRITE_ONCE(ft_ready, true);
 	rc = ft_init_fault(5) ? -ENOMEM : flow_indr_dev_register(ft_bind, NULL);
 	if (!rc)
 		return 0;
 	WRITE_ONCE(ft_ready, false);
+	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
+fdb:
+	unregister_switchdev_notifier(&ft_fdb_nb);
+nexthop:
 	unregister_nexthop_notifier(&init_net, &ft_nexthop_nb);
 fib:
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
@@ -1673,6 +1942,8 @@ static void __exit ask_flowtable_exit(void)
 	list_for_each_entry(entry, &ft_entries, list)
 		nf_flow_offload_handle_invalidate(entry->handle);
 	cdx_ft_end();
+	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
+	unregister_switchdev_notifier(&ft_fdb_nb);
 	unregister_nexthop_notifier(&init_net, &ft_nexthop_nb);
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);

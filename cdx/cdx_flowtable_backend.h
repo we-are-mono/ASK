@@ -37,6 +37,16 @@ struct cdx_ft_rule {
 	struct net_device *out;
 	struct net_device *in_logical;
 	struct net_device *out_logical;
+	/* The bridge each logical device reaches its physical port through, or
+	 * NULL when the path has none. Adapter state: the backend needs only
+	 * the ports and the tag stacks, but the bridge is a dependency of its
+	 * own, because the FDB entry (bridge, dst_mac, out_bridge_vid) is what
+	 * chose out. A vid of zero means the bridge does not filter by VLAN,
+	 * which is also the key its FDB lookup used. */
+	struct net_device *in_bridge;
+	struct net_device *out_bridge;
+	u16 in_bridge_vid;
+	u16 out_bridge_vid;
 	union nf_inet_addr src, dst;
 	__be16 sport, dport;
 	/* Complete tuple after translation; identical to the match without NAT. */

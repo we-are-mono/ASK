@@ -56,6 +56,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_vlan_failslab.py       251          (ASK_VLAN_FAILSLAB_VID)
 #   test_mcast_hcsync_quarantine.py 261..264 (ASK_MCAST_HCSYNC_BASE_VID)
 #   test_flowtable_vlan.py      271/272      (ASK_FLOWTABLE_VLAN_ID, +1 inner)
+#   test_flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
 #   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
 #
 # Overlaps that are safe only because the pairs never run concurrently and

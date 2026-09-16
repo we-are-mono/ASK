@@ -79,12 +79,22 @@ struct net_device {
     char name[8];
     struct net *net;
     unsigned type, addr_len, reg_state;
-    bool bridge, l3_slave, running, carrier;
+    bool l3_slave, running, carrier, switch_port;
     u8 dev_addr[6], perm_addr[6];
 };
+/* A DPAA MAC reports no switch parent, which is what dev_get_port_parent_id()
+ * signals by leaving -EOPNOTSUPP as the answer. A port that does report one
+ * belongs to a switch ASIC, whose bridge VLANs the gate has to exclude. */
+struct netdev_phys_item_id { unsigned char id[32]; unsigned char id_len; };
+static int dev_get_port_parent_id(struct net_device *d, struct netdev_phys_item_id *ppid,
+                                  bool recurse)
+{
+    if (!d->switch_port) return -EOPNOTSUPP;
+    *ppid = (struct netdev_phys_item_id){ .id = {1}, .id_len = 1 };
+    return 0;
+}
 #define dev_net(d) ((d)->net)
 #define net_eq(a,b) ((a) == (b))
-#define netif_is_bridge_port(d) ((d)->bridge)
 #define netif_is_l3_slave(d) ((d)->l3_slave)
 #define netif_running(d) ((d)->running)
 #define netif_carrier_ok(d) ((d)->carrier)
@@ -287,8 +297,14 @@ static void test_backend(void)
     assert(cdx_ft_port_supported(&in) && cdx_ft_port_supported(&out));
     assert(!cdx_ft_port_supported(NULL));
     out.net=&other_net; assert(!cdx_ft_port_supported(&out)); out.net=&init_net;
-    out.bridge=true; assert(!cdx_ft_port_supported(&out)); out.bridge=false;
+    /* A VRF slave moves the route lookup somewhere this contract cannot
+     * follow, and a switch ASIC's port lets the bridge mark a VLAN as already
+     * stripped in hardware with nothing in the rule naming it. An enslaved
+     * port is no longer refused at all, so there is nothing here to assert
+     * about one: the gate has stopped reading that state.
+     */
     out.l3_slave=true; assert(!cdx_ft_port_supported(&out)); out.l3_slave=false;
+    out.switch_port=true; assert(!cdx_ft_port_supported(&out)); out.switch_port=false;
     out.carrier=false; assert(!cdx_ft_port_supported(&out)); out.carrier=true;
     out.running=false; assert(!cdx_ft_port_supported(&out)); out.running=true;
     out.dev_addr[5]=1; assert(cdx_ft_port_supported(&out));

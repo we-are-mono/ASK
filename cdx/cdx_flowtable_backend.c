@@ -158,16 +158,32 @@ void cdx_ft_admission_end(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_end, ASK_CDX_FLOWTABLE);
 
+/* A port belonging to a switch ASIC would let the bridge mark a VLAN as
+ * already stripped by hardware, which describes a tag the adapter's own
+ * encoder is then expected to reproduce with nothing in the rule naming it.
+ * A DPAA MAC is never such a port; prove that rather than assume it. */
+static bool cdx_ft_switch_port(struct net_device *dev)
+{
+	struct netdev_phys_item_id ppid;
+
+	return dev_get_port_parent_id(dev, &ppid, false) != -EOPNOTSUPP;
+}
+
 bool cdx_ft_port_supported(struct net_device *dev)
 {
 	POnifDesc onif;
 	struct dpa_iface_info *iface;
 
 	cdx_ft_assert_held();
+	/* A bridge port is admissible: the adapter's device walk recognizes the
+	 * bridge hop above it and derives the tag stack the bridge produces, so
+	 * an enslaved port is described rather than excluded. An L3 slave still
+	 * is not -- a VRF moves the route lookup somewhere this contract does
+	 * not follow. */
 	if (!dev || !net_eq(dev_net(dev), &init_net) ||
 	    dev->type != ARPHRD_ETHER || dev->addr_len != ETH_ALEN ||
 	    dev->reg_state != NETREG_REGISTERED ||
-	    netif_is_bridge_port(dev) || netif_is_l3_slave(dev) ||
+	    netif_is_l3_slave(dev) || cdx_ft_switch_port(dev) ||
 	    !netif_running(dev) || !netif_carrier_ok(dev))
 		return false;
 	iface = dpa_get_ifinfo_by_netdev(dev);

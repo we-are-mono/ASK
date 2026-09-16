@@ -189,11 +189,49 @@ struct flow_block_cb {
 };
 struct net { int id; };
 static struct net init_net;
+/* One bridge VLAN membership, as `bridge vlan add dev D vid N [untagged]`
+ * records it: on the master it carries the PVID, on a port it carries the
+ * egress mode br_vlan_fill_forward_path_mode() reads. */
+#define BR_MAX_VLANS 4
+struct br_vlan_entry { u16 vid, flags; };
+struct bridge_vlan_info { u16 vid, flags; };
+#define BRIDGE_VLAN_INFO_PVID (1 << 1)
+#define BRIDGE_VLAN_INFO_UNTAGGED (1 << 2)
+
 /* real_dev is what makes a device a VLAN here, exactly as vlan_dev_priv's
- * presence does in the kernel; a physical port leaves it NULL. */
+ * presence does in the kernel; a physical port leaves it NULL. A bridge is
+ * not a VLAN however its lower list is filled in, which is what lets the
+ * bridge below carry a decoy first lower device. */
 struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
-                    struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto; };
-static bool is_vlan_dev(const struct net_device *d) { return d->real_dev; }
+                    struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
+                    bool bridge, vlan_filtering; struct net_device *master;
+                    u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
+                    unsigned br_nvlans; };
+static bool is_vlan_dev(const struct net_device *d) { return d->real_dev && !d->bridge; }
+static bool netif_is_bridge_master(const struct net_device *d) { return d->bridge; }
+static struct net_device *netdev_master_upper_dev_get(struct net_device *d) { return d->master; }
+/* The bridge queries the adapter mirrors br_vlan_fill_forward_path_pvid() and
+ * br_vlan_fill_forward_path_mode() through. br_vlan_get_proto() reports host
+ * order, and br_vlan_get_pvid() succeeds even with no PVID configured -- the
+ * resulting zero then fails the membership lookup, exactly as in the kernel. */
+static bool br_vlan_enabled(const struct net_device *d)
+{ assert(d->bridge); return d->vlan_filtering; }
+static int br_vlan_get_proto(const struct net_device *d, u16 *proto)
+{ assert(d->bridge); *proto = d->br_proto; return 0; }
+static int br_vlan_get_pvid(const struct net_device *d, u16 *pvid)
+{ assert(d->bridge); *pvid = d->pvid; return 0; }
+static int br_vlan_get_info(const struct net_device *d, u16 vid, struct bridge_vlan_info *info)
+{
+    unsigned i;
+
+    for (i = 0; i < d->br_nvlans; i++)
+        if (d->br_vlans[i].vid == vid) {
+            info->vid = vid;
+            info->flags = d->br_vlans[i].flags;
+            return 0;
+        }
+    return -ENOENT;
+}
 /* Faithful to the kernel's own vlan_dev_real_dev(), which descends through
  * every stacked VLAN at once and returns the bottom device -- not the
  * immediate parent. Modelling it as the parent would make a QinQ stack look
@@ -219,6 +257,37 @@ static __be16 vlan_dev_vlan_proto(const struct net_device *d) { return d->vlan_p
 #define dev_net(d) ((d)->net ? (d)->net : &init_net)
 struct netdev_notifier_info { struct net_device *dev; };
 #define netdev_notifier_info_to_dev(p) (((struct netdev_notifier_info *)(p))->dev)
+/* The switchdev chains the bridge reports FDB and VLAN-membership changes on.
+ * Both notifier info structs lead with the common one, which is what makes
+ * switchdev_notifier_info_to_dev() work on either. */
+enum switchdev_notifier_type {
+    SWITCHDEV_FDB_ADD_TO_DEVICE = 1, SWITCHDEV_FDB_DEL_TO_DEVICE,
+    SWITCHDEV_PORT_OBJ_ADD, SWITCHDEV_PORT_OBJ_DEL, SWITCHDEV_PORT_ATTR_SET,
+};
+enum switchdev_obj_id { SWITCHDEV_OBJ_ID_PORT_VLAN = 1, SWITCHDEV_OBJ_ID_PORT_MDB };
+struct switchdev_notifier_info { struct net_device *dev; void *extack; const void *ctx; };
+struct switchdev_notifier_fdb_info {
+    struct switchdev_notifier_info info; /* must be first */
+    const unsigned char *addr;
+    u16 vid;
+};
+enum switchdev_attr_id {
+    SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING = 1, SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL,
+    SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME,
+};
+struct switchdev_obj { enum switchdev_obj_id id; };
+struct switchdev_attr { enum switchdev_attr_id id; };
+struct switchdev_notifier_port_obj_info {
+    struct switchdev_notifier_info info; /* must be first */
+    const struct switchdev_obj *obj;
+    bool handled;
+};
+struct switchdev_notifier_port_attr_info {
+    struct switchdev_notifier_info info; /* must be first */
+    const struct switchdev_attr *attr;
+    bool handled;
+};
+#define switchdev_notifier_info_to_dev(p) (((struct switchdev_notifier_info *)(p))->dev)
 struct dst_ops { unsigned family; };
 struct dst_entry {
     struct dst_ops *ops;
@@ -397,7 +466,7 @@ static LIST_HEAD(ft_block_list);
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
-static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_admission_invalidations;
+static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_admission_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
@@ -532,8 +601,10 @@ struct proc_dir_entry { int unused; };
 static struct proc_dir_entry proc_entry, *ft_proc;
 static int ft_proc_ops;
 static struct notifier_block ft_netdev_nb, ft_neigh_nb, ft_fib_nb, ft_nexthop_nb;
+static struct notifier_block ft_fdb_nb, ft_swdev_nb;
 static unsigned registration_step, registration_failure, canceled;
 static bool backend_claimed, netdev_registered, neigh_registered, fib_registered, nexthop_registered, indirect_registered;
+static bool fdb_registered, swdev_obj_registered;
 static bool owner_enabled = true;
 static bool registration_fails(void) { return ++registration_step == registration_failure; }
 static struct proc_dir_entry *proc_create(const char *name, int mode, void *parent, void *ops)
@@ -567,6 +638,14 @@ static void unregister_netevent_notifier(struct notifier_block *nb)
 { assert(neigh_registered); neigh_registered=false; }
 static void unregister_fib_notifier(struct net *net, struct notifier_block *nb)
 { assert(fib_registered); fib_registered=false; }
+static int register_switchdev_notifier(struct notifier_block *nb)
+{ if (registration_fails()) return -ENOMEM; fdb_registered=true; return 0; }
+static void unregister_switchdev_notifier(struct notifier_block *nb)
+{ assert(fdb_registered); fdb_registered=false; }
+static int register_switchdev_blocking_notifier(struct notifier_block *nb)
+{ if (registration_fails()) return -ENOMEM; swdev_obj_registered=true; return 0; }
+static void unregister_switchdev_blocking_notifier(struct notifier_block *nb)
+{ assert(swdev_obj_registered); swdev_obj_registered=false; }
 static void cancel_work_sync(int *work) { assert(work == &ft_retire_work); canceled++; }
 static void cancel_delayed_work_sync(int *work) { assert(work == &ft_work); canceled++; }
 static int register_indirect(void)
@@ -575,6 +654,7 @@ static void unregister_indirect(void)
 {
     assert(indirect_registered && canceled == 2 && !cdx_info->ctrl.mutex);
     assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered);
+    assert(!fdb_registered && !swdev_obj_registered);
     while (ft_block_list.next != &ft_block_list) {
         struct flow_block_cb *cb = list_entry(ft_block_list.next, struct flow_block_cb, driver_list);
         list_del(&cb->driver_list); list_del(&cb->list);
@@ -597,6 +677,23 @@ static void msleep(unsigned ms)
 
 static struct net_device in = { .ifindex = 5, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1} };
 static struct net_device out = { .ifindex = 6, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2} };
+/* A bridge over each physical port, and a VLAN device on top of one of them:
+ * what OpenWrt spells br-lan and br-lan.N. `decoy` is each bridge's first
+ * lower device and deliberately not the port a flow leaves by -- a walk that
+ * descended a bridge through its adjacency list would land there, because a
+ * bridge has many lower devices and the first is whichever was enslaved
+ * first, never the one the FDB chose. */
+static struct net_device decoy = { .ifindex = 11, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 9} };
+static struct net_device br = { .ifindex = 12, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+                                .real_dev = &decoy, .bridge = true };
+static struct net_device br_tag = { .ifindex = 13, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+                                    .real_dev = &br, .vlan_id = 100 };
+static struct net_device in_br = { .ifindex = 14, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1},
+                                   .real_dev = &decoy, .bridge = true };
+/* br-lan.100.300: a second tag inside the bridge's own, so the bridge resolves
+ * on an outermost tag that is not the only one. */
+static struct net_device br_qinq = { .ifindex = 15, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+                                     .real_dev = &br_tag, .vlan_id = 300 };
 static struct cdx_ft_binding binding = { .dev = &in };
 static struct dst_ops ipv4_ops = { .family = AF_INET };
 static struct dst_ops ipv6_ops6 = { .family = AF_INET6 };
@@ -671,6 +768,10 @@ static void fixture(void)
     cls = (struct flow_cls_offload){ .rule = &rule, .nf_ct = &ct, .nf_dst = &route.dst, .nf_mtu = 1492,
         .nf_dst_reverse = &reverse_route.dst, .nf_handle = &handle, .cookie = 123, .common.protocol = ETH_P_ALL };
     physical_ok = neigh_ok = true;
+    /* Unbridged by default. A leftover master or VLAN membership from a
+     * bridged case would change the path every later one walks. */
+    in.master = out.master = decoy.master = NULL;
+    in.br_nvlans = out.br_nvlans = 0;
 }
 /* The IPv4 fixture converted one family over: same devices, same Ethernet
  * rewrites and redirect, but IPv6 selectors, an rt6 destination carrying the
@@ -881,8 +982,8 @@ static void test_ipv6(void)
 /* out_tag is eth3.100 over the egress port, in_tag eth4.200 over the ingress
  * one, and out_qinq is 300 inside 100 -- what Linux spells eth3.100.300, and
  * what the wire carries as an outer 100 and an inner 300. A device that is
- * neither a VLAN nor a physical port stands in for every other upper device:
- * a bridge, a bond, a PPPoE session. */
+ * neither a VLAN, a bridge nor a physical port stands in for every other
+ * upper device: a bond, a MACVLAN, a PPPoE session. */
 static struct net_device out_tag = { .ifindex = 7, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
                                      .real_dev = &out, .vlan_id = 100 };
 static struct net_device in_tag = { .ifindex = 8, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1},
@@ -913,6 +1014,57 @@ static void vlan_fixture(void)
     ether_addr_copy(out_qinq.dev_addr, out.dev_addr);
     ether_addr_copy(in_tag.dev_addr, in.dev_addr);
     assert(!out_tag.refs && !in_tag.refs && !out_qinq.refs);
+}
+
+/* A bridge over each physical port, VLAN filtering off: the plain br-lan an
+ * untagged LAN is built as. The ports are enslaved, the bridge takes its
+ * lowest port's address as Linux does by default, and br_tag sits on top for
+ * the vlan-aware cases. Every mutable field is restored, because the
+ * rejection cases work by breaking one of them. */
+static void bridge_fixture(void)
+{
+    vlan_fixture();
+    br.real_dev = in_br.real_dev = &decoy;
+    br.bridge = in_br.bridge = true;
+    br.vlan_filtering = in_br.vlan_filtering = false;
+    br.br_proto = in_br.br_proto = ETH_P_8021Q;
+    br.pvid = in_br.pvid = 0;
+    br.br_nvlans = in_br.br_nvlans = 0;
+    br.mtu = in_br.mtu = 1500;
+    br_tag.real_dev = &br;
+    br_tag.vlan_id = 100;
+    br_tag.vlan_proto = htons(ETH_P_8021Q);
+    br_tag.mtu = 1500;
+    br_qinq.real_dev = &br_tag;
+    br_qinq.vlan_id = 300;
+    br_qinq.vlan_proto = htons(ETH_P_8021Q);
+    br_qinq.mtu = 1500;
+    out.master = &br;
+    in.master = &in_br;
+    decoy.master = &br;
+    ether_addr_copy(br.dev_addr, out.dev_addr);
+    ether_addr_copy(br_tag.dev_addr, out.dev_addr);
+    ether_addr_copy(br_qinq.dev_addr, out.dev_addr);
+    ether_addr_copy(in_br.dev_addr, in.dev_addr);
+    assert(!br.refs && !br_tag.refs && !br_qinq.refs && !in_br.refs && !decoy.refs);
+}
+
+/* Make the bridge VLAN-aware and give the egress port one membership. */
+static void bridge_vlan(u16 pvid, u16 vid, u16 flags)
+{
+    br.vlan_filtering = true;
+    br.pvid = pvid;
+    out.br_nvlans = 1;
+    out.br_vlans[0] = (struct br_vlan_entry){ .vid = vid, .flags = flags };
+}
+
+/* Egress through a plain bridge: the route names br-lan, the redirect still
+ * names the port under it, and no tag lies between. */
+static void bridge_out_fixture(void)
+{
+    bridge_fixture();
+    route.dst.dev = &br;
+    neighbour.dev = &br;
 }
 
 /* Splice an encapsulation block in after the four Ethernet mangles, sliding
@@ -1197,6 +1349,358 @@ static void test_vlan(void)
     assert(handle.invalid);
     ft_retire_workfn(NULL);
     assert(!ft_count && !in_tag.refs && !out.refs && !allocated);
+}
+
+static void test_bridge(void)
+{
+    struct cdx_ft_rule decoded;
+    const u16 push_one[] = { 100 }, ingress_one[] = { 100 };
+
+    /* A plain br-lan, VLAN filtering off: the route names the bridge, the
+     * redirect names the port, and the wire carries no tag. This is the
+     * untagged LAN OpenWrt ships by default. */
+    bridge_out_fixture();
+    /* The trap this pins down: the bridge's first lower device is not the
+     * port the flow leaves by, so a walk that descended it by adjacency the
+     * way it descends a VLAN would derive the wrong port for every case
+     * below. Only the redirect and the enslavement name the right one. */
+    assert(br.real_dev == &decoy && &decoy != &out && out.master == &br);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(!decoded.out_vlans && !decoded.in_vlans);
+    assert(decoded.out == &out && decoded.in == &in);
+    assert(decoded.out_logical == &br && decoded.out_bridge == &br &&
+           decoded.out_bridge_vid == 0);
+    assert(!decoded.in_bridge && decoded.in_logical == &in);
+    /* The Ethernet source is still the port's, because that is the address
+     * flow_offload_eth_src() writes for a neighbour-output flow. */
+    assert(!memcmp(decoded.src_mac, out.dev_addr, ETH_ALEN));
+
+    /* br-lan.100 over a bridge whose egress port is tagged for 100: the tag
+     * comes from the VLAN device and the bridge keeps it. */
+    bridge_fixture();
+    bridge_vlan(1, 100, 0);
+    route.dst.dev = &br_tag;
+    neighbour.dev = &br_tag;
+    encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_vlans == 1 && decoded.out_vlan[0].id == 100 &&
+           decoded.out_vlan[0].proto == htons(ETH_P_8021Q));
+    assert(decoded.out_bridge == &br && decoded.out_bridge_vid == 100);
+    assert(decoded.out_logical == &br_tag && decoded.out == &out);
+
+    /* The same devices with the port untagged for 100 -- the access port a
+     * vlan-aware br-lan actually ships with. The bridge strips the tag, so
+     * the wire carries none and the rule pushes none, even though a device
+     * walk that stopped at the netdevs would have derived one. */
+    bridge_fixture();
+    bridge_vlan(100, 100, BRIDGE_VLAN_INFO_UNTAGGED | BRIDGE_VLAN_INFO_PVID);
+    route.dst.dev = &br_tag;
+    neighbour.dev = &br_tag;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(!decoded.out_vlans && decoded.out_bridge == &br &&
+           decoded.out_bridge_vid == 100);
+
+    /* Routing through br-lan itself on a vlan-aware bridge: the frame enters
+     * on the PVID and the port is tagged for it, so the bridge inserts a tag
+     * that no netdev anywhere describes. */
+    bridge_out_fixture();
+    bridge_vlan(100, 100, BRIDGE_VLAN_INFO_PVID);
+    encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_vlans == 1 && decoded.out_vlan[0].id == 100 &&
+           decoded.out_vlan[0].proto == htons(ETH_P_8021Q));
+    assert(decoded.out_bridge_vid == 100 && decoded.out_logical == &br);
+
+    /* Untagged for the PVID is the ordinary access port, and adds nothing. */
+    bridge_out_fixture();
+    bridge_vlan(100, 100, BRIDGE_VLAN_INFO_UNTAGGED | BRIDGE_VLAN_INFO_PVID);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(!decoded.out_vlans && decoded.out_bridge_vid == 100);
+
+    /* A bridge on the ingress side, which is the shipping shape: the LAN is
+     * bridged and the WAN is not. */
+    bridge_fixture();
+    reverse_route.dst.dev = &in_br;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(!decoded.in_vlans && decoded.in_bridge == &in_br &&
+           decoded.in_logical == &in_br && !decoded.out_bridge);
+
+    /* Ingress through br-lan.100 on an access port: the frame arrives
+     * untagged, so there is no POP and no ingress selector to check. */
+    bridge_fixture();
+    in_br.vlan_filtering = true;
+    in_br.pvid = 100;
+    in.br_nvlans = 1;
+    in.br_vlans[0] = (struct br_vlan_entry){ .vid = 100,
+        .flags = BRIDGE_VLAN_INFO_UNTAGGED | BRIDGE_VLAN_INFO_PVID };
+    br_tag.real_dev = &in_br;
+    reverse_route.dst.dev = &br_tag;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(!decoded.in_vlans && decoded.in_bridge == &in_br &&
+           decoded.in_bridge_vid == 100);
+    /* Tagged on that port instead, and the tag reappears on both the POP and
+     * the ingress selector. This is also the only shape where the bridge is
+     * neither logical device, so it is the one that proves a bridge is pinned
+     * and watched in its own right rather than as somebody's route target. */
+    bridge_fixture();
+    in_br.vlan_filtering = true;
+    in_br.pvid = 1;
+    in.br_nvlans = 1;
+    in.br_vlans[0] = (struct br_vlan_entry){ .vid = 100, .flags = 0 };
+    br_tag.real_dev = &in_br;
+    reverse_route.dst.dev = &br_tag;
+    encap_actions(1, NULL, 0);
+    encap_keys(ingress_one, ARRAY_SIZE(ingress_one));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.in_vlans == 1 && decoded.in_vlan[0].id == 100 &&
+           decoded.in_bridge == &in_br && decoded.in_bridge_vid == 100);
+    assert(decoded.in_logical == &br_tag && !decoded.out_bridge);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(out.refs == 1 && br_tag.refs == 1 && in_br.refs == 1 && !in.refs);
+    ft_device_retire(&in_br, &ft_link_invalidations);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out.refs && !br_tag.refs && !in_br.refs && !allocated);
+
+    /* A second tag inside the bridge's own: the bridge resolves on the
+     * outermost tag, which is 100 and not the 300 above it. The egress port
+     * is untagged for 100 and a member of 300, so the bridge strips its own
+     * tag and the inner one survives. Resolving on the wrong end of the stack
+     * would key the FDB on 300 and leave both tags on the wire. */
+    bridge_fixture();
+    br.vlan_filtering = true;
+    br.pvid = 1;
+    out.br_nvlans = 2;
+    out.br_vlans[0] = (struct br_vlan_entry){ .vid = 100,
+        .flags = BRIDGE_VLAN_INFO_UNTAGGED };
+    out.br_vlans[1] = (struct br_vlan_entry){ .vid = 300, .flags = 0 };
+    route.dst.dev = &br_qinq;
+    neighbour.dev = &br_qinq;
+    encap_actions(0, (const u16[]){ 300 }, 1);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_vlans == 1 && decoded.out_vlan[0].id == 300);
+    assert(decoded.out_bridge == &br && decoded.out_bridge_vid == 100);
+
+#define BRIDGE_REJECT(...) do { bridge_out_fixture(); __VA_ARGS__; \
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+    /* The port a bridged flow leaves by is the one the FDB chose, and the
+     * redirect names it. A bridge the port is not enslaved to describes a
+     * different path entirely. */
+    BRIDGE_REJECT(out.master = NULL);
+    BRIDGE_REJECT(out.master = &in_br);
+    /* A bridge port that is itself a stacked device hides whatever tag lies
+     * between it and the physical port, so the walk declines rather than
+     * deriving a stack it cannot see. */
+    BRIDGE_REJECT(out.master = NULL; out_tag.master = &br);
+    /* A vlan-aware bridge whose egress port is not a member of the resolved
+     * VLAN would have failed the path walk outright, so Netfilter would never
+     * have described this flow. The action list is made to agree with the tag
+     * the PVID implies, so only the membership lookup can decline it. */
+    BRIDGE_REJECT(bridge_vlan(100, 200, 0);
+                  encap_actions(0, push_one, ARRAY_SIZE(push_one)));
+    /* No PVID configured is the same refusal: VID zero is nobody's member. */
+    BRIDGE_REJECT(bridge_vlan(0, 100, 0);
+                  encap_actions(0, (const u16[]){ 0 }, 1));
+    /* A bridge filtering in 802.1ad is declined for the reason a VLAN device
+     * in 802.1ad is: the kernel describes no selector for such a tag and
+     * emits no push action for one. Made to agree with itself, so only the
+     * protocol check can refuse it. */
+    BRIDGE_REJECT(bridge_vlan(100, 100, BRIDGE_VLAN_INFO_PVID);
+                  br.br_proto = ETH_P_8021AD;
+                  encap_actions(0, push_one, ARRAY_SIZE(push_one));
+                  rule.action.entries[4].vlan.proto = htons(ETH_P_8021AD));
+    /* The bridge carries its own MTU and its own address, exactly as a VLAN
+     * device does, and both belong to the flow that routes through it. */
+    BRIDGE_REJECT(br.mtu = 1491);
+    BRIDGE_REJECT(br.dev_addr[5]++);
+    /* A neighbour on the port underneath is not this flow's neighbour. */
+    BRIDGE_REJECT(neighbour.dev = &out);
+    /* An inserted tag the action list does not push, and a pushed tag the
+     * bridge does not insert, are both refused. */
+    BRIDGE_REJECT(bridge_vlan(100, 100, BRIDGE_VLAN_INFO_PVID));
+    BRIDGE_REJECT(encap_actions(0, push_one, ARRAY_SIZE(push_one)));
+#undef BRIDGE_REJECT
+
+    /* Two bridges, one per direction, is three distinct devices pinned plus
+     * the egress port -- and each is a dependency the flow retires on. */
+    bridge_fixture();
+    route.dst.dev = &br;
+    neighbour.dev = &br;
+    reverse_route.dst.dev = &in_br;
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(out.refs == 1 && br.refs == 1 && in_br.refs == 1 && !in.refs && !br_tag.refs);
+    ft_device_retire(&br, &ft_mtu_invalidations);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out.refs && !br.refs && !in_br.refs && !allocated);
+
+    /* The ingress bridge is watched too, and so is a VLAN device above one:
+     * br-lan.100 and br-lan are separate objects and both are pinned. */
+    bridge_fixture();
+    bridge_vlan(1, 100, 0);
+    route.dst.dev = &br_tag;
+    neighbour.dev = &br_tag;
+    reverse_route.dst.dev = &in_br;
+    encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(out.refs == 1 && br.refs == 1 && br_tag.refs == 1 && in_br.refs == 1);
+    ft_device_retire(&in_br, &ft_link_invalidations);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out.refs && !br.refs && !br_tag.refs && !in_br.refs && !allocated);
+
+    /* One bridge carrying both directions is counted once, which is what an
+     * inter-VLAN route across a single vlan-aware bridge looks like. */
+    bridge_fixture();
+    bridge_vlan(1, 100, 0);
+    in.master = &br;
+    in.br_nvlans = 1;
+    in.br_vlans[0] = (struct br_vlan_entry){ .vid = 1,
+        .flags = BRIDGE_VLAN_INFO_UNTAGGED | BRIDGE_VLAN_INFO_PVID };
+    route.dst.dev = &br_tag;
+    neighbour.dev = &br_tag;
+    reverse_route.dst.dev = &br;
+    encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_bridge == &br && decoded.in_bridge == &br);
+    assert(decoded.out_bridge_vid == 100 && decoded.in_bridge_vid == 1);
+    assert(!decoded.in_vlans && decoded.out_vlans == 1);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    /* The bridge is both this direction's ingress logical device and the
+     * egress path's bridge, so it is pinned once for each -- what matters is
+     * that the puts mirror the holds, which the teardown below proves. */
+    assert(br.refs == 2 && br_tag.refs == 1 && out.refs == 1);
+    ft_device_retire(&br, &ft_link_invalidations);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !br.refs && !br_tag.refs && !out.refs && !allocated);
+}
+
+/* The FDB pins a bridged flow's egress port, and nothing else here watches
+ * it. Each case installs one entry, delivers one event and requires the
+ * handle to move or stay exactly as the pinning did. */
+static void test_bridge_fdb(void)
+{
+    const u8 *dst = neighbour.ha;
+    struct switchdev_notifier_fdb_info info;
+    u64 before;
+
+    /* Install a bridged egress direction whose destination MAC is the one the
+     * bridge would have looked up. */
+#define FDB_FIXTURE() do { bridge_out_fixture(); bridge_vlan(100, 100, \
+        BRIDGE_VLAN_INFO_UNTAGGED | BRIDGE_VLAN_INFO_PVID); \
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1); \
+    info = (struct switchdev_notifier_fdb_info){ .info.dev = &out, .addr = dst, .vid = 100 }; \
+    before = ft_fdb_invalidations; } while (0)
+#define FDB_DRAIN() do { ft_handle_invalidate(&handle, &ft_mac_invalidations); \
+    ft_retire_workfn(NULL); assert(!ft_count && !allocated); } while (0)
+
+    /* A delete against the port the flow leaves by withdraws the pinning. */
+    FDB_FIXTURE();
+    assert(ft_fdb_event(NULL, SWITCHDEV_FDB_DEL_TO_DEVICE, &info) == NOTIFY_DONE);
+    assert(handle.invalid && ft_fdb_invalidations == before + 1);
+    FDB_DRAIN();
+
+    /* An add naming the same port re-states it and changes nothing. */
+    FDB_FIXTURE();
+    assert(ft_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info) == NOTIFY_DONE);
+    assert(!handle.invalid && ft_fdb_invalidations == before);
+    /* An add naming another port is a station that roamed, and the hardware
+     * entry would otherwise keep forwarding to the old one. */
+    info.info.dev = &decoy;
+    assert(ft_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info) == NOTIFY_DONE);
+    assert(handle.invalid && ft_fdb_invalidations == before + 1);
+    FDB_DRAIN();
+
+    /* Another station's address, and another VLAN, are other flows' pinnings. */
+    FDB_FIXTURE();
+    info.info.dev = &decoy;
+    info.vid = 101;
+    assert(ft_fdb_event(NULL, SWITCHDEV_FDB_DEL_TO_DEVICE, &info) == NOTIFY_DONE);
+    assert(!handle.invalid);
+    info.vid = 100;
+    info.addr = in.dev_addr;
+    assert(ft_fdb_event(NULL, SWITCHDEV_FDB_DEL_TO_DEVICE, &info) == NOTIFY_DONE);
+    assert(!handle.invalid);
+    /* Neither is an unrelated event on the same chain. */
+    assert(ft_fdb_event(NULL, SWITCHDEV_PORT_ATTR_SET, &info) == NOTIFY_DONE);
+    assert(!handle.invalid && ft_fdb_invalidations == before);
+    FDB_DRAIN();
+
+    /* An unbridged flow has no FDB dependency, so the same event leaves it
+     * alone however well its address matches. */
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    info = (struct switchdev_notifier_fdb_info){ .info.dev = &decoy, .addr = dst, .vid = 0 };
+    before = ft_fdb_invalidations;
+    assert(ft_fdb_event(NULL, SWITCHDEV_FDB_DEL_TO_DEVICE, &info) == NOTIFY_DONE);
+    assert(!handle.invalid && ft_fdb_invalidations == before);
+    FDB_DRAIN();
+#undef FDB_FIXTURE
+#undef FDB_DRAIN
+
+    /* Per-port VLAN membership decides whether a frame leaves tagged, and
+     * reconfiguring it emits no netdev event, so the coarse invalidation is
+     * the only thing that notices. It must never claim the object: a handled
+     * port-VLAN object makes the bridge skip vlan_vid_add() and filter the
+     * VLAN out of the port entirely. */
+    struct switchdev_obj vlan_obj = { .id = SWITCHDEV_OBJ_ID_PORT_VLAN };
+    struct switchdev_obj mdb_obj = { .id = SWITCHDEV_OBJ_ID_PORT_MDB };
+    struct switchdev_notifier_port_obj_info obj = { .info.dev = &out, .obj = &vlan_obj };
+
+    bridge_out_fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    assert(!atomic_read(&ft_invalid));
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
+    assert(atomic_read(&ft_invalid) && !obj.handled);
+    atomic_set(&ft_invalid, 0);
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_DEL, &obj) == NOTIFY_DONE);
+    assert(atomic_read(&ft_invalid) && !obj.handled);
+    atomic_set(&ft_invalid, 0);
+    /* A device nothing here depends on is somebody else's bridge. Every
+     * bridge installs its default PVID on a port the moment it is enslaved,
+     * whatever its VLAN filtering setting, so a scope test that let this
+     * through would retire every flow whenever any device anywhere was
+     * enslaved to anything. */
+    obj.info.dev = &upper;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
+    assert(!atomic_read(&ft_invalid) && !obj.handled);
+    obj.info.dev = &out;
+    /* Another object kind on the same chain is somebody else's business. */
+    obj.obj = &mdb_obj;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
+    assert(!atomic_read(&ft_invalid) && !obj.handled);
+    obj.obj = &vlan_obj;
+
+    /* Whether the bridge filters by VLAN at all, and in which protocol, are
+     * the other two inputs to the derivation, and both arrive as attributes
+     * against the bridge rather than as objects against a port. Neither emits
+     * a netdev event, so dropping them would leave the hardware pushing a tag
+     * software had stopped pushing. */
+    struct switchdev_attr filtering = { .id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING };
+    struct switchdev_attr protocol = { .id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL };
+    struct switchdev_attr ageing = { .id = SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME };
+    struct switchdev_notifier_port_attr_info set = { .info.dev = &br, .attr = &filtering };
+
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(atomic_read(&ft_invalid) && !set.handled);
+    atomic_set(&ft_invalid, 0);
+    set.attr = &protocol;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(atomic_read(&ft_invalid) && !set.handled);
+    atomic_set(&ft_invalid, 0);
+    /* Another attribute of the same bridge changes nothing this derivation
+     * reads, and neither does either attribute on an unrelated bridge. */
+    set.attr = &ageing;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(!atomic_read(&ft_invalid) && !set.handled);
+    set.attr = &filtering;
+    set.info.dev = &upper;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(!atomic_read(&ft_invalid) && !set.handled);
+    ft_handle_invalidate(&handle, &ft_mac_invalidations);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !allocated);
 }
 
 static void snat_fixture(bool forward, bool tcp)
@@ -2254,7 +2758,7 @@ static void test_nexthop_objects(void)
 
 static void test_registration(void)
 {
-    for (registration_failure = 0; registration_failure <= 7; registration_failure++) {
+    for (registration_failure = 0; registration_failure <= 9; registration_failure++) {
         /* A fresh adapter instance, backed by an independently owned CDX. */
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         fixture();
@@ -2274,15 +2778,17 @@ static void test_registration(void)
         }
         assert(!ft_proc && !ft_ready && !backend_claimed && !live_hw && !allocated);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
+        assert(!fdb_registered && !swdev_obj_registered);
         assert(!ft_count && !ft_bound && !ft_neighbour_refs && !ft_handle_refs);
         assert(!in.refs && !out.refs && !cdx_info->ctrl.mutex);
     }
     registration_failure=0;
-    for (ft_init_fail_stage=1; ft_init_fail_stage<=6; ft_init_fail_stage++) {
+    for (ft_init_fail_stage=1; ft_init_fail_stage<=8; ft_init_fail_stage++) {
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         assert(ask_flowtable_init() == -ENOMEM);
         assert(!ft_ready && !ft_proc && !backend_claimed && !cdx_info->ctrl.mutex);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
+        assert(!fdb_registered && !swdev_obj_registered);
     }
     ft_init_fail_stage=0;
     /* Fatal deletion on exit still waits for quiescence. Reload is refused. */
@@ -2390,6 +2896,8 @@ int main(void)
     test_selective_routes();
     test_ipv6();
     test_vlan();
+    test_bridge();
+    test_bridge_fdb();
     test_snat();
     test_dnat();
     test_double_nat();

@@ -1,4 +1,4 @@
-From 2be837b7e289649fcb91a11a6a8bcf00c6069d3a Mon Sep 17 00:00:00 2001
+From 0cdaf2170e755f6a96d55eca573cb2379c7685cf Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 14 Sep 2026 23:03:32 +0200
 Subject: [PATCH] netfilter: provide hardware context and selective flow
@@ -21,6 +21,14 @@ Native DIRECT tuples cache Ethernet addresses and bypass neighbour output.
 Keep routed software tuples on XMIT_NEIGH for opted-in tables and retire
 DIRECT tuples built concurrently with binding before packet rewriting.
 Both requests are monotonic for the table and survive device unbinding.
+
+A bridge hop forces DIRECT of its own accord, before that request is
+consulted, so a bridged flow reaches an adapter with cached addresses and
+no destination at all, losing the route generation it was selected in.
+Honour the request there too. The egress port is
+unaffected: a NEIGH redirect names the reverse tuple's ingress interface,
+which the same path walk already resolved through the bridge FDB, and
+software output keeps traversing the bridge as ordinary routing does.
 
 Other tables retain their existing behaviour and allocate no handles.
 This is a downstream kernel-internal interface; no userspace ABI changes.
@@ -47,7 +55,7 @@ withdrawal or blackhole policy. Keep that legacy fallback for other callers;
 reject flow creation on the experimental path until routing succeeds.
 ---
  include/net/flow.h                    |  2 +
- include/net/flow_offload.h            | 19 ++++++++
+ include/net/flow_offload.h            | 22 ++++++++++
  include/net/netevent.h                | 29 +++++++++++++
  include/net/netfilter/nf_flow_table.h | 20 +++++++++
  net/ipv4/fib_trie.c                   | 20 +++++++++
@@ -56,8 +64,8 @@ reject flow creation on the experimental path until routing succeeds.
  net/netfilter/nf_flow_table_core.c    | 62 ++++++++++++++++++++++++++-
  net/netfilter/nf_flow_table_ip.c      | 14 ++++--
  net/netfilter/nf_flow_table_offload.c | 28 +++++++++++-
- net/netfilter/nft_flow_offload.c      |  6 +++
- 11 files changed, 219 insertions(+), 7 deletions(-)
+ net/netfilter/nft_flow_offload.c      | 18 +++++++-
+ 11 files changed, 233 insertions(+), 8 deletions(-)
 
 diff --git a/include/net/flow.h b/include/net/flow.h
 index 335bbc52171c..5e373dbaa397 100644
@@ -73,10 +81,10 @@ index 335bbc52171c..5e373dbaa397 100644
  	kuid_t  flowic_uid;
  	__u32		flowic_multipath_hash;
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f4b762..6555fee23d60 100644
+index 292cd8f4b762..06ed867d557b 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
-@@ -688,7 +688,26 @@ struct flow_cls_common_offload {
+@@ -688,7 +688,29 @@ struct flow_cls_common_offload {
  	struct netlink_ext_ack *extack;
  };
  
@@ -89,8 +97,11 @@ index 292cd8f4b762..6555fee23d60 100644
 + * nf_flow_offload_handle_get/put; it carries no flow/table/conntrack pointer.
 + * Each destination carries the cookie it was selected with: an IPv6 route is
 + * only valid for one FIB generation, so dst_check() needs that value and a
-+ * zero cookie rejects every IPv6 destination. IPv4 ignores it. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 6
++ * zero cookie rejects every IPv6 destination. IPv4 ignores it.
++ * Version 7 also keeps a bridged path on NEIGH output for such a table, so a
++ * flow whose egress port the bridge FDB resolved arrives with a destination
++ * instead of cached Ethernet addresses. */
++#define FLOW_CLS_HAS_NF_CONTEXT 7
  struct flow_cls_offload {
 +	const struct nf_conn *nf_ct;
 +	struct dst_entry *nf_dst;
@@ -528,10 +539,29 @@ index 4f346f51d7d7..0759c372c66f 100644
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 7dbbd892e197..4afb01d5c18b 100644
+index 7dbbd892e197..dd0748aad17d 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -171,6 +171,7 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+@@ -158,7 +158,17 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			case DEV_PATH_BR_VLAN_KEEP:
+ 				break;
+ 			}
+-			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
++			/* A bridge hop otherwise forces DIRECT unconditionally,
++			 * which discards the destination this direction was
++			 * routed through and with it the FIB generation cookie
++			 * and the neighbour a routed adapter validates against.
++			 * Keep the routed contract for an opted-in table: the
++			 * egress port still reaches the rule, since a NEIGH
++			 * redirect names other_tuple->iifidx, which is the port
++			 * this walk resolved through the bridge FDB.
++			 */
++			if (!READ_ONCE(flowtable->use_neigh))
++				info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+ 			break;
+ 		default:
+ 			info->indev = NULL;
+@@ -171,6 +181,7 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
  	info->hw_outdev = info->indev;
  
  	if (nf_flowtable_hw_offload(flowtable) &&
@@ -539,7 +569,7 @@ index 7dbbd892e197..4afb01d5c18b 100644
  	    nft_is_valid_ether_device(info->indev))
  		info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  }
-@@ -246,6 +247,11 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+@@ -246,6 +257,11 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
  		fl.u.ip4.flowi4_tos = ip_hdr(pkt->skb)->tos & INET_DSCP_MASK;
  		fl.u.ip4.flowi4_mark = pkt->skb->mark;
  		fl.u.ip4.flowi4_flags = FLOWI_FLAG_ANYSRC;

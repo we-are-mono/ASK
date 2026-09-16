@@ -210,6 +210,8 @@ causes can coalesce. Hardware retirement errors escalate to global recovery.
 | Committed IPv4 route prefix | Retire generations using the prefix; fresh route lookup permits readmission |
 | MTU, going down, carrier loss or MAC change | Retire generations using the physical device; current port/route state gates readmission |
 | Built-in FIB nexthop ADD/DEL during device/address synchronization | Retire all installed generations conservatively, preserving bindings |
+| Bridge FDB entry moved, aged out or deleted for a flow's destination MAC | Retire generations pinned to that entry; relearning permits readmission |
+| Bridge per-port VLAN membership add or delete | Stop admission globally; recreate the table after configuration settles |
 | Rename or same-MAC usable NUD progress | Preserve valid entries |
 | Routing policy, nexthop-object mutation, relevant unregister or upper-device change | Stop admission globally; recreate the table after configuration settles |
 | Nexthop-object statistics query or notifier registration dump without bindings | No invalidation |
@@ -300,8 +302,8 @@ invalidation causes, quarantine and recovery state. Preserve it before unload
 when per-instance diagnostics matter. The test build's one-shot add fault stages
 are 1 before allocation, 2 before hardware, 3 after hardware with rollback, and
 4 matching contention after the peer direction installs. Load-only initialization
-stages are 1 procfs, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration and
-6 nexthop-object registration. The provider's test-only unlink fault leaves a
+stages are 1 procfs, 2 netdev, 3 neighbour, 4 FIB, 5 indirect registration,
+6 nexthop-object registration, 7 bridge FDB and 8 bridge VLAN objects. The provider's test-only unlink fault leaves a
 real key linked; it is a terminal test requiring a fresh boot afterward.
 
 Verification combines production-code host checks, relevant KASAN/lockdep DUT
