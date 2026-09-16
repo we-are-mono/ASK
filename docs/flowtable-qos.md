@@ -399,7 +399,21 @@ traffic, but only once it is chosen rather than inherited from `kzalloc`.
 Both are validated at load, because a boot-immutable parameter has exactly one
 moment to be rejected out loud.
 
-*Proof.* Buildable on the rig today. `tools/tests/test_qos_control.py` already
+*Proved on hardware, 2026-09-17.* Booted `ask.offload=flowtable` with
+`ask_flowtable.qos_mark_mask=0xf0` on the KASAN image, and marked every
+forwarded flow `ct mark 0x30` from an nftables chain at forward/mangle. Four
+flows installed, every one reporting `qos=03` — the class that mask and mark
+decode to — and a TCP transfer through them ran 27.4 GB at 9.41 Gb/s. Under
+the previous code each of those flows was refused outright for carrying a
+nonzero mark, so admission, decode and the write into the hardware entry are
+all exercised by that one result. The scoped UDP SNAT offload tests pass with
+the same mask and marks live.
+
+What this does *not* show is shaping: `priv->ceetm_en` is false without
+`CMD_QM_QOSENABLE`, so the class selects among unshaped forwarding FQs rather
+than CEETM class queues. That is increment 3's job.
+
+*Remaining proof.* `tools/tests/test_qos_control.py` already
 queries all 128 class queues over `CMD_QM_QUERY_QUEUE` and reads back their
 fqids; the same reply carries `deque_pkts` and `frm_count`. The test enables
 CEETM over FCI — the bench use of option C — assigns a channel, drives two
@@ -438,11 +452,10 @@ structural rather than incidental. Delivered as
   `NR_CPUS`. It now asserts against the leaf headroom, which is the invariant
   that actually matters.
 
-*Proof.* Builds clean on both kernel configurations, with the queue count no
-longer differing between them. The test image's Tx queue count is unchanged,
-which is deliberate: it makes the one configuration that gets exercised on
-hardware identical to what it ran before, and leaves only OpenWrt's reduction
-from sixty-four unverified.
+*Proved on hardware, 2026-09-17.* `eth3` reports sixteen Tx queues, and the
+count no longer differs between the two kernel configurations. The test image's
+count is unchanged by design, so what the rig exercises is what it ran before;
+OpenWrt's reduction from sixty-four is still unverified.
 
 ### 2b. `ndo_setup_tc`, and why it is not in 2a
 
@@ -496,8 +509,15 @@ adapter registers at init and the window is a boot-time one, but a kernel
 carrying this patch without the adapter loaded is a configuration that now
 declines `flags offload` flowtables on these ports.
 
-*Effort: 1 week for 2a and 2b together; 2b written but unproven, and it is
-what the rig should see first.*
+*Proved on hardware, 2026-09-17.* `ethtool -k eth3` reports `hw-tc-offload:
+on`, and with the ndo present a policy still binds — `bindings: 2`, so
+Netfilter took the direct route and the adapter served it — and `ask-flowtable
+stop` returns 0 with bindings back to zero, so the unbind does not deadlock on
+the rwsem its caller already holds. Those were the two failures a build cannot
+show, and neither occurred. A KASAN boot reported nothing beyond its own init
+banner.
+
+*Effort: 1 week for 2a and 2b together.*
 
 ### 3. HTB offload commands
 
