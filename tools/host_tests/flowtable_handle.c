@@ -30,6 +30,15 @@ enum { FLOW_OFFLOAD_DIR_ORIGINAL, FLOW_OFFLOAD_DIR_REPLY, FLOW_OFFLOAD_DIR_MAX }
 #define nf_flowtable_time_stamp 1000
 struct nf_flow_offload_handle;
 struct nf_conn { unsigned refs; bool dying; };
+struct net { int unused; };
+static struct net conntrack_net;
+#define nf_ct_net(ct) (&conntrack_net)
+/* Per-cause retirement counters. Recording them is what lets a spurious
+ * hardware retirement be attributed instead of merely observed. */
+static struct { unsigned count_gc_hw_invalid, count_gc_expired,
+                count_gc_dying, count_gc_custom; } gc_stats;
+#define NF_FLOW_TABLE_STAT_INC_ATOMIC(net, counter) \
+    do { (void)(net); gc_stats.counter++; } while (0)
 struct rhash_head { int unused; };
 struct flow_offload_tuple { unsigned dir; };
 struct flow_offload_tuple_rhash { struct rhash_head node; struct flow_offload_tuple tuple; };

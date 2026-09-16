@@ -37,6 +37,9 @@ SPORT = int(os.environ.get("ASK_FLOWTABLE_SPORT", "48270"))
 DPORT = int(os.environ.get("ASK_FLOWTABLE_DPORT", "48271"))
 TABLE = "ask_poc"
 ARTIFACTS = Path(os.environ.get("ASK_FLOWTABLE_ARTIFACTS", "/tmp/ask-flowtable"))
+# Per-boot floor for the cumulative counters health checks compare against;
+# the rig fixture refreshes it for every test.
+HEALTH_BASELINE = {"errors": 0}
 
 
 async def read(agent, session, path):
@@ -276,6 +279,10 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     initial = await r.state()
     assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
+    # The adapter's error count is cumulative for the boot and deliberately
+    # never reset, so whatever earlier tests already accounted for is this
+    # test's floor. Only errors raised from here are its own.
+    HEALTH_BASELINE["errors"] = initial["errors"]
     assert "auto_bridge " not in await read(r.target, r.session, "/proc/modules")
     # The daemon pidfile is absent on a clean experimental boot; also inspect
     # the command line of any stale pidfile rather than treating it as proof.

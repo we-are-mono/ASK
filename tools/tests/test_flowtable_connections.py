@@ -13,7 +13,8 @@ import pytest_asyncio
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from flowtable_connections_peer import TCP_SIZE, UDP_SIZE, payload
-from test_flowtable_offload import DPORT, SPORT as BASE_SPORT, TABLE, WAN_IP, command, read, rig  # noqa: F401
+from test_flowtable_offload import (DPORT, HEALTH_BASELINE, SPORT as BASE_SPORT, TABLE, WAN_IP,
+                                    command, read, rig)  # noqa: F401
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
@@ -39,10 +40,16 @@ def keys(r, ids):
     return result
 
 
+# The adapter's error count is cumulative for the boot and deliberately never
+# reset, and the rearm test asserts that its barrier adds exactly two. Health
+# therefore means "no new errors", not "none ever": against an absolute zero
+# every test collected after that one fails on its predecessor's bookkeeping.
+# The other three are current state rather than counters and stay absolute.
 def healthy(state):
     assert state["bindings"] == 2 and state["max_entries"] == 32768, state
     assert state["entries"] == state["neighbour_refs"] == state["handle_refs"] == len(state["flows"]), state
-    assert state["invalidated"] == state["fatal"] == state["quarantine"] == state["errors"] == 0, state
+    assert state["invalidated"] == state["fatal"] == state["quarantine"] == 0, state
+    assert state["errors"] == HEALTH_BASELINE["errors"], (state, HEALTH_BASELINE)
 
 
 def unchanged(r, before, after, ids):
@@ -238,7 +245,8 @@ async def connections(rig):
         try:
             final = await r.delete_table()
             assert final["entries"] == final["neighbour_refs"] == final["quarantine"] == 0, final
-            assert final["installs"] == final["deletes"] and not final["errors"], final
+            assert final["installs"] == final["deletes"], final
+            assert final["errors"] == HEALTH_BASELINE["errors"], (final, HEALTH_BASELINE)
             r.record("connections-cleanup", final)
         except Exception as error:
             failures.append(str(error))

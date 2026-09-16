@@ -57,9 +57,15 @@ async def tcp_snat(rig, request):
             await stop(con)
             return await delete_table()
 
+        # The adapter's error count is cumulative for the boot and never reset,
+        # so this fixture's floor is whatever earlier tests already accounted
+        # for. Only the three current-state fields are absolute.
+        baseline = (await state())["errors"]
+
         async def checked_state():
             result = await state()
-            assert result["errors"] == result["fatal"] == result["quarantine"] == result["invalidated"] == 0, result
+            assert result["fatal"] == result["quarantine"] == result["invalidated"] == 0, result
+            assert result["errors"] == baseline, (result, baseline)
             local, remote, mapped = f"{r.lan_ip}:{SPORT}", f"{WAN_IP}:{DPORT}", f"{external}:{port}"
             expected = {TARGET_LAN_IF: (local, remote, mapped, remote, WAN_IP),
                         TARGET_WAN_IF: (remote, mapped, remote, local, r.lan_ip)}
