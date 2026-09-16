@@ -1,0 +1,218 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] sdk_dpaa: let this netdev host a hardware qdisc
+
+A hardware qdisc gives each leaf class a netdev queue index, and sch_htb
+turns the index a driver returns straight into netdev_get_tx_queue() with no
+bounds check. Reserving those slots means knowing how many queues exist, and
+this driver did not: DPAA_ETH_TX_QUEUES was NR_CPUS, so the same code offered
+16 queues under one kernel configuration and 64 under another, sizing
+egress_fqs[] and conf_fqs[] to match. A budget that moves with someone else's
+Kconfig cannot be part of an interface contract.
+
+Pin the direct queues at sixteen and reserve DPAA_ETH_CEETM_LEAF_QUEUES more
+above them, one per CEETM class queue on a channel. Sixteen is not a new
+number - it is what the more constrained configuration already ran, so that
+Tx path is untouched and the other moves down to a count already in service.
+It stays a power of two because the Tx paths index conf_fqs[] with & (N - 1).
+The count is not derived from the core count: these queues carry only what the
+CPU sends, an offloaded flow reaches none of them, and with no XPS maps here a
+queue is picked by flow hash rather than by CPU.
+
+netif_set_real_num_tx_queues() then reports only the direct queues as usable -
+the first such call this driver has made - so ordinary traffic cannot hash
+into the reserved range and a qdisc sees an honest count of what already
+existed. Nothing allocates an egress FQ for a reserved slot: a leaf class
+sends through a CEETM logical FQ that the scheduler owns.
+
+Add the ndo_setup_tc that hands those slots out, as a handler the offload
+module registers, since a built-in driver cannot link against one.
+
+That ndo is load-bearing beyond tc. Netfilter chooses how to bind a hardware
+flowtable on whether the netdev has an ndo_setup_tc at all
+(nf_flow_table_offload_setup), so from here every such bind arrives through
+this callback rather than through the module's indirect registration. With no
+handler registered the binds are refused, where previously they were served;
+the module registers one at init, and keeps its indirect registration too so
+it still works on a kernel without this patch.
+
+No leaf is allocated yet, so no traffic changes queue.
+
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
+@@ -194,13 +194,42 @@
+ #define fm_l4_frame_is_tcp(parse_result_ptr) \
+ 	((parse_result_ptr)->l4r & FM_L4_PARSE_RESULT_TCP)
+ 
+-/* number of Tx queues to FMan */
++/* Number of Tx queues to FMan that carry ordinary, unclassified traffic.
++ *
++ * These are the queues the CPU sends through: locally generated traffic, flows
++ * that were never offloaded, and the punt path. A hardware-offloaded flow
++ * never reaches one, so this count says nothing about offload capacity.
++ *
++ * It was NR_CPUS, which is a distribution's build-time ceiling rather than a
++ * property of the board: the same driver offered 16 queues under one kernel
++ * configuration and 64 under another, and sized egress_fqs[] and conf_fqs[] to
++ * match. A hardware qdisc allocates its leaf classes out of the queues above
++ * this count, so a budget that moves with someone else's Kconfig cannot be
++ * part of an interface contract.
++ *
++ * Sixteen is chosen because it is what the more constrained of those two
++ * configurations already ran, which makes this a fixed number rather than a
++ * new one. It stays a power of two because the Tx paths index conf_fqs[] with
++ * & (DPAA_ETH_TX_QUEUES - 1). Queues are picked by flow hash rather than by
++ * CPU -- this driver installs no XPS maps -- so the count trades qdisc
++ * contention between concurrent software senders against the frame queues each
++ * one costs, and is not bounded by the core count in either direction.
++ */
+ #ifdef CONFIG_FMAN_PFC
+ #define DPAA_ETH_TX_QUEUES	(NR_CPUS * CONFIG_FMAN_PFC_COS_COUNT)
+ #else
+-#define DPAA_ETH_TX_QUEUES	NR_CPUS
++#define DPAA_ETH_TX_QUEUES	16
+ #endif
+ 
++/* Headroom above the direct queues, one slot per CEETM class queue on a
++ * channel, reserved so a hardware qdisc can hand sch_htb a real and
++ * exclusively owned netdev_queue index for each leaf class. Nothing allocates
++ * an egress FQ for these: a leaf's frames leave through a CEETM logical FQ
++ * that the scheduler owns, not through egress_fqs[].
++ */
++#define DPAA_ETH_CEETM_LEAF_QUEUES	16
++#define DPAA_ETH_TX_QUEUES_MAX	(DPAA_ETH_TX_QUEUES + DPAA_ETH_CEETM_LEAF_QUEUES)
++
+ #define DPAA_ETH_RX_QUEUES	128
+ #define DPAA_IP_VERSION_4  4
+ 
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
+@@ -111,6 +111,21 @@
+ typedef struct qman_fq *(*cdx_get_ceetm_dscp_fq)(void *, uint8_t dscp);
+ int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func);
+ void dpa_unregister_ceetm_get_egress_fq(void);
++
++/* Handler for the netdev's ndo_setup_tc, registered by the offload module
++ * because a built-in driver cannot link against one.
++ *
++ * Registering is not optional once the ndo exists. Netfilter picks its
++ * flowtable binding route on whether the netdev has an ndo_setup_tc at all
++ * (nf_flow_table_offload_setup), so from the moment this driver offers one,
++ * every hardware flowtable bind arrives here instead of through the module's
++ * indirect registration. With no handler those binds are refused, where before
++ * they were served.
++ */
++typedef int (*dpa_setup_tc_handler)(struct net_device *dev,
++				    enum tc_setup_type type, void *type_data);
++int dpa_register_setup_tc(dpa_setup_tc_handler handler);
++void dpa_unregister_setup_tc(void);
+ #endif
+ 
+ 
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
+@@ -684,6 +684,43 @@
+ }
+ #endif
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++/* Set by the offload module; a built-in driver cannot link against one. */
++static dpa_setup_tc_handler dpa_setup_tc_func;
++
++int dpa_register_setup_tc(dpa_setup_tc_handler handler)
++{
++	if (!handler)
++		return -EINVAL;
++	if (cmpxchg(&dpa_setup_tc_func, NULL, handler))
++		return -EBUSY;
++	return 0;
++}
++EXPORT_SYMBOL(dpa_register_setup_tc);
++
++void dpa_unregister_setup_tc(void)
++{
++	WRITE_ONCE(dpa_setup_tc_func, NULL);
++}
++EXPORT_SYMBOL(dpa_unregister_setup_tc);
++
++/* Read the handler once: an unregister can NULL it concurrently, and a
++ * half-torn read would call through freed module text.
++ *
++ * Refusing when nothing is registered is deliberate rather than convenient.
++ * Netfilter has already chosen this route over the module's indirect
++ * registration by the time it gets here, so answering anything but an error
++ * would claim a binding no one is going to service.
++ */
++static int dpa_setup_tc(struct net_device *dev, enum tc_setup_type type,
++			void *type_data)
++{
++	dpa_setup_tc_handler handler = READ_ONCE(dpa_setup_tc_func);
++
++	return handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
++}
++#endif
++
+ static const struct net_device_ops dpa_private_ops = {
+ 	.ndo_open = dpa_eth_priv_start,
+ 	.ndo_start_xmit = dpa_tx,
+@@ -703,6 +740,9 @@
+ #endif
+ 	.ndo_set_features = dpa_set_features,
+ 	.ndo_fix_features = dpa_fix_features,
++#ifdef CONFIG_CPE_FAST_PATH
++	.ndo_setup_tc = dpa_setup_tc,
++#endif
+ };
+ 
+ static int dpa_private_napi_add(struct net_device *net_dev)
+@@ -779,6 +819,15 @@
+ 				NETIF_F_RXCSUM;
+ 	net_dev->lltx               = true;
+ 
++#ifdef CONFIG_CPE_FAST_PATH
++	/* tc_can_offload() gates every hardware qdisc on this bit, and it has
++	 * to be in features rather than only in hw_features to be on by
++	 * default. Offered alongside ndo_setup_tc, since neither is any use
++	 * without the other. */
++	net_dev->hw_features |= NETIF_F_HW_TC;
++	net_dev->features |= NETIF_F_HW_TC;
++#endif
++
+ 	/* Advertise S/G and HIGHDMA support for private interfaces */
+ 	net_dev->hw_features |= NETIF_F_SG | NETIF_F_HIGHDMA;
+ 	/* Recent kernels enable GSO automatically, if
+@@ -953,11 +1002,25 @@
+ 	/* Allocate this early, so we can store relevant information in
+ 	 * the private area (needed by 1588 code in dpa_mac_probe)
+ 	 */
+-	net_dev = alloc_etherdev_mq(sizeof(*priv), DPAA_ETH_TX_QUEUES);
++	/* Allocate the leaf-class headroom up front, the way every other
++	 * hardware-qdisc driver does: sch_htb turns the qid a driver hands back
++	 * straight into netdev_get_tx_queue() with no bounds check, so those
++	 * slots have to exist before a class can name one. Only the direct
++	 * queues are live until then; see the real_num_tx_queues call below. */
++	net_dev = alloc_etherdev_mq(sizeof(*priv), DPAA_ETH_TX_QUEUES_MAX);
+ 	if (!net_dev) {
+ 		dev_err(dev, "alloc_etherdev_mq() failed\n");
+ 		goto alloc_etherdev_mq_failed;
+ 	}
++	/* alloc_etherdev_mq() reports every allocated queue as usable. Narrow
++	 * that to the queues that actually have an egress FQ behind them, so
++	 * ordinary traffic never hashes into the reserved range and a later
++	 * qdisc sees an honest count of pre-existing direct queues. */
++	err = netif_set_real_num_tx_queues(net_dev, DPAA_ETH_TX_QUEUES);
++	if (err) {
++		dev_err(dev, "netif_set_real_num_tx_queues() = %d\n", err);
++		goto netif_set_real_num_tx_queues_failed;
++	}
+ 
+ 	/* Do this here, so we can be verbose early */
+ 	SET_NETDEV_DEV(net_dev, dev);
+@@ -1152,6 +1215,8 @@
+ alloc_failed:
+ mac_probe_failed:
+ 	dev_set_drvdata(dev, NULL);
++	/* Reached before drvdata is set, so it has nothing to undo. */
++netif_set_real_num_tx_queues_failed:
+ 	free_netdev(net_dev);
+ alloc_etherdev_mq_failed:
+ 	if (atomic_read(&dpa_bp->refs) == 0)

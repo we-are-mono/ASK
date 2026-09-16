@@ -143,6 +143,7 @@ static __be32 inet_make_mask(unsigned plen) { assert(plen <= 32); return htonl(p
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
 #define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define list_for_each_entry(p, h, m) \
     for (p = list_entry((h)->next, typeof(*p), m); &p->m != (h); p = list_entry(p->m.next, typeof(*p), m))
 #define list_for_each_entry_safe(p, n, h, m) \
@@ -359,7 +360,11 @@ static void read_unlock_bh(bool *lock) { assert(*lock); *lock = false; }
 #define spin_unlock read_unlock_bh
 #define spin_lock_bh read_lock_bh
 #define spin_unlock_bh read_unlock_bh
-struct nf_flowtable { struct { int nelems; } rhashtable; bool use_neigh, use_hw_handles, flow_block_lock; };
+/* flow_block is embedded, not referenced: the direct route recovers its owner
+ * with container_of on bo->block, so a harness that kept them apart would let
+ * a wrong offset through. */
+struct nf_flowtable { struct { int nelems; } rhashtable; struct flow_block flow_block;
+    bool use_neigh, use_hw_handles, flow_block_lock; };
 struct nf_conntrack_tuple {
     struct { union nf_inet_addr u3; union { __be16 all; } u; u16 l3num; } src;
     struct { union nf_inet_addr u3; union { __be16 all; } u; } dst;
@@ -688,6 +693,20 @@ static void flow_block_cb_remove(struct flow_block_cb *cb, struct flow_block_off
     assert(block_write_lock && *block_write_lock);
     list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
 }
+/* The driver-side registration the direct route arrives through. Exactly one
+ * handler may be live at a time, and a load that fails after taking it has to
+ * give it back -- otherwise the next load finds the slot occupied by a module
+ * that is no longer there. */
+static int registered_setup_tc;
+typedef int (*dpa_setup_tc_handler)(struct net_device *, enum tc_setup_type, void *);
+static int dpa_register_setup_tc(dpa_setup_tc_handler handler)
+{
+    assert(handler);
+    if (registered_setup_tc) return -EBUSY;
+    registered_setup_tc = 1;
+    return 0;
+}
+static void dpa_unregister_setup_tc(void) { registered_setup_tc = 0; }
 /* What the encoder would write into the two PPPoE opcodes, recorded so a test
  * can require the index rather than the slot pointer: a direction that strips
  * counts into its session's receive half, one that inserts into the transmit

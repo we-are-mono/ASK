@@ -465,20 +465,39 @@ moment the DPAA netdev grows an `ndo_setup_tc` — for HTB, for anything — eve
 flowtable bind takes the direct branch and `ft_bind` is never called again.
 Acceleration would stop, with no error anywhere.
 
-Migrating is not a redirect. `ft_bind` takes the `struct nf_flowtable *` as its
-own argument and needs it for binding identity and for the `use_neigh` and
-`use_hw_handles` writes; the direct path hands a driver only a
-`flow_block_offload`, which carries no flowtable pointer.
-`patches/kernel/140-ask-flowtable-context.patch` plumbs that context into the
-indirect callback, so the direct path needs the same treatment before an
-`ndo_setup_tc` can exist on this netdev at all.
+Migrating is not a redirect, but it needs no kernel change to carry the
+context, which a first reading of this got wrong. `ft_bind` takes the
+`struct nf_flowtable *` as its own argument and needs it for binding identity
+and the `use_neigh`/`use_hw_handles` writes. The direct path passes only a
+`flow_block_offload` — but `nf_flow_table_block_offload_init()` sets
+`bo->block = &flowtable->flow_block`, so the owner is recoverable with
+`container_of`. Patch 140 is not involved.
 
-So 2b is: extend patch 140 to carry the flowtable context on the direct path,
-move the adapter to a direct block callback, then add `ndo_setup_tc` and
-`NETIF_F_HW_TC`. It has to be proved on hardware in one step with the
-flowtable, because the failure mode is silence.
+What the two routes genuinely disagree about is smaller and sharper, and
+neither half is visible to a compiler:
 
-*Effort: 1 week for 2a and 2b together, with 2b needing rig time.*
+- **Locking.** The indirect route calls the driver *before* `block_setup`
+  takes `flow_block_lock`, so `ft_bind` takes it itself on UNBIND. The direct
+  route already holds it across the whole of `ndo_setup_tc`, for both
+  commands (`nf_flow_table_offload_cmd`), so taking it there deadlocks on a
+  non-recursive rwsem at the first unbind.
+- **Callback helpers.** `flow_block_cb_alloc`/`_remove` rather than the
+  `flow_indr_` pair.
+
+So `ft_bind`'s body became `ft_block_setup`, shared by both routes and
+differing only in those two places, with `ft_bind` and `cdx_ft_setup_tc` as
+the entry points. Both registrations are kept: which route Netfilter uses is
+the driver's choice, and a kernel without the ndo has only the indirect one.
+
+One consequence worth stating. Because Netfilter selects on the ndo's mere
+presence, from the moment this driver offers one, a hardware flowtable bind
+with no handler registered is *refused*, where before it was served. The
+adapter registers at init and the window is a boot-time one, but a kernel
+carrying this patch without the adapter loaded is a configuration that now
+declines `flags offload` flowtables on these ports.
+
+*Effort: 1 week for 2a and 2b together; 2b written but unproven, and it is
+what the rig should see first.*
 
 ### 3. HTB offload commands
 
