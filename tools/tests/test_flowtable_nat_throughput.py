@@ -55,8 +55,8 @@ async def test_flowtable_nat_throughput(rate_path):
     server = lan_task = None
     with Console.target(log_path=str(ARTIFACTS / "nat-rate-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
-        assert (await console_command(con, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
-        await console_command(con, "nft", nat)
+        assert (await command(r.target, r.session, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
+        await command(r.target, r.session, "nft", nat)
         try:
             await apply(con, policy, r=r)
             server = await asyncio.create_subprocess_exec("iperf3", "-s", "-1", "-B", WAN_IP, "-p", str(PORT), "-J",
@@ -150,9 +150,9 @@ assert result.returncode == 0
                     try:
                         await stop(con)
                     finally:
-                        await console_command(con, "nft", "delete", "table", "ip", nat_table)
+                        await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
                         await console_command(con, "rm", "-f", CONFIG)
-                        await console_command(con, "conntrack", "-D", "-p", "tcp", "--orig-src", r.lan_ip,
+                        await command(r.target, r.session, "conntrack", "-D", "-p", "tcp", "--orig-src", r.lan_ip,
                             "--orig-dst", WAN_IP, "--dport", str(PORT), check=False)
             final = await r.state()
             assert final["installs"] == final["deletes"] and final["errors"] == final["fatal"] == final["quarantine"] == 0, final

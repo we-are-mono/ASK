@@ -119,16 +119,18 @@ async def test_flowtable_udp_snat(connections, zero_checksum, nat_kind="snat"):
     await r.delete_table()
     with Console.target(log_path=str(ARTIFACTS / "snat-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
-        existing = await console_command(con, "nft", "list", "table", "ip", nat_table, check=False)
+        existing = await command(r.target, r.session, "nft", "list", "table", "ip", nat_table, check=False)
         assert existing["rc"] != 0, existing
         # Run before the fixture's legacy priority-100 NAT exemption. Linux
         # retains the resolved mapping when this independent policy is drained.
-        await console_command(con, "nft", nat)
+        await command(r.target, r.session, "nft", nat)
         try:
             await apply(con, candidate(r), r=r)
             # Roll back a hardware insertion once before establishing the same
             # mapping normally. Directional retry must preserve all references.
-            await console_command(con, "sh", "-c", "echo 3 > /sys/module/ask_flowtable/parameters/flowtable_fail_stage")
+            armed = await r.target.fs_write(
+                r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage", "3")
+            assert armed["errno"] == 0, armed
             async with peer(r, [flow]) as p:
                 await snat_warm(r, p, external, port, "snat-admission")
                 assert (await read(r.target, r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip() == "0"
@@ -170,6 +172,6 @@ async def test_flowtable_udp_snat(connections, zero_checksum, nat_kind="snat"):
                 await stop(con)
             finally:
                 try:
-                    await console_command(con, "nft", "delete", "table", "ip", nat_table)
+                    await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
                 finally:
                     await console_command(con, "rm", "-f", CONFIG)

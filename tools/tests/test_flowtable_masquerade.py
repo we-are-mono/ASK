@@ -130,7 +130,7 @@ async def test_flowtable_masquerade_wan_lifecycle(connections, masquerade_networ
             result = {}
             for ident in ids:
                 f = FLOWS[ident]
-                reply = await console_command(con, "conntrack", "-L", "-p", f["proto"],
+                reply = await command(r.target, r.session, "conntrack", "-L", "-p", f["proto"],
                     "--orig-src", r.lan_ip, "--orig-dst", WAN_IP, "--sport", str(f["sport"]),
                     "--dport", str(DPORT), "-o", "id")
                 # UART merges stdout/stderr; conntrack prints its entry-count
@@ -164,9 +164,9 @@ async def test_flowtable_masquerade_wan_lifecycle(connections, masquerade_networ
             await console_command(con, "ip", "route", "replace", WAN_IP + "/32", "dev", TARGET_WAN_IF, "mtu", "1200")
             await console_command(con, "ip", "neigh", "replace", WAN_IP, "lladdr", r.wan_mac, "nud", "permanent", "dev", TARGET_WAN_IF)
 
-        existing = await console_command(con, "nft", "list", "table", "ip", nat_table, check=False)
+        existing = await command(r.target, r.session, "nft", "list", "table", "ip", nat_table, check=False)
         assert existing["rc"] != 0
-        await console_command(con, "nft", nat)
+        await command(r.target, r.session, "nft", nat)
         try:
             await console_command(con, "iptables", "-t", "nat", "-I", *control)
             await apply(con, candidate(r), r=r)
@@ -203,5 +203,5 @@ async def test_flowtable_masquerade_wan_lifecycle(connections, masquerade_networ
                 await stop(con)
             finally:
                 await console_command(con, "iptables", "-t", "nat", "-D", *control, check=False)
-                await console_command(con, "nft", "delete", "table", "ip", nat_table)
+                await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
                 await console_command(con, "rm", "-f", CONFIG)

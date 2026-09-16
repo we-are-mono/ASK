@@ -135,15 +135,17 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
         async def conntracks():
             result = {}
             for proto in ("udp", "tcp"):
-                result[proto] = (await console_command(con, "conntrack", "-L", "-p", proto,
+                result[proto] = (await command(r.target, r.session, "conntrack", "-L", "-p", proto,
                     "--orig-src", CLIENT["lan"], "--orig-dst", external, "--sport", str(sport),
                     "--dport", str(PUBLIC_PORT), "-o", "extended,id"))["stdout"]
             return result
-        assert (await console_command(con, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
-        await console_command(con, "nft", nat)
+        assert (await command(r.target, r.session, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
+        await command(r.target, r.session, "nft", nat)
         try:
             await apply(con, policy, r=r)
-            await console_command(con, "sh", "-c", "echo 3 > /sys/module/ask_flowtable/parameters/flowtable_fail_stage")
+            armed = await r.target.fs_write(
+                r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage", "3")
+            assert armed["errno"] == 0, armed
             async with peer(r, flows, servers=servers) as p:
                 await warm(r, p, expected)
                 assert (await read(r.target, r.session, "/sys/module/ask_flowtable/parameters/flowtable_fail_stage")).strip() == "0"
@@ -188,10 +190,10 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
             try:
                 await stop(con)
             finally:
-                await console_command(con, "nft", "delete", "table", "ip", nat_table)
+                await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
                 await console_command(con, "rm", "-f", CONFIG)
                 for proto in ("tcp", "udp"):
-                    await console_command(con, "conntrack", "-D", "-p", proto, "--orig-src", CLIENT["lan"],
+                    await command(r.target, r.session, "conntrack", "-D", "-p", proto, "--orig-src", CLIENT["lan"],
                         "--orig-dst", external, "--sport", str(sport), "--dport", str(PUBLIC_PORT), check=False)
             final = await r.state()
             assert final["installs"] == final["deletes"] and final["errors"] == final["fatal"] == final["quarantine"] == 0, final

@@ -43,9 +43,9 @@ async def tcp_snat(rig, request):
     table, delete_table, state = r.table, r.delete_table, r.state
     with Console.target(log_path=str(ARTIFACTS / "tcp-snat-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
-        existing = await console_command(con, "nft", "list", "table", "ip", nat_table, check=False)
+        existing = await command(r.target, r.session, "nft", "list", "table", "ip", nat_table, check=False)
         assert existing["rc"] != 0, existing
-        await console_command(con, "nft", nat)
+        await command(r.target, r.session, "nft", nat)
 
         async def create():
             # Flag counters remain at the forward hook. The production policy
@@ -83,7 +83,7 @@ async def tcp_snat(rig, request):
                 await stop(con)
             finally:
                 try:
-                    await console_command(con, "nft", "delete", "table", "ip", nat_table)
+                    await command(r.target, r.session, "nft", "delete", "table", "ip", nat_table)
                 finally:
                     await console_command(con, "rm", "-f", CONFIG)
 
