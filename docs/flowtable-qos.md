@@ -408,30 +408,77 @@ negative case: a mark outside the mask must not change the class.
 
 *Effort: 2–3 days including rig time.*
 
-### 2. TX queue foundation
+### 2a. TX queue foundation
 
 Nothing in `sdk_dpaa` supports a per-queue model yet, and the gaps are
-structural rather than incidental.
+structural rather than incidental. Delivered as
+`patches/kernel/150-sdk_dpaa-tx-queue-headroom.patch`.
 
-- Decouple the queue count from `NR_CPUS`. `DPAA_ETH_TX_QUEUES` is literally
-  `NR_CPUS` (`dpaa_eth.h:201`), giving 64 queues under OpenWrt and 16 under
-  meta-ask. A leaf budget that varies with a distribution's kernel config is
-  not a contract. Allocate `online CPUs + CEETM leaf budget` explicitly in the
-  `alloc_etherdev_mq()` call at `dpaa_eth.c:956`.
-- Add `NETIF_F_HW_TC` to `hw_features`, without which `tc_can_offload()`
-  refuses the qdisc outright.
-- Add an `ndo_setup_tc` that dispatches to cdx through a registered callback,
-  the same indirection `dpa_register_ceetm_get_egress_fq()` already uses
-  (`dpaa_eth_sg.c:80`) so the out-of-tree module stays out of tree.
-- Call `netif_set_real_num_tx_queues()`, which the driver never does today.
-- Untangle `cdx/control_qm.c:475`, which asserts the CEETM class-queue count
-  against `DPAA_ETH_TX_QUEUES` because the two index spaces are currently
-  conflated.
+- `DPAA_ETH_TX_QUEUES` was literally `NR_CPUS` (`dpaa_eth.h:201`) — 64 queues
+  under OpenWrt, 16 under meta-ask. Pinned at sixteen, which is what the more
+  constrained of the two already ran, so the test image's Tx path is unchanged
+  and the other moves down to a count already in service. Still a power of
+  two, because the Tx paths index `conf_fqs[]` with `& (N - 1)`.
 
-*Proof.* Queue count is correct and identical across both kernel configs;
-`tc qdisc add … htb offload` is accepted and rejected for the right reasons.
+  These are only the queues the CPU sends through; an offloaded flow reaches
+  none of them, so the count says nothing about offload capacity. It is not
+  derived from the core count either: with no XPS maps in this driver,
+  `netdev_core_pick_tx()` falls through to `skb_tx_hash()`, so a queue is
+  chosen by flow hash rather than by CPU. The count trades qdisc contention
+  between concurrent software senders against the frame queues each one costs.
+- `DPAA_ETH_CEETM_LEAF_QUEUES` reserves sixteen more, allocated up front by
+  `alloc_etherdev_mq()`, because `sch_htb` turns a returned qid straight into
+  `netdev_get_tx_queue()` with no bounds check.
+- `netif_set_real_num_tx_queues()` narrows the usable set to the direct
+  queues, which the driver never called at all. Ordinary traffic therefore
+  cannot hash into the reserved range, and a qdisc sees an honest count of
+  the queues that already existed.
+- `cdx/control_qm.c` asserted the CEETM class-queue count against
+  `DPAA_ETH_TX_QUEUES`, which held only because both were sized from
+  `NR_CPUS`. It now asserts against the leaf headroom, which is the invariant
+  that actually matters.
 
-*Effort: 1 week.*
+*Proof.* Builds clean on both kernel configurations, with the queue count no
+longer differing between them. The test image's Tx queue count is unchanged,
+which is deliberate: it makes the one configuration that gets exercised on
+hardware identical to what it ran before, and leaves only OpenWrt's reduction
+from sixty-four unverified.
+
+### 2b. `ndo_setup_tc`, and why it is not in 2a
+
+`NETIF_F_HW_TC` and an `ndo_setup_tc` that dispatches to cdx look like part of
+the same increment, and they are not, because adding the ndo silently moves
+the *flowtable* onto a path cdx does not implement.
+
+`nf_flow_table_offload_setup()` chooses its binding by presence, not by
+capability:
+
+```c
+if (dev->netdev_ops->ndo_setup_tc)
+        err = nf_flow_table_offload_cmd(...);      /* direct */
+else
+        err = nf_flow_table_indr_offload_cmd(...); /* indirect */
+```
+
+The adapter registers with `flow_indr_dev_register(ft_bind, NULL)`, so the
+moment the DPAA netdev grows an `ndo_setup_tc` — for HTB, for anything — every
+flowtable bind takes the direct branch and `ft_bind` is never called again.
+Acceleration would stop, with no error anywhere.
+
+Migrating is not a redirect. `ft_bind` takes the `struct nf_flowtable *` as its
+own argument and needs it for binding identity and for the `use_neigh` and
+`use_hw_handles` writes; the direct path hands a driver only a
+`flow_block_offload`, which carries no flowtable pointer.
+`patches/kernel/140-ask-flowtable-context.patch` plumbs that context into the
+indirect callback, so the direct path needs the same treatment before an
+`ndo_setup_tc` can exist on this netdev at all.
+
+So 2b is: extend patch 140 to carry the flowtable context on the direct path,
+move the adapter to a direct block callback, then add `ndo_setup_tc` and
+`NETIF_F_HW_TC`. It has to be proved on hardware in one step with the
+flowtable, because the failure mode is silence.
+
+*Effort: 1 week for 2a and 2b together, with 2b needing rig time.*
 
 ### 3. HTB offload commands
 
@@ -533,14 +580,16 @@ here: CMM validates `cir`/`pir` against a packets-per-second range while
 
 ### Order and total
 
-Increments 1 and 2 are independent. 3 depends on 2; 4 on 3; 5 on 3. 6, 7 and 8
-each depend only on 1. Roughly **six to eight weeks** of focused work to the
-end of increment 5, where the feature becomes consumable, plus three weeks for
-6 to 8.
+Increments 1 and 2a are independent, and both are written. 2b depends on 2a
+and gates 3; 4 depends on 3; 5 on 3. 6, 7 and 8 each depend only on 1.
+Roughly **six to eight weeks** of focused work to the end of increment 5,
+where the feature becomes consumable, plus three weeks for 6 to 8.
 
-The largest single risk is increment 3's teardown paths, because `sch_htb`
-discards the return value of the two destroy commands and the file they land
-in has a history of exactly that failure mode.
+Two risks stand out, and both are failures that a build cannot catch. 2b moves
+the flowtable's binding path, where a mistake stops acceleration silently
+rather than loudly. And increment 3's teardown paths run under a `sch_htb`
+that discards the return value of both destroy commands, in a file whose
+history — A21, A109, A122, A133 — is that exact failure mode.
 
 ## The consumer contract
 
