@@ -117,12 +117,15 @@ Three reasons, all deliberate, all in the current tree.
 So QoS is dormant end to end. Retiring it today costs no shipped behaviour — it
 costs a capability. That is what makes staging possible.
 
-It also hides a trap. If QoS were enabled with the flowtable owning the
-datapath, `qosmark == 0` would send **every** offloaded flow to
-`fls(chnl_map) - 1` — the channel `ceetm_get_egressfq()` calls "least prio" —
-class queue 0, which `GET_CEETM_PRIORITY` maps to CEETM queue 7, the *lowest*
-priority strict queue. Any design must name an explicit default class rather
-than let zero mean "wherever zero lands".
+It also hides a trap. Enable QoS and `qosmark == 0` sends **every** unmarked
+flow to `fls(chnl_map) - 1` — the channel `ceetm_get_egressfq()` calls "least
+prio" — class queue 0, which `GET_CEETM_PRIORITY` maps to CEETM queue 7, the
+*lowest* priority strict queue. This is a property of the mark encoding rather
+than of the flowtable: the software path reaches the same queue for a
+conntracked unmarked flow. Only bare control traffic escapes it, because
+`pfe_eth_get_queuenum()` returns `QOS_DEFAULT_QUEUE = 7` when there is no
+conntrack at all, which inverts to CEETM queue 0, the highest. Any design must
+name an explicit default class rather than let zero mean "wherever zero lands".
 
 ## Design
 
@@ -254,11 +257,17 @@ The QM command family is *not* sealed in flowtable mode; only
 writing the same `CMD_QM_*` structures to `/dev/cdx_ctrl` removes CMM from the
 QoS path with no kernel change whatsoever.
 
-**Recommendation: C to unblock, B as the destination.** C lets CMM be retired
-from QoS on the same day the classification work lands, because it changes
-nothing in the kernel and nothing in the UCI schema. B then replaces C's
-transport with `tc` without touching the hardware layer again. A is not worth
-its risk.
+**Recommendation: B, directly.** C looks attractive because it needs no kernel
+change, but that advantage does not survive contact with how the product is
+built. ASK is a dependency of the OpenWrt image, not a peer of it: OpenWrt
+consumes whatever ASK exposes, and it has to be adapted to the flowtable
+regardless, since `package/ask/ask-modules` ships only `cdx`, `auto_bridge` and
+`fci` today. Landing C would therefore buy no earlier product capability and
+would cost the OpenWrt side two adaptations — one to C's bespoke tool, one to
+`tc` — for the same feature. C keeps its value only as a bench fixture for
+exercising CEETM on the test image before the `ndo_setup_tc` work lands.
+
+A is not worth its risk at any point.
 
 ### Policing
 
@@ -280,26 +289,100 @@ fix the range rather than reproduce it.
 
 ## Sequencing
 
-1. **Classification.** `cdx_ft_rule.qos`, the mark decode with a mask, the
-   direction split, the default-class contract, and a hardware proof that two
-   flows with different marks land in different class queues under load. Cannot
-   start before a default class is chosen, or admitted flows silently land on
-   the lowest-priority queue.
-2. **Control channel C.** Replace `cmmqos.init`'s `cmm -c` backend with a direct
-   FCI writer. Purely a userspace change; the UCI schema does not move.
-3. **Retire the ASK mark.** Drop patch 060, the iptables extensions and their
+Everything here is ASK-side. OpenWrt consumes the result and is adapted once,
+at the end, rather than tracking intermediate control planes.
+
+1. **Classification.** `cdx_ft_rule.qos`, the mark decode with a configurable
+   mask, the direction split, the default-class contract, and a hardware proof
+   that two flows with different marks land in different class queues under
+   load. Cannot start before a default class is chosen, or admitted flows
+   silently land on the lowest-priority queue.
+2. **Control channel B.** `ndo_setup_tc` HTB offload over the existing
+   `cdx_ceetm_app.c`. Deletes `cmm/src/module_qm.c`, most of
+   `cdx/control_qm.c` and 23 command codes.
+3. **WRED.** Expose the per-colour WRED parameters the CCG already has
+   (`wr_en_g/y/r`, `wr_parm_g/y/r` in `qm_ceetm_ccg_params`) and that cdx
+   configures nowhere. Without it the offered QoS is strict priority plus
+   shapers over a tail-drop of eight frames, which is not competitive with the
+   `cake`/`fq_codel` behaviour an OpenWrt user expects from the word "QoS".
+   This is a configuration gap, not a hardware one.
+4. **Retire the ASK mark.** Drop patch 060, the iptables extensions and their
    two Kconfig symbols once nothing reads `ct->qosconnmark`. Note that
    `pfe_eth_get_queuenum()` reads it on the software TX path, so this step also
    has to convert `cpe_fp_tx()` to `ct->mark`.
-4. **Control channel B.** `ndo_setup_tc` HTB offload over the existing
-   `cdx_ceetm_app.c`, retargeting the UCI renderer to `tc`. Deletes
-   `cmm/src/module_qm.c`, most of `cdx/control_qm.c` and 23 command codes.
 5. **Ingress policing, if wanted.** Extend the mark decode with `iqid`, argue
    the bit budget, and prove a policed flow drops at its configured rate.
-   Independent of everything above and unconfigured in the product today.
+   Unconfigured in the product today.
 
-Steps 1 and 2 are independent and can land in either order. Step 3 depends on 1.
-Step 4 depends on 2. Step 5 depends on 1.
+Steps 1, 2 and 3 are independent. Step 4 depends on 1. Step 5 depends on 1.
+
+## The consumer contract
+
+ASK is a dependency of several distributions — Armbian in production, OpenWrt
+on the gateway, meta-ask on the bench — so what it exposes has to be a
+*generic Linux* contract. Anything shaped like one consumer's configuration
+system is wrong by construction, and a bespoke control binary is worse: it has
+no ecosystem tooling and has to be packaged three times.
+
+The flowtable controller already sets the precedent and should be matched
+rather than improved on. `tools/ask_flowtable.py` is stdlib-only Python over
+`/etc/ask/flowtable.json`, `/proc/cdx_flowtable`, `/sys/class/net` and the
+`nft` binary. No UCI, no procd, no systemd, no distribution assumption
+anywhere. QoS should look the same.
+
+| Concern | Generic interface | What a consumer does with it |
+| --- | --- | --- |
+| Scheduler tree | `tc` HTB offload via `ndo_setup_tc` | Armbian: `tc` directly. OpenWrt: render UCI to `tc`. Bench: script it. |
+| Classification | `ct mark`, set by nftables or iptables | Whatever firewall the distribution already runs |
+| Policy and state | `/etc/ask/*.json` plus a stdlib-only tool | Package the file; no code |
+
+This is the decisive argument against a userspace FCI writer. `tc` is in
+iproute2 on every distribution, is already the vocabulary for hardware queue
+trees, and gives `tc -s class show` for free. A private binary over
+`/dev/cdx_ctrl` would give one consumer a fast path and every other consumer a
+porting task.
+
+Three things must be decided on the ASK side, because no consumer can paper
+over them.
+
+- **Who owns the flowtable, and how a conflict is reported.** There are two
+  conflicts and only one of them is already handled. ASK registers an *indirect*
+  block callback (`flow_indr_dev_register`, `cdx/ask_flowtable.c:1417`), so a
+  foreign flowtable declaring `flags offload` on a supported port can seize the
+  CDX backend; the adapter then refuses the second table with `-EBUSY`
+  (`:949`) and the controller reports "another flowtable owns the backend
+  bindings". That one is loud. The other is not: a foreign flowtable whose
+  forward chain runs at a **lower priority number** than ASK's 10 wins
+  `test_and_set_bit(IPS_OFFLOAD_BIT)` in `nft_flow_offload_eval()` and takes
+  every flow. There is no packet state in which the earlier chain declines and
+  ASK's accepts, so ASK receives nothing at all, silently, with no error
+  anywhere. The generic fix is not to special-case a firewall manager: the
+  controller should enumerate flowtables on its devices, and refuse to claim
+  ownership while another one exists whose chain runs earlier.
+- **Which mark bits, and prefer the high ones.** The mask must be
+  configuration, not a constant; the policy schema already carries
+  `mark: {value, mask}` and the decode should read its mask from there. Bias
+  the default allocation towards the **top** of the word. The realistic
+  contender for `ct mark` across distributions is strongSwan's `connmark`
+  plugin, which is built and loaded by default in more than one of ours; when
+  an operator configures `mark_in`/`mark_out` as `%unique`, strongSwan
+  allocates small ascending integers from 1, i.e. squarely in the low bits.
+- **Which hook the mark must arrive from.** The requirement is not simply
+  "before priority 10" — it is *before the flow is admitted*, on a hook that
+  sees the packet earlier in the same traversal. Prerouting and forward-mangle
+  hooks qualify. Postrouting does not: a mark written there is visible only
+  from the following packet, so the first established forward packet is
+  evaluated against the old value. ASK should state that requirement and leave
+  the mechanism entirely to the consumer, because there is no portable one —
+  nftables can express `ct mark set` directly, but a given distribution's
+  firewall front-end may have no vocabulary for it and may need a raw-ruleset
+  include instead.
+
+Once a flow is cached in hardware its packets bypass the forward hooks
+entirely, so a mark written by a later rule change never reaches it. That is
+the same constraint as the sampled-at-admission contract above, arriving from
+the other direction, and the existing stop → change → apply revocation
+sequence is the only way to re-evaluate.
 
 Nothing here needs the flowtable to reach parity first: QoS is dormant in the
 shipping build, so the increments add a capability rather than restore one.
