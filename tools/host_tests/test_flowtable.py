@@ -33,14 +33,18 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         + function(hashes, "__jhash_nwords") + function(hashes, "jhash_3words"))
     hardware = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     (tmp_path / "flowtable_types.inc").write_text(
-        hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("/* Process-context transactions")]
+        # From the encapsulation bound, not the rule: the rule embeds the tag
+        # type and its depth, so slicing past them leaves an incomplete struct.
+        hardware[hardware.index("#define CDX_FT_VLAN_MAX"):hardware.index("/* Process-context transactions")]
         + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
     )
-    names = ["ft_fault", "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
+    names = ["ft_fault", "ft_devices_hold", "ft_devices_put",
+             "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
-             "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_tuple_matches", "ft_nat_edit", "ft_translation", "ft_parse", "ft_same_key", "ft_key_hash",
+             "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
+             "ft_vlan_lower", "ft_vlan_stack", "ft_vlan_match", "ft_vlan_actions", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_stats", "ft_request_targets", "ft_admission_fault", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_bind",
              "ft_invalidate_work", "ft_device_used", "ft_device_retire", "ft_netdev_event", "ft_init_fault", "ask_flowtable_init", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]
     (tmp_path / "flowtable_production.inc").write_text(
@@ -62,7 +66,7 @@ def test_flowtable_hardware_ownership(tmp_path):
     hardware = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     source = (ROOT / "cdx/cdx_flowtable_hw.c").read_text()
     (tmp_path / "hardware_types.inc").write_text(
-        hardware[hardware.index("struct cdx_ft_rule {"):hardware.index("/* Process-context transactions")])
+        hardware[hardware.index("#define CDX_FT_VLAN_MAX"):hardware.index("/* Process-context transactions")])
     (tmp_path / "physical_production.inc").write_text(
         function((ROOT / "cdx/devman.c").read_text(), "dpa_get_ifinfo_by_netdev") +
         function((ROOT / "cdx/devman.c").read_text(), "dpa_netdev_is_physical"))

@@ -14,6 +14,7 @@
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/hashtable.h>
+#include <linux/if_vlan.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
@@ -44,6 +45,10 @@
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 6
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
 #endif
+
+/* A rule must be able to describe every encapsulation a tuple can carry;
+ * otherwise a stack Netfilter admits would be silently truncated here. */
+static_assert(CDX_FT_VLAN_MAX == NF_FLOW_TABLE_ENCAP_MAX);
 
 #ifdef CDX_DEBUG_FLOWTABLE
 static unsigned int ft_fail_stage;
@@ -170,6 +175,27 @@ static void ft_neigh_invalidate(struct cdx_ft_entry *entry)
 	ft_handle_invalidate(entry->handle, &ft_neigh_invalidations);
 }
 
+/* The binding already pins the ingress port for its whole lifetime, so only
+ * the egress port and any VLAN device the rule names still need a reference.
+ * A logical device equal to its physical port must not be counted twice. */
+static void ft_devices_hold(const struct cdx_ft_rule *rule)
+{
+	dev_hold(rule->out);
+	if (rule->out_logical != rule->out)
+		dev_hold(rule->out_logical);
+	if (rule->in_logical != rule->in)
+		dev_hold(rule->in_logical);
+}
+
+static void ft_devices_put(const struct cdx_ft_rule *rule)
+{
+	if (rule->in_logical != rule->in)
+		dev_put(rule->in_logical);
+	if (rule->out_logical != rule->out)
+		dev_put(rule->out_logical);
+	dev_put(rule->out);
+}
+
 static int ft_remove(struct cdx_ft_entry *entry)
 {
 	int rc = cdx_ft_del(&entry->hw);
@@ -184,7 +210,7 @@ static int ft_remove(struct cdx_ft_entry *entry)
 	ft_neigh_detach(entry);
 	nf_flow_offload_handle_put(entry->handle);
 	ft_handle_refs--;
-	dev_put(entry->rule.out);
+	ft_devices_put(&entry->rule);
 	kfree(entry);
 	ft_count--;
 	ft_deletes++;
@@ -267,7 +293,9 @@ static bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
  * with the cookie they were selected under: an IPv6 destination belongs to one
  * FIB generation and dst_check() rejects every one of them against a zero
  * cookie. No route pointer escapes the callback. Transformed routes need a
- * separate contract in either family. */
+ * separate contract in either family. dev is the logical egress device, which
+ * is the VLAN subinterface rather than the physical port when the flow is
+ * tagged; the destination Netfilter selected belongs to that device. */
 static bool ft_next_hop(const struct flow_cls_offload *cls,
 			struct net_device *dev, u8 family,
 			const union nf_inet_addr *daddr,
@@ -318,8 +346,10 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	struct neighbour *neigh;
 	bool valid;
 
+	/* Neighbours belong to the device the route names, which is the VLAN
+	 * subinterface for a tagged flow; the physical port never sees them. */
 	neigh = neigh_lookup(ft_neigh_table(entry->rule.family), &entry->next_hop,
-			     entry->rule.out);
+			     entry->rule.out_logical);
 	if (!neigh)
 		return -EOPNOTSUPP;
 	/* Recheck at watch publication: the mapping may have changed after the
@@ -457,10 +487,12 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	const struct flow_action *actions = &cls->rule->action;
 	const struct flow_action_entry *csum;
 	unsigned long status = READ_ONCE(ct->status), nat = status & IPS_NAT_MASK;
-	unsigned int edits = !!(nat & IPS_SRC_NAT) + !!(nat & IPS_DST_NAT), offset = 4;
-	/* Four Ethernet mangles and a redirect surround the translation. IPv4
+	unsigned int edits = !!(nat & IPS_SRC_NAT) + !!(nat & IPS_DST_NAT);
+	/* Four Ethernet mangles, then one action per ingress tag popped and
+	 * per egress tag pushed, then the translation, then the redirect. IPv4
 	 * spends two actions per edit and appends one checksum action; IPv6
 	 * spends five and has no header checksum to recompute. */
+	unsigned int encaps = out->in_vlans + out->out_vlans, offset = 4 + encaps;
 	unsigned int per_edit = out->family == AF_INET6 ? 5 : 2;
 	unsigned int fixed = out->family == AF_INET6 ? 5 : 6;
 	bool forward;
@@ -470,11 +502,11 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 	out->new_sport = out->sport;
 	out->new_dport = out->dport;
 	if (!nat)
-		return actions->num_entries == 5;
+		return actions->num_entries == 5 + encaps;
 	if (((nat & IPS_SRC_NAT) && !(status & IPS_SRC_NAT_DONE)) ||
 	    ((nat & IPS_DST_NAT) && !(status & IPS_DST_NAT_DONE)) ||
 	    (out->proto != IPPROTO_UDP && out->proto != IPPROTO_TCP) ||
-	    actions->num_entries != fixed + per_edit * edits)
+	    actions->num_entries != fixed + encaps + per_edit * edits)
 		return false;
 	forward = ft_tuple_matches(out, orig);
 	if (forward == ft_tuple_matches(out, reply))
@@ -515,9 +547,117 @@ static bool ft_translation(const struct flow_cls_offload *cls, struct cdx_ft_rul
 			TCA_CSUM_UPDATE_FLAG_TCP : TCA_CSUM_UPDATE_FLAG_UDP));
 }
 
+/* The immediate lower device. vlan_dev_real_dev() is emphatically not it: it
+ * descends through every stacked VLAN in one call and returns the bottom
+ * device, which would collapse a QinQ pair into its inner tag alone. A VLAN
+ * device has exactly one lower neighbour, and admission holds RTNL, which is
+ * what walking that list requires.
+ */
+static struct net_device *ft_vlan_lower(struct net_device *dev)
+{
+	struct net_device *lower;
+	struct list_head *iter;
+
+	netdev_for_each_lower_dev(dev, lower, iter)
+		return lower;
+	return NULL;
+}
+
+/* Derive the VLAN stack Linux would add between a logical device and its
+ * physical port, outermost first. Netfilter also describes this stack in its
+ * POP/PUSH actions, but the devices are the authority and the actions are
+ * checked against them, exactly as a NAT mangle is checked against its
+ * conntrack. Stopping on anything that is not an 802.1Q VLAN device is what
+ * declines a bridge, a PPPoE session, a bond or a MACVLAN here, rather than
+ * admitting a flow whose encapsulation the hardware would not reproduce.
+ * Returns the tag count, or -EOPNOTSUPP for a path this contract excludes.
+ */
+static int ft_vlan_stack(struct net_device *logical, const struct net_device *physical,
+			 struct cdx_ft_vlan *stack)
+{
+	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX];
+	unsigned int count = 0, i;
+
+	if (!logical || !physical)
+		return -EOPNOTSUPP;
+	/* Each step strictly descends and the tag count is bounded, so a path
+	 * that never reaches the port terminates at the bound. */
+	while (logical != physical) {
+		if (!is_vlan_dev(logical) || count == CDX_FT_VLAN_MAX ||
+		    vlan_dev_vlan_proto(logical) != htons(ETH_P_8021Q))
+			return -EOPNOTSUPP;
+		inner[count].proto = vlan_dev_vlan_proto(logical);
+		inner[count].id = vlan_dev_vlan_id(logical);
+		count++;
+		logical = ft_vlan_lower(logical);
+		if (!logical)
+			return -EOPNOTSUPP;
+	}
+	for (i = 0; i < count; i++)
+		stack[i] = inner[count - 1 - i];
+	return count;
+}
+
+/* Netfilter records the ingress tags in the VLAN and CVLAN dissector values,
+ * outermost first, without ever advertising either key in used_keys -- only
+ * their offsets are registered. They are therefore readable but not
+ * selectable, and only meaningful for as many tags as the device walk found,
+ * which is what bounds this loop. Each must name the tag that walk derived,
+ * under Netfilter's own exact masks, and must impose neither priority nor
+ * DEI, which the hardware does not reproduce. */
+static bool ft_vlan_match(struct flow_rule *rule, const struct cdx_ft_rule *out)
+{
+	struct flow_match_vlan vlan;
+	unsigned int i;
+
+	for (i = 0; i < out->in_vlans; i++) {
+		if (i)
+			flow_rule_match_cvlan(rule, &vlan);
+		else
+			flow_rule_match_vlan(rule, &vlan);
+		if (vlan.mask->vlan_id != VLAN_VID_MASK ||
+		    vlan.mask->vlan_tpid != htons(0xffff) ||
+		    vlan.mask->vlan_priority || vlan.mask->vlan_dei ||
+		    vlan.mask->vlan_eth_type ||
+		    vlan.key->vlan_id != out->in_vlan[i].id ||
+		    vlan.key->vlan_tpid != out->in_vlan[i].proto ||
+		    vlan.key->vlan_priority || vlan.key->vlan_dei)
+			return false;
+	}
+	return true;
+}
+
+/* The encapsulation block sits between the Ethernet rewrites and the
+ * translation: one POP per ingress tag, then one PUSH per egress tag, each
+ * outermost first. A POP carries no identity, so the ingress stack is proven
+ * by the devices and the selectors above; a PUSH carries its own and must
+ * agree with the stack. An action of any other kind here is a capability this
+ * contract does not describe -- a PPPoE session, a tunnel -- and is declined
+ * rather than dropped on the floor. */
+static bool ft_vlan_actions(const struct flow_action *actions,
+			    const struct cdx_ft_rule *out)
+{
+	unsigned int i, at = 4;
+
+	for (i = 0; i < out->in_vlans; i++, at++)
+		if (actions->entries[at].id != FLOW_ACTION_VLAN_POP)
+			return false;
+	for (i = 0; i < out->out_vlans; i++, at++) {
+		const struct flow_action_entry *push = &actions->entries[at];
+
+		if (push->id != FLOW_ACTION_VLAN_PUSH ||
+		    push->vlan.vid != out->out_vlan[i].id ||
+		    push->vlan.proto != out->out_vlan[i].proto ||
+		    push->vlan.prio)
+			return false;
+	}
+	return true;
+}
+
 /* Exact masks preserve every selector. Native flowtables supply routing
- * semantics (including TTL decrement), four Ethernet mangle words, optional
- * translation/checksum actions and a final redirect. */
+ * semantics (including TTL decrement), four Ethernet mangle words, an
+ * encapsulation block, optional translation/checksum actions and a final
+ * redirect. */
 static int ft_parse(struct cdx_ft_binding *binding,
 		    const struct flow_cls_offload *cls, struct cdx_ft_rule *out,
 		    union nf_inet_addr *next_hop)
@@ -542,11 +682,17 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	u8 ethernet[12] = {};
 	u8 family;
 	u32 word;
-	int i;
+	int i, vlans;
 
 	if (!rule)
 		return -EOPNOTSUPP;
 	used = rule->match.dissector->used_keys;
+	/* An ingress tag adds no selector here. nf_flow_rule_match() registers
+	 * the VLAN and CVLAN dissector offsets and fills their values, but
+	 * never advertises either key, so the described set is the same with a
+	 * tag as without one and this comparison stays exact. The tags are
+	 * still read back through those offsets, and cross-checked against the
+	 * devices, in ft_vlan_match(). */
 	if (used == keys4 || used == (keys4 | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)))
 		family = AF_INET;
 	else if (used == keys6 || used == (keys6 | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)))
@@ -599,6 +745,50 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	out->sport = ports.key->src;
 	out->dport = ports.key->dst;
 	out->proto = basic.key->ip_proto;
+	/* Four Ethernet mangles and a redirect are the shortest admissible
+	 * action list. Resolve the devices before the translation, because the
+	 * encapsulation they imply decides where every later action sits; from
+	 * there the exact count ft_translation requires bounds each index. */
+	if (rule->action.num_entries < 5)
+		return -EOPNOTSUPP;
+	action = &rule->action.entries[rule->action.num_entries - 1];
+	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_port_supported(action->dev) ||
+	    !cdx_ft_port_supported(binding->dev) || !cls->nf_dst || !cls->nf_dst_reverse)
+		return -EOPNOTSUPP;
+	out->in = binding->dev;
+	out->out = action->dev;
+	/* This direction's destination names the device it leaves by; the
+	 * reverse direction's names the device it arrives on. Requiring each
+	 * to reach its physical port through VLAN devices alone is what ties
+	 * the borrowed destinations to the redirect and the binding. Both are
+	 * now required, where only the egress one used to be: patch 140
+	 * supplies a destination only for a neighbour-output direction, so a
+	 * missing reverse one means that direction is transformed or direct,
+	 * neither of which this contract describes. */
+	out->out_logical = cls->nf_dst->dev;
+	out->in_logical = cls->nf_dst_reverse->dev;
+	vlans = ft_vlan_stack(out->out_logical, out->out, out->out_vlan);
+	if (vlans < 0)
+		return vlans;
+	out->out_vlans = vlans;
+	vlans = ft_vlan_stack(out->in_logical, out->in, out->in_vlan);
+	if (vlans < 0)
+		return vlans;
+	out->in_vlans = vlans;
+	/* The Ethernet source a neighbour-output flow carries is the physical
+	 * port's, and the encoder caches exactly one address per port. A VLAN
+	 * device that overrides its parent's address would have software emit
+	 * one source MAC and hardware another for the same flow, so it is
+	 * declined rather than left silently divergent. */
+	if (!ether_addr_equal(out->out_logical->dev_addr, out->out->dev_addr))
+		return -EOPNOTSUPP;
+	/* Re-entering the port a frame arrived on is a hairpin, and needs full
+	 * NAT to be a distinct path -- unless the two stacks differ, which is
+	 * ordinary routing between VLANs carried on one trunk. */
+	if (out->out == out->in && out->out_vlans == out->in_vlans &&
+	    !memcmp(out->out_vlan, out->in_vlan, sizeof(out->out_vlan)) &&
+	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK)
+		return -EOPNOTSUPP;
 	if (!ft_translation(cls, out))
 		return -EOPNOTSUPP;
 	switch (basic.key->ip_proto) {
@@ -620,6 +810,15 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	default:
 		return -EOPNOTSUPP;
 	}
+	/* Bounded by the tag count the devices produced, which is the only
+	 * thing that makes these reads meaningful: the keys are never in
+	 * used_keys, so nothing about them can be established from the set
+	 * compared above. A tag the devices found but Netfilter did not
+	 * describe leaves the dissector offset at zero, and the meta key
+	 * living there carries an all-ones ingress mask, which fails the
+	 * priority and DEI test below rather than being read as a tag. */
+	if (!ft_vlan_match(rule, out))
+		return -EOPNOTSUPP;
 	for (i = 0; i < 4; i++) {
 		action = &rule->action.entries[i];
 		if (action->id != FLOW_ACTION_MANGLE ||
@@ -631,21 +830,19 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		word = (word & masks[i]) | action->mangle.val;
 		memcpy(ethernet + offsets[i], &word, sizeof(word));
 	}
-	action = &rule->action.entries[rule->action.num_entries - 1];
-	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_port_supported(action->dev) ||
-	    !cdx_ft_port_supported(binding->dev) ||
-	    (action->dev == binding->dev &&
-	     (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK) ||
+	/* Neighbours, the borrowed destination and the payload bound all belong
+	 * to the logical egress device. The Ethernet source is the physical
+	 * port's, because that is the address Netfilter writes for a
+	 * neighbour-output flow and the only one the encoder can cache. */
+	if (!ft_vlan_actions(&rule->action, out) ||
 	    !is_valid_ether_addr(ethernet) ||
-	    !ft_next_hop(cls, action->dev, family, &out->new_dst, next_hop) ||
-	    !ft_neigh_check(family, action->dev, next_hop, ethernet) ||
-	    cls->nf_mtu > action->dev->mtu ||
+	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop) ||
+	    !ft_neigh_check(family, out->out_logical, next_hop, ethernet) ||
+	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return -EOPNOTSUPP;
-	if (!ether_addr_equal(ethernet + ETH_ALEN, action->dev->dev_addr))
+	if (!ether_addr_equal(ethernet + ETH_ALEN, out->out->dev_addr))
 		return -ESTALE;
-	out->in = binding->dev;
-	out->out = action->dev;
 	out->mtu = cls->nf_mtu;
 	ether_addr_copy(out->dst_mac, ethernet);
 	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
@@ -721,7 +918,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	entry->handle = cls->nf_handle;
 	nf_flow_offload_handle_get(entry->handle);
 	ft_handle_refs++;
-	dev_hold(rule.out);
+	ft_devices_hold(&rule);
 	rc = ft_neigh_attach(entry);
 	if (!rc)
 		rc = ft_fault(2) ? -EIO : cdx_ft_add(&rule, &entry->hw);
@@ -729,7 +926,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		ft_neigh_detach(entry);
 		nf_flow_offload_handle_put(entry->handle);
 		ft_handle_refs--;
-		dev_put(rule.out);
+		ft_devices_put(&rule);
 		kfree(entry);
 		return rc;
 	}
@@ -1057,7 +1254,8 @@ static bool ft_device_used(const struct net_device *dev)
 		if (binding->dev == dev)
 			return true;
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-		if (entry->rule.in == dev || entry->rule.out == dev)
+		if (entry->rule.in == dev || entry->rule.out == dev ||
+		    entry->rule.in_logical == dev || entry->rule.out_logical == dev)
 			return true;
 	return false;
 }
@@ -1067,8 +1265,12 @@ static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
 	struct cdx_ft_entry *entry;
 
 	spin_lock_bh(&ft_watch_lock);
+	/* A VLAN device carries its own MTU and administrative state, and a
+	 * flow tagged through it depends on both exactly as it depends on the
+	 * physical port underneath. */
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-		if (entry->rule.in == dev || entry->rule.out == dev)
+		if (entry->rule.in == dev || entry->rule.out == dev ||
+		    entry->rule.in_logical == dev || entry->rule.out_logical == dev)
 			ft_handle_invalidate(entry->handle, counter);
 	spin_unlock_bh(&ft_watch_lock);
 }
@@ -1307,19 +1509,39 @@ static void ft_stop(struct seq_file *seq, void *v)
 	cdx_ft_end();
 }
 
+/* Outermost first, dot separated, "-" when the direction carries no tag. One
+ * whitespace-free token per direction keeps the row parseable. */
+static void ft_vlan_text(const struct cdx_ft_vlan *stack, u8 count, char *text, size_t size)
+{
+	unsigned int at = 0;
+	u8 i;
+
+	if (!count) {
+		strscpy(text, "-", size);
+		return;
+	}
+	for (i = 0; i < count; i++)
+		at += scnprintf(text + at, size - at, i ? ".%u" : "%u", stack[i].id);
+}
+
 static int ft_show(struct seq_file *seq, void *v)
 {
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
+	char in_vlan[16], out_vlan[16];
 
 	if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
 		cdx_ft_stats(entry->hw, &stats);
+		ft_vlan_text(entry->rule.in_vlan, entry->rule.in_vlans, in_vlan, sizeof(in_vlan));
+		ft_vlan_text(entry->rule.out_vlan, entry->rule.out_vlans, out_vlan,
+			     sizeof(out_vlan));
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+				   in_vlan, out_vlan,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
 				   &entry->rule.dst.in6, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
@@ -1327,8 +1549,9 @@ static int ft_show(struct seq_file *seq, void *v)
 				   entry->rule.proto, entry->rule.mtu,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
+				   in_vlan, out_vlan,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),
 				   &entry->rule.dst.ip, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),

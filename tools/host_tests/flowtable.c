@@ -21,7 +21,10 @@ static u32 get_random_u32(void) { return 0x87654321; }
 #define ETH_ALEN 6
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86dd
+#define ETH_P_8021Q 0x8100
+#define ETH_P_8021AD 0x88a8
 #define ETH_P_ALL 3
+#define VLAN_VID_MASK 0x0fff
 #define IPV6_MIN_MTU 1280
 #define BIT(n) (1UL << (n))
 #define BIT_ULL(n) (1ULL << (n))
@@ -186,7 +189,30 @@ struct flow_block_cb {
 };
 struct net { int id; };
 static struct net init_net;
-struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down; };
+/* real_dev is what makes a device a VLAN here, exactly as vlan_dev_priv's
+ * presence does in the kernel; a physical port leaves it NULL. */
+struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
+                    struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto; };
+static bool is_vlan_dev(const struct net_device *d) { return d->real_dev; }
+/* Faithful to the kernel's own vlan_dev_real_dev(), which descends through
+ * every stacked VLAN at once and returns the bottom device -- not the
+ * immediate parent. Modelling it as the parent would make a QinQ stack look
+ * one tag deep to the tests and exactly one tag deep on hardware. */
+static struct net_device *vlan_dev_real_dev(const struct net_device *d)
+{
+    struct net_device *ret = d->real_dev;
+
+    while (is_vlan_dev(ret)) ret = ret->real_dev;
+    return ret;
+}
+static u16 vlan_dev_vlan_id(const struct net_device *d) { return d->vlan_id; }
+static __be16 vlan_dev_vlan_proto(const struct net_device *d) { return d->vlan_proto; }
+/* The immediate lower neighbour, which for a VLAN device is its parent and
+ * nothing else. The kernel's list holds direct neighbours only, so a single
+ * pointer models it exactly. */
+#define netdev_for_each_lower_dev(dev, lower, iter)                       \
+    for ((iter) = (struct list_head *)(dev), (lower) = (dev)->real_dev;   \
+         (lower) && (iter); (iter) = NULL)
 #define netif_carrier_ok(d) (!(d)->carrier_lost)
 #define netif_running(d) (!(d)->down)
 #define fallthrough __attribute__((fallthrough))
@@ -275,7 +301,8 @@ static bool is_valid_ether_addr(const u8 *a)
 #define ipv4_is_lbcast(a) ((a) == htonl(0xffffffff))
 enum { FLOW_DISSECTOR_KEY_META, FLOW_DISSECTOR_KEY_CONTROL, FLOW_DISSECTOR_KEY_BASIC,
        FLOW_DISSECTOR_KEY_IPV4_ADDRS, FLOW_DISSECTOR_KEY_IPV6_ADDRS,
-       FLOW_DISSECTOR_KEY_PORTS, FLOW_DISSECTOR_KEY_TCP };
+       FLOW_DISSECTOR_KEY_PORTS, FLOW_DISSECTOR_KEY_TCP,
+       FLOW_DISSECTOR_KEY_VLAN, FLOW_DISSECTOR_KEY_CVLAN };
 struct flow_dissector { unsigned long long used_keys; };
 /* Spelled out rather than a literal: adding a dissector key shifts every bit
  * above it, and a stale literal would quietly describe a different key set. */
@@ -291,20 +318,27 @@ struct ipv4_addrs { __be32 src, dst; };
 struct ipv6_addrs { struct in6_addr src, dst; };
 struct ports { __be16 src, dst; };
 struct tcp { __be16 flags; };
+/* Same field names and widths as flow_dissector_key_vlan, which is what the
+ * decoder's exact-mask rules are written against. */
+struct vlan { u16 vlan_id:12, vlan_dei:1, vlan_priority:3; __be16 vlan_tpid, vlan_eth_type; };
 #define MATCH(t) struct flow_match_##t { struct t *key, *mask; }
 MATCH(meta); MATCH(control); MATCH(basic); MATCH(ipv4_addrs); MATCH(ipv6_addrs);
-MATCH(ports); MATCH(tcp);
-enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACTION_CSUM };
+MATCH(ports); MATCH(tcp); MATCH(vlan);
+enum { FLOW_ACTION_MANGLE, FLOW_ACTION_REDIRECT, FLOW_ACTION_CSUM,
+       FLOW_ACTION_VLAN_PUSH, FLOW_ACTION_VLAN_POP, FLOW_ACTION_PPPOE_PUSH };
 enum flow_action_mangle_base { FLOW_ACT_MANGLE_HDR_TYPE_IP4, FLOW_ACT_MANGLE_HDR_TYPE_IP6,
        FLOW_ACT_MANGLE_HDR_TYPE_UDP, FLOW_ACT_MANGLE_HDR_TYPE_TCP, FLOW_ACT_MANGLE_HDR_TYPE_ETH };
 struct flow_action_entry {
     unsigned id, csum_flags;
     struct { unsigned htype, offset; u32 mask, val; } mangle;
+    struct { u16 vid; __be16 proto; u8 prio; } vlan;
     struct net_device *dev;
 };
-/* An IPv6 translation spends five actions per edit, so both edits plus the
- * Ethernet rewrites and the redirect need more room than IPv4 ever did. */
-struct flow_action { unsigned num_entries; struct flow_action_entry entries[16]; };
+/* NF_FLOW_RULE_ACTION_MAX, which is what Netfilter allocates and refuses to
+ * exceed. The deepest list it can actually produce is four Ethernet rewrites,
+ * two tags popped and two pushed, an IPv6 translation at five actions per edit
+ * for both edits, and the redirect: nineteen. */
+struct flow_action { unsigned num_entries; struct flow_action_entry entries[24]; };
 struct flow_rule {
     struct { struct flow_dissector *dissector; } match;
     struct flow_action action;
@@ -315,10 +349,13 @@ struct flow_rule {
     struct flow_match_ipv6_addrs ipv6_addrs;
     struct flow_match_ports ports;
     struct flow_match_tcp tcp;
+    struct flow_match_vlan vlan, cvlan;
 };
 #define GETMATCH(t) static void flow_rule_match_##t(struct flow_rule *r, struct flow_match_##t *m) { *m = r->t; }
 GETMATCH(meta) GETMATCH(control) GETMATCH(basic) GETMATCH(ipv4_addrs)
-GETMATCH(ipv6_addrs) GETMATCH(ports) GETMATCH(tcp)
+GETMATCH(ipv6_addrs) GETMATCH(ports) GETMATCH(tcp) GETMATCH(vlan)
+/* The second visible tag arrives in its own key with the same value type. */
+static void flow_rule_match_cvlan(struct flow_rule *r, struct flow_match_vlan *m) { *m = r->cvlan; }
 struct flow_stats { u64 bytes, pkts; unsigned long lastused; };
 struct nf_flow_offload_handle { unsigned refs; bool invalid; };
 static struct nf_flow_offload_handle handle;
@@ -839,6 +876,327 @@ static void test_ipv6(void)
     ft_retire_workfn(NULL);
     assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated);
     neighbour.tbl = &arp_tbl;
+}
+
+/* out_tag is eth3.100 over the egress port, in_tag eth4.200 over the ingress
+ * one, and out_qinq is 300 inside 100 -- what Linux spells eth3.100.300, and
+ * what the wire carries as an outer 100 and an inner 300. A device that is
+ * neither a VLAN nor a physical port stands in for every other upper device:
+ * a bridge, a bond, a PPPoE session. */
+static struct net_device out_tag = { .ifindex = 7, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+                                     .real_dev = &out, .vlan_id = 100 };
+static struct net_device in_tag = { .ifindex = 8, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 1},
+                                    .real_dev = &in, .vlan_id = 200 };
+static struct net_device out_qinq = { .ifindex = 9, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2},
+                                      .real_dev = &out_tag, .vlan_id = 300 };
+static struct net_device upper = { .ifindex = 10, .mtu = 1500, .dev_addr = {2, 0, 0, 0, 0, 2} };
+static struct vlan vk[2], vm[2];
+static void snat_fixture(bool forward, bool tcp);
+
+/* Every mutable field is restored, because the rejection cases below work by
+ * breaking one of them and the next case must not inherit the damage. */
+static void vlan_fixture(void)
+{
+    fixture();
+    /* htons() is not a constant expression, so the protocols are set here
+     * rather than in the initialisers above. */
+    out_tag.vlan_proto = in_tag.vlan_proto = out_qinq.vlan_proto = htons(ETH_P_8021Q);
+    out_tag.mtu = in_tag.mtu = out_qinq.mtu = 1500;
+    out_tag.real_dev = &out;
+    in_tag.real_dev = &in;
+    out_qinq.real_dev = &out_tag;
+    out_tag.vlan_id = 100;
+    in_tag.vlan_id = 200;
+    out_qinq.vlan_id = 300;
+    /* Inherited from the parent, as the kernel does by default. */
+    ether_addr_copy(out_tag.dev_addr, out.dev_addr);
+    ether_addr_copy(out_qinq.dev_addr, out.dev_addr);
+    ether_addr_copy(in_tag.dev_addr, in.dev_addr);
+    assert(!out_tag.refs && !in_tag.refs && !out_qinq.refs);
+}
+
+/* Splice an encapsulation block in after the four Ethernet mangles, sliding
+ * whatever the fixture already laid out from index four onward up behind it.
+ * Pushes are given outermost first, the order Netfilter emits them in. */
+static void encap_actions(unsigned pops, const u16 *pushes, unsigned num_pushes)
+{
+    unsigned encaps = pops + num_pushes, i;
+
+    assert(rule.action.num_entries + encaps <= ARRAY_SIZE(rule.action.entries));
+    for (i = rule.action.num_entries; i-- > 4; )
+        rule.action.entries[i + encaps] = rule.action.entries[i];
+    rule.action.num_entries += encaps;
+    for (i = 0; i < pops; i++)
+        rule.action.entries[4 + i] = (struct flow_action_entry){ .id = FLOW_ACTION_VLAN_POP };
+    for (i = 0; i < num_pushes; i++)
+        rule.action.entries[4 + pops + i] = (struct flow_action_entry){
+            .id = FLOW_ACTION_VLAN_PUSH,
+            .vlan = { .vid = pushes[i], .proto = htons(ETH_P_8021Q) } };
+}
+
+/* The outermost visible ingress tag is recorded in KEY_VLAN and the next one
+ * in KEY_CVLAN, each with an exact VID and TPID and no priority or DEI.
+ * used_keys is deliberately left alone: nf_flow_rule_match() registers these
+ * two offsets and fills their values but never advertises either key, so a
+ * tagged rule describes exactly the same key set as an untagged one. A
+ * fixture that advertised them would be testing a kernel that does not
+ * exist. */
+static void encap_keys(const u16 *ingress, unsigned count)
+{
+    unsigned i;
+
+    for (i = 0; i < count; i++) {
+        vk[i] = (struct vlan){ .vlan_id = ingress[i], .vlan_tpid = htons(ETH_P_8021Q) };
+        vm[i] = (struct vlan){ .vlan_id = VLAN_VID_MASK, .vlan_tpid = htons(0xffff) };
+    }
+    rule.vlan = (struct flow_match_vlan){ &vk[0], &vm[0] };
+    rule.cvlan = (struct flow_match_vlan){ &vk[1], &vm[1] };
+}
+
+/* Rewrite the Ethernet source mangle words to name a different port, the way
+ * flow_offload_eth_src() does. A hairpin needs it because the frame leaves by
+ * the port it arrived on, whose address is not the fixture's egress one. */
+static void source_mac(const struct net_device *dev)
+{
+    u16 leading;
+
+    memcpy(&leading, dev->dev_addr, 2);
+    rule.action.entries[0].mangle.val = (u32)leading << 16;
+    memcpy(&rule.action.entries[1].mangle.val, dev->dev_addr + 2, 4);
+}
+
+/* Egress tagged with 100: the redirect still names the physical port, the
+ * route still names the VLAN device, and the tag is what lies between. */
+static void egress_tag_fixture(void)
+{
+    const u16 push[] = { 100 };
+
+    vlan_fixture();
+    route.dst.dev = &out_tag;
+    /* A neighbour is discovered on the device the route names. The one the
+     * plain fixture puts on the physical port is a different neighbour. */
+    neighbour.dev = &out_tag;
+    encap_actions(0, push, ARRAY_SIZE(push));
+}
+
+/* Ingress tagged with 200, egress untagged: the asymmetric shape of a tagged
+ * LAN behind an untagged WAN, and the one a real bench is wired as. */
+static void ingress_tag_fixture(void)
+{
+    const u16 ingress[] = { 200 };
+
+    vlan_fixture();
+    reverse_route.dst.dev = &in_tag;
+    encap_actions(1, NULL, 0);
+    encap_keys(ingress, ARRAY_SIZE(ingress));
+}
+
+static void test_vlan(void)
+{
+    struct cdx_ft_rule decoded;
+    const u16 push_one[] = { 100 }, push_qinq[] = { 100, 300 }, ingress_one[] = { 200 };
+
+    /* An untagged flow names the physical ports as its own logical devices,
+     * which is what keeps every reference balanced without a special case. */
+    vlan_fixture();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(!decoded.in_vlans && !decoded.out_vlans);
+    assert(decoded.in_logical == &in && decoded.out_logical == &out);
+
+    /* One egress tag. The hardware ports are unchanged; only the stack and
+     * the logical device move. */
+    egress_tag_fixture();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_vlans == 1 && decoded.out_vlan[0].id == 100 &&
+           decoded.out_vlan[0].proto == htons(ETH_P_8021Q));
+    assert(!decoded.in_vlans && decoded.out == &out && decoded.in == &in);
+    assert(decoded.out_logical == &out_tag && decoded.in_logical == &in);
+    /* The Ethernet source stays the physical port's: that is the address
+     * Netfilter writes for a neighbour-output flow. */
+    assert(!memcmp(decoded.src_mac, out.dev_addr, ETH_ALEN));
+
+    /* One ingress tag and no egress tag. */
+    ingress_tag_fixture();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.in_vlans == 1 && decoded.in_vlan[0].id == 200 && !decoded.out_vlans);
+    assert(decoded.in_logical == &in_tag && decoded.out_logical == &out);
+
+    /* QinQ: the rule orders its tags outermost first, so the outer 100 the
+     * lower VLAN device carries comes before the inner 300 of the upper one.
+     * The trap this pins down is that vlan_dev_real_dev() reports the bottom
+     * device rather than the immediate parent, so a decoder built on it sees
+     * one tag where the wire carries two. */
+    vlan_fixture();
+    assert(vlan_dev_real_dev(&out_qinq) == &out && out_qinq.real_dev == &out_tag);
+    route.dst.dev = &out_qinq;
+    neighbour.dev = &out_qinq;
+    encap_actions(0, push_qinq, ARRAY_SIZE(push_qinq));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.out_vlans == 2 &&
+           decoded.out_vlan[0].id == 100 && decoded.out_vlan[1].id == 300);
+
+#define VLAN_REJECT(...) do { egress_tag_fixture(); __VA_ARGS__; \
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+    /* The PUSH actions must agree with the devices, in identity and in order. */
+    VLAN_REJECT(rule.action.entries[4].vlan.vid = 101);
+    VLAN_REJECT(rule.action.entries[4].vlan.proto = htons(ETH_P_8021AD));
+    VLAN_REJECT(rule.action.entries[4].vlan.prio = 1);
+    VLAN_REJECT(rule.action.entries[4].id = FLOW_ACTION_VLAN_POP);
+    VLAN_REJECT(rule.action.entries[4].id = FLOW_ACTION_PPPOE_PUSH);
+    /* A tag the device walk derived but the action list omits, and the other
+     * way round, are both action-count mismatches. */
+    VLAN_REJECT(rule.action.entries[4] = rule.action.entries[5];
+                rule.action.num_entries = 5);
+    VLAN_REJECT(route.dst.dev = &out);
+    /* Only 802.1Q, and only as deep as a tuple can describe. */
+    VLAN_REJECT(out_tag.vlan_proto = htons(ETH_P_8021AD));
+    /* Made to agree with itself, so only the device walk can decline it: an
+     * 802.1ad stack is outside the contract on its own terms, not merely
+     * because some action disagreed with it. */
+    VLAN_REJECT(out_tag.vlan_proto = htons(ETH_P_8021AD);
+                rule.action.entries[4].vlan.proto = htons(ETH_P_8021AD));
+    VLAN_REJECT(route.dst.dev = &upper);
+    VLAN_REJECT(out_tag.real_dev = &upper);
+    /* The payload bound belongs to the logical device, not the port. */
+    VLAN_REJECT(out_tag.mtu = 1491);
+    /* A VLAN device normally inherits its parent's address. One that does not
+     * would have software and hardware disagree about the Ethernet source. */
+    VLAN_REJECT(out_tag.dev_addr[5]++);
+    /* A neighbour on the physical port is not this flow's neighbour. */
+    VLAN_REJECT(neighbour.dev = &out);
+#undef VLAN_REJECT
+
+    /* A QinQ stack one tag deeper than a tuple can carry is declined rather
+     * than silently truncated to its outer two tags. */
+    vlan_fixture();
+    struct net_device deeper = out_qinq;
+    deeper.real_dev = &out_qinq;
+    deeper.vlan_id = 400;
+    route.dst.dev = &deeper;
+    encap_actions(0, push_qinq, ARRAY_SIZE(push_qinq));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+
+#define KEY_REJECT(...) do { ingress_tag_fixture(); __VA_ARGS__; \
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP); } while (0)
+    /* The ingress selectors must name the tags the devices derived, under
+     * Netfilter's own exact masks and imposing nothing else. */
+    KEY_REJECT(vk[0].vlan_id = 201);
+    KEY_REJECT(vk[0].vlan_tpid = htons(ETH_P_8021AD));
+    KEY_REJECT(in_tag.vlan_proto = htons(ETH_P_8021AD);
+               vk[0].vlan_tpid = htons(ETH_P_8021AD));
+    KEY_REJECT(vk[0].vlan_priority = 1);
+    KEY_REJECT(vk[0].vlan_dei = 1);
+    KEY_REJECT(vm[0].vlan_id = 0);
+    KEY_REJECT(vm[0].vlan_tpid = 0);
+    KEY_REJECT(vm[0].vlan_priority = 7);
+    KEY_REJECT(vm[0].vlan_eth_type = htons(0xffff));
+    /* A tagged rule describes the same key set as an untagged one, so a rule
+     * that advertises a VLAN selector is not one this kernel produced. */
+    KEY_REJECT(dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN));
+    KEY_REJECT(dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN));
+    KEY_REJECT(rule.action.entries[4].id = FLOW_ACTION_VLAN_PUSH);
+#undef KEY_REJECT
+
+    /* Re-entering the port a frame arrived on is only a distinct path when
+     * the two stacks differ; without that it still needs full NAT. */
+    vlan_fixture();
+    route.dst.dev = &in_tag;
+    reverse_route.dst.dev = &in;
+    neighbour.dev = &in_tag;
+    source_mac(&in);
+    encap_actions(0, (const u16[]){ 200 }, 1);
+    rule.action.entries[rule.action.num_entries - 1].dev = &in;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.in == decoded.out && decoded.out_vlans == 1 && !decoded.in_vlans);
+    /* The same port with the same stack on both sides is the shape that still
+     * needs full NAT to be a distinct path. */
+    vlan_fixture();
+    route.dst.dev = &in;
+    reverse_route.dst.dev = &in;
+    neighbour.dev = &in;
+    source_mac(&in);
+    rule.action.entries[4].dev = &in;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+
+    /* Translation indices move with the encapsulation block: the NAT edits
+     * and the checksum sit behind the pops and pushes, not at a fixed four. */
+    snat_fixture(true, false);
+    out_tag.vlan_proto = in_tag.vlan_proto = htons(ETH_P_8021Q);
+    route.dst.dev = &out_tag;
+    reverse_route.dst.dev = &in_tag;
+    neighbour.dev = &out_tag;
+    encap_actions(1, push_one, ARRAY_SIZE(push_one));
+    encap_keys(ingress_one, ARRAY_SIZE(ingress_one));
+    assert(rule.action.num_entries == 10);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.in_vlans == 1 && decoded.out_vlans == 1);
+    assert(decoded.new_src.ip == htonl(0xcb007104) && decoded.new_sport == htons(40000));
+    /* The same list with the block removed no longer describes those indices. */
+    rule.action.entries[4] = rule.action.entries[6];
+    rule.action.entries[5] = rule.action.entries[7];
+    rule.action.entries[6] = rule.action.entries[8];
+    rule.action.entries[7] = rule.action.entries[9];
+    rule.action.num_entries = 8;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+
+    /* Two tags on ingress, which is the only shape that reads the second
+     * selector: the first arrives in KEY_VLAN and the second in KEY_CVLAN. */
+    vlan_fixture();
+    reverse_route.dst.dev = &out_qinq;
+    out_qinq.real_dev = &out_tag;
+    out_tag.real_dev = &out;
+    binding.dev = &out;
+    mk.ingress_ifindex = out.ifindex;
+    /* The frame leaves by `in` here, so that is whose address the Ethernet
+     * source names. */
+    source_mac(&in);
+    rule.action.entries[4].dev = &in;
+    route.dst.dev = &in;
+    neighbour.dev = &in;
+    encap_actions(2, NULL, 0);
+    encap_keys(push_qinq, ARRAY_SIZE(push_qinq));
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.in_vlans == 2 && !decoded.out_vlans);
+    assert(decoded.in_vlan[0].id == 100 && decoded.in_vlan[1].id == 300);
+    /* The inner tag is described by the second selector, so a wrong one there
+     * must be refused exactly as a wrong outer one is. */
+    vk[1].vlan_id = 301;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    binding.dev = &in;
+    mk.ingress_ifindex = in.ifindex;
+
+    /* Tagged on both sides: three distinct devices are pinned, which no
+     * single-sided case reaches. */
+    vlan_fixture();
+    route.dst.dev = &out_tag;
+    reverse_route.dst.dev = &in_tag;
+    neighbour.dev = &out_tag;
+    encap_actions(1, push_one, ARRAY_SIZE(push_one));
+    encap_keys(ingress_one, ARRAY_SIZE(ingress_one));
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(out.refs == 1 && out_tag.refs == 1 && in_tag.refs == 1 && !in.refs);
+    ft_device_retire(&in_tag, &ft_mtu_invalidations);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out.refs && !out_tag.refs && !in_tag.refs && !allocated);
+
+    /* Every device the rule names is pinned for the life of the entry, and a
+     * VLAN device carries its own MTU and administrative state. */
+    egress_tag_fixture();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(out.refs == 1 && out_tag.refs == 1 && !in.refs);
+    ft_device_retire(&out_tag, &ft_mtu_invalidations);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !out.refs && !out_tag.refs && !ft_handle_refs && !ft_neighbour_refs);
+
+    ingress_tag_fixture();
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(in_tag.refs == 1 && out.refs == 1);
+    ft_device_retire(&in_tag, &ft_link_invalidations);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !in_tag.refs && !out.refs && !allocated);
 }
 
 static void snat_fixture(bool forward, bool tcp)
@@ -2031,6 +2389,7 @@ int main(void)
     test_selective_neighbours();
     test_selective_routes();
     test_ipv6();
+    test_vlan();
     test_snat();
     test_dnat();
     test_double_nat();

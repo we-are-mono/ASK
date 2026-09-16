@@ -162,7 +162,23 @@ void IP_delete_CT_route(PCtEntry pCtEntry);
 U64 IP_get_qosconnmark(PCtEntry pOrigEntry, PCtEntry pReplEntry);
 cdx_timer_t ct_get_time_remaining(PCT_PAIR ppair);
 
+/* Layer 2 encapsulation supplied by the caller instead of derived from a
+ * registered VLAN interface. The Linux flowtable owner has no such interface:
+ * the kernel hands it a physical redirect plus a tag stack, so the tags come
+ * from the flow. Innermost first, matching dpa_l2hdr_info, which is the
+ * reverse of the order the wire and Netfilter use. Ingress tags are validated
+ * and stripped; egress tags are inserted. */
+struct cdx_l2_encap {
+	U32 num_ingress;
+	U32 num_egress;
+	struct vlan_header ingress[DPA_CLS_HM_MAX_VLANs];
+	struct vlan_header egress[DPA_CLS_HM_MAX_VLANs];
+};
+
 int insert_entry_in_classif_table(PCtEntry entry);
+/* As above, with an explicit encapsulation. A NULL encap is exactly the
+ * interface-derived behaviour, which is what every legacy caller wants. */
+int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap);
 int delete_entry_from_classif_table(PCtEntry entry);
 
 PCtEntry IPv4_find_ctentry(U32 saddr, U32 daddr, U16 sport, U16 dport, U8 proto);

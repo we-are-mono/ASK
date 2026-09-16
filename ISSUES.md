@@ -282,6 +282,21 @@ each so the open bug list stays honest.
   era). To enable: add a transport-mode rig case and validate the path plus the
   AOFL-adjusted lengths before it ships.
 
+- [ ] **A141 — `tx_init()` is never called.** `cdx/control_tx.c:243` defines it
+  and `cdx/control_tx.h:54` declares it; nothing else in the tree references it.
+  Three consequences. `gDscpVlanPcpMapCtx.portid` keeps its BSS zero instead of
+  `NO_TX_PORT` (-1), so `cdx_get_tx_dscp_vlanpcp_map_enable(0)` reports a
+  DSCP-to-VLAN-PCP map enabled on portid 0 — harmless on gateway-dk only
+  because `config/gateway-dk/cdx_cfg.xml` assigns portids 1,4,5,6,7,9,10 and
+  never 0, but a board that used portid 0 would get a spurious priority tag on
+  every egress flow. `set_cmd_handler(EVENT_PKT_TX, M_tx_cmdproc)` never runs,
+  so `CMD_PORT_UPDATE` and the three `CMD_TX_DSCP_VLANPCP_MAP_*` FCI commands
+  return ERR_UNKNOWN_COMMAND. And `phy_port[i].id` is never seeded. To fix:
+  call `tx_init()` from the cdx init sequence alongside the other
+  `*_init()` handlers, then check whether anything depended on the current
+  portid-0 behaviour. Found while validating the VLAN encapsulation override,
+  whose tripwire is the first code to act on that map's state.
+
 - [ ] **A103 — fmlib PCD-modify / FrmReplic / VSPAlloc verbs.** fmlib omits the
   `DEV_TO_ID` handle→id conversion at several sites, so a userspace `t_Device *`
   is sent where the kernel now expects a cookie:

@@ -37,10 +37,28 @@ static bool ft_unlink_fault(void)
 #endif
 }
 
+/* The rule orders its tags outermost first, as the wire and Netfilter do;
+ * dpa_l2hdr_info orders them innermost first, because it is built by walking
+ * a VLAN interface up towards its parent. Reverse them here, at the one place
+ * the two conventions meet. tpid and tci are host-order in that description:
+ * the header manipulation applies cpu_to_be16/32 when it lays them out. */
+static void ft_encap(const struct cdx_ft_vlan *stack, u8 count,
+		     struct vlan_header *headers, u32 *num)
+{
+	u8 i;
+
+	for (i = 0; i < count; i++) {
+		headers[count - 1 - i].tpid = ntohs(stack[i].proto);
+		headers[count - 1 - i].tci = stack[i].id;
+	}
+	*num = count;
+}
+
 int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 {
 	POnifDesc in, out;
 	struct dpa_iface_info *in_iface, *out_iface;
+	struct cdx_l2_encap encap = {};
 	struct cdx_ft_hw *hw;
 	PCtEntry ct;
 
@@ -126,7 +144,18 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 		ct->hash = HASH_CT(rule->src.ip, rule->dst.ip, rule->sport,
 				   rule->dport, rule->proto);
 	}
-	if (insert_entry_in_classif_table(ct)) {
+	/* Both ports are physical, so the interface walk describes no
+	 * encapsulation at all; the tags admission derived from the devices
+	 * Linux routed through are the whole description. */
+	ft_encap(rule->in_vlan, rule->in_vlans, encap.ingress, &encap.num_ingress);
+	ft_encap(rule->out_vlan, rule->out_vlans, encap.egress, &encap.num_egress);
+	/* A flow with no tags asks for no override, and takes exactly the path
+	 * it took before tags existed. The override refuses a description the
+	 * interfaces already filled in -- a DSCP-to-PCP egress map is the one
+	 * thing that does so -- and that refusal must not reach a flow that is
+	 * not asking to replace anything. */
+	if (insert_entry_in_classif_table_encap(
+		    ct, encap.num_ingress || encap.num_egress ? &encap : NULL)) {
 		kfree(hw);
 		return -EIO;
 	}

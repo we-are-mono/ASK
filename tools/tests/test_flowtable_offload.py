@@ -199,6 +199,11 @@ class Rig:
                        sport=SPORT, ignore_pmtu=False):
         assert payload_size >= 8
         peer_if = getattr(self, "peer_if", LAN_NIC)
+        # Driver-level counters belong to the physical NIC. A VLAN device has
+        # no ethtool statistics at all, so a tagged peer has to name the port
+        # underneath it for the link health check while still capturing frames
+        # on the device that terminates the tag.
+        link_if = getattr(self, "peer_link", peer_if)
         peer_mac = getattr(self, "peer_mac", self.lan_mac)
         gateway_mac = getattr(self, "peer_gateway_mac", self.dut_lan_mac)
         ttl = 64 - getattr(self, "forward_hops", 1)
@@ -207,7 +212,7 @@ class Rig:
         script = f'''
 import json, socket, struct, subprocess, time
 def link_stats():
-    text = subprocess.check_output(['ethtool', '-S', {peer_if!r}], text=True)
+    text = subprocess.check_output(['ethtool', '-S', {link_if!r}], text=True)
     return {{k.strip(): int(v.strip()) for line in text.splitlines() if ':' in line
             for k, v in [line.split(':', 1)] if v.strip().isdigit() and
             any(word in k for word in ('error', 'dropped', 'no_buffer', 'no_dma', 'timeout'))}}

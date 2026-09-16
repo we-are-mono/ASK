@@ -35,14 +35,13 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 
 | # | Subsystem | Lines | FCI cmds | Linux mechanism | Effort | Notes |
 | ---: | --- | ---: | ---: | --- | --- | --- |
-| 2 | VLAN (`module_vlan`) | 556 | 2 | Yes — `DEV_PATH_VLAN`, `encap[]` | Low-Med | The kernel already fills the encap stack; needs FMAN VLAN key encoding. |
 | 3 | PPPoE (`pppoe.c`, `control_pppoe`) | 303 | 2 | Yes — `DEV_PATH_PPPOE` | Low-Med | The relay offset is already confirmed on hardware. |
 | 4 | Bridge / auto_bridge (`ffbridge.c`) | 276 | — | Yes — `DEV_PATH_BRIDGE` | Medium | CDX already falls back to the physical ingress port for `br-lan.N`. |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | High | Largest command surface and the most likely blocker: `USE_QOSCONNMARK`, `ENABLE_INGRESS_QOS` and `ENABLE_EGRESS_QOS` are all in the shipping build. Shaping has no flowtable concept. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Partial — `FLOW_OFFLOAD_XMIT_XFRM` | High | The xmit type exists, but SA handling, rekey and ESN live entirely in CDX. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | The flowtable is unicast-conntrack by construction. Needs a parallel replication path rather than a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
-| 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow counters exist. Treat carefully: the stats path is where A140 lived. |
+| 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow counters exist. Treat carefully: the stats path is where A140 lived. Now also owes the per-VLAN-interface counters, see below. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
 | 11 | Wi-Fi (`module_wifi`, `dpa_wifi`) | 345 | 3 | No | High | Needs driver-side `dev_fill_forward_path` support that does not exist. |
 | 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
@@ -63,6 +62,31 @@ cookie or `dst_check()` rejects all of them. And the `CtEntry` union means an
 IPv6 entry's destination address occupies the bytes IPv4 uses for its twin
 mirror, so the legacy twin fields must be left untouched. Both are the kind of
 defect that admits flows and then misroutes them, rather than failing loudly.
+
+## VLAN, delivered
+
+Scoped and landed 2026-09-16, QinQ included. The mechanism, the three places
+where an encapsulated flow is not an ordinary one with an extra header, and
+the hardware proof are in the [VLAN guide](flowtable-vlan.md).
+
+The finding worth carrying into the remaining increments is that a tagged flow
+is the first one where the device Linux routes through and the device the
+hardware transmits on are different objects. Neighbours, the borrowed
+destination, the payload bound and the retirement dependencies all belong to
+the logical device; only the classifier key and the egress queue belong to the
+port. Every later encapsulation — PPPoE, bridges, tunnels — inherits that
+split, and so does the device walk that derives it, which item 4 widens rather
+than replaces.
+
+One capability does not come across: **per-VLAN-interface byte counters**. CMM
+maintains them in the microcode's logical statistics area and returns them
+through an FCI query. This ownership mode loads no FCI, and the microcode
+needs an interface index to allocate the counters against, which only a
+registered VLAN interface has. Both halves belong to item 9, which has to
+cover physical ports, VLANs and per-flow read-back in one design rather than
+grow a VLAN-shaped allocator here. Until it lands, the flowtable path reports
+per-flow counters and the physical ports' own MAC counters, and nothing
+per-VLAN.
 
 ## Parity measurements
 
@@ -90,16 +114,53 @@ than the forward one under *both* owners, so that asymmetry belongs to the
 path rather than to either owner; it is unexplained and worth its own look,
 but it is not a flowtable regression.
 
-This covers one feature. The remaining subsystems each need their own paired
+**IPv4 TCP masquerade over an 802.1Q LAN, 4 streams, 30 s — 2026-09-16**
+
+| Direction | Flowtable | CMM |
+| --- | --- | --- |
+| LAN to WAN | 9.39 Gb/s, 2.15% and 2.16% DUT CPU | 9.39 Gb/s, 3.34% and 3.42% DUT CPU |
+| WAN to LAN | 9.39 Gb/s, 2.93% and 2.90% DUT CPU | 9.39 Gb/s, 2.05% and 2.07% DUT CPU |
+
+Two settled runs per cell. Both owners were sampled while the transfer was
+still in flight rather than after it: the flowtable adapter held ten
+directional entries carrying the expected `271`/`-` tag pair, and the CMM
+connection table held the five connections. Reading either table after the
+transfer catches whatever survived teardown, which is not what was carrying
+it.
+
+The rates are identical. The CPU difference is about a point either way and
+changes sign between directions, while repeats within one owner agree to
+0.03 points, so it is a real but small and non-directional difference rather
+than a regression. The order-of-magnitude reverse-direction asymmetry recorded
+for the untagged IPv4 measurement above does not appear here under either
+owner.
+
+**The first measurement after a boot is contaminated under both owners** —
+23.47% and 25.48% on the reverse direction against roughly 2% once settled.
+Discard a boot's first run rather than reporting it; a single pair of runs
+cannot tell that artefact from a real difference between owners, which is why
+every cell above is two settled runs.
+
+These cover two features. The remaining subsystems each need their own paired
 measurement before the retirement claim can be made for them.
 
 ## Sequencing
 
-**Items 2 to 4 are the natural next increments.** Linux supplies the mechanism,
-so each is an encoder and an eligibility contract with its own focused proof,
-exactly like the NAT and IPv6 increments already delivered. VLAN is the best
-next target: the kernel already fills the encap stack, so the work is FMAN key
-encoding rather than new architecture.
+**Items 3 and 4 are the natural next increments.** Linux supplies the
+mechanism, so each is an encoder and an eligibility contract with its own
+focused proof, exactly like the NAT, IPv6 and VLAN increments already
+delivered. Both reuse the VLAN increment's device walk and its encapsulation
+override; neither needs new architecture in the encoder.
+
+Item 4 does need one thing VLAN did not: a dependency the adapter does not yet
+watch. `br_fill_forward_path()` resolves the egress port through
+`br_fdb_find_rcu()`, so a bridged flow's hardware entry is pinned to whichever
+port the FDB named at admission. A station that roams, or an entry that ages
+out and is relearned elsewhere, silently misforwards until something else
+retires the flow. Bridge offload therefore needs FDB invalidation alongside the
+existing route, neighbour, device and nexthop watches. The product's real
+topology is a vlan-aware bridge, which is items 2 and 4 together, so item 4 is
+what makes the VLAN work reach the shipping configuration.
 
 **Items 5 to 8 need feature-specific contracts.** Each expresses behaviour a
 unicast flowtable tuple cannot carry, and each needs its own hardware

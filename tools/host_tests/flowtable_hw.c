@@ -28,6 +28,16 @@ typedef uint64_t u64;
 #define EN_EHASH_DELETE_UNSYNCED -2
 #define HASH_CT(s,d,sp,dp,proto) ((proto) * 13)
 #define HASH_CT6(s,d,sp,dp,proto) ((proto) * 17)
+#define DPA_CLS_HM_MAX_VLANs 6
+#define ETH_P_8021Q 0x8100
+/* Host order in this description, as the header manipulation expects: it
+ * applies cpu_to_be16/32 itself when it lays the tags out. */
+struct vlan_header { uint16_t tpid, tci; };
+struct cdx_l2_encap {
+    u32 num_ingress, num_egress;
+    struct vlan_header ingress[DPA_CLS_HM_MAX_VLANs];
+    struct vlan_header egress[DPA_CLS_HM_MAX_VLANs];
+};
 union nf_inet_addr {
     u32 all[4];
     __be32 ip;
@@ -157,10 +167,21 @@ static u8 expected_family = AF_INET;
 static __be16 expected_sport, expected_dport;
 static unsigned expected_proto = IPPROTO_UDP;
 static bool expected_hairpin;
+static struct cdx_l2_encap observed_encap;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
-static int insert_entry_in_classif_table(PCtEntry ct)
+static bool observed_encap_given;
+static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_encap *encap)
 {
+    /* An untagged flow asks for no override at all, so it takes the same path
+     * it took before tags existed; an override that describes nothing would
+     * still subject it to the override's own refusals. */
+    memset(&observed_encap, 0, sizeof(observed_encap));
+    observed_encap_given = encap != NULL;
+    if (encap) {
+        assert(encap->num_ingress || encap->num_egress);
+        observed_encap = *encap;
+    }
     assert(!memcmp((expected_hairpin ? in_iface : out_iface).eth_info.mac_addr, (u8[]){2,0,0,0,0,0}, 6));
     assert(ct->proto == expected_proto && ct->twin->proto == expected_proto);
     assert(ct->Sport == htons(1234) && ct->Dport == htons(5678));
@@ -405,6 +426,31 @@ int main(void)
     expected_family = rule.family = AF_INET;
     rule.src = v4(htonl(0xc0000201)); rule.dst = v4(htonl(0xc6336401));
     rule.proto = expected_proto = IPPROTO_UDP;
+
+    /* Encapsulation. The rule orders its tags outermost first; the L2
+     * description the header manipulation reads orders them innermost first,
+     * because it is normally built by walking a VLAN interface up towards its
+     * parent. Getting that reversal wrong swaps a QinQ pair on the wire and
+     * nothing else would notice, so it is asserted tag by tag. */
+    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(!observed_encap_given);
+    assert(cdx_ft_hw_del(&hw) == 0);
+    rule.in_vlans = 1;
+    rule.in_vlan[0] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 200 };
+    rule.out_vlans = 2;
+    rule.out_vlan[0] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 100 };
+    rule.out_vlan[1] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 300 };
+    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(observed_encap_given);
+    assert(observed_encap.num_ingress == 1 && observed_encap.num_egress == 2);
+    assert(observed_encap.ingress[0].tci == 200 && observed_encap.ingress[0].tpid == 0x8100);
+    /* Innermost first here: the rule's outer 100 lands last. */
+    assert(observed_encap.egress[0].tci == 300 && observed_encap.egress[0].tpid == 0x8100);
+    assert(observed_encap.egress[1].tci == 100 && observed_encap.egress[1].tpid == 0x8100);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    rule.in_vlans = rule.out_vlans = 0;
+    memset(rule.in_vlan, 0, sizeof(rule.in_vlan));
+    memset(rule.out_vlan, 0, sizeof(rule.out_vlan));
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     assert(cdx_ft_hw_add(&rule,&hw)==0);

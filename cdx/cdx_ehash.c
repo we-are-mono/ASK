@@ -1021,8 +1021,57 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 	return FAILURE;
 }
 
+/* Apply a caller-supplied VLAN stack to the L2 description derived from the
+ * interfaces. Only the Linux flowtable owner uses this: its egress is a
+ * physical port with tags named by the flow, so dpa_get_tx_info_by_itf() has
+ * no VLAN interface to walk and returns an untagged description.
+ *
+ * vlan_filtering suppresses the per-VLAN-interface statistics pointer in
+ * create_vlan_ins_hm(), exactly as the bridge path does for tags that come
+ * from bridge VLAN filtering rather than from a netdev. Without it the
+ * unallocated offset 0 would aim the ucode's counter update at another
+ * interface's statistics slot.
+ *
+ * Refusing a description that already carries tags is deliberate: the only
+ * way that happens here is a DSCP-to-VLAN-PCP egress map, which belongs to a
+ * QoS configuration this owner does not implement, and silently replacing its
+ * priority tag would lose it.
+ */
+static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap *encap)
+{
+	struct dpa_l2hdr_info *l2_info = &info->l2_info;
+
+	if (encap->num_ingress > DPA_CLS_HM_MAX_VLANs ||
+	    encap->num_egress > DPA_CLS_HM_MAX_VLANs) {
+		DPA_ERROR("%s::encapsulation deeper than the hardware supports\n", __func__);
+		return FAILURE;
+	}
+	if (l2_info->num_ingress_vlan_hdrs || l2_info->num_egress_vlan_hdrs ||
+	    l2_info->vlan_present || l2_info->pppoe_present || l2_info->add_pppoe_hdr) {
+		DPA_ERROR("%s::interfaces already describe an encapsulation\n", __func__);
+		return FAILURE;
+	}
+	memcpy(l2_info->ingress_vlan_hdrs, encap->ingress,
+	       encap->num_ingress * sizeof(*encap->ingress));
+	l2_info->num_ingress_vlan_hdrs = encap->num_ingress;
+	l2_info->vlan_present = !!encap->num_ingress;
+	memcpy(l2_info->egress_vlan_hdrs, encap->egress,
+	       encap->num_egress * sizeof(*encap->egress));
+	l2_info->num_egress_vlan_hdrs = encap->num_egress;
+#ifdef VLAN_FILTER
+	if (encap->num_egress)
+		l2_info->vlan_filtering = 1;
+#endif
+	return SUCCESS;
+}
+
 /* insert classif entry into table */
 int insert_entry_in_classif_table(PCtEntry entry)
+{
+	return insert_entry_in_classif_table_encap(entry, NULL);
+}
+
+int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_encap *encap)
 {
 	struct ins_entry_info *info;
 	struct en_exthash_tbl_entry *tbl_entry;
@@ -1102,6 +1151,9 @@ int insert_entry_in_classif_table(PCtEntry entry)
 				__func__);
 		goto err_ret;
 	}
+
+	if (encap && apply_l2_encap(info, encap))
+		goto err_ret;
 
 #ifdef DPA_IPSEC_OFFLOAD
 	/* if the connection is a secure one  and  SA direction is inbound
