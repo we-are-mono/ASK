@@ -333,6 +333,35 @@ each so the open bug list stays honest.
   Whole-tree replacement (`PcdCcModifyTree`) is deliberately unsupported
   under A113 and is excluded from this enablement work.
 
+- [ ] **A141 — `ceetm_get_egressfq` mutates the shared FQ it returns.** With a
+  class-queue policer enabled, the `ff = 1` call ORs the policer-profile number
+  into the top byte of `cqinfo->ceetmfq.egress_fq.fqid`
+  (`cdx/cdx_ceetm_app.c:57`). The clearing branch is an `else if` gated on
+  `cq_shaper_enable == DISABLE_POLICER`, so a later `ff = 0` call hits neither
+  branch and sees the polluted value. `ceetm_dscp_fq_map()` trips exactly that:
+  it stores the *pointer* returned by the `ff = 0` call into
+  `qm_ctx->dscp_fq_map->dscp_fq[dscp]`, then calls again with `ff = 1` on the
+  same object (`:1557`, `:1573`). The slow-path DSCP table is then left pointing
+  at an FQ whose `fqid` carries a fast-path-only policer byte, which QMan would
+  see as part of the FQID. Unreachable today — QoS is dormant, `cmmqos` ships
+  disabled — but it is on the path any QoS increment takes. Fix by returning the
+  fqid by value, or by keeping the policer byte out of the `qman_fq` entirely
+  and applying it only where the ucode parameter block is written.
+  Adjacent, same file: `ceetm_release_iface()` passes `qm_ctx - gQMCtx` to
+  `disable_dscp_fqid_map()` (`:1902`) where every other caller passes
+  `qm_ctx->port_info->portid`; these agree only because `QM_GET_CONTEXT` is
+  `&gQMCtx[portid]`.
+
+- [ ] **A142 — the CEETM tree is built in flowtable mode with no consumer.**
+  `CMD_INIT(qm)` runs unconditionally (`cdx/cdx_cmdhandler.c:163`), unlike
+  `CMD_INIT(ipsec)` which is skipped when `cdx_flowtable_enabled()` (`:167`). So
+  a flowtable boot still claims 8 CEETM channels, 128 CCGs, 128 class queues and
+  128 LFQs at module load, plus 128 FMAN egress policer profiles at DPA init —
+  none of which any command can reach, because CMM is not running. Decide with
+  the [QoS design](docs/flowtable-qos.md): either gate `qm_init()` the way IPsec
+  is gated, or keep the tree and give the flowtable a way to use it. Leaving it
+  as-is spends profile-id space and QMan resources on nothing.
+
 ---
 
 <a name="archive"></a>
