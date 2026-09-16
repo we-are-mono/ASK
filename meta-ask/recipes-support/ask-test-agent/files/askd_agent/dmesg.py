@@ -37,8 +37,68 @@ SPLAT_RE = re.compile(
     r"inconsistent.*usage)"     # lockdep state-mismatch
 )
 
+def open_at_tail() -> int | None:
+    """Open /dev/kmsg positioned after the last record, for a capture window.
+
+    Every open of /dev/kmsg starts at the *oldest* surviving record, so
+    learning "where we are now" by reading to the end costs a full parse of
+    the ring -- 4 MiB on a log_buf_len=4M image, which is most of a second in
+    Python and was being paid twice per test. SEEK_END is handled specially
+    for this file: it positions after the last record, so a later read returns
+    exactly what the window produced and nothing before it. Holding the
+    descriptor open is what makes that position durable.
+
+    Returns a descriptor the caller must close, or None if kmsg is absent.
+    """
+    if not KMSG_PATH.exists():
+        return None
+    try:
+        fd = os.open(str(KMSG_PATH), os.O_RDONLY | os.O_NONBLOCK)
+        os.lseek(fd, 0, os.SEEK_END)
+    except OSError:
+        return None
+    return fd
+
+
+def drain(fd: int | None) -> list[str]:
+    """Read every record written since the descriptor was positioned."""
+    lines: list[str] = []
+    if fd is None:
+        return lines
+    while True:
+        try:
+            chunk = os.read(fd, 8192)
+        except BlockingIOError:
+            break
+        except OSError:
+            # EPIPE: records were overwritten while we held the position, so
+            # the window is no longer complete. Keep what we have rather than
+            # reporting a clean window we cannot vouch for.
+            lines.append("askd-agent: kmsg overrun, window truncated")
+            break
+        if not chunk:
+            break
+        for raw in chunk.splitlines():
+            _, _, msg = raw.partition(b";")
+            lines.append(msg.decode("utf-8", "replace"))
+    return lines
+
+
+def close(fd: int | None) -> None:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def read_kmsg_seq() -> int | None:
-    """Return the current last-written /dev/kmsg sequence number (None if N/A)."""
+    """Return the current last-written /dev/kmsg sequence number (None if N/A).
+
+    Walks the whole ring; used only by the cursor-based dmesg-delta endpoint,
+    where the caller supplies its own cursor across separate requests and no
+    descriptor can be held between them.
+    """
     if not KMSG_PATH.exists():
         return None
     # /dev/kmsg format: "priority,seq,time_us,flags[,...];message\n"

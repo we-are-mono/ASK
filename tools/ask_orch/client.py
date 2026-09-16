@@ -49,8 +49,14 @@ class Agent:
             r.raise_for_status()
             return await r.json()
 
-    async def capture_start(self, session: aiohttp.ClientSession, ifaces: list[str] | None = None) -> str:
-        body = {"ifaces": ifaces or []}
+    async def capture_start(self, session: aiohttp.ClientSession, ifaces: list[str] | None = None,
+                            *, counters: bool = False) -> str:
+        """Open a capture window. `counters` additionally snapshots the
+        firmware counters, which costs about a second at each end of the
+        window because it reads every /proc/fqid_stats entry and each read is
+        a live frame-queue query. Ask for it only where the deltas are read;
+        the splat window itself does not need them."""
+        body = {"ifaces": ifaces or [], "counters": counters}
         async with session.post(f"{self.base_url}/capture-start", json=body) as r:
             r.raise_for_status()
             return (await r.json())["capture_id"]

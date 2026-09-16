@@ -78,12 +78,29 @@ async def counters_get(request: web.Request) -> web.Response:
     return web.json_response(counters.snapshot(ifaces))
 
 
+# A window whose stop never arrives would otherwise hold its descriptor for
+# the life of the agent. Tests open one per test, so a small bound is plenty
+# and keeps a crashed run from exhausting the descriptor table.
+MAX_OPEN_CAPTURES = 64
+
+
 async def capture_start(request: web.Request) -> web.Response:
-    ifaces = (await _maybe_json(request)).get("ifaces") or ["eth3", "eth4"]
+    body = await _maybe_json(request)
+    ifaces = body.get("ifaces") or ["eth3", "eth4"]
+    # Opt-in, because it is not free: the snapshot walks every file under
+    # /proc/fqid_stats -- 779 of them on this image -- and each read is a live
+    # QMan frame-queue query, about a second per snapshot and two snapshots per
+    # window. Callers that only want the splat window should not pay it. Ask
+    # for it with {"counters": true} when the deltas are actually read.
+    want_counters = bool(body.get("counters"))
+    captures = request.app["captures"]
+    while len(captures) >= MAX_OPEN_CAPTURES:
+        stale = captures.pop(next(iter(captures)))
+        dmesg.close(stale["kmsg_fd"])
     cap_id = _new_capture_id()
-    request.app["captures"][cap_id] = {
-        "kmsg_cursor": dmesg.read_kmsg_seq(),
-        "counters": counters.snapshot(ifaces),
+    captures[cap_id] = {
+        "kmsg_fd": dmesg.open_at_tail(),
+        "counters": counters.snapshot(ifaces) if want_counters else None,
         "ifaces": ifaces,
     }
     return web.json_response({"capture_id": cap_id})
@@ -94,14 +111,16 @@ async def capture_stop(request: web.Request) -> web.Response:
     cap = request.app["captures"].pop(cap_id, None)
     if cap is None:
         return web.json_response({"error": "unknown capture_id"}, status=404)
-    new_cursor, new_lines = dmesg.read_since(cap["kmsg_cursor"])
-    after = counters.snapshot(cap["ifaces"])
+    new_lines = dmesg.drain(cap["kmsg_fd"])
+    dmesg.close(cap["kmsg_fd"])
     splats = dmesg.has_splat(new_lines)
+    before = cap["counters"]
+    delta = (counters.diff_numeric(before, counters.snapshot(cap["ifaces"]))
+             if before is not None else None)
     return web.json_response({
         "dmesg": new_lines,
         "splats": splats,
-        "kmsg_cursor_end": new_cursor,
-        "counters_delta": counters.diff_numeric(cap["counters"], after),
+        "counters_delta": delta,
     })
 
 
