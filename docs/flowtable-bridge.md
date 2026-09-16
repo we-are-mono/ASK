@@ -229,5 +229,7 @@ needs a per-flow Ethernet source in the encoder rather than one cached address
 per port, which is the same allocator question interface statistics raise, and
 belongs with item 9 rather than here.
 
-MACVLAN, which item 13 records, is a separate upper device and is still
-declined by the walk: it is neither an 802.1Q VLAN nor a bridge master.
+MACVLAN is a separate upper device and is still declined by the walk: it is
+neither an 802.1Q VLAN nor a bridge master. That is the accepted answer rather
+than a pending increment — see the out-of-scope entry in the
+[retirement roadmap](flowtable-cmm-porting-roadmap.md).

@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?(?:int |void |U16 |struct qman_fq \*|enum qman_cb_dqrr_result )"
+    # An explicit list of return types rather than "anything": it is what
+    # keeps a forward declaration or a call site from being mistaken for the
+    # definition. Widen it when a new one is needed.
+    match = re.search(r"^(?:static )?(?:int |void |U16 |uint32_t |"
+                      r"struct qman_fq \*|enum qman_cb_dqrr_result )"
                       + name + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     start = match.start()

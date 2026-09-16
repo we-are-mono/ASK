@@ -3,7 +3,7 @@
 Session offload in the ASK flowtable adapter: why a session cannot be derived
 the way a tag can, what stands in for the neighbour and the Ethernet
 destination a ppp device does not have, what a session costs in the
-encapsulation budget, and the hardware proof.
+encapsulation budget, where its byte counters live, and the hardware proof.
 
 The accepted boundary is the
 [supported scope](linux-flowtable-offload.md#supported-scope). This document
@@ -110,24 +110,28 @@ session that comes from a flow rather than from a registered PPPoE interface:
 `struct cdx_l2_encap` carried only tags, and `apply_l2_encap()` refused any
 description that named a session at all.
 
-One thing had to be added rather than plumbed. Both opcodes index the logical
-statistics area by an offset a registered interface owns. A flow-described
-session owns none, so the insert would have aimed the microcode's counter
-update at the unallocated offset zero — another interface's slot — and the
-strip would have failed outright, since its lookup resolves an interface of
-type `IF_TYPE_PPPOE` and is handed a physical port. `pppoe_no_ifstats` makes
-both emit a null statistics pointer instead.
+One thing had to be added rather than plumbed. Both opcodes reach the logical
+statistics area by an index a registered interface owns: the insert reads one
+off the description, and the strip looks one up by interface id. A
+flow-described session is registered as nothing, so the insert would have aimed
+the microcode's counter update at the unallocated index zero — another
+interface's record — and the strip would have failed outright, since its lookup
+resolves an interface of type `IF_TYPE_PPPOE` and is handed a physical port.
+`pppoe_flow_ifstats` makes both take their index from the description instead,
+the insert from `pppoe_stats_offset` and the strip from `pppoe_rx_stats_offset`,
+which is what lets the adapter own a record rather than borrow an interface's.
 
-**That suppression rests on weaker evidence than the VLAN one.** The VLAN
-insert's field is documented in the SDK header as "base of stats area or stats
-pointer, null no stats". The two PPPoE structures carry no such comment; the
-only evidence that null means "no statistics" for them is that NXP's own
-`INCLUDE_PPPoE_IFSTATS`-disabled arms write zero. Host tests pin the emission —
-`tools/host_tests/pppoe_hm.c` compiles both production manipulations against
-the shipped header and requires the null pointer, and requires the strip not to
-attempt the interface lookup at all — but what the microcode does with a null
-pointer is not provable off hardware. The hardware runs below show no counter
-corruption and no errors, which is evidence and not proof.
+An index of zero then means no record at all and both opcodes emit a null
+pointer. That arm rests on weaker evidence than the VLAN one: the VLAN insert's
+field is documented in the SDK header as "base of stats area or stats pointer,
+null no stats", the two PPPoE structures carry no such comment, and the only
+evidence that null means "no statistics" for them is that NXP's own
+`INCLUDE_PPPoE_IFSTATS`-disabled arms write zero. It is now the degraded arm
+rather than the normal one — a session that got a record names it — and it is
+reached only when the firmware pool is empty. `tools/host_tests/pppoe_hm.c`
+pins both arms against the shipped header: the index the description names for
+each opcode, the null pointer when it names none, and the strip not attempting
+the interface lookup at all.
 
 ## Eligibility
 
@@ -150,15 +154,64 @@ Beyond the rules a routed, tagged flow already satisfies:
 - A session and its tags together may not exceed `NF_FLOW_TABLE_ENCAP_MAX`.
 - The four Ethernet mangle words must be zero on a session egress, and the
   `FLOW_ACTION_PPPOE_PUSH` sid must equal the one the walk resolved.
-- IPv6 over a session is declined. `en_ehash_insert_pppoe_hdr` carries a
-  version, a type, a code and a session id, and no PPP protocol id at all, so
-  the firmware chooses between `0x0021` and `0x0057` on its own and nothing has
-  shown that it picks the IPv6 one for an IPv6 flow. A wrong protocol id is a
-  header the peer discards — a silent loss rather than a loud refusal — so it
-  is excluded until proven.
+
+The address family is not one of these rules. `en_ehash_insert_pppoe_hdr`
+carries a version, a type, a code and a session id and no PPP protocol id at
+all, so the microcode chooses between `0x0021` and `0x0057` itself, and it
+chooses correctly: measured on this bench under CMM, IPv6 through a PPPoE
+session runs at 8.95 Gb/s forward and 9.20 Gb/s reverse at roughly 2% DUT CPU,
+with CMM's `v6connections` table holding all five connections mid-transfer and
+its `pppoe` table registering the session. CMM reaches the opcode through the
+same `create_pppoe_ins_hm()` and the same `INSERT_PPPoE_HDR`, and iperf3
+completed cleanly, so the peer parsed every frame the microcode emitted. A
+wrong protocol id is a header the peer discards, which would have shown as loss
+rather than as a rate.
 
 The classifier key is unchanged — the physical port plus the 5-tuple — so a
 session reaches the hardware only as the header it inserts or strips.
+
+## Per-session counters
+
+The firmware counts bytes and packets into a record in the logical statistics
+area, and the two opcodes are what name the record: the insert counts what it
+encapsulated into the record's transmit half, the strip counts what it
+decapsulated into its receive half. So one record describes a **session**
+rather than either flow, and the adapter holds it that way — claimed when the
+first direction naming a session is admitted, released when the last retires,
+shared by every connection over that session.
+
+The identity a record is keyed on is the whole of what the path walk resolved:
+the session id, the concentrator, and the device the session runs over. An id
+is allocated per concentrator and per client, so two sessions can carry the
+same one and only the three together name a session.
+
+**The pool is four records deep and shared with the legacy owner.** It is the
+same `MAX_PPPoE_INTERFACES` carve a registered PPPoE interface allocates from,
+so a fifth session — or a fifth between the two owners — finds it empty. That
+is not a refusal: counters are observability and forwarding is the product, so
+the flow installs and forwards, the opcodes are given an index of zero, and the
+session carries no counters for its life. The answer a session gets is the
+answer it keeps; returning a record later does not retrofit one, because a live
+connection's counters beginning halfway through it would be worse than none.
+
+Which is why the degradation is visible rather than silent. `/proc/cdx_flowtable`
+carries `session_records` and `session_slots` in the header and one `session`
+row per session with live flows:
+
+```
+session pppoe=1@00:11:22:33:44:55 lower=7 refs=2 slot=yes rx_packets=… rx_bytes=… tx_packets=… tx_bytes=…
+```
+
+`slot=none` is a session the pool had nothing for. `pppoe=` repeats exactly
+what the flow rows carry in `in_ppp=`/`out_ppp=`, so the two can be joined, and
+`refs` is how many directions name the session — two for one connection across
+it.
+
+This does not extend to VLANs yet, but the mechanism does: the backend API
+names the shape of the record (`CDX_FT_STATS_TIMESTAMPED` for the timestamped
+records a session's opcodes read, `CDX_FT_STATS_PLAIN` for the ones a VLAN's
+would), not the feature, so a VLAN asks for a slot with the same call. See item
+9 of the [retirement roadmap](flowtable-cmm-porting-roadmap.md).
 
 ## Retirement
 
@@ -185,8 +238,17 @@ directions differ only by a session, the lifecycle of an entry holding no
 neighbour, and twenty-two declined paths. `tools/host_tests/pppoe_hm.c` covers
 the two header manipulations and `apply_l2_encap()` against the shipped SDK
 header, including the session-id byte order — which the legacy control path
-reaches by applying `htons()` twice, so it is worth stating — and the
-statistics suppression on both opcodes. Thirty mutations of the guards
+reaches by applying `htons()` twice, so it is worth stating — and the index
+each opcode takes from the description. `tools/host_tests/flowtable.c::test_pppoe_stats`
+covers the ownership: one record per session rather than per flow or per
+direction, the same record found by identity for a second connection, the
+record returned only when the last reference is, a fifth session admitted
+without one, and the index of zero the encoder is then given.
+`tools/host_tests/ifstats.c` covers the allocator underneath that — the two
+pools' geometry, the index each record yields against the address it names,
+exhaustion, reuse and the lifetime of a record across deinit — because an index
+that names the wrong record is a counter update landing in another interface's
+memory, which no hardware run would show. Thirty mutations of the guards
 described here were reintroduced one at a time; twenty-eight were caught. The
 two that were not were redundant guards subsumed by others, one of which was
 also the only thing bounding the walk; both were removed and the bound made
@@ -201,6 +263,8 @@ independent view of what was negotiated:
 | Case | Hardware packets, each direction | Evidence beyond the counters |
 | --- | --- | --- |
 | Routed UDP | 64 | session recorded on the direction that inserts it and the one that strips it, and on neither LAN half; both directions name the physical ports; the forward MTU is 1492 with nothing having set it |
+| Routed UDP over IPv6 | 64 | the same session, carrying a v6 connection whose every datagram was answered — so the peer parsed every frame, which is the only thing that establishes the PPP protocol id the microcode chose |
+| Session counters | 64 | the session's own record moved by the burst in both halves, with two references to one record and no row left behind once the connection retires |
 | Source NAT | 64 | the concentrator observed the translated source, so the rewrite and the encapsulation reached the same frame in the right order |
 | Tagged LAN | 64 | a tag on the LAN and a tag plus a session on the WAN: each direction pops one and pushes two, asserted per direction rather than as a set |
 | Full-MTU datagram | 16 | a 1464-byte payload fills the 1492 path MTU, so the microcode's size check counts neither the eight session bytes nor the four tag bytes |
@@ -233,15 +297,13 @@ other subscriber's — and no exported interface reports a session change, so
 closing it would need a notifier that does not exist. Stated rather than
 silently assumed away.
 
-**IPv6 over a session**, for the reason in the eligibility list: the firmware's
-choice of PPP protocol id is unverified.
-
-**Per-session byte counters.** CMM maintains them in the microcode's logical
-statistics area against a registered PPPoE interface and returns them through
-an FCI query; this ownership mode loads no FCI and registers no such interface,
-which is the same reason a tagged flow carries no per-VLAN-interface counters
-and the same item — 9 in the [retirement
-roadmap](flowtable-cmm-porting-roadmap.md) — that owes both.
+**Counters for a fifth session.** The firmware pool is four records deep and
+shared with the legacy owner, so a fifth session forwards without any. That is
+a bounded gap rather than an unimplemented feature: the flows install, the
+counters are the only thing missing, and `slot=none` in `/proc/cdx_flowtable`
+says which sessions it happened to. Widening the pool means moving a MURAM
+carve the legacy owner also allocates from, which belongs to item 9 rather than
+here.
 
 **PPPoE relay**, which is a different feature: session-to-session forwarding
 through `REPLACE_PPPOE_HDR` and the relay classifier table, deleted from CMM

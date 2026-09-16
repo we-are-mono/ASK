@@ -33,6 +33,7 @@ import json
 import os
 import pathlib
 import re
+import socket
 import subprocess
 
 import pytest
@@ -40,8 +41,10 @@ import pytest_asyncio
 
 from ask_orch.client import Agent
 from ask_orch.uart import Console
-from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN,
-                       TopologyStack, dut_vlan_subif, lan_run, lan_vlan_subif)
+from _topology import (DUT_IPV6_LAN, LAN_IPV6, LAN_NIC, PPPOE_IPV6_LOCAL,
+                       PPPOE_IPV6_REMOTE, TARGET_LAN_IF, TARGET_WAN_IF,
+                       VLAN_ID_PPPOE_WAN, TopologyStack, dut_vlan_subif, lan_run,
+                       lan_vlan_subif)
 import test_flowtable_offload as ft
 from test_flowtable_offload import (ARTIFACTS, DPORT, Echo, SPORT, Rig, command,
                                     console_command, console_python, read)
@@ -62,6 +65,17 @@ LAN_VID = int(os.environ.get("ASK_FLOWTABLE_PPPOE_LAN_VID", "276"))
 INNER_LOCAL = os.environ.get("ASK_PPPOE_INNER_LOCAL", "10.98.0.1")
 INNER_REMOTE = os.environ.get("ASK_PPPOE_INNER_REMOTE", "10.98.0.2")
 PPPOE_USER, PPPOE_SECRET = "ask-test", "ask-test-secret"
+
+# The same two ends of the session in IPv6, claimed in _topology.py. IPV6CP
+# negotiates interface identifiers and forms link-local addresses from them; a
+# global address it does not assign, so the fixture puts one on each end.
+INNER_LOCAL6 = PPPOE_IPV6_LOCAL
+INNER_REMOTE6 = PPPOE_IPV6_REMOTE
+# Distinct from the IPv4 cases' ports. The fixture's conntrack clear is
+# IPv4-shaped by construction, so a v6 connection left behind by an earlier run
+# would otherwise be readmitted into this one's measurement.
+SPORT6 = int(os.environ.get("ASK_FLOWTABLE_PPPOE_SPORT6", "48280"))
+DPORT6 = int(os.environ.get("ASK_FLOWTABLE_PPPOE_DPORT6", "48281"))
 
 # Not derived from either VLAN id: an id can exceed an octet, and a subnet
 # built out of one silently aliases as soon as it does.
@@ -101,6 +115,21 @@ async def _flows(r):
     return (await r.state())["flows"]
 
 
+def _session_row(state, identity):
+    """The statistics record the adapter holds for one session.
+
+    Keyed on the same `id@concentrator` string the flow rows carry, which is
+    what lets the two be joined. A session always has a row once a direction
+    naming it is admitted; whether it has a firmware record is what `slot`
+    says, because the pool is four deep and shared and running out has to be
+    visible rather than silent.
+    """
+    wanted = _session_text(identity)
+    matching = [s for s in state["sessions"] if s["pppoe"] == wanted]
+    assert len(matching) == 1, (wanted, state["sessions"])
+    return matching[0]
+
+
 def _direction(flows, source, destination):
     """One installed direction, named by the endpoints of its match."""
     matching = [f for f in flows if f["src"].startswith(source + ":")
@@ -111,12 +140,17 @@ def _direction(flows, source, destination):
 
 # ---- the session ---------------------------------------------------------
 
-def _server_start():
+def _server_start(ipv6=False):
     """The access concentrator, on the orchestrator's standing tagged device.
 
     Run as a plain subprocess rather than through the WAN agent: pppoe-server
     is deliberately not in the agent's exec allowlist, and the orchestrator is
     the machine this test already runs on.
+
+    `ipv6` enables IPV6CP on this end. It is enabled on both ends or neither:
+    the peer that is not asked for it rejects the protocol, and the side that
+    wanted it gives up rather than failing, so a session would come up carrying
+    IPv4 only and the case that needs v6 would fail as a routing problem.
     """
     server = "/usr/sbin/pppoe-server"
     if not os.access(server, os.X_OK):
@@ -135,7 +169,8 @@ def _server_start():
         "nodefaultroute\n"
         "lcp-echo-interval 5\n"
         "lcp-echo-failure 3\n"
-        "noipdefault\n")
+        "noipdefault\n"
+        + ("+ipv6\n" if ipv6 else ""))
     proc = subprocess.Popen(
         # -k: kernel-mode PPPoE. -F: stay in the foreground, so this handle is
         # the server rather than a wrapper that has already exited, which is
@@ -163,7 +198,7 @@ def _server_stop(proc):
             pass
 
 
-async def _dial(console, lower):
+async def _dial(console, lower, ipv6=False):
     """Start pppd on the DUT over `lower` and wait for the session.
 
     pppd is not in the agent's exec allowlist, so the whole of it goes over the
@@ -194,7 +229,12 @@ async def _dial(console, lower):
         "lcp-echo-interval 5\n"
         "lcp-echo-failure 3\n"
         f"pap-secrets {DUT_SECRETS}\n"
-        f"chap-secrets {DUT_SECRETS}\n")
+        f"chap-secrets {DUT_SECRETS}\n"
+        # IPV6CP, which brings up the v6 network protocol on the session and
+        # forms a link-local address from the negotiated interface identifiers.
+        # The global addresses are the fixture's to add; this is what makes the
+        # device carry v6 at all.
+        + ("+ipv6\n" if ipv6 else ""))
     secrets = f'"{PPPOE_USER}"   *   "{PPPOE_SECRET}"   *\n'
     # Built here and staged as literals rather than assembled on the DUT: the
     # script that carries them is checksum-verified over the line, which a
@@ -273,7 +313,7 @@ def _session_text(identity):
     return f"{identity[0]}@{identity[1]}"
 
 
-async def _wait_reachable(r, attempts=10):
+async def _wait_reachable(r, attempts=25):
     """Prove the path across the session before measuring anything on it.
 
     The first packet after a bring-up can lose a race with the peer route and
@@ -282,14 +322,111 @@ async def _wait_reachable(r, attempts=10):
     catch. Absorb the bring-up here instead of in whichever case happens to
     run first.
     """
+    # Three probes per attempt, not one: the first datagram after a cold boot
+    # is the one that resolves the neighbour rather than the one that crosses,
+    # so a single-packet probe reports failure for a path that is one packet
+    # away from working. Observed on a freshly booted DUT, where ten
+    # single-packet attempts were not enough and every later case passed.
     for _ in range(attempts):
-        probe = await lan_run(r.lan, f"ping -c 1 -W 2 -I {r.peer_if} {INNER_LOCAL} "
-                                     f">/dev/null 2>&1; echo rc=$?", 12.0)
+        probe = await lan_run(r.lan, f"ping -c 3 -W 2 -I {r.peer_if} {INNER_LOCAL} "
+                                     f">/dev/null 2>&1; echo rc=$?", 20.0)
         if "rc=0" in probe.stdout:
             return
         await asyncio.sleep(1.0)
-    pytest.fail(f"the LAN VM could not reach {INNER_LOCAL} across the session after "
+    await _unreachable(r, INNER_LOCAL, attempts, probe)
+
+
+async def _unreachable(r, target, attempts, probe):
+    """Fail with the state of every hop, not just the verdict.
+
+    "Could not reach" names the symptom and nothing else, and the path has
+    four places to break: the session itself, the DUT's route across it, the
+    concentrator's route back to the LAN, and the LAN VM's route to the inner
+    address. Report all four so the next failure is diagnosed from the log
+    rather than from a re-run.
+    """
+    dut = await command(r.target, r.session, "ip", "-br", "addr", "show", "ppp0",
+                        check=False)
+    dut_route = await command(r.target, r.session, "ip", "route", "get", target,
+                              check=False)
+    lan_route = await lan_run(r.lan, f"ip route get {target} 2>&1", 10.0)
+    wan_route = await command(r.wan, r.session, "ip", "route", "get", r.lan_ip,
+                              check=False)
+    pytest.fail(
+        f"the LAN VM could not reach {target} across the session after "
+        f"{attempts} attempts: {probe.stdout!r}\n"
+        f"  DUT ppp0:        {dut.get('stdout', dut)!r}\n"
+        f"  DUT route:       {dut_route.get('stdout', dut_route)!r}\n"
+        f"  LAN route:       {lan_route.stdout!r}\n"
+        f"  concentrator ->  {wan_route.get('stdout', wan_route)!r}")
+
+
+async def _wait_reachable6(r, attempts=25):
+    """The same bring-up absorption for the v6 path across the session.
+
+    Sourced from the LAN address the offload rule matches on rather than from
+    an interface: the LAN VM carries more than one v6 address, and a probe that
+    left from a different one would prove a path the flow never takes.
+    """
+    for _ in range(attempts):
+        probe = await lan_run(r.lan, f"ping -6 -c 3 -W 2 -I {LAN_IPV6} {INNER_LOCAL6} "
+                                     f">/dev/null 2>&1; echo rc=$?", 20.0)
+        if "rc=0" in probe.stdout:
+            return
+        await asyncio.sleep(1.0)
+    pytest.fail(f"the LAN VM could not reach {INNER_LOCAL6} across the session after "
                 f"{attempts} attempts: {probe.stdout!r}")
+
+
+async def _offload_table6(r):
+    """The offload table for a v6 flow across the session.
+
+    `Rig.table()` writes an IPv4 match by construction and the family is part
+    of the adapter's key, so this direction needs a table of its own. The
+    devices are the same two physical ports: a ppp device is never one, which
+    is as true for v6 as for v4.
+    """
+    await r.nft(f'''table inet {ft.TABLE} {{
+ flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }};
+ flags offload; }}
+ chain forward {{ type filter hook forward priority 0; policy accept;
+ ip6 saddr {LAN_IPV6} udp sport {SPORT6} udp dport {DPORT6} flow add @fast
+ }}
+}}''')
+    await r.wait(lambda s: s["bindings"] == 2)
+
+
+async def _exchange6(r, count):
+    """Echo `count` v6 datagrams from the LAN VM across the session.
+
+    A reply from the wrong endpoint or with the wrong payload is fatal; a
+    timeout is only counted, so the caller can tolerate loss while the flow is
+    still being admitted and forbid it once it is installed.
+    """
+    script = f'''
+import json, socket, struct, time
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.bind(({LAN_IPV6!r}, {SPORT6}))
+echoed = lost = 0
+for n in range({count}):
+    payload = struct.pack('!Q', n) + b'ASK-flowtable-pppoe-v6'.ljust(48, b'.')
+    s.sendto(payload, ({INNER_LOCAL6!r}, {DPORT6}))
+    try:
+        data, addr = s.recvfrom(2048)
+    except TimeoutError:
+        lost += 1
+        continue
+    assert data == payload, (n, data)
+    assert (addr[0], addr[1]) == ({INNER_LOCAL6!r}, {DPORT6}), (n, addr)
+    echoed += 1
+    time.sleep(0.01)
+s.close()
+print(json.dumps({{'echoed': echoed, 'lost': lost}}))
+'''
+    result = await r.run_peer(script, timeout=count * 0.3 + 40, label="flowtable_pppoe_v6")
+    assert result.rc == 0, result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 # ---- topology ------------------------------------------------------------
@@ -327,12 +464,94 @@ async def _lan_segment(r, stack, tagged):
     return reachable
 
 
+async def _ipv6_session(r, stack, cleanup):
+    """Global IPv6 on both ends of the session, and a LAN that can reach it.
+
+    Three /64s meet here and only one of them is new. The LAN segment reuses
+    the addresses the IPv6 offload tests already put on the DUT's LAN port and
+    the LAN VM, so that half of the path is the one those tests proved. The
+    session's own two endpoints get a /64 of their own, because they are on
+    neither segment: they are the ends of the point-to-point link between the
+    two ppp devices, and taking an address out of a segment's prefix would make
+    a routing mistake look like a working path.
+
+    What IPV6CP brings up is the protocol and a link-local address formed from
+    the negotiated interface identifiers. A global address it does not assign,
+    so each end gets one here -- as a /64 on a point-to-point device, which
+    makes the far end on-link and needs no next hop, exactly as the IPv4 side
+    of this session needs none.
+    """
+    async def target(*argv, check=True):
+        return await command(r.target, r.session, *argv, check=check)
+
+    # The concentrator's own ppp device, named by the address pppoe-server put
+    # on it rather than assumed to be the DUT's name: both ends are usually
+    # ppp0, which is a coincidence between two machines rather than a fact
+    # about either.
+    addresses = json.loads((await command(r.wan, r.session, "ip", "-j", "-4", "addr"))["stdout"])
+    r.server_ppp_if = next(i["ifname"] for i in addresses
+                           if any(a.get("local") == INNER_LOCAL for a in i["addr_info"]))
+
+    previous = (await target("sysctl", "-n", "net.ipv6.conf.all.forwarding"))["stdout"].strip()
+    cleanup.append((r.target, ["sysctl", "-w",
+                               f"net.ipv6.conf.all.forwarding={previous}"]))
+    await target("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
+
+    # nodad throughout: duplicate address detection leaves an address tentative
+    # for about a second and a half, and the first flow would silently not come
+    # up. A ppp device is NOARP and skips it anyway; the LAN port does not.
+    for address, interface in ((INNER_REMOTE6, r.ppp_if), (DUT_IPV6_LAN, TARGET_LAN_IF)):
+        await target("ip", "-6", "addr", "del", f"{address}/64", "dev", interface,
+                     check=False)
+        await target("ip", "-6", "addr", "add", f"{address}/64", "dev", interface, "nodad")
+        cleanup.append((r.target, ["ip", "-6", "addr", "del", f"{address}/64",
+                                   "dev", interface]))
+    await target("ip", "-6", "neigh", "replace", LAN_IPV6, "lladdr", r.lan_mac,
+                 "nud", "permanent", "dev", TARGET_LAN_IF)
+    cleanup.append((r.target, ["ip", "-6", "neigh", "del", LAN_IPV6,
+                               "dev", TARGET_LAN_IF]))
+
+    await command(r.wan, r.session, "ip", "-6", "addr", "del", f"{INNER_LOCAL6}/64",
+                  "dev", r.server_ppp_if, check=False)
+    await command(r.wan, r.session, "ip", "-6", "addr", "add", f"{INNER_LOCAL6}/64",
+                  "dev", r.server_ppp_if, "nodad")
+    cleanup.append((r.wan, ["ip", "-6", "addr", "del", f"{INNER_LOCAL6}/64",
+                            "dev", r.server_ppp_if]))
+    # The concentrator has no route to the LAN at all, in either family. Point
+    # to point, so no next hop: the session is the only way there.
+    await command(r.wan, r.session, "ip", "-6", "route", "replace", f"{LAN_IPV6}/128",
+                  "dev", r.server_ppp_if)
+    cleanup.append((r.wan, ["ip", "-6", "route", "del", f"{LAN_IPV6}/128",
+                            "dev", r.server_ppp_if]))
+
+    await lan_run(r.lan, f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} 2>/dev/null; true")
+    result = await lan_run(r.lan, f"ip -6 addr add {LAN_IPV6}/64 dev {LAN_NIC} nodad")
+    assert result.rc == 0, result.stdout
+    await lan_run(r.lan, f"ip -6 neigh replace {DUT_IPV6_LAN} lladdr {r.dut_lan_mac} "
+                         f"nud permanent dev {LAN_NIC}")
+    # A host route rather than a default: the LAN VM keeps whatever v6 default
+    # it already had, so nothing else it does moves onto this path.
+    await lan_run(r.lan, f"ip -6 route replace {INNER_LOCAL6}/128 via {DUT_IPV6_LAN} "
+                         f"dev {LAN_NIC}")
+
+    async def _lan_restore():
+        await lan_run(r.lan, f"ip -6 route del {INNER_LOCAL6}/128 dev {LAN_NIC} "
+                             f"2>/dev/null; true")
+        await lan_run(r.lan, f"ip -6 neigh del {DUT_IPV6_LAN} dev {LAN_NIC} "
+                             f"2>/dev/null; true")
+        await lan_run(r.lan, f"ip -6 addr del {LAN_IPV6}/64 dev {LAN_NIC} "
+                             f"2>/dev/null; true")
+    stack.push(_lan_restore)
+    await _wait_reachable6(r)
+
+
 @pytest_asyncio.fixture
 async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, monkeypatch):
     """LAN VM -> DUT -> PPPoE session -> orchestrator.
 
-    The parameter selects the shape: "udp" (default), "tcp", or "tagged" for a
-    tagged LAN behind the session. Teardown reverses only what came up.
+    The parameter selects the shape: "udp" (default), "tcp", "tagged" for a
+    tagged LAN behind the session, or "ipv6" for a session carrying v6 as well.
+    Teardown reverses only what came up.
 
     The far endpoint is the session's own inner address, not the orchestrator's
     ordinary WAN address. It has to be: a host route for the WAN address down
@@ -342,10 +561,14 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     every Rig method; monkeypatch puts it back.
     """
     shape = getattr(request, "param", "udp")
-    assert shape in {"udp", "tcp", "tagged"}
+    assert shape in {"udp", "tcp", "tagged", "ipv6"}
     monkeypatch.setattr(ft, "WAN_IP", INNER_LOCAL)
     r = Rig()
     r.proto = "tcp" if shape == "tcp" else "udp"
+    # The v6 shape is v4 plus a second family on the same session, never
+    # instead of it: the v4 path is what the bring-up waits on and what the
+    # control channel and the session's own addressing already run over.
+    r.session_ipv6 = shape == "ipv6"
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     initial = await r.state()
@@ -354,10 +577,21 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     r.wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     stack = TopologyStack()
     cleanup = []
-    transport = server = None
+    transport = transport6 = server = None
     console = Console.target(log_path=str(ARTIFACTS / "pppoe-uart.log"))
     try:
         await command(r.target, r.session, "modprobe", "xt_tcpudp")
+        # Quiet the kernel's own console before driving it. Every command here
+        # is framed by a marker the reader matches on, and a printk landing
+        # mid-marker truncates it -- observed as "missing console output
+        # boundary" with the leading bytes of the token gone, and as a dial
+        # that silently did not happen, which then surfaces one step later as
+        # an unreachable peer. Restored in teardown. The same precaution, for
+        # the same reason, as _pppoe_e2e.py's.
+        printk = (await read(r.target, r.session, "/proc/sys/kernel/printk")).split()
+        await command(r.target, r.session, "sysctl", "-w", "kernel.printk=1 4 1 7")
+        cleanup.append((r.target, ["sysctl", "-w",
+                                   "kernel.printk=" + " ".join(printk[:4])]))
         await asyncio.to_thread(console.login, "root", None)
         # Probe for pppd before anything is built: skipping here costs nothing,
         # where skipping after the concentrator is up costs a spin-up and a
@@ -372,7 +606,7 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
         # that has nothing to do with the session.
         r.ppp_lower = await dut_vlan_subif(stack, r.target, r.session,
                                            parent=TARGET_WAN_IF, vid=WAN_VID)
-        server = _server_start()
+        server = _server_start(ipv6=r.session_ipv6)
         # ~0.5s to bind. A bad interface or a port already in use exits fast;
         # catching that here beats a bring-up timeout half a minute later.
         await asyncio.sleep(0.5)
@@ -380,7 +614,7 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
             _, err = server.communicate(timeout=2)
             pytest.fail(f"pppoe-server exited rc={server.returncode} on {SERVER_IF}: "
                         f"{err.decode('utf-8', 'replace')[:1000]!r}")
-        r.ppp_if, r.ppp_pid = await _dial(console, r.ppp_lower)
+        r.ppp_if, r.ppp_pid = await _dial(console, r.ppp_lower, ipv6=r.session_ipv6)
         stack.push(lambda: _hangup(console))
         r.console = console
         r.reachable = await _lan_segment(r, stack, shape == "tagged")
@@ -414,6 +648,12 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
         if r.proto == "udp":
             transport, r.echo = await asyncio.get_running_loop().create_datagram_endpoint(
                 SourceEcho, local_addr=(INNER_LOCAL, DPORT))
+        if r.session_ipv6:
+            # After the v4 path is proven, so a v6 failure is about v6 rather
+            # than about a session that never came up.
+            await _ipv6_session(r, stack, cleanup)
+            transport6, r.echo6 = await asyncio.get_running_loop().create_datagram_endpoint(
+                SourceEcho, local_addr=(INNER_LOCAL6, DPORT6), family=socket.AF_INET6)
         r.record("pppoe-fixture", {"lan": r.lan_ip, "inner": INNER_LOCAL, "shape": shape,
                                    "ppp": r.ppp_if, "lower": r.ppp_lower,
                                    "pppd_pid": r.ppp_pid, "reachable": r.reachable,
@@ -422,8 +662,9 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
                                    "initial": initial})
         yield r
     finally:
-        if transport:
-            transport.close()
+        for endpoint in (transport, transport6):
+            if endpoint:
+                endpoint.close()
         failures = []
         steps = [r.delete_table] + ([r.clear_ct] if hasattr(r, "lan_ip") else [])
         for step in steps:
@@ -527,6 +768,117 @@ async def test_flowtable_pppoe_routed(pppoe_rig):
     assert all(d == 64 for d in delta.values()), delta
     r.record("pppoe-routed", {"flows": flows, "delta": delta,
                               "session": _session_text(r.session_identity)})
+
+
+@pytest.mark.parametrize("pppoe_rig", ["ipv6"], indirect=True)
+async def test_flowtable_pppoe_ipv6_routed(pppoe_rig):
+    """IPv6 across the session, which was the one thing a session excluded.
+
+    The exclusion was about the firmware rather than the adapter.
+    `en_ehash_insert_pppoe_hdr` carries a version, a type, a code and a session
+    id, and no PPP protocol id at all, so the microcode chooses between 0x0021
+    and 0x0057 itself and nothing had shown which it picks for an IPv6 frame. A
+    wrong choice is a header the concentrator discards, which is silent loss
+    rather than a refusal, so it stayed out until measured.
+
+    This is the measurement. A complete v6 exchange across the session is the
+    evidence: every datagram was answered, so the peer parsed every frame the
+    hardware inserted a header onto, which a wrong protocol id would not
+    survive. The counters then say the hardware carried it rather than software
+    quietly doing the work.
+
+    One routed case is the whole of it, deliberately. Nothing about the family
+    reaches the session decode -- the walk, the concentrator and the id are
+    identical either way -- so what the other shapes would re-prove is the
+    adapter's handling of a session, which the IPv4 cases already cover, and
+    what is new here belongs to the firmware.
+    """
+    r = pppoe_rig
+    await _offload_table6(r)
+    # Nothing re-offers a flow on its own, so each attempt sends before it
+    # looks; admission needs traffic and the reverse direction needs a reply.
+    for _ in range(10):
+        await _exchange6(r, 4)
+        if (await r.state())["entries"] == 2:
+            break
+    flows = await _both_directions(r)
+    forward = _direction(flows, f"[{LAN_IPV6}]", f"[{INNER_LOCAL6}]")
+    reverse = _direction(flows, f"[{INNER_LOCAL6}]", f"[{LAN_IPV6}]")
+    assert forward["family"] == reverse["family"] == "6", flows
+    # The session, asserted exactly as the v4 routed case asserts it: the id
+    # and the concentrator the kernel negotiated, on the direction that inserts
+    # the header and on the direction that strips it, and on neither LAN half.
+    _assert_session(r, forward, reverse)
+    assert forward["in_vlan"] == "-" and reverse["out_vlan"] == "-", (forward, reverse)
+    assert forward["in_br"] == reverse["out_br"] == "-", (forward, reverse)
+    # The forward direction leaves by the session, so it carries the session's
+    # MTU -- which is above the IPv6 minimum link MTU, the one extra thing v6
+    # requires of a path.
+    assert int(forward["mtu"]) == SESSION_MTU, forward
+
+    before = {f["cookie"]: int(f["packets"]) for f in flows}
+    report = await _exchange6(r, 64)
+    assert report == {"echoed": 64, "lost": 0}, report
+    state = await r.state()
+    after = {f["cookie"]: int(f["packets"]) for f in state["flows"]}
+    assert set(before) == set(after), (before, state)
+    delta = {c: after[c] - before[c] for c in before}
+    assert all(d == 64 for d in delta.values()), (delta, state)
+    assert state["errors"] == 0, state
+    # And what the far end observed, which is where the protocol id was really
+    # decided: the concentrator's stack had to parse the PPP frame before this
+    # datagram could reach a socket at all.
+    assert r.echo6.sources == {(LAN_IPV6, SPORT6)}, r.echo6.sources
+    r.record("pppoe-ipv6-routed", {"flows": flows, "delta": delta,
+                                   "session": _session_text(r.session_identity),
+                                   "observed": sorted(r.echo6.sources)})
+
+
+async def test_flowtable_pppoe_session_counters(pppoe_rig):
+    """The session's own byte counters, which the firmware keeps for it.
+
+    One record per session, not per flow and not per direction: both halves of
+    this connection name the same session, so the record carries two
+    references and the two directions count into its two halves. Sending a
+    measured burst and requiring the record to have moved by it is what
+    separates counters the firmware is really maintaining from an index that
+    was merely written into an opcode.
+    """
+    r = pppoe_rig
+    await r.table()
+    await r.exchange(count=4)
+    await _both_directions(r)
+    state = await r.state()
+    row = _session_row(state, r.session_identity)
+    # Held by both directions of the one connection, and holding a record:
+    # the pool is empty only after four sessions, and this bench has one.
+    assert row["refs"] == "2", row
+    assert row["slot"] == "yes", row
+    assert state["session_records"] == 1 and state["session_slots"] == 1, state
+    before = {k: int(row[k]) for k in
+              ("rx_packets", "rx_bytes", "tx_packets", "tx_bytes")}
+
+    payload = 256
+    await r.exchange(count=64, payload_size=payload)
+    row = _session_row(await r.state(), r.session_identity)
+    after = {k: int(row[k]) for k in before}
+    delta = {k: after[k] - before[k] for k in before}
+    # Transmitted frames are the ones this direction inserted a header onto
+    # and received ones are those the other direction stripped from, so a
+    # symmetric exchange moves both halves by the burst.
+    assert delta["tx_packets"] == 64 and delta["rx_packets"] == 64, (before, after)
+    # Bytes are the firmware's own accounting rather than a number this test
+    # can predict exactly, so require them to have moved by at least the
+    # payload and no more than a full frame's worth of overhead per packet.
+    for half in ("rx_bytes", "tx_bytes"):
+        assert payload * 64 <= delta[half] <= (payload + 64) * 64, (half, delta)
+    r.record("pppoe-session-counters", {"before": before, "after": after,
+                                        "delta": delta, "row": row})
+    # The record belongs to the session, so retiring the connection returns it
+    # and the session stops being reported at all.
+    await r.delete_table()
+    state = await r.state()
+    assert state["session_records"] == 0 and not state["sessions"], state
 
 
 async def test_flowtable_pppoe_snat(pppoe_rig):
@@ -756,7 +1108,7 @@ async def test_flowtable_pppoe_session_retires_and_redials(pppoe_rig):
     # The device is gone, so /proc/net/pppoe has nothing left to describe.
     assert not (await read(r.target, r.session, "/proc/net/pppoe")).splitlines()[1:]
 
-    r.ppp_if, r.ppp_pid = await _dial(r.console, r.ppp_lower)
+    r.ppp_if, r.ppp_pid = await _dial(r.console, r.ppp_lower, ipv6=r.session_ipv6)
     # The device went and took its routes with it; the concentrator still has
     # no other way back to the LAN.
     for prefix in (r.reachable, f"{SNAT_ADDR}/32"):

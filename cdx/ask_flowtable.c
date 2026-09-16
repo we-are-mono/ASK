@@ -78,6 +78,32 @@ struct cdx_ft_binding {
 	struct nf_flowtable *table; /* retained as identity; borrowed in bind only */
 };
 
+/* One PPPoE session's statistics record, shared by every direction naming that
+ * session: claimed when the first is admitted and returned when the last
+ * retires, so the counters describe the session rather than any one flow and
+ * survive a connection coming and going underneath them.
+ *
+ * Keyed on the identity the path walk already derived, the device the session
+ * runs over included: a session id is unique only per concentrator and per
+ * client, and two sessions to different concentrators can share one. The
+ * device is held as an index rather than a pinned object because nothing here
+ * dereferences it -- an index that was recycled could only match after every
+ * entry naming the old one had retired and freed this record.
+ *
+ * slot is NULL for a session admitted while the firmware's small pool was
+ * empty. That is a session without counters, not a flow without hardware, and
+ * it stays that way for the session's life so the answer does not change
+ * underneath a running connection.
+ */
+struct cdx_ft_session_stats {
+	struct list_head list;
+	int lower_ifindex;
+	u16 id;
+	u8 mac[ETH_ALEN];
+	unsigned int refs;
+	struct cdx_ft_stats_slot *slot;
+};
+
 struct cdx_ft_entry {
 	struct list_head list;
 	struct hlist_node cookie_node;
@@ -87,6 +113,12 @@ struct cdx_ft_entry {
 	struct nf_flow_offload_handle *handle;
 	union nf_inet_addr next_hop;
 	struct cdx_ft_binding *binding;
+	/* The session record each half of this direction counts into, or NULL.
+	 * Held on the entry rather than in the rule: a rule is compared
+	 * bytewise against a stored one to decide whether anything changed,
+	 * and an attached resource is not part of that description. */
+	struct cdx_ft_session_stats *in_stats;
+	struct cdx_ft_session_stats *out_stats;
 	unsigned long cookie;
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
@@ -120,6 +152,9 @@ static u32 ft_hash_seed;
 static LIST_HEAD(ft_neigh_entries);
 static DEFINE_SPINLOCK(ft_watch_lock);
 static LIST_HEAD(ft_block_list);
+/* Session statistics records, under the backend transaction like the entries
+ * that reference them. No notifier walks this list. */
+static LIST_HEAD(ft_session_stats);
 static unsigned int ft_bound, ft_count;
 static unsigned int ft_neighbour_refs;
 static unsigned int ft_handle_refs;
@@ -224,6 +259,85 @@ static void ft_devices_put(const struct cdx_ft_rule *rule)
 	dev_put(rule->out);
 }
 
+/* The record for one session, created on first reference. Exhaustion of the
+ * firmware pool is deliberately not a failure: counters are observability and
+ * forwarding is the product, so the record is created regardless and simply
+ * carries no slot. That also keeps the reference counting uniform -- every
+ * direction naming a session holds a reference whether or not a slot exists,
+ * so the session shows up in the read-back either way and the degradation is
+ * visible rather than silent. */
+static struct cdx_ft_session_stats *ft_session_stats_get(const struct cdx_ft_session *session)
+{
+	struct cdx_ft_session_stats *record;
+
+	/* Asserted past the early return, not before it: a direction with no
+	 * session touches neither the list nor the firmware pool, and claiming
+	 * it needs a transaction would say something about this call that is
+	 * not true of it. */
+	if (!session->present)
+		return NULL;
+	cdx_ft_assert_held();
+	list_for_each_entry(record, &ft_session_stats, list)
+		if (record->id == session->id &&
+		    record->lower_ifindex == session->lower_ifindex &&
+		    ether_addr_equal(record->mac, session->mac)) {
+			record->refs++;
+			return record;
+		}
+	record = kzalloc(sizeof(*record), GFP_KERNEL);
+	if (!record)
+		return NULL;
+	record->id = session->id;
+	record->lower_ifindex = session->lower_ifindex;
+	ether_addr_copy(record->mac, session->mac);
+	record->refs = 1;
+	if (cdx_ft_stats_alloc(CDX_FT_STATS_TIMESTAMPED, &record->slot))
+		record->slot = NULL;
+	list_add_tail(&record->list, &ft_session_stats);
+	return record;
+}
+
+static void ft_session_stats_put(struct cdx_ft_session_stats **held)
+{
+	struct cdx_ft_session_stats *record = *held;
+
+	if (!record)
+		return;
+	cdx_ft_assert_held();
+	*held = NULL;
+	if (--record->refs)
+		return;
+	/* The last direction naming this session has retired, so the firmware
+	 * is no longer counting into the record and the slot can go back to a
+	 * pool the next session will draw from. */
+	cdx_ft_stats_free(&record->slot);
+	list_del(&record->list);
+	kfree(record);
+}
+
+/* Both halves of one connection name the same session and therefore share one
+ * record, so a connection holds two references to it. Nothing here can fail:
+ * a direction whose record could not be created counts nowhere and forwards
+ * regardless. */
+static void ft_stats_attach(struct cdx_ft_entry *entry)
+{
+	entry->in_stats = ft_session_stats_get(&entry->rule.in_session);
+	entry->out_stats = ft_session_stats_get(&entry->rule.out_session);
+}
+
+static void ft_stats_detach(struct cdx_ft_entry *entry)
+{
+	ft_session_stats_put(&entry->in_stats);
+	ft_session_stats_put(&entry->out_stats);
+}
+
+static void ft_stats_binding(const struct cdx_ft_entry *entry,
+			     struct cdx_ft_stats_binding *binding)
+{
+	binding->in_session = entry->in_stats ? entry->in_stats->slot : NULL;
+	binding->out_session = entry->out_stats ? entry->out_stats->slot : NULL;
+}
+
 static int ft_remove(struct cdx_ft_entry *entry)
 {
 	int rc = cdx_ft_del(&entry->hw);
@@ -236,6 +350,9 @@ static int ft_remove(struct cdx_ft_entry *entry)
 	hash_del(&entry->cookie_node);
 	hash_del(&entry->key_node);
 	ft_neigh_detach(entry);
+	/* After the hardware entry is gone, so the firmware has stopped
+	 * counting into the record before it can be handed to anyone else. */
+	ft_stats_detach(entry);
 	nf_flow_offload_handle_put(entry->handle);
 	ft_handle_refs--;
 	ft_devices_put(&entry->rule);
@@ -751,6 +868,7 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 			return -EOPNOTSUPP;
 		out_session->present = true;
 		out_session->id = session->id;
+		out_session->lower_ifindex = session->lower_ifindex;
 		ether_addr_copy(out_session->mac, session->h_dest);
 		logical = lower;
 	}
@@ -1006,15 +1124,6 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	if (vlans < 0)
 		return vlans;
 	out->in_vlans = vlans;
-	/* IPv6 over PPPoE is declined. The insert opcode's parameter carries a
-	 * version, a type, a code and a session id, and no PPP protocol id at
-	 * all, so the firmware chooses between 0x0021 and 0x0057 on its own and
-	 * nothing has shown that it picks the IPv6 one for an IPv6 flow. A
-	 * wrong protocol id is a header the peer discards, which is a silent
-	 * loss rather than a loud refusal, so it is excluded until proven. */
-	if (family == AF_INET6 &&
-	    (out->out_session.present || out->in_session.present))
-		return -EOPNOTSUPP;
 	/* The Ethernet source a neighbour-output flow carries is the physical
 	 * port's, and the encoder caches exactly one address per port. A logical
 	 * device that does not share that address would have software emit one
@@ -1188,9 +1297,19 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	ft_handle_refs++;
 	ft_devices_hold(&rule);
 	rc = ft_neigh_attach(entry);
-	if (!rc)
-		rc = ft_fault(2) ? -EIO : cdx_ft_add(&rule, &entry->hw);
+	if (!rc) {
+		struct cdx_ft_stats_binding binding;
+
+		/* Claimed before the hardware entry exists, so the indices the
+		 * encoder writes name a record this entry already holds a
+		 * reference to; a record acquired afterwards could be the one
+		 * a concurrent retirement had just returned. */
+		ft_stats_attach(entry);
+		ft_stats_binding(entry, &binding);
+		rc = ft_fault(2) ? -EIO : cdx_ft_add(&rule, &binding, &entry->hw);
+	}
 	if (rc) {
+		ft_stats_detach(entry);
 		ft_neigh_detach(entry);
 		nf_flow_offload_handle_put(entry->handle);
 		ft_handle_refs--;
@@ -1906,6 +2025,31 @@ static void ft_vlan_text(const struct cdx_ft_vlan *stack, u8 count, char *text, 
 		at += scnprintf(text + at, size - at, i ? ".%u" : "%u", stack[i].id);
 }
 
+/* One row per session carrying live flows, whether or not it has a firmware
+ * record. A session without one is the visible face of an exhausted pool: the
+ * flows are forwarded either way, and this is what says which of them are
+ * being counted. The rows sit with the header rather than in the paged flow
+ * iteration because there is one per distinct session with live flows, which
+ * is the number of uplinks rather than the number of connections.
+ *
+ * pppoe= repeats exactly what the flow rows carry in in_ppp=/out_ppp=, so the
+ * two can be joined.
+ */
+static void ft_session_rows(struct seq_file *seq)
+{
+	struct cdx_ft_session_stats *record;
+	struct cdx_ft_stats rx, tx;
+
+	list_for_each_entry(record, &ft_session_stats, list) {
+		cdx_ft_stats_read(record->slot, &rx, &tx);
+		seq_printf(seq,
+			   "session pppoe=%u@%pM lower=%d refs=%u slot=%s rx_packets=%llu rx_bytes=%llu tx_packets=%llu tx_bytes=%llu\n",
+			   record->id, record->mac, record->lower_ifindex,
+			   record->refs, record->slot ? "yes" : "none",
+			   rx.packets, rx.bytes, tx.packets, tx.bytes);
+	}
+}
+
 /* The PPPoE session, as the id and the concentrator the path walk resolved.
  * Both are shown for either direction even though only an egress session is
  * inserted: the two come from the same walk, so a direction that strips and
@@ -1937,8 +2081,10 @@ static void ft_bridge_text(const struct net_device *bridge, u16 vid, char *text,
 
 static int ft_show(struct seq_file *seq, void *v)
 {
+	struct cdx_ft_session_stats *record;
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
+	unsigned int records = 0, slots = 0;
 	char in_vlan[16], out_vlan[16];
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
 	char in_ppp[26], out_ppp[26];
@@ -1979,6 +2125,10 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->next_hop.ip, stats.packets, stats.bytes, stats.lastused);
 		return 0;
 	}
+	list_for_each_entry(record, &ft_session_stats, list) {
+		records++;
+		slots += !!record->slot;
+	}
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
@@ -1996,6 +2146,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_mac_invalidations),
 		   atomic64_read(&ft_fdb_invalidations),
 		   atomic64_read(&ft_admission_invalidations));
+	seq_printf(seq, "session_records %u\nsession_slots %u\n",
+		   records, slots);
+	ft_session_rows(seq);
 	return 0;
 }
 
@@ -2128,6 +2281,12 @@ static void __exit ask_flowtable_exit(void)
 			msleep(1000);
 		}
 	} while (rc);
+	/* Every record is held by the entries naming its session, and the
+	 * release above only succeeds with none of those left, so the list has
+	 * drained with them. Say so rather than assume it: a slot never
+	 * returned is a firmware record no later session can claim, and
+	 * nothing else would ever report that. */
+	WARN_ON_ONCE(!list_empty(&ft_session_stats));
 }
 
 MODULE_LICENSE("GPL");

@@ -118,9 +118,9 @@ int main(void)
          * type is written afterwards has to be the session one. */
         assert(info.eth_type == ETHERTYPE_PPPOE);
 
-        /* The same session described by a flow owns no slot, so it must emit
-         * the null pointer the statistics-disabled build emits, whatever the
-         * base and whatever stale offset the description carries. */
+        /* A flow-described session names its own record in the description,
+         * and the pointer is built from that rather than from a registered
+         * interface -- the same arithmetic, a different source. */
         memset(bytes, 0xa5, sizeof(bytes));
         info = (struct ins_entry_info){ .opc_count = 2, .param_size = 8,
                                         .paramptr = bytes + 1, .opcptr = opcode,
@@ -128,7 +128,23 @@ int main(void)
         opcode[0] = opcode[1] = 0xa5;
         info.l2_info.pppoe_sess_id = sids[s];
         info.l2_info.pppoe_stats_offset = stats_offset;
-        info.l2_info.pppoe_no_ifstats = 1;
+        info.l2_info.pppoe_flow_ifstats = 1;
+        assert(create_pppoe_ins_hm(&info) == SUCCESS);
+        expect_insert(bytes + 1, stats_base + offsets[o] * 24, sids[s]);
+        assert(opcode[0] == INSERT_PPPoE_HDR && info.eth_type == ETHERTYPE_PPPOE);
+
+        /* And a session with no record names index zero, which is never a
+         * record: every real one has STATS_WITH_TS set. The opcode then
+         * carries the null pointer the statistics-disabled build writes,
+         * rather than aiming at whoever owns record zero. */
+        memset(bytes, 0xa5, sizeof(bytes));
+        info = (struct ins_entry_info){ .opc_count = 2, .param_size = 8,
+                                        .paramptr = bytes + 1, .opcptr = opcode,
+                                        .eth_type = 0x0800 };
+        opcode[0] = opcode[1] = 0xa5;
+        info.l2_info.pppoe_sess_id = sids[s];
+        info.l2_info.pppoe_stats_offset = 0;
+        info.l2_info.pppoe_flow_ifstats = 1;
         assert(create_pppoe_ins_hm(&info) == SUCCESS);
         expect_insert(bytes + 1, 0, sids[s]);
         assert(opcode[0] == INSERT_PPPoE_HDR && info.eth_type == ETHERTYPE_PPPOE);
@@ -163,16 +179,33 @@ int main(void)
         assert(opcode[0] == STRIP_PPPoE_HDR && info.opc_count == 3);
         assert(info.paramptr == bytes + 5 && info.param_size == 0);
 
+        /* A flow-described session names its receive record in the
+         * description. The lookup is not attempted at all -- on a physical
+         * port it returns a failure that would refuse the whole flow -- and
+         * the pointer comes from the index that was named. */
         memset(bytes, 0xa5, sizeof(bytes));
         opcode[0] = opcode[1] = 0xa5;
         info = (struct ins_entry_info){ .opc_count = 2, .param_size = 4,
                                         .paramptr = bytes + 1, .opcptr = opcode };
-        info.l2_info.pppoe_no_ifstats = 1;
+        info.l2_info.pppoe_flow_ifstats = 1;
+        info.l2_info.pppoe_rx_stats_offset = stats_offset;
+        /* The transmit index is the insert's and must not be read here: the
+         * two halves of one record are different addresses. */
+        info.l2_info.pppoe_stats_offset = (uint8_t)(stats_offset + 1);
         stats_lookups = 0;
         assert(insert_remove_pppoe_hm(&info, 7) == SUCCESS);
-        /* Not merely a null pointer: the lookup is not attempted at all,
-         * because on a physical port it returns a failure that would refuse
-         * the whole flow. */
+        assert(stats_lookups == 0);
+        assert(memcmp(bytes + 1, expected, sizeof(expected)) == 0);
+        assert(opcode[0] == STRIP_PPPoE_HDR);
+
+        /* No record: index zero, null pointer, still no lookup. */
+        memset(bytes, 0xa5, sizeof(bytes));
+        opcode[0] = opcode[1] = 0xa5;
+        info = (struct ins_entry_info){ .opc_count = 2, .param_size = 4,
+                                        .paramptr = bytes + 1, .opcptr = opcode };
+        info.l2_info.pppoe_flow_ifstats = 1;
+        stats_lookups = 0;
+        assert(insert_remove_pppoe_hm(&info, 7) == SUCCESS);
         assert(stats_lookups == 0);
         assert(memcmp(bytes + 1, (uint8_t[4]){0}, 4) == 0);
         assert(opcode[0] == STRIP_PPPoE_HDR);
@@ -196,7 +229,7 @@ int main(void)
         case 1: info.param_size = 7; break;
         case 2: info.param_size = 3; break;
         case 3: fail_stats = 1; break;
-        case 4: fail_stats = 1; info.l2_info.pppoe_no_ifstats = 1; break;
+        case 4: fail_stats = 1; info.l2_info.pppoe_flow_ifstats = 1; break;
         }
         count = info.opc_count;
         size = info.param_size;
@@ -228,17 +261,28 @@ int main(void)
         encap.egress_pppoe = 1;
         encap.egress_session_id = 0x1234;
         memcpy(encap.egress_session_mac, ac, ETHER_ADDR_LEN);
+        /* Deliberately different values on the two sides: the receive index
+         * belongs to the strip and the transmit one to the insert, and a
+         * description that swapped them would count each direction into the
+         * other half without either opcode noticing. */
+        encap.ingress_stats_index = 0x83;
+        encap.egress_stats_index = 0x84;
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(info.l2_info.add_pppoe_hdr && !info.l2_info.pppoe_present);
-        assert(info.l2_info.pppoe_no_ifstats);
+        assert(info.l2_info.pppoe_flow_ifstats);
         assert(info.l2_info.pppoe_sess_id == 0x1234);
         assert(!memcmp(info.l2_info.ac_mac_addr, ac, ETHER_ADDR_LEN));
+        assert(info.l2_info.pppoe_rx_stats_offset == 0x83);
+        assert(info.l2_info.pppoe_stats_offset == 0x84);
 
         memset(&info, 0, sizeof(info));
-        encap = (struct cdx_l2_encap){ .ingress_pppoe = 1 };
+        encap = (struct cdx_l2_encap){ .ingress_pppoe = 1, .ingress_stats_index = 0x85 };
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(info.l2_info.pppoe_present && !info.l2_info.add_pppoe_hdr);
-        assert(info.l2_info.pppoe_no_ifstats);
+        assert(info.l2_info.pppoe_flow_ifstats);
+        assert(info.l2_info.pppoe_rx_stats_offset == 0x85);
+        /* A session that inserts nothing names no transmit record either. */
+        assert(!info.l2_info.pppoe_stats_offset);
 
         /* A description that already names a session came from a registered
          * interface, and replacing it would lose whatever it described. */
@@ -258,7 +302,8 @@ int main(void)
         encap.egress[0].tci = 100;
         assert(apply_l2_encap(&info, &encap) == SUCCESS);
         assert(!info.l2_info.pppoe_present && !info.l2_info.add_pppoe_hdr);
-        assert(!info.l2_info.pppoe_no_ifstats);
+        assert(!info.l2_info.pppoe_flow_ifstats);
+        assert(!info.l2_info.pppoe_rx_stats_offset && !info.l2_info.pppoe_stats_offset);
         assert(info.l2_info.num_egress_vlan_hdrs == 1);
     }
     puts("PPPoE HM encoding, suppression and refusal checks passed");

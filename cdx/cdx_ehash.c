@@ -1029,9 +1029,11 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
  *
  * vlan_filtering suppresses the per-VLAN-interface statistics pointer in
  * create_vlan_ins_hm(), exactly as the bridge path does for tags that come
- * from bridge VLAN filtering rather than from a netdev, and pppoe_no_ifstats
- * does the same for both PPPoE opcodes. Without them the unallocated offset 0
- * would aim the ucode's counter update at another interface's statistics slot.
+ * from bridge VLAN filtering rather than from a netdev. PPPoE goes further:
+ * pppoe_flow_ifstats tells both opcodes to take their index from this
+ * description, which carries the record the caller allocated for the session,
+ * or zero for a session that has none. Without it the unallocated index 0
+ * would aim the ucode's counter update at another interface's record.
  *
  * The session's Ethernet destination is written to ac_mac_addr because that is
  * where create_ethernet_hm() reads a PPPoE flow's destination from. It is the
@@ -1077,8 +1079,13 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 		memcpy(l2_info->ac_mac_addr, encap->egress_session_mac,
 		       ETHER_ADDR_LEN);
 	}
-	if (encap->ingress_pppoe || encap->egress_pppoe)
-		l2_info->pppoe_no_ifstats = 1;
+	if (encap->ingress_pppoe || encap->egress_pppoe) {
+		l2_info->pppoe_flow_ifstats = 1;
+#ifdef INCLUDE_PPPoE_IFSTATS
+		l2_info->pppoe_rx_stats_offset = encap->ingress_stats_index;
+		l2_info->pppoe_stats_offset = encap->egress_stats_index;
+#endif
+	}
 	return SUCCESS;
 }
 
@@ -1748,9 +1755,23 @@ err_ret:
 	return FAILURE;
 }
 
+#ifdef INCLUDE_PPPoE_IFSTATS
+/* The address of one timestamped statistics record half, from the index a
+ * header manipulation carries. Index zero is never a record a PPPoE session
+ * owns -- STATS_WITH_TS is always set on a real one -- so it is the caller's
+ * way of saying there is none, and the opcode takes a null pointer instead. */
+static uint32_t pppoe_stats_pointer(uint8_t index)
+{
+	if (!index)
+		return 0;
+	return get_logical_ifstats_base() +
+		((index & ~STATS_WITH_TS) * sizeof(struct en_ehash_stats_with_ts));
+}
+#endif
+
 static int create_pppoe_ins_hm(struct ins_entry_info *info)
 {
-	struct en_ehash_insert_pppoe_hdr *param;	
+	struct en_ehash_insert_pppoe_hdr *param;
 	uint32_t word;
 
 	if (info->opc_count == MAX_OPCODES)
@@ -1766,11 +1787,12 @@ static int create_pppoe_ins_hm(struct ins_entry_info *info)
 	/* Update the Ethertype now PPPoE is the outermost header  */
 	info->eth_type = ETHERTYPE_PPPOE;
 #ifdef INCLUDE_PPPoE_IFSTATS
-	/* A session described by a flow owns no statistics slot, so the only
-	 * offset available would be the unallocated zero. Emit the same null
-	 * pointer the statistics-disabled build below emits. */
-	if (info->l2_info.pppoe_no_ifstats) {
-		param->stats_ptr = 0;
+	/* A flow-described session names its own record, or names none. Either
+	 * way the index is already in the description, where the legacy path
+	 * put a registered interface's. */
+	if (info->l2_info.pppoe_flow_ifstats) {
+		param->stats_ptr =
+			cpu_to_be32(pppoe_stats_pointer(info->l2_info.pppoe_stats_offset));
 	} else {
 		uint8_t offset;
 
@@ -1941,10 +1963,11 @@ static int insert_remove_pppoe_hm(struct ins_entry_info *info, uint32_t itf_inde
 #ifdef INCLUDE_PPPoE_IFSTATS
 	/* The lookup below resolves a registered PPPoE interface, which a
 	 * session described by a flow does not have -- itf_index names the
-	 * physical port and the lookup would fail outright. Emit the null
-	 * pointer the statistics-disabled build emits, as the insert does. */
-	if (info->l2_info.pppoe_no_ifstats) {
-		stats_ptr = 0;
+	 * physical port and the lookup would fail outright, taking the flow
+	 * with it. Such a session names its receive record in the description
+	 * instead, or names none. */
+	if (info->l2_info.pppoe_flow_ifstats) {
+		stats_ptr = pppoe_stats_pointer(info->l2_info.pppoe_rx_stats_offset);
 	} else {
 		uint8_t offset;
 

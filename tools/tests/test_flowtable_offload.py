@@ -122,11 +122,20 @@ async def console_python(console, script, *, timeout=20, attempts=3):
         await console_command(console, "rm", "-f", path, staged)
 
 
+# Row kinds the proc file emits, by their leading word. Everything else is a
+# single "key value" counter. A row kind always yields a list, present and
+# empty when nothing of that kind exists, so a caller never has to guess
+# whether an absent key means none or means an older adapter.
+STATUS_ROWS = {"flow": "flows", "session": "sessions"}
+
+
 def status_text(text):
-    state = {"flows": []}
+    state = {name: [] for name in STATUS_ROWS.values()}
     for line in text.splitlines():
-        if line.startswith("flow "):
-            state["flows"].append(dict(item.split("=", 1) for item in line.split()[1:]))
+        kind, _, rest = line.partition(" ")
+        if kind in STATUS_ROWS:
+            state[STATUS_ROWS[kind]].append(
+                dict(item.split("=", 1) for item in rest.split()))
         else:
             key, value = line.split()
             state[key] = int(value) if value.isdecimal() else value

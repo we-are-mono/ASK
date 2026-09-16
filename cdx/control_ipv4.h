@@ -185,6 +185,13 @@ struct cdx_l2_encap {
 	U8 egress_pppoe;
 	U16 egress_session_id;
 	U8 egress_session_mac[ETHER_ADDR_LEN];
+	/* Where each side counts, as an index into the firmware's statistics
+	 * area. The legacy owner looks these up from a registered interface;
+	 * this one holds its own record and names it here. Zero means the
+	 * session has no record -- never a record at index zero, which belongs
+	 * to someone else and is exactly the aliasing this field replaces. */
+	U8 ingress_stats_index;
+	U8 egress_stats_index;
 };
 
 int insert_entry_in_classif_table(PCtEntry entry);

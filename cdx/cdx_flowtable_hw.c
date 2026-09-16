@@ -54,7 +54,9 @@ static void ft_encap(const struct cdx_ft_vlan *stack, u8 count,
 	*num = count;
 }
 
-int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
+int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
+		  const struct cdx_ft_stats_binding *stats,
+		  struct cdx_ft_hw **result)
 {
 	POnifDesc in, out;
 	struct dpa_iface_info *in_iface, *out_iface;
@@ -156,6 +158,15 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	encap.egress_pppoe = rule->out_session.present;
 	encap.egress_session_id = rule->out_session.id;
 	ether_addr_copy(encap.egress_session_mac, rule->out_session.mac);
+	/* A direction that strips counts into its session's receive half and
+	 * one that inserts into the transmit half of its own, which are the
+	 * two halves of the same record when one connection crosses one
+	 * session. A session without a record leaves the index zero, which the
+	 * opcodes read as no record rather than as record zero. */
+	if (stats->in_session)
+		encap.ingress_stats_index = stats->in_session->rx_index;
+	if (stats->out_session)
+		encap.egress_stats_index = stats->out_session->tx_index;
 	/* A flow with no encapsulation asks for no override, and takes exactly
 	 * the path it took before tags existed. The override refuses a
 	 * description the interfaces already filled in -- a DSCP-to-PCP egress

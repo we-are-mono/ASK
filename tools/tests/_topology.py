@@ -531,6 +531,25 @@ WAN_IPV6      = os.environ.get("ASK_WAN_IPV6", "fc00:beef::99")
 VIRT_IPV6     = os.environ.get("ASK_VIRT_IPV6", "fc00:beef::dd")
 TARGET_WAN_IF = os.environ.get("ASK_TARGET_WAN_IF", "eth4")
 
+# A third ULA /64, claimed by test_flowtable_pppoe.py for the addresses a PPPoE
+# session carries inside itself. It is deliberately neither of the two above:
+# the session's endpoints are not on the LAN or the WAN segment, they are on
+# the point-to-point link between the two ppp devices, and giving them an
+# address out of a segment /64 would make a routing mistake look like a
+# working path. The concentrator takes ::1 and the DUT ::2, matching the
+# INNER_LOCAL/INNER_REMOTE convention the IPv4 side of that session uses.
+# ("babe" rather than a spelling like "ppp" because p is not a hex digit and
+# the address would not parse.)
+#
+# Only the session's own /64 is new. Its LAN side reuses DUT_IPV6_LAN and
+# LAN_IPV6 above, which it configures itself rather than through
+# ipv6_topology -- that fixture also addresses the WAN port, which is where
+# the session stands. Sharing those two with test_flowtable_ipv6.py is safe
+# only because pytest runs serially and both tear down in finalizers, the same
+# basis as the VLAN id overlaps recorded above.
+PPPOE_IPV6_LOCAL  = os.environ.get("ASK_PPPOE_INNER_LOCAL6", "fc00:babe::1")
+PPPOE_IPV6_REMOTE = os.environ.get("ASK_PPPOE_INNER_REMOTE6", "fc00:babe::2")
+
 
 @pytest_asyncio.fixture
 async def ipv6_topology(aiohttp_session, target_agent, lan):

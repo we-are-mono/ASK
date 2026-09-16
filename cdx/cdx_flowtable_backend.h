@@ -31,6 +31,11 @@ struct cdx_ft_vlan {
 struct cdx_ft_session {
 	u8 mac[ETH_ALEN];
 	u16 id;
+	/* The device the session runs over, as an index. Nothing in the
+	 * backend uses it; it completes the identity for a caller that needs
+	 * to tell two sessions apart, because an id is unique only per
+	 * concentrator and per client. */
+	int lower_ifindex;
 	bool present;
 };
 
@@ -95,6 +100,39 @@ struct cdx_ft_counters {
 	u32 lastused;
 };
 
+/* One direction of an interface-level counter pair, as the firmware keeps it.
+ * Packets are 32 bits in the firmware record and are widened here. */
+struct cdx_ft_stats {
+	u64 bytes;
+	u64 packets;
+};
+
+struct cdx_ft_stats_slot;
+
+/* Which statistics pool a slot comes from. The firmware keeps two, differing
+ * only in whether a record carries a timestamp, and the header manipulation
+ * that reaches a record has to agree with the pool it came from. Naming the
+ * record shape rather than the feature is what lets a VLAN ask for a slot with
+ * the same call: interface statistics are one design, per item 9 of the
+ * retirement roadmap, not one design per encapsulation. */
+enum cdx_ft_stats_kind {
+	CDX_FT_STATS_TIMESTAMPED,	/* what a PPPoE session's insert/strip read */
+	CDX_FT_STATS_PLAIN,		/* what a VLAN's would */
+};
+
+/* The statistics slots a direction's encapsulation counts into. One session
+ * has a single slot serving both of its directions: the direction that
+ * inserts the header counts into that slot's transmit half and the direction
+ * that strips one counts into its receive half, so the two halves describe
+ * the session between them rather than either flow. NULL is a direction whose
+ * session has no slot, and the encoder then emits no pointer at all -- which
+ * is not the same as emitting zero by accident, because the unallocated index
+ * zero belongs to another record. */
+struct cdx_ft_stats_binding {
+	struct cdx_ft_stats_slot *in_session;
+	struct cdx_ft_stats_slot *out_session;
+};
+
 /* Process-context transactions serialize adapter state with CDX hardware
  * operations. They intentionally retain the existing control-lock ordering.
  * No backend operation calls the adapter. Never flush Netfilter work inside a
@@ -123,7 +161,27 @@ unsigned int cdx_ft_pending(void);
 int cdx_ft_admission_begin(void);
 void cdx_ft_admission_end(void);
 bool cdx_ft_port_supported(struct net_device *dev);
-int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result);
+/* stats names the slots this direction counts into and is never NULL; a
+ * direction with no session, or whose session has no slot, passes one holding
+ * NULLs. It is separate from the rule because it is a resource the adapter
+ * attached rather than a property of the flow, and the rule is compared
+ * bytewise against a stored one to decide whether anything changed. */
+int cdx_ft_add(const struct cdx_ft_rule *rule,
+	       const struct cdx_ft_stats_binding *stats,
+	       struct cdx_ft_hw **result);
+/* Interface-level byte counters live in a small fixed firmware area, four
+ * timestamped records and the rest plain, shared with the legacy owner.
+ * Allocation is therefore expected to fail, and failing is not fatal:
+ * counters are observability and forwarding is the product, so a caller that
+ * cannot have a slot must still install its flow. -ENOSPC says exactly that.
+ * A slot outlives no adapter: free every one before unload.
+ */
+int cdx_ft_stats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **slot);
+void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot);
+/* Reads the firmware's own record. Either pointer may be NULL to skip it; a
+ * NULL slot reports zeroes, which is what a caller without one should show. */
+void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
+		       struct cdx_ft_stats *rx, struct cdx_ft_stats *tx);
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. -EAGAIN: unlinked storage awaits a barrier. -EIO:
  * unlink is unproven; CDX latches a terminal failure and must quiesce hardware.

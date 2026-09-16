@@ -21,6 +21,7 @@
 #include "layer2.h"
 #include "portdefs.h"
 #include "fm_muram_ext.h"
+#include "cdx_flowtable_hw.h"
 
 #ifdef INCLUDE_IFSTATS_SUPPORT
 
@@ -234,6 +235,143 @@ void free_iface_stats(uint32_t dev_type, struct dpa_iface_info *iface)
 uint32_t get_logical_ifstats_base(void)
 {
 	return (stats_mem_phys);
+}
+
+/* The index a header manipulation carries for one record half, in units of its
+ * own pool's record. Both fields that eventually hold it are eight bits wide
+ * (dpa_iface_info's rxstats_index, dpa_l2hdr_info's offsets), so a plain
+ * record far enough into the area cannot be named at all -- the legacy path
+ * truncates there silently, and refusing is the only honest answer. */
+static int ifstats_slot_index(const void *half, size_t stride, u8 *index)
+{
+	unsigned long units = ((const uint8_t *)half - (const uint8_t *)stats_mem) / stride;
+
+	if (units > U8_MAX)
+		return -ERANGE;
+	*index = (u8)units;
+	return 0;
+}
+
+int cdx_ft_ifstats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **out)
+{
+	struct cdx_ft_stats_slot *slot;
+	int rc = -ENOSPC;
+
+	*out = NULL;
+	slot = kzalloc(sizeof(*slot), GFP_KERNEL);
+	if (!slot)
+		return -ENOMEM;
+	slot->kind = kind;
+	spin_lock(&dpa_statslist_lock);
+	if (!stats_mem) {
+		/* Deinit has returned the carve; there is nothing to index. */
+	} else if (kind == CDX_FT_STATS_TIMESTAMPED) {
+		struct cdx_pppoe_iface_ifinfo *record = pppoe_ifstats_freelist;
+
+		if (record &&
+		    !ifstats_slot_index(&record->stats.rxstats,
+					sizeof(struct en_ehash_stats_with_ts),
+					&slot->rx_index) &&
+		    !ifstats_slot_index(&record->stats.txstats,
+					sizeof(struct en_ehash_stats_with_ts),
+					&slot->tx_index)) {
+			pppoe_ifstats_freelist = record->next;
+			/* memset_io for MURAM: it is device memory on ARM64 and
+			 * a plain memset emits dc zva, which faults. Reads of
+			 * the same region do not, which is why the read below
+			 * is an ordinary struct access. */
+			memset_io((void __iomem *)record, 0, sizeof(*record));
+			slot->rx_index |= STATS_WITH_TS;
+			slot->tx_index |= STATS_WITH_TS;
+			slot->record = record;
+			rc = 0;
+		}
+	} else {
+		struct cdx_iface_ifinfo *record = ifstats_freelist;
+
+		if (record &&
+		    !ifstats_slot_index(&record->stats.rxstats,
+					sizeof(struct en_ehash_stats), &slot->rx_index) &&
+		    !ifstats_slot_index(&record->stats.txstats,
+					sizeof(struct en_ehash_stats), &slot->tx_index)) {
+			ifstats_freelist = record->next;
+			memset_io((void __iomem *)record, 0, sizeof(*record));
+			slot->record = record;
+			rc = 0;
+		}
+	}
+	spin_unlock(&dpa_statslist_lock);
+	if (rc) {
+		kfree(slot);
+		return rc;
+	}
+	*out = slot;
+	return 0;
+}
+
+void cdx_ft_ifstats_free(struct cdx_ft_stats_slot **out)
+{
+	struct cdx_ft_stats_slot *slot = *out;
+
+	if (!slot)
+		return;
+	*out = NULL;
+	spin_lock(&dpa_statslist_lock);
+	/* Deinit may already have dropped the carve and both lists, in which
+	 * case there is no list to return this record to and nothing that
+	 * could hand it out again. */
+	if (stats_mem && slot->kind == CDX_FT_STATS_TIMESTAMPED) {
+		struct cdx_pppoe_iface_ifinfo *record = slot->record;
+
+		record->next = pppoe_ifstats_freelist;
+		pppoe_ifstats_freelist = record;
+	} else if (stats_mem) {
+		struct cdx_iface_ifinfo *record = slot->record;
+
+		record->next = ifstats_freelist;
+		ifstats_freelist = record;
+	}
+	spin_unlock(&dpa_statslist_lock);
+	kfree(slot);
+}
+
+/* The firmware writes these fields big-endian, so the read is a be-to-cpu
+ * conversion. control_stat.c spells the same conversion cpu_to_be32/64, which
+ * is the identical byte swap under a name that says the opposite; it is not
+ * copied here, because a reader of this path should be able to tell which way
+ * the value is travelling. */
+void cdx_ft_ifstats_read(const struct cdx_ft_stats_slot *slot,
+			 struct cdx_ft_stats *rx, struct cdx_ft_stats *tx)
+{
+	if (rx)
+		*rx = (struct cdx_ft_stats){};
+	if (tx)
+		*tx = (struct cdx_ft_stats){};
+	if (!slot)
+		return;
+	if (slot->kind == CDX_FT_STATS_TIMESTAMPED) {
+		const struct en_ehash_ifstats_with_ts *record = slot->record;
+
+		if (rx) {
+			rx->bytes = be64_to_cpu(record->rxstats.bytes);
+			rx->packets = be32_to_cpu(record->rxstats.pkts);
+		}
+		if (tx) {
+			tx->bytes = be64_to_cpu(record->txstats.bytes);
+			tx->packets = be32_to_cpu(record->txstats.pkts);
+		}
+	} else {
+		const struct en_ehash_ifstats *record = slot->record;
+
+		if (rx) {
+			rx->bytes = be64_to_cpu(record->rxstats.bytes);
+			rx->packets = be32_to_cpu(record->rxstats.pkts);
+		}
+		if (tx) {
+			tx->bytes = be64_to_cpu(record->txstats.bytes);
+			tx->packets = be32_to_cpu(record->txstats.pkts);
+		}
+	}
 }
 #endif
 

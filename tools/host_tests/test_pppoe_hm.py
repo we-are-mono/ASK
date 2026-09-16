@@ -51,7 +51,8 @@ def test_pppoe_hm(tmp_path):
         + declaration(header, "en_ehash_insert_pppoe_hdr")
         + declaration(header, "en_ehash_strip_pppoe_hdr"))
     (tmp_path / "pppoe_hm.inc").write_text(
-        function(ehash, "create_pppoe_ins_hm")
+        function(ehash, "pppoe_stats_pointer")
+        + function(ehash, "create_pppoe_ins_hm")
         + function(ehash, "insert_remove_pppoe_hm")
         + function(ehash, "apply_l2_encap")
         + display(header, "display_pppoehdr_insert_opc")

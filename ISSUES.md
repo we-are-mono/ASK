@@ -152,6 +152,28 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A142 — the interface-statistics offset field is too narrow for its own
+  pool.** `cdx_init_stats` carves one MURAM region as 4 `cdx_pppoe_iface_ifinfo`
+  followed by 124 `cdx_iface_ifinfo`, but the two pools index it with different
+  divisors: timestamped records divide by `sizeof(en_ehash_stats_with_ts)` (24)
+  and plain ones by `sizeof(en_ehash_stats)` (16), measured from the same base.
+  Plain indices therefore run 12..259 while every consumer field that carries
+  one — `vlan_stats_offsets[]`, `pppoe_stats_offset`, `ether_stats_offset` in
+  `struct dpa_l2hdr_info` — is `uint8_t`. The last two plain records (122 and
+  123) yield 256..259, which truncate to 0..3: indices inside the *timestamped*
+  pool. A VLAN, tunnel or Ethernet interface allocated that late would have the
+  microcode's counter update land on a PPPoE session's record. Reaching it needs
+  roughly 123 registered logical interfaces, which is why it has never been
+  seen, and the flowtable owner cannot reach it at all — `ifstats_slot_index`
+  refuses an out-of-range index rather than truncating, and
+  `tools/host_tests/ifstats.c` pins the record where aliasing starts.
+  Second symptom, same cause: `STATS_WITH_TS` is `1 << 7`, so every plain index
+  from 128 up (record 58 onward) carries it without meaning it. Nothing masks a
+  plain index today, but item 9's per-VLAN read-back must not use the bit to
+  tell the pools apart. Fixing it means widening the fields, or numbering both
+  pools in the same units, and touches the legacy encoder — not the flowtable
+  path.
+
 - [ ] **A140.** A retiring flow clears `IPS_OFFLOAD` on a conntrack a newer
   flow already owns, and the conntrack then dies under the live flow. Root
   caused 2026-09-16 with temporary diagnostic printks at the offload

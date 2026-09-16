@@ -87,7 +87,10 @@ struct ipv6hdr { u8 prefix[8]; struct in6_addr saddr, daddr; };
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define GFP_KERNEL 0
 #define HZ 100
-#define WARN_ON_ONCE(x) (x)
+/* A warn that fires is a bug the kernel would only log; here it fails the run,
+ * which is what an invariant stated with WARN_ON_ONCE deserves from a test.
+ * Still yields its value: production code branches on some of them. */
+#define WARN_ON_ONCE(x) ({ int warned_ = !!(x); assert(!warned_); warned_; })
 #define pr_err(...) ((void)0)
 #define pr_info(...) ((void)0)
 #define pr_err_ratelimited(...) ((void)0)
@@ -485,6 +488,7 @@ static u32 ft_hash_seed;
 static LIST_HEAD(ft_neigh_entries);
 static bool ft_watch_lock;
 static LIST_HEAD(ft_block_list);
+static LIST_HEAD(ft_session_stats);
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
@@ -518,6 +522,62 @@ static void down_write(bool *lock)
 { assert(!cdx_info->ctrl.mutex && !*lock && !block_write_lock); *lock = true; block_write_lock = lock; }
 static void up_write(bool *lock)
 { assert(!cdx_info->ctrl.mutex && *lock && block_write_lock == lock); *lock = false; block_write_lock = NULL; }
+/* The firmware's statistics pool, at its real depth: four timestamped records,
+ * each a receive and a transmit half. Indices are what the header
+ * manipulations carry, and index zero is never a valid one -- STATS_WITH_TS is
+ * always set on a timestamped record -- which is what lets zero mean "no
+ * record" everywhere one is passed on. */
+#define STATS_WITH_TS 0x80
+#define STATS_TIMESTAMPED_SLOTS 4
+struct cdx_ft_stats_slot { unsigned index; enum cdx_ft_stats_kind kind; u8 rx_index, tx_index;
+                           struct cdx_ft_stats rx, tx; };
+static struct cdx_ft_stats_slot stats_pool[STATS_TIMESTAMPED_SLOTS];
+static bool stats_taken[STATS_TIMESTAMPED_SLOTS];
+static unsigned stats_allocations, stats_frees;
+static int stats_alloc_fail;
+static int cdx_ft_stats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **slot)
+{
+    assert(cdx_info->ctrl.mutex);
+    *slot = NULL;
+    if (stats_alloc_fail) return stats_alloc_fail;
+    for (unsigned i = 0; i < STATS_TIMESTAMPED_SLOTS; i++) {
+        if (stats_taken[i]) continue;
+        stats_taken[i] = true;
+        stats_pool[i] = (struct cdx_ft_stats_slot){
+            .index = i, .kind = kind,
+            .rx_index = (u8)((i * 2) | STATS_WITH_TS),
+            .tx_index = (u8)((i * 2 + 1) | STATS_WITH_TS) };
+        stats_allocations++;
+        *slot = &stats_pool[i];
+        return 0;
+    }
+    return -ENOSPC;
+}
+static void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot)
+{
+    assert(cdx_info->ctrl.mutex);
+    if (!*slot) return;
+    assert(stats_taken[(*slot)->index]);
+    stats_taken[(*slot)->index] = false;
+    stats_frees++;
+    *slot = NULL;
+}
+static void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
+                              struct cdx_ft_stats *rx, struct cdx_ft_stats *tx)
+{
+    assert(cdx_info->ctrl.mutex);
+    if (rx) *rx = (struct cdx_ft_stats){};
+    if (tx) *tx = (struct cdx_ft_stats){};
+    if (!slot) return;
+    if (rx) *rx = slot->rx;
+    if (tx) *tx = slot->tx;
+}
+static unsigned stats_in_use(void)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < STATS_TIMESTAMPED_SLOTS; i++) n += stats_taken[i];
+    return n;
+}
 static int cdx_ft_admission_begin(void) { return rtnl_trylock() ? 0 : -EAGAIN; }
 static void cdx_ft_admission_end(void) { rtnl_unlock(); }
 static bool cdx_ft_failed(void) { return ft_fatal; }
@@ -605,8 +665,19 @@ static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_bloc
     assert(block_write_lock && *block_write_lock);
     list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
 }
-static int cdx_ft_add(const struct cdx_ft_rule *r, struct cdx_ft_hw **hw)
+/* What the encoder would write into the two PPPoE opcodes, recorded so a test
+ * can require the index rather than the slot pointer: a direction that strips
+ * counts into its session's receive half, one that inserts into the transmit
+ * half of its own, and a session with no record leaves zero. */
+static u8 observed_in_stats, observed_out_stats;
+static int cdx_ft_add(const struct cdx_ft_rule *r,
+                      const struct cdx_ft_stats_binding *stats, struct cdx_ft_hw **hw)
 {
+    assert(stats);
+    assert(!stats->in_session || r->in_session.present);
+    assert(!stats->out_session || r->out_session.present);
+    observed_in_stats = stats->in_session ? stats->in_session->rx_index : 0;
+    observed_out_stats = stats->out_session ? stats->out_session->tx_index : 0;
     if (hardware_fail) return -EIO;
     *hw = calloc(1, sizeof(**hw)); assert(*hw); live_hw++;
     (*hw)->stats.lastused = (u32)jiffies;
@@ -1967,8 +2038,11 @@ static void test_pppoe(void)
     /* An ingress session must not be given a pop the kernel never emits. */
     PPPOE_IN_REJECT(encap_actions(1, NULL, 0));
 
-    /* IPv6 over a session is excluded: the insert opcode carries no PPP
-     * protocol id, so nothing establishes that the firmware writes 0x0057. */
+    /* IPv6 over a session, which the firmware carries: the insert opcode
+     * names no PPP protocol id, so the ucode picks one, and it picks the
+     * IPv6 one -- measured on hardware at line rate with the peer parsing
+     * every frame. Nothing about the family reaches this decode, which is
+     * the point: the session is described identically either way. */
     fixture6();
     route6.dst.dev = &ppp;
     egress_session = (struct nf_flow_session){ .lower_ifindex = out.ifindex,
@@ -1976,7 +2050,22 @@ static void test_pppoe(void)
     memcpy(egress_session.h_dest, AC_MAC, ETH_ALEN);
     zero_ethernet_dest();
     session_push(SESSION_ID);
-    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.family == AF_INET6 && decoded.out_session.present);
+    assert(decoded.out_session.id == SESSION_ID);
+    assert(!memcmp(decoded.dst_mac, AC_MAC, ETH_ALEN));
+    assert(!decoded.in_session.present);
+    /* And the other way round, where the rule describes the session with
+     * nothing at all and only the devices say it is there. */
+    fixture6();
+    reverse_route6.dst.dev = &in_ppp;
+    ingress_session = (struct nf_flow_session){ .lower_ifindex = in.ifindex,
+                                                .id = SESSION_ID + 1 };
+    memcpy(ingress_session.h_dest, AC_MAC, ETH_ALEN);
+    assert(rule.action.num_entries == 5);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.family == AF_INET6 && decoded.in_session.present);
+    assert(decoded.in_session.id == SESSION_ID + 1 && !decoded.out_session.present);
 
     /* Lifecycle. A session direction holds no neighbour, so it has to reach
      * the watch list by another route -- and a device event has to find it
@@ -1985,7 +2074,13 @@ static void test_pppoe(void)
      * with nothing to release. */
     pppoe_out_fixture();
     u64 links = ft_link_invalidations;
+    /* Admission and removal run inside the backend transaction the rule
+     * callback holds, which is also what serializes the session statistics
+     * records a session direction claims. ft_retire_workfn takes it itself,
+     * so it stays outside. */
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
     assert(!ft_neighbour_refs && ppp.refs == 1 && out.refs == 1);
     assert(ft_neigh_entries.next != &ft_neigh_entries);
     ft_device_retire(&ppp, &ft_link_invalidations);
@@ -1997,6 +2092,7 @@ static void test_pppoe(void)
     /* Statistics on a session direction must not reach for a neighbour that
      * is not there, and must not report the flow as unused. */
     pppoe_out_fixture();
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
     struct cdx_ft_entry *entry = ft_find(&binding, cls.cookie);
     assert(entry && !entry->neigh);
@@ -2004,7 +2100,238 @@ static void test_pppoe(void)
     assert(ft_stats(entry, &cls) == 0);
     cls.command = FLOW_CLS_REPLACE;
     assert(ft_remove(entry) == 0 && !ft_count);
+    cdx_ft_end();
     assert(!ppp.refs && !out.refs && !allocated);
+}
+
+/* One more flow over a named session, on top of a fixture already laid out.
+ * Mutates only what varies, because re-running a fixture while an entry is
+ * live trips its own assertions. Every guard other than the one a case is
+ * about is made to agree: the push carries the same id the session record
+ * does, so a case that expects a refusal gets it from the guard it names
+ * rather than from the action cross-check. */
+static void session_rule(unsigned long cookie, u16 sport, u16 sid, int lower_ifindex)
+{
+    cls.cookie = cookie;
+    cls.stats = (struct flow_stats){0};
+    pk.src = htons(sport);
+    egress_session.id = sid;
+    egress_session.lower_ifindex = lower_ifindex;
+    rule.action.entries[4].pppoe.sid = sid;
+}
+
+static struct cdx_ft_session_stats *only_record(void)
+{
+    assert(ft_session_stats.next != &ft_session_stats);
+    assert(ft_session_stats.next->next == &ft_session_stats);
+    return list_entry(ft_session_stats.next, struct cdx_ft_session_stats, list);
+}
+
+static unsigned record_count(void)
+{
+    struct cdx_ft_session_stats *record;
+    unsigned n = 0;
+
+    list_for_each_entry(record, &ft_session_stats, list) n++;
+    return n;
+}
+
+/* Interface-level counters for a session: one record per session rather than
+ * per flow or per direction, claimed when the first direction naming it is
+ * admitted and returned when the last retires. The firmware pool is four
+ * records deep and shared with the legacy owner, so running out is an expected
+ * outcome and not a failure -- the flow installs and forwards, and the record
+ * says it is counting nowhere so the degradation can be seen.
+ *
+ * Admission and removal run inside the backend transaction the rule callback
+ * holds, which is what serializes the record list as well; the fixtures do not
+ * touch it, so it is held across the whole of this.
+ */
+static void test_pppoe_stats(void)
+{
+    struct cdx_ft_entry *first, *second;
+    struct cdx_ft_stats rx, tx;
+    unsigned allocations, frees;
+
+    cdx_ft_begin();
+    assert(!stats_in_use() && record_count() == 0);
+    allocations = stats_allocations;
+
+    /* First admission of a session claims a record, and the index the encoder
+     * was handed is the transmit half of that record -- never zero, which is
+     * the index of somebody else's. */
+    pppoe_out_fixture();
+    session_rule(1, 10000, 0x1234, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(stats_in_use() == 1 && stats_allocations == allocations + 1);
+    first = ft_find(&binding, 1);
+    assert(first && first->out_stats && !first->in_stats);
+    assert(first->out_stats->refs == 1 && first->out_stats->slot);
+    assert(observed_out_stats == first->out_stats->slot->tx_index);
+    assert(observed_out_stats && !observed_in_stats);
+    assert(record_count() == 1);
+
+    /* Read-back. A fresh record has counted nothing; what the firmware puts
+     * there is reported per half; and a session with no record reads as
+     * zeroes rather than as an error, which is what it has to show. */
+    cdx_ft_stats_read(first->out_stats->slot, &rx, &tx);
+    assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
+    first->out_stats->slot->tx = (struct cdx_ft_stats){ .bytes = 4096, .packets = 32 };
+    cdx_ft_stats_read(first->out_stats->slot, &rx, &tx);
+    assert(tx.packets == 32 && tx.bytes == 4096 && !rx.packets && !rx.bytes);
+    cdx_ft_stats_read(NULL, &rx, &tx);
+    assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
+
+    /* A second connection over the same session shares that record: one slot,
+     * two references. The identity decides, so a flow differing only in its
+     * ports finds the record the first one created. */
+    session_rule(2, 10001, 0x1234, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 2);
+    second = ft_find(&binding, 2);
+    assert(second && second->out_stats == first->out_stats);
+    assert(first->out_stats->refs == 2);
+    assert(stats_in_use() == 1 && record_count() == 1);
+
+    /* The record returns only when the last reference does. */
+    frees = stats_frees;
+    assert(ft_remove(first) == 0 && ft_count == 1);
+    assert(stats_in_use() == 1 && stats_frees == frees && record_count() == 1);
+    assert(second->out_stats->refs == 1);
+    assert(ft_remove(second) == 0 && !ft_count);
+    assert(!stats_in_use() && stats_frees == frees + 1 && record_count() == 0);
+
+    /* The same id reached through a different concentrator is a different
+     * session and takes a record of its own: an id is allocated per
+     * concentrator, so it identifies nothing on its own. */
+    pppoe_out_fixture();
+    session_rule(5, 10004, 0x1234, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0);
+    session_rule(6, 10005, 0x1234, out.ifindex);
+    egress_session.h_dest[5]++;
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 2);
+    assert(record_count() == 2 && stats_in_use() == 2);
+    assert(ft_find(&binding, 5)->out_stats != ft_find(&binding, 6)->out_stats);
+    assert(ft_remove(ft_find(&binding, 5)) == 0);
+    assert(ft_remove(ft_find(&binding, 6)) == 0 && !ft_count);
+    assert(!stats_in_use() && record_count() == 0);
+
+    /* All three parts of the identity, including the device -- which
+     * admission alone cannot vary here, because a lower device that is not
+     * the port itself brings a tag with it and a different rule. */
+    {
+        struct cdx_ft_session key = { .present = true, .id = 7, .lower_ifindex = 11 };
+        struct cdx_ft_session other;
+        struct cdx_ft_session_stats *record, *found;
+
+        memcpy(key.mac, AC_MAC, ETH_ALEN);
+        record = ft_session_stats_get(&key);
+        assert(record && record_count() == 1 && record->refs == 1);
+        other = key;
+        found = ft_session_stats_get(&other);
+        assert(found == record && record->refs == 2);
+        ft_session_stats_put(&found);
+        for (unsigned part = 0; part < 3; part++) {
+            other = key;
+            if (part == 0) other.id++;
+            else if (part == 1) other.lower_ifindex++;
+            else other.mac[5]++;
+            found = ft_session_stats_get(&other);
+            assert(found && found != record && record_count() == 2);
+            ft_session_stats_put(&found);
+            assert(record_count() == 1);
+        }
+        /* And a direction with no session claims nothing to begin with. */
+        other = (struct cdx_ft_session){};
+        assert(!ft_session_stats_get(&other) && record_count() == 1);
+        ft_session_stats_put(&record);
+        assert(record_count() == 0 && !stats_in_use());
+    }
+
+    /* Exhaustion. Four sessions take the pool; the fifth is admitted and
+     * forwards holding a record with no slot, which the encoder is told by an
+     * index of zero rather than by being handed an index at all. */
+    pppoe_out_fixture();
+    for (unsigned i = 0; i < STATS_TIMESTAMPED_SLOTS; i++) {
+        session_rule(10 + i, (u16)(11000 + i), (u16)(0x2000 + i), out.ifindex);
+        assert(ft_replace(&binding, &cls) == 0);
+        assert(observed_out_stats);
+    }
+    assert(stats_in_use() == STATS_TIMESTAMPED_SLOTS);
+    session_rule(20, 12000, 0x3000, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0);
+    assert(ft_count == STATS_TIMESTAMPED_SLOTS + 1);
+    first = ft_find(&binding, 20);
+    assert(first && first->out_stats && !first->out_stats->slot);
+    assert(!observed_out_stats);
+    /* The record exists and counts references either way, so the session is
+     * reported as one without a slot rather than not reported at all. */
+    assert(record_count() == STATS_TIMESTAMPED_SLOTS + 1);
+    assert(first->out_stats->refs == 1);
+    for (unsigned i = 0; i < STATS_TIMESTAMPED_SLOTS; i++)
+        assert(ft_remove(ft_find(&binding, 10 + i)) == 0);
+    /* Returning four slots does not retrofit one. The answer a session got is
+     * the answer it keeps, so a live connection's counters never begin
+     * halfway through its life. */
+    assert(!stats_in_use() && first->out_stats && !first->out_stats->slot);
+    assert(ft_remove(first) == 0 && !ft_count && record_count() == 0);
+
+    /* And the pool is reusable once returned. */
+    pppoe_out_fixture();
+    session_rule(30, 13000, 0x4000, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0);
+    assert(stats_in_use() == 1 && only_record()->slot);
+    assert(ft_remove(ft_find(&binding, 30)) == 0);
+    assert(!stats_in_use() && record_count() == 0);
+
+    /* An allocation failing for any other reason lands in the same place: the
+     * flow installs, counts nowhere, and holds a record saying so. */
+    stats_alloc_fail = -ENOMEM;
+    session_rule(31, 13001, 0x4001, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && !observed_out_stats);
+    assert(record_count() == 1 && !only_record()->slot);
+    stats_alloc_fail = 0;
+    assert(ft_remove(ft_find(&binding, 31)) == 0);
+    assert(!stats_in_use() && record_count() == 0);
+
+    /* A flow whose hardware installation fails releases its reference with
+     * everything else, rather than stranding one of four records. */
+    session_rule(32, 13002, 0x4002, out.ifindex);
+    hardware_fail = true;
+    assert(ft_replace(&binding, &cls) == -EIO && !ft_count);
+    hardware_fail = false;
+    assert(!stats_in_use() && record_count() == 0);
+
+    /* A record has two halves and the direction decides which one is counted
+     * into: a direction that strips counts received frames, one that inserts
+     * counts transmitted ones. The two halves of a connection therefore
+     * describe the session between them, which is the whole reason the record
+     * belongs to the session rather than to either flow. */
+    cdx_ft_end();
+    pppoe_in_fixture();
+    cdx_ft_begin();
+    /* Not session_rule(): that one names an egress session, and naming one
+     * here would be a session the walk never crosses. The ingress fixture has
+     * already described this direction's. */
+    cls.cookie = 40;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    first = ft_find(&binding, 40);
+    assert(first && first->in_stats && !first->out_stats);
+    assert(first->in_stats->slot && first->in_stats->refs == 1);
+    assert(observed_in_stats == first->in_stats->slot->rx_index && !observed_out_stats);
+    assert(first->in_stats->slot->rx_index != first->in_stats->slot->tx_index);
+    assert(ft_remove(first) == 0 && !ft_count);
+    assert(!stats_in_use() && record_count() == 0);
+
+    /* A flow with no session claims nothing at all. */
+    cdx_ft_end();
+    fixture();
+    cdx_ft_begin();
+    assert(ft_replace(&binding, &cls) == 0);
+    assert(!stats_in_use() && record_count() == 0);
+    assert(!observed_in_stats && !observed_out_stats);
+    assert(ft_remove(ft_find(&binding, cls.cookie)) == 0 && !ft_count);
+    cdx_ft_end();
 }
 
 static void snat_fixture(bool forward, bool tcp)
@@ -3203,6 +3530,7 @@ int main(void)
     test_bridge();
     test_bridge_fdb();
     test_pppoe();
+    test_pppoe_stats();
     test_snat();
     test_dnat();
     test_double_nat();

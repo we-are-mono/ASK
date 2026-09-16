@@ -39,11 +39,24 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Partial — `FLOW_OFFLOAD_XMIT_XFRM` | High | The xmit type exists, but SA handling, rekey and ESN live entirely in CDX. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | The flowtable is unicast-conntrack by construction. Needs a parallel replication path rather than a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
-| 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow counters exist. Treat carefully: the stats path is where A140 lived. Now also owes the per-VLAN-interface and per-session counters, see below. |
+| 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
 | 11 | Wi-Fi (`module_wifi`, `dpa_wifi`) | 345 | 3 | No | High | Needs driver-side `dev_fill_forward_path` support that does not exist. |
 | 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
-| 13 | MACVLAN (`module_macvlan`) | 202 | 2 | Partial — path type exists | Low | Did not fall out of the VLAN and bridge work: the device walk declines it as its own path type. Needs an arm of its own. |
+
+## Out of scope
+
+**MACVLAN (`module_macvlan`, 202 lines) is not a retirement blocker, because
+CMM never offloaded it.** `FC_MACVLAN`, `CMD_MACVLAN_ENTRY` and
+`CMD_MACVLAN_ENTRY_RESET` are declared in `cdx/cdx_cmdhandler.h` and dispatched
+from nowhere in `cdx/`, so the `FPP_CMD_MACVLAN_ENTRY` that
+`cmm/src/module_macvlan.c` sends returns `ERR_UNKNOWN_COMMAND`. The 202 lines
+are sender-side code for a command the hardware layer does not implement, and
+there is no capability here to replace.
+
+`ISSUES.md` A38 deferred it on 2026-09-11 and the reasoning stands unchanged;
+the product owner has since confirmed there is no MACVLAN use case. A38 remains
+open as the record of that deferral.
 
 ## IPv6, delivered
 
@@ -78,13 +91,14 @@ widened rather than replaced.
 
 One capability does not come across: **per-VLAN-interface byte counters**. CMM
 maintains them in the microcode's logical statistics area and returns them
-through an FCI query. This ownership mode loads no FCI, and the microcode
-needs an interface index to allocate the counters against, which only a
-registered VLAN interface has. Both halves belong to item 9, which has to
-cover physical ports, VLANs, PPPoE sessions and per-flow read-back in one
-design rather than grow a VLAN-shaped allocator here. Until it lands, the
-flowtable path reports per-flow counters and the physical ports' own MAC
-counters, and nothing per-VLAN or per-session.
+through an FCI query. This ownership mode loads no FCI, and the microcode needs
+an interface index to allocate the counters against, which only a registered
+VLAN interface has. Deferring it to item 9 was the right call rather than
+growing a VLAN-shaped allocator here: the PPPoE increment then needed the same
+mechanism and built a general one, so what remains for a VLAN is asking it for
+a record and reading it back. Until that lands the flowtable path reports
+per-flow counters, the physical ports' own MAC counters and a PPPoE session's
+own records, and nothing per-VLAN.
 
 ## Bridge, delivered
 
@@ -110,9 +124,10 @@ reports on too. That is the fifth dependency class, alongside route,
 neighbour, netdev and nexthop, and the first one where upstream's own
 behaviour was the thing being corrected rather than followed.
 
-Item 13 (MACVLAN) did **not** fall out of this work as expected. A MACVLAN is
-neither an 802.1Q VLAN nor a bridge master, so the widened walk still declines
-it; it needs its own arm and its own eligibility rules.
+A MACVLAN did **not** fall out of this work, and that is correct rather than a
+gap. It is neither an 802.1Q VLAN nor a bridge master, so the widened walk
+declines it as its own path type — which is the right answer for a device
+CMM never offloaded either; see the out-of-scope entry above.
 
 ## PPPoE, delivered
 
@@ -154,12 +169,43 @@ table untouched. Worth carrying into any later increment whose path type has a
 route of its own: the route watch gets there first, and the coarser netdev
 escalation is a backstop rather than the mechanism.
 
-One capability does not come across, and it is the same one VLAN left behind:
-**per-session byte counters**, which CMM keeps in the microcode's logical
-statistics area against a registered PPPoE interface. Item 9 owes them
-alongside the per-VLAN ones. The residual gap that is PPPoE's own is a session
-renegotiated under a `pppN` device that never disappears; the failure mode is
-loss rather than misdelivery, and no exported interface reports it.
+**The third finding is that the interface-statistics allocator is now general,
+which changes what item 9 is.** Per-session byte counters were the capability
+VLAN left behind and PPPoE was going to leave behind too. They came across
+instead, because what was missing turned out to be ownership rather than a
+mechanism: the microcode's records exist, they are indexed rather than named by
+an interface, and only the allocator's interface was interface-shaped. It now
+names the shape of the record — `CDX_FT_STATS_TIMESTAMPED` for the timestamped
+records a session's opcodes read, `CDX_FT_STATS_PLAIN` for the ones a VLAN's
+would — so **a VLAN asks for a slot with the same call a session does**. What
+item 9 still owes for interface statistics is therefore per-VLAN and per-port
+*read-back*, not an allocator: something to ask for a slot on a tagged flow's
+behalf and somewhere to report it, both of which a session already demonstrates
+in `/proc/cdx_flowtable`.
+
+Two caveats belong with it. The pool is four timestamped records deep and
+shared with the legacy owner, so exhaustion is an ordinary outcome rather than
+a fault — a fifth session forwards without counters and says so — and widening
+it means moving a MURAM carve both owners allocate from. And the plain pool has
+more records than the eight-bit index fields can name, so its usable depth is
+122 of 124; the allocator refuses the rest rather than truncating, which the
+legacy path does silently.
+
+The residual gap that is PPPoE's own is a session renegotiated under a `pppN`
+device that never disappears; the failure mode is loss rather than
+misdelivery, and no exported interface reports it.
+
+**And IPv6 through a session is carried, which an earlier revision of this
+document said was excluded.** The insert opcode names no PPP protocol id, so
+the microcode chooses one, and the exclusion stood on nobody having shown which
+it chooses for a v6 frame. Measured: CMM offloads IPv6 through a PPPoE session
+on this bench at 8.95 Gb/s forward and 9.20 Gb/s reverse at roughly 2% DUT CPU,
+with its `v6connections` table holding all five connections mid-transfer and
+its `pppoe` table registering the session, and iperf3 completing cleanly — so
+the peer parsed every frame. CMM reaches the opcode through the same
+`create_pppoe_ins_hm()` and the same `INSERT_PPPoE_HDR`. The general lesson is
+the first finding's again: a capability was scoped out on a reading rather than
+a measurement, and the measurement disagreed.
 
 ## Parity measurements
 
@@ -264,18 +310,21 @@ measurement before the retirement claim can be made for them.
 
 ## Sequencing
 
-**Item 13 is the natural next increment**, and the last of the shape that has
-worked five times now: Linux supplies the mechanism, so it is an arm of the
-device walk plus an eligibility contract with its own focused proof, as NAT,
-IPv6, VLAN, bridge and PPPoE each were. It is not expected to fall out of
-another increment — a MACVLAN is its own path type and the walk declines it.
-PPPoE is the one to model it on rather than VLAN: a MACVLAN, like a session,
-may need something carrying over from the kernel's own path walk that a device
-walk cannot re-derive.
+**The device-walk family of increments is complete.** NAT, IPv6, VLAN, bridge
+and PPPoE were all the same shape — Linux supplies the mechanism, so each was
+an arm of the device walk plus an eligibility contract with its own focused
+proof — and nothing remaining has that shape. MACVLAN was the last candidate
+and it is out of scope, above, so the next increment is a change of kind rather
+than another one of these.
 
 **Items 5 to 8 need feature-specific contracts.** Each expresses behaviour a
 unicast flowtable tuple cannot carry, and each needs its own hardware
 eligibility rules before any code.
+
+**Item 9 needs read-back rather than a mechanism.** The allocator that hands
+out firmware statistics records is general and a session already uses it; what
+is left is asking for a record on a VLAN's and a port's behalf and reporting
+what it holds.
 
 **Items 10, 11 and 12 need a scoping decision first.** RTP relay and Wi-Fi
 offload have no Linux counterpart at all, so the question is whether the

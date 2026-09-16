@@ -198,7 +198,9 @@ bool cdx_ft_port_supported(struct net_device *dev)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_port_supported, ASK_CDX_FLOWTABLE);
 
-int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
+int cdx_ft_add(const struct cdx_ft_rule *rule,
+	       const struct cdx_ft_stats_binding *stats,
+	       struct cdx_ft_hw **result)
 {
 	int rc;
 
@@ -211,12 +213,40 @@ int cdx_ft_add(const struct cdx_ft_rule *rule, struct cdx_ft_hw **result)
 	    !cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out) ||
 	    !ether_addr_equal(rule->src_mac, rule->out->dev_addr))
 		return -EOPNOTSUPP;
-	rc = cdx_ft_hw_add(rule, result);
+	rc = cdx_ft_hw_add(rule, stats, result);
 	if (!rc)
 		ft_live++;
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_add, ASK_CDX_FLOWTABLE);
+
+/* Ownership, not encoding: a statistics slot is claimed and returned by the
+ * adapter's own policy, so these are transaction-scoped like every other
+ * backend operation but need no hardware state of their own. */
+int cdx_ft_stats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **slot)
+{
+	cdx_ft_assert_held();
+	*slot = NULL;
+	if (!ft_claimed || ft_failed)
+		return -EOPNOTSUPP;
+	return cdx_ft_ifstats_alloc(kind, slot);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_alloc, ASK_CDX_FLOWTABLE);
+
+void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot)
+{
+	cdx_ft_assert_held();
+	cdx_ft_ifstats_free(slot);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_free, ASK_CDX_FLOWTABLE);
+
+void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
+		       struct cdx_ft_stats *rx, struct cdx_ft_stats *tx)
+{
+	cdx_ft_assert_held();
+	cdx_ft_ifstats_read(slot, rx, tx);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_read, ASK_CDX_FLOWTABLE);
 
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 {

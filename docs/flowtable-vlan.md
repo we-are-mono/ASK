@@ -144,7 +144,9 @@ directions share a handle.
 Per-VLAN-interface byte counters. CMM maintains them in the microcode's
 logical statistics area and returns them through an FCI query; this ownership
 mode loads no FCI, and the counters would need an interface index to be
-allocated against. Interface statistics are their own retirement item, and
-they need one design covering physical ports, VLANs and per-flow read-back
-rather than a VLAN-shaped allocator here. Recorded against item 9 in the
+allocated against. Deferring that to item 9 rather than growing a VLAN-shaped
+allocator here is what made it cheap when PPPoE needed the same thing: the
+allocator built for a session names the shape of the record rather than the
+feature, so a VLAN asks for one with the same call. What is still missing for
+a tagged flow is asking and reading back. Recorded against item 9 in the
 [retirement roadmap](flowtable-cmm-porting-roadmap.md).

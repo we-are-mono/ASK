@@ -45,7 +45,13 @@ struct cdx_l2_encap {
     u8 egress_pppoe;
     u16 egress_session_id;
     u8 egress_session_mac[ETHER_ADDR_LEN];
+    /* Where each side counts. Zero means no record, never record zero. */
+    u8 ingress_stats_index;
+    u8 egress_stats_index;
 };
+/* The slot as CDX defines it. The encoder reads only the two indices, which
+ * is the whole of what it needs from one. */
+struct cdx_ft_stats_slot { void *record; int kind; u8 rx_index, tx_index; };
 union nf_inet_addr {
     u32 all[4];
     __be32 ip;
@@ -264,6 +270,37 @@ static int dpa_cfg_quiesce(void)
 }
 #include "physical_production.inc"
 #include "hardware_types.inc"
+/* The free-list half of the statistics API lives in cdx_ifstats.c, beside the
+ * lists it draws from; what the backend adds is the ownership check, so that
+ * is what is exercised here and the pool itself is simulated. */
+static struct cdx_ft_stats_slot ifstats_slot = { .rx_index = 0x80, .tx_index = 0x81 };
+static bool ifstats_taken;
+static int ifstats_alloc_error;
+static unsigned ifstats_reads;
+static int cdx_ft_ifstats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **slot)
+{
+    *slot = NULL;
+    if (ifstats_alloc_error) return ifstats_alloc_error;
+    if (ifstats_taken) return -ENOSPC;
+    ifstats_taken = true;
+    ifstats_slot.kind = kind;
+    *slot = &ifstats_slot;
+    return 0;
+}
+static void cdx_ft_ifstats_free(struct cdx_ft_stats_slot **slot)
+{
+    if (!*slot) return;
+    assert(*slot == &ifstats_slot && ifstats_taken);
+    ifstats_taken = false;
+    *slot = NULL;
+}
+static void cdx_ft_ifstats_read(const struct cdx_ft_stats_slot *slot,
+                                struct cdx_ft_stats *rx, struct cdx_ft_stats *tx)
+{
+    ifstats_reads++;
+    if (rx) *rx = (struct cdx_ft_stats){ .bytes = slot ? 4096 : 0 };
+    if (tx) *tx = (struct cdx_ft_stats){ .bytes = slot ? 8192 : 0 };
+}
 #include "hardware_production.inc"
 #include "backend_production.inc"
 
@@ -279,6 +316,10 @@ static void test_backend(void)
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     struct cdx_ft_hw *hw = NULL;
+    /* No session by default, so every case that is not about statistics
+     * passes a binding naming none -- which is what the encoder then has to
+     * turn into an index of zero rather than an index at all. */
+    struct cdx_ft_stats_binding stats = {};
     expected_proto = IPPROTO_UDP;
     cdx_info->ctrl.mutex = false;
     assert(!cdx_flowtable_enabled() && !cdx_flowtable_config_sealed());
@@ -295,12 +336,45 @@ static void test_backend(void)
     assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
     offload_owner="cmm";
     cdx_ft_begin();
+    /* A statistics slot is backend-owned like anything else it hands out, so
+     * it is refused before the claim. Freeing nothing is always a no-op,
+     * which is what every error path relies on. */
+    {
+        struct cdx_ft_stats_slot *slot = (void *)1;
+
+        assert(cdx_ft_stats_alloc(CDX_FT_STATS_TIMESTAMPED, &slot) == -EOPNOTSUPP && !slot);
+        cdx_ft_stats_free(&slot);
+        assert(!ifstats_taken);
+    }
     assert(cdx_ft_claim() == -EOPNOTSUPP && !cdx_flowtable_config_sealed());
     offload_owner="flowtable";
     assert(cdx_flowtable_mode_check() == 0 && !cdx_ft_observing());
     legacy_pending=1; assert(cdx_ft_claim() == -EBUSY); legacy_pending=0;
     assert(cdx_ft_claim() == 0 && cdx_flowtable_config_sealed());
     assert(cdx_ft_claim() == -EBUSY);
+    /* The pool itself, through the backend's ownership check: one record at a
+     * time here, a kind that reaches the free lists unchanged, a read that
+     * reports each half, and a free that returns it. */
+    {
+        struct cdx_ft_stats_slot *slot = NULL, *second = NULL;
+        struct cdx_ft_stats rx, tx;
+        unsigned reads = ifstats_reads;
+
+        assert(cdx_ft_stats_alloc(CDX_FT_STATS_TIMESTAMPED, &slot) == 0 && slot);
+        assert(slot->kind == CDX_FT_STATS_TIMESTAMPED);
+        assert(cdx_ft_stats_alloc(CDX_FT_STATS_TIMESTAMPED, &second) == -ENOSPC && !second);
+        cdx_ft_stats_read(slot, &rx, &tx);
+        assert(ifstats_reads == reads + 1 && rx.bytes == 4096 && tx.bytes == 8192);
+        cdx_ft_stats_free(&slot);
+        assert(!slot && !ifstats_taken);
+        assert(cdx_ft_stats_alloc(CDX_FT_STATS_PLAIN, &slot) == 0 &&
+               slot->kind == CDX_FT_STATS_PLAIN);
+        cdx_ft_stats_free(&slot);
+        cdx_ft_stats_free(&slot);
+        ifstats_alloc_error = -ENOMEM;
+        assert(cdx_ft_stats_alloc(CDX_FT_STATS_TIMESTAMPED, &slot) == -ENOMEM && !slot);
+        ifstats_alloc_error = 0;
+    }
     rtnl_busy=true; assert(cdx_ft_admission_begin() == -EAGAIN && !rtnl && cdx_info->ctrl.mutex);
     rtnl_busy=false; assert(cdx_ft_admission_begin() == 0);
     assert(cdx_ft_port_supported(&in) && cdx_ft_port_supported(&out));
@@ -317,7 +391,7 @@ static void test_backend(void)
     out.carrier=false; assert(!cdx_ft_port_supported(&out)); out.carrier=true;
     out.running=false; assert(!cdx_ft_port_supported(&out)); out.running=true;
     out.dev_addr[5]=1; assert(cdx_ft_port_supported(&out));
-    assert(cdx_ft_add(&rule,&hw)==-EOPNOTSUPP && !hw); out.dev_addr[5]=0;
+    assert(cdx_ft_add(&rule,&stats,&hw)==-EOPNOTSUPP && !hw); out.dev_addr[5]=0;
     out.reg_state=0; assert(!cdx_ft_port_supported(&out)); out.reg_state=NETREG_REGISTERED;
     out.type=0; assert(!cdx_ft_port_supported(&out)); out.type=ARPHRD_ETHER;
     out.addr_len=0; assert(!cdx_ft_port_supported(&out)); out.addr_len=ETH_ALEN;
@@ -327,7 +401,7 @@ static void test_backend(void)
     out_onif.flags=0; assert(!cdx_ft_port_supported(&out)); out_onif.flags=ENTRY_VALID;
     out_iface.itf_id=L2_MAX_ONIF; assert(!cdx_ft_port_supported(&out)); out_iface.itf_id=2;
     out_iface.eth_info.net_dev=&in; assert(!cdx_ft_port_supported(&out)); out_iface.eth_info.net_dev=&out;
-    ft_observe=true; assert(cdx_ft_add(&rule,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
+    ft_observe=true; assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
     /* Exercise same-port translation through the provider's real admission
      * entry point as well as the lower encoder and adapter decoder. */
     rule.out = &in; expected_hairpin = true;
@@ -335,13 +409,13 @@ static void test_backend(void)
     rule.new_dst = expected_dst = v4(htonl(0xcb007105));
     rule.new_sport = expected_sport = htons(40000);
     rule.new_dport = expected_dport = htons(30000);
-    assert(cdx_ft_add(&rule,&hw) == 0 && ft_live == 1);
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && ft_live == 1);
     assert(cdx_ft_del(&hw) == 0 && !hw && !ft_live && !allocations);
     rule.out = &out; expected_hairpin = false;
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
-    fail_insert=true; assert(cdx_ft_add(&rule,&hw) == -EIO && !ft_live); fail_insert=false;
-    assert(cdx_ft_add(&rule,&hw) == 0 && ft_live == 1);
+    fail_insert=true; assert(cdx_ft_add(&rule,&stats,&hw) == -EIO && !ft_live); fail_insert=false;
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && ft_live == 1);
     assert(cdx_ft_release() == -EBUSY && ft_claimed);
     struct cdx_ft_counters counters;
     cdx_ft_stats(hw,&counters); assert(counters.packets == 99);
@@ -355,7 +429,7 @@ static void test_backend(void)
     fail_sync=false; assert(cdx_ft_recover() == 0 && !key && !cdx_ft_pending());
     assert(cdx_ft_claim() == 0 && cdx_flowtable_config_sealed());
     assert(cdx_ft_admission_begin() == 0);
-    assert(cdx_ft_add(&rule,&hw) == 0);
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0);
     cdx_ft_admission_end();
     delete_result=-EIO;
     assert(cdx_ft_del(&hw) == -EIO && !hw && !ft_live && cdx_ft_failed());
@@ -366,10 +440,19 @@ static void test_backend(void)
     quiesce_fail=false;
     assert(cdx_ft_recover() == 0 && stopped && quiesces == 2 && key->linked);
     assert(!allocations && !cdx_ft_pending() && cdx_ft_failed());
+    /* After a terminal failure nothing new is handed out, statistics
+     * included: the adapter is on its way to a global recovery and a record
+     * claimed now would be one nothing is going to return. */
+    {
+        struct cdx_ft_stats_slot *slot = (void *)1;
+
+        assert(cdx_ft_stats_alloc(CDX_FT_STATS_TIMESTAMPED, &slot) == -EOPNOTSUPP && !slot);
+        assert(!ifstats_taken);
+    }
     assert(cdx_ft_release() == 0 && cdx_flowtable_config_sealed());
     assert(cdx_ft_claim() == -EOPNOTSUPP && cdx_ft_failed());
     assert(cdx_ft_admission_begin() == 0);
-    assert(cdx_ft_add(&rule,&hw) == -EOPNOTSUPP && !hw);
+    assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
     cdx_ft_admission_end();
     cdx_flowtable_quiesced();
     cdx_ft_end();
@@ -402,14 +485,15 @@ int main(void)
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     struct cdx_ft_hw *hw;
     struct cdx_ft_counters counters;
+    struct cdx_ft_stats_binding stats = {};
     in_iface.eth_info.net_dev=&in; out_iface.eth_info.net_dev=&out;
-    fail_alloc = true; assert(cdx_ft_hw_add(&rule,&hw) == -ENOMEM && !hw); fail_alloc=false;
-    fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
-    out_itf.type = 2; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP); out_itf.type=129;
-    rule.proto = IPPROTO_ICMP; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP && !hw);
+    fail_alloc = true; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -ENOMEM && !hw); fail_alloc=false;
+    fail_insert=true; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EIO && !allocations); fail_insert=false;
+    out_itf.type = 2; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP); out_itf.type=129;
+    rule.proto = IPPROTO_ICMP; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
     for(unsigned i=0; i<128; i++) {
         rule.proto = expected_proto = (i & 1) ? IPPROTO_TCP : IPPROTO_UDP;
-        assert(cdx_ft_hw_add(&rule,&hw) == 0);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
         cdx_ft_hw_stats(hw,&counters); assert(counters.packets==99 && counters.bytes==12345 && counters.lastused==321);
         /* No allocation is possible once deletion starts. */
         fail_alloc=true; assert(cdx_ft_hw_del(&hw) == 0 && !hw && !key && !allocations); fail_alloc=false;
@@ -425,9 +509,9 @@ int main(void)
         rule.new_dst = expected_dst = variant == 1 || variant == 5 || variant >= 6 ? v4(htonl(0xcb007104)) : rule.dst;
         rule.new_sport = expected_sport = variant == 2 || variant == 4 || variant >= 6 ? htons(40000) : rule.sport;
         rule.new_dport = expected_dport = variant == 3 || variant == 5 || variant >= 6 ? htons(40000) : rule.dport;
-        assert(cdx_ft_hw_add(&rule,&hw) == 0);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
-        fail_insert=true; assert(cdx_ft_hw_add(&rule,&hw) == -EIO && !allocations); fail_insert=false;
+        fail_insert=true; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EIO && !allocations); fail_insert=false;
     }
     expected_hairpin = false; rule.out = &out;
     /* The same translation matrix one family over. The encoder gates each
@@ -443,11 +527,11 @@ int main(void)
         rule.new_dst = expected_dst = variant == 1 || variant == 5 || variant >= 6 ? v6(0x105) : rule.dst;
         rule.new_sport = expected_sport = variant == 2 || variant == 4 || variant >= 6 ? htons(40000) : rule.sport;
         rule.new_dport = expected_dport = variant == 3 || variant == 5 || variant >= 6 ? htons(40000) : rule.dport;
-        assert(cdx_ft_hw_add(&rule,&hw) == 0);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
         assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
     }
     /* An unrecognised family is refused rather than silently encoded as IPv4. */
-    rule.family = AF_UNSPEC; assert(cdx_ft_hw_add(&rule,&hw) == -EOPNOTSUPP && !hw);
+    rule.family = AF_UNSPEC; assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw);
     expected_family = rule.family = AF_INET;
     rule.src = v4(htonl(0xc0000201)); rule.dst = v4(htonl(0xc6336401));
     rule.proto = expected_proto = IPPROTO_UDP;
@@ -457,7 +541,7 @@ int main(void)
      * because it is normally built by walking a VLAN interface up towards its
      * parent. Getting that reversal wrong swaps a QinQ pair on the wire and
      * nothing else would notice, so it is asserted tag by tag. */
-    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
     assert(!observed_encap_given);
     assert(cdx_ft_hw_del(&hw) == 0);
     rule.in_vlans = 1;
@@ -465,7 +549,7 @@ int main(void)
     rule.out_vlans = 2;
     rule.out_vlan[0] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 100 };
     rule.out_vlan[1] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 300 };
-    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
     assert(observed_encap_given);
     assert(observed_encap.num_ingress == 1 && observed_encap.num_egress == 2);
     assert(observed_encap.ingress[0].tci == 200 && observed_encap.ingress[0].tpid == 0x8100);
@@ -485,18 +569,36 @@ int main(void)
     rule.out_session = (struct cdx_ft_session){ .mac = {2,0xac,0,0,0,1},
                                                 .id = 0x1234, .present = true };
     rule.in_session = (struct cdx_ft_session){ .present = true };
-    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
     assert(observed_encap_given);
     assert(!observed_encap.num_ingress && !observed_encap.num_egress);
     assert(observed_encap.egress_pppoe && observed_encap.ingress_pppoe);
     assert(observed_encap.egress_session_id == 0x1234);
     assert(!memcmp(observed_encap.egress_session_mac, (u8[]){2,0xac,0,0,0,1}, 6));
+    /* A session with no record leaves both indices at zero, which the opcodes
+     * read as no record rather than as record zero. */
+    assert(!observed_encap.ingress_stats_index && !observed_encap.egress_stats_index);
     assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    /* And with one, each direction takes the half its own encapsulation
+     * counts into: a strip counts receives, an insert counts transmits. */
+    stats.in_session = stats.out_session = &ifstats_slot;
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+    assert(observed_encap.ingress_stats_index == ifstats_slot.rx_index);
+    assert(observed_encap.egress_stats_index == ifstats_slot.tx_index);
+    assert(ifstats_slot.rx_index != ifstats_slot.tx_index);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    /* One direction with a record and one without keeps them apart. */
+    stats.in_session = NULL;
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+    assert(!observed_encap.ingress_stats_index);
+    assert(observed_encap.egress_stats_index == ifstats_slot.tx_index);
+    assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    stats.out_session = NULL;
     /* A session inside a tag: both descriptions travel together, and the tag
      * still reverses while the session does not. */
     rule.out_vlans = 1;
     rule.out_vlan[0] = (struct cdx_ft_vlan){ .proto = htons(ETH_P_8021Q), .id = 100 };
-    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
     assert(observed_encap.num_egress == 1 && observed_encap.egress[0].tci == 100);
     assert(observed_encap.egress_pppoe && observed_encap.egress_session_id == 0x1234);
     assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
@@ -504,36 +606,36 @@ int main(void)
     memset(rule.out_vlan, 0, sizeof(rule.out_vlan));
     rule.in_session = rule.out_session = (struct cdx_ft_session){};
     /* And with neither, the override is withheld again. */
-    assert(cdx_ft_hw_add(&rule,&hw) == 0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
     assert(!observed_encap_given);
     assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
-    assert(cdx_ft_hw_add(&rule,&hw)==0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
     delete_result=EN_EHASH_DELETE_UNSYNCED; fail_alloc=true;
     assert(cdx_ft_hw_del(&hw)==-EAGAIN && !hw && key && !key->linked && allocations==2);
     assert(cdx_ft_hw_pending()==1); unsigned old=deletes;
     fail_sync=true; assert(cdx_ft_hw_retry()==-EAGAIN && key && !key->safe && deletes==old);
     fail_sync=false; assert(cdx_ft_hw_retry()==0 && !key && !allocations && deletes==old);
     fail_alloc=false;
-    assert(cdx_ft_hw_add(&rule,&hw)==0); assert(cdx_ft_hw_del(&hw)==-EAGAIN);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw)==0); assert(cdx_ft_hw_del(&hw)==-EAGAIN);
     stopped=true; cdx_ft_hw_quiesced(); stopped=false;
     assert(!key && !allocations && !cdx_ft_hw_pending());
-    assert(cdx_ft_hw_add(&rule,&hw)==0); delete_result=-1;
+    assert(cdx_ft_hw_add(&rule,&stats,&hw)==0); delete_result=-1;
     assert(cdx_ft_hw_del(&hw)==-EIO && key->linked && cdx_ft_hw_pending()==1);
     old=syncs; assert(cdx_ft_hw_retry()==-EAGAIN && syncs==old && key->linked);
     stopped=true; cdx_ft_hw_quiesced(); assert(!allocations && key->linked);
     /* Reset owns the potentially linked allocation, never the retiring owner. */
     free(key); key=NULL;
     stopped=false; delete_result=0;
-    assert(cdx_ft_hw_add(&rule,&hw)==0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
     ft_fail_unlink=true; old=deletes;
     assert(cdx_ft_hw_del(&hw)==-EIO && !hw && !ft_fail_unlink);
     assert(deletes==old && key->linked && cdx_ft_hw_pending()==1);
     old=syncs; assert(cdx_ft_hw_retry()==-EAGAIN && syncs==old && key->linked);
     stopped=true; cdx_ft_hw_quiesced(); assert(!allocations && key->linked);
     free(key); key=NULL; stopped=false;
-    assert(cdx_ft_hw_add(&rule,&hw)==0);
+    assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);
     assert(cdx_ft_hw_del(&hw)==0 && !hw && !key && !allocations);
     test_backend();
     puts("Flowtable hardware: encoding, consuming delete, allocation-free retirement, barrier retry and quiescence passed");
