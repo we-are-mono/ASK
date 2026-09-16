@@ -58,7 +58,7 @@ async def test_flowtable_nat_throughput(rate_path):
         assert (await console_command(con, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
         await console_command(con, "nft", nat)
         try:
-            await apply(con, policy)
+            await apply(con, policy, r=r)
             server = await asyncio.create_subprocess_exec("iperf3", "-s", "-1", "-B", WAN_IP, "-p", str(PORT), "-J",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await asyncio.sleep(0.2)

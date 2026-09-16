@@ -142,7 +142,7 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
         assert (await console_command(con, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
         await console_command(con, "nft", nat)
         try:
-            await apply(con, policy)
+            await apply(con, policy, r=r)
             await console_command(con, "sh", "-c", "echo 3 > /sys/module/ask_flowtable/parameters/flowtable_fail_stage")
             async with peer(r, flows, servers=servers) as p:
                 await warm(r, p, expected)
@@ -172,7 +172,7 @@ async def test_flowtable_hairpin(hairpin, zero_checksum):
                     assert re.findall(r"\bid=\d+", ct_before[proto]) == re.findall(r"\bid=\d+", ct_after[proto]) != []
                 r.record("software", {"crossing": crossing, "transfers": reports, "software_tx": tx,
                                       "state": drained, "ct_before": ct_before, "ct_after": ct_after})
-                await apply(con, policy)
+                await apply(con, policy, r=r)
                 await warm(r, p, expected)
                 await hardware(r, p, expected, "restored-hardware")
                 status = await p.rpc("servers")

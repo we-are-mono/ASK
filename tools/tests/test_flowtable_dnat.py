@@ -151,7 +151,7 @@ async def test_flowtable_dnat(rig, zero_checksum, double_nat=False):
         assert (await console_command(con, "nft", "list", "table", "ip", nat_table, check=False))["rc"] != 0
         await console_command(con, "nft", nat)
         try:
-            await apply(con, policy)
+            await apply(con, policy, r=r)
             await console_command(con, "sh", "-c", "echo 3 > /sys/module/ask_flowtable/parameters/flowtable_fail_stage")
             async with peer(r, flows, initial_ids=[], servers=servers) as controller:
                 clients.controller = controller
@@ -187,7 +187,7 @@ async def test_flowtable_dnat(rig, zero_checksum, double_nat=False):
                         assert re.findall(r"\bid=\d+", ct_before[proto]) == re.findall(r"\bid=\d+", ct_after[proto]) != []
                     r.record("dnat-software", {"crossing": reports, "transfers": software, "software_tx": tx,
                                               "state": drained, "ct_before": ct_before, "ct_after": ct_after})
-                    await apply(con, policy)
+                    await apply(con, policy, r=r)
                     await warm(r, clients, expected)
                     await hardware(r, clients, expected, "dnat-restored-hardware")
                     status = await controller.rpc("servers")

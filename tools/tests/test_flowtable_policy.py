@@ -28,8 +28,19 @@ def candidate(r):
             "exclude": []}
 
 
-async def apply(con, policy, *, check=True):
-    await console_python(con, f"from pathlib import Path\nPath({CONFIG!r}).write_text({json.dumps(policy)!r})\n")
+async def apply(con, policy, *, check=True, r=None):
+    """Install a policy. Pass `r` to write the config over the agent instead of
+    the console: the write is setup, never inside a measurement window, and the
+    agent egresses on the WAN port where the software-TX bounds are loose --
+    the tight ones are all on the LAN port, which agent traffic never touches.
+    The CLI run stays on the console either way, because apply drains the
+    datapath and an HTTP reply in flight across that drain can be lost."""
+    text = json.dumps(policy)
+    if r is not None:
+        written = await r.target.fs_write(r.session, CONFIG, text)
+        assert written["errno"] == 0, written
+    else:
+        await console_python(con, f"from pathlib import Path\nPath({CONFIG!r}).write_text({text!r})\n")
     result = await console_command(con, "/usr/sbin/ask-flowtable", "apply", "--config", CONFIG,
                                    check=check, timeout=40)
     if check:
@@ -57,14 +68,14 @@ async def test_flowtable_policy_revokes_live_connections(connections):
     with Console.target(log_path=str(ARTIFACTS / "policy-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         try:
-            await apply(con, policy)
+            await apply(con, policy, r=r)
             async with peer(r, flows) as p:
                 await warm(r, p, [0, 1], "policy-initial-admission", flows)
                 initial = await hardware(r, p, "policy-initial-hardware", flows)
                 excluded = copy.deepcopy(policy)
                 # 'port' matches either direction's tuple endpoints.
                 excluded["exclude"] = [{"protocol": "udp", "port": SPORT}]
-                result = await apply(con, excluded)
+                result = await apply(con, excluded, r=r)
                 assert result["drained"]["deletes"] == initial["deletes"] + 4, result
                 for _ in range(8):
                     await p.batch([0, 1], 128, 0.01)
@@ -94,19 +105,19 @@ async def test_flowtable_policy_revokes_live_connections(connections):
                          "udp": udp, "tcp": tcp, "udp_software_tx": tx, "tcp_software_tx": tcp_tx})
 
                 # Schema errors leave the installed generation untouched.
-                rejected = await apply(con, {**policy, "enabled": "yes"}, check=False)
+                rejected = await apply(con, {**policy, "enabled": "yes"}, check=False, r=r)
                 assert rejected["rc"] != 0 and "expected boolean" in rejected["stdout"], rejected
                 held = await r.state()
                 assert held["installs"] == accelerated["installs"] and held["deletes"] == accelerated["deletes"]
                 assert (await installed(con))["policy_hash"] == policy_hash(excluded)
-                await apply(con, policy)
+                await apply(con, policy, r=r)
                 await warm(r, p, [0, 1], "policy-exclusion-removed", flows)
                 await hardware(r, p, "policy-restored-hardware", flows)
 
                 # A valid configuration with unsupported hardware ports is
                 # rejected after retiring the old policy. Both sockets survive.
                 unsupported = {**policy, "devices": [TARGET_LAN_IF, "lo"]}
-                rejected = await apply(con, unsupported, check=False)
+                rejected = await apply(con, unsupported, check=False, r=r)
                 assert rejected["rc"] != 0 and "acceleration disabled" in rejected["stdout"], rejected
                 status = await installed(con)
                 assert not status["policy_installed"] and not status["admission_ready"], status
@@ -130,14 +141,14 @@ async def test_flowtable_policy_preserves_foreign_table(connections):
         try:
             # The fixture's differently named flowtable owns the backend.
             before = await r.state()
-            result = await apply(con, candidate(r), check=False)
+            result = await apply(con, candidate(r), check=False, r=r)
             assert result["rc"] != 0 and "another flowtable" in result["stdout"], result
             after = await r.state()
             assert after["bindings"] == 2 and after["rearms"] == before["rearms"]
             await r.delete_table()
             await r.nft("table inet ask_flowtable { comment \"foreign\"; }")
             try:
-                result = await apply(con, candidate(r), check=False)
+                result = await apply(con, candidate(r), check=False, r=r)
                 assert result["rc"] != 0 and "ownership marker" in result["stdout"], result
                 listed = await console_command(con, "nft", "-j", "list", "table", "inet", "ask_flowtable")
                 assert any(t.get("table", {}).get("comment") == "foreign" for t in json.loads(listed["stdout"])["nftables"])

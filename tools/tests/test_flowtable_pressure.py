@@ -31,7 +31,7 @@ async def test_flowtable_concurrent_policy_and_routes(connections):
     with Console.target(log_path=str(ARTIFACTS / "pressure-policy-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         try:
-            await apply(con, policy)
+            await apply(con, policy, r=r)
             async with peer(r, flows) as p:
                 initial = await warm(r, p, [0, 1], "pressure-policy-initial", flows)
                 await p.rpc("start", [0, 1], count=0, interval=0.01)
@@ -99,7 +99,7 @@ finally:
                         await p.rpc("stop", [0, 1])
                 # Resolve the last-lock-winner ordering with an explicit final
                 # desired policy, then prove stable hardware on both sockets.
-                await apply(con, policy)
+                await apply(con, policy, r=r)
                 status = await installed(con)
                 assert status["admission_ready"] and status["policy_hash"] == policy_hash(policy), status
                 await warm(r, p, [0, 1], "pressure-policy-recovered", flows)

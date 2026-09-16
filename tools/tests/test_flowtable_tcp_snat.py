@@ -51,7 +51,7 @@ async def tcp_snat(rig, request):
             # Flag counters remain at the forward hook. The production policy
             # owns the flowtable, including stop/reapply during the same socket.
             await r.nft(f"table inet {TABLE} {{ chain forward {{ type filter hook forward priority 0; policy accept; }}; }}")
-            await apply(con, policy)
+            await apply(con, policy, r=r)
 
         async def remove():
             await stop(con)

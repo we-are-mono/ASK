@@ -169,7 +169,7 @@ async def test_flowtable_masquerade_wan_lifecycle(connections, masquerade_networ
         await console_command(con, "nft", nat)
         try:
             await console_command(con, "iptables", "-t", "nat", "-I", *control)
-            await apply(con, candidate(r))
+            await apply(con, candidate(r), r=r)
             async with peer(r, flows, initial_ids=[0, 1]) as p:
                 await warm_mapping(r, p, [0, 1], ADDRESS)
                 before = await hardware_mapping(r, p, [0, 1], ADDRESS, "masq-initial")

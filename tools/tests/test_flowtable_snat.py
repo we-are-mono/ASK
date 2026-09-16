@@ -125,7 +125,7 @@ async def test_flowtable_udp_snat(connections, zero_checksum, nat_kind="snat"):
         # retains the resolved mapping when this independent policy is drained.
         await console_command(con, "nft", nat)
         try:
-            await apply(con, candidate(r))
+            await apply(con, candidate(r), r=r)
             # Roll back a hardware insertion once before establishing the same
             # mapping normally. Directional retry must preserve all references.
             await console_command(con, "sh", "-c", "echo 3 > /sys/module/ask_flowtable/parameters/flowtable_fail_stage")
@@ -161,7 +161,7 @@ async def test_flowtable_udp_snat(connections, zero_checksum, nat_kind="snat"):
                 assert re.findall(r"\bid=\d+", ct_before["stdout"]) == re.findall(r"\bid=\d+", ct_after["stdout"]) != []
                 r.record("snat-software", {"crossing": crossing, "reports": reports, "software_tx": tx,
                                            "state": drained, "ct_before": ct_before, "ct_after": ct_after})
-                await apply(con, candidate(r))
+                await apply(con, candidate(r), r=r)
                 await snat_warm(r, p, external, port, "snat-restored-admission")
                 await snat_hardware(r, p, external, port, zero_checksum, "snat-restored-hardware")
         finally:
