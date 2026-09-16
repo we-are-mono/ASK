@@ -60,6 +60,42 @@ def test_policy_json_and_tuple_semantics(tmp_path):
     assert candidate == original, "render mutated the candidate"
 
 
+def test_policy_admission_test_follows_the_adapter_mask():
+    """The rendered guard restates the adapter's own test, never a constant."""
+    # No mask: classification is off, so every mark still declines to software.
+    # This is the historical "ct mark != 0 return", spelled as a masked test.
+    assert "  ct mark & 0xffffffff != 0x0 return" in policy.render(BASE).splitlines()
+    # With a mask, only the bits the adapter cannot decode refuse admission;
+    # the class bits are left for it to read.
+    assert "  ct mark & 0xff00ffff != 0x0 return" in policy.render(BASE, 0x00ff0000).splitlines()
+    # A mask spanning the whole word refuses nothing. The adapter rejects such
+    # a mask at load, so the controller never has to second-guess it here.
+    assert "  ct mark & 0x0 != 0x0 return" in policy.render(BASE, 0xffffffff).splitlines()
+    # The mask belongs to the running adapter, not to the policy, so it must
+    # change the guard without moving the marker that identifies the table:
+    # a reboot under a different mask is not a different policy.
+    masked, plain = policy.render(BASE, 0x00ff0000), policy.render(BASE)
+    assert masked != plain
+    marker = policy.MARKER + policy.policy_hash(BASE)
+    assert marker in masked and marker in plain
+
+
+def test_policy_apply_renders_against_the_live_mask(runtime):
+    """A mask known only to the backend has to reach the installed ruleset."""
+    runtime.resources["qos_mark_mask"] = 0x00ff0000
+    scripts = []
+    original = runtime.nft
+
+    def capture(*args, script=None):
+        if script is not None:
+            scripts.append(script)
+        return original(*args, script=script)
+
+    runtime.nft = capture
+    runtime.apply(BASE)
+    assert scripts and all("ct mark & 0xff00ffff != 0x0 return" in s for s in scripts)
+
+
 def resources(**values):
     return {"owner": "flowtable", "fatal": 0, "observe": 0, "invalidated": 0,
             **dict.fromkeys(policy.DRAIN_FIELDS, 0), **values}

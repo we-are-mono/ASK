@@ -92,7 +92,31 @@ struct cdx_ft_rule {
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];
 	u16 mtu;
+	/* Egress class, already decoded from the conntrack mark: low nibble is
+	 * the CEETM class queue, high nibble the channel, where zero means the
+	 * port's own least-priority channel. Deliberately absent from
+	 * ft_same_key(), because two marks describe one flow rather than two;
+	 * present in the whole-rule comparison, so a reclassified flow is
+	 * reinstalled rather than left on its old queue.
+	 */
+	u8 qos;
 };
+
+/* Layout of cdx_ft_rule.qos. Stated here rather than in the adapter because
+ * this header is where the rule's meaning is agreed, and the adapter must not
+ * reach into CEETM headers to learn it.
+ *
+ * The channel nibble is valid over 0..CDX_FT_QOS_MAX_CHANNEL inclusive: zero
+ * selects the egress port's least-priority channel rather than naming channel
+ * zero, and 1..8 name a channel directly, which is the numbering
+ * ceetm_get_egressfq() expects. CDX_FT_QOS_MAX_CHANNEL therefore equals
+ * CDX_CEETM_MAX_CHANNELS, and a static assertion in cdx_ceetm_app.c — where
+ * that count is owned — fails the build if the two ever drift.
+ */
+#define CDX_FT_QOS_QUEUE_MASK	0x0fu
+#define CDX_FT_QOS_CHANNEL_MASK	0xf0u
+#define CDX_FT_QOS_CHANNEL_SHIFT 4
+#define CDX_FT_QOS_MAX_CHANNEL	8
 
 struct cdx_ft_counters {
 	u64 packets;

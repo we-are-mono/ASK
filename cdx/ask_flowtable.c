@@ -72,6 +72,52 @@ module_param_named(flowtable_fail_stage, ft_fail_stage, uint, 0600);
 MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocation, 2 before hardware, 3 after hardware, 4 busy after peer direction");
 #endif
 
+/* Egress QoS classification. The conntrack mark is the only key the software
+ * and hardware paths can share: an offloaded flow produces no skb, so nothing
+ * a tc filter decides can reach it. Reading it here keeps one source of truth.
+ *
+ * Both are boot-immutable, like offload_owner, because a mask that changed
+ * under live flows would leave already-installed entries encoding a layout
+ * nothing else still agrees with.
+ *
+ * A zero mask disables classification entirely and restores the historical
+ * contract exactly: any nonzero mark refuses admission, so a mark meant for
+ * policy routing is never silently reinterpreted as a queue. The mask is
+ * reported in the proc header, and the controller renders its own admission
+ * test from that rather than restating this one.
+ *
+ * A masked value of zero is indistinguishable from an unmarked flow, as with
+ * every other fwmark scheme; that case takes the default class rather than
+ * naming class zero.
+ */
+static unsigned int ft_qos_mark_mask;
+static unsigned int ft_qos_default_class;
+module_param_named(qos_mark_mask, ft_qos_mark_mask, uint, 0444);
+MODULE_PARM_DESC(qos_mark_mask, "Conntrack mark bits holding the egress class; 0 disables classification and refuses marked flows");
+module_param_named(qos_default_class, ft_qos_default_class, uint, 0444);
+MODULE_PARM_DESC(qos_default_class, "Class for flows whose masked mark is zero: low nibble class queue, high nibble channel");
+
+/* Reject a class the hardware cannot express rather than truncating it into a
+ * different queue, which would accelerate the flow onto a queue nobody asked
+ * for instead of declining it. */
+static bool ft_qos_class_valid(unsigned int class)
+{
+	return class <= U8_MAX &&
+		((class & CDX_FT_QOS_CHANNEL_MASK) >> CDX_FT_QOS_CHANNEL_SHIFT) <=
+			CDX_FT_QOS_MAX_CHANNEL;
+}
+
+/* Map a conntrack mark onto an egress class. The masked bits are shifted down
+ * to their own base so an operator can place the field anywhere in the word
+ * and share the rest with policy routing or a VPN's own marks. */
+static u8 ft_qos_class(u32 mark)
+{
+	if (!ft_qos_mark_mask)
+		return 0;
+	mark = (mark & ft_qos_mark_mask) >> __ffs(ft_qos_mark_mask);
+	return mark ? (u8)mark : (u8)ft_qos_default_class;
+}
+
 struct cdx_ft_binding {
 	struct list_head list;
 	struct net_device *dev;
@@ -1019,6 +1065,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	struct flow_match_ports ports;
 	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
+	u32 mark;
 	static const u32 offsets[4] = { 4, 8, 0, 4 };
 	static const u32 masks[4] = { 0x0000ffff, 0, 0, 0xffff0000 };
 	u8 ethernet[12] = {};
@@ -1042,12 +1089,21 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	else
 		return -EOPNOTSUPP;
 	keys = family == AF_INET6 ? keys6 : keys4;
-	if (!cls->nf_ct || !cls->nf_mtu || cls->nf_counter ||
+	if (!cls->nf_ct)
+		return -EOPNOTSUPP;
+	/* Sampled once: the admission test below and the class derived further
+	 * down have to describe the same mark, or a concurrent change could
+	 * install a class taken from a value that would not have been admitted. */
+	mark = READ_ONCE(cls->nf_ct->mark);
+	if (!cls->nf_mtu || cls->nf_counter ||
 	    !nf_flow_offload_handle_valid(cls->nf_handle) ||
 	    !net_eq(nf_ct_net(cls->nf_ct), &init_net) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_ORIGINAL) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_REPLY) ||
-	    READ_ONCE(cls->nf_ct->mark) ||
+	    /* Outside the classification mask the mark still means something
+	     * this adapter cannot honour, so it still refuses. With no mask
+	     * configured that is every mark, exactly as before. */
+	    (mark & ~ft_qos_mark_mask) ||
 	    cls->common.chain_index || cls->common.protocol != ETH_P_ALL)
 		return -EOPNOTSUPP;
 	flow_rule_match_meta(rule, &meta);
@@ -1147,6 +1203,15 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK)
 		return -EOPNOTSUPP;
 	if (!ft_translation(cls, out))
+		return -EOPNOTSUPP;
+	/* Each direction is admitted as its own rule, so this is already a
+	 * per-direction class even though both directions read one mark. The
+	 * channel nibble is normally zero, which resolves to whichever channel
+	 * the egress port owns, so one class index means "this priority, on
+	 * whatever port this direction leaves by". A class the hardware cannot
+	 * express declines the flow to software rather than guessing a queue. */
+	out->qos = ft_qos_class(mark);
+	if (!ft_qos_class_valid(out->qos))
 		return -EOPNOTSUPP;
 	switch (basic.key->ip_proto) {
 	case IPPROTO_TCP:
@@ -2104,24 +2169,24 @@ static int ft_show(struct seq_file *seq, void *v)
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%02x nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
 				   &entry->rule.dst.in6, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
 				   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
-				   entry->rule.proto, entry->rule.mtu,
+				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%02x nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),
 				   &entry->rule.dst.ip, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
 				   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
-				   entry->rule.proto, entry->rule.mtu,
+				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
 				   &entry->next_hop.ip, stats.packets, stats.bytes, stats.lastused);
 		return 0;
 	}
@@ -2129,6 +2194,11 @@ static int ft_show(struct seq_file *seq, void *v)
 		records++;
 		slots += !!record->slot;
 	}
+	/* The controller reads the mask back from here rather than from sysfs,
+	 * because it already parses this header and must refuse a policy whose
+	 * mark selectors contradict what the running adapter will decode. */
+	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\n",
+		   ft_qos_mark_mask, ft_qos_default_class);
 	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
@@ -2183,6 +2253,21 @@ static int __init ask_flowtable_init(void)
 {
 	int rc;
 
+	/* Refuse a classification the adapter would have to truncate. Both
+	 * values are boot-immutable, so checking once here is the only chance
+	 * to say so out loud; silently narrowing them would accelerate flows
+	 * onto queues the operator never named. */
+	if (ft_qos_mark_mask &&
+	    (ft_qos_mark_mask >> __ffs(ft_qos_mark_mask)) > U8_MAX) {
+		pr_err("cdx flowtable: qos_mark_mask %#x spans more than the eight bits of a class\n",
+		       ft_qos_mark_mask);
+		return -EINVAL;
+	}
+	if (!ft_qos_class_valid(ft_qos_default_class)) {
+		pr_err("cdx flowtable: qos_default_class %#x names no CEETM queue\n",
+		       ft_qos_default_class);
+		return -EINVAL;
+	}
 	ft_hash_seed = get_random_u32();
 	/* Exported symbol dependencies pin a fully initialized CDX throughout
 	 * this module's lifetime, including failed initialization and exit. */
