@@ -1453,6 +1453,79 @@ banner.
 
 *Effort: 3–4 days.*
 
+### 10. The exception and SEC rates
+
+The last two `CMD_QM_*` families. `CMD_QM_EXPT_RATE` and
+`CMD_QM_QUERY_EXPT_RATE` meter the punt path; `CMD_QM_SEC_POLICER_CONFIG`,
+`_QUERY_STATS` and `_RESET` meter the crypto one. Neither has a netdev, so no
+`tc` filter can reach either, and the question the plan left open was what they
+should become instead.
+
+**The exception rate is global, and that is now established rather than
+suspected.** `cdxdrv_create_missaction_policer_profiles()` creates a *shared*
+FMAN profile (`sharedProfile = 1`) and `dpa_cfg.c` installs it as the **miss
+action** of the Ethernet and PPPoE-relay hash tables —
+`FM_PCD_HashTableModifyMissNextEngine` with
+`newRelativeProfileId = CDX_EXPT_ETH_RATELIMIT`. A frame that matches no
+classifier entry meets that profile on its way to the CPU. The tables are per
+FMAN and so is the profile: `cdx_set_expt_rate(fm_index, type, ...)` indexes
+`fman_info[]` and an exception *type* (ETH, WIFI, and two that are declared and
+unsupported), never a port. So option 2 from the plan — a `tc` filter on the
+port whose punted traffic it governs — is not available, because there is no
+such port.
+
+**And the kernel already has a name for it.** "Rate-limit the packets this
+device sends to its CPU" is what `devlink-trap` policers are for:
+
+```sh
+devlink trap policer set pci/xxxx policer 1 rate 1000 burst 512
+devlink trap policer show
+```
+
+`devlink_trap_policers_register()`, `trap_policer_set` and
+`trap_policer_counter_get` are the exact shape of `CMD_QM_EXPT_RATE`,
+`CMD_QM_QUERY_EXPT_RATE` and the per-colour counters behind them — a rate, a
+burst and a drop count for traffic the hardware punts. mlxsw drives the same
+hardware idea through it. This is a better answer than the `devlink param` the
+plan reached for: a param is an untyped knob, a trap policer is the thing
+itself, and `devlink trap group set ... policer N` is how an operator says which
+punted traffic it governs.
+
+*What it costs, and the one decision it needs.* This driver has no `devlink`
+instance at all, so the work is a registration as much as a mapping: allocate
+and register one against the FMAN device, declare the policer, and wire the two
+callbacks onto `cdx_set_expt_rate()` and `get_plcr_counter()`. The open
+question is **who owns that instance** — cdx, which configures the FMAN's PCD
+and is where every other command in this document landed, or `sdk_dpaa`, which
+owns the netdevs and would mean a kernel patch. cdx is the answer that needs no
+patch and keeps the QoS plane in one module; the plumbing is the same either
+way, so the choice moves the registration and nothing else.
+
+**The SEC rate is not a second mechanism.** `INGRESS_SEC_POLICER_QUEUE_NUM` is
+`INGRESS_ALL_POLICER_QUEUES - 1` — profile 8 of the same ingress pool the seven
+per-flow profiles come from, programmed through the same
+`cdx_ingress_policer_modify_config()` that
+[increment 8](#8-ingress-policing) already drove from `tc`. What makes it
+different is only *who selects it*: the hardware does, when it steers a frame to
+the SEC block, and no 5-tuple filter can say "the crypto engine's input" because
+that is not a property of any flow's tuple.
+
+So it is an aggregate meter on one internal engine, and **no kernel verb
+describes it.** It is not a trap — nothing is being punted — and it is not a
+filter's own match. `devlink param` is the remaining generic surface, and a
+driver-specific `u32` param is an honest way to spell "the rate at which this
+device will feed its crypto engine", even though it is a knob rather than a
+model of the thing. That is the one place in this document where goal 2 is met
+in letter and not in spirit, and it is worth saying so plainly rather than
+inventing a shape for it.
+
+Its ceiling stays as it is: `QM_SECRATE_MAX_CIR = 14880952` is the 64-byte frame
+rate of a 10G port, the profile really is programmed in
+`e_FM_PCD_PLCR_PACKET_MODE`, and it is not the byte-mode unit confusion that
+[the ingress range](#the-unit-error-fixed) was.
+
+*Effort: 3–4 days for the exception rate, a day for the SEC one.*
+
 ### Order and total
 
 Increments 1 and 2a are independent, and both are written. 2b depends on 2a
