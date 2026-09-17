@@ -2399,6 +2399,42 @@ release:
 	return rc;
 }
 
+/* Give back the callbacks Netfilter is still holding.
+ *
+ * A bind installs a flow_block_cb into the flowtable's own block, and
+ * Netfilter keeps it until something unbinds. flow_indr_dev_unregister()
+ * unwinds the *indirect* binds for us and knows nothing about the direct
+ * ones -- which is every bind since the driver grew an ndo_setup_tc, because
+ * that is what nf_flow_table_offload_setup() prefers once it exists. Left
+ * behind, the callback still points into this module's text, and the next
+ * queued offload calls it: flow_offload_work_handler faulting on freed text
+ * with the flowtable itself perfectly healthy.
+ *
+ * Any callback still on the driver list belongs to a table that is still
+ * live, because a table on its way out unbinds first. Its lock is therefore
+ * safe to take, and taking it for write is also what waits out a callback
+ * already running on nf_flow_offload_tuple()'s read side -- so no caller is
+ * inside this text by the time it goes.
+ */
+static void ft_block_drain(void)
+{
+	struct flow_block_cb *cb, *next;
+	struct cdx_ft_binding *binding;
+	struct nf_flowtable *table;
+
+	list_for_each_entry_safe(cb, next, &ft_block_list, driver_list) {
+		binding = cb->cb_priv;
+		table = binding->table;
+		down_write(&table->flow_block_lock);
+		list_del(&cb->list);
+		up_write(&table->flow_block_lock);
+		list_del(&cb->driver_list);
+		/* Runs ft_release(), which retires this binding's entries and
+		 * drops its device reference, exactly as an unbind would. */
+		flow_block_cb_free(cb);
+	}
+}
+
 static void __exit ask_flowtable_exit(void)
 {
 	struct cdx_ft_entry *entry;
@@ -2428,6 +2464,9 @@ static void __exit ask_flowtable_exit(void)
 	cdx_unregister_ft_setup_tc();
 	cdx_unregister_ft_qos_class();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
+	/* Indirect binds are gone with the line above; the direct ones are
+	 * still Netfilter's, and nothing else will ever hand them back. */
+	ft_block_drain();
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
 	 * before releasing CDX. Release the transaction between retries so
