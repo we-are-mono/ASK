@@ -83,7 +83,25 @@ static void *kzalloc(size_t size, int flags)
 static void kfree(void *p) { if (p) allocations--; free(p); }
 
 /* Kernel side of the interface, as much of it as this file touches. */
-enum tc_setup_type { TC_SETUP_QDISC_HTB, TC_SETUP_FT, TC_SETUP_ROOT_QDISC, TC_SETUP_BLOCK };
+enum tc_setup_type { TC_SETUP_QDISC_HTB, TC_SETUP_FT, TC_SETUP_ROOT_QDISC,
+		     TC_SETUP_QDISC_RED, TC_SETUP_BLOCK };
+enum tc_red_command { TC_RED_REPLACE, TC_RED_DESTROY, TC_RED_STATS,
+		      TC_RED_XSTATS, TC_RED_GRAFT };
+struct tc_red_qopt_offload_params {
+	u32 min, max, probability, limit;
+	bool is_ecn, is_harddrop, is_nodrop;
+};
+struct tc_red_qopt_offload {
+	enum tc_red_command command;
+	u32 handle;
+	u32 parent;
+	struct tc_red_qopt_offload_params set;
+};
+#define TC_H_MAJ_MASK	0xFFFF0000U
+#define TC_H_MIN_MASK	0x0000FFFFU
+#define TC_H_MIN(h)	((h) & TC_H_MIN_MASK)
+#define TC_H_MAKE(maj, min) (((maj) & TC_H_MAJ_MASK) | ((min) & TC_H_MIN_MASK))
+#define TC_H_ROOT	0xFFFFFFFFU
 enum tc_htb_command {
 	TC_HTB_CREATE,
 	TC_HTB_DESTROY,
@@ -184,6 +202,26 @@ static int ceetm_class_counters(u32 channel, u32 quenum, u64 *deq_frames,
 	*deq_frames = 1000u * channel + quenum;
 	*deq_bytes = 100000u * channel + 100u * quenum;
 	*rej_frames = 10u * channel + quenum;
+	return 0;
+}
+
+/* The WRED curve a class queue was last given, so a test can say which class
+ * a RED qdisc reached. */
+static struct { u32 min, max, probability, limit; bool set; }
+	wred[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
+static int ceetm_set_class_wred(u32 channel, u32 quenum, u32 min, u32 max,
+				u32 probability, u32 limit)
+{
+	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	wred[channel][quenum] = (__typeof__(wred[0][0])){ min, max, probability,
+							  limit, true };
+	return 0;
+}
+static int ceetm_clear_class_wred(u32 channel, u32 quenum, u32 depth)
+{
+	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	assert(depth == 128);
+	memset(&wred[channel][quenum], 0, sizeof(wred[0][0]));
 	return 0;
 }
 
@@ -363,6 +401,7 @@ static void reset_world(void)
 	devices[0].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
 	devices[1].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
 	memset(class_fqs, 0, sizeof(class_fqs));
+	memset(wred, 0, sizeof(wred));
 	real_num_tx_queues_fails = 0;
 	class_counters_fail = false;
 	cdx_ft_qos_class_func = NULL;
@@ -907,6 +946,75 @@ static void test_class_statistics(void)
 	assert_balanced(dev);
 }
 
+/* A RED qdisc names the class it was grafted under, and that class is the
+ * class queue whose congestion group it configures. */
+static int red(struct net_device *dev, u32 parent, enum tc_red_command cmd,
+	       u32 min, u32 max, u32 probability, u32 limit, bool ecn)
+{
+	struct tc_red_qopt_offload opt = {
+		.command = cmd,
+		.parent = parent,
+		.set = { .min = min, .max = max, .probability = probability,
+			 .limit = limit, .is_ecn = ecn },
+	};
+
+	return cdx_htb_setup_red(dev, &opt);
+}
+
+static void test_red(void)
+{
+	struct net_device *dev = &devices[0];
+	u16 qid1, qid10;
+
+	reset_world();
+	/* Nothing to graft onto before a qdisc exists. */
+	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
+		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
+
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!to_inner(dev, 10, 1, 0, 0));
+	assert(!query(dev, 10, &qid10));
+
+	/* Class 10 is channel 0's top strict-priority queue. */
+	assert(!red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
+		    1000, 4000, 1u << 26, 16000, false));
+	assert(wred[0][NUM_PQS - 1].set);
+	assert(wred[0][NUM_PQS - 1].min == 1000 && wred[0][NUM_PQS - 1].max == 4000);
+	assert(wred[0][NUM_PQS - 1].limit == 16000);
+
+	/* ECN is a request to mark, and this hardware only drops. Answering it
+	 * by dropping would be the wrong answer to the question asked. */
+	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
+		   1000, 4000, 1u << 26, 16000, true) == -EOPNOTSUPP);
+	/* A curve with no band, and one with no limit, are refused. */
+	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
+		   4000, 4000, 1u << 26, 16000, false) == -EINVAL);
+	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
+		   1000, 4000, 1u << 26, 0, false) == -EINVAL);
+
+	/* The root qdisc is the port, not a class queue; an inner class is a
+	 * channel, which has no congestion group of its own. */
+	assert(red(dev, TC_H_ROOT, TC_RED_REPLACE,
+		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
+	assert(red(dev, TC_H_MAKE(1 << 16, 1), TC_RED_REPLACE,
+		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
+	assert(red(dev, TC_H_MAKE(1 << 16, 99), TC_RED_REPLACE,
+		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
+
+	/* Statistics are ethtool's, where they describe what the qdisc cannot
+	 * see; tc is told so rather than given zeroes. */
+	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_STATS,
+		   0, 0, 0, 0, false) == -EOPNOTSUPP);
+
+	assert(!red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_DESTROY,
+		    0, 0, 0, 0, false));
+	assert(!wred[0][NUM_PQS - 1].set);
+
+	assert(!destroy(dev));
+	assert_balanced(dev);
+}
+
 /* A queue that cannot be put into service is a class that cannot be created,
  * and it has to leave nothing behind. */
 static void test_queue_budget(void)
@@ -957,12 +1065,13 @@ int main(void)
 	test_channel_reuse();
 	test_software_path();
 	test_class_statistics();
+	test_red();
 	test_queue_budget();
 	test_faults();
 	test_dispatch();
 	test_refusals();
 	assert(allocations == 0);
 	printf("htb offload: tree, density, limits, reuse, software path, "
-	       "statistics, %d fault points, dispatch passed\n", 24);
+	       "statistics, WRED, %d fault points, dispatch passed\n", 24);
 	return 0;
 }

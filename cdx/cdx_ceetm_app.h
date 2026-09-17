@@ -120,6 +120,9 @@ struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
 int ceetm_class_counters(uint32_t channel_num, uint32_t quenum,
 			 uint64_t *deq_frames, uint64_t *deq_bytes,
 			 uint64_t *rej_frames);
+int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
+			 uint32_t max, uint32_t probability, uint32_t limit);
+int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth);
 int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num);
 int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir_bps);
 int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight,

@@ -1437,6 +1437,165 @@ struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
 	return ceetm_get_egressfq(qm_ctx, channel + 1, quenum, 0);
 }
 
+/* The WRED curve a tc RED qdisc describes, in the congestion group's own
+ * encoding.
+ *
+ * RED names a minimum and a maximum queue depth and a maximum drop
+ * probability: below the minimum nothing is dropped, at the maximum the
+ * probability reaches its own, and in between it rises linearly. The CCG names
+ * the same curve by its top and its gradient instead --
+ *
+ *   MaxTH = MA * 2^Mn	   the depth at which the probability reaches MaxP
+ *   Slope = SA / 2^Sn	   how steeply it gets there
+ *   MaxP  = 4 * (Pn + 1)  the probability at MaxTH
+ *
+ * -- so the minimum is implied at MaxTH - MaxP/Slope, and converting means
+ * putting MaxTH at RED's maximum and choosing the slope that lands the implied
+ * minimum on RED's minimum.
+ *
+ * What MaxP is a fraction of is the one thing the SDK headers state no units
+ * for. Two hundred and fifty-sixths is the reading under which 4 * (Pn + 1)
+ * spans exactly 1/64 to 1 across Pn's six bits, which is the only reading that
+ * uses the field's whole range and reaches certainty. It is calibrated against
+ * the rejected-frame counters on hardware rather than taken on faith; see
+ * docs/flowtable-qos.md.
+ */
+#define CEETM_WRED_MAXP_UNITS	256u
+
+/* MaxTH = MA * 2^Mn, with MA eight bits wide. */
+static void ceetm_wred_maxth(uint32_t bytes, struct qm_cgr_wr_parm *parm)
+{
+	uint32_t e = 0;
+
+	while (bytes > 0xff && e < 0x1f) {
+		bytes >>= 1;
+		e++;
+	}
+	parm->MA = bytes > 0xff ? 0xff : bytes;
+	parm->Mn = e;
+}
+
+/* Slope = SA / 2^Sn, where SA has to land between 64 and 127 -- the encoding
+ * keeps the gradient's precision by normalising it into the top half of a
+ * seven-bit mantissa. */
+static void ceetm_wred_slope(uint32_t maxp, uint32_t span,
+			     struct qm_cgr_wr_parm *parm)
+{
+	uint64_t num = maxp;
+	uint64_t sa;
+	uint32_t sn = 0;
+
+	if (!span)
+		span = 1;
+	/* Shift until SA would reach 64, bounded well before the shift could
+	 * overflow: a span wide enough to still be short of it by then wants a
+	 * gentler slope than this encoding has, and gets the gentlest. */
+	while (sn < 40 && num < 64ull * span) {
+		num <<= 1;
+		sn++;
+	}
+	sa = div64_u64(num, span);
+	if (sa < 64)
+		sa = 64;
+	if (sa > 127)
+		sa = 127;
+	parm->SA = sa;
+	parm->Sn = sn;
+}
+
+/* Put a class queue's congestion group on a WRED curve, and its tail drop at
+ * the queue limit the same qdisc names.
+ *
+ * Both move to counting bytes rather than frames, because RED names its
+ * thresholds in bytes and the offload carries no average frame size to convert
+ * them with -- and because one mode covers tail drop and WRED together, so
+ * they cannot disagree about the unit.
+ */
+int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
+			 uint32_t max, uint32_t probability, uint32_t limit)
+{
+	struct qm_ceetm_ccg_params params;
+	struct ceetm_chnl_info *chnl_ctx;
+	struct qm_ceetm_ccg *ccg;
+	uint32_t maxp, maxth;
+	uint16_t mask;
+
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	if (!limit || !max || max <= min)
+		return -EINVAL;
+	chnl_ctx = &qm_chnl_info[channel_num];
+	ccg = chnl_ctx->cq_info[quenum].ccg;
+	if (!ccg)
+		return -ENODEV;
+
+	memset(&params, 0, sizeof(params));
+	params.mode = 0;	/* bytes */
+	params.td_en = 1;
+	params.td_mode = 1;
+	qm_cgr_cs_thres_set64(&params.td_thres, limit, 0);
+
+	/* The probability arrives as a fraction of 2^32. */
+	maxp = (uint32_t)(((uint64_t)probability * CEETM_WRED_MAXP_UNITS) >> 32);
+	if (maxp < 4)
+		maxp = 4;
+	if (maxp > CEETM_WRED_MAXP_UNITS)
+		maxp = CEETM_WRED_MAXP_UNITS;
+	params.wr_parm_g.Pn = maxp / 4 - 1;
+	/* Take the probability back out of the field before deriving the slope
+	 * from it. Pn steps in quarters of a 256th, so the curve's top is not
+	 * quite what was asked for -- and a slope drawn to the asked-for top
+	 * would put the curve's implied minimum somewhere else entirely. */
+	maxp = 4 * (params.wr_parm_g.Pn + 1);
+	ceetm_wred_maxth(max, &params.wr_parm_g);
+	/* Draw the slope to the top the field actually holds rather than the one
+	 * that was asked for. MaxTH rounds down to an eight-bit mantissa, and on
+	 * a band that is narrow beside its own depth that rounding is most of the
+	 * band -- a slope drawn to the requested top would then put the implied
+	 * minimum well below the requested one. */
+	maxth = (uint32_t)params.wr_parm_g.MA << params.wr_parm_g.Mn;
+	ceetm_wred_slope(maxp, maxth > min ? maxth - min : 1, &params.wr_parm_g);
+	/* One curve for every colour. A RED qdisc describes one, and a frame's
+	 * colour here is whatever the class queue's policer made it; giving the
+	 * colours separate curves is what GRED is for, and is not this. */
+	params.wr_parm_y = params.wr_parm_g;
+	params.wr_parm_r = params.wr_parm_g;
+	params.wr_en_g = 1;
+	params.wr_en_y = 1;
+	params.wr_en_r = 1;
+
+	mask = QM_CCGR_WE_MODE | QM_CCGR_WE_TD_EN | QM_CCGR_WE_TD_MODE |
+	       QM_CCGR_WE_TD_THRES |
+	       QM_CCGR_WE_WR_EN_G | QM_CCGR_WE_WR_EN_Y | QM_CCGR_WE_WR_EN_R |
+	       QM_CCGR_WE_WR_PARM_G | QM_CCGR_WE_WR_PARM_Y | QM_CCGR_WE_WR_PARM_R;
+	if (qman_ceetm_ccg_set(ccg, mask, &params))
+		return -EIO;
+	chnl_ctx->cq_info[quenum].qdepth = limit;
+	return 0;
+}
+
+/* Take the curve away again, back to the frame-counted tail drop a leaf class
+ * has without a RED qdisc on it. */
+int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth)
+{
+	struct qm_ceetm_ccg_params params;
+	struct qm_ceetm_ccg *ccg;
+	uint16_t mask;
+
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	ccg = qm_chnl_info[channel_num].cq_info[quenum].ccg;
+	if (!ccg)
+		return -ENODEV;
+	memset(&params, 0, sizeof(params));
+	mask = QM_CCGR_WE_WR_EN_G | QM_CCGR_WE_WR_EN_Y | QM_CCGR_WE_WR_EN_R;
+	if (qman_ceetm_ccg_set(ccg, mask, &params))
+		return -EIO;
+	if (ceetm_cfg_td_on_class_queue(&qm_chnl_info[channel_num], quenum, depth))
+		return -EIO;
+	return 0;
+}
+
 /* What a class queue actually dequeued, and what its congestion group
  * rejected. Read without QMAN_CEETM_FLAG_CLEAR_STATISTICS_COUNTER, so
  * repeated reads report totals rather than deltas -- these counters have one
