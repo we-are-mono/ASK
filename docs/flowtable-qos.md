@@ -722,13 +722,44 @@ alone. No KASAN, BUG, WARNING or lockdep output in either boot.
 
 ### 5. Hardware statistics through ethtool
 
-Extend the existing `get_strings`/`get_sset_count`/`get_ethtool_stats`
-(`sdk_dpaa/dpaa_ethtool.c:564`) with per-class dequeued frames, dequeued bytes
-and rejected frames, read from the counters cdx already calls
-(`cdx/cdx_ceetm_app.c:1732`, `:1741`).
+The existing `get_strings`/`get_sset_count`/`get_ethtool_stats` gain dequeued
+frames, dequeued bytes and rejected frames per leaf class, read through a third
+callback on the `struct dpa_qdisc_ops` increment 4 introduced.
 
-*Proof.* `ethtool -S` accounts for offloaded traffic that `tc -s class show`
-cannot see, and the two together account for the whole link.
+Two things decide the shape.
+
+**The count has to be a constant.** ethtool fetches the names and the values in
+separate ioctls, so a count that moved with `tc class add` would leave userspace
+lining one up against the other. There is therefore one set of counters per leaf
+*slot* — sixteen, always — rather than per class in the tree, and a slot no class
+holds reads zero. The driver answers even with no module registered, so the
+number does not change when cdx loads either. The name carries the slot, and
+leaf *N* is Tx queue `DPAA_ETH_TX_QUEUES + N`, which is what
+`TC_HTB_LEAF_QUERY_QUEUE` answers for a classid.
+
+**The counters are read without `QMAN_CEETM_FLAG_CLEAR_STATISTICS_COUNTER`**, so
+repeated reads report totals rather than deltas. They have one owner in
+hardware and `CMD_QM_QUERY_QUEUE` can clear them, which moves the baseline
+underneath anyone else reading; a statistics call that cleared them would make
+every other reader wrong.
+
+*Proved on hardware, 2026-09-17.* A `rate 3gbit` class on `eth4`, a marked flow
+through it, on the KASAN image. `ethtool -S` counted **1,951,317 frames,
+2,954,241,583 bytes and 17,727 rejected** on leaf 0 where `tc -s class show`
+counted **766 bytes in 11 packets** — the handshake, and nothing else, because
+an offloaded flow never enqueues on the leaf's software qdisc.
+
+The two account for the same traffic. iperf3 received 2.63 GBytes of TCP
+payload; the frame bytes ethtool reports are 4.6% more, which is 1514/1448 —
+the Ethernet, IP and TCP headers that payload does not count. The frames divide
+into the bytes at exactly 1514, so every one was full-size. And the rejected
+count is the shaper doing its job: 17,727 frames tail-dropped holding the flow
+to its 3 Gbit ceiling, which no `tc` counter can see at all.
+
+Read twice with no traffic in between, the values were identical — totals, not
+deltas. `eth4` reported 48 CEETM counters before the tree existed, with it live
+and after `tc qdisc del`, and leaf 0 read zero once no class held it. No KASAN,
+BUG, WARNING or lockdep output.
 
 *Effort: 2–3 days.*
 

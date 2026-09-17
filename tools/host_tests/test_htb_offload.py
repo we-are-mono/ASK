@@ -45,6 +45,7 @@ def test_htb_offload(tmp_path):
         "cdx_htb_node_modify", "cdx_htb_query_queue", "cdx_htb_setup_tc",
         "cdx_htb_port_gone", "cdx_register_ft_qos_class",
         "cdx_unregister_ft_qos_class", "cdx_htb_select_queue", "cdx_htb_txq_fq",
+        "cdx_htb_class_stats",
         "cdx_register_ft_setup_tc",
         "cdx_unregister_ft_setup_tc", "cdx_setup_tc", "cdx_htb_init",
         "cdx_htb_exit",

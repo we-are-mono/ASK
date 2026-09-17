@@ -1437,6 +1437,33 @@ struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
 	return ceetm_get_egressfq(qm_ctx, channel + 1, quenum, 0);
 }
 
+/* What a class queue actually dequeued, and what its congestion group
+ * rejected. Read without QMAN_CEETM_FLAG_CLEAR_STATISTICS_COUNTER, so
+ * repeated reads report totals rather than deltas -- these counters have one
+ * owner in hardware, and CMD_QM_QUERY_QUEUE can clear them, which moves the
+ * baseline underneath anyone else reading. */
+int ceetm_class_counters(uint32_t channel_num, uint32_t quenum,
+			 uint64_t *deq_frames, uint64_t *deq_bytes,
+			 uint64_t *rej_frames)
+{
+	struct classque_info *cqinfo;
+	uint64_t pkts, bytes;
+
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	cqinfo = &qm_chnl_info[channel_num].cq_info[quenum];
+	if (!cqinfo->cq || !cqinfo->ccg)
+		return -ENODEV;
+	if (qman_ceetm_cq_get_dequeue_statistics(cqinfo->cq, 0, &pkts, &bytes))
+		return -EIO;
+	*deq_frames = pkts;
+	*deq_bytes = bytes;
+	if (qman_ceetm_ccg_get_reject_statistics(cqinfo->ccg, 0, &pkts, &bytes))
+		return -EIO;
+	*rej_frames = pkts;
+	return 0;
+}
+
 /* Program a channel's committed and excess rates, in bits per second.
  *
  * A zero committed rate means no shaping at all: both buckets go to the token

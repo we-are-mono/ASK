@@ -785,9 +785,33 @@ static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq)
 	return ceetm_class_fq(qm_ctx, channel, READ_ONCE(port->txq_cq[slot]));
 }
 
+/* The counters that describe accelerated traffic, in leaf-slot order. A slot no
+ * class holds, and a queue the hardware will not answer for, are left at the
+ * zero the caller already wrote: ethtool asks for a fixed number of values and
+ * has to get one for every slot. Runs under RTNL from ethtool, which is also
+ * what publishes the map, so this reads a settled one. */
+static void cdx_htb_class_stats(void *qm_ctx, u64 *data)
+{
+	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
+	unsigned int slot;
+
+	if (!port)
+		return;
+	for (slot = 0; slot < CDX_HTB_MAX_LEAVES;
+	     slot++, data += DPA_CEETM_CLASS_STATS) {
+		u8 channel = READ_ONCE(port->txq_channel[slot]);
+
+		if (channel == CDX_HTB_NONE)
+			continue;
+		ceetm_class_counters(channel, READ_ONCE(port->txq_cq[slot]),
+				     &data[0], &data[1], &data[2]);
+	}
+}
+
 static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {
 	.select_queue = cdx_htb_select_queue,
 	.txq_fq = cdx_htb_txq_fq,
+	.class_stats = cdx_htb_class_stats,
 };
 
 /* The flowtable adapter's half of the ndo.
