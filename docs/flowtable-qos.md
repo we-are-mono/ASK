@@ -768,17 +768,92 @@ the offering rather than enabling it.
 
 ### 6. WRED
 
-The CCG already carries `wr_en_g/y/r` and `wr_parm_g/y/r`
-(`include/linux/fsl_qman.h:3748`); cdx configures none of it, so today's
-offering is strict priority and shapers over a tail-drop of eight frames.
-Expose the parameters and pick defaults that behave under load.
+The CCG carries `wr_en_g/y/r` and `wr_parm_g/y/r` and always has. Nothing ever
+wrote them: cdx touched those fields zero times, and the CQ configuration
+command CMM can send carries four flags — shaper eligibility, weight, tail-drop
+threshold, policer rate — with no WRED among them. So this is not a CMM feature
+being ported. It is capability the hardware shipped with that no control plane
+ever reached, which also means there is no parity bar to clear: nothing can
+regress, because nothing used it.
 
-Note that cdx also disables congestion-state notification entirely
-(`cscn_en = 0`, `cdx/cdx_ceetm_app.c:436`), so overload is invisible to
-software. Decide in this increment whether that stays true.
+**The control surface is `tc ... red` on a leaf class**, offloaded through
+`TC_SETUP_QDISC_RED`. It is the only vocabulary in tc for what the congestion
+group does, it ships everywhere, and sch_red hands the driver the class the
+qdisc was grafted under — which is exactly the class queue whose congestion
+group it configures. A RED qdisc anywhere else is refused rather than quietly
+kept in software, because an offloaded flow would never reach it.
 
-*Proof.* A saturating flow and a sparse one share a class; latency for the
-sparse flow stays bounded where tail-drop alone would not keep it so.
+ECN is refused too. This hardware drops; it cannot mark. Accepting `ecn` would
+answer a request to mark by dropping instead.
+
+**Converting the curve is the whole of the work.** RED says "start dropping at
+min, reach probability P at max". The CCG says "reach P at MaxTH, getting there
+at Slope", so the minimum is implied rather than stored, and all three fields
+are separately encoded mantissa-and-exponent. Two things that look like details
+are not:
+
+- the probability has to be taken back *out* of `Pn` before the slope is drawn
+  from it, because `Pn` steps in quarters of a 256th and a slope drawn to the
+  asked-for top puts the implied minimum somewhere else entirely;
+- the slope has to be drawn to the `MaxTH` the field actually holds, not the one
+  requested, because `MaxTH` rounds down to an eight-bit mantissa and on a band
+  that is narrow beside its own depth that rounding is most of the band.
+
+Both were caught by `tools/host_tests/test_ceetm_wred.py`, which asserts the
+invariant that matters — the curve's *implied minimum* lands back on the
+minimum that was asked for — across seven shapes rather than checking that each
+field round-trips.
+
+Tail drop moves to counting bytes along with the curve, because RED names its
+thresholds in bytes and the offload carries no average frame size to convert
+them with, and because one mode covers both so they cannot disagree about the
+unit. RED's `limit` becomes the tail-drop threshold. Without a RED qdisc a leaf
+keeps the frame-counted default from increment 3.
+
+**Congestion-state notification stays off**, which settles the question this
+increment was asked to decide. Nothing consumes a notification: there is no CSCN
+handler and `cscn_targ` is never set, so enabling it would deliver events to a
+portal with no consumer. The visibility gap it was meant to close is closed
+instead by increment 5 — the rejected-frame counter is the observable, and a
+counter costs nothing where an interrupt would.
+
+*Proved on hardware, 2026-09-17.* A `rate 500mbit` class on `eth4`, an offloaded
+bulk flow saturating it, and a ping through the same class as the sparse flow —
+software-forwarded, because ICMP is not offloadable, so the two paths increments
+3 and 4 built share one class queue.
+
+| leaf class queue | ping avg | ping max | sparse-flow loss | frames rejected |
+| --- | --- | --- | --- | --- |
+| tail drop only | 3.359 ms | 3.658 ms | 6.7% | 3,194 |
+| `min 60000 max 150000 probability 0.02` | 2.448 ms | 3.161 ms | 0% | 4,245 |
+| `min 20000 max 60000 probability 0.02` | 1.646 ms | 1.930 ms | 0% | 8,112 |
+| `min 20000 max 60000 probability 0.20` | 1.428 ms | 1.870 ms | 0% | 3,512 |
+| `min 5000 max 20000 probability 0.02` | 1.298 ms | 4.108 ms | 6.7% | 18,302 |
+
+The baseline is bufferbloat, and measurably so: 128 frames of 1514 bytes drained
+at 500 Mbit is 3.1 ms, and the queue sat full at 3.36. WRED halves that and
+takes the sparse flow's loss to zero — tail drop was hitting the ping, and early
+random drops hit the bulk flow instead, which is the entire point.
+
+Latency falls monotonically as the band tightens and rejections rise with it,
+across a twelvefold range of thresholds, which is what says the byte thresholds
+land where they were asked to. Raising the probability shortens the queue
+*and* drops less, which is the equilibrium moving down a steeper curve rather
+than an anomaly. Too tight a band — five thousand bytes is about three frames —
+starts dropping the sparse flow again, and is the far edge of useful
+configuration rather than a better setting.
+
+What that does **not** establish is the one number the SDK headers give no units
+for. `MaxP = 4 * (Pn + 1)` is a fraction of something they never state; 256ths
+is the reading under which the field spans exactly 1/64 to 1 across its six
+bits, and every measurement above is consistent with it, but consistency across
+one probability decade is not the reference manual. It is recorded as
+`CEETM_WRED_MAXP_UNITS` with its reasoning attached, and a test fails if either
+goes missing.
+
+No KASAN, BUG, WARNING or lockdep output. Removing the RED qdisc returned the
+class to its frame-counted tail drop, and tearing the tree down left sixteen Tx
+queues and no bindings.
 
 *Effort: 1 week.*
 

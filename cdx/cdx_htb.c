@@ -81,7 +81,8 @@
  * than queueing them. A hundred and twenty-eight is about a millisecond at a
  * gigabit and stays a bounded claim on the buffer pool at sixteen leaves per
  * port. HTB carries no queue-depth field, so this is a default rather than a
- * setting; increment 6 replaces tail drop with WRED and revisits it.
+ * setting: a RED qdisc on the leaf replaces this with a WRED curve, and its
+ * own limit, in bytes.
  */
 #define CDX_HTB_CQ_DEPTH	128
 
@@ -648,6 +649,46 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
 	return 0;
 }
 
+/* A RED qdisc on a leaf class is that class's WRED curve.
+ *
+ * sch_red offers the only vocabulary in tc for what the congestion group can
+ * already do, and it arrives naming the class it was grafted under -- which is
+ * the class queue whose congestion group this configures. A RED qdisc anywhere
+ * else has no class queue behind it and is refused rather than silently kept in
+ * software, because an offloaded flow would never reach it.
+ *
+ * ECN is refused for the same reason: this hardware drops, it does not mark, so
+ * accepting `ecn` would answer a request to mark by dropping instead.
+ */
+static int cdx_htb_red(struct cdx_htb_port *port, struct tc_red_qopt_offload *opt)
+{
+	struct cdx_htb_class *cl;
+
+	if (opt->parent == TC_H_ROOT)
+		return -EOPNOTSUPP;
+	cl = cdx_htb_find(port, TC_H_MIN(opt->parent));
+	if (!cl || cl->inner)
+		return -EOPNOTSUPP;
+
+	switch (opt->command) {
+	case TC_RED_REPLACE:
+		if (opt->set.is_ecn)
+			return -EOPNOTSUPP;
+		if (!opt->set.max || opt->set.max <= opt->set.min || !opt->set.limit)
+			return -EINVAL;
+		return ceetm_set_class_wred(cl->channel, cl->cq, opt->set.min,
+					    opt->set.max, opt->set.probability,
+					    opt->set.limit);
+	case TC_RED_DESTROY:
+		return ceetm_clear_class_wred(cl->channel, cl->cq,
+					      CDX_HTB_CQ_DEPTH);
+	default:
+		/* Statistics come from ethtool, where they describe the
+		 * accelerated traffic a qdisc counter cannot see. */
+		return -EOPNOTSUPP;
+	}
+}
+
 static int cdx_htb_query_queue(struct cdx_htb_port *port,
 			       struct tc_htb_qopt_offload *opt)
 {
@@ -657,6 +698,17 @@ static int cdx_htb_query_queue(struct cdx_htb_port *port,
 		return -ENOENT;
 	opt->qid = cl->qid;
 	return 0;
+}
+
+static int cdx_htb_setup_red(struct net_device *dev,
+			     struct tc_red_qopt_offload *opt)
+{
+	struct cdx_htb_port *port = cdx_htb_port_of(dev);
+
+	ASSERT_RTNL();
+	if (!port || !port->live)
+		return -EOPNOTSUPP;
+	return cdx_htb_red(port, opt);
 }
 
 static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *opt)
@@ -852,6 +904,8 @@ static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 	switch (type) {
 	case TC_SETUP_QDISC_HTB:
 		return cdx_htb_setup_tc(dev, type_data);
+	case TC_SETUP_QDISC_RED:
+		return cdx_htb_setup_red(dev, type_data);
 	case TC_SETUP_ROOT_QDISC:
 		/* A notification that the netdev's root qdisc changed, not a
 		 * request. This driver's scheduler state comes from the HTB
