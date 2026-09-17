@@ -333,15 +333,11 @@ each so the open bug list stays honest.
   Whole-tree replacement (`PcdCcModifyTree`) is deliberately unsupported
   under A113 and is excluded from this enablement work.
 
-- [ ] **A150 — the CEETM tree is built in flowtable mode with no consumer.**
-  `CMD_INIT(qm)` runs unconditionally (`cdx/cdx_cmdhandler.c:163`), unlike
-  `CMD_INIT(ipsec)` which is skipped when `cdx_flowtable_enabled()` (`:167`). So
-  a flowtable boot still claims 8 CEETM channels, 128 CCGs, 128 class queues and
-  128 LFQs at module load, plus 128 FMAN egress policer profiles at DPA init —
-  none of which any command can reach, because CMM is not running. Decide with
-  the [QoS design](docs/flowtable-qos.md): either gate `qm_init()` the way IPsec
-  is gated, or keep the tree and give the flowtable a way to use it. Leaving it
-  as-is spends profile-id space and QMan resources on nothing.
+- [x] **A150.** The CEETM tree was built in flowtable mode with no consumer, and the choice
+  was to gate `qm_init()` or give the flowtable a way to use it —
+  resolved by the second: the tree is the pool `tc` HTB offload claims from
+  (`cdx_htb.c:6`, "nothing new is claimed here"), with the ingress policers and the DSCP
+  map drawing on it too. Gating it would now break those. Not a resource spent on nothing.
 
 ---
 
