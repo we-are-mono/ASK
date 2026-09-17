@@ -2214,18 +2214,6 @@ static int cmmFFControlCmd(struct cli_def * cli, const char *command, char *argv
 	return CLI_OK;
 }
 
-static int cmmIpv4Cmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
-{
-	cmmCtChangeProcess4(argv, 0, globalConf.cli.daemon_handle);
-	return CLI_OK;
-}
-
-static int cmmIpv6Cmd(struct cli_def * cli, const char *command, char *argv[], int argc) 
-{
-	cmmCtChangeProcess6(argv, 0, globalConf.cli.daemon_handle);
-	return CLI_OK;
-}
-
 int cmmFFControlProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle)
 {
 	int cpt = tabStart;
@@ -2456,14 +2444,6 @@ int cmmCliInit(struct cmm_cli *ctx)
 		cli_register_command(ctx->handle, c, "bridge", cmmBridgeControlCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Manage automatic bridging");
 		cli_register_command(ctx->handle, c, "asym_fastforward", cmmAsymFFEnableCmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Enable or disable Asymmetric Fast forward");
 	}
-
-	c = cli_register_command(ctx->handle, NULL, "ipv4", cmmIpv4Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
-	if (c)
-		cli_register_command(ctx->handle, c, "update", cmmIpv4Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Update IPv4 Connection");
-
-	c = cli_register_command(ctx->handle, NULL, "ipv6", cmmIpv6Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "");
-	if (c)
-		cli_register_command(ctx->handle, c, "update", cmmIpv6Cmd, PRIVILEGE_UNPRIVILEGED, MODE_EXEC, "Update IPv6 Connection");
 
 	cli_register_command(ctx->handle, NULL, "stop", cmmFcStop, PRIVILEGE_PRIVILEGED, MODE_EXEC, "Kill cmm");
 

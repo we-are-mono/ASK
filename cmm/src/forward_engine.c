@@ -458,7 +458,6 @@ int cmmFeCtUpdate4(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 	cmd.dport = nfct_get_attr_u16(ctEntry->ct, ATTR_ORIG_PORT_DST);
 	cmd.sport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_SRC);
 	cmd.dport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_DST);
-	cmd.qosconnmark = cmmQosmarkGet(ctEntry->ct);
 
 	if (!(ctEntry->fpp_dir & ORIGINATOR))
 		cmd.flags |= CTCMD_FLAGS_ORIG_DISABLED;
@@ -466,7 +465,7 @@ int cmmFeCtUpdate4(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 	if (!(ctEntry->fpp_dir & REPLIER))
 		cmd.flags |= CTCMD_FLAGS_REP_DISABLED;
 
-	cmm_print(DEBUG_INFO, "%s: protocol=%d, qosconnmark=0x%" PRIx64 "\n", __func__, cmd.protocol, cmd.qosconnmark);
+	cmm_print(DEBUG_INFO, "%s: protocol=%d\n", __func__, cmd.protocol);
 	cmm_print(DEBUG_INFO, "  Saddr=%s, Daddr=%s, Sport=%d, Dport=%d\n",
 		  inet_ntop(AF_INET, &cmd.saddr, saddr_buf, sizeof(saddr_buf)),
 			    inet_ntop(AF_INET, &cmd.daddr, daddr_buf, sizeof(daddr_buf)),
@@ -656,7 +655,6 @@ int cmmFeCtUpdate6(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 	cmd.dport = nfct_get_attr_u16(ctEntry->ct, ATTR_ORIG_PORT_DST);
 	cmd.sport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_SRC);
 	cmd.dport_reply = nfct_get_attr_u16(ctEntry->ct, ATTR_REPL_PORT_DST);
-	cmd.qosconnmark = cmmQosmarkGet(ctEntry->ct);
 
 	cmd.route_id = ctEntry->orig.fpp_route_id;
 	cmd.route_id_reply = ctEntry->rep.fpp_route_id;
@@ -667,7 +665,7 @@ int cmmFeCtUpdate6(FCI_CLIENT *fci_handler, int action, struct ctTable *ctEntry)
 	if (!(ctEntry->fpp_dir & REPLIER))
 		cmd.flags |= CTCMD_FLAGS_REP_DISABLED;
 
-	cmm_print(DEBUG_INFO, "%s: protocol=%d, qosconnmark=0x%" PRIx64 "\n", __func__, cmd.protocol, cmd.qosconnmark);
+	cmm_print(DEBUG_INFO, "%s: protocol=%d\n", __func__, cmd.protocol);
 	cmm_print(DEBUG_INFO, "  Saddr=%s, Daddr=%s, Sport=%d, Dport=%d\n",
 		  inet_ntop(AF_INET6, &cmd.saddr, buf, sizeof(buf)),
 			    inet_ntop(AF_INET6, &cmd.daddr, buf1, sizeof(buf1)),
@@ -1246,7 +1244,7 @@ int cmmCtQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_han
         }
         cmm_print(DEBUG_STDOUT, "IPv4 Connections:\n");
         do {
-            cmm_print(DEBUG_STDOUT, "%04d: protocol=%d, qosconnmark=0x%" PRIx64 "\n", count, ctCmd->protocol, ctCmd->qosconnmark);
+            cmm_print(DEBUG_STDOUT, "%04d: protocol=%d\n", count, ctCmd->protocol);
             cmm_print(DEBUG_STDOUT, "  Init:  Saddr=%s, Daddr=%s, Sport=%d, Dport=%d\n",
                       inet_ntop(AF_INET, &ctCmd->saddr, saddr_buf, sizeof(saddr_buf)),
                       inet_ntop(AF_INET, &ctCmd->daddr, daddr_buf, sizeof(daddr_buf)),
@@ -1325,8 +1323,7 @@ int cmmCt6QueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_ha
         do {
 
             
-            cmm_print(DEBUG_STDOUT, "%04d: protocol=%d, qosconnmark=0x%" PRIx64 "\n", 
-                                            count, ctCmd->protocol, ctCmd->qosconnmark);
+            cmm_print(DEBUG_STDOUT, "%04d: protocol=%d\n", count, ctCmd->protocol);
             cmm_print(DEBUG_STDOUT, "  Init:  Saddr=%s, Daddr=%s, Sport=%d, Dport=%d\n",
                       inet_ntop(AF_INET6, &ctCmd->saddr, saddr_buf, sizeof(saddr_buf)),
                       inet_ntop(AF_INET6, &ctCmd->daddr, daddr_buf, sizeof(daddr_buf)),

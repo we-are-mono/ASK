@@ -1,4 +1,4 @@
-From cee994bcbf122913dc661963528ca4088927ea24 Mon Sep 17 00:00:00 2001
+From 72b4a8534995134a29cec507919e5d746a704fd6 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] ask: IPv4/IPv6 forwarding-path hook points
@@ -17,17 +17,17 @@ the ip6_tunnel site was dropped during the forward-port when the
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- net/ipv4/ip_output.c          | 41 ++++++++++++++++++++++++++++++++++-
+ net/ipv4/ip_output.c          | 38 ++++++++++++++++++++++++++++++++++-
  net/ipv4/ip_tunnel.c          |  3 +++
- net/ipv6/ip6_output.c         | 31 ++++++++++++++++++++++++--
+ net/ipv6/ip6_output.c         | 28 ++++++++++++++++++++++++--
  net/ipv6/ip6_tunnel.c         |  4 ++++
- net/ipv6/netfilter/ip6t_NPT.c | 29 +++++++++++++++++++++++++
- net/ipv6/output_core.c        | 19 ++++++++++++++++
+ net/ipv6/netfilter/ip6t_NPT.c | 29 ++++++++++++++++++++++++++
+ net/ipv6/output_core.c        | 19 ++++++++++++++++++
  net/ipv6/sit.c                |  3 +++
- 7 files changed, 127 insertions(+), 3 deletions(-)
+ 7 files changed, 121 insertions(+), 3 deletions(-)
 
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
-index 41031c5c4303..bbe8475c5a82 100644
+index 41031c5c4303..2eb271fe8755 100644
 --- a/net/ipv4/ip_output.c
 +++ b/net/ipv4/ip_output.c
 @@ -102,6 +102,17 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -98,16 +98,6 @@ index 41031c5c4303..bbe8475c5a82 100644
  	ret_val = NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING,
  				net, sk, skb, indev, dev,
  				ip_finish_output,
-@@ -566,6 +602,9 @@ static void ip_copy_metadata(struct sk_buff *to, struct sk_buff *from)
- 	skb_dst_copy(to, from);
- 	to->dev = from->dev;
- 	to->mark = from->mark;
-+#if defined(CONFIG_CPE_FAST_PATH)
-+	to->qosmark = from->qosmark;
-+#endif
- 
- 	skb_copy_hash(to, from);
- 
 diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
 index 7c77d06372d1..708663706279 100644
 --- a/net/ipv4/ip_tunnel.c
@@ -123,7 +113,7 @@ index 7c77d06372d1..708663706279 100644
  	}
  
 diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index 5d17982cb994..dd2b5b549e26 100644
+index 5d17982cb994..685da1a7dd66 100644
 --- a/net/ipv6/ip6_output.c
 +++ b/net/ipv6/ip6_output.c
 @@ -83,6 +83,13 @@ static int ip6_finish_output2(struct net *net, struct sock *sk, struct sk_buff *
@@ -182,16 +172,6 @@ index 5d17982cb994..dd2b5b549e26 100644
  	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
  			    net, sk, skb, indev, dev,
  			    ip6_finish_output,
-@@ -694,6 +718,9 @@ static void ip6_copy_metadata(struct sk_buff *to, struct sk_buff *from)
- 	skb_dst_set(to, dst_clone(skb_dst(from)));
- 	to->dev = from->dev;
- 	to->mark = from->mark;
-+#if defined(CONFIG_CPE_FAST_PATH)
-+	to->qosmark = from->qosmark;
-+#endif
- 
- 	skb_copy_hash(to, from);
- 
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
 index b788a06bd3a5..09964b40f0d2 100644
 --- a/net/ipv6/ip6_tunnel.c

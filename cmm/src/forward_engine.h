@@ -43,8 +43,6 @@
 	int cmmFeCatch(unsigned short fcode, unsigned short len, unsigned short *payload);
 
 	/* command processors */
-	int cmmCtChangeProcess4(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
-	int cmmCtChangeProcess6(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 
 	int cmmRtQueryProcess(char ** keywords, int tabStart, daemon_handle_t daemon_handle);
 

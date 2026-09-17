@@ -274,7 +274,6 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 			memcpy(pEntry_orig->Saddr_v6, Ctcmd.Saddr, IPV6_ADDRESS_LENGTH);
 			pEntry_orig->Sport = Ctcmd.Sport;
 			pEntry_orig->Dport = Ctcmd.Dport;
-			pEntry_orig->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_ORIG);
 			pEntry_orig->status = CONNTRACK_ORIG;
 
 			if (Ctcmd.flags & CTCMD_FLAGS_ORIG_DISABLED)
@@ -304,7 +303,6 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 			memcpy(pEntry_rep->Saddr_v6, Ctcmd.SaddrReply, IPV6_ADDRESS_LENGTH);
 			pEntry_rep->Sport = Ctcmd.SportReply;
 			pEntry_rep->Dport = Ctcmd.DportReply;
-			pEntry_rep->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_REPLIER);
 			pEntry_rep->status = 0;
 			SET_PROTOCOL(pEntry_orig, pEntry_rep, Ctcmd.protocol);
 
@@ -445,8 +443,6 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 				}
 			}
 #endif
-			pEntry_orig->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_ORIG);
-
 			if (Ctcmd.flags & CTCMD_FLAGS_ORIG_DISABLED) {
 				pEntry_orig->status |= CONNTRACK_FF_DISABLED;
 				IP_delete_CT_route((PCtEntry)pEntry_orig);
@@ -468,7 +464,6 @@ static int IPv6_handle_CONNTRACK(U16 *p, U16 Length)
 			} else
 				pEntry_orig->status &= ~(CONNTRACK_SEC | CONNTRACK_SEC_noSA);
 #endif
-			pEntry_rep->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_REPLIER);
 			if (Ctcmd.flags & CTCMD_FLAGS_REP_DISABLED) {
 				pEntry_rep->status |= CONNTRACK_FF_DISABLED;
 				IP_delete_CT_route((PCtEntry)pEntry_rep);
@@ -698,7 +693,7 @@ static int IPv6_CT_Get_Hash_Snapshot(int ct6_hash_index,int v6_ct_total_entries,
 			pSnapshot->SportReply = 	twin_entry->Sport;
 			pSnapshot->DportReply = 	twin_entry->Dport;
 			pSnapshot->protocol   =  GET_PROTOCOL(pCtEntry); 
-			pSnapshot->qosconnmark     = IP_get_qosconnmark((PCtEntry)pCtEntry, (PCtEntry)twin_entry);
+			pSnapshot->qosconnmark     = 0;
 			pSnapshot->SA_nr      =	0;
 			pSnapshot->SAReply_nr	= 	0;
 			pSnapshot->format = 0;

@@ -159,7 +159,6 @@ int IPv4_delete_CTpair(PCtEntry ctEntry);
 void IP_deleteCt_from_onif_index(U32 if_index);
 PRouteEntry IP_Check_Route(PCtEntry pCtEntry);
 void IP_delete_CT_route(PCtEntry pCtEntry);
-U64 IP_get_qosconnmark(PCtEntry pOrigEntry, PCtEntry pReplEntry);
 cdx_timer_t ct_get_time_remaining(PCT_PAIR ppair);
 
 /* Layer 2 encapsulation supplied by the caller instead of derived from a

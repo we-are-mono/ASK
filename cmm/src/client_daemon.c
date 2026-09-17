@@ -645,31 +645,6 @@ int cmmClientProcessCmd(char * command, int argc, char ** argv, daemon_handle_t 
 		if (cmmVlanClient(cpt,keywords, 1, daemon_handle))
 			return -1;
 	}
-	else if (strcasecmp(keywords[0], "ipv4") == 0)
-	{
-	  	if(cpt < 2)
-	    		goto help;
-		
-		if (strcasecmp(keywords[1], "update") == 0)
-		{
-			/*Call IPv4 update function*/
-			if (cmmCtChangeProcess4(keywords, 2, daemon_handle))
-				return -1;
-		}
-	}
-	else if (strcasecmp(keywords[0], "ipv6") == 0)
-	{
-	  	if(cpt < 2)
-	    		goto help;
-		
-		if (strcasecmp(keywords[1], "update") == 0)
-		{
-			/*Call IPv6 update function*/
-			if (cmmCtChangeProcess6(keywords, 2, daemon_handle))
-				return -1;
-		}
-	}
-
 	else
 		goto help;
 

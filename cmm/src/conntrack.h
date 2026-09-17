@@ -137,9 +137,6 @@
 
 	int cmmCtShow(struct cli_def * cli, const char *command, char *argv[], int argc);
 
-	u_int64_t cmmQosmarkGet(struct nf_conntrack *ct);
-	void cmmQosmarkSet(struct nf_conntrack *ct, u_int64_t qosmark);
-
 	struct ctTable *__cmmCtFind(struct nf_conntrack *ctTemp);
 	void __cmmRouteDeregister(FCI_CLIENT *fci_handle, struct ct_route *rt, const char *dir);
 	void ____cmmRouteDeregister(struct RtEntry *route, const char *dir);
