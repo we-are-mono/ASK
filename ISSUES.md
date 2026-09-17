@@ -343,8 +343,10 @@ each so the open bug list stays honest.
   `qm_ctx->dscp_fq_map->dscp_fq[dscp]`, then calls again with `ff = 1` on the
   same object (`:1557`, `:1573`). The slow-path DSCP table is then left pointing
   at an FQ whose `fqid` carries a fast-path-only policer byte, which QMan would
-  see as part of the FQID. Unreachable today — QoS is dormant, `cmmqos` ships
-  disabled — but it is on the path any QoS increment takes. Fix by returning the
+  see as part of the FQID. Still unreachable: both branches need a class-queue
+  policer, which only the `CMD_QM_*` policer commands enable and nothing sends —
+  the `tc` control plane does not program one. But it is on the path any
+  class-queue policer work takes. Fix by returning the
   fqid by value, or by keeping the policer byte out of the `qman_fq` entirely
   and applying it only where the ucode parameter block is written.
   Adjacent, same file: `ceetm_release_iface()` passes `qm_ctx - gQMCtx` to
@@ -361,6 +363,20 @@ each so the open bug list stays honest.
   the [QoS design](docs/flowtable-qos.md): either gate `qm_init()` the way IPsec
   is gated, or keep the tree and give the flowtable a way to use it. Leaving it
   as-is spends profile-id space and QMan resources on nothing.
+
+- [ ] **A146 — the libnetfilter-conntrack ASK patch still declares the retired
+  QoS mark.** `patches/libnetfilter-conntrack/{1.1.0,1.1.1}/01-nxp-ask-comcerto-fp-extensions.patch`
+  adds `ATTR_QOSCONNMARK`, `CTA_QOSCONNMARK` and `CTA_QOSCONNMARK_PAD` plus
+  their build/parse/copy/compare/print helpers. The kernel attribute they mirror
+  is gone and cmm no longer reads or writes the attribute, so they are dead —
+  and the patch's own header still claims the enum "matches kernel 6.12
+  nfnetlink_conntrack.h", which it no longer does. Harmless at runtime: the two
+  values sit at the end of `ctattr_type`, so removing them kernel-side shifted
+  nothing, and with no setter the library never emits an attribute the kernel
+  would now reject. The trap is that the declarations make it look as though
+  rebuilding cmm with `-DUSE_QOSCONNMARK` would still work. Fix by regenerating
+  both patches against their upstream tarballs with the QoS hunks dropped; it
+  needs a source fetch, which is why it is not bundled with the retirement.
 
 ---
 

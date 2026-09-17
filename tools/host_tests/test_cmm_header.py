@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize("defines", [[], ["-DLS1043", "-DUSE_QOSCONNMARK"]],
+@pytest.mark.parametrize("defines", [[], ["-DLS1043"]],
                          ids=["generic", "ls1043"])
 def test_cmm_header_standalone(defines):
     root = Path(__file__).resolve().parents[2]

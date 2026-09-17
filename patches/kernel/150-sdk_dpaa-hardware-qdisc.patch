@@ -358,10 +358,10 @@ userspace lining one up against the other.
  	if (atomic_read(&dpa_bp->refs) == 0)
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -1973,9 +1973,20 @@
+@@ -1949,9 +1949,20 @@
  		egress_fq = NULL;
- 		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when qosconnark(markval is 0) is not present or
- 						can't find egress fq for dscp */
+ 		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when the frame names
+ 						no class and the DSCP map answers */
 +		/* A hardware qdisc has already decided this frame's class, in
 +		 * ndo_select_queue and from the same key the hardware rule used,
 +		 * and put the frame on that leaf's Tx queue. Reading the class
@@ -373,14 +373,14 @@ userspace lining one up against the other.
 +		egress_fq = dpa_qdisc_txq_fq(priv->qm_ctx, skb_get_queue_mapping(skb));
 +		if (egress_fq)
 +			get_ceetm_cm_egress_fq = 0;
- 		/* markval is 0 means qosconnmark is not configured, so getting dscp from skb. */
- 		/* using dscp get the egress fq. */
+ 		/* No class named, so take the DSCP from the frame and let the
+ 		 * map choose the egress fq. */
 -		if (!markval && ceetm_get_dscp_fq) {
 +		if (get_ceetm_cm_egress_fq && !markval && ceetm_get_dscp_fq) {
  			skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
  			if (skb_nh)
  			{
-@@ -2017,7 +2028,14 @@
+@@ -1993,7 +2004,14 @@
  			queuenum = queuenum % DPAA_ETH_TX_QUEUES;
  		egress_fq = priv->egress_fqs[queuenum];
  	}

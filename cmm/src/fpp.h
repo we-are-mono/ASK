@@ -317,6 +317,9 @@ typedef struct fpp_ct_cmd {
     u_int16_t   dport_reply;
     u_int16_t   protocol;                     /*TCP, UDP ...*/
     u_int16_t   flags;
+    /* Reserved. Was the per-connection QoS class; classification is now the
+     * conntrack mark, decoded in the kernel. Kept so the command layout does
+     * not move; senders write zero. */
     u_int64_t qosconnmark;
     u_int32_t   route_id;
     u_int32_t   route_id_reply;
@@ -338,7 +341,7 @@ typedef struct fpp_ct_ex_cmd {
     u_int16_t   dport_reply;
     u_int16_t   protocol;                   /*TCP, UDP ...*/
     u_int16_t   flags;
-    u_int64_t qosconnmark;
+    u_int64_t qosconnmark;      /* reserved, zero; see fpp_ct_cmd_t */
     u_int32_t   route_id;
     u_int32_t   route_id_reply;
     // optional security parameters
@@ -365,7 +368,7 @@ typedef struct fpp_ct6_cmd {
     u_int16_t   dport_reply;
     u_int16_t   protocol;                     /*TCP, UDP ...*/
     u_int16_t   flags;
-    u_int64_t qosconnmark;
+    u_int64_t qosconnmark;      /* reserved, zero; see fpp_ct_cmd_t */
     u_int32_t   route_id;
     u_int32_t   route_id_reply;
 } __attribute__((__packed__)) fpp_ct6_cmd_t;
@@ -383,7 +386,7 @@ typedef struct fpp_ct6_ex_cmd {
     u_int16_t   dport_reply;
     u_int16_t   protocol;                     /*TCP, UDP ...*/
     u_int16_t   flags;
-    u_int64_t qosconnmark;
+    u_int64_t qosconnmark;      /* reserved, zero; see fpp_ct_cmd_t */
     u_int32_t   route_id;
     u_int32_t   route_id_reply;
     u_int8_t    sa_dir;

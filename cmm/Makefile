@@ -25,7 +25,7 @@ CFLAGS  += -I$(ABM_DIR)/include
 # defines of their own, so there is only one list to keep correct.
 # ENABLE_EGRESS_QOS is our deliberate addition to NXP's documented set.
 CFLAGS  += -DAUTO_BRIDGE -DLS1043 -DWIFI_ENABLE -DFLOW_STATS \
-           -DSEC_PROFILE_SUPPORT -DUSE_QOSCONNMARK -DENABLE_INGRESS_QOS \
+           -DSEC_PROFILE_SUPPORT -DENABLE_INGRESS_QOS \
            -DENABLE_EGRESS_QOS -DVLAN_FILTER
 
 LDFLAGS += -L$(LIBFCI_DIR) -L$(SYSROOT)/lib

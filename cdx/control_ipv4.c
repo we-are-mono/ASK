@@ -381,19 +381,6 @@ PRouteEntry IP_Check_Route(PCtEntry pCtEntry)
 }
 
 
-U64 IP_get_qosconnmark(PCtEntry pOrigEntry, PCtEntry pReplEntry)
-{
-	U64 qosconnmark;
-
-	qosconnmark = pOrigEntry->qosmark.markval;
-	if (pReplEntry->qosmark.markval != 0)
-	{
-		qosconnmark |= (((U64)pReplEntry->qosmark.markval << 32) | ((uint64_t)1 << 63));
-	}
-	return qosconnmark;
-}
-
-
 int IPv4_delete_CTpair(PCtEntry ctEntry)
 {
 	PCtEntry twin_entry;
@@ -644,8 +631,6 @@ static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 			pEntry_orig->twin_Saddr = Ctcmd.SaddrReply;
 			pEntry_orig->twin_Sport = Ctcmd.SportReply;
 			pEntry_orig->twin_Dport = Ctcmd.DportReply;
-			pEntry_orig->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_ORIG);
-			DPRINT(KERN_ERR "%s:%d entry dip %08x qosmark : %x cmdqosconnmark  : %x  qno : %d\n", __func__, __LINE__, Ctcmd.Daddr, (unsigned int)pEntry_orig->qosmark.markval, (unsigned int)Ctcmd.qosconnmark, pEntry_orig->queue);
 			pEntry_orig->status = CONNTRACK_ORIG;
 
 			if (Ctcmd.flags & CTCMD_FLAGS_ORIG_DISABLED)
@@ -678,8 +663,6 @@ static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 			pEntry_rep->twin_Saddr = Ctcmd.Saddr;
 			pEntry_rep->twin_Sport = Ctcmd.Sport;
 			pEntry_rep->twin_Dport = Ctcmd.Dport;
-			pEntry_rep->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_REPLIER);
-			DPRINT(KERN_ERR "%s:%d entry dip %08x qosmark : %x  qno : %d\n", __func__, __LINE__, Ctcmd.Daddr, (unsigned int)pEntry_rep->qosmark.markval, pEntry_rep->queue);
 			pEntry_rep->status = 0;
 			SET_PROTOCOL(pEntry_orig, pEntry_rep, Ctcmd.protocol);
 
@@ -860,7 +843,6 @@ static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 				}
 			}
 #endif
-			pEntry_orig->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_ORIG);
 			if (Ctcmd.flags & CTCMD_FLAGS_ORIG_DISABLED) {
 				pEntry_orig->status |= CONNTRACK_FF_DISABLED;
 				IP_delete_CT_route(pEntry_orig);
@@ -882,7 +864,6 @@ static int IPv4_HandleIP_CONNTRACK(U16 *p, U16 Length)
 			} else
 				pEntry_orig->status &= ~(CONNTRACK_SEC | CONNTRACK_SEC_noSA);
 #endif
-			pEntry_rep->qosmark.markval = get_ctentry_qosmark_from_qosconnmark(Ctcmd.qosconnmark, CONN_REPLIER);
 			if (Ctcmd.flags & CTCMD_FLAGS_REP_DISABLED) {
 				pEntry_rep->status |= CONNTRACK_FF_DISABLED;
 				IP_delete_CT_route(pEntry_rep);
@@ -1506,7 +1487,7 @@ static int IPv4_CT_Get_Hash_Snapshot(int ct_hash_index, int ct_total_entries, PC
 			pSnapshot->SportReply = 	pCtEntry->twin_Sport;
 			pSnapshot->DportReply = 	pCtEntry->twin_Dport;
 			pSnapshot->protocol   =  GET_PROTOCOL(pCtEntry); 
-			pSnapshot->qosconnmark     = IP_get_qosconnmark(pCtEntry, pReplyEntry);
+			pSnapshot->qosconnmark     = 0;
 			pSnapshot->SA_nr      =	0;
 			pSnapshot->SAReply_nr	= 	0;
 			pSnapshot->format = 0;

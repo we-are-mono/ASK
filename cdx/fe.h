@@ -249,6 +249,9 @@ typedef struct _tCtCommand {
 	U16		DportReply;
 	U16		protocol;
 	U16		flags;
+	/* Reserved. Was the per-connection QoS class; classification is now
+	 * the conntrack mark, decoded by the flowtable adapter. Kept so the
+	 * command layout does not move; senders write zero. */
 	U64		qosconnmark;
 	U32		route_id;
 	U32		route_id_reply;
@@ -271,7 +274,7 @@ typedef struct _tCtExCommand {
 	U16 		DportReply;
 	U16 		protocol;		/*TCP, UDP ...*/
 	U16 		flags;
-	U64 		qosconnmark;
+	U64 		qosconnmark;		/* reserved, zero; see CtCommand */
 	U32		route_id;
 	U32		route_id_reply;
 	// optional security parameters
@@ -393,7 +396,7 @@ typedef struct _tCtCommandIPv6 {
 	U16		DportReply;
 	U16		protocol;
 	U16		flags;
-	U64		qosconnmark;
+	U64		qosconnmark;		/* reserved, zero; see CtCommand */
 	U32		route_id;
 	U32		route_id_reply;
 }__attribute__((__packed__)) CtCommandIPv6, *PCtCommandIPv6;
@@ -411,7 +414,7 @@ typedef struct _tCtExCommandIPv6 {
 	U16		DportReply;
 	U16		protocol;
 	U16		flags;
-	U64		qosconnmark;
+	U64		qosconnmark;		/* reserved, zero; see CtCommand */
 	U32		route_id;
 	U32		route_id_reply;
       	U8 		SA_dir;

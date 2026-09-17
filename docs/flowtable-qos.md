@@ -65,9 +65,11 @@ skipped when `cdx_flowtable_enabled()` (`cdx/cdx_cmdhandler.c:163`, `:167`). In
 flowtable mode the board therefore pays for 128 LFQs and 128 policer profiles
 that nothing can reach.
 
-And CMM **never decides a queue**. `forward_engine.c:461` and `:659` copy
-`ct->qosconnmark` verbatim into the FCI conntrack command. That is the entire
-contribution of the daemon to the classification plane.
+And CMM **never decided a queue**. `forward_engine.c` copied `ct->qosconnmark`
+verbatim into the FCI conntrack command, and that was the entire contribution of
+the daemon to the classification plane. Increment 7 removed the copy along with
+the field, so CMM mode now has no classifier at all — the scheduler commands are
+untouched and every flow lands on the default class.
 
 ## The field everything reduces to
 
@@ -86,19 +88,21 @@ direction inside the hardware conntrack entry:
 | 24-27 | `chnl_id` | `ceetm_get_egressfq()` → CEETM channel 0-7 |
 | 31 | `ds_info_valid` | direction split |
 
-Two readers consume it. On the **software** TX path, `pfe_eth_get_queuenum()`
-(`sdk_dpaa/dpaa_eth_sg.c:1454`) pulls `ct->qosconnmark` off the skb's conntrack
-and `cpe_fp_tx()` resolves it to a CEETM FQ. On the **hardware** path,
-`insert_entry_in_classif_table()` passes `&entry->qosmark` to
+Two readers consume it. On the **software** TX path, `dpa_tx()` resolves a
+class — from the Tx queue the qdisc chose, else from `pfe_eth_get_queuenum()`,
+else from the DSCP map — and `cpe_fp_tx()` turns it into a CEETM FQ. On the
+**hardware** path, `insert_entry_in_classif_table()` passes `&entry->qosmark` to
 `dpa_get_tx_info_by_itf()` (`cdx/cdx_ehash.c:1100`), which reaches
 `cdx_get_txfq()` and bakes the resulting CEETM LFQID into the classifier entry's
 action. From then on the FMAN enqueues straight to a CEETM class queue and the
 hardware scheduler shapes the flow with no software involvement at all.
 
-`ct->qosconnmark` is a 64-bit ASK-added field on `struct nf_conn`
-(`patches/kernel/060-ask-netfilter-qosmark.patch`), set by an
-`iptables -j QOSCONNMARK` target. Low 32 bits are the original direction, high
-32 the reply, gated by bit 63 (`cdx/cdx.h:67`).
+This union is the *hardware* mark format and it stays. What fed it used to be
+`ct->qosconnmark`, a 64-bit ASK-added field on `struct nf_conn` set by an
+`iptables -j QOSCONNMARK` target — low 32 bits the original direction, high 32
+the reply, gated by bit 63. Increment 7 removed it; the key is now `ct->mark`,
+decoded by `ft_qos_class()` in the flowtable adapter. Grep results conflate the
+two names, so read each site: `union ctentry_qosmark` is not the ASK mark.
 
 ## Why a flowtable flow has no QoS today
 
@@ -859,12 +863,75 @@ queues and no bindings.
 
 ### 7. Retire the ASK mark
 
-Drop `patches/kernel/060`, the four files in `iptables-extensions/`, and
-`CONFIG_NETFILTER_XT_QOSMARK`/`_QOSCONNMARK`, once nothing reads
-`ct->qosconnmark`. Increment 4 already moved the software path, so this is
-mostly deletion. Worth doing early rather than late: the extension is not
-packaged for OpenWrt at all, so `ct->qosconnmark` is permanently zero there
-and the path is already dead in production.
+`ct->mark` is the classification key; `ct->qosconnmark` is gone, and with it
+`skb->qosmark`, the two xtables modules, and the four `iptables-extensions/`
+plugins. Increment 1 established the replacement and increment 4 moved the
+software path onto it, so this increment is deletion — but it was not the
+deletion the plan described, in two ways worth recording.
+
+**The field was never in patch 060.** `nf_conn.qosconnmark`, `IPCT_QOSCONNMARK`,
+`CTA_QOSCONNMARK`/`_PAD` and the ctnetlink dump and set paths were all in
+**050**, the conntrack-offload patch, whose other contents ASK still needs;
+`skb->qosmark` and its `__copy_skb_header` line were in **010**. So three
+patches were regenerated surgically rather than one being dropped. What 060
+actually carried besides the xtables modules is
+`net/netfilter/comcerto_fp_netfilter.c` — the hooks that stamp a conntrack's
+`comcerto_fp_info` for cmm, nothing to do with QoS. 060 keeps only those and is
+renamed `060-ask-netfilter-fastpath-hooks.patch`.
+
+Removing `IPCT_QOSCONNMARK` also puts `IPCT_SYNPROXY` back on its mainline
+value. It had been inserted mid-enum, shifting everything after it.
+
+**The mark was writable after all**, by two paths the survey missed, and both
+are now gone:
+
+- `cmmCtChange()` served `CMMD_ACTION_UPDATE` on the IPv4 and IPv6 conntrack
+  commands. It wrote the value into conntrack over ctnetlink and re-registered
+  the flow, and that write was its only effect, so the action now falls through
+  to `CMMD_ERR_UNKNOWN_ACTION`.
+- `ffcontrol`'s `ipv4 update` / `ipv6 update` CLI verbs existed to reach it. The
+  verbs, their `cmmCtChangeProcess4/6` senders and their dispatch are removed.
+
+So the honest statement is not that nothing could write the mark — it is that
+nothing in any shipped configuration did, which the maintainer confirmed.
+
+**cmm keeps compiling and keeps its FCI layout.** `cmmQosmarkGet/Set` are gone
+and `cmd.qosconnmark` is simply not filled; the structures `memset` to zero, so
+every conntrack command now carries the zero that every shipped build already
+carried. The `qosconnmark` field itself stays in `fpp.h` and `cdx/fe.h`, marked
+reserved: it is a public header, and renaming it would break source
+compatibility for out-of-tree FCI clients for no gain. cdx's side — the
+`get_ctentry_qosmark_from_qosconnmark()` decode, `IP_get_qosconnmark()` and
+their eight call sites — is removed, because a decode that can only ever
+produce zero is worse than no decode. `union ctentry_qosmark` stays: it is the
+*hardware* mark format that `cdx_get_txfq()` and `ceetm_get_egressfq()` use, not
+the conntrack one.
+
+`pfe_eth_get_queuenum()` loses its conntrack branch and falls through to
+`skb->mark & EMAC_QUEUENUM_MASK`, then to `QOS_DEFAULT_QUEUE` — the standard
+fallback that was already written beneath it.
+
+**What this costs is one capability: asymmetric per-direction class.** The
+64-bit field packed two classes into one word, bit 63 marking the reply half
+valid. `ct->mark` is 32 bits and carries one. Recovering it needs no kernel
+patch — a second field in `ct->mark` selected by direction, about eight mask
+bits and a decode change.
+
+**It also ends per-flow classification in CMM mode**, which is the part to be
+deliberate about now that cmm stays in the tree. CMM mode keeps its CEETM
+scheduler — the `CMD_QM_*` commands are untouched — but has no classifier, so
+every flow lands on the default class. That is what every shipped
+configuration already did: `cmmqos` ships disabled, `CMD_QM_QOSENABLE` is never
+sent, and with `priv->ceetm_en` false `cdx_get_txfq()` returns
+`fwd_tx_fqinfo[0]` and bypasses CEETM entirely. Per-flow QoS lives in flowtable
+mode, where `tc` builds the tree and `ct mark` selects the class.
+
+The deliberate non-change is `ATTR_QOSCONNMARK` in the libnetfilter-conntrack
+ASK patch, which is now a dead declaration mirroring a kernel attribute that no
+longer exists. Removing it means regenerating two patches against upstream
+tarballs; filed as **A146**.
+
+*Proved on hardware, 2026-09-17.* See the increment 4 re-run below.
 
 *Effort: 3–4 days.*
 

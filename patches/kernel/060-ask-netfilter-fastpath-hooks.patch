@@ -1,0 +1,429 @@
+From e4116b3fbab116938b0f183c717b46c156cc55d9 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Thu, 23 Apr 2026 17:55:41 +0200
+Subject: [PATCH] ask: comcerto fast-path netfilter hooks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds net/netfilter/comcerto_fp_netfilter.c, built under CPE_FAST_PATH from
+010. It registers prerouting, local-out and postrouting hooks that stamp a
+conntrack entry's per-direction comcerto_fp_info — ifindex, iif, the
+underlying interface for tunnelled and VLAN traffic, and the xfrm handles
+of the SAs a packet traversed — so that cmm can read the offload metadata
+back over ctnetlink and program the entry into hardware.
+
+The conntrack fields it writes are declared in 050.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ net/netfilter/Makefile                |   1 +
+ net/netfilter/comcerto_fp_netfilter.c | 384 ++++++++++++++++++++++++++
+ 2 files changed, 385 insertions(+)
+ create mode 100644 net/netfilter/comcerto_fp_netfilter.c
+
+diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
+index f0aa4d7ef499..f40b8f51082e 100644
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -22,6 +22,7 @@ nf_conntrack-$(CONFIG_DEBUG_INFO_BTF) += nf_conntrack_bpf.o
+ endif
+ 
+ obj-$(CONFIG_NETFILTER) = netfilter.o
++obj-$(CONFIG_CPE_FAST_PATH) += comcerto_fp_netfilter.o
+ obj-$(CONFIG_NETFILTER_BPF_LINK) += nf_bpf_link.o
+ 
+ obj-$(CONFIG_NETFILTER_NETLINK) += nfnetlink.o
+diff --git a/net/netfilter/comcerto_fp_netfilter.c b/net/netfilter/comcerto_fp_netfilter.c
+new file mode 100644
+index 000000000000..4da8ed73d1c8
+--- /dev/null
++++ b/net/netfilter/comcerto_fp_netfilter.c
+@@ -0,0 +1,384 @@
++/* Copyright (C) 2015 Freescale Semiconductor, Inc.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *     * Redistributions of source code must retain the above copyright
++ *       notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above copyright
++ *       notice, this list of conditions and the following disclaimer in the
++ *       documentation and/or other materials provided with the distribution.
++ *     * Neither the name of Freescale Semiconductor nor the
++ *       names of its contributors may be used to endorse or promote products
++ *       derived from this software without specific prior written permission.
++ *
++ *
++ * ALTERNATIVELY, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") as published by the Free Software
++ * Foundation, either version 2 of that License or (at your option) any
++ * later version.
++ *
++ * THIS SOFTWARE IS PROVIDED BY Freescale Semiconductor ``AS IS'' AND ANY
++ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
++ * DISCLAIMED. IN NO EVENT SHALL Freescale Semiconductor BE LIABLE FOR ANY
++ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
++ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
++ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/skbuff.h>
++#include <linux/netfilter.h>
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_ecache.h>
++
++
++#ifndef IPSEC_FLOW_CACHE
++/* this function is used to fill the xfrm info in conntrack structure */
++static void nf_ct_set_xfrm_in_fp(struct sk_buff *skb, struct xfrm_state *xfrm[MAX_SUPPORTED_XFRMS_PER_DIR],
++						  int num_xfrm, int xfrm_dir, int *rekey)
++{
++	struct nf_conn *ct;
++	enum ip_conntrack_info ctinfo;
++	struct comcerto_fp_info *fp_info;
++	int dir, xfrm_ind, ii;
++
++	if (num_xfrm > MAX_SUPPORTED_XFRMS_PER_DIR)
++	{
++		printk(KERN_ERR "%s(%d) num_xfrm %d > %d(MAX supported)\n",
++			__func__,__LINE__,num_xfrm,MAX_SUPPORTED_XFRMS_PER_DIR);
++		return;
++	}	
++	/* get ct info */
++	ct = nf_ct_get(skb, &ctinfo);
++	if (!ct)
++	{
++		return;
++	}
++	
++	dir = CTINFO2DIR(ctinfo);
++	if (dir == IP_CT_DIR_ORIGINAL) {
++		fp_info = &ct->fp_info[IP_CT_DIR_ORIGINAL];
++	} else {
++		fp_info = &ct->fp_info[IP_CT_DIR_REPLY];
++	}
++
++	if (xfrm_dir == XFRM_POLICY_FWD)
++		xfrm_dir = 0;
++	/* xfrm_dir can be XFRM_POLICY_IN, XFRM_POLICY_OUT, XFRM_POLICY_FWD */
++	/* fp_info->xfrm_id[4] has 4 instances , first 2 instances reserved for direction IN/FWD
++	   next 2 instances for OUT direction */
++	xfrm_ind =  xfrm_dir << 1;
++	
++	for (ii=0; ii<num_xfrm; ii++)
++	{
++		if (fp_info->xfrm_handle[xfrm_ind+ii]  && 
++			fp_info->xfrm_handle[xfrm_ind+ii] != xfrm[ii]->handle)
++		{
++			*rekey = 1;
++		}
++		/* filling SA info and xfrm handle */
++		fp_info->xfrm_handle[xfrm_ind+ii] = xfrm[ii]->handle;
++		/*printk("%s(%d)ii %d, index %d ct %p,  dir %d, SPI %x, proto %d xfrmdir %d, sgid %x\n",
++		__func__,__LINE__,ii, xfrm_ind+ii, ct,  dir, xfrm[ii]->id.spi, xfrm[ii]->id.proto,
++		xfrm_dir, fp_info->xfrm_handle[xfrm_ind+ii]); */
++	}
++	return;
++}
++
++/* this function is used to get the inbound and outbound xfrm info corresponding to
++ * skb , if exist fill in conntrack structure */
++static unsigned int fp_netfilter_get_xfrm_info(struct sk_buff *skb)
++{
++	struct nf_conn *ct;
++	enum ip_conntrack_info ctinfo;
++	struct sec_path *sp ;
++	struct xfrm_state *x[2]={}, *tmp;
++	int num_xfrms = 0, i, dir, rekey = 0;
++	struct dst_entry *dst1 = skb_dst(skb);
++
++	/* get ct info */
++	ct = nf_ct_get(skb, &ctinfo);
++	if (!ct)
++	{
++		return NF_ACCEPT;
++	}
++	/* ctinfo direction [originator/replier] */
++	dir = CTINFO2DIR(ctinfo);
++
++	/* extract the inbound IPSec information if exist */
++	if ((sp = skb_sec_path(skb)))
++	{
++		for (i=sp->len-1; (i>=0) && (num_xfrms < MAX_SUPPORTED_XFRMS_PER_DIR); i--)
++		{
++			x[num_xfrms] = sp->xvec[i];
++	
++			/* printk("%s(%d) num_xfrm %d , xfrm %p , SPI %x dir XFRM_POLICY_FWD, handle %x\n",
++				__func__,__LINE__,num_xfrms, x[num_xfrms], 
++				x[num_xfrms]->id.spi, x[num_xfrms]->handle);*/
++			num_xfrms++;
++		}
++		if (num_xfrms)
++			nf_ct_set_xfrm_in_fp(skb, x, num_xfrms, XFRM_POLICY_FWD, &rekey);
++	}
++
++	/* extract the outbound IPSec information if exist */
++	if (dst1 && dst1->xfrm)
++	{
++		for (i=0; i<MAX_SUPPORTED_XFRMS_PER_DIR; i++)
++			x[i]  = 0;
++		num_xfrms = 0;
++	
++		while(((tmp = dst1->xfrm) != NULL) && (num_xfrms<MAX_SUPPORTED_XFRMS_PER_DIR))  {
++			/*printk("%s(%d) num_xfrm %d , xfrm %p , SPI %x, handle %x XFRM_POLICY_OUT\n",
++				__func__,__LINE__, num_xfrms, tmp, tmp->id.spi, tmp->handle);*/
++			x[num_xfrms] = tmp;			
++			dst1 = xfrm_dst_child(dst1);
++			num_xfrms++;
++			if (dst1 == NULL) {
++				printk("%s(%d) DST is null \n",__func__,__LINE__);
++				break;
++			}
++		}
++		if (num_xfrms)
++			nf_ct_set_xfrm_in_fp(skb, x, num_xfrms, XFRM_POLICY_OUT, &rekey);
++	}
++
++	/* if there is a change in ipsec info, send rekey conntrack event */
++	if (rekey)
++	{
++		/*printk("%s(%d) sending rekey event\n",__func__,__LINE__); */
++		nf_conntrack_event_cache(IPCT_PROTOINFO, ct);
++	}
++	return NF_ACCEPT;
++}
++#endif /* IPSEC_FLOW_CACHE */
++
++static unsigned int fp_netfilter_pre_routing(int family, const struct nf_hook_state *state, struct sk_buff *skb)
++{
++	struct nf_conn *ct;
++	u_int8_t protonum;
++	enum ip_conntrack_info ctinfo;
++	struct comcerto_fp_info *fp_info;
++	int dir;
++
++	ct = nf_ct_get(skb, &ctinfo);
++	if (!ct)
++		goto done;
++
++	protonum = nf_ct_protonum(ct);
++	if ((protonum != IPPROTO_TCP) && (protonum != IPPROTO_UDP) && (protonum != IPPROTO_IPIP) && (protonum != IPPROTO_IPV6) &&
++	(protonum != IPPROTO_GRE) && (protonum != IPPROTO_ESP) && (protonum != IPPROTO_AH))
++		goto done;
++
++	dir = CTINFO2DIR(ctinfo);
++
++
++	/* We could also check for changes and notify userspace (or print message) */
++	if (dir == IP_CT_DIR_ORIGINAL) {
++		fp_info = &ct->fp_info[IP_CT_DIR_ORIGINAL];
++	} else {
++		fp_info = &ct->fp_info[IP_CT_DIR_REPLY];
++	}
++
++	if (fp_info->mark && (fp_info->mark != skb->mark))
++		pr_debug("ct: mark changed %x, %x\n", fp_info->mark, skb->mark);
++
++
++	if (fp_info->ifindex && (fp_info->ifindex != skb->dev->ifindex))
++		pr_debug("ct: ifindex changed %d, %d\n", fp_info->ifindex, skb->dev->ifindex);
++
++	if (fp_info->iif && (fp_info->iif != skb->iif_index))
++		pr_debug("ct: iif changed %d, %d\n", fp_info->iif, skb->iif_index);
++	/*      // commenting it out as a duplicate print. In most cases iif and underlying iif are the same.
++			if (fp_info->underlying_iif && (fp_info->underlying_iif != skb->underlying_iif))
++			if (printk_ratelimit())
++			printk(KERN_DEBUG "ct: underlying_iif changed %d, %d\n", fp_info->underlying_iif, skb->underlying_iif);
++	 */
++
++	fp_info->mark = skb->mark;
++	fp_info->ifindex = skb->dev->ifindex;
++	/* now skb_iif always tracks dev,so iif_index stores incoming interface */
++	fp_info->iif = skb->iif_index;
++	fp_info->underlying_iif = skb->underlying_iif;
++	/*omit priority bits in vlan tag*/
++	fp_info->underlying_vlan_id = skb->underlying_vlan_tci & VLAN_VID_MASK;
++
++done:
++	return NF_ACCEPT;
++}
++
++static unsigned int fp_netfilter_local_out(int family, const struct nf_hook_state *state, struct sk_buff *skb)
++{
++	struct nf_conn *ct;
++	u_int8_t protonum;
++	enum ip_conntrack_info ctinfo;
++	struct comcerto_fp_info *fp_info;
++	int dir,update_event=0;
++
++	ct = nf_ct_get(skb, &ctinfo);
++	if (!ct)
++		goto done;
++
++
++	protonum = nf_ct_protonum(ct);
++	if ((protonum != IPPROTO_IPIP) && (protonum != IPPROTO_IPV6) && (protonum != IPPROTO_GRE))
++			goto done;
++
++	dir = CTINFO2DIR(ctinfo);
++
++	/* We could also check for changes and notify userspace (or print message) */
++	if (dir == IP_CT_DIR_ORIGINAL) {
++		fp_info = &ct->fp_info[IP_CT_DIR_ORIGINAL];
++	} else {
++		fp_info = &ct->fp_info[IP_CT_DIR_REPLY];
++	}
++
++	if (fp_info->mark && (fp_info->mark != skb->mark))
++		pr_debug("ct: mark changed %x, %x\n", fp_info->mark, skb->mark);
++
++	if ((fp_info->ifindex) && (skb->dev) && (fp_info->ifindex != skb->dev->ifindex)) {
++		pr_debug("ct: ifindex changed %d, %d\n", fp_info->ifindex, skb->dev->ifindex);
++		update_event=1;
++	}
++
++	fp_info->mark = skb->mark;
++	if (skb->dev)
++		fp_info->ifindex = skb->dev->ifindex;
++
++	if (update_event == 1) {
++		nf_conntrack_event_cache(IPCT_PROTOINFO, ct);
++	}
++
++	fp_info->iif = 0; /* To identify the connection as local connection */
++
++#ifndef IPSEC_FLOW_CACHE
++	/* fill xfrm info in conntrack structure */
++	return (fp_netfilter_get_xfrm_info(skb));
++#endif /* IPSEC_FLOW_CACHE */
++done:
++	return NF_ACCEPT;
++}
++
++
++#ifndef IPSEC_FLOW_CACHE
++/* this post routing hook is introduced to gather the xfrm information
++ * corresponding to ctinfo of skb and fill it in conntrack structure.
++ * This is required to take the xfrm info of ctinfo part of conntrack message
++ * to user space
++ */
++static unsigned int fp_ip_netfilter_post_routing(void *priv,
++						struct sk_buff *skb,
++						const struct nf_hook_state *state)
++{
++	return (fp_netfilter_get_xfrm_info(skb));
++}
++#endif /* IPSEC_FLOW_CACHE */
++
++static unsigned int fp_ipv4_netfilter_pre_routing(void *priv,
++		struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	return fp_netfilter_pre_routing(PF_INET, state, skb);
++}
++
++static unsigned int fp_ipv6_netfilter_pre_routing(void *priv,
++		struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	return fp_netfilter_pre_routing(PF_INET6, state, skb);
++}
++
++static unsigned int fp_ipv4_netfilter_local_out(void *priv,
++		struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	return fp_netfilter_local_out(PF_INET, state, skb);
++}
++
++static unsigned int fp_ipv6_netfilter_local_out(void *priv,
++		struct sk_buff *skb,
++		const struct nf_hook_state *state)
++{
++	return fp_netfilter_local_out(PF_INET6, state, skb);
++}
++
++
++static struct nf_hook_ops fp_netfilter_ops[] __read_mostly = {
++	{
++		.hook       = fp_ipv4_netfilter_pre_routing,
++		.pf     = NFPROTO_IPV4,
++		.hooknum    = NF_INET_PRE_ROUTING,
++		.priority   = NF_IP_PRI_LAST,
++	},
++	{
++		.hook       = fp_ipv6_netfilter_pre_routing,
++		.pf     = NFPROTO_IPV6,
++		.hooknum    = NF_INET_PRE_ROUTING,
++		.priority   = NF_IP_PRI_LAST,
++	},
++	/* For local_out packets, routing will be done
++	   1. before entering the LOCAL_OUT hook
++	   2. and at the completion of all mangle rules,
++	   if there are changes to the packet like mark etc
++
++	   So NF_IP_PRI_LAST priority is used here to receive
++	   the mark value of the packet, at the end of all changes.
++	 */
++	{
++		.hook           = fp_ipv4_netfilter_local_out,
++		.pf             = NFPROTO_IPV4,
++		.hooknum        = NF_INET_LOCAL_OUT,
++		.priority       = NF_IP_PRI_LAST - 1,
++	},
++	{
++		.hook           = fp_ipv6_netfilter_local_out,
++		.pf             = NFPROTO_IPV6,
++		.hooknum        = NF_INET_LOCAL_OUT,
++		.priority       = NF_IP_PRI_LAST - 1,
++	},
++
++#ifndef IPSEC_FLOW_CACHE
++	{
++		.hook			= fp_ip_netfilter_post_routing,
++		.pf 			= NFPROTO_IPV4,
++		.hooknum		= NF_INET_POST_ROUTING,
++		.priority		= NF_IP_PRI_LAST - 1, /* this priority should be less than INT_MAX */
++	},
++	{
++		.hook			= fp_ip_netfilter_post_routing,
++		.pf 			= NFPROTO_IPV6,
++		.hooknum		= NF_INET_POST_ROUTING,
++		.priority		= NF_IP_PRI_LAST - 1, /* this priority should be less than INT_MAX, */
++	},
++#endif
++};
++
++static int __init fp_netfilter_init(void)
++{
++	int rc;
++
++	rc = nf_register_net_hooks(&init_net, fp_netfilter_ops, ARRAY_SIZE(fp_netfilter_ops));
++	if (rc < 0) {
++		printk(KERN_ERR "fp_netfilter_ops: can't register hooks.\n");
++		goto err0;
++	}
++
++	return 0;
++
++err0:
++	return rc;
++}
++
++
++static void __exit fp_netfilter_exit(void)
++{
++	nf_unregister_net_hooks(&init_net, fp_netfilter_ops, ARRAY_SIZE(fp_netfilter_ops));
++}
++
++module_init(fp_netfilter_init);
++module_exit(fp_netfilter_exit);
+-- 
+2.47.3
+
