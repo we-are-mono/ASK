@@ -7,40 +7,22 @@ Adds support for:
 - IPS_PERMANENT and IPS_DPI_ALLOWED connection status bits
 - Increased socket buffer size (10MB) for high-volume tracking
 - Comcerto fast path info (ifindex, iif, mark, underlying_iif, underlying_vlan_id)
-- QoS connection marking (64-bit qosconnmark attribute)
 - XFRM/IPSec handle tracking for fast path
 - Build ID support for netlink messages
 
 These extensions enable CMM daemon integration with ASK hardware offloading
 on NXP Layerscape processors.
 
-Note: CTA attribute ordering matches kernel 6.12 nfnetlink_conntrack.h:
-  CTA_LAYERSCAPE_FP_ORIG, CTA_LAYERSCAPE_FP_REPLY, CTA_QOSCONNMARK, CTA_QOSCONNMARK_PAD
+The QoS connection mark this patch used to declare is gone: the kernel
+attribute it mirrored no longer exists, so ATTR_QOSCONNMARK and
+CTA_QOSCONNMARK described something nothing could carry.
 
 Upstream-Status: Inappropriate [NXP vendor extension]
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- include/internal/internal.h                   |   1 +
- include/internal/object.h                     |  12 ++
- .../libnetfilter_conntrack.h                  |  17 ++
- .../linux_nf_conntrack_common.h               |  10 +-
- .../linux_nfnetlink_conntrack.h               |  18 ++
- src/conntrack/api.c                           |  50 ++++++
- src/conntrack/build_mnl.c                     |  21 +++
- src/conntrack/compare.c                       |  14 +-
- src/conntrack/copy.c                          |   9 +
- src/conntrack/getter.c                        |  80 +++++++++
- src/conntrack/parse_mnl.c                     | 161 ++++++++++++++++++
- src/conntrack/setter.c                        |   9 +
- src/conntrack/snprintf_default.c              |  13 ++
- src/conntrack/snprintf_xml.c                  |   6 +
- src/main.c                                    |   3 +
- 15 files changed, 422 insertions(+), 2 deletions(-)
-
-diff --git a/include/internal/internal.h b/include/internal/internal.h
-index 7cd7c44..2b544cd 100644
---- a/include/internal/internal.h
-+++ b/include/internal/internal.h
+diff -ruN v110/include/internal/internal.h v110-ask/include/internal/internal.h
+--- a/include/internal/internal.h	2024-09-25 12:15:49.000000000 +0200
++++ b/include/internal/internal.h	2026-09-17 17:21:43.211575830 +0200
 @@ -9,6 +9,7 @@
  #include <stdio.h>
  #include <stdlib.h>
@@ -49,11 +31,10 @@ index 7cd7c44..2b544cd 100644
  #include <string.h>
  #include <sys/types.h>
  #include <arpa/inet.h>
-diff --git a/include/internal/object.h b/include/internal/object.h
-index 658e4d2..72263c9 100644
---- a/include/internal/object.h
-+++ b/include/internal/object.h
-@@ -149,6 +149,16 @@ struct __nfct_nat {
+diff -ruN v110/include/internal/object.h v110-ask/include/internal/object.h
+--- a/include/internal/object.h	2024-09-25 12:15:49.000000000 +0200
++++ b/include/internal/object.h	2026-09-17 17:21:43.227576064 +0200
+@@ -149,6 +149,16 @@
  	union __nfct_l4_src 	l4min, l4max;
  };
  
@@ -70,20 +51,18 @@ index 658e4d2..72263c9 100644
  struct nfct_tuple_head {
  	struct __nfct_tuple 	orig;
  
-@@ -164,6 +174,8 @@ struct nf_conntrack {
+@@ -164,6 +174,7 @@
  	uint32_t 	timeout;
  	uint32_t	mark;
  	uint32_t	secmark;
-+	uint64_t	qosconnmark;			/* NXP ASK: QoS connection mark */
 +	struct __nfct_comcerto_fp_info fp_info[__DIR_MAX];	/* NXP ASK: fast path info */
  	uint32_t 	status;
  	uint32_t	use;
  	uint32_t	id;
-diff --git a/include/libnetfilter_conntrack/libnetfilter_conntrack.h b/include/libnetfilter_conntrack/libnetfilter_conntrack.h
-index 27d972d..919c8b0 100644
---- a/include/libnetfilter_conntrack/libnetfilter_conntrack.h
-+++ b/include/libnetfilter_conntrack/libnetfilter_conntrack.h
-@@ -144,6 +144,20 @@ enum nf_conntrack_attr {
+diff -ruN v110/include/libnetfilter_conntrack/libnetfilter_conntrack.h v110-ask/include/libnetfilter_conntrack/libnetfilter_conntrack.h
+--- a/include/libnetfilter_conntrack/libnetfilter_conntrack.h	2024-09-25 12:15:49.000000000 +0200
++++ b/include/libnetfilter_conntrack/libnetfilter_conntrack.h	2026-09-17 17:21:43.247576356 +0200
+@@ -144,6 +144,19 @@
  	ATTR_SYNPROXY_ISN = 72,			/* u32 bits */
  	ATTR_SYNPROXY_ITS,			/* u32 bits */
  	ATTR_SYNPROXY_TSOFF,			/* u32 bits */
@@ -100,11 +79,10 @@ index 27d972d..919c8b0 100644
 +	ATTR_REPL_COMCERTO_FP_XFRM_HANDLE,
 +	ATTR_ORIG_COMCERTO_FP_UNDERLYING_VID,
 +	ATTR_REPL_COMCERTO_FP_UNDERLYING_VID,
-+	ATTR_QOSCONNMARK,			/* NXP ASK: u64 bits */
  	ATTR_MAX
  };
  
-@@ -219,6 +233,9 @@ enum nf_conntrack_msg_type {
+@@ -219,6 +232,9 @@
  extern struct nf_conntrack *nfct_new(void);
  extern void nfct_destroy(struct nf_conntrack *ct);
  
@@ -114,11 +92,10 @@ index 27d972d..919c8b0 100644
  /* clone */
  struct nf_conntrack *nfct_clone(const struct nf_conntrack *ct);
  
-diff --git a/include/libnetfilter_conntrack/linux_nf_conntrack_common.h b/include/libnetfilter_conntrack/linux_nf_conntrack_common.h
-index 131ca25..73953fa 100644
---- a/include/libnetfilter_conntrack/linux_nf_conntrack_common.h
-+++ b/include/libnetfilter_conntrack/linux_nf_conntrack_common.h
-@@ -123,6 +123,14 @@ enum ip_conntrack_status {
+diff -ruN v110/include/libnetfilter_conntrack/linux_nf_conntrack_common.h v110-ask/include/libnetfilter_conntrack/linux_nf_conntrack_common.h
+--- a/include/libnetfilter_conntrack/linux_nf_conntrack_common.h	2024-09-25 12:15:49.000000000 +0200
++++ b/include/libnetfilter_conntrack/linux_nf_conntrack_common.h	2026-09-17 17:21:43.211575830 +0200
+@@ -123,6 +123,14 @@
  	IPS_HW_OFFLOAD_BIT = 15,
  	IPS_HW_OFFLOAD = (1 << IPS_HW_OFFLOAD_BIT),
  
@@ -133,7 +110,7 @@ index 131ca25..73953fa 100644
  	/* Be careful here, modifying these bits can make things messy,
  	 * so don't let users modify them directly.
  	 */
-@@ -131,7 +139,7 @@ enum ip_conntrack_status {
+@@ -131,7 +139,7 @@
  				 IPS_SEQ_ADJUST | IPS_TEMPLATE | IPS_UNTRACKED |
  				 IPS_OFFLOAD | IPS_HW_OFFLOAD),
  
@@ -142,23 +119,20 @@ index 131ca25..73953fa 100644
  };
  
  /* Connection tracking event types */
-diff --git a/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h b/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h
-index b8ffe02..418870a 100644
---- a/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h
-+++ b/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h
-@@ -60,6 +60,11 @@ enum ctattr_type {
+diff -ruN v110/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h v110-ask/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h
+--- a/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h	2024-09-25 12:15:49.000000000 +0200
++++ b/include/libnetfilter_conntrack/linux_nfnetlink_conntrack.h	2026-09-17 17:21:43.251576415 +0200
+@@ -60,6 +60,9 @@
  	CTA_SYNPROXY,
  	CTA_FILTER,
  	CTA_STATUS_MASK,
 +	/* NXP ASK: Layerscape fast path attributes - order must match kernel! */
 +	CTA_LAYERSCAPE_FP_ORIG,
 +	CTA_LAYERSCAPE_FP_REPLY,
-+	CTA_QOSCONNMARK,
-+	CTA_QOSCONNMARK_PAD,
  	__CTA_MAX
  };
  #define CTA_MAX (__CTA_MAX - 1)
-@@ -238,6 +243,19 @@ enum ctattr_help {
+@@ -238,6 +241,19 @@
  };
  #define CTA_HELP_MAX (__CTA_HELP_MAX - 1)
  
@@ -178,15 +152,13 @@ index b8ffe02..418870a 100644
  enum ctattr_secctx {
  	CTA_SECCTX_UNSPEC,
  	CTA_SECCTX_NAME,
-diff --git a/src/conntrack/api.c b/src/conntrack/api.c
-index f0e038b..72adfb6 100644
---- a/src/conntrack/api.c
-+++ b/src/conntrack/api.c
-@@ -105,6 +105,56 @@ void nfct_destroy(struct nf_conntrack *ct)
- 	ct = NULL; /* bugtrap */
+diff -ruN v110/src/conntrack/api.c v110-ask/src/conntrack/api.c
+--- a/src/conntrack/api.c	2024-09-25 12:15:49.000000000 +0200
++++ b/src/conntrack/api.c	2026-09-17 17:21:43.259576531 +0200
+@@ -106,6 +106,55 @@
  }
  
-+/**
+ /**
 + * nfct_clear - clear/reset a conntrack object for reuse
 + * \param ct pointer to the conntrack object
 + *
@@ -220,7 +192,6 @@ index f0e038b..72adfb6 100644
 +	ct->timeout = 0;
 +	ct->mark = 0;
 +	ct->secmark = 0;
-+	ct->qosconnmark = 0;
 +	memset(&ct->fp_info, 0, sizeof(ct->fp_info));
 +	ct->status = 0;
 +	ct->use = 0;
@@ -236,25 +207,17 @@ index f0e038b..72adfb6 100644
 +	memset(&ct->synproxy, 0, sizeof(ct->synproxy));
 +}
 +
- /**
++/**
   * nf_sizeof - return the size in bytes of a certain conntrack object
   * \param ct pointer to the conntrack object
-diff --git a/src/conntrack/build_mnl.c b/src/conntrack/build_mnl.c
-index e563c4e..66fd9dc 100644
---- a/src/conntrack/build_mnl.c
-+++ b/src/conntrack/build_mnl.c
-@@ -449,6 +449,20 @@ static void nfct_build_synproxy(struct nlmsghdr *nlh,
+  *
+diff -ruN v110/src/conntrack/build_mnl.c v110-ask/src/conntrack/build_mnl.c
+--- a/src/conntrack/build_mnl.c	2024-09-25 12:15:49.000000000 +0200
++++ b/src/conntrack/build_mnl.c	2026-09-17 17:21:43.267576648 +0200
+@@ -449,6 +449,12 @@
  	mnl_attr_nest_end(nlh, nest);
  }
  
-+/* NXP ASK: Build QoS connection mark */
-+static void nfct_build_qosconnmark(struct nlmsghdr *nlh,
-+				   const struct nf_conntrack *ct)
-+{
-+	uint64_t qosconnmark = htobe64(ct->qosconnmark);
-+	mnl_attr_put(nlh, CTA_QOSCONNMARK, sizeof(uint64_t), &qosconnmark);
-+}
-+
 +/* NXP ASK: Build ID */
 +static void nfct_build_id(struct nlmsghdr *nlh, const struct nf_conntrack *ct)
 +{
@@ -264,84 +227,33 @@ index e563c4e..66fd9dc 100644
  int
  nfct_nlmsg_build(struct nlmsghdr *nlh, const struct nf_conntrack *ct)
  {
-@@ -592,6 +606,13 @@ nfct_nlmsg_build(struct nlmsghdr *nlh, const struct nf_conntrack *ct)
+@@ -592,6 +598,10 @@
  	    test_bit(ATTR_SYNPROXY_TSOFF, ct->head.set))
  		nfct_build_synproxy(nlh, ct);
  
 +	/* NXP ASK: QoS connection mark and ID */
-+	if (test_bit(ATTR_QOSCONNMARK, ct->head.set))
-+		nfct_build_qosconnmark(nlh, ct);
-+
 +	if (test_bit(ATTR_ID, ct->head.set))
 +		nfct_build_id(nlh, ct);
 +
  	return 0;
  }
  
-diff --git a/src/conntrack/compare.c b/src/conntrack/compare.c
-index 8b2f3cb..86dece3 100644
---- a/src/conntrack/compare.c
-+++ b/src/conntrack/compare.c
-@@ -318,7 +318,16 @@ cmp_mark(const struct nf_conntrack *ct1,
+diff -ruN v110/src/conntrack/compare.c v110-ask/src/conntrack/compare.c
+--- a/src/conntrack/compare.c	2024-09-25 12:15:49.000000000 +0200
++++ b/src/conntrack/compare.c	2026-09-17 17:21:43.267576648 +0200
+@@ -318,7 +318,7 @@
  	       nfct_get_attr_u32(ct2, ATTR_MARK);
  }
  
 -static int 
-+/* NXP ASK: QoS connection mark comparison */
-+static int
-+cmp_qosconnmark(const struct nf_conntrack *ct1,
-+		const struct nf_conntrack *ct2,
-+		unsigned int flags)
-+{
-+	return (ct1->qosconnmark == ct2->qosconnmark);
-+}
-+
 +static int
  cmp_timeout(const struct nf_conntrack *ct1,
  	    const struct nf_conntrack *ct2,
  	    unsigned int flags)
-@@ -448,6 +457,9 @@ static int cmp_meta(const struct nf_conntrack *ct1,
- 		return 0;
- 	if (!__cmp(ATTR_MARK, ct1, ct2, flags, cmp_mark, false))
- 		return 0;
-+	/* NXP ASK: QoS connection mark */
-+	if (!__cmp(ATTR_QOSCONNMARK, ct1, ct2, flags, cmp_qosconnmark, false))
-+		return 0;
- 	if (!__cmp(ATTR_TIMEOUT, ct1, ct2, flags, cmp_timeout, true))
- 		return 0;
- 	if (!__cmp(ATTR_STATUS, ct1, ct2, flags, cmp_status, true))
-diff --git a/src/conntrack/copy.c b/src/conntrack/copy.c
-index 402f994..c20b400 100644
---- a/src/conntrack/copy.c
-+++ b/src/conntrack/copy.c
-@@ -516,6 +516,13 @@ static void copy_attr_synproxy_tsoff(struct nf_conntrack *dest,
- 	dest->synproxy.tsoff = orig->synproxy.tsoff;
- }
- 
-+/* NXP ASK: QoS connection mark copy */
-+static void copy_attr_qosconnmark(struct nf_conntrack *dest,
-+				  const struct nf_conntrack *orig)
-+{
-+	dest->qosconnmark = orig->qosconnmark;
-+}
-+
- const copy_attr copy_attr_array[ATTR_MAX] = {
- 	[ATTR_ORIG_IPV4_SRC]		= copy_attr_orig_ipv4_src,
- 	[ATTR_ORIG_IPV4_DST] 		= copy_attr_orig_ipv4_dst,
-@@ -592,6 +599,8 @@ const copy_attr copy_attr_array[ATTR_MAX] = {
- 	[ATTR_SYNPROXY_ITS]		= copy_attr_synproxy_its,
- 	[ATTR_SYNPROXY_ISN]		= copy_attr_synproxy_isn,
- 	[ATTR_SYNPROXY_TSOFF]		= copy_attr_synproxy_tsoff,
-+	/* NXP ASK: QoS connection mark */
-+	[ATTR_QOSCONNMARK]		= copy_attr_qosconnmark,
- };
- 
- /* this is used by nfct_copy() with the NFCT_CP_OVERRIDE flag set. */
-diff --git a/src/conntrack/getter.c b/src/conntrack/getter.c
-index d1f9a5a..ff46725 100644
---- a/src/conntrack/getter.c
-+++ b/src/conntrack/getter.c
-@@ -384,6 +384,72 @@ static const void *get_attr_synproxy_tsoff(const struct nf_conntrack *ct)
+diff -ruN v110/src/conntrack/getter.c v110-ask/src/conntrack/getter.c
+--- a/src/conntrack/getter.c	2024-09-25 12:15:49.000000000 +0200
++++ b/src/conntrack/getter.c	2026-09-17 17:21:43.275576765 +0200
+@@ -384,6 +384,67 @@
  	return &ct->synproxy.tsoff;
  }
  
@@ -406,15 +318,10 @@ index d1f9a5a..ff46725 100644
 +	return &ct->fp_info[__DIR_REPL].underlying_vlan_id;
 +}
 +
-+static const void *get_attr_qosconnmark(const struct nf_conntrack *ct)
-+{
-+	return &ct->qosconnmark;
-+}
-+
  const get_attr get_attr_array[ATTR_MAX] = {
  	[ATTR_ORIG_IPV4_SRC]		= get_attr_orig_ipv4_src,
  	[ATTR_ORIG_IPV4_DST] 		= get_attr_orig_ipv4_dst,
-@@ -460,4 +526,18 @@ const get_attr get_attr_array[ATTR_MAX] = {
+@@ -460,4 +521,17 @@
  	[ATTR_SYNPROXY_ISN]		= get_attr_synproxy_isn,
  	[ATTR_SYNPROXY_ITS]		= get_attr_synproxy_its,
  	[ATTR_SYNPROXY_TSOFF]		= get_attr_synproxy_tsoff,
@@ -431,13 +338,11 @@ index d1f9a5a..ff46725 100644
 +	[ATTR_REPL_COMCERTO_FP_XFRM_HANDLE]	= get_attr_repl_comcerto_fp_xfrm_handle,
 +	[ATTR_ORIG_COMCERTO_FP_UNDERLYING_VID]	= get_attr_orig_comcerto_fp_underlying_vid,
 +	[ATTR_REPL_COMCERTO_FP_UNDERLYING_VID]	= get_attr_repl_comcerto_fp_underlying_vid,
-+	[ATTR_QOSCONNMARK]			= get_attr_qosconnmark,
  };
-diff --git a/src/conntrack/parse_mnl.c b/src/conntrack/parse_mnl.c
-index 3cbfc6a..3af6cd4 100644
---- a/src/conntrack/parse_mnl.c
-+++ b/src/conntrack/parse_mnl.c
-@@ -856,6 +856,139 @@ static int nfct_parse_synproxy(const struct nlattr *attr,
+diff -ruN v110/src/conntrack/parse_mnl.c v110-ask/src/conntrack/parse_mnl.c
+--- a/src/conntrack/parse_mnl.c	2024-09-25 12:15:49.000000000 +0200
++++ b/src/conntrack/parse_mnl.c	2026-09-17 17:21:43.283576883 +0200
+@@ -856,6 +856,139 @@
  	return 0;
  }
  
@@ -577,7 +482,7 @@ index 3cbfc6a..3af6cd4 100644
  static int
  nfct_parse_conntrack_attr_cb(const struct nlattr *attr, void *data)
  {
-@@ -897,6 +1030,16 @@ nfct_parse_conntrack_attr_cb(const struct nlattr *attr, void *data)
+@@ -897,6 +1030,15 @@
  	case CTA_NAT_DST:
  		/* deprecated */
  		break;
@@ -587,14 +492,13 @@ index 3cbfc6a..3af6cd4 100644
 +		if (mnl_attr_validate(attr, MNL_TYPE_NESTED) < 0)
 +			abi_breakage();
 +		break;
-+	case CTA_QOSCONNMARK:
 +		if (mnl_attr_validate(attr, MNL_TYPE_U64) < 0)
 +			abi_breakage();
 +		break;
  	}
  	tb[type] = attr;
  	return MNL_CB_OK;
-@@ -1029,6 +1172,24 @@ nfct_payload_parse(const void *payload, size_t payload_len,
+@@ -1029,6 +1171,19 @@
  			return -1;
  	}
  
@@ -611,92 +515,13 @@ index 3cbfc6a..3af6cd4 100644
 +			return -1;
 +	}
 +
-+	if (tb[CTA_QOSCONNMARK]) {
-+		ct->qosconnmark = be64toh(mnl_attr_get_u64(tb[CTA_QOSCONNMARK]));
-+		set_bit(ATTR_QOSCONNMARK, ct->head.set);
-+	}
-+
  	return 0;
  }
  
-diff --git a/src/conntrack/setter.c b/src/conntrack/setter.c
-index cee81f1..2d25380 100644
---- a/src/conntrack/setter.c
-+++ b/src/conntrack/setter.c
-@@ -457,6 +457,13 @@ set_attr_synproxy_tsoff(struct nf_conntrack *ct, const void *value, size_t len)
- 	ct->synproxy.tsoff = *((uint32_t *) value);
- }
- 
-+/* NXP ASK: QoS connection mark setter */
-+static void
-+set_attr_qosconnmark(struct nf_conntrack *ct, const void *value, size_t len)
-+{
-+	ct->qosconnmark = *((uint64_t *) value);
-+}
-+
- static void
- set_attr_do_nothing(struct nf_conntrack *ct, const void *value, size_t len) {}
- 
-@@ -536,4 +543,6 @@ const set_attr set_attr_array[ATTR_MAX] = {
- 	[ATTR_SYNPROXY_ISN]	= set_attr_synproxy_isn,
- 	[ATTR_SYNPROXY_ITS]	= set_attr_synproxy_its,
- 	[ATTR_SYNPROXY_TSOFF]	= set_attr_synproxy_tsoff,
-+	/* NXP ASK: QoS connection mark */
-+	[ATTR_QOSCONNMARK]	= set_attr_qosconnmark,
- };
-diff --git a/src/conntrack/snprintf_default.c b/src/conntrack/snprintf_default.c
-index 4fe2a2d..8d43808 100644
---- a/src/conntrack/snprintf_default.c
-+++ b/src/conntrack/snprintf_default.c
-@@ -244,6 +244,13 @@ __snprintf_mark(char *buf, unsigned int len, const struct nf_conntrack *ct)
- 	return (snprintf(buf, len, "mark=%u ", ct->mark));
- }
- 
-+/* NXP ASK: QoS connection mark output */
-+static int
-+__snprintf_qosconnmark(char *buf, unsigned int len, const struct nf_conntrack *ct)
-+{
-+	return (snprintf(buf, len, "qosconnmark=0x%" PRIx64 " ", ct->qosconnmark));
-+}
-+
- static int
- __snprintf_secmark(char *buf, unsigned int len, const struct nf_conntrack *ct)
- {
-@@ -473,6 +480,12 @@ int __snprintf_conntrack_default(char *buf,
- 		BUFFER_SIZE(ret, size, len, offset);
- 	}
- 
-+	/* NXP ASK: QoS connection mark output */
-+	if (test_bit(ATTR_QOSCONNMARK, ct->head.set)) {
-+		ret = __snprintf_qosconnmark(buf+offset, len, ct);
-+		BUFFER_SIZE(ret, size, len, offset);
-+	}
-+
- 	if (test_bit(ATTR_SECMARK, ct->head.set)) {
- 		ret = __snprintf_secmark(buf+offset, len, ct);
- 		BUFFER_SIZE(ret, size, len, offset);
-diff --git a/src/conntrack/snprintf_xml.c b/src/conntrack/snprintf_xml.c
-index e557df2..ef917e2 100644
---- a/src/conntrack/snprintf_xml.c
-+++ b/src/conntrack/snprintf_xml.c
-@@ -480,6 +480,12 @@ int __snprintf_conntrack_xml(char *buf,
- 		BUFFER_SIZE(ret, size, len, offset);
- 	}
- 
-+	/* NXP ASK: QoS connection mark output */
-+	if (test_bit(ATTR_QOSCONNMARK, ct->head.set)) {
-+		ret = snprintf(buf+offset, len, "<qosconnmark>%" PRIx64 "</qosconnmark>", ct->qosconnmark);
-+		BUFFER_SIZE(ret, size, len, offset);
-+	}
-+
- 	if (map && test_bit(ATTR_CONNLABELS, ct->head.set)) {
- 		ret = __snprintf_clabels_xml(buf+offset, len, ct, map);
- 		BUFFER_SIZE(ret, size, len, offset);
-diff --git a/src/main.c b/src/main.c
-index 4011ad6..c0d5896 100644
---- a/src/main.c
-+++ b/src/main.c
-@@ -89,6 +89,9 @@ struct nfct_handle *nfct_open(uint8_t subsys_id, unsigned subscriptions)
+diff -ruN v110/src/main.c v110-ask/src/main.c
+--- a/src/main.c	2024-09-25 12:15:49.000000000 +0200
++++ b/src/main.c	2026-09-17 17:21:43.215575889 +0200
+@@ -89,6 +89,9 @@
  	if (!nfnlh)
  		return NULL;
  
@@ -706,6 +531,3 @@ index 4011ad6..c0d5896 100644
  	nfcth = nfct_open_nfnl(nfnlh, subsys_id, subscriptions);
  	if (!nfcth)
  		nfnl_close(nfnlh);
--- 
-2.47.3
-
