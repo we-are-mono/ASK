@@ -288,11 +288,19 @@ static int qman_ceetm_configure_mapping_shaper_tcfc(struct qm_mcc_ceetm_mapping_
 static void dpa_disable_ceetm(struct net_device *dev) { dev->priv.ceetm_en = false; }
 /* Bookkeeping only, and covered by htb_offload.c; here it just has to be
  * called before the context it names is released. */
-static unsigned htb_ports_dropped;
+static unsigned htb_ports_dropped, dscp_ports_dropped;
 static void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 {
     assert(qm_ctx);
+    /* The filters naming classes in the tree go first, so this must already
+     * have happened by the time the tree itself is dropped. */
+    assert(dscp_ports_dropped > htb_ports_dropped);
     htb_ports_dropped++;
+}
+static void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
+{
+    assert(qm_ctx);
+    dscp_ports_dropped++;
 }
 static void synchronize_net(void) {}
 static int ceetm_enable_or_disable_qos(QM_context_ctl *ctx, unsigned enable)

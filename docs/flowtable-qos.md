@@ -1355,6 +1355,104 @@ correct as it stands.
 
 *Effort: 1 week.*
 
+### 9. The DSCP map
+
+The second classifier, and the last one reachable only by FCI.
+`CMD_QM_DSCP_Q_MAP_CFG`, `_RESET`, `_STATUS` and
+`CMD_QM_QUERY_IFACE_DSCP_FQID_MAP` fill a per-port table of sixty-four frame
+queues, one per codepoint, which both paths consult for a frame that names no
+class of its own. It becomes a `tc` filter on the port's egress:
+
+```sh
+tc filter add dev eth3 egress protocol ip flower ip_tos 0xb8/0xfc \
+    action skbedit priority 1:10
+```
+
+**`skbedit priority` is how tc says "send this to that class".** It arrives as
+`FLOW_ACTION_PRIORITY` carrying the handle verbatim, and mlxsw and ocelot
+already consume it, so nothing here is invented. The handle is resolved against
+the tree increment 3 built, which is what keeps one definition of what class
+1:10 *is* — the alternative, a private DSCP-to-queue syntax, would be a second
+one.
+
+**The whole codepoint has to be matched.** The table has one entry per DSCP and
+no way to express "these frames and not those", so a partial `ip_tos` mask, a
+port match beside it, or a `ttl` would each claim more traffic than the filter
+described. They are refused rather than narrowed. The ECN bits share the byte
+and are not ours to match on.
+
+**The microcode's copy of the table is a singleton.** `dscp_fq_map_ff_g` holds
+one port id — "Now supporting only one interface", as the code enabling it says
+— so the second port to ask is refused, and the first port's last filter hands
+the table back. This is a hardware limit stated rather than worked around, the
+same shape as the seven ingress policer profiles.
+
+**The map tracks the tree.** A filter records the class an operator named, not
+the `(channel, class queue)` it resolved to, so `tc class del` and a rebuild are
+followed: every DSCP filter is resolved again after each HTB command, and a
+codepoint whose class has gone selects nothing rather than whatever now holds
+those indices.
+
+#### It was dead on both paths, and both had to be fixed
+
+Programming the table was not enough, and it took a measurement to find out: a
+filter reported `in_hw`, EF traffic ran at the channel's full rate, and the leaf
+counters showed 144 frames — the software handshake and nothing else.
+
+- **Hardware.** `cdx_get_tx_dscp_fq_map()` set the microcode's enable bit only
+  when `qosmark->markval` was zero. But `markval` is the whole 32-bit union, and
+  increment 8 has `cdx_ft_hw_add()` raise `iqid_valid` for *every* offloaded
+  flow — profile 0 is a real answer, so the bit is not a "policer wanted" flag.
+  The word was therefore never zero. The test now reads the egress nibbles
+  alone, which is what "this frame names no class" means; an ingress policer
+  says nothing about which queue a frame leaves by. That is the same distinction
+  `cdx_htb_select_queue()` already drew for the software path.
+- **Software.** `dpa_tx()` reaches its DSCP branch only when
+  `pfe_eth_get_queuenum()` returns zero, and that function answers
+  `QOS_DEFAULT_QUEUE` — seven — for a frame with no `skb->mark`. It has returned
+  nonzero for every such frame since increment 7 removed its conntrack arm. The
+  branch is left alone and the class is chosen earlier instead, in
+  `ndo_select_queue`, where increment 4 already resolves the conntrack mark:
+  a frame whose mark names no class asks the DSCP table, and the answer is the
+  same class the filter gave the hardware. One filter, two readers, and no
+  change to the SDK driver.
+
+Both are filed as **A151**.
+
+*Proved on hardware, 2026-09-17.* `ask.offload=flowtable` with
+`qos_mark_mask=0xf0` on the KASAN image, an HTB tree on `eth3` with leaves at
+`prio 0` and `prio 1`, and a filter sending EF to the first.
+
+| | leaf 0 frames | leaf 0 bytes |
+| --- | --- | --- |
+| before the fixes, after 1.08 GB of EF | 144 | 186,475 |
+| after, 1.10 GB of EF | 819,163 | 1,240,171,105 |
+| then 10 s of best-effort | +29 | +16,747 |
+
+The middle row is the whole transfer arriving on the class the codepoint names
+— 1.24 GB of frame bytes against 1.10 GBytes of iperf3 payload, the difference
+being headers. The last row is the selectivity: a full best-effort transfer
+moved that leaf by twenty-nine frames, the ARP and handshake residue, because
+an unmarked frame with an unclaimed codepoint falls through to the default class
+queue, which is not a leaf.
+
+Refusals reach the operator as themselves:
+
+```
+Error: cdx: flower: the whole DSCP has to be matched, and the ECN bits cannot be.
+Error: cdx: no such class on this port.
+Error: cdx: that class is a channel, not a leaf queue.
+Error: cdx: the hardware DSCP map serves one port at a time, and another port holds it.
+```
+
+and the last one is not permanent: deleting `eth3`'s filter handed the table
+back, and the identical filter on `eth4` was then accepted. Tearing both ports
+down left `ethtool -S` reporting its constant forty-eight CEETM counters. No
+BUG, WARNING, call trace or KASAN output across the run beyond KASAN's own init
+banner.
+
+*Effort: 3–4 days.*
+
 ### Order and total
 
 Increments 1 and 2a are independent, and both are written. 2b depends on 2a
