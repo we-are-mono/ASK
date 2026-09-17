@@ -92,14 +92,15 @@ struct cdx_ft_rule {
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];
 	u16 mtu;
-	/* Egress class, already decoded from the conntrack mark: low nibble is
-	 * the CEETM class queue, high nibble the channel, where zero means the
-	 * port's own least-priority channel. Deliberately absent from
-	 * ft_same_key(), because two marks describe one flow rather than two;
-	 * present in the whole-rule comparison, so a reclassified flow is
-	 * reinstalled rather than left on its old queue.
+	/* Class, already decoded from the conntrack mark: low nibble is the
+	 * CEETM class queue, second nibble the channel (zero means the port's
+	 * own least-priority channel), third nibble the ingress policer profile
+	 * (zero means none). Deliberately absent from ft_same_key(), because
+	 * two marks describe one flow rather than two; present in the
+	 * whole-rule comparison, so a reclassified flow is reinstalled rather
+	 * than left on its old queue.
 	 */
-	u8 qos;
+	u16 qos;
 };
 
 /* Layout of cdx_ft_rule.qos. Stated here rather than in the adapter because
@@ -112,11 +113,33 @@ struct cdx_ft_rule {
  * ceetm_get_egressfq() expects. CDX_FT_QOS_MAX_CHANNEL therefore equals
  * CDX_CEETM_MAX_CHANNELS, and a static assertion in cdx_ceetm_app.c — where
  * that count is owned — fails the build if the two ever drift.
+ *
+ * The policer nibble numbers the same way and for the same reason: zero means
+ * this flow passes no ingress policer, and 1..CDX_FT_QOS_MAX_POLICER name one
+ * of the eight RFC-2698 profiles, profile n being nibble n+1. Zero has to mean
+ * "none" rather than "profile 0" because profile 0 is a real profile, so a
+ * sentinel is the only way to express the absence — the same shape the channel
+ * nibble already uses, rather than a separate valid bit to keep in step.
  */
-#define CDX_FT_QOS_QUEUE_MASK	0x0fu
-#define CDX_FT_QOS_CHANNEL_MASK	0xf0u
+#define CDX_FT_QOS_QUEUE_MASK	0x00fu
+#define CDX_FT_QOS_CHANNEL_MASK	0x0f0u
 #define CDX_FT_QOS_CHANNEL_SHIFT 4
 #define CDX_FT_QOS_MAX_CHANNEL	8
+#define CDX_FT_QOS_POLICER_MASK	0xf00u
+#define CDX_FT_QOS_POLICER_SHIFT 8
+#define CDX_FT_QOS_MAX_POLICER	8
+/* Every bit the encoding defines, so the adapter can reject a mark that names
+ * anything outside it rather than truncating it into a different class. */
+#define CDX_FT_QOS_MASK		(CDX_FT_QOS_QUEUE_MASK | \
+				 CDX_FT_QOS_CHANNEL_MASK | \
+				 CDX_FT_QOS_POLICER_MASK)
+/* The part that names an egress destination, which is all the Tx path may use
+ * to index its class table. The policer nibble selects an ingress meter and
+ * says nothing about where a frame leaves, so a flow that names one must not
+ * land on a different queue for it — and must not reach past a table sized for
+ * the egress class alone. */
+#define CDX_FT_QOS_EGRESS_MASK	(CDX_FT_QOS_QUEUE_MASK | \
+				 CDX_FT_QOS_CHANNEL_MASK)
 
 struct cdx_ft_counters {
 	u64 packets;

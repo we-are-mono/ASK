@@ -27,11 +27,16 @@ def test_htb_offload(tmp_path):
     compiler = os.environ.get("CC", "cc")
     assert shutil.which(compiler), f"C compiler required: {compiler}"
     source = (ROOT / "cdx/cdx_htb.c").read_text()
+    backend = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     (tmp_path / "htb_types.inc").write_text(
+        # The class encoding first: the queue budget asserts against it, and the
+        # Tx path masks a decoded class with it before indexing.
+        backend[backend.index("/* Layout of cdx_ft_rule.qos"):
+                backend.index("struct cdx_ft_counters")]
         # The queue budget and both structures, stopping where the file's own
         # storage begins: the harness declares that itself so it can inspect it.
-        source[source.index("/* Leaf classes are handed netdev"):
-               source.index("/* Indexed the way gQMCtx is")])
+        + source[source.index("/* Leaf classes are handed netdev"):
+                 source.index("/* Indexed the way gQMCtx is")])
     # In file order, which is also dependency order: no forward declarations
     # are needed and the compiler catches a call to something not yet defined.
     names = [

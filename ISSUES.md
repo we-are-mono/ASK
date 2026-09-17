@@ -378,6 +378,25 @@ each so the open bug list stays honest.
   both patches against their upstream tarballs with the QoS hunks dropped; it
   needs a source fetch, which is why it is not bundled with the retirement.
 
+- [ ] **A147 — nothing can set an ingress policer rate in flowtable mode.** A
+  flow can now *select* one of the eight FMAN RFC-2698 ingress profiles: the
+  class the conntrack mark carries has a third nibble, and `cdx_ft_hw_add()`
+  turns it into `iqid`/`iqid_valid`. Nothing can configure what those profiles
+  do. `comcerto_fpp_send_command()` refuses every FCI family when
+  `cdx_flowtable_enabled()` (`cdx/cdx_cmdhandler.c:208`), `FC_QM` included, and
+  `/dev/cdx_ctrl` is not a route to them — its table carries
+  `CDX_CTRL_DPA_SET_PARAMS`, `CDX_CTRL_DPA_INIT_CHECK` and a debug MURAM read
+  and nothing else. (The QoS design's option C claimed the QM family was
+  unsealed; it is not, and that claim is corrected in the doc.) So the two
+  halves of a proof cannot meet in one boot: flowtable mode classifies but
+  cannot set a rate, and CMM mode can set a rate but no longer classifies.
+  Selecting an unconfigured profile is inert rather than a silent drop —
+  `cdx_get_policer_profile_id()` answers zero unless the profile is enabled and
+  the encoder then leaves `PREEMPT_POLICE_PKT` clear — which is why the
+  selection ships ahead of this. Three candidate surfaces and a recommendation
+  are in [the QoS design](docs/flowtable-qos.md#the-gap-nothing-can-set-the-rates);
+  the decision is the product's, not the increment's.
+
 ---
 
 <a name="archive"></a>

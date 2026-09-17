@@ -39,10 +39,16 @@
 #define QM_ERROR                -1
 #define QM_INVALID_KEYWORD      -2
 
+/* Ingress flow policer rates are Kbit/s, not packets per second: cdx programs
+ * these profiles in e_FM_PCD_PLCR_BYTE_MODE, where the FMD multiplies the value
+ * by 1000 to reach bits per second. The ceiling is the fastest port's line
+ * rate, 10 Gbit/s. The fast-forward and SEC rates above really are per-second
+ * packet counts — those profiles are programmed in packet mode — which is why
+ * only this pair changed. */
 #define QM_INGRESS_MIN_CIR       1
-#define QM_INGRESS_MAX_CIR       20971250
+#define QM_INGRESS_MAX_CIR       10000000
 #define QM_INGRESS_MIN_PIR       1
-#define QM_INGRESS_MAX_PIR       20971250
+#define QM_INGRESS_MAX_PIR       10000000
 
 int cmmQmShowProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);
 int cmmQmQueryProcess(char ** keywords, int tabSize, daemon_handle_t daemon_handle);

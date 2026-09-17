@@ -273,10 +273,15 @@ becomes `tc class add dev eth3 parent 1: classid 1:10 htb rate 100mbit ceil
 renderer retargeted from `cmm -c` to `tc` — no product-surface change at all.
 
 **C — a small userspace tool speaking the existing FCI commands.**
-The QM command family is *not* sealed in flowtable mode; only
-`CDX_CTRL_DPA_SET_PARAMS` is (`cdx/cdx_dev.c:140`). A tool of a few hundred lines
-writing the same `CMD_QM_*` structures to `/dev/cdx_ctrl` removes CMM from the
-QoS path with no kernel change whatsoever.
+A tool of a few hundred lines writing the same `CMD_QM_*` structures removes CMM
+from the QoS path with no kernel change to the hardware layer.
+
+This option was originally written up as needing no kernel change at all, on the
+claim that the QM family is not sealed in flowtable mode. **That was wrong**, and
+[increment 8](#the-gap-nothing-can-set-the-rates) records how it was found:
+`comcerto_fpp_send_command()` refuses every family when
+`cdx_flowtable_enabled()`, and `/dev/cdx_ctrl` carries three ioctls, none of them
+a QM command. C in flowtable mode needs the seal opened first.
 
 **Recommendation: B, with the mark kept as the single classification key.**
 
@@ -351,10 +356,16 @@ rate can eventually become a `TC_SETUP_BLOCK` matchall-police; the exception and
 SEC rates police the punt and crypto paths, which have no netdev, so they stay a
 private knob under whatever control channel plane 1 ends up using.
 
-One thing not to copy forward: CMM validates ingress `cir`/`pir` against
-`1..20971250`, a packets-per-second range, while `cdx_qos.c` programs the profile
-in `e_FM_PCD_PLCR_BYTE_MODE`, where the unit is Kbit/s. The replacement should
-fix the range rather than reproduce it.
+Which profile a flow's ingress frames meet is a different question from what
+that profile's rate is, and the two have been settled separately.
+[Increment 8](#8-ingress-policing) delivered the selection as a third nibble of
+the class the mark carries. The rates have no surface in flowtable mode at all,
+because the QM command family is sealed there; that is an open decision, with
+the options and a recommendation recorded with the increment.
+
+One thing not to copy forward, now fixed: CMM validated ingress `cir`/`pir`
+against `1..20971250`, a packets-per-second range, while `cdx_qos.c` programs
+those profiles in `e_FM_PCD_PLCR_BYTE_MODE`, where the unit is Kbit/s.
 
 ## Implementation plan
 
@@ -937,10 +948,95 @@ tarballs; filed as **A146**.
 
 ### 8. Ingress policing
 
-Extend the decode with `iqid`, argue the bit budget against the mask, and
-prove a policed flow drops at its configured rate. Fix the unit error while
-here: CMM validates `cir`/`pir` against a packets-per-second range while
-`cdx_qos.c` programs the profile in byte mode, where the unit is Kbit/s.
+The class the mark carries now has a third nibble, and it selects one of the
+eight FMAN RFC-2698 ingress profiles.
+
+**The selection half is delivered. The rate half has no control surface in
+flowtable mode, and that is a decision this increment could not make for
+itself** — see below.
+
+`cdx_ft_rule.qos` widens from 8 bits to 12: class queue, channel, ingress
+policer, one nibble each. The policer nibble is numbered exactly as the channel
+nibble already was, and for the same reason — **zero has to mean "none"**,
+because profile 0 is a real profile and a sentinel is the only way to say the
+flow passes no meter. So nibble *n* names profile *n-1*, and
+`cdx_ft_hw_add()` translates rather than copies: it sets `iqid` to *n-1* and
+raises `iqid_valid`, or leaves both clear. Using a separate valid bit in the
+rule's own encoding would have been a second thing to keep in step with the
+nibble for no gain.
+
+*Bit budget.* Twelve bits of a 32-bit `ct->mark` are spoken for, leaving twenty
+to the operator's own policy routing or VPN marks. `qos_mark_mask` still places
+the field anywhere in the word, and a mask narrower than twelve bits is not an
+error: the nibbles it does not cover read zero, which every position spells
+"unspecified".
+
+*One hazard, and it is the reason to say this out loud.* The software Tx path
+indexes `class_txq[256]` with the decoded class. Widening the decode without
+masking would have read up to 3839 bytes past that array on any frame whose
+mark named a policer. `cdx_htb_select_queue()` masks with
+`CDX_FT_QOS_EGRESS_MASK` before indexing — the policer names an ingress meter
+and says nothing about which queue a frame leaves by — and a static assertion
+ties the table's size to that mask.
+
+**No tc verb, and no invention.** There is no mainline tc verb for a policer
+bound to a PCD classification result: `tc filter … action police` on a `clsact`
+ingress qdisc polices a filter's own match, not a profile the keygen result
+selects. So this stays a mark field.
+
+#### The gap: nothing can set the rates
+
+This is the part the plan did not anticipate, and it is worth recording
+precisely because the doc above got it wrong.
+
+The claim in [option C](#scheduler-configuration-swap-the-transport-keep-the-hardware-layer)
+that "the QM command family is *not* sealed in flowtable mode" **is false.**
+`comcerto_fpp_send_command()` refuses *every* family when
+`cdx_flowtable_enabled()` (`cdx/cdx_cmdhandler.c:208`), `FC_QM` included. And
+`/dev/cdx_ctrl` is not a route to the QM commands at all — its table carries
+three ioctls, `CDX_CTRL_DPA_SET_PARAMS`, `CDX_CTRL_DPA_INIT_CHECK` and a debug
+MURAM read (`cdx/cdx_dev.c`). The FCI commands travel over netlink, which is
+the sealed path.
+
+So in flowtable mode the eight profiles cannot be configured, and the two
+halves of a proof cannot meet in one boot:
+
+- **flowtable mode** has the classifier but no way to set a rate;
+- **CMM mode** can set a rate — `set qm ingress queue <1-7> cir … pir …` — but
+  after increment 7 has no classifier, so no flow can select a profile.
+
+Naming an unconfigured profile is harmless rather than a silent drop:
+`cdx_get_policer_profile_id()` answers zero unless that profile is enabled, and
+the encoder leaves `PREEMPT_POLICE_PKT` clear when it does. The selection is
+therefore safe to ship ahead of the surface that configures it.
+
+Three candidate surfaces, none of them free:
+
+1. **A module parameter on `ask_flowtable`**, alongside `qos_mark_mask` and
+   `qos_default_class`. Not a new surface — it is the one already there — and it
+   needs cdx to export the profile setters. Boot-time only, which sits badly
+   with the rule that offload configuration must be changeable without a
+   reboot.
+2. **The policy JSON and `ask-flowtable`**, matching the consumer contract
+   exactly. Needs a kernel-side write path that does not exist yet.
+3. **Unseal the `FC_QM` ingress-policer subcommands.** Smallest change,
+   and it reintroduces the FCI control plane this design argues against.
+
+Recommendation: **2**, because it is the only one that is both runtime and
+already the contract; **1** as a bench fixture if a proof is wanted sooner.
+
+#### The unit error, fixed
+
+CMM validated ingress `cir`/`pir` against `1..20971250`, a packets-per-second
+range, while `cdx_qos.c` programs those profiles in `e_FM_PCD_PLCR_BYTE_MODE`.
+The FMD settles the unit beyond argument: in byte mode `GetInfoRateReg()` does
+`tmp *= 1000; /* kb --> b */`, so the field is **Kbit/s**. The range is now
+`1..10000000`, the fastest port's line rate.
+
+Only that pair was wrong. The fast-forward rate really is packets per second —
+`port_ff_lim_mode` is `e_FM_PCD_PLCR_PACKET_MODE` — and so is the SEC rate,
+whose ceiling of 14880952 is the 64-byte frame rate of a 10G port and is
+correct as it stands.
 
 *Effort: 1 week.*
 

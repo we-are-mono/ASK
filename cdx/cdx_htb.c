@@ -51,6 +51,7 @@
 #include "module_qm.h"
 #include "cdx_ceetm_app.h"
 #include "cdx_flowtable.h"
+#include "cdx_flowtable_backend.h"
 #include "cdx_htb.h"
 
 /* Leaf classes are handed netdev Tx queue indices out of the headroom patch 150
@@ -70,8 +71,10 @@
  * sentinel serves for a whole memset. */
 #define CDX_HTB_NONE		0xffu
 
-/* Every value a decoded conntrack mark can take. */
+/* Every egress destination a decoded conntrack mark can name. */
 #define CDX_HTB_CLASSES		256
+static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
+	      "class_txq[] must cover every egress class the adapter can decode");
 
 /* Frames a leaf's class queue may hold before tail drop.
  *
@@ -813,8 +816,14 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 		return DPA_SELECT_QUEUE_NONE;
 	/* One read of the mark, as the adapter takes one when it admits a flow:
 	 * a class chosen from a value that changed underneath would put this
-	 * frame somewhere the flow's own rule does not name. */
-	slot = READ_ONCE(port->class_txq[decode(READ_ONCE(ct->mark))]);
+	 * frame somewhere the flow's own rule does not name.
+	 *
+	 * Only the egress nibbles index the table. The class the adapter decodes
+	 * is wider than an egress destination — it also names an ingress policer
+	 * profile, which has no bearing on which queue a frame leaves by — and
+	 * this table is sized for the egress class alone. */
+	slot = READ_ONCE(port->class_txq[decode(READ_ONCE(ct->mark)) &
+					 CDX_FT_QOS_EGRESS_MASK]);
 	if (slot == CDX_HTB_NONE)
 		return DPA_SELECT_QUEUE_NONE;
 	return CDX_HTB_QID_BASE + slot;

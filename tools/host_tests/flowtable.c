@@ -714,7 +714,7 @@ static void cdx_unregister_ft_setup_tc(void) { registered_setup_tc = 0; }
  * and returned alongside the handler above, and a load that fails after taking
  * it has to give both back. */
 static int registered_qos_class;
-typedef u8 (*cdx_ft_qos_class_fn)(u32 mark);
+typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
 static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
 {
     assert(fn);
@@ -3455,6 +3455,62 @@ static void test_nexthop_objects(void)
     }
 }
 
+/* The conntrack mark is the only classification key, and one decode serves both
+ * the hardware rule and the software Tx path, so what it produces is a contract
+ * rather than an implementation detail. Three nibbles, each with a sentinel
+ * meaning "unspecified": class queue, channel, ingress policer profile. */
+static void test_qos_decode(void)
+{
+    unsigned int saved_mask = ft_qos_mark_mask, saved_default = ft_qos_default_class;
+
+    /* No mask configured is not "class zero" — it is classification switched
+     * off, and admission refuses marked flows outright elsewhere. */
+    ft_qos_mark_mask = 0; ft_qos_default_class = 0x123;
+    assert(ft_qos_class(0xabc) == 0);
+
+    /* The field is shifted down to its own base, so an operator may place it
+     * anywhere in the word and keep the rest for policy routing or a VPN. */
+    ft_qos_mark_mask = 0xfff00; ft_qos_default_class = 0;
+    assert(ft_qos_class(0x12300) == 0x123);
+    assert(ft_qos_class(0x12345) == 0x123);   /* bits outside the mask ignored */
+    assert(ft_qos_class(0xfff12300) == 0x123);
+
+    /* A masked mark of zero takes the named default rather than landing on
+     * whatever zero happens to mean. */
+    ft_qos_default_class = 0x207;
+    assert(ft_qos_class(0x00000) == 0x207);
+    assert(ft_qos_class(0x00045) == 0x207);
+
+    /* A mask narrower than the encoding is not an error: the nibbles it does
+     * not reach read zero, which every position spells "unspecified". */
+    ft_qos_mark_mask = 0xf; ft_qos_default_class = 0;
+    assert(ft_qos_class(0x7) == 0x007);
+
+    ft_qos_mark_mask = saved_mask; ft_qos_default_class = saved_default;
+
+    /* Validity. Each nibble is bounded at its own maximum, and the channel and
+     * policer nibbles admit their maximum *inclusive* because value n names
+     * object n-1 while zero names none. */
+    assert(ft_qos_class_valid(0x000));
+    assert(ft_qos_class_valid(0x00f));                       /* class queue 15 */
+    assert(ft_qos_class_valid(CDX_FT_QOS_MAX_CHANNEL << CDX_FT_QOS_CHANNEL_SHIFT));
+    assert(ft_qos_class_valid(CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT));
+    assert(ft_qos_class_valid(0x88f));                       /* all three, full */
+    /* One past either bound names an object the hardware does not have. A flow
+     * asking for it is declined to software, never truncated onto a queue or a
+     * meter nobody asked for. */
+    assert(!ft_qos_class_valid((CDX_FT_QOS_MAX_CHANNEL + 1) << CDX_FT_QOS_CHANNEL_SHIFT));
+    assert(!ft_qos_class_valid((CDX_FT_QOS_MAX_POLICER + 1) << CDX_FT_QOS_POLICER_SHIFT));
+    /* Anything above the three nibbles is outside the encoding entirely. */
+    assert(!ft_qos_class_valid(0x1000));
+    assert(!ft_qos_class_valid(~CDX_FT_QOS_MASK & 0xffff));
+
+    /* The egress mask is what the Tx path may index its class table with, so it
+     * has to exclude the policer nibble and stay inside a 256-entry table. */
+    assert(CDX_FT_QOS_EGRESS_MASK == 0xff);
+    assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_POLICER_MASK));
+}
+
 static void test_registration(void)
 {
     for (registration_failure = 0; registration_failure <= 9; registration_failure++) {
@@ -3616,6 +3672,7 @@ int main(void)
     test_device_recovery();
     test_transient_admission();
     test_nexthop_objects();
+    test_qos_decode();
     test_registration();
-    puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm and fatal retry passed");
+    puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm, class decode and fatal retry passed");
 }
