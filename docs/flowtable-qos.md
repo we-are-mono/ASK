@@ -1092,7 +1092,7 @@ filter. Two stages, and the first needs none of it:
 
 - **Stage 1 — `matchall`.** A port-wide meter needs no correlation at all: every
   flow on the port uses it. This restores the per-port fast-forward rate as a
-  kernel verb, and is the whole of what most deployments want.
+  kernel verb, and is the whole of what most deployments want. **Delivered.**
 - **Stage 2 — `flower`.** Offloading a 5-tuple match means recording the filter
   and consulting it when a flow is admitted, so `cdx_ft_hw_add()` can set
   `iqid` to the profile that filter allocated. The class nibble from
@@ -1108,6 +1108,52 @@ answer, as it is for the mark.
 What this retires: the per-port fast-forward rate, the eight profiles and the
 aggregate default all become `tc` verbs, and nothing in the QoS plane needs FCI
 or CMM. That is the last QoS reason to keep either.
+
+#### Stage 1, proved on hardware 2026-09-17
+
+`cdx_setup_tc()` now answers `TC_SETUP_BLOCK` for a clsact ingress block, and
+`cdx_police.c` turns a `matchall` filter's police action into the port's
+profile. `CONFIG_NET_CLS_MATCHALL` had to be enabled — the classifier was
+simply absent from both defconfigs, so `tc` answered "TC classifier not found"
+before any of this was reachable.
+
+The filter is genuinely offloaded, not accepted and ignored. `skip_sw` means
+hardware or nothing, and `tc filter show` agrees:
+
+```
+filter protocol all pref 49152 matchall chain 0 handle 0x1
+  skip_sw
+  in_hw
+	action order 1: police 0x1 rate 500Mbit burst 65500b mtu 2Kb action drop
+```
+
+And it meters. loki sending through the DUT's LAN port, policed on that port's
+ingress:
+
+| configured | measured |
+| --- | --- |
+| no filter | 109 Mbit/s |
+| `rate 20mbit` | 17.6 Mbit/s |
+| `rate 50mbit` | 41.1 Mbit/s |
+| filter removed | 111 Mbit/s |
+
+Goodput lands a little under each cap, which is what a token-bucket policer in
+front of TCP should do: it drops rather than queues, the sender backs off, and
+the profile meters the full frame while iperf3 reports payload. Removing the
+filter returns the port to the rate it booted with rather than leaving the last
+policed value in place.
+
+Refusals reach the operator as themselves rather than a bare `EOPNOTSUPP`:
+
+```
+Error: cdx: police: rate rounds to zero at this profile's resolution.
+Error: cdx: police: exceed action must be drop.
+```
+
+No BUG, WARNING or call trace across the run. Statistics are deliberately
+refused for now: the profile keeps per-colour counters and `get_plcr_counter()`
+reads them, but claiming `TC_CLSMATCHALL_STATS` without wiring them would
+report a filter that passed everything.
 
 #### The unit error, fixed
 

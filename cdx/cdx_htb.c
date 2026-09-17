@@ -53,6 +53,7 @@
 #include "cdx_flowtable.h"
 #include "cdx_flowtable_backend.h"
 #include "cdx_htb.h"
+#include "cdx_police.h"
 
 /* Leaf classes are handed netdev Tx queue indices out of the headroom patch 150
  * reserved above the direct queues, and sch_htb turns the index this file
@@ -924,6 +925,10 @@ static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 		 * successful `tc qdisc add ... htb offload`, because by then
 		 * the qdisc is already flagged as offloaded. */
 		return 0;
+	case TC_SETUP_BLOCK:
+		/* Filters, not qdiscs: an ingress block carries the police
+		 * action that programs this port's rate limiter. */
+		return cdx_police_setup_block(dev, type_data);
 	case TC_SETUP_FT:
 		handler = READ_ONCE(cdx_ft_handler);
 		return handler ? handler(dev, type, type_data) : -EOPNOTSUPP;

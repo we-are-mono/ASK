@@ -423,7 +423,15 @@ int cdxdrv_release_shared_policers(struct cdx_fman_info *finfo)
 }
 
 /* api to modify port specific policer profile to reserver bandwidth for incoming control packets */
-int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
+/* Program a port's ingress rate-limiter profile. The profile is created once at
+ * port init; this only pushes parameters into it.
+ *
+ * `cbs`/`pbs` of zero mean "use the burst this port's speed implies", which is
+ * what the FCI fast-forward path has always done. A tc police action carries
+ * its own burst and passes it through.
+ */
+static int port_plcr_set(char *ifname, uint32_t rate_mode,
+			 uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs)
 {
 	void *handle;
 	int hardwarePortId;
@@ -463,14 +471,22 @@ int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
 	Params.color.dfltColor = e_FM_PCD_PLCR_RED;
 	//override color is RED
 	Params.color.override = e_FM_PCD_PLCR_RED;
-	Params.nonPassthroughAlgParams.rateMode = port_ff_lim_mode;
+	Params.nonPassthroughAlgParams.rateMode = rate_mode;
+	if (rate_mode == e_FM_PCD_PLCR_BYTE_MODE) {
+		/* Meter the frame as it arrived, and roll a red frame back by the
+		 * same length, so the accounting matches what the wire carried. */
+		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection =
+			e_FM_PCD_PLCR_FULL_FRM_LEN;
+		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection =
+			e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
+	}
 	if (iface_info->eth_info.speed == PORT_1G_SPEED ) {
-		Params.nonPassthroughAlgParams.committedBurstSize = DEFAULT_1G_PORT_FF_CBS;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = DEFAULT_1G_PORT_FF_PBS;
+		Params.nonPassthroughAlgParams.committedBurstSize = cbs ? cbs : DEFAULT_1G_PORT_FF_CBS;
+		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs ? pbs : DEFAULT_1G_PORT_FF_PBS;
 	}
 	else if (iface_info->eth_info.speed == PORT_10G_SPEED ) {
-		Params.nonPassthroughAlgParams.committedBurstSize = DEFAULT_10G_PORT_FF_CBS;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = DEFAULT_10G_PORT_FF_PBS;
+		Params.nonPassthroughAlgParams.committedBurstSize = cbs ? cbs : DEFAULT_10G_PORT_FF_CBS;
+		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs ? pbs : DEFAULT_10G_PORT_FF_PBS;
 	}
 	else
 	{
@@ -502,6 +518,44 @@ int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
 			__func__, hardwarePortId, cir, pir);
 #endif
 	return SUCCESS;
+}
+
+/* The FCI fast-forward rate. Its unit is whatever port_ff_lim_mode says, which
+ * is packets per second, and its burst comes from the port's speed. */
+int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir)
+{
+	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0);
+}
+
+/* A tc `matchall action police` on a port's ingress, which is the same object
+ * reached by a kernel verb instead of an FCI command. The caller has already
+ * converted the action's rates into this profile's unit; byte mode is Kbit/s,
+ * packet mode is packets per second. */
+int cdx_port_police_set(char *ifname, bool byte_mode,
+			uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs)
+{
+	return port_plcr_set(ifname,
+			     byte_mode ? e_FM_PCD_PLCR_BYTE_MODE : e_FM_PCD_PLCR_PACKET_MODE,
+			     cir, pir, cbs, pbs);
+}
+
+/* Removing the filter returns the port to the rate it booted with, rather than
+ * leaving the last policed value in place with nothing describing it. */
+int cdx_port_police_clear(char *ifname)
+{
+	struct dpa_iface_info *iface_info = dpa_get_iface_by_name(ifname);
+	uint32_t cir, pir;
+
+	if (!iface_info || !(iface_info->if_flags & IF_TYPE_ETHERNET))
+		return FAILURE;
+	if (iface_info->eth_info.speed == PORT_1G_SPEED) {
+		cir = DEFAULT_PORT_FF_CIR_VALUE_1G;
+		pir = DEFAULT_PORT_FF_PIR_VALUE_1G;
+	} else {
+		cir = DEFAULT_PORT_FF_CIR_VALUE_10G;
+		pir = DEFAULT_PORT_FF_PIR_VALUE_10G;
+	}
+	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0);
 }
 
 void get_plcr_counter(void *handle, uint32_t *counterval, uint32_t clear)
