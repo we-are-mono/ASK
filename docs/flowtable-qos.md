@@ -1621,6 +1621,60 @@ rate of a 10G port, the profile really is programmed in
 
 *Effort: 3–4 days for the exception rate, a day for the SEC one.*
 
+### 11. DSCP remarking
+
+The last parity gap against the original NXP ASK, and not a `CMD_QM_*` command
+at all. `cdx_ehash.c` reads `qosmark->dscp_mark_flag` and `dscp_mark_value` —
+bits 8 to 14 of the hardware mark — and writes the codepoint into the
+header-manipulation block that already decrements TTL, so the remark rides an
+opcode every routed flow carries anyway. **Nothing in the tree has ever written
+those bits.** NXP left it to the operator's
+`iptables -j QOSCONNMARK --set-mark`, which OpenWrt never packaged.
+
+**The plan said to widen the class; it should not be widened.** Seven more bits
+— one flag and six of value — takes `cdx_ft_rule.qos` past sixteen and costs the
+operator seven bits of `ct->mark`, leaving thirteen. That is the right shape
+only if the remark has to travel *in the mark*, and it does not. The same plan
+names `FLOW_ACTION_MANGLE` as the verb, and a tc filter already carries its own
+value: this is the shape [increment 8's stage 2](#stage-2-proved-on-hardware-2026-09-17)
+used for the ingress policer, where a filter records what it matched and
+`ft_parse()` resolves it against the finished tuple at admission. A remark
+filter is the same thing on the other side of the flow:
+
+```sh
+tc filter add dev eth3 egress protocol ip flower ip_proto udp dst_port 5004 \
+    action pedit ex munge ip tos set 0xb8
+```
+
+`cdx_ft_rule` already carries `out` as well as `in`, so an egress filter has a
+port to match against. The cost is zero mark bits and no widening; the operator
+keeps all twenty.
+
+*Why it cannot be keyed on the codepoint instead.* The obvious reading — a
+DSCP-to-DSCP map beside the DSCP-to-class one — does not work: the hardware's
+remark is a property of a *flow entry*, and a flow has no DSCP. Only its packets
+do. So the selector has to be something the entry knows, which is the tuple.
+
+*What the work is.* `cdx_police.c` already has the 5-tuple record, its flower
+parse and the matcher that resolves it against a rule; a second copy in
+`cdx_dscp.c` would be a second answer to "which traffic does this describe", and
+the only difference is which device the rule is matched on. So the matcher moves
+to a file both share, parameterised on `in` against `out`, and the police path's
+own host test is what says the move changed nothing. Then the remark filter
+records a codepoint, and `cdx_ft_hw_add()` sets the two mark fields from it the
+way it already sets the policer nibble.
+
+Two details the parse has to get right. `pedit` mangles in four-byte words, so
+the IPv4 tos byte arrives as `offset 0` with a mask covering the DSCP bits of
+the second byte, and a mask narrower than the whole codepoint has to be refused
+for the same reason the class filter refuses one. And an operator will write
+`action csum ip` beside it, because that is what pedit needs in software; the
+hardware recomputes the checksum itself, so that action has to be accepted and
+ignored rather than refused, which means this is the one filter here that takes
+more than a single action.
+
+*Effort: 3–4 days.*
+
 ### Order and total
 
 Increments 1 and 2a are independent, and both are written. 2b depends on 2a
