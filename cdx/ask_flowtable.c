@@ -2314,9 +2314,9 @@ static int __init ask_flowtable_init(void)
 	 * to say so out loud; silently narrowing them would accelerate flows
 	 * onto queues the operator never named. */
 	if (ft_qos_mark_mask &&
-	    (ft_qos_mark_mask >> __ffs(ft_qos_mark_mask)) > U8_MAX) {
-		pr_err("cdx flowtable: qos_mark_mask %#x spans more than the eight bits of a class\n",
-		       ft_qos_mark_mask);
+	    (ft_qos_mark_mask >> __ffs(ft_qos_mark_mask)) > CDX_FT_QOS_MASK) {
+		pr_err("cdx flowtable: qos_mark_mask %#x spans more than the %u bits of a class\n",
+		       ft_qos_mark_mask, (unsigned int)fls(CDX_FT_QOS_MASK));
 		return -EINVAL;
 	}
 	if (!ft_qos_class_valid(ft_qos_default_class)) {

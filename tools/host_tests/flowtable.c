@@ -3509,6 +3509,30 @@ static void test_qos_decode(void)
      * has to exclude the policer nibble and stay inside a 256-entry table. */
     assert(CDX_FT_QOS_EGRESS_MASK == 0xff);
     assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_POLICER_MASK));
+
+    /* Init refuses a mask wider than a class rather than narrowing it silently,
+     * and that bound has to track the encoding. It did not when the policer
+     * nibble was added: the check still said eight bits, so a mask covering all
+     * three nibbles was refused and the adapter never came up. Both edges are
+     * pinned here because only the rig caught it the first time. */
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    ft_qos_mark_mask = CDX_FT_QOS_MASK; ft_qos_default_class = 0;
+    assert(ask_flowtable_init() == 0);
+    ask_flowtable_exit();
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    ft_qos_mark_mask = (CDX_FT_QOS_MASK << 1) | 1;   /* one bit too wide */
+    assert(ask_flowtable_init() == -EINVAL);
+    /* The same width placed anywhere in the word is still a class: the field is
+     * shifted down to its own base before it is measured. */
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    ft_qos_mark_mask = CDX_FT_QOS_MASK << 16;
+    assert(ask_flowtable_init() == 0);
+    ask_flowtable_exit();
+    ft_qos_mark_mask = saved_mask; ft_qos_default_class = saved_default;
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
 }
 
 static void test_registration(void)
