@@ -1297,6 +1297,49 @@ code that satisfies them.
 With this, `CMD_QM_INGRESS_POLICER_QUERY_STATS` has a kernel-verb equivalent
 and nothing in the ingress-policing plane needs FCI.
 
+##### Proved on hardware, 2026-09-17
+
+`ask.offload=flowtable` with `qos_mark_mask=0xf0` on the KASAN image, policy
+applied (`bindings 2`), loki sending through the DUT's LAN port.
+
+A `matchall action police rate 2gbit burst 32m` reported **`Sent 0 bytes 0 pkt`
+the moment it was installed**, although the port's limiter had been metering
+since link-up — which is the seeded baseline, and the one number that says the
+filter reports its own traffic rather than the port's history. `tc` also showed
+`in_hw` and `used_hw_stats immediate`.
+
+Ten seconds of four-stream iperf3 then ran at **1.93 Gbit/s** — under the cap,
+and an order of magnitude above the ~130 Mbit this rig forwards in software, so
+the flow was in hardware and the hardware meter was holding it. The filter
+reported **1,823,099 frames, 155,954 dropped**. iperf3's own sender counted
+**156,001 retransmits**: the profile's red counter and the sender's losses agree
+to 0.03%, which is what says red is the drops rather than something adjacent.
+
+Read three times in a row with no traffic between, the filter reported
+`1823099 pkt (dropped 155954)` **each time**. Under a driver handing back
+totals the second read would have doubled it. That is the whole of the delta
+contract in one observation.
+
+Two `flower` filters then took profiles 1 and 2 on the same port, one naming
+TCP port 5201 at `rate 1gbit`, the other 5202 at `rate 400mbit`; both installed
+`in_hw` at `0 pkt`.
+
+| | goodput | frames | dropped |
+| --- | --- | --- | --- |
+| 5201, `rate 1gbit` | 978 Mbit/s | 957,738 | 112,571 |
+| 5202, `rate 400mbit` | 405 Mbit/s | 415,970 | — |
+
+The independence is the point. After the first flow, filter 2 read exactly
+zero. After the second, filter 1 read **exactly 957,738** again — unchanged to
+the frame — so each filter's baseline is its own and each profile counts only
+the flows the filter claims. `tc` reported the whole of it as
+`Sent hardware … pkt` with `Sent software 0 bytes 0 pkt`, which is honest: an
+offloaded flow never reaches the action in software.
+
+Deleting the filters and the qdisc returned the port to an empty ingress block.
+No BUG, WARNING, call trace or KASAN output across the run beyond KASAN's own
+init banner.
+
 #### The unit error, fixed
 
 CMM validated ingress `cir`/`pir` against `1..20971250`, a packets-per-second
