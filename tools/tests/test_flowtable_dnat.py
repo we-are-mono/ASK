@@ -19,6 +19,16 @@ from test_flowtable_tcp import cpu, cpu_delta, software_tx
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
                                reason="requires an explicit experimental boot")
 PUBLIC_PORT = DPORT + 1000
+# Unlike every other flowtable test, these clients bind on the WAN host itself
+# rather than on Loki, so their source ports share a namespace with the sockets
+# the rig fixture holds there: a UDP echo endpoint on (WAN_IP, DPORT) kept for
+# the whole session, the TCP echo server on the same port, and the control
+# server on DPORT + 1. SPORT and DPORT are adjacent, so deriving the second
+# parameter's port as SPORT + 1 landed on the echo socket and bound
+# EADDRINUSE. Take them from an offset nothing else uses; +32, +96 and +128
+# are spoken for by the connections, selective-neighbour and routes tests.
+WAN_SPORT = SPORT + 160
+assert DPORT not in (WAN_SPORT, WAN_SPORT + 1), (WAN_SPORT, DPORT)
 
 
 class LocalClients:
@@ -104,7 +114,7 @@ async def test_flowtable_dnat(rig, zero_checksum, double_nat=False):
     addresses = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show",
                                          "dev", TARGET_WAN_IF))["stdout"])
     external = next(a["local"] for a in addresses[0]["addr_info"] if a["family"] == "inet")
-    sport = SPORT + int(zero_checksum)
+    sport = WAN_SPORT + int(zero_checksum)
     nat_table = "ask_double_nat_test" if double_nat else "ask_dnat_test"
     server_peer = [r.lan_gateway, sport + 1024] if double_nat else [WAN_IP, sport]
     flows, expected = [], {}

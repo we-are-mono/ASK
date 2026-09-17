@@ -31,7 +31,12 @@ async def masquerade_network(request, target_agent, aiohttp_session):
         return
     # Autouse ordering provisions the extra subnet before the common rig finds
     # its endpoint interface and installs its ordinary routes/neighbours.
-    assert WAN_IP == ENDPOINT, f"run this test with ASK_WAN_IPERF_IP={ENDPOINT}"
+    if WAN_IP != ENDPOINT:
+        # This test needs the WAN host on a subnet of its own, and the fixture
+        # only provisions it for this test -- so a sweep cannot be pointed at
+        # that address without stranding every other test. It is run on its
+        # own, and saying so is more use than erroring in every ordinary run.
+        pytest.skip(f"needs ASK_WAN_IPERF_IP={ENDPOINT}, this run has {WAN_IP}")
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     cleanup = []
     try:
