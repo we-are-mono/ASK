@@ -922,11 +922,25 @@ the conntrack one.
 `skb->mark & EMAC_QUEUENUM_MASK`, then to `QOS_DEFAULT_QUEUE` — the standard
 fallback that was already written beneath it.
 
-**What this costs is one capability: asymmetric per-direction class.** The
-64-bit field packed two classes into one word, bit 63 marking the reply half
-valid. `ct->mark` is 32 bits and carries one. Recovering it needs no kernel
-patch — a second field in `ct->mark` selected by direction, about eight mask
-bits and a decode change.
+**What this looks like it costs is asymmetric per-direction class**, and the
+first version of this paragraph said so plainly: the 64-bit field packed two
+classes into one word with bit 63 marking the reply half valid, and `ct->mark`
+is 32 bits and carries one. That framing was too generous to what was lost;
+[what the original actually did](#what-the-original-ask-did-with-asymmetry)
+records why, and the short form is that on this platform the capability was
+never reachable in the original either.
+
+It is also less of a gap than it reads, because most of the asymmetry a gateway
+wants does not live in the mark at all. The two directions leave by different
+ports and so sit on different channels already — a channel nibble of zero means
+"whichever channel this port owns" — so what the mark shares between them is
+only the queue index within each port's own tree. The
+[DSCP map](#9-the-dscp-map) is per port, and the
+[ingress policer](#stage-2-proved-on-hardware-2026-09-17) matches one
+direction's tuple on one port's ingress; both are already per-direction without
+a single mark bit. What is genuinely not expressible is "this particular flow,
+identified by its conntrack, takes a different queue index upstream from
+downstream", and nothing has asked for that.
 
 **It also ends per-flow classification in CMM mode**, which is the part to be
 deliberate about now that cmm stays in the tree. CMM mode keeps its CEETM
@@ -1811,6 +1825,91 @@ What they do need is a decision, before step 1, on whether the product intends
 to ship CEETM QoS at all. If it does not, the honest retirement is to delete
 the plane rather than port it, and steps 1 and 5 collapse into removing the
 `ct->mark` refusal at `ask_flowtable.c:562`.
+
+## What the original ASK did with asymmetry
+
+Investigated in `~/Mono/ASK-NXP` (cdx 5.03.1, cmm 17.03.1) because the
+[mark retirement](#7-retire-the-ask-mark) recorded asymmetric per-direction
+class as a capability given up, and it is worth knowing what was actually given
+up before spending anything recovering it.
+
+**The design is better than "two classes in one word" suggests.** The 64-bit
+field is two halves named by *direction of travel*, not by conntrack's
+originator and replier:
+
+```c
+typedef union {                         /* cmm/src/fpp.h:348 */
+	u_int64_t x;
+	struct { u_int32_t x_us; u_int32_t x_ds; };
+	struct { qosmark_t qosmark_us; qosmark_t qosmark_ds; };
+} qosconnmark_t;
+```
+
+Upstream and downstream is what an operator means; originator and replier is an
+accident of which packet conntrack saw first. cdx decodes per direction and the
+reply half is gated
+(`get_ctentry_qosmark_from_qosconnmark`, `cdx/cdx-5.03.1/cdx.h:69`): with
+`REPLIER_CONNMARK_VALID` clear the reply direction decodes to **zero**, the
+default class, rather than inheriting the originator's. `control_ipv4.c` then
+writes two independent `CtEntry`s, so the hardware genuinely carried two
+classes. The silicon was never the constraint and still is not: `union
+ctentry_qosmark` is 32 bits *per direction*, and cdx writes both.
+
+**It was set by hand-packing one integer.** The `QOSCONNMARK` target is a 64-bit
+clone of `CONNMARK` — `--set-mark value[/mask]`, `--save-mark`, `--restore-mark`
+— with no direction keyword, so an operator wrote the two halves and the valid
+bit as a single number.
+
+**And on this platform it was wired to nothing, twice over.**
+
+- `cmmQosmarkGet()` (`cmm/src/conntrack.c:3896`) is
+  `#ifdef USE_QOSCONNMARK` → the 64-bit `ATTR_QOSCONNMARK`, `#else` → the
+  standard 32-bit `ATTR_MARK`. **`USE_QOSCONNMARK` appears exactly once in the
+  entire NXP tree: in that `#ifdef`.** Nothing defines it. So cmm read
+  `ct->mark` — a *different field* from the one the target wrote — and
+  `forward_engine.c:336` is the only thing that fills the FCI command's
+  `qosconnmark`, through that helper. The high half never left the kernel.
+- The logic that reconciles "the operator said upstream/downstream" with "this
+  conntrack's originator may be either" is `#if !defined(LS1043)`
+  (`forward_engine.c:363`), and cmm builds with `-DLS1043`. It could not have
+  compiled on this platform anyway: it dereferences `ds_flag`, a field that
+  exists only in the non-LS1043 `qosmark_t`.
+
+The kernel half really did ship — `CONFIG_NETFILTER_XT_QOSCONNMARK=m` in the
+release config — so an operator could set all 64 bits. Nothing downstream read
+them.
+
+### So the gap is not worth closing
+
+The conclusion this points to is that asymmetric per-flow class was designed,
+built end to end, shipped as a module, and then left unconnected in the one
+place that would have made it work. A capability that survives that long
+without anyone noticing it does nothing is not one the product is waiting for.
+
+Three things reinforce it. Most of the asymmetry a gateway actually wants is
+already expressible, per the [note in increment 7](#7-retire-the-ask-mark) —
+different ports, different channels, per-port DSCP maps, per-direction ingress
+policers. The asymmetry that does matter on a real link is capacity, and the
+answer to that is shaping egress and policing ingress, which this document
+already delivers, not giving one flow two service classes. And Linux itself
+treats the connection mark as a property of the connection: `ct mark` has no
+direction, and neither fw4, `cake` nor `qosify` offers per-direction class.
+
+**Decision: do not build it.** If a real requirement ever appears, the cheap
+route is an egress `flower` filter naming the tuple — the machinery
+[stage 2](#stage-2-proved-on-hardware-2026-09-17) already uses for the ingress
+policer, at the cost of no mark bits at all.
+
+*Two carriers were weighed and rejected first, and are recorded so they are not
+re-proposed.* Restoring a 64-bit field means restoring the kernel patch, the
+xtables module, the userspace extension and a per-distro packaging job, on
+consumers whose firewall is nftables-native — which is the chain increment 7
+was written to delete. Conntrack labels avoid all of that and offer 128 bits
+with `CONFIG_NF_CONNTRACK_LABELS=y` already set, but nftables addresses them one
+bit at a time: `ct label set 0x5d000` is rejected with *"bit 380928 out of range
+(128 max)"*, and a nineteen-bit class becomes nineteen statements. Labels would
+also need `nf_connlabels_get()` at init, because `nf_ct_labels_ext_add()` is a
+no-op while `labels_used` is zero and every read would otherwise return NULL.
 
 ## Defects found while mapping this
 
