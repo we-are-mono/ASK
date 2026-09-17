@@ -162,9 +162,14 @@ int __init cdx_cmdhandler_init(void)
 	CMD_INIT(bridge);
 	CMD_INIT(qm);
 	statistics_init();
-#ifdef DPA_IPSEC_OFFLOAD 
-	if (!cdx_flowtable_enabled())
-		CMD_INIT(ipsec);
+#ifdef DPA_IPSEC_OFFLOAD
+	/* Initialised in both ownership modes, like every other subsystem
+	 * here. What this builds is hardware — the SA caches, the CAAM job
+	 * ring, the SEC era and the datapath frame-queue hook — and only the
+	 * FCI dispatch it also registers belongs to one owner. That one line
+	 * is gated inside ipsec_init() instead, so the hardware is up for
+	 * whichever consumer is driving it. */
+	CMD_INIT(ipsec);
 #endif
 #ifdef WIFI_ENABLE
 	wifi_init();
