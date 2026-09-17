@@ -45,8 +45,18 @@
 #include "endian_ext.h" 
 #include "dpa_control_mc.h"
 #include "dpa_wifi.h"
-#include "cdx_ceetm_gdef.h" 
+#include "cdx_ceetm_gdef.h"
 #include "cdx_defs.h"
+#include "cdx_flowtable_backend.h"
+
+/* The flowtable adapter names an ingress policer profile in its own class
+ * encoding and bounds it with its own constant, because it must not include
+ * the FMAN policer headers. The profile count belongs to this file, so the
+ * check does too: adding profiles here fails the build until the rule's
+ * encoding is widened, rather than leaving the adapter refusing a profile the
+ * hardware now has. */
+static_assert(CDX_FT_QOS_MAX_POLICER == INGRESS_FLOW_POLICER_QUEUES,
+	      "cdx_ft_rule.qos policer bound must track the ingress profile count");
 
 //#define QOS_DEBUG	1
 

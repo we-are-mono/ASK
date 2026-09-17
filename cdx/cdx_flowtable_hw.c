@@ -178,6 +178,23 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	ct->qosmark.queue = rule->qos & CDX_FT_QOS_QUEUE_MASK;
 	ct->qosmark.chnl_id = (rule->qos & CDX_FT_QOS_CHANNEL_MASK) >>
 			      CDX_FT_QOS_CHANNEL_SHIFT;
+	/* The ingress policer travels the same field but reaches the hardware by
+	 * a different route: create_preemptive_checks_hm() turns iqid into the
+	 * ucode's pp_no, so this selects which of the eight RFC-2698 profiles
+	 * the flow's ingress frames are metered against. iqid_valid gates the
+	 * read, which is why the sentinel has to be translated here rather than
+	 * carried through — nibble zero means no policer and must leave the
+	 * valid bit clear, not select profile zero.
+	 *
+	 * Naming a profile that no control plane has configured is harmless
+	 * rather than a silent drop: cdx_get_policer_profile_id() answers zero
+	 * unless that profile is enabled, and the encoder leaves
+	 * PREEMPT_POLICE_PKT clear when it does. */
+	if (rule->qos & CDX_FT_QOS_POLICER_MASK) {
+		ct->qosmark.iqid = ((rule->qos & CDX_FT_QOS_POLICER_MASK) >>
+				    CDX_FT_QOS_POLICER_SHIFT) - 1;
+		ct->qosmark.iqid_valid = 1;
+	}
 	/* A flow with no encapsulation asks for no override, and takes exactly
 	 * the path it took before tags existed. The override refuses a
 	 * description the interfaces already filled in -- a DSCP-to-PCP egress

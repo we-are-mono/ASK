@@ -170,10 +170,18 @@ typedef struct CtEntry {
         };
         struct { __be32 Saddr_v6[4], Daddr_v6[4]; };
     };
-    /* Only the two fields the backend writes. The production union carries
-     * ingress-policer and DSCP-marking bits as well; leaving them out keeps a
-     * case honest about which ones this path is responsible for. */
-    struct { unsigned queue : 4; unsigned chnl_id : 4; } qosmark;
+    /* Only the fields the backend writes, laid out as the production union
+     * lays them out so the bit positions are the ones under test. The DSCP
+     * marking bits stay out: nothing on this path sets them, and leaving them
+     * absent keeps a case honest about which fields it is responsible for. */
+    struct {
+        unsigned queue : 4;
+        unsigned pad_1 : 12;
+        unsigned iqid : 4;
+        unsigned pad_2 : 3;
+        unsigned iqid_valid : 1;
+        unsigned chnl_id : 4;
+    } qosmark;
 } CtEntry, *PCtEntry;
 static struct itf in_itf = {129, 1}, out_itf = {129, 2};
 typedef struct { struct itf *itf; unsigned flags; } OnifDesc, *POnifDesc;
@@ -194,6 +202,9 @@ static union nf_inet_addr expected_src, expected_dst;
 static u8 expected_family = AF_INET;
 static __be16 expected_sport, expected_dport;
 static unsigned expected_proto = IPPROTO_UDP;
+/* The class the rule under test carries, so the encoder stub can require that
+ * each nibble reached the field that reads it. */
+static u16 expected_qos;
 static bool expected_hairpin;
 static struct cdx_l2_encap observed_encap;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
@@ -241,6 +252,23 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
         bool nat = expected_src.ip != ct->Saddr_v4 || expected_dst.ip != ct->Daddr_v4 ||
                    expected_sport != ct->Sport || expected_dport != ct->Dport;
         assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0)));
+    }
+    /* The rule's three class nibbles reach three separate hardware fields, and
+     * the policer one is translated rather than copied: nibble zero means this
+     * flow passes no meter, so it must leave the valid bit clear instead of
+     * selecting profile zero, and nibble n names profile n-1.
+     *
+     * Spelled out in nibbles rather than through the header's masks, as the
+     * CtEntry bit positions above are: this stub is compiled before the
+     * encoding header is included, and the caller builds its values from the
+     * macros, so a shift that moved would fail there. */
+    assert(ct->qosmark.queue == (expected_qos & 0xf));
+    assert(ct->qosmark.chnl_id == ((expected_qos >> 4) & 0xf));
+    if ((expected_qos >> 8) & 0xf) {
+        assert(ct->qosmark.iqid_valid);
+        assert(ct->qosmark.iqid == (((expected_qos >> 8) & 0xf) - 1));
+    } else {
+        assert(!ct->qosmark.iqid_valid && !ct->qosmark.iqid);
     }
     assert(ct->pRtEntry->itf == (expected_hairpin ? &in_itf : &out_itf) && ct->pRtEntry->input_itf == &in_itf);
     assert(ct->pRtEntry->underlying_input_itf == &in_itf && ct->pRtEntry->mtu == 1200);
@@ -504,6 +532,19 @@ int main(void)
         unsigned old=deletes; assert(cdx_ft_hw_del(&hw)==0 && deletes==old);
     }
     rule.proto = expected_proto = IPPROTO_UDP;
+    /* Every combination the class encoding admits, so no nibble can be dropped,
+     * shifted into another field or left selecting profile zero when the flow
+     * asked for none. The insert callback does the checking. */
+    for (unsigned queue = 0; queue <= 15; queue++)
+        for (unsigned channel = 0; channel <= CDX_FT_QOS_MAX_CHANNEL; channel++)
+            for (unsigned policer = 0; policer <= CDX_FT_QOS_MAX_POLICER; policer++) {
+                rule.qos = expected_qos = queue |
+                        (channel << CDX_FT_QOS_CHANNEL_SHIFT) |
+                        (policer << CDX_FT_QOS_POLICER_SHIFT);
+                assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+                assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+            }
+    rule.qos = expected_qos = 0;
     for (unsigned i = 0; i < 16; i++) {
         unsigned variant = i % 8;
         expected_hairpin = variant == 7;

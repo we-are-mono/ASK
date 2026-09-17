@@ -550,8 +550,8 @@ void cmmQmSetPrintHelp(void)
 #endif /* endif for SEC_PROFILE_SUPPORT */
                 "\n"
                 "	set qm ingress queue <0-7> policer [on | off]\n"
-                "	set qm ingress queue <1-7> [cir {1 - 20971250}] [pir {1 - 20971250}]\n"
-                "	set qm ingress queue default [cir {1 - 20971250}] [pir {1 - 20971250}]\n"
+                "	set qm ingress queue <1-7> [cir {1 - 10000000 Kbit/s}] [pir {1 - 10000000 Kbit/s}]\n"
+                "	set qm ingress queue default [cir {1 - 10000000 Kbit/s}] [pir {1 - 10000000 Kbit/s}]\n"
                 "	set qm ingress reset \n"
                 "\n"
 		,
@@ -1426,8 +1426,8 @@ static int qm_ingress_policer_cfg(char **keywords, int *pcpt, daemon_handle_t da
 	}
 help:
 	cmm_print(DEBUG_STDOUT, "Usage: set qm ingress queue <0-7> policer [on | off]\n");
-	cmm_print(DEBUG_STDOUT, "Usage: set qm ingress queue <1-7> [cir {1 - 20971250}] [pir {1 - 20971250}]\n");
-	cmm_print(DEBUG_STDOUT, "Usage: set qm ingress queue default [cir {1 - 20971250] [pir {1 - 20971250}]\n");
+	cmm_print(DEBUG_STDOUT, "Usage: set qm ingress queue <1-7> [cir {1 - 10000000 Kbit/s}] [pir {1 - 10000000 Kbit/s}]\n");
+	cmm_print(DEBUG_STDOUT, "Usage: set qm ingress queue default [cir {1 - 10000000 Kbit/s}] [pir {1 - 10000000 Kbit/s}]\n");
 	cmm_print(DEBUG_STDOUT, "Usage: set qm ingress reset \n");
 	return QM_ERROR;
 }

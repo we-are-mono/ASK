@@ -346,7 +346,7 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 typedef int (*cdx_ft_setup_tc_handler)(struct net_device *dev,
 				       enum tc_setup_type type, void *type_data);
 static cdx_ft_setup_tc_handler cdx_ft_handler;
-typedef u8 (*cdx_ft_qos_class_fn)(u32 mark);
+typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
 
 /* The ops table is file-scope data rather than a function, so the harness
@@ -798,13 +798,13 @@ static void test_dispatch(void)
 }
 
 /* The classifier the adapter registers, as ft_qos_class() decodes a mark: the
- * masked bits shifted down to their own base. Eight bits wide, because a class
- * is a channel nibble and a class-queue nibble and a narrower field can only
- * ever name the queue. */
-static u8 test_qos_class(u32 mark) { return (mark & 0xff00) >> 8; }
+ * masked bits shifted down to their own base. Twelve bits wide, because a class
+ * names a class queue, a channel and an ingress policer profile, one nibble
+ * each, and a narrower field can only ever name the queue. */
+static u16 test_qos_class(u32 mark) { return (mark & 0xfff00) >> 8; }
 
 /* Send a frame whose conntrack carries the mark that decodes to `class`. */
-static u16 pick(struct net_device *dev, u8 class)
+static u16 pick(struct net_device *dev, u16 class)
 {
 	struct nf_conn ct = { .mark = (u32)class << 8 };
 	struct sk_buff skb = { .ct = &ct };
@@ -849,6 +849,17 @@ static void test_software_path(void)
 	/* A class no leaf holds leaves the stack's own choice alone. */
 	assert(pick(dev, 0x00) == DPA_SELECT_QUEUE_NONE);
 	assert(pick(dev, 0x03) == DPA_SELECT_QUEUE_NONE);
+	/* The class also names an ingress policer profile, which says nothing
+	 * about where a frame leaves. Every profile has to give the same queue
+	 * as no profile, and none of them may index past a table sized for the
+	 * egress class -- the reason this path masks before it looks. */
+	for (unsigned profile = 0; profile <= CDX_FT_QOS_MAX_POLICER; profile++) {
+		u16 policed = (u16)(profile << CDX_FT_QOS_POLICER_SHIFT);
+
+		assert(pick(dev, policed | (1 << 4) | (NUM_PQS - 1)) == qid10);
+		assert(pick(dev, policed | (2 << 4) | (NUM_PQS - 1)) == qid2);
+		assert(pick(dev, policed | 0x03) == DPA_SELECT_QUEUE_NONE);
+	}
 	/* A frame with no conntrack has no class to read. */
 	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 
