@@ -96,8 +96,15 @@ async def test_flowtable_mtu_recovery(connections):
                     reports = await p.rpc("stop", ids)
                     tx_after = await software_tx(r)
                     current_mtus(after, mtus)
-                    assert after["installs"] == before["installs"] + 4, (before, after)
-                    assert after["deletes"] == before["deletes"] + 4, (before, after)
+                    # This case changes an MTU under RTNL while traffic is
+                    # flowing, so an admission can lose rtnl_trylock, decline
+                    # with -EAGAIN and retire its generation for a later retry.
+                    # Each such retry reinstalls what it retired, which is one
+                    # more install and one more delete than the four directions
+                    # this is counting -- and busy is exactly how many.
+                    retries = after["busy"] - before["busy"]
+                    assert after["installs"] == before["installs"] + 4 + retries, (before, after)
+                    assert after["deletes"] == before["deletes"] + 4 + retries, (before, after)
                     assert after["mtu_invalidations"] == before["mtu_invalidations"] + 2, (before, after)
                     assert after["rearms"] == initial["rearms"] and not after["invalidation_done"], after
                     assert all(report["count"] > 0 for report in reports.values()), reports
