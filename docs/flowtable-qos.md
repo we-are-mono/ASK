@@ -1022,20 +1022,92 @@ Naming an unconfigured profile is harmless rather than a silent drop:
 the encoder leaves `PREEMPT_POLICE_PKT` clear when it does. The selection is
 therefore safe to ship ahead of the surface that configures it.
 
-Three candidate surfaces, none of them free:
+Three surfaces were weighed and **all three were rejected**, which is worth
+recording because two of them look reasonable until a fact kills them.
 
-1. **A module parameter on `ask_flowtable`**, alongside `qos_mark_mask` and
-   `qos_default_class`. Not a new surface — it is the one already there — and it
-   needs cdx to export the profile setters. Boot-time only, which sits badly
-   with the rule that offload configuration must be changeable without a
-   reboot.
-2. **The policy JSON and `ask-flowtable`**, matching the consumer contract
-   exactly. Needs a kernel-side write path that does not exist yet.
-3. **Unseal the `FC_QM` ingress-policer subcommands.** Smallest change,
-   and it reintroduces the FCI control plane this design argues against.
+1. **A module parameter on `ask_flowtable`.** Not a new surface — `qos_mark_mask`
+   and the writable `flowtable_fail_stage` are already there. But a private knob
+   with a private schema is not a kernel interface, and a consumer still has to
+   learn something ASK-shaped.
+2. **The policy JSON and `ask-flowtable`.** Same objection: `ask-flowtable` is
+   already packaged everywhere, so it costs no packaging, but it is still an
+   ASK-private vocabulary.
+3. **Unseal the `FC_QM` ingress-policer subcommands.** This one looked strongest
+   — one change restores per-port, aggregate and per-flow together, reusing
+   handlers, validation and `CMD_QM_QUERY` read-back that already exist and are
+   tested. **It does not work.** `fci` is not loaded in flowtable mode at all
+   (`rmmod fci` on the DUT answers "not currently loaded"), and the only FCI
+   client in the product is cmm, which does not run there either. Unsealing the
+   commands would expose a surface nothing can speak; making it speakable means
+   loading `fci` and writing and packaging a new FCI client for Armbian,
+   OpenWrt and meta-ask. That is a per-consumer porting cost, which is the
+   objection that retired option C for the scheduler.
 
-Recommendation: **2**, because it is the only one that is both runtime and
-already the contract; **1** as a bench fixture if a proof is wanted sooner.
+**Decision: offload `FLOW_ACTION_POLICE`.** The scheduler already set the
+pattern and it is the one to follow — `tc` for the tree, `ethtool -S` for the
+counters, `ct mark` for classification, and no ASK-specific API anywhere. The
+ingress meter should arrive the same way:
+
+```sh
+tc qdisc add dev eth4 clsact
+tc filter add dev eth4 ingress matchall \
+    action police rate 500mbit burst 64k conform-exceed drop
+tc filter add dev eth4 ingress flower ip_proto udp dst_port 5004 \
+    action police rate 20mbit peakrate 25mbit burst 32k conform-exceed drop
+```
+
+### Ingress policing through `tc`, in outline
+
+**The mapping is close to one-to-one**, which is what makes this worth doing
+rather than tolerating. `flow_action_entry.police` carries `rate_bytes_ps`,
+`peakrate_bytes_ps`, `burst`, `burst_pkt`, `rate_pkt_ps`, `mtu` and an
+`exceed`/`notexceed` pair of action ids. The hardware profile is
+`e_FM_PCD_PLCR_RFC_2698`: CIR, PIR, CBS, PBS, and an action per colour. So
+`rate_bytes_ps` is the CIR, `peakrate_bytes_ps` the PIR, `burst` the CBS, and
+`exceed.act_id == FLOW_ACTION_DROP` is what `cdx_qos.c` already programs as
+`e_FM_PCD_PLCR_DROP_FRAME` on red. Even the mode survives: `rate_pkt_ps` is
+packet mode, which these profiles also support.
+
+Only the unit differs. The kernel gives bytes per second; the FMD's byte mode
+takes Kbit/s (`GetInfoRateReg()` does `tmp *= 1000`), so the conversion is
+`rate_bytes_ps * 8 / 1000` — the same unit confusion that made CMM validate a
+packets-per-second range against a byte-mode profile.
+
+**Eight meters is the budget, and finite meters are ordinary.** Profile 0 stays
+the default for everything unclassified, leaving seven for distinct police
+actions; the SEC profile is numbered separately and is not in this pool. An
+eighth distinct action returns `-EOPNOTSUPP` and tc leaves the filter in
+software, which is exactly how a driver with finite meters is expected to
+behave.
+
+**`TC_SETUP_BLOCK` is not handled today** — `cdx_setup_tc()` answers HTB, RED,
+`TC_SETUP_ROOT_QDISC` and `TC_SETUP_FT`, and everything else falls to
+`-EOPNOTSUPP`. That is the entry point this work adds.
+
+**The one hard part is binding a filter to a flow.** `action police` attaches to
+a *tc filter*; the FMAN selects a profile per *flowtable entry*, through the
+`iqid` in that entry's own action. The two are created by different subsystems,
+so something has to decide that a given admitted flow falls under a given
+filter. Two stages, and the first needs none of it:
+
+- **Stage 1 — `matchall`.** A port-wide meter needs no correlation at all: every
+  flow on the port uses it. This restores the per-port fast-forward rate as a
+  kernel verb, and is the whole of what most deployments want.
+- **Stage 2 — `flower`.** Offloading a 5-tuple match means recording the filter
+  and consulting it when a flow is admitted, so `cdx_ft_hw_add()` can set
+  `iqid` to the profile that filter allocated. The class nibble from
+  increment 8 is the mechanism underneath; it stops being an operator-facing
+  surface and becomes how the adapter tells the hardware what tc already
+  decided.
+
+Revocation is the same constraint as classification: an offloaded flow never
+re-enters the ingress path, so a filter added after admission does not reach
+flows already in hardware. The existing stop → change → apply sequence is the
+answer, as it is for the mark.
+
+What this retires: the per-port fast-forward rate, the eight profiles and the
+aggregate default all become `tc` verbs, and nothing in the QoS plane needs FCI
+or CMM. That is the last QoS reason to keep either.
 
 #### The unit error, fixed
 

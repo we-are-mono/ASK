@@ -393,14 +393,24 @@ each so the open bug list stays honest.
   Selecting an unconfigured profile is inert rather than a silent drop —
   `cdx_get_policer_profile_id()` answers zero unless the profile is enabled and
   the encoder then leaves `PREEMPT_POLICE_PKT` clear — which is why the
-  selection ships ahead of this. Three candidate surfaces and a recommendation
-  are in [the QoS design](docs/flowtable-qos.md#the-gap-nothing-can-set-the-rates);
-  the decision is the product's, not the increment's.
-  One constraint for whichever surface wins: **profile 0 is not one slot of
-  eight.** The hardware encoder starts there and only an `iqid`-carrying mark
-  moves it, so profile 0 meters every flow that names nothing — it is the
-  default, and needs a defined rate rather than being left to whatever the
-  eight-way configuration happens to put in slot zero.
+  selection ships ahead of this.
+  **Decided: offload `FLOW_ACTION_POLICE`** via `TC_SETUP_BLOCK`, which
+  `cdx_setup_tc()` does not handle today. `flow_action_entry.police` maps
+  nearly one-to-one onto the RFC-2698 profile — `rate_bytes_ps` to CIR,
+  `peakrate_bytes_ps` to PIR, `burst` to CBS, `exceed.act_id` to the red action
+  — differing only in unit (bytes/s in, Kbit/s out). Stage 1 is `matchall`,
+  which needs no correlation and restores the per-port rate; stage 2 is
+  `flower`, which must record the filter and consult it at admission so
+  `cdx_ft_hw_add()` sets `iqid` to the profile that filter allocated. Seven
+  meters are available for distinct actions; an eighth returns `-EOPNOTSUPP`
+  and stays in software. Profile 0 is reserved as the default for everything
+  unclassified — it is not one slot of eight, because the hardware encoder
+  starts there and only an `iqid`-carrying mark moves it.
+  Rejected: a module param and the policy JSON (both ASK-private vocabularies),
+  and unsealing `FC_QM` — `fci` is not even loaded in flowtable mode and cmm,
+  the only FCI client, does not run there, so it would need a new client
+  packaged for three distributions. Full reasoning in
+  [the QoS design](docs/flowtable-qos.md#ingress-policing-through-tc-in-outline).
 
 ---
 
