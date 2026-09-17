@@ -355,16 +355,44 @@ not capability.
 
 ## Tests
 
-Eight IPsec files already exist under `tools/tests/`. They were written for
-the CMM path and `CMD_INIT(ipsec)` is skipped in a flowtable boot, so their
-current status in this mode is unknown and is worth establishing before
-designing new ones rather than assuming either way. Run them against a
-flowtable boot at step 1, when the hardware is initialised but nothing steers
-to SEC, and record which fail for want of a control plane rather than for want
-of correctness.
+IPsec is described elsewhere as the most covered subsystem left on the board.
+That is true by file count, and the useful question is not how many files
+reach it through FCI — nearly all of them do — but **whether what a file
+asserts survives the port**. Sorted that way the seven files split three ways,
+and only the first group is dead.
 
-New coverage follows the house rule: the failing test comes first and is
-proved to fail without the fix.
+**Removed, because the thing they assert is the thing being deleted.**
+`test_ipsec_offload.py` asserted the wire layouts of `0x0A01`, `0x0A04`,
+`0x0A07`, `0x0A02` and `0x0A0A`, and `test_concurrent_query_vs_mutator_ipsec.py`
+asserted the per-cursor locking in `cdx/query_ipsec.c`. That cursor exists only
+to serve FCI `ACTION_QUERY`; the `xfrmdev_ops` control plane has no query
+command, so neither has a successor to move to. `query_sa()` and the two QUERY
+command codes went out of `_ipsec_helpers.py` with them.
+
+**Kept, because FCI is only how they knock.** `_key_zeroing` (H2,
+`cdx_ipsec_sec_sa_context_free`), `_dma_balance` (H3, the shared-descriptor
+DMA-map unwind), `_failslab` (M7-class, `cdx_ipsec_sec_sa_context_alloc`) and
+`_natt_spi_bounds` (H5, the `spi_param[16]` overrun) are regression nets for
+named memory-safety defects in `cdx/cdx_dpa_ipsec.c` — every one of those
+functions is code the port keeps and calls harder. What they lose at step 3 is
+the door, not the subject: `xdo_dev_state_add()` reaches the same allocator,
+the same descriptor builder and the same classification-entry path, so each is
+re-pointed rather than rewritten. `_natt_spi_bounds` needs one extra look,
+because its reachability hook resolves an SA through
+`xfrm_state_lookup_byhandle()`, which this design deletes.
+
+**The one that transfers in shape, with a caveat worth knowing before step 4.**
+`test_ipsec_esp_traffic.py` installs through `ip xfrm` and lets kernel XFRM
+events drive the rest, which is exactly the new shape — but its *oracle* is the
+FCI SA-statistics cursor, walking `0x0A0A`/`0x0A0B` for the SPI's packet and
+byte counts. So the install half transfers and the verification half does not.
+The replacement is upstream and better: `xdo_dev_state_update_stats()` puts
+hardware counters where `ip -s xfrm state` already reads them, so the standard
+tool becomes the oracle and the test stops needing a private cursor at all.
+
+New coverage follows the house rule: the failing test comes first and is proved
+to fail without the fix. The first one is the step 4 proof, because step 4 is
+the first step that makes an observable promise.
 
 ## The consumer contract
 
