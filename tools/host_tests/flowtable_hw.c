@@ -175,10 +175,16 @@ typedef struct CtEntry {
      * marking bits stay out: nothing on this path sets them, and leaving them
      * absent keeps a case honest about which fields it is responsible for. */
     struct {
+        /* The hardware mark's own layout, bit for bit: the remark's flag and
+         * value sit between the class queue and the ingress policer, which is
+         * why they are two separate fields rather than one seven-bit one. */
         unsigned queue : 4;
-        unsigned pad_1 : 12;
+        unsigned pad_1 : 4;
+        unsigned dscp_mark_flag : 1;
+        unsigned dscp_mark_value : 6;
+        unsigned pad_2 : 1;
         unsigned iqid : 4;
-        unsigned pad_2 : 3;
+        unsigned pad_3 : 3;
         unsigned iqid_valid : 1;
         unsigned chnl_id : 4;
     } qosmark;
@@ -267,6 +273,11 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     assert(ct->qosmark.chnl_id == ((expected_qos >> 4) & 0xf));
     assert(ct->qosmark.iqid == ((expected_qos >> 8) & 0xf));
     assert(ct->qosmark.iqid_valid);
+    /* The remark's flag is conditional where the policer's is not, because
+     * DSCP zero is a real codepoint and "remark to CS0" has to differ from
+     * "do not remark". */
+    assert(ct->qosmark.dscp_mark_flag == ((expected_qos >> 12) & 0x1));
+    assert(ct->qosmark.dscp_mark_value == ((expected_qos >> 13) & 0x3f));
     assert(ct->pRtEntry->itf == (expected_hairpin ? &in_itf : &out_itf) && ct->pRtEntry->input_itf == &in_itf);
     assert(ct->pRtEntry->underlying_input_itf == &in_itf && ct->pRtEntry->mtu == 1200);
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));

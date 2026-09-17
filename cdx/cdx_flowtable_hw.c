@@ -197,6 +197,19 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	ct->qosmark.iqid = (rule->qos & CDX_FT_QOS_POLICER_MASK) >>
 			   CDX_FT_QOS_POLICER_SHIFT;
 	ct->qosmark.iqid_valid = 1;
+	/* The remark rides an opcode every routed flow already carries:
+	 * create_update_dscp_hm() writes the codepoint into the header
+	 * manipulation that decrements TTL, so this costs no extra opcode.
+	 *
+	 * Unlike the policer the flag is conditional, because DSCP zero is a
+	 * real codepoint -- CS0 is what an operator remarks *to* for best
+	 * effort -- so "remark to zero" and "do not remark" have to be
+	 * different states. These two fields are the first thing in the tree
+	 * ever to write them: the hardware has always read them, and NXP left
+	 * filling them to an iptables target nobody packaged. */
+	ct->qosmark.dscp_mark_flag = (rule->qos & CDX_FT_QOS_REMARK_MASK) ? 1 : 0;
+	ct->qosmark.dscp_mark_value = (rule->qos & CDX_FT_QOS_DSCP_MASK) >>
+				      CDX_FT_QOS_DSCP_SHIFT;
 	/* A flow with no encapsulation asks for no override, and takes exactly
 	 * the path it took before tags existed. The override refuses a
 	 * description the interfaces already filled in -- a DSCP-to-PCP egress
