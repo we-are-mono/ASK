@@ -413,6 +413,18 @@ typedef struct _tSAEntry {
 void* M_ipsec_sa_cache_lookup_by_spi(U32 *daddr, U32 spi, U8 proto, U8 family);
 void* M_ipsec_sa_cache_lookup_by_h(U16 handle);
 void* M_ipsec_get_matched_natt_tunnel(PSAEntry sa);
+
+/* SA construction, shared by the two control planes. The FCI handlers reach
+ * these one command at a time; cdx_ipsec_backend.c calls the same sequence in
+ * one pass from a complete description. Both run under the control mutex.
+ * Keys are named in the PF_KEY numbering (SADB_AALG_* / SADB_EALG_*). */
+void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto,
+			      U8 family, U16 handle, U8 replay, U8 esn,
+			      U16 mtu, U16 dev_mtu, U8 dir);
+int M_ipsec_sa_cache_delete(U16 handle);
+int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8 *key);
+int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8 *key);
+int ipsec_install_fp_entry(PSAEntry sa);
 extern struct slist_head sa_cache_by_spi[];
 extern struct slist_head sa_cache_by_h[];
 

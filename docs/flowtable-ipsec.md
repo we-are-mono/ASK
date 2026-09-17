@@ -156,10 +156,25 @@ kernel feature that landed after NXP wrote them.
 
 **`offload_handle` is already the field CDX wants.**
 `struct xfrm_dev_offload` carries `unsigned long offload_handle`, `dev`,
-`real_dev`, `dir` and `type`. That removes the need for `xfrm_state.handle`,
-`xfrm_state.byh`, `netns_xfrm.state_byh` and the whole handle-lookup hash 040
-adds to `xfrm_state.c` — Linux already stores a driver cookie per state and
-already indexes states for us.
+`real_dev`, `dir` and `type`. Linux already stores a driver cookie per state,
+so `xfrm_state.handle` has nothing left to do.
+
+The index beside it is a subtler question, and reading the datapath changed the
+answer. `netns_xfrm.state_byh` is not bookkeeping: `dpa_ipsec.c:391` walks it
+**per packet**, on the SEC decrypt-completion path, because a decrypted frame
+arrives carrying nothing but its SA's handle in the trailer and the stack drops
+it unless a `sec_path` naming the state is attached first. Deleting the hash
+without replacing the lookup would break inbound IPsec entirely.
+
+It is still deleted, because the lookup belongs on the other side of the
+interface. The backend allocates the handle — it must, since the handle indexes
+`sa_cache_by_h` and no caller can know which values are free — and it is handed
+the `xfrm_state` by `xdo_dev_state_add()`, so it can answer `handle → state`
+from the cache it already keeps. The legacy design needed an index in kernel
+core only because CMM chose the handle and cdx had nothing but the number. Here
+the same code that allocates the handle holds the state, and
+`get_netdev_of_SA_by_fqid()` has already found that entry one line earlier on
+the very path that wants it, so the second lookup collapses into the first.
 
 **The consumer already speaks it.** `strongswan-6.0.3` is in the OpenWrt build
 tree for this target and supports `hw_offload = packet` per child SA
@@ -309,8 +324,37 @@ initialisation banner, so the CAAM job-ring claim brings no splat with it.
 
 `cdx/cdx_ipsec_backend.h`, alongside `cdx_flowtable_backend.h` and under the
 same `ASK_CDX_FLOWTABLE` GPL-only export namespace: typed SA add, delete,
-stats read-back and an opaque handle. No CDX control structures, no firmware
-objects, no `xfrm` types — the adapter converts.
+stats read-back and an opaque owner. Keys are named in the PF_KEY numbering
+the SEC descriptor builder already consumes, for the same reason
+`cdx_ft_rule` holds a `union nf_inet_addr` — a UAPI value type crosses without
+being transcribed, and no private enum has to be kept in step with two other
+tables.
+
+Three things are decided here rather than inherited.
+
+**One call, not five.** FCI spells an SA as CREATE, SET_KEYS, SET_TUNNEL or
+SET_NATT, SET_LIFETIME and SET_STATE in sequence, because PF_KEY delivers a
+state to userspace in installments. `xdo_dev_state_add()` is handed a complete
+`xfrm_state`, so the SA is described once and installed once — and there is no
+window in which a half-built SA is reachable by handle.
+
+**The backend allocates the handle.** CMM chose the sagd and cdx trusted it,
+which works only while there is exactly one client. The handle indexes the SA
+cache and is what SEC stamps into a decrypted frame, so it belongs to whoever
+owns that cache. Allocation rotates rather than restarting from one, so a
+frame still in flight when its SA was deleted resolves to nothing rather than
+to whichever SA was created next.
+
+**The state is bound before the classifier entry, not after.** The FCI path
+installs the entry and then looks the state up, which is the only order
+available to it. Here the order matters: frames can arrive from SEC the moment
+the entry exists, and one arriving before the state is reachable is dropped.
+
+The SA machinery itself is not duplicated. `M_ipsec_sa_cache_create()`, the two
+key setters, `M_ipsec_sa_cache_delete()` and the classifier install are the
+functions the legacy owner already drives, now declared in `control_ipsec.h`;
+`ipsec_push_sa_to_fast_path()` was split so its FCI-only state lookup stays
+with FCI. Only the door is new.
 
 ### 3. `xfrmdev_ops` on the DPAA netdev
 
