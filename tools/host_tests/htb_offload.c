@@ -349,6 +349,18 @@ static cdx_ft_setup_tc_handler cdx_ft_handler;
 typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
 
+/* The filter layer, which owns what a police action means. This file is about
+ * the qdisc layer and the one ndo_setup_tc they share, so all that matters
+ * here is that a block request is routed there rather than dropped; the
+ * action's own validation is tools/host_tests/police.c. */
+static unsigned police_blocks;
+static int cdx_police_setup_block(struct net_device *dev, void *f)
+{
+	assert(dev && f);
+	police_blocks++;
+	return -EOPNOTSUPP;
+}
+
 /* The ops table is file-scope data rather than a function, so the harness
  * builds its own from the production callbacks it does compile. */
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb);
@@ -780,7 +792,12 @@ static void test_dispatch(void)
 	assert(cdx_register_ft_setup_tc(ft_stub) == -EBUSY);
 	assert(!cdx_setup_tc(&devices[0], TC_SETUP_FT, &block));
 	assert(ft_calls == 1);
+	/* A block is the filter layer's, not the qdisc layer's: this ndo only
+	 * has to route it there. It used to fall through to the default arm
+	 * and be refused before anything could offload a police action. */
+	police_blocks = 0;
 	assert(cdx_setup_tc(&devices[0], TC_SETUP_BLOCK, &block) == -EOPNOTSUPP);
+	assert(police_blocks == 1);
 	/* The root-qdisc graft is a notification. Refusing it makes every
 	 * successful `tc qdisc add ... htb offload` report a failed graft. */
 	assert(!cdx_setup_tc(&devices[0], TC_SETUP_ROOT_QDISC, &block));

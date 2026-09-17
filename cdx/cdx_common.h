@@ -421,6 +421,9 @@ unsigned int cdx_ehash_quarantine_pending(void);
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size);
 int cdx_get_expt_rate(void *cmd);
 int cdx_set_ff_rate(char *ifname, uint32_t cir, uint32_t pir);
+int cdx_port_police_set(char *ifname, bool byte_mode,
+			uint32_t cir, uint32_t pir, uint32_t cbs, uint32_t pbs);
+int cdx_port_police_clear(char *ifname);
 int cdx_get_ff_rate(void *cmd);
 void get_plcr_counter(void *handle, uint32_t *counterval, uint32_t clear);
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no);

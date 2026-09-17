@@ -378,7 +378,13 @@ each so the open bug list stays honest.
   both patches against their upstream tarballs with the QoS hunks dropped; it
   needs a source fetch, which is why it is not bundled with the retirement.
 
-- [ ] **A147 — nothing can set an ingress policer rate in flowtable mode.** A
+- [ ] **A147 — per-flow ingress policer rates have no surface in flowtable mode.**
+  **Stage 1 is done**: `tc matchall action police` on a clsact ingress block is
+  offloaded onto the port's own profile (`cdx_police.c`), proved `in_hw` and
+  metering on the rig — 20mbit measured 17.6, 50mbit measured 41.1, against 109
+  unpoliced. That restores the per-port rate. What remains is `flower`, which
+  must bind a filter to the eight per-flow profiles and to flows the flowtable
+  admitted. The rest of this entry is the original finding. A
   flow can now *select* one of the eight FMAN RFC-2698 ingress profiles: the
   class the conntrack mark carries has a third nibble, and `cdx_ft_hw_add()`
   turns it into `iqid`/`iqid_valid`. Nothing can configure what those profiles
