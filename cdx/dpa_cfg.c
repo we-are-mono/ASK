@@ -535,6 +535,32 @@ static int get_cctbl_info(struct cdx_fman_info *finfo,
 	return 0;
 }
 
+/* Whether the punt profile meters packets rather than bytes. A devlink trap
+ * policer's rate is packets per second, so a caller speaking that unit has to
+ * know which one the profile was configured for rather than assume it. */
+bool cdx_expt_rate_is_packet_mode(uint32_t fm_index)
+{
+	if (fm_index >= num_fmans)
+		return false;
+	return (fman_info + fm_index)->expt_ratelim_mode != EXPT_PKT_LIM_PLCR_MODE_BYTE;
+}
+
+/* The colours the punt profile counted, for a caller with no FCI command
+ * structure to fill. Read without clearing, as everywhere else. */
+int cdx_expt_rate_counters(uint32_t fm_index, uint32_t type,
+			   struct cdx_police_counters *out)
+{
+	struct cdx_fman_info *finfo;
+
+	if (fm_index >= num_fmans || type >= CDX_EXPT_MAX_EXPT_LIMIT_TYPES)
+		return FAILURE;
+	finfo = (fman_info + fm_index);
+	if (!finfo->expt_rate_limit_info[type].handle)
+		return FAILURE;
+	cdx_plcr_colours(finfo->expt_rate_limit_info[type].handle, out);
+	return SUCCESS;
+}
+
 int cdx_set_expt_rate(uint32_t fm_index, uint32_t type, uint32_t limit, uint32_t burst_size)
 {
 	struct cdx_fman_info *finfo;

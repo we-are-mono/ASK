@@ -1501,6 +1501,66 @@ owns the netdevs and would mean a kernel patch. cdx is the answer that needs no
 patch and keeps the QoS plane in one module; the plumbing is the same either
 way, so the choice moves the registration and nothing else.
 
+The instance lands on the FMAN's own platform device, reached through
+`mac_dev->fm_dev` — which the SDK's own `fm_get_handle()` casts to
+`t_LnxWrpFmDev *`, so the pointer is that wrapper and nothing else. It is
+registered as the first ethernet interface comes up, because that is the first
+moment cdx holds anything that can name the device, and it belongs to the FMAN
+rather than to a port: one profile meters every port's misses, and an instance
+per port would be four handles onto one meter.
+
+**No traps, and no groups.** The kernel binds policers to trap groups and groups
+to traps, and a trap is something a driver *reports* — it hands every punted
+packet to `devlink_trap_report()` so drop monitor can see it. This driver does
+not, and declaring a trap taxonomy it does not report would claim more than the
+hardware tells us. A policer on its own is listable and settable, which is the
+whole of the verb being ported.
+
+**The rate is packets per second, and so is the profile — but only by
+configuration.** `expt_ratelim_mode` can put it in byte mode, and the FCI
+command that fed it named its field `pkts_per_sec`, so packet mode is the
+intent. A rate arriving in one unit and programmed as the other is the mistake
+[the ingress range](#the-unit-error-fixed) already made once, so byte mode is
+refused rather than reinterpreted. (The field's own comment in `cdx_ioctl.h`
+said the opposite of what its defines spell; that is fixed.)
+
+*Proved on hardware, 2026-09-17.* The image gained `iproute2-devlink`, without
+which none of this could be driven from the DUT at all.
+
+```
+# devlink dev show
+platform/1a00000.fman
+# devlink trap policer show
+  policer 1 rate 5000000 burst 2048
+```
+
+Set to `rate 100000 burst 512` it reads back as asked. CMM's validated range
+survives as the policer's own `min`/`max`, so devlink refuses what CMM refused,
+with its own message rather than a driver error:
+
+```
+Error: Policer rate lower than limit.       # rate 10
+Error: Policer rate higher than limit.      # rate 9000000
+```
+
+And it meters. At `rate 1000 burst 1` — the minimum — a TCP connection through
+the DUT could not even be established, because the punt path is how a
+software-forwarded flow starts, and `devlink -s trap policer show` counted
+**8 dropped**. Read twice with no traffic between, it stayed at 8: a running
+total, which is what devlink asks for, and unlike the `tc` statistics there is
+no baseline to keep. Restoring the rate restored forwarding.
+
+One behaviour worth knowing: **setting a rate clears the drop count.** Writing
+the same `rate 1000 burst 1` again took the counter from 8 to 0, because
+programming the profile goes through `FM_PCD_PlcrProfileSet`. An operator who
+changes the rate loses the history.
+
+No BUG, WARNING, call trace or KASAN output beyond KASAN's own init banner.
+
+*The SEC rate is still not delivered*, for the reason above: it has no kernel
+verb, only a devlink param's untyped knob, and that is a decision to take
+deliberately rather than by momentum.
+
 **The SEC rate is not a second mechanism.** `INGRESS_SEC_POLICER_QUEUE_NUM` is
 `INGRESS_ALL_POLICER_QUEUES - 1` — profile 8 of the same ingress pool the seven
 per-flow profiles come from, programmed through the same

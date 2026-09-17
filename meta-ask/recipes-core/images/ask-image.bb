@@ -14,6 +14,7 @@ IMAGE_INSTALL = " \
     iproute2 \
     iproute2-bridge \
     iproute2-tc \
+    iproute2-devlink \
     iputils \
     iptables \
     nftables \

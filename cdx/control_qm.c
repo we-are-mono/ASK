@@ -22,6 +22,7 @@
 #include "cdx_ceetm_app.h"
 #include "cdx_htb.h"
 #include "cdx_dscp.h"
+#include "cdx_devlink.h"
 #include "misc.h"
 
 QM_context_ctl gQMCtx[MAX_PHY_PORTS];
@@ -470,6 +471,9 @@ void qm_exit(void)
 {
 	printk(KERN_INFO "%s:%d\n", __func__, __LINE__);
 	set_cmd_handler(EVENT_QM, NULL);
+	/* Before the hardware below it goes: an instance outliving its own
+	 * device is a handle onto nothing. */
+	cdx_devlink_detach();
 	qm_quiesce();
 	return;
 }
@@ -525,6 +529,12 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 		priv = netdev_priv(qm_ctx->net_dev);
 		priv->qm_ctx = qm_ctx;
 	}
+	/* First interface up is the first moment anything here can name the
+	 * FMAN's own device, which is what the punt policer belongs to. A
+	 * failure is not this interface's problem: the scheduler works without
+	 * a devlink instance and the interface has already been built. */
+	if (cdx_devlink_attach(qm_ctx->net_dev))
+		ceetm_err("%s::unable to register the devlink instance\n", __func__);
 #endif
 	return SUCCESS;
 }

@@ -302,6 +302,20 @@ static void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
     assert(qm_ctx);
     dscp_ports_dropped++;
 }
+
+/* The devlink instance the punt policer lives on. It is registered once, as
+ * the first interface comes up, and its own behaviour is not this harness's
+ * subject; what matters here is that an interface is still built when the
+ * registration fails, and that the instance goes before the hardware does. */
+static unsigned devlink_attaches, devlink_detaches;
+static int devlink_attach_rc;
+static int cdx_devlink_attach(struct net_device *net_dev)
+{
+    assert(net_dev);
+    devlink_attaches++;
+    return devlink_attach_rc;
+}
+static void cdx_devlink_detach(void) { devlink_detaches++; }
 static void synchronize_net(void) {}
 static int ceetm_enable_or_disable_qos(QM_context_ctl *ctx, unsigned enable)
 { assert(!enable); ctx->qos_enabled = 0; return 0; }
@@ -413,7 +427,13 @@ int main(void)
         assert(!gQMCtx[port.portid].iface_info && !gQMCtx[port.portid].net_dev);
     }
     fail_at = 0;
+    /* The devlink instance is registered here, and a registration that fails
+     * is reported rather than failing the interface: the scheduler works
+     * without one, and by this point the interface is already built. */
+    devlink_attach_rc = -12 /* ENOMEM */;
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
+    assert(devlink_attaches == 1);
+    devlink_attach_rc = 0;
     assert(cdx_enable_ceetm_on_iface(&iface) < 0);
     QM_context_ctl *ctx = &gQMCtx[port.portid];
     assert(!ceetm_get_egressfq(ctx, 0, 0));

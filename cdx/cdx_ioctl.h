@@ -167,7 +167,9 @@ struct cdx_fman_info {
 	uint32_t max_ports;	//max ports with this fman
 	uint32_t num_tables;	//max tables for this fman
 	uint32_t fmMuramMemSize; 
-	uint32_t expt_ratelim_mode;       //0 bytes mode, 1 pkt mode
+	/* EXPT_PKT_LIM_PLCR_MODE_PKT (0) or _BYTE (1). The comment here used to
+	 * say the opposite of what the defines above it spell. */
+	uint32_t expt_ratelim_mode;
 	uint32_t expt_ratelim_burst_size; //bytes or packets
 };
 
