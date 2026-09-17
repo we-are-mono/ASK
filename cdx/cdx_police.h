@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright 2026 Mono
+ * Copyright 2026 Mono Technologies Inc.
  *
  * Ingress policing offload. The driver's single ndo_setup_tc dispatches
  * TC_SETUP_BLOCK here; see cdx_police.c for what the block accepts.

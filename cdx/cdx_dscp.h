@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright 2026 Mono
+ * Copyright 2026 Mono Technologies Inc.
  *
  * Egress classification by DSCP. The driver's single ndo_setup_tc dispatches a
  * clsact egress block here; see cdx_dscp.c for what the block accepts.

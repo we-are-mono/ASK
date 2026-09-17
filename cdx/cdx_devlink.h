@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright 2026 Mono
+ * Copyright 2026 Mono Technologies Inc.
  *
  * The punt rate as a devlink trap policer; see cdx_devlink.c.
  */

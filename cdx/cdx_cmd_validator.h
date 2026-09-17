@@ -1,5 +1,5 @@
 /*
- *  Copyright 2026 Mono Gateway
+ *  Copyright 2026 Mono Technologies Inc.
  *
  * SPDX-License-Identifier:    GPL-2.0+
  */
