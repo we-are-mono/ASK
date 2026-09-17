@@ -1631,47 +1631,57 @@ opcode every routed flow carries anyway. **Nothing in the tree has ever written
 those bits.** NXP left it to the operator's
 `iptables -j QOSCONNMARK --set-mark`, which OpenWrt never packaged.
 
-**The plan said to widen the class; it should not be widened.** Seven more bits
-— one flag and six of value — takes `cdx_ft_rule.qos` past sixteen and costs the
-operator seven bits of `ct->mark`, leaving thirteen. That is the right shape
-only if the remark has to travel *in the mark*, and it does not. The same plan
-names `FLOW_ACTION_MANGLE` as the verb, and a tc filter already carries its own
-value: this is the shape [increment 8's stage 2](#stage-2-proved-on-hardware-2026-09-17)
-used for the ingress policer, where a filter records what it matched and
-`ft_parse()` resolves it against the finished tuple at admission. A remark
-filter is the same thing on the other side of the flow:
+**It travels in the mark**, so `cdx_ft_rule.qos` widens from twelve bits to
+nineteen: class queue, channel, ingress policer, then one flag and six bits of
+codepoint. The field goes `u16 → u32` and the operator keeps thirteen bits of
+`ct->mark` instead of twenty.
+
+That is worth arguing for rather than assuming, because the obvious alternative
+looks cheaper. A `tc` filter carries its own value, and
+[increment 8's stage 2](#stage-2-proved-on-hardware-2026-09-17) already binds an
+egress-side property to a flow by recording what a `flower` filter matched and
+resolving it at admission. A remark filter on the port's egress would cost no
+mark bits at all:
 
 ```sh
 tc filter add dev eth3 egress protocol ip flower ip_proto udp dst_port 5004 \
     action pedit ex munge ip tos set 0xb8
 ```
 
-`cdx_ft_rule` already carries `out` as well as `in`, so an egress filter has a
-port to match against. The cost is zero mark bits and no widening; the operator
-keeps all twenty.
+**Three things rule it out, and the first is the consumer contract.** `act_pedit`
+and `act_csum` are not in OpenWrt's core scheduler package. They ship only in
+`kmod-sched`, a fifteen-module bundle — `sch_codel`, `gred`, `multiq`, `sfq`,
+`teql`, `fq`, `ets`, `act_simple`, `act_skbmod` and four `em_` matches — which
+also drags in `kmod-lib-crc32c` and `kmod-lib-textsearch`. That is a great deal
+of kernel to ship for one action. `ct mark set` is nftables and is already in
+every image.
 
-*Why it cannot be keyed on the codepoint instead.* The obvious reading — a
-DSCP-to-DSCP map beside the DSCP-to-class one — does not work: the hardware's
-remark is a property of a *flow entry*, and a flow has no DSCP. Only its packets
-do. So the selector has to be something the entry knows, which is the tuple.
+Second, **the operator is already setting `ct mark`.** The class queue and the
+policer nibble are read from it, so remarking rides a rule that has to exist
+anyway: one value, set in one place. Taking the codepoint from a `tc` filter
+instead would put a flow's class in the mark and its remark in a filter — two
+sources of truth for one flow's QoS, which is the argument
+[against classifying by HTB leaf](#why-htb-offload-does-not-classify) arriving
+from a different direction.
 
-*What the work is.* `cdx_police.c` already has the 5-tuple record, its flower
-parse and the matcher that resolves it against a rule; a second copy in
-`cdx_dscp.c` would be a second answer to "which traffic does this describe", and
-the only difference is which device the rule is matched on. So the matcher moves
-to a file both share, parameterised on `in` against `out`, and the police path's
-own host test is what says the move changed nothing. Then the remark filter
-records a codepoint, and `cdx_ft_hw_add()` sets the two mark fields from it the
-way it already sets the policer nibble.
+Third, it cannot be keyed on the codepoint the way the
+[DSCP class map](#9-the-dscp-map) is. The hardware's remark is a property of a
+flow *entry*, and a flow has no DSCP — only its packets do — so the selector has
+to be something the entry knows. The mark is exactly that.
 
-Two details the parse has to get right. `pedit` mangles in four-byte words, so
-the IPv4 tos byte arrives as `offset 0` with a mask covering the DSCP bits of
-the second byte, and a mask narrower than the whole codepoint has to be refused
-for the same reason the class filter refuses one. And an operator will write
-`action csum ip` beside it, because that is what pedit needs in software; the
-hardware recomputes the checksum itself, so that action has to be accepted and
-ignored rather than refused, which means this is the one filter here that takes
-more than a single action.
+*The bit budget.* Nineteen of thirty-two are spoken for, leaving thirteen: 8192
+values for policy routing and VPN marks. `qos_mark_mask` still places the field
+anywhere in the word, and the
+[consumer contract](#the-consumer-contract) already asks for it to be biased
+towards the top, because strongSwan's `connmark` plugin allocates small ascending
+integers from the bottom.
+
+*One hazard, the same one the policer nibble had.* The software Tx path indexes
+`class_txq[]` with the decoded class, and that table is sized for the egress
+class alone. The remark is no more an egress destination than the ingress
+policer is, so `cdx_htb_select_queue()` keeps masking with
+`CDX_FT_QOS_EGRESS_MASK` before it indexes, and the static assertion that ties
+the table's size to that mask keeps saying so.
 
 *Effort: 3–4 days.*
 
