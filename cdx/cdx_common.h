@@ -444,6 +444,8 @@ void cdx_plcr_colours(void *handle, struct cdx_police_counters *out);
 int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out);
 int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
 				 struct cdx_police_counters *out);
+int cdx_ingress_policer_config(uint32_t fm_index, uint32_t queue_no,
+			       uint32_t *cir, uint32_t *cbs);
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no);
 int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32_t oper);
 int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs);

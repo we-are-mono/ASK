@@ -1557,9 +1557,44 @@ changes the rate loses the history.
 
 No BUG, WARNING, call trace or KASAN output beyond KASAN's own init banner.
 
-*The SEC rate is still not delivered*, for the reason above: it has no kernel
-verb, only a devlink param's untyped knob, and that is a decision to take
-deliberately rather than by momentum.
+#### The SEC rate, as the knob it is
+
+Delivered on the same instance, as two driver-specific parameters, and with the
+reservation above standing: this is the one place in the QoS port where a kernel
+interface is met in letter and not in spirit.
+
+```sh
+devlink dev param set platform/1a00000.fman name sec_rate  value 200000 cmode runtime
+devlink dev param set platform/1a00000.fman name sec_burst value 1024   cmode runtime
+```
+
+**Nothing is shadowed.** Both values are read from and written to the hardware
+layer, which keeps them beside the profile handle. A parameter reporting a
+value the profile did not hold would be worse than no parameter, and the pair
+has to be written together — a rate programmed against a stale burst is a
+different meter from the one asked for — so the one not being set is read back
+rather than assumed.
+
+*Proved on hardware, 2026-09-17.* Before anything was set, the parameters read
+**`sec_rate 740000`** and **`sec_burst 32`**: the profile's own defaults, which
+is what says they come from the hardware and not from a static. Setting them to
+200000 and 1024 read back as asked. CMM's range is enforced with a sentence
+rather than an errno:
+
+```
+Error: cdx: the SEC rate is frames per second, up to a 10G port's 64-byte frame rate.
+Error: cdx: the SEC burst is frames, at most 2048.
+```
+
+The profile is enabled once, when the instance registers, rather than on every
+write: the hardware layer's enable is idempotent but announces itself in a
+printk, and a knob that logs a line every time it is written is a knob nobody
+uses twice. `dmesg` carries none of them, and no BUG, WARNING, call trace or
+KASAN output beyond the init banner.
+
+**What this closes.** With the punt rate a trap policer and the SEC rate a
+parameter, no `CMD_QM_*` family is left without a kernel-verb equivalent, and
+nothing in the QoS plane needs FCI or CMM.
 
 **The SEC rate is not a second mechanism.** `INGRESS_SEC_POLICER_QUEUE_NUM` is
 `INGRESS_ALL_POLICER_QUEUES - 1` — profile 8 of the same ingress pool the seven
