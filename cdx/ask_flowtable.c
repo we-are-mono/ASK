@@ -48,6 +48,7 @@
 #include <dpaa_eth_common.h>
 #include "cdx_flowtable_backend.h"
 #include "cdx_flowtable.h"
+#include "cdx_police.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 8
 #error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
@@ -1075,6 +1076,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	struct flow_match_tcp tcp;
 	const struct flow_action_entry *action;
 	u32 mark;
+	u8 policer;
 	static const u32 offsets[4] = { 4, 8, 0, 4 };
 	static const u32 masks[4] = { 0x0000ffff, 0, 0, 0xffff0000 };
 	u8 ethernet[12] = {};
@@ -1293,6 +1295,19 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		return -ESTALE;
 	out->mtu = cls->nf_mtu;
 	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
+	/* Last, because a tc police filter is matched against the finished
+	 * tuple. A filter is the more specific statement of the same intent as
+	 * the mark, so where one claims this flow its profile replaces the
+	 * mark's nibble; with none, the mark's stands.
+	 *
+	 * Resolved into the rule rather than further down, so that the rule is
+	 * what the hardware is given *and* what /proc reports. Doing it below
+	 * left the two disagreeing: a policed flow metered against the filter's
+	 * profile while the row said qos=000. */
+	policer = cdx_police_lookup(out);
+	if (policer)
+		out->qos = (out->qos & ~CDX_FT_QOS_POLICER_MASK) |
+			   (policer << CDX_FT_QOS_POLICER_SHIFT);
 	return 0;
 }
 

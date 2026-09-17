@@ -267,6 +267,7 @@ u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
 	return profile;
 }
+EXPORT_SYMBOL_NS_GPL(cdx_police_lookup, ASK_CDX_FLOWTABLE);
 
 /* Only the keys that make a 5-tuple. Anything else -- VLAN, MPLS, a TCP flag --
  * would select frames the hardware cannot distinguish at this point, and

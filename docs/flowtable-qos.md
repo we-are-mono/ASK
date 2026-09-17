@@ -1215,11 +1215,29 @@ So an operator policing TCP should size the burst against the flow rather than
 leave it small, and a rate under about a megabyte of burst will read low. That
 is a property of policing, not of this hardware.
 
-One observability gap, deliberately left: `/proc/cdx_flowtable` reports
-`qos=000` for a policed flow, because the nibble it prints is the rule's — the
-one derived from the mark — and the profile a filter chose is resolved below
-it. `tc filter show` names the filter; connecting the two wants the per-colour
-counters that stage-1 statistics also need.
+**The rule is the single truth, which is why the filter is resolved in the
+adapter rather than in the backend.** The first cut looked it up in
+`cdx_ft_hw_add()`, which worked but left `/proc/cdx_flowtable` reporting
+`qos=000` for a flow that was being metered: the row printed the rule's nibble,
+the one derived from the mark, while the hardware had been told something else.
+`ft_parse()` now resolves it last, once the tuple is finished, so what the
+hardware is given and what the row says are the same value:
+
+```
+ 2 qos=000      # reply direction, arriving on the other port
+ 2 qos=100      # policed direction: policer nibble 1, profile 1
+```
+
+and with the filter naming a different host, all four rows read `qos=000`.
+
+Last, rather than anywhere convenient, because a filter matches on the
+finished tuple: the ports, the protocol and the ingress device all have to be
+decided first. The harness pins that by refusing a lookup on a half-built rule.
+
+Statistics remain refused, for both `matchall` and `flower`: the profile keeps
+per-colour counters and `get_plcr_counter()` reads them, but claiming
+`TC_CLSMATCHALL_STATS` or `FLOW_CLS_STATS` without wiring them would report a
+filter that passed everything.
 
 #### The unit error, fixed
 
