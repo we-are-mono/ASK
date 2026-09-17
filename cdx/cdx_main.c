@@ -392,8 +392,15 @@ static int __init cdx_module_init(void)
 	}
 
 #ifdef DPA_IPSEC_OFFLOAD
-	if (cdx_flowtable_enabled())
-		goto initialized;
+	/* Built in both ownership modes, like the rest of the hardware above.
+	 *
+	 * This used to be skipped in flowtable mode alongside CMD_INIT(ipsec),
+	 * and the two gates are easy to mistake for one. They are not: that
+	 * one registers an FCI dispatch entry, while this builds the offline
+	 * port, the SEC buffer pool and the PCD frame queues -- resources no
+	 * control plane can substitute for. Without them SEC has nowhere to
+	 * put a frame, and the first symptom is a shared descriptor that
+	 * cannot be created, several layers away from the cause. */
 	if (cdx_dpa_ipsec_init()) {
 		printk("%s::dpa_ipsec start failed\n", __func__);
 		rc = -EIO;
@@ -410,7 +417,6 @@ static int __init cdx_module_init(void)
 		rc = -ENOMEM;
 		goto exit;
 	}
-initialized:
 #endif
 	return 0;
 
