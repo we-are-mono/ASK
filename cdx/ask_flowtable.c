@@ -98,7 +98,7 @@ static unsigned int ft_qos_default_class;
 module_param_named(qos_mark_mask, ft_qos_mark_mask, uint, 0444);
 MODULE_PARM_DESC(qos_mark_mask, "Conntrack mark bits holding the class; 0 disables classification and refuses marked flows");
 module_param_named(qos_default_class, ft_qos_default_class, uint, 0444);
-MODULE_PARM_DESC(qos_default_class, "Class for flows whose masked mark is zero: nibbles low to high are class queue, channel, ingress policer profile");
+MODULE_PARM_DESC(qos_default_class, "Class for flows whose masked mark is zero: nibbles low to high are class queue, channel, ingress policer profile, then a remark flag and six bits of DSCP");
 
 /* Reject a class the hardware cannot express rather than truncating it into a
  * different queue, which would accelerate the flow onto a queue nobody asked
@@ -116,16 +116,17 @@ static bool ft_qos_class_valid(unsigned int class)
  * own base so an operator can place the field anywhere in the word and share
  * the rest with policy routing or a VPN's own marks.
  *
- * Twelve bits are spoken for — four each for class queue, channel and ingress
- * policer — leaving twenty of a 32-bit mark to the operator. A mask narrower
- * than the fields an operator uses is not an error: the nibbles it does not
- * cover read zero, which is this encoding's "unspecified" in every position. */
-static u16 ft_qos_class(u32 mark)
+ * Nineteen bits are spoken for — four each for class queue, channel and ingress
+ * policer, then a flag and six bits of DSCP to remark with — leaving thirteen
+ * of a 32-bit mark to the operator. A mask narrower than the fields an operator
+ * uses is not an error: the bits it does not cover read zero, which is this
+ * encoding's "unspecified" in every position, including a clear remark flag. */
+static u32 ft_qos_class(u32 mark)
 {
 	if (!ft_qos_mark_mask)
 		return 0;
 	mark = (mark & ft_qos_mark_mask) >> __ffs(ft_qos_mark_mask);
-	return mark ? (u16)mark : (u16)ft_qos_default_class;
+	return mark ? mark : ft_qos_default_class;
 }
 
 struct cdx_ft_binding {
@@ -2240,7 +2241,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%03x nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
@@ -2250,7 +2251,7 @@ static int ft_show(struct seq_file *seq, void *v)
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%03x nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),

@@ -1683,6 +1683,28 @@ policer is, so `cdx_htb_select_queue()` keeps masking with
 `CDX_FT_QOS_EGRESS_MASK` before it indexes, and the static assertion that ties
 the table's size to that mask keeps saying so.
 
+*Proved on hardware, 2026-09-17.* Booted `ask.offload=flowtable` with
+`qos_mark_mask=0x7ffff` — the full nineteen bits, accepted at load, which is the
+init validation tracking the widened encoding — and
+`qos_default_class=0x5d000`: remark flag set, codepoint 46, which is EF.
+
+Every installed rule reported `qos=5d000` in `/proc/cdx_flowtable`, whose field
+widened from three hex digits to five along with the class. Then the wire, with
+loki sending plain iperf3 and setting no DSCP of its own:
+
+| | bulk packets on the WAN side |
+| --- | --- |
+| policy applied, flows in hardware | **40 of 40 at `tos 0xb8`** |
+| `ask-flowtable stop`, same traffic in software | **40 of 40 at `tos 0x0`** |
+
+Same sender, same invocation, same configured class: the only variable is
+whether the flow is in hardware, which is what says the remark is the hardware's
+and not something the sender or the stack did. The first capture of a fresh
+connection shows the same thing from the inside — its handshake leaves at
+`tos 0x0` and its data at `0xb8`, because admission happens in between.
+
+No BUG, WARNING, call trace or KASAN output beyond the init banner.
+
 *Effort: 3–4 days.*
 
 ### Order and total

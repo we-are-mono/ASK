@@ -30,7 +30,7 @@ void cdx_unregister_ft_setup_tc(void);
  * Deriving it twice from the same mark would still be two decodes to keep in
  * step; this is one. Unregistered, the software path expresses no opinion and
  * behaves as it did before there was a qdisc. */
-typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
+typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
 int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn);
 void cdx_unregister_ft_qos_class(void);
 

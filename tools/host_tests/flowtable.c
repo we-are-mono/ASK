@@ -747,7 +747,7 @@ static void cdx_unregister_ft_setup_tc(void) { registered_setup_tc = 0; }
  * and returned alongside the handler above, and a load that fails after taking
  * it has to give both back. */
 static int registered_qos_class;
-typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
+typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
 static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
 {
     assert(fn);
@@ -3564,14 +3564,49 @@ static void test_qos_decode(void)
      * meter nobody asked for. */
     assert(!ft_qos_class_valid((CDX_FT_QOS_MAX_CHANNEL + 1) << CDX_FT_QOS_CHANNEL_SHIFT));
     assert(!ft_qos_class_valid((CDX_FT_QOS_MAX_POLICER + 1) << CDX_FT_QOS_POLICER_SHIFT));
-    /* Anything above the three nibbles is outside the encoding entirely. */
-    assert(!ft_qos_class_valid(0x1000));
-    assert(!ft_qos_class_valid(~CDX_FT_QOS_MASK & 0xffff));
+
+    /* The remark: a flag and six bits of codepoint. Every codepoint is valid --
+     * six bits is exactly the field -- so the only thing out of range above the
+     * policer nibble is a bit the encoding does not define at all. */
+    assert(ft_qos_class_valid(CDX_FT_QOS_REMARK_MASK));            /* remark to CS0 */
+    assert(ft_qos_class_valid(CDX_FT_QOS_REMARK_MASK |
+                              (CDX_FT_QOS_MAX_DSCP << CDX_FT_QOS_DSCP_SHIFT)));
+    /* Every field at its own maximum. Not CDX_FT_QOS_MASK itself: that has all
+     * four channel bits set, and channel 15 is three past the eight CEETM has. */
+    assert(ft_qos_class_valid(CDX_FT_QOS_QUEUE_MASK |
+                              (CDX_FT_QOS_MAX_CHANNEL << CDX_FT_QOS_CHANNEL_SHIFT) |
+                              (CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT) |
+                              CDX_FT_QOS_REMARK_MASK |
+                              (CDX_FT_QOS_MAX_DSCP << CDX_FT_QOS_DSCP_SHIFT)));
+    assert(!ft_qos_class_valid(CDX_FT_QOS_MASK + 1));
+    assert(!ft_qos_class_valid(~CDX_FT_QOS_MASK & 0xffffffu));
+
+    /* The flag is why the codepoint needs one. Every other field spells
+     * "unspecified" as zero, but DSCP zero is CS0 -- a real codepoint, and the
+     * one an operator remarks *to* for best effort -- so "remark to zero" and
+     * "do not remark" have to be different values, and they are. */
+    assert(CDX_FT_QOS_REMARK_MASK != 0);
+    assert((0u & CDX_FT_QOS_REMARK_MASK) == 0);                    /* says nothing */
+    assert((CDX_FT_QOS_REMARK_MASK & CDX_FT_QOS_REMARK_MASK) != 0);/* says CS0 */
+
+    /* The six bits sit above the flag and below nothing else. */
+    assert(CDX_FT_QOS_DSCP_MASK >> CDX_FT_QOS_DSCP_SHIFT == CDX_FT_QOS_MAX_DSCP);
+    assert(!(CDX_FT_QOS_DSCP_MASK & CDX_FT_QOS_REMARK_MASK));
+
+    /* Nineteen bits spoken for, thirteen left to the operator. */
+    assert(CDX_FT_QOS_MASK == 0x07ffffu);        /* 19 contiguous bits from zero */
+    assert((CDX_FT_QOS_MASK & (CDX_FT_QOS_MASK + 1)) == 0);
 
     /* The egress mask is what the Tx path may index its class table with, so it
-     * has to exclude the policer nibble and stay inside a 256-entry table. */
+     * has to exclude the policer nibble and the remark -- neither says anything
+     * about where a frame leaves -- and stay inside a 256-entry table. Widening
+     * the class made this load-bearing: unmasked, a remark of CS7 indexes 508
+     * entries past the table. */
     assert(CDX_FT_QOS_EGRESS_MASK == 0xff);
     assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_POLICER_MASK));
+    assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_REMARK_MASK));
+    assert(!(CDX_FT_QOS_EGRESS_MASK & CDX_FT_QOS_DSCP_MASK));
+    assert((CDX_FT_QOS_MASK & CDX_FT_QOS_EGRESS_MASK) == CDX_FT_QOS_EGRESS_MASK);
 
     /* Init refuses a mask wider than a class rather than narrowing it silently,
      * and that bound has to track the encoding. It did not when the policer
