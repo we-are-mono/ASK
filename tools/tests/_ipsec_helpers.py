@@ -13,10 +13,12 @@ and x86_64 produce identical sizes for these layouts):
   CommandIPSecSetKey   144 B   (control_ipsec.h:107-113)
   CommandIPSecSetNatt    8 B   (control_ipsec.h:115-120)
   CommandIPSecSetState   8 B   (control_ipsec.h:122-127)
-  SAQueryCommand       252 B   (control_ipsec.h:165-216, __packed)
-                                 — the IPv6 union member dominates the
-                                 tnl union at 36 B; ipv4 case is 12 B.
-                                 Total = 184 + 36 + 4×8 = 252.
+
+The SA query cursor is not covered here. Its tests were removed with the
+IPsec flowtable port: the cursor in cdx/query_ipsec.c exists only to serve
+FCI ACTION_QUERY, and the port's control plane has no query command at all,
+so that coverage had no successor to move to. The SA install path below is
+different — it drives cdx_dpa_ipsec.c, which the port keeps.
 
 Historical notes — both bugs are now fixed, kept so tests don't
 re-learn the wrong lesson:
@@ -48,14 +50,10 @@ CMD_IPSEC_SA_SET_KEYS       = 0x0A04
 CMD_IPSEC_SA_SET_TUNNEL     = 0x0A05
 CMD_IPSEC_SA_SET_NATT       = 0x0A06
 CMD_IPSEC_SA_SET_STATE      = 0x0A07
-CMD_IPSEC_SA_ACTION_QUERY   = 0x0A0A
-CMD_IPSEC_SA_ACTION_QUERY_CONT = 0x0A0B
 
 # ---------------------------------------------------------------- actions
 ACTION_REGISTER   = 0
 ACTION_DEREGISTER = 1
-ACTION_QUERY      = 6
-ACTION_QUERY_CONT = 7
 
 # ---------------------------------------------------------------- protocol enums
 PROTO_FAMILY_IPV4 = 2
@@ -235,20 +233,6 @@ def set_natt(sagd: int, sport: int, dport: int = 4500) -> bytes:
 def set_state(sagd: int, state: int = XFRM_STATE_VALID) -> bytes:
     """Build an 8-byte CommandIPSecSetState payload."""
     return struct.pack("<HHHH", sagd & 0xFFFF, 0, state & 0xFFFF, 0)
-
-
-def query_sa(action: int = ACTION_QUERY) -> bytes:
-    """Build a 252-byte SAQueryCommand payload.
-
-    The kernel populates most fields on response; we only need to set the
-    `action` field to enter the query cursor. The QUERY entry path
-    (control_ipsec.c QUERY handler) does not validate other fields before
-    walking sa_cache, so an all-zeros payload after the action word is
-    safe — verified empirically. If a
-    future kernel change starts validating proto_family or sa_type before
-    the cursor walk, tighten this to set the minimal required fields.
-    """
-    return struct.pack("<H", action & 0xFFFF) + b"\x00" * 250
 
 
 # ---------------------------------------------------------------- orchestrator
