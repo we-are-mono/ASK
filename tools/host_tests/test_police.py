@@ -30,10 +30,20 @@ def test_police_offload(tmp_path):
     # In file order, which is also dependency order. cdx_police_setup_block is
     # left out: it is block plumbing over kernel helpers the stub does not
     # model, and nothing it does is a decision worth pinning here.
-    names = ["cdx_police_bytes_to_kbits", "cdx_police_check",
-             "cdx_police_replace", "cdx_police_matchall"]
+    names = ["cdx_police_bytes_to_kbits", "cdx_police_check", "cdx_police_rates",
+             "cdx_police_replace", "cdx_police_matchall",
+             "cdx_police_profile_get", "cdx_police_profile_put",
+             "cdx_police_addr_eq", "cdx_police_filter_matches",
+             "cdx_police_lookup", "cdx_police_parse",
+             "cdx_police_flower_replace", "cdx_police_flower_destroy",
+             "cdx_police_flower"]
     (tmp_path / "police_production.inc").write_text(
-        "\n".join(function(source, name) for name in names))
+        # The filter record and the state it lives in are file-scope, so they
+        # are sliced rather than lifted by name -- the lookup's answer depends
+        # on both.
+        source[source.index("struct cdx_police_filter {"):
+               source.index("static int cdx_police_profile_get")]
+        + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "police"
     subprocess.run([
         compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",

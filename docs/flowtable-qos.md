@@ -1098,7 +1098,7 @@ filter. Two stages, and the first needs none of it:
   `iqid` to the profile that filter allocated. The class nibble from
   increment 8 is the mechanism underneath; it stops being an operator-facing
   surface and becomes how the adapter tells the hardware what tc already
-  decided.
+  decided. **Delivered.**
 
 Revocation is the same constraint as classification: an offloaded flow never
 re-enters the ingress path, so a filter added after admission does not reach
@@ -1154,6 +1154,57 @@ No BUG, WARNING or call trace across the run. Statistics are deliberately
 refused for now: the profile keeps per-colour counters and `get_plcr_counter()`
 reads them, but claiming `TC_CLSMATCHALL_STATS` without wiring them would
 report a filter that passed everything.
+
+#### Stage 2, proved on hardware 2026-09-17
+
+A `flower` filter allocates one of the seven per-flow profiles, records what it
+matched, and `cdx_ft_hw_add()` consults that when a flow is admitted — setting
+`iqid` to the profile whose filter claims the flow. A tc filter outranks the
+conntrack mark, because it is the more specific statement of the same intent;
+with no filter matching, the mark's nibble stands.
+
+The binding is made **at admission**, so a filter has to exist before the flow
+does. `conntrack -F` is what forces re-admission in testing, and the stop →
+change → apply sequence is what does it in service. This is the same contract
+the mark already had, arriving from the other direction.
+
+loki sending through the DUT's LAN port, with the flowtable bound so the flow
+is genuinely in hardware:
+
+| | goodput |
+| --- | --- |
+| offloaded, no filter | 9372 Mbit/s |
+| `flower src_ip <loki> action police rate 30mbit burst 1m` | 29.0 Mbit/s |
+| same filter naming a different host | 9409 Mbit/s |
+| filter removed | 9402 Mbit/s |
+
+The middle two rows are the point: the meter reaches the flow the filter names
+and only that flow.
+
+**The burst matters more than it looks, and the rig proved it twice.** The first
+attempt measured 0.00 Mbit/s — `cdxdrv_modify_ingress_qos_policer_profile()`
+was discarding the caller's burst and forcing its 2000-byte default, about one
+and a third frames, which drops enough of every TCP window that the connection
+collapses rather than settling. That is fixed; the FCI path passes the default
+explicitly and is unaffected. Even then a burst has to be big enough for the
+flow's burstiness, because a policer drops where a shaper would queue:
+
+| burst, at `rate 30mbit` | goodput |
+| --- | --- |
+| 32k | 10.9 Mbit/s |
+| 128k | 9.70 Mbit/s |
+| 1m | 29.0 Mbit/s |
+| 4m | 32.1 Mbit/s |
+
+So an operator policing TCP should size the burst against the flow rather than
+leave it small, and a rate under about a megabyte of burst will read low. That
+is a property of policing, not of this hardware.
+
+One observability gap, deliberately left: `/proc/cdx_flowtable` reports
+`qos=000` for a policed flow, because the nibble it prints is the rule's — the
+one derived from the mark — and the profile a filter chose is resolved below
+it. `tc filter show` names the filter; connecting the two wants the per-colour
+counters that stage-1 statistics also need.
 
 #### The unit error, fixed
 

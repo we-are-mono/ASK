@@ -205,6 +205,10 @@ static unsigned expected_proto = IPPROTO_UDP;
 /* The class the rule under test carries, so the encoder stub can require that
  * each nibble reached the field that reads it. */
 static u16 expected_qos;
+/* What the filter layer says about this flow. A tc police filter is a more
+ * specific statement than the mark, so a non-zero answer here has to win.
+ * The stub itself lives below, once cdx_ft_rule exists. */
+static u8 police_lookup_profile;
 static bool expected_hairpin;
 static struct cdx_l2_encap observed_encap;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
@@ -265,7 +269,8 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
      * macros, so a shift that moved would fail there. */
     assert(ct->qosmark.queue == (expected_qos & 0xf));
     assert(ct->qosmark.chnl_id == ((expected_qos >> 4) & 0xf));
-    assert(ct->qosmark.iqid == ((expected_qos >> 8) & 0xf));
+    assert(ct->qosmark.iqid == (police_lookup_profile ? police_lookup_profile
+                                                      : ((expected_qos >> 8) & 0xf)));
     assert(ct->qosmark.iqid_valid);
     assert(ct->pRtEntry->itf == (expected_hairpin ? &in_itf : &out_itf) && ct->pRtEntry->input_itf == &in_itf);
     assert(ct->pRtEntry->underlying_input_itf == &in_itf && ct->pRtEntry->mtu == 1200);
@@ -299,6 +304,12 @@ static int dpa_cfg_quiesce(void)
 }
 #include "physical_production.inc"
 #include "hardware_types.inc"
+
+static u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
+{
+    assert(rule);
+    return police_lookup_profile;
+}
 /* The free-list half of the statistics API lives in cdx_ifstats.c, beside the
  * lists it draws from; what the backend adds is the ownership check, so that
  * is what is exercised here and the pool itself is simulated. */
@@ -541,6 +552,17 @@ int main(void)
                 assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
                 assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
             }
+    /* A tc police filter outranks the mark: the mark is how a profile could be
+     * named before there was a kernel verb for it. With no filter matching,
+     * the mark's nibble stands. */
+    for (unsigned profile = 1; profile <= CDX_FT_QOS_MAX_POLICER; profile++) {
+        police_lookup_profile = profile;
+        rule.qos = expected_qos = 3 | (2 << CDX_FT_QOS_CHANNEL_SHIFT) |
+                                  (5 << CDX_FT_QOS_POLICER_SHIFT);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+    }
+    police_lookup_profile = 0;
     rule.qos = expected_qos = 0;
     for (unsigned i = 0; i < 16; i++) {
         unsigned variant = i % 8;
