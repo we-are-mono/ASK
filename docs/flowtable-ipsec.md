@@ -283,6 +283,28 @@ Proof: a flowtable boot logs the SEC era and the job-ring device, and
 `devlink trap policer 2` is present with zero counts — unchanged behaviour,
 since nothing steers to SEC yet.
 
+#### Proved on hardware, 2026-09-17
+
+KASAN image, booted with `ask.offload=flowtable`:
+
+```
+# cat /sys/module/cdx/parameters/offload_owner
+flowtable
+# dmesg | grep -iE 'cdx_ipsec_init|SEC era|job ring'
+[   13.513736] caam 1700000.crypto: job rings = 3, qi = 1
+[   15.516041] cdx_ipsec_init
+[   15.519502] cdx_ipsec_init SEC era= 8
+[   15.523521] cdx_ipsec_init job ring device= 00000000173dc891
+# devlink trap policer show
+platform/1a00000.fman:
+  policer 1 rate 5000000 burst 2048
+  policer 2 rate 14880952 burst 2048
+```
+
+Before this change none of the `cdx_ipsec_init` lines appeared in a flowtable
+boot at all. The only `dmesg` hit for `call trace|kasan|BUG:` is KASAN's own
+initialisation banner, so the CAAM job-ring claim brings no splat with it.
+
 ### 2. The backend interface
 
 `cdx/cdx_ipsec_backend.h`, alongside `cdx_flowtable_backend.h` and under the
