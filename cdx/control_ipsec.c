@@ -210,7 +210,7 @@ void* M_ipsec_sa_cache_lookup_by_spi(U32 *daddr, U32 spi, U8 proto, U8 family)
 }
 
 
-static int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
+int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
 {
 	U16      algo;
 
@@ -258,7 +258,7 @@ static int M_ipsec_sa_set_digest_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 }
 
 
-static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
+int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8* key)
 {
 	U16      algo;
 	uint8_t	 comb_mode=0, extra_size=0;
@@ -367,7 +367,7 @@ static int M_ipsec_sa_set_cipher_key(PSAEntry sa, U16 key_alg, U16 key_bits, U8*
 	return 0;
 }
 
-static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, U8 family, U16 handle, U8 replay, U8 esn, U16 mtu, U16 dev_mtu, U8 dir)
+void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, U8 family, U16 handle, U8 replay, U8 esn, U16 mtu, U16 dev_mtu, U8 dir)
 {
 	U32     hash_key_sa;
 	PSAEntry sa;
@@ -472,7 +472,7 @@ static void *M_ipsec_sa_cache_create(U32 *saddr, U32 *daddr, U32 spi, U8 proto, 
 	return sa;
 }
 
-static int M_ipsec_sa_cache_delete(U16 handle)
+int M_ipsec_sa_cache_delete(U16 handle)
 {
 	U32     hash_key_sa_by_spi;
 	U32	hash_key_sa_by_h = handle & (NUM_SA_ENTRIES-1);
@@ -792,23 +792,36 @@ static void *cdx_test_xfrm_lookup_by_sa(PSAEntry sa)
 }
 #endif /* CDX_DEBUG_IPSEC_TEST_XFRM */
 
+/* Install the SA's classifier entry and nothing else.
+ *
+ * Split out from ipsec_push_sa_to_fast_path() because the two control planes
+ * bind the kernel state differently and only the binding differs. The FCI path
+ * has nothing but a handle, so it must look the state up afterwards; the
+ * backend path is handed the state before it ever asks for a handle, so a
+ * lookup there would be asking the kernel to answer a question the caller
+ * already knew. Everything up to and including the entry is common, and lives
+ * here.
+ */
+int ipsec_install_fp_entry(PSAEntry sa)
+{
+	int rc;
+
+	if (IS_NATT_SA(sa))
+		rc = cdx_ipsec_process_udp_classification_table_entry(sa);
+	else
+		rc = cdx_ipsec_add_classification_table_entry(sa);
+
+	return rc ? ERR_CREATION_FAILED : NO_ERR;
+}
+
 static int ipsec_push_sa_to_fast_path(PSAEntry sa)
 {
 	void *xfrm_state;
 	int rc;
 
-
-	if (IS_NATT_SA(sa))
-	{
-		rc = cdx_ipsec_process_udp_classification_table_entry(sa);
-		if (rc)
-			return ERR_CREATION_FAILED;
-	}
-	else {
-		rc = cdx_ipsec_add_classification_table_entry(sa);
-		if (rc)
-			return ERR_CREATION_FAILED;
-	}
+	rc = ipsec_install_fp_entry(sa);
+	if (rc)
+		return rc;
 
 	/* The classification entry install is what resolves sa->netdev, so
 	 * the state lookup can only run after it. If the lookup fails the
