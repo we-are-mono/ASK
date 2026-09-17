@@ -426,6 +426,20 @@ int cdx_port_police_set(char *ifname, bool byte_mode,
 int cdx_port_police_clear(char *ifname);
 int cdx_get_ff_rate(void *cmd);
 void get_plcr_counter(void *handle, uint32_t *counterval, uint32_t clear);
+
+/* What an RFC-2698 profile counts: frames per output colour, and nothing
+ * else. There is no byte counter in the hardware. Green and yellow are
+ * enqueued, red is dropped, so the frames the meter saw are the sum of the
+ * three and the ones it discarded are the red ones. */
+struct cdx_police_counters {
+	uint32_t	green;
+	uint32_t	yellow;
+	uint32_t	red;
+};
+void cdx_plcr_colours(void *handle, struct cdx_police_counters *out);
+int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out);
+int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
+				 struct cdx_police_counters *out);
 int cdx_get_policer_profile_id(uint32_t fm_index, uint32_t queue_no);
 int cdx_ingress_enable_or_disable_qos(uint32_t fm_index,uint32_t queue_no,uint32_t oper);
 int cdx_ingress_policer_modify_config(uint32_t fm_index,uint32_t queue_no,uint32_t cir,uint32_t pir, uint32_t cbs, uint32_t pbs);

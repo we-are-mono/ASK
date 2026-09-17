@@ -1150,10 +1150,8 @@ Error: cdx: police: rate rounds to zero at this profile's resolution.
 Error: cdx: police: exceed action must be drop.
 ```
 
-No BUG, WARNING or call trace across the run. Statistics are deliberately
-refused for now: the profile keeps per-colour counters and `get_plcr_counter()`
-reads them, but claiming `TC_CLSMATCHALL_STATS` without wiring them would
-report a filter that passed everything.
+No BUG, WARNING or call trace across the run. Statistics were refused at this
+stage and are delivered below.
 
 #### Stage 2, proved on hardware 2026-09-17
 
@@ -1234,10 +1232,70 @@ Last, rather than anywhere convenient, because a filter matches on the
 finished tuple: the ports, the protocol and the ingress device all have to be
 decided first. The harness pins that by refusing a lookup on a half-built rule.
 
-Statistics remain refused, for both `matchall` and `flower`: the profile keeps
-per-colour counters and `get_plcr_counter()` reads them, but claiming
-`TC_CLSMATCHALL_STATS` or `FLOW_CLS_STATS` without wiring them would report a
-filter that passed everything.
+#### Stage 3, the counters
+
+`TC_CLSMATCHALL_STATS` and `FLOW_CLS_STATS` were refused through stages 1 and 2
+because claiming them without wiring the counters would report every filter as
+passing everything. They are answered now, and the whole of the work is the
+arithmetic between what the hardware keeps and what tc expects.
+
+**The profile counts frames per colour and nothing else.** There is no byte
+counter anywhere in it: `e_FmPcdPlcrProfileCounters` offers green, yellow and
+red packet totals and the two recoloured ones, and that is the complete list.
+Green and yellow are enqueued and red is dropped, because the profile programs
+`e_FM_PCD_PLCR_DROP_FRAME` on red, so the frames the meter saw are the sum of
+the three totals and the ones it discarded are the red ones.
+
+So `tc` is told frames and drops, and **zero bytes**. The two alternatives are
+worse: multiplying frames by an assumed size would put an invented number in a
+counter an operator sizes a policer from, and refusing statistics outright
+loses the drop count — which is the one number no software counter can supply
+for a flow that never reaches the CPU, and the reason to have this at all.
+
+**Totals in, deltas out.** `flow_stats_update()` adds what a driver reports to
+what the action already holds, and the hardware counters are free-running, so
+every filter keeps the values it last read and reports the difference.
+
+A counter that has gone *backwards* is the case worth stating. It was cleared
+by another reader — the FCI query commands still clear these on request — and
+not wrapped, so what it holds now is the whole of the delta. The other reading
+is a 32-bit wrap, and at 10G with full-size frames the counters do wrap, in
+about ninety minutes of saturation. Both readings are wrong some of the time
+and the asymmetry decides it: treating a clear as a wrap credits a filter with
+almost four billion frames it never saw, while treating a wrap as a clear loses
+one wrap's counting from a filter nobody had polled in an hour and a half. An
+invented four billion is the worse answer.
+
+**A filter's baseline starts where the hardware is, not at zero.** The port's
+limiter has been counting since the port came up, and a per-flow profile handed
+back by one filter still holds the frames that filter metered — the pool is
+seven profiles and they are reused. Without seeding, a new filter's first
+report would credit it with everything anyone ever metered through that
+profile. So `matchall` reads the port counters and `flower` reads the profile's
+as the filter is created.
+
+The records this needs are also what makes an unknown cookie answerable:
+`matchall` had no per-filter state at all before, and both commands now return
+`-ENOENT` for a filter the driver never recorded rather than handing back the
+port's numbers under somebody else's name. The same records absorb tc's replay
+of a filter onto a block callback that binds after it — the second arrival
+reprograms the hardware and keeps the baseline, because the counters did not
+restart.
+
+The counter read itself happens **outside** `cdx_police_lock`.
+`FM_PCD_PlcrProfileGetCounter()` takes the FMD's host-command path when one is
+in use and busy-waits there, and that lock is taken from the flowtable's
+admission path. The filter is therefore looked up twice: once to decide which
+profile to read, and again afterwards to find the baseline, because it can be
+destroyed in between.
+
+`tools/host_tests/test_police.py` pins the arithmetic — the colour mapping, the
+delta, the cleared counter, the seeded baseline, per-filter independence and
+the unknown cookie. Two of those assertions were confirmed to fail without the
+code that satisfies them.
+
+With this, `CMD_QM_INGRESS_POLICER_QUERY_STATS` has a kernel-verb equivalent
+and nothing in the ingress-policing plane needs FCI.
 
 #### The unit error, fixed
 

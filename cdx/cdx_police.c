@@ -18,11 +18,14 @@
  * profile takes CIR, PIR, CBS and an action per colour. Only the unit differs:
  * the kernel counts bytes per second, the FMD's byte mode counts Kbit/s.
  *
- * This file is the port-wide half -- `matchall`, every frame arriving on the
- * port. It needs no correlation with anything: the filter's scope and the
- * profile's scope are the same set of frames. Matching a subset (`flower`) has
- * to reach the eight per-flow profiles instead, and bind them to flows the
- * flowtable admitted, which is a separate piece of work.
+ * Two halves. `matchall` is the port-wide one and needs no correlation with
+ * anything: the filter's scope and the port profile's scope are the same set
+ * of frames. `flower` matches a subset, so it reaches the seven per-flow
+ * profiles instead and has to bind them to flows the flowtable admitted --
+ * which is the whole of the second half below.
+ *
+ * Both report what they metered. The profile counts frames per colour and has
+ * no byte counter, so tc is told frames and drops and nothing else.
  */
 
 #include <linux/module.h>
@@ -30,6 +33,7 @@
 #include <linux/rtnetlink.h>
 #include <net/flow_offload.h>
 #include <net/pkt_cls.h>
+#include <linux/jiffies.h>
 #include <linux/spinlock.h>
 #include "cdx.h"
 #include "misc.h"
@@ -118,13 +122,95 @@ static int cdx_police_rates(const struct flow_action_entry *act,
 	return 0;
 }
 
+/* ---- what a filter can say about what it metered ------------------------
+ *
+ * The profile counts frames per colour and nothing else: there is no byte
+ * counter anywhere in it. So tc is told how many frames the meter saw and how
+ * many it dropped, and zero bytes. Deriving a byte count from an assumed frame
+ * size would be an invention, and refusing statistics altogether would lose
+ * the drop count -- which is the number an operator sizing a policer is
+ * actually looking for, and one no software counter can supply for a flow that
+ * never reaches the CPU.
+ *
+ * tc adds up what a driver reports and the hardware counters are free-running
+ * totals, so every filter keeps the values it last read and reports the
+ * difference.
+ */
+
+/* Guards both lists below. Taken from the flowtable's admission path through
+ * cdx_police_lookup(), so it stays a spinlock; the counter reads are done
+ * outside it, because they reach the FMD's host-command path and busy-wait
+ * there. */
+static DEFINE_SPINLOCK(cdx_police_lock);
+
+/* A matchall filter is the port's own rate limiter rather than one of the
+ * numbered per-flow profiles, so it is kept apart from them: none of it
+ * reaches cdx_police_lookup(), and its counters come from a different handle.
+ * The record exists to give the filter somewhere to keep its baseline. */
+struct cdx_police_port {
+	struct list_head		list;
+	struct net_device		*dev;
+	unsigned long			cookie;
+	struct cdx_police_counters	base;
+};
+
+static LIST_HEAD(cdx_police_ports);
+
+/* One counter's delta. A counter that has gone backwards was cleared by
+ * another reader -- the FCI query commands still clear these on request --
+ * rather than having wrapped, so the value it now holds is the whole of the
+ * delta. Reading it as a 32-bit wrap instead would credit a filter with most
+ * of four billion frames to cover a sample nobody missed, which is a far worse
+ * answer than losing one wrap's worth of counting. */
+static u32 cdx_police_delta(u32 *last, u32 now)
+{
+	u32 delta = now >= *last ? now - *last : now;
+
+	*last = now;
+	return delta;
+}
+
+/* Green and yellow are enqueued, red is dropped, because the profile programs
+ * e_FM_PCD_PLCR_DROP_FRAME on red. Every frame the meter saw is therefore the
+ * sum of the three, and the dropped ones are the red ones. */
+static void cdx_police_report(struct flow_stats *stats,
+			      struct cdx_police_counters *base,
+			      const struct cdx_police_counters *now)
+{
+	u64 green = cdx_police_delta(&base->green, now->green);
+	u64 yellow = cdx_police_delta(&base->yellow, now->yellow);
+	u64 drops = cdx_police_delta(&base->red, now->red);
+
+	/* lastused is offered only when something moved. flow_stats_update()
+	 * keeps the later of what it holds and what it is given, so a quiet
+	 * filter has nothing to contribute and must not claim the present
+	 * moment as a time it was used. */
+	flow_stats_update(stats, 0, green + yellow + drops, drops,
+			  green + yellow + drops ? jiffies : 0,
+			  FLOW_ACTION_HW_STATS_IMMEDIATE);
+}
+
+/* Both finders run under cdx_police_lock. */
+static struct cdx_police_port *cdx_police_port_find(struct net_device *dev,
+						    unsigned long cookie)
+{
+	struct cdx_police_port *port;
+
+	list_for_each_entry(port, &cdx_police_ports, list)
+		if (port->dev == dev && port->cookie == cookie)
+			return port;
+	return NULL;
+}
+
 static int cdx_police_replace(struct net_device *dev,
 			      struct tc_cls_matchall_offload *f)
 {
 	struct netlink_ext_ack *extack = f->common.extack;
 	struct flow_action *action = &f->rule->action;
 	const struct flow_action_entry *act;
+	struct cdx_police_port *port;
 	u32 cir, pir, cbs, pbs;
+	unsigned long flags;
 	bool byte_mode;
 	int rc;
 
@@ -145,11 +231,79 @@ static int cdx_police_replace(struct net_device *dev,
 	if (rc)
 		return rc;
 
+	/* Allocated before the hardware is touched so a failure to program the
+	 * port leaves nothing behind to unwind. */
+	port = kzalloc(sizeof(*port), GFP_KERNEL);
+	if (!port)
+		return -ENOMEM;
+	port->dev = dev;
+	port->cookie = f->cookie;
+
 	if (cdx_port_police_set(dev->name, byte_mode, cir, pir, cbs, pbs) != SUCCESS) {
+		kfree(port);
 		NL_SET_ERR_MSG_MOD(extack, "police: the port has no rate limiter");
 		return -EINVAL;
 	}
+
+	/* The port's limiter has been counting since the port came up, so a new
+	 * filter starts from where the hardware is now. Without this its first
+	 * report would credit it with every frame the port ever metered. A read
+	 * that fails leaves the baseline at zero, which is the same answer as
+	 * one taken before any traffic. */
+	cdx_port_police_counters(dev->name, &port->base);
+
+	/* tc replays a filter onto a block callback that binds after it, so the
+	 * same cookie can arrive twice. The second time reprograms the port and
+	 * keeps the record already there: the hardware counters did not
+	 * restart, so neither may the baseline. */
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	if (cdx_police_port_find(dev, f->cookie)) {
+		spin_unlock_irqrestore(&cdx_police_lock, flags);
+		kfree(port);
+		return 0;
+	}
+	list_add_tail(&port->list, &cdx_police_ports);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
 	return 0;
+}
+
+static int cdx_police_port_destroy(struct net_device *dev,
+				   struct tc_cls_matchall_offload *f)
+{
+	struct cdx_police_port *port;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	port = cdx_police_port_find(dev, f->cookie);
+	if (port)
+		list_del(&port->list);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	kfree(port);
+	cdx_port_police_clear(dev->name);
+	return 0;
+}
+
+static int cdx_police_port_stats(struct net_device *dev,
+				 struct tc_cls_matchall_offload *f)
+{
+	struct cdx_police_counters now;
+	struct cdx_police_port *port;
+	unsigned long flags;
+	bool reported;
+
+	if (cdx_port_police_counters(dev->name, &now) != SUCCESS)
+		return -EINVAL;
+
+	/* Looked up after the read rather than before it, because a filter can
+	 * be destroyed while its counters are being fetched and the baseline
+	 * belongs to whichever record is still there afterwards. */
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	port = cdx_police_port_find(dev, f->cookie);
+	reported = port != NULL;
+	if (port)
+		cdx_police_report(&f->stats, &port->base, &now);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	return reported ? 0 : -ENOENT;
 }
 
 static int cdx_police_matchall(struct net_device *dev,
@@ -159,13 +313,10 @@ static int cdx_police_matchall(struct net_device *dev,
 	case TC_CLSMATCHALL_REPLACE:
 		return cdx_police_replace(dev, f);
 	case TC_CLSMATCHALL_DESTROY:
-		cdx_port_police_clear(dev->name);
-		return 0;
+		return cdx_police_port_destroy(dev, f);
+	case TC_CLSMATCHALL_STATS:
+		return cdx_police_port_stats(dev, f);
 	default:
-		/* TC_CLSMATCHALL_STATS wants per-colour counters. The profile
-		 * keeps them and get_plcr_counter() reads them; wiring that to
-		 * tc's accounting is separate work, and claiming support
-		 * without it would report a filter as passing everything. */
 		return -EOPNOTSUPP;
 	}
 }
@@ -191,10 +342,10 @@ struct cdx_police_filter {
 	bool			proto_masked;
 	union nf_inet_addr	src, src_mask, dst, dst_mask;
 	__be16			sport, sport_mask, dport, dport_mask;
+	struct cdx_police_counters base;
 };
 
 static LIST_HEAD(cdx_police_filters);
-static DEFINE_SPINLOCK(cdx_police_lock);
 /* Profile 0 is the default every unclassified flow already meters against, so
  * the pool starts at 1. Bit n set means profile n is spoken for. */
 static unsigned long cdx_police_profiles;
@@ -268,6 +419,18 @@ u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
 	return profile;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_police_lookup, ASK_CDX_FLOWTABLE);
+
+/* The filter tc means by a cookie. Runs under cdx_police_lock. */
+static struct cdx_police_filter *cdx_police_filter_find(struct net_device *dev,
+							unsigned long cookie)
+{
+	struct cdx_police_filter *filter;
+
+	list_for_each_entry(filter, &cdx_police_filters, list)
+		if (filter->dev == dev && filter->cookie == cookie)
+			return filter;
+	return NULL;
+}
 
 /* Only the keys that make a 5-tuple. Anything else -- VLAN, MPLS, a TCP flag --
  * would select frames the hardware cannot distinguish at this point, and
@@ -418,6 +581,11 @@ static int cdx_police_flower_replace(struct net_device *dev,
 		goto err_profile;
 	}
 
+	/* A profile given back by one filter and handed to the next still holds
+	 * the frames the first one metered, so the baseline starts where the
+	 * hardware is rather than at zero. */
+	cdx_ingress_policer_counters(FMAN_INDEX, profile, &filter->base);
+
 	spin_lock_irqsave(&cdx_police_lock, flags);
 	list_add_tail(&filter->list, &cdx_police_filters);
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
@@ -435,20 +603,19 @@ err_free:
 static int cdx_police_flower_destroy(struct net_device *dev,
 				     struct flow_cls_offload *f)
 {
-	struct cdx_police_filter *filter, *next;
+	struct cdx_police_filter *filter;
 	unsigned long flags;
-	u8 profile = 0;
+	u8 profile;
 
 	spin_lock_irqsave(&cdx_police_lock, flags);
-	list_for_each_entry_safe(filter, next, &cdx_police_filters, list)
-		if (filter->dev == dev && filter->cookie == f->cookie) {
-			profile = filter->profile;
-			cdx_police_profile_put(profile);
-			list_del(&filter->list);
-			break;
-		}
+	filter = cdx_police_filter_find(dev, f->cookie);
+	if (filter) {
+		profile = filter->profile;
+		cdx_police_profile_put(profile);
+		list_del(&filter->list);
+	}
 	spin_unlock_irqrestore(&cdx_police_lock, flags);
-	if (!profile)
+	if (!filter)
 		return -ENOENT;
 	/* Turn the meter off before the profile can be handed to another
 	 * filter, so a flow still naming it passes rather than meets somebody
@@ -460,6 +627,38 @@ static int cdx_police_flower_destroy(struct net_device *dev,
 	return 0;
 }
 
+static int cdx_police_flower_stats(struct net_device *dev,
+				   struct flow_cls_offload *f)
+{
+	struct cdx_police_counters now;
+	struct cdx_police_filter *filter;
+	unsigned long flags;
+	bool reported;
+	u8 profile;
+
+	/* Which profile to read is decided under the lock; reading it is not,
+	 * because the counter fetch busy-waits on a host command. The filter
+	 * is then found again, since it can be destroyed in between and its
+	 * profile handed to somebody else. */
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	filter = cdx_police_filter_find(dev, f->cookie);
+	profile = filter ? filter->profile : 0;
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	if (!profile)
+		return -ENOENT;
+
+	if (cdx_ingress_policer_counters(FMAN_INDEX, profile, &now) != SUCCESS)
+		return -EINVAL;
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	filter = cdx_police_filter_find(dev, f->cookie);
+	reported = filter && filter->profile == profile;
+	if (reported)
+		cdx_police_report(&f->stats, &filter->base, &now);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	return reported ? 0 : -ENOENT;
+}
+
 static int cdx_police_flower(struct net_device *dev, struct flow_cls_offload *f)
 {
 	switch (f->command) {
@@ -467,8 +666,9 @@ static int cdx_police_flower(struct net_device *dev, struct flow_cls_offload *f)
 		return cdx_police_flower_replace(dev, f);
 	case FLOW_CLS_DESTROY:
 		return cdx_police_flower_destroy(dev, f);
+	case FLOW_CLS_STATS:
+		return cdx_police_flower_stats(dev, f);
 	default:
-		/* Statistics need the per-colour counters, as matchall's do. */
 		return -EOPNOTSUPP;
 	}
 }
