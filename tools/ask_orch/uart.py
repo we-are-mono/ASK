@@ -30,6 +30,7 @@ import re
 import select
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -39,6 +40,36 @@ import serial
 DEFAULT_TARGET_DEV = os.environ.get("ASK_TARGET_DEV", "/dev/ttyUSB0")
 DEFAULT_LAN_VM     = os.environ.get("ASK_LAN_VM", "loki")
 DEFAULT_BAUD       = 115200
+
+# One UART, one reader -- enforced here rather than left as a convention.
+#
+# Nothing stops two Console objects naming the same device, and the module
+# lifecycle test does exactly that: it opens its own console for the rmmod
+# sequence while the rig fixture already holds one. Both then sit in _pump()
+# on the same tty, each consuming bytes the other is waiting for, and both
+# block until their timeout -- which, for callers that pass no timeout, is
+# never. Serial reads are destructive, so this cannot be fixed by buffering.
+#
+# The lock is keyed by device and shared across instances, because no
+# per-instance state can see the other reader. It is re-entrant so run() may
+# call expect() while holding it.
+#
+# It serialises whole operations (run, login, sync_prompt, a bare expect), not
+# individual reads. A caller that sends and then expects as two separate steps
+# still races another reader between them; use run(), or hold `port_lock()`
+# across the pair.
+_PORT_LOCKS: dict[str, threading.RLock] = {}
+_PORT_LOCKS_GUARD = threading.Lock()
+
+
+def port_lock(port: str) -> threading.RLock:
+    """The lock guarding `port`, created on first use."""
+    with _PORT_LOCKS_GUARD:
+        lock = _PORT_LOCKS.get(port)
+        if lock is None:
+            lock = threading.RLock()
+            _PORT_LOCKS[port] = lock
+        return lock
 
 # Patterns we expect to see from the remote shell. Kept loose — BusyBox,
 # systemd's agetty, Armbian, and Yocto all use slightly different prompts.
@@ -81,6 +112,7 @@ class Console:
         self.buf       = b""
         self.log_fp    = open(log_path, "ab", buffering=0) if log_path else None
         self.ser       = serial.Serial(port=port, baudrate=baud, timeout=0)
+        self.lock      = port_lock(port)
 
     # --- factory helpers ------------------------------------------------
 
@@ -119,19 +151,20 @@ class Console:
         else:
             pat = pattern
         deadline = time.monotonic() + (timeout if timeout is not None else self.timeout_s)
-        while True:
-            self._pump(timeout_s=0.1)
-            m = pat.search(self.buf)
-            if m:
-                before = self.buf[:m.start()]
-                self.buf = self.buf[m.end():]
-                return m, before
-            if time.monotonic() > deadline:
-                tail = self.buf[-400:].decode(errors="replace")
-                raise TimeoutError(
-                    f"expect({pat.pattern!r}) timed out on {self.port}; "
-                    f"tail: {tail!r}"
-                )
+        with self.lock:
+            while True:
+                self._pump(timeout_s=0.1)
+                m = pat.search(self.buf)
+                if m:
+                    before = self.buf[:m.start()]
+                    self.buf = self.buf[m.end():]
+                    return m, before
+                if time.monotonic() > deadline:
+                    tail = self.buf[-400:].decode(errors="replace")
+                    raise TimeoutError(
+                        f"expect({pat.pattern!r}) timed out on {self.port}; "
+                        f"tail: {tail!r}"
+                    )
 
     def _pump(self, timeout_s: float) -> None:
         r, _, _ = select.select([self.ser.fileno()], [], [], timeout_s)
@@ -162,33 +195,35 @@ class Console:
         Sends a harmless Enter to jostle the remote into printing its
         prompt. Idempotent — safe to call multiple times.
         """
-        for _ in range(tries):
-            self.send(b"\n")
-            try:
-                self.expect(PROMPT_RE, timeout=timeout)
-                return
-            except TimeoutError:
-                continue
+        with self.lock:
+            for _ in range(tries):
+                self.send(b"\n")
+                try:
+                    self.expect(PROMPT_RE, timeout=timeout)
+                    return
+                except TimeoutError:
+                    continue
         raise TimeoutError(f"no prompt on {self.port} after {tries} tries")
 
     def login(self, user: str, password: str | None = None,
               timeout: float = 5.0) -> None:
         """Log in if sitting at a login prompt; no-op at an already-logged-in shell."""
-        self.send(b"\n")
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            self._pump(0.3)
-            if PROMPT_RE.search(self.buf):
-                self.buf = b""
-                return
-            if LOGIN_RE.search(self.buf):
-                self.buf = b""
-                self.send(user + "\n")
-                if password is not None:
-                    self.expect(PASSWORD_RE, timeout=5.0)
-                    self.send(password + "\n")
-                self.expect(PROMPT_RE, timeout=10.0)
-                return
+        with self.lock:
+            self.send(b"\n")
+            while time.monotonic() < deadline:
+                self._pump(0.3)
+                if PROMPT_RE.search(self.buf):
+                    self.buf = b""
+                    return
+                if LOGIN_RE.search(self.buf):
+                    self.buf = b""
+                    self.send(user + "\n")
+                    if password is not None:
+                        self.expect(PASSWORD_RE, timeout=5.0)
+                        self.send(password + "\n")
+                    self.expect(PROMPT_RE, timeout=10.0)
+                    return
         raise TimeoutError(f"login timed out on {self.port}")
 
     # --- command execution ---------------------------------------------
@@ -201,20 +236,23 @@ class Console:
         """
         marker = f"__ASK_RC_{os.getpid()}_{int(time.monotonic() * 1e6)}__"
         wrapped = f"{cmd}; echo {marker}=$?\n"
-        self.send(wrapped)
+        # Send and read as one unit: a second reader arriving between the two
+        # would eat this command's marker and leave both waiting.
+        with self.lock:
+            self.send(wrapped)
 
-        # Everything between "the shell's echo of our wrapped command"
-        # and the marker is the real command output.
-        marker_re = re.compile(rf"{re.escape(marker)}=(\-?\d+)".encode())
-        m, before = self.expect(marker_re, timeout=timeout)
-        rc = int(m.group(1))
+            # Everything between "the shell's echo of our wrapped command"
+            # and the marker is the real command output.
+            marker_re = re.compile(rf"{re.escape(marker)}=(\-?\d+)".encode())
+            m, before = self.expect(marker_re, timeout=timeout)
+            rc = int(m.group(1))
 
-        # Flush up to the next prompt so the buffer is clean for subsequent
-        # commands; we ignore what's in there (just the post-marker prompt).
-        try:
-            self.expect(PROMPT_RE, timeout=5.0)
-        except TimeoutError:
-            pass
+            # Flush up to the next prompt so the buffer is clean for subsequent
+            # commands; we ignore what's in there (just the post-marker prompt).
+            try:
+                self.expect(PROMPT_RE, timeout=5.0)
+            except TimeoutError:
+                pass
 
         raw = before.decode(errors="replace")
         out = _strip_echo(raw, wrapped)
