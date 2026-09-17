@@ -291,11 +291,34 @@ including TTL/MTU exceptions, can already have incremented these counters.
 Callbacks use deltas; a backwards sample triggers invalidation rather than
 unsigned underflow. Firmware timestamps use 32-bit CDX jiffies, expanded relative
 to current kernel time; supported idle intervals must stay below half that
-clock's range. Linux owns activity refresh and expiry. Accurate post-punt
-conntrack accounting cannot be reconstructed from these totals, so native
-counter-enabled hardware tables are refused. Enabling counters on an existing
-table causes the statistics guard to invalidate it without reporting hardware
-deltas into conntrack. Recreate the table for a defined accounting transition.
+clock's range. Linux owns activity refresh and expiry.
+
+Counter-enabled hardware tables are admitted, and a reported delta is restated
+in the units Netfilter counts in. The two counters disagree about framing, not
+about packets: a classifier hit counts the frame as it arrived, while
+`nf_ct_acct_update()` in the software fast path counts `skb->len` after
+`nf_flow_encap_pop()` has removed the Ethernet header, every tag above it and
+any PPPoE session header. `ft_l2_overhead()` subtracts exactly that stack, taken
+from the direction's own ingress framing, and saturates at zero rather than
+wrapping when a delta cannot carry it.
+
+Two residuals remain, both bounded and neither correctable from a total:
+
+- **Padding.** A frame below the sixty-byte minimum was padded before it was
+  counted, and padding is invisible in an aggregate. A flow of minimum-size
+  frames — pure TCP acknowledgements, small RTP — reads high by at most ten
+  bytes per frame.
+- **Punts.** A frame punted after its hit was counted here is counted again by
+  the path that handled it. That is bounded by exception traffic (TTL, MTU,
+  TCP state), which is zero on a healthy flow.
+
+This was previously resolved the other way: counter-enabled tables were refused
+outright and enabling counters on a live table invalidated it. That refused
+every flow under the configuration consumers actually ship — OpenWrt's firewall
+renders `counter` on every flowtable unconditionally — to avoid a per-frame
+constant that is arithmetic rather than unknowable. `/proc/cdx_flowtable`
+continues to expose the raw hardware counters, so diagnostics still see what
+the classifier saw.
 
 `/proc/cdx_flowtable` exposes entries, tuple rewrites, raw counters, references,
 invalidation causes, quarantine and recovery state. Preserve it before unload

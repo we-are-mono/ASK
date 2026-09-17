@@ -18,7 +18,11 @@ static u32 rol32(u32 v, unsigned n) { return (v << n) | (v >> (32 - n)); }
 #define fallthrough __attribute__((fallthrough))
 #include "flowtable_hash.inc"
 static u32 get_random_u32(void) { return 0x87654321; }
+#define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define ETH_ALEN 6
+#define ETH_HLEN 14
+#define VLAN_HLEN 4
+#define PPPOE_SES_HLEN 8
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86dd
 #define ETH_P_8021Q 0x8100
@@ -3027,7 +3031,8 @@ static void test_connections(void)
         entries[i]->hw->stats = (struct cdx_ft_counters){
             .packets = 100 + i, .bytes = 10000 + i * 100, .lastused = 990 };
         assert(ft_stats(entries[i], &cls) == 0);
-        assert(cls.stats.pkts == 100 + i && cls.stats.bytes == 10000 + i * 100);
+        assert(cls.stats.pkts == 100 + i &&
+               cls.stats.bytes == 10000 + i * 100 - (100 + i) * ETH_HLEN);
     }
     test_iterator(ARRAY_SIZE(entries));
     assert(ft_count == ARRAY_SIZE(entries) && live_hw == ft_count);
@@ -3059,7 +3064,8 @@ static void test_connections(void)
         entries[i]->hw->stats.packets += i + 1;
         entries[i]->hw->stats.bytes += (i + 1) * 100;
         assert(ft_stats(entries[i], &cls) == 0);
-        assert(cls.stats.pkts == i + 1 && cls.stats.bytes == (i + 1) * 100);
+        assert(cls.stats.pkts == i + 1 &&
+               cls.stats.bytes == (i + 1) * (100 - ETH_HLEN));
     }
     test_iterator(ARRAY_SIZE(entries));
     /* Different removal order exercises list head, middle and tail; sharing
@@ -3425,6 +3431,57 @@ static void test_binding_capacity(void)
     ft_invalid_done = false;
 }
 
+/* OpenWrt's firewall declares `counter` on every flowtable it renders, with no
+ * option to turn it off, so refusing a counter-enabled table refuses the only
+ * configuration the consumer actually ships. The two counters disagree about
+ * framing rather than about packets: hardware counts the frame as it arrived,
+ * Netfilter counts what it forwards, after the encapsulation has been popped. */
+static void test_counter_accounting(void)
+{
+    struct cdx_ft_rule framing = {};
+    struct cdx_ft_entry *e;
+
+    /* Every ingress shape the subtraction has to describe. */
+    assert(ft_l2_overhead(&framing) == ETH_HLEN);
+    framing.in_vlans = 1;
+    assert(ft_l2_overhead(&framing) == ETH_HLEN + VLAN_HLEN);
+    framing.in_vlans = 2;
+    assert(ft_l2_overhead(&framing) == ETH_HLEN + 2 * VLAN_HLEN);
+    framing.in_session.present = true;
+    assert(ft_l2_overhead(&framing) == ETH_HLEN + 2 * VLAN_HLEN + PPPOE_SES_HLEN);
+    framing.in_vlans = 0;
+    assert(ft_l2_overhead(&framing) == ETH_HLEN + PPPOE_SES_HLEN);
+    /* An egress tag is pushed after the hit was counted and changes nothing. */
+    framing = (struct cdx_ft_rule){ .out_vlans = 2, .out_session = { .present = true } };
+    assert(ft_l2_overhead(&framing) == ETH_HLEN);
+
+    fixture();
+    cls.nf_counter = true;
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    e = ft_find(&binding, cls.cookie);
+    assert(e && !e->rule.in_vlans && !e->rule.in_session.present);
+    /* Ten 256-byte UDP payloads: 14 + 20 + 8 + 256 on the wire, and the 284
+     * Netfilter would have counted for each after popping the Ethernet header. */
+    e->hw->stats.packets = 10;
+    e->hw->stats.bytes = 10 * 298;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_stats(e, &cls) == 0 && !ft_invalid);
+    assert(cls.stats.pkts == 10 && cls.stats.bytes == 10 * 284);
+    /* A later sample reports its own delta, corrected the same way. */
+    e->hw->stats.packets = 15;
+    e->hw->stats.bytes = 15 * 298;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_stats(e, &cls) == 0 && cls.stats.pkts == 5 && cls.stats.bytes == 5 * 284);
+    /* A delta too small to carry its own framing reports nothing, rather than
+     * underflowing into an enormous unsigned byte count. */
+    e->hw->stats.packets = 16;
+    e->hw->stats.bytes += 4;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_stats(e, &cls) == 0 && cls.stats.pkts == 1 && cls.stats.bytes == 0);
+    assert(ft_remove(e) == 0 && !ft_count && !allocated && !live_hw);
+    cls.nf_counter = false;
+}
+
 static void test_device_recovery(void)
 {
     struct net other_net;
@@ -3782,7 +3839,7 @@ int main(void)
     assert(!memcmp(decoded.dst_mac, (u8[]){2,0x11,0x22,0x33,0x44,0x55}, 6));
     assert(!memcmp(decoded.src_mac, out.dev_addr, 6));
     REJECT(cls.nf_ct = NULL); REJECT(ct.net = NULL); REJECT(ct.zone[0] = 1); REJECT(ct.zone[1] = 1);
-    REJECT(cls.nf_counter = true); REJECT(cls.nf_handle = NULL);
+    REJECT(cls.nf_handle = NULL);
     REJECT(handle.invalid = true);
     REJECT(ct.mark = 1); REJECT(ct.status = IPS_NAT_MASK); REJECT(cls.nf_mtu = 0);
     REJECT(cls.nf_mtu = 67); REJECT(cls.nf_mtu = 1501); REJECT(cls.common.chain_index = 1);
@@ -3816,7 +3873,11 @@ int main(void)
         cls.cookie++; assert(ft_replace(&binding, &cls) == -EEXIST); cls.cookie--;
         struct cdx_ft_entry *e = ft_find(&binding, cls.cookie); assert(e);
         e->hw->stats = (struct cdx_ft_counters){ .packets = 100, .bytes = 12300, .lastused = 990 };
-        assert(ft_stats(e, &cls) == 0 && cls.stats.pkts == 100 && cls.stats.bytes == 12300);
+        /* Reported in Netfilter's units whether or not this table counts:
+         * the number means one thing, and which reader wants it is not the
+         * adapter's business. */
+        assert(ft_stats(e, &cls) == 0 && cls.stats.pkts == 100 &&
+               cls.stats.bytes == 12300 - 100 * ETH_HLEN);
         cls.stats = (struct flow_stats){0};
         assert(ft_stats(e, &cls) == 0 && cls.stats.pkts == 0 && cls.stats.bytes == 0);
         assert(cls.stats.lastused == 990);
@@ -3837,9 +3898,6 @@ int main(void)
     ft_observe = true; assert(ft_replace(&binding, &cls) == -EOPNOTSUPP); ft_observe = false;
     assert(ft_replace(&binding, &cls) == 0);
     struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
-    cls.nf_counter = true;
-    assert(ft_stats(e, &cls) == -EOPNOTSUPP && ft_invalid);
-    cls.nf_counter = false; ft_invalid = 0;
     e->reported.packets = 1; assert(ft_stats(e, &cls) == -EIO && ft_invalid);
     deletion_error = -EAGAIN; assert(ft_remove(e) == -EAGAIN && !ft_fatal);
     ft_invalid = 0; deletion_error = 0; assert(ft_replace(&binding, &cls) == 0);
@@ -3870,6 +3928,7 @@ int main(void)
     test_double_nat();
     test_device_dependencies();
     test_binding_capacity();
+    test_counter_accounting();
     test_device_recovery();
     test_transient_admission();
     test_nexthop_objects();

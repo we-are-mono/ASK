@@ -45,7 +45,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
              "ft_session_stats_get", "ft_session_stats_put", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
-             "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
+             "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
              "ft_vlan_lower", "ft_bridge_vlan", "ft_path_stack", "ft_vlan_match", "ft_vlan_actions", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_stats", "ft_request_targets", "ft_admission_fault", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_invalidate_work", "ft_entry_uses", "ft_device_used", "ft_device_retire", "ft_netdev_event",

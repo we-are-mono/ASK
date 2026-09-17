@@ -18,6 +18,7 @@
 #include <linux/etherdevice.h>
 #include <linux/hashtable.h>
 #include <linux/if_bridge.h>
+#include <linux/if_pppox.h>
 #include <linux/if_vlan.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
@@ -1107,7 +1108,10 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * down have to describe the same mark, or a concurrent change could
 	 * install a class taken from a value that would not have been admitted. */
 	mark = READ_ONCE(cls->nf_ct->mark);
-	if (!cls->nf_mtu || cls->nf_counter ||
+	/* A counter-enabled table is admitted: the consumer's firewall declares
+	 * one unconditionally, and ft_stats() restates the hardware delta in
+	 * Netfilter's own units rather than refusing every flow over framing. */
+	if (!cls->nf_mtu ||
 	    !nf_flow_offload_handle_valid(cls->nf_handle) ||
 	    !net_eq(nf_ct_net(cls->nf_ct), &init_net) ||
 	    nf_ct_zone_id(nf_ct_zone(cls->nf_ct), IP_CT_DIR_ORIGINAL) ||
@@ -1428,6 +1432,32 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	return 0;
 }
 
+/* What the hardware's byte counter includes and Netfilter's does not.
+ *
+ * A classifier hit counts the frame as it arrived: Ethernet header, every tag
+ * above it, and a PPPoE session header, padded to the medium's minimum and
+ * without the FCS. Netfilter counts skb->len where it forwards, which is after
+ * nf_flow_encap_pop() has removed exactly that stack. Reporting a hardware
+ * delta into conntrack accounting without this subtraction adds a constant to
+ * every frame of every flow.
+ *
+ * Ingress framing only: an egress tag or session is pushed after the hit was
+ * counted, and the reverse direction is a hardware entry of its own.
+ *
+ * Padding is not recoverable and is not corrected for. It is invisible in a
+ * total, so a flow whose frames fall below the sixty-byte minimum still reads
+ * high by what was padded -- at most ten bytes on the frames that carry the
+ * least. Frames punted to Linux have also been counted here and counted again
+ * by the slow path that handled them; that is bounded by exception traffic,
+ * which is zero on a healthy flow. Both residuals are documented in
+ * docs/flowtable-architecture.md rather than silently absorbed.
+ */
+static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
+{
+	return ETH_HLEN + rule->in_vlans * VLAN_HLEN +
+	       (rule->in_session.present ? PPPOE_SES_HLEN : 0);
+}
+
 static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 {
 	struct cdx_ft_counters now;
@@ -1436,14 +1466,6 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 
 	if (!nf_flow_offload_handle_valid(entry->handle)) {
 		ft_neigh_invalidate(entry);
-		return -EOPNOTSUPP;
-	}
-	/* A table can enable counters after installation. Its matching frames
-	 * may already have been counted again on a punt to Linux. Retire all
-	 * directions and leave accounting to software; never publish hit counts
-	 * as independently forwarded packets. */
-	if (cls->nf_counter) {
-		ft_invalidate();
 		return -EOPNOTSUPP;
 	}
 	cdx_ft_stats(entry->hw, &now);
@@ -1457,12 +1479,16 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 	}
 	packets = now.packets - entry->reported.packets;
 	bytes = now.bytes - entry->reported.bytes;
+	/* Restate the delta in the units Netfilter counts in. Saturate rather
+	 * than wrap: a delta that cannot carry its own framing describes frames
+	 * this adapter cannot account for, and zero is the honest answer. */
+	bytes -= min_t(u64, bytes, packets * ft_l2_overhead(&entry->rule));
 	if (!ft_neigh_used(entry, packets != 0))
 		return -EOPNOTSUPP;
-	/* These are classifier hits, including some later punts, and Ethernet
-	 * bytes including padding but excluding FCS. Only tables without native
-	 * counter accounting are admitted. Linux uses lastused for ageing; proc
-	 * exposes the raw counters for diagnostics, not delivery accounting. */
+	/* These are classifier hits, so a frame punted after its hit has been
+	 * counted here and counted again by the path that handled it. Linux uses
+	 * lastused for ageing; proc exposes the raw hardware counters for
+	 * diagnostics, separately from what is reported into accounting. */
 	/* Firmware uses the same 32-bit jiffies counter as CDX. Expand relative
 	 * to the current kernel clock; admitted idle durations are below 2^31. */
 	lastused = jiffies - (u32)((u32)jiffies - now.lastused);

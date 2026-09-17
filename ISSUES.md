@@ -1184,13 +1184,13 @@ file's git history.
   fixed (this commit): both patches regenerated against their upstream tags with the QoS
   hunks dropped, verified by applying each to a pristine tree and diffing the result.
 
-- [x] **A152.** The adapter refused a third flowtable binding (`ft_bound >= 2`, the proof of
-  concept's own acceptance limit, carried along unexamined), which a gateway with a WAN and
-  several bridged LANs exceeds; and invalidation snapshotted bound devices into a two-element
-  array, so lifting the cap alone would have skipped `nf_flow_table_cleanup()` on every port
-  past the second —
-  fixed (this commit): both are sized by `CDX_FT_MAX_BINDINGS`, asserted equal to
-  `MAX_PHY_PORTS`, which is the only table a bindable port can come from.
+- [x] **A153.** Counter-enabled flowtables were refused, which refuses every flow under the
+  configuration consumers ship — OpenWrt renders `counter` unconditionally —
+  fixed (this commit): `ft_l2_overhead()` restates each delta in Netfilter's units.
+
+- [x] **A152.** The adapter refused a third binding (`ft_bound >= 2`, the proof of concept's
+  acceptance limit), and invalidation snapshotted bound devices into a two-element array —
+  fixed (this commit): both sized by `CDX_FT_MAX_BINDINGS`, asserted equal to `MAX_PHY_PORTS`.
 
 - [x] **A151.** The DSCP egress map was unreachable on both paths: the hardware enable tested the
   whole `qosmark` word, which `cdx_ft_hw_add()` never leaves zero because it always raises
