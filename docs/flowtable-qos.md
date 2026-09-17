@@ -956,14 +956,26 @@ flowtable mode, and that is a decision this increment could not make for
 itself** — see below.
 
 `cdx_ft_rule.qos` widens from 8 bits to 12: class queue, channel, ingress
-policer, one nibble each. The policer nibble is numbered exactly as the channel
-nibble already was, and for the same reason — **zero has to mean "none"**,
-because profile 0 is a real profile and a sentinel is the only way to say the
-flow passes no meter. So nibble *n* names profile *n-1*, and
-`cdx_ft_hw_add()` translates rather than copies: it sets `iqid` to *n-1* and
-raises `iqid_valid`, or leaves both clear. Using a separate valid bit in the
-rule's own encoding would have been a second thing to keep in step with the
-nibble for no gain.
+policer, one nibble each.
+
+**The policer nibble is the profile number directly, 0–7, and deliberately
+unlike the channel nibble beside it.** The symmetry is tempting and it is
+wrong. The channel nibble needs a sentinel because "the port's least-priority
+channel" is a real, distinct answer from "channel 1". The policer nibble needs
+none, because **there is no "no meter" state to express**: the hardware encoder
+starts from profile 0 and only an `iqid`-carrying mark moves it, so profile 0
+is what every flow that says nothing has always metered against. It is the
+default profile — the one CMM spells `set qm ingress queue default`, which is
+literally `queue_no = 0`.
+
+A nibble reserved to mean "none" would therefore select profile 0 anyway and
+collide with the nibble naming it. `cdx_ft_hw_add()` copies the nibble into
+`iqid` and always raises `iqid_valid`; the bit is not a "policer wanted" flag,
+since leaving it clear selects profile 0 just the same.
+
+That makes **profile 0 special for whoever ends up configuring rates**: it is
+the one that meters everything which does not say otherwise, so it needs a
+defined default rather than being one slot of eight.
 
 *Bit budget.* Twelve bits of a 32-bit `ct->mark` are spoken for, leaving twenty
 to the operator's own policy routing or VPN marks. `qos_mark_mask` still places

@@ -114,12 +114,21 @@ struct cdx_ft_rule {
  * CDX_CEETM_MAX_CHANNELS, and a static assertion in cdx_ceetm_app.c — where
  * that count is owned — fails the build if the two ever drift.
  *
- * The policer nibble numbers the same way and for the same reason: zero means
- * this flow passes no ingress policer, and 1..CDX_FT_QOS_MAX_POLICER name one
- * of the eight RFC-2698 profiles, profile n being nibble n+1. Zero has to mean
- * "none" rather than "profile 0" because profile 0 is a real profile, so a
- * sentinel is the only way to express the absence — the same shape the channel
- * nibble already uses, rather than a separate valid bit to keep in step.
+ * The policer nibble does NOT number that way, and the difference is worth
+ * stating because the symmetry is tempting. It is the RFC-2698 profile number
+ * directly, 0..CDX_FT_QOS_MAX_POLICER.
+ *
+ * There is no sentinel because there is no absence to express. The hardware
+ * encoder starts from profile 0 and only an iqid-carrying mark moves it
+ * (`quenum` in create_entry_in_classif_table_hm), so profile 0 is what every
+ * flow that says nothing has always metered against — it is the default
+ * profile, which CMM spells `set qm ingress queue default`. A nibble reserved
+ * to mean "no policer" would therefore select profile 0 anyway, and collide
+ * with the nibble that names it.
+ *
+ * Naming a profile no control plane has configured is inert rather than a
+ * silent drop: cdx_get_policer_profile_id() answers zero unless that profile
+ * is enabled, and the encoder then leaves PREEMPT_POLICE_PKT clear.
  */
 #define CDX_FT_QOS_QUEUE_MASK	0x00fu
 #define CDX_FT_QOS_CHANNEL_MASK	0x0f0u
@@ -127,7 +136,7 @@ struct cdx_ft_rule {
 #define CDX_FT_QOS_MAX_CHANNEL	8
 #define CDX_FT_QOS_POLICER_MASK	0xf00u
 #define CDX_FT_QOS_POLICER_SHIFT 8
-#define CDX_FT_QOS_MAX_POLICER	8
+#define CDX_FT_QOS_MAX_POLICER	7	/* highest profile number, inclusive */
 /* Every bit the encoding defines, so the adapter can reject a mark that names
  * anything outside it rather than truncating it into a different class. */
 #define CDX_FT_QOS_MASK		(CDX_FT_QOS_QUEUE_MASK | \

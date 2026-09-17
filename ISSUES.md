@@ -396,6 +396,11 @@ each so the open bug list stays honest.
   selection ships ahead of this. Three candidate surfaces and a recommendation
   are in [the QoS design](docs/flowtable-qos.md#the-gap-nothing-can-set-the-rates);
   the decision is the product's, not the increment's.
+  One constraint for whichever surface wins: **profile 0 is not one slot of
+  eight.** The hardware encoder starts there and only an `iqid`-carrying mark
+  moves it, so profile 0 meters every flow that names nothing — it is the
+  default, and needs a defined rate rather than being left to whatever the
+  eight-way configuration happens to put in slot zero.
 
 ---
 
