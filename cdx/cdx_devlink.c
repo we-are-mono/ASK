@@ -112,6 +112,121 @@ static int cdx_devlink_policer_counter_get(struct devlink *devlink,
 	return 0;
 }
 
+/* ---- the SEC rate ------------------------------------------------------
+ *
+ * The crypto path's meter is profile 8 of the same ingress pool the seven
+ * per-flow profiles come from, and it is programmed through the same call that
+ * `tc ... action police' already drives for them. What makes it different is
+ * only who selects it: the hardware does, when it steers a frame to the SEC
+ * block, and no 5-tuple filter can say "the crypto engine's input" because that
+ * is not a property of any flow's tuple.
+ *
+ * So there is no verb for it. It is not a trap -- nothing is punted -- and it
+ * is not a filter's own match. A driver-specific parameter is the remaining
+ * generic surface, and it is an untyped knob rather than a model of the thing.
+ * That is worth saying rather than inventing a shape: this is the one place in
+ * the QoS port where a kernel interface is met in letter and not in spirit.
+ */
+enum cdx_devlink_param_id {
+	/* Driver-specific ids start above the generic ones. */
+	CDX_DEVLINK_PARAM_ID_SEC_RATE = DEVLINK_PARAM_GENERIC_ID_MAX + 1,
+	CDX_DEVLINK_PARAM_ID_SEC_BURST,
+};
+
+/* The range CMM validated, as with the punt policer above. */
+#define CDX_SEC_RATE_MIN	1
+#define CDX_SEC_RATE_MAX	14880952	/* 64-byte frames/s at 10G */
+#define CDX_SEC_BURST_MIN	1
+#define CDX_SEC_BURST_MAX	2048
+
+/* Both values come from and go to the hardware layer, which keeps them beside
+ * the profile handle. Nothing is shadowed here: a parameter that reported a
+ * value the profile did not hold would be worse than no parameter. */
+static int cdx_devlink_param_get(struct devlink *devlink, u32 id,
+				 struct devlink_param_gset_ctx *ctx)
+{
+	u32 cir, cbs;
+
+	if (cdx_ingress_policer_config(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM,
+				       &cir, &cbs) != SUCCESS)
+		return -EINVAL;
+	switch (id) {
+	case CDX_DEVLINK_PARAM_ID_SEC_RATE:
+		ctx->val.vu32 = cir;
+		return 0;
+	case CDX_DEVLINK_PARAM_ID_SEC_BURST:
+		ctx->val.vu32 = cbs;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int cdx_devlink_param_set(struct devlink *devlink, u32 id,
+				 struct devlink_param_gset_ctx *ctx,
+				 struct netlink_ext_ack *extack)
+{
+	u32 cir, cbs;
+
+	/* The profile takes a rate and a burst together, so the one not being
+	 * set is read back rather than assumed: a rate programmed against a
+	 * stale burst is a different meter from the one asked for. */
+	if (cdx_ingress_policer_config(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM,
+				       &cir, &cbs) != SUCCESS)
+		return -EINVAL;
+	switch (id) {
+	case CDX_DEVLINK_PARAM_ID_SEC_RATE:
+		cir = ctx->val.vu32;
+		break;
+	case CDX_DEVLINK_PARAM_ID_SEC_BURST:
+		cbs = ctx->val.vu32;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (cdx_ingress_policer_modify_config(FMAN_INDEX,
+					      INGRESS_SEC_POLICER_QUEUE_NUM,
+					      cir, cir, cbs, cbs) != SUCCESS) {
+		NL_SET_ERR_MSG_MOD(extack, "the SEC policer profile could not be programmed");
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int cdx_devlink_param_validate(struct devlink *devlink, u32 id,
+				      union devlink_param_value val,
+				      struct netlink_ext_ack *extack)
+{
+	switch (id) {
+	case CDX_DEVLINK_PARAM_ID_SEC_RATE:
+		if (val.vu32 < CDX_SEC_RATE_MIN || val.vu32 > CDX_SEC_RATE_MAX) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "the SEC rate is frames per second, up to a 10G port's 64-byte frame rate");
+			return -ERANGE;
+		}
+		return 0;
+	case CDX_DEVLINK_PARAM_ID_SEC_BURST:
+		if (val.vu32 < CDX_SEC_BURST_MIN || val.vu32 > CDX_SEC_BURST_MAX) {
+			NL_SET_ERR_MSG_MOD(extack, "the SEC burst is frames, at most 2048");
+			return -ERANGE;
+		}
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static const struct devlink_param cdx_devlink_params[] = {
+	DEVLINK_PARAM_DRIVER(CDX_DEVLINK_PARAM_ID_SEC_RATE, "sec_rate",
+			     DEVLINK_PARAM_TYPE_U32,
+			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
+			     cdx_devlink_param_get, cdx_devlink_param_set,
+			     cdx_devlink_param_validate),
+	DEVLINK_PARAM_DRIVER(CDX_DEVLINK_PARAM_ID_SEC_BURST, "sec_burst",
+			     DEVLINK_PARAM_TYPE_U32,
+			     BIT(DEVLINK_PARAM_CMODE_RUNTIME),
+			     cdx_devlink_param_get, cdx_devlink_param_set,
+			     cdx_devlink_param_validate),
+};
+
 static const struct devlink_ops cdx_devlink_ops = {
 	.trap_policer_set		= cdx_devlink_policer_set,
 	.trap_policer_counter_get	= cdx_devlink_policer_counter_get,
@@ -147,9 +262,22 @@ int cdx_devlink_attach(struct net_device *net_dev)
 	devlink = devlink_alloc(&cdx_devlink_ops, 0, dev);
 	if (!devlink)
 		return -ENOMEM;
+	/* The SEC profile is turned on once, here, rather than on every
+	 * parameter set: the hardware layer's enable is idempotent but says so
+	 * in a printk, and a knob that logs a line each time it is written is
+	 * a knob nobody will use twice. */
+	cdx_ingress_enable_or_disable_qos(FMAN_INDEX, INGRESS_SEC_POLICER_QUEUE_NUM,
+					  ENABLE_INGRESS_POLICER);
 	devl_lock(devlink);
 	rc = devl_trap_policers_register(devlink, cdx_trap_policers,
 					 ARRAY_SIZE(cdx_trap_policers));
+	if (!rc) {
+		rc = devl_params_register(devlink, cdx_devlink_params,
+					  ARRAY_SIZE(cdx_devlink_params));
+		if (rc)
+			devl_trap_policers_unregister(devlink, cdx_trap_policers,
+						      ARRAY_SIZE(cdx_trap_policers));
+	}
 	devl_unlock(devlink);
 	if (rc) {
 		devlink_free(devlink);
@@ -169,6 +297,8 @@ void cdx_devlink_detach(void)
 	cdx_devlink = NULL;
 	devlink_unregister(devlink);
 	devl_lock(devlink);
+	devl_params_unregister(devlink, cdx_devlink_params,
+			       ARRAY_SIZE(cdx_devlink_params));
 	devl_trap_policers_unregister(devlink, cdx_trap_policers,
 				      ARRAY_SIZE(cdx_trap_policers));
 	devl_unlock(devlink);
