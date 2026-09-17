@@ -100,6 +100,7 @@ struct tc_red_qopt_offload {
 #define TC_H_MAJ_MASK	0xFFFF0000U
 #define TC_H_MIN_MASK	0x0000FFFFU
 #define TC_H_MIN(h)	((h) & TC_H_MIN_MASK)
+#define TC_H_MAJ(h)	((h) & TC_H_MAJ_MASK)
 #define TC_H_MAKE(maj, min) (((maj) & TC_H_MAJ_MASK) | ((min) & TC_H_MIN_MASK))
 #define TC_H_ROOT	0xFFFFFFFFU
 enum tc_htb_command {
@@ -154,15 +155,47 @@ struct dpa_qdisc_ops {
 	void (*class_stats)(void *qm_ctx, u64 *data);
 };
 
-/* Conntrack, as much of it as the queue selection touches. */
+/* Conntrack, and the frame's own header, as much of each as the queue
+ * selection touches. A frame carries a DSCP whether or not it has a
+ * conntrack: the map answers for the ones that named no class. */
 enum ip_conntrack_info { IP_CT_NEW, IP_CT_ESTABLISHED };
 struct nf_conn { u32 mark; };
-struct sk_buff { struct nf_conn *ct; };
+#define ETH_P_IP	0x0800
+#define ETH_P_IPV6	0x86DD
+/* A macro rather than a function, because the production switch uses it in
+ * case labels, where the kernel's own htons() is equally constant-foldable. */
+#define htons(v)	((u16)((((u16)(v)) >> 8) | (((u16)(v)) << 8)))
+struct iphdr { u8 tos; };
+struct ipv6hdr { u8 dsfield; };
+struct sk_buff {
+	struct nf_conn *ct;
+	u16 protocol;		/* big-endian, as the kernel keeps it */
+	u8 tos;			/* the whole dsfield, as a header carries it */
+	bool short_header;	/* too short to read the network header */
+};
 struct qman_fq { unsigned channel, quenum; };
 static struct nf_conn *nf_ct_get(struct sk_buff *skb, enum ip_conntrack_info *info)
 {
 	*info = IP_CT_ESTABLISHED;
 	return skb->ct;
+}
+static bool pskb_network_may_pull(struct sk_buff *skb, unsigned len)
+{ (void)len; return !skb->short_header; }
+static struct iphdr *ip_hdr(struct sk_buff *skb)
+{ static struct iphdr h; h.tos = skb->tos; return &h; }
+static struct ipv6hdr *ipv6_hdr(struct sk_buff *skb)
+{ static struct ipv6hdr h; h.dsfield = skb->tos; return &h; }
+static u8 ipv4_get_dsfield(const struct iphdr *h) { return h->tos; }
+static u8 ipv6_get_dsfield(const struct ipv6hdr *h) { return h->dsfield; }
+
+/* The DSCP filters, which own what a codepoint means. Their own validation is
+ * tools/host_tests/dscp_map.c; here all that matters is that a frame naming no
+ * class reaches them and lands on the class they answer with. */
+static u16 dscp_classes[64];
+static u16 cdx_dscp_class(struct tQM_context_ctl *qm_ctx, u8 dscp)
+{
+	assert(qm_ctx);
+	return dscp < 64 ? dscp_classes[dscp] : 0;
 }
 static void synchronize_net(void) {}
 
@@ -349,17 +382,46 @@ static cdx_ft_setup_tc_handler cdx_ft_handler;
 typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
 
-/* The filter layer, which owns what a police action means. This file is about
- * the qdisc layer and the one ndo_setup_tc they share, so all that matters
- * here is that a block request is routed there rather than dropped; the
- * action's own validation is tools/host_tests/police.c. */
-static unsigned police_blocks;
-static int cdx_police_setup_block(struct net_device *dev, void *f)
+/* The filter layers, which own what a police action and a DSCP filter mean.
+ * This file is about the qdisc layer and the one ndo_setup_tc they all share,
+ * so all that matters here is that a block request reaches the half that owns
+ * its direction; their own validation is police.c and dscp_map.c. */
+enum flow_block_binder_type {
+	FLOW_BLOCK_BINDER_TYPE_UNSPEC,
+	FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
+	FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS,
+};
+struct flow_block_offload { enum flow_block_binder_type binder_type; };
+static unsigned police_blocks, dscp_blocks;
+static int cdx_police_setup_block(struct net_device *dev, struct flow_block_offload *f)
 {
 	assert(dev && f);
 	police_blocks++;
 	return -EOPNOTSUPP;
 }
+static int cdx_dscp_setup_block(struct net_device *dev, struct flow_block_offload *f)
+{
+	assert(dev && f);
+	dscp_blocks++;
+	return -EOPNOTSUPP;
+}
+
+/* A tree change is announced to the DSCP map, which names classes in it. */
+static unsigned dscp_tree_changes;
+static void cdx_dscp_tree_changed(struct net_device *dev)
+{
+	assert(dev);
+	dscp_tree_changes++;
+}
+static void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx) { (void)qm_ctx; }
+
+/* One lock over the class lists. The production file takes it around every
+ * command so a filter resolving a classid cannot walk a list mid-edit; here it
+ * only has to assert it is never taken twice. */
+typedef int mutex_t;
+#define DEFINE_MUTEX(x) mutex_t x
+static void mutex_lock(mutex_t *m) { assert(!*m); *m = 1; }
+static void mutex_unlock(mutex_t *m) { assert(*m); *m = 0; }
 
 /* The ops table is file-scope data rather than a function, so the harness
  * builds its own from the production callbacks it does compile. */
@@ -385,6 +447,7 @@ static void dpa_unregister_setup_tc(void) { registered_ndo = NULL; }
 #include "htb_types.inc"
 
 static struct cdx_htb_port cdx_htb_ports[MAX_PHY_PORTS];
+static DEFINE_MUTEX(cdx_htb_mutex);
 
 #include "htb_production.inc"
 
@@ -877,8 +940,53 @@ static void test_software_path(void)
 		assert(pick(dev, policed | (2 << 4) | (NUM_PQS - 1)) == qid2);
 		assert(pick(dev, policed | 0x03) == DPA_SELECT_QUEUE_NONE);
 	}
-	/* A frame with no conntrack has no class to read. */
+	/* A frame with no conntrack has no class to read, and no DSCP filter
+	 * claims one either. */
 	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+
+	/* ---- the DSCP map answers for frames that named no class ---- */
+
+	memset(dscp_classes, 0, sizeof(dscp_classes));
+	/* EF on channel 1, class queue 7 -- 1:10's pair, in the encoding the
+	 * published class map is indexed by. */
+	dscp_classes[46] = (1 << 4) | (NUM_PQS - 1);
+	struct sk_buff ef = { .ct = NULL, .protocol = htons(ETH_P_IP), .tos = 46 << 2 };
+	assert(cdx_htb_select_queue(dev, &ef) == qid10);
+	/* Including over IPv6, where the same six bits sit in a different
+	 * header. */
+	struct sk_buff ef6 = { .ct = NULL, .protocol = htons(ETH_P_IPV6), .tos = 46 << 2 };
+	assert(cdx_htb_select_queue(dev, &ef6) == qid10);
+	/* A codepoint nobody claimed leaves the stack's own choice alone. */
+	struct sk_buff be = { .ct = NULL, .protocol = htons(ETH_P_IP), .tos = 0 };
+	assert(cdx_htb_select_queue(dev, &be) == DPA_SELECT_QUEUE_NONE);
+	/* So does a frame that is not IP at all, and one whose header cannot
+	 * be read without pulling it. */
+	struct sk_buff arp = { .ct = NULL, .protocol = htons(0x0806), .tos = 46 << 2 };
+	assert(cdx_htb_select_queue(dev, &arp) == DPA_SELECT_QUEUE_NONE);
+	struct sk_buff runt = { .ct = NULL, .protocol = htons(ETH_P_IP),
+				.tos = 46 << 2, .short_header = true };
+	assert(cdx_htb_select_queue(dev, &runt) == DPA_SELECT_QUEUE_NONE);
+
+	/* A frame that *did* name a class keeps it: the mark outranks the map,
+	 * which is the precedence the hardware applies to the same frame. */
+	struct nf_conn marked = { .mark = (u32)((2 << 4) | (NUM_PQS - 1)) << 8 };
+	struct sk_buff both = { .ct = &marked, .protocol = htons(ETH_P_IP),
+				.tos = 46 << 2 };
+	assert(cdx_htb_select_queue(dev, &both) == qid2);
+	/* And a conntracked frame whose mark names nothing still gets the map's
+	 * answer, rather than falling through to the stack's choice. */
+	struct nf_conn unmarked = { .mark = 0 };
+	struct sk_buff ct_ef = { .ct = &unmarked, .protocol = htons(ETH_P_IP),
+				 .tos = 46 << 2 };
+	assert(cdx_htb_select_queue(dev, &ct_ef) == qid10);
+
+	/* A class the map names but no leaf holds is not a queue. */
+	dscp_classes[46] = 0x03;
+	assert(cdx_htb_select_queue(dev, &ef) == DPA_SELECT_QUEUE_NONE);
+	/* Nor is one past the table the class map is sized for. */
+	dscp_classes[46] = CDX_HTB_CLASSES + 1;
+	assert(cdx_htb_select_queue(dev, &ef) == DPA_SELECT_QUEUE_NONE);
+	memset(dscp_classes, 0, sizeof(dscp_classes));
 
 	/* And the Tx path resolves the pair back out of the queue index. */
 	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid10) == &class_fqs[0][NUM_PQS - 1]);

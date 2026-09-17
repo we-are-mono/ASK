@@ -166,7 +166,18 @@ int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_
 
 		priv = netdev_priv(eth_info->net_dev);
 		if ((priv) && (priv->ceetm_en)) {
-			if ((!qosmark->markval) && /* No QOSCONNMARK */
+			/* Only the egress half of the mark decides this. The
+			 * map answers for a frame that names no class, and a
+			 * class is a channel and a class queue; the iqid beside
+			 * them names an *ingress* policer profile and says
+			 * nothing about which queue a frame leaves by.
+			 *
+			 * Testing the whole word instead read iqid_valid, which
+			 * cdx_ft_hw_add() raises for every offloaded flow --
+			 * profile zero is a real answer, so the bit is not a
+			 * "policer wanted" flag -- and so never let an
+			 * offloaded flow reach the map at all. */
+			if ((!qosmark->queue && !qosmark->chnl_id) &&
 				((struct tQM_context_ctl *)priv->qm_ctx)->dscp_fq_map) /* DSCP FQ MAP enabled */
 				*is_dscp_fq_map = 1;
 			else

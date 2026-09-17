@@ -1192,6 +1192,13 @@ file's git history.
   onto the port profile and `flower` onto the seven per-flow profiles, bound to
   flows at admission; the per-flow path was also discarding the caller's burst.
 
+- [x] **A151.** The DSCP egress map was unreachable on both paths: the hardware enable tested the
+  whole `qosmark` word, which `cdx_ft_hw_add()` never leaves zero because it always raises
+  `iqid_valid`, and the software branch tested `pfe_eth_get_queuenum()`, which answers
+  `QOS_DEFAULT_QUEUE` for an unmarked frame —
+  fixed (this commit): the hardware enable reads the egress nibbles only, and the software path is
+  served from `ndo_select_queue` off the same published table rather than from `dpa_tx()`.
+
 - [x] **A149.** `ceetm_get_egressfq()` ORed the class-queue policer's profile number into the
   shared `qman_fq`'s own fqid, where the clearing branch could not undo it and the software Tx
   path would have enqueued to it — the DSCP map stored the pointer from one call and the value

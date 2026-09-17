@@ -43,6 +43,9 @@
 #include <linux/slab.h>
 #include <net/pkt_cls.h>
 #include <net/pkt_sched.h>
+#include <net/dsfield.h>
+#include <net/ip.h>
+#include <net/ipv6.h>
 #include <net/netfilter/nf_conntrack.h>
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
@@ -54,6 +57,7 @@
 #include "cdx_flowtable_backend.h"
 #include "cdx_htb.h"
 #include "cdx_police.h"
+#include "cdx_dscp.h"
 
 /* Leaf classes are handed netdev Tx queue indices out of the headroom patch 150
  * reserved above the direct queues, and sch_htb turns the index this file
@@ -126,6 +130,13 @@ struct cdx_htb_port {
 /* Indexed the way gQMCtx is, so a netdev's stashed QoS context names its
  * entry. Ports without CEETM never reach here at all. */
 static struct cdx_htb_port cdx_htb_ports[MAX_PHY_PORTS];
+
+/* The class lists, which the Tx path never reads -- it reads the byte arrays
+ * published from them. The HTB commands arrive under RTNL, but a filter naming
+ * a class does not: cls_flower runs unlocked, so a block callback asking which
+ * queue a classid means can land while a class is being added. One mutex over
+ * the control side of every port serialises the two. */
+static DEFINE_MUTEX(cdx_htb_mutex);
 
 static struct cdx_htb_port *cdx_htb_entry(struct tQM_context_ctl *qm_ctx)
 {
@@ -708,25 +719,19 @@ static int cdx_htb_setup_red(struct net_device *dev,
 			     struct tc_red_qopt_offload *opt)
 {
 	struct cdx_htb_port *port = cdx_htb_port_of(dev);
+	int rc;
 
 	ASSERT_RTNL();
 	if (!port || !port->live)
 		return -EOPNOTSUPP;
-	return cdx_htb_red(port, opt);
+	mutex_lock(&cdx_htb_mutex);
+	rc = cdx_htb_red(port, opt);
+	mutex_unlock(&cdx_htb_mutex);
+	return rc;
 }
 
-static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *opt)
+static int cdx_htb_command(struct cdx_htb_port *port, struct tc_htb_qopt_offload *opt)
 {
-	struct cdx_htb_port *port = cdx_htb_port_of(dev);
-
-	ASSERT_RTNL();
-	if (!port) {
-		NL_SET_ERR_MSG_MOD(opt->extack, "CEETM is not configured on this interface");
-		return -EOPNOTSUPP;
-	}
-	if (opt->command != TC_HTB_CREATE && !port->live)
-		return -ENOENT;
-
 	switch (opt->command) {
 	case TC_HTB_CREATE:
 		return cdx_htb_create(port, opt);
@@ -751,13 +756,88 @@ static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *
 	return -EOPNOTSUPP;
 }
 
+static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *opt)
+{
+	struct cdx_htb_port *port = cdx_htb_port_of(dev);
+	int rc;
+
+	ASSERT_RTNL();
+	if (!port) {
+		NL_SET_ERR_MSG_MOD(opt->extack, "CEETM is not configured on this interface");
+		return -EOPNOTSUPP;
+	}
+	if (opt->command != TC_HTB_CREATE && !port->live)
+		return -ENOENT;
+
+	mutex_lock(&cdx_htb_mutex);
+	rc = cdx_htb_command(port, opt);
+	mutex_unlock(&cdx_htb_mutex);
+	/* Whatever the tree now is, a DSCP filter naming a class in it has to
+	 * be told: a class that moved or went away leaves the map pointing at a
+	 * queue the operator no longer means. Outside the lock, because the
+	 * reprogramming comes back through the resolver below. */
+	cdx_dscp_tree_changed(dev);
+	return rc;
+}
+
+/* The CEETM channel and class queue a leaf class names, for a filter that
+ * wants to send something to it.
+ *
+ * classid is a whole tc handle, the way `action skbedit priority 1:10' writes
+ * it, because a filter names a class as the operator typed it. The tree itself
+ * is keyed on minors -- sch_htb truncates them in the offload structure -- so
+ * the major is checked against the qdisc's and then discarded.
+ */
+int cdx_htb_class_queue(struct net_device *dev, u32 classid, u8 *channel, u8 *cq,
+			struct netlink_ext_ack *extack)
+{
+	struct cdx_htb_port *port = cdx_htb_port_of(dev);
+	struct cdx_htb_class *cl;
+	int rc = 0;
+
+	if (!port)
+		return -EOPNOTSUPP;
+	mutex_lock(&cdx_htb_mutex);
+	if (!port->live) {
+		NL_SET_ERR_MSG_MOD(extack, "no hardware qdisc on this port to name a class in");
+		rc = -ENOENT;
+		goto out;
+	}
+	if (TC_H_MAJ(classid) >> 16 != port->major) {
+		NL_SET_ERR_MSG_MOD(extack, "that class belongs to another qdisc");
+		rc = -EINVAL;
+		goto out;
+	}
+	cl = cdx_htb_find(port, TC_H_MIN(classid));
+	if (!cl) {
+		NL_SET_ERR_MSG_MOD(extack, "no such class on this port");
+		rc = -ENOENT;
+		goto out;
+	}
+	/* An inner class is a channel. Frames are enqueued to queues, and a
+	 * channel has as many as sixteen of them. */
+	if (cl->inner) {
+		NL_SET_ERR_MSG_MOD(extack, "that class is a channel, not a leaf queue");
+		rc = -EINVAL;
+		goto out;
+	}
+	*channel = cl->channel;
+	*cq = cl->cq;
+out:
+	mutex_unlock(&cdx_htb_mutex);
+	return rc;
+}
+
 void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 {
 	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
 	struct cdx_htb_class *cl, *next;
 
-	if (!port || !port->live)
+	if (!port)
 		return;
+	mutex_lock(&cdx_htb_mutex);
+	if (!port->live)
+		goto out;
 	/* The caller is releasing the whole CEETM context, so the hardware is
 	 * its problem; only the bookkeeping is ours. A qdisc still attached to
 	 * a netdev being unregistered is destroyed by dev_shutdown() before the
@@ -766,6 +846,8 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 		cdx_htb_class_free(port, cl);
 	memset(port, 0, sizeof(*port));
 	INIT_LIST_HEAD(&port->classes);
+out:
+	mutex_unlock(&cdx_htb_mutex);
 }
 
 /* The data path. Both callbacks run per frame, without RTNL, against the byte
@@ -798,6 +880,42 @@ void cdx_unregister_ft_qos_class(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_qos_class, ASK_CDX_FLOWTABLE);
 
+/* The class queue a DSCP filter names for this frame, as a leaf slot.
+ *
+ * Only reached when the frame named no class of its own, which is the same
+ * precedence the hardware applies: an entry whose mark carries a class does not
+ * get the microcode's DSCP bit set either. The answer comes from the table the
+ * filter published, so software and hardware resolve one filter rather than
+ * agreeing twice. */
+static u8 cdx_htb_dscp_slot(struct cdx_htb_port *port, struct sk_buff *skb)
+{
+	u16 klass;
+	u8 dscp;
+
+	switch (skb->protocol) {
+	case htons(ETH_P_IP):
+		if (!pskb_network_may_pull(skb, sizeof(struct iphdr)))
+			return CDX_HTB_NONE;
+		dscp = ipv4_get_dsfield(ip_hdr(skb)) >> 2;
+		break;
+	case htons(ETH_P_IPV6):
+		if (!pskb_network_may_pull(skb, sizeof(struct ipv6hdr)))
+			return CDX_HTB_NONE;
+		dscp = ipv6_get_dsfield(ipv6_hdr(skb)) >> 2;
+		break;
+	default:
+		return CDX_HTB_NONE;
+	}
+	/* Already in this file's own class encoding, because the filter
+	 * resolved its classid against this tree when it was programmed. So the
+	 * published map answers it exactly as it answers a conntrack mark's --
+	 * no second lookup, and no walk of a list being mutated under RTNL. */
+	klass = cdx_dscp_class(port->qm_ctx, dscp);
+	if (!klass || klass >= CDX_HTB_CLASSES)
+		return CDX_HTB_NONE;
+	return READ_ONCE(port->class_txq[klass]);
+}
+
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 {
 	cdx_ft_qos_class_fn decode = READ_ONCE(cdx_ft_qos_class_func);
@@ -805,6 +923,7 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	struct cdx_htb_port *port;
 	enum ip_conntrack_info cinfo;
 	struct nf_conn *ct;
+	u16 klass = 0;
 	u8 slot;
 
 	if (!decode)
@@ -813,8 +932,6 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	if (!port)
 		return DPA_SELECT_QUEUE_NONE;
 	ct = nf_ct_get(skb, &cinfo);
-	if (!ct)
-		return DPA_SELECT_QUEUE_NONE;
 	/* One read of the mark, as the adapter takes one when it admits a flow:
 	 * a class chosen from a value that changed underneath would put this
 	 * frame somewhere the flow's own rule does not name.
@@ -823,8 +940,19 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	 * is wider than an egress destination — it also names an ingress policer
 	 * profile, which has no bearing on which queue a frame leaves by — and
 	 * this table is sized for the egress class alone. */
-	slot = READ_ONCE(port->class_txq[decode(READ_ONCE(ct->mark)) &
-					 CDX_FT_QOS_EGRESS_MASK]);
+	if (ct)
+		klass = decode(READ_ONCE(ct->mark)) & CDX_FT_QOS_EGRESS_MASK;
+	/* No class named, so the DSCP map gets to choose. A frame with no
+	 * conntrack at all reaches here too: it has a DSCP like any other, and
+	 * nothing has named a class for it. */
+	if (!klass) {
+		slot = cdx_htb_dscp_slot(port, skb);
+		if (slot != CDX_HTB_NONE)
+			return CDX_HTB_QID_BASE + slot;
+	}
+	if (!ct)
+		return DPA_SELECT_QUEUE_NONE;
+	slot = READ_ONCE(port->class_txq[klass]);
 	if (slot == CDX_HTB_NONE)
 		return DPA_SELECT_QUEUE_NONE;
 	return CDX_HTB_QID_BASE + slot;
@@ -925,10 +1053,19 @@ static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 		 * successful `tc qdisc add ... htb offload`, because by then
 		 * the qdisc is already flagged as offloaded. */
 		return 0;
-	case TC_SETUP_BLOCK:
-		/* Filters, not qdiscs: an ingress block carries the police
-		 * action that programs this port's rate limiter. */
+	case TC_SETUP_BLOCK: {
+		/* Filters, not qdiscs, and the two directions of a clsact
+		 * qdisc are two different objects: an ingress block carries the
+		 * police action that programs this port's rate limiter, an
+		 * egress one the DSCP map that classifies what leaves by it.
+		 * Each half refuses the other's binder type, so offering both
+		 * is how a clsact gets served at all. */
+		struct flow_block_offload *bo = type_data;
+
+		if (bo->binder_type == FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS)
+			return cdx_dscp_setup_block(dev, type_data);
 		return cdx_police_setup_block(dev, type_data);
+	}
 	case TC_SETUP_FT:
 		handler = READ_ONCE(cdx_ft_handler);
 		return handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
@@ -965,6 +1102,11 @@ void cdx_htb_exit(void)
 	 * the same way, and waits out the frames already inside it. */
 	dpa_unregister_setup_tc();
 	dpa_unregister_qdisc_ops();
-	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++)
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++) {
+		/* Filters before the tree they name classes in, and from out
+		 * here rather than inside cdx_htb_port_gone(), because a filter
+		 * add takes the DSCP lock and then this file's. */
+		cdx_dscp_port_gone(&gQMCtx[ii]);
 		cdx_htb_port_gone(&gQMCtx[ii]);
+	}
 }

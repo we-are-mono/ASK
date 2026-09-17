@@ -21,6 +21,7 @@
 #include "module_qm.h"
 #include "cdx_ceetm_app.h"
 #include "cdx_htb.h"
+#include "cdx_dscp.h"
 #include "misc.h"
 
 QM_context_ctl gQMCtx[MAX_PHY_PORTS];
@@ -535,8 +536,10 @@ int cdx_disable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 
 	for (ii = 0; ii < ARRAY_SIZE(gQMCtx); ii++) {
 		if (gQMCtx[ii].iface_info == iface_info) {
-			/* The hardware below is about to go; drop the qdisc
-			 * bookkeeping that names it first. */
+			/* The hardware below is about to go; drop what names
+			 * it first, the filters before the tree they name
+			 * classes in. */
+			cdx_dscp_port_gone(&gQMCtx[ii]);
 			cdx_htb_port_gone(&gQMCtx[ii]);
 			return ceetm_release_iface(&gQMCtx[ii]);
 		}
