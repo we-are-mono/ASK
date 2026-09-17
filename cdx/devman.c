@@ -538,19 +538,19 @@ static inline int dpa_get_fqid_from_eth(struct eth_iface_info *eth_info,
 		uint32_t *tx_fqid,
 		void  *info)
 {
-	struct qman_fq *egress_fq;
+	uint32_t fqid;
 	U32 mark = 0; /* Default queue */
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)&mark;
 	if(info)
 		qosmark = info;
-	egress_fq = cdx_get_txfq(eth_info, qosmark);
+	fqid = cdx_get_txfqid(eth_info, qosmark);
 
-	if (!egress_fq) {
+	if (!fqid) {
 		DPA_ERROR("%s::unable to get ceetm fqid for chnl %d queue %d\n",
 				__func__, qosmark->chnl_id, qosmark->queue);
 		return FAILURE;
-	} 
-	*tx_fqid = egress_fq->fqid;
+	}
+	*tx_fqid = fqid;
 	return SUCCESS;
 }
 

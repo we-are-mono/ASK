@@ -1446,21 +1446,26 @@ the plane rather than port it, and steps 1 and 5 collapse into removing the
 ## Defects found while mapping this
 
 None is on the flowtable path; all are in code a QoS increment would touch.
-The first two are filed as **A141**, the last as **A142**.
+The first two were filed as **A149** and are fixed; the last is **A150**. They
+were originally filed under numbers another pair of issues already held, which
+made "see A141" ambiguous for as long as it lasted.
 
-- `ceetm_get_egressfq()` (`cdx/cdx_ceetm_app.c:54`) mutates the shared
-  `qman_fq.fqid` in place, OR-ing the policer-profile number into the top byte
-  when the class-queue policer is on and `ff == 1`. The clearing branch is an
-  `else if` requiring `cq_shaper_enable == DISABLE_POLICER`, so a subsequent
-  `ff = 0` call hits neither branch. `ceetm_dscp_fq_map()` calls it with
-  `ff = 0` and then `ff = 1` on the same FQ, storing the *pointer* from the
-  first call and the *value* from the second, so with the class-queue policer
-  enabled the slow-path DSCP table ends up pointing at an FQ whose `fqid`
-  carries the fast-path policer byte.
-- `ceetm_release_iface()` calls `disable_dscp_fqid_map(qm_ctx - gQMCtx)`
-  (`cdx/cdx_ceetm_app.c:1902`) — array-index arithmetic — where every other
-  caller passes `qm_ctx->port_info->portid`. They agree only because
-  `QM_GET_CONTEXT(portid)` is `&gQMCtx[portid]`.
+- `ceetm_get_egressfq()` mutated the shared `qman_fq.fqid` in place, OR-ing the
+  policer-profile number into the top byte when the class-queue policer was on
+  and `ff == 1`. The clearing branch was an `else if` requiring
+  `cq_shaper_enable == DISABLE_POLICER`, so a subsequent `ff = 0` call hit
+  neither branch. `ceetm_dscp_fq_map()` called it with `ff = 0` and then
+  `ff = 1` on the same FQ, storing the *pointer* from the first call and the
+  *value* from the second, so with the class-queue policer enabled the
+  slow-path DSCP table ended up pointing at an FQ whose `fqid` carried the
+  fast-path policer byte. **Fixed:** the two readings of an fqid are now two
+  functions — `ceetm_get_egressfq()` hands back the queue and never writes to
+  it, and `ceetm_egress_fqid()` composes the number the microcode wants, by
+  value, at the one place that writes a parameter block.
+- `ceetm_release_iface()` called `disable_dscp_fqid_map(qm_ctx - gQMCtx)` —
+  array-index arithmetic — where every other caller passes
+  `qm_ctx->port_info->portid`. They agreed only because `QM_GET_CONTEXT(portid)`
+  is `&gQMCtx[portid]`. **Fixed** alongside the above: it passes the port id.
 - `union ctentry_qosmark.vlan_pbits` and `.vlan_pbits_valid` are declared,
   carried through the whole command path, and read by nothing.
 - In flowtable mode, `CMD_INIT(qm)` still builds 8 channels, 128 class queues,

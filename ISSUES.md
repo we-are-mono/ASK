@@ -333,28 +333,7 @@ each so the open bug list stays honest.
   Whole-tree replacement (`PcdCcModifyTree`) is deliberately unsupported
   under A113 and is excluded from this enablement work.
 
-- [ ] **A141 — `ceetm_get_egressfq` mutates the shared FQ it returns.** With a
-  class-queue policer enabled, the `ff = 1` call ORs the policer-profile number
-  into the top byte of `cqinfo->ceetmfq.egress_fq.fqid`
-  (`cdx/cdx_ceetm_app.c:57`). The clearing branch is an `else if` gated on
-  `cq_shaper_enable == DISABLE_POLICER`, so a later `ff = 0` call hits neither
-  branch and sees the polluted value. `ceetm_dscp_fq_map()` trips exactly that:
-  it stores the *pointer* returned by the `ff = 0` call into
-  `qm_ctx->dscp_fq_map->dscp_fq[dscp]`, then calls again with `ff = 1` on the
-  same object (`:1557`, `:1573`). The slow-path DSCP table is then left pointing
-  at an FQ whose `fqid` carries a fast-path-only policer byte, which QMan would
-  see as part of the FQID. Still unreachable: both branches need a class-queue
-  policer, which only the `CMD_QM_*` policer commands enable and nothing sends —
-  the `tc` control plane does not program one. But it is on the path any
-  class-queue policer work takes. Fix by returning the
-  fqid by value, or by keeping the policer byte out of the `qman_fq` entirely
-  and applying it only where the ucode parameter block is written.
-  Adjacent, same file: `ceetm_release_iface()` passes `qm_ctx - gQMCtx` to
-  `disable_dscp_fqid_map()` (`:1902`) where every other caller passes
-  `qm_ctx->port_info->portid`; these agree only because `QM_GET_CONTEXT` is
-  `&gQMCtx[portid]`.
-
-- [ ] **A142 — the CEETM tree is built in flowtable mode with no consumer.**
+- [ ] **A150 — the CEETM tree is built in flowtable mode with no consumer.**
   `CMD_INIT(qm)` runs unconditionally (`cdx/cdx_cmdhandler.c:163`), unlike
   `CMD_INIT(ipsec)` which is skipped when `cdx_flowtable_enabled()` (`:167`). So
   a flowtable boot still claims 8 CEETM channels, 128 CCGs, 128 class queues and
@@ -1212,6 +1191,13 @@ file's git history.
   fixed (this commit): `tc action police` offloads via `TC_SETUP_BLOCK`, `matchall`
   onto the port profile and `flower` onto the seven per-flow profiles, bound to
   flows at admission; the per-flow path was also discarding the caller's burst.
+
+- [x] **A149.** `ceetm_get_egressfq()` ORed the class-queue policer's profile number into the
+  shared `qman_fq`'s own fqid, where the clearing branch could not undo it and the software Tx
+  path would have enqueued to it — the DSCP map stored the pointer from one call and the value
+  from the next —
+  fixed (this commit): the fqid is composed by value in `ceetm_egress_fqid()`, the lookup no
+  longer writes, and one channel resolver serves both readings. Was filed as a second A141.
 
 - [x] **A148.** Unload left the flow_block_cb of a direct bind in a live flowtable, so the next
   offload work called freed module text (`flow_offload_work_handler` oops) — latent since the

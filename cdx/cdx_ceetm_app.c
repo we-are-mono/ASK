@@ -38,64 +38,118 @@ static bool ceetm_callbacks_registered;
 static int ceetm_release_channels(void);
 
 
-static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t classque, uint32_t ff)
+/* The class queue a (channel, class queue) pair names, or NULL.
+ *
+ * Channel zero means "whichever channel this port owns", which is how a
+ * conntrack mark spells a class that does not care; every other value is
+ * one-based, as the FCI commands number them.
+ *
+ * This used to OR the class-queue policer's profile number into the returned
+ * FQ's own fqid, which is a value the *microcode* wants and the software Tx
+ * path must never see -- and it wrote it into an object every caller shares.
+ * The clearing branch could not undo it either, because it required the
+ * policer to be disabled. The byte is composed by value in
+ * ceetm_egress_fqid() instead, where the parameter block is written, and the
+ * qman_fq itself is now never written to at all.
+ */
+/* The channel index a mark's nibble names, or negative for none.
+ *
+ * Zero means "whichever channel this port owns", which is the highest one it
+ * holds; every other value is one-based, as the FCI commands number them. One
+ * rule, because both readings below resolve the same pair and a second copy of
+ * this would be a second answer to keep in step. */
+static int ceetm_resolve_channel(struct tQM_context_ctl *qm_ctx, uint32_t channel)
 {
-	struct ceetm_chnl_info *chnl_ctx;
-	struct tQM_context_ctl *qm_ctx;
-	struct qman_fq *fq;
-	uint32_t pp_no;
-
 	if (channel > CDX_CEETM_MAX_CHANNELS)
-		return NULL;
-	if (classque >= CDX_CEETM_MAX_QUEUES_PER_CHANNEL)
-		return NULL;
-	qm_ctx = ctx;
+		return -1;
 	if (!qm_ctx || !qm_ctx->chnl_map)
-		return NULL;
-	if (!channel) {
-		/* get least prio channel on this interface */
-		channel = fls(qm_ctx->chnl_map) - 1;
-		ceetm_dbg("%s::incoming channel reassigned as %d\n", __func__, channel);
-	} else
-		channel--;
-	chnl_ctx = &qm_chnl_info[channel];
-	if (chnl_ctx->qm_ctx != qm_ctx || !chnl_ctx->cq_info[classque].fq_created)
-		return NULL;
-	fq =  &chnl_ctx->cq_info[classque].ceetmfq.egress_fq;
-	if(chnl_ctx->cq_info[classque].cq_shaper_enable && ff) {
-		pp_no = ((chnl_ctx->cq_info[classque].pp_num) << 24);
-		fq->fqid = (pp_no|fq->fqid);
-	}
-	else if(chnl_ctx->cq_info[classque].cq_shaper_enable == DISABLE_POLICER)
-		fq->fqid = (fq->fqid & 0x00FFFFFF); /* ensure MSByte is set to Zero */
-
-	/*ceetm_dbg("%s::markval %08x egress fq %p fqid %d(%x)\n", __func__, markval, fq, fq->fqid, fq->fqid);*/
-	return (fq);
+		return -1;
+	if (channel)
+		return (int)channel - 1;
+	/* least prio channel on this interface */
+	ceetm_dbg("%s::incoming channel reassigned as %d\n", __func__,
+		  fls(qm_ctx->chnl_map) - 1);
+	return fls(qm_ctx->chnl_map) - 1;
 }
 
-struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *info)
+static struct qman_fq *ceetm_get_egressfq(void *ctx, uint32_t channel, uint32_t classque)
+{
+	struct ceetm_chnl_info *chnl_ctx;
+	struct tQM_context_ctl *qm_ctx = ctx;
+	int resolved = ceetm_resolve_channel(qm_ctx, channel);
+
+	if (resolved < 0 || classque >= CDX_CEETM_MAX_QUEUES_PER_CHANNEL)
+		return NULL;
+	chnl_ctx = &qm_chnl_info[resolved];
+	if (chnl_ctx->qm_ctx != qm_ctx || !chnl_ctx->cq_info[classque].fq_created)
+		return NULL;
+	return &chnl_ctx->cq_info[classque].ceetmfq.egress_fq;
+}
+
+/* The same queue's fqid as the microcode wants it: the class-queue policer's
+ * profile number in the top byte when that policer is on, and a clear top byte
+ * when it is not. Zero means there is no such queue.
+ *
+ * By value, because the two readings of an fqid differ and only one of them
+ * belongs in the shared qman_fq. A frame the CPU enqueues goes to the FQ
+ * object; a frame the hardware forwards is described by a number in a
+ * parameter block, and that number is this one.
+ */
+uint32_t ceetm_egress_fqid(void *ctx, uint32_t channel, uint32_t classque)
+{
+	struct ceetm_chnl_info *chnl_ctx;
+	struct qman_fq *fq = ceetm_get_egressfq(ctx, channel, classque);
+	int resolved;
+	uint32_t fqid;
+
+	if (!fq)
+		return 0;
+	resolved = ceetm_resolve_channel(ctx, channel);
+	chnl_ctx = &qm_chnl_info[resolved];
+	fqid = fq->fqid & 0x00FFFFFF;
+	if (chnl_ctx->cq_info[classque].cq_shaper_enable)
+		fqid |= (uint32_t)chnl_ctx->cq_info[classque].pp_num << 24;
+	return fqid;
+}
+
+/* The Tx path's hook keeps the SDK's four-argument shape, whose last argument
+ * asked for the fast-forward reading of the fqid. That reading is a value
+ * rather than an object, so it comes from ceetm_egress_fqid() at the one place
+ * that wants it; cpe_fp_tx() has always passed zero here and wants the queue
+ * itself. Narrowing the typedef means regenerating patch 010 for a parameter
+ * that is already dead at its only caller.
+ */
+static struct qman_fq *ceetm_egressfq_hook(void *ctx, uint32_t channel,
+					   uint32_t classque, uint32_t ff)
+{
+	return ceetm_get_egressfq(ctx, channel, classque);
+}
+
+/* The fqid a classifier entry's action should carry for this mark, or zero if
+ * the class it names does not exist. A value rather than the queue itself,
+ * because what the caller writes into the entry is a number and because the
+ * class-queue policer's profile byte belongs in that number and nowhere else.
+ */
+uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *info)
 {
 	union ctentry_qosmark *qosmark = (union ctentry_qosmark *)info;
 	uint32_t quenum;
 #ifdef ENABLE_EGRESS_QOS
-	uint32_t ff = 1;
 	struct dpa_priv_s *priv;
-	struct qman_fq *egress_fq;
+	uint32_t fqid;
 
 	priv = netdev_priv(eth_info->net_dev);
 	if (priv->ceetm_en) {
-		egress_fq = ceetm_get_egressfq(priv->qm_ctx, qosmark->chnl_id, qosmark->queue,ff);
-		if (!egress_fq) {
+		fqid = ceetm_egress_fqid(priv->qm_ctx, qosmark->chnl_id, qosmark->queue);
+		if (!fqid)
 			ceetm_err("%s::unable to get ceetm fqid for markval %x\n",
 				__func__, qosmark->markval);
-			return NULL;
-		}
-		return (egress_fq);
-	} 
+		return fqid;
+	}
 #endif
 	/* QOS not enabled on this interface */
 	quenum = (qosmark->queue & (DPAA_FWD_TX_QUEUES - 1));
-	return (&eth_info->fwd_tx_fqinfo[quenum]);
+	return eth_info->fwd_tx_fqinfo[quenum].fqid;
 }
 
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void* info)
@@ -860,7 +914,7 @@ int ceetm_init_channels(void)
 		chinfo++;
 	}
 	/* register functions to return CEETM egress FQID */
-	if (dpa_register_ceetm_get_egress_fq(ceetm_get_egressfq, ceetm_get_dscp_fq)) {
+	if (dpa_register_ceetm_get_egress_fq(ceetm_egressfq_hook, ceetm_get_dscp_fq)) {
 		ceetm_err("%s::unable to register ceetmFq functions\n", __func__);
 		goto err_release;
 	}
@@ -1434,7 +1488,16 @@ struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
 {
 	if (channel >= CDX_CEETM_MAX_CHANNELS)
 		return NULL;
-	return ceetm_get_egressfq(qm_ctx, channel + 1, quenum, 0);
+	return ceetm_get_egressfq(qm_ctx, channel + 1, quenum);
+}
+
+/* The same queue's fqid, by the same numbering. */
+uint32_t ceetm_class_fqid(struct tQM_context_ctl *qm_ctx, uint32_t channel,
+			  uint32_t quenum)
+{
+	if (channel >= CDX_CEETM_MAX_CHANNELS)
+		return 0;
+	return ceetm_egress_fqid(qm_ctx, channel + 1, quenum);
 }
 
 /* The WRED curve a tc RED qdisc describes, in the congestion group's own
@@ -1915,14 +1978,14 @@ static int add_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, struct 
  * This function add one dscp fq mapping in fast path. It returns CEETM_SUCCESS
  * in success case otherwise returns CEETM_FAILURE.
 */
-static int add_dscp_fq_map_ff(struct tQM_context_ctl *qm_ctx, uint8_t dscp, struct qman_fq *egress_fq)
+static int add_dscp_fq_map_ff(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint32_t fqid)
 {
 	cdx_dscp_fqid_t	*dscp_fqid_map;
 
 	if ((dscp_fqid_map = get_dscp_fqid_map(qm_ctx->port_info->portid)) == NULL)
 		return CEETM_FAILURE;
 
-	dscp_fqid_map->fqid[dscp] = cpu_to_be32(egress_fq->fqid);
+	dscp_fqid_map->fqid[dscp] = cpu_to_be32(fqid);
 
 	return CEETM_SUCCESS;
 }
@@ -1935,37 +1998,31 @@ static int add_dscp_fq_map_ff(struct tQM_context_ctl *qm_ctx, uint8_t dscp, stru
 int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, uint8_t channel_num, uint8_t clsqueue_num)
 {
 	struct qman_fq *egress_fq;
+	uint32_t fqid;
 
 		/* slow path get egress fq*/
-	egress_fq = ceetm_get_egressfq(qm_ctx, channel_num, clsqueue_num, 0);
+	egress_fq = ceetm_get_egressfq(qm_ctx, channel_num, clsqueue_num);
 	if (!egress_fq)
 	{
-		ceetm_err("Failed to find egress fq for channel %d and class queue %d on %s\n", 
+		ceetm_err("Failed to find egress fq for channel %d and class queue %d on %s\n",
 				channel_num, clsqueue_num, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
 
 	if (add_dscp_fq_map(qm_ctx, dscp, egress_fq))
 	{
-		ceetm_err("Failed to add dscp %d fq %d map on %s\n", 
+		ceetm_err("Failed to add dscp %d fq %d map on %s\n",
 				dscp, egress_fq->fqid, qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
 
-		/* fast path get egress fq*/
-	egress_fq = ceetm_get_egressfq(qm_ctx, channel_num, clsqueue_num, 1);
-	if (!egress_fq)
+		/* fast path wants the same queue as a number, with the
+		 * class-queue policer's profile byte in it */
+	fqid = ceetm_egress_fqid(qm_ctx, channel_num, clsqueue_num);
+	if (!fqid || add_dscp_fq_map_ff(qm_ctx, dscp, fqid))
 	{
-		ceetm_err("Failed to find egress fq for channel %d and class queue %d on %s\n", 
-				channel_num, clsqueue_num, qm_ctx->iface_info->name);
-		if (dscp_fq_unmap(qm_ctx, dscp))
-			ceetm_err("dscp to fq unmap is failed on interface <%s>\n", qm_ctx->iface_info->name);
-		return CEETM_FAILURE;
-	}
-	if (add_dscp_fq_map_ff(qm_ctx, dscp, egress_fq))
-	{
-		ceetm_err("Failed to add dscp %d fq %d map on %s\n", 
-				dscp, egress_fq->fqid, qm_ctx->iface_info->name);
+		ceetm_err("Failed to add dscp %d fq %x map on %s\n",
+				dscp, fqid, qm_ctx->iface_info->name);
 		if (dscp_fq_unmap(qm_ctx, dscp))
 			ceetm_err("dscp to fq unmap is failed on interface <%s>\n", qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
@@ -2336,7 +2393,10 @@ int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
 	}
 	ceetm_put_channel_devices(detached);
 	if (qm_ctx->dscp_fq_map) {
-		if (disable_dscp_fqid_map(qm_ctx - gQMCtx))
+		/* The port id, as every other caller passes it. Index arithmetic
+		 * happened to give the same answer only because QM_GET_CONTEXT()
+		 * is &gQMCtx[portid]. */
+		if (disable_dscp_fqid_map(qm_ctx->port_info->portid))
 			ret = CEETM_FAILURE;
 		kfree(qm_ctx->dscp_fq_map);
 	}

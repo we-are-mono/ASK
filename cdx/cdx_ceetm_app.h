@@ -117,6 +117,9 @@ int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp);
  * rather than CEETM_FAILURE, because tc reports them to the operator. */
 struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
 			       uint32_t quenum);
+uint32_t ceetm_class_fqid(struct tQM_context_ctl *qm_ctx, uint32_t channel,
+			  uint32_t quenum);
+uint32_t ceetm_egress_fqid(void *ctx, uint32_t channel, uint32_t classque);
 int ceetm_class_counters(uint32_t channel_num, uint32_t quenum,
 			 uint64_t *deq_frames, uint64_t *deq_bytes,
 			 uint64_t *rej_frames);

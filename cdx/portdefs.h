@@ -236,7 +236,7 @@ int dpaa_vwd_init(void);
 void dpaa_vwd_exit(void);
 U16 dpa_iface_stats_get( struct dpa_iface_info *iface_info, struct iface_stats *ifstats);
 void  dpa_iface_stats_reset(struct dpa_iface_info *iface_info, struct iface_stats *stats);
-struct qman_fq *cdx_get_txfq(struct eth_iface_info *eth_info, void *markval);
+uint32_t cdx_get_txfqid(struct eth_iface_info *eth_info, void *markval);
 int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_map, void *markval);
 int dpaa_is_oh_port(uint32_t portid);
 #endif

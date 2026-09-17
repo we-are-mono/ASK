@@ -42,7 +42,8 @@ def test_qos_lifecycle(tmp_path):
         + header[header.index("struct ceetm_fq {"):header.index("// commands")]
     )
     names = [
-        "ceetm_get_egressfq", "ceetm_release_lni", "ceetm_program_channel_shaper",
+        "ceetm_resolve_channel", "ceetm_get_egressfq", "ceetm_egressfq_hook",
+        "ceetm_release_lni", "ceetm_program_channel_shaper",
         "ceetm_create_lni", "ceetm_get_fqcount",
         "ceetm_create_ccg_for_class_queue", "ceetm_num_to_2powN_multiple",
         "ceetm_cfg_td_on_class_queue", "ceetm_create_cq",
