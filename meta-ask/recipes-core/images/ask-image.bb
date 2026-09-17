@@ -13,6 +13,7 @@ IMAGE_INSTALL = " \
     ethtool \
     iproute2 \
     iproute2-bridge \
+    iproute2-tc \
     iputils \
     iptables \
     nftables \

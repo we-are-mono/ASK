@@ -2355,8 +2355,10 @@ static int __init ask_flowtable_init(void)
 		goto not_ready;
 	/* Both routes stay registered. Which one Netfilter uses is the driver's
 	 * choice, not ours, and a kernel without the ndo has only the indirect
-	 * one -- so the adapter has to serve whichever arrives. */
-	rc = ft_init_fault(9) ? -EBUSY : dpa_register_setup_tc(cdx_ft_setup_tc);
+	 * one -- so the adapter has to serve whichever arrives. The direct route
+	 * arrives through CDX, which holds the driver's single ndo_setup_tc slot
+	 * because it also serves the hardware qdisc on the same callback. */
+	rc = ft_init_fault(9) ? -EBUSY : cdx_register_ft_setup_tc(cdx_ft_setup_tc);
 	if (!rc)
 		return 0;
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
@@ -2408,7 +2410,7 @@ static void __exit ask_flowtable_exit(void)
 	cancel_delayed_work_sync(&ft_work);
 	/* Direct first: it is the route a DPAA port actually takes, so closing
 	 * it stops new binds before the indirect one is torn down. */
-	dpa_unregister_setup_tc();
+	cdx_unregister_ft_setup_tc();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,
