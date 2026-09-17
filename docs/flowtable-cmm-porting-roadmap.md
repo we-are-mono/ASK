@@ -37,7 +37,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | ---: | --- | ---: | ---: | --- | --- | --- |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Partial — `FLOW_OFFLOAD_XMIT_XFRM` | High | The xmit type exists, but SA handling, rekey and ESN live entirely in CDX. |
-| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | **Required, and scheduled directly after IPsec.** The flowtable is unicast-conntrack by construction, so this needs a parallel replication path rather than a flowtable feature. |
+| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | **Wanted, and scheduled after IPsec — but not a merge blocker.** `query mc4` on a production gateway carrying IPTV answers "table empty": the offload has never been active, so this adds a capability rather than preserving behaviour. Needs a parallel replication path, not a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
@@ -340,12 +340,26 @@ has already registered `devlink trap policer 2` — the SEC meter — which mete
 nothing until IPsec lands and is deliberately ungated so nothing has to be
 remembered when it does.
 
-Multicast follows, and the question of whether it is needed at all is now
-**closed: it is.** It runs in production on a Gateway Development Kit under
-CMM, so it is not a capability to add but behaviour to preserve, and retirement
-cannot complete without it. Earlier revisions of this file left that open
-pending an answer about IPTV; the answer is yes, and the absence of any
-`test_mcast*` in the suite is a gap in coverage rather than evidence of disuse.
+Multicast follows, and it is wanted: IPTV runs in production on a Gateway
+Development Kit, bridged on the ISP's VLAN. Earlier revisions of this file left
+its scope open pending an answer about IPTV, and the answer is yes.
+
+**It is not, however, a merge blocker, and the distinction was nearly missed.**
+`cmm -c "query mc4"` on that same production gateway answers *"FPP Multicast
+IPV4 table empty"*. Nothing in CMM learns multicast — no netlink, no IGMP
+snooping, no MFC in `module_mcast.c` or `module_mc4.c`, only an explicit
+`CMD_MC4_MULTICAST` from outside that nothing on the box sends — and
+`auto_bridge` tracks the unicast FDB alone. So the streams have been forwarded
+in software by the Linux bridge the whole time, and the flowtable gives up
+nothing by not replicating them. Porting this adds a capability rather than
+restoring one, which is why it can follow IPsec instead of gating the merge.
+
+That the box is **bridged** rather than routed also decides the mechanism:
+`ipmr`'s MFC is empty and irrelevant here, and the source of truth is the
+bridge's MDB, offered to any driver willing to listen — `br_switchdev_mdb_notify()`
+calls `switchdev_port_obj_add()` for every port group with no check that the
+port belongs to a switch ASIC, so the events are available without ASK becoming
+a switchdev driver or growing a port parent id.
 
 **QoS is no longer the critical path.** Its three build features are compiled
 in, but `/etc/config/cmmqos` ships with `enabled '0'` and nothing sends
