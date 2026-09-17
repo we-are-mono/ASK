@@ -1826,6 +1826,162 @@ to ship CEETM QoS at all. If it does not, the honest retirement is to delete
 the plane rather than port it, and steps 1 and 5 collapse into removing the
 `ct->mark` refusal at `ask_flowtable.c:562`.
 
+## Transparency, and who declares the flowtable
+
+CMM needed no configuration at all. It shadowed conntrack over netlink and
+pushed flows to CDX without OpenWrt knowing it existed: install the packages,
+and forwarding was accelerated. The flowtable is declarative, so *something*
+has to name a flowtable on named devices, and a box where nothing does is a
+box with no acceleration and no error. That is a real regression in
+transparency and it should be recorded as one rather than argued away.
+
+What rescues the user-visible behaviour is that **the adapter never asks whose
+flowtable it is**. `ft_block_setup()` checks that the binder is a clsact
+ingress block in the initial namespace, that the port is cdx-backed, that a
+first bind sees an empty table, and that every binding belongs to one table
+with no device bound twice (`cdx/ask_flowtable.c:1608`, `:1625`, `:1638`). It
+never reads the table's name and never consults ASK policy. Any flowtable can
+drive it — including OpenWrt's own.
+
+So the OpenWrt integration is not an ASK package at all:
+
+1. ship `option flow_offloading_hw '1'` as a mono profile default, which is a
+   `uci-defaults` script in a mono package — routine, but no such package
+   exists yet;
+2. fw4 resolves the offload devices from the live network configuration and
+   re-renders on every network reload;
+3. ASK binds.
+
+No Python on the box, no static device list, no hotplug integration. fw4
+already solves each of those for its own purposes, PPPoE and VLAN device
+naming included. Two details, read out of `firewall4-2025.03.17` in the
+OpenWrt tree rather than assumed, are what make it fit:
+
+- `resolve_hw_offload_devices()` descends bridges and VLAN devices to their
+  lower devices (`resolve_lower_devices()`, `fw4.uc:426`) before declaring the
+  flowtable. It therefore hands the kernel **physical ports**, which is exactly
+  and only what `cdx_ft_port_supported()` admits. The software path does not
+  descend and offers bridge names directly.
+- That descent is also why **the two-binding cap had to go first**. A WAN plus
+  a single `br-lan` over two physical ports is already three devices, before
+  any second bridge exists. The cap did not merely block ambitious topologies;
+  it blocked the ordinary one.
+
+A third thing had to change, and it was ours. fw4 renders `counter;` into every
+flowtable it declares, unconditionally — it is not behind any option
+(`templates/ruleset.uc:24`). The adapter used to refuse counter-enabled tables
+outright, so binding would have succeeded and then every flow would have been
+rejected: `bindings 4, entries 0`, silently, which is the same signature as the
+priority clash below and a different cause. The refusal existed because the
+hardware counts frames as they arrive and Netfilter counts what it forwards,
+so publishing hardware deltas into conntrack accounting overstated every flow
+by its framing. That is arithmetic, not an unknowable, and A153 subtracts it.
+The two bounded residuals — sub-minimum frames whose padding cannot be
+recovered from a total, and frames punted after their hit was counted — are
+documented in `docs/flowtable-architecture.md` rather than paid for by
+refusing to offload at all.
+
+### The clash, which is automatic rather than accidental
+
+ASK's admit chain runs at `filter` priority 10 (`tools/ask_flowtable.py:162`).
+fw4's forward chain runs at `priority filter`, which is 0, and
+`meta l4proto { tcp, udp } flow offload @ft` is its **first statement**
+(`templates/ruleset.uc:135-138`). If fw4 offloads at all, it reaches every flow
+first, `nft_flow_offload_eval()` sets `IPS_OFFLOAD_BIT`, and ASK's chain never
+sees one: `bindings 2, entries 0`, forever, with no error anywhere.
+
+The part that is not a user mistake is how a box arrives there. Before fw4
+declares a hardware-offload flowtable it *probes* for one, by asking the kernel
+to check a second table of its own:
+
+```
+add table inet fw4-hw-offload-test;
+add flowtable inet fw4-hw-offload-test ft {
+        hook ingress priority 0; devices = { ... }; flags offload; }
+```
+
+run through `nft -c` (`nft_try_hw_offload()`, `fw4.uc:477`). A checked
+transaction still binds: `nft_register_flowtable_net_hooks()` calls the
+driver and propagates its error (`net/netfilter/nf_tables_api.c:8513`), and for
+a `flags offload` table `nf_flow_table_offload_setup()` returns exactly what
+`ndo_setup_tc` returned (`nf_flow_table_offload.c:1273`). If ASK's *own* table
+is already bound, that second table is refused with `-EBUSY`, the check fails,
+and fw4 does not stop — it warns `Hardware flow offloading unavailable,
+falling back to software offloading`, sets `flow_offloading_hw` false, and
+installs the software offload that takes every flow at priority 0.
+
+So ASK's controller holding its own table, while fw4 has any offloading
+enabled, degrades to the worst available outcome without anyone choosing it.
+The two models are exclusive, and that is the decision to write into whatever
+ships:
+
+| Who declares the flowtable | ASK policy | fw4 options |
+| --- | --- | --- |
+| fw4 (recommended for OpenWrt) | `enabled: false`, controller not used | `flow_offloading '1'`, `flow_offloading_hw '1'` |
+| ASK's controller | `enabled: true` | both off |
+
+One piece of good news, also verified rather than assumed: `fw4 reload` does
+not disturb a table it does not own. Its teardown is scoped — `flush table
+inet fw4` and `delete flowtable inet fw4 ft` — and there is no `flush ruleset`
+anywhere in the package.
+
+What remains unbuilt is the detection, and it is squarely ASK's: the
+controller should enumerate the flowtables on its devices, compare chain
+priorities, and refuse to `apply` while another table's chain runs earlier,
+naming the offender. It is small — `nft -j list ruleset`, compare, refuse —
+and it is the same requirement the [consumer contract](#the-consumer-contract)
+already states. It is deliberately left as a follow-up rather than done here,
+because its message depends on the ownership decision in the table above:
+"refuse" is right for the second row and wrong for the first, where an
+fw4-owned flowtable is not an offender but the intended configuration.
+
+### Transactional apply: withdrawn, and why
+
+An earlier analysis proposed a validate-then-apply-with-rollback layer over
+`tc` and `devlink`, mirroring what `nft -c` gives for nftables. It is not
+being built, and the reasoning is worth keeping so it is not proposed again.
+
+- **Mainline solved this for netfilter and nowhere else.** nftables has a real
+  kernel transaction — `NFNL_MSG_BATCH_BEGIN`/`END` and the `->commit`/`->abort`
+  pair. `net/sched/sch_api.c`, `net/core/rtnetlink.c` and
+  `net/devlink/netlink.c` have no equivalent. `tc -batch` is a userspace loop,
+  and its `-force` means *continue on error*, which is the opposite of atomic.
+- **The kernel already does the verification.** Every bound described in this
+  document is enforced in the driver, with an extack a human can read. A
+  userspace layer would not move safety into userspace; it would add failing
+  fast, and not being left half-applied.
+- **CMM's own protocol was not atomic either.** `cmm/src/module_qm.c:1635`
+  records "Not atomic: phase 2 flushes before phase 3 re-applies". What it had
+  was a whole-config dry run, and the flowtable model mostly removes the need
+  for the flush that made one necessary — `TC_HTB_NODE_MODIFY` works on a live
+  tree.
+- **The renderer that exists is a consumer's, not ASK's.** `package/mono/cmmqos`
+  is a Mono package with no validation that delegates to cmm's `qm-config`. It
+  has to be rewritten against `tc` and `devlink` regardless, and that rewrite
+  is where a consumer's validation belongs.
+
+### The budgets, in one place
+
+What ASK does owe its consumers is the hardware's limits stated once, so that
+OpenWrt, Armbian, VyOS and a bench image do not each re-derive them from the
+driver. Every number here is the hardware's or the driver's, not a policy:
+
+| Resource | Bound | Scope | Where it is enforced |
+| --- | --- | --- | --- |
+| CEETM channels | 8 | the whole SoC, shared by every port | `CDX_CEETM_MAX_CHANNELS`, `cdx/cdx_ceetm_app.h:54` |
+| Leaf classes | 16 per port | per port | `CDX_CEETM_MAX_QUEUES_PER_CHANNEL`, `:59` |
+| Weighted leaves | 8 per channel | until WBFS group B is claimed | `qman_ceetm_cq_claim_A` |
+| Strict priorities | 8 | per channel | CEETM |
+| Tail-drop depth | 128 frames | per leaf, ASK's default | hardware default is 8, far too shallow |
+| Ingress policer profiles | 8, of which **7** are addressable | per port | profile 0 is the default for everything unclassified; `CDX_FT_QOS_MAX_POLICER` |
+| DSCP→class egress map | **1 port at a time** | SoC-wide | "Now supporting only one interface", and the second port is refused |
+| Flowtable bindings | `MAX_PHY_PORTS` | one per cdx-backed port | `CDX_FT_MAX_BINDINGS`; was 2 until A152 |
+| Offloaded flows | 32768 | global, all ports together | `CDX_FT_MAX_ENTRIES`; admission budget, no eviction |
+
+The two that bite a real configuration first are the eight channels, because
+they are SoC-wide rather than per-port and a two-port gateway shaping both
+directions has already spent a quarter of them, and the single DSCP map port.
+
 ## What the original ASK did with asymmetry
 
 Investigated in `~/Mono/ASK-NXP` (cdx 5.03.1, cmm 17.03.1) because the

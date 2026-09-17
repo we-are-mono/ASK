@@ -79,8 +79,9 @@ flowtable verification, are recorded in the
 [policy/startup](flowtable/history/policy-and-startup.md) histories.
 
 Hardware counters report classifier hits, including packets subsequently punted
-for exceptions. Exact Linux post-punt conntrack accounting remains outside the
-contract; counter-enabled hardware tables are refused. Capacity and allocation
+for exceptions. Counter-enabled hardware tables are admitted, with the reported
+delta restated in Netfilter's units; padding and punts remain as bounded
+residuals, described in the architecture. Capacity and allocation
 refusals preserve software forwarding and bounded ownership. Hardware admission
 is directional; resource refusal is not a promise of atomic two-direction
 installation. Transient lock contention has explicit partial-generation recovery.
