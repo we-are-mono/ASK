@@ -343,21 +343,6 @@ each so the open bug list stays honest.
   is gated, or keep the tree and give the flowtable a way to use it. Leaving it
   as-is spends profile-id space and QMan resources on nothing.
 
-- [ ] **A146 — the libnetfilter-conntrack ASK patch still declares the retired
-  QoS mark.** `patches/libnetfilter-conntrack/{1.1.0,1.1.1}/01-nxp-ask-comcerto-fp-extensions.patch`
-  adds `ATTR_QOSCONNMARK`, `CTA_QOSCONNMARK` and `CTA_QOSCONNMARK_PAD` plus
-  their build/parse/copy/compare/print helpers. The kernel attribute they mirror
-  is gone and cmm no longer reads or writes the attribute, so they are dead —
-  and the patch's own header still claims the enum "matches kernel 6.12
-  nfnetlink_conntrack.h", which it no longer does. Harmless at runtime: the two
-  values sit at the end of `ctattr_type`, so removing them kernel-side shifted
-  nothing, and with no setter the library never emits an attribute the kernel
-  would now reject. The trap is that the declarations make it look as though
-  rebuilding cmm with `-DUSE_QOSCONNMARK` would still work. Fix by regenerating
-  both patches against their upstream tarballs with the QoS hunks dropped; it
-  needs a source fetch, which is why it is not bundled with the retirement.
-
-
 ---
 
 <a name="archive"></a>
@@ -1191,6 +1176,13 @@ file's git history.
   fixed (this commit): `tc action police` offloads via `TC_SETUP_BLOCK`, `matchall`
   onto the port profile and `flower` onto the seven per-flow profiles, bound to
   flows at admission; the per-flow path was also discarding the caller's burst.
+
+- [x] **A146.** The libnetfilter-conntrack ASK patches still declared `ATTR_QOSCONNMARK`,
+  `CTA_QOSCONNMARK` and their build/parse/copy/compare/print helpers, mirroring a kernel
+  attribute that no longer exists, which made it look as though rebuilding cmm with
+  `-DUSE_QOSCONNMARK` would still work —
+  fixed (this commit): both patches regenerated against their upstream tags with the QoS
+  hunks dropped, verified by applying each to a pristine tree and diffing the result.
 
 - [x] **A151.** The DSCP egress map was unreachable on both paths: the hardware enable tested the
   whole `qosmark` word, which `cdx_ft_hw_add()` never leaves zero because it always raises
