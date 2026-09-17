@@ -193,8 +193,12 @@ struct flow_block_offload {
 };
 struct flow_block_cb {
     struct list_head list, driver_list;
-    void *ident, *priv;
+    void *ident, *cb_priv;
     void (*release)(void *);
+    /* Which route installed it. Netfilter unwinds only the indirect ones on
+     * flow_indr_dev_unregister(); a direct callback stays its property until
+     * somebody unbinds, which is what the adapter's own drain is for. */
+    bool indirect;
 };
 struct net { int id; };
 static struct net init_net;
@@ -655,7 +659,8 @@ static struct flow_block_cb *flow_indr_block_cb_alloc(rule_callback_t fn, void *
 {
     if (callback_allocation_fail) return ERR_PTR(-ENOMEM);
     struct flow_block_cb *cb = kzalloc(sizeof(*cb), GFP_KERNEL); assert(cb);
-    cb->ident = ident; cb->priv = priv; cb->release = release;
+    cb->ident = ident; cb->cb_priv = priv; cb->release = release;
+    cb->indirect = true;
     if (invalidate_on_bind) { assert(ft_bound); ft_invalidate(); }
     return cb;
 }
@@ -677,16 +682,25 @@ static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_bloc
 }
 /* The direct route's pair. Netfilter holds flow_block_lock across the whole of
  * ndo_setup_tc there, so the exclusion the indirect move asserts has to hold
- * here too -- it is just the caller who established it. No case reaches these
- * yet: nothing registers the direct entry point. */
+ * here too -- it is just the caller who established it. This is the route
+ * every bind takes once the driver has an ndo_setup_tc, which it now does. */
 static struct flow_block_cb *flow_block_cb_alloc(rule_callback_t fn, void *ident,
     void *priv, void (*release)(void *))
 {
     if (callback_allocation_fail) return ERR_PTR(-ENOMEM);
     struct flow_block_cb *cb = kzalloc(sizeof(*cb), GFP_KERNEL); assert(cb);
-    cb->ident = ident; cb->priv = priv; cb->release = release;
+    cb->ident = ident; cb->cb_priv = priv; cb->release = release;
+    cb->indirect = false;
     if (invalidate_on_bind) { assert(ft_bound); ft_invalidate(); }
     return cb;
+}
+/* Netfilter's own free: runs the release and drops the callback. Mirrors a
+ * kernel API, so it stays declared whether or not this build calls it. */
+__attribute__((unused))
+static void flow_block_cb_free(struct flow_block_cb *cb)
+{
+    cb->release(cb->cb_priv);
+    kfree(cb);
 }
 static void flow_block_cb_remove(struct flow_block_cb *cb, struct flow_block_offload *bo)
 {
@@ -820,10 +834,18 @@ static void unregister_indirect(void)
     } else {
         assert(!canceled);
     }
-    while (ft_block_list.next != &ft_block_list) {
-        struct flow_block_cb *cb = list_entry(ft_block_list.next, struct flow_block_cb, driver_list);
+    /* Only the indirect callbacks. Netfilter tracks those itself and unwinds
+     * them here; a direct callback is the flowtable's property and it has no
+     * idea the adapter is leaving. Releasing those too -- as this stub used
+     * to -- models a cleanup the kernel does not perform, and hid a
+     * use-after-free: the direct callback survived unload, and the next
+     * offload work item called into freed module text. */
+    struct flow_block_cb *cb, *next;
+    list_for_each_entry_safe(cb, next, &ft_block_list, driver_list) {
+        if (!cb->indirect)
+            continue;
         list_del(&cb->driver_list); list_del(&cb->list);
-        cb->release(cb->priv); kfree(cb);
+        cb->release(cb->cb_priv); kfree(cb);
     }
     indirect_registered=false;
 }
@@ -2676,10 +2698,31 @@ static int bind_device(struct net_device *dev, int command)
         struct flow_block_cb *cb = list_entry(bo.cb_list.next, struct flow_block_cb, list);
         list_del(&cb->list);
         if (command == FLOW_BLOCK_BIND) list_add_tail(&cb->list, &block.cb_list);
-        else { cb->release(cb->priv); kfree(cb); }
+        else { cb->release(cb->cb_priv); kfree(cb); }
     }
     return rc;
 }
+/* The direct route, as a netdev that has an ndo_setup_tc takes it: Netfilter
+ * passes the flowtable's own embedded block and no table argument, recovers
+ * the owner by container_of, and holds flow_block_lock across the call. */
+static int bind_device_direct(struct net_device *dev, int command)
+{
+    struct flow_block_offload bo = { .block = &table.flow_block, .net = &init_net,
+        .binder_type = FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS, .command = command };
+    list_init(&bo.cb_list);
+    down_write(&table.flow_block_lock);
+    int rc = cdx_ft_setup_tc(dev, TC_SETUP_FT, &bo);
+    up_write(&table.flow_block_lock);
+    assert(!block_write_lock && !cdx_info->ctrl.mutex);
+    while (bo.cb_list.next != &bo.cb_list) {
+        struct flow_block_cb *cb = list_entry(bo.cb_list.next, struct flow_block_cb, list);
+        list_del(&cb->list);
+        if (command == FLOW_BLOCK_BIND) list_add_tail(&cb->list, &table.flow_block.cb_list);
+        else { cb->release(cb->cb_priv); kfree(cb); }
+    }
+    return rc;
+}
+
 static bool can_rearm(void)
 {
     mutex_lock(&cdx_info->ctrl.mutex);
@@ -2775,7 +2818,7 @@ static void test_rearm(void)
         assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && ft_rearms == cycle + 1);
         fixture();
         struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
-        assert(cb && ft_replace(cb->priv, &cls) == 0);
+        assert(cb && ft_replace(cb->cb_priv, &cls) == 0);
         assert(ft_count == 1 && live_hw == 1);
         assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0); /* Real entry retirement. */
         assert(bind_device(&out, FLOW_BLOCK_UNBIND) == 0);
@@ -3288,7 +3331,7 @@ static void test_device_dependencies(void)
     in.net = NULL;
     device_event(&in, NETDEV_REGISTER, false);
     struct flow_block_cb *cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
-    assert(cb && ft_replace(cb->priv, &cls) == 0);
+    assert(cb && ft_replace(cb->cb_priv, &cls) == 0);
     assert(ft_bound == 1 && in.refs == 1 && out.refs == 1);
     for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
         device_event(&out, events[i], true); /* Egress has no binding. */
@@ -3314,7 +3357,7 @@ static void test_device_dependencies(void)
     cb = flow_block_cb_lookup(&block, ft_rule_callback, &in);
     for (unsigned stage = 2; stage <= 3; stage++) {
         ft_fail_stage = stage;
-        assert(ft_replace(cb->priv, &cls) < 0 && !ft_count && !out.refs);
+        assert(ft_replace(cb->cb_priv, &cls) < 0 && !ft_count && !out.refs);
         device_event(&out, NETDEV_CHANGEMTU, false);
     }
     assert(bind_device(&in, FLOW_BLOCK_UNBIND) == 0);
@@ -3536,6 +3579,42 @@ static void test_qos_decode(void)
     ft_ready=ft_stopping=false; registration_step=canceled=0;
 }
 
+/* Unload after a direct bind.
+ *
+ * Netfilter unwinds the binds it brokered indirectly when the adapter
+ * unregisters, and it has no idea about a direct one -- that callback is the
+ * flowtable's, and the flowtable is still alive. If the adapter does not hand
+ * it back itself, it survives the unload still pointing at this module's text,
+ * and the next queued offload calls it. On hardware that is
+ * flow_offload_work_handler faulting on freed text with the table perfectly
+ * healthy, which is exactly what the rig showed.
+ *
+ * Every bind takes this route now that the driver has an ndo_setup_tc, so
+ * this is the ordinary case rather than a corner of one.
+ */
+static void test_direct_bind_unload(void)
+{
+    list_init(&table.flow_block.cb_list);
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    assert(ask_flowtable_init() == 0);
+    assert(bind_device_direct(&in, FLOW_BLOCK_BIND) == 0);
+    assert(ft_bound == 1 && in.refs == 1);
+    /* The callback is live in the table, which is where it has to be for the
+     * fault to be reachable at all. */
+    assert(table.flow_block.cb_list.next != &table.flow_block.cb_list);
+
+    ask_flowtable_exit();
+
+    /* Nothing may still name this module: not in the table Netfilter walks,
+     * not on the adapter's own list. */
+    assert(table.flow_block.cb_list.next == &table.flow_block.cb_list);
+    assert(ft_block_list.next == &ft_block_list);
+    /* And the release really ran, rather than the callback being dropped on
+     * the floor: the binding is gone and its device reference with it. */
+    assert(!ft_bound && !in.refs && !allocated && !ft_count);
+}
+
 static void test_registration(void)
 {
     for (registration_failure = 0; registration_failure <= 9; registration_failure++) {
@@ -3698,6 +3777,7 @@ int main(void)
     test_transient_admission();
     test_nexthop_objects();
     test_qos_decode();
+    test_direct_bind_unload();
     test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm, class decode and fatal retry passed");
 }

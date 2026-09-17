@@ -1229,3 +1229,8 @@ file's git history.
 - [x] **A145.** `cpe_fp_tx()` confirmed on a frame queue chosen by class-queue id rather than
   by sending Tx queue, so every DSCP-classified frame confirmed on `conf_fqs[0]` whichever core sent it —
   fixed (this commit): index by `skb_get_queue_mapping()`, which is what the non-CEETM branch already used.
+
+- [x] **A148.** Unload left the flow_block_cb of a direct bind in a live flowtable, so the next
+  offload work called freed module text (`flow_offload_work_handler` oops) — latent since the
+  driver grew an `ndo_setup_tc` and `flow_indr_dev_unregister()` unwinds only indirect binds —
+  fixed (this commit): drain the driver block list on exit under each table's `flow_block_lock`.
