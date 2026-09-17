@@ -378,45 +378,6 @@ each so the open bug list stays honest.
   both patches against their upstream tarballs with the QoS hunks dropped; it
   needs a source fetch, which is why it is not bundled with the retirement.
 
-- [ ] **A147 — per-flow ingress policer rates have no surface in flowtable mode.**
-  **Stage 1 is done**: `tc matchall action police` on a clsact ingress block is
-  offloaded onto the port's own profile (`cdx_police.c`), proved `in_hw` and
-  metering on the rig — 20mbit measured 17.6, 50mbit measured 41.1, against 109
-  unpoliced. That restores the per-port rate. What remains is `flower`, which
-  must bind a filter to the eight per-flow profiles and to flows the flowtable
-  admitted. The rest of this entry is the original finding. A
-  flow can now *select* one of the eight FMAN RFC-2698 ingress profiles: the
-  class the conntrack mark carries has a third nibble, and `cdx_ft_hw_add()`
-  turns it into `iqid`/`iqid_valid`. Nothing can configure what those profiles
-  do. `comcerto_fpp_send_command()` refuses every FCI family when
-  `cdx_flowtable_enabled()` (`cdx/cdx_cmdhandler.c:208`), `FC_QM` included, and
-  `/dev/cdx_ctrl` is not a route to them — its table carries
-  `CDX_CTRL_DPA_SET_PARAMS`, `CDX_CTRL_DPA_INIT_CHECK` and a debug MURAM read
-  and nothing else. (The QoS design's option C claimed the QM family was
-  unsealed; it is not, and that claim is corrected in the doc.) So the two
-  halves of a proof cannot meet in one boot: flowtable mode classifies but
-  cannot set a rate, and CMM mode can set a rate but no longer classifies.
-  Selecting an unconfigured profile is inert rather than a silent drop —
-  `cdx_get_policer_profile_id()` answers zero unless the profile is enabled and
-  the encoder then leaves `PREEMPT_POLICE_PKT` clear — which is why the
-  selection ships ahead of this.
-  **Decided: offload `FLOW_ACTION_POLICE`** via `TC_SETUP_BLOCK`, which
-  `cdx_setup_tc()` does not handle today. `flow_action_entry.police` maps
-  nearly one-to-one onto the RFC-2698 profile — `rate_bytes_ps` to CIR,
-  `peakrate_bytes_ps` to PIR, `burst` to CBS, `exceed.act_id` to the red action
-  — differing only in unit (bytes/s in, Kbit/s out). Stage 1 is `matchall`,
-  which needs no correlation and restores the per-port rate; stage 2 is
-  `flower`, which must record the filter and consult it at admission so
-  `cdx_ft_hw_add()` sets `iqid` to the profile that filter allocated. Seven
-  meters are available for distinct actions; an eighth returns `-EOPNOTSUPP`
-  and stays in software. Profile 0 is reserved as the default for everything
-  unclassified — it is not one slot of eight, because the hardware encoder
-  starts there and only an `iqid`-carrying mark moves it.
-  Rejected: a module param and the policy JSON (both ASK-private vocabularies),
-  and unsealing `FC_QM` — `fci` is not even loaded in flowtable mode and cmm,
-  the only FCI client, does not run there, so it would need a new client
-  packaged for three distributions. Full reasoning in
-  [the QoS design](docs/flowtable-qos.md#ingress-policing-through-tc-in-outline).
 
 ---
 
@@ -1245,6 +1206,12 @@ file's git history.
 - [x] **A145.** `cpe_fp_tx()` confirmed on a frame queue chosen by class-queue id rather than
   by sending Tx queue, so every DSCP-classified frame confirmed on `conf_fqs[0]` whichever core sent it —
   fixed (this commit): index by `skb_get_queue_mapping()`, which is what the non-CEETM branch already used.
+
+- [x] **A147.** Ingress policer rates had no surface in flowtable mode (the FCI
+  family that reaches them is sealed and its only client does not run there) —
+  fixed (this commit): `tc action police` offloads via `TC_SETUP_BLOCK`, `matchall`
+  onto the port profile and `flower` onto the seven per-flow profiles, bound to
+  flows at admission; the per-flow path was also discarding the caller's burst.
 
 - [x] **A148.** Unload left the flow_block_cb of a direct bind in a live flowtable, so the next
   offload work called freed module text (`flow_offload_work_handler` oops) — latent since the

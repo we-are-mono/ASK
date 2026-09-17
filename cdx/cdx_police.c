@@ -30,9 +30,12 @@
 #include <linux/rtnetlink.h>
 #include <net/flow_offload.h>
 #include <net/pkt_cls.h>
+#include <linux/spinlock.h>
 #include "cdx.h"
 #include "misc.h"
+#include "cdx_ioctl.h"
 #include "cdx_common.h"
+#include "cdx_flowtable_backend.h"
 #include "cdx_police.h"
 
 /* Bytes per second as tc counts them, to the Kbit/s the profile is programmed
@@ -81,6 +84,40 @@ static int cdx_police_check(const struct flow_action_entry *act,
 	return 0;
 }
 
+/* The action's rates in the profile's own units. Byte mode is Kbit/s, packet
+ * mode is packets per second; the two are never mixed, which cdx_police_check()
+ * has already established. */
+static int cdx_police_rates(const struct flow_action_entry *act,
+			    struct netlink_ext_ack *extack, bool *byte_mode,
+			    u32 *cir, u32 *pir, u32 *cbs, u32 *pbs)
+{
+	*byte_mode = act->police.rate_bytes_ps != 0;
+	if (*byte_mode) {
+		*cir = cdx_police_bytes_to_kbits(act->police.rate_bytes_ps);
+		/* RFC-2698 requires the peak rate to be at least the committed
+		 * one. tc lets an operator omit it, meaning "no second rate",
+		 * which this profile spells as the two being equal. */
+		*pir = act->police.peakrate_bytes_ps ?
+			cdx_police_bytes_to_kbits(act->police.peakrate_bytes_ps) : *cir;
+		*cbs = act->police.burst;
+		*pbs = act->police.burst;
+	} else {
+		*cir = (u32)act->police.rate_pkt_ps;
+		*pir = *cir;
+		*cbs = (u32)act->police.burst_pkt;
+		*pbs = *cbs;
+	}
+	if (*pir < *cir) {
+		NL_SET_ERR_MSG_MOD(extack, "police: peakrate must be at least rate");
+		return -EOPNOTSUPP;
+	}
+	if (!*cir) {
+		NL_SET_ERR_MSG_MOD(extack, "police: rate rounds to zero at this profile's resolution");
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 static int cdx_police_replace(struct net_device *dev,
 			      struct tc_cls_matchall_offload *f)
 {
@@ -104,30 +141,9 @@ static int cdx_police_replace(struct net_device *dev,
 	if (rc)
 		return rc;
 
-	byte_mode = act->police.rate_bytes_ps != 0;
-	if (byte_mode) {
-		cir = cdx_police_bytes_to_kbits(act->police.rate_bytes_ps);
-		/* RFC-2698 requires the peak rate to be at least the committed
-		 * one. tc lets an operator omit it, meaning "no second rate",
-		 * which this profile spells as the two being equal. */
-		pir = act->police.peakrate_bytes_ps ?
-			cdx_police_bytes_to_kbits(act->police.peakrate_bytes_ps) : cir;
-		cbs = act->police.burst;
-		pbs = act->police.burst;
-	} else {
-		cir = (u32)act->police.rate_pkt_ps;
-		pir = cir;
-		cbs = (u32)act->police.burst_pkt;
-		pbs = cbs;
-	}
-	if (pir < cir) {
-		NL_SET_ERR_MSG_MOD(extack, "police: peakrate must be at least rate");
-		return -EOPNOTSUPP;
-	}
-	if (!cir) {
-		NL_SET_ERR_MSG_MOD(extack, "police: rate rounds to zero at this profile's resolution");
-		return -EOPNOTSUPP;
-	}
+	rc = cdx_police_rates(act, extack, &byte_mode, &cir, &pir, &cbs, &pbs);
+	if (rc)
+		return rc;
 
 	if (cdx_port_police_set(dev->name, byte_mode, cir, pir, cbs, pbs) != SUCCESS) {
 		NL_SET_ERR_MSG_MOD(extack, "police: the port has no rate limiter");
@@ -154,14 +170,321 @@ static int cdx_police_matchall(struct net_device *dev,
 	}
 }
 
+/* ---- flower: a meter for a subset of the port's traffic ----------------
+ *
+ * matchall and the port profile describe the same frames, so one can simply be
+ * the other. A flower filter does not: it names a 5-tuple, and the hardware
+ * selects a per-flow profile through the `iqid` in a flowtable entry's own
+ * action. The filter and the entry are created by different subsystems and
+ * neither knows about the other, so the binding has to be made here --
+ * remember what each filter matched, and consult that when a flow is admitted.
+ *
+ * The lookup runs once per admitted flow, not per frame.
+ */
+struct cdx_police_filter {
+	struct list_head	list;
+	struct net_device	*dev;
+	unsigned long		cookie;
+	u8			profile;	/* 1..CDX_FT_QOS_MAX_POLICER */
+	u8			family;		/* AF_INET or AF_INET6 */
+	u8			proto;
+	bool			proto_masked;
+	union nf_inet_addr	src, src_mask, dst, dst_mask;
+	__be16			sport, sport_mask, dport, dport_mask;
+};
+
+static LIST_HEAD(cdx_police_filters);
+static DEFINE_SPINLOCK(cdx_police_lock);
+/* Profile 0 is the default every unclassified flow already meters against, so
+ * the pool starts at 1. Bit n set means profile n is spoken for. */
+static unsigned long cdx_police_profiles;
+
+static int cdx_police_profile_get(void)
+{
+	unsigned int n;
+
+	for (n = 1; n <= CDX_FT_QOS_MAX_POLICER; n++)
+		if (!(cdx_police_profiles & BIT(n))) {
+			cdx_police_profiles |= BIT(n);
+			return n;
+		}
+	return -ENOSPC;
+}
+
+static void cdx_police_profile_put(unsigned int n)
+{
+	cdx_police_profiles &= ~BIT(n);
+}
+
+/* A field the filter did not constrain has a zero mask and matches anything,
+ * which is what flower means by leaving it out. */
+static bool cdx_police_addr_eq(const union nf_inet_addr *a,
+			       const union nf_inet_addr *key,
+			       const union nf_inet_addr *mask)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		if ((a->all[i] & mask->all[i]) != (key->all[i] & mask->all[i]))
+			return false;
+	return true;
+}
+
+static bool cdx_police_filter_matches(const struct cdx_police_filter *f,
+				      const struct cdx_ft_rule *rule)
+{
+	/* The filter sits on one port's ingress, and a flowtable direction
+	 * arrives on exactly one port. */
+	if (f->dev != rule->in || f->family != rule->family)
+		return false;
+	if (f->proto_masked && f->proto != rule->proto)
+		return false;
+	if ((rule->sport & f->sport_mask) != (f->sport & f->sport_mask))
+		return false;
+	if ((rule->dport & f->dport_mask) != (f->dport & f->dport_mask))
+		return false;
+	return cdx_police_addr_eq(&rule->src, &f->src, &f->src_mask) &&
+	       cdx_police_addr_eq(&rule->dst, &f->dst, &f->dst_mask);
+}
+
+/* The profile an admitted flow should meter against, as a cdx_ft_rule.qos
+ * policer nibble, or zero for the default. First match wins: tc evaluates
+ * filters in priority order and hands them over in that order, so the first
+ * one recorded is the first one that would have matched in software.
+ */
+u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
+{
+	const struct cdx_police_filter *f;
+	unsigned long flags;
+	u8 profile = 0;
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	list_for_each_entry(f, &cdx_police_filters, list)
+		if (cdx_police_filter_matches(f, rule)) {
+			profile = f->profile;
+			break;
+		}
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	return profile;
+}
+
+/* Only the keys that make a 5-tuple. Anything else -- VLAN, MPLS, a TCP flag --
+ * would select frames the hardware cannot distinguish at this point, and
+ * accepting it would meter a wider set than the operator described. */
+static int cdx_police_parse(struct flow_cls_offload *f,
+			    struct cdx_police_filter *out)
+{
+	struct netlink_ext_ack *extack = f->common.extack;
+	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct flow_match_control control;
+	struct flow_match_basic basic;
+	unsigned long long used;
+	const unsigned long long allowed =
+		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
+		BIT_ULL(FLOW_DISSECTOR_KEY_PORTS) |
+		BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS) |
+		BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS);
+
+	used = rule->match.dissector->used_keys;
+	if (used & ~allowed) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: only the 5-tuple keys are supported");
+		return -EOPNOTSUPP;
+	}
+	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL)) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: a control key is required");
+		return -EOPNOTSUPP;
+	}
+	flow_rule_match_control(rule, &control);
+	if (control.mask->flags) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: fragment matching is not supported");
+		return -EOPNOTSUPP;
+	}
+	if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+		out->family = AF_INET;
+	else if (control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS)
+		out->family = AF_INET6;
+	else {
+		NL_SET_ERR_MSG_MOD(extack, "flower: an IPv4 or IPv6 address type is required");
+		return -EOPNOTSUPP;
+	}
+
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
+		flow_rule_match_basic(rule, &basic);
+		if (basic.mask->ip_proto) {
+			if (basic.mask->ip_proto != 0xff) {
+				NL_SET_ERR_MSG_MOD(extack, "flower: a partial protocol mask is not supported");
+				return -EOPNOTSUPP;
+			}
+			out->proto = basic.key->ip_proto;
+			out->proto_masked = true;
+		}
+	}
+	if (out->family == AF_INET) {
+		struct flow_match_ipv4_addrs ipv4;
+
+		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
+			flow_rule_match_ipv4_addrs(rule, &ipv4);
+			out->src.ip = ipv4.key->src;
+			out->src_mask.ip = ipv4.mask->src;
+			out->dst.ip = ipv4.key->dst;
+			out->dst_mask.ip = ipv4.mask->dst;
+		}
+	} else {
+		struct flow_match_ipv6_addrs ipv6;
+
+		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV6_ADDRS)) {
+			flow_rule_match_ipv6_addrs(rule, &ipv6);
+			memcpy(&out->src.in6, &ipv6.key->src, sizeof(out->src.in6));
+			memcpy(&out->src_mask.in6, &ipv6.mask->src, sizeof(out->src_mask.in6));
+			memcpy(&out->dst.in6, &ipv6.key->dst, sizeof(out->dst.in6));
+			memcpy(&out->dst_mask.in6, &ipv6.mask->dst, sizeof(out->dst_mask.in6));
+		}
+	}
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+		struct flow_match_ports ports;
+
+		flow_rule_match_ports(rule, &ports);
+		out->sport = ports.key->src;
+		out->sport_mask = ports.mask->src;
+		out->dport = ports.key->dst;
+		out->dport_mask = ports.mask->dst;
+	}
+	return 0;
+}
+
+static int cdx_police_flower_replace(struct net_device *dev,
+				     struct flow_cls_offload *f)
+{
+	struct netlink_ext_ack *extack = f->common.extack;
+	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct cdx_police_filter *filter;
+	const struct flow_action_entry *act;
+	u32 cir, pir, cbs, pbs;
+	unsigned long flags;
+	bool byte_mode;
+	int profile, rc;
+
+	if (!flow_offload_has_one_action(&rule->action)) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: exactly one action is supported");
+		return -EOPNOTSUPP;
+	}
+	act = &rule->action.entries[0];
+	if (act->id != FLOW_ACTION_POLICE) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: only police is supported");
+		return -EOPNOTSUPP;
+	}
+	rc = cdx_police_check(act, extack);
+	if (rc)
+		return rc;
+	rc = cdx_police_rates(act, extack, &byte_mode, &cir, &pir, &cbs, &pbs);
+	if (rc)
+		return rc;
+	/* The per-flow profiles are programmed in byte mode; a packet-rate
+	 * meter would need the whole pool switched over, which is not a
+	 * per-filter decision. */
+	if (!byte_mode) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: a packet rate is only supported port-wide");
+		return -EOPNOTSUPP;
+	}
+
+	filter = kzalloc(sizeof(*filter), GFP_KERNEL);
+	if (!filter)
+		return -ENOMEM;
+	filter->dev = dev;
+	filter->cookie = f->cookie;
+	rc = cdx_police_parse(f, filter);
+	if (rc)
+		goto err_free;
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	profile = cdx_police_profile_get();
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	if (profile < 0) {
+		/* Seven meters, and the eighth caller is told so rather than
+		 * silently sharing one. tc then leaves the filter in software. */
+		NL_SET_ERR_MSG_MOD(extack, "flower: no ingress policer profile is free");
+		rc = -EOPNOTSUPP;
+		goto err_free;
+	}
+	filter->profile = profile;
+
+	if (cdx_ingress_enable_or_disable_qos(FMAN_INDEX, profile,
+					      ENABLE_INGRESS_POLICER) != SUCCESS ||
+	    cdx_ingress_policer_modify_config(FMAN_INDEX, profile,
+					      cir, pir, cbs, pbs) != SUCCESS) {
+		NL_SET_ERR_MSG_MOD(extack, "flower: the ingress policer profile could not be programmed");
+		rc = -EINVAL;
+		goto err_profile;
+	}
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	list_add_tail(&filter->list, &cdx_police_filters);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	return 0;
+
+err_profile:
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	cdx_police_profile_put(profile);
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+err_free:
+	kfree(filter);
+	return rc;
+}
+
+static int cdx_police_flower_destroy(struct net_device *dev,
+				     struct flow_cls_offload *f)
+{
+	struct cdx_police_filter *filter, *next;
+	unsigned long flags;
+	u8 profile = 0;
+
+	spin_lock_irqsave(&cdx_police_lock, flags);
+	list_for_each_entry_safe(filter, next, &cdx_police_filters, list)
+		if (filter->dev == dev && filter->cookie == f->cookie) {
+			profile = filter->profile;
+			cdx_police_profile_put(profile);
+			list_del(&filter->list);
+			break;
+		}
+	spin_unlock_irqrestore(&cdx_police_lock, flags);
+	if (!profile)
+		return -ENOENT;
+	/* Turn the meter off before the profile can be handed to another
+	 * filter, so a flow still naming it passes rather than meets somebody
+	 * else's rate. Flows admitted under it keep naming it until they are
+	 * reinstalled, which is the same contract the conntrack mark has. */
+	cdx_ingress_enable_or_disable_qos(FMAN_INDEX, profile,
+					  DISABLE_INGRESS_POLICER);
+	kfree(filter);
+	return 0;
+}
+
+static int cdx_police_flower(struct net_device *dev, struct flow_cls_offload *f)
+{
+	switch (f->command) {
+	case FLOW_CLS_REPLACE:
+		return cdx_police_flower_replace(dev, f);
+	case FLOW_CLS_DESTROY:
+		return cdx_police_flower_destroy(dev, f);
+	default:
+		/* Statistics need the per-colour counters, as matchall's do. */
+		return -EOPNOTSUPP;
+	}
+}
+
 static int cdx_police_block_cb(enum tc_setup_type type, void *type_data,
 			       void *cb_priv)
 {
 	struct net_device *dev = cb_priv;
 
-	if (type != TC_SETUP_CLSMATCHALL)
+	switch (type) {
+	case TC_SETUP_CLSMATCHALL:
+		return cdx_police_matchall(dev, type_data);
+	case TC_SETUP_CLSFLOWER:
+		return cdx_police_flower(dev, type_data);
+	default:
 		return -EOPNOTSUPP;
-	return cdx_police_matchall(dev, type_data);
+	}
 }
 
 static LIST_HEAD(cdx_police_block_list);

@@ -802,11 +802,18 @@ int cdxdrv_modify_ingress_qos_policer_profile(struct cdx_fman_info *finfo, uint3
 		/*set algorithm mode as bytes/sec */
 		Params.nonPassthroughAlgParams.rateMode = e_FM_PCD_PLCR_BYTE_MODE;
 		Params.nonPassthroughAlgParams.committedInfoRate = cir;
-		Params.nonPassthroughAlgParams.committedBurstSize = DEFAULT_INGRESS_BYTE_MODE_CBS;
-		cbs = DEFAULT_INGRESS_BYTE_MODE_CBS;
+		/* Honour the caller's burst. This used to force the default of
+		 * 2000 bytes whatever was asked for -- barely one frame, so a
+		 * TCP flow lost enough of every window to collapse rather than
+		 * settle at the rate. The FCI path passes zero and still gets
+		 * the default. */
+		if (!cbs)
+			cbs = DEFAULT_INGRESS_BYTE_MODE_CBS;
+		if (!pbs)
+			pbs = DEFAULT_INGRESS_BYTE_MODE_PBS;
+		Params.nonPassthroughAlgParams.committedBurstSize = cbs;
 		Params.nonPassthroughAlgParams.peakOrExcessInfoRate = pir;
-		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = DEFAULT_INGRESS_BYTE_MODE_PBS;
-		pbs = DEFAULT_INGRESS_BYTE_MODE_PBS;
+		Params.nonPassthroughAlgParams.peakOrExcessBurstSize = pbs;
 		Params.nonPassthroughAlgParams.byteModeParams.frameLengthSelection = e_FM_PCD_PLCR_FULL_FRM_LEN;
 		Params.nonPassthroughAlgParams.byteModeParams.rollBackFrameSelection = e_FM_PCD_PLCR_ROLLBACK_FULL_FRM_LEN;
 	}
