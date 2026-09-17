@@ -11,6 +11,11 @@
  * the hardware selects a profile per flowtable entry. Neither subsystem knows
  * about the other, so the lookup here is the whole of the correspondence and
  * a wrong answer silently meters the wrong traffic.
+ *
+ * The third is the accounting. The hardware keeps running totals with more
+ * than one reader and tc accumulates deltas, so the arithmetic between them --
+ * including what a counter going backwards means -- is the part that decides
+ * whether a reported drop count is the truth.
  */
 #include <assert.h>
 #include <stdbool.h>
@@ -134,18 +139,40 @@ static bool flow_rule_match_key(const struct flow_rule *r, unsigned key)
 #define flow_rule_match_ipv6_addrs(r, m) do { (m)->key = &(r)->ipv6; (m)->mask = &(r)->ipv6_mask; } while (0)
 #define flow_rule_match_ports(r, m) do { (m)->key = &(r)->ports; (m)->mask = &(r)->ports_mask; } while (0)
 
+/* What a driver hands back on a stats command, and the accumulator tc keeps
+ * it in. The real flow_stats_update() adds rather than assigns, which is why
+ * the driver has to subtract a baseline before it gets here. */
+#define FLOW_ACTION_HW_STATS_IMMEDIATE 2
+struct flow_stats {
+    u64 pkts, bytes, drops, lastused;
+    unsigned used_hw_stats;
+    bool used_hw_stats_valid;
+};
+static unsigned long jiffies = 4294000000UL;
+static void flow_stats_update(struct flow_stats *s, u64 bytes, u64 pkts, u64 drops,
+                              u64 lastused, unsigned used_hw_stats)
+{
+    s->pkts += pkts; s->bytes += bytes; s->drops += drops;
+    if (lastused > s->lastused) s->lastused = lastused;
+    s->used_hw_stats |= used_hw_stats;
+    s->used_hw_stats_valid = true;
+}
+
 enum { TC_CLSMATCHALL_REPLACE, TC_CLSMATCHALL_DESTROY, TC_CLSMATCHALL_STATS };
 enum { FLOW_CLS_REPLACE, FLOW_CLS_DESTROY, FLOW_CLS_STATS };
 struct tc_cls_matchall_offload {
     struct { struct netlink_ext_ack *extack; } common;
     int command;
+    unsigned long cookie;
     struct flow_rule *rule;
+    struct flow_stats stats;
 };
 struct flow_cls_offload {
     struct { struct netlink_ext_ack *extack; } common;
     int command;
     unsigned long cookie;
     struct flow_rule *rule;
+    struct flow_stats stats;
 };
 static struct flow_rule *flow_cls_offload_flow_rule(struct flow_cls_offload *f)
 { return f->rule; }
@@ -175,6 +202,28 @@ static int cdx_port_police_set(const char *ifname, bool byte_mode,
     return SUCCESS;
 }
 static int cdx_port_police_clear(const char *ifname) { (void)ifname; hw.cleared = true; return SUCCESS; }
+
+/* The colours a profile counted. Free-running totals, as the hardware keeps
+ * them, so a case can move them the way traffic would -- or clear them the way
+ * the FCI query commands still can. */
+struct cdx_police_counters { u32 green, yellow, red; };
+static struct cdx_police_counters port_hw, prof_hw[CDX_FT_QOS_MAX_POLICER + 1];
+static bool counters_fail;
+static int cdx_port_police_counters(const char *ifname, struct cdx_police_counters *out)
+{
+    (void)ifname;
+    if (counters_fail) return FAILURE;
+    *out = port_hw;
+    return SUCCESS;
+}
+static int cdx_ingress_policer_counters(u32 fm, u32 queue_no, struct cdx_police_counters *out)
+{
+    assert(fm == FMAN_INDEX);
+    assert(queue_no >= 1 && queue_no <= CDX_FT_QOS_MAX_POLICER);
+    if (counters_fail) return FAILURE;
+    *out = prof_hw[queue_no];
+    return SUCCESS;
+}
 
 static struct { unsigned enabled, disabled, configured; u32 last_profile, cir, pir; } prof;
 static bool prof_fail;
@@ -210,15 +259,32 @@ static struct flow_action_entry base(void)
     return a;
 }
 
+/* One matchall filter, and the cookie tc would name it by. */
+#define MALL_COOKIE 0x5a5aUL
+
 static int offer(struct flow_action_entry act)
 {
     struct flow_rule rule = { .action = { .num_entries = 1 } };
     rule.action.entries[0] = act;
     struct tc_cls_matchall_offload f = {
-        .common = { .extack = &ack }, .command = TC_CLSMATCHALL_REPLACE, .rule = &rule };
+        .common = { .extack = &ack }, .command = TC_CLSMATCHALL_REPLACE,
+        .cookie = MALL_COOKIE, .rule = &rule };
     memset(&hw, 0, sizeof(hw));
     ack.msg = NULL;
     return cdx_police_matchall(&dev, &f);
+}
+
+static int mall_cmd(struct net_device *d, unsigned long cookie, int command,
+                    struct flow_stats *out)
+{
+    struct tc_cls_matchall_offload f = { .common = { .extack = &ack },
+        .command = command, .cookie = cookie };
+    int rc;
+
+    ack.msg = NULL;
+    rc = cdx_police_matchall(d, &f);
+    if (out) *out = f.stats;
+    return rc;
 }
 
 /* A flower filter on a v4 5-tuple, with every field exact unless masked out. */
@@ -250,12 +316,22 @@ static int flower_add(struct net_device *d, unsigned long cookie, struct flow_ru
     return cdx_police_flower(d, &f);
 }
 
-static int flower_del(struct net_device *d, unsigned long cookie)
+static int flower_cmd(struct net_device *d, unsigned long cookie, int command,
+                      struct flow_stats *out)
 {
     struct flow_cls_offload f = { .common = { .extack = &ack },
-        .command = FLOW_CLS_DESTROY, .cookie = cookie };
+        .command = command, .cookie = cookie };
+    int rc;
+
     ack.msg = NULL;
-    return cdx_police_flower(d, &f);
+    rc = cdx_police_flower(d, &f);
+    if (out) *out = f.stats;
+    return rc;
+}
+
+static int flower_del(struct net_device *d, unsigned long cookie)
+{
+    return flower_cmd(d, cookie, FLOW_CLS_DESTROY, NULL);
 }
 
 static struct cdx_ft_rule flow_on(struct net_device *d)
@@ -309,15 +385,55 @@ int main(void)
     a = base(); a.id = FLOW_ACTION_MANGLE;
     assert(offer(a) == -EOPNOTSUPP && !hw.set);
 
+    /* A port that cannot be programmed leaves nothing behind -- the record is
+     * allocated before the hardware is touched precisely so this path can
+     * hand it back, and the leak checker is what says it did. */
     hw_fail = true; assert(offer(base()) == -EINVAL); hw_fail = false;
-    {
-        struct tc_cls_matchall_offload f = {
-            .common = { .extack = &ack }, .command = TC_CLSMATCHALL_DESTROY };
-        memset(&hw, 0, sizeof(hw));
-        assert(cdx_police_matchall(&dev, &f) == 0 && hw.cleared);
-        f.command = TC_CLSMATCHALL_STATS;
-        assert(cdx_police_matchall(&dev, &f) == -EOPNOTSUPP);
-    }
+
+    /* ---- matchall: what the filter reports ---- */
+
+    /* Every offer above carried the same cookie, which is what tc does when
+     * it replays a filter onto a block callback that binds after it: the port
+     * is reprogrammed and the record is not duplicated. */
+    assert(offer(base()) == 0);
+
+    struct flow_stats s;
+    port_hw = (struct cdx_police_counters){ .green = 100, .yellow = 20, .red = 5 };
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    /* Green and yellow were enqueued, red was dropped, so the meter saw 125
+     * frames and discarded 5. No byte counter exists in the profile, so none
+     * is claimed rather than one being invented from an assumed frame size. */
+    assert(s.pkts == 125 && s.drops == 5 && s.bytes == 0);
+    assert(s.lastused == jiffies && s.used_hw_stats_valid);
+    assert(s.used_hw_stats == FLOW_ACTION_HW_STATS_IMMEDIATE);
+
+    /* Totals in, deltas out: tc adds up what it is given. */
+    port_hw.green += 10; port_hw.red += 2;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 12 && s.drops == 2);
+
+    /* Nothing moved, so nothing is reported -- and no claim is made about
+     * when the filter was last used. */
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 0 && s.drops == 0 && s.lastused == 0);
+
+    /* Another reader cleared the profile. What the counter now holds is the
+     * whole of the delta; reading a counter that went backwards as a 32-bit
+     * wrap would credit the filter with four billion frames it never saw. */
+    port_hw = (struct cdx_police_counters){ .green = 3, .yellow = 0, .red = 1 };
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == 0);
+    assert(s.pkts == 4 && s.drops == 1);
+
+    /* A cookie the driver never recorded gets no answer at all, rather than
+     * the port's numbers under somebody else's name. */
+    assert(mall_cmd(&dev, 999, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
+    counters_fail = true;
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -EINVAL);
+    counters_fail = false;
+
+    memset(&hw, 0, sizeof(hw));
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_DESTROY, NULL) == 0 && hw.cleared);
+    assert(mall_cmd(&dev, MALL_COOKIE, TC_CLSMATCHALL_STATS, &s) == -ENOENT);
 
     /* ---- flower: a meter for some of the port's flows ---- */
 
@@ -407,6 +523,56 @@ int main(void)
     fr = flower_rule();
     assert(flower_add(&dev, 6, &fr) == 0);
     assert(flower_del(&dev, 6) == 0);
+
+    /* ---- flower: the same accounting, on the profile the filter holds ---- */
+
+    fr = flower_rule();
+    assert(flower_add(&dev, 7, &fr) == 0);
+    unsigned mine = prof.last_profile;
+    fr = flower_rule(); fr.ports.dst = 7777;
+    assert(flower_add(&dev, 8, &fr) == 0);
+    unsigned theirs = prof.last_profile;
+    assert(mine != theirs);
+
+    prof_hw[mine] = (struct cdx_police_counters){ .green = 40, .yellow = 0, .red = 9 };
+    prof_hw[theirs] = (struct cdx_police_counters){ .green = 1, .yellow = 1, .red = 1 };
+    assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == 0);
+    assert(s.pkts == 49 && s.drops == 9 && s.bytes == 0);
+    /* Each filter reads the profile it was given and not its neighbour's. */
+    assert(flower_cmd(&dev, 8, FLOW_CLS_STATS, &s) == 0);
+    assert(s.pkts == 3 && s.drops == 1);
+
+    /* Baselines are per filter, so one reading its counters does not empty
+     * the other's. */
+    prof_hw[mine].red += 4;
+    assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == 0);
+    assert(s.pkts == 4 && s.drops == 4);
+    assert(flower_cmd(&dev, 8, FLOW_CLS_STATS, &s) == 0);
+    assert(s.pkts == 0 && s.drops == 0);
+
+    assert(flower_cmd(&dev, 4242, FLOW_CLS_STATS, &s) == -ENOENT);
+    assert(flower_cmd(&other, 7, FLOW_CLS_STATS, &s) == -ENOENT);
+    counters_fail = true;
+    assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == -EINVAL);
+    counters_fail = false;
+
+    assert(flower_del(&dev, 7) == 0);
+    assert(flower_cmd(&dev, 7, FLOW_CLS_STATS, &s) == -ENOENT);
+    assert(flower_del(&dev, 8) == 0);
+
+    /* The same profile is handed to the next filter, still holding everything
+     * the last one metered. A new filter reports what happened since it
+     * existed, not since the profile did. */
+    fr = flower_rule();
+    assert(flower_add(&dev, 9, &fr) == 0);
+    assert(prof.last_profile == mine);
+    assert(prof_hw[mine].green + prof_hw[mine].red > 0);
+    assert(flower_cmd(&dev, 9, FLOW_CLS_STATS, &s) == 0);
+    assert(s.pkts == 0 && s.drops == 0);
+    prof_hw[mine].green += 6;
+    assert(flower_cmd(&dev, 9, FLOW_CLS_STATS, &s) == 0);
+    assert(s.pkts == 6 && s.drops == 0);
+    assert(flower_del(&dev, 9) == 0);
 
     assert(!allocations);
     puts("Police: unit conversion, action validation, flower binding, "

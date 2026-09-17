@@ -1445,4 +1445,24 @@ int cdx_ingress_policer_stats(uint32_t fm_index,uint32_t queue_no,void *stats,ui
 
 	return 0;
 }
+
+/* The colours one ingress profile counted, without the FCI command structure
+ * around them. Read without clearing, so every other reader's baseline stays
+ * where it was; a caller wanting deltas keeps its own. */
+int cdx_ingress_policer_counters(uint32_t fm_index, uint32_t queue_no,
+				 struct cdx_police_counters *out)
+{
+	struct cdx_fman_info *finfo;
+
+	if (fm_index >= num_fmans || queue_no >= INGRESS_ALL_POLICER_QUEUES)
+		return FAILURE;
+
+	finfo = (fman_info + fm_index);
+
+	if (!finfo->ingress_policer_info[queue_no].handle)
+		return FAILURE;
+
+	cdx_plcr_colours(finfo->ingress_policer_info[queue_no].handle, out);
+	return SUCCESS;
+}
 #endif

@@ -558,6 +558,34 @@ int cdx_port_police_clear(char *ifname)
 	return port_plcr_set(ifname, port_ff_lim_mode, cir, pir, 0, 0);
 }
 
+/* The colours a profile counted, for a caller that has no FCI command
+ * structure to fill. Read without clearing: the counters have more than one
+ * reader, and clearing them here would move everyone else's baseline.
+ *
+ * Both of these reach FM_PCD_PlcrProfileGetCounter(), which may take the
+ * host-command path and busy-wait there, so neither is callable under a
+ * spinlock.
+ */
+void cdx_plcr_colours(void *handle, struct cdx_police_counters *out)
+{
+	uint32_t counterval[MAX_RATLIM_CNTR] = { 0 };
+
+	get_plcr_counter(handle, counterval, 0);
+	out->green = counterval[GREEN_TOTAL];
+	out->yellow = counterval[YELLOW_TOTAL];
+	out->red = counterval[RED_TOTAL];
+}
+
+int cdx_port_police_counters(char *ifname, struct cdx_police_counters *out)
+{
+	int hardwarePortId = dpa_get_iface_hwid_by_name_and_type(ifname, IF_TYPE_ETHERNET);
+
+	if (hardwarePortId == -1 || !port_rate_lim_mode[hardwarePortId].handle)
+		return FAILURE;
+	cdx_plcr_colours(port_rate_lim_mode[hardwarePortId].handle, out);
+	return SUCCESS;
+}
+
 void get_plcr_counter(void *handle, uint32_t *counterval, uint32_t clear)
 {
 	uint32_t ii;

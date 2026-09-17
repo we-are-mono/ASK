@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def function(source: str, name: str) -> str:
     """Lift one function definition out of a production source file."""
-    match = re.search(rf"^(?:static\s+)?[\w \*]+\b{name}\(", source, re.M)
+    # The line has to begin with a return type, not with the ` * ' of a comment
+    # continuation: a comment naming `foo()' above the definition of foo would
+    # otherwise be lifted instead, and the brace matching below would run from
+    # there to whatever it found next.
+    match = re.search(rf"^(?:static\s+)?\w[\w \*]*\b{name}\(", source, re.M)
     assert match, name
     end = source.index("{", match.start()) + 1
     depth = 1
@@ -31,18 +35,22 @@ def test_police_offload(tmp_path):
     # left out: it is block plumbing over kernel helpers the stub does not
     # model, and nothing it does is a decision worth pinning here.
     names = ["cdx_police_bytes_to_kbits", "cdx_police_check", "cdx_police_rates",
-             "cdx_police_replace", "cdx_police_matchall",
+             "cdx_police_delta", "cdx_police_report", "cdx_police_port_find",
+             "cdx_police_replace", "cdx_police_port_destroy",
+             "cdx_police_port_stats", "cdx_police_matchall",
              "cdx_police_profile_get", "cdx_police_profile_put",
              "cdx_police_addr_eq", "cdx_police_filter_matches",
-             "cdx_police_lookup", "cdx_police_parse",
+             "cdx_police_lookup", "cdx_police_filter_find", "cdx_police_parse",
              "cdx_police_flower_replace", "cdx_police_flower_destroy",
-             "cdx_police_flower"]
+             "cdx_police_flower_stats", "cdx_police_flower"]
     (tmp_path / "police_production.inc").write_text(
-        # The filter record and the state it lives in are file-scope, so they
-        # are sliced rather than lifted by name -- the lookup's answer depends
-        # on both.
-        source[source.index("struct cdx_police_filter {"):
-               source.index("static int cdx_police_profile_get")]
+        # The two records and the state they live in are file-scope, so they
+        # are sliced rather than lifted by name -- what a lookup answers and
+        # what a baseline holds depend on the state as much as the code.
+        source[source.index("static DEFINE_SPINLOCK(cdx_police_lock);"):
+               source.index("/* One counter's delta.")]
+        + source[source.index("struct cdx_police_filter {"):
+                 source.index("static int cdx_police_profile_get")]
         + "\n".join(function(source, name) for name in names))
     binary = tmp_path / "police"
     subprocess.run([
