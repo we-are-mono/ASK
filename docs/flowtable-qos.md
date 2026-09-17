@@ -1168,18 +1168,33 @@ does. `conntrack -F` is what forces re-admission in testing, and the stop →
 change → apply sequence is what does it in service. This is the same contract
 the mark already had, arriving from the other direction.
 
-loki sending through the DUT's LAN port, with the flowtable bound so the flow
-is genuinely in hardware:
+loki sending through the DUT's LAN port, with the flowtable bound.
+
+**Measure above the software path's ceiling, or the number proves nothing about
+where the policing happened.** Software forwarding tops out near 130 Mbit on
+this rig, so a 30 Mbit result shows only that *something* enforced the rate —
+the kernel could have. A multi-gigabit cap can be reached by an offloaded flow
+and nothing else, so one number proves the flow is in hardware *and* that the
+hardware meter is holding it:
+
+| `flower src_ip <loki> action police …` | goodput |
+| --- | --- |
+| no filter | 9414 Mbit/s |
+| `rate 5gbit burst 32m` | 4787 Mbit/s |
+| `rate 2gbit burst 32m` | 1930 Mbit/s |
+| filter removed | 9414 Mbit/s |
+
+Both caps land within 4% of what was asked for, at rates the CPU could not
+forward at all.
+
+Selectivity, at a rate where it is easy to read:
 
 | | goodput |
 | --- | --- |
-| offloaded, no filter | 9372 Mbit/s |
-| `flower src_ip <loki> action police rate 30mbit burst 1m` | 29.0 Mbit/s |
+| `rate 30mbit burst 1m`, filter naming loki | 29.0 Mbit/s |
 | same filter naming a different host | 9409 Mbit/s |
-| filter removed | 9402 Mbit/s |
 
-The middle two rows are the point: the meter reaches the flow the filter names
-and only that flow.
+The meter reaches the flow the filter names and only that flow.
 
 **The burst matters more than it looks, and the rig proved it twice.** The first
 attempt measured 0.00 Mbit/s — `cdxdrv_modify_ingress_qos_policer_profile()`
