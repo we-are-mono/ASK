@@ -99,6 +99,15 @@ def lan():
     """
     con = Console.lan()
     con.login(LAN_USER, LAN_PASSWORD)
+    # A getty hands out an 80-column terminal, and a command long enough to
+    # wrap comes back with its own echo folded into the output, where stripping
+    # it no longer matches and the caller parses the echo instead of the answer
+    # -- `ip -j link show dev <nic>` with its exit-code marker is already over
+    # the line. Widen the terminal rather than shorten every command: send it
+    # directly, because run() is the thing that cannot be trusted until it is
+    # set. Belongs here, not in a runbook step: a rebooted VM has 80 again.
+    con.send("stty cols 1000 rows 200\r")
+    con.sync_prompt()
     yield con
     con.close()
 
