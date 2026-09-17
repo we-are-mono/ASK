@@ -1622,7 +1622,7 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 	if (bo->command == FLOW_BLOCK_BIND) {
 		rearm = atomic_read(&ft_invalid);
 		if (!ft_ready || ft_stopping || cdx_ft_failed() || !cdx_ft_port_supported(dev) ||
-		    ft_bound >= 2 || (rearm && !ft_can_rearm())) {
+		    ft_bound >= CDX_FT_MAX_BINDINGS || (rearm && !ft_can_rearm())) {
 			rc = -EOPNOTSUPP;
 			goto out;
 		}
@@ -1729,7 +1729,11 @@ EXPORT_SYMBOL(cdx_ft_setup_tc);
 
 static void ft_invalidate_work(struct work_struct *work)
 {
-	struct net_device *devices[2];
+	/* Every bound device has to be flushed, and the flush has to happen
+	 * outside the transaction the binding list is walked under, so the walk
+	 * copies the list out first. Sized by the bound admission enforces, which
+	 * makes the guard below unreachable rather than a silently short flush. */
+	struct net_device *devices[CDX_FT_MAX_BINDINGS];
 	struct cdx_ft_binding *binding;
 	struct cdx_ft_entry *entry, *next;
 	unsigned int n = 0, i;

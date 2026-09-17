@@ -15,7 +15,8 @@ import pytest
 
 import ask_flowtable as policy
 
-BASE = {"version": 1, "enabled": True, "devices": ["eth3", "eth4"],
+ROOT = Path(__file__).resolve().parents[2]
+BASE ={"version": 1, "enabled": True, "devices": ["eth3", "eth4"],
         "scope": [{"source": "192.0.2.0/24", "destination": "198.51.100.2"}],
         "exclude": [{"protocol": "tcp", "port": 21}]}
 
@@ -29,10 +30,40 @@ BASE = {"version": 1, "enabled": True, "devices": ["eth3", "eth4"],
     {"exclude": [{"port": {"min": 100, "max": 1}}]},
     {"exclude": [{"mark": {"value": 16, "mask": 15}}]},
     {"exclude": [{"name": "an accidental wildcard"}]},
+    {"devices": ["eth3"]}, {"devices": []},
+    {"devices": [f"eth{i}" for i in range(policy.MAX_DEVICES + 1)]},
+    {"devices": ["eth3", "eth4", "eth3"]},
 ])
 def test_policy_rejects_invalid_configuration(change):
     with pytest.raises(policy.PolicyError):
         policy.validate({**copy.deepcopy(BASE), **change})
+
+
+def test_policy_accepts_a_port_per_bridge():
+    """A WAN and three bridged LANs is four devices, not a pair. Each names an
+    ingress; a direction's egress comes from the route, so nothing pairs them."""
+    gateway = {**copy.deepcopy(BASE), "devices": ["pppoe-wan", "br-lan", "br-guest", "br-iot"]}
+    assert policy.validate(gateway) is gateway
+    flowtable = next(line for line in policy.render(gateway).splitlines() if "flowtable fast" in line)
+    for device in gateway["devices"]:
+        assert f'"{device}"' in flowtable
+
+
+def test_policy_device_bound_matches_the_adapter():
+    """MAX_DEVICES restates CDX_FT_MAX_BINDINGS. Drift would refuse a policy
+    the adapter would have taken, or accept one it will only half bind."""
+    header = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
+    assert int(re.search(r"^#define CDX_FT_MAX_BINDINGS\s+(\d+)", header, re.M)[1]) == policy.MAX_DEVICES
+
+
+@pytest.mark.parametrize("reported, expected", [
+    ({"dev": ["eth3", "eth4"]}, ["eth3", "eth4"]),
+    ({"dev": "eth3"}, ["eth3"]),   # nft reports a lone device unwrapped
+    ({}, []),
+])
+def test_policy_reads_back_the_installed_devices(reported, expected):
+    contents = [{"table": {"name": policy.TABLE}}, {"flowtable": {"name": "fast", **reported}}]
+    assert policy.flowtable_devices(contents) == expected
 
 
 def test_policy_json_and_tuple_semantics(tmp_path):

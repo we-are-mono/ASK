@@ -21,6 +21,11 @@ CONFIG = Path("/etc/ask/flowtable.json")
 PROC = Path("/proc/cdx_flowtable")
 LOCK = Path("/run/lock/ask-flowtable.lock")
 DRAIN_FIELDS = ("bindings", "entries", "handle_refs", "neighbour_refs", "quarantine")
+# The adapter's own bound, CDX_FT_MAX_BINDINGS in cdx/cdx_flowtable_backend.h.
+# Restated here so an oversized policy is refused at check time, naming the
+# limit, rather than binding part of itself and rolling back. The kernel stays
+# the enforcer; a host test fails if the two numbers ever disagree.
+MAX_DEVICES = 40
 ADDRESS_FIELDS = {
     "source": "original ip saddr", "destination": "original ip daddr",
     "reply_source": "reply ip saddr", "reply_destination": "reply ip daddr",
@@ -93,9 +98,13 @@ def validate(policy):
     require(type(policy["version"]) is int and policy["version"] == 1, "unsupported configuration version")
     require(type(policy["enabled"]) is bool, "enabled: expected boolean")
     devices = policy["devices"]
-    require(isinstance(devices, list) and len(devices) == 2 and
+    # Two is a forwarding pair, and a gateway with a WAN and several bridged
+    # LANs needs one entry per port that forwards. Nothing pairs them: each
+    # names an ingress, and a direction's egress is resolved from the route.
+    require(isinstance(devices, list) and 2 <= len(devices) <= MAX_DEVICES and
             all(isinstance(d, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", d) for d in devices) and
-            devices[0] != devices[1], "devices: expected two distinct interface names")
+            len(set(devices)) == len(devices),
+            f"devices: expected 2 to {MAX_DEVICES} distinct interface names")
     for field in ("scope", "exclude"):
         require(isinstance(policy[field], list) and len(policy[field]) <= 256, field + ": expected at most 256 matches")
         for rule in policy[field]:
@@ -120,6 +129,18 @@ def load_policy(path):
         return validate(json.loads(data, object_pairs_hook=unique_object))
     except (ValueError, UnicodeError, RecursionError) as error:
         raise PolicyError("invalid JSON: " + str(error)) from error
+
+
+def flowtable_devices(contents):
+    """The devices the installed table's flowtable names, read back from nft
+    rather than from the policy file: status describes what is running, which
+    is the only thing the binding count can be compared against. A single
+    device is reported as a bare string and several as a list."""
+    for item in contents:
+        if "flowtable" in item:
+            devices = item["flowtable"].get("dev", [])
+            return [devices] if isinstance(devices, str) else list(devices)
+    return []
 
 
 def policy_hash(policy):
@@ -221,7 +242,8 @@ class Runtime:
         comment = table.get("comment", "")
         require(re.fullmatch(re.escape(MARKER) + r"[0-9a-f]{64}", comment),
                 "refusing to modify a table without this controller's ownership marker")
-        return {"hash": comment[len(MARKER):], "contents": contents}
+        return {"hash": comment[len(MARKER):], "contents": contents,
+                "devices": flowtable_devices(contents)}
 
     def state(self):
         return backend_state()
@@ -292,7 +314,8 @@ class Runtime:
         with self.locked():
             current, state = self.table(), self.state()
             return {"policy_installed": bool(current), "policy_hash": current["hash"] if current else None,
-                    "admission_ready": bool(current and state and state["bindings"] == 2 and
+                    "admission_ready": bool(current and state and current["devices"] and
+                                            state["bindings"] == len(current["devices"]) and
                                             not state["fatal"] and not state["invalidated"] and not state["observe"]),
                     "backend": state}
 

@@ -158,6 +158,11 @@ void cdx_ft_admission_end(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_admission_end, ASK_CDX_FLOWTABLE);
 
+/* The devices cdx_ft_port_supported() can admit are exactly the physical
+ * Ethernet onifs, and cdx_add_eth_onif() takes a phy_port slot for each one
+ * it creates. One binding per device therefore cannot outrun that table. */
+static_assert(CDX_FT_MAX_BINDINGS == MAX_PHY_PORTS);
+
 /* A port belonging to a switch ASIC would let the bridge mark a VLAN as
  * already stripped by hardware, which describes a tag the adapter's own
  * encoder is then expected to reproduce with nothing in the rule naming it.

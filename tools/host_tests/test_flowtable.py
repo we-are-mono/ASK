@@ -68,7 +68,12 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
 def test_flowtable_hardware_ownership(tmp_path):
     hardware = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     source = (ROOT / "cdx/cdx_flowtable_hw.c").read_text()
+    # The real port-table size, not a stub one: the backend asserts that the
+    # binding bound equals it, and an invented value would assert nothing.
+    system = re.search(r"^#define MAX_PHY_PORTS\s+\d+", (ROOT / "cdx/system.h").read_text(), re.M)
+    assert system
     (tmp_path / "hardware_types.inc").write_text(
+        system.group() + "\n" +
         hardware[hardware.index("#define CDX_FT_VLAN_MAX"):hardware.index("/* Process-context transactions")])
     (tmp_path / "physical_production.inc").write_text(
         function((ROOT / "cdx/devman.c").read_text(), "dpa_get_ifinfo_by_netdev") +

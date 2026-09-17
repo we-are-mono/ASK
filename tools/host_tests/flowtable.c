@@ -3383,6 +3383,48 @@ static void test_device_dependencies(void)
     assert(!ft_bound && !in.refs && !allocated && ft_installs == ft_deletes);
 }
 
+/* A real gateway binds one flowtable to every port that forwards: a WAN and
+ * three bridged LANs is four, and nothing pairs two bindings -- a direction's
+ * egress needs no binding of its own. Fill the table to its stated bound and
+ * check the paths that walk bindings rather than count them: admission is
+ * still one per device, and invalidation still flushes Netfilter's cache for
+ * every bound device, not for the first two it snapshots. */
+static void test_binding_capacity(void)
+{
+    struct net_device ports[CDX_FT_MAX_BINDINGS + 1];
+    unsigned i, before;
+
+    fixture();
+    assert(!ft_bound && !ft_count && !ft_invalid && !allocated);
+    for (i = 0; i < ARRAY_SIZE(ports); i++)
+        ports[i] = (struct net_device){ .ifindex = 1000 + (int)i, .mtu = 1500,
+            .type = ARPHRD_ETHER, .dev_addr = {2, 0, 0, 0, 1, (u8)i} };
+    for (i = 0; i < CDX_FT_MAX_BINDINGS; i++) {
+        assert(bind_device(&ports[i], FLOW_BLOCK_BIND) == 0);
+        assert(ft_bound == i + 1 && ports[i].refs == 1);
+        /* One binding per device, whatever the count is -- while there is
+         * room, since a full table refuses everything before it looks at
+         * which device is asking. */
+        if (ft_bound < CDX_FT_MAX_BINDINGS)
+            assert(bind_device(&ports[i], FLOW_BLOCK_BIND) == -EBUSY);
+        assert(ft_bound == i + 1 && ports[i].refs == 1);
+    }
+    /* Past the last port the backend could ever describe. */
+    assert(bind_device(&ports[i], FLOW_BLOCK_BIND) == -EOPNOTSUPP && !ports[i].refs);
+    assert(bind_device(&ports[0], FLOW_BLOCK_BIND) == -EOPNOTSUPP && ports[0].refs == 1);
+    before = flushed;
+    ft_invalidate();
+    ft_invalidate_work(NULL);
+    assert(flushed - before == CDX_FT_MAX_BINDINGS && ft_invalid_done);
+    for (i = 0; i < CDX_FT_MAX_BINDINGS; i++) {
+        assert(bind_device(&ports[i], FLOW_BLOCK_UNBIND) == 0);
+        assert(!ports[i].refs);
+    }
+    assert(!ft_bound && !allocated && ft_installs == ft_deletes);
+    ft_invalid = 0;
+    ft_invalid_done = false;
+}
+
 static void test_device_recovery(void)
 {
     struct net other_net;
@@ -3827,6 +3869,7 @@ int main(void)
     test_dnat();
     test_double_nat();
     test_device_dependencies();
+    test_binding_capacity();
     test_device_recovery();
     test_transient_admission();
     test_nexthop_objects();
