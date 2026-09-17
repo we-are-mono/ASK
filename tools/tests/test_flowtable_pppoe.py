@@ -794,6 +794,10 @@ async def test_flowtable_pppoe_ipv6_routed(pppoe_rig):
     what is new here belongs to the firmware.
     """
     r = pppoe_rig
+    # Errors accumulate for the life of the module, and the fault-injection
+    # cases in test_flowtable_offload.py raise some on purpose, so what this
+    # case can claim is that it added none of its own.
+    baseline = (await r.state())["errors"]
     await _offload_table6(r)
     # Nothing re-offers a flow on its own, so each attempt sends before it
     # looks; admission needs traffic and the reverse direction needs a reply.
@@ -824,7 +828,7 @@ async def test_flowtable_pppoe_ipv6_routed(pppoe_rig):
     assert set(before) == set(after), (before, state)
     delta = {c: after[c] - before[c] for c in before}
     assert all(d == 64 for d in delta.values()), (delta, state)
-    assert state["errors"] == 0, state
+    assert state["errors"] == baseline, (baseline, state)
     # And what the far end observed, which is where the protocol id was really
     # decided: the concentrator's stack had to parse the PPP frame before this
     # datagram could reach a socket at all.

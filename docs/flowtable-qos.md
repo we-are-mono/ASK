@@ -1843,19 +1843,12 @@ with no device bound twice (`cdx/ask_flowtable.c:1608`, `:1625`, `:1638`). It
 never reads the table's name and never consults ASK policy. Any flowtable can
 drive it — including OpenWrt's own.
 
-So the OpenWrt integration is not an ASK package at all:
-
-1. ship `option flow_offloading_hw '1'` as a mono profile default, which is a
-   `uci-defaults` script in a mono package — routine, but no such package
-   exists yet;
-2. fw4 resolves the offload devices from the live network configuration and
-   re-renders on every network reload;
-3. ASK binds.
-
-No Python on the box, no static device list, no hotplug integration. fw4
-already solves each of those for its own purposes, PPPoE and VLAN device
-naming included. Two details, read out of `firewall4-2025.03.17` in the
-OpenWrt tree rather than assumed, are what make it fit:
+That was first taken as the integration: set `flow_offloading_hw` by default,
+let fw4 declare the flowtable, and have ASK bind to it — no ASK package on the
+box at all. The route was abandoned for a better one (below), but the reading
+that produced it is worth keeping, because it is the same evidence that decides
+the alternative. Two details, read out of `firewall4-2025.03.17` in the OpenWrt
+tree rather than assumed:
 
 - `resolve_hw_offload_devices()` descends bridges and VLAN devices to their
   lower devices (`resolve_lower_devices()`, `fw4.uc:426`) before declaring the
@@ -1880,6 +1873,21 @@ The two bounded residuals — sub-minimum frames whose padding cannot be
 recovered from a total, and frames punted after their hit was counted — are
 documented in `docs/flowtable-architecture.md` rather than paid for by
 refusing to offload at all.
+
+Both survive the change of route. The cap is needed by any topology with more
+than two forwarding ports, whoever declares the table, and the counter refusal
+was wrong on its own terms: it rejected a flow over a per-frame constant, and
+any consumer that enables counters would have hit it.
+
+Both changes were proved together on the rig, with the ruleset fw4 would have
+written rather than one built to pass: a flowtable over three cabled ports
+declaring `counter;` and `flags offload;` reaches `bindings 3`, where the same
+ruleset was refused twice over before. Invalidating it with three bound —
+`ip link add link eth3 ... type vlan id 9`, which is a dependency change on a
+bound device — completed with `invalidation_done 1` and no kernel warning,
+which is the drain walking all three rather than the first two. Through the
+controller instead of by hand, a three-device policy applies to `bindings 3`
+and reports `admission_ready: true`.
 
 ### The clash, which is automatic rather than accidental
 
@@ -1912,28 +1920,47 @@ installs the software offload that takes every flow at priority 0.
 
 So ASK's controller holding its own table, while fw4 has any offloading
 enabled, degrades to the worst available outcome without anyone choosing it.
-The two models are exclusive, and that is the decision to write into whatever
-ships:
-
-| Who declares the flowtable | ASK policy | fw4 options |
-| --- | --- | --- |
-| fw4 (recommended for OpenWrt) | `enabled: false`, controller not used | `flow_offloading '1'`, `flow_offloading_hw '1'` |
-| ASK's controller | `enabled: true` | both off |
+Only one component can declare the flowtable, and on a board that offloads
+unconditionally the answer is ASK — which is what the fw4 patch below settles,
+by removing the other declarer rather than negotiating with it.
 
 One piece of good news, also verified rather than assumed: `fw4 reload` does
 not disturb a table it does not own. Its teardown is scoped — `flush table
 inet fw4` and `delete flowtable inet fw4 ft` — and there is no `flush ruleset`
 anywhere in the package.
 
-What remains unbuilt is the detection, and it is squarely ASK's: the
-controller should enumerate the flowtables on its devices, compare chain
-priorities, and refuse to `apply` while another table's chain runs earlier,
-naming the offender. It is small — `nft -j list ruleset`, compare, refuse —
-and it is the same requirement the [consumer contract](#the-consumer-contract)
-already states. It is deliberately left as a follow-up rather than done here,
-because its message depends on the ownership decision in the table above:
-"refuse" is right for the second row and wrong for the first, where an
-fw4-owned flowtable is not an offender but the intended configuration.
+### Resolved by patching fw4, not by ASK
+
+An earlier draft of this section prescribed detection on the ASK side: the
+controller enumerating flowtables on its devices, comparing chain priorities
+and refusing to `apply` while another table's chain runs earlier. That is not
+being built, and the reason is worth recording, because reading what LuCI
+actually does with these options settles it.
+
+LuCI presents one selector, "Flow offloading type", with three values
+(`luci-app-firewall/.../firewall/zones.js:80`): None, Software, Hardware.
+Hardware writes both options at once. On a board where ASK offloads
+unconditionally, every value of that selector is wrong: None gives hardware
+acceleration, Software replaces it with something slower, and Hardware fails
+fw4's probe and silently downgrades to the same slower thing. The best outcome
+is the default nobody chooses, and no amount of detection on our side makes
+that control mean what it says.
+
+Mono builds its own OpenWrt image and does not upstream it, so the fix belongs
+where the wrong assumption is. fw4 already has a vocabulary for an option that
+does not apply — `UNSUPPORTED`, used for `custom_chains` and `disable_ipv6`,
+which warns and drops the value (`fw4.uc:887`). Marking both offload options
+that way is two lines, and because `resolve_offload_devices()` is the single
+funnel for the flowtable and its `flow offload` rule alike, fw4 then declares
+no flowtable whatever the configuration says — no probe, no `-EBUSY`, no
+downgrade, and no ordering race for anyone to reason about. Setting the option
+by hand logs `option 'flow_offloading_hw' is not supported by fw4` rather than
+doing nothing quietly.
+
+That patch lives in the OpenWrt tree. **Nothing is owed by this repository**,
+which is why the controller keeps its current behaviour and gains no ownership
+check: with fw4 declaring nothing and Armbian declaring nothing, no supported
+consumer has a competing declarer left to detect.
 
 ### Transactional apply: withdrawn, and why
 

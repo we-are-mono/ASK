@@ -57,6 +57,20 @@ async def command(agent, session, *argv, check=True):
     return result
 
 
+async def ct_bytes(r):
+    """Bytes conntrack has accounted to the original direction of the flow.
+
+    The first bytes= in an extended listing is the original direction; the
+    second is the reply. Both the software fast path and a hardware delta land
+    here, which is what makes the two agreeing on units observable at all."""
+    listing = await command(r.target, r.session, "conntrack", "-L", "-p", r.proto,
+                            "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
+                            "--sport", str(SPORT), "--dport", str(DPORT), "-o", "extended")
+    counts = re.findall(r"bytes=(\d+)", listing["stdout"])
+    assert counts, listing
+    return int(counts[0])
+
+
 async def upper_roundtrip(r, dev):
     """Exercise unsupported upper-device topology, restoring it through UART."""
     temporary = "askftupper"
@@ -176,12 +190,16 @@ class Rig:
     async def nft(self, text):
         return await command(self.target, self.session, "nft", text)
 
-    async def table(self, hardware=True, counter=False):
+    async def table(self, hardware=True, counter=False, mark=None):
+        # A mark is set in the same rule that offers the flow, so admission
+        # sees it: it is how a test asks for a hardware decline that owes
+        # nothing to fault injection.
+        marking = f"ct mark set {mark:#x}" if mark else ""
         await self.nft(f'''table inet {TABLE} {{
  flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }};
  {"flags offload;" if hardware else ""} {"counter;" if counter else ""} }}
  chain forward {{ type filter hook forward priority 0; policy accept;
- ip saddr {self.lan_ip} ip daddr {WAN_IP} {self.proto} sport {SPORT} {self.proto} dport {DPORT} flow add @fast
+ ip saddr {self.lan_ip} ip daddr {WAN_IP} {self.proto} sport {SPORT} {self.proto} dport {DPORT} {marking} flow add @fast
  }}
 }}''')
         if hardware:
@@ -470,12 +488,29 @@ async def test_flowtable_offload_reference_and_lifecycle(rig):
     assert (await r.state())["entries"] == 0
     await r.delete_table()
     await r.clear_ct()
+    # A counter-enabled hardware table is admitted, and what reaches conntrack
+    # accounting is the frame Netfilter counts rather than the frame the
+    # classifier saw. A 256-byte payload is 298 bytes on the wire and 284 once
+    # the Ethernet header the software path never sees is taken off, so both
+    # paths agree and the total is the same whichever forwarded it.
     await r.table(counter=True)
-    before = await r.state()
-    await r.exchange()
-    rejected = await r.wait(lambda s: s["rejects"] > before["rejects"])
-    assert rejected["entries"] == 0 and rejected["installs"] == before["installs"], rejected
-    r.record("counter-declined", rejected)
+    await r.clear_ct()
+    payload, count = 256, 64
+    expected = count * (payload + 8 + 20)
+    # The whole flow, not a delta around a baseline. The first packets cross in
+    # software and the rest in hardware, and the total is the same either way --
+    # which is the point: the two now agree on what a frame is worth, so no part
+    # of this has to know where the boundary fell.
+    await r.exchange(count, payload_size=payload)
+    counted = await r.wait(lambda s: s["entries"] == 2)
+    total, deadline = None, time.monotonic() + 30
+    while time.monotonic() < deadline:
+        total = await ct_bytes(r)
+        if total >= expected:
+            break
+        await asyncio.sleep(0.5)
+    assert total == expected, (total, expected, counted, await r.state())
+    r.record("counter-accounted", {"bytes": total, "expected": expected, "state": await r.state()})
     await r.delete_table()
     await r.clear_ct()
     await r.table()

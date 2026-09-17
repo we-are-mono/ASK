@@ -253,7 +253,12 @@ async def test_flowtable_arp_software_fallback(rig):
         await r.exchange(32, promiscuous=False)  # Resolve both next hops first.
         await r.clear_ct()
         before = await r.state()
-        await r.table(counter=True)  # Hardware accounting is deliberately unsupported.
+        # A hardware table that declines this flow, so the decline itself is
+        # under test: a mark carrying a bit the adapter cannot honour. Taken
+        # from the running mask rather than assumed, and the lowest such bit,
+        # so the flow is refused whatever the boot configured.
+        outside = ~int(before["qos_mark_mask"]) & 0xffffffff
+        await r.table(mark=outside & -outside)
         await r.exchange(128, promiscuous=False)
         declined = await r.wait(lambda s: s["rejects"] > before["rejects"])
         assert declined["entries"] == declined["neighbour_refs"] == 0, declined
