@@ -168,7 +168,7 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		encap.ingress_stats_index = stats->in_session->rx_index;
 	if (stats->out_session)
 		encap.egress_stats_index = stats->out_session->tx_index;
-	/* The shared encoder reads this on its way to cdx_get_txfq(), which
+	/* The shared encoder reads this on its way to cdx_get_txfqid(), which
 	 * resolves the pair to a CEETM logical FQ and bakes that FQID into the
 	 * classifier action. Leaving it zero, as this backend did before, asks
 	 * for class queue zero of the port's least-priority channel — which

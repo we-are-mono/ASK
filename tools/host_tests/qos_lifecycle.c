@@ -408,19 +408,19 @@ int main(void)
     assert(cdx_enable_ceetm_on_iface(&iface) == 0);
     assert(cdx_enable_ceetm_on_iface(&iface) < 0);
     QM_context_ctl *ctx = &gQMCtx[port.portid];
-    assert(!ceetm_get_egressfq(ctx, 0, 0, 0));
-    assert(!ceetm_get_egressfq(NULL, 1, 0, 0));
+    assert(!ceetm_get_egressfq(ctx, 0, 0));
+    assert(!ceetm_get_egressfq(NULL, 1, 0));
     fail_at = step + 1;
     assert(ceetm_assign_chnl(ctx, 0) < 0);
     assert(!ctx->chnl_map && !qm_chnl_info[0].qm_ctx && list_empty(&lni.channels));
     fail_at = 0;
     assert(ceetm_assign_chnl(ctx, 0) == 0);
     assert(mapping_id == qm_chnl_info[0].channel->idx);
-    assert(ceetm_get_egressfq(ctx, 0, 0, 0) == &qm_chnl_info[0].cq_info[0].ceetmfq.egress_fq);
-    assert(!ceetm_get_egressfq(ctx, 2, 0, 0));
-    assert(!ceetm_get_egressfq(ctx, CDX_CEETM_MAX_CHANNELS + 1, 0, 0));
-    assert(!ceetm_get_egressfq(ctx, 1, MAX_SCHEDULER_QUEUES, 0));
-    assert(!ceetm_get_egressfq(&gQMCtx[0], 1, 0, 0));
+    assert(ceetm_get_egressfq(ctx, 0, 0) == &qm_chnl_info[0].cq_info[0].ceetmfq.egress_fq);
+    assert(!ceetm_get_egressfq(ctx, 2, 0));
+    assert(!ceetm_get_egressfq(ctx, CDX_CEETM_MAX_CHANNELS + 1, 0));
+    assert(!ceetm_get_egressfq(ctx, 1, MAX_SCHEDULER_QUEUES));
+    assert(!ceetm_get_egressfq(&gQMCtx[0], 1, 0));
     ctx->dscp_fq_map = kzalloc(sizeof(*ctx->dscp_fq_map), 0);
     dev.priv.ceetm_en = true;
     ctx->qos_enabled = true;
@@ -428,7 +428,7 @@ int main(void)
     assert(cdx_disable_ceetm_on_iface(&iface) == 0);
     assert(!dev.priv.ceetm_en && !dev.priv.qm_ctx && !ctx->chnl_map);
     assert(!qm_chnl_info[0].qm_ctx && list_empty(&qm_chnl_info[0].channel->node));
-    assert(!ceetm_get_egressfq(ctx, 0, 0, 0));
+    assert(!ceetm_get_egressfq(ctx, 0, 0));
     assert(!pop_calls && queries >= MAX_SCHEDULER_QUEUES);
     assert(!pending_enqueues && !pending_frames && !pending_erns);
     for (unsigned i = 0; i < MAX_SCHEDULER_QUEUES; i++)
