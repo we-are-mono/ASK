@@ -709,6 +709,20 @@ static int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler)
     return 0;
 }
 static void cdx_unregister_ft_setup_tc(void) { registered_setup_tc = 0; }
+/* The classifier CDX borrows so the software Tx path resolves a frame's class
+ * with the same function that gave the flow's hardware rule one. It is claimed
+ * and returned alongside the handler above, and a load that fails after taking
+ * it has to give both back. */
+static int registered_qos_class;
+typedef u8 (*cdx_ft_qos_class_fn)(u32 mark);
+static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
+{
+    assert(fn);
+    if (registered_qos_class) return -EBUSY;
+    registered_qos_class = 1;
+    return 0;
+}
+static void cdx_unregister_ft_qos_class(void) { registered_qos_class = 0; }
 /* What the encoder would write into the two PPPoE opcodes, recorded so a test
  * can require the index rather than the slot pointer: a direction that strips
  * counts into its session's receive half, one that inserts into the transmit
@@ -793,9 +807,19 @@ static int register_indirect(void)
 { assert(ft_ready); if (registration_fails()) return -ENOMEM; indirect_registered=true; return 0; }
 static void unregister_indirect(void)
 {
-    assert(indirect_registered && canceled == 2 && !cdx_info->ctrl.mutex);
-    assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered);
-    assert(!fdb_registered && !swdev_obj_registered);
+    assert(indirect_registered && !cdx_info->ctrl.mutex);
+    /* Unload gives this route back last, with both works cancelled and every
+     * notifier already gone. A load unwinding its own failure gives it back
+     * first and in the opposite order, with nothing yet scheduled to cancel,
+     * so the ordering below is the exit path's alone. ft_stopping tells them
+     * apart, and only exit sets it. */
+    if (ft_stopping) {
+        assert(canceled == 2);
+        assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered);
+        assert(!fdb_registered && !swdev_obj_registered);
+    } else {
+        assert(!canceled);
+    }
     while (ft_block_list.next != &ft_block_list) {
         struct flow_block_cb *cb = list_entry(ft_block_list.next, struct flow_block_cb, driver_list);
         list_del(&cb->driver_list); list_del(&cb->list);
@@ -3464,6 +3488,16 @@ static void test_registration(void)
         assert(!ft_ready && !ft_proc && !backend_claimed && !cdx_info->ctrl.mutex);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
         assert(!fdb_registered && !swdev_obj_registered);
+    }
+    /* The two registrations CDX holds fail with -EBUSY rather than -ENOMEM,
+     * and the second one failing has to give the first back: a module that
+     * left the driver's ndo pointing into it would be unloadable text on the
+     * flowtable's binding path. */
+    for (ft_init_fail_stage=9; ft_init_fail_stage<=10; ft_init_fail_stage++) {
+        ft_ready=ft_stopping=false; registration_step=canceled=0;
+        assert(ask_flowtable_init() == -EBUSY);
+        assert(!registered_setup_tc && !registered_qos_class);
+        assert(!ft_ready && !ft_proc && !backend_claimed && !indirect_registered);
     }
     ft_init_fail_stage=0;
     /* Fatal deletion on exit still waits for quiescence. Reload is refused. */

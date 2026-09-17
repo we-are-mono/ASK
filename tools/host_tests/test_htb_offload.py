@@ -36,13 +36,16 @@ def test_htb_offload(tmp_path):
     # are needed and the compiler catches a call to something not yet defined.
     names = [
         "cdx_htb_entry", "cdx_htb_port_of", "cdx_htb_find", "cdx_htb_find_qid",
-        "cdx_htb_channel_owned", "cdx_htb_channel_get", "cdx_htb_cq_get",
+        "cdx_htb_channel_owned", "cdx_htb_publish", "cdx_htb_resize",
+        "cdx_htb_channel_get", "cdx_htb_cq_get",
         "cdx_htb_cq_configure", "cdx_htb_cq_release", "cdx_htb_cq_restore",
         "cdx_htb_shape", "cdx_htb_class_free", "cdx_htb_qid_free",
         "cdx_htb_create", "cdx_htb_destroy", "cdx_htb_leaf_alloc",
         "cdx_htb_leaf_to_inner", "cdx_htb_leaf_del", "cdx_htb_leaf_del_last",
         "cdx_htb_node_modify", "cdx_htb_query_queue", "cdx_htb_setup_tc",
-        "cdx_htb_port_gone", "cdx_register_ft_setup_tc",
+        "cdx_htb_port_gone", "cdx_register_ft_qos_class",
+        "cdx_unregister_ft_qos_class", "cdx_htb_select_queue", "cdx_htb_txq_fq",
+        "cdx_register_ft_setup_tc",
         "cdx_unregister_ft_setup_tc", "cdx_setup_tc", "cdx_htb_init",
         "cdx_htb_exit",
     ]

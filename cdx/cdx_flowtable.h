@@ -23,6 +23,17 @@ typedef int (*cdx_ft_setup_tc_handler)(struct net_device *dev,
 int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler);
 void cdx_unregister_ft_setup_tc(void);
 
+/* The adapter's own classifier: a conntrack mark in, an egress class out.
+ *
+ * Registered so the software Tx path resolves a frame's class with the very
+ * function that decided the class of the hardware rule for the same flow.
+ * Deriving it twice from the same mark would still be two decodes to keep in
+ * step; this is one. Unregistered, the software path expresses no opinion and
+ * behaves as it did before there was a qdisc. */
+typedef u8 (*cdx_ft_qos_class_fn)(u32 mark);
+int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn);
+void cdx_unregister_ft_qos_class(void);
+
 bool cdx_flowtable_enabled(void);
 int cdx_flowtable_mode_check(void);
 int cdx_flowtable_guard_init(void);
