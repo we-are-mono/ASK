@@ -37,7 +37,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | ---: | --- | ---: | ---: | --- | --- | --- |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Partial — `FLOW_OFFLOAD_XMIT_XFRM` | High | The xmit type exists, but SA handling, rekey and ESN live entirely in CDX. |
-| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | The flowtable is unicast-conntrack by construction. Needs a parallel replication path rather than a flowtable feature. |
+| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | **Required, and scheduled directly after IPsec.** The flowtable is unicast-conntrack by construction, so this needs a parallel replication path rather than a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
@@ -329,6 +329,23 @@ what it holds.
 **Items 10, 11 and 12 need a scoping decision first.** RTP relay and Wi-Fi
 offload have no Linux counterpart at all, so the question is whether the
 product still needs them, not how to port them.
+
+**The order is IPsec, then multicast.** Both are decided rather than open, and
+the reasoning for each is worth keeping so neither is re-litigated.
+
+IPsec goes first because it is the larger body of live functionality: eight
+test files exercise it, `FLOW_OFFLOAD_XMIT_XFRM` already exists as the xmit
+type, the hardware questions were answered by A24a and A15, and the QoS work
+has already registered `devlink trap policer 2` — the SEC meter — which meters
+nothing until IPsec lands and is deliberately ungated so nothing has to be
+remembered when it does.
+
+Multicast follows, and the question of whether it is needed at all is now
+**closed: it is.** It runs in production on a Gateway Development Kit under
+CMM, so it is not a capability to add but behaviour to preserve, and retirement
+cannot complete without it. Earlier revisions of this file left that open
+pending an answer about IPTV; the answer is yes, and the absence of any
+`test_mcast*` in the suite is a gap in coverage rather than evidence of disuse.
 
 **QoS is no longer the critical path.** Its three build features are compiled
 in, but `/etc/config/cmmqos` ships with `enabled '0'` and nothing sends
