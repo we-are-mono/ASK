@@ -36,7 +36,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | # | Subsystem | Lines | FCI cmds | Linux mechanism | Effort | Notes |
 | ---: | --- | ---: | ---: | --- | --- | --- |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
-| 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Partial — `FLOW_OFFLOAD_XMIT_XFRM` | High | The xmit type exists, but SA handling, rekey and ESN live entirely in CDX. |
+| 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | Scoped: see the [IPsec design](flowtable-ipsec.md). Smaller than it read: the shared encoder already carries the SEC action and `ipsec_init()` is nearly mode-agnostic, so what is missing is a control plane. `FLOW_OFFLOAD_XMIT_XFRM` is not it — that line is upstream context and the adapter deliberately excludes XFRM destinations. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | **Wanted, and scheduled after IPsec — but not a merge blocker.** `query mc4` on a production gateway carrying IPTV answers "table empty": the offload has never been active, so this adds a capability rather than preserving behaviour. Needs a parallel replication path, not a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
@@ -334,11 +334,14 @@ product still needs them, not how to port them.
 the reasoning for each is worth keeping so neither is re-litigated.
 
 IPsec goes first because it is the larger body of live functionality: eight
-test files exercise it, `FLOW_OFFLOAD_XMIT_XFRM` already exists as the xmit
-type, the hardware questions were answered by A24a and A15, and the QoS work
-has already registered `devlink trap policer 2` — the SEC meter — which meters
-nothing until IPsec lands and is deliberately ungated so nothing has to be
-remembered when it does.
+test files exercise it, the hardware questions were answered by A24a and A15,
+and the QoS work has already registered `devlink trap policer 2` — the SEC
+meter — which meters nothing until IPsec lands and is deliberately ungated so
+nothing has to be remembered when it does. It is scoped in the
+[IPsec design](flowtable-ipsec.md), which also records why the control plane
+converges on mainline `xfrmdev_ops` rather than extending patch 040: that
+patch's largest file is a netlink bus whose only consumer is CMM, so it is the
+half of the design being retired rather than an alternative to retiring it.
 
 Multicast follows, and it is wanted: IPTV runs in production on a Gateway
 Development Kit, bridged on the ISP's VLAN. Earlier revisions of this file left
