@@ -43,6 +43,14 @@ struct shaper_info {
 	uint32_t enable;
 	uint32_t bsize;
 	struct qm_ceetm_rate token_cr;
+	/* The excess rate belongs with the committed one. It used to be a local
+	 * in each programming site, always zero for an LNI and always the
+	 * maximum for a channel -- except in ceetm_enable_or_disable_qos(),
+	 * which passed zero for a channel whose shaper was already enabled and
+	 * so took away the excess bandwidth its class queues are eligible for.
+	 * Holding it here is what makes every site program the same value, and
+	 * lets a qdisc name a ceil that is neither of those two. */
+	struct qm_ceetm_rate token_er;
 };
 
 struct classque_info {

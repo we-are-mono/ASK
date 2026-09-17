@@ -51,6 +51,7 @@ def test_qos_lifecycle(tmp_path):
         "ceetm_init_cq_plcr", "ceetm_exit_cq_plcr", "ceetm_assign_chnl",
         "ceetm_release_fd", "ceetm_sync_portal", "ceetm_sync_portals",
         "ceetm_drain_queue", "ceetm_drain_channel",
+        "ceetm_quiesce_port", "ceetm_put_channel_devices",
         "ceetm_release_iface", "ceetm_release_queue", "ceetm_release_channels",
         "ceetm_exit",
     ]

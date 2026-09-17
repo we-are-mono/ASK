@@ -35,8 +35,20 @@ static void kthread_stop(void *thread)
     assert(!rtnl && !cdx_info->ctrl.mutex && !callbacks_released);
     timer_running = false; timer_stops++;
 }
+/* The netdev's ndo_setup_tc has to be given up before anything a tc command
+ * would reach is torn down, and before the timer stops taking the same locks a
+ * qdisc command would find held. */
+static bool ndo_released;
+static void cdx_htb_exit(void)
+{
+    assert(!rtnl && !cdx_info->ctrl.mutex);
+    assert(!ports_safe && !queues_safe && !callbacks_released && !freed);
+    assert(timer_running);
+    ndo_released = true;
+}
 static int dpa_cfg_quiesce(void)
 {
+    assert(ndo_released);
     assert(rtnl && cdx_info->ctrl.mutex && !callbacks_released && !freed && !timer_running);
     if (++port_attempts <= port_failures) return -1;
     ports_safe = true;
@@ -83,11 +95,13 @@ int main(void)
     for (port_failures = 0; port_failures <= 3; port_failures++) {
         for (queue_failures = 0; queue_failures <= 3; queue_failures++) {
             ports_safe = queues_safe = callbacks_released = freed = false;
+            ndo_released = false;
             sleeps = netlink_operations = port_attempts = queue_attempts = 0;
             lock_contention = 2; lock_waits = timer_stops = 0;
             timer_running = true; cdx_info->ctrl.timer_thread = &timer_running;
             cdx_module_deinit();
             assert(freed && !rtnl && !cdx_info->ctrl.mutex);
+            assert(ndo_released);
             assert(timer_stops == 1 && !cdx_info->ctrl.timer_thread);
             assert(lock_waits == 2 + sleeps && !lock_contention);
             assert(port_attempts == port_failures + 1);

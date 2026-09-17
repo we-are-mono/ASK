@@ -245,7 +245,6 @@ err_ret:
 static int ceetm_setup_lni(struct tQM_context_ctl *qm_ctx)
 {
 	struct shaper_info *shinfo;
-	struct qm_ceetm_rate token_er;
 
 	ceetm_dbg("%s::setting lni,sp\n", __func__);
 	if(qman_ceetm_sp_set_lni(qm_ctx->sp, qm_ctx->lni)) {
@@ -263,11 +262,13 @@ static int ceetm_setup_lni(struct tQM_context_ctl *qm_ctx)
 	shinfo->enable = 0;
 	shinfo->token_cr.whole = CEETM_TOKEN_WHOLE_MAXVAL;
 	shinfo->token_cr.fraction = CEETM_TOKEN_FRAC_MAXVAL;
-	token_er.whole = 0;
-	token_er.fraction = 0;
+	/* An LNI's shaper is coupled (above), so its excess rate is whatever the
+	 * committed one leaves unused rather than a rate of its own. */
+	shinfo->token_er.whole = 0;
+	shinfo->token_er.fraction = 0;
 	shinfo->bsize = CEETM_DEFA_BSIZE;
-	if (ceetm_program_port_shaper(qm_ctx, &shinfo->token_cr, &token_er,
-			shinfo->bsize)) { 
+	if (ceetm_program_port_shaper(qm_ctx, &shinfo->token_cr, &shinfo->token_er,
+			shinfo->bsize)) {
 		ceetm_err("%s::unable to program lni shaper, idx %d\n", __func__, qm_ctx->lni->idx);
 		return CEETM_FAILURE;
 	}	
@@ -280,7 +281,6 @@ static int ceetm_setup_lni(struct tQM_context_ctl *qm_ctx)
 static int ceetm_cfg_shaper(void *ctx, uint32_t type, PQosShaperConfigCommand params)
 {
 	struct qm_ceetm_rate token_cr;
-	struct qm_ceetm_rate token_er;
 	struct shaper_info *shinfo;
 	struct tQM_context_ctl *qm_ctx;
 	struct ceetm_chnl_info *chnl_ctx;
@@ -291,15 +291,17 @@ static int ceetm_cfg_shaper(void *ctx, uint32_t type, PQosShaperConfigCommand pa
 	if (type == PORT_SHAPER_TYPE) {
 		qm_ctx = (struct tQM_context_ctl *)ctx;
 		shinfo = &qm_ctx->shaper_info;
-		token_er.whole = 0;
-		token_er.fraction = 0;
+		shinfo->token_er.whole = 0;
+		shinfo->token_er.fraction = 0;
 	} else {
+		/* This command carries one rate, so borrowing stays unbounded.
+		 * ceetm_set_channel_rates() is the caller that names both. */
 		chnl_ctx = (struct ceetm_chnl_info *)ctx;
 		shinfo = &chnl_ctx->shaper_info;
-		token_er.whole = CEETM_TOKEN_WHOLE_MAXVAL;
-		token_er.fraction = CEETM_TOKEN_FRAC_MAXVAL;
+		shinfo->token_er.whole = CEETM_TOKEN_WHOLE_MAXVAL;
+		shinfo->token_er.fraction = CEETM_TOKEN_FRAC_MAXVAL;
 	}
-	
+
 	if (params->cfg_flags & SHAPER_CFG_VALID) {
 		/* new configuration available */
 		if(qman_ceetm_bps2tokenrate((params->rate * 1000), &token_cr, 0)) {
@@ -336,13 +338,13 @@ static int ceetm_cfg_shaper(void *ctx, uint32_t type, PQosShaperConfigCommand pa
 	if (cfg) {
 		if (type == PORT_SHAPER_TYPE) {
 			/* Port shaper configuration */
-			if (ceetm_program_port_shaper(qm_ctx, &token_cr, &token_er, 
+			if (ceetm_program_port_shaper(qm_ctx, &token_cr, &shinfo->token_er,
 				shinfo->bsize)) {
 				return CEETM_FAILURE;
 			}
 		} else {
 			/* channel shaper configuration */
-			if (ceetm_program_channel_shaper(chnl_ctx, &token_cr, &token_er,
+			if (ceetm_program_channel_shaper(chnl_ctx, &token_cr, &shinfo->token_er,
 				shinfo->bsize)) {
 				return CEETM_FAILURE;
 			}
@@ -770,7 +772,6 @@ static int ceetm_create_queues(struct ceetm_chnl_info *chnl_ctx)
 static int ceetm_create_channel(struct ceetm_chnl_info *qm_channel)
 {
 	struct qm_ceetm_channel *channel;
-	struct qm_ceetm_rate er_rate;
 
 	channel = kzalloc(sizeof(*channel), GFP_KERNEL);
 	if (!channel) {
@@ -786,16 +787,24 @@ static int ceetm_create_channel(struct ceetm_chnl_info *qm_channel)
 	INIT_LIST_HEAD(&channel->class_queues);
         INIT_LIST_HEAD(&channel->ccgs);
 	qm_channel->channel = channel;
-	/* Enable Shaper by default, do not couple CR and ER */
-	if (qman_ceetm_channel_enable_shaper(channel, 0)) {
+	/* Enable the shaper, coupling the two token buckets so committed-rate
+	 * tokens a channel does not use top up its excess-rate ones. That is
+	 * what makes a finite excess rate an actual ceiling on the channel
+	 * rather than a second allowance on top of the committed one, which is
+	 * what a qdisc naming a rate and a ceil is asking for, and is how the
+	 * SDK's own CEETM qdisc programs the same pair. It changes nothing for
+	 * a channel whose excess rate is the maximum, which is every channel
+	 * the FCI commands configure: surplus added to a bucket already
+	 * refilling at full rate is surplus still. Coupling cannot be changed
+	 * afterwards without disabling the shaper, so it is decided here. */
+	if (qman_ceetm_channel_enable_shaper(channel, 1)) {
 		ceetm_err("%s::unable to enable shaper for chnl %p\n",
 			__func__, channel);
 		return CEETM_FAILURE;
 	}
-	er_rate.whole = CEETM_TOKEN_WHOLE_MAXVAL;
-	er_rate.fraction = CEETM_TOKEN_FRAC_MAXVAL;
 	/* set max possible rate as default value */
-	if (ceetm_program_channel_shaper(qm_channel, &qm_channel->shaper_info.token_cr, &er_rate,
+	if (ceetm_program_channel_shaper(qm_channel, &qm_channel->shaper_info.token_cr,
+		&qm_channel->shaper_info.token_er,
 		qm_channel->shaper_info.bsize)) {
 		ceetm_err("%s::unable to configure shaper for chnl %p\n",
 			__func__, qm_channel);
@@ -830,7 +839,10 @@ int ceetm_init_channels(void)
 		chinfo->wbfq_priority = CEETM_DEFA_WBFQ_PRIORITY;
 		chinfo->wbfq_chshaper = 0;
 		chinfo->shaper_info.bsize = CEETM_DEFA_BSIZE;
-		chinfo->shaper_info.token_cr = cr; 
+		chinfo->shaper_info.token_cr = cr;
+		/* A channel's shaper is not coupled, so its excess rate is a
+		 * rate of its own; unbounded until a class names a ceil. */
+		chinfo->shaper_info.token_er = cr;
 		chinfo->shaper_info.rate = rate;
 		chinfo->shaper_info.enable = 0;
 		chinfo->idx = ii;
@@ -963,13 +975,14 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 {
 	uint32_t ii;
 	uint32_t jj;
-	struct qm_ceetm_rate token;
 	uint64_t rate;
 
 	/* turn off port shaper */
 	/* set limits very high, disable shaper */
 	qm_ctx->shaper_info.token_cr.whole = CEETM_TOKEN_WHOLE_MAXVAL;
 	qm_ctx->shaper_info.token_cr.fraction = CEETM_TOKEN_FRAC_MAXVAL;
+	qm_ctx->shaper_info.token_er.whole = 0;
+	qm_ctx->shaper_info.token_er.fraction = 0;
 	qm_ctx->shaper_info.bsize = CEETM_DEFA_BSIZE;
 	qm_ctx->shaper_info.enable = 0;
 	if (qman_ceetm_tokenrate2bps(&qm_ctx->shaper_info.token_cr, &rate, 0)) {
@@ -977,11 +990,9 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 		return CEETM_FAILURE;
 	}
 	qm_ctx->shaper_info.rate = rate;
-	token.whole = 0;
-	token.fraction = 0;
-	ceetm_dbg("%s::turning port shaper off\n", __func__); 
+	ceetm_dbg("%s::turning port shaper off\n", __func__);
 	if (ceetm_program_port_shaper(qm_ctx, &qm_ctx->shaper_info.token_cr,
-		&token, qm_ctx->shaper_info.bsize)) {
+		&qm_ctx->shaper_info.token_er, qm_ctx->shaper_info.bsize)) {
 		ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 		return CEETM_FAILURE;
 	}
@@ -1001,6 +1012,7 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 			qm_channel->wbfq_chshaper = 0;
 			qm_channel->shaper_info.token_cr.whole = CEETM_TOKEN_WHOLE_MAXVAL;
 		        qm_channel->shaper_info.token_cr.fraction = CEETM_TOKEN_FRAC_MAXVAL;
+			qm_channel->shaper_info.token_er = qm_channel->shaper_info.token_cr;
 			qm_channel->shaper_info.bsize = CEETM_DEFA_BSIZE;
 			qm_channel->shaper_info.rate = rate;
 			qm_channel->shaper_info.enable = 0;
@@ -1012,8 +1024,8 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 				return CEETM_FAILURE;
 			}
 			ceetm_dbg("%s::turning channel %d shaper off\n", __func__, ii); 
-			if (ceetm_program_channel_shaper(qm_channel, &qm_channel->shaper_info.token_cr, 
-				&qm_channel->shaper_info.token_cr, qm_channel->shaper_info.bsize)) {
+			if (ceetm_program_channel_shaper(qm_channel, &qm_channel->shaper_info.token_cr,
+				&qm_channel->shaper_info.token_er, qm_channel->shaper_info.bsize)) {
 				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 				return CEETM_FAILURE;
 			}
@@ -1103,12 +1115,10 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 				return QOS_ENERR_IO;
 			}
 				
-			token.whole = 0;
-			token.fraction = 0;
 			/* configure all shapers as per configuration in the context */
 			/* program lni, port shaper */
 			if (ceetm_program_port_shaper(qm_ctx, &qm_ctx->shaper_info.token_cr,
-						&token,
+						&qm_ctx->shaper_info.token_er,
 						qm_ctx->shaper_info.bsize)) {
 				ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 				return QOS_ENERR_IO;
@@ -1116,13 +1126,14 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 			for (ii = 0; ii < NUM_CHANNEL_SHAPERS; ii++) {
 				if (qm_ctx->chnl_map & (1 << ii)) {
 					chnl_ctx = &qm_chnl_info[ii];
-					/* configure channel shaper */
-					if (!chnl_ctx->shaper_info.enable) {
-						token.whole = CEETM_TOKEN_WHOLE_MAXVAL;
-						token.fraction = CEETM_TOKEN_FRAC_MAXVAL;
-					}	
+					/* Configure the channel shaper from the two
+					 * rates the context holds. This used to pass
+					 * a zero excess rate for a channel whose
+					 * shaper was enabled, which left its class
+					 * queues -- all excess-eligible by default --
+					 * with nothing to transmit against. */
 					if (ceetm_program_channel_shaper(chnl_ctx, &chnl_ctx->shaper_info.token_cr,
-							&token,
+							&chnl_ctx->shaper_info.token_er,
 							chnl_ctx->shaper_info.bsize)) {
 						ceetm_err("%s:ceetm_program_shaper failed \n", __func__);
 						return QOS_ENERR_IO;
@@ -1163,6 +1174,16 @@ int ceetm_enable_or_disable_qos(struct tQM_context_ctl *qm_ctx, uint32_t oper)
 						return QOS_ENERR_IO;
 					}
 				}
+			}
+			/* Undo what ceetm_setup_lni() did on the way in. The SDK
+			 * refuses to enable an LNI shaper that is already
+			 * enabled, so leaving it on makes the next enable fail
+			 * inside setup with the port half committed -- which is
+			 * what a qdisc torn down and built again does, and what
+			 * CMM toggling QOSENABLE does. */
+			if (qm_ctx->lni && qman_ceetm_lni_disable_shaper(qm_ctx->lni)) {
+				ceetm_err("%s:qman_ceetm_lni_disable_shaper failed\n", __func__);
+				return QOS_ENERR_IO;
 			}
 			qm_ctx->qos_enabled = 0;
 		} else {
@@ -1374,6 +1395,159 @@ int ceetm_assign_chnl(struct tQM_context_ctl *qm_ctx, uint32_t channel_num)
 		chnl_ctx->cq_info[ii].ceetmfq.net_dev = qm_ctx->net_dev;
 	}
 	return CEETM_SUCCESS;
+}
+
+/* The calls below are the hardware qdisc's half of this file. They return plain
+ * negative error codes rather than CEETM_FAILURE, because the caller hands them
+ * back to tc, which reports them to the operator. Nothing here claims an
+ * object: every channel, class queue and logical FQ was built at module load,
+ * and configuring one is all a qdisc ever needs.
+ */
+
+/* Bind whichever channel is free to this port, and say which one it was.
+ * Channel allocation was CMM's policy and is now this file's: lowest free
+ * index, skipping any whose earlier drain failed -- ceetm_assign_chnl() refuses
+ * those, and refusing is how a channel that may still hold frames stays out of
+ * service. */
+int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num)
+{
+	uint32_t ii;
+
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+		if (qm_chnl_info[ii].qm_ctx)
+			continue;
+		if (ceetm_assign_chnl(qm_ctx, ii))
+			continue;
+		*channel_num = ii;
+		return 0;
+	}
+	return -ENOSPC;
+}
+
+/* Program a channel's committed and excess rates, in bits per second.
+ *
+ * A zero committed rate means no shaping at all: both buckets go to the token
+ * rate's maximum, which is how this file has always spelled "unshaped". A zero
+ * excess rate with a committed one is a real zero — a channel that may not
+ * exceed what it was committed. The two are separate because the buckets are
+ * additive: what the channel can send approaches their sum.
+ */
+int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir_bps)
+{
+	struct ceetm_chnl_info *chnl_ctx;
+	struct shaper_info *shinfo;
+	struct qm_ceetm_rate cr, er;
+	uint64_t rate;
+
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS)
+		return -EINVAL;
+	chnl_ctx = &qm_chnl_info[channel_num];
+	shinfo = &chnl_ctx->shaper_info;
+	cr.whole = CEETM_TOKEN_WHOLE_MAXVAL;
+	cr.fraction = CEETM_TOKEN_FRAC_MAXVAL;
+	er = cr;
+	if (cir_bps) {
+		if (qman_ceetm_bps2tokenrate(cir_bps, &cr, 0)) {
+			ceetm_err("%s::cannot shape channel %u at %llu bps\n",
+				__func__, channel_num, cir_bps);
+			return -EINVAL;
+		}
+		er.whole = 0;
+		er.fraction = 0;
+		if (eir_bps && qman_ceetm_bps2tokenrate(eir_bps, &er, 0)) {
+			ceetm_err("%s::cannot cap channel %u at %llu bps\n",
+				__func__, channel_num, eir_bps);
+			return -EINVAL;
+		}
+	}
+	if (qman_ceetm_tokenrate2bps(&cr, &rate, 0))
+		rate = cir_bps;
+	shinfo->token_cr = cr;
+	shinfo->token_er = er;
+	shinfo->bsize = CEETM_DEFA_BSIZE;
+	shinfo->rate = rate;
+	shinfo->enable = cir_bps ? 1 : 0;
+	if (ceetm_program_channel_shaper(chnl_ctx, &cr, &er, shinfo->bsize))
+		return -EIO;
+	return 0;
+}
+
+/* Put a leaf class's frames on a class queue.
+ *
+ * A weight makes it one of the eight weighted queues, sharing what its
+ * priority level is given; no weight makes it one of the eight strict-priority
+ * queues, where its index alone decides who pre-empts whom. Either way it is
+ * made eligible for both of its channel's token buckets, so it transmits
+ * against the committed rate and then borrows from the excess one -- which is
+ * what a class with a rate and a ceil is asking for, and which
+ * ceetm_configure_cq()'s single "channel shaper on" switch cannot express.
+ */
+int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight,
+			  uint32_t depth)
+{
+	struct qm_ceetm_weight_code weight_code;
+	struct ceetm_chnl_info *chnl_ctx;
+	struct classque_info *cqinfo;
+	uint32_t ceetm_quenum;
+
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	if ((weight != 0) != (quenum >= NUM_PQS))
+		return -EINVAL;
+	chnl_ctx = &qm_chnl_info[channel_num];
+	cqinfo = &chnl_ctx->cq_info[quenum];
+	ceetm_quenum = cqinfo->ceetm_idx;
+	if (ceetm_cfg_td_on_class_queue(chnl_ctx, quenum, depth))
+		return -EIO;
+	if (weight) {
+		if (qman_ceetm_ratio2wbfs(weight, 1, &weight_code, 0))
+			return -ERANGE;
+		if (qman_ceetm_set_queue_weight(cqinfo->cq, &weight_code))
+			return -EIO;
+		cqinfo->weight = weight;
+		/* Eligibility is per group, not per queue, so this says the
+		 * same thing every time another weighted class arrives. */
+		if (qman_ceetm_channel_set_group_cr_eligibility(chnl_ctx->channel, 0, 1) ||
+		    qman_ceetm_channel_set_group_er_eligibility(chnl_ctx->channel, 0, 1))
+			return -EIO;
+		return 0;
+	}
+	if (qman_ceetm_channel_set_cq_cr_eligibility(chnl_ctx->channel, ceetm_quenum, 1) ||
+	    qman_ceetm_channel_set_cq_er_eligibility(chnl_ctx->channel, ceetm_quenum, 1))
+		return -EIO;
+	cqinfo->ch_shaper_enable = 1;
+	return 0;
+}
+
+/* Return a class queue to the state ceetm_reset_qos() would leave it in: its
+ * default depth, and out of contention for the channel's committed rate. Group
+ * eligibility is deliberately left alone -- it belongs to all eight weighted
+ * queues, and the surviving ones still want it. */
+int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
+{
+	struct qm_ceetm_weight_code weight_code;
+	struct ceetm_chnl_info *chnl_ctx;
+	struct classque_info *cqinfo;
+	int ret = 0;
+
+	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	chnl_ctx = &qm_chnl_info[channel_num];
+	cqinfo = &chnl_ctx->cq_info[quenum];
+	if (ceetm_cfg_td_on_class_queue(chnl_ctx, quenum, DEFAULT_CQ_DEPTH))
+		ret = -EIO;
+	if (quenum >= NUM_PQS) {
+		cqinfo->weight = DEFAULT_WBFQ_WEIGHT;
+		if (qman_ceetm_ratio2wbfs(DEFAULT_WBFQ_WEIGHT, 1, &weight_code, 0) ||
+		    qman_ceetm_set_queue_weight(cqinfo->cq, &weight_code))
+			ret = -EIO;
+		return ret;
+	}
+	if (qman_ceetm_channel_set_cq_cr_eligibility(chnl_ctx->channel, cqinfo->ceetm_idx, 0) ||
+	    qman_ceetm_channel_set_cq_er_eligibility(chnl_ctx->channel, cqinfo->ceetm_idx, 1))
+		ret = -EIO;
+	cqinfo->ch_shaper_enable = 0;
+	return ret;
 }
 
 /*
@@ -1862,12 +2036,20 @@ static int ceetm_drain_channel(struct ceetm_chnl_info *chinfo)
 	return ret;
 }
 
-int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
+/* Take a port's scheduling down and hand its channels back: stop software
+ * senders resolving CEETM frame queues, let what is queued leave, widen the
+ * shapers, and take each channel off the LNI's list. Reports which channels
+ * were detached, so their interface references can be dropped once the readers
+ * that might still hold one are known to be finished.
+ *
+ * A channel whose drain failed is still detached. It keeps its drain_failed
+ * mark, and that is what stops ceetm_assign_chnl() handing it out again. */
+static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx, uint32_t *detached)
 {
-	int ii, jj;
 	int ret = CEETM_SUCCESS;
-	uint32_t detached = 0;
+	int ii;
 
+	*detached = 0;
 	if (qm_ctx->net_dev) {
 		dpa_disable_ceetm(qm_ctx->net_dev);
 		/* Finish TX readers before changing their context or queues. */
@@ -1886,16 +2068,16 @@ int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
 			ret = CEETM_FAILURE;
 		list_del_init(&chinfo->channel->node);
 		chinfo->qm_ctx = NULL;
-		detached |= 1U << ii;
+		*detached |= 1U << ii;
 	}
-	if (qm_ctx->net_dev) {
-		struct dpa_priv_s *priv = netdev_priv(qm_ctx->net_dev);
+	qm_ctx->chnl_map &= ~*detached;
+	return ret;
+}
 
-		if (ceetm_sync_portals())
-			ret = CEETM_FAILURE;
-		synchronize_net();
-		priv->qm_ctx = NULL;
-	}
+static void ceetm_put_channel_devices(uint32_t detached)
+{
+	int ii, jj;
+
 	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
 		if (!(detached & (1U << ii)))
 			continue;
@@ -1908,6 +2090,52 @@ int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
 			}
 		}
 	}
+}
+
+/* Stop scheduling on a port whose interface stays up: a qdisc being torn down
+ * rather than a netdev going away. The LNI and sub-portal are left claimed, so
+ * the same port can be configured again without an interface event, and every
+ * class queue goes back to the defaults it had before any of this.
+ *
+ * The caller cannot act on a failure -- sch_htb discards the return value of
+ * both its destroy commands -- so this reports what went wrong and keeps going
+ * rather than stopping at the first error. */
+int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
+{
+	uint32_t detached;
+	int ret = CEETM_SUCCESS;
+
+	if (!qm_ctx->chnl_map && !qm_ctx->qos_enabled)
+		return CEETM_SUCCESS;
+	if (ceetm_reset_qos(qm_ctx))
+		ret = CEETM_FAILURE;
+	if (ceetm_quiesce_port(qm_ctx, &detached))
+		ret = CEETM_FAILURE;
+	if (qm_ctx->net_dev) {
+		if (ceetm_sync_portals())
+			ret = CEETM_FAILURE;
+		synchronize_net();
+	}
+	ceetm_put_channel_devices(detached);
+	return ret;
+}
+
+int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
+{
+	int ret = CEETM_SUCCESS;
+	uint32_t detached;
+
+	if (ceetm_quiesce_port(qm_ctx, &detached))
+		ret = CEETM_FAILURE;
+	if (qm_ctx->net_dev) {
+		struct dpa_priv_s *priv = netdev_priv(qm_ctx->net_dev);
+
+		if (ceetm_sync_portals())
+			ret = CEETM_FAILURE;
+		synchronize_net();
+		priv->qm_ctx = NULL;
+	}
+	ceetm_put_channel_devices(detached);
 	if (qm_ctx->dscp_fq_map) {
 		if (disable_dscp_fqid_map(qm_ctx - gQMCtx))
 			ret = CEETM_FAILURE;

@@ -43,6 +43,7 @@
 #include "cdx.h"
 #include "cdx_flowtable.h"
 #include "cdx_cmdhandler.h"
+#include "cdx_htb.h"
 #include "dpa_ipsec.h"
 
 #ifdef CDX_DEBUG_KEY_ZEROING
@@ -214,6 +215,13 @@ static void cdx_module_deinit(void)
 
 	/* A loaded flowtable adapter pins CDX. Its callbacks and hardware
 	 * have drained before provider shutdown can run. */
+	/* Give up the netdev's ndo_setup_tc before anything it reaches is torn
+	 * down. The driver holds a pointer into this module's text rather than a
+	 * symbol reference, so a tc command can arrive right up to here; running
+	 * this ahead of the deinit chain is deliberate, because that chain runs
+	 * after the QoS objects a qdisc command would configure have gone.
+	 * Safe on the initialization-failure path too, where nothing registered. */
+	cdx_htb_exit();
 	/* Stop the remaining internal writer before terminal retries release
 	 * both locks. Timer storage survives until its normal exit callback. */
 	cdx_ctrl_timer_stop();
@@ -325,6 +333,13 @@ static int __init cdx_module_init(void)
 	rc = cdx_ctrl_init(cdx_info);
 	if (rc != 0) {
 		printk("%s::cdx_ctrl_init failed\n", __func__);
+		goto exit;
+	}
+	/* After cdx_ctrl_init, which is where qm_init builds every CEETM
+	 * channel and class queue a qdisc command can configure. */
+	rc = cdx_htb_init();
+	if (rc != 0) {
+		printk("%s::cdx_htb_init failed\n", __func__);
 		goto exit;
 	}
 	rc = devman_init_linux_stats();

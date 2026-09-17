@@ -1177,3 +1177,11 @@ file's git history.
 
 - [x] **A136.** Tests mistook combined netdev statistics for software counters —
   fixed (this commit): use SDK ethtool software RX plus delivery; retain totals for accounting and preserve capture names.
+
+- [x] **A143.** Enabling QoS drove the excess rate of an already-shaped channel to
+  zero, starving every class queue on it —
+  fixed (this commit): hold the excess rate in `shaper_info` so all five programming sites pass the same value.
+
+- [x] **A144.** Disabling QoS left the LNI shaper enabled, so a port could only ever be
+  enabled once; the second attempt failed inside `ceetm_setup_lni` with the port half committed —
+  fixed (this commit): disable the shaper on the way out, which is what makes a qdisc rebuild or a QOSENABLE toggle work.

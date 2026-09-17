@@ -229,9 +229,10 @@ SDK code that is compiled out of every current build.
 
 **B — keep `cdx_ceetm_app.c`, replace FCI with `ndo_setup_tc` HTB offload.**
 `TC_SETUP_QDISC_HTB` is the mainline-blessed verb for this shape and is what
-mlx5 uses for hardware queue trees. The parameter mapping is clean: root
-`rate`/`ceil` → LNI commit/excess shaper; leaf `rate`/`ceil` → channel shaper;
-leaf `prio` → strict-priority class queue; leaf `quantum` → WBFS weight.
+mlx5 uses for hardware queue trees. The parameter mapping is clean: `rate` and
+`ceil` are shaper rates, `prio` picks a strict-priority class queue and
+`quantum` a weighted one. Which level of the tree owns which is settled in
+[increment 3](#3-htb-offload-commands), where it was built.
 Tail-drop depth has no HTB field and stays a per-port default. The callback has
 everything it needs already: `priv->qm_ctx` is stashed at netdev registration
 (`cdx/control_qm.c:518`), and every cdx setter — `ceetm_configure_shaper`,
@@ -521,32 +522,122 @@ banner.
 
 ### 3. HTB offload commands
 
-Implement the command set over `cdx_ceetm_app.c`'s existing setters, all of
-which are already thin functions over a `(channel, class queue)` pair.
+The command set, in `cdx/cdx_htb.c`, over `cdx_ceetm_app.c`'s existing setters.
+Nothing new is claimed: `ceetm_init_channels()` builds every channel, class
+queue and logical FQ at module load, so a tc class only ever decides which
+`(channel, class queue)` pair it means.
 
-- `TC_HTB_CREATE` latches the qdisc handle major and default class.
-- `TC_HTB_LEAF_ALLOC_QUEUE` claims a channel and class queue, returns a dense
-  qid, and records the `txq → (channel, class queue)` map.
-- `TC_HTB_LEAF_TO_INNER`, `LEAF_DEL`, `LEAF_DEL_LAST`, `NODE_MODIFY`,
-  `LEAF_QUERY_QUEUE`.
-- Map `rate`/`ceil` to the LNI and channel shapers, `prio` to the strict
-  priority queue, `quantum` to the WBFS weight.
+**The tree maps onto the hardware's own three levels.**
 
-Three sharp edges from the `sch_htb` contract. `LEAF_DEL` may write back a
-different classid to report that the driver moved a qid, which is how the
-range stays dense; skipping it means fragmenting the budget. `TC_HTB_DESTROY`
-and `LEAF_DEL_LAST_FORCE` have their return values **discarded**, so teardown
-must always succeed — the same class of problem A21, A109, A122 and A133 were
-about, in the same file, so budget for it. And every leaf add or delete wraps
-a full `dev_deactivate()`/`dev_activate()` cycle, so building a wide tree
-quiesces the netdev once per class.
+| HTB | CEETM | parameters |
+| --- | --- | --- |
+| qdisc root | the port, that is its LNI | `default` is recorded, and advisory until increment 4 |
+| class under the root | a channel bound to that port | `rate` → committed shaper, `ceil` → ceiling |
+| class under one of those | a class queue on that channel | `prio` → one of eight strict-priority queues, `quantum` → the weighted group instead |
 
-Only eight weighted leaves per channel are available until WBFS group B is
-claimed (`qman_ceetm_cq_claim_A`, `cdx/cdx_ceetm_app.c:548`).
+A class under the root that has no children is both: it holds a channel and
+occupies one class queue on it, because `sch_htb` gives every leaf a netdev Tx
+queue and expects frames to reach it. `TC_HTB_LEAF_TO_INNER` is where it stops
+being a queue and becomes only a channel, handing the child both its Tx queue
+and its place on the channel. A third level is refused — there is no fourth
+level in CEETM to put it on.
 
-*Proof.* Build a tree with `tc`, read it back with `tc class show`, and
-confirm against `CMD_QM_QUERY_QUEUE` that the hardware matches what was asked
-for. Tear it down and confirm every claim is released.
+Two mappings are worth stating because they are not the obvious reading.
+
+**`ceil` is a ceiling, and the hardware's two token buckets are additive.** A
+class queue eligible for both transmits against the committed rate and then
+again against the excess one, so the channel's output approaches their sum;
+the excess rate to program is `ceil - rate`, not `ceil`. Measured before the
+correction: a class given `rate 200mbit ceil 200mbit` ran at 376 Mbit/s.
+The channel shaper is also coupled, so committed tokens a class does not use
+top up its excess ones, which is what makes borrowing up to `ceil` behave the
+way HTB describes it. The SDK's own CEETM qdisc couples the same shaper.
+
+**`quantum` is a weight, not a byte count.** CEETM's weighted scheduler takes a
+weight of 1 to 255; there is no byte-deficit round robin to give a quantum to.
+A leaf that names one asks to share bandwidth at its priority level rather than
+to pre-empt, which is the weighted group; a leaf that does not gets a
+strict-priority queue of its own, and asking for a priority another class holds
+is an error rather than a silent demotion. A leaf's own `rate` and `ceil` have
+no hardware behind them — CEETM shapes channels, not queues — so what a leaf
+can change is where it sits among its siblings.
+
+**Registration moved into `cdx.ko`.** A driver takes one `ndo_setup_tc`
+handler, and CEETM belongs to cdx, which is loaded in both ownership modes
+while the flowtable adapter is loaded in one. So cdx claims the ndo and
+dispatches: `TC_SETUP_QDISC_HTB` to this file, `TC_SETUP_FT` on to the adapter
+through a registration of its own, `TC_SETUP_ROOT_QDISC` acknowledged because
+it is a notification and refusing it makes every successful `tc qdisc add`
+report a failed graft. The window increment 2b described is unchanged: a bind
+arriving with no adapter registered is still refused.
+
+Some things the contract makes sharp:
+
+- `LEAF_DEL` writes back a different classid to report that the driver moved a
+  qid, which is how the range stays dense in its sixteen slots per port.
+- `TC_HTB_DESTROY` and `LEAF_DEL_LAST_FORCE` have their return values
+  **discarded**, so teardown reports trouble and keeps going rather than
+  stopping at the first failure.
+- `real_num_tx_queues` deliberately stays at the direct queues. Growing it
+  would let ordinary traffic hash onto a leaf's queue, and nothing in the
+  software Tx path reads that index yet — with CEETM on, `cpe_fp_tx()` resolves
+  its frame queue from the mark. Increment 4 owns that, and grows the count
+  when it is true.
+- A channel a class gave up stays bound to the port and is handed to the next
+  class under the root, rather than detached and rebound: detaching a live
+  channel means draining it while frames are still being classified onto it.
+  Channels return to the global pool at `TC_HTB_DESTROY`.
+- Leaf class queues get a tail-drop depth of 128 frames rather than the
+  hardware layer's default of eight, which is far too shallow for a queue that
+  is deliberately being shaped. Increment 6 replaces tail drop with WRED.
+
+Limits, all of them the hardware's: eight channels for the whole SoC shared by
+every port, eight weighted leaves per channel until WBFS group B is claimed
+(`qman_ceetm_cq_claim_A`), eight strict priorities, sixteen leaves per port,
+and two levels. `tc qdisc replace` on a port that already has one is refused,
+because `sch_htb` creates the new qdisc before destroying the old; delete and
+add instead. mlx5 refuses the same sequence.
+
+Two defects in the hardware layer had to be fixed for any of this to work
+twice, both filed as A143 and A144 and both reachable from CMM as well:
+enabling QoS drove an already-shaped channel's excess rate to zero, starving
+every class queue on it, and disabling QoS left the LNI shaper enabled, so a
+port could only ever be enabled once. `tools/host_tests/test_ceetm_qos_enable.py`
+cycles the pair and fails on either.
+
+*Proved on hardware, 2026-09-17.* Both ownership modes, on the KASAN image.
+
+Under `ask.offload=cmm`, with no flowtable adapter loaded at all,
+`tc qdisc add dev eth3 root handle 1: htb offload` and four classes built a
+tree that `CMD_QM_QUERY_QUEUE` and `CMD_QM_QUERY` read back as exactly what was
+asked for: the port QoS-enabled, channel 0 shaped at 1000000 Kbps, class queues
+7 and 6 — CEETM priorities 0 and 1, which is the inversion
+`GET_CEETM_PRIORITY` applies — at depth 128, and class queue 8, the first of the
+weighted group, carrying the weight 4 that `quantum 4` asked for. The other 125
+stayed at their defaults. Deleting a class in the middle and then the qdisc
+returned the port to `mq` with sixteen `pfifo_fast`, and the same queries
+reported `qos_enabled=0`, no channel claimed, and every class queue back at
+depth 8 and weight 1.
+
+Under `ask.offload=flowtable` with `qos_mark_mask=0xf0`, a policy bound through
+the moved registration (`bindings 2`), and every offloaded flow carried the
+class its mark named. A qdisc built, torn down and built again on the same port
+succeeded both times, which is the A144 case. Shaping followed `tc`:
+
+| tc | measured |
+| --- | --- |
+| unshaped | 9.41 Gbit/s |
+| `rate 200mbit ceil 200mbit` | 188 Mbit/s |
+| `rate 600mbit ceil 600mbit` | 565 Mbit/s |
+| `rate 200mbit ceil 800mbit` | 753 Mbit/s |
+
+Each is the ceiling less TCP's header share, and the last two came from
+`TC_HTB_NODE_MODIFY` on a live tree. With two classes on one 200 Mbit channel
+and two marks, `/proc/cdx_flowtable` showed six flows at `qos=06` and six at
+`qos=07` — the two classes the two marks name — and the strict priority between
+them is unambiguous: the `prio 0` flow took 188 Mbit/s and the `prio 1` flow
+0.00 bit/s. **That is the first point at which QoS genuinely shapes.** No
+KASAN, BUG, WARNING or lockdep output in either boot.
 
 *Effort: 1.5–2 weeks.*
 

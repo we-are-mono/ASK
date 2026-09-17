@@ -693,20 +693,22 @@ static void flow_block_cb_remove(struct flow_block_cb *cb, struct flow_block_off
     assert(block_write_lock && *block_write_lock);
     list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
 }
-/* The driver-side registration the direct route arrives through. Exactly one
- * handler may be live at a time, and a load that fails after taking it has to
- * give it back -- otherwise the next load finds the slot occupied by a module
- * that is no longer there. */
+/* The registration the direct route arrives through. CDX holds the driver's
+ * single ndo_setup_tc, because it serves the hardware qdisc on the same
+ * callback, so the adapter registers with CDX rather than with the driver.
+ * Exactly one handler may be live at a time, and a load that fails after taking
+ * it has to give it back -- otherwise the next load finds the slot occupied by
+ * a module that is no longer there. */
 static int registered_setup_tc;
-typedef int (*dpa_setup_tc_handler)(struct net_device *, enum tc_setup_type, void *);
-static int dpa_register_setup_tc(dpa_setup_tc_handler handler)
+typedef int (*cdx_ft_setup_tc_handler)(struct net_device *, enum tc_setup_type, void *);
+static int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler)
 {
     assert(handler);
     if (registered_setup_tc) return -EBUSY;
     registered_setup_tc = 1;
     return 0;
 }
-static void dpa_unregister_setup_tc(void) { registered_setup_tc = 0; }
+static void cdx_unregister_ft_setup_tc(void) { registered_setup_tc = 0; }
 /* What the encoder would write into the two PPPoE opcodes, recorded so a test
  * can require the index rather than the slot pointer: a direction that strips
  * counts into its session's receive half, one that inserts into the transmit
