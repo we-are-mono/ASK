@@ -3488,14 +3488,15 @@ static void test_qos_decode(void)
 
     ft_qos_mark_mask = saved_mask; ft_qos_default_class = saved_default;
 
-    /* Validity. Each nibble is bounded at its own maximum, and the channel and
-     * policer nibbles admit their maximum *inclusive* because value n names
-     * object n-1 while zero names none. */
+    /* Validity. Each nibble is bounded at its own maximum, inclusive. The
+     * channel nibble admits 8 because value n names channel n-1 and zero is a
+     * sentinel; the policer nibble admits 7 because it is a plain profile
+     * number with no sentinel to make room for. */
     assert(ft_qos_class_valid(0x000));
     assert(ft_qos_class_valid(0x00f));                       /* class queue 15 */
     assert(ft_qos_class_valid(CDX_FT_QOS_MAX_CHANNEL << CDX_FT_QOS_CHANNEL_SHIFT));
     assert(ft_qos_class_valid(CDX_FT_QOS_MAX_POLICER << CDX_FT_QOS_POLICER_SHIFT));
-    assert(ft_qos_class_valid(0x88f));                       /* all three, full */
+    assert(ft_qos_class_valid(0x78f));                       /* all three, full */
     /* One past either bound names an object the hardware does not have. A flow
      * asking for it is declined to software, never truncated onto a queue or a
      * meter nobody asked for. */

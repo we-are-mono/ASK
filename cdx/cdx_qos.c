@@ -54,8 +54,9 @@
  * the FMAN policer headers. The profile count belongs to this file, so the
  * check does too: adding profiles here fails the build until the rule's
  * encoding is widened, rather than leaving the adapter refusing a profile the
- * hardware now has. */
-static_assert(CDX_FT_QOS_MAX_POLICER == INGRESS_FLOW_POLICER_QUEUES,
+ * hardware now has. The adapter's bound is the highest profile number, so it
+ * is one below the count. */
+static_assert(CDX_FT_QOS_MAX_POLICER == INGRESS_FLOW_POLICER_QUEUES - 1,
 	      "cdx_ft_rule.qos policer bound must track the ingress profile count");
 
 //#define QOS_DEBUG	1
