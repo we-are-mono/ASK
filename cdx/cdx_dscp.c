@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright 2026 Mono
+ * Copyright 2026 Mono Technologies Inc.
  *
  * Egress classification by DSCP, as a tc verb.
  *

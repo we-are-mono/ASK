@@ -1557,40 +1557,51 @@ changes the rate loses the history.
 
 No BUG, WARNING, call trace or KASAN output beyond KASAN's own init banner.
 
-#### The SEC rate, as the knob it is
+#### The SEC meter, as a second policer
 
-Delivered on the same instance, as two driver-specific parameters, and with the
-reservation above standing: this is the one place in the QoS port where a kernel
-interface is met in letter and not in spirit.
+Delivered on the same instance, as `policer 2`, and the reservation the plan
+carried — that this one would have to be an untyped knob — turns out not to
+hold.
 
 ```sh
-devlink dev param set platform/1a00000.fman name sec_rate  value 200000 cmode runtime
-devlink dev param set platform/1a00000.fman name sec_burst value 1024   cmode runtime
+devlink trap policer set platform/1a00000.fman policer 2 rate 200000 burst 1024
+devlink -s trap policer show
 ```
 
-**Nothing is shadowed.** Both values are read from and written to the hardware
-layer, which keeps them beside the profile handle. A parameter reporting a
-value the profile did not hold would be worse than no parameter, and the pair
-has to be written together — a rate programmed against a stale burst is a
-different meter from the one asked for — so the one not being set is read back
-rather than assumed.
+**It is the same kind of object as the punt meter, so it gets the same verbs.**
+Profile 8 reaches a frame exactly as the seven per-flow profiles do —
+`create_preemptive_checks_hm()` puts a profile number in the ucode's `pp_no`.
+What differs is who chooses: a flow whose egress goes to the SEC block takes
+this profile *instead of* the one its own class names, and that substitution is
+the hardware's. No filter can ask for it, because "bound for the crypto engine"
+is not a property of any flow's tuple.
 
-*Proved on hardware, 2026-09-17.* Before anything was set, the parameters read
-**`sec_rate 740000`** and **`sec_burst 32`**: the profile's own defaults, which
-is what says they come from the hardware and not from a static. Setting them to
-200000 and 1024 read back as asked. CMM's range is enforced with a sentence
-rather than an errno:
+It was first delivered as two devlink *parameters*, and that was wrong for one
+concrete reason: **a parameter cannot report a drop count.** Every other meter
+in the system can be asked what it discarded — the port's and the seven
+per-flow ones through `tc -s filter show`, the punt one through
+`devlink -s trap policer show`. Making this one a policer closes that asymmetry
+and leaves a single mechanism for both device-wide meters instead of two.
 
-```
-Error: cdx: the SEC rate is frames per second, up to a 10G port's 64-byte frame rate.
-Error: cdx: the SEC burst is frames, at most 2048.
-```
+Its rate really is packets per second — the profile is created in
+`e_FM_PCD_PLCR_PACKET_MODE` with the `QM_SECRATE` defaults — so unlike the punt
+policer there is no mode to check and no unit to refuse.
 
-The profile is enabled once, when the instance registers, rather than on every
-write: the hardware layer's enable is idempotent but announces itself in a
-printk, and a knob that logs a line every time it is written is a knob nobody
-uses twice. `dmesg` carries none of them, and no BUG, WARNING, call trace or
-KASAN output beyond the init banner.
+*It is idle in flowtable mode today, and that is temporary.* `CMD_INIT(ipsec)`
+is skipped when the flowtable owns the hardware and `to_sec_fqid` is set
+nowhere else, so nothing selects this profile there yet: IPsec has not been
+ported to the flowtable, it is backlog, and QoS went first. The policer is
+registered unconditionally so that when IPsec lands the meter works with no
+change here — gating it on the ownership mode would only leave a gate somebody
+has to remember to remove.
+
+*Proved on hardware, 2026-09-17.* Both policers appear on
+`platform/1a00000.fman`, policer 2 defaulting to `rate 14880952 burst 2048` —
+`QM_SECRATE_MAX_CIR`, the 64-byte frame rate of a 10G port. Set to
+`rate 200000 burst 1024` it read back as asked, and CMM's range is enforced at
+both edges: `rate 99999999` and `burst 4096` are both refused. `devlink dev
+param show` is now empty, the parameters having been replaced rather than
+duplicated. No BUG, WARNING or call trace.
 
 **What this closes.** With the punt rate a trap policer and the SEC rate a
 parameter, no `CMD_QM_*` family is left without a kernel-verb equivalent, and
@@ -1605,14 +1616,20 @@ different is only *who selects it*: the hardware does, when it steers a frame to
 the SEC block, and no 5-tuple filter can say "the crypto engine's input" because
 that is not a property of any flow's tuple.
 
-So it is an aggregate meter on one internal engine, and **no kernel verb
-describes it.** It is not a trap — nothing is being punted — and it is not a
-filter's own match. `devlink param` is the remaining generic surface, and a
-driver-specific `u32` param is an honest way to spell "the rate at which this
-device will feed its crypto engine", even though it is a knob rather than a
-model of the thing. That is the one place in this document where goal 2 is met
-in letter and not in spirit, and it is worth saying so plainly rather than
-inventing a shape for it.
+So it is a meter on one internal engine's input, and the first reading of that
+was that **no kernel verb describes it** — not a trap, not a filter's own
+match — leaving a driver-specific `devlink param` as the only generic surface,
+a knob rather than a model of the thing. That was recorded as the one place in
+this document where goal 2 is met in letter and not in spirit.
+
+**It was the wrong answer, and a parameter is what showed it: a parameter
+cannot report a drop count.** Every other meter here can be asked what it
+discarded. What this object actually is — a rate, a burst and a drop count — is
+precisely a devlink policer, which is why it became [policer 2](#the-sec-meter-as-a-second-policer)
+rather than two parameters. Both device-wide meters now answer the same three
+verbs. The reservation stands only over the naming: devlink keeps policers in
+the `trap` namespace, and this one throttles an internal engine rather than a
+punt.
 
 Its ceiling stays as it is: `QM_SECRATE_MAX_CIR = 14880952` is the 64-byte frame
 rate of a 10G port, the profile really is programmed in
