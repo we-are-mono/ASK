@@ -20,6 +20,7 @@
 #include "layer2.h"
 #include "control_ipsec.h"
 #include "cdx_dpa_ipsec.h"
+#include "cdx_flowtable.h"
 #include "misc.h"
 
 //#define CONTROL_IPSEC_DEBUG 1
@@ -1365,7 +1366,14 @@ int ipsec_init(void)
 	cdx_timer_init(&sa_timer, M_ipsec_sa_timer);
 	cdx_timer_add(&sa_timer, SA_TIMER_INTERVAL);
 
-	set_cmd_handler(EVENT_IPS_IN, M_ipsec_cmdproc);
+	/* The only part of this init that belongs to one owner. Every FCI
+	 * command already returns -EOPNOTSUPP in flowtable mode, so leaving
+	 * the handler registered would be harmless — but a dispatch entry
+	 * for a bus that is not running says the wrong thing about who owns
+	 * the subsystem, and this is the line the ownership gate used to
+	 * stand in front of. */
+	if (!cdx_flowtable_enabled())
+		set_cmd_handler(EVENT_IPS_IN, M_ipsec_cmdproc);
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 	//register hook function for intercepting ipsec packets from ethernet driver
 	if (dpa_register_ipsec_fq_handler(cdx_get_to_sec_fq_handler)) {
