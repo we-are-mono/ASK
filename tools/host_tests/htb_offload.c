@@ -127,11 +127,13 @@ static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->pri
 
 /* What the stack does with a queue index the driver hands back. */
 #define DPA_SELECT_QUEUE_NONE	((u16)~0U)
+#define DPA_CEETM_CLASS_STATS	3
 struct sk_buff;
 struct qman_fq;
 struct dpa_qdisc_ops {
 	u16 (*select_queue)(struct net_device *dev, struct sk_buff *skb);
 	struct qman_fq *(*txq_fq)(void *qm_ctx, u16 txq);
+	void (*class_stats)(void *qm_ctx, u64 *data);
 };
 
 /* Conntrack, as much of it as the queue selection touches. */
@@ -168,10 +170,27 @@ static struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx,
 	return &class_fqs[channel][quenum];
 }
 
+/* A synthetic total per (channel, class queue), so a test can say which pair a
+ * leaf slot's counters came from. Queues the hardware will not answer for stay
+ * at whatever the caller had. */
+static bool class_counters_fail;
+static int ceetm_class_counters(u32 channel, u32 quenum, u64 *deq_frames,
+				u64 *deq_bytes, u64 *rej_frames)
+{
+	if (channel >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return -EINVAL;
+	if (class_counters_fail)
+		return -EIO;
+	*deq_frames = 1000u * channel + quenum;
+	*deq_bytes = 100000u * channel + 100u * quenum;
+	*rej_frames = 10u * channel + quenum;
+	return 0;
+}
+
 static const struct dpa_qdisc_ops *registered_qdisc_ops;
 static int dpa_register_qdisc_ops(const struct dpa_qdisc_ops *ops)
 {
-	if (!ops || !ops->select_queue || !ops->txq_fq)
+	if (!ops || !ops->select_queue || !ops->txq_fq || !ops->class_stats)
 		return -EINVAL;
 	if (registered_qdisc_ops)
 		return -EBUSY;
@@ -296,9 +315,11 @@ static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
  * builds its own from the production callbacks it does compile. */
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb);
 static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq);
+static void cdx_htb_class_stats(void *qm_ctx, u64 *data);
 static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {
 	.select_queue = cdx_htb_select_queue,
 	.txq_fq = cdx_htb_txq_fq,
+	.class_stats = cdx_htb_class_stats,
 };
 static cdx_ft_setup_tc_handler registered_ndo;
 static int dpa_register_setup_tc(cdx_ft_setup_tc_handler handler)
@@ -343,6 +364,7 @@ static void reset_world(void)
 	devices[1].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
 	memset(class_fqs, 0, sizeof(class_fqs));
 	real_num_tx_queues_fails = 0;
+	class_counters_fail = false;
 	cdx_ft_qos_class_func = NULL;
 	stop_calls = 0;
 	fault_point = -1;
@@ -834,6 +856,57 @@ static void test_software_path(void)
 	assert_balanced(dev);
 }
 
+/* ethtool asks for a fixed number of values and gets one for every leaf slot,
+ * whatever the tree looks like -- names and values arrive in separate ioctls,
+ * so a count that moved with the tree would misalign them. */
+static void test_class_statistics(void)
+{
+	u64 data[CDX_HTB_MAX_LEAVES * DPA_CEETM_CLASS_STATS];
+	struct net_device *dev = &devices[0];
+	u16 qid1, qid2, qid10;
+	unsigned ii;
+
+	reset_world();
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!add_leaf(dev, 2, 0, 0, 0, 1000, 1000, &qid2));
+	assert(!to_inner(dev, 10, 1, 0, 0));
+	assert(!query(dev, 10, &qid10));
+
+	memset(data, 0xff, sizeof(data));
+	cdx_htb_class_stats(dev->priv.qm_ctx, data);
+	/* Slot 0 is class 10: channel 0, the top strict-priority queue. */
+	assert(data[0] == NUM_PQS - 1 && data[1] == 100u * (NUM_PQS - 1));
+	assert(data[2] == NUM_PQS - 1);
+	/* Slot 1 is class 2, on the second channel. */
+	assert(data[3] == 1000u + NUM_PQS - 1);
+	assert(data[4] == 100000u + 100u * (NUM_PQS - 1));
+	assert(data[5] == 10u + NUM_PQS - 1);
+	/* Every other slot is left exactly as the caller had it, which is the
+	 * zero the driver writes before asking. */
+	for (ii = 2 * DPA_CEETM_CLASS_STATS; ii < ARRAY_SIZE(data); ii++)
+		assert(data[ii] == UINT64_MAX);
+
+	/* A queue the hardware will not answer for leaves its slot alone rather
+	 * than reporting a number nothing stands behind. */
+	memset(data, 0, sizeof(data));
+	class_counters_fail = true;
+	cdx_htb_class_stats(dev->priv.qm_ctx, data);
+	for (ii = 0; ii < ARRAY_SIZE(data); ii++)
+		assert(data[ii] == 0);
+	class_counters_fail = false;
+
+	/* A port with no context at all still has to be safe to ask. */
+	cdx_htb_class_stats(NULL, data);
+
+	assert(!destroy(dev));
+	memset(data, 0, sizeof(data));
+	cdx_htb_class_stats(dev->priv.qm_ctx, data);
+	for (ii = 0; ii < ARRAY_SIZE(data); ii++)
+		assert(data[ii] == 0);
+	assert_balanced(dev);
+}
+
 /* A queue that cannot be put into service is a class that cannot be created,
  * and it has to leave nothing behind. */
 static void test_queue_budget(void)
@@ -883,12 +956,13 @@ int main(void)
 	test_depth_and_limits();
 	test_channel_reuse();
 	test_software_path();
+	test_class_statistics();
 	test_queue_budget();
 	test_faults();
 	test_dispatch();
 	test_refusals();
 	assert(allocations == 0);
 	printf("htb offload: tree, density, limits, reuse, software path, "
-	       "%d fault points, dispatch passed\n", 24);
+	       "statistics, %d fault points, dispatch passed\n", 24);
 	return 0;
 }
