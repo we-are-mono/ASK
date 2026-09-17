@@ -19,10 +19,15 @@ other, and the thing that used to join them is the daemon being retired.
 
 Concretely, in a flowtable boot today:
 
-- `cdx/cdx_cmdhandler.c:165` skips `CMD_INIT(ipsec)`. It is the only subsystem
-  gated on ownership; `CMD_INIT(qm)`, `CMD_INIT(mc4)` and `CMD_INIT(mc6)` all
-  run unconditionally. So the SA caches are not initialised, the CAAM job ring
-  is not claimed and the datapath hook is not registered.
+- **Two** ownership gates skip IPsec, not one, and they are easy to mistake for
+  each other. `cdx/cdx_cmdhandler.c:165` skips `CMD_INIT(ipsec)`, so the SA
+  caches are not initialised, the CAAM job ring is not claimed and the datapath
+  frame-queue hook is not registered. Separately, `cdx/cdx_main.c:395` jumps
+  over `cdx_dpa_ipsec_init()` and the scatter-gather and skb-return buffer
+  pools, so the SEC **offline port, buffer pool and PCD frame queues** are
+  never built at all. The second one is the one that matters most and the
+  easier to miss: its absence surfaces as a shared descriptor that cannot be
+  created, several layers from the cause, with no log line naming a pool.
 - `to_sec_fqid` is written only from the CMM path, so no frame selects SEC.
 - `devlink trap policer 2` — the SEC meter registered by the QoS increment —
   meters nothing, which `cdx/cdx_devlink.c:99` already says is temporary.
@@ -220,16 +225,23 @@ old SA, let fresh traffic readmit against the new one. ISSUES A15 settled that
 no resync is needed and that blackout-window losses are recovered by an xfrm
 flush. So the field is dropped rather than reimplemented.
 
-**`type_offload` must exist for ESP.** `xfrm_dev_state_add()` refuses a state
-whose `x->type_offload` is NULL before it ever reaches the driver, and that
-type is registered by the ESP offload module. The test image's defconfig has
-`CONFIG_INET_ESP_OFFLOAD=m` but `CONFIG_INET6_ESP_OFFLOAD=y`
-(`meta-ask/recipes-kernel/linux/files/defconfig:99`, `:105`). The asymmetry is
-not deliberate and IPv4 is the one that matters first, so the v4 symbol moves
-to `=y` with this work rather than leaving a hardware feature dependent on
-`esp4_offload` having been modprobed. The failure it would otherwise produce
-is a clean `-EINVAL` from the netlink add, not a silent fallback, which is
-easy to misread as the driver refusing the SA.
+**`type_offload` must exist for ESP, and getting it took two config changes
+rather than one.** `xfrm_dev_state_add()` refuses a state whose
+`x->type_offload` is NULL before it ever reaches the driver, and that type is
+registered by the ESP offload module. The test image had
+`CONFIG_INET_ESP_OFFLOAD=m` against `CONFIG_INET6_ESP_OFFLOAD=y`, and the
+initramfs does not even package `esp4_offload.ko`, so the v4 type was never
+registered at all.
+
+Setting `CONFIG_INET_ESP_OFFLOAD=y` alone does nothing, silently: it depends on
+`INET_ESP`, which was `=m`, so Kconfig downgrades it straight back to `=m` and
+`olddefconfig` reports nothing. Both symbols move to `=y`, matching the IPv6
+side, which was already built in.
+
+The failure this produces is worth recognising, because it looks like the
+driver refusing the SA and is not: `ip xfrm state add … offload packet` fails
+with *"Error: Type doesn't support offload"*, which is the `type_offload` gate
+and happens before any `xdo_dev_state_add` runs.
 
 `CONFIG_INET_IPSEC_OFFLOAD=y`, `CONFIG_INET6_IPSEC_OFFLOAD=y` and
 `CONFIG_CPE_FAST_PATH=y` are all already set, so patch 040's code is compiled
@@ -252,12 +264,40 @@ by `xfrm_dev_state_add()` before the driver sees it. ESN is admitted; the
 state is programmed with the ESN flag and `xdo_dev_state_advance_esn` is where
 the sequence-number window is kept, not in an ASK-private notifier.
 
-**The device.** The state's `xso.dev` must be a registered physical CDX port,
-running, with carrier, and outside bridge and L3-slave configurations — the
-same port predicate `cdx_ft_hw_add()` already applies to its ingress and
-egress devices. A state bound to any other device is refused with `-EINVAL`
-rather than accepted and ignored, because packet offload has no silent
-software fallback and an accepted-but-dead SA would black-hole the tunnel.
+**The device.** The state's `xso.dev` must be a registered physical CDX port.
+A state bound to any other device is refused rather than accepted and ignored,
+because packet offload has no silent software fallback and an accepted-but-dead
+SA would black-hole the tunnel. This is an *identity* test and deliberately not
+the liveness one a flow's ports face: an SA may legitimately be installed
+before the link it will ride has carrier, and refusing then would fail the
+tunnel outright instead of delaying it.
+
+**The local endpoint must be an address on that port.** Not a contract this
+work chose — it is how CDX resolves an SA to an interface at all.
+`cdx_ipsec_add_classification_table_entry()` looks the SA up by address:
+`sa->id.saddr` for an outbound SA, `sa->id.daddr` for an inbound one. A
+tunnel whose local endpoint lives somewhere else is refused with
+`dpa_get_iface_info_by_ipaddress returned error` in the log. Real deployments
+satisfy this without trying, because strongSwan's local endpoint is the WAN
+address; a bench that invents endpoints has to put one on the port.
+
+**An outbound SA needs a resolved next hop at install time**, and this is the
+requirement that most changes the shape of the work. What leaves SEC is a
+finished frame: the hardware writes the outer header and both Ethernet
+addresses, so it must be told the destination before the first packet. The
+legacy owner never resolved anything — CMM had already filled CDX's route
+table over FCI and named a route id — and **this ownership mode keeps that
+table empty by design**, the same way the flowtable gives each direction a
+private route rather than joining the legacy hash. So the adapter resolves the
+peer through the ordinary FIB and neighbour table and the SA carries its own
+embedded route, holding the single reference a table-held one would have had.
+
+A missing route or an unresolved neighbour is therefore a refusal, not
+something to wait out. In practice IKE has just completed a round trip with
+the peer, so both exist. What has no equivalent yet is the *later* case: CMM
+handled a route change under an SA with `CMD_IPSEC_SA_SET_TNL_ROUTE`, and
+nothing here re-resolves one. That belongs with the dependency watches in the
+increments below rather than with the SA install.
 
 **The flow.** A flow is eligible for the SEC action when its egress
 destination carries exactly one `xfrm_state`, that state is offloaded to a
@@ -289,10 +329,12 @@ Ordered so that each step is provable on the rig before the next depends on it.
 
 ### 1. Ungate the hardware
 
-Run `CMD_INIT(ipsec)` in both ownership modes and move the FCI dispatch
-registration behind the ownership check instead of the whole init. After this
-the SA caches exist, the CAAM job ring is claimed, the SEC era is detected and
-`cdx_get_to_sec_fq_handler` is registered in a flowtable boot.
+Both gates. Run `CMD_INIT(ipsec)` in both ownership modes and move the FCI
+dispatch registration behind the ownership check instead of the whole init, and
+stop jumping over `cdx_dpa_ipsec_init()` in `cdx_module_init()`. After this the
+SA caches exist, the CAAM job ring is claimed, the SEC era is detected,
+`cdx_get_to_sec_fq_handler` is registered, and — the part the first pass missed
+— the SEC offline port, buffer pool and PCD frame queues are built.
 
 Proof: a flowtable boot logs the SEC era and the job-ring device, and
 `devlink trap policer 2` is present with zero counts — unchanged behaviour,
@@ -378,11 +420,75 @@ computes, minus the serialisation:
 | Hardware cookie | written back to `x->xso.offload_handle` |
 
 The port's `NETIF_F_HW_ESP` feature bit is set here too, without which
-strongSwan never offers the state — see the consumer contract above.
+strongSwan never offers the state — see the consumer contract above. It goes
+into `wanted_features` as well as `hw_features` and `features`, because
+`netdev_get_wanted_features()` is `(features & ~hw_features) | wanted_features`:
+once the bit is advertised in `hw_features` the first term stops carrying it,
+so anything that later recomputes features would clear it and the only symptom
+would be strongSwan quietly declining to offload from then on.
+
+#### The callback contract, which decides where the teardown goes
+
+Three facts about when these run, none of them obvious from the ops struct,
+and together they fix the design:
+
+- **`xdo_dev_state_delete()` is atomic.** `xfrm_state_delete()` takes `x->lock`
+  with `spin_lock_bh()` around `__xfrm_state_delete()`, which is what reaches
+  the callback. Every backend operation needs the control mutex, so no hardware
+  teardown can happen there.
+- **`xdo_dev_state_free()` may sleep**, reached from `___xfrm_state_destroy()`
+  on the garbage collector's workqueue or after a `synchronize_rcu()`. The
+  teardown goes there. It also runs while the state is still allocated —
+  `xfrm_dev_state_free()` is called before `xfrm_state_free()` — which is what
+  makes a borrowed state pointer safe.
+- **The backend must not hold a reference to the state.** Free is reached only
+  once the last reference is gone, so a reference held by the SA would be
+  waiting for the teardown that is waiting for it, and the SA would never be
+  destroyed at all. The pointer is borrowed and dropped in the teardown.
+
+What this leaves is a window between a state being deleted and its last
+reference going away, during which the hardware SA is still installed. It is
+bounded by an RCU grace period and the state garbage collector, and the legacy
+owner has the same window for the same reason — its `SA_DELETE` is
+asynchronous too.
+
+**Policy offload is deliberately not implemented, and that is load-bearing
+rather than a gap.** `xfrm_state_find()`'s acquire path calls
+`xdo_dev_state_add()` under `xfrm_state_lock` with `netdev_hold(GFP_ATOMIC)`
+beside it, and its failure branch calls `xdo_dev_state_free()` under the same
+lock. Both are reachable only when a *policy* was packet-offloaded, so
+declining `xdo_dev_policy_add` keeps every callback in the context this design
+assumes. Adding policy offload later would make both callbacks atomic on that
+path and make this teardown illegal; whoever adds it has to move the teardown
+to a workqueue first.
 
 Proof: `ip xfrm state add … offload packet dev ethN` succeeds, the SA appears
 in CDX's cache, `ethtool -k ethN` reports `esp-hw-offload: on`, and deleting
 the state releases the SEC context.
+
+#### Proved on hardware, 2026-09-18
+
+`tools/tests/test_ipsec_xfrm_offload.py`, both cases, on a KASAN flowtable
+boot. Each was watched failing first: `esp-hw-offload: off [fixed]` before the
+ops were attached, and the SA refused before each gate below was cleared.
+
+```
+[   15.456749] cdx_ipsec_init SEC era= 8
+[   27.688329] ipsec_init_ohport:: ipsec of port id = 9
+[   27.695407]  add_ipsec_bpool::bp->size :1792, bpid 34
+# ethtool -k eth3 | grep esp-hw   ->  esp-hw-offload: on
+# ethtool -k eth4 | grep esp-hw   ->  esp-hw-offload: on
+```
+
+**Four refusals stood between the ops being registered and an SA installing,
+and each one was a layer the design had not accounted for.** In order:
+`Type doesn't support offload` (the ESP offload type, two config symbols);
+`dpa_get_iface_info_by_ipaddress returned error` (the local endpoint must be
+an address on the port); `dpa_get_out_tx_info_by_itf_id::NULL Route` (an
+outbound SA needs egress framing, and this mode keeps no route table); and
+`unable to create shared desc` (the SEC buffer pool, skipped by the second
+ownership gate). None was visible from reading; each surfaced several layers
+from its cause.
 
 ### 4. The slow path
 

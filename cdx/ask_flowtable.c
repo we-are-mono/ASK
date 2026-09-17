@@ -46,9 +46,11 @@
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
 #include <net/switchdev.h>
+#include <net/xfrm.h>
 #include <dpaa_eth_common.h>
 #include "cdx_flowtable_backend.h"
 #include "cdx_flowtable.h"
+#include "cdx_ipsec_backend.h"
 #include "cdx_police.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 8
@@ -1836,6 +1838,9 @@ static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
 	spin_unlock_bh(&ft_watch_lock);
 }
 
+static void ft_ipsec_attach(struct net_device *dev);
+static void ft_ipsec_detach(struct net_device *dev);
+
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
@@ -1843,6 +1848,13 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
 	switch (event) {
+	case NETDEV_REGISTER:
+		/* Also how every port that already exists is reached:
+		 * register_netdevice_notifier() replays this event for each of
+		 * them, under the RTNL the attachment needs, so there is no
+		 * separate startup walk to keep in step with this one. */
+		ft_ipsec_attach(dev);
+		break;
 	case NETDEV_CHANGE:
 		if (netif_running(dev) && netif_carrier_ok(dev))
 			break;
@@ -1867,6 +1879,12 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * pinned physical device, including after table recreation. */
 		break;
 	case NETDEV_UNREGISTER:
+		/* Drop the ops before the device goes, so nothing can reach
+		 * this module through a device it no longer owns. Any SA still
+		 * bound to it has already been deleted by the core, which
+		 * unwinds offloaded states when their device unregisters. */
+		ft_ipsec_detach(dev);
+		fallthrough;
 	case NETDEV_CHANGEUPPER:
 		spin_lock_bh(&ft_watch_lock);
 		/* Latch before releasing the watch lock: a concurrent last unbind
@@ -2114,6 +2132,328 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 		ft_invalidate();
 	spin_unlock_bh(&ft_watch_lock);
 	return NOTIFY_DONE;
+}
+
+/* ---------------------------------------------------------------- IPsec
+ *
+ * Mainline's device offload API, used in its packet mode. strongSwan asks for
+ * it per child SA with `hw_offload = packet` (or `auto`), the kernel resolves
+ * the state and hands it to xdo_dev_state_add(), and everything below is
+ * translation: the hardware SA machinery is CDX's, reached through
+ * cdx_ipsec_backend.h.
+ *
+ * Why the adapter rather than CDX, when CDX is already xfrm-aware: an SA's
+ * eligibility is policy, and policy lives on this side of the interface for
+ * the same reason a flow's does. Retiring the directions that depend on an SA
+ * will need the watch list too, which is here.
+ */
+
+/* Resolve the next hop toward the remote tunnel endpoint.
+ *
+ * An outbound SA needs this at install time, because what leaves SEC is a
+ * finished frame: the hardware writes the outer header and the Ethernet
+ * addresses, so it has to be told the destination before the first packet,
+ * not after. The legacy owner never resolved anything here -- CMM had already
+ * populated CDX's route table over FCI and named a route id -- and this
+ * ownership mode keeps no such table, so the adapter answers the question the
+ * same way it answers it for a flow.
+ *
+ * The lookup is the ordinary FIB, ignoring policy routing for the same reason
+ * admission does: Linux's own selected route is the answer, and repeating the
+ * decision with incomplete context would be guessing. A missing route or an
+ * unresolved neighbour is a refusal rather than something to retry, because
+ * packet offload has no software fallback to wait in.
+ */
+static int ft_ipsec_next_hop(struct xfrm_state *x,
+			     struct cdx_ipsec_sa_spec *spec,
+			     struct netlink_ext_ack *extack)
+{
+	struct neighbour *neigh;
+	struct rtable *rt;
+	struct flowi4 fl4 = {
+		.daddr = x->id.daddr.a4,
+		.saddr = x->props.saddr.a4,
+		.flowi4_oif = spec->dev->ifindex,
+	};
+	int rc = 0;
+
+	if (spec->family != AF_INET) {
+		NL_SET_ERR_MSG(extack, "cdx: only IPv4 tunnel endpoints are supported");
+		return -EOPNOTSUPP;
+	}
+	rt = ip_route_output_key(&init_net, &fl4);
+	if (IS_ERR(rt)) {
+		NL_SET_ERR_MSG(extack, "cdx: no route to the remote tunnel endpoint");
+		return PTR_ERR(rt);
+	}
+	if (rt->dst.dev != spec->dev) {
+		NL_SET_ERR_MSG(extack, "cdx: the route to the peer does not leave by the offload device");
+		rc = -EOPNOTSUPP;
+		goto out;
+	}
+	rcu_read_lock();
+	neigh = __ipv4_neigh_lookup_noref(rt->dst.dev,
+					  (__force u32)rt_nexthop(rt, fl4.daddr));
+	/* Every usable state, which is the same set admission accepts: a
+	 * neighbour that is merely stale still has the address that was last
+	 * confirmed, and Linux will refresh it in its own time. */
+	if (neigh && (neigh->nud_state & NUD_VALID))
+		ether_addr_copy(spec->dst_mac, neigh->ha);
+	else
+		rc = -EHOSTUNREACH;
+	rcu_read_unlock();
+	if (rc)
+		NL_SET_ERR_MSG(extack, "cdx: the remote tunnel endpoint has no resolved neighbour");
+out:
+	ip_rt_put(rt);
+	return rc;
+}
+
+/* Translate a kernel state into the backend's description of one.
+ *
+ * Algorithm identities come straight from x->props.aalgo and x->props.ealgo,
+ * which are the PF_KEY numbers whatever configured the state resolved for us:
+ * xfrm_user sets them from the algorithm's own descriptor, including for AEAD,
+ * where xfrm_aead_get_byname() has already picked the descriptor matching the
+ * requested ICV length. So GCM at 8, 12 and 16 bytes arrive as three distinct
+ * identities with nothing here to derive -- the legacy serialiser matched on
+ * alg_name substrings and ICV arithmetic to reach the same three constants.
+ */
+static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
+			 struct netlink_ext_ack *extack)
+{
+	struct net_device *dev = x->xso.dev;
+
+	memset(spec, 0, sizeof(*spec));
+	spec->dev = dev;
+	spec->family = x->props.family;
+	spec->spi = x->id.spi;
+	spec->dir = x->xso.dir == XFRM_DEV_OFFLOAD_IN ? CDX_IPSEC_DIR_IN
+						      : CDX_IPSEC_DIR_OUT;
+	spec->tunnel = x->props.mode == XFRM_MODE_TUNNEL;
+	spec->esn = !!(x->props.flags & XFRM_STATE_ESN);
+	spec->replay = x->props.replay_window || x->replay_esn;
+	if (spec->family == AF_INET6) {
+		memcpy(spec->src.ip6, x->props.saddr.a6, sizeof(spec->src.ip6));
+		memcpy(spec->dst.ip6, x->id.daddr.a6, sizeof(spec->dst.ip6));
+	} else {
+		spec->src.ip = x->props.saddr.a4;
+		spec->dst.ip = x->id.daddr.a4;
+	}
+	/* The outer header's own fields, which are not the inner packet's.
+	 * Both constants match what the legacy serialiser emitted: a fixed hop
+	 * limit, and a traffic class of zero because the ECN and DSCP an
+	 * encapsulated frame carries are copied per frame by the hardware
+	 * rather than fixed once in the template. */
+	spec->ttl = 64;
+	spec->tos = 0;
+	/* Copying DF makes the tunnel report the inner path's fragmentation
+	 * needs, which is what path MTU discovery is. A state that asked for
+	 * no PMTU discovery is asking for the opposite. */
+	spec->copy_df = spec->family == AF_INET &&
+			spec->dir == CDX_IPSEC_DIR_OUT &&
+			!(x->props.flags & XFRM_STATE_NOPMTUDISC);
+	if (x->encap) {
+		if (x->encap->encap_type != UDP_ENCAP_ESPINUDP) {
+			NL_SET_ERR_MSG(extack, "cdx: only UDP-encapsulated ESP is supported");
+			return -EOPNOTSUPP;
+		}
+		spec->natt_sport = x->encap->encap_sport;
+		spec->natt_dport = x->encap->encap_dport;
+	}
+	if (x->aalg) {
+		if (x->aalg->alg_key_len > CDX_IPSEC_KEY_MAX * 8) {
+			NL_SET_ERR_MSG(extack, "cdx: authentication key too long");
+			return -EINVAL;
+		}
+		spec->auth.alg = x->props.aalgo;
+		spec->auth.bits = x->aalg->alg_key_len;
+		memcpy(spec->auth.key, x->aalg->alg_key, x->aalg->alg_key_len / 8);
+	}
+	/* ealg and aead are exclusive: a transform is either a cipher with a
+	 * separate authenticator or a single combined mode. Both land in the
+	 * same slot because SEC builds one descriptor either way, and the
+	 * algorithm identity already says which it is. */
+	if (x->ealg) {
+		if (x->ealg->alg_key_len > CDX_IPSEC_KEY_MAX * 8) {
+			NL_SET_ERR_MSG(extack, "cdx: cipher key too long");
+			return -EINVAL;
+		}
+		spec->crypt.alg = x->props.ealgo;
+		spec->crypt.bits = x->ealg->alg_key_len;
+		memcpy(spec->crypt.key, x->ealg->alg_key, x->ealg->alg_key_len / 8);
+	} else if (x->aead) {
+		if (x->aead->alg_key_len > CDX_IPSEC_KEY_MAX * 8) {
+			NL_SET_ERR_MSG(extack, "cdx: AEAD key too long");
+			return -EINVAL;
+		}
+		spec->crypt.alg = x->props.ealgo;
+		spec->crypt.bits = x->aead->alg_key_len;
+		memcpy(spec->crypt.key, x->aead->alg_key, x->aead->alg_key_len / 8);
+	}
+	spec->lft.soft_bytes = x->lft.soft_byte_limit == XFRM_INF ? 0 :
+			       x->lft.soft_byte_limit;
+	spec->lft.hard_bytes = x->lft.hard_byte_limit == XFRM_INF ? 0 :
+			       x->lft.hard_byte_limit;
+	spec->lft.soft_packets = x->lft.soft_packet_limit == XFRM_INF ? 0 :
+				 x->lft.soft_packet_limit;
+	spec->lft.hard_packets = x->lft.hard_packet_limit == XFRM_INF ? 0 :
+				 x->lft.hard_packet_limit;
+	spec->dev_mtu = dev->mtu;
+	spec->mtu = xfrm_state_mtu(x, dev->mtu);
+	if (spec->dir == CDX_IPSEC_DIR_OUT)
+		return ft_ipsec_next_hop(x, spec, extack);
+	return 0;
+}
+
+static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack)
+{
+	struct cdx_ipsec_sa_spec spec;
+	struct cdx_ipsec_sa *sa;
+	int rc;
+
+	/* Crypto offload would leave the stack building every ESP header and
+	 * hand SEC only the cipher, which is not what this hardware is for and
+	 * not what the classifier can steer. Refusing is the honest answer;
+	 * a caller asking for `auto` gets software instead, which works. */
+	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET) {
+		NL_SET_ERR_MSG(extack, "cdx: only packet offload is supported");
+		return -EOPNOTSUPP;
+	}
+	if (x->id.proto != IPPROTO_ESP) {
+		NL_SET_ERR_MSG(extack, "cdx: only ESP can be offloaded");
+		return -EOPNOTSUPP;
+	}
+	if (x->props.mode != XFRM_MODE_TUNNEL &&
+	    x->props.mode != XFRM_MODE_TRANSPORT) {
+		NL_SET_ERR_MSG(extack, "cdx: only tunnel and transport mode can be offloaded");
+		return -EOPNOTSUPP;
+	}
+	rc = ft_ipsec_spec(x, &spec, extack);
+	if (rc)
+		return rc;
+	cdx_ft_begin();
+	rc = cdx_ipsec_sa_add(&spec, x, &sa);
+	cdx_ft_end();
+	if (rc) {
+		NL_SET_ERR_MSG_WEAK(extack, "cdx: the hardware refused this SA");
+		return rc;
+	}
+	/* The opaque owner, not the sixteen-bit handle: it identifies this SA
+	 * for as long as it lives, whereas a handle becomes reusable the
+	 * moment the SA is deleted. cdx_ipsec_sa_handle() still answers for
+	 * anything that needs the number the hardware knows. */
+	x->xso.offload_handle = (unsigned long)sa;
+	return 0;
+}
+
+/* Delete cannot touch the hardware, and this is not an oversight.
+ *
+ * xfrm_state_delete() takes x->lock with spin_lock_bh() before calling
+ * __xfrm_state_delete(), which is what reaches this callback -- so it runs in
+ * atomic context, and every backend operation needs the control mutex. The
+ * teardown therefore belongs in free, below, which is the one of the two that
+ * may sleep.
+ *
+ * What this leaves is a window: between the state being deleted and its last
+ * reference going away, the hardware SA is still installed and still
+ * encrypting. That window is bounded by an RCU grace period and the state
+ * garbage collector, and the legacy owner has the same one for the same
+ * reason -- its SA_DELETE is asynchronous too.
+ */
+static void ft_xdo_state_delete(struct xfrm_state *x)
+{
+}
+
+/* Reached from ___xfrm_state_destroy(), after the last reference is gone and
+ * before the state itself is freed, in a context that may sleep -- the garbage
+ * collector's workqueue, or a caller that has just done synchronize_rcu().
+ *
+ * There is one path where it is called under a spinlock instead, in
+ * xfrm_state_find()'s acquire failure branch. It is unreachable here: it runs
+ * only when a *policy* was packet-offloaded, and this driver offers no
+ * xdo_dev_policy_add, so pol->xdo.type is never XFRM_DEV_OFFLOAD_PACKET. That
+ * is worth knowing before policy offload is ever added, because adding it
+ * would make this callback atomic on that path and this teardown illegal.
+ */
+static void ft_xdo_state_free(struct xfrm_state *x)
+{
+	struct cdx_ipsec_sa *sa = (struct cdx_ipsec_sa *)x->xso.offload_handle;
+
+	if (!sa)
+		return;
+	x->xso.offload_handle = 0;
+	cdx_ft_begin();
+	cdx_ipsec_sa_del(&sa);
+	cdx_ft_end();
+}
+
+static bool ft_xdo_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
+{
+	/* Reached only after the core's own size check. There is nothing
+	 * per-frame left to refuse: an SA the hardware accepted stays
+	 * installed until the state is deleted, and a port that has gone down
+	 * takes its flows with it rather than its SAs. */
+	return true;
+}
+
+static const struct xfrmdev_ops ft_xfrmdev_ops = {
+	.xdo_dev_state_add	= ft_xdo_state_add,
+	.xdo_dev_state_delete	= ft_xdo_state_delete,
+	.xdo_dev_state_free	= ft_xdo_state_free,
+	.xdo_dev_offload_ok	= ft_xdo_offload_ok,
+};
+
+/* Attach the ops to a CDX physical port, and say so in its features.
+ *
+ * The feature bit is not decoration. strongSwan resolves the position of
+ * `esp-hw-offload` once at startup and then tests it per interface before it
+ * will even ask the kernel for offload, so a port that does not advertise it
+ * is simply never offered an SA -- silently, and with the tunnel working in
+ * software. Whatever sets the ops must set this too.
+ */
+static void ft_ipsec_attach(struct net_device *dev)
+{
+	ASSERT_RTNL();
+	if (dev->xfrmdev_ops || !cdx_ipsec_port_supported(dev))
+		return;
+	dev->xfrmdev_ops = &ft_xfrmdev_ops;
+	/* All three, and wanted_features is the one that is easy to miss.
+	 * netdev_get_wanted_features() is (features & ~hw_features) |
+	 * wanted_features, so the moment the bit is advertised in hw_features
+	 * the first term stops carrying it. Anything that recomputes features
+	 * afterwards -- an MTU change, joining a bridge, an unrelated ethtool
+	 * call -- would then clear it, and the only symptom would be
+	 * strongSwan quietly declining to offload from that point on. */
+	dev->hw_features |= NETIF_F_HW_ESP;
+	dev->wanted_features |= NETIF_F_HW_ESP;
+	dev->features |= NETIF_F_HW_ESP;
+	netdev_features_change(dev);
+}
+
+static void ft_ipsec_detach(struct net_device *dev)
+{
+	ASSERT_RTNL();
+	if (dev->xfrmdev_ops != &ft_xfrmdev_ops)
+		return;
+	dev->features &= ~NETIF_F_HW_ESP;
+	dev->wanted_features &= ~NETIF_F_HW_ESP;
+	dev->hw_features &= ~NETIF_F_HW_ESP;
+	dev->xfrmdev_ops = NULL;
+	netdev_features_change(dev);
+}
+
+/* Detach from every port this module attached to. Unload cannot leave an ops
+ * pointer into freed module text behind, and there is no notifier replay for
+ * unregistration to do it for us. */
+static void ft_ipsec_detach_all(void)
+{
+	struct net_device *dev;
+
+	rtnl_lock();
+	for_each_netdev(&init_net, dev)
+		ft_ipsec_detach(dev);
+	rtnl_unlock();
 }
 
 static struct notifier_block ft_netdev_nb = { .notifier_call = ft_netdev_event };
@@ -2435,6 +2775,9 @@ neigh:
 	unregister_netevent_notifier(&ft_neigh_nb);
 netdev:
 	unregister_netdevice_notifier(&ft_netdev_nb);
+	/* The notifier's registration replayed NETDEV_REGISTER and attached
+	 * every port, so a failure after that point has ports to give back. */
+	ft_ipsec_detach_all();
 proc:
 	proc_remove(ft_proc);
 	ft_proc = NULL;
@@ -2502,6 +2845,10 @@ static void __exit ask_flowtable_exit(void)
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
 	unregister_netdevice_notifier(&ft_netdev_nb);
+	/* Unregistration replays nothing, so the ops this module planted on
+	 * each port have to be taken back by hand -- they point into text
+	 * that is about to go away. */
+	ft_ipsec_detach_all();
 	cancel_work_sync(&ft_retire_work);
 	cancel_delayed_work_sync(&ft_work);
 	/* Direct first: it is the route a DPAA port actually takes, so closing

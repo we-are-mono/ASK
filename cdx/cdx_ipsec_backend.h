@@ -94,6 +94,17 @@ struct cdx_ipsec_sa_spec {
 	 * and the fragmentation check wants the SA's own bound. */
 	u16 mtu;
 	u16 dev_mtu;
+	/* The next hop toward the remote tunnel endpoint, for an outbound SA.
+	 *
+	 * An outbound SA needs egress framing at install time, because the
+	 * encapsulated frame leaves SEC already addressed. The legacy owner
+	 * supplied that as a route object it had already been told about over
+	 * FCI; this ownership mode keeps no such table, so the caller resolves
+	 * the peer itself and names the result here, exactly as a flow's rule
+	 * names its own destination MAC. Ignored for an inbound SA, which is
+	 * classified rather than transmitted.
+	 */
+	u8 dst_mac[ETH_ALEN];
 	u8 family;
 	u8 dir;
 	/* Outer header fields for tunnel mode. `tos` is the traffic class the
@@ -131,25 +142,30 @@ struct cdx_ipsec_counters {
  * calls back into the adapter.
  */
 
-/* Whether this device can carry an offloaded SA at all. Answers false in CMM
- * mode, after terminal failure, and for any device that is not a registered
- * physical CDX port -- the same predicate a flow's ports must satisfy, because
- * an SA that named a device no flow could use would be accepted and then never
- * selected. Safe to call outside a transaction; the answer is provisional and
- * cdx_ipsec_sa_add() rechecks it.
+/* Whether this device is a CDX physical port, and so can carry an offloaded
+ * SA. This is an identity question and deliberately not a liveness one: an SA
+ * may legitimately be installed before the link it will ride has carrier, and
+ * packet offload has no software fallback, so refusing then would fail the
+ * tunnel outright rather than delay it. A flow over the SA is checked against
+ * the stricter cdx_ft_port_supported() when it is admitted.
+ *
+ * Needs neither a transaction nor RTNL, so the ops attachment can call it from
+ * a netdev notifier.
  */
 bool cdx_ipsec_port_supported(struct net_device *dev);
 
 /* Install an SA and return its opaque owner.
  *
- * `x` is the kernel state this SA was built from. The backend holds a
- * reference to it for the SA's whole life, because the SEC completion path
- * needs it: a decrypted frame arrives with nothing but the SA's handle in its
- * trailer, and the stack drops it unless a sec_path naming the state is
- * attached before it is delivered. Resolving that per packet is why the
- * legacy design put a handle index in the kernel's own state table; here the
- * backend allocated the handle and can answer from its own cache, so the
- * lookup stays where the handle lives and the kernel needs no index at all.
+ * `x` is the kernel state this SA was built from, and it is **borrowed**: the
+ * backend records the pointer and takes no reference. It needs the pointer
+ * because the SEC completion path has nothing but the SA's handle to work
+ * from and the stack drops a decrypted frame unless a sec_path naming the
+ * state is attached first. It must not take a reference because the caller is
+ * expected to destroy this SA from inside the kernel's own teardown of that
+ * state, which only runs once every reference is gone -- a reference here
+ * would be waiting for the teardown that is waiting for it. The pointer is
+ * therefore valid exactly as long as the caller honours that: destroy the SA
+ * while the state is still allocated.
  *
  * The handle is allocated here rather than supplied. A caller has no way to
  * know which values are free -- the SA cache is indexed by them -- and the
@@ -165,10 +181,11 @@ bool cdx_ipsec_port_supported(struct net_device *dev);
 int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		     struct cdx_ipsec_sa **result);
 
-/* Always consumes *sa. Releases the SEC context, the classifier entry, the
- * handle and the state reference. A flow still naming this SA is not the
- * backend's problem to solve: the caller retires its dependent directions
- * first, exactly as it does for a neighbour or a route.
+/* Always consumes *sa. Releases the SEC context, the classifier entry and the
+ * handle, and drops the borrowed state pointer without putting a reference it
+ * never took. A flow still naming this SA is not the backend's problem to
+ * solve: the caller retires its dependent directions first, exactly as it
+ * does for a neighbour or a route.
  */
 void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa);
 

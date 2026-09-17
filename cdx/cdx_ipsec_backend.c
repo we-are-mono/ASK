@@ -16,6 +16,8 @@
  * declares. Only the door is new.
  */
 
+#include <linux/etherdevice.h>
+#include <linux/if_arp.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
@@ -23,6 +25,7 @@
 #include <linux/string.h>
 #include <net/xfrm.h>
 
+#include "portdefs.h"
 #include "cdx.h"
 #include "cdx_common.h"
 #include "control_ipv4.h"
@@ -43,6 +46,15 @@
 struct cdx_ipsec_sa {
 	PSAEntry entry;
 	struct net_device *dev;
+	/* The outbound SA's own egress route, embedded rather than looked up.
+	 *
+	 * The legacy owner resolves sa->pRtEntry out of CDX's route table,
+	 * which CMM fills over FCI and which this ownership mode leaves empty
+	 * by design -- the flowtable gives each direction a private route for
+	 * the same reason. So an SA gets one too, built from what the caller
+	 * resolved, and it never joins the legacy route hash, its reference
+	 * counting or its ageing. */
+	RouteEntry route;
 	u16 handle;
 };
 
@@ -83,13 +95,26 @@ static int cdx_ipsec_alloc_handle(u16 *out)
 
 bool cdx_ipsec_port_supported(struct net_device *dev)
 {
-	/* An SA rides a flow, and a flow's ports must already satisfy the
-	 * flowtable contract. Answering anything wider here would accept an SA
-	 * bound to a device no direction could ever be installed on, which
-	 * fails later and further from the cause -- and, under packet offload,
-	 * fails as a black hole rather than as a refusal, because the stack
-	 * has already stopped encrypting for a state the hardware accepted. */
-	return cdx_ft_port_supported(dev);
+	/* Identity, not liveness, and the difference is the whole point of not
+	 * reusing cdx_ft_port_supported() here.
+	 *
+	 * That predicate also requires the port to be running with carrier,
+	 * which is right for a flow: a direction installed on a dead port
+	 * forwards nothing. An SA is not a flow. strongSwan can complete an
+	 * exchange and install a state before the link it will ride has
+	 * settled, and packet offload has no software fallback to degrade
+	 * into -- a refusal fails the SA outright. Gating on carrier would
+	 * therefore turn a momentary link event into a tunnel that never comes
+	 * up, for no gain: a flow over this SA is checked again, under RTNL,
+	 * when it is admitted.
+	 *
+	 * What must hold is that the device really is a CDX physical port, and
+	 * dpa_netdev_is_physical() answers exactly that under its own lock --
+	 * so this is safe from a notifier and from a caller holding RTNL,
+	 * which is where the ops attachment runs. */
+	return dev && net_eq(dev_net(dev), &init_net) &&
+	       dev->type == ARPHRD_ETHER && dev->addr_len == ETH_ALEN &&
+	       dpa_netdev_is_physical(dev);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_port_supported, ASK_CDX_FLOWTABLE);
 
@@ -166,6 +191,10 @@ static int cdx_ipsec_validate(const struct cdx_ipsec_sa_spec *spec)
 	 * it turns a caller's omission into plaintext on the wire. */
 	if (!spec->auth.alg && !spec->crypt.alg)
 		return -EOPNOTSUPP;
+	/* An outbound SA leaves SEC already addressed, so a next hop is part
+	 * of describing it rather than something to discover later. */
+	if (spec->dir == CDX_IPSEC_DIR_OUT && is_zero_ether_addr(spec->dst_mac))
+		return -EINVAL;
 	if (!cdx_ipsec_port_supported(spec->dev))
 		return -EOPNOTSUPP;
 	return 0;
@@ -245,23 +274,62 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		sa->natt.socket = NULL;
 	}
 
+	/* An outbound SA transmits, so it needs the egress framing now. The
+	 * onif is the hardware identity of the port the caller bound the SA
+	 * to, and the MAC is the next hop it resolved toward the peer. An
+	 * inbound SA is classified rather than transmitted and leaves this
+	 * NULL, which is what the legacy path also does for it. */
+	if (spec->dir == CDX_IPSEC_DIR_OUT) {
+		struct dpa_iface_info *iface;
+		POnifDesc onif;
+
+		iface = dpa_get_ifinfo_by_netdev(spec->dev);
+		if (!iface || iface->itf_id >= L2_MAX_ONIF) {
+			rc = -EOPNOTSUPP;
+			goto err_delete_sa;
+		}
+		onif = get_onif_by_index(iface->itf_id);
+		if (!(onif->flags & ENTRY_VALID) || !onif->itf ||
+		    onif->itf->index != iface->itf_id) {
+			rc = -EOPNOTSUPP;
+			goto err_delete_sa;
+		}
+		owner->route.itf = onif->itf;
+		owner->route.mtu = spec->dev_mtu;
+		ether_addr_copy(owner->route.dstmac, spec->dst_mac);
+		/* One holder: this SA. sa_remove() puts the route on teardown,
+		 * and that put warns on an unbalanced count -- so the embedded
+		 * route carries the reference a table-held one would have,
+		 * rather than the shared release path learning to special-case
+		 * a route it did not hand out. */
+		owner->route.nbref = 1;
+		sa->pRtEntry = &owner->route;
+	}
+
 	sa->lft_conf.soft_byte_limit = spec->lft.soft_bytes;
 	sa->lft_conf.hard_byte_limit = spec->lft.hard_bytes;
 	sa->lft_conf.soft_packet_limit = spec->lft.soft_packets;
 	sa->lft_conf.hard_packet_limit = spec->lft.hard_packets;
 
-	/* Bind the state before the entry exists, not after. The SEC
-	 * completion path resolves a decrypted frame's SA from the handle in
-	 * its trailer and needs the state to attach a sec_path; installing the
-	 * entry first would open a window in which frames arrive for an SA
-	 * whose state is not yet reachable, and they would be dropped. */
-	xfrm_state_hold(x);
+	/* Borrowed, deliberately without a reference.
+	 *
+	 * A reference here would be a cycle. The kernel tears an offloaded SA
+	 * down through xdo_dev_state_free(), which ___xfrm_state_destroy()
+	 * reaches only once the last reference to the state is gone -- so a
+	 * reference held by this SA would be waiting for the teardown that is
+	 * waiting for it, and neither would ever happen. The pointer is safe
+	 * without one because the caller destroys this SA from inside that
+	 * same free callback, while the state is still allocated.
+	 *
+	 * It is bound before the entry is installed rather than after, because
+	 * frames can arrive from SEC the moment the entry exists and the
+	 * completion path needs the state to attach a sec_path to them. */
 	sa->xfrm_state = x;
 
 	rc = ipsec_install_fp_entry(sa);
 	if (rc) {
 		rc = -EIO;
-		goto err_put_state;
+		goto err_clear_state;
 	}
 
 	sa->flags |= SA_ENABLED;
@@ -275,9 +343,8 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	*result = owner;
 	return 0;
 
-err_put_state:
+err_clear_state:
 	sa->xfrm_state = NULL;
-	xfrm_state_put(x);
 err_delete_sa:
 	M_ipsec_sa_cache_delete(handle);
 err_free_owner:
@@ -294,10 +361,13 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 	if (!owner)
 		return;
 	*sa = NULL;
-	/* The cache delete releases the state reference along with the SEC
-	 * context and the classifier entry, which is why none is dropped here:
-	 * the teardown can be deferred behind an FQ retire, and the state has
-	 * to outlive whatever is still in flight. */
+	/* Drop the borrowed state pointer before the release path runs. That
+	 * path puts a reference for the legacy owner, which does hold one --
+	 * this SA does not, for the reason cdx_ipsec_sa_add() gives, so the
+	 * put has to be given nothing to do rather than a reference that was
+	 * never taken. */
+	if (owner->entry)
+		owner->entry->xfrm_state = NULL;
 	M_ipsec_sa_cache_delete(owner->handle);
 	kfree(owner);
 }
