@@ -1424,6 +1424,19 @@ int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num)
 	return -ENOSPC;
 }
 
+/* The frame queue a class queue on a channel sends through, by the indices
+ * this file numbers them with. ceetm_get_egressfq() takes the conntrack mark's
+ * numbering instead, where zero means "whichever channel this port owns"
+ * rather than channel zero, so a caller that already knows the channel has to
+ * say so by naming it one higher. */
+struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
+			       uint32_t quenum)
+{
+	if (channel >= CDX_CEETM_MAX_CHANNELS)
+		return NULL;
+	return ceetm_get_egressfq(qm_ctx, channel + 1, quenum, 0);
+}
+
 /* Program a channel's committed and excess rates, in bits per second.
  *
  * A zero committed rate means no shaping at all: both buckets go to the token

@@ -110,14 +110,75 @@ struct tc_htb_qopt_offload {
 #define TC_HTB_CLASSID_ROOT	UINT32_MAX
 
 struct dpa_iface_info { char name[16]; };
+struct net_device;
 struct tQM_context_ctl {
 	struct dpa_iface_info *iface_info;
+	struct net_device *net_dev;
 	u32 qos_enabled;
 	u32 chnl_map;
 };
 struct dpa_priv_s { void *qm_ctx; };
-struct net_device { struct dpa_priv_s priv; };
+struct net_device {
+	struct dpa_priv_s priv;
+	char name[16];
+	unsigned real_num_tx_queues;
+};
 static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->priv; }
+
+/* What the stack does with a queue index the driver hands back. */
+#define DPA_SELECT_QUEUE_NONE	((u16)~0U)
+struct sk_buff;
+struct qman_fq;
+struct dpa_qdisc_ops {
+	u16 (*select_queue)(struct net_device *dev, struct sk_buff *skb);
+	struct qman_fq *(*txq_fq)(void *qm_ctx, u16 txq);
+};
+
+/* Conntrack, as much of it as the queue selection touches. */
+enum ip_conntrack_info { IP_CT_NEW, IP_CT_ESTABLISHED };
+struct nf_conn { u32 mark; };
+struct sk_buff { struct nf_conn *ct; };
+struct qman_fq { unsigned channel, quenum; };
+static struct nf_conn *nf_ct_get(struct sk_buff *skb, enum ip_conntrack_info *info)
+{
+	*info = IP_CT_ESTABLISHED;
+	return skb->ct;
+}
+static void synchronize_net(void) {}
+
+static int real_num_tx_queues_fails;
+static int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
+{
+	assert(txq >= 1 && txq <= DPAA_ETH_TX_QUEUES + DPAA_ETH_CEETM_LEAF_QUEUES);
+	if (real_num_tx_queues_fails && txq > dev->real_num_tx_queues)
+		return -ENOMEM;
+	dev->real_num_tx_queues = txq;
+	return 0;
+}
+
+/* One frame queue per (channel, class queue), so a test can name the pair a
+ * Tx queue resolved to rather than just that it resolved to something. */
+static struct qman_fq class_fqs[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
+static struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx,
+				      u32 channel, u32 quenum)
+{
+	assert(qm_ctx);
+	if (channel >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
+		return NULL;
+	return &class_fqs[channel][quenum];
+}
+
+static const struct dpa_qdisc_ops *registered_qdisc_ops;
+static int dpa_register_qdisc_ops(const struct dpa_qdisc_ops *ops)
+{
+	if (!ops || !ops->select_queue || !ops->txq_fq)
+		return -EINVAL;
+	if (registered_qdisc_ops)
+		return -EBUSY;
+	registered_qdisc_ops = ops;
+	return 0;
+}
+static void dpa_unregister_qdisc_ops(void) { registered_qdisc_ops = NULL; }
 
 static struct tQM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
@@ -228,6 +289,17 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 typedef int (*cdx_ft_setup_tc_handler)(struct net_device *dev,
 				       enum tc_setup_type type, void *type_data);
 static cdx_ft_setup_tc_handler cdx_ft_handler;
+typedef u8 (*cdx_ft_qos_class_fn)(u32 mark);
+static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
+
+/* The ops table is file-scope data rather than a function, so the harness
+ * builds its own from the production callbacks it does compile. */
+static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb);
+static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq);
+static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {
+	.select_queue = cdx_htb_select_queue,
+	.txq_fq = cdx_htb_txq_fq,
+};
 static cdx_ft_setup_tc_handler registered_ndo;
 static int dpa_register_setup_tc(cdx_ft_setup_tc_handler handler)
 {
@@ -265,6 +337,13 @@ static void reset_world(void)
 		INIT_LIST_HEAD(&cdx_htb_ports[ii].classes);
 	devices[0].priv.qm_ctx = &gQMCtx[3];
 	devices[1].priv.qm_ctx = &gQMCtx[4];
+	gQMCtx[3].net_dev = &devices[0];
+	gQMCtx[4].net_dev = &devices[1];
+	devices[0].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
+	devices[1].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
+	memset(class_fqs, 0, sizeof(class_fqs));
+	real_num_tx_queues_fails = 0;
+	cdx_ft_qos_class_func = NULL;
 	stop_calls = 0;
 	fault_point = -1;
 	fault_seen = 0;
@@ -657,6 +736,124 @@ static void test_dispatch(void)
 	assert(allocations == 0);
 }
 
+/* The classifier the adapter registers, as ft_qos_class() decodes a mark: the
+ * masked bits shifted down to their own base. Eight bits wide, because a class
+ * is a channel nibble and a class-queue nibble and a narrower field can only
+ * ever name the queue. */
+static u8 test_qos_class(u32 mark) { return (mark & 0xff00) >> 8; }
+
+/* Send a frame whose conntrack carries the mark that decodes to `class`. */
+static u16 pick(struct net_device *dev, u8 class)
+{
+	struct nf_conn ct = { .mark = (u32)class << 8 };
+	struct sk_buff skb = { .ct = &ct };
+
+	return cdx_htb_select_queue(dev, &skb);
+}
+
+/* The software path has to reach the class the hardware path would have put
+ * the same flow on, and reach it from the queue index rather than by decoding
+ * the mark a second time. */
+static void test_software_path(void)
+{
+	struct net_device *dev = &devices[0];
+	struct sk_buff skb = { .ct = NULL };
+	u16 qid1, qid2, qid10, qid11, moved;
+
+	reset_world();
+	assert(!cdx_register_ft_qos_class(test_qos_class));
+	assert(cdx_register_ft_qos_class(test_qos_class) == -EBUSY);
+	assert(!create(dev, 1, 0));
+
+	/* Two channels, so the channel nibble has something to choose between. */
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!add_leaf(dev, 2, 0, 0, 0, 1000, 1000, &qid2));
+	assert(!to_inner(dev, 10, 1, 0, 0));
+	assert(!query(dev, 10, &qid10));
+	assert(!add_leaf(dev, 11, 1, 1, 0, 0, 0, &qid11));
+	/* Each leaf's queue is usable, which is the count the stack caps to. */
+	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES + 3);
+
+	/* Channel 1 is the first channel, class queue 7 is prio 0: the mark
+	 * 0x70 | 0x0 that named 1:10 in hardware picks 1:10's Tx queue here.
+	 * The mark's channel nibble is one-based, as ceetm_get_egressfq()
+	 * numbers them. */
+	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == qid10);
+	assert(pick(dev, (1 << 4) | (NUM_PQS - 2)) == qid11);
+	/* Channel 2's only leaf is class 2, which still holds its own queue. */
+	assert(pick(dev, (2 << 4) | (NUM_PQS - 1)) == qid2);
+	/* A channel nibble of zero means the highest channel this port owns,
+	 * which is the second one -- the same answer the hardware gives. */
+	assert(pick(dev, NUM_PQS - 1) == qid2);
+	/* A class no leaf holds leaves the stack's own choice alone. */
+	assert(pick(dev, 0x00) == DPA_SELECT_QUEUE_NONE);
+	assert(pick(dev, 0x03) == DPA_SELECT_QUEUE_NONE);
+	/* A frame with no conntrack has no class to read. */
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+
+	/* And the Tx path resolves the pair back out of the queue index. */
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid10) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11) == &class_fqs[0][NUM_PQS - 2]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2) == &class_fqs[1][NUM_PQS - 1]);
+	/* Ordinary queues are not leaf classes, and neither is a slot no class
+	 * holds; both send the frame down the path it took before. */
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, 0));
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES - 1));
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES + 3));
+	assert(!cdx_htb_txq_fq(NULL, qid10));
+
+	/* Deleting a leaf that is not the last one takes its class off the map,
+	 * and the leaf that moved into the hole answers for the hole -- with
+	 * the channel and class queue it already had, because only the Tx queue
+	 * index moved. */
+	assert(!del_leaf(dev, 2, &moved));
+	assert(moved == 11);
+	assert(pick(dev, (2 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
+	assert(pick(dev, (1 << 4) | (NUM_PQS - 2)) == qid2);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2) == &class_fqs[0][NUM_PQS - 2]);
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, qid11));
+	/* Channel 2 stays claimed for the next class under the root, so the
+	 * mark that names "whichever channel this port owns" still resolves the
+	 * way ceetm_get_egressfq() resolves it: to that channel, which now
+	 * holds no class of its own. */
+	assert(pick(dev, NUM_PQS - 1) == DPA_SELECT_QUEUE_NONE);
+
+	assert(!destroy(dev));
+	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES);
+	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES));
+	assert_balanced(dev);
+
+	/* With no classifier registered nothing here has an opinion, which is
+	 * what leaves a CMM port's Tx path exactly as it was. */
+	cdx_unregister_ft_qos_class();
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+}
+
+/* A queue that cannot be put into service is a class that cannot be created,
+ * and it has to leave nothing behind. */
+static void test_queue_budget(void)
+{
+	struct net_device *dev = &devices[0];
+	u16 qid;
+
+	reset_world();
+	assert(!create(dev, 1, 0));
+	real_num_tx_queues_fails = 1;
+	assert(add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid) == -ENOMEM);
+	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES);
+	real_num_tx_queues_fails = 0;
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid));
+	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES + 1);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+	assert(allocations == 0);
+}
+
 /* An interface with no CEETM context cannot host this qdisc, and neither can a
  * port another control plane already configured. */
 static void test_refusals(void)
@@ -685,10 +882,13 @@ int main(void)
 	test_density();
 	test_depth_and_limits();
 	test_channel_reuse();
+	test_software_path();
+	test_queue_budget();
 	test_faults();
 	test_dispatch();
 	test_refusals();
 	assert(allocations == 0);
-	printf("htb offload: tree, density, limits, reuse, %d fault points, dispatch passed\n", 24);
+	printf("htb offload: tree, density, limits, reuse, software path, "
+	       "%d fault points, dispatch passed\n", 24);
 	return 0;
 }

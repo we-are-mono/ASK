@@ -43,6 +43,7 @@
 #include <linux/slab.h>
 #include <net/pkt_cls.h>
 #include <net/pkt_sched.h>
+#include <net/netfilter/nf_conntrack.h>
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
 #include "cdx.h"
@@ -56,16 +57,21 @@
  * reserved above the direct queues, and sch_htb turns the index this file
  * returns straight into netdev_get_tx_queue() with no bounds check.
  *
- * real_num_tx_queues deliberately stays where probe left it, covering the
- * direct queues only. Growing it would let ordinary traffic hash onto a leaf's
- * queue, and nothing in the software Tx path reads that index yet: with CEETM
- * enabled, cpe_fp_tx() resolves its frame queue from the conntrack mark, not
- * from skb_get_queue_mapping(). Until increment 4 teaches it otherwise, an
- * honest count is the one that says which queues software actually sends
- * through.
+ * real_num_tx_queues grows to cover them as classes come into service, because
+ * netdev_cap_txqueue() rewrites anything at or above it to queue zero. The
+ * driver keeps ordinary traffic off the range by folding its own queue choice
+ * back below the base, so what the count decides is only whether a leaf can be
+ * named -- not whether unclassified frames can wander onto one.
  */
 #define CDX_HTB_QID_BASE	DPAA_ETH_TX_QUEUES
 #define CDX_HTB_MAX_LEAVES	DPAA_ETH_CEETM_LEAF_QUEUES
+
+/* No such queue, no such class. Both maps below are byte arrays, so one
+ * sentinel serves for a whole memset. */
+#define CDX_HTB_NONE		0xffu
+
+/* Every value a decoded conntrack mark can take. */
+#define CDX_HTB_CLASSES		256
 
 /* Frames a leaf's class queue may hold before tail drop.
  *
@@ -102,6 +108,14 @@ struct cdx_htb_port {
 	u16 defcls;
 	u16 leaves;		/* qids in use, dense from CDX_HTB_QID_BASE */
 	bool live;
+	/* What the Tx path reads, and the only part of this structure it may.
+	 * Plain byte arrays rather than a walk of the class list, because both
+	 * are read from ndo_select_queue and cpe_fp_tx without RTNL while that
+	 * list is being mutated under it. A reader racing a rebuild sees an old
+	 * byte or a new one, never a freed node. */
+	u8 class_txq[CDX_HTB_CLASSES];		/* class -> leaf slot */
+	u8 txq_channel[CDX_HTB_MAX_LEAVES];	/* leaf slot -> CEETM channel */
+	u8 txq_cq[CDX_HTB_MAX_LEAVES];		/* leaf slot -> class queue */
 };
 
 /* Indexed the way gQMCtx is, so a netdev's stashed QoS context names its
@@ -153,6 +167,54 @@ static bool cdx_htb_channel_owned(struct cdx_htb_port *port, u8 channel)
 		if (!cl->parent && cl->channel == channel)
 			return true;
 	return false;
+}
+
+/* Republish what the Tx path reads. Called after every change to the tree,
+ * under RTNL, and cheap enough to redo whole rather than patch in place.
+ *
+ * A class names its channel the way a conntrack mark does, where a channel
+ * nibble of zero means "whichever channel this port owns" rather than channel
+ * zero, and ceetm_get_egressfq() resolves that to the highest one it has. The
+ * same answer has to come out here, or a flow the hardware put on a class
+ * would take a different one in software. */
+static void cdx_htb_publish(struct cdx_htb_port *port)
+{
+	struct cdx_htb_class *cl;
+	u8 top = CDX_HTB_NONE;
+	unsigned int ii;
+
+	memset(port->class_txq, CDX_HTB_NONE, sizeof(port->class_txq));
+	memset(port->txq_channel, CDX_HTB_NONE, sizeof(port->txq_channel));
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
+		if (port->channels & BIT(ii))
+			top = ii;
+	list_for_each_entry(cl, &port->classes, list) {
+		u8 slot;
+
+		if (cl->inner)
+			continue;
+		slot = (u8)(cl->qid - CDX_HTB_QID_BASE);
+		if (WARN_ON_ONCE(slot >= CDX_HTB_MAX_LEAVES))
+			continue;
+		port->txq_cq[slot] = cl->cq;
+		WRITE_ONCE(port->txq_channel[slot], cl->channel);
+		WRITE_ONCE(port->class_txq[((cl->channel + 1) << 4) | cl->cq], slot);
+		if (cl->channel == top)
+			WRITE_ONCE(port->class_txq[cl->cq], slot);
+	}
+}
+
+/* Narrow or widen the usable Tx queues to cover the leaf classes in service.
+ * Ordinary traffic is folded below this range by the driver, so what it really
+ * decides is whether a leaf's queue can be named at all: sch_htb grafts a qdisc
+ * on it either way, but netdev_cap_txqueue() rewrites anything at or above the
+ * count to queue zero. */
+static int cdx_htb_resize(struct cdx_htb_port *port, u16 leaves)
+{
+	if (!port->qm_ctx->net_dev)
+		return 0;
+	return netif_set_real_num_tx_queues(port->qm_ctx->net_dev,
+					    CDX_HTB_QID_BASE + leaves);
 }
 
 /* A channel for a class directly under the qdisc root.
@@ -335,6 +397,7 @@ static int cdx_htb_create(struct cdx_htb_port *port, struct tc_htb_qopt_offload 
 	 * layer resolves a zero mark to. */
 	port->defcls = opt->classid;
 	port->live = true;
+	cdx_htb_publish(port);
 	return 0;
 }
 
@@ -360,6 +423,11 @@ static void cdx_htb_destroy(struct cdx_htb_port *port)
 	port->channels = 0;
 	port->leaves = 0;
 	port->live = false;
+	/* Stop the Tx path naming a leaf before the queues stop existing. */
+	cdx_htb_publish(port);
+	if (cdx_htb_resize(port, 0))
+		pr_warn("cdx: %s kept Tx queues no class is using\n",
+			port->qm_ctx->net_dev ? port->qm_ctx->net_dev->name : "?");
 }
 
 static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
@@ -413,6 +481,13 @@ static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
 		rc = -EIO;
 		goto err_cq;
 	}
+	/* Last thing that can fail: growing the usable range is what lets the
+	 * stack put a frame on this leaf's queue at all. */
+	rc = cdx_htb_resize(port, port->leaves + 1);
+	if (rc) {
+		NL_SET_ERR_MSG_MOD(opt->extack, "cannot put another Tx queue into service");
+		goto err_cq;
+	}
 	cl->classid = opt->classid;
 	cl->parent = root ? 0 : (u16)opt->parent_classid;
 	cl->channel = channel;
@@ -420,6 +495,7 @@ static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
 	cl->quantum = opt->quantum;
 	cl->qid = CDX_HTB_QID_BASE + port->leaves++;
 	list_add_tail(&cl->list, &port->classes);
+	cdx_htb_publish(port);
 	opt->qid = cl->qid;
 	return 0;
 
@@ -482,6 +558,7 @@ static int cdx_htb_leaf_to_inner(struct cdx_htb_port *port,
 	parent->qid = 0;
 	parent->cq = 0;
 	parent->quantum = 0;
+	cdx_htb_publish(port);
 	return 0;
 }
 
@@ -505,6 +582,7 @@ static int cdx_htb_leaf_del(struct cdx_htb_port *port,
 			cl->channel);
 	moved = cdx_htb_qid_free(port, cl->qid);
 	cdx_htb_class_free(port, cl);
+	cdx_htb_publish(port);
 	if (moved)
 		opt->classid = moved;
 	return 0;
@@ -529,6 +607,7 @@ static int cdx_htb_leaf_del_last(struct cdx_htb_port *port,
 		cdx_htb_cq_release(port, cl->channel, cl->cq);
 		cdx_htb_qid_free(port, cl->qid);
 		cdx_htb_class_free(port, cl);
+		cdx_htb_publish(port);
 		return force ? 0 : -ENOENT;
 	}
 	parent->inner = false;
@@ -536,6 +615,7 @@ static int cdx_htb_leaf_del_last(struct cdx_htb_port *port,
 	parent->cq = cl->cq;
 	parent->quantum = cl->quantum;
 	cdx_htb_class_free(port, cl);
+	cdx_htb_publish(port);
 	return 0;
 }
 
@@ -564,6 +644,7 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
 	}
 	cl->cq = cq;
 	cl->quantum = opt->quantum;
+	cdx_htb_publish(port);
 	return 0;
 }
 
@@ -631,6 +712,84 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx)
 	INIT_LIST_HEAD(&port->classes);
 }
 
+/* The data path. Both callbacks run per frame, without RTNL, against the byte
+ * maps cdx_htb_publish() keeps.
+ *
+ * The class comes from the adapter's own classifier, registered below, so the
+ * frame lands on the class the hardware rule would have given the same flow. No
+ * classifier registered means nothing here has an opinion: the frame keeps the
+ * queue the stack chose, and cpe_fp_tx() resolves it exactly as it did before
+ * any of this existed. That is what CMM's ports do, and why enabling a qdisc
+ * there builds a tree without changing how a frame reaches it.
+ */
+static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
+
+int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
+{
+	if (!fn)
+		return -EINVAL;
+	if (cmpxchg(&cdx_ft_qos_class_func, NULL, fn))
+		return -EBUSY;
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_register_ft_qos_class, ASK_CDX_FLOWTABLE);
+
+void cdx_unregister_ft_qos_class(void)
+{
+	WRITE_ONCE(cdx_ft_qos_class_func, NULL);
+	/* Finish the Tx readers that may be inside it before its module goes. */
+	synchronize_net();
+}
+EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_qos_class, ASK_CDX_FLOWTABLE);
+
+static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
+{
+	cdx_ft_qos_class_fn decode = READ_ONCE(cdx_ft_qos_class_func);
+	struct dpa_priv_s *priv = netdev_priv(dev);
+	struct cdx_htb_port *port;
+	enum ip_conntrack_info cinfo;
+	struct nf_conn *ct;
+	u8 slot;
+
+	if (!decode)
+		return DPA_SELECT_QUEUE_NONE;
+	port = cdx_htb_entry(priv->qm_ctx);
+	if (!port)
+		return DPA_SELECT_QUEUE_NONE;
+	ct = nf_ct_get(skb, &cinfo);
+	if (!ct)
+		return DPA_SELECT_QUEUE_NONE;
+	/* One read of the mark, as the adapter takes one when it admits a flow:
+	 * a class chosen from a value that changed underneath would put this
+	 * frame somewhere the flow's own rule does not name. */
+	slot = READ_ONCE(port->class_txq[decode(READ_ONCE(ct->mark))]);
+	if (slot == CDX_HTB_NONE)
+		return DPA_SELECT_QUEUE_NONE;
+	return CDX_HTB_QID_BASE + slot;
+}
+
+static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq)
+{
+	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
+	u8 channel;
+	u16 slot;
+
+	if (!port || txq < CDX_HTB_QID_BASE)
+		return NULL;
+	slot = txq - CDX_HTB_QID_BASE;
+	if (slot >= CDX_HTB_MAX_LEAVES)
+		return NULL;
+	channel = READ_ONCE(port->txq_channel[slot]);
+	if (channel == CDX_HTB_NONE)
+		return NULL;
+	return ceetm_class_fq(qm_ctx, channel, READ_ONCE(port->txq_cq[slot]));
+}
+
+static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {
+	.select_queue = cdx_htb_select_queue,
+	.txq_fq = cdx_htb_txq_fq,
+};
+
 /* The flowtable adapter's half of the ndo.
  *
  * Only one handler can be registered with the driver, and this one is it,
@@ -689,10 +848,19 @@ static int cdx_setup_tc(struct net_device *dev, enum tc_setup_type type,
 int cdx_htb_init(void)
 {
 	unsigned int ii;
+	int rc;
 
-	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++)
+	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++) {
 		INIT_LIST_HEAD(&cdx_htb_ports[ii].classes);
-	return dpa_register_setup_tc(cdx_setup_tc);
+		cdx_htb_publish(&cdx_htb_ports[ii]);
+	}
+	rc = dpa_register_qdisc_ops(&cdx_htb_qdisc_ops);
+	if (rc)
+		return rc;
+	rc = dpa_register_setup_tc(cdx_setup_tc);
+	if (rc)
+		dpa_unregister_qdisc_ops();
+	return rc;
 }
 
 void cdx_htb_exit(void)
@@ -701,8 +869,10 @@ void cdx_htb_exit(void)
 
 	/* Stop new commands before releasing anything: the driver holds a
 	 * pointer into this module's text rather than a symbol reference, so a
-	 * tc command can arrive until this returns. */
+	 * tc command can arrive until this returns. The data path is retired
+	 * the same way, and waits out the frames already inside it. */
 	dpa_unregister_setup_tc();
+	dpa_unregister_qdisc_ops();
 	for (ii = 0; ii < ARRAY_SIZE(cdx_htb_ports); ii++)
 		cdx_htb_port_gone(&gQMCtx[ii]);
 }

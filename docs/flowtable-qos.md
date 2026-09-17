@@ -643,17 +643,80 @@ KASAN, BUG, WARNING or lockdep output in either boot.
 
 ### 4. The software path agrees with hardware
 
-- `ndo_select_queue` resolves the conntrack mark to the leaf's TX queue,
-  reusing the decode `pfe_eth_get_queuenum()` performs today.
-- `cpe_fp_tx()` selects its CEETM FQ from `skb_get_queue_mapping()` through
-  the increment-3 map instead of resolving the mark itself.
-- Fix the `conf_fq` index while here. `dpaa_eth_sg.c:1999` indexes
-  `conf_fqs[]` with a class-queue id in the CEETM branch, so every
-  DSCP-classified frame confirms on `conf_fqs[0]`. That is a live bug, not a
-  consequence of this work.
+The driver grows a second pair of callbacks, `struct dpa_qdisc_ops`, registered
+by the same module that hands out leaf classes and published as one pointer so
+a frame never sees one without the other.
 
-*Proof.* One flow, forced through software and then offloaded, lands in the
-same class queue both times.
+- `ndo_select_queue` asks which leaf a frame belongs to and puts it on that
+  leaf's Tx queue.
+- `cpe_fp_tx()` reads the class back out of the queue index instead of
+  resolving the frame's mark a second time.
+
+**The decode is one function, not two that agree.** The plan above said this
+reused what `pfe_eth_get_queuenum()` does, and that was wrong in a way worth
+recording: that function reads `ct->qosconnmark`, the ASK mark, while the
+flowtable classifies on `ct->mark` under `qos_mark_mask`. Two fields, two
+encodings. So the adapter registers `ft_qos_class()` itself with cdx, and the
+software path calls the very function that gave the flow's hardware rule its
+class. Deriving the same answer twice would still be two things to keep in
+step.
+
+That registration is also the switch. With no classifier registered — every
+CMM port, because the adapter is not loaded there — queue selection expresses
+no opinion and `cpe_fp_tx()` resolves its frame queue exactly as it did before
+any of this existed. Enabling a qdisc under CMM therefore builds a tree without
+changing how a frame reaches it.
+
+`real_num_tx_queues` now grows as leaf classes come into service, because
+`netdev_cap_txqueue()` rewrites anything at or above it to queue zero. What
+keeps ordinary traffic off the range is not the count but the driver: a frame
+that named no class keeps the stack's own choice — socket affinity and XPS
+included — folded back below the leaf base. A leaf queue is reachable only by
+naming its class.
+
+The maps the Tx path reads are plain byte arrays rebuilt under RTNL after every
+change to the tree, rather than a walk of the class list, because that list is
+mutated under RTNL while frames are reading it. A reader racing a rebuild sees
+an old byte or a new one, never a freed node.
+
+**The `conf_fq` index is fixed here too**, as the plan intended. `cpe_fp_tx()`
+indexed `conf_fqs[]` with `queuenum`, which in the CEETM branch is a class-queue
+id and not a Tx queue at all: a DSCP-classified frame, whose `queuenum` is
+always zero, confirmed on `conf_fqs[0]` whichever core sent it, and a marked one
+confirmed on whichever conf queue its class happened to number. Filed as A145.
+It is a pre-existing defect rather than a consequence of this work, but the
+correct index — the queue the frame actually left by — is the one this increment
+makes meaningful.
+
+*Proved on hardware, 2026-09-17.* One flow, forced through software and then
+offloaded, on the KASAN image with a `rate 400mbit` class and a mark naming it.
+
+Software first, with the policy unbound so nothing is accelerated:
+`tc -s class show dev eth4` counted **93,465,296 bytes in 61,760 packets on
+class 1:10** — the class the mark names. Before this increment that counter read
+zero, because the frame went to a direct queue and never reached the leaf's
+qdisc. Then the same flow offloaded: throughput went to 376 Mbit/s, every entry
+reported `qos=07` — the same class — and the qdisc counter moved by 486 bytes in
+7 packets, which is the handshake that still goes through software. Hardware
+bypasses the qdisc entirely and lands on the class the software path chose.
+
+The shaper holds at rates only the hardware path can reach, which is what makes
+a capped measurement proof of both at once — software forwarding on this rig
+tops out near 130 Mbit/s:
+
+| tc | measured |
+| --- | --- |
+| unshaped | 9.41 Gbit/s |
+| `rate 2gbit ceil 2gbit` | 1.88 Gbit/s |
+| `rate 5gbit ceil 5gbit` | 4.71 Gbit/s |
+| `rate 8gbit ceil 8gbit` | 7.53 Gbit/s |
+
+Each is within about 1.5% of the ceiling less TCP's header share, and the last
+two came from `TC_HTB_NODE_MODIFY` on a live tree. `eth4` reported seventeen Tx
+queues with one leaf class and sixteen again after teardown. Under
+`ask.offload=cmm`, with no adapter loaded, the port still forwarded at
+9.38 Gbit/s and stayed at sixteen queues — the path this increment leaves
+alone. No KASAN, BUG, WARNING or lockdep output in either boot.
 
 *Effort: 3–4 days.*
 

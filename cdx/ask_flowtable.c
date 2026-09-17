@@ -2359,8 +2359,15 @@ static int __init ask_flowtable_init(void)
 	 * arrives through CDX, which holds the driver's single ndo_setup_tc slot
 	 * because it also serves the hardware qdisc on the same callback. */
 	rc = ft_init_fault(9) ? -EBUSY : cdx_register_ft_setup_tc(cdx_ft_setup_tc);
+	if (rc)
+		goto indirect;
+	/* Hand the classifier over too, so a frame the software path sends
+	 * takes the class this same function gave the flow's hardware rule. */
+	rc = ft_init_fault(10) ? -EBUSY : cdx_register_ft_qos_class(ft_qos_class);
 	if (!rc)
 		return 0;
+	cdx_unregister_ft_setup_tc();
+indirect:
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 not_ready:
 	WRITE_ONCE(ft_ready, false);
@@ -2409,8 +2416,10 @@ static void __exit ask_flowtable_exit(void)
 	cancel_work_sync(&ft_retire_work);
 	cancel_delayed_work_sync(&ft_work);
 	/* Direct first: it is the route a DPAA port actually takes, so closing
-	 * it stops new binds before the indirect one is torn down. */
+	 * it stops new binds before the indirect one is torn down. The
+	 * classifier goes with it, and waits out the frames inside it. */
 	cdx_unregister_ft_setup_tc();
+	cdx_unregister_ft_qos_class();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	WRITE_ONCE(ft_ready, false);
 	/* Exit cannot fail. Complete every barrier, or prove hardware stopped,

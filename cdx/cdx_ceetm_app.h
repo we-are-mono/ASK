@@ -115,6 +115,8 @@ int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp);
 
 /* The hardware qdisc's half (cdx_htb.c). These return negative error codes
  * rather than CEETM_FAILURE, because tc reports them to the operator. */
+struct qman_fq *ceetm_class_fq(struct tQM_context_ctl *qm_ctx, uint32_t channel,
+			       uint32_t quenum);
 int ceetm_claim_channel(struct tQM_context_ctl *qm_ctx, uint32_t *channel_num);
 int ceetm_set_channel_rates(uint32_t channel_num, uint64_t cir_bps, uint64_t eir_bps);
 int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight,

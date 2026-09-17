@@ -1185,3 +1185,7 @@ file's git history.
 - [x] **A144.** Disabling QoS left the LNI shaper enabled, so a port could only ever be
   enabled once; the second attempt failed inside `ceetm_setup_lni` with the port half committed —
   fixed (this commit): disable the shaper on the way out, which is what makes a qdisc rebuild or a QOSENABLE toggle work.
+
+- [x] **A145.** `cpe_fp_tx()` confirmed on a frame queue chosen by class-queue id rather than
+  by sending Tx queue, so every DSCP-classified frame confirmed on `conf_fqs[0]` whichever core sent it —
+  fixed (this commit): index by `skb_get_queue_mapping()`, which is what the non-CEETM branch already used.
