@@ -64,7 +64,6 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	struct cdx_l2_encap encap = {};
 	struct cdx_ft_hw *hw;
 	PCtEntry ct;
-	u8 policer;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
 	*result = NULL;
@@ -191,17 +190,12 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * makes the rule say exactly which profile it means and keeps the nibble
 	 * a plain profile number.
 	 *
-	 * A tc police filter outranks the mark. The mark is how an operator
-	 * could name a profile before there was a kernel verb for it; `tc
-	 * filter ... action police` is that verb, so where one matches this
-	 * flow it is the more specific statement of intent. With no filter
-	 * matching, the mark's nibble stands -- and if it too is zero, the flow
-	 * meters against profile 0 exactly as it always has. */
-	policer = cdx_police_lookup(rule);
-	if (!policer)
-		policer = (rule->qos & CDX_FT_QOS_POLICER_MASK) >>
-			  CDX_FT_QOS_POLICER_SHIFT;
-	ct->qosmark.iqid = policer;
+	 * Which profile that is was settled by the adapter, which resolves a tc
+	 * police filter against the finished tuple before handing the rule over.
+	 * Doing it here instead would leave the rule -- and so /proc -- saying
+	 * something different from what the hardware was told. */
+	ct->qosmark.iqid = (rule->qos & CDX_FT_QOS_POLICER_MASK) >>
+			   CDX_FT_QOS_POLICER_SHIFT;
 	ct->qosmark.iqid_valid = 1;
 	/* A flow with no encapsulation asks for no override, and takes exactly
 	 * the path it took before tags existed. The override refuses a

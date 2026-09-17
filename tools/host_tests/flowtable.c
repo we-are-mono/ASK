@@ -680,6 +680,25 @@ static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_bloc
     assert(block_write_lock && *block_write_lock);
     list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
 }
+/* The filter layer's answer for a finished tuple. A tc police filter is the
+ * more specific statement of the same intent as the mark, so a non-zero answer
+ * replaces the mark's policer nibble -- and the rule carries the result, so
+ * that what the hardware is told and what /proc reports are the same thing. */
+static u8 police_lookup_profile;
+static unsigned police_lookups;
+static u8 cdx_police_lookup(const struct cdx_ft_rule *rule)
+{
+    /* A filter matches on the finished tuple, so this has to be asked last --
+     * with the ports, the protocol and the ingress device already decided.
+     * Asking earlier would match some filters against a half-built rule. */
+    assert(rule && rule->in && rule->out);
+    assert(rule->family == AF_INET || rule->family == AF_INET6);
+    assert(rule->proto == IPPROTO_TCP || rule->proto == IPPROTO_UDP);
+    assert(rule->mtu);
+    police_lookups++;
+    return police_lookup_profile;
+}
+
 /* The direct route's pair. Netfilter holds flow_block_lock across the whole of
  * ndo_setup_tc there, so the exclusion the indirect move asserts has to hold
  * here too -- it is just the caller who established it. This is the route
