@@ -14,6 +14,7 @@
 #include "layer2.h"
 #include "globals.h"
 #include "control_wifi.h"
+#include "cdx_flowtable.h"
 
 #ifdef CFG_WIFI_OFFLOAD
 
@@ -184,7 +185,15 @@ void wifi_init(void)
 	struct physical_port	*port;
 
 
-	set_cmd_handler(EVENT_PKT_WIFIRX, M_wifi_rx_cmdproc);
+	/* The only part of this init that belongs to one owner, and the same
+	 * split ipsec_init() has: what follows is per-VAP bookkeeping the
+	 * hardware needs whoever drives it, while the dispatch entry below is
+	 * FCI's alone. Every FCI command already returns -EOPNOTSUPP in
+	 * flowtable mode, so registering it would be harmless — but a handler
+	 * for a bus that is not running says the wrong thing about who owns
+	 * the subsystem. */
+	if (!cdx_flowtable_enabled())
+		set_cmd_handler(EVENT_PKT_WIFIRX, M_wifi_rx_cmdproc);
 
 	for ( i = 0; i < MAX_WIFI_VAPS; i++ )
 	{

@@ -378,7 +378,17 @@ static int __init cdx_module_init(void)
 	printk("%s::start_dpa_app successful\n", __func__);
 #endif
 #ifdef CFG_WIFI_OFFLOAD
-	rc = cdx_flowtable_enabled() ? 0 : dpaa_vwd_init();
+	/* Built in both ownership modes, like the rest of the hardware here.
+	 * What this claims is the offline port the board declared for Wi-Fi
+	 * (dpa-fman0-oh@3, sized for it in the device tree), its buffer pools
+	 * and the per-VAP frame-queue machinery — none of which belongs to a
+	 * consumer. The one line that does is the FCI dispatch, gated inside
+	 * wifi_init() instead.
+	 *
+	 * Skipping it here was the same mistake the IPsec gate made: the
+	 * absence surfaces several layers away, as a frame queue that cannot
+	 * be resolved, with nothing in the message naming Wi-Fi. */
+	rc = dpaa_vwd_init();
 	if (rc != 0)  {
 		printk("%s::vwd_driver_init failed\n", __func__);
 		goto exit;
