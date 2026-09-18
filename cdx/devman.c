@@ -304,10 +304,13 @@ static int get_eth_iface_info(struct dpa_iface_info *iface_info,
 	//os interface id
 	iface_info->osid = device->ifindex;
 	eth_info = &iface_info->eth_info;
-	//save netdev
+	/* Save the netdev. It is the source of this port's hardware address
+	 * too, read where the header is encoded rather than copied here: the
+	 * only value that was ever available to copy is perm_addr, which by
+	 * definition does not follow `ip link set ... address`, and nothing
+	 * else ever refreshed it. The reference taken above is held for the
+	 * life of this record, so the read is always safe. */
 	eth_info->net_dev = device;
-	//copy iface mac address 
-	memcpy(eth_info->mac_addr, device->perm_addr, ETH_ALEN);
 	//copy speed, mtu and others
 	eth_info->speed = priv->mac_dev->max_speed;
 	eth_info->rx_channel_id = priv->channel;
@@ -1105,10 +1108,15 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 						ETHER_ADDR_LEN);
 			if (!src_mac)
 			{
+				/* The bridge's address is the bridge's and is
+				 * supplied over FCI; a port's own is the
+				 * netdev's, read now rather than from a copy
+				 * taken at registration that never followed a
+				 * change. */
 				if (eth_info->is_bridged)
 					src_mac = eth_info->br_mac_addr;
 				else
-					src_mac = eth_info->mac_addr;
+					src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
 			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, NULL))
 				break;
@@ -1396,10 +1404,12 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 
 			if (!src_mac)
 			{
+				/* As above: the netdev's current address, not
+				 * a registration-time copy of perm_addr. */
 				if (eth_info->is_bridged)
 					src_mac = eth_info->br_mac_addr;
 				else
-					src_mac = eth_info->mac_addr;
+					src_mac = (unsigned char *)eth_info->net_dev->dev_addr;
 			}
 
 			if(dpa_get_fqid_from_eth(eth_info, &l2_info->fqid, qosinfo))
@@ -1875,7 +1885,13 @@ void dpa_release_interface(uint32_t itf_id)
 }
 
 
-//get mac address by name
+/* Get a port's hardware address by interface name.
+ *
+ * Reads the netdev rather than any stored copy, for the reason
+ * get_eth_iface_info() gives: the only value ever stored was perm_addr, and
+ * nothing refreshed it. The record holds a reference to the device for its
+ * whole life, so the dereference is safe under the list lock.
+ */
 int dpa_get_mac_addr(char *name, char *mac_addr)
 {
 	struct dpa_iface_info *iface_info;
@@ -1889,8 +1905,9 @@ int dpa_get_mac_addr(char *name, char *mac_addr)
 		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
 			//match name
 			if (strcmp (name, iface_info->name) == 0) {
-				memcpy(mac_addr, iface_info->eth_info.mac_addr,
-						ETH_ALEN);
+				memcpy(mac_addr,
+				       iface_info->eth_info.net_dev->dev_addr,
+				       ETH_ALEN);
 				retval = 0;
 				break;
 			}
@@ -1901,7 +1918,7 @@ int dpa_get_mac_addr(char *name, char *mac_addr)
 	return retval;
 }
 
-#ifdef DPA_IPSEC_OFFLOAD 
+#ifdef DPA_IPSEC_OFFLOAD
 /*
 * This function reconfiguring the discard mask by clearing the FM_FD_ERR_PRS_HDR_ERR
 * and FM_FD_ERR_BLOCK_LIMIT_EXCEEDED error bit flags from FM_RFSDM_DEFAULT macro.

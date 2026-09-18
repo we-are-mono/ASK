@@ -132,7 +132,9 @@ static void unregister_netdevice_notifier(struct notifier_block *nb)
 struct dpa_iface_info {
     struct dpa_iface_info *next;
     unsigned if_flags, itf_id;
-    struct { struct net_device *net_dev; u8 mac_addr[6]; } eth_info;
+    /* No mac_addr, matching production: a port's own address is its
+     * netdev's, read where the header is encoded. */
+    struct { struct net_device *net_dev; } eth_info;
 };
 static struct dpa_iface_info out_iface = { .if_flags=129, .itf_id=2 };
 static struct dpa_iface_info in_iface = { .next=&out_iface, .if_flags=129, .itf_id=1 };
@@ -240,7 +242,11 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
                encap->ingress_pppoe || encap->egress_pppoe);
         observed_encap = *encap;
     }
-    assert(!memcmp((expected_hairpin ? in_iface : out_iface).eth_info.mac_addr, (u8[]){2,0,0,0,0,0}, 6));
+    /* The encoding port's source address is the netdev's, and the backend no
+     * longer copies it anywhere first. Admission has already refused any rule
+     * whose src_mac disagrees with it, so the two match by construction. */
+    assert(!memcmp((expected_hairpin ? in_iface : out_iface).eth_info.net_dev->dev_addr,
+                   (u8[]){2,0,0,0,0,0}, 6));
     assert(ct->proto == expected_proto && ct->twin->proto == expected_proto);
     assert(ct->Sport == htons(1234) && ct->Dport == htons(5678));
     /* Ports always come from the twin object, in both families. */
@@ -559,7 +565,14 @@ static void test_backend(void)
 
 int main(void)
 {
-    struct net_device in = { .name = "in", .mtu = 1500 }, out = { .name = "out", .mtu = 1500 };
+    /* The ports carry the address the rule claims as its source. That is not
+     * decoration: admission refuses any direction whose src_mac is not the
+     * egress port's current address, so a fixture where they disagree
+     * describes a rule the backend can never be handed. It used to be able to
+     * disagree, because the backend copied the rule's value into the
+     * interface record before encoding; the encoder reads the netdev now. */
+    struct net_device in = { .name = "in", .mtu = 1500, .dev_addr = {2} },
+                      out = { .name = "out", .mtu = 1500, .dev_addr = {2} };
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .in_logical=&in, .out_logical=&out,
         .family=AF_INET, .src.ip=htonl(0xc0000201), .dst.ip=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };

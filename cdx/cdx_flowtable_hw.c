@@ -83,13 +83,13 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	    in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
 	    out->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
 		return -EOPNOTSUPP;
-	/* The legacy encoder obtains its Ethernet source from this cache.
-	 * Admission validated the requested MAC under RTNL; synchronize the
-	 * cache under its reader lock before encoding the new direction.
-	 * Legacy control is sealed throughout this ownership mode. */
-	spin_lock(&dpa_devlist_lock);
-	ether_addr_copy(out_iface->eth_info.mac_addr, rule->src_mac);
-	spin_unlock(&dpa_devlist_lock);
+	/* Nothing to synchronize before encoding any more. This used to copy
+	 * the admission-validated source MAC into the interface record,
+	 * because the encoder read its Ethernet source from a cache that was
+	 * filled once from perm_addr and never followed a change. The encoder
+	 * reads the netdev directly now, and admission has already refused any
+	 * direction whose source is not that port's current address, so the
+	 * two agree by construction rather than by being copied. */
 	hw = kzalloc(sizeof(*hw), GFP_KERNEL);
 	if (!hw)
 		return -ENOMEM;
