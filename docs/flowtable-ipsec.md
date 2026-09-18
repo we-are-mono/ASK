@@ -300,10 +300,12 @@ to degrade into. The wait runs on the netlink path before any CDX lock or RTNL
 is taken, so it blocks only the caller that asked for the SA, and its bound is
 short next to the exchange that preceded it. This was found on the rig: an SA
 installed moments after a reboot was refused with "no resolved neighbour"
-purely because nothing had spoken to the peer yet. What has no equivalent yet is the *later* case: CMM
-handled a route change under an SA with `CMD_IPSEC_SA_SET_TNL_ROUTE`, and
-nothing here re-resolves one. That belongs with the dependency watches in the
-increments below rather than with the SA install.
+purely because nothing had spoken to the peer yet.
+
+The *later* case — the peer moving once the SA is installed — is step 8 below.
+CMM was told about it over `CMD_IPSEC_SA_SET_TNL_ROUTE`; this ownership mode
+notices it itself, from the same neighbour and route events that retire a
+flow.
 
 **The flow.** A flow is eligible for the SEC action when its egress
 destination carries exactly one `xfrm_state`, that state is offloaded to a
@@ -860,6 +862,163 @@ A DUT reset was observed once during a UDP variant of this bench under the
 legacy owner, with no console logger attached and nothing captured; it is
 recorded as ISSUES A155 rather than diagnosed here.
 
+### 8. Following a peer that moves
+
+The last piece of the legacy owner's control surface with no successor. An
+outbound SA's next hop is resolved once, at install, and written into the
+classifier entry's header-manipulation opcodes; nothing re-reads it per frame.
+So a peer that moves — a gateway failover, a replaced NIC at the far end —
+left the tunnel emitting to an address nobody answers to, with no error
+anywhere. CMM was told about it as `CMD_IPSEC_SA_SET_TNL_ROUTE`.
+
+Three things decide the shape, and the first two are what make it small.
+
+**It is a rebuild, not a field update.** The address is in the entry's
+opcodes, so the entry has to come out and go back in — which is exactly what
+the legacy handler did, for the same reason. The SEC context is untouched:
+`SA_SH_DESC_BUILT` keeps the shared descriptor, so the keys, the PDB and the
+outer header stay as they were and the sequence numbers do not restart. The
+old entry must be provably gone before the new one goes in, because both carry
+the same key and a bucket holding two copies of one key cannot be cleared
+afterwards; a delete that cannot prove it refuses the rebuild and leaves the
+SA on the address it had, which is no worse than not trying.
+
+**It is a watch, not a poll.** The notifiers that retire a flow whose
+neighbour or route moved already fire for exactly this; an SA riding the same
+segment is marked from the same place. Marking rather than retiring is the
+whole difference between an SA and a flow: a flow is readmitted from scratch
+by its next packet, which is why retiring it is enough, and nothing re-offers
+an SA. Its hardware has to be corrected in place.
+
+What a marked watch is worth telling about is narrower than it first looks. A
+neighbour that has merely aged names the address the entry already carries;
+one that has gone *unusable* — incomplete, failed, dead — names nothing
+better to program, and chasing it is worse than useless. The re-resolution
+probes what it finds, the probe fails, that failure is itself a neighbour
+update, and the two keep each other going for as long as the peer stays down.
+So only a usable neighbour naming a *different* address marks anything, which
+is where this parts company with the flow watch: a flow with a dead neighbour
+should be retired, because Linux resolves it again on readmission.
+
+The port's own hardware address is in those same opcodes, so it is watched
+too. That took fixing something older first. The encoder read that address
+from a field in CDX's interface record which was filled once from `perm_addr`
+at registration and never followed a change — so a rebuild would have re-read
+the same stale bytes, reported success and cost a live tunnel a classifier gap
+for nothing. `perm_addr` is the *permanent* address; it does not follow
+`ip link set … address` by definition, and no FCI command ever updated the
+copy either.
+
+That field is gone. The ethernet arm reads `net_dev->dev_addr` where the
+header is encoded, which is the only value that is ever right, and the record
+has held a reference to the device since registration so the read is always
+safe. Every other interface type in that family keeps its stored address,
+because CMM invents those interfaces and describes them over FCI — there is no
+kernel object to ask. This was the one arm that had one.
+
+It is worth being clear about what that fixes, because "follows a change" is
+the smaller half. An SA installed at any point *after* a MAC change previously
+took the stale address and kept it for ever, with no event that could correct
+it — which is the ordinary case for a gateway whose address is set in
+configuration before the tunnel comes up. The legacy owner's route entries
+read the same field and had the same defect.
+
+A local change also has a second-order effect worth knowing: setting a port's
+address flushes that device's neighbour table, so the rebuild it triggers
+always finds the peer momentarily unresolvable and fails. What recovers it is
+the neighbour coming back — carrying the address it always had. That is why an
+*unchanged* neighbour still marks a watch that is already waiting to retry:
+without it the SA would sit on the old framing until the peer happened to move
+as well.
+
+**The correction cannot happen where it is noticed.** The notifiers run under
+`neigh->lock` and the adapter's watch lock; a rebuild needs the control mutex
+and sleeps. So a work item does it, and the SA's lifetime gets one rule the
+work depends on: `ft_xdo_state_delete()` unlinks the watch *before* it queues
+the retirement that frees the SA, and that retirement takes the control mutex.
+A watch still on the list while the mutex is held therefore names an SA that
+is still there. Nothing dereferences a watch outside the lock, which is what
+the per-watch cookie is for: a freed watch's memory can be reused by the next
+SA installed, and an address would then name the wrong one.
+
+Both of those unlink paths take their locks with softirqs off, and that is not
+decoration. `xdo_dev_state_delete()` looks like an atomic-context callback —
+`xfrm_state_delete()` holds `x->lock` across it and `xfrm_timer_handler()` runs
+in a softirq — but `xfrm_add_sa()` also reaches it directly from netlink when a
+state fails to insert, with softirqs enabled. The watch list is walked from
+softirq by the neighbour notifier, so a plain `spin_lock` on that path would
+deadlock against an ARP reply landing on the same CPU.
+
+**A rebuild that fails is terminal for that SA's framing, not just for the
+attempt.** The delete frees the entry's software bookkeeping whichever way it
+went, so after a hard failure nothing distinguishes "no entry" from "an entry
+still linked under a key we no longer track" — and a second attempt would add
+that key on top of the one the hardware still holds, which is the duplicate
+bucket the delete refuses to risk in the first place. So such an SA is marked
+and never moved again; it keeps classifying on the framing it has until it is
+deleted and reinstalled. An outbound NAT-T entry shared with another SA on the
+same UDP tuple is refused for a different reason: its delete only drops a
+reference, so a rebuild would change nothing and claiming otherwise would be a
+lie. That one is retried once the twin is gone.
+
+Re-resolution does not wait for a neighbour the way an install does. An
+install has nowhere to retry from — packet offload has no software fallback,
+so a refusal fails the tunnel — while a re-resolution has the neighbour event
+that will arrive when the peer answers. So it probes and returns rather than
+holding a shared workqueue for seconds, and a failed lookup leaves the SA on
+the address it has.
+
+A failure is said out loud, once per SA and again after any recovery, because
+one case cannot be fixed at all: a peer that moves to a route leaving by a
+*different* port. Packet offload binds a state to one device and this SA's
+egress framing belongs to that device, so there is nothing to rebuild — and
+nothing else would report it. The watch is re-marked rather than re-queued,
+so the event that fixes the underlying problem is what brings the work back;
+re-queueing would spin against a peer that is simply down.
+
+`ipsec_next_hop_updates` in `/proc/cdx_flowtable` counts the rebuilds, beside
+the invalidation counters.
+
+#### Proved on hardware, 2026-09-18
+
+An SA installed on `eth4`, then `ip link set dev eth4 address …`, watched
+through `ipsec_next_hop_updates` and the adapter's own log:
+
+```
+device_moved match=1                         the address change marks the watch
+follow rc=-113                               the peer is unresolvable: that change
+                                             just flushed the neighbour table
+neigh stale=1, ha unchanged                  the neighbour comes back
+follow rc=0   was_src=e8:f6:d7:00:01:14      rebuilt on the port's new address
+peer then moves to ..91:ee
+follow rc=0   was_src=02:00:00:00:91:aa      rebuilt again, and the watch had
+                                             recorded the new local address
+ipsec_next_hop_updates                       0 -> 1 -> 2
+```
+
+**The bench lied first, and the lie is worth recording.** Every SA the test
+helper installed was hard-expiring seconds after install, so the watch was
+gone before any of this could be observed and the feature looked unreachable.
+The cause was in the helper, not the adapter: it set all eight fields of
+`xfrm_lifetime_cfg` to `XFRM_INF`, and while that is right for the byte and
+packet limits, `xfrm_timer_handler()` computes the *time* limits into a signed
+`time64_t` — where `XFRM_INF` is −1, so the state expires on the first tick.
+iproute2 sends zero for those four. An SA that quietly disappears a moment
+after install still passes a test that installs and acts at once, which is how
+far this got before a `dump_stack()` in the delete callback named
+`xfrm_timer_handler` as the caller and ended the argument.
+
+#### Proved off the hardware
+
+`tools/host_tests/test_ipsec_adapter.py`. The watch is the part a rig run
+cannot show cheaply — a peer moves once, correctly, and the interesting cases
+either do not occur or occur once in a way nothing distinguishes from
+success — so the cases live in the harness: a neighbour that aged versus one
+that moved, a peer that has gone away and must not be chased, a route event
+that turns out to have changed nothing, a rebuild the hardware refuses, and
+the delete-versus-resolve ordering, proved by draining the retirement queue
+between the two and watching the work decline to touch the freed SA.
+
 ## Tests
 
 IPsec is described elsewhere as the most covered subsystem left on the board.
@@ -876,17 +1035,39 @@ to serve FCI `ACTION_QUERY`; the `xfrmdev_ops` control plane has no query
 command, so neither has a successor to move to. `query_sa()` and the two QUERY
 command codes went out of `_ipsec_helpers.py` with them.
 
-**Kept, because FCI is only how they knock.** `_key_zeroing` (H2,
+**Re-pointed, because FCI was only how they knocked.** `_key_zeroing` (H2,
 `cdx_ipsec_sec_sa_context_free`), `_dma_balance` (H3, the shared-descriptor
 DMA-map unwind), `_failslab` (M7-class, `cdx_ipsec_sec_sa_context_alloc`) and
 `_natt_spi_bounds` (H5, the `spi_param[16]` overrun) are regression nets for
 named memory-safety defects in `cdx/cdx_dpa_ipsec.c` — every one of those
-functions is code the port keeps and calls harder. What they lose at step 3 is
-the door, not the subject: `xdo_dev_state_add()` reaches the same allocator,
-the same descriptor builder and the same classification-entry path, so each is
-re-pointed rather than rewritten. `_natt_spi_bounds` needs one extra look,
-because its reachability hook resolves an SA through
-`xfrm_state_lookup_byhandle()`, which this design deletes.
+functions is code the port keeps and calls harder. What they lost was the
+door, not the subject, so each installs its SAs as `XFRM_MSG_NEWSA` now and
+asserts the same thing. Three consequences worth recording, because each is a
+simplification rather than a translation:
+
+- **One message replaces five commands.** FCI spelled an install as CREATE,
+  SET_KEYS, SET_NATT or SET_TUNNEL and SET_STATE, and the two failslab sweeps
+  each armed a different step. There is one call to arm now, so what separates
+  those two files is no longer *which command* but *where in the install* the
+  fault lands. The install's faultable-allocation count is measured — arm
+  fail-nth beyond any plausible depth and the residue says how many eligible
+  allocations the send made — and `_failslab` sweeps the head, where the SA
+  cache and the key buffers are, while `_dma_balance` sweeps the tail, where
+  the descriptor maps and the classifier entry are. Guessing is gone.
+- **`_natt_spi_bounds` no longer needs the test hook.** Its bound sits inside
+  `if (natt_sa && natt_sa->ct)`, reachable only when a prior same-flow SA
+  still holds a populated ct — which an FCI-installed SA could not, because
+  production resolved its kernel state by handle and a synthetic SA had none.
+  That is what `CDX_DEBUG_IPSEC_TEST_XFRM` was for. An offloaded SA is built
+  *from* a real `xfrm_state` and `cdx_ipsec_sa_add()` binds it before the
+  entry is installed, so the ct survives on its own and the array accumulates
+  without help. Sixteen install, the seventeenth is refused.
+- **The agent's fault injection stopped being FCI's.** `_netlink_send_failslab`
+  was already protocol-generic; only `/fci/send` offered it. `/netlink/send`
+  takes `failslab_times` too now, which is what lets an XFRM `NEWSA` drive the
+  SA allocator's unwind with an armed window covering exactly one send. Letting
+  `ip` send the message instead would spend the counter on its own startup long
+  before the allocator ran.
 
 **The one that transfers in shape, with a caveat worth knowing before step 4.**
 `test_ipsec_esp_traffic.py` installs through `ip xfrm` and lets kernel XFRM
@@ -896,6 +1077,25 @@ byte counts. So the install half transfers and the verification half does not.
 The replacement is upstream and better: `xdo_dev_state_update_stats()` puts
 hardware counters where `ip -s xfrm state` already reads them, so the standard
 tool becomes the oracle and the test stops needing a private cursor at all.
+
+**And the decision logic is compiled off the hardware.**
+`tools/host_tests/ipsec_adapter.c` builds `ft_ipsec_resolve()`,
+`ft_ipsec_spec()`, `ft_ipsec_peer_mac()`, `ft_ipsec_paired_inbound()`,
+`ft_ipsec_offloaded()`, the `xfrmdev_ops` callbacks and the SA next-hop watch
+from the adapter itself, against stubs for xfrm, the FIB and the backend. The
+flowtable harness stubs these instead, which was the right call for what it
+tests and the wrong one to leave as the only arrangement: the boundary is
+worth stubbing, the *decisions* are not, and multicast had already shown the
+better shape with its own harness.
+
+Two of the cases exist because a rig run cannot show them cheaply. The
+reference discipline in `ft_ipsec_resolve()` — a matching policy takes over
+the caller's reference to a borrowed destination, and the harness models that
+transfer, so an assertion says the borrowed destination came back exactly as
+it was found rather than freed under the flowtable. And the ordering the
+next-hop watch rests on: a state deleted while a re-resolution is outstanding
+must find no watch for its cookie, which the harness proves by draining the
+retirement queue between the two.
 
 New coverage follows the house rule: the failing test comes first and is proved
 to fail without the fix. The first one is the step 4 proof, because step 4 is
@@ -951,15 +1151,6 @@ What is left is smaller and none of it blocks retirement:
   a slot for each, but nothing proves the opcode order for a flow decrypted
   from one tunnel and re-encrypted into another. Admission allows at most one
   per end, so such a flow is carried in software today.
-- **An SA's own next hop is resolved once, at install, and never re-resolved.**
-  What leaves SEC is a finished frame, so the peer's Ethernet address is baked
-  into the SA's hardware entry; a peer that moves — a gateway failover, a
-  replaced NIC — leaves the tunnel emitting to an address nobody answers to,
-  silently. The legacy owner had `CMD_IPSEC_SA_SET_TNL_ROUTE` for this and
-  nothing here replaces it. Fixing it is not a watch on its own: the address
-  reaches the hardware through the shared descriptor, so a change means
-  rebuilding the SA's entry, which is the control plane's to drive. Scoped
-  out of this increment deliberately, and the largest of the four.
 - **`nft_flow_offload_skip()` declines every packet with a `sec_path`**, which
   is why only the encrypted direction can create a tunnelled flow. That is
   upstream behaviour and costs nothing here — one direction is enough to
