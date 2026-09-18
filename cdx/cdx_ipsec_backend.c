@@ -356,6 +356,7 @@ EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_add, ASK_CDX_FLOWTABLE);
 void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 {
 	struct cdx_ipsec_sa *owner = *sa;
+	int rc;
 
 	cdx_ft_assert_held();
 	if (!owner)
@@ -368,7 +369,14 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 	 * never taken. */
 	if (owner->entry)
 		owner->entry->xfrm_state = NULL;
-	M_ipsec_sa_cache_delete(owner->handle);
+	rc = M_ipsec_sa_cache_delete(owner->handle);
+	/* The only way this fails is a handle the cache never had, which would
+	 * mean this owner outlived its entry -- worth saying out loud, because
+	 * the hardware entry then stays in the classifier and the next SA with
+	 * the same key is refused by the hash table rather than by us. */
+	if (rc)
+		pr_warn("cdx: IPsec SA handle %u was not in the cache (%d); its hardware entry may be stranded\n",
+			owner->handle, rc);
 	kfree(owner);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_del, ASK_CDX_FLOWTABLE);

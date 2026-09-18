@@ -292,9 +292,15 @@ private route rather than joining the legacy hash. So the adapter resolves the
 peer through the ordinary FIB and neighbour table and the SA carries its own
 embedded route, holding the single reference a table-held one would have had.
 
-A missing route or an unresolved neighbour is therefore a refusal, not
-something to wait out. In practice IKE has just completed a round trip with
-the peer, so both exist. What has no equivalent yet is the *later* case: CMM
+A missing route is a refusal. An unresolved *neighbour* is not: the adapter
+asks for it the ordinary way and waits briefly, because a cold ARP cache is a
+normal state for a freshly booted gateway and refusing then would fail the
+tunnel outright rather than delay it — packet offload has no software fallback
+to degrade into. The wait runs on the netlink path before any CDX lock or RTNL
+is taken, so it blocks only the caller that asked for the SA, and its bound is
+short next to the exchange that preceded it. This was found on the rig: an SA
+installed moments after a reboot was refused with "no resolved neighbour"
+purely because nothing had spoken to the peer yet. What has no equivalent yet is the *later* case: CMM
 handled a route change under an SA with `CMD_IPSEC_SA_SET_TNL_ROUTE`, and
 nothing here re-resolves one. That belongs with the dependency watches in the
 increments below rather than with the SA install.
@@ -435,32 +441,58 @@ and together they fix the design:
 - **`xdo_dev_state_delete()` is atomic.** `xfrm_state_delete()` takes `x->lock`
   with `spin_lock_bh()` around `__xfrm_state_delete()`, which is what reaches
   the callback. Every backend operation needs the control mutex, so no hardware
-  teardown can happen there.
+  teardown can happen there directly.
 - **`xdo_dev_state_free()` may sleep**, reached from `___xfrm_state_destroy()`
-  on the garbage collector's workqueue or after a `synchronize_rcu()`. The
-  teardown goes there. It also runs while the state is still allocated —
-  `xfrm_dev_state_free()` is called before `xfrm_state_free()` — which is what
-  makes a borrowed state pointer safe.
+  on the garbage collector's workqueue or after a `synchronize_rcu()`.
 - **The backend must not hold a reference to the state.** Free is reached only
   once the last reference is gone, so a reference held by the SA would be
-  waiting for the teardown that is waiting for it, and the SA would never be
-  destroyed at all. The pointer is borrowed and dropped in the teardown.
+  waiting for the teardown that is waiting for it. The pointer is borrowed and
+  dropped in the teardown.
 
-What this leaves is a window between a state being deleted and its last
-reference going away, during which the hardware SA is still installed. It is
-bounded by an RCU grace period and the state garbage collector, and the legacy
-owner has the same window for the same reason — its `SA_DELETE` is
-asynchronous too.
+**And the teardown must not wait for free either**, which is the part this
+increment got wrong first and had to be shown on hardware. A frame handed to
+SEC holds a reference to the state: it travels on the skb's sec_path so the
+transmit path can find its frame queue. That skb is freed *lazily* — the DPAA
+submit path stashes it in the scatter-gather table's trailing slot and the
+buffer's next user frees it — so on an idle tunnel the next user never arrives,
+the references sit there, free never runs, and the SA stays in the classifier
+for ever. The next SA with the same key is then refused by the hash table with
+`Resource Already Exists`.
 
-**Policy offload is deliberately not implemented, and that is load-bearing
-rather than a gap.** `xfrm_state_find()`'s acquire path calls
-`xdo_dev_state_add()` under `xfrm_state_lock` with `netdev_hold(GFP_ATOMIC)`
-beside it, and its failure branch calls `xdo_dev_state_free()` under the same
-lock. Both are reachable only when a *policy* was packet-offloaded, so
-declining `xdo_dev_policy_add` keeps every callback in the context this design
-assumes. Adding policy offload later would make both callbacks atomic on that
-path and make this teardown illegal; whoever adds it has to move the teardown
-to a workqueue first.
+The references and the lazy free are both older than this work; patch 040 takes
+the same hold on the CMM path. What was new was the coupling: CMM retired an SA
+over FCI on its own schedule, so nothing depended on the state's refcount, while
+here the teardown *was* the state's destruction. So the hardware is retired from
+a workqueue queued by delete — promptly, and independently of any skb — and the
+state's lifetime is left to the kernel. The window the earlier revision of this
+document accepted, between deletion and the last reference going away, is gone
+with it.
+
+**Policy offload is mandatory, which an earlier revision of this document got
+exactly backwards.** It first said that declining `xdo_dev_policy_add` was a
+deliberate simplification that kept the callbacks out of atomic context. It is
+not optional at all: `xfrm_state_find()` skips a packet-offloaded state
+whenever the policy that reached it is not offloaded too --
+
+```c
+} else if (x->xso.type == XFRM_DEV_OFFLOAD_PACKET)
+        /* Skip HW policy for SW lookups */
+        continue;
+```
+
+-- so an SA paired with a software policy is never selected. On the rig that
+looked like success: the SA installed, reported itself installed, and carried
+nothing, with `0 packets` on the state and no error anywhere. CDX needs nothing
+from a policy, so the ops exist only to make that pairing hold.
+
+Implementing them does make `xfrm_state_find()`'s acquire path reachable, where
+`xdo_dev_state_add()` runs under `xfrm_state_lock` with `netdev_hold(GFP_ATOMIC)`
+beside it and the failure branch calls `xdo_dev_state_free()` under the same
+lock. That is handled rather than avoided: an acquire placeholder carries
+`XFRM_DEV_OFFLOAD_FLAG_ACQ`, has no keys and no SPI, and is accepted without
+being programmed, so the atomic path never does real work and free finds
+nothing to release. Accepting rather than refusing matters -- a refusal there
+fails the on-demand tunnel being negotiated.
 
 Proof: `ip xfrm state add … offload packet dev ethN` succeeds, the SA appears
 in CDX's cache, `ethtool -k ethN` reports `esp-hw-offload: on`, and deleting
@@ -492,15 +524,62 @@ from its cause.
 
 ### 4. The slow path
 
-Replace `x->offloaded` with `x->xso.type == XFRM_DEV_OFFLOAD_PACKET` and
-`x->handle` with `x->xso.offload_handle` at the three datapath sites, and add
-the sec_path hunk that packet-offload tunnel-mode output needs. Delete the
-`skb->ipsec_offload` flag and its guards.
+Replace `x->offloaded` with `x->xso.type == XFRM_DEV_OFFLOAD_PACKET` at the
+datapath sites, publish the backend's handle as `x->handle` so the SEC
+completion path can still resolve a decrypted frame, and give packet-offload
+tunnel output the sec_path and the finished Ethernet header SEC expects.
 
-Proof: a tunnel carries traffic with no flowtable entry at all, at software
-forwarding rates, with `tx_caam_enc` counting and the ESP visible on the wire.
-This is the first end-to-end proof that the SA reached SEC, and it does not
-depend on any classifier work.
+Three things in that hunk are not obvious, and each one was a failure first:
+
+**It must not take `xfrm_dev_direct_output()`.** That path pushes
+`hard_header_len` of uninitialised space and transmits without resolving a
+neighbour, because it is written for hardware that writes the L2 header
+itself. SEC is handed the frame complete with its Ethernet header, so every
+packet takes the ordinary neighbour output instead — which is the reason the
+comment beside it already gives for locally generated packets, and is simply
+true of all of them here.
+
+**It must set `sp->len` and not `sp->olen`.** `xfrm_offload(skb)` answers
+non-NULL exactly when `olen` is non-zero and equal to `len`, and a non-NULL
+answer draws the frame into `validate_xmit_xfrm()` on the way out — which, on
+a device advertising `NETIF_F_HW_ESP`, encrypts it in software and hands the
+driver a finished packet. The tunnel then works perfectly with the hardware
+counter at zero, which is exactly how this was found. The crypto-offload
+branch below does increment `olen`, because that path wants the fixup.
+
+**It must complete the checksum.** `skb_checksum_help()` sits after the
+packet-offload branch, so a locally generated frame still carrying
+`CHECKSUM_PARTIAL` reaches SEC unfinished. ESP authenticates the ciphertext,
+not the payload inside it, so such a packet encrypts, traverses and decrypts
+perfectly and is then dropped at the far end for a bad inner checksum: the
+peer's SA counters advance and nothing is delivered. Upstream skips that help
+only for a device advertising `NETIF_F_HW_ESP_TX_CSUM`, which this does not
+claim.
+
+Proof: a tunnel carries traffic with no flowtable entry at all, with the SEC
+counter advancing and an independent peer decrypting what it produced.
+
+#### Proved on hardware, 2026-09-18
+
+`tools/tests/test_ipsec_packet_offload_traffic.py`, on a KASAN flowtable boot.
+The tunnel runs between the DUT and the LAN VM; only the DUT is offloaded, so
+the peer's decryption is an independent check on what SEC emitted.
+
+```
+endpoints      = 192.168.1.1 <-> 192.168.1.122
+sec_frames     = 32     frames the DUT's port handed to SEC
+peer_decrypted = 32     frames the LAN VM authenticated and decrypted
+delivered      = 32     payloads intact
+```
+
+On the wire, captured at the peer: 32 × `ESP(spi=0x0a878e3e,seq=0x1..0x20)`.
+
+**Putting the far end on the orchestrator instead was a mistake that cost
+hours.** There the decrypted datagrams reached the IP layer and were dropped by
+that host's own input path, so the peer's SA counters advanced while nothing
+arrived — evidence that looked exactly like a malformed-packet bug in the
+offload and was nothing of the sort. A bench whose far end is an ordinary host
+on the segment, with the test machine outside the path, is worth insisting on.
 
 ### 5. The outbound fast path
 
