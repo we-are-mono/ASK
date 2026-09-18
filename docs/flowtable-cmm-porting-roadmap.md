@@ -37,7 +37,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | ---: | --- | ---: | ---: | --- | --- | --- |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | **Delivered**, both directions: see the [IPsec design](flowtable-ipsec.md). Control plane is mainline `xfrmdev_ops` in packet mode, with no ASK userspace. The estimate that the shared encoder already carried the SEC action held; what it did not anticipate is that `FLOW_OFFLOAD_XMIT_XFRM` had to be *admitted* rather than excluded — three generic helpers refuse that transmit type outright, which silently kept every real tunnel in software until step 6 measured it. |
-| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Scoped: see the [multicast design](flowtable-multicast.md).** Wanted, and next — but not a merge blocker: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Control plane is the bridge's own IGMP snooping, read off the switchdev chain the adapter is already on, with no ASK userspace. The decisive fact is that the classifier key is an exact `(S,G)` while an IGMPv2 join is `(*,G)`, so membership alone cannot compose a key; the source and the ingress port are learned from the stream. Needs a parallel replication path, not a flowtable feature. |
+| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Bridged path delivered, unproven on hardware: see the [multicast design](flowtable-multicast.md).** Control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on, with no ASK userspace and no consumer configuration at all. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Routed multicast is a second learner against the same encoder and is not built. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
@@ -415,6 +415,22 @@ unreachable in a flowtable boot for a reason that is not an init gate —
 `comcerto_fpp_send_command()` refuses every FCI command in this ownership
 mode, so the learner calls the encoder in kernel and the listener-ceiling
 measurement has to run in a CMM boot.
+
+**What landed, and what has not.** The encoder now takes a caller-supplied tag
+stack rather than requiring a CMM-registered VLAN interface to imply one
+(`961ac61`), resolves a listener before building its entry so either owner can
+(`53d7551`), and is reachable through a typed in-kernel interface that
+describes a group whole (`f6e413a`). A kernel patch carries the L3 group into
+the MDB switchdev object, which otherwise discards it (`092add6`). The learner
+is in two halves, which is what the (S,G)-versus-(\*,G) gap forces: memberships
+from the switchdev chain (`b7eb41c`), and the source and ingress port from the
+group's own traffic (`51a7cd5`).
+
+None of it has run on hardware. The end-to-end suite is
+`tools/tests/test_mcast_e2e.py`, written before the learner so it gates rather
+than describes; its oracles are the bridge reporting `offload`, the group in
+`/proc/cdx_flowtable`, and the DUT's CPU not seeing a stream its listeners are
+receiving. Until that has passed, this row is code rather than a capability.
 
 **QoS is no longer the critical path.** Its three build features are compiled
 in, but `/etc/config/cmmqos` ships with `enabled '0'` and nothing sends
