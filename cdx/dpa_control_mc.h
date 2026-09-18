@@ -133,12 +133,14 @@ int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action);
 int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action);
 int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);
 
-/* Builds one listener's entry. `encap` names the tags this listener's frames
- * leave with, or is NULL to take them from the egress interface. The scratch
- * state is the builder's own; see the definition for why that is not merely
- * tidiness. */
+/* Builds one listener's entry. The listener is already resolved -- an onif and
+ * the netdev whose MTU the enqueue carries, borrowed for the call -- because
+ * the two owners resolve it differently. `encap` names the tags this listener's
+ * frames leave with, or is NULL to take them from the egress interface. The
+ * scratch state is the builder's own; see the definition for why that is not
+ * merely tidiness. */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
-	MC4Output *pListener, const struct cdx_l2_encap *encap,
+	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
 	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type);
 
 /* Module init/exit functions */

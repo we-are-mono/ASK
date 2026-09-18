@@ -2890,34 +2890,36 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
  * from an FCI command CMM sends, so an ownership mode without CMM has no such
  * interface to walk and must say what it wants instead -- the same reasoning,
  * and the same struct, as a flowtable direction's tag stack.
+ *
+ * The listener arrives already resolved, as an onif and the netdev whose MTU
+ * the enqueue opcode carries, because the two owners resolve it differently and
+ * neither way serves the other. The legacy owner names a registered interface
+ * and finds both by that name; this one holds a netdev and finds the onif by
+ * index. They are not interchangeable: dpa_add_vlan_if() records a VLAN's
+ * dpa_iface_info with no net_dev and without IF_TYPE_ETHERNET, so resolving
+ * every listener from a netdev would silently stop finding CMM's tagged ones.
+ * `dev` is borrowed and the caller holds it across the call.
  */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
-	MC4Output *pListener, const struct cdx_l2_encap *encap,
+	POnifDesc onif_desc, struct net_device *dev, const struct cdx_l2_encap *encap,
 	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type)
 {
 	struct ins_entry_info *pInsEntryInfo;
-	POnifDesc onif_desc;
 	struct dpa_l2hdr_info *pL2Info;
 	struct dpa_l3hdr_info *pL3Info;
 	struct en_exthash_tbl_entry *tbl_entry = NULL;
-	struct net_device *dev;
 	uint64_t phyaddr;
 	uint16_t flags;
 	uint8_t *ptr;
+
+	if (!onif_desc || !onif_desc->itf || !dev)
+		return NULL;
 
 	pInsEntryInfo = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
 	if (!pInsEntryInfo)
 		return NULL;
 
-	DPA_INFO("%s(%d) listener output device %s\n",__func__,__LINE__,pListener->output_device_str);
-	onif_desc = get_onif_by_name(pListener->output_device_str);
-	if (!onif_desc)
-	{
-		DPA_ERROR("%s::unable to get onif for iface %s\n", __func__, pListener->output_device_str);
-		goto err_ret;
-	}
-
-
+	DPA_INFO("%s(%d) listener output device %s\n",__func__,__LINE__,dev->name);
 	DPA_INFO("%s(%d) onif_desc->itf->index %d\n",__func__,__LINE__,onif_desc->itf->index);
 	/* Into the struct's own fields, not into locals copied over afterwards:
 	 * dpa_get_tdinfo() below reads fm_idx, and the copy used to happen ten
@@ -2980,18 +2982,11 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 	 * interface that carries them, never both. */
 	if (encap && apply_l2_encap(pInsEntryInfo, encap))
 		goto err_ret;
-	dev = dev_get_by_name(&init_net, pListener->output_device_str);
-	if(dev == NULL)
-	{
-		goto err_ret;
-	}
-
 	pL2Info->mtu = dev->mtu;
 #ifdef CDX_DPA_DEBUG
 	DPA_INFO("%s:: mtu %d\n", __func__, dev->mtu);
 #endif
 
-	dev_put(dev);
 	//allocate hash table entry
 	tbl_entry = ExternalHashTableAllocEntry(pInsEntryInfo->td);
 	if (!tbl_entry) {
