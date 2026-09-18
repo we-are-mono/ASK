@@ -37,7 +37,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | ---: | --- | ---: | ---: | --- | --- | --- |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | **Delivered**, both directions: see the [IPsec design](flowtable-ipsec.md). Control plane is mainline `xfrmdev_ops` in packet mode, with no ASK userspace. The estimate that the shared encoder already carried the SEC action held; what it did not anticipate is that `FLOW_OFFLOAD_XMIT_XFRM` had to be *admitted* rather than excluded — three generic helpers refuse that transmit type outright, which silently kept every real tunnel in software until step 6 measured it. |
-| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | No | High | **Wanted, and scheduled after IPsec — but not a merge blocker.** `query mc4` on a production gateway carrying IPTV answers "table empty": the offload has never been active, so this adds a capability rather than preserving behaviour. Needs a parallel replication path, not a flowtable feature. |
+| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Scoped: see the [multicast design](flowtable-multicast.md).** Wanted, and next — but not a merge blocker: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Control plane is the bridge's own IGMP snooping, read off the switchdev chain the adapter is already on, with no ASK userspace. The decisive fact is that the classifier key is an exact `(S,G)` while an IGMPv2 join is `(*,G)`, so membership alone cannot compose a key; the source and the ingress port are learned from the stream. Needs a parallel replication path, not a flowtable feature. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
@@ -393,6 +393,28 @@ bridge's MDB, offered to any driver willing to listen — `br_switchdev_mdb_noti
 calls `switchdev_port_obj_add()` for every port group with no check that the
 port belongs to a switch ASIC, so the events are available without ASK becoming
 a switchdev driver or growing a port parent id.
+
+What that mechanism does **not** supply is the rest of a classifier key, and
+scoping it found this to be the item's real problem rather than the
+eight-listener constant an earlier pass concentrated on. `fill_key_info()`
+composes a multicast key as `{portid, saddr, daddr, protocol}` in an external
+*hash* table, so the source address is exact and unmaskable — `src_addr_mask`
+is a wire field NXP never wired to anything — while an IGMPv2 join produces a
+`(*,G)` MDB entry with no source and no ingress port at all. Both missing
+facts are properties of the traffic rather than of the membership, so both are
+learned from the stream's first frames, which the bridge is forwarding in
+software anyway. The [multicast design](flowtable-multicast.md) records the
+three options and what the chosen one costs.
+
+Two corrections to earlier revisions of this file belong with it. The encoder
+is **not** unproven CMM-era code: `tools/tests/` carries five `test_mcast_*`
+files and `cb8fc27` fixed the hardware path that makes them pass, with
+replication asserted at exactly one frame per listener. And the encoder is
+unreachable in a flowtable boot for a reason that is not an init gate —
+`CMD_INIT(mc4)` and `CMD_INIT(mc6)` already run unconditionally, but
+`comcerto_fpp_send_command()` refuses every FCI command in this ownership
+mode, so the learner calls the encoder in kernel and the listener-ceiling
+measurement has to run in a CMM boot.
 
 **QoS is no longer the critical path.** Its three build features are compiled
 in, but `/etc/config/cmmqos` ships with `enabled '0'` and nothing sends
