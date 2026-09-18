@@ -2138,6 +2138,10 @@ static void ft_ipsec_retire_sa(u16 handle)
 static void ft_ipsec_attach(struct net_device *dev);
 static void ft_ipsec_detach(struct net_device *dev);
 
+/* Defined with the multicast learner below, because it belongs with that
+ * state rather than with the chains it is reached from. */
+static void ft_mc_device_gone(struct net_device *dev);
+
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
@@ -2405,11 +2409,10 @@ static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *pt
  * which would leave the port filtering that VLAN out. This is an observer,
  * and an observer must leave -EOPNOTSUPP to be the chain's answer.
  */
-/* Defined with the rest of the multicast learner below, because they belong
- * with that state rather than with the chains they are reached from. */
+/* Defined with the rest of the multicast learner below, because it belongs
+ * with that state rather than with this chain's other cases. */
 static bool ft_mc_swdev_obj(unsigned long event,
 			    struct switchdev_notifier_port_obj_info *obj);
-static void ft_mc_device_gone(struct net_device *dev);
 
 static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
