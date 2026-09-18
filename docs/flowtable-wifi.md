@@ -383,10 +383,39 @@ direction: the frame is *already* an skb in the CPU when it arrives from PCIe,
 so injection adds a descriptor build and an offline-port round trip to buy
 back the same 37%.
 
-NXP appears to have reached the same place. `cdx_wifi_rx_fastpath()` is
-exported and has no caller in any tree, and their own `wifi_fastforward_conf_file`
-sets `direct_rx_path = 0` for every non-QCA driver -- so the fast version was
-Atheros-only and the general version is the round trip. Their round trip is
+NXP reached the same place, and their Programmer's Guide (BHR ASK for
+LS1012x/LS104x/LS102x, Rev. E, 10.24) says so outright. Section 10.24.2.3
+requires that "the WLAN driver needs to be modified to call
+`comcerto_wifi_rx_fastpath()` instead of `netif_rx()`/`netif_receive_skb()`",
+and records the path as enabled by default only for `ath0/ath1/ath2`. That is
+our `cdx_wifi_rx_fastpath()`, which has no caller in any tree because `moal`
+was never modified; their own `wifi_fastforward_conf_file` sets
+`direct_rx_path = 0` for every non-QCA driver. The stated purpose is reducing
+an NCNB cache penalty, which is a PPFE memory-architecture cost that DPAA does
+not have -- so on this board even the motivation does not transfer.
+
+The same section prices the egress side. Sending to the VAP through
+`dev_queue_xmit()` is documented as the default, and the two optimisations of
+it are worth "approximately 6% CPU saving" (10.24.2.1, skipping QDisc via
+`ndo_start_xmit`) and "approximately 9%" (10.24.2.2, the custom NCNB skb) --
+and the second is "implemented only for QCA driver/device and it does not work
+with other devices or drivers". So the delivery cost measured above as ~63% of
+the packet is, by the vendor's own accounting, shavable by single digits and
+only on hardware this board does not have.
+
+Section 10.24.2.4 documents the single-core ceiling as a known limitation:
+"all HIF-Rx traffic is processed by the same processor context ... a single CPU
+might not be enough to process this amount of data", with per-VAP
+`rx_cpu_affinity` as the remedy. The equivalent here is that a VAP owns 64
+forwarding frame queues and flows hash across them, so parallel connections
+already spread while a single connection cannot.
+
+One thing the guide corrects about this document's earlier reading: VWD's
+`NF_INET_PRE_ROUTING` hook is not vestigial CMM machinery. 10.24.6.3 calls it
+the default -- "By default VWD is enabled with only routing feature" -- with
+`vwd_bridge_hook_enable` as its bridged counterpart. It is the sanctioned
+mechanism for the legacy owner; what makes it wrong in flowtable mode is only
+that nothing populates the uplink direction for it to match. Their round trip is
 the VWD `NF_INET_PRE_ROUTING` hook, which this branch now disables in
 flowtable mode: with no uplink entries for it to match, it was injecting every
 packet into the offline port and taking every one straight back
