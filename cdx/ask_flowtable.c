@@ -25,6 +25,7 @@
 #include <linux/ipv6.h>
 #include <linux/jhash.h>
 #include <linux/module.h>
+#include <linux/netfilter_bridge.h>
 #include <linux/proc_fs.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
@@ -2695,27 +2696,264 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 	return !g->host;
 }
 
+/* ---- the traffic half -------------------------------------------------
+ *
+ * A membership says which ports want a group. It cannot say which source is
+ * sending it or which port that source is behind, because until a frame
+ * arrives neither is a fact about anything. Both are read off the frames the
+ * bridge is still flooding in software, which is what it does for every group
+ * that has no hardware entry -- and stops doing the moment one appears, so
+ * this costs nothing once the offload starts paying.
+ *
+ * The hook runs in softirq and may not sleep, so it records into a small ring
+ * and wakes the worker. No allocation, no mutex, no hardware.
+ */
+
+struct ft_mc_seen {
+	int bridge_ifindex;
+	int in_ifindex;
+	struct br_ip addr;
+	union nf_inet_addr src;
+};
+
+/* Deep enough to absorb the few frames between an observation and the worker
+ * installing its entry, and no deeper: past that the stream is either
+ * offloaded or the group was refused, and in both cases further observations
+ * describe nothing new. Overflow drops the newest, which costs a retry on the
+ * next frame rather than anything permanent. */
+#define FT_MC_RING 16
+static struct ft_mc_seen ft_mc_ring[FT_MC_RING];
+static unsigned int ft_mc_ring_head, ft_mc_ring_tail;
+static DEFINE_SPINLOCK(ft_mc_ring_lock);
+/* The last thing recorded, so a stream at line rate does not fill the ring
+ * with restatements of one fact between two runs of the worker. */
+static struct ft_mc_seen ft_mc_last;
+static u64 ft_mc_observed, ft_mc_dropped;
+static bool ft_mc_hooked;
+
+static bool ft_mc_seen_eq(const struct ft_mc_seen *a, const struct ft_mc_seen *b)
+{
+	return a->bridge_ifindex == b->bridge_ifindex &&
+	       a->in_ifindex == b->in_ifindex &&
+	       !memcmp(&a->addr, &b->addr, sizeof(a->addr)) &&
+	       !memcmp(&a->src, &b->src, sizeof(a->src));
+}
+
+/* The VLAN this frame is on, as the bridge will resolve it a moment later in
+ * br_allowed_ingress(): the tag it carries, or the ingress port's PVID when it
+ * carries none. Reading it here rather than waiting for the bridge to do it is
+ * what lets the observation name the same VLAN the MDB entry does. */
+static u16 ft_mc_frame_vid(struct net_device *port, struct sk_buff *skb)
+{
+	u16 vid = 0;
+
+	if (skb_vlan_tag_present(skb))
+		return skb_vlan_tag_get_id(skb);
+	if (skb->protocol == htons(ETH_P_8021Q)) {
+		struct vlan_hdr *vhdr;
+
+		if (!pskb_may_pull(skb, VLAN_HLEN))
+			return 0;
+		vhdr = (struct vlan_hdr *)skb->data;
+		return ntohs(vhdr->h_vlan_TCI) & VLAN_VID_MASK;
+	}
+	br_vlan_get_pvid_rcu(port, &vid);
+	return vid;
+}
+
+static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
+			       const struct nf_hook_state *state)
+{
+	struct net_device *port = state->in;
+	struct net_device *bridge;
+	struct ft_mc_seen seen = {};
+	unsigned int next;
+	__be16 proto;
+
+	/* Cheapest tests first: this sits in the bridge's receive path. */
+	if (!port || !skb || !is_multicast_ether_addr(eth_hdr(skb)->h_dest) ||
+	    is_broadcast_ether_addr(eth_hdr(skb)->h_dest))
+		return NF_ACCEPT;
+	bridge = netdev_master_upper_dev_get_rcu(port);
+	if (!bridge || !netif_is_bridge_master(bridge))
+		return NF_ACCEPT;
+
+	proto = skb->protocol;
+	if (proto == htons(ETH_P_8021Q)) {
+		struct vlan_hdr *vhdr;
+
+		if (!pskb_may_pull(skb, VLAN_HLEN + sizeof(struct iphdr)))
+			return NF_ACCEPT;
+		vhdr = (struct vlan_hdr *)skb->data;
+		proto = vhdr->h_vlan_encapsulated_proto;
+	}
+
+	if (proto == htons(ETH_P_IP)) {
+		const struct iphdr *iph = ip_hdr(skb);
+
+		if (!pskb_may_pull(skb, sizeof(*iph)))
+			return NF_ACCEPT;
+		/* Link-local scope carries IGMP itself and the querier the
+		 * whole design depends on; never a candidate. */
+		if ((ntohl(iph->daddr) & 0xffffff00) == 0xe0000000)
+			return NF_ACCEPT;
+		seen.addr.dst.ip4 = iph->daddr;
+		seen.src.ip = iph->saddr;
+		seen.addr.proto = htons(ETH_P_IP);
+	} else if (proto == htons(ETH_P_IPV6)) {
+		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
+
+		if (!pskb_may_pull(skb, sizeof(*ip6h)))
+			return NF_ACCEPT;
+		if (__ipv6_addr_src_scope(__ipv6_addr_type(&ip6h->daddr)) <=
+		    IPV6_ADDR_SCOPE_LINKLOCAL)
+			return NF_ACCEPT;
+		seen.addr.dst.ip6 = ip6h->daddr;
+		seen.src.in6 = ip6h->saddr;
+		seen.addr.proto = htons(ETH_P_IPV6);
+	} else {
+		return NF_ACCEPT;
+	}
+
+	seen.addr.vid = ft_mc_frame_vid(port, skb);
+	seen.bridge_ifindex = bridge->ifindex;
+	seen.in_ifindex = port->ifindex;
+
+	spin_lock(&ft_mc_ring_lock);
+	if (ft_mc_seen_eq(&seen, &ft_mc_last))
+		goto out;	/* already recorded and not yet acted on */
+	next = (ft_mc_ring_head + 1) % FT_MC_RING;
+	if (next == ft_mc_ring_tail) {
+		ft_mc_dropped++;
+		goto out;
+	}
+	ft_mc_ring[ft_mc_ring_head] = seen;
+	ft_mc_ring_head = next;
+	ft_mc_last = seen;
+	ft_mc_observed++;
+	schedule_work(&ft_mc_work);
+out:
+	spin_unlock(&ft_mc_ring_lock);
+	return NF_ACCEPT;	/* always: this observes, it never diverts */
+}
+
+static struct nf_hook_ops ft_mc_hook_ops = {
+	.hook = ft_mc_hook,
+	.pf = NFPROTO_BRIDGE,
+	.hooknum = NF_BR_PRE_ROUTING,
+	/* Before anything that might consume the frame, and before the bridge
+	 * resolves its VLAN -- which is why the vid is derived here rather
+	 * than read off the skb's control block. */
+	.priority = NF_BR_PRI_FIRST,
+};
+
+/* The hook exists only while something is waiting for a source. A box whose
+ * groups are all installed, or which has no memberships at all, pays the
+ * static key in nf_hook_bridge_pre() and nothing else.
+ *
+ * Registration sleeps, so this runs from the worker. Called without
+ * ft_mc_lock. */
+static void ft_mc_hook_sync(bool wanted)
+{
+	if (wanted == ft_mc_hooked)
+		return;
+	if (wanted) {
+		if (nf_register_net_hook(&init_net, &ft_mc_hook_ops))
+			return;
+	} else {
+		nf_unregister_net_hook(&init_net, &ft_mc_hook_ops);
+		spin_lock_bh(&ft_mc_ring_lock);
+		memset(&ft_mc_last, 0, sizeof(ft_mc_last));
+		spin_unlock_bh(&ft_mc_ring_lock);
+	}
+	ft_mc_hooked = wanted;
+}
+
+/* Match an observation to a membership. Called with ft_mc_lock held.
+ *
+ * A (*,G) membership takes any source; an (S,G) one -- which an IGMPv3
+ * INCLUDE report produces -- takes only its own, because the bridge already
+ * said which source that group is about.
+ */
+static struct ft_mc_group *ft_mc_match(const struct ft_mc_seen *seen)
+{
+	struct ft_mc_group *g;
+
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		if (g->bridge->ifindex != seen->bridge_ifindex ||
+		    g->addr.proto != seen->addr.proto ||
+		    g->addr.vid != seen->addr.vid ||
+		    memcmp(&g->addr.dst, &seen->addr.dst, sizeof(g->addr.dst)))
+			continue;
+		if (memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) &&
+		    memcmp(&g->addr.src, &seen->src, sizeof(seen->src)))
+			continue;
+		return g;
+	}
+	return NULL;
+}
+
+/* Fill in a group's source and ingress from an observation. Returns true when
+ * that changed something the hardware has to be told about. */
+static bool ft_mc_resolve(struct ft_mc_group *g, const struct ft_mc_seen *seen)
+{
+	struct net_device *in;
+
+	lockdep_assert_held(&ft_mc_lock);
+	if (g->in && g->in->ifindex == seen->in_ifindex &&
+	    !memcmp(&g->src, &seen->src, sizeof(g->src)))
+		return false;	/* already what we have */
+	in = dev_get_by_index(&init_net, seen->in_ifindex);
+	if (!in)
+		return false;
+	if (!cdx_mc_port_identity(in)) {
+		dev_put(in);
+		return false;
+	}
+	/* A source or ingress that changed re-keys the group: the old entry
+	 * matches a stream nobody is sending any more. The contract says a
+	 * second simultaneous source wants an entry of its own; this carries
+	 * one, so the newest wins and the previous entry is replaced. */
+	if (g->in)
+		dev_put(g->in);
+	g->in = in;
+	g->src = seen->src;
+	return true;
+}
+
 /* The worker. Runs outside RTNL, so it may take the transaction -- and never
  * while holding ft_mc_lock, which is the ordering obligation stated above.
- *
- * Nothing installs yet: a group needs a source and an ingress port before it
- * has a key, and supplying those is the traffic half's job. What this does
- * today is retire groups whose membership went away, which is the half of the
- * lifecycle the membership alone can decide.
  */
 static void ft_mc_work_fn(struct work_struct *work)
 {
 	struct ft_mc_group *g, *tmp;
+	struct ft_mc_seen seen;
 	LIST_HEAD(dead);
+	bool want_hook;
 
+	/* Drain what the hook observed. */
+	for (;;) {
+		spin_lock_bh(&ft_mc_ring_lock);
+		if (ft_mc_ring_head == ft_mc_ring_tail) {
+			spin_unlock_bh(&ft_mc_ring_lock);
+			break;
+		}
+		seen = ft_mc_ring[ft_mc_ring_tail];
+		ft_mc_ring_tail = (ft_mc_ring_tail + 1) % FT_MC_RING;
+		spin_unlock_bh(&ft_mc_ring_lock);
+
+		mutex_lock(&ft_mc_lock);
+		g = ft_mc_stopping ? NULL : ft_mc_match(&seen);
+		if (g && ft_mc_resolve(g, &seen))
+			g->dirty = true;
+		mutex_unlock(&ft_mc_lock);
+	}
+
+	/* Retire what lost its last listener. */
 	mutex_lock(&ft_mc_lock);
 	list_for_each_entry_safe(g, tmp, &ft_mc_groups, list) {
-		if (!g->dirty)
-			continue;
-		g->dirty = false;
 		if (g->ports)
 			continue;
-		/* No listener left, so nothing to replicate to. */
 		list_move(&g->list, &dead);
 		ft_mc_count--;
 	}
@@ -2732,6 +2970,112 @@ static void ft_mc_work_fn(struct work_struct *work)
 		list_del(&g->list);
 		ft_mc_group_free(g);
 	}
+
+	/* Install or update whatever is now installable. One group per pass
+	 * through the list, because the transaction is dropped between each --
+	 * ft_mc_lock is never held across it. */
+	for (;;) {
+		struct cdx_mc_group_spec spec = {};
+		struct cdx_mc_group *hw = NULL;
+		struct ft_mc_group *target = NULL;
+		bool replace = false;
+		u8 i;
+
+		mutex_lock(&ft_mc_lock);
+		list_for_each_entry(g, &ft_mc_groups, list) {
+			if (!g->dirty || ft_mc_stopping)
+				continue;
+			if (g->host || !g->ports || !g->in) {
+				/* Not installable. A group that was installed
+				 * and has become ineligible is retired below
+				 * rather than left carrying stale ports. */
+				if (!g->hw) {
+					g->dirty = false;
+					continue;
+				}
+			}
+			target = g;
+			break;
+		}
+		if (!target) {
+			mutex_unlock(&ft_mc_lock);
+			break;
+		}
+		target->dirty = false;
+		/* Snapshot under the lock; the hardware call happens after it
+		 * is dropped. The devices are pinned by the group, which is
+		 * why the spec may borrow them. */
+		if (!target->host && target->ports && target->in) {
+			spec.in = target->in;
+			spec.family = target->addr.proto == htons(ETH_P_IPV6) ?
+				AF_INET6 : AF_INET;
+			if (spec.family == AF_INET6) {
+				spec.src.in6 = target->src.in6;
+				spec.dst.in6 = target->addr.dst.ip6;
+			} else {
+				spec.src.ip = target->src.ip;
+				spec.dst.ip = target->addr.dst.ip4;
+			}
+			spec.listeners = target->ports;
+			for (i = 0; i < target->ports; i++) {
+				spec.listener[i].dev = target->port[i].dev;
+				spec.listener[i].vlans = target->port[i].vlans;
+				memcpy(spec.listener[i].vlan,
+				       target->port[i].vlan,
+				       sizeof(spec.listener[i].vlan));
+			}
+			replace = target->hw != NULL;
+			hw = target->hw;
+		} else {
+			hw = target->hw;
+			target->hw = NULL;
+		}
+		mutex_unlock(&ft_mc_lock);
+
+		cdx_ft_begin();
+		if (!spec.listeners) {
+			/* Became ineligible: take it out of hardware and
+			 * leave the membership, which may become installable
+			 * again when the host leaves or a port returns. */
+			if (hw) {
+				cdx_mc_group_del(&hw);
+				ft_mc_installed--;
+			}
+		} else if (replace) {
+			if (cdx_mc_group_replace(hw, &spec))
+				ft_mc_install_errors++;
+		} else {
+			if (cdx_mc_group_add(&spec, &hw)) {
+				ft_mc_install_errors++;
+				hw = NULL;
+			} else {
+				ft_mc_installed++;
+			}
+		}
+		cdx_ft_end();
+
+		mutex_lock(&ft_mc_lock);
+		/* The group may have been retired while the transaction was
+		 * held; it is still allocated, because only this function
+		 * frees one and it is not reentrant. */
+		if (spec.listeners || hw)
+			target->hw = hw;
+		mutex_unlock(&ft_mc_lock);
+	}
+
+	/* Somebody still waiting for a source keeps the hook registered. */
+	mutex_lock(&ft_mc_lock);
+	want_hook = false;
+	list_for_each_entry(g, &ft_mc_groups, list)
+		if (!g->host && g->ports && !g->hw) {
+			want_hook = true;
+			break;
+		}
+	mutex_unlock(&ft_mc_lock);
+	if (!ft_mc_stopping)
+		ft_mc_hook_sync(want_hook);
+	else
+		ft_mc_hook_sync(false);
 }
 
 /* The MDB half of the switchdev chain.
@@ -2785,6 +3129,10 @@ static void ft_mc_exit(void)
 	mutex_lock(&ft_mc_lock);
 	ft_mc_stopping = true;
 	mutex_unlock(&ft_mc_lock);
+	/* Before the work is cancelled: the hook's only action is to wake it,
+	 * so a hook still registered afterwards could re-arm what was just
+	 * drained. Unregistering waits for the readers already inside it. */
+	ft_mc_hook_sync(false);
 	cancel_work_sync(&ft_mc_work);
 	/* The chain is already unregistered by the caller, so nothing can add
 	 * to this list while it drains. */
@@ -3524,9 +3872,11 @@ static int ft_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   records, slots);
 	ft_session_rows(seq);
-	seq_printf(seq, "mcast_groups %u\nmcast_installed %u\nmcast_refused %llu\nmcast_install_errors %llu\n",
+	seq_printf(seq, "mcast_groups %u\nmcast_installed %u\nmcast_refused %llu\nmcast_install_errors %llu\n"
+		   "mcast_observed %llu\nmcast_dropped %llu\nmcast_hooked %u\n",
 		   ft_mc_count, ft_mc_installed, ft_mc_refused,
-		   ft_mc_install_errors);
+		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
+		   ft_mc_hooked);
 	ft_mc_rows(seq);
 	return 0;
 }
