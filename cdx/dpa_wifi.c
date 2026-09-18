@@ -127,6 +127,9 @@ static unsigned int dpaa_vwd_nf_route_hook_fn( void *ops,struct sk_buff *skb,con
 static unsigned int dpaa_vwd_nf_bridge_hook_fn( void *ops,struct sk_buff *skb,const struct nf_hook_state *state);
 
 static int dpaa_vwd_send_packet(struct dpaa_vwd_priv_s *priv, void *vap_handle, struct sk_buff *skb);
+/* Defined with the hook registration it drives, below, rather than here: the
+ * callers are the two places vap_count changes outside init and exit. */
+static void vwd_hooks_sync(struct dpaa_vwd_priv_s *priv);
 static ssize_t vwd_show_dump_stats(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t vwd_show_vap_stats(struct device *dev, struct device_attribute *attr, char *buf);
 static ssize_t vwd_show_fast_path_enable(struct device *dev, struct device_attribute *attr, char *buf);
@@ -2360,6 +2363,10 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 
 	spin_unlock_bh(&priv->vaplock);
 
+	/* Every path above that can change vap_count reaches here, and this
+	 * is the first point at which sleeping is allowed again. */
+	vwd_hooks_sync(priv);
+
 	if (create_sysfs) {
 		/* Create sysfs entry for vap interface */
 		if (device_create_file(priv->vwd_device, &dev_attr_vap[cmd->vapid])) {
@@ -2632,6 +2639,12 @@ static int vwd_netdev_event(struct notifier_block *nb,
 				vwd_vap_down(priv, vap);
 		}
 		spin_unlock_bh(&priv->vaplock);
+		/* The fourth place vap_count moves, and the one that is not an
+		 * ioctl: a VAP whose netdev unregistered takes the count down
+		 * with it, and the last one out should take the hooks with it
+		 * too. Safe here -- notifiers run under RTNL in process
+		 * context, and nothing below holds vaplock. */
+		vwd_hooks_sync(priv);
 	}
 	return NOTIFY_DONE;
 }
@@ -2643,7 +2656,27 @@ static struct notifier_block vwd_netdev_notifier = {
 /** dpaa_vwd_up
  *
  */
-static int dpaa_vwd_up(struct dpaa_vwd_priv_s *priv)
+/* The classifier hooks are registered only while a VAP exists.
+ *
+ * They sit at NF_INET_PRE_ROUTING with NF_IP_PRI_FIRST, so with them
+ * registered every packet that reaches PRE_ROUTING enters
+ * vwd_classify_route_packet(), which takes the global vaplock before it can
+ * discover that the device has no VAP and there was nothing to do. A fully
+ * offloaded flow never gets there -- the flowtable steals it earlier, at
+ * NF_NETDEV_INGRESS -- but everything on the software path does: first
+ * packets, local traffic, anything the classifier declined. On a board with
+ * no radio configured that is a global lock acquisition per packet buying
+ * nothing.
+ *
+ * This did not matter while VWD was built only for the legacy owner, which
+ * had a VAP whenever it was running at all. It matters now that the hardware
+ * comes up in both ownership modes, so the cost is tied to a VAP existing
+ * rather than to the subsystem being compiled in.
+ */
+static DEFINE_MUTEX(vwd_hook_mutex);
+static bool vwd_hooks_on;
+
+static int vwd_hooks_register(void)
 {
 	int ret;
 
@@ -2656,9 +2689,66 @@ static int dpaa_vwd_up(struct dpaa_vwd_priv_s *priv)
 	ret = nf_register_net_hook(&init_net, &vwd_hook_bridge);
 	if (ret)
 		goto err_bridge;
+	return 0;
+
+err_bridge:
+	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
+err_ipv6:
+	nf_unregister_net_hook(&init_net, &vwd_hook);
+	synchronize_net();
+	return ret;
+}
+
+static void vwd_hooks_unregister(void)
+{
+	nf_unregister_net_hook(&init_net, &vwd_hook);
+	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
+	nf_unregister_net_hook(&init_net, &vwd_hook_bridge);
+	/* nf_unregister_net_hook only call_rcu()s the old array; it does not
+	 * wait. Callers that go on to free what a classifier could still be
+	 * walking must synchronise themselves. */
+}
+
+/* Bring the hooks into line with whether any VAP is open.
+ *
+ * Must not be called with vaplock held: registration allocates and
+ * unregistration waits. Every caller therefore runs it after dropping that
+ * lock, which is also why the decision is re-read here rather than passed in
+ * -- the count can have moved again by the time we get the mutex, and the
+ * last writer to reach this point is the one that should win.
+ */
+static void vwd_hooks_sync(struct dpaa_vwd_priv_s *priv)
+{
+	bool want;
+
+	spin_lock_bh(&priv->vaplock);
+	want = priv->vap_count > 0;
+	spin_unlock_bh(&priv->vaplock);
+
+	mutex_lock(&vwd_hook_mutex);
+	if (want && !vwd_hooks_on) {
+		if (!vwd_hooks_register())
+			vwd_hooks_on = true;
+		else
+			DPAWIFI_ERROR("%s::could not register the classifier hooks; this VAP will not offload\n",
+				      __func__);
+	} else if (!want && vwd_hooks_on) {
+		vwd_hooks_unregister();
+		vwd_hooks_on = false;
+		/* A classifier may still be in flight against the VAP that
+		 * just went away; the caller's own teardown waits it out. */
+	}
+	mutex_unlock(&vwd_hook_mutex);
+}
+
+static int dpaa_vwd_up(struct dpaa_vwd_priv_s *priv)
+{
+	int ret;
+
+	/* No hooks here. They arrive with the first VAP; see vwd_hooks_sync(). */
 	ret = register_netdevice_notifier(&vwd_netdev_notifier);
 	if (ret)
-		goto err_notifier;
+		return ret;
 	ret = dpaa_vwd_sysfs_init(priv);
 	if (ret)
 		goto err_sysfs;
@@ -2667,13 +2757,6 @@ static int dpaa_vwd_up(struct dpaa_vwd_priv_s *priv)
 
 err_sysfs:
 	unregister_netdevice_notifier(&vwd_netdev_notifier);
-err_notifier:
-	nf_unregister_net_hook(&init_net, &vwd_hook_bridge);
-err_bridge:
-	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
-err_ipv6:
-	nf_unregister_net_hook(&init_net, &vwd_hook);
-	synchronize_net();
 	return ret;
 }
 
@@ -2700,9 +2783,15 @@ static int dpaa_vwd_down( struct dpaa_vwd_priv_s *priv )
 	 * and attrs exactly once via the masks */
 	unregister_netdevice_notifier(&vwd_netdev_notifier);
 	wifi_rx_fastpath_unregister();
-	nf_unregister_net_hook(&init_net, &vwd_hook);
-	nf_unregister_net_hook(&init_net, &vwd_hook_ipv6);
-	nf_unregister_net_hook(&init_net, &vwd_hook_bridge);
+	/* Whatever the VAP count says: the notifier replay above has already
+	 * taken every VAP down, so this is the unconditional counterpart to
+	 * the deferred registration and leaves nothing behind on exit. */
+	mutex_lock(&vwd_hook_mutex);
+	if (vwd_hooks_on) {
+		vwd_hooks_unregister();
+		vwd_hooks_on = false;
+	}
+	mutex_unlock(&vwd_hook_mutex);
 	/* nf_unregister_net_hook only call_rcu()s the old entries array —
 	 * it does NOT wait — and the rx-fastpath unregister is a bare
 	 * pointer swap. Wait out in-flight classifiers/rx handlers here so
