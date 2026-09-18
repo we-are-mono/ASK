@@ -43,8 +43,12 @@ int main(void)
         for (unsigned type = FLOW_OFFLOAD_XMIT_NEIGH; type <= FLOW_OFFLOAD_XMIT_XFRM; type++) {
             tuple.xmit_type = type;
             tuple.dst_cache = &destination; tuple.dst_cookie = 42;
-            assert(nf_flow_offload_dst(&tuple) ==
-                   (type == FLOW_OFFLOAD_XMIT_NEIGH ? &destination : NULL));
+            /* Both keep a destination in that union, and both hand it
+             * over. flow_offload_fill_route() fills NEIGH and XFRM from the
+             * same branch, so refusing to show a transformed one to the
+             * driver would be refusing the flow rather than describing it --
+             * and refusing it is how a tunnel ends up carried in software. */
+            assert(nf_flow_offload_dst(&tuple) == &destination);
             assert(nf_flow_dst_check(&table, &tuple));
             tuple.dst_cookie = 41;
             assert(!nf_flow_dst_check(&table, &tuple));

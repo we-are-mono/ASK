@@ -501,8 +501,17 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 		(void)gro_result; /* Result no longer checked - GRO_DROP removed in kernel 6.12 */
 
 	}
-	else if ( (netif_receive_skb(skb) == NET_RX_DROP)) /* (netif_rx(skb) != NET_RX_SUCCESS) */
-		DPAIPSEC_ERROR("%s::packet dropped\n", __func__);
+	else
+		/* NET_RX_DROP here does not mean the frame was dropped, so it
+		 * is deliberately not reported. __netif_receive_skb_core()
+		 * leaves its return at NET_RX_DROP whenever an ingress hook
+		 * takes the frame, and the flowtable's is exactly such a hook:
+		 * every decrypted frame it forwards in software comes back
+		 * through here looking like a loss. Measured on the bench:
+		 * fifty-nine of sixty "dropped" frames were delivered. A
+		 * counter that cannot tell a loss from a steal is worse than
+		 * none, and at line rate it is also a log flood. */
+		netif_receive_skb(skb);
 	return qman_cb_dqrr_consume;
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 pkt_drop:

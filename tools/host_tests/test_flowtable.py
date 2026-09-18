@@ -100,7 +100,12 @@ def test_flowtable_neighbour_fallback(tmp_path):
     source = (kernel / "net/netfilter/nf_flow_table_ip.c").read_text()
     offload = (kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
     (tmp_path / "neigh_fallback_production.inc").write_text(
-        function(source, "nf_flow_dst_check") + function(offload, "nf_flow_offload_dst"))
+        function(source, "nf_flow_dst_check")
+        # The predicate the accessor is built on, not a detail of it: which
+        # transmit types keep a destination in that union is the whole
+        # question this test asks, so it is compiled rather than stubbed.
+        + function(offload, "nf_flow_offload_has_dst")
+        + function(offload, "nf_flow_offload_dst"))
     binary = tmp_path / "flowtable_neigh"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",

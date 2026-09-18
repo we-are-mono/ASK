@@ -24,6 +24,11 @@ typedef uint64_t u64;
 #define CONNTRACK_DNAT 0x10
 #define CONNTRACK_NAT 0x20
 #define CONNTRACK_SNAT CONNTRACK_NAT
+#define CONNTRACK_SEC 0x1000
+/* One slot per direction of travel, as the encoder reads them: an outbound SA
+ * decides where a matched frame goes, an inbound one decides which port's
+ * table the entry has to live in to be matched at all. */
+#define SA_MAX_OP 2
 #define GFP_KERNEL 0
 #define EN_EHASH_DELETE_UNSYNCED -2
 #define HASH_CT(s,d,sp,dp,proto) ((proto) * 13)
@@ -155,6 +160,7 @@ typedef struct CtEntry {
     struct CtEntry *twin;
     RouteEntry *pRtEntry;
     struct hw_ct *ct;
+    u16 hSAEntry[SA_MAX_OP];
     unsigned fftype, status, proto, hash;
     __be16 Sport, Dport;
     /* The real hardware-visible overlay, byte for byte: an IPv6 destination

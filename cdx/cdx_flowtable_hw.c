@@ -218,12 +218,23 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * conntrack command's SA_handle fields; this is the same description
 	 * arriving from a different control plane.
 	 *
-	 * Only hSAEntry[0] is filled. The array holds SA_MAX_OP so a stacked
-	 * bundle (ESP under AH) can name both, and nothing here proves the
-	 * opcode order such a bundle needs -- so admission refuses more than
-	 * one and this stays deliberately single. */
+	 * The array holds SA_MAX_OP so a stacked bundle (ESP under AH) can name
+	 * both, and nothing here proves the opcode order such a bundle needs --
+	 * so admission refuses more than one per end and the two slots are one
+	 * per direction of travel rather than a stack.
+	 *
+	 * The two ends are independent. An outbound SA decides where the frame
+	 * goes once it has matched; an inbound one decides where the entry has
+	 * to live to be matched at all, because cdx_ipsec_fill_sec_info()
+	 * answers it by replacing the table descriptor and port id with the
+	 * offline port's. A direction can name either, or both when one tunnel
+	 * feeds another. */
 	if (rule->sa_handle) {
 		ct->hSAEntry[0] = rule->sa_handle;
+		ct->status |= CONNTRACK_SEC;
+	}
+	if (rule->in_sa_handle) {
+		ct->hSAEntry[1] = rule->in_sa_handle;
 		ct->status |= CONNTRACK_SEC;
 	}
 	/* A flow with no encapsulation asks for no override, and takes exactly

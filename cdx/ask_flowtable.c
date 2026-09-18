@@ -495,66 +495,155 @@ static bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
 }
 
 /* Borrow the route selected by Netfilter, not a second FIB lookup which could
- * lose its policy/ingress context. Patch 140 supplies only retained NEIGH dsts
- * with the cookie they were selected under: an IPv6 destination belongs to one
- * FIB generation and dst_check() rejects every one of them against a zero
- * cookie. No route pointer escapes the callback. Transformed routes need a
- * separate contract in either family. dev is the logical egress device, which
- * is the VLAN subinterface rather than the physical port when the flow is
- * tagged; the destination Netfilter selected belongs to that device. */
-/* The offloaded SA this direction's frames are encrypted by, or zero.
+ * lose its policy/ingress context. Patch 140 supplies the retained NEIGH and
+ * XFRM dsts with the cookie they were selected under: an IPv6 destination
+ * belongs to one FIB generation and dst_check() rejects every one of them
+ * against a zero cookie. No route pointer escapes the callback. A transformed
+ * destination is handed over rather than withheld, and ft_next_hop() below
+ * says what that costs: the route that transmits is the one under the bundle,
+ * and the address to resolve on it is the tunnel's far end. dev is the
+ * logical egress device, which is the VLAN subinterface rather than the
+ * physical port when the flow is tagged; the destination Netfilter selected
+ * belongs to that device. */
+/* The one offloaded SA a resolved transform names, or NULL.
  *
- * Returns false when the flow is transformed by something this contract
- * cannot carry, which must be a refusal rather than a plain installation --
- * an entry that forwards in hardware what a policy says to encrypt sends it
- * in the clear, and the policy never gets a say. That is the failure this
- * function exists to prevent, and it was observed on the bench before it did:
- * fifty-nine packets forwarded past a `level required` policy.
+ * A bundle deeper than one transform is refused here rather than by each
+ * caller: nothing proves the opcode order a stacked bundle needs, so such a
+ * flow belongs in software whichever end asked about it.
+ */
+static struct xfrm_state *ft_ipsec_offloaded(const struct dst_entry *bundle,
+					     struct net_device *dev)
+{
+	struct xfrm_state *x = dst_xfrm(bundle);
+
+	if (!x || dst_xfrm(xfrm_dst_child(bundle)))
+		return NULL;		/* nothing, or a bundle deeper than one */
+	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET || !x->xso.offload_handle)
+		return NULL;		/* the stack is doing this one */
+	if (x->xso.dev != dev)
+		return NULL;		/* another port's SEC context */
+	return x;
+}
+
+/* Name the offloaded inbound SA paired with an outbound one.
  *
- * The question has to be asked of the policy, not of the borrowed
- * destination. A transformed dst only reaches the flowtable for locally
- * generated traffic; a *forwarded* flow is routed by nf_route() with a plain
- * FIB lookup and is transformed later, in xfrm_route_forward() at
- * POSTROUTING, so its cached destination never carries the transform that
- * will be applied to it. Asking dst_xfrm() therefore answers "no policy" for
- * exactly the flows a gateway encrypts. So this repeats the lookup
- * forwarding itself does, against the same tuple, and believes the answer.
+ * A child SA is installed as a pair with mirrored endpoints, so the inbound
+ * half of `out` is the state whose destination is our local endpoint and whose
+ * source is the peer. Asking xfrm's own index for it beats keeping a second
+ * one here: the pair is the kernel's fact, not this adapter's, and a private
+ * copy would have to be kept in step with every rekey.
  *
- * KEEP_DST_REF is what makes that safe on a destination this code does not
- * own: without it a matching policy releases the reference the caller
+ * Three outcomes. No such state at all means the far end sends in the clear,
+ * so the direction installs as any other with no handle. A usable one is
+ * named. One that exists and is not usable -- software, another port's, dead
+ * -- is a refusal: its frames are decrypted before they could match this
+ * tuple, so the entry would be installed, counted and never matched.
+ *
+ * A rekey briefly leaves two inbound states for one pair; the lookup answers
+ * with the most recently installed, which is the one a fresh flow should name.
+ * The older one keeps its own classifier entry until it is deleted, and that
+ * deletion retires whatever still depends on it.
+ */
+static bool ft_ipsec_paired_inbound(const struct xfrm_state *out,
+				    struct net_device *in, u16 *handle)
+{
+	struct xfrm_state *x;
+	bool ok = false;
+
+	*handle = 0;
+	x = xfrm_state_lookup_byaddr(&init_net, out->mark.v, &out->props.saddr,
+				     &out->id.daddr, IPPROTO_ESP,
+				     out->props.family);
+	if (!x)
+		return true;		/* the far end sends in the clear */
+	if (x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
+	    x->xso.dir == XFRM_DEV_OFFLOAD_IN && x->xso.offload_handle &&
+	    x->xso.dev == in && x->km.state == XFRM_STATE_VALID) {
+		*handle = cdx_ipsec_sa_handle(
+			(struct cdx_ipsec_sa *)x->xso.offload_handle);
+		ok = *handle != 0;
+	}
+	xfrm_state_put(x);
+	return ok;
+}
+
+/* Record the handle this end of the direction needs, and say whether the
+ * direction may be installed at all.
+ *
+ * The sending end names the state it found. The receiving end names that
+ * state's inbound half instead, and treats a missing half as "the far end
+ * sends in the clear" rather than as a failure -- a one-way tunnel is unusual
+ * but legal, and refusing it would give up an acceleration that works.
+ */
+static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_in,
+			    u16 *handle)
+{
+	if (!pair_in) {
+		*handle = cdx_ipsec_sa_handle(
+			(struct cdx_ipsec_sa *)x->xso.offload_handle);
+		return *handle != 0;
+	}
+	return ft_ipsec_paired_inbound(x, pair_in, handle);
+}
+
+/* What transform covers `fl` leaving `dev`, and which SA handle this direction
+ * should record because of it.
+ *
+ * Two questions share this one lookup, because they are the same question
+ * asked from opposite ends of a direction:
+ *
+ *   `pair_in == NULL` -- what encrypts the frames this direction *sends*.
+ *     *handle receives that outbound SA's handle.
+ *   `pair_in != NULL` -- what the frames this direction *receives* were
+ *     encrypted by. The tuple passed is the reversed one, so the policy found
+ *     is the one that would transform those frames had this gateway sent them,
+ *     and the SA that actually decrypted them is that policy's inbound half on
+ *     `pair_in`. *handle receives its handle.
+ *
+ * The question has to be asked of the policy, not only of the borrowed
+ * destination. A transformed dst reaches the flowtable only when the packet
+ * that created the flow was itself transformed, which is whichever direction
+ * won the race -- the other one is routed by nf_route() with a plain FIB
+ * lookup and transformed later, so its cached destination carries nothing.
+ * Reading the destination alone therefore answers "no policy" for exactly the
+ * flows a gateway encrypts. Where the destination *is* transformed the answer
+ * is already in hand and the lookup is skipped: a transform that is there is
+ * not a false positive.
+ *
+ * Refusal differs by end, and deliberately so:
+ *
+ *   sending   -- a policy that claims the tuple and resolves to nothing the
+ *     hardware can carry is a refusal. An entry that forwards in hardware what
+ *     a policy says to encrypt sends it in the clear, and the policy never
+ *     gets a say; fifty-nine packets went that way on the bench.
+ *   receiving -- a policy proves nothing about what the far end actually
+ *     sends, so only a *state* does. An inbound SA for this pair that exists
+ *     and cannot be named is a refusal, because its frames are decrypted
+ *     before they could match this tuple and an entry keyed on the physical
+ *     port would match nothing at all. Its absence is simply a direction whose
+ *     frames arrive in the clear, which must install exactly as it always did.
+ *
+ * KEEP_DST_REF is what makes the lookup safe on a destination this code does
+ * not own: without it a matching policy releases the reference the caller
  * borrowed.
  */
-static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
-			    const struct cdx_ft_rule *rule,
-			    struct net_device *out, u16 *handle)
+static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
+			     struct net_device *dev, struct net_device *pair_in,
+			     u16 *handle)
 {
-	struct dst_entry *dst = cls->nf_dst;
 	struct dst_entry *bundle;
 	struct xfrm_state *x;
-	struct flowi fl = {};
-	bool ok = false;
+	bool ok;
 
 	*handle = 0;
 	if (!dst)
 		return true;
-	/* The translated tuple, with its ports: a policy selector can name
-	 * them, and a flowi missing them would fail to match a policy that
-	 * does -- admitting in the clear exactly the flow it was meant to
-	 * catch. These are the post-NAT values because that is what leaves
-	 * this port and what xfrm_route_forward() sees at POSTROUTING. */
-	if (rule->family != AF_INET) {
-		fl.u.ip6.daddr = rule->new_dst.in6;
-		fl.u.ip6.saddr = rule->new_src.in6;
-		fl.u.ip6.fl6_dport = rule->new_dport;
-		fl.u.ip6.fl6_sport = rule->new_sport;
-	} else {
-		fl.u.ip4.daddr = rule->new_dst.ip;
-		fl.u.ip4.saddr = rule->new_src.ip;
-		fl.u.ip4.fl4_dport = rule->new_dport;
-		fl.u.ip4.fl4_sport = rule->new_sport;
+	if (dst_xfrm(dst)) {
+		x = ft_ipsec_offloaded(dst, dev);
+		if (!x)
+			return !!pair_in;
+		return ft_ipsec_record(x, pair_in, handle);
 	}
-	fl.flowi_proto = rule->proto;
-	fl.flowi_oif = out->ifindex;
 
 	/* Take a reference before asking, because a matching policy consumes
 	 * one. xfrm_bundle_create() links the destination into the bundle it
@@ -566,37 +655,80 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 	 * destination the flowtable still uses. KASAN caught exactly that, as
 	 * a slab-use-after-free in rcuref_put(). */
 	dst_hold(dst);
-	bundle = xfrm_lookup(&init_net, dst, &fl, NULL,
+	bundle = xfrm_lookup(&init_net, dst, fl, NULL,
 			     XFRM_LOOKUP_KEEP_DST_REF);
 	if (IS_ERR(bundle)) {
 		dst_release(dst);
-		/* A policy matched and no state could be resolved. Forwarding
+		/* A policy matched and no state could be resolved. Sending
 		 * this in hardware would bypass it, so refuse and let the
 		 * software path make whatever decision the policy asks for --
-		 * an acquire, a block, or a drop. */
-		return false;
+		 * an acquire, a block, or a drop. Receiving is unaffected:
+		 * nothing has been decrypted, so nothing is arriving. */
+		return !!pair_in;
 	}
 	if (bundle == dst) {
-		/* No policy: an ordinary plain flow. Nothing consumed the
+		/* No policy: an ordinary plain end. Nothing consumed the
 		 * reference taken above, so give it back. */
 		dst_release(dst);
 		return true;
 	}
 
-	x = bundle->xfrm;
-	if (!x || dst_xfrm(xfrm_dst_child(bundle)))
-		goto out;		/* nothing, or a bundle deeper than one */
-	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET || !x->xso.offload_handle)
-		goto out;		/* the stack is doing this one */
-	if (x->xso.dev != out)
-		goto out;		/* another port's SEC context */
-	*handle = cdx_ipsec_sa_handle((struct cdx_ipsec_sa *)x->xso.offload_handle);
-	ok = *handle != 0;
-out:
+	x = ft_ipsec_offloaded(bundle, dev);
+	ok = x ? ft_ipsec_record(x, pair_in, handle) : !!pair_in;
 	/* Releases the whole chain, including the reference the bundle took
 	 * over from us above. */
 	dst_release(bundle);
 	return ok;
+}
+
+/* The tuple a direction presents to policy on its way out of a port.
+ *
+ * `reverse` builds the other direction's, which is this one's inverse: what
+ * this direction received is what the far end sent, and the untranslated pair
+ * is what the peer addressed. Ports are carried because a policy selector can
+ * name them, and a flowi missing them would fail to match a policy that does.
+ */
+static void ft_ipsec_flowi(const struct cdx_ft_rule *rule, bool reverse,
+			   struct net_device *out, struct flowi *fl)
+{
+	const union nf_inet_addr *src = reverse ? &rule->dst : &rule->new_src;
+	const union nf_inet_addr *dst = reverse ? &rule->src : &rule->new_dst;
+	__be16 sport = reverse ? rule->dport : rule->new_sport;
+	__be16 dport = reverse ? rule->sport : rule->new_dport;
+
+	memset(fl, 0, sizeof(*fl));
+	if (rule->family != AF_INET) {
+		fl->u.ip6.daddr = dst->in6;
+		fl->u.ip6.saddr = src->in6;
+		fl->u.ip6.fl6_dport = dport;
+		fl->u.ip6.fl6_sport = sport;
+	} else {
+		fl->u.ip4.daddr = dst->ip;
+		fl->u.ip4.saddr = src->ip;
+		fl->u.ip4.fl4_dport = dport;
+		fl->u.ip4.fl4_sport = sport;
+	}
+	fl->flowi_proto = rule->proto;
+	fl->flowi_oif = out->ifindex;
+}
+
+/* Both ends of one direction: what encrypts what it sends, and what decrypted
+ * what it receives. The sending end is asked of the destination this callback
+ * borrowed; the receiving end of the reverse direction's, which is the path
+ * the far end's frames took to get here.
+ */
+static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
+			    struct cdx_ft_rule *rule, struct net_device *out,
+			    struct net_device *in)
+{
+	struct flowi fl;
+
+	ft_ipsec_flowi(rule, false, out, &fl);
+	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, NULL, &rule->sa_handle))
+		return false;
+	ft_ipsec_flowi(rule, true, in, &fl);
+	return ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, rule->in,
+				&rule->in_sa_handle);
 }
 
 static bool ft_next_hop(const struct flow_cls_offload *cls,
@@ -605,9 +737,10 @@ static bool ft_next_hop(const struct flow_cls_offload *cls,
 			union nf_inet_addr *next_hop)
 {
 	struct dst_entry *dst = cls->nf_dst;
+	const struct xfrm_state *x = NULL;
+	union nf_inet_addr peer;
 
-	if (!dst || dst->ops->family != family || dst->dev != dev ||
-	    dst->lwtstate || dst->error ||
+	if (!dst || dst->ops->family != family || dst->error ||
 	    !dst_check(dst, cls->nf_dst_cookie))
 		return false;
 	/* An encrypted flow's destination is the transform, and the route to
@@ -619,9 +752,31 @@ static bool ft_next_hop(const struct flow_cls_offload *cls,
 	 * The SA itself is checked separately, by ft_ipsec_handle(); this is
 	 * only about where the finished frame goes. */
 	while (dst_xfrm(dst)) {
+		x = dst_xfrm(dst);
 		dst = xfrm_dst_child(dst);
 		if (!dst || dst->ops->family != family || dst->error)
 			return false;
+	}
+	/* Asked of the route that transmits, which is the one under any
+	 * transform. The bundle above it carries the encapsulating device and
+	 * whatever tunnel encapsulation the transform brings, neither of which
+	 * describes the frame this port puts on the wire. */
+	if (dst->dev != dev || dst->lwtstate)
+		return false;
+	/* Past a transform the address to resolve is the tunnel's far end, not
+	 * the flow's own destination. Both reach the same answer through a
+	 * gateway route, which is why this went unnoticed: rt_nexthop() returns
+	 * the gateway whatever it is handed. On an on-link route it returns
+	 * what it was given, so asking with the inner destination named a next
+	 * hop that is not on this segment and has no neighbour -- and the
+	 * direction was refused rather than encrypted. */
+	if (x) {
+		memset(&peer, 0, sizeof(peer));
+		if (family == AF_INET6)
+			memcpy(&peer.in6, x->id.daddr.a6, sizeof(peer.in6));
+		else
+			peer.ip = x->id.daddr.a4;
+		daddr = &peer;
 	}
 	memset(next_hop, 0, sizeof(*next_hop));
 	if (family == AF_INET6) {
@@ -1387,7 +1542,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * neighbour-output flow and the only one the encoder can cache. */
 	if (!ft_vlan_actions(&rule->action, out) ||
 	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop) ||
-	    !ft_ipsec_handle(cls, out, out->out_logical, &out->sa_handle) ||
+	    !ft_ipsec_handle(cls, out, out->out_logical, out->in_logical) ||
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return -EOPNOTSUPP;
@@ -1972,7 +2127,8 @@ static void ft_ipsec_retire_sa(u16 handle)
 		return;
 	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
-		if (entry->rule.sa_handle == handle)
+		if (entry->rule.sa_handle == handle ||
+		    entry->rule.in_sa_handle == handle)
 			ft_handle_invalidate(entry->handle, &ft_ipsec_invalidations);
 	spin_unlock_bh(&ft_watch_lock);
 }
@@ -2903,7 +3059,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
@@ -2911,10 +3067,10 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
 				   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
-				   entry->rule.sa_handle,
+				   entry->rule.sa_handle, entry->rule.in_sa_handle,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),
@@ -2922,7 +3078,7 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
 				   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
-				   entry->rule.sa_handle,
+				   entry->rule.sa_handle, entry->rule.in_sa_handle,
 				   &entry->next_hop.ip, stats.packets, stats.bytes, stats.lastused);
 		return 0;
 	}
