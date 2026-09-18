@@ -1,0 +1,116 @@
+From: Tomaz Zaman <tomaz@mono.si>
+Subject: [PATCH] moal: stop touching the receive descriptor after handing it up
+
+woal_alloc_mlan_buffer() puts the mlan_buffer inside the skb it allocates:
+
+	skb = __dev_alloc_skb(size + sizeof(mlan_buffer), flag);
+	skb_reserve(skb, sizeof(mlan_buffer));
+	pmbuf = (mlan_buffer *)skb->head;
+
+So the descriptor and the packet share one allocation, and freeing the skb
+frees the descriptor with it. moal_recv_packet() does not observe that.
+After it hands the skb to netif_rx() or netif_receive_skb() -- which
+consume it, and on this path complete inline, so the frame is routed,
+answered and freed before the call returns -- it goes on to read pmbuf
+twice more:
+
+	done:
+		if (status != MLAN_STATUS_PENDING && pmbuf && !pmbuf->pdesc && skb)
+			dev_kfree_skb(skb);
+		if (pmbuf && !pmbuf->pbuf)
+			status = MLAN_STATUS_PENDING;
+
+Both dereference memory the stack has already returned to the allocator,
+and the first can free the skb a second time as well: MLAN_STATUS_PENDING
+is how this function says "someone else owns this now", and the delivery
+paths never set it -- only the branch that receives an skb already
+attached to the buffer does.
+
+An access point triggers this within seconds of a client associating:
+every ARP reply and every IPv6 multicast frame is delivered, consumed and
+freed inline. KASAN on an LS1046A, once per frame:
+
+  BUG: KASAN: slab-use-after-free in moal_recv_packet+0x3890/0x4d44 [moal]
+  Read of size 8 at addr ffff00084fac4028 by task kworker/u17:3/152
+  Workqueue: MOAL_PCIE_RX_WORK_QUEUE woal_pcie_rx_work_queue [moal]
+   moal_recv_packet+0x3890/0x4d44 [moal]
+   wlan_process_uap_rx_packet+0x5cc/0x124c [mlan]
+   woal_pcie_rx_work_queue+0x180/0x1fc [moal]
+  Freed by task 152:
+   __kfree_skb <- consume_skb <- arp_process <- arp_rcv
+
+Same task both times. Without KASAN it is silent corruption of whatever
+reuses the slab, and what it presents as is an access point that faults
+mid-handshake -- which the client reports as an authentication failure.
+
+Fix both halves. Say that the skb has been handed off, once, after the
+delivery chain, so the second free cannot happen; and do not consult the
+descriptor at all once it has, since it no longer exists. The remaining
+work under `done:` is only meaningful for a buffer that was *not* handed
+up, so gating the whole epilogue on that is both correct and narrower than
+the reads it removes.
+
+Upstream-Status: Pending [reported to NXP; moal_recv_packet() dereferences
+the mlan_buffer after the skb it is embedded in has been given to the
+network stack, and frees that skb a second time]
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ mlinux/moal_shim.c | 35 ++++++++++++++++++++++++++---------
+ 1 file changed, 26 insertions(+), 9 deletions(-)
+
+--- a/mlinux/moal_shim.c
++++ b/mlinux/moal_shim.c
+@@ -3111,6 +3111,15 @@
+ 					woal_get_monotonic_time(&t);
+ 					pmbuf->out_ts_sec = t.time_sec;
+ 					pmbuf->out_ts_usec = t.time_usec;
++					/* Accounted here rather than after the
++					 * handoff below. woal_alloc_mlan_buffer()
++					 * places the mlan_buffer at skb->head, so
++					 * once the stack has the skb this
++					 * descriptor is freed memory; a few
++					 * microseconds early is the only legal
++					 * time to read it. */
++					moal_tp_accounting(handle, pmbuf,
++							   RX_TIME_PKT);
+ 				}
+ 			}
+ 			if (priv->phandle->tp_acnt.drop_point == RX_DROP_P4) {
+@@ -3136,18 +3145,27 @@
+ 					}
+ 				}
+ 			}
+-			if (priv->phandle->tp_acnt.on) {
+-				if (pmbuf && pmbuf->in_ts_sec)
+-					moal_tp_accounting(handle, pmbuf,
+-							   RX_TIME_PKT);
+-			}
++			/* Every arm above consumes the skb, and the
++			 * mlan_buffer lives at skb->head, so pmbuf is freed
++			 * with it. Record the handoff before anything can read
++			 * either again; the RX_TIME_PKT accounting that used
++			 * to sit here now runs just above, while pmbuf is
++			 * still live.
++			 */
++			status = MLAN_STATUS_PENDING;
+ 		}
+ 	}
+ done:
+-	if (status != MLAN_STATUS_PENDING && pmbuf && !pmbuf->pdesc && skb)
+-		dev_kfree_skb(skb);
+-	if (pmbuf && !pmbuf->pbuf)
+-		status = MLAN_STATUS_PENDING;
++	/* Nothing below may touch pmbuf once the skb carrying it is gone, and
++	 * MLAN_STATUS_PENDING is precisely the record of that. Both statements
++	 * only ever meant anything for a buffer that was never handed up.
++	 */
++	if (status != MLAN_STATUS_PENDING) {
++		if (pmbuf && !pmbuf->pdesc && skb)
++			dev_kfree_skb(skb);
++		if (pmbuf && !pmbuf->pbuf)
++			status = MLAN_STATUS_PENDING;
++	}
+ 	LEAVE();
+ 	return status;
+ }

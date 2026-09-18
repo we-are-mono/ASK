@@ -13,6 +13,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
 SRC_URI = "git://github.com/nxp-imx/mwifiex.git;protocol=https;branch=hotfix/lf-6.12.49_2.2.0_hotfix \
            file://0001-cfg80211-set_monitor_channel-gained-its-netdev-in-6.12.patch \
+           file://0002-moal-do-not-free-an-skb-already-handed-to-the-stack.patch \
 "
 SRCREV = "09f41e1423e4806a127507d5fa284cd02c46772f"
 
