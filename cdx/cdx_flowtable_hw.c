@@ -96,7 +96,23 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	hw->route.itf = out->itf;
 	hw->route.input_itf = in->itf;
 	hw->route.underlying_input_itf = in->itf;
-	hw->route.mtu = rule->mtu;
+	/* The ucode checks the size of what it *transmits* against this, and
+	 * for a direction handed to SEC that is the outer frame: the entry
+	 * carries the expansion separately, in hdr_xpnd_sz, and the check adds
+	 * it before comparing. Netfilter's MTU for such a flow is the
+	 * tunnel-reduced inner one, so programming it directly fails every
+	 * full-size frame -- 1438 + 62 against 1438 -- and each one takes the
+	 * exception path instead. The flow is then matched and counted and
+	 * forwarded by the CPU anyway, which looks like an offload that works
+	 * and performs like software: measured at 0.07 Gb/s against the legacy
+	 * owner's 2.54 on the same tunnel, with the software SEC submit
+	 * counting once per packet.
+	 *
+	 * The limit that belongs here is the egress port's own. The legacy
+	 * owner never met this because its route table holds interface MTUs
+	 * rather than per-flow ones, and the same reasoning is already written
+	 * down beside the tunnel-interface case in devman.c. */
+	hw->route.mtu = rule->sa_handle ? rule->out_logical->mtu : rule->mtu;
 	ether_addr_copy(hw->route.dstmac, rule->dst_mac);
 	ct = &hw->entry;
 	ct->twin = &hw->twin;

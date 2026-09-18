@@ -71,6 +71,15 @@ COUNT = 60
 # after this handful rather than tracking the whole transfer, not its exact
 # value, so the bound is generous and the assertions below lean on "stopped".
 SETUP = 5
+# Full-size frames, deliberately. The classifier checks the size of what it
+# *transmits* against the MTU programmed in the entry, and for a direction
+# handed to SEC that is the outer frame -- the tunnel expansion is added before
+# the comparison. A short payload fits whatever is programmed, so a wrong MTU
+# excepts nothing and every assertion below passes while the hardware quietly
+# hands each frame to the CPU. This payload puts the inner datagram close
+# enough to the tunnel's own MTU that the sum exceeds a tunnel-reduced bound
+# and stays inside the port's, which is the difference the two make.
+PAYLOAD = 1400
 CIPHER = "0x" + "a5" * 16
 AUTH = "0x" + "5a" * 32
 TABLE = "ask_ipsec_inbound"
@@ -216,7 +225,7 @@ async def test_tunnel_carries_both_directions_in_hardware(
         sock.settimeout(1)
         echoed = 0
         for _ in range(COUNT):
-            sock.sendto(b"y" * 512, (LAN_INNER, PORT))
+            sock.sendto(b"y" * PAYLOAD, (LAN_INNER, PORT))
             try:
                 sock.recv(2048)
                 echoed += 1

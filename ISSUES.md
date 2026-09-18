@@ -158,9 +158,9 @@ result independently of those temporary files.
   ended with the agent unreachable and the board back at 27 seconds of uptime;
   `panic=10` reboots on panic, so it panicked. No console logger was attached,
   so the ring buffer went with it and there is nothing to read. Two things
-  weaken the diagnosis rather than the observation: the LAN link was flapping
-  at the time (see below), and the same bench had just carried three TCP runs
-  per direction without incident. Reproduce with `Console.target()` logging to
+  weaken the diagnosis rather than the observation: the LAN segment was
+  flapping at the time, and the same bench had just carried three TCP runs per
+  direction without incident. Reproduce with `Console.target()` logging to
   a file for the whole run before drawing any conclusion — and note the rig's
   LAN segment has to be healthy first, or the flap is a confound. Worth doing
   even though CMM is being retired: the SEC datapath under it is shared code.
