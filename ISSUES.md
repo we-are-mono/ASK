@@ -152,6 +152,33 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A156 — a failed multicast UPDATE leaves the listeners it already
+  installed forwarding, and reports failure.** `cdx_update_mcast_group()`
+  (`cdx/dpa_control_mc.c`) commits each listener of a batch as it is built:
+  `bIsValidEntry = 1`, `uiListenerCnt++`, and
+  `cdx_exthash_update_first_mcast_member_addr()` splices the entry into the
+  live replication chain under the bucket spinlock. Its `err_ret:` label is a
+  bare `return iRet;` with no unwind, so a failure on listener *k* returns an
+  error to the FCI client while listeners 1..*k*−1 stay installed and
+  replicating. The comment above the failure branch asserts the opposite —
+  that prior listeners "are about to be torn down" — and is stale.
+  Not a leak: each installed entry is owned by a valid `members[]` slot and is
+  freed at group teardown. The defect is that the control plane's view of the
+  group diverges from the hardware's, silently and permanently, and a client
+  that retries the same UPDATE then fails again on
+  `Cdx_GetMcastMemberId() != -1` ("member already exists") for listeners it
+  believes it never added. The create path does not share this: its `err_ret`
+  cascade calls `cdx_free_exthash_mcast_members()` and refuses the whole group.
+  Fixing it is not a one-liner — the entries are already visible to the
+  microcode, so the unwind has to splice them back out under the bucket lock
+  and then release them through the quarantine barrier rather than freeing
+  them directly, which is the same discipline the group-DELETE path uses.
+  Surfaced by the audit of the `ins_entry_info` sharing fixed in this area;
+  pre-existing and unrelated to that fix. Reachable today only when a listener
+  entry fails to build — a missing onif, an exhausted hash table, or
+  `-ENOMEM` under pressure — which `test_mcast_failslab.py` already provokes,
+  so it is worth an assertion there once fixed.
+
 - [ ] **A155 — the DUT reset during a CMM-mode UDP tunnel probe, with no trace
   captured.** A one-way UDP transfer through an IPsec tunnel (400 Mb/s,
   1300-byte datagrams, forwarded WAN to LAN, legacy owner, non-KASAN image)

@@ -775,7 +775,6 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 	MC4Output	*pListener;
 	RouteEntry *pRtEntry, RtEntry;
 	int iRet = 0;
-	struct ins_entry_info *pInsEntryInfo, InsEntryInfo;
 	struct mcast_group_info *pMcastGrpInfo;
 	int ii, member_id = 0;
 	unsigned int uiNoOfListeners;
@@ -862,10 +861,8 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		iRet = -1;
 		goto err_ret;
 	}
-	memset(&InsEntryInfo, 0, sizeof(struct ins_entry_info));
-	pInsEntryInfo = &InsEntryInfo;
 	memset(&RtEntry,0, sizeof(RouteEntry));
-	pRtEntry = &RtEntry; 
+	pRtEntry = &RtEntry;
 
 	if(pMcastGrpInfo->mctype == 0)
 	{
@@ -917,7 +914,11 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 
 		DPA_INFO("%s(%d) creating table entry of mcast member %s\n",
 				__func__,__LINE__, pListener->output_device_str);
-		tbl_entry = create_exthash_entry4mcast_member(pRtEntry, pInsEntryInfo, pListener, tbl_entry, tbl_type);
+		/* No encapsulation is named: an FCI listener is a registered
+		 * interface and the interface walk describes whatever tags it
+		 * carries, which is the legacy owner's whole model. */
+		tbl_entry = create_exthash_entry4mcast_member(pRtEntry, pListener, NULL,
+							     tbl_entry, tbl_type);
 		if (!tbl_entry)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
@@ -1137,7 +1138,6 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 	PMC4Command mcast4_group;
 	PMC6Command mcast6_group;
 	RouteEntry *pRtEntry, RtEntry;
-	struct ins_entry_info *pInsEntryInfo, InsEntryInfo;
 	struct mcast_group_info *pMcastGrpInfo, McastGrpInfo;
 	struct mcast_group_info *pTempGrpInfo;
 	struct en_exthash_tbl_entry *tbl_entry = NULL;
@@ -1150,8 +1150,6 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 	uint64_t phyaddr;
 
 
-	memset(&InsEntryInfo, 0, sizeof(struct ins_entry_info));
-	pInsEntryInfo = &InsEntryInfo;
 	/* The create path zeroes its stack RouteEntry; without this the
 	 * vlan_filter_flags read by dpa_get_tx_info_by_itf is stack garbage. */
 	memset(&RtEntry, 0, sizeof(RouteEntry));
@@ -1268,7 +1266,9 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 			goto err_ret;
 		}
 
-		tbl_entry = create_exthash_entry4mcast_member(pRtEntry, pInsEntryInfo, pListener, NULL, tbl_type);
+		/* As in the create path: an FCI listener carries its own tags. */
+		tbl_entry = create_exthash_entry4mcast_member(pRtEntry, pListener, NULL,
+							     NULL, tbl_type);
 		if (!tbl_entry)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
@@ -1278,8 +1278,12 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 			 * entry and the loop body only sets it on error
 			 * branches, so without an explicit assignment here
 			 * the err_ret label returns 0 = NO_ERR even though
-			 * the listener add failed and any prior listeners
-			 * in this UPDATE batch are about to be torn down. */
+			 * the listener add failed.
+			 *
+			 * Note what the caller is NOT told: listeners earlier
+			 * in this batch are already spliced into the live
+			 * chain and keep replicating, because err_ret unwinds
+			 * nothing. See ISSUES.md A156. */
 			iRet = -1;
 			goto err_ret;
 		}

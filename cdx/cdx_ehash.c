@@ -2863,12 +2863,40 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
 	return SUCCESS;
 }
 
+/* Builds one listener's entry in a multicast group's replication chain.
+ *
+ * The scratch state is allocated here rather than supplied by the caller, and
+ * that is load-bearing rather than tidiness. struct ins_entry_info carries the
+ * write cursor into *one* entry's fixed opcode and parameter area -- opcptr,
+ * paramptr, param_size and opc_count together -- so it describes the entry
+ * being built and nothing that outlives it. Both mcast callers used to declare
+ * one on the stack, memset it once, and hand the same pointer to every listener
+ * in the group; three quarters of that cursor were then re-based per entry and
+ * opc_count was not, so the opcode budget of a 16-slot area was shared across
+ * every listener of the group. It never tripped, because the FCI dispatcher
+ * refuses a command naming more than MC_MAX_LISTENERS_IN_QUERY listeners and a
+ * group larger than that is built by several commands, each with a fresh
+ * struct -- but the headroom was six opcodes and the accounting was wrong.
+ *
+ * Owning it here removes the class rather than the four instances of it:
+ * tnl_hdr_size accumulates with +=, flags is only ever OR-ed, and preempt_params
+ * would be left pointing into the previous listener's entry for any future path
+ * that emitted a preemptive check. Every other entry builder in this file
+ * already allocates its own; this was the only loop that did not.
+ *
+ * `encap` names the VLAN tags this listener's frames leave with, or is NULL to
+ * take them from the egress interface as the legacy owner does. A registered
+ * VLAN interface is how CMM describes a tagged listener, and it is created only
+ * from an FCI command CMM sends, so an ownership mode without CMM has no such
+ * interface to walk and must say what it wants instead -- the same reasoning,
+ * and the same struct, as a flowtable direction's tag stack.
+ */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
-	struct ins_entry_info *pInsEntryInfo, MC4Output	*pListener, struct en_exthash_tbl_entry* prev_tbl_entry, 
-	uint32_t tbl_type)
+	MC4Output *pListener, const struct cdx_l2_encap *encap,
+	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type)
 {
+	struct ins_entry_info *pInsEntryInfo;
 	POnifDesc onif_desc;
-	int fm_idx, port_idx;
 	struct dpa_l2hdr_info *pL2Info;
 	struct dpa_l3hdr_info *pL3Info;
 	struct en_exthash_tbl_entry *tbl_entry = NULL;
@@ -2877,8 +2905,12 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 	uint16_t flags;
 	uint8_t *ptr;
 
+	pInsEntryInfo = kzalloc(sizeof(struct ins_entry_info), GFP_KERNEL);
+	if (!pInsEntryInfo)
+		return NULL;
+
 	DPA_INFO("%s(%d) listener output device %s\n",__func__,__LINE__,pListener->output_device_str);
-	onif_desc = get_onif_by_name(pListener->output_device_str); 
+	onif_desc = get_onif_by_name(pListener->output_device_str);
 	if (!onif_desc)
 	{
 		DPA_ERROR("%s::unable to get onif for iface %s\n", __func__, pListener->output_device_str);
@@ -2887,19 +2919,27 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 
 
 	DPA_INFO("%s(%d) onif_desc->itf->index %d\n",__func__,__LINE__,onif_desc->itf->index);
-	if(dpa_get_fm_port_index(onif_desc->itf->index,0, &fm_idx, &port_idx, &pInsEntryInfo->port_id))
+	/* Into the struct's own fields, not into locals copied over afterwards:
+	 * dpa_get_tdinfo() below reads fm_idx, and the copy used to happen ten
+	 * lines later. Every entry therefore selected its table descriptor with
+	 * the previous listener's FMAN index, or with zero on the first one.
+	 * Invisible on a single-FMAN part and wrong on any other. */
+	if(dpa_get_fm_port_index(onif_desc->itf->index, 0, &pInsEntryInfo->fm_idx,
+				&pInsEntryInfo->port_idx, &pInsEntryInfo->port_id))
 	{
 		DPA_ERROR("%s::unable to get fmindex for itfid %d\n",__func__, onif_desc->itf->index);
 		goto err_ret;
 	}
 
-	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__func__,__LINE__,fm_idx, port_idx, pInsEntryInfo->port_id);
-	pInsEntryInfo->fm_pcd = dpa_get_pcdhandle(fm_idx);
+	DPA_INFO("%s(%d) fm_idx %d, port_idx %d, port_id %d\n",__func__,__LINE__,
+			pInsEntryInfo->fm_idx, pInsEntryInfo->port_idx, pInsEntryInfo->port_id);
+	pInsEntryInfo->fm_pcd = dpa_get_pcdhandle(pInsEntryInfo->fm_idx);
 	if (!pInsEntryInfo->fm_pcd)
 	{
-		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__func__, fm_idx);
+		DPA_ERROR("%s::unable to get fm_pcd_handle for fmindex %d\n",__func__,
+				pInsEntryInfo->fm_idx);
 		goto err_ret;
-	} 
+	}
 
 	DPA_INFO("%s(%d) fm_pcd %p \n",__func__,__LINE__, pInsEntryInfo->fm_pcd);
 	//get table descriptor based on type and port
@@ -2913,8 +2953,6 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 
 	//Code to create hm for mcast single member
 
-	pInsEntryInfo->fm_idx = fm_idx;
-	pInsEntryInfo->port_idx = port_idx;
 	pL2Info = &pInsEntryInfo->l2_info;
 	pL3Info = &pInsEntryInfo->l3_info;
 
@@ -2937,6 +2975,11 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		}
 	}
 	DPA_INFO("dpa_get_tx_info_by_itf success\n");
+	/* After the interface walk, which is what apply_l2_encap() refuses to
+	 * overwrite: a listener either names its tags or is described by an
+	 * interface that carries them, never both. */
+	if (encap && apply_l2_encap(pInsEntryInfo, encap))
+		goto err_ret;
 	dev = dev_get_by_name(&init_net, pListener->output_device_str);
 	if(dev == NULL)
 	{
@@ -2998,8 +3041,10 @@ struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEn
 		prev_tbl_entry->hashentry.next_entry_hi = cpu_to_be16((phyaddr >> 32) & 0xffff);
 		prev_tbl_entry->hashentry.next_entry_lo = cpu_to_be32((phyaddr & 0xffffffff));
 	}
+	kfree(pInsEntryInfo);
 	return tbl_entry;
 err_ret:
+	kfree(pInsEntryInfo);
 	if (tbl_entry)
 		ExternalHashTableEntryFree(tbl_entry);
 	return NULL;
