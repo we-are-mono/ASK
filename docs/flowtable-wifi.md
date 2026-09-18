@@ -287,6 +287,55 @@ The oracle to be careful about is the one the QoS increment taught: a
 functional test cannot tell hardware from software here, because both deliver
 every packet. Only a rate and a CPU measurement separate them.
 
+Measured 2026-09-18, with an iPhone on the 5 GHz AP.
+
+The result that matters is not a rate. It is that **the hardware path to a
+Wi-Fi client is already live and already refused**. `flags offload` will not
+bind `uap0` -- a `moal` netdev supports no offload -- but the devices list
+only names which ingresses are hooked, and wire-to-Wi-Fi ingresses on `eth4`:
+
+```
+flowtable fast { hook ingress priority 0; devices = { "eth4" }; flags offload; }
+-> bindings 1
+```
+
+With that bound and a rule adding `ip daddr 192.168.2.0/24` to the flowtable, a
+client's ordinary background traffic drove CDX's `rejects` from 40 to 100 in
+thirty seconds while `installs` stayed at zero. Every Wi-Fi-destined flow
+already reaches admission and dies on the `dpa_netdev_is_physical()` test named
+above. That is step 5's blocker demonstrated rather than reasoned, and it gives
+that step a far better proof than a transfer rate: those rejects become
+installs.
+
+Linux's own flowtable does accelerate Wi-Fi client flows once one exists --
+ordinary browsing showed 24 of 88 conntracks `[OFFLOAD]` -- so the prediction
+above is right about the mechanism and wrong about the default: the image ships
+an empty nftables ruleset, and nothing accelerates until something installs a
+flowtable.
+
+**No throughput figure is recorded here, because none was taken with the
+offload active.** Every rate measured during this step ran with `bindings 0`,
+which is to say against a system where the classifier had no part -- software
+forwarding compared with nothing. A number from that configuration describes a
+misconfiguration, not the board. The comparison worth having is the same flows
+installed and not, which step 5 makes possible for the first time.
+
+One cost to weigh when it does: hardware egress removes the route lookup, NAT,
+conntrack and header rewrite, but `process_vap_rx_fwd_pkt()` still builds an
+skb, calls `dev_queue_xmit()` and takes the global `vaplock` **per packet** --
+the shape of the lock `e67f0ba` removed from the classifier hooks. What it
+keeps may dominate what it removes.
+
+Step 6 remains the harder case: its direction genuinely needs the VAP's own
+ingress hooked, which cannot be bound, so it is the offline-port injection or
+nothing.
+
+A measurement trap, filed as A159: a bound flowtable stops the port's own
+**ingress** byte counters, because the ingress hook takes the packet before
+the SDK driver accounts it. Ingress read 151 KB for a transfer egress and the
+server both put at ~105 MB. Step 5's proof is written against a packet counter
+on an offloaded path and has to pick one that still counts.
+
 ### 5. The egress fast path
 
 `cdx_ft_rule` gains the VAP binding; admission accepts a VAP egress; the
