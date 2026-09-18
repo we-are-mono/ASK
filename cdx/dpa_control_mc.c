@@ -23,6 +23,7 @@
 #include "cdx_flowtable_backend.h"
 #include "cdx_mcast_backend.h"
 #include "linux/netdevice.h"
+#include <linux/if_arp.h>
 #include <linux/if_ether.h>
 #include <net/ipv6.h>
 #include <net/net_namespace.h>
@@ -2067,6 +2068,18 @@ bool cdx_mc_port_supported(struct net_device *dev)
 	return cdx_ft_port_supported(dev);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_mc_port_supported, ASK_CDX_FLOWTABLE);
+
+bool cdx_mc_port_identity(struct net_device *dev)
+{
+	/* No transaction, no RTNL: dpa_netdev_is_physical() answers under its
+	 * own lock, which is what lets the MDB handler ask this while holding
+	 * RTNL -- where cdx_mc_port_supported() could not be called at all. */
+	return dev && net_eq(dev_net(dev), &init_net) &&
+	       dev->type == ARPHRD_ETHER && dev->addr_len == ETH_ALEN &&
+	       dev->reg_state == NETREG_REGISTERED &&
+	       !netif_is_l3_slave(dev) && dpa_netdev_is_physical(dev);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_mc_port_identity, ASK_CDX_FLOWTABLE);
 
 /* The group address, as the classifier requires it and as the contract narrows
  * it. Link-local scope is refused rather than carried: 224.0.0.0/24 and IPv6

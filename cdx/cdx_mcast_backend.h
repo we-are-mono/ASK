@@ -98,6 +98,21 @@ struct cdx_mc_group_spec {
  */
 bool cdx_mc_port_supported(struct net_device *dev);
 
+/* Whether this device is a CDX physical port, answerable from a notifier.
+ *
+ * The identity half of the test above, without the onif resolution that needs
+ * the transaction and without the liveness that needs RTNL. It exists because
+ * the MDB switchdev handler runs holding RTNL and so cannot take the
+ * transaction at all, yet still has to decide whether to take a membership on
+ * — see docs/flowtable-multicast.md. dpa_netdev_is_physical() answers under
+ * its own lock, so this is safe from a notifier and from an RTNL holder.
+ *
+ * A caller that gets `true` here has not been promised the port will pass
+ * cdx_mc_port_supported() later; a port can lose carrier, and that check is
+ * the authoritative one.
+ */
+bool cdx_mc_port_identity(struct net_device *dev);
+
 /* Install a group and return its opaque owner.
  *
  * Every listener is programmed or none is. A partially replicated group is a
