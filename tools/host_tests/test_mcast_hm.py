@@ -102,6 +102,51 @@ def test_listener_builder_owns_its_cursor():
             f"{caller} must not hold a cursor to share between listeners")
 
 
+def test_listener_arrives_resolved():
+    """The two owners resolve a listener differently and neither way serves the
+    other: dpa_add_vlan_if() records a VLAN's dpa_iface_info without a net_dev
+    and without IF_TYPE_ETHERNET, so dpa_get_ifinfo_by_netdev() cannot find
+    CMM's tagged listeners, while a caller holding a netdev has no name worth
+    trusting. So the builder takes the resolved pair and neither lookup.
+    """
+    ehash = (ROOT / "cdx/cdx_ehash.c").read_text()
+    mc = (ROOT / "cdx/dpa_control_mc.c").read_text()
+    body = function(ehash, "create_exthash_entry4mcast_member")
+
+    signature = re.search(
+        r"create_exthash_entry4mcast_member\(([^)]*)\)\s*\{", ehash, re.S).group(1)
+    assert "POnifDesc onif_desc" in signature and "struct net_device *dev" in signature
+    assert "MC4Output" not in signature, (
+        "the builder must not take a wire message's listener record")
+    for lookup in ("get_onif_by_name(", "dev_get_by_name("):
+        assert lookup not in body, (
+            f"the builder must not resolve the listener itself ({lookup})")
+
+    # And the name lookup the legacy owner still needs lives in one place,
+    # which is also where the netdev reference it borrows is released.
+    helper = function(mc, "mcast_member_by_name")
+    assert "get_onif_by_name(name)" in helper and "dev_get_by_name(" in helper
+    assert helper.count("dev_put(dev)") == 1
+
+
+def test_root_entry_needs_no_wire_message():
+    """A group's root entry carries the classifier key and the head of the
+    listener chain. Everything it needs is in the group -- the ingress name,
+    both addresses, the family -- so reading them back out of an FCI message
+    meant a group could only be built by a caller holding one.
+    """
+    mc = (ROOT / "cdx/dpa_control_mc.c").read_text()
+    signature = re.search(
+        r"cdx_add_mcast_table_entry\(([^)]*)\)\s*\{", mc, re.S).group(1)
+    assert "mcast_cmd" not in signature and "MC4Command" not in signature, (
+        "the root-entry builder must take the group, not a wire message")
+
+    body = function(mc, "cdx_add_mcast_table_entry")
+    for field in ("pMcastGrpInfo->ipv4_saddr", "pMcastGrpInfo->ipv4_daddr",
+                  "pMcastGrpInfo->ucIngressIface"):
+        assert field in body, f"{field} must come from the group"
+
+
 def test_listener_takes_its_tags_from_the_caller():
     """A registered VLAN interface is how the legacy owner describes a tagged
     listener, and only an FCI command CMM sends creates one. An ownership mode

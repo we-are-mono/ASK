@@ -647,11 +647,48 @@ static int Cdx_GetMcastMemberFreeIndex(struct mcast_group_info *pMcastGrpInfo)
 
 
 int cdx_free_exthash_mcast_members(struct mcast_group_info *pMcastGrpInfo);
-static int cdx_add_mcast_table_entry(void *mcast_cmd,
-		struct mcast_group_info *pMcastGrpInfo)
+
+/* One listener of an FCI-described group.
+ *
+ * The legacy control plane names a registered interface, so both halves of the
+ * listener -- the onif its classification and egress framing come from, and the
+ * netdev whose MTU the enqueue opcode carries -- are found by that one name.
+ * Whatever tags it carries are the interface's own, which is why no
+ * encapsulation is named here; see create_exthash_entry4mcast_member().
+ */
+static struct en_exthash_tbl_entry *mcast_member_by_name(RouteEntry *pRtEntry,
+		U8 *name, struct en_exthash_tbl_entry *prev_tbl_entry,
+		uint32_t tbl_type)
 {
-	PMC4Command mcast4_group;
-	PMC6Command mcast6_group;
+	struct en_exthash_tbl_entry *tbl_entry;
+	struct net_device *dev;
+	POnifDesc onif_desc;
+
+	onif_desc = get_onif_by_name(name);
+	if (!onif_desc) {
+		DPA_ERROR("%s::unable to get onif for iface %s\n", __func__, name);
+		return NULL;
+	}
+	dev = dev_get_by_name(&init_net, (const char *)name);
+	if (!dev) {
+		DPA_ERROR("%s::no netdev for iface %s\n", __func__, name);
+		return NULL;
+	}
+	tbl_entry = create_exthash_entry4mcast_member(pRtEntry, onif_desc, dev, NULL,
+						     prev_tbl_entry, tbl_type);
+	dev_put(dev);
+	return tbl_entry;
+}
+
+/* The group's root entry: the classifier key, and the pointer to the head of
+ * the listener chain the microcode replicates along.
+ *
+ * Everything this needs is already in the group -- the ingress interface name,
+ * both addresses and the family -- so it takes no command. It used to read the
+ * FCI message for the same three things, which meant the only way to build a
+ * group's root entry was to have a wire message to hand. */
+static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
+{
 	RouteEntry *pRtEntry;
 	POnifDesc onif_desc;
 	struct _tCtEntry *pCtEntry;
@@ -661,22 +698,9 @@ static int cdx_add_mcast_table_entry(void *mcast_cmd,
 
 	pRtEntry = NULL;
 	pCtEntry = NULL;
-	mcast4_group = NULL;
-	mcast6_group = NULL;
 
-	if (mcast_cmd == NULL)
-		return FAILURE;
-
-	if(pMcastGrpInfo->mctype == 0)
-	{
-		mcast4_group = (PMC4Command)(mcast_cmd);
-		strncpy(ucInterface,mcast4_group->input_device_str,IF_NAME_SIZE-1);
-	}
-	else
-	{
-		mcast6_group = (PMC6Command)(mcast_cmd);
-		strncpy(ucInterface,mcast6_group->input_device_str,IF_NAME_SIZE-1);
-	}
+	strncpy(ucInterface, pMcastGrpInfo->ucIngressIface, IF_NAME_SIZE-1);
+	ucInterface[IF_NAME_SIZE-1] = '\0';
 
 	pRtEntry = kzalloc((sizeof(RouteEntry)), GFP_KERNEL);
 	if (!pRtEntry)
@@ -700,20 +724,20 @@ static int cdx_add_mcast_table_entry(void *mcast_cmd,
 
 	if(pMcastGrpInfo->mctype == 0)
 	{
-		pCtEntry->Saddr_v4 = (mcast4_group->src_addr);
-		pCtEntry->Daddr_v4 = (mcast4_group->dst_addr);
+		pCtEntry->Saddr_v4 = pMcastGrpInfo->ipv4_saddr;
+		pCtEntry->Daddr_v4 = pMcastGrpInfo->ipv4_daddr;
 		pCtEntry->twin_Daddr = pCtEntry->Saddr_v4;
 		pCtEntry->twin_Saddr = pCtEntry->Daddr_v4;
 		pCtEntry->fftype = FFTYPE_IPV4;
 	}
 	else
 	{
-		memcpy(pCtEntry->Saddr_v6,mcast6_group->src_addr, IPV6_ADDRESS_LENGTH);
-		memcpy(pCtEntry->Daddr_v6,mcast6_group->dst_addr, IPV6_ADDRESS_LENGTH);
+		memcpy(pCtEntry->Saddr_v6,pMcastGrpInfo->ipv6_saddr, IPV6_ADDRESS_LENGTH);
+		memcpy(pCtEntry->Daddr_v6,pMcastGrpInfo->ipv6_daddr, IPV6_ADDRESS_LENGTH);
 		pCtEntry->fftype = FFTYPE_IPV6;
 	}
 
-	onif_desc = get_onif_by_name(ucInterface); 
+	onif_desc = get_onif_by_name(ucInterface);
 	if (!onif_desc)
 	{
 		DPA_ERROR("%s::unable to get onif for iface %s\n",__func__, ucInterface);
@@ -914,11 +938,8 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 
 		DPA_INFO("%s(%d) creating table entry of mcast member %s\n",
 				__func__,__LINE__, pListener->output_device_str);
-		/* No encapsulation is named: an FCI listener is a registered
-		 * interface and the interface walk describes whatever tags it
-		 * carries, which is the legacy owner's whole model. */
-		tbl_entry = create_exthash_entry4mcast_member(pRtEntry, pListener, NULL,
-							     tbl_entry, tbl_type);
+		tbl_entry = mcast_member_by_name(pRtEntry, pListener->output_device_str,
+						 tbl_entry, tbl_type);
 		if (!tbl_entry)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
@@ -937,10 +958,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 		member_id++;
 	}
 
-	if(pMcastGrpInfo->mctype == 0)
-		iRet = cdx_add_mcast_table_entry(mcast4_group, pMcastGrpInfo);
-	else
-		iRet = cdx_add_mcast_table_entry(mcast6_group, pMcastGrpInfo);
+	iRet = cdx_add_mcast_table_entry(pMcastGrpInfo);
 
 	if(iRet != 0)
 	{
@@ -1266,9 +1284,8 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6)
 			goto err_ret;
 		}
 
-		/* As in the create path: an FCI listener carries its own tags. */
-		tbl_entry = create_exthash_entry4mcast_member(pRtEntry, pListener, NULL,
-							     NULL, tbl_type);
+		tbl_entry = mcast_member_by_name(pRtEntry, pListener->output_device_str,
+						 NULL, tbl_type);
 		if (!tbl_entry)
 		{
 			DPA_ERROR("%s(%d) : create_exthash_entry4mcast_member failed\n",
