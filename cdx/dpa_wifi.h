@@ -94,6 +94,9 @@ struct vap_stats_s {
 #define         UPDATE          2
 #define         RESET           3
 #define         CONFIGURE       4
+/* Returns one configured-but-closed slot to the free pool. Only an owner that
+ * allocates vap ids needs it; see the RELEASE arm of dpaa_vwd_handle_vap(). */
+#define         RELEASE         5
 
 struct vap_cmd_s {
 	int32_t	action;
@@ -133,6 +136,9 @@ struct vwd_global_stats_s {
 	u32 					pkts_tx_errors;
 	u32 					pkts_dev_down_drop;
 };
+
+int dpaa_vwd_vap_cmd(struct vap_cmd_s *cmd);
+bool dpaa_vwd_ready(void);
 
 int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash);
 int dpaa_get_wifi_dev(uint16_t vap_id, void** netdev);

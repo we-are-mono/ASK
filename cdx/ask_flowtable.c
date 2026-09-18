@@ -48,11 +48,13 @@
 #include <net/netfilter/nf_flow_table.h>
 #include <net/switchdev.h>
 #include <net/xfrm.h>
+#include <net/cfg80211.h>
 #include <dpaa_eth_common.h>
 #include "cdx_flowtable_backend.h"
 #include "cdx_mcast_backend.h"
 #include "cdx_flowtable.h"
 #include "cdx_ipsec_backend.h"
+#include "cdx_wifi_backend.h"
 #include "cdx_police.h"
 
 #if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 8
@@ -2371,6 +2373,13 @@ static void ft_ipsec_watch_flush(void)
 static void ft_ipsec_attach(struct net_device *dev);
 static void ft_ipsec_detach(struct net_device *dev);
 
+/* Defined with the VAP watch below, for the same reason the multicast one is:
+ * they belong with the state they keep rather than with the chain that reaches
+ * them. */
+static void ft_wifi_reconsider(struct net_device *dev);
+static void ft_wifi_device_gone(struct net_device *dev);
+static void ft_wifi_address_changed(struct net_device *dev);
+
 /* Defined with the multicast learner below, because it belongs with that
  * state rather than with the chains it is reached from. */
 static void ft_mc_device_gone(struct net_device *dev);
@@ -2388,8 +2397,25 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * them, under the RTNL the attachment needs, so there is no
 		 * separate startup walk to keep in step with this one. */
 		ft_ipsec_attach(dev);
+		/* And the same replay is how an AP interface that already
+		 * exists at load is found. */
+		ft_wifi_reconsider(dev);
+		break;
+	case NETDEV_UP:
+	case NETDEV_DOWN:
+		/* The pair that carries every VAP transition. An interface is
+		 * registered by the driver long before hostapd configures it,
+		 * so UP is where it becomes a VAP; and because changing an
+		 * interface's type raises no event of its own, DOWN is the
+		 * only thing that reliably precedes one -- so retiring here is
+		 * what keeps a device that comes back as a station from
+		 * keeping the VAP it held as an AP. */
+		ft_wifi_reconsider(dev);
 		break;
 	case NETDEV_CHANGE:
+		/* Covers the reverse too: an interface leaving AP mode stops
+		 * being a VAP, and the worker retires it. */
+		ft_wifi_reconsider(dev);
 		if (netif_running(dev) && netif_carrier_ok(dev))
 			break;
 		fallthrough;
@@ -2417,6 +2443,10 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * and is not re-offered the way a retired flow is, so it is
 		 * corrected rather than retired. */
 		ft_ipsec_device_moved(dev);
+		/* A VAP carries it too, in the port and in the encoder's
+		 * record, and neither can be rewritten in place -- so it is
+		 * registered again instead. */
+		ft_wifi_address_changed(dev);
 		break;
 	case NETDEV_CHANGENAME:
 		/* Names carry no forwarding semantics; backend lookup uses the
@@ -2431,6 +2461,10 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* And every multicast reference to it, which is what would
 		 * otherwise hold the unregistration open forever. */
 		ft_mc_device_gone(dev);
+		/* Same shape for a VAP: the watch stops naming the device here
+		 * so nothing can follow the pointer, and the worker releases
+		 * what is left using only what it copied. */
+		ft_wifi_device_gone(dev);
 		fallthrough;
 	case NETDEV_CHANGEUPPER:
 		spin_lock_bh(&ft_watch_lock);
@@ -4426,6 +4460,317 @@ static void ft_ipsec_detach_all(void)
 	rtnl_unlock();
 }
 
+/* Wi-Fi VAPs.
+ *
+ * A VAP registering is a netdev event, and that is the whole of the control
+ * plane that FPP_CMD_WIFI_VAP_ENTRY, a userspace daemon and a static UCI file
+ * used to be.
+ *
+ * It cannot be done where it is noticed. Registration needs the backend
+ * transaction and then RTNL -- the order cdx_ft_admission_begin() takes them,
+ * and the only order this module ever takes them in -- while a netdev notifier
+ * arrives already holding RTNL. Taking the transaction under it is exactly the
+ * inversion that trylock exists to avoid. So the notifier records what it saw
+ * and a worker reconciles it, as the multicast learner and the IPsec next-hop
+ * watch both do, for the same reason.
+ */
+struct ft_wifi_watch {
+	struct list_head list;
+	/* NULL once the device has unregistered. Only ever compared or
+	 * referenced under ft_wifi_lock, never stored beyond a worker pass. */
+	struct net_device *dev;
+	struct cdx_wifi_vap *vap;
+	bool wanted;
+	bool gone;
+	/* The registration copied this device's hardware address into the
+	 * port and into the encoder's record of it, and neither is re-read per
+	 * frame -- so an address that changes afterwards leaves the classifier
+	 * writing the old one as the source of every frame leaving this VAP.
+	 * There is no way to correct it in place, for the same reason an SA's
+	 * next hop cannot be: it is built into what was registered. So the VAP
+	 * is retired and registered again, which this asks the worker to do. */
+	bool stale;
+};
+
+static LIST_HEAD(ft_wifi_watches);
+static DEFINE_MUTEX(ft_wifi_lock);
+static bool ft_wifi_stopping;
+static unsigned int ft_wifi_registered;
+static atomic64_t ft_wifi_refusals = ATOMIC64_INIT(0);
+static void ft_wifi_work_fn(struct work_struct *work);
+static DECLARE_WORK(ft_wifi_work, ft_wifi_work_fn);
+
+/* Which netdevs are VAPs, and the reason this is policy rather than mechanism.
+ *
+ * A cfg80211 device in AP or AP_VLAN mode. That is a property of the device
+ * instead of a name in a configuration file, so a station-mode, monitor or P2P
+ * interface fails it without having to be excluded by hand, and an interface
+ * that changes mode stops being a VAP at the moment it does. AP_VLAN counts
+ * because it is an AP's per-station egress and carries frames the same way.
+ *
+ * Running is part of it, and not as a policy preference -- the backend cannot
+ * do anything else. vwd_vap_up() refuses a device that is not IFF_UP, so
+ * offering one can only produce a failed registration; a board that registers
+ * its AP interfaces at driver load and brings them up later (which is what
+ * hostapd does here) would otherwise spend a refusal on every interface at
+ * every boot, and count it.
+ *
+ * It also happens to be the only way the other half of this predicate is
+ * observable. cfg80211_change_iface() changes an interface's type without
+ * raising any netdev event at all -- no notifier, not even
+ * netdev_state_change() -- so nothing would re-read the iftype on its own. A
+ * type change goes through a down and an up, and those do raise events, so
+ * gating on running is what makes "stopped being an AP" reach this at all.
+ */
+static bool ft_wifi_is_vap(struct net_device *dev)
+{
+	struct wireless_dev *wdev;
+
+	ASSERT_RTNL();
+	if (!netif_running(dev))
+		return false;
+	wdev = dev->ieee80211_ptr;
+	return wdev && (wdev->iftype == NL80211_IFTYPE_AP ||
+			wdev->iftype == NL80211_IFTYPE_AP_VLAN);
+}
+
+/* Record what this device should be and let the worker make it so. Called for
+ * every event that can change the answer, including the ones that only change
+ * it indirectly: hostapd sets the interface type and then brings it up, and
+ * the type change alone raises no netdev event of its own. */
+static void ft_wifi_reconsider(struct net_device *dev)
+{
+	struct ft_wifi_watch *w, *found = NULL;
+	bool want, changed = false;
+
+	ASSERT_RTNL();
+	want = ft_wifi_is_vap(dev) && cdx_wifi_vap_supported(dev);
+
+	mutex_lock(&ft_wifi_lock);
+	if (ft_wifi_stopping)
+		goto out;
+	list_for_each_entry(w, &ft_wifi_watches, list) {
+		if (w->dev == dev) {
+			found = w;
+			break;
+		}
+	}
+	if (!found) {
+		if (!want)
+			goto out;
+		found = kzalloc(sizeof(*found), GFP_KERNEL);
+		if (!found) {
+			/* Nothing was registered, so nothing is inconsistent:
+			 * the device simply is not offloaded until an event
+			 * brings it past here again. */
+			atomic64_inc(&ft_wifi_refusals);
+			goto out;
+		}
+		found->dev = dev;
+		list_add(&found->list, &ft_wifi_watches);
+	}
+	changed = found->wanted != want;
+	found->wanted = want;
+out:
+	mutex_unlock(&ft_wifi_lock);
+	if (changed)
+		schedule_work(&ft_wifi_work);
+}
+
+/* This device's hardware address moved, so what was registered for it no
+ * longer describes it. Marked rather than corrected: see ft_wifi_watch.stale.
+ */
+static void ft_wifi_address_changed(struct net_device *dev)
+{
+	struct ft_wifi_watch *w;
+	bool changed = false;
+
+	ASSERT_RTNL();
+	mutex_lock(&ft_wifi_lock);
+	list_for_each_entry(w, &ft_wifi_watches, list) {
+		if (w->dev != dev || !w->vap)
+			continue;
+		w->stale = true;
+		changed = true;
+	}
+	mutex_unlock(&ft_wifi_lock);
+	if (changed)
+		schedule_work(&ft_wifi_work);
+}
+
+/* The device is going. Nothing may follow the pointer after this returns.
+ *
+ * VWD's own netdev notifier takes the hardware half of the VAP down as the
+ * device unregisters, so what the worker still has to release is the logical
+ * interface and the devman record -- neither of which needs the device, which
+ * is why the backend copied what it needs at registration time. */
+static void ft_wifi_device_gone(struct net_device *dev)
+{
+	struct ft_wifi_watch *w;
+	bool changed = false;
+
+	ASSERT_RTNL();
+	mutex_lock(&ft_wifi_lock);
+	list_for_each_entry(w, &ft_wifi_watches, list) {
+		if (w->dev != dev)
+			continue;
+		w->dev = NULL;
+		w->gone = true;
+		w->wanted = false;
+		changed = true;
+	}
+	mutex_unlock(&ft_wifi_lock);
+	if (changed)
+		schedule_work(&ft_wifi_work);
+}
+
+static void ft_wifi_work_fn(struct work_struct *work)
+{
+	struct ft_wifi_watch *w, *tmp;
+
+	/* One VAP per pass. The transaction is taken and dropped around each,
+	 * and ft_wifi_lock is never held across it -- the same discipline the
+	 * multicast worker keeps, and for the same reason: the backend sleeps.
+	 */
+	for (;;) {
+		struct cdx_wifi_vap *vap = NULL;
+		struct net_device *dev = NULL;
+		int rc;
+
+		mutex_lock(&ft_wifi_lock);
+		list_for_each_entry_safe(w, tmp, &ft_wifi_watches, list) {
+			if (w->wanted && !w->vap) {
+				/* Referenced here, under the lock that
+				 * ft_wifi_device_gone() also takes, so the
+				 * device cannot be freed between choosing it
+				 * and using it below. Released at the end of
+				 * this pass; a reference held any longer would
+				 * be one unregister_netdevice() waits on. */
+				dev = w->dev;
+				dev_hold(dev);
+				break;
+			}
+			if (w->vap && (!w->wanted || w->stale)) {
+				/* Claimed here rather than cleared after the
+				 * delete: the watch must stop naming this VAP
+				 * before the lock is dropped, or a later pass
+				 * finds the same pointer again and hands it to
+				 * the backend twice.
+				 *
+				 * A stale one is retired the same way, and
+				 * leaves `wanted` set -- so the next pass sees
+				 * a wanted watch with no VAP and registers it
+				 * again, this time reading the address the
+				 * device has now. */
+				vap = w->vap;
+				w->vap = NULL;
+				w->stale = false;
+				ft_wifi_registered--;
+				break;
+			}
+			if (!w->wanted && !w->vap && w->gone) {
+				list_del(&w->list);
+				kfree(w);
+			}
+		}
+		mutex_unlock(&ft_wifi_lock);
+
+		if (!dev && !vap)
+			return;
+
+		cdx_ft_begin();
+		if (cdx_ft_admission_begin()) {
+			/* RTNL is held by something that can wait for this
+			 * transaction. Come back rather than invert the two. */
+			cdx_ft_end();
+			if (dev)
+				dev_put(dev);
+			schedule_work(&ft_wifi_work);
+			return;
+		}
+
+		if (dev) {
+			struct cdx_wifi_vap *made = NULL;
+
+			/* Re-read the decision under the locks that make it
+			 * true rather than trusting what the notifier saw: the
+			 * device may have changed mode or started
+			 * unregistering since. */
+			if (dev->reg_state != NETREG_REGISTERED ||
+			    !ft_wifi_is_vap(dev))
+				rc = -ENODEV;
+			else
+				rc = cdx_wifi_vap_add(dev, &made);
+
+			mutex_lock(&ft_wifi_lock);
+			list_for_each_entry(w, &ft_wifi_watches, list) {
+				if (w->dev != dev)
+					continue;
+				if (made) {
+					w->vap = made;
+					made = NULL;
+					ft_wifi_registered++;
+				} else {
+					/* Give up on this device rather than
+					 * spin: an add that failed once will
+					 * fail the same way until something
+					 * about the device changes, and every
+					 * such change comes back through
+					 * ft_wifi_reconsider(). */
+					w->wanted = false;
+					atomic64_inc(&ft_wifi_refusals);
+				}
+				break;
+			}
+			mutex_unlock(&ft_wifi_lock);
+
+			/* Nothing on the list claimed it -- the watch went
+			 * away while the transaction was open. Do not leak the
+			 * registration it no longer owns. */
+			if (made)
+				cdx_wifi_vap_del(&made);
+			if (rc && rc != -ENODEV)
+				pr_warn_ratelimited("cdx flowtable: %s could not be offloaded as a Wi-Fi VAP (%d)\n",
+						    netdev_name(dev), rc);
+		} else {
+			/* Already unlinked from its watch above, so this owns
+			 * it outright and nothing else can reach it. */
+			cdx_wifi_vap_del(&vap);
+		}
+
+		cdx_ft_admission_end();
+		cdx_ft_end();
+		if (dev)
+			dev_put(dev);
+	}
+}
+
+/* Retire every VAP this module registered. Unload cannot leave a logical
+ * interface or a VWD slot owned by a module that is going away, and there is
+ * no notifier replay for unregistration to do it. */
+static void ft_wifi_exit(void)
+{
+	struct ft_wifi_watch *w, *tmp;
+
+	mutex_lock(&ft_wifi_lock);
+	ft_wifi_stopping = true;
+	mutex_unlock(&ft_wifi_lock);
+	cancel_work_sync(&ft_wifi_work);
+
+	list_for_each_entry_safe(w, tmp, &ft_wifi_watches, list) {
+		if (w->vap) {
+			cdx_ft_begin();
+			rtnl_lock();
+			cdx_wifi_vap_del(&w->vap);
+			rtnl_unlock();
+			cdx_ft_end();
+			ft_wifi_registered--;
+		}
+		list_del(&w->list);
+		kfree(w);
+	}
+}
+
 static struct notifier_block ft_netdev_nb = { .notifier_call = ft_netdev_event };
 static struct notifier_block ft_fdb_nb = { .notifier_call = ft_fdb_event };
 static struct notifier_block ft_swdev_nb = { .notifier_call = ft_swdev_event };
@@ -4640,6 +4985,14 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_count, ft_mc_installed, ft_mc_refused,
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
+	/* How many AP-mode devices this module currently has registered, and
+	 * how many it looked at and did not. The second is what separates "no
+	 * Wi-Fi offload because nothing asked" from "no Wi-Fi offload because
+	 * the registration failed", which are otherwise the same absence: the
+	 * per-VAP sysfs file under /sys/class/vwd/ appears only on success, so
+	 * without this a refusal leaves no trace anywhere. */
+	seq_printf(seq, "wifi_vaps %u\nwifi_refused %llu\n",
+		   ft_wifi_registered, atomic64_read(&ft_wifi_refusals));
 	ft_mc_rows(seq);
 	return 0;
 }
@@ -4760,6 +5113,9 @@ netdev:
 	 * and an SA could already have been installed and deleted through
 	 * them, leaving a retirement queued against code about to unload. */
 	ft_ipsec_detach_all();
+	/* The same replay could have registered a VAP for an AP interface that
+	 * already existed, so this failure path owes them back too. */
+	ft_wifi_exit();
 	flush_work(&ft_ipsec_retire);
 	cancel_work_sync(&ft_ipsec_follow);
 	ft_ipsec_watch_flush();
@@ -4834,6 +5190,9 @@ static void __exit ask_flowtable_exit(void)
 	 * while the groups drain, and before the module's text does -- the
 	 * worker holds a pointer into it. */
 	ft_mc_exit();
+	/* Likewise for the VAPs, and before the module's text goes: the
+	 * reconciling worker holds a pointer into it. */
+	ft_wifi_exit();
 	/* Unregistration replays nothing, so the ops this module planted on
 	 * each port have to be taken back by hand -- they point into text
 	 * that is about to go away. */

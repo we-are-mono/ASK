@@ -2145,7 +2145,14 @@ static int vwd_vap_configure(struct dpaa_vwd_priv_s *priv, struct vap_desc_s *va
 	vap->ifindex = cmd->ifindex;
 	vap->direct_rx_path = cmd->direct_rx_path;
 	vap->no_l2_itf = cmd->no_l2_itf;
-	memcpy(vap->ifname, cmd->ifname, 12);
+	/* The whole name, not the first 12 bytes of it. Both sides are
+	 * IFNAMSIZ and the hard-coded length silently truncated anything
+	 * longer -- which CMM never produced, because it named VAPs from a
+	 * config file that used short ones. A name taken from a netdev has no
+	 * such habit, and the truncated copy is what the sysfs attribute below
+	 * is named after, so the damage would show up as a mislabelled stats
+	 * file rather than as anything failing. */
+	strscpy(vap->ifname, (const char *)cmd->ifname, sizeof(vap->ifname));
 	memcpy(vap->macaddr, cmd->macaddr, ETH_ALEN);
 	vap->state = VAP_ST_CONFIGURED;
 
@@ -2307,6 +2314,37 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			vwd_vap_down(priv, vap);
 
 			break;
+		case RELEASE:
+			/* Hand a slot back to the free pool.
+			 *
+			 * REMOVE stops at VAP_ST_CONFIGURED because that is
+			 * where the legacy owner wants it: CMM configures each
+			 * VAP once from a static file and then cycles it
+			 * up and down under a fixed id, so the configured
+			 * fields stay true across a REMOVE and re-configuring
+			 * them would be wasted work. Nothing there ever needed
+			 * a slot back.
+			 *
+			 * An owner that allocates ids does. Once a VAP's netdev
+			 * is gone its slot has to become reusable by a
+			 * different device, and a CONFIGURE onto a slot still
+			 * holding the old ifname is refused -- so without this
+			 * the id space would drain one VAP at a time until the
+			 * allocator wrapped onto an unusable slot. The sysfs
+			 * attribute goes with it, for the reason RESET drops
+			 * its own: it is named after the old interface, and a
+			 * later CONFIGURE would otherwise double-create it.
+			 */
+			DPAWIFI_INFO("%s: RELEASE ... %s\n", __func__, vap->ifname);
+			if (vap->state != VAP_ST_CONFIGURED) {
+				DPAWIFI_ERROR("%s : VAP (id : %d) is not configured\n",
+						__func__, cmd->vapid);
+				rc = -1;
+				break;
+			}
+			vap->state = VAP_ST_CLOSE;
+			__set_bit(cmd->vapid, reset_mask);
+			break;
 		case UPDATE:
 			DPAWIFI_INFO("%s: UPDATE ... %s\n", __func__, cmd->ifname);
 			if (vap->state == VAP_ST_CONFIGURING) {
@@ -2439,6 +2477,31 @@ long dpaa_vwd_ioctl(struct file * file, unsigned int cmd, unsigned long arg)
 done:
 	rtnl_unlock();
 	return rc;
+}
+
+/* The same VAP table, reached from inside the kernel.
+ *
+ * dpaa_vwd_ioctl() is the legacy owner's door: it copies a vap_cmd_s out of a
+ * userspace buffer and takes RTNL around the handler. An owner that learns
+ * about VAPs from netdev events has the command already and is called with
+ * RTNL held, so it needs the handler without either -- which is all this is.
+ * The lock the ioctl takes is asserted rather than taken, because taking it
+ * here would deadlock the notifier-driven caller this exists for.
+ */
+int dpaa_vwd_vap_cmd(struct vap_cmd_s *cmd)
+{
+	ASSERT_RTNL();
+	if (READ_ONCE(vwd_stopping))
+		return -ENODEV;
+	return dpaa_vwd_handle_vap(&vwd, cmd);
+}
+
+/* Whether VWD is up far enough to hold a VAP. False before dpaa_vwd_init()
+ * has finished and again as soon as teardown starts, which is what makes it
+ * safe to ask from a notifier that may be running against either edge. */
+bool dpaa_vwd_ready(void)
+{
+	return !READ_ONCE(vwd_stopping);
 }
 
 static int vwd_init_ohport(struct dpaa_vwd_priv_s *priv)
@@ -2727,14 +2790,32 @@ static void vwd_hooks_sync(struct dpaa_vwd_priv_s *priv)
 
 	mutex_lock(&vwd_hook_mutex);
 	if (want && !vwd_hooks_on) {
-		if (!vwd_hooks_register())
+		if (!vwd_hooks_register()) {
 			vwd_hooks_on = true;
-		else
+			/* Both transitions are logged because the hooks are
+			 * otherwise invisible: they are netfilter registrations
+			 * with no sysfs or procfs face, so whether the
+			 * classifier is in the path at all can only be inferred
+			 * from behaviour. Saying it once per transition costs
+			 * nothing -- the count moves only on a VAP appearing or
+			 * going away -- and is the difference between "no
+			 * offload because no hook" and "no offload because the
+			 * flow was declined", which look identical from the
+			 * counters.
+			 *
+			 * pr_info rather than DPAWIFI_INFO: that macro compiles
+			 * to nothing unless CDX_DPA_DEBUG is defined, which no
+			 * shipped build defines, so a transition logged through
+			 * it is exactly as invisible as no log at all. */
+			pr_info("cdx wifi: classifier hooks registered; first VAP is open\n");
+		} else {
 			DPAWIFI_ERROR("%s::could not register the classifier hooks; this VAP will not offload\n",
 				      __func__);
+		}
 	} else if (!want && vwd_hooks_on) {
 		vwd_hooks_unregister();
 		vwd_hooks_on = false;
+		pr_info("cdx wifi: classifier hooks unregistered; no VAP is open\n");
 		/* A classifier may still be in flight against the VAP that
 		 * just went away; the caller's own teardown waits it out. */
 	}

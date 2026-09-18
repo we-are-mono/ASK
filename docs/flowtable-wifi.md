@@ -160,10 +160,28 @@ together.
 Two things this decides on the way past:
 
 **Which netdevs count.** Not every netdev is a VAP. The identity test is a
-cfg80211 device in AP mode — `dev->ieee80211_ptr` with an `iftype` of
+running cfg80211 device in AP mode — `dev->ieee80211_ptr` with an `iftype` of
 `NL80211_IFTYPE_AP` or `AP_VLAN` — which is a property of the device rather
 than of a name in a file, and which a station-mode or monitor interface fails
 without needing to be excluded by hand.
+
+Running is part of it, and the first rig run is what established that. Two
+things force it. `vwd_vap_up()` refuses a device that is not `IFF_UP`, so
+offering one can only produce a failed registration — and the driver here
+registers both AP interfaces at load and brings them up later, so without the
+gate every boot spent two refusals before hostapd had done anything. And
+`cfg80211_change_iface()` changes an interface's type without raising any
+netdev event at all: no notifier, not even `netdev_state_change()`. So there is
+no event on which to re-read the iftype directly. A type change goes through a
+down and an up, both of which do raise events, so gating on running is what
+turns "stopped being an AP" into something this can observe at all.
+
+One driver-specific caveat, recorded because it will mislead the next person
+who tries to test this by hand: `moal` declines to change the type of a `uap`
+interface, logging `Skip change virtual intf type on uap: from 3 to 2` and
+returning success. An `iw dev uap0 set type managed` against this board
+therefore does nothing, and a VAP that stays registered afterwards is correct
+rather than stale.
 
 **Where the VAP's address comes from.** `wlan_iface_info.mac_addr` is filled
 from the FCI command today. Under a notifier it comes from the netdev, and the
@@ -305,10 +323,12 @@ lifecycle, compiled from the adapter against stubs.
 
 ## Open questions
 
-- **What `no_l2_itf` means.** VWD carries a per-VAP flag for interfaces that
-  present no L2 header, and NXP's configuration sets it per driver. Which way
-  it should be set for `moal` is unestablished, and it changes what the
-  encoder must write.
+- ~~**What `no_l2_itf` means.**~~ Settled from the code: `dpa_wifi.c` says it
+  above `vwd_is_no_l2_itf_device()` — *"will return 1 if the device is
+  cellular"* — so it describes an interface with no L2 header at all. Zero for
+  `moal`, and zero by construction rather than by choice: admission only
+  accepts `ARPHRD_ETHER` devices with a six-byte address, so the case the flag
+  describes is refused before it can reach the flag.
 - **Whether the ingress half is worth building at all.** Step 4 decides it.
   The honest possibility is that Linux's own fast path is already close
   enough that the offline-port round trip buys nothing, in which case this
