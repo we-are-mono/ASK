@@ -152,6 +152,19 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A155 — the DUT reset during a CMM-mode UDP tunnel probe, with no trace
+  captured.** A one-way UDP transfer through an IPsec tunnel (400 Mb/s,
+  1300-byte datagrams, forwarded WAN to LAN, legacy owner, non-KASAN image)
+  ended with the agent unreachable and the board back at 27 seconds of uptime;
+  `panic=10` reboots on panic, so it panicked. No console logger was attached,
+  so the ring buffer went with it and there is nothing to read. Two things
+  weaken the diagnosis rather than the observation: the LAN link was flapping
+  at the time (see below), and the same bench had just carried three TCP runs
+  per direction without incident. Reproduce with `Console.target()` logging to
+  a file for the whole run before drawing any conclusion — and note the rig's
+  LAN segment has to be healthy first, or the flap is a confound. Worth doing
+  even though CMM is being retired: the SEC datapath under it is shared code.
+
 - [ ] **A142 — the interface-statistics offset field is too narrow for its own
   pool.** `cdx_init_stats` carves one MURAM region as 4 `cdx_pppoe_iface_ifinfo`
   followed by 124 `cdx_iface_ifinfo`, but the two pools index it with different

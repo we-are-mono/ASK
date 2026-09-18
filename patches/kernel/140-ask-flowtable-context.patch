@@ -1,4 +1,4 @@
-From 40f365ab4dbc7c727a77ec2f22982582b81dae39 Mon Sep 17 00:00:00 2001
+From b207007fef12ac96cdfa3e97fef85d6a22e5e3c9 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 14 Sep 2026 23:03:32 +0200
 Subject: [PATCH] netfilter: provide hardware context and selective flow
@@ -74,6 +74,24 @@ Zero the Ethernet address the walk is seeded with. It stays untouched for a
 destination that is not a valid Ethernet device, which is what a ppp device
 is, and is then copied into the path context a bridge resolves its FDB
 against.
+
+Admit a transformed destination rather than refusing its transmit type.
+flow_offload_eth_src(), flow_offload_eth_dst() and flow_offload_redirect()
+each answered -EOPNOTSUPP for FLOW_OFFLOAD_XMIT_XFRM, and the first of them
+fails nf_flow_offload_rule_alloc() -- which runs before any driver callback,
+for both directions of the flow. A connection was therefore only ever offered
+to hardware when the packet that created it happened to be the untransformed
+one, so an IPsec tunnel carrying traffic both ways silently fell back to
+software with no error anywhere: every reply carries a sec_path, which
+nft_flow_offload_skip() declines, leaving only the encrypted direction to
+create the flow.
+
+The source address and the egress interface are the same for a transformed
+direction as for a routed one -- a transform changes what the frame becomes,
+not which port puts it on the wire. The destination is not: what leaves the
+port is the outer packet, addressed to the remote tunnel endpoint, so the
+neighbour belongs to the route underneath the bundle and the address that
+finds it is the outermost state's rather than the tuple's own.
 ---
  include/net/flow.h                    |  2 +
  include/net/flow_offload.h            | 31 ++++++++++
@@ -84,9 +102,9 @@ against.
  net/ipv6/ip6_fib.c                    | 23 +++++++
  net/netfilter/nf_flow_table_core.c    | 66 +++++++++++++++++++-
  net/netfilter/nf_flow_table_ip.c      | 14 ++++-
- net/netfilter/nf_flow_table_offload.c | 46 +++++++++++++-
+ net/netfilter/nf_flow_table_offload.c | 82 ++++++++++++++++++++++++-
  net/netfilter/nft_flow_offload.c      | 87 +++++++++++++++++++++------
- 11 files changed, 341 insertions(+), 24 deletions(-)
+ 11 files changed, 377 insertions(+), 24 deletions(-)
 
 diff --git a/include/net/flow.h b/include/net/flow.h
 index 335bbc52171c..5e373dbaa397 100644
@@ -579,15 +597,82 @@ index 98edcaa37b38..632a92be3ef6 100644
  		return 0;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f51d7d7..ccbcc3ecccc1 100644
+index 4f346f51d7d7..ee87af80a9c1 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -896,6 +896,36 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
+@@ -12,6 +12,7 @@
+ #include <net/netfilter/nf_conntrack_acct.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
++#include <net/xfrm.h>
+ 
+ #define NF_FLOW_RULE_ACTION_MAX	24
+ 
+@@ -250,6 +251,10 @@ static int flow_offload_eth_src(struct net *net,
+ 		addr = this_tuple->out.h_source;
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
++	case FLOW_OFFLOAD_XMIT_XFRM:
++		/* Both transmit by the ordinary output path, so the frame
++		 * carries this port's address either way. What a transform
++		 * changes is the destination, not the source. */
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		dev = dev_get_by_index(net, other_tuple->iifidx);
+ 		if (!dev)
+@@ -303,9 +308,38 @@ static int flow_offload_eth_dst(struct net *net,
+ 		ether_addr_copy(ha, this_tuple->out.h_dest);
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
++	case FLOW_OFFLOAD_XMIT_XFRM:
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		daddr = &other_tuple->src_v4;
+ 		dst_cache = this_tuple->dst_cache;
++		if (this_tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM) {
++			const struct xfrm_state *x = NULL;
++
++			/* What leaves this port is the transform's outer
++			 * packet, addressed to the remote tunnel endpoint
++			 * rather than to the tuple's own destination. So the
++			 * neighbour belongs to the route underneath the
++			 * bundle, and the address that finds it is the
++			 * outermost state's.
++			 *
++			 * Refusing the transmit type instead, as this did,
++			 * fails nf_flow_offload_rule_alloc() and with it the
++			 * whole flow -- in both directions, before any driver
++			 * is asked. A connection is only ever offered to
++			 * hardware when the packet that created it happened to
++			 * be the untransformed one, which for a tunnel that
++			 * carries traffic both ways is never.
++			 */
++			while (dst_cache && dst_xfrm(dst_cache)) {
++				x = dst_xfrm(dst_cache);
++				dst_cache = xfrm_dst_child(dst_cache);
++			}
++			if (!x || !dst_cache)
++				return -ENOENT;
++			daddr = this_tuple->l3proto == NFPROTO_IPV6 ?
++				(const void *)&x->id.daddr.a6 :
++				(const void *)&x->id.daddr.a4;
++		}
+ 		n = dst_neigh_lookup(dst_cache, daddr);
+ 		if (!n)
+ 			return -ENOENT;
+@@ -597,6 +631,10 @@ static int flow_offload_redirect(struct net *net,
+ 		ifindex = this_tuple->out.hw_ifidx;
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
++	case FLOW_OFFLOAD_XMIT_XFRM:
++		/* The transform decides what the frame becomes, not which port
++		 * puts it on the wire: that is still the device the reverse
++		 * direction arrives on, exactly as for a routed direction. */
+ 		other_tuple = &flow->tuplehash[!dir].tuple;
+ 		ifindex = other_tuple->iifidx;
+ 		break;
+@@ -896,6 +934,34 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
  	cls_flow->cookie = (unsigned long)tuple;
  }
  
-+/* DIRECT and TC share this union with non-pointer data. XFRM destinations
-+ * are deliberately excluded from the routed-neighbour adapter contract. */
 +/* DIRECT and TC share this union with non-pointer data, so the transmit type
 + * has to be checked before the destination is read. NEIGH and XFRM are the two
 + * that store a dst there -- flow_offload_fill_route() fills both from the same
@@ -619,7 +704,7 @@ index 4f346f51d7d7..ccbcc3ecccc1 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +934,21 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +970,21 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {

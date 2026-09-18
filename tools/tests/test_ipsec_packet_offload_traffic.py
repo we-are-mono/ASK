@@ -38,6 +38,14 @@ import pytest
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF
 
+# Ownership is exclusive and fixed for the boot: in a CMM boot the adapter is
+# never loaded, so the ports advertise no esp-hw-offload and there is no
+# /proc/cdx_flowtable to read. These assert the flowtable owner's behaviour and
+# have nothing to talk to otherwise, so they take the same opt-in gate the
+# test_flowtable_* files do rather than failing a legacy run.
+pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
+                                reason="requires an explicit flowtable boot")
+
 # Inner endpoints, carried inside the tunnel, on lo at each end.
 DUT_INNER = "198.18.87.1"
 LAN_INNER = "198.18.87.2"

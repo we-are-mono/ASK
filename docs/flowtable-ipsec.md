@@ -654,15 +654,169 @@ frames on this port.
 
 ### 6. The inbound fast path
 
-The offline-port half. Scope after step 5 measures, because the reverse
-direction is where reading has been least reliable in this subsystem and the
-PPPoE increment's lesson was to measure before believing a parser.
+The offline-port half, scoped after step 5 measured rather than before.
+Measuring first was right: two of the three things this step turned out to
+need were invisible from the source, and one of them was that **step 5 had
+never been exercised by a tunnel at all**.
+
+#### What the hardware was already doing
+
+The first measurement was an inbound offloaded SA on its own, with no flow
+involved. It installs, and SEC decrypts every arriving ESP frame in hardware:
+
+```
+tx todec delta : 0      frames the software path handed to SEC
+delivered      : 32/32  payloads the DUT's inner listener received
+DUT  SA counters: 0 packets   xfrm_input() never ran
+loki SA counters: 32 packets  the peer encrypted all 32
+```
+
+So the SPI-keyed half of inbound was complete before this increment started:
+the inbound SA's own classifier entry steers ESP to SEC, and `xfrm_input()` is
+not on the path. What was missing is everything after decryption.
+
+#### The three defects, in the order the bench found them
+
+**The decrypted frame is classified on the offline port.** An entry keyed on
+the physical ingress port cannot match it, so the reverse direction's entry was
+installed, counted as installed, and never matched a frame:
+
+```
+in=eth4 out=eth3  sa=0  packets=58    forward direction, hardware
+in=eth3 out=eth4  sa=0  packets=0     reverse direction, installed and dead
+```
+
+Every decrypted frame reached the CPU instead, which the exception handler
+counted 59 times for a 60-packet transfer.
+
+**A transformed destination was refused by three generic helpers.**
+`flow_offload_eth_src()`, `flow_offload_eth_dst()` and
+`flow_offload_redirect()` each answer `-EOPNOTSUPP` for
+`FLOW_OFFLOAD_XMIT_XFRM`, and the first of them fails
+`nf_flow_offload_rule_alloc()` — which runs before any driver callback, for
+both directions. A printk settled it where reading had not:
+
+```
+ASKDBG skip: sec_path present
+ASKDBG route: dir=0 xmit[dir]=2 xmit[!dir]=1 this_dst_xfrm=1
+ASKDBG route_common: dir=0 xmit=2 src=-95 -> REFUSED
+```
+
+`-95` is `-EOPNOTSUPP`, and `counter deltas {}` on the adapter's own statistics
+confirms it never heard about the flow.
+
+This is what makes the defect bigger than the increment. **Step 5's proof holds
+only because its bench encrypted one direction.** A flow is created by whichever
+packet reaches `nft flow add` first; with a plain return direction that is the
+reply, whose destination carries no transform, so both tuples come out
+`NEIGH` and nothing notices. Give the tunnel its other half and every reply
+carries a `sec_path`, `nft_flow_offload_skip()` declines it, and the only packet
+left to create the flow is the encrypted one — whose destination *is* the
+bundle. The whole connection then falls back to software, both directions, with
+no error anywhere. Measured: `tx toenc` tracking the transfer one for one at 60
+of 60, and `conntrack -L` showing `[OFFLOAD]` without `[HW_OFFLOAD]`.
+
+**`ft_next_hop()` resolved the wrong address past a transform.** The walk down
+to the underlying route was already there, written for this case in step 5 and
+never reached. What it then asked that route for was the flow's own
+destination. Through a gateway route that is harmless, because `rt_nexthop()`
+returns the gateway whatever it is handed; on an on-link route it returns what
+it was given, so the next hop came back as the *inner* destination, which is
+not on this segment and has no neighbour. The address to resolve is the
+outermost state's `id.daddr`.
+
+#### What the adapter now asks
+
+A direction has two ends and they need different questions, so the one policy
+lookup is asked twice: once about what the direction sends, and once about the
+reversed tuple leaving by the ingress port, which is what the far end sent.
+The second answer names an *outbound* SA, and the inbound half of that pair is
+the state whose destination is our local endpoint and whose source is the peer
+— `xfrm_state_lookup_byaddr()` answers exactly that, so the pairing stays the
+kernel's fact rather than a second index kept here.
+
+Refusal differs by end, and that asymmetry is the sharp edge:
+
+- **sending** — a policy that claims the tuple and resolves to nothing the
+  hardware can carry is a refusal, or the classifier forwards in the clear what
+  the policy says to encrypt.
+- **receiving** — a policy proves nothing about what the far end actually
+  sends, so only a *state* does. An inbound SA for this pair that exists and
+  cannot be named is a refusal, because its frames are decrypted before they
+  could match this tuple. Its absence is simply a direction whose frames arrive
+  in the clear, and must install exactly as it always did — a one-way tunnel is
+  unusual but legal, and refusing it would give up an acceleration that works.
+
+The handle then rides `cdx_ft_rule.in_sa_handle` into `hSAEntry[1]` with
+`CONNTRACK_SEC`, and `cdx_ipsec_fill_sec_info()` does the rest: it recognises
+the inbound direction, replaces the table descriptor and port id with the
+offline port's, and the entry lands where the decrypted frame is actually
+classified. That hook is the one CMM has been driving for years; only the
+description reaching it is new.
+
+#### Proved on hardware, 2026-09-18
+
+`tools/tests/test_ipsec_inbound_flow_offload.py`, on a KASAN flowtable boot.
+Both halves of the tunnel are offloaded, the DUT forwards between the WAN-side
+orchestrator and an inner address on the LAN VM, and only the DUT is in
+hardware.
+
+```
+in=eth4 out=eth3  sa=1  in_sa=0  packets=57   encrypted direction
+in=eth3 out=eth4  sa=0  in_sa=2  packets=57   decrypted direction
+tx toenc delta : 3     was 60, one per packet
+tx todec delta : 0     inbound never reaches the software SEC submit
+exception drops: 2     was 59, one per decrypted frame
+conntrack      : [HW_OFFLOAD]
+```
+
+The reverse direction's own packet counter is the oracle, because it is what
+separates an entry that exists from an entry that matches. It read zero for the
+whole transfer before this increment while the echo still worked.
+
+One log line was retired along the way. `ipsec_exception_pkt_handler()`
+reported `packet dropped` whenever `netif_receive_skb()` answered
+`NET_RX_DROP`, and that answer does not mean the frame was dropped:
+`__netif_receive_skb_core()` leaves its return at `NET_RX_DROP` whenever an
+ingress hook takes the frame, which is what the flowtable's software path does
+to every decrypted frame it forwards. Fifty-nine of sixty "dropped" frames were
+delivered. A counter that cannot tell a loss from a steal is worse than none,
+and at line rate it is also a log flood.
 
 ### 7. Parity
 
 A paired-boot measurement against CMM, same image, same tunnel, same traffic,
 same CPU accounting, per the roadmap's parity table. Retirement needs parity,
 not capability.
+
+**Not yet settled.** A first attempt ran on a non-KASAN image with the tunnel
+between the DUT's LAN port and the LAN VM and iperf3 forwarded through it, and
+it produced numbers that cannot be trusted: the rig's LAN segment began
+flapping partway through (`ixgbe ... NIC Link is Up 10 Gbps` followed by
+`Link is Down` twenty-eight milliseconds later, repeatedly) and eventually
+stayed down. The DUT's own port kept reporting link, so the break is between
+the switch and the LAN VM's NIC and needs a cable rather than a command.
+
+What that attempt did establish, and what it did not:
+
+- CMM carries this bench at 2.54 Gb/s forward and 2.70 Gb/s reverse, at
+  1.3 to 2.1 per cent DUT CPU, with both directions offloaded — its connection
+  table shows `IPSEC(Init:sa_nr=1 ...) (Reply:sa_nr=1 ...)`. So the comparison
+  is like for like: both owners put the tunnel in hardware.
+- The flowtable's decrypting direction matched it, at 2.63 to 2.66 Gb/s and
+  1.1 to 2.4 per cent CPU.
+- The flowtable's *encrypting* direction read 0.13 to 0.17 Gb/s at 26 to 39
+  per cent CPU over TCP. That number is **not** reported as a regression,
+  because a UDP transfer in the same direction on the same bench reached its
+  full 400 Mb/s offered rate with 83 per cent of frames carried in hardware,
+  which a broken encrypting path could not do. A TCP collapse with 116
+  retransmits, alongside a link flapping on a sub-second cadence, is what a
+  lossy segment looks like.
+
+The measurement is therefore unfinished, not failed. Redo it once the segment
+is repaired, and gate each run on link stability at both ends rather than
+assuming it: the failure mode here was silent on the DUT, which reported
+`Link detected: yes` throughout.
 
 ## Tests
 
@@ -737,7 +891,35 @@ A swanctl file written by hand bypasses the wrapper entirely and takes
 
 ## Open questions
 
-- Whether the inbound offline-port table can hold a flowtable-owned entry at
-  all, or whether the OH port's descriptor assumes a CMM-owned connection.
-  This is the one remaining unknown with real design risk, and it is settled
-  by measuring at step 5 rather than by reading.
+The one that carried real design risk — whether the offline port's table can
+hold a flowtable-owned entry at all, or whether its descriptor assumes a
+CMM-owned connection — is answered. It can: the entry is built by the same
+encoder, relocated by the same `cdx_ipsec_fill_sec_info()` branch the legacy
+owner uses, and it matches. Nothing in that descriptor knows who owns the
+connection. See step 6 above for the measurement.
+
+What is left is smaller and none of it blocks retirement:
+
+- **A rekey names the newest inbound SA.** `xfrm_state_lookup_byaddr()` answers
+  with the most recently installed state for a pair, which is the one a fresh
+  flow should name; the older one keeps its own classifier entry until it is
+  deleted, and that deletion retires whatever depends on it. Nothing here has
+  been exercised against a live rekey under load.
+- **A direction can hold both an inbound and an outbound SA**, and the rule has
+  a slot for each, but nothing proves the opcode order for a flow decrypted
+  from one tunnel and re-encrypted into another. Admission allows at most one
+  per end, so such a flow is carried in software today.
+- **An SA's own next hop is resolved once, at install, and never re-resolved.**
+  What leaves SEC is a finished frame, so the peer's Ethernet address is baked
+  into the SA's hardware entry; a peer that moves — a gateway failover, a
+  replaced NIC — leaves the tunnel emitting to an address nobody answers to,
+  silently. The legacy owner had `CMD_IPSEC_SA_SET_TNL_ROUTE` for this and
+  nothing here replaces it. Fixing it is not a watch on its own: the address
+  reaches the hardware through the shared descriptor, so a change means
+  rebuilding the SA's entry, which is the control plane's to drive. Scoped
+  out of this increment deliberately, and the largest of the four.
+- **`nft_flow_offload_skip()` declines every packet with a `sec_path`**, which
+  is why only the encrypted direction can create a tunnelled flow. That is
+  upstream behaviour and costs nothing here — one direction is enough to
+  describe both — but it does mean a tunnel whose *only* traffic is inbound
+  never offloads at all.

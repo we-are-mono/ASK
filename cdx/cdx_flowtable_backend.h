@@ -128,12 +128,30 @@ struct cdx_ft_rule {
 	 * SEC stamps the same number into a decrypted frame. Zero means the
 	 * direction carries no SA, which is every flow that is not tunnelled.
 	 *
-	 * Only an outbound SA appears here. An inbound one is not a property
-	 * of a routed flow at all: its frames arrive as ESP, are classified on
-	 * the SPI rather than on this tuple, and reach the flow only after SEC
-	 * has decrypted them.
+	 * Only an outbound SA appears here; the inbound one has a field of its
+	 * own below, because the two act on opposite ends of the direction and
+	 * a direction can hold both.
 	 */
 	u16 sa_handle;
+	/* The offloaded SA this direction's frames arrive decrypted from, or
+	 * zero.
+	 *
+	 * An inbound SA is not the mirror of an outbound one. Its frames reach
+	 * the port as ESP and are classified on the SPI, by the SA's own
+	 * classifier entry, so they never match this tuple on the way in. What
+	 * they match is this entry *after* SEC has decrypted them -- and a
+	 * decrypted frame re-enters classification on the offline port rather
+	 * than on the physical port it arrived by. So naming the SA here is
+	 * not decoration: it is what moves the entry into the offline port's
+	 * table and puts that port's id in its key. Without it the entry is
+	 * installed on the physical port, is counted, and never matches a
+	 * single frame.
+	 *
+	 * Zero means the direction's frames arrive in the clear, which is
+	 * every direction of every flow that is not the receiving half of a
+	 * tunnel.
+	 */
+	u16 in_sa_handle;
 };
 
 /* Layout of cdx_ft_rule.qos. Stated here rather than in the adapter because

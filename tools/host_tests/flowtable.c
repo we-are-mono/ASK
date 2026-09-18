@@ -314,10 +314,18 @@ struct switchdev_notifier_port_attr_info {
 };
 #define switchdev_notifier_info_to_dev(p) (((struct switchdev_notifier_info *)(p))->dev)
 struct dst_ops { unsigned family; };
+/* Only the field the adapter reads off a transform: what leaves the port is
+ * the outer packet, addressed to the SA's remote endpoint. */
+typedef union { __be32 a4; u32 a6[4]; } xfrm_address_t;
+struct xfrm_state { struct { xfrm_address_t daddr; } id; };
 struct dst_entry {
     struct dst_ops *ops;
     struct net_device *dev;
-    void *xfrm, *lwtstate;
+    struct xfrm_state *xfrm;
+    /* The route under a transform. A bundle with none is a broken bundle,
+     * which the walk must refuse rather than read past. */
+    struct dst_entry *xfrm_child;
+    void *lwtstate;
     int error;
     u32 cookie;
     bool valid;
@@ -334,6 +342,7 @@ struct rt6_info { struct dst_entry dst; unsigned rt6i_flags;
 #define RTF_CACHE 0x01000000
 #define RTF_LOCAL 0x80000000
 #define dst_xfrm(d) ((d)->xfrm)
+#define xfrm_dst_child(d) ((d)->xfrm_child)
 #define dst_rtable(d) ((struct rtable *)(d))
 #define dst_rt6_info(d) ((struct rt6_info *)(d))
 /* IPv4 ignores the cookie; IPv6 pins the destination to one FIB generation
@@ -618,6 +627,31 @@ static void nf_flow_table_cleanup(struct net_device *dev)
 { assert(!cdx_info->ctrl.mutex); flushed++; if (cleanup_hook) cleanup_hook(); }
 static void dev_hold(struct net_device *d) { d->refs++; }
 static void dev_put(struct net_device *d) { assert(d->refs > 0); d->refs--; }
+/* The IPsec side of the adapter, which the netdev notifier and the module's
+ * own init and exit reach. Stubbed rather than compiled: attaching xfrmdev_ops
+ * and resolving an SA pull in xfrm and the SA backend, neither of which this
+ * harness simulates, and none of the behaviour under test here depends on
+ * them. What must still hold is that the lifecycle calls them at all, so the
+ * counters below let a case say so. */
+static unsigned ipsec_attached, ipsec_detached, ipsec_detached_all;
+static int ft_ipsec_retire;
+static void ft_ipsec_attach(struct net_device *d) { ipsec_attached++; }
+static void ft_ipsec_detach(struct net_device *d) { ipsec_detached++; }
+static void ft_ipsec_detach_all(void) { ipsec_detached_all++; }
+static void flush_work(int *work) { assert(work == &ft_ipsec_retire); }
+/* Policy resolution for both ends of a direction, which needs xfrm. A case
+ * sets what the answer should be; refusing must reject the direction rather
+ * than install it, because an entry installed past a policy that says encrypt
+ * forwards in the clear. */
+static bool ipsec_ok = true;
+static u16 ipsec_sa, ipsec_in_sa;
+static bool ft_ipsec_handle(const struct flow_cls_offload *cls, struct cdx_ft_rule *out,
+                            struct net_device *egress, struct net_device *ingress)
+{
+    out->sa_handle = ipsec_sa;
+    out->in_sa_handle = ipsec_in_sa;
+    return ipsec_ok;
+}
 /* Resolves the one device a session hop names. Defined past the device
  * declarations, which the production decoder is included ahead of. Takes no
  * reference, exactly as the kernel's does under RTNL. */
@@ -947,6 +981,9 @@ static struct ports pk, pm;
 static struct tcp tk, tm;
 static void fixture(void)
 {
+    /* Both ends plain by default: a case that wants a transform says so. */
+    ipsec_ok = true;
+    ipsec_sa = ipsec_in_sa = 0;
     assert(!ft_handle_refs && handle.refs <= 1);
     handle = (struct nf_flow_offload_handle){ .refs = 1 };
     assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && ft_neigh_entries.next == &ft_neigh_entries);
@@ -2860,7 +2897,9 @@ static void test_gateways(void)
     REJECT(route.dst.ops = &ipv6_ops);
     REJECT(route.dst.dev = &in);
     REJECT(route.dst.valid = false);
-    REJECT(route.dst.xfrm = &route);
+    static struct xfrm_state sa;
+    REJECT(route.dst.xfrm = &sa);            /* a bundle with no route under it */
+    REJECT(ipsec_ok = false);                /* a policy claims it, hardware cannot */
     REJECT(route.dst.lwtstate = &route);
     REJECT(route.rt_type = 2); /* Local route, not forwarded unicast. */
     REJECT(route.rt_gw_family = AF_INET6);
