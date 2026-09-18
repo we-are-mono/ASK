@@ -10,6 +10,10 @@
 #ifndef _DPA_CONTROL_MC_H_
 #define _DPA_CONTROL_MC_H_
 
+/* Defined in control_ipv4.h, which this header deliberately does not pull in:
+ * the tag stack crosses the interface as a pointer and nothing here reads it. */
+struct cdx_l2_encap;
+
 #define MC4_NUM_HASH_ENTRIES 16
 #define MC6_NUM_HASH_ENTRIES 16
 #define MC4_MIN_COMMAND_SIZE	32+12 /* with one listener entry using 1 interface name */
@@ -129,9 +133,13 @@ int MC4_Get_Next_Hash_Entry(PMC4Command pMC4Cmd, int reset_action);
 int MC6_Get_Next_Hash_Entry(PMC6Command pMC6Cmd, int reset_action);
 int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);
 
+/* Builds one listener's entry. `encap` names the tags this listener's frames
+ * leave with, or is NULL to take them from the egress interface. The scratch
+ * state is the builder's own; see the definition for why that is not merely
+ * tidiness. */
 struct en_exthash_tbl_entry* create_exthash_entry4mcast_member(RouteEntry *pRtEntry,
-	struct ins_entry_info *pInsEntryInfo, MC4Output	*pListener, struct en_exthash_tbl_entry* prev_tbl_entry,
-	uint32_t tbl_type);
+	MC4Output *pListener, const struct cdx_l2_encap *encap,
+	struct en_exthash_tbl_entry* prev_tbl_entry, uint32_t tbl_type);
 
 /* Module init/exit functions */
 int mc4_init(void);

@@ -18,7 +18,8 @@ def function(source, name):
     # keeps a forward declaration or a call site from being mistaken for the
     # definition. Widen it when a new one is needed.
     match = re.search(r"^(?:static )?(?:int |void |U16 |uint32_t |"
-                      r"struct qman_fq \*|enum qman_cb_dqrr_result )"
+                      r"struct qman_fq \*|struct en_exthash_tbl_entry\* |"
+                      r"enum qman_cb_dqrr_result )"
                       + name + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     start = match.start()

@@ -306,6 +306,37 @@ that is easy to conflate: `MC_MAX_LISTENERS_IN_QUERY` is 5, it sizes
 *message* rather than a forwarding limit. It is irrelevant to an in-kernel
 caller, which is one more argument for not synthesising FCI.
 
+**Scoping this turned up a second, quieter bound that had to be removed before
+the measurement could mean anything.** `struct ins_entry_info` is the write
+cursor into one entry's fixed 16-slot opcode area, and both multicast callers
+declared one, zeroed it once, and passed the same pointer to every listener in
+the group. Three quarters of the cursor — `opcptr`, `paramptr`, `param_size` —
+were re-based per entry; `opc_count` was not, and nothing in the tree ever
+assigns it zero. A group's listeners therefore shared one entry's opcode
+budget: two opcodes per tagged listener against `MAX_OPCODES` of 16.
+
+It never tripped, and the reason is the `MC_MAX_LISTENERS_IN_QUERY` gate above.
+`MC4_Command_Handler` refuses any mutating command naming more than five
+listeners, and a group larger than that is assembled by several commands, each
+with a fresh struct — `test_mcast_pagination.py` builds its eight as ADD 5 plus
+UPDATE 3. So the worst reachable case was ten opcodes against sixteen. Latent,
+with six opcodes of headroom, and the headroom would have evaporated the moment
+someone raised the per-command limit toward the per-group one in order to run
+step 1.
+
+The fix is to stop sharing the struct: the builder allocates its own, which is
+what every other entry builder in `cdx_ehash.c` already does. That also removes
+three things the sharing made possible but that nothing has yet hit —
+`tnl_hdr_size` accumulating with `+=`, `flags` only ever being OR-ed, and
+`preempt_params` being left pointing into the previous listener's entry for any
+future path that emits a preemptive check. Riding along in the same commit is a
+use-before-init the audit found next door: `create_exthash_entry4mcast_member()`
+passed `dpa_get_fm_port_index()` a *local* `fm_idx` and copied it into the
+struct ten lines after `dpa_get_tdinfo()` had already read the struct's copy, so
+every listener selected its table descriptor with the previous listener's FMAN
+index — or with zero, on the first. Invisible on a single-FMAN part and wrong
+on any other.
+
 **Host delivery is not solved by this increment.**
 `SWITCHDEV_OBJ_ID_HOST_MDB` exists for traffic the bridge itself must receive,
 and a hardware entry that replicates to ports only would starve a local
