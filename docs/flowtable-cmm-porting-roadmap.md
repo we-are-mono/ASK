@@ -37,7 +37,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | ---: | --- | ---: | ---: | --- | --- | --- |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | **Delivered**, both directions: see the [IPsec design](flowtable-ipsec.md). Control plane is mainline `xfrmdev_ops` in packet mode, with no ASK userspace. The estimate that the shared encoder already carried the SEC action held; what it did not anticipate is that `FLOW_OFFLOAD_XMIT_XFRM` had to be *admitted* rather than excluded — three generic helpers refuse that transmit type outright, which silently kept every real tunnel in software until step 6 measured it. |
-| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Bridged path delivered, unproven on hardware: see the [multicast design](flowtable-multicast.md).** Control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on, with no ASK userspace and no consumer configuration at all. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Routed multicast is a second learner against the same encoder and is not built. |
+| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Bridged path delivered and proved on hardware, both families: see the [multicast design](flowtable-multicast.md).** Control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on, with no ASK userspace and no consumer configuration at all. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Routed multicast is a second learner against the same encoder and is not built. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
@@ -426,11 +426,18 @@ is in two halves, which is what the (S,G)-versus-(\*,G) gap forces: memberships
 from the switchdev chain (`b7eb41c`), and the source and ingress port from the
 group's own traffic (`51a7cd5`).
 
-None of it has run on hardware. The end-to-end suite is
-`tools/tests/test_mcast_e2e.py`, written before the learner so it gates rather
-than describes; its oracles are the bridge reporting `offload`, the group in
-`/proc/cdx_flowtable`, and the DUT's CPU not seeing a stream its listeners are
-receiving. Until that has passed, this row is code rather than a capability.
+**It works on hardware.** A bridge learns a group from its own snooping, the
+hook learns the source and ingress from the stream, and the classifier carries
+it: 1000 of 1000 frames matched with **zero** reaching the CPU, 50,000 at 385k
+pps with no loss, IPv6 alongside IPv4, and `(S,G)` memberships refusing a
+foreign source. The table of runs is in the design doc.
+
+Two things temper it. The rig has one usable listener port, so multi-listener
+replication and the chain swap a join performs against an installed group are
+unexercised; and the soft parser refuses to classify TTL 0 or 1, which for a
+*bridged* group is a real gap rather than correct behaviour — see the design
+doc. The end-to-end suite is `tools/tests/test_mcast_e2e.py`, written before
+the learner so it gates rather than describes.
 
 **QoS is no longer the critical path.** Its three build features are compiled
 in, but `/etc/config/cmmqos` ships with `enabled '0'` and nothing sends

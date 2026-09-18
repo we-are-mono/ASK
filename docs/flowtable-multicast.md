@@ -621,6 +621,41 @@ the product ships today and is the number that actually improves.
 Channel-change latency belongs in this row, because step 6 deliberately spends
 a forwarding decision in software.
 
+## Proved on hardware, 2026-09-18
+
+Flowtable boot, KASAN image, a plain bridge over the DUT's WAN and LAN ports
+with snooping on. Memberships added with `bridge mdb add`; streams injected
+from the orchestrator. Every case reads three independent things: the group's
+row in `/proc/cdx_flowtable`, the classifier entry's own match counter, and
+whether the frames reached the CPU at all.
+
+| What | Result |
+| --- | --- |
+| IPv4 `(*,G)`, source learned from traffic | `installed`, 1000 of 1000 frames matched |
+| Frames reaching the DUT's CPU, group installed | **0** — capture on the bridge saw none of the 1000 |
+| Replication out the listener port | +1000 on eth3's transmit counter |
+| Sustained rate | 50,000 frames at 385k pps, **+50000** matched, no loss |
+| IPv6 `(*,G)` via MLD, the mc6 encoder | `installed`, 962 of 1000 matched |
+| IPv4 `(S,G)`, source from the membership | `installed`, 768 of 800 matched |
+| `(S,G)` with a foreign source | stays `pending-source` — 300 frames, correctly ignored |
+| Membership withdrawn | group retired, `mcast_installed` decremented, entry gone |
+| Teardown of the bridge | every group retired, every device released, no splat |
+| Tagged listener on a vlan-aware bridge | tag resolved — `ports=eth3/3999` |
+
+The first few frames of each stream are forwarded in software while the source
+is being learned — 15 of 1000, 38 of 1000, 32 of 800 across the runs above.
+That is the design working: a `(*,G)` membership has no key until traffic
+supplies one, and the window is however long the worker takes to run.
+
+Three things this rig could not exercise, and they are coverage gaps rather
+than results. The board has five ports and only two have carrier, one of which
+is the ingress, so **every group here has exactly one listener**: multi-listener
+replication, the chain swap a join or leave performs against an installed
+group, and the listener ceiling all need a second live listener port. And the
+managed switch upstream does not trunk VLAN 3999, so while the tag is derived
+correctly and reaches the encoder, a tagged frame has not been carried end to
+end. The encapsulation itself is covered by `tools/host_tests/test_mcast_hm.py`.
+
 ## Tests
 
 The five existing files all drive FCI and all keep working, because step 2

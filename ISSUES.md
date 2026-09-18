@@ -152,6 +152,22 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A158 — multicast replication to more than one listener has never been
+  run.** The bridged multicast offload is proved on hardware for a single
+  listener (see the [design doc](docs/flowtable-multicast.md)), but the DUT has
+  five ports and only two with carrier, one of which every group uses as its
+  ingress. So every group exercised so far has exactly one listener, and three
+  things are untested as a direct consequence: replication to N ports at once,
+  the chain swap `cdx_mc_group_replace()` performs when a join or leave changes
+  an installed group's listener set, and the listener ceiling
+  `MC_MAX_LISTENERS_PER_GROUP` names. The chain swap is the one that matters —
+  it is what keeps the other listeners of an IPTV group from a gap whenever
+  anyone changes channel, and it is the most intricate code in the backend.
+  Needs a second listener port with carrier, or a CMM boot where VLAN
+  sub-interfaces register as onifs and can stand in as listeners the way
+  `test_mcast_replication.py` already uses them. Not a defect; a measurement
+  that has not been taken.
+
 - [ ] **A156 — a failed multicast UPDATE leaves the listeners it already
   installed forwarding, and reports failure.** `cdx_update_mcast_group()`
   (`cdx/dpa_control_mc.c`) commits each listener of a batch as it is built:
@@ -392,7 +408,7 @@ file's git history.
 - [x] **A157.** Bridged multicast looked installed-but-never-matching on the
   first rig run; not a defect — the injector used a plain UDP socket, whose
   default multicast TTL of 1 the soft parser excepts before classification.
-  With TTL 64 the group matches every frame (_pending_).
+  With TTL 64 the group matches every frame (_9550336_).
 
 - [x] **G1.** `/dev/cdx_ctrl` ioctl dispatcher was ungated — added a CAP_NET_ADMIN
   check ahead of the command-table lookup (_815a0ca_).
