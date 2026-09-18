@@ -787,36 +787,78 @@ and at line rate it is also a log flood.
 
 A paired-boot measurement against CMM, same image, same tunnel, same traffic,
 same CPU accounting, per the roadmap's parity table. Retirement needs parity,
-not capability.
+not capability — and the first attempt did not have it.
 
-**Not yet settled.** A first attempt ran on a non-KASAN image with the tunnel
-between the DUT's LAN port and the LAN VM and iperf3 forwarded through it, and
-it produced numbers that cannot be trusted: the rig's LAN segment began
-flapping partway through (`ixgbe ... NIC Link is Up 10 Gbps` followed by
-`Link is Down` twenty-eight milliseconds later, repeatedly) and eventually
-stayed down. The DUT's own port kept reporting link, so the break is between
-the switch and the LAN VM's NIC and needs a cable rather than a command.
+#### The MTU the classifier is told is the outer one
 
-What that attempt did establish, and what it did not:
+Tunnelled TCP through the flowtable ran at 0.07 Gb/s against the legacy
+owner's 2.54 on the same bench, with a quarter of the DUT's CPU spent and the
+software SEC submit counting once per packet. Everything that looked like
+evidence of an offload was there: both directions installed, the SA named, the
+entry's own counter tracking every frame, and ESP on the wire. The entry was
+matching and then excepting each frame to the CPU, which encrypted it — an
+offload that works and performs like software.
 
-- CMM carries this bench at 2.54 Gb/s forward and 2.70 Gb/s reverse, at
-  1.3 to 2.1 per cent DUT CPU, with both directions offloaded — its connection
-  table shows `IPSEC(Init:sa_nr=1 ...) (Reply:sa_nr=1 ...)`. So the comparison
-  is like for like: both owners put the tunnel in hardware.
-- The flowtable's decrypting direction matched it, at 2.63 to 2.66 Gb/s and
-  1.1 to 2.4 per cent CPU.
-- The flowtable's *encrypting* direction read 0.13 to 0.17 Gb/s at 26 to 39
-  per cent CPU over TCP. That number is **not** reported as a regression,
-  because a UDP transfer in the same direction on the same bench reached its
-  full 400 Mb/s offered rate with 83 per cent of frames carried in hardware,
-  which a broken encrypting path could not do. A TCP collapse with 116
-  retransmits, alongside a link flapping on a sub-second cadence, is what a
-  lossy segment looks like.
+The cause is one field. The microcode compares the size of what it
+*transmits* against the MTU programmed in the entry, and for a direction handed
+to SEC that is the outer frame: the expansion travels separately, in
+`hdr_xpnd_sz`, and is added before the comparison. Netfilter's MTU for a
+transformed flow is the tunnel-*reduced* inner one, so programming
+`cls->nf_mtu` directly asks the hardware whether 1438 + 44 fits in 1438. It
+does not, and every full-size frame took the exception path.
 
-The measurement is therefore unfinished, not failed. Redo it once the segment
-is repaired, and gate each run on link stability at both ends rather than
-assuming it: the failure mode here was silent on the DUT, which reported
-`Link detected: yes` throughout.
+NXP wrote the rule down at the only other site that meets it, where a tunnel
+interface's reduced MTU is corrected before programming:
+
+```c
+// In case of tunneling , interface MTU was reduced with tunnel header size
+// In ucode , as we are checking the total packet size with MTU after tunneling ,
+// We need to program MTU size in ucode including the tunnel header size.
+l2_info->mtu += l3_info->header_size;
+```
+
+The legacy owner never met it because its route table holds interface MTUs
+rather than per-flow ones. So a direction carrying an outbound SA now programs
+the egress port's MTU, and `cdx_ft_rule.mtu` keeps meaning what it meant: the
+flow's own bound, which admission still checks and `/proc` still reports.
+
+Worth naming the shape of this, because it is the second time in this
+increment: a hardware path that *degrades* rather than fails is invisible to
+every functional test. The step 6 proofs all pass against the broken MTU —
+they move sixty packets, and sixty packets through the CPU look exactly like
+sixty packets through SEC. Only a rate measurement separates them, which is
+what parity is for.
+
+#### Proved on hardware, 2026-09-18
+
+Paired boots, same non-KASAN image, same tunnel, same traffic, two settled
+runs per cell with each boot's first run discarded, and every run gated on the
+LAN segment not having flapped during it.
+
+| Direction | Flowtable | CMM |
+| --- | --- | --- |
+| WAN to LAN, encrypting | 2.55 and 2.55 Gb/s | 2.55 and 2.55 Gb/s |
+| LAN to WAN, decrypting | 2.65 and 2.65 Gb/s | 2.72 and 2.71 Gb/s |
+
+Both owners were confirmed to be carrying it in hardware rather than reaching
+the rate in software, and by the same oracle in both: `tx toenc`, the count of
+frames the *software* path handed to SEC, stayed between 20 and 54 for
+transfers of roughly two hundred thousand packets. The legacy owner's
+connection table showed `IPSEC(Init:sa_nr=1 ...) (Reply:sa_nr=1 ...)`; the
+adapter's showed both directions with their SA handles.
+
+The encrypting direction is identical. The decrypting direction is 2.4 per cent
+slower under the flowtable, consistently across three runs each — small, real,
+and not explained here; it is the direction that crosses the offline port
+twice, so a per-frame cost there is the first place to look if it ever matters.
+
+The absolute rate is the LAN VM's software crypto ceiling, not the DUT's: only
+the DUT's SAs are in hardware. That ceiling is identical on both sides of the
+comparison, which is what makes the DUT's own cost the thing being measured.
+
+A DUT reset was observed once during a UDP variant of this bench under the
+legacy owner, with no console logger attached and nothing captured; it is
+recorded as ISSUES A155 rather than diagnosed here.
 
 ## Tests
 

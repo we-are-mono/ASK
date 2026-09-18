@@ -214,6 +214,36 @@ a like-for-like comparison against the owner it replaces. The two owners are
 exclusive per boot, so each row is a paired boot: same image, same NAT rule,
 same traffic, same CPU accounting, only the owner differs.
 
+**IPsec tunnel, forwarded TCP, 4 streams, 20 s, non-KASAN image — 2026-09-18**
+
+| Direction | Flowtable | CMM |
+| --- | --- | --- |
+| WAN to LAN, encrypting | 2.55 and 2.55 Gb/s | 2.55 and 2.55 Gb/s |
+| LAN to WAN, decrypting | 2.65 and 2.65 Gb/s | 2.72 and 2.71 Gb/s |
+
+Two settled runs per cell. The tunnel's outer endpoints are the DUT's LAN port
+and the LAN VM, and the traffic inside it is forwarded between the WAN-side
+orchestrator and an inner address on the VM. Only the DUT's SAs are in
+hardware, so the VM's software crypto sets the absolute ceiling — identically
+on both sides, which is what leaves the DUT's own cost as the variable.
+
+Both owners were confirmed to be carrying it in hardware by the same oracle:
+`tx toenc`, which counts frames the *software* path handed to SEC, stayed
+between 20 and 54 across transfers of roughly two hundred thousand packets.
+Each run was also gated on the LAN segment not having lost carrier during it,
+after a flapping cable produced a full set of plausible-looking numbers.
+
+The encrypting direction is identical. The decrypting direction is 2.4 per cent
+slower under the flowtable, consistently; it is the direction that crosses the
+offline port twice, and the difference is recorded rather than explained. CPU
+followed the same per-run trend under both owners and so cancels.
+
+This row cost a real defect to produce: the adapter was programming the
+classifier with Netfilter's tunnel-*reduced* flow MTU, and the microcode
+compares post-tunnelling size against it, so every full-size frame was matched,
+excepted to the CPU and encrypted in software — 0.07 Gb/s while every
+functional test passed. See the [IPsec design](flowtable-ipsec.md).
+
 **IPv4 TCP masquerade, 4 streams, 30 s, non-KASAN image — 2026-09-16**
 
 | Direction | Flowtable | CMM |

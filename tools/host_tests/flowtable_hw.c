@@ -97,7 +97,7 @@ static struct net init_net, other_net;
 struct net_device {
     char name[8];
     struct net *net;
-    unsigned type, addr_len, reg_state;
+    unsigned type, addr_len, reg_state, mtu;
     bool l3_slave, running, carrier, switch_port;
     u8 dev_addr[6], perm_addr[6];
 };
@@ -218,6 +218,12 @@ static unsigned expected_proto = IPPROTO_UDP;
  * each nibble reached the field that reads it. */
 static u16 expected_qos;
 static bool expected_hairpin;
+/* What the entry must carry as its own MTU. Ordinarily the flow's, but a
+ * direction handed to SEC has to be given the egress port's instead: the
+ * microcode adds the tunnel expansion before comparing, so a tunnel-reduced
+ * bound rejects every full-size frame. */
+static unsigned expected_mtu;
+static u16 expected_sa, expected_in_sa;
 static struct cdx_l2_encap observed_encap;
 static void *kzalloc(size_t n, int flags) { if(fail_alloc) return NULL; allocations++; return calloc(1,n); }
 static void kfree(void *p) { assert(p && allocations); allocations--; free(p); }
@@ -254,6 +260,8 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
             expected_status |= CONNTRACK_SNAT;
         if (!nf_inet_addr_cmp_local(&expected_dst, &destination) || expected_dport != ct->Dport)
             expected_status |= CONNTRACK_DNAT;
+        if (expected_sa || expected_in_sa)
+            expected_status |= CONNTRACK_SEC;
         assert(ct->status == expected_status);
     } else {
         assert(ct->fftype == FFTYPE_IPV4 && ct->hash == expected_proto * 13);
@@ -263,7 +271,8 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
         assert(ct->twin->Saddr_v4 == expected_dst.ip && ct->twin->Daddr_v4 == expected_src.ip);
         bool nat = expected_src.ip != ct->Saddr_v4 || expected_dst.ip != ct->Daddr_v4 ||
                    expected_sport != ct->Sport || expected_dport != ct->Dport;
-        assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0)));
+        assert(ct->status == (CONNTRACK_ORIG | (nat ? CONNTRACK_NAT : 0) |
+                              ((expected_sa || expected_in_sa) ? CONNTRACK_SEC : 0)));
     }
     /* The rule's three class nibbles reach three separate hardware fields. The
      * policer nibble is a plain profile number and is copied straight through,
@@ -285,7 +294,10 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     assert(ct->qosmark.dscp_mark_flag == ((expected_qos >> 12) & 0x1));
     assert(ct->qosmark.dscp_mark_value == ((expected_qos >> 13) & 0x3f));
     assert(ct->pRtEntry->itf == (expected_hairpin ? &in_itf : &out_itf) && ct->pRtEntry->input_itf == &in_itf);
-    assert(ct->pRtEntry->underlying_input_itf == &in_itf && ct->pRtEntry->mtu == 1200);
+    assert(ct->pRtEntry->underlying_input_itf == &in_itf);
+    assert(ct->pRtEntry->mtu == expected_mtu);
+    assert(ct->hSAEntry[0] == expected_sa && ct->hSAEntry[1] == expected_in_sa);
+    assert(!(ct->status & CONNTRACK_SEC) == !(expected_sa || expected_in_sa));
     assert(!memcmp(ct->pRtEntry->dstmac, (u8[]){2,3,4,5,6,7},6));
     if (fail_insert) return -1;
     ct->ct = kzalloc(sizeof(*ct->ct), GFP_KERNEL); assert(ct->ct);
@@ -353,12 +365,16 @@ static void cdx_ft_ifstats_read(const struct cdx_ft_stats_slot *slot,
 static void test_backend(void)
 {
     struct net_device in = { .name="in", .net=&init_net, .type=ARPHRD_ETHER,
-        .addr_len=ETH_ALEN, .reg_state=NETREG_REGISTERED, .running=true, .carrier=true, .dev_addr={2}, .perm_addr={2} };
+        .addr_len=ETH_ALEN, .reg_state=NETREG_REGISTERED, .mtu=1500, .running=true, .carrier=true, .dev_addr={2}, .perm_addr={2} };
     struct net_device out = in;
     strcpy(out.name, "out");
     in_iface.eth_info.net_dev = &in; out_iface.eth_info.net_dev = &out;
     struct cdx_ft_rule rule = { .in=&in, .out=&out, .family=AF_INET, .src.ip=htonl(0xc0000201), .dst.ip=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+    /* Untagged, so the logical device and the port are the same object --
+     * which is what the rule's own contract says they are without a tag. */
+    rule.in_logical = &in; rule.out_logical = &out;
+    expected_mtu = 1200;
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     struct cdx_ft_hw *hw = NULL;
@@ -448,6 +464,25 @@ static void test_backend(void)
     out_iface.itf_id=L2_MAX_ONIF; assert(!cdx_ft_port_supported(&out)); out_iface.itf_id=2;
     out_iface.eth_info.net_dev=&in; assert(!cdx_ft_port_supported(&out)); out_iface.eth_info.net_dev=&out;
     ft_observe=true; assert(cdx_ft_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw); ft_observe=false;
+    /* A direction that names an SA. Each end lands in its own slot and marks
+     * the entry secure, and the *sending* end additionally replaces the
+     * entry's MTU with the egress port's: the microcode adds the tunnel
+     * expansion before comparing, so leaving the flow's tunnel-reduced bound
+     * there rejects every full-size frame and sends it to the CPU instead.
+     * That failure is invisible to a functional test -- the entry matches and
+     * counts either way -- so it is pinned here. */
+    rule.sa_handle = expected_sa = 7;
+    expected_mtu = out.mtu;
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw);
+    assert(cdx_ft_del(&hw) == 0 && !hw);
+    rule.sa_handle = expected_sa = 0;
+    /* The receiving end takes no such correction: what it transmits is the
+     * decrypted inner frame, so the flow's own bound is the right one. */
+    rule.in_sa_handle = expected_in_sa = 8;
+    expected_mtu = rule.mtu;
+    assert(cdx_ft_add(&rule,&stats,&hw) == 0 && hw);
+    assert(cdx_ft_del(&hw) == 0 && !hw);
+    rule.in_sa_handle = expected_in_sa = 0;
     /* Exercise same-port translation through the provider's real admission
      * entry point as well as the lower encoder and adapter decoder. */
     rule.out = &in; expected_hairpin = true;
@@ -524,9 +559,11 @@ static void test_backend(void)
 
 int main(void)
 {
-    struct net_device in = { .name = "in" }, out = { .name = "out" };
-    struct cdx_ft_rule rule = { .in=&in, .out=&out, .family=AF_INET, .src.ip=htonl(0xc0000201), .dst.ip=htonl(0xc6336401),
+    struct net_device in = { .name = "in", .mtu = 1500 }, out = { .name = "out", .mtu = 1500 };
+    struct cdx_ft_rule rule = { .in=&in, .out=&out, .in_logical=&in, .out_logical=&out,
+        .family=AF_INET, .src.ip=htonl(0xc0000201), .dst.ip=htonl(0xc6336401),
         .sport=htons(1234), .dport=htons(5678), .proto=IPPROTO_UDP, .src_mac={2}, .dst_mac={2,3,4,5,6,7}, .mtu=1200 };
+    expected_mtu = 1200;
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     struct cdx_ft_hw *hw;
