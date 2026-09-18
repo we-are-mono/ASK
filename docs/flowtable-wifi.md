@@ -345,11 +345,56 @@ VAP's frame queue instead of a MAC port's.
 Proof: a WAN-to-Wi-Fi transfer offloaded, with the entry's own packet counter
 tracking the transfer and the software forwarding path idle.
 
-### 6. The ingress half, if step 4 justified it
+### 6. The ingress half -- not built, and the measurement says why
 
-Injection into the offline port from the flowtable's ingress hook rather than
-from VWD's `NF_INET_PRE_ROUTING` one, so there is a single ingress mechanism
-rather than two competing for the same frame.
+Step 4 was allowed to conclude that the ingress half buys nothing. It does.
+
+**The egress offload is worth 1.6x, and that is its whole worth.** Measured
+with a client on the 5 GHz AP, the same transfer with the flowtable bound and
+flushed, both runs saturating one core:
+
+```
+offload off   ~92 Mbit/s    one core at 100%
+offload on   ~145 Mbit/s    one core at 100%
+```
+
+So at a fixed core budget the per-packet cost falls to about 63% of what it
+was: the route lookup, conntrack, NAT and header rewrite are about **37% of a
+wire-to-Wi-Fi packet**, and hardware removes all of it. The other 63% is the
+skb build, `dev_queue_xmit()`, `moal` and the PCIe transfer, and no amount of
+classifier work touches it.
+
+**It cannot be a bypass, because FMAN cannot reach the radio.** The 88W9098 is
+a PCIe device; FMAN can only enqueue to its own MAC and offline ports. A VAP
+frame queue is therefore a handoff point and not an egress: `vap_rx_fwd_pkt()`
+is a qman dequeue callback, on the CPU, by construction. MediaTek's WED exists
+precisely to close that gap, which is why `mt7915`/`mt7996` are the only
+drivers implementing `net_fill_forward_path`; there is no equivalent here.
+
+One consequence worth knowing: a flow is hashed to one of the VAP's 64
+forwarding queues, so a single TCP connection is served by a single core and
+tops out around 145 Mbit/s. Parallel connections spread and go faster. The
+board's Wi-Fi ceiling is therefore per-flow, not aggregate.
+
+**Against that, the ingress half is not worth building.** The uplink is not
+CPU-bound at all -- during upload no core exceeds 70% while the download pegs
+one -- so there is no bottleneck to relieve. And the trade is worse in that
+direction: the frame is *already* an skb in the CPU when it arrives from PCIe,
+so injection adds a descriptor build and an offline-port round trip to buy
+back the same 37%.
+
+NXP appears to have reached the same place. `cdx_wifi_rx_fastpath()` is
+exported and has no caller in any tree, and their own `wifi_fastforward_conf_file`
+sets `direct_rx_path = 0` for every non-QCA driver -- so the fast version was
+Atheros-only and the general version is the round trip. Their round trip is
+the VWD `NF_INET_PRE_ROUTING` hook, which this branch now disables in
+flowtable mode: with no uplink entries for it to match, it was injecting every
+packet into the offline port and taking every one straight back
+(`pkts_tx_route` and `pkts_slow_forwarded` both 237240), for a global vaplock
+and two DMAs each.
+
+The mechanism therefore stays in the tree, off, and reachable if a future
+board changes the arithmetic.
 
 ## Tests
 

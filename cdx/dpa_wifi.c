@@ -39,6 +39,7 @@
 #include "dpa_wifi.h"
 #include "layer2.h"
 #include "cdx.h"
+#include "cdx_flowtable.h"
 #include "procfs.h"
 
 //uncomment to allow debug prints
@@ -3013,7 +3014,24 @@ int dpaa_vwd_init(void)
 		goto err_hooks;
 
 	WRITE_ONCE(vwd_stopping, false);
-	WRITE_ONCE(priv->fast_path_enable, 1);
+	/* The legacy classifier's own fast path, and only for the owner that
+	 * has one. It steals frames at NF_INET_PRE_ROUTING and injects them
+	 * into the Wi-Fi offline port itself, which is the whole of how CMM
+	 * offloads Wi-Fi -- and is exactly what the flowtable owner already
+	 * does for itself, through the classifier entries it installs.
+	 * Enabling it in that mode puts two owners on the same frames: the
+	 * flowtable's NF_NETDEV_INGRESS hook takes what it can and this takes
+	 * the rest. That works, which is the problem -- it hides which path is
+	 * carrying the traffic, and it costs a global vaplock on every packet
+	 * that reaches PRE_ROUTING, which is the cost e67f0ba removed.
+	 *
+	 * It became reachable when dpaa_vwd_init() started running in both
+	 * ownership modes: the hardware belongs in both, this does not. The
+	 * sysfs knob still turns it on by hand, for anyone deliberately
+	 * comparing the two paths.
+	 */
+	if (!cdx_flowtable_enabled())
+		WRITE_ONCE(priv->fast_path_enable, 1);
 	register_cdx_deinit_func(dpaa_vwd_exit);
 	return 0;
 
