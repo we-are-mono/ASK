@@ -15,15 +15,22 @@ bridge floods multicast perfectly well in software, so arrival proves
 forwarding and says nothing about offload. Each case therefore carries three
 oracles, and the third is the one that discriminates:
 
-  1. `bridge mdb show` reports `offload` against the port group. That is the
-     kernel's own vocabulary for "a driver took this on", set by the adapter
-     answering the switchdev object.
-  2. The group is present in the hardware table, read from /proc.
+  1. `bridge mdb show` reports `offload` against the port group. Read this as
+     "the adapter took responsibility for the group", not "the hardware is
+     carrying it": the switchdev handler runs under RTNL and cannot take the
+     transaction an install needs, so it decides and a work item installs.
+     See docs/flowtable-multicast.md, "The handler cannot install".
+  2. The group is present in the hardware table, read from /proc. THIS is
+     "actually installed", and it is where a disagreement with (1) surfaces.
   3. **The DUT's CPU does not see the stream.** A hardware-replicated frame is
      matched and transmitted by the FMAN and never reaches the host, so a
      capture on the DUT's bridge device counts ~0 while loki counts thousands.
      Software flooding cannot produce that, and neither can a group that is
      merely present in a table but not matching.
+
+The three deliberately mean different things — accepted, installed, and
+matching — so a case that passes all three has been checked at three
+independent points rather than three times at one.
 
 IGMPv2 and IGMPv3 are both covered and the split is not incidental. The
 classifier key is an exact (S,G), so a v3 INCLUDE report — which carries a
@@ -335,8 +342,11 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
     )
     assert in_hw, f"{group}: forwarded, but no hardware entry — software path"
     assert offloaded, (
-        f"{group}: hardware entry present but `bridge mdb show` does not "
-        f"report offload; the adapter did not answer the switchdev object"
+        f"{group}: installed in hardware, but `bridge mdb show` does not "
+        f"report offload. The flag is set when the adapter accepts the "
+        f"switchdev object, which is strictly earlier than the install, so "
+        f"an entry present without it means the group reached hardware by "
+        f"some path other than the membership it was supposed to come from"
     )
     # The discriminating one.
     assert cpu_seen < sent * 0.05, (
