@@ -152,6 +152,51 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A157 — a bridged multicast group installs correctly and the classifier
+  never matches it.** First hardware run of the multicast learner, flowtable
+  boot, 2026-09-18. A plain bridge over eth4 and eth3 with snooping and a
+  querier; `bridge mdb add dev brm port eth3 grp 239.8.1.1 permanent`; 1000
+  UDP frames from 10.0.0.232 to 239.8.1.1:47300 injected on eth4.
+
+  Everything the adapter controls is right. The group reaches `state=installed`
+  with `src=10.0.0.232 in=eth4`, so the traffic half resolved the source and
+  ingress correctly. The composed key is `{portid=7, src=10.0.0.232,
+  dst=239.8.1.1, proto=17}`, `key_size=10` — exactly the shape `fill_key_info()`
+  produces with the ports masked. `inPhyPortNum` resolves through
+  `add_incoming_iface_info()` to the onif index, then `dpa_get_fm_port_index()`
+  to `port_id=7`, which is the same derivation the working unicast path uses.
+  `bridge mdb show` reports `offload`. No errors, no quarantine, no splat.
+
+  And the entry's own counters stay at **`packets=0 bytes=0`** across the whole
+  stream, while eth3 transmits ~1000 frames and a capture on the bridge sees
+  the full 1000 — so the Linux bridge is flooding it in software and the
+  hardware entry is matching nothing. Frames are not reaching
+  `cdx_multicast4_cc` at all.
+
+  What is eliminated: the key's addresses, the learned source, the portid
+  derivation, the MAC-filter subscription (M15's fix is in place and the port
+  is allmulti besides), the store barrier (also M15), promiscuous mode (the SDK
+  only toggles the MAC's own promisc, it does not bypass PCD), and the
+  ingress-equals-listener guard (eth4 in, eth3 out).
+
+  What is not yet eliminated, and is the place to start: **every passing
+  multicast test in the tree uses an unbridged ingress in a CMM boot.**
+  `test_mcast_replication.py` injects on eth4 while eth4 carries its own
+  address, with CMM-registered VLAN subifs as listeners. A bridged ingress with
+  a physical-port listener is a combination the hardware path has never been
+  asked for. `cdx_pcd.xml`'s `dist_order` puts `cdx_udp4_dist` ahead of
+  `cdx_ipv4multicast_dist` on every ethernet port, which would send a multicast
+  *UDP* frame to the 5-tuple table first — that ordering is the same one the
+  passing test runs under, so it is not obviously the cause, but the
+  interaction between it and a bridged port is unexamined.
+
+  Next step is a bisect rather than more reading: same bridged topology, CMM
+  boot, group programmed by hand over FCI. If that also reports zero matches,
+  the defect is the topology's and not the learner's, and the multicast design
+  doc's "one encoder, two learners" assumption needs revisiting for the bridged
+  case. The learner itself is otherwise proven on hardware — memberships,
+  source learning, install, retirement and the `offload` flag all behaved.
+
 - [ ] **A156 — a failed multicast UPDATE leaves the listeners it already
   installed forwarding, and reports failure.** `cdx_update_mcast_group()`
   (`cdx/dpa_control_mc.c`) commits each listener of a batch as it is built:
