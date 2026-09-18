@@ -53,6 +53,7 @@ union nf_inet_addr {
  * learner compares pointers and asks the stubs about them. */
 struct net_device {
     const char *name;
+    int ifindex;
     bool physical;
     bool bridge_master;
 };
@@ -131,6 +132,18 @@ static int br_vlan_get_info(struct net_device *port, uint16_t vid,
     return -EOPNOTSUPP;
 }
 
+/* Whether any byte differs from c. The learner uses it to ask whether a
+ * membership named a source at all, which is what tells (S,G) from (*,G). */
+static void *memchr_inv(const void *p, int c, size_t n)
+{
+    const unsigned char *b = p;
+
+    for (size_t i = 0; i < n; i++)
+        if (b[i] != (unsigned char)c)
+            return (void *)(b + i);
+    return NULL;
+}
+
 #define lockdep_assert_held(x) ((void)0)
 #define kzalloc(n, f) calloc(1, (n))
 #define kfree(p) free(p)
@@ -140,11 +153,11 @@ static int br_vlan_get_info(struct net_device *port, uint16_t vid,
 
 /* --- helpers --------------------------------------------------------- */
 
-static struct net_device BR   = { .name = "br0",  .bridge_master = true };
-static struct net_device P1   = { .name = "eth3", .physical = true };
-static struct net_device P2   = { .name = "eth4", .physical = true };
-static struct net_device P3   = { .name = "eth5", .physical = true };
-static struct net_device SOFT = { .name = "vx0",  .physical = false };
+static struct net_device BR   = { .name = "br0",  .ifindex = 10, .bridge_master = true };
+static struct net_device P1   = { .name = "eth3", .ifindex = 11, .physical = true };
+static struct net_device P2   = { .name = "eth4", .ifindex = 12, .physical = true };
+static struct net_device P3   = { .name = "eth5", .ifindex = 13, .physical = true };
+static struct net_device SOFT = { .name = "vx0",  .ifindex = 14, .physical = false };
 
 static struct br_ip group_v4(uint32_t dst, uint32_t src, uint16_t vid)
 {
@@ -367,6 +380,88 @@ int main(void)
 
         assert(!ft_mc_membership(&BR, &P2, &elsewhere, true, false));
         assert(ft_mc_refused == before + 1);
+    }
+
+    /* ---- matching an observation to a membership --------------------
+     *
+     * The distinction the whole design turns on. An IGMPv2 join produces a
+     * (*,G) membership, which any source of that group satisfies. An IGMPv3
+     * INCLUDE report produces an (S,G) one, where the bridge has already said
+     * which source the group is about and a different one is a different
+     * stream that these listeners did not ask for.
+     */
+    reset();
+    {
+        struct br_ip any = group_v4(0x010007ef, 0, 0);          /* (*,G) */
+        struct br_ip specific = group_v4(0x020007ef, 0x0100000a, 0); /* (S,G) */
+        struct ft_mc_seen seen;
+
+        assert(ft_mc_membership(&BR, &P1, &any, true, false));
+        assert(ft_mc_membership(&BR, &P1, &specific, true, false));
+
+        /* Any source matches the wildcard membership. */
+        memset(&seen, 0, sizeof(seen));
+        seen.bridge_ifindex = BR.ifindex;
+        seen.addr = any;
+        seen.src.ip = 0x0900000a;
+        assert(ft_mc_match(&seen) == ft_mc_find(&BR, &any));
+
+        /* The named source matches the source-specific one. */
+        memset(&seen, 0, sizeof(seen));
+        seen.bridge_ifindex = BR.ifindex;
+        seen.addr = specific;
+        seen.addr.src.ip4 = 0;   /* the observation carries no source in addr */
+        seen.src.ip = 0x0100000a;
+        assert(ft_mc_match(&seen) == ft_mc_find(&BR, &specific));
+
+        /* A different source does not. Somebody else sending to a group
+         * these listeners asked for from one source is not their stream. */
+        seen.src.ip = 0x0200000a;
+        assert(ft_mc_match(&seen) == NULL);
+
+        /* A different bridge is a different group even for the same
+         * addresses, because it resolves to different ports. */
+        memset(&seen, 0, sizeof(seen));
+        seen.bridge_ifindex = BR.ifindex + 1;
+        seen.addr = any;
+        assert(ft_mc_match(&seen) == NULL);
+
+        /* And a different VLAN is a different membership. */
+        memset(&seen, 0, sizeof(seen));
+        seen.bridge_ifindex = BR.ifindex;
+        seen.addr = any;
+        seen.addr.vid = 100;
+        assert(ft_mc_match(&seen) == NULL);
+
+        /* As is a different family with the same bytes. */
+        memset(&seen, 0, sizeof(seen));
+        seen.bridge_ifindex = BR.ifindex;
+        seen.addr = any;
+        seen.addr.proto = htons(ETH_P_IPV6);
+        assert(ft_mc_match(&seen) == NULL);
+    }
+
+    /* The hook's own dedup: one fact recorded once, however many frames
+     * restate it, so a line-rate stream does not fill the ring between two
+     * runs of the worker. */
+    {
+        struct ft_mc_seen a, b;
+
+        memset(&a, 0, sizeof(a));
+        a.bridge_ifindex = 1;
+        a.in_ifindex = 2;
+        a.addr = group_v4(0x010007ef, 0, 0);
+        a.src.ip = 0x0100000a;
+        b = a;
+        assert(ft_mc_seen_eq(&a, &b));
+        b.src.ip = 0x0200000a;
+        assert(!ft_mc_seen_eq(&a, &b));   /* a second source is a new fact */
+        b = a;
+        b.in_ifindex = 3;
+        assert(!ft_mc_seen_eq(&a, &b));   /* so is the same stream elsewhere */
+        b = a;
+        b.addr.vid = 7;
+        assert(!ft_mc_seen_eq(&a, &b));
     }
 
     reset();

@@ -18,6 +18,10 @@ def test_mcast_learner(tmp_path):
     # that no longer matches what the adapter keeps.
     (tmp_path / "mcast_learner.inc").write_text(
         source[source.index("struct ft_mc_port {"):source.index("static LIST_HEAD(ft_mc_groups)")]
+        # The observation the hook records, declared further down with the
+        # traffic half rather than with the group it resolves against.
+        + source[source.index("struct ft_mc_seen {"):
+                 source.index("};", source.index("struct ft_mc_seen {")) + 3]
         # The extraction order is the file's, which is not a valid declaration
         # order on its own: ft_mc_membership calls helpers defined after it in
         # the list. Forward-declare rather than reorder, so the harness does
@@ -36,6 +40,8 @@ def test_mcast_learner(tmp_path):
             "ft_mc_port_tags",
             "ft_mc_group_free",
             "ft_mc_membership",
+            "ft_mc_seen_eq",
+            "ft_mc_match",
         ]))
     binary = tmp_path / "mcast_learner"
     subprocess.run([
