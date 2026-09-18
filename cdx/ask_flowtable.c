@@ -225,6 +225,7 @@ static atomic64_t ft_link_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_mac_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_fdb_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_admission_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_ipsec_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping;
@@ -501,6 +502,103 @@ static bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
  * separate contract in either family. dev is the logical egress device, which
  * is the VLAN subinterface rather than the physical port when the flow is
  * tagged; the destination Netfilter selected belongs to that device. */
+/* The offloaded SA this direction's frames are encrypted by, or zero.
+ *
+ * Returns false when the flow is transformed by something this contract
+ * cannot carry, which must be a refusal rather than a plain installation --
+ * an entry that forwards in hardware what a policy says to encrypt sends it
+ * in the clear, and the policy never gets a say. That is the failure this
+ * function exists to prevent, and it was observed on the bench before it did:
+ * fifty-nine packets forwarded past a `level required` policy.
+ *
+ * The question has to be asked of the policy, not of the borrowed
+ * destination. A transformed dst only reaches the flowtable for locally
+ * generated traffic; a *forwarded* flow is routed by nf_route() with a plain
+ * FIB lookup and is transformed later, in xfrm_route_forward() at
+ * POSTROUTING, so its cached destination never carries the transform that
+ * will be applied to it. Asking dst_xfrm() therefore answers "no policy" for
+ * exactly the flows a gateway encrypts. So this repeats the lookup
+ * forwarding itself does, against the same tuple, and believes the answer.
+ *
+ * KEEP_DST_REF is what makes that safe on a destination this code does not
+ * own: without it a matching policy releases the reference the caller
+ * borrowed.
+ */
+static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
+			    const struct cdx_ft_rule *rule,
+			    struct net_device *out, u16 *handle)
+{
+	struct dst_entry *dst = cls->nf_dst;
+	struct dst_entry *bundle;
+	struct xfrm_state *x;
+	struct flowi fl = {};
+	bool ok = false;
+
+	*handle = 0;
+	if (!dst)
+		return true;
+	/* The translated tuple, with its ports: a policy selector can name
+	 * them, and a flowi missing them would fail to match a policy that
+	 * does -- admitting in the clear exactly the flow it was meant to
+	 * catch. These are the post-NAT values because that is what leaves
+	 * this port and what xfrm_route_forward() sees at POSTROUTING. */
+	if (rule->family != AF_INET) {
+		fl.u.ip6.daddr = rule->new_dst.in6;
+		fl.u.ip6.saddr = rule->new_src.in6;
+		fl.u.ip6.fl6_dport = rule->new_dport;
+		fl.u.ip6.fl6_sport = rule->new_sport;
+	} else {
+		fl.u.ip4.daddr = rule->new_dst.ip;
+		fl.u.ip4.saddr = rule->new_src.ip;
+		fl.u.ip4.fl4_dport = rule->new_dport;
+		fl.u.ip4.fl4_sport = rule->new_sport;
+	}
+	fl.flowi_proto = rule->proto;
+	fl.flowi_oif = out->ifindex;
+
+	/* Take a reference before asking, because a matching policy consumes
+	 * one. xfrm_bundle_create() links the destination into the bundle it
+	 * builds and takes over the caller's reference to it; KEEP_DST_REF
+	 * only suppresses the extra release on the paths that fail. The
+	 * destination here is borrowed from the callback and this code owns no
+	 * reference to it, so without this the bundle would consume one that
+	 * was never ours -- and releasing the bundle below would free a
+	 * destination the flowtable still uses. KASAN caught exactly that, as
+	 * a slab-use-after-free in rcuref_put(). */
+	dst_hold(dst);
+	bundle = xfrm_lookup(&init_net, dst, &fl, NULL,
+			     XFRM_LOOKUP_KEEP_DST_REF);
+	if (IS_ERR(bundle)) {
+		dst_release(dst);
+		/* A policy matched and no state could be resolved. Forwarding
+		 * this in hardware would bypass it, so refuse and let the
+		 * software path make whatever decision the policy asks for --
+		 * an acquire, a block, or a drop. */
+		return false;
+	}
+	if (bundle == dst) {
+		/* No policy: an ordinary plain flow. Nothing consumed the
+		 * reference taken above, so give it back. */
+		dst_release(dst);
+		return true;
+	}
+
+	x = bundle->xfrm;
+	if (!x || dst_xfrm(xfrm_dst_child(bundle)))
+		goto out;		/* nothing, or a bundle deeper than one */
+	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET || !x->xso.offload_handle)
+		goto out;		/* the stack is doing this one */
+	if (x->xso.dev != out)
+		goto out;		/* another port's SEC context */
+	*handle = cdx_ipsec_sa_handle((struct cdx_ipsec_sa *)x->xso.offload_handle);
+	ok = *handle != 0;
+out:
+	/* Releases the whole chain, including the reference the bundle took
+	 * over from us above. */
+	dst_release(bundle);
+	return ok;
+}
+
 static bool ft_next_hop(const struct flow_cls_offload *cls,
 			struct net_device *dev, u8 family,
 			const union nf_inet_addr *daddr,
@@ -509,9 +607,22 @@ static bool ft_next_hop(const struct flow_cls_offload *cls,
 	struct dst_entry *dst = cls->nf_dst;
 
 	if (!dst || dst->ops->family != family || dst->dev != dev ||
-	    dst_xfrm(dst) || dst->lwtstate || dst->error ||
+	    dst->lwtstate || dst->error ||
 	    !dst_check(dst, cls->nf_dst_cookie))
 		return false;
+	/* An encrypted flow's destination is the transform, and the route to
+	 * the peer is underneath it. The next hop belongs to that route: what
+	 * leaves this port is the outer packet, addressed to the tunnel's far
+	 * end rather than to the inner destination the tuple names. Walk down
+	 * to it and judge that route by the same rules as any other.
+	 *
+	 * The SA itself is checked separately, by ft_ipsec_handle(); this is
+	 * only about where the finished frame goes. */
+	while (dst_xfrm(dst)) {
+		dst = xfrm_dst_child(dst);
+		if (!dst || dst->ops->family != family || dst->error)
+			return false;
+	}
 	memset(next_hop, 0, sizeof(*next_hop));
 	if (family == AF_INET6) {
 		const struct rt6_info *rt = dst_rt6_info(dst);
@@ -1276,6 +1387,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * neighbour-output flow and the only one the encoder can cache. */
 	if (!ft_vlan_actions(&rule->action, out) ||
 	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop) ||
+	    !ft_ipsec_handle(cls, out, out->out_logical, &out->sa_handle) ||
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return -EOPNOTSUPP;
@@ -1835,6 +1947,33 @@ static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
 		if (ft_entry_uses(entry, dev))
 			ft_handle_invalidate(entry->handle, counter);
+	spin_unlock_bh(&ft_watch_lock);
+}
+
+/* Retire every direction encrypted by an SA that is going away.
+ *
+ * An offloaded SA is a dependency of the same kind as a route or a neighbour:
+ * a direction names it by handle, and when it stops existing the hardware
+ * entry points at a SEC context that no longer describes anything. Handles are
+ * reused once their SA is deleted, so this has to run before the hardware is
+ * retired -- which it does, because the caller queues that retirement and this
+ * happens first, under a lock the datapath never takes.
+ *
+ * Retiring rather than rewriting is deliberate, and matches every other
+ * dependency here: Linux stops using its cached lookup immediately, the flow
+ * is readmitted from scratch on the next packet, and the SA it then names is
+ * whichever one the policy resolves to by that point.
+ */
+static void ft_ipsec_retire_sa(u16 handle)
+{
+	struct cdx_ft_entry *entry;
+
+	if (!handle)
+		return;
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
+		if (entry->rule.sa_handle == handle)
+			ft_handle_invalidate(entry->handle, &ft_ipsec_invalidations);
 	spin_unlock_bh(&ft_watch_lock);
 }
 
@@ -2472,6 +2611,10 @@ static void ft_xdo_state_delete(struct xfrm_state *x)
 	if (!sa)
 		return;
 	x->xso.offload_handle = 0;
+	/* Retire the flows first, while the handle still names this SA. They
+	 * point at a SEC context that is about to stop describing anything,
+	 * and a handle is reusable the moment its SA is gone. */
+	ft_ipsec_retire_sa(cdx_ipsec_sa_handle(sa));
 	/* GFP_ATOMIC: x->lock is held. An allocation failure here would strand
 	 * the hardware SA, so say so rather than fail silently -- the operator
 	 * can still reload the adapter, and the alternative is a classifier
@@ -2760,7 +2903,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
@@ -2768,9 +2911,10 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
 				   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
+				   entry->rule.sa_handle,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),
@@ -2778,6 +2922,7 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
 				   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
+				   entry->rule.sa_handle,
 				   &entry->next_hop.ip, stats.packets, stats.bytes, stats.lastused);
 		return 0;
 	}
@@ -2794,7 +2939,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\n",
 		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -2806,7 +2951,8 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_link_invalidations),
 		   atomic64_read(&ft_mac_invalidations),
 		   atomic64_read(&ft_fdb_invalidations),
-		   atomic64_read(&ft_admission_invalidations));
+		   atomic64_read(&ft_admission_invalidations),
+		   atomic64_read(&ft_ipsec_invalidations));
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   records, slots);
 	ft_session_rows(seq);

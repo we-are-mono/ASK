@@ -121,6 +121,19 @@ struct cdx_ft_rule {
 	 * Nineteen bits wide, so u32: a u16 would silently drop the codepoint.
 	 */
 	u32 qos;
+	/* The offloaded SA this direction's frames are encrypted by, or zero.
+	 *
+	 * A handle rather than the opaque owner, because this is what the
+	 * hardware works in: the classifier entry names the SA by handle and
+	 * SEC stamps the same number into a decrypted frame. Zero means the
+	 * direction carries no SA, which is every flow that is not tunnelled.
+	 *
+	 * Only an outbound SA appears here. An inbound one is not a property
+	 * of a routed flow at all: its frames arrive as ESP, are classified on
+	 * the SPI rather than on this tuple, and reach the flow only after SEC
+	 * has decrypted them.
+	 */
+	u16 sa_handle;
 };
 
 /* Layout of cdx_ft_rule.qos. Stated here rather than in the adapter because
