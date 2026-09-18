@@ -2164,11 +2164,18 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
  * unresolved neighbour is a refusal rather than something to retry, because
  * packet offload has no software fallback to wait in.
  */
+/* How long to wait for the peer's neighbour entry, and in how many steps.
+ * Two seconds total: an ARP exchange on a LAN completes in microseconds, so
+ * this is a bound on something going wrong rather than an expected cost. */
+#define FT_IPSEC_NEIGH_TRIES	20
+#define FT_IPSEC_NEIGH_WAIT_MS	100
+
 static int ft_ipsec_next_hop(struct xfrm_state *x,
 			     struct cdx_ipsec_sa_spec *spec,
 			     struct netlink_ext_ack *extack)
 {
-	struct neighbour *neigh;
+	struct neighbour *neighbour;
+	unsigned int attempt;
 	struct rtable *rt;
 	struct flowi4 fl4 = {
 		.daddr = x->id.daddr.a4,
@@ -2191,19 +2198,46 @@ static int ft_ipsec_next_hop(struct xfrm_state *x,
 		rc = -EOPNOTSUPP;
 		goto out;
 	}
-	rcu_read_lock();
-	neigh = __ipv4_neigh_lookup_noref(rt->dst.dev,
-					  (__force u32)rt_nexthop(rt, fl4.daddr));
-	/* Every usable state, which is the same set admission accepts: a
-	 * neighbour that is merely stale still has the address that was last
-	 * confirmed, and Linux will refresh it in its own time. */
-	if (neigh && (neigh->nud_state & NUD_VALID))
-		ether_addr_copy(spec->dst_mac, neigh->ha);
-	else
+	/* Resolve the peer, asking for it if nobody has yet.
+	 *
+	 * An offloaded SA is usually installed moments after an IKE exchange
+	 * with this same peer, so the neighbour is normally already there. It
+	 * is not guaranteed: the exchange may have run over a different
+	 * address, or the entry may have been evicted, and on a freshly booted
+	 * gateway the table can simply be empty. Refusing then would fail the
+	 * tunnel outright, because packet offload has no software fallback to
+	 * fall back into -- so ask the ordinary way and wait briefly, rather
+	 * than turn a cold ARP cache into a tunnel that never comes up.
+	 *
+	 * This runs in process context on the netlink path, before any CDX
+	 * lock or RTNL is taken, so waiting here blocks only the caller that
+	 * asked for the SA. The bound is short enough to be invisible next to
+	 * the exchange that preceded it and long enough for ARP on a LAN.
+	 */
+	neighbour = dst_neigh_lookup(&rt->dst, &fl4.daddr);
+	if (!neighbour) {
 		rc = -EHOSTUNREACH;
-	rcu_read_unlock();
+		goto report;
+	}
+	for (attempt = 0; attempt < FT_IPSEC_NEIGH_TRIES; attempt++) {
+		/* Every usable state, which is the same set admission accepts:
+		 * a neighbour that is merely stale still has the address that
+		 * was last confirmed, and Linux refreshes it in its own time. */
+		if (READ_ONCE(neighbour->nud_state) & NUD_VALID) {
+			read_lock_bh(&neighbour->lock);
+			ether_addr_copy(spec->dst_mac, neighbour->ha);
+			read_unlock_bh(&neighbour->lock);
+			break;
+		}
+		neigh_event_send(neighbour, NULL);
+		msleep(FT_IPSEC_NEIGH_WAIT_MS);
+	}
+	if (is_zero_ether_addr(spec->dst_mac))
+		rc = -EHOSTUNREACH;
+	neigh_release(neighbour);
+report:
 	if (rc)
-		NL_SET_ERR_MSG(extack, "cdx: the remote tunnel endpoint has no resolved neighbour");
+		NL_SET_ERR_MSG(extack, "cdx: the remote tunnel endpoint did not resolve");
 out:
 	ip_rt_put(rt);
 	return rc;
@@ -2320,6 +2354,17 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 		NL_SET_ERR_MSG(extack, "cdx: only packet offload is supported");
 		return -EOPNOTSUPP;
 	}
+	/* An acquire placeholder, created by xfrm_state_find() when a policy
+	 * matched and no SA existed yet. It carries no keys and no SPI, so
+	 * there is nothing to program -- and it arrives under xfrm_state_lock
+	 * with GFP_ATOMIC, where none of the work below is legal. Accept it
+	 * and do nothing: the real state that replaces it comes through here
+	 * again, from netlink, in a context that can do the work.
+	 *
+	 * Accepting rather than refusing matters. A refusal fails the acquire,
+	 * and with it the on-demand tunnel that was being negotiated. */
+	if (x->xso.flags & XFRM_DEV_OFFLOAD_FLAG_ACQ)
+		return 0;
 	if (x->id.proto != IPPROTO_ESP) {
 		NL_SET_ERR_MSG(extack, "cdx: only ESP can be offloaded");
 		return -EOPNOTSUPP;
@@ -2344,48 +2389,113 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	 * moment the SA is deleted. cdx_ipsec_sa_handle() still answers for
 	 * anything that needs the number the hardware knows. */
 	x->xso.offload_handle = (unsigned long)sa;
+	/* Publish the hardware's own name for this SA as well.
+	 *
+	 * The datapath works in handles rather than pointers, because that is
+	 * all a frame can carry: SEC stamps the handle into a decrypted
+	 * frame's trailer, and the transmit path looks the frame queue up by
+	 * it. Setting it here, before the state is inserted, is what makes the
+	 * kernel's handle index point at the SA the hardware actually has --
+	 * xfrm_state_insert_byh() honours a handle that is already set rather
+	 * than allocating over it.
+	 */
+	x->handle = cdx_ipsec_sa_handle(sa);
 	return 0;
 }
 
-/* Delete cannot touch the hardware, and this is not an oversight.
+/* SAs whose state has been deleted and whose hardware is waiting to go.
  *
- * xfrm_state_delete() takes x->lock with spin_lock_bh() before calling
- * __xfrm_state_delete(), which is what reaches this callback -- so it runs in
- * atomic context, and every backend operation needs the control mutex. The
- * teardown therefore belongs in free, below, which is the one of the two that
- * may sleep.
+ * Teardown cannot happen in the callback that learns about it, and it must not
+ * wait for the callback that could: see ft_xdo_state_delete() below.
+ */
+static LIST_HEAD(ft_ipsec_retired);
+static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
+
+struct ft_ipsec_retirement {
+	struct list_head list;
+	struct cdx_ipsec_sa *sa;
+};
+
+static void ft_ipsec_retire_work(struct work_struct *work)
+{
+	struct ft_ipsec_retirement *retirement;
+
+	for (;;) {
+		spin_lock_bh(&ft_ipsec_retired_lock);
+		retirement = list_first_entry_or_null(&ft_ipsec_retired,
+						      struct ft_ipsec_retirement, list);
+		if (retirement)
+			list_del(&retirement->list);
+		spin_unlock_bh(&ft_ipsec_retired_lock);
+		if (!retirement)
+			return;
+		cdx_ft_begin();
+		cdx_ipsec_sa_del(&retirement->sa);
+		cdx_ft_end();
+		kfree(retirement);
+	}
+}
+
+static DECLARE_WORK(ft_ipsec_retire, ft_ipsec_retire_work);
+
+/* Delete cannot touch the hardware, and it must not wait for free either.
  *
- * What this leaves is a window: between the state being deleted and its last
- * reference going away, the hardware SA is still installed and still
- * encrypting. That window is bounded by an RCU grace period and the state
- * garbage collector, and the legacy owner has the same one for the same
- * reason -- its SA_DELETE is asynchronous too.
+ * It cannot touch it because xfrm_state_delete() holds x->lock across
+ * __xfrm_state_delete() with spin_lock_bh(), so this runs in atomic context
+ * and every backend operation needs the control mutex.
+ *
+ * Waiting for xdo_dev_state_free() was the first answer and it was wrong. Free
+ * is reached only once the last reference to the state is gone, and a frame
+ * handed to SEC holds one: the state travels on the skb's sec_path so the
+ * transmit path can find its frame queue, and that skb is freed lazily -- the
+ * DPAA submit path stashes it in the scatter-gather table's trailing slot and
+ * the buffer's *next* user frees it. On an idle tunnel that next user never
+ * arrives, so the references sit there, free never runs, and the SA stays in
+ * the classifier for ever. Reinstalling the same SPI then fails with
+ * "Resource Already Exists" from the hash table, which is how this was found.
+ *
+ * Under the legacy owner the same references are taken and the same lazy free
+ * applies, but nothing depended on it: CMM retired the SA over FCI, on its own
+ * schedule. Here the teardown *is* the state's destruction, so tying the two
+ * together made SA removal wait on buffer recycling.
+ *
+ * So the hardware is retired from a workqueue instead, promptly, and the
+ * state's own lifetime is left to the kernel. What survives the SA is the
+ * borrowed pointer in the SA cache, which cdx_ipsec_sa_del() clears before
+ * anything can follow it.
  */
 static void ft_xdo_state_delete(struct xfrm_state *x)
 {
-}
-
-/* Reached from ___xfrm_state_destroy(), after the last reference is gone and
- * before the state itself is freed, in a context that may sleep -- the garbage
- * collector's workqueue, or a caller that has just done synchronize_rcu().
- *
- * There is one path where it is called under a spinlock instead, in
- * xfrm_state_find()'s acquire failure branch. It is unreachable here: it runs
- * only when a *policy* was packet-offloaded, and this driver offers no
- * xdo_dev_policy_add, so pol->xdo.type is never XFRM_DEV_OFFLOAD_PACKET. That
- * is worth knowing before policy offload is ever added, because adding it
- * would make this callback atomic on that path and this teardown illegal.
- */
-static void ft_xdo_state_free(struct xfrm_state *x)
-{
 	struct cdx_ipsec_sa *sa = (struct cdx_ipsec_sa *)x->xso.offload_handle;
+	struct ft_ipsec_retirement *retirement;
 
 	if (!sa)
 		return;
 	x->xso.offload_handle = 0;
-	cdx_ft_begin();
-	cdx_ipsec_sa_del(&sa);
-	cdx_ft_end();
+	/* GFP_ATOMIC: x->lock is held. An allocation failure here would strand
+	 * the hardware SA, so say so rather than fail silently -- the operator
+	 * can still reload the adapter, and the alternative is a classifier
+	 * entry nobody can account for. */
+	retirement = kzalloc(sizeof(*retirement), GFP_ATOMIC);
+	if (!retirement) {
+		pr_err("cdx: no memory to retire IPsec SA for spi %x; its hardware entry is stranded\n",
+		       ntohl(x->id.spi));
+		return;
+	}
+	retirement->sa = sa;
+	spin_lock(&ft_ipsec_retired_lock);
+	list_add_tail(&retirement->list, &ft_ipsec_retired);
+	spin_unlock(&ft_ipsec_retired_lock);
+	schedule_work(&ft_ipsec_retire);
+}
+
+/* Nothing left to do: delete has already queued the hardware retirement, and
+ * the handle it took is gone. This exists so the core has something to call
+ * and so a state that somehow reaches free still un-owns its SA.
+ */
+static void ft_xdo_state_free(struct xfrm_state *x)
+{
+	WARN_ON_ONCE(x->xso.offload_handle);
 }
 
 static bool ft_xdo_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
@@ -2397,11 +2507,50 @@ static bool ft_xdo_offload_ok(struct sk_buff *skb, struct xfrm_state *x)
 	return true;
 }
 
+/* Policy offload, which is not optional however little the hardware needs it.
+ *
+ * CDX steers on flows and SPIs, not on policy selectors, so there is nothing
+ * here to program -- and the first version of this driver therefore left the
+ * policy ops out. That was wrong, and silently: xfrm_state_find() skips a
+ * packet-offloaded state whenever the policy that reached it is not offloaded
+ * too ("Skip HW policy for SW lookups"), so every offloaded SA was invisible
+ * to the lookup and no packet ever selected one. The SA installed, reported
+ * itself installed, and carried nothing.
+ *
+ * So these exist to make the pairing hold. Accepting a policy means agreeing
+ * that flows matching it may select this device's offloaded SAs, which is
+ * exactly what is wanted; the steering those flows then get is the SA's, and
+ * the classifier entry belongs to the flow rather than to the policy.
+ */
+static int ft_xdo_policy_add(struct xfrm_policy *xp, struct netlink_ext_ack *extack)
+{
+	if (xp->xdo.type != XFRM_DEV_OFFLOAD_PACKET) {
+		NL_SET_ERR_MSG(extack, "cdx: only packet offload is supported");
+		return -EOPNOTSUPP;
+	}
+	if (!cdx_ipsec_port_supported(xp->xdo.dev)) {
+		NL_SET_ERR_MSG(extack, "cdx: not an offload-capable port");
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+static void ft_xdo_policy_delete(struct xfrm_policy *xp)
+{
+}
+
+static void ft_xdo_policy_free(struct xfrm_policy *xp)
+{
+}
+
 static const struct xfrmdev_ops ft_xfrmdev_ops = {
 	.xdo_dev_state_add	= ft_xdo_state_add,
 	.xdo_dev_state_delete	= ft_xdo_state_delete,
 	.xdo_dev_state_free	= ft_xdo_state_free,
 	.xdo_dev_offload_ok	= ft_xdo_offload_ok,
+	.xdo_dev_policy_add	= ft_xdo_policy_add,
+	.xdo_dev_policy_delete	= ft_xdo_policy_delete,
+	.xdo_dev_policy_free	= ft_xdo_policy_free,
 };
 
 /* Attach the ops to a CDX physical port, and say so in its features.
@@ -2776,8 +2925,11 @@ neigh:
 netdev:
 	unregister_netdevice_notifier(&ft_netdev_nb);
 	/* The notifier's registration replayed NETDEV_REGISTER and attached
-	 * every port, so a failure after that point has ports to give back. */
+	 * every port, so a failure after that point has ports to give back --
+	 * and an SA could already have been installed and deleted through
+	 * them, leaving a retirement queued against code about to unload. */
 	ft_ipsec_detach_all();
+	flush_work(&ft_ipsec_retire);
 proc:
 	proc_remove(ft_proc);
 	ft_proc = NULL;
@@ -2849,6 +3001,11 @@ static void __exit ask_flowtable_exit(void)
 	 * each port have to be taken back by hand -- they point into text
 	 * that is about to go away. */
 	ft_ipsec_detach_all();
+	/* Detaching stops new retirements being queued; this drains the ones
+	 * already queued. Both are needed before the work item's own code can
+	 * be unmapped, and this order is the only one that ends with an empty
+	 * list. */
+	flush_work(&ft_ipsec_retire);
 	cancel_work_sync(&ft_retire_work);
 	cancel_delayed_work_sync(&ft_work);
 	/* Direct first: it is the route a DPAA port actually takes, so closing
