@@ -516,15 +516,57 @@ notifier.
 
 `SWITCHDEV_OBJ_ID_PORT_MDB` and `SWITCHDEV_OBJ_ID_HOST_MDB` on the existing
 blocking chain. Accumulate per-`(bridge, group, vid)` port sets, resolve each
-port's tag stack, and hold the result as a pending group. Answer `handled` and
-zero only for a group actually installed, so `bridge mdb show` says `offload`
-when and only when the hardware is carrying it — and leave `-EOPNOTSUPP` to be
-the chain's answer otherwise, which is the discipline `ft_swdev_event()`
-already documents for port VLANs.
+port's tag stack, and hold the result as a pending group.
 
 Nothing is installed at this step. `/proc/cdx_flowtable` grows a multicast
 section showing pending groups, which is both the proof and the operator
 surface the contract promised.
+
+#### The handler cannot install, and that decides what `offload` means
+
+A switchdev object with `SWITCHDEV_F_DEFER` is delivered from
+`switchdev_port_obj_add_deferred()`, which opens with `ASSERT_RTNL()`. So this
+handler runs **holding RTNL**, and the transaction every backend operation
+requires is `cdx_info->ctrl.mutex`.
+
+Those two cannot be nested in that order here, and the tree already says so.
+`cdx_ctrl_lock_with_rtnl()` in `cdx_main.c` is a trylock-and-back-off loop
+carrying the rule outright: *"RTNL holders may flush flowtable callbacks which
+need ctrl.mutex; legacy FCI can take RTNL with ctrl.mutex held. Never wait for
+either lock while holding the other."* Both orders exist in the tree —
+`control_vlan.c` takes RTNL from inside an FCI command, which runs under
+ctrl.mutex — and `cdx_ft_admission_begin()` is an `rtnl_trylock()` for exactly
+this reason. A blocking `cdx_ft_begin()` from this handler would be the
+inversion those two are avoiding.
+
+It is also the wrong place to install regardless of locking: building a group
+means allocating entries and syncing the PCD, and doing that under RTNL stalls
+every other network configuration on the box for the duration.
+
+So the handler **decides** and a work item **installs**. Everything the
+decision needs — which ports are supported, what tag each carries, whether the
+bridge itself has joined — is bridge and netdev state, which RTNL is precisely
+the right lock for. Nothing in it touches hardware.
+
+That settles what `handled` may claim. The adapter answers `handled` for a
+group it has accepted responsibility for, not for one already in hardware,
+because at that instant no group can be. `bridge mdb show` therefore reads
+*"the adapter took this on"* rather than *"the hardware is carrying this"*, and
+the two differ for as long as the work item takes to run — and permanently if
+the install ultimately fails.
+
+That is a stretch of the flag's upstream meaning, where a switch driver's
+accept is synchronous with its hardware, and it is taken deliberately over the
+alternatives. Leaving `-EOPNOTSUPP` as the answer, as the port-VLAN observer
+does, would keep the flag honest but give an operator no standard-tool signal
+at all. Setting it from the work item is not available: the deferred operation
+has already called `obj->complete()` and returned by then, and MDB has no late
+notification of the kind `SWITCHDEV_FDB_OFFLOADED` gives the FDB.
+
+What makes the stretch tolerable is that it is not the surface anything
+important reads. `/proc/cdx_flowtable` says what is actually installed, and it
+is where a disagreement shows up. The two are worth reading together, and the
+end-to-end tests assert both for that reason.
 
 ### 6. The traffic half of the learner
 
