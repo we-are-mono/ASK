@@ -1359,7 +1359,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	int i, vlans;
 
 	if (!rule)
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	used = rule->match.dissector->used_keys;
 	/* An ingress tag adds no selector here. nf_flow_rule_match() registers
 	 * the VLAN and CVLAN dissector offsets and fills their values, but
@@ -1372,10 +1372,10 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	else if (used == keys6 || used == (keys6 | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)))
 		family = AF_INET6;
 	else
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	keys = family == AF_INET6 ? keys6 : keys4;
 	if (!cls->nf_ct)
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	/* Sampled once: the admission test below and the class derived further
 	 * down have to describe the same mark, or a concurrent change could
 	 * install a class taken from a value that would not have been admitted. */
@@ -1393,7 +1393,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	     * configured that is every mark, exactly as before. */
 	    (mark & ~ft_qos_mark_mask) ||
 	    cls->common.chain_index || cls->common.protocol != ETH_P_ALL)
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	flow_rule_match_meta(rule, &meta);
 	flow_rule_match_control(rule, &control);
 	flow_rule_match_basic(rule, &basic);
@@ -1410,24 +1410,24 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    nf_ct_l3num(cls->nf_ct) != family ||
 	    ports.mask->src != htons(0xffff) || ports.mask->dst != htons(0xffff) ||
 	    !ports.key->src || !ports.key->dst)
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	memset(out, 0, sizeof(*out));
 	out->family = family;
 	if (family == AF_INET6) {
 		flow_rule_match_ipv6_addrs(rule, &ipv6);
 		if (!ft_exact6(&ipv6.mask->src) || !ft_exact6(&ipv6.mask->dst))
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		out->src.in6 = ipv6.key->src;
 		out->dst.in6 = ipv6.key->dst;
 	} else {
 		flow_rule_match_ipv4_addrs(rule, &ipv4);
 		if (ipv4.mask->src != htonl(0xffffffff) || ipv4.mask->dst != htonl(0xffffffff))
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		out->src.ip = ipv4.key->src;
 		out->dst.ip = ipv4.key->dst;
 	}
 	if (!ft_endpoint(family, &out->src) || !ft_endpoint(family, &out->dst))
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	out->sport = ports.key->src;
 	out->dport = ports.key->dst;
 	out->proto = basic.key->ip_proto;
@@ -1436,11 +1436,23 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * encapsulation they imply decides where every later action sits; from
 	 * there the exact count ft_translation requires bounds each index. */
 	if (rule->action.num_entries < 5)
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	action = &rule->action.entries[rule->action.num_entries - 1];
-	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_port_supported(action->dev) ||
-	    !cdx_ft_port_supported(binding->dev) || !cls->nf_dst || !cls->nf_dst_reverse)
-		return -EOPNOTSUPP;
+	if (action->id != FLOW_ACTION_REDIRECT || !cdx_ft_egress_supported(action->dev) ||
+	    !cdx_ft_port_supported(binding->dev) || !cls->nf_dst || !cls->nf_dst_reverse) {
+		/* The one gate worth naming its operands rather than just its
+		 * line: six conditions, and which failed is the whole
+		 * question. */
+		ask_dbg(ASK_DBG_DEVICE,
+			"gate redirect=%d out=%s egress_ok=%d in=%s in_ok=%d dst=%d rdst=%d\n",
+			action->id == FLOW_ACTION_REDIRECT,
+			action->dev ? netdev_name(action->dev) : "(null)",
+			action->dev ? cdx_ft_egress_supported(action->dev) : -1,
+			binding->dev ? netdev_name(binding->dev) : "(null)",
+			binding->dev ? cdx_ft_port_supported(binding->dev) : -1,
+			!!cls->nf_dst, !!cls->nf_dst_reverse);
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	out->in = binding->dev;
 	out->out = action->dev;
 	/* This direction's destination names the device it leaves by; the
@@ -1480,7 +1492,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * device below it, which is the one that does have one. */
 	if (!out->out_session.present &&
 	    !ether_addr_equal(out->out_logical->dev_addr, out->out->dev_addr))
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	/* Re-entering the port a frame arrived on is a hairpin, and needs full
 	 * NAT to be a distinct path -- unless the two stacks differ, which is
 	 * ordinary routing between VLANs carried on one trunk, or the two
@@ -1489,9 +1501,9 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    !memcmp(out->out_vlan, out->in_vlan, sizeof(out->out_vlan)) &&
 	    out->out_session.present == out->in_session.present &&
 	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK)
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	if (!ft_translation(cls, out))
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	/* Each direction is admitted as its own rule, so this is already a
 	 * per-direction class even though both directions read one mark. The
 	 * channel nibble is normally zero, which resolves to whichever channel
@@ -1500,25 +1512,25 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * express declines the flow to software rather than guessing a queue. */
 	out->qos = ft_qos_class(mark);
 	if (!ft_qos_class_valid(out->qos))
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	switch (basic.key->ip_proto) {
 	case IPPROTO_TCP:
 		if (used != (keys | BIT_ULL(FLOW_DISSECTOR_KEY_TCP)) ||
 		    !nf_conntrack_tcp_established(cls->nf_ct))
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		flow_rule_match_tcp(rule, &tcp);
 		/* cdx_sp.xml punts SYN/FIN/RST before TCP hash lookup. Accept
 		 * precisely Netfilter's FIN/RST exclusion; never discard an
 		 * additional selector which that parser cannot enforce. */
 		if (tcp.key->flags || tcp.mask->flags != htons(TCPHDR_FIN | TCPHDR_RST))
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		break;
 	case IPPROTO_UDP:
 		if (used != keys)
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		break;
 	default:
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	}
 	/* Bounded by the tag count the devices produced, which is the only
 	 * thing that makes these reads meaningful: the keys are never in
@@ -1528,14 +1540,14 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * living there carries an all-ones ingress mask, which fails the
 	 * priority and DEI test below rather than being read as a tag. */
 	if (!ft_vlan_match(rule, out))
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	for (i = 0; i < 4; i++) {
 		action = &rule->action.entries[i];
 		if (action->id != FLOW_ACTION_MANGLE ||
 		    action->mangle.htype != FLOW_ACT_MANGLE_HDR_TYPE_ETH ||
 		    action->mangle.offset != offsets[i] || action->mangle.mask != masks[i] ||
 		    (action->mangle.val & masks[i]))
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		memcpy(&word, ethernet + offsets[i], sizeof(word));
 		word = (word & masks[i]) | action->mangle.val;
 		memcpy(ethernet + offsets[i], &word, sizeof(word));
@@ -1549,7 +1561,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    !ft_ipsec_handle(cls, out, out->out_logical, out->in_logical) ||
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
 	if (out->out_session.present) {
 		/* A ppp device resolves no Ethernet destination and Netfilter
 		 * writes none: flow_offload_eth_dst() reads the NOARP neighbour
@@ -1561,16 +1573,16 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		 * future kernel that starts writing something here from being
 		 * silently overridden. */
 		if (!is_zero_ether_addr(ethernet))
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, out->out_session.mac);
 	} else {
 		if (!is_valid_ether_addr(ethernet) ||
 		    !ft_neigh_check(family, out->out_logical, next_hop, ethernet))
-			return -EOPNOTSUPP;
+			return ask_refuse(-EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, ethernet);
 	}
 	if (!ether_addr_equal(ethernet + ETH_ALEN, out->out->dev_addr))
-		return -ESTALE;
+		return ask_refuse(-ESTALE);
 	out->mtu = cls->nf_mtu;
 	ether_addr_copy(out->src_mac, ethernet + ETH_ALEN);
 	/* Last, because a tc police filter is matched against the finished
@@ -1620,7 +1632,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	/* A delayed request must never replace a different flow generation
 	 * merely because its opaque directional cookie has the same value. */
 	if (entry && entry->handle != cls->nf_handle)
-		return -ESTALE;
+		return ask_refuse(-ESTALE);
 	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
 		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
 	rc = ft_parse(binding, cls, &rule, &next_hop);
@@ -1629,9 +1641,17 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	if (!rc)
 		ft_validated++;
 	if (rc || cdx_ft_observing() || atomic_read(&ft_invalid) || ft_stopping || cdx_ft_failed()) {
+		/* Four latches and a parse result behind one return. A flow
+		 * that parsed cleanly and dies here died for a reason that has
+		 * nothing to do with the flow, which is worth distinguishing
+		 * from one the decoder refused. */
+		ask_dbg(ASK_DBG_DEVICE,
+			"replace parse=%d observe=%d invalid=%d stopping=%d failed=%d\n",
+			rc, cdx_ft_observing(), atomic_read(&ft_invalid),
+			ft_stopping, cdx_ft_failed());
 		if (entry)
 			ft_remove(entry);
-		return rc ? rc : -EOPNOTSUPP;
+		return ask_refuse(rc ? rc : -EOPNOTSUPP);
 	}
 	if (entry) {
 		if (nf_inet_addr_cmp(&entry->next_hop, &next_hop) &&
@@ -1639,18 +1659,18 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 			return 0;
 		rc = ft_remove(entry);
 		if (rc)
-			return rc;
+			return ask_refuse(rc);
 	}
 	hash_for_each_possible(ft_keys, other, key_node, ft_key_hash(&rule))
 		if (ft_same_key(&other->rule, &rule))
-			return -EEXIST;
+			return ask_refuse(-EEXIST);
 	if (ft_count >= CDX_FT_MAX_ENTRIES)
-		return -ENOSPC;
+		return ask_refuse(-ENOSPC);
 	if (ft_fault(1))
-		return -ENOMEM;
+		return ask_refuse(-ENOMEM);
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
-		return -ENOMEM;
+		return ask_refuse(-ENOMEM);
 	/* ft_neigh_detach() unlinks by emptiness, because an entry can reach
 	 * the watch list holding no neighbour, and a kzalloc'd list head is
 	 * not an empty one. */
@@ -1682,7 +1702,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 		ft_handle_refs--;
 		ft_devices_put(&rule);
 		kfree(entry);
-		return rc;
+		return ask_refuse(rc);
 	}
 	list_add_tail(&entry->list, &ft_entries);
 	hash_add(ft_cookies, &entry->cookie_node,

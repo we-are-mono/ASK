@@ -8,6 +8,7 @@
 #include "cdx.h"
 #include "control_ipv4.h"
 #include "fm_ehash.h"
+#include "cdx_flowtable_backend.h"
 #include "cdx_flowtable_hw.h"
 #include "cdx_police.h"
 
@@ -55,6 +56,26 @@ static void ft_encap(const struct cdx_ft_vlan *stack, u8 count,
 	*num = count;
 }
 
+/* What this path will encode an egress to, which is the same set
+ * cdx_ft_egress_supported() admits: an ethernet port, or a Wi-Fi VAP.
+ *
+ * Stated again here rather than delegated, because the two ask different
+ * questions of different things. Admission resolves a netdev and asks whether
+ * it may be used; this holds the onif already and asks what it is. The ingress
+ * beside it stays ethernet-only, so a single shared predicate would have to be
+ * told which side it was being asked about.
+ *
+ * A VAP egress needs nothing else from here: the shared encoder's
+ * dpa_get_tx_fqid_devinfo_by_iface() already has a WLAN arm that resolves the
+ * VAP's forwarding frame queue and the Wi-Fi offline port, so what this builds
+ * is an ordinary entry with its enqueue target pointed elsewhere.
+ */
+static bool ft_hw_egress_onif(U8 type)
+{
+	return type == (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
+	       type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL);
+}
+
 int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		  const struct cdx_ft_stats_binding *stats,
 		  struct cdx_ft_hw **result)
@@ -69,20 +90,35 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	*result = NULL;
 	if ((rule->proto != IPPROTO_TCP && rule->proto != IPPROTO_UDP) ||
 	    (rule->family != AF_INET && rule->family != AF_INET6))
-		return -EOPNOTSUPP;
+		return ask_refuse(-EOPNOTSUPP);
+	/* The last gate before hardware, and the one whose silence is most
+	 * expensive: a direction that reaches here has already satisfied
+	 * admission, so a refusal means the two disagree, and the operands are
+	 * what say how. */
 	in_iface = dpa_get_ifinfo_by_netdev(rule->in);
 	out_iface = dpa_get_ifinfo_by_netdev(rule->out);
 	if (!in_iface || !out_iface || in_iface->itf_id >= L2_MAX_ONIF ||
-	    out_iface->itf_id >= L2_MAX_ONIF)
-		return -EOPNOTSUPP;
+	    out_iface->itf_id >= L2_MAX_ONIF) {
+		ask_dbg(ASK_DBG_DEVICE, "hw iface in=%s(%s) out=%s(%s)\n",
+			netdev_name(rule->in), in_iface ? "found" : "unresolved",
+			netdev_name(rule->out), out_iface ? "found" : "unresolved");
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	in = get_onif_by_index(in_iface->itf_id);
 	out = get_onif_by_index(out_iface->itf_id);
 	if (!(in->flags & ENTRY_VALID) || !(out->flags & ENTRY_VALID) ||
 	    !in->itf || !out->itf ||
 	    in->itf->index != in_iface->itf_id || out->itf->index != out_iface->itf_id ||
 	    in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) ||
-	    out->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
-		return -EOPNOTSUPP;
+	    !ft_hw_egress_onif(out->itf->type)) {
+		ask_dbg(ASK_DBG_DEVICE,
+			"hw onif in=%s type=0x%x valid=%d out=%s type=0x%x valid=%d\n",
+			netdev_name(rule->in), in->itf ? in->itf->type : 0,
+			!!(in->flags & ENTRY_VALID),
+			netdev_name(rule->out), out->itf ? out->itf->type : 0,
+			!!(out->flags & ENTRY_VALID));
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	/* Nothing to synchronize before encoding any more. This used to copy
 	 * the admission-validated source MAC into the interface record,
 	 * because the encoder read its Ethernet source from a cache that was

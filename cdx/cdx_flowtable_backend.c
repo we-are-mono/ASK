@@ -10,6 +10,7 @@
 #include "cdx_flowtable_backend.h"
 #include "cdx_flowtable_hw.h"
 #include "devman.h"
+#include "dpa_wifi.h"
 
 static char *offload_owner = "cmm";
 module_param(offload_owner, charp, 0444);
@@ -18,6 +19,15 @@ MODULE_PARM_DESC(offload_owner, "Hardware flow owner: cmm (default) or flowtable
 static bool ft_observe;
 module_param_named(flowtable_observe, ft_observe, bool, 0444);
 MODULE_PARM_DESC(flowtable_observe, "Validate requests but decline hardware installation");
+
+/* ASK-DEBUG. Lives here rather than in the adapter because both modules make
+ * admission decisions and one knob should govern both; the adapter reaches it
+ * through the exported symbol. Writable at runtime (0644) on purpose -- the
+ * question it answers usually arrives after the interesting boot. */
+unsigned int cdx_ft_debug_mask;
+EXPORT_SYMBOL_NS_GPL(cdx_ft_debug_mask, ASK_CDX_FLOWTABLE);
+module_param_named(ask_debug, cdx_ft_debug_mask, uint, 0644);
+MODULE_PARM_DESC(ask_debug, "ASK-DEBUG admission tracing: 1=refusals 2=accepts 4=devices");
 
 /* These belong to CDX, not the adapter. Detach/reclaim must neither change the
  * selected owner nor forget an unproven hardware deletion. Configuration stays
@@ -174,7 +184,16 @@ static bool cdx_ft_switch_port(struct net_device *dev)
 	return dev_get_port_parent_id(dev, &ppid, false) != -EOPNOTSUPP;
 }
 
-bool cdx_ft_port_supported(struct net_device *dev)
+/* Everything both predicates below require, which is every check that is
+ * about the device rather than about what it is made of: the right namespace,
+ * an Ethernet header, registered, running with carrier, not a VRF slave, not a
+ * switch ASIC port, and a valid onif whose type the caller then judges.
+ *
+ * Returns the onif type on success and zero on any refusal. Zero is not a
+ * legal type -- every onif carries at least one IF_TYPE bit -- so it is
+ * unambiguous as a failure value.
+ */
+static U8 cdx_ft_onif_type(struct net_device *dev)
 {
 	POnifDesc onif;
 	struct dpa_iface_info *iface;
@@ -190,18 +209,55 @@ bool cdx_ft_port_supported(struct net_device *dev)
 	    dev->reg_state != NETREG_REGISTERED ||
 	    netif_is_l3_slave(dev) || cdx_ft_switch_port(dev) ||
 	    !netif_running(dev) || !netif_carrier_ok(dev))
-		return false;
+		return 0;
 	iface = dpa_get_ifinfo_by_netdev(dev);
 	if (!iface || iface->itf_id >= L2_MAX_ONIF)
-		return false;
+		return 0;
 	onif = get_onif_by_index(iface->itf_id);
 	if (!(onif->flags & ENTRY_VALID) || !onif->itf ||
-	    onif->itf->index != iface->itf_id ||
-	    onif->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
-		return false;
-	return true;
+	    onif->itf->index != iface->itf_id)
+		return 0;
+	return onif->itf->type;
+}
+
+bool cdx_ft_port_supported(struct net_device *dev)
+{
+	return cdx_ft_onif_type(dev) == (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_port_supported, ASK_CDX_FLOWTABLE);
+
+/* What a finished frame may be handed to, which is a strictly wider set than
+ * what may originate one.
+ *
+ * A VAP is an egress and only an egress. The encoder already resolves one --
+ * dpa_get_out_tx_info_by_itf_id() has a WLAN arm that turns the onif into the
+ * VAP's forwarding frame queue -- so an entry leaving through a VAP is an
+ * ordinary entry with its enqueue target pointed elsewhere, and needs nothing
+ * else from this side.
+ *
+ * The reverse is not true and is not granted here. A VAP's own ingress cannot
+ * be hooked at all: an offloaded flowtable refuses to bind a device whose
+ * driver supports no offload, which `moal` does not, so a flow arriving from
+ * Wi-Fi never reaches this contract in the first place and stays on the
+ * software path. Keeping the two predicates separate is what states that in
+ * code rather than in a comment.
+ *
+ * Open, not merely configured: the frame queues an entry would name are built
+ * during the transition to open.
+ */
+bool cdx_ft_egress_supported(struct net_device *dev)
+{
+	U8 type = cdx_ft_onif_type(dev);
+
+	if (type == (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL))
+		return true;
+	ask_dbg(ASK_DBG_DEVICE, "egress %s onif_type=0x%x vap_open=%d\n",
+		dev ? netdev_name(dev) : "(null)", type,
+		dev ? dpaa_vwd_vap_is_open(dev) : -1);
+	return type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL) &&
+	       dpaa_vwd_vap_is_open(dev);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_egress_supported, ASK_CDX_FLOWTABLE);
 
 int cdx_ft_add(const struct cdx_ft_rule *rule,
 	       const struct cdx_ft_stats_binding *stats,
@@ -215,9 +271,19 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 	/* The adapter validates tuple/NAT eligibility, including same-port
 	 * hairpin routing. The provider rechecks physical device state. */
 	if (!ft_claimed || ft_failed || ft_observe || cdx_ft_pending() ||
-	    !cdx_ft_port_supported(rule->in) || !cdx_ft_port_supported(rule->out) ||
-	    !ether_addr_equal(rule->src_mac, rule->out->dev_addr))
-		return -EOPNOTSUPP;
+	    !cdx_ft_port_supported(rule->in) || !cdx_ft_egress_supported(rule->out) ||
+	    !ether_addr_equal(rule->src_mac, rule->out->dev_addr)) {
+		/* Eight clauses and one return: without the operands a refusal
+		 * here says only that CDX declined, which is the least useful
+		 * true thing it could say. */
+		ask_dbg(ASK_DBG_DEVICE,
+			"add claimed=%d failed=%d observe=%d pending=%u in=%s(%d) out=%s(%d) srcmac=%d\n",
+			ft_claimed, ft_failed, ft_observe, cdx_ft_pending(),
+			netdev_name(rule->in), cdx_ft_port_supported(rule->in),
+			netdev_name(rule->out), cdx_ft_egress_supported(rule->out),
+			ether_addr_equal(rule->src_mac, rule->out->dev_addr));
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	rc = cdx_ft_hw_add(rule, stats, result);
 	if (!rc)
 		ft_live++;

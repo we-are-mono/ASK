@@ -120,6 +120,11 @@ struct pppoe_iface_info {
 };
 
 struct wlan_iface_info {
+	/* The device this VAP rides, so a netdev can be resolved back to its
+	 * iface the way an ethernet port can. Borrowed, never dereferenced --
+	 * only compared -- and cleared when the VAP is retired, which is what
+	 * the ethernet arm's own net_dev does. */
+	struct net_device *net_dev;
 	uint16_t vap_id;
 	uint8_t is_bridged;		/* Flag to check if interface is bridged or not */
 	uint8_t pad;			/* not used */

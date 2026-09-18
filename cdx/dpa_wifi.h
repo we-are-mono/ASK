@@ -139,6 +139,7 @@ struct vwd_global_stats_s {
 
 int dpaa_vwd_vap_cmd(struct vap_cmd_s *cmd);
 bool dpaa_vwd_ready(void);
+bool dpaa_vwd_vap_is_open(const struct net_device *dev);
 
 int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash);
 int dpaa_get_wifi_dev(uint16_t vap_id, void** netdev);

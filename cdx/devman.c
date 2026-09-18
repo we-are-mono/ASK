@@ -446,10 +446,17 @@ struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev)
 	struct dpa_iface_info *iface;
 
 	lockdep_assert_held(&cdx_info->ctrl.mutex);
-	for (iface = dpa_interface_info; iface; iface = iface->next)
+	/* Both arms that carry a device, because both can be named as a flow's
+	 * egress. The union means the field has to be chosen by if_flags
+	 * rather than read blindly. */
+	for (iface = dpa_interface_info; iface; iface = iface->next) {
 		if ((iface->if_flags & IF_TYPE_ETHERNET) &&
 		    iface->eth_info.net_dev == dev)
 			return iface;
+		if ((iface->if_flags & IF_TYPE_WLAN) &&
+		    iface->wlan_info.net_dev == dev)
+			return iface;
+	}
 	return NULL;
 }
 
@@ -2313,6 +2320,10 @@ static int get_wlan_iface_info(struct dpa_iface_info *iface_info)
 		return FAILURE;
 	}
 	iface_info->mtu = device->mtu;
+	/* Borrowed, exactly as the ethernet arm borrows its own: compared to
+	 * resolve a netdev back to this iface, never dereferenced, and gone
+	 * when the VAP is retired. */
+	iface_info->wlan_info.net_dev = device;
 	dev_put(device);
 
 	dpaa_get_wifi_ohport_handle(&ohport_handle);

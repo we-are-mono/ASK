@@ -16,10 +16,18 @@ case "$1" in
         [ -r "$CONF" ] || exit 0
         owner=cmm
         observe=0
+        # ASK-DEBUG defaults on here and nowhere else. This is the development
+        # image: the question "why was that flow not offloaded" is the one it
+        # exists to answer, and a refusal is otherwise a single counter
+        # standing for two dozen conditions. 1 = refusals only; accepts (2) and
+        # device decisions (4) print per flow and are left to be asked for.
+        # Product images take the driver default, which is off.
+        askdebug=1
         for arg in $(cat /proc/cmdline); do
             case "$arg" in
                 ask.offload=*) owner=${arg#ask.offload=} ;;
                 ask.flowtable_observe=*) observe=${arg#ask.flowtable_observe=} ;;
+                ask.debug=*) askdebug=${arg#ask.debug=} ;;
             esac
         done
         case "$owner:$observe" in
@@ -29,7 +37,8 @@ case "$1" in
         while read -r mod; do
             case "$mod" in ''|'#'*) continue ;; esac
             if [ "$mod" = cdx ]; then
-                modprobe cdx offload_owner="$owner" flowtable_observe="$observe" || exit 1
+                modprobe cdx offload_owner="$owner" flowtable_observe="$observe" \
+                        ask_debug="$askdebug" || exit 1
                 if [ "$owner" = flowtable ]; then
                     modprobe ask_flowtable || exit 1
                 fi

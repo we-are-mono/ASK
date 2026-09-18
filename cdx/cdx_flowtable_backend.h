@@ -287,6 +287,59 @@ unsigned int cdx_ft_pending(void);
 int cdx_ft_admission_begin(void);
 void cdx_ft_admission_end(void);
 bool cdx_ft_port_supported(struct net_device *dev);
+
+/* What a finished frame may be handed to: every device the above admits, plus
+ * an open Wi-Fi VAP. Wider than cdx_ft_port_supported() and deliberately not a
+ * replacement for it -- a VAP may receive a frame and may not originate one,
+ * because its ingress cannot be hooked by an offloaded flowtable at all. */
+bool cdx_ft_egress_supported(struct net_device *dev);
+
+/* ASK-DEBUG: why a flow was accepted or refused.
+ *
+ * A refusal is otherwise a single counter standing for two dozen distinct
+ * conditions, which is enough to know that offload is not happening and not
+ * enough to know why. Finding out has meant adding temporary printks, building,
+ * and rebooting the board -- once per question.
+ *
+ * Off by default, because this prints per flow and a busy gateway admits a lot
+ * of them. Off costs one test of a variable that is almost always cold, which
+ * is why the refusal sites can carry it unconditionally. Turn it on at runtime,
+ * without rebuilding or rebooting:
+ *
+ *   echo 1 > /sys/module/cdx/parameters/ask_debug
+ *
+ * The mask is deliberately not a single bool: the accept trace is useful on a
+ * quiet bench and ruinous under load, and the two are wanted separately.
+ *
+ * meta-ask turns refusal tracing on at boot. It is the development image, and
+ * the question it exists to answer is exactly this one. Product images keep
+ * the default.
+ */
+#define ASK_DBG_REFUSE	0x1	/* every refusal, with the site that made it */
+#define ASK_DBG_ACCEPT	0x2	/* every accepted flow */
+#define ASK_DBG_DEVICE	0x4	/* device eligibility, per decision */
+
+extern unsigned int cdx_ft_debug_mask;
+
+#define ask_dbg(bit, fmt, ...)						\
+	do {								\
+		if (unlikely(cdx_ft_debug_mask & (bit)))			\
+			pr_info("ASK-DEBUG: " fmt, ##__VA_ARGS__);	\
+	} while (0)
+
+/* Wraps a refusal so that it names itself. Function and line rather than a
+ * hand-written reason per site: there are two dozen of them, a string at each
+ * would be one more thing to keep true, and the line is what a reader needs to
+ * find the condition anyway. Evaluates its argument once and yields it, so it
+ * substitutes directly into `return ask_refuse(-EOPNOTSUPP);`. */
+#define ask_refuse(err)							\
+	({								\
+		int __ask_err = (err);					\
+		ask_dbg(ASK_DBG_REFUSE, "%s:%d refused (%d)\n",		\
+			__func__, __LINE__, __ask_err);			\
+		__ask_err;						\
+	})
+
 /* stats names the slots this direction counts into and is never NULL; a
  * direction with no session, or whose session has no slot, passes one holding
  * NULLs. It is separate from the rule because it is a resource the adapter

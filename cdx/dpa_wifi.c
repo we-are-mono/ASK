@@ -2504,6 +2504,34 @@ bool dpaa_vwd_ready(void)
 	return !READ_ONCE(vwd_stopping);
 }
 
+/* Whether this device is a VAP the classifier may enqueue to right now.
+ *
+ * VAP_ST_OPEN and nothing weaker. A slot that is merely configured has no
+ * frame queues yet -- they are built during the transition to open -- so an
+ * entry naming one would enqueue into nothing, and a slot mid-transition is
+ * refused rather than queued for the same reason. The state is read under
+ * vaplock because that is what the transition holds.
+ */
+bool dpaa_vwd_vap_is_open(const struct net_device *dev)
+{
+	struct dpaa_vwd_priv_s *priv = &vwd;
+	bool open = false;
+	int ii;
+
+	if (!dev || READ_ONCE(vwd_stopping))
+		return false;
+	spin_lock_bh(&priv->vaplock);
+	for (ii = 0; ii < MAX_WIFI_VAPS; ii++) {
+		if (priv->vaps[ii].state == VAP_ST_OPEN &&
+		    priv->vaps[ii].wifi_dev == dev) {
+			open = true;
+			break;
+		}
+	}
+	spin_unlock_bh(&priv->vaplock);
+	return open;
+}
+
 static int vwd_init_ohport(struct dpaa_vwd_priv_s *priv)
 {
 	int handle;
