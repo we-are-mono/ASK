@@ -668,6 +668,22 @@ async def ioctl_send(request: web.Request) -> web.Response:
 _EXEC_ARGV0_ALLOWED = {
     "ip", "ethtool", "iptables", "modprobe", "rmmod", "insmod",
     "sysctl", "conntrack", "bridge", "tcpdump", "nft",
+    # Reading the kernel log. Several subsystems say what they did only
+    # there -- VWD logs the classifier hooks appearing and going, and those
+    # hooks have no sysfs or procfs face at all -- so without this the only
+    # way to see a transition is a UART session, which cannot be scripted
+    # alongside the HTTP fixtures the rest of a test uses.
+    "dmesg", "lsmod",
+    # Wi-Fi. A VAP's lifecycle is driven by these and by nothing else on
+    # this image: hostapd owns the AP interface, so it is what has to stop
+    # before the interface can unregister, and `iw` is the only way to
+    # change an interface's type or take one down to a station. Without
+    # them the registration half of the VAP work is testable and the
+    # retirement half is not.
+    "iw", "hostapd", "hostapd_cli", "wpa_supplicant", "wpa_cli",
+    # Stopping the above. argv[0] stays the gate, so this buys the ability
+    # to signal a named process and nothing more.
+    "kill", "killall",
     # Fuzz harness for cmm's RTNL parser; built from cmm/test/ via
     # `make -C cmm fuzzer`, packaged into the test image alongside cmm.
     "cmm_rtnl_fuzzer",
