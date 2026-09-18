@@ -289,7 +289,8 @@ enum switchdev_notifier_type {
     SWITCHDEV_FDB_ADD_TO_DEVICE = 1, SWITCHDEV_FDB_DEL_TO_DEVICE,
     SWITCHDEV_PORT_OBJ_ADD, SWITCHDEV_PORT_OBJ_DEL, SWITCHDEV_PORT_ATTR_SET,
 };
-enum switchdev_obj_id { SWITCHDEV_OBJ_ID_PORT_VLAN = 1, SWITCHDEV_OBJ_ID_PORT_MDB };
+enum switchdev_obj_id { SWITCHDEV_OBJ_ID_PORT_VLAN = 1, SWITCHDEV_OBJ_ID_PORT_MDB,
+                        SWITCHDEV_OBJ_ID_HOST_MDB };
 struct switchdev_notifier_info { struct net_device *dev; void *extack; const void *ctx; };
 struct switchdev_notifier_fdb_info {
     struct switchdev_notifier_info info; /* must be first */
@@ -312,6 +313,20 @@ struct switchdev_notifier_port_attr_info {
     const struct switchdev_attr *attr;
     bool handled;
 };
+/* The multicast learner, which this harness does not compile: it has its own
+ * file, because its state and stubs have nothing to do with a flow's. What
+ * matters here is only that ft_swdev_event() routes an MDB object away from
+ * the VLAN dependency logic and does not fall through into it, so the stub
+ * records the call and claims nothing. */
+static unsigned mc_objects;
+static bool ft_mc_swdev_obj(unsigned long event,
+                            struct switchdev_notifier_port_obj_info *obj)
+{
+    (void)event; (void)obj;
+    mc_objects++;
+    return false;
+}
+static void ft_mc_exit(void) { }
 #define switchdev_notifier_info_to_dev(p) (((struct switchdev_notifier_info *)(p))->dev)
 struct dst_ops { unsigned family; };
 /* Only the field the adapter reads off a transform: what leaves the port is
@@ -1948,10 +1963,25 @@ static void test_bridge_fdb(void)
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
     assert(!atomic_read(&ft_invalid) && !obj.handled);
     obj.info.dev = &out;
-    /* Another object kind on the same chain is somebody else's business. */
+    /* An MDB object goes to the multicast learner and must not reach the VLAN
+     * arm: it is a membership to install rather than a dependency that
+     * changed, so retiring every flow that touches this device for one would
+     * be both wrong and expensive -- a channel change would flush the
+     * unicast table. */
     obj.obj = &mdb_obj;
+    mc_objects = 0;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
+    assert(mc_objects == 1);
     assert(!atomic_read(&ft_invalid) && !obj.handled);
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_DEL, &obj) == NOTIFY_DONE);
+    assert(mc_objects == 2);
+    assert(!atomic_read(&ft_invalid) && !obj.handled);
+    /* A host membership takes the same route. */
+    mdb_obj.id = SWITCHDEV_OBJ_ID_HOST_MDB;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
+    assert(mc_objects == 3);
+    assert(!atomic_read(&ft_invalid) && !obj.handled);
+    mdb_obj.id = SWITCHDEV_OBJ_ID_PORT_MDB;
     obj.obj = &vlan_obj;
 
     /* Whether the bridge filters by VLAN at all, and in which protocol, are

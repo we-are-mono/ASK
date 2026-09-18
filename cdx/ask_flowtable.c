@@ -49,6 +49,7 @@
 #include <net/xfrm.h>
 #include <dpaa_eth_common.h>
 #include "cdx_flowtable_backend.h"
+#include "cdx_mcast_backend.h"
 #include "cdx_flowtable.h"
 #include "cdx_ipsec_backend.h"
 #include "cdx_police.h"
@@ -2394,6 +2395,11 @@ static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *pt
  * which would leave the port filtering that VLAN out. This is an observer,
  * and an observer must leave -EOPNOTSUPP to be the chain's answer.
  */
+/* Defined with the rest of the multicast learner below, because it belongs
+ * with that state rather than with this chain's other cases. */
+static bool ft_mc_swdev_obj(unsigned long event,
+			    struct switchdev_notifier_port_obj_info *obj);
+
 static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	const struct switchdev_notifier_port_attr_info *attr;
@@ -2404,7 +2410,21 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 	case SWITCHDEV_PORT_OBJ_ADD:
 	case SWITCHDEV_PORT_OBJ_DEL:
 		obj = ptr;
-		if (!obj->obj || obj->obj->id != SWITCHDEV_OBJ_ID_PORT_VLAN)
+		if (!obj->obj)
+			return NOTIFY_DONE;
+		/* An MDB object is a membership rather than a dependency: it
+		 * describes something to install, not something to retire, and
+		 * it is answered rather than merely observed. See the
+		 * Multicast section. */
+		if (obj->obj->id == SWITCHDEV_OBJ_ID_PORT_MDB ||
+		    obj->obj->id == SWITCHDEV_OBJ_ID_HOST_MDB) {
+			struct switchdev_notifier_port_obj_info *info = ptr;
+
+			if (ft_mc_swdev_obj(event, info))
+				info->handled = true;
+			return NOTIFY_DONE;
+		}
+		if (obj->obj->id != SWITCHDEV_OBJ_ID_PORT_VLAN)
 			return NOTIFY_DONE;
 		break;
 	case SWITCHDEV_PORT_ATTR_SET:
@@ -2427,6 +2447,398 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 		ft_invalidate();
 	spin_unlock_bh(&ft_watch_lock);
 	return NOTIFY_DONE;
+}
+
+/* ------------------------------------------------------------- Multicast
+ *
+ * The bridge's own IGMP and MLD snooping is the control plane. It maintains
+ * the MDB, reports every port group on the switchdev chain this adapter is
+ * already registered on, and needs nothing installed, configured or packaged
+ * by us -- which is the whole point: a consumer that bridges an ISP's IPTV
+ * VLAN already has the memberships, and what changes is who replicates them.
+ *
+ * What the MDB cannot supply is the rest of a classifier key. CDX matches an
+ * exact (S,G) on an exact ingress port, and an IGMPv2 join produces a (*,G)
+ * with neither a source nor any notion of where the traffic comes from. Both
+ * are properties of the traffic rather than of the membership, so both are
+ * learned from the stream -- see docs/flowtable-multicast.md. This half is the
+ * membership; it records what the bridge says and installs nothing.
+ *
+ * Locking, which is not incidental here. The switchdev handler runs holding
+ * RTNL (switchdev_port_obj_add_deferred() asserts it), and a backend operation
+ * needs the transaction, and cdx_ctrl_lock_with_rtnl() states the rule those
+ * two live under: never wait for either lock while holding the other. So the
+ * handler only ever takes ft_mc_lock, and a work item does the hardware
+ * outside RTNL.
+ *
+ * That leaves one ordering obligation, which every function below keeps:
+ * **ft_mc_lock is never held across cdx_ft_begin()**. /proc reads the group
+ * list from inside the transaction, so a worker that took the transaction
+ * while holding ft_mc_lock would close a cycle with it. The worker therefore
+ * snapshots under the lock, releases it, does the hardware, and re-takes it to
+ * record what happened.
+ */
+
+/* One listener: the bridge port a copy leaves by, and the tags it leaves with.
+ *
+ * The tags are not the port's own -- a physical port in this ownership mode
+ * has no VLAN interface and would describe none. They are what the bridge
+ * would have added on egress for this group's VLAN, which is a tag when the
+ * port is a tagged member of it and nothing when it is untagged.
+ */
+struct ft_mc_port {
+	struct net_device *dev;
+	struct cdx_ft_vlan vlan[CDX_FT_VLAN_MAX];
+	u8 vlans;
+};
+
+/* A group the bridge has told us about.
+ *
+ * Keyed on (bridge, br_ip), which is what the MDB itself is keyed on: the
+ * group address, the VLAN, the address family, and -- for a source-specific
+ * membership -- the source. Two bridges carrying the same group are two
+ * groups here, because they resolve to different ports.
+ */
+struct ft_mc_group {
+	struct list_head list;
+	struct net_device *bridge;
+	struct br_ip addr;
+	struct ft_mc_port port[CDX_MC_MAX_LISTENERS];
+	u8 ports;
+	/* The bridge itself has joined, so the host needs a copy. A hardware
+	 * entry replicates to ports and the frame never reaches the CPU, so
+	 * such a group is refused rather than carried: the alternative is
+	 * starving a local listener silently. */
+	bool host;
+	/* The membership changed and the worker has not caught up. */
+	bool dirty;
+	/* Supplied by the traffic half: the source and the port its frames
+	 * arrive on. Until both are known the group is a permission rather
+	 * than something installable.
+	 *
+	 * One pair, and the contract says a group with several simultaneous
+	 * sources wants an entry each. Widening this to a set belongs with the
+	 * traffic learner that would populate it, not here -- an IPTV channel
+	 * has one source, and a structure for a shape nobody has produced yet
+	 * would be guessing at its own requirements.
+	 */
+	struct net_device *in;
+	union nf_inet_addr src;
+	struct cdx_mc_group *hw;
+};
+
+static LIST_HEAD(ft_mc_groups);
+static DEFINE_MUTEX(ft_mc_lock);
+static unsigned int ft_mc_count, ft_mc_installed;
+static u64 ft_mc_refused, ft_mc_install_errors;
+static void ft_mc_work_fn(struct work_struct *work);
+static DECLARE_WORK(ft_mc_work, ft_mc_work_fn);
+/* Set once the adapter is tearing down, so a queued worker that runs during
+ * exit does nothing rather than reaching a backend that is going away. */
+static bool ft_mc_stopping;
+
+static bool ft_mc_same_group(const struct ft_mc_group *g,
+			     const struct net_device *bridge,
+			     const struct br_ip *addr)
+{
+	return g->bridge == bridge && !memcmp(&g->addr, addr, sizeof(*addr));
+}
+
+static struct ft_mc_group *ft_mc_find(const struct net_device *bridge,
+				      const struct br_ip *addr)
+{
+	struct ft_mc_group *g;
+
+	list_for_each_entry(g, &ft_mc_groups, list)
+		if (ft_mc_same_group(g, bridge, addr))
+			return g;
+	return NULL;
+}
+
+/* Whether this port could carry a replica, asked the only way a caller holding
+ * RTNL may ask it.
+ *
+ * Deliberately not cdx_mc_port_supported(), which resolves an onif and so
+ * needs the transaction. dpa_netdev_is_physical() exists for exactly this
+ * position -- the tree describes it as a notifier-safe identity check that
+ * never takes the control mutex while the caller owns RTNL. The authoritative
+ * test runs in the worker; this one decides what the adapter tells the bridge.
+ */
+static bool ft_mc_port_eligible(struct net_device *dev)
+{
+	return cdx_mc_port_identity(dev);
+}
+
+/* The tags this group's copies leave `port` with.
+ *
+ * ft_bridge_vlan() asks the same question from the other end -- it walks a
+ * flow's path down to a port and works out what the bridge added along the
+ * way. Here the VLAN is already known, because the MDB entry names it, so
+ * only the port's membership is in question.
+ */
+static int ft_mc_port_tags(struct net_device *bridge, struct net_device *port,
+			   u16 vid, struct cdx_ft_vlan *stack, u8 *count)
+{
+	struct bridge_vlan_info vinfo;
+	u16 proto;
+
+	*count = 0;
+	if (!br_vlan_enabled(bridge))
+		return 0;
+	/* Only 802.1Q, for the reason ft_bridge_vlan() gives: the kernel
+	 * describes no selector for an 802.1ad tag, so it is one the hardware
+	 * would be asked to reproduce blind. */
+	if (br_vlan_get_proto(bridge, &proto) || proto != ETH_P_8021Q)
+		return -EOPNOTSUPP;
+	if (!vid)
+		return -EOPNOTSUPP;
+	/* A port that is not a member of the group's VLAN would not receive
+	 * this group in software either. */
+	if (br_vlan_get_info(port, vid, &vinfo))
+		return -EOPNOTSUPP;
+	if (vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED)
+		return 0;
+	stack[0].proto = htons(proto);
+	stack[0].id = vid;
+	*count = 1;
+	return 0;
+}
+
+static void ft_mc_group_free(struct ft_mc_group *g)
+{
+	u8 i;
+
+	for (i = 0; i < g->ports; i++)
+		dev_put(g->port[i].dev);
+	if (g->in)
+		dev_put(g->in);
+	dev_put(g->bridge);
+	kfree(g);
+}
+
+/* Add or remove one port group. Called with ft_mc_lock held and no hardware
+ * touched; the worker is what acts on the result. Returns true when the
+ * adapter is taking responsibility for this membership, which is what the
+ * switchdev answer reports. */
+static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
+			     const struct br_ip *addr, bool adding, bool host)
+{
+	struct ft_mc_group *g;
+	u8 i;
+
+	lockdep_assert_held(&ft_mc_lock);
+	g = ft_mc_find(bridge, addr);
+
+	if (host) {
+		/* A host membership carries no port of its own to add; it says
+		 * the bridge wants a copy, which makes the whole group
+		 * ineligible for as long as it holds. */
+		if (!g && !adding)
+			return false;
+		if (!g)
+			return false;
+		g->host = adding;
+		g->dirty = true;
+		return false;
+	}
+
+	if (!adding) {
+		if (!g)
+			return false;
+		for (i = 0; i < g->ports; i++) {
+			if (g->port[i].dev != port)
+				continue;
+			dev_put(g->port[i].dev);
+			memmove(&g->port[i], &g->port[i + 1],
+				(g->ports - i - 1) * sizeof(g->port[0]));
+			g->ports--;
+			memset(&g->port[g->ports], 0, sizeof(g->port[0]));
+			g->dirty = true;
+			break;
+		}
+		return false;
+	}
+
+	if (!ft_mc_port_eligible(port)) {
+		ft_mc_refused++;
+		return false;
+	}
+	if (!g) {
+		g = kzalloc(sizeof(*g), GFP_KERNEL);
+		if (!g)
+			return false;
+		dev_hold(bridge);
+		g->bridge = bridge;
+		g->addr = *addr;
+		list_add(&g->list, &ft_mc_groups);
+		ft_mc_count++;
+	}
+	for (i = 0; i < g->ports; i++)
+		if (g->port[i].dev == port)
+			return !g->host;	/* already a member */
+	if (g->ports == CDX_MC_MAX_LISTENERS) {
+		/* Capacity is an ordinary outcome: the group stays in software
+		 * and says so through /proc, exactly as an exhausted
+		 * statistics pool does for a PPPoE session. */
+		ft_mc_refused++;
+		return false;
+	}
+	if (ft_mc_port_tags(bridge, port, addr->vid, g->port[g->ports].vlan,
+			    &g->port[g->ports].vlans)) {
+		ft_mc_refused++;
+		return false;
+	}
+	dev_hold(port);
+	g->port[g->ports].dev = port;
+	g->ports++;
+	g->dirty = true;
+	return !g->host;
+}
+
+/* The worker. Runs outside RTNL, so it may take the transaction -- and never
+ * while holding ft_mc_lock, which is the ordering obligation stated above.
+ *
+ * Nothing installs yet: a group needs a source and an ingress port before it
+ * has a key, and supplying those is the traffic half's job. What this does
+ * today is retire groups whose membership went away, which is the half of the
+ * lifecycle the membership alone can decide.
+ */
+static void ft_mc_work_fn(struct work_struct *work)
+{
+	struct ft_mc_group *g, *tmp;
+	LIST_HEAD(dead);
+
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry_safe(g, tmp, &ft_mc_groups, list) {
+		if (!g->dirty)
+			continue;
+		g->dirty = false;
+		if (g->ports)
+			continue;
+		/* No listener left, so nothing to replicate to. */
+		list_move(&g->list, &dead);
+		ft_mc_count--;
+	}
+	mutex_unlock(&ft_mc_lock);
+
+	list_for_each_entry_safe(g, tmp, &dead, list) {
+		if (g->hw) {
+			cdx_ft_begin();
+			if (!ft_mc_stopping)
+				cdx_mc_group_del(&g->hw);
+			cdx_ft_end();
+			ft_mc_installed--;
+		}
+		list_del(&g->list);
+		ft_mc_group_free(g);
+	}
+}
+
+/* The MDB half of the switchdev chain.
+ *
+ * Never blocks, never touches hardware, and answers `handled` for a membership
+ * the adapter has taken on -- which is earlier than having installed it, for
+ * the reason the section header gives. /proc is the surface that says what is
+ * actually in hardware.
+ */
+static bool ft_mc_swdev_obj(unsigned long event,
+			    struct switchdev_notifier_port_obj_info *obj)
+{
+	const struct switchdev_obj_port_mdb *mdb;
+	struct net_device *port, *bridge;
+	bool host, adding, taken;
+
+	if (obj->obj->id != SWITCHDEV_OBJ_ID_PORT_MDB &&
+	    obj->obj->id != SWITCHDEV_OBJ_ID_HOST_MDB)
+		return false;
+	host = obj->obj->id == SWITCHDEV_OBJ_ID_HOST_MDB;
+	adding = event == SWITCHDEV_PORT_OBJ_ADD;
+	mdb = SWITCHDEV_OBJ_PORT_MDB(obj->obj);
+	/* orig_dev is the bridge for a host membership and the port for a port
+	 * group; the bridge is the object's own device in the first case and
+	 * the port's master in the second. */
+	port = obj->info.dev;
+	bridge = host ? obj->obj->orig_dev : netdev_master_upper_dev_get(port);
+	if (!port || !bridge || !netif_is_bridge_master(bridge) ||
+	    !net_eq(dev_net(port), &init_net))
+		return false;
+	/* Patch 160 carries the group the bridge learned; addr[] is the
+	 * multicast MAC it folds into, which 32 groups share and which this
+	 * classifier cannot key on at all. A zero proto means the object came
+	 * from a path that does not populate it. */
+	if (!mdb->group.proto)
+		return false;
+
+	mutex_lock(&ft_mc_lock);
+	taken = ft_mc_stopping ? false :
+		ft_mc_membership(bridge, port, &mdb->group, adding, host);
+	mutex_unlock(&ft_mc_lock);
+	if (!ft_mc_stopping)
+		schedule_work(&ft_mc_work);
+	return taken;
+}
+
+static void ft_mc_exit(void)
+{
+	struct ft_mc_group *g, *tmp;
+
+	mutex_lock(&ft_mc_lock);
+	ft_mc_stopping = true;
+	mutex_unlock(&ft_mc_lock);
+	cancel_work_sync(&ft_mc_work);
+	/* The chain is already unregistered by the caller, so nothing can add
+	 * to this list while it drains. */
+	list_for_each_entry_safe(g, tmp, &ft_mc_groups, list) {
+		if (g->hw) {
+			cdx_ft_begin();
+			cdx_mc_group_del(&g->hw);
+			cdx_ft_end();
+		}
+		list_del(&g->list);
+		ft_mc_group_free(g);
+	}
+	ft_mc_count = 0;
+	ft_mc_installed = 0;
+}
+
+static void ft_mc_rows(struct seq_file *seq)
+{
+	struct ft_mc_group *g;
+	char ports[192];
+	u8 i;
+
+	/* Read outside the transaction the caller holds, which is what the
+	 * ordering rule requires: /proc takes cdx_ft_begin() then this, so the
+	 * worker must never take them the other way round. It does not. */
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		size_t n = 0;
+
+		ports[0] = '\0';
+		for (i = 0; i < g->ports; i++)
+			n += scnprintf(ports + n, sizeof(ports) - n, "%s%s/%u",
+				       i ? "," : "", g->port[i].dev->name,
+				       g->port[i].vlans ? g->port[i].vlan[0].id : 0);
+		if (g->addr.proto == htons(ETH_P_IPV6))
+			seq_printf(seq,
+				   "mcast br=%s family=6 group=%pI6c src=%pI6c vid=%u ports=%s in=%s state=%s\n",
+				   g->bridge->name, &g->addr.dst.ip6,
+				   &g->addr.src.ip6, g->addr.vid,
+				   g->ports ? ports : "-",
+				   g->in ? g->in->name : "-",
+				   g->host ? "refused-host" :
+				   g->hw ? "installed" : "pending");
+		else
+			seq_printf(seq,
+				   "mcast br=%s family=4 group=%pI4 src=%pI4 vid=%u ports=%s in=%s state=%s\n",
+				   g->bridge->name, &g->addr.dst.ip4,
+				   &g->addr.src.ip4, g->addr.vid,
+				   g->ports ? ports : "-",
+				   g->in ? g->in->name : "-",
+				   g->host ? "refused-host" :
+				   g->hw ? "installed" : "pending");
+	}
+	mutex_unlock(&ft_mc_lock);
 }
 
 /* ---------------------------------------------------------------- IPsec
@@ -3112,6 +3524,10 @@ static int ft_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   records, slots);
 	ft_session_rows(seq);
+	seq_printf(seq, "mcast_groups %u\nmcast_installed %u\nmcast_refused %llu\nmcast_install_errors %llu\n",
+		   ft_mc_count, ft_mc_installed, ft_mc_refused,
+		   ft_mc_install_errors);
+	ft_mc_rows(seq);
 	return 0;
 }
 
@@ -3299,6 +3715,10 @@ static void __exit ask_flowtable_exit(void)
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
 	unregister_netdevice_notifier(&ft_netdev_nb);
+	/* After the switchdev chain is gone, so nothing can add a membership
+	 * while the groups drain, and before the module's text does -- the
+	 * worker holds a pointer into it. */
+	ft_mc_exit();
 	/* Unregistration replays nothing, so the ops this module planted on
 	 * each port have to be taken back by hand -- they point into text
 	 * that is about to go away. */

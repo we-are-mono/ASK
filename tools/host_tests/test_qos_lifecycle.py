@@ -19,8 +19,10 @@ def function(source, name):
     # definition. Widen it when a new one is needed.
     match = re.search(r"^(?:static )?(?:int |void |bool |U16 |uint32_t |"
                       r"struct qman_fq \*|struct en_exthash_tbl_entry ?\* ?|"
-                      r"struct net_device ?\* ?|"
+                      r"struct net_device ?\* ?|struct ft_mc_group ?\* ?|"
                       r"enum qman_cb_dqrr_result )"
+                      # __init/__exit sit between the return type and the name.
+                      r"(?:__init |__exit )?"
                       + name + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     start = match.start()
