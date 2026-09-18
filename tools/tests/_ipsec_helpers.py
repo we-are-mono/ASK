@@ -1,37 +1,40 @@
-"""Shared IPsec FCI helpers.
+"""Shared IPsec helpers: SAs installed the way the offload control plane
+installs them.
 
-Wire layouts come from cdx/control_ipsec.h:69-216 and cdx/cdx_cmdhandler.h:208-224.
-Unlike PPPoE's single-step REGISTER, an IPsec SA install requires four FCI
-calls in sequence: CREATE, SET_KEYS, optional SET_NATT or SET_TUNNEL, and
-SET_STATE. The orchestrator at the bottom of this module factors that out.
+The control plane is `xfrmdev_ops`. strongSwan asks for `hw_offload = packet`
+per child SA, the kernel resolves the state and hands it to
+`xdo_dev_state_add()`, and the adapter programs CDX from there. So an SA here
+is an XFRM `NEWSA`, not the five-command FCI sequence the retired daemon used:
+FCI's `CMD_IPSEC_SA_*` reached the same allocator, the same descriptor builder
+and the same classification-entry path, but through a door that goes away with
+CMM.
 
-Sizes (validated against `gcc -c` of the actual struct definitions; ARM64
-and x86_64 produce identical sizes for these layouts):
+Two ways in, and the difference is only how much the caller needs to steer.
 
-  CommandIPSecCreateSA  48 B   (struct definition: control_ipsec.h:96-100)
-  CommandIPSecDeleteSA   4 B   (control_ipsec.h:102-105)
-  CommandIPSecSetKey   144 B   (control_ipsec.h:107-113)
-  CommandIPSecSetNatt    8 B   (control_ipsec.h:115-120)
-  CommandIPSecSetState   8 B   (control_ipsec.h:122-127)
+`ip xfrm state add` through the agent's command channel is the readable one,
+and what a real deployment does. Use it wherever the test is about the SA's
+effect.
 
-The SA query cursor is not covered here. Its tests were removed with the
-IPsec flowtable port: the cursor in cdx/query_ipsec.c exists only to serve
-FCI ACTION_QUERY, and the port's control plane has no query command at all,
-so that coverage had no successor to move to. The SA install path below is
-different — it drives cdx_dpa_ipsec.c, which the port keeps.
+The raw `NEWSA` builders below are the other, and they exist for one reason:
+fault injection needs an armed window covering exactly one send, so the
+message has to be built here rather than by `ip`, whose own startup would
+spend the fail-nth counter long before the SA allocator ran. The wire layout
+is `include/uapi/linux/xfrm.h`, checked with `offsetof` against the kernel
+this image is built from:
 
-Historical notes — both bugs are now fixed, kept so tests don't
-re-learn the wrong lesson:
+  xfrm_selector     56 B
+  xfrm_id           24 B    (daddr 16, spi 4, proto 1, pad)
+  xfrm_usersa_info 224 B    (sel 0, id 56, saddr 80, lft 96, curlft 160,
+                             stats 192, seq 204, reqid 208, family 212,
+                             mode 214, replay_window 215, flags 216)
+  xfrm_algo         68 B + key      (name 64, key_len 4)
+  xfrm_algo_auth    72 B + key      (name 64, key_len 4, trunc_len 4)
+  xfrm_user_offload  8 B            (ifindex 4, flags 1, pad)
+  xfrm_encap_tmpl   24 B            (type 2, sport 2, dport 2, pad, oa 16)
 
-  1. ipsec_push_sa_to_fast_path once DISCARDED the classification-entry
-     return, so an H5 NAT-T SPI bounds-check failure surfaced to
-     user-space as NO_ERR. It now propagates ERR_CREATION_FAILED
-     (control_ipsec.c:663), so reply_rc is a usable oracle for that
-     failure once a test can actually reach the bounds-check site.
-
-  2. SA_SET_KEYS once dereferenced sa before the NULL check, so
-     SET_KEYS for a sagd that doesn't exist panicked. It now checks
-     sa == NULL first (control_ipsec.c) and returns ERR_SA_UNKNOWN.
+`sa_install_probe()` sends one unencumbered NEWSA and reads the state back
+before any sweep begins, so a layout mistake fails loudly at the start rather
+than turning a whole sweep into a no-op.
 """
 
 from __future__ import annotations
@@ -43,425 +46,451 @@ import struct
 from dataclasses import dataclass
 
 
-# ---------------------------------------------------------------- command codes
-CMD_IPSEC_SA_CREATE         = 0x0A01
-CMD_IPSEC_SA_DELETE         = 0x0A02
-CMD_IPSEC_SA_SET_KEYS       = 0x0A04
-CMD_IPSEC_SA_SET_TUNNEL     = 0x0A05
-CMD_IPSEC_SA_SET_NATT       = 0x0A06
-CMD_IPSEC_SA_SET_STATE      = 0x0A07
+# ---------------------------------------------------------------- netlink
+NETLINK_XFRM = 6
 
-# ---------------------------------------------------------------- actions
-ACTION_REGISTER   = 0
-ACTION_DEREGISTER = 1
+XFRM_MSG_NEWSA = 16
+XFRM_MSG_DELSA = 17
 
-# ---------------------------------------------------------------- protocol enums
-PROTO_FAMILY_IPV4 = 2
-PROTO_FAMILY_IPV6 = 10
+NLM_F_REQUEST = 0x01
+NLM_F_ACK     = 0x04
 
-SA_TYPE_ESP = 50
-SA_TYPE_AH  = 51
+NLMSG_ERROR = 2
 
-SA_MODE_TRANSPORT = 0x0
-SA_MODE_TUNNEL    = 0x1
+# Attributes (uapi/linux/xfrm.h). AUTH_TRUNC rather than AUTH because it is
+# what carries the truncation length, and what iproute2 sends for `auth-trunc`.
+XFRMA_ALG_AUTH_TRUNC = 20
+XFRMA_ALG_CRYPT      = 2
+XFRMA_ALG_AEAD       = 18
+XFRMA_ENCAP          = 4
+XFRMA_OFFLOAD_DEV    = 28
 
-NLKEY_SAFLAGS_ESN     = 0x1
-NLKEY_SAFLAGS_INBOUND = 0x2
+# xfrm_user_offload.flags
+XFRM_OFFLOAD_IPV6    = 1
+XFRM_OFFLOAD_INBOUND = 2
+XFRM_OFFLOAD_PACKET  = 4
 
-# SA states (control_ipsec.h:308-312)
-SA_STATE_INIT    = 0x1
-SA_STATE_VALID   = 0x2
-SA_STATE_DEAD    = 0x3
-SA_STATE_EXPIRED = 0x4
-SA_STATE_DYING   = 0x5
+AF_INET = 2
 
-# XFRM_STATE_VALID is the user-space-side state code that triggers fast-path
-# push inside SET_STATE (control_ipsec.c:821 — distinct from SA_STATE_VALID).
-# Cross-reference linux/include/net/xfrm.h: VOID=0, ACQ=1, VALID=2, ERROR=3,
-# EXPIRED=4, DEAD=5. Sending anything other than VALID hits the else-branch
-# at control_ipsec.c:851 which deletes the SA — verified empirically.
-XFRM_STATE_VALID = 2
+XFRM_MODE_TRANSPORT = 0
+XFRM_MODE_TUNNEL    = 1
+
+XFRM_INF = (1 << 64) - 1
+
+UDP_ENCAP_ESPINUDP = 2
+
+IPPROTO_ESP = 50
+
+# The per-flow SPI array a NAT-T classifier entry carries
+# (sdk_fman/inc/Peripherals/fm_ehash.h). Same-flow NAT-T SAs accumulate in it,
+# and the slot after the last one is the H5 bound.
+MAX_SPI_PER_FLOW = 16
 
 # ---------------------------------------------------------------- algorithms
-# AES-CBC + HMAC-SHA2-256 chosen as a non-AEAD pair so cipher and auth key
-# buffers each exercise distinct allocator paths inside
-# cdx_ipsec_sec_sa_context_alloc. AES-GCM (algos 18-20) is also supported
-# but is AEAD — auth_key buffer would be ignored, masking any auth-side
-# allocator regression.
-SADB_X_EALG_AESCBC          = 12   # control_ipsec.h:53
-SADB_X_AALG_SHA2_256HMAC    = 5    # control_ipsec.h:38
-SADB_X_AALG_NULL            = 251  # control_ipsec.h:43
+# AES-CBC + HMAC-SHA2-256 rather than an AEAD, so the cipher and the
+# authenticator each allocate their own key buffer inside
+# cdx_ipsec_sec_sa_context_alloc. An AEAD occupies one slot and would leave
+# any auth-side allocator regression invisible.
+ENC_ALG  = "cbc(aes)"
+AUTH_ALG = "hmac(sha256)"
+AUTH_TRUNC_BITS = 128
 
-# IPsec_key_desc.key_type: 1 = cipher, 0 = auth (control_ipsec.c:627)
-KEY_TYPE_CIPHER = 1
-KEY_TYPE_AUTH   = 0
-
-# Limits
-IPSEC_MAX_KEY_SIZE = 64    # control_ipsec.h:24
-IPSEC_MAX_NUM_KEYS = 2     # control_ipsec.h:25
-MAX_SPI_PER_FLOW   = 16    # sdk_fman/inc/Peripherals/fm_ehash.h:187
-SAGD_BASE          = 0xF000  # synthetic-test sagd range; cmm is passive
-                              # (cmm/src/module_ipsec.c:103,278) so collision
-                              # risk is zero.
-
-# ---------------------------------------------------------------- error codes
-NO_ERR                  = 0
-ERR_UNKNOWN_COMMAND     = 1
-ERR_WRONG_COMMAND_SIZE  = 2
-ERR_NOT_ENOUGH_MEMORY   = 6
-ERR_CREATION_FAILED     = 7
-ERR_SA_DUPLICATED        = 904
-ERR_SA_DUPLICATED_HANDLE = 905
-ERR_SA_UNKNOWN           = 906
-ERR_SA_INVALID_CIPHER_KEY = 907
-ERR_SA_INVALID_DIGEST_KEY = 908
-ERR_SA_ENTRY_NOT_FOUND   = 909
+# Recognisable patterns, so the H2 key-zeroing probe can say whether the
+# cipher key survived kfree_sensitive: sixteen 0xA5 bytes for the cipher,
+# thirty-two 0x5A for the authenticator.
+CIPHER_KEY = b"\xA5" * 16
+AUTH_KEY   = b"\x5A" * 32
 
 # ---------------------------------------------------------------- leak filter
-# Each name verified against cdx/control_ipsec.c + cdx/cdx_dpa_ipsec.c via
-# grep. Anything added by analogy to other subsystems would mask real leaks
-# and gets dropped on first false-positive.
+# Every name checked against cdx/ + the adapter by grep. These are the
+# functions an offloaded SA install actually walks; anything added by analogy
+# would mask a real leak and gets dropped on first false positive.
 IPSEC_LEAK_FILTER = [
-    "M_ipsec_cmdproc",                                  # control_ipsec.c:1140
+    "ft_xdo_state_add",                                 # ask_flowtable.c
+    "ft_ipsec_spec",                                    # ask_flowtable.c
+    "ft_ipsec_watch_add",                               # the SA next-hop watch
+    "cdx_ipsec_sa_add",                                 # cdx_ipsec_backend.c
+    "cdx_ipsec_sa_del",                                 # cdx_ipsec_backend.c
     "M_ipsec_sa_cache_create",                          # SA struct allocator
-    "IPsec_handle_CREATE_SA",                           # control_ipsec.c:460
-    "IPsec_handle_SA_SET_KEYS",                         # control_ipsec.c:600
-    "IPsec_handle_SA_SET_NATT",                         # control_ipsec.c:685
-    "IPsec_handle_SA_SET_STATE",                        # control_ipsec.c:798
-    "ipsec_create_sa_handle",                           # dispatch wrapper
-    "ipsec_set_keys_handle",                            # dispatch wrapper
-    "ipsec_push_sa_to_fast_path",                       # control_ipsec.c:716
-    "cdx_ipsec_sec_sa_context_alloc",                   # cdx_dpa_ipsec.c:429
-    "cdx_ipsec_sec_sa_context_free",                    # cdx_dpa_ipsec.c:240
-    "cdx_ipsec_create_shareddescriptor",                # cdx_dpa_ipsec.c:1938
-    "cdx_ipsec_add_classification_table_entry",         # cdx_dpa_ipsec.c:2397
-    "cdx_ipsec_process_udp_classification_table_entry", # cdx_dpa_ipsec.c:2325
+    "M_ipsec_sa_set_cipher_key",                        # control_ipsec.c
+    "M_ipsec_sa_set_digest_key",                        # control_ipsec.c
+    "ipsec_install_fp_entry",                           # control_ipsec.c
+    "cdx_ipsec_sec_sa_context_alloc",                   # cdx_dpa_ipsec.c
+    "cdx_ipsec_sec_sa_context_free",                    # cdx_dpa_ipsec.c
+    "cdx_ipsec_create_shareddescriptor",                # cdx_dpa_ipsec.c
+    "cdx_ipsec_add_classification_table_entry",         # cdx_dpa_ipsec.c
+    "cdx_ipsec_process_udp_classification_table_entry", # cdx_dpa_ipsec.c
 ]
 
-# Extension for the dma-balance test — kmemleak will surface DMA leaks
-# under these symbol prefixes if the H3 unwind regresses.
-IPSEC_DMA_LEAK_FILTER = IPSEC_LEAK_FILTER + [
-    "dma_alloc_coherent",
-    "dma_map_single",
-    "__dma_alloc_pages",
-]
+# There is deliberately no DMA-specific filter. An earlier one named
+# dma_alloc_coherent, dma_map_single and __dma_alloc_pages, and not one of
+# them could ever match: dma_map_single is a macro and dma_alloc_coherent is
+# static inline, so neither appears in a backtrace, and an unbalanced map is
+# not an allocation kmemleak tracks in the first place. The oracle for a
+# leaked map is KASAN plus the splat window, and saying otherwise made a
+# tripwire out of three names that matched nothing.
+
+# The SEC context is released on a 1-second cdx_timer that reschedules while
+# any frame queue is still retiring, so a freshly deleted SA is not gone the
+# moment the netlink call returns.
+SA_RELEASE_GRACE_S = float(os.environ.get("ASK_IPSEC_KMEMLEAK_GRACE_S", "30.0"))
 
 
-# ---------------------------------------------------------------- payload builders
+# ---------------------------------------------------------------- wire builders
 
-def create_sa(
-    sagd: int,
+def _addr(ip: str | None) -> bytes:
+    """xfrm_address_t: a v4 address in the first four bytes, rest zero."""
+    if not ip:
+        return b"\x00" * 16
+    return socket.inet_aton(ip) + b"\x00" * 12
+
+
+def _selector() -> bytes:
+    """An all-zero xfrm_selector, which is what `ip xfrm state add` sends when
+    no selector is named: the state is selected by policy, not by its own."""
+    return b"\x00" * 56
+
+
+def _algo(name: str, key: bytes) -> bytes:
+    """struct xfrm_algo: alg_name[64], alg_key_len (bits), alg_key[]."""
+    return (name.encode().ljust(64, b"\x00")
+            + struct.pack("<I", len(key) * 8) + key)
+
+
+def _algo_auth(name: str, key: bytes, trunc_bits: int) -> bytes:
+    """struct xfrm_algo_auth: alg_name[64], alg_key_len, alg_trunc_len, key[]."""
+    return (name.encode().ljust(64, b"\x00")
+            + struct.pack("<II", len(key) * 8, trunc_bits) + key)
+
+
+def _nla(attr_type: int, payload: bytes) -> bytes:
+    """One netlink attribute, padded to four bytes. nla_len counts the header
+    but not the padding, which is why the two lengths differ."""
+    header = struct.pack("<HH", 4 + len(payload), attr_type)
+    blob = header + payload
+    return blob + b"\x00" * (-len(blob) % 4)
+
+
+def newsa(
+    *,
+    src: str,
+    dst: str,
     spi: int,
-    dst_ip: int,
-    *,
-    src_ip: int = 0,
-    sa_type: int = SA_TYPE_ESP,
-    family: int = PROTO_FAMILY_IPV4,
-    replay_window: int = 0,
-    flags: int = NLKEY_SAFLAGS_INBOUND,
-    mtu: int = 1500,
-    dev_mtu: int = 1500,
+    reqid: int,
+    ifindex: int,
+    inbound: bool = False,
+    mode: int = XFRM_MODE_TUNNEL,
+    offload: bool = True,
+    cipher_key: bytes = CIPHER_KEY,
+    auth_key: bytes = AUTH_KEY,
+    natt: tuple[int, int] | None = None,
 ) -> bytes:
-    """Build a 48-byte CommandIPSecCreateSA wire payload.
+    """Build an XFRM_MSG_NEWSA body: xfrm_usersa_info then its attributes.
 
-    Layout: sagd(U16) rsvd(U16) + IPSec_said{spi(U32) sa_type(U8)
-    proto_family(U8) replay_window(U8) flags(U8) dst_ip[4](U32)
-    src_ip[4](U32) mtu(U16) dev_mtu(U16)}.
-
-    dst_ip / src_ip are passed as a single u32 (the v4 case populates
-    dst_ip[0]; tests that need v6 should call create_sa_v6 instead — not
-    yet provided since v4 coverage is enough).
+    `offload=False` describes the same SA without XFRMA_OFFLOAD_DEV, which is
+    how a case asks for a software state -- useful as the control that proves
+    an assertion is about the offload rather than about xfrm.
     """
-    return (
-        struct.pack("<HH", sagd & 0xFFFF, 0)
-        + struct.pack("<I", spi & 0xFFFFFFFF)
-        + struct.pack("<BBBB", sa_type, family, replay_window, flags & 0xFF)
-        + struct.pack("<IIII", dst_ip & 0xFFFFFFFF, 0, 0, 0)
-        + struct.pack("<IIII", src_ip & 0xFFFFFFFF, 0, 0, 0)
-        + struct.pack("<HH", mtu, dev_mtu)
+    info = (
+        _selector()                                   # sel
+        # id: the SPI is a __be32, so it goes on the wire in network order
+        # while every length and index beside it is native.
+        + _addr(dst) + struct.pack(">I", spi) + struct.pack("<BBH", IPPROTO_ESP, 0, 0)
+        + _addr(src)                                  # saddr
+        # lft. The byte and packet limits say "unlimited" with XFRM_INF; the
+        # four *time* limits say it with zero, and the difference is not
+        # cosmetic. xfrm_timer_handler() computes
+        #   tmo = hard_add_expires_seconds + curlft.add_time - now
+        # into a signed time64_t, so XFRM_INF there reads as -1, tmo comes out
+        # negative, and the state hard-expires on the first tick. An SA that
+        # quietly vanishes a moment after install still passes a test that
+        # installs and acts at once, which is exactly how long this went
+        # unnoticed. iproute2 sends the same split.
+        + struct.pack("<4Q", *([XFRM_INF] * 4))       # soft/hard byte, packet
+        + struct.pack("<4Q", 0, 0, 0, 0)              # add/use expiry seconds
+        + b"\x00" * 32                                # curlft
+        + b"\x00" * 12                                # stats
+        + struct.pack("<II", 0, reqid)                # seq, reqid
+        + struct.pack("<HBBB", AF_INET, mode, 0, 0)   # family, mode, replay, flags
+        + b"\x00" * 7                                 # tail padding to 224
     )
-
-
-def delete_sa(sagd: int) -> bytes:
-    """Build a 4-byte CommandIPSecDeleteSA payload."""
-    return struct.pack("<HH", sagd & 0xFFFF, 0)
-
-
-def _key_desc(key_alg: int, key_type: int, key: bytes) -> bytes:
-    """One IPSec_key_desc (68 B): key_bits(U16) key_alg(U8) key_type(U8) key[64]."""
-    if len(key) > IPSEC_MAX_KEY_SIZE:
-        raise ValueError(f"key too long: {len(key)} > {IPSEC_MAX_KEY_SIZE}")
-    return (
-        struct.pack("<HBB", len(key) * 8, key_alg, key_type)
-        + key.ljust(IPSEC_MAX_KEY_SIZE, b"\x00")
+    assert len(info) == 224, len(info)
+    attrs = (
+        _nla(XFRMA_ALG_CRYPT, _algo(ENC_ALG, cipher_key))
+        + _nla(XFRMA_ALG_AUTH_TRUNC,
+               _algo_auth(AUTH_ALG, auth_key, AUTH_TRUNC_BITS))
     )
+    if natt is not None:
+        sport, dport = natt
+        attrs += _nla(XFRMA_ENCAP,
+                      struct.pack("<H", UDP_ENCAP_ESPINUDP)
+                      + struct.pack(">HH", sport, dport)   # __be16 pair
+                      + b"\x00" * 2 + _addr(None))
+    if offload:
+        flags = XFRM_OFFLOAD_PACKET | (XFRM_OFFLOAD_INBOUND if inbound else 0)
+        attrs += _nla(XFRMA_OFFLOAD_DEV,
+                      struct.pack("<IBBH", ifindex, flags, 0, 0))
+    return info + attrs
 
 
-def set_keys(
-    sagd: int,
-    *,
-    cipher_alg: int = SADB_X_EALG_AESCBC,
-    cipher_key: bytes = b"\xA5" * 16,
-    auth_alg: int = SADB_X_AALG_SHA2_256HMAC,
-    auth_key: bytes = b"\x5A" * 32,
-) -> bytes:
-    """Build a 144-byte CommandIPSecSetKey payload.
-
-    Layout: sagd(U16) rsvd(U16) num_keys(U16) rsvd2(U16) keys[2] (each 68B).
-    Cipher key first (key_type=1), auth key second (key_type=0) — matches
-    the order IPsec_handle_SA_SET_KEYS iterates and the algorithm-id
-    switch in M_ipsec_sa_set_cipher_key / M_ipsec_sa_set_digest_key.
-
-    Recognizable byte patterns (0xA5 cipher, 0x5A auth) so the H2
-    key-zeroing regression test can detect surviving cipher key bytes
-    in the post-kfree_sensitive slab snapshot — see
-    test_ipsec_key_zeroing.py.
-    """
-    return (
-        struct.pack("<HH", sagd & 0xFFFF, 0)
-        + struct.pack("<HH", IPSEC_MAX_NUM_KEYS, 0)
-        + _key_desc(cipher_alg, KEY_TYPE_CIPHER, cipher_key)
-        + _key_desc(auth_alg,   KEY_TYPE_AUTH,   auth_key)
-    )
+def delsa(*, dst: str, spi: int) -> bytes:
+    """Build an XFRM_MSG_DELSA body: struct xfrm_usersa_id."""
+    return (_addr(dst) + struct.pack(">I", spi)
+            + struct.pack("<HBB", AF_INET, IPPROTO_ESP, 0))
 
 
-def set_natt(sagd: int, sport: int, dport: int = 4500) -> bytes:
-    """Build an 8-byte CommandIPSecSetNatt payload."""
-    return struct.pack("<HHHH", sagd & 0xFFFF, sport & 0xFFFF, dport & 0xFFFF, 0)
-
-
-def set_state(sagd: int, state: int = XFRM_STATE_VALID) -> bytes:
-    """Build an 8-byte CommandIPSecSetState payload."""
-    return struct.pack("<HHHH", sagd & 0xFFFF, 0, state & 0xFFFF, 0)
-
-
-# ---------------------------------------------------------------- orchestrator
+# ---------------------------------------------------------------- results
 
 @dataclass
-class InstallResult:
-    """Per-step outcomes for a 4-step SA install.
+class SaReply:
+    """What one NEWSA or DELSA attempt came back with.
 
-    `replies[step_name]` is the agent's reply dict for that FCI call;
-    `infra_skip_reason` is set iff CREATE failed with an infra-class
-    error (so the test should pytest.skip rather than fail). If a later
-    step (set_keys/set_natt/set_state) fails, `infra_skip_reason` stays
-    None — the test should fail loudly because it's a wire-format bug,
-    not infra.
+    `error` is the netlink ACK's own code: 0 for accepted, negative errno for
+    a refusal. `lost` is the fault-injection case where no reply arrived at
+    all.
+
+    The two are not interchangeable, and a sweep that treats them as one
+    proves less than it looks. A reply that arrived carrying an error is the
+    install itself refusing: the fault landed somewhere on the path that
+    builds the SA. A reply that never arrived is the *reply* being built with
+    a faulted allocation, which happens after the SA is already installed --
+    the netlink ACK's own skb is allocated well past anything cdx does. So
+    `refused` is the property to assert non-vacuity on; `lost` says only that
+    fail-nth armed.
     """
-    replies: dict[str, dict]
-    infra_skip_reason: str | None
+    error: int | None
+    lost: bool
+    fail_nth_residue: int | None
+    raw: dict
+
+    @property
+    def ok(self) -> bool:
+        return self.error == 0
+
+    @property
+    def refused(self) -> bool:
+        """The install itself was rejected, as opposed to the reply being
+        lost after it succeeded."""
+        return not self.lost and (self.error or 0) != 0
 
 
-# Returned by CREATE when CAAM/DPAA infra isn't ready. Empirical — the
-# specific code may need adjustment once we observe real behaviour.
-# ERR_CREATION_FAILED comes from M_ipsec_sa_cache_create returning false,
-# which on this build means the SA cache pool is empty or DPAA isn't up.
-INFRA_CREATE_RC_SET = {ERR_CREATION_FAILED, ERR_NOT_ENOUGH_MEMORY}
+def _parse(result: dict) -> SaReply:
+    body = bytes.fromhex(result.get("body_hex", "") or "")
+    reply = bytes.fromhex(result.get("reply_hex", "") or "")
+    residue = result.get("fail_nth_residue")
+    if result.get("send_error") or len(reply) < 16 or len(body) < 4:
+        return SaReply(error=None, lost=True, fail_nth_residue=residue,
+                       raw=result)
+    msg_type = struct.unpack_from("<H", reply, 4)[0]
+    if msg_type != NLMSG_ERROR:
+        # Anything else is a reply this helper does not model; surface it
+        # rather than guess a code from it.
+        return SaReply(error=None, lost=False, fail_nth_residue=residue,
+                       raw=result)
+    return SaReply(error=struct.unpack_from("<i", body, 0)[0], lost=False,
+                   fail_nth_residue=residue, raw=result)
 
 
-async def install_sa_inbound(
-    target_agent,
-    aiohttp_session,
-    sagd: int,
-    *,
-    spi: int,
-    dst_ip: int,
-    natt: bool = False,
-    natt_sport: int = 0,
-    natt_dport: int = 4500,
-    failslab_step: str | None = None,
-    failslab_times: int | None = None,
-    timeout_ms: int = 3000,
-) -> InstallResult:
-    """Drive the 4-step SA install: CREATE → SET_KEYS → [SET_NATT] → SET_STATE.
+# ---------------------------------------------------------------- operations
 
-    `failslab_step` selects which step is armed with `failslab_times`
-    fail-Nth on the kernel side. Subsequent steps run unencumbered so
-    we can observe whether the failed step's err-path unwound cleanly.
-    """
-    replies: dict[str, dict] = {}
-
-    async def _send(step: str, fcode: int, payload: bytes) -> dict:
-        kwargs = {}
-        if step == failslab_step and failslab_times is not None:
-            kwargs["failslab_times"] = failslab_times
-        r = await target_agent.fci_send(
-            aiohttp_session, fcode=fcode,
-            length=len(payload), payload=payload,
-            timeout_ms=timeout_ms, **kwargs,
-        )
-        replies[step] = r
-        return r
-
-    r = await _send("create", CMD_IPSEC_SA_CREATE, create_sa(sagd, spi, dst_ip))
-    if r.get("reply_rc") in INFRA_CREATE_RC_SET and step_failed_unencumbered("create", failslab_step):
-        return InstallResult(
-            replies=replies,
-            infra_skip_reason=(
-                f"CREATE returned reply_rc={r.get('reply_rc')!r} unencumbered "
-                f"— CAAM/DPAA infra likely not ready. send_error={r.get('send_error')!r}"
-            ),
-        )
-    # If CREATE was the failslab step, a NULL allocation is expected; bail
-    # without continuing so the caller sees the fault outcome cleanly.
-    if r.get("reply_rc") != NO_ERR:
-        return InstallResult(replies=replies, infra_skip_reason=None)
-
-    r = await _send("set_keys", CMD_IPSEC_SA_SET_KEYS, set_keys(sagd))
-    if r.get("reply_rc") != NO_ERR:
-        return InstallResult(replies=replies, infra_skip_reason=None)
-
-    if natt:
-        r = await _send("set_natt", CMD_IPSEC_SA_SET_NATT,
-                        set_natt(sagd, sport=natt_sport, dport=natt_dport))
-        if r.get("reply_rc") != NO_ERR:
-            return InstallResult(replies=replies, infra_skip_reason=None)
-
-    await _send("set_state", CMD_IPSEC_SA_SET_STATE, set_state(sagd))
-    return InstallResult(replies=replies, infra_skip_reason=None)
-
-
-def step_failed_unencumbered(step: str, failslab_step: str | None) -> bool:
-    """True iff `step` ran without failslab armed (i.e. its failure is
-    interpretable as infra-class rather than fault-injection-induced)."""
-    return failslab_step != step
-
-
-async def cleanup_sa(target_agent, aiohttp_session, sagd: int) -> None:
-    """Best-effort DELETE; ignore reply_rc. Tests use this in finally blocks
-    to keep the SA cache clean between iterations."""
-    await target_agent.fci_send(
-        aiohttp_session, fcode=CMD_IPSEC_SA_DELETE,
-        length=4, payload=delete_sa(sagd), timeout_ms=2000,
+async def sa_add(
+    target_agent, session, *, src: str, dst: str, spi: int, reqid: int,
+    ifindex: int, inbound: bool = False, mode: int = XFRM_MODE_TUNNEL,
+    offload: bool = True, cipher_key: bytes = CIPHER_KEY,
+    auth_key: bytes = AUTH_KEY, natt: tuple[int, int] | None = None,
+    failslab_times: int | None = None, timeout_ms: int = 3000,
+) -> SaReply:
+    """Install one SA over XFRM, optionally with the Nth kmalloc of the send
+    forced to NULL."""
+    result = await target_agent.netlink_send(
+        session, NETLINK_XFRM,
+        newsa(src=src, dst=dst, spi=spi, reqid=reqid, ifindex=ifindex,
+              inbound=inbound, mode=mode, offload=offload,
+              cipher_key=cipher_key, auth_key=auth_key, natt=natt),
+        nlmsg_type=XFRM_MSG_NEWSA,
+        nlmsg_flags=NLM_F_REQUEST | NLM_F_ACK,
+        timeout_ms=timeout_ms, failslab_times=failslab_times,
     )
+    return _parse(result)
 
 
-# ---------------------------------------------------------------- DUT-local addr
-
-def ipv4_to_daddr_int(ip_str: str) -> int:
-    """Convert a dotted-quad IPv4 string to the integer create_sa() expects
-    as `dst_ip` so the SA's daddr matches a DUT-local interface address.
-
-    The match is dpa_get_iface_info_by_ipaddress → devman.c:830
-    `if (if_info->ifa_local == *daddr)`. `ifa_local` is a __be32 held in
-    kernel memory; on the little-endian ARM64 target that word read back as
-    a host u32 is the network-order bytes in little-endian order. create_sa()
-    packs dst_ip with struct.pack("<I", dst_ip) and the kernel reads it back
-    as a host u32 into sa->id.daddr.a6[0], so passing the network-order bytes
-    interpreted little-endian makes sa->id.daddr.a6[0] == ifa_local bit-for-bit.
-
-    i.e. dst_ip = int.from_bytes(inet_aton(ip), "little").  For 10.0.0.62:
-    inet_aton -> b'\\x0a\\x00\\x00\\x3e'; read little-endian -> 0x3e00000a,
-    which is exactly the u32 value the kernel holds for ifa_local on LE ARM64.
-    """
-    return struct.unpack("<I", socket.inet_aton(ip_str))[0]
-
-
-async def resolve_dut_local_ipv4(target_agent, aiohttp_session, iface: str) -> tuple[str, int]:
-    """Return (dotted_quad, daddr_int) for a DUT-local IPv4 address usable as
-    an SA daddr so the fast-path install clears dpa_get_iface_info_by_ipaddress.
-
-    ASK_IPSEC_LOCAL_IP overrides the query (dotted-quad); otherwise the address
-    is read live from `ip -4 -j addr show dev <iface>` on the DUT. Returns the
-    first global-scope inet address found. Raises if none is present so the
-    caller can skip rather than silently install an unmatched (synthetic) daddr
-    that would short-circuit before the guarded sites.
-    """
-    override = os.environ.get("ASK_IPSEC_LOCAL_IP")
-    if override:
-        return override, ipv4_to_daddr_int(override)
-
-    r = await target_agent.exec_cmd(
-        aiohttp_session, ["ip", "-4", "-j", "addr", "show", "dev", iface],
-        timeout_ms=3000,
-    )
-    if r.get("rc") != 0:
-        raise RuntimeError(
-            f"`ip -4 -j addr show dev {iface}` failed on DUT: rc={r.get('rc')!r}, "
-            f"stderr={r.get('stderr', '')!r}"
-        )
-    try:
-        links = json.loads(r.get("stdout", "") or "[]")
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"couldn't parse `ip -4 -j addr show dev {iface}` output: {e}; "
-            f"stdout={r.get('stdout', '')[:200]!r}"
-        )
-    for link in links:
-        for ai in link.get("addr_info", []):
-            if ai.get("family") == "inet" and ai.get("local"):
-                # Prefer a global-scope address; fall back to any inet if the
-                # iface only carries a non-global one.
-                if ai.get("scope") == "global":
-                    ip = ai["local"]
-                    return ip, ipv4_to_daddr_int(ip)
-    # No global-scope inet — retry accepting any inet address.
-    for link in links:
-        for ai in link.get("addr_info", []):
-            if ai.get("family") == "inet" and ai.get("local"):
-                ip = ai["local"]
-                return ip, ipv4_to_daddr_int(ip)
-    raise RuntimeError(
-        f"no IPv4 address on DUT iface {iface}; set ASK_IPSEC_LOCAL_IP to a "
-        f"DUT-local address, or assign one to {iface}"
-    )
-
-
-# ---------------------------------------------------------------- xfrm state (test hook)
-# These drive the kernel's `ip xfrm` table directly so the
-# CDX_DEBUG_IPSEC_TEST_XFRM fallback (cdx/control_ipsec.c, compiled only
-# into the meta-ask test image) can resolve a synthetic NAT-T SA to a
-# real, ref-held xfrm_state by (daddr, spi, proto ESP) and let the H5
-# per-flow SPI-array path run. xfrm_state_lookup keys only on
-# daddr+spi+proto+family+mark; `src`, mode, reqid, the crypto keys and the
-# espinudp ports are required by `ip xfrm state add` syntax but do not
-# affect the match — cdx never uses this state to process a packet.
-
-# Fixed literal keys — any value works; the state is only ever matched by
-# the by-SPI lookup, never used for crypto. 16B enc (aes-cbc-128), 24B auth.
-_XFRM_ENC_KEY  = "0x000102030405060708090a0b0c0d0e0f"
-_XFRM_AUTH_KEY = "0x000102030405060708090a0b0c0d0e0f1011121314151617"
-
-
-async def add_xfrm_state_natt(
-    target_agent,
-    aiohttp_session,
-    *,
-    spi: int,
-    daddr_ip: str,
-    src_ip: str,
-    sport: int,
-    dport: int,
-    timeout_ms: int = 3000,
-) -> dict:
-    """Add one inbound NAT-T ESP xfrm state (dst=daddr_ip, given spi) on the
-    DUT via the agent's `ip` exec (argv form). Returns the exec reply dict
-    (rc/stdout/stderr).
-
-    `encap espinudp <sport> <dport> 0.0.0.0` mirrors the SA's NAT-T ports;
-    the trailing 0.0.0.0 is espinudp's original-address arg, unused for the
-    lookup. `src_ip` is likewise irrelevant to the by-SPI match — it only
-    satisfies the command syntax.
-    """
-    return await target_agent.exec_cmd(
-        aiohttp_session,
-        [
-            "ip", "xfrm", "state", "add",
-            "src", src_ip, "dst", daddr_ip,
-            "proto", "esp", "spi", f"0x{spi:08x}",
-            "mode", "tunnel", "reqid", "1",
-            "enc", "cbc(aes)", _XFRM_ENC_KEY,
-            "auth", "hmac(sha256)", _XFRM_AUTH_KEY,
-            "encap", "espinudp", str(sport), str(dport), "0.0.0.0",
-        ],
+async def sa_del(target_agent, session, *, dst: str, spi: int,
+                 timeout_ms: int = 3000) -> SaReply:
+    """Best-effort removal. Callers use this in finally blocks, so a state
+    that was never installed coming back -ESRCH is expected, not an error."""
+    result = await target_agent.netlink_send(
+        session, NETLINK_XFRM, delsa(dst=dst, spi=spi),
+        nlmsg_type=XFRM_MSG_DELSA,
+        nlmsg_flags=NLM_F_REQUEST | NLM_F_ACK,
         timeout_ms=timeout_ms,
     )
+    return _parse(result)
 
 
-async def flush_xfrm(target_agent, aiohttp_session, timeout_ms: int = 3000) -> None:
-    """Best-effort `ip xfrm state flush` + `ip xfrm policy flush` on the DUT.
-    Used in fixture finalizers to clear the pre-created test states."""
-    for sub in (["state", "flush"], ["policy", "flush"]):
-        await target_agent.exec_cmd(
-            aiohttp_session, ["ip", "xfrm", *sub], timeout_ms=timeout_ms,
-        )
+async def sa_flush_range(target_agent, session, *, dst: str,
+                         spis: list[int]) -> None:
+    """Remove a whole sweep's worth of SAs, ignoring every outcome."""
+    for spi in spis:
+        await sa_del(target_agent, session, dst=dst, spi=spi)
+
+
+async def sa_install_probe(
+    target_agent, session, *, src: str, dst: str, spi: int, reqid: int,
+    ifindex: int, inbound: bool = False, natt: tuple[int, int] | None = None,
+) -> str | None:
+    """One unencumbered install, read back, and removed again.
+
+    Returns None when the SA installed and the kernel reports it, or a reason
+    string the caller can skip on. Sweeps run this first: a wire-layout
+    mistake or an unprepared bench would otherwise make every faulted
+    iteration fail identically and prove nothing.
+
+    Skipping is right for *these* files, whose subject is an unwind path
+    rather than the install, but it means none of them goes red if offloaded
+    SA install breaks outright. That tripwire is
+    test_ipsec_xfrm_offload.py::test_packet_offload_sa_install, which asserts
+    the same install through `ip` and fails rather than skips. Worth knowing,
+    because nothing here says so on the day four files all skip at once.
+    """
+    await sa_del(target_agent, session, dst=dst, spi=spi)
+    reply = await sa_add(target_agent, session, src=src, dst=dst, spi=spi,
+                         reqid=reqid, ifindex=ifindex, inbound=inbound,
+                         natt=natt)
+    if not reply.ok:
+        await sa_del(target_agent, session, dst=dst, spi=spi)
+        return (f"unencumbered NEWSA was refused (error={reply.error!r}, "
+                f"lost={reply.lost}) — either the offload is not available on "
+                f"this boot or the bench endpoints are not set up; raw={reply.raw!r}")
+    shown = await target_agent.exec_cmd(
+        session, ["ip", "-d", "xfrm", "state", "get", "src", src, "dst", dst,
+                  "proto", "esp", "spi", hex(spi)], timeout_ms=3000)
+    await sa_del(target_agent, session, dst=dst, spi=spi)
+    if shown.get("rc") != 0:
+        return (f"NEWSA was accepted but `ip xfrm state get` cannot see it "
+                f"(rc={shown.get('rc')!r}) — the message this module builds is "
+                f"not describing the SA it claims to")
+    out = shown.get("stdout", "")
+    if "crypto offload parameters" not in out:
+        return (f"the installed SA carries no offload; XFRMA_OFFLOAD_DEV did "
+                f"not take. `ip -d xfrm state get` said: {out!r}")
+    return None
+
+
+async def measure_install_allocations(
+    target_agent, session, *, src: str, dst: str, spi: int, reqid: int,
+    ifindex: int, inbound: bool = False, natt: tuple[int, int] | None = None,
+) -> int | None:
+    """How many faultable allocations one whole SA install makes.
+
+    Arming fail-nth far beyond any plausible count faults nothing, and the
+    residue left behind is what the counter did not spend -- so the difference
+    is the number of eligible allocations the send actually made. That turns
+    "sweep the first hundred" into a measured window: the early values land in
+    xfrm's own state construction and the SA cache, the late ones in the
+    descriptor build and the classifier entry, and a test that wants one of
+    those can say so instead of hoping.
+
+    Two things the count is not. It spans the whole send and receive, so the
+    last stretch of it is the netlink ACK rather than anything cdx does --
+    which is why a sweep aimed at the tail asserts on `SaReply.refused` and
+    not merely on something having gone wrong. And it counts a handful of the
+    probe's own reads, so it is an upper bound on the install rather than a
+    measurement of it.
+
+    Returns None when the probe could not be read, which the caller should
+    treat as "sweep blind" rather than as a failure.
+    """
+    ceiling = 1_000_000
+    await sa_del(target_agent, session, dst=dst, spi=spi)
+    reply = await sa_add(target_agent, session, src=src, dst=dst, spi=spi,
+                         reqid=reqid, ifindex=ifindex, inbound=inbound,
+                         natt=natt, failslab_times=ceiling)
+    await sa_del(target_agent, session, dst=dst, spi=spi)
+    residue = reply.fail_nth_residue
+    if not reply.ok or residue is None or residue <= 0 or residue > ceiling:
+        return None
+    return ceiling - residue
+
+
+# ---------------------------------------------------------------- bench setup
+
+async def endpoints_up(target_agent, session, *, iface: str, local: str,
+                       peer: str, lladdr: str) -> None:
+    """Give the bench what a real tunnel would have had from its exchange.
+
+    Both are contract, not convenience. The local endpoint must be an address
+    on the CDX port, because that is what resolves an SA to an interface
+    (dpa_get_iface_info_by_ipaddress matches the SA's own source for an
+    outbound SA and its destination for an inbound one). And the peer needs a
+    route and a resolved neighbour, because what leaves SEC is a finished
+    frame: the destination MAC is written into the SA at install time rather
+    than read per packet.
+
+    The neighbour is permanent and the peer does not exist. Nothing here
+    sends, so inventing a lladdr keeps these control-plane tests off a
+    two-host bench.
+    """
+    for argv in (
+        ["ip", "address", "replace", f"{local}/32", "dev", iface],
+        ["ip", "route", "replace", f"{peer}/32", "dev", iface],
+        ["ip", "neigh", "replace", peer, "lladdr", lladdr, "dev", iface,
+         "nud", "permanent"],
+    ):
+        r = await target_agent.exec_cmd(session, argv, timeout_ms=3000)
+        # Checked, because the alternative is that the bench comes up half
+        # built and every later refusal is blamed on the offload.
+        if r.get("rc") != 0:
+            raise RuntimeError(
+                f"bench setup failed: {' '.join(argv)} -> rc={r.get('rc')!r}, "
+                f"stderr={r.get('stderr', '')!r}")
+
+
+async def endpoints_down(target_agent, session, *, iface: str, local: str,
+                         peer: str) -> None:
+    for argv in (
+        ["ip", "neigh", "del", peer, "dev", iface],
+        ["ip", "route", "del", f"{peer}/32", "dev", iface],
+        ["ip", "address", "del", f"{local}/32", "dev", iface],
+    ):
+        await target_agent.exec_cmd(session, argv, timeout_ms=3000)
+
+
+async def iface_index(target_agent, session, iface: str) -> int:
+    """The ifindex XFRMA_OFFLOAD_DEV names. Read live rather than assumed:
+    an SA bound to the wrong device is refused several layers away from the
+    mistake."""
+    r = await target_agent.exec_cmd(
+        session, ["ip", "-j", "link", "show", "dev", iface], timeout_ms=3000)
+    if r.get("rc") != 0:
+        raise RuntimeError(f"`ip link show dev {iface}` failed: {r!r}")
+    links = json.loads(r.get("stdout", "") or "[]")
+    if not links or "ifindex" not in links[0]:
+        raise RuntimeError(f"no ifindex for {iface}: {r.get('stdout', '')!r}")
+    return int(links[0]["ifindex"])
+
+
+async def dut_local_ipv4(target_agent, session, iface: str) -> str:
+    """A DUT-local IPv4 address on `iface`, for a test that needs the SA's
+    endpoint to be one the hardware can resolve to a port. ASK_IPSEC_LOCAL_IP
+    overrides the query."""
+    override = os.environ.get("ASK_IPSEC_LOCAL_IP")
+    if override:
+        return override
+    r = await target_agent.exec_cmd(
+        session, ["ip", "-4", "-j", "addr", "show", "dev", iface],
+        timeout_ms=3000)
+    if r.get("rc") != 0:
+        raise RuntimeError(
+            f"`ip -4 -j addr show dev {iface}` failed on DUT: {r!r}")
+    links = json.loads(r.get("stdout", "") or "[]")
+    for want_global in (True, False):
+        for link in links:
+            for ai in link.get("addr_info", []):
+                if ai.get("family") != "inet" or not ai.get("local"):
+                    continue
+                if want_global and ai.get("scope") != "global":
+                    continue
+                return ai["local"]
+    raise RuntimeError(
+        f"{iface} carries no IPv4 address; an offloaded SA's local endpoint "
+        f"has to be an address on the port it is bound to")

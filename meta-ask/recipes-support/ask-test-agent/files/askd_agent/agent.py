@@ -909,6 +909,13 @@ async def netlink_send(request: web.Request) -> web.Response:
     `uid` / `userns` fork a child that drops privilege before opening
     the netlink socket (the in-kernel netlink_capable gate checks the
     socket opener's credentials), for capability-gate tests.
+
+    `failslab_times` takes the same fork-isolated fail-nth path /fci/send
+    does, and for the same reason: an armed window that covers exactly one
+    send is the only way to drive a specific allocation on the handler's
+    side to NULL. It is not FCI-specific -- XFRM's own NEWSA reaches the
+    IPsec SA allocator through xdo_dev_state_add() just as an FCI command
+    reaches it through the cdx dispatcher.
     """
     body = await _maybe_json(request)
     try:
@@ -920,6 +927,7 @@ async def netlink_send(request: web.Request) -> web.Response:
     nlmsg_flags = int(body.get("nlmsg_flags", 0))
     nlmsg_len_override = body.get("nlmsg_len_override")
     timeout_s = float(body.get("timeout_ms", 500)) / 1000.0
+    failslab_times = body.get("failslab_times")
     uid = body.get("uid")
     if uid is not None:
         uid = int(uid)
@@ -935,6 +943,13 @@ async def netlink_send(request: web.Request) -> web.Response:
                     ),
                     uid, timeout_s, userns=userns,
                 ),
+            )
+        elif failslab_times is not None:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _netlink_send_failslab,
+                protocol, msg, nlmsg_len_override,
+                nlmsg_type, nlmsg_flags, timeout_s, int(failslab_times),
             )
         else:
             result = await asyncio.get_event_loop().run_in_executor(

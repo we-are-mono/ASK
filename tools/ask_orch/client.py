@@ -156,9 +156,14 @@ class Agent:
         nlmsg_flags: int = 0,
         nlmsg_len_override: int | None = None,
         timeout_ms: int = 500,
+        failslab_times: int | None = None,
         uid: int | None = None,
         userns: bool = False,
     ) -> dict:
+        """`failslab_times` behaves exactly as it does for fci_send: the agent
+        forks, arms per-task fail-nth so the Nth kmalloc of the send path
+        returns NULL, and sends. It works for any protocol, which is what
+        lets an XFRM NEWSA drive the IPsec SA allocator's unwind."""
         body: dict = {
             "protocol":    protocol,
             "body_hex":    msg.hex(),
@@ -168,6 +173,8 @@ class Agent:
         }
         if nlmsg_len_override is not None:
             body["nlmsg_len_override"] = nlmsg_len_override
+        if failslab_times is not None:
+            body["failslab_times"] = int(failslab_times)
         if uid is not None:
             body["uid"] = int(uid)
         if userns:
