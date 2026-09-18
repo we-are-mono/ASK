@@ -15,18 +15,26 @@ wrong field: ASK's FMAN classifier composes an exact-match key from the
 source and group addresses, and a multicast MAC cannot be recovered
 into one.
 
-The bridge has mp->addr at the point it throws it away, so carry it.
+A blocked port group needs saying too. A driver that replicates in
+hardware takes the forwarding decision away from br_forward(), which
+skips a port group an IGMPv3 or MLDv2 source filter excludes this
+source for. A driver that could not see that would deliver exactly what
+the filter excluded, and with the frame no longer reaching the bridge
+there is no software path left to correct it. Reported as a switchdev
+flag of its own rather than as MDB_PG_FLAGS_*, whose values are
+bridge-private and not an interface.
+
 Additive: existing drivers read addr[] and vid as before and need not
-know the field exists.
+know either field exists.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
-  include/net/switchdev.h   | 18 ++++++++++++++++++
-  net/bridge/br_switchdev.c |  4 ++++
-  2 files changed, 22 insertions(+)
+  include/net/switchdev.h   | 37 +++++++++++++++++++++++++++++++++++++
+  net/bridge/br_switchdev.c | 10 ++++++++++
+  2 files changed, 47 insertions(+)
 
 diff --git a/include/net/switchdev.h b/include/net/switchdev.h
-index 8346b0d29542..9c9659009b98 100644
+index 8346b0d29542..da9e6370ed0f 100644
 --- a/include/net/switchdev.h
 +++ b/include/net/switchdev.h
 @@ -10,6 +10,8 @@
@@ -38,7 +46,17 @@ index 8346b0d29542..9c9659009b98 100644
  #include <net/ip_fib.h>
  
  #define SWITCHDEV_F_NO_RECURSE		BIT(0)
-@@ -114,6 +116,22 @@ struct switchdev_obj_port_mdb {
+@@ -109,11 +111,46 @@ struct switchdev_obj_port_vlan {
+ #define SWITCHDEV_OBJ_PORT_VLAN(OBJ) \
+ 	container_of((OBJ), struct switchdev_obj_port_vlan, obj)
+ 
++/* An IGMPv3 or MLDv2 source filter excludes this source for this port, so the
++ * bridge does not forward it there. A driver replicating in hardware must not
++ * either. */
++#define SWITCHDEV_OBJ_MDB_F_BLOCKED	BIT(0)
++
+ /* SWITCHDEV_OBJ_ID_PORT_MDB */
+ struct switchdev_obj_port_mdb {
  	struct switchdev_obj obj;
  	unsigned char addr[ETH_ALEN];
  	u16 vid;
@@ -58,11 +76,25 @@ index 8346b0d29542..9c9659009b98 100644
 +	 * populate it.
 +	 */
 +	struct br_ip group;
++	/* SWITCHDEV_OBJ_MDB_F_*, translated from the port group's own flags
++	 * rather than copied: MDB_PG_FLAGS_* are bridge-private and their
++	 * values are not an interface.
++	 *
++	 * A driver that replicates in hardware needs this because it is taking
++	 * the forwarding decision away from br_forward(), which consults the
++	 * port group's flags. A driver that could not see them would deliver
++	 * to a port the bridge would have skipped, with no software path left
++	 * to correct it.
++	 *
++	 * Zero on the paths that do not populate it, which is also the value
++	 * that means "an ordinary member".
++	 */
++	u8 flags;
  };
  
  #define SWITCHDEV_OBJ_PORT_MDB(OBJ) \
 diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
-index f10bd6a233dc..77f3df59663b 100644
+index f10bd6a233dc..6b61f0b13998 100644
 --- a/net/bridge/br_switchdev.c
 +++ b/net/bridge/br_switchdev.c
 @@ -540,6 +540,10 @@ static void br_switchdev_mdb_populate(struct switchdev_obj_port_mdb *mdb,
@@ -76,6 +108,19 @@ index f10bd6a233dc..77f3df59663b 100644
  }
  
  static void br_switchdev_host_mdb_one(struct net_device *dev,
+@@ -653,6 +657,12 @@ void br_switchdev_mdb_notify(struct net_device *dev,
+ 
+ 	br_switchdev_mdb_populate(&mdb, mp);
+ 
++	/* Translated, not copied: MDB_PG_FLAGS_* are ours and their values are
++	 * not an interface. What a driver replicating in hardware needs is
++	 * what br_forward() would have done, and for a blocked port group that
++	 * is to skip it. */
++	if (pg->flags & MDB_PG_FLAGS_BLOCKED)
++		mdb.flags |= SWITCHDEV_OBJ_MDB_F_BLOCKED;
+ 	mdb.obj.orig_dev = pg->key.port->dev;
+ 	switch (type) {
+ 	case RTM_NEWMDB:
 -- 
 2.47.3
 

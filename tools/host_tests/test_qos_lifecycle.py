@@ -17,7 +17,7 @@ def function(source, name):
     # An explicit list of return types rather than "anything": it is what
     # keeps a forward declaration or a call site from being mistaken for the
     # definition. Widen it when a new one is needed.
-    match = re.search(r"^(?:static )?(?:int |void |bool |U16 |uint32_t |"
+    match = re.search(r"^(?:static )?(?:int |void |bool |U16 |u16 |uint32_t |"
                       r"struct qman_fq \*|struct en_exthash_tbl_entry ?\* ?|"
                       r"struct net_device ?\* ?|struct ft_mc_group ?\* ?|"
                       r"enum qman_cb_dqrr_result )"
