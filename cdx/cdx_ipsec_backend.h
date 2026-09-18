@@ -189,6 +189,39 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
  */
 void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa);
 
+/* Point an outbound SA's egress framing at a different next hop.
+ *
+ * The peer's Ethernet address is not consulted per frame. It is written into
+ * the classifier entry's header-manipulation opcodes when that entry is
+ * built, so a peer that moves cannot be followed by storing a new value
+ * anywhere: the entry has to come out and go back in. That is what the legacy
+ * owner did on CMD_IPSEC_SA_SET_TNL_ROUTE, and it is what this does.
+ *
+ * The SEC context is untouched. SA_SH_DESC_BUILT keeps the shared descriptor
+ * -- the keys, the PDB and the outer header -- exactly as it was, so the
+ * transform is never half-built and the sequence numbers do not restart.
+ *
+ * The rebuild re-reads the whole of the SA's egress framing, not only the
+ * address named here -- the port's own hardware address included, since that
+ * shares the same opcodes and the encoder now reads it from the netdev rather
+ * than from a registration-time copy. So a caller that knows anything about
+ * the framing has moved may pass the address it already has and let the rest
+ * be picked up.
+ *
+ * Inbound SAs are refused: they are classified rather than transmitted and
+ * hold no egress framing to move.
+ *
+ * -EINVAL: not an outbound SA, or no usable address.
+ * -EBUSY: an outbound NAT-T entry shared with another SA on the same UDP
+ *  tuple. Its framing belongs to whichever SA built it and a rebuild would
+ *  change nothing; try again once the other SA is gone.
+ * -EIO: the old entry could not be proved gone, so nothing was rebuilt, or
+ *  the rebuild failed. Either way the SA is left on the framing it had, and
+ *  in the first case it can no longer be moved at all -- a second attempt
+ *  would add a key the hardware still holds.
+ */
+int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac);
+
 /* The handle SEC and the classifier know this SA by. Stable for the SA's
  * life, never zero, and reusable by a later SA once this one is deleted.
  */

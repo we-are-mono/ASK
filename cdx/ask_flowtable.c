@@ -2135,6 +2135,239 @@ static void ft_ipsec_retire_sa(u16 handle)
 	spin_unlock_bh(&ft_watch_lock);
 }
 
+/* ------------------------------------------- following a peer that moves
+ *
+ * An outbound SA's next hop is resolved once, when the state is installed,
+ * and written into its classifier entry -- because what leaves SEC is a
+ * finished frame and the hardware has to be told the destination before the
+ * first packet, not after. Nothing re-reads it per frame, so a peer that
+ * moves (a gateway failover, a replaced NIC on the far end) would leave the
+ * tunnel emitting to an address nobody answers to, with no error anywhere.
+ * The legacy owner was told about such a move over FCI, as
+ * CMD_IPSEC_SA_SET_TNL_ROUTE; this ownership mode has to notice it itself.
+ *
+ * So each outbound SA keeps a watch here, and the same notifiers that retire
+ * a flow whose neighbour or route moved mark the watch instead. Marking
+ * rather than retiring is the whole difference between an SA and a flow: a
+ * flow is readmitted from scratch on its next packet, which is why retiring
+ * it is enough, while nothing re-offers an SA. Its hardware has to be
+ * corrected in place.
+ *
+ * The correction cannot happen where it is noticed -- the notifiers run under
+ * neigh->lock and ft_watch_lock, and rebuilding an entry needs the control
+ * mutex and sleeps -- so a work item does it. That gives the SA's lifetime
+ * one rule the work depends on: ft_xdo_state_delete() unlinks the watch
+ * before it queues the retirement that frees the SA, and the retirement takes
+ * the control mutex to do it. So a watch still on this list while the control
+ * mutex is held names an SA that is still there.
+ */
+struct ft_ipsec_watch {
+	struct list_head list;
+	/* Identity that survives the memory. The work drops every lock to
+	 * resolve, and a watch freed meanwhile could have its allocation
+	 * reused by the next SA -- so it comes back and looks for this,
+	 * never for the pointer it started with. */
+	u64 cookie;
+	/* Which pass of the follow work last took this watch on. The work
+	 * re-marks a watch whose rebuild failed, so without this a failure
+	 * would be picked straight back up inside the same pass and spin. */
+	u64 pass;
+	struct cdx_ipsec_sa *sa;
+	struct net_device *dev;
+	union nf_inet_addr local;
+	union nf_inet_addr peer;
+	/* What the hardware is currently writing: the peer's address and the
+	 * port's own. Both are in the entry's header-manipulation opcodes, so
+	 * either changing is the same defect and takes the same rebuild. */
+	u8 dst_mac[ETH_ALEN];
+	u8 src_mac[ETH_ALEN];
+	u8 family;
+	bool stale;
+	/* A failure has been reported for this watch, so the next one stays
+	 * quiet. Cleared by a rebuild that works, because the next failure
+	 * after a recovery is news again. */
+	bool reported;
+};
+
+static LIST_HEAD(ft_ipsec_watches);
+static u64 ft_ipsec_watch_cookies;
+static u64 ft_ipsec_follow_pass;
+static atomic64_t ft_ipsec_next_hop_updates = ATOMIC64_INIT(0);
+
+static void ft_ipsec_follow_work(struct work_struct *work);
+static DECLARE_WORK(ft_ipsec_follow, ft_ipsec_follow_work);
+
+/* Caller holds ft_watch_lock. */
+static void ft_ipsec_mark(struct ft_ipsec_watch *watch)
+{
+	watch->stale = true;
+	schedule_work(&ft_ipsec_follow);
+}
+
+/* A neighbour this adapter may have resolved an SA against has changed.
+ *
+ * Matched by address and device rather than by a held neighbour pointer, the
+ * way a flow matches: an SA is not worth a neighbour reference, since it has
+ * no per-packet use for one and holding it would keep a dead entry alive.
+ * Caller holds neigh->lock and ft_watch_lock.
+ *
+ * Only a neighbour that is usable *and* names a different address is worth
+ * anything here, and both halves matter. An unchanged one is ordinary NUD
+ * ageing, and the entry already carries it. An unusable one -- incomplete,
+ * failed, dead -- names nothing better to program, and marking it would be
+ * worse than useless: the re-resolution probes what it finds, the probe fails,
+ * the failure is itself a neighbour update, and the two would keep each other
+ * going for as long as the peer stayed down. The SA keeps the address it has
+ * and the neighbour table does its own backoff.
+ */
+static void ft_ipsec_neigh_moved(struct neighbour *neigh)
+{
+	struct ft_ipsec_watch *watch;
+
+	if (neigh->tbl != &arp_tbl || neigh->dead ||
+	    !(neigh->nud_state & NUD_VALID))
+		return;
+	list_for_each_entry(watch, &ft_ipsec_watches, list) {
+		if (watch->family != AF_INET || watch->dev != neigh->dev)
+			continue;
+		if (*(__be32 *)neigh->primary_key != watch->peer.ip)
+			continue;
+		/* A different address is the case this watch exists for. An
+		 * unchanged one still matters when a previous attempt failed
+		 * and left the watch waiting: a usable neighbour appearing is
+		 * exactly the event that retry is waiting for, and the reason
+		 * it failed need not have been the peer at all. Changing this
+		 * port's own address flushes its neighbour table, so the
+		 * rebuild that change asks for always finds the peer
+		 * momentarily unresolvable -- and the neighbour that comes
+		 * back carries the address it always had. */
+		if (!ether_addr_equal(neigh->ha, watch->dst_mac) || watch->stale)
+			ft_ipsec_mark(watch);
+	}
+}
+
+/* A route covering this prefix changed, so the gateway an SA's frames leave
+ * by may have. Unlike the neighbour case there is nothing to compare here --
+ * the answer is whatever the FIB now returns -- so every SA under the prefix
+ * is re-resolved and the work discards the ones that did not move.
+ * Caller holds ft_watch_lock.
+ */
+static void ft_ipsec_route_moved(u8 family, const void *dst, __be32 mask,
+				 unsigned int prefixlen)
+{
+	struct ft_ipsec_watch *watch;
+
+	list_for_each_entry(watch, &ft_ipsec_watches, list) {
+		if (watch->family != family)
+			continue;
+		if (family == AF_INET) {
+			if ((watch->peer.ip ^ *(const __be32 *)dst) & mask)
+				continue;
+		} else if (!ipv6_prefix_equal(&watch->peer.in6, dst, prefixlen)) {
+			continue;
+		}
+		ft_ipsec_mark(watch);
+	}
+}
+
+/* Everything, for the events that say only that routing changed. */
+static void ft_ipsec_all_moved(void)
+{
+	struct ft_ipsec_watch *watch;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		ft_ipsec_mark(watch);
+	spin_unlock_bh(&ft_watch_lock);
+}
+
+/* This port's own hardware address changed. It is written into the same
+ * opcodes as the peer's, so an SA riding the port is as silently wrong as one
+ * whose peer moved -- and unlike the flows on that port, which the caller
+ * retires and which are readmitted with the new address, nothing re-offers an
+ * SA. The encoder reads the port's address from its netdev, so rebuilding the
+ * entry genuinely picks the new one up.
+ */
+static void ft_ipsec_device_moved(const struct net_device *dev)
+{
+	struct ft_ipsec_watch *watch;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		if (watch->dev == dev)
+			ft_ipsec_mark(watch);
+	spin_unlock_bh(&ft_watch_lock);
+}
+
+/* Publish a freshly installed outbound SA's next hop for watching.
+ *
+ * The watch is allocated by the caller before the SA is installed, so a
+ * failure to allocate one refuses the SA with nothing built rather than
+ * leaving hardware behind that nothing is following.
+ *
+ * It is published stale, which costs one resolution that almost always finds
+ * nothing to do. Resolving the peer at install can wait seconds for a cold
+ * ARP cache, and the watch does not exist for any of it; an event arriving in
+ * that window would be lost. Starting stale closes it.
+ */
+static void ft_ipsec_watch_add(struct ft_ipsec_watch *watch,
+			       const struct cdx_ipsec_sa_spec *spec,
+			       struct cdx_ipsec_sa *sa)
+{
+	watch->sa = sa;
+	watch->dev = spec->dev;
+	watch->family = spec->family;
+	watch->local = spec->src;
+	watch->peer = spec->dst;
+	ether_addr_copy(watch->dst_mac, spec->dst_mac);
+	ether_addr_copy(watch->src_mac, spec->dev->dev_addr);
+	spin_lock_bh(&ft_watch_lock);
+	watch->cookie = ++ft_ipsec_watch_cookies;
+	list_add_tail(&watch->list, &ft_ipsec_watches);
+	ft_ipsec_mark(watch);
+	spin_unlock_bh(&ft_watch_lock);
+}
+
+/* Unlink the watch for an SA that is going away, before anything frees the SA
+ * itself.
+ *
+ * _bh, because xdo_dev_state_delete() does not always arrive with softirqs
+ * already off and this lock is taken from softirq. xfrm_state_delete() holds
+ * x->lock across it and xfrm_timer_handler() runs in one, which is the shape
+ * the callback contract describes -- but xfrm_add_sa() also reaches it
+ * directly, from netlink, when a state fails to insert. On that path a
+ * neighbour update landing on the same CPU would spin on a lock this holds.
+ */
+static void ft_ipsec_watch_del(const struct cdx_ipsec_sa *sa)
+{
+	struct ft_ipsec_watch *watch, *next;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry_safe(watch, next, &ft_ipsec_watches, list) {
+		if (watch->sa != sa)
+			continue;
+		list_del(&watch->list);
+		kfree(watch);
+	}
+	spin_unlock_bh(&ft_watch_lock);
+}
+
+/* Nothing is watching any more. Module exit only: the states themselves are
+ * the kernel's and outlive this, so there is no SA to retire here -- only the
+ * watches, which point into text about to be unmapped.
+ */
+static void ft_ipsec_watch_flush(void)
+{
+	struct ft_ipsec_watch *watch, *next;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry_safe(watch, next, &ft_ipsec_watches, list) {
+		list_del(&watch->list);
+		kfree(watch);
+	}
+	spin_unlock_bh(&ft_watch_lock);
+}
+
 static void ft_ipsec_attach(struct net_device *dev);
 static void ft_ipsec_detach(struct net_device *dev);
 
@@ -2180,6 +2413,10 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* NEIGH software output uses the current MAC. Reject a queued
 		 * stale hardware source too, invalidating its entire generation. */
 		ft_device_retire(dev, &ft_mac_invalidations);
+		/* An SA on this port carries the same address in its own entry
+		 * and is not re-offered the way a retired flow is, so it is
+		 * corrected rather than retired. */
+		ft_ipsec_device_moved(dev);
 		break;
 	case NETDEV_CHANGENAME:
 		/* Names carry no forwarding semantics; backend lookup uses the
@@ -2216,10 +2453,12 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 		return NOTIFY_DONE;
 	if (event->prefixlen > 32) {
 		ft_invalidate();
+		ft_ipsec_all_moved();
 		return NOTIFY_DONE;
 	}
 	mask = inet_make_mask(event->prefixlen);
 	spin_lock_bh(&ft_watch_lock);
+	ft_ipsec_route_moved(AF_INET, &event->dst, mask, event->prefixlen);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
 		/* After NAT, current egress uses new_dst; reverse egress uses src.
 		 * Check both endpoints even if only one direction installed. Match
@@ -2246,9 +2485,11 @@ static int ft_route6_event(const struct netevent_ipv6_route *event)
 		return NOTIFY_DONE;
 	if (event->prefixlen > 128) {
 		ft_invalidate();
+		ft_ipsec_all_moved();
 		return NOTIFY_DONE;
 	}
 	spin_lock_bh(&ft_watch_lock);
+	ft_ipsec_route_moved(AF_INET6, &event->dst, 0, event->prefixlen);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
 		if (entry->rule.family != AF_INET6)
 			continue;
@@ -2284,6 +2525,9 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 			ft_neigh_invalidate(entry);
 		}
 	}
+	/* An SA watching this peer is corrected rather than retired: nothing
+	 * re-offers an SA the way a packet re-offers a flow. */
+	ft_ipsec_neigh_moved(neigh);
 	spin_unlock(&ft_watch_lock);
 	read_unlock_bh(&neigh->lock);
 	return NOTIFY_DONE;
@@ -3554,21 +3798,37 @@ static void ft_mc_rows(struct seq_file *seq)
 #define FT_IPSEC_NEIGH_TRIES	20
 #define FT_IPSEC_NEIGH_WAIT_MS	100
 
-static int ft_ipsec_next_hop(struct xfrm_state *x,
-			     struct cdx_ipsec_sa_spec *spec,
-			     struct netlink_ext_ack *extack)
+/* Ask the FIB and the neighbour table where the peer is now.
+ *
+ * `wait` is the difference between the two callers, and it is not a tuning
+ * knob. At install time there is nowhere to retry from: packet offload has no
+ * software fallback, so a refusal fails the tunnel outright and a cold ARP
+ * cache has to be waited out. A re-resolution has somewhere to wait instead --
+ * the neighbour event that arrives when the peer answers brings it straight
+ * back here -- so it probes and returns rather than holding a shared
+ * workqueue for seconds.
+ */
+static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
+			     const union nf_inet_addr *local,
+			     const union nf_inet_addr *peer, bool wait,
+			     u8 *mac, struct netlink_ext_ack *extack)
 {
 	struct neighbour *neighbour;
 	unsigned int attempt;
 	struct rtable *rt;
+	/* The SA's own local endpoint is part of the question, not decoration:
+	 * an output lookup carrying a source address answers for the route
+	 * that address may actually use, which is the one this tunnel's frames
+	 * will take. */
 	struct flowi4 fl4 = {
-		.daddr = x->id.daddr.a4,
-		.saddr = x->props.saddr.a4,
-		.flowi4_oif = spec->dev->ifindex,
+		.daddr = peer->ip,
+		.saddr = local->ip,
+		.flowi4_oif = dev->ifindex,
 	};
 	int rc = 0;
 
-	if (spec->family != AF_INET) {
+	eth_zero_addr(mac);
+	if (family != AF_INET) {
 		NL_SET_ERR_MSG(extack, "cdx: only IPv4 tunnel endpoints are supported");
 		return -EOPNOTSUPP;
 	}
@@ -3577,7 +3837,7 @@ static int ft_ipsec_next_hop(struct xfrm_state *x,
 		NL_SET_ERR_MSG(extack, "cdx: no route to the remote tunnel endpoint");
 		return PTR_ERR(rt);
 	}
-	if (rt->dst.dev != spec->dev) {
+	if (rt->dst.dev != dev) {
 		NL_SET_ERR_MSG(extack, "cdx: the route to the peer does not leave by the offload device");
 		rc = -EOPNOTSUPP;
 		goto out;
@@ -3589,34 +3849,35 @@ static int ft_ipsec_next_hop(struct xfrm_state *x,
 	 * is not guaranteed: the exchange may have run over a different
 	 * address, or the entry may have been evicted, and on a freshly booted
 	 * gateway the table can simply be empty. Refusing then would fail the
-	 * tunnel outright, because packet offload has no software fallback to
-	 * fall back into -- so ask the ordinary way and wait briefly, rather
-	 * than turn a cold ARP cache into a tunnel that never comes up.
+	 * tunnel outright, so ask the ordinary way rather than turn a cold ARP
+	 * cache into a tunnel that never comes up.
 	 *
-	 * This runs in process context on the netlink path, before any CDX
-	 * lock or RTNL is taken, so waiting here blocks only the caller that
-	 * asked for the SA. The bound is short enough to be invisible next to
-	 * the exchange that preceded it and long enough for ARP on a LAN.
+	 * The waiting caller runs in process context on the netlink path,
+	 * before any CDX lock or RTNL is taken, so waiting blocks only the
+	 * caller that asked for the SA. The bound is short enough to be
+	 * invisible next to the exchange that preceded it and long enough for
+	 * ARP on a LAN.
 	 */
 	neighbour = dst_neigh_lookup(&rt->dst, &fl4.daddr);
 	if (!neighbour) {
 		rc = -EHOSTUNREACH;
 		goto report;
 	}
-	for (attempt = 0; attempt < FT_IPSEC_NEIGH_TRIES; attempt++) {
+	for (attempt = 0; attempt < (wait ? FT_IPSEC_NEIGH_TRIES : 1); attempt++) {
 		/* Every usable state, which is the same set admission accepts:
 		 * a neighbour that is merely stale still has the address that
 		 * was last confirmed, and Linux refreshes it in its own time. */
 		if (READ_ONCE(neighbour->nud_state) & NUD_VALID) {
 			read_lock_bh(&neighbour->lock);
-			ether_addr_copy(spec->dst_mac, neighbour->ha);
+			ether_addr_copy(mac, neighbour->ha);
 			read_unlock_bh(&neighbour->lock);
 			break;
 		}
 		neigh_event_send(neighbour, NULL);
-		msleep(FT_IPSEC_NEIGH_WAIT_MS);
+		if (wait)
+			msleep(FT_IPSEC_NEIGH_WAIT_MS);
 	}
-	if (is_zero_ether_addr(spec->dst_mac))
+	if (is_zero_ether_addr(mac))
 		rc = -EHOSTUNREACH;
 	neigh_release(neighbour);
 report:
@@ -3625,6 +3886,14 @@ report:
 out:
 	ip_rt_put(rt);
 	return rc;
+}
+
+static int ft_ipsec_next_hop(struct xfrm_state *x,
+			     struct cdx_ipsec_sa_spec *spec,
+			     struct netlink_ext_ack *extack)
+{
+	return ft_ipsec_peer_mac(spec->dev, spec->family, &spec->src, &spec->dst,
+				 true, spec->dst_mac, extack);
 }
 
 /* Translate a kernel state into the backend's description of one.
@@ -3726,6 +3995,7 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 
 static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack)
 {
+	struct ft_ipsec_watch *watch = NULL;
 	struct cdx_ipsec_sa_spec spec;
 	struct cdx_ipsec_sa *sa;
 	int rc;
@@ -3761,13 +4031,25 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	rc = ft_ipsec_spec(x, &spec, extack);
 	if (rc)
 		return rc;
+	/* Before the hardware, so that an SA nothing could follow is never
+	 * installed at all. An outbound SA's next hop is written into its
+	 * entry and never re-read, so the watch is part of installing one
+	 * rather than an improvement on it. */
+	if (spec.dir == CDX_IPSEC_DIR_OUT) {
+		watch = kzalloc(sizeof(*watch), GFP_KERNEL);
+		if (!watch)
+			return -ENOMEM;
+	}
 	cdx_ft_begin();
 	rc = cdx_ipsec_sa_add(&spec, x, &sa);
 	cdx_ft_end();
 	if (rc) {
+		kfree(watch);
 		NL_SET_ERR_MSG_WEAK(extack, "cdx: the hardware refused this SA");
 		return rc;
 	}
+	if (watch)
+		ft_ipsec_watch_add(watch, &spec, sa);
 	/* The opaque owner, not the sixteen-bit handle: it identifies this SA
 	 * for as long as it lives, whereas a handle becomes reusable the
 	 * moment the SA is deleted. cdx_ipsec_sa_handle() still answers for
@@ -3822,6 +4104,149 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 
 static DECLARE_WORK(ft_ipsec_retire, ft_ipsec_retire_work);
 
+/* Find a watch by the identity it was created with, never by its address.
+ * Caller holds ft_watch_lock.
+ */
+static struct ft_ipsec_watch *ft_ipsec_watch_find(u64 cookie)
+{
+	struct ft_ipsec_watch *watch;
+
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		if (watch->cookie == cookie)
+			return watch;
+	return NULL;
+}
+
+/* The next watch this pass has not already taken on. Caller holds
+ * ft_watch_lock. */
+static struct ft_ipsec_watch *ft_ipsec_watch_stale(u64 pass)
+{
+	struct ft_ipsec_watch *watch;
+
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		if (watch->stale && watch->pass != pass)
+			return watch;
+	return NULL;
+}
+
+/* Ask again where each marked SA's peer is, and correct the ones that moved.
+ *
+ * Two things make this safe to do with every lock dropped across the lookup,
+ * which it has to be because resolving sleeps:
+ *
+ * The device is pinned for the pass. xfrm holds a reference to an offloaded
+ * state's device, but that reference goes with the state, and the state can be
+ * destroyed while this is resolving -- so the pass takes its own.
+ *
+ * The SA is alive whenever its watch is. ft_xdo_state_delete() unlinks the
+ * watch before queueing the retirement, and that retirement takes the control
+ * mutex to free the SA; so a watch found under both is an SA the rebuild can
+ * still be handed. Nothing here dereferences a watch pointer outside the lock,
+ * which is why the cookie exists: a freed watch's memory can be reused by the
+ * next SA installed, and an address would then name the wrong one.
+ *
+ * A failure leaves the SA on the address it has, which is what it would have
+ * had anyway, and re-marks the watch without queueing itself again: the
+ * neighbour or route event that fixes the underlying problem is what brings
+ * the work back, and re-queueing here would spin against a peer that is
+ * simply down. The re-mark is why each pass takes a watch at most once --
+ * otherwise the loop below would pick the same failure straight back up.
+ *
+ * A failure is also said out loud, once per watch. The silent cases are the
+ * ones worth naming: a peer that has moved to a route leaving by a different
+ * port cannot be followed at all, because packet offload binds a state to one
+ * device and this SA's egress framing belongs to that device. Nothing retires
+ * the SA and nothing else would report it.
+ */
+static void ft_ipsec_follow_work(struct work_struct *work)
+{
+	struct ft_ipsec_watch *watch;
+	struct cdx_ipsec_sa *sa;
+	union nf_inet_addr local;
+	union nf_inet_addr peer;
+	struct net_device *dev;
+	u8 was_dst[ETH_ALEN];
+	u8 was_src[ETH_ALEN];
+	u8 mac[ETH_ALEN];
+	bool reported;
+	u64 cookie;
+	u64 pass;
+	u8 family;
+	int rc;
+
+	spin_lock_bh(&ft_watch_lock);
+	pass = ++ft_ipsec_follow_pass;
+	spin_unlock_bh(&ft_watch_lock);
+
+	for (;;) {
+		spin_lock_bh(&ft_watch_lock);
+		watch = ft_ipsec_watch_stale(pass);
+		if (!watch) {
+			spin_unlock_bh(&ft_watch_lock);
+			return;
+		}
+		watch->stale = false;
+		watch->pass = pass;
+		cookie = watch->cookie;
+		dev = watch->dev;
+		family = watch->family;
+		local = watch->local;
+		peer = watch->peer;
+		reported = watch->reported;
+		ether_addr_copy(was_dst, watch->dst_mac);
+		ether_addr_copy(was_src, watch->src_mac);
+		dev_hold(dev);
+		spin_unlock_bh(&ft_watch_lock);
+
+		rc = ft_ipsec_peer_mac(dev, family, &local, &peer, false, mac,
+				       NULL);
+		if (!rc && ether_addr_equal(mac, was_dst) &&
+		    ether_addr_equal(dev->dev_addr, was_src)) {
+			/* Neither address moved. A route event marks every SA
+			 * under the changed prefix, so most passes end here. */
+			dev_put(dev);
+			continue;
+		}
+		if (!rc) {
+			cdx_ft_begin();
+			spin_lock_bh(&ft_watch_lock);
+			watch = ft_ipsec_watch_find(cookie);
+			sa = watch ? watch->sa : NULL;
+			spin_unlock_bh(&ft_watch_lock);
+			rc = sa ? cdx_ipsec_sa_set_next_hop(sa, mac) : 0;
+			if (sa && !rc) {
+				spin_lock_bh(&ft_watch_lock);
+				watch = ft_ipsec_watch_find(cookie);
+				if (watch) {
+					ether_addr_copy(watch->dst_mac, mac);
+					ether_addr_copy(watch->src_mac,
+							dev->dev_addr);
+					watch->reported = false;
+				}
+				spin_unlock_bh(&ft_watch_lock);
+				atomic64_inc(&ft_ipsec_next_hop_updates);
+				netdev_info(dev, "cdx: IPsec SA followed its peer to %pM\n",
+					    mac);
+			}
+			cdx_ft_end();
+		}
+		if (rc) {
+			spin_lock_bh(&ft_watch_lock);
+			watch = ft_ipsec_watch_find(cookie);
+			if (watch) {
+				watch->stale = true;
+				watch->reported = true;
+			}
+			spin_unlock_bh(&ft_watch_lock);
+			if (!reported)
+				netdev_warn(dev,
+					    "cdx: IPsec SA to %pI4 could not follow its peer (%d); its tunnel keeps emitting to %pM\n",
+					    &peer.ip, rc, was_dst);
+		}
+		dev_put(dev);
+	}
+}
+
 /* Delete cannot touch the hardware, and it must not wait for free either.
  *
  * It cannot touch it because xfrm_state_delete() holds x->lock across
@@ -3856,14 +4281,18 @@ static void ft_xdo_state_delete(struct xfrm_state *x)
 	if (!sa)
 		return;
 	x->xso.offload_handle = 0;
+	/* Before the retirement is queued, and this order is what the resolve
+	 * work relies on: once the watch is off the list, a pass that finds no
+	 * watch for its cookie knows the SA is going and leaves it alone. */
+	ft_ipsec_watch_del(sa);
 	/* Retire the flows first, while the handle still names this SA. They
 	 * point at a SEC context that is about to stop describing anything,
 	 * and a handle is reusable the moment its SA is gone. */
 	ft_ipsec_retire_sa(cdx_ipsec_sa_handle(sa));
-	/* GFP_ATOMIC: x->lock is held. An allocation failure here would strand
-	 * the hardware SA, so say so rather than fail silently -- the operator
-	 * can still reload the adapter, and the alternative is a classifier
-	 * entry nobody can account for. */
+	/* GFP_ATOMIC: this can arrive with x->lock held. An allocation failure
+	 * here would strand the hardware SA, so say so rather than fail
+	 * silently -- the operator can still reload the adapter, and the
+	 * alternative is a classifier entry nobody can account for. */
 	retirement = kzalloc(sizeof(*retirement), GFP_ATOMIC);
 	if (!retirement) {
 		pr_err("cdx: no memory to retire IPsec SA for spi %x; its hardware entry is stranded\n",
@@ -3871,9 +4300,13 @@ static void ft_xdo_state_delete(struct xfrm_state *x)
 		return;
 	}
 	retirement->sa = sa;
-	spin_lock(&ft_ipsec_retired_lock);
+	/* _bh for the same reason ft_ipsec_watch_del() uses it: this callback
+	 * reaches here from a softirq on SA expiry and from plain netlink
+	 * context when a state fails to insert, so the queue has to be taken
+	 * with softirqs off on both. */
+	spin_lock_bh(&ft_ipsec_retired_lock);
 	list_add_tail(&retirement->list, &ft_ipsec_retired);
-	spin_unlock(&ft_ipsec_retired_lock);
+	spin_unlock_bh(&ft_ipsec_retired_lock);
 	schedule_work(&ft_ipsec_retire);
 }
 
@@ -4184,7 +4617,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_next_hop_updates %lld\n",
 		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -4197,7 +4630,8 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_mac_invalidations),
 		   atomic64_read(&ft_fdb_invalidations),
 		   atomic64_read(&ft_admission_invalidations),
-		   atomic64_read(&ft_ipsec_invalidations));
+		   atomic64_read(&ft_ipsec_invalidations),
+		   atomic64_read(&ft_ipsec_next_hop_updates));
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   records, slots);
 	ft_session_rows(seq);
@@ -4327,6 +4761,8 @@ netdev:
 	 * them, leaving a retirement queued against code about to unload. */
 	ft_ipsec_detach_all();
 	flush_work(&ft_ipsec_retire);
+	cancel_work_sync(&ft_ipsec_follow);
+	ft_ipsec_watch_flush();
 proc:
 	proc_remove(ft_proc);
 	ft_proc = NULL;
@@ -4407,6 +4843,11 @@ static void __exit ask_flowtable_exit(void)
 	 * be unmapped, and this order is the only one that ends with an empty
 	 * list. */
 	flush_work(&ft_ipsec_retire);
+	/* The notifiers that mark a watch are gone above, so nothing can queue
+	 * this again; stop the pass in flight and drop the watches it walked,
+	 * which are this module's memory rather than the kernel's. */
+	cancel_work_sync(&ft_ipsec_follow);
+	ft_ipsec_watch_flush();
 	cancel_work_sync(&ft_retire_work);
 	cancel_delayed_work_sync(&ft_work);
 	/* Direct first: it is the route a DPAA port actually takes, so closing

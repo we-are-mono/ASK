@@ -56,6 +56,14 @@ struct cdx_ipsec_sa {
 	 * counting or its ageing. */
 	RouteEntry route;
 	u16 handle;
+	/* A classifier entry this SA could not prove it had removed. The
+	 * delete path frees its software bookkeeping on every arm, including
+	 * failure, so afterwards nothing distinguishes "no entry" from "an
+	 * entry still linked under a key we no longer track" -- and a later
+	 * rebuild would add that key a second time, which is exactly the
+	 * duplicate bucket the delete refuses to risk. Once set, this SA's
+	 * framing stops being rewritable. */
+	bool stranded;
 };
 
 /* Rotating hint for the handle search below. Static because the handle space
@@ -380,6 +388,79 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 	kfree(owner);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_del, ASK_CDX_FLOWTABLE);
+
+int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac)
+{
+	u8 previous[ETH_ALEN];
+	PSAEntry entry;
+	int rc;
+
+	cdx_ft_assert_held();
+	if (!sa || !sa->entry || !dst_mac || is_zero_ether_addr(dst_mac))
+		return -EINVAL;
+	entry = sa->entry;
+	/* Only an outbound SA has egress framing at all, and only this owner's
+	 * embedded route can be rewritten -- an entry holding someone else's
+	 * route is not this interface's to move. */
+	if (entry->pRtEntry != &sa->route)
+		return -EINVAL;
+	if (sa->stranded)
+		return -EIO;
+	if (cdx_ft_failed())
+		return -EIO;
+	/* An outbound NAT-T entry shared with another SA on the same UDP
+	 * tuple, which a rekey overlap produces. Its delete only drops a
+	 * reference, leaving the entry -- and the address in its opcodes --
+	 * exactly as it was, and the reinstall would find the same entry and
+	 * take the reference back. Nothing would change and this would report
+	 * that it had, so refuse instead: when the other SA goes the count
+	 * falls to one and the next attempt rewrites it for real. */
+	if (IS_NATT_SA(entry) && entry->ct && entry->ct->natt_out_refcnt > 1)
+		return -EBUSY;
+
+	/* The old entry has to be provably out before the new one goes in.
+	 * Both carry the same key, and a bucket holding two copies of one key
+	 * cannot be fully cleared afterwards -- so a delete that cannot prove
+	 * the key is gone refuses the rebuild rather than making the SA
+	 * unrecoverable. The unsynced arm is the exception: it parks the key
+	 * in the quarantine, provably out of the table, so a rebuild over it
+	 * is safe.
+	 *
+	 * A hard failure is terminal for this SA's framing rather than merely
+	 * this attempt. The delete frees its software bookkeeping whichever
+	 * way it went, so a later attempt would find no entry to remove, skip
+	 * the removal, and add the same key again on top of the one still
+	 * linked. The SA keeps classifying on the framing it has -- which is
+	 * the state it was already in -- until it is deleted and reinstalled. */
+	if (entry->ct && entry->ct->handle) {
+		rc = cdx_ipsec_delete_fp_entry(entry);
+		if (rc && rc != EN_EHASH_DELETE_UNSYNCED) {
+			sa->stranded = true;
+			pr_warn("cdx: IPsec SA handle %u could not release its classifier entry (%d); it is left on its previous next hop and cannot be moved again\n",
+				sa->handle, rc);
+			return -EIO;
+		}
+	}
+	ether_addr_copy(previous, sa->route.dstmac);
+	ether_addr_copy(sa->route.dstmac, dst_mac);
+	rc = ipsec_install_fp_entry(entry);
+	if (!rc)
+		return 0;
+
+	/* Put the SA back rather than leave it with no entry at all. What just
+	 * failed is the same install that succeeded when this SA was created,
+	 * so the retry is very likely to work -- and it ends with the SA where
+	 * it started, reachable on an address that has moved, instead of with
+	 * frames leaving SEC to match nothing. */
+	ether_addr_copy(sa->route.dstmac, previous);
+	if (ipsec_install_fp_entry(entry)) {
+		sa->stranded = true;
+		pr_err("cdx: IPsec SA handle %u lost its classifier entry while following its peer; its tunnel carries nothing until the SA is reinstalled\n",
+		       sa->handle);
+	}
+	return -EIO;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_set_next_hop, ASK_CDX_FLOWTABLE);
 
 u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 {

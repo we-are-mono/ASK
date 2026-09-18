@@ -20,6 +20,7 @@ def function(source, name):
     match = re.search(r"^(?:static )?(?:int |void |bool |U16 |u16 |uint32_t |"
                       r"struct qman_fq \*|struct en_exthash_tbl_entry ?\* ?|"
                       r"struct net_device ?\* ?|struct ft_mc_group ?\* ?|"
+                      r"struct xfrm_state ?\* ?|struct ft_ipsec_watch ?\* ?|"
                       r"enum qman_cb_dqrr_result )"
                       # __init/__exit sit between the return type and the name.
                       r"(?:__init |__exit )?"
