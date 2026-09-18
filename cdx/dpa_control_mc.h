@@ -93,8 +93,19 @@ struct mcast_group_info
   int grpid;
   unsigned int uiListenerCnt;
   struct mcast_group_member members[MC_MAX_LISTENERS_PER_GROUP];
-  struct _tCtEntry *pCtEntry;  
+  struct _tCtEntry *pCtEntry;
   char ucIngressIface[IF_NAME_SIZE];
+  /* The ingress device, when the owner that installed this group holds one.
+   *
+   * The legacy owner names an interface and leaves this NULL, because its
+   * whole control plane is names and nothing it does outlives a rename. A
+   * group installed through cdx_mcast_backend.h is identified by its ports,
+   * which the caller pins for the group's life, so it can be keyed on the
+   * device itself -- and must be: nothing in cdx handles NETDEV_CHANGENAME, so
+   * a renamed ingress would otherwise stop matching its own group and freeze
+   * its listener set forever. ucIngressIface stays populated either way, for
+   * the query walkers and the log. */
+  struct net_device *in_dev;
   uint8_t mctype;
 };
 

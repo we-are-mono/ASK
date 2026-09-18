@@ -337,6 +337,38 @@ every listener selected its table descriptor with the previous listener's FMAN
 index — or with zero, on the first. Invisible on a single-FMAN part and wrong
 on any other.
 
+**Replication does not take an offline port, and that is a decision rather
+than an inheritance.** Three FMAN offline ports are unclaimed on this board —
+the DTS declares six, `0x2` is the PCD host-command port and CDX takes `0x3`
+and `0x4` for IPsec and Wi-Fi, so `0x5` through `0x7` are free and claiming one
+is a cell-index override alongside the existing two. An offline port buys a
+second classification pass, which is what IPsec needs because a decrypted
+frame's real 5-tuple was encrypted on the way in, and what Wi-Fi needs because
+its frames never arrived on a MAC at all.
+
+Multicast needs neither, and the reason is that fan-out is already expressible
+in the ingress port's own tables. The root entry's `REPLICATE` opcode names a
+chain of per-listener entries, each carrying its own opcode list — its own
+`INSERT_VLAN_HDR`, its own `INSERT_L2_HDR`, its own enqueue — so a per-listener
+header transform is a property of that listener's entry rather than something
+a frame has to be re-classified to acquire. The bridged case is exactly this:
+one group's copies leave tagged on one port and untagged on another, and both
+are one pass.
+
+Nor is the chain a bound to route around. The microcode walks `next_entry` to
+a null terminator rather than a count — `first_member_flow_addr`'s neighbouring
+`rsvd` field is the vendor's own commented-out `num_mcast_members`, and their
+dumper walks `while(1)` — so nothing in the structure limits its length. The
+eight was `MC_MAX_LISTENERS_PER_GROUP` sizing a software array, plus the shared
+opcode cursor described above, and neither survives contact.
+
+The positive reason not to spend one is that multicast is the worst possible
+workload to put a second pipeline traversal in front of. It is the one case
+where the frame count is *multiplied*: N listeners already cost N transmits,
+and a re-injection pass would make it N transmits plus a re-classify. An
+offline port is a scarce resource being spent to make the expensive case more
+expensive.
+
 **Host delivery is not solved by this increment.**
 `SWITCHDEV_OBJ_ID_HOST_MDB` exists for traffic the bridge itself must receive,
 and a hardware entry that replicates to ports only would starve a local

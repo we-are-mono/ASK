@@ -8,6 +8,10 @@
  *
  */
 #include <linux/mutex.h>
+/* Before cdx.h, as every other file that needs it does: it reaches the SDK's
+ * own types_linux.h, which defines TRUE and FALSE and is -Werror about
+ * redefining them. */
+#include "portdefs.h"
 #include "cdx.h"
 #include "cdx_cmd_validator.h"
 #include "list.h"
@@ -16,8 +20,11 @@
 #include "control_ipv4.h"
 #include "dpa_control_mc.h"
 #include "control_ipv6.h"
+#include "cdx_flowtable_backend.h"
+#include "cdx_mcast_backend.h"
 #include "linux/netdevice.h"
 #include <linux/if_ether.h>
+#include <net/ipv6.h>
 #include <net/net_namespace.h>
 
 typedef union ucode_phyaddr_u {
@@ -273,38 +280,61 @@ static void cdx_mcast_compute_mac(const struct mcast_group_info *grp,
 	}
 }
 
-static int cdx_mcast_subscribe_ingress_mac(const char *ifname,
+/* The group's ingress device.
+ *
+ * A group whose owner holds the device uses it; one that only has a name looks
+ * the name up. The distinction matters at teardown rather than at install: a
+ * rename between the two would leave the name lookup finding nothing, and the
+ * dev_mc_add() refcount would never be dropped. Returns NULL with nothing held
+ * when the device is gone, which for an unsubscribe means the subscription
+ * went with it. */
+static struct net_device *cdx_mcast_ingress_dev(const struct mcast_group_info *grp,
+						bool *put)
+{
+	*put = false;
+	if (grp->in_dev)
+		return grp->in_dev;
+	*put = true;
+	return dev_get_by_name(&init_net, grp->ucIngressIface);
+}
+
+static int cdx_mcast_subscribe_ingress_mac(const struct mcast_group_info *grp,
 					   const uint8_t mac[ETH_ALEN])
 {
 	struct net_device *dev;
+	bool put;
 	int rc;
 
-	dev = dev_get_by_name(&init_net, ifname);
+	dev = cdx_mcast_ingress_dev(grp, &put);
 	if (!dev) {
-		DPA_ERROR("%s::ingress netdev %s not found\n", __func__, ifname);
+		DPA_ERROR("%s::ingress netdev %s not found\n", __func__,
+			  grp->ucIngressIface);
 		return -ENODEV;
 	}
 	rc = dev_mc_add(dev, mac);
-	dev_put(dev);
+	if (put)
+		dev_put(dev);
 	if (rc)
 		DPA_ERROR("%s::dev_mc_add(%s, %pM) failed: %d\n",
-			  __func__, ifname, mac, rc);
+			  __func__, grp->ucIngressIface, mac, rc);
 	return rc;
 }
 
-static void cdx_mcast_unsubscribe_ingress_mac(const char *ifname,
+static void cdx_mcast_unsubscribe_ingress_mac(const struct mcast_group_info *grp,
 					      const uint8_t mac[ETH_ALEN])
 {
 	struct net_device *dev;
+	bool put;
 
-	dev = dev_get_by_name(&init_net, ifname);
+	dev = cdx_mcast_ingress_dev(grp, &put);
 	if (!dev) {
 		/* Interface gone (e.g. removed before group teardown). The
 		 * subscription is gone with it; nothing to undo. */
 		return;
 	}
 	(void)dev_mc_del(dev, mac);
-	dev_put(dev);
+	if (put)
+		dev_put(dev);
 }
 
 
@@ -737,7 +767,21 @@ static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
 		pCtEntry->fftype = FFTYPE_IPV6;
 	}
 
-	onif_desc = get_onif_by_name(ucInterface);
+	/* By device where the owner holds one, by name otherwise -- the same
+	 * split, and for the same reason, as a listener's resolution. */
+	if (pMcastGrpInfo->in_dev) {
+		struct dpa_iface_info *iface;
+
+		iface = dpa_get_ifinfo_by_netdev(pMcastGrpInfo->in_dev);
+		onif_desc = (iface && iface->itf_id < L2_MAX_ONIF) ?
+			get_onif_by_index(iface->itf_id) : NULL;
+		if (onif_desc && (!(onif_desc->flags & ENTRY_VALID) ||
+				  !onif_desc->itf ||
+				  onif_desc->itf->index != iface->itf_id))
+			onif_desc = NULL;
+	} else {
+		onif_desc = get_onif_by_name(ucInterface);
+	}
 	if (!onif_desc)
 	{
 		DPA_ERROR("%s::unable to get onif for iface %s\n",__func__, ucInterface);
@@ -918,8 +962,7 @@ static int cdx_create_mcast_group(void *mcast_cmd, int bIsIPv6)
 	{
 		uint8_t mac[ETH_ALEN];
 		cdx_mcast_compute_mac(pMcastGrpInfo, mac);
-		iRet = cdx_mcast_subscribe_ingress_mac(
-			pMcastGrpInfo->ucIngressIface, mac);
+		iRet = cdx_mcast_subscribe_ingress_mac(pMcastGrpInfo, mac);
 		if (iRet) {
 			DPA_ERROR("%s::%d MAC filter subscription failed (%d)\n",
 				  __func__, __LINE__, iRet);
@@ -980,8 +1023,7 @@ err_ret:
 		{
 			uint8_t mac[ETH_ALEN];
 			cdx_mcast_compute_mac(pMcastGrpInfo, mac);
-			cdx_mcast_unsubscribe_ingress_mac(
-				pMcastGrpInfo->ucIngressIface, mac);
+			cdx_mcast_unsubscribe_ingress_mac(pMcastGrpInfo, mac);
 		}
 		/* Use a local for the cleanup return; reassigning iRet here
 		 * would clobber the original failure code set by whichever
@@ -1143,7 +1185,7 @@ static void cdx_mcast_group_destroy(struct mcast_group_info *pMcastGrpInfo)
 	 * now-gone group. dev_mc_add/del refcount, so groups sharing a MAC
 	 * (IPv4 32→23-bit collisions) decrement cleanly. */
 	cdx_mcast_compute_mac(pMcastGrpInfo, mac);
-	cdx_mcast_unsubscribe_ingress_mac(pMcastGrpInfo->ucIngressIface, mac);
+	cdx_mcast_unsubscribe_ingress_mac(pMcastGrpInfo, mac);
 	kfree(pMcastGrpInfo);
 }
 
@@ -1985,3 +2027,551 @@ void mc6_exit(void)
 
 	return;
 }
+
+/* ------------------------------------------------- the flowtable owner's door
+ *
+ * The typed group interface cdx_mcast_backend.h declares.
+ *
+ * The legacy control plane reaches the machinery below through FCI: something
+ * outside the box sends CMD_MC4_MULTICAST, CMM forwards it, and this file
+ * decodes a wire message back into a group. Nothing in the product ever sent
+ * that command -- `query mc4` on a production gateway carrying IPTV answers
+ * "table empty" -- so what follows is not a second way in to a working feature.
+ * It is the first one.
+ *
+ * What it is not is a second implementation. The group list, the id allocator,
+ * the ingress MAC subscription, the per-listener entry builder, the root entry
+ * and the whole of teardown are the code the legacy owner already runs; only
+ * the door is new. A caller here describes a group whole, in kernel types, and
+ * it is installed in one pass -- there is no ADD-then-UPDATE sequence because
+ * there is no five-listener wire message to split it across.
+ */
+
+struct cdx_mc_group {
+	struct mcast_group_info *info;
+};
+
+/* The public bound and the array it indexes are declared in different headers,
+ * and raising the public one alone would overrun struct mcast_group_info's
+ * member array on the heap. The file already pins the array's own width with
+ * BUILD_BUG_ON(MC_MAX_LISTENERS_PER_GROUP > 8); this pins the two to each
+ * other, the way CDX_FT_MAX_BINDINGS and CDX_FT_VLAN_MAX are pinned to theirs. */
+static_assert(CDX_MC_MAX_LISTENERS == MC_MAX_LISTENERS_PER_GROUP,
+	      "the group interface's listener bound must be the member array's");
+
+bool cdx_mc_port_supported(struct net_device *dev)
+{
+	/* Deliberately the flowtable's own test rather than a weaker one of
+	 * this subsystem's: a group's ports are the flowtable's ports, and a
+	 * device that could not carry a flow cannot carry a replica either. */
+	return cdx_ft_port_supported(dev);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_mc_port_supported, ASK_CDX_FLOWTABLE);
+
+/* The group address, as the classifier requires it and as the contract narrows
+ * it. Link-local scope is refused rather than carried: 224.0.0.0/24 and IPv6
+ * scopes 1 and 2 are where IGMP, MLD and the querier itself live, and
+ * replicating those in hardware would take the membership protocol away from
+ * the bridge whose snooping is the source of truth for every group here. */
+static int cdx_mc_check_group(const struct cdx_mc_group_spec *spec)
+{
+	if (spec->family == AF_INET) {
+		u32 dst = ntohl(spec->dst.ip);
+
+		if ((dst & 0xf0000000) != 0xe0000000)
+			return -EOPNOTSUPP;
+		if ((dst & 0xffffff00) == 0xe0000000)
+			return -EOPNOTSUPP;
+		/* A source is part of the key and an external hash cannot mask
+		 * one, so a caller holding a (*,G) membership has nothing to
+		 * install yet. Saying so here keeps that from becoming a
+		 * group keyed on 0.0.0.0 that matches nothing. */
+		if (!spec->src.ip)
+			return -EOPNOTSUPP;
+		return 0;
+	}
+	if (spec->family == AF_INET6) {
+		const struct in6_addr *dst = &spec->dst.in6;
+
+		if (!ipv6_addr_is_multicast(dst))
+			return -EOPNOTSUPP;
+		if (__ipv6_addr_src_scope(__ipv6_addr_type(dst)) <=
+		    IPV6_ADDR_SCOPE_LINKLOCAL)
+			return -EOPNOTSUPP;
+		if (ipv6_addr_any(&spec->src.in6))
+			return -EOPNOTSUPP;
+		return 0;
+	}
+	return -EOPNOTSUPP;
+}
+
+static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
+{
+	unsigned int ii, jj;
+	int rc;
+
+	if (!spec->in || !spec->listeners ||
+	    spec->listeners > CDX_MC_MAX_LISTENERS)
+		return -EOPNOTSUPP;
+	rc = cdx_mc_check_group(spec);
+	if (rc)
+		return rc;
+	if (!cdx_mc_port_supported(spec->in))
+		return -EOPNOTSUPP;
+	for (ii = 0; ii < spec->listeners; ii++) {
+		const struct cdx_mc_listener *l = &spec->listener[ii];
+
+		if (!l->dev || l->vlans > CDX_FT_VLAN_MAX)
+			return -EOPNOTSUPP;
+		if (!cdx_mc_port_supported(l->dev))
+			return -EOPNOTSUPP;
+		/* A port named twice would be programmed twice and receive
+		 * two copies of every frame. The bridge cannot produce such a
+		 * membership, so this is a caller error rather than a
+		 * configuration, and it fails rather than being deduplicated
+		 * -- silently forwarding a different group than the one asked
+		 * for is the worse outcome. */
+		for (jj = 0; jj < ii; jj++)
+			if (spec->listener[jj].dev == l->dev)
+				return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+/* One listener's entry. The onif comes from the netdev by index, which is the
+ * resolution this ownership mode can do -- see create_exthash_entry4mcast_member
+ * for why the legacy owner's name lookup is not interchangeable with it. */
+static struct en_exthash_tbl_entry *cdx_mc_listener_entry(RouteEntry *pRtEntry,
+		const struct cdx_mc_listener *listener,
+		struct en_exthash_tbl_entry *prev, uint32_t tbl_type)
+{
+	struct cdx_l2_encap encap = {};
+	struct dpa_iface_info *iface;
+	POnifDesc onif_desc;
+	u8 ii;
+
+	iface = dpa_get_ifinfo_by_netdev(listener->dev);
+	if (!iface || iface->itf_id >= L2_MAX_ONIF) {
+		DPA_ERROR("%s::no interface for %s\n", __func__,
+			  listener->dev->name);
+		return NULL;
+	}
+	onif_desc = get_onif_by_index(iface->itf_id);
+	if (!onif_desc || !(onif_desc->flags & ENTRY_VALID) || !onif_desc->itf ||
+	    onif_desc->itf->index != iface->itf_id) {
+		DPA_ERROR("%s::no valid onif for %s\n", __func__,
+			  listener->dev->name);
+		return NULL;
+	}
+	/* The rule orders tags outermost first, as the wire and the bridge do;
+	 * dpa_l2hdr_info orders them innermost first. Reversed here, at the one
+	 * place in this path the two conventions meet -- the same reversal
+	 * ft_encap() performs for a flow's direction. */
+	for (ii = 0; ii < listener->vlans; ii++) {
+		encap.egress[listener->vlans - 1 - ii].tpid =
+			ntohs(listener->vlan[ii].proto);
+		encap.egress[listener->vlans - 1 - ii].tci = listener->vlan[ii].id;
+	}
+	encap.num_egress = listener->vlans;
+	/* An untagged listener asks for no override, and must not be given
+	 * one: apply_l2_encap() refuses a description the interface walk
+	 * already filled in, and a DSCP-to-PCP egress map fills one in -- it
+	 * pushes a priority tag on a plain physical port. Overriding nothing
+	 * would then fail the whole group for a listener that wanted nothing.
+	 * The flowtable's own encoder guards the same way. */
+	return create_exthash_entry4mcast_member(pRtEntry, onif_desc,
+						 listener->dev,
+						 listener->vlans ? &encap : NULL,
+						 prev, tbl_type);
+}
+
+/* Builds a whole listener chain into `grp`, threaded head to tail, and leaves
+ * it unpublished: nothing in the classifier points at it until a caller makes
+ * something do so. On failure nothing of it survives -- an unpublished chain is
+ * unreachable by the microcode, so its entries are released outright rather
+ * than quarantined, which is the create path's own reasoning. */
+static int cdx_mc_build_listeners(struct mcast_group_info *grp,
+				  const struct cdx_mc_group_spec *spec)
+{
+	struct en_exthash_tbl_entry *tbl_entry = NULL;
+	RouteEntry RtEntry, *pRtEntry = &RtEntry;
+	uint32_t tbl_type;
+	unsigned int ii;
+
+	memset(&RtEntry, 0, sizeof(RouteEntry));
+	cdx_mcast_compute_mac(grp, pRtEntry->dstmac);
+	tbl_type = grp->mctype ? IPV6_MULTICAST_TABLE : IPV4_MULTICAST_TABLE;
+
+	for (ii = 0; ii < spec->listeners; ii++) {
+		tbl_entry = cdx_mc_listener_entry(pRtEntry, &spec->listener[ii],
+						  tbl_entry, tbl_type);
+		if (!tbl_entry) {
+			/* Releases the entries built so far and clears their
+			 * slots. It also hands back the group id, so a caller
+			 * that allocated one must not release it again. */
+			cdx_free_exthash_mcast_members(grp);
+			grp->uiListenerCnt = 0;
+			grp->grpid = -1;
+			return -EIO;
+		}
+		grp->members[ii].bIsValidEntry = 1;
+		grp->members[ii].member_id = ii;
+		grp->members[ii].tbl_entry = tbl_entry;
+		strncpy(grp->members[ii].if_info, spec->listener[ii].dev->name,
+			IF_NAME_SIZE - 1);
+		grp->uiListenerCnt++;
+	}
+	return 0;
+}
+
+/* Programs a described group's listener chain and root entry into an otherwise
+ * empty mcast_group_info. On failure nothing of it is installed. */
+static int cdx_mc_program(struct mcast_group_info *grp,
+			  const struct cdx_mc_group_spec *spec)
+{
+	uint8_t mac[ETH_ALEN];
+	int rc;
+
+	cdx_mcast_compute_mac(grp, mac);
+	/* Before any hardware state, so a failure here unwinds with nothing to
+	 * undo -- the sequencing the legacy create path settled on. */
+	rc = cdx_mcast_subscribe_ingress_mac(grp, mac);
+	if (rc) {
+		DPA_ERROR("%s::MAC filter subscription failed (%d)\n",
+			  __func__, rc);
+		return rc;
+	}
+	rc = cdx_mc_build_listeners(grp, spec);
+	if (rc)
+		goto err_ret;
+
+	rc = cdx_add_mcast_table_entry(grp);
+	if (rc) {
+		DPA_ERROR("%s::adding mcast table entry failed (%d)\n",
+			  __func__, rc);
+		rc = rc < 0 ? rc : -EIO;
+		cdx_free_exthash_mcast_members(grp);
+		grp->uiListenerCnt = 0;
+		grp->grpid = -1;
+		goto err_ret;
+	}
+	return 0;
+
+err_ret:
+	cdx_mcast_unsubscribe_ingress_mac(grp, mac);
+	return rc;
+}
+
+int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
+		     struct cdx_mc_group **result)
+{
+	struct mcast_group_info *grp;
+	uint8_t IngressIface[IF_NAME_SIZE];
+	struct cdx_mc_group *group;
+	int rc;
+
+	cdx_ft_assert_held();
+	*result = NULL;
+	rc = cdx_mc_check(spec);
+	if (rc)
+		return rc;
+
+	group = kzalloc(sizeof(*group), GFP_KERNEL);
+	if (!group)
+		return -ENOMEM;
+	grp = kzalloc(sizeof(*grp), GFP_KERNEL);
+	if (!grp) {
+		kfree(group);
+		return -ENOMEM;
+	}
+	INIT_LIST_HEAD(&grp->list);
+	grp->grpid = -1;
+	grp->mctype = spec->family == AF_INET6;
+	if (grp->mctype) {
+		memcpy(grp->ipv6_saddr, &spec->src.in6, IPV6_ADDRESS_LENGTH);
+		memcpy(grp->ipv6_daddr, &spec->dst.in6, IPV6_ADDRESS_LENGTH);
+	} else {
+		grp->ipv4_saddr = spec->src.ip;
+		grp->ipv4_daddr = spec->dst.ip;
+	}
+	strncpy(grp->ucIngressIface, spec->in->name, IF_NAME_SIZE - 1);
+	/* Keyed on the device rather than on that name. The caller pins it for
+	 * the group's life, nothing in cdx handles NETDEV_CHANGENAME, and a
+	 * group that stopped recognising its own ingress after a rename would
+	 * refuse every subsequent replace and freeze its listener set. */
+	grp->in_dev = spec->in;
+
+	/* Serialized against the FCI mutators, which is the discipline this
+	 * file's own header states for any caller that does not arrive through
+	 * the command dispatcher. Both owners never run at once, but the rule
+	 * is about this file's state rather than about who is driving. */
+	mutex_lock(&mc_mutators_mutex);
+	/* GetMcastGrpId() matches on the address pair alone -- the ingress is
+	 * reported back rather than compared -- so this refuses a second
+	 * ingress for one (S,G) as well as a genuine duplicate. That is the
+	 * legacy owner's restriction and it is inherited deliberately: one
+	 * group id and one root entry exist per address pair here, and lifting
+	 * it is a change to that structure rather than to this check. A caller
+	 * wanting a different listener set for an installed key wants replace. */
+	if (GetMcastGrpId(grp, IngressIface) != -1) {
+		rc = -EEXIST;
+		goto err_unlock;
+	}
+	grp->grpid = GetNewMcastGrpId(grp->mctype);
+	if (grp->grpid == -1) {
+		rc = -ENOSPC;
+		goto err_unlock;
+	}
+	rc = cdx_mc_program(grp, spec);
+	if (rc) {
+		/* Released only if it is still held. The arms of
+		 * cdx_mc_program() that get as far as building listeners
+		 * unwind through cdx_free_exthash_mcast_members(), which hands
+		 * the id back itself and leaves grpid -1; releasing it twice
+		 * would free a slot a later add may already hold. */
+		if (grp->grpid != -1)
+			FreeMcastGrpID(grp->mctype, grp->grpid);
+		goto err_unlock;
+	}
+	AddToMcastGrpList(grp);
+	mutex_unlock(&mc_mutators_mutex);
+
+	group->info = grp;
+	*result = group;
+	return 0;
+
+err_unlock:
+	mutex_unlock(&mc_mutators_mutex);
+	kfree(grp);
+	kfree(group);
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_add, ASK_CDX_FLOWTABLE);
+
+/* Whether a spec describes the group already installed. The key is what a
+ * replace may not change: a different one is a different entry in a different
+ * hash bucket, which is an add and a delete rather than a replacement. */
+static bool cdx_mc_same_key(const struct mcast_group_info *grp,
+			    const struct cdx_mc_group_spec *spec)
+{
+	if (grp->mctype != (spec->family == AF_INET6))
+		return false;
+	/* The device, not its name. A group installed through this interface
+	 * holds a pinned netdev precisely so a rename cannot make it stop
+	 * recognising its own ingress -- which would refuse every subsequent
+	 * replace and freeze the listener set for good. */
+	if (grp->in_dev != spec->in)
+		return false;
+	if (grp->mctype)
+		return !memcmp(grp->ipv6_saddr, &spec->src.in6, IPV6_ADDRESS_LENGTH) &&
+		       !memcmp(grp->ipv6_daddr, &spec->dst.in6, IPV6_ADDRESS_LENGTH);
+	return grp->ipv4_saddr == spec->src.ip && grp->ipv4_daddr == spec->dst.ip;
+}
+
+/* Points a group's root entry at a different listener chain.
+ *
+ * The root entry's REPLICATE opcode holds one pointer, the head of the chain
+ * the microcode walks, so a whole listener set is exchanged by rewriting that
+ * pointer -- the same publish cdx_exthash_update_first_mcast_member_addr()
+ * performs to prepend a single listener, for the same reason and with the same
+ * barrier. The classifier key never leaves the table, so no frame of this group
+ * misses while the set changes.
+ *
+ * The caller owns the ordering: the new chain must be fully built and the old
+ * one must not be released until after this returns, because the microcode may
+ * be part-way along it. */
+static int cdx_mc_publish_chain(struct mcast_group_info *grp,
+				struct en_exthash_tbl_entry *head)
+{
+	struct en_exthash_tbl_entry *root = grp->pCtEntry->ct->handle;
+	struct en_ehash_replicate_param *param;
+	ucode_phyaddr_t tmp_val;
+	uint64_t phyaddr;
+
+	param = (struct en_ehash_replicate_param *)root->replicate_params;
+	if (!param) {
+		/* A multicast root always carries REPLICATE, so this is
+		 * unreachable -- but it must be an error rather than a silent
+		 * return, because the caller destroys the old chain on the
+		 * strength of this having happened. */
+		DPA_ERROR("%s::root entry carries no replicate parameter\n",
+			  __func__);
+		return -EIO;
+	}
+	phyaddr = XX_VirtToPhys(head);
+	tmp_val.rsvd = 0;
+	tmp_val.addr_hi = cpu_to_be16((phyaddr >> 32) & 0xffff);
+	tmp_val.addr_lo = cpu_to_be32(phyaddr & 0xffffffff);
+	/* The new chain's opcodes, parameters and next_entry words are all
+	 * stores that must be visible before FMAN can reach them, and it can
+	 * reach them the instant the pointer below lands. */
+	wmb();
+	param->first_member_flow_addr = tmp_val.addr;
+	param->first_listener_entry = head;
+	return 0;
+}
+
+int cdx_mc_group_replace(struct cdx_mc_group *group,
+			 const struct cdx_mc_group_spec *spec)
+{
+	struct mcast_group_info *grp, *fresh;
+	unsigned int ii;
+	int rc;
+
+	cdx_ft_assert_held();
+	if (!group || !group->info)
+		return -EINVAL;
+	grp = group->info;
+	if (!grp->pCtEntry || !grp->pCtEntry->ct)
+		return -EINVAL;
+	rc = cdx_mc_check(spec);
+	if (rc)
+		return rc;
+	if (!cdx_mc_same_key(grp, spec))
+		return -EINVAL;
+	/* fresh borrows the installed group's key, and must borrow its device
+	 * too: the ingress onif is resolved from it, and a name lookup would
+	 * be the one thing keying on the device was meant to avoid. */
+
+	/* The new chain is built beside the installed one rather than over it,
+	 * so a set that cannot be carried costs the listeners that already were
+	 * nothing at all: on failure the old chain is still the one the root
+	 * entry names and still the one replicating.
+	 *
+	 * `fresh` is scratch. It borrows the group's key only because the entry
+	 * builder derives the group MAC and table type from it, and it never
+	 * reaches a list or an id -- FreeMcastGrpID() ignores the -1. */
+	fresh = kzalloc(sizeof(*fresh), GFP_KERNEL);
+	if (!fresh)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&fresh->list);
+	fresh->grpid = -1;
+	fresh->mctype = grp->mctype;
+	/* The two address pairs are one union, so these copy the key whichever
+	 * family it is; the v4 fields are not a separate assignment. */
+	memcpy(fresh->ipv6_saddr, grp->ipv6_saddr, sizeof(fresh->ipv6_saddr));
+	memcpy(fresh->ipv6_daddr, grp->ipv6_daddr, sizeof(fresh->ipv6_daddr));
+	strncpy(fresh->ucIngressIface, grp->ucIngressIface, IF_NAME_SIZE - 1);
+	fresh->in_dev = grp->in_dev;
+
+	mutex_lock(&mc_mutators_mutex);
+	/* Reclaim anything a previous failed barrier left parked before adding
+	 * to the backlog again, exactly as the legacy mutators open. */
+	cdx_ehash_quarantine_drain(grp->pCtEntry->ct->td);
+	rc = cdx_mc_build_listeners(fresh, spec);
+	if (rc)
+		goto err_unlock;
+	rc = cdx_mc_publish_chain(grp, fresh->members[0].tbl_entry);
+	if (rc) {
+		/* Nothing was published, so the new chain is unreachable and
+		 * the old one is still the group's. */
+		cdx_free_exthash_mcast_members(fresh);
+		goto err_unlock;
+	}
+	/* The displaced chain is out of the root entry's reach but a walk
+	 * already under way can still be inside it, so it is parked rather
+	 * than freed. Swapping members[] is what the bucket lock protects --
+	 * the parameter store above is not ordered by it and does not need to
+	 * be -- so take the old entries out under the lock and park them
+	 * after: cdx_ehash_quarantine_entry() allocates. */
+	{
+		struct mcast_group_member old[MC_MAX_LISTENERS_PER_GROUP];
+		unsigned int uiHash;
+		spinlock_t *lock;
+
+		if (grp->mctype == 0) {
+			uiHash = HASH_MC4(grp->ipv4_daddr);
+			lock = &mc4_spinlocks[uiHash];
+		} else {
+			uiHash = HASH_MC6((void *)(grp->ipv6_daddr));
+			lock = &mc6_spinlocks[uiHash];
+		}
+		spin_lock(lock);
+		for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++) {
+			old[ii] = grp->members[ii];
+			grp->members[ii] = fresh->members[ii];
+		}
+		grp->uiListenerCnt = fresh->uiListenerCnt;
+		spin_unlock(lock);
+
+		for (ii = 0; ii < MC_MAX_LISTENERS_PER_GROUP; ii++)
+			if (old[ii].bIsValidEntry)
+				cdx_ehash_quarantine_entry(old[ii].tbl_entry);
+	}
+	/* And drain what was just parked. The chain is unlinked and the
+	 * barrier proves the microcode is done with it, so the backlog settles
+	 * at zero rather than growing by a chain per channel change. */
+	cdx_ehash_quarantine_drain(grp->pCtEntry->ct->td);
+	mutex_unlock(&mc_mutators_mutex);
+	kfree(fresh);
+	return 0;
+
+err_unlock:
+	mutex_unlock(&mc_mutators_mutex);
+	kfree(fresh);
+	return rc;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_replace, ASK_CDX_FLOWTABLE);
+
+void cdx_mc_group_del(struct cdx_mc_group **group)
+{
+	struct mcast_group_info *grp;
+	unsigned int uiHash;
+
+	cdx_ft_assert_held();
+	if (!group || !*group)
+		return;
+	grp = (*group)->info;
+	kfree(*group);
+	*group = NULL;
+	if (!grp)
+		return;
+
+	mutex_lock(&mc_mutators_mutex);
+	/* Unlink under the bucket lock the query walkers hold, then tear down
+	 * unlocked: the hash-table helpers issue hardware completions and can
+	 * sleep, and once the node is out of the list no reader can reach it.
+	 * The legacy delete path splits it the same way. */
+	if (grp->mctype == 0) {
+		uiHash = HASH_MC4(grp->ipv4_daddr);
+		spin_lock(&mc4_spinlocks[uiHash]);
+		list_del(&grp->list);
+		spin_unlock(&mc4_spinlocks[uiHash]);
+	} else {
+		uiHash = HASH_MC6((void *)(grp->ipv6_daddr));
+		spin_lock(&mc6_spinlocks[uiHash]);
+		list_del(&grp->list);
+		spin_unlock(&mc6_spinlocks[uiHash]);
+	}
+	mutex_unlock(&mc_mutators_mutex);
+	cdx_mcast_group_destroy(grp);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_del, ASK_CDX_FLOWTABLE);
+
+void cdx_mc_group_stats(const struct cdx_mc_group *group,
+			struct cdx_ft_counters *stats)
+{
+	struct mcast_group_info *grp;
+
+	/* Under the transaction like every other operation here, and not
+	 * merely by convention: hw_ct_get_active() reads and writes back
+	 * through ct, which cdx_mc_group_del() frees. The NULL tests below do
+	 * not help against that -- they test pointers a concurrent delete is
+	 * part-way through invalidating. */
+	cdx_ft_assert_held();
+	memset(stats, 0, sizeof(*stats));
+	if (!group || !group->info)
+		return;
+	grp = group->info;
+	if (!grp->pCtEntry || !grp->pCtEntry->ct)
+		return;
+	/* The root entry's own counters: frames matched on ingress, once each.
+	 * The replication happens below this entry and nothing between here and
+	 * the wire counts a replica separately, so a caller reporting
+	 * per-listener delivery wants the ports' own counters. */
+	hw_ct_get_active(grp->pCtEntry->ct);
+	stats->packets = grp->pCtEntry->ct->pkts;
+	stats->bytes = grp->pCtEntry->ct->bytes;
+	stats->lastused = grp->pCtEntry->ct->timestamp;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_mc_group_stats, ASK_CDX_FLOWTABLE);
