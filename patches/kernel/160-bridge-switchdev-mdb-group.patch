@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Fri, 18 Sep 2026 13:20:00 +0200
+Subject: [PATCH] bridge: carry the multicast group into the MDB switchdev object
+
+br_switchdev_mdb_populate() converts a group to a multicast MAC with
+ip_eth_mc_map() and hands the driver nothing else, so the L3 group the
+bridge learned is discarded at the boundary.
+
+For a driver that keys on a MAC that is merely lossy -- 28 bits of IPv4
+group fold into 23 bits of address, so 32 groups share one and the
+driver delivers the union of their port sets. For a driver whose
+classifier keys on the group itself it is not a coarser answer but the
+wrong field: ASK's FMAN classifier composes an exact-match key from the
+source and group addresses, and a multicast MAC cannot be recovered
+into one.
+
+The bridge has mp->addr at the point it throws it away, so carry it.
+Additive: existing drivers read addr[] and vid as before and need not
+know the field exists.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+  include/net/switchdev.h   | 18 ++++++++++++++++++
+  net/bridge/br_switchdev.c |  4 ++++
+  2 files changed, 22 insertions(+)
+
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 8346b0d29542..9c9659009b98 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -10,6 +10,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
+ #include <linux/list.h>
++/* For struct br_ip, embedded by value in switchdev_obj_port_mdb. */
++#include <linux/if_bridge.h>
+ #include <net/ip_fib.h>
+ 
+ #define SWITCHDEV_F_NO_RECURSE		BIT(0)
+@@ -114,6 +116,22 @@ struct switchdev_obj_port_mdb {
+ 	struct switchdev_obj obj;
+ 	unsigned char addr[ETH_ALEN];
+ 	u16 vid;
++	/* The group as the bridge holds it, before ip_eth_mc_map() folded it
++	 * into addr[] above.
++	 *
++	 * That folding is lossy and not merely imprecise: 28 bits of IPv4
++	 * group become 23 bits of Ethernet address, so 32 groups share one
++	 * MAC and a driver matching on addr[] delivers the union of their
++	 * port sets. A classifier keyed on the L3 group cannot use addr[] at
++	 * all -- it is not a coarser version of what such a driver needs, it
++	 * is a different field.
++	 *
++	 * The bridge has mp->addr at the point it discards it, so it is
++	 * carried here instead. Drivers that key on the MAC are unaffected
++	 * and need not read this; proto is zero on the paths that do not
++	 * populate it.
++	 */
++	struct br_ip group;
+ };
+ 
+ #define SWITCHDEV_OBJ_PORT_MDB(OBJ) \
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+index f10bd6a233dc..77f3df59663b 100644
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -540,6 +540,10 @@ static void br_switchdev_mdb_populate(struct switchdev_obj_port_mdb *mdb,
+ 		ether_addr_copy(mdb->addr, mp->addr.dst.mac_addr);
+ 
+ 	mdb->vid = mp->addr.vid;
++	/* And the group itself, which the conversion above cannot express: a
++	 * driver whose classifier keys on the L3 group needs the address the
++	 * bridge learned, not the multicast MAC 32 of them share. */
++	mdb->group = mp->addr;
+ }
+ 
+ static void br_switchdev_host_mdb_one(struct net_device *dev,
+-- 
+2.47.3
+
