@@ -1,0 +1,79 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          wifi-ap
+# Required-Start:    ask-modules
+# Default-Start:     S
+# Short-Description: Bring up the `ask-test` access point on uap0
+### END INIT INFO
+
+# Runs before gateway-setup, not after, and that ordering is load-bearing:
+# dnsmasq is started at the end of S40 with bind-interfaces, so uap0 has to
+# exist and carry its address by then or dnsmasq refuses to bind it and Wi-Fi
+# clients get no lease.
+#
+# The AP gets its own subnet rather than joining eth3 in a bridge. Bridging
+# would put Wi-Fi clients on the LAN, which is how a product would ship it,
+# but it would also change what eth3 is for every existing test in the suite
+# and turn every LAN flow into a bridged one. A separate subnet leaves all of
+# that alone and makes a Wi-Fi client's traffic a *routed* flow out of uap0,
+# which is the shape the offload work is about.
+
+WLAN_IF=uap0
+WLAN_ADDR=192.168.2.1/24
+HOSTAPD_CONF=/etc/hostapd-ask.conf
+HOSTAPD_PID=/var/run/hostapd-ask.pid
+
+# The radio enumerates over PCIe and registers its netdevs asynchronously
+# after moal loads, so the interface is not guaranteed to exist the instant
+# this script runs. Bounded wait: absent a radio (or on a board without one)
+# this exits cleanly rather than holding up the boot.
+wait_for_iface() {
+    i=0
+    while [ $i -lt 30 ]; do
+        [ -e "/sys/class/net/$WLAN_IF" ] && return 0
+        i=$((i + 1))
+        sleep 0.5
+    done
+    return 1
+}
+
+start() {
+    if ! wait_for_iface; then
+        echo "wifi-ap: $WLAN_IF never appeared; no radio on this board?" >&2
+        return 0
+    fi
+    if [ ! -r "$HOSTAPD_CONF" ]; then
+        echo "wifi-ap: $HOSTAPD_CONF missing" >&2
+        return 0
+    fi
+    if pidof hostapd >/dev/null 2>&1; then
+        return 0
+    fi
+
+    ip link set "$WLAN_IF" up
+    ip addr replace "$WLAN_ADDR" dev "$WLAN_IF"
+
+    # -B daemonises. A failure here is not fatal to the boot: the board is
+    # still a usable wired gateway without its radio, and a test that needs
+    # the AP will say so far more clearly than a dead boot would.
+    if ! hostapd -B -P "$HOSTAPD_PID" "$HOSTAPD_CONF"; then
+        echo "wifi-ap: hostapd failed to start" >&2
+    fi
+}
+
+stop() {
+    [ -r "$HOSTAPD_PID" ] && kill "$(cat "$HOSTAPD_PID")" 2>/dev/null
+    return 0
+}
+
+case "$1" in
+    start|"") start ;;
+    stop)     stop ;;
+    restart)  stop; sleep 1; start ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

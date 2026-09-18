@@ -70,6 +70,15 @@ IMAGE_INSTALL = " \
     \
     \
     lmsensors-sensors \
+    \
+    \
+    nxp-mwifiex \
+    nxp-wifi-firmware \
+    kernel-module-cfg80211 \
+    hostapd \
+    wpa-supplicant \
+    iw \
+    wireless-regdb-static \
 "
 
 # Test harness (agent + python fuzzing/orchestration tooling + stress tools).

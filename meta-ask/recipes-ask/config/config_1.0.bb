@@ -7,17 +7,19 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 SRC_URI = "file://S03debugfs \
            file://S05ask-modules \
            file://S20status-leds \
+           file://S35wifi-ap \
            file://S40gateway-setup \
            file://S50cmm \
            file://S50ask-flowtable \
            file://dnsmasq-gateway.conf \
+           file://hostapd-ask.conf \
           "
 
 # No source tree — just config files, referenced via UNPACKDIR below.
 # Point S at UNPACKDIR so bitbake doesn't warn about a missing ${BP}.
 S = "${UNPACKDIR}"
 
-RDEPENDS:${PN} += "dnsmasq iptables iproute2 nftables python3-core python3-json python3-crypt python3-fcntl"
+RDEPENDS:${PN} += "dnsmasq iptables iproute2 nftables python3-core python3-json python3-crypt python3-fcntl hostapd"
 
 # These files are installed from ${ASK_SRCROOT} (outside SRC_URI's reach).
 # Without listing them as task input checksums, bitbake's sstate signature for
@@ -69,6 +71,13 @@ fakeroot do_install() {
     install -m 0755 ${UNPACKDIR}/S05ask-modules ${D}${sysconfdir}/init.d/ask-modules
     ln -sf ../init.d/ask-modules ${D}${sysconfdir}/rcS.d/S05ask-modules
 
+    # The `ask-test` access point. Ordered before gateway-setup so uap0 has
+    # its address by the time that script starts dnsmasq with
+    # bind-interfaces, which would otherwise refuse to serve the AP subnet.
+    install -m 0755 ${UNPACKDIR}/S35wifi-ap ${D}${sysconfdir}/init.d/wifi-ap
+    ln -sf ../init.d/wifi-ap ${D}${sysconfdir}/rcS.d/S35wifi-ap
+    install -m 0644 ${UNPACKDIR}/hostapd-ask.conf ${D}${sysconfdir}/hostapd-ask.conf
+
     # Gateway networking (WAN=eth4 static 10.0.0.62/24, LAN=eth3 static 192.168.1.1/24,
     # iptables MASQUERADE, dnsmasq DHCP server). Runs in rcS so the board
     # is gateway-ready by the time multi-user services (dropbear) come up.
@@ -102,6 +111,9 @@ FILES:${PN} = " \
     ${sysconfdir}/rcS.d/S03debugfs \
     ${sysconfdir}/init.d/ask-modules \
     ${sysconfdir}/rcS.d/S05ask-modules \
+    ${sysconfdir}/init.d/wifi-ap \
+    ${sysconfdir}/rcS.d/S35wifi-ap \
+    ${sysconfdir}/hostapd-ask.conf \
     ${sysconfdir}/init.d/gateway-setup \
     ${sysconfdir}/rcS.d/S40gateway-setup \
     ${sysconfdir}/dnsmasq-gateway.conf \

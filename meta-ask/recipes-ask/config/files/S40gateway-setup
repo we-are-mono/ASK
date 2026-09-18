@@ -11,6 +11,9 @@
 
 LAN_IF=eth3
 LAN_ADDR=192.168.1.1/24
+# The Wi-Fi AP's interface. Addressed and brought up by S35wifi-ap; named
+# here only so its forwarding rules can be stated alongside the wired ones.
+WLAN_IF=uap0
 WAN_IF=eth4
 # Test image: pin WAN to a stable static address so the orchestrator has
 # a fixed POST target and installed FMAN offload rules can't go stale
@@ -88,6 +91,14 @@ start_nat() {
     add_rule -t nat POSTROUTING -o "$WAN_IF" -j MASQUERADE
     add_rule FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
     add_rule FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+    # The Wi-Fi AP's subnet, on its own interface rather than bridged into
+    # the LAN (see S35wifi-ap for why). MASQUERADE above is already
+    # interface-agnostic on the way in, so only the forward pair is needed.
+    # Added unconditionally: iptables accepts rules naming an interface that
+    # does not exist yet, and a board with no radio simply never matches them.
+    add_rule FORWARD -i "$WLAN_IF" -o "$WAN_IF" -j ACCEPT
+    add_rule FORWARD -i "$WAN_IF" -o "$WLAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
 }
 
 start_filter6() {
