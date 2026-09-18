@@ -74,6 +74,9 @@ BRIDGE = "br_mcast_e2e"
 # for bridge names that shell out.
 
 MCAST_PORT = int(os.environ.get("ASK_MCAST_E2E_PORT", "47300"))
+# Above 1, always. See send_stream_from_vision() and the TTL section of
+# docs/flowtable-multicast.md: the parser refuses to classify TTL 0 or 1.
+MCAST_TTL = int(os.environ.get("ASK_MCAST_E2E_TTL", "64"))
 # Distinct group per case so a stale entry from one cannot satisfy another.
 GROUPS_V4 = {
     "v3_include": "239.8.1.1",
@@ -273,16 +276,21 @@ def send_stream_from_vision(group: str, family: int, seconds: float,
 
     iface = os.environ.get("ASK_WAN_INJECT_IF", "br0")
     src = wan_source_address(family)
+    # Explicitly, and never inherited. The FMC soft parser ends the parse
+    # before classification for TTL 0 or 1, so a TTL-1 stream is never matched
+    # in hardware however correct the entry is -- and a plain UDP multicast
+    # socket sends TTL 1 by default. Getting this wrong makes a working
+    # offload look completely dead; it cost a rig session once.
     if family == 6:
         # IPv6 multicast MAC: 33:33:<low 32 bits of the group>.
         import socket as _socket
         raw = _socket.inet_pton(_socket.AF_INET6, group)
         mac = "33:33:" + ":".join(f"{b:02x}" for b in raw[12:16])
-        layer = IPv6(src=src, dst=group)
+        layer = IPv6(src=src, dst=group, hlim=MCAST_TTL)
     else:
         o = [int(b) for b in group.split(".")]
         mac = "01:00:5e:%02x:%02x:%02x" % (o[1] & 0x7F, o[2], o[3])
-        layer = IP(src=src, dst=group)
+        layer = IP(src=src, dst=group, ttl=MCAST_TTL)
 
     frame = (Ether(dst=mac) / layer / UDP(sport=MCAST_PORT, dport=MCAST_PORT)
              / Raw(b"x" * 512))

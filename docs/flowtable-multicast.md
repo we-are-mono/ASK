@@ -369,6 +369,29 @@ and a re-injection pass would make it N transmits plus a re-classify. An
 offline port is a scarce resource being spent to make the expensive case more
 expensive.
 
+**A stream with TTL 1 is never offloaded, and for a bridged group that is a
+real limitation rather than a formality.** The FMC soft parser ends the parse
+before classification for any IPv4 frame whose TTL is 0 or 1
+(`cdx_sp.xml`, the `ipv4schema` protocol's `<before>` block, which assigns a
+new next-instruction address and exits), and the same for an IPv6 hop limit.
+Such a frame reaches the CPU and the bridge floods it in software, exactly as
+it does today.
+
+For *routed* multicast that is correct and unremarkable: TTL 1 means do not
+forward beyond this link, so a router must not replicate it. For a **bridge**
+it is a genuine gap, because bridging is not forwarding in the IP sense and
+the Linux bridge will happily replicate a TTL-1 group. Anything that scopes
+itself to the local link by TTL — and a good deal of service discovery does —
+is therefore carried in software on this hardware whatever the MDB says. The
+group still installs and still reports `offload`; it simply never matches.
+
+Nothing in the adapter can change that: the decision is made in the parser
+before any table is consulted. It is recorded here because it is invisible
+from every surface an operator has, and because it is a very effective way to
+convince yourself the offload is broken when it is working. Measure with a TTL
+above 1, and have a test that sets it explicitly rather than inheriting a
+default: a plain UDP multicast socket sends TTL 1.
+
 **Host delivery is not solved by this increment.**
 `SWITCHDEV_OBJ_ID_HOST_MDB` exists for traffic the bridge itself must receive,
 and a hardware entry that replicates to ports only would starve a local
