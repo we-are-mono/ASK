@@ -583,14 +583,74 @@ on the segment, with the test machine outside the path, is worth insisting on.
 
 ### 5. The outbound fast path
 
-`struct cdx_ft_rule` gains the SA handles; `cdx_ft_hw_add()` sets
-`CONNTRACK_SEC` and `hSAEntry[]`; the adapter resolves `dst_xfrm()` on the
-egress destination it already borrows, applies the eligibility contract and
-publishes an SA watch.
+`struct cdx_ft_rule` gains the SA handle; `cdx_ft_hw_add()` sets
+`CONNTRACK_SEC` and `hSAEntry[]`; the adapter resolves the SA, applies the
+eligibility contract and publishes an SA watch. Patch 140 also stops hiding
+transformed destinations from the driver: `nf_flow_offload_dst()` returned NULL
+for anything but `XMIT_NEIGH`, although `flow_offload_fill_route()` fills NEIGH
+and XFRM from the same branch and both genuinely hold one.
 
-Proof: line-rate LAN-to-WAN through the tunnel, the adapter's entry naming the
-SA, and `devlink trap policer 2` counting without `cdx_devlink.c` being
-touched — which is the check the QoS increment left behind on purpose.
+#### Ask the policy, not the destination
+
+The obvious implementation is to read `dst_xfrm()` off the destination the
+callback already borrows. It is wrong, and wrong in the direction that matters.
+
+A transformed destination only reaches the flowtable for **locally generated**
+traffic. A *forwarded* flow is routed by `nf_route()` with a plain FIB lookup
+and is transformed afterwards, in `xfrm_route_forward()` at POSTROUTING, so its
+cached destination never carries the transform that will be applied to it.
+`dst_xfrm()` therefore answers "no transform" for exactly the flows a gateway
+encrypts — and the flow is then installed as an ordinary plain one, so the
+classifier forwards in hardware what the policy says to encrypt. **Measured on
+the bench before this was fixed: fifty-nine packets forwarded past a `level
+required` policy, in the clear.**
+
+That blind spot is this branch's own. The `dst_xfrm(dst)` refusal came in with
+`444af05`, which created the adapter; NXP has no flowtable adapter at all. It
+had never been reachable because IPsec did not work in this ownership mode
+until the first increment above made it work, which is why it surfaced here
+rather than earlier.
+
+So admission repeats the lookup forwarding itself does — `xfrm_lookup()` with
+the flow's own translated tuple, ports included, since a selector can name them
+— and believes the answer. Three outcomes: no policy, and the flow is plain; a
+policy resolving to an offloadable SA, and its handle goes on the rule; a
+policy that matches but resolves to nothing usable, and the flow is **refused**
+so the software path can do whatever the policy asks, including an acquire.
+
+One subtlety, found by KASAN rather than by reading: on success
+`xfrm_bundle_create()` links the destination into the bundle and takes over the
+caller's reference to it. `XFRM_LOOKUP_KEEP_DST_REF` does not prevent that; it
+only suppresses the extra release on the paths that fail. Passing a borrowed
+destination therefore hands over a reference that was never ours, and releasing
+the bundle frees a destination the flowtable still uses —
+`slab-use-after-free in rcuref_put()`, which panicked the DUT. The lookup takes
+its own reference first and gives it back on the paths that consume nothing.
+
+#### The SA is a dependency, like a route or a neighbour
+
+A direction names its SA by handle, and handles are reused once their SA is
+deleted, so the flows have to be retired before the hardware is. They are, from
+the same callback that queues the retirement, and `ipsec_invalidations` in
+`/proc/cdx_flowtable` counts them alongside the other causes. Retiring rather
+than rewriting matches every other dependency here: Linux stops using its
+cached lookup at once and the flow is readmitted from scratch on the next
+packet.
+
+Proof: the tunnelled direction offloaded with its SA named, the return
+direction plain because no policy covers it, and — the oracle that separates
+this increment from the one before it — `tx toenc` advancing by **one** rather
+than by the packet count. That counter counts frames the *software* path handed
+to SEC, so on the slow path it tracks the transfer; here it moves once, for the
+packet that travelled before the entry existed, and then stops while the rest
+goes through. Throughput cannot tell the two apart.
+
+`devlink trap policer 2` is not part of that proof, and the earlier revision of
+this document overstated it. The policer reports drops, not passes, so a drop
+count of zero is consistent with metering traffic and dropping none of it —
+but it does not by itself demonstrate that frames traverse the meter. Showing
+that would mean exceeding 14.88 Mpps, which is line rate for minimum-size
+frames on this port.
 
 ### 6. The inbound fast path
 

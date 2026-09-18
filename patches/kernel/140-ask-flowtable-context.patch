@@ -1,4 +1,4 @@
-From 415b118456dc75bbe55dee02f3c3a8400a96166c Mon Sep 17 00:00:00 2001
+From 40f365ab4dbc7c727a77ec2f22982582b81dae39 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Mon, 14 Sep 2026 23:03:32 +0200
 Subject: [PATCH] netfilter: provide hardware context and selective flow
@@ -84,9 +84,9 @@ against.
  net/ipv6/ip6_fib.c                    | 23 +++++++
  net/netfilter/nf_flow_table_core.c    | 66 +++++++++++++++++++-
  net/netfilter/nf_flow_table_ip.c      | 14 ++++-
- net/netfilter/nf_flow_table_offload.c | 33 +++++++++-
+ net/netfilter/nf_flow_table_offload.c | 46 +++++++++++++-
  net/netfilter/nft_flow_offload.c      | 87 +++++++++++++++++++++------
- 11 files changed, 328 insertions(+), 24 deletions(-)
+ 11 files changed, 341 insertions(+), 24 deletions(-)
 
 diff --git a/include/net/flow.h b/include/net/flow.h
 index 335bbc52171c..5e373dbaa397 100644
@@ -579,18 +579,31 @@ index 98edcaa37b38..632a92be3ef6 100644
  		return 0;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f51d7d7..6c1f8eba1027 100644
+index 4f346f51d7d7..ccbcc3ecccc1 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -896,6 +896,23 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
+@@ -896,6 +896,36 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
  	cls_flow->cookie = (unsigned long)tuple;
  }
  
 +/* DIRECT and TC share this union with non-pointer data. XFRM destinations
 + * are deliberately excluded from the routed-neighbour adapter contract. */
++/* DIRECT and TC share this union with non-pointer data, so the transmit type
++ * has to be checked before the destination is read. NEIGH and XFRM are the two
++ * that store a dst there -- flow_offload_fill_route() fills both from the same
++ * branch -- and both are handed over: a transformed destination is what an
++ * encrypted flow has, and refusing to show it to the driver would be refusing
++ * the flow rather than describing it.
++ */
++static bool nf_flow_offload_has_dst(const struct flow_offload_tuple *tuple)
++{
++	return tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
++	       tuple->xmit_type == FLOW_OFFLOAD_XMIT_XFRM;
++}
++
 +static struct dst_entry *nf_flow_offload_dst(const struct flow_offload_tuple *tuple)
 +{
-+	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH)
++	if (!nf_flow_offload_has_dst(tuple))
 +		return NULL;
 +	return tuple->dst_cache;
 +}
@@ -598,7 +611,7 @@ index 4f346f51d7d7..6c1f8eba1027 100644
 +/* Aliased by ifidx for the other transmit types, so it shares that guard. */
 +static u32 nf_flow_offload_dst_cookie(const struct flow_offload_tuple *tuple)
 +{
-+	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH)
++	if (!nf_flow_offload_has_dst(tuple))
 +		return 0;
 +	return tuple->dst_cookie;
 +}
@@ -606,7 +619,7 @@ index 4f346f51d7d7..6c1f8eba1027 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +921,21 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +934,21 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {

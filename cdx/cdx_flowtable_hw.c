@@ -210,6 +210,22 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	ct->qosmark.dscp_mark_flag = (rule->qos & CDX_FT_QOS_REMARK_MASK) ? 1 : 0;
 	ct->qosmark.dscp_mark_value = (rule->qos & CDX_FT_QOS_DSCP_MASK) >>
 				      CDX_FT_QOS_DSCP_SHIFT;
+	/* An encrypted direction names its SA, and the shared encoder does the
+	 * rest: insert_entry_in_classif_table_encap() reads CONNTRACK_SEC and
+	 * calls cdx_ipsec_fill_sec_info(), which resolves these handles and
+	 * points the entry's action at the SEC frame queue instead of the
+	 * egress port. That hook has been there all along, driven by the FCI
+	 * conntrack command's SA_handle fields; this is the same description
+	 * arriving from a different control plane.
+	 *
+	 * Only hSAEntry[0] is filled. The array holds SA_MAX_OP so a stacked
+	 * bundle (ESP under AH) can name both, and nothing here proves the
+	 * opcode order such a bundle needs -- so admission refuses more than
+	 * one and this stays deliberately single. */
+	if (rule->sa_handle) {
+		ct->hSAEntry[0] = rule->sa_handle;
+		ct->status |= CONNTRACK_SEC;
+	}
 	/* A flow with no encapsulation asks for no override, and takes exactly
 	 * the path it took before tags existed. The override refuses a
 	 * description the interfaces already filled in -- a DSCP-to-PCP egress
