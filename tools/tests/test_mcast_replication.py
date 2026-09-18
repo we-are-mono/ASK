@@ -48,6 +48,13 @@ import struct
 
 import pytest_asyncio
 
+from _mcast_helpers import (
+    capture_parallel_window,
+    kill_parallel_tcpdumps,
+    pcap_cleanup_lan,  # noqa: F401  (fixture, imported for resolution)
+    read_pcap_count,
+    spawn_parallel_tcpdumps,
+)
 from _topology import (
     TARGET_WAN_IF,
     lan_run_python,
@@ -61,6 +68,9 @@ MCAST_DST_A = os.environ.get("ASK_MCAST_REPL_DST_A", os.environ.get("ASK_MCAST_R
 MCAST_DST_B = os.environ.get("ASK_MCAST_REPL_DST_B", os.environ.get("ASK_MCAST_REPL_DST_3C", "239.7.2.2"))
 MCAST_SRC    = os.environ.get("ASK_WAN_IPERF_IP",      "10.0.0.141")
 MCAST_PORT   = int(os.environ.get("ASK_MCAST_REPL_PORT", "47200"))
+# The capture filter, tight enough that background multicast on a shared
+# subnet cannot be counted as this test's traffic.
+MCAST_BPF    = f"udp port {MCAST_PORT}"
 INGRESS_WAN   = os.environ.get("ASK_MCAST_INGRESS_WAN", TARGET_WAN_IF)
 # MCAST_DST_B's ingress is the source LAN VLAN subif on the DUT — set per
 # fixture below since it depends on the listener fixture's vid choice.
@@ -213,116 +223,6 @@ async def mcast_group_lan_vlan_ingress(
             warnings.warn(f"3c teardown REMOVE returned reply_rc={rc}: {r}")
 
 
-@pytest_asyncio.fixture
-async def pcap_cleanup_lan(lan):
-    """Tracks pcap paths created during a test; rm them on teardown so
-    /tmp on the LAN VM doesn't accumulate over many parametrize runs.
-    UART has direct shell access — single rm call suffices.
-    """
-    paths: list[str] = []
-    yield paths
-    if paths:
-        try:
-            lan.run("rm -f " + " ".join(paths), timeout=5)
-        except Exception:
-            pass
-
-
-# ---- capture helpers (UART-driven, no LAN agent required) ----------------
-
-_TCPDUMP_PIDFILE_PREFIX = "/tmp/ask_mcast_tcpdump"
-
-
-def _spawn_parallel_tcpdumps(
-    lan, ifaces: list[str], capfiles: list[str], port: int,
-) -> None:
-    """Launch one backgrounded tcpdump per (iface, capfile) on the LAN VM.
-
-    Plain `tcpdump -w file &` (no -G/-W) so behaviour is portable across
-    tcpdump/libpcap versions; `pkill` after the window terminates them
-    cleanly. We capture each tcpdump's PID into a sidecar file so the
-    later kill is precise instead of `pkill -f tcpdump`-broad.
-
-    Single UART command chains all spawns so the UART round-trip is
-    one shot regardless of N.
-    """
-    bpf = f"udp port {port}"
-    # `&` terminates a command, then `echo $!` captures the pid into a
-    # sidecar. Background processes need stdin/stdout/stderr redirection
-    # so they detach cleanly from the controlling shell.
-    chain = ""
-    for iface, capfile in zip(ifaces, capfiles):
-        pidfile = f"{_TCPDUMP_PIDFILE_PREFIX}_{iface}.pid"
-        # `-Q in` records inbound only — excludes the local sendp's
-        # egress copy that AF_PACKET would otherwise capture, so the
-        # frame count reflects just what arrives at the listener
-        # (replicated by the DUT, plus any FMAN self-echo to the
-        # ingress port).
-        chain += (
-            f"nohup tcpdump -i {iface} -Q in -w {capfile} '{bpf}' "
-            f"</dev/null >/dev/null 2>&1 & "
-            f"echo $! > {pidfile}; "
-        )
-    chain += "echo SPAWNED"
-    r = lan.run(chain, timeout=10)
-    assert "SPAWNED" in r.stdout, (
-        f"failed to spawn tcpdumps via UART: rc={r.rc}, out={r.stdout!r}"
-    )
-
-
-def _kill_parallel_tcpdumps(lan, ifaces: list[str]) -> None:
-    """SIGTERM the previously-spawned tcpdumps via their pid sidecars."""
-    chain = ""
-    for iface in ifaces:
-        pidfile = f"{_TCPDUMP_PIDFILE_PREFIX}_{iface}.pid"
-        # `kill -TERM $(cat <pidfile>) 2>/dev/null || true` so a
-        # missing pidfile or already-dead pid doesn't fail the chain.
-        chain += (
-            f"[ -f {pidfile} ] && kill -TERM $(cat {pidfile}) "
-            f"2>/dev/null; rm -f {pidfile}; "
-        )
-    chain += "echo KILLED"
-    r = lan.run(chain, timeout=10)
-    assert "KILLED" in r.stdout, (
-        f"failed to kill tcpdumps: rc={r.rc}, out={r.stdout!r}"
-    )
-
-
-def _read_pcap_count(lan, capfile: str) -> int:
-    """Parse a saved pcap via `tcpdump -r`; count UDP summary lines."""
-    r = lan.run(f"tcpdump -r {capfile} -nn 2>&1", timeout=10)
-    if r.rc != 0:
-        raise AssertionError(
-            f"tcpdump -r {capfile} failed: rc={r.rc}, out={r.stdout!r}"
-        )
-    return sum(
-        1 for ln in r.stdout.splitlines()
-        if " IP " in ln and "UDP" in ln
-    )
-
-
-async def _capture_parallel_window(
-    lan, *, ifaces: list[str], capfiles: list[str], port: int,
-    window_s: float = 2.0,
-) -> dict[str, int]:
-    """Spawn parallel tcpdumps, sleep through the window, kill them,
-    read the pcaps, return per-iface counts. Pure UART — no LAN agent
-    needed (LAN VM is behind the DUT NAT).
-    """
-    _spawn_parallel_tcpdumps(lan, ifaces, capfiles, port)
-    # Tiny grace so tcpdumps are listening before any traffic arrives.
-    # Caller is expected to inject AFTER this returns.
-    await asyncio.sleep(0.4)
-    await asyncio.sleep(window_s)
-    _kill_parallel_tcpdumps(lan, ifaces)
-    # Tiny pause for the pcap writer to flush on TERM.
-    await asyncio.sleep(0.2)
-    return {
-        iface: _read_pcap_count(lan, cf)
-        for iface, cf in zip(ifaces, capfiles)
-    }
-
-
 # ---- 3b: WAN-side injection -----------------------------------------------
 
 def _send_mcast_from_orchestrator(dst: str, port: int, payload: bytes) -> None:
@@ -361,9 +261,9 @@ async def test_mcast_replication_one_per_listener_wan_injection(
     # Pre-test drain — assert no stray multicast on listeners.
     drain_capfiles = [f"/tmp/ask_mcast_drain_{vid}.pcap" for vid in vids]
     pcap_cleanup_lan.extend(drain_capfiles)
-    drain_counts = await _capture_parallel_window(
+    drain_counts = await capture_parallel_window(
         lan, ifaces=lan_ifaces, capfiles=drain_capfiles,
-        port=MCAST_PORT, window_s=2.0,
+        bpf=MCAST_BPF, window_s=2.0,
     )
     for iface, n in drain_counts.items():
         assert n == 0, (
@@ -375,8 +275,8 @@ async def test_mcast_replication_one_per_listener_wan_injection(
     capfiles = [f"/tmp/ask_mcast_wan_{vid}.pcap" for vid in vids]
     pcap_cleanup_lan.extend(capfiles)
 
-    _spawn_parallel_tcpdumps(
-        lan, lan_ifaces, capfiles, port=MCAST_PORT,
+    spawn_parallel_tcpdumps(
+        lan, lan_ifaces, capfiles, MCAST_BPF,
     )
     try:
         # Small grace so tcpdumps are listening before the mcast hits.
@@ -388,12 +288,12 @@ async def test_mcast_replication_one_per_listener_wan_injection(
         # Wait the rest of the capture window before terminating.
         await asyncio.sleep(2.0)
     finally:
-        _kill_parallel_tcpdumps(lan, lan_ifaces)
+        kill_parallel_tcpdumps(lan, lan_ifaces)
     # Brief pause for the pcap writer to flush on TERM.
     await asyncio.sleep(0.2)
 
     counts = {
-        iface: _read_pcap_count(lan, cf)
+        iface: read_pcap_count(lan, cf)
         for iface, cf in zip(lan_ifaces, capfiles)
     }
     for iface, n in counts.items():
@@ -450,8 +350,8 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
     capfiles   = [f"/tmp/ask_mcast_vlan_{vid}.pcap" for vid in vids]
     pcap_cleanup_lan.extend(capfiles)
 
-    _spawn_parallel_tcpdumps(
-        lan, lan_ifaces, capfiles, port=MCAST_PORT,
+    spawn_parallel_tcpdumps(
+        lan, lan_ifaces, capfiles, MCAST_BPF,
     )
     try:
         # Grace before injection so tcpdumps are listening.
@@ -461,13 +361,13 @@ async def test_mcast_replication_lan_vlan_tagged_injection(
         # Drain window for replicated frames.
         await asyncio.sleep(2.0)
     finally:
-        _kill_parallel_tcpdumps(lan, lan_ifaces)
+        kill_parallel_tcpdumps(lan, lan_ifaces)
     # tcpdump only flushes the pcap on TERM; a stray read while the
     # writer is still alive yields a truncated/empty file.
     await asyncio.sleep(0.2)
 
     counts = {
-        iface: _read_pcap_count(lan, cf)
+        iface: read_pcap_count(lan, cf)
         for iface, cf in zip(lan_ifaces, capfiles)
     }
 
