@@ -3468,6 +3468,7 @@ static const char *ft_mc_state(const struct ft_mc_group *g)
 
 static void ft_mc_rows(struct seq_file *seq)
 {
+	struct cdx_ft_counters stats;
 	struct ft_mc_group *g;
 	char ports[192];
 	u8 i;
@@ -3479,27 +3480,40 @@ static void ft_mc_rows(struct seq_file *seq)
 	list_for_each_entry(g, &ft_mc_groups, list) {
 		size_t n = 0;
 
+		/* What the classifier entry actually matched. The one number
+		 * that distinguishes a group the hardware is carrying from one
+		 * that is merely in the table: an installed group whose count
+		 * stays at zero while its stream runs is being forwarded by
+		 * the bridge in software, and every other field looks
+		 * identical in both cases. The caller holds the transaction
+		 * this read needs. */
+		cdx_mc_group_stats(g->hw, &stats);
 		ports[0] = '\0';
 		for (i = 0; i < g->ports; i++)
 			n += scnprintf(ports + n, sizeof(ports) - n, "%s%s/%u",
 				       i ? "," : "", g->port[i].dev->name,
 				       g->port[i].vlans ? g->port[i].vlan[0].id : 0);
+		/* Two sources, and the difference is the whole design: `member`
+		 * is what the bridge asked for -- zero for a (*,G) join -- and
+		 * `src` is what the traffic taught us, which is the one in the
+		 * hardware key. Showing only the first makes an installed group
+		 * look unkeyed. */
 		if (g->addr.proto == htons(ETH_P_IPV6))
 			seq_printf(seq,
-				   "mcast br=%s family=6 group=%pI6c src=%pI6c vid=%u ports=%s in=%s state=%s\n",
+				   "mcast br=%s family=6 group=%pI6c member_src=%pI6c src=%pI6c vid=%u ports=%s in=%s state=%s packets=%llu bytes=%llu\n",
 				   g->bridge->name, &g->addr.dst.ip6,
-				   &g->addr.src.ip6, g->addr.vid,
+				   &g->addr.src.ip6, &g->src.in6, g->addr.vid,
 				   g->ports ? ports : "-",
 				   g->in ? g->in->name : "-",
-				   ft_mc_state(g));
+				   ft_mc_state(g), stats.packets, stats.bytes);
 		else
 			seq_printf(seq,
-				   "mcast br=%s family=4 group=%pI4 src=%pI4 vid=%u ports=%s in=%s state=%s\n",
+				   "mcast br=%s family=4 group=%pI4 member_src=%pI4 src=%pI4 vid=%u ports=%s in=%s state=%s packets=%llu bytes=%llu\n",
 				   g->bridge->name, &g->addr.dst.ip4,
-				   &g->addr.src.ip4, g->addr.vid,
+				   &g->addr.src.ip4, &g->src.ip, g->addr.vid,
 				   g->ports ? ports : "-",
 				   g->in ? g->in->name : "-",
-				   ft_mc_state(g));
+				   ft_mc_state(g), stats.packets, stats.bytes);
 	}
 	mutex_unlock(&ft_mc_lock);
 }

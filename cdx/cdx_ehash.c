@@ -1430,9 +1430,8 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 		DPA_ERROR("%s::unable to compose key\n",
 								__func__);
 		goto err_ret;
-	}	
-		
-	//round off keysize to next 4 bytes boundary 
+	}
+	//round off keysize to next 4 bytes boundary
 	ptr = (uint8_t *)&tbl_entry->hashentry.key[0];			
 	ptr += ALIGN(key_size, TBLENTRY_OPC_ALIGN);
 	//set start of opcode list 
