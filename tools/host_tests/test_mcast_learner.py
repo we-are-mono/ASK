@@ -40,6 +40,8 @@ def test_mcast_learner(tmp_path):
             "ft_mc_port_tags",
             "ft_mc_group_free",
             "ft_mc_membership",
+            "ft_mc_drop_port",
+            "ft_mc_key_contested",
             "ft_mc_seen_eq",
             "ft_mc_match",
         ]))
@@ -120,4 +122,70 @@ def test_exit_drains_before_the_module_text_goes_away():
     mc_exit = function(source, "ft_mc_exit")
     assert "cancel_work_sync(&ft_mc_work)" in mc_exit, (
         "the worker must be stopped, not merely asked to stop")
-    assert "ft_mc_stopping = true" in mc_exit
+    assert "WRITE_ONCE(ft_mc_stopping, true)" in mc_exit
+
+    # The hook is unregistered on both sides of the cancel. Registering sleeps,
+    # so a worker part-way through planting one when the flag went up is only
+    # actually stopped by the second call -- and a hook left on the bridge
+    # chain after the module text is unmapped oopses on the next frame.
+    assert mc_exit.count("ft_mc_hook_sync(false)") == 2, (
+        "the hook must be unregistered before and after the work is cancelled")
+    assert mc_exit.index("ft_mc_hook_sync(false)") < \
+        mc_exit.index("cancel_work_sync(&ft_mc_work)") < \
+        mc_exit.rindex("ft_mc_hook_sync(false)")
+
+    sync = function(source, "ft_mc_hook_sync")
+    assert "mutex_lock(&ft_mc_hook_lock)" in sync, (
+        "the flag alone cannot serialize a registration that sleeps")
+    assert "READ_ONCE(ft_mc_stopping)" in sync, (
+        "teardown must win however the two interleave")
+
+
+def test_the_vid_follows_the_bridge_rather_than_the_port():
+    """A bridge that does not filter resolves every frame to VLAN zero and
+    reports every MDB entry with vid zero, but the port's PVID is not zero --
+    nbp_vlan_init() installs the bridge's default_pvid on enslavement whatever
+    the filtering setting. Asking the port unconditionally returns 1, no
+    observation ever matches a membership, and the learner is inert on the
+    commonest configuration there is.
+    """
+    body = function(SOURCE.read_text(), "ft_mc_frame_vid")
+    assert "br_vlan_enabled(bridge)" in body, (
+        "a bridge that does not filter has no VLAN to resolve")
+    assert body.index("br_vlan_enabled(bridge)") < \
+        body.index("br_vlan_get_pvid_rcu"), (
+        "the filtering test must come before the PVID lookup")
+
+
+def test_a_blocked_port_group_is_not_a_listener():
+    """A blocked port group is one an IGMPv3 source filter excludes this source
+    for; br_forward() skips it. Installing it would deliver exactly what the
+    filter excluded, and with the frame no longer reaching the bridge there is
+    no software path left to correct it.
+    """
+    body = function(SOURCE.read_text(), "ft_mc_swdev_obj")
+    assert "SWITCHDEV_OBJ_MDB_F_BLOCKED" in body, (
+        "the learner must honour the bridge's source filter")
+
+
+def test_the_learner_lets_go_of_a_device_that_went_away():
+    """Nothing reports a group's ingress port, and a permanent MDB entry's
+    delete arrives after the port has left the bridge -- del_nbp() flushes
+    those from br_multicast_del_port(), after netdev_upper_dev_unlink(). Both
+    would otherwise hold a reference that blocks unregistration for good.
+    """
+    source = SOURCE.read_text()
+    netdev = function(source, "ft_netdev_event")
+    assert netdev.count("ft_mc_device_gone(dev)") == 2, (
+        "both the link going down and unregistration must reach the learner")
+
+    gone = function(source, "ft_mc_device_gone")
+    assert "ft_mc_drop_port(dev)" in gone, "as a listener"
+    assert "g->in == dev" in gone, "as an ingress"
+    assert "g->bridge == dev" in gone, "as the bridge itself"
+
+    # And the delete that arrives too late falls back to dropping the port
+    # wherever it is still listed.
+    swdev = function(source, "ft_mc_swdev_obj")
+    assert "ft_mc_drop_port(port)" in swdev, (
+        "a delete with no master left must still release the port")

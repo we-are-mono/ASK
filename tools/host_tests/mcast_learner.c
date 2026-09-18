@@ -158,6 +158,7 @@ static struct net_device P1   = { .name = "eth3", .ifindex = 11, .physical = tru
 static struct net_device P2   = { .name = "eth4", .ifindex = 12, .physical = true };
 static struct net_device P3   = { .name = "eth5", .ifindex = 13, .physical = true };
 static struct net_device SOFT = { .name = "vx0",  .ifindex = 14, .physical = false };
+static struct net_device BR2  = { .name = "br1",  .ifindex = 15, .bridge_master = true };
 
 static struct br_ip group_v4(uint32_t dst, uint32_t src, uint16_t vid)
 {
@@ -297,13 +298,24 @@ int main(void)
     assert(!only_group()->host);
     assert(ft_mc_membership(&BR, &P3, &g1, true, false));
 
-    /* A host membership for a group nothing else joined creates nothing --
-     * there is no port set to disqualify. */
+    /* A host membership arriving FIRST has to be recorded, and this is the
+     * ordering the bridge actually produces: br_multicast_add_group() calls
+     * br_multicast_host_join() on a freshly created mdb entry, so HOST_MDB
+     * is emitted before any port group for that address. Dropping it left
+     * the group to be created later by the first port join with host clear,
+     * and the local listener then stopped receiving the moment the offload
+     * installed -- exactly what refusing a host group exists to prevent. */
     reset();
     {
         struct br_ip lonely = group_v4(0x0a0007ef, 0, 0);
-        assert(!ft_mc_membership(&BR, &P1, &lonely, true, true));
-        assert(ft_mc_count == 0);
+
+        assert(!ft_mc_membership(&BR, &BR, &lonely, true, true));
+        assert(ft_mc_count == 1);
+        assert(ft_mc_find(&BR, &lonely)->host);
+        /* And a port joining afterwards finds it and is refused. */
+        assert(!ft_mc_membership(&BR, &P1, &lonely, true, false));
+        assert(ft_mc_find(&BR, &lonely)->ports == 1);
+        assert(ft_mc_find(&BR, &lonely)->host);
     }
 
     /* Tags. On a bridge that does not filter, nothing is pushed. */
@@ -462,6 +474,61 @@ int main(void)
         b = a;
         b.addr.vid = 7;
         assert(!ft_mc_seen_eq(&a, &b));
+    }
+
+    /* A key two memberships both claim. The hardware distinguishes only the
+     * address pair, so installing either would stop the frame reaching the
+     * bridge and the other one's ports would go quiet with nothing to say
+     * why. The bridge produces this routinely: an (S,G) entry appears
+     * alongside the (*,G) one whenever INCLUDE and EXCLUDE listeners
+     * coexist. Neither may install. */
+    reset();
+    {
+        struct br_ip wildcard = group_v4(0x0b0007ef, 0, 0);
+        struct br_ip sourced  = group_v4(0x0b0007ef, 0x0100000a, 0);
+
+        assert(ft_mc_membership(&BR, &P1, &wildcard, true, false));
+        assert(!ft_mc_key_contested(ft_mc_find(&BR, &wildcard)));
+        assert(ft_mc_membership(&BR, &P2, &sourced, true, false));
+        assert(ft_mc_key_contested(ft_mc_find(&BR, &wildcard)));
+        assert(ft_mc_key_contested(ft_mc_find(&BR, &sourced)));
+
+        /* A host-only membership is not a claim on the key -- it installs
+         * nothing -- so it does not contest. */
+        reset();
+        assert(!ft_mc_membership(&BR, &BR, &wildcard, true, true));
+        assert(ft_mc_membership(&BR, &P1, &sourced, true, false));
+        assert(!ft_mc_key_contested(ft_mc_find(&BR, &sourced)));
+
+        /* Nor does a group on a different bridge, whose ports are its own. */
+        reset();
+        assert(ft_mc_membership(&BR, &P1, &wildcard, true, false));
+        assert(ft_mc_membership(&BR2, &P2, &sourced, true, false));
+        assert(!ft_mc_key_contested(ft_mc_find(&BR, &wildcard)));
+    }
+
+    /* Dropping a port by device alone, for the delete that arrives after the
+     * port has already left the bridge -- del_nbp() flushes permanent mdb
+     * entries after netdev_upper_dev_unlink(), so the master lookup is empty
+     * and the membership would otherwise never be removed, holding a
+     * reference that blocks the port's unregistration for good. */
+    reset();
+    {
+        struct br_ip a = group_v4(0x0c0007ef, 0, 0);
+        struct br_ip b = group_v4(0x0d0007ef, 0, 0);
+
+        assert(ft_mc_membership(&BR, &P1, &a, true, false));
+        assert(ft_mc_membership(&BR, &P2, &a, true, false));
+        assert(ft_mc_membership(&BR, &P1, &b, true, false));
+        ft_mc_drop_port(&P1);
+        assert(ft_mc_find(&BR, &a)->ports == 1);
+        assert(ft_mc_find(&BR, &a)->port[0].dev == &P2);
+        assert(ft_mc_find(&BR, &b)->ports == 0);
+        /* Every reference it held is gone: the two groups' bridges only. */
+        assert(holds == 3);
+        /* And dropping a port nothing lists is inert. */
+        ft_mc_drop_port(&P3);
+        assert(holds == 3);
     }
 
     reset();

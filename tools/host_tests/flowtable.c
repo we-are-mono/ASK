@@ -327,6 +327,12 @@ static bool ft_mc_swdev_obj(unsigned long event,
     return false;
 }
 static void ft_mc_exit(void) { }
+static unsigned mc_devices_gone;
+static void ft_mc_device_gone(struct net_device *dev)
+{
+    (void)dev;
+    mc_devices_gone++;
+}
 #define switchdev_notifier_info_to_dev(p) (((struct switchdev_notifier_info *)(p))->dev)
 struct dst_ops { unsigned family; };
 /* Only the field the adapter reads off a transform: what leaves the port is
