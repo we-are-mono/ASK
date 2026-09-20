@@ -1,0 +1,138 @@
+fmlib: complete the DEV_TO_ID handle-to-cookie conversions (ASK A103)
+
+Post-A85 the kernel expects cookies at the ioctl boundary and cleanly
+rejects raw userspace t_Device pointers (E_INVALID_SELECTION). fmlib
+omitted the conversion at eight sites, leaving the affected verbs
+unusable from userspace:
+
+ - FM_PCD_CcRootBuild: FR next-engine arm (frm_replic_id)
+ - FM_PCD_FrmReplicSetGroup / AddMember: nested-FR arm
+ - FM_PCD_PlcrProfileSet: modify arm (profile_select.p_profile)
+ - FM_PCD_ManipNodeReplace: p_next_manip (the NXP REMINDER comment)
+ - FM_PORT_PcdKgModifyInitialScheme: scheme_id (direct arm)
+ - FM_PORT_PcdPlcrModifyInitialProfile: profile cookie
+ - FM_PORT_VSPAlloc: NULL p_fm_tx_port (ports are fd-based, not
+   cookie-registered; the kernel derives the coupled Tx handle for Rx
+   ports and refuses any userspace value)
+
+Each conversion follows the file's established local idiom and the
+kernel handler contract in lnxwrp_ioctls_fm.c. Whole-tree replacement
+(PcdCcModifyTree) remains deliberately unsupported per A113.
+
+--- a/src/fm_lib.c
++++ b/src/fm_lib.c
+@@ -825,6 +825,12 @@
+             if (params.fm_pcd_cc_group_params[i].next_engine_per_entries_in_grp[j].manip_id) {
+             	DEV_TO_ID(params.fm_pcd_cc_group_params[i].next_engine_per_entries_in_grp[j].manip_id);
+             }
++
++#if (DPAA_VERSION >= 11)
++            if (params.fm_pcd_cc_group_params[i].next_engine_per_entries_in_grp[j].next_engine == e_IOC_FM_PCD_FR &&
++                params.fm_pcd_cc_group_params[i].next_engine_per_entries_in_grp[j].params.fr_params.frm_replic_id)
++                    DEV_TO_ID(params.fm_pcd_cc_group_params[i].next_engine_per_entries_in_grp[j].params.fr_params.frm_replic_id);
++#endif /* DPAA_VERSION >= 11 */
+         }
+ 
+     p_Dev = (t_Device *)malloc(sizeof(t_Device));
+@@ -1455,6 +1461,11 @@
+             (ioc_fm_pcd_port_params_t*) (((t_Device*) p_Profile->id.newParams.h_FmPort)->h_UserPriv);
+     }
+ 
++    /* Modify arm: the kernel expects a policer-profile cookie, not the
++     * userspace t_Device pointer the memcpy above left in place. */
++    if (params.modify && params.profile_select.p_profile)
++        DEV_TO_ID(params.profile_select.p_profile);
++
+     /* correct paramsOnGreen.h_Profile, paramsOnYellow.h_Profile, paramsOnRed.h_Profile
+      * if next engine is policer... that means that FM_PCD_PlcrProfileSet was called */
+     if (params.next_engine_on_green == e_IOC_FM_PCD_PLCR && params.params_on_green.p_profile)
+@@ -1587,9 +1598,10 @@
+     memset(&params, 0, sizeof(ioc_fm_pcd_manip_params_t));
+     memcpy(&params, p_FmPcdManipParams, sizeof(t_FmPcdManipParams));
+     params.id = UINT_TO_PTR(p_Dev->id);
+-    /* REMINDER:
+-       Also take care of params.p_next_manip here, although it's currently
+-       ignored by the LLD! */
++
++    /* The kernel expects a manip-node cookie for the chained manip. */
++    if (params.p_next_manip)
++        DEV_TO_ID(params.p_next_manip);
+ 
+     if (ioctl(p_PcdDev->fd, FM_PCD_IOC_MANIP_NODE_SET, &params))
+         RETURN_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+@@ -2052,13 +2064,20 @@
+ t_Error FM_PORT_PcdKgModifyInitialScheme(t_Handle h_FmPort, t_FmPcdKgSchemeSelect *p_FmPcdKgScheme)
+ {
+     t_Device *p_Dev = (t_Device*) h_FmPort;
++    ioc_fm_pcd_kg_scheme_select_t params;
+ 
+     ASSERT_COND(sizeof(t_FmPcdKgSchemeSelect) == sizeof(ioc_fm_pcd_kg_scheme_select_t));
+     SANITY_CHECK_RETURN_ERROR(p_Dev, E_INVALID_HANDLE);
+ 
+     _fml_dbg("Calling...\n");
+ 
+-    if (ioctl(p_Dev->fd, FM_PORT_IOC_PCD_KG_MODIFY_INITIAL_SCHEME, p_FmPcdKgScheme))
++    /* The kernel expects a scheme cookie for a direct selection, not the
++     * userspace t_Device pointer. */
++    memcpy(&params, p_FmPcdKgScheme, sizeof(ioc_fm_pcd_kg_scheme_select_t));
++    if (params.direct && params.scheme_id)
++        DEV_TO_ID(params.scheme_id);
++
++    if (ioctl(p_Dev->fd, FM_PORT_IOC_PCD_KG_MODIFY_INITIAL_SCHEME, &params))
+         RETURN_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+ 
+     _fml_dbg("Called.\n");
+@@ -2075,7 +2094,9 @@
+ 
+     _fml_dbg("Calling...\n");
+ 
+-    id.obj = h_Profile;
++    /* The kernel expects a policer-profile cookie, not the userspace
++     * t_Device pointer. */
++    id.obj = UINT_TO_PTR(((t_Device *) h_Profile)->id);
+ 
+     if (ioctl(p_Dev->fd, FM_PORT_IOC_PCD_PLCR_MODIFY_INITIAL_PROFILE, &id))
+         RETURN_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+@@ -2180,6 +2201,10 @@
+         	t_Device *p_NextDev = (t_Device*) p_FrmReplicGroupParam->nextEngineParams[i].params.kgParams.h_DirectScheme;
+         	params.next_engine_params[i].params.kg_params.p_direct_scheme = UINT_TO_PTR(p_NextDev->id);
+         }
++        else if (p_FrmReplicGroupParam->nextEngineParams[i].nextEngine == e_FM_PCD_FR) {
++        	t_Device *p_NextDev = (t_Device*) p_FrmReplicGroupParam->nextEngineParams[i].params.frParams.h_FrmReplic;
++        	params.next_engine_params[i].params.fr_params.frm_replic_id = UINT_TO_PTR(p_NextDev->id);
++        }
+ 
+         /* Convert hdr manip pointer */
+         if (p_FrmReplicGroupParam->nextEngineParams[i].h_Manip) {
+@@ -2261,6 +2286,10 @@
+         t_Device *p_NextDev = (t_Device*) p_MemberParams->params.kgParams.h_DirectScheme;
+         params.next_engine_params.params.kg_params.p_direct_scheme = UINT_TO_PTR(p_NextDev->id);
+     }
++    else if (p_MemberParams->nextEngine == e_FM_PCD_FR) {
++        t_Device *p_NextDev = (t_Device*) p_MemberParams->params.frParams.h_FrmReplic;
++        params.next_engine_params.params.fr_params.frm_replic_id = UINT_TO_PTR(p_NextDev->id);
++    }
+ 
+     /* Convert hdr manip pointer */
+     if (p_MemberParams->h_Manip) {
+@@ -2446,12 +2475,19 @@
+ t_Error FM_PORT_VSPAlloc(t_Handle h_FmPort, t_FmPortVSPAllocParams *p_Params)
+ {
+     t_Device    *p_Dev = (t_Device*) h_FmPort;
++    ioc_fm_port_vsp_alloc_params_t params;
+ 
+     SANITY_CHECK_RETURN_VALUE(p_Dev, E_INVALID_HANDLE, E_OK);
+ 
+     _fml_dbg("Calling...\n");
+ 
+-    if (ioctl(p_Dev->fd, FM_PORT_IOC_VSP_ALLOC, p_Params))
++    /* Ports are fd-based, not cookie-registered: the kernel derives the
++     * coupled Tx handle itself (Rx ports) and refuses any userspace value
++     * here, so never forward one. */
++    memcpy(&params, p_Params, sizeof(ioc_fm_port_vsp_alloc_params_t));
++    params.p_fm_tx_port = NULL;
++
++    if (ioctl(p_Dev->fd, FM_PORT_IOC_VSP_ALLOC, &params))
+         RETURN_ERROR(MINOR, E_INVALID_OPERATION, NO_MSG);
+ 
+     _fml_dbg("Called.\n");
