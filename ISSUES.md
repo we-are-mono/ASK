@@ -421,6 +421,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A163.** The IPsec egress encoder passed hash 0 to `dpaa_get_vap_fwd_fq()`, pinning every
+  encrypted flow to a VAP onto queue 0 and one CPU — fixed (this commit): spread by SA handle.
+
 - [x] **A162.** `moal` defaulted `tx_skb_clone=1` and so `pskb_copy`'d every transmitted frame on
   its single TX worker, the second-largest item on the pegged core — fixed (this commit): default 0,
   the cloned/headroom predicate it bypassed still copies what needs copying (patch 0004).

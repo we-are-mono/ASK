@@ -1044,9 +1044,9 @@ int dpa_get_l2l3_info_by_itf_id(uint32_t itf_id, struct dpa_l2hdr_info *l2_info,
 	return retval;
 }
 
-int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry , 
+int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 		struct dpa_l2hdr_info *l2_info,
-		struct dpa_l3hdr_info *l3_info)
+		struct dpa_l3hdr_info *l3_info, uint32_t hash)
 {
 
 	struct dpa_iface_info *iface_info;
@@ -1096,8 +1096,13 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 					src_mac = wlan_info->mac_addr;
 			}
 
-			/* Always using queue 0 for outbound ESP packets */
-			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, 0);
+			/* A VAP's forwarding queues are spread over the CPU
+			 * portals, and the dequeue callback runs on the CPU
+			 * whose portal the queue lands on. Spread by the
+			 * caller's hash rather than pinning every SA to
+			 * queue 0, which put all encrypted Wi-Fi egress on
+			 * one core. */
+			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash);
 
 			l2_info->is_wlan_iface = 1;
 			retval = SUCCESS;

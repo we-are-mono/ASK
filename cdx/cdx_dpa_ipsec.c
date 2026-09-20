@@ -2463,7 +2463,8 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		} else {
 */
 		if (dpa_get_out_tx_info_by_itf_id(sa->pRtEntry,
-					&info->l2_info, &info->l3_info)) {
+					&info->l2_info, &info->l3_info,
+					(uint32_t)sa->handle)) {
 			DPA_ERROR("%s:: dpa_get_out_tx_info_by_itf_id returned error\n",
 					__func__);
 			goto err_ret;
