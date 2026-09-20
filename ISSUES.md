@@ -463,6 +463,11 @@ file's git history.
 
 ## Gating
 
+- [x] **A174.** The netlink cb_mutex lockdep name table stopped at 33 while `MAX_LINKS` is 64, and moal's
+  socket sits at 63: a nameless class WARNs, `debug_locks_off()` disables lockdep and sets the console
+  to level 15 on every test-image boot since the radio was added — fixed (this commit): patch 093 names
+  every slot.
+
 - [x] **A172.** VWD drained its queues through `eth0`'s NAPI, which is enabled only while `eth0` is
   open — never, on this board — so the portal's dequeue interrupt stayed masked and only the WAN port's
   transmit confirmations kept the path moving — fixed (this commit): VWD owns a NAPI per CPU and portal.

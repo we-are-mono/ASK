@@ -1,48 +1,69 @@
-From bfba753e663ad8d15f1289d9fcea1b5d91f93f08 Mon Sep 17 00:00:00 2001
+From ab592a3ae09afe7d17398adf1813c057144affc5 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sat, 25 Apr 2026 17:55:41 +0200
-Subject: [PATCH] netlink: name NETLINK_KEY and NETLINK_L2FLOW in cb_mutex
- string table
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Subject: [PATCH] netlink: name every cb_mutex lock class up to MAX_LINKS
 
-The nlk_cb_mutex_key_strings[] array is declared sized [MAX_LINKS + 1]
-(65 entries with MAX_LINKS=64) but only initialized for indices 0..32,
-with a "nlk_cb_mutex-MAX_LINKS" sentinel placed at index 32 — left over
-from when MAX_LINKS actually was 32. Indices 33..64 are implicitly NULL.
+The ASK patch that raised MAX_LINKS from 32 to 64 left the lockdep name
+table for the per-protocol cb_mutex at its upstream length, so the first
+version of this change named only the two protocols ASK itself uses
+(NETLINK_KEY = 32, NETLINK_L2FLOW = 33) and every slot above them stayed
+NULL. That is not a cosmetic gap: lockdep_init_map_type() refuses a
+nameless class with DEBUG_LOCKS_WARN_ON, which calls debug_locks_off() --
+lockdep is disabled for the rest of the boot and the console log level is
+raised to 15. The Wi-Fi driver creates its socket at NETLINK_NXP =
+MAX_LINKS - 1, so a debug kernel with moal loaded ran without lockdep
+from 29 seconds after boot, with every KERN_INFO line on the serial
+console.
 
-Since NETLINK_L2FLOW = 33 (added by the ASK patch bundle), creating a
-kernel netlink socket on that protocol hands lockdep a NULL name:
-
-    WARNING at lockdep.c:4925 DEBUG_LOCKS_WARN_ON(!name)
-    lockdep_init_map_type
-    __netlink_create
-    __netlink_kernel_create
-    abm_init [auto_bridge]
-
-Also, the sentinel at index 32 misnames NETLINK_KEY = 32 as "MAX_LINKS"
-on every boot. Swap that entry to the real name and add an L2FLOW entry
-at index 33.
-
-This only affects lockdep trace readability and the DEBUG_LOCKS_WARN_ON
-above — no functional change.
-
-Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+Name the whole range; the sentinel stays last, at index MAX_LINKS.
 ---
- net/netlink/af_netlink.c | 2 ++
- 1 file changed, 2 insertions(+)
+ net/netlink/af_netlink.c | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
 
 diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
-index 8b060465a2be..5fa41e9e22da 100644
+index e250d4a3d030..630d57d08f31 100644
 --- a/net/netlink/af_netlink.c
 +++ b/net/netlink/af_netlink.c
-@@ -127,6 +127,8 @@ static const char *const nlk_cb_mutex_key_strings[MAX_LINKS + 1] = {
+@@ -127,6 +127,42 @@ static const char *const nlk_cb_mutex_key_strings[MAX_LINKS + 1] = {
  	"nlk_cb_mutex-29",
  	"nlk_cb_mutex-30",
  	"nlk_cb_mutex-31",
 +	"nlk_cb_mutex-KEY",        /* NETLINK_KEY = 32 */
 +	"nlk_cb_mutex-L2FLOW",     /* NETLINK_L2FLOW = 33 (ASK) */
++	/* MAX_LINKS is 64 here, not 32, and every slot needs a name: a NULL
++	 * makes lockdep_init_map_type() WARN, which turns lockdep off for the
++	 * rest of the boot and sets the console to motormouth. The Wi-Fi
++	 * driver's socket sits at MAX_LINKS - 1. */
++	"nlk_cb_mutex-34",
++	"nlk_cb_mutex-35",
++	"nlk_cb_mutex-36",
++	"nlk_cb_mutex-37",
++	"nlk_cb_mutex-38",
++	"nlk_cb_mutex-39",
++	"nlk_cb_mutex-40",
++	"nlk_cb_mutex-41",
++	"nlk_cb_mutex-42",
++	"nlk_cb_mutex-43",
++	"nlk_cb_mutex-44",
++	"nlk_cb_mutex-45",
++	"nlk_cb_mutex-46",
++	"nlk_cb_mutex-47",
++	"nlk_cb_mutex-48",
++	"nlk_cb_mutex-49",
++	"nlk_cb_mutex-50",
++	"nlk_cb_mutex-51",
++	"nlk_cb_mutex-52",
++	"nlk_cb_mutex-53",
++	"nlk_cb_mutex-54",
++	"nlk_cb_mutex-55",
++	"nlk_cb_mutex-56",
++	"nlk_cb_mutex-57",
++	"nlk_cb_mutex-58",
++	"nlk_cb_mutex-59",
++	"nlk_cb_mutex-60",
++	"nlk_cb_mutex-61",
++	"nlk_cb_mutex-62",
++	"nlk_cb_mutex-NXP",        /* NETLINK_NXP = MAX_LINKS - 1 (moal) */
  	"nlk_cb_mutex-MAX_LINKS"
  };
  
