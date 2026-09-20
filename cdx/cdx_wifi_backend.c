@@ -64,21 +64,35 @@ struct cdx_wifi_vap {
 static struct cdx_wifi_vap *cdx_wifi_slot[MAX_WIFI_VAPS];
 static u16 cdx_wifi_next_vapid;
 
-/* Rotates rather than restarting the search from zero.
+/* Prefers a free slot that already carries its frame queues, and rotates
+ * only among fresh ones.
  *
- * The id is not just an index here: it names a VWD slot whose frame queues
- * outlive the VAP that built them, a physical_port at PORT_WIFI_IDX + id, and
- * a sysfs attribute. Handing a freed id straight back to the next VAP is what
- * turns a reference that has not caught up -- an entry queued for retirement,
- * a reader holding the old stats file open -- into one that resolves to the
- * wrong VAP instead of to nothing. Spending the whole id space first costs a
- * u16 and makes that window as wide as the table.
+ * The id is not just an index here: it names a VWD slot whose 65 frame queues
+ * are built on first open and kept until module exit, a physical_port at
+ * PORT_WIFI_IDX + id, and a sysfs attribute. Rotating through the whole id
+ * space before reusing any of it -- the first version of this -- meant every
+ * hostapd restart or link bounce claimed a fresh slot and built its queues,
+ * until all 32 slots held them: 2080 frame queues for a board with two VAPs,
+ * each set built under RTNL. Reusing a built slot bounds that by the peak
+ * number of VAPs alive at once.
+ *
+ * Handing a freed id back is safe because nothing resolves an id without
+ * checking what it currently names: the dequeue path tests the slot's state
+ * and device under vaplock, the encoder reaches a VAP only through a record
+ * dpa_get_ifinfo_by_netdev() has confirmed VWD still owns, and entries that
+ * named the old VAP were retired at NETDEV_GOING_DOWN, before the slot was
+ * released.
  */
 static int cdx_wifi_alloc_vapid(u16 *out)
 {
 	unsigned int tries;
 	u16 cand;
 
+	for (cand = 0; cand < MAX_WIFI_VAPS; cand++)
+		if (!cdx_wifi_slot[cand] && dpaa_vwd_vap_built(cand)) {
+			*out = cand;
+			return 0;
+		}
 	for (tries = 0; tries < MAX_WIFI_VAPS; tries++) {
 		cand = cdx_wifi_next_vapid++ % MAX_WIFI_VAPS;
 		if (cdx_wifi_slot[cand])

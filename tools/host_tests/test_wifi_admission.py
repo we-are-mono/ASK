@@ -45,7 +45,10 @@ def test_hardware_path_agrees_with_admission():
     was opened -- so assert the two sets are still the same set."""
     hw = (ROOT / "cdx/cdx_flowtable_hw.c").read_text()
     egress = function(hw, "ft_hw_egress_onif")
-    assert "IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL" in egress
-    assert "IF_TYPE_WLAN | IF_TYPE_PHYSICAL" in egress
+    # The whole body, not two substrings: a third accepted type, or one of
+    # these two dropped, would still contain both names.
+    body = " ".join(egress.split("{", 1)[1].rsplit("}", 1)[0].split())
+    assert body == ("return type == (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL) || "
+                    "type == (IF_TYPE_WLAN | IF_TYPE_PHYSICAL);"), body
     # The ingress beside it must not have been widened by the same edit.
     assert "in->itf->type != (IF_TYPE_ETHERNET | IF_TYPE_PHYSICAL)" in hw

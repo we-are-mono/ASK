@@ -2533,6 +2533,38 @@ bool dpaa_vwd_vap_is_open(const struct net_device *dev)
 	return open;
 }
 
+/* Whether VWD still binds this slot to this device. The devman record that
+ * names a VAP by id is freed one workqueue hop after the device goes, and a
+ * netdev freed and reallocated inside that hop would otherwise match the
+ * stale record by address alone. Released slots keep their device pointer,
+ * so the state is part of the answer.
+ */
+bool dpaa_vwd_vap_owns(uint16_t vap_id, const struct net_device *dev)
+{
+	struct dpaa_vwd_priv_s *priv = &vwd;
+	bool owns;
+
+	if (!dev || vap_id >= MAX_WIFI_VAPS || READ_ONCE(vwd_stopping))
+		return false;
+	spin_lock_bh(&priv->vaplock);
+	owns = priv->vaps[vap_id].wifi_dev == dev &&
+	       priv->vaps[vap_id].state != VAP_ST_CLOSE;
+	spin_unlock_bh(&priv->vaplock);
+	return owns;
+}
+
+/* Whether this slot already carries its frame queues. They are built on a
+ * slot's first open and kept until module exit, so a slot that has them is
+ * cheaper to hand out again than a fresh one, and the id allocator prefers
+ * it for that reason.
+ */
+bool dpaa_vwd_vap_built(uint16_t vap_id)
+{
+	if (vap_id >= MAX_WIFI_VAPS || READ_ONCE(vwd_stopping))
+		return false;
+	return READ_ONCE(vwd.vaps[vap_id].wlan_fq_to_fman) != NULL;
+}
+
 static int vwd_init_ohport(struct dpaa_vwd_priv_s *priv)
 {
 	int handle;

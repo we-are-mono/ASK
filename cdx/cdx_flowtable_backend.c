@@ -279,9 +279,11 @@ int cdx_ft_add(const struct cdx_ft_rule *rule,
 		ask_dbg(ASK_DBG_DEVICE,
 			"add claimed=%d failed=%d observe=%d pending=%u in=%s(%d) out=%s(%d) srcmac=%d\n",
 			ft_claimed, ft_failed, ft_observe, cdx_ft_pending(),
-			netdev_name(rule->in), cdx_ft_port_supported(rule->in),
-			netdev_name(rule->out), cdx_ft_egress_supported(rule->out),
-			ether_addr_equal(rule->src_mac, rule->out->dev_addr));
+			rule->in ? netdev_name(rule->in) : "(null)",
+			cdx_ft_port_supported(rule->in),
+			rule->out ? netdev_name(rule->out) : "(null)",
+			cdx_ft_egress_supported(rule->out),
+			rule->out ? ether_addr_equal(rule->src_mac, rule->out->dev_addr) : -1);
 		return ask_refuse(-EOPNOTSUPP);
 	}
 	rc = cdx_ft_hw_add(rule, stats, result);

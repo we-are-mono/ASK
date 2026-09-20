@@ -453,8 +453,14 @@ struct dpa_iface_info *dpa_get_ifinfo_by_netdev(const struct net_device *dev)
 		if ((iface->if_flags & IF_TYPE_ETHERNET) &&
 		    iface->eth_info.net_dev == dev)
 			return iface;
+		/* The WLAN record outlives its device by one workqueue hop
+		 * (the retire path frees it from ft_wifi_work_fn), so a match
+		 * by address alone could name a netdev that was freed and
+		 * reallocated inside that hop. VWD clears its own binding
+		 * synchronously, so ask it as well. */
 		if ((iface->if_flags & IF_TYPE_WLAN) &&
-		    iface->wlan_info.net_dev == dev)
+		    iface->wlan_info.net_dev == dev &&
+		    dpaa_vwd_vap_owns(iface->wlan_info.vap_id, dev))
 			return iface;
 	}
 	return NULL;

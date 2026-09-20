@@ -390,8 +390,16 @@ static int __init cdx_module_init(void)
 	 * be resolved, with nothing in the message naming Wi-Fi. */
 	rc = dpaa_vwd_init();
 	if (rc != 0)  {
-		printk("%s::vwd_driver_init failed\n", __func__);
-		goto exit;
+		/* Not fatal. What failed is a claim on board-specific resources
+		 * -- the Wi-Fi offline port, its buffer pool, the first Ethernet
+		 * port's private data -- and a board without them is a gateway
+		 * without Wi-Fi offload, not a gateway without offload.
+		 * dpaa_vwd_ready() stays false, so cdx_wifi_vap_supported()
+		 * refuses every VAP and dpaa_vwd_vap_cmd() refuses the legacy
+		 * owner's commands; nothing else here depends on it. */
+		pr_warn("%s: Wi-Fi offload unavailable, VWD init failed (%d)\n",
+			__func__, rc);
+		rc = 0;
 	}
 #endif
 	// initialize global fragmentation params

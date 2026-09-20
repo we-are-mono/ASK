@@ -152,6 +152,25 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A167 — a failed IPsec initialisation refuses to load `cdx.ko` at all.**
+  `cdx_main.c` treats `cdx_dpa_ipsec_init()` failing as fatal, so a board whose
+  device tree lacks the IPsec offline port (`dpa-fman0-oh@2`), or on which the
+  CAAM job ring is unavailable, has no offload of any kind rather than no IPsec
+  offload. The Wi-Fi gate of the same shape is now non-fatal (A168) because
+  `dpaa_vwd_ready()` already refuses every later use; the IPsec side has no
+  equivalent readiness predicate that SA admission and the encoder consult, so
+  it needs one before the gate can be relaxed. Same class, separate fix.
+
+- [ ] **A166 — `dpaa_get_vap_fwd_fq()` dereferences a slot whose queues may not
+  exist.** `vwd.vaps[id].wlan_fq_from_fman[hash & 63]->fqid` with no NULL
+  check; the queues are built on the slot's first open. In the legacy owner
+  the devman WLAN record is created by `wifi_vap_entry(WIFI_ADD_VAP)` before
+  CMM's `/dev/vwd` CONFIGURE/ADD builds them, so the encoder arms at
+  `devman.c:603`, `:1105` and `:1396` can reach an empty slot from the control
+  path. The flowtable owner is not exposed: it admits a VAP only through
+  `dpaa_vwd_vap_is_open()`, under RTNL, which VWD's transitions also hold. The
+  fix is a failing return, but all three callers ignore the return today.
+
 - [ ] **A159 — a bound flowtable stops the port's ingress byte counters.**
   With an nftables flowtable bound to a port, that port's rx byte and packet
   counters stop counting forwarded traffic. Measured with a controlled
@@ -424,6 +443,17 @@ file's git history.
 - [x] **A171.** A non-DPAA device in an offload flowtable (a VAP, which fw4 always lists once Wi-Fi
   is in the LAN bridge) was refused, which fails the whole table and drops every port to software —
   fixed (this commit): bound passively, its flows declined into the software fast path.
+
+- [x] **A170.** `dpa_get_ifinfo_by_netdev()` matched a VAP record by address alone, and the record
+  outlives its device by one workqueue hop — fixed (this commit): VWD must still own the device.
+
+- [x] **A169.** The VAP-id allocator rotated through all 32 slots before reusing one, and each slot's
+  65 frame queues live until module exit, so restarts grew the table to 2080 queues —
+  fixed (this commit): prefer a free slot whose queues exist, bounded by peak concurrent VAPs.
+
+- [x] **A168.** `dpaa_vwd_init()` failing refused to load `cdx.ko`, so a board without the Wi-Fi
+  offline port had no offload at all — fixed (this commit): non-fatal; `dpaa_vwd_ready()` gates
+  every later use.
 
 - [x] **A163.** The IPsec egress encoder passed hash 0 to `dpaa_get_vap_fwd_fq()`, pinning every
   encrypted flow to a VAP onto queue 0 and one CPU — fixed (this commit): spread by SA handle.
