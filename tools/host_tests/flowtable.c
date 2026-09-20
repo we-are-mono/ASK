@@ -135,7 +135,8 @@ struct iphdr { u8 prefix[12]; __be32 saddr, daddr; };
 enum { FIB_EVENT_ENTRY_REPLACE, FIB_EVENT_ENTRY_APPEND, FIB_EVENT_ENTRY_ADD,
        FIB_EVENT_ENTRY_DEL, FIB_EVENT_RULE_ADD, FIB_EVENT_RULE_DEL, FIB_EVENT_NH_ADD, FIB_EVENT_NH_DEL };
 enum { NETDEV_GOING_DOWN, NETDEV_UNREGISTER, NETDEV_CHANGEMTU, NETDEV_CHANGEADDR,
-       NETDEV_CHANGEUPPER, NETDEV_CHANGENAME, NETDEV_REGISTER, NETDEV_CHANGE };
+       NETDEV_CHANGEUPPER, NETDEV_CHANGENAME, NETDEV_REGISTER, NETDEV_CHANGE,
+       NETDEV_UP, NETDEV_DOWN };
 enum { NEXTHOP_EVENT_DEL, NEXTHOP_EVENT_REPLACE, NEXTHOP_EVENT_RES_TABLE_PRE_REPLACE,
        NEXTHOP_EVENT_BUCKET_REPLACE, NEXTHOP_EVENT_HW_STATS_REPORT_DELTA };
 struct fib_notifier_info { int family; };
@@ -197,6 +198,7 @@ struct flow_block_offload {
 };
 struct flow_block_cb {
     struct list_head list, driver_list;
+    int (*cb)(enum tc_setup_type, void *, void *);
     void *ident, *cb_priv;
     void (*release)(void *);
     /* Which route installed it. Netfilter unwinds only the indirect ones on
@@ -333,6 +335,13 @@ static void ft_mc_device_gone(struct net_device *dev)
     (void)dev;
     mc_devices_gone++;
 }
+/* The Wi-Fi VAP registration lives in its own file and has its own harness
+ * (wifi_admission.c); here the notifier's calls into it only count. */
+static unsigned wifi_reconsiders, wifi_address_changes, wifi_devices_gone;
+static void ft_wifi_reconsider(struct net_device *dev) { (void)dev; wifi_reconsiders++; }
+static void ft_wifi_address_changed(struct net_device *dev) { (void)dev; wifi_address_changes++; }
+static void ft_wifi_device_gone(struct net_device *dev) { (void)dev; wifi_devices_gone++; }
+static void ft_wifi_exit(void) { }
 #define switchdev_notifier_info_to_dev(p) (((struct switchdev_notifier_info *)(p))->dev)
 struct dst_ops { unsigned family; };
 /* Only the field the adapter reads off a transform: what leaves the port is
@@ -693,6 +702,13 @@ static int atomic_read(int *v) { return *v; }
 static void atomic_set(int *v, int n) { *v = n; }
 static void ft_invalidate(void) { ft_invalid = 1; }
 static bool cdx_ft_port_supported(struct net_device *d) { return d && physical_ok; }
+/* The egress set is wider in production (an open VAP); the asymmetry has its
+ * own harness (wifi_admission.c). Here the two sets coincide. */
+static bool cdx_ft_egress_supported(struct net_device *d) { return cdx_ft_port_supported(d); }
+static unsigned int ft_passive;
+/* ASK-DEBUG tracing is a printk in production; nothing to observe here. */
+#define ask_refuse(err) (err)
+#define ask_dbg(bit, fmt, ...) do { } while (0)
 /* Both tables read key_len bytes from the front of the address union, so the
  * caller hands over the same pointer for either family. */
 static struct neighbour *neigh_lookup(struct neigh_table *table, const void *dst, struct net_device *dev)
@@ -730,7 +746,7 @@ static struct flow_block_cb *flow_indr_block_cb_alloc(rule_callback_t fn, void *
 {
     if (callback_allocation_fail) return ERR_PTR(-ENOMEM);
     struct flow_block_cb *cb = kzalloc(sizeof(*cb), GFP_KERNEL); assert(cb);
-    cb->ident = ident; cb->cb_priv = priv; cb->release = release;
+    cb->cb = fn; cb->ident = ident; cb->cb_priv = priv; cb->release = release;
     cb->indirect = true;
     if (invalidate_on_bind) { assert(ft_bound); ft_invalidate(); }
     return cb;
@@ -741,7 +757,10 @@ static struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
                                                  rule_callback_t fn, void *ident)
 {
     struct flow_block_cb *cb;
-    list_for_each_entry(cb, &block->cb_list, list) if (cb->ident == ident) return cb;
+    /* By callback as well as identity, as the kernel does: a passively bound
+     * device and a programmed one carry different callbacks. */
+    list_for_each_entry(cb, &block->cb_list, list)
+        if (cb->ident == ident && cb->cb == fn) return cb;
     return NULL;
 }
 static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_block_offload *bo)
@@ -779,7 +798,7 @@ static struct flow_block_cb *flow_block_cb_alloc(rule_callback_t fn, void *ident
 {
     if (callback_allocation_fail) return ERR_PTR(-ENOMEM);
     struct flow_block_cb *cb = kzalloc(sizeof(*cb), GFP_KERNEL); assert(cb);
-    cb->ident = ident; cb->cb_priv = priv; cb->release = release;
+    cb->cb = fn; cb->ident = ident; cb->cb_priv = priv; cb->release = release;
     cb->indirect = false;
     if (invalidate_on_bind) { assert(ft_bound); ft_invalidate(); }
     return cb;

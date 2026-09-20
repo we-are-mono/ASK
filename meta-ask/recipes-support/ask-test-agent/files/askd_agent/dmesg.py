@@ -27,7 +27,7 @@ SPLAT_RE = re.compile(
     r"==============|"          # KASAN/KFENCE/UBSAN banner separator
     r"UBSAN:|"
     r"WARNING:|"                # WARN_ON family + bad-unlock-balance etc.
-    r"BUG: |"                   # generic kernel BUG()
+    r"(?<!DE)BUG: |"            # generic kernel BUG(); not "ASK-DEBUG: " tracing
     r"kernel BUG at|"           # BUG_ON
     r"Oops:|"                   # NULL deref / page fault
     r"Unable to handle|"        # arm64 page-fault banner

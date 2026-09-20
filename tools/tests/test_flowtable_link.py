@@ -91,6 +91,7 @@ async def test_flowtable_link_recovery(connections):
         finally:
             await command(r.target, r.session, "iptables", "-t", "nat", "-D", *control_nat)
         log = (await console_command(con, "dmesg"))["stdout"]
-        assert not re.search(r"BUG:|WARNING:|KASAN:|Oops:|Kernel panic|inconsistent lock state", log), log
+        # (?<!DE): "ASK-DEBUG:" is admission tracing, not a BUG.
+        assert not re.search(r"(?<!DE)BUG:|WARNING:|KASAN:|Oops:|Kernel panic|inconsistent lock state", log), log
         r.record("link-complete", {"state": await r.state(), "table": identity, "boot_id": boot_id,
                                    "dmesg": log})

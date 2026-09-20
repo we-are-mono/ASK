@@ -140,7 +140,7 @@ async def console_python(console, script, *, timeout=20, attempts=3):
 # single "key value" counter. A row kind always yields a list, present and
 # empty when nothing of that kind exists, so a caller never has to guess
 # whether an absent key means none or means an older adapter.
-STATUS_ROWS = {"flow": "flows", "session": "sessions"}
+STATUS_ROWS = {"flow": "flows", "session": "sessions", "mcast": "mcast"}
 
 
 def status_text(text):
@@ -151,7 +151,9 @@ def status_text(text):
             state[STATUS_ROWS[kind]].append(
                 dict(item.split("=", 1) for item in rest.split()))
         else:
-            key, value = line.split()
+            parts = line.split()
+            assert len(parts) == 2, f"unexpected /proc/cdx_flowtable line: {line!r}"
+            key, value = parts
             state[key] = int(value) if value.isdecimal() else value
     return state
 

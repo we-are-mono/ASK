@@ -142,6 +142,12 @@ struct cdx_ft_binding {
 	struct nf_flowtable *table; /* retained as identity; borrowed in bind only */
 };
 
+/* A device bound passively -- one the classifier cannot program, accepted so
+ * that the table registers. Only what the unload drain needs. */
+struct cdx_ft_passive {
+	struct nf_flowtable *table;
+};
+
 /* One PPPoE session's statistics record, shared by every direction naming that
  * session: claimed when the first is admitted and returned when the last
  * retires, so the counters describe the session rather than any one flow and
@@ -1900,12 +1906,8 @@ static void ft_release(void *priv)
  * offloaded" and leaves it on the software fast path, which is exactly where a
  * Wi-Fi ingress belongs; the DPAA ports in the same table keep their hardware
  * path. Nothing is allocated for the device beyond the record the unload drain
- * needs to find its table.
+ * needs to find its table (struct cdx_ft_passive, beside the binding).
  */
-struct cdx_ft_passive {
-	struct nf_flowtable *table;
-};
-
 static int ft_passive_callback(enum tc_setup_type type, void *data, void *priv)
 {
 	return -EOPNOTSUPP;

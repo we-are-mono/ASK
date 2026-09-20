@@ -10,11 +10,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize("cmdline,fail,expected,rc", [
-    ("", "", ["cdx offload_owner=cmm flowtable_observe=0", "fci", "auto_bridge"], 0),
-    ("ask.offload=flowtable", "", ["cdx offload_owner=flowtable flowtable_observe=0", "ask_flowtable"], 0),
-    ("ask.offload=flowtable ask.flowtable_observe=1", "", ["cdx offload_owner=flowtable flowtable_observe=1", "ask_flowtable"], 0),
-    ("ask.offload=flowtable", "ask_flowtable", ["cdx offload_owner=flowtable flowtable_observe=0", "ask_flowtable"], 1),
-    ("ask.offload=flowtable", "cdx", ["cdx offload_owner=flowtable flowtable_observe=0"], 1),
+    ("", "", ["cdx offload_owner=cmm flowtable_observe=0 ask_debug=1", "fci", "auto_bridge"], 0),
+    ("ask.offload=flowtable", "", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=1", "ask_flowtable"], 0),
+    ("ask.offload=flowtable ask.flowtable_observe=1", "", ["cdx offload_owner=flowtable flowtable_observe=1 ask_debug=1", "ask_flowtable"], 0),
+    ("ask.offload=flowtable ask.debug=0", "", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=0", "ask_flowtable"], 0),
+    ("ask.offload=flowtable", "ask_flowtable", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=1", "ask_flowtable"], 1),
+    ("ask.offload=flowtable", "cdx", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=1"], 1),
     ("ask.offload=invalid", "", [], 1),
 ])
 def test_flowtable_boot_modules(tmp_path, cmdline, fail, expected, rc):

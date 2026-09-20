@@ -34,6 +34,13 @@ case "$1" in
             cmm:0|flowtable:0|flowtable:1) ;;
             *) echo "Invalid ASK offload boot selection: $owner:$observe" >&2; exit 1 ;;
         esac
+        # ASK-DEBUG prints per flow at KERN_INFO. On the serial console that
+        # is a line for every refused direction of every offloaded flow, in
+        # the middle of whatever a console-driven test is reading back, and
+        # the harness's command markers do not survive it. Keep everything
+        # in the kernel log (dmesg, and the agent's splat capture, read the
+        # ring), but let the console carry warnings and worse only.
+        [ -w /proc/sys/kernel/printk ] && echo "5 4 1 7" > /proc/sys/kernel/printk
         while read -r mod; do
             case "$mod" in ''|'#'*) continue ;; esac
             if [ "$mod" = cdx ]; then

@@ -12,9 +12,17 @@ typedef uint8_t u8;
 typedef uint16_t u16, __be16;
 typedef uint32_t u32, __be32;
 typedef uint64_t u64;
+typedef u8 U8;
 #define ETH_ALEN 6
 #define IF_TYPE_ETHERNET 1
+#define IF_TYPE_WLAN 32
 #define IF_TYPE_PHYSICAL 128
+/* ASK-DEBUG tracing is a printk in production; nothing to observe here. */
+#define ASK_DBG_REFUSE 1
+#define ASK_DBG_ACCEPT 2
+#define ASK_DBG_DEVICE 4
+#define ask_refuse(err) (err)
+#define ask_dbg(bit, fmt, ...) do { } while (0)
 #define L2_MAX_ONIF 8
 #define ENTRY_VALID 1
 #define NETREG_REGISTERED 1
@@ -135,10 +143,16 @@ struct dpa_iface_info {
     /* No mac_addr, matching production: a port's own address is its
      * netdev's, read where the header is encoded. */
     struct { struct net_device *net_dev; } eth_info;
+    struct { struct net_device *net_dev; uint16_t vap_id; } wlan_info;
 };
 static struct dpa_iface_info out_iface = { .if_flags=129, .itf_id=2 };
 static struct dpa_iface_info in_iface = { .next=&out_iface, .if_flags=129, .itf_id=1 };
 static struct dpa_iface_info *dpa_interface_info = &in_iface;
+/* VWD's answers about a VAP. This harness has no Wi-Fi case of its own (see
+ * wifi_admission.c); both say "not a VAP" unless a case says otherwise. */
+static bool vap_open;
+static bool dpaa_vwd_vap_is_open(const struct net_device *d) { return d && vap_open; }
+static bool dpaa_vwd_vap_owns(uint16_t vap_id, const struct net_device *d) { (void)vap_id; return d && vap_open; }
 static bool dpa_devlist_lock;
 static void spin_lock(bool *l) { assert(!*l); *l=true; }
 static void spin_unlock(bool *l) { assert(*l); *l=false; }
