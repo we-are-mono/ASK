@@ -152,33 +152,6 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A160 — use-after-free in the Wi-Fi driver's receive path.** KASAN
-  catches `moal_recv_packet()` reading 8 bytes at offset 40 of an skb head the
-  stack has already freed:
-
-  ```
-  BUG: KASAN: slab-use-after-free in moal_recv_packet+0x380c/0x4d44 [moal]
-  Workqueue: MOAL_PCIE_RX_WORK_QUEUE woal_pcie_rx_work_queue [moal]
-  Freed by task 146: __kfree_skb <- sk_skb_reason_drop <- icmpv6_rcv <- ip6_mc_input
-  ```
-
-  Same task both times: moal hands the frame up, `ip6_mc_input` delivers it,
-  `icmpv6_rcv` drops it and frees the 8 KB head, and moal then touches the skb
-  it no longer owns. It fires on ordinary IPv6 multicast, so an associating
-  client triggers it within seconds — the AP faults mid-handshake and tears
-  down, which is what "incorrect password" and a station that never appears
-  look like from the client.
-
-  It is in `moal` (pinned at 09f41e14, the same commit the shipping OpenWrt
-  profile uses), not in ASK code, and it is present in product builds too —
-  KASAN only makes it visible. Without instrumentation it is silent corruption
-  of whatever reuses that 8 KB slab.
-
-  Blocks the Wi-Fi offload work: step 5 cannot be proved while a client cannot
-  stay associated. Needs the driver's rx path read against the skb ownership
-  rules — `netif_receive_skb()` and friends consume the skb, and nothing may
-  read it afterwards.
-
 - [ ] **A159 — a bound flowtable stops the port's ingress byte counters.**
   With an nftables flowtable bound to a port, that port's rx byte and packet
   counters stop counting forwarded traffic. Measured with a controlled
@@ -447,6 +420,13 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A161.** Use-after-free in the Wi-Fi driver's transmit path: `wlan_dequeue_tx_packet()` read
+  `ptr->sta` after the send helpers dropped `ra_list_spinlock`, racing `wlan_wmm_delete_peer_ralist()`
+  on a station leaving under load — fixed (this commit): re-validate under the lock (patch 0003).
+
+- [x] **A160.** Use-after-free in the Wi-Fi driver's receive path: `moal_recv_packet()` read the skb
+  after `netif_rx()` consumed it — fixed: record the handoff, gate the epilogue (_f07beac_, patch 0002).
 
 - [x] **A157.** Bridged multicast looked installed-but-never-matching on the
   first rig run; not a defect — the injector used a plain UDP socket, whose
