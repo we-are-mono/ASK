@@ -37,16 +37,21 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         # type and its depth, so slicing past them leaves an incomplete struct.
         hardware[hardware.index("#define CDX_FT_VLAN_MAX"):hardware.index("/* Process-context transactions")]
         + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
+        # The framing a VLAN device's record is published with, as the
+        # adapter defines it: the cases below assert the published values.
+        + "\n".join(re.findall(r"^#define FT_VLAN_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
     )
     names = ["ft_fault", "ft_devices_hold", "ft_devices_put",
              "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
-             "ft_session_stats_get", "ft_session_stats_put", "ft_stats_attach",
+             "ft_session_stats_get", "ft_session_stats_put", "ft_dev_stats_release",
+             "ft_dev_stats_get", "ft_dev_stats_put", "ft_dev_stats_gone",
+             "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
              "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
-             "ft_vlan_lower", "ft_bridge_vlan", "ft_path_stack", "ft_vlan_match", "ft_vlan_actions", "ft_parse", "ft_same_key", "ft_key_hash",
+             "ft_vlan_lower", "ft_bridge_vlan", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_stats", "ft_request_targets", "ft_admission_fault", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_passive_callback", "ft_passive_release", "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_invalidate_work", "ft_entry_uses", "ft_device_used", "ft_device_retire", "ft_netdev_event",
              "ft_fdb_event", "ft_swdev_event", "ft_init_fault", "ask_flowtable_init", "ft_block_drain", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]

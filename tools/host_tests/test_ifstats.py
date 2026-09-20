@@ -1,4 +1,5 @@
-"""Check the production interface-statistics allocator against a simulated MURAM."""
+"""Check the production interface-statistics allocator, and the fold of its
+records into a net device's counters, against a simulated MURAM."""
 
 import os
 from pathlib import Path
@@ -90,7 +91,12 @@ def test_ifstats(tmp_path):
         + function(source, "ifstats_slot_index")
         + function(source, "cdx_ft_ifstats_alloc")
         + function(source, "cdx_ft_ifstats_free")
-        + function(source, "cdx_ft_ifstats_read"))
+        + function(source, "cdx_ft_ifstats_read")
+        + function(source, "cdx_ft_ifstats_publish")
+        + function(source, "cdx_ft_ifstats_unpublish")
+        + function(source, "ifstats_restated")
+        + function(source, "cdx_ifstats_fold")
+        + function(source, "cdx_ft_ifstats_fold"))
     binary = tmp_path / "ifstats"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

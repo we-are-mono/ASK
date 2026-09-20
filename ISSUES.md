@@ -183,22 +183,6 @@ result independently of those temporary files.
   exit (`dpa_wifi.c`: port release + queue teardown) and drain the pool through its
   `free_buf_cb` before freeing it.
 
-- [ ] **A159 — a bound flowtable stops the port's ingress byte counters.**
-  With an nftables flowtable bound to a port, that port's rx byte and packet
-  counters stop counting forwarded traffic. Measured with a controlled
-  100,000,000-byte transfer, flowtable as the only variable: `eth4` rx moved
-  +151,832 with it bound and +105,111,580 without, while `uap0` tx reported
-  ~105 MB both times. `ethtool -S` agrees with `/proc/net/dev`, so this is the
-  driver's accounting rather than a procfs quirk, and egress is unaffected.
-  The flowtable's `NF_NETDEV_INGRESS` hook takes the packet before the SDK
-  DPAA driver accounts it; a conventional driver updates stats in NAPI poll
-  before `netif_receive_skb` and would not show this. It matters for two
-  reasons beyond tidiness. `ip -s`, procfs and `ethtool -S` all under-report
-  WAN ingress exactly when offload is active, which is the case the
-  statistics work exists to cover. And any test that asserts throughput from
-  a port's rx counters asserts nothing once a flowtable is bound — including
-  the proof `docs/flowtable-wifi.md` writes for its own step 5.
-
 - [ ] **A158 — multicast replication to more than one listener has never been
   run.** The bridged multicast offload is proved on hardware for a single
   listener (see the [design doc](docs/flowtable-multicast.md)), but the DUT has
@@ -465,6 +449,11 @@ file's git history.
   offline port or a SEC job ring had no offload at all — fixed (this commit): non-fatal, with
   `cdx_ipsec_ready()` refusing SA admission by both owners, the xfrmdev attachment and the encoder's
   table lookup; proved with `cdx.dpa_init_fail_site=cdx_dpa_ipsec_init`.
+
+- [x] **A159.** A bound flowtable stopped the port's rx counters: the SDK driver counted a frame only
+  when `netif_receive_skb()` returned other than `NET_RX_DROP`, which a frame stolen on the ingress
+  hook always does — fixed (this commit): patch 104 counts before the handoff; hardware-forwarded
+  frames come from the firmware records `dev_get_stats()` folds in, see `docs/flowtable-statistics.md`.
 
 - [x] **A165.** The "single TX worker is the wire-to-Wi-Fi ceiling" was an instrumentation artifact:
   a production-config kernel (no KASAN/lockdep/kmemleak) with the flow offloaded runs 654 Mbit/s median,

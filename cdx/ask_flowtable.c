@@ -174,6 +174,34 @@ struct cdx_ft_session_stats {
 	struct cdx_ft_stats_slot *slot;
 };
 
+/* One VLAN device's interface counters: the record its tag counts into, which
+ * dev_get_stats() folds into the device's own counters -- so `ip -s link` and
+ * /proc/net/dev show traffic that never reached the CPU. The session record
+ * above is keyed on a session because that is what its two opcodes describe;
+ * this one is keyed on the device because that is what the reader names.
+ *
+ * Held for the device's lifetime rather than its flows': a slot returned to
+ * the pool is zeroed when handed out again, so a record that came and went
+ * with the flows would drop the device's counters back to zero every time it
+ * went idle. refs counts the hardware directions whose opcodes name the
+ * record's indices and is what makes freeing safe: the device can unregister
+ * while an entry naming the record is still being retired, and the slot has
+ * to outlive that opcode. gone marks the device as unregistered. The record is
+ * freed by whichever comes last, the unregistration or the last release, and a
+ * gone record is never found by index again, so a device that reuses the index
+ * starts a record of its own.
+ *
+ * slot is NULL for a device admitted while the plain pool was empty: its flows
+ * forward without counting, and the row in /proc/cdx_flowtable says so.
+ */
+struct cdx_ft_dev_stats {
+	struct list_head list;
+	int ifindex;
+	unsigned int refs;
+	bool gone;
+	struct cdx_ft_stats_slot *slot;
+};
+
 struct cdx_ft_entry {
 	struct list_head list;
 	struct hlist_node cookie_node;
@@ -189,6 +217,10 @@ struct cdx_ft_entry {
 	 * and an attached resource is not part of that description. */
 	struct cdx_ft_session_stats *in_stats;
 	struct cdx_ft_session_stats *out_stats;
+	/* And the VLAN device record each tag counts into, indexed like the
+	 * rule's stacks; NULL for a tag with no device or no record. */
+	struct cdx_ft_dev_stats *in_vlan_stats[CDX_FT_VLAN_MAX];
+	struct cdx_ft_dev_stats *out_vlan_stats[CDX_FT_VLAN_MAX];
 	unsigned long cookie;
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
@@ -225,6 +257,12 @@ static LIST_HEAD(ft_block_list);
 /* Session statistics records, under the backend transaction like the entries
  * that reference them. No notifier walks this list. */
 static LIST_HEAD(ft_session_stats);
+/* VLAN device records. Mutated under the backend transaction like the session
+ * list, and additionally under ft_dev_stats_lock, because the netdev notifier
+ * marks a record's device gone without a transaction: the reaper then frees
+ * what nothing references any more. */
+static LIST_HEAD(ft_dev_stats);
+static DEFINE_SPINLOCK(ft_dev_stats_lock);
 static unsigned int ft_bound, ft_count;
 static unsigned int ft_neighbour_refs;
 static unsigned int ft_handle_refs;
@@ -245,8 +283,10 @@ static struct proc_dir_entry *ft_proc;
 static void ft_invalidate_work(struct work_struct *work);
 static void ft_neigh_detach(struct cdx_ft_entry *entry);
 static void ft_retire_workfn(struct work_struct *work);
+static void ft_dev_stats_reap(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_work, ft_invalidate_work);
 static DECLARE_WORK(ft_retire_work, ft_retire_workfn);
+static DECLARE_WORK(ft_dev_stats_work, ft_dev_stats_reap);
 
 static bool ft_fault(unsigned int stage)
 {
@@ -386,27 +426,203 @@ static void ft_session_stats_put(struct cdx_ft_session_stats **held)
 	kfree(record);
 }
 
+/* What the firmware's VLAN opcodes count into a device's record and the
+ * device's own counters would not, per packet.
+ *
+ * Measured on hardware rather than inferred (docs/flowtable-statistics.md has
+ * the frames): the firmware counts a tag's record with the frame as it stands
+ * once that tag has been handled, so the strip counts the frame with the tag
+ * already gone and the insert counts it with the tag already on -- for a
+ * double-tagged 306-byte frame the two records read 302 and 298 on the way in
+ * and 302 and 306 on the way out. An 802.1Q device counts a received frame after
+ * the port pulled the Ethernet header and its own tag came off, and a
+ * transmitted one after vlan_dev_hard_start_xmit() moved its own tag into the
+ * skb's metadata (reorder_hdr, the default) -- so on both sides the device's
+ * number is the frame without the device's tag, and the framing to take off is
+ * the Ethernet header on receive and the tag itself on transmit, at every depth
+ * of the stack. The software fast path confirms the transmit side: the same
+ * burst forwarded by the CPU leaves 298 per frame on eth3.271 for 302 on the
+ * wire.
+ */
+#define FT_VLAN_RX_OVERHEAD ETH_HLEN
+#define FT_VLAN_TX_OVERHEAD VLAN_HLEN
+
+static void ft_dev_stats_release(struct cdx_ft_dev_stats *record)
+{
+	cdx_ft_stats_free(&record->slot);
+	kfree(record);
+}
+
+/* The record for one VLAN device, created on first reference and published to
+ * the device at once. Exhaustion of the firmware pool is not a failure, for
+ * the reason the session record gives: the record exists and counts nothing,
+ * so the degradation shows in /proc rather than passing silently. A tag with
+ * no device -- a vlan-aware bridge's own -- has no record, because there is no
+ * interface whose counters it could be folded into. */
+static struct cdx_ft_dev_stats *ft_dev_stats_get(int ifindex)
+{
+	struct cdx_ft_dev_stats *record;
+
+	if (!ifindex)
+		return NULL;
+	cdx_ft_assert_held();
+	/* Under RTNL as well, which the caller holds for the device walk the
+	 * rule came from: the device cannot unregister between the search and
+	 * the insertion, so a record is never added for a device already gone. */
+	ASSERT_RTNL();
+	spin_lock_bh(&ft_dev_stats_lock);
+	list_for_each_entry(record, &ft_dev_stats, list)
+		if (record->ifindex == ifindex && !record->gone) {
+			record->refs++;
+			spin_unlock_bh(&ft_dev_stats_lock);
+			return record;
+		}
+	spin_unlock_bh(&ft_dev_stats_lock);
+	record = kzalloc(sizeof(*record), GFP_KERNEL);
+	if (!record)
+		return NULL;
+	record->ifindex = ifindex;
+	record->refs = 1;
+	if (cdx_ft_stats_alloc(CDX_FT_STATS_PLAIN, &record->slot))
+		record->slot = NULL;
+	else
+		cdx_ft_stats_publish(record->slot, ifindex,
+				     FT_VLAN_RX_OVERHEAD, FT_VLAN_TX_OVERHEAD);
+	spin_lock_bh(&ft_dev_stats_lock);
+	list_add_tail(&record->list, &ft_dev_stats);
+	spin_unlock_bh(&ft_dev_stats_lock);
+	return record;
+}
+
+static void ft_dev_stats_put(struct cdx_ft_dev_stats **held)
+{
+	struct cdx_ft_dev_stats *record = *held;
+	bool last;
+
+	if (!record)
+		return;
+	cdx_ft_assert_held();
+	*held = NULL;
+	spin_lock_bh(&ft_dev_stats_lock);
+	/* The last direction naming a record whose device has already gone:
+	 * nothing will find it again, so it goes with the direction. A device
+	 * that is still here keeps its record and its totals. */
+	last = !--record->refs && record->gone;
+	if (last)
+		list_del(&record->list);
+	spin_unlock_bh(&ft_dev_stats_lock);
+	if (last)
+		ft_dev_stats_release(record);
+}
+
+/* From the netdev notifier, under RTNL and without a transaction, so only the
+ * mark is made here; a record nothing references is freed by the reaper, which
+ * takes the transaction the backend requires. One still referenced is freed by
+ * the last release instead.
+ *
+ * The publication is withdrawn now rather than with the slot. A device that
+ * has left init_net for another namespace keeps its index there, and this
+ * namespace can hand the same index to a new device while the old record waits
+ * on its last direction; the fold keys on the index alone, so a record left
+ * published would be counted into that new device. Withdrawing needs only the
+ * allocator's spinlock, which is why it can be done from here. */
+static void ft_dev_stats_gone(const struct net_device *dev)
+{
+	struct cdx_ft_dev_stats *record;
+	bool reap = false;
+
+	spin_lock_bh(&ft_dev_stats_lock);
+	list_for_each_entry(record, &ft_dev_stats, list)
+		if (record->ifindex == dev->ifindex && !READ_ONCE(record->gone)) {
+			WRITE_ONCE(record->gone, true);
+			cdx_ft_stats_unpublish(record->slot);
+			reap |= !record->refs;
+		}
+	spin_unlock_bh(&ft_dev_stats_lock);
+	if (reap)
+		schedule_work(&ft_dev_stats_work);
+}
+
+static void ft_dev_stats_reap(struct work_struct *work)
+{
+	struct cdx_ft_dev_stats *record, *next;
+	LIST_HEAD(free);
+
+	cdx_ft_begin();
+	spin_lock_bh(&ft_dev_stats_lock);
+	list_for_each_entry_safe(record, next, &ft_dev_stats, list)
+		if (record->gone && !record->refs)
+			list_move(&record->list, &free);
+	spin_unlock_bh(&ft_dev_stats_lock);
+	list_for_each_entry_safe(record, next, &free, list) {
+		list_del(&record->list);
+		ft_dev_stats_release(record);
+	}
+	cdx_ft_end();
+}
+
+/* At unload, after the backend release has proved no hardware direction is
+ * left: the devices are still registered, so unlike the session list this one
+ * does not drain by construction, and every record is freed here. */
+static void ft_dev_stats_drop_all(void)
+{
+	struct cdx_ft_dev_stats *record, *next;
+	LIST_HEAD(free);
+
+	cdx_ft_begin();
+	spin_lock_bh(&ft_dev_stats_lock);
+	list_splice_init(&ft_dev_stats, &free);
+	spin_unlock_bh(&ft_dev_stats_lock);
+	list_for_each_entry_safe(record, next, &free, list) {
+		WARN_ON_ONCE(record->refs);
+		list_del(&record->list);
+		ft_dev_stats_release(record);
+	}
+	cdx_ft_end();
+}
+
 /* Both halves of one connection name the same session and therefore share one
- * record, so a connection holds two references to it. Nothing here can fail:
+ * record, so a connection holds two references to it; likewise each tag's VLAN
+ * device, where one half strips and the other inserts. Nothing here can fail:
  * a direction whose record could not be created counts nowhere and forwards
  * regardless. */
 static void ft_stats_attach(struct cdx_ft_entry *entry)
 {
+	unsigned int i;
+
 	entry->in_stats = ft_session_stats_get(&entry->rule.in_session);
 	entry->out_stats = ft_session_stats_get(&entry->rule.out_session);
+	for (i = 0; i < entry->rule.in_vlans; i++)
+		entry->in_vlan_stats[i] = ft_dev_stats_get(entry->rule.in_vlan[i].ifindex);
+	for (i = 0; i < entry->rule.out_vlans; i++)
+		entry->out_vlan_stats[i] = ft_dev_stats_get(entry->rule.out_vlan[i].ifindex);
 }
 
 static void ft_stats_detach(struct cdx_ft_entry *entry)
 {
+	unsigned int i;
+
 	ft_session_stats_put(&entry->in_stats);
 	ft_session_stats_put(&entry->out_stats);
+	for (i = 0; i < CDX_FT_VLAN_MAX; i++) {
+		ft_dev_stats_put(&entry->in_vlan_stats[i]);
+		ft_dev_stats_put(&entry->out_vlan_stats[i]);
+	}
 }
 
 static void ft_stats_binding(const struct cdx_ft_entry *entry,
 			     struct cdx_ft_stats_binding *binding)
 {
+	unsigned int i;
+
 	binding->in_session = entry->in_stats ? entry->in_stats->slot : NULL;
 	binding->out_session = entry->out_stats ? entry->out_stats->slot : NULL;
+	for (i = 0; i < CDX_FT_VLAN_MAX; i++) {
+		binding->in_vlan[i] = entry->in_vlan_stats[i] ?
+			entry->in_vlan_stats[i]->slot : NULL;
+		binding->out_vlan[i] = entry->out_vlan_stats[i] ?
+			entry->out_vlan_stats[i]->slot : NULL;
+	}
 }
 
 static int ft_remove(struct cdx_ft_entry *entry)
@@ -1166,7 +1382,9 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 			 struct cdx_ft_vlan *stack, struct net_device **bridge,
 			 u16 *bridge_vid, struct cdx_ft_session *out_session)
 {
-	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX];
+	/* Zeroed so a tag the bridge adds carries no device: ft_bridge_vlan()
+	 * writes the tag and leaves ifindex alone. */
+	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX] = {};
 	unsigned int count = 0, i;
 	int vid;
 
@@ -1235,6 +1453,8 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 			return -EOPNOTSUPP;
 		inner[count].proto = vlan_dev_vlan_proto(logical);
 		inner[count].id = vlan_dev_vlan_id(logical);
+		/* The device whose counters this tag's traffic belongs to. */
+		inner[count].ifindex = logical->ifindex;
 		count++;
 		logical = ft_vlan_lower(logical);
 		if (!logical)
@@ -1265,6 +1485,21 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
  * which is what bounds this loop. Each must name the tag that walk derived,
  * under Netfilter's own exact masks, and must impose neither priority nor
  * DEI, which the hardware does not reproduce. */
+/* Whether two stacks put the same tags on the wire. The device behind a tag is
+ * not part of that: a tag a vlan-aware bridge adds and the same tag from an
+ * 802.1Q device look identical to the hardware, and the hairpin question is
+ * about what the hardware sees. */
+static bool ft_same_tags(const struct cdx_ft_vlan *a, const struct cdx_ft_vlan *b,
+			 unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		if (a[i].proto != b[i].proto || a[i].id != b[i].id)
+			return false;
+	return true;
+}
+
 static bool ft_vlan_match(struct flow_rule *rule, const struct cdx_ft_rule *out)
 {
 	struct flow_match_vlan vlan;
@@ -1504,7 +1739,7 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * ordinary routing between VLANs carried on one trunk, or the two
 	 * sessions do, which is the same thing one layer down. */
 	if (out->out == out->in && out->out_vlans == out->in_vlans &&
-	    !memcmp(out->out_vlan, out->in_vlan, sizeof(out->out_vlan)) &&
+	    ft_same_tags(out->out_vlan, out->in_vlan, out->in_vlans) &&
 	    out->out_session.present == out->in_session.present &&
 	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK)
 		return ask_refuse(-EOPNOTSUPP);
@@ -2555,6 +2790,9 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * so nothing can follow the pointer, and the worker releases
 		 * what is left using only what it copied. */
 		ft_wifi_device_gone(dev);
+		/* And a VLAN device's counter record, which outlives its flows
+		 * and so has nothing but this event to end it. */
+		ft_dev_stats_gone(dev);
 		fallthrough;
 	case NETDEV_CHANGEUPPER:
 		spin_lock_bh(&ft_watch_lock);
@@ -4968,6 +5206,33 @@ static void ft_session_rows(struct seq_file *seq)
 	}
 }
 
+/* One row per VLAN device with a record, whether or not the pool had a slot
+ * for it. The counts are the firmware's own totals, whole frames; the device's
+ * `ip -s link` shows the same records restated in its units, so the two differ
+ * by exactly the framing and nothing else. dev= is the current name, or "-"
+ * once the device has left this namespace and the record is waiting on the
+ * last direction naming it. gone is written by the notifier under its own
+ * lock, which this walk, under the transaction, does not take. */
+static void ft_dev_rows(struct seq_file *seq)
+{
+	struct cdx_ft_dev_stats *record;
+	struct cdx_ft_stats rx, tx;
+	struct net_device *dev;
+
+	list_for_each_entry(record, &ft_dev_stats, list) {
+		cdx_ft_stats_read(record->slot, &rx, &tx);
+		rcu_read_lock();
+		dev = READ_ONCE(record->gone) ? NULL :
+			dev_get_by_index_rcu(&init_net, record->ifindex);
+		seq_printf(seq,
+			   "vlan dev=%s ifindex=%d refs=%u slot=%s rx_packets=%llu rx_bytes=%llu tx_packets=%llu tx_bytes=%llu\n",
+			   dev ? netdev_name(dev) : "-", record->ifindex, record->refs,
+			   record->slot ? "yes" : "none",
+			   rx.packets, rx.bytes, tx.packets, tx.bytes);
+		rcu_read_unlock();
+	}
+}
+
 /* The PPPoE session, as the id and the concentrator the path walk resolved.
  * Both are shown for either direction even though only an egress session is
  * inserted: the two come from the same walk, so a direction that strips and
@@ -5000,6 +5265,7 @@ static void ft_bridge_text(const struct net_device *bridge, u16 vid, char *text,
 static int ft_show(struct seq_file *seq, void *v)
 {
 	struct cdx_ft_session_stats *record;
+	struct cdx_ft_dev_stats *dev_record;
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
 	unsigned int records = 0, slots = 0;
@@ -5076,6 +5342,13 @@ static int ft_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   records, slots);
 	ft_session_rows(seq);
+	records = slots = 0;
+	list_for_each_entry(dev_record, &ft_dev_stats, list) {
+		records++;
+		slots += !!dev_record->slot;
+	}
+	seq_printf(seq, "vlan_records %u\nvlan_slots %u\n", records, slots);
+	ft_dev_rows(seq);
 	seq_printf(seq, "mcast_groups %u\nmcast_installed %u\nmcast_refused %llu\nmcast_install_errors %llu\n"
 		   "mcast_observed %llu\nmcast_dropped %llu\nmcast_hooked %u\nmcast_hook_errors %llu\n",
 		   ft_mc_count, ft_mc_installed, ft_mc_refused,
@@ -5340,6 +5613,11 @@ static void __exit ask_flowtable_exit(void)
 	 * returned is a firmware record no later session can claim, and
 	 * nothing else would ever report that. */
 	WARN_ON_ONCE(!list_empty(&ft_session_stats));
+	/* The VLAN device records are held by their devices, which are still
+	 * here, so this list does not drain on its own. The notifier that
+	 * could queue the reaper is already unregistered above. */
+	cancel_work_sync(&ft_dev_stats_work);
+	ft_dev_stats_drop_all();
 }
 
 MODULE_LICENSE("GPL");

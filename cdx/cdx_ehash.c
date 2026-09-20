@@ -1027,13 +1027,15 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
  * dpa_get_tx_info_by_itf() has no VLAN or PPPoE interface to walk and returns
  * a bare description.
  *
- * vlan_filtering suppresses the per-VLAN-interface statistics pointer in
- * create_vlan_ins_hm(), exactly as the bridge path does for tags that come
- * from bridge VLAN filtering rather than from a netdev. PPPoE goes further:
- * pppoe_flow_ifstats tells both opcodes to take their index from this
- * description, which carries the record the caller allocated for the session,
- * or zero for a session that has none. Without it the unallocated index 0
- * would aim the ucode's counter update at another interface's record.
+ * The statistics indices come from the description too. pppoe_flow_ifstats
+ * tells both PPPoE opcodes to take theirs from it, which carries the record the
+ * caller allocated for the session, or zero for a session that has none;
+ * vlan_flow_ifstats does the same for the two VLAN opcodes, one index per tag.
+ * Without either the unallocated index 0 would aim the ucode's counter update
+ * at another interface's record. Before the VLAN records existed this path
+ * borrowed vlan_filtering to keep the insert from emitting a pointer at all,
+ * the way the bridge path does for tags that come from bridge VLAN filtering
+ * rather than from a netdev; a tag that has no record still gets none.
  *
  * The session's Ethernet destination is written to ac_mac_addr because that is
  * where create_ethernet_hm() reads a PPPoE flow's destination from. It is the
@@ -1046,6 +1048,24 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
  * belongs to a QoS configuration this owner does not implement, and silently
  * replacing its priority tag would lose it.
  */
+#ifdef INCLUDE_VLAN_IFSTATS
+/* Whether a flow-described stack names a record for every one of its tags.
+ * All or none: the opcodes' list form has no way to skip a tag, and zero is
+ * not "no record" there but another owner's record. A stack with no tags at
+ * all names nothing and so gets nothing, which is the same answer. */
+static int vlan_flow_stats_named(const uint8_t *indices, uint32_t count)
+{
+	uint32_t i;
+
+	if (!count)
+		return 0;
+	for (i = 0; i < count; i++)
+		if (!indices[i])
+			return 0;
+	return 1;
+}
+#endif
+
 static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap *encap)
 {
 	struct dpa_l2hdr_info *l2_info = &info->l2_info;
@@ -1067,9 +1087,12 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 	memcpy(l2_info->egress_vlan_hdrs, encap->egress,
 	       encap->num_egress * sizeof(*encap->egress));
 	l2_info->num_egress_vlan_hdrs = encap->num_egress;
-#ifdef VLAN_FILTER
-	if (encap->num_egress)
-		l2_info->vlan_filtering = 1;
+	l2_info->vlan_flow_ifstats = 1;
+#ifdef INCLUDE_VLAN_IFSTATS
+	memcpy(l2_info->ingress_vlan_stats_offsets, encap->ingress_vlan_stats_index,
+	       sizeof(l2_info->ingress_vlan_stats_offsets));
+	memcpy(l2_info->vlan_stats_offsets, encap->egress_vlan_stats_index,
+	       sizeof(l2_info->vlan_stats_offsets));
 #endif
 	if (encap->ingress_pppoe)
 		l2_info->pppoe_present = 1;
@@ -1853,8 +1876,15 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 	/* already set to 0(NULL), so we can skip the stats.*/
 	if (!l2_info->egress_vlan_hdrs[0].tci)
 		goto skip_stats;
+	/* A flow-described stack names its records or names none; a registered
+	 * stack has one per interface unless the tags are the bridge's. */
+	if (l2_info->vlan_flow_ifstats) {
+		if (!vlan_flow_stats_named(l2_info->vlan_stats_offsets, num_egress_vlan_hdrs))
+			goto skip_stats;
+	}
 #ifdef VLAN_FILTER
-	if (!l2_info->vlan_filtering)
+	else if (l2_info->vlan_filtering)
+		goto skip_stats;
 #endif
 	{
 		uint8_t *st_ptr;
@@ -1864,13 +1894,28 @@ static int create_vlan_ins_hm(struct ins_entry_info *info)
 			st_ptr = (uint8_t *)((uint32_t *)ptr + (num_egress_vlan_hdrs ));
 			param_size = ALIGN(param_size + num_egress_vlan_hdrs, sizeof(uint32_t));
 			if (param_size > info->param_size)
-				return FAILURE;	
+				return FAILURE;
 			/* add stats base */
 			word |= (get_logical_ifstats_base());
-			for (ii = num_egress_vlan_hdrs - 1 ; ii >=0 ; ii--) {
-				*st_ptr = l2_info->vlan_stats_offsets[ii];
-				/* save offset reversed order so that uCode can update easily */
-				st_ptr++;
+			if (l2_info->vlan_flow_ifstats) {
+				/* The ucode inserts the innermost header first and
+				 * counts the k-th record with the frame as it
+				 * stands after the k-th insertion (measured: a
+				 * frame ending at 306 bytes reads 302 in the first
+				 * record and 306 in the second). Listing the
+				 * records innermost first therefore gives each VLAN
+				 * device the frame with its own tag on and the tags
+				 * inside it, which is what the device's own
+				 * transmit counter would have shown. The registered
+				 * path below keeps its historical reversed order. */
+				for (ii = 0; ii < (int32_t)num_egress_vlan_hdrs; ii++)
+					*st_ptr++ = l2_info->vlan_stats_offsets[ii];
+			} else {
+				for (ii = num_egress_vlan_hdrs - 1 ; ii >=0 ; ii--) {
+					*st_ptr = l2_info->vlan_stats_offsets[ii];
+					/* save offset reversed order so that uCode can update easily */
+					st_ptr++;
+				}
 			}
 		} else {
 			/* single Vlan header, add stats ptr directly */
@@ -2037,7 +2082,45 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 	param = (struct en_ehash_strip_all_vlan_hdrs *)info->paramptr;
 	param_size = sizeof(struct en_ehash_strip_all_vlan_hdrs);
 #ifdef INCLUDE_VLAN_IFSTATS
-	{
+	if (info->l2_info.vlan_flow_ifstats) {
+		/* The flow names its own records, or none. The list is laid out
+		 * outermost first, the order vlan_id[] below uses: the ucode
+		 * strips the outer tag first and counts the k-th record with
+		 * the frame as it stands after the k-th strip (measured: a
+		 * 306-byte double-tagged frame reads 302 in the first record
+		 * and 298 in the second), so this order gives each VLAN device
+		 * the frame with its own tag off, which is what the device's own
+		 * receive counter would have shown once the Ethernet header is
+		 * taken off too. Without records the word is the vendor's own
+		 * statistics-disabled encoding rather than a base with a count
+		 * of zero, which is what the registered path emits for an
+		 * untagged ingress and what a reader would otherwise have to
+		 * know is ignored. */
+		uint32_t padding;
+
+		num_entries = info->l2_info.num_ingress_vlan_hdrs;
+		if (!vlan_flow_stats_named(info->l2_info.ingress_vlan_stats_offsets,
+					   num_entries))
+			num_entries = 0;
+		if (num_entries > 1) {
+			padding = PAD(num_entries, sizeof(uint32_t));
+			param_size += (padding + num_entries);
+			if (param_size > info->param_size)
+				return FAILURE;
+			for (i = 0; i < num_entries; i++)
+				param->stats_offsets[i] =
+					info->l2_info.ingress_vlan_stats_offsets[num_entries - 1 - i];
+			word = ((padding << 30) | (num_entries << 24) | get_logical_ifstats_base());
+		} else {
+			if (param_size > info->param_size)
+				return FAILURE;
+			word = 0;
+			if (num_entries == 1)
+				word = ((1 << 24) | (get_logical_ifstats_base() +
+					(info->l2_info.ingress_vlan_stats_offsets[0] *
+					 sizeof(struct en_ehash_stats))));
+		}
+	} else {
 		uint32_t padding;
 		if (dpa_get_num_vlan_iface_stats_entries(iif_index,underlying_iif_index,
 					&num_entries)) {
@@ -2059,7 +2142,11 @@ static int insert_remove_vlan_hm(struct ins_entry_info *info, uint32_t iif_index
 				return FAILURE;
 			}
 		} else {
-			uint8_t offset;
+			/* Zero rather than indeterminate: with no VLAN interface
+			 * on the ingress path the lookup below answers SUCCESS
+			 * without writing the offset, and the word then carries
+			 * a count of zero beside whatever this held. */
+			uint8_t offset = 0;
 
 			padding = 0;
 			//check if we have room

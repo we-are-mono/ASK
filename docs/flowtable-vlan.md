@@ -34,12 +34,14 @@ CDX takes the stack from the rule. It has no VLAN interface to walk: the
 adapter registers none, and in this ownership mode `control_vlan.c` never
 runs. `insert_entry_in_classif_table_encap()` applies the rule's tags to the
 L2 description that `dpa_get_tx_info_by_itf()` derived from the physical
-ports, and sets `vlan_filtering` so `create_vlan_ins_hm()` emits no
-per-interface statistics pointer — the same mechanism the bridge path already
-uses for tags that come from bridge VLAN filtering rather than from a netdev.
-Without it the unallocated offset zero would aim the microcode's counter
-update at another interface's statistics slot. `fill_actions()` is unchanged,
-and every legacy caller passes no encapsulation at all.
+ports, and marks the stack flow-described so the two VLAN header manipulations
+take their per-interface statistics pointers from the description as well —
+one record per tag, named by the adapter, or none. Without that the
+unallocated offset zero would aim the microcode's counter update at another
+interface's statistics slot, which is why this increment originally borrowed
+`vlan_filtering` to suppress the pointer outright, the way the bridge path
+does for tags with no netdev behind them. `fill_actions()` is unchanged, and
+every legacy caller passes no encapsulation at all.
 
 Registering VLAN interfaces from the adapter instead was rejected. It would
 not have avoided the logical/physical split, which the borrowed destination
@@ -139,7 +141,7 @@ LAN device moves only the direction leaving by it, the other keeps the port's
 MTU, and one connection retiring is a single invalidation because both
 directions share a handle.
 
-## What this does not carry
+## What this did not carry
 
 Per-VLAN-interface byte counters. CMM maintains them in the microcode's
 logical statistics area and returns them through an FCI query; this ownership
@@ -147,6 +149,7 @@ mode loads no FCI, and the counters would need an interface index to be
 allocated against. Deferring that to item 9 rather than growing a VLAN-shaped
 allocator here is what made it cheap when PPPoE needed the same thing: the
 allocator built for a session names the shape of the record rather than the
-feature, so a VLAN asks for one with the same call. What is still missing for
-a tagged flow is asking and reading back. Recorded against item 9 in the
-[retirement roadmap](flowtable-cmm-porting-roadmap.md).
+feature, so a VLAN asks for one with the same call. Item 9 has since landed
+the asking and the reading back — one record per VLAN device, folded into the
+device's own `ip -s link` counters — in the
+[interface counters guide](flowtable-statistics.md).

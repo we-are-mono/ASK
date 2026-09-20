@@ -1,0 +1,82 @@
+From 5d3ddbeb13fc303c048af9bd0672ad06ad193ef1 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Sun, 20 Sep 2026 16:10:21 +0200
+Subject: [PATCH] sdk_dpaa: count received frames before the stack's verdict
+
+_dpa_rx() incremented rx_packets and rx_bytes only when
+netif_receive_skb() returned something other than NET_RX_DROP. That
+return value is not a drop report: __netif_receive_skb_core()
+initialises it to NET_RX_DROP and only a delivered protocol handler
+overwrites it, so a frame consumed on the NF_NETDEV_INGRESS hook comes
+back as NET_RX_DROP after being forwarded. Every frame an nftables
+flowtable forwards in software took that path, and vanished from the
+port's receive counters without incrementing rx_dropped either -- the
+driver counted nothing on that return. GRO would have hidden it for TCP,
+but dpa_fix_features() clears NETIF_F_RXCSUM, so use_gro is never set
+and every frame goes through netif_receive_skb().
+
+Account the frame first, as every other driver does, and hand it to
+the stack unconditionally. Real drops are counted by the core in its
+own rx_dropped and rx_nohandler, which dev_get_stats() adds on top.
+The debug loopback arm kept its own increment because it returned
+before the shared one; with the shared one first it needs none.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 30 +++++++++++--------
+ 1 file changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+index 65518093cfee..4d041e0fe4d4 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+@@ -774,12 +774,23 @@ void __hot _dpa_rx(struct net_device *net_dev,
+ 
+ 	skb_len = skb->len;
+ 
++	/* Account the frame before handing it to the stack, as every other
++	 * driver does. netif_receive_skb()'s return value is not a drop
++	 * report: __netif_receive_skb_core() initialises it to NET_RX_DROP and
++	 * only a delivered protocol handler overwrites it, so a frame consumed
++	 * on the NF_NETDEV_INGRESS hook -- which is every frame an nftables
++	 * flowtable forwards in software -- comes back as NET_RX_DROP after
++	 * being forwarded. Counting only on any other value made such frames
++	 * vanish from rx_packets and rx_bytes without incrementing rx_dropped
++	 * either. Real drops are already counted by the core in its own
++	 * rx_dropped and rx_nohandler, which dev_get_stats() adds on top.
++	 */
++	percpu_stats->rx_packets++;
++	percpu_stats->rx_bytes += skb_len;
++
+ #ifdef CONFIG_FSL_DPAA_DBG_LOOP
+-	if (dpa_skb_loop(priv, skb)) {
+-		percpu_stats->rx_packets++;
+-		percpu_stats->rx_bytes += skb_len;
++	if (dpa_skb_loop(priv, skb))
+ 		return;
+-	}
+ #endif
+ 
+ 	skb_record_rx_queue(skb, raw_smp_processor_id());
+@@ -790,15 +801,10 @@ void __hot _dpa_rx(struct net_device *net_dev,
+ 		struct dpa_napi_portal *np = &percpu_priv->np[pc->index];
+ 
+ 		np->p = portal;
+-		/* The stack doesn't report if the frame was dropped but it
+-		 * will increment rx_dropped automatically.
+-		 */
+ 		napi_gro_receive(&np->napi, skb);
+-	} else if (unlikely(netif_receive_skb(skb) == NET_RX_DROP))
+-		return;
+-
+-	percpu_stats->rx_packets++;
+-	percpu_stats->rx_bytes += skb_len;
++	} else {
++		netif_receive_skb(skb);
++	}
+ 
+ 	return;
+ 
+-- 
+2.47.3
+

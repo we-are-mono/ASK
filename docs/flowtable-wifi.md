@@ -336,11 +336,14 @@ Step 6 remains the harder case: its direction genuinely needs the VAP's own
 ingress hooked, which cannot be bound, so it is the offline-port injection or
 nothing.
 
-A measurement trap, filed as A159: a bound flowtable stops the port's own
-**ingress** byte counters, because the ingress hook takes the packet before
-the SDK driver accounts it. Ingress read 151 KB for a transfer egress and the
-server both put at ~105 MB. Step 5's proof is written against a packet counter
-on an offloaded path and has to pick one that still counts.
+A measurement trap, filed as A159 and since fixed: a bound flowtable stopped
+the port's own **ingress** byte counters, because the SDK driver read the
+stack's return value as a drop report and a frame the ingress hook consumed
+looked like one. Ingress read 151 KB for a transfer egress and the server both
+put at ~105 MB. The port's counters now include both what the CPU forwarded
+and what the hardware did; the [interface counters guide](flowtable-statistics.md)
+has the mechanism. Step 5's proof was written before that against a packet
+counter that still counted.
 
 ### 5. The egress fast path
 

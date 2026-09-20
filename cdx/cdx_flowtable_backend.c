@@ -321,6 +321,22 @@ void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_read, ASK_CDX_FLOWTABLE);
 
+void cdx_ft_stats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
+			  unsigned int rx_overhead, unsigned int tx_overhead)
+{
+	cdx_ft_assert_held();
+	cdx_ft_ifstats_publish(slot, ifindex, rx_overhead, tx_overhead);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_publish, ASK_CDX_FLOWTABLE);
+
+/* No transaction: the caller is a netdev notifier, and the slot's owner --
+ * who alone can free it -- is serialized against that notifier by its own lock. */
+void cdx_ft_stats_unpublish(struct cdx_ft_stats_slot *slot)
+{
+	cdx_ft_ifstats_unpublish(slot);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_stats_unpublish, ASK_CDX_FLOWTABLE);
+
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats)
 {
 	cdx_ft_assert_held();

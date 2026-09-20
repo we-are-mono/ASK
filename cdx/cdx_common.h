@@ -242,6 +242,15 @@ struct dpa_l2hdr_info {
 		 * unallocated index zero to be used as an index would aim the
 		 * ucode's counter update at another interface's record. */
 		uint32_t pppoe_flow_ifstats:1;
+		/* The VLAN counterpart: the two VLAN header manipulations look
+		 * their record indices up from registered VLAN interfaces, which
+		 * a flow-described stack has none of. Set, they read
+		 * vlan_stats_offsets (insert) and ingress_vlan_stats_offsets
+		 * (strip) instead, one index per tag, and emit no pointer at
+		 * all unless every tag in the stack names a record. This also
+		 * retires the earlier borrowing of vlan_filtering to keep the
+		 * insert from emitting the unallocated index zero. */
+		uint32_t vlan_flow_ifstats:1;
 		uint32_t add_eth_type:1;
 		uint32_t dscp_vlanpcp_map_enable:1;
 	};
@@ -255,6 +264,10 @@ struct dpa_l2hdr_info {
 	struct vlan_header ingress_vlan_hdrs[DPA_CLS_HM_MAX_VLANs];
 #ifdef INCLUDE_VLAN_IFSTATS
 	uint8_t vlan_stats_offsets[DPA_CLS_HM_MAX_VLANs];
+	/* Receive halves for the strip, innermost first like everything
+	 * else here. Only a flow-described stack fills this: the legacy strip
+	 * walks the registered interfaces for its indices. */
+	uint8_t ingress_vlan_stats_offsets[DPA_CLS_HM_MAX_VLANs];
 #endif
 	uint8_t l2hdr[6 * 2];
 	uint8_t ac_mac_addr[6];

@@ -39,7 +39,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | **Delivered**, both directions: see the [IPsec design](flowtable-ipsec.md). Control plane is mainline `xfrmdev_ops` in packet mode, with no ASK userspace. The estimate that the shared encoder already carried the SEC action held; what it did not anticipate is that `FLOW_OFFLOAD_XMIT_XFRM` had to be *admitted* rather than excluded — three generic helpers refuse that transmit type outright, which silently kept every real tunnel in software until step 6 measured it. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Bridged path delivered and proved on hardware, both families: see the [multicast design](flowtable-multicast.md).** Control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on, with no ASK userspace and no consumer configuration at all. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Routed multicast is a second learner against the same encoder and is not built. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
-| 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
+| 9 | Statistics (`module_stat`) | 985 | 12 | Yes — `dev_get_stats()` fold | Medium | **Delivered**: see the [interface counters guide](flowtable-statistics.md). A port's and a VLAN device's `ip -s link` and `/proc/net/dev` include the traffic the hardware forwarded, folded from the firmware's own records by `dev_get_stats()` and restated into each device's units — the framing was measured on the DK, not inferred. No FCI, no ASK binary on the reading side; `/proc/cdx_flowtable` keeps raw `vlan` rows as a diagnostic. Alongside it, the SDK driver's own receive counters now see frames the software flowtable forwards (A159, patch 104). Tests: `test_flowtable_ifstats` on the rig; `test_ifstats`, `test_vlan_hm`, `test_flowtable` on the host. Not carried: tags with no device behind them (the bridge's own), and a PPPoE session's record is procfs-only rather than folded into its `ppp` device. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
 | 11 | Wi-Fi (`module_wifi`, `dpa_wifi`) | 345 | 3 | Yes — CDX VWD VAP path | High | **Delivered**, but not via the generic `dev_fill_forward_path` this row assumed unavailable: wire→Wi-Fi flows are offloaded through the Wi-Fi offline port and per-VAP frame queues (VWD), driven by netdev events (a VAP registering) with no ASK userspace — see `cdx/cdx_wifi_backend.c` and `ft_wifi_reconsider` in `cdx/ask_flowtable.c`. Proved at ~650 Mbit/s on the DK (production kernel, offload engaged), CPU ~27%; the driver fixes it needed are A160–A176. Tests: `test_wifi_adapter`, `test_wifi_admission`, `test_wifi_control`. |
 | 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
@@ -89,16 +89,16 @@ port. Every later encapsulation — PPPoE, bridges, tunnels — inherits that
 split, and so does the device walk that derives it, which the bridge increment
 widened rather than replaced.
 
-One capability does not come across: **per-VLAN-interface byte counters**. CMM
-maintains them in the microcode's logical statistics area and returns them
-through an FCI query. This ownership mode loads no FCI, and the microcode needs
-an interface index to allocate the counters against, which only a registered
-VLAN interface has. Deferring it to item 9 was the right call rather than
-growing a VLAN-shaped allocator here: the PPPoE increment then needed the same
-mechanism and built a general one, so what remains for a VLAN is asking it for
-a record and reading it back. Until that lands the flowtable path reports
-per-flow counters, the physical ports' own MAC counters and a PPPoE session's
-own records, and nothing per-VLAN.
+One capability did not come across with this increment: **per-VLAN-interface
+byte counters**. CMM maintains them in the microcode's logical statistics area
+and returns them through an FCI query. This ownership mode loads no FCI, and
+the microcode needs an interface index to allocate the counters against, which
+only a registered VLAN interface had. Deferring it to item 9 was the right call
+rather than growing a VLAN-shaped allocator here: the PPPoE increment then
+needed the same mechanism and built a general one, and item 9 finished it —
+the adapter now holds one record per VLAN device and `dev_get_stats()` folds it
+into the device's own counters; see the
+[interface counters guide](flowtable-statistics.md).
 
 ## Bridge, delivered
 
@@ -178,10 +178,11 @@ an interface, and only the allocator's interface was interface-shaped. It now
 names the shape of the record — `CDX_FT_STATS_TIMESTAMPED` for the timestamped
 records a session's opcodes read, `CDX_FT_STATS_PLAIN` for the ones a VLAN's
 would — so **a VLAN asks for a slot with the same call a session does**. What
-item 9 still owes for interface statistics is therefore per-VLAN and per-port
+item 9 still owed for interface statistics was therefore per-VLAN and per-port
 *read-back*, not an allocator: something to ask for a slot on a tagged flow's
-behalf and somewhere to report it, both of which a session already demonstrates
-in `/proc/cdx_flowtable`.
+behalf and somewhere to report it. It has since been delivered, and the
+somewhere turned out to be the kernel's own `dev_get_stats()` rather than
+`/proc/cdx_flowtable`; see the [interface counters guide](flowtable-statistics.md).
 
 Two caveats belong with it. The pool is four timestamped records deep and
 shared with the legacy owner, so exhaustion is an ordinary outcome rather than

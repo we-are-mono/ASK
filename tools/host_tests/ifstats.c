@@ -36,6 +36,31 @@
 
 typedef uint8_t u8;
 typedef uint64_t u64;
+#define min(a, b) ((a) < (b) ? (a) : (b))
+
+/* Enough of the kernel's list to hold the published slots, and enough of a net
+ * device and its counters for dev_get_stats()'s fold: the index the fold keys
+ * on, the namespace it refuses, and the four counters it adds to. */
+struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD(n) struct list_head n = { &n, &n }
+#define list_entry(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define list_for_each_entry(p, h, m) \
+    for (p = list_entry((h)->next, typeof(*p), m); &p->m != (h); p = list_entry(p->m.next, typeof(*p), m))
+static void list_init(struct list_head *h) { h->next = h->prev = h; }
+#define INIT_LIST_HEAD(h) list_init(h)
+static void list_add_tail(struct list_head *e, struct list_head *h)
+{ e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e; }
+static void list_del(struct list_head *e) { e->prev->next = e->next; e->next->prev = e->prev; }
+static void list_del_init(struct list_head *e) { list_del(e); list_init(e); }
+static void list_move_tail(struct list_head *e, struct list_head *h) { list_del(e); list_add_tail(e, h); }
+static int list_empty(const struct list_head *h) { return h->next == h; }
+struct net { int unused; };
+static struct net init_net, other_net;
+struct net_device { int ifindex; struct net *net; };
+#define dev_net(d) ((d)->net ? (d)->net : &init_net)
+#define net_eq(a, b) ((a) == (b))
+struct rtnl_link_stats64 { u64 rx_packets, tx_packets, rx_bytes, tx_bytes, rx_errors; };
+#define ETH_HLEN 14
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define cpu_to_be64(x) __builtin_bswap64((uint64_t)(x))
@@ -606,6 +631,138 @@ int main(void)
         assert(ts_free_count() == TS_RECORDS);
     }
 
+    /* ---- publication: what dev_get_stats() sees -------------------------
+     *
+     * A slot published to a device is folded into that device's counters and
+     * no other's, restated per packet by the overhead it was published with,
+     * and is gone from the fold the moment it is freed. The values are the
+     * ones the bench measured: 64 tagged frames of 302 bytes arrive as 19,328
+     * bytes in the record; a VLAN device counts them as 284 each. */
+    {
+        struct net_device tagged = { .ifindex = 7 }, other = { .ifindex = 8 };
+        struct net_device elsewhere = { .ifindex = 7, .net = &other_net };
+        struct rtnl_link_stats64 storage;
+        struct en_ehash_ifstats *record;
+
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        assert(list_empty(&slot->published) && list_empty(&published_slots));
+        record = slot->record;
+        record->rxstats.bytes = cpu_to_be64(19328);
+        record->rxstats.pkts = cpu_to_be32(64);
+        record->txstats.bytes = cpu_to_be64(19072);
+        record->txstats.pkts = cpu_to_be32(64);
+
+        /* Unpublished, a record reaches no device at all. */
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&tagged, &storage);
+        assert(!storage.rx_packets && !storage.rx_bytes && !storage.tx_packets && !storage.tx_bytes);
+
+        cdx_ft_ifstats_publish(slot, tagged.ifindex, ETH_HLEN + 4, 0);
+        assert(!list_empty(&slot->published) && published_slots.next == &slot->published);
+        /* Added to whatever the device's own counters already held, which is
+         * what the driver's software path put there. */
+        storage = (struct rtnl_link_stats64){ .rx_packets = 10, .rx_bytes = 1000,
+                                              .tx_packets = 20, .tx_bytes = 2000,
+                                              .rx_errors = 3 };
+        cdx_ft_ifstats_fold(&tagged, &storage);
+        assert(storage.rx_packets == 74 && storage.rx_bytes == 1000 + 64 * 284);
+        assert(storage.tx_packets == 84 && storage.tx_bytes == 2000 + 19072);
+        assert(storage.rx_errors == 3);
+        /* Another index, or the same index in another namespace, is another
+         * device. */
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&other, &storage);
+        cdx_ft_ifstats_fold(&elsewhere, &storage);
+        assert(!storage.rx_packets && !storage.rx_bytes && !storage.tx_packets && !storage.tx_bytes);
+
+        /* Republishing moves the slot rather than listing it twice: the old
+         * device stops seeing it and the new one sees it exactly once. */
+        cdx_ft_ifstats_publish(slot, other.ifindex, ETH_HLEN, ETH_HLEN);
+        assert(published_slots.next == &slot->published &&
+               published_slots.prev == &slot->published);
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&tagged, &storage);
+        assert(!storage.rx_packets && !storage.rx_bytes);
+        cdx_ft_ifstats_fold(&other, &storage);
+        assert(storage.rx_packets == 64 && storage.rx_bytes == 19328 - 64 * ETH_HLEN);
+        assert(storage.tx_packets == 64 && storage.tx_bytes == 19072 - 64 * ETH_HLEN);
+
+        /* Saturation. Minimum-size frames carry padding the firmware counts
+         * and the overhead cannot know about, so bytes can fall short of
+         * packets times overhead; the answer is then zero, not a wrapped
+         * count in the exabytes. */
+        record->rxstats.bytes = cpu_to_be64(60 * 3);
+        record->rxstats.pkts = cpu_to_be32(3);
+        cdx_ft_ifstats_publish(slot, other.ifindex, 100, 0);
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&other, &storage);
+        assert(storage.rx_packets == 3 && storage.rx_bytes == 0);
+        /* The port's own arm in devman.c uses the same helper directly, with
+         * the Ethernet header as the receive overhead and none on transmit. */
+        memset(&storage, 0, sizeof(storage));
+        cdx_ifstats_fold(&storage, 19328, 64, 19072, 64, ETH_HLEN, 0);
+        assert(storage.rx_bytes == 18432 && storage.tx_bytes == 19072);
+        assert(storage.rx_packets == 64 && storage.tx_packets == 64);
+
+        /* Two slots on one device add up; freeing one withdraws only it. */
+        {
+            struct cdx_ft_stats_slot *second = take(CDX_FT_STATS_PLAIN, "plain");
+            struct en_ehash_ifstats *more = second->record;
+
+            more->rxstats.bytes = cpu_to_be64(1000);
+            more->rxstats.pkts = cpu_to_be32(10);
+            cdx_ft_ifstats_publish(second, other.ifindex, 0, 0);
+            memset(&storage, 0, sizeof(storage));
+            cdx_ft_ifstats_fold(&other, &storage);
+            assert(storage.rx_packets == 13 && storage.rx_bytes == 1000);
+            cdx_ft_ifstats_free(&second);
+            memset(&storage, 0, sizeof(storage));
+            cdx_ft_ifstats_fold(&other, &storage);
+            assert(storage.rx_packets == 3 && storage.rx_bytes == 0);
+        }
+
+        /* Withdrawing ahead of the free leaves the record readable but folded
+         * nowhere; publishing again brings it back; a NULL slot is nothing to
+         * withdraw. */
+        cdx_ft_ifstats_unpublish(slot);
+        assert(list_empty(&slot->published) && list_empty(&published_slots));
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&other, &storage);
+        assert(!storage.rx_packets && !storage.rx_bytes);
+        cdx_ft_ifstats_read(slot, &rx, &tx);
+        assert(rx.packets == 3);
+        cdx_ft_ifstats_unpublish(slot);
+        cdx_ft_ifstats_unpublish(NULL);
+        cdx_ft_ifstats_publish(NULL, other.ifindex, 0, 0);
+        cdx_ft_ifstats_publish(slot, other.ifindex, 100, 0);
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&other, &storage);
+        assert(storage.rx_packets == 3 && storage.rx_bytes == 0);
+
+        /* Freeing withdraws the publication under the same lock the fold
+         * reads under, so a fold afterwards finds nothing -- and the slot's
+         * memory is gone, which is what the sanitizer would report if the
+         * list still pointed at it. */
+        cdx_ft_ifstats_free(&slot);
+        assert(list_empty(&published_slots));
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&other, &storage);
+        assert(!storage.rx_packets && !storage.rx_bytes);
+
+        /* A published slot that outlives the carve reads nothing rather than
+         * the memory the carve used to be: the fold is what guards that, not
+         * the owner returning the slot first. */
+        slot = take(CDX_FT_STATS_PLAIN, "plain");
+        cdx_ft_ifstats_publish(slot, other.ifindex, 0, 0);
+        drop_pools();
+        memset(&storage, 0, sizeof(storage));
+        cdx_ft_ifstats_fold(&other, &storage);
+        assert(!storage.rx_packets && !storage.rx_bytes);
+        cdx_ft_ifstats_free(&slot);
+        assert(list_empty(&published_slots));
+        init_pools();
+    }
+
     /* ---- deinit ---------------------------------------------------------
      *
      * The carve goes back and both lists go with it. Anything asking after
@@ -645,7 +802,7 @@ int main(void)
     assert(!locked);
     assert(kzalloc_calls == kfree_calls);
     assert(dpa_errors);
-    printf("ifstats pool geometry, indices, exhaustion and lifetime checks passed"
+    printf("ifstats pool geometry, indices, exhaustion, lifetime and publication checks passed"
            " (%u records named, %u allocations)\n",
            (unsigned)(TS_RECORDS + PLAIN_NAMEABLE), kzalloc_calls);
     return 0;

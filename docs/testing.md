@@ -231,8 +231,11 @@ across the `sudo` boundary automatically (use space-free values).
 
 ASK adds FMAN interface statistics to `dev_get_stats()`. Consequently,
 `ip -s link`, `ifconfig`, `/proc/net/dev`, and sysfs netdev statistics include
-both software and hardware traffic. Use those totals for volume and header
-length accounting, not to decide which path forwarded a packet.
+both software and hardware traffic, on physical ports and, under the flowtable
+owner, on VLAN devices too (see the
+[interface counters guide](flowtable-statistics.md) for the units). Use those
+totals for volume and header length accounting, not to decide which path
+forwarded a packet.
 
 The SDK DPAA driver's `ethtool -S <physical-ingress-port>` counter
 `rx packets [TOTAL]` contains software RX only. The harness reads this

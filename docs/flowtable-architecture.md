@@ -302,6 +302,12 @@ any PPPoE session header. `ft_l2_overhead()` subtracts exactly that stack, taken
 from the direction's own ingress framing, and saturates at zero rather than
 wrapping when a delta cannot carry it.
 
+Per-interface counters are a separate set of firmware records, folded into a
+port's or a VLAN device's `rtnl_link_stats64` by the `dev_get_stats()` hook and
+restated the same way into that device's units; the
+[interface counters guide](flowtable-statistics.md) has the records, the
+measured framing and the lifetime rules.
+
 Two residuals remain, both bounded and neither correctable from a total:
 
 - **Padding.** A frame below the sixty-byte minimum was padded before it was

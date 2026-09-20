@@ -161,6 +161,14 @@ static void list_init(struct list_head *h) { h->next = h->prev = h; }
 #define INIT_LIST_HEAD(h) list_init(h)
 static bool list_empty(const struct list_head *h) { return h->next == h; }
 static void list_del_init(struct list_head *e) { list_del(e); list_init(e); }
+static void list_move(struct list_head *e, struct list_head *h)
+{ list_del(e); e->next = h->next; e->prev = h; h->next->prev = e; h->next = e; }
+static void list_splice_init(struct list_head *from, struct list_head *to)
+{
+    if (list_empty(from)) return;
+    from->next->prev = to; from->prev->next = to->next; to->next->prev = from->prev;
+    to->next = from->next; list_init(from);
+}
 struct hlist_node { struct hlist_node *next, **pprev; };
 struct hlist_head { struct hlist_node *first; };
 struct seq_file { int unused; };
@@ -533,7 +541,7 @@ static void flow_stats_update(struct flow_stats *s, u64 b, u64 p, u64 d, unsigne
 #include "flowtable_types.inc"
 struct cdx_ft_hw { struct cdx_ft_counters stats; };
 struct work_struct { int unused; };
-static int ft_work, ft_retire_work;
+static int ft_work, ft_retire_work, ft_dev_stats_work;
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
 static DEFINE_HASHTABLE(ft_cookies, CDX_FT_HASH_BITS);
@@ -543,6 +551,14 @@ static LIST_HEAD(ft_neigh_entries);
 static bool ft_watch_lock;
 static LIST_HEAD(ft_block_list);
 static LIST_HEAD(ft_session_stats);
+static LIST_HEAD(ft_dev_stats);
+static bool ft_dev_stats_lock;
+static void drop_dev_records(void);
+/* The production allocator asserts RTNL because the install runs under the
+ * admission's rtnl_trylock(); this harness drives ft_replace() directly from
+ * most cases, without one, so the assertion is a statement here rather than a
+ * check. */
+#define ASSERT_RTNL() do { } while (0)
 static unsigned ft_count, ft_bound, ft_fail_stage, ft_init_fail_stage;
 /* Module parameters in production; plain globals here so a case can set the
  * mask, drive ft_parse, and read the class back off the rule. */
@@ -586,24 +602,40 @@ static void up_write(bool *lock)
  * record" everywhere one is passed on. */
 #define STATS_WITH_TS 0x80
 #define STATS_TIMESTAMPED_SLOTS 4
+/* And a plain pool behind it, a few records deep, indexed from where the
+ * timestamped records end -- in its own units, so the first plain index is
+ * twelve and none of them carries the flag. */
+#define STATS_PLAIN_SLOTS 8
+#define STATS_PLAIN_BASE 12
 struct cdx_ft_stats_slot { unsigned index; enum cdx_ft_stats_kind kind; u8 rx_index, tx_index;
-                           struct cdx_ft_stats rx, tx; };
-static struct cdx_ft_stats_slot stats_pool[STATS_TIMESTAMPED_SLOTS];
-static bool stats_taken[STATS_TIMESTAMPED_SLOTS];
-static unsigned stats_allocations, stats_frees;
+                           struct cdx_ft_stats rx, tx;
+                           int published_ifindex; unsigned published_rx_overhead, published_tx_overhead; };
+static struct cdx_ft_stats_slot stats_pool[STATS_TIMESTAMPED_SLOTS + STATS_PLAIN_SLOTS];
+static bool stats_taken[STATS_TIMESTAMPED_SLOTS + STATS_PLAIN_SLOTS];
+static unsigned stats_allocations, stats_frees, stats_publications;
 static int stats_alloc_fail;
 static int cdx_ft_stats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot **slot)
 {
+    unsigned first = kind == CDX_FT_STATS_TIMESTAMPED ? 0 : STATS_TIMESTAMPED_SLOTS;
+    unsigned end = kind == CDX_FT_STATS_TIMESTAMPED ? STATS_TIMESTAMPED_SLOTS
+                                                    : STATS_TIMESTAMPED_SLOTS + STATS_PLAIN_SLOTS;
+
     assert(cdx_info->ctrl.mutex);
     *slot = NULL;
     if (stats_alloc_fail) return stats_alloc_fail;
-    for (unsigned i = 0; i < STATS_TIMESTAMPED_SLOTS; i++) {
+    for (unsigned i = first; i < end; i++) {
+        unsigned n = i - first;
+
         if (stats_taken[i]) continue;
         stats_taken[i] = true;
-        stats_pool[i] = (struct cdx_ft_stats_slot){
-            .index = i, .kind = kind,
-            .rx_index = (u8)((i * 2) | STATS_WITH_TS),
-            .tx_index = (u8)((i * 2 + 1) | STATS_WITH_TS) };
+        stats_pool[i] = (struct cdx_ft_stats_slot){ .index = i, .kind = kind };
+        if (kind == CDX_FT_STATS_TIMESTAMPED) {
+            stats_pool[i].rx_index = (u8)((n * 2) | STATS_WITH_TS);
+            stats_pool[i].tx_index = (u8)((n * 2 + 1) | STATS_WITH_TS);
+        } else {
+            stats_pool[i].rx_index = (u8)(STATS_PLAIN_BASE + n * 2);
+            stats_pool[i].tx_index = (u8)(STATS_PLAIN_BASE + n * 2 + 1);
+        }
         stats_allocations++;
         *slot = &stats_pool[i];
         return 0;
@@ -618,6 +650,32 @@ static void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot)
     stats_taken[(*slot)->index] = false;
     stats_frees++;
     *slot = NULL;
+}
+/* Publication is the backend's; here it is recorded on the slot so a case can
+ * say which device a record reaches and in what units. */
+static void cdx_ft_stats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
+                                 unsigned rx_overhead, unsigned tx_overhead)
+{
+    assert(cdx_info->ctrl.mutex && slot && stats_taken[slot->index] && ifindex);
+    slot->published_ifindex = ifindex;
+    slot->published_rx_overhead = rx_overhead;
+    slot->published_tx_overhead = tx_overhead;
+    stats_publications++;
+}
+/* Withdrawal takes no transaction -- the notifier calls it -- and tolerates a
+ * record that never had a slot. */
+static void cdx_ft_stats_unpublish(struct cdx_ft_stats_slot *slot)
+{
+    if (!slot) return;
+    assert(stats_taken[slot->index]);
+    slot->published_ifindex = 0;
+}
+static unsigned plain_in_use(void)
+{
+    unsigned n = 0;
+    for (unsigned i = STATS_TIMESTAMPED_SLOTS; i < STATS_TIMESTAMPED_SLOTS + STATS_PLAIN_SLOTS; i++)
+        n += stats_taken[i];
+    return n;
 }
 static void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
                               struct cdx_ft_stats *rx, struct cdx_ft_stats *tx)
@@ -651,8 +709,12 @@ static int cdx_ft_recover(void)
     return retry_error;
 }
 static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
-static unsigned neigh_scheduled;
-static void schedule_work(int *work) { assert(work == &ft_retire_work); neigh_scheduled++; }
+static unsigned neigh_scheduled, dev_stats_scheduled;
+static void schedule_work(int *work)
+{
+    assert(work == &ft_retire_work || work == &ft_dev_stats_work);
+    if (work == &ft_dev_stats_work) dev_stats_scheduled++; else neigh_scheduled++;
+}
 static void nf_flow_table_cleanup(struct net_device *dev)
 { assert(!cdx_info->ctrl.mutex); flushed++; if (cleanup_hook) cleanup_hook(); }
 static void dev_hold(struct net_device *d) { d->refs++; }
@@ -851,6 +913,7 @@ static void cdx_unregister_ft_qos_class(void) { registered_qos_class = 0; }
  * counts into its session's receive half, one that inserts into the transmit
  * half of its own, and a session with no record leaves zero. */
 static u8 observed_in_stats, observed_out_stats;
+static u8 observed_in_vlan[CDX_FT_VLAN_MAX], observed_out_vlan[CDX_FT_VLAN_MAX];
 static int cdx_ft_add(const struct cdx_ft_rule *r,
                       const struct cdx_ft_stats_binding *stats, struct cdx_ft_hw **hw)
 {
@@ -859,6 +922,15 @@ static int cdx_ft_add(const struct cdx_ft_rule *r,
     assert(!stats->out_session || r->out_session.present);
     observed_in_stats = stats->in_session ? stats->in_session->rx_index : 0;
     observed_out_stats = stats->out_session ? stats->out_session->tx_index : 0;
+    /* A tag's slot is named only for a tag the rule carries, and the halves
+     * are the record's: receive for what is stripped, transmit for what is
+     * inserted. */
+    for (unsigned i = 0; i < CDX_FT_VLAN_MAX; i++) {
+        assert(!stats->in_vlan[i] || i < r->in_vlans);
+        assert(!stats->out_vlan[i] || i < r->out_vlans);
+        observed_in_vlan[i] = stats->in_vlan[i] ? stats->in_vlan[i]->rx_index : 0;
+        observed_out_vlan[i] = stats->out_vlan[i] ? stats->out_vlan[i]->tx_index : 0;
+    }
     if (hardware_fail) return -EIO;
     *hw = calloc(1, sizeof(**hw)); assert(*hw); live_hw++;
     (*hw)->stats.lastused = (u32)jiffies;
@@ -925,7 +997,7 @@ static int register_switchdev_blocking_notifier(struct notifier_block *nb)
 static void unregister_switchdev_blocking_notifier(struct notifier_block *nb)
 { assert(swdev_obj_registered); swdev_obj_registered=false; }
 static void cancel_work_sync(int *work)
-{ assert(work == &ft_retire_work || work == &ft_ipsec_follow); canceled++; }
+{ assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work); canceled++; }
 static void cancel_delayed_work_sync(int *work) { assert(work == &ft_work); canceled++; }
 static int register_indirect(void)
 { assert(ft_ready); if (registration_fails()) return -ENOMEM; indirect_registered=true; return 0; }
@@ -1661,17 +1733,24 @@ static void test_vlan(void)
     neighbour.dev = &out_tag;
     encap_actions(1, push_one, ARRAY_SIZE(push_one));
     encap_keys(ingress_one, ARRAY_SIZE(ingress_one));
+    /* Under the transaction, as production installs are: a tagged flow now
+     * claims a VLAN device record, and that claim asserts it. */
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
     assert(out.refs == 1 && out_tag.refs == 1 && in_tag.refs == 1 && !in.refs);
     ft_device_retire(&in_tag, &ft_mtu_invalidations);
     assert(handle.invalid);
     ft_retire_workfn(NULL);
+    drop_dev_records();
     assert(!ft_count && !out.refs && !out_tag.refs && !in_tag.refs && !allocated);
 
     /* Every device the rule names is pinned for the life of the entry, and a
      * VLAN device carries its own MTU and administrative state. */
     egress_tag_fixture();
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
     assert(out.refs == 1 && out_tag.refs == 1 && !in.refs);
     ft_device_retire(&out_tag, &ft_mtu_invalidations);
     assert(handle.invalid);
@@ -1679,11 +1758,14 @@ static void test_vlan(void)
     assert(!ft_count && !out.refs && !out_tag.refs && !ft_handle_refs && !ft_neighbour_refs);
 
     ingress_tag_fixture();
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
     assert(in_tag.refs == 1 && out.refs == 1);
     ft_device_retire(&in_tag, &ft_link_invalidations);
     assert(handle.invalid);
     ft_retire_workfn(NULL);
+    drop_dev_records();
     assert(!ft_count && !in_tag.refs && !out.refs && !allocated);
 }
 
@@ -1791,11 +1873,14 @@ static void test_bridge(void)
     assert(decoded.in_vlans == 1 && decoded.in_vlan[0].id == 100 &&
            decoded.in_bridge == &in_br && decoded.in_bridge_vid == 100);
     assert(decoded.in_logical == &br_tag && !decoded.out_bridge);
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
     assert(out.refs == 1 && br_tag.refs == 1 && in_br.refs == 1 && !in.refs);
     ft_device_retire(&in_br, &ft_link_invalidations);
     assert(handle.invalid);
     ft_retire_workfn(NULL);
+    drop_dev_records();
     assert(!ft_count && !out.refs && !br_tag.refs && !in_br.refs && !allocated);
 
     /* A second tag inside the bridge's own: the bridge resolves on the
@@ -1878,11 +1963,14 @@ static void test_bridge(void)
     neighbour.dev = &br_tag;
     reverse_route.dst.dev = &in_br;
     encap_actions(0, push_one, ARRAY_SIZE(push_one));
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
     assert(out.refs == 1 && br.refs == 1 && br_tag.refs == 1 && in_br.refs == 1);
     ft_device_retire(&in_br, &ft_link_invalidations);
     assert(handle.invalid);
     ft_retire_workfn(NULL);
+    drop_dev_records();
     assert(!ft_count && !out.refs && !br.refs && !br_tag.refs && !in_br.refs && !allocated);
 
     /* One bridge carrying both directions is counted once, which is what an
@@ -1901,7 +1989,9 @@ static void test_bridge(void)
     assert(decoded.out_bridge == &br && decoded.in_bridge == &br);
     assert(decoded.out_bridge_vid == 100 && decoded.in_bridge_vid == 1);
     assert(!decoded.in_vlans && decoded.out_vlans == 1);
+    cdx_ft_begin();
     assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    cdx_ft_end();
     /* The bridge is both this direction's ingress logical device and the
      * egress path's bridge, so it is pinned once for each -- what matters is
      * that the puts mirror the holds, which the teardown below proves. */
@@ -1909,6 +1999,7 @@ static void test_bridge(void)
     ft_device_retire(&br, &ft_link_invalidations);
     assert(handle.invalid);
     ft_retire_workfn(NULL);
+    drop_dev_records();
     assert(!ft_count && !br.refs && !br_tag.refs && !out.refs && !allocated);
 }
 
@@ -2550,6 +2641,229 @@ static void test_pppoe_stats(void)
     assert(!stats_in_use() && record_count() == 0);
     assert(!observed_in_stats && !observed_out_stats);
     assert(ft_remove(ft_find(&binding, cls.cookie)) == 0 && !ft_count);
+    cdx_ft_end();
+}
+
+static unsigned dev_record_count(void)
+{
+    struct cdx_ft_dev_stats *record;
+    unsigned n = 0;
+
+    list_for_each_entry(record, &ft_dev_stats, list) n++;
+    return n;
+}
+
+static struct cdx_ft_dev_stats *dev_record(int ifindex)
+{
+    struct cdx_ft_dev_stats *record;
+
+    list_for_each_entry(record, &ft_dev_stats, list)
+        if (record->ifindex == ifindex && !record->gone) return record;
+    return NULL;
+}
+
+static void device_unregistered(struct net_device *dev)
+{
+    struct netdev_notifier_info info = { .dev = dev };
+
+    assert(!cdx_info->ctrl.mutex);
+    ft_netdev_event(NULL, NETDEV_UNREGISTER, &info);
+    /* The invalidation a used device raises is another case's business. */
+    ft_invalid = 0;
+}
+
+/* The VLAN device records: one per device the tags of a flow belong to, held
+ * for the device's life rather than the flow's, published to the device in
+ * the units its own counters use. */
+static void test_vlan_stats(void)
+{
+    struct cdx_ft_entry *first, *second;
+    struct cdx_ft_dev_stats *record, *outer, *inner;
+    struct cdx_ft_stats_slot *slot;
+
+    /* One egress tag, on eth3.100 over the egress port. The direction inserts,
+     * so it names the record's transmit half; nothing is stripped, so the
+     * ingress side names nothing. The record is published to the VLAN device
+     * with the framing a first-position tag implies. */
+    egress_tag_fixture();
+    cdx_ft_begin();
+    cls.cookie = 50;
+    cls.stats = (struct flow_stats){0};
+    assert(!plain_in_use() && !dev_record_count());
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    first = ft_find(&binding, 50);
+    assert(first && first->out_vlan_stats[0] && !first->out_vlan_stats[1]);
+    assert(!first->in_vlan_stats[0] && !first->in_stats && !first->out_stats);
+    record = first->out_vlan_stats[0];
+    assert(record == dev_record(out_tag.ifindex) && record->refs == 1 && !record->gone);
+    assert(record->slot && record->slot->kind == CDX_FT_STATS_PLAIN);
+    assert(record->slot->published_ifindex == out_tag.ifindex);
+    /* The firmware counts a device's record with the device's own tag already
+     * handled; the device counts both ways without its own tag, so the
+     * framing to take off is the Ethernet header on receive and the tag on
+     * transmit -- the adapter's own constants, read off the source. */
+    assert(record->slot->published_rx_overhead == FT_VLAN_RX_OVERHEAD);
+    assert(record->slot->published_tx_overhead == FT_VLAN_TX_OVERHEAD);
+    assert(FT_VLAN_RX_OVERHEAD == ETH_HLEN && FT_VLAN_TX_OVERHEAD == VLAN_HLEN);
+    assert(observed_out_vlan[0] == record->slot->tx_index && !observed_out_vlan[1]);
+    assert(!observed_in_vlan[0] && !observed_in_stats && !observed_out_stats);
+    assert(plain_in_use() == 1 && dev_record_count() == 1 && !stats_in_use());
+
+    /* A second connection through the same device shares the record. */
+    cls.cookie = 51;
+    pk.src = htons(10001);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 2);
+    second = ft_find(&binding, 51);
+    assert(second && second->out_vlan_stats[0] == record && record->refs == 2);
+    assert(plain_in_use() == 1 && dev_record_count() == 1);
+    assert(observed_out_vlan[0] == record->slot->tx_index);
+
+    /* Both retire; the device is still here, so its record and its slot stay,
+     * totals intact. The next flow through it finds the same record. */
+    slot = record->slot;
+    assert(ft_remove(first) == 0 && ft_remove(second) == 0 && !ft_count);
+    assert(record->refs == 0 && !record->gone);
+    assert(dev_record(out_tag.ifindex) == record && record->slot == slot);
+    assert(plain_in_use() == 1 && dev_record_count() == 1);
+    cls.cookie = 52;
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    first = ft_find(&binding, 52);
+    assert(first->out_vlan_stats[0] == record && record->refs == 1 && record->slot == slot);
+
+    /* The device unregisters while a direction still names the record: it is
+     * marked gone, kept until that direction retires, and freed by the
+     * retirement. Nothing is queued for the reaper, which has nothing to do. */
+    cdx_ft_end();
+    dev_stats_scheduled = 0;
+    device_unregistered(&out_tag);
+    assert(!dev_stats_scheduled);
+    cdx_ft_begin();
+    assert(record->gone && record->refs == 1 && !dev_record(out_tag.ifindex));
+    assert(dev_record_count() == 1 && plain_in_use() == 1);
+    /* Its publication went with the device, not with the slot: the index may
+     * be handed to a new device while this record waits on its direction. */
+    assert(record->slot && !record->slot->published_ifindex);
+    /* And a claim for the same index now starts a record of its own rather
+     * than finding the gone one -- the index may belong to a new device. The
+     * unregistration retired the flow's handle, so this claims directly, as
+     * the install of a flow on the new device would. */
+    {
+        struct cdx_ft_dev_stats *fresh = ft_dev_stats_get(out_tag.ifindex);
+
+        assert(fresh && fresh != record && !fresh->gone && fresh->refs == 1);
+        assert(fresh->slot && fresh->slot != record->slot);
+        assert(dev_record_count() == 2 && plain_in_use() == 2);
+        ft_dev_stats_put(&fresh);
+        assert(!fresh && dev_record(out_tag.ifindex) && dev_record_count() == 2);
+    }
+    /* The gone record goes with its last direction; the fresh one stays with
+     * what it takes to be a live device. */
+    assert(ft_remove(first) == 0 && !ft_count);
+    assert(dev_record_count() == 1 && plain_in_use() == 1 && dev_record(out_tag.ifindex));
+
+    /* The device unregisters with nothing naming its record: the reaper is
+     * queued and frees it. */
+    cdx_ft_end();
+    device_unregistered(&out_tag);
+    assert(dev_stats_scheduled == 1);
+    ft_dev_stats_reap(NULL);
+    cdx_ft_begin();
+    assert(!dev_record_count() && !plain_in_use());
+    /* An event for a device without a record queues nothing. */
+    cdx_ft_end();
+    device_unregistered(&out_tag);
+    assert(dev_stats_scheduled == 1);
+
+    /* One ingress tag: the direction strips, so it names the receive half,
+     * and the record belongs to the ingress VLAN device. */
+    ingress_tag_fixture();
+    cdx_ft_begin();
+    cls.cookie = 54;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    first = ft_find(&binding, 54);
+    assert(first->in_vlan_stats[0] && !first->out_vlan_stats[0]);
+    record = first->in_vlan_stats[0];
+    assert(record == dev_record(in_tag.ifindex) && record->slot);
+    assert(record->slot->published_ifindex == in_tag.ifindex);
+    assert(record->slot->published_rx_overhead == FT_VLAN_RX_OVERHEAD);
+    assert(observed_in_vlan[0] == record->slot->rx_index && !observed_out_vlan[0]);
+    assert(record->slot->rx_index != record->slot->tx_index);
+    assert(!(record->slot->rx_index & STATS_WITH_TS));
+    assert(ft_remove(first) == 0 && !ft_count);
+    assert(record->refs == 0 && dev_record_count() == 1);
+
+    /* QinQ egress: two devices, two records, ordered like the rule's tags.
+     * The outer tag is eth3.100's and comes first; the inner is
+     * eth3.100.300's. Both are published with the same framing, because the
+     * firmware hands each record the frame with that record's own tag
+     * handled, whatever its depth. */
+    cdx_ft_end();
+    vlan_fixture();
+    route.dst.dev = &out_qinq;
+    neighbour.dev = &out_qinq;
+    encap_actions(0, (const u16[]){ 100, 300 }, 2);
+    cdx_ft_begin();
+    cls.cookie = 55;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    first = ft_find(&binding, 55);
+    outer = first->out_vlan_stats[0];
+    inner = first->out_vlan_stats[1];
+    assert(outer && inner && outer != inner);
+    assert(outer->ifindex == out_tag.ifindex && inner->ifindex == out_qinq.ifindex);
+    assert(outer->slot->published_rx_overhead == FT_VLAN_RX_OVERHEAD);
+    assert(outer->slot->published_tx_overhead == FT_VLAN_TX_OVERHEAD);
+    assert(inner->slot->published_rx_overhead == FT_VLAN_RX_OVERHEAD);
+    assert(inner->slot->published_tx_overhead == FT_VLAN_TX_OVERHEAD);
+    assert(observed_out_vlan[0] == outer->slot->tx_index);
+    assert(observed_out_vlan[1] == inner->slot->tx_index);
+    assert(plain_in_use() == 3 && dev_record_count() == 3);
+    assert(ft_remove(first) == 0 && !ft_count);
+
+    /* The pool empty: the record exists and says it has no slot, the encoder
+     * is told there is none, and the flow installs regardless. Returning a
+     * slot later does not retrofit one. The records the devices above still
+     * hold are dropped first, or eth3.100's would simply be found again. */
+    cdx_ft_end();
+    drop_dev_records();
+    egress_tag_fixture();
+    cdx_ft_begin();
+    stats_alloc_fail = -ENOSPC;
+    cls.cookie = 56;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    stats_alloc_fail = 0;
+    first = ft_find(&binding, 56);
+    record = first->out_vlan_stats[0];
+    assert(record && !record->slot && record->refs == 1 && !observed_out_vlan[0]);
+    assert(!plain_in_use() && dev_record_count() == 1);
+    assert(ft_remove(first) == 0);
+    cls.cookie = 57;
+    assert(ft_replace(&binding, &cls) == 0);
+    assert(ft_find(&binding, 57)->out_vlan_stats[0] == record && !record->slot);
+    assert(ft_remove(ft_find(&binding, 57)) == 0 && !ft_count);
+
+    /* A hardware installation that fails releases the reference with
+     * everything else. */
+    cls.cookie = 58;
+    hardware_fail = true;
+    assert(ft_replace(&binding, &cls) == -EIO && !ft_count);
+    hardware_fail = false;
+    assert(record->refs == 0);
+
+    /* Unload frees what the devices were holding, referenced by nothing. */
+    cdx_ft_end();
+    ft_dev_stats_drop_all();
+    assert(!dev_record_count() && !plain_in_use());
+    /* And a flow with no tags claims none of this. */
+    fixture();
+    cdx_ft_begin();
+    cls.cookie = 59;
+    assert(ft_replace(&binding, &cls) == 0);
+    assert(!dev_record_count() && !plain_in_use());
+    assert(!observed_in_vlan[0] && !observed_out_vlan[0]);
+    assert(ft_remove(ft_find(&binding, 59)) == 0 && !ft_count);
     cdx_ft_end();
 }
 
@@ -3436,6 +3750,21 @@ static void test_selective_routes(void)
     assert(ft_installs == ft_deletes && ft_errors == errors);
 }
 
+/* A VLAN device's counter record outlives its flows by design, so a scenario
+ * that ends with every flow retired still holds one per VLAN device the flows
+ * crossed. Before a case asserts that nothing is left allocated, drop them the
+ * way unload does -- after checking that no retired flow still references
+ * one, which is the leak this would otherwise hide. */
+static void drop_dev_records(void)
+{
+    struct cdx_ft_dev_stats *record;
+
+    assert(!cdx_info->ctrl.mutex);
+    list_for_each_entry(record, &ft_dev_stats, list)
+        assert(!record->refs);
+    ft_dev_stats_drop_all();
+}
+
 static void device_event(struct net_device *dev, unsigned long event, bool invalid)
 {
     struct netdev_notifier_info info = { .dev = dev };
@@ -4041,7 +4370,8 @@ int main(void)
     test_transient_admission();
     test_nexthop_objects();
     test_qos_decode();
+    test_vlan_stats();
     test_direct_bind_unload();
     test_registration();
-    puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm, class decode and fatal retry passed");
+    puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm, class decode, VLAN records and fatal retry passed");
 }

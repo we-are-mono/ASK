@@ -24,6 +24,7 @@ Current checkpoint: IPv6, 802.1Q VLAN, bridging, PPPoE, IPv4 TCP/UDP NAT and
 | Where VLAN tags come from, the logical/physical split, and its proof | [VLAN guide](flowtable-vlan.md) |
 | Why a bridged flow keeps its destination, where its tags come from, and its proof | [Bridge guide](flowtable-bridge.md) |
 | Why a PPPoE session is handed over rather than derived, what stands in for its neighbour, where its counters live, and its proof | [PPPoE guide](flowtable-pppoe.md) |
+| How a port's and a VLAN device's `ip -s link` come to include offloaded traffic, the measured framing, and its proof | [Interface counters guide](flowtable-statistics.md) |
 | Admission budget, pressure and resource reuse | [Capacity guide](flowtable-capacity.md) |
 | Original proposal, implementation snapshots and dated measurements | [History by topic and chronology](flowtable/history/README.md) |
 | Remaining intermittent UDP/link observations | [UDP loss investigation](flowtable-udp-loss-investigation.md) |
@@ -45,7 +46,7 @@ configuration instructions.
 | Routed traffic | Unicast IPv4 and IPv6 UDP and established/assured TCP; default conntrack zones and zero conntrack mark |
 | Encapsulation | 802.1Q VLAN subinterfaces on either port, up to two stacked tags per direction, ingress and egress independently. The tag stack is derived from the devices Linux routed through and the pop/push actions must agree with it. 802.1ad, a VLAN device overriding its parent's MAC, and any upper device that is neither an 802.1Q VLAN, a bridge nor a PPPoE session (bond, MACVLAN) are declined |
 | PPPoE | One session per direction in either address family, outermost, over a physical port or over the VLAN device or bridge below it. The session is not derived but carried from the kernel's own forwarding-path walk through patch 140, because a ppp device registers no lower neighbour and the session lives in a pppox socket; the push action's sid must agree with it. A session spends one of the two encapsulation slots, so it admits one tag alongside and PPPoE over QinQ is declined. A session egress has no neighbour and no Ethernet destination — Netfilter writes zeros, and the concentrator the session names is required instead. The insert opcode names no PPP protocol id, so the microcode chooses one; measured on this bench, it chooses correctly for IPv6 |
-| Interface counters | A PPPoE session carries the firmware's own byte and packet counters, one record per session shared by every flow over it, read back through `/proc/cdx_flowtable`. The record pool is four deep and shared with the legacy owner: a fifth session forwards without counters rather than being refused, and which sessions have a record is reported. VLANs and physical ports have no equivalent read-back yet |
+| Interface counters | A physical port's and a VLAN device's `ip -s link` and `/proc/net/dev` include the traffic the hardware forwarded on their behalf, folded from the firmware's own per-interface records by `dev_get_stats()` and restated into each device's units; `ethtool -S` stays the driver's software view, so the difference between the two is the offloaded traffic. One plain record per VLAN device, held for the device's life; the pool is 122 deep and shared with the legacy owner, so a device the pool has nothing for forwards uncounted and `/proc/cdx_flowtable` says so. A PPPoE session carries its own timestamped record, one per session shared by every flow over it, read back through `/proc/cdx_flowtable` only; that pool is four deep. A tag with no device behind it — a vlan-aware bridge's own — has no counter |
 | Bridging | One bridge master per direction, which must be the physical port's own master. Its effective tag stack is derived from the bridge's VLAN groups exactly as `br_vlan_fill_forward_path_*()` derives it, so a vlan-aware bridge over a tagged or an untagged port and a plain bridge are all described. A bridge port that is itself a stacked device, a port reporting a switchdev parent, and a bridge whose MAC differs from the egress port's are declined. Transmit stays NEIGH: patch 140 keeps the borrowed destination on a bridged path so the routed contract applies unchanged |
 | Throughput | Loki → Vision TCP NAT: 9.414 Gb/s receive, 1.84% aggregate DUT CPU on the KASAN image. Routed IPv6 TCP: 9.173 Gb/s forward and 9.260 Gb/s reverse on the same image, against 97.9 Mb/s with the same flow forwarded in software |
 | NAT | TCP/UDP static source NAT, MASQUERADE, destination and hairpin/double NAT in IPv4, including address/port translation and inverse reply translation. IPv6 source and destination NAT, with the full 128-bit address rewrite and its inverse |
@@ -72,12 +73,13 @@ reconnection that keeps the unit changes the id and the concentrator under a
 device that stayed. The failure mode is loss rather than misdelivery, and no
 exported interface reports a session change.
 
-A tagged flow carries no per-VLAN-interface byte counters. The firmware records
-and the allocator that hands them out are in place — a session already uses
-them, and the backend API names the shape of the record rather than the feature
-— but nothing asks for one on behalf of a VLAN and nothing reads one back, so
-that half remains a retirement item. Per-flow counters, the physical ports' own
-MAC counters and a session's own records are unaffected.
+A frame the software fast path forwards is counted by the port it arrived on
+but not by the VLAN device above it: Netfilter's hook runs on the physical port
+and forwards from there, so the frame never reaches the 8021q layer. That is
+the kernel's own accounting, not the fold's; the hardware path counts the VLAN
+device from its own record. See the
+[interface counters guide](flowtable-statistics.md) for what is and is not
+counted.
 
 Both families share one admission budget and one set of adapter indexes, so
 the 32,768 bound counts IPv4 and IPv6 directions together. Within IPv6 the

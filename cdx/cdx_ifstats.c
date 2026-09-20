@@ -41,10 +41,17 @@
  *   stats_mem, stats_mem_phys
  *      - Set once at init in cdx_init_stats; after that read-only.
  *
+ *   published_slots
+ *      - The flowtable owner's records that dev_get_stats() folds into a
+ *        device's counters, under the same lock: the fold runs in
+ *        process context (RTNL or RCU) and must find a slot either
+ *        published with a live record or gone, never freed.
+ *
  * Contexts:
  *   cdx_alloc_ifstats, cdx_free_ifstats     - process, ioctl.
  *   cdx_iface_stats_get                     - any context.
  *   cdx_init_stats                          - module init.
+ *   cdx_ft_ifstats_fold                     - process, dev_get_stats().
  */
 DEFINE_SPINLOCK(dpa_statslist_lock);
 //base of stats area
@@ -56,6 +63,8 @@ uint32_t stats_mem_phys;
 struct cdx_iface_ifinfo *ifstats_freelist;
 //free list for pppoe
 struct cdx_pppoe_iface_ifinfo *pppoe_ifstats_freelist;
+//flowtable-owned records published to a net device
+static LIST_HEAD(published_slots);
 
 extern void *FmMurambaseAddr;
 
@@ -262,6 +271,7 @@ int cdx_ft_ifstats_alloc(enum cdx_ft_stats_kind kind, struct cdx_ft_stats_slot *
 	if (!slot)
 		return -ENOMEM;
 	slot->kind = kind;
+	INIT_LIST_HEAD(&slot->published);
 	spin_lock(&dpa_statslist_lock);
 	if (!stats_mem) {
 		/* Deinit has returned the carve; there is nothing to index. */
@@ -317,6 +327,9 @@ void cdx_ft_ifstats_free(struct cdx_ft_stats_slot **out)
 		return;
 	*out = NULL;
 	spin_lock(&dpa_statslist_lock);
+	/* Withdrawn under the same lock the fold reads under, so a reader
+	 * finds the slot published or finds nothing; never a freed one. */
+	list_del_init(&slot->published);
 	/* Deinit may already have dropped the carve and both lists, in which
 	 * case there is no list to return this record to and nothing that
 	 * could hand it out again. */
@@ -372,6 +385,75 @@ void cdx_ft_ifstats_read(const struct cdx_ft_stats_slot *slot,
 			tx->packets = be32_to_cpu(record->txstats.pkts);
 		}
 	}
+}
+
+void cdx_ft_ifstats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
+			    unsigned int rx_overhead, unsigned int tx_overhead)
+{
+	if (!slot)
+		return;
+	spin_lock(&dpa_statslist_lock);
+	slot->ifindex = ifindex;
+	slot->rx_overhead = rx_overhead;
+	slot->tx_overhead = tx_overhead;
+	/* One device per slot: a republication moves it rather than listing
+	 * it twice, which would count the record twice into the new device. */
+	list_move_tail(&slot->published, &published_slots);
+	spin_unlock(&dpa_statslist_lock);
+}
+
+void cdx_ft_ifstats_unpublish(struct cdx_ft_stats_slot *slot)
+{
+	if (!slot)
+		return;
+	spin_lock(&dpa_statslist_lock);
+	list_del_init(&slot->published);
+	spin_unlock(&dpa_statslist_lock);
+}
+
+/* The framing the firmware counted and the device's own counter would not,
+ * taken off per packet. Saturating: a minimum-size frame is padded on the
+ * wire and the firmware counts the padding, so a stream of small frames can
+ * carry less payload than the overhead says, and a wrapped difference would
+ * report a byte count in the exabytes. */
+static u64 ifstats_restated(u64 bytes, u64 packets, unsigned int overhead)
+{
+	u64 framing = packets * overhead;
+
+	return bytes - min(bytes, framing);
+}
+
+void cdx_ifstats_fold(struct rtnl_link_stats64 *storage,
+		      u64 rx_bytes, u64 rx_packets, u64 tx_bytes, u64 tx_packets,
+		      unsigned int rx_overhead, unsigned int tx_overhead)
+{
+	storage->rx_packets += rx_packets;
+	storage->rx_bytes += ifstats_restated(rx_bytes, rx_packets, rx_overhead);
+	storage->tx_packets += tx_packets;
+	storage->tx_bytes += ifstats_restated(tx_bytes, tx_packets, tx_overhead);
+}
+
+void cdx_ft_ifstats_fold(const struct net_device *dev, struct rtnl_link_stats64 *storage)
+{
+	struct cdx_ft_stats_slot *slot;
+	struct cdx_ft_stats rx, tx;
+
+	/* Indices are per namespace and every record here is init_net's. */
+	if (!net_eq(dev_net(dev), &init_net))
+		return;
+	spin_lock(&dpa_statslist_lock);
+	/* A record outliving the carve names memory the driver no longer owns;
+	 * cdx_ft_ifstats_free() leaves such a slot published until the owner
+	 * returns it, so the guard belongs here. */
+	if (stats_mem)
+		list_for_each_entry(slot, &published_slots, published) {
+			if (slot->ifindex != dev->ifindex)
+				continue;
+			cdx_ft_ifstats_read(slot, &rx, &tx);
+			cdx_ifstats_fold(storage, rx.bytes, rx.packets, tx.bytes,
+					 tx.packets, slot->rx_overhead, slot->tx_overhead);
+		}
+	spin_unlock(&dpa_statslist_lock);
 }
 #endif
 

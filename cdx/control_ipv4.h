@@ -191,6 +191,14 @@ struct cdx_l2_encap {
 	 * to someone else and is exactly the aliasing this field replaces. */
 	U8 ingress_stats_index;
 	U8 egress_stats_index;
+	/* The same for each tag, indexed like ingress[] and egress[] -- innermost
+	 * first -- in the plain pool's units. A VLAN device's record counts what
+	 * the strip removed into its receive half and what the insert added into
+	 * its transmit half. Zero is again no record. The opcodes take all of a
+	 * stack's records or none: their list form has no way to skip one tag,
+	 * and naming index zero for it would count into someone else's. */
+	U8 ingress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
+	U8 egress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
 };
 
 int insert_entry_in_classif_table(PCtEntry entry);

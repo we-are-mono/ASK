@@ -207,11 +207,13 @@ what the flow rows carry in `in_ppp=`/`out_ppp=`, so the two can be joined, and
 `refs` is how many directions name the session — two for one connection across
 it.
 
-This does not extend to VLANs yet, but the mechanism does: the backend API
-names the shape of the record (`CDX_FT_STATS_TIMESTAMPED` for the timestamped
-records a session's opcodes read, `CDX_FT_STATS_PLAIN` for the ones a VLAN's
-would), not the feature, so a VLAN asks for a slot with the same call. See item
-9 of the [retirement roadmap](flowtable-cmm-porting-roadmap.md).
+The mechanism extends to VLANs, and item 9 did so: the backend API names the
+shape of the record (`CDX_FT_STATS_TIMESTAMPED` for the timestamped records a
+session's opcodes read, `CDX_FT_STATS_PLAIN` for the ones a VLAN's do), not the
+feature, so a VLAN device asks for a slot with the same call — and, unlike a
+session, has its record folded into its own `ip -s link` counters. The
+[interface counters guide](flowtable-statistics.md) has that design and why a
+session's record stays procfs-only for now.
 
 ## Retirement
 

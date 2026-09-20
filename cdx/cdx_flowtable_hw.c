@@ -56,6 +56,23 @@ static void ft_encap(const struct cdx_ft_vlan *stack, u8 count,
 	*num = count;
 }
 
+/* The record half each tag counts into, in the same reversed order. A tag
+ * with no slot leaves zero, which the header manipulations read as no record;
+ * they then emit no pointer for the stack at all, so one missing record costs
+ * the whole stack its counters rather than counting the rest into slot zero. */
+static void ft_encap_stats(struct cdx_ft_stats_slot *const *slots, u8 count,
+			   bool receive, U8 *indices)
+{
+	u8 i;
+
+	for (i = 0; i < count; i++) {
+		const struct cdx_ft_stats_slot *slot = slots[i];
+
+		if (slot)
+			indices[count - 1 - i] = receive ? slot->rx_index : slot->tx_index;
+	}
+}
+
 /* What this path will encode an egress to, which is the same set
  * cdx_ft_egress_supported() admits: an ethernet port, or a Wi-Fi VAP.
  *
@@ -220,6 +237,11 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 		encap.ingress_stats_index = stats->in_session->rx_index;
 	if (stats->out_session)
 		encap.egress_stats_index = stats->out_session->tx_index;
+	/* The same halves for each tag's VLAN device, reversed as the tags
+	 * themselves were: the binding is ordered like the rule and the
+	 * description like dpa_l2hdr_info. */
+	ft_encap_stats(stats->in_vlan, rule->in_vlans, true, encap.ingress_vlan_stats_index);
+	ft_encap_stats(stats->out_vlan, rule->out_vlans, false, encap.egress_vlan_stats_index);
 	/* The shared encoder reads this on its way to cdx_get_txfqid(), which
 	 * resolves the pair to a CEETM logical FQ and bakes that FQID into the
 	 * classifier action. Leaving it zero, as this backend did before, asks

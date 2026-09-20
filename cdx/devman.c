@@ -53,6 +53,7 @@
 #include "devman.h"
 #include "control_tx.h"
 #include "procfs.h"
+#include "cdx_flowtable_hw.h"
 
 //#define DEVMAN_DEBUG	1
 
@@ -3066,7 +3067,23 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 			storage->tx_bytes += cpu_to_be64(stats->txstats.bytes);
 			break;
 		} 
-		if(iface_info->if_flags & (IF_TYPE_TUNNEL | IF_TYPE_VLAN | IF_TYPE_ETHERNET)) {
+		if (iface_info->if_flags & IF_TYPE_ETHERNET) {
+			struct en_ehash_ifstats *stats = iface_info->stats;
+
+			/* The port's record: what UPDATE_ETH_RX_STATS counted on
+			 * ingress and the enqueue counted on egress, both as
+			 * whole frames. The driver's own rx_bytes excludes the
+			 * Ethernet header, so the record is restated to match
+			 * before the two are added; transmit already agrees. */
+			cdx_ifstats_fold(storage,
+					 be64_to_cpu(stats->rxstats.bytes),
+					 be32_to_cpu(stats->rxstats.pkts),
+					 be64_to_cpu(stats->txstats.bytes),
+					 be32_to_cpu(stats->txstats.pkts),
+					 CDX_IFSTATS_PORT_RX_OVERHEAD, 0);
+			break;
+		}
+		if(iface_info->if_flags & (IF_TYPE_TUNNEL | IF_TYPE_VLAN)) {
 			struct en_ehash_ifstats *stats;
 			//printk("%s::returning other iface stats\n", __func__);
 			stats = (struct en_ehash_ifstats *)iface_info->stats;
@@ -3076,11 +3093,16 @@ static void virt_iface_stats_callback(struct net_device *dev, struct rtnl_link_s
 			storage->tx_bytes += cpu_to_be64(stats->txstats.bytes);
 			break;
 		}
-		printk("%s::unknown iface type,no stats available\n", 
+		printk("%s::unknown iface type,no stats available\n",
 				__func__);
 		iface_info = iface_info->next;
 	}
 	spin_unlock(&dpa_devlist_lock);
+	/* The flowtable owner registers no logical interfaces, so its VLAN
+	 * devices are not on the list above; their records are published to the
+	 * device by index and folded here. Outside the device-list lock: the two
+	 * are independent, and nothing needs them nested. */
+	cdx_ft_ifstats_fold(dev, storage);
 }
 
 static void devman_deinit_linux_stats(void)

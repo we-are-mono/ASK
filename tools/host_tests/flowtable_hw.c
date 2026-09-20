@@ -61,6 +61,9 @@ struct cdx_l2_encap {
     /* Where each side counts. Zero means no record, never record zero. */
     u8 ingress_stats_index;
     u8 egress_stats_index;
+    /* And per tag, innermost first like the tags themselves. */
+    u8 ingress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
+    u8 egress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
 };
 /* The slot as CDX defines it. The encoder reads only the two indices, which
  * is the whole of what it needs from one. */
@@ -378,6 +381,19 @@ static void cdx_ft_ifstats_read(const struct cdx_ft_stats_slot *slot,
     ifstats_reads++;
     if (rx) *rx = (struct cdx_ft_stats){ .bytes = slot ? 4096 : 0 };
     if (tx) *tx = (struct cdx_ft_stats){ .bytes = slot ? 8192 : 0 };
+}
+/* Publication is the fold's business, exercised in the ifstats harness; the
+ * backend only has to pass it through under the transaction. */
+static unsigned ifstats_publications;
+static void cdx_ft_ifstats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
+                                   unsigned rx_overhead, unsigned tx_overhead)
+{
+    assert(slot == &ifstats_slot && ifstats_taken && ifindex);
+    ifstats_publications++;
+}
+static void cdx_ft_ifstats_unpublish(struct cdx_ft_stats_slot *slot)
+{
+    assert(!slot || slot == &ifstats_slot);
 }
 #include "hardware_production.inc"
 #include "backend_production.inc"

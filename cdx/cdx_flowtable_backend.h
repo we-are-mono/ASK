@@ -32,10 +32,18 @@ struct cdx_ft_hw;
 
 /* One 802.1Q tag. proto is the TPID in network byte order and id the 12-bit
  * VID. A flowtable rule describes neither priority nor DEI, so neither is
- * imposed and both are zero on the wire. */
+ * imposed and both are zero on the wire.
+ *
+ * ifindex names the VLAN device that adds or removes this tag, or is zero for
+ * a tag that comes from a vlan-aware bridge's own filtering and has no device
+ * behind it. Adapter state: the backend never reads it. It is what the
+ * interface counters are kept against, because `ip -s link` reads them off a
+ * device, and it is part of the rule so that a device recreated under the same
+ * VID reinstalls rather than being taken for the old one. */
 struct cdx_ft_vlan {
 	__be16 proto;
 	u16 id;
+	int ifindex;
 };
 
 /* One PPPoE session on a direction's path. present says the direction carries
@@ -257,6 +265,14 @@ enum cdx_ft_stats_kind {
 struct cdx_ft_stats_binding {
 	struct cdx_ft_stats_slot *in_session;
 	struct cdx_ft_stats_slot *out_session;
+	/* One per tag, indexed like the rule's in_vlan and out_vlan -- outermost
+	 * first. A VLAN device's slot is likewise one record for both directions:
+	 * the strip counts into its receive half and the insert into its transmit
+	 * half. NULL for a tag without a device or without a record; the encoder
+	 * then emits no pointer for the whole stack, because the opcodes' list
+	 * form cannot skip one tag. */
+	struct cdx_ft_stats_slot *in_vlan[CDX_FT_VLAN_MAX];
+	struct cdx_ft_stats_slot *out_vlan[CDX_FT_VLAN_MAX];
 };
 
 /* Process-context transactions serialize adapter state with CDX hardware
@@ -362,6 +378,20 @@ void cdx_ft_stats_free(struct cdx_ft_stats_slot **slot);
  * NULL slot reports zeroes, which is what a caller without one should show. */
 void cdx_ft_stats_read(const struct cdx_ft_stats_slot *slot,
 		       struct cdx_ft_stats *rx, struct cdx_ft_stats *tx);
+/* Have dev_get_stats() fold the slot's record into the counters of the
+ * init_net device with this index, so `ip -s link`, /proc/net/dev and every
+ * other reader of rtnl_link_stats64 see the traffic the hardware forwarded on
+ * that device's behalf. The overheads are what the firmware's byte count
+ * includes per packet and the device's own counters would not -- the firmware
+ * counts frames as they are on the wire, without the FCS -- and are subtracted
+ * so the two contributions to one counter agree on units. A slot is published
+ * to at most one device, and freeing it withdraws the publication. Withdrawing
+ * it earlier needs no transaction -- only the allocator's own spinlock -- so a
+ * netdev notifier may do it the moment the device goes; a NULL slot is
+ * tolerated by both. */
+void cdx_ft_stats_publish(struct cdx_ft_stats_slot *slot, int ifindex,
+			  unsigned int rx_overhead, unsigned int tx_overhead);
+void cdx_ft_stats_unpublish(struct cdx_ft_stats_slot *slot);
 void cdx_ft_stats(struct cdx_ft_hw *hw, struct cdx_ft_counters *stats);
 /* Always consumes *hw. -EAGAIN: unlinked storage awaits a barrier. -EIO:
  * unlink is unproven; CDX latches a terminal failure and must quiesce hardware.
