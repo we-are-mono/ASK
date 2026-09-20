@@ -176,44 +176,53 @@ The firmware counts bytes and packets into a record in the logical statistics
 area, and the two opcodes are what name the record: the insert counts what it
 encapsulated into the record's transmit half, the strip counts what it
 decapsulated into its receive half. So one record describes a **session**
-rather than either flow, and the adapter holds it that way — claimed when the
-first direction naming a session is admitted, released when the last retires,
-shared by every connection over that session.
+rather than either flow — and the adapter holds it for the **ppp device** the
+session runs on, which is where the counters are read: `ip -s link show ppp0`
+includes what the hardware forwarded through the session, restated into the
+payload bytes the ppp device itself counts. The
+[interface counters guide](flowtable-statistics.md) has the fold, the measured
+framing and the lifetime rules shared with the VLAN devices' records.
 
-The identity a record is keyed on is the whole of what the path walk resolved:
-the session id, the concentrator, and the device the session runs over. An id
-is allocated per concentrator and per client, so two sessions can carry the
-same one and only the three together name a session.
+Keying on the device rather than on the session identity is what makes the
+device's counters monotonic: a record that came and went with the flows would
+drop them back to zero every time the connection went idle. A ppp device
+carries one session at a time, and a session renegotiated under a device that
+stays is still that device's traffic. The identity the path walk resolved — the
+session id, the concentrator, the device the session runs over — is kept on the
+record for the `/proc` row, following the last direction admitted, so the row
+still joins with the flow rows.
 
 **The pool is four records deep and shared with the legacy owner.** It is the
 same `MAX_PPPoE_INTERFACES` carve a registered PPPoE interface allocates from,
-so a fifth session — or a fifth between the two owners — finds it empty. That
-is not a refusal: counters are observability and forwarding is the product, so
-the flow installs and forwards, the opcodes are given an index of zero, and the
-session carries no counters for its life. The answer a session gets is the
-answer it keeps; returning a record later does not retrofit one, because a live
-connection's counters beginning halfway through it would be worse than none.
+so a fifth ppp device — or a fifth between the two owners — finds it empty.
+That is not a refusal: counters are observability and forwarding is the
+product, so the flow installs and forwards, the opcodes are given an index of
+zero, and the device carries no counters for as long as it has the record. The
+answer a device gets is the answer it keeps; returning a record later does not
+retrofit one, because a live connection's counters beginning halfway through it
+would be worse than none.
 
 Which is why the degradation is visible rather than silent. `/proc/cdx_flowtable`
 carries `session_records` and `session_slots` in the header and one `session`
-row per session with live flows:
+row per ppp device with a record:
 
 ```
-session pppoe=1@00:11:22:33:44:55 lower=7 refs=2 slot=yes rx_packets=… rx_bytes=… tx_packets=… tx_bytes=…
+session dev=ppp0 ifindex=18 pppoe=1@00:11:22:33:44:55 lower=7 refs=2 slot=yes rx_packets=… rx_bytes=… tx_packets=… tx_bytes=…
 ```
 
-`slot=none` is a session the pool had nothing for. `pppoe=` repeats exactly
+`slot=none` is a device the pool had nothing for. `pppoe=` repeats exactly
 what the flow rows carry in `in_ppp=`/`out_ppp=`, so the two can be joined, and
-`refs` is how many directions name the session — two for one connection across
-it.
+`refs` is how many directions currently name the record — two for one
+connection across it, zero for a device whose connections have all gone and
+whose totals are waiting for the next. The numbers are the firmware's own, whole
+frames less the headers already handled; the device's `ip -s link` shows them
+restated.
 
-The mechanism extends to VLANs, and item 9 did so: the backend API names the
+The mechanism is one design for every encapsulation: the backend API names the
 shape of the record (`CDX_FT_STATS_TIMESTAMPED` for the timestamped records a
 session's opcodes read, `CDX_FT_STATS_PLAIN` for the ones a VLAN's do), not the
-feature, so a VLAN device asks for a slot with the same call — and, unlike a
-session, has its record folded into its own `ip -s link` counters. The
-[interface counters guide](flowtable-statistics.md) has that design and why a
-session's record stays procfs-only for now.
+feature, so a VLAN device asks for a slot with the same call and is folded the
+same way.
 
 ## Retirement
 
@@ -242,10 +251,13 @@ the two header manipulations and `apply_l2_encap()` against the shipped SDK
 header, including the session-id byte order — which the legacy control path
 reaches by applying `htons()` twice, so it is worth stating — and the index
 each opcode takes from the description. `tools/host_tests/flowtable.c::test_pppoe_stats`
-covers the ownership: one record per session rather than per flow or per
-direction, the same record found by identity for a second connection, the
-record returned only when the last reference is, a fifth session admitted
-without one, and the index of zero the encoder is then given.
+covers the ownership: one record per ppp device rather than per flow or per
+direction, the same record found for a second connection and for a session
+renegotiated under the same device, the record kept with its slot when the
+last direction retires and freed only when the device goes, the receive
+framing growing by the tag a session runs over, a device the pool has nothing
+for admitted without a slot and keeping that answer, and the index of zero the
+encoder is then given.
 `tools/host_tests/ifstats.c` covers the allocator underneath that — the two
 pools' geometry, the index each record yields against the address it names,
 exhaustion, reuse and the lifetime of a record across deinit — because an index

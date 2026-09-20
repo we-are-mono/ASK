@@ -550,7 +550,6 @@ static u32 ft_hash_seed;
 static LIST_HEAD(ft_neigh_entries);
 static bool ft_watch_lock;
 static LIST_HEAD(ft_block_list);
-static LIST_HEAD(ft_session_stats);
 static LIST_HEAD(ft_dev_stats);
 static bool ft_dev_stats_lock;
 static void drop_dev_records(void);
@@ -2396,6 +2395,7 @@ static void test_pppoe(void)
     ft_device_retire(&ppp, &ft_link_invalidations);
     assert(handle.invalid && ft_link_invalidations == links + 1);
     ft_retire_workfn(NULL);
+    drop_dev_records();
     assert(!ft_count && !ppp.refs && !out.refs && !allocated);
     assert(ft_neigh_entries.next == &ft_neigh_entries);
 
@@ -2411,6 +2411,7 @@ static void test_pppoe(void)
     cls.command = FLOW_CLS_REPLACE;
     assert(ft_remove(entry) == 0 && !ft_count);
     cdx_ft_end();
+    drop_dev_records();
     assert(!ppp.refs && !out.refs && !allocated);
 }
 
@@ -2428,220 +2429,6 @@ static void session_rule(unsigned long cookie, u16 sport, u16 sid, int lower_ifi
     egress_session.id = sid;
     egress_session.lower_ifindex = lower_ifindex;
     rule.action.entries[4].pppoe.sid = sid;
-}
-
-static struct cdx_ft_session_stats *only_record(void)
-{
-    assert(ft_session_stats.next != &ft_session_stats);
-    assert(ft_session_stats.next->next == &ft_session_stats);
-    return list_entry(ft_session_stats.next, struct cdx_ft_session_stats, list);
-}
-
-static unsigned record_count(void)
-{
-    struct cdx_ft_session_stats *record;
-    unsigned n = 0;
-
-    list_for_each_entry(record, &ft_session_stats, list) n++;
-    return n;
-}
-
-/* Interface-level counters for a session: one record per session rather than
- * per flow or per direction, claimed when the first direction naming it is
- * admitted and returned when the last retires. The firmware pool is four
- * records deep and shared with the legacy owner, so running out is an expected
- * outcome and not a failure -- the flow installs and forwards, and the record
- * says it is counting nowhere so the degradation can be seen.
- *
- * Admission and removal run inside the backend transaction the rule callback
- * holds, which is what serializes the record list as well; the fixtures do not
- * touch it, so it is held across the whole of this.
- */
-static void test_pppoe_stats(void)
-{
-    struct cdx_ft_entry *first, *second;
-    struct cdx_ft_stats rx, tx;
-    unsigned allocations, frees;
-
-    cdx_ft_begin();
-    assert(!stats_in_use() && record_count() == 0);
-    allocations = stats_allocations;
-
-    /* First admission of a session claims a record, and the index the encoder
-     * was handed is the transmit half of that record -- never zero, which is
-     * the index of somebody else's. */
-    pppoe_out_fixture();
-    session_rule(1, 10000, 0x1234, out.ifindex);
-    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
-    assert(stats_in_use() == 1 && stats_allocations == allocations + 1);
-    first = ft_find(&binding, 1);
-    assert(first && first->out_stats && !first->in_stats);
-    assert(first->out_stats->refs == 1 && first->out_stats->slot);
-    assert(observed_out_stats == first->out_stats->slot->tx_index);
-    assert(observed_out_stats && !observed_in_stats);
-    assert(record_count() == 1);
-
-    /* Read-back. A fresh record has counted nothing; what the firmware puts
-     * there is reported per half; and a session with no record reads as
-     * zeroes rather than as an error, which is what it has to show. */
-    cdx_ft_stats_read(first->out_stats->slot, &rx, &tx);
-    assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
-    first->out_stats->slot->tx = (struct cdx_ft_stats){ .bytes = 4096, .packets = 32 };
-    cdx_ft_stats_read(first->out_stats->slot, &rx, &tx);
-    assert(tx.packets == 32 && tx.bytes == 4096 && !rx.packets && !rx.bytes);
-    cdx_ft_stats_read(NULL, &rx, &tx);
-    assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
-
-    /* A second connection over the same session shares that record: one slot,
-     * two references. The identity decides, so a flow differing only in its
-     * ports finds the record the first one created. */
-    session_rule(2, 10001, 0x1234, out.ifindex);
-    assert(ft_replace(&binding, &cls) == 0 && ft_count == 2);
-    second = ft_find(&binding, 2);
-    assert(second && second->out_stats == first->out_stats);
-    assert(first->out_stats->refs == 2);
-    assert(stats_in_use() == 1 && record_count() == 1);
-
-    /* The record returns only when the last reference does. */
-    frees = stats_frees;
-    assert(ft_remove(first) == 0 && ft_count == 1);
-    assert(stats_in_use() == 1 && stats_frees == frees && record_count() == 1);
-    assert(second->out_stats->refs == 1);
-    assert(ft_remove(second) == 0 && !ft_count);
-    assert(!stats_in_use() && stats_frees == frees + 1 && record_count() == 0);
-
-    /* The same id reached through a different concentrator is a different
-     * session and takes a record of its own: an id is allocated per
-     * concentrator, so it identifies nothing on its own. */
-    pppoe_out_fixture();
-    session_rule(5, 10004, 0x1234, out.ifindex);
-    assert(ft_replace(&binding, &cls) == 0);
-    session_rule(6, 10005, 0x1234, out.ifindex);
-    egress_session.h_dest[5]++;
-    assert(ft_replace(&binding, &cls) == 0 && ft_count == 2);
-    assert(record_count() == 2 && stats_in_use() == 2);
-    assert(ft_find(&binding, 5)->out_stats != ft_find(&binding, 6)->out_stats);
-    assert(ft_remove(ft_find(&binding, 5)) == 0);
-    assert(ft_remove(ft_find(&binding, 6)) == 0 && !ft_count);
-    assert(!stats_in_use() && record_count() == 0);
-
-    /* All three parts of the identity, including the device -- which
-     * admission alone cannot vary here, because a lower device that is not
-     * the port itself brings a tag with it and a different rule. */
-    {
-        struct cdx_ft_session key = { .present = true, .id = 7, .lower_ifindex = 11 };
-        struct cdx_ft_session other;
-        struct cdx_ft_session_stats *record, *found;
-
-        memcpy(key.mac, AC_MAC, ETH_ALEN);
-        record = ft_session_stats_get(&key);
-        assert(record && record_count() == 1 && record->refs == 1);
-        other = key;
-        found = ft_session_stats_get(&other);
-        assert(found == record && record->refs == 2);
-        ft_session_stats_put(&found);
-        for (unsigned part = 0; part < 3; part++) {
-            other = key;
-            if (part == 0) other.id++;
-            else if (part == 1) other.lower_ifindex++;
-            else other.mac[5]++;
-            found = ft_session_stats_get(&other);
-            assert(found && found != record && record_count() == 2);
-            ft_session_stats_put(&found);
-            assert(record_count() == 1);
-        }
-        /* And a direction with no session claims nothing to begin with. */
-        other = (struct cdx_ft_session){};
-        assert(!ft_session_stats_get(&other) && record_count() == 1);
-        ft_session_stats_put(&record);
-        assert(record_count() == 0 && !stats_in_use());
-    }
-
-    /* Exhaustion. Four sessions take the pool; the fifth is admitted and
-     * forwards holding a record with no slot, which the encoder is told by an
-     * index of zero rather than by being handed an index at all. */
-    pppoe_out_fixture();
-    for (unsigned i = 0; i < STATS_TIMESTAMPED_SLOTS; i++) {
-        session_rule(10 + i, (u16)(11000 + i), (u16)(0x2000 + i), out.ifindex);
-        assert(ft_replace(&binding, &cls) == 0);
-        assert(observed_out_stats);
-    }
-    assert(stats_in_use() == STATS_TIMESTAMPED_SLOTS);
-    session_rule(20, 12000, 0x3000, out.ifindex);
-    assert(ft_replace(&binding, &cls) == 0);
-    assert(ft_count == STATS_TIMESTAMPED_SLOTS + 1);
-    first = ft_find(&binding, 20);
-    assert(first && first->out_stats && !first->out_stats->slot);
-    assert(!observed_out_stats);
-    /* The record exists and counts references either way, so the session is
-     * reported as one without a slot rather than not reported at all. */
-    assert(record_count() == STATS_TIMESTAMPED_SLOTS + 1);
-    assert(first->out_stats->refs == 1);
-    for (unsigned i = 0; i < STATS_TIMESTAMPED_SLOTS; i++)
-        assert(ft_remove(ft_find(&binding, 10 + i)) == 0);
-    /* Returning four slots does not retrofit one. The answer a session got is
-     * the answer it keeps, so a live connection's counters never begin
-     * halfway through its life. */
-    assert(!stats_in_use() && first->out_stats && !first->out_stats->slot);
-    assert(ft_remove(first) == 0 && !ft_count && record_count() == 0);
-
-    /* And the pool is reusable once returned. */
-    pppoe_out_fixture();
-    session_rule(30, 13000, 0x4000, out.ifindex);
-    assert(ft_replace(&binding, &cls) == 0);
-    assert(stats_in_use() == 1 && only_record()->slot);
-    assert(ft_remove(ft_find(&binding, 30)) == 0);
-    assert(!stats_in_use() && record_count() == 0);
-
-    /* An allocation failing for any other reason lands in the same place: the
-     * flow installs, counts nowhere, and holds a record saying so. */
-    stats_alloc_fail = -ENOMEM;
-    session_rule(31, 13001, 0x4001, out.ifindex);
-    assert(ft_replace(&binding, &cls) == 0 && !observed_out_stats);
-    assert(record_count() == 1 && !only_record()->slot);
-    stats_alloc_fail = 0;
-    assert(ft_remove(ft_find(&binding, 31)) == 0);
-    assert(!stats_in_use() && record_count() == 0);
-
-    /* A flow whose hardware installation fails releases its reference with
-     * everything else, rather than stranding one of four records. */
-    session_rule(32, 13002, 0x4002, out.ifindex);
-    hardware_fail = true;
-    assert(ft_replace(&binding, &cls) == -EIO && !ft_count);
-    hardware_fail = false;
-    assert(!stats_in_use() && record_count() == 0);
-
-    /* A record has two halves and the direction decides which one is counted
-     * into: a direction that strips counts received frames, one that inserts
-     * counts transmitted ones. The two halves of a connection therefore
-     * describe the session between them, which is the whole reason the record
-     * belongs to the session rather than to either flow. */
-    cdx_ft_end();
-    pppoe_in_fixture();
-    cdx_ft_begin();
-    /* Not session_rule(): that one names an egress session, and naming one
-     * here would be a session the walk never crosses. The ingress fixture has
-     * already described this direction's. */
-    cls.cookie = 40;
-    cls.stats = (struct flow_stats){0};
-    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
-    first = ft_find(&binding, 40);
-    assert(first && first->in_stats && !first->out_stats);
-    assert(first->in_stats->slot && first->in_stats->refs == 1);
-    assert(observed_in_stats == first->in_stats->slot->rx_index && !observed_out_stats);
-    assert(first->in_stats->slot->rx_index != first->in_stats->slot->tx_index);
-    assert(ft_remove(first) == 0 && !ft_count);
-    assert(!stats_in_use() && record_count() == 0);
-
-    /* A flow with no session claims nothing at all. */
-    cdx_ft_end();
-    fixture();
-    cdx_ft_begin();
-    assert(ft_replace(&binding, &cls) == 0);
-    assert(!stats_in_use() && record_count() == 0);
-    assert(!observed_in_stats && !observed_out_stats);
-    assert(ft_remove(ft_find(&binding, cls.cookie)) == 0 && !ft_count);
-    cdx_ft_end();
 }
 
 static unsigned dev_record_count(void)
@@ -2670,6 +2457,229 @@ static void device_unregistered(struct net_device *dev)
     ft_netdev_event(NULL, NETDEV_UNREGISTER, &info);
     /* The invalidation a used device raises is another case's business. */
     ft_invalid = 0;
+}
+
+static unsigned session_record_count(void)
+{
+    struct cdx_ft_dev_stats *record;
+    unsigned n = 0;
+
+    list_for_each_entry(record, &ft_dev_stats, list)
+        n += record->kind == CDX_FT_STATS_TIMESTAMPED;
+    return n;
+}
+
+/* Interface-level counters for a ppp device: one timestamped record per
+ * device, claimed by the first direction crossing its session and kept for the
+ * device's life, published to the device with the session's framing. The
+ * firmware pool is four records deep and shared with the legacy owner, so
+ * running out is an expected outcome and not a failure -- the flow installs
+ * and forwards, and the record says it is counting nowhere so the degradation
+ * can be seen.
+ *
+ * Admission and removal run inside the backend transaction the rule callback
+ * holds, which is what serializes the record list as well; the fixtures do not
+ * touch it, so it is held across each section. Dropping the records between
+ * sections stands in for the devices going away.
+ */
+static void test_pppoe_stats(void)
+{
+    struct cdx_ft_entry *first, *second;
+    struct cdx_ft_dev_stats *record;
+    struct cdx_ft_stats rx, tx;
+    unsigned allocations, frees;
+
+    cdx_ft_begin();
+    assert(!stats_in_use() && !dev_record_count());
+    allocations = stats_allocations;
+
+    /* First admission of a session claims the ppp device's record, publishes
+     * it to that device with the PPPoE framing, and hands the encoder the
+     * transmit half's index -- never zero, which is somebody else's. */
+    pppoe_out_fixture();
+    session_rule(1, 10000, 0x1234, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    assert(stats_in_use() == 1 && stats_allocations == allocations + 1);
+    first = ft_find(&binding, 1);
+    assert(first && first->out_stats && !first->in_stats);
+    record = first->out_stats;
+    assert(record == dev_record(ppp.ifindex) && record->kind == CDX_FT_STATS_TIMESTAMPED);
+    assert(record->refs == 1 && record->slot && record->slot->kind == CDX_FT_STATS_TIMESTAMPED);
+    assert(record->slot->published_ifindex == ppp.ifindex);
+    /* The strip counts the frame less the session header alone -- the tags
+     * under the session, none here, stay in -- and the insert has put the
+     * session header on; the device counts the payload alone. */
+    assert(record->slot->published_rx_overhead == ft_ppp_rx_overhead(0));
+    assert(record->slot->published_tx_overhead == FT_PPP_TX_OVERHEAD);
+    assert(ft_ppp_rx_overhead(0) == ETH_HLEN && ft_ppp_rx_overhead(1) == ETH_HLEN + VLAN_HLEN);
+    assert(FT_PPP_TX_OVERHEAD == ETH_HLEN + PPPOE_SES_HLEN);
+    assert(observed_out_stats == record->slot->tx_index);
+    assert(observed_out_stats && !observed_in_stats);
+    assert(session_record_count() == 1 && dev_record_count() == 1);
+    /* The row carries the session the walk resolved, in full. */
+    assert(record->session.present && record->session.id == 0x1234);
+    assert(record->session.lower_ifindex == out.ifindex);
+    assert(!memcmp(record->session.mac, AC_MAC, ETH_ALEN));
+
+    /* Read-back. A fresh record has counted nothing; what the firmware puts
+     * there is reported per half; and a device with no record reads as zeroes
+     * rather than as an error, which is what it has to show. */
+    cdx_ft_stats_read(record->slot, &rx, &tx);
+    assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
+    record->slot->tx = (struct cdx_ft_stats){ .bytes = 4096, .packets = 32 };
+    cdx_ft_stats_read(record->slot, &rx, &tx);
+    assert(tx.packets == 32 && tx.bytes == 4096 && !rx.packets && !rx.bytes);
+    cdx_ft_stats_read(NULL, &rx, &tx);
+    assert(!rx.packets && !rx.bytes && !tx.packets && !tx.bytes);
+
+    /* A second connection over the same device shares the record: one slot,
+     * two references. */
+    session_rule(2, 10001, 0x1234, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 2);
+    second = ft_find(&binding, 2);
+    assert(second && second->out_stats == record && record->refs == 2);
+    assert(stats_in_use() == 1 && session_record_count() == 1);
+
+    /* A session renegotiated under a device that stays is that device's
+     * traffic: a different id on the same ppp device finds the same record,
+     * and the row follows the newest direction. */
+    session_rule(3, 10002, 0x1235, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 3);
+    assert(ft_find(&binding, 3)->out_stats == record && record->refs == 3);
+    assert(record->session.id == 0x1235 && session_record_count() == 1);
+
+    /* The record outlives its flows: retiring them returns the references
+     * and nothing else, so the device's totals survive a connection going
+     * idle, and the next one finds the same record and the same slot. */
+    frees = stats_frees;
+    assert(ft_remove(first) == 0 && record->refs == 2);
+    assert(ft_remove(second) == 0 && ft_remove(ft_find(&binding, 3)) == 0 && !ft_count);
+    assert(record->refs == 0 && !record->gone && stats_frees == frees);
+    assert(stats_in_use() == 1 && session_record_count() == 1);
+    assert(dev_record(ppp.ifindex) == record && record->slot);
+    {
+        struct cdx_ft_stats_slot *slot = record->slot;
+
+        session_rule(4, 10003, 0x1236, out.ifindex);
+        assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+        assert(ft_find(&binding, 4)->out_stats == record && record->refs == 1);
+        assert(record->slot == slot && record->session.id == 0x1236);
+        assert(ft_remove(ft_find(&binding, 4)) == 0 && !ft_count && record->refs == 0);
+    }
+
+    /* Only the device going frees it -- here with nothing naming it, so the
+     * reaper does the freeing -- and a new device under the same index then
+     * starts a record of its own. */
+    cdx_ft_end();
+    dev_stats_scheduled = 0;
+    device_unregistered(&ppp);
+    assert(dev_stats_scheduled == 1);
+    ft_dev_stats_reap(NULL);
+    cdx_ft_begin();
+    assert(!dev_record_count() && !stats_in_use() && stats_frees == frees + 1);
+
+    /* Exhaustion. The pool has nothing: the device's record exists and says
+     * so, the encoder is told there is none, and the flow installs regardless.
+     * Returning a slot later does not retrofit one -- the answer a device got
+     * is the answer it keeps, so a live connection's counters never begin
+     * halfway through its life -- and the record, slotless, still outlives its
+     * flows. */
+    pppoe_out_fixture();
+    stats_alloc_fail = -ENOSPC;
+    session_rule(20, 12000, 0x3000, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    stats_alloc_fail = 0;
+    first = ft_find(&binding, 20);
+    record = first->out_stats;
+    assert(record && !record->slot && record->refs == 1 && !observed_out_stats);
+    assert(session_record_count() == 1 && !stats_in_use());
+    session_rule(21, 12001, 0x3000, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 2);
+    assert(ft_find(&binding, 21)->out_stats == record && !record->slot && !observed_out_stats);
+    assert(ft_remove(first) == 0 && ft_remove(ft_find(&binding, 21)) == 0 && !ft_count);
+    assert(dev_record(ppp.ifindex) == record && !record->slot && !record->refs);
+    /* Gone and unreferenced, it is reaped like any other; the device that
+     * comes back under the index gets a slot if the pool has one. This one
+     * runs its session over a VLAN device, the shape the bench has: the tag
+     * under the session stays in what the strip counts, so the device's
+     * receive framing grows by it, and the tag's own record sits alongside. */
+    cdx_ft_end();
+    device_unregistered(&ppp);
+    ft_dev_stats_reap(NULL);
+    cdx_ft_begin();
+    assert(!dev_record_count());
+    pppoe_out_fixture();
+    /* The session's push is named before the tag's is inserted ahead of it. */
+    session_rule(22, 12002, 0x3001, out_tag.ifindex);
+    encap_actions(0, (const u16[]){ 100 }, 1);
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    first = ft_find(&binding, 22);
+    record = first->out_stats;
+    assert(stats_in_use() == 1 && record && record->slot);
+    assert(record->slot->published_rx_overhead == ETH_HLEN + VLAN_HLEN);
+    assert(record->slot->published_tx_overhead == FT_PPP_TX_OVERHEAD);
+    assert(observed_out_stats == record->slot->tx_index);
+    assert(first->out_vlan_stats[0] && first->out_vlan_stats[0]->ifindex == out_tag.ifindex);
+    assert(plain_in_use() == 1 && dev_record_count() == 2);
+    assert(ft_remove(first) == 0 && !ft_count);
+
+    /* An allocation failing for any other reason lands in the same place: the
+     * flow installs, counts nowhere, and holds a record saying so. */
+    cdx_ft_end();
+    drop_dev_records();
+    pppoe_out_fixture();
+    cdx_ft_begin();
+    stats_alloc_fail = -ENOMEM;
+    session_rule(31, 13001, 0x4001, out.ifindex);
+    assert(ft_replace(&binding, &cls) == 0 && !observed_out_stats);
+    assert(session_record_count() == 1 && !dev_record(ppp.ifindex)->slot);
+    stats_alloc_fail = 0;
+    assert(ft_remove(ft_find(&binding, 31)) == 0 && !ft_count);
+
+    /* A flow whose hardware installation fails releases its reference with
+     * everything else. */
+    session_rule(32, 13002, 0x4002, out.ifindex);
+    hardware_fail = true;
+    assert(ft_replace(&binding, &cls) == -EIO && !ft_count);
+    hardware_fail = false;
+    assert(dev_record(ppp.ifindex) && !dev_record(ppp.ifindex)->refs);
+
+    /* A record has two halves and the direction decides which one is counted
+     * into: a direction that strips counts received frames, one that inserts
+     * counts transmitted ones. The two halves of a connection therefore
+     * describe the device between them. The ingress fixture's session runs on
+     * another ppp device, which gets a record of its own. */
+    cdx_ft_end();
+    drop_dev_records();
+    pppoe_in_fixture();
+    cdx_ft_begin();
+    /* Not session_rule(): that one names an egress session, and naming one
+     * here would be a session the walk never crosses. The ingress fixture has
+     * already described this direction's. */
+    cls.cookie = 40;
+    cls.stats = (struct flow_stats){0};
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1);
+    first = ft_find(&binding, 40);
+    assert(first && first->in_stats && !first->out_stats);
+    record = first->in_stats;
+    assert(record == dev_record(in_ppp.ifindex) && record->slot && record->refs == 1);
+    assert(record->slot->published_ifindex == in_ppp.ifindex);
+    assert(observed_in_stats == record->slot->rx_index && !observed_out_stats);
+    assert(record->slot->rx_index != record->slot->tx_index);
+    assert(record->session.present && record->session.id == SESSION_ID + 1);
+    assert(ft_remove(first) == 0 && !ft_count);
+    assert(stats_in_use() == 1 && session_record_count() == 1 && !record->refs);
+
+    /* A flow with no session claims nothing at all. */
+    cdx_ft_end();
+    drop_dev_records();
+    fixture();
+    cdx_ft_begin();
+    assert(ft_replace(&binding, &cls) == 0);
+    assert(!stats_in_use() && !dev_record_count());
+    assert(!observed_in_stats && !observed_out_stats);
+    assert(ft_remove(ft_find(&binding, cls.cookie)) == 0 && !ft_count);
+    cdx_ft_end();
 }
 
 /* The VLAN device records: one per device the tags of a flow belong to, held
@@ -2748,7 +2758,8 @@ static void test_vlan_stats(void)
      * unregistration retired the flow's handle, so this claims directly, as
      * the install of a flow on the new device would. */
     {
-        struct cdx_ft_dev_stats *fresh = ft_dev_stats_get(out_tag.ifindex);
+        struct cdx_ft_dev_stats *fresh = ft_dev_stats_get(out_tag.ifindex,
+                                                          CDX_FT_STATS_PLAIN, NULL, 0);
 
         assert(fresh && fresh != record && !fresh->gone && fresh->refs == 1);
         assert(fresh->slot && fresh->slot != record->slot);

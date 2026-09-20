@@ -838,15 +838,26 @@ async def test_flowtable_pppoe_ipv6_routed(pppoe_rig):
                                    "observed": sorted(r.echo6.sources)})
 
 
-async def test_flowtable_pppoe_session_counters(pppoe_rig):
-    """The session's own byte counters, which the firmware keeps for it.
+async def _ppp_link(r):
+    link = json.loads((await command(r.target, r.session, "ip", "-s", "-j", "link", "show",
+                                     "dev", r.ppp_if))["stdout"])[0]["stats64"]
+    return {"rx_packets": link["rx"]["packets"], "rx_bytes": link["rx"]["bytes"],
+            "tx_packets": link["tx"]["packets"], "tx_bytes": link["tx"]["bytes"]}
 
-    One record per session, not per flow and not per direction: both halves of
-    this connection name the same session, so the record carries two
+
+async def test_flowtable_pppoe_session_counters(pppoe_rig):
+    """The session's own byte counters, which the firmware keeps for it, and
+    where an operator reads them: on the ppp device.
+
+    One record per ppp device, not per flow and not per direction: both halves
+    of this connection cross the same device, so the record carries two
     references and the two directions count into its two halves. Sending a
     measured burst and requiring the record to have moved by it is what
     separates counters the firmware is really maintaining from an index that
-    was merely written into an opcode.
+    was merely written into an opcode; requiring `ip -s link` on the device to
+    have moved by the same burst, restated into the payload the device itself
+    counts, is what makes the record an operator's number rather than a
+    diagnostic.
     """
     r = pppoe_rig
     await r.table()
@@ -855,34 +866,52 @@ async def test_flowtable_pppoe_session_counters(pppoe_rig):
     state = await r.state()
     row = _session_row(state, r.session_identity)
     # Held by both directions of the one connection, and holding a record:
-    # the pool is empty only after four sessions, and this bench has one.
+    # the pool is empty only after four sessions, and this bench has one. The
+    # record is the device's, and says which device.
     assert row["refs"] == "2", row
     assert row["slot"] == "yes", row
+    assert row["dev"] == r.ppp_if, row
     assert state["session_records"] == 1 and state["session_slots"] == 1, state
     before = {k: int(row[k]) for k in
               ("rx_packets", "rx_bytes", "tx_packets", "tx_bytes")}
+    link_before = await _ppp_link(r)
 
     payload = 256
+    ip_len = 20 + 8 + payload
     await r.exchange(count=64, payload_size=payload)
     row = _session_row(await r.state(), r.session_identity)
+    link_after = await _ppp_link(r)
     after = {k: int(row[k]) for k in before}
     delta = {k: after[k] - before[k] for k in before}
+    link = {k: link_after[k] - link_before[k] for k in before}
     # Transmitted frames are the ones this direction inserted a header onto
     # and received ones are those the other direction stripped from, so a
     # symmetric exchange moves both halves by the burst.
     assert delta["tx_packets"] == 64 and delta["rx_packets"] == 64, (before, after)
-    # Bytes are the firmware's own accounting rather than a number this test
-    # can predict exactly, so require them to have moved by at least the
-    # payload and no more than a full frame's worth of overhead per packet.
-    for half in ("rx_bytes", "tx_bytes"):
-        assert payload * 64 <= delta[half] <= (payload + 64) * 64, (half, delta)
-    r.record("pppoe-session-counters", {"before": before, "after": after,
-                                        "delta": delta, "row": row})
-    # The record belongs to the session, so retiring the connection returns it
-    # and the session stops being reported at all.
+    # The firmware's session record, measured on this bench and pinned here:
+    # the strip counts the frame as it arrived less the session header alone,
+    # so the WAN tag the session runs over is still in; the insert counts the
+    # frame with the session header on and no tag yet.
+    assert delta["rx_bytes"] == 64 * (ip_len + 14 + 4), delta
+    assert delta["tx_bytes"] == 64 * (ip_len + 14 + 8), delta
+    # The device counts the payload alone, both ways, and its counters now
+    # include the burst restated to exactly that -- plus the few frames the
+    # session itself exchanges meanwhile (LCP echoes), each at most one frame.
+    for half in ("rx", "tx"):
+        stray = link[f"{half}_packets"] - 64
+        assert 0 <= stray <= 8, (half, link)
+        assert 64 * ip_len <= link[f"{half}_bytes"] <= 64 * ip_len + stray * 1518, (half, link)
+    r.record("pppoe-session-counters", {"before": before, "after": after, "delta": delta,
+                                        "row": row, "link": link})
+    # The record belongs to the device rather than to the flows: retiring the
+    # connection returns the references and keeps the record and its totals,
+    # so the device's counters survive the connection going idle.
     await r.delete_table()
     state = await r.state()
-    assert state["session_records"] == 0 and not state["sessions"], state
+    row = _session_row(state, r.session_identity)
+    assert row["refs"] == "0" and row["slot"] == "yes", row
+    assert state["session_records"] == 1 and state["session_slots"] == 1, state
+    assert {k: int(row[k]) for k in after} == after, (row, after)
 
 
 async def test_flowtable_pppoe_snat(pppoe_rig):

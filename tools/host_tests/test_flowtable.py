@@ -39,14 +39,14 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
         + source[source.index("struct cdx_ft_binding {"):source.index("static LIST_HEAD")]
         # The framing a VLAN device's record is published with, as the
         # adapter defines it: the cases below assert the published values.
-        + "\n".join(re.findall(r"^#define FT_VLAN_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
+        + "\n".join(re.findall(r"^#define FT_(?:VLAN|PPP)_[RT]X_OVERHEAD\s.*$", source, re.M)) + "\n"
     )
     names = ["ft_fault", "ft_devices_hold", "ft_devices_put",
              "ft_find", "ft_handle_invalidate", "ft_neigh_invalidate", "ft_neigh_matches",
              "ft_neigh_table", "ft_neigh_check", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
-             "ft_session_stats_get", "ft_session_stats_put", "ft_dev_stats_release",
+             "ft_ppp_rx_overhead", "ft_dev_stats_release",
              "ft_dev_stats_get", "ft_dev_stats_put", "ft_dev_stats_gone",
              "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",

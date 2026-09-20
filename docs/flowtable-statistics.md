@@ -34,14 +34,28 @@ count into them.
   needed a registered VLAN interface to allocate against. The flowtable owner
   registers none, so until now it emitted no pointer at all for a tag — the
   same suppression the bridge path uses for tags with no device behind them.
+- `STRIP_PPPoE_HDR` and `INSERT_PPPoE_HDR` take one pointer each, into a
+  timestamped record. This is where a **ppp device's** counters come from; the
+  [PPPoE increment](flowtable-pppoe.md) already claimed the record, keyed on the
+  session, and read it back through `/proc/cdx_flowtable` alone.
 
-The adapter now allocates one plain record per VLAN device a flow's tag stack
-crosses (`struct cdx_ft_dev_stats` in `cdx/ask_flowtable.c`), the same call a
-PPPoE session uses for its timestamped one. The path walk that derives the tag
-stack records which device each tag belongs to (`cdx_ft_vlan.ifindex`, zero for
-a tag a vlan-aware bridge adds with no device of its own), the binding carries
-one slot per tag to the encoder, and the two opcodes take their pointers from
-the flow's description rather than from an interface lookup.
+The adapter holds one record per logical device a flow's encapsulation crosses
+(`struct cdx_ft_dev_stats` in `cdx/ask_flowtable.c`): a plain one for each VLAN
+device in the tag stack, a timestamped one for the ppp device a session runs
+on. The path walk that derives the tag stack records which device each tag
+belongs to (`cdx_ft_vlan.ifindex`, zero for a tag a vlan-aware bridge adds with
+no device of its own); the ppp device is the direction's logical device
+whenever it carries a session, because the walk takes the session hop only from
+a device of that type. The binding carries one slot per tag and one per session
+to the encoder, and the opcodes take their pointers from the flow's description
+rather than from an interface lookup.
+
+Keying the session's record on the ppp device rather than on the session
+itself is what the fold needs and what the reader means: a ppp device carries
+one session at a time, and a session renegotiated under a device that stays is
+still that device's traffic. The `/proc` row keeps the session identity the
+walk resolved — id, concentrator, the device it runs over — following the last
+direction admitted, so it still joins with the flow rows.
 
 ### Read-back
 
@@ -63,28 +77,36 @@ finds a slot published with a live record or finds nothing.
 
 ### Lifetime
 
-A VLAN device's record lives as long as the device, not as long as its flows.
-A slot returned to the pool is zeroed when handed out again, so a record that
-came and went with the flows would drop the device's counters back to zero
-every time it went idle. The record is therefore claimed by the first flow that
-crosses the device and kept until the device unregisters; `refs` counts the
-hardware directions whose opcodes name its indices, and the record is freed by
-whichever comes last, the unregistration or the last release, because the
-device can unregister while an entry naming the record is still being retired
-and the slot has to outlive that opcode. A record marked gone is never found by
-index again, so a device that reuses the index starts a record of its own. The
-netdev notifier only marks, and withdraws the record's publication at once --
-a device moved to another namespace keeps its index there and this one can
-hand it to a new device while the old record waits, and the fold keys on the
-index alone; a work item then takes the backend transaction and frees what
-nothing references.
+A device's record lives as long as the device, not as long as its flows. A slot
+returned to the pool is zeroed when handed out again, so a record that came and
+went with the flows would drop the device's counters back to zero every time it
+went idle -- which is what the session-keyed record used to do. The record is
+therefore claimed by the first flow that crosses the device and kept until the
+device unregisters; `refs` counts the hardware directions whose opcodes name
+its indices, and the record is freed by whichever comes last, the
+unregistration or the last release, because the device can unregister while an
+entry naming the record is still being retired and the slot has to outlive that
+opcode. A record marked gone is never found by index again, so a device that
+reuses the index starts a record of its own. The netdev notifier only marks,
+and withdraws the record's publication at once -- a device moved to another
+namespace keeps its index there and this one can hand it to a new device while
+the old record waits, and the fold keys on the index alone; a work item then
+takes the backend transaction and frees what nothing references.
 
-The plain pool is 122 records deep and shared with the legacy owner. Exhaustion
-is an ordinary outcome, as for sessions: the record exists, says it has no slot,
-the encoder is told there is none, and the flow forwards without counting. A
-stack is all or nothing: the opcodes' list form has no way to skip one tag, and
-index zero there is another owner's record, so one tag without a slot costs the
-whole stack its counters rather than counting the rest into somebody else's.
+pppd normally creates a ppp device per dial and destroys it when the session
+ends, so a ppp device's record lives exactly as long as its session; with
+`persist`, or a session renegotiated under a unit that stays, it lives across
+them, which is what the device's own counters do too.
+
+The plain pool is 122 records deep and the timestamped one 4, both shared with
+the legacy owner. Exhaustion is an ordinary outcome: the record exists, says it
+has no slot, the encoder is told there is none, and the flow forwards without
+counting. The answer a device got is the answer it keeps for as long as it has
+the record, so a live connection's counters never begin halfway through its
+life. A tag stack is all or nothing: the opcodes' list form has no way to skip
+one tag, and index zero there is another owner's record, so one tag without a
+slot costs the whole stack its counters rather than counting the rest into
+somebody else's.
 
 ## Units, measured
 
@@ -96,19 +118,23 @@ rather than inferred, with bursts of 64 UDP datagrams of 256 bytes (284-byte IP
 packets) through a tagged LAN on the DK, reading the raw records off
 `/proc/cdx_flowtable` and the devices' counters at the same time.
 
-| Frame | On the wire | Port rx record | VLAN rx record | VLAN tx record |
+| Frame | On the wire | Port rx record | Device rx record | Device tx record |
 | --- | ---: | ---: | ---: | ---: |
 | one tag, `eth3.271` | 302 | 302 | 298 | 302 |
 | two tags, `eth3.271` (outer) | 306 | 306 | 302 | 306 |
 | two tags, `eth3.271.272` (inner) | 306 | 306 | 298 | 302 |
+| session over a tag, `ppp0` | 310 | 310 | 302 | 306 |
 
 So the port's record counts the frame as it arrived, and a tag's record counts
 the frame **as it stands once that tag has been handled**: the strip counts it
 with the tag already off, the insert with the tag already on, and a two-tag
 stack is counted progressively, 302 then 298 on the way in and 302 then 306 on
-the way out.
+the way out. The session's record is not quite the same on receive: the strip
+counts the frame as it arrived less the session header alone, so the tag under
+the session is still in although the tag strip ran first. On transmit the
+insert runs before any tag goes on and has the eight-byte session header on.
 
-That decides three things.
+That decides four things.
 
 - **A port's receive counter subtracts the Ethernet header.** The SDK driver
   counts `skb->len` after `eth_type_trans()` has pulled it, so the driver's
@@ -134,6 +160,12 @@ That decides three things.
   beside its VIDs, and the order the legacy path has always written — would
   hand the outer device the frame with only the inner tag on. The flow path
   lists them the other way; the legacy path is left as it was.
+- **A ppp device subtracts the Ethernet header plus one tag per VLAN device its
+  session runs over on receive, and the Ethernet and session headers on
+  transmit.** `ppp_generic.c` counts `skb->len - PPP_PROTO_LEN` both ways, the
+  payload alone. The tag count is a property of the device -- a session's
+  lower device is fixed for its life -- and is taken from the direction's own
+  tag stack, which sits entirely under the session.
 
 The residual is the one every restatement here shares: padding. A stream of
 frames under 60 bytes reads high by what was padded, at most ten bytes each,
@@ -185,6 +217,11 @@ frames each way per case:
   not before patch 104; and the VLAN device's own transmit counter, fed by
   Linux alone here, reads 298 per 302-byte frame, which is the convention the
   hardware fold restates to.
+- **Session** (`test_flowtable_pppoe_session_counters`, a session over a tagged
+  WAN). The record reads 64 × 302 received and 64 × 306 transmitted for 64
+  frames of 284-byte payload; `ip -s link show ppp0` moves by 64 × 284 both
+  ways plus the session's own LCP echoes; and retiring the connection leaves
+  the record in place with no references, its totals intact.
 
 Host tests carry what the bench cannot show cheaply: `test_ifstats.py` the
 publication, fold, restatement and withdrawal against the real allocator on a
@@ -193,16 +230,20 @@ and the all-or-nothing rule against the shipped SDK header; `test_flowtable.py`
 the record's lifetime across flows, unregistration and reuse of an index.
 
 `/proc/cdx_flowtable` gained `vlan_records` and `vlan_slots` in its header and
-one `vlan` row per device with a record:
+one `vlan` row per device with a record, and its `session` rows now name the
+device too:
 
 ```
+session dev=ppp0 ifindex=18 pppoe=1@00:11:22:33:44:55 lower=7 refs=2 slot=yes rx_packets=64 rx_bytes=19328 tx_packets=64 tx_bytes=19584
 vlan dev=eth3.271 ifindex=16 refs=2 slot=yes rx_packets=64 rx_bytes=19072 tx_packets=64 tx_bytes=19328
 ```
 
 The numbers there are the firmware's own, whole frames; the device's `ip -s
 link` shows the same records restated, so the two differ by the framing and
 nothing else. `slot=none` is a device the pool had nothing for; `dev=-` is a
-device that has unregistered while a direction still names its record.
+device that has unregistered while a direction still names its record. A
+session row's `pppoe=` is the session the last admitted direction named, in the
+form the flow rows use.
 
 ## What is not carried, and why
 
@@ -213,13 +254,6 @@ device that has unregistered while a direction still names its record.
   device above it has nothing to fold into. The physical ports count that
   traffic; the bridge device itself does not. CMM had the same gap: its
   bridge path suppressed the pointer for exactly these tags.
-- **A PPPoE session's record is not folded into its `ppp` device.** The
-  session counters exist and read back through `/proc/cdx_flowtable`, as the
-  [PPPoE guide](flowtable-pppoe.md) describes; publishing that record to the
-  `ppp` device with the session's framing subtracted is the same mechanism
-  and a natural next step, but a session record is keyed on the session and
-  comes and goes with its flows, so it would need the device-lifetime treatment
-  first. Left as the one per-interface counter that is procfs-only.
 - **The software fast path is blind to VLAN devices.** Netfilter's flowtable
   hook runs on the physical port and forwards from there, so a frame it handles
   in software is counted by the port (after patch 104) but never reaches the
