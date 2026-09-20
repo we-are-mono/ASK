@@ -119,6 +119,7 @@ struct dpaa_vwd_priv_s vwd;
 
 extern struct dpa_bp *dpa_bpid2pool(int bpid);
 extern struct dpa_priv_s* get_eth_priv(unsigned char* name);
+extern struct dpa_priv_s *dpa_first_eth_priv(void);
 
 static int dpaa_vwd_open(struct inode *inode, struct file *file);
 static long dpaa_vwd_ioctl(struct file * file, unsigned int cmd, unsigned long arg);
@@ -1285,26 +1286,109 @@ void drain_tx_bp_pool(struct dpa_bp *bp)
 }
 
 
+/* Dequeue context for VWD's own frame queues.
+ *
+ * A DQRR callback runs in hard-IRQ context the first time a portal has work,
+ * and the SDK's convention is to mask DQRI there and leave the rest to a NAPI
+ * poll. VWD used to borrow eth0's per-portal NAPI for that, and a port's NAPI
+ * is enabled only while the port is open: on a board whose first port is
+ * unused it never is, napi_schedule() is then a no-op, and every VAP frame
+ * that arrives on an idle portal leaves DQRI masked with nothing to unmask
+ * it. That the path worked at all was an accident of TCP: the client's
+ * acknowledgements produce transmit confirmations on the WAN port, whose own
+ * NAPI drains the same portal and re-enables the interrupt.
+ *
+ * So VWD owns its polling: one NAPI per possible CPU and portal, on a dummy
+ * device, enabled for the module's life, polled by the SDK's dpaa_eth_poll().
+ */
+struct vwd_napi {
+	struct dpa_napi_portal *np;
+};
+static struct vwd_napi __percpu *vwd_napi;
+static struct net_device *vwd_napi_dev;
+
+static void vwd_napi_del(void)
+{
+	int cpu, i;
+
+	if (vwd_napi) {
+		for_each_possible_cpu(cpu) {
+			struct vwd_napi *vn = per_cpu_ptr(vwd_napi, cpu);
+
+			if (!vn->np)
+				continue;
+			for (i = 0; i < qman_portal_max; i++) {
+				napi_disable(&vn->np[i].napi);
+				netif_napi_del(&vn->np[i].napi);
+			}
+			kfree(vn->np);
+			vn->np = NULL;
+		}
+		free_percpu(vwd_napi);
+		vwd_napi = NULL;
+	}
+	if (vwd_napi_dev) {
+		free_netdev(vwd_napi_dev);
+		vwd_napi_dev = NULL;
+	}
+}
+
+static int vwd_napi_add(void)
+{
+	int cpu, i;
+
+	vwd_napi_dev = alloc_netdev_dummy(0);
+	if (!vwd_napi_dev)
+		return -ENOMEM;
+	vwd_napi = alloc_percpu(struct vwd_napi);
+	if (!vwd_napi)
+		goto err;
+	for_each_possible_cpu(cpu) {
+		struct vwd_napi *vn = per_cpu_ptr(vwd_napi, cpu);
+
+		vn->np = kcalloc(qman_portal_max, sizeof(*vn->np), GFP_KERNEL);
+		if (!vn->np)
+			goto err;
+		for (i = 0; i < qman_portal_max; i++) {
+			netif_napi_add(vwd_napi_dev, &vn->np[i].napi, dpaa_eth_poll);
+			napi_enable(&vn->np[i].napi);
+		}
+	}
+	return 0;
+err:
+	vwd_napi_del();
+	return -ENOMEM;
+}
+
+/* dpaa_eth_napi_schedule() on VWD's own contexts: in interrupt context, mask
+ * DQRI and hand the portal to the poll; in a poll already, process inline. */
+static int vwd_napi_schedule(struct qman_portal *portal)
+{
+	if (unlikely(in_irq() || !in_serving_softirq())) {
+		if (likely(!qman_p_irqsource_remove(portal, QM_PIRQ_DQRI))) {
+			const struct qman_portal_config *pc =
+				qman_p_get_portal_config(portal);
+			struct dpa_napi_portal *np =
+				&raw_cpu_ptr(vwd_napi)->np[pc->index];
+
+			np->p = portal;
+			napi_schedule(&np->napi);
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static enum qman_cb_dqrr_result vwd_rx_exception_pkt(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
-
-	struct dpa_priv_s               *priv = vwd.eth_priv;
-	struct dpa_percpu_priv_s        *percpu_priv;
-
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;
 
-	DPA_BUG_ON(priv);
-	/* IRQ handler, non-migratable; safe to use raw_cpu_ptr here */
-	percpu_priv = raw_cpu_ptr(priv->percpu_priv);
-
-#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-	if (unlikely(dpaa_eth_napi_schedule(percpu_priv, portal)))
+	if (unlikely(vwd_napi_schedule(portal)))
 		return qman_cb_dqrr_stop;
-#endif
 
-	process_rx_exception_pkt(portal, fq, dq);	
+	process_rx_exception_pkt(portal, fq, dq);
 	return qman_cb_dqrr_consume;
 }
 
@@ -1312,18 +1396,11 @@ static enum qman_cb_dqrr_result vwd_rx_exception_pkt(struct qman_portal *portal,
 static enum qman_cb_dqrr_result vwd_rx_error(struct qman_portal *portal,
 		struct qman_fq *fq, const struct qm_dqrr_entry *dq)
 {
-#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-	struct dpa_percpu_priv_s *percpu_priv;
-#endif
-
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;
 
-#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-	percpu_priv = raw_cpu_ptr(vwd.eth_priv->percpu_priv);
-	if (unlikely(dpaa_eth_napi_schedule(percpu_priv, portal)))
+	if (unlikely(vwd_napi_schedule(portal)))
 		return qman_cb_dqrr_stop;
-#endif
 	INCR_PER_CPU_STAT(vwd.vwd_global_stats, pkts_tx_errors);
 	vwd_release_tx_frame(&dq->fd);
 	return qman_cb_dqrr_consume;
@@ -1347,23 +1424,11 @@ static void vwd_send_to_vap(struct sk_buff* skb)
 static enum qman_cb_dqrr_result vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq,
 		const struct qm_dqrr_entry *dq)
 {
-
-#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-	struct dpa_priv_s               *priv = vwd.eth_priv;
-	struct dpa_percpu_priv_s        *percpu_priv;
-#endif
-
 	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
 		return qman_cb_dqrr_consume;
 
-#ifndef CONFIG_FSL_ASK_QMAN_PORTAL_NAPI
-	DPA_BUG_ON(priv);
-	/* IRQ handler, non-migratable; safe to use raw_cpu_ptr here */
-	percpu_priv = raw_cpu_ptr(priv->percpu_priv);
-
-	if (unlikely(dpaa_eth_napi_schedule(percpu_priv, portal)))
+	if (unlikely(vwd_napi_schedule(portal)))
 		return qman_cb_dqrr_stop;
-#endif
 	process_vap_rx_fwd_pkt(portal, fq, dq);
 	return qman_cb_dqrr_consume;
 }
@@ -1384,21 +1449,25 @@ static int process_vap_rx_fwd_pkt(struct qman_portal *portal, struct qman_fq *fq
 		INCR_PER_CPU_STAT(priv->vwd_global_stats, pkts_slow_fail);
 		return 0;
 	}
-	/* The notifier clears these links under vaplock before the device
-	 * can be freed. Keep our own reference through dev_queue_xmit().
+	/* Published under RCU rather than a lock: vwd_vap_down() clears the
+	 * device's wifi_offload_dev, then every queue's net_dev, before the
+	 * state leaves OPEN, and a device being unregistered is only freed
+	 * after the core's synchronize_net(), which this read section is
+	 * inside of. So a queue whose device we still see is a device that
+	 * is still alive for the length of dev_queue_xmit(), and no per-frame
+	 * reference is needed. The state is the last thing the open path
+	 * publishes, and the first thing checked here.
 	 */
-	spin_lock_bh(&priv->vaplock);
-	net_dev = ((struct dpa_fq *)fq)->net_dev;
+	rcu_read_lock();
+	net_dev = READ_ONCE(((struct dpa_fq *)fq)->net_dev);
 	if (net_dev) {
 		vap = (void *)READ_ONCE(net_dev->wifi_offload_dev);
-		if (!vap || vap->state != VAP_ST_OPEN || !netif_running(net_dev))
+		if (!vap || smp_load_acquire(&vap->state) != VAP_ST_OPEN ||
+		    !netif_running(net_dev))
 			net_dev = NULL;
-		else {
-			dev_hold(net_dev);
+		else
 			no_l2_itf = vap->no_l2_itf;
-		}
 	}
-	spin_unlock_bh(&priv->vaplock);
 	/*If vap interface is down then fq net_dev is NULL, in this case release the fd.*/
 	if (!net_dev)
 	{
@@ -1495,8 +1564,7 @@ process_skb:
 done:
 	if (tx)
 		vwd_complete_tx_buffer(tx);
-	if (net_dev)
-		dev_put(net_dev);
+	rcu_read_unlock();
 	return 0;
 
 rel_fd:
@@ -1897,7 +1965,17 @@ static int release_vap_fqs(struct vap_desc_s *vap)
 
 int dpaa_get_vap_fwd_fq(uint16_t vap_id, uint32_t* fqid, uint32_t hash)
 {
-	*fqid = vwd.vaps[vap_id].wlan_fq_from_fman[hash & (CDX_VWD_FWD_FQ_MAX - 1)]->fqid;
+	struct dpa_fq *dpa_fq;
+
+	/* A slot's queues exist only from its first open. The legacy owner
+	 * creates the devman record before it opens the slot, so the encoder
+	 * can ask about a slot that has none; answer failure, not a NULL. */
+	if (vap_id >= MAX_WIFI_VAPS)
+		return -1;
+	dpa_fq = vwd.vaps[vap_id].wlan_fq_from_fman[hash & (CDX_VWD_FWD_FQ_MAX - 1)];
+	if (!dpa_fq)
+		return -1;
+	*fqid = dpa_fq->fqid;
 #ifdef DPA_WIFI_DEBUG
 	DPAWIFI_INFO("%s:: fwd_fq :%x\n",__func__, *fqid);
 #endif
@@ -2012,12 +2090,13 @@ static int release_device_tx_done_bpool(struct dpaa_vwd_priv_s  *vwd)
 }
 
 
+/* Both publish to the lock-free dequeue path, process_vap_rx_fwd_pkt(). */
 static int set_vap_fqs_netdev(struct vap_desc_s *vap)
 {
 	int index = 0;
 	for (index = 0; index < CDX_VWD_FWD_FQ_MAX; index++)
-		vap->wlan_fq_from_fman[index]->net_dev = vap->wifi_dev;
-	vap->wlan_fq_to_fman->net_dev = vap->wifi_dev;
+		WRITE_ONCE(vap->wlan_fq_from_fman[index]->net_dev, vap->wifi_dev);
+	WRITE_ONCE(vap->wlan_fq_to_fman->net_dev, vap->wifi_dev);
 	return 0;
 }
 
@@ -2028,8 +2107,8 @@ static int reset_vap_fqs_netdev(struct vap_desc_s *vap)
 {
 	int index = 0;
 	for (index = 0; index < CDX_VWD_FWD_FQ_MAX; index++)
-		vap->wlan_fq_from_fman[index]->net_dev = NULL;
-	vap->wlan_fq_to_fman->net_dev = NULL;
+		WRITE_ONCE(vap->wlan_fq_from_fman[index]->net_dev, NULL);
+	WRITE_ONCE(vap->wlan_fq_to_fman->net_dev, NULL);
 	return 0;
 }
 
@@ -2122,14 +2201,14 @@ static int vwd_vap_down(struct dpaa_vwd_priv_s *priv , struct vap_desc_s *vap)
 			vap->macaddr[4], vap->macaddr[5] );
 #endif
 
-	/* unpublish from the lock-free ipsec xmit hook first, then tear
-	 * down the fq netdev links it would have used */
+	/* unpublish from the lock-free ipsec xmit hook and the dequeue path
+	 * first, then tear down the fq netdev links they would have used */
 	if(vap->wifi_dev)
 		WRITE_ONCE(vap->wifi_dev->wifi_offload_dev, NULL);
 
 	reset_vap_fqs_netdev(vap);
 
-	vap->state = VAP_ST_CONFIGURED;
+	smp_store_release(&vap->state, VAP_ST_CONFIGURED);
 
 	vap->wifi_dev = NULL;
 	priv->vap_count--;
@@ -2289,7 +2368,9 @@ static int dpaa_vwd_handle_vap( struct dpaa_vwd_priv_s *priv, struct vap_cmd_s *
 			}
 			else
 			{
-				vap->state = VAP_ST_OPEN;
+				/* Last: the dequeue path reads this first, and
+				 * the queues' device pointers were stored above. */
+				smp_store_release(&vap->state, VAP_ST_OPEN);
 				priv->vap_count++;
 			}
 			break;
@@ -3007,10 +3088,17 @@ int dpaa_vwd_init(void)
 	rc = vwd_init_stats(priv);
 	if (rc)
 		goto err_stats;
-	priv->eth_priv = get_eth_priv("eth0");
+	rc = vwd_napi_add();
+	if (rc)
+		goto err_stats;
+	/* Any DPAA port will do: what is read from it is the buffer layout
+	 * every port shares (headroom, errata handling) and a per-CPU count
+	 * for refilling the pool its frames came from. It used to be "eth0"
+	 * by name, which a board is free not to have. */
+	priv->eth_priv = dpa_first_eth_priv();
 	if (!priv->eth_priv) {
 		rc = -ENODEV;
-		goto err_stats;
+		goto err_napi;
 	}
 	rc = add_device_tx_done_bpool(priv);
 	if (rc)
@@ -3085,6 +3173,8 @@ err_pool:
 err_eth:
 	dev_put(priv->eth_priv->net_dev);
 	priv->eth_priv = NULL;
+err_napi:
+	vwd_napi_del();
 err_stats:
 	vwd_release_stats(priv);
 	return rc;
@@ -3126,6 +3216,8 @@ void dpaa_vwd_exit(void)
 	vwd_release_pcd_fqs(priv);
 	vwd_free_ohport(priv);
 	synchronize_net();
+	/* Every queue is retired, so no poll can be scheduled any more. */
+	vwd_napi_del();
 	release_device_tx_done_bpool(priv);
 	vwd_release_stats(priv);
 	dev_put(priv->eth_priv->net_dev);

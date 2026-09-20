@@ -606,7 +606,8 @@ static int dpa_get_tx_fqid_devinfo_by_iface(struct dpa_iface_info *iface_info,
 
 		if(fqid)
 		{
-			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, fqid, hash);
+			if (dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, fqid, hash))
+				return FAILURE;
 #ifdef DEVMAN_DEBUG
 			DPA_INFO("%s:: wlan tx fqid :%d: %x\n", __func__, *fqid, *fqid);
 #endif
@@ -1108,7 +1109,8 @@ int dpa_get_out_tx_info_by_itf_id(PRouteEntry rt_entry ,
 			 * caller's hash rather than pinning every SA to
 			 * queue 0, which put all encrypted Wi-Fi egress on
 			 * one core. */
-			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash);
+			if (dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash))
+				break;
 
 			l2_info->is_wlan_iface = 1;
 			retval = SUCCESS;
@@ -1399,7 +1401,8 @@ int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 					src_mac = wlan_info->mac_addr;
 			}
 
-			dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash);
+			if (dpaa_get_vap_fwd_fq(iface_info->wlan_info.vap_id, &l2_info->fqid, hash))
+				break;
 
 			l2_info->is_wlan_iface = 1;
 			retval = SUCCESS;
@@ -3004,6 +3007,31 @@ struct dpa_priv_s* get_eth_priv(unsigned char* name)
 	}
 	priv = netdev_priv(device);
 	return priv;
+}
+
+/* The first physical Ethernet port on record, held. For consumers that need
+ * a DPAA port's private data for what every port shares -- the buffer layout
+ * and errata handling -- rather than for any one port in particular. Pairs
+ * with dev_put() on the returned priv's net_dev, exactly as get_eth_priv(). */
+struct dpa_priv_s *dpa_first_eth_priv(void)
+{
+	struct dpa_iface_info *iface;
+	struct net_device *device = NULL;
+
+	spin_lock(&dpa_devlist_lock);
+	for (iface = dpa_interface_info; iface; iface = iface->next) {
+		if ((iface->if_flags & IF_TYPE_ETHERNET) && iface->eth_info.net_dev) {
+			device = iface->eth_info.net_dev;
+			dev_hold(device);
+			break;
+		}
+	}
+	spin_unlock(&dpa_devlist_lock);
+	if (!device) {
+		DPA_INFO("%s::no Ethernet port on record\n", __func__);
+		return NULL;
+	}
+	return netdev_priv(device);
 }
 
 

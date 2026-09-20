@@ -161,16 +161,6 @@ result independently of those temporary files.
   equivalent readiness predicate that SA admission and the encoder consult, so
   it needs one before the gate can be relaxed. Same class, separate fix.
 
-- [ ] **A166 — `dpaa_get_vap_fwd_fq()` dereferences a slot whose queues may not
-  exist.** `vwd.vaps[id].wlan_fq_from_fman[hash & 63]->fqid` with no NULL
-  check; the queues are built on the slot's first open. In the legacy owner
-  the devman WLAN record is created by `wifi_vap_entry(WIFI_ADD_VAP)` before
-  CMM's `/dev/vwd` CONFIGURE/ADD builds them, so the encoder arms at
-  `devman.c:603`, `:1105` and `:1396` can reach an empty slot from the control
-  path. The flowtable owner is not exposed: it admits a VAP only through
-  `dpaa_vwd_vap_is_open()`, under RTNL, which VWD's transitions also hold. The
-  fix is a failing return, but all three callers ignore the return today.
-
 - [ ] **A165 — the Wi-Fi driver's single transmit worker is the wire-to-Wi-Fi
   ceiling.** Measured 2026-09-20 with the egress offload active (`bindings 1`,
   entries tracking conntrack's `[OFFLOAD]` count), a client on channel 36 at
@@ -191,16 +181,6 @@ result independently of those temporary files.
   structural one, which is that one worker per radio cannot be spread by
   anything CDX does. A non-instrumented boot of the same image is the one
   measurement that would put a production number on this.
-
-- [ ] **A164 — `process_vap_rx_fwd_pkt()` takes the global `vaplock` and a
-  `dev_hold`/`dev_put` pair per frame.** All 64 forwarding queues of every
-  VAP, on all four portals, serialise on one spinlock for a state read the
-  notifier could publish under RCU, and pin the netdev for a synchronous
-  `dev_queue_xmit()` that an RCU read section already covers. Not on the
-  profile today because A165 walls the path first; it becomes the aggregate
-  limit the moment the driver stops being one. Needs the VAP retire path
-  (`vwd_vap_down`, `reset_vap_fqs_netdev`) read for what it relies on the
-  lock for before the readers are changed.
 
 - [ ] **A159 — a bound flowtable stops the port's ingress byte counters.**
   With an nftables flowtable bound to a port, that port's rx byte and packet
@@ -470,6 +450,16 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A172.** VWD drained its queues through `eth0`'s NAPI, which is enabled only while `eth0` is
+  open — never, on this board — so the portal's dequeue interrupt stayed masked and only the WAN port's
+  transmit confirmations kept the path moving — fixed (this commit): VWD owns a NAPI per CPU and portal.
+
+- [x] **A166.** `dpaa_get_vap_fwd_fq()` dereferenced a slot whose queues may not exist yet (legacy
+  owner creates the record before the open) — fixed (this commit): failing return, all callers check.
+
+- [x] **A164.** `process_vap_rx_fwd_pkt()` took the global `vaplock` and a `dev_hold`/`dev_put` pair per
+  frame — fixed (this commit): RCU read section; the retire path publishes with release semantics.
 
 - [x] **A171.** A non-DPAA device in an offload flowtable (a VAP, which fw4 always lists once Wi-Fi
   is in the LAN bridge) was refused, which fails the whole table and drops every port to software —
