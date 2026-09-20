@@ -171,6 +171,37 @@ result independently of those temporary files.
   `dpaa_vwd_vap_is_open()`, under RTNL, which VWD's transitions also hold. The
   fix is a failing return, but all three callers ignore the return today.
 
+- [ ] **A165 — the Wi-Fi driver's single transmit worker is the wire-to-Wi-Fi
+  ceiling.** Measured 2026-09-20 with the egress offload active (`bindings 1`,
+  entries tracking conntrack's `[OFFLOAD]` count), a client on channel 36 at
+  80 MHz: 160 Mbit/s with the driver at its defaults, 178 with
+  `amsdu_disable=1`, and in both runs cpu0 at 95-99% busy with 99.9% of its
+  samples in one thread -- moal's `MOAL_WORK_QUEUE` / `MOAL_TX_WORK_QUEUE`
+  workers, each created `max_active = 1`, one per adapter. The air is not the
+  cap (the phone's frames arrive at VHT80 NSS2 MCS8/9, 780-866 Mbit/s PHY) and
+  the CDX handoff is not on the profile above 1%. The pegged core is
+  `ra_list_spinlock` churn once per MSDU, the A-MSDU copy, the per-packet skb
+  copy (`tx_skb_clone`, fixed in A162) and the free; on the KASAN image about
+  28% of its samples are KASAN/kmemleak bookkeeping inside those alloc/free
+  calls, so the production height is not established -- only the location.
+  A control with no classifier at all (a UDP blast generated on the board out
+  `uap0`) stalls at the same 120-135 Mbit/s. Remaining levers, none taken yet:
+  measure A-MSDU off against real client mixes before changing its default;
+  move the free of the source skb out of the aggregation loop; and the
+  structural one, which is that one worker per radio cannot be spread by
+  anything CDX does. A non-instrumented boot of the same image is the one
+  measurement that would put a production number on this.
+
+- [ ] **A164 — `process_vap_rx_fwd_pkt()` takes the global `vaplock` and a
+  `dev_hold`/`dev_put` pair per frame.** All 64 forwarding queues of every
+  VAP, on all four portals, serialise on one spinlock for a state read the
+  notifier could publish under RCU, and pin the netdev for a synchronous
+  `dev_queue_xmit()` that an RCU read section already covers. Not on the
+  profile today because A165 walls the path first; it becomes the aggregate
+  limit the moment the driver stops being one. Needs the VAP retire path
+  (`vwd_vap_down`, `reset_vap_fqs_netdev`) read for what it relies on the
+  lock for before the readers are changed.
+
 - [ ] **A159 — a bound flowtable stops the port's ingress byte counters.**
   With an nftables flowtable bound to a port, that port's rx byte and packet
   counters stop counting forwarded traffic. Measured with a controlled

@@ -287,12 +287,18 @@ The oracle to be careful about is the one the QoS increment taught: a
 functional test cannot tell hardware from software here, because both deliver
 every packet. Only a rate and a CPU measurement separate them.
 
-Measured 2026-09-18, with an iPhone on the 5 GHz AP.
+Measured 2026-09-18, with an iPhone on a 5 GHz AP configured by hand on the
+running board -- the image's own AP was 2.4 GHz at the time, and that copy
+did not survive the next reboot. The image now ships the 5 GHz configuration
+(see step 6).
 
 The result that matters is not a rate. It is that **the hardware path to a
-Wi-Fi client is already live and already refused**. `flags offload` will not
-bind `uap0` -- a `moal` netdev supports no offload -- but the devices list
-only names which ingresses are hooked, and wire-to-Wi-Fi ingresses on `eth4`:
+Wi-Fi client is already live and already refused**. At the time, listing
+`uap0` among the flowtable's devices failed the whole table (the adapter
+refused to bind a device it could not program, and Netfilter registers an
+offload table only when every device binds -- see A171, which now binds such
+a device passively), so the table named only the ingress that matters for
+wire-to-Wi-Fi, `eth4`:
 
 ```
 flowtable fast { hook ingress priority 0; devices = { "eth4" }; flags offload; }
@@ -349,20 +355,74 @@ tracking the transfer and the software forwarding path idle.
 
 Step 4 was allowed to conclude that the ingress half buys nothing. It does.
 
-**The egress offload is worth 1.6x, and that is its whole worth.** Measured
-with a client on the 5 GHz AP, the same transfer with the flowtable bound and
-flushed, both runs saturating one core:
+**The first measurement here was wrong, and the record of it is kept because
+the way it was wrong is instructive.** It read `~92 Mbit/s` with the flowtable
+flushed and `~145 Mbit/s` with it bound, called the difference the classifier's
+share and the remainder "skb build, `dev_queue_xmit()`, `moal` and the PCIe
+transfer". Two things undermined it. The 92 was taken on the image's own AP,
+which was 2.4 GHz HT20 -- an air ceiling of about 90 Mbit/s, so that number
+measured the radio configuration, not the software. The 145 was taken on a
+5 GHz AP configured by hand and erased by the next reboot, so the two runs were
+not on the same air and the ratio between them means nothing. The image now
+ships the 5 GHz VHT80 configuration, so every figure below is reproducible
+from the tree.
+
+**Re-measured 2026-09-20 with the offload active** (`bindings 1`, CDX entries
+tracking conntrack's `[OFFLOAD]` count), a phone on channel 36 at 80 MHz,
+sampled over a 15 s window of an iperf3 download:
 
 ```
-offload off   ~92 Mbit/s    one core at 100%
-offload on   ~145 Mbit/s    one core at 100%
+driver defaults                160 Mbit/s   cpu0 99% busy, cpu1-3 28-51%
+amsdu_disable=1                178 Mbit/s   cpu0 95% busy
+tx_skb_clone=0 (patch 0004)    201 Mbit/s   cpu0 50% busy, cpu1-3 25-43%
 ```
 
-So at a fixed core budget the per-packet cost falls to about 63% of what it
-was: the route lookup, conntrack, NAT and header rewrite are about **37% of a
-wire-to-Wi-Fi packet**, and hardware removes all of it. The other 63% is the
-skb build, `dev_queue_xmit()`, `moal` and the PCIe transfer, and no amount of
-classifier work touches it.
+The third row is the image as it now ships. With the per-packet copy gone no
+core is saturated any more, so the 200 Mbit/s that remains is not a CPU
+ceiling; it is somewhere in the radio, its firmware, or the client, and the
+next step for it is a measurement on the radio side rather than in this tree.
+
+The air is not the limit. The driver's receive histogram has the phone's
+frames arriving at VHT80 NSS2 MCS8/9 -- 780-866 Mbit/s PHY -- at 37-47 dB
+SNR, and nothing about the downlink is worse than that.
+
+**Where the pegged core goes.** `perf` on cpu0 attributes 99.9% of its samples
+to one thread: `kworker/u17:*+M`, moal's `MOAL_WORK_QUEUE`, created with
+`max_active = 1` -- one worker for the whole adapter, both VAPs, both
+directions. Inside it, with the driver at its defaults, 38% of the core is
+IRQ-disabled time under `wlan_11n_aggregate_pkt()`: host-side A-MSDU
+aggregation, which takes and drops `ra_list_spinlock` once per MSDU, copies
+each frame into the aggregate and frees the source skb. With A-MSDU off the
+pegged thread becomes the TX worker, `woal_tx_work_handler -> woal_start_xmit`,
+and its two largest items are `skb_realloc_headroom -> pskb_copy` and the free
+of the original -- `tx_skb_clone`, which defaulted to 1 on every platform and
+copied every frame whether or not the headroom test it guards would have
+fired. The CDX side of the handoff -- `vap_rx_fwd_pkt()`, the skb build,
+`dev_queue_xmit()` -- does not appear above the 1% cut at all.
+
+A control confirms the wall is the driver's and not the classifier's: a UDP
+blast generated on the board itself, out `uap0` to the same client with no
+FMAN involvement, stalls at the same 120-135 Mbit/s with the generators blocked
+on backpressure.
+
+**What the numbers do and do not establish.** They were taken on the KASAN
+image, which also carries kmemleak. Both run inside the driver's per-packet
+alloc, copy and free: on the pegged core about 28% of samples are KASAN's
+quarantine and stack recording and kmemleak's object tracking, and part of
+the IRQ-off time is their own irqsave locks. The production build carries
+neither, so these runs fix the *location* of the ceiling -- one single-threaded
+worker per radio, doing a host copy per packet -- and not its production
+height.
+
+**What changed because of this.** The driver patches in `meta-ask` now default
+`tx_skb_clone` to 0 (the predicate it bypassed already copies a cloned or
+headroom-short skb), and fix a second use-after-free the flood exposed:
+`wlan_dequeue_tx_packet()` read `ptr->sta` after the send helpers had dropped
+`ra_list_spinlock`, racing `wlan_wmm_delete_peer_ralist()`. The IPsec egress
+encoder passed hash 0 to `dpaa_get_vap_fwd_fq()` and so pinned every encrypted
+Wi-Fi flow to queue 0 and one CPU; it now spreads by SA. A-MSDU stays on by
+default: the 11% here is one client at one frame size, and its air-efficiency
+value for small frames was not measured.
 
 **It cannot be a bypass, because FMAN cannot reach the radio.** The 88W9098 is
 a PCIe device; FMAN can only enqueue to its own MAC and offline ports. A VAP
@@ -371,17 +431,19 @@ is a qman dequeue callback, on the CPU, by construction. MediaTek's WED exists
 precisely to close that gap, which is why `mt7915`/`mt7996` are the only
 drivers implementing `net_fill_forward_path`; there is no equivalent here.
 
-One consequence worth knowing: a flow is hashed to one of the VAP's 64
-forwarding queues, so a single TCP connection is served by a single core and
-tops out around 145 Mbit/s. Parallel connections spread and go faster. The
-board's Wi-Fi ceiling is therefore per-flow, not aggregate.
+The VAP's 64 forwarding queues do spread flows across the four portals, but
+that spreading ends at `dev_queue_xmit()`: everything then funnels into the
+driver's single worker, so the ceiling is per radio, not per flow. More
+connections do not raise it.
 
-**Against that, the ingress half is not worth building.** The uplink is not
-CPU-bound at all -- during upload no core exceeds 70% while the download pegs
-one -- so there is no bottleneck to relieve. And the trade is worse in that
-direction: the frame is *already* an skb in the CPU when it arrives from PCIe,
-so injection adds a descriptor build and an offline-port round trip to buy
-back the same 37%.
+**Against that, the ingress half is not worth building**, for a sharper reason
+than before. The uplink is not CPU-bound -- during upload no core exceeds 70%
+while the download pegs one -- and the wall the download hits is inside the
+driver's transmit worker, which an offline-port injection on the receive side
+cannot touch. The trade is also worse in that direction: the frame is
+*already* an skb in the CPU when it arrives from PCIe, so injection adds a
+descriptor build and an offline-port round trip to remove a route lookup that
+is not on the profile.
 
 NXP reached the same place, and their Programmer's Guide (BHR ASK for
 LS1012x/LS104x/LS102x, Rev. E, 10.24) says so outright. Section 10.24.2.3
