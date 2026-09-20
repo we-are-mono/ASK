@@ -500,7 +500,24 @@ lifecycle, and the admission contract can all be driven against an ordinary
 netdev standing in for a VAP.
 
 **What needs the radio** is the measurement in step 4 and the end-to-end
-proofs in steps 5 and 6, which need an associated station.
+proofs in steps 5 and 6, which need an associated station -- and it has to
+be an external one. The board's second radio was tried as a loopback client
+(its wiphy moved into a network namespace, `wpa_supplicant` scanning
+explicitly on the AP's channel, with the AP on 5 GHz and then on 2.4 GHz)
+and it never receives the first radio's beacons, so there is no
+phone-free Wi-Fi coverage to be had from this module.
+
+**The dequeue context, found on the way.** VWD's queue callbacks used to
+schedule `eth0`'s per-portal NAPI to drain a portal after the first frame
+arrived in interrupt context. A port's NAPI is enabled only while the port
+is open, and `eth0` on this board never is, so that `napi_schedule()` was a
+no-op that left the portal's dequeue interrupt masked. The path still
+carried 200 Mbit/s because TCP's acknowledgements produce transmit
+confirmations on the WAN port, whose own NAPI drains the same portal and
+unmasks it -- a dependency on return traffic that a one-way flow would not
+satisfy, and a poll cadence set by the acknowledgements rather than by the
+frames. VWD now owns one NAPI per CPU and portal, on a dummy device, enabled
+for the module's life.
 
 **The host harness gets the decision logic**, as multicast and IPsec both did:
 which netdevs are VAPs, what admission accepts, and the registration

@@ -152,6 +152,18 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A173 — the Wi-Fi driver sleeps in atomic context when reporting scan
+  results in station mode.** With the second radio's `mmlan0` scanning as a
+  station, the debug kernel prints `__might_resched` from `MOAL_EVT_WORK_QUEUE`:
+  `woal_evt_work_queue -> woal_inform_bss_from_scan_result ->
+  cfg80211_inform_bss_data -> kzalloc(GFP_KERNEL)`, i.e. moal calls into
+  cfg80211 with a sleeping allocation while holding a spinlock. It is the
+  station scan path only (`moal` at 09f41e14); an access point never runs it,
+  so the product is not exposed unless a STA interface is used. Likely fix is
+  the GFP flag or the lock scope in `woal_inform_bss_from_scan_result()`;
+  reproduce with `wpa_supplicant` on `mmlan0` and read the full splat before
+  choosing.
+
 - [ ] **A167 — a failed IPsec initialisation refuses to load `cdx.ko` at all.**
   `cdx_main.c` treats `cdx_dpa_ipsec_init()` failing as fatal, so a board whose
   device tree lacks the IPsec offline port (`dpa-fman0-oh@2`), or on which the
