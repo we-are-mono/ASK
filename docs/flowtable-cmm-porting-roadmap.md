@@ -35,13 +35,13 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 
 | # | Subsystem | Lines | FCI cmds | Linux mechanism | Effort | Notes |
 | ---: | --- | ---: | ---: | --- | --- | --- |
-| 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Partial — conntrack mark only | Medium | Scoped: see the [QoS design](flowtable-qos.md). Three separable planes; only classification is new, and it is one field on `cdx_ft_rule`. QoS is dormant in the shipping build, so this is a capability to add, not behaviour to preserve. |
+| 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Yes — conntrack mark + `ndo_setup_tc` | Medium | **Delivered**: see the [QoS design](flowtable-qos.md), stages 1–8. Classification reaches hardware as the class word on `cdx_ft_rule` (`ft_qos_class`, queue/channel/policer/DSCP nibbles); CEETM scheduling via `ndo_setup_tc`/HTB offload; WRED; the DSCP map; and ingress-policer *selection* are all built and proved on hardware. Tests: `test_qos_control`, `test_htb_offload`, `test_police`, `test_dscp_map`, `test_ceetm_*`, `test_qos_lifecycle`. Residual, not a CMM-parity gap: the ingress-policer *rate* has no consumer control surface yet (a packaging decision, stage 8). |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | **Delivered**, both directions: see the [IPsec design](flowtable-ipsec.md). Control plane is mainline `xfrmdev_ops` in packet mode, with no ASK userspace. The estimate that the shared encoder already carried the SEC action held; what it did not anticipate is that `FLOW_OFFLOAD_XMIT_XFRM` had to be *admitted* rather than excluded — three generic helpers refuse that transmit type outright, which silently kept every real tunnel in software until step 6 measured it. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Bridged path delivered and proved on hardware, both families: see the [multicast design](flowtable-multicast.md).** Control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on, with no ASK userspace and no consumer configuration at all. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Routed multicast is a second learner against the same encoder and is not built. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Partial — flow stats callbacks | Medium | Per-flow and per-session counters exist. What is left is per-VLAN and per-port read-back, on the allocator that already serves the session ones; see below. Treat carefully: the stats path is where A140 lived. |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
-| 11 | Wi-Fi (`module_wifi`, `dpa_wifi`) | 345 | 3 | No | High | Needs driver-side `dev_fill_forward_path` support that does not exist. |
+| 11 | Wi-Fi (`module_wifi`, `dpa_wifi`) | 345 | 3 | Yes — CDX VWD VAP path | High | **Delivered**, but not via the generic `dev_fill_forward_path` this row assumed unavailable: wire→Wi-Fi flows are offloaded through the Wi-Fi offline port and per-VAP frame queues (VWD), driven by netdev events (a VAP registering) with no ASK userspace — see `cdx/cdx_wifi_backend.c` and `ft_wifi_reconsider` in `cdx/ask_flowtable.c`. Proved at ~650 Mbit/s on the DK (production kernel, offload engaged), CPU ~27%; the driver fixes it needed are A160–A176. Tests: `test_wifi_adapter`, `test_wifi_admission`, `test_wifi_control`. |
 | 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
 
 ## Out of scope
@@ -347,21 +347,24 @@ proof — and nothing remaining has that shape. MACVLAN was the last candidate
 and it is out of scope, above, so the next increment is a change of kind rather
 than another one of these.
 
-**Items 5 to 8 need feature-specific contracts.** Each expresses behaviour a
-unicast flowtable tuple cannot carry, and each needs its own hardware
-eligibility rules before any code.
+**Of items 5–8, only tunnels (8) remain.** QoS (5), IPsec (6) and bridged
+multicast (7) are delivered above; each expressed behaviour a unicast flowtable
+tuple cannot carry and got its own hardware eligibility rules. Tunnels still
+need theirs.
 
 **Item 9 needs read-back rather than a mechanism.** The allocator that hands
 out firmware statistics records is general and a session already uses it; what
 is left is asking for a record on a VLAN's and a port's behalf and reporting
 what it holds.
 
-**Items 10, 11 and 12 need a scoping decision first.** RTP relay and Wi-Fi
-offload have no Linux counterpart at all, so the question is whether the
-product still needs them, not how to port them.
+**Items 10 and 12 need a scoping decision first.** RTP relay has no Linux
+counterpart and sockets are local termination, so the question is whether the
+product still needs them, not how to port them. Wi-Fi (11) is delivered above
+through the CDX VWD VAP path — which is exactly why it did not need the Linux
+forward-path mechanism this section once assumed it required.
 
-**The order is IPsec, then multicast.** Both are decided rather than open, and
-the reasoning for each is worth keeping so neither is re-litigated.
+**The order was IPsec, then multicast — both now delivered (items 6, 7).** The
+reasoning is kept as the record of why they were sequenced that way.
 
 IPsec goes first because it is the larger body of live functionality: eight
 test files exercise it, the hardware questions were answered by A24a and A15,
