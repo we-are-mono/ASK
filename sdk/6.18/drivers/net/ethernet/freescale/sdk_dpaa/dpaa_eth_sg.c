@@ -784,12 +784,23 @@ void __hot _dpa_rx(struct net_device *net_dev,
 
 	skb_len = skb->len;
 
+	/* Account the frame before handing it to the stack, as every other
+	 * driver does. netif_receive_skb()'s return value is not a drop
+	 * report: __netif_receive_skb_core() initialises it to NET_RX_DROP and
+	 * only a delivered protocol handler overwrites it, so a frame consumed
+	 * on the NF_NETDEV_INGRESS hook -- which is every frame an nftables
+	 * flowtable forwards in software -- comes back as NET_RX_DROP after
+	 * being forwarded. Counting only on any other value made such frames
+	 * vanish from rx_packets and rx_bytes without incrementing rx_dropped
+	 * either. Real drops are already counted by the core in its own
+	 * rx_dropped and rx_nohandler, which dev_get_stats() adds on top.
+	 */
+	percpu_stats->rx_packets++;
+	percpu_stats->rx_bytes += skb_len;
+
 #ifdef CONFIG_FSL_DPAA_DBG_LOOP
-	if (dpa_skb_loop(priv, skb)) {
-		percpu_stats->rx_packets++;
-		percpu_stats->rx_bytes += skb_len;
+	if (dpa_skb_loop(priv, skb))
 		return;
-	}
 #endif
 
 	skb_record_rx_queue(skb, raw_smp_processor_id());
@@ -798,15 +809,10 @@ void __hot _dpa_rx(struct net_device *net_dev,
 		struct dpa_napi_portal *np = &percpu_priv->np;
 
 		np->p = portal;
-		/* The stack doesn't report if the frame was dropped but it
-		 * will increment rx_dropped automatically.
-		 */
 		qman_portal_napi_gro_receive(ctx, &np->napi, skb);
-	} else if (unlikely(netif_receive_skb(skb) == NET_RX_DROP))
-		return;
-
-	percpu_stats->rx_packets++;
-	percpu_stats->rx_bytes += skb_len;
+	} else {
+		netif_receive_skb(skb);
+	}
 
 	return;
 
