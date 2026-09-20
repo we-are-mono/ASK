@@ -16,6 +16,8 @@ SRC_URI = "git://github.com/nxp-imx/mwifiex.git;protocol=https;branch=hotfix/lf-
            file://0002-moal-do-not-free-an-skb-already-handed-to-the-stack.patch \
            file://0003-mlan-revalidate-the-ralist-after-the-send-helpers-drop-the-lock.patch \
            file://0004-moal-do-not-copy-every-transmitted-skb-by-default.patch \
+           file://0005-moal-report-scan-results-outside-scan_req_lock.patch \
+           file://0006-moal-give-each-mlan-spinlock-its-own-lockdep-class.patch \
 "
 SRCREV = "09f41e1423e4806a127507d5fa284cd02c46772f"
 

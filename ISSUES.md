@@ -152,6 +152,17 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A178 — moal's scan_request lifecycle has holes outside `scan_req_lock`.** Found while
+  fixing A173 (driver 09f41e14, `mlinux/`): `woal_clean_up()` completes and NULLs
+  `handle->scan_request` with no lock at all, so it can double-complete against
+  `woal_cancel_scan()` or the event worker; the fake-scan and scan-block branches of
+  `woal_cfg80211_scan()` set `scan_request` without `scan_priv`, and `woal_clean_up()` gates
+  on `scan_priv`, so on remove/hang with such a scan pending the request is never completed and
+  `scan_timeout_work` stays armed across `destroy_workqueue()`; the real-timeout branch of
+  `woal_scan_timeout_handler()` never completes the request either and relies on the hang path.
+  Station and ACS scans only, so not on the product's steady state; a generation counter beside
+  `scan_request` would also close the pointer-reuse residue in patch 0005's "same request" guard.
+
 - [ ] **A177 — `cdx_dpa_ipsec_exit()` and the init unwind do not fully release what init claimed.**
   `release_ipsec_bpool()` (`cdx/dpa_ipsec.c`) frees the BMan pool bookkeeping and the `dpa_bp`
   without draining the 512 skb-backed buffers `dpaa_bp_alloc_n_add_buffs()` seeded, so they leak
@@ -451,6 +462,15 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A176.** `moal_init_lock()` gave every mlan spinlock the one lockdep class of its single
+  `spin_lock_init()` site, so the first client's ADDBA (command lock inside the TX ralist lock) reported
+  "possible recursive locking" and switched lockdep off for the run — fixed (this commit): driver patch
+  0006, a dynamic key per lock.
+
+- [x] **A173.** moal reported scan results to cfg80211 under `scan_req_lock` (irqsave): GFP_KERNEL allocs,
+  `bss_lock` taken `_bh`, and the first scan's waited ioctl — fixed (this commit): driver patch 0005
+  reports outside the lock and completes only the request it took.
 
 - [x] **A167.** `cdx_dpa_ipsec_init()` failing refused to load `cdx.ko`, so a board without the IPsec
   offline port or a SEC job ring had no offload at all — fixed (this commit): non-fatal, with
