@@ -41,11 +41,14 @@ before polling starts. Missing providers defer the whole probe; failure
 releases any resources acquired for earlier ports. Disabled children are
 ignored. A device link stops the monitor before MDIO controller removal.
 
-Netdev lookup and packet-counter access occur under RTNL on each poll.
-The driver retains no netdev reference between polls, so netdev removal
-can complete and a replacement device can be discovered. A busy RTNL
-lock postpones that sample. Driver removal cancels all polling before
-releasing the corresponding resources.
+Each poll resolves the netdev under RCU and holds a reference only for
+the PCS read and the packet-counter read; it never takes RTNL. The offload
+backend admits flows by trying RTNL under its own transaction and retires
+an admission when the try fails, so a monitor holding RTNL ten times a
+second per port would turn a share of every flow admission into a
+retirement. No reference is kept between polls, so netdev removal can
+complete and a replacement device can be discovered. Driver removal
+cancels all polling before releasing the corresponding resources.
 
 The LED monitor does not change the DPAA fixed PHY's carrier state.
 Consequently, `ethtool` and `operstate` can still report the configured

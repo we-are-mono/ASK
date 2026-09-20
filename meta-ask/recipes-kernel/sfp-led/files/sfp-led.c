@@ -29,7 +29,6 @@
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
 #include <linux/platform_device.h>
-#include <linux/rtnetlink.h>
 #include <linux/sfp.h>
 #include <linux/workqueue.h>
 
@@ -67,13 +66,21 @@ static void sfp_led_set(struct led_classdev *led, bool on)
 	up_read(&led->trigger_lock);
 }
 
-/* The caller holds RTNL throughout lookup and use; no reference is cached. */
-static struct net_device *sfp_led_find_netdev(struct device_node *mac_np)
+/*
+ * The running netdev of the port's MAC, with a reference the caller drops,
+ * or NULL. Resolved under RCU rather than RTNL: this runs ten times a second
+ * per port, and the offload backend only ever tries RTNL under its own
+ * transaction, declining and retiring an admission when the try fails. A
+ * poll holding RTNL would turn a share of every box's flow admissions into
+ * such retirements. The reference is what keeps the device, its driver
+ * private data and its statistics valid until the poll is done with them.
+ */
+static struct net_device *sfp_led_get_netdev(struct device_node *mac_np)
 {
-	struct net_device *netdev;
+	struct net_device *netdev, *found = NULL;
 
-	ASSERT_RTNL();
-	for_each_netdev(&init_net, netdev) {
+	rcu_read_lock();
+	for_each_netdev_rcu(&init_net, netdev) {
 		struct device *parent = netdev->dev.parent;
 		struct device_node *node;
 		bool match;
@@ -84,11 +91,17 @@ static struct net_device *sfp_led_find_netdev(struct device_node *mac_np)
 		node = of_parse_phandle(parent->of_node, "fsl,fman-mac", 0);
 		match = node == mac_np;
 		of_node_put(node);
-		if (match)
-			return netdev;
+		if (!match)
+			continue;
+		if (netif_running(netdev) && netif_device_present(netdev)) {
+			dev_hold(netdev);
+			found = netdev;
+		}
+		break;
 	}
+	rcu_read_unlock();
 
-	return NULL;
+	return found;
 }
 
 static bool sfp_led_module_present(struct sfp_led_port *port)
@@ -167,20 +180,17 @@ static void sfp_led_poll(struct work_struct *work)
 	}
 
 	/*
-	 * Network teardown can flush work while holding RTNL. Retry instead
-	 * of waiting, and never carry a netdev pointer across rtnl_unlock().
+	 * The PCS read sleeps on the MDIO bus lock, so it runs outside RCU;
+	 * the held reference keeps the netdev and its counters valid across it.
 	 */
-	if (!rtnl_trylock())
-		goto reschedule;
-
-	netdev = sfp_led_find_netdev(port->mac_np);
-	if (netdev && netif_running(netdev) && netif_device_present(netdev)) {
+	netdev = sfp_led_get_netdev(port->mac_np);
+	if (netdev) {
 		ifindex = netdev->ifindex;
 		link = sfp_led_pcs_link(port) > 0;
 		if (link)
 			dev_get_stats(netdev, &stats);
+		dev_put(netdev);
 	}
-	rtnl_unlock();
 
 	sfp_led_update(port, true, link, ifindex, &stats);
 

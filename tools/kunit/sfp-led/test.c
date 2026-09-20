@@ -5,6 +5,7 @@
  */
 #include <kunit/test.h>
 #include <linux/etherdevice.h>
+#include <linux/rtnetlink.h>
 
 struct sfp_led_test {
 	struct kunit *test;
@@ -364,7 +365,12 @@ static void sfp_led_test_admin_down(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->pcs_reads, 0U);
 }
 
-static void sfp_led_test_rtnl_busy(struct kunit *test)
+/*
+ * The poll neither waits for nor yields to RTNL: a holder elsewhere -- an
+ * offload admission trying the lock, a link change under it -- must find the
+ * sample already taken, and the sample must not depend on the lock being free.
+ */
+static void sfp_led_test_rtnl_held(struct kunit *test)
 {
 	struct sfp_led_test *ctx = test->priv;
 
@@ -373,9 +379,9 @@ static void sfp_led_test_rtnl_busy(struct kunit *test)
 	rtnl_lock();
 	sfp_led_test_poll_once(ctx);
 	rtnl_unlock();
-	KUNIT_EXPECT_EQ(test, ctx->pcs_reads, 0U);
-	sfp_led_test_poll_once(ctx);
+	KUNIT_EXPECT_EQ(test, ctx->pcs_reads, 2U);
 	KUNIT_EXPECT_TRUE(test, ctx->port.last_link);
+	KUNIT_EXPECT_EQ(test, ctx->port.last_ifindex, ctx->netdev->ifindex);
 }
 
 static void sfp_led_test_unregister(struct kunit *test)
@@ -458,7 +464,7 @@ static struct kunit_case sfp_led_test_cases[] = {
 	KUNIT_CASE(sfp_led_test_pcs_errors),
 	KUNIT_CASE(sfp_led_test_presence_recovery),
 	KUNIT_CASE(sfp_led_test_admin_down),
-	KUNIT_CASE(sfp_led_test_rtnl_busy),
+	KUNIT_CASE(sfp_led_test_rtnl_held),
 	KUNIT_CASE(sfp_led_test_unregister),
 	KUNIT_CASE(sfp_led_test_user_trigger),
 	KUNIT_CASE(sfp_led_test_deferred_led),

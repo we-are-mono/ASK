@@ -436,6 +436,10 @@ file's git history.
 
 ## Gating
 
+- [x] **A182.** `test_flowtable_ipv6_mtu_recovery` flaked in the full suite: a readmission that lost
+  `rtnl_trylock` (the sfp-led poll held RTNL 18×/s) needs two GC ticks, more than ten quick rounds — fixed
+  (this commit): deadline settles with the busy path injected every run; the LED poll no longer takes RTNL.
+
 - [x] **A176.** `moal_init_lock()` gave every mlan spinlock the one lockdep class of its single
   `spin_lock_init()` site, so the first client's ADDBA (command lock inside the TX ralist lock) reported
   "possible recursive locking" and switched lockdep off for the run — fixed (this commit): driver patch

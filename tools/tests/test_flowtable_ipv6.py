@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import time
 
 import pytest
 import pytest_asyncio
@@ -155,6 +156,10 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
     initial = await r.state()
     assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
+    # The adapter's error count is cumulative for the boot and never reset;
+    # tests that inject failures may already have run. Only errors raised
+    # from here are this file's own.
+    r.errors = initial["errors"]
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     r.wan = wan
     cleanup = []
@@ -314,16 +319,29 @@ def _hardware_delta(before, after):
     return {i: int(after[i]["packets"]) - int(before[i]["packets"]) for i in before}
 
 
-async def _settle(r, proto, forward, reverse, send, label):
-    """Drive traffic until both directions are installed, then record them."""
-    for _ in range(10):
+async def _drive(r, send, settled, failure, timeout=10):
+    """Exchange traffic until `settled(state)` holds, failing with `failure`
+    once `timeout` seconds have passed. A deadline, not a round count: an
+    admission can lose rtnl_trylock in the backend, which declines it and
+    retires the generation, and Linux re-offers the flow only after two
+    flowtable GC ticks. A round is one short LAN exchange plus a state read,
+    well under a second, so the default covers that retry several times."""
+    deadline = time.monotonic() + timeout
+    while True:
         await send()
         state = await r.state()
-        if state["entries"] == 2:
-            rows = _assert_pair(state, proto, forward, reverse)
-            r.record(label, state)
-            return state, rows
-    pytest.fail(f"IPv6 flow did not install: {state}")
+        if settled(state):
+            return state
+        if time.monotonic() >= deadline:
+            pytest.fail(f"{failure}: {state}")
+
+
+async def _settle(r, proto, forward, reverse, send, label):
+    """Drive traffic until both directions are installed, then record them."""
+    state = await _drive(r, send, lambda s: s["entries"] == 2, "IPv6 flow did not install")
+    rows = _assert_pair(state, proto, forward, reverse)
+    r.record(label, state)
+    return state, rows
 
 
 @pytest.mark.parametrize("case", ["routed", "snat", "dnat"])
@@ -385,7 +403,7 @@ async def test_flowtable_ipv6_udp(ipv6_rig, case):
         assert delta == {TARGET_LAN_IF: 64, TARGET_WAN_IF: 64}, (delta, before_state, after_state)
         assert before_state["installs"] == after_state["installs"], (before_state, after_state)
         assert before_state["deletes"] == after_state["deletes"], (before_state, after_state)
-        assert after_state["errors"] == 0, after_state
+        assert after_state["errors"] == r.errors, after_state
         assert echo.sources == {seen_source}, echo.sources
         for direction in before:
             assert after[direction]["cookie"] == before[direction]["cookie"], (before, after)
@@ -426,7 +444,7 @@ async def test_flowtable_ipv6_tcp(ipv6_rig):
             # so require that much rather than an exact count.
             assert delta[TARGET_LAN_IF] >= 100 and delta[TARGET_WAN_IF] >= 100, \
                 (delta, after_state)
-            assert after_state["errors"] == 0, after_state
+            assert after_state["errors"] == r.errors, after_state
             assert state["installs"] == after_state["installs"], (state, after_state)
             for direction in before:
                 assert after[direction]["cookie"] == before[direction]["cookie"], (before, after)
@@ -464,13 +482,8 @@ async def test_flowtable_ipv6_masquerade(ipv6_rig):
             return await _udp_exchange(r, sport, WAN_IPV6, dport, count, (WAN_IPV6, dport),
                                        "flowtable_v6_masquerade")
 
-        for _ in range(10):
-            await send()
-            state = await r.state()
-            if state["entries"] == 2:
-                break
-        else:
-            pytest.fail(f"IPv6 masquerade did not install: {state}")
+        state = await _drive(r, send, lambda s: s["entries"] == 2,
+                             "IPv6 masquerade did not install")
         rows = {f["in"]: f for f in state["flows"]}
         assert set(rows) == {TARGET_LAN_IF, TARGET_WAN_IF}, state
         forward, reverse = rows[TARGET_LAN_IF], rows[TARGET_WAN_IF]
@@ -492,7 +505,7 @@ async def test_flowtable_ipv6_masquerade(ipv6_rig):
         after = {f["in"]: f for f in after_state["flows"]}
         delta = _hardware_delta(before, after)
         assert delta == {TARGET_LAN_IF: 64, TARGET_WAN_IF: 64}, (delta, after_state)
-        assert after_state["errors"] == 0, after_state
+        assert after_state["errors"] == r.errors, after_state
         assert echo.sources == {(DUT_IPV6_WAN, port)}, echo.sources
         r.record("ipv6-masquerade-hardware", {"after": after_state, "hardware_delta": delta,
                                               "translated_port": port})
@@ -523,31 +536,44 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
             """`expected` maps egress device to MTU: a direction describes the
             path it leaves by, so only the one egressing the changed device
             moves."""
-            for _ in range(10):
-                await send()
-                state = await r.state()
-                if state["entries"] == 2 and all(
-                        int(f["mtu"]) == expected[f["out"]] for f in state["flows"]):
-                    return state
-            pytest.fail(f"IPv6 flow did not settle at MTU {expected}: {state}")
+            # The reduce step below retires the flow twice over (the MTU change,
+            # then the injected lost RTNL), four GC ticks in the worst case.
+            return await _drive(r, send, lambda s: s["entries"] == 2 and all(
+                int(f["mtu"]) == expected[f["out"]] for f in s["flows"]),
+                f"IPv6 flow did not settle at MTU {expected}", timeout=20)
 
         initial = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
         r.record("ipv6-mtu-initial", initial)
         # 1400 is below the port MTU and above the IPv6 minimum, so the flow
         # stays admissible and simply has to be re-described.
-        await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
-                      "mtu", "1400")
-        # Both directions of a connection share one invalidation handle and
-        # the counter moves on the transition, so a single connection retiring
-        # is one increment -- not one per direction.
-        retired = await r.wait(lambda s: s["mtu_invalidations"] >= initial["mtu_invalidations"] + 1)
-        reduced = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: 1400})
-        assert reduced["errors"] == 0, reduced
+        #
+        # The readmission is made to lose RTNL on its second direction. The
+        # backend never waits for RTNL under its transaction: it declines with
+        # -EAGAIN, retires the generation, and Linux re-offers the flow after
+        # two flowtable GC ticks. Any RTNL holder can cause that in production,
+        # so the re-description has to survive it every run, not by chance.
+        knob = "/sys/module/ask_flowtable/parameters/flowtable_fail_stage"
+        assert (await r.target.fs_write(r.session, knob, "4"))["errno"] == 0
+        try:
+            await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
+                          "mtu", "1400")
+            # Both directions of a connection share one invalidation handle and
+            # the counter moves on the transition, so a single connection
+            # retiring is one increment -- not one per direction.
+            retired = await r.wait(lambda s: s["mtu_invalidations"] >= initial["mtu_invalidations"] + 1)
+            reduced = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: 1400})
+            assert (await read(r.target, r.session, knob)).strip() == "0", "fault not consumed"
+        finally:
+            assert (await r.target.fs_write(r.session, knob, "0"))["errno"] == 0
+        assert reduced["errors"] == r.errors, reduced
+        assert reduced["busy"] >= initial["busy"] + 1, (initial, reduced)
+        assert reduced["admission_invalidations"] >= initial["admission_invalidations"] + 1, \
+            (initial, reduced)
         r.record("ipv6-mtu-reduced", {"retired": retired, "reduced": reduced})
         await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
                       "mtu", str(original))
         restored = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
-        assert restored["errors"] == 0, restored
+        assert restored["errors"] == r.errors, restored
         r.record("ipv6-mtu-restored", restored)
     finally:
         transport.close()
@@ -594,19 +620,20 @@ for s in sockets:
     s.close()
 print(json.dumps({{'echoed': echoed, 'lost': lost}}))
 '''
-        state = None
-        for _ in range(6):
+        async def send():
             result = await lan_run_python(r.lan, script, timeout=120, label="flowtable_v6_budget")
             assert result.rc == 0, result.stdout
-            state = await r.state()
-            if state["entries"] == 2 * count:
-                break
-        assert state["entries"] == 2 * count, state
+
+        # Each round drives every connection, so a round is long; the budget
+        # still has to hold a lost-RTNL retry on any one of them.
+        state = await _drive(r, send, lambda s: s["entries"] == 2 * count,
+                             "IPv6 budget did not fill", timeout=60)
         # One budget, one index pair: every IPv6 direction is counted like an
         # IPv4 one, holds its own references, and none is double-counted.
         assert state["handle_refs"] == state["neighbour_refs"] == 2 * count, state
         assert state["max_entries"] == 32768, state
-        assert state["errors"] == state["fatal"] == state["quarantine"] == 0, state
+        assert state["errors"] == r.errors, state
+        assert state["fatal"] == state["quarantine"] == 0, state
         assert all(f["family"] == "6" for f in state["flows"]), state
         # Every reverse direction legitimately shares one source endpoint --
         # the echo server -- so identity is the pair, not the source alone.
@@ -756,13 +783,8 @@ async def test_flowtable_ipv6_hairpin(hairpin6):
         # already the translated one: matching the public port never fires.
         await _offload_table(r, f'ip6 saddr {client} ip6 daddr {server} '
                                 f'udp sport {HAIRPIN_SPORT} udp dport {HAIRPIN_DPORT}')
-        for _ in range(10):
-            await _hairpin_exchange(r, external, 8)
-            state = await r.state()
-            if state["entries"] == 2:
-                break
-        else:
-            pytest.fail(f"IPv6 hairpin did not install: {state}")
+        state = await _drive(r, lambda: _hairpin_exchange(r, external, 8),
+                             lambda s: s["entries"] == 2, "IPv6 hairpin did not install")
         rows = {(f["src"], f["dst"]): f for f in state["flows"]}
         # Client to server carries both translations at once; the reply carries
         # both inverses. Every direction enters and leaves by the LAN port.
@@ -781,7 +803,7 @@ async def test_flowtable_ipv6_hairpin(hairpin6):
         after = {(f["src"], f["dst"]): f for f in after_state["flows"]}
         delta = {key: int(after[key]["packets"]) - int(before[key]["packets"]) for key in before}
         assert delta == {(origin, public): 64, (target, mapped): 64}, (delta, after_state)
-        assert after_state["errors"] == 0, after_state
+        assert after_state["errors"] == r.errors, after_state
         r.record("ipv6-hairpin-hardware", {"after": after_state,
                                            "hardware_delta": {str(k): v for k, v in delta.items()}})
     finally:
