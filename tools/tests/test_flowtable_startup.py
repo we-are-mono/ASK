@@ -31,16 +31,33 @@ async def test_flowtable_startup_without_cmm_or_fci(connections):
         await asyncio.to_thread(con.login, "root", None)
         cmm = await console_command(con, "/etc/init.d/cmm", "start")
         assert "CMM disabled" in cmm["stdout"], cmm
-        default = json.loads(await read(r.target, r.session, "/etc/ask/flowtable.json"))
-        assert not default["enabled"], "test expects the shipped disabled policy"
-        result = await console_command(con, "/etc/init.d/ask-flowtable", "start")
-        applied = json.loads(result["stdout"])
-        assert not applied["enabled"] and applied["drained"]["bindings"] == 0, applied
+        # The shipped offload service is default-on and needs no configuration:
+        # its shipped policy parses, starting it binds every up CDX port, and
+        # none of that loads CMM or FCI. It is stopped again afterwards because
+        # this test's own table needs the ports.
+        shipped = await console_command(con, "/usr/sbin/ask-flowtable", "check",
+                                        "--config", "/etc/ask/offload.conf")
+        assert json.loads(shipped["stdout"])["policy_hash"], shipped
+        await console_command(con, "/etc/init.d/ask-flowtable", "start", check=False,
+                              timeout=45)
+        for _ in range(40):
+            status = json.loads((await console_command(con, "/usr/sbin/ask-flowtable",
+                                                       "status"))["stdout"])
+            if status["policy_installed"] and status["admission_ready"]:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            pytest.fail(f"default-on service did not bind the backend: {status}")
+        assert status["backend"]["bindings"] >= 2, status
+        assert status["backend"]["owner"] == "flowtable", status
         await independent()
+        await console_command(con, "/etc/init.d/ask-flowtable", "stop", check=False,
+                              timeout=45)
+    await r.wait(lambda s: not s["bindings"] and not s["entries"])
     await table(r)
     flows = [{**f, "lan": r.lan_ip} for f in FLOWS[:2]]
     async with peer(r, flows) as p:
         await warm(r, p, [0, 1], "startup-independent-admission", flows)
         state = await hardware(r, p, "startup-independent-hardware", flows)
         await independent()
-        r.record("startup-independent", {"default_policy": applied, "cmm_start": cmm, "state": state})
+        r.record("startup-independent", {"default_service": status, "cmm_start": cmm, "state": state})
