@@ -173,33 +173,6 @@ result independently of those temporary files.
   exit (`dpa_wifi.c`: port release + queue teardown) and drain the pool through its
   `free_buf_cb` before freeing it.
 
-- [ ] **A165 — the Wi-Fi driver's single transmit worker is the wire-to-Wi-Fi
-  ceiling.** Measured 2026-09-20 with the egress offload active (`bindings 1`,
-  entries tracking conntrack's `[OFFLOAD]` count), a client on channel 36 at
-  80 MHz: 160 Mbit/s with the driver at its defaults, 178 with
-  `amsdu_disable=1`, and in both runs cpu0 at 95-99% busy with 99.9% of its
-  samples in one thread -- moal's `MOAL_WORK_QUEUE` / `MOAL_TX_WORK_QUEUE`
-  workers, each created `max_active = 1`, one per adapter. The air is not the
-  cap (the phone's frames arrive at VHT80 NSS2 MCS8/9, 780-866 Mbit/s PHY) and
-  the CDX handoff is not on the profile above 1%. The pegged core is
-  `ra_list_spinlock` churn once per MSDU, the A-MSDU copy, the per-packet skb
-  copy (`tx_skb_clone`, fixed in A162) and the free; on the KASAN image about
-  28% of its samples are KASAN/kmemleak bookkeeping inside those alloc/free
-  calls, so the production height is not established -- only the location.
-  A control with no classifier at all (a UDP blast generated on the board out
-  `uap0`) stalls at the same 120-135 Mbit/s. Remaining levers, none taken yet:
-  measure A-MSDU off against real client mixes before changing its default;
-  move the free of the source skb out of the aggregation loop; and the
-  structural one, which is that one worker per radio cannot be spread by
-  anything CDX does. A non-instrumented boot of the same image is the one
-  measurement that would put a production number on this.
-  Driver patch 0007 takes the second lever: the A-MSDU is now built under one
-  hold of `ra_list_spinlock` and the sources are freed after it is dropped,
-  instead of an unlock, a free, a relock and a ralist revalidation per MSDU.
-  It boots and serves the AP but is **unmeasured** — every number here needs
-  the phone (iperf3 reverse to the orchestrator); measure it and the A-MSDU
-  on/off question with the same client before either default moves.
-
 - [ ] **A159 — a bound flowtable stops the port's ingress byte counters.**
   With an nftables flowtable bound to a port, that port's rx byte and packet
   counters stop counting forwarded traffic. Measured with a controlled
@@ -482,6 +455,12 @@ file's git history.
   offline port or a SEC job ring had no offload at all — fixed (this commit): non-fatal, with
   `cdx_ipsec_ready()` refusing SA admission by both owners, the xfrmdev attachment and the encoder's
   table lookup; proved with `cdx.dpa_init_fail_site=cdx_dpa_ipsec_init`.
+
+- [x] **A165.** The "single TX worker is the wire-to-Wi-Fi ceiling" was an instrumentation artifact:
+  a production-config kernel (no KASAN/lockdep/kmemleak) with the flow offloaded runs 654 Mbit/s median,
+  666 peak on VHT80 2x2 — the air ceiling, not the worker. The 160–201 figures were KASAN+lockdep
+  roughly halving a CPU-borne path plus offload not engaged. Lock-churn lever landed in _c14ecd5_
+  (patch 0007); the single-worker structural limit is dormant below a faster PHY. Numbers in memory.
 
 - [x] **A175.** `ft_wifi_exit()` blocked on RTNL with the CDX transaction held, the reverse of the bind
   path's order (transaction under RTNL via `dpa_setup_tc`) — a lock inversion lockdep reports at unload
