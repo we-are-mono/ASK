@@ -444,12 +444,29 @@ async def test_flowtable_bridge_fdb_roaming(bridge_rig):
         # broadcasts for a host that does not exist carries exactly the MAC the
         # bridge has learned on the first port, tagged onto the second.
         await lan_run(r.lan, f"ip link set {lan_if} up; "
-                             f"ip addr add {ROAM_ADDR}/24 dev {lan_if}; "
-                             f"ping -c 1 -W 1 -I {lan_if} {ROAM_PROBE} "
-                             f">/dev/null 2>&1; true", 20.0)
-        moved = await r.wait(
-            lambda s: s["fdb_invalidations"] >= before["fdb_invalidations"] + 1, timeout=15)
-        assert await _fdb(r, r.lan_mac) == [roam_port]
+                             f"ip addr add {ROAM_ADDR}/24 dev {lan_if}", 20.0)
+        # The roam port and the parent carry the same MAC, so the parent's own
+        # background traffic can relearn the entry back onto it between reads. A
+        # single snapshot after the first probe therefore races. Re-send the
+        # tagged probe and poll until the bridge both shows the address on the
+        # roam port and has told the adapter to invalidate; seeing the roam port
+        # once is proof the relearn happened, and the retirement below is the
+        # invariant the test is really asserting.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 20
+        moved = None
+        while moved is None:
+            await lan_run(r.lan, f"ping -c 1 -W 1 -I {lan_if} {ROAM_PROBE} "
+                                 f">/dev/null 2>&1; true", 12.0)
+            s = await r.state()
+            if (s["fdb_invalidations"] >= before["fdb_invalidations"] + 1
+                    and await _fdb(r, r.lan_mac) == [roam_port]):
+                moved = s
+            elif loop.time() >= deadline:
+                pytest.fail(f"station did not roam to {roam_port}: "
+                            f"fdb={await _fdb(r, r.lan_mac)} state={s}")
+            else:
+                await asyncio.sleep(0.5)
         retired = await r.wait(lambda s: not s["entries"], timeout=15)
         assert retired["errors"] == before["errors"], retired
         r.record("bridge-fdb-roaming", {"flows": flows, "before": before,

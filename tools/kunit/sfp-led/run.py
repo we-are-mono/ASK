@@ -35,13 +35,14 @@ def main():
     shutil.copyfile(tests / "test.c", dest / "test.c")
     (dest / "Makefile").write_text("obj-$(CONFIG_SFP_LED_KUNIT_TEST) += sfp-led.o\n")
 
+    # The entry is the last thing in the file; rewrite it so a tree reused
+    # across driver revisions carries the current dependencies.
     kconfig = kernel / "drivers/leds/Kconfig"
-    if "config SFP_LED_KUNIT_TEST" not in kconfig.read_text():
-        with kconfig.open("a") as stream:
-            stream.write(
-                '\nconfig SFP_LED_KUNIT_TEST\n\tbool "Mono SFP LED KUnit tests"\n'
-                "\tdepends on KUNIT && OF && I2C && PHYLIB && LEDS_CLASS && LEDS_TRIGGERS\n"
-            )
+    text = kconfig.read_text().split("\nconfig SFP_LED_KUNIT_TEST")[0]
+    kconfig.write_text(
+        text + '\nconfig SFP_LED_KUNIT_TEST\n\tbool "Mono SFP LED KUnit tests"\n'
+        "\tdepends on KUNIT && OF && GPIOLIB && PHYLIB && LEDS_CLASS && LEDS_TRIGGERS\n"
+    )
     makefile = kernel / "drivers/leds/Makefile"
     if "sfp-led-kunit/" not in makefile.read_text():
         with makefile.open("a") as stream:
@@ -53,7 +54,11 @@ def main():
         [sys.executable, "tools/testing/kunit/kunit.py", "run",
          f"--kunitconfig={tests / '.kunitconfig'}", f"--build_dir={build}",
          f"--jobs={args.jobs}", "--timeout=90",
-         f"--kernel_args=dtb={dest / 'test.dtb'}", "sfp-led"],
+         f"--kernel_args=dtb={dest / 'test.dtb'}",
+         # fw_devlink would hold the populated ports on their LED nodes until
+         # the deferred-probe timeout, which this run never reaches; the board
+         # loads the module at S99, past it.
+         "--kernel_args=fw_devlink=off", "sfp-led"],
         cwd=kernel, env=env, check=True,
     )
 

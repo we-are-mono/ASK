@@ -6,9 +6,15 @@
 	#address-cells = <1>;
 	#size-cells = <1>;
 
-	i2c: i2c {
-		#address-cells = <1>;
-		#size-cells = <0>;
+	gpio: gpio {
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+
+	/* A controller no chip ever registers for: its consumers defer. */
+	gpio_absent: gpio-absent {
+		gpio-controller;
+		#gpio-cells = <2>;
 	};
 
 	mdio {
@@ -20,13 +26,26 @@
 		};
 	};
 
+	/* Active-low, as the board declares its cages. */
 	sfp: sfp {
-		i2c-bus = <&i2c>;
+		mod-def0-gpios = <&gpio 0 1>;
+	};
+
+	sfp_nogpio: sfp-nogpio {
+		mod-def0-gpios = <&gpio_absent 0 1>;
 	};
 
 	mac: mac {
 		compatible = "fsl,fman-memac";
 		sfp = <&sfp>;
+		phy-connection-type = "xgmii";
+		pcs-handle = <&pcs>;
+		pcs-handle-names = "xfi";
+	};
+
+	mac2: mac2 {
+		compatible = "fsl,fman-memac";
+		sfp = <&sfp_nogpio>;
 		phy-connection-type = "xgmii";
 		pcs-handle = <&pcs>;
 		pcs-handle-names = "xfi";
@@ -42,12 +61,19 @@
 
 	controller {
 		port0 {
+			compatible = "mono,sfp-led-port";
 			sfp = <&sfp>;
 			leds = <&link>, <&activity>;
 		};
 		port1 {
+			compatible = "mono,sfp-led-port";
 			sfp = <&sfp>;
 			leds = <&link>, <&late>;
+		};
+		port2 {
+			compatible = "mono,sfp-led-port";
+			sfp = <&sfp_nogpio>;
+			leds = <&link>, <&activity>;
 		};
 	};
 };

@@ -436,6 +436,18 @@ file's git history.
 
 ## Gating
 
+- [x] **A185.** `test_flowtable_bridge_fdb_roaming` (from da0b00a) read the bridge FDB once after the
+  roam, but the parent carries the same MAC and its background traffic relearns the entry, so the
+  single snapshot raced — fixed (this commit): re-send the tagged probe and poll until the roam port shows.
+
+- [x] **A184.** sfp-led probing before sfp.c held MOD_DEF0 (sfp requests it only after its I²C adapter)
+  won the line, and sfp's exclusive retry then failed for good — fixed (this commit): a port defers until
+  the sfp device is bound, so it only ever borrows; KUnit `sfp_unbound` took the line without it.
+
+- [x] **A183.** sfp-led put a borrowed MOD_DEF0 descriptor on deferred probe and unload: the sfp driver's
+  line and active-low flag were released under it and a device ref it never took dropped — fixed (this
+  commit): borrow without devm, put only an owned line; KUnit `shared_gpio` crashed UML without it.
+
 - [x] **A182.** `test_flowtable_ipv6_mtu_recovery` flaked in the full suite: a readmission that lost
   `rtnl_trylock` (the sfp-led poll held RTNL 18×/s) needs two GC ticks, more than ten quick rounds — fixed
   (this commit): deadline settles with the busy path injected every run; the LED poll no longer takes RTNL.
