@@ -290,8 +290,9 @@ bool cdx_ft_port_supported(struct net_device *dev);
 
 /* What a finished frame may be handed to: every device the above admits, plus
  * an open Wi-Fi VAP. Wider than cdx_ft_port_supported() and deliberately not a
- * replacement for it -- a VAP may receive a frame and may not originate one,
- * because its ingress cannot be hooked by an offloaded flowtable at all. */
+ * replacement for it -- a VAP may receive a frame and may not originate one:
+ * its ingress is bound passively and every flow from it is declined into the
+ * software fast path. */
 bool cdx_ft_egress_supported(struct net_device *dev);
 
 /* ASK-DEBUG: why a flow was accepted or refused.

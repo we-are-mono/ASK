@@ -235,12 +235,12 @@ EXPORT_SYMBOL_NS_GPL(cdx_ft_port_supported, ASK_CDX_FLOWTABLE);
  * ordinary entry with its enqueue target pointed elsewhere, and needs nothing
  * else from this side.
  *
- * The reverse is not true and is not granted here. A VAP's own ingress cannot
- * be hooked at all: an offloaded flowtable refuses to bind a device whose
- * driver supports no offload, which `moal` does not, so a flow arriving from
- * Wi-Fi never reaches this contract in the first place and stays on the
- * software path. Keeping the two predicates separate is what states that in
- * code rather than in a comment.
+ * The reverse is not true and is not granted here. A VAP's own ingress is
+ * never programmed: the adapter binds a non-DPAA device passively (every
+ * request declined), so a flow arriving from Wi-Fi is refused here and stays
+ * on the software fast path while the DPAA ports in the same table keep
+ * theirs. Keeping the two predicates separate is what states that in code
+ * rather than in a comment.
  *
  * Open, not merely configured: the frame queues an entry would name are built
  * during the transition to open.

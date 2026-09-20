@@ -421,6 +421,10 @@ file's git history.
 
 ## Gating
 
+- [x] **A171.** A non-DPAA device in an offload flowtable (a VAP, which fw4 always lists once Wi-Fi
+  is in the LAN bridge) was refused, which fails the whole table and drops every port to software —
+  fixed (this commit): bound passively, its flows declined into the software fast path.
+
 - [x] **A163.** The IPsec egress encoder passed hash 0 to `dpaa_get_vap_fwd_fq()`, pinning every
   encrypted flow to a VAP onto queue 0 and one CPU — fixed (this commit): spread by SA handle.
 

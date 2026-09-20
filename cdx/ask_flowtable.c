@@ -1886,6 +1886,38 @@ static void ft_release(void *priv)
 	kfree(binding);
 }
 
+/* A device the classifier cannot program, bound anyway.
+ *
+ * Netfilter registers an offload flowtable only if every listed device accepts
+ * its block: one refusal fails the whole table, and fw4 then falls back to
+ * software offload for every port. The list it hands over is the physical
+ * lowers of the zone devices, so on a gateway with Wi-Fi in the LAN bridge a
+ * VAP is always on it. Refusing the VAP therefore cost the wired ports their
+ * hardware path -- the opposite of what the refusal was written to protect.
+ *
+ * So a device that is not a DPAA port is bound with this callback instead,
+ * which declines every request. Netfilter counts a declined direction as "not
+ * offloaded" and leaves it on the software fast path, which is exactly where a
+ * Wi-Fi ingress belongs; the DPAA ports in the same table keep their hardware
+ * path. Nothing is allocated for the device beyond the record the unload drain
+ * needs to find its table.
+ */
+struct cdx_ft_passive {
+	struct nf_flowtable *table;
+};
+
+static int ft_passive_callback(enum tc_setup_type type, void *data, void *priv)
+{
+	return -EOPNOTSUPP;
+}
+
+static void ft_passive_release(void *priv)
+{
+	kfree(priv);
+}
+
+static unsigned int ft_passive;
+
 /* All previous callbacks must have lost their bindings, and the worker must
  * have finished both hardware retirement and Linux flow cleanup. Completion
  * is published as its last action under the backend transaction, so an old worker cannot
@@ -1939,9 +1971,40 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		down_write(&flowtable->flow_block_lock);
 	cdx_ft_begin();
 	if (bo->command == FLOW_BLOCK_BIND) {
+		if (!ft_ready || ft_stopping) {
+			rc = -EOPNOTSUPP;
+			goto out;
+		}
+		if (!cdx_ft_port_supported(dev)) {
+			struct cdx_ft_passive *passive;
+
+			passive = kzalloc(sizeof(*passive), GFP_KERNEL);
+			if (!passive) {
+				rc = -ENOMEM;
+				goto out;
+			}
+			passive->table = flowtable;
+			cb = indirect ?
+				flow_indr_block_cb_alloc(ft_passive_callback, dev, passive,
+					ft_passive_release, bo, dev, sch, flowtable, NULL,
+					cleanup) :
+				flow_block_cb_alloc(ft_passive_callback, dev, passive,
+					ft_passive_release);
+			if (IS_ERR(cb)) {
+				kfree(passive);
+				rc = PTR_ERR(cb);
+				goto out;
+			}
+			flow_block_cb_add(cb, bo);
+			list_add_tail(&cb->driver_list, &ft_block_list);
+			ft_passive++;
+			pr_info("cdx flowtable: %s bound passively, its flows stay in software\n",
+				netdev_name(dev));
+			goto out;
+		}
 		rearm = atomic_read(&ft_invalid);
-		if (!ft_ready || ft_stopping || cdx_ft_failed() || !cdx_ft_port_supported(dev) ||
-		    ft_bound >= CDX_FT_MAX_BINDINGS || (rearm && !ft_can_rearm())) {
+		if (cdx_ft_failed() || ft_bound >= CDX_FT_MAX_BINDINGS ||
+		    (rearm && !ft_can_rearm())) {
 			rc = -EOPNOTSUPP;
 			goto out;
 		}
@@ -1999,6 +2062,11 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		list_add_tail(&cb->driver_list, &ft_block_list);
 	} else if (bo->command == FLOW_BLOCK_UNBIND) {
 		cb = flow_block_cb_lookup(bo->block, ft_rule_callback, dev);
+		if (!cb) {
+			cb = flow_block_cb_lookup(bo->block, ft_passive_callback, dev);
+			if (cb)
+				ft_passive--;
+		}
 		if (!cb) {
 			rc = -ENOENT;
 			goto out;
@@ -4978,12 +5046,12 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * mark selectors contradict what the running adapter will decode. */
 	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\n",
 		   ft_qos_mark_mask, ft_qos_default_class);
-	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\nentries %u\nmax_entries %u\n"
+	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\npassive %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
 		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_next_hop_updates %lld\n",
-		   "flowtable", cdx_ft_observing(), ft_bound, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
+		   "flowtable", cdx_ft_observing(), ft_bound, ft_passive, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
 		   cdx_ft_pending(),
@@ -5173,8 +5241,12 @@ static void ft_block_drain(void)
 	struct nf_flowtable *table;
 
 	list_for_each_entry_safe(cb, next, &ft_block_list, driver_list) {
-		binding = cb->cb_priv;
-		table = binding->table;
+		if (cb->cb == ft_passive_callback) {
+			table = ((struct cdx_ft_passive *)cb->cb_priv)->table;
+		} else {
+			binding = cb->cb_priv;
+			table = binding->table;
+		}
 		down_write(&table->flow_block_lock);
 		list_del(&cb->list);
 		up_write(&table->flow_block_lock);
