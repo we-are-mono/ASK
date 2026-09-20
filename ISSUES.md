@@ -421,6 +421,10 @@ file's git history.
 
 ## Gating
 
+- [x] **A162.** `moal` defaulted `tx_skb_clone=1` and so `pskb_copy`'d every transmitted frame on
+  its single TX worker, the second-largest item on the pegged core — fixed (this commit): default 0,
+  the cloned/headroom predicate it bypassed still copies what needs copying (patch 0004).
+
 - [x] **A161.** Use-after-free in the Wi-Fi driver's transmit path: `wlan_dequeue_tx_packet()` read
   `ptr->sta` after the send helpers dropped `ra_list_spinlock`, racing `wlan_wmm_delete_peer_ralist()`
   on a station leaving under load — fixed (this commit): re-validate under the lock (patch 0003).
