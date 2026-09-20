@@ -463,6 +463,10 @@ file's git history.
 
 ## Gating
 
+- [x] **A175.** `ft_wifi_exit()` blocked on RTNL with the CDX transaction held, the reverse of the bind
+  path's order (transaction under RTNL via `dpa_setup_tc`) — a lock inversion lockdep reports at unload
+  once a table has been bound; hidden until A174 restored lockdep — fixed (this commit): RTNL first.
+
 - [x] **A174.** The netlink cb_mutex lockdep name table stopped at 33 while `MAX_LINKS` is 64, and moal's
   socket sits at 63: a nameless class WARNs, `debug_locks_off()` disables lockdep and sets the console
   to level 15 on every test-image boot since the radio was added — fixed (this commit): patch 093 names

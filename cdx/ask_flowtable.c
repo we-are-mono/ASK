@@ -4557,12 +4557,14 @@ static void ft_ipsec_detach_all(void)
  * used to be.
  *
  * It cannot be done where it is noticed. Registration needs the backend
- * transaction and then RTNL -- the order cdx_ft_admission_begin() takes them,
- * and the only order this module ever takes them in -- while a netdev notifier
- * arrives already holding RTNL. Taking the transaction under it is exactly the
- * inversion that trylock exists to avoid. So the notifier records what it saw
- * and a worker reconciles it, as the multicast learner and the IPsec next-hop
- * watch both do, for the same reason.
+ * transaction and RTNL, and the two have one safe order: RTNL is taken under
+ * the transaction only by trying (cdx_ft_admission_begin()), because the bind
+ * path already takes the transaction under RTNL and a blocking rtnl_lock()
+ * inside the transaction would invert that -- lockdep reported exactly this at
+ * unload, where the exit path once blocked on RTNL with the transaction held;
+ * it now takes RTNL first. A netdev notifier arrives already holding RTNL, so
+ * the notifier records what it saw and a worker reconciles it, as the multicast
+ * learner and the IPsec next-hop watch both do, for the same reason.
  */
 struct ft_wifi_watch {
 	struct list_head list;
@@ -4849,11 +4851,15 @@ static void ft_wifi_exit(void)
 
 	list_for_each_entry_safe(w, tmp, &ft_wifi_watches, list) {
 		if (w->vap) {
-			cdx_ft_begin();
+			/* RTNL before the transaction, never after it: the bind
+			 * path takes the transaction under RTNL (via dpa_setup_tc),
+			 * so the reverse order here is a lock inversion lockdep
+			 * reports at unload once a table has ever been bound. */
 			rtnl_lock();
+			cdx_ft_begin();
 			cdx_wifi_vap_del(&w->vap);
-			rtnl_unlock();
 			cdx_ft_end();
+			rtnl_unlock();
 			ft_wifi_registered--;
 		}
 		list_del(&w->list);
