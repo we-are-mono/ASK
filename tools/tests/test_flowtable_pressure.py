@@ -10,10 +10,9 @@ import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from ask_flowtable import policy_hash
 from test_flowtable_connections import FLOWS, SPORT, connections, peer  # noqa: F401
 from test_flowtable_offload import ARTIFACTS, DPORT, TABLE, WAN_IP, command, console_command, console_python, rig  # noqa: F401
-from test_flowtable_policy import apply, candidate, installed, stop
+from test_flowtable_policy import apply, candidate, expected_hash, installed, policy_to_conf, stop
 from test_flowtable_selective_neighbour import hardware, keys, warm
 from test_flowtable_tcp import software_tx
 
@@ -32,6 +31,8 @@ async def test_flowtable_concurrent_policy_and_routes(connections):
         await asyncio.to_thread(con.login, "root", None)
         try:
             await apply(con, policy, r=r)
+            phash = await expected_hash(con, policy)
+            ehash = await expected_hash(con, excluded)
             async with peer(r, flows) as p:
                 initial = await warm(r, p, [0, 1], "pressure-policy-initial", flows)
                 await p.rpc("start", [0, 1], count=0, interval=0.01)
@@ -39,8 +40,8 @@ async def test_flowtable_concurrent_policy_and_routes(connections):
                 try:
                     script = f'''
 import concurrent.futures, json, pathlib, subprocess, time
-policies = { [policy, excluded]!r}
-paths = [pathlib.Path('/tmp/ask-flowtable-race-%d.json' % i) for i in range(2)]
+confs = { [policy_to_conf(policy), policy_to_conf(excluded)]!r}
+paths = [pathlib.Path('/tmp/ask-flowtable-race-%d.conf' % i) for i in range(2)]
 def run(argv):
     start = time.monotonic()
     r = subprocess.run(argv, capture_output=True, text=True, timeout=45)
@@ -56,7 +57,7 @@ def change():
         time.sleep(0.05)
     return result
 try:
-    for path, policy in zip(paths, policies): path.write_text(json.dumps(policy))
+    for path, text in zip(paths, confs): path.write_text(text)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         jobs = [pool.submit(reload, i) for i in range(3)] + [pool.submit(change)]
         result = [j.result() for j in jobs]
@@ -92,7 +93,7 @@ finally:
                     for group in operations[:3]:
                         for item in group:
                             applied = json.loads(item["stdout"])
-                            assert applied["enabled"] and applied["policy_hash"] in (policy_hash(policy), policy_hash(excluded))
+                            assert applied["enabled"] and applied["policy_hash"] in (phash, ehash)
                             assert all(applied["drained"][k] == 0 for k in ("bindings", "entries", "handle_refs", "neighbour_refs", "quarantine"))
                 finally:
                     if running:
@@ -101,10 +102,10 @@ finally:
                 # desired policy, then prove stable hardware on both sockets.
                 await apply(con, policy, r=r)
                 status = await installed(con)
-                assert status["admission_ready"] and status["policy_hash"] == policy_hash(policy), status
+                assert status["admission_ready"] and status["policy_hash"] == phash, status
                 await warm(r, p, [0, 1], "pressure-policy-recovered", flows)
                 await hardware(r, p, "pressure-policy-final-hardware", flows)
         finally:
             await stop(con)
             await console_command(con, "ip", "link", "set", "dev", TARGET_LAN_IF, "mtu", "1500")
-            await console_command(con, "rm", "-f", "/tmp/ask-flowtable-test.json")
+            await console_command(con, "rm", "-f", "/tmp/ask-flowtable-test.conf")

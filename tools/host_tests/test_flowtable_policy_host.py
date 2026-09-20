@@ -1,305 +1,206 @@
-"""Configuration validation and the hardware-drain transaction boundary."""
-import copy
-import json
+"""The ask-flowtable policy engine, compiled and driven natively.
+
+The offload policy is now a C daemon (flowtable/src). This test compiles its
+validator, renderer, and ownership fingerprint into a small harness
+(flowtable_policy.c) and feeds it conf snippets, so the accept/reject surface,
+the injection guards, and the rendered nftables output are covered off the rig.
+"""
 import os
 from pathlib import Path
 import re
-import signal
-import shlex
 import subprocess
-import sys
-import time
-from types import SimpleNamespace
 
 import pytest
 
-import ask_flowtable as policy
-
 ROOT = Path(__file__).resolve().parents[2]
-BASE ={"version": 1, "enabled": True, "devices": ["eth3", "eth4"],
-        "scope": [{"source": "192.0.2.0/24", "destination": "198.51.100.2"}],
-        "exclude": [{"protocol": "tcp", "port": 21}]}
+ENGINE = ROOT / "flowtable" / "src"
+HARNESS = Path(__file__).with_name("flowtable_policy.c")
+
+BASE = """\
+enabled yes
+devices eth3 eth4
+scope 192.0.2.0/24 -> 198.51.100.2
+exclude tcp 21
+"""
 
 
-@pytest.mark.parametrize("change", [
-    {"version": True}, {"version": 2}, {"enabled": 1}, {"devices": ["eth3", "eth3"]},
-    {"devices": ["eth3; flush ruleset", "eth4"]}, {"scope": []}, {"extra": 1},
-    {"exclude": [{}]}, {"scope": [{"source": "192.0.2.1/24"}]},
-    {"scope": [{"source": "2001:db8::/32"}]}, {"exclude": [{"protocol": "icmp"}]},
-    {"exclude": [{"port": True}]}, {"exclude": [{"port": 0}]},
-    {"exclude": [{"port": {"min": 100, "max": 1}}]},
-    {"exclude": [{"mark": {"value": 16, "mask": 15}}]},
-    {"exclude": [{"name": "an accidental wildcard"}]},
-    {"devices": ["eth3"]}, {"devices": []},
-    {"devices": [f"eth{i}" for i in range(policy.MAX_DEVICES + 1)]},
-    {"devices": ["eth3", "eth4", "eth3"]},
+@pytest.fixture(scope="module")
+def engine(tmp_path_factory):
+    out = tmp_path_factory.mktemp("ft") / "flowtable_policy"
+    cc = os.environ.get("HOSTCC", "cc")
+    subprocess.run([
+        cc, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        "-I", str(ENGINE),
+        str(ENGINE / "policy.c"), str(ENGINE / "conf.c"),
+        str(ENGINE / "render.c"), str(ENGINE / "sha256.c"), str(ENGINE / "marker.c"),
+        str(HARNESS), "-o", str(out),
+    ], check=True)
+    return out
+
+
+def run(engine, conf, *args):
+    env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+           "UBSAN_OPTIONS": "halt_on_error=1"}
+    return subprocess.run([str(engine), *args], input=conf, text=True,
+                          capture_output=True, env=env)
+
+
+def check(engine, conf):
+    return run(engine, conf, "check")
+
+
+def render(engine, conf, mask=None):
+    args = ["render"] + (["--mask", hex(mask)] if mask is not None else [])
+    r = run(engine, conf, *args)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout
+
+
+# --- validation: accept -----------------------------------------------------
+
+def test_accepts_the_default_and_base(engine):
+    for conf in (BASE, "devices auto\nscope any\nexclude tcp 21\nexclude udp 5060\n"):
+        r = check(engine, conf)
+        assert r.returncode == 0 and r.stdout.startswith("OK "), r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("conf", [
+    "enabled yes\ndevices eth3 eth4\nscope any\n",
+    "devices auto\nscope any\n",                                  # auto defers count
+    "enabled no\n",                                               # disabled needs nothing
+    "devices eth3 eth4\nscope proto tcp dport 443 saddr 10.0.0.0/24\n",
+    "devices eth3 eth4\nscope 10.0.0.0/8 -> 1.2.3.4\nexclude mark 0x10/0xf0\n",
+    "devices pppoe-wan br-lan br-guest br-iot\nscope any\n",      # a port per bridge
 ])
-def test_policy_rejects_invalid_configuration(change):
-    with pytest.raises(policy.PolicyError):
-        policy.validate({**copy.deepcopy(BASE), **change})
+def test_accepts(engine, conf):
+    r = check(engine, conf)
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
-def test_policy_accepts_a_port_per_bridge():
-    """A WAN and three bridged LANs is four devices, not a pair. Each names an
-    ingress; a direction's egress comes from the route, so nothing pairs them."""
-    gateway = {**copy.deepcopy(BASE), "devices": ["pppoe-wan", "br-lan", "br-guest", "br-iot"]}
-    assert policy.validate(gateway) is gateway
-    flowtable = next(line for line in policy.render(gateway).splitlines() if "flowtable fast" in line)
-    for device in gateway["devices"]:
-        assert f'"{device}"' in flowtable
+# --- validation: reject -----------------------------------------------------
+
+@pytest.mark.parametrize("conf,msg", [
+    ("version 2\ndevices eth3 eth4\nscope any\n", "version"),
+    ("enabled maybe\ndevices eth3 eth4\nscope any\n", "yes or no"),
+    ("devices eth3\nscope any\n", "2 to"),
+    ("devices eth3 eth3\nscope any\n", "duplicate"),
+    ('devices "eth3; flush ruleset" eth4\nscope any\n', "invalid interface name"),
+    ("devices eth3 eth4\n", "admission scope"),                   # enabled, no scope
+    ("devices eth3 eth4\nscope saddr 192.0.2.1/24\n", "host bits"),
+    ("devices eth3 eth4\nscope saddr 2001:db8::/32\n", "IPv4"),
+    ("devices eth3 eth4\nexclude proto icmp\n", "tcp and udp"),
+    ("devices eth3 eth4\nexclude name lonely\n", "at least one selector"),
+    ("devices eth3 eth4\nscope proto tcp dport 70000\n", "1..65535"),
+    ("devices eth3 eth4\nscope port 100-1\n", "min exceeds max"),
+    ("devices eth3 eth4\nscope any\nbogus line\n", "unknown configuration key"),
+    ("devices eth3 eth4\nscope badkey 5\n", "unknown selector"),
+    ("enabled yes\nenabled no\ndevices eth3 eth4\nscope any\n", "duplicate key: enabled"),
+    ("devices eth3 eth4\ndevices eth5 eth6\nscope any\n", "duplicate key: devices"),
+])
+def test_rejects(engine, conf, msg):
+    r = check(engine, conf)
+    assert r.returncode != 0, "expected rejection: " + r.stdout
+    assert msg in r.stdout, f"want {msg!r} in {r.stdout!r}"
 
 
-def test_policy_device_bound_matches_the_adapter():
-    """MAX_DEVICES restates CDX_FT_MAX_BINDINGS. Drift would refuse a policy
+def test_rejects_oversized_device_list(engine):
+    devs = " ".join(f"eth{i}" for i in range(41))
+    r = check(engine, f"devices {devs}\nscope any\n")
+    assert r.returncode != 0 and ("at most 40" in r.stdout or "2 to 40" in r.stdout), r.stdout
+
+
+def test_rejects_config_over_64k(engine):
+    conf = "devices eth3 eth4\nscope any\n" + "# pad\n" * 20000
+    r = check(engine, conf)
+    assert r.returncode != 0 and "64 KiB" in r.stdout, r.stdout
+
+
+# --- rendering --------------------------------------------------------------
+
+def test_render_port_shorthand_expands_all_fields(engine):
+    rules = render(engine, BASE)
+    for expr in ("ct original proto-src 21", "ct original proto-dst 21",
+                 "ct reply proto-src 21", "ct reply proto-dst 21"):
+        assert "meta l4proto tcp " + expr + " return" in rules
+
+
+def test_render_addresses_ports_and_scope(engine):
+    conf = ("devices eth3 eth4\n"
+            "scope 192.0.2.0/24 -> 198.51.100.2\n"
+            "exclude reply-daddr 203.0.113.4 sport 1000-2000 mark 0x2/0x3\n")
+    rules = render(engine, conf)
+    assert ("ct reply ip daddr 203.0.113.4/32 ct original proto-src 1000-2000 "
+            "ct mark & 0x3 == 0x2 return") in rules
+    assert "ct original ip saddr 192.0.2.0/24 ct original ip daddr 198.51.100.2/32 flow add @fast" in rules
+
+
+def test_render_is_offload_only_and_clean(engine):
+    rules = render(engine, BASE)
+    assert "flags offload" in rules
+    assert "counter" not in rules and "flush" not in rules
+    assert "ct status snat" not in rules and "ct status dnat" not in rules
+
+
+def test_render_port_per_bridge_binds_each(engine):
+    conf = "devices pppoe-wan br-lan br-guest br-iot\nscope any\n"
+    line = next(l for l in render(engine, conf).splitlines() if "flowtable fast" in l)
+    for dev in ("pppoe-wan", "br-lan", "br-guest", "br-iot"):
+        assert f'"{dev}"' in line
+
+
+def test_render_marker_stable_and_present(engine):
+    rules = render(engine, BASE)
+    m = re.search(r'comment "ask-flowtable/v1:([0-9a-f]{64})"', rules)
+    assert m
+    got = check(engine, BASE).stdout.split()[1]
+    assert m.group(1) == got, "table marker must equal the policy hash"
+
+
+def test_render_admission_mask_follows_the_adapter(engine):
+    # No mask: every mark still declines to software (historical ct mark != 0).
+    assert "  ct mark & 0xffffffff != 0x0 return" in render(engine, BASE, 0).splitlines()
+    # A class mask leaves the class bits for the adapter; other bits refuse.
+    assert "  ct mark & 0xff00ffff != 0x0 return" in render(engine, BASE, 0x00ff0000).splitlines()
+    # The mask changes the guard but not the marker: a reboot under a different
+    # mask is not a different policy.
+    plain, masked = render(engine, BASE, 0), render(engine, BASE, 0x00ff0000)
+    assert plain != masked
+    marker = 'comment "ask-flowtable/v1:' + check(engine, BASE).stdout.split()[1] + '"'
+    assert marker in plain and marker in masked
+
+
+HEX = "0" * 64
+
+
+@pytest.mark.parametrize("text,owned", [
+    # Our own table: marker is the table comment, before the chain.
+    (f'table inet ask_flowtable {{\n\tcomment "ask-flowtable/v1:{HEX}"\n\t'
+     f'flowtable fast {{ }}\n\tchain admit {{ }}\n}}\n', True),
+    # Regression guard: "flowtable " also occurs in the table NAME; the bound
+    # must not exclude our own comment on the line above the flowtable object.
+    (f'table inet ask_flowtable {{ # ask_flowtable\n\tcomment "ask-flowtable/v1:{HEX}"\n\t'
+     f'flowtable fast {{ }}\n\tchain c {{ }}\n}}\n', True),
+    # Foreign table, same name, marker only inside a rule comment (in a chain):
+    # must NOT be mistaken for ours (else we would delete a foreign table).
+    (f'table inet ask_flowtable {{\n\tcomment "not ours"\n\tchain c {{ '
+     f'ip saddr 1.2.3.4 comment "ask-flowtable/v1:{HEX}" }}\n}}\n', False),
+    # No marker at all.
+    ('table inet ask_flowtable {\n\tcomment "foreign"\n}\n', False),
+    # Truncated hash.
+    ('table inet ask_flowtable {\n\tcomment "ask-flowtable/v1:dead"\n\tchain c {}\n}\n', False),
+])
+def test_marker_ownership(engine, text, owned):
+    r = run(engine, text, "marker")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.startswith("OWNED " if owned else "FOREIGN"), r.stdout
+
+
+def test_device_bound_matches_the_adapter():
+    """FT_MAX_DEVICES restates CDX_FT_MAX_BINDINGS. Drift would refuse a policy
     the adapter would have taken, or accept one it will only half bind."""
     header = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
-    assert int(re.search(r"^#define CDX_FT_MAX_BINDINGS\s+(\d+)", header, re.M)[1]) == policy.MAX_DEVICES
-
-
-@pytest.mark.parametrize("reported, expected", [
-    ({"dev": ["eth3", "eth4"]}, ["eth3", "eth4"]),
-    ({"dev": "eth3"}, ["eth3"]),   # nft reports a lone device unwrapped
-    ({}, []),
-])
-def test_policy_reads_back_the_installed_devices(reported, expected):
-    contents = [{"table": {"name": policy.TABLE}}, {"flowtable": {"name": "fast", **reported}}]
-    assert policy.flowtable_devices(contents) == expected
-
-
-def test_policy_json_and_tuple_semantics(tmp_path):
-    path = tmp_path / "policy.json"
-    path.write_text('{"version": 1, "version": 2}')
-    with pytest.raises(policy.PolicyError, match="duplicate JSON key"):
-        policy.load_policy(path)
-    path.write_bytes(b" " * 65537)
-    with pytest.raises(policy.PolicyError, match="64 KiB"):
-        policy.load_policy(path)
-    candidate = copy.deepcopy(BASE)
-    candidate["exclude"].append({"reply_destination": "203.0.113.4", "source_port": {"min": 1000, "max": 2000},
-                                 "mark": {"value": 2, "mask": 3}})
-    original = copy.deepcopy(candidate)
-    rules = policy.render(candidate)
-    for expression in ("ct original proto-src 21", "ct original proto-dst 21",
-                       "ct reply proto-src 21", "ct reply proto-dst 21"):
-        assert "meta l4proto tcp " + expression + " return" in rules
-    assert "ct reply ip daddr 203.0.113.4/32 ct original proto-src 1000-2000 ct mark & 0x3 == 0x2 return" in rules
-    assert "ct original ip saddr 192.0.2.0/24 ct original ip daddr 198.51.100.2/32 flow add @fast" in rules
-    assert "ct status snat" not in rules
-    assert "ct status dnat" not in rules
-    assert "counter" not in rules and "flush" not in rules
-    assert policy.MARKER + policy.policy_hash(candidate) in rules
-    assert candidate == original, "render mutated the candidate"
-
-
-def test_policy_admission_test_follows_the_adapter_mask():
-    """The rendered guard restates the adapter's own test, never a constant."""
-    # No mask: classification is off, so every mark still declines to software.
-    # This is the historical "ct mark != 0 return", spelled as a masked test.
-    assert "  ct mark & 0xffffffff != 0x0 return" in policy.render(BASE).splitlines()
-    # With a mask, only the bits the adapter cannot decode refuse admission;
-    # the class bits are left for it to read.
-    assert "  ct mark & 0xff00ffff != 0x0 return" in policy.render(BASE, 0x00ff0000).splitlines()
-    # A mask spanning the whole word refuses nothing. The adapter rejects such
-    # a mask at load, so the controller never has to second-guess it here.
-    assert "  ct mark & 0x0 != 0x0 return" in policy.render(BASE, 0xffffffff).splitlines()
-    # The mask belongs to the running adapter, not to the policy, so it must
-    # change the guard without moving the marker that identifies the table:
-    # a reboot under a different mask is not a different policy.
-    masked, plain = policy.render(BASE, 0x00ff0000), policy.render(BASE)
-    assert masked != plain
-    marker = policy.MARKER + policy.policy_hash(BASE)
-    assert marker in masked and marker in plain
-
-
-def test_policy_apply_renders_against_the_live_mask(runtime):
-    """A mask known only to the backend has to reach the installed ruleset."""
-    runtime.resources["qos_mark_mask"] = 0x00ff0000
-    scripts = []
-    original = runtime.nft
-
-    def capture(*args, script=None):
-        if script is not None:
-            scripts.append(script)
-        return original(*args, script=script)
-
-    runtime.nft = capture
-    runtime.apply(BASE)
-    assert scripts and all("ct mark & 0xff00ffff != 0x0 return" in s for s in scripts)
-
-
-def resources(**values):
-    return {"owner": "flowtable", "fatal": 0, "observe": 0, "invalidated": 0,
-            **dict.fromkeys(policy.DRAIN_FIELDS, 0), **values}
-
-
-class Backend(policy.Runtime):
-    """Simulate asynchronous provider completion, never the policy algorithm."""
-    def __init__(self):
-        self.current = {"hash": "0" * 64}
-        self.resources = resources(bindings=2, entries=2, handle_refs=2, neighbour_refs=2)
-        self.pending = []
-        self.calls = []
-        self.failure = None
-
-    def table(self):
-        return self.current
-
-    def state(self):
-        if self.pending:
-            self.resources = self.pending.pop(0)
-        return copy.deepcopy(self.resources)
-
-    def require_device(self, name):
-        assert name in ("eth3", "eth4")
-
-    def nft(self, *args, script=None):
-        self.calls.append(args)
-        if args[0] == "delete":
-            self.current = None
-            self.pending = [resources(entries=2, handle_refs=2, neighbour_refs=2, quarantine=1), resources()]
-        else:
-            assert all(self.resources[k] == 0 for k in policy.DRAIN_FIELDS), "publication preceded hardware drain"
-            if args[0] == "--check":
-                if self.failure == "check":
-                    raise policy.PolicyError("kernel rejected candidate")
-                self.pending = [resources(bindings=2), resources()]
-            else:
-                assert args == ("-f", "-")
-                self.current = {"hash": re.search(policy.MARKER + r"([0-9a-f]{64})", script)[1]}
-                self.resources = resources(bindings=2, invalidated=int(self.failure == "verify"))
-                if self.failure == "install":
-                    raise policy.PolicyError("transaction completion failed")
-        return ""
-
-
-@pytest.fixture
-def runtime(tmp_path, monkeypatch):
-    monkeypatch.setattr(policy, "LOCK", tmp_path / "policy.lock")
-    monkeypatch.setattr(policy, "time", SimpleNamespace(monotonic=time.monotonic, sleep=lambda delay: None))
-    return Backend()
-
-
-def test_policy_apply_waits_for_both_drains(runtime):
-    result = runtime.apply(BASE)
-    assert result["enabled"] and result["policy_hash"] == policy.policy_hash(BASE)
-    assert all(result["drained"][k] == 0 for k in policy.DRAIN_FIELDS)
-    assert runtime.calls == [("delete", "table", "inet", policy.TABLE), ("--check", "-f", "-"), ("-f", "-")]
-    assert runtime.lock_fd is None
-    stopped = runtime.apply({**BASE, "enabled": False})
-    assert not stopped["enabled"] and runtime.current is None
-    assert all(stopped["drained"][k] == 0 for k in policy.DRAIN_FIELDS)
-
-
-@pytest.mark.parametrize("failure", ["check", "install", "verify"])
-def test_policy_failed_apply_leaves_hardware_drained(runtime, failure):
-    runtime.failure = failure
-    with pytest.raises(policy.PolicyError, match="acceleration disabled"):
-        runtime.apply(BASE)
-    assert runtime.current is None and not runtime.pending
-    assert all(runtime.resources[k] == 0 for k in policy.DRAIN_FIELDS)
-    assert runtime.lock_fd is None
-
-
-def test_policy_refuses_foreign_owner_and_fatal_state(runtime):
-    runtime.resources["fatal"] = 1
-    with pytest.raises(policy.PolicyError, match="fresh boot"):
-        runtime.apply(BASE)
-    assert runtime.current and not runtime.calls
-    runtime.resources["fatal"] = 0
-    runtime.current = None
-    with pytest.raises(policy.PolicyError, match="another flowtable"):
-        runtime.apply(BASE)
-    with pytest.raises(policy.PolicyError, match="another flowtable"):
-        runtime.stop()
-    assert not runtime.calls
-
-
-def test_policy_does_not_delete_table_without_marker(monkeypatch):
-    runtime = policy.Runtime()
-    table = {"table": {"family": "inet", "name": policy.TABLE}}
-    calls = []
-
-    def nft(*args, **kwargs):
-        calls.append(args)
-        return json.dumps({"nftables": [table]})
-
-    monkeypatch.setattr(runtime, "nft", nft)
-    with pytest.raises(policy.PolicyError, match="ownership marker"):
-        runtime.table()
-    assert all(args[0] == "-j" for args in calls)
-
-
-def test_policy_failed_retirement_never_publishes(runtime, monkeypatch):
-    runtime.remove = lambda: runtime.drain(timeout=0)
-    with pytest.raises(policy.PolicyError, match="have not drained"):
-        runtime.apply(BASE)
-    assert not runtime.calls and runtime.current
-    runtime.resources["fatal"] = 1
-    with pytest.raises(policy.PolicyError, match="retirement failed"):
-        runtime.drain()
-
-
-@pytest.mark.parametrize("owner,action,expected,rc", [
-    ("cmm", "start", [], 0), ("", "start", [], 0),
-    ("flowtable", "reload", ["apply"], 7),
-    ("flowtable", "stop", ["stop"], 7),
-    ("flowtable", "status", ["status"], 7),
-])
-def test_policy_boot_ownership_and_failure(tmp_path, owner, action, expected, rc):
-    selection, calls, executable = (tmp_path / n for n in ("owner", "calls", "control"))
-    selection.write_text(owner)
-    calls.touch()
-    executable.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(str(calls)) + '\nexit 7\n')
-    executable.chmod(0o755)
-    root = Path(__file__).resolve().parents[2]
-    source = (root / "meta-ask/recipes-ask/config/files/S50ask-flowtable").read_text()
-    script = tmp_path / "init"
-    script.write_text(source.replace("/sys/module/cdx/parameters/offload_owner", shlex.quote(str(selection)))
-                     .replace("/usr/sbin/ask-flowtable", shlex.quote(str(executable))))
-    result = subprocess.run(["sh", str(script), action], capture_output=True, text=True, timeout=5)
-    assert result.returncode == rc, result
-    assert calls.read_text().splitlines() == expected
-
-
-def test_policy_child_preserves_lease_after_controller_death(tmp_path, monkeypatch):
-    lock, pidfile = tmp_path / "policy.lock", tmp_path / "child.pid"
-    monkeypatch.setattr(policy, "LOCK", lock)
-    fake = tmp_path / "nft"
-    fake.write_text("#!/usr/bin/python3\nimport os,time,pathlib\n"
-                    "target=pathlib.Path(os.environ['TEST_CHILD_PID']); temporary=target.with_suffix('.tmp')\n"
-                    "temporary.write_text(str(os.getpid())); temporary.replace(target)\n"
-                    "time.sleep(10)\n")
-    fake.chmod(0o755)
-    source = "import os,pathlib,ask_flowtable as p\np.LOCK=pathlib.Path(os.environ['TEST_LOCK'])\n"
-    source += "r=p.Runtime()\nwith r.locked(): r.nft('--hold')\n"
-    child = None
-    controller = subprocess.Popen([sys.executable, "-c", source], env={
-        **os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-        "PYTHONPATH": str(Path(policy.__file__).parent), "TEST_LOCK": str(lock), "TEST_CHILD_PID": str(pidfile),
-    }, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        deadline = time.monotonic() + 3
-        while not pidfile.exists() or not pidfile.read_text():
-            assert controller.poll() is None and time.monotonic() < deadline
-            time.sleep(0.01)
-        child = os.pidfd_open(int(pidfile.read_text()))
-        controller.kill()
-        controller.wait(timeout=3)
-        with pytest.raises(policy.PolicyError, match="holds the lock"):
-            with policy.policy_lock(timeout=0.05):
-                pytest.fail("orphaned nft transaction lost its lease")
-        signal.pidfd_send_signal(child, signal.SIGTERM)
-        os.close(child)
-        child = None
-        with policy.policy_lock(timeout=3):
-            pass
-    finally:
-        if controller.poll() is None:
-            controller.kill()
-        controller.wait(timeout=3)
-        if child is not None:
-            try:
-                signal.pidfd_send_signal(child, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            os.close(child)
+    policy_h = (ENGINE / "policy.h").read_text()
+    adapter = int(re.search(r"^#define CDX_FT_MAX_BINDINGS\s+(\d+)", header, re.M)[1])
+    engine_max = int(re.search(r"^#define FT_MAX_DEVICES\s+(\d+)", policy_h, re.M)[1])
+    assert adapter == engine_max

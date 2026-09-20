@@ -152,6 +152,16 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A181 — ask-flowtable render buffer can reject a validated maximal policy.**
+  `flowtable/src/`: the conf validator accepts up to 256 scope + 256 exclude rules,
+  but `ft_render` targets a `FT_CONF_MAX*2` (128 KiB) buffer, and a `port`-shorthand
+  rule with address prefixes expands to four lines. A pathological maximal policy can
+  overflow the render buffer and be refused at apply with "rendered ruleset exceeds
+  buffer" though it validated. Bounded by `vsnprintf` (no memory unsafety) and no real
+  policy approaches it, but size the render buffer to the worst-case expansion, or cap
+  the rule count against it, so validation and rendering agree. Found in the C daemon's
+  adversarial review.
+
 - [ ] **A178 — moal's scan_request lifecycle has holes outside `scan_req_lock`.** Found while
   fixing A173 (driver 09f41e14, `mlinux/`): `woal_clean_up()` completes and NULLs
   `handle->scan_request` with no lock at all, so it can double-complete against

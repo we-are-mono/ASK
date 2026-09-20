@@ -324,6 +324,13 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
     assert r.proto in {"udp", "tcp"}
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
+    # The offload service is default-on: a normal boot has already installed the
+    # catch-all policy, so the backend starts bound. These controlled tests own
+    # the policy themselves, so stop the boot daemon first — the init script
+    # kills it and removes its table, draining the hardware to an unbound state.
+    with Console.target(log_path=str(ARTIFACTS / "boot-daemon-stop.log")) as _con:
+        await asyncio.to_thread(_con.login, "root", None)
+        await console_command(_con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)
     initial = await r.state()
     assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial

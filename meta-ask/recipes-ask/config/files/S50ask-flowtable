@@ -3,15 +3,44 @@
 # Provides:          ask-flowtable
 # Required-Start:    ask-modules gateway-setup
 # Default-Start:     S
-# Short-Description: Apply Linux flowtable admission policy
+# Short-Description: ASK default-on hardware flow-offload service
 ### END INIT INFO
 
-# The legacy boot owns its own policy. This file never changes ownership.
+# The legacy boot owns its own policy (CMM). This service only runs when the
+# Linux flowtable owns the ASK hardware.
 [ "$(cat /sys/module/cdx/parameters/offload_owner 2>/dev/null)" = flowtable ] || exit 0
 
+DAEMON=/usr/sbin/ask-flowtable
+PIDFILE=/var/run/ask-flowtable.pid
+
 case "$1" in
-    start|reload|restart|"") exec /usr/sbin/ask-flowtable apply ;;
-    stop) exec /usr/sbin/ask-flowtable stop ;;
-    status) exec /usr/sbin/ask-flowtable status ;;
-    *) echo "Usage: $0 {start|reload|restart|stop|status}" >&2; exit 1 ;;
+    start|"")
+        [ -x "$DAEMON" ] || { echo "ask-flowtable not installed" >&2; exit 1; }
+        # The daemon runs in the foreground (boot-apply then a netlink loop that
+        # re-applies on interface/VAP changes). start-stop-daemon backgrounds it
+        # and owns the pidfile; kill by pidfile only, never by name — invoked as
+        # /etc/init.d/ask-flowtable this script's own basename is "ask-flowtable"
+        # and a name match would hit the script, not the daemon (the CMM init
+        # script documents the same hazard).
+        start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- daemon
+        ;;
+    stop)
+        start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null || true
+        # Remove the installed table and drain the hardware.
+        "$DAEMON" stop >/dev/null 2>&1 || true
+        rm -f "$PIDFILE"
+        ;;
+    reload|restart)
+        "$0" stop
+        "$0" start
+        ;;
+    status)
+        exec "$DAEMON" status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|reload|restart|status}" >&2
+        exit 1
+        ;;
 esac
+
+exit 0

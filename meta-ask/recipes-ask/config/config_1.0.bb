@@ -19,7 +19,9 @@ SRC_URI = "file://S03debugfs \
 # Point S at UNPACKDIR so bitbake doesn't warn about a missing ${BP}.
 S = "${UNPACKDIR}"
 
-RDEPENDS:${PN} += "dnsmasq iptables iproute2 nftables python3-core python3-json python3-crypt python3-fcntl hostapd"
+# The flowtable offload service is now the C ask-flowtable daemon (its own
+# package); the Python helper and its python3-* runtime are gone.
+RDEPENDS:${PN} += "dnsmasq iptables iproute2 nftables hostapd ask-flowtable"
 
 # These files are installed from ${ASK_SRCROOT} (outside SRC_URI's reach).
 # Without listing them as task input checksums, bitbake's sstate signature for
@@ -33,8 +35,7 @@ do_install[file-checksums] += " \
     ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml:True \
     ${ASK_SRCROOT}/config/ask-modules.conf:True \
     ${ASK_SRCROOT}/config/fastforward:True \
-    ${ASK_SRCROOT}/config/flowtable.json:True \
-    ${ASK_SRCROOT}/tools/ask_flowtable.py:True \
+    ${ASK_SRCROOT}/config/offload.conf:True \
 "
 
 fakeroot do_install() {
@@ -53,9 +54,10 @@ fakeroot do_install() {
     install -d ${D}${sysconfdir}/config
     install -m 0644 ${ASK_SRCROOT}/config/fastforward ${D}${sysconfdir}/config/fastforward
 
-    install -d ${D}${sysconfdir}/ask ${D}${sbindir}
-    install -m 0644 ${ASK_SRCROOT}/config/flowtable.json ${D}${sysconfdir}/ask/flowtable.json
-    install -m 0755 ${ASK_SRCROOT}/tools/ask_flowtable.py ${D}${sbindir}/ask-flowtable
+    # The default offload policy. The ask-flowtable daemon (its own package)
+    # falls back to identical built-in defaults when this file is absent.
+    install -d ${D}${sysconfdir}/ask
+    install -m 0644 ${ASK_SRCROOT}/config/offload.conf ${D}${sysconfdir}/ask/offload.conf
 
     install -d ${D}${sysconfdir}/init.d
     install -d ${D}${sysconfdir}/rcS.d
@@ -105,8 +107,7 @@ FILES:${PN} = " \
     ${sysconfdir}/cdx_sp.xml \
     ${sysconfdir}/modules-load.d/ask.conf \
     ${sysconfdir}/config/fastforward \
-    ${sysconfdir}/ask/flowtable.json \
-    ${sbindir}/ask-flowtable \
+    ${sysconfdir}/ask/offload.conf \
     ${sysconfdir}/init.d/debugfs \
     ${sysconfdir}/rcS.d/S03debugfs \
     ${sysconfdir}/init.d/ask-modules \
