@@ -149,6 +149,11 @@ struct cdx_ipsec_counters {
  * tunnel outright rather than delay it. A flow over the SA is checked against
  * the stricter cdx_ft_port_supported() when it is admitted.
  *
+ * It also answers whether there is an IPsec engine behind the port at all. A
+ * board without the IPsec offline port or a SEC job ring loads CDX without
+ * IPsec, and then this is false for every port, for the module's life: no
+ * ops are attached, no capability advertised, no SA admitted.
+ *
  * Needs neither a transaction nor RTNL, so the ops attachment can call it from
  * a netdev notifier.
  */

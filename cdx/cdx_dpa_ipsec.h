@@ -89,6 +89,7 @@ typedef struct fpp_sec_failure_stats_query_cmd {
 
 int cdx_ipsec_init(void);
 void cdx_ipsec_deinit(void);
+bool cdx_ipsec_ready(void);
 
 PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc (uint32_t);
 void cdx_ipsec_sec_sa_context_free(PDpaSecSAContext pdpa_sec_context ) ;

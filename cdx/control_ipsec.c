@@ -497,6 +497,12 @@ int IPsec_handle_CREATE_SA(U16 *p, U16 Length)
 	/* Check length */
 	if (Length != sizeof(CommandIPSecCreateSA))
 		return ERR_WRONG_COMMAND_SIZE;
+	/* The engine, not the command: with no offline port or job ring there
+	 * is no SEC context to build, and refusing the first command of the
+	 * sequence keeps the cache from carrying an SA that can never be
+	 * pushed. */
+	if (!cdx_ipsec_ready())
+		return ERR_CREATION_FAILED;
 
 	memset(&cmd, 0, sizeof(CommandIPSecCreateSA));
 	memcpy((U8*)&cmd, (U8*)p,  Length);
@@ -1371,8 +1377,14 @@ int ipsec_init(void)
 	/* initialize a singled list for puting the sec sa context with the pair of fqid
 	 * and the shared descriptor and other memory if any required by Sec.
 	 */
+	/* Not fatal. What failed is the CAAM job ring, and a board without one
+	 * is a gateway without IPsec offload, not a gateway without offload:
+	 * cdx_ipsec_ready() stays false, so both owners refuse every SA and
+	 * nothing below ever reaches SEC. The rest of this init is bookkeeping
+	 * that ipsec_exit() expects to find in place. */
 	if (cdx_ipsec_init())
-		return -1;
+		pr_warn("%s: IPsec offload unavailable, no SEC job ring\n",
+			__func__);
 #ifdef CONTROL_IPSEC_DEBUG
 	printk(KERN_INFO "%s timer is initialized \n", __func__);
 #endif

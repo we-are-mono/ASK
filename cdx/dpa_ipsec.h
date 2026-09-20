@@ -8,6 +8,7 @@
  *
  */
 
+#include <linux/types.h>
 #include "pdb.h"
 
 #ifndef DPA_IPSEC_H
@@ -103,6 +104,7 @@ struct qman_fq *get_to_sec_fq(void *handle);
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size);
 int cdx_dpa_ipsec_init(void);
 void cdx_dpa_ipsec_exit(void);
+bool cdx_dpa_ipsec_ready(void);
 
 int cdx_init_scatter_gather_bpool(void);
 int cdx_init_skb_2bfreed_bpool(void);

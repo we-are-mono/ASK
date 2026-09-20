@@ -435,6 +435,20 @@ static void cdx_ipsec_release_jr(void)
 		caam_jr_free(jrdev);
 }
 
+/* Whether an SA can be built at all: the DPA side (offline port, pool,
+ * frame queues) and the SEC side (a job ring) are both claimed at module
+ * init, and either can be missing on a board whose device tree does not
+ * describe it. Consulted before anything that would touch either -- SA
+ * admission by both owners, the xfrmdev attachment that advertises the
+ * capability, the table descriptors the encoder arms with -- so that the
+ * absence is a refusal at the entry rather than a fault several layers in.
+ * The job ring is also given back by the reboot notifier, which makes this
+ * false for the shutdown as well. */
+bool cdx_ipsec_ready(void)
+{
+	return cdx_dpa_ipsec_ready() && READ_ONCE(jrdev_g);
+}
+
 static int cdx_ipsec_reboot_notify(struct notifier_block *nb,
 		unsigned long action, void *data)
 {
@@ -508,9 +522,10 @@ int cdx_ipsec_fill_sec_info( PCtEntry entry, struct ins_entry_info *info)
 #endif				
 			}else{
 				info->l3_info.ipsec_inbound_flow = 1;
-				dpa_ipsec_ofport_td(ipsec_instance, 
-					info->tbl_type, &info->td, &info->port_id );
-#ifdef CDX_DPA_DEBUG	
+				if (dpa_ipsec_ofport_td(ipsec_instance,
+					info->tbl_type, &info->td, &info->port_id))
+					return -1;
+#ifdef CDX_DPA_DEBUG
 //			printk(KERN_CRIT "%s InBound SA info->td  = %d\n", __func__,info->td );
 #endif
 			}
@@ -2432,8 +2447,12 @@ int  cdx_ipsec_add_classification_table_entry(PSAEntry sa)
 		printk("%s::outbound sa\n", __func__);
 #endif
 		sa_dir_in = 0;
-		dpa_ipsec_ofport_td(ipsec_instance, tbl_type, &sa->ct->td,
-				&info->port_id);
+		if (dpa_ipsec_ofport_td(ipsec_instance, tbl_type, &sa->ct->td,
+				&info->port_id)) {
+			DPA_ERROR("%s::no IPsec offline port for the ESP table\n",
+					__func__);
+			goto err_ret;
+		}
 
 		if( dpa_get_iface_info_by_ipaddress(sa->family, &sa->id.saddr[0], NULL,
 					NULL , NULL,  &sa->netdev, (uint32_t)sa->handle) != SUCCESS)

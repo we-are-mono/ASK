@@ -98,6 +98,8 @@ static unsigned warnings;
 #define netdev_warn(dev, fmt, ...) do { (void)(dev); warnings++; } while (0)
 #define pr_warn(...) ((void)0)
 #define pr_err(...) ((void)0)
+#define WARN_ON_ONCE(cond) assert(!(cond))
+#define ASSERT_RTNL() do { } while (0)
 #define DEFINE_SPINLOCK(name) int name
 
 typedef long long atomic64_t;
@@ -135,6 +137,9 @@ static bool ipv6_prefix_equal(const void *a, const void *b, unsigned int len)
 }
 
 /* --- devices --------------------------------------------------------- */
+typedef u64 netdev_features_t;
+#define NETIF_F_HW_ESP ((netdev_features_t)1 << 40)
+struct xfrmdev_ops;
 struct net_device {
 	const char *name;
 	int ifindex;
@@ -142,7 +147,18 @@ struct net_device {
 	u8 dev_addr[ETH_ALEN];
 	bool physical;
 	unsigned refs;
+	/* What the attachment writes: the ops, and the capability in all
+	 * three feature sets, because the kernel recomputes features from
+	 * them and drops a bit that is missing from any one. */
+	const struct xfrmdev_ops *xfrmdev_ops;
+	netdev_features_t features, hw_features, wanted_features;
 };
+static unsigned features_changes;
+static void netdev_features_change(struct net_device *dev)
+{
+	(void)dev;
+	features_changes++;
+}
 static unsigned dev_holds;
 static void dev_hold(struct net_device *d) { d->refs++; dev_holds++; }
 static void dev_put(struct net_device *d)
@@ -384,6 +400,8 @@ static unsigned sa_next_hop_calls;
 
 #include "ipsec_types.inc"
 
+static bool cdx_ipsec_port_supported(struct net_device *dev);
+
 static u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 {
 	return sa ? sa->handle : 0;
@@ -395,6 +413,10 @@ static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 
 	(void)x;
 	*result = NULL;
+	/* The backend's own first check: a port the engine cannot serve is
+	 * refused before anything is built. */
+	if (!cdx_ipsec_port_supported(spec->dev))
+		return -EOPNOTSUPP;
 	if (sa_add_error)
 		return sa_add_error;
 	assert(sa_installed < sizeof(sa_pool) / sizeof(sa_pool[0]));
@@ -469,6 +491,20 @@ static LIST_HEAD(ft_ipsec_retired);
 static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
 
 struct netlink_ext_ack { const char *_msg; };
+/* The kernel's table, member for member, so that the adapter's own instance
+ * of it compiles here and the attachment can be checked against it. */
+struct sk_buff;
+struct xfrmdev_ops {
+	int (*xdo_dev_state_add)(struct xfrm_state *x,
+				 struct netlink_ext_ack *extack);
+	void (*xdo_dev_state_delete)(struct xfrm_state *x);
+	void (*xdo_dev_state_free)(struct xfrm_state *x);
+	bool (*xdo_dev_offload_ok)(struct sk_buff *skb, struct xfrm_state *xs);
+	int (*xdo_dev_policy_add)(struct xfrm_policy *x,
+				  struct netlink_ext_ack *extack);
+	void (*xdo_dev_policy_delete)(struct xfrm_policy *x);
+	void (*xdo_dev_policy_free)(struct xfrm_policy *x);
+};
 #define NL_SET_ERR_MSG(extack, msg) do { \
 	static const char __msg[] = msg; \
 	struct netlink_ext_ack *__e = (extack); \
@@ -591,6 +627,9 @@ static void bench_reset(void)
 	works_scheduled = retires_scheduled = 0;
 	retired_handles = 0;
 	port_supported = true;
+	WAN.xfrmdev_ops = NULL;
+	WAN.features = WAN.hw_features = WAN.wanted_features = 0;
+	features_changes = 0;
 	slept = 0;
 	neigh_probes = 0;
 	auth_key.alg_key_len = 160;
@@ -827,6 +866,67 @@ static void test_policy_add(void)
 	policy.xdo.dev = &WAN;
 	policy.xdo.type = XFRM_DEV_OFFLOAD_CRYPTO;
 	assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
+}
+
+/* The attachment, and what it does when there is no engine behind the port.
+ *
+ * A board whose device tree lacks the IPsec offline port or a SEC job ring
+ * loads the module with cdx_ipsec_port_supported() false for every port,
+ * and that predicate is the whole of what the adapter learns. What it must
+ * then do is nothing: never attach the ops -- so the port never advertises
+ * hardware ESP and strongSwan is never offered it -- and refuse a state or
+ * policy that arrives regardless, leaving nothing behind.
+ */
+static void test_engine_unavailable(void)
+{
+	struct xfrm_state *x = outbound_state();
+	struct xfrm_policy policy;
+	struct netlink_ext_ack ack = { NULL };
+
+	bench_reset();
+	bench_clear_sas();
+	port_supported = false;
+
+	ft_ipsec_attach(&WAN);
+	assert(!WAN.xfrmdev_ops);
+	assert(!((WAN.features | WAN.hw_features | WAN.wanted_features) &
+		 NETIF_F_HW_ESP));
+	assert(features_changes == 0);
+
+	/* Refused at admission too, should a state reach it by another
+	 * door, and with no watch left for an SA that never existed. */
+	assert(ft_xdo_state_add(x, &ack) == -EOPNOTSUPP);
+	assert(sa_installed == 0);
+	ft_ipsec_all_moved();
+	assert(works_scheduled == 0);
+	memset(&policy, 0, sizeof(policy));
+	policy.xdo.type = XFRM_DEV_OFFLOAD_PACKET;
+	policy.xdo.dev = &WAN;
+	assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
+
+	/* Detaching a port that was never attached is not a features event. */
+	ft_ipsec_detach(&WAN);
+	assert(features_changes == 0);
+
+	/* With the engine there: attached once, the capability in all three
+	 * feature sets, idempotent, and given back in full. */
+	port_supported = true;
+	ft_ipsec_attach(&WAN);
+	assert(WAN.xfrmdev_ops == &ft_xfrmdev_ops);
+	assert(WAN.features & WAN.hw_features & WAN.wanted_features &
+	       NETIF_F_HW_ESP);
+	assert(features_changes == 1);
+	ft_ipsec_attach(&WAN);
+	assert(features_changes == 1);
+	ft_ipsec_detach(&WAN);
+	assert(!WAN.xfrmdev_ops);
+	assert(!((WAN.features | WAN.hw_features | WAN.wanted_features) &
+		 NETIF_F_HW_ESP));
+	assert(features_changes == 2);
+
+	/* A port that is not CDX's at all is never attached either. */
+	ft_ipsec_attach(&SOFT);
+	assert(!SOFT.xfrmdev_ops && features_changes == 2);
 }
 
 static void test_offloaded(void)
@@ -1389,6 +1489,7 @@ int main(void)
 	test_next_hop();
 	test_state_add();
 	test_policy_add();
+	test_engine_unavailable();
 	test_offloaded();
 	test_paired_inbound();
 	test_resolve();

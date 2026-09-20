@@ -272,6 +272,20 @@ the liveness one a flow's ports face: an SA may legitimately be installed
 before the link it will ride has carrier, and refusing then would fail the
 tunnel outright instead of delaying it.
 
+**And there must be an engine behind the port.** The IPsec offline port, its
+buffer pool and PCD frame queues, and the CAAM job ring are all claimed at
+module init, and a board whose device tree describes none of them still
+loads `cdx.ko` — as a gateway without IPsec offload, not one without offload
+(A167). `cdx_ipsec_ready()` says whether that claim succeeded, and
+`cdx_ipsec_port_supported()` folds it in, which is what makes the absence a
+refusal at every entry rather than a fault several layers in: the adapter
+never attaches the xfrmdev ops to such a port, so it never advertises
+`esp-hw-offload` and strongSwan is never offered it; a state or policy that
+reaches admission anyway is refused with `-EOPNOTSUPP`; the legacy owner's
+`CREATE_SA` fails; and the encoder's table lookup fails cleanly. The test image
+can boot into this state with `cdx.dpa_init_fail_site=cdx_dpa_ipsec_init
+cdx.dpa_init_fail_step=1` on the kernel command line.
+
 **The local endpoint must be an address on that port.** Not a contract this
 work chose — it is how CDX resolves an SA to an interface at all.
 `cdx_ipsec_add_classification_table_entry()` looks the SA up by address:

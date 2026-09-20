@@ -152,26 +152,15 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A173 — the Wi-Fi driver sleeps in atomic context when reporting scan
-  results in station mode.** With the second radio's `mmlan0` scanning as a
-  station, the debug kernel prints `__might_resched` from `MOAL_EVT_WORK_QUEUE`:
-  `woal_evt_work_queue -> woal_inform_bss_from_scan_result ->
-  cfg80211_inform_bss_data -> kzalloc(GFP_KERNEL)`, i.e. moal calls into
-  cfg80211 with a sleeping allocation while holding a spinlock. It is the
-  station scan path only (`moal` at 09f41e14); an access point never runs it,
-  so the product is not exposed unless a STA interface is used. Likely fix is
-  the GFP flag or the lock scope in `woal_inform_bss_from_scan_result()`;
-  reproduce with `wpa_supplicant` on `mmlan0` and read the full splat before
-  choosing.
-
-- [ ] **A167 — a failed IPsec initialisation refuses to load `cdx.ko` at all.**
-  `cdx_main.c` treats `cdx_dpa_ipsec_init()` failing as fatal, so a board whose
-  device tree lacks the IPsec offline port (`dpa-fman0-oh@2`), or on which the
-  CAAM job ring is unavailable, has no offload of any kind rather than no IPsec
-  offload. The Wi-Fi gate of the same shape is now non-fatal (A168) because
-  `dpaa_vwd_ready()` already refuses every later use; the IPsec side has no
-  equivalent readiness predicate that SA admission and the encoder consult, so
-  it needs one before the gate can be relaxed. Same class, separate fix.
+- [ ] **A177 — `cdx_dpa_ipsec_exit()` and the init unwind do not fully release what init claimed.**
+  `release_ipsec_bpool()` (`cdx/dpa_ipsec.c`) frees the BMan pool bookkeeping and the `dpa_bp`
+  without draining the 512 skb-backed buffers `dpaa_bp_alloc_n_add_buffs()` seeded, so they leak
+  and the BPID is recycled with buffers still in hardware; the exit never calls
+  `release_offline_port()` and never tears down the PCD frame queues, and a `create_ipsec_pcd_fqs()`
+  partial failure leaves live queues pointing at `ipsec_exception_pkt_handler` with no pool. Reached
+  at unload and, since A167, at a partial init failure after the pool was seeded. Mirror the Wi-Fi
+  exit (`dpa_wifi.c`: port release + queue teardown) and drain the pool through its
+  `free_buf_cb` before freeing it.
 
 - [ ] **A165 — the Wi-Fi driver's single transmit worker is the wire-to-Wi-Fi
   ceiling.** Measured 2026-09-20 with the egress offload active (`bindings 1`,
@@ -462,6 +451,11 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A167.** `cdx_dpa_ipsec_init()` failing refused to load `cdx.ko`, so a board without the IPsec
+  offline port or a SEC job ring had no offload at all — fixed (this commit): non-fatal, with
+  `cdx_ipsec_ready()` refusing SA admission by both owners, the xfrmdev attachment and the encoder's
+  table lookup; proved with `cdx.dpa_init_fail_site=cdx_dpa_ipsec_init`.
 
 - [x] **A175.** `ft_wifi_exit()` blocked on RTNL with the CDX transaction held, the reverse of the bind
   path's order (transaction under RTNL via `dpa_setup_tc`) — a lock inversion lockdep reports at unload

@@ -1024,7 +1024,7 @@ static int ipsec_init_ohport(struct ipsec_info *info)
 {
 
 	/* Get OH port for this driver */
-	info->ofport_handle = alloc_offline_port(IPSEC_FMAN_IDX, PORT_TYPE_IPSEC, 
+	info->ofport_handle = alloc_offline_port(IPSEC_FMAN_IDX, PORT_TYPE_IPSEC,
 			NULL, NULL);
 	if (info->ofport_handle < 0)
 	{
@@ -1034,17 +1034,24 @@ static int ipsec_init_ohport(struct ipsec_info *info)
 #ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s: allocated oh port %d\n", __func__, info->ofport_handle);
 #endif
-	if (get_ofport_info(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_channel, 
+	if (get_ofport_info(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_channel,
 				&info->ofport_td[0])) {
 		DPAIPSEC_ERROR("%s: Error in getting OH port info\n", __func__);
-		return FAILURE;
+		goto release;
 	}
 	if (get_ofport_portid(IPSEC_FMAN_IDX, info->ofport_handle, &info->ofport_portid)) {
 		DPAIPSEC_ERROR("%s: Error in getting OH port id\n", __func__);
-		return FAILURE;
+		goto release;
 	}
 	printk("%s:: ipsec of port id = %d\n ", __func__, info->ofport_portid);
 	return SUCCESS;
+
+release:
+	/* The module carries on without IPsec after a failure here, so the
+	 * claim on the port cannot be left behind. */
+	release_offline_port(IPSEC_FMAN_IDX, info->ofport_handle);
+	info->ofport_handle = -1;
+	return FAILURE;
 }
 
 void *  dpa_get_ipsec_instance(void)
@@ -1052,13 +1059,18 @@ void *  dpa_get_ipsec_instance(void)
 	return &ipsecinfo; 
 }
 
-int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td, 
+int dpa_ipsec_ofport_td(struct ipsec_info *info, uint32_t table_type, void **td,
 		uint32_t* portid)
 {
 	if (table_type >= MAX_MATCH_TABLES) {
 		DPAIPSEC_ERROR("%s::invalid table type %d\n", __func__, table_type);
 		return FAILURE;
 	}
+	/* No port, no tables: the descriptors below are only filled in by a
+	 * successful cdx_dpa_ipsec_init(), and a NULL one handed out here
+	 * would fault in the table insert rather than fail it. */
+	if (!cdx_dpa_ipsec_ready())
+		return FAILURE;
 	*td = info->ofport_td[table_type];
 	*portid = info->ofport_portid;
 	return SUCCESS;
@@ -1419,22 +1431,43 @@ static void cdx_dpaa_ingress_cgr_exit(struct cgr_priv *cgr)
 #endif
 
 
+/* Whether the DPA side of IPsec -- the offline port, its tables, the SEC
+ * buffer pool and the PCD frame queues -- is there to be used. False until
+ * cdx_dpa_ipsec_init() has finished, and again as soon as teardown starts.
+ * A board whose device tree lacks the IPsec offline port leaves it false for
+ * the module's whole life, and that is the only way the rest of the module
+ * learns of it: every path that would touch this state asks here first,
+ * through cdx_ipsec_ready(). */
+static bool dpa_ipsec_ready;
+
+bool cdx_dpa_ipsec_ready(void)
+{
+	/* Paired with the release below: a reader that sees true also sees
+	 * the table descriptors and pools stored before it. */
+	return smp_load_acquire(&dpa_ipsec_ready);
+}
+
 int cdx_dpa_ipsec_init(void)
 {
 
 	DPAIPSEC_INFO("%s::\n", __func__);
 	ipsecinfo.crypto_channel_id = qm_channel_caam;
 	ipsecinfo.ipsec_exception_fq = NULL;
-	if (ipsec_init_ohport(&ipsecinfo)) {
-		return FAILURE;
-	}
-	if (add_ipsec_bpool(&ipsecinfo)) {
-		return FAILURE;
-	}
+	/* Zero is a valid port index, and the unwind below keys on the sign. */
+	ipsecinfo.ofport_handle = -1;
+	/* Each step undoes the ones before it on failure. The module carries
+	 * on without IPsec, so a half-built claim on the port or the pool
+	 * would otherwise be held for nothing. The fault hook is the same one
+	 * the other startup acquisitions expose, so a test can boot a board
+	 * "without" the port and prove the rest still comes up. */
+	if (cdx_dpa_init_fault() || ipsec_init_ohport(&ipsecinfo))
+		goto ohport_failure;
+	if (add_ipsec_bpool(&ipsecinfo))
+		goto bpool_failure;
 #ifdef CS_TAIL_DROP
 	if (sec_congestion){
 		if (cdx_dpaa_ingress_cgr_init(&ipsecinfo.cgr)) {
-			return FAILURE;
+			goto cgr_failure;
 		}
 	}
 #endif
@@ -1442,19 +1475,34 @@ int cdx_dpa_ipsec_init(void)
 		goto ipsec_pcd_fq_failure;
 	}
 	register_cdx_deinit_func(cdx_dpa_ipsec_exit);
+	/* Last, once everything a reader could reach through it exists, and
+	 * ordered after it: the FCI device is already registered by now, so a
+	 * command can be asking. */
+	smp_store_release(&dpa_ipsec_ready, true);
 	return SUCCESS;
 
 ipsec_pcd_fq_failure:
 #ifdef CS_TAIL_DROP
 	if(sec_congestion)
 		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);
+cgr_failure:
 #endif
+	release_ipsec_bpool(&ipsecinfo);
+bpool_failure:
+	if (ipsecinfo.ofport_handle >= 0) {
+		release_offline_port(IPSEC_FMAN_IDX, ipsecinfo.ofport_handle);
+		ipsecinfo.ofport_handle = -1;
+	}
+ohport_failure:
 	return FAILURE;
 }
 
 void cdx_dpa_ipsec_exit(void)
 {
 	DPAIPSEC_INFO("%s::\n", __func__);
+	/* First, so that nothing admitted from here on finds state that is
+	 * being torn down below it. */
+	WRITE_ONCE(dpa_ipsec_ready, false);
 #ifdef CS_TAIL_DROP
 	if(sec_congestion)
 		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);
@@ -1467,5 +1515,9 @@ void cdx_dpa_ipsec_exit(void)
 struct dpa_bp* get_ipsec_bp(void)
 {
 	return NULL;
+}
+bool cdx_dpa_ipsec_ready(void)
+{
+	return false;
 }
 #endif

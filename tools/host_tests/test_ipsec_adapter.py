@@ -46,13 +46,21 @@ def test_ipsec_adapter(tmp_path):
         "ft_xdo_state_add",
         "ft_ipsec_watch_find", "ft_ipsec_watch_stale", "ft_ipsec_follow_work",
         "ft_xdo_state_delete", "ft_xdo_policy_add",
+        "ft_xdo_state_free", "ft_xdo_offload_ok",
+        "ft_xdo_policy_delete", "ft_xdo_policy_free",
     ]
+    # The attachment comes last: it names the ops table, which names every
+    # callback above.
+    attachment = ["ft_ipsec_attach", "ft_ipsec_detach"]
     (tmp_path / "ipsec_production.inc").write_text(
         # The neighbour wait's own bounds, which decide whether an install
         # waits at all; a harness inventing them would assert nothing.
         source[source.index("#define FT_IPSEC_NEIGH_TRIES"):
                source.index("static int ft_ipsec_peer_mac")]
-        + "\n".join(function(source, name) for name in names))
+        + "\n".join(function(source, name) for name in names)
+        + source[source.index("static const struct xfrmdev_ops ft_xfrmdev_ops = {"):
+                 source.index("/* Attach the ops to a CDX physical port")]
+        + "\n".join(function(source, name) for name in attachment))
     binary = tmp_path / "ipsec_adapter"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",

@@ -119,10 +119,20 @@ bool cdx_ipsec_port_supported(struct net_device *dev)
 	 * What must hold is that the device really is a CDX physical port, and
 	 * dpa_netdev_is_physical() answers exactly that under its own lock --
 	 * so this is safe from a notifier and from a caller holding RTNL,
-	 * which is where the ops attachment runs. */
+	 * which is where the ops attachment runs.
+	 *
+	 * And that there is an engine behind the port. A board whose device
+	 * tree lacks the IPsec offline port or a SEC job ring loads this module
+	 * without IPsec, and the port must then not advertise a capability it
+	 * cannot honour: the adapter attaches the xfrmdev ops through this
+	 * predicate, so a false here is what keeps strongSwan from ever being
+	 * offered hardware ESP on that port, and what refuses an SA that
+	 * reaches admission anyway. Decided at module init and withdrawn only
+	 * at shutdown, so like the identity beside it, never a momentary
+	 * condition. */
 	return dev && net_eq(dev_net(dev), &init_net) &&
 	       dev->type == ARPHRD_ETHER && dev->addr_len == ETH_ALEN &&
-	       dpa_netdev_is_physical(dev);
+	       dpa_netdev_is_physical(dev) && cdx_ipsec_ready();
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_port_supported, ASK_CDX_FLOWTABLE);
 

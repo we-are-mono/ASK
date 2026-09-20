@@ -420,9 +420,15 @@ static int __init cdx_module_init(void)
 	 * put a frame, and the first symptom is a shared descriptor that
 	 * cannot be created, several layers away from the cause. */
 	if (cdx_dpa_ipsec_init()) {
-		printk("%s::dpa_ipsec start failed\n", __func__);
-		rc = -EIO;
-		goto exit;
+		/* Not fatal, for the reason the Wi-Fi gate above is not: what
+		 * failed is a claim on board-specific resources -- the IPsec
+		 * offline port, its buffer pool, the PCD frame queues -- and a
+		 * board without them is a gateway without IPsec offload, not a
+		 * gateway without offload. cdx_ipsec_ready() stays false, so
+		 * both owners refuse every SA and the encoder never arms;
+		 * nothing else here depends on it. */
+		pr_warn("%s: IPsec offload unavailable, DPA IPsec init failed\n",
+			__func__);
 	}
 
 	if (cdx_init_scatter_gather_bpool()) {
