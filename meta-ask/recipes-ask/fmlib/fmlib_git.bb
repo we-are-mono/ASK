@@ -5,6 +5,7 @@ LIC_FILES_CHKSUM = "file://LICENSE;md5=9c7bd5e45d066db084bdb3543d55b1ac"
 
 SRC_URI = "git://github.com/nxp-qoriq/fmlib.git;protocol=https;nobranch=1 \
            file://01-mono-ask-extensions.patch \
+           file://02-a103-dev-to-id-conversions.patch \
 "
 SRCREV = "7a58ecaf0d90d71d6b78d3ac7998282a472c4394"
 
