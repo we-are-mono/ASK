@@ -193,6 +193,12 @@ result independently of those temporary files.
   structural one, which is that one worker per radio cannot be spread by
   anything CDX does. A non-instrumented boot of the same image is the one
   measurement that would put a production number on this.
+  Driver patch 0007 takes the second lever: the A-MSDU is now built under one
+  hold of `ra_list_spinlock` and the sources are freed after it is dropped,
+  instead of an unlock, a free, a relock and a ralist revalidation per MSDU.
+  It boots and serves the AP but is **unmeasured** — every number here needs
+  the phone (iperf3 reverse to the orchestrator); measure it and the A-MSDU
+  on/off question with the same client before either default moves.
 
 - [ ] **A159 — a bound flowtable stops the port's ingress byte counters.**
   With an nftables flowtable bound to a port, that port's rx byte and packet
