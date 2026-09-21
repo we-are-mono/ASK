@@ -2138,15 +2138,31 @@ static int cdx_mc_check(const struct cdx_mc_group_spec *spec)
 			return -EOPNOTSUPP;
 		if (!cdx_mc_port_supported(l->dev))
 			return -EOPNOTSUPP;
-		/* A port named twice would be programmed twice and receive
-		 * two copies of every frame. The bridge cannot produce such a
-		 * membership, so this is a caller error rather than a
-		 * configuration, and it fails rather than being deduplicated
-		 * -- silently forwarding a different group than the one asked
-		 * for is the worse outcome. */
-		for (jj = 0; jj < ii; jj++)
-			if (spec->listener[jj].dev == l->dev)
+		/* A listener repeated exactly would be programmed twice and
+		 * that port would receive two identical copies of every frame.
+		 * It fails rather than being deduplicated, because silently
+		 * forwarding something other than what was asked for is the
+		 * worse outcome.
+		 *
+		 * The same port with *different* framing is not that, and is
+		 * not refused: those are two different copies, one tagged for
+		 * each VLAN the port serves, which is what a gateway carrying
+		 * several VLANs on one link replicates. Nothing below this
+		 * interface identifies a member by its device. Each one gets
+		 * its own external-hash entry from its own ins_entry_info,
+		 * built from the onif plus the caller's cdx_l2_encap and
+		 * threaded into the chain by pointer; the group's members[] is
+		 * indexed by position, and the name copied into if_info is for
+		 * the query dump alone. The name lookups that do exist --
+		 * Cdx_GetMcastMemberId(), mcast_member_by_name() -- are on the
+		 * FCI mutators, which never reach this path. */
+		for (jj = 0; jj < ii; jj++) {
+			const struct cdx_mc_listener *o = &spec->listener[jj];
+
+			if (o->dev == l->dev && o->vlans == l->vlans &&
+			    !memcmp(o->vlan, l->vlan, sizeof(o->vlan)))
 				return -EOPNOTSUPP;
+		}
 	}
 	return 0;
 }

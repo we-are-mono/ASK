@@ -58,6 +58,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_flowtable_vlan.py      271/272      (ASK_FLOWTABLE_VLAN_ID, +1 inner)
 #   test_flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
 #   test_flowtable_pppoe.py     276          (ASK_FLOWTABLE_PPPOE_LAN_VID)
+#   test_mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
 #   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
@@ -71,6 +72,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # 231/232; mcast_replication 241/242/243 vs mcast_concurrent 241+.
 VLAN_IDS_MCAST: tuple[int, int, int]  = (241, 242, 243)
 VLAN_IDS_BRIDGE: tuple[int, int]      = (231, 232)
+VLAN_ID_MROUTE: int                   = 244
 VLAN_ID_PPPOE_WAN: int                = 3900
 
 # Bench wiring: the DUT's eth3 faces the LAN client VM, eth4 faces the

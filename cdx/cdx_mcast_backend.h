@@ -32,6 +32,13 @@ struct cdx_mc_group;
  * the port is a tagged member of it and nothing when the port is untagged.
  * Resolving that is the caller's, because it is a question about bridge
  * configuration and this side knows only ports.
+ *
+ * A listener is identified by its whole framing rather than by its device, so
+ * one port may appear twice in a group with different tags and may not appear
+ * twice with the same ones. Two tagged copies out of one port is what a
+ * gateway carrying several VLANs on one link replicates, and nothing below
+ * this interface objects: each listener gets its own external-hash entry,
+ * built from its own encapsulation and threaded into the chain by pointer.
  */
 struct cdx_mc_listener {
 	struct net_device *dev;

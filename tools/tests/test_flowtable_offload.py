@@ -141,7 +141,7 @@ async def console_python(console, script, *, timeout=20, attempts=3):
 # empty when nothing of that kind exists, so a caller never has to guess
 # whether an absent key means none or means an older adapter.
 STATUS_ROWS = {"flow": "flows", "session": "sessions", "vlan": "vlans",
-               "tunnel": "tunnels", "mcast": "mcast"}
+               "tunnel": "tunnels", "mcast": "mcast", "mroute": "mroute"}
 
 
 def status_text(text):

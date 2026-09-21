@@ -17,11 +17,13 @@ def function(source, name):
     # An explicit list of return types rather than "anything": it is what
     # keeps a forward declaration or a call site from being mistaken for the
     # definition. Widen it when a new one is needed.
-    match = re.search(r"^(?:static )?(?:int |void |bool |U8 |U16 |u16 |u64 |uint32_t |"
+    match = re.search(r"^(?:static )?(?:int |void |bool |U8 |U16 |u16 |u32 |u64 |uint32_t |"
+                      r"unsigned int |const char \*|"
                       r"struct qman_fq \*|struct en_exthash_tbl_entry ?\* ?|"
                       r"struct net_device ?\* ?|struct ft_mc_group ?\* ?|"
+                      r"struct ft_mr_group ?\* ?|"
                       r"struct xfrm_state ?\* ?|struct ft_ipsec_watch ?\* ?|"
-                      r"enum qman_cb_dqrr_result )"
+                      r"enum ft_mr_state |enum qman_cb_dqrr_result )"
                       # __init/__exit sit between the return type and the name.
                       r"(?:__init |__exit )?"
                       + name + r"\([^;]*?\)\s*\{", source, re.M)

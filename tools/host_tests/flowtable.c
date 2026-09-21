@@ -383,6 +383,26 @@ static void ft_mc_device_gone(struct net_device *dev)
     (void)dev;
     mc_devices_gone++;
 }
+/* The routed learner has its own file and its own harness
+ * (mroute_learner.c); here the chains' calls into it only count. The two
+ * multicast families the FIB chain carries are ipmr's and ip6mr's, and this
+ * adapter hands both of them straight over. */
+#define RTNL_FAMILY_IPMR 128
+#define RTNL_FAMILY_IP6MR 129
+static unsigned mroute_events, mroute_kicks, mroute_devices_gone;
+static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
+{
+    (void)event; (void)info;
+    mroute_events++;
+    return NOTIFY_DONE;
+}
+static void ft_mr_kick(void) { mroute_kicks++; }
+static void ft_mr_device_gone(struct net_device *dev)
+{
+    (void)dev;
+    mroute_devices_gone++;
+}
+static void ft_mr_exit(void) { }
 /* The Wi-Fi VAP registration lives in its own file and has its own harness
  * (wifi_admission.c); here the notifier's calls into it only count. */
 static unsigned wifi_reconsiders, wifi_address_changes, wifi_devices_gone;

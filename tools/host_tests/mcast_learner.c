@@ -42,6 +42,7 @@ union nf_inet_addr {
 #define CDX_FT_VLAN_MAX 2
 #define CDX_MC_MAX_LISTENERS 8
 #define EOPNOTSUPP 95
+#define ENOENT 2
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define htons(x) __builtin_bswap16((uint16_t)(x))
@@ -259,28 +260,90 @@ int main(void)
         assert(ft_mc_count == 2);
     }
 
-    /* A port the hardware cannot carry is refused, and refusing is counted
-     * rather than silent. */
+    /* A port the hardware cannot carry is RECORDED, not forgotten, and the
+     * recording is the whole point.
+     *
+     * A matched frame never reaches the bridge, so a listener the hardware
+     * did not take on does not fall back to software -- it stops receiving.
+     * Dropping the member here and installing for the rest is exactly the
+     * partial replication the contract refuses, and it is the shipping shape:
+     * br-lan carries the Wi-Fi VAP, so a phone joining the stream a set-top
+     * box is already watching puts an uncarriable port in the group. */
     reset();
     {
         unsigned long long before = ft_mc_refused;
+
         assert(!ft_mc_membership(&BR, &SOFT, &g1, true, false));
-        assert(ft_mc_count == 0 && ft_mc_refused == before + 1);
-        assert(holds == 0);
+        assert(ft_mc_count == 1 && ft_mc_refused == before + 1);
+        assert(only_group()->ports == 1);
+        assert(only_group()->port[0].dev == &SOFT);
+        assert(only_group()->port[0].uncarried);
+        assert(!ft_mc_carriable(only_group()));
+        assert(holds == 2);   /* the bridge and the port it cannot carry */
     }
 
-    /* Capacity. The ninth listener is refused; the group keeps the eight it
-     * has and does not claim the ninth was taken on. */
+    /* Eligible and ineligible together: the group is not installable, and the
+     * eligible port's own join must not claim it was taken on either --
+     * `handled` becomes MDB_PG_FLAGS_OFFLOAD, and a group that will never
+     * install must not report one. */
+    reset();
+    assert(ft_mc_membership(&BR, &P1, &g1, true, false));
+    assert(ft_mc_carriable(only_group()));
+    assert(!ft_mc_membership(&BR, &SOFT, &g1, true, false));
+    assert(only_group()->ports == 2 && !ft_mc_carriable(only_group()));
+    /* A third port joining a group that is already uncarriable is recorded
+     * and answers no. */
+    assert(!ft_mc_membership(&BR, &P2, &g1, true, false));
+    assert(only_group()->ports == 3 && !ft_mc_carriable(only_group()));
+    /* The uncarriable one leaves and the group becomes installable again. */
+    assert(!ft_mc_membership(&BR, &SOFT, &g1, false, false));
+    assert(only_group()->ports == 2 && ft_mc_carriable(only_group()));
+    /* And a restated membership re-answers from the group's current state
+     * rather than from the port's alone. */
+    assert(ft_mc_membership(&BR, &P1, &g1, true, false));
+    assert(!ft_mc_membership(&BR, &SOFT, &g1, true, false));
+    assert(!ft_mc_membership(&BR, &P1, &g1, true, false));
+
+    /* ft_mc_device_gone() reaches an uncarried member the same way, so a VAP
+     * unregistering releases the reference the group holds on it. */
+    reset();
+    assert(ft_mc_membership(&BR, &P1, &g1, true, false));
+    assert(!ft_mc_membership(&BR, &SOFT, &g1, true, false));
+    assert(holds == 3);
+    ft_mc_drop_port(&SOFT);
+    assert(only_group()->ports == 1 && ft_mc_carriable(only_group()));
+    assert(holds == 2);
+
+    /* Capacity. The ninth listener is recorded too -- forgetting it is the
+     * same silent partial replication one count further along -- so the group
+     * is not installable until one of them leaves. */
     reset();
     {
         struct net_device ports[CDX_MC_MAX_LISTENERS + 1];
+
         for (unsigned i = 0; i <= CDX_MC_MAX_LISTENERS; i++) {
             ports[i] = (struct net_device){ .name = "p", .physical = true };
             bool taken = ft_mc_membership(&BR, &ports[i], &g1, true, false);
             assert(taken == (i < CDX_MC_MAX_LISTENERS));
         }
-        assert(only_group()->ports == CDX_MC_MAX_LISTENERS);
+        assert(only_group()->ports == CDX_MC_MAX_LISTENERS + 1);
+        assert(!ft_mc_carriable(only_group()));
         assert(ft_mc_refused == 1);
+        /* One leaves and the remaining eight are installable. */
+        assert(!ft_mc_membership(&BR, &ports[0], &g1, false, false));
+        assert(only_group()->ports == CDX_MC_MAX_LISTENERS);
+        assert(ft_mc_carriable(only_group()));
+        /* A tenth distinct port has nowhere to be recorded, which is a
+         * member the group cannot name. It fails closed and stays that way
+         * until the group empties: a later leave cannot be told apart from
+         * that member's, so clearing it could install to a set missing
+         * somebody. Unreachable on a board with five ports. */
+        assert(!ft_mc_membership(&BR, &ports[0], &g1, true, false));
+        assert(!ft_mc_membership(&BR, &SOFT, &g1, true, false));
+        assert(only_group()->overflow);
+        assert(!ft_mc_carriable(only_group()));
+        assert(!ft_mc_membership(&BR, &ports[0], &g1, false, false));
+        assert(only_group()->overflow && !ft_mc_carriable(only_group()));
     }
 
     /* A host membership makes the group ineligible without removing its
@@ -384,14 +447,20 @@ int main(void)
         assert(only_group()->port[0].vlan[0].id == 3999);
     }
 
-    /* And a join whose VLAN the port is not in is refused rather than
-     * installed untagged, which would put the group on the wrong VLAN. */
+    /* And a join whose VLAN the port is not in is dropped rather than
+     * installed untagged, which would put the group on the wrong VLAN.
+     *
+     * Dropped, not recorded as uncarriable: br_allowed_egress() would not
+     * give that port a copy either, so it is not a listener this group is
+     * failing to serve, and it is not counted as a refusal. */
     {
         struct br_ip elsewhere = group_v4(0x040007ef, 0, 4000);
         unsigned long long before = ft_mc_refused;
 
         assert(!ft_mc_membership(&BR, &P2, &elsewhere, true, false));
-        assert(ft_mc_refused == before + 1);
+        assert(ft_mc_refused == before);
+        assert(ft_mc_find(&BR, &elsewhere)->ports == 0);
+        assert(ft_mc_carriable(ft_mc_find(&BR, &elsewhere)));
     }
 
     /* ---- matching an observation to a membership --------------------

@@ -21,11 +21,14 @@
 #include <linux/if_bridge.h>
 #include <linux/if_pppox.h>
 #include <linux/if_vlan.h>
+#include <linux/igmp.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/jhash.h>
 #include <linux/module.h>
+#include <linux/mroute.h>
+#include <linux/mroute6.h>
 #include <linux/netfilter_bridge.h>
 #include <linux/proc_fs.h>
 #include <linux/random.h>
@@ -33,9 +36,12 @@
 #include <linux/spinlock.h>
 #include <linux/tc_act/tc_csum.h>
 #include <linux/workqueue.h>
+#include <net/addrconf.h>
 #include <net/arp.h>
 #include <net/fib_notifier.h>
+#include <net/fib_rules.h>
 #include <net/flow_offload.h>
+#include <net/if_inet6.h>
 #include <net/ip6_route.h>
 #include <net/ip6_tunnel.h>
 #include <net/ip_tunnels.h>
@@ -2950,9 +2956,11 @@ static void ft_wifi_reconsider(struct net_device *dev);
 static void ft_wifi_device_gone(struct net_device *dev);
 static void ft_wifi_address_changed(struct net_device *dev);
 
-/* Defined with the multicast learner below, because it belongs with that
- * state rather than with the chains it is reached from. */
+/* Defined with the multicast learners below, because they belong with that
+ * state rather than with the chains they are reached from. */
 static void ft_mc_device_gone(struct net_device *dev);
+static void ft_mr_device_gone(struct net_device *dev);
+static void ft_mr_kick(void);
 
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
@@ -2981,6 +2989,11 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * what keeps a device that comes back as a station from
 		 * keeping the VAP it held as an AP. */
 		ft_wifi_reconsider(dev);
+		/* A routed group refused because one of its ports had no
+		 * carrier has nothing else that would ever reconsider it: the
+		 * MFC entry does not change when a link returns, and no frame
+		 * re-offers a group the way a packet re-offers a flow. */
+		ft_mr_kick();
 		break;
 	case NETDEV_CHANGE:
 		/* Covers the reverse too: an interface leaving AP mode stops
@@ -3011,6 +3024,10 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * reports it, so without this the group would keep an entry
 		 * keyed on a port carrying nothing. */
 		ft_mc_device_gone(dev);
+		/* And a routed group's, which ipmr reports only when the VIF
+		 * itself is removed -- a link going down leaves the VIF in
+		 * place and the entry keyed on a port carrying nothing. */
+		ft_mr_device_gone(dev);
 		break;
 	case NETDEV_CHANGEMTU:
 		/* IPv4 flushes route caches under this event's RTNL. Admission
@@ -3041,8 +3058,11 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * unwinds offloaded states when their device unregisters. */
 		ft_ipsec_detach(dev);
 		/* And every multicast reference to it, which is what would
-		 * otherwise hold the unregistration open forever. */
+		 * otherwise hold the unregistration open forever. Both
+		 * learners: a routed group pins its ingress port and every
+		 * listener exactly as a bridged one does. */
 		ft_mc_device_gone(dev);
+		ft_mr_device_gone(dev);
 		/* Same shape for a VAP: the watch stops naming the device here
 		 * so nothing can follow the pointer, and the worker releases
 		 * what is left using only what it copied. */
@@ -3183,11 +3203,24 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 	return NOTIFY_DONE;
 }
 
+/* Defined with the routed multicast learner below, because it belongs with
+ * that state rather than with this chain's other cases. */
+static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info);
+
 static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *ptr)
 {
 	struct fib_notifier_info *info = ptr;
 	struct cdx_ft_entry *entry;
 
+	/* ipmr and ip6mr announce their VIFs, their MFC entries and their
+	 * policy rules on this same chain under two families of their own.
+	 * They describe a replication list rather than a route, so they are
+	 * answered by the routed multicast learner and never reach the unicast
+	 * retirement below -- which would otherwise see an unknown event and
+	 * retire the whole table on every MFC change. */
+	if (info->family == RTNL_FAMILY_IPMR ||
+	    info->family == RTNL_FAMILY_IP6MR)
+		return ft_mr_fib_event(event, info);
 	if (info->family != AF_INET && info->family != AF_INET6)
 		return NOTIFY_DONE;
 	switch (event) {
@@ -3347,6 +3380,12 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 	}
 	if (!dev)
 		return NOTIFY_DONE;
+	/* A routed group that expands through a bridge derives every
+	 * listener's tag from exactly the three settings this case carries, so
+	 * a change to any of them makes its recorded set describe something
+	 * the bridge no longer does. It is re-derived rather than retired; the
+	 * worker decides whether the group survives the new configuration. */
+	ft_mr_kick();
 	spin_lock_bh(&ft_watch_lock);
 	/* Latch before releasing the watch lock, exactly as the netdev
 	 * upper-device event does: a concurrent last unbind and fresh bind must
@@ -3355,6 +3394,99 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 		ft_invalidate();
 	spin_unlock_bh(&ft_watch_lock);
 	return NOTIFY_DONE;
+}
+
+/* --------------------------------------------- The multicast key namespace
+ *
+ * Two learners reach one classifier. The bridge's MDB feeds the first and
+ * ipmr's MFC feeds the second, and both compose the same key: the classifier
+ * keeps one group id and one root entry per address pair, which
+ * GetMcastGrpId() enforces by matching (saddr,daddr) and refusing a second.
+ *
+ * So the pair is a shared namespace and somebody has to own each one. This is
+ * that register: a learner takes the key before it installs and gives it back
+ * when it stops carrying it, and a learner that cannot take one says
+ * "refused-contested" rather than spending a transaction to be told -EEXIST
+ * and then retrying three more times.
+ *
+ * It is a leaf: a spinlock taken while no other lock of this module is held,
+ * so it orders against nothing. That is deliberate and it is what makes the
+ * check shareable -- the alternative, each learner reading the other's list,
+ * would need ft_mc_lock and ft_mr_lock nested in some order, and the routed
+ * worker already takes ft_mc_lock under RTNL while holding neither.
+ *
+ * Giving a key back wakes both learners, because the refusal it caused is now
+ * stale and nothing else would ever reconsider it.
+ */
+struct ft_mc_claim {
+	struct list_head list;
+	u8 family;
+	union nf_inet_addr src;
+	union nf_inet_addr dst;
+};
+
+static LIST_HEAD(ft_mc_claims);
+static DEFINE_SPINLOCK(ft_mc_claim_lock);
+static void ft_mc_kick(void);
+
+static bool ft_mc_claim_same(const struct ft_mc_claim *c, u8 family,
+			     const union nf_inet_addr *src,
+			     const union nf_inet_addr *dst)
+{
+	return c->family == family && !memcmp(&c->src, src, sizeof(*src)) &&
+	       !memcmp(&c->dst, dst, sizeof(*dst));
+}
+
+/* Take the key, or say who has it. -EEXIST is an ordinary answer and the only
+ * one a caller reports to an operator; -ENOMEM is an install error like any
+ * other. Allocation happens before the lock, because this is a leaf and taking
+ * it must not be able to sleep. */
+static int ft_mc_claim_take(u8 family, const union nf_inet_addr *src,
+			    const union nf_inet_addr *dst)
+{
+	struct ft_mc_claim *claim, *other;
+
+	claim = kzalloc(sizeof(*claim), GFP_KERNEL);
+	if (!claim)
+		return -ENOMEM;
+	claim->family = family;
+	claim->src = *src;
+	claim->dst = *dst;
+	spin_lock_bh(&ft_mc_claim_lock);
+	list_for_each_entry(other, &ft_mc_claims, list) {
+		if (!ft_mc_claim_same(other, family, src, dst))
+			continue;
+		spin_unlock_bh(&ft_mc_claim_lock);
+		kfree(claim);
+		return -EEXIST;
+	}
+	list_add(&claim->list, &ft_mc_claims);
+	spin_unlock_bh(&ft_mc_claim_lock);
+	return 0;
+}
+
+static void ft_mc_claim_give(u8 family, const union nf_inet_addr *src,
+			     const union nf_inet_addr *dst)
+{
+	struct ft_mc_claim *claim, *tmp;
+	bool freed = false;
+
+	spin_lock_bh(&ft_mc_claim_lock);
+	list_for_each_entry_safe(claim, tmp, &ft_mc_claims, list) {
+		if (!ft_mc_claim_same(claim, family, src, dst))
+			continue;
+		list_del(&claim->list);
+		kfree(claim);
+		freed = true;
+		break;
+	}
+	spin_unlock_bh(&ft_mc_claim_lock);
+	if (!freed)
+		return;
+	/* Whoever was refused this key is still refused until something looks
+	 * again, and nothing else ever will. */
+	ft_mc_kick();
+	ft_mr_kick();
 }
 
 /* ------------------------------------------------------------- Multicast
@@ -3387,7 +3519,20 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
  * record what happened.
  */
 
-/* One listener: the bridge port a copy leaves by, and the tags it leaves with.
+/* How many memberships one group keeps a record of.
+ *
+ * One more than the hardware can replicate to, because a member the hardware
+ * *cannot* carry still has to be recorded: it is what makes the group
+ * ineligible, and forgetting it is how a group comes to be installed for a
+ * subset of the ports the bridge delivers to. The extra slot is what lets the
+ * ninth join be recorded as the thing that refuses the group rather than
+ * disappearing. A tenth distinct port in one MDB port group is unreachable on
+ * a board with five, and fails closed; see `overflow`.
+ */
+#define FT_MC_MAX_MEMBERS	(CDX_MC_MAX_LISTENERS + 1)
+
+/* One member: a bridge port this group is delivered to, and the tags a copy
+ * leaves it with.
  *
  * The tags are not the port's own -- a physical port in this ownership mode
  * has no VLAN interface and would describe none. They are what the bridge
@@ -3398,6 +3543,15 @@ struct ft_mc_port {
 	struct net_device *dev;
 	struct cdx_ft_vlan vlan[CDX_FT_VLAN_MAX];
 	u8 vlans;
+	/* The bridge delivers this group here and the hardware cannot: the
+	 * port is not a CDX port at all -- a Wi-Fi VAP on br-lan is the
+	 * shipping example -- or its egress framing is one no rule can
+	 * describe. The member is recorded anyway, because a group that
+	 * installed without it would take the frame away from the bridge and
+	 * this listener would simply stop receiving, with nothing anywhere to
+	 * say why. That is the partial replication the contract refuses, and
+	 * refusing it means knowing the member is there. */
+	bool uncarried;
 };
 
 /* A group the bridge has told us about.
@@ -3411,8 +3565,14 @@ struct ft_mc_group {
 	struct list_head list;
 	struct net_device *bridge;
 	struct br_ip addr;
-	struct ft_mc_port port[CDX_MC_MAX_LISTENERS];
+	struct ft_mc_port port[FT_MC_MAX_MEMBERS];
 	u8 ports;
+	/* A join arrived with no slot left to record it in, so this group has
+	 * a member it cannot name. Sticky until the group empties, because
+	 * there is no way to tell a later leave apart from that member's:
+	 * conservative, and it fails towards software rather than towards
+	 * replicating to a set that is missing somebody. */
+	bool overflow;
 	/* The bridge itself has joined, so the host needs a copy. A hardware
 	 * entry replicates to ports and the frame never reaches the CPU, so
 	 * such a group is refused rather than carried: the alternative is
@@ -3469,6 +3629,35 @@ static DECLARE_WORK(ft_mc_work, ft_mc_work_fn);
 /* Set once the adapter is tearing down, so a queued worker that runs during
  * exit does nothing rather than reaching a backend that is going away. */
 static bool ft_mc_stopping;
+/* Something outside this learner changed an answer it had already given --
+ * today only a hardware key being handed back. Every group that is not in
+ * hardware is reconsidered on the next pass. */
+static bool ft_mc_recheck;
+
+static void ft_mc_kick(void)
+{
+	if (READ_ONCE(ft_mc_stopping))
+		return;
+	WRITE_ONCE(ft_mc_recheck, true);
+	schedule_work(&ft_mc_work);
+}
+
+/* The hardware key a group would occupy, in the shape the shared register
+ * keeps. A membership names its group as a br_ip and learns its source from
+ * traffic; the classifier knows only an address pair and a family. */
+static void ft_mc_group_key(const struct ft_mc_group *g, u8 *family,
+			    union nf_inet_addr *src, union nf_inet_addr *dst)
+{
+	memset(dst, 0, sizeof(*dst));
+	*src = g->src;
+	if (g->addr.proto == htons(ETH_P_IPV6)) {
+		*family = AF_INET6;
+		dst->in6 = g->addr.dst.ip6;
+	} else {
+		*family = AF_INET;
+		dst->ip = g->addr.dst.ip4;
+	}
+}
 
 static bool ft_mc_same_group(const struct ft_mc_group *g,
 			     const struct net_device *bridge,
@@ -3486,6 +3675,28 @@ static struct ft_mc_group *ft_mc_find(const struct net_device *bridge,
 		if (ft_mc_same_group(g, bridge, addr))
 			return g;
 	return NULL;
+}
+
+/* Whether every port the bridge delivers this group to is one the hardware can
+ * be given.
+ *
+ * All or nothing, and the reason is that there is no half. A matched frame
+ * never reaches the bridge, so a member left out of the hardware set does not
+ * fall back to software -- it stops receiving, silently. A group with a Wi-Fi
+ * VAP among its listeners, which is what br-lan looks like the moment a phone
+ * joins the same stream as a set-top box, is therefore carried by the bridge
+ * in software in its entirety rather than by the hardware in part.
+ */
+static bool ft_mc_carriable(const struct ft_mc_group *g)
+{
+	u8 i;
+
+	if (g->overflow || g->ports > CDX_MC_MAX_LISTENERS)
+		return false;
+	for (i = 0; i < g->ports; i++)
+		if (g->port[i].uncarried)
+			return false;
+	return true;
 }
 
 /* Whether this port could carry a replica, asked the only way a caller holding
@@ -3508,6 +3719,11 @@ static bool ft_mc_port_eligible(struct net_device *dev)
  * flow's path down to a port and works out what the bridge added along the
  * way. Here the VLAN is already known, because the MDB entry names it, so
  * only the port's membership is in question.
+ *
+ * Two kinds of failure, and the caller has to tell them apart. -ENOENT means
+ * the bridge would not deliver to this port at all, so dropping the member
+ * costs nothing. -EOPNOTSUPP means it would and this side cannot describe the
+ * framing, which makes the member one the group has to be refused over.
  */
 static int ft_mc_port_tags(struct net_device *bridge, struct net_device *port,
 			   u16 vid, struct cdx_ft_vlan *stack, u8 *count)
@@ -3526,9 +3742,10 @@ static int ft_mc_port_tags(struct net_device *bridge, struct net_device *port,
 	if (!vid)
 		return -EOPNOTSUPP;
 	/* A port that is not a member of the group's VLAN would not receive
-	 * this group in software either. */
+	 * this group in software either -- br_allowed_egress() drops the copy
+	 * -- so it is not a listener rather than an uncarriable one. */
 	if (br_vlan_get_info(port, vid, &vinfo))
-		return -EOPNOTSUPP;
+		return -ENOENT;
 	if (vinfo.flags & BRIDGE_VLAN_INFO_UNTAGGED)
 		return 0;
 	stack[0].proto = htons(proto);
@@ -3580,6 +3797,8 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 			     const struct br_ip *addr, bool adding, bool host)
 {
 	struct ft_mc_group *g;
+	bool uncarried;
+	int rc;
 	u8 i;
 
 	lockdep_assert_held(&ft_mc_lock);
@@ -3638,10 +3857,6 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 		return false;
 	}
 
-	if (!ft_mc_port_eligible(port)) {
-		ft_mc_refused++;
-		return false;
-	}
 	if (!g) {
 		g = kzalloc(sizeof(*g), GFP_KERNEL);
 		if (!g)
@@ -3653,25 +3868,48 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 		ft_mc_count++;
 	}
 	for (i = 0; i < g->ports; i++)
-		if (g->port[i].dev == port)
-			return !g->host;	/* already a member */
-	if (g->ports == CDX_MC_MAX_LISTENERS) {
-		/* Capacity is an ordinary outcome: the group stays in software
-		 * and says so through /proc, exactly as an exhausted
-		 * statistics pool does for a PPPoE session. */
+		if (g->port[i].dev == port)	/* already a member */
+			return !g->port[i].uncarried && !g->host &&
+			       ft_mc_carriable(g);
+	if (g->ports == FT_MC_MAX_MEMBERS) {
+		/* Nowhere to record it, so from here the group has a member it
+		 * cannot name and must not be installed. */
+		g->overflow = true;
+		g->dirty = true;
 		ft_mc_refused++;
 		return false;
 	}
-	if (ft_mc_port_tags(bridge, port, addr->vid, g->port[g->ports].vlan,
-			    &g->port[g->ports].vlans)) {
+	memset(&g->port[g->ports], 0, sizeof(g->port[0]));
+	uncarried = !ft_mc_port_eligible(port);
+	if (!uncarried) {
+		rc = ft_mc_port_tags(bridge, port, addr->vid,
+				     g->port[g->ports].vlan,
+				     &g->port[g->ports].vlans);
+		if (rc == -ENOENT) {
+			/* Not a listener at all; the bridge would drop the
+			 * copy on egress too. */
+			memset(&g->port[g->ports], 0, sizeof(g->port[0]));
+			return false;
+		}
+		uncarried = rc != 0;
+	}
+	if (uncarried) {
+		/* Recorded, never programmed. */
+		memset(&g->port[g->ports], 0, sizeof(g->port[0]));
+		g->port[g->ports].uncarried = true;
 		ft_mc_refused++;
-		return false;
 	}
 	dev_hold(port);
 	g->port[g->ports].dev = port;
 	g->ports++;
 	g->dirty = true;
-	return !g->host;
+	/* One more listener than the hardware can replicate to. Capacity and
+	 * an uncarriable port are the same outcome as far as the group is
+	 * concerned -- it stays in software and /proc says which -- exactly as
+	 * an exhausted statistics pool does for a PPPoE session. */
+	if (!uncarried && g->ports > CDX_MC_MAX_LISTENERS)
+		ft_mc_refused++;
+	return !uncarried && !g->host && ft_mc_carriable(g);
 }
 
 /* ---- the traffic half -------------------------------------------------
@@ -3996,6 +4234,21 @@ static void ft_mc_work_fn(struct work_struct *work)
 	LIST_HEAD(dead);
 	bool want_hook;
 
+	/* A hardware key was handed back, so every refusal that named it is
+	 * stale. Retries go with it: a group that failed against a key it
+	 * could not have is not a group that cannot be carried. */
+	if (READ_ONCE(ft_mc_recheck)) {
+		WRITE_ONCE(ft_mc_recheck, false);
+		mutex_lock(&ft_mc_lock);
+		list_for_each_entry(g, &ft_mc_groups, list) {
+			if (g->hw)
+				continue;
+			g->retries = 0;
+			g->dirty = true;
+		}
+		mutex_unlock(&ft_mc_lock);
+	}
+
 	/* Drain what the hook observed. */
 	for (;;) {
 		spin_lock_bh(&ft_mc_ring_lock);
@@ -4028,15 +4281,20 @@ static void ft_mc_work_fn(struct work_struct *work)
 
 	list_for_each_entry_safe(g, tmp, &dead, list) {
 		if (g->hw) {
+			union nf_inet_addr src, dst;
+			u8 family;
+
 			/* Even while stopping. Skipping the delete would strand
 			 * the classifier entry, its group id and its listener
 			 * chain in hardware with nothing left to own them --
 			 * this group is already off the list ft_mc_exit()
 			 * drains, so nobody else would ever see it. */
+			ft_mc_group_key(g, &family, &src, &dst);
 			cdx_ft_begin();
 			cdx_mc_group_del(&g->hw);
 			cdx_ft_end();
 			ft_mc_installed--;
+			ft_mc_claim_give(family, &src, &dst);
 		}
 		list_del(&g->list);
 		ft_mc_group_free(g);
@@ -4049,15 +4307,18 @@ static void ft_mc_work_fn(struct work_struct *work)
 		struct cdx_mc_group_spec spec = {};
 		struct cdx_mc_group *hw = NULL;
 		struct ft_mc_group *target = NULL;
-		bool replace = false;
-		int rc = 0;
+		union nf_inet_addr key_src = {}, key_dst = {};
+		bool replace = false, contested = false, release = false;
+		u8 key_family = AF_INET;
+		int rc = 0, take;
 		u8 i;
 
 		mutex_lock(&ft_mc_lock);
 		list_for_each_entry(g, &ft_mc_groups, list) {
 			if (!g->dirty || ft_mc_stopping)
 				continue;
-			if (g->host || !g->ports || !g->in) {
+			if (g->host || !g->ports || !g->in ||
+			    !ft_mc_carriable(g)) {
 				/* Not installable. A group that was installed
 				 * and has become ineligible is retired below
 				 * rather than left carrying stale ports. */
@@ -4075,6 +4336,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		}
 		target->dirty = false;
 		target->contested = ft_mc_key_contested(target);
+		ft_mc_group_key(target, &key_family, &key_src, &key_dst);
 		/* Snapshot under the lock; the hardware call happens after it
 		 * is dropped. Every device in the spec gets a reference of its
 		 * own for that window: the group's own pins are dropped by a
@@ -4084,7 +4346,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * references would leave the spec naming a device whose last
 		 * reference had just gone. */
 		if (!target->host && !target->contested &&
-		    target->ports && target->in &&
+		    target->ports && target->in && ft_mc_carriable(target) &&
 		    target->retries < FT_MC_MAX_RETRIES) {
 			spec.in = target->in;
 			spec.family = target->addr.proto == htons(ETH_P_IPV6) ?
@@ -4127,31 +4389,54 @@ static void ft_mc_work_fn(struct work_struct *work)
 		}
 		mutex_unlock(&ft_mc_lock);
 
-		cdx_ft_begin();
-		if (!spec.listeners) {
-			/* Became ineligible: take it out of hardware and
-			 * leave the membership, which may become installable
-			 * again when the host leaves or a port returns. */
-			if (hw) {
-				cdx_mc_group_del(&hw);
-				ft_mc_installed--;
-			}
-		} else if (replace) {
-			rc = cdx_mc_group_replace(hw, &spec);
-			if (rc)
-				ft_mc_install_errors++;
-		} else {
-			rc = cdx_mc_group_add(&spec, &hw);
-			if (rc) {
-				ft_mc_install_errors++;
-				hw = NULL;
+		/* The shared key is taken before the transaction rather than
+		 * inside it. An address pair the routed learner is already
+		 * carrying is an answer for the operator rather than an
+		 * error, and finding that out here costs neither a
+		 * transaction nor the three retries an -EEXIST would burn. A
+		 * replace keeps the key it already holds. */
+		take = spec.listeners && !replace ?
+			ft_mc_claim_take(key_family, &key_src, &key_dst) : 0;
+		if (take == -EEXIST)
+			contested = true;
+		else if (take)
+			rc = take;	/* an install failure like any other */
+
+		if (!take) {
+			cdx_ft_begin();
+			if (!spec.listeners) {
+				/* Became ineligible: take it out of hardware and
+				 * leave the membership, which may become installable
+				 * again when the host leaves or a port returns. */
+				if (hw) {
+					cdx_mc_group_del(&hw);
+					ft_mc_installed--;
+					release = true;
+				}
+			} else if (replace) {
+				rc = cdx_mc_group_replace(hw, &spec);
+				if (rc)
+					ft_mc_install_errors++;
 			} else {
-				ft_mc_installed++;
+				rc = cdx_mc_group_add(&spec, &hw);
+				if (rc) {
+					ft_mc_install_errors++;
+					hw = NULL;
+					release = true;
+				} else {
+					ft_mc_installed++;
+				}
 			}
+			cdx_ft_end();
+			if (release)
+				ft_mc_claim_give(key_family, &key_src, &key_dst);
+		} else if (rc) {
+			ft_mc_install_errors++;
 		}
-		cdx_ft_end();
 
 		mutex_lock(&ft_mc_lock);
+		if (contested)
+			target->contested = true;
 		/* The group may have been retired while the transaction was
 		 * held; it is still allocated, because only this function
 		 * frees one and it is not reentrant. */
@@ -4223,6 +4508,15 @@ static bool ft_mc_swdev_obj(unsigned long event,
 	port = obj->info.dev;
 	if (!port || !net_eq(dev_net(port), &init_net))
 		return false;
+	/* A routed group whose oif is a bridge replicates to exactly the ports
+	 * that bridge's memberships name -- br_dev_xmit() hands a group with
+	 * an MDB entry to br_multicast_flood() rather than flooding it -- so
+	 * every membership change here can change a routed listener set. The
+	 * second set-top box joining on a second port is the case: the routed
+	 * group has to grow from one listener to two. Only a kick, and here
+	 * rather than at each of the arms below, because this handler holds
+	 * RTNL and reaches no hardware whichever way it ends. */
+	ft_mr_kick();
 	bridge = host ? obj->obj->orig_dev : netdev_master_upper_dev_get(port);
 	if (!bridge || !netif_is_bridge_master(bridge)) {
 		/* A delete can legitimately arrive after the port has left.
@@ -4331,9 +4625,14 @@ static void ft_mc_exit(void)
 	 * to this list while it drains. */
 	list_for_each_entry_safe(g, tmp, &ft_mc_groups, list) {
 		if (g->hw) {
+			union nf_inet_addr src, dst;
+			u8 family;
+
+			ft_mc_group_key(g, &family, &src, &dst);
 			cdx_ft_begin();
 			cdx_mc_group_del(&g->hw);
 			cdx_ft_end();
+			ft_mc_claim_give(family, &src, &dst);
 		}
 		list_del(&g->list);
 		ft_mc_group_free(g);
@@ -4349,6 +4648,12 @@ static const char *ft_mc_state(const struct ft_mc_group *g)
 {
 	if (g->host)
 		return "refused-host";
+	/* Before "installed", deliberately: a group that has just gained a
+	 * member the hardware cannot carry is still in the table for one more
+	 * worker pass, and what an operator needs to read in that window is
+	 * the reason it is about to come out. */
+	if (!ft_mc_carriable(g))
+		return "refused-listener";
 	if (g->contested)
 		return "refused-contested";
 	if (g->retries >= FT_MC_MAX_RETRIES)
@@ -4410,6 +4715,1316 @@ static void ft_mc_rows(struct seq_file *seq)
 				   ft_mc_state(g), stats.packets, stats.bytes);
 	}
 	mutex_unlock(&ft_mc_lock);
+}
+
+/* The port set a bridge would replicate a group to, read from the membership
+ * half of the learner above.
+ *
+ * br_dev_xmit() hands a locally generated multicast frame that has an MDB
+ * entry to br_multicast_flood(), which copies it to that entry's ports (and to
+ * the bridge's router ports, which are a stated exclusion). Everything else
+ * goes to br_flood(), which copies it to every port carrying BR_MCAST_FLOOD.
+ * This answers the first; a caller seeing -ENOENT falls back to the second.
+ *
+ * Which membership: the bridge looks up (S,G) first and (*,G) second, and an
+ * (S,G) entry is self-contained -- br_multicast_sg_add_exclude_ports() folds
+ * the star-exclude ports into it -- so the first match wins rather than the
+ * union of the two.
+ *
+ * Takes ft_mc_lock and nothing else. Its caller is the routed worker, holding
+ * RTNL and neither learner's mutex, which is what keeps the two orders apart.
+ * The ports it returns are borrowed for the length of that RTNL section: a
+ * leave runs from the switchdev handler, which holds RTNL too.
+ */
+static int ft_mc_bridge_ports(struct net_device *bridge, u8 family,
+			      const union nf_inet_addr *src,
+			      const union nf_inet_addr *dst, u16 vid,
+			      struct net_device **ports, u8 max)
+{
+	__be16 proto = family == AF_INET6 ? htons(ETH_P_IPV6) : htons(ETH_P_IP);
+	const struct ft_mc_group *g, *best = NULL;
+	int n = -ENOENT;
+	u8 i;
+
+	if (!br_multicast_enabled(bridge))
+		return -ENOENT;
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		bool sourced;
+
+		if (g->bridge != bridge || g->addr.proto != proto ||
+		    g->addr.vid != vid || !g->ports)
+			continue;
+		if (family == AF_INET6) {
+			if (!ipv6_addr_equal(&g->addr.dst.ip6, &dst->in6))
+				continue;
+			sourced = !ipv6_addr_any(&g->addr.src.ip6);
+			if (sourced &&
+			    !ipv6_addr_equal(&g->addr.src.ip6, &src->in6))
+				continue;
+		} else {
+			if (g->addr.dst.ip4 != dst->ip)
+				continue;
+			sourced = g->addr.src.ip4 != 0;
+			if (sourced && g->addr.src.ip4 != src->ip)
+				continue;
+		}
+		if (sourced) {
+			best = g;
+			break;
+		}
+		if (!best)
+			best = g;
+	}
+	if (best && (best->ports > max || !ft_mc_carriable(best))) {
+		/* A membership with a member the hardware cannot carry is the
+		 * same answer here as it is over there: the whole group stays
+		 * in software. Handing back the carried subset would replicate
+		 * to it and leave the rest silently unserved -- and the routed
+		 * caller could not tell, because what it got back would look
+		 * like a complete port set. */
+		n = -EOPNOTSUPP;
+	} else if (best) {
+		for (i = 0; i < best->ports; i++)
+			ports[i] = best->port[i].dev;
+		n = best->ports;
+	}
+	mutex_unlock(&ft_mc_lock);
+	return n;
+}
+
+/* ------------------------------------------------------- Routed multicast
+ *
+ * The second learner, and the one with nothing to learn. Where a bridge's MDB
+ * describes a permission that traffic has to complete -- see the section above
+ * -- ipmr's MFC is already the classifier's key: mfc_origin and mfc_mcastgrp
+ * are an exact (S,G), mfc_parent names the interface the stream arrives on,
+ * and ttls[] is the replication list. Every fact the bridged learner had to
+ * recover from frames is stated outright here, so this half has no packet
+ * hook and nothing is ever waiting on a source.
+ *
+ * It is not a second feature either. The hardware transform is a router's
+ * already: fill_actions() sets TTL_HM_VALID on the root entry unconditionally,
+ * so the microcode decrements the TTL -- and the parser refuses to classify a
+ * frame that arrives with 0 or 1, which is the kernel's own `ttl > 1` rule --
+ * and every listener entry rebuilds the Ethernet header with the egress port's
+ * own address and the group's mapped multicast destination. The encoder needed
+ * no change; this feeds it a different spec.
+ *
+ * The control plane is whatever fills the MFC -- igmpproxy, omcproxy,
+ * smcroute, pimd -- and none of them needs anything from ASK. They install
+ * (S,G) entries at threshold 1 in the default table, which is what the
+ * contract below accepts. See docs/flowtable-multicast-routed.md.
+ *
+ * Locking, which is where this differs from every other notifier in this file.
+ * The FIB chain is an *atomic* chain and every mr_* caller asserts RTNL, so
+ * the handler runs in process context under RTNL and may not sleep: it holds
+ * the mfc and the device, appends to a queue under a spinlock, and wakes a
+ * worker. The worker takes ft_mr_lock to choose a group, releases it, takes
+ * RTNL to decide -- device walks, bridge VLAN state, and the bridged learner's
+ * port set under ft_mc_lock -- releases RTNL, and only then takes the
+ * transaction. Three rules hold throughout, and tools/host_tests/
+ * test_mroute_learner.py greps for each:
+ *
+ *   - ft_mr_lock is never held across cdx_ft_begin(). /proc takes the
+ *     transaction and then the lock, so the other order would close a cycle.
+ *   - RTNL is never held across cdx_ft_begin() either, which is
+ *     cdx_ctrl_lock_with_rtnl()'s standing rule rather than this section's.
+ *   - ft_mr_lock is never taken while ft_mc_lock is held. The routed worker
+ *     takes ft_mc_lock briefly, holding neither; the bridged side never
+ *     reaches into this one at all, it only kicks the worker.
+ */
+
+/* Enough to ride out a transient -- a port bouncing, a moment of capacity
+ * pressure -- and few enough that a group which genuinely cannot be carried
+ * stops costing anything. Anything that changes the answer resets it. */
+#define FT_MR_MAX_RETRIES	4
+/* One name per oif, and an oif produces at least one listener, so the listener
+ * ceiling bounds the count. */
+#define FT_MR_OIF_TEXT		(CDX_MC_MAX_LISTENERS * (IFNAMSIZ + 1))
+/* mlxsw folds its hardware counters every five seconds and nothing here wants
+ * to be finer: the numbers feed `ip -s mroute` and a daemon's SIOCGETSGCNT,
+ * both of which an operator reads by hand. */
+#define FT_MR_STATS_INTERVAL	(5 * HZ)
+
+enum ft_mr_state {
+	/* Eligible, and the worker has not installed it yet. */
+	FT_MR_PENDING,
+	FT_MR_INSTALLED,
+	/* Everything from here down is a refusal, in the order the contract
+	 * tests them. ft_mr_refusal() depends on FT_MR_PENDING and
+	 * FT_MR_INSTALLED staying below the first of them. */
+	FT_MR_REFUSED_TABLE,
+	FT_MR_REFUSED_POLICY,
+	FT_MR_REFUSED_WILDCARD,
+	FT_MR_REFUSED_SCOPE,
+	FT_MR_REFUSED_INGRESS,
+	FT_MR_REFUSED_HOST,
+	FT_MR_REFUSED_THRESHOLD,
+	FT_MR_REFUSED_LISTENER,
+	FT_MR_REFUSED_CONTESTED,
+	FT_MR_REFUSED_FAILED,
+};
+
+/* Why a group is not being replicated, for an operator looking at a stream
+ * that is not offloaded. Every refusal in the contract has a word of its own:
+ * one "refused" would answer ten different questions the same way. */
+static const char *ft_mr_state_text(enum ft_mr_state state)
+{
+	switch (state) {
+	case FT_MR_PENDING:		return "pending";
+	case FT_MR_INSTALLED:		return "installed";
+	case FT_MR_REFUSED_TABLE:	return "refused-table";
+	case FT_MR_REFUSED_POLICY:	return "refused-policy";
+	case FT_MR_REFUSED_WILDCARD:	return "refused-wildcard";
+	case FT_MR_REFUSED_SCOPE:	return "refused-scope";
+	case FT_MR_REFUSED_INGRESS:	return "refused-ingress";
+	case FT_MR_REFUSED_HOST:	return "refused-host";
+	case FT_MR_REFUSED_THRESHOLD:	return "refused-threshold";
+	case FT_MR_REFUSED_LISTENER:	return "refused-listener";
+	case FT_MR_REFUSED_CONTESTED:	return "refused-contested";
+	case FT_MR_REFUSED_FAILED:	return "refused-failed";
+	}
+	return "unknown";
+}
+
+static bool ft_mr_refusal(enum ft_mr_state state)
+{
+	return state >= FT_MR_REFUSED_TABLE;
+}
+
+/* One VIF, mirrored from the chain rather than read out of ipmr.
+ *
+ * The MFC notification carries mfc_parent and ttls[] as VIF *indexes* and
+ * nothing that resolves them; mr_table is private to ipmr. So the VIF table is
+ * kept here, built from the VIF_ADD and VIF_DEL the same chain delivers -- and
+ * the registration dump replays every existing VIF before any MFC entry
+ * (mr_dump()), so it is complete before the first group arrives.
+ */
+struct ft_mr_vif {
+	struct net_device *dev;
+	unsigned short flags;
+};
+
+/* One routed group: an MFC entry this learner has an opinion about.
+ *
+ * Keyed on the mfc pointer, which is exact -- ipmr emits ENTRY_REPLACE against
+ * the same pointer when thresholds or the parent change, ENTRY_ADD for a new
+ * one, and ENTRY_DEL for that one -- and safe, because the reference taken
+ * with mr_cache_hold() keeps the object from being freed and its address from
+ * being reused underneath us.
+ *
+ * `in` and `listener[]` are what the last successful derivation installed,
+ * each pinned for as long as the hardware entry names it. They are what /proc
+ * reports, so they describe the hardware rather than the intent.
+ */
+struct ft_mr_group {
+	struct list_head list;
+	struct mr_mfc *mfc;
+	u32 table;
+	u8 family;
+	union nf_inet_addr src;
+	union nf_inet_addr dst;
+	struct net_device *in;
+	u8 in_tags;
+	struct cdx_mc_listener listener[CDX_MC_MAX_LISTENERS];
+	u8 listeners;
+	char oifs[FT_MR_OIF_TEXT];
+	struct cdx_mc_group *hw;
+	enum ft_mr_state state;
+	/* The shared address-pair register holds this group's key. */
+	bool claimed;
+	/* MFC_OFFLOAD is set on the kernel's entry. */
+	bool offloaded;
+	bool dirty;
+	/* The kernel deleted the entry; retire and forget it. */
+	bool gone;
+	u8 retries;
+};
+
+/* What one derivation produced, with a reference of its own on every device in
+ * it. Either the group adopts the whole thing or ft_mr_plan_put() returns it;
+ * there is no half-adopted state, because the backend borrows exactly these
+ * pointers and a group that owned some of them would name one it did not. */
+struct ft_mr_plan {
+	struct cdx_mc_group_spec spec;
+	char oifs[FT_MR_OIF_TEXT];
+	u8 in_tags;
+};
+
+/* What the atomic handler hands the worker. The mfc and the device are held
+ * here rather than looked up later: by the time the worker runs, the entry may
+ * have been deleted and the device unregistered. */
+struct ft_mr_event {
+	struct list_head list;
+	unsigned long event;
+	u8 family;
+	u32 table;
+	struct mr_mfc *mfc;
+	struct net_device *dev;
+	unsigned short vif_index;
+	unsigned short vif_flags;
+	bool rule_default;
+};
+
+static LIST_HEAD(ft_mr_groups);
+static DEFINE_MUTEX(ft_mr_lock);
+static LIST_HEAD(ft_mr_queue);
+static DEFINE_SPINLOCK(ft_mr_queue_lock);
+static struct ft_mr_vif ft_mr_vif[2][MAXVIFS];
+static unsigned int ft_mr_count, ft_mr_installed;
+static unsigned int ft_mr_policy[2];
+static u64 ft_mr_refused, ft_mr_install_errors, ft_mr_lost;
+static bool ft_mr_stopping;
+static bool ft_mr_recheck;
+static void ft_mr_work_fn(struct work_struct *work);
+static void ft_mr_stats_fn(struct work_struct *work);
+static DECLARE_WORK(ft_mr_work, ft_mr_work_fn);
+static DECLARE_DELAYED_WORK(ft_mr_stats, ft_mr_stats_fn);
+
+static unsigned int ft_mr_idx(u8 family)
+{
+	return family == AF_INET6 ? 1 : 0;
+}
+
+/* The one multicast routing table this learner reads. ipmr_rules_init()
+ * creates RT_TABLE_DEFAULT and ip6mr_rules_init() RT6_TABLE_DFLT; reaching any
+ * other one takes a policy rule, and a policy rule is what ft_mr_derive()
+ * refuses the whole family over. */
+static u32 ft_mr_default_table(u8 family)
+{
+	return family == AF_INET6 ? RT6_TABLE_DFLT : RT_TABLE_DEFAULT;
+}
+
+/* Wake the worker and have it reconsider every answer it has given.
+ *
+ * Reached from the netdev chain, the switchdev chain and the shared key
+ * register, all of which can change a decision without changing an MFC entry.
+ * Retries go with it: a group that failed against a port with no carrier is
+ * not a group that cannot be carried, and nothing else would ever look again.
+ */
+static void ft_mr_kick(void)
+{
+	if (READ_ONCE(ft_mr_stopping))
+		return;
+	WRITE_ONCE(ft_mr_recheck, true);
+	schedule_work(&ft_mr_work);
+}
+
+/* ---- the contract's tests, each answerable on its own ------------------ */
+
+/* The classifier composes {portid, saddr, daddr, protocol} into an external
+ * *hash* table, so a masked source cannot match -- a wildcard would change the
+ * hash rather than widen it. An (*,G) MFC entry, and the (*,*) form ipmr also
+ * carries, therefore have no key to install. */
+static bool ft_mr_specific(u8 family, const union nf_inet_addr *src,
+			   const union nf_inet_addr *dst)
+{
+	if (family == AF_INET6)
+		return !ipv6_addr_any(&src->in6) && !ipv6_addr_any(&dst->in6);
+	return src->ip != htonl(INADDR_ANY) && dst->ip != htonl(INADDR_ANY);
+}
+
+/* Link-local scope carries the membership protocols themselves. The backend
+ * refuses it too; mirroring the test here is what makes /proc say
+ * "refused-scope" instead of "refused-failed" four retries later. */
+static bool ft_mr_scope_ok(u8 family, const union nf_inet_addr *dst)
+{
+	if (family == AF_INET6)
+		return ipv6_addr_is_multicast(&dst->in6) &&
+		       __ipv6_addr_src_scope(__ipv6_addr_type(&dst->in6)) >
+			       IPV6_ADDR_SCOPE_LINKLOCAL;
+	return ipv4_is_multicast(dst->ip) &&
+	       (ntohl(dst->ip) & 0xffffff00) != 0xe0000000;
+}
+
+/* Whether the box itself has joined this group on the interface the stream
+ * arrives on.
+ *
+ * ip_mr_input() delivers locally as well as forwarding when it does --
+ * ip_route_input_mc() asks ip_check_mc_rcu() on the input device, and IPv6
+ * asks the idev's own list -- and a hardware entry replicates to ports without
+ * the frame ever reaching the CPU. Such a group is refused rather than carried
+ * with a starved local listener, which is the bridged learner's answer to the
+ * same question. Neither check is exported, so the lists are walked here.
+ */
+static bool ft_mr_host_member(struct net_device *dev, u8 family,
+			      const union nf_inet_addr *group)
+{
+	bool found = false;
+
+	rcu_read_lock();
+	if (family == AF_INET6) {
+		struct inet6_dev *idev = __in6_dev_get(dev);
+		struct ifmcaddr6 *mc;
+
+		for (mc = idev ? rcu_dereference(idev->mc_list) : NULL;
+		     mc && !found; mc = rcu_dereference(mc->next))
+			found = ipv6_addr_equal(&mc->mca_addr, &group->in6);
+	} else {
+		struct in_device *in_dev = __in_dev_get_rcu(dev);
+		struct ip_mc_list *im;
+
+		for (im = in_dev ? rcu_dereference(in_dev->mc_list) : NULL;
+		     im && !found; im = rcu_dereference(im->next_rcu))
+			found = im->multiaddr == group->ip;
+	}
+	rcu_read_unlock();
+	return found;
+}
+
+/* The one physical port a VIF's traffic arrives on, and the framing it arrives
+ * with, in a listener's own shape.
+ *
+ * The classifier key names a port, not a VLAN, and the per-listener rebuild
+ * strips whatever L2 the frame came in with -- so a VIF that is a VLAN device
+ * keys on the port beneath it. A bridge cannot be an ingress at all: it is
+ * many ports and the key is one. A bridge *port* is refused for the opposite
+ * reason -- its frames go to the bridge's rx handler and never reach a VIF
+ * above it, so a VIF naming one describes traffic that does not exist.
+ *
+ * The tags are returned as well as counted, for two things. The counter fold
+ * subtracts the framing they represent. And a copy is refused only when its
+ * port *and* its tags equal the ingress's, which is the rule ft_parse()
+ * already applies to a flow: re-entering the port a frame arrived on is
+ * refused only when the two stacks match, because differing stacks are
+ * "ordinary routing between VLANs carried on one trunk". See ft_mr_listener().
+ */
+static struct net_device *ft_mr_ingress_port(struct net_device *dev,
+					     struct cdx_mc_listener *in)
+{
+	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX] = {};
+	unsigned int n = 0, i;
+
+	memset(in, 0, sizeof(*in));
+	for (;;) {
+		if (!dev || netif_is_bridge_master(dev) ||
+		    netif_is_bridge_port(dev) || dev->type == ARPHRD_PPP)
+			return NULL;
+		if (cdx_mc_port_identity(dev)) {
+			/* Outermost first, as a listener's are and as the wire
+			 * carries them; the walk accumulates the other way. */
+			for (i = 0; i < n; i++)
+				in->vlan[i] = inner[n - 1 - i];
+			in->vlans = n;
+			in->dev = dev;
+			return dev;
+		}
+		if (!is_vlan_dev(dev) || n == CDX_FT_VLAN_MAX ||
+		    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
+			return NULL;
+		inner[n].proto = vlan_dev_vlan_proto(dev);
+		inner[n].id = vlan_dev_vlan_id(dev);
+		n++;
+		dev = ft_vlan_lower(dev);
+	}
+}
+
+/* Append one resolved listener.
+ *
+ * `inner` is innermost first, the order the device walk accumulates in and the
+ * order ft_bridge_vlan() reads; a listener is described outermost first, the
+ * order the wire carries. The reversal happens here, at the one place the two
+ * conventions meet.
+ */
+static int ft_mr_listener(struct net_device *port,
+			  const struct cdx_mc_listener *ingress,
+			  const struct cdx_ft_vlan *inner, unsigned int tags,
+			  struct cdx_mc_listener *out, u8 *count)
+{
+	struct cdx_mc_listener add = {};
+	unsigned int i;
+
+	if (tags > CDX_FT_VLAN_MAX)
+		return -EOPNOTSUPP;
+	add.dev = port;
+	add.vlans = tags;
+	for (i = 0; i < tags; i++)
+		add.vlan[i] = inner[tags - 1 - i];
+	/* A copy that would leave the way the frame arrived is not a copy: a
+	 * router does not send a group back where it came from, and
+	 * ip_mr_forward() will not either -- a threshold on the parent VIF is
+	 * honoured only for the (*,*) form.
+	 *
+	 * "The way it arrived" is the port *and* its tags, which is the rule
+	 * ft_parse() has been applying to a flow since the IPv6 increment:
+	 * re-entering the ingress port is refused only when the two tag stacks
+	 * match, because differing stacks are ordinary routing between VLANs
+	 * carried on one trunk. The hardware demonstrably enqueues back to the
+	 * port a frame arrived on -- the hairpin double-NAT case is measured
+	 * at full rate in both directions on one port (docs/flowtable-ipv6.md)
+	 * -- so multicast agreeing with that rule is the two paths saying the
+	 * same thing, not a new capability being claimed. Unicast additionally
+	 * lets full NAT make an identical-stack hairpin distinct; a group has
+	 * no NAT, so identical is refused outright. */
+	if (add.dev == ingress->dev && add.vlans == ingress->vlans &&
+	    !memcmp(add.vlan, ingress->vlan, sizeof(add.vlan)))
+		return -EOPNOTSUPP;
+	/* Two oifs resolving to the same port with the same framing are one
+	 * copy and collapse; with different framing they are two, and the
+	 * backend takes both -- it identifies a listener by its whole framing
+	 * rather than by its device, and each gets its own entry in the chain.
+	 * A gateway serving several VLANs out of one port replicates that way,
+	 * and so does the bench: the rig has one LAN port with carrier and
+	 * every group's other port is its ingress, so two tagged oifs on that
+	 * port are the only way replication to several listeners and the chain
+	 * swap a join performs can be exercised there at all (ISSUES.md
+	 * A158). */
+	for (i = 0; i < *count; i++)
+		if (out[i].dev == add.dev && out[i].vlans == add.vlans &&
+		    !memcmp(out[i].vlan, add.vlan, sizeof(add.vlan)))
+			return 0;
+	if (*count == CDX_MC_MAX_LISTENERS)
+		return -EOPNOTSUPP;
+	out[*count] = add;
+	(*count)++;
+	return 0;
+}
+
+/* The VLAN a bridge forwards this group within, which is one answer for the
+ * whole bridge: the outermost tag above it when the frame already carries one
+ * in the bridge's protocol, and the bridge's PVID otherwise. It is the first
+ * half of what ft_bridge_vlan() decides per port, asked once because the MDB
+ * lookup needs it before any port has been chosen. */
+static int ft_mr_bridge_vid(struct net_device *bridge,
+			    const struct cdx_ft_vlan *inner, unsigned int tags,
+			    u16 *vid)
+{
+	u16 proto;
+
+	*vid = 0;
+	if (!br_vlan_enabled(bridge))
+		return 0;
+	if (br_vlan_get_proto(bridge, &proto) || proto != ETH_P_8021Q)
+		return -EOPNOTSUPP;
+	if (tags && inner[tags - 1].proto == htons(proto)) {
+		*vid = inner[tags - 1].id;
+		return 0;
+	}
+	return br_vlan_get_pvid(bridge, vid) ? -EOPNOTSUPP : 0;
+}
+
+/* An oif that is a bridge becomes every port the bridge would copy to.
+ *
+ * A bridge with a port the hardware cannot carry is refused whole rather than
+ * served in part: the matched frame never reaches the bridge, so a port left
+ * out does not fall back to software, it simply stops receiving. That is the
+ * same all-or-nothing rule the backend states for a listener set, applied one
+ * level up -- and it is also what makes reading the bridged learner's port set
+ * safe, because that learner drops a port it cannot carry rather than
+ * recording it.
+ */
+static int ft_mr_expand_bridge(struct net_device *bridge,
+			       const struct cdx_mc_listener *ingress,
+			       const struct cdx_ft_vlan *inner,
+			       unsigned int tags, u8 family,
+			       const union nf_inet_addr *src,
+			       const union nf_inet_addr *dst,
+			       struct cdx_mc_listener *out, u8 *count)
+{
+	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
+	struct net_device *port;
+	struct list_head *iter;
+	int n, rc;
+	u16 vid;
+	u8 i;
+
+	netdev_for_each_lower_dev(bridge, port, iter) {
+		if (netdev_master_upper_dev_get(port) != bridge)
+			continue;
+		if (!cdx_mc_port_identity(port))
+			return -EOPNOTSUPP;
+	}
+	rc = ft_mr_bridge_vid(bridge, inner, tags, &vid);
+	if (rc)
+		return rc;
+	n = ft_mc_bridge_ports(bridge, family, src, dst, vid, chosen,
+			       ARRAY_SIZE(chosen));
+	/* -ENOENT is "no membership", which is the flood arm below. Anything
+	 * else is a membership this side cannot serve whole, and a bridge that
+	 * cannot be served whole is not served at all. */
+	if (n < 0 && n != -ENOENT)
+		return -EOPNOTSUPP;
+	if (n < 0) {
+		/* No snooping, or nothing has joined: br_flood() copies to
+		 * every port that floods multicast. */
+		n = 0;
+		netdev_for_each_lower_dev(bridge, port, iter) {
+			if (netdev_master_upper_dev_get(port) != bridge ||
+			    !br_port_flag_is_set(port, BR_MCAST_FLOOD))
+				continue;
+			if (n == (int)ARRAY_SIZE(chosen))
+				return -EOPNOTSUPP;
+			chosen[n++] = port;
+		}
+	}
+	if (!n)
+		return -EOPNOTSUPP;
+	for (i = 0; i < n; i++) {
+		struct cdx_ft_vlan stack[CDX_FT_VLAN_MAX];
+		unsigned int c = tags;
+
+		memcpy(stack, inner, sizeof(stack));
+		if (ft_bridge_vlan(bridge, chosen[i], stack, &c) < 0)
+			return -EOPNOTSUPP;
+		rc = ft_mr_listener(chosen[i], ingress, stack, c, out, count);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
+/* One oif, resolved to the listeners the hardware has to be given.
+ *
+ * A physical port is itself. A VLAN device is the port beneath it plus its
+ * tag, up to the two a rule can describe, 802.1Q only for the reason
+ * ft_bridge_vlan() gives. A bridge is its ports. Anything else -- a bond, a
+ * MACVLAN, a ppp device, a tunnel -- is refused rather than approximated,
+ * which is ft_path_stack()'s rule for a flow's path applied to a replica's.
+ */
+static int ft_mr_expand(struct net_device *dev,
+			const struct cdx_mc_listener *ingress,
+			u8 family, const union nf_inet_addr *src,
+			const union nf_inet_addr *dst,
+			struct cdx_mc_listener *out, u8 *count)
+{
+	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX] = {};
+	unsigned int tags = 0;
+
+	for (;;) {
+		if (!dev)
+			return -EOPNOTSUPP;
+		if (netif_is_bridge_master(dev))
+			return ft_mr_expand_bridge(dev, ingress, inner, tags,
+						   family, src, dst, out,
+						   count);
+		if (cdx_mc_port_identity(dev))
+			return ft_mr_listener(dev, ingress, inner, tags, out,
+					      count);
+		if (!is_vlan_dev(dev) || tags == CDX_FT_VLAN_MAX ||
+		    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
+			return -EOPNOTSUPP;
+		inner[tags].proto = vlan_dev_vlan_proto(dev);
+		inner[tags].id = vlan_dev_vlan_id(dev);
+		tags++;
+		dev = ft_vlan_lower(dev);
+	}
+}
+
+static void ft_mr_plan_put(struct ft_mr_plan *plan)
+{
+	u8 i;
+
+	for (i = 0; i < plan->spec.listeners; i++)
+		if (plan->spec.listener[i].dev)
+			dev_put(plan->spec.listener[i].dev);
+	if (plan->spec.in)
+		dev_put(plan->spec.in);
+	memset(plan, 0, sizeof(*plan));
+}
+
+/* The whole contract, in the order an operator would want it answered.
+ *
+ * Runs under RTNL with neither learner mutex held, and touches no hardware.
+ * Every refusal returns with the plan empty and owing no reference; only the
+ * last line, which is the only success, takes any.
+ */
+static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
+				     struct ft_mr_plan *plan)
+{
+	struct cdx_mc_group_spec spec = {};
+	unsigned int idx = ft_mr_idx(g->family);
+	char oifs[FT_MR_OIF_TEXT];
+	struct cdx_mc_listener in;
+	struct net_device *vif_dev;
+	unsigned short bad_flags;
+	struct mr_mfc *mfc = g->mfc;
+	size_t at = 0;
+	int ct;
+
+	ASSERT_RTNL();
+	oifs[0] = '\0';
+	if (g->table != ft_mr_default_table(g->family))
+		return FT_MR_REFUSED_TABLE;
+	/* A policy rule that is not the default one can send a stream to a
+	 * table this learner does not read, and the hardware entry would keep
+	 * matching whatever the rule decided afterwards. One such rule
+	 * anywhere in a family therefore keeps the whole family in software.
+	 * The registration dump replays the existing rules, so the count is
+	 * right from load rather than from the first change. */
+	if (ft_mr_policy[idx])
+		return FT_MR_REFUSED_POLICY;
+	if (!ft_mr_specific(g->family, &g->src, &g->dst))
+		return FT_MR_REFUSED_WILDCARD;
+	if (!ft_mr_scope_ok(g->family, &g->dst))
+		return FT_MR_REFUSED_SCOPE;
+
+	if (mfc->mfc_parent >= MAXVIFS)
+		return FT_MR_REFUSED_INGRESS;
+	/* A PIM register VIF is a tunnel to the rendezvous point built in
+	 * software, and an IPIP VIF encapsulates on egress; neither is a port
+	 * and the hardware would be asked to forward onto nothing. */
+	bad_flags = g->family == AF_INET6 ? MIFF_REGISTER :
+					    (VIFF_TUNNEL | VIFF_REGISTER);
+	vif_dev = ft_mr_vif[idx][mfc->mfc_parent].dev;
+	if (!vif_dev || (ft_mr_vif[idx][mfc->mfc_parent].flags & bad_flags))
+		return FT_MR_REFUSED_INGRESS;
+	spec.in = ft_mr_ingress_port(vif_dev, &in);
+	if (!spec.in)
+		return FT_MR_REFUSED_INGRESS;
+	if (ft_mr_host_member(vif_dev, g->family, &g->dst))
+		return FT_MR_REFUSED_HOST;
+
+	/* ip_mr_forward() forwards out vif ct when ttl > ttls[ct], and 255
+	 * means "not an oif". The hardware's own rule is ttl >= 2, because the
+	 * parser ends the parse for 0 and 1 -- which is exactly threshold 1
+	 * and nothing else. A scoped threshold is a decision the classifier
+	 * cannot express, so the group stays in software rather than being
+	 * carried with the scope silently dropped. */
+	for (ct = mfc->mfc_un.res.minvif; ct < mfc->mfc_un.res.maxvif; ct++) {
+		unsigned char ttl = mfc->mfc_un.res.ttls[ct];
+		struct net_device *oif;
+		int rc;
+
+		if (ttl == 255)
+			continue;
+		if (ttl != 1)
+			return FT_MR_REFUSED_THRESHOLD;
+		if (ct == mfc->mfc_parent)
+			return FT_MR_REFUSED_LISTENER;
+		if (ft_mr_vif[idx][ct].flags & bad_flags)
+			return FT_MR_REFUSED_LISTENER;
+		oif = ft_mr_vif[idx][ct].dev;
+		/* A VIF the kernel has removed is dropped rather than
+		 * refused: what is left is a smaller replication list, and an
+		 * empty one is caught below. */
+		if (!oif)
+			continue;
+		rc = ft_mr_expand(oif, &in, g->family, &g->src, &g->dst,
+				  spec.listener, &spec.listeners);
+		if (rc)
+			return FT_MR_REFUSED_LISTENER;
+		at += scnprintf(oifs + at, sizeof(oifs) - at, "%s%s",
+				at ? "," : "", oif->name);
+	}
+	if (!spec.listeners)
+		return FT_MR_REFUSED_LISTENER;
+
+	spec.family = g->family;
+	spec.src = g->src;
+	spec.dst = g->dst;
+	/* From here the plan owns one reference per device, which the caller
+	 * either hands to the group or returns through ft_mr_plan_put(). */
+	dev_hold(spec.in);
+	for (ct = 0; ct < spec.listeners; ct++)
+		dev_hold(spec.listener[ct].dev);
+	plan->spec = spec;
+	plan->in_tags = in.vlans;
+	strscpy(plan->oifs, oifs, sizeof(plan->oifs));
+	return FT_MR_PENDING;
+}
+
+/* ---- the chain, the queue and the worker ------------------------------- */
+
+static struct ft_mr_group *ft_mr_find(const struct mr_mfc *mfc)
+{
+	struct ft_mr_group *g;
+
+	list_for_each_entry(g, &ft_mr_groups, list)
+		if (g->mfc == mfc)
+			return g;
+	return NULL;
+}
+
+static void ft_mr_dirty_family(u8 family)
+{
+	struct ft_mr_group *g;
+
+	list_for_each_entry(g, &ft_mr_groups, list)
+		if (g->family == family) {
+			g->retries = 0;
+			g->dirty = true;
+		}
+}
+
+/* One queued event, applied to this learner's own state. Called with
+ * ft_mr_lock held, from the worker; no hardware, no RTNL, no device walks --
+ * every decision is deferred to ft_mr_derive(). */
+static void ft_mr_apply(struct ft_mr_event *ev)
+{
+	struct ft_mr_vif *vif;
+	struct ft_mr_group *g;
+	unsigned int idx = ft_mr_idx(ev->family);
+
+	lockdep_assert_held(&ft_mr_lock);
+	switch (ev->event) {
+	case FIB_EVENT_RULE_ADD:
+	case FIB_EVENT_RULE_DEL:
+		if (ev->rule_default)
+			return;
+		if (ev->event == FIB_EVENT_RULE_ADD)
+			ft_mr_policy[idx]++;
+		else if (ft_mr_policy[idx])
+			ft_mr_policy[idx]--;
+		ft_mr_dirty_family(ev->family);
+		return;
+	case FIB_EVENT_VIF_ADD:
+	case FIB_EVENT_VIF_DEL:
+		if (ev->table != ft_mr_default_table(ev->family) ||
+		    ev->vif_index >= MAXVIFS)
+			return;
+		vif = &ft_mr_vif[idx][ev->vif_index];
+		if (vif->dev)
+			dev_put(vif->dev);
+		vif->dev = NULL;
+		vif->flags = 0;
+		if (ev->event == FIB_EVENT_VIF_ADD && ev->dev) {
+			dev_hold(ev->dev);
+			vif->dev = ev->dev;
+			vif->flags = ev->vif_flags;
+		}
+		/* An index is only meaningful against the table it indexes, so
+		 * every group of this family is re-derived rather than only
+		 * those that name this one. */
+		ft_mr_dirty_family(ev->family);
+		return;
+	default:
+		break;
+	}
+
+	g = ft_mr_find(ev->mfc);
+	if (ev->event == FIB_EVENT_ENTRY_DEL) {
+		if (g) {
+			g->gone = true;
+			g->dirty = true;
+		}
+		return;
+	}
+	if (!g) {
+		g = kzalloc(sizeof(*g), GFP_KERNEL);
+		if (!g)
+			return;
+		/* The event's own reference is released when it is freed, so
+		 * the group takes one of its own for as long as it refers to
+		 * the entry -- which is what keeps the pointer it is keyed on
+		 * from being reused. */
+		mr_cache_hold(ev->mfc);
+		g->mfc = ev->mfc;
+		g->table = ev->table;
+		g->family = ev->family;
+		if (ev->family == AF_INET6) {
+			const struct mfc6_cache *c =
+				container_of(ev->mfc, struct mfc6_cache, _c);
+
+			g->src.in6 = c->mf6c_origin;
+			g->dst.in6 = c->mf6c_mcastgrp;
+		} else {
+			const struct mfc_cache *c =
+				container_of(ev->mfc, struct mfc_cache, _c);
+
+			g->src.ip = c->mfc_origin;
+			g->dst.ip = c->mfc_mcastgrp;
+		}
+		list_add(&g->list, &ft_mr_groups);
+		ft_mr_count++;
+	}
+	/* The addresses are the rhashtable key and cannot change, so a
+	 * replace is a new parent or a new threshold set and both are read
+	 * fresh by the derivation. */
+	g->retries = 0;
+	g->dirty = true;
+}
+
+/* The FIB chain, for the two multicast families.
+ *
+ * Atomic, and every mr_* caller holds RTNL. So this may take a spinlock and
+ * nothing else: it holds what the worker will need, queues it and returns.
+ */
+static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
+{
+	struct vif_entry_notifier_info *ven;
+	struct mfc_entry_notifier_info *men;
+	struct fib_rule_notifier_info *fri;
+	struct ft_mr_event *ev;
+
+	switch (event) {
+	case FIB_EVENT_RULE_ADD:
+	case FIB_EVENT_RULE_DEL:
+	case FIB_EVENT_VIF_ADD:
+	case FIB_EVENT_VIF_DEL:
+	case FIB_EVENT_ENTRY_ADD:
+	case FIB_EVENT_ENTRY_REPLACE:
+	case FIB_EVENT_ENTRY_DEL:
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
+	if (READ_ONCE(ft_mr_stopping))
+		return NOTIFY_DONE;
+	ev = kzalloc(sizeof(*ev), GFP_ATOMIC);
+	if (!ev) {
+		/* Bounded and reported rather than silently absorbed. A lost
+		 * VIF, rule or replace is recovered by the full re-derivation
+		 * the kick asks for; a lost delete is not, and leaves a group
+		 * whose entry is retired only when a port it names goes away
+		 * or the adapter unloads. The mfc it still holds keeps that
+		 * safe -- stale, never freed underneath. */
+		spin_lock_bh(&ft_mr_queue_lock);
+		ft_mr_lost++;
+		spin_unlock_bh(&ft_mr_queue_lock);
+		pr_warn_ratelimited("cdx: routed multicast event dropped; groups may be stale\n");
+		ft_mr_kick();
+		return NOTIFY_DONE;
+	}
+	ev->event = event;
+	ev->family = info->family == RTNL_FAMILY_IP6MR ? AF_INET6 : AF_INET;
+	switch (event) {
+	case FIB_EVENT_RULE_ADD:
+	case FIB_EVENT_RULE_DEL:
+		fri = container_of(info, struct fib_rule_notifier_info, info);
+		ev->rule_default = ev->family == AF_INET6 ?
+			ip6mr_rule_default(fri->rule) :
+			ipmr_rule_default(fri->rule);
+		break;
+	case FIB_EVENT_VIF_ADD:
+	case FIB_EVENT_VIF_DEL:
+		ven = container_of(info, struct vif_entry_notifier_info, info);
+		ev->table = ven->tb_id;
+		ev->vif_index = ven->vif_index;
+		ev->vif_flags = ven->vif_flags;
+		ev->dev = ven->dev;
+		if (ev->dev)
+			dev_hold(ev->dev);
+		break;
+	default:
+		men = container_of(info, struct mfc_entry_notifier_info, info);
+		ev->table = men->tb_id;
+		ev->mfc = men->mfc;
+		mr_cache_hold(ev->mfc);
+		break;
+	}
+	spin_lock_bh(&ft_mr_queue_lock);
+	list_add_tail(&ev->list, &ft_mr_queue);
+	spin_unlock_bh(&ft_mr_queue_lock);
+	schedule_work(&ft_mr_work);
+	return NOTIFY_DONE;
+}
+
+/* MFC_OFFLOAD is what makes `ip mroute show` print `offload` against an entry,
+ * and it is the only standard-tool surface this learner has. ipmr writes
+ * mfc_flags under RTNL, from ipmr_mfc_add(), so this does too rather than
+ * racing a read-modify-write with it -- which means it must never be called
+ * from the derivation, where RTNL is already held. */
+static void ft_mr_offload_flag(struct ft_mr_group *g, bool on)
+{
+	if (g->offloaded == on)
+		return;
+	rtnl_lock();
+	if (on)
+		g->mfc->mfc_flags |= MFC_OFFLOAD;
+	else
+		g->mfc->mfc_flags &= ~MFC_OFFLOAD;
+	rtnl_unlock();
+	g->offloaded = on;
+}
+
+/* What the hardware counted, restated in the units the kernel counts in and
+ * written where the standard tools read it.
+ *
+ * ip_mr_forward() counts skb->len, which is the L3 packet; the classifier
+ * counts the L2 frame it matched. The difference is the ingress framing, the
+ * same correction ft_l2_overhead() makes for a flow -- and the same residual,
+ * since padding on a short frame is not recoverable.
+ *
+ * The values are absolute rather than deltas, and the software counters are
+ * zero for an entry the CPU never sees, so there is nothing to double count.
+ */
+static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c)
+{
+	u64 bytes = c->bytes;
+
+	if (!g->hw)
+		return;
+	bytes -= min_t(u64, bytes,
+		       c->packets * (u64)(ETH_HLEN + g->in_tags * VLAN_HLEN));
+	if (atomic_long_read(&g->mfc->mfc_un.res.pkt) != (long)c->packets)
+		WRITE_ONCE(g->mfc->mfc_un.res.lastuse, jiffies);
+	atomic_long_set(&g->mfc->mfc_un.res.pkt, c->packets);
+	atomic_long_set(&g->mfc->mfc_un.res.bytes, bytes);
+}
+
+static void ft_mr_release_set(struct ft_mr_group *g)
+{
+	u8 i;
+
+	for (i = 0; i < g->listeners; i++)
+		if (g->listener[i].dev)
+			dev_put(g->listener[i].dev);
+	memset(g->listener, 0, sizeof(g->listener));
+	g->listeners = 0;
+	if (g->in)
+		dev_put(g->in);
+	g->in = NULL;
+	g->in_tags = 0;
+	g->oifs[0] = '\0';
+}
+
+static void ft_mr_group_free(struct ft_mr_group *g)
+{
+	/* Before the reference goes. mr_cache_put() can free the entry through
+	 * RCU, and a flag cleared after that is written into freed memory. */
+	ft_mr_offload_flag(g, false);
+	ft_mr_release_set(g);
+	mr_cache_put(g->mfc);
+	kfree(g);
+}
+
+/* A device this learner holds is going away or has stopped forwarding.
+ *
+ * Runs from the netdev chain under RTNL, so it may take ft_mr_lock and must
+ * not touch the backend. The references are dropped here rather than left to
+ * the worker: one still held when netdev_wait_allrefs() starts spinning is a
+ * device that never finishes unregistering. The hardware entry still naming it
+ * is retired by the worker a moment later, which is the bridged learner's
+ * answer to the same window.
+ */
+static void ft_mr_device_gone(struct net_device *dev)
+{
+	struct ft_mr_group *g;
+	bool changed = false;
+	u8 i;
+
+	mutex_lock(&ft_mr_lock);
+	list_for_each_entry(g, &ft_mr_groups, list) {
+		bool hit = g->in == dev;
+
+		for (i = 0; i < g->listeners; i++)
+			hit |= g->listener[i].dev == dev;
+		if (!hit)
+			continue;
+		ft_mr_release_set(g);
+		g->retries = 0;
+		g->dirty = true;
+		changed = true;
+	}
+	mutex_unlock(&ft_mr_lock);
+	if (changed && !READ_ONCE(ft_mr_stopping))
+		schedule_work(&ft_mr_work);
+}
+
+static void ft_mr_work_fn(struct work_struct *work)
+{
+	struct ft_mr_group *g, *tmp;
+	struct ft_mr_event *ev;
+	LIST_HEAD(dead);
+
+	/* 1. What the chain saw. */
+	for (;;) {
+		spin_lock_bh(&ft_mr_queue_lock);
+		ev = list_first_entry_or_null(&ft_mr_queue,
+					      struct ft_mr_event, list);
+		if (ev)
+			list_del(&ev->list);
+		spin_unlock_bh(&ft_mr_queue_lock);
+		if (!ev)
+			break;
+		mutex_lock(&ft_mr_lock);
+		if (!ft_mr_stopping)
+			ft_mr_apply(ev);
+		mutex_unlock(&ft_mr_lock);
+		if (ev->mfc)
+			mr_cache_put(ev->mfc);
+		if (ev->dev)
+			dev_put(ev->dev);
+		kfree(ev);
+	}
+
+	/* 2. Anything outside this learner that stales an answer it gave. */
+	if (READ_ONCE(ft_mr_recheck)) {
+		WRITE_ONCE(ft_mr_recheck, false);
+		mutex_lock(&ft_mr_lock);
+		ft_mr_dirty_family(AF_INET);
+		ft_mr_dirty_family(AF_INET6);
+		mutex_unlock(&ft_mr_lock);
+	}
+
+	/* 3. Entries the kernel has deleted. */
+	mutex_lock(&ft_mr_lock);
+	list_for_each_entry_safe(g, tmp, &ft_mr_groups, list) {
+		if (!g->gone)
+			continue;
+		list_move(&g->list, &dead);
+		ft_mr_count--;
+	}
+	mutex_unlock(&ft_mr_lock);
+	list_for_each_entry_safe(g, tmp, &dead, list) {
+		if (g->hw) {
+			/* Even while stopping: this group is already off the
+			 * list ft_mr_exit() drains, so leaving it would strand
+			 * the entry, its group id and its listener chain with
+			 * nothing left to own them. */
+			cdx_ft_begin();
+			cdx_mc_group_del(&g->hw);
+			cdx_ft_end();
+			ft_mr_installed--;
+		}
+		if (g->claimed) {
+			ft_mc_claim_give(g->family, &g->src, &g->dst);
+			g->claimed = false;
+		}
+		list_del(&g->list);
+		ft_mr_group_free(g);
+	}
+
+	/* 4. One group per pass: the transaction is dropped between each,
+	 * because ft_mr_lock is never held across it. */
+	for (;;) {
+		struct ft_mr_group *target = NULL;
+		struct cdx_mc_group *hw = NULL;
+		struct ft_mr_plan plan = {};
+		enum ft_mr_state state;
+		bool claimed = false;
+		bool rekey = false;
+		u8 retries = 0;
+		int rc = 0;
+
+		mutex_lock(&ft_mr_lock);
+		list_for_each_entry(g, &ft_mr_groups, list) {
+			if (!g->dirty || g->gone || ft_mr_stopping)
+				continue;
+			target = g;
+			break;
+		}
+		if (target) {
+			target->dirty = false;
+			claimed = target->claimed;
+			retries = target->retries;
+			hw = target->hw;
+			target->hw = NULL;
+		}
+		mutex_unlock(&ft_mr_lock);
+		if (!target)
+			break;
+
+		/* Decide under RTNL with no learner mutex held: the walk reads
+		 * bridge and netdev state, which RTNL is the lock for, and it
+		 * asks the bridged learner for a port set, which needs
+		 * ft_mc_lock. Nothing in it touches hardware. */
+		rtnl_lock();
+		state = retries >= FT_MR_MAX_RETRIES ?
+			FT_MR_REFUSED_FAILED : ft_mr_derive(target, &plan);
+		/* cdx_mc_group_replace() refuses a spec whose ingress differs
+		 * from the installed one -- the port is part of the classifier
+		 * key -- so a parent VIF that moved is a delete and an add
+		 * rather than a replacement. Decided here rather than after
+		 * the unlock because the installed ingress is the other thing
+		 * ft_mr_device_gone() clears, and it holds RTNL to do it. */
+		rekey = hw && plan.spec.in != target->in;
+		rtnl_unlock();
+
+		if (state == FT_MR_PENDING && !claimed) {
+			rc = ft_mc_claim_take(target->family, &target->src,
+					      &target->dst);
+			if (rc == -EEXIST) {
+				state = FT_MR_REFUSED_CONTESTED;
+				rc = 0;
+			} else if (rc) {
+				ft_mr_install_errors++;
+			} else {
+				claimed = true;
+			}
+		}
+
+		if (!rc && (hw || state == FT_MR_PENDING)) {
+			cdx_ft_begin();
+			if (hw && (rekey || state != FT_MR_PENDING)) {
+				cdx_mc_group_del(&hw);
+				ft_mr_installed--;
+			}
+			if (state == FT_MR_PENDING) {
+				if (hw) {
+					rc = cdx_mc_group_replace(hw,
+								  &plan.spec);
+				} else {
+					rc = cdx_mc_group_add(&plan.spec, &hw);
+					if (rc)
+						hw = NULL;
+					else
+						ft_mr_installed++;
+				}
+			}
+			cdx_ft_end();
+			if (rc)
+				ft_mr_install_errors++;
+		}
+		if (state == FT_MR_PENDING && !rc && hw)
+			state = FT_MR_INSTALLED;
+
+		mutex_lock(&ft_mr_lock);
+		target->hw = hw;
+		if (state == FT_MR_INSTALLED) {
+			/* Adopt the plan whole, references included: the
+			 * backend borrows exactly these pointers, so a group
+			 * owning some of them would name one it did not. */
+			ft_mr_release_set(target);
+			target->in = plan.spec.in;
+			target->in_tags = plan.in_tags;
+			target->listeners = plan.spec.listeners;
+			memcpy(target->listener, plan.spec.listener,
+			       sizeof(target->listener));
+			strscpy(target->oifs, plan.oifs, sizeof(target->oifs));
+			memset(&plan, 0, sizeof(plan));
+			target->retries = 0;
+		} else {
+			/* A replace that failed left the previously installed
+			 * set in hardware, which is what the backend promises,
+			 * so the group goes on describing that set rather than
+			 * the one it wanted. With nothing installed there is
+			 * nothing left to describe. */
+			if (!hw)
+				ft_mr_release_set(target);
+			if (rc && ++target->retries >= FT_MR_MAX_RETRIES)
+				state = FT_MR_REFUSED_FAILED;
+			else if (rc)
+				target->dirty = true;
+		}
+		target->claimed = claimed && hw;
+		if (ft_mr_refusal(state) && !ft_mr_refusal(target->state))
+			ft_mr_refused++;
+		target->state = state;
+		mutex_unlock(&ft_mr_lock);
+
+		/* Nothing is installed under this key any more, so hand it
+		 * back and let whoever was refused it look again. */
+		if (claimed && !hw)
+			ft_mc_claim_give(target->family, &target->src,
+					 &target->dst);
+		/* Outside every lock this worker holds, because it takes
+		 * RTNL. */
+		ft_mr_offload_flag(target, state == FT_MR_INSTALLED);
+		ft_mr_plan_put(&plan);
+	}
+
+	if (ft_mr_installed && !READ_ONCE(ft_mr_stopping))
+		schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
+}
+
+/* The periodic half of the counter fold. /proc does the other half on read, so
+ * a reader always sees fresh numbers and a daemon polling SIOCGETSGCNT sees
+ * them within one interval without anybody reading /proc at all. */
+static void ft_mr_stats_fn(struct work_struct *work)
+{
+	struct cdx_ft_counters stats;
+	struct ft_mr_group *g;
+
+	if (READ_ONCE(ft_mr_stopping))
+		return;
+	/* The transaction first and the lock second, which is the order /proc
+	 * takes them in and therefore the only one either may. */
+	cdx_ft_begin();
+	mutex_lock(&ft_mr_lock);
+	list_for_each_entry(g, &ft_mr_groups, list) {
+		if (!g->hw)
+			continue;
+		cdx_mc_group_stats(g->hw, &stats);
+		ft_mr_fold(g, &stats);
+	}
+	mutex_unlock(&ft_mr_lock);
+	cdx_ft_end();
+	if (ft_mr_installed && !READ_ONCE(ft_mr_stopping))
+		schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
+}
+
+static void ft_mr_exit(void)
+{
+	struct ft_mr_group *g, *tmp;
+	struct ft_mr_event *ev, *evtmp;
+	unsigned int idx, i;
+
+	mutex_lock(&ft_mr_lock);
+	WRITE_ONCE(ft_mr_stopping, true);
+	mutex_unlock(&ft_mr_lock);
+	cancel_work_sync(&ft_mr_work);
+	cancel_delayed_work_sync(&ft_mr_stats);
+	/* The chain is already unregistered by the caller, so nothing can add
+	 * to either list while they drain. */
+	list_for_each_entry_safe(ev, evtmp, &ft_mr_queue, list) {
+		list_del(&ev->list);
+		if (ev->mfc)
+			mr_cache_put(ev->mfc);
+		if (ev->dev)
+			dev_put(ev->dev);
+		kfree(ev);
+	}
+	list_for_each_entry_safe(g, tmp, &ft_mr_groups, list) {
+		if (g->hw) {
+			cdx_ft_begin();
+			cdx_mc_group_del(&g->hw);
+			cdx_ft_end();
+		}
+		if (g->claimed)
+			ft_mc_claim_give(g->family, &g->src, &g->dst);
+		list_del(&g->list);
+		ft_mr_group_free(g);
+	}
+	for (idx = 0; idx < ARRAY_SIZE(ft_mr_vif); idx++)
+		for (i = 0; i < MAXVIFS; i++) {
+			if (ft_mr_vif[idx][i].dev)
+				dev_put(ft_mr_vif[idx][i].dev);
+			ft_mr_vif[idx][i].dev = NULL;
+			ft_mr_vif[idx][i].flags = 0;
+		}
+	ft_mr_count = 0;
+	ft_mr_installed = 0;
+	ft_mr_policy[0] = 0;
+	ft_mr_policy[1] = 0;
+}
+
+static void ft_mr_rows(struct seq_file *seq)
+{
+	struct cdx_ft_counters stats;
+	struct ft_mr_group *g;
+	char listeners[224];
+	u8 i;
+
+	/* Read outside the transaction the caller holds, which is what the
+	 * ordering rule requires: /proc takes cdx_ft_begin() then this, so the
+	 * worker must never take them the other way round. It does not. */
+	mutex_lock(&ft_mr_lock);
+	list_for_each_entry(g, &ft_mr_groups, list) {
+		size_t n = 0;
+
+		cdx_mc_group_stats(g->hw, &stats);
+		/* A read is also a fold, so `ip -s mroute` and this file never
+		 * disagree about how much the hardware has carried. */
+		ft_mr_fold(g, &stats);
+		listeners[0] = '\0';
+		for (i = 0; i < g->listeners; i++)
+			n += scnprintf(listeners + n, sizeof(listeners) - n,
+				       "%s%s/%u", i ? "," : "",
+				       g->listener[i].dev->name,
+				       g->listener[i].vlans ?
+					       g->listener[i].vlan[0].id : 0);
+		if (g->family == AF_INET6)
+			seq_printf(seq,
+				   "mroute family=6 table=%u group=%pI6c src=%pI6c in=%s oifs=%s listeners=%s state=%s packets=%llu bytes=%llu\n",
+				   g->table, &g->dst.in6, &g->src.in6,
+				   g->in ? g->in->name : "-",
+				   g->oifs[0] ? g->oifs : "-",
+				   g->listeners ? listeners : "-",
+				   ft_mr_state_text(g->state),
+				   stats.packets, stats.bytes);
+		else
+			seq_printf(seq,
+				   "mroute family=4 table=%u group=%pI4 src=%pI4 in=%s oifs=%s listeners=%s state=%s packets=%llu bytes=%llu\n",
+				   g->table, &g->dst.ip, &g->src.ip,
+				   g->in ? g->in->name : "-",
+				   g->oifs[0] ? g->oifs : "-",
+				   g->listeners ? listeners : "-",
+				   ft_mr_state_text(g->state),
+				   stats.packets, stats.bytes);
+	}
+	mutex_unlock(&ft_mr_lock);
 }
 
 /* ---------------------------------------------------------------- IPsec
@@ -5696,6 +7311,17 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mc_count, ft_mc_installed, ft_mc_refused,
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
+	/* The routed learner's own totals. mroute_policy_rules is the one an
+	 * operator is most likely to need: a single non-default ipmr rule
+	 * keeps every group of that family in software, and nothing else on
+	 * the box would say so. mroute_lost counts chain events dropped for
+	 * want of memory, which is the only way this learner's view can be
+	 * behind the kernel's. */
+	seq_printf(seq, "mroute_groups %u\nmroute_installed %u\nmroute_refused %llu\n"
+		   "mroute_install_errors %llu\nmroute_policy_rules %u\nmroute_lost %llu\n",
+		   ft_mr_count, ft_mr_installed, ft_mr_refused,
+		   ft_mr_install_errors, ft_mr_policy[0] + ft_mr_policy[1],
+		   ft_mr_lost);
 	/* How many AP-mode devices this module currently has registered, and
 	 * how many it looked at and did not. The second is what separates "no
 	 * Wi-Fi offload because nothing asked" from "no Wi-Fi offload because
@@ -5705,6 +7331,7 @@ static int ft_show(struct seq_file *seq, void *v)
 	seq_printf(seq, "wifi_vaps %u\nwifi_refused %llu\n",
 		   ft_wifi_registered, atomic64_read(&ft_wifi_refusals));
 	ft_mc_rows(seq);
+	ft_mr_rows(seq);
 	return 0;
 }
 
@@ -5819,6 +7446,14 @@ neigh:
 	unregister_netevent_notifier(&ft_neigh_nb);
 netdev:
 	unregister_netdevice_notifier(&ft_netdev_nb);
+	/* Both chains are unregistered above, so nothing can add a membership
+	 * or an MFC entry while these drain. Registering either replays what
+	 * already exists -- the FIB notifier dumps every VIF and MFC entry,
+	 * the switchdev chain reports every port group -- so a failure after
+	 * those points has groups, hardware entries and pinned devices to give
+	 * back, and a worker holding a pointer into text about to go. */
+	ft_mc_exit();
+	ft_mr_exit();
 	/* The notifier's registration replayed NETDEV_REGISTER and attached
 	 * every port, so a failure after that point has ports to give back --
 	 * and an SA could already have been installed and deleted through
@@ -5912,6 +7547,12 @@ static void __exit ask_flowtable_exit(void)
 	 * while the groups drain, and before the module's text does -- the
 	 * worker holds a pointer into it. */
 	ft_mc_exit();
+	/* And after the FIB chain, for the same reason one family over: the
+	 * routed learner's events arrive there. It goes second so that a key
+	 * the bridged learner hands back cannot wake a worker this has already
+	 * stopped -- ft_mr_kick() answers to ft_mr_stopping either way, but
+	 * the order makes that a property rather than a coincidence. */
+	ft_mr_exit();
 	/* Likewise for the VAPs, and before the module's text goes: the
 	 * reconciling worker holds a pointer into it. */
 	ft_wifi_exit();

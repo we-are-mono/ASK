@@ -425,11 +425,16 @@ gets its own entry.
 **The listeners.** Each MDB port group names a bridge port. That port must
 satisfy `cdx_ft_port_supported()` — a registered physical CDX Ethernet onif,
 not an L3 slave, not a switch-ASIC port, up and with carrier. A port that does
-not is not a reason to refuse the group: it is dropped from the hardware
-replication list, and the group is then refused outright, because a partially
-replicated group is a silently broken one. There is no mode in which some
-listeners are served by hardware and the rest by software, since the matched
-frame never reaches the bridge to be flooded to the remainder.
+not **is recorded as a member the hardware cannot carry, and the whole group is
+then refused**, because a partially replicated group is a silently broken one:
+the matched frame never reaches the bridge, so a listener left out of the
+hardware set does not fall back to software, it stops receiving. Recording it
+is what makes refusing possible — dropping the member and installing for the
+rest is the same bug wearing a shorter listener list. The shipping shape is a
+Wi-Fi VAP on `br-lan`: a phone joining the stream a set-top box is already
+watching puts an uncarriable port in the group, and the group goes back to the
+bridge in its entirety. Exceeding the listener ceiling is the same outcome and
+is reported the same way. `/proc` says `refused-listener`.
 
 **The tag stack.** A bridged group carries the MDB entry's `vid`. Each
 listener's egress framing is resolved from that vid and the port's own
@@ -694,24 +699,32 @@ by ASK. An operator who bridges an ISP's IPTV VLAN today already has the MDB
 populated; what changes is that the groups in it are replicated by the FMAN
 instead of by the CPU.
 
-`igmpproxy` and `smcroute` remain a consumer's business and are unaffected:
-they program `ipmr`'s MFC, which is the *routed* multicast path, and this
-increment does not read it. That is a second learner against the same encoder
-and is scoped as a follow-up — see below.
+`igmpproxy` and `smcroute` remain a consumer's business and are unaffected by
+*this* half: they program `ipmr`'s MFC, which is the *routed* multicast path,
+and this increment does not read it. That is a second learner against the same
+encoder, and it has since been built — see the
+[routed design](flowtable-multicast-routed.md). It has no consumer contract of
+its own either: whichever daemon a product ships writes `(S,G)` entries at
+threshold 1 into the default table and needs nothing from ASK.
 
 ## Open questions
 
-- **Routed multicast is a second learner, not a second feature.** `ipmr`'s
-  `mfc_cache` carries `mfc_origin`, `mfc_mcastgrp`, `mfc_parent` and
-  `ttls[MAXVIFS]`, where a non-zero `ttls[i]` means "forward out vif i" —
-  which is already a replication list, and already an `(S,G)` key, so it needs
-  none of the traffic-learning above. The kernel announces changes through
-  `call_ipmr_mfc_entry_notifiers()` on family `RTNL_FAMILY_IPMR`, and **the
-  adapter is already on that chain**: `ft_fib_event()` receives those events
-  today and drops them at its `AF_INET`/`AF_INET6` filter. Deliberately not
-  built here. If it is built, three things need deciding: who owns a group that
-  is both bridged and routed, whether the two learners' output lists merge, and
-  that they share one listener budget.
+- **Routed multicast is a second learner, not a second feature. Built — see
+  the [routed design](flowtable-multicast-routed.md).** `ipmr`'s `mfc_cache`
+  carries `mfc_origin`, `mfc_mcastgrp`, `mfc_parent` and `ttls[MAXVIFS]`, where
+  `ttls[i]` below 255 means "forward out vif i" — which is already a
+  replication list, and already an `(S,G)` key, so it needs none of the
+  traffic-learning above. The kernel announces changes through
+  `call_ipmr_mfc_entry_notifiers()` on family `RTNL_FAMILY_IPMR`, and the
+  adapter was already on that chain; `ft_fib_event()` used to drop those events
+  at its `AF_INET`/`AF_INET6` filter and now hands them to `ft_mr_fib_event()`.
+  Of the three things this bullet said needed deciding, two are settled: the
+  two learners share one hardware key namespace through a register
+  (`ft_mc_claim_take()`), and whoever takes an address pair first carries it
+  while the other reports `refused-contested`; and they share the eight-listener
+  budget per group because each group is its own. The third — merging the two
+  output lists for a group that is both bridged and routed — is still open and
+  is in `ISSUES.md`.
 
 - **The idle timer's period is unmeasured.** A source that stops sending leaves
   an entry matching nothing. Too short and a bursty stream is retired between

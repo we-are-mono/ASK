@@ -152,6 +152,35 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A189 — a routed group's bridge oif skips the bridge's multicast router
+  ports.** `cdx/ask_flowtable.c` `ft_mr_expand_bridge()` reproduces
+  `br_dev_xmit()`'s two arms — the MDB port group when one exists, the
+  `BR_MCAST_FLOOD` set otherwise — but `br_multicast_flood()` also copies to
+  every port the bridge has learned a multicast router on, and that set is not
+  read. A routed group whose oif is a bridge with a downstream multicast router
+  therefore under-replicates: the router port stops receiving and, because the
+  matched frame never reaches the bridge, there is no software path left to
+  correct it. Nothing exports a bridge's router-port set; the switchdev chain
+  the adapter is already on emits `SWITCHDEV_ATTR_ID_PORT_MROUTER` whenever a
+  port starts or stops being one (`net/bridge/br_multicast.c`), so the fix is
+  to track it there and add those ports to the copy set. Filed rather than
+  scoped as an exclusion because the failure is silent. No deployment on this
+  box has a bridge oif with a router port today. See the
+  [routed multicast design](flowtable-multicast-routed.md).
+
+- [ ] **A188 — a group that is both bridged and routed is carried once, not
+  merged.** The classifier keeps one group id and one root entry per address
+  pair, so the two multicast learners share a key namespace and coordinate
+  through `ft_mc_claim_take()`: whoever takes an `(S,G)` first carries it and
+  the other reports `refused-contested` and stays in software. That is correct
+  — no listener is silently dropped — but not optimal, because the right answer
+  for an IPTV VLAN that is bridged to some ports and routed to others is one
+  hardware group carrying the union of both listener sets. Merging means
+  deciding which learner owns the retirement of a listener the other
+  contributed, and neither keeps the state for that today; it also has to fit
+  both sets inside `CDX_MC_MAX_LISTENERS`. Deferred rather than guessed at.
+  See the [routed multicast design](flowtable-multicast-routed.md).
+
 - [ ] **A187 — `display_l3hdr_insert_opc()` decodes the wrong bits of the tunnel insert word.**
   `patches/kernel/010-ask-fman-dpaa-ehash.patch`, the debug decoder for
   `INSERT_L3_HDR`: the encoder writes the first word big-endian with the mode at
@@ -220,6 +249,16 @@ result independently of those temporary files.
   sub-interfaces register as onifs and can stand in as listeners the way
   `test_mcast_replication.py` already uses them. Not a defect; a measurement
   that has not been taken.
+  **Measured 2026-09-21, and the gap is now narrower than this entry.** A
+  listener is identified by its whole framing rather than by its device, so two
+  oifs on the one LAN port — untagged and tagged on a sub-interface — are two
+  entries in the chain. `test_routed_to_two_listeners_on_one_port` passes on
+  hardware: the row names `eth3/0,eth3/244`, both copies are counted
+  separately, and deleting the VLAN device exercises the chain swap through
+  `cdx_mc_group_replace()` with the group never leaving hardware. So
+  replication to more than one listener and the swap are both proved. What is
+  still untested is replication across more than one *port*, which still needs
+  a second listener port with carrier, and the listener ceiling.
 
 - [ ] **A156 — a failed multicast UPDATE leaves the listeners it already
   installed forwarding, and reports failure.** `cdx_update_mcast_group()`
@@ -384,14 +423,6 @@ Each path either never executes in this deployment or fails cleanly if invoked
 the product decides to enable that feature. The enabling recipe is kept with
 each so the open bug list stays honest.
 
-- [ ] **A33 — routed multicast through a vlan-aware bridge.** The routed-mcast
-  offload path resolves interfaces via `get_onif_by_name`, which returns NULL
-  for `br-lan.N`, so routed mcast through a vlan-aware bridge would fail like the
-  unicast A32 case. Not applicable to the Mono Gateway, which does not route
-  multicast — IPTV is L2-bridged (`br-iptv`: `eth0.3999` ↔ `br-lan.3999`, IGMP
-  snooping), a separate ABM/L2-flow path. To enable: mirror A32 (physical-port
-  fallback in `dpa_control_mc.c` / `insert_mcast_entry_in_classif_table`).
-
 - [ ] **A38 — macvlan hardware offload.** cmm already sends
   FPP_CMD_MACVLAN_ENTRY/RESET on macvlan interface events (`itf.c`
   cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx has no
@@ -457,6 +488,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A33.** Routed multicast resolved listeners through `get_onif_by_name`, NULL for a `br-lan.N` —
+  superseded: the flowtable learner hands the encoder ports and tag stacks, so there is no name (_pending_).
 
 - [x] **A185.** `test_flowtable_bridge_fdb_roaming` (from da0b00a) read the bridge FDB once after the
   roam, but the parent carries the same MAC and its background traffic relearns the entry, so the

@@ -681,6 +681,11 @@ _EXEC_ARGV0_ALLOWED = {
     # them the registration half of the VAP work is testable and the
     # retirement half is not.
     "iw", "hostapd", "hostapd_cli", "wpa_supplicant", "wpa_cli",
+    # Routed multicast. ipmr's MFC has no /proc or netlink write surface a
+    # test could use: an entry is installed by a process holding an MRT_INIT
+    # socket and by nothing else, so the consumer is the control plane and
+    # has to be driven directly.
+    "smcrouted", "smcroutectl",
     # Stopping the above. argv[0] stays the gate, so this buys the ability
     # to signal a named process and nothing more.
     "kill", "killall",

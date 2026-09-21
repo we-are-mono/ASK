@@ -44,23 +44,37 @@ happened to emit would exercise one of them.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 
 import pytest
 import pytest_asyncio
 
+from ask_orch.counters import kernel_rx_packets
+from ask_orch.uart import Console
+
 from _mcast_helpers import (  # noqa: F401  (fixture imported for resolution)
     capture_parallel_window,
+    kill_parallel_tcpdumps,
     pcap_cleanup_lan,
+    read_pcap_count,
+    spawn_parallel_tcpdumps,
 )
 from _topology import (
     LAN_NIC,
     TARGET_LAN_IF,
     TARGET_WAN_IF,
+    VLAN_ID_MROUTE,
     TopologyStack,
+    dut_vlan_subif,
     lan_run,
     lan_run_python,
+    lan_vlan_subif,
 )
+# The serial console and its command wrapper, for the one step that cannot go
+# over the agent: see mcast_bridge.
+from test_flowtable_offload import ARTIFACTS, console_command
 
 pytestmark = pytest.mark.asyncio
 
@@ -84,6 +98,9 @@ GROUPS_V4 = {
     "vlan": "239.8.1.3",
     "rejoin": "239.8.1.4",
     "routed": "239.8.1.5",
+    "routed_vlan": "239.8.1.6",
+    "routed_bridge": "239.8.1.7",
+    "routed_pair": "239.8.1.8",
 }
 GROUPS_V6 = {
     "mldv2_include": "ff1e::8:1:1",
@@ -110,31 +127,127 @@ async def mcast_bridge(aiohttp_session, target_agent):
     The querier is not optional. Without one nothing on the segment elicits
     membership reports, the MDB stays empty, and the bridge floods every group
     to every port — which looks exactly like a working test and proves nothing.
+
+    **The enslavement cannot go over the agent, and an earlier revision of this
+    fixture tried.** The agent is reached on the WAN port's own address, and the
+    moment that port becomes a bridge port its address stops receiving — a
+    bridge port's frames go to the bridge, not to the port. Every later step,
+    including this fixture's own teardown, was then issued down a path that no
+    longer existed: the run hung at the first case and left the port enslaved,
+    recoverable only by a login on the serial console.
+
+    So the address follows the port into the bridge, as one sequence on the
+    console, and two details keep the orchestrator from noticing. The bridge is
+    created carrying the WAN port's own MAC rather than the lowest port's, so
+    the peer's neighbour entry stays correct and no repin is needed. And the
+    address is moved rather than duplicated, so there is exactly one route to
+    the segment at any moment.
     """
     stack = TopologyStack()
+    console = Console.target(log_path=str(ARTIFACTS / "mcast-bridge-uart.log"))
 
     async def _exec(*argv: str):
         return await target_agent.exec_cmd(aiohttp_session, list(argv))
 
     try:
-        await _exec("ip", "link", "del", BRIDGE)  # idempotent
+        # Where the management address is *now*. Normally the WAN port, but a
+        # run interrupted between the move onto the bridge and its restore
+        # leaves it on the bridge, and a fixture that only looked at the port
+        # would fail on a tree that is merely untidy rather than tidying it.
+        management = None
+        for dev in (TARGET_WAN_IF, BRIDGE):
+            info = json.loads((await _exec("ip", "-j", "-4", "addr", "show",
+                                           "dev", dev))["stdout"] or "[]")
+            if not info:
+                continue
+            management = next((f"{a['local']}/{a['prefixlen']}"
+                               for a in info[0]["addr_info"]
+                               if a["family"] == "inet"), None)
+            if management:
+                break
+        assert management, (
+            f"no IPv4 address on {TARGET_WAN_IF} or {BRIDGE} to manage the DUT "
+            f"by; this fixture moves that address and cannot start without it")
+        routes = json.loads((await _exec("ip", "-j", "route", "show",
+                                         "default"))["stdout"] or "[]")
+        gateway = next((r["gateway"] for r in routes
+                        if r.get("dev") in (TARGET_WAN_IF, BRIDGE)), None)
+        # Through the file endpoint rather than `cat`, which the agent's argv
+        # allowlist does not carry.
+        r = await target_agent.fs_read(
+            aiohttp_session, f"/sys/class/net/{TARGET_WAN_IF}/address")
+        assert r.get("errno") == 0, f"reading {TARGET_WAN_IF}'s address: {r}"
+        mac = bytes.fromhex(r["content_hex"]).decode().strip()
+
+        # Put the tree back the way this fixture expects to find it, over the
+        # console and whether or not it is already that way. Deleting a stale
+        # bridge takes the management address with it, so the two have to
+        # happen together and the agent cannot be the one to do it.
+        for argv in (["ip", "link", "del", BRIDGE],
+                     ["ip", "addr", "replace", management, "dev", TARGET_WAN_IF],
+                     ["ip", "link", "set", TARGET_WAN_IF, "up"],
+                     ["ip", "link", "set", TARGET_LAN_IF, "up"]):
+            await console_command(console, *argv, check=False, timeout=30)
+        for _ in range(40):
+            try:
+                if (await target_agent.health(aiohttp_session)).get("ok"):
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        else:
+            pytest.fail(f"the agent did not answer after {management} was put "
+                        f"back on {TARGET_WAN_IF}")
+
         r = await _exec("ip", "link", "add", "name", BRIDGE, "type", "bridge",
                         "mcast_snooping", "1", "mcast_querier", "1")
         assert r["rc"] == 0, f"bridge add {BRIDGE}: {r}"
-
-        async def _cleanup():
-            for port in (TARGET_WAN_IF, TARGET_LAN_IF):
-                await _exec("ip", "link", "set", port, "nomaster")
-            await _exec("ip", "link", "del", BRIDGE)
-        stack.push(_cleanup)
-
-        for port in (TARGET_WAN_IF, TARGET_LAN_IF):
-            r = await _exec("ip", "link", "set", port, "master", BRIDGE)
-            assert r["rc"] == 0, f"enslave {port}: {r}"
-            r = await _exec("ip", "link", "set", port, "up")
-            assert r["rc"] == 0, f"up {port}: {r}"
+        r = await _exec("ip", "link", "set", BRIDGE, "address", mac)
+        assert r["rc"] == 0, f"bridge mac {mac}: {r}"
         r = await _exec("ip", "link", "set", BRIDGE, "up")
         assert r["rc"] == 0, f"bridge up: {r}"
+
+        async def _restore():
+            # Deleting the bridge releases both ports with it. The LAN port
+            # never gave up its address, so it needs nothing; the WAN port's is
+            # put back explicitly because the sequence below took it away.
+            undo = [["ip", "link", "del", BRIDGE],
+                    ["ip", "addr", "replace", management, "dev", TARGET_WAN_IF],
+                    ["ip", "link", "set", TARGET_WAN_IF, "up"],
+                    ["ip", "link", "set", TARGET_LAN_IF, "up"]]
+            if gateway:
+                undo.append(["ip", "route", "replace", "default", "via", gateway,
+                             "dev", TARGET_WAN_IF])
+            for argv in undo:
+                await console_command(console, *argv, check=False, timeout=30)
+
+        # Pushed before the first step rather than after the last: a step that
+        # fails halfway leaves the management address on a device that cannot
+        # receive it, and there is no way back over the network from there.
+        stack.push(_restore)
+
+        steps = [["ip", "addr", "del", management, "dev", TARGET_WAN_IF],
+                 ["ip", "link", "set", TARGET_WAN_IF, "master", BRIDGE],
+                 ["ip", "link", "set", TARGET_LAN_IF, "master", BRIDGE],
+                 ["ip", "link", "set", TARGET_WAN_IF, "up"],
+                 ["ip", "link", "set", TARGET_LAN_IF, "up"],
+                 ["ip", "addr", "add", management, "dev", BRIDGE]]
+        if gateway:
+            steps.append(["ip", "route", "replace", "default", "via", gateway,
+                          "dev", BRIDGE])
+        for argv in steps:
+            await console_command(console, *argv, timeout=30)
+
+        for _ in range(40):
+            try:
+                if (await target_agent.health(aiohttp_session)).get("ok"):
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        else:
+            pytest.fail("the agent did not answer after the ports joined the "
+                        f"bridge; {management} was moved to {BRIDGE}")
 
         # The querier's startup queries are spaced by
         # multicast_startup_query_interval; without waiting them out the first
@@ -143,6 +256,7 @@ async def mcast_bridge(aiohttp_session, target_agent):
         yield BRIDGE
     finally:
         await stack.teardown("mcast_bridge")
+        console.close()
 
 
 # ---------------------------------------------------------------- oracles
@@ -163,33 +277,50 @@ async def mdb_reports_offload(target_agent, session, group: str) -> bool:
     return False
 
 
+async def flowtable_proc(target_agent, session) -> str:
+    """The adapter's diagnostic file, decoded.
+
+    fs_read answers with `content_hex`, because the endpoint is binary-safe
+    for the probes that need it. Reading `content` instead returns nothing at
+    all, which makes every oracle built on this file quietly pass or quietly
+    fail depending on its sense.
+    """
+    r = await target_agent.fs_read(session, "/proc/cdx_flowtable",
+                                   max_bytes=16 << 20)
+    assert r.get("errno") == 0, f"/proc/cdx_flowtable: {r}"
+    return bytes.fromhex(r["content_hex"]).decode()
+
+
 async def hardware_has_group(target_agent, session, group: str) -> bool:
     """Whether the adapter's own table holds the group."""
-    r = await target_agent.fs_read(session, "/proc/cdx_flowtable")
-    return group in (r.get("content") or "")
+    return group in await flowtable_proc(target_agent, session)
 
 
-async def dut_cpu_frame_count(target_agent, session, bridge: str,
-                              group: str, window_s: float) -> int:
-    """How many frames of the stream reached the DUT's CPU.
+async def dut_cpu_frame_count(target_agent, session, iface: str,
+                              window_s: float) -> int:
+    """How many frames the DUT's CPU received on `iface` during the window.
 
     The discriminating oracle. A hardware-replicated frame is matched and
     transmitted by the FMAN without ever being enqueued to the host, so this
-    is ~0 when the offload is carrying the stream and approximately the whole
-    stream when the bridge is flooding it in software.
+    stays at the segment's background noise when the offload is carrying the
+    stream and rises by the whole stream when software is forwarding it.
+
+    The SDK driver's private `rx packets [TOTAL]` rather than a capture: the
+    agent's capture window snapshots dmesg and counters and records no
+    packets at all, and the netdev totals it would otherwise be read from
+    include the hardware's own counts (ISSUES.md A136), which is precisely
+    the traffic this has to exclude.
     """
-    cap = await target_agent.capture_start(session, ifaces=[bridge])
+    before = await kernel_rx_packets(target_agent, session, iface)
     await asyncio.sleep(window_s)
-    r = await target_agent.capture_stop(session, cap["cap_id"])
-    return sum(
-        1 for ln in (r.get("stdout") or "").splitlines() if group in ln
-    )
+    return await kernel_rx_packets(target_agent, session, iface) - before
 
 
 # ------------------------------------------------------------ LAN VM side
 
 def _join_script(group: str, port: int, source: str | None,
-                 family: int, seconds: float, igmp_version: int | None) -> str:
+                 family: int, seconds: float, igmp_version: int | None,
+                 iface: str) -> str:
     """A consumer that joins and then counts what arrives.
 
     Joining with a real socket rather than `ip maddr` is deliberate: the socket
@@ -197,6 +328,10 @@ def _join_script(group: str, port: int, source: str | None,
     v2-versus-v3 distinction these cases turn on. IP_ADD_SOURCE_MEMBERSHIP
     produces an INCLUDE report naming the source; IP_ADD_MEMBERSHIP with
     force_igmp_version=2 produces a v2 report with none.
+
+    A routed consumer joins for a different reason: the DUT does not snoop and
+    the static MFC entry is what forwards, but the NIC still has to accept the
+    group's multicast MAC, and nothing but a join puts it in the filter.
     """
     return f"""
 import socket, struct, time, sys
@@ -208,14 +343,14 @@ FAMILY = socket.AF_INET6 if {family} == 6 else socket.AF_INET
 SECONDS = {seconds}
 
 if {igmp_version!r} is not None:
-    with open('/proc/sys/net/ipv4/conf/{LAN_NIC}/force_igmp_version', 'w') as f:
+    with open('/proc/sys/net/ipv4/conf/{iface}/force_igmp_version', 'w') as f:
         f.write(str({igmp_version!r}))
 
 s = socket.socket(FAMILY, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('', PORT))
 
-ifindex = socket.if_nametoindex({LAN_NIC!r})
+ifindex = socket.if_nametoindex({iface!r})
 if FAMILY == socket.AF_INET6:
     mreq = socket.inet_pton(socket.AF_INET6, GROUP) + struct.pack('@I', ifindex)
     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
@@ -225,7 +360,14 @@ elif SOURCE is not None:
             + socket.inet_aton(SOURCE))
     s.setsockopt(socket.IPPROTO_IP, 39, mreq)   # IP_ADD_SOURCE_MEMBERSHIP
 else:
-    mreq = socket.inet_aton(GROUP) + socket.inet_aton('0.0.0.0')
+    # ip_mreqn, not ip_mreq. The shorter form names the interface by
+    # *address*, and 0.0.0.0 there means "whichever one the route to the group
+    # resolves to" -- the default route's, which is never a VLAN
+    # sub-interface. A consumer asked to join on one would silently be joined
+    # on its parent instead, receive nothing however correct the offload is,
+    # and the frames would be on the wire the whole time.
+    mreq = (socket.inet_aton(GROUP) + socket.inet_aton('0.0.0.0')
+            + struct.pack('@i', ifindex))
     s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
 print('JOINED', flush=True)
@@ -244,9 +386,10 @@ print('RECEIVED', seen, flush=True)
 
 async def lan_join_and_count(lan, *, group: str, source: str | None,
                              family: int, seconds: float,
-                             igmp_version: int | None, label: str) -> int:
+                             igmp_version: int | None, label: str,
+                             iface: str = LAN_NIC) -> int:
     script = _join_script(group, MCAST_PORT, source, family, seconds,
-                          igmp_version)
+                          igmp_version, iface)
     r = await lan_run_python(lan, script, label=label, timeout=seconds + 30)
     assert "JOINED" in r.stdout, f"LAN join failed: {r.stdout!r}"
     for line in r.stdout.splitlines():
@@ -311,8 +454,6 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
                            family: int, source: str | None,
                            igmp_version: int | None, label: str):
     """One bridged case, end to end, with all three oracles."""
-    bridge = BRIDGE
-
     # A pre-test drain: background multicast on a shared segment must not be
     # counted as this group's.
     await asyncio.sleep(2.0)
@@ -323,6 +464,23 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
         f"a stale entry from an earlier run would satisfy every oracle here"
     )
 
+    # What the segment costs the CPU anyway, measured before the consumer
+    # starts rather than inside its window. The counter below is the whole
+    # port's, and this is a populated lab: ARP, SSDP and the agent's own
+    # management traffic all arrive here and all reach the CPU, and the port
+    # carries the DUT's management address while it is bridged. Roughly thirty
+    # frames a second of that is enough to spend a flat five-percent budget on
+    # its own, which is how this read failed once with the offload carrying
+    # every frame of the group. What the case is entitled to assert is the
+    # *excess*.
+    #
+    # Before the joiner, not after it: the consumer's window is only four
+    # seconds longer than the stream's, and an idle window inside it leaves no
+    # room for the stream itself.
+    idle = await dut_cpu_frame_count(
+        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
+    )
+
     joiner = asyncio.create_task(lan_join_and_count(
         lan, group=group, source=source, family=family,
         seconds=STREAM_S + 4.0, igmp_version=igmp_version, label=label,
@@ -330,8 +488,10 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
     # Let the report reach the bridge and the learner act on it.
     await asyncio.sleep(2.0)
 
+    # On the ingress port, not on the bridge device: the counter that
+    # discriminates is the SDK driver's own, and a bridge master has none.
     cpu_frames = asyncio.create_task(dut_cpu_frame_count(
-        target_agent, aiohttp_session, bridge, group, STREAM_S,
+        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
     ))
     await asyncio.to_thread(
         send_stream_from_vision, group, family, STREAM_S, STREAM_PPS,
@@ -357,10 +517,13 @@ async def run_bridged_case(aiohttp_session, target_agent, lan, *, group: str,
         f"some path other than the membership it was supposed to come from"
     )
     # The discriminating one.
-    assert cpu_seen < sent * 0.05, (
-        f"{group}: {cpu_seen} of {sent} frames reached the DUT's CPU. A "
-        f"hardware-replicated frame never does, so the bridge is still "
-        f"flooding this group in software whatever the table says"
+    assert cpu_seen - idle < sent * 0.05, (
+        f"{group}: the DUT's CPU received {cpu_seen} frames on "
+        f"{TARGET_WAN_IF} while the stream ran against {idle} over an idle "
+        f"window of the same length, so {cpu_seen - idle} of {sent} are this "
+        f"group's. A hardware-replicated frame never reaches the CPU, so the "
+        f"bridge is still flooding this group in software whatever the table "
+        f"says"
     )
 
 
@@ -422,21 +585,479 @@ async def test_a_leave_does_not_interrupt_the_others(aiohttp_session,
     pytest.skip("needs the second LAN consumer the topology does not yet have")
 
 
-@pytest.mark.parametrize("family", [4, 6])
-async def test_routed(aiohttp_session, target_agent, lan, family):
-    """Routed multicast, programmed through ipmr's MFC by smcroute.
+# ------------------------------------------------------- routed multicast
+#
+# The second learner, against the same encoder. ipmr's MFC already carries an
+# (S,G), an iif and a replication list, so nothing here is learned from
+# traffic: smcroute writes the entry and the group is either in hardware a
+# moment later or /proc says why not. See docs/flowtable-multicast-routed.md.
+#
+# The DUT routes rather than bridges in these cases, which is its shipping
+# configuration -- eth4 is the WAN at 10.0.0.62/24 and eth3 the LAN at
+# 192.168.1.1/24, both up with forwarding on, from S40gateway-setup. Nothing
+# has to be built for the plain case but the MFC entry itself.
+#
+# A fourth oracle joins the three above, and it is the one only routing can
+# satisfy: the replicas arriving at the LAN VM carry the DUT's own egress MAC
+# as their source and a TTL one lower than the sender's. A bridge would have
+# forwarded the frame with the sender's MAC and TTL untouched, so this is what
+# tells "the FMAN routed it" from "the FMAN bridged it".
 
-    A second learner against the same encoder: mfc_cache already carries an
-    (S,G) and a replication list in ttls[], so it needs none of the traffic
-    learning the bridged (*,G) case does, and ft_fib_event() is already on the
-    RTNL_FAMILY_IPMR chain — it drops those events at its family filter today.
+SMCROUTE_CONF = "/tmp/ask_mroute.conf"
+# The bridge for the case whose oif is one. Not br-lan, and not the bridge the
+# bridged cases build: those enslave the WAN port too, which would make the
+# ingress a bridge port and the whole group ineligible.
+MROUTE_BRIDGE = "br_mroute_e2e"
 
-    Deliberately failing rather than skipping: this is the acceptance gate for
-    an increment that has not been built, and a skip would let it be forgotten.
+
+async def _exec(target_agent, session, *argv, check=True, timeout_ms=10000):
+    r = await target_agent.exec_cmd(session, list(argv), timeout_ms=timeout_ms)
+    if check:
+        assert r["rc"] == 0, f"{' '.join(argv)}: {r}"
+    return r
+
+
+async def dut_mac(target_agent, session, iface: str) -> str:
+    r = await _exec(target_agent, session, "ip", "-br", "link", "show", iface)
+    fields = (r.get("stdout") or "").split()
+    assert len(fields) >= 3, f"no MAC for {iface}: {r}"
+    return fields[2].lower()
+
+
+async def mroute_line(target_agent, session, family: int, source: str,
+                      group: str) -> tuple[str, int]:
+    """The kernel's own view of one MFC entry: its `ip -s mroute` line and the
+    packet count on the line below it.
+
+    Both are standard-tool surfaces rather than anything ASK-private, which is
+    the point of the fold: `offload` appears because the learner set
+    MFC_OFFLOAD, and the counters are the classifier's, restated into the units
+    ip_mr_forward() would have counted in.
     """
-    pytest.fail(
-        "routed multicast learner not implemented — reads ipmr's MFC via "
-        "call_ipmr_mfc_entry_notifiers() on RTNL_FAMILY_IPMR, which "
-        "ft_fib_event() currently filters out. See docs/flowtable-multicast.md "
-        "'Open questions'."
+    argv = ["ip", "-s"] + (["-6"] if family == 6 else []) + ["mroute", "show"]
+    r = await _exec(target_agent, session, *argv)
+    lines = (r.get("stdout") or "").splitlines()
+    for i, line in enumerate(lines):
+        if source in line and group in line:
+            packets = 0
+            if i + 1 < len(lines):
+                m = re.search(r"(\d+)\s+packets", lines[i + 1])
+                if m:
+                    packets = int(m.group(1))
+            return line, packets
+    return "", 0
+
+
+async def mroute_proc_row(target_agent, session, group: str) -> str:
+    for line in (await flowtable_proc(target_agent, session)).splitlines():
+        if line.startswith("mroute ") and f"group={group} " in line:
+            return line
+    return ""
+
+
+@pytest_asyncio.fixture
+async def smcrouted(aiohttp_session, target_agent):
+    """A running smcrouted with a VIF on exactly the interfaces a case names.
+
+    `-N` rather than the default, which enables every multicast-capable
+    interface it can find: a VIF set that depends on what else the image
+    happened to bring up is not a fixture, and a stray VIF changes the index
+    every threshold in the MFC is expressed against.
+
+    Yields a callable that (re)starts the daemon over a given interface list;
+    a case that builds a VLAN device or a bridge has to do so before the
+    daemon starts, because smcroute matches a phyint by name at startup.
+    """
+    started: list[bool] = []
+
+    async def start(ifaces: list[str]):
+        if started:
+            await _exec(target_agent, aiohttp_session, "killall", "smcrouted",
+                        check=False)
+            await asyncio.sleep(1.0)
+            started.clear()
+        conf = "".join(f"phyint {i} enable\n" for i in ifaces)
+        w = await target_agent.fs_write(aiohttp_session, SMCROUTE_CONF, conf)
+        assert w.get("errno", 0) == 0, f"writing {SMCROUTE_CONF}: {w}"
+        await _exec(target_agent, aiohttp_session, "smcrouted", "-N",
+                    "-f", SMCROUTE_CONF, "-l", "notice")
+        started.append(True)
+        # MRT_INIT, the VIF adds and the registration dump all happen inside
+        # the daemon's first second; the adapter's own worker follows them.
+        await asyncio.sleep(2.0)
+
+    try:
+        yield start
+    finally:
+        await _exec(target_agent, aiohttp_session, "killall", "smcrouted",
+                    check=False)
+        await asyncio.sleep(1.0)
+
+
+@pytest_asyncio.fixture
+async def mroute_lan_bridge(aiohttp_session, target_agent):
+    """A bridge over the DUT's LAN port alone, carrying its address.
+
+    The oif is then a bridge with one CDX port and snooping off, which is the
+    br_flood() arm of the listener walk. The WAN port stays out of it: an
+    ingress that is a bridge port is refused, and rightly -- its frames go to
+    the bridge's rx handler and never reach a VIF above it.
+    """
+    stack = TopologyStack()
+    try:
+        await _exec(target_agent, aiohttp_session, "ip", "link", "del",
+                    MROUTE_BRIDGE, check=False)
+        await _exec(target_agent, aiohttp_session, "ip", "link", "add", "name",
+                    MROUTE_BRIDGE, "type", "bridge", "mcast_snooping", "0")
+
+        async def _cleanup():
+            await _exec(target_agent, aiohttp_session, "ip", "link", "set",
+                        TARGET_LAN_IF, "nomaster", check=False)
+            await _exec(target_agent, aiohttp_session, "ip", "link", "del",
+                        MROUTE_BRIDGE, check=False)
+            await _exec(target_agent, aiohttp_session, "ip", "addr", "replace",
+                        "192.168.1.1/24", "dev", TARGET_LAN_IF, check=False)
+            await _exec(target_agent, aiohttp_session, "ip", "link", "set",
+                        TARGET_LAN_IF, "up", check=False)
+        stack.push(_cleanup)
+
+        await _exec(target_agent, aiohttp_session, "ip", "addr", "flush", "dev",
+                    TARGET_LAN_IF)
+        await _exec(target_agent, aiohttp_session, "ip", "link", "set",
+                    TARGET_LAN_IF, "master", MROUTE_BRIDGE)
+        await _exec(target_agent, aiohttp_session, "ip", "addr", "replace",
+                    "192.168.1.1/24", "dev", MROUTE_BRIDGE)
+        await _exec(target_agent, aiohttp_session, "ip", "link", "set",
+                    MROUTE_BRIDGE, "up")
+        await asyncio.sleep(1.0)
+        yield MROUTE_BRIDGE
+    finally:
+        await stack.teardown("mroute_lan_bridge")
+
+
+async def run_routed_case(aiohttp_session, target_agent, lan, *, group: str,
+                          family: int, oif: str, egress_port: str,
+                          lan_iface: str, label: str, smcrouted,
+                          check_source_mac: bool = True):
+    """One routed case, end to end.
+
+    Six oracles: `ip mroute show` reports offload, /proc says installed, the
+    DUT's CPU never sees the stream, the consumer receives it, the replicas
+    carry the router's own framing, and `ip -s mroute` shows the hardware's
+    count where the software counter is zero. The last two are what a bridged
+    case cannot produce.
+    """
+    source = wan_source_address(family)
+    sent = int(STREAM_S * STREAM_PPS)
+    capfile = f"/tmp/ask_mroute_{label}.pcap"
+
+    await smcrouted([TARGET_WAN_IF, oif])
+
+    assert not await mroute_proc_row(target_agent, aiohttp_session, group), (
+        f"{group} already has a routed row before this case programmed it — "
+        f"a stale entry from an earlier run would satisfy every oracle here"
+    )
+
+    await _exec(target_agent, aiohttp_session,
+                "smcroutectl", "add", TARGET_WAN_IF, source, group, oif)
+    # The FIB chain fires under RTNL and the adapter's worker installs outside
+    # it, so the entry appears a moment after the route does.
+    await asyncio.sleep(2.0)
+
+    row = await mroute_proc_row(target_agent, aiohttp_session, group)
+    assert "state=installed" in row, (
+        f"{group}: the routed learner did not install it. /proc row: "
+        f"{row or '(absent)'}. A refused-* state names which clause of the "
+        f"contract turned it down; an absent row means the MFC event never "
+        f"reached ft_mr_fib_event() at all"
+    )
+
+    _, before = await mroute_line(target_agent, aiohttp_session, family,
+                                  source, group)
+
+    # Two streams, one oracle each, because the LAN VM's console is a single
+    # channel and the two LAN-side observers cannot share it. The socket
+    # consumer runs a staged Python script over that console for the whole
+    # window; spawning a capture in the middle of it writes into the same
+    # line discipline, and what the consumer counts afterwards is no longer
+    # about this group. Measured rather than reasoned: the same case with the
+    # capture removed goes from 0 of 1500 delivered to 1500 of 1500, with the
+    # classifier counting both runs.
+    # The segment's own cost, measured before the consumer starts rather than
+    # inside its window: the port counter is the whole port's, and what this
+    # case is entitled to assert is the excess over the ARP, SSDP and
+    # management traffic the CPU receives here anyway. Before the joiner,
+    # because its window is only a few seconds longer than the stream's.
+    idle = await dut_cpu_frame_count(
+        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
+    )
+    joiner = asyncio.create_task(lan_join_and_count(
+        lan, group=group, source=None, family=family,
+        seconds=STREAM_S + 4.0, igmp_version=None, label=label,
+        iface=lan_iface,
+    ))
+    await asyncio.sleep(2.0)
+    cpu_frames = asyncio.create_task(dut_cpu_frame_count(
+        target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
+    ))
+    await asyncio.to_thread(
+        send_stream_from_vision, group, family, STREAM_S, STREAM_PPS,
+    )
+    received = await joiner
+    cpu_seen = await cpu_frames
+
+    # Second window: the console is idle now, so the capture has it to itself.
+    # This is the one that answers what the replicas look like on the wire.
+    spawn_parallel_tcpdumps(lan, [lan_iface], [capfile],
+                            f"udp port {MCAST_PORT}")
+    await asyncio.sleep(0.4)
+    await asyncio.to_thread(
+        send_stream_from_vision, group, family, STREAM_S, STREAM_PPS,
+    )
+    kill_parallel_tcpdumps(lan, [lan_iface])
+    await asyncio.sleep(0.2)
+
+    # The /proc read first, and not incidentally: the counter fold runs on a
+    # five-second timer *and* on every read of that file, so reading it is what
+    # makes `ip -s mroute` exact rather than up to one interval stale. Asking
+    # the kernel first reports whatever the last timer happened to catch, which
+    # on a three-second stream is most of it and not all.
+    row = await mroute_proc_row(target_agent, aiohttp_session, group)
+    line, packets = await mroute_line(target_agent, aiohttp_session, family,
+                                      source, group)
+    captured = read_pcap_count(lan, capfile)
+    headers = lan.run(f"tcpdump -r {capfile} -nn -e -v -c 2 2>&1",
+                      timeout=15).stdout
+    mac = await dut_mac(target_agent, aiohttp_session, egress_port)
+    lan.run(f"rm -f {capfile}", timeout=5)
+
+    # Forwarding first: without it the rest describes a broken path.
+    assert received > sent * 0.95, (
+        f"{group}: consumer received {received} of {sent} — a routed group is "
+        f"forwarded by the kernel until the offload takes it, so anything "
+        f"below 95% is loss rather than a learning window"
+    )
+    assert "state=installed" in row, (
+        f"{group}: installed before the stream and {row!r} after it — the "
+        f"group was retired while its own traffic was running")
+    assert "offload" in line, (
+        f"{group}: /proc says installed but `ip -s mroute` does not report "
+        f"offload: {line!r}. MFC_OFFLOAD is set by the learner after a "
+        f"successful install, so the two disagreeing means the flag was "
+        f"never written or was cleared behind the entry's back")
+    assert cpu_seen - idle < sent * 0.05, (
+        f"{group}: the DUT's CPU received {cpu_seen} frames on "
+        f"{TARGET_WAN_IF} while the stream ran against {idle} over an idle "
+        f"window of the same length, so {cpu_seen - idle} of {sent} are this "
+        f"group's. A hardware-replicated frame never reaches the CPU, so ipmr "
+        f"is still forwarding this group in software whatever the table says")
+    assert packets - before > 2 * sent * 0.9, (
+        f"{group}: `ip -s mroute` moved by {packets - before} over two "
+        f"streams of {sent}. The software counter is zero for an offloaded "
+        f"entry, so this is the classifier's own count folded into the "
+        f"kernel's -- a flat counter with the stream delivered means the fold "
+        f"never ran")
+    assert captured > sent * 0.95, (
+        f"{group}: the LAN capture saw {captured} of {sent}")
+    # The oracle only routing can satisfy.
+    ttl = "hlim 63" if family == 6 else "ttl 63"
+    assert ttl in headers, (
+        f"{group}: replicas do not carry {ttl}, so nothing decremented the "
+        f"header — the frame was bridged rather than routed. Headers: "
+        f"{headers[:400]!r}")
+    if check_source_mac:
+        assert mac in headers.lower(), (
+            f"{group}: replicas do not carry {egress_port}'s address {mac} as "
+            f"their Ethernet source, so the listener entry did not rebuild "
+            f"the L2 header. Headers: {headers[:400]!r}")
+
+    # Teardown is an assertion too: the entry going has to take the hardware
+    # group and the kernel's flag with it.
+    await _exec(target_agent, aiohttp_session,
+                "smcroutectl", "remove", TARGET_WAN_IF, source, group)
+    await asyncio.sleep(2.0)
+    assert not await mroute_proc_row(target_agent, aiohttp_session, group), (
+        f"{group}: the routed row outlived its MFC entry")
+    line, _ = await mroute_line(target_agent, aiohttp_session, family, source,
+                                group)
+    assert not line, f"{group}: the MFC entry outlived its removal: {line!r}"
+
+
+@pytest.mark.parametrize("family", [4, 6])
+async def test_routed_to_a_port(aiohttp_session, target_agent, lan, smcrouted,
+                                family):
+    """The plain shape, both families: one (S,G), one oif, and that oif is the
+    LAN port itself.
+    """
+    group = GROUPS_V6["routed"] if family == 6 else GROUPS_V4["routed"]
+    await run_routed_case(
+        aiohttp_session, target_agent, lan, group=group, family=family,
+        oif=TARGET_LAN_IF, egress_port=TARGET_LAN_IF, lan_iface=LAN_NIC,
+        label=f"mroute_port_v{family}", smcrouted=smcrouted,
+    )
+
+
+async def test_routed_to_a_vlan_subinterface(aiohttp_session, target_agent,
+                                             lan, smcrouted):
+    """The oif is a VLAN device over the LAN port.
+
+    The listener is the port beneath it and the tag is pushed by the entry's
+    own INSERT_VLAN_HDR, which is the whole reason a listener carries a tag
+    stack rather than an interface name: a VLAN device has no onif in this
+    ownership mode and would describe none.
+    """
+    stack = TopologyStack()
+    group = GROUPS_V4["routed_vlan"]
+    try:
+        dut_if = await dut_vlan_subif(
+            stack, target_agent, aiohttp_session, parent=TARGET_LAN_IF,
+            vid=VLAN_ID_MROUTE, ipv4=f"192.168.{VLAN_ID_MROUTE}.1/24",
+        )
+        lan_if = await lan_vlan_subif(
+            stack, lan, parent=LAN_NIC, vid=VLAN_ID_MROUTE,
+            ipv4=f"192.168.{VLAN_ID_MROUTE}.2/24",
+        )
+        await run_routed_case(
+            aiohttp_session, target_agent, lan, group=group, family=4,
+            oif=dut_if, egress_port=TARGET_LAN_IF, lan_iface=lan_if,
+            label="mroute_vlan", smcrouted=smcrouted,
+        )
+    finally:
+        await stack.teardown("test_routed_to_a_vlan_subinterface")
+
+
+async def test_routed_to_two_listeners_on_one_port(aiohttp_session,
+                                                   target_agent, lan,
+                                                   smcrouted):
+    """Two oifs on the one LAN port: untagged, and tagged on a sub-interface.
+
+    This is the only multi-listener replication this rig can do, and it is the
+    measurement ISSUES.md A158 has been waiting for. The board has five ports
+    and two with carrier, one of which is every group's ingress, so a second
+    listener has to be a second tag stack on the one port that is left. A
+    listener is identified by its whole framing rather than by its device, so
+    the backend takes both and builds one entry per copy in the chain.
+
+    The two copies are counted separately rather than together, which is what
+    discriminates replication from a single copy seen twice: the socket joined
+    on the parent NIC receives the untagged one, and only that one, because
+    the tagged copy is demuxed to the sub-interface where nothing has joined;
+    the capture on the sub-interface sees the tagged one.
+    """
+    stack = TopologyStack()
+    group = GROUPS_V4["routed_pair"]
+    source = wan_source_address(4)
+    sent = int(STREAM_S * STREAM_PPS)
+    capfile = "/tmp/ask_mroute_pair.pcap"
+    try:
+        dut_if = await dut_vlan_subif(
+            stack, target_agent, aiohttp_session, parent=TARGET_LAN_IF,
+            vid=VLAN_ID_MROUTE, ipv4=f"192.168.{VLAN_ID_MROUTE}.1/24",
+        )
+        lan_if = await lan_vlan_subif(
+            stack, lan, parent=LAN_NIC, vid=VLAN_ID_MROUTE,
+            ipv4=f"192.168.{VLAN_ID_MROUTE}.2/24",
+        )
+        await smcrouted([TARGET_WAN_IF, TARGET_LAN_IF, dut_if])
+        await _exec(target_agent, aiohttp_session, "smcroutectl", "add",
+                    TARGET_WAN_IF, source, group, TARGET_LAN_IF, dut_if)
+        await asyncio.sleep(2.0)
+
+        row = await mroute_proc_row(target_agent, aiohttp_session, group)
+        assert "state=installed" in row, (
+            f"{group}: two oifs on one port were not installed. /proc row: "
+            f"{row or '(absent)'}")
+        # Both copies, named separately, on the one port.
+        listeners = re.search(r"listeners=(\S+)", row)
+        assert listeners, row
+        assert listeners.group(1).count(TARGET_LAN_IF) == 2, (
+            f"{group}: expected two listeners on {TARGET_LAN_IF}, one per tag "
+            f"stack; got {listeners.group(1)!r}. A backend that identified a "
+            f"listener by its device would have collapsed them")
+
+        # One stream per observer, for the reason run_routed_case gives: the
+        # socket consumer and the capture both live on the LAN VM's single
+        # console and cannot be in flight together. The two copies are still
+        # counted separately, which is what discriminates replication from one
+        # copy seen twice -- they are just counted one stream apart.
+        idle = await dut_cpu_frame_count(
+            target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
+        )
+        joiner = asyncio.create_task(lan_join_and_count(
+            lan, group=group, source=None, family=4,
+            seconds=STREAM_S + 4.0, igmp_version=None,
+            label="mroute_pair", iface=LAN_NIC,
+        ))
+        await asyncio.sleep(2.0)
+        cpu_frames = asyncio.create_task(dut_cpu_frame_count(
+            target_agent, aiohttp_session, TARGET_WAN_IF, STREAM_S,
+        ))
+        await asyncio.to_thread(
+            send_stream_from_vision, group, 4, STREAM_S, STREAM_PPS,
+        )
+        untagged = await joiner
+        cpu_seen = await cpu_frames
+
+        spawn_parallel_tcpdumps(lan, [lan_if], [capfile],
+                                f"udp port {MCAST_PORT}")
+        await asyncio.sleep(0.4)
+        await asyncio.to_thread(
+            send_stream_from_vision, group, 4, STREAM_S, STREAM_PPS,
+        )
+        kill_parallel_tcpdumps(lan, [lan_if])
+        await asyncio.sleep(0.2)
+        tagged = read_pcap_count(lan, capfile)
+        lan.run(f"rm -f {capfile}", timeout=5)
+
+        assert untagged > sent * 0.95, (
+            f"{group}: the untagged copy arrived {untagged} of {sent} times")
+        assert tagged > sent * 0.95, (
+            f"{group}: the tagged copy arrived {tagged} of {sent} times on "
+            f"{lan_if}. One copy of two means the chain carries one entry "
+            f"where it should carry two")
+        assert cpu_seen - idle < sent * 0.05, (
+            f"{group}: {cpu_seen - idle} of {sent} frames reached the DUT's "
+            f"CPU above the segment's own {idle}, so ipmr replicated this in "
+            f"software")
+
+        # The chain swap, triggered the way one really happens: the VLAN device
+        # carrying the second oif goes away, ipmr withdraws its VIF, and the
+        # group is re-derived onto the listener that is left. A second
+        # `smcroutectl add` for the same (S,G) cannot stand in for it -- it
+        # does not shrink an oif list, it leaves the route as it was, which is
+        # what an earlier revision of this case asserted against and what the
+        # rig reported back.
+        await _exec(target_agent, aiohttp_session, "ip", "link", "del", dut_if)
+        await asyncio.sleep(3.0)
+        row = await mroute_proc_row(target_agent, aiohttp_session, group)
+        assert "state=installed" in row, (
+            f"{group}: the group did not survive losing an oif: {row!r}")
+        listeners = re.search(r"listeners=(\S+)", row)
+        assert listeners and listeners.group(1).count(TARGET_LAN_IF) == 1, (
+            f"{group}: the replaced set still names two listeners: {row!r}")
+
+        await _exec(target_agent, aiohttp_session, "smcroutectl", "remove",
+                    TARGET_WAN_IF, source, group)
+        await asyncio.sleep(2.0)
+        assert not await mroute_proc_row(target_agent, aiohttp_session, group)
+    finally:
+        await stack.teardown("test_routed_to_two_listeners_on_one_port")
+
+
+async def test_routed_to_a_bridge(aiohttp_session, target_agent, lan,
+                                  smcrouted, mroute_lan_bridge):
+    """The oif is a bridge over the LAN port, with snooping off.
+
+    br_dev_xmit() hands such a frame to br_flood(), so the listener set is
+    every port carrying BR_MCAST_FLOOD -- here the one. The source-MAC oracle
+    is not asserted: the hardware writes the egress *port's* address and the
+    software path would write the bridge's, and the two are only equal
+    because a one-port bridge inherits its port's address, so an assertion on
+    it would be testing that coincidence rather than the offload.
+    """
+    await run_routed_case(
+        aiohttp_session, target_agent, lan, group=GROUPS_V4["routed_bridge"],
+        family=4, oif=mroute_lan_bridge, egress_port=TARGET_LAN_IF,
+        lan_iface=LAN_NIC, label="mroute_bridge", smcrouted=smcrouted,
+        check_source_mac=False,
     )

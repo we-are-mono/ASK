@@ -17,7 +17,10 @@ def test_mcast_learner(tmp_path):
     # resized on either has to fail here rather than compile into a harness
     # that no longer matches what the adapter keeps.
     (tmp_path / "mcast_learner.inc").write_text(
-        source[source.index("struct ft_mc_port {"):source.index("static LIST_HEAD(ft_mc_groups)")]
+        # From the member bound rather than from the struct, so the harness
+        # gets FT_MC_MAX_MEMBERS without restating it.
+        source[source.index("#define FT_MC_MAX_MEMBERS"):
+               source.index("static LIST_HEAD(ft_mc_groups)")]
         # The observation the hook records, declared further down with the
         # traffic half rather than with the group it resolves against.
         + source[source.index("struct ft_mc_seen {"):
@@ -33,9 +36,11 @@ def test_mcast_learner(tmp_path):
           "static struct ft_mc_group *ft_mc_find(const struct net_device *bridge,\n"
           "                                      const struct br_ip *addr);\n"
           "static void ft_mc_group_free(struct ft_mc_group *g);\n"
+        + "static bool ft_mc_carriable(const struct ft_mc_group *g);\n"
         + "\n".join(function(source, name) for name in [
             "ft_mc_same_group",
             "ft_mc_find",
+            "ft_mc_carriable",
             "ft_mc_port_eligible",
             "ft_mc_port_tags",
             "ft_mc_group_free",
@@ -139,6 +144,35 @@ def test_exit_drains_before_the_module_text_goes_away():
         "the flag alone cannot serialize a registration that sleeps")
     assert "READ_ONCE(ft_mc_stopping)" in sync, (
         "teardown must win however the two interleave")
+
+
+def test_a_group_the_hardware_cannot_serve_whole_is_not_served_at_all():
+    """A matched frame never reaches the bridge, so a member the hardware did
+    not take on does not fall back to software -- it stops receiving, with
+    nothing anywhere to say why. Refusing that means recording the member, and
+    every place that decides whether to install has to ask.
+    """
+    source = SOURCE.read_text()
+    # The member is kept, not dropped, and the group knows it cannot install.
+    assert "bool uncarried;" in source
+    carriable = function(source, "ft_mc_carriable")
+    assert "g->overflow" in carriable
+    assert "g->ports > CDX_MC_MAX_LISTENERS" in carriable
+    assert "uncarried" in carriable
+
+    worker = function(source, "ft_mc_work_fn")
+    assert worker.count("ft_mc_carriable(") == 2, (
+        "both the pick and the spec build must ask")
+    assert "ft_mc_carriable(g)" in function(source, "ft_mc_state"), (
+        "/proc must name the reason")
+    # The MDB answer must not claim a group that will never install.
+    assert "ft_mc_carriable(g)" in function(source, "ft_mc_membership")
+
+    # And the routed learner reads this port set, so it must be refused the
+    # carried subset rather than handed it.
+    ports = function(source, "ft_mc_bridge_ports")
+    assert "!ft_mc_carriable(best)" in ports, (
+        "handing back the carried subset would look like a complete set")
 
 
 def test_the_vid_follows_the_bridge_rather_than_the_port():

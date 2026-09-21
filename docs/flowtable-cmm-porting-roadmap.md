@@ -37,7 +37,7 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | ---: | --- | ---: | ---: | --- | --- | --- |
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Yes — conntrack mark + `ndo_setup_tc` | Medium | **Delivered**: see the [QoS design](flowtable-qos.md), stages 1–8. Classification reaches hardware as the class word on `cdx_ft_rule` (`ft_qos_class`, queue/channel/policer/DSCP nibbles); CEETM scheduling via `ndo_setup_tc`/HTB offload; WRED; the DSCP map; and ingress-policer *selection* are all built and proved on hardware. Tests: `test_qos_control`, `test_htb_offload`, `test_police`, `test_dscp_map`, `test_ceetm_*`, `test_qos_lifecycle`. Residual, not a CMM-parity gap: the ingress-policer *rate* has no consumer control surface yet (a packaging decision, stage 8). |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | **Delivered**, both directions: see the [IPsec design](flowtable-ipsec.md). Control plane is mainline `xfrmdev_ops` in packet mode, with no ASK userspace. The estimate that the shared encoder already carried the SEC action held; what it did not anticipate is that `FLOW_OFFLOAD_XMIT_XFRM` had to be *admitted* rather than excluded — three generic helpers refuse that transmit type outright, which silently kept every real tunnel in software until step 6 measured it. |
-| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Bridged path delivered and proved on hardware, both families: see the [multicast design](flowtable-multicast.md).** Control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on, with no ASK userspace and no consumer configuration at all. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Routed multicast is a second learner against the same encoder and is not built. |
+| 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB and ipmr | High | **Delivered, both paths and both families: the [bridged design](flowtable-multicast.md) and the [routed design](flowtable-multicast-routed.md).** Bridged control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on; routed is `ipmr`/`ip6mr`'s MFC, read off the FIB chain it was also already on (`ft_fib_event()` used to drop `RTNL_FAMILY_IPMR` at its family filter). No ASK userspace on either, and no consumer configuration for the bridged half at all; the routed half needs whatever daemon the product already ships — `igmpproxy`, `omcproxy`, `smcroute`, `pimd` — and needs nothing *from* it, because they all write `(S,G)` at threshold 1 into the default table. The routed half is where the encoder finally does what it was built for: `TTL_HM_VALID` and the per-listener L2 rebuild are a router's transform, so no encoder change was needed. Standard-tool surfaces: `bridge mdb show` prints `offload` for a bridged group, `ip mroute show` and `ip -s mroute` for a routed one. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. |
 | 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | **Delivered**, both modes and both directions: see the [tunnel design](flowtable-tunnels.md). 6o4 (`sit`, proto 41) and 4o6 (`ip6_tnl` ipip6, next header 4); EtherIP and GRE/IPv6 out of scope. The device walk did not reach a tunnel netdev — none carried `ndo_fill_forward_path` in 6.12 — so the increment starts with a kernel hook adding it to `sit` and `ip6_tnl` (patch 143), which records the outer header and next hop the driver's own transmit path would resolve. Egress inserts the outer header (PPPoE-shaped); ingress strips it (the reverse rule Netfilter describes with nothing), keyed on the physical port. The decap did *not* need the `IS_LOCAL`/`xfrmdev_ops` machinery this row once expected: the strip is an ordinary reverse entry on the inner tuple. Both modes offload at line rate (9.1 Gb/s); the outer DF bit is not reproducible (microcode limitation, as under CMM). |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Yes — `dev_get_stats()` fold | Medium | **Delivered**: see the [interface counters guide](flowtable-statistics.md). A port's and a VLAN device's `ip -s link` and `/proc/net/dev` include the traffic the hardware forwarded, folded from the firmware's own records by `dev_get_stats()` and restated into each device's units — the framing was measured on the DK, not inferred. No FCI, no ASK binary on the reading side; `/proc/cdx_flowtable` keeps raw `vlan` rows as a diagnostic. Alongside it, the SDK driver's own receive counters now see frames the software flowtable forwards (A159, patch 104). A PPPoE session's record is keyed on its `ppp` device and folded the same way. Tests: `test_flowtable_ifstats` and `test_flowtable_pppoe_session_counters` on the rig; `test_ifstats`, `test_vlan_hm`, `test_flowtable` on the host. Not carried: tags with no device behind them (the bridge's own). |
 | 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | **Retired, not ported** (2026-09-20). No Linux analogue, and built on the FPP socket primitive (12): `control_rtp_relay.c` relays one socket endpoint to another (`rtp_flow_add(from_socket, to_socket)`). It is a session-border-controller media-anchoring feature; this product's one real VoIP case is a phone NATed to the ISP, already offloaded as ordinary UDP. Retires with CMM; recoverable from git history if a carrier/SBC product is ever built. See Sequencing. |
@@ -378,9 +378,9 @@ proof — and nothing remaining has that shape. MACVLAN was the last candidate
 and it is out of scope, above, so the next increment is a change of kind rather
 than another one of these.
 
-**Items 5–8 are all delivered.** QoS (5), IPsec (6), bridged multicast (7) and
-now tunnels (8) each expressed behaviour a unicast flowtable tuple cannot carry
-and got its own hardware eligibility rules. The tunnel increment was a walk arm
+**Items 5–8 are all delivered.** QoS (5), IPsec (6), multicast (7) and tunnels
+(8) each expressed behaviour a unicast flowtable tuple cannot carry and got its
+own hardware eligibility rules. The tunnel increment was a walk arm
 plus an encap contract plus a hardware-measured decap path, as expected — but
 its two halves turned out simpler than this section predicted. The egress half
 is an encapsulation insert, closest to the PPPoE increment, and the tunnel
@@ -391,6 +391,18 @@ next hop the driver's transmit path would. The ingress half was *not* the
 frame re-forwards on the inner tuple as an ordinary reverse entry keyed on the
 physical port, so it needed no local-route machinery at all. See the
 [tunnel design](flowtable-tunnels.md).
+
+**Item 7's routed half closed the list, and it was the cheapest of the four.**
+Where the bridged learner had to recover a source and an ingress port from the
+first frames of a stream, because an MDB membership states neither, `ipmr`'s
+MFC entry states both — `mfc_origin`, `mfc_parent` and `ttls[]` are a key, an
+ingress and a replication list written down before any traffic arrives. So the
+routed learner has no packet hook, nothing is ever pending on traffic, and the
+encoder needed no change: `TTL_HM_VALID` on the root entry and the per-listener
+Ethernet rebuild are a router's transform, which the bridged half had been
+using to bridge. What it did need was a shared hardware-key register, because
+two learners now compose keys into a space the classifier keeps one entry per
+address pair in. See the [routed design](flowtable-multicast-routed.md).
 
 **Item 9 needs read-back rather than a mechanism.** The allocator that hands
 out firmware statistics records is general and a session already uses it; what

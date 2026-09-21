@@ -108,6 +108,35 @@ def test_a_group_is_all_or_nothing():
         "a listener must never be skipped -- a partial group is a broken one")
 
 
+def test_a_listener_is_its_whole_framing_not_its_port():
+    """One port may carry two copies of a group with different tags, and may
+    not carry the same copy twice.
+
+    Nothing below this interface identifies a member by its device: each
+    listener gets its own external-hash entry built from its own
+    encapsulation, members[] is indexed by position, and the name copied into
+    if_info is for the query dump. The name lookups that exist --
+    Cdx_GetMcastMemberId, mcast_member_by_name -- are on the FCI mutators and
+    never reach this path.
+
+    The shape matters because of the bench rather than the product: the rig
+    has one LAN port with carrier and every group's other port is its ingress,
+    so two tagged copies on that one port are the only way replication to
+    several listeners and the chain swap can be exercised at all (A158).
+    """
+    body = code("cdx_mc_check")
+    assert "o->vlans == l->vlans" in body and "memcmp(o->vlan, l->vlan" in body, (
+        "the duplicate test must compare the whole framing, not the device")
+    assert "spec->listener[jj].dev == l->dev" not in body, (
+        "a port named twice with different tags is two copies, not a duplicate")
+    # And the in-kernel build path still indexes its members by position.
+    build = code("cdx_mc_build_listeners")
+    for byname in ("Cdx_GetMcastMemberId", "mcast_member_by_name"):
+        assert byname not in build, (
+            f"{byname} identifies a member by name; this path must not use it")
+    assert "grp->members[ii]" in build
+
+
 def test_replace_keeps_the_key_in_the_classifier():
     """Delete-then-add would take the group's key out of the table between the
     two, so every remaining listener would see a gap because a different

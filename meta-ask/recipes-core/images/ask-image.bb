@@ -20,6 +20,7 @@ IMAGE_INSTALL = " \
     nftables \
     bridge-utils \
     conntrack-tools \
+    smcroute \
     ppp \
     ppp-oe \
     kernel-module-ppp-generic \
@@ -116,6 +117,15 @@ ROOTFS_POSTPROCESS_COMMAND += "disable_conntrackd_init;"
 # and empty /etc/dnsmasq.conf would just race and fail. Strip them.
 ROOTFS_POSTPROCESS_COMMAND += "disable_dnsmasq_default_init;"
 
+# smcroute is here so the routed-multicast tests have a real consumer writing
+# ipmr's MFC. They own the daemon's lifecycle: each case starts it with `-N`
+# and a generated config, so the VIF set is exactly the interfaces that case
+# names. A daemon started at boot would enable every multicast-capable
+# interface it could find and shift every VIF index out from under them. The
+# recipe registers no init script today; this is the guard against one
+# arriving with a version bump.
+ROOTFS_POSTPROCESS_COMMAND += "disable_smcroute_init;"
+
 disable_conntrackd_init() {
     rm -f ${IMAGE_ROOTFS}/etc/init.d/conntrackd
     rm -f ${IMAGE_ROOTFS}/etc/rcS.d/*conntrackd*
@@ -125,6 +135,11 @@ disable_conntrackd_init() {
 disable_dnsmasq_default_init() {
     rm -f ${IMAGE_ROOTFS}/etc/rcS.d/*dnsmasq*
     rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*dnsmasq*
+}
+
+disable_smcroute_init() {
+    rm -f ${IMAGE_ROOTFS}/etc/init.d/smcroute
+    rm -f ${IMAGE_ROOTFS}/etc/rc*.d/*smcroute*
 }
 
 inherit image
