@@ -145,6 +145,11 @@ async def mcast_bridge(aiohttp_session, target_agent):
     """
     stack = TopologyStack()
     console = Console.target(log_path=str(ARTIFACTS / "mcast-bridge-uart.log"))
+    # A fresh boot leaves the console at a login prompt, and every command
+    # below would be typed into it as a username. Logging in is idempotent on
+    # a console that already has a shell.
+    console.login("root", None)
+    console.sync_prompt()
 
     async def _exec(*argv: str):
         return await target_agent.exec_cmd(aiohttp_session, list(argv))

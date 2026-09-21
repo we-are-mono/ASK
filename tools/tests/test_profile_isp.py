@@ -69,7 +69,7 @@ from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, kernel_rx_packets, lan_run_python)
 from test_flowtable_offload import (ARTIFACTS, STATUS_ROWS, Rig, command,
                                     console_command, read)
-from test_flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6, INNER_REMOTE,
+from test_flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6,
                                   INNER_REMOTE6, SESSION_MTU, SourceEcho, WAN_VID,
                                   _dial, _hangup, _server_start, _server_stop,
                                   _session_identity, _session_text)
@@ -833,6 +833,13 @@ async def _bridge_wan_for_iptv(ctx, stack):
     steps.append(["ip", "addr", "add", f"{IPTV_GATEWAY}/24", "dev", iptv_dev])
 
     async def _restore():
+        # This host's own cache first, and on this host, because it is the one
+        # machine that is always reachable from here. Every step after it runs
+        # on a console and may fail; if the repin outlived them it would send
+        # this host's frames to the bridge's address after the bridge was gone,
+        # which is a bench that cannot be recovered over the network at all.
+        await command(ctx.wan, ctx.session, "ip", "neigh", "del",
+                      management.split("/")[0], "dev", ctx.wan_if, check=False)
         undo = [["ip", "link", "del", iptv_dev]] if iptv_dev != mgmt_dev else []
         undo += [["ip", "link", "del", mgmt_dev],
                  ["ip", "link", "set", TARGET_WAN_IF, "nomaster"],
@@ -842,8 +849,6 @@ async def _bridge_wan_for_iptv(ctx, stack):
                          "dev", TARGET_WAN_IF])
         for argv in undo:
             await console_command(console, *argv, check=False, timeout=30)
-        await command(ctx.wan, ctx.session, "ip", "neigh", "del",
-                      management.split("/")[0], "dev", ctx.wan_if, check=False)
 
     # Pushed before the first step rather than after the last. A step that fails
     # halfway leaves the management address on a device that cannot receive, and
@@ -859,8 +864,19 @@ async def _bridge_wan_for_iptv(ctx, stack):
     # age out, which is a minute of an unreachable agent.
     bridge_mac = (await console_command(
         console, "cat", f"/sys/class/net/{BRIDGE}/address"))["stdout"].strip()
+    # `stale`, never `permanent`. A stale entry is used immediately and
+    # revalidated by ARP in the background, so it buys the same minute this
+    # repin exists to save -- and it corrects itself if it is ever wrong.
+    #
+    # A permanent one does not, and that is not a tidiness point: when this
+    # fixture's teardown could not reach the agent, the pin outlived the bridge
+    # whose address it named, and from then on every frame this host sent to
+    # the DUT went to a MAC that no longer answered. The board was unreachable
+    # for the agent, for ssh and for U-Boot's own TFTP, so it could not even
+    # boot, and nothing on either machine said why: the DUT looked healthy from
+    # its console and the orchestrator's link was fine.
     await command(ctx.wan, ctx.session, "ip", "neigh", "replace",
-                  management.split("/")[0], "lladdr", bridge_mac, "nud", "permanent",
+                  management.split("/")[0], "lladdr", bridge_mac, "nud", "stale",
                   "dev", ctx.wan_if)
     for _ in range(40):
         try:
@@ -871,6 +887,23 @@ async def _bridge_wan_for_iptv(ctx, stack):
         await asyncio.sleep(0.5)
     pytest.fail("the agent did not answer after the WAN port joined the bridge; "
                 f"management {management} was moved to {mgmt_dev}")
+
+
+async def _session_address(ctx):
+    """The IPv4 address this session actually negotiated.
+
+    Not the constant. `pppoe-server -R` names the *start* of a pool, so the
+    address a dial receives depends on how many sessions the concentrator has
+    already handed out -- a lingering one from an earlier run moves the next
+    dial along by one. Asserting the constant made this profile pass while the
+    bench was fresh and fail once it had dialled a few times, which reads as
+    flakiness and is really the test knowing something it should have asked.
+    """
+    addresses = json.loads((await command(ctx.target, ctx.session, "ip", "-j",
+                                          "-4", "addr", "show",
+                                          "dev", ctx.ppp_if))["stdout"])
+    return next(a["local"] for a in addresses[0]["addr_info"]
+                if a["family"] == "inet")
 
 
 async def _session_ipv6(ctx, cleanup):
@@ -1037,6 +1070,7 @@ async def isp(target_agent, lan):
             ctx.ppp_if, ctx.ppp_pid = await _dial(console, ctx.ppp_lower, ipv6=True)
             stack.push(lambda: _hangup(console))
             ctx.session_identity = await _session_identity(ctx)
+            ctx.ppp_local = await _session_address(ctx)
 
             # ---- the LAN, and the IPTV VLAN bridged in from the WAN port ----
             await _bridge_lan(ctx, stack)
@@ -1167,7 +1201,7 @@ async def test_profile_isp_subscriber_reaches_the_internet(isp, splat_window):
     assert forward["in_vlan"] == "-" and reverse["out_vlan"] == "-", (forward, reverse)
     # Translated to the session's own address, which is what an ISP sees. The
     # port is masquerade's to choose, so only the address is asserted.
-    assert forward["new_src"].startswith(INNER_REMOTE + ":"), forward
+    assert forward["new_src"].startswith(ctx.ppp_local + ":"), (forward, ctx.ppp_local)
     # The forward direction leaves by the session, so it carries the session's
     # MTU. Nothing here set that; the eight bytes of overhead are already in it.
     assert int(forward["mtu"]) == SESSION_MTU, forward
@@ -1190,7 +1224,7 @@ async def test_profile_isp_guest_vlan_is_tagged_on_the_wire(isp, splat_window):
     assert forward["in_br"] == ctx.bridge_text[GUEST_VID], forward
     assert forward["in_vlan"] == str(GUEST_VID), forward
     assert reverse["out_vlan"] == str(GUEST_VID), reverse
-    assert forward["new_src"].startswith(INNER_REMOTE + ":"), forward
+    assert forward["new_src"].startswith(ctx.ppp_local + ":"), (forward, ctx.ppp_local)
 
 
 async def test_profile_isp_ipv6_rides_the_session_natively(isp, splat_window):
@@ -1268,11 +1302,24 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
     default_class = int((await read(
         ctx.target, ctx.session,
         "/sys/module/ask_flowtable/parameters/qos_default_class")).strip())
-    if default_class & 0xf == VOICE_CQ:
-        pytest.skip(f"qos_default_class names class queue {VOICE_CQ}, which is the "
-                    f"one the voice mark names; the two would be indistinguishable")
+    if default_class & 0xf in (VOICE_CQ, BULK_CQ):
+        pytest.skip(f"qos_default_class names class queue {default_class & 0xf}, "
+                    f"which is one of the two this case marks for; traffic that "
+                    f"missed its mark would be indistinguishable from traffic "
+                    f"that carried it")
     shift = (mask & -mask).bit_length() - 1
     voice_mark = VOICE_CQ << shift
+    # The bulk flow is marked too, rather than left to the default class.
+    #
+    # What this case is about is a mark picking a class, and two marks name two
+    # leaves unambiguously. Leaving bulk unmarked instead made the assertion
+    # depend on where the *default* lands, and that is a different question
+    # with a different answer: the default is a class-queue nibble in the
+    # adapter's numbering, where 0 is the lowest strict priority, while a tc
+    # leaf of `prio N` holds queue NUM_PQS-1-N in the opposite direction. The
+    # two scales meet nowhere this test can assert on, and the run that found
+    # it showed the default's traffic on the voice leaf's counter.
+    bulk_mark = BULK_CQ << shift
 
     async def dut(*argv, check=True):
         return await command(ctx.target, ctx.session, *argv, check=check)
@@ -1298,10 +1345,16 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
         # its first child rather than allocating a new one.
         await tc("class", "add", "dev", TARGET_WAN_IF, "parent", "1:",
                  "classid", "1:10", "htb", "rate", CHANNEL_RATE, "ceil", CHANNEL_CEIL)
+        # Each leaf carries a rate because `sch_htb` requires one of every
+        # class and rejects the add outright without it; only `prio` is what
+        # this profile is actually asserting on, and it is what selects the
+        # strict-priority class queue the leaf maps to.
         await tc("class", "add", "dev", TARGET_WAN_IF, "parent", "1:10",
-                 "classid", "1:100", "htb", "prio", str(VOICE_PRIO))
+                 "classid", "1:100", "htb", "rate", CHANNEL_RATE,
+                 "ceil", CHANNEL_CEIL, "prio", str(VOICE_PRIO))
         await tc("class", "add", "dev", TARGET_WAN_IF, "parent", "1:10",
-                 "classid", "1:101", "htb", "prio", str(BULK_PRIO))
+                 "classid", "1:101", "htb", "rate", CHANNEL_RATE,
+                 "ceil", CHANNEL_CEIL, "prio", str(BULK_PRIO))
         tree = (await tc("-s", "class", "show", "dev", TARGET_WAN_IF))["stdout"]
         for classid in ("1:10", "1:100", "1:101"):
             assert classid in tree, (classid, tree)
@@ -1309,6 +1362,8 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
  chain mangle {{ type filter hook forward priority -150; policy accept;
  udp dport {PORT_VOICE} ct mark set {voice_mark:#x}
  udp sport {PORT_VOICE} ct mark set {voice_mark:#x}
+ udp dport {PORT_BULK} ct mark set {bulk_mark:#x}
+ udp sport {PORT_BULK} ct mark set {bulk_mark:#x}
  }}
 }}''')
         # The mark is sampled at admission, so a connection that predates the
@@ -1328,7 +1383,7 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
         for row in (voice_fwd, voice_rev):
             assert int(row["qos"], 16) == VOICE_CQ, (row, voice_mark, mask)
         for row in (bulk_fwd, bulk_rev):
-            assert int(row["qos"], 16) == default_class, (row, default_class)
+            assert int(row["qos"], 16) == BULK_CQ, (row, bulk_mark, mask)
         _assert_session(ctx, voice_fwd, voice_rev)
 
         # The voice burst left by exactly one leaf, and it is the one created
@@ -1336,16 +1391,21 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
         moved = {slot: voiced[slot] - before.get(slot, 0) for slot in voiced}
         assert moved.get(0, 0) >= 64, (moved, before, voiced)
         assert all(value == 0 for slot, value in moved.items() if slot), moved
-        # The bulk flow named the default class. Whether a leaf accounts for it
-        # depends on whether the default is one of this tree's queues, and the
-        # counters have to agree with that either way.
-        unmoved = {slot: bulked[slot] - voiced[slot] for slot in bulked}
-        expected_leaf = 1 if default_class & 0xf == BULK_CQ else None
-        for slot, value in unmoved.items():
-            if slot == expected_leaf:
-                assert value >= 64, (slot, unmoved)
-            else:
-                assert value == 0, (slot, unmoved)
+        # And the bulk burst left by the other leaf, and only that one. Two
+        # marks, two leaves: this is the discrimination the case exists for,
+        # and it fails if the class word reaches the hardware for one mark and
+        # not the other, or if both land in the same queue.
+        after_bulk = {slot: bulked[slot] - voiced[slot] for slot in bulked}
+        assert after_bulk.get(1, 0) >= 64, (after_bulk, voiced, bulked)
+        # Every leaf but the bulk one and the default one. This port carries
+        # the box's own unmarked traffic -- the test agent's HTTP among it --
+        # and unmarked means the default class, which on this tree shares a
+        # queue with leaf 0. Demanding a flat zero there asked the bench to be
+        # silent on its own management path, which it never is; what the case
+        # can honestly require is that nothing reached a queue no mark named.
+        for slot, value in after_bulk.items():
+            if slot not in (0, 1):
+                assert value == 0, (slot, after_bulk)
         ctx.record("isp-qos", {"mask": mask, "voice_mark": voice_mark,
                                "default_class": default_class, "tree": tree,
                                "leaves_before": before, "after_voice": voiced,
@@ -1378,13 +1438,18 @@ while True:
 '''
     await command(ctx.target, ctx.session, "nft", f'''table inet {NAT_TABLE} {{
  chain prerouting {{ type nat hook prerouting priority -110; policy accept;
- iif {ctx.ppp_if} ip daddr {INNER_REMOTE} udp dport {PORT_PUBLIC} dnat ip to {client['ip']}:{PORT_PUBLIC}
+ iif {ctx.ppp_if} ip daddr {ctx.ppp_local} udp dport {PORT_PUBLIC} dnat ip to {client['ip']}:{PORT_PUBLIC}
  }}
 }}''')
     staged = (f"import pathlib, subprocess\n"
               f"pathlib.Path({receiver!r}).write_text({listener!r})\n"
               f"subprocess.Popen(['python3', {receiver!r}], start_new_session=True)\n"
               "print('RECEIVER-UP')\n")
+
+    # The address the session negotiated, not the pool's first: the
+    # concentrator hands out the next one on every dial, so a constant here
+    # aims the knock and the DNAT rule at an address the DUT may not hold.
+    public = ctx.ppp_local
 
     def _knock(count):
         """The orchestrator is the far end here, so this runs in this process.
@@ -1397,7 +1462,7 @@ while True:
         try:
             for index in range(count):
                 sock.sendto(b"ASK-profile-forward-%04d" % index,
-                            (INNER_REMOTE, PORT_PUBLIC))
+                            (public, PORT_PUBLIC))
                 try:
                     sock.recv(2048)
                     echoed += 1
@@ -1417,9 +1482,9 @@ while True:
         assert echoed >= sent - 4, (echoed, sent)
         flows = (await ctx.state())["flows"]
         forward = _direction(flows, f"{INNER_LOCAL}:{PORT_PUBLIC}",
-                             f"{INNER_REMOTE}:{PORT_PUBLIC}")
+                             f"{ctx.ppp_local}:{PORT_PUBLIC}")
         reverse = [f for f in flows if f["src"] == f"{client['ip']}:{PORT_PUBLIC}"
-                   and f["new_src"] == f"{INNER_REMOTE}:{PORT_PUBLIC}"]
+                   and f["new_src"] == f"{ctx.ppp_local}:{PORT_PUBLIC}"]
         assert len(reverse) == 1, flows
         reverse = reverse[0]
         assert forward["new_dst"] == f"{client['ip']}:{PORT_PUBLIC}", forward
@@ -1481,7 +1546,14 @@ print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
         measured = json.loads(stdout)["end"]["sum_received"]
         ctx.record("isp-throughput", {"client": report, "server": measured})
         assert report["rc"] == 0, report
-        floor = float(os.environ.get("ASK_FLOWTABLE_MIN_GBPS", "9")) * 1e9
+        # This path's own ceiling, not the plain-NAT one. Every frame here
+        # spends both encapsulation slots -- a session inside a carrier tag --
+        # and the roadmap's paired measurement of exactly this shape records
+        # 8.948 and 8.936 Gb/s under the flowtable against 8.984 and 8.931
+        # under CMM. A 9 Gb/s floor borrowed from the untagged benchmark
+        # therefore fails a path that is at its ceiling, which is the opposite
+        # of what a throughput gate is for.
+        floor = float(os.environ.get("ASK_PROFILE_ISP_MIN_GBPS", "8.8")) * 1e9
         assert measured["bits_per_second"] >= floor, (measured, floor)
     finally:
         if server.returncode is None:
@@ -1564,6 +1636,9 @@ async def test_profile_isp_redial_readmits_every_flow(isp, splat_window):
 
     ctx.ppp_if, ctx.ppp_pid = await _dial(ctx.console, ctx.ppp_lower, ipv6=True)
     ctx.session_identity = await _session_identity(ctx)
+    # A redial takes the next address out of the concentrator's pool, so the
+    # cases that run after this one have to be told what it is.
+    ctx.ppp_local = await _session_address(ctx)
     # The device went and took its addresses and rules with it. Restated only
     # where it is missing, so a redial onto the same device name does not leave
     # the same rule twice.
