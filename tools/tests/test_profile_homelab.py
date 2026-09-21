@@ -1,0 +1,1919 @@
+"""The gateway as an enthusiast runs it: a plain routed uplink, a segmented
+LAN, a VPN and a tunnel, proved as one configuration.
+
+The other profile in this directory is the carrier shape -- a session on a
+tagged uplink, IPTV, QoS. This one is the other half of the product's
+deployment surface and shares almost nothing with it. The uplink is static
+dual-stack on the WAN port with no session at all. The LAN is one physical port
+carrying three VLANs, with a firewall policy between them rather than one flat
+subnet. There is an IPsec tunnel to a host on the LAN, a 6o4 tunnel giving the
+main VLAN IPv6 through a broker, routed multicast fed by smcroute rather than
+by a bridge's snooping, and an ingress policer on the uplink. Six features,
+three of which the carrier profile never touches.
+
+The point of running them together is what they share: one physical port on
+each side, one conntrack table, one flowtable binding, one classifier. Inter-
+VLAN routing between two VLANs on the same port is a hairpin, a bridge and a
+tag at once, and it is the case most likely to break when any one of them
+changes. The tunnel and the IPsec tunnel both ask the classifier to build an
+outer header the CPU would otherwise have built. Multicast asks it to replicate
+onto devices the unicast path never names.
+
+The disciplines are this file's copy of the ISP profile's, and they are not
+negotiable in either:
+
+  - **the row names the encapsulation.** Delivery proves nothing on its own --
+    the CPU forwards, the bridge floods -- so every case reads the adapter's own
+    row back, requires it to name the bridge, tags, tunnel or SA it was supposed
+    to build, then sends a second burst and requires the classifier's own packet
+    counters to account for all of it.
+  - **the CPU did not do it.** The physical ports' software receive counters
+    stay flat across the measured burst while the hardware counters move.
+
+The lifecycle half asks what happens when the parts move: the default route
+changes and comes back, an IPsec SA is replaced under a live flow, a VLAN
+membership is withdrawn from the LAN port, and finally the adapter itself is
+unloaded and reloaded with the whole profile standing -- after which every
+feature above is re-proved by a short burst rather than assumed.
+
+Bench furniture this profile needs, none of it created here:
+
+  - `smcroute` (`smcrouted` and `smcroutectl`) in the DUT image. Both are in the
+    agent's argv allowlist already; the case skips, naming them, if the binaries
+    are absent.
+  - `iperf3` on the LAN VM and on the orchestrator, for the policer and the
+    opt-in throughput case.
+  - nothing on the WAN switch: unlike the ISP profile, nothing here is tagged
+    on the uplink.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import secrets
+import socket
+import time
+
+import aiohttp
+import pytest
+import pytest_asyncio
+
+from ask_orch.client import Agent
+from ask_orch.uart import Console
+from _topology import (DUT_IPV6_WAN, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6,
+                       TopologyStack, dut_vlan_subif, kernel_rx_packets, lan_run,
+                       lan_run_python)
+from test_flowtable_offload import (ARTIFACTS, STATUS_ROWS, Rig, command,
+                                    console_command, read)
+from test_flowtable_policy import CONFIG, apply, stop
+from test_flowtable_tunnel import (Shape, _dut_tunnel, _orchestrator_tunnel,
+                                   _outer_segment, _tunnel_text)
+from test_ipsec_inbound_flow_offload import crypto, quoted, sec_counter
+
+pytestmark = [
+    pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
+                       reason="requires an explicit experimental boot"),
+    # Every case runs on the loop the profile fixture was built on. Without
+    # this the suite's default function loop scope gives each test a loop of
+    # its own, and the fixture's loop -- the one holding the echo endpoints the
+    # traffic helpers talk to -- never runs again after setup: nothing is
+    # echoed, no error is raised anywhere, and every case fails as an
+    # unreachable peer. Verified both ways before it was written down.
+    pytest.mark.asyncio(loop_scope="module"),
+]
+
+# ---- constants that belong in _topology.py's VLAN conventions block --------
+#
+# Claimed here only because this file may not edit that one while it is being
+# changed elsewhere. Move them across with the rest of the block:
+#
+#   test_profile_homelab.py     281/282/283
+#
+BRIDGE = "br-home"
+VID_A = int(os.environ.get("ASK_PROFILE_HOME_VID_A", "281"))   # trusted, PVID
+VID_B = int(os.environ.get("ASK_PROFILE_HOME_VID_B", "282"))   # IoT
+VID_C = int(os.environ.get("ASK_PROFILE_HOME_VID_C", "283"))   # guest
+
+# Subnets, deliberately not derived from the VLAN ids: an id can exceed an
+# octet and a subnet built out of one silently aliases as soon as it does.
+SUBNET_A, GATEWAY_A, CLIENT_A = "172.29.81.0/24", "172.29.81.1", "172.29.81.2"
+SUBNET_B, GATEWAY_B, CLIENT_B = "172.29.82.0/24", "172.29.82.1", "172.29.82.2"
+SUBNET_C, GATEWAY_C, CLIENT_C = "172.29.83.0/24", "172.29.83.1", "172.29.83.2"
+MAC_A, MAC_B, MAC_C = ("02:9d:99:b2:81:02", "02:9d:99:b2:82:02", "02:9d:99:b2:83:02")
+# VLAN A's IPv6, which arrives through the 6o4 tunnel rather than from the WAN
+# port: this is the tunnel-broker shape, where the uplink is v4-only.
+PREFIX_A6, GATEWAY_A6, CLIENT_A6 = "fc00:81::/64", "fc00:81::1", "fc00:81::2"
+
+# An address on the orchestrator that is not on the WAN segment, so reaching it
+# costs the DUT a default route. Every WAN case here uses it, which is what
+# makes the default-route lifecycle case a test of those flows rather than of a
+# route nothing was using.
+INTERNET = os.environ.get("ASK_PROFILE_HOME_INTERNET", "198.18.50.1")
+# The inner address of the IPsec tunnel, on the LAN VM's loopback. 198.18.98.x
+# deliberately avoids 198.18.87.x and 198.18.96.x, which the two IPsec files
+# already put on that same loopback.
+IPSEC_INNER = os.environ.get("ASK_PROFILE_HOME_IPSEC_INNER", "198.18.98.2")
+IPSEC_REQID_OUT, IPSEC_REQID_IN = "49212", "49213"
+# Packets that legitimately travel in software before the entries exist. A
+# bidirectional tunnel needs a few: conntrack must confirm, and only an
+# original-direction packet can create the flow at all, because every reply
+# carries a sec_path and nft_flow_offload_skip() declines it.
+IPSEC_SETUP = 5
+# Full-size, deliberately: the classifier checks the size of what it transmits
+# against the MTU in the entry, and for a direction handed to SEC that is the
+# outer frame. A short payload fits whatever is programmed, so a wrong MTU
+# excepts nothing and every assertion still passes while the CPU does the work.
+IPSEC_PAYLOAD = 1400
+
+# One port per case, so a conntrack left behind by one never feeds another.
+PORT = int(os.environ.get("ASK_PROFILE_HOME_PORT", "49200"))
+PORT_A, PORT_B, PORT_C = PORT, PORT + 2, PORT + 4
+PORT_HAIRPIN, PORT_REFUSED = PORT + 6, PORT + 8
+PORT_V6 = PORT + 10
+PORT_IPSEC = PORT + 12
+PORT_MCAST = PORT + 14
+PORT_RATE = PORT + 16
+PORT_POLICE = PORT + 18
+
+GROUP = os.environ.get("ASK_PROFILE_HOME_GROUP", "239.9.2.1")
+# The daemon's generated config. A path of this profile's own, because
+# test_mcast_e2e.py writes one too and the two must never be each other's.
+SMCROUTE_CONF = "/tmp/ask-profile-home-smcroute.conf"
+# Above 1, always: the soft parser ends the parse before classification for TTL
+# 0 or 1, and ip_mr_forward()'s own rule is the same one. The replicas carry one
+# less, which is the routing the hardware did on the way through.
+STREAM_TTL = 64
+STREAM_S, STREAM_PPS = 3.0, 500
+
+# The ingress meter. Well under the line rate and well under what the software
+# path can forward, because the rate is not what proves the offload here --
+# `skip_sw` plus `in_hw` plus the profile's own colour counters are.
+POLICE_RATE_MBIT = int(os.environ.get("ASK_PROFILE_HOME_POLICE_MBIT", "50"))
+POLICE_BURST = os.environ.get("ASK_PROFILE_HOME_POLICE_BURST", "4m")
+POLICE_OFFERED_MBIT = POLICE_RATE_MBIT * 6
+
+FIREWALL_TABLE = "ask_profile_home"
+TUNNEL_DEVICE = os.environ.get("ASK_PROFILE_HOME_TUNNEL", "fthome6o4")
+ORCH_IPV4 = os.environ.get("ASK_WAN_IP", "127.0.0.1")
+INJECT_IF = os.environ.get("ASK_WAN_INJECT_IF", "br0")
+
+
+def orchestrator_source():
+    """The orchestrator's WAN address: the multicast source, the IPsec inner
+    peer and the DUT's alternate default gateway. The conftest default is stale
+    on most benches, so everything that needs it reads it from here."""
+    return os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
+
+
+# ---- reading the adapter ---------------------------------------------------
+
+# test_flowtable_offload's row map predates the routed-multicast learner and its
+# parser asserts on a line it does not recognise, so one `mroute` row would
+# break every state read in this file -- which installs one deliberately.
+PROFILE_ROWS = {**STATUS_ROWS, "mroute": "mroute"}
+
+
+def status_text(text):
+    state = {name: [] for name in PROFILE_ROWS.values()}
+    state["unparsed"] = []
+    for line in text.splitlines():
+        kind, _, rest = line.partition(" ")
+        if kind in PROFILE_ROWS:
+            state[PROFILE_ROWS[kind]].append(
+                dict(item.split("=", 1) for item in rest.split()))
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            state["unparsed"].append(line)
+            continue
+        key, value = parts
+        state[key] = int(value) if value.isdecimal() else value
+    return state
+
+
+class Profile(Rig):
+    """Rig's reading half -- state, wait, nft, record -- over a whole profile.
+
+    Its table, exchange and conntrack helpers are not reused: each describes one
+    LAN address against one WAN endpoint, and this profile has three clients,
+    two tunnels and a multicast group. The offload policy is the shipping
+    daemon's own catch-all, which is what the box runs by default.
+    """
+
+    async def state(self):
+        return status_text(await read(self.target, self.session, "/proc/cdx_flowtable"))
+
+
+def _direction(flows, source, destination):
+    matching = [f for f in flows if f["src"] == source and f["dst"] == destination]
+    assert len(matching) == 1, (source, destination, flows)
+    return matching[0]
+
+
+def _directions(flows, source, sport, peer, dport):
+    """Both halves of one connection, translated or not. The reverse half can be
+    joined back to the client only through `new_dst` once it is masqueraded, and
+    this profile has translated and untranslated paths at the same time."""
+    forward = _direction(flows, f"{source}:{sport}", f"{peer}:{dport}")
+    reverse = [f for f in flows if f["src"] == f"{peer}:{dport}"
+               and f["new_dst"] == f"{source}:{sport}"]
+    assert len(reverse) == 1, (source, sport, peer, dport, flows)
+    return forward, reverse[0]
+
+
+def _bracketed(address):
+    return f"[{address}]" if ":" in address else address
+
+
+# ---- LAN-side clients ------------------------------------------------------
+
+def _client(name, *, vid, ip, mac, gateway, ip6=None, gateway6=None):
+    return {"name": name, "netns": f"ask-home-{name}", "iface": f"askh{name}",
+            "vid": vid, "ip": ip, "mac": mac, "gateway": gateway,
+            "ip6": ip6, "gateway6": gateway6}
+
+
+CLIENTS = [
+    _client("a", vid=None, ip=CLIENT_A, mac=MAC_A, gateway=GATEWAY_A,
+            ip6=CLIENT_A6, gateway6=GATEWAY_A6),
+    _client("b", vid=VID_B, ip=CLIENT_B, mac=MAC_B, gateway=GATEWAY_B),
+    _client("c", vid=VID_C, ip=CLIENT_C, mac=MAC_C, gateway=GATEWAY_C),
+]
+BY_NAME = {c["name"]: c for c in CLIENTS}
+
+
+async def _build_clients(ctx):
+    """One network namespace per VLAN, all on the one physical LAN wire.
+
+    The trusted VLAN's client is a macvlan, so it is untagged exactly as a
+    laptop is; the IoT and guest clients are VLAN devices moved into their
+    namespaces, so their frames carry the tag the bridge classifies on. Distinct
+    MACs, so the bridge learns three stations on one port rather than one.
+
+    The whole build is one script, and it removes every namespace it created if
+    any step fails: a half-built client would be inherited by the next run as a
+    name collision rather than as the failure it is.
+    """
+    setup = f'''
+import pathlib, subprocess
+clients = {CLIENTS!r}
+def run(*args): subprocess.run(args, check=True, capture_output=True, text=True)
+for c in clients:
+    assert not pathlib.Path('/var/run/netns/' + c['netns']).exists(), c['netns']
+    assert not pathlib.Path('/sys/class/net/' + c['iface']).exists(), c['iface']
+created = []
+try:
+    for c in clients:
+        run('ip', 'netns', 'add', c['netns']); created.append(c)
+        if c['vid'] is None:
+            run('ip', 'link', 'add', 'link', {LAN_NIC!r}, 'name', c['iface'],
+                'netns', c['netns'], 'type', 'macvlan', 'mode', 'bridge')
+        else:
+            run('ip', 'link', 'add', 'link', {LAN_NIC!r}, 'name', c['iface'],
+                'type', 'vlan', 'id', str(c['vid']))
+            run('ip', 'link', 'set', c['iface'], 'netns', c['netns'])
+        run('ip', '-n', c['netns'], 'link', 'set', 'lo', 'up')
+        run('ip', '-n', c['netns'], 'link', 'set', c['iface'], 'address', c['mac'], 'up')
+        run('ip', '-n', c['netns'], 'addr', 'add', c['ip'] + '/24', 'dev', c['iface'])
+        run('ip', '-n', c['netns'], 'route', 'add', 'default', 'via', c['gateway'])
+        # A multicast stream's source is on another subnet entirely, and a
+        # namespace that reverse-path filters drops every frame of it.
+        run('ip', 'netns', 'exec', c['netns'], 'sysctl', '-qw',
+            'net.ipv4.conf.all.rp_filter=0')
+        run('ip', 'netns', 'exec', c['netns'], 'sysctl', '-qw',
+            'net.ipv4.conf.%s.rp_filter=0' % c['iface'])
+        if c['ip6']:
+            run('ip', '-n', c['netns'], 'addr', 'add', c['ip6'] + '/64',
+                'dev', c['iface'], 'nodad')
+            run('ip', '-n', c['netns'], 'route', 'add', 'default', 'via', c['gateway6'])
+except BaseException:
+    for c in reversed(created):
+        subprocess.run(['ip', 'netns', 'del', c['netns']], capture_output=True)
+    raise
+print('CLIENTS-UP')
+'''
+    result = await lan_run_python(ctx.lan, setup, label="profile_home_clients",
+                                  timeout=60)
+    assert result.rc == 0 and "CLIENTS-UP" in result.stdout, result.stdout
+
+
+async def _drop_clients(ctx):
+    teardown = f'''
+import subprocess
+errors = []
+for c in {CLIENTS!r}:
+    result = subprocess.run(['ip', 'netns', 'del', c['netns']],
+                            capture_output=True, text=True)
+    if result.returncode:
+        errors.append(result.stderr)
+assert not errors, errors
+'''
+    await lan_run_python(ctx.lan, teardown, label="profile_home_clients_down",
+                         timeout=40)
+
+
+async def _client_python(ctx, client, script, *, label, timeout=60):
+    """Run a script inside one client's namespace on the LAN VM. The same setns
+    preamble Rig.run_peer uses, stated here because a profile drives several
+    namespaces in one test and the Rig-level attribute would have to be set and
+    unset around every call."""
+    staged = ("import os\n"
+              f"with open('/var/run/netns/' + {client['netns']!r}, 'rb') as ns:\n"
+              "    os.setns(ns.fileno(), os.CLONE_NEWNET)\n" + script)
+    return await lan_run_python(ctx.lan, staged, label=label, timeout=timeout)
+
+
+# ---- traffic ---------------------------------------------------------------
+
+def _source_address(client, peer):
+    return client["ip6"] if ":" in peer else client["ip"]
+
+
+async def _exchange(ctx, client, *, peer, dport, sport, count, payload_size=256,
+                    label="profile_home", tolerate_loss=False):
+    """Echo `count` datagrams from one client and report what came back.
+
+    A reply from the wrong endpoint or with the wrong payload is fatal: either
+    means the path is not the one under test. A timeout is only counted, so a
+    caller can tolerate loss while a flow is being admitted -- and a case that
+    expects the firewall to refuse the traffic entirely can read the count.
+    """
+    source = _source_address(client, peer)
+    family = "socket.AF_INET6" if ":" in source else "socket.AF_INET"
+    script = f'''
+import json, socket, struct, time
+s = socket.socket({family}, socket.SOCK_DGRAM)
+s.settimeout({0.5 if tolerate_loss else 2})
+s.bind(({source!r}, {sport}))
+echoed = lost = 0
+for n in range({count}):
+    payload = struct.pack('!Q', n) + b'ASK-profile'.ljust({payload_size} - 8, b'.')[:{payload_size} - 8]
+    try:
+        s.sendto(payload, ({peer!r}, {dport}))
+    except OSError:
+        lost += 1
+        continue
+    try:
+        data, addr = s.recvfrom(4096)
+    except (TimeoutError, OSError):
+        lost += 1
+        continue
+    assert data == payload, (n, len(data), len(payload))
+    assert (addr[0], addr[1]) == ({peer!r}, {dport}), (n, addr)
+    echoed += 1
+    time.sleep(0.005)
+s.close()
+print(json.dumps({{'echoed': echoed, 'lost': lost}}))
+'''
+    result = await _client_python(ctx, client, script, label=label,
+                                  timeout=count * 0.3 + 40)
+    assert result.rc == 0, result.stdout
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+async def _software_rx(ctx):
+    return {dev: await kernel_rx_packets(ctx.target, ctx.session, dev)
+            for dev in (TARGET_LAN_IF, TARGET_WAN_IF)}
+
+
+async def _admit(ctx, client, *, peer, dport, sport, timeout=20, label="profile_home"):
+    """Send short bursts until both directions are installed. A deadline rather
+    than a round count: an admission that loses rtnl_trylock is declined and
+    re-offered only after two flowtable GC ticks, and nothing re-offers a
+    retired flow on its own -- so every attempt sends before it looks."""
+    source, target = _bracketed(_source_address(client, peer)), _bracketed(peer)
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        await _exchange(ctx, client, peer=peer, dport=dport, sport=sport, count=4,
+                        label=label)
+        flows = (await ctx.state())["flows"]
+        try:
+            return _directions(flows, source, sport, target, dport)
+        except AssertionError:
+            if asyncio.get_running_loop().time() > deadline:
+                conntrack = await command(ctx.target, ctx.session, "conntrack", "-L",
+                                          "-o", "extended", check=False)
+                state = await ctx.state()
+                ctx.record("home-partial-admission",
+                           {"state": state, "conntrack": conntrack})
+                pytest.fail(
+                    f"{client['name']} {source}:{sport} -> {target}:{dport} was not "
+                    f"admitted in both directions: validated={state['validated']} "
+                    f"rejects={state['rejects']} busy={state['busy']} "
+                    f"errors={state['errors']}\nflows={state['flows']}")
+            await asyncio.sleep(0.5)
+
+
+async def _accounted(ctx, client, *, peer, dport, sport, count=64, payload_size=256,
+                     label="profile_home"):
+    """Admit the connection, then measure a second burst against the hardware.
+
+    Three things are required of that burst and all three are needed: the rows
+    are the same rows -- the cookies did not move, so nothing was readmitted
+    underneath the measurement -- the classifier counted every frame, and the
+    physical ports' software receive counters did not. The bound on the WAN port
+    is looser because the agent's own control channel shares it; the LAN port
+    carries nothing but the profile.
+    """
+    forward, reverse = await _admit(ctx, client, peer=peer, dport=dport, sport=sport,
+                                    label=label)
+    before = {f["cookie"]: int(f["packets"]) for f in (forward, reverse)}
+    software_before = await _software_rx(ctx)
+    report = await _exchange(ctx, client, peer=peer, dport=dport, sport=sport,
+                             count=count, payload_size=payload_size, label=label)
+    software_after = await _software_rx(ctx)
+    state = await ctx.state()
+    after = {f["cookie"]: int(f["packets"]) for f in state["flows"]
+             if f["cookie"] in before}
+    assert report == {"echoed": count, "lost": 0}, report
+    assert set(after) == set(before), (
+        "a direction was readmitted mid-measurement: "
+        + " ".join(f"{k}={state[k]}" for k in sorted(state)
+                   if k.endswith("invalidations") or
+                   k in ("invalidated", "invalidation_done", "rearms", "errors",
+                         "rejects", "busy", "installs", "deletes")))
+    delta = {c: after[c] - before[c] for c in before}
+    assert all(d == count for d in delta.values()), (delta, state)
+    software = {dev: software_after[dev] - software_before[dev]
+                for dev in software_before}
+    # A software-forwarded burst puts `count` frames through each port's
+    # receive path, so anything well under that says the hardware carried it.
+    # The LAN port carries nothing but the profile and takes the tight bound;
+    # the WAN port also carries the agent's own control channel, which is a
+    # handful of frames per call on a kept-alive connection.
+    assert software[TARGET_LAN_IF] < count // 4, (software, count)
+    assert software[TARGET_WAN_IF] < count // 2, (software, count)
+    ctx.record(f"home-{label}", {"forward": forward, "reverse": reverse,
+                                 "delta": delta, "software_rx": software})
+    return forward, reverse
+
+
+def _assert_wan(ctx, forward, reverse, *, client):
+    """A masqueraded flow out of the LAN bridge and onto the WAN port."""
+    assert forward["in"] == TARGET_LAN_IF and forward["out"] == TARGET_WAN_IF, forward
+    assert reverse["in"] == TARGET_WAN_IF and reverse["out"] == TARGET_LAN_IF, reverse
+    dev = ctx.bridge_text[client["vid"] or VID_A]
+    assert forward["in_br"] == dev and forward["out_br"] == "-", forward
+    assert reverse["out_br"] == dev and reverse["in_br"] == "-", reverse
+    # The port is masquerade's to choose, so only the address is asserted.
+    assert forward["new_src"].startswith(ctx.wan_address + ":"), forward
+    tag = "-" if client["vid"] is None else str(client["vid"])
+    assert forward["in_vlan"] == tag and forward["out_vlan"] == "-", forward
+    assert reverse["out_vlan"] == tag and reverse["in_vlan"] == "-", reverse
+
+
+# ---- the profile -----------------------------------------------------------
+
+def _policy():
+    """The shipping offload policy: every eligible forwarded flow, across both
+    physical ports."""
+    return {"version": 1, "enabled": True, "devices": [TARGET_LAN_IF, TARGET_WAN_IF],
+            "scope": [{}], "exclude": []}
+
+
+async def _bridge_lan(ctx, stack):
+    """One VLAN-aware bridge over the one physical LAN port, carrying three
+    VLANs: A untagged on the PVID, B and C tagged.
+
+    `vlan_default_pvid 0` first, so the only PVID anywhere is the one this asks
+    for; the bridge resolves its FDB lookup inside whichever VLAN a frame ends
+    up in, and an unasked-for default of 1 puts frames somewhere nothing else
+    describes.
+    """
+    async def dut(*argv, check=True):
+        return await command(ctx.target, ctx.session, *argv, check=check)
+
+    addresses = json.loads((await dut("ip", "-j", "-4", "addr", "show",
+                                      "dev", TARGET_LAN_IF))["stdout"])[0]
+    original = next(f"{a['local']}/{a['prefixlen']}" for a in addresses["addr_info"]
+                    if a["family"] == "inet")
+    await dut("ip", "link", "del", BRIDGE, check=False)
+    await dut("ip", "link", "add", "name", BRIDGE, "type", "bridge")
+
+    async def _drop_bridge():
+        await dut("ip", "link", "del", BRIDGE, check=False)
+        await dut("ip", "addr", "replace", original, "dev", TARGET_LAN_IF, check=False)
+    stack.push(_drop_bridge)
+
+    await dut("ip", "link", "set", BRIDGE, "type", "bridge", "vlan_filtering", "1",
+              "vlan_default_pvid", "0")
+    await dut("ip", "addr", "del", original, "dev", TARGET_LAN_IF)
+    await dut("ip", "link", "set", TARGET_LAN_IF, "master", BRIDGE)
+    await dut("ip", "link", "set", BRIDGE, "up")
+    await dut("bridge", "vlan", "add", "dev", TARGET_LAN_IF, "vid", str(VID_A),
+              "pvid", "untagged")
+    for vid in (VID_B, VID_C):
+        await dut("bridge", "vlan", "add", "dev", TARGET_LAN_IF, "vid", str(vid))
+    for vid in (VID_A, VID_B, VID_C):
+        await dut("bridge", "vlan", "add", "dev", BRIDGE, "vid", str(vid), "self")
+
+    ctx.bridge_text = {}
+    for vid, address, address6 in ((VID_A, GATEWAY_A, GATEWAY_A6),
+                                   (VID_B, GATEWAY_B, None),
+                                   (VID_C, GATEWAY_C, None)):
+        ctx.bridge_text[vid] = await dut_vlan_subif(
+            stack, ctx.target, ctx.session, parent=BRIDGE, vid=vid,
+            name=f"{BRIDGE}.{vid}", ipv4=f"{address}/24",
+            ipv6=f"{address6}/64" if address6 else None)
+    # The LAN VM keeps whatever address the box handed it, and the IPsec tunnel
+    # below stands on that segment, so the port's original prefix is restated on
+    # the trusted VLAN: the bridge is transparent and the host is still there.
+    await dut("ip", "addr", "add", original, "dev", ctx.bridge_text[VID_A])
+    ctx.lan_original = original
+    ctx.dut_lan_address = original.split("/")[0]
+    ctx.dut_lan_mac = (await read(ctx.target, ctx.session,
+                                  f"/sys/class/net/{TARGET_LAN_IF}/address")).strip()
+
+
+async def _firewall(ctx, cleanup):
+    """The segmentation policy: trusted may reach IoT, IoT may not reach
+    trusted, guest may reach neither, and everything may reach the WAN
+    masqueraded.
+
+    Stated as explicit refusals under an accept policy rather than as a
+    default-drop chain. A default-drop forward chain would also have to
+    enumerate the decrypted IPsec traffic, the tunnel's inner packets and the
+    replicated multicast this profile carries, and the subject of the case is
+    the segmentation decision rather than an exhaustive ruleset -- a rule
+    missing from the enumeration would fail a feature for a reason that has
+    nothing to do with what is being tested.
+
+    Priority matters: this chain runs at the filter hook's own priority, ahead
+    of the offload policy's chain, so a refused packet is dropped before
+    admission is ever offered it. That is what lets a case assert that the
+    refused direction has no row at all rather than a row that never matches.
+    """
+    trusted, iot, guest = (ctx.bridge_text[VID_A], ctx.bridge_text[VID_B],
+                           ctx.bridge_text[VID_C])
+    await command(ctx.target, ctx.session, "nft", "delete", "table", "inet",
+                  FIREWALL_TABLE, check=False)
+    await command(ctx.target, ctx.session, "nft", f'''table inet {FIREWALL_TABLE} {{
+ chain forward {{ type filter hook forward priority filter; policy accept;
+ ct state established,related accept
+ iifname "{iot}" oifname "{trusted}" counter drop
+ iifname "{guest}" oifname {{ "{trusted}", "{iot}" }} counter drop
+ }}
+ chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;
+ oifname "{TARGET_WAN_IF}" ip saddr {{ {SUBNET_A}, {SUBNET_B}, {SUBNET_C} }} masquerade
+ }}
+}}''')
+    cleanup.append((ctx.target, ["nft", "delete", "table", "inet", FIREWALL_TABLE]))
+
+
+async def _firewall_drops(ctx, iif, oif):
+    """What the refusal rule has counted.
+
+    The counter is the only oracle that distinguishes a refused direction from
+    one that had nothing to answer it: a silent echo proves nothing on its own,
+    because an unanswered datagram looks the same whether the firewall dropped
+    it or the far side simply never replied.
+    """
+    listing = await command(ctx.target, ctx.session, "nft", "list", "table", "inet",
+                            FIREWALL_TABLE)
+    for line in listing["stdout"].splitlines():
+        if f'iifname "{iif}"' in line and oif in line:
+            match = re.search(r"counter packets (\d+)", line)
+            assert match, line
+            return int(match.group(1))
+    raise AssertionError(f"no refusal rule for {iif} -> {oif} in "
+                         f"{listing['stdout']!r}")
+
+
+async def _udp_listener(ctx, client, port, label):
+    """A UDP echo in one client's namespace, detached, and a callable that
+    stops it. Detached because the LAN VM's console is a single channel and the
+    traffic that follows has to use it."""
+    path = f"/tmp/ask_profile_home_echo_{label}_{port}.py"
+    script = (f"import socket\n"
+              f"s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+              f"s.bind(({client['ip']!r}, {port}))\n"
+              f"while True:\n"
+              f"    data, peer = s.recvfrom(2048)\n"
+              f"    s.sendto(data, peer)\n")
+    staged = (f"import pathlib, subprocess\n"
+              f"pathlib.Path({path!r}).write_text({script!r})\n"
+              f"subprocess.Popen(['python3', {path!r}], start_new_session=True)\n"
+              "print('LISTENER-UP')\n")
+    started = await _client_python(ctx, client, staged, label=f"{label}_up", timeout=30)
+    assert "LISTENER-UP" in started.stdout, started.stdout
+
+    async def stop_listener():
+        await _client_python(ctx, client,
+                             f"import subprocess\n"
+                             f"subprocess.run(['pkill', '-f', {path!r}])\n",
+                             label=f"{label}_down", timeout=20)
+    return stop_listener
+
+
+async def _reachable(ctx, client, peer, attempts=25):
+    """Prove a path before measuring anything on it. The first packet after a
+    bring-up loses a race with ARP or ND, and the measurement helpers treat one
+    lost datagram as the failure it would otherwise be."""
+    source = _source_address(client, peer)
+    argv = (["ping", "-6"] if ":" in peer else ["ping"]) + \
+        ["-c", "3", "-W", "2", "-I", source, peer]
+    script = (f"import subprocess\n"
+              f"print('rc=%d' % subprocess.run({argv!r}, capture_output=True).returncode)\n")
+    for _ in range(attempts):
+        probe = await _client_python(ctx, client, script,
+                                     label="profile_home_reachable", timeout=30)
+        if "rc=0" in probe.stdout:
+            return
+        await asyncio.sleep(1.0)
+    dut = await command(ctx.target, ctx.session, "ip", "-br", "addr", check=False)
+    route = await command(ctx.target, ctx.session, "ip", "route", "get", peer,
+                          check=False)
+    pytest.fail(f"{client['name']} could not reach {peer} after {attempts} attempts: "
+                f"{probe.stdout!r}\n  DUT addresses: {dut.get('stdout', dut)!r}\n"
+                f"  DUT route:     {route.get('stdout', route)!r}")
+
+
+# ---- IPsec -----------------------------------------------------------------
+#
+# The tunnel runs between the DUT and the LAN VM, both ends ordinary hosts on
+# the trusted segment, and carries a routed inner subnet. Only the DUT is
+# offloaded: the LAN VM is plain software IPsec and has no idea its peer is not,
+# which makes its decryption an independent check on what SEC emitted.
+
+def _ipsec_states(ctx, spi_out, spi_in):
+    outer_local, outer_remote = ctx.dut_lan_address, ctx.lan_outer
+    here = orchestrator_source()
+    return {
+        "out_state": ("src", outer_local, "dst", outer_remote, "proto", "esp",
+                      "spi", hex(spi_out)),
+        "in_state": ("src", outer_remote, "dst", outer_local, "proto", "esp",
+                     "spi", hex(spi_in)),
+        "fwd_sel": ("src", here + "/32", "dst", IPSEC_INNER + "/32"),
+        "rev_sel": ("src", IPSEC_INNER + "/32", "dst", here + "/32"),
+        "fwd_tmpl": ("tmpl", "src", outer_local, "dst", outer_remote, "proto", "esp",
+                     "mode", "tunnel", "reqid", IPSEC_REQID_OUT, "level", "required"),
+        "rev_tmpl": ("tmpl", "src", outer_remote, "dst", outer_local, "proto", "esp",
+                     "mode", "tunnel", "reqid", IPSEC_REQID_IN, "level", "required"),
+    }
+
+
+async def _install_ipsec(ctx, spi_out, spi_in):
+    """Both SAs and all three policies, on both ends.
+
+    The DUT's state and policy are both offloaded, and both have to be:
+    xfrm_state_find() skips a packet-offloaded state whenever the policy that
+    reached it is not offloaded too, so an SA paired with a software policy is
+    never selected and the tunnel carries nothing.
+
+    The forward policy is ordinary IPsec-gateway configuration rather than
+    anything about the offload: a decrypted packet that is *forwarded* is
+    checked against the fwd policy, and a tunnel-mode sec_path with no matching
+    one is rejected outright, so without it the replies never reach the forward
+    chain at all.
+    """
+    s = _ipsec_states(ctx, spi_out, spi_in)
+
+    async def dut(*argv, check=True):
+        return await command(ctx.target, ctx.session, *argv, check=check)
+
+    await ctx.lan_sh("ip xfrm state flush; ip xfrm policy flush", 25)
+    await ctx.lan_sh(f"ip address add {IPSEC_INNER}/32 dev lo 2>/dev/null; true", 20)
+    await ctx.lan_sh("ip xfrm state add " + quoted(
+        *s["out_state"], *crypto(IPSEC_REQID_OUT), "replay-window", "32"), 25)
+    await ctx.lan_sh("ip xfrm state add " + quoted(
+        *s["in_state"], *crypto(IPSEC_REQID_IN), "replay-window", "32"), 25)
+    await ctx.lan_sh("ip xfrm policy add " + quoted(*s["fwd_sel"], "dir", "in",
+                                                    *s["fwd_tmpl"]), 25)
+    await ctx.lan_sh("ip xfrm policy add " + quoted(*s["rev_sel"], "dir", "out",
+                                                    *s["rev_tmpl"]), 25)
+
+    await dut("ip", "xfrm", "policy", "flush")
+    await dut("ip", "xfrm", "state", "flush")
+    await dut("ip", "route", "replace", IPSEC_INNER + "/32", "via", ctx.lan_outer)
+    await dut("ip", "xfrm", "state", "add", *s["out_state"], *crypto(IPSEC_REQID_OUT),
+              "offload", "packet", "dev", TARGET_LAN_IF, "dir", "out")
+    await dut("ip", "xfrm", "state", "add", *s["in_state"], *crypto(IPSEC_REQID_IN),
+              "offload", "packet", "dev", TARGET_LAN_IF, "dir", "in")
+    await dut("ip", "xfrm", "policy", "add", *s["fwd_sel"], "dir", "out",
+              *s["fwd_tmpl"], "offload", "packet", "dev", TARGET_LAN_IF)
+    await dut("ip", "xfrm", "policy", "add", *s["rev_sel"], "dir", "in",
+              *s["rev_tmpl"], "offload", "packet", "dev", TARGET_LAN_IF)
+    await dut("ip", "xfrm", "policy", "add", *s["rev_sel"], "dir", "fwd", *s["rev_tmpl"])
+    # A conntrack entry surviving an earlier scenario carries IPS_OFFLOAD and is
+    # never offered to the flowtable again, so the flow would be judged on that
+    # scenario's decision rather than on this one's.
+    await dut("conntrack", "-F", check=False)
+    ctx.ipsec_spis = (spi_out, spi_in)
+
+
+async def _rekey_ipsec(ctx, spi_out):
+    """Replace the outbound SA in place, the way a rekey does: same selectors,
+    same reqid, a new SPI.
+
+    The policy names its template by reqid rather than by SPI, so the new state
+    is selected without the policy being touched and without conntrack being
+    flushed. That is what makes the case a test of the flow's dependency on the
+    *state* -- flushing conntrack would retire every flow in the profile and the
+    cookies would change for a reason that had nothing to do with the SA.
+
+    The peer learns the new SPI before the DUT starts sending it, and the old
+    state is removed from the peer afterwards: in between, either is decodable,
+    which is the whole point of a rekey.
+    """
+    old_out, old_in = ctx.ipsec_spis
+    fresh = _ipsec_states(ctx, spi_out, old_in)
+    stale = _ipsec_states(ctx, old_out, old_in)
+    await ctx.lan_sh("ip xfrm state add " + quoted(
+        *fresh["out_state"], *crypto(IPSEC_REQID_OUT), "replay-window", "32"), 25)
+    await command(ctx.target, ctx.session, "ip", "xfrm", "state", "delete",
+                  *stale["out_state"])
+    await command(ctx.target, ctx.session, "ip", "xfrm", "state", "add",
+                  *fresh["out_state"], *crypto(IPSEC_REQID_OUT),
+                  "offload", "packet", "dev", TARGET_LAN_IF, "dir", "out")
+    await ctx.lan_sh("ip xfrm state delete " + quoted(*stale["out_state"]), 25)
+    ctx.ipsec_spis = (spi_out, old_in)
+
+
+async def _ipsec_traffic(ctx, count):
+    """Drive the tunnel from the orchestrator and report what SEC did.
+
+    The far end is the LAN VM's inner address, so the traffic is generated here
+    and echoed there. Off the event loop, because the socket blocks and the
+    profile's other endpoints live on that loop.
+    """
+    toenc_before = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx toenc")
+    todec_before = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx todec")
+
+    def _drive():
+        echoed = 0
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(1)
+        try:
+            for _ in range(count):
+                sock.sendto(b"y" * IPSEC_PAYLOAD, (IPSEC_INNER, PORT_IPSEC))
+                try:
+                    sock.recv(2048)
+                    echoed += 1
+                except OSError:
+                    pass
+                time.sleep(0.02)
+        finally:
+            sock.close()
+        return echoed
+
+    echoed = await asyncio.to_thread(_drive)
+    toenc = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx toenc")
+    todec = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx todec")
+    rows = (await ctx.state())["flows"]
+    return {"echoed": echoed, "toenc": toenc - toenc_before,
+            "todec": todec - todec_before,
+            "forward": [r for r in rows if r.get("out") == TARGET_LAN_IF
+                        and r.get("sa") != "0"],
+            "reverse": [r for r in rows if r.get("out") == TARGET_WAN_IF
+                        and r.get("in_sa") != "0"]}
+
+
+def _assert_ipsec(report, count):
+    """The asymmetry is the subject. An arriving ESP frame's 5-tuple is the
+    tunnel's, so it cannot match a flow entry at all: the inbound SA's own
+    classifier entry steers it to SEC on the SPI, and what SEC hands back
+    re-enters classification on the offline port rather than on the physical
+    one. An entry keyed on the physical port is therefore installed, counted and
+    never matched, which is why the reverse direction's own packet counter is
+    the oracle rather than the echo."""
+    assert report["echoed"] >= count - 2, report
+    assert report["forward"], (
+        "the encrypted direction was not offloaded, so nothing was offered to "
+        f"the driver for this flow at all: {report}")
+    assert report["reverse"], (
+        "the decrypted direction names no inbound SA, so its entry was keyed on "
+        f"the physical port and cannot match a frame SEC re-classifies: {report}")
+    assert int(report["reverse"][0]["packets"]) >= count - IPSEC_SETUP, report
+    assert int(report["forward"][0]["packets"]) >= count - IPSEC_SETUP, report
+    # A handful, not `count`: the frames that travelled before the entries
+    # existed. On the slow path this counter tracks the transfer one for one.
+    assert report["toenc"] <= IPSEC_SETUP, (
+        f"{report['toenc']} frames reached SEC through the software path; the "
+        f"classifier should have steered all but the first")
+    # Zero, not one: inbound steering is on the SPI and needs no first packet
+    # through the stack, because the SA's own entry exists before any arrives.
+    assert report["todec"] == 0, (
+        f"{report['todec']} ESP frames were decrypted from the software path")
+
+
+# ---- routed multicast ------------------------------------------------------
+
+async def _smcroute(ctx, *oifs):
+    """The one place this file speaks to smcroute.
+
+    The routed learner reads ipmr's MFC, and the MFC has no /proc or netlink
+    write surface a test could use: an entry is installed by a process holding
+    an MRT_INIT socket and by nothing else, so the consumer *is* the control
+    plane. Keeping the whole invocation here is what lets it be aligned with
+    whatever the learner settles on without touching a case.
+
+    The daemon is started once, with `-N` and a generated config naming exactly
+    the interfaces this profile routes between. The default enables every
+    multicast-capable interface it can find, and a VIF set that depends on what
+    else the image happened to bring up is not a fixture -- a stray VIF shifts
+    the index every threshold in the MFC is expressed against. Both outbound
+    VLANs are named from the start even though the first route uses one, because
+    smcroute matches a phyint by name at startup and a device that had no VIF
+    then cannot be added to a route later.
+
+    `remove` before `add` because re-adding an existing (iif, source, group)
+    changes nothing: adding an outbound interface means restating the route with
+    the whole list, which is the MFC's replication list changing under a live
+    daemon rather than at install. With no outbound interfaces the route goes
+    and the daemon with it, which is what teardown wants.
+    """
+    source, group = orchestrator_source(), GROUP
+    if not oifs:
+        # Teardown, and the one caller that must not raise: `check=False` only
+        # skips the rc assertion, while a binary the image does not have comes
+        # back as HTTP 501 and aiohttp raises that. On an image without
+        # smcroute this is reached from the fixture's finally, where an
+        # exception would skip every remaining undo and leave the LAN port
+        # enslaved with no address.
+        if getattr(ctx, "smcrouted", False):
+            for argv in (["smcroutectl", "remove", TARGET_WAN_IF, source, group],
+                         ["killall", "smcrouted"]):
+                try:
+                    await command(ctx.target, ctx.session, *argv, check=False)
+                except aiohttp.ClientResponseError:
+                    pass
+            ctx.smcrouted = False
+            await asyncio.sleep(1.0)
+        return
+    if not getattr(ctx, "smcrouted", False):
+        phyints = [TARGET_WAN_IF, ctx.bridge_text[VID_A], ctx.bridge_text[VID_B]]
+        written = await ctx.target.fs_write(
+            ctx.session, SMCROUTE_CONF,
+            "".join(f"phyint {name} enable\n" for name in phyints))
+        assert written["errno"] == 0, written
+        result = await command(ctx.target, ctx.session, "smcrouted", "-N",
+                               "-f", SMCROUTE_CONF, "-l", "notice", check=False)
+        assert result["rc"] == 0, result
+        ctx.smcrouted = True
+        # MRT_INIT, the VIF adds and the registration dump all happen inside the
+        # daemon's first second; the adapter's own worker follows them.
+        await asyncio.sleep(2.0)
+    await command(ctx.target, ctx.session, "smcroutectl", "remove", TARGET_WAN_IF,
+                  source, group, check=False)
+    result = await command(ctx.target, ctx.session, "smcroutectl", "add",
+                           TARGET_WAN_IF, source, group, *oifs, check=False)
+    assert result["rc"] == 0, (oifs, result)
+
+
+async def _mroute_row(ctx):
+    for row in (await ctx.state())["mroute"]:
+        if row["group"] == GROUP and row["src"] == orchestrator_source():
+            return row
+    return None
+
+
+def _inject_stream(seconds, pps, port):
+    """Put the multicast stream on the WAN wire from the orchestrator.
+
+    A layer-2 send with an explicit interface, because a multicast destination
+    has no host route and a layer-3 send would leave by whichever interface the
+    kernel likes. The source is pinned because the classifier key is an exact
+    (S,G) and so is the MFC entry: a source scapy chose for itself would match
+    neither.
+    """
+    from scapy.all import IP, UDP, Ether, Raw, sendp
+
+    octets = [int(b) for b in GROUP.split(".")]
+    mac = "01:00:5e:%02x:%02x:%02x" % (octets[1] & 0x7F, octets[2], octets[3])
+    frame = (Ether(dst=mac)
+             / IP(src=orchestrator_source(), dst=GROUP, ttl=STREAM_TTL)
+             / UDP(sport=port, dport=port) / Raw(b"x" * 512))
+    sendp(frame, iface=INJECT_IF, count=int(seconds * pps), inter=1.0 / pps,
+          verbose=False)
+
+
+def _listener_script(client, seconds, port, result):
+    """Count the replicas and read their headers back.
+
+    A raw socket rather than a UDP one, and promiscuous, because a routed
+    replica is not the frame the source sent: the hardware rebuilt its Ethernet
+    header with the egress port's own address and decremented the TTL, and those
+    two fields are the difference between a replica the classifier made and a
+    frame the bridge flooded. Nothing joins the group here -- routed multicast is
+    static, and a membership would let a snooping path deliver frames that say
+    nothing about the MFC.
+
+    The tag is not read off the frame, and cannot be: a VLAN device is handed
+    its frames with the tag already taken off, so a capture on either client
+    sees an untagged one. Which device received the copy is the assertion
+    instead -- a VLAN device receives nothing that did not carry its tag, and a
+    macvlan receives nothing that carried any.
+
+    It writes its answer to a file rather than printing it, because it is
+    started detached: see _spawn_listener.
+    """
+    return f"""
+import json, socket, struct, time
+raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+raw.bind(({client['iface']!r}, 0))
+raw.setsockopt(263, 1, struct.pack('IHH8s',
+               socket.if_nametoindex({client['iface']!r}), 1, 0, b''))
+raw.settimeout(0.2)
+group = socket.inet_aton({GROUP!r})
+seen, samples = 0, []
+deadline = time.monotonic() + {seconds}
+while time.monotonic() < deadline:
+    try:
+        frame = raw.recv(2048)
+    except TimeoutError:
+        continue
+    offset = 14
+    if frame[12:14] == b'\\x81\\x00':
+        offset = 18
+    if frame[offset - 2:offset] != b'\\x08\\x00':
+        continue
+    if frame[offset + 16:offset + 20] != group:
+        continue
+    header = offset + (frame[offset] & 15) * 4
+    # The port as well as the group: two streams to one group would otherwise
+    # be counted as one, and the case that adds an outbound interface is
+    # exactly where that would go unnoticed.
+    if struct.unpack('!H', frame[header + 2:header + 4])[0] != {port}:
+        continue
+    seen += 1
+    if len(samples) < 4:
+        samples.append({{'src_mac': frame[6:12].hex(':'),
+                        'dst_mac': frame[0:6].hex(':'),
+                        'ttl': frame[offset + 8]}})
+raw.close()
+with open({result!r}, 'w') as out:
+    out.write(json.dumps({{'received': seen, 'samples': samples}}))
+"""
+
+
+async def _spawn_listener(ctx, client, seconds, result):
+    """Start one client's counter detached, and return as soon as it is up.
+
+    Several clients have to be listening at once, and the LAN VM's console is a
+    single channel: `lan_run_python` stages its script with a *blocking*
+    `Console.run` and every run holds the port's lock for its whole duration,
+    so two of them launched as concurrent tasks serialise -- the first listener
+    has already exited by the time the second is staged, and the second's
+    staging blocks the event loop meanwhile. The listeners are therefore
+    started one round-trip at a time, in the background, and read back
+    afterwards; the pattern is test_mcast_replication.py's.
+    """
+    path = f"/tmp/ask_profile_home_listen_{client['name']}.py"
+    staged = (f"import pathlib, subprocess\n"
+              f"pathlib.Path({path!r}).write_text("
+              f"{_listener_script(client, seconds, PORT_MCAST, result)!r})\n"
+              f"pathlib.Path({result!r}).unlink(missing_ok=True)\n"
+              f"subprocess.Popen(['python3', {path!r}], start_new_session=True)\n"
+              "print('LISTENER-UP')\n")
+    started = await _client_python(ctx, client, staged,
+                                   label=f"profile_home_listen_{client['name']}",
+                                   timeout=30)
+    assert "LISTENER-UP" in started.stdout, started.stdout
+
+
+async def _collect_listener(ctx, client, result, timeout=30):
+    """What one detached counter wrote, once it has finished writing it.
+
+    The namespaces share a filesystem -- a network namespace is only the
+    network -- so this reads from the LAN VM's ordinary shell rather than
+    needing to re-enter the client's.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        probe = await lan_run(ctx.lan, f"cat {result} 2>/dev/null; echo", 20)
+        body = probe.stdout
+        start, end = body.find("{"), body.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(body[start:end + 1])
+        assert asyncio.get_running_loop().time() < deadline, (
+            f"{client['name']}'s multicast counter never wrote {result}: "
+            f"{probe.stdout!r}")
+        await asyncio.sleep(1.0)
+
+
+async def _watch_routed(ctx, clients, seconds, label):
+    """Run the stream and answer with what every listener saw and what the CPU
+    did not see.
+
+    The listeners are started first and left running, and the software receive
+    counter is sampled across the injection, because the discriminating oracle
+    is the one measured while the frames are in flight. Their window is longer
+    than the stream by the time it takes to start them all plus the settling
+    pause, so every one of them is counting before the first frame.
+    """
+    results = {client["name"]: f"/tmp/ask_{label}_{client['name']}.json"
+               for client in clients}
+    window = seconds + 6.0 + 2.0 * len(clients)
+    for client in clients:
+        await _spawn_listener(ctx, client, window, results[client["name"]])
+    await asyncio.sleep(2.0)
+    before = await kernel_rx_packets(ctx.target, ctx.session, TARGET_WAN_IF)
+    await asyncio.to_thread(_inject_stream, seconds, STREAM_PPS, PORT_MCAST)
+    cpu = await kernel_rx_packets(ctx.target, ctx.session, TARGET_WAN_IF) - before
+    observed = {"sent": int(seconds * STREAM_PPS), "cpu": cpu, "clients": {},
+                "mroute": await _mroute_row(ctx)}
+    for client in clients:
+        observed["clients"][client["name"]] = await _collect_listener(
+            ctx, client, results[client["name"]], timeout=window + 30)
+    return observed
+
+
+# ---- the fixture -----------------------------------------------------------
+
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def homelab(target_agent, lan):
+    """The whole homelab profile, built once for the file.
+
+    Module-scoped deliberately: the build is a bridge that takes the LAN port,
+    three namespaced clients, a firewall, two tunnels and a multicast routing
+    daemon, and the lifecycle cases are only meaningful against a profile that
+    has been carrying traffic rather than one built a moment ago.
+
+    Its own aiohttp session, because conftest's is function-scoped and bound to
+    the per-test loop. The LAN console is the session-scoped shared one.
+
+    Two orderings matter. Every device the profile stands on exists before the
+    offload policy is applied, because adding an upper to a bound port is a
+    configuration change the adapter answers with full invalidation. And the
+    DUT's default route is pointed at the orchestrator before anything measures
+    a WAN flow, because every WAN case here talks to an address that is
+    deliberately off the WAN segment -- which is what gives the default-route
+    lifecycle case something to move.
+    """
+    async with aiohttp.ClientSession() as session:
+        ctx = Profile()
+        ctx.target, ctx.session, ctx.lan = target_agent, session, lan
+        ctx.wan = Agent("wan", f"http://{ORCH_IPV4}:9110")
+        ctx.sequence, ctx.recovery_console, ctx.proto = 1, None, "udp"
+        ctx.echoes = {}
+        ctx.ipsec_spis = None
+        ctx.smcrouted = False
+
+        async def lan_sh(cmd, timeout=20):
+            return await lan_run(ctx.lan, cmd, timeout)
+        ctx.lan_sh = lan_sh
+
+        stack = TopologyStack()
+        cleanup, endpoints = [], []
+        console = Console.target(log_path=str(ARTIFACTS / "profile-home-uart.log"))
+        try:
+            initial = await ctx.state()
+            assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
+            ctx.baseline_errors = initial["errors"]
+            await asyncio.to_thread(console.login, "root", None)
+            ctx.console = console
+            # This profile owns the policy, so the boot daemon's catch-all is
+            # stopped first and reapplied from here; the init script drains the
+            # hardware to an unbound state.
+            await console_command(console, "/etc/init.d/ask-flowtable", "stop",
+                                  check=False, timeout=45)
+            # A known starting point, and the first thing that would be wrong if
+            # the boot daemon had not let go: everything this file measures is a
+            # delta against an unbound adapter.
+            drained = await ctx.wait(lambda s: not s["bindings"] and not s["entries"],
+                                     timeout=30)
+            assert drained["invalidated"] == drained["fatal"] == 0, drained
+            printk = (await read(ctx.target, ctx.session,
+                                 "/proc/sys/kernel/printk")).split()
+            await command(ctx.target, ctx.session, "sysctl", "-w",
+                          "kernel.printk=1 4 1 7")
+            # Restored by hand at the end of teardown rather than from the
+            # cleanup list: console calls come after that list, and a printk
+            # landing mid-marker is what breaks them.
+            ctx.printk = " ".join(printk[:4])
+            await command(ctx.target, ctx.session, "modprobe", "xt_tcpudp")
+            old_acct = (await read(ctx.target, ctx.session,
+                                   "/proc/sys/net/netfilter/nf_conntrack_acct")).strip()
+            await command(ctx.target, ctx.session, "sysctl", "-w",
+                          "net.netfilter.nf_conntrack_acct=1")
+            cleanup.append((ctx.target, ["sysctl", "-w",
+                                         f"net.netfilter.nf_conntrack_acct={old_acct}"]))
+            for key in ("net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"):
+                previous = (await command(ctx.target, ctx.session, "sysctl", "-n",
+                                          key))["stdout"].strip()
+                cleanup.append((ctx.target, ["sysctl", "-w", f"{key}={previous}"]))
+                await command(ctx.target, ctx.session, "sysctl", "-w", f"{key}=1")
+
+            # ---- the WAN: static v4 and v6, no session ----
+            addresses = json.loads((await command(ctx.target, ctx.session, "ip", "-j",
+                                                  "-4", "addr", "show",
+                                                  "dev", TARGET_WAN_IF))["stdout"])[0]
+            ctx.wan_address = next(a["local"] for a in addresses["addr_info"]
+                                   if a["family"] == "inet")
+            ctx.dut_wan_mac = (await read(ctx.target, ctx.session,
+                                          f"/sys/class/net/{TARGET_WAN_IF}/address")).strip()
+            orch = json.loads((await command(ctx.wan, ctx.session, "ip", "-j", "-4",
+                                             "addr"))["stdout"])
+            ctx.wan_if = next(i["ifname"] for i in orch
+                              if any(a.get("local") == orchestrator_source()
+                                     for a in i["addr_info"]))
+            ctx.wan_mac = json.loads((await command(
+                ctx.wan, ctx.session, "ip", "-j", "link", "show",
+                "dev", ctx.wan_if))["stdout"])[0]["address"]
+            # The image's own v6 address on the WAN port, restated rather than
+            # assumed, and its counterpart on the orchestrator. Both nodad: DAD
+            # leaves a static address tentative for about a second and a half
+            # and the first flow silently fails to come up.
+            await command(ctx.target, ctx.session, "ip", "-6", "addr", "add",
+                          f"{DUT_IPV6_WAN}/64", "dev", TARGET_WAN_IF, "nodad",
+                          check=False)
+            await command(ctx.wan, ctx.session, "ip", "-6", "addr", "add",
+                          f"{WAN_IPV6}/64", "dev", ctx.wan_if, "nodad", check=False)
+            cleanup.append((ctx.wan, ["ip", "-6", "addr", "del", f"{WAN_IPV6}/64",
+                                      "dev", ctx.wan_if]))
+
+            # The off-segment address every WAN case talks to, and the default
+            # route that reaches it. The image's own default is saved first: it
+            # is what the lifecycle case moves back to.
+            routes = json.loads((await command(ctx.target, ctx.session, "ip", "-j",
+                                               "route", "show", "default"))["stdout"])
+            ctx.first_gateway = next(
+                (r["gateway"] for r in routes if r.get("dev") == TARGET_WAN_IF), None)
+            assert ctx.first_gateway, ("the WAN port has no default route to move",
+                                       routes)
+            ctx.second_gateway = orchestrator_source()
+            await command(ctx.wan, ctx.session, "ip", "addr", "add",
+                          f"{INTERNET}/32", "dev", "lo", check=False)
+            cleanup.append((ctx.wan, ["ip", "addr", "del", f"{INTERNET}/32",
+                                      "dev", "lo"]))
+            cleanup.append((ctx.target, ["ip", "route", "replace", "default", "via",
+                                         ctx.first_gateway, "dev", TARGET_WAN_IF]))
+            await command(ctx.target, ctx.session, "ip", "route", "replace", "default",
+                          "via", ctx.second_gateway, "dev", TARGET_WAN_IF)
+
+            # ---- the LAN: one bridge, three VLANs, three clients ----
+            await _bridge_lan(ctx, stack)
+            await _build_clients(ctx)
+            stack.push(lambda: _drop_clients(ctx))
+            # Pinned in both families, so admission never races ARP or ND: a
+            # direction offered before its neighbour resolves is declined, and
+            # nothing re-offers it until the next packet.
+            for client in CLIENTS:
+                dev = ctx.bridge_text[client["vid"] or VID_A]
+                await command(ctx.target, ctx.session, "ip", "neigh", "replace",
+                              client["ip"], "lladdr", client["mac"], "nud",
+                              "permanent", "dev", dev)
+                cleanup.append((ctx.target, ["ip", "neigh", "del", client["ip"],
+                                             "dev", dev]))
+                if client["ip6"]:
+                    await command(ctx.target, ctx.session, "ip", "-6", "neigh",
+                                  "replace", client["ip6"], "lladdr", client["mac"],
+                                  "nud", "permanent", "dev", dev)
+                    cleanup.append((ctx.target, ["ip", "-6", "neigh", "del",
+                                                 client["ip6"], "dev", dev]))
+            # The way back to each client subnet, for the policer's blast and
+            # for anything the orchestrator initiates.
+            for subnet in (SUBNET_A, SUBNET_B, SUBNET_C):
+                await command(ctx.wan, ctx.session, "ip", "route", "replace", subnet,
+                              "via", ctx.wan_address, "dev", ctx.wan_if)
+                cleanup.append((ctx.wan, ["ip", "route", "del", subnet,
+                                          "dev", ctx.wan_if]))
+            await _firewall(ctx, cleanup)
+
+            # The LAN VM's own address on the trusted segment: the outer
+            # endpoint of the IPsec tunnel, and discovered rather than assumed
+            # because the segment's addressing belongs to the bench.
+            show = await lan_run(ctx.lan, f"ip -o -4 addr show dev {LAN_NIC}", 20)
+            ctx.lan_outer = next(field.split("/")[0] for field in show.stdout.split()
+                                 if field.count(".") == 3 and "/" in field)
+            await command(ctx.wan, ctx.session, "ip", "route", "replace",
+                          f"{IPSEC_INNER}/32", "via", ctx.wan_address,
+                          "dev", ctx.wan_if)
+            cleanup.append((ctx.wan, ["ip", "route", "del", f"{IPSEC_INNER}/32",
+                                      "dev", ctx.wan_if]))
+
+            # ---- the 6o4 tunnel, which is where VLAN A's IPv6 comes from ----
+            ctx.shape = Shape("6o4", PORT_V6, PORT_V6)
+            # A device name of this profile's own, so a leaked one from the
+            # tunnel file cannot be mistaken for it.
+            ctx.shape.device = TUNNEL_DEVICE
+            # Shape takes the outer endpoints from ASK_TARGET_IP and ASK_WAN_IP
+            # while everything else here reads them off the interfaces. A stale
+            # override makes the tunnel come up against an address nobody holds,
+            # which surfaces three steps later as an unreachable peer.
+            assert ctx.shape.outer[0] == ctx.wan_address, (
+                "ASK_TARGET_IP does not name the address on the DUT's WAN port",
+                ctx.shape.outer, ctx.wan_address)
+            assert ctx.shape.outer[1] == orchestrator_source(), (
+                "ASK_WAN_IP and ASK_WAN_IPERF_IP name different orchestrator "
+                "addresses; the tunnel would be built against one and measured "
+                "against the other", ctx.shape.outer, orchestrator_source())
+            ctx.lan_address = CLIENT_A6
+            await _outer_segment(ctx, cleanup)
+            await _dut_tunnel(ctx, cleanup)
+            await _orchestrator_tunnel(ctx, cleanup)
+
+            loop = asyncio.get_running_loop()
+            # No endpoint on the throughput port: that case starts a real
+            # iperf3 server on the same address, and an echo alongside it would
+            # be a second thing bound to one number for no reason.
+            for port in (PORT_A, PORT_B, PORT_C):
+                transport, echo = await loop.create_datagram_endpoint(
+                    _Echo, local_addr=(INTERNET, port))
+                endpoints.append(transport)
+                ctx.echoes[port] = echo
+            transport, echo = await loop.create_datagram_endpoint(
+                _Echo, local_addr=(ctx.shape.inner_orch, PORT_V6),
+                family=socket.AF_INET6)
+            endpoints.append(transport)
+            ctx.echoes[PORT_V6] = echo
+
+            await _reachable(ctx, BY_NAME["a"], INTERNET)
+            await _reachable(ctx, BY_NAME["b"], INTERNET)
+            await _reachable(ctx, BY_NAME["c"], INTERNET)
+            await _reachable(ctx, BY_NAME["a"], ctx.shape.inner_orch)
+
+            # ---- the offload policy, last: every device it binds exists ----
+            await apply(console, _policy(), r=ctx)
+            await ctx.wait(lambda s: s["bindings"] == 2)
+            ctx.record("home-fixture", {
+                "wan": ctx.wan_address, "internet": INTERNET,
+                "gateways": [ctx.first_gateway, ctx.second_gateway],
+                "bridge": ctx.bridge_text, "lan_outer": ctx.lan_outer,
+                "tunnel": _tunnel_text(ctx.shape), "clients": CLIENTS,
+                "initial": initial})
+            yield ctx
+        finally:
+            for transport in endpoints:
+                transport.close()
+            failures = []
+
+            async def undo(step, label):
+                """Every undo runs, whatever the one before it did.
+
+                A teardown step that raises takes the whole rest of the cleanup
+                with it, and the steps that matter most -- the bridge giving the
+                LAN port its address back -- are at the end. `check=False` is
+                not enough on its own: the agent answers 501 for a binary the
+                image does not have and aiohttp raises that, and a console call
+                after a failed login raises on its output marker before it ever
+                looks at `check`.
+                """
+                try:
+                    await step()
+                except Exception as error:
+                    failures.append(f"{label}: {error}")
+
+            async def target(*argv):
+                await command(ctx.target, ctx.session, *argv, check=False)
+
+            await undo(lambda: stop(console), "ask-flowtable stop")
+            # Belt and braces: the multicast case stops its own daemon, and a
+            # case that failed part-way through may not have.
+            await undo(lambda: _smcroute(ctx), "smcroute")
+            await undo(lambda: console_command(console, "tc", "qdisc", "del", "dev",
+                                               TARGET_WAN_IF, "clsact", check=False,
+                                               timeout=30), "clsact")
+            await undo(lambda: target("ip", "xfrm", "policy", "flush"), "xfrm policy")
+            await undo(lambda: target("ip", "xfrm", "state", "flush"), "xfrm state")
+            await undo(lambda: target("ip", "route", "del", f"{IPSEC_INNER}/32"),
+                       "inner route")
+            await undo(lambda: lan_run(ctx.lan,
+                                       "ip xfrm state flush; ip xfrm policy flush; "
+                                       f"ip address del {IPSEC_INNER}/32 dev lo "
+                                       "2>/dev/null; true", 30), "lan xfrm")
+            await undo(lambda: target("conntrack", "-F"), "conntrack")
+            for agent, argv in reversed(cleanup):
+                await undo(lambda a=agent, v=argv: command(a, ctx.session, *v,
+                                                           check=False), " ".join(argv))
+            await undo(lambda: stack.teardown("profile-homelab"), "topology")
+            try:
+                await undo(lambda: console_command(console, "rm", "-f", CONFIG,
+                                                   check=False), "config")
+                # Last, because everything above drives the console.
+                if getattr(ctx, "printk", None):
+                    await undo(lambda: target("sysctl", "-w",
+                                              f"kernel.printk={ctx.printk}"), "printk")
+            finally:
+                console.close()
+            assert not failures, failures
+
+
+class _Echo(asyncio.DatagramProtocol):
+    """Echoes every datagram back and records where it came from: under
+    masquerade that is the translated endpoint, which is the wire-level proof of
+    the rewrite."""
+
+    def __init__(self):
+        self.packets = 0
+        self.sources = set()
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        self.packets += 1
+        self.sources.add((addr[0], addr[1]))
+        self.transport.sendto(data, addr)
+
+
+# ---- traffic ---------------------------------------------------------------
+
+async def test_profile_homelab_trusted_vlan_reaches_the_wan(homelab, splat_window):
+    """The ordinary case: untagged on the wire, bridged, masqueraded, routed out
+    of the WAN port through the default route.
+
+    A VLAN device is in the path and the wire carries no tag, because the port
+    is untagged for the PVID -- the configuration OpenWrt ships and the one a
+    derivation that stopped at the netdevs would push a tag for.
+    """
+    ctx = homelab
+    client = BY_NAME["a"]
+    forward, reverse = await _accounted(ctx, client, peer=INTERNET, dport=PORT_A,
+                                        sport=PORT_A, label="trusted")
+    _assert_wan(ctx, forward, reverse, client=client)
+    # What the far endpoint observed, which is the only evidence the rewrite
+    # reached the wire rather than only the rule.
+    assert {address for address, _port in ctx.echoes[PORT_A].sources} == \
+        {ctx.wan_address}, ctx.echoes[PORT_A].sources
+
+
+async def test_profile_homelab_tagged_vlans_reach_the_wan(homelab, splat_window):
+    """The IoT and guest VLANs, which differ from the trusted one in one bridge
+    membership each and must differ on the wire in exactly one tag each.
+
+    Same bridge, same port, same uplink. Running both in one case is deliberate:
+    two tagged VLANs on one port share a bridge FDB and a classifier, and a
+    derivation that keyed on the port rather than on the VLAN would forward both
+    into whichever was admitted first.
+    """
+    ctx = homelab
+    for name, port in (("b", PORT_B), ("c", PORT_C)):
+        client = BY_NAME[name]
+        forward, reverse = await _accounted(ctx, client, peer=INTERNET, dport=port,
+                                            sport=port, label=f"tagged-{name}")
+        _assert_wan(ctx, forward, reverse, client=client)
+        assert forward["in_br"] == ctx.bridge_text[client["vid"]], forward
+
+
+async def test_profile_homelab_inter_vlan_is_a_hairpin(homelab, splat_window):
+    """Trusted to IoT: across two VLANs, and on this bench in and out of one
+    physical port.
+
+    The product does not deploy that way. A gateway with five ports puts two
+    VLANs on two ports and the path is the ordinary two-port one; carrying
+    every VLAN on a single trunk is a shape this product is not built for. The
+    bench has one LAN port with carrier, so inter-VLAN routing here is
+    necessarily a hairpin, and the case is written that way because it is the
+    only way this rig can exercise VLAN-to-VLAN routing at all.
+
+    What it does exercise is real and is the most to get wrong at once. The
+    frame arrives untagged on the port, the bridge puts it in the trusted VLAN,
+    the DUT routes it into the IoT VLAN, and it leaves with a tag on. The
+    bridge is on both sides of it, so a derivation that named the bridge once
+    would lose half of it, and the tag is pushed on egress only.
+
+    The other half of the policy is asserted here too: the IoT VLAN may not
+    open a connection back. That needs a listener on the far side and the
+    firewall's own counter, because an unanswered datagram looks identical
+    whether the rule dropped it or nothing was bound to the port -- an
+    assertion on the echo alone could never fail. With a listener running and
+    the drop counter moving by the burst, the refusal is the thing measured.
+    """
+    ctx = homelab
+    trusted, iot = BY_NAME["a"], BY_NAME["b"]
+    # Each client answers on one port, so each direction has something to talk
+    # to: the hairpin is allowed and must be echoed, the reverse is refused and
+    # must not be, and both have a live peer.
+    stop_iot = await _udp_listener(ctx, iot, PORT_HAIRPIN, "profile_home_hairpin")
+    stop_trusted = await _udp_listener(ctx, trusted, PORT_REFUSED,
+                                       "profile_home_refused")
+    try:
+        await asyncio.sleep(1.0)
+        forward, reverse = await _accounted(ctx, trusted, peer=iot["ip"],
+                                            dport=PORT_HAIRPIN, sport=PORT_HAIRPIN,
+                                            label="hairpin")
+        # One port, both ways, and the tag only on the side that carries it.
+        assert forward["in"] == forward["out"] == TARGET_LAN_IF, forward
+        assert reverse["in"] == reverse["out"] == TARGET_LAN_IF, reverse
+        assert forward["in_br"] == ctx.bridge_text[VID_A], forward
+        assert forward["out_br"] == ctx.bridge_text[VID_B], forward
+        assert forward["in_vlan"] == "-" and forward["out_vlan"] == str(VID_B), forward
+        assert reverse["in_vlan"] == str(VID_B) and reverse["out_vlan"] == "-", reverse
+        # Not translated: masquerade is scoped to the WAN port, and an
+        # inter-VLAN flow that picked it up would hide the client from its peer.
+        assert forward["new_src"] == forward["src"], forward
+
+        # And the direction the firewall refuses. A fresh port, so this is a new
+        # connection rather than the reply to the one above, and a listener is
+        # bound on the far side so silence can only mean the rule.
+        before = await ctx.state()
+        drops_before = await _firewall_drops(ctx, ctx.bridge_text[VID_B],
+                                             ctx.bridge_text[VID_A])
+        refused = await _exchange(ctx, iot, peer=trusted["ip"], dport=PORT_REFUSED,
+                                  sport=PORT_REFUSED, count=8, label="refused",
+                                  tolerate_loss=True)
+        drops = await _firewall_drops(ctx, ctx.bridge_text[VID_B],
+                                      ctx.bridge_text[VID_A]) - drops_before
+        after = await ctx.state()
+        assert refused["echoed"] == 0, refused
+        assert drops >= 8, (drops, refused)
+        assert not [f for f in after["flows"]
+                    if f["src"] == f"{iot['ip']}:{PORT_REFUSED}"], after
+        assert after["installs"] == before["installs"], (before, after)
+        ctx.record("home-hairpin", {"forward": forward, "reverse": reverse,
+                                    "refused": refused, "drops": drops})
+    finally:
+        await stop_trusted()
+        await stop_iot()
+
+
+async def test_profile_homelab_ipsec_carries_both_directions(homelab, splat_window):
+    """A packet-offload tunnel to a host on the LAN, both directions in
+    hardware.
+
+    Inbound is not the mirror of outbound and the asymmetry is the whole
+    subject: an arriving ESP frame's 5-tuple is the tunnel's, so it cannot match
+    a flow entry, and what SEC hands back re-enters classification on the
+    offline port. The reverse direction's own packet counter is therefore the
+    oracle -- it read zero for whole transfers while the echo still worked.
+    """
+    ctx = homelab
+    spi_out = 0x0A980000 | (secrets.randbelow(0xFFFF) + 1)
+    await _install_ipsec(ctx, spi_out, spi_out ^ 0x8000)
+    await _start_ipsec_echo(ctx)
+    report = await _ipsec_traffic(ctx, 60)
+    ctx.record("home-ipsec", report)
+    _assert_ipsec(report, 60)
+
+
+async def test_profile_homelab_tunnel_gives_the_trusted_vlan_ipv6(homelab,
+                                                                  splat_window):
+    """6o4 to a broker on the WAN side, which is where VLAN A's IPv6 comes from.
+
+    The forward direction inserts the outer IPv4 header and the reverse strips
+    it, so the adapter names the tunnel on exactly those two and on neither LAN
+    half -- while both still name the physical ports, because a tunnel device
+    never becomes one. The LAN side of the same connection is bridged and
+    untagged, which is the combination this profile adds over the tunnel file's.
+    """
+    ctx = homelab
+    client = BY_NAME["a"]
+    forward, reverse = await _accounted(ctx, client, peer=ctx.shape.inner_orch,
+                                        dport=PORT_V6, sport=PORT_V6, label="tunnel6")
+    expected = _tunnel_text(ctx.shape)
+    assert forward["out_tnl"] == expected and forward["in_tnl"] == "-", forward
+    assert reverse["in_tnl"] == expected and reverse["out_tnl"] == "-", reverse
+    assert forward["in"] == TARGET_LAN_IF and forward["out"] == TARGET_WAN_IF, forward
+    assert reverse["in"] == TARGET_WAN_IF and reverse["out"] == TARGET_LAN_IF, reverse
+    assert forward["family"] == reverse["family"] == "6", (forward, reverse)
+    assert forward["in_br"] == ctx.bridge_text[VID_A], forward
+    # The forward direction leaves by the tunnel, so it carries the tunnel's
+    # MTU: 1500 less the outer IPv4 header, and nothing here computed that.
+    assert int(forward["mtu"]) == ctx.shape.mtu, forward
+
+
+async def test_profile_homelab_routed_multicast_replicates(homelab, splat_window):
+    """A stream routed from the WAN port into two VLANs on the LAN port.
+
+    The routed learner reads ipmr's MFC, where every fact the bridged learner
+    has to recover from traffic is already stated: mfc_origin and mfc_mcastgrp
+    are an exact (S,G), mfc_parent names the ingress, and ttls[] is the
+    replication list. So there is nothing to learn and nothing pending -- an
+    entry either installs or is refused, and the row says which.
+
+    Four oracles. `ip mroute show` reports offload, which is the kernel's own
+    view of what a driver claimed. The adapter's row says `installed`, which is
+    the classifier holding the key. The DUT's software receive counter says the
+    stream never reached the CPU. And the replicas themselves carry the egress
+    port's MAC and one less TTL than was sent, which is the routing the hardware
+    did on the way through -- a flooded frame would carry the source's own
+    header untouched.
+
+    Then a second outbound interface is added and both VLANs receive, which is
+    the replication list changing under a live entry rather than at install.
+    """
+    ctx = homelab
+    trusted, iot = BY_NAME["a"], BY_NAME["b"]
+    try:
+        # The agent answers 501 for a binary it does not have, and aiohttp
+        # raises that rather than returning it, so the absence is caught rather
+        # than read.
+        try:
+            await _smcroute(ctx, ctx.bridge_text[VID_A])
+        except aiohttp.ClientResponseError as error:
+            if error.status != 501:
+                raise
+            pytest.skip("smcroute is not in the DUT image; add `smcroute` to "
+                        "IMAGE_INSTALL")
+        # The entry is installed by the daemon and adopted by the learner; give
+        # the worker its transaction before the stream starts, or the first
+        # second of it is measured against a route that is still pending.
+        await ctx.wait(lambda s: any(r["group"] == GROUP and r["state"] == "installed"
+                                     for r in s["mroute"]), timeout=20)
+        observed = await _watch_routed(ctx, [trusted], STREAM_S, "profile_home_mcast")
+        ctx.record("home-mroute-one", observed)
+        sent = observed["sent"]
+        listener = observed["clients"]["a"]
+        assert listener["received"] >= sent * 0.95, (listener, sent)
+        row = observed["mroute"]
+        assert row and row["state"] == "installed", row
+        assert row["in"] == TARGET_WAN_IF, row
+        assert ctx.bridge_text[VID_A] in row["oifs"], row
+        assert int(row["packets"]) > 0, (
+            "the entry is installed but the classifier matched nothing: the "
+            f"stream is going past it, {row}")
+        mroute = await command(ctx.target, ctx.session, "ip", "mroute", "show")
+        assert any(GROUP in line and "offload" in line
+                   for line in mroute["stdout"].splitlines()), mroute["stdout"]
+        assert observed["cpu"] < sent * 0.05, (
+            f"{observed['cpu']} of {sent} frames reached the DUT's CPU; the "
+            f"stream is being replicated in software")
+        # The replica is not the frame the source sent: the egress port's own
+        # address is on it and the TTL is one lower, which is the routing the
+        # hardware did on the way through. A flooded copy would carry neither.
+        for sample in listener["samples"]:
+            assert sample["src_mac"] == ctx.dut_lan_mac, (sample, ctx.dut_lan_mac)
+            assert sample["ttl"] == STREAM_TTL - 1, sample
+
+        # A second outbound interface: the IoT VLAN joins the same group.
+        await _smcroute(ctx, ctx.bridge_text[VID_A], ctx.bridge_text[VID_B])
+        await ctx.wait(lambda s: any(
+            r["group"] == GROUP and r["state"] == "installed"
+            and ctx.bridge_text[VID_B] in r["oifs"] for r in s["mroute"]), timeout=20)
+        both = await _watch_routed(ctx, [trusted, iot], STREAM_S,
+                                   "profile_home_mcast_two")
+        ctx.record("home-mroute-two", both)
+        for name in ("a", "b"):
+            assert both["clients"][name]["received"] >= both["sent"] * 0.95, \
+                (name, both)
+        # One entry, two egress framings. The IoT client's device is a VLAN
+        # device and receives nothing that did not carry its tag, so its count
+        # is the assertion that the copy for that VLAN was tagged -- and the
+        # trusted client's macvlan receives nothing that carried one.
+        for sample in both["clients"]["b"]["samples"]:
+            assert sample["src_mac"] == ctx.dut_lan_mac, (sample, ctx.dut_lan_mac)
+            assert sample["ttl"] == STREAM_TTL - 1, sample
+        assert both["cpu"] < both["sent"] * 0.05, both
+    finally:
+        # Takes the route and the daemon with it: nothing else in the profile
+        # wants a VIF set, and the next case's counters should not be measured
+        # against a stream this one is still routing.
+        await _smcroute(ctx)
+
+
+async def test_profile_homelab_ingress_policer_holds_the_rate(homelab, splat_window):
+    """A port-wide meter on the uplink, as a tc filter.
+
+    `skip_sw` is what makes this a hardware assertion rather than a rate
+    measurement: the filter is offloaded or it does not exist, and `tc filter
+    show` reporting `in_hw` is the kernel agreeing that a driver took it. The
+    rate that follows is then the hardware's, and the profile's own colour
+    counters are what the drops are read from -- green and yellow are enqueued,
+    red is dropped, so every frame the meter saw is the sum of the three.
+
+    Deliberately not a throughput case: the cap is well under what the software
+    path could forward, so the number alone would prove nothing. The pair that
+    proves it is `in_hw` plus a drop count that accounts for the loss.
+    """
+    ctx = homelab
+    client = BY_NAME["a"]
+
+    async def tc(*argv, check=True):
+        """`tc` is not in the agent's argv allowlist -- argv[0] is the whole
+        gate -- so the filter is installed on the console the fixture holds."""
+        return await console_command(ctx.console, "tc", *argv, check=check, timeout=30)
+
+    await tc("qdisc", "del", "dev", TARGET_WAN_IF, "clsact", check=False)
+    await tc("qdisc", "add", "dev", TARGET_WAN_IF, "clsact")
+    try:
+        await tc("filter", "add", "dev", TARGET_WAN_IF, "ingress", "matchall",
+                 "skip_sw", "action", "police", "rate", f"{POLICE_RATE_MBIT}mbit",
+                 "burst", POLICE_BURST, "conform-exceed", "drop")
+        shown = await tc("-s", "filter", "show", "dev", TARGET_WAN_IF, "ingress")
+        assert "in_hw" in shown["stdout"], shown["stdout"]
+        assert "skip_sw" in shown["stdout"], shown["stdout"]
+        dropped_before = _police_drops(shown["stdout"])
+
+        server = f'''
+import json, subprocess
+result = subprocess.run(['iperf3', '-s', '-1', '-B', {client['ip']!r},
+                         '-p', {str(PORT_POLICE)!r}, '-J'],
+                        capture_output=True, text=True, timeout=60)
+print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
+'''
+        listener = asyncio.create_task(_client_python(
+            ctx, client, server, label="profile_home_police_server", timeout=90))
+        await asyncio.sleep(1.5)
+        blast = await asyncio.create_subprocess_exec(
+            "iperf3", "-c", client["ip"], "-u", "-b", f"{POLICE_OFFERED_MBIT}M",
+            "-l", "1400", "-t", "5", "-p", str(PORT_POLICE), "-J",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await asyncio.wait_for(blast.communicate(), 60)
+        result = await listener
+        assert result.rc == 0, result.stdout
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        assert report["rc"] == 0, (report, stderr[:400])
+        received = json.loads(report["stdout"])["end"]["sum"]
+        offered = json.loads(stdout)["end"]["sum"]
+        shown = await tc("-s", "filter", "show", "dev", TARGET_WAN_IF, "ingress")
+        dropped = _police_drops(shown["stdout"]) - dropped_before
+        ctx.record("home-policer", {"offered": offered, "received": received,
+                                    "dropped": dropped, "filter": shown["stdout"]})
+        cap = POLICE_RATE_MBIT * 1e6
+        assert offered["bits_per_second"] > cap * 2, (
+            "the orchestrator could not offer enough to exercise the meter", offered)
+        # A token bucket drops rather than queues, so the received rate lands at
+        # or just under the cap; the margin is the burst draining at the start.
+        assert received["bits_per_second"] <= cap * 1.3, (received, cap)
+        assert received["bits_per_second"] > cap * 0.5, (received, cap)
+        # And the meter says it did it. Nothing else on this port dropped
+        # anything, so the filter's own red count has to account for the loss.
+        assert dropped > 0, (dropped, shown["stdout"])
+        assert dropped >= received["lost_packets"] * 0.5, (dropped, received)
+    finally:
+        await tc("qdisc", "del", "dev", TARGET_WAN_IF, "clsact", check=False)
+
+
+def _police_drops(text):
+    """The police action's dropped count, from `tc -s filter show`.
+
+    The driver reports green, yellow and red through flow_stats_update() as
+    packets and drops, and red is what the profile is programmed to drop. tc
+    prints a stats block for the filter and another for the action, so the
+    larger of the two is the one that has the driver's numbers in it.
+    """
+    return max((int(value) for value in re.findall(r"\(dropped (\d+)", text)),
+               default=0)
+
+
+@pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_THROUGHPUT") != "1",
+                    reason="full-rate benchmark opt-in")
+async def test_profile_homelab_throughput(homelab, splat_window):
+    """What the profile forwards when nothing is in its way.
+
+    A number below the ceiling means the CPU carried it, because the CPU cannot
+    carry this much: the point is the floor rather than the measurement, and it
+    runs against the same bridged, firewalled, masqueraded profile as everything
+    above rather than a bare NAT path.
+    """
+    ctx = homelab
+    client = BY_NAME["a"]
+    server = await asyncio.create_subprocess_exec(
+        "iperf3", "-s", "-1", "-B", INTERNET, "-p", str(PORT_RATE), "-J",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        await asyncio.sleep(0.3)
+        assert server.returncode is None, "the endpoint iperf3 did not start"
+        script = f'''
+import json, subprocess
+argv = ['iperf3', '-c', {INTERNET!r}, '-B', {client['ip']!r}, '-p', {str(PORT_RATE)!r},
+        '-P', '4', '-t', '20', '-O', '3', '-Z', '-J']
+result = subprocess.run(argv, capture_output=True, text=True, timeout=45)
+print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
+'''
+        result = await _client_python(ctx, client, script, label="profile_home_rate",
+                                      timeout=70)
+        assert result.rc == 0, result.stdout
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        stdout, _ = await asyncio.wait_for(server.communicate(), 15)
+        measured = json.loads(stdout)["end"]["sum_received"]
+        ctx.record("home-throughput", {"client": report, "server": measured})
+        assert report["rc"] == 0, report
+        floor = float(os.environ.get("ASK_FLOWTABLE_MIN_GBPS", "9")) * 1e9
+        assert measured["bits_per_second"] >= floor, (measured, floor)
+    finally:
+        if server.returncode is None:
+            server.terminate()
+            await asyncio.wait_for(server.communicate(), 10)
+
+
+# ---- lifecycle -------------------------------------------------------------
+
+async def test_profile_homelab_default_route_moves_and_returns(homelab, splat_window):
+    """The uplink's next hop changes, and the flows that borrowed it do too.
+
+    Every WAN flow in this profile reaches its peer through the default route,
+    so moving it has to retire them: a flow admitted against the old next hop
+    would keep sending frames to a gateway that is no longer the one Linux would
+    use, and every counter would look healthy while they went nowhere.
+
+    Selective is the other half. The inter-VLAN flow borrowed no default route
+    at all, so it must survive untouched -- same cookie, counters still climbing
+    -- which is what separates a targeted retirement from a global invalidation
+    that happens to look like one.
+    """
+    ctx = homelab
+    client = BY_NAME["a"]
+    forward, _ = await _accounted(ctx, client, peer=INTERNET, dport=PORT_A,
+                                  sport=PORT_A, label="route-before")
+    before = await ctx.state()
+    await command(ctx.target, ctx.session, "ip", "route", "replace", "default",
+                  "via", ctx.first_gateway, "dev", TARGET_WAN_IF)
+    try:
+        retired = await ctx.wait(
+            lambda s: s["route_invalidations"] > before["route_invalidations"]
+            and not [f for f in s["flows"] if f["cookie"] == forward["cookie"]],
+            timeout=30)
+        assert retired["bindings"] == 2, retired
+        assert retired["invalidated"] == 0 and retired["invalidation_done"] == 0, retired
+        assert retired["rearms"] == before["rearms"], retired
+        assert retired["errors"] == before["errors"], retired
+    finally:
+        await command(ctx.target, ctx.session, "ip", "route", "replace", "default",
+                      "via", ctx.second_gateway, "dev", TARGET_WAN_IF)
+    after_forward, after_reverse = await _accounted(ctx, client, peer=INTERNET,
+                                                    dport=PORT_A, sport=PORT_A,
+                                                    label="route-after")
+    _assert_wan(ctx, after_forward, after_reverse, client=client)
+    # The retirement is proved by the wait above, which required the old cookie
+    # to be gone. It is deliberately not re-proved by requiring the readmitted
+    # flow to carry a *different* cookie: the cookie is the address of a
+    # Netfilter tuple, and a flow retired and immediately readmitted often
+    # lands on the same slab object and comes back with the same one.
+    after = await ctx.state()
+    assert after["errors"] == before["errors"], (before, after)
+    ctx.record("home-route-change", {"before": before, "retired": retired,
+                                     "after": after})
+
+
+async def test_profile_homelab_ipsec_sa_is_replaced(homelab, splat_window):
+    """The SA is rekeyed under a live tunnel, and the flows follow the new one.
+
+    Nothing about an SA reaches the rule in a form that could be revalidated:
+    the flow was built with a handle to the state it was admitted against. So
+    replacing the state has to retire the flows -- otherwise the hardware keeps
+    encrypting with a key the peer has already forgotten, which is silent loss
+    with healthy counters, exactly as a stale PPPoE session id would be.
+
+    Nothing else is disturbed while it happens: the policy is untouched, the
+    conntrack table is not flushed and no device changes, so a flow that comes
+    back with a new cookie came back because its SA went and for no other
+    reason.
+    """
+    ctx = homelab
+    first = 0x0A990000 | (secrets.randbelow(0xFFFF) + 1)
+    await _install_ipsec(ctx, first, first ^ 0x8000)
+    await _start_ipsec_echo(ctx)
+    before = await _ipsec_traffic(ctx, 40)
+    _assert_ipsec(before, 40)
+    old_cookies = {row["cookie"] for row in before["forward"] + before["reverse"]}
+    state_before = await ctx.state()
+
+    second = first ^ 0x1000
+    await _rekey_ipsec(ctx, second)
+    retired = await ctx.wait(
+        lambda s: not [f for f in s["flows"] if f["cookie"] in old_cookies],
+        timeout=30)
+    assert retired["bindings"] == 2, retired
+    assert retired["errors"] == state_before["errors"], (state_before, retired)
+    assert retired["fatal"] == retired["quarantine"] == 0, retired
+
+    after = await _ipsec_traffic(ctx, 40)
+    ctx.record("home-ipsec-rekey", {"before": before, "retired": retired,
+                                    "after": after,
+                                    "spis": [hex(first), hex(second)]})
+    # The retirement is the `ctx.wait` above, which required every cookie the
+    # old SA's flows carried to be gone; the traffic here is the readmission.
+    # The two are deliberately not joined by requiring the new cookies to
+    # differ -- a cookie is the address of a Netfilter tuple and a readmitted
+    # flow often reuses the slab object, so that would be a coin toss.
+    _assert_ipsec(after, 40)
+
+
+async def test_profile_homelab_bridge_vlan_change_retires(homelab, splat_window):
+    """A VLAN is withdrawn from the LAN port and given back.
+
+    The guest VLAN's membership is what tells the bridge to accept its frames on
+    that port and what the adapter derived the egress tag from. Withdrawing it
+    has to retire the flows that carry that tag -- and only those: the trusted
+    VLAN's flow is on the same port, the same bridge and the same classifier,
+    and it has no business noticing.
+    """
+    ctx = homelab
+    guest, trusted = BY_NAME["c"], BY_NAME["a"]
+    kept, _ = await _accounted(ctx, trusted, peer=INTERNET, dport=PORT_A,
+                               sport=PORT_A, label="vlan-change-kept")
+    going, _ = await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
+                                sport=PORT_C, label="vlan-change-before")
+    before = await ctx.state()
+    await command(ctx.target, ctx.session, "bridge", "vlan", "del", "dev",
+                  TARGET_LAN_IF, "vid", str(VID_C))
+    try:
+        retired = await ctx.wait(
+            lambda s: not [f for f in s["flows"] if f["cookie"] == going["cookie"]],
+            timeout=30)
+        assert retired["errors"] == before["errors"], retired
+        assert retired["fatal"] == retired["quarantine"] == 0, retired
+        # The trusted VLAN's flow is untouched, which is the selectivity: the
+        # same entry is still there, under the same cookie, and its counters
+        # have not gone backwards -- a readmission would have reset them.
+        survivor = [f for f in retired["flows"] if f["cookie"] == kept["cookie"]]
+        assert len(survivor) == 1, (kept, retired)
+        assert int(survivor[0]["packets"]) >= int(kept["packets"]), (kept, survivor)
+    finally:
+        await command(ctx.target, ctx.session, "bridge", "vlan", "add", "dev",
+                      TARGET_LAN_IF, "vid", str(VID_C))
+    await _reachable(ctx, guest, INTERNET)
+    forward, reverse = await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
+                                        sport=PORT_C, label="vlan-change-after")
+    _assert_wan(ctx, forward, reverse, client=guest)
+    ctx.record("home-vlan-change", {"before": before, "retired": retired,
+                                    "after": await ctx.state()})
+
+
+async def test_profile_homelab_module_reload_reproves_the_profile(homelab,
+                                                                  splat_window):
+    """The adapter is unloaded and reloaded with the whole profile standing.
+
+    Nothing in Linux replays a device-specific flowtable binding when a driver
+    registers again, so the table that was there stays in software and the
+    policy has to be applied afresh -- which is the contract, not a defect, and
+    is what `apply` does. What must survive the round trip is everything the
+    adapter did *not* own: the bridge, the VLANs, the firewall, the tunnels and
+    the routes are the kernel's, and a reload that needed any of them rebuilt
+    would mean an operator's `modprobe` costs them their configuration.
+
+    Then every feature is re-proved by a short burst rather than assumed. The
+    IPsec tunnel is the exception that has to be reinstalled: its hardware state
+    belonged to the module, so its SAs are offered again -- which is itself worth
+    proving, because it is what an operator would do.
+    """
+    ctx = homelab
+    console = ctx.console
+    fci = any(line.startswith("fci ") for line in
+              (await read(ctx.target, ctx.session, "/proc/modules")).splitlines())
+    if fci:
+        # FCI depends on CDX and has no controller in this boot; remove the
+        # dependency before the measured unload rather than forcing it.
+        await console_command(console, "rmmod", "fci")
+    try:
+        await console_command(console, "test", "-e",
+                              "/sys/module/cdx/holders/ask_flowtable")
+        await console_command(console, "rmmod", "ask_flowtable", timeout=30)
+        for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
+                     "/sys/module/cdx/holders/ask_flowtable"):
+            absent = await console_command(console, "test", "-e", path, check=False)
+            assert absent["rc"] == 1, path
+        # Still a working router while the adapter is gone: the profile is the
+        # kernel's configuration and only the acceleration was the module's.
+        report = await _exchange(ctx, BY_NAME["a"], peer=INTERNET, dport=PORT_A,
+                                 sport=PORT_A, count=16, label="reload-software")
+        assert report == {"echoed": 16, "lost": 0}, report
+        await console_command(console, "modprobe", "ask_flowtable", timeout=30)
+        detached = await ctx.state()
+        assert detached["bindings"] == detached["entries"] == 0, detached
+        assert detached["fatal"] == 0, detached
+        await apply(console, _policy(), r=ctx)
+        await ctx.wait(lambda s: s["bindings"] == 2)
+    finally:
+        if fci:
+            await console_command(console, "modprobe", "fci", check=False)
+
+    # ---- and now every feature again, on the profile that was never rebuilt.
+    trusted, iot, guest = BY_NAME["a"], BY_NAME["b"], BY_NAME["c"]
+    forward, reverse = await _accounted(ctx, trusted, peer=INTERNET, dport=PORT_A,
+                                        sport=PORT_A, label="reload-wan")
+    _assert_wan(ctx, forward, reverse, client=trusted)
+    forward, reverse = await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
+                                        sport=PORT_C, label="reload-guest")
+    _assert_wan(ctx, forward, reverse, client=guest)
+    forward, reverse = await _accounted(ctx, trusted, peer=ctx.shape.inner_orch,
+                                        dport=PORT_V6, sport=PORT_V6,
+                                        label="reload-tunnel")
+    assert forward["out_tnl"] == _tunnel_text(ctx.shape), forward
+    assert reverse["in_tnl"] == _tunnel_text(ctx.shape), reverse
+    # The firewall is the kernel's, not the module's, so it has to still be
+    # refusing. Counted rather than inferred from silence, for the reason the
+    # hairpin case gives.
+    stop_trusted = await _udp_listener(ctx, trusted, PORT_REFUSED,
+                                       "profile_home_reload_refused")
+    try:
+        drops_before = await _firewall_drops(ctx, ctx.bridge_text[VID_B],
+                                             ctx.bridge_text[VID_A])
+        refused = await _exchange(ctx, iot, peer=trusted["ip"], dport=PORT_REFUSED,
+                                  sport=PORT_REFUSED, count=8, label="reload-refused",
+                                  tolerate_loss=True)
+        drops = await _firewall_drops(ctx, ctx.bridge_text[VID_B],
+                                      ctx.bridge_text[VID_A]) - drops_before
+        assert refused["echoed"] == 0, refused
+        assert drops >= 8, (drops, refused)
+    finally:
+        await stop_trusted()
+
+    spi = 0x0A9A0000 | (secrets.randbelow(0xFFFF) + 1)
+    await _install_ipsec(ctx, spi, spi ^ 0x8000)
+    await _start_ipsec_echo(ctx)
+    ipsec = await _ipsec_traffic(ctx, 40)
+    ctx.record("home-reload-ipsec", ipsec)
+    _assert_ipsec(ipsec, 40)
+    ctx.record("home-module-reload", {"state": await ctx.state()})
+
+
+async def _start_ipsec_echo(ctx):
+    """The far end of the IPsec tunnel: a UDP echo on the LAN VM's inner
+    address, backgrounded because the UART is one channel and cannot be held
+    open across the traffic the orchestrator then sends."""
+    path = f"/tmp/ask_profile_home_ipsec_{os.getpid()}.py"
+    script = (f"import socket\n"
+              f"s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+              f"s.bind(({IPSEC_INNER!r}, {PORT_IPSEC}))\n"
+              f"while True:\n"
+              f"    data, peer = s.recvfrom(2048)\n"
+              f"    s.sendto(data, peer)\n")
+    import base64
+    blob = base64.b64encode(script.encode()).decode()
+    await lan_run(ctx.lan, f"pkill -f {path}; echo {blob} | base64 -d > {path}", 20)
+    await lan_run(ctx.lan, f"setsid python3 {path} >/dev/null 2>&1 & sleep 1", 25)
