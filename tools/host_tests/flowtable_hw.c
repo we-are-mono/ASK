@@ -13,6 +13,9 @@ typedef uint16_t u16, __be16;
 typedef uint32_t u32, __be32;
 typedef uint64_t u64;
 typedef u8 U8;
+typedef u16 U16;
+typedef u32 U32;
+#define BIT(n) (1UL << (n))
 #define ETH_ALEN 6
 #define IF_TYPE_ETHERNET 1
 #define IF_TYPE_WLAN 32
@@ -64,6 +67,17 @@ struct cdx_l2_encap {
     /* And per tag, innermost first like the tags themselves. */
     u8 ingress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
     u8 egress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
+    /* An IP-in-IP tunnel on either side, outside every L2 header: the egress
+     * side carries the outer header the insert writes and the ingress side
+     * only what the strip needs, each naming its record in the plain pool. */
+    struct cdx_tunnel_encap {
+        u8 present;
+        u8 mode;
+        u8 header_size;
+        u8 flags;
+        u8 stats_index;
+        u8 header[40];
+    } ingress_tunnel, egress_tunnel;
 };
 /* The slot as CDX defines it. The encoder reads only the two indices, which
  * is the whole of what it needs from one. */
@@ -256,7 +270,8 @@ static int insert_entry_in_classif_table_encap(PCtEntry ct, const struct cdx_l2_
     observed_encap_given = encap != NULL;
     if (encap) {
         assert(encap->num_ingress || encap->num_egress ||
-               encap->ingress_pppoe || encap->egress_pppoe);
+               encap->ingress_pppoe || encap->egress_pppoe ||
+               encap->ingress_tunnel.present || encap->egress_tunnel.present);
         observed_encap = *encap;
     }
     /* The encoding port's source address is the netdev's, and the backend no
@@ -350,11 +365,20 @@ static int dpa_cfg_quiesce(void)
     return 0;
 }
 #include "physical_production.inc"
+/* The outer header the egress tunnel inserts is built by the same function
+ * the legacy tunnel interface builds its own with, compiled from CDX rather
+ * than restated: both owners have to put the same bytes on the wire, and a
+ * copy here would agree with itself while the two diverged. */
+#include "tunnel_types.inc"
+#include "tunnel_production.inc"
 #include "hardware_types.inc"
 /* The free-list half of the statistics API lives in cdx_ifstats.c, beside the
  * lists it draws from; what the backend adds is the ownership check, so that
  * is what is exercised here and the pool itself is simulated. */
 static struct cdx_ft_stats_slot ifstats_slot = { .rx_index = 0x80, .tx_index = 0x81 };
+/* A tunnel device's record comes from the plain pool, whose indices carry no
+ * timestamp flag; distinct from the session's so neither can stand in for it. */
+static struct cdx_ft_stats_slot tunnel_slot = { .rx_index = 0x0c, .tx_index = 0x0d };
 static bool ifstats_taken;
 static int ifstats_alloc_error;
 static unsigned ifstats_reads;
@@ -748,6 +772,143 @@ int main(void)
     assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
     assert(!observed_encap_given);
     assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+
+    /* An IP-in-IP tunnel, which asks for an override with no tag and no
+     * session either. The egress side is the interesting half: the header is
+     * built here rather than carried in the rule, so what the hardware
+     * inserts and what software would insert are the same bytes only if this
+     * builds them the same way -- which is why it is the production builder
+     * that runs, and why every field of the result is pinned. */
+    {
+        const struct cdx_tunnel_encap *egress = &observed_encap.egress_tunnel;
+        const struct cdx_tunnel_encap *ingress = &observed_encap.ingress_tunnel;
+        const union nf_inet_addr local4 = v4(htonl(0xc0a80a01));
+        const union nf_inet_addr remote4 = v4(htonl(0xcb0071c8));
+        const union nf_inet_addr local6 = v6(0x901), remote6 = v6(0x902);
+
+        /* 6o4: an IPv4 outer header around an IPv6 flow. The tunnel device is
+         * doing path MTU discovery, so the hop records DF -- and the header
+         * built here still leaves the fragment word clear, because the
+         * INSERT_L3_HDR opcode fills that field itself and ignores the
+         * template's, exactly as the legacy owner found. */
+        rule.out_tunnel = (struct cdx_ft_tunnel){
+            .local = local4, .remote = remote4, .nexthop = v4(htonl(0xc0a80afe)),
+            .ifindex = 18, .lower_ifindex = 6, .mode = CDX_FT_TUNNEL_6O4,
+            .family = AF_INET, .proto = 41, .ttl = 64, .tos = 0,
+            .flags = CDX_FT_TUNNEL_DF, .header_size = 20, .present = true };
+        /* The microcode compares the *outer* frame against the entry's bound,
+         * and Netfilter's MTU is the tunnel device's, already reduced by the
+         * header. Leaving it reduced rejects every full-size frame to the
+         * CPU, which looks like offload and performs like software. */
+        expected_mtu = rule.mtu + 20;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(observed_encap_given && egress->present && !ingress->present);
+        assert(!observed_encap.num_ingress && !observed_encap.num_egress);
+        assert(!observed_encap.ingress_pppoe && !observed_encap.egress_pppoe);
+        assert(egress->mode == TNL_MODE_6O4 && egress->header_size == 20);
+        assert(!egress->flags);
+        assert(egress->header[0] == 0x45 && !egress->header[1]);
+        /* Total length, identification, the fragment word and the checksum
+         * are the microcode's, per packet, and are all left zero here -- the
+         * fragment word including the DF the hop recorded. */
+        assert(!egress->header[2] && !egress->header[3]);
+        assert(!egress->header[4] && !egress->header[5]);
+        assert(!egress->header[6] && !egress->header[7]);
+        assert(egress->header[8] == 64 && egress->header[9] == 41);
+        assert(!egress->header[10] && !egress->header[11]);
+        assert(!memcmp(egress->header + 12, &local4.ip, 4));
+        assert(!memcmp(egress->header + 16, &remote4.ip, 4));
+        /* Nothing past the size it declared. */
+        assert(!egress->header[20]);
+        /* With no record the index is zero, which the opcode reads as no
+         * record rather than as record zero. */
+        assert(!egress->stats_index);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+
+        /* With one, the insert counts into its transmit half. */
+        stats.out_tunnel = &tunnel_slot;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(egress->stats_index == tunnel_slot.tx_index);
+        assert(tunnel_slot.rx_index != tunnel_slot.tx_index);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+        stats.out_tunnel = NULL;
+
+        /* A tunnel that never asked for DF produces the same bytes, which is
+         * the point: the flag reaches the rule and stops there. */
+        rule.out_tunnel.flags = 0;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(!egress->flags && !egress->header[6] && !egress->header[7]);
+        assert(egress->header[0] == 0x45 && egress->header[9] == 41);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+
+        /* The ingress side: a strip validates nothing, so it takes the mode,
+         * the size, the DSCP-propagation flag and its receive record, and no
+         * header at all. It expands nothing this port transmits, so the bound
+         * stays the flow's. */
+        rule.out_tunnel = (struct cdx_ft_tunnel){};
+        rule.in_tunnel = (struct cdx_ft_tunnel){
+            .local = local4, .remote = remote4, .ifindex = 19,
+            .lower_ifindex = 5, .mode = CDX_FT_TUNNEL_6O4, .family = AF_INET,
+            .proto = 41, .ttl = 64, .flags = CDX_FT_TUNNEL_DSCP_COPY,
+            .header_size = 20, .present = true };
+        stats.in_tunnel = &tunnel_slot;
+        expected_mtu = rule.mtu;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(observed_encap_given && ingress->present && !egress->present);
+        assert(ingress->mode == TNL_MODE_6O4 && ingress->header_size == 20);
+        assert(ingress->flags == DSCP_COPY);
+        assert(ingress->stats_index == tunnel_slot.rx_index);
+        assert(!ingress->header[0]);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+        stats.in_tunnel = NULL;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(!ingress->stats_index);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+        rule.in_tunnel = (struct cdx_ft_tunnel){};
+
+        /* 4o6 with an inherited traffic class: the outer IPv6 header takes
+         * the flag rather than a value, and the recorded class is zero. */
+        rule.out_tunnel = (struct cdx_ft_tunnel){
+            .local = local6, .remote = remote6, .ifindex = 20,
+            .lower_ifindex = 6, .mode = CDX_FT_TUNNEL_4O6, .family = AF_INET6,
+            .proto = 4, .ttl = 63, .tos = 0, .flowlabel = htonl(0x12345),
+            .flags = CDX_FT_TUNNEL_INHERIT_TOS, .header_size = 40,
+            .present = true };
+        expected_mtu = rule.mtu + 40;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(egress->present && egress->mode == TNL_MODE_4O6);
+        assert(egress->header_size == 40 && egress->flags == INHERIT_TC);
+        /* Version 6, traffic class zero, and the flow label the walk recorded. */
+        assert(egress->header[0] == 0x60 && egress->header[1] == 0x01);
+        assert(egress->header[2] == 0x23 && egress->header[3] == 0x45);
+        assert(!egress->header[4] && !egress->header[5]);
+        assert(egress->header[6] == 4 && egress->header[7] == 63);
+        assert(!memcmp(egress->header + 8, local6.ip6, 16));
+        assert(!memcmp(egress->header + 24, remote6.ip6, 16));
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+
+        /* And a fixed traffic class, which lands in the header instead of in
+         * a flag: CS1 is 0x20, so the first byte reads 0x62. */
+        rule.out_tunnel.flags = 0;
+        rule.out_tunnel.tos = 0x20;
+        rule.out_tunnel.flowlabel = 0;
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == 0);
+        assert(!egress->flags && egress->header[0] == 0x62);
+        assert(!egress->header[1] && !egress->header[2] && !egress->header[3]);
+        assert(cdx_ft_hw_del(&hw) == 0 && !key && !allocations);
+
+        /* A size the builder disagrees with means admission and the encoder
+         * are describing different headers, which is refused rather than
+         * encoded as whichever of the two the hardware happens to read. */
+        rule.out_tunnel.mode = CDX_FT_TUNNEL_6O4;
+        rule.out_tunnel.family = AF_INET;
+        rule.out_tunnel.local = local4;
+        rule.out_tunnel.remote = remote4;
+        assert(rule.out_tunnel.header_size == 40);
+        assert(cdx_ft_hw_add(&rule,&stats,&hw) == -EOPNOTSUPP && !hw && !allocations);
+        rule.out_tunnel = (struct cdx_ft_tunnel){};
+        expected_mtu = rule.mtu;
+    }
     rule.new_src = expected_src = rule.src; rule.new_dst = expected_dst = rule.dst;
     rule.new_sport = expected_sport = rule.sport; rule.new_dport = expected_dport = rule.dport;
     assert(cdx_ft_hw_add(&rule,&stats,&hw)==0);

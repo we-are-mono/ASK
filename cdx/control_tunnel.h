@@ -129,6 +129,19 @@ int tunnel_init(void);
 void tunnel_exit(void);
 void tnl_update(PTnlEntry pTunnelEntry);
 
+/* Build the outer header the hardware inserts for a 6o4 or 4o6 tunnel into
+ * `header`, which holds at least 40 bytes, leaving zero what the microcode
+ * fills per packet: the IPv4 length, identification and checksum, the IPv6
+ * payload length. `local` and `remote` are the endpoints in network order,
+ * one word for IPv4 and four for IPv6; `fl` is the IPv4 TOS or the IPv6
+ * traffic class and flow label as one network-order word; `frag_off` is the
+ * IPv4 flags and fragment offset word, network order, which carries DF.
+ * Returns the header size, or zero for a mode this does not build. Shared by
+ * the legacy tunnel interface and the flowtable owner so both insert the same
+ * bytes. */
+U8 tnl_build_header(U8 mode, const U32 *local, const U32 *remote, U32 fl,
+		    U8 hlim, U16 frag_off, U8 *header);
+
 U16 Tnl_Get_Next_Hash_Entry(PTNLCommand_query pTnlCmd, int reset_action);
 
 int dpa_add_tunnel_if(itf_t *itf, itf_t *phys_itf, PTnlEntry pTunnelEntry);

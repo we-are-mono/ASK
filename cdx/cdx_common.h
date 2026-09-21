@@ -291,8 +291,20 @@ struct dpa_l3hdr_info {
 		uint8_t add_tnl_header:1;
 		uint8_t tnl_header_present:1;
 		uint8_t ipsec_inbound_flow:1; /* Flag to identify ipsec inbound flow */
+		/* The two tunnel header manipulations reach the logical
+		 * statistics area by an index a registered tunnel interface
+		 * owns, looked up from the route's interfaces. A tunnel
+		 * described by a flow has no such interface, so set this and
+		 * both take their index from the description instead --
+		 * tunnel_stats_offset for the insert and tunnel_rx_stats_offset
+		 * for the strip. Zero is no record and emits a null pointer,
+		 * which is what the INCLUDE_TUNNEL_IFSTATS-disabled arms
+		 * write; index zero itself belongs to someone else. */
+		uint8_t tunnel_flow_ifstats:1;
 	};
 	uint8_t tunnel_flags; /* used in dscp propagation */
+	uint8_t tunnel_stats_offset;
+	uint8_t tunnel_rx_stats_offset;
 	uint8_t pad;
 
 	uint16_t proto;

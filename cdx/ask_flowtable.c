@@ -17,6 +17,7 @@
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/hashtable.h>
+#include <linux/if_arp.h>
 #include <linux/if_bridge.h>
 #include <linux/if_pppox.h>
 #include <linux/if_vlan.h>
@@ -36,6 +37,8 @@
 #include <net/fib_notifier.h>
 #include <net/flow_offload.h>
 #include <net/ip6_route.h>
+#include <net/ip6_tunnel.h>
+#include <net/ip_tunnels.h>
 #include <net/ipv6.h>
 #include <net/ndisc.h>
 #include <net/netevent.h>
@@ -57,8 +60,8 @@
 #include "cdx_wifi_backend.h"
 #include "cdx_police.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 8
-#error "CDX flowtable requires patches/kernel/140-ask-flowtable-context.patch"
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 9
+#error "CDX flowtable requires flowtable context version 9 or later (patches/kernel/14x-ask-flowtable-*.patch)"
 #endif
 
 /* The bridge FDB pins a bridged flow's egress port, and this is the only
@@ -183,6 +186,11 @@ struct cdx_ft_dev_stats {
 	bool gone;
 	struct cdx_ft_stats_slot *slot;
 	struct cdx_ft_session session;
+	/* A tunnel device's record is a plain one, like a VLAN device's; this
+	 * is what tells the two apart in the read-back and carries the
+	 * identity the flow rows print, following the last direction admitted
+	 * exactly as a session's does. */
+	struct cdx_ft_tunnel tunnel;
 };
 
 struct cdx_ft_entry {
@@ -204,6 +212,9 @@ struct cdx_ft_entry {
 	 * rule's stacks; NULL for a tag with no device or no record. */
 	struct cdx_ft_dev_stats *in_vlan_stats[CDX_FT_VLAN_MAX];
 	struct cdx_ft_dev_stats *out_vlan_stats[CDX_FT_VLAN_MAX];
+	/* And the tunnel device's, held the same way. */
+	struct cdx_ft_dev_stats *in_tunnel_stats;
+	struct cdx_ft_dev_stats *out_tunnel_stats;
 	unsigned long cookie;
 	struct cdx_ft_rule rule;
 	struct cdx_ft_hw *hw;
@@ -394,6 +405,29 @@ static unsigned int ft_ppp_rx_overhead(unsigned int lower_tags)
 
 #define FT_PPP_TX_OVERHEAD (ETH_HLEN + PPPOE_SES_HLEN)
 
+/* What the firmware counts into a tunnel device's record and the device's own
+ * counters do not, per packet, measured on the DK (docs/flowtable-tunnels.md
+ * has the frames). A tunnel device counts the inner packet alone on both
+ * sides: sit and ip6_tnl add skb->len after the outer header has been pulled
+ * on receive, and the inner length on transmit. Measured with a 104-byte
+ * inner packet on an untagged path: the strip's record read 118, so it counts
+ * the Ethernet header and the inner packet but not the outer header it has
+ * removed -- receive overhead ETH_HLEN; the insert's read 138, the whole frame
+ * with the outer header on -- transmit overhead ETH_HLEN + the outer header.
+ * A tag or a session under the tunnel adds its own bytes to both, by the same
+ * reasoning the VLAN and session records follow.
+ *
+ * The record is one per device and serves both directions, so the framing is
+ * named per side rather than per rule: the direction that strips over the
+ * device supplies the receive framing from its own ingress stack, the one that
+ * inserts supplies the transmit framing from its egress stack. The two are the
+ * same physical stack for one connection; where they differ, the first
+ * direction admitted publishes, as a session's record does. */
+static unsigned int ft_tunnel_under(unsigned int vlans, bool session)
+{
+	return vlans * VLAN_HLEN + (session ? PPPOE_SES_HLEN : 0);
+}
+
 static void ft_dev_stats_release(struct cdx_ft_dev_stats *record)
 {
 	cdx_ft_stats_free(&record->slot);
@@ -411,7 +445,9 @@ static void ft_dev_stats_release(struct cdx_ft_dev_stats *record)
  * whose counters it could be folded into. */
 static struct cdx_ft_dev_stats *ft_dev_stats_get(int ifindex, enum cdx_ft_stats_kind kind,
 						 const struct cdx_ft_session *session,
-						 unsigned int lower_tags)
+						 const struct cdx_ft_tunnel *tunnel,
+						 unsigned int rx_overhead,
+						 unsigned int tx_overhead)
 {
 	struct cdx_ft_dev_stats *record;
 
@@ -430,14 +466,18 @@ static struct cdx_ft_dev_stats *ft_dev_stats_get(int ifindex, enum cdx_ft_stats_
 			 * unregistration that marks a record gone was missed.
 			 * Counting nowhere is the safe answer then: the other
 			 * pool's index would aim an opcode at a record of the
-			 * wrong shape. */
-			if (WARN_ON_ONCE(record->kind != kind)) {
+			 * wrong shape. A tunnel device and a VLAN device share
+			 * a pool but not a shape either. */
+			if (WARN_ON_ONCE(record->kind != kind ||
+					 record->tunnel.present != !!tunnel)) {
 				spin_unlock_bh(&ft_dev_stats_lock);
 				return NULL;
 			}
 			record->refs++;
 			if (session)
 				record->session = *session;
+			if (tunnel)
+				record->tunnel = *tunnel;
 			spin_unlock_bh(&ft_dev_stats_lock);
 			return record;
 		}
@@ -450,14 +490,12 @@ static struct cdx_ft_dev_stats *ft_dev_stats_get(int ifindex, enum cdx_ft_stats_
 	record->refs = 1;
 	if (session)
 		record->session = *session;
+	if (tunnel)
+		record->tunnel = *tunnel;
 	if (cdx_ft_stats_alloc(kind, &record->slot))
 		record->slot = NULL;
-	else if (kind == CDX_FT_STATS_TIMESTAMPED)
-		cdx_ft_stats_publish(record->slot, ifindex,
-				     ft_ppp_rx_overhead(lower_tags), FT_PPP_TX_OVERHEAD);
 	else
-		cdx_ft_stats_publish(record->slot, ifindex,
-				     FT_VLAN_RX_OVERHEAD, FT_VLAN_TX_OVERHEAD);
+		cdx_ft_stats_publish(record->slot, ifindex, rx_overhead, tx_overhead);
 	spin_lock_bh(&ft_dev_stats_lock);
 	list_add_tail(&record->list, &ft_dev_stats);
 	spin_unlock_bh(&ft_dev_stats_lock);
@@ -563,20 +601,50 @@ static void ft_stats_attach(struct cdx_ft_entry *entry)
 	const struct cdx_ft_rule *rule = &entry->rule;
 	unsigned int i;
 
-	/* A session is outermost on its path, so the direction's whole tag
-	 * stack is what sits under it. */
+	/* A session is outermost on its L2 path, so the direction's whole tag
+	 * stack is what sits under it. The ppp device is the direction's
+	 * logical device unless a tunnel runs over the session, in which case
+	 * it is the device the tunnel hop named. */
 	entry->in_stats = rule->in_session.present ?
-		ft_dev_stats_get(rule->in_logical->ifindex, CDX_FT_STATS_TIMESTAMPED,
-				 &rule->in_session, rule->in_vlans) : NULL;
+		ft_dev_stats_get(rule->in_session.lower_ifindex ?
+				 (rule->in_tunnel.present ? rule->in_tunnel.lower_ifindex :
+				  rule->in_logical->ifindex) : 0,
+				 CDX_FT_STATS_TIMESTAMPED, &rule->in_session, NULL,
+				 ft_ppp_rx_overhead(rule->in_vlans), FT_PPP_TX_OVERHEAD) : NULL;
 	entry->out_stats = rule->out_session.present ?
-		ft_dev_stats_get(rule->out_logical->ifindex, CDX_FT_STATS_TIMESTAMPED,
-				 &rule->out_session, rule->out_vlans) : NULL;
+		ft_dev_stats_get(rule->out_tunnel.present ? rule->out_tunnel.lower_ifindex :
+				 rule->out_logical->ifindex,
+				 CDX_FT_STATS_TIMESTAMPED, &rule->out_session, NULL,
+				 ft_ppp_rx_overhead(rule->out_vlans), FT_PPP_TX_OVERHEAD) : NULL;
 	for (i = 0; i < rule->in_vlans; i++)
 		entry->in_vlan_stats[i] = ft_dev_stats_get(rule->in_vlan[i].ifindex,
-							   CDX_FT_STATS_PLAIN, NULL, 0);
+							   CDX_FT_STATS_PLAIN, NULL, NULL,
+							   FT_VLAN_RX_OVERHEAD, FT_VLAN_TX_OVERHEAD);
 	for (i = 0; i < rule->out_vlans; i++)
 		entry->out_vlan_stats[i] = ft_dev_stats_get(rule->out_vlan[i].ifindex,
-							    CDX_FT_STATS_PLAIN, NULL, 0);
+							    CDX_FT_STATS_PLAIN, NULL, NULL,
+							    FT_VLAN_RX_OVERHEAD, FT_VLAN_TX_OVERHEAD);
+	/* A tunnel is outermost of all, so the tunnel device is always the
+	 * direction's logical device when it carries one. The receive framing
+	 * is this direction's ingress stack under the tunnel and the transmit
+	 * framing its egress stack plus the outer header, each named from the
+	 * side that feeds that half of the shared record. */
+	entry->in_tunnel_stats = rule->in_tunnel.present ?
+		ft_dev_stats_get(rule->in_tunnel.ifindex, CDX_FT_STATS_PLAIN, NULL,
+				 &rule->in_tunnel,
+				 ETH_HLEN + ft_tunnel_under(rule->in_vlans,
+							    rule->in_session.present),
+				 ETH_HLEN + rule->in_tunnel.header_size +
+				 ft_tunnel_under(rule->in_vlans,
+						 rule->in_session.present)) : NULL;
+	entry->out_tunnel_stats = rule->out_tunnel.present ?
+		ft_dev_stats_get(rule->out_tunnel.ifindex, CDX_FT_STATS_PLAIN, NULL,
+				 &rule->out_tunnel,
+				 ETH_HLEN + ft_tunnel_under(rule->out_vlans,
+							    rule->out_session.present),
+				 ETH_HLEN + rule->out_tunnel.header_size +
+				 ft_tunnel_under(rule->out_vlans,
+						 rule->out_session.present)) : NULL;
 }
 
 static void ft_stats_detach(struct cdx_ft_entry *entry)
@@ -589,6 +657,8 @@ static void ft_stats_detach(struct cdx_ft_entry *entry)
 		ft_dev_stats_put(&entry->in_vlan_stats[i]);
 		ft_dev_stats_put(&entry->out_vlan_stats[i]);
 	}
+	ft_dev_stats_put(&entry->in_tunnel_stats);
+	ft_dev_stats_put(&entry->out_tunnel_stats);
 }
 
 static void ft_stats_binding(const struct cdx_ft_entry *entry,
@@ -598,6 +668,8 @@ static void ft_stats_binding(const struct cdx_ft_entry *entry,
 
 	binding->in_session = entry->in_stats ? entry->in_stats->slot : NULL;
 	binding->out_session = entry->out_stats ? entry->out_stats->slot : NULL;
+	binding->in_tunnel = entry->in_tunnel_stats ? entry->in_tunnel_stats->slot : NULL;
+	binding->out_tunnel = entry->out_tunnel_stats ? entry->out_tunnel_stats->slot : NULL;
 	for (i = 0; i < CDX_FT_VLAN_MAX; i++) {
 		binding->in_vlan[i] = entry->in_vlan_stats[i] ?
 			entry->in_vlan_stats[i]->slot : NULL;
@@ -1038,10 +1110,30 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 		spin_unlock_bh(&ft_watch_lock);
 		return 0;
 	}
-	/* Neighbours belong to the device the route names, which is the VLAN
-	 * subinterface for a tagged flow; the physical port never sees them. */
-	neigh = neigh_lookup(ft_neigh_table(entry->rule.family), &entry->next_hop,
-			     entry->rule.out_logical);
+	if (entry->rule.out_tunnel.present) {
+		const struct cdx_ft_tunnel *tunnel = &entry->rule.out_tunnel;
+		struct net_device *lower;
+
+		/* A tunnel device is NOARP too and resolves nothing; what this
+		 * direction depends on is the outer next hop, which lives on
+		 * the device below the tunnel in the outer header's family.
+		 * That is the neighbour to hold and to watch, and a change to
+		 * it is what retires the entry -- the inner next hop on the
+		 * tunnel device is a fiction with a zero address. Admission
+		 * holds RTNL, so the index still names the device the walk
+		 * resolved. */
+		lower = __dev_get_by_index(&init_net, tunnel->lower_ifindex);
+		if (!lower)
+			return -EOPNOTSUPP;
+		neigh = neigh_lookup(ft_neigh_table(tunnel->family), &tunnel->nexthop,
+				     lower);
+	} else {
+		/* Neighbours belong to the device the route names, which is
+		 * the VLAN subinterface for a tagged flow; the physical port
+		 * never sees them. */
+		neigh = neigh_lookup(ft_neigh_table(entry->rule.family), &entry->next_hop,
+				     entry->rule.out_logical);
+	}
 	if (!neigh)
 		return -EOPNOTSUPP;
 	/* Recheck at watch publication: the mapping may have changed after the
@@ -1358,10 +1450,107 @@ static int ft_bridge_vlan(struct net_device *bridge, struct net_device *port,
  * usual, so a session over a VLAN device or a bridge is still derived.
  * Returns the tag count, or -EOPNOTSUPP for a path this contract excludes.
  */
+static bool ft_tunnel_dev(const struct net_device *dev)
+{
+	return dev->type == ARPHRD_SIT || dev->type == ARPHRD_TUNNEL6;
+}
+
+/* The tunnel hop, taken from the kernel's own forwarding-path walk and checked
+ * against the tunnel device it names.
+ *
+ * The hop is handed over rather than derived, for the same reason a session
+ * is: the outer route is looked up by the tunnel's transmit path rather than
+ * by the flow's, a tunnel device registers no lower neighbour to descend to,
+ * and a second walk could disagree with the one the rule was built from. What
+ * the device itself says is used as the cross-check -- the endpoints, the TTL
+ * and the traffic class are its configuration, and a record that no longer
+ * matches it describes a tunnel that has since been changed underneath the
+ * flow. The mode follows from the device: a sit device inserts an IPv4 header
+ * around an IPv6 packet, an ip6tnl device in ipip6 mode an IPv6 header around
+ * an IPv4 one. Those two are what the hardware builds; every other shape --
+ * 6rd and ISATAP, which pick the outer destination per packet, IPv6 in IPv6,
+ * IPv4 in IPv4, GRE -- is refused here or was already refused by the walk.
+ *
+ * Two things the hardware cannot do are refused rather than approximated. A
+ * TTL of zero means the inner packet's, and the insert writes the header it
+ * is given; a TOS of "inherit" on a sit tunnel likewise, where the ip6tnl
+ * insert has a flag for it and the sit one does not. Returns the device the
+ * outer packet leaves by, which is where the walk continues.
+ */
+static struct net_device *ft_tunnel_hop(struct net_device *logical,
+					const struct nf_flow_tunnel *hop,
+					struct cdx_ft_tunnel *out)
+{
+	struct net_device *lower;
+
+	if (!hop->lower_ifindex)
+		return NULL;
+	lower = __dev_get_by_index(&init_net, hop->lower_ifindex);
+	if (!lower || lower == logical || !hop->ttl ||
+	    (hop->flags & CDX_FT_TUNNEL_DSCP_COPY && logical->type != ARPHRD_TUNNEL6))
+		return NULL;
+	memset(out, 0, sizeof(*out));
+	if (logical->type == ARPHRD_SIT) {
+		const struct ip_tunnel *tunnel = netdev_priv(logical);
+		const struct iphdr *tiph = &tunnel->parms.iph;
+
+		if (hop->family != AF_INET || hop->proto != IPPROTO_IPV6 ||
+		    (hop->flags & CDX_FT_TUNNEL_INHERIT_TOS) ||
+		    !tiph->daddr || tiph->daddr != hop->daddr.ip ||
+		    (tiph->saddr && tiph->saddr != hop->saddr.ip) ||
+		    !hop->saddr.ip || tiph->ttl != hop->ttl ||
+		    tiph->tos != hop->tos ||
+		    ipv4_is_multicast(hop->daddr.ip) || ipv4_is_lbcast(hop->daddr.ip))
+			return NULL;
+		out->mode = CDX_FT_TUNNEL_6O4;
+		out->header_size = sizeof(struct iphdr);
+	} else if (logical->type == ARPHRD_TUNNEL6) {
+		const struct ip6_tnl *tunnel = netdev_priv(logical);
+		const struct __ip6_tnl_parm *parms = &tunnel->parms;
+
+		if (hop->family != AF_INET6 || hop->proto != IPPROTO_IPIP ||
+		    (parms->proto != IPPROTO_IPIP && parms->proto) ||
+		    !ipv6_addr_equal(&parms->laddr, &hop->saddr.in6) ||
+		    !ipv6_addr_equal(&parms->raddr, &hop->daddr.in6) ||
+		    parms->hop_limit != hop->ttl ||
+		    ipv6_addr_is_multicast(&hop->daddr.in6) ||
+		    !!(parms->flags & IP6_TNL_F_USE_ORIG_TCLASS) !=
+		    !!(hop->flags & CDX_FT_TUNNEL_INHERIT_TOS))
+			return NULL;
+		out->mode = CDX_FT_TUNNEL_4O6;
+		out->header_size = sizeof(struct ipv6hdr);
+	} else {
+		return NULL;
+	}
+	/* The outer next hop has to be somewhere the hardware can send to. A
+	 * ppp device below the tunnel resolves no address at all -- its
+	 * neighbours carry the zero one -- and the session hop then names the
+	 * concentrator instead, so only a lower device that does resolve
+	 * neighbours is held to this. */
+	if (lower->type != ARPHRD_PPP && !is_valid_ether_addr(hop->h_dest))
+		return NULL;
+	out->present = true;
+	out->family = hop->family;
+	out->proto = hop->proto;
+	out->ttl = hop->ttl;
+	out->tos = hop->tos;
+	out->flags = hop->flags;
+	out->flowlabel = hop->flowlabel;
+	out->local = hop->saddr;
+	out->remote = hop->daddr;
+	out->nexthop = hop->nexthop;
+	ether_addr_copy(out->mac, hop->h_dest);
+	out->ifindex = logical->ifindex;
+	out->lower_ifindex = hop->lower_ifindex;
+	return lower;
+}
+
 static int ft_path_stack(struct net_device *logical, struct net_device *physical,
 			 const struct nf_flow_session *session,
+			 const struct nf_flow_tunnel *tunnel,
 			 struct cdx_ft_vlan *stack, struct net_device **bridge,
-			 u16 *bridge_vid, struct cdx_ft_session *out_session)
+			 u16 *bridge_vid, struct cdx_ft_session *out_session,
+			 struct cdx_ft_tunnel *out_tunnel)
 {
 	/* Zeroed so a tag the bridge adds carries no device: ft_bridge_vlan()
 	 * writes the tag and leaves ifindex alone. */
@@ -1372,8 +1561,21 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 	*bridge = NULL;
 	*bridge_vid = 0;
 	memset(out_session, 0, sizeof(*out_session));
-	if (!logical || !physical || !session)
+	memset(out_tunnel, 0, sizeof(*out_tunnel));
+	if (!logical || !physical || !session || !tunnel)
 		return -EOPNOTSUPP;
+	/* The tunnel hop comes first of all, for the same structural reason
+	 * the session hop comes before the loop: a tunnel is the outermost
+	 * header a direction inserts, so the device it leaves by may be a ppp
+	 * device, a VLAN device, a bridge or the port itself, and each of those
+	 * is then walked as usual. The loop never returns here, so a tunnel
+	 * anywhere else on the path is declined as any other unsupported upper
+	 * device is. */
+	if (ft_tunnel_dev(logical)) {
+		logical = ft_tunnel_hop(logical, tunnel, out_tunnel);
+		if (!logical)
+			return -EOPNOTSUPP;
+	}
 	/* The session hop is taken before the walk rather than inside it, which
 	 * is what makes "at most one, and outermost" structural instead of
 	 * guarded: the loop never comes back here, so a second ppp device, or
@@ -1444,8 +1646,9 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 	/* A session the kernel's walk crossed but this one did not reach is a
 	 * path shape this contract does not describe, and the hardware would be
 	 * asked to forward it with no session header at all. Refuse rather than
-	 * silently drop the hop. */
-	if (session->lower_ifindex && !out_session->present)
+	 * silently drop the hop. The same for a tunnel. */
+	if ((session->lower_ifindex && !out_session->present) ||
+	    (tunnel->lower_ifindex && !out_tunnel->present))
 		return -EOPNOTSUPP;
 	/* A session spends one of the encapsulation slots a direction has, so a
 	 * session and a full tag stack together exceed what a tuple can
@@ -1691,17 +1894,30 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * paired with this direction's destination is what it inserts, and the
 	 * one paired with the reverse destination is what it strips. */
 	vlans = ft_path_stack(out->out_logical, out->out, cls->nf_session,
-			      out->out_vlan, &out->out_bridge,
-			      &out->out_bridge_vid, &out->out_session);
+			      cls->nf_tunnel, out->out_vlan, &out->out_bridge,
+			      &out->out_bridge_vid, &out->out_session,
+			      &out->out_tunnel);
 	if (vlans < 0)
 		return vlans;
 	out->out_vlans = vlans;
 	vlans = ft_path_stack(out->in_logical, out->in, cls->nf_session_reverse,
-			      out->in_vlan, &out->in_bridge,
-			      &out->in_bridge_vid, &out->in_session);
+			      cls->nf_tunnel_reverse, out->in_vlan, &out->in_bridge,
+			      &out->in_bridge_vid, &out->in_session, &out->in_tunnel);
 	if (vlans < 0)
 		return vlans;
 	out->in_vlans = vlans;
+	/* A tunnel carries one family inside the other, and the mode the device
+	 * decided has to be the one the flow's family asks for: a sit device
+	 * with an IPv4 flow through it is IPv4 in IPv4, which the hardware does
+	 * not build, and an ip6tnl device in "any" mode carrying IPv6 is IPv6
+	 * in IPv6, which it does not build either. */
+	if ((out->out_tunnel.present &&
+	     out->out_tunnel.mode != (family == AF_INET6 ? CDX_FT_TUNNEL_6O4 :
+				      CDX_FT_TUNNEL_4O6)) ||
+	    (out->in_tunnel.present &&
+	     out->in_tunnel.mode != (family == AF_INET6 ? CDX_FT_TUNNEL_6O4 :
+				     CDX_FT_TUNNEL_4O6)))
+		return ask_refuse(-EOPNOTSUPP);
 	/* The Ethernet source a neighbour-output flow carries is the physical
 	 * port's, and the encoder caches exactly one address per port. A logical
 	 * device that does not share that address would have software emit one
@@ -1711,17 +1927,27 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * this also decides which ports of a multi-port bridge are eligible.
 	 * A ppp device has no address at all -- addr_len is zero -- so where a
 	 * session is present the same rule is imposed by the walk, on the
-	 * device below it, which is the one that does have one. */
-	if (!out->out_session.present &&
+	 * device below it, which is the one that does have one. A tunnel
+	 * device's address is its local IP address, so the same applies. */
+	if (!out->out_session.present && !out->out_tunnel.present &&
 	    !ether_addr_equal(out->out_logical->dev_addr, out->out->dev_addr))
 		return ask_refuse(-EOPNOTSUPP);
+	if (out->out_tunnel.present && !out->out_session.present) {
+		struct net_device *lower = __dev_get_by_index(
+			&init_net, out->out_tunnel.lower_ifindex);
+
+		if (!lower || !ether_addr_equal(lower->dev_addr, out->out->dev_addr))
+			return ask_refuse(-EOPNOTSUPP);
+	}
 	/* Re-entering the port a frame arrived on is a hairpin, and needs full
 	 * NAT to be a distinct path -- unless the two stacks differ, which is
 	 * ordinary routing between VLANs carried on one trunk, or the two
-	 * sessions do, which is the same thing one layer down. */
+	 * sessions do, which is the same thing one layer down, or the two
+	 * tunnels do, one layer up. */
 	if (out->out == out->in && out->out_vlans == out->in_vlans &&
 	    ft_same_tags(out->out_vlan, out->in_vlan, out->in_vlans) &&
 	    out->out_session.present == out->in_session.present &&
+	    out->out_tunnel.present == out->in_tunnel.present &&
 	    (READ_ONCE(cls->nf_ct->status) & IPS_NAT_MASK) != IPS_NAT_MASK)
 		return ask_refuse(-EOPNOTSUPP);
 	if (!ft_translation(cls, out))
@@ -1784,6 +2010,12 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return ask_refuse(-EOPNOTSUPP);
+	/* A tunnel inside a transform, or a transform inside a tunnel, is a
+	 * header order nothing here proves. The walk already refuses an outer
+	 * packet a policy would transform; this refuses an inner one. */
+	if ((out->out_tunnel.present || out->in_tunnel.present) &&
+	    (out->sa_handle || out->in_sa_handle))
+		return ask_refuse(-EOPNOTSUPP);
 	if (out->out_session.present) {
 		/* A ppp device resolves no Ethernet destination and Netfilter
 		 * writes none: flow_offload_eth_dst() reads the NOARP neighbour
@@ -1793,10 +2025,36 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		 * destination is the concentrator the session names. Requiring
 		 * the zero rather than ignoring the words is what keeps a
 		 * future kernel that starts writing something here from being
-		 * silently overridden. */
+		 * silently overridden. A tunnel over the session changes none
+		 * of this: the outer packet is still addressed to the
+		 * concentrator. */
 		if (!is_zero_ether_addr(ethernet))
 			return ask_refuse(-EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, out->out_session.mac);
+	} else if (out->out_tunnel.present) {
+		struct net_device *lower = __dev_get_by_index(
+			&init_net, out->out_tunnel.lower_ifindex);
+		u8 own[ETH_ALEN] = {};
+
+		/* A tunnel device is NOARP too, but unlike a ppp device it has
+		 * header ops and an address -- its local IP address, four or
+		 * sixteen bytes -- and for such a device ndisc_constructor() and
+		 * arp_constructor() both copy that address into the neighbour's
+		 * hardware address. So what Netfilter writes into the four
+		 * mangle words is the tunnel's own local address, zero-padded
+		 * to six bytes, and that is what is required here, exactly, for
+		 * the reason the session arm requires zero: a kernel that
+		 * started resolving something else there must not be silently
+		 * overridden. The destination is the outer next hop the walk
+		 * resolved on the device below, checked against that device's
+		 * neighbour as a routed flow's is checked against its own. */
+		memcpy(own, out->out_logical->dev_addr,
+		       min_t(unsigned int, out->out_logical->addr_len, ETH_ALEN));
+		if (memcmp(ethernet, own, ETH_ALEN) || !lower ||
+		    !ft_neigh_check(out->out_tunnel.family, lower,
+				    &out->out_tunnel.nexthop, out->out_tunnel.mac))
+			return ask_refuse(-EOPNOTSUPP);
+		ether_addr_copy(out->dst_mac, out->out_tunnel.mac);
 	} else {
 		if (!is_valid_ether_addr(ethernet) ||
 		    !ft_neigh_check(family, out->out_logical, next_hop, ethernet))
@@ -1969,8 +2227,14 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
  */
 static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
 {
+	/* An ingress tunnel's outer header is stripped before the inner packet
+	 * is what Netfilter would count, so it is framing here too, one layer
+	 * up. A peer that adds an encapsulation-limit option to its IPv6 outer
+	 * header sends eight bytes more than this, which is not recoverable
+	 * per frame and is documented rather than guessed at. */
 	return ETH_HLEN + rule->in_vlans * VLAN_HLEN +
-	       (rule->in_session.present ? PPPOE_SES_HLEN : 0);
+	       (rule->in_session.present ? PPPOE_SES_HLEN : 0) +
+	       (rule->in_tunnel.present ? rule->in_tunnel.header_size : 0);
 }
 
 static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
@@ -2722,6 +2986,18 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* Covers the reverse too: an interface leaving AP mode stops
 		 * being a VAP, and the worker retires it. */
 		ft_wifi_reconsider(dev);
+		/* A tunnel device raises only this when `ip tunnel change`
+		 * rewrites its endpoints, TTL or traffic class in place, and it
+		 * is always running with carrier, so the check below would
+		 * pass it. Every flow through it was admitted against the old
+		 * parameters and would keep inserting the old header from
+		 * hardware while software inserted the new one; retire them
+		 * and let the next packet re-offer each against the tunnel as
+		 * it now is. */
+		if (ft_tunnel_dev(dev)) {
+			ft_device_retire(dev, &ft_link_invalidations);
+			break;
+		}
 		if (netif_running(dev) && netif_carrier_ok(dev))
 			break;
 		fallthrough;
@@ -2774,6 +3050,18 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* And a VLAN device's counter record, which outlives its flows
 		 * and so has nothing but this event to end it. */
 		ft_dev_stats_gone(dev);
+		/* A tunnel device is never a port and never bound, only a
+		 * dependency of the flows through it, so its removal retires
+		 * exactly those and leaves the bindings up -- the same answer
+		 * as its route going away, which in `ip link del` happens in
+		 * the same RTNL transaction, too late for the retirement it
+		 * causes to have emptied the watch list before this event
+		 * arrives and takes the device for a port whose flows were
+		 * abandoned. */
+		if (ft_tunnel_dev(dev)) {
+			ft_device_retire(dev, &ft_link_invalidations);
+			break;
+		}
 		fallthrough;
 	case NETDEV_CHANGEUPPER:
 		spin_lock_bh(&ft_watch_lock);
@@ -2803,6 +3091,18 @@ static int ft_route_event(const struct netevent_ipv4_route *event)
 	spin_lock_bh(&ft_watch_lock);
 	ft_ipsec_route_moved(AF_INET, &event->dst, mask, event->prefixlen);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+		/* The outer route of an egress tunnel is a dependency of its
+		 * own, in the outer header's family rather than the flow's,
+		 * and nothing borrowed from the flow watches it: the inner
+		 * destination is on the tunnel device whatever the outer
+		 * route does. Matched on the outer destination, by the same
+		 * conservative rule as the inner endpoints below. */
+		if (entry->rule.out_tunnel.present &&
+		    entry->rule.out_tunnel.family == AF_INET &&
+		    !((entry->rule.out_tunnel.remote.ip ^ event->dst) & mask)) {
+			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+			continue;
+		}
 		/* After NAT, current egress uses new_dst; reverse egress uses src.
 		 * Check both endpoints even if only one direction installed. Match
 		 * all tables/DSCP aliases conservatively: a new more-specific route
@@ -2834,6 +3134,13 @@ static int ft_route6_event(const struct netevent_ipv6_route *event)
 	spin_lock_bh(&ft_watch_lock);
 	ft_ipsec_route_moved(AF_INET6, &event->dst, 0, event->prefixlen);
 	list_for_each_entry(entry, &ft_neigh_entries, neigh_list) {
+		if (entry->rule.out_tunnel.present &&
+		    entry->rule.out_tunnel.family == AF_INET6 &&
+		    ipv6_prefix_equal(&entry->rule.out_tunnel.remote.in6, &event->dst,
+				      event->prefixlen)) {
+			ft_handle_invalidate(entry->handle, &ft_route_invalidations);
+			continue;
+		}
 		if (entry->rule.family != AF_INET6)
 			continue;
 		if (ipv6_prefix_equal(&entry->rule.new_dst.in6, &event->dst, event->prefixlen) ||
@@ -5189,14 +5496,16 @@ static const char *ft_dev_stats_name(const struct cdx_ft_dev_stats *record, char
  * with the header rather than in the paged flow iteration because there is
  * one per device, which is the number of uplinks and VLANs rather than the
  * number of connections. */
-static void ft_dev_rows(struct seq_file *seq, enum cdx_ft_stats_kind kind)
+static void ft_tunnel_text(const struct cdx_ft_tunnel *tunnel, char *text, size_t size);
+
+static void ft_dev_rows(struct seq_file *seq, enum cdx_ft_stats_kind kind, bool tunnel)
 {
 	struct cdx_ft_dev_stats *record;
 	struct cdx_ft_stats rx, tx;
-	char name[IFNAMSIZ];
+	char name[IFNAMSIZ], tnl[IFNAMSIZ + 100];
 
 	list_for_each_entry(record, &ft_dev_stats, list) {
-		if (record->kind != kind)
+		if (record->kind != kind || record->tunnel.present != tunnel)
 			continue;
 		cdx_ft_stats_read(record->slot, &rx, &tx);
 		if (kind == CDX_FT_STATS_TIMESTAMPED)
@@ -5207,7 +5516,17 @@ static void ft_dev_rows(struct seq_file *seq, enum cdx_ft_stats_kind kind)
 				   record->session.lower_ifindex, record->refs,
 				   record->slot ? "yes" : "none",
 				   rx.packets, rx.bytes, tx.packets, tx.bytes);
-		else
+		else if (tunnel) {
+			/* The same identity the flow rows carry, so the two can
+			 * be joined, plus the device the outer packet leaves by. */
+			ft_tunnel_text(&record->tunnel, tnl, sizeof(tnl));
+			seq_printf(seq,
+				   "tunnel dev=%s ifindex=%d tnl=%s lower=%d refs=%u slot=%s rx_packets=%llu rx_bytes=%llu tx_packets=%llu tx_bytes=%llu\n",
+				   ft_dev_stats_name(record, name), record->ifindex, tnl,
+				   record->tunnel.lower_ifindex, record->refs,
+				   record->slot ? "yes" : "none",
+				   rx.packets, rx.bytes, tx.packets, tx.bytes);
+		} else
 			seq_printf(seq,
 				   "vlan dev=%s ifindex=%d refs=%u slot=%s rx_packets=%llu rx_bytes=%llu tx_packets=%llu tx_bytes=%llu\n",
 				   ft_dev_stats_name(record, name), record->ifindex, record->refs,
@@ -5231,6 +5550,36 @@ static void ft_session_text(const struct cdx_ft_session *session, char *text,
 		scnprintf(text, size, "%u@%pM", session->id, session->mac);
 }
 
+/* The tunnel as the device, the mode and the outer endpoints local first,
+ * which is how `ip -d link show` describes the device too. Shown for either
+ * direction, because both come from the same walk and the strip side naming
+ * the same tunnel as the insert side is what shows the connection agrees with
+ * itself. An IPv6 endpoint is bracketed, as the row's other addresses are, so
+ * the whole stays one whitespace-free token. */
+static void ft_tunnel_text(const struct cdx_ft_tunnel *tunnel, char *text, size_t size)
+{
+	struct net_device *dev;
+	const char *mode = tunnel->mode == CDX_FT_TUNNEL_6O4 ? "6o4" : "4o6";
+	char name[IFNAMSIZ];
+
+	if (!tunnel->present) {
+		strscpy(text, "-", size);
+		return;
+	}
+	/* By index and under RCU rather than by a pinned pointer: the record
+	 * rows outlive the flows that pinned the device. */
+	rcu_read_lock();
+	dev = dev_get_by_index_rcu(&init_net, tunnel->ifindex);
+	strscpy(name, dev ? dev->name : "?", sizeof(name));
+	rcu_read_unlock();
+	if (tunnel->family == AF_INET6)
+		scnprintf(text, size, "%s/%s:[%pI6c]>[%pI6c]", name, mode,
+			  &tunnel->local.in6, &tunnel->remote.in6);
+	else
+		scnprintf(text, size, "%s/%s:%pI4>%pI4", name, mode,
+			  &tunnel->local.ip, &tunnel->remote.ip);
+}
+
 /* The bridge, and the VID its FDB lookup was keyed on. That VID is not always
  * one of the tags: on an untagged egress port the frame carries none at all,
  * which is exactly the configuration a vlan-aware bridge ships with. */
@@ -5251,13 +5600,17 @@ static int ft_show(struct seq_file *seq, void *v)
 	struct cdx_ft_entry *entry;
 	struct cdx_ft_counters stats;
 	unsigned int session_records = 0, session_slots = 0, vlan_records = 0, vlan_slots = 0;
+	unsigned int tunnel_records = 0, tunnel_slots = 0;
 	char in_vlan[16], out_vlan[16];
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
 	char in_ppp[26], out_ppp[26];
+	char in_tnl[IFNAMSIZ + 100], out_tnl[IFNAMSIZ + 100];
 
 	if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
 		cdx_ft_stats(entry->hw, &stats);
+		ft_tunnel_text(&entry->rule.in_tunnel, in_tnl, sizeof(in_tnl));
+		ft_tunnel_text(&entry->rule.out_tunnel, out_tnl, sizeof(out_tnl));
 		ft_vlan_text(entry->rule.in_vlan, entry->rule.in_vlans, in_vlan, sizeof(in_vlan));
 		ft_vlan_text(entry->rule.out_vlan, entry->rule.out_vlans, out_vlan,
 			     sizeof(out_vlan));
@@ -5270,9 +5623,10 @@ static int ft_show(struct seq_file *seq, void *v)
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
+				   in_tnl, out_tnl,
 				   &entry->rule.src.in6, ntohs(entry->rule.sport),
 				   &entry->rule.dst.in6, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.in6, ntohs(entry->rule.new_sport),
@@ -5281,9 +5635,10 @@ static int ft_show(struct seq_file *seq, void *v)
 				   entry->rule.sa_handle, entry->rule.in_sa_handle,
 				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
+				   in_tnl, out_tnl,
 				   &entry->rule.src.ip, ntohs(entry->rule.sport),
 				   &entry->rule.dst.ip, ntohs(entry->rule.dport),
 				   &entry->rule.new_src.ip, ntohs(entry->rule.new_sport),
@@ -5297,6 +5652,9 @@ static int ft_show(struct seq_file *seq, void *v)
 		if (record->kind == CDX_FT_STATS_TIMESTAMPED) {
 			session_records++;
 			session_slots += !!record->slot;
+		} else if (record->tunnel.present) {
+			tunnel_records++;
+			tunnel_slots += !!record->slot;
 		} else {
 			vlan_records++;
 			vlan_slots += !!record->slot;
@@ -5328,9 +5686,11 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_ipsec_next_hop_updates));
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   session_records, session_slots);
-	ft_dev_rows(seq, CDX_FT_STATS_TIMESTAMPED);
+	ft_dev_rows(seq, CDX_FT_STATS_TIMESTAMPED, false);
 	seq_printf(seq, "vlan_records %u\nvlan_slots %u\n", vlan_records, vlan_slots);
-	ft_dev_rows(seq, CDX_FT_STATS_PLAIN);
+	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, false);
+	seq_printf(seq, "tunnel_records %u\ntunnel_slots %u\n", tunnel_records, tunnel_slots);
+	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, true);
 	seq_printf(seq, "mcast_groups %u\nmcast_installed %u\nmcast_refused %llu\nmcast_install_errors %llu\n"
 		   "mcast_observed %llu\nmcast_dropped %llu\nmcast_hooked %u\nmcast_hook_errors %llu\n",
 		   ft_mc_count, ft_mc_installed, ft_mc_refused,

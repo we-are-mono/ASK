@@ -59,6 +59,9 @@ struct ins_entry_info {
     uint8_t *paramptr, *opcptr;
     uint32_t *vlan_hdrs;
     struct dpa_l2hdr_info l2_info;
+    /* An encapsulation naming a tunnel reaches past the L2 half into this
+     * one, so the description apply_l2_encap() fills spans both. */
+    struct dpa_l3hdr_info l3_info;
 };
 
 static uint32_t get_logical_ifstats_base(void) { return 0; }

@@ -2,6 +2,7 @@
 #ifndef CDX_FLOWTABLE_BACKEND_H
 #define CDX_FLOWTABLE_BACKEND_H
 
+#include <linux/bits.h>
 #include <linux/types.h>
 #include <linux/if_ether.h>
 #include <linux/netfilter.h>
@@ -64,6 +65,48 @@ struct cdx_ft_session {
 	bool present;
 };
 
+/* The two IP-in-IP encapsulations the hardware can insert and strip. */
+enum cdx_ft_tunnel_mode {
+	CDX_FT_TUNNEL_NONE,
+	CDX_FT_TUNNEL_6O4,	/* IPv6 inside an IPv4 header, protocol 41 */
+	CDX_FT_TUNNEL_4O6,	/* IPv4 inside an IPv6 header, next header 4 */
+};
+
+/* Properties of a tunnel hop that hold per tunnel rather than per packet. */
+#define CDX_FT_TUNNEL_INHERIT_TOS	BIT(0)	/* outer TOS copied from the inner packet */
+#define CDX_FT_TUNNEL_DF		BIT(1)	/* the outer IPv4 header carries DF */
+#define CDX_FT_TUNNEL_ENCAP_LIMIT	BIT(2)	/* software adds a TEL option; hardware does not */
+#define CDX_FT_TUNNEL_DSCP_COPY		BIT(3)	/* on strip, the outer DSCP replaces the inner */
+
+/* One IP-in-IP tunnel on a direction's path, above every tag and above a
+ * session. present says the direction crosses one; the rest describes the
+ * outer header the direction inserts -- endpoints local first, TTL, TOS or
+ * traffic class, flow label -- or, for an ingress tunnel, the header it
+ * strips, which the strip validates no more than a session strip does. mac is
+ * the outer next hop's Ethernet address and nexthop its IP address on the
+ * device below the tunnel, which is what an egress direction resolves its
+ * destination through instead of a neighbour on the tunnel device, a tunnel
+ * device having none. ifindex names the tunnel device, for the counters and
+ * the /proc row; lower_ifindex the device the outer packet leaves by. A tunnel
+ * is an L3 header and spends no L2 encapsulation slot. */
+struct cdx_ft_tunnel {
+	union nf_inet_addr local;
+	union nf_inet_addr remote;
+	union nf_inet_addr nexthop;
+	__be32 flowlabel;
+	int ifindex;
+	int lower_ifindex;
+	u8 mac[ETH_ALEN];
+	u8 mode;
+	u8 family;		/* of the outer header: AF_INET or AF_INET6 */
+	u8 proto;		/* the outer header's protocol or next header */
+	u8 ttl;
+	u8 tos;
+	u8 flags;
+	u8 header_size;		/* 20 or 40: what the direction inserts or strips */
+	bool present;
+};
+
 /* Private in-repository interface. No CDX, firmware or borrowed Netfilter
  * objects cross it; the address union is a plain UAPI value type shared with
  * conntrack so no tuple has to be transcribed. Addresses and ports are in
@@ -110,6 +153,12 @@ struct cdx_ft_rule {
 	 * destination such a direction has. */
 	struct cdx_ft_session in_session;
 	struct cdx_ft_session out_session;
+	/* The tunnel each direction crosses, outside every tag and session:
+	 * in_tunnel is the outer header stripped on ingress and out_tunnel the
+	 * one inserted on egress. An egress tunnel also decides dst_mac, the
+	 * way a session does, unless the tunnel itself runs over a session. */
+	struct cdx_ft_tunnel in_tunnel;
+	struct cdx_ft_tunnel out_tunnel;
 	u8 in_vlans;
 	u8 out_vlans;
 	u8 family;
@@ -273,6 +322,10 @@ struct cdx_ft_stats_binding {
 	 * form cannot skip one tag. */
 	struct cdx_ft_stats_slot *in_vlan[CDX_FT_VLAN_MAX];
 	struct cdx_ft_stats_slot *out_vlan[CDX_FT_VLAN_MAX];
+	/* And the tunnel device's, a plain record like a VLAN's: the strip
+	 * counts into its receive half and the insert into its transmit half. */
+	struct cdx_ft_stats_slot *in_tunnel;
+	struct cdx_ft_stats_slot *out_tunnel;
 };
 
 /* Process-context transactions serialize adapter state with CDX hardware

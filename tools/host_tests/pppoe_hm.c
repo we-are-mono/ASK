@@ -35,6 +35,9 @@ struct ins_entry_info {
     unsigned opc_count, param_size, eth_type;
     uint8_t *paramptr, *opcptr;
     struct dpa_l2hdr_info l2_info;
+    /* An encapsulation that names a tunnel writes here rather than into the
+     * L2 half, so the description apply_l2_encap() fills spans both. */
+    struct dpa_l3hdr_info l3_info;
 };
 
 static uint32_t stats_base;
@@ -305,6 +308,115 @@ int main(void)
         assert(!info.l2_info.pppoe_flow_ifstats);
         assert(!info.l2_info.pppoe_rx_stats_offset && !info.l2_info.pppoe_stats_offset);
         assert(info.l2_info.num_egress_vlan_hdrs == 1);
+        /* A tag says nothing about a tunnel either way. */
+        assert(!info.l3_info.add_tnl_header && !info.l3_info.tnl_header_present);
+        assert(!info.l3_info.tunnel_flow_ifstats && !info.l3_info.header_size);
     }
-    puts("PPPoE HM encoding, suppression and refusal checks passed");
+
+    /* The tunnel half of the same description. A tunnel is an L3 header, so it
+     * spends no encapsulation slot and lands in l3_info; what it shares with a
+     * session is that the flow names its own record, which is what stops the
+     * opcodes resolving a registered tunnel interface that does not exist. */
+    {
+        struct ins_entry_info info;
+        struct cdx_l2_encap encap;
+        uint8_t outer[40];
+
+        for (unsigned i = 0; i < sizeof(outer); i++) outer[i] = (uint8_t)(0x40 + i);
+
+        /* Egress only: the header the insert writes, its size and the
+         * transmit record. */
+        memset(&info, 0, sizeof(info));
+        encap = (struct cdx_l2_encap){};
+        encap.egress_tunnel.present = 1;
+        encap.egress_tunnel.mode = TNL_MODE_6O4;
+        encap.egress_tunnel.header_size = 20;
+        encap.egress_tunnel.stats_index = 0x0d;
+        memcpy(encap.egress_tunnel.header, outer, 20);
+        assert(apply_l2_encap(&info, &encap) == SUCCESS);
+        assert(info.l3_info.add_tnl_header && !info.l3_info.tnl_header_present);
+        assert(info.l3_info.tunnel_flow_ifstats);
+        assert(info.l3_info.mode == TNL_MODE_6O4 && info.l3_info.header_size == 20);
+        assert(!memcmp(info.l3_info.header, outer, 20));
+        /* Only what the description named: the bytes past the header stay
+         * zero, so a size that grew would not carry stale ones along. */
+        assert(!info.l3_info.header[20]);
+        assert(info.l3_info.tunnel_stats_offset == 0x0d);
+        /* A direction that strips nothing names no receive record. */
+        assert(!info.l3_info.tunnel_rx_stats_offset && !info.l3_info.tunnel_flags);
+
+        /* Ingress only: the strip validates nothing, so it takes the mode, the
+         * size, the DSCP-propagation flag and the receive record and no
+         * header at all. */
+        memset(&info, 0, sizeof(info));
+        encap = (struct cdx_l2_encap){};
+        encap.ingress_tunnel.present = 1;
+        encap.ingress_tunnel.mode = TNL_MODE_4O6;
+        encap.ingress_tunnel.header_size = 40;
+        encap.ingress_tunnel.flags = DSCP_COPY;
+        encap.ingress_tunnel.stats_index = 0x0e;
+        assert(apply_l2_encap(&info, &encap) == SUCCESS);
+        assert(info.l3_info.tnl_header_present && !info.l3_info.add_tnl_header);
+        assert(info.l3_info.tunnel_flow_ifstats);
+        assert(info.l3_info.mode == TNL_MODE_4O6 && info.l3_info.header_size == 40);
+        assert(info.l3_info.tunnel_flags == DSCP_COPY);
+        assert(info.l3_info.tunnel_rx_stats_offset == 0x0e);
+        assert(!info.l3_info.tunnel_stats_offset);
+        assert(!info.l3_info.header[0]);
+
+        /* Both sides of a router between two tunnels of the same shape: one
+         * mode, one size, two records and the flags of both. */
+        memset(&info, 0, sizeof(info));
+        encap = (struct cdx_l2_encap){};
+        encap.ingress_tunnel = (struct cdx_tunnel_encap){
+            .present = 1, .mode = TNL_MODE_4O6, .header_size = 40,
+            .flags = DSCP_COPY, .stats_index = 0x10 };
+        encap.egress_tunnel = (struct cdx_tunnel_encap){
+            .present = 1, .mode = TNL_MODE_4O6, .header_size = 40,
+            .flags = INHERIT_TC, .stats_index = 0x11 };
+        memcpy(encap.egress_tunnel.header, outer, 40);
+        assert(apply_l2_encap(&info, &encap) == SUCCESS);
+        assert(info.l3_info.add_tnl_header && info.l3_info.tnl_header_present);
+        assert(info.l3_info.tunnel_flags == (DSCP_COPY | INHERIT_TC));
+        assert(info.l3_info.tunnel_rx_stats_offset == 0x10);
+        assert(info.l3_info.tunnel_stats_offset == 0x11);
+        assert(!memcmp(info.l3_info.header, outer, 40));
+
+        /* One description carries one mode and one size, so a direction that
+         * strips one shape and inserts another is refused rather than encoded
+         * as whichever arm ran last. */
+        memset(&info, 0, sizeof(info));
+        encap.egress_tunnel.mode = TNL_MODE_6O4;
+        assert(apply_l2_encap(&info, &encap) == FAILURE);
+        encap.egress_tunnel.mode = TNL_MODE_4O6;
+        memset(&info, 0, sizeof(info));
+        encap.egress_tunnel.header_size = 20;
+        assert(apply_l2_encap(&info, &encap) == FAILURE);
+        encap.egress_tunnel.header_size = 40;
+
+        /* A header larger than the one the hardware inserts would run off the
+         * description; the size is a byte, so a caller can name one. */
+        memset(&info, 0, sizeof(info));
+        encap = (struct cdx_l2_encap){};
+        encap.egress_tunnel.present = 1;
+        encap.egress_tunnel.mode = TNL_MODE_4O6;
+        encap.egress_tunnel.header_size = 41;
+        assert(apply_l2_encap(&info, &encap) == FAILURE);
+
+        /* A description that already names a tunnel came from a registered
+         * interface, and replacing it would lose whatever it described. */
+        for (unsigned side = 0; side < 2; side++) {
+            memset(&info, 0, sizeof(info));
+            if (side)
+                info.l3_info.add_tnl_header = 1;
+            else
+                info.l3_info.tnl_header_present = 1;
+            encap = (struct cdx_l2_encap){};
+            encap.ingress_tunnel.present = 1;
+            encap.ingress_tunnel.mode = TNL_MODE_6O4;
+            encap.ingress_tunnel.header_size = 20;
+            assert(apply_l2_encap(&info, &encap) == FAILURE);
+        }
+    }
+    puts("PPPoE and tunnel HM encoding, suppression and refusal checks passed");
 }

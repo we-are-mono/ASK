@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from test_pppoe_hm import declaration
+from test_pppoe_hm import declaration, typedef
 from test_qos_lifecycle import function
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,6 +42,10 @@ def test_mcast_hm(tmp_path):
         re.search(r"^#define DPA_CLS_HM_MAX_VLANs.*$", common, re.M).group() + "\n"
         + declaration(common, "vlan_header")
         + declaration(common, "dpa_l2hdr_info")
+        # And the L3 half, which an encapsulation naming a tunnel writes into.
+        + typedef(common, "IPv4_HDR_STRUCT")
+        + typedef(common, "IPv6_HDR_STRUCT")
+        + declaration(common, "dpa_l3hdr_info")
         + declaration((ROOT / "cdx/control_ipv4.h").read_text(), "cdx_l2_encap")
         + "\n".join(re.findall(r"^#define\s+(?:INSERT_VLAN_HDR|INSERT_L2_HDR)\s.*$",
                                header, re.M)) + "\n"
@@ -50,6 +54,9 @@ def test_mcast_hm(tmp_path):
         + loose_declaration(header, "en_ehash_insert_l2_hdr"))
     (tmp_path / "mcast_hm.inc").write_text(
         function(ehash, "apply_l2_encap")
+        # The predicate the tag emitter gates its statistics pointer on, which
+        # it calls and this test therefore has to carry.
+        + function(ehash, "vlan_flow_stats_named")
         + function(ehash, "create_vlan_ins_hm")
         + function(ehash, "create_ethernet_hm"))
     binary = tmp_path / "mcast_hm"

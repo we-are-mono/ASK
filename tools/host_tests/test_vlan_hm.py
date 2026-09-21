@@ -6,7 +6,7 @@ import re
 import subprocess
 
 from test_ifstats import declaration as typed_declaration
-from test_pppoe_hm import display
+from test_pppoe_hm import display, typedef
 from test_qos_lifecycle import function
 
 
@@ -40,6 +40,10 @@ def test_vlan_hm(tmp_path):
                                r"ROUTE_FLOW_PVID_SET)\s.*$", ehash, re.M)) + "\n"
         + declaration(common, "vlan_header")
         + declaration(common, "dpa_l2hdr_info")
+        # And the L3 half, which an encapsulation naming a tunnel writes into.
+        + typedef(common, "IPv4_HDR_STRUCT")
+        + typedef(common, "IPv6_HDR_STRUCT")
+        + declaration(common, "dpa_l3hdr_info")
         + declaration((ROOT / "cdx/control_ipv4.h").read_text(), "cdx_l2_encap")
         # Without their trailing comments: the header runs one of them over
         # several lines, and the first line alone is an unterminated comment

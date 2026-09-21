@@ -38,11 +38,11 @@ volume. None of this needs porting; it needs deleting once CMM is retired.
 | 5 | QoS and CEETM (`module_qm`) | 1,907 | 23 | Yes — conntrack mark + `ndo_setup_tc` | Medium | **Delivered**: see the [QoS design](flowtable-qos.md), stages 1–8. Classification reaches hardware as the class word on `cdx_ft_rule` (`ft_qos_class`, queue/channel/policer/DSCP nibbles); CEETM scheduling via `ndo_setup_tc`/HTB offload; WRED; the DSCP map; and ingress-policer *selection* are all built and proved on hardware. Tests: `test_qos_control`, `test_htb_offload`, `test_police`, `test_dscp_map`, `test_ceetm_*`, `test_qos_lifecycle`. Residual, not a CMM-parity gap: the ingress-policer *rate* has no consumer control surface yet (a packaging decision, stage 8). |
 | 6 | IPsec (`module_ipsec`, `dpa_ipsec`) | 618 | 14 | Yes — `xfrmdev_ops` packet offload | Medium | **Delivered**, both directions: see the [IPsec design](flowtable-ipsec.md). Control plane is mainline `xfrmdev_ops` in packet mode, with no ASK userspace. The estimate that the shared encoder already carried the SEC action held; what it did not anticipate is that `FLOW_OFFLOAD_XMIT_XFRM` had to be *admitted* rather than excluded — three generic helpers refuse that transmit type outright, which silently kept every real tunnel in software until step 6 measured it. |
 | 7 | Multicast (`module_mcast`, `mc4`, `mc6`) | 1,785 | 4 | Partial — bridge MDB | High | **Bridged path delivered and proved on hardware, both families: see the [multicast design](flowtable-multicast.md).** Control plane is the bridge's own IGMP and MLD snooping, read off the switchdev chain the adapter was already on, with no ASK userspace and no consumer configuration at all. Not a merge blocker either way: `query mc4` on a production gateway carrying IPTV answers "table empty", so this adds a capability rather than preserving behaviour. Routed multicast is a second learner against the same encoder and is not built. |
-| 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | Encapsulation does not fit the tuple contract. |
+| 8 | Tunnels (`module_tunnel`) | 1,223 | 7 | Partial | High | **Delivered**, both modes and both directions: see the [tunnel design](flowtable-tunnels.md). 6o4 (`sit`, proto 41) and 4o6 (`ip6_tnl` ipip6, next header 4); EtherIP and GRE/IPv6 out of scope. The device walk did not reach a tunnel netdev — none carried `ndo_fill_forward_path` in 6.12 — so the increment starts with a kernel hook adding it to `sit` and `ip6_tnl` (patch 143), which records the outer header and next hop the driver's own transmit path would resolve. Egress inserts the outer header (PPPoE-shaped); ingress strips it (the reverse rule Netfilter describes with nothing), keyed on the physical port. The decap did *not* need the `IS_LOCAL`/`xfrmdev_ops` machinery this row once expected: the strip is an ordinary reverse entry on the inner tuple. Both modes offload at line rate (9.1 Gb/s); the outer DF bit is not reproducible (microcode limitation, as under CMM). |
 | 9 | Statistics (`module_stat`) | 985 | 12 | Yes — `dev_get_stats()` fold | Medium | **Delivered**: see the [interface counters guide](flowtable-statistics.md). A port's and a VLAN device's `ip -s link` and `/proc/net/dev` include the traffic the hardware forwarded, folded from the firmware's own records by `dev_get_stats()` and restated into each device's units — the framing was measured on the DK, not inferred. No FCI, no ASK binary on the reading side; `/proc/cdx_flowtable` keeps raw `vlan` rows as a diagnostic. Alongside it, the SDK driver's own receive counters now see frames the software flowtable forwards (A159, patch 104). A PPPoE session's record is keyed on its `ppp` device and folded the same way. Tests: `test_flowtable_ifstats` and `test_flowtable_pppoe_session_counters` on the rig; `test_ifstats`, `test_vlan_hm`, `test_flowtable` on the host. Not carried: tags with no device behind them (the bridge's own). |
-| 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | No Linux analogue. Scope decision before any porting. |
+| 10 | RTP/RTCP relay (`module_rtp`) | 849 | 9 | No | High | **Retired, not ported** (2026-09-20). No Linux analogue, and built on the FPP socket primitive (12): `control_rtp_relay.c` relays one socket endpoint to another (`rtp_flow_add(from_socket, to_socket)`). It is a session-border-controller media-anchoring feature; this product's one real VoIP case is a phone NATed to the ISP, already offloaded as ordinary UDP. Retires with CMM; recoverable from git history if a carrier/SBC product is ever built. See Sequencing. |
 | 11 | Wi-Fi (`module_wifi`, `dpa_wifi`) | 345 | 3 | Yes — CDX VWD VAP path | High | **Delivered**, but not via the generic `dev_fill_forward_path` this row assumed unavailable: wire→Wi-Fi flows are offloaded through the Wi-Fi offline port and per-VAP frame queues (VWD), driven by netdev events (a VAP registering) with no ASK userspace — see `cdx/cdx_wifi_backend.c` and `ft_wifi_reconsider` in `cdx/ask_flowtable.c`. Proved at ~650 Mbit/s on the DK (production kernel, offload engaged), CPU ~27%; the driver fixes it needed are A160–A176. Tests: `test_wifi_adapter`, `test_wifi_admission`, `test_wifi_control`. |
-| 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | Local termination. Decide whether it needs porting at all. |
+| 12 | Sockets (`module_socket`) | 1,641 | — | Not applicable | Medium | **Retired, not ported** (2026-09-20). An FPP socket is one locally-terminated endpoint, opened only by an explicit FCI (`CMD_IPV4_SOCK_OPEN`) that nothing on the box sends, with no auto-learning. Its only consumer is RTP relay (10), so it retires with it. Local termination also cannot be offloaded away — the CPU must receive a locally delivered packet regardless. Recoverable from git history. |
 
 ## Out of scope
 
@@ -336,8 +336,38 @@ Discard a boot's first run rather than reporting it; a single pair of runs
 cannot tell that artefact from a real difference between owners, which is why
 every cell above is two settled runs.
 
-These cover four features. The remaining subsystems each need their own paired
-measurement before the retirement claim can be made for them.
+These early rows are paired flowtable-vs-CMM, and every CMM cell equalled the
+flowtable cell. That settled the method: CMM is known to do all of this at line
+rate, so the retirement bar ("no performance lost") only asks whether the
+*ported* path reaches the same ceiling. Later confirmations are therefore
+flowtable-only, measured in the default boot with the offload confirmed active
+— no CMM boot, since CMM cannot beat a path already at its ceiling. The paired
+rows above stand as the record that established the equivalence.
+
+Confirmed flowtable line-rate so far: the four NAT shapes, IPsec, and tunnels
+below; Wi-Fi at its air ceiling (~650 Mbit/s, see the [Wi-Fi design](flowtable-wifi.md)).
+Still to confirm, each a single flowtable boot: QoS bulk throughput unaffected,
+and bridged multicast single-listener line rate. Statistics is read-back
+accuracy, not a throughput measurement.
+
+**6o4 and 4o6 tunnels, 4 streams, 20 s, KASAN image — 2026-09-21**
+
+| Direction | Flowtable | CMM |
+| --- | --- | --- |
+| 6o4, DUT inserts | 9.150 and 9.150 Gb/s, ≤14% DUT CPU | not run |
+| 6o4, DUT strips | 9.140 and 9.140 Gb/s, ≤3% DUT CPU | not run |
+| 4o6, DUT inserts | 9.140 and 9.140 Gb/s, ≤1.3% DUT CPU | not run |
+| 4o6, DUT strips | 9.080 and 9.080 Gb/s, ≤0.7% DUT CPU | not run |
+
+Two runs per cell, LAN VM → DUT → tunnel → orchestrator. Both owners forward
+this in hardware, confirmed for the flowtable by ten-plus directional entries
+each naming a tunnel and the ports' software receive counters staying in the
+tens of packets across transfers of millions. The flowtable reaches the path's
+line rate — the same ~9.1 Gb/s ceiling the NAT and IPsec rows hit, here bounded
+by the tunnel's reduced MTU and the per-packet outer header — so a paired CMM
+boot could only confirm a tie at line rate and was not run. CMM's own tunnel
+offload is separately proved by `test_tunnel_tx_offload` and
+`test_tunnel_decap_offload`, which run in CMM mode.
 
 ## Sequencing
 
@@ -348,21 +378,52 @@ proof — and nothing remaining has that shape. MACVLAN was the last candidate
 and it is out of scope, above, so the next increment is a change of kind rather
 than another one of these.
 
-**Of items 5–8, only tunnels (8) remain.** QoS (5), IPsec (6) and bridged
-multicast (7) are delivered above; each expressed behaviour a unicast flowtable
-tuple cannot carry and got its own hardware eligibility rules. Tunnels still
-need theirs.
+**Items 5–8 are all delivered.** QoS (5), IPsec (6), bridged multicast (7) and
+now tunnels (8) each expressed behaviour a unicast flowtable tuple cannot carry
+and got its own hardware eligibility rules. The tunnel increment was a walk arm
+plus an encap contract plus a hardware-measured decap path, as expected — but
+its two halves turned out simpler than this section predicted. The egress half
+is an encapsulation insert, closest to the PPPoE increment, and the tunnel
+netdevs' missing `ndo_fill_forward_path` in 6.12 was the first piece: a kernel
+hook (patch 143) adds it to `sit` and `ip6_tnl`, resolving the outer header and
+next hop the driver's transmit path would. The ingress half was *not* the
+`IS_LOCAL`/`xfrmdev_ops` category this section expected: a decapsulated tunnel
+frame re-forwards on the inner tuple as an ordinary reverse entry keyed on the
+physical port, so it needed no local-route machinery at all. See the
+[tunnel design](flowtable-tunnels.md).
 
 **Item 9 needs read-back rather than a mechanism.** The allocator that hands
 out firmware statistics records is general and a session already uses it; what
 is left is asking for a record on a VLAN's and a port's behalf and reporting
 what it holds.
 
-**Items 10 and 12 need a scoping decision first.** RTP relay has no Linux
-counterpart and sockets are local termination, so the question is whether the
-product still needs them, not how to port them. Wi-Fi (11) is delivered above
-through the CDX VWD VAP path — which is exactly why it did not need the Linux
-forward-path mechanism this section once assumed it required.
+**Items 10 and 12 are retired together, not ported** (decided 2026-09-20). In
+CMM, sockets, tunnels, RTP relay and IPsec SAs all register the same route
+class: `conntrack.c` sets `IS_LOCAL` on the FPP route for any of
+`FLOWFLAG_SOCKET_ROUTE`, `FLOWFLAG_FLOATING_TUNNEL`, `FLOWFLAG_LOCAL` or
+`FLOWFLAG_SA_ROUTE`, so to the forward engine they are one category — a
+destination that terminates on the box rather than L3-forwarding. Within that
+category the FPP *socket* (12) is the primitive, one locally-terminated
+endpoint opened only by an explicit FCI nothing on the box sends, and RTP relay
+(10) is built directly on it, relaying one socket to another
+(`control_rtp_relay.c`, `rtp_flow_add(from_socket, to_socket)`). RTP relay
+cannot be ported without sockets, and sockets have no other consumer.
+
+Both are session-border-controller and carrier media-anchoring features, and
+that is a different product from this gateway. The one real VoIP case here — a
+phone NATed to the ISP — is an ordinary UDP flow the delivered flowtable NAT
+already offloads; a single G.711 call is ~190 kbit/s and ~100 pps bidirectional,
+six orders of magnitude below where per-packet offload matters, so even a SOHO
+PBX's handful of lines is software-trivial. So both retire with CMM rather than
+being reimplemented on the flowtable. The code is not deleted ahead of the rest
+of CMM — it is the parity baseline until CMM is retired — and it stays in git
+history, so a carrier/SBC or many-line IAD product could restore it.
+
+(Tunnels share the `IS_LOCAL` category but are their own hardware object and
+follow the IPsec precedent above, so they are not gated by this decision.)
+Wi-Fi (11) is delivered above through the CDX VWD VAP path — which is exactly
+why it did not need the Linux forward-path mechanism this section once assumed
+it required.
 
 **The order was IPsec, then multicast — both now delivered (items 6, 7).** The
 reasoning is kept as the record of why they were sequenced that way.

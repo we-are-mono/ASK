@@ -140,7 +140,8 @@ async def console_python(console, script, *, timeout=20, attempts=3):
 # single "key value" counter. A row kind always yields a list, present and
 # empty when nothing of that kind exists, so a caller never has to guess
 # whether an absent key means none or means an older adapter.
-STATUS_ROWS = {"flow": "flows", "session": "sessions", "vlan": "vlans", "mcast": "mcast"}
+STATUS_ROWS = {"flow": "flows", "session": "sessions", "vlan": "vlans",
+               "tunnel": "tunnels", "mcast": "mcast"}
 
 
 def status_text(text):

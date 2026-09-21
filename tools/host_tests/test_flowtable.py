@@ -46,12 +46,13 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_neigh_table", "ft_neigh_check", "ft_nexthop_usable",
              "ft_next_hop", "ft_routes_valid", "ft_neigh_attach", "ft_neigh_detach", "ft_neigh_used",
              "ft_route_event", "ft_route6_event", "ft_neigh_event", "ft_fib_event", "ft_nexthop_event",
-             "ft_ppp_rx_overhead", "ft_dev_stats_release",
+             "ft_ppp_rx_overhead", "ft_tunnel_under",
+             "ft_dev_stats_release",
              "ft_dev_stats_get", "ft_dev_stats_put", "ft_dev_stats_gone",
              "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
              "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
-             "ft_vlan_lower", "ft_bridge_vlan", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_parse", "ft_same_key", "ft_key_hash",
+             "ft_vlan_lower", "ft_bridge_vlan", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_stats", "ft_request_targets", "ft_admission_fault", "ft_rule_callback", "ft_release", "ft_can_rearm", "ft_passive_callback", "ft_passive_release", "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_invalidate_work", "ft_entry_uses", "ft_device_used", "ft_device_retire", "ft_netdev_event",
              "ft_fdb_event", "ft_swdev_event", "ft_init_fault", "ask_flowtable_init", "ft_block_drain", "ask_flowtable_exit", "ft_position", "ft_start", "ft_next", "ft_stop"]
@@ -83,6 +84,30 @@ def test_flowtable_hardware_ownership(tmp_path):
     (tmp_path / "physical_production.inc").write_text(
         function((ROOT / "cdx/devman.c").read_text(), "dpa_get_ifinfo_by_netdev") +
         function((ROOT / "cdx/devman.c").read_text(), "dpa_netdev_is_physical"))
+    # The outer header a tunnel egress inserts, and the types the builder is
+    # written against -- the real IP headers and the real mode numbers, so a
+    # field reordered or a mode renumbered fails here rather than compiling
+    # into bytes the legacy owner and this one disagree about.
+    common = (ROOT / "cdx/cdx_common.h").read_text()
+    tunnel = (ROOT / "cdx/control_tunnel.h").read_text()
+    (tmp_path / "tunnel_types.inc").write_text(
+        "#define ENDIAN_LITTLE 1\n"
+        + re.search(r"^#define IPV6_ADDRESS_LENGTH\s.*$", common, re.M).group() + "\n"
+        + "\n".join(re.findall(r"^#define\s+IPPROTOCOL_(?:IPIP|IPV6)\s.*$",
+                               (ROOT / "cdx/fe.h").read_text(), re.M)) + "\n"
+        + re.search(r"enum TNL_MODE \{[^}]*\};", tunnel, re.S).group() + "\n"
+        + "\n".join(re.findall(r"^#define\s+(?:INHERIT_TC|DSCP_COPY)\s.*$",
+                               tunnel, re.M)) + "\n"
+        + re.search(r"typedef struct\s+IPv4_HDR_STRUCT\b.*?\}\s*\w+\s*;",
+                    common, re.S).group() + "\n"
+        + re.search(r"typedef struct\s+IPv6_HDR_STRUCT\b.*?\}\s*\w+\s*;",
+                    common, re.S).group() + "\n"
+        + re.search(r"#define IPV6_SET_VER_TC_FL.*?while \(0\)\n",
+                    (ROOT / "cdx/control_ipv6.h").read_text(), re.S).group())
+    (tmp_path / "tunnel_production.inc").write_text(
+        function((ROOT / "cdx/cdx_hal.h").read_text(), "__WRITE_UNALIGNED_INT")
+        + "#define WRITE_UNALIGNED_INT(var, val) __WRITE_UNALIGNED_INT(&(var), (val))\n"
+        + function((ROOT / "cdx/control_tunnel.c").read_text(), "tnl_build_header"))
     (tmp_path / "hardware_production.inc").write_text(source[source.index("struct cdx_ft_hw {"):])
     backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()
     (tmp_path / "backend_production.inc").write_text(backend[backend.index("static char *offload_owner"):])

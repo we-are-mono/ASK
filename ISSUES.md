@@ -152,6 +152,28 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A187 — `display_l3hdr_insert_opc()` decodes the wrong bits of the tunnel insert word.**
+  `patches/kernel/010-ask-fman-dpaa-ehash.patch`, the debug decoder for
+  `INSERT_L3_HDR`: the encoder writes the first word big-endian with the mode at
+  bits 25-24 and inherited traffic class at bit 27, but the decode prints `df`
+  from bit 28 (which is `calc_cksum`) and `cs` from bit 29 (reserved), and reads
+  `stats_ptr` through the little-endian bitfield arm, byte-reversed on an LE
+  host. `hdr_len` and the mode happen to land right. Debug-path only (the
+  `display_*` decoders run under CDX_DPA_DEBUG), no runtime effect; found while
+  building `tools/host_tests/test_tunnel_hm.py`, which pins only the correct
+  fields. Fix the bit positions and the stats-pointer read when 010 is next
+  touched.
+
+- [ ] **A186 — a tunnel over a PPPoE session is refused rather than offloaded.**
+  `cdx/ask_flowtable.c` `ft_parse`: a 6o4/4o6 tunnel whose outer packet egresses
+  over a PPPoE session (6rd or DS-Lite on a PPPoE WAN) is declined to software,
+  not misforwarded — the session-egress arm requires zero Ethernet mangle words
+  and a tunnel over it leaves the tunnel's own local address there. Frames still
+  reach their destination; only the acceleration is missing. No production
+  topology on this box needs it today. To enable: reconcile the session and
+  tunnel dst-MAC contracts so the tunnel arm runs when both are present. See
+  the [tunnel design](flowtable-tunnels.md).
+
 - [ ] **A181 — ask-flowtable render buffer can reject a validated maximal policy.**
   `flowtable/src/`: the conf validator accepts up to 256 scope + 256 exclude rules,
   but `ft_render` targets a `FT_CONF_MAX*2` (128 KiB) buffer, and a `port`-shorthand

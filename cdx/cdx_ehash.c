@@ -340,12 +340,15 @@ uint64_t XX_VirtToPhys(void * addr)
 
 static int Get_Tnl_Ethertype(int mode )
 {
+	/* Unsigned literals: 0x86dd << 16 does not fit a signed int, and the
+	 * caller keeps only the low half anyway (the inner ethertype the strip
+	 * exposes). */
 	switch(mode)
 	{
 		case TNL_MODE_6O4:
-			return ( (0x0800 << 16) | 0x86dd);
-		case TNL_MODE_4O6:		
-			return ( (0x86dd << 16) | 0x0800);
+			return ( (0x0800u << 16) | 0x86ddu);
+		case TNL_MODE_4O6:
+			return ( (0x86ddu << 16) | 0x0800u);
 		default:
 			return 0;
 	}
@@ -1108,6 +1111,51 @@ static int apply_l2_encap(struct ins_entry_info *info, const struct cdx_l2_encap
 		l2_info->pppoe_rx_stats_offset = encap->ingress_stats_index;
 		l2_info->pppoe_stats_offset = encap->egress_stats_index;
 #endif
+	}
+	if (encap->ingress_tunnel.present || encap->egress_tunnel.present) {
+		struct dpa_l3hdr_info *l3_info = &info->l3_info;
+
+		/* The same refusal as for a tag: a route whose interfaces
+		 * already describe a tunnel is the legacy owner's, and a flow
+		 * naming one on top of it would describe two. */
+		if (l3_info->add_tnl_header || l3_info->tnl_header_present) {
+			DPA_ERROR("%s::interfaces already describe a tunnel\n", __func__);
+			return FAILURE;
+		}
+		/* One mode and one header size per direction. Both sides of a
+		 * direction carry the same inner family, so a direction that
+		 * strips one tunnel and inserts another -- a router between two
+		 * tunnels -- has the same mode on both, and the encoder's single
+		 * description of it is not a limitation. */
+		if (encap->ingress_tunnel.present && encap->egress_tunnel.present &&
+		    (encap->ingress_tunnel.mode != encap->egress_tunnel.mode ||
+		     encap->ingress_tunnel.header_size != encap->egress_tunnel.header_size)) {
+			DPA_ERROR("%s::a direction strips one tunnel mode and inserts another\n",
+				  __func__);
+			return FAILURE;
+		}
+		l3_info->tunnel_flow_ifstats = 1;
+		if (encap->ingress_tunnel.present) {
+			l3_info->tnl_header_present = 1;
+			l3_info->mode = encap->ingress_tunnel.mode;
+			l3_info->header_size = encap->ingress_tunnel.header_size;
+			l3_info->tunnel_flags |= encap->ingress_tunnel.flags;
+			l3_info->tunnel_rx_stats_offset = encap->ingress_tunnel.stats_index;
+		}
+		if (encap->egress_tunnel.present) {
+			if (encap->egress_tunnel.header_size > sizeof(l3_info->header)) {
+				DPA_ERROR("%s::tunnel header larger than the hardware inserts\n",
+					  __func__);
+				return FAILURE;
+			}
+			l3_info->add_tnl_header = 1;
+			l3_info->mode = encap->egress_tunnel.mode;
+			l3_info->header_size = encap->egress_tunnel.header_size;
+			memcpy(l3_info->header, encap->egress_tunnel.header,
+			       encap->egress_tunnel.header_size);
+			l3_info->tunnel_flags |= encap->egress_tunnel.flags;
+			l3_info->tunnel_stats_offset = encap->egress_tunnel.stats_index;
+		}
 	}
 	return SUCCESS;
 }
@@ -2442,7 +2490,20 @@ static int create_nat_hm(struct ins_entry_info *info)
 	info->opcptr++;
 	return ret;
 }
-static int create_tunnel_insert_hm(struct ins_entry_info *info) 
+#ifdef INCLUDE_TUNNEL_IFSTATS
+/* The statistics pointer a flow-described tunnel's opcodes carry: the record
+ * at the given index of the plain pool, or the null pointer for no record.
+ * Index zero is another owner's record, never "none". */
+static uint32_t tunnel_stats_pointer(uint8_t index)
+{
+	if (!index)
+		return 0;
+	return (get_logical_ifstats_base() +
+		(index * sizeof(struct en_ehash_stats))) & 0xffffff;
+}
+#endif
+
+static int create_tunnel_insert_hm(struct ins_entry_info *info)
 {
 	uint32_t size;
 	uint32_t word;
@@ -2483,7 +2544,12 @@ static int create_tunnel_insert_hm(struct ins_entry_info *info)
 	//TODO: routing destination offset is now 0
 	word = 0;
 #ifdef INCLUDE_TUNNEL_IFSTATS
-	{
+	if (info->l3_info.tunnel_flow_ifstats) {
+		/* A flow-described tunnel names its own record, or names
+		 * none; the legacy lookup below resolves a registered tunnel
+		 * interface, which such a flow does not have. */
+		word |= tunnel_stats_pointer(info->l3_info.tunnel_stats_offset);
+	} else {
 		uint8_t offset;
 		PCtEntry ctentry;
 
@@ -2536,7 +2602,14 @@ static int create_tunnel_remove_hm(struct ins_entry_info *info)
 	}
 
 #ifdef INCLUDE_TUNNEL_IFSTATS
-	{
+	if (info->l3_info.tunnel_flow_ifstats) {
+		/* The lookup below resolves a registered tunnel interface,
+		 * which a flow-described tunnel does not have: input_itf is the
+		 * physical port and the lookup would fail outright, taking the
+		 * flow with it. Such a tunnel names its receive record in the
+		 * description instead, or names none. */
+		word |= tunnel_stats_pointer(info->l3_info.tunnel_rx_stats_offset);
+	} else {
 		uint8_t offset;
 		if (dpa_get_iface_stats_entries(ctentry->pRtEntry->input_itf->index, 0,
 					&offset, RX_IFSTATS, IF_TYPE_TUNNEL)) {

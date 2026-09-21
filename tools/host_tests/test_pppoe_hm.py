@@ -22,6 +22,14 @@ def declaration(source, name):
     return source[start:source.index(";", end) + 1] + "\n"
 
 
+def typedef(source, tag):
+    """A typedef'd struct, tag through to the name it is typedef'd to. The two
+    IP headers are declared this way and the L3 description embeds both."""
+    match = re.search(r"typedef struct\s+" + tag + r"\b.*?\}\s*\w+\s*;", source, re.S)
+    assert match, tag
+    return match.group() + "\n"
+
+
 def display(source, name):
     body = source[source.index("static inline void *" + name + "("):]
     return body[:body.index("\n}") + 3]
@@ -39,10 +47,20 @@ def test_pppoe_hm(tmp_path):
     # The real L2 description and the real caller-supplied encapsulation, not a
     # restatement of them: a field renamed or resized on either side of that
     # boundary has to fail here rather than compile into a silent mismatch.
+    tunnel = (ROOT / "cdx/control_tunnel.h").read_text()
     (tmp_path / "pppoe_hm_types.inc").write_text(
         re.search(r"^#define DPA_CLS_HM_MAX_VLANs.*$", common, re.M).group() + "\n"
+        + re.search(r"enum TNL_MODE \{[^}]*\};", tunnel, re.S).group() + "\n"
+        + "\n".join(re.findall(r"^#define\s+(?:INHERIT_TC|DSCP_COPY)\s.*$",
+                               tunnel, re.M)) + "\n"
         + declaration(common, "vlan_header")
         + declaration(common, "dpa_l2hdr_info")
+        # The L3 description too: an encapsulation naming a tunnel reaches past
+        # the L2 half into this one, so the same "real type, not a copy" rule
+        # has to cover it.
+        + typedef(common, "IPv4_HDR_STRUCT")
+        + typedef(common, "IPv6_HDR_STRUCT")
+        + declaration(common, "dpa_l3hdr_info")
         + declaration((ROOT / "cdx/control_ipv4.h").read_text(), "cdx_l2_encap")
         + "\n".join(re.findall(r"^#define\s+(?:PPPoE_VERSION|PPPoE_TYPE|PPPoE_CODE|"
                                r"STATS_WITH_TS|INSERT_PPPoE_HDR|STRIP_PPPoE_HDR)\s.*$",

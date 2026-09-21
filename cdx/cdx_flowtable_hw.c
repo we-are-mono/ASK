@@ -3,10 +3,12 @@
  * hash, route hash, CMM notification, or ageing timer owns these objects. */
 #include <linux/etherdevice.h>
 #include <linux/module.h>
+#include <net/ip.h>
 #include <net/ipv6.h>
 #include "portdefs.h"
 #include "cdx.h"
 #include "control_ipv4.h"
+#include "control_tunnel.h"
 #include "fm_ehash.h"
 #include "cdx_flowtable_backend.h"
 #include "cdx_flowtable_hw.h"
@@ -166,6 +168,14 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * rather than per-flow ones, and the same reasoning is already written
 	 * down beside the tunnel-interface case in devman.c. */
 	hw->route.mtu = rule->sa_handle ? rule->out_logical->mtu : rule->mtu;
+	/* The same reasoning for a tunnel, where the expansion is a fixed
+	 * header rather than SEC's variable one: Netfilter's MTU is the tunnel
+	 * device's, already reduced by the outer header, and the microcode
+	 * compares the outer packet against what it is given, so the header
+	 * goes back on here. This is the arithmetic the legacy owner's
+	 * tunnel-interface arm in devman.c does. */
+	if (rule->out_tunnel.present)
+		hw->route.mtu += rule->out_tunnel.header_size;
 	ether_addr_copy(hw->route.dstmac, rule->dst_mac);
 	ct = &hw->entry;
 	ct->twin = &hw->twin;
@@ -242,6 +252,49 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * description like dpa_l2hdr_info. */
 	ft_encap_stats(stats->in_vlan, rule->in_vlans, true, encap.ingress_vlan_stats_index);
 	ft_encap_stats(stats->out_vlan, rule->out_vlans, false, encap.egress_vlan_stats_index);
+	/* A tunnel on either side, outside everything above. The egress header
+	 * is built by the same function the legacy tunnel interface builds its
+	 * own with, from the endpoints, TTL and traffic class the walk
+	 * recorded, so both owners insert the same bytes; the per-packet
+	 * fields are the microcode's. The size it comes back with has to be
+	 * the one admission derived from the device, or the two would be
+	 * describing different headers. */
+	if (rule->out_tunnel.present) {
+		const struct cdx_ft_tunnel *tunnel = &rule->out_tunnel;
+		struct cdx_tunnel_encap *egress = &encap.egress_tunnel;
+		u32 fl = tunnel->family == AF_INET6 ?
+			(htonl((u32)tunnel->tos << 20) | tunnel->flowlabel) : tunnel->tos;
+
+		egress->present = 1;
+		egress->mode = tunnel->mode == CDX_FT_TUNNEL_6O4 ? TNL_MODE_6O4 : TNL_MODE_4O6;
+		egress->flags = tunnel->flags & CDX_FT_TUNNEL_INHERIT_TOS ? INHERIT_TC : 0;
+		/* The outer IPv4 header carries no don't-fragment bit, which is
+		 * a limitation of the INSERT_L3_HDR opcode rather than a choice:
+		 * measured on the DK, the microcode fills the fragment field
+		 * itself and ignores the template's, so a header built with DF
+		 * still leaves the port without it. The legacy owner met the
+		 * same wall and hardcoded frag_off to zero in M_tnl_build_header;
+		 * this matches it. So the tunnel device's pmtudisc setting
+		 * reaches the wire only for frames the CPU forwards. */
+		egress->header_size = tnl_build_header(egress->mode, tunnel->local.all,
+						       tunnel->remote.all, fl, tunnel->ttl,
+						       0, egress->header);
+		if (egress->header_size != tunnel->header_size) {
+			kfree(hw);
+			return ask_refuse(-EOPNOTSUPP);
+		}
+		egress->stats_index = stats->out_tunnel ? stats->out_tunnel->tx_index : 0;
+	}
+	if (rule->in_tunnel.present) {
+		const struct cdx_ft_tunnel *tunnel = &rule->in_tunnel;
+		struct cdx_tunnel_encap *ingress = &encap.ingress_tunnel;
+
+		ingress->present = 1;
+		ingress->mode = tunnel->mode == CDX_FT_TUNNEL_6O4 ? TNL_MODE_6O4 : TNL_MODE_4O6;
+		ingress->header_size = tunnel->header_size;
+		ingress->flags = tunnel->flags & CDX_FT_TUNNEL_DSCP_COPY ? DSCP_COPY : 0;
+		ingress->stats_index = stats->in_tunnel ? stats->in_tunnel->rx_index : 0;
+	}
 	/* The shared encoder reads this on its way to cdx_get_txfqid(), which
 	 * resolves the pair to a CEETM logical FQ and bakes that FQID into the
 	 * classifier action. Leaving it zero, as this backend did before, asks
@@ -318,7 +371,9 @@ int cdx_ft_hw_add(const struct cdx_ft_rule *rule,
 	 * a flow that is not asking to replace anything. */
 	if (insert_entry_in_classif_table_encap(
 		    ct, encap.num_ingress || encap.num_egress ||
-			encap.ingress_pppoe || encap.egress_pppoe ? &encap : NULL)) {
+			encap.ingress_pppoe || encap.egress_pppoe ||
+			encap.ingress_tunnel.present || encap.egress_tunnel.present ?
+			&encap : NULL)) {
 		kfree(hw);
 		return -EIO;
 	}

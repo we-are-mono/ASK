@@ -1,0 +1,466 @@
+From f4996fccc2c9a449aa787280b6ed9cf1feb0f931 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Mon, 21 Sep 2026 02:09:46 +0200
+Subject: [PATCH] netfilter: walk the forwarding path through sit and ip6_tnl
+ devices
+
+A flow whose egress is an IP-in-IP tunnel stopped at the tunnel device:
+sit and ip6_tnl had no ndo_fill_forward_path, so the walk that lets a
+hardware adapter describe VLAN, bridge and PPPoE paths never reached
+the port the outer packet leaves by, and the reverse direction kept the
+tunnel device as its ingress, where no hardware can match it.
+
+Give both drivers the hook. Each resolves the hop exactly as its
+transmit path would -- the outer route, its next hop and that hop's
+neighbour on the device below -- and records the outer header it would
+prepend in a new DEV_PATH_TUNNEL entry: family, protocol, TTL, TOS or
+traffic class, flow label, the endpoints, the next hop and the per-tunnel
+properties software decides once (inherited TOS, DF, the encapsulation
+limit option, DSCP copy on receive). The walk then continues on the
+outer route's device with ctx->daddr set to the next hop's address, so a
+tunnel over a VLAN device, a bridge or a PPPoE session is descended like
+any upper device. Only a point-to-point tunnel is a hop: 6rd, ISATAP,
+NBMA, collect_md, FOU/GUE, a per-packet mark and a transformed outer
+route are refused by the hook.
+
+The flowtable carries the hop whole, as it carries a PPPoE session:
+nf_flow_tunnel on the route and the tuple, handed to the driver as
+nf_tunnel and nf_tunnel_reverse beside the two destinations. Nothing
+else describes it -- no push action for the header a direction inserts,
+no pop or dissector key for the one it strips -- and it spends no
+encapsulation slot, since those are the L2 headers a rule can pop and
+push. Only a table that asked for neighbour output takes the hop; any
+other keeps the tunnel device as the reverse ingress, where the software
+path matches the decapsulated packet, which moving the ingress to the
+port below would lose.
+
+Context version 9.
+---
+ include/linux/netdevice.h             | 32 +++++++++++
+ include/net/flow_offload.h            | 10 +++-
+ include/net/netfilter/nf_flow_table.h | 29 ++++++++++
+ net/ipv6/ip6_tunnel.c                 | 82 +++++++++++++++++++++++++++
+ net/ipv6/sit.c                        | 69 ++++++++++++++++++++++
+ net/netfilter/nf_flow_table_core.c    |  1 +
+ net/netfilter/nf_flow_table_offload.c |  2 +
+ net/netfilter/nft_flow_offload.c      | 38 +++++++++++++
+ 8 files changed, 261 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index c658c038556d..5658e8d15f41 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -839,8 +839,21 @@ enum net_device_path_type {
+ 	DEV_PATH_PPPOE,
+ 	DEV_PATH_DSA,
+ 	DEV_PATH_MTK_WDMA,
++	DEV_PATH_TUNNEL,
+ };
+ 
++/* Properties of a DEV_PATH_TUNNEL hop that its transmit path decides per
++ * tunnel rather than per packet. INHERIT_TOS: the outer TOS or traffic class
++ * is copied from the inner packet, and the recorded one is zero. DF: the
++ * outer IPv4 header carries the don't-fragment bit. ENCAP_LIMIT: the outer
++ * IPv6 header is followed by a destination options header carrying a tunnel
++ * encapsulation limit. DSCP_COPY: on receive, the outer DSCP replaces the
++ * inner packet's. */
++#define DEV_PATH_TUNNEL_F_INHERIT_TOS	BIT(0)
++#define DEV_PATH_TUNNEL_F_DF		BIT(1)
++#define DEV_PATH_TUNNEL_F_ENCAP_LIMIT	BIT(2)
++#define DEV_PATH_TUNNEL_F_DSCP_COPY	BIT(3)
++
+ struct net_device_path {
+ 	enum net_device_path_type	type;
+ 	const struct net_device		*dev;
+@@ -871,6 +884,25 @@ struct net_device_path {
+ 			u8 bss;
+ 			u8 amsdu;
+ 		} mtk_wdma;
++		/* An IP-in-IP tunnel device: the outer header its transmit
++		 * path would prepend, resolved as that path resolves it, and
++		 * the next hop the outer packet leaves for. The walk continues
++		 * on the device the outer route names, with ctx->daddr set to
++		 * that next hop's address, so a tunnel over a VLAN device, a
++		 * bridge or a PPPoE session is walked past the tunnel as any
++		 * other upper device is. */
++		struct {
++			u8	family;		/* AF_INET or AF_INET6: the outer header */
++			u8	proto;		/* its protocol or next header */
++			u8	ttl;		/* zero copies the inner packet's */
++			u8	tos;		/* TOS or traffic class */
++			u8	flags;		/* DEV_PATH_TUNNEL_F_* */
++			u8	h_dest[ETH_ALEN];
++			__be32	flowlabel;	/* an IPv6 outer header's, or zero */
++			__be32	saddr[4];	/* the outer endpoints, IPv4 in [0] */
++			__be32	daddr[4];
++			__be32	nexthop[4];	/* the outer route's next hop */
++		} tunnel;
+ 	};
+ };
+ 
+diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
+index c619bb1cb63f..5c9bcfebc49a 100644
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -690,6 +690,7 @@ struct flow_cls_common_offload {
+ 
+ struct nf_flow_offload_handle;
+ struct nf_flow_session;
++struct nf_flow_tunnel;
+ 
+ /* Context is borrowed for the callback and NULL for other producers. Drivers
+  * must not retain nf_ct, either dst or either session. nf_dst is this
+@@ -707,14 +708,19 @@ struct nf_flow_session;
+  * if any: nf_session belongs to nf_dst and nf_session_reverse to
+  * nf_dst_reverse, so a direction's egress and ingress sessions are named the
+  * same way its two destinations are. Both are always non-NULL; a path with no
+- * session reports a zero lower_ifindex. */
+-#define FLOW_CLS_HAS_NF_CONTEXT 8
++ * session reports a zero lower_ifindex.
++ * Version 9 does the same for the IP-in-IP tunnel a path crosses: nf_tunnel
++ * belongs to nf_dst and nf_tunnel_reverse to nf_dst_reverse, always non-NULL,
++ * and a path with no tunnel reports a zero lower_ifindex. */
++#define FLOW_CLS_HAS_NF_CONTEXT 9
+ struct flow_cls_offload {
+ 	const struct nf_conn *nf_ct;
+ 	struct dst_entry *nf_dst;
+ 	struct dst_entry *nf_dst_reverse;
+ 	const struct nf_flow_session *nf_session;
+ 	const struct nf_flow_session *nf_session_reverse;
++	const struct nf_flow_tunnel *nf_tunnel;
++	const struct nf_flow_tunnel *nf_tunnel_reverse;
+ 	struct nf_flow_offload_handle *nf_handle;
+ 	u32 nf_dst_cookie;
+ 	u32 nf_dst_reverse_cookie;
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+index 3764c26d19ba..64701d13405a 100644
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -130,6 +130,32 @@ struct nf_flow_session {
+ 	u8				h_dest[ETH_ALEN];
+ };
+ 
++/* One IP-in-IP tunnel on the path a direction transmits over, as the tunnel
++ * device's own forwarding-path hook resolved it: the outer header it would
++ * prepend, the next hop the outer packet leaves for and its address, and the
++ * device it leaves by. A hardware adapter cannot re-derive any of it: the
++ * outer route is looked up by the tunnel's transmit path rather than by the
++ * flow's, and a tunnel device registers no lower neighbour. Netfilter
++ * describes neither half -- there is no push for the header a direction
++ * inserts and no pop or key for the one it strips -- so this record is the
++ * only account of the hop a rule carries. lower_ifindex is zero when the path
++ * crosses no tunnel, which makes the whole record meaningless, exactly as for
++ * a session. The flags are DEV_PATH_TUNNEL_F_*.
++ */
++struct nf_flow_tunnel {
++	int				lower_ifindex;
++	u8				family;
++	u8				proto;
++	u8				ttl;
++	u8				tos;
++	u8				flags;
++	u8				h_dest[ETH_ALEN];
++	__be32				flowlabel;
++	union nf_inet_addr		saddr;
++	union nf_inet_addr		daddr;
++	union nf_inet_addr		nexthop;
++};
++
+ struct flow_offload_tuple {
+ 	union {
+ 		struct in_addr		src_v4;
+@@ -164,6 +190,7 @@ struct flow_offload_tuple {
+ 	/* Below __hash, so it never widens a lookup key, and outside the
+ 	 * union below, which a NEIGH tuple spends on its destination. */
+ 	struct nf_flow_session		session;
++	struct nf_flow_tunnel		tunnel;
+ 	union {
+ 		struct {
+ 			struct dst_entry *dst_cache;
+@@ -245,6 +272,8 @@ struct nf_flow_route {
+ 		 * out.h_dest would otherwise be the only record of -- and that
+ 		 * member is not carried over to a NEIGH tuple. */
+ 		struct nf_flow_session		session;
++		/* And the tunnel it crosses, which nothing else records. */
++		struct nf_flow_tunnel		tunnel;
+ 		enum flow_offload_xmit_type	xmit_type;
+ 	} tuple[FLOW_OFFLOAD_DIR_MAX];
+ };
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index 09964b40f0d2..5ef7ce780708 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -1428,6 +1428,87 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
+ 	return 0;
+ }
+ 
++/* The forwarding path through this tunnel: the outer IPv6 header the transmit
++ * path would build for an IPv4 packet, and the device and next hop the outer
++ * packet leaves by, looked up as ip6_tnl_xmit() looks them up. Only a tunnel
++ * with a fixed remote is a hop: an NBMA tunnel picks the outer destination
++ * per packet, a collect_md one takes it from metadata, and a per-packet mark
++ * or an extra encapsulation (FOU, GUE) reach the outer packet by ways this
++ * walk cannot see. An IPv6 payload would be IPv6-in-IPv6, which is not
++ * described either; the walk reports the IPIP header and leaves the family
++ * of the flow inside to whoever consumes the hop.
++ */
++static int ip6_tnl_fill_forward_path(struct net_device_path_ctx *ctx,
++				     struct net_device_path *path)
++{
++	struct net_device *dev = (struct net_device *)ctx->dev;
++	struct ip6_tnl *t = netdev_priv(dev);
++	const struct __ip6_tnl_parm *p = &t->parms;
++	const struct rt6_info *rt;
++	struct dst_entry *dst;
++	struct neighbour *n;
++	struct flowi6 fl6;
++	u8 nud_state;
++	int ret = -ENOENT;
++
++	if ((p->proto != IPPROTO_IPIP && p->proto != 0) || p->collect_md ||
++	    ipv6_addr_any(&p->raddr) || (p->flags & IP6_TNL_F_USE_ORIG_FWMARK) ||
++	    !(p->flags & IP6_TNL_F_CAP_XMIT) || t->encap.type != TUNNEL_ENCAP_NONE)
++		return -EOPNOTSUPP;
++	/* The template the transmit path starts from: the endpoints, the
++	 * bound link and the fixed traffic class and flow label. */
++	memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
++	fl6.flowi6_proto = IPPROTO_IPIP;
++	fl6.flowi6_mark = p->fwmark;
++	fl6.flowi6_uid = sock_net_uid(dev_net(dev), NULL);
++	dst = ip6_route_output(dev_net(dev), NULL, &fl6);
++	if (dst->error) {
++		dst_release(dst);
++		return -ENOENT;
++	}
++	dst = xfrm_lookup(dev_net(dev), dst, flowi6_to_flowi(&fl6), NULL, 0);
++	if (IS_ERR(dst))
++		return -ENOENT;
++	rt = dst_rt6_info(dst);
++	if (dst_xfrm(dst) || dst->dev == dev || dst->lwtstate ||
++	    (rt->rt6i_flags & (RTF_REJECT | RTF_LOCAL | RTF_ANYCAST))) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	n = dst_neigh_lookup(dst, &fl6.daddr);
++	if (!n)
++		goto out;
++	read_lock_bh(&n->lock);
++	nud_state = n->nud_state;
++	ether_addr_copy(path->tunnel.h_dest, n->ha);
++	read_unlock_bh(&n->lock);
++	neigh_release(n);
++	if (!(nud_state & NUD_VALID))
++		goto out;
++	path->type = DEV_PATH_TUNNEL;
++	path->dev = dev;
++	path->tunnel.family = AF_INET6;
++	path->tunnel.proto = IPPROTO_IPIP;
++	path->tunnel.ttl = p->hop_limit;
++	path->tunnel.tos = p->flags & IP6_TNL_F_USE_ORIG_TCLASS ? 0 :
++			   ip6_tclass(p->flowinfo);
++	path->tunnel.flags =
++		(p->flags & IP6_TNL_F_USE_ORIG_TCLASS ? DEV_PATH_TUNNEL_F_INHERIT_TOS : 0) |
++		(p->flags & IP6_TNL_F_IGN_ENCAP_LIMIT ? 0 : DEV_PATH_TUNNEL_F_ENCAP_LIMIT) |
++		(p->flags & IP6_TNL_F_RCV_DSCP_COPY ? DEV_PATH_TUNNEL_F_DSCP_COPY : 0);
++	path->tunnel.flowlabel = p->flowinfo & IPV6_FLOWLABEL_MASK;
++	memcpy(path->tunnel.saddr, &fl6.saddr, sizeof(fl6.saddr));
++	memcpy(path->tunnel.daddr, &fl6.daddr, sizeof(fl6.daddr));
++	memcpy(path->tunnel.nexthop, rt6_nexthop(rt, &fl6.daddr),
++	       sizeof(struct in6_addr));
++	memcpy(ctx->daddr, path->tunnel.h_dest, ETH_ALEN);
++	ctx->dev = dst->dev;
++	ret = 0;
++out:
++	dst_release(dst);
++	return ret;
++}
++
+ static netdev_tx_t
+ ip6_tnl_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+@@ -1834,6 +1915,7 @@ static const struct net_device_ops ip6_tnl_netdev_ops = {
+ 	.ndo_change_mtu = ip6_tnl_change_mtu,
+ 	.ndo_get_stats64 = dev_get_tstats64,
+ 	.ndo_get_iflink = ip6_tnl_get_iflink,
++	.ndo_fill_forward_path = ip6_tnl_fill_forward_path,
+ };
+ 
+ #define IPXIPX_FEATURES (NETIF_F_SG |		\
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+index 710d66374c57..aeb81c942d33 100644
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -1069,6 +1069,74 @@ static netdev_tx_t sit_tunnel_xmit__(struct sk_buff *skb,
+ 	return NETDEV_TX_OK;
+ }
+ 
++/* The forwarding path through this tunnel: the outer IPv4 header the transmit
++ * path would build for an IPv6 packet, and the device and next hop the outer
++ * packet leaves by. The route is looked up exactly as ipip6_tunnel_xmit()
++ * looks it up, so a hardware adapter describing the hop describes what
++ * software does. Only a point-to-point tunnel with a fixed remote is a hop at
++ * all: 6rd and ISATAP derive the outer destination from the inner one, which
++ * this walk does not see. A TOS of 1 means the inner packet's, and is
++ * reported as such rather than as a value.
++ */
++static int ipip6_fill_forward_path(struct net_device_path_ctx *ctx,
++				   struct net_device_path *path)
++{
++	struct net_device *dev = (struct net_device *)ctx->dev;
++	struct ip_tunnel *tunnel = netdev_priv(dev);
++	const struct iphdr *tiph = &tunnel->parms.iph;
++	u8 tos = tiph->tos == 1 ? 0 : tiph->tos;
++	struct neighbour *n;
++	struct flowi4 fl4;
++	struct rtable *rt;
++	u8 nud_state;
++	int ret = -ENOENT;
++
++	if (!tiph->daddr || (dev->priv_flags & IFF_ISATAP))
++		return -EOPNOTSUPP;
++	flowi4_init_output(&fl4, tunnel->parms.link, tunnel->fwmark,
++			   tos & INET_DSCP_MASK, RT_SCOPE_UNIVERSE,
++			   IPPROTO_IPV6, 0, tiph->daddr, tiph->saddr, 0, 0,
++			   sock_net_uid(tunnel->net, NULL));
++	rt = ip_route_output_flow(tunnel->net, &fl4, NULL);
++	if (IS_ERR(rt))
++		return -ENOENT;
++	/* A transformed outer packet, a routing loop, a route with its own
++	 * encapsulation or an IPv6 next hop are all shapes the walk does not
++	 * describe. */
++	if (rt->rt_type != RTN_UNICAST || rt->rt_gw_family == AF_INET6 ||
++	    rt->dst.dev == dev || rt->dst.lwtstate || dst_xfrm(&rt->dst)) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	n = dst_neigh_lookup(&rt->dst, &fl4.daddr);
++	if (!n)
++		goto out;
++	read_lock_bh(&n->lock);
++	nud_state = n->nud_state;
++	ether_addr_copy(path->tunnel.h_dest, n->ha);
++	read_unlock_bh(&n->lock);
++	neigh_release(n);
++	if (!(nud_state & NUD_VALID))
++		goto out;
++	path->type = DEV_PATH_TUNNEL;
++	path->dev = dev;
++	path->tunnel.family = AF_INET;
++	path->tunnel.proto = IPPROTO_IPV6;
++	path->tunnel.ttl = tiph->ttl;
++	path->tunnel.tos = tos;
++	path->tunnel.flags = (tiph->tos == 1 ? DEV_PATH_TUNNEL_F_INHERIT_TOS : 0) |
++			     (tiph->frag_off & htons(IP_DF) ? DEV_PATH_TUNNEL_F_DF : 0);
++	path->tunnel.saddr[0] = fl4.saddr;
++	path->tunnel.daddr[0] = fl4.daddr;
++	path->tunnel.nexthop[0] = rt_nexthop(rt, fl4.daddr);
++	memcpy(ctx->daddr, path->tunnel.h_dest, ETH_ALEN);
++	ctx->dev = rt->dst.dev;
++	ret = 0;
++out:
++	ip_rt_put(rt);
++	return ret;
++}
++
+ static netdev_tx_t sit_tunnel_xmit(struct sk_buff *skb,
+ 				   struct net_device *dev)
+ {
+@@ -1409,6 +1477,7 @@ static const struct net_device_ops ipip6_netdev_ops = {
+ 	.ndo_siocdevprivate = ipip6_tunnel_siocdevprivate,
+ 	.ndo_get_iflink = ip_tunnel_get_iflink,
+ 	.ndo_tunnel_ctl = ipip6_tunnel_ctl,
++	.ndo_fill_forward_path = ipip6_fill_forward_path,
+ };
+ 
+ static void ipip6_dev_free(struct net_device *dev)
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index af55c12a3919..de59b6fbf362 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -172,6 +172,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+ 	 * path, not to how the path is transmitted, and a DIRECT tuple has no
+ 	 * room for it once the union holds its cached addresses. */
+ 	flow_tuple->session = route->tuple[dir].session;
++	flow_tuple->tunnel = route->tuple[dir].tunnel;
+ 
+ 	switch (route->tuple[dir].xmit_type) {
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index ee87af80a9c1..f1f53559588a 100644
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -979,6 +979,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+ 		 * record naming no session is already self-describing. */
+ 		.nf_session = &flow->tuplehash[dir].tuple.session,
+ 		.nf_session_reverse = &flow->tuplehash[!dir].tuple.session,
++		.nf_tunnel = &flow->tuplehash[dir].tuple.tunnel,
++		.nf_tunnel_reverse = &flow->tuplehash[!dir].tuple.tunnel,
+ 		.nf_handle = flow->hw_handle,
+ 		.nf_dst_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[dir].tuple),
+ 		.nf_dst_reverse_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[!dir].tuple),
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index d71edfa36e95..3f0e8aa76abe 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -93,6 +93,8 @@ struct nft_forward_info {
+ 	 * implicit in h_dest and the encap slot: a hardware adapter cannot
+ 	 * re-derive any of it, and h_dest is not carried to a NEIGH tuple. */
+ 	struct nf_flow_session session;
++	/* And the one tunnel, for the same reason. */
++	struct nf_flow_tunnel tunnel;
+ 	enum flow_offload_xmit_type xmit_type;
+ };
+ 
+@@ -188,6 +190,41 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			if (!READ_ONCE(flowtable->use_neigh))
+ 				info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+ 			break;
++		case DEV_PATH_TUNNEL:
++			/* Only for a table that asked for neighbour output,
++			 * which is a hardware adapter's. Anything else keeps
++			 * the tunnel device as the reverse direction's ingress,
++			 * where the software path matches the inner packet
++			 * after the tunnel has decapsulated it; moving that
++			 * ingress to the port below would lose it, because the
++			 * software path decapsulates nothing.
++			 *
++			 * Recorded whole, like a session, because nothing about
++			 * it reaches a rule: the outer header goes on after the
++			 * flowtable has transmitted, so no push describes it,
++			 * and comes off before the inner packet exists, so no
++			 * pop or key describes that. Not an encapsulation slot
++			 * either -- those are the L2 headers a rule can pop and
++			 * push. One per path, and the device the outer packet
++			 * leaves by is the next entry's. */
++			if (!READ_ONCE(flowtable->use_neigh) ||
++			    info->tunnel.lower_ifindex || i + 1 >= stack->num_paths)
++				goto refuse;
++			info->tunnel.lower_ifindex = stack->path[i + 1].dev->ifindex;
++			info->tunnel.family = path->tunnel.family;
++			info->tunnel.proto = path->tunnel.proto;
++			info->tunnel.ttl = path->tunnel.ttl;
++			info->tunnel.tos = path->tunnel.tos;
++			info->tunnel.flags = path->tunnel.flags;
++			info->tunnel.flowlabel = path->tunnel.flowlabel;
++			memcpy(info->tunnel.h_dest, path->tunnel.h_dest, ETH_ALEN);
++			memcpy(&info->tunnel.saddr, path->tunnel.saddr,
++			       sizeof(info->tunnel.saddr));
++			memcpy(&info->tunnel.daddr, path->tunnel.daddr,
++			       sizeof(info->tunnel.daddr));
++			memcpy(&info->tunnel.nexthop, path->tunnel.nexthop,
++			       sizeof(info->tunnel.nexthop));
++			break;
+ 		default:
+ 			goto refuse;
+ 		}
+@@ -256,6 +293,7 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+ 	/* Belongs to this direction's egress path, as out.h_dest does, and
+ 	 * unlike out.h_dest it survives NEIGH output. */
+ 	route->tuple[dir].session = info.session;
++	route->tuple[dir].tunnel = info.tunnel;
+ 
+ 	route->tuple[!dir].in.ifindex = info.indev->ifindex;
+ 	for (i = 0; i < info.num_encaps; i++) {
+-- 
+2.47.3
+

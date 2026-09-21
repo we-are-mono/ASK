@@ -147,48 +147,55 @@ static BOOL M_tnl_delete(PTnlEntry pTunnelEntry)
  *
  *
  */
-static void M_tnl_build_header(PTnlEntry pTunnelEntry)
+U8 tnl_build_header(U8 mode, const U32 *local, const U32 *remote, U32 fl,
+		    U8 hlim, U16 frag_off, U8 *header)
 {
 	ipv6_hdr_t ip6_hdr;
 	ipv4_hdr_t ip4_hdr;
 
+	switch (mode) {
+	case TNL_MODE_6O4:
+		/* MAC|IPv4|IPv6: the IPv4 part is pre-built. */
+		memset(&ip4_hdr, 0, sizeof(ip4_hdr));
+		ip4_hdr.SourceAddress = local[0];
+		ip4_hdr.DestinationAddress = remote[0];
+		ip4_hdr.Version_IHL = 0x45;
+		ip4_hdr.Protocol = IPPROTOCOL_IPV6;
+		ip4_hdr.TypeOfService = fl & 0xFF;
+		ip4_hdr.TotalLength = 0; /* computed for each packet */
+		ip4_hdr.TTL = hlim;
+		ip4_hdr.Identification = 0;
+		ip4_hdr.HeaderChksum = 0; /* computed for each packet */
+		ip4_hdr.Flags_FragmentOffset = frag_off;
+		memcpy(header, &ip4_hdr, sizeof(ip4_hdr));
+		return sizeof(ip4_hdr);
+	case TNL_MODE_4O6:
+		/* MAC|IPv6|IPv4: the IPv6 part is pre-built. */
+		memset(&ip6_hdr, 0, sizeof(ip6_hdr));
+		memcpy(ip6_hdr.DestinationAddress, remote, IPV6_ADDRESS_LENGTH);
+		memcpy(ip6_hdr.SourceAddress, local, IPV6_ADDRESS_LENGTH);
+		IPV6_SET_VER_TC_FL(&ip6_hdr, fl);
+		ip6_hdr.HopLimit = hlim;
+		ip6_hdr.TotalLength = 0; /* computed for each packet */
+		ip6_hdr.NextHeader = IPPROTOCOL_IPIP;
+		memcpy(header, &ip6_hdr, sizeof(ip6_hdr));
+		return sizeof(ip6_hdr);
+	default:
+		return 0;
+	}
+}
+
+static void M_tnl_build_header(PTnlEntry pTunnelEntry)
+{
+	ipv6_hdr_t ip6_hdr;
+
 	switch (pTunnelEntry->mode)
 	{
-		/* 6o4 case : MAC|IPV4|IPV6 		*/
-		/* Here IPV4 part is pre-built	*/
-
 		case TNL_MODE_6O4:
-			ip4_hdr.SourceAddress = pTunnelEntry->local[0];
-			ip4_hdr.DestinationAddress = pTunnelEntry->remote[0];
-			ip4_hdr.Version_IHL = 0x45;
-			ip4_hdr.Protocol = IPPROTOCOL_IPV6;
-			ip4_hdr.TypeOfService = pTunnelEntry->fl & 0xFF;
-			ip4_hdr.TotalLength = 0; //to be computed for each packet
-			ip4_hdr.TTL = pTunnelEntry->hlim;
-			ip4_hdr.Identification = 0;
-			ip4_hdr.HeaderChksum = 0; //to be computed
-			ip4_hdr.Flags_FragmentOffset = 0;
-
-			pTunnelEntry->header_size = sizeof(ipv4_hdr_t);
-			memcpy(pTunnelEntry->header, (U8*)&ip4_hdr, pTunnelEntry->header_size);
-			break;
-
-			/* 4o6 case : MAC|IPV6|IPV4             */
-			/* Here IPV6 part is pre-built  */
-
-
 		case TNL_MODE_4O6:
-
-			memcpy((U8*)ip6_hdr.DestinationAddress, (U8*)pTunnelEntry->remote, IPV6_ADDRESS_LENGTH);
-			memcpy((U8*)ip6_hdr.SourceAddress, (U8*)pTunnelEntry->local, IPV6_ADDRESS_LENGTH);
-			IPV6_SET_VER_TC_FL(&ip6_hdr, pTunnelEntry->fl);
-			ip6_hdr.HopLimit = pTunnelEntry->hlim;
-			ip6_hdr.TotalLength = 0; //to be computed for each packet
-			ip6_hdr.NextHeader = IPPROTOCOL_IPIP;
-
-			pTunnelEntry->header_size = sizeof(ipv6_hdr_t);
-			memcpy(pTunnelEntry->header, (U8*)&ip6_hdr, pTunnelEntry->header_size);
-
+			pTunnelEntry->header_size = tnl_build_header(
+				pTunnelEntry->mode, pTunnelEntry->local, pTunnelEntry->remote,
+				pTunnelEntry->fl, pTunnelEntry->hlim, 0, pTunnelEntry->header);
 			break;
 
 		case TNL_MODE_GRE_IPV6:

@@ -199,6 +199,21 @@ struct cdx_l2_encap {
 	 * and naming index zero for it would count into someone else's. */
 	U8 ingress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
 	U8 egress_vlan_stats_index[DPA_CLS_HM_MAX_VLANs];
+	/* An IP-in-IP tunnel on either side, outside every L2 header. The
+	 * egress side carries the outer header the insert writes, built as
+	 * the legacy tunnel interface builds its own, with the per-packet
+	 * fields left zero; the ingress side carries only what the strip
+	 * needs, which is the mode and the header size. Each names its
+	 * record in the plain statistics pool, or zero for none, exactly as
+	 * a tag does. */
+	struct cdx_tunnel_encap {
+		U8 present;
+		U8 mode;		/* TNL_MODE_6O4 or TNL_MODE_4O6 */
+		U8 header_size;
+		U8 flags;		/* INHERIT_TC, DSCP_COPY */
+		U8 stats_index;
+		U8 header[40];
+	} ingress_tunnel, egress_tunnel;
 };
 
 int insert_entry_in_classif_table(PCtEntry entry);
