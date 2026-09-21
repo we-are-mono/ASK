@@ -173,7 +173,10 @@ async def hardware(r, p, label, flows=FLOWS):
             packets = int(new[key]["packets"]) - int(old[key]["packets"])
             if flows[ident]["proto"] == "udp":
                 assert packets == 256, (key, packets)
-                assert int(new[key]["bytes"]) - int(old[key]["bytes"]) == 256 * (256 + 42), (key, old, new)
+                # Proc reports raw ingress bytes, including any VLAN tags.
+                tags = old[key]["in_vlan"]
+                vlan_bytes = 0 if tags == "-" else 4 * len(tags.split("."))
+                assert int(new[key]["bytes"]) - int(old[key]["bytes"]) == 256 * (256 + 42 + vlan_bytes), (key, old, new)
             else:
                 assert packets >= reports[ident]["bytes"] // 1500, (key, packets)
     tx = {dev: tx_after[dev] - tx_before[dev] for dev in tx_before}

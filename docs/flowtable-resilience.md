@@ -1,8 +1,8 @@
 # Flowtable resilience testing
 
 Status: controller reconciliation, bounded nft execution, controller crash
-supervision and allocation-failure recovery implemented 2026-09-21; broader
-fault coverage remains planned.
+supervision, allocation-failure recovery, routed VLAN recovery and bridge VLAN
+membership recovery validated 2026-09-21–22; broader fault coverage remains planned.
 This document separates that implementation from the
 remaining recovery requirements. Hardware validation is recorded below.
 
@@ -294,6 +294,94 @@ This named-path sweep does not claim every allocation in the native/SDK stack,
 or IPv6, XFRM, multicast and topology-failure coverage. Those remain separate
 extensions of this recovery contract.
 
+## Routed VLAN prerequisite recovery — 2026-09-21
+
+The [service VLAN test](../tools/tests/test_flowtable_service_vlan.py) deletes
+and recreates a routed LAN VLAN three times under the shipping service. It
+retains the same tagged TCP/UDP sockets and separate untagged control sockets.
+The VLAN stays absent for at least six seconds per cycle: affected hardware
+entries and the VLAN counter record must retire, tagged UDP must stop reaching
+the WAN, and untagged traffic must continue. The controller must leave the
+missing VLAN absent.
+
+The harness restores only the VLAN, address, route and neighbour. It verifies
+a new interface index, then requires original-socket hardware admission within
+20 seconds and completed directional hardware proof within 40 seconds.
+Forbidden traffic remains blocked before and after each cycle. The controller
+and supervisor identities, policy hash and boot identity remain unchanged.
+After convergence, a complete health-check interval must pass without another
+policy install or hardware generation replacement. A new TCP connection must
+also offload after all three cycles.
+
+The existing KASAN image passed the three-cycle test in 164.04 seconds, without
+product changes or a new boot. All 243 host tests passed in 94.17 seconds.
+The existing missing-table service regression also passed (81.29 seconds),
+checking the shared service fixture and untagged hardware-counter assertions.
+
+| Cycle | Admission checks complete | Directional hardware proof complete | Policy installs |
+| --- | ---: | ---: | ---: |
+| 1 | 5.38 s | 13.56 s | 2 |
+| 2 | 5.66 s | 13.84 s | 2 |
+| 3 | 5.54 s | 13.72 s | 2 |
+
+Timings start after network restoration. TCP records remained intact; UDP
+loss was observed during the deliberate outage. Each restored VLAN had one
+counter record and one slot, and teardown returned both to zero with balanced
+flow references and hardware installs/deletes. No backend errors were added.
+Validation ended with normal policy resumed on the original boot, test-owned
+network state removed, accumulated installs/deletes both at 170 and six rearms
+retained. Entries, flow references, VLAN records/slots and backend errors were
+zero. There were no kernel splats or new taint, and no reboot or counter reset.
+
+This covers routed VLAN netdevice recreation. Bridge VLAN-membership changes
+are covered separately below; other missing prerequisites and combined fault
+sequences remain separate service-recovery cases.
+
+## Bridge VLAN membership recovery — 2026-09-22
+
+The [service bridge test](../tools/tests/test_flowtable_service_bridge.py) uses
+a VLAN-aware bridge with untagged trusted traffic and tagged guest traffic on
+the same physical LAN port. It removes only the guest VLAN membership three
+times, retaining both VLAN interfaces, addresses, routes and pinned neighbours.
+The shipping controller must leave membership absent until the harness restores
+it; no policy apply, resume or service restart is allowed during recovery.
+
+During each outage, all guest hardware entries must retire within five seconds.
+After a 200 ms allowance for in-flight traffic, guest UDP must stop reaching the
+WAN. Reverse probes use the existing hardware UDP reply tuple and deliberately
+invalid payload serials: even one delivered probe fails the guest receiver.
+Trusted TCP/UDP must continue, and membership remains absent for at least six
+seconds. Interface identities and the remaining network configuration must stay
+unchanged.
+
+Restoring only membership must recover the original guest TCP/UDP sockets and
+their hardware admission within 20 seconds, with directional counter proof
+completed within 40 seconds. Forbidden traffic remains blocked, resource counts
+return to baseline, and a full health-check interval must pass without another
+policy install or flow generation replacement. A new TCP connection must also
+offload after all three cycles. The controller, supervisor and boot identities
+remain unchanged.
+
+The existing KASAN image passed all three cycles in 169.14 seconds, without
+product changes or a new boot. Each outage blocked all 18 reverse probes and
+guest uplink UDP while trusted TCP/UDP continued. TCP records survived and
+UDP loss was observed during each deliberate outage.
+
+| Cycle | Admission checks complete | Directional hardware proof complete | Policy installs |
+| --- | ---: | ---: | ---: |
+| 1 | 6.54 s | 14.72 s | 2 |
+| 2 | 6.53 s | 14.72 s | 2 |
+| 3 | 6.51 s | 14.70 s | 2 |
+
+Timings start after restoring membership; the hardware proof includes an
+eight-second traffic window. Final cleanup removed the test bridge, VLANs,
+guest namespace and WAN route, restored the physical LAN configuration and
+resumed normal policy on boot `f9bfb4a5-1875-4e6e-b40d-e8572800e06c`.
+Accumulated installs/deletes both reached 230, with 12 rearms retained and zero
+entries, flow references, VLAN records/slots or backend errors. Failslab settings,
+kernel taint and running binaries were unchanged, with no kernel splats.
+No reboot or counter reset was used.
+
 ## Coverage before this slice
 
 The following observations motivated the work:
@@ -311,8 +399,9 @@ The following observations motivated the work:
   than autonomous service recovery. Global invalidation deliberately requires
   a fresh binding/reconciliation boundary; recovery must preserve that barrier.
 - The [homelab profile](../tools/tests/test_profile_homelab.py) explicitly
-  reapplies policy after VLAN invalidation. That is useful lifecycle coverage,
-  but does not establish that the running service repairs itself.
+  reapplies policy after bridge VLAN-membership invalidation. That is useful
+  lifecycle coverage. The separate service bridge test above establishes
+  recovery without a test-issued policy repair.
 - The [IPsec failslab sweep](../tools/tests/test_ipsec_failslab.py) exercises
   native XFRM installation with isolated `fail-nth` injection. It is a useful
   pattern for allocation coverage, with additional recovery assertions needed.

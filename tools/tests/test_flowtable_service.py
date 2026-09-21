@@ -9,6 +9,7 @@ otherwise execs the real nft with the inherited transaction lease intact.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
@@ -68,7 +69,14 @@ async def wait_service(r, ready=True, timeout=12, policy_hash=None):
 
 @pytest_asyncio.fixture
 async def service(rig):
-    r = rig
+    async with managed_service(rig) as r:
+        yield r
+
+
+@asynccontextmanager
+async def managed_service(r, addresses=None):
+    """Run the shipping service for one or more test LAN endpoints."""
+    addresses = tuple(addresses or (r.lan_ip,))
     old = await read(r.target, r.session, CONF)
     cleanup = []
     initial_errors = (await r.state())["errors"]
@@ -76,20 +84,22 @@ async def service(rig):
         await asyncio.to_thread(con.login, "root", None)
         r.service_console = con
         try:
-            for proto in ("tcp", "udp"):
-                nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", proto,
-                       "--sport", f"{FIRST}:{FIRST + 2}", "--dport", str(DPORT), "-j", "ACCEPT"]
-                await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
-                cleanup.append(["iptables", "-t", "nat", "-D", *nat])
-                await command(r.target, r.session, "conntrack", "-D", "-p", proto,
-                              "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
-                              "--dport", str(DPORT), check=False)
-            deny = ["FORWARD", "-s", r.lan_ip, "-d", WAN_IP, "-p", "udp",
-                    "--sport", str(FIRST + 2), "--dport", str(DPORT), "-j", "DROP"]
-            await command(r.target, r.session, "iptables", "-I", *deny)
-            cleanup.append(["iptables", "-D", *deny])
-            policy = (f"enabled yes\ndevices {TARGET_LAN_IF} {TARGET_WAN_IF}\n"
-                      f"scope saddr {r.lan_ip} daddr {WAN_IP} sport {FIRST}-{FIRST + 2} dport {DPORT}\n")
+            policy = f"enabled yes\ndevices {TARGET_LAN_IF} {TARGET_WAN_IF}\n"
+            for address in addresses:
+                for proto in ("tcp", "udp"):
+                    nat = ["POSTROUTING", "-s", address, "-d", WAN_IP, "-p", proto,
+                           "--sport", f"{FIRST}:{FIRST + 2}", "--dport", str(DPORT), "-j", "ACCEPT"]
+                    await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
+                    cleanup.append(["iptables", "-t", "nat", "-D", *nat])
+                    await command(r.target, r.session, "conntrack", "-D", "-p", proto,
+                                  "--orig-src", address, "--orig-dst", WAN_IP,
+                                  "--dport", str(DPORT), check=False)
+                deny = ["FORWARD", "-s", address, "-d", WAN_IP, "-p", "udp",
+                        "--sport", str(FIRST + 2), "--dport", str(DPORT), "-j", "DROP"]
+                await command(r.target, r.session, "iptables", "-I", *deny)
+                cleanup.append(["iptables", "-D", *deny])
+                policy += (f"scope saddr {address} daddr {WAN_IP} sport {FIRST}-{FIRST + 2} "
+                           f"dport {DPORT}\n")
             result = await r.target.fs_write(r.session, CONF, policy)
             assert result["errno"] == 0, result
             # Resolve the real executable before adding the fault wrapper to
@@ -141,10 +151,11 @@ compile(script, str(root / 'nft'), 'exec')
             await attempt(console_python(con, f"from pathlib import Path\nPath({CONF!r}).write_text({old!r})\n"))
             for argv in reversed(cleanup):
                 await attempt(console_command(con, *argv))
-            for proto in ("tcp", "udp"):
-                await attempt(console_command(con, "conntrack", "-D", "-p", proto,
-                                              "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
-                                              "--dport", str(DPORT), check=False))
+            for address in addresses:
+                for proto in ("tcp", "udp"):
+                    await attempt(console_command(con, "conntrack", "-D", "-p", proto,
+                                                  "--orig-src", address, "--orig-dst", WAN_IP,
+                                                  "--dport", str(DPORT), check=False))
             await attempt(console_command(con, "rm", "-rf", FAULT_DIR))
             assert not failures, ("service fixture restoration failed", failures)
 
