@@ -169,6 +169,15 @@ retiring a partial pair so native GC and fresh traffic can retry both directions
 through the same table. A callback visiting the other bound port is rejected
 before RTNL and cannot invalidate a successfully installed direction.
 
+Admission allocation failures use the same selective recovery: adapter entry
+and hardware-owner `-ENOMEM`, and genuine native admission work/rule/action
+allocation failures, invalidate the opted-in generation. Otherwise hardware
+activity in one installed direction can keep a partial pair alive without
+software refresh retrying its missing peer. Native work already pending and
+failed statistics/deletion work allocations retain their normal semantics;
+unsupported match/action construction is not treated as memory pressure.
+See the [failslab recovery contract](flowtable-resilience.md#allocation-failure-recovery--2026-09-21).
+
 ## Execution contexts and lock ordering
 
 Backend begin/end transactions use the CDX control mutex to serialize hardware

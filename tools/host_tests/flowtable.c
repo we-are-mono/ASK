@@ -646,6 +646,7 @@ static int ft_invalid;
 static unsigned long jiffies = 1000;
 static unsigned allocated, live_hw, flushed, scheduled;
 static bool allocation_fail, hardware_fail, invalidate_on_add, physical_ok = true, neigh_ok = true;
+static int hardware_alloc_error;
 static bool change_neigh_on_add, change_neigh_on_lookup;
 static unsigned neigh_lookups, neigh_uses;
 static int neigh_send_error;
@@ -1013,6 +1014,10 @@ static int cdx_ft_add(const struct cdx_ft_rule *r,
         observed_out_vlan[i] = stats->out_vlan[i] ? stats->out_vlan[i]->tx_index : 0;
     }
     if (hardware_fail) return -EIO;
+    if (hardware_alloc_error) {
+        assert(ft_handle_refs && ft_neighbour_refs);
+        return hardware_alloc_error;
+    }
     *hw = calloc(1, sizeof(**hw)); assert(*hw); live_hw++;
     (*hw)->stats.lastused = (u32)jiffies;
     if (invalidate_on_add) ft_invalidate();
@@ -4495,6 +4500,42 @@ static void test_transient_admission(void)
     }
 }
 
+static void test_allocation_admission_recovery(void)
+{
+    for (unsigned tcp = 0; tcp < 2; tcp++)
+        for (unsigned peer_installed = 0; peer_installed < 2; peer_installed++)
+            for (unsigned hardware = 0; hardware < 2; hardware++) {
+                if (tcp) tcp_fixture(); else fixture();
+                cls.command = FLOW_CLS_REPLACE;
+                u64 invalidations = ft_admission_invalidations;
+                if (peer_installed) {
+                    assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+                    cls.cookie++; pk.src++;
+                }
+                allocation_fail = !hardware;
+                hardware_alloc_error = hardware ? -ENOMEM : 0;
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == -ENOMEM);
+                allocation_fail = false;
+                hardware_alloc_error = 0;
+                /* Hardware-only activity in the installed direction can
+                 * keep a partial generation alive without software refresh
+                 * retrying admission. Retire it on allocation failure. */
+                assert(handle.invalid && ft_admission_invalidations == invalidations + 1);
+                assert(ft_count == peer_installed && ft_handle_refs == peer_installed &&
+                       ft_neighbour_refs == peer_installed);
+                ft_retire_workfn(NULL);
+                assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs &&
+                       !allocated && !live_hw && handle.refs == 1);
+                /* Native GC permits the same connection's next generation. */
+                handle = (struct nf_flow_offload_handle){ .refs = 1 };
+                assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, &binding) == 0);
+                assert(ft_count == 1 && !handle.invalid && !ft_invalid);
+                cdx_ft_begin();
+                assert(ft_remove(ft_find(&binding, cls.cookie)) == 0);
+                cdx_ft_end();
+            }
+}
+
 static void test_selective_routes(void)
 {
     struct nf_flow_offload_handle contexts[2] = {{1, false}, {1, false}};
@@ -5224,6 +5265,7 @@ int main(void)
     test_counter_accounting();
     test_device_recovery();
     test_transient_admission();
+    test_allocation_admission_recovery();
     test_nexthop_objects();
     test_qos_decode();
     test_vlan_stats();

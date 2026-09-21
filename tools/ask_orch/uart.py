@@ -106,9 +106,13 @@ class Console:
     """
 
     def __init__(self, port: str, baud: int = DEFAULT_BAUD,
-                 timeout_s: float = 5.0, log_path: str | None = None):
+                 timeout_s: float = 5.0, log_path: str | None = None,
+                 write_chunk_bytes: int = 0, write_pause_s: float = 0.003):
+        assert write_chunk_bytes >= 0 and write_pause_s >= 0
         self.port      = port
         self.timeout_s = timeout_s
+        self.write_chunk_bytes = write_chunk_bytes
+        self.write_pause_s = write_pause_s
         self.buf       = b""
         self.log_fp    = open(log_path, "ab", buffering=0) if log_path else None
         self.ser       = serial.Serial(port=port, baudrate=baud, timeout=0)
@@ -118,6 +122,11 @@ class Console:
 
     @classmethod
     def target(cls, **kw) -> "Console":
+        # The physical UART has no flow control. KASAN/fault tracing can delay
+        # its receiver enough to overrun a continuous command line. Leave
+        # FIFO headroom and a scheduling gap; PTY-backed LAN consoles need
+        # neither. Never replay a mutation after losing its result marker.
+        kw.setdefault("write_chunk_bytes", 8)
         return cls(port=DEFAULT_TARGET_DEV, **kw)
 
     @classmethod
@@ -131,10 +140,15 @@ class Console:
     def send(self, data: bytes | str) -> None:
         if isinstance(data, str):
             data = data.encode()
-        if self.log_fp:
-            self.log_fp.write(b"<SEND>" + data + b"</SEND>\n")
-        self.ser.write(data)
-        self.ser.flush()
+        with self.lock:
+            if self.log_fp:
+                self.log_fp.write(b"<SEND>" + data + b"</SEND>\n")
+            chunk = self.write_chunk_bytes or max(1, len(data))
+            for start in range(0, len(data), chunk):
+                self.ser.write(data[start:start + chunk])
+                self.ser.flush()
+                if start + chunk < len(data):
+                    time.sleep(self.write_pause_s)
 
     def expect(self, pattern: re.Pattern[bytes] | bytes | str,
                timeout: float | None = None) -> tuple[re.Match[bytes], bytes]:

@@ -21,6 +21,7 @@ import pytest
 serial = pytest.importorskip("serial", reason="pyserial required for console tests")
 
 from ask_orch.uart import Console, port_lock  # noqa: E402
+from ask_orch import uart  # noqa: E402
 
 
 @pytest.fixture
@@ -48,6 +49,37 @@ def test_lock_is_shared_per_device_not_per_instance(pty_port):
     finally:
         a.close()
         b.close()
+
+
+def test_target_paces_writes_for_a_small_receive_fifo(monkeypatch):
+    class Receiver:
+        def __init__(self, **kwargs):
+            self.fifo = b""
+            self.received = b""
+
+        def write(self, data):
+            # A stalled physical receiver loses bytes past its FIFO capacity.
+            self.fifo = (self.fifo + data)[:8]
+
+        def flush(self):
+            pass
+
+        def service(self, delay):
+            assert delay >= 0.003
+            self.received += self.fifo
+            self.fifo = b""
+
+        def close(self):
+            pass
+
+    receiver = Receiver()
+    monkeypatch.setattr(uart.serial, "Serial", lambda **kwargs: receiver)
+    monkeypatch.setattr(uart.time, "sleep", receiver.service)
+    command = "printf 'a command longer than the FIFO'; echo __ASK_RC_123__=$?\n"
+    with Console.target() as con:
+        con.send(command)
+    receiver.service(0.003)
+    assert receiver.received == command.encode()
 
 
 def test_two_readers_on_one_port_do_not_eat_each_others_output(pty_port):

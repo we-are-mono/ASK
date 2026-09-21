@@ -2342,6 +2342,12 @@ static int ft_rule_callback(enum tc_setup_type type, void *data, void *priv)
 			rc = -EAGAIN;
 		} else {
 			rc = ft_replace(binding, cls);
+			/* A partially installed generation can stay alive entirely
+			 * through its hardware direction, without software refresh
+			 * retrying the failed allocation. Retire only this generation
+			 * so native GC permits fresh admission after memory recovers. */
+			if (rc == -ENOMEM)
+				ft_handle_invalidate(cls->nf_handle, &ft_admission_invalidations);
 			cdx_ft_admission_end();
 		}
 		if (rc)

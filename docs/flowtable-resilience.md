@@ -1,7 +1,8 @@
 # Flowtable resilience testing
 
-Status: controller reconciliation, bounded nft execution and controller crash
-supervision implemented 2026-09-21; broader fault coverage remains planned.
+Status: controller reconciliation, bounded nft execution, controller crash
+supervision and allocation-failure recovery implemented 2026-09-21; broader
+fault coverage remains planned.
 This document separates that implementation from the
 remaining recovery requirements. Hardware validation is recorded below.
 
@@ -83,9 +84,7 @@ completion time is not a claim that forwarding was unavailable until then.
 Existing TCP/UDP sockets survived, new connections offloaded, forbidden UDP
 never reached the WAN receiver, and teardown balanced resources without new
 backend errors. Maintenance stop stayed in effect across service restart
-until explicit resume. Image/build logs, JUnit results, counter snapshots and
-UART transcripts are under `/tmp/ask-flowtable-resilience-20260921/` on the
-development host.
+until explicit resume.
 
 ## Bounded nft execution — 2026-09-21
 
@@ -136,8 +135,7 @@ Both cases retained daemon/boot identity, reaped the injected processes,
 preserved existing sockets, offloaded a new connection, blocked forbidden
 traffic and balanced resources on teardown without new backend errors. The
 lost reply required no duplicate install. The DUT was restored to a fresh
-default-policy boot. Evidence, image identities, source hashes and logs are
-under `/tmp/ask-flowtable-nft-deadlines-20260921/` on the development host.
+default-policy boot.
 
 ## Controller crash supervision — 2026-09-21
 
@@ -203,14 +201,98 @@ policy resumed and test-owned faults removed. Final accumulated installs and
 deletes both equal 142, with zero entries, handle/neighbour references, backend
 errors, quarantine or fatal state. One rearm records the intentional invalidation
 test. Kernel taint remains the out-of-tree baseline of 4096, with no kernel
-splats. There was no cleanup reboot or counter reset. Evidence, image/source
-identities, logs and final state are under
-`/tmp/ask-flowtable-supervision-20260921/` on the development host.
+splats. There was no cleanup reboot or counter reset.
 
 The final audit retained the existing kmemleak report without clearing it or
 forcing another scan. Its 15,977 objects all have boot-time DPAA/CDX buffer-pool
 allocation stacks, consistent with the hardware-owned pool baseline. This is
 not an allocation-failure sweep or a general leak-free claim.
+
+## Allocation-failure recovery — 2026-09-21
+
+A transient allocation failure must not strand a partially offloaded flow.
+Software forwarding normally retries admission when it refreshes a flow's
+timeout. However, traffic confined to an already installed hardware direction
+can keep the generation alive through hardware statistics, without a software
+refresh retrying the missing direction.
+
+Adapter entry and hardware-owner allocation failures now invalidate that
+flow's shared handle. Native admission work, flow-rule and action-array
+allocation failures do the same for tables that opt into handles. Selective
+retirement and ordinary native GC then permit a fresh generation of the same
+connection. The admission table and unrelated hardware flows remain installed.
+Pending work, unsupported match/action construction, capacity refusal and
+statistics/deletion work allocation failures retain their existing behavior.
+
+The [failslab suite](../tools/tests/test_flowtable_failslab.py) uses actual
+kernel slab allocation failures. Stack filters target seven paths: physical
+binding, block callback, admission work, native rule, action array, adapter
+entry and hardware owner. This reaches softirq and worker allocations without
+injecting failures into the test agent. The hardware-owner case also exercises
+unwind after acquiring the flow handle, devices and neighbour reference.
+
+An [independent fault lease](../tools/tests/_flowtable_failslab_guard.py)
+holds a test lock, refuses an active injector, snapshots the settings and
+restores them after consumption, cancellation or a 20-second deadline. It
+never repairs policy or flows. Each test requires a consumed fault, exactly one
+failslab diagnostic and a stack naming the selected path; `times=1` alone is
+not accepted as proof of exactly one fault under concurrent allocation.
+
+Binding cases leave the shipping controller to repair a deliberately missing
+table. Admission cases retain two established control flows and require the
+new TCP/UDP socket to recover through continued traffic alone. Checks include
+unchanged control cookies and monotonic counters, directional hardware traffic,
+blocked forbidden traffic, unchanged service/boot identity and balanced fixture
+teardown. Readiness must return within 20 seconds, with the timed hardware
+proof completed within 40 seconds. DUT cases inject at the first eligible
+allocation in each selected path; the host matrix additionally covers failure
+after the peer direction is already installed.
+
+Both the adapter and native host regressions fail against the previous code.
+The initial full host run passed 241 tests in 93.18 seconds, including ASan/UBSan
+coverage of both directional rule allocations, partially installed generations,
+unwind and unaffected non-fault paths. The guard tests cover consumption,
+cancellation, lease expiry, partial setup failure and refusal to overwrite an
+active injector. Independent review verified the production changes and guard.
+
+On the rebuilt and staged KASAN image, all 12 DUT cases passed in 920.49
+seconds: two binding failures and five admission paths for both TCP and UDP.
+Binding readiness returned in 5.89–5.96 seconds; admission checks completed in
+1.62–1.83 seconds. Every directional hardware proof met the 40-second limit,
+control flows retained their cookies and advancing counters, and denied traffic
+remained blocked. Every injection consumed exactly one fault in its selected
+path and restored the original injector settings. Teardown balanced all hardware
+installs/deletes and handle/neighbour references with zero backend errors.
+
+The first hardware attempt exposed physical UART input overruns during fixture
+cleanup. Target-console writes now use short paced chunks under the shared
+port lock, without replaying commands whose outcome is unknown. The UART and
+guard regressions pass together (ten tests in 12.12 seconds), including lost
+guard-launch acknowledgements. Guard scripts are staged and read back through
+the management agent before injection; their independent lease and UART cleanup
+remain available if management fails. This
+also keeps setup within the traffic peer's idle deadline. Failed attempts are
+retained with the successful run's evidence. The final harness change also
+passed a repeat of TCP hardware-owner recovery (73.35 seconds) on the same boot.
+
+Two consecutive kmemleak scans found zero objects owned by the tested native
+flow/handle, rule/action, binding/callback and adapter admission paths. Both
+reports were saved without clearing the existing boot history. Owner filtering
+excludes the known boot-time DPAA buffer-pool reports; this is a scoped unwind
+check, not a claim that the whole kernel is leak-free.
+
+The normal policy is resumed on boot
+`f9bfb4a5-1875-4e6e-b40d-e8572800e06c`, with test-owned faults removed and every
+failslab setting restored. Accumulated installs/deletes are both 107, with
+zero entries, handle/neighbour references, backend errors, quarantine or fatal
+state. The five admission invalidations are retained. There are no kernel
+splats, and taint remains the out-of-tree baseline of 4096. The only boot change
+was loading the rebuilt, staged KASAN image before validation; there was no
+cleanup reboot, counter reset or kmemleak clear.
+
+This named-path sweep does not claim every allocation in the native/SDK stack,
+or IPv6, XFRM, multicast and topology-failure coverage. Those remain separate
+extensions of this recovery contract.
 
 ## Coverage before this slice
 
@@ -386,7 +468,7 @@ baseline. Booting the rebuilt image before testing and a separately justified
 terminal recovery reset are distinct operations; record their reasons and
 boot identities.
 
-The next deliverable is deterministic allocation-failure coverage, followed by
-repeated fault sequences and missing-prerequisite recovery tests. Keep
+The next deliverables extend allocation coverage and add repeated fault
+sequences and missing-prerequisite recovery tests. Keep
 this document's status and evidence current as each recovery guarantee is
 implemented and verified.

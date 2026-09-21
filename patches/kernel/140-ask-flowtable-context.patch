@@ -1,6 +1,6 @@
-From b207007fef12ac96cdfa3e97fef85d6a22e5e3c9 Mon Sep 17 00:00:00 2001
+From f26a87ea60dd27ecf3dd55801b079d5f4d771c3f Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
-Date: Mon, 14 Sep 2026 23:03:32 +0200
+Date: Mon, 21 Sep 2026 22:47:39 +0200
 Subject: [PATCH] netfilter: provide hardware context and selective flow
  invalidation
 
@@ -100,22 +100,27 @@ could reach the physical-port hardware callbacks. Keep the XFRM destination
 and transmit type untouched; its outer peer is not the inner tuple's
 neighbour. Unowned tables retain their existing path selection.
 
+Retire an opted-in hardware generation when native admission work or rule
+allocation fails. Otherwise a surviving hardware direction can keep a partial
+generation alive without software refresh retrying its missing peer. Invalidate
+only real allocation failures: pending work, statistics/deletion allocation
+failures and unsupported match/action paths retain their existing semantics.
 ---
- include/net/flow.h                    |    2 +
- include/net/flow_offload.h            |   31 ++++++++++
- include/net/netevent.h                |   29 ++++++++++
- include/net/netfilter/nf_flow_table.h |   44 +++++++++++++++
- net/ipv4/fib_trie.c                   |   20 +++++++
- net/ipv4/route.c                      |    3 +
- net/ipv6/ip6_fib.c                    |   23 ++++++++
- net/netfilter/nf_flow_table_core.c    |   66 ++++++++++++++++++++++
- net/netfilter/nf_flow_table_ip.c      |   14 ++++-
- net/netfilter/nf_flow_table_offload.c |   82 +++++++++++++++++++++++++++-
- net/netfilter/nft_flow_offload.c      |   98 +++++++++++++++++++++++++++------
- 11 files changed, 388 insertions(+), 24 deletions(-)
+ include/net/flow.h                    |  2 +
+ include/net/flow_offload.h            | 31 +++++++++
+ include/net/netevent.h                | 29 ++++++++
+ include/net/netfilter/nf_flow_table.h | 44 ++++++++++++
+ net/ipv4/fib_trie.c                   | 20 ++++++
+ net/ipv4/route.c                      |  3 +-
+ net/ipv6/ip6_fib.c                    | 23 +++++++
+ net/netfilter/nf_flow_table_core.c    | 66 +++++++++++++++++-
+ net/netfilter/nf_flow_table_ip.c      | 14 +++-
+ net/netfilter/nf_flow_table_offload.c | 94 ++++++++++++++++++++++++-
+ net/netfilter/nft_flow_offload.c      | 98 ++++++++++++++++++++++-----
+ 11 files changed, 398 insertions(+), 26 deletions(-)
 
 diff --git a/include/net/flow.h b/include/net/flow.h
-index 335bbc52171c..5e373dbaa397 100644
+index 335bbc5..5e373db 100644
 --- a/include/net/flow.h
 +++ b/include/net/flow.h
 @@ -38,6 +38,8 @@ struct flowi_common {
@@ -128,7 +133,7 @@ index 335bbc52171c..5e373dbaa397 100644
  	kuid_t  flowic_uid;
  	__u32		flowic_multipath_hash;
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index 292cd8f4b762..c619bb1cb63f 100644
+index 292cd8f..c619bb1 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
 @@ -688,7 +688,38 @@ struct flow_cls_common_offload {
@@ -171,7 +176,7 @@ index 292cd8f4b762..c619bb1cb63f 100644
  	enum flow_cls_command command;
  	bool use_act_stats;
 diff --git a/include/net/netevent.h b/include/net/netevent.h
-index 1be3757a8b7f..6fb27a2ca8a9 100644
+index 1be3757..6fb27a2 100644
 --- a/include/net/netevent.h
 +++ b/include/net/netevent.h
 @@ -2,6 +2,9 @@
@@ -232,7 +237,7 @@ index 1be3757a8b7f..6fb27a2ca8a9 100644
  
  int register_netevent_notifier(struct notifier_block *nb);
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 1a6fca013165..3764c26d19ba 100644
+index 1a6fca0..3764c26 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -84,6 +84,12 @@ struct nf_flowtable {
@@ -322,7 +327,7 @@ index 1a6fca013165..3764c26d19ba 100644
  nf_flow_table_offload_add_cb(struct nf_flowtable *flow_table,
  			     flow_setup_cb_t *cb, void *cb_priv)
 diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
-index 3d2df1d435ae..a9f5bbc3acfb 100644
+index 3d2df1d..a9f5bbc 100644
 --- a/net/ipv4/fib_trie.c
 +++ b/net/ipv4/fib_trie.c
 @@ -70,9 +70,26 @@
@@ -377,7 +382,7 @@ index 3d2df1d435ae..a9f5bbc3acfb 100644
  			alias_free_mem_rcu(fa);
  			found++;
 diff --git a/net/ipv4/route.c b/net/ipv4/route.c
-index 2b8c29a29c4a..e96b8d035fc4 100644
+index 2b8c29a..e96b8d0 100644
 --- a/net/ipv4/route.c
 +++ b/net/ipv4/route.c
 @@ -2771,7 +2771,8 @@ struct rtable *ip_route_output_key_hash_rcu(struct net *net, struct flowi4 *fl4,
@@ -391,7 +396,7 @@ index 2b8c29a29c4a..e96b8d035fc4 100644
  			/* Apparently, routing tables are wrong. Assume,
  			 * that the destination is on link.
 diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
-index 5b94cb8df8d8..2c1b9df1937a 100644
+index 5b94cb8..2c1b9df 100644
 --- a/net/ipv6/ip6_fib.c
 +++ b/net/ipv6/ip6_fib.c
 @@ -32,6 +32,7 @@
@@ -446,7 +451,7 @@ index 5b94cb8df8d8..2c1b9df1937a 100644
  }
  
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index df72b0376970..d2efb4da17d3 100644
+index df72b03..d2efb4d 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
 @@ -17,6 +17,55 @@
@@ -565,7 +570,7 @@ index df72b0376970..d2efb4da17d3 100644
  	flow_block_init(&flowtable->flow_block);
  	init_rwsem(&flowtable->flow_block_lock);
 diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
-index 98edcaa37b38..632a92be3ef6 100644
+index 98edcaa..632a92b 100644
 --- a/net/netfilter/nf_flow_table_ip.c
 +++ b/net/netfilter/nf_flow_table_ip.c
 @@ -254,8 +254,16 @@ static bool nf_flow_exceeds_mtu(const struct sk_buff *skb, unsigned int mtu)
@@ -605,7 +610,7 @@ index 98edcaa37b38..632a92be3ef6 100644
  		return 0;
  	}
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index 4f346f51d7d7..ee87af80a9c1 100644
+index 4f346f5..58a1e50 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
 @@ -12,6 +12,7 @@
@@ -677,7 +682,26 @@ index 4f346f51d7d7..ee87af80a9c1 100644
  		other_tuple = &flow->tuplehash[!dir].tuple;
  		ifindex = other_tuple->iifidx;
  		break;
-@@ -896,6 +934,34 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
+@@ -805,12 +843,16 @@ nf_flow_offload_rule_alloc(struct net *net,
+ 	int err = -ENOMEM;
+ 
+ 	flow_rule = kzalloc(sizeof(*flow_rule), GFP_KERNEL);
+-	if (!flow_rule)
++	if (!flow_rule) {
++		nf_flow_offload_handle_invalidate(flow->hw_handle);
+ 		goto err_flow;
++	}
+ 
+ 	flow_rule->rule = flow_rule_alloc(NF_FLOW_RULE_ACTION_MAX);
+-	if (!flow_rule->rule)
++	if (!flow_rule->rule) {
++		nf_flow_offload_handle_invalidate(flow->hw_handle);
+ 		goto err_flow_rule;
++	}
+ 
+ 	flow_rule->rule->match.dissector = &flow_rule->match.dissector;
+ 	flow_rule->rule->match.mask = &flow_rule->match.mask;
+@@ -896,6 +938,34 @@ static void nf_flow_offload_init(struct flow_cls_offload *cls_flow,
  	cls_flow->cookie = (unsigned long)tuple;
  }
  
@@ -712,7 +736,7 @@ index 4f346f51d7d7..ee87af80a9c1 100644
  static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_offload *flow,
  				 struct nf_flow_rule *flow_rule,
-@@ -904,7 +970,21 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -904,7 +974,21 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  				 struct flow_stats *stats,
  				 struct list_head *block_cb_list)
  {
@@ -735,6 +759,17 @@ index 4f346f51d7d7..ee87af80a9c1 100644
  	struct netlink_ext_ack extack = {};
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
+@@ -1087,6 +1171,10 @@ nf_flow_offload_work_alloc(struct nf_flowtable *flowtable,
+ 
+ 	offload = kmalloc(sizeof(struct flow_offload_work), GFP_ATOMIC);
+ 	if (!offload) {
++		/* A partial hardware generation may stay alive from hardware
++		 * stats alone, with no software refresh to retry admission. */
++		if (cmd == FLOW_CLS_REPLACE)
++			nf_flow_offload_handle_invalidate(flow->hw_handle);
+ 		clear_bit(NF_FLOW_HW_PENDING, &flow->flags);
+ 		return NULL;
+ 	}
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
 index 7dbbd89..6430f45 100644
 --- a/net/netfilter/nft_flow_offload.c
@@ -912,7 +947,6 @@ index 7dbbd89..6430f45 100644
  	}
  
  	return 0;
-
 -- 
 2.47.3
 

@@ -1,0 +1,136 @@
+"""The independent fault lease restores configuration even without a runner."""
+import importlib.util
+import gzip
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+SOURCE = Path(__file__).resolve().parents[1] / "tests/_flowtable_failslab_guard.py"
+spec = importlib.util.spec_from_file_location("slab_guard", SOURCE)
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+
+
+@pytest.fixture
+def knobs(tmp_path):
+    debugfs = tmp_path / "debugfs"
+    debugfs.mkdir()
+    for name in guard.KNOBS:
+        (debugfs / name).write_text("0" if name == "probability" else "1")
+    symbols = tmp_path / "symbols"
+    symbols.write_text("1000 t ft_replace [ask_flowtable]\n2000 t next [ask_flowtable]\n")
+    backend, kmsg = tmp_path / "backend", tmp_path / "kmsg"
+    backend.write_text("entries 0\n")
+    kmsg.touch()
+    return {"debugfs": debugfs, "kallsyms": symbols, "backend": backend,
+            "lock_path": tmp_path / "lock", "kmsg": kmsg}
+
+
+@pytest.mark.parametrize("finish", ["consumed", "expired", "cancelled", "setup-error"])
+def test_fault_lease_restores_every_knob(tmp_path, knobs, monkeypatch, finish):
+    root = tmp_path / "result"
+    before = {name: (knobs["debugfs"] / name).read_text() for name in guard.KNOBS}
+    original = Path.write_text
+    failed = False
+
+    def write(path, value, *args, **kwargs):
+        nonlocal failed
+        if finish == "setup-error" and path == knobs["debugfs"] / "require-end" and not failed:
+            failed = True
+            raise OSError("injected setup write error")
+        result = original(path, value, *args, **kwargs)
+        if path == knobs["debugfs"] / "probability" and value == "100":
+            if finish == "consumed":
+                original(knobs["debugfs"] / "times", "0")
+            elif finish == "cancelled":
+                (root / "cancel").touch()
+        return result
+
+    monkeypatch.setattr(Path, "write_text", write)
+    guard.run(root, "entry", lease=0.02, **knobs)
+    result = json.loads((root / "result.json").read_text())
+    assert result["consumed"] == (finish == "consumed")
+    assert ("error" in result) == (finish == "setup-error")
+    assert not result["restore_errors"] and result["restored"] == before
+    assert {name: (knobs["debugfs"] / name).read_text() for name in guard.KNOBS} == before
+
+
+def test_refuses_another_active_injector(tmp_path, knobs):
+    (knobs["debugfs"] / "probability").write_text("100")
+    before = {name: (knobs["debugfs"] / name).read_text() for name in guard.KNOBS}
+    root = tmp_path / "result"
+    guard.run(root, "entry", **knobs)
+    result = json.loads((root / "result.json").read_text())
+    assert "another failslab user" in result["error"] and not (root / "armed.json").exists()
+    assert {name: (knobs["debugfs"] / name).read_text() for name in guard.KNOBS} == before
+
+
+def test_symbol_selection_requires_unique_visible_module_function():
+    text = ("1000 t ft_block_setup.constprop.0 [ask_flowtable]\n"
+            "1000 t alias [ask_flowtable]\n2000 t next [ask_flowtable]\n"
+            "3000 t ft_block_setup [unrelated]\n4000 t next [unrelated]\n")
+    selected = guard.symbol_range(text, "ft_block_setup", "ask_flowtable")
+    assert selected["start"] == 0x1000 and selected["end"] == 0x2000
+    with pytest.raises(AssertionError):
+        guard.symbol_range(text.replace("1000", "0000"), "ft_block_setup", "ask_flowtable")
+    with pytest.raises(AssertionError):
+        guard.symbol_range(text + "1500 t ft_block_setup [ask_flowtable]\n", "ft_block_setup", "ask_flowtable")
+
+
+async def test_lost_launch_acknowledgement_still_cancels_guard(monkeypatch):
+    monkeypatch.syspath_prepend(str(SOURCE.parent))
+    import test_flowtable_failslab as suite
+
+    active = False
+    cancelled = False
+    script = None
+    records = {}
+
+    class Target:
+        async def fs_read(self, session, path):
+            assert path == "/proc/config.gz"
+            config = ("CONFIG_KASAN=y\nCONFIG_FAILSLAB=y\n"
+                      "CONFIG_FAULT_INJECTION_STACKTRACE_FILTER=y\n")
+            return {"errno": 0, "content_hex": gzip.compress(config.encode()).hex()}
+
+        async def fs_write(self, session, path, content):
+            nonlocal script
+            script = content
+            return {"errno": 0}
+
+    async def read(*args):
+        return script
+
+    async def command(console, *args):
+        nonlocal cancelled
+        if args[0] == "touch":
+            assert args[1].endswith("/cancel")
+            cancelled = True
+        else:
+            assert args[0] == "mkdir"
+
+    async def launch(*args):
+        nonlocal active
+        active = True
+        raise EOFError("guard launched, UART acknowledgement lost")
+
+    async def result(r, path, timeout):
+        nonlocal active
+        assert cancelled and path.endswith("/result.json")
+        active = False
+        return {"restore_errors": [], "original": {"probability": "0"},
+                "restored": {"probability": "0"}}
+
+    monkeypatch.setattr(suite, "read", read)
+    monkeypatch.setattr(suite, "console_command", command)
+    monkeypatch.setattr(suite, "console_python", launch)
+    monkeypatch.setattr(suite, "wait_json", result)
+    r = SimpleNamespace(target=Target(), session=None, service_console=None,
+                        record=lambda name, value: records.update({name: value}))
+    with pytest.raises(EOFError, match="acknowledgement lost"):
+        async with suite.slab_fault(r, "entry", "lost-launch"):
+            pytest.fail("an unacknowledged launch must not run the test body")
+    assert not active and cancelled
+    assert "lost-launch-guard-final" in records
