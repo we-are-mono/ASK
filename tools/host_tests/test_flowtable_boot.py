@@ -35,3 +35,33 @@ def test_flowtable_boot_modules(tmp_path, cmdline, fail, expected, rc):
                                  "CALLS": str(log), "FAIL": fail}, timeout=5)
     assert result.returncode == rc, result
     assert log.read_text().splitlines() == expected
+
+
+@pytest.mark.parametrize("verb,stop_rc,expected,rc", [
+    ("stop", 42, ["stop"], 42),
+    ("stop", 0, ["stop"], 0),
+    ("restart", 0, [], 0),
+    ("reload", 0, ["resume"], 0),
+])
+def test_flowtable_service_preserves_authority_and_stop_errors(tmp_path, verb, stop_rc, expected, rc):
+    log, owner = tmp_path / "calls", tmp_path / "owner"
+    owner.write_text("flowtable\n")
+    daemon = tmp_path / "daemon"
+    daemon.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$CALLS"\n'
+                      'if [ "$1" = stop ]; then exit "$STOP_RC"; fi\n')
+    daemon.chmod(0o755)
+    service = tmp_path / "service"
+    text = (ROOT / "meta-ask/recipes-ask/config/files/S50ask-flowtable").read_text()
+    text = text.replace("/sys/module/cdx/parameters/offload_owner", str(owner))
+    text = text.replace("DAEMON=/usr/sbin/ask-flowtable", "DAEMON=" + shlex.quote(str(daemon)))
+    text = text.replace("PIDFILE=/var/run/ask-flowtable.pid", "PIDFILE=" + shlex.quote(str(tmp_path / "pid")))
+    service.write_text(text)
+    service.chmod(0o755)
+    starter = tmp_path / "start-stop-daemon"
+    starter.write_text("#!/bin/sh\nexit 0\n")
+    starter.chmod(0o755)
+    result = subprocess.run([str(service), verb], capture_output=True, text=True,
+                            env={**os.environ, "PATH": str(tmp_path) + ":" + os.environ["PATH"],
+                                 "CALLS": str(log), "STOP_RC": str(stop_rc)}, timeout=5)
+    assert result.returncode == rc, result
+    assert (log.read_text().splitlines() if log.exists() else []) == expected

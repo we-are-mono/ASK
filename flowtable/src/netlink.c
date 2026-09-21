@@ -26,13 +26,13 @@ int ft_nl_open(void)
 	return fd;
 }
 
-/* Drain all pending messages (non-blocking). Returns 1 if at least one was
- * read (something changed), 0 otherwise. */
+/* Bound a drain so continuous events cannot starve the reconciliation timer.
+ * Returns 1 if at least one message was read (something changed), 0 otherwise. */
 int ft_nl_drain(int fd)
 {
 	char buf[8192];
 	int seen = 0;
-	for (;;) {
+	for (int i = 0; i < 64; i++) {
 		ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
 		if (n > 0) { seen = 1; continue; }
 		if (n < 0 && (errno == EINTR))

@@ -2,8 +2,8 @@
  *
  * A Python-free replacement for tools/ask_flowtable.py. One-shot verbs
  * (apply|stop|status|check|render) preserve the retired tool's CLI so the test
- * harness is unchanged; `daemon` adds the default-on behaviour — apply at boot
- * and re-apply when interfaces or Wi-Fi VAPs change.
+ * harness is unchanged; `daemon` reconciles the configured policy and backend
+ * health. Manual apply/stop retain control until an explicit `resume`.
  * SPDX-License-Identifier: GPL-2.0+
  */
 #include "runtime.h"
@@ -16,6 +16,55 @@
 #include <errno.h>
 #include <signal.h>
 #include <poll.h>
+#include <time.h>
+#include <sys/stat.h>
+
+#ifndef FT_HEALTH_MS
+#define FT_HEALTH_MS 5000
+#endif
+#ifndef FT_RETRY_MIN_MS
+#define FT_RETRY_MIN_MS 1000
+#endif
+#ifndef FT_RETRY_MAX_MS
+#define FT_RETRY_MAX_MS 30000
+#endif
+#ifndef FT_DEBOUNCE_MS
+#define FT_DEBOUNCE_MS 500
+#endif
+
+/* All accesses are serialized by FT_LOCK, including the daemon's decision
+ * and its complete apply transaction. /run survives process restarts, not boot. */
+static int paused_read(struct ft_ctx *ctx, bool *paused)
+{
+	struct stat st;
+	if (lstat(FT_PAUSED, &st) == 0) {
+		*paused = true;
+		return 0;
+	}
+	if (errno == ENOENT) {
+		*paused = false;
+		return 0;
+	}
+	snprintf(ctx->err, sizeof(ctx->err), "cannot read reconciliation pause: %s", strerror(errno));
+	return -1;
+}
+
+static int paused_set(struct ft_ctx *ctx, bool paused)
+{
+	if (!paused) {
+		if (unlink(FT_PAUSED) == 0 || errno == ENOENT)
+			return 0;
+	} else {
+		int fd = open(FT_PAUSED, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if (fd >= 0) {
+			close(fd);
+			return 0;
+		}
+	}
+	snprintf(ctx->err, sizeof(ctx->err), "cannot %s reconciliation pause: %s",
+		 paused ? "set" : "clear", strerror(errno));
+	return -1;
+}
 
 /* The built-in zero-config default, used when the conf file is absent: offload
  * every established TCP/UDP flow across the up CDX ports, minus the ALG control
@@ -33,7 +82,7 @@ int ft_load_policy(struct ft_ctx *ctx, const char *path, struct ft_policy *p)
 	char buf[FT_CONF_MAX + 1];
 	int fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
-		if (errno == ENOENT)
+		if (errno == ENOENT && !strcmp(path, FT_DEFAULT_CONF))
 			return ft_conf_parse(ctx, DEFAULT_CONF, sizeof(DEFAULT_CONF) - 1, p);
 		snprintf(ctx->err, sizeof(ctx->err), "cannot open %s: %s", path, strerror(errno));
 		return -1;
@@ -53,21 +102,23 @@ int ft_load_policy(struct ft_ctx *ctx, const char *path, struct ft_policy *p)
 
 /* The apply transaction, mirroring the Python Runtime.apply(): drain the old
  * hardware before rebinding, never leave a foreign or half-applied table. */
-int ft_apply(struct ft_ctx *ctx, struct ft_policy *p, bool emit)
+static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
+			int lock, bool reconcile)
 {
 	struct ft_backend st, drained;
 	bool present, owned;
 	char inhash[65], script[FT_CONF_MAX * 2];
 	char dj[512], bj[512], hash[65];
-	int lock, rc = -1;
+	int rc = -1;
 	memset(&drained, 0, sizeof(drained));
 
-	lock = ft_lock(ctx, 30000);
-	if (lock < 0)
-		return -1;
-
-	if (ft_nft_inspect(ctx, &present, &owned, inhash))
+	if (ft_nft_inspect(ctx, &present, &owned, inhash, lock))
 		goto out;
+	if (present && !owned) {
+		snprintf(ctx->err, sizeof(ctx->err),
+			 "refusing to modify a table without this controller's ownership marker");
+		goto out;
+	}
 	if (ft_backend_read(ctx, &st))
 		goto out;
 	if (!owned && st.present && st.bindings > 0) {
@@ -92,6 +143,14 @@ int ft_apply(struct ft_ctx *ctx, struct ft_policy *p, bool emit)
 		}
 		if (ft_render(ctx, p, st.qos_mark_mask, script, sizeof(script)) < 0)
 			goto out;
+		ft_policy_hash(p, hash);
+		if (reconcile && owned && !strcmp(inhash, hash) &&
+		    st.bindings == p->ndevices && !st.invalidated && !st.quarantine)
+			return 0;
+	} else if (reconcile && !present &&
+		   (!st.present || (!st.bindings && !st.entries && !st.handle_refs &&
+				   !st.neighbour_refs && !st.quarantine && !st.fatal))) {
+		return 0;
 	}
 
 	/* Remove our previous table and let the hardware drain before rebinding. */
@@ -99,7 +158,8 @@ int ft_apply(struct ft_ctx *ctx, struct ft_policy *p, bool emit)
 		goto out;
 	if (ft_backend_drain(ctx, 15000))
 		goto out;
-	ft_backend_read(ctx, &drained);   /* the post-remove state the CLI reports */
+	if (ft_backend_read(ctx, &drained))  /* the post-remove state the CLI reports */
+		goto out;
 
 	if (!p->enabled) {
 		rc = 0;
@@ -119,11 +179,12 @@ int ft_apply(struct ft_ctx *ctx, struct ft_policy *p, bool emit)
 		goto out;
 
 	/* Verify healthy bindings; roll back on any doubt. */
-	if (ft_nft_inspect(ctx, &present, &owned, inhash) || ft_backend_read(ctx, &st))
+	if (ft_nft_inspect(ctx, &present, &owned, inhash, lock) || ft_backend_read(ctx, &st))
 		goto rollback;
 	ft_policy_hash(p, hash);
 	if (!(present && owned && !strcmp(inhash, hash) &&
-	      st.present && st.bindings == p->ndevices && !st.fatal && !st.invalidated)) {
+	      st.present && !strcmp(st.owner, "flowtable") && !st.observe &&
+	      st.bindings == p->ndevices && !st.fatal && !st.invalidated && !st.quarantine)) {
 		snprintf(ctx->err, sizeof(ctx->err), "new policy did not acquire healthy backend bindings");
 		goto rollback;
 	}
@@ -141,8 +202,7 @@ rollback:
 		struct ft_ctx tmp;
 		char why[sizeof(ctx->err)];
 		snprintf(why, sizeof(why), "%s", ctx->err);
-		if (ft_nft_delete(&tmp, lock) == 0) {
-			ft_backend_drain(&tmp, 15000);
+		if (ft_nft_delete(&tmp, lock) == 0 && ft_backend_drain(&tmp, 15000) == 0) {
 			snprintf(ctx->err, sizeof(ctx->err), "apply failed, acceleration disabled: %.200s", why);
 		} else {
 			/* Left dirty: say so, mirroring the Python's compound error. */
@@ -151,6 +211,19 @@ rollback:
 		}
 	}
 out:
+	return reconcile && !rc ? 1 : rc;
+}
+
+int ft_apply(struct ft_ctx *ctx, struct ft_policy *p, bool emit)
+{
+	int lock = ft_lock(ctx, 30000);
+	if (lock < 0)
+		return -1;
+	/* A manual policy can be temporary or security-sensitive. The daemon must
+	 * not replace it with its own configuration, even if this apply fails. */
+	int rc = paused_set(ctx, true);
+	if (!rc)
+		rc = apply_locked(ctx, p, emit, lock, false);
 	close(lock);
 	return rc;
 }
@@ -165,7 +238,9 @@ int ft_stop(struct ft_ctx *ctx, bool emit)
 	lock = ft_lock(ctx, 30000);
 	if (lock < 0)
 		return -1;
-	if (ft_nft_inspect(ctx, &present, &owned, inhash))
+	if (paused_set(ctx, true))
+		goto out;
+	if (ft_nft_inspect(ctx, &present, &owned, inhash, lock))
 		goto out;
 	if (ft_backend_read(ctx, &st))
 		goto out;
@@ -177,9 +252,10 @@ int ft_stop(struct ft_ctx *ctx, bool emit)
 		goto out;
 	if (ft_backend_drain(ctx, 15000))
 		goto out;
+	if (emit && ft_backend_read(ctx, &drained))
+		goto out;
 	rc = 0;
 	if (emit) {
-		ft_backend_read(ctx, &drained);
 		ft_backend_json(&drained, dj, sizeof(dj));
 		printf("{\"enabled\": false, \"drained\": %s}\n", dj);
 	}
@@ -191,23 +267,27 @@ out:
 static int cmd_status(struct ft_ctx *ctx)
 {
 	struct ft_backend st;
-	bool present, owned;
+	bool present, owned, paused;
 	char inhash[65];
 	int lock = ft_lock(ctx, 30000);
 	if (lock < 0)
 		return -1;
-	if (ft_nft_inspect(ctx, &present, &owned, inhash) || ft_backend_read(ctx, &st)) {
+	if (paused_read(ctx, &paused) || ft_nft_inspect(ctx, &present, &owned, inhash, lock) ||
+	    ft_backend_read(ctx, &st)) {
 		close(lock);
 		return -1;
 	}
 	close(lock);
-	bool ready = owned && st.present && st.bindings > 0 && !st.fatal && !st.invalidated && !st.observe;
+	bool ready = owned && st.present && !strcmp(st.owner, "flowtable") &&
+		     st.bindings > 0 && !st.fatal && !st.invalidated && !st.observe && !st.quarantine;
 	printf("{\"policy_installed\": %s, \"policy_hash\": %s%s%s, "
+	       "\"reconciliation_paused\": %s, "
 	       "\"admission_ready\": %s, \"backend\": {\"present\": %s, \"owner\": \"%s\", "
 	       "\"bindings\": %ld, \"entries\": %ld, \"handle_refs\": %ld, \"neighbour_refs\": %ld, "
 	       "\"quarantine\": %ld, \"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld}}\n",
 	       owned ? "true" : "false",
 	       owned ? "\"" : "null", owned ? inhash : "", owned ? "\"" : "",
+	       paused ? "true" : "false",
 	       ready ? "true" : "false",
 	       st.present ? "true" : "false", st.owner,
 	       st.bindings, st.entries, st.handle_refs, st.neighbour_refs, st.quarantine,
@@ -218,28 +298,58 @@ static int cmd_status(struct ft_ctx *ctx)
 static volatile sig_atomic_t stop_flag;
 static void on_signal(int s) { (void)s; stop_flag = 1; }
 
-/* Resolve + render the current policy and return its hash, or "" if it cannot
- * be applied right now (e.g. fewer than two ports up). */
-static void resolve_hash(const char *conf, char out[65])
+/* Decide and repair under the same lease as manual control. A paused daemon
+ * neither interprets its policy nor touches the manually controlled backend. */
+static int reconcile(struct ft_ctx *ctx, const char *conf)
 {
-	struct ft_ctx ctx;
 	struct ft_policy p;
-	out[0] = '\0';
-	if (ft_load_policy(&ctx, conf, &p))
-		return;
-	if (p.enabled && p.devices_auto)
-		ft_enumerate(&p);
-	if (p.enabled && p.ndevices < 2)
-		return;
-	ft_policy_hash(&p, out);
+	bool paused;
+	/* Allow short status readers to finish without turning routine polling
+	 * into repeated recovery backoff. Long manual operations remain bounded. */
+	int rc = -1, lock = ft_lock(ctx, 1000);
+	if (lock < 0)
+		return -1;
+	if (paused_read(ctx, &paused))
+		goto out;
+	if (paused) {
+		rc = 0;
+		goto out;
+	}
+	if (ft_load_policy(ctx, conf, &p))
+		goto out;
+	rc = apply_locked(ctx, &p, false, lock, true);
+out:
+	close(lock);
+	return rc;
+}
+
+static int cmd_resume(struct ft_ctx *ctx)
+{
+	int lock = ft_lock(ctx, 30000);
+	if (lock < 0)
+		return -1;
+	int rc = paused_set(ctx, false);
+	close(lock);
+	if (!rc)
+		puts("{\"reconciliation_paused\": false}");
+	return rc;
+}
+
+static int64_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static int cmd_daemon(const char *conf)
 {
-	struct ft_ctx ctx;
+	struct ft_ctx ctx = {0};
 	char owner[16];
 	int nl;
-	char applied[65] = "";
+	int retry_ms = FT_RETRY_MIN_MS;
+	int64_t due = 0;
+	bool failed = false;
 
 	ft_offload_owner(owner);
 	if (strcmp(owner, "flowtable")) {
@@ -253,58 +363,46 @@ static int cmd_daemon(const char *conf)
 	signal(SIGPIPE, SIG_IGN);
 
 	nl = ft_nl_open();
-	if (nl < 0) {
-		fprintf(stderr, "ask-flowtable: netlink open failed: %s\n", strerror(errno));
-		return 1;
-	}
-
-	/* Boot apply (tolerate "not enough ports yet"; a netlink event will retry). */
-	{
-		struct ft_policy p;
-		if (!ft_load_policy(&ctx, conf, &p)) {
-			if (ft_apply(&ctx, &p, false) == 0)
-				ft_policy_hash(&p, applied);
-			else
-				fprintf(stderr, "ask-flowtable: initial apply deferred: %s\n", ctx.err);
-		} else {
-			fprintf(stderr, "ask-flowtable: %s\n", ctx.err);
-		}
-	}
-
 	while (!stop_flag) {
+		if (now_ms() >= due) {
+			int rc = reconcile(&ctx, conf);
+			failed = rc < 0;
+			if (failed) {
+				fprintf(stderr, "ask-flowtable: reconciliation deferred: %s; retry in %d ms\n",
+					ctx.err, retry_ms);
+				due = now_ms() + retry_ms;
+				if (retry_ms < FT_RETRY_MAX_MS)
+					retry_ms = retry_ms > FT_RETRY_MAX_MS / 2 ? FT_RETRY_MAX_MS : retry_ms * 2;
+			} else {
+				if (rc > 0)
+					fprintf(stderr, "ask-flowtable: reconciled policy and backend\n");
+				retry_ms = FT_RETRY_MIN_MS;
+				due = now_ms() + FT_HEALTH_MS;
+			}
+			if (nl < 0)
+				nl = ft_nl_open();   /* timers still work while event delivery is unavailable */
+		}
+		if (stop_flag)
+			break;
+		int64_t wait = due - now_ms();
 		struct pollfd pfd = { nl, POLLIN, 0 };
-		int r = poll(&pfd, 1, -1);
+		int r = poll(&pfd, 1, wait > 0 ? (int)wait : 0);
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
-		if (!(pfd.revents & POLLIN))
-			continue;
-		ft_nl_drain(nl);
-		/* Debounce: absorb a burst of link/addr churn before acting. */
-		for (;;) {
-			struct pollfd d = { nl, POLLIN, 0 };
-			if (poll(&d, 1, 500) > 0 && (d.revents & POLLIN))
-				ft_nl_drain(nl);
-			else
-				break;
+		if (pfd.revents & (POLLIN | POLLERR)) {
+			ft_nl_drain(nl);
+			int64_t event_due = now_ms() + FT_DEBOUNCE_MS;
+			/* Events can advance a healthy check, never postpone a deadline
+			 * or defeat failure backoff. A storm cannot starve recovery. */
+			if (!failed && event_due < due)
+				due = event_due;
 		}
-		char want[65];
-		resolve_hash(conf, want);
-		if (!strcmp(want, applied))
-			continue;   /* nothing material changed */
-		struct ft_policy p;
-		if (ft_load_policy(&ctx, conf, &p)) {
-			fprintf(stderr, "ask-flowtable: reload failed: %s\n", ctx.err);
-			continue;
-		}
-		if (ft_apply(&ctx, &p, false) == 0) {
-			ft_policy_hash(&p, applied);
-			fprintf(stderr, "ask-flowtable: re-applied for interface change\n");
-		} else {
-			applied[0] = '\0';   /* force a retry on the next event */
-			fprintf(stderr, "ask-flowtable: re-apply deferred: %s\n", ctx.err);
+		if (pfd.revents & (POLLHUP | POLLNVAL)) {
+			close(nl);
+			nl = -1;
 		}
 	}
 	close(nl);
@@ -313,7 +411,7 @@ static int cmd_daemon(const char *conf)
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: ask-flowtable {apply|stop|status|check|render|daemon} [--config PATH]\n");
+	fprintf(stderr, "usage: ask-flowtable {apply|stop|resume|status|check|render|daemon} [--config PATH]\n");
 	return 2;
 }
 
@@ -321,18 +419,22 @@ int main(int argc, char **argv)
 {
 	const char *conf = FT_DEFAULT_CONF;
 	const char *cmd = NULL;
+	bool explicit_conf = false;
 	int i;
 
 	for (i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--config") && i + 1 < argc)
+		if (!strcmp(argv[i], "--config") && i + 1 < argc) {
 			conf = argv[++i];
-		else if (!cmd)
+			explicit_conf = true;
+		} else if (!cmd)
 			cmd = argv[i];
 		else
 			return usage();
 	}
 	if (!cmd)
 		return usage();
+	if (!strcmp(cmd, "resume") && explicit_conf)
+		return usage();   /* resume selects the running daemon's policy, not a candidate */
 
 	struct ft_ctx ctx;
 	memset(&ctx, 0, sizeof(ctx));
@@ -345,6 +447,10 @@ int main(int argc, char **argv)
 		return cmd_daemon(conf);
 	if (!strcmp(cmd, "status"))
 		return cmd_status(&ctx) ? (fprintf(stderr, "ask-flowtable: %s\n", ctx.err), 1) : 0;
+	if (!strcmp(cmd, "stop"))
+		return ft_stop(&ctx, true) ? (fprintf(stderr, "ask-flowtable: %s\n", ctx.err), 1) : 0;
+	if (!strcmp(cmd, "resume"))
+		return cmd_resume(&ctx) ? (fprintf(stderr, "ask-flowtable: %s\n", ctx.err), 1) : 0;
 
 	struct ft_policy p;
 	if (ft_load_policy(&ctx, conf, &p)) {
@@ -374,13 +480,6 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(cmd, "apply")) {
 		if (ft_apply(&ctx, &p, true)) {
-			fprintf(stderr, "ask-flowtable: %s\n", ctx.err);
-			return 1;
-		}
-		return 0;
-	}
-	if (!strcmp(cmd, "stop")) {
-		if (ft_stop(&ctx, true)) {
 			fprintf(stderr, "ask-flowtable: %s\n", ctx.err);
 			return 1;
 		}

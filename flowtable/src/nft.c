@@ -12,71 +12,12 @@
 #include <sys/file.h>
 #include <sys/wait.h>
 
-/* Run argv (no shell). If input!=NULL, feed it on stdin. Capture combined
- * stdout+stderr into out (out may be NULL). Returns the child exit code, or
- * -1 on spawn failure. */
-/* keepfd: an fd whose open-file description the child should inherit across
- * exec (used to hand the flock lease to a committing nft, so an orphaned nft
- * keeps the lock if its controller is killed mid-transaction). -1 for none. */
-static int run(char *const argv[], const char *input, char *out, size_t outlen, int keepfd)
-{
-	int in_pipe[2] = { -1, -1 }, out_pipe[2];
-	pid_t pid;
-	if (out) out[0] = '\0';
-	if (input && pipe(in_pipe) < 0) return -1;
-	if (pipe(out_pipe) < 0) { if (input) { close(in_pipe[0]); close(in_pipe[1]); } return -1; }
-
-	pid = fork();
-	if (pid < 0) {
-		if (input) { close(in_pipe[0]); close(in_pipe[1]); }
-		close(out_pipe[0]); close(out_pipe[1]);
-		return -1;
-	}
-	if (pid == 0) {
-		if (input) { dup2(in_pipe[0], 0); close(in_pipe[0]); close(in_pipe[1]); }
-		else { int n = open("/dev/null", O_RDONLY); if (n >= 0) { dup2(n, 0); close(n); } }
-		dup2(out_pipe[1], 1);
-		dup2(out_pipe[1], 2);
-		close(out_pipe[0]); close(out_pipe[1]);
-		/* dup() clears O_CLOEXEC, so this copy survives exec and keeps the
-		 * flock's OFD alive even if the parent (its fd) is gone. */
-		if (keepfd >= 0)
-			(void)dup(keepfd);
-		setenv("LC_ALL", "C", 1);
-		execvp(argv[0], argv);
-		_exit(127);
-	}
-	if (input) close(in_pipe[0]);
-	close(out_pipe[1]);
-	if (input) {
-		size_t off = 0, len = strlen(input);
-		while (off < len) {
-			ssize_t w = write(in_pipe[1], input + off, len - off);
-			if (w <= 0) break;
-			off += (size_t)w;
-		}
-		close(in_pipe[1]);
-	}
-	size_t got = 0;
-	for (;;) {
-		char buf[4096];
-		ssize_t r = read(out_pipe[0], buf, sizeof(buf));
-		if (r <= 0) break;
-		if (out && got + (size_t)r < outlen) { memcpy(out + got, buf, r); got += (size_t)r; }
-	}
-	if (out && got < outlen) out[got] = '\0';
-	close(out_pipe[0]);
-	int status;
-	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
 int ft_nft_run(struct ft_ctx *ctx, const char *script, bool check_only, int keepfd)
 {
 	char err[512];
 	char *argv_check[] = { "nft", "--check", "-f", "-", NULL };
 	char *argv_apply[] = { "nft", "-f", "-", NULL };
-	int rc = run(check_only ? argv_check : argv_apply, script, err, sizeof(err), keepfd);
+	int rc = ft_nft_exec(check_only ? argv_check : argv_apply, script, err, sizeof(err), keepfd);
 	if (rc != 0) {
 		char *nl = strchr(err, '\n'); if (nl) *nl = '\0';
 		snprintf(ctx->err, sizeof(ctx->err), "nft: %.240s", err[0] ? err : "failed");
@@ -85,24 +26,41 @@ int ft_nft_run(struct ft_ctx *ctx, const char *script, bool check_only, int keep
 	return 0;
 }
 
-int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65])
+int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65], int keepfd)
 {
-	char out[8192];
+	char out[FT_CONF_MAX * 4];
 	char *argv[] = { "nft", "list", "table", "inet", FT_TABLE, NULL };
-	int rc = run(argv, NULL, out, sizeof(out), -1);
-	(void)ctx;
+	int rc = ft_nft_exec(argv, NULL, out, sizeof(out), keepfd);
 	*present = false; *owned = false; if (hash) hash[0] = '\0';
-	if (rc != 0)
-		return 0;   /* absent (or nft error treated as absent) */
+	if (rc < 0) goto inspect_error;
+	if (rc != 0) {
+		/* An unsuccessful lookup is not proof of absence: ENOMEM, denied
+		 * access or a broken nft must not authorize a replacement. Confirm
+		 * absence with a successful inventory, without parsing stderr. */
+		char *tables[] = { "nft", "list", "tables", NULL };
+		if (ft_nft_exec(tables, NULL, out, sizeof(out), keepfd) != 0)
+			goto inspect_error;
+		char *save, *line = strtok_r(out, "\n", &save);
+		for (; line; line = strtok_r(NULL, "\n", &save)) {
+			char kind[16], family[16], name[64];
+			if (sscanf(line, "%15s %15s %63s", kind, family, name) == 3 &&
+			    !strcmp(kind, "table") && !strcmp(family, "inet") && !strcmp(name, FT_TABLE))
+				goto inspect_error;
+		}
+		return 0;
+	}
 	*present = true;
 	*owned = ft_marker_owned(out, hash);
 	return 0;
+inspect_error:
+	snprintf(ctx->err, sizeof(ctx->err), "cannot inspect nft table state");
+	return -1;
 }
 
 int ft_nft_delete(struct ft_ctx *ctx, int keepfd)
 {
 	bool present, owned; char hash[65];
-	if (ft_nft_inspect(ctx, &present, &owned, hash))
+	if (ft_nft_inspect(ctx, &present, &owned, hash, keepfd))
 		return -1;
 	if (!present)
 		return 0;
@@ -112,8 +70,9 @@ int ft_nft_delete(struct ft_ctx *ctx, int keepfd)
 		return -1;
 	}
 	char *argv[] = { "nft", "delete", "table", "inet", FT_TABLE, NULL };
-	if (run(argv, NULL, NULL, 0, keepfd) != 0) {
-		snprintf(ctx->err, sizeof(ctx->err), "nft: could not delete existing table");
+	char err[512];
+	if (ft_nft_exec(argv, NULL, err, sizeof(err), keepfd) != 0) {
+		snprintf(ctx->err, sizeof(ctx->err), "nft delete: %.240s", err[0] ? err : "failed");
 		return -1;
 	}
 	return 0;
@@ -143,9 +102,9 @@ int ft_lock(struct ft_ctx *ctx, int timeout_ms)
 			close(fd);
 			return -1;
 		}
-		ts.tv_sec = 0; ts.tv_nsec = 50 * 1000000;
+		ts.tv_sec = 0; ts.tv_nsec = 10 * 1000000;
 		nanosleep(&ts, NULL);
-		waited += 50;
+		waited += 10;
 	}
 	return fd;
 }

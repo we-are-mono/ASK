@@ -10,6 +10,7 @@
 #define FT_PROC        "/proc/cdx_flowtable"
 #define FT_OWNER_PARAM "/sys/module/cdx/parameters/offload_owner"
 #define FT_LOCK        "/run/lock/ask-flowtable.lock"
+#define FT_PAUSED      "/run/lock/ask-flowtable.paused"
 #define FT_DEFAULT_CONF "/etc/ask/offload.conf"
 
 /* The header of /proc/cdx_flowtable. present=false means the adapter is not
@@ -39,12 +40,15 @@ int ft_backend_drain(struct ft_ctx *ctx, int timeout_ms);
  * Returns the count (>=0). */
 int ft_enumerate(struct ft_policy *p);
 
+/* Internal process boundary: bounded I/O, execution and lease lifetime. */
+int ft_nft_exec(char *const argv[], const char *input, char *out, size_t outlen, int keepfd);
+
 /* nft interactions (shell out to the shipped nft). All return 0/-1 (ctx->err). */
 int ft_nft_run(struct ft_ctx *ctx, const char *script, bool check_only, int keepfd);
 int ft_nft_delete(struct ft_ctx *ctx, int keepfd);  /* delete our table if present */
 /* Inspect our table: present, whether it carries our marker (owned) vs a
  * foreign table of the same name, and the marker hash. */
-int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65]);
+int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65], int keepfd);
 
 /* flock the single-flight lock for the duration of an operation. Returns an fd
  * (>=0) to close when done, or -1 (ctx->err). */

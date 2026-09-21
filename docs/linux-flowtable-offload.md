@@ -18,6 +18,7 @@ Current checkpoint: IPv6, 802.1Q VLAN, bridging, PPPoE, IPv4 TCP/UDP NAT and
 | --- | --- |
 | Current interfaces, ownership, locking and lifetime contracts | [Architecture](flowtable-architecture.md) |
 | Accepted foundation, recovery matrix and verification limits | [Foundation checkpoint](flowtable-foundation.md) |
+| Controller recovery, fault-injection coverage and remaining resilience work | [Resilience test plan](flowtable-resilience.md) |
 | Configure scope/exclusions, revoke active flows, migrate CMM settings | [Policy guide](flowtable-policy.md) |
 | Supported NAT mappings and their focused proof | [NAT guide](flowtable-nat.md) |
 | IPv6 eligibility, what the family really changes, and its proof | [IPv6 guide](flowtable-ipv6.md) |
@@ -123,10 +124,13 @@ acceptance and a stable binary ABI are not dependencies.
 The test initramfs selects flowtable mode with `ask.offload=flowtable`; absence
 selects CMM. `ask.flowtable_observe=1` validates requests without installing
 hardware. Switching owner requires a clean boot. Healthy adapter reload retains
-provider ownership; recreate the flowtable to restore hardware binding.
+provider ownership; automatic reconciliation restores the configured binding
+when the daemon retains authority, otherwise explicitly reapply the policy.
 
-The shipped `/etc/ask/flowtable.json` is disabled. Use `ask-flowtable check`,
-`render`, `apply`, `status` and `stop` as described in the [policy guide](flowtable-policy.md).
+The shipped `/etc/ask/offload.conf` enables eligible traffic by default. Use
+`ask-flowtable check`, `render`, `apply`, `status`, `stop` and `resume` as described
+in the [policy guide](flowtable-policy.md). Manual apply/stop pause automatic
+reconciliation until explicit resume, including across service restarts.
 Policy replacement drains existing hardware before publishing new admission.
 Changing unrelated firewall rules alone does not revoke a cached hardware flow;
 follow the [firewall revocation sequence](flowtable-policy.md#firewall-ordering-and-revocation).

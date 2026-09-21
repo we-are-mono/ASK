@@ -21,8 +21,10 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 
 	memset(b, 0, sizeof(*b));
 	if (!f) {
-		b->present = false;
-		return 0;   /* adapter not loaded is a valid state, not an error */
+		if (errno == ENOENT)
+			return 0;   /* adapter not loaded */
+		snprintf(ctx->err, sizeof(ctx->err), "cannot read backend diagnostics: %s", strerror(errno));
+		return -1;
 	}
 	b->present = true;
 	while (fgets(line, sizeof(line), f)) {
@@ -53,8 +55,9 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 		else if (!strcmp(key, "errors"))         { b->errors = v; }
 		else if (!strcmp(key, "qos_mark_mask"))  { b->qos_mark_mask = (uint32_t)strtoul(sval, NULL, 0); }
 	}
+	int error = ferror(f);
 	fclose(f);
-	if (seen != 255) {
+	if (error || seen != 255) {
 		snprintf(ctx->err, sizeof(ctx->err), "incomplete backend diagnostics");
 		return -1;
 	}

@@ -1,7 +1,7 @@
 SUMMARY = "ask-flowtable — ASK default-on hardware flow-offload service"
 DESCRIPTION = "Installs and maintains the nftables flowtable that drives the \
-CDX/FMAN hardware offload, and re-applies it as interfaces and Wi-Fi VAPs \
-change. Replaces the tools/ask_flowtable.py helper — a self-contained C \
+CDX/FMAN hardware offload, reconciling policy and backend health with bounded \
+retries and explicit manual ownership. Replaces the tools/ask_flowtable.py helper — a self-contained C \
 service with no Python or JSON-library runtime dependency, so it ports \
 unchanged to Armbian and NixOS."
 LICENSE = "GPL-2.0-only"

@@ -49,6 +49,8 @@ async def test_boot_service_offloads_by_default(target_agent, aiohttp_session):
         # (Re)start the boot service — idempotent, and the point of the test is
         # that starting it is the *whole* configuration.
         await console_command(con, INIT, "restart", check=False, timeout=45)
+        # Prior one-shot tests can retain manual ownership across restart.
+        await console_command(con, DAEMON, "resume")
 
         # It installs its table and binds every up CDX physical port with no
         # further action.

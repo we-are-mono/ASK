@@ -32,7 +32,8 @@ async def test_flowtable_startup_without_cmm_or_fci(connections):
         cmm = await console_command(con, "/etc/init.d/cmm", "start")
         assert "CMM disabled" in cmm["stdout"], cmm
         # The shipped offload service is default-on and needs no configuration:
-        # its shipped policy parses, starting it binds every up CDX port, and
+        # its shipped policy parses, starting/resuming it after the fixture's
+        # explicit maintenance stop binds every up CDX port, and
         # none of that loads CMM or FCI. It is stopped again afterwards because
         # this test's own table needs the ports.
         shipped = await console_command(con, "/usr/sbin/ask-flowtable", "check",
@@ -40,6 +41,7 @@ async def test_flowtable_startup_without_cmm_or_fci(connections):
         assert json.loads(shipped["stdout"])["policy_hash"], shipped
         await console_command(con, "/etc/init.d/ask-flowtable", "start", check=False,
                               timeout=45)
+        await console_command(con, "/usr/sbin/ask-flowtable", "resume")
         for _ in range(40):
             status = json.loads((await console_command(con, "/usr/sbin/ask-flowtable",
                                                        "status"))["stdout"])
