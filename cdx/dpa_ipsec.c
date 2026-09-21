@@ -88,6 +88,8 @@
 struct cgr_priv {
 /*	bool use_ingress_cgr;*/
 	struct qman_cgr ingress_cgr;
+	int cpu;
+	int delete_result;
 };
 /* The following macro is used as default value before introducing module param */
 
@@ -114,14 +116,18 @@ struct ipsec_info {
 	void *ofport_td[MAX_MATCH_TABLES];
 	uint32_t expt_fq_count ;
 	struct dpa_bp *ipsec_bp;
-	struct dpa_fq		*ipsec_exception_fq;
+	/* PCD wrappers are individually allocated; SA queues are embedded in
+	 * dpa_ipsec_sainfo and must only be freed by their SA owner. */
+	struct dpa_fq *ipsec_pcd_fqs;
+	struct dpa_fq *ipsec_exception_fq;
 	struct port_bman_pool_info parent_pool_info;
 #ifdef CS_TAIL_DROP
 	struct cgr_priv	cgr;
+	bool cgr_initialized;
 #endif
 };
 
-static struct ipsec_info ipsecinfo;
+static struct ipsec_info ipsecinfo = { .ofport_handle = -1 };
 #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 extern struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
 #endif
@@ -326,6 +332,10 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	gro_result_t gro_result;
 	const struct qman_portal_config *pc;
 	struct dpa_napi_portal *np;
+
+	/* A volatile dequeue may finish without a frame descriptor. */
+	if (!(dq->stat & QM_DQRR_STAT_FD_VALID))
+		return qman_cb_dqrr_consume;
 #ifdef DPA_IPSEC_DEBUG
 	DPAIPSEC_INFO("%s::fqid %x(%d), bpid %d, len %d, \n offset %d sts %08x\n", __func__,
 			dq->fqid, dq->fqid, dq->fd.bpid, dq->fd.length20,
@@ -528,7 +538,7 @@ rel_fd:
 
 static int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info)
 {
-	struct dpa_fq *list = info->ipsec_exception_fq;
+	struct dpa_fq *list = info->ipsec_pcd_fqs;
 	while (list)
 	{
 		if (list->fqid == fqid)
@@ -663,8 +673,7 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			dpa_fq = kzalloc((sizeof(struct dpa_fq)), GFP_KERNEL);
 			if (!dpa_fq) {
 				DPAIPSEC_ERROR("%s::unable to alloc mem for dpa_fq\n", __func__) ;
-				/* nothing to free for this iteration (dpa_fq is NULL);
-				 * err_ret unwinds the FQs from earlier iterations. */
+				/* The caller drains all previously published queues. */
 				goto err_ret;
 			}
 
@@ -697,8 +706,8 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 					DPAIPSEC_ERROR("%s::qman_create_fq failed for fqid 0x%x (%d): err=%d, dist=%d\n",
 							__func__, dpa_fq->fqid, dpa_fq->fqid,
 							qrc, jj);
-					/* not on the exception-fq list yet; free the
-					 * wrapper here so err_ret doesn't have to. */
+					/* Not on the PCD list yet; the caller cannot
+					 * release this wrapper for us. */
 					kfree(dpa_fq);
 					goto err_ret;
 				}
@@ -720,17 +729,17 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 							__func__, dpa_fq->fqid, dpa_fq->fqid,
 							qrc, jj, fqbase & 0xFFFF, portid, dpa_fq->channel);
 					qman_destroy_fq(fq, 0);
-					/* not on the exception-fq list yet; the FQ is
+					/* Not on the PCD list yet; the FQ is
 					 * already destroyed, so just free the wrapper. */
 					kfree(dpa_fq);
 					goto err_ret;
 				}
 			}
 			cdx_create_type_fqid_info_in_procfs(fq, PCD_DIR, oh_iface_info->pcd_proc_entry, NULL);
-			/* FQ is fully created, initialised and registered in procfs;
-			 * only now put it on the exception-fq list so err_ret never
-			 * walks a half-built or already-destroyed FQ. */
-			ipsec_addfq_to_exceptionfq_list(dpa_fq, info);
+			/* Track only fully initialized queues. The common cleanup
+			 * retains them and the buffer pool until draining completes. */
+			dpa_fq->list.next = (struct list_head *)info->ipsec_pcd_fqs;
+			info->ipsec_pcd_fqs = dpa_fq;
 #ifdef DPA_IPSEC_DEBUG
 			DPAIPSEC_INFO("%s::created pcd fq %x(%d) for wlan packets "
 					"channel 0x%x\n", __func__,
@@ -739,39 +748,13 @@ static int create_ipsec_pcd_fqs(struct ipsec_info *info, uint32_t schedule)
 			/* next FQ */
 			fqbase++;
 			info->expt_fq_count++;
+			if (cdx_dpa_init_fault())
+				goto err_ret;
 		}
 	}
 	return SUCCESS;
 err_ret:
-	/*
-	 * Unwind every FQ that an earlier iteration fully set up and placed on
-	 * the exception-fq list. The current (failing) FQ is never on the list
-	 * — it is added only after procfs registration — so it can't be double-
-	 * retired or double-freed here; its wrapper is already freed at the goto
-	 * site. Mirrors the SA-path err_ret3 teardown, plus the kfree these
-	 * kzalloc'd wrappers need (the SA path uses a fixed sec_fq[] array). A
-	 * retire/oos failure leaves the FQ un-OOS, so we must not destroy it
-	 * (QMan would keep a dangling pointer for later callbacks — UAF); bail
-	 * out and leak the remainder deliberately, as the SA teardown does.
-	 */
-	while (info->ipsec_exception_fq) {
-		dpa_fq = info->ipsec_exception_fq;
-		fq = &dpa_fq->fq_base;
-		ipsec_delfq_from_exceptionfq_list(dpa_fq->fqid, info);
-		if (qman_retire_fq(fq, NULL)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		if (qman_oos_fq(fq)) {
-			DPAIPSEC_ERROR("%s::Failed to oos FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		cdx_remove_fqid_info_in_procfs(fq->fqid);
-		qman_destroy_fq(fq, 0);
-		kfree(dpa_fq);
-	}
+	/* Includes failures between distributions, not just inside a batch. */
 	return FAILURE;
 }
 
@@ -987,19 +970,11 @@ err_ret3:
 	for (; ii>0 ; ii--)
 	{
 		fq = &(ipsecsa_info->sec_fq[ii-1].fq_base);
+		/* No caller has received this SA, so no producer can submit to
+		 * it. Wait out asynchronous retirement before releasing the
+		 * embedded queues, shared descriptor or module reference. */
+		cdx_destroy_fq(fq);
 		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
-		if (qman_retire_fq(fq, NULL)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		if (qman_oos_fq(fq)) {
-			DPAIPSEC_ERROR("%s::Failed to retire FQ %x(%d)\n",
-					__func__, fq->fqid, fq->fqid);
-			return FAILURE;
-		}
-		cdx_remove_fqid_info_in_procfs(fq->fqid);
-		qman_destroy_fq(fq, 0);
 	}
 	if (ipsecsa_info->sa_proc_entry) {
 		proc_remove(((cdx_proc_dir_entry_t *)(ipsecsa_info->sa_proc_entry))->proc_dir);
@@ -1047,10 +1022,7 @@ static int ipsec_init_ohport(struct ipsec_info *info)
 	return SUCCESS;
 
 release:
-	/* The module carries on without IPsec after a failure here, so the
-	 * claim on the port cannot be left behind. */
-	release_offline_port(IPSEC_FMAN_IDX, info->ofport_handle);
-	info->ofport_handle = -1;
+	/* The common init unwind releases the tracked port claim. */
 	return FAILURE;
 }
 
@@ -1162,6 +1134,29 @@ int cdx_init_scatter_gather_bpool(void)
 	return 0;
 }
 
+static void ipsec_free_pool_buffer(void *addr)
+{
+	struct sk_buff *skb, **skbh;
+
+	/* dpaa_bp_alloc_n_add_buffs(..., true) stores an skb immediately
+	 * before the DMA buffer. Its head is slab allocated, not a page. */
+	DPA_READ_SKB_PTR(skb, skbh, addr, -1);
+	dev_kfree_skb_any(skb);
+}
+
+static void release_ipsec_bpool(struct ipsec_info *info)
+{
+	struct dpa_bp *bp = info->ipsec_bp;
+
+	if (!bp)
+		return;
+	/* Unmap and drain through free_buf_cb, then remove the BPID lookup
+	 * before recycling it. bman_free_pool alone does neither. */
+	_dpa_bp_free(bp);
+	kfree(bp);
+	info->ipsec_bp = NULL;
+}
+
 static int add_ipsec_bpool(struct ipsec_info *info)
 {
 	struct dpa_bp *bp,*bp_parent;
@@ -1193,7 +1188,7 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	bp->dev = bp_parent->dev;
 	bp->size = IPSEC_BUFSIZE;
 	bp->config_count = IPSEC_BUFCOUNT;
-	bp->free_buf_cb = _dpa_bp_free_pf;
+	bp->free_buf_cb = ipsec_free_pool_buffer;
 	if (dpa_bp_alloc(bp, bp->dev)) {
 		DPAIPSEC_ERROR("%s::dpa_bp_alloc failed for ipsec\n",
 				__func__);
@@ -1222,21 +1217,12 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	if (dpaa_bp_alloc_n_add_buffs(bp, IPSEC_BUFCOUNT, 1)) {
 		DPAIPSEC_ERROR("%s::dpaa_bp_alloc_n_add_buffs failed for ipsec\n",
 				__func__);
-		bman_free_pool(bp->pool);
-		kfree(bp);
-		info->ipsec_bp = NULL;
+		/* Earlier batches (and part of the last one) are already in
+		 * BMan. The caller drains them through the common unwind. */
 		return -1;
 	}
 
-	return 0;
-}
-static int release_ipsec_bpool(struct ipsec_info *info)
-{
-	struct dpa_bp *bp =  info->ipsec_bp ;
-	bman_free_pool(bp->pool);
-	kfree(bp);
-	info->ipsec_bp = NULL; 
-	return 0;
+	return cdx_dpa_init_fault() ? FAILURE : SUCCESS;
 }
 
 int cdx_dpa_get_ipsec_pool_info(uint32_t *bpid, uint32_t *buf_size)
@@ -1254,17 +1240,24 @@ void *cdx_dpa_ipsecsa_alloc(struct ipsec_info *info, uint32_t handle)
 {
 	struct dpa_ipsec_sainfo *sainfo;
 
+	/* An SA can still own SEC work while its deferred deletion runs.
+	 * Keep the pool and callback text loaded until all its queues are
+	 * gone, including SAs retained after a failed retirement. */
+	if (!try_module_get(THIS_MODULE))
+		return NULL;
 	sainfo = (struct dpa_ipsec_sainfo *)
 		kzalloc(sizeof(struct dpa_ipsec_sainfo), GFP_KERNEL);
 	if (!sainfo) {
 		DPAIPSEC_ERROR("%s::Error in allocating sainfo\n",
 				__func__);
+		module_put(THIS_MODULE);
 		return NULL;
 	}
 	memset(sainfo, 0, sizeof(struct dpa_ipsec_sainfo));
 	//create fqs in scheduled state
 	if (create_ipsec_fqs(sainfo, 1, handle)) {
 		kfree(sainfo);
+		module_put(THIS_MODULE);
 		return NULL;
 	}
 	return sainfo;
@@ -1304,7 +1297,6 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	for (ii = 0; ii < NUM_FQS_PER_SA; ii++) {
 		dpa_fq = &sainfo->sec_fq[ii];
 		fq = &dpa_fq->fq_base;
-		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		if (qman_oos_fq(fq)) {
 			/*
 			 * FQ is left in qman_fq_state_retired (not OOS).
@@ -1322,6 +1314,10 @@ int cdx_dpa_ipsecsa_release(void *handle)
 				fq->fqid);
 			return FAILURE;
 		}
+		/* QMan can publish the retired state before its last callback
+		 * returns. Retain both the embedded queue and the module. */
+		synchronize_net();
+		ipsec_delfq_from_exceptionfq_list(fq->fqid,&ipsecinfo);
 		cdx_remove_fqid_info_in_procfs(fq->fqid);
 		qman_destroy_fq(fq, 0);
 	}
@@ -1338,6 +1334,7 @@ int cdx_dpa_ipsecsa_release(void *handle)
 	kfree(sainfo->shdesc_mem);
 	qman_release_fqid_range(sainfo->sec_fq[FQ_FROM_SEC].fqid, NUM_FQS_PER_SA);
 	kfree(sainfo);
+	module_put(THIS_MODULE);
 	return SUCCESS;
 }
 
@@ -1401,8 +1398,12 @@ static int cdx_dpaa_ingress_cgr_init(struct cgr_priv *cgr)
 	initcgr.we_mask |= QM_CGR_WE_CSTD_EN;
 	initcgr.cgr.cstd_en = QM_CGR_EN;
 
+	/* Deletion must use this same affine portal, even after migration. */
+	preempt_disable();
+	cgr->cpu = smp_processor_id();
 	err = qman_create_cgr(&cgr->ingress_cgr, QMAN_CGR_FLAG_USE_INIT,
 			&initcgr);
+	preempt_enable();
 	if (err < 0) {
 		pr_err("Error %d creating ingress CGR with ID %d\n", err,
 				cgr->ingress_cgr.cgrid);
@@ -1417,16 +1418,30 @@ out_error:
 	return err;
 }
 
+static void ipsec_delete_cgr_on_cpu(void *arg)
+{
+	struct cgr_priv *cgr = arg;
+
+	cgr->delete_result = qman_delete_cgr(&cgr->ingress_cgr);
+}
+
 static void cdx_dpaa_ingress_cgr_exit(struct cgr_priv *cgr)
 {
-	int iRet = 0;
+	int ret;
 
-	if ((iRet = qman_delete_cgr(&cgr->ingress_cgr)))
-		printk("Deletion of CGR failed: %d\n", iRet);
-	else
-		qman_release_cgrid(cgr->ingress_cgr.cgrid);
-
-	return;
+	/* qman_delete_cgr_safe() discards errors. Keep callback storage and
+	 * module text alive until deletion on the owning portal succeeds. */
+	for (;;) {
+		ret = smp_call_function_single(cgr->cpu, ipsec_delete_cgr_on_cpu,
+					       cgr, 1);
+		if (!ret)
+			ret = cgr->delete_result;
+		if (!ret)
+			break;
+		pr_warn_ratelimited("cdx: cannot delete IPsec CGR: %d\n", ret);
+		usleep_range(1000, 2000);
+	}
+	qman_release_cgrid(cgr->ingress_cgr.cgrid);
 }
 #endif
 
@@ -1452,27 +1467,25 @@ int cdx_dpa_ipsec_init(void)
 
 	DPAIPSEC_INFO("%s::\n", __func__);
 	ipsecinfo.crypto_channel_id = qm_channel_caam;
-	ipsecinfo.ipsec_exception_fq = NULL;
-	/* Zero is a valid port index, and the unwind below keys on the sign. */
-	ipsecinfo.ofport_handle = -1;
 	/* Each step undoes the ones before it on failure. The module carries
 	 * on without IPsec, so a half-built claim on the port or the pool
 	 * would otherwise be held for nothing. The fault hook is the same one
 	 * the other startup acquisitions expose, so a test can boot a board
 	 * "without" the port and prove the rest still comes up. */
 	if (cdx_dpa_init_fault() || ipsec_init_ohport(&ipsecinfo))
-		goto ohport_failure;
+		goto failure;
 	if (add_ipsec_bpool(&ipsecinfo))
-		goto bpool_failure;
+		goto failure;
 #ifdef CS_TAIL_DROP
 	if (sec_congestion){
 		if (cdx_dpaa_ingress_cgr_init(&ipsecinfo.cgr)) {
-			goto cgr_failure;
+			goto failure;
 		}
+		ipsecinfo.cgr_initialized = true;
 	}
 #endif
 	if (create_ipsec_pcd_fqs(&ipsecinfo, 1)) {
-		goto ipsec_pcd_fq_failure;
+		goto failure;
 	}
 	register_cdx_deinit_func(cdx_dpa_ipsec_exit);
 	/* Last, once everything a reader could reach through it exists, and
@@ -1481,19 +1494,8 @@ int cdx_dpa_ipsec_init(void)
 	smp_store_release(&dpa_ipsec_ready, true);
 	return SUCCESS;
 
-ipsec_pcd_fq_failure:
-#ifdef CS_TAIL_DROP
-	if(sec_congestion)
-		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);
-cgr_failure:
-#endif
-	release_ipsec_bpool(&ipsecinfo);
-bpool_failure:
-	if (ipsecinfo.ofport_handle >= 0) {
-		release_offline_port(IPSEC_FMAN_IDX, ipsecinfo.ofport_handle);
-		ipsecinfo.ofport_handle = -1;
-	}
-ohport_failure:
+failure:
+	cdx_dpa_ipsec_exit();
 	return FAILURE;
 }
 
@@ -1503,9 +1505,22 @@ void cdx_dpa_ipsec_exit(void)
 	/* First, so that nothing admitted from here on finds state that is
 	 * being torn down below it. */
 	WRITE_ONCE(dpa_ipsec_ready, false);
+	/* Live and retiring SAs pin the module; module shutdown stops the
+	 * producer ports before this callback. Init rollback admits no SA.
+	 * Retain the pool while queues retire, return pending frames and
+	 * finish portal callbacks. */
+	cdx_destroy_fq_list(&ipsecinfo.ipsec_pcd_fqs);
+	ipsecinfo.expt_fq_count = 0;
+	if (ipsecinfo.ofport_handle >= 0) {
+		release_offline_port(IPSEC_FMAN_IDX, ipsecinfo.ofport_handle);
+		ipsecinfo.ofport_handle = -1;
+	}
+	memset(ipsecinfo.ofport_td, 0, sizeof(ipsecinfo.ofport_td));
 #ifdef CS_TAIL_DROP
-	if(sec_congestion)
+	if (ipsecinfo.cgr_initialized) {
 		cdx_dpaa_ingress_cgr_exit(&ipsecinfo.cgr);
+		ipsecinfo.cgr_initialized = false;
+	}
 #endif
 	release_ipsec_bpool(&ipsecinfo);
 	return;

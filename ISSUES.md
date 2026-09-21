@@ -224,16 +224,6 @@ result independently of those temporary files.
   Station and ACS scans only, so not on the product's steady state; a generation counter beside
   `scan_request` would also close the pointer-reuse residue in patch 0005's "same request" guard.
 
-- [ ] **A177 — `cdx_dpa_ipsec_exit()` and the init unwind do not fully release what init claimed.**
-  `release_ipsec_bpool()` (`cdx/dpa_ipsec.c`) frees the BMan pool bookkeeping and the `dpa_bp`
-  without draining the 512 skb-backed buffers `dpaa_bp_alloc_n_add_buffs()` seeded, so they leak
-  and the BPID is recycled with buffers still in hardware; the exit never calls
-  `release_offline_port()` and never tears down the PCD frame queues, and a `create_ipsec_pcd_fqs()`
-  partial failure leaves live queues pointing at `ipsec_exception_pkt_handler` with no pool. Reached
-  at unload and, since A167, at a partial init failure after the pool was seeded. Mirror the Wi-Fi
-  exit (`dpa_wifi.c`: port release + queue teardown) and drain the pool through its
-  `free_buf_cb` before freeing it.
-
 - [ ] **A158 — multicast replication to more than one listener has never been
   run.** The bridged multicast offload is proved on hardware for a single
   listener (see the [design doc](docs/flowtable-multicast.md)), but the DUT has
@@ -488,6 +478,14 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A177.** IPsec exit and partial-init unwind left PCD queues and seeded buffers live —
+  fixed (this commit): separate allocated PCD queues from embedded SA queues; drain callbacks
+  before releasing the port, skb-backed pool and BPID mapping. SAs pin CDX until their queues
+  are freed; failed SA creation now waits for retirement. CGR deletion runs on its owning CPU
+  and retains resources on error. SDK patch 105 fixes zero-buffer seed failures and DMA-error
+  double frees. Validation: 194 ASan/UBSan lifecycle cases, 154 host tests and ARM64 `-Werror`
+  compilation of CDX and the SDK seeder; DUT validation remains pending.
 
 - [x] **A33.** Routed multicast resolved listeners through `get_onif_by_name`, NULL for a `br-lan.N` —
   superseded: the flowtable learner hands the encoder ports and tag stacks, so there is no name (_pending_).

@@ -78,6 +78,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://102-sdk_dpaa-extend-stop-drain-delays.patch \
            file://103-qbman-ceetm-lfq-unwind.patch \
            file://104-sdk_dpaa-rx-stats-before-stack-verdict.patch \
+           file://105-sdk_dpaa-buffer-seed-failure.patch \
            file://110-sdk-mainline-build-compat.patch \
            file://120-emc2305-dt-fan-control.patch \
            file://130-thermal-linear-governor.patch \
