@@ -1,8 +1,8 @@
 # Flowtable resilience testing
 
-Status: controller reconciliation and bounded nft execution implemented
-2026-09-21; broader fault
-coverage remains planned. This document separates that implementation from the
+Status: controller reconciliation, bounded nft execution and controller crash
+supervision implemented 2026-09-21; broader fault coverage remains planned.
+This document separates that implementation from the
 remaining recovery requirements. Hardware validation is recorded below.
 
 The objective is to prove both safe behavior during a failure and automatic
@@ -60,9 +60,8 @@ and completed directional hardware-counter proof within 35 seconds of fault
 injection. The maintenance test explicitly resumes after proving that stop
 survives a service restart; autonomous fault cases issue no repair command.
 
-Process crash supervision, expanded failslab coverage and fatal hardware reset
-policy remain outstanding. The
-one-shot nft failure in this first DUT suite is a controlled process failure,
+Expanded failslab coverage and fatal hardware reset policy remain outstanding.
+The one-shot nft failure in this first DUT suite is a controlled process failure,
 not an allocation-failure coverage claim.
 
 Validation on the rebuilt, staged non-KASAN image (controller-only changes):
@@ -121,7 +120,7 @@ successful real commit followed by a hung reply. Recovery must occur within
 pass hardware checks for existing TCP/UDP sockets and a new TCP flow, plus
 forbidden-traffic checks.
 Neither autonomous case issues a repair command. Hardware proof must complete
-within 35 seconds. Daemon crash restart remains separate from child cleanup.
+within 35 seconds. Controller crash supervision is covered separately below.
 
 Validation: all 218 host tests passed (70.04 seconds), including 37 controller
 and process fault cases under ASan/UBSan. All controller sources compiled
@@ -140,6 +139,79 @@ lost reply required no duplicate install. The DUT was restored to a fresh
 default-policy boot. Evidence, image identities, source hashes and logs are
 under `/tmp/ask-flowtable-nft-deadlines-20260921/` on the development host.
 
+## Controller crash supervision — 2026-09-21
+
+The shipping service supervises one foreground controller. Unexpected exits
+restart with 1/2/4/8/16/30-second capped backoff, resetting after 60 seconds of
+stable uptime. Lifecycle commands use a protected control socket and separate
+control/supervisor locks; PID files are never used to authorize signalling.
+Only one controller can hold the daemon lifetime lock. The supervisor checks
+the offload owner before spawning and idles while flowtable ownership is absent.
+
+Service stop disables respawning before terminating and reaping the controller,
+then performs the existing pause-and-drain transaction. Worker crashes and
+service restarts preserve manual pauses. A failed drain remains an error; it
+does not silently restart admission. Killing the supervisor kills its worker
+through a parent-death signal; automatically replacing the supervisor itself
+still requires PID 1 supervision, which the current BusyBox image does not
+provide. The nft guardians independently retain transaction cleanup authority.
+
+The [supervisor host tests](../tools/host_tests/test_flowtable_supervisor.py)
+exercise crashes at retirement/install/commit boundaries, unexpected zero
+exits, paused-worker crashes, stop during backoff, concurrent lifecycle calls,
+stale PID files, inactive ownership, capped/resetting crash delays, failed drain,
+supervisor death and a stalled logger. Both ASan and UBSan diagnostics are
+retained even for automatically restarted workers.
+
+The DUT wrapper kills the actual controller after real table deletion, before
+installing its replacement, or immediately after a successful real commit. It
+records ancestry, stage and backend state. Each test publishes a valid changed
+policy to initiate replacement, then only observes and sends traffic after the
+crash. Recovery requires the same supervisor and boot, one replacement worker,
+the new policy hash, retired old writers, existing TCP/UDP sockets, a new
+hardware TCP flow and blocked forbidden traffic. A committed healthy replacement
+must not be installed twice. Readiness is required within 20 seconds and a
+completed hardware-counter proof within 35 seconds of publishing the policy.
+Separate maintenance checks crash a paused worker and prove an intentional
+service stop stays stopped; restarting the service preserves the pause.
+
+Host validation: all 234 tests passed (96.44 seconds), including 16 new
+supervisor cases under ASan/UBSan. All controller sources compiled without
+warnings under GCC 15.2. Independent review also exercised 24 overlapping
+lifecycle commands, repeated controller crashes, supervisor death and the
+stalled-logger regression.
+
+Hardware validation used the rebuilt and staged non-KASAN image. All 12
+service/default-on/startup cases passed (589.74 seconds). After making the
+test's policy publication atomic, all three crash cases passed again
+(170.49 seconds) on the same boot:
+
+| Controller killed | Controller ready | Directional hardware proof completed |
+| --- | ---: | ---: |
+| After real table deletion | 7.09 s | 17.80 s |
+| Before replacement install | 7.53 s | 18.33 s |
+| After successful replacement commit | 6.60 s | 17.31 s |
+
+Each crash replaced exactly one worker under the same supervisor, retired
+the old transaction processes and recovered without harness repair. Existing
+TCP/UDP sockets survived, a new TCP connection offloaded and forbidden traffic
+remained blocked. Paused-worker crashes and explicit service restarts preserved
+the pause; intentional service stop remained stopped.
+
+The DUT remains on boot `f507eb7a-2f08-4df9-90da-7946d9d7fa93`, with the normal
+policy resumed and test-owned faults removed. Final accumulated installs and
+deletes both equal 142, with zero entries, handle/neighbour references, backend
+errors, quarantine or fatal state. One rearm records the intentional invalidation
+test. Kernel taint remains the out-of-tree baseline of 4096, with no kernel
+splats. There was no cleanup reboot or counter reset. Evidence, image/source
+identities, logs and final state are under
+`/tmp/ask-flowtable-supervision-20260921/` on the development host.
+
+The final audit retained the existing kmemleak report without clearing it or
+forcing another scan. Its 15,977 objects all have boot-time DPAA/CDX buffer-pool
+allocation stacks, consistent with the hardware-owned pool baseline. This is
+not an allocation-failure sweep or a general leak-free claim.
+
 ## Coverage before this slice
 
 The following observations motivated the work:
@@ -149,8 +221,8 @@ The following observations motivated the work:
   unchanged desired hashes without checking observed backend health. The first
   slice replaces those decisions with reconciliation.
 - The [boot service](../meta-ask/recipes-ask/config/files/S50ask-flowtable)
-  backgrounds the daemon with `start-stop-daemon`; the script provides no
-  crash supervision.
+  previously backgrounded the daemon once with `start-stop-daemon`. The
+  supervisor now replaces crashed controllers.
 - [Flowtable fault tests](../tools/tests/test_flowtable_offload.py) already
   exercise add failures, invalidation/rearm and terminal deletion failures.
   Their explicit table recreation and cleanup prove those operations, rather
@@ -307,9 +379,14 @@ Store the scenario and seed/failure index, injection-hit evidence, timeline,
 policy/topology snapshots, process/boot identities, backend/resource counters,
 directional traffic measurements, kernel logs and any rescue action. Redact
 secrets such as IPsec key material. After a pass or captured failure, remove
-test-owned state and verify a known baseline before the next case.
+test-owned state and verify the intended policy before the next case. Keep the
+DUT on the same boot after validation, preserving accumulated runtime state
+and counters for subsequent tests. Do not reboot merely to obtain a clean
+baseline. Booting the rebuilt image before testing and a separately justified
+terminal recovery reset are distinct operations; record their reasons and
+boot identities.
 
-The next deliverable is daemon crash supervision. Extend allocation coverage and
-repeated fault sequences after those recovery mechanisms are present. Keep
+The next deliverable is deterministic allocation-failure coverage, followed by
+repeated fault sequences and missing-prerequisite recovery tests. Keep
 this document's status and evidence current as each recovery guarantee is
 implemented and verified.

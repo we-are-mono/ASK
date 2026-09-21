@@ -38,17 +38,17 @@ def test_flowtable_boot_modules(tmp_path, cmdline, fail, expected, rc):
 
 
 @pytest.mark.parametrize("verb,stop_rc,expected,rc", [
-    ("stop", 42, ["stop"], 42),
-    ("stop", 0, ["stop"], 0),
-    ("restart", 0, [], 0),
-    ("reload", 0, ["resume"], 0),
+    ("stop", 42, ["service-stop"], 42),
+    ("stop", 0, ["service-stop"], 0),
+    ("restart", 0, ["service-restart"], 0),
+    ("reload", 0, ["resume", "service-start"], 0),
 ])
 def test_flowtable_service_preserves_authority_and_stop_errors(tmp_path, verb, stop_rc, expected, rc):
     log, owner = tmp_path / "calls", tmp_path / "owner"
     owner.write_text("flowtable\n")
     daemon = tmp_path / "daemon"
     daemon.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$CALLS"\n'
-                      'if [ "$1" = stop ]; then exit "$STOP_RC"; fi\n')
+                      'if [ "$1" = service-stop ]; then exit "$STOP_RC"; fi\n')
     daemon.chmod(0o755)
     service = tmp_path / "service"
     text = (ROOT / "meta-ask/recipes-ask/config/files/S50ask-flowtable").read_text()

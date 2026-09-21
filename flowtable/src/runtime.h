@@ -12,6 +12,12 @@
 #define FT_LOCK        "/run/lock/ask-flowtable.lock"
 #define FT_PAUSED      "/run/lock/ask-flowtable.paused"
 #define FT_DEFAULT_CONF "/etc/ask/offload.conf"
+#define FT_DAEMON_LOCK  "/run/lock/ask-flowtable-daemon.lock"
+#define FT_SERVICE_LOCK "/run/lock/ask-flowtable-service.lock"
+#define FT_CONTROL_LOCK "/run/lock/ask-flowtable-control.lock"
+#define FT_SERVICE_SOCKET "/run/ask-flowtable.sock"
+#define FT_WORKER_PID "/var/run/ask-flowtable.pid"
+#define FT_SUPERVISOR_PID "/var/run/ask-flowtable-supervisor.pid"
 
 /* The header of /proc/cdx_flowtable. present=false means the adapter is not
  * loaded. The DRAIN_FIELDS must all be zero before a rebind. */
@@ -53,6 +59,12 @@ int ft_nft_inspect(struct ft_ctx *ctx, bool *present, bool *owned, char hash[65]
 /* flock the single-flight lock for the duration of an operation. Returns an fd
  * (>=0) to close when done, or -1 (ctx->err). */
 int ft_lock(struct ft_ctx *ctx, int timeout_ms);
+int ft_path_lock(struct ft_ctx *ctx, const char *path, int timeout_ms);
+
+/* Foreground supervisor and serialized init-service lifecycle commands. */
+int ft_supervise(const char *conf, int readyfd);
+int ft_service(struct ft_ctx *ctx, const char *verb, const char *conf);
+void ft_log(int priority, const char *format, ...) __attribute__((format(printf, 2, 3)));
 
 /* The current offload owner from the module parameter ("flowtable"/"cmm"/""). */
 void ft_offload_owner(char out[16]);

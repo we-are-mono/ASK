@@ -116,6 +116,19 @@ async def console_command(console, *argv, check=True, timeout=20, resync=False):
     return {"rc": result.rc, "stdout": stdout}
 
 
+async def flowtable_json(console, *args):
+    """Decode controller JSON while retaining unrelated UART noise as errors.
+
+    Managed-service diagnostics use a console fallback on this image. Those
+    complete log lines can arrive inside our command's output markers; the
+    raw UART transcript still records them for diagnosis.
+    """
+    result = await console_command(console, "/usr/sbin/ask-flowtable", *args)
+    lines = [line for line in result["stdout"].splitlines()
+             if not re.fullmatch(r"ask-flowtable\[\d+\]: .*", line)]
+    return json.loads("\n".join(lines))
+
+
 async def console_python(console, script, *, timeout=20, attempts=3):
     # The physical UART can lose characters in long input lines, so stage short
     # chunks and verify the exact script before executing any test operation.

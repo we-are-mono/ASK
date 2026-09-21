@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 import time
 
 import pytest
@@ -20,7 +21,7 @@ from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import peer
 from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command,
-                                    console_command, console_python, read, rig)  # noqa: F401
+                                    console_command, console_python, flowtable_json, read, rig)  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, warm
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
@@ -35,17 +36,30 @@ FLOWS = [{"id": i, "proto": proto, "sport": FIRST + offset}
 
 
 async def service_status(r):
-    result = await console_command(r.service_console, DAEMON, "status")
-    return json.loads(result["stdout"])
+    return await flowtable_json(r.service_console, "status")
 
 
-async def wait_service(r, ready=True, timeout=12):
+async def supervision_status(r):
+    return await flowtable_json(r.service_console, "service-status")
+
+
+async def wait_replacement(r, previous, timeout=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = await supervision_status(r)
+        if state.get("worker_pid", 0) not in (0, int(previous)):
+            return state
+        await asyncio.sleep(0.1)
+    pytest.fail(f"supervisor did not replace worker {previous}: {state}")
+
+
+async def wait_service(r, ready=True, timeout=12, policy_hash=None):
     deadline = time.monotonic() + timeout
     samples = []
     while time.monotonic() < deadline:
         status = await service_status(r)
         samples.append({"time": time.monotonic(), "status": status})
-        if status["admission_ready"] == ready:
+        if status["admission_ready"] == ready and (policy_hash is None or status["policy_hash"] == policy_hash):
             return samples
         await asyncio.sleep(0.2)
     r.record("service-recovery-timeout", samples)
@@ -80,6 +94,8 @@ async def service(rig):
             assert result["errno"] == 0, result
             # Resolve the real executable before adding the fault wrapper to
             # PATH. The wrapper is confined to this daemon's environment.
+            wrapper = Path(__file__).with_name("_flowtable_service_nft.py").read_text()
+            wrapper = wrapper.replace("__FAULT_ROOT__", repr(FAULT_DIR))
             await console_python(con, f'''
 from pathlib import Path
 import shutil
@@ -88,38 +104,7 @@ assert not root.exists(), root
 root.mkdir()
 real = shutil.which('nft')
 assert real
-script = """#!/usr/bin/python3
-import json, os, signal, sys, time
-from pathlib import Path
-root = Path({FAULT_DIR!r})
-if sys.argv[1:] == ['-f', '-']:
-    with (root / 'attempts').open('a') as f:
-        print(time.monotonic(), file=f)
-    try:
-        (root / 'armed').rename(root / 'consumed')
-    except FileNotFoundError:
-        pass
-    else:
-        fault = (root / 'consumed').read_text().strip()
-        if fault == 'once':
-            sys.exit('injected one-shot nft transaction failure')
-        child = os.fork()
-        if child == 0:
-            if fault == 'hung-apply':
-                os.setsid()
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                time.sleep(30)
-            os.execv(REAL_NFT, [REAL_NFT, *sys.argv[1:]])
-        (root / 'pids.tmp').write_text(json.dumps(dict(worker=os.getpid(), guardian=os.getppid(), child=child)))
-        (root / 'pids.tmp').replace(root / 'pids')
-        if fault == 'lost-reply':
-            _, status = os.waitpid(child, 0)
-            assert status == 0, status
-            (root / 'committed').touch()
-        time.sleep(60)
-        sys.exit('test timeout did not terminate nft')
-os.execv(REAL_NFT, [REAL_NFT, *sys.argv[1:]])
-""".replace('REAL_NFT', repr(real))
+script = {wrapper!r}.replace('__REAL_NFT__', repr(real))
 compile(script, str(root / 'nft'), 'exec')
 (root / 'nft').write_text(script)
 (root / 'nft').chmod(0o755)
@@ -130,6 +115,7 @@ compile(script, str(root / 'nft'), 'exec')
             r.service_boot = (await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")).strip()
             r.service_pid = (await read(r.target, r.session, "/var/run/ask-flowtable.pid")).strip()
             r.service_hash = (await service_status(r))["policy_hash"]
+            r.supervisor_pid = (await read(r.target, r.session, "/var/run/ask-flowtable-supervisor.pid")).strip()
             yield r
         finally:
             # Teardown occurs only after the recovery assertions (or failure
@@ -252,13 +238,19 @@ async def test_flowtable_service_maintenance_stop(service):
     async with peer(r, flows, initial_ids=[0, 1, 3]) as p:
         await warm(r, p, [0, 1], "service-stop-warm", flows[:2])
         await console_command(r.service_console, DAEMON, "stop", timeout=45)
+        # A crash while paused must replace the worker without rearming.
+        await console_command(r.service_console, "kill", "-KILL", r.service_pid)
+        replacement = await wait_replacement(r, r.service_pid)
+        assert replacement["supervisor_pid"] == int(r.supervisor_pid), replacement
         # Longer than a health interval, then a real service process restart.
         await asyncio.sleep(6)
         assert not (await service_status(r))["admission_ready"]
         await console_command(r.service_console, INIT, "restart", timeout=45)
         await asyncio.sleep(6)
         restarted_pid = (await read(r.target, r.session, "/var/run/ask-flowtable.pid")).strip()
-        assert restarted_pid != r.service_pid, (r.service_pid, restarted_pid)
+        assert int(restarted_pid) != replacement["worker_pid"], (replacement, restarted_pid)
+        restarted = await supervision_status(r)
+        assert restarted["supervisor_pid"] != replacement["supervisor_pid"], (replacement, restarted)
         status = await service_status(r)
         assert status["reconciliation_paused"] and not status["policy_installed"], status
         await p.batch([0, 1], count=64, interval=0.01)
@@ -269,4 +261,100 @@ async def test_flowtable_service_maintenance_stop(service):
         await hardware(r, p, "service-stop-hardware", flows[:2])
         assert not (await service_status(r))["reconciliation_paused"]
         r.record("service-maintenance-restart", {"before_pid": r.service_pid,
-                 "after_pid": restarted_pid, "paused_status": status})
+                 "crash_replacement": replacement, "after_pid": restarted_pid,
+                 "restarted": restarted, "paused_status": status})
+
+
+@pytest.mark.parametrize("point,attempt_count", [("drain", 2), ("install", 3), ("commit", 2)])
+async def test_flowtable_service_controller_crash(service, point, attempt_count):
+    r = service
+    flows = [{**f, "lan": r.lan_ip} for f in FLOWS]
+    async with peer(r, flows, initial_ids=[0, 1, 3]) as p:
+        await warm(r, p, [0, 1], f"crash-{point}-warm", flows[:2])
+        initial = await hardware(r, p, f"crash-{point}-before", flows[:2])
+        await blocked_probe(r, p)
+        result = await r.target.fs_write(r.session, FAULT_DIR + "/crash", point)
+        assert result["errno"] == 0, result
+        # Publish a valid changed policy to initiate a real replacement. The
+        # extra exclusion is outside the traffic's scope, preserving sockets.
+        candidate = (await read(r.target, r.session, CONF)) + "exclude tcp 9\n"
+        candidate_path = CONF + ".recovery-test"
+        assert (await r.target.fs_read(r.session, candidate_path))["errno"] != 0
+        try:
+            result = await r.target.fs_write(r.session, candidate_path, candidate)
+            assert result["errno"] == 0, result
+            started = time.monotonic()
+            # Same-directory rename avoids injecting a second, unintended
+            # fault where the daemon could read a truncated configuration.
+            await console_command(r.service_console, "mv", candidate_path, CONF)
+        finally:
+            await console_command(r.service_console, "rm", "-f", candidate_path)
+        expected_hash = (await flowtable_json(r.service_console, "check"))["policy_hash"]
+        assert expected_hash != r.service_hash
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            hit_file = await r.target.fs_read(r.session, FAULT_DIR + "/crash-hit")
+            if hit_file["errno"] == 0:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail(f"crash injection never reached {point}")
+        hit = json.loads(await read(r.target, r.session, FAULT_DIR + "/crash-hit"))
+        assert hit["point"] == point and hit["controller"] == int(r.service_pid), hit
+        # Observation and traffic only after the injected crash: no repair
+        # command, signal to the supervisor, policy rewrite or reboot.
+        software = await p.batch([0, 1], count=32, interval=0.01)
+        await blocked_probe(r, p)
+        replacement = await wait_replacement(r, r.service_pid)
+        assert replacement["supervisor_pid"] == int(r.supervisor_pid), replacement
+        assert replacement["restarts"] == 1, replacement
+        samples = await wait_service(r, timeout=20, policy_hash=expected_hash)
+        elapsed = time.monotonic() - started
+        assert elapsed < 20, (elapsed, samples)
+        await console_python(r.service_console, f"""
+from pathlib import Path
+for pid in {[hit[k] for k in ('controller', 'guardian', 'wrapper', 'real_nft') if hit[k]]!r}:
+    assert not Path('/proc/' + str(pid)).exists(), pid
+""")
+        await warm(r, p, [0, 1], f"crash-{point}-readmitted", flows[:2])
+        recovered = await hardware(r, p, f"crash-{point}-after", flows[:2])
+        hardware_seconds = time.monotonic() - started
+        assert hardware_seconds < 35, hardware_seconds
+        assert recovered["errors"] == initial["errors"], (initial, recovered)
+        await p.rpc("open", [2])
+        await warm(r, p, [0, 1, 2], f"crash-{point}-new-flow", flows[:3])
+        await hardware(r, p, f"crash-{point}-new-hardware", flows[:3])
+        await blocked_probe(r, p)
+        attempts = (await read(r.target, r.session, FAULT_DIR + "/attempts")).splitlines()
+        assert len(attempts) == attempt_count, attempts
+        assert (await read(r.target, r.session, "/proc/sys/kernel/random/boot_id")).strip() == r.service_boot
+        assert not (await service_status(r))["reconciliation_paused"]
+        r.record(f"service-crash-{point}-recovery", {"controller_seconds": elapsed,
+                 "hardware_proof_seconds": hardware_seconds, "hit": hit, "replacement": replacement,
+                 "samples": samples, "transition_transfers": software, "boot": r.service_boot})
+
+
+async def test_flowtable_service_intentional_stop(service):
+    r = service
+    flows = [{**f, "lan": r.lan_ip} for f in FLOWS]
+    async with peer(r, flows, initial_ids=[0, 1, 3]) as p:
+        await warm(r, p, [0, 1], "service-stop-supervisor-warm", flows[:2])
+        await console_command(r.service_console, INIT, "stop", timeout=45)
+        await asyncio.sleep(6)
+        assert not (await supervision_status(r))["running"]
+        for path in ("/var/run/ask-flowtable.pid", "/var/run/ask-flowtable-supervisor.pid"):
+            assert (await r.target.fs_read(r.session, path))["errno"] != 0, path
+        status = await service_status(r)
+        assert status["reconciliation_paused"] and not status["policy_installed"], status
+        await p.batch([0, 1], count=64, interval=0.01)
+        await blocked_probe(r, p)
+        await console_command(r.service_console, INIT, "start")
+        await asyncio.sleep(6)
+        assert (await supervision_status(r))["running"]
+        assert (await service_status(r))["reconciliation_paused"]
+        assert not (await service_status(r))["policy_installed"]
+        await console_command(r.service_console, DAEMON, "resume")
+        await wait_service(r)
+        await warm(r, p, [0, 1], "service-stop-supervisor-readmitted", flows[:2])
+        await hardware(r, p, "service-stop-supervisor-hardware", flows[:2])
+        r.record("service-intentional-stop", {"paused_status": status, "supervision": await supervision_status(r)})

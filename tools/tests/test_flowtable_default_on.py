@@ -16,7 +16,7 @@ import os
 import pytest
 
 from ask_orch.uart import Console
-from test_flowtable_offload import ARTIFACTS, console_command, read, rig  # noqa: F401
+from test_flowtable_offload import ARTIFACTS, console_command, flowtable_json, read, rig  # noqa: F401
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
                                reason="requires an explicit experimental boot")
@@ -27,8 +27,7 @@ DEFAULT_CONF = "/etc/ask/offload.conf"
 
 
 async def _status(con):
-    result = await console_command(con, DAEMON, "status")
-    return json.loads(result["stdout"])
+    return await flowtable_json(con, "status")
 
 
 async def test_boot_service_offloads_by_default(target_agent, aiohttp_session):

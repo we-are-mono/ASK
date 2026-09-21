@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <syslog.h>
 
 #ifndef FT_HEALTH_MS
 #define FT_HEALTH_MS 5000
@@ -355,7 +356,14 @@ static int cmd_daemon(const char *conf)
 	if (strcmp(owner, "flowtable")) {
 		fprintf(stderr, "ask-flowtable: offload owner is '%s', not flowtable; idle\n",
 			owner[0] ? owner : "none");
+		ft_log(LOG_NOTICE, "offload owner is '%s', not flowtable; idle", owner[0] ? owner : "none");
 		return 0;   /* nothing to own; let the init system consider us done */
+	}
+	int instance = ft_path_lock(&ctx, FT_DAEMON_LOCK, 0);
+	if (instance < 0) {
+		fprintf(stderr, "ask-flowtable: another daemon is still running: %s\n", ctx.err);
+		ft_log(LOG_WARNING, "another daemon is still running: %s", ctx.err);
+		return 1;
 	}
 
 	signal(SIGTERM, on_signal);
@@ -370,12 +378,15 @@ static int cmd_daemon(const char *conf)
 			if (failed) {
 				fprintf(stderr, "ask-flowtable: reconciliation deferred: %s; retry in %d ms\n",
 					ctx.err, retry_ms);
+				ft_log(LOG_WARNING, "reconciliation deferred: %s; retry in %d ms", ctx.err, retry_ms);
 				due = now_ms() + retry_ms;
 				if (retry_ms < FT_RETRY_MAX_MS)
 					retry_ms = retry_ms > FT_RETRY_MAX_MS / 2 ? FT_RETRY_MAX_MS : retry_ms * 2;
 			} else {
-				if (rc > 0)
+				if (rc > 0) {
 					fprintf(stderr, "ask-flowtable: reconciled policy and backend\n");
+					ft_log(LOG_NOTICE, "reconciled policy and backend");
+				}
 				retry_ms = FT_RETRY_MIN_MS;
 				due = now_ms() + FT_HEALTH_MS;
 			}
@@ -406,12 +417,13 @@ static int cmd_daemon(const char *conf)
 		}
 	}
 	close(nl);
+	close(instance);
 	return 0;
 }
 
 static int usage(void)
 {
-	fprintf(stderr, "usage: ask-flowtable {apply|stop|resume|status|check|render|daemon} [--config PATH]\n");
+	fprintf(stderr, "usage: ask-flowtable {apply|stop|resume|status|check|render|daemon|supervise|service-start|service-stop|service-restart|service-status} [--config PATH]\n");
 	return 2;
 }
 
@@ -445,6 +457,10 @@ int main(int argc, char **argv)
 
 	if (!strcmp(cmd, "daemon"))
 		return cmd_daemon(conf);
+	if (!strcmp(cmd, "supervise"))
+		return ft_supervise(conf, -1);
+	if (!strncmp(cmd, "service-", 8))
+		return ft_service(&ctx, cmd + 8, conf) ? (fprintf(stderr, "ask-flowtable: %s\n", ctx.err), 1) : 0;
 	if (!strcmp(cmd, "status"))
 		return cmd_status(&ctx) ? (fprintf(stderr, "ask-flowtable: %s\n", ctx.err), 1) : 0;
 	if (!strcmp(cmd, "stop"))

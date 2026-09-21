@@ -78,7 +78,7 @@ int ft_nft_delete(struct ft_ctx *ctx, int keepfd)
 	return 0;
 }
 
-int ft_lock(struct ft_ctx *ctx, int timeout_ms)
+int ft_path_lock(struct ft_ctx *ctx, const char *path, int timeout_ms)
 {
 	struct timespec ts;
 	long waited = 0;
@@ -86,7 +86,7 @@ int ft_lock(struct ft_ctx *ctx, int timeout_ms)
 	/* The lock lives under /run/lock, which a minimal image may not have yet
 	 * (the Python helper mkdir'd it too). Create it best-effort. */
 	mkdir("/run/lock", 0755);
-	fd = open(FT_LOCK, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (fd < 0) {
 		snprintf(ctx->err, sizeof(ctx->err), "cannot open lock: %s", strerror(errno));
 		return -1;
@@ -107,6 +107,11 @@ int ft_lock(struct ft_ctx *ctx, int timeout_ms)
 		waited += 10;
 	}
 	return fd;
+}
+
+int ft_lock(struct ft_ctx *ctx, int timeout_ms)
+{
+	return ft_path_lock(ctx, FT_LOCK, timeout_ms);
 }
 
 void ft_offload_owner(char out[16])

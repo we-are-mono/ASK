@@ -25,6 +25,14 @@ def controller(tmp_path):
         "/run/lock/ask-flowtable.lock": str(tmp_path / "lock"),
         "/run/lock/ask-flowtable.paused": str(tmp_path / "paused"),
         "/etc/ask/offload.conf": str(tmp_path / "policy"),
+        "/run/lock/ask-flowtable-daemon.lock": str(tmp_path / "daemon.lock"),
+        "/run/lock/ask-flowtable-service.lock": str(tmp_path / "service.lock"),
+        "/run/lock/ask-flowtable-control.lock": str(tmp_path / "control.lock"),
+        "/run/ask-flowtable.sock": str(tmp_path / "service.sock"),
+        "/var/run/ask-flowtable.pid": str(tmp_path / "daemon.pid"),
+        "/var/run/ask-flowtable-supervisor.pid": str(tmp_path / "supervisor.pid"),
+        "/dev/log": str(tmp_path / "log.sock"),
+        "/dev/console": str(tmp_path / "console"),
     }
     for path in ENGINE.iterdir():
         if path.suffix not in {".h", ".c"}:
@@ -58,6 +66,9 @@ int ft_enumerate(struct ft_policy *p) {
         "-fno-pie", "-no-pie", "-DFT_HEALTH_MS=100", "-DFT_RETRY_MIN_MS=50",
         "-DFT_RETRY_MAX_MS=400", "-DFT_DEBOUNCE_MS=20",
         "-DFT_NFT_TIMEOUT_MS=500", "-DFT_NFT_CLEANUP_MS=500",
+        "-DFT_SUPERVISOR_MIN_MS=60", "-DFT_SUPERVISOR_MAX_MS=240",
+        "-DFT_SUPERVISOR_STABLE_MS=600", "-DFT_SUPERVISOR_STOP_MS=100",
+        "-DFT_SERVICE_WAIT_MS=1500",
         *map(str, sorted(src.glob("*.c"))), "-o", str(binary),
     ], check=True)
     shutil.copyfile(Path(__file__).with_name("flowtable_nft.py"), tmp_path / "nft")

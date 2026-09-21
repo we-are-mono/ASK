@@ -84,7 +84,8 @@ drain/install/verify transaction even if the desired policy hash is unchanged.
 
 | Command | Authority and effect |
 | --- | --- |
-| `daemon` | Maintain its configured policy unless reconciliation is paused. |
+| `daemon` | Maintain its configured policy in the foreground unless reconciliation is paused. A lifetime lock permits only one controller. |
+| `supervise` | Run the foreground supervisor, replacing a crashed controller with capped backoff. |
 | `stop` | Pause automatic reconciliation before removing the owned table and draining hardware. Works even with malformed configuration. A failed drain returns an error and leaves reconciliation paused. |
 | `apply [--config PATH]` | Validate a candidate, take manual control, and apply it once. Once the transaction starts, reconciliation stays paused on success or failure. Parse/load failures leave existing authority unchanged. |
 | `resume` | Release the pause under the transaction lock. The running daemon subsequently validates and reconciles its own configured policy. This command does not install a candidate, start the daemon, or certify recovery; observe `status` and traffic. |
@@ -99,9 +100,32 @@ expires on reboot with `/run`. For a persistent disable, set `enabled no`.
 Service `start` and `restart` preserve the pause. Service `stop` pauses and
 drains, propagating failure to its caller. Service `reload` explicitly resumes
 and starts the daemon if necessary. A fresh boot starts automatic maintenance
-of the configured policy. Hung `nft` operations are cancelled and retried;
-restarting a crashed daemon still requires process supervision, which remains
-outstanding.
+of the configured policy. Hung `nft` operations are cancelled and retried.
+
+The boot service now runs a supervisor. An unexpected controller exit, including
+exit status zero, restarts after 1, 2, 4, 8, 16 and then 30 seconds. A controller
+that runs for at least 60 seconds resets this delay. The supervisor checks the
+hardware owner before spawning and waits while the flowtable owner is inactive.
+Crashes never clear the manual pause. Service `stop` first disables respawning
+and terminates/reaps the worker, then performs the locked pause-and-drain
+transaction. After two seconds of graceful shutdown it kills a stuck worker;
+nft guardians retain their own cleanup and transaction leases.
+
+The init script calls `service-start`, `service-stop` and `service-restart`.
+These commands serialize lifecycle changes separately from policy transactions
+and address a protected local control socket. PID files are observational:
+`/var/run/ask-flowtable.pid` identifies the worker and
+`/var/run/ask-flowtable-supervisor.pid` identifies its supervisor. Stale files
+never authorize signalling a process. `ask-flowtable service-status` reports
+the current supervisor/worker PIDs, restart count, retry delay and stopping
+state; ordinary `status` continues to describe policy and backend health.
+
+Diagnostics use best-effort nonblocking syslog delivery, with a nonblocking
+console fallback for the minimal image. A stalled logger cannot block a restart.
+Killing the supervisor itself kills its worker, preserving transaction safety,
+but the BusyBox boot does not automatically recreate the supervisor. That needs
+PID 1 supervision or an explicit service start. Platforms with an existing
+service manager can instead supervise the foreground `daemon` directly.
 
 One-shot custom policies remain under manual control so the daemon cannot
 overwrite a temporary or more restrictive policy with its default. To make a

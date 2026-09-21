@@ -6,45 +6,23 @@
 # Short-Description: ASK default-on hardware flow-offload service
 ### END INIT INFO
 
-# The legacy boot owns its own policy (CMM). This service only runs when the
-# Linux flowtable owns the ASK hardware.
-[ "$(cat /sys/module/cdx/parameters/offload_owner 2>/dev/null)" = flowtable ] || exit 0
-
+# Lifecycle commands serialize control and address the supervisor through its
+# protected socket. PID files are diagnostics, never authority for signalling.
 DAEMON=/usr/sbin/ask-flowtable
-PIDFILE=/var/run/ask-flowtable.pid
 
 case "$1" in
     start|"")
-        [ -x "$DAEMON" ] || { echo "ask-flowtable not installed" >&2; exit 1; }
-        # The daemon runs in the foreground (periodic reconciliation plus
-        # interface events). start-stop-daemon backgrounds it
-        # and owns the pidfile; kill by pidfile only, never by name — invoked as
-        # /etc/init.d/ask-flowtable this script's own basename is "ask-flowtable"
-        # and a name match would hit the script, not the daemon (the CMM init
-        # script documents the same hazard).
-        start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- daemon
+        exec "$DAEMON" service-start
         ;;
     stop)
-        start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null || true
-        # Remove the installed table and drain the hardware.
-        "$DAEMON" stop
-        result=$?
-        rm -f "$PIDFILE"
-        exit "$result"
+        exec "$DAEMON" service-stop
         ;;
     reload)
-        # Explicitly hand control back to the daemon's configured policy.
         "$DAEMON" resume || exit $?
-        "$0" start
+        exec "$DAEMON" service-start
         ;;
     restart)
-        # Restart the process while preserving manual/maintenance ownership.
-        # Do not call the stop verb: that would introduce a new pause.
-        start-stop-daemon -K -q -p "$PIDFILE" 2>/dev/null || true
-        # The old process can still be completing an nft transaction. Its
-        # inherited lease serializes it with the replacement daemon.
-        rm -f "$PIDFILE"
-        "$0" start
+        exec "$DAEMON" service-restart
         ;;
     status)
         exec "$DAEMON" status
@@ -54,5 +32,3 @@ case "$1" in
         exit 1
         ;;
 esac
-
-exit 0

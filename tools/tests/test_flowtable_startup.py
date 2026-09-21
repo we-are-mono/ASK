@@ -8,7 +8,7 @@ import pytest
 from ask_orch.uart import Console
 from test_flowtable_connections import FLOWS, connections, peer  # noqa: F401
 from test_flowtable_module import table
-from test_flowtable_offload import ARTIFACTS, console_command, read, rig  # noqa: F401
+from test_flowtable_offload import ARTIFACTS, console_command, flowtable_json, read, rig  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, warm
 
 pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
@@ -43,8 +43,7 @@ async def test_flowtable_startup_without_cmm_or_fci(connections):
                               timeout=45)
         await console_command(con, "/usr/sbin/ask-flowtable", "resume")
         for _ in range(40):
-            status = json.loads((await console_command(con, "/usr/sbin/ask-flowtable",
-                                                       "status"))["stdout"])
+            status = await flowtable_json(con, "status")
             if status["policy_installed"] and status["admission_ready"]:
                 break
             await asyncio.sleep(0.5)

@@ -19,6 +19,8 @@ SRCS := \
 	backend.c \
 	nft.c \
 	nft_process.c \
+	supervisor.c \
+	log.c \
 	enumerate.c \
 	netlink.c \
 	main.c
