@@ -8,6 +8,12 @@ still the [supported scope](linux-flowtable-offload.md#supported-scope), which
 admits only flows with a **zero conntrack mark**. That exclusion is the subject
 of this document: it is the seam where QoS attaches.
 
+Hardware QoS rate tests should target around **2 Gbit/s**, with offered traffic
+well above the cap. The rig reaches roughly 9 Gbit/s unshaped, while software
+forwarding cannot reach 2 Gbit/s. Delivery near that cap therefore checks both
+rate enforcement and hardware forwarding. Keep hardware admission and packet
+or drop counters as additional checks; a low-rate result alone proves neither.
+
 ## Three planes, not one subsystem
 
 "QoS" in ASK is three independent mechanisms that share a command family and

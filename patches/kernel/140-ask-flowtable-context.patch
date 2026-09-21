@@ -92,19 +92,27 @@ not which port puts it on the wire. The destination is not: what leaves the
 port is the outer packet, addressed to the remote tunnel endpoint, so the
 neighbour belongs to the route underneath the bundle and the address that
 finds it is the outermost state's rather than the tuple's own.
+
+Resolve the NEIGH direction's physical path even when the other direction
+is transformed, for opted-in tables. Requiring both directions to be NEIGH
+left a LAN bridge/VLAN unresolved beside an IPsec WAN: neither direction
+could reach the physical-port hardware callbacks. Keep the XFRM destination
+and transmit type untouched; its outer peer is not the inner tuple's
+neighbour. Unowned tables retain their existing path selection.
+
 ---
- include/net/flow.h                    |  2 +
- include/net/flow_offload.h            | 31 ++++++++++
- include/net/netevent.h                | 29 +++++++++
- include/net/netfilter/nf_flow_table.h | 44 ++++++++++++++
- net/ipv4/fib_trie.c                   | 20 ++++++
- net/ipv4/route.c                      |  3 +-
- net/ipv6/ip6_fib.c                    | 23 +++++++
- net/netfilter/nf_flow_table_core.c    | 66 +++++++++++++++++++-
- net/netfilter/nf_flow_table_ip.c      | 14 ++++-
- net/netfilter/nf_flow_table_offload.c | 82 ++++++++++++++++++++++++-
- net/netfilter/nft_flow_offload.c      | 87 +++++++++++++++++++++------
- 11 files changed, 377 insertions(+), 24 deletions(-)
+ include/net/flow.h                    |    2 +
+ include/net/flow_offload.h            |   31 ++++++++++
+ include/net/netevent.h                |   29 ++++++++++
+ include/net/netfilter/nf_flow_table.h |   44 +++++++++++++++
+ net/ipv4/fib_trie.c                   |   20 +++++++
+ net/ipv4/route.c                      |    3 +
+ net/ipv6/ip6_fib.c                    |   23 ++++++++
+ net/netfilter/nf_flow_table_core.c    |   66 ++++++++++++++++++++++
+ net/netfilter/nf_flow_table_ip.c      |   14 ++++-
+ net/netfilter/nf_flow_table_offload.c |   82 +++++++++++++++++++++++++++-
+ net/netfilter/nft_flow_offload.c      |   98 +++++++++++++++++++++++++++------
+ 11 files changed, 388 insertions(+), 24 deletions(-)
 
 diff --git a/include/net/flow.h b/include/net/flow.h
 index 335bbc52171c..5e373dbaa397 100644
@@ -728,7 +736,7 @@ index 4f346f51d7d7..ee87af80a9c1 100644
  	struct flow_block_cb *block_cb;
  	__be16 proto = ETH_P_ALL;
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index 7dbbd892e197..d71edfa36e95 100644
+index 7dbbd89..6430f45 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
 @@ -89,6 +89,10 @@ struct nft_forward_info {
@@ -886,6 +894,25 @@ index 7dbbd892e197..d71edfa36e95 100644
  		break;
  	case NFPROTO_IPV6:
  		fl.u.ip6.daddr = ct->tuplehash[dir].tuple.src.u3.in6;
+@@ -274,6 +327,17 @@ static int nft_flow_route(const struct nft_pktinfo *pkt,
+ 	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
+ 		nft_dev_forward_path(route, ct, dir, ft);
+ 		nft_dev_forward_path(route, ct, !dir, ft);
++	} else if (READ_ONCE(ft->data.use_neigh)) {
++		/* A transform in one direction must not hide the other one's
++		 * bridge/VLAN path. Its physical ingress and tags also name
++		 * that direction's hardware redirect. Only walk NEIGH: the
++		 * generic walk resolves the inner tuple's neighbour, not the
++		 * XFRM outer peer, and must never turn XFRM into DIRECT.
++		 */
++		if (route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
++			nft_dev_forward_path(route, ct, dir, ft);
++		if (route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH)
++			nft_dev_forward_path(route, ct, !dir, ft);
+ 	}
+ 
+ 	return 0;
+
 -- 
 2.47.3
 

@@ -331,6 +331,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A190.** IPsec skipped the opposite LAN bridge/VLAN path and prevented flow offload —
+  fixed (_:/^flowtable: resolve bridged LAN paths beside IPsec_).
+
 - [x] **A158.** Multicast listener ceiling and replication across physical ports —
   hardware validation completed 2026-09-21 on a rebuilt, staged and TFTP-booted
   KASAN flowtable image. All four IPv4/IPv6 cases passed: eight exact hardware

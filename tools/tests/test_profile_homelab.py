@@ -6,7 +6,7 @@ tagged uplink, IPTV, QoS. This one is the other half of the product's
 deployment surface and shares almost nothing with it. The uplink is static
 dual-stack on the WAN port with no session at all. The LAN is one physical port
 carrying three VLANs, with a firewall policy between them rather than one flat
-subnet. There is an IPsec tunnel to a host on the LAN, a 6o4 tunnel giving the
+subnet. There is an IPsec tunnel to a peer on the WAN, a 6o4 tunnel giving the
 main VLAN IPv6 through a broker, routed multicast fed by smcroute rather than
 by a bridge's snooping, and an ingress policer on the uplink. Six features,
 three of which the carrier profile never touches.
@@ -54,7 +54,6 @@ import os
 import re
 import secrets
 import socket
-import time
 
 import aiohttp
 import pytest
@@ -70,7 +69,7 @@ from test_flowtable_offload import (ARTIFACTS, STATUS_ROWS, Rig, command,
 from test_flowtable_policy import CONFIG, apply, stop
 from test_flowtable_tunnel import (Shape, _dut_tunnel, _orchestrator_tunnel,
                                    _outer_segment, _tunnel_text)
-from test_ipsec_inbound_flow_offload import crypto, quoted, sec_counter
+from test_ipsec_inbound_flow_offload import crypto, sec_counter
 
 pytestmark = [
     pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
@@ -111,9 +110,8 @@ PREFIX_A6, GATEWAY_A6, CLIENT_A6 = "fc00:81::/64", "fc00:81::1", "fc00:81::2"
 # makes the default-route lifecycle case a test of those flows rather than of a
 # route nothing was using.
 INTERNET = os.environ.get("ASK_PROFILE_HOME_INTERNET", "198.18.50.1")
-# The inner address of the IPsec tunnel, on the LAN VM's loopback. 198.18.98.x
-# deliberately avoids 198.18.87.x and 198.18.96.x, which the two IPsec files
-# already put on that same loopback.
+# The inner address of the IPsec tunnel, on the WAN peer's loopback. 198.18.98.x
+# deliberately avoids the inner prefixes used by the other IPsec tests.
 IPSEC_INNER = os.environ.get("ASK_PROFILE_HOME_IPSEC_INNER", "198.18.98.2")
 IPSEC_REQID_OUT, IPSEC_REQID_IN = "49212", "49213"
 # Packets that legitimately travel in software before the entries exist. A
@@ -147,12 +145,12 @@ SMCROUTE_CONF = "/tmp/ask-profile-home-smcroute.conf"
 STREAM_TTL = 64
 STREAM_S, STREAM_PPS = 3.0, 500
 
-# The ingress meter. Well under the line rate and well under what the software
-# path can forward, because the rate is not what proves the offload here --
-# `skip_sw` plus `in_hw` plus the profile's own colour counters are.
-POLICE_RATE_MBIT = int(os.environ.get("ASK_PROFILE_HOME_POLICE_MBIT", "50"))
+# Below the roughly 9 Gbit/s wire ceiling, above the DUT's software capacity:
+# delivery near 2 Gbit/s proves useful hardware forwarding as well as a cap.
+# skip_sw/in_hw and the meter's own drop counters remain independent oracles.
+POLICE_RATE_MBIT = int(os.environ.get("ASK_PROFILE_HOME_POLICE_MBIT", "2000"))
 POLICE_BURST = os.environ.get("ASK_PROFILE_HOME_POLICE_BURST", "4m")
-POLICE_OFFERED_MBIT = POLICE_RATE_MBIT * 6
+POLICE_OFFERED_MBIT = POLICE_RATE_MBIT * 3
 
 FIREWALL_TABLE = "ask_profile_home"
 TUNNEL_DEVICE = os.environ.get("ASK_PROFILE_HOME_TUNNEL", "fthome6o4")
@@ -161,7 +159,7 @@ INJECT_IF = os.environ.get("ASK_WAN_INJECT_IF", "br0")
 
 
 def orchestrator_source():
-    """The orchestrator's WAN address: the multicast source, the IPsec inner
+    """The orchestrator's WAN address: the multicast source, the IPsec outer
     peer and the DUT's alternate default gateway. The conftest default is stale
     on most benches, so everything that needs it reads it from here."""
     return os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
@@ -531,9 +529,8 @@ async def _bridge_lan(ctx, stack):
             stack, ctx.target, ctx.session, parent=BRIDGE, vid=vid,
             name=f"{BRIDGE}.{vid}", ipv4=f"{address}/24",
             ipv6=f"{address6}/64" if address6 else None)
-    # The LAN VM keeps whatever address the box handed it, and the IPsec tunnel
-    # below stands on that segment, so the port's original prefix is restated on
-    # the trusted VLAN: the bridge is transparent and the host is still there.
+    # Keep the LAN VM's existing address reachable on the trusted VLAN while
+    # the profile's clients use their separate namespaces and subnets.
     await dut("ip", "addr", "add", original, "dev", ctx.bridge_text[VID_A])
     ctx.lan_original = original
     ctx.dut_lan_address = original.split("/")[0]
@@ -561,6 +558,13 @@ async def _firewall(ctx, cleanup):
     """
     trusted, iot, guest = (ctx.bridge_text[VID_A], ctx.bridge_text[VID_B],
                            ctx.bridge_text[VID_C])
+    # The image also has a legacy iptables WAN masquerade rule. A return in
+    # this nft chain alone cannot exempt VPN traffic from that earlier chain;
+    # it would change the inner source and stop the XFRM selector matching.
+    exemption = ["POSTROUTING", "-s", CLIENT_A, "-d", IPSEC_INNER, "-j", "ACCEPT"]
+    await command(ctx.target, ctx.session, "iptables", "-t", "nat", "-I",
+                  exemption[0], "1", *exemption[1:])
+    cleanup.append((ctx.target, ["iptables", "-t", "nat", "-D", *exemption]))
     await command(ctx.target, ctx.session, "nft", "delete", "table", "inet",
                   FIREWALL_TABLE, check=False)
     await command(ctx.target, ctx.session, "nft", f'''table inet {FIREWALL_TABLE} {{
@@ -570,6 +574,7 @@ async def _firewall(ctx, cleanup):
  iifname "{guest}" oifname {{ "{trusted}", "{iot}" }} counter drop
  }}
  chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;
+ ip saddr {CLIENT_A} ip daddr {IPSEC_INNER} return
  oifname "{TARGET_WAN_IF}" ip saddr {{ {SUBNET_A}, {SUBNET_B}, {SUBNET_C} }} masquerade
  }}
 }}''')
@@ -646,14 +651,14 @@ async def _reachable(ctx, client, peer, attempts=25):
 
 # ---- IPsec -----------------------------------------------------------------
 #
-# The tunnel runs between the DUT and the LAN VM, both ends ordinary hosts on
-# the trusted segment, and carries a routed inner subnet. Only the DUT is
-# offloaded: the LAN VM is plain software IPsec and has no idea its peer is not,
+# The tunnel runs between the DUT and the orchestrator, both endpoints on
+# the WAN segment, and carries a routed inner subnet. Only the DUT is
+# offloaded: the WAN peer is plain software IPsec and has no idea its peer is not,
 # which makes its decryption an independent check on what SEC emitted.
 
 def _ipsec_states(ctx, spi_out, spi_in):
-    outer_local, outer_remote = ctx.dut_lan_address, ctx.lan_outer
-    here = orchestrator_source()
+    outer_local, outer_remote = ctx.wan_address, orchestrator_source()
+    here = CLIENT_A
     return {
         "out_state": ("src", outer_local, "dst", outer_remote, "proto", "esp",
                       "spi", hex(spi_out)),
@@ -668,8 +673,23 @@ def _ipsec_states(ctx, spi_out, spi_in):
     }
 
 
+async def _peer_xfrm_add(ctx, kind, identity, *parameters):
+    await command(ctx.wan, ctx.session, "ip", "xfrm", kind, "add",
+                  *identity, *parameters)
+    ctx.ipsec_peer_objects.append((kind, identity))
+
+
+async def _clear_peer_ipsec(ctx):
+    # The WAN host is shared. Remove only states and policies this fixture
+    # successfully created, never flush its XFRM tables.
+    for kind, identity in reversed(ctx.ipsec_peer_objects):
+        await command(ctx.wan, ctx.session, "ip", "xfrm", kind, "delete",
+                      *identity, check=False)
+    ctx.ipsec_peer_objects.clear()
+
+
 async def _install_ipsec(ctx, spi_out, spi_in):
-    """Both SAs and all three policies, on both ends.
+    """Paired SAs and policies on the gateway and its software peer.
 
     The DUT's state and policy are both offloaded, and both have to be:
     xfrm_state_find() skips a packet-offloaded state whenever the policy that
@@ -687,28 +707,26 @@ async def _install_ipsec(ctx, spi_out, spi_in):
     async def dut(*argv, check=True):
         return await command(ctx.target, ctx.session, *argv, check=check)
 
-    await ctx.lan_sh("ip xfrm state flush; ip xfrm policy flush", 25)
-    await ctx.lan_sh(f"ip address add {IPSEC_INNER}/32 dev lo 2>/dev/null; true", 20)
-    await ctx.lan_sh("ip xfrm state add " + quoted(
-        *s["out_state"], *crypto(IPSEC_REQID_OUT), "replay-window", "32"), 25)
-    await ctx.lan_sh("ip xfrm state add " + quoted(
-        *s["in_state"], *crypto(IPSEC_REQID_IN), "replay-window", "32"), 25)
-    await ctx.lan_sh("ip xfrm policy add " + quoted(*s["fwd_sel"], "dir", "in",
-                                                    *s["fwd_tmpl"]), 25)
-    await ctx.lan_sh("ip xfrm policy add " + quoted(*s["rev_sel"], "dir", "out",
-                                                    *s["rev_tmpl"]), 25)
+    await _clear_peer_ipsec(ctx)
+    await _peer_xfrm_add(ctx, "state", s["out_state"],
+                         *crypto(IPSEC_REQID_OUT), "replay-window", "32")
+    await _peer_xfrm_add(ctx, "state", s["in_state"],
+                         *crypto(IPSEC_REQID_IN), "replay-window", "32")
+    await _peer_xfrm_add(ctx, "policy", (*s["fwd_sel"], "dir", "in"), *s["fwd_tmpl"])
+    await _peer_xfrm_add(ctx, "policy", (*s["rev_sel"], "dir", "out"), *s["rev_tmpl"])
 
     await dut("ip", "xfrm", "policy", "flush")
     await dut("ip", "xfrm", "state", "flush")
-    await dut("ip", "route", "replace", IPSEC_INNER + "/32", "via", ctx.lan_outer)
+    await dut("ip", "route", "replace", IPSEC_INNER + "/32",
+              "via", orchestrator_source(), "dev", TARGET_WAN_IF)
     await dut("ip", "xfrm", "state", "add", *s["out_state"], *crypto(IPSEC_REQID_OUT),
-              "offload", "packet", "dev", TARGET_LAN_IF, "dir", "out")
+              "offload", "packet", "dev", TARGET_WAN_IF, "dir", "out")
     await dut("ip", "xfrm", "state", "add", *s["in_state"], *crypto(IPSEC_REQID_IN),
-              "offload", "packet", "dev", TARGET_LAN_IF, "dir", "in")
+              "offload", "packet", "dev", TARGET_WAN_IF, "dir", "in")
     await dut("ip", "xfrm", "policy", "add", *s["fwd_sel"], "dir", "out",
-              *s["fwd_tmpl"], "offload", "packet", "dev", TARGET_LAN_IF)
+              *s["fwd_tmpl"], "offload", "packet", "dev", TARGET_WAN_IF)
     await dut("ip", "xfrm", "policy", "add", *s["rev_sel"], "dir", "in",
-              *s["rev_tmpl"], "offload", "packet", "dev", TARGET_LAN_IF)
+              *s["rev_tmpl"], "offload", "packet", "dev", TARGET_WAN_IF)
     await dut("ip", "xfrm", "policy", "add", *s["rev_sel"], "dir", "fwd", *s["rev_tmpl"])
     # A conntrack entry surviving an earlier scenario carries IPS_OFFLOAD and is
     # never offered to the flowtable again, so the flow would be judged on that
@@ -734,53 +752,45 @@ async def _rekey_ipsec(ctx, spi_out):
     old_out, old_in = ctx.ipsec_spis
     fresh = _ipsec_states(ctx, spi_out, old_in)
     stale = _ipsec_states(ctx, old_out, old_in)
-    await ctx.lan_sh("ip xfrm state add " + quoted(
-        *fresh["out_state"], *crypto(IPSEC_REQID_OUT), "replay-window", "32"), 25)
+    await _peer_xfrm_add(ctx, "state", fresh["out_state"],
+                         *crypto(IPSEC_REQID_OUT), "replay-window", "32")
     await command(ctx.target, ctx.session, "ip", "xfrm", "state", "delete",
                   *stale["out_state"])
     await command(ctx.target, ctx.session, "ip", "xfrm", "state", "add",
                   *fresh["out_state"], *crypto(IPSEC_REQID_OUT),
-                  "offload", "packet", "dev", TARGET_LAN_IF, "dir", "out")
-    await ctx.lan_sh("ip xfrm state delete " + quoted(*stale["out_state"]), 25)
+                  "offload", "packet", "dev", TARGET_WAN_IF, "dir", "out")
+    await command(ctx.wan, ctx.session, "ip", "xfrm", "state", "delete",
+                  *stale["out_state"])
+    ctx.ipsec_peer_objects.remove(("state", stale["out_state"]))
     ctx.ipsec_spis = (spi_out, old_in)
 
 
 async def _ipsec_traffic(ctx, count):
-    """Drive the tunnel from the orchestrator and report what SEC did.
-
-    The far end is the LAN VM's inner address, so the traffic is generated here
-    and echoed there. Off the event loop, because the socket blocks and the
-    profile's other endpoints live on that loop.
-    """
-    toenc_before = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx toenc")
-    todec_before = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx todec")
-
-    def _drive():
-        echoed = 0
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1)
-        try:
-            for _ in range(count):
-                sock.sendto(b"y" * IPSEC_PAYLOAD, (IPSEC_INNER, PORT_IPSEC))
-                try:
-                    sock.recv(2048)
-                    echoed += 1
-                except OSError:
-                    pass
-                time.sleep(0.02)
-        finally:
-            sock.close()
-        return echoed
-
-    echoed = await asyncio.to_thread(_drive)
-    toenc = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx toenc")
-    todec = await sec_counter(ctx.session, ctx.target, TARGET_LAN_IF, "tx todec")
-    rows = (await ctx.state())["flows"]
-    return {"echoed": echoed, "toenc": toenc - toenc_before,
+    """Drive trusted LAN traffic through the WAN VPN and report SEC steering."""
+    endpoints = {f"{CLIENT_A}:{PORT_IPSEC}", f"{IPSEC_INNER}:{PORT_IPSEC}"}
+    before = {r["cookie"]: int(r["packets"])
+              for r in (await ctx.state())["flows"]
+              if {r["src"], r["dst"]} == endpoints}
+    toenc_before = await sec_counter(ctx.session, ctx.target, TARGET_WAN_IF, "tx toenc")
+    todec_before = await sec_counter(ctx.session, ctx.target, TARGET_WAN_IF, "tx todec")
+    report = await _exchange(ctx, BY_NAME["a"], peer=IPSEC_INNER,
+                             dport=PORT_IPSEC, sport=PORT_IPSEC, count=count,
+                             payload_size=IPSEC_PAYLOAD, label="profile_home_ipsec",
+                             tolerate_loss=True)
+    toenc = await sec_counter(ctx.session, ctx.target, TARGET_WAN_IF, "tx toenc")
+    todec = await sec_counter(ctx.session, ctx.target, TARGET_WAN_IF, "tx todec")
+    assert ctx.ipsec_echo.sources == {(CLIENT_A, PORT_IPSEC)}, ctx.ipsec_echo.sources
+    state = await ctx.state()
+    rows = [r for r in state["flows"]
+            if {r["src"], r["dst"]} == endpoints]
+    return {"echoed": report["echoed"], "state": state,
+            "toenc": toenc - toenc_before,
             "todec": todec - todec_before,
-            "forward": [r for r in rows if r.get("out") == TARGET_LAN_IF
+            "hardware_packets": {r["cookie"]: int(r["packets"]) - before.get(r["cookie"], 0)
+                                 for r in rows},
+            "forward": [r for r in rows if r.get("out") == TARGET_WAN_IF
                         and r.get("sa") != "0"],
-            "reverse": [r for r in rows if r.get("out") == TARGET_WAN_IF
+            "reverse": [r for r in rows if r.get("out") == TARGET_LAN_IF
                         and r.get("in_sa") != "0"]}
 
 
@@ -794,13 +804,14 @@ def _assert_ipsec(report, count):
     the oracle rather than the echo."""
     assert report["echoed"] >= count - 2, report
     assert report["forward"], (
-        "the encrypted direction was not offloaded, so nothing was offered to "
-        f"the driver for this flow at all: {report}")
+        f"the encrypted direction has no hardware flow: {report}")
     assert report["reverse"], (
-        "the decrypted direction names no inbound SA, so its entry was keyed on "
-        f"the physical port and cannot match a frame SEC re-classifies: {report}")
-    assert int(report["reverse"][0]["packets"]) >= count - IPSEC_SETUP, report
-    assert int(report["forward"][0]["packets"]) >= count - IPSEC_SETUP, report
+        f"the decrypted direction has no hardware flow naming its inbound SA: {report}")
+    assert len(report["forward"]) == len(report["reverse"]) == 1, report
+    assert report["forward"][0]["in_br"] == f"{BRIDGE}.{VID_A}", report
+    assert report["reverse"][0]["out_br"] == f"{BRIDGE}.{VID_A}", report
+    for row in report["forward"] + report["reverse"]:
+        assert report["hardware_packets"][row["cookie"]] >= count - IPSEC_SETUP, report
     # A handful, not `count`: the frames that travelled before the entries
     # existed. On the slow path this counter tracks the transfer one for one.
     assert report["toenc"] <= IPSEC_SETUP, (
@@ -1063,14 +1074,13 @@ async def homelab(target_agent, lan):
         ctx.sequence, ctx.recovery_console, ctx.proto = 1, None, "udp"
         ctx.echoes = {}
         ctx.ipsec_spis = None
+        ctx.ipsec_peer_objects = []
+        ctx.ipsec_echo = None
         ctx.smcrouted = False
-
-        async def lan_sh(cmd, timeout=20):
-            return await lan_run(ctx.lan, cmd, timeout)
-        ctx.lan_sh = lan_sh
 
         stack = TopologyStack()
         cleanup, endpoints = [], []
+        ctx.endpoints = endpoints
         console = Console.target(log_path=str(ARTIFACTS / "profile-home-uart.log"))
         try:
             initial = await ctx.state()
@@ -1168,13 +1178,13 @@ async def homelab(target_agent, lan):
                 dev = ctx.bridge_text[client["vid"] or VID_A]
                 await command(ctx.target, ctx.session, "ip", "neigh", "replace",
                               client["ip"], "lladdr", client["mac"], "nud",
-                              "permanent", "dev", dev)
+                              "stale", "dev", dev)
                 cleanup.append((ctx.target, ["ip", "neigh", "del", client["ip"],
                                              "dev", dev]))
                 if client["ip6"]:
                     await command(ctx.target, ctx.session, "ip", "-6", "neigh",
                                   "replace", client["ip6"], "lladdr", client["mac"],
-                                  "nud", "permanent", "dev", dev)
+                                  "nud", "stale", "dev", dev)
                     cleanup.append((ctx.target, ["ip", "-6", "neigh", "del",
                                                  client["ip6"], "dev", dev]))
             # The way back to each client subnet, for the policer's blast and
@@ -1186,17 +1196,14 @@ async def homelab(target_agent, lan):
                                           "dev", ctx.wan_if]))
             await _firewall(ctx, cleanup)
 
-            # The LAN VM's own address on the trusted segment: the outer
-            # endpoint of the IPsec tunnel, and discovered rather than assumed
-            # because the segment's addressing belongs to the bench.
-            show = await lan_run(ctx.lan, f"ip -o -4 addr show dev {LAN_NIC}", 20)
-            ctx.lan_outer = next(field.split("/")[0] for field in show.stdout.split()
-                                 if field.count(".") == 3 and "/" in field)
-            await command(ctx.wan, ctx.session, "ip", "route", "replace",
-                          f"{IPSEC_INNER}/32", "via", ctx.wan_address,
-                          "dev", ctx.wan_if)
-            cleanup.append((ctx.wan, ["ip", "route", "del", f"{IPSEC_INNER}/32",
-                                      "dev", ctx.wan_if]))
+            # Packet-offloaded SAs require their outer address on the physical
+            # offload port. eth3 is now a bridge slave, so the VPN belongs on
+            # the plain WAN uplink, as in a normal homelab deployment. Its
+            # software peer has an inner address of its own on the WAN host.
+            await command(ctx.wan, ctx.session, "ip", "addr", "add",
+                          f"{IPSEC_INNER}/32", "dev", "lo")
+            cleanup.append((ctx.wan, ["ip", "addr", "del", f"{IPSEC_INNER}/32",
+                                      "dev", "lo"]))
 
             # ---- the 6o4 tunnel, which is where VLAN A's IPv6 comes from ----
             ctx.shape = Shape("6o4", PORT_V6, PORT_V6)
@@ -1245,7 +1252,8 @@ async def homelab(target_agent, lan):
             ctx.record("home-fixture", {
                 "wan": ctx.wan_address, "internet": INTERNET,
                 "gateways": [ctx.first_gateway, ctx.second_gateway],
-                "bridge": ctx.bridge_text, "lan_outer": ctx.lan_outer,
+                "bridge": ctx.bridge_text,
+                "ipsec_outer": [ctx.wan_address, orchestrator_source()],
                 "tunnel": _tunnel_text(ctx.shape), "clients": CLIENTS,
                 "initial": initial})
             yield ctx
@@ -1284,10 +1292,7 @@ async def homelab(target_agent, lan):
             await undo(lambda: target("ip", "xfrm", "state", "flush"), "xfrm state")
             await undo(lambda: target("ip", "route", "del", f"{IPSEC_INNER}/32"),
                        "inner route")
-            await undo(lambda: lan_run(ctx.lan,
-                                       "ip xfrm state flush; ip xfrm policy flush; "
-                                       f"ip address del {IPSEC_INNER}/32 dev lo "
-                                       "2>/dev/null; true", 30), "lan xfrm")
+            await undo(lambda: _clear_peer_ipsec(ctx), "WAN peer xfrm")
             await undo(lambda: target("conntrack", "-F"), "conntrack")
             for agent, argv in reversed(cleanup):
                 await undo(lambda a=agent, v=argv: command(a, ctx.session, *v,
@@ -1424,18 +1429,23 @@ async def test_profile_homelab_inter_vlan_is_a_hairpin(homelab, splat_window):
         after = await ctx.state()
         assert refused["echoed"] == 0, refused
         assert drops >= 8, (drops, refused)
+        # Other clients, including Wi-Fi, can add flows during this window.
+        # Require neither direction of the refused connection in hardware;
+        # the global install counter cannot attribute a flow to this burst.
+        refused_end = f"{iot['ip']}:{PORT_REFUSED}"
         assert not [f for f in after["flows"]
-                    if f["src"] == f"{iot['ip']}:{PORT_REFUSED}"], after
-        assert after["installs"] == before["installs"], (before, after)
+                    if refused_end in (f["src"], f["dst"],
+                                       f["new_src"], f["new_dst"])], after
         ctx.record("home-hairpin", {"forward": forward, "reverse": reverse,
-                                    "refused": refused, "drops": drops})
+                                    "refused": refused, "drops": drops,
+                                    "before": before, "after": after})
     finally:
         await stop_trusted()
         await stop_iot()
 
 
 async def test_profile_homelab_ipsec_carries_both_directions(homelab, splat_window):
-    """A packet-offload tunnel to a host on the LAN, both directions in
+    """A packet-offload tunnel to a WAN peer, both directions in
     hardware.
 
     Inbound is not the mirror of outbound and the asymmetry is the whole
@@ -1578,9 +1588,9 @@ async def test_profile_homelab_ingress_policer_holds_the_rate(homelab, splat_win
     counters are what the drops are read from -- green and yellow are enqueued,
     red is dropped, so every frame the meter saw is the sum of the three.
 
-    Deliberately not a throughput case: the cap is well under what the software
-    path could forward, so the number alone would prove nothing. The pair that
-    proves it is `in_hw` plus a drop count that accounts for the loss.
+    The 2 Gbit/s cap is below line rate and above software forwarding capacity.
+    Received throughput near that cap, in_hw and accounted drops prove both
+    enforcement and hardware forwarding under the complete profile.
     """
     ctx = homelab
     client = BY_NAME["a"]
@@ -1620,19 +1630,23 @@ print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
         assert result.rc == 0, result.stdout
         report = json.loads(result.stdout.strip().splitlines()[-1])
         assert report["rc"] == 0, (report, stderr[:400])
-        received = json.loads(report["stdout"])["end"]["sum"]
-        offered = json.loads(stdout)["end"]["sum"]
+        server_report = json.loads(report["stdout"])
+        client_report = json.loads(stdout)
+        received = server_report["end"]["sum_received"]
+        offered = client_report["end"]["sum_sent"]
         shown = await tc("-s", "filter", "show", "dev", TARGET_WAN_IF, "ingress")
         dropped = _police_drops(shown["stdout"]) - dropped_before
         ctx.record("home-policer", {"offered": offered, "received": received,
-                                    "dropped": dropped, "filter": shown["stdout"]})
+                                    "dropped": dropped, "filter": shown["stdout"],
+                                    "server_report": server_report,
+                                    "client_report": client_report})
         cap = POLICE_RATE_MBIT * 1e6
         assert offered["bits_per_second"] > cap * 2, (
             "the orchestrator could not offer enough to exercise the meter", offered)
         # A token bucket drops rather than queues, so the received rate lands at
         # or just under the cap; the margin is the burst draining at the start.
-        assert received["bits_per_second"] <= cap * 1.3, (received, cap)
-        assert received["bits_per_second"] > cap * 0.5, (received, cap)
+        assert received["bits_per_second"] <= cap * 1.15, (received, cap)
+        assert received["bits_per_second"] >= cap * 0.8, (received, cap)
         # And the meter says it did it. Nothing else on this port dropped
         # anything, so the filter's own red count has to account for the loss.
         assert dropped > 0, (dropped, shown["stdout"])
@@ -1775,6 +1789,12 @@ async def test_profile_homelab_ipsec_sa_is_replaced(homelab, splat_window):
     assert retired["errors"] == state_before["errors"], (state_before, retired)
     assert retired["fatal"] == retired["quarantine"] == 0, retired
 
+    # Hardware retirement precedes native flowtable GC clearing IPS_OFFLOAD.
+    # Wait for readmission with the same connection, without flushing it, then
+    # count only the measured burst. An immediate 200 ms burst can finish
+    # entirely before the next one-second GC tick has made admission possible.
+    await _admit(ctx, BY_NAME["a"], peer=IPSEC_INNER, dport=PORT_IPSEC,
+                 sport=PORT_IPSEC, label="ipsec-rekey-admission")
     after = await _ipsec_traffic(ctx, 40)
     ctx.record("home-ipsec-rekey", {"before": before, "retired": retired,
                                     "after": after,
@@ -1790,37 +1810,52 @@ async def test_profile_homelab_ipsec_sa_is_replaced(homelab, splat_window):
 async def test_profile_homelab_bridge_vlan_change_retires(homelab, splat_window):
     """A VLAN is withdrawn from the LAN port and given back.
 
-    The guest VLAN's membership is what tells the bridge to accept its frames on
-    that port and what the adapter derived the egress tag from. Withdrawing it
-    has to retire the flows that carry that tag -- and only those: the trusted
-    VLAN's flow is on the same port, the same bridge and the same classifier,
-    and it has no business noticing.
+    PORT_VLAN changes deliberately drain the shared flowtable and stop
+    admission until the policy is reapplied. The guest must stop receiving,
+    trusted traffic must survive in software, and both must return to hardware
+    after membership is restored and the controller reconciles its policy.
     """
     ctx = homelab
     guest, trusted = BY_NAME["c"], BY_NAME["a"]
-    kept, _ = await _accounted(ctx, trusted, peer=INTERNET, dport=PORT_A,
-                               sport=PORT_A, label="vlan-change-kept")
-    going, _ = await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
-                                sport=PORT_C, label="vlan-change-before")
+    await _accounted(ctx, trusted, peer=INTERNET, dport=PORT_A,
+                     sport=PORT_A, label="vlan-change-trusted-before")
+    await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
+                     sport=PORT_C, label="vlan-change-before")
     before = await ctx.state()
     await command(ctx.target, ctx.session, "bridge", "vlan", "del", "dev",
                   TARGET_LAN_IF, "vid", str(VID_C))
     try:
         retired = await ctx.wait(
-            lambda s: not [f for f in s["flows"] if f["cookie"] == going["cookie"]],
+            lambda s: s["invalidated"] == s["invalidation_done"] == 1
+            and not s["entries"] and not s["neighbour_refs"] and not s["handle_refs"],
             timeout=30)
         assert retired["errors"] == before["errors"], retired
         assert retired["fatal"] == retired["quarantine"] == 0, retired
-        # The trusted VLAN's flow is untouched, which is the selectivity: the
-        # same entry is still there, under the same cookie, and its counters
-        # have not gone backwards -- a readmission would have reset them.
-        survivor = [f for f in retired["flows"] if f["cookie"] == kept["cookie"]]
-        assert len(survivor) == 1, (kept, retired)
-        assert int(survivor[0]["packets"]) >= int(kept["packets"]), (kept, survivor)
+        assert not retired["flows"], retired
+        blocked = await _exchange(ctx, guest, peer=INTERNET, dport=PORT_C,
+                                   sport=PORT_C, count=8, tolerate_loss=True,
+                                   label="vlan-change-blocked")
+        assert blocked == {"echoed": 0, "lost": 8}, blocked
+        software_before = await _software_rx(ctx)
+        surviving = await _exchange(ctx, trusted, peer=INTERNET, dport=PORT_A,
+                                     sport=PORT_A, count=16,
+                                     label="vlan-change-software")
+        software_after = await _software_rx(ctx)
+        assert surviving == {"echoed": 16, "lost": 0}, surviving
+        assert software_after[TARGET_LAN_IF] - software_before[TARGET_LAN_IF] >= 16
+        assert not (await ctx.state())["entries"]
+        ctx.record("home-vlan-withdrawn", {"retired": retired, "blocked": blocked,
+                                          "surviving": surviving})
     finally:
         await command(ctx.target, ctx.session, "bridge", "vlan", "add", "dev",
                       TARGET_LAN_IF, "vid", str(VID_C))
     await _reachable(ctx, guest, INTERNET)
+    await apply(ctx.console, _policy(), r=ctx)
+    ready = await ctx.wait(lambda s: not s["invalidated"] and s["bindings"] == 2)
+    assert ready["rearms"] > before["rearms"], (before, ready)
+    forward, reverse = await _accounted(ctx, trusted, peer=INTERNET, dport=PORT_A,
+                                        sport=PORT_A, label="vlan-change-trusted-after")
+    _assert_wan(ctx, forward, reverse, client=trusted)
     forward, reverse = await _accounted(ctx, guest, peer=INTERNET, dport=PORT_C,
                                         sport=PORT_C, label="vlan-change-after")
     _assert_wan(ctx, forward, reverse, client=guest)
@@ -1917,17 +1952,8 @@ async def test_profile_homelab_module_reload_reproves_the_profile(homelab,
 
 
 async def _start_ipsec_echo(ctx):
-    """The far end of the IPsec tunnel: a UDP echo on the LAN VM's inner
-    address, backgrounded because the UART is one channel and cannot be held
-    open across the traffic the orchestrator then sends."""
-    path = f"/tmp/ask_profile_home_ipsec_{os.getpid()}.py"
-    script = (f"import socket\n"
-              f"s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
-              f"s.bind(({IPSEC_INNER!r}, {PORT_IPSEC}))\n"
-              f"while True:\n"
-              f"    data, peer = s.recvfrom(2048)\n"
-              f"    s.sendto(data, peer)\n")
-    import base64
-    blob = base64.b64encode(script.encode()).decode()
-    await lan_run(ctx.lan, f"pkill -f {path}; echo {blob} | base64 -d > {path}", 20)
-    await lan_run(ctx.lan, f"setsid python3 {path} >/dev/null 2>&1 & sleep 1", 25)
+    """The WAN peer echoes decrypted payloads on the fixture's running loop."""
+    if ctx.ipsec_echo is None:
+        transport, ctx.ipsec_echo = await asyncio.get_running_loop().create_datagram_endpoint(
+            _Echo, local_addr=(IPSEC_INNER, PORT_IPSEC))
+        ctx.endpoints.append(transport)

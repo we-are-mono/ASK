@@ -295,6 +295,13 @@ tunnel whose local endpoint lives somewhere else is refused with
 satisfy this without trying, because strongSwan's local endpoint is the WAN
 address; a bench that invents endpoints has to put one on the port.
 
+The inner LAN may still be a bridge or VLAN. For an opted-in flowtable,
+Netfilter resolves that direction's physical path even when the opposite
+destination uses XFRM. Requiring both directions to use neighbour output
+skipped the LAN walk and left hardware admission pointing at the logical
+bridge. The transformed direction keeps its destination and transmit type;
+the ordinary device walk must not resolve its inner address as the outer peer.
+
 **An outbound SA needs a resolved next hop at install time**, and this is the
 requirement that most changes the shape of the work. What leaves SEC is a
 finished frame: the hardware writes the outer header and both Ethernet
