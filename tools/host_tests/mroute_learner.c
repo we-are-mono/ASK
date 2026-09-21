@@ -173,10 +173,6 @@ static unsigned lower_used;
              (((lower) = list_entry((iter), struct ft_lower, list)->dev), 1); \
          (iter) = (iter)->next)
 
-static struct net_device *netdev_master_upper_dev_get(struct net_device *d)
-{
-    return d->master;
-}
 static bool netif_is_bridge_master(const struct net_device *d)
 {
     return d->bridge_master;
@@ -238,33 +234,50 @@ static int br_vlan_get_info(const struct net_device *port, u16 vid,
         }
     return -EOPNOTSUPP;
 }
-static bool br_port_flag_is_set(const struct net_device *d, unsigned long flag)
-{
-    return (d->port_flags & flag) != 0;
-}
 
-/* The bridged learner's port set, which the routed walk reads through
- * ft_mc_bridge_ports(). Stubbed rather than compiled: it is the membership
- * half's state and tools/host_tests/test_mcast_learner.py owns it. */
+/* Inputs for the kernel-snapshot stub below. */
 static struct net_device *mdb_ports[CDX_MC_MAX_LISTENERS];
 static int mdb_count = -ENOENT;
 static u16 mdb_vid;
 static u16 mdb_vid_seen;
 
-static int ft_mc_bridge_ports(struct net_device *bridge, u8 family,
-                              const union nf_inet_addr *src,
-                              const union nf_inet_addr *dst, u16 vid,
-                              struct net_device **ports, u8 max)
+struct br_ip {
+    union { u32 ip4; struct in6_addr ip6; } src, dst;
+    u16 proto, vid;
+};
+
+/* The kernel snapshot is executed separately by bridge_mcast_snapshot.c.
+ * This stub controls which complete set (or failure) the adapter receives. */
+static int snapshot_error;
+static int br_multicast_list_ports(struct net_device *bridge,
+                                  const struct br_ip *group,
+                                  struct net_device **ports, unsigned max)
 {
-    (void)bridge; (void)family; (void)src; (void)dst;
-    mdb_vid_seen = vid;
-    if (mdb_count < 0 || vid != mdb_vid)
-        return -ENOENT;
-    if (mdb_count > max)
-        return -E2BIG;
-    for (int i = 0; i < mdb_count; i++)
-        ports[i] = mdb_ports[i];
-    return mdb_count;
+    struct net_device *port;
+    struct list_head *iter;
+    unsigned n = 0;
+    mdb_vid_seen = group->vid;
+    if (snapshot_error)
+        return snapshot_error;
+    netdev_for_each_lower_dev(bridge, port, iter) {
+        bool selected = (port->port_flags & BR_MCAST_FLOOD) != 0;
+        if (mdb_count >= 0 && group->vid == mdb_vid) {
+            selected = false;
+            for (int i = 0; i < mdb_count; i++)
+                selected |= mdb_ports[i] == port;
+        }
+        if (!selected)
+            continue;
+        if (vlan_enabled) {
+            struct bridge_vlan_info info;
+            if (br_vlan_get_info(port, group->vid, &info))
+                continue;
+        }
+        if (n == max)
+            return -E2BIG;
+        ports[n++] = port;
+    }
+    return n;
 }
 
 /* --- multicast routing ------------------------------------------------ */
@@ -543,6 +556,7 @@ static void reset(void)
     vlan_proto = ETH_P_8021Q;
     bridge_pvid = 0;
     mdb_count = -ENOENT;
+    snapshot_error = 0;
     mdb_vid = 0;
     mc_list_count = mc4_used = mc6_used = 0;
     lower_used = 0;
@@ -967,6 +981,25 @@ int main(void)
            plan.spec.listener[1].dev == &LAN2);
     assert(plan.spec.listener[0].vlans == 0);
     assert(!strcmp(plan.oifs, "br0"));
+    g->in = plan.spec.in;
+    g->in_tags = plan.in_tags;
+    g->listeners = plan.spec.listeners;
+    memcpy(g->listener, plan.spec.listener, sizeof(g->listener));
+    assert(ft_mr_plan_same(g, &plan));
+    g->listener[0].vlans = 1;
+    assert(!ft_mr_plan_same(g, &plan));
+    g->listener[0].vlans = 0;
+    g->listener[0].dev = &LAN3;
+    assert(!ft_mr_plan_same(g, &plan));
+    g->listener[0].dev = &LAN;
+    g->listeners--;
+    assert(!ft_mr_plan_same(g, &plan));
+    g->listeners++;
+    g->in = &LAN3;
+    assert(!ft_mr_plan_same(g, &plan));
+    g->in = NULL;
+    g->listeners = 0;
+
     ft_mr_plan_put(&plan);
 
     /* One port the hardware cannot carry refuses the whole bridge: the
@@ -974,6 +1007,7 @@ int main(void)
      * to software, it stops receiving. */
     LAN3.physical = false;
     SOFT.master = &BR;
+    SOFT.port_flags = BR_MCAST_FLOOD;
     SOFT.bridge_port = true;
     lower_add(&BR, &SOFT);
     assert(refuse(g) == FT_MR_REFUSED_LISTENER);
@@ -1049,10 +1083,16 @@ int main(void)
     assert(plan.spec.listener[1].dev == &LAN2);
     assert(plan.spec.listener[1].vlans == 0);
     ft_mr_plan_put(&plan);
-    /* A port that is not a member of that VLAN is refused rather than
-     * carried untagged, which would put the group on the wrong VLAN. */
+    /* The snapshot excludes a port outside this VLAN; it must never be
+     * carried untagged onto a different network. */
     membership_count = 0;
     member(&LAN, 3999, false);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN);
+    ft_mr_plan_put(&plan);
+    snapshot_error = -E2BIG;
+    assert(refuse(g) == FT_MR_REFUSED_LISTENER);
+    snapshot_error = -EOPNOTSUPP;
     assert(refuse(g) == FT_MR_REFUSED_LISTENER);
     free(g);
 

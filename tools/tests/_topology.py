@@ -59,6 +59,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
 #   test_flowtable_pppoe.py     276          (ASK_FLOWTABLE_PPPOE_LAN_VID)
 #   test_mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
+#   test_mroute_capacity.py     311..319     (nine LAN listeners)
 #   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
@@ -66,6 +67,8 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # concentrator binds to it, so test_flowtable_pppoe.py builds eth4.3900 on the
 # DUT to meet it and never creates or deletes anything on the orchestrator
 # side. Do not reuse 3900 for a test that does.
+# test_mroute_capacity.py also receives a tagged WAN replica on that existing
+# device using a temporary packet-socket membership, without reconfiguring it.
 #
 # Overlaps that are safe only because the pairs never run concurrently and
 # both sides tear down in finalizers: bridge 231/232 vs mcast_failslab
@@ -73,6 +76,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 VLAN_IDS_MCAST: tuple[int, int, int]  = (241, 242, 243)
 VLAN_IDS_BRIDGE: tuple[int, int]      = (231, 232)
 VLAN_ID_MROUTE: int                   = 244
+VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
 VLAN_ID_PPPOE_WAN: int                = 3900
 
 # Bench wiring: the DUT's eth3 faces the LAN client VM, eth4 faces the

@@ -873,8 +873,9 @@ the DUT's SAs are in hardware. That ceiling is identical on both sides of the
 comparison, which is what makes the DUT's own cost the thing being measured.
 
 A DUT reset was observed once during a UDP variant of this bench under the
-legacy owner, with no console logger attached and nothing captured; it is
-recorded as ISSUES A155 rather than diagnosed here.
+legacy owner, with no console logger attached and nothing captured. ISSUES A155
+was closed as wontfix on 2026-09-21 because CMM is being retired; its root cause
+remains unconfirmed.
 
 ### 8. Following a peer that moves
 

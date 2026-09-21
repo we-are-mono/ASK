@@ -3370,9 +3370,27 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 		break;
 	case SWITCHDEV_PORT_ATTR_SET:
 		attr = ptr;
-		if (!attr->attr ||
-		    (attr->attr->id != SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING &&
-		     attr->attr->id != SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL))
+		if (!attr->attr)
+			return NOTIFY_DONE;
+		switch (attr->attr->id) {
+		case SWITCHDEV_ATTR_ID_PORT_MROUTER:
+		case SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED:
+		case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
+		case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+		case SWITCHDEV_ATTR_ID_PORT_MST_STATE:
+		case SWITCHDEV_ATTR_ID_BRIDGE_MST:
+		case SWITCHDEV_ATTR_ID_VLAN_MSTI:
+			/* Observe only: these events can change a bridge oif's
+			 * copy set without changing any MFC entry. The kernel
+			 * snapshot, not the event's coarse boolean, is authority. */
+			if (dev && net_eq(dev_net(dev), &init_net))
+				ft_mr_kick();
+			return NOTIFY_DONE;
+		default:
+			break;
+		}
+		if (attr->attr->id != SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING &&
+		    attr->attr->id != SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL)
 			return NOTIFY_DONE;
 		break;
 	default:
@@ -4508,10 +4526,8 @@ static bool ft_mc_swdev_obj(unsigned long event,
 	port = obj->info.dev;
 	if (!port || !net_eq(dev_net(port), &init_net))
 		return false;
-	/* A routed group whose oif is a bridge replicates to exactly the ports
-	 * that bridge's memberships name -- br_dev_xmit() hands a group with
-	 * an MDB entry to br_multicast_flood() rather than flooding it -- so
-	 * every membership change here can change a routed listener set. The
+	/* A routed group's bridge snapshot includes the MDB and router ports,
+	 * so every membership change can change a routed listener set. The
 	 * second set-top box joining on a second port is the case: the routed
 	 * group has to grow from one listener to two. Only a kick, and here
 	 * rather than at each of the arms below, because this handler holds
@@ -4717,82 +4733,6 @@ static void ft_mc_rows(struct seq_file *seq)
 	mutex_unlock(&ft_mc_lock);
 }
 
-/* The port set a bridge would replicate a group to, read from the membership
- * half of the learner above.
- *
- * br_dev_xmit() hands a locally generated multicast frame that has an MDB
- * entry to br_multicast_flood(), which copies it to that entry's ports (and to
- * the bridge's router ports, which are a stated exclusion). Everything else
- * goes to br_flood(), which copies it to every port carrying BR_MCAST_FLOOD.
- * This answers the first; a caller seeing -ENOENT falls back to the second.
- *
- * Which membership: the bridge looks up (S,G) first and (*,G) second, and an
- * (S,G) entry is self-contained -- br_multicast_sg_add_exclude_ports() folds
- * the star-exclude ports into it -- so the first match wins rather than the
- * union of the two.
- *
- * Takes ft_mc_lock and nothing else. Its caller is the routed worker, holding
- * RTNL and neither learner's mutex, which is what keeps the two orders apart.
- * The ports it returns are borrowed for the length of that RTNL section: a
- * leave runs from the switchdev handler, which holds RTNL too.
- */
-static int ft_mc_bridge_ports(struct net_device *bridge, u8 family,
-			      const union nf_inet_addr *src,
-			      const union nf_inet_addr *dst, u16 vid,
-			      struct net_device **ports, u8 max)
-{
-	__be16 proto = family == AF_INET6 ? htons(ETH_P_IPV6) : htons(ETH_P_IP);
-	const struct ft_mc_group *g, *best = NULL;
-	int n = -ENOENT;
-	u8 i;
-
-	if (!br_multicast_enabled(bridge))
-		return -ENOENT;
-	mutex_lock(&ft_mc_lock);
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		bool sourced;
-
-		if (g->bridge != bridge || g->addr.proto != proto ||
-		    g->addr.vid != vid || !g->ports)
-			continue;
-		if (family == AF_INET6) {
-			if (!ipv6_addr_equal(&g->addr.dst.ip6, &dst->in6))
-				continue;
-			sourced = !ipv6_addr_any(&g->addr.src.ip6);
-			if (sourced &&
-			    !ipv6_addr_equal(&g->addr.src.ip6, &src->in6))
-				continue;
-		} else {
-			if (g->addr.dst.ip4 != dst->ip)
-				continue;
-			sourced = g->addr.src.ip4 != 0;
-			if (sourced && g->addr.src.ip4 != src->ip)
-				continue;
-		}
-		if (sourced) {
-			best = g;
-			break;
-		}
-		if (!best)
-			best = g;
-	}
-	if (best && (best->ports > max || !ft_mc_carriable(best))) {
-		/* A membership with a member the hardware cannot carry is the
-		 * same answer here as it is over there: the whole group stays
-		 * in software. Handing back the carried subset would replicate
-		 * to it and leave the rest silently unserved -- and the routed
-		 * caller could not tell, because what it got back would look
-		 * like a complete port set. */
-		n = -EOPNOTSUPP;
-	} else if (best) {
-		for (i = 0; i < best->ports; i++)
-			ports[i] = best->port[i].dev;
-		n = best->ports;
-	}
-	mutex_unlock(&ft_mc_lock);
-	return n;
-}
-
 /* ------------------------------------------------------- Routed multicast
  *
  * The second learner, and the one with nothing to learn. Where a bridge's MDB
@@ -4821,8 +4761,8 @@ static int ft_mc_bridge_ports(struct net_device *bridge, u8 family,
  * the handler runs in process context under RTNL and may not sleep: it holds
  * the mfc and the device, appends to a queue under a spinlock, and wakes a
  * worker. The worker takes ft_mr_lock to choose a group, releases it, takes
- * RTNL to decide -- device walks, bridge VLAN state, and the bridged learner's
- * port set under ft_mc_lock -- releases RTNL, and only then takes the
+ * RTNL to decide -- device walks, bridge VLAN state and the kernel's multicast
+ * egress snapshot -- releases RTNL, and only then takes the
  * transaction. Three rules hold throughout, and tools/host_tests/
  * test_mroute_learner.py greps for each:
  *
@@ -4830,9 +4770,8 @@ static int ft_mc_bridge_ports(struct net_device *bridge, u8 family,
  *     transaction and then the lock, so the other order would close a cycle.
  *   - RTNL is never held across cdx_ft_begin() either, which is
  *     cdx_ctrl_lock_with_rtnl()'s standing rule rather than this section's.
- *   - ft_mr_lock is never taken while ft_mc_lock is held. The routed worker
- *     takes ft_mc_lock briefly, holding neither; the bridged side never
- *     reaches into this one at all, it only kicks the worker.
+ *   - ft_mr_lock and ft_mc_lock are never nested. The bridged side only
+ *     kicks this worker; the routed side reads bridge state from the kernel.
  */
 
 /* Enough to ride out a transient -- a port bouncing, a moment of capacity
@@ -5204,16 +5143,10 @@ static int ft_mr_bridge_vid(struct net_device *bridge,
 	return br_vlan_get_pvid(bridge, vid) ? -EOPNOTSUPP : 0;
 }
 
-/* An oif that is a bridge becomes every port the bridge would copy to.
- *
- * A bridge with a port the hardware cannot carry is refused whole rather than
- * served in part: the matched frame never reaches the bridge, so a port left
- * out does not fall back to software, it simply stops receiving. That is the
- * same all-or-nothing rule the backend states for a listener set, applied one
- * level up -- and it is also what makes reading the bridged learner's port set
- * safe, because that learner drops a port it cannot carry rather than
- * recording it.
- */
+/* A bridge oif uses a live kernel snapshot, including router ports. The
+ * switchdev MDB mirror alone cannot supply that set, and a cached MROUTER
+ * boolean loses the protocol and VLAN. RTNL keeps the borrowed ports alive
+ * until the completed plan takes its references. */
 static int ft_mr_expand_bridge(struct net_device *bridge,
 			       const struct cdx_mc_listener *ingress,
 			       const struct cdx_ft_vlan *inner,
@@ -5223,47 +5156,33 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
 			       struct cdx_mc_listener *out, u8 *count)
 {
 	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
-	struct net_device *port;
-	struct list_head *iter;
+	struct br_ip group = {};
 	int n, rc;
-	u16 vid;
 	u8 i;
 
-	netdev_for_each_lower_dev(bridge, port, iter) {
-		if (netdev_master_upper_dev_get(port) != bridge)
-			continue;
-		if (!cdx_mc_port_identity(port))
-			return -EOPNOTSUPP;
-	}
-	rc = ft_mr_bridge_vid(bridge, inner, tags, &vid);
+	rc = ft_mr_bridge_vid(bridge, inner, tags, &group.vid);
 	if (rc)
 		return rc;
-	n = ft_mc_bridge_ports(bridge, family, src, dst, vid, chosen,
-			       ARRAY_SIZE(chosen));
-	/* -ENOENT is "no membership", which is the flood arm below. Anything
-	 * else is a membership this side cannot serve whole, and a bridge that
-	 * cannot be served whole is not served at all. */
-	if (n < 0 && n != -ENOENT)
-		return -EOPNOTSUPP;
-	if (n < 0) {
-		/* No snooping, or nothing has joined: br_flood() copies to
-		 * every port that floods multicast. */
-		n = 0;
-		netdev_for_each_lower_dev(bridge, port, iter) {
-			if (netdev_master_upper_dev_get(port) != bridge ||
-			    !br_port_flag_is_set(port, BR_MCAST_FLOOD))
-				continue;
-			if (n == (int)ARRAY_SIZE(chosen))
-				return -EOPNOTSUPP;
-			chosen[n++] = port;
-		}
+	if (family == AF_INET6) {
+		group.proto = htons(ETH_P_IPV6);
+		group.src.ip6 = src->in6;
+		group.dst.ip6 = dst->in6;
+	} else {
+		group.proto = htons(ETH_P_IP);
+		group.src.ip4 = src->ip;
+		group.dst.ip4 = dst->ip;
 	}
-	if (!n)
-		return -EOPNOTSUPP;
+	n = br_multicast_list_ports(bridge, &group, chosen, ARRAY_SIZE(chosen));
+	if (n < 0)
+		return n;
 	for (i = 0; i < n; i++) {
 		struct cdx_ft_vlan stack[CDX_FT_VLAN_MAX];
 		unsigned int c = tags;
 
+		/* Every selected destination must be carried. An unsupported
+		 * router or listener refuses the whole group, never a subset. */
+		if (!cdx_mc_port_identity(chosen[i]))
+			return -EOPNOTSUPP;
 		memcpy(stack, inner, sizeof(stack));
 		if (ft_bridge_vlan(bridge, chosen[i], stack, &c) < 0)
 			return -EOPNOTSUPP;
@@ -5271,6 +5190,8 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
 		if (rc)
 			return rc;
 	}
+	/* An empty bridge contributes no copies; another oif may still do so.
+	 * ft_mr_derive() refuses a completely empty replication set. */
 	return 0;
 }
 
@@ -5422,6 +5343,31 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	plan->in_tags = in.vlans;
 	strscpy(plan->oifs, oifs, sizeof(plan->oifs));
 	return FT_MR_PENDING;
+}
+
+/* A refresh need not replace an unchanged chain. Compare the forwarding
+ * fields, not padding or the logical oif names: two oifs can resolve to the
+ * same physical copies. Called under RTNL, which also protects device removal. */
+static bool ft_mr_plan_same(const struct ft_mr_group *g,
+			    const struct ft_mr_plan *plan)
+{
+	u8 i, j;
+
+	if (g->in != plan->spec.in || g->in_tags != plan->in_tags ||
+	    g->listeners != plan->spec.listeners)
+		return false;
+	for (i = 0; i < g->listeners; i++) {
+		const struct cdx_mc_listener *a = &g->listener[i];
+		const struct cdx_mc_listener *b = &plan->spec.listener[i];
+
+		if (a->dev != b->dev || a->vlans != b->vlans)
+			return false;
+		for (j = 0; j < a->vlans; j++)
+			if (a->vlan[j].proto != b->vlan[j].proto ||
+			    a->vlan[j].id != b->vlan[j].id)
+				return false;
+	}
+	return true;
 }
 
 /* ---- the chain, the queue and the worker ------------------------------- */
@@ -5784,7 +5730,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 		struct ft_mr_plan plan = {};
 		enum ft_mr_state state;
 		bool claimed = false;
-		bool rekey = false;
+		bool rekey = false, same = false;
 		u8 retries = 0;
 		int rc = 0;
 
@@ -5807,9 +5753,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 			break;
 
 		/* Decide under RTNL with no learner mutex held: the walk reads
-		 * bridge and netdev state, which RTNL is the lock for, and it
-		 * asks the bridged learner for a port set, which needs
-		 * ft_mc_lock. Nothing in it touches hardware. */
+		 * bridge and netdev state, including the kernel's current MDB
+		 * and router-port set. Nothing in it touches hardware. */
 		rtnl_lock();
 		state = retries >= FT_MR_MAX_RETRIES ?
 			FT_MR_REFUSED_FAILED : ft_mr_derive(target, &plan);
@@ -5820,6 +5765,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * the unlock because the installed ingress is the other thing
 		 * ft_mr_device_gone() clears, and it holds RTNL to do it. */
 		rekey = hw && plan.spec.in != target->in;
+		same = hw && state == FT_MR_PENDING && ft_mr_plan_same(target, &plan);
 		rtnl_unlock();
 
 		if (state == FT_MR_PENDING && !claimed) {
@@ -5835,7 +5781,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 			}
 		}
 
-		if (!rc && (hw || state == FT_MR_PENDING)) {
+		if (!rc && !same && (hw || state == FT_MR_PENDING)) {
 			cdx_ft_begin();
 			if (hw && (rekey || state != FT_MR_PENDING)) {
 				cdx_mc_group_del(&hw);
@@ -5845,6 +5791,13 @@ static void ft_mr_work_fn(struct work_struct *work)
 				if (hw) {
 					rc = cdx_mc_group_replace(hw,
 								  &plan.spec);
+					if (rc) {
+						/* The old set can omit a newly learned
+						 * router. Return the entire stream to
+						 * software until a full set installs. */
+						cdx_mc_group_del(&hw);
+						ft_mr_installed--;
+					}
 				} else {
 					rc = cdx_mc_group_add(&plan.spec, &hw);
 					if (rc)
@@ -5876,11 +5829,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 			memset(&plan, 0, sizeof(plan));
 			target->retries = 0;
 		} else {
-			/* A replace that failed left the previously installed
-			 * set in hardware, which is what the backend promises,
-			 * so the group goes on describing that set rather than
-			 * the one it wanted. With nothing installed there is
-			 * nothing left to describe. */
+			/* A failed update was withdrawn above: an incomplete old
+			 * listener set cannot stand in for the requested one. */
 			if (!hw)
 				ft_mr_release_set(target);
 			if (rc && ++target->retries >= FT_MR_MAX_RETRIES)
@@ -5905,7 +5855,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 		ft_mr_plan_put(&plan);
 	}
 
-	if (ft_mr_installed && !READ_ONCE(ft_mr_stopping))
+	if (ft_mr_count && !READ_ONCE(ft_mr_stopping))
 		schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
 }
 
@@ -5924,6 +5874,12 @@ static void ft_mr_stats_fn(struct work_struct *work)
 	cdx_ft_begin();
 	mutex_lock(&ft_mr_lock);
 	list_for_each_entry(g, &ft_mr_groups, list) {
+		/* Querier timers and per-VLAN snooping changes have no complete
+		 * switchdev notification. Refresh from the live bridge within
+		 * one interval, including groups currently refused. Preserve
+		 * the retry ceiling; real control-plane events reset it. */
+		if (!g->gone && g->retries < FT_MR_MAX_RETRIES)
+			g->dirty = true;
 		if (!g->hw)
 			continue;
 		cdx_mc_group_stats(g->hw, &stats);
@@ -5931,8 +5887,10 @@ static void ft_mr_stats_fn(struct work_struct *work)
 	}
 	mutex_unlock(&ft_mr_lock);
 	cdx_ft_end();
-	if (ft_mr_installed && !READ_ONCE(ft_mr_stopping))
+	if (ft_mr_count && !READ_ONCE(ft_mr_stopping)) {
+		schedule_work(&ft_mr_work);
 		schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
+	}
 }
 
 static void ft_mr_exit(void)
@@ -5944,6 +5902,10 @@ static void ft_mr_exit(void)
 	mutex_lock(&ft_mr_lock);
 	WRITE_ONCE(ft_mr_stopping, true);
 	mutex_unlock(&ft_mr_lock);
+	/* The refresh can queue the worker, and the worker can rearm the
+	 * refresh. Drain the producer first, then the worker, then any timer
+	 * a worker already past its stopping check rearmed during the drain. */
+	cancel_delayed_work_sync(&ft_mr_stats);
 	cancel_work_sync(&ft_mr_work);
 	cancel_delayed_work_sync(&ft_mr_stats);
 	/* The chain is already unregistered by the caller, so nothing can add

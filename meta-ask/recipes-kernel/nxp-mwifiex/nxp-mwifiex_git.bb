@@ -19,6 +19,7 @@ SRC_URI = "git://github.com/nxp-imx/mwifiex.git;protocol=https;branch=hotfix/lf-
            file://0005-moal-report-scan-results-outside-scan_req_lock.patch \
            file://0006-moal-give-each-mlan-spinlock-its-own-lockdep-class.patch \
            file://0007-mlan-aggregate-an-A-MSDU-under-one-hold-of-the-ralis.patch \
+           file://0008-moal-own-scan-requests-through-completion-and-teardown.patch \
 "
 SRCREV = "09f41e1423e4806a127507d5fa284cd02c46772f"
 

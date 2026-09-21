@@ -148,16 +148,16 @@ classifier cannot express and the group stays in software:
   carries them. 802.1ad is declined for the reason `ft_bridge_vlan()` gives:
   the kernel describes no selector for that tag and the hardware would be asked
   to reproduce it blind.
-- A bridge, plain or vlan-aware, is its ports. Which ports is what
-  `br_dev_xmit()` decides: a group with an MDB entry goes to
-  `br_multicast_flood()` and therefore to exactly that entry's port group, and
-  everything else to `br_flood()` and therefore to every port carrying
-  `BR_MCAST_FLOOD`. The first of those is read from the bridged learner, which
-  mirrors the MDB already; the second is read from the ports directly. Each
-  port's egress tag comes from `ft_bridge_vlan()` applied to the stack
-  accumulated above the bridge, which is the shipping `br-lan.N` shape: the
-  bridge forwards within the VLAN the frame already carries and the port's own
-  membership decides tagged or untagged.
+- A bridge, plain or VLAN-aware, is its complete multicast data egress set.
+  Kernel patch 161 exports `br_multicast_list_ports()`: under RTNL and the
+  bridge's multicast lock it reads the current VLAN context, querier, MDB and
+  protocol-specific router list. With snooping and a querier, copies go to the
+  applicable MDB port group **and multicast router ports**; without an MDB
+  entry they go to router ports alone. Without active snooping/querier they
+  follow `BR_MCAST_FLOOD`. A port present in both sets receives one copy.
+  Source filters, forwarding state and VLAN egress membership apply before
+  returning the set. Each selected port's tag stack still comes from
+  `ft_bridge_vlan()`, including the `br-lan.N` shape.
 - Anything else — a bond, a MACVLAN, a ppp device, a tunnel — is refused.
 
 **A listener is its whole framing, not its port.** One port carries as many
@@ -196,14 +196,12 @@ the parser composes before any table is consulted.
 
 Two further rules, both `refused-listener`:
 
-- **A bridge with any port the hardware cannot carry is refused whole.** A
-  matched frame never reaches the bridge, so a port left out of the hardware
-  set does not fall back to software — it stops receiving. This is the
-  backend's all-or-nothing rule applied one level up. The bridged learner keeps
-  the same rule from its own side, so its port set is safe to read: it records
-  a member it cannot carry rather than dropping it, and `ft_mc_bridge_ports()`
-  refuses such a membership outright rather than handing back the carried
-  subset — which would look, from here, exactly like a complete one.
+- **A bridge with any selected destination the hardware cannot carry is
+  refused whole.** A matched frame never reaches the bridge, so omitting a
+  selected Wi-Fi or other unsupported router/listener would stop its delivery.
+  Ports outside the copy set do not prevent offload. The kernel snapshot
+  refuses an overflowing set instead of returning a truncated one, and refuses
+  MST and multicast-to-unicast copies, which this port-only API cannot describe.
 - **A listener whose port and tags both equal the ingress's is refused**, as is
   a parent VIF named as its own oif.
 
@@ -247,8 +245,7 @@ each learner consults before it installs and releases when it stops carrying a
 key. It is a leaf: a spinlock taken while no other lock of this module is held,
 so it orders against nothing. That is what makes it shareable. The alternative,
 each learner reading the other's list, would need `ft_mc_lock` and `ft_mr_lock`
-nested in some order, and the routed worker already takes `ft_mc_lock` while
-holding neither.
+nested in some order. The shared register avoids that dependency.
 
 Whoever gets there first wins; the other reports `refused-contested` and waits.
 Handing a key back wakes both learners, because the refusal it caused is now
@@ -305,10 +302,9 @@ only one either may use.
 
 **The two learners never nest their locks.** `ft_mr_lock` is never taken while
 `ft_mc_lock` is held and `ft_mc_lock` is never taken while `ft_mr_lock` is held.
-The routed worker takes `ft_mc_lock` briefly, under RTNL and with its own lock
-released, to copy a bridge's port set; the bridged side never reaches into this
-learner at all — the MDB handler only calls `ft_mr_kick()`, which sets a flag
-and schedules.
+The routed worker reads the kernel's bridge snapshot under RTNL, with its own
+lock released. The bridged side's MDB handler only calls `ft_mr_kick()`, which
+sets a flag and schedules.
 
 **Dependencies and retirement.** The same classes the bridged learner has, one
 family over:
@@ -323,7 +319,15 @@ family over:
 | A port coming back up | the netdev chain | re-derived; nothing else would ever reconsider a refused group, because the MFC entry does not change and no frame re-offers it |
 | A bridged membership on a bridge some group expands through | the switchdev chain | the routed worker is kicked; the second set-top box joining on a second port is the case, and the group grows from one listener to two through `cdx_mc_group_replace()` |
 | The bridge's VLAN configuration or filtering | the switchdev chain | kicked and re-derived |
+| A multicast router port, snooping, flood flag or forwarding state | switchdev attributes | kicked and re-derived from the live snapshot; patch 161 emits router refreshes on either protocol's transition, even while the other remains a router |
+| Querier timers or per-VLAN snooping state without a notification | the existing five-second worker | re-derived, including refused groups; unchanged forwarding plans leave their hardware chains intact |
 | A hardware key handed back | the shared register | both learners kicked |
+
+A replacement that fails is withdrawn completely: retaining the old chain
+could omit a new router port indefinitely. Software carries the whole stream
+while the bounded admission retries run. Periodic refresh preserves the retry
+ceiling; control-plane changes reset it. Teardown drains the refresh, worker,
+and any refresh rearmed by an in-flight worker before freeing groups.
 
 ## Standard-tool surfaces
 
@@ -383,13 +387,6 @@ whole family in software and nothing else on the box would say so.
 
 ## Deliberately excluded
 
-- **Multicast router ports.** `br_multicast_flood()` copies to a bridge's
-  router ports as well as to the port group, and this listener walk does not.
-  A bridge with a downstream multicast router would under-replicate. There is
-  no exported way to ask a bridge for its router ports; the switchdev chain
-  emits `SWITCHDEV_ATTR_ID_PORT_MROUTER` and tracking that is a separate piece
-  of work. `ISSUES.md` carries it, because under-replication is silent and that
-  makes it a gap rather than a scoping decision.
 - **Other multicast routing tables, and policy routing.** Refused rather than
   followed, and refused for the whole family, because a hardware entry matches
   before any rule could redirect it.
@@ -457,11 +454,12 @@ configuration, and `smcroute` writes the MFC entries. Five cases: IPv4 and IPv6
 to the LAN port, IPv4 to a VLAN sub-interface on it, IPv4 to a bridge over it
 with snooping off, and **two oifs on the one LAN port — untagged and tagged**.
 
-That last one is the measurement `ISSUES.md` A158 has been waiting for. The
-board has five ports and two with carrier, one of which is every group's
-ingress, so a second listener has to be a second tag stack on the one port
-left; identifying a listener by its framing rather than by its device is what
-makes that expressible. It counts the two copies separately, which is what
+That last case supplied A158's first replication measurement. The board has
+two ports with carrier; that run used WAN ingress and two differently framed
+LAN listeners. The later A158 completion below also sends a tagged replica
+back through the physical WAN port, proving both transmit paths. Identifying
+a listener by its framing rather than just its device makes these topologies
+expressible. The first case counts the two copies separately, which is what
 discriminates replication from one copy seen twice — the socket joined on the
 parent NIC receives the untagged copy and only that one, because the tagged
 copy is demuxed to the sub-interface where nothing has joined — and then drops
@@ -523,3 +521,105 @@ than a shortfall. `ip -s mroute` lags the hardware by up to the fold's
 five-second interval, so a reader who wants it exact reads
 `/proc/cdx_flowtable` first — that read folds. A test that asked the kernel
 first saw 88% of a three-second stream and looked like a broken fold.
+
+## A189 follow-up — 2026-09-21
+
+Router ports are included by kernel patch 161 and the routed bridge expansion.
+The snapshot reads existing state directly, so a module load needs no router
+notification replay and keeps no additional device references or event cache.
+IPv4 and IPv6 router sets and per-VLAN contexts remain distinct. It also fixes
+router-only delivery with no MDB, and the flood decision when no querier exists.
+
+Host regressions execute the snapshot with IPv6 enabled and disabled and run
+the routed worker through unchanged refreshes, listener changes, replacement
+failure, retry exhaustion/recovery and teardown with a timer rearm. The full
+host suite and KASAN image build are recorded in `ISSUES.md`.
+
+DUT validation of the bridge/router semantics remains pending. The image was
+rebuilt, staged and booted for A158 below, but those plain VLAN-oif cases do not
+exercise this change. The earlier hardware results above predate A189. A future
+rig check should turn snooping and a querier on, disable multicast flooding on the LAN
+bridge port, and toggle that port's multicast-router role while routing a group
+with no MDB membership. Capture delivery and hardware counters, verify removal
+and re-addition, then repeat with an overlapping MDB membership and IPv6.
+
+## A158 hardware completion — 2026-09-21
+
+`tools/tests/test_mroute_capacity.py` passed all four rig cases in **48.13 s**,
+with no failures or skips, on the rebuilt KASAN flowtable image. Each shape
+passed for both IPv4 and IPv6:
+
+- **8 → 9 → 8 listeners.** Nine VLAN subinterfaces are available on the LAN
+  port. Eight must install and each receive every sequence exactly once. Adding
+  the ninth must withdraw the entire hardware group while all nine receive in
+  software. Deleting the ninth DUT VLAN withdraws its VIF; eight must return to
+  hardware and the ninth receiving VLAN must become silent.
+- **Two physical egress ports.** The source enters WAN untagged. One tagged
+  copy leaves LAN and a differently tagged copy leaves WAN. The WAN receiver is
+  an AF_PACKET socket on the existing orchestrator `wan3900` interface, so
+  local-source IP rejection cannot hide a correctly received replica. Both
+  `eth3/311` and `eth4/3900` received every sequence independently. This proves
+  two physical transmit paths using the existing cables.
+
+The initial run passed both listener-ceiling cases but received no WAN copy
+on the proposed VLAN 320. A software-transmit probe then received **16/16**
+untagged packets and **16/16** on VLAN 3900, but **0/16** on VLAN 320, locating
+the limitation in the bench path. The final run uses the standing VLAN 3900;
+its interface, addresses, routes and PPPoE service are not reconfigured.
+
+The tests reserve LAN VLANs 311–319 and `198.18.158.0/24` for DUT oif
+addresses. Each capture joins only its Ethernet multicast destination and
+closes that socket membership at exit. Each test owns a separate smcrouted
+identity and stops only that instance. An existing multicast workload prevents
+admission rather than being removed. No CMM or FCI is used.
+
+Each window sends 256 unique sequences at 200 packets/s, checks exact delivery
+per receiving VLAN and no duplicates, verifies hop limit/TTL 63 and the DUT's
+physical egress MAC, and compares `/proc`, MFC offload flags and software RX
+counters. JSON artifacts record the packet results, route rows and counters.
+All expected receivers got **256/256** unique sequences, with zero duplicate
+or malformed copies. The ninth receiver got zero while the group had eight
+listeners, including after recovery. The 17 packet-oracle host tests also pass.
+
+| Family | Window | Classifier packet delta | Software ingress RX | 1.28 s idle RX |
+| --- | --- | ---: | ---: | ---: |
+| IPv4 | Eight, initial | 256 | 3 | 3 |
+| IPv4 | Nine, software | 0 | 261 | 4 |
+| IPv4 | Eight, recovered | 256 | 4 | 3 |
+| IPv4 | Two physical ports | 256 | 4 | 7 |
+| IPv6 | Eight, initial | 256 | 5 | 4 |
+| IPv6 | Nine, software | 0 | 260 | 3 |
+| IPv6 | Eight, recovered | 256 | 4 | 5 |
+| IPv6 | Two physical ports | 256 | 5 | 3 |
+
+The nine-listener windows had `state=refused-listener`, an empty hardware
+listener list and no MFC offload flag. Every other window had `state=installed`
+and the offload flag. Route removal erased each group's row. Final inspection
+found no A158 routes, VLAN devices or running test processes; the existing
+`wan3900` remained present, both physical links were up and the agent was healthy.
+No KASAN, UBSAN, BUG, WARN or lockdep reports appeared; taint remained the
+out-of-tree-module baseline of 4096. This run did not perform a kmemleak scan.
+
+Reproduction: build with `KASAN=1 make ask-image`, stage with `make stage-image`,
+and TFTP boot with `ask.offload=flowtable`. The compressed image exceeded the
+old 128 MiB U-Boot input bound; this boot used the temporary setting
+`kernel_comp_size=0x10000000`, with no flash or saved-environment writes.
+Set `ASK_WAN_IPERF_IP` to the orchestrator's current address and `ASK_WAN_IPV6`
+if the source differs from `fc00:beef::99`. `ASK_MROUTE_WAN_IF` and
+`ASK_MROUTE_WAN_VID` may select a different existing, transported WAN VLAN.
+
+```sh
+sudo env PYTHONPATH=tools ASK_WAN_IPERF_IP=10.0.0.232 \
+  ASK_FLOWTABLE_ARTIFACTS=/tmp/ask-a158-hardware-20260921/run2 \
+  /opt/askd-agent/venv/bin/pytest -c tools/pyproject.toml \
+  tools/tests/test_mroute_capacity.py
+```
+
+Artifacts on `vision`: `/tmp/ask-a158-hardware-20260921/` contains build/stage
+and boot logs, verified kernel/module build IDs, the initial failed run and WAN
+path probe, final `run2` JSON/JUnit results, and post-test cleanup evidence.
+The staged image and DTB hashes matched the build; loaded kernel, CDX and
+ask_flowtable build IDs matched their ELF artifacts. Image SHA-256:
+`d34bdd5b6a4e82e24a5c013be0f383113b55c43bc02a3585e2afd64e836f4f2c`.
+The build passed with five existing forced-task/build-path warnings. A158 is
+closed, and the DUT remains in flowtable mode on this tested image.

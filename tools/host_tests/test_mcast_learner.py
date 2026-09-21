@@ -168,11 +168,10 @@ def test_a_group_the_hardware_cannot_serve_whole_is_not_served_at_all():
     # The MDB answer must not claim a group that will never install.
     assert "ft_mc_carriable(g)" in function(source, "ft_mc_membership")
 
-    # And the routed learner reads this port set, so it must be refused the
-    # carried subset rather than handed it.
-    ports = function(source, "ft_mc_bridge_ports")
-    assert "!ft_mc_carriable(best)" in ports, (
-        "handing back the carried subset would look like a complete set")
+    # The routed learner reads the complete kernel snapshot independently.
+    routed = function(source, "ft_mr_expand_bridge")
+    assert "br_multicast_list_ports(" in routed
+    assert "!cdx_mc_port_identity(chosen[i])" in routed
 
 
 def test_the_vid_follows_the_bridge_rather_than_the_port():

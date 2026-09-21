@@ -350,6 +350,10 @@ struct switchdev_notifier_fdb_info {
 enum switchdev_attr_id {
     SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING = 1, SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL,
     SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME,
+    SWITCHDEV_ATTR_ID_PORT_MROUTER, SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
+    SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS, SWITCHDEV_ATTR_ID_PORT_STP_STATE,
+    SWITCHDEV_ATTR_ID_PORT_MST_STATE, SWITCHDEV_ATTR_ID_BRIDGE_MST,
+    SWITCHDEV_ATTR_ID_VLAN_MSTI,
 };
 struct switchdev_obj { enum switchdev_obj_id id; };
 struct switchdev_attr { enum switchdev_attr_id id; };
@@ -2242,6 +2246,29 @@ static void test_bridge_fdb(void)
     set.info.dev = &upper;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
     assert(!atomic_read(&ft_invalid) && !set.handled);
+    /* Multicast router and forwarding changes refresh routed groups without
+     * claiming the attribute or retiring unrelated unicast entries. */
+    enum switchdev_attr_id changes[] = {
+        SWITCHDEV_ATTR_ID_PORT_MROUTER, SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
+        SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS, SWITCHDEV_ATTR_ID_PORT_STP_STATE,
+        SWITCHDEV_ATTR_ID_PORT_MST_STATE, SWITCHDEV_ATTR_ID_BRIDGE_MST,
+        SWITCHDEV_ATTR_ID_VLAN_MSTI,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(changes); i++) {
+        struct switchdev_attr change = { .id = changes[i] };
+        unsigned kicks = mroute_kicks;
+        set.attr = &change;
+        set.info.dev = &out;
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(mroute_kicks == kicks + 1);
+        assert(!atomic_read(&ft_invalid) && !set.handled);
+        set.info.dev = NULL;
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(mroute_kicks == kicks + 1);
+    }
+    set.attr = NULL;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+
     ft_handle_invalidate(&handle, &ft_mac_invalidations);
     ft_retire_workfn(NULL);
     assert(!ft_count && !allocated);

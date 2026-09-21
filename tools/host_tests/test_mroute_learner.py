@@ -57,6 +57,7 @@ def test_mroute_learner(tmp_path):
             "ft_mr_expand",
             "ft_mr_plan_put",
             "ft_mr_derive",
+            "ft_mr_plan_same",
             "ft_mr_find",
             "ft_mr_dirty_family",
             "ft_mr_apply",
@@ -136,9 +137,9 @@ def test_the_worker_never_holds_a_lock_across_the_transaction():
 
 
 def test_the_two_learners_never_nest_their_locks():
-    """One order, everywhere. The routed worker takes ft_mc_lock under RTNL
-    with ft_mr_lock released, to copy a bridge's port set; the bridged side
-    never reaches into the routed learner at all, it only kicks the worker.
+    """One order, everywhere. The routed worker reads the kernel snapshot
+    with ft_mr_lock released; the bridged side never reaches into the routed
+    learner at all, it only kicks the worker.
     Nesting them in both directions is the deadlock this rules out.
     """
     source = SOURCE.read_text()

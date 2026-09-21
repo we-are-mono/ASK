@@ -152,22 +152,6 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A189 — a routed group's bridge oif skips the bridge's multicast router
-  ports.** `cdx/ask_flowtable.c` `ft_mr_expand_bridge()` reproduces
-  `br_dev_xmit()`'s two arms — the MDB port group when one exists, the
-  `BR_MCAST_FLOOD` set otherwise — but `br_multicast_flood()` also copies to
-  every port the bridge has learned a multicast router on, and that set is not
-  read. A routed group whose oif is a bridge with a downstream multicast router
-  therefore under-replicates: the router port stops receiving and, because the
-  matched frame never reaches the bridge, there is no software path left to
-  correct it. Nothing exports a bridge's router-port set; the switchdev chain
-  the adapter is already on emits `SWITCHDEV_ATTR_ID_PORT_MROUTER` whenever a
-  port starts or stops being one (`net/bridge/br_multicast.c`), so the fix is
-  to track it there and add those ports to the copy set. Filed rather than
-  scoped as an exclusion because the failure is silent. No deployment on this
-  box has a bridge oif with a router port today. See the
-  [routed multicast design](flowtable-multicast-routed.md).
-
 - [ ] **A188 — a group that is both bridged and routed is carried once, not
   merged.** The classifier keeps one group id and one root entry per address
   pair, so the two multicast learners share a key namespace and coordinate
@@ -213,83 +197,6 @@ result independently of those temporary files.
   the rule count against it, so validation and rendering agree. Found in the C daemon's
   adversarial review.
 
-- [ ] **A178 — moal's scan_request lifecycle has holes outside `scan_req_lock`.** Found while
-  fixing A173 (driver 09f41e14, `mlinux/`): `woal_clean_up()` completes and NULLs
-  `handle->scan_request` with no lock at all, so it can double-complete against
-  `woal_cancel_scan()` or the event worker; the fake-scan and scan-block branches of
-  `woal_cfg80211_scan()` set `scan_request` without `scan_priv`, and `woal_clean_up()` gates
-  on `scan_priv`, so on remove/hang with such a scan pending the request is never completed and
-  `scan_timeout_work` stays armed across `destroy_workqueue()`; the real-timeout branch of
-  `woal_scan_timeout_handler()` never completes the request either and relies on the hang path.
-  Station and ACS scans only, so not on the product's steady state; a generation counter beside
-  `scan_request` would also close the pointer-reuse residue in patch 0005's "same request" guard.
-
-- [ ] **A158 — multicast replication to more than one listener has never been
-  run.** The bridged multicast offload is proved on hardware for a single
-  listener (see the [design doc](docs/flowtable-multicast.md)), but the DUT has
-  five ports and only two with carrier, one of which every group uses as its
-  ingress. So every group exercised so far has exactly one listener, and three
-  things are untested as a direct consequence: replication to N ports at once,
-  the chain swap `cdx_mc_group_replace()` performs when a join or leave changes
-  an installed group's listener set, and the listener ceiling
-  `MC_MAX_LISTENERS_PER_GROUP` names. The chain swap is the one that matters —
-  it is what keeps the other listeners of an IPTV group from a gap whenever
-  anyone changes channel, and it is the most intricate code in the backend.
-  Needs a second listener port with carrier, or a CMM boot where VLAN
-  sub-interfaces register as onifs and can stand in as listeners the way
-  `test_mcast_replication.py` already uses them. Not a defect; a measurement
-  that has not been taken.
-  **Measured 2026-09-21, and the gap is now narrower than this entry.** A
-  listener is identified by its whole framing rather than by its device, so two
-  oifs on the one LAN port — untagged and tagged on a sub-interface — are two
-  entries in the chain. `test_routed_to_two_listeners_on_one_port` passes on
-  hardware: the row names `eth3/0,eth3/244`, both copies are counted
-  separately, and deleting the VLAN device exercises the chain swap through
-  `cdx_mc_group_replace()` with the group never leaving hardware. So
-  replication to more than one listener and the swap are both proved. What is
-  still untested is replication across more than one *port*, which still needs
-  a second listener port with carrier, and the listener ceiling.
-
-- [ ] **A156 — a failed multicast UPDATE leaves the listeners it already
-  installed forwarding, and reports failure.** `cdx_update_mcast_group()`
-  (`cdx/dpa_control_mc.c`) commits each listener of a batch as it is built:
-  `bIsValidEntry = 1`, `uiListenerCnt++`, and
-  `cdx_exthash_update_first_mcast_member_addr()` splices the entry into the
-  live replication chain under the bucket spinlock. Its `err_ret:` label is a
-  bare `return iRet;` with no unwind, so a failure on listener *k* returns an
-  error to the FCI client while listeners 1..*k*−1 stay installed and
-  replicating. The comment above the failure branch asserts the opposite —
-  that prior listeners "are about to be torn down" — and is stale.
-  Not a leak: each installed entry is owned by a valid `members[]` slot and is
-  freed at group teardown. The defect is that the control plane's view of the
-  group diverges from the hardware's, silently and permanently, and a client
-  that retries the same UPDATE then fails again on
-  `Cdx_GetMcastMemberId() != -1` ("member already exists") for listeners it
-  believes it never added. The create path does not share this: its `err_ret`
-  cascade calls `cdx_free_exthash_mcast_members()` and refuses the whole group.
-  Fixing it is not a one-liner — the entries are already visible to the
-  microcode, so the unwind has to splice them back out under the bucket lock
-  and then release them through the quarantine barrier rather than freeing
-  them directly, which is the same discipline the group-DELETE path uses.
-  Surfaced by the audit of the `ins_entry_info` sharing fixed in this area;
-  pre-existing and unrelated to that fix. Reachable today only when a listener
-  entry fails to build — a missing onif, an exhausted hash table, or
-  `-ENOMEM` under pressure — which `test_mcast_failslab.py` already provokes,
-  so it is worth an assertion there once fixed.
-
-- [ ] **A155 — the DUT reset during a CMM-mode UDP tunnel probe, with no trace
-  captured.** A one-way UDP transfer through an IPsec tunnel (400 Mb/s,
-  1300-byte datagrams, forwarded WAN to LAN, legacy owner, non-KASAN image)
-  ended with the agent unreachable and the board back at 27 seconds of uptime;
-  `panic=10` reboots on panic, so it panicked. No console logger was attached,
-  so the ring buffer went with it and there is nothing to read. Two things
-  weaken the diagnosis rather than the observation: the LAN segment was
-  flapping at the time, and the same bench had just carried three TCP runs per
-  direction without incident. Reproduce with `Console.target()` logging to
-  a file for the whole run before drawing any conclusion — and note the rig's
-  LAN segment has to be healthy first, or the flap is a confound. Worth doing
-  even though CMM is being retired: the SEC datapath under it is shared code.
-
 - [ ] **A142 — the interface-statistics offset field is too narrow for its own
   pool.** `cdx_init_stats` carves one MURAM region as 4 `cdx_pppoe_iface_ifinfo`
   followed by 124 `cdx_iface_ifinfo`, but the two pools index it with different
@@ -311,46 +218,6 @@ result independently of those temporary files.
   tell the pools apart. Fixing it means widening the fields, or numbering both
   pools in the same units, and touches the legacy encoder — not the flowtable
   path.
-
-- [ ] **A140.** A retiring flow clears `IPS_OFFLOAD` on a conntrack a newer
-  flow already owns, and the conntrack then dies under the live flow. Root
-  caused 2026-09-16 with temporary diagnostic printks at the offload
-  lifecycle transitions; 78 of 82 deaths in one run match the pattern exactly,
-  with no rate-limited output and full coverage of all 16,384 connections:
-
-  ```
-  teardown  86332 -> 90     old flow retires, conntrack cut to 90s
-  admit       119 -> 86400  new flow on the same tuple restores NF_CT_DAY
-  teardown  86399 -> 90     old flow's teardown clears IPS_OFFLOAD again
-  reap                      113s later, conntrack dead, live flow retired
-  ```
-
-  Closing and immediately reopening a tuple leaves two flows sharing one
-  conntrack for 0.22-2.59 seconds (median 0.48). `flow_offload_teardown`
-  (`net/netfilter/nf_flow_table_core.c`) clears `IPS_OFFLOAD_BIT` and calls
-  `flow_offload_fixup_ct` against `flow->ct` without checking whether that
-  conntrack still belongs to the flow being retired. The surviving flow is then
-  running on a conntrack `gc_worker` will not refresh — it tests bit 14, now
-  clear — and that traffic cannot refresh either, because the flow is forwarded
-  in hardware and no packet reaches `nft_flow_offload` to set the bit again. It
-  expires and `gc_dying` retires the live flow, which is why that cause
-  outweighed every other three to one.
-
-  Upstream defect, not ASK: no adapter code participates, and `gc_hw_invalid`,
-  `add_fail` and `del_blocked` are all zero or negligible. UDP-only because
-  `flow_offload_fixup_ct` leaves established TCP 431,880 seconds against UDP's
-  90, so a poisoned TCP conntrack is re-offloaded long before it expires.
-  Reproduces on any workload that reopens a tuple while its predecessor is
-  still retiring, which a client reconnecting from the same source port does.
-
-  Fix direction: make the conntrack offload bit owned. Record on the flow
-  whether its own admission set `IPS_OFFLOAD_BIT` (`nft_flow_offload`'s
-  `test_and_set_bit` returning zero), and let only that flow clear it and apply
-  the fixup. Raising `nf_conntrack_udp_timeout_stream` only widens the window
-  and is a mitigation, not a fix. Instrumentation, eliminated explanations and
-  the measurement traps are in
-  [the retirement investigation](docs/flowtable-retirement-investigation.md).
-  Artifacts: `/tmp/ask-flowtable-churn/askdbg3.txt` on `vision`.
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
@@ -434,21 +301,6 @@ each so the open bug list stays honest.
   era). To enable: add a transport-mode rig case and validate the path plus the
   AOFL-adjusted lengths before it ships.
 
-- [ ] **A141 — `tx_init()` is never called.** `cdx/control_tx.c:243` defines it
-  and `cdx/control_tx.h:54` declares it; nothing else in the tree references it.
-  Three consequences. `gDscpVlanPcpMapCtx.portid` keeps its BSS zero instead of
-  `NO_TX_PORT` (-1), so `cdx_get_tx_dscp_vlanpcp_map_enable(0)` reports a
-  DSCP-to-VLAN-PCP map enabled on portid 0 — harmless on gateway-dk only
-  because `config/gateway-dk/cdx_cfg.xml` assigns portids 1,4,5,6,7,9,10 and
-  never 0, but a board that used portid 0 would get a spurious priority tag on
-  every egress flow. `set_cmd_handler(EVENT_PKT_TX, M_tx_cmdproc)` never runs,
-  so `CMD_PORT_UPDATE` and the three `CMD_TX_DSCP_VLANPCP_MAP_*` FCI commands
-  return ERR_UNKNOWN_COMMAND. And `phy_port[i].id` is never seeded. To fix:
-  call `tx_init()` from the cdx init sequence alongside the other
-  `*_init()` handlers, then check whether anything depended on the current
-  portid-0 behaviour. Found while validating the VLAN encapsulation override,
-  whose tripwire is the first code to act on that map's state.
-
 - [ ] **A103 — fmlib PCD-modify / FrmReplic / VSPAlloc verbs.** fmlib omits the
   `DEV_TO_ID` handle→id conversion at several sites, so a userspace `t_Device *`
   is sent where the kernel now expects a cookie:
@@ -478,6 +330,48 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A158.** Multicast listener ceiling and replication across physical ports —
+  hardware validation completed 2026-09-21 on a rebuilt, staged and TFTP-booted
+  KASAN flowtable image. All four IPv4/IPv6 cases passed: eight exact hardware
+  copies, whole-group software fallback at nine, recovery to eight, and simultaneous
+  LAN/WAN replicas. Every expected receiver got all 256 sequences once per window;
+  no malformed copies or kernel reports, and teardown left no test routes or devices.
+  WAN replication uses the existing VLAN 3900 because this bench filters VLAN 320.
+  See [measurements and artifacts](docs/flowtable-multicast-routed.md#a158-hardware-completion--2026-09-21).
+
+- [x] **A189.** Routed bridge oifs omitted multicast router ports — fixed in kernel patch
+  161 and `ft_mr_expand_bridge()`: snapshot the live MDB/router union per protocol and
+  VLAN, deduplicate ports, and honour querier, forwarding and VLAN state. Router changes
+  refresh the set; the five-second worker covers unreported changes without rebuilding
+  unchanged chains. Unsupported/overflowing sets and failed replacements return the whole
+  stream to software. No router cache or additional device references. Validation:
+  154 ASan/UBSan snapshot scenarios, worker refresh/failure/device-removal/teardown cases,
+  ten rejected regression mutations, 158 host tests, ARM64 `-Werror` checks and a full
+  KASAN image build. The image was staged and booted for A158; its plain VLAN-oif
+  cases do not cover A189's bridge/router semantics, whose DUT validation remains pending.
+  See [routed multicast](docs/flowtable-multicast-routed.md#a189-follow-up--2026-09-21).
+
+- [x] **A140.** Repeated teardown of a retiring flow cleared a newer flow's conntrack
+  offload bit and shortened its timeout — fixed in _6e50c4f_: kernel patch 142 hands the
+  conntrack back only on the first `NF_FLOW_TEARDOWN` transition. The 16,384-connection
+  churn proof passed with zero conntracks reaped (82 before). Stale open entry archived
+  2026-09-21; the patch remains included by the kernel recipe.
+
+- [x] **A141.** The claim that `tx_init()` was never called was stale: current
+  `cdx_cmdhandler_init()` starts with `CMD_INIT(tx)`, which registers the TX handler,
+  seeds physical port IDs and sets `gDscpVlanPcpMapCtx.portid = NO_TX_PORT`.
+  Closed on source verification 2026-09-21; no code change needed.
+
+- [x] **A178.** moal could lose or double-complete scan requests during cancellation, timeout
+  and teardown — fixed in driver patch 0008: all accepted scans (including cached scans and
+  ACS) have an interface owner and generation under `scan_req_lock`; queued results carry
+  that generation. Request preparation failures reject without completing, and accepted
+  submission failures complete without also returning an error. Real timeouts complete even
+  when firmware recovery is suppressed. Cleanup drains timer and result work before queue or
+  interface removal, reset reopens admission, and competing firmware/cancel paths release the
+  scan semaphore once. Validation: 134 ASan/UBSan scenarios, nine rejected regression mutations,
+  155 host tests and full ARM64 `-Werror` Wi-Fi module build; DUT validation remains pending.
 
 - [x] **A177.** IPsec exit and partial-init unwind left PCD queues and seeded buffers live —
   fixed (this commit): separate allocated PCD queues from embedded SA queues; drain callbacks
@@ -820,6 +714,23 @@ file's git history.
   boot on eth4 rx>0 with static neighbors). Reopen if it recurs.
 
 ## Corrections to the original review (wontfix / not-a-bug)
+
+- [-] **A156 (wontfix, CMM retirement).** A failed legacy multicast UPDATE in
+  `cdx_update_mcast_group()` leaves listeners from earlier in the batch live,
+  so FCI receives failure while hardware keeps the partial update. Closed on
+  2026-09-21 under the CMM retirement decision: its callers are the IPv4/IPv6
+  FCI handlers and the legacy ADD-on-existing-group path. Flowtable ownership
+  rejects FCI dispatch in `comcerto_fpp_send_command()`. Both flowtable multicast
+  learners instead call `cdx_mc_group_replace()`, which builds the new chain
+  unpublished, frees it on build failure, and publishes only after all listeners
+  succeed. The legacy defect is retained until that control path is removed.
+
+- [-] **A155 (wontfix, CMM retirement).** One DUT reset was observed during a
+  CMM-owned IPsec UDP transfer (400 Mb/s, 1300-byte datagrams, WAN to LAN,
+  non-KASAN image). No console trace was captured, and the LAN segment was
+  flapping; the root cause remains unconfirmed. Closed by scope decision on
+  2026-09-21: CMM is being retired, so further legacy-mode reproduction and
+  repair are out of scope.
 
 - [-] **N20 (not a bug).** "Same-SPI reinstall blackholes the tunnel" was a test
   artifact — reinstalling one peer's SA rewinds ESP seq to 1, the other peer
