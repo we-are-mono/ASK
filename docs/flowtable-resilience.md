@@ -2,7 +2,8 @@
 
 Status: controller reconciliation, bounded nft execution, controller crash
 supervision, allocation-failure recovery, routed VLAN recovery and bridge VLAN
-membership recovery validated 2026-09-21–22; broader fault coverage remains planned.
+membership, route and next-hop recovery validated 2026-09-21–22; broader fault
+coverage remains planned.
 This document separates that implementation from the
 remaining recovery requirements. Hardware validation is recorded below.
 
@@ -381,6 +382,66 @@ Accumulated installs/deletes both reached 230, with 12 rearms retained and zero
 entries, flow references, VLAN records/slots or backend errors. Failslab settings,
 kernel taint and running binaries were unchanged, with no kernel splats.
 No reboot or counter reset was used.
+
+## Route and next-hop recovery — 2026-09-22
+
+The [service route tests](../tools/tests/test_flowtable_service_route.py) keep
+the shipping service running while one destination's route is withdrawn or
+its next hop stops answering ARP. The destination uses a loopback address in
+a LAN namespace reached through a distinct gateway address. Separate control
+TCP/UDP connections use the ordinary LAN path.
+
+Route withdrawal removes only the destination's host route. A preinstalled
+blackhole fallback prevents an unrelated default route from hiding the outage.
+Next-hop failure leaves routing unchanged, suppresses the gateway's ARP replies
+and requests a real neighbour probe. The test requires a failed or incomplete
+neighbour, then restores only ARP replies. It never inserts a neighbour entry
+to make recovery pass. The ARP suppression has an independent 15-second expiry.
+
+Each fault repeats three times. The affected hardware directions must retire
+within five seconds, and a six-second observation window must show no completed
+TCP records or validated UDP replies after allowing 200 ms for in-flight data.
+Control traffic must continue with its original hardware cookies and monotonic
+counters. The running service must preserve the missing prerequisite and leave
+the healthy admission table installed: zero policy reinstalls or global rearms
+are allowed throughout either case.
+
+Restoring the route or ARP replies must recover the original TCP/UDP sockets,
+with hardware readmission checks complete within 20 seconds and directional
+hardware proof within 40 seconds. The UDP receiver keeps its loss-tolerant
+window open while neighbour queues drain. Forbidden traffic remains blocked,
+a full health-check interval must pass without hardware churn, and a new TCP
+connection must offload after the final cycle. Teardown restores neighbour
+timers and removes the namespace, test routes and dynamically learned next hop.
+
+Both final DUT cases passed on the existing KASAN image in 321.44 seconds,
+with three cycles each and no product changes. All 243 host tests passed in
+94.57 seconds. The ranges below cover the three cycles of each fault:
+
+| Fault | Hardware retired | Admission checks complete | Directional hardware proof complete |
+| --- | ---: | ---: | ---: |
+| Route withdrawn | 0.41–0.43 s | 7.13–7.16 s | 15.30–15.35 s |
+| Next hop unreachable | 0.93–0.97 s | 1.67–2.63 s | 9.82–10.80 s |
+
+Retirement is measured from injection; recovery timings start after restoring
+the prerequisite and include the eight-second hardware proof window where
+applicable. Control cookies survived all cycles, with zero policy reinstalls
+or global rearms. TCP records remained intact, UDP loss was observed during
+the deliberate outages, and forbidden probes stayed blocked.
+
+An initial attempt failed during the final new-connection check when the LAN
+client received a DHCP NAK and lost its address for three seconds. Its six
+fault cycles had passed; the failed run and DHCP journal were retained. The
+final tests also count late validated UDP replies in the outage observer.
+
+Normal policy is resumed on the original boot
+`f9bfb4a5-1875-4e6e-b40d-e8572800e06c`. Installs/deletes both equal 322, with
+12 rearms retained from earlier tests and 12 each of route and neighbour
+invalidations retained across both attempts. Entries, handle/neighbour
+references, VLAN records/slots and backend errors are zero. Final audit found
+no test routes, next-hop entry or namespace, restored neighbour timers and
+unchanged failslab settings, running binaries and taint, with no kernel splats.
+There was no reboot or counter reset.
 
 ## Coverage before this slice
 

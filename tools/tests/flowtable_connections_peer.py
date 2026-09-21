@@ -43,6 +43,9 @@ class Flow:
         self.validate_udp = validate_udp
         self.capture_udp = capture_udp
         self.serial = 0
+        # Lifetime count of validated records, including late UDP replies.
+        # Fault tests inspect it while a transfer is still running.
+        self.received = 0
         self.reader = self.writer = self.sock = None
         self.wire = None
         self.stop = asyncio.Event()
@@ -113,6 +116,7 @@ class Flow:
                             assert ident == self.spec['id'] and first <= serial < self.serial
                             assert reply == payload(ident, serial, size)
                             late += 1
+                            self.received += 1
                         if self.wire:
                             while True:
                                 frame = await loop.sock_recv(self.wire, 65536)
@@ -122,6 +126,7 @@ class Flow:
                                     break
                 assert reply == data, (self.spec, self.serial, "corrupt, duplicate or misdirected echo")
                 received += 1
+                self.received += 1
             except (TimeoutError, OSError) as error:
                 if not allow_loss or (isinstance(error, OSError) and not isinstance(error, TimeoutError)
                                       and error.errno not in {errno.EHOSTUNREACH, errno.ENETUNREACH,
@@ -212,7 +217,8 @@ async def main(config):
                 elif op == "status":
                     result = {"running": len(running), "errors": {
                         ident: repr(task.exception()) for ident, task in running.items()
-                        if task.done() and not task.cancelled() and task.exception()}}
+                        if task.done() and not task.cancelled() and task.exception()},
+                        "received": {ident: flow.received for ident, flow in flows.items()}}
                 elif op == "neighbour":
                     flow = flows[command["ident"]]
                     with namespace(flow.spec):
