@@ -2338,6 +2338,34 @@ static int ceetm_quiesce_port(struct tQM_context_ctl *qm_ctx, uint32_t *detached
 		*detached |= 1U << ii;
 	}
 	qm_ctx->chnl_map &= ~*detached;
+	/* And take the sub-portal back out of CEETM mode, which is the other
+	 * half of what enabling it did and was missing entirely.
+	 *
+	 * Without this the port is dead the moment its tree is removed, in a
+	 * way that reads as healthy everywhere an operator would look:
+	 * dpa_disable_ceetm() above has already put the transmit path back on
+	 * the ordinary egress frame queues, and those live on the sub-portal's
+	 * dedicated channel -- which QMan stops servicing while CEETM mode is
+	 * set. qman_enqueue() succeeds, the driver counts the frame, tx_errors
+	 * stays zero, the link stays up, and nothing reaches the wire. Only a
+	 * reset clears it, because the sole other caller of the disable is
+	 * interface removal.
+	 *
+	 * After the drain, never before it. ceetm_drain_channel() prefers
+	 * normal transmission and polls the queues empty; clearing the bit
+	 * first stops the scheduler feeding the port, so every teardown would
+	 * burn the drain timeout per class queue and end in drain_failed,
+	 * which blacklists the channel from any later claim.
+	 *
+	 * The claims themselves are deliberately kept, so the same port can be
+	 * configured again without an interface event; only the mode goes.
+	 * The SDK's own CEETM qdisc pairs these two calls in ceetm_destroy()
+	 * for exactly this reason. */
+	if (qm_ctx->sp && qman_sp_disable_ceetm_mode(qm_ctx->sp->dcp_idx,
+						     qm_ctx->sp->idx)) {
+		ceetm_err("%s::qman_sp_disable_ceetm_mode failed\n", __func__);
+		ret = CEETM_FAILURE;
+	}
 	return ret;
 }
 

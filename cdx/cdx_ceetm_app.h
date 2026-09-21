@@ -137,4 +137,11 @@ int ceetm_exit(void);
 #endif
 
 extern int qman_sp_enable_ceetm_mode(enum qm_dc_portal portal, u16 sub_portal);
+/* Its pair, which this file needs and did not declare. Enabling CEETM mode on
+ * a Tx sub-portal moves its dequeues from the dedicated channel every ordinary
+ * egress frame queue of that port sits on, over to the LNI scheduler. Leaving
+ * it enabled after the scheduling tree is gone therefore strands the port: the
+ * software path is put back on those frame queues, QMan accepts every enqueue
+ * and nothing ever dequeues them. */
+extern int qman_sp_disable_ceetm_mode(enum qm_dc_portal portal, u16 sub_portal);
 #endif

@@ -165,6 +165,19 @@ static void *kzalloc(size_t size, int flags)
     p = calloc(1, size); assert(p); allocations++; return p;
 }
 static void kfree(void *p) { if (p) { assert(allocations); allocations--; free(p); } }
+/* CEETM mode on a Tx sub-portal, which is a register bit rather than a claim.
+ * Counted both ways so a teardown that leaves it set is visible here rather
+ * than only on hardware, where it presents as a port that accepts frames,
+ * counts them and transmits nothing. */
+static int sp_ceetm_mode;
+static int qman_sp_enable_ceetm_mode(int portal, uint16_t sp)
+{
+    (void)portal; (void)sp; sp_ceetm_mode++; return 0;
+}
+static int qman_sp_disable_ceetm_mode(int portal, uint16_t sp)
+{
+    (void)portal; (void)sp; sp_ceetm_mode--; return 0;
+}
 static int qman_alloc_ceetm0_channel(unsigned *id)
 {
     if (hw_step()) return -ENOSPC;
