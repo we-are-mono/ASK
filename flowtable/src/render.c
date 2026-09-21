@@ -95,7 +95,15 @@ int ft_render(struct ft_ctx *ctx, const struct ft_policy *p,
 	emit(&o, " }; flags offload; }\n");
 	emit(&o, " chain admit {\n");
 	emit(&o, "  type filter hook forward priority 10; policy accept;\n");
-	emit(&o, "  meta nfproto != ipv4 return\n");
+	/* Both families. The adapter has carried IPv6 since the increment that
+	 * followed this line being written, and the supported scope has said so
+	 * ever since -- but this gate was never widened, so a box running the
+	 * default-on service offloaded no IPv6 at all, in any topology, and
+	 * nothing noticed: every IPv6 test writes an nft table of its own and
+	 * never renders this chain. An address-scoped match below stays IPv4 by
+	 * construction and simply will not match a v6 flow, which is the right
+	 * answer until a match can name its family. */
+	emit(&o, "  meta nfproto != { ipv4, ipv6 } return\n");
 	emit(&o, "  meta l4proto != { tcp, udp } return\n");
 	emit(&o, "  ct direction != original return\n");
 	emit(&o, "  ct state != established return\n");

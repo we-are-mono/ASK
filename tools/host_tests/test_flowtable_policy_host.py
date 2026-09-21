@@ -142,6 +142,21 @@ def test_render_is_offload_only_and_clean(engine):
     assert "ct status snat" not in rules and "ct status dnat" not in rules
 
 
+def test_render_admits_both_address_families(engine):
+    """The family gate must not exclude IPv6.
+
+    It did, for five days after the adapter grew IPv6, and no test caught it:
+    every IPv6 test on the rig writes an nft table of its own and never renders
+    this chain, so the one path a shipped box actually uses -- the default-on
+    service, with no configuration at all -- offloaded IPv4 and silently
+    nothing else. The profile tests were the first to drive IPv6 through the
+    rendered policy and the first to see it.
+    """
+    rules = render(engine, BASE)
+    assert "  meta nfproto != { ipv4, ipv6 } return" in rules.splitlines()
+    assert "meta nfproto != ipv4 return" not in rules
+
+
 def test_render_port_per_bridge_binds_each(engine):
     conf = "devices pppoe-wan br-lan br-guest br-iot\nscope any\n"
     line = next(l for l in render(engine, conf).splitlines() if "flowtable fast" in l)
