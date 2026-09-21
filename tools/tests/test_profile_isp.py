@@ -275,9 +275,25 @@ async def _build_clients(ctx):
     next run as a name collision rather than as the failure it is.
     """
     setup = f'''
-import pathlib, subprocess
+import pathlib, subprocess, time
 clients = {CLIENTS!r}
 def run(*args): subprocess.run(args, check=True, capture_output=True, text=True)
+
+# Anything a previous run left behind, before asserting the wire is clean.
+#
+# A listener started detached outlives a run that aborted, and while it lives
+# it holds its network namespace open -- `ip netns del` only unlinks the name.
+# The macvlan inside that namespace therefore keeps its MAC registered against
+# the lower device, and the next run's client cannot take the same one: the
+# failure is "Address already in use" on a host where `ip netns list` is empty
+# and `ip link` shows nothing. Measured, not imagined; it is how this fixture
+# first failed on the rig.
+subprocess.run(['pkill', '-9', '-f', '/tmp/ask_profile_isp_'], capture_output=True)
+for c in clients:
+    subprocess.run(['ip', 'netns', 'del', c['netns']], capture_output=True)
+    subprocess.run(['ip', 'link', 'del', c['iface']], capture_output=True)
+time.sleep(0.5)
+
 for c in clients:
     assert not pathlib.Path('/var/run/netns/' + c['netns']).exists(), c['netns']
     assert not pathlib.Path('/sys/class/net/' + c['iface']).exists(), c['iface']
