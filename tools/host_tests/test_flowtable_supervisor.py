@@ -153,9 +153,9 @@ def test_stale_pid_files_never_signal_unrelated_process(running):
             unrelated.terminate()
 
 
-def test_inactive_owner_suppresses_respawn_but_allows_stop(running):
+def test_absent_cdx_suppresses_respawn_but_allows_stop(running):
     c = running
-    (c.root / "owner").write_text("cmm\n")
+    (c.root / "cdx").rmdir()
     os.kill(worker(c), signal.SIGKILL)
     c.wait(lambda: worker(c) == 0)
     time.sleep(0.5)

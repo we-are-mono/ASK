@@ -19,8 +19,6 @@ from test_flowtable_tcp import (cpu, cpu_delta, software_tx,
                                test_flowtable_tcp_retransmit_withdraw_rst as _tcp)
 from test_flowtable_tcp_snat import tcp_snat  # noqa: F401
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 ADDRESS, REPLACEMENT, ENDPOINT = "198.18.40.1", "198.18.40.3", "198.18.40.2"
 
 

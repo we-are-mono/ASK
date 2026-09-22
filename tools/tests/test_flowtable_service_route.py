@@ -18,8 +18,6 @@ from test_flowtable_selective_neighbour import hardware, keys, unchanged, warm
 from test_flowtable_service import FIRST, managed_service, service_status, supervision_status
 from test_flowtable_service_vlan import attempts, balanced, denied, received
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires the flowtable service on the DUT")
 NETNS, LAN_IF = "ask-ft-service-route", "askftroute"
 ADDRESS, NETWORK = "172.29.87.2", "172.29.87.0/24"
 NEXT_HOP = "198.18.87.2"

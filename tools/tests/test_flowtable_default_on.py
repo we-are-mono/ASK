@@ -10,16 +10,11 @@ normal default-on state.
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 
 import pytest
 
 from ask_orch.uart import Console
-from test_flowtable_offload import ARTIFACTS, console_command, flowtable_json, read, rig  # noqa: F401
-
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
+from test_flowtable_offload import ARTIFACTS, console_command, console_json, flowtable_json, rig  # noqa: F401
 
 INIT = "/etc/init.d/ask-flowtable"
 DAEMON = "/usr/sbin/ask-flowtable"
@@ -30,20 +25,16 @@ async def _status(con):
     return await flowtable_json(con, "status")
 
 
-async def test_boot_service_offloads_by_default(target_agent, aiohttp_session):
+async def test_boot_service_offloads_by_default():
     with Console.target(log_path=str(ARTIFACTS / "default-on-uart.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
-
-        owner = (await read(target_agent, aiohttp_session,
-                            "/sys/module/cdx/parameters/offload_owner")).strip()
-        assert owner == "flowtable", "boot ask.offload=flowtable first"
 
         # Zero-config: the shipped default parses and is the catch-all. (Its
         # `check` hash covers the unresolved "devices auto"; the installed
         # table's marker is the resolved-device hash, so the two differ by
         # design and are not compared here.)
         shipped = await console_command(con, DAEMON, "check", "--config", DEFAULT_CONF)
-        assert json.loads(shipped["stdout"])["policy_hash"], shipped
+        assert console_json(shipped["stdout"])["policy_hash"], shipped
 
         # (Re)start the boot service — idempotent, and the point of the test is
         # that starting it is the *whole* configuration.
@@ -65,5 +56,4 @@ async def test_boot_service_offloads_by_default(target_agent, aiohttp_session):
         # every up CDX physical port is bound — with no configuration.
         assert status["policy_hash"] and len(status["policy_hash"]) == 64, status
         assert status["backend"]["bindings"] >= 2, status
-        assert status["backend"]["owner"] == "flowtable", status
         assert not status["backend"]["fatal"] and not status["backend"]["invalidated"], status

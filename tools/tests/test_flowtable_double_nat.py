@@ -1,7 +1,6 @@
 """Combined IPv4 NAT across ports and hairpin routing on one physical port."""
 import asyncio
 import json
-import os
 import re
 
 import pytest
@@ -17,8 +16,6 @@ from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command,
 from test_flowtable_policy import CONFIG, apply, candidate, stop
 from test_flowtable_tcp import software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 GATEWAY = "198.18.42.1"
 CLIENT = {"netns": "ask-ft-hairpin-client", "iface": "askfthc", "lan": "198.18.42.2", "mac": "02:9d:99:b2:42:02"}
 SERVER = {"netns": "ask-ft-hairpin-server", "iface": "askfths", "lan": "198.18.42.3", "mac": "02:9d:99:b2:42:03"}

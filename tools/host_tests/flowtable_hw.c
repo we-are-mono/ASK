@@ -444,19 +444,13 @@ static void test_backend(void)
     struct cdx_ft_stats_binding stats = {};
     expected_proto = IPPROTO_UDP;
     cdx_info->ctrl.mutex = false;
-    assert(!cdx_flowtable_enabled() && !cdx_flowtable_config_sealed());
-    assert(cdx_flowtable_mode_check() == 0);
-    ft_observe=true; assert(cdx_flowtable_mode_check() == -EINVAL); ft_observe=false;
-    offload_owner="wrong"; assert(cdx_flowtable_mode_check() == -EINVAL); offload_owner="cmm";
-    assert(cdx_flowtable_guard_init() == 0 && !notifier_registered);
-    cdx_flowtable_guard_exit();
-    offload_owner="flowtable"; fail_notifier=true;
+    assert(!cdx_flowtable_config_sealed() && !cdx_ft_observing());
+    fail_notifier=true;
     assert(cdx_flowtable_guard_init() == -ENOMEM && !ft_guard_registered);
     cdx_flowtable_guard_exit(); fail_notifier=false;
     assert(cdx_flowtable_guard_init() == 0 && notifier_registered);
     struct netdev_notifier_info info = {&out};
     assert(cdx_ft_netdev_event(NULL, NETDEV_PRE_UP, &info) == NOTIFY_DONE);
-    offload_owner="cmm";
     cdx_ft_begin();
     /* A statistics slot is backend-owned like anything else it hands out, so
      * it is refused before the claim. Freeing nothing is always a no-op,
@@ -468,10 +462,9 @@ static void test_backend(void)
         cdx_ft_stats_free(&slot);
         assert(!ifstats_taken);
     }
-    assert(cdx_ft_claim() == -EOPNOTSUPP && !cdx_flowtable_config_sealed());
-    offload_owner="flowtable";
-    assert(cdx_flowtable_mode_check() == 0 && !cdx_ft_observing());
-    legacy_pending=1; assert(cdx_ft_claim() == -EBUSY); legacy_pending=0;
+    legacy_pending=1;
+    assert(cdx_ft_claim() == -EBUSY && !cdx_flowtable_config_sealed());
+    legacy_pending=0;
     assert(cdx_ft_claim() == 0 && cdx_flowtable_config_sealed());
     assert(cdx_ft_claim() == -EBUSY);
     /* The pool itself, through the backend's ownership check: one record at a

@@ -1,6 +1,6 @@
 # Static UDP SNAT: history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md) · [History index](README.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md) · [History index](README.md)
 
 Forced translation, endpoint checksums, route recovery and live software fallback.
 
@@ -19,7 +19,7 @@ sequence against both tuples and passes complete match/translated tuples through
 the private backend API. CDX's standalone directional entry supplies the existing
 encoder with an inverse translated twin; the legacy encoder and proprietary
 firmware are unchanged. TCP NAT, MASQUERADE, DNAT and double/hairpin NAT remain
-outside hardware eligibility. See the [NAT contract](../../flowtable-nat.md).
+outside hardware eligibility. See the [NAT contract](../nat.md).
 
 Reply neighbour lookup now uses the translated LAN destination. Route-prefix
 retirement watches each direction's translated destination and match source,

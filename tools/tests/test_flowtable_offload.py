@@ -1,7 +1,6 @@
-"""Opt-in, CMM-independent IPv4/UDP flowtable acceptance on the real DUT.
+"""IPv4/UDP flowtable acceptance on the real DUT.
 
-Boot ask.offload=flowtable, then ASK_FLOWTABLE_TESTS=1 make ask-test
-ASK_TEST_ARGS='-k flowtable_offload'. Normal legacy runs skip these tests.
+Run with make ask-test ASK_TEST_ARGS='-k flowtable_offload'.
 Healthy invalidation can recover after complete flowtable detachment. Terminal
 failure tests still require a fresh boot before using ASK again.
 """
@@ -30,8 +29,6 @@ from ask_orch.counters import kernel_tx_packets
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, kernel_rx_packets, lan_run_python
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 WAN_IP = os.environ.get("ASK_WAN_IPERF_IP", "10.0.0.141")
 SPORT = int(os.environ.get("ASK_FLOWTABLE_SPORT", "48270"))
 DPORT = int(os.environ.get("ASK_FLOWTABLE_DPORT", "48271"))
@@ -50,8 +47,8 @@ async def read(agent, session, path):
     return bytes.fromhex(result["content_hex"]).decode()
 
 
-async def command(agent, session, *argv, check=True):
-    result = await agent.exec_cmd(session, list(argv), timeout_ms=15000)
+async def command(agent, session, *argv, check=True, timeout_ms=15000):
+    result = await agent.exec_cmd(session, list(argv), timeout_ms=timeout_ms)
     if check:
         assert result["rc"] == 0, result
     return result
@@ -122,17 +119,29 @@ async def console_command(console, *argv, check=True, timeout=20, resync=False):
     return {"rc": result.rc, "stdout": stdout}
 
 
-async def flowtable_json(console, *args):
-    """Decode controller JSON while retaining unrelated UART noise as errors.
+# Other writers share the UART with our command: the managed service's
+# console-fallback log lines, and kernel messages at console level (failslab
+# stack dumps, the Wi-Fi driver logging a client associating with the test
+# AP, and printk's own "messages dropped" notice when it falls behind). Each is
+# a whole line, but it can start anywhere, including in the middle of the
+# controller's JSON, so it is removed wherever it lands. None of these shapes
+# can occur inside that JSON.
+CONSOLE_NOISE = re.compile(
+    r"(?:(?:ask-flowtable\[\d+\]: |\[\s*\d+\.\d+\] )[^\n]*|\*\* \d+ printk messages dropped \*\*)\r?\n?")
 
-    Managed-service diagnostics use a console fallback on this image. Those
-    complete log lines can arrive inside our command's output markers; the
-    raw UART transcript still records them for diagnosis.
+
+def console_json(text):
+    """Decode controller JSON from UART output, minus interleaved console lines.
+
+    The raw UART transcript still records those lines for diagnosis.
     """
+    return json.loads(CONSOLE_NOISE.sub("", text))
+
+
+async def flowtable_json(console, *args):
+    """Run the controller over the UART and decode its JSON."""
     result = await console_command(console, "/usr/sbin/ask-flowtable", *args)
-    lines = [line for line in result["stdout"].splitlines()
-             if not re.fullmatch(r"ask-flowtable\[\d+\]: .*", line)]
-    return json.loads("\n".join(lines))
+    return console_json(result["stdout"])
 
 
 async def console_python(console, script, *, timeout=20, attempts=3):
@@ -258,9 +267,12 @@ class Rig:
         if hardware:
             await self.wait(lambda s: s["bindings"] == 2)
 
-    async def delete_table(self):
-        await command(self.target, self.session, "nft", "delete", "table", "inet", TABLE, check=False)
-        return await self.wait(lambda s: not s["bindings"] and not s["entries"])
+    async def delete_table(self, timeout=10):
+        # Unbinding retires every hardware entry one delete at a time before
+        # nft returns, so a caller holding a full table passes a longer bound.
+        await command(self.target, self.session, "nft", "delete", "table", "inet", TABLE,
+                      check=False, timeout_ms=max(15000, timeout * 1000))
+        return await self.wait(lambda s: not s["bindings"] and not s["entries"], timeout=timeout)
 
     async def clear_ct(self):
         await command(self.target, self.session, "conntrack", "-D", "-p", self.proto,
@@ -383,17 +395,11 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
         await asyncio.to_thread(_con.login, "root", None)
         await console_command(_con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)
     initial = await r.state()
-    assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     # The adapter's error count is cumulative for the boot and deliberately
     # never reset, so whatever earlier tests already accounted for is this
     # test's floor. Only errors raised from here are its own.
     HEALTH_BASELINE["errors"] = initial["errors"]
-    assert "auto_bridge " not in await read(r.target, r.session, "/proc/modules")
-    # The daemon pidfile is absent on a clean experimental boot; also inspect
-    # the command line of any stale pidfile rather than treating it as proof.
-    pid = await r.target.fs_read(r.session, "/var/run/cmm.pid")
-    assert pid["errno"] != 0, "CMM must never have started in this boot"
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     cleanup = []
     transport = None
@@ -522,22 +528,6 @@ async def test_flowtable_offload_long_exchange(rig):
 async def test_flowtable_offload_reference_and_lifecycle(rig):
     r = rig
     from _ioctl import CDX_CTRL_DPA_SET_PARAMS, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
-    from test_fci_netlink_caps import _nl_header_and_err
-    # Flowtable boots do not load FCI. Load it only for the negative legacy
-    # ownership check, then restore the boot's module state before traffic.
-    fci_present = any(line.startswith("fci ") for line in
-                      (await read(r.target, r.session, "/proc/modules")).splitlines())
-    with Console.target(log_path=str(ARTIFACTS / "reference-fci-uart.log")) as con:
-        await asyncio.to_thread(con.login, "root", None)
-        try:
-            if not fci_present:
-                await console_command(con, "modprobe", "fci")
-            for fcode in [0xFFFF, 0x0316]:  # unknown command and IPv4 reset
-                reply = await r.target.fci_send(r.session, fcode=fcode, length=0)
-                assert _nl_header_and_err(reply) == (2, -errno.EOPNOTSUPP), reply
-        finally:
-            if not fci_present:
-                await console_command(con, "rmmod", "fci")
     reply = await r.target.ioctl_send(r.session, "/dev/cdx_ctrl", CDX_CTRL_DPA_SET_PARAMS,
                                      bytes(SIZEOF_CDX_CTRL_SET_DPA_PARAMS))
     assert reply["errno"] == errno.EOPNOTSUPP, reply
@@ -954,11 +944,6 @@ async def test_flowtable_offload_terminal(rig):
     r.recovery_console = Console.target(log_path=str(ARTIFACTS / "terminal-uart.log"))
     con = r.recovery_console
     await asyncio.to_thread(con.login, "root", None)
-    # FCI depends on CDX, but has no active controller in this boot. Remove
-    # that dependency before the measured CDX unload; never force removal.
-    if any(line.startswith("fci ") for line in
-           (await read(r.target, r.session, "/proc/modules")).splitlines()):
-        await console_command(con, "rmmod", "fci")
     await r.table()
     await r.exchange(128)
     initial = await r.wait(lambda s: s["entries"] == 2)

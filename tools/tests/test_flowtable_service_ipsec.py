@@ -30,8 +30,6 @@ from test_flowtable_tcp import software_tx
 from test_flowtable_tunnel import Capture
 from test_ipsec_inbound_flow_offload import crypto, sec_counter
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires the flowtable service on the DUT")
 INNER = "198.18.102.2"
 LAN_INNER = "198.18.102.3"
 REQIDS = {"out": "49301", "in": "49302"}

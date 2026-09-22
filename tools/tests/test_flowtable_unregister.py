@@ -82,7 +82,7 @@ print(json.dumps({{'device': str(device), 'name': device.name, 'driver': str(dri
     finally:
         try:
             await console_command(con, "nft", "delete", "table", "inet", TABLE, check=False)
-            for module in ("ask_flowtable", "fci", "cdx"):
+            for module in ("ask_flowtable", "cdx"):
                 present = await console_command(con, "test", "-e", "/sys/module/" + module, check=False)
                 if present["rc"] == 0:
                     await console_command(con, "rmmod", module, timeout=25)

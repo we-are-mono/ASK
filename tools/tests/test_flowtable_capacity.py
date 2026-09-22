@@ -18,11 +18,15 @@ from test_flowtable_connections import by_key, healthy, peer
 from test_flowtable_offload import DPORT, TABLE, WAN_IP, command, read, rig, status_text  # noqa: F401
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 CAPACITY = 32768
 CONNECTIONS = CAPACITY // 2
 REPLACEMENTS = 256
+# Detaching a full table retires every hardware entry serially before nft
+# returns: 13.7 s on 2026-09-21, 14.6 s isolated and over 15 s mid-suite on
+# 2026-09-22 (KASAN). The wait is generous; the bound is what is asserted, at
+# about twice the measured time.
+DETACH_SECONDS = 60
+DETACH_BOUND_SECONDS = 30
 # Keep explicit data sockets below the lab's ephemeral port range, so opening
 # thousands of sockets cannot collide with the active control connection.
 BASE = 20000
@@ -329,12 +333,16 @@ async def test_flowtable_capacity_overflow_and_reuse(rig):
             record_delivery(r, p, "capacity-regenerated-transfers", reports)
             # Exercise whole-table detachment while every socket is still open.
             started = time.monotonic()
-            final = await r.delete_table()
+            final = await r.delete_table(timeout=DETACH_SECONDS)
+            detach = time.monotonic() - started
+            r.record("capacity-drain", {"state": final, "seconds": detach,
+                                       "memory_drained": await read(r.target, r.session, "/proc/meminfo")})
             assert final["installs"] == final["deletes"]
             assert all(final[k] == 0 for k in ("entries", "handle_refs", "neighbour_refs", "quarantine", "errors"))
             assert socket_drops(receiver) == 0, "generator UDP receive queue overflow"
-            r.record("capacity-drain", {"state": final, "seconds": time.monotonic() - started,
-                                       "memory_drained": await read(r.target, r.session, "/proc/meminfo")})
+            # The retirement holds CDX's control mutex throughout, so its
+            # length is a property to bound, not only to wait out.
+            assert detach < DETACH_BOUND_SECONDS, detach
     finally:
         try:
             records = {}
@@ -346,7 +354,7 @@ async def test_flowtable_capacity_overflow_and_reuse(rig):
             r.record("capacity-final-state", await r.state())
             failures = []
             try:
-                await r.delete_table()
+                await r.delete_table(timeout=DETACH_SECONDS)
             except Exception as error:
                 failures.append(str(error))
             for proto in ("udp", "tcp"):

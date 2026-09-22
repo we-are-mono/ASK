@@ -2,7 +2,7 @@
 
 The adapter admission budget moves directly from 64 to **32,768 directional
 entries**, enough for **16,384 fully accelerated connections**. No intermediate
-production limits are introduced. The [capacity guide](../../flowtable-capacity.md)
+production limits are introduced. The [capacity guide](../capacity.md)
 records the resource rationale, implementation and reproduction command.
 
 ## Implementation and image
@@ -166,7 +166,7 @@ Earlier failed attempts remain under `/tmp/ask-flowtable-capacity/`:
   the earlier link errors or claimed fixed.
 
 The Loki link was temporarily advertised at 1 Gb/s for the capacity proof.
-These observations extend the [UDP/link investigation](../../flowtable-udp-loss-investigation.md).
+These observations extend the [UDP/link investigation](../udp-loss-investigation.md).
 The operator identified the cable-heavy homelab as an environment where small
 errors should not displace the main work. No controlled component-isolation
 experiment was performed and no cause or permanent link fix is claimed.

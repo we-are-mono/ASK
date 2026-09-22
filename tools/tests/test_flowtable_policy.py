@@ -4,19 +4,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import os
-
-import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import FLOWS, SPORT, by_key, connections, peer  # noqa: F401
-from test_flowtable_offload import ARTIFACTS, DPORT, WAN_IP, console_command, console_python, rig  # noqa: F401
+from test_flowtable_offload import (ARTIFACTS, DPORT, WAN_IP, command, console_command,  # noqa: F401
+                                    console_json, console_python, rig)
 from test_flowtable_selective_neighbour import hardware, keys, warm
 from test_flowtable_tcp import software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 CONFIG = "/tmp/ask-flowtable-test.conf"
 
 # The offload engine is the C ask-flowtable daemon; the hardware-drain fields it
@@ -82,7 +78,7 @@ async def expected_hash(con, policy):
     scratch = "/tmp/ask-flowtable-hash.conf"
     await console_python(con, f"from pathlib import Path\nPath({scratch!r}).write_text({policy_to_conf(policy)!r})\n")
     result = await console_command(con, "/usr/sbin/ask-flowtable", "check", "--config", scratch)
-    return json.loads(result["stdout"])["policy_hash"]
+    return console_json(result["stdout"])["policy_hash"]
 
 
 async def apply(con, policy, *, check=True, r=None):
@@ -101,20 +97,29 @@ async def apply(con, policy, *, check=True, r=None):
     result = await console_command(con, "/usr/sbin/ask-flowtable", "apply", "--config", CONFIG,
                                    check=check, timeout=40)
     if check:
-        result = json.loads(result["stdout"])
+        result = console_json(result["stdout"])
         assert all(result["drained"][k] == 0 for k in DRAIN_FIELDS), result
     return result
 
 
 async def stop(con):
     result = await console_command(con, "/usr/sbin/ask-flowtable", "stop", timeout=40)
-    state = json.loads(result["stdout"])["drained"]
+    state = console_json(result["stdout"])["drained"]
     assert all(state[k] == 0 for k in DRAIN_FIELDS), state
 
 
 async def installed(con):
     result = await console_command(con, "/usr/sbin/ask-flowtable", "status")
-    return json.loads(result["stdout"])
+    return console_json(result["stdout"])
+
+
+async def policy_table_handle(r):
+    """The kernel's handle for the controller's table. Replacing the installed
+    generation creates a new table, so a changed handle means it was replaced."""
+    listing = json.loads((await command(r.target, r.session, "nft", "-j", "list", "tables"))["stdout"])
+    return next((item["table"]["handle"] for item in listing["nftables"]
+                 if item.get("table", {}).get("family") == "inet"
+                 and item["table"].get("name") == "ask_flowtable"), None)
 
 
 async def test_flowtable_policy_revokes_live_connections(connections):
@@ -151,6 +156,8 @@ async def test_flowtable_policy_revokes_live_connections(connections):
                 before_tcp = await software_tx(r)
                 tcp = await p.batch([1], 256, 0.015625)
                 after_tcp, accelerated = await software_tx(r), await r.state()
+                generation = await policy_table_handle(r)
+                assert generation is not None, "the controller's table is missing"
                 tcp_tx = {d: after_tcp[d] - before_tcp[d] for d in before_tcp}
                 assert tcp_tx[TARGET_LAN_IF] <= 64 and tcp_tx[TARGET_WAN_IF] <= 512, tcp_tx
                 for key in keys([1], flows):
@@ -161,11 +168,23 @@ async def test_flowtable_policy_revokes_live_connections(connections):
                 r.record("policy-exclusion-revoked-existing-udp", {"apply": result, "state": accelerated,
                          "udp": udp, "tcp": tcp, "udp_software_tx": tx, "tcp_software_tx": tcp_tx})
 
-                # Schema errors leave the installed generation untouched.
+                # Schema errors leave the installed generation untouched: the
+                # same table, still bound, never drained or rearmed, from the
+                # snapshot above through the status/check reads and the
+                # rejected apply. Install and delete counts are not that proof
+                # -- the fixture ages flows out after 5 s idle, and the TCP
+                # connection is idle here, so a legitimate expiry can retire
+                # its entries meanwhile. Nothing can install without traffic.
+                before = accelerated
                 rejected = await apply(con, {**policy, "enabled": "maybe"}, check=False, r=r)
                 assert rejected["rc"] != 0 and "yes or no" in rejected["stdout"], rejected
                 held = await r.state()
-                assert held["installs"] == accelerated["installs"] and held["deletes"] == accelerated["deletes"]
+                moved = {k: (before[k], held[k]) for k in held if k != "flows" and before.get(k) != held[k]}
+                assert await policy_table_handle(r) == generation, moved
+                assert held["bindings"] == before["bindings"] and held["installs"] == before["installs"], moved
+                assert all(held[k] == before[k] for k in held
+                           if k in ("rearms", "invalidated", "fatal") or k.endswith("_invalidations")), moved
+                assert held["deletes"] - before["deletes"] <= before["entries"], moved
                 assert (await installed(con))["policy_hash"] == await expected_hash(con, excluded)
                 await apply(con, policy, r=r)
                 await warm(r, p, [0, 1], "policy-exclusion-removed", flows)

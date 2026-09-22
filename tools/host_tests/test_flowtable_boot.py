@@ -1,4 +1,4 @@
-"""Exercise boot ownership selection using the installed module-loader script."""
+"""Exercise the installed module-loader and flowtable service scripts."""
 import os
 from pathlib import Path
 import shlex
@@ -9,18 +9,22 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+LOADED = ["cdx flowtable_observe=0 ask_debug=1", "ask_flowtable", "nf_conntrack"]
+
+
 @pytest.mark.parametrize("cmdline,fail,expected,rc", [
-    ("", "", ["cdx offload_owner=cmm flowtable_observe=0 ask_debug=1", "fci", "auto_bridge"], 0),
-    ("ask.offload=flowtable", "", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=1", "ask_flowtable"], 0),
-    ("ask.offload=flowtable ask.flowtable_observe=1", "", ["cdx offload_owner=flowtable flowtable_observe=1 ask_debug=1", "ask_flowtable"], 0),
-    ("ask.offload=flowtable ask.debug=0", "", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=0", "ask_flowtable"], 0),
-    ("ask.offload=flowtable", "ask_flowtable", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=1", "ask_flowtable"], 1),
-    ("ask.offload=flowtable", "cdx", ["cdx offload_owner=flowtable flowtable_observe=0 ask_debug=1"], 1),
-    ("ask.offload=invalid", "", [], 1),
+    ("", "", LOADED, 0),
+    # The retired owner switch may linger in a boot environment; it selects nothing.
+    ("ask.offload=cmm", "", LOADED, 0),
+    ("ask.flowtable_observe=1", "", ["cdx flowtable_observe=1 ask_debug=1", *LOADED[1:]], 0),
+    ("ask.debug=0", "", ["cdx flowtable_observe=0 ask_debug=0", *LOADED[1:]], 0),
+    ("", "ask_flowtable", LOADED[:2], 1),
+    ("", "cdx", LOADED[:1], 1),
+    ("ask.flowtable_observe=2", "", [], 1),
 ])
 def test_flowtable_boot_modules(tmp_path, cmdline, fail, expected, rc):
     conf, boot, log = (tmp_path / name for name in ("modules", "cmdline", "calls"))
-    conf.write_text("# dependencies first\n\ncdx\nfci\nauto_bridge\n")
+    conf.write_text("# dependencies first\n\ncdx\nnf_conntrack\n")
     boot.write_text(cmdline + "\n")
     log.touch()
     probe = tmp_path / "modprobe"
@@ -44,15 +48,13 @@ def test_flowtable_boot_modules(tmp_path, cmdline, fail, expected, rc):
     ("reload", 0, ["resume", "service-start"], 0),
 ])
 def test_flowtable_service_preserves_authority_and_stop_errors(tmp_path, verb, stop_rc, expected, rc):
-    log, owner = tmp_path / "calls", tmp_path / "owner"
-    owner.write_text("flowtable\n")
+    log = tmp_path / "calls"
     daemon = tmp_path / "daemon"
     daemon.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$CALLS"\n'
                       'if [ "$1" = service-stop ]; then exit "$STOP_RC"; fi\n')
     daemon.chmod(0o755)
     service = tmp_path / "service"
     text = (ROOT / "meta-ask/recipes-ask/config/files/S50ask-flowtable").read_text()
-    text = text.replace("/sys/module/cdx/parameters/offload_owner", str(owner))
     text = text.replace("DAEMON=/usr/sbin/ask-flowtable", "DAEMON=" + shlex.quote(str(daemon)))
     text = text.replace("PIDFILE=/var/run/ask-flowtable.pid", "PIDFILE=" + shlex.quote(str(tmp_path / "pid")))
     service.write_text(text)

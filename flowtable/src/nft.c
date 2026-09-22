@@ -1,4 +1,4 @@
-/* nft process I/O, table ownership inspection, single-flight lock, owner param.
+/* nft process I/O, table ownership inspection, single-flight lock.
  * Shells out to the shipped `nft` (no libnftnl). SPDX-License-Identifier: GPL-2.0+ */
 #include "runtime.h"
 #include <stdio.h>
@@ -114,15 +114,3 @@ int ft_lock(struct ft_ctx *ctx, int timeout_ms)
 	return ft_path_lock(ctx, FT_LOCK, timeout_ms);
 }
 
-void ft_offload_owner(char out[16])
-{
-	FILE *f = fopen(FT_OWNER_PARAM, "r");
-	out[0] = '\0';
-	if (!f)
-		return;
-	if (fgets(out, 16, f)) {
-		char *nl = strpbrk(out, "\r\n");
-		if (nl) *nl = '\0';
-	}
-	fclose(f);
-}

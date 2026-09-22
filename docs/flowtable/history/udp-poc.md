@@ -1,6 +1,6 @@
 # UDP PoC and initial recovery: history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md) · [History index](README.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md) · [History index](README.md)
 
 First hardware proof, terminal lifecycle and healthy global recovery.
 
@@ -65,7 +65,7 @@ investigation isolated the stuck branch to the FLEXOPTIX DAC's mux channel;
 unplugging and reinserting the DAC restored both modules, and a normal reboot
 passed the board self-tests. The original trigger remains unresolved.
 
-The [follow-up UDP investigation](../../flowtable-udp-loss-investigation.md)
+The [follow-up UDP investigation](../udp-loss-investigation.md)
 reproduced losses on this exact final image with I2C healthy. It recorded one
 ordinary-routing loss with an X550 receive CRC error, and hardware losses
 counted by the DUT's LAN transmit MAC without a corresponding LAN reply or

@@ -95,7 +95,7 @@ MODULE_PARM_DESC(flowtable_fail_stage, "One-shot add failure: 1 before allocatio
  * and hardware paths can share: an offloaded flow produces no skb, so nothing
  * a tc filter decides can reach it. Reading it here keeps one source of truth.
  *
- * Both are boot-immutable, like offload_owner, because a mask that changed
+ * Both are boot-immutable because a mask that changed
  * under live flows would leave already-installed entries encoding a layout
  * nothing else still agrees with.
  *
@@ -372,7 +372,7 @@ static void ft_devices_put(const struct cdx_ft_rule *rule)
 /* What the firmware's VLAN opcodes count into a device's record and the
  * device's own counters would not, per packet.
  *
- * Measured on hardware rather than inferred (docs/flowtable-statistics.md has
+ * Measured on hardware rather than inferred (docs/flowtable/statistics.md has
  * the frames): the firmware counts a tag's record with the frame as it stands
  * once that tag has been handled, so the strip counts the frame with the tag
  * already gone and the insert counts it with the tag already on -- for a
@@ -391,7 +391,7 @@ static void ft_devices_put(const struct cdx_ft_rule *rule)
 #define FT_VLAN_TX_OVERHEAD VLAN_HLEN
 
 /* The same for a ppp device and the two PPPoE opcodes, measured on the DK with
- * a session over one tag (docs/flowtable-statistics.md has the frames). The
+ * a session over one tag (docs/flowtable/statistics.md has the frames). The
  * strip counts the frame as it arrived less the session header alone: for a
  * 310-byte frame its record reads 302, so the tags under the session are still
  * in the count even though the tag strip ran first. The insert runs before any
@@ -414,7 +414,7 @@ static unsigned int ft_ppp_rx_overhead(unsigned int lower_tags)
 #define FT_PPP_TX_OVERHEAD (ETH_HLEN + PPPOE_SES_HLEN)
 
 /* What the firmware counts into a tunnel device's record and the device's own
- * counters do not, per packet, measured on the DK (docs/flowtable-tunnels.md
+ * counters do not, per packet, measured on the DK (docs/flowtable/tunnels.md
  * has the frames). A tunnel device counts the inner packet alone on both
  * sides: sit and ip6_tnl add skb->len after the outer header has been pulled
  * on receive, and the inner length on transmit. Measured with a 104-byte
@@ -2296,7 +2296,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
  * least. Frames punted to Linux have also been counted here and counted again
  * by the slow path that handled them; that is bounded by exception traffic,
  * which is zero on a healthy flow. Both residuals are documented in
- * docs/flowtable-architecture.md rather than silently absorbed.
+ * docs/flowtable/architecture.md rather than silently absorbed.
  */
 static unsigned int ft_l2_overhead(const struct cdx_ft_rule *rule)
 {
@@ -3603,7 +3603,7 @@ static void ft_mc_claim_give(u8 family, const union nf_inet_addr *src,
  * exact (S,G) on an exact ingress port, and an IGMPv2 join produces a (*,G)
  * with neither a source nor any notion of where the traffic comes from. Both
  * are properties of the traffic rather than of the membership, so both are
- * learned from the stream -- see docs/flowtable-multicast.md. This half is the
+ * learned from the stream -- see docs/flowtable/multicast.md. This half is the
  * membership; it records what the bridge says and installs nothing.
  *
  * Locking, which is not incidental here. The switchdev handler runs holding
@@ -4838,7 +4838,7 @@ static void ft_mc_rows(struct seq_file *seq)
  * The control plane is whatever fills the MFC -- igmpproxy, omcproxy,
  * smcroute, pimd -- and none of them needs anything from ASK. They install
  * (S,G) entries at threshold 1 in the default table, which is what the
- * contract below accepts. See docs/flowtable-multicast-routed.md.
+ * contract below accepts. See docs/flowtable/multicast-routed.md.
  *
  * Locking, which is where this differs from every other notifier in this file.
  * The FIB chain is an *atomic* chain and every mr_* caller asserts RTNL, so
@@ -5182,7 +5182,7 @@ static int ft_mr_listener(struct net_device *port,
 	 * match, because differing stacks are ordinary routing between VLANs
 	 * carried on one trunk. The hardware demonstrably enqueues back to the
 	 * port a frame arrived on -- the hairpin double-NAT case is measured
-	 * at full rate in both directions on one port (docs/flowtable-ipv6.md)
+	 * at full rate in both directions on one port (docs/flowtable/ipv6.md)
 	 * -- so multicast agreeing with that rule is the two paths saying the
 	 * same thing, not a new capability being claimed. Unicast additionally
 	 * lets full NAT make an identical-stack hairpin distinct; a group has
@@ -7469,12 +7469,12 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * mark selectors contradict what the running adapter will decode. */
 	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\n",
 		   ft_qos_mark_mask, ft_qos_default_class);
-	seq_printf(seq, "owner %s\nobserve %u\nbindings %u\npassive %u\nentries %u\nmax_entries %u\n"
+	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
 		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
-		   "flowtable", cdx_ft_observing(), ft_bound, ft_passive, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
+		   cdx_ft_observing(), ft_bound, ft_passive, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
 		   cdx_ft_pending(),

@@ -6,7 +6,6 @@ import json
 import os
 import time
 
-import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
@@ -19,8 +18,6 @@ from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_service import FIRST, managed_service, service_status, supervision_status, wait_service
 from test_flowtable_service_vlan import attempts, balanced, denied, received
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires the flowtable service on the DUT")
 BRIDGE = "br-ftsvc"
 TRUST_VID, GUEST_VID = 285, 286
 TRUST_IF, GUEST_IF = f"{BRIDGE}.{TRUST_VID}", f"{BRIDGE}.{GUEST_VID}"

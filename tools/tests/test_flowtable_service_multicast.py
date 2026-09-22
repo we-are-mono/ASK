@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import socket
 import struct
 import time
@@ -19,8 +18,6 @@ from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_service import FAULT_DIR, FIRST, FLOWS, managed_service, supervision_status
 from test_flowtable_service_vlan import attempts, balanced, denied
 
-pytestmark = pytest.mark.skipif(os.environ.get('ASK_FLOWTABLE_TESTS') != '1',
-                               reason='requires the flowtable service on the DUT')
 IDENTITY = 'ask-recovery-mcast'
 PORT = 49401
 GROUPS = {4: ['239.9.4.1', '239.9.4.2'], 6: ['ff1e::9:4:1', 'ff1e::9:4:2']}

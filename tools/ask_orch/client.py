@@ -13,18 +13,18 @@ import aiohttp
 # Two signal classes combined:
 #
 #   1. Module-name annotations. kmemleak writes backtrace frames via %pS,
-#      which for symbols in loadable modules appends "[modname]". All our
-#      three out-of-tree kmods show up as [cdx], [fci], [auto_bridge] in
-#      any frame that sits in that module — regardless of what the
-#      function is called. This is the strongest signal: a frame either
-#      is in a given .ko or it isn't.
+#      which for symbols in loadable modules appends "[modname]". Our two
+#      out-of-tree kmods show up as [cdx] and [ask_flowtable] in any frame
+#      that sits in that module — regardless of what the function is
+#      called. This is the strongest signal: a frame either is in a given
+#      .ko or it isn't.
 #
 #   2. Function-name prefixes. Backup signal for cases where module
 #      annotation might be stripped (e.g. certain aggressive link-time
-#      optimisations or symbol-table truncation). cdx/fci/auto_bridge
-#      consistently prefix their exported + file-scope functions with
-#      cdx_/fci_/abm_ respectively. Redundant with (1) on a healthy
-#      kallsyms setup; cheap insurance when it isn't.
+#      optimisations or symbol-table truncation). cdx consistently
+#      prefixes its exported + file-scope functions with cdx_. Redundant
+#      with (1) on a healthy kallsyms setup; cheap insurance when it isn't.
+#      The adapter's ft_ prefix is too generic to use the same way.
 #
 # Built-in kernel code (including NXP's sdk_dpaa / sdk_fman / fsl_qbman,
 # which link into vmlinux in our config) shows no bracket annotation, so
@@ -34,8 +34,8 @@ import aiohttp
 # their names start with "dpa_" / "dpaa_" / "qman_" / "bman_" / "fm_",
 # none of which appear in the needles below.
 ASK_KMEMLEAK_FILTER = [
-    "[cdx]", "[fci]", "[auto_bridge]",
-    "cdx_", "fci_", "abm_",
+    "[cdx]", "[ask_flowtable]",
+    "cdx_",
 ]
 
 
@@ -102,50 +102,6 @@ class Agent:
             r.raise_for_status()
             return await r.json()
 
-    async def cmm_query(self, session: aiohttp.ClientSession, table: str = "connections") -> dict:
-        async with session.post(f"{self.base_url}/cmm/query", json={"table": table}) as r:
-            r.raise_for_status()
-            return await r.json()
-
-    async def fci_send(
-        self,
-        session: aiohttp.ClientSession,
-        fcode: int,
-        length: int,
-        payload: bytes = b"",
-        timeout_ms: int = 500,
-        nlmsg_len_override: int | None = None,
-        failslab_times: int | None = None,
-        uid: int | None = None,
-        userns: bool = False,
-    ) -> dict:
-        """Send an FCI command and return the parsed reply. When
-        `failslab_times=N` is set, the agent wraps the netlink send in a
-        forked child and arms per-task fail-nth so that exactly the Nth
-        kmalloc made by that child (anywhere in the syscall path: netlink
-        scaffold, fci handler, cdx dispatcher, control_*.c handler) is
-        forced to return NULL. `ignore-gfp-wait` is flipped off so
-        GFP_KERNEL allocations are eligible. Use this for err-path unwind
-        discipline tests: pair with a kmemleak cursor around the sweep
-        to catch leaks on unwind."""
-        body: dict = {
-            "fcode":       fcode & 0xFFFF,
-            "length":      length & 0xFFFF,
-            "payload_hex": payload.hex(),
-            "timeout_ms":  timeout_ms,
-        }
-        if nlmsg_len_override is not None:
-            body["nlmsg_len_override"] = nlmsg_len_override
-        if failslab_times is not None:
-            body["failslab_times"] = int(failslab_times)
-        if uid is not None:
-            body["uid"] = int(uid)
-        if userns:
-            body["userns"] = True
-        async with session.post(f"{self.base_url}/fci/send", json=body) as r:
-            r.raise_for_status()
-            return await r.json()
-
     async def netlink_send(
         self,
         session: aiohttp.ClientSession,
@@ -160,10 +116,13 @@ class Agent:
         uid: int | None = None,
         userns: bool = False,
     ) -> dict:
-        """`failslab_times` behaves exactly as it does for fci_send: the agent
-        forks, arms per-task fail-nth so the Nth kmalloc of the send path
-        returns NULL, and sends. It works for any protocol, which is what
-        lets an XFRM NEWSA drive the IPsec SA allocator's unwind."""
+        """Send a raw netlink message and return the raw reply. When
+        `failslab_times=N` is set, the agent forks, arms per-task fail-nth so
+        that exactly the Nth kmalloc made by that child in the send path
+        returns NULL, and sends; `ignore-gfp-wait` is off so GFP_KERNEL
+        allocations are eligible. It works for any protocol, which is what
+        lets an XFRM NEWSA drive the IPsec SA allocator's unwind. Pair with a
+        kmemleak cursor around the sweep to catch leaks on unwind."""
         body: dict = {
             "protocol":    protocol,
             "body_hex":    msg.hex(),
@@ -180,42 +139,6 @@ class Agent:
         if userns:
             body["userns"] = True
         async with session.post(f"{self.base_url}/netlink/send", json=body) as r:
-            r.raise_for_status()
-            return await r.json()
-
-    async def netlink_listen_start(
-        self,
-        session: aiohttp.ClientSession,
-        *,
-        protocol: int,
-        group: int,
-    ) -> str:
-        """Subscribe to a netlink multicast group on the agent.
-
-        Returns a listener_id. The agent opens an AF_NETLINK socket on
-        `protocol`, joins multicast `group` via NETLINK_ADD_MEMBERSHIP,
-        and runs a daemon thread that buffers received frames until
-        netlink_listen_stop drains them. Use for kernel-emitted netlink
-        notifications (e.g. abm's NETLINK_L2FLOW=33 group=1 broadcasts).
-        """
-        body = {"protocol": int(protocol), "group": int(group)}
-        async with session.post(f"{self.base_url}/netlink-listen-start", json=body) as r:
-            r.raise_for_status()
-            return (await r.json())["listener_id"]
-
-    async def netlink_listen_stop(
-        self,
-        session: aiohttp.ClientSession,
-        listener_id: str,
-    ) -> dict:
-        """Drain buffered frames + close the listener socket.
-
-        Returns {"messages": [hex, ...], "count": int}; `messages` is
-        the list of raw netlink frames as hex strings, in arrival order.
-        """
-        async with session.post(
-            f"{self.base_url}/netlink-listen-stop/{listener_id}",
-        ) as r:
             r.raise_for_status()
             return await r.json()
 

@@ -72,8 +72,6 @@ from test_flowtable_tunnel import (Shape, _dut_tunnel, _orchestrator_tunnel,
 from test_ipsec_inbound_flow_offload import crypto, sec_counter
 
 pytestmark = [
-    pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                       reason="requires an explicit experimental boot"),
     # Every case runs on the loop the profile fixture was built on. Without
     # this the suite's default function loop scope gives each test a loop of
     # its own, and the fixture's loop -- the one holding the echo endpoints the
@@ -983,7 +981,7 @@ async def _spawn_listener(ctx, client, seconds, result):
     has already exited by the time the second is staged, and the second's
     staging blocks the event loop meanwhile. The listeners are therefore
     started one round-trip at a time, in the background, and read back
-    afterwards; the pattern is test_mcast_replication.py's.
+    afterwards; the pattern is _mcast_helpers.spawn_parallel_tcpdumps's.
     """
     path = f"/tmp/ask_profile_home_listen_{client['name']}.py"
     staged = (f"import pathlib, subprocess\n"
@@ -1084,7 +1082,6 @@ async def homelab(target_agent, lan):
         console = Console.target(log_path=str(ARTIFACTS / "profile-home-uart.log"))
         try:
             initial = await ctx.state()
-            assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
             ctx.baseline_errors = initial["errors"]
             await asyncio.to_thread(console.login, "root", None)
             ctx.console = console
@@ -1667,15 +1664,14 @@ def _police_drops(text):
                default=0)
 
 
-@pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_THROUGHPUT") != "1",
-                    reason="full-rate benchmark opt-in")
 async def test_profile_homelab_throughput(homelab, splat_window):
     """What the profile forwards when nothing is in its way.
 
     A number below the ceiling means the CPU carried it, because the CPU cannot
     carry this much: the point is the floor rather than the measurement, and it
     runs against the same bridged, firewalled, masqueraded profile as everything
-    above rather than a bare NAT path.
+    above rather than a bare NAT path. A floor needs a steady-state sample, not
+    a long one: five measured seconds after a two-second ramp.
     """
     ctx = homelab
     client = BY_NAME["a"]
@@ -1688,8 +1684,8 @@ async def test_profile_homelab_throughput(homelab, splat_window):
         script = f'''
 import json, subprocess
 argv = ['iperf3', '-c', {INTERNET!r}, '-B', {client['ip']!r}, '-p', {str(PORT_RATE)!r},
-        '-P', '4', '-t', '20', '-O', '3', '-Z', '-J']
-result = subprocess.run(argv, capture_output=True, text=True, timeout=45)
+        '-P', '4', '-t', '5', '-O', '2', '-Z', '-J']
+result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
 print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
 '''
         result = await _client_python(ctx, client, script, label="profile_home_rate",
@@ -1882,34 +1878,24 @@ async def test_profile_homelab_module_reload_reproves_the_profile(homelab,
     """
     ctx = homelab
     console = ctx.console
-    fci = any(line.startswith("fci ") for line in
-              (await read(ctx.target, ctx.session, "/proc/modules")).splitlines())
-    if fci:
-        # FCI depends on CDX and has no controller in this boot; remove the
-        # dependency before the measured unload rather than forcing it.
-        await console_command(console, "rmmod", "fci")
-    try:
-        await console_command(console, "test", "-e",
-                              "/sys/module/cdx/holders/ask_flowtable")
-        await console_command(console, "rmmod", "ask_flowtable", timeout=30)
-        for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
-                     "/sys/module/cdx/holders/ask_flowtable"):
-            absent = await console_command(console, "test", "-e", path, check=False)
-            assert absent["rc"] == 1, path
-        # Still a working router while the adapter is gone: the profile is the
-        # kernel's configuration and only the acceleration was the module's.
-        report = await _exchange(ctx, BY_NAME["a"], peer=INTERNET, dport=PORT_A,
-                                 sport=PORT_A, count=16, label="reload-software")
-        assert report == {"echoed": 16, "lost": 0}, report
-        await console_command(console, "modprobe", "ask_flowtable", timeout=30)
-        detached = await ctx.state()
-        assert detached["bindings"] == detached["entries"] == 0, detached
-        assert detached["fatal"] == 0, detached
-        await apply(console, _policy(), r=ctx)
-        await ctx.wait(lambda s: s["bindings"] == 2)
-    finally:
-        if fci:
-            await console_command(console, "modprobe", "fci", check=False)
+    await console_command(console, "test", "-e",
+                          "/sys/module/cdx/holders/ask_flowtable")
+    await console_command(console, "rmmod", "ask_flowtable", timeout=30)
+    for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
+                 "/sys/module/cdx/holders/ask_flowtable"):
+        absent = await console_command(console, "test", "-e", path, check=False)
+        assert absent["rc"] == 1, path
+    # Still a working router while the adapter is gone: the profile is the
+    # kernel's configuration and only the acceleration was the module's.
+    report = await _exchange(ctx, BY_NAME["a"], peer=INTERNET, dport=PORT_A,
+                             sport=PORT_A, count=16, label="reload-software")
+    assert report == {"echoed": 16, "lost": 0}, report
+    await console_command(console, "modprobe", "ask_flowtable", timeout=30)
+    detached = await ctx.state()
+    assert detached["bindings"] == detached["entries"] == 0, detached
+    assert detached["fatal"] == 0, detached
+    await apply(console, _policy(), r=ctx)
+    await ctx.wait(lambda s: s["bindings"] == 2)
 
     # ---- and now every feature again, on the profile that was never rebuilt.
     trusted, iot, guest = BY_NAME["a"], BY_NAME["b"], BY_NAME["c"]

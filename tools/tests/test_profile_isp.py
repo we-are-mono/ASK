@@ -76,8 +76,6 @@ from test_flowtable_pppoe import (INNER_LOCAL, INNER_LOCAL6,
 from test_flowtable_policy import CONFIG, apply, stop
 
 pytestmark = [
-    pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                       reason="requires an explicit experimental boot"),
     # Every case runs on the loop the profile fixture was built on. Without
     # this the suite's default function loop scope gives each test a loop of
     # its own, and the fixture's loop -- the one holding the echo endpoints the
@@ -1003,7 +1001,6 @@ async def isp(target_agent, lan):
         console = Console.target(log_path=str(ARTIFACTS / "profile-isp-uart.log"))
         try:
             initial = await ctx.state()
-            assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
             ctx.baseline_errors = initial["errors"]
             await asyncio.to_thread(console.login, "root", None)
             ctx.console = console
@@ -1513,15 +1510,15 @@ while True:
                              label="profile_isp_forward_stop", timeout=20)
 
 
-@pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_THROUGHPUT") != "1",
-                    reason="full-rate benchmark opt-in")
 async def test_profile_isp_throughput(isp, splat_window):
     """What the profile forwards when nothing is in its way.
 
     A number below the ceiling means the CPU carried it, because the CPU cannot
     carry this much: the point of the case is the floor, not the measurement. It
     runs against the same profile as everything above, so what it measures is
-    the shipping configuration rather than a bare NAT path.
+    the shipping configuration rather than a bare NAT path. A floor needs a
+    steady-state sample, not a long one: five measured seconds after a
+    two-second ramp.
     """
     ctx = isp
     client = BY_NAME["main"]
@@ -1534,8 +1531,8 @@ async def test_profile_isp_throughput(isp, splat_window):
         script = f'''
 import json, subprocess
 argv = ['iperf3', '-c', {INNER_LOCAL!r}, '-B', {client['ip']!r}, '-p', {str(PORT_RATE)!r},
-        '-P', '4', '-t', '20', '-O', '3', '-Z', '-J']
-result = subprocess.run(argv, capture_output=True, text=True, timeout=45)
+        '-P', '4', '-t', '5', '-O', '2', '-Z', '-J']
+result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
 print(json.dumps({{'rc': result.returncode, 'stdout': result.stdout}}))
 '''
         result = await _client_python(ctx, client, script, label="profile_isp_rate",

@@ -6,7 +6,6 @@ from functools import partial
 import json
 import os
 
-import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
@@ -16,8 +15,6 @@ from test_flowtable_offload import DPORT, SPORT, TABLE, WAN_IP, command, read, r
 from test_flowtable_selective_neighbour import keys as peer_keys, unchanged as peer_unchanged
 from test_flowtable_selective_neighbour import warm as peer_warm, hardware as peer_hardware
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 PEERS = [dict(netns="ask-ft-route-a", iface="askftra", lan="198.18.30.2", mac="02:9d:99:b2:33:c1"),
          dict(netns="ask-ft-route-b", iface="askftrb", lan="198.18.31.2", mac="02:9d:99:b2:33:d1")]
 FLOWS = [{**spec, "id": 2 * i + j, "proto": proto, "sport": SPORT + 128}

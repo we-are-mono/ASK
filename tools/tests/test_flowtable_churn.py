@@ -20,7 +20,7 @@ from test_flowtable_offload import DPORT, TABLE, WAN_IP, command, read, rig  # n
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("ASK_FLOWTABLE_TESTS") != "1" or os.environ.get("ASK_FLOWTABLE_CHURN") != "1",
+    os.environ.get("ASK_FLOWTABLE_CHURN") != "1",
     reason="explicit sustained full-capacity churn proof")
 GROUP = 256
 SURVIVORS = GROUP

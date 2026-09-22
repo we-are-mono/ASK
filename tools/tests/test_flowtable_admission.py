@@ -1,17 +1,12 @@
 """Retry transient partial admission without replacing the table or sockets."""
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from test_flowtable_connections import SPORT, connections, peer  # noqa: F401
 from test_flowtable_mtu import table_identity
 from test_flowtable_offload import read, rig  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, warm
-
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 
 
 @pytest.mark.parametrize("protocol", ["udp", "tcp"])

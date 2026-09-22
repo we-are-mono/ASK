@@ -1,6 +1,6 @@
 # Policy, startup and foundation acceptance: history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md) · [History index](README.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md) · [History index](README.md)
 
 Configuration/revocation, CMM/FCI-free startup and final legacy compatibility.
 
@@ -24,7 +24,7 @@ The image installs the controller, a disabled default policy carrying the three
 existing ALG-control exclusions, and a flowtable-only boot hook after gateway
 setup. External source checksums make policy/script edits invalidate the recipe's
 install signature. Python dependencies follow this repository's package manifest.
-[Policy operations and CMM setting migration](../../flowtable-policy.md) document
+[Policy operations and CMM setting migration](../policy.md) document
 scope, tuple selectors, native sysctls, firewall ordering, revocation, failure
 semantics and remaining feature limits.
 
@@ -106,7 +106,7 @@ scope. This includes automatic device/route/neighbour recovery, physical identit
 and removal, provider terminal safety, partial-admission recovery, nexthop-object
 retirement, policy/configuration migration with live revocation, CMM/FCI-free
 startup, and concurrent reconfiguration/resource-pressure acceptance. The
-[checkpoint](../../flowtable-foundation.md) separates those supported contracts from
+[checkpoint](../foundation.md) separates those supported contracts from
 future CMM feature parity. Existing proprietary firmware and initial FMC hardware
 setup remain in use. No eBPF/XDP implementation or alternative-kernel work was
 required to establish this boundary.

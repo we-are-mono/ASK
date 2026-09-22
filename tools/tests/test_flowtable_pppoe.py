@@ -49,9 +49,6 @@ import test_flowtable_offload as ft
 from test_flowtable_offload import (ARTIFACTS, DPORT, Echo, SPORT, Rig, command,
                                     console_command, console_python, read)
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                                reason="requires an explicit experimental boot")
-
 # The orchestrator's standing tagged device, and the tag the DUT has to put on
 # eth4 to meet it. Claimed in _topology.py: 3900 is bench furniture, not this
 # file's to create or delete.
@@ -572,7 +569,6 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     initial = await r.state()
-    assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     r.wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     stack = TopologyStack()
@@ -586,8 +582,7 @@ async def pppoe_rig(target_agent, aiohttp_session, lan, splat_window, request, m
         # mid-marker truncates it -- observed as "missing console output
         # boundary" with the leading bytes of the token gone, and as a dial
         # that silently did not happen, which then surfaces one step later as
-        # an unreachable peer. Restored in teardown. The same precaution, for
-        # the same reason, as _pppoe_e2e.py's.
+        # an unreachable peer. Restored in teardown.
         printk = (await read(r.target, r.session, "/proc/sys/kernel/printk")).split()
         await command(r.target, r.session, "sysctl", "-w", "kernel.printk=1 4 1 7")
         cleanup.append((r.target, ["sysctl", "-w",

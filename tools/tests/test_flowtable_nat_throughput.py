@@ -1,9 +1,8 @@
-"""Opt-in full-rate Loki-to-Vision TCP NAT benchmark with hardware-path evidence."""
+"""Full-rate Loki-to-Vision TCP NAT check with hardware-path evidence."""
 import asyncio
 import json
 import os
 
-import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
@@ -16,10 +15,12 @@ from test_flowtable_offload import (ARTIFACTS, DPORT, WAN_IP, command,
 from test_flowtable_policy import CONFIG, apply, candidate, stop
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("ASK_FLOWTABLE_TESTS") != "1" or os.environ.get("ASK_FLOWTABLE_THROUGHPUT") != "1",
-    reason="requires explicit experimental boot and full-rate benchmark opt-in")
 PORT, STREAMS = DPORT + 3000, 4
+# Short enough for every suite run. The proof is structural -- every bulk
+# stream on its hardware entry, software TX flat, cookies stable -- and the
+# rate only needs a steady-state sample: iperf discards the ramp (-O), and the
+# hardware window sits inside the measured interval.
+IPERF_SECONDS, IPERF_OMIT, WINDOW_SECONDS = 5, 2, 3
 
 
 @pytest_asyncio.fixture
@@ -68,7 +69,7 @@ import json, subprocess
 link = subprocess.check_output(['ethtool', {LAN_NIC!r}], text=True)
 assert 'Speed: 10000Mb/s' in link and 'Duplex: Full' in link and 'Link detected: yes' in link, link
 argv = ['iperf3', '-c', {WAN_IP!r}, '-B', {r.lan_ip!r}, '-p', {str(PORT)!r},
-        '-P', {str(STREAMS)!r}, '-t', '20', '-O', '3', '-Z', '-J']
+        '-P', {str(STREAMS)!r}, '-t', {str(IPERF_SECONDS)!r}, '-O', {str(IPERF_OMIT)!r}, '-Z', '-J']
 existing = json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'exact', {WAN_IP + '/32'!r}], text=True))
 assert not existing, existing
 subprocess.run(['ip', 'route', 'add', {WAN_IP + '/32'!r}, 'via', {r.lan_gateway!r}, 'dev', {LAN_NIC!r}, 'mtu', '1500'], check=True)
@@ -106,7 +107,7 @@ assert result.returncode == 0
                 reply = old[(TARGET_WAN_IF, "6", row["new_dst"], row["new_src"])]
                 assert (reply["new_src"], reply["new_dst"]) == (row["dst"], row["src"]), reply
             tx_before, cpu_before = await software_tx(r), await cpu(r)
-            await asyncio.sleep(10)
+            await asyncio.sleep(WINDOW_SECONDS)
             cpu_after, tx_after = await cpu(r), await software_tx(r)
             after = await r.state()
             healthy(after)
@@ -134,7 +135,7 @@ assert result.returncode == 0
                                         "stderr": stderr.decode(), "lan_link": client["link"]})
             assert client["rc"] == server.returncode == 0 and "error" not in client_json and "error" not in server_json
             received = server_json["end"]["sum_received"]
-            assert received["bytes"] > 0 and received["seconds"] >= 19, received
+            assert received["bytes"] > 0 and received["seconds"] >= IPERF_SECONDS - 0.1, received
             assert received["bits_per_second"] >= float(os.environ.get("ASK_FLOWTABLE_MIN_GBPS", "9")) * 1e9, received
         finally:
             try:

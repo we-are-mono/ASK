@@ -22,13 +22,16 @@ no "ASK distro" and nothing here runs on its own.
 The components:
 
 - **Kernel modules** — `cdx` (the core offload engine: hardware flow tables,
-  IPsec offload, and QoS via DPAA/FMAN), `fci` (control channel to the CMM
-  daemon), `auto_bridge` (L2 bridge flow detection).
-- **Userspace** — `cmm` (offloads netfilter conntrack flows to the classifier),
+  IPsec offload, and QoS via DPAA/FMAN) and `ask_flowtable` (the adapter that
+  lets Linux's native flowtables drive CDX).
+- **Userspace** — `ask-flowtable` (the default-on offload policy daemon),
   `dpa_app` (loads the FMAN classification rules), `fmc` (NXP's FMAN config
   compiler).
-- **Supporting libraries** — `libfci`, `fmlib`, `libcli`, and ASK-patched
-  `libnfnetlink` / `libnetfilter_conntrack` (CMM's fast-path conntrack).
+- **Supporting libraries** — `fmlib`.
+- **Reference sources** — `cmm/`, `fci/` (with `libfci`) and `auto_bridge/`
+  hold the retired CMM daemon, its FCI control channel and the L2 bridge flow
+  detector. They are kept for reference while the move to Linux flowtables
+  completes; nothing builds or ships them.
 - **Kernel side** — the `patches/kernel/` stack (`010`–`130`: the vendored
   DPAA/FMAN SDK, ASK's hooks, and board drivers, applied onto stock mainline
   6.12) and the board device tree in `dts/`. See
@@ -45,10 +48,9 @@ reference:
 
 | Component | Recipe |
 |-----------|--------|
-| `cdx`, `fci`, `auto_bridge` (kernel modules) | `meta-ask/recipes-ask/{cdx,fci,auto-bridge}/` |
-| `cmm`, `dpa_app`, `fmc` (userspace) | `meta-ask/recipes-ask/{cmm,dpa-app,fmc}/` |
-| `libfci`, `fmlib`, `libcli` (libraries) | `meta-ask/recipes-ask/{libfci,fmlib,libcli}/` |
-| patched `libnfnetlink` / `libnetfilter-conntrack` | `meta-ask/recipes-ask/{libnfnetlink,libnetfilter-conntrack}/` |
+| `cdx`, `ask_flowtable` (kernel modules) | `meta-ask/recipes-ask/cdx/` |
+| `ask-flowtable`, `dpa_app`, `fmc` (userspace) | `meta-ask/recipes-ask/{flowtable,dpa-app,fmc}/` |
+| `fmlib` (library) | `meta-ask/recipes-ask/fmlib/` |
 | kernel + ASK patch stack | `meta-ask/recipes-kernel/linux/linux-ask_6.12.bb` |
 | bootable showcase image | `meta-ask/recipes-core/images/ask-image.bb` |
 
@@ -170,10 +172,12 @@ development for the newest supported kernel; `mono-6.12` is the 6.12 maintenance
 line; releases are tagged (`mono-1.0.0`). See [docs/versioning.md](docs/versioning.md)
 for the full branch model.
 
-The `feat/linux-flowtable-offload` branch develops an opt-in alternative to CMM
-flow management. The [project overview](docs/linux-flowtable-offload.md) links
-the current architecture, supported foundation and TCP/UDP SNAT/MASQUERADE, operating
-guides, and historical validation evidence. The default CMM mode is preserved.
+The `feat/linux-flowtable-offload` branch replaces CMM flow management with
+Linux's native flowtables. The test image boots only that path; `cmm/`, `fci/`
+and `auto_bridge/` remain as unbuilt reference sources. The
+[project overview](docs/flowtable/README.md) links the current
+architecture, supported features, operating guides, and historical validation
+evidence.
 
 ## License
 

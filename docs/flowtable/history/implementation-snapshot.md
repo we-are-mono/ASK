@@ -1,6 +1,6 @@
 # Consolidated implementation snapshot: history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md) · [History index](README.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md) · [History index](README.md)
 
 Earlier consolidated contracts and focused-check instructions; some restrictions are superseded.
 

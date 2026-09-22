@@ -96,13 +96,9 @@ static struct devlink *cdx_devlink;
  * e_FM_PCD_PLCR_PACKET_MODE with QM_SECRATE defaults -- so unlike the punt
  * policer there is no mode to check.
  *
- * *It is idle in flowtable mode today, and that is temporary.* `CMD_INIT(ipsec)`
- * is skipped when the flowtable owns the hardware and `to_sec_fqid` is set
- * nowhere else, so no frame selects this profile there yet -- IPsec has not
- * been ported to the flowtable; it is backlog, and QoS went first. The policer
- * is registered unconditionally anyway, so that when IPsec does land the meter
- * starts working with no change here. Gating it on the ownership mode would
- * only mean a gate somebody has to remember to remove.
+ * The flowtable's XFRM provider now sends flows to SEC, but that frames
+ * traverse this meter is not yet demonstrated: the policer reports drops, not
+ * passes, and showing traversal means exceeding its rate.
  */
 #define CDX_DEVLINK_POLICER_SEC	2
 

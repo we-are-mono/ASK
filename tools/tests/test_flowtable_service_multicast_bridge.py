@@ -13,7 +13,7 @@ from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, rig  # noqa: F401
 from test_flowtable_service import managed_service
-from test_flowtable_service_multicast import recover, pytestmark
+from test_flowtable_service_multicast import recover
 
 BRIDGE = 'br-ftmcast'
 LAN_VID, WAN_VID, IPTV_VID = 287, 288, 289

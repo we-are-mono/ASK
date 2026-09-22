@@ -13,8 +13,6 @@ from test_flowtable_connections import by_key, healthy, peer
 from test_flowtable_offload import DPORT, SPORT, TABLE, WAN_IP, command, read, rig  # noqa: F401
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 GATEWAY = "198.18.29.1"
 PEERS = [dict(netns="ask-ft-neigh-a", iface="askftna", lan="198.18.29.2", mac="02:9d:99:b2:33:a1"),
          dict(netns="ask-ft-neigh-b", iface="askftnb", lan="198.18.29.3", mac="02:9d:99:b2:33:b1")]

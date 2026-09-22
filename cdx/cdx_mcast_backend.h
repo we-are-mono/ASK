@@ -113,7 +113,7 @@ bool cdx_mc_port_supported(struct net_device *dev);
  * the transaction and without the liveness that needs RTNL. It exists because
  * the MDB switchdev handler runs holding RTNL and so cannot take the
  * transaction at all, yet still has to decide whether to take a membership on
- * — see docs/flowtable-multicast.md. dpa_netdev_is_physical() answers under
+ * — see docs/flowtable/multicast.md. dpa_netdev_is_physical() answers under
  * its own lock, so this is safe from a notifier and from an RTNL holder.
  *
  * A caller that gets `true` here has not been promised the port will pass

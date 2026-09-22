@@ -12,10 +12,6 @@
 #include "devman.h"
 #include "dpa_wifi.h"
 
-static char *offload_owner = "cmm";
-module_param(offload_owner, charp, 0444);
-MODULE_PARM_DESC(offload_owner, "Hardware flow owner: cmm (default) or flowtable; boot selection only");
-
 static bool ft_observe;
 module_param_named(flowtable_observe, ft_observe, bool, 0444);
 MODULE_PARM_DESC(flowtable_observe, "Validate requests but decline hardware installation");
@@ -29,16 +25,11 @@ EXPORT_SYMBOL_NS_GPL(cdx_ft_debug_mask, ASK_CDX_FLOWTABLE);
 module_param_named(ask_debug, cdx_ft_debug_mask, uint, 0644);
 MODULE_PARM_DESC(ask_debug, "ASK-DEBUG admission tracing: 1=refusals 2=accepts 4=devices");
 
-/* These belong to CDX, not the adapter. Detach/reclaim must neither change the
- * selected owner nor forget an unproven hardware deletion. Configuration stays
- * sealed after the first claim, even if registration subsequently fails. */
+/* These belong to CDX, not the adapter. Detach/reclaim must not forget an
+ * unproven hardware deletion. Configuration stays sealed after the first
+ * claim, even if registration subsequently fails. */
 static bool ft_claimed, ft_config_sealed, ft_failed;
 static unsigned int ft_live;
-
-bool cdx_flowtable_enabled(void)
-{
-	return !strcmp(offload_owner, "flowtable");
-}
 
 bool cdx_ft_observing(void)
 {
@@ -49,15 +40,6 @@ EXPORT_SYMBOL_NS_GPL(cdx_ft_observing, ASK_CDX_FLOWTABLE);
 bool cdx_flowtable_config_sealed(void)
 {
 	return READ_ONCE(ft_config_sealed);
-}
-
-int cdx_flowtable_mode_check(void)
-{
-	if (strcmp(offload_owner, "cmm") && strcmp(offload_owner, "flowtable"))
-		return -EINVAL;
-	if (ft_observe && !cdx_flowtable_enabled())
-		return -EINVAL;
-	return 0;
 }
 
 /* The SDK's normal ndo_open enables FMAN ports. A failed hardware unlink
@@ -82,8 +64,6 @@ int cdx_flowtable_guard_init(void)
 {
 	int rc;
 
-	if (!cdx_flowtable_enabled())
-		return 0;
 	rc = register_netdevice_notifier(&ft_guard_nb);
 	if (!rc)
 		ft_guard_registered = true;
@@ -133,7 +113,7 @@ EXPORT_SYMBOL_NS_GPL(cdx_ft_pending, ASK_CDX_FLOWTABLE);
 int cdx_ft_claim(void)
 {
 	cdx_ft_assert_held();
-	if (!cdx_flowtable_enabled() || ft_failed)
+	if (ft_failed)
 		return -EOPNOTSUPP;
 	if (ft_claimed || ft_live || cdx_ft_pending())
 		return -EBUSY;

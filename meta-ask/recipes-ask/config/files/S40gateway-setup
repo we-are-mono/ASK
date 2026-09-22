@@ -32,8 +32,7 @@ WAN_ADDR6=fc00:beef::1/64
 DNSMASQ_CONF=/etc/dnsmasq-gateway.conf
 
 start_loopback() {
-    # cmm's CLI listener binds 127.0.0.1:2103; if lo is down the bind fails
-    # with EADDRNOTAVAIL and cmm tears down its IPC msgqs and exits(1).
+    # Nothing else in this initramfs brings loopback up.
     ip link set lo up
 }
 
@@ -106,7 +105,7 @@ start_filter6() {
     # the ISP delegation in production. We still need an ip6tables
     # FORWARD rule with `-m conntrack` so the kernel engages IPv6
     # conntrack tracking on forwarded flows. Without it, no v6 flow
-    # gets tracked, CMM has nothing to mirror, and FMAN never offloads
+    # gets tracked, the flowtable has nothing to offload, and FMAN never offloads
     # the tunnel encap egress (the whole point of this image's
     # tunnel-offload tests).
     #

@@ -17,6 +17,8 @@ with (root / "calls").open("a") as log:
 
 def backend(**changes):
     path = root / "backend"
+    if not path.exists():
+        return  # adapter not loaded: no backend to reflect the change
     fields = dict(line.split() for line in path.read_text().splitlines())
     fields.update({k: str(v) for k, v in changes.items()})
     tmp = path.with_suffix(".tmp")

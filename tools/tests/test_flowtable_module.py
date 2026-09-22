@@ -3,9 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import os
-
-import pytest
 
 from ask_orch.uart import Console
 from _ioctl import CDX_CTRL_DPA_SET_PARAMS, SIZEOF_CDX_CTRL_SET_DPA_PARAMS
@@ -14,9 +11,6 @@ from test_flowtable_connections import FLOWS, SPORT, connections, peer  # noqa: 
 from test_flowtable_offload import ARTIFACTS, DPORT, TABLE, WAN_IP, console_command, read, rig  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, warm
 from test_flowtable_tcp import software_tx
-
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 
 
 async def table(r):
@@ -36,11 +30,7 @@ async def test_flowtable_module_lifecycle(connections):
     ids = [0, 1]
     con = Console.target(log_path=str(ARTIFACTS / "module-uart.log"))
     await asyncio.to_thread(con.login, "root", None)
-    fci = any(line.startswith("fci ") for line in
-              (await read(r.target, r.session, "/proc/modules")).splitlines())
     try:
-        if fci:
-            await console_command(con, "rmmod", "fci")
         await console_command(con, "test", "-e", "/sys/module/cdx/holders/ask_flowtable")
         pinned = await console_command(con, "rmmod", "cdx", check=False)
         assert pinned["rc"] != 0 and "in use" in pinned["stdout"], pinned
@@ -132,7 +122,5 @@ async def test_flowtable_module_lifecycle(connections):
             reply = await r.target.fs_write(r.session, "/proc/fm_ehash_hcsync_fail", "0")
             assert reply["errno"] == 0, reply
             await console_command(con, "modprobe", "ask_flowtable")
-            if fci:
-                await console_command(con, "modprobe", "fci")
         finally:
             con.close()

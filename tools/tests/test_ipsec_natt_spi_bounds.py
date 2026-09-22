@@ -36,8 +36,6 @@ would miss if the write happened to succeed. splat_window is that oracle.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import pytest_asyncio
 
@@ -52,9 +50,6 @@ from _ipsec_helpers import (
     sa_install_probe,
 )
 from _topology import TARGET_WAN_IF
-
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                                reason="requires an explicit flowtable boot")
 
 # These SAs are inbound: the array being filled belongs to the entry that
 # classifies arriving UDP-encapsulated ESP, so the SA's destination is the

@@ -42,11 +42,11 @@ static struct cdx_fman_info *fman_info;
 static struct dpa_fq *dpa_pcd_fq;
 static int dpa_cfg_lock, rtnl;
 static bool config_sealed, seal_on_lock;
-static unsigned lock_contention, lock_waits;
+static unsigned lock_contention, lock_waits, rtnl_locks;
 static bool cdx_flowtable_config_sealed(void) { return config_sealed; }
 static unsigned port_up_mask = 15;
 static struct { struct { int mutex; } ctrl; } cdx_instance, *cdx_info = &cdx_instance;
-static void rtnl_lock(void) { assert(!rtnl && !cdx_info->ctrl.mutex); rtnl = 1; }
+static void rtnl_lock(void) { assert(!rtnl && !cdx_info->ctrl.mutex); rtnl = 1; rtnl_locks++; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = 0; }
 static struct cdx_fman_info input[2];
 static struct cdx_ctrl_set_dpa_params request = { input, 2 };
@@ -254,6 +254,18 @@ static void retry(void)
 }
 int main(void)
 {
+    /* The FMAN count is bounded before any lock, allocation or hardware
+     * work: zero leaves fman_info unset for code that dereferences it, and
+     * a count past CDX_MAX_FMANS overruns the per-FMAN wrapper array. */
+    static const unsigned bad_counts[] = { 0, CDX_MAX_FMANS + 1, 10000, 0xffffffffu };
+    for (unsigned i = 0; i < ARRAY_SIZE(bad_counts); i++) {
+        setup(); request.num_fmans = bad_counts[i]; rtnl_locks = 0;
+        assert(cdx_ioc_set_dpa_params((unsigned long)&request) == -EINVAL);
+        assert(copy_step == 1 && !alloc_step && !step && !rtnl_locks);
+        assert(!fman_info && !live_allocs && !cdx_info->ctrl.mutex && !rtnl);
+    }
+    request.num_fmans = 2;
+
     /* Claim can seal configuration while an already validated ioctl waits
      * for the control transaction. Drop RTNL to let that claimant run, then
      * recheck ownership before any allocation or hardware work. */

@@ -28,8 +28,7 @@ import pytest
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from ask_orch.uart import Console
 from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read
-from test_flowtable_vlan import (VLAN_ID, VLAN_INNER, _both_directions,  # noqa: F401
-                                 pytestmark, vlan_rig)
+from test_flowtable_vlan import VLAN_ID, VLAN_INNER, _both_directions, vlan_rig  # noqa: F401
 
 PAYLOAD = 256
 COUNT = 64

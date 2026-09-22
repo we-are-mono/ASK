@@ -5,12 +5,18 @@
 #include <stdlib.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 static long now_ms(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+bool ft_cdx_present(void)
+{
+	return !access(FT_CDX_MODULE, F_OK);
 }
 
 int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
@@ -34,21 +40,15 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 			break;
 		if (sscanf(line, "%63s %63s", key, sval) != 2)
 			continue;
-		if (!strcmp(key, "owner")) {
-			size_t l = strlen(sval);
-			if (l >= sizeof(b->owner)) l = sizeof(b->owner) - 1;
-			memcpy(b->owner, sval, l); b->owner[l] = '\0';
-			seen |= 1; continue;
-		}
 		v = strtol(sval, NULL, 0);
-		if      (!strcmp(key, "bindings"))       { b->bindings = v; seen |= 2; }
+		if      (!strcmp(key, "bindings"))       { b->bindings = v; seen |= 1; }
 		else if (!strcmp(key, "entries"))        { b->entries = v; }
-		else if (!strcmp(key, "handle_refs"))    { b->handle_refs = v; seen |= 4; }
-		else if (!strcmp(key, "neighbour_refs")) { b->neighbour_refs = v; seen |= 8; }
-		else if (!strcmp(key, "quarantine"))     { b->quarantine = v; seen |= 16; }
-		else if (!strcmp(key, "fatal"))          { b->fatal = v; seen |= 32; }
-		else if (!strcmp(key, "observe"))        { b->observe = v; seen |= 64; }
-		else if (!strcmp(key, "invalidated"))    { b->invalidated = v; seen |= 128; }
+		else if (!strcmp(key, "handle_refs"))    { b->handle_refs = v; seen |= 2; }
+		else if (!strcmp(key, "neighbour_refs")) { b->neighbour_refs = v; seen |= 4; }
+		else if (!strcmp(key, "quarantine"))     { b->quarantine = v; seen |= 8; }
+		else if (!strcmp(key, "fatal"))          { b->fatal = v; seen |= 16; }
+		else if (!strcmp(key, "observe"))        { b->observe = v; seen |= 32; }
+		else if (!strcmp(key, "invalidated"))    { b->invalidated = v; seen |= 64; }
 		else if (!strcmp(key, "installs"))       { b->installs = v; }
 		else if (!strcmp(key, "deletes"))        { b->deletes = v; }
 		else if (!strcmp(key, "rearms"))         { b->rearms = v; }
@@ -57,7 +57,7 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 	}
 	int error = ferror(f);
 	fclose(f);
-	if (error || seen != 255) {
+	if (error || seen != 127) {
 		snprintf(ctx->err, sizeof(ctx->err), "incomplete backend diagnostics");
 		return -1;
 	}
@@ -67,11 +67,11 @@ int ft_backend_read(struct ft_ctx *ctx, struct ft_backend *b)
 int ft_backend_json(const struct ft_backend *b, char *buf, size_t n)
 {
 	return snprintf(buf, n,
-		"{\"present\": %s, \"owner\": \"%s\", \"bindings\": %ld, \"entries\": %ld, "
+		"{\"present\": %s, \"bindings\": %ld, \"entries\": %ld, "
 		"\"handle_refs\": %ld, \"neighbour_refs\": %ld, \"quarantine\": %ld, "
 		"\"installs\": %ld, \"deletes\": %ld, \"rearms\": %ld, \"errors\": %ld, "
 		"\"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld}",
-		b->present ? "true" : "false", b->owner, b->bindings, b->entries,
+		b->present ? "true" : "false", b->bindings, b->entries,
 		b->handle_refs, b->neighbour_refs, b->quarantine,
 		b->installs, b->deletes, b->rearms, b->errors,
 		b->fatal, b->invalidated, b->observe);

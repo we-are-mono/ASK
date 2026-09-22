@@ -20,7 +20,7 @@ from test_flowtable_selective_neighbour import keys, warm
 from test_flowtable_service import FIRST, service, supervision_status
 from test_flowtable_service_ipsec import (INNER, LAN_INNER, REQIDS, TARGET_LAN_IF,
     TARGET_WAN_IF, WAN_IP, Wire, balanced, flows_for, hardware, ipsec_service,
-    negative, plaintext_probe, pytestmark)  # noqa: F401
+    negative, plaintext_probe)  # noqa: F401
 from test_flowtable_service_vlan import attempts
 
 MARK_TABLE = "ask_recovery_xfrm_mark"

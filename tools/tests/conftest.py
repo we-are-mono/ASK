@@ -5,8 +5,8 @@ Design notes:
     loop that created it; pytest-asyncio's default test loop is
     function-scoped).
   - The LAN-side UART console is session-scoped. Logging in over serial
-    takes ~0.5s; with ~720 fuzz cases coming up we can't afford to
-    re-login per test. Trade-off: tests share the shell — they must
+    takes ~0.5s, which is not worth paying again for every test.
+    Trade-off: tests share the shell — they must
     leave it at a clean prompt (Console.run() already does).
   - `splat_window` is per-test: opens a dmesg/counters capture on entry,
     asserts no new KASAN/BUG/UBSAN/lockdep splats on exit. Any test
@@ -29,7 +29,7 @@ The LAN VM is reached only via libvirt PTY (Console.lan()) — it sits
 behind the DUT's NAT and has no IP path from the orchestrator, by
 design. Tests drive LAN-side work through the UART; parallel-shape
 work uses backgrounded shell processes coordinated via filesystem
-state (see test_mcast_replication.py for the pattern).
+state (see _mcast_helpers.py for the pattern).
 """
 
 from __future__ import annotations

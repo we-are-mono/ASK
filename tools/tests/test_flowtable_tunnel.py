@@ -46,9 +46,6 @@ from _topology import (DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN
 import test_flowtable_offload as ft
 from test_flowtable_offload import ARTIFACTS, Rig, command, console_command, read
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                                reason="requires an explicit experimental boot")
-
 TABLE = "ask_tunnel"
 DUT_WAN_IPV4 = os.environ.get("ASK_TARGET_IP", "10.0.0.62")
 # The orchestrator's own WAN address, which is also where its agent listens.
@@ -560,7 +557,6 @@ async def tunnel_rig(target_agent, aiohttp_session, lan, splat_window, request):
         await asyncio.to_thread(con.login, "root", None)
         await console_command(con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)
     initial = await r.state()
-    assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     ft.HEALTH_BASELINE["errors"] = initial["errors"]
     r.wan = Agent("wan", f"http://{ORCH_IPV4}:9110")

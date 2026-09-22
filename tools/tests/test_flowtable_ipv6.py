@@ -24,8 +24,6 @@ from _topology import (DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN
                        TARGET_WAN_IF, VIRT_IPV6, WAN_IPV6, lan_run, lan_run_python)
 from test_flowtable_offload import Rig, command, read
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 TABLE = "ask_poc6"
 NAT_TABLE = "ask_nat6"
 # Distinct per case so a leftover conntrack from one never feeds another.
@@ -154,7 +152,6 @@ async def ipv6_rig(target_agent, aiohttp_session, lan, splat_window):
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     initial = await r.state()
-    assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     # The adapter's error count is cumulative for the boot and never reset;
     # tests that inject failures may already have run. Only errors raised

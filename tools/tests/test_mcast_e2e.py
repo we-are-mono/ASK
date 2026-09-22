@@ -1,8 +1,7 @@
 """End-to-end multicast offload: a real consumer joins, a real source sends.
 
-Everything else that touches multicast in this suite programs a group by hand
-over FCI and then checks the hardware replicated it. That proves the encoder.
-It cannot prove the thing this increment is actually about, which is that
+Programming a group by hand and checking the hardware replicated it proves the
+encoder. It cannot prove the thing this file is actually about, which is that
 nobody has to program anything: the LAN VM sends an IGMP or MLD report, the
 bridge's own snooping learns the group, and the offload follows from that.
 
@@ -19,7 +18,7 @@ oracles, and the third is the one that discriminates:
      "the adapter took responsibility for the group", not "the hardware is
      carrying it": the switchdev handler runs under RTNL and cannot take the
      transaction an install needs, so it decides and a work item installs.
-     See docs/flowtable-multicast.md, "The handler cannot install".
+     See docs/flowtable/multicast.md, "The handler cannot install".
   2. The group is present in the hardware table, read from /proc. THIS is
      "actually installed", and it is where a disagreement with (1) surfaces.
   3. **The DUT's CPU does not see the stream.** A hardware-replicated frame is
@@ -89,7 +88,7 @@ BRIDGE = "br_mcast_e2e"
 
 MCAST_PORT = int(os.environ.get("ASK_MCAST_E2E_PORT", "47300"))
 # Above 1, always. See send_stream_from_vision() and the TTL section of
-# docs/flowtable-multicast.md: the parser refuses to classify TTL 0 or 1.
+# docs/flowtable/multicast.md: the parser refuses to classify TTL 0 or 1.
 MCAST_TTL = int(os.environ.get("ASK_MCAST_E2E_TTL", "64"))
 # Distinct group per case so a stale entry from one cannot satisfy another.
 GROUPS_V4 = {
@@ -595,7 +594,7 @@ async def test_a_leave_does_not_interrupt_the_others(aiohttp_session,
 # The second learner, against the same encoder. ipmr's MFC already carries an
 # (S,G), an iif and a replication list, so nothing here is learned from
 # traffic: smcroute writes the entry and the group is either in hardware a
-# moment later or /proc says why not. See docs/flowtable-multicast-routed.md.
+# moment later or /proc says why not. See docs/flowtable/multicast-routed.md.
 #
 # The DUT routes rather than bridges in these cases, which is its shipping
 # configuration -- eth4 is the WAN at 10.0.0.62/24 and eth3 the LAN at
@@ -908,8 +907,8 @@ async def test_routed_to_a_vlan_subinterface(aiohttp_session, target_agent,
 
     The listener is the port beneath it and the tag is pushed by the entry's
     own INSERT_VLAN_HDR, which is the whole reason a listener carries a tag
-    stack rather than an interface name: a VLAN device has no onif in this
-    ownership mode and would describe none.
+    stack rather than an interface name: a VLAN device has no onif of its own
+    and would describe none.
     """
     stack = TopologyStack()
     group = GROUPS_V4["routed_vlan"]

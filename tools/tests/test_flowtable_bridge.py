@@ -29,9 +29,6 @@ from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack,
                        dut_vlan_subif, lan_run, lan_vlan_subif)
 from test_flowtable_offload import (DPORT, Echo, SPORT, WAN_IP, Rig, command, read)
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                                reason="requires an explicit experimental boot")
-
 BRIDGE = "br-ft"
 # Claimed in _topology.py's VLAN ID conventions block. 273 carries the access
 # shape, 274 the tagged one, and 275 the second bridge port the roaming case
@@ -185,9 +182,7 @@ async def bridge_rig(target_agent, aiohttp_session, lan, splat_window, request):
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
     initial = await r.state()
-    assert initial["owner"] == "flowtable", "boot ask.offload=flowtable first"
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
-    assert "auto_bridge " not in await read(r.target, r.session, "/proc/modules")
     r.wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     stack = TopologyStack()
     cleanup = []

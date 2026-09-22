@@ -8,7 +8,6 @@
  *
  */
 #include "cdx.h"
-#include "cdx_flowtable.h"
 
 /*
  * Concurrency:
@@ -163,12 +162,9 @@ int __init cdx_cmdhandler_init(void)
 	CMD_INIT(qm);
 	statistics_init();
 #ifdef DPA_IPSEC_OFFLOAD
-	/* Initialised in both ownership modes, like every other subsystem
-	 * here. What this builds is hardware — the SA caches, the CAAM job
-	 * ring, the SEC era and the datapath frame-queue hook — and only the
-	 * FCI dispatch it also registers belongs to one owner. That one line
-	 * is gated inside ipsec_init() instead, so the hardware is up for
-	 * whichever consumer is driving it. */
+	/* What this builds is hardware — the SA caches, the CAAM job ring, the
+	 * SEC era and the datapath frame-queue hook — which the flowtable's
+	 * XFRM provider drives. */
 	CMD_INIT(ipsec);
 #endif
 #ifdef WIFI_ENABLE
@@ -204,24 +200,14 @@ void cdx_cmdhandler_exit(void)
 	CMD_EXIT(tx);
 }
 
+/* The FCI control plane is retired: the Linux flowtable owns the hardware and
+ * nothing loads fci. Every command family can reach state the flowtable
+ * adapter now owns, so the entry point refuses them all. The command handlers
+ * behind it remain until they are removed. */
 int comcerto_fpp_send_command(u16 fcode, u16 length, u16 *payload, u16 *rlen, u16 *rbuf)
 {
-	struct _cdx_ctrl *ctrl = &cdx_info->ctrl;
-
-	/* All FCI command families can reach shared state. Experimental
-	 * diagnostics use /proc/cdx_flowtable, never the inactive controller. */
-	if (cdx_flowtable_enabled()) {
-		*rlen = 0;
-		return -EOPNOTSUPP;
-	}
-
-	mutex_lock(&ctrl->mutex);
-
-	cdx_cmd_handler(fcode, length, payload, rlen, rbuf);
-
-	mutex_unlock(&ctrl->mutex);
-
-	return 0;
+	*rlen = 0;
+	return -EOPNOTSUPP;
 }
 EXPORT_SYMBOL(comcerto_fpp_send_command);
 

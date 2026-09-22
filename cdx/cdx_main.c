@@ -299,10 +299,6 @@ static int __init cdx_module_init(void)
 
 	printk(KERN_INFO "%s\n", __func__);
 
-	rc = cdx_flowtable_mode_check();
-	if (rc)
-		return rc;
-
 	rc = cdx_check_fman_firmware();
 	if (rc)
 		return rc;
@@ -378,16 +374,11 @@ static int __init cdx_module_init(void)
 	printk("%s::start_dpa_app successful\n", __func__);
 #endif
 #ifdef CFG_WIFI_OFFLOAD
-	/* Built in both ownership modes, like the rest of the hardware here.
-	 * What this claims is the offline port the board declared for Wi-Fi
+	/* What this claims is the offline port the board declared for Wi-Fi
 	 * (dpa-fman0-oh@3, sized for it in the device tree), its buffer pools
-	 * and the per-VAP frame-queue machinery — none of which belongs to a
-	 * consumer. The one line that does is the FCI dispatch, gated inside
-	 * wifi_init() instead.
-	 *
-	 * Skipping it here was the same mistake the IPsec gate made: the
-	 * absence surfaces several layers away, as a frame queue that cannot
-	 * be resolved, with nothing in the message naming Wi-Fi. */
+	 * and the per-VAP frame-queue machinery. Without it the absence surfaces
+	 * several layers away, as a frame queue that cannot be resolved, with
+	 * nothing in the message naming Wi-Fi. */
 	rc = dpaa_vwd_init();
 	if (rc != 0)  {
 		/* Not fatal. What failed is a claim on board-specific resources
@@ -410,22 +401,18 @@ static int __init cdx_module_init(void)
 	}
 
 #ifdef DPA_IPSEC_OFFLOAD
-	/* Built in both ownership modes, like the rest of the hardware above.
-	 *
-	 * This used to be skipped in flowtable mode alongside CMD_INIT(ipsec),
-	 * and the two gates are easy to mistake for one. They are not: that
-	 * one registers an FCI dispatch entry, while this builds the offline
-	 * port, the SEC buffer pool and the PCD frame queues -- resources no
-	 * control plane can substitute for. Without them SEC has nowhere to
-	 * put a frame, and the first symptom is a shared descriptor that
-	 * cannot be created, several layers away from the cause. */
+	/* This builds the offline port, the SEC buffer pool and the PCD frame
+	 * queues -- resources no control plane can substitute for. Without them
+	 * SEC has nowhere to put a frame, and the first symptom is a shared
+	 * descriptor that cannot be created, several layers away from the
+	 * cause. */
 	if (cdx_dpa_ipsec_init()) {
-		/* Not fatal, for the reason the Wi-Fi gate above is not: what
+		/* Not fatal, for the reason the Wi-Fi failure above is not: what
 		 * failed is a claim on board-specific resources -- the IPsec
 		 * offline port, its buffer pool, the PCD frame queues -- and a
 		 * board without them is a gateway without IPsec offload, not a
 		 * gateway without offload. cdx_ipsec_ready() stays false, so
-		 * both owners refuse every SA and the encoder never arms;
+		 * the XFRM provider refuses every SA and the encoder never arms;
 		 * nothing else here depends on it. */
 		pr_warn("%s: IPsec offload unavailable, DPA IPsec init failed\n",
 			__func__);

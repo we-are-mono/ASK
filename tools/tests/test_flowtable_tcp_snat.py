@@ -1,7 +1,6 @@
 """Run the TCP lifetime proofs with a forced native SNAT address and port."""
 import asyncio
 import json
-import os
 
 import pytest
 import pytest_asyncio
@@ -15,11 +14,7 @@ from test_flowtable_tcp import (
     test_flowtable_tcp_retransmit_withdraw_rst as _rst,
 )
 
-pytestmark = [
-    pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                       reason="requires an explicit experimental boot"),
-    pytest.mark.parametrize("rig", ["tcp"], indirect=True),
-]
+pytestmark = pytest.mark.parametrize("rig", ["tcp"], indirect=True)
 
 
 @pytest_asyncio.fixture

@@ -8,8 +8,8 @@
 #include <stdint.h>
 
 #define FT_PROC        "/proc/cdx_flowtable"
-#define FT_OWNER_PARAM "/sys/module/cdx/parameters/offload_owner"
-#define FT_LOCK        "/run/lock/ask-flowtable.lock"
+#define FT_CDX_MODULE  "/sys/module/cdx"
+#define FT_LOCK      "/run/lock/ask-flowtable.lock"
 #define FT_PAUSED      "/run/lock/ask-flowtable.paused"
 #define FT_DEFAULT_CONF "/etc/ask/offload.conf"
 #define FT_DAEMON_LOCK  "/run/lock/ask-flowtable-daemon.lock"
@@ -23,7 +23,6 @@
  * loaded. The DRAIN_FIELDS must all be zero before a rebind. */
 struct ft_backend {
 	bool     present;
-	char     owner[16];
 	long     bindings, entries, handle_refs, neighbour_refs, quarantine;
 	long     fatal, observe, invalidated;
 	long     installs, deletes, rearms, errors;   /* observability, for the CLI result */
@@ -66,8 +65,10 @@ int ft_supervise(const char *conf, int readyfd);
 int ft_service(struct ft_ctx *ctx, const char *verb, const char *conf);
 void ft_log(int priority, const char *format, ...) __attribute__((format(printf, 2, 3)));
 
-/* The current offload owner from the module parameter ("flowtable"/"cmm"/""). */
-void ft_offload_owner(char out[16]);
+/* Whether CDX is loaded. Without it there is no ASK hardware to own and the
+ * daemon idles. The adapter on top of it may come and go; the controller
+ * retries until it is back rather than giving up. */
+bool ft_cdx_present(void);
 
 /* Load policy: parse the conf file, or, when absent, the built-in default
  * (enabled, devices auto, ALG excludes). Returns 0/-1 (ctx->err). */

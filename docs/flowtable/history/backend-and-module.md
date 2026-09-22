@@ -1,6 +1,6 @@
 # Backend and adapter module: history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md) · [History index](README.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md) · [History index](README.md)
 
 Provider extraction, module lifetime, dependency filtering and lock-order corrections.
 

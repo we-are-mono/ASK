@@ -1,4 +1,4 @@
-"""Focused IPv4 TCP acceptance using the opt-in two-port flowtable rig."""
+"""Focused IPv4 TCP acceptance using the two-port flowtable rig."""
 from __future__ import annotations
 
 import asyncio
@@ -18,11 +18,7 @@ from ask_orch.counters import kernel_tx_packets
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_offload import ARTIFACTS, DPORT, SPORT, TABLE, WAN_IP, command, read, rig  # noqa: F401
 
-pytestmark = [
-    pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                       reason="requires an explicit experimental boot"),
-    pytest.mark.parametrize("rig", ["tcp"], indirect=True),
-]
+pytestmark = pytest.mark.parametrize("rig", ["tcp"], indirect=True)
 BLOCK = bytes(range(256)) * 256
 MIB = 1 << 20
 

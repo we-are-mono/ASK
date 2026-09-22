@@ -9,7 +9,6 @@ SRC_URI = "file://S03debugfs \
            file://S20status-leds \
            file://S35wifi-ap \
            file://S40gateway-setup \
-           file://S50cmm \
            file://S50ask-flowtable \
            file://dnsmasq-gateway.conf \
            file://hostapd-ask.conf \
@@ -34,7 +33,6 @@ do_install[file-checksums] += " \
     ${ASK_SRCROOT}/dpa_app/files/etc/cdx_pcd.xml:True \
     ${ASK_SRCROOT}/dpa_app/files/etc/cdx_sp.xml:True \
     ${ASK_SRCROOT}/config/ask-modules.conf:True \
-    ${ASK_SRCROOT}/config/fastforward:True \
     ${ASK_SRCROOT}/config/offload.conf:True \
 "
 
@@ -50,9 +48,6 @@ fakeroot do_install() {
     install -d ${D}${sysconfdir}/modules-load.d
     install -m 0644 ${ASK_SRCROOT}/config/ask-modules.conf \
         ${D}${sysconfdir}/modules-load.d/ask.conf
-
-    install -d ${D}${sysconfdir}/config
-    install -m 0644 ${ASK_SRCROOT}/config/fastforward ${D}${sysconfdir}/config/fastforward
 
     # The default offload policy. The ask-flowtable daemon (its own package)
     # falls back to identical built-in defaults when this file is absent.
@@ -87,15 +82,11 @@ fakeroot do_install() {
     ln -sf ../init.d/gateway-setup ${D}${sysconfdir}/rcS.d/S40gateway-setup
     install -m 0644 ${UNPACKDIR}/dnsmasq-gateway.conf ${D}${sysconfdir}/dnsmasq-gateway.conf
 
-    # CMM (ASK connection manager) — depends on cdx/fci being loaded first.
-    install -m 0755 ${UNPACKDIR}/S50cmm ${D}${sysconfdir}/init.d/cmm
-    ln -sf ../init.d/cmm ${D}${sysconfdir}/rcS.d/S50cmm
-
     install -m 0755 ${UNPACKDIR}/S50ask-flowtable ${D}${sysconfdir}/init.d/ask-flowtable
     ln -sf ../init.d/ask-flowtable ${D}${sysconfdir}/rcS.d/S50ask-flowtable
 
     # Status LED config — runs after modules-load.d brings up leds-lp5812
-    # (S05ask-modules), but before the gateway/CMM bring-up so the cue is
+    # (S05ask-modules), but before the gateway/offload bring-up so the cue is
     # visible from early boot.
     install -m 0755 ${UNPACKDIR}/S20status-leds ${D}${sysconfdir}/init.d/status-leds
     ln -sf ../init.d/status-leds ${D}${sysconfdir}/rcS.d/S20status-leds
@@ -106,7 +97,6 @@ FILES:${PN} = " \
     ${sysconfdir}/cdx_pcd.xml \
     ${sysconfdir}/cdx_sp.xml \
     ${sysconfdir}/modules-load.d/ask.conf \
-    ${sysconfdir}/config/fastforward \
     ${sysconfdir}/ask/offload.conf \
     ${sysconfdir}/init.d/debugfs \
     ${sysconfdir}/rcS.d/S03debugfs \
@@ -118,8 +108,6 @@ FILES:${PN} = " \
     ${sysconfdir}/init.d/gateway-setup \
     ${sysconfdir}/rcS.d/S40gateway-setup \
     ${sysconfdir}/dnsmasq-gateway.conf \
-    ${sysconfdir}/init.d/cmm \
-    ${sysconfdir}/rcS.d/S50cmm \
     ${sysconfdir}/init.d/ask-flowtable \
     ${sysconfdir}/rcS.d/S50ask-flowtable \
     ${sysconfdir}/init.d/status-leds \

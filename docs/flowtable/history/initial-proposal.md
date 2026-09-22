@@ -1,6 +1,6 @@
 # Initial proposal: history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md) · [History index](README.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md) · [History index](README.md)
 
 Original objectives, ownership constraints, engineering standards and proposed increments.
 

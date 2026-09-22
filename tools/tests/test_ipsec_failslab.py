@@ -56,9 +56,6 @@ from _ipsec_helpers import (
 )
 from _topology import TARGET_WAN_IF
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                                reason="requires an explicit flowtable boot")
-
 LOCAL = "198.18.88.1"
 PEER = "198.18.88.2"
 PEER_MAC = "02:00:00:00:88:02"

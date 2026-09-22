@@ -22,9 +22,6 @@ from test_flowtable_service_vlan import attempts, balanced, denied
 from test_flowtable_tcp import software_tx
 from test_flowtable_tunnel import Capture, Shape, _assert_outer, _assert_tunnel, _tunnel_text
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires the flowtable service on the DUT")
-
 
 async def create_tunnel(r, agent):
     shape = r.shape

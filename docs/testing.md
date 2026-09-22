@@ -231,9 +231,8 @@ across the `sudo` boundary automatically (use space-free values).
 
 ASK adds FMAN interface statistics to `dev_get_stats()`. Consequently,
 `ip -s link`, `ifconfig`, `/proc/net/dev`, and sysfs netdev statistics include
-both software and hardware traffic, on physical ports and, under the flowtable
-owner, on VLAN devices too (see the
-[interface counters guide](flowtable-statistics.md) for the units). Use those
+both software and hardware traffic, on physical ports and on VLAN devices (see
+the [interface counters guide](flowtable/statistics.md) for the units). Use those
 totals for volume and header length accounting, not to decide which path
 forwarded a packet.
 
@@ -250,7 +249,8 @@ presence and encapsulation overhead alone do not prove offload.
 
 Prerequisites: the DUT is on the test image with its agent responding, the
 WAN agent is deployed, the WAN iperf3 server is up, and no manual session is
-holding either serial console.
+holding either serial console. The image boots only the flowtable offload
+path, so one boot runs the whole suite, `test_flowtable_*` included.
 
 ```sh
 # full suite (re-state your bench's addresses)
@@ -259,7 +259,7 @@ ASK_WAN_IP=<wan-host> ASK_WAN_IPERF_IP=<wan-iperf> make ask-test
 # a scoped subset while iterating
 make ask-test ASK_TEST_ARGS='-k "ipsec or mcast"'
 
-# QoS allocation, cleanup, and command regressions
+# QoS regressions
 make ask-test ASK_TEST_ARGS='-k qos'
 ```
 
@@ -292,16 +292,6 @@ take RTNL during every retry wait and resources survive until recovery.
 The SDK CQ-pop test checks command and
 descriptor byte order, portal-result lifetime, prefetch retries, errors,
 and a final response containing both a frame and the empty-queue flag.
-
-On the DUT, the QoS tests query all 128 queues and verify that rejected
-assignments and out-of-range queries leave port configuration unchanged.
-These checks do not reload the module. Unload/reload under traffic still
-requires a dedicated board run with the updated kernel and CDX module.
-
-The RTP regressions open a relay call and check special-payload boundaries,
-including 160, 161 and 65535 bytes, then verify that control and RTCP queries
-still work. CMM IPC tests cover unsupported-command replies; Wi-Fi tests
-exercise VAP reset and repeated VWD character-device open/close.
 
 The DPA host lifecycle test compiles the pinned FMC and FMLIB sources with
 our patches and the production loader under ASan/UBSan. It injects startup
@@ -384,42 +374,6 @@ The queue model invokes the registered dequeue callback for contiguous and
 scatter/gather frames and for completions without a valid frame descriptor.
 It checks that every returned frame is released once and empty completions
 release nothing, for both 8- and 16-queue configurations.
-
-CMM route retries have host coverage in
-`tools/host_tests/test_cmm_route_retry.py`: IPv4/IPv6 tunnel, socket and SA
-holders retry changed MAC, output interface and MTU after allocation or
-programming failures, including shared bindings and local tunnel events.
-`tools/host_tests/test_cmm_sa_delete.py` covers SA deletion and dying-state
-ordering, shared route references, flow-update and command failures,
-missing entries, malformed commands and valid-state/rekey handling under
-ASan/UBSan for generic and LS1043 builds.
-
-The dedicated hardware regression restarts CMM with a temporary
-`LD_PRELOAD` library that rejects selected FCI sends before they reach
-CDX. It tests gateway and MTU changes with permanent neighbors, repeated
-failures and recovery on a notification with unchanged forwarding data.
-The library is built on the host and is never included in the image.
-Run this separately from traffic tests on a normally booted DUT:
-
-```sh
-sudo env PYTHONPATH=tools pytest -c tools/pyproject.toml tools/route_tests
-```
-
-It requires `aarch64-linux-gnu-gcc` on the host (override with
-`ASK_AARCH64_CC`). The fixture restores normal CMM startup and removes its
-routes, neighbors and holders. SA cleanup uses normal XFRM deletion and
-asserts that the last hardware route disappears. Additional cases repeat
-normal deletion and timed hard expiry with sole and shared SA routes,
-checking that the surviving SA retains its route until it too is removed.
-
-The ESP traffic tests use the WAN host as a kernel XFRM peer. They drive
-CMM's normal SA installation and verify payload delivery plus SEC packet
-and byte counters for both encryption and decryption. The WAN host needs
-`iproute2` and kernel support for AES-CBC/HMAC-SHA256 XFRM tunnels.
-`ASK_WAN_IPERF_IP` must name an address on that host's DUT-facing interface.
-The fixture creates temporary inner addresses, routes, SAs, policies and a
-scoped NAT exception, and removes them on exit. These tests also need the
-DUT console logged in as root; the test image uses an empty password.
 
 `make ask-test` runs pytest under `sudo` (it needs the serial PTYs and the
 USB-serial node) against the source tree, so test edits are picked up

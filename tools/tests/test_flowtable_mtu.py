@@ -14,9 +14,6 @@ from test_flowtable_offload import DPORT, TABLE, WAN_IP, command, read, rig  # n
 from test_flowtable_selective_neighbour import hardware, warm
 from test_flowtable_tcp import software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
-
 
 async def table_identity(r):
     result = await command(r.target, r.session, "nft", "-a", "-j", "list", "table", "inet", TABLE)

@@ -128,7 +128,7 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 	}
 
 	if (p->enabled) {
-		if (!st.present || strcmp(st.owner, "flowtable") || st.observe) {
+		if (!st.present || st.observe) {
 			snprintf(ctx->err, sizeof(ctx->err), "an active flowtable provider is required");
 			goto out;
 		}
@@ -184,7 +184,7 @@ static int apply_locked(struct ft_ctx *ctx, struct ft_policy *p, bool emit,
 		goto rollback;
 	ft_policy_hash(p, hash);
 	if (!(present && owned && !strcmp(inhash, hash) &&
-	      st.present && !strcmp(st.owner, "flowtable") && !st.observe &&
+	      st.present && !st.observe &&
 	      st.bindings == p->ndevices && !st.fatal && !st.invalidated && !st.quarantine)) {
 		snprintf(ctx->err, sizeof(ctx->err), "new policy did not acquire healthy backend bindings");
 		goto rollback;
@@ -279,18 +279,18 @@ static int cmd_status(struct ft_ctx *ctx)
 		return -1;
 	}
 	close(lock);
-	bool ready = owned && st.present && !strcmp(st.owner, "flowtable") &&
+	bool ready = owned && st.present &&
 		     st.bindings > 0 && !st.fatal && !st.invalidated && !st.observe && !st.quarantine;
 	printf("{\"policy_installed\": %s, \"policy_hash\": %s%s%s, "
 	       "\"reconciliation_paused\": %s, "
-	       "\"admission_ready\": %s, \"backend\": {\"present\": %s, \"owner\": \"%s\", "
+	       "\"admission_ready\": %s, \"backend\": {\"present\": %s, "
 	       "\"bindings\": %ld, \"entries\": %ld, \"handle_refs\": %ld, \"neighbour_refs\": %ld, "
 	       "\"quarantine\": %ld, \"fatal\": %ld, \"invalidated\": %ld, \"observe\": %ld}}\n",
 	       owned ? "true" : "false",
 	       owned ? "\"" : "null", owned ? inhash : "", owned ? "\"" : "",
 	       paused ? "true" : "false",
 	       ready ? "true" : "false",
-	       st.present ? "true" : "false", st.owner,
+	       st.present ? "true" : "false",
 	       st.bindings, st.entries, st.handle_refs, st.neighbour_refs, st.quarantine,
 	       st.fatal, st.invalidated, st.observe);
 	return 0;
@@ -346,17 +346,14 @@ static int64_t now_ms(void)
 static int cmd_daemon(const char *conf)
 {
 	struct ft_ctx ctx = {0};
-	char owner[16];
 	int nl;
 	int retry_ms = FT_RETRY_MIN_MS;
 	int64_t due = 0;
 	bool failed = false;
 
-	ft_offload_owner(owner);
-	if (strcmp(owner, "flowtable")) {
-		fprintf(stderr, "ask-flowtable: offload owner is '%s', not flowtable; idle\n",
-			owner[0] ? owner : "none");
-		ft_log(LOG_NOTICE, "offload owner is '%s', not flowtable; idle", owner[0] ? owner : "none");
+	if (!ft_cdx_present()) {
+		fprintf(stderr, "ask-flowtable: cdx not loaded; idle\n");
+		ft_log(LOG_NOTICE, "cdx not loaded; idle");
 		return 0;   /* nothing to own; let the init system consider us done */
 	}
 	int instance = ft_path_lock(&ctx, FT_DAEMON_LOCK, 0);

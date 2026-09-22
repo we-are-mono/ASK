@@ -1,6 +1,6 @@
 /* The admission contract for a Wi-Fi VAP, compiled from the backend.
  *
- * Step 5 of docs/flowtable-wifi.md rests on one asymmetry: a VAP may be a
+ * Step 5 of docs/flowtable/wifi.md rests on one asymmetry: a VAP may be a
  * flow's egress and may never be its ingress. That is not a preference. A
  * VAP's ingress cannot be hooked at all -- an offloaded flowtable refuses to
  * bind a device whose driver supports no offload, and `moal` supports none --

@@ -1055,7 +1055,6 @@ static struct notifier_block ft_fdb_nb, ft_swdev_nb;
 static unsigned registration_step, registration_failure, canceled;
 static bool backend_claimed, netdev_registered, neigh_registered, fib_registered, nexthop_registered, indirect_registered;
 static bool fdb_registered, swdev_obj_registered;
-static bool owner_enabled = true;
 static bool registration_fails(void) { return ++registration_step == registration_failure; }
 static struct proc_dir_entry *proc_create(const char *name, int mode, void *parent, void *ops)
 { assert(!strcmp(name,"cdx_flowtable") && mode == 0400 && !parent); return registration_fails() ? NULL : &proc_entry; }
@@ -1063,7 +1062,7 @@ static void proc_remove(struct proc_dir_entry *entry) { assert(entry == &proc_en
 static int cdx_ft_claim(void)
 {
     assert(cdx_info->ctrl.mutex && !backend_claimed);
-    if (!owner_enabled || ft_fatal) return -EOPNOTSUPP;
+    if (ft_fatal) return -EOPNOTSUPP;
     if (registration_fails()) return -EBUSY;
     backend_claimed = true; return 0;
 }
@@ -5201,9 +5200,11 @@ static void test_registration(void)
     assert(ft_fatal && !backend_claimed && !live_hw && !allocated && handle.invalid);
     assert(unload_sleeps == 3 && !ft_proc);
     assert(ask_flowtable_init() == -EOPNOTSUPP && !backend_claimed && !ft_proc);
-    owner_enabled=false; ft_fatal=false; registration_failure=registration_step=0;
+    /* The refused claim comes before anything registers. */
+    registration_failure=registration_step=0;
     assert(ask_flowtable_init() == -EOPNOTSUPP && !backend_claimed && !registration_step);
     assert(!ft_proc && !cdx_info->ctrl.mutex);
+    ft_fatal=false;
 }
 
 int main(void)

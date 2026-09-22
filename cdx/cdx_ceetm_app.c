@@ -1532,7 +1532,7 @@ uint32_t ceetm_class_fqid(struct tQM_context_ctl *qm_ctx, uint32_t channel,
  * spans exactly 1/64 to 1 across Pn's six bits, which is the only reading that
  * uses the field's whole range and reaches certainty. It is calibrated against
  * the rejected-frame counters on hardware rather than taken on faith; see
- * docs/flowtable-qos.md.
+ * docs/flowtable/qos.md.
  */
 #define CEETM_WRED_MAXP_UNITS	256u
 

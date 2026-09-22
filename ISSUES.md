@@ -152,6 +152,53 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A195 — an offloaded flow's conntrack can expire underneath it.** Linux
+  6.12 re-extends an offloaded ct's timeout only from conntrack's own
+  gc_worker (`nf_ct_offload_timeout()`, `net/netfilter/nf_conntrack_core.c`),
+  on that worker's adaptive schedule. A packet that still passes conntrack
+  after admission (kprobes caught one 20 ms in, status already `IPS_OFFLOAD`)
+  resets `ct->timeout` to the protocol timeout, 30 s for UDP; if gc_worker does
+  not revisit in time the ct expires, the next table walk (`conntrack -L/-D`,
+  `nf_ct_gc_expired`) evicts it, and flowtable GC retires the live hardware
+  flow as `gc_dying`. Seen as intermittent
+  `test_flowtable_service_ipsec_admission_churn` failures (2 of 4 same-boot
+  reruns). Upstream moved the extension into the flowtable GC
+  (`nf_flow_table_extend_ct_timeout()`, every pass; present in the 6.18 tree);
+  backport it as a kernel patch.
+
+- [ ] **A194 — cdx and the kernel patches still carry CMM's control plane.**
+  Retiring CMM left dead code behind, kept deliberately while the cmm/, fci/
+  and auto_bridge/ reference sources are still consulted. `cdx/cdx_cmdhandler.c`
+  `comcerto_fpp_send_command()` now refuses every command, so the FCI command
+  handlers registered across `cdx/control_*.c`, `cdx_cmd_handler()`, the
+  `comcerto_fpp_register_event_cb()` event path and the command-validation
+  tables are unreachable. `cdx/dpa_wifi.c` keeps CMM's Wi-Fi fast path (the
+  NF_INET_PRE_ROUTING hook behind the `vwd_fast_path_enable` sysfs knob), which
+  nothing enables. On the kernel side, audit which parts of
+  `patches/kernel/020-ask-bridge-hooks.patch` (the BREVENT hooks auto_bridge
+  consumed) and `060-ask-netfilter-fastpath-hooks.patch` serve only CMM or
+  auto_bridge. Remove what the flowtable path does not use, with host-test
+  coverage for the shared machinery the handlers sit beside.
+
+- [ ] **A193 — multicast quarantine on a failed hardware delete is untested.**
+  The test image still builds `CDX_DEBUG_MC_HCSYNC_FAIL`, whose
+  `/proc/cdx_mc_hcsync_fail` knob fails `dpa_control_mc.c`'s hand-issued HC
+  barriers, but its only driver was the FCI `test_mcast_hcsync_quarantine.py`,
+  deleted with CMM. The unicast equivalent is covered by
+  `test_flowtable_module.py` through `/proc/fm_ehash_hcsync_fail`. Add a
+  flowtable-mode test that arms the knob while a bridged and a routed learner
+  withdraw a group, proving the failed delete quarantines rather than frees live
+  hardware state and reclaims on the next good barrier.
+
+- [ ] **A192 — VLAN and PPPoE admissions have no allocation-failure coverage.**
+  `test_flowtable_failslab.py` injects failures into plain TCP/UDP admission
+  (work, rule, actions, entry, hardware), and the tunnel, IPsec, IPv6 and
+  multicast service suites have their own, but nothing fails an allocation
+  while admitting a flow whose egress pushes a VLAN tag or a PPPoE session. The
+  deleted `test_vlan_failslab.py` and `test_pppoe_failslab.py` covered those
+  entry builders through FCI. Add stack-filtered failslab cases for both encaps
+  to the flowtable service suites.
+
 - [ ] **A191 — bridged multicast rewrites the source MAC and cannot accept
   tagged ingress.** The listener builders in `cdx/cdx_ehash.c` strip Ethernet
   at the root and insert a literal header carrying the egress port's MAC, which
@@ -163,7 +210,7 @@ result independently of those temporary files.
   on the original MAC pair and rebuilding with the matched source; production
   integration does not. `test_flowtable_service_multicast_bridge.py` checks IP
   source and hop count only, so it cannot catch the rewrite; the fix needs a
-  wire-level MAC assertion. See [the hardware investigation](docs/flowtable-multicast-hardware.md).
+  wire-level MAC assertion. See [the hardware investigation](docs/flowtable/multicast-hardware.md).
 
 - [ ] **A188 — a group that is both bridged and routed is carried once, not
   merged.** The classifier keeps one group id and one root entry per address
@@ -176,7 +223,7 @@ result independently of those temporary files.
   deciding which learner owns the retirement of a listener the other
   contributed, and neither keeps the state for that today; it also has to fit
   both sets inside `CDX_MC_MAX_LISTENERS`. Deferred rather than guessed at.
-  See the [routed multicast design](flowtable-multicast-routed.md).
+  See the [routed multicast design](docs/flowtable/multicast-routed.md).
 
 - [ ] **A187 — `display_l3hdr_insert_opc()` decodes the wrong bits of the tunnel insert word.**
   `patches/kernel/010-ask-fman-dpaa-ehash.patch`, the debug decoder for
@@ -198,7 +245,7 @@ result independently of those temporary files.
   reach their destination; only the acceleration is missing. No production
   topology on this box needs it today. To enable: reconcile the session and
   tunnel dst-MAC contracts so the tunnel arm runs when both are present. See
-  the [tunnel design](flowtable-tunnels.md).
+  the [tunnel design](docs/flowtable/tunnels.md).
 
 - [ ] **A181 — ask-flowtable render buffer can reject a validated maximal policy.**
   `flowtable/src/`: the conf validator accepts up to 256 scope + 256 exclude rules,
@@ -209,28 +256,6 @@ result independently of those temporary files.
   policy approaches it, but size the render buffer to the worst-case expansion, or cap
   the rule count against it, so validation and rendering agree. Found in the C daemon's
   adversarial review.
-
-- [ ] **A142 — the interface-statistics offset field is too narrow for its own
-  pool.** `cdx_init_stats` carves one MURAM region as 4 `cdx_pppoe_iface_ifinfo`
-  followed by 124 `cdx_iface_ifinfo`, but the two pools index it with different
-  divisors: timestamped records divide by `sizeof(en_ehash_stats_with_ts)` (24)
-  and plain ones by `sizeof(en_ehash_stats)` (16), measured from the same base.
-  Plain indices therefore run 12..259 while every consumer field that carries
-  one — `vlan_stats_offsets[]`, `pppoe_stats_offset`, `ether_stats_offset` in
-  `struct dpa_l2hdr_info` — is `uint8_t`. The last two plain records (122 and
-  123) yield 256..259, which truncate to 0..3: indices inside the *timestamped*
-  pool. A VLAN, tunnel or Ethernet interface allocated that late would have the
-  microcode's counter update land on a PPPoE session's record. Reaching it needs
-  roughly 123 registered logical interfaces, which is why it has never been
-  seen, and the flowtable owner cannot reach it at all — `ifstats_slot_index`
-  refuses an out-of-range index rather than truncating, and
-  `tools/host_tests/ifstats.c` pins the record where aliasing starts.
-  Second symptom, same cause: `STATS_WITH_TS` is `1 << 7`, so every plain index
-  from 128 up (record 58 onward) carries it without meaning it. Nothing masks a
-  plain index today, but item 9's per-VLAN read-back must not use the bit to
-  tell the pools apart. Fixing it means widening the fields, or numbering both
-  pools in the same units, and touches the legacy encoder — not the flowtable
-  path.
 
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
@@ -253,37 +278,10 @@ result independently of those temporary files.
   UDP loss were not isolated. RPS across four CPUs and serializing the flow
   admission workqueue did not resolve it; both settings were restored.
   The accepted paced-capacity result remains recorded in
-  [capacity validation](docs/flowtable-capacity.md). If revisited, measure RX
+  [capacity validation](docs/flowtable/capacity.md). If revisited, measure RX
   buffer and miss-policer drops separately before changing either mechanism.
   Captures, image identity and diagnostic scripts:
   `/tmp/ask-flowtable-burst/` on `vision` (temporary artifacts).
-
-- [ ] **A79.** `cmmUpdateFlows` iterator invalidation (A76 residue): the nested
-  local-registration recursion (`____cmmCtLocalRegister → __cmmRouteLocalNew
-  → ____cmmCtRegister`) reaches `__cmm_ct_get_SA`, which on an SPI-mismatch
-  rekey `list_del`s (and may head-`list_add` onto another SA) the
-  `list_by_sa` node the outer walk saved as `next` — so the next
-  `container_of` walks a moved/foreign node. **Investigated (2026-08-20):
-  no safe localized fix.** ct *objects* are pointer-stable (the reprogram
-  path never frees a ctTable — only the deregister path does), so this is
-  list-node movement, not UAF. The current node is already `list_del`'d
-  before the reprogram; the hazard is the saved-next. Exposed walks:
-  `cmmUpdateFlows` and `cmmUpdateCtEntriesInFlowNoSAList` (both hold a
-  saved-next across the reprogram); `cmmUpdateFlowsWithNewSAInfo`'s own loop
-  is safe (touches no list) but funnels into `cmmUpdateFlows`. "Re-fetch
-  next from the head" fails: `list_add` is head-insert, so a ct re-added by
-  the recursion is re-read — terminates for the three `SA_DELETE` paths
-  (the `SA_DELETE` gate refuses re-link) but infinite-loops the two
-  non-delete cases (flow_no_sa re-add, rekey-to-old-SA). A snapshot needs
-  per-node re-validation that it still references this SA/direction plus a
-  dynamically-sized copy of an unbounded list. Fix shape (design): a
-  per-pass generation/visited marker on `ctTable`, or a walk-in-progress
-  guard that stops the A76 recursion from re-entering a list being walked —
-  new struct field, deliberate change. **Decision (2026-09-01): keep open and
-  documented, do not fix** — a rare, non-UAF mis-iteration behind a contrived
-  trigger does not justify a deliberate hot-path change with its own regression
-  risk. If ever fixed, prefer the visited/generation marker (fails safe). Revisit
-  only on a field sighting or a planned flow-walk refactor. Open (deferred, low).
 
 ## Feature enablement (not bugs)
 
@@ -293,12 +291,12 @@ Each path either never executes in this deployment or fails cleanly if invoked
 the product decides to enable that feature. The enabling recipe is kept with
 each so the open bug list stays honest.
 
-- [ ] **A38 — macvlan hardware offload.** cmm already sends
+- [ ] **A38 — macvlan hardware offload.** CMM sent
   FPP_CMD_MACVLAN_ENTRY/RESET on macvlan interface events (`itf.c`
-  cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx has no
-  FC_MACVLAN/EVENT_MACVLAN handler, so a send returns ERR_UNKNOWN_COMMAND. The
-  gateway creates no macvlan netdevs today (CONFIG_MACVLAN built but unused), so
-  it is inert; the cmm sender is deliberately kept.
+  cmmFeMacVlanUpdate, gated on ITF_MACVLAN), but cdx never had an
+  FC_MACVLAN/EVENT_MACVLAN handler, and the flowtable adapter has no macvlan
+  path either. The gateway creates no macvlan netdevs today (CONFIG_MACVLAN
+  built but unused).
   **Decision (2026-09-11): defer.** Traffic terminating on a local macvlan
   endpoint still needs kernel and application processing; a separate MAC
   does not make it an offloadable forwarding path. No concrete forwarding
@@ -354,7 +352,7 @@ file's git history.
   LAN/WAN replicas. Every expected receiver got all 256 sequences once per window;
   no malformed copies or kernel reports, and teardown left no test routes or devices.
   WAN replication uses the existing VLAN 3900 because this bench filters VLAN 320.
-  See [measurements and artifacts](docs/flowtable-multicast-routed.md#a158-hardware-completion--2026-09-21).
+  See [measurements and artifacts](docs/flowtable/multicast-routed.md#a158-hardware-completion--2026-09-21).
 
 - [x] **A189.** Routed bridge oifs omitted multicast router ports — fixed in kernel patch
   161 and `ft_mr_expand_bridge()`: snapshot the live MDB/router union per protocol and
@@ -366,7 +364,7 @@ file's git history.
   ten rejected regression mutations, 158 host tests, ARM64 `-Werror` checks and a full
   KASAN image build. The image was staged and booted for A158; its plain VLAN-oif
   cases do not cover A189's bridge/router semantics, whose DUT validation remains pending.
-  See [routed multicast](docs/flowtable-multicast-routed.md#a189-follow-up--2026-09-21).
+  See [routed multicast](docs/flowtable/multicast-routed.md#a189-follow-up--2026-09-21).
 
 - [x] **A140.** Repeated teardown of a retiring flow cleared a newer flow's conntrack
   offload bit and shortened its timeout — fixed in _6e50c4f_: kernel patch 142 hands the
@@ -433,7 +431,7 @@ file's git history.
 - [x] **A159.** A bound flowtable stopped the port's rx counters: the SDK driver counted a frame only
   when `netif_receive_skb()` returned other than `NET_RX_DROP`, which a frame stolen on the ingress
   hook always does — fixed (this commit): patch 104 counts before the handoff; hardware-forwarded
-  frames come from the firmware records `dev_get_stats()` folds in, see `docs/flowtable-statistics.md`.
+  frames come from the firmware records `dev_get_stats()` folds in, see `docs/flowtable/statistics.md`.
 
 - [x] **A165.** The "single TX worker is the wire-to-Wi-Fi ceiling" was an instrumentation artifact:
   a production-config kernel (no KASAN/lockdep/kmemleak) with the flow offloaded runs 654 Mbit/s median,
@@ -730,6 +728,12 @@ file's git history.
   boot on eth4 rx>0 with static neighbors). Reopen if it recurs.
 
 ## Corrections to the original review (wontfix / not-a-bug)
+
+- [-] **A142 (wontfix, CMM retirement).** Interface-statistics offsets truncating
+  past record 121 — reachable only through CMM's interface registration, now retired (this commit).
+
+- [-] **A79 (wontfix, CMM retirement).** `cmmUpdateFlows` iterator invalidation —
+  CMM no longer runs; the source is kept only as reference (this commit).
 
 - [-] **A156 (wontfix, CMM retirement).** A failed legacy multicast UPDATE in
   `cdx_update_mcast_group()` leaves listeners from earlier in the batch live,

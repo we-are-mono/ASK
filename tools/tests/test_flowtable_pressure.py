@@ -4,9 +4,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import os
-
-import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
@@ -15,9 +12,6 @@ from test_flowtable_offload import ARTIFACTS, DPORT, TABLE, WAN_IP, command, con
 from test_flowtable_policy import apply, candidate, expected_hash, installed, policy_to_conf, stop
 from test_flowtable_selective_neighbour import hardware, keys, warm
 from test_flowtable_tcp import software_tx
-
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 
 
 async def test_flowtable_concurrent_policy_and_routes(connections):

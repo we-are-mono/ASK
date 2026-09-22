@@ -5,7 +5,6 @@ import asyncio
 from contextlib import asynccontextmanager
 import gzip
 import json
-import os
 from pathlib import Path
 import time
 
@@ -16,9 +15,6 @@ from test_flowtable_offload import console_command, console_python, read, rig  #
 from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_service import (FAULT_DIR, FLOWS, blocked_probe,
                                     service, service_status, supervision_status, wait_service)  # noqa: F401
-
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit flowtable boot")
 
 
 async def wait_json(r, path, timeout=25):

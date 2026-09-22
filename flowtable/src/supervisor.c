@@ -48,13 +48,6 @@ static int64_t now_ms(void)
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static bool active_owner(void)
-{
-	char owner[16];
-	ft_offload_owner(owner);
-	return !strcmp(owner, "flowtable");
-}
-
 static int socket_address(struct sockaddr_un *addr)
 {
 	memset(addr, 0, sizeof(*addr));
@@ -150,7 +143,7 @@ int ft_supervise(const char *conf, int readyfd)
 			if (!stop_due) { kill(state.worker, SIGTERM); stop_due = now + FT_SUPERVISOR_STOP_MS; }
 			if (!killed && now >= stop_due) { kill(state.worker, SIGKILL); killed = true; }
 		} else if (!state.worker && now >= due) {
-			if (!active_owner()) {
+			if (!ft_cdx_present()) {
 				due = now + FT_SUPERVISOR_MAX_MS;
 			} else {
 				state.worker = spawn_worker(conf);
@@ -258,7 +251,11 @@ static int launch(const char *conf)
 	int rc = request('P', &state);
 	if (!rc) return state.stopping ? -1 : 0;
 	if (rc < 0) return -1;
-	if (!active_owner()) return 0;
+	if (!ft_cdx_present()) {
+		fprintf(stderr, "ask-flowtable: cdx not loaded; not starting\n");
+		ft_log(LOG_NOTICE, "cdx not loaded; not starting");
+		return 0;
+	}
 	int p[2];
 	if (pipe2(p, O_CLOEXEC | O_NONBLOCK)) return -1;
 	signal(SIGCHLD, SIG_DFL);

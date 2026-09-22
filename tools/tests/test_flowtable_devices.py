@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
-
-import pytest
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import FLOWS, by_key, connections, peer  # noqa: F401
@@ -13,8 +10,6 @@ from test_flowtable_offload import command, upper_roundtrip, rig  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_tcp import software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 DUMMY, RENAMED, BRIDGE = "askftdev0", "askftdev1", "askftdevbr"
 
 

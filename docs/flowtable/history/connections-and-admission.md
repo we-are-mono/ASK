@@ -1,6 +1,6 @@
 # Connections, admission and capacity: history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md) · [History index](README.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md) · [History index](README.md)
 
 TCP, independent connection lifetimes, partial-admission recovery and resource pressure.
 

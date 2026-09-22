@@ -339,8 +339,7 @@ void cdx_ft_end(void);
 void cdx_ft_assert_held(void);
 
 /* All operations below require a transaction unless explicitly stated.
- * Claim is exclusive and available only in the per-boot flowtable owner mode.
- * Release requires zero live directions, but CDX keeps any retired hardware
+ * Claim is exclusive. Release requires zero live directions, but CDX keeps any retired hardware
  * storage and its terminal failure state. Neither operation resets hardware.
  */
 int cdx_ft_claim(void);

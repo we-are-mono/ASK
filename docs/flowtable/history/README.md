@@ -1,13 +1,13 @@
 # Flowtable design and validation history
 
-[Project overview](../../linux-flowtable-offload.md) · [Current architecture](../../flowtable-architecture.md)
+[Project overview](../README.md) · [Current architecture](../architecture.md)
 
 These records preserve the consolidated document at `cc34cef`, through the
 full-rate TCP NAT and connection-capacity proofs on 2026-09-15. They are historical evidence, including
 superseded contracts and failed attempts. Current operating guidance lives in the
-[foundation](../../flowtable-foundation.md), [policy](../../flowtable-policy.md)
-and [NAT](../../flowtable-nat.md) guides, with the current admission budget in
-the [capacity guide](../../flowtable-capacity.md).
+[foundation](../foundation.md), [policy](../policy.md)
+and [NAT](../nat.md) guides, with the current admission budget in
+the [capacity guide](../capacity.md).
 
 The split preserves every original section from “Purpose and constraints”
 onward, with only relative Markdown links rebased. The former overview is
@@ -36,7 +36,7 @@ original bench records; they are not a promise of permanent artifact storage.
 | [Static TCP SNAT](tcp-snat.md) | Bulk transfers, idle expiry, retransmission, live policy withdrawal and FIN/RST. |
 | [Static UDP SNAT](udp-snat.md) | Forced translation, endpoint checksums, route recovery and live software fallback. |
 
-The separate [UDP loss investigation](../../flowtable-udp-loss-investigation.md)
+The separate [UDP loss investigation](../udp-loss-investigation.md)
 remains intact. Unexplained failures are retained; later passing measurements do
 not silently reclassify them as fixed.
 

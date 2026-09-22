@@ -1,7 +1,6 @@
 """WAN-initiated IPv4 TCP/UDP port forwarding through native DNAT."""
 import asyncio
 import json
-import os
 import re
 
 import pytest
@@ -16,8 +15,6 @@ from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command,
 from test_flowtable_policy import CONFIG, apply, candidate, stop
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 PUBLIC_PORT = DPORT + 1000
 # Unlike every other flowtable test, these clients bind on the WAN host itself
 # rather than on Loki, so their source ports share a namespace with the sockets

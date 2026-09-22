@@ -1,6 +1,6 @@
 """A158: the flowtable listener ceiling and replication across physical ports.
 
-Run on an idle flowtable-mode DUT. No CMM/FCI and no global daemon kills.
+Run on an idle DUT. No global daemon kills.
 Captures identify every sequence independently on every receiving VLAN.
 """
 from __future__ import annotations
@@ -212,9 +212,6 @@ async def _window(target, session, *, family, group, observers,
 
 
 async def _preflight(target, session):
-    cmdline = await target.fs_read(session, "/proc/cmdline")
-    boot = bytes.fromhex(cmdline["content_hex"]).decode()
-    assert "ask.offload=flowtable" in boot, "A158 requires a flowtable boot; do not boot CMM"
     assert "mroute_groups 0\n" in await flowtable_proc(target, session), \
         "existing multicast routes belong to another workload"
 

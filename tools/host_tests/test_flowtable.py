@@ -110,7 +110,7 @@ def test_flowtable_hardware_ownership(tmp_path):
         + function((ROOT / "cdx/control_tunnel.c").read_text(), "tnl_build_header"))
     (tmp_path / "hardware_production.inc").write_text(source[source.index("struct cdx_ft_hw {"):])
     backend = (ROOT / "cdx/cdx_flowtable_backend.c").read_text()
-    (tmp_path / "backend_production.inc").write_text(backend[backend.index("static char *offload_owner"):])
+    (tmp_path / "backend_production.inc").write_text(backend[backend.index("static bool ft_observe"):])
     binary = tmp_path / "flowtable_hw"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",

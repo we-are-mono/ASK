@@ -16,11 +16,9 @@ Three concerns colocated here, in order of increasing scope:
      the exec_cmd allowlist; -c 1 + the agent's per-call timeout
      bound the wait without needing a new endpoint.
 
-  3. Multi-listener + multi-port-bridge fixtures. These need
-     N parallel VLAN subifs (multi-listener) and a Linux bridge with N
-     VLAN-pseudo-port members (multi-port-bridge). Built on the same
-     finalizer-stack discipline as test_vlan_data_plane.py — partial
-     setup tears down whatever did come up.
+  3. Composable topology fixtures: VLAN subifs on either side and the
+     IPv6 topology, built on a finalizer stack so a partial setup tears
+     down whatever did come up.
 
 By design: no new agent endpoints, no new exec_cmd allowlist
 entries, no /pkt/inject, no pcap storage. Everything here runs on
@@ -48,13 +46,6 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # Every test that creates VLAN subinterfaces on the LAN segment claims its
 # IDs here so they don't collide. pytest runs serially, but teardown races
 # and shared-segment capture still make overlap worth tracking. Claims:
-#   test_vlan_data_plane.py     100          (ASK_VLAN_ID)
-#   test_mcast_pagination.py    201..208     (ASK_MCAST_BASE_VID) + 300 transient
-#   test_mcast_failslab.py      231/232      (ASK_MCAST_FAILSLAB_VID)
-#   test_mcast_concurrent.py    241+         (ASK_MCAST_CONCURRENT_VID)
-#   test_mcast_replication.py   241/242/243  (VLAN_IDS_MCAST)
-#   test_vlan_failslab.py       251          (ASK_VLAN_FAILSLAB_VID)
-#   test_mcast_hcsync_quarantine.py 261..264 (ASK_MCAST_HCSYNC_BASE_VID)
 #   test_flowtable_vlan.py      271/272      (ASK_FLOWTABLE_VLAN_ID, +1 inner)
 #   test_flowtable_bridge.py    273/274/275  (ASK_FLOWTABLE_BRIDGE_VID, +1, +2)
 #   test_flowtable_pppoe.py     276          (ASK_FLOWTABLE_PPPOE_LAN_VID)
@@ -62,7 +53,6 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_flowtable_service_bridge.py 285/286 (trusted/guest bridge membership)
 #   test_mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
 #   test_mroute_capacity.py     311..319     (nine LAN listeners)
-#   bridge helpers              231/232      (VLAN_IDS_BRIDGE)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
@@ -71,12 +61,6 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # side. Do not reuse 3900 for a test that does.
 # test_mroute_capacity.py also receives a tagged WAN replica on that existing
 # device using a temporary packet-socket membership, without reconfiguring it.
-#
-# Overlaps that are safe only because the pairs never run concurrently and
-# both sides tear down in finalizers: bridge 231/232 vs mcast_failslab
-# 231/232; mcast_replication 241/242/243 vs mcast_concurrent 241+.
-VLAN_IDS_MCAST: tuple[int, int, int]  = (241, 242, 243)
-VLAN_IDS_BRIDGE: tuple[int, int]      = (231, 232)
 VLAN_ID_MROUTE: int                   = 244
 VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
 VLAN_ID_PPPOE_WAN: int                = 3900
@@ -672,77 +656,6 @@ async def ipv6_topology(aiohttp_session, target_agent, lan):
                 await cleanup()
             except Exception as e:
                 warnings.warn(f"ipv6_topology cleanup failed: {e}")
-
-
-@pytest_asyncio.fixture
-async def multi_listener_subifs(aiohttp_session, target_agent, lan):
-    """N=3 VLAN subifs on the DUT's LAN-facing port (TARGET_LAN_IF,
-    eth3 by default) + matching subifs on the LAN VM.
-
-    Yields list of (target_iface, lan_iface, vlan_id) tuples. CMM picks
-    up the target-side NEWLINK netlink events and registers each VLAN
-    in the FMAN onif table — prerequisite for mcast ADD's
-    get_onif_by_name(listener) resolution.
-    """
-    stack = TopologyStack()
-    listeners: list[tuple[str, str, int]] = []
-    try:
-        for vid in VLAN_IDS_MCAST:
-            t = await dut_vlan_subif(
-                stack, target_agent, aiohttp_session,
-                parent=TARGET_LAN_IF, vid=vid,
-            )
-            l = await lan_vlan_subif(
-                stack, lan, parent=LAN_NIC, vid=vid,
-            )
-            listeners.append((t, l, vid))
-
-        # Let CMM/netlink propagate the NEWLINKs.
-        await asyncio.sleep(1.0)
-        yield listeners
-    finally:
-        await stack.teardown("multi_listener_subifs")
-
-
-@pytest_asyncio.fixture
-async def bridge_with_n_ports(aiohttp_session, target_agent):
-    """Linux bridge `br_test_abm` on the DUT with N=2 VLAN-pseudo-port
-    members on TARGET_LAN_IF. Yields (bridge_name, [port_iface, ...]).
-
-    Single-physical-link constraint applies — a stimulus-validity gate
-    must run before this fixture is used to assert anything about
-    BREVENT_PORT_DOWN behaviour.
-    """
-    bridge = "br_test_abm"
-    stack = TopologyStack()
-
-    async def _exec(*argv: str):
-        return await target_agent.exec_cmd(aiohttp_session, list(argv))
-
-    ports: list[str] = []
-    try:
-        await _exec("ip", "link", "del", bridge)  # idempotent
-        r = await _exec("ip", "link", "add", "name", bridge, "type", "bridge")
-        assert r["rc"] == 0, f"bridge add {bridge}: {r}"
-
-        async def _cleanup_bridge():
-            await _exec("ip", "link", "del", bridge)
-        stack.push(_cleanup_bridge)
-
-        r = await _exec("ip", "link", "set", bridge, "up")
-        assert r["rc"] == 0, f"bridge up {bridge}: {r}"
-
-        for vid in VLAN_IDS_BRIDGE:
-            port = await dut_vlan_subif(
-                stack, target_agent, aiohttp_session,
-                parent=TARGET_LAN_IF, vid=vid, master=bridge,
-            )
-            ports.append(port)
-
-        await asyncio.sleep(0.5)
-        yield bridge, ports
-    finally:
-        await stack.teardown("bridge_with_n_ports")
 
 
 # ---- helpers for golden-file paths ----------------------------------------

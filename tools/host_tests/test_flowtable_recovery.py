@@ -21,7 +21,7 @@ def controller(tmp_path):
     src.mkdir()
     replacements = {
         "/proc/cdx_flowtable": str(tmp_path / "backend"),
-        "/sys/module/cdx/parameters/offload_owner": str(tmp_path / "owner"),
+        "/sys/module/cdx": str(tmp_path / "cdx"),
         "/run/lock/ask-flowtable.lock": str(tmp_path / "lock"),
         "/run/lock/ask-flowtable.paused": str(tmp_path / "paused"),
         "/etc/ask/offload.conf": str(tmp_path / "policy"),
@@ -73,10 +73,10 @@ int ft_enumerate(struct ft_policy *p) {
     ], check=True)
     shutil.copyfile(Path(__file__).with_name("flowtable_nft.py"), tmp_path / "nft")
     (tmp_path / "nft").chmod(0o755)
-    (tmp_path / "owner").write_text("flowtable\n")
+    (tmp_path / "cdx").mkdir()
     (tmp_path / "policy").write_text(POLICY)
     (tmp_path / "backend").write_text(
-        "owner flowtable\nbindings 0\nentries 0\nhandle_refs 0\nneighbour_refs 0\n"
+        "bindings 0\nentries 0\nhandle_refs 0\nneighbour_refs 0\n"
         "quarantine 0\nfatal 0\nobserve 0\ninvalidated 0\n"
         "installs 0\ndeletes 0\nrearms 0\nerrors 0\nqos_mark_mask 0\n")
     os.mkfifo(tmp_path / "events")
@@ -329,7 +329,7 @@ def test_foreign_backend_bindings_are_never_replaced(controller):
         c.wait(c.ready)
 
 
-@pytest.mark.parametrize("field,value", [("fatal", 1), ("observe", 1), ("owner", "cmm")])
+@pytest.mark.parametrize("field,value", [("fatal", 1), ("observe", 1)])
 def test_inactive_or_fatal_backend_is_not_rearmed(controller, field, value):
     c = controller
     c.backend(**{field: value})
@@ -337,8 +337,22 @@ def test_inactive_or_fatal_backend_is_not_rearmed(controller, field, value):
         time.sleep(0.5)
         assert not c.calls("delete") and not c.calls("-f") and not c.calls("--check")
         if field != "fatal":
-            c.backend(**{field: "flowtable" if field == "owner" else 0})
+            c.backend(**{field: 0})
             c.wait(c.ready)
+
+
+def test_absent_adapter_is_retried_until_it_returns(controller):
+    """CDX without the adapter (e.g. across an ask_flowtable reload) keeps
+    the controller running: it installs nothing, then recovers by itself."""
+    c = controller
+    backend = c.root / "backend"
+    header = backend.read_text()
+    backend.unlink()
+    with c.daemon():
+        time.sleep(0.5)
+        assert not c.calls("-f") and not c.calls("--check")
+        backend.write_text(header)
+        c.wait(c.ready)
 
 
 def test_inspection_error_does_not_authorize_install(controller):

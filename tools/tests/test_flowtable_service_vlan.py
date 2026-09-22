@@ -7,7 +7,6 @@ import os
 import struct
 import time
 
-import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
@@ -18,8 +17,6 @@ from test_flowtable_selective_neighbour import hardware, unchanged, warm
 from test_flowtable_service import (FAULT_DIR, FIRST, managed_service, service_status,
                                     supervision_status, wait_service)
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires the flowtable service on the DUT")
 VID = 284
 DUT_IF = f"{TARGET_LAN_IF}.{VID}"
 LAN_IF = "askftvlan"

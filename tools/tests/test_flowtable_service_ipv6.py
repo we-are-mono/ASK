@@ -20,8 +20,6 @@ from test_flowtable_selective_neighbour import hardware, keys, unchanged, warm
 from test_flowtable_service import FIRST, managed_service, supervision_status, wait_service
 from test_flowtable_service_vlan import attempts, balanced, denied, received
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires the flowtable service on the DUT")
 NETNS, LAN_IF = "ask-ft-service-ipv6", "askftsv6"
 LAN_GATEWAY, NEXT_HOP = "fd42:6173:6:1::1", "fd42:6173:6:1::2"
 WAN_GATEWAY, WAN = "fd42:6173:6:2::1", "fd42:6173:6:2::2"

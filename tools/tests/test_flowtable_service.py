@@ -12,7 +12,6 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import ipaddress
-import os
 from pathlib import Path
 import time
 
@@ -26,8 +25,6 @@ from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command,
                                     console_command, console_python, flowtable_json, read, rig)  # noqa: F401
 from test_flowtable_selective_neighbour import hardware, warm
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires a flowtable boot and staged recovery controller")
 DAEMON = "/usr/sbin/ask-flowtable"
 INIT = "/etc/init.d/ask-flowtable"
 CONF = "/etc/ask/offload.conf"

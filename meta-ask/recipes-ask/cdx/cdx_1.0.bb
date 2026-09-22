@@ -23,7 +23,7 @@ EXTRA_OEMAKE += "KERNELDIR=${STAGING_KERNEL_DIR} PLATFORM=LS1046A CONFIG_ASK_CDX
 #   CDX_DEBUG_KEY_ZEROING    - cdx_dpa_ipsec.c freed-key snapshot;
 #                              see tools/tests/test_ipsec_key_zeroing.py
 #   CDX_DEBUG_MC_HCSYNC_FAIL - dpa_control_mc.c HC-sync fault injection;
-#                              see tools/tests/test_mcast_hcsync_quarantine.py
+#                              no flowtable-mode driver yet (ISSUES.md A193)
 #   CDX_DEBUG_IPSEC_TEST_XFRM - control_ipsec.c by-SPI xfrm fallback so a
 #                              synthetic NAT-T SA can clear the fast-path
 #                              gate with a real, pre-created `ip xfrm`

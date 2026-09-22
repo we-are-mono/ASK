@@ -1,4 +1,4 @@
-"""One routed connection through a real LAN gateway, without CMM or NAT."""
+"""One routed connection through a real LAN gateway, without NAT."""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -15,8 +15,6 @@ from test_flowtable_arp import (CHANGED_MAC, arp_environment, check_arp_trace, i
                               wait_neighbour)
 from test_flowtable_tcp import BLOCK, connection, hardware_transfer, installed
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 NETNS = "ask-ft-gateway"
 ROUTER_IF, PEER_IF = "askftgw", "askftpeer"
 ROUTER_IP, PEER_IP = "198.18.27.1", "198.18.27.2"

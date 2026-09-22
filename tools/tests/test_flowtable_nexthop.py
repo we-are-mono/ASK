@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
-
-import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_WAN_IF
@@ -18,8 +15,6 @@ from test_flowtable_offload import (ARTIFACTS, WAN_IP, command, console_command,
 from test_flowtable_selective_neighbour import hardware, warm
 from test_flowtable_tcp import software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 NHID = "42135"
 
 

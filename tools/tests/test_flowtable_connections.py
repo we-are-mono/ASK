@@ -5,11 +5,9 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import socket
-import os
 from pathlib import Path
 import secrets
 
-import pytest
 import pytest_asyncio
 
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
@@ -18,8 +16,6 @@ from test_flowtable_offload import (DPORT, HEALTH_BASELINE, SPORT as BASE_SPORT,
                                     command, read, rig)  # noqa: F401
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 # Keep this set separate from the single-connection regressions' TCP TIME_WAIT.
 SPORT = BASE_SPORT + 32
 FLOWS = [{"id": i, "proto": "tcp" if i & 1 else "udp", "sport": SPORT + i // 2}

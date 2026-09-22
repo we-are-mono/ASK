@@ -1,11 +1,10 @@
-"""Ordinary ARP on the direct-route flowtable topology, without CMM."""
+"""Ordinary ARP on the direct-route flowtable topology."""
 from __future__ import annotations
 
 import asyncio
 import base64
 from contextlib import asynccontextmanager
 import json
-import os
 from pathlib import Path
 import time
 
@@ -15,8 +14,6 @@ from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
 from test_flowtable_tcp import BLOCK, connection, hardware_transfer, installed, software_tx
 
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 CHANGED_MAC = "02:9d:99:b2:33:02"
 PEER = Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
 

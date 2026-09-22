@@ -1,8 +1,7 @@
-"""ABI tripwire — fail CI on silent renumbering of CDX commands or ioctls.
+"""ABI tripwire — fail CI on silent renumbering of CDX ioctls.
 
-The golden snapshot at golden/cdx_abi_snapshot.json pins:
-  - every CMD_* code in EXACT/BOUNDED/PERMISSIVE buckets
-  - every CDX_CTRL_* ioctl encoding
+The golden snapshot at golden/cdx_abi_snapshot.json pins every CDX_CTRL_*
+ioctl encoding.
 
 A renumber, deletion, or addition without bumping the snapshot fails this
 test with a structured diff. To accept the change deliberately, regenerate:
@@ -18,7 +17,6 @@ import json
 import os
 from pathlib import Path
 
-import _cmd_catalog as cat
 import _ioctl as ic
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "cdx_abi_snapshot.json"
@@ -34,19 +32,8 @@ def _ioctl_encodings() -> dict[str, int]:
 
 
 def _build_snapshot() -> dict:
-    exact, bounded, permissive = cat.build_catalogs()
     return {
         "version": SNAPSHOT_VERSION,
-        "_cmd_catalog": {
-            "exact":      [list(t) for t in exact],
-            "bounded":    [list(t) for t in bounded],
-            "permissive": [list(t) for t in permissive],
-            "counts": {
-                "exact":      len(exact),
-                "bounded":    len(bounded),
-                "permissive": len(permissive),
-            },
-        },
         "_ioctl": _ioctl_encodings(),
     }
 
@@ -63,27 +50,8 @@ def _diff_dict(name: str, golden: dict, current: dict) -> list[str]:
     return out
 
 
-def _diff_pairs(name: str, golden_pairs: list, current_pairs: list) -> list[str]:
-    g = {k: v for k, v in golden_pairs}
-    c = {k: v for k, v in current_pairs}
-    return _diff_dict(name, g, c)
-
-
 def _diff(golden: dict, current: dict) -> list[str]:
-    diffs: list[str] = []
-    for bucket in ("exact", "bounded", "permissive"):
-        diffs.extend(_diff_pairs(
-            f"_cmd_catalog.{bucket}",
-            golden["_cmd_catalog"][bucket],
-            current["_cmd_catalog"][bucket],
-        ))
-    diffs.extend(_diff_dict(
-        "_cmd_catalog.counts",
-        golden["_cmd_catalog"]["counts"],
-        current["_cmd_catalog"]["counts"],
-    ))
-    diffs.extend(_diff_dict("_ioctl", golden["_ioctl"], current["_ioctl"]))
-    return diffs
+    return _diff_dict("_ioctl", golden["_ioctl"], current["_ioctl"])
 
 
 def test_abi_snapshot():

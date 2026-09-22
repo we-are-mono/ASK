@@ -9,8 +9,8 @@ struct net_device;
 struct netlink_ext_ack;
 
 /* Claim the netdev's ndo_setup_tc and start serving TC_SETUP_QDISC_HTB.
- * cdx owns the registration because CEETM is cdx's, and because cdx is loaded
- * in both ownership modes while the flowtable adapter is loaded in one. */
+ * cdx owns the registration because CEETM is cdx's, and because cdx stays
+ * loaded while the flowtable adapter can come and go. */
 int cdx_htb_init(void);
 void cdx_htb_exit(void);
 

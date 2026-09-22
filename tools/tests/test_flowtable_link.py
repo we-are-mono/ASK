@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
-
-import pytest
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
@@ -15,9 +12,6 @@ from test_flowtable_mtu import table_identity
 from test_flowtable_offload import (ARTIFACTS, DPORT, WAN_IP, command, console_command, read, rig,  # noqa: F401
                                     status_text)
 from test_flowtable_selective_neighbour import hardware, warm
-
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                               reason="requires an explicit experimental boot")
 
 
 async def test_flowtable_link_recovery(connections):

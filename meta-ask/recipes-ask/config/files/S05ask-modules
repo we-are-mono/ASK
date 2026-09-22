@@ -7,14 +7,13 @@
 ### END INIT INFO
 
 # Read /etc/modules-load.d/ask.conf and modprobe each non-comment line in order.
-# Order matters: cdx before fci, auto_bridge after cdx.
+# cdx brings the flowtable adapter up right behind it.
 
 CONF=/etc/modules-load.d/ask.conf
 
 case "$1" in
     start|"")
         [ -r "$CONF" ] || exit 0
-        owner=cmm
         observe=0
         # ASK-DEBUG defaults on here and nowhere else. This is the development
         # image: the question "why was that flow not offloaded" is the one it
@@ -25,14 +24,13 @@ case "$1" in
         askdebug=1
         for arg in $(cat /proc/cmdline); do
             case "$arg" in
-                ask.offload=*) owner=${arg#ask.offload=} ;;
                 ask.flowtable_observe=*) observe=${arg#ask.flowtable_observe=} ;;
                 ask.debug=*) askdebug=${arg#ask.debug=} ;;
             esac
         done
-        case "$owner:$observe" in
-            cmm:0|flowtable:0|flowtable:1) ;;
-            *) echo "Invalid ASK offload boot selection: $owner:$observe" >&2; exit 1 ;;
+        case "$observe" in
+            0|1) ;;
+            *) echo "Invalid ask.flowtable_observe: $observe" >&2; exit 1 ;;
         esac
         # ASK-DEBUG prints per flow at KERN_INFO. On the serial console that
         # is a line for every refused direction of every offloaded flow, in
@@ -44,13 +42,8 @@ case "$1" in
         while read -r mod; do
             case "$mod" in ''|'#'*) continue ;; esac
             if [ "$mod" = cdx ]; then
-                modprobe cdx offload_owner="$owner" flowtable_observe="$observe" \
-                        ask_debug="$askdebug" || exit 1
-                if [ "$owner" = flowtable ]; then
-                    modprobe ask_flowtable || exit 1
-                fi
-            elif [ "$owner" = flowtable ] && { [ "$mod" = fci ] || [ "$mod" = auto_bridge ]; }; then
-                continue
+                modprobe cdx flowtable_observe="$observe" ask_debug="$askdebug" || exit 1
+                modprobe ask_flowtable || exit 1
             else
                 modprobe "$mod" || exit 1
             fi

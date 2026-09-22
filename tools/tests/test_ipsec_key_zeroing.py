@@ -42,7 +42,6 @@ neither. If that changes, this test must be revisited.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import pytest
 
@@ -56,11 +55,6 @@ from _ipsec_helpers import (
     sa_install_probe,
 )
 from _topology import TARGET_WAN_IF
-
-# The adapter owns IPsec only in a flowtable boot; in a CMM boot the ports
-# advertise no offload and there is nothing here to talk to.
-pytestmark = pytest.mark.skipif(os.environ.get("ASK_FLOWTABLE_TESTS") != "1",
-                                reason="requires an explicit flowtable boot")
 
 # Documentation-range endpoints, distinct from every other IPsec file's so the
 # tests can run in any order.

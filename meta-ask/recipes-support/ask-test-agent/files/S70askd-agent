@@ -1,7 +1,7 @@
 #!/bin/sh
 ### BEGIN INIT INFO
 # Provides:          askd-agent
-# Required-Start:    cmm gateway-setup
+# Required-Start:    ask-flowtable gateway-setup
 # Default-Start:     S
 # Short-Description: ASK test-harness on-target HTTP/JSON agent
 ### END INIT INFO

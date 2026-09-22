@@ -45,8 +45,6 @@ IMAGE_INSTALL = " \
     \
     \
     cdx \
-    fci \
-    auto-bridge \
     sfp-led \
     lp5812-driver \
     config \
@@ -64,7 +62,6 @@ IMAGE_INSTALL = " \
     kernel-module-ip6-tables \
     kernel-module-ip6table-filter \
     kernel-module-ip6table-mangle \
-    cmm \
     dpa-app \
     dnsmasq \
     fmc \

@@ -7,11 +7,11 @@ C7: off-by-one `fm_index > num_fmans` (should be `>=`).
 C8: `queue_no` / `port_idx` / `dscp` bound checks.
 C9b: CDX_CTRL_DPA_CONNADD was deleted — invoking it must return ENOTTY.
 
-Only C6 is driven via CDX_CTRL_DPA_SET_PARAMS and thus testable at the
-ioctl layer. C7/C8 are reachable only via specific control_*.c paths
-that would need a valid params setup first — they're covered by the
-FCI fuzzer's payload-mutation pass (test_fci_fuzz.py). This file just
-exercises the ioctl-surface bounds: C6 + C9b.
+Only C6 is driven via CDX_CTRL_DPA_SET_PARAMS. Once the flowtable adapter
+has claimed the backend at boot that ioctl is refused outright, so this
+file pins the refusal and the host test pins the bounds behind it. C7/C8
+are reachable only via specific control_*.c paths, not from the ioctl
+surface. This file exercises the ioctl surface: C6 + C9b.
 """
 
 from __future__ import annotations
@@ -42,36 +42,27 @@ CDX_MAX_FMANS = 16
 
 
 @pytest.mark.parametrize("num_fmans", [
-    0xFFFFFFFF,        # wraps most signed comparisons
-    10_000,            # 625× the cap
+    0,                 # would leave fman_info unset
+    1,                 # well-formed count, still a reconfiguration
     CDX_MAX_FMANS + 1, # just past the cap
+    10_000,            # 625× the cap
+    0xFFFFFFFF,        # wraps most signed comparisons
 ])
-async def test_c6_num_fmans_above_cap_rejected(
+async def test_c6_set_params_refused_once_sealed(
     aiohttp_session, target_agent, splat_window, num_fmans,
 ):
-    """CDX_MAX_FMANS=16; anything larger must be rejected before alloc."""
+    """The flowtable adapter claims the backend at boot, which seals CDX's
+    configuration: from then on every CDX_CTRL_DPA_SET_PARAMS is refused
+    before its contents are read, however malformed. The num_fmans bounds
+    behind the seal (0 and above CDX_MAX_FMANS -> EINVAL before any
+    allocation) are pinned by tools/host_tests/cdx_startup.c."""
     data = _set_params_struct(num_fmans=num_fmans)
     r = await target_agent.ioctl_send(
         aiohttp_session,
         device=DEVICE, cmd=CDX_CTRL_DPA_SET_PARAMS, data=data,
     )
-    assert r.get("errno") == errno.EINVAL, (
-        f"num_fmans={num_fmans}: expected EINVAL before allocation, got {r}"
-    )
-
-
-async def test_c6_num_fmans_zero_rejected(
-    aiohttp_session, target_agent, splat_window,
-):
-    """0 fmans is also rejected — `fman_info` gets dereferenced unconditionally
-    in the post-alloc path (see dpa_cfg.c commit comment)."""
-    data = _set_params_struct(num_fmans=0)
-    r = await target_agent.ioctl_send(
-        aiohttp_session,
-        device=DEVICE, cmd=CDX_CTRL_DPA_SET_PARAMS, data=data,
-    )
-    assert r.get("errno") != 0, (
-        f"num_fmans=0: expected rejection, got rc={r.get('rc')} data={r}"
+    assert r.get("errno") == errno.EOPNOTSUPP, (
+        f"num_fmans={num_fmans}: expected the sealed configuration to refuse, got {r}"
     )
 
 

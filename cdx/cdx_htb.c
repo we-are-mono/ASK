@@ -1007,9 +1007,8 @@ static const struct dpa_qdisc_ops cdx_htb_qdisc_ops = {
 /* The flowtable adapter's half of the ndo.
  *
  * Only one handler can be registered with the driver, and this one is it,
- * because cdx is loaded whichever ownership mode the box booted in while the
- * adapter is loaded in one of them. TC_SETUP_FT therefore arrives here and is
- * passed on. Netfilter chooses between this route and the adapter's indirect
+ * because cdx stays loaded while the adapter can come and go. TC_SETUP_FT
+ * therefore arrives here and is passed on. Netfilter chooses between this route and the adapter's indirect
  * block registration purely on whether the netdev has an ndo_setup_tc at all,
  * so a bind that arrives with nothing registered has to be refused rather than
  * quietly served by neither.
