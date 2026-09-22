@@ -666,4 +666,7 @@ static inline void _dpa_bp_free_pf(void *addr)
 int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs,
 			      bool act_skb);
 
+void dpaa_sec_sg_release(const struct qm_fd *fd, bool free_skb);
+unsigned int dpaa_sec_sg_reap(unsigned int budget);
+
 #endif	/* __DPA_H */
