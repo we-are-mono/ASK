@@ -1,44 +1,517 @@
-From 9bd5602cb8d96ea655627bb7569d988650e24802 Mon Sep 17 00:00:00 2001
+From 256c6ee8ee5c36de0e145930e0b3530f6a8f0db5 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
-Date: Mon, 4 May 2026 18:00:00 +0200
-Subject: [PATCH] sdk_dpaa: use slab_build_skb() for kmalloc'd pool buffers
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Tue, 22 Sep 2026 04:09:54 +0200
+Subject: [PATCH] sdk_dpaa: preserve SEC buffer ownership through receive and
+ completion
 
-dpaa_bp_alloc_n_add_buffs() seeds a BMan pool's buffers via kmalloc()
-and, when act_skb=true, wraps each buffer in an skb via
-build_skb(ptr_buf, 0). Modern kernels (6.0+) added a WARN_ONCE in
-__build_skb_around() that fires when frag_size == 0 — telling the caller
-to use slab_build_skb() instead, which is the dedicated path for slab-
-allocated buffers (it tracks the kmem_cache size and handles the
-alignment-and-truesize accounting correctly).
-
-cdx's IPsec output BMan pool seed (after A23) is the only consumer that
-exercises act_skb=true on this code path, so the warning surfaces at
-cdx module load. behaviorally the kernel auto-corrects via __slab_build_skb
-after warning — so this patch is just removing the WARN noise, not
-fixing a runtime regression. slab_build_skb() is a drop-in replacement
-for build_skb(ptr, 0) on slab buffers.
+Use page-backed skb pools for SG receive. Retain the permanent SGT mapping and record exact payload ownership, unmapping and releasing completed skbs even when traffic becomes idle. Share completion across reuse, rejected enqueues and bounded reaping.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |   3 +
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 393 +++++++-----------
+ 2 files changed, 164 insertions(+), 232 deletions(-)
 
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
+index a653166..b832617 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h
+@@ -689,4 +689,7 @@ struct sk_buff *a050385_realign_skb(struct sk_buff *skb,
+ int skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
+ 			  struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd);
+ 
++void dpaa_sec_sg_release(const struct qm_fd *fd, bool free_skb);
++unsigned int dpaa_sec_sg_reap(unsigned int budget);
++
+ #endif	/* __DPA_H */
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 4854edf74d5f..ce0400ca782a 100644
+index 96d913c..1eb907b 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -197,7 +197,7 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+@@ -134,7 +134,11 @@ static void dpa_bp_recycle_frag(struct dpa_bp *dpa_bp, unsigned long vaddr,
+ 	addr = dma_map_single(dpa_bp->dev, (void *)vaddr, dpa_bp->size,
+ 			      DMA_BIDIRECTIONAL);
+ 	if (unlikely(dma_mapping_error(dpa_bp->dev, addr))) {
++		struct sk_buff *skb, **skbh;
++
+ 		dev_err(dpa_bp->dev, "DMA mapping failed");
++		DPA_READ_SKB_PTR(skb, skbh, (void *)vaddr, -1);
++		dev_kfree_skb_any(skb);
+ 		return;
+ 	}
+ 
+@@ -158,7 +162,8 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+ 	uint32_t bufsize;
+ 
+ 	if (act_skb)
+-		bufsize =  DPAA_EXTRA_BUF_SIZE_4_SKB + dpa_bp->size;
++		bufsize = PAGE_SIZE << get_order(DPAA_EXTRA_BUF_SIZE_4_SKB +
++					       dpa_bp->size);
+ 	else
+ 		bufsize =  SMP_CACHE_BYTES + dpa_bp->size + DPA_MAX_FD_OFFSET + 128;
+ 
+@@ -175,11 +180,21 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+ 		else
+ 			entries_in_bmb = 8;
+ 		for (ii= 0; ii<entries_in_bmb; ii++) {
+-			ptr_buf = (char *)kmalloc(bufsize, GFP_DMA | GFP_ATOMIC);
++			/* Secondary SG buffers become skb page fragments. Their
++			 * storage must remain pinned after the skb shell is freed;
++			 * a page reference cannot retain a kmalloc slab object. */
++			if (act_skb) {
++				struct page *page = alloc_pages(GFP_DMA | GFP_ATOMIC |
++							       __GFP_COMP, get_order(bufsize));
++
++				ptr_buf = page ? page_address(page) : NULL;
++			} else {
++				ptr_buf = kmalloc(bufsize, GFP_DMA | GFP_ATOMIC);
++			}
+ 
+ 			if (unlikely(!ptr_buf))
+ 			{
+-				pr_err("%s(%d) ii %d,  buffs2fill %d kmalloc failed \n",
++				pr_err_ratelimited("%s(%d) ii %d,  buffs2fill %d buffer allocation failed \n",
+ 						__func__,__LINE__,ii, buffs2fill);
+ 				goto handle_fail;
+ 			}
+@@ -195,11 +210,11 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
  				 * We only need enough space to store a pointer, but allocate
  				 * an entire cacheline for performance reasons.
  				 */
 -				skb = build_skb(ptr_buf, 0);
-+				skb = slab_build_skb(ptr_buf);
++				skb = build_skb(ptr_buf, bufsize);
  				if (unlikely(!skb)) {
- 					pr_err("%s(%d) ii %d , buffs2fill %d build_skb failed \n",
+-					pr_err("%s(%d) ii %d , buffs2fill %d build_skb failed \n",
++					pr_err_ratelimited("%s(%d) ii %d , buffs2fill %d build_skb failed \n",
  							__func__,__LINE__, ii, buffs2fill);
+-					kfree(new_buf);
++					put_page(virt_to_head_page(new_buf));
+ 					goto handle_fail;
+ 				}
+ 				ptr_buf = PTR_ALIGN(ptr_buf, SMP_CACHE_BYTES) + SMP_CACHE_BYTES;
+@@ -212,7 +227,7 @@ int dpaa_bp_alloc_n_add_buffs(const struct dpa_bp *dpa_bp, uint32_t nbuffs, bool
+ 			addr = dma_map_single(dev, ptr_buf, dpa_bp->size, DMA_BIDIRECTIONAL);
+ 			if (unlikely(dma_mapping_error(dev, addr)))
+ 			{
+-				pr_err("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
++				pr_err_ratelimited("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
+ 						__func__,__LINE__,ii,buffs2fill);
+ 				if (act_skb)
+ 				{
+@@ -1089,7 +1104,7 @@ static void dma_unmap_skb_sg_addrs(struct device *dev, struct sk_buff *skb,
+ 		sgt_idx++;
+ 
+ 		nr_frags = skb_shinfo(cur_skb)->nr_frags;
+-		while(nr_frags)
++		while (nr_frags && sgt_idx < skb_list_frags)
+ 		{
+ 			addr = qm_sg_addr(&sgt[sgt_idx]);
+ 			dma_unmap_page(dev, addr, qm_sg_entry_get_len(&sgt[sgt_idx]), dma_dir);
+@@ -1123,169 +1138,162 @@ static inline void prepare_qm_sg_entry(struct qm_sg_entry *sgt, int sgt_idx,
+ 	return;
+ }
+ 
+-int __hot skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev , struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd)
++/* The SGT has one permanent bidirectional mapping from pool seeding.
++ * Software ownership lives beyond the largest hardware table, so completion
++ * never has to infer a pointer or mapping device from hardware final bits. */
++#define DPA_SEC_SG_OWNER_OFFSET \
++	ALIGN(sizeof(struct qm_sg_entry) * (DPA_SGT_MAX_ENTRIES + 1), SMP_CACHE_BYTES)
++struct dpa_sec_sg_owner {
++	struct sk_buff *skb;
++	struct device *dev;
++	unsigned int mapped;
++};
++
++static struct dpa_sec_sg_owner *dpa_sec_sg_owner(struct qm_sg_entry *sgt)
+ {
+-	dma_addr_t addr, sg_addr;
+-	struct sk_buff *list_skb;
+-	struct sk_buff *cur_skb;
+-	int  sgt_size;
+-	int err;
++	return (void *)sgt + DPA_SEC_SG_OWNER_OFFSET;
++}
++
++/* Only a successful BMan acquire or a rejected enqueue grants CPU ownership.
++ * The caller holds the buffer until its next release/enqueue, excluding both
++ * concurrent reuse and the idle reaper. */
++static struct qm_sg_entry *dpa_sec_sg_acquire(struct dpa_bp *bp, dma_addr_t addr)
++{
++	dma_sync_single_for_cpu(bp->dev, addr, bp->size, DMA_BIDIRECTIONAL);
++	return phys_to_virt(addr);
++}
++
++static void dpa_sec_sg_complete(struct qm_sg_entry *sgt, bool free_skb)
++{
++	struct dpa_sec_sg_owner *owner = dpa_sec_sg_owner(sgt);
++	struct sk_buff *skb = owner->skb;
++	struct device *dev = owner->dev;
++
++	if (!skb)
++		return;
++	dma_unmap_skb_sg_addrs(dev, skb, sgt, owner->mapped);
++	memset(owner, 0, sizeof(*owner));
++	put_device(dev);
++	if (free_skb)
++		dev_kfree_skb_any(skb);
++}
++
++static void dpa_sec_sg_recycle(struct dpa_bp *bp, dma_addr_t addr)
++{
++	struct bm_buffer bmb = { .opaque = 0 };
++
++	dma_sync_single_for_device(bp->dev, addr, bp->size, DMA_BIDIRECTIONAL);
++	bm_buffer_set64(&bmb, addr);
++	while (bman_release(bp->pool, &bmb, 1, 0))
++		cpu_relax();
++}
++
++/* Synchronous submit failure must preserve the skb for its caller; an
++ * asynchronous rejection owns it and releases it here. */
++void dpaa_sec_sg_release(const struct qm_fd *fd, bool free_skb)
++{
++	struct dpa_bp *bp = smp_load_acquire(&sg_bpool_g);
++	dma_addr_t addr = qm_fd_addr(fd);
++
++	dpa_sec_sg_complete(dpa_sec_sg_acquire(bp, addr), free_skb);
++	dpa_sec_sg_recycle(bp, addr);
++}
++EXPORT_SYMBOL(dpaa_sec_sg_release);
++
++unsigned int dpaa_sec_sg_reap(unsigned int budget)
++{
++	struct dpa_bp *clean = smp_load_acquire(&sg_bpool_g);
++	struct dpa_bp *done = smp_load_acquire(&skb_2bfreed_bpool_g);
++	unsigned int reaped = 0;
++	struct bm_buffer bmb;
++
++	/* The output-pool worker can start before the input pools exist. */
++	if (!clean || !done)
++		return 0;
++	while (reaped < budget && bman_acquire(done->pool, &bmb, 1, 0) == 1) {
++		dma_addr_t addr = bmb.addr;
++
++		dpa_sec_sg_complete(dpa_sec_sg_acquire(clean, addr), true);
++		dpa_sec_sg_recycle(clean, addr);
++		reaped++;
++	}
++	return reaped;
++}
++EXPORT_SYMBOL(dpaa_sec_sg_reap);
++
++int __hot skb_fraglist_to_sg_fd(struct device *dev, struct net_device *net_dev,
++			      struct sk_buff *skb, struct qm_fd *fd, u32 fd_cmd)
++{
++	struct dpa_bp *clean = smp_load_acquire(&sg_bpool_g);
++	struct dpa_bp *done = smp_load_acquire(&skb_2bfreed_bpool_g);
++	struct dpa_sec_sg_owner *owner;
++	struct sk_buff *cur_skb, *list_skb;
+ 	struct qm_sg_entry *sgt;
+ 	struct bm_buffer bmb;
+-	int sgt_index = 0, nr_frags = 0;
+-	const enum dma_data_direction dma_dir = DMA_TO_DEVICE;
+-	int dma_map_size;
++	dma_addr_t addr, sg_addr;
++	unsigned int nr_frags, i;
+ 	skb_frag_t *frag;
+ 
+-	// calculate the number of fragments
+-	// check if any of skb is not recyclable
++	if (!clean || !done ||
++	    clean->size < DPA_SEC_SG_OWNER_OFFSET + sizeof(*owner))
++		return -EINVAL;
+ 	nr_frags = 1 + skb_shinfo(skb)->nr_frags;
+ 	skb_walk_frags(skb, list_skb)
+-	{
+ 		nr_frags += 1 + skb_shinfo(list_skb)->nr_frags;
+-	}
+-
+-	/* The below condition covers nr_frags + 1(This is to store skb address in opaque variable at the end.)*/
+-	if (nr_frags > (DPA_SGT_MAX_ENTRIES))
+-	{
+-		/* Too many fragments for a single SGT: collapse the skb into one
+-		 * contiguous buffer and rebuild the count instead of dropping the
+-		 * frame. This TX/offload path owns an unshared skb (ndo_start_xmit
+-		 * and xfrm_input both hand over skb->users == 1, and this code
+-		 * already rewrites skb->data in place), so skb_linearize() may
+-		 * realloc its data. Only drop if the collapse itself fails (OOM). */
++	if (nr_frags > DPA_SGT_MAX_ENTRIES) {
++		/* The submitter owns the skb and already permits header rewrites. */
+ 		if (skb_linearize(skb))
+-		{
+-			pr_err_ratelimited("%s()::%d skb frags %d crossed the MAX SGT entries %d and linearize failed", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
+-			return -1;
+-		}
+-		/* recompute after linearize -- a linear skb is a single buffer */
+-		nr_frags = 1 + skb_shinfo(skb)->nr_frags;
+-		skb_walk_frags(skb, list_skb)
+-		{
+-			nr_frags += 1 + skb_shinfo(list_skb)->nr_frags;
+-		}
+-		if (nr_frags > (DPA_SGT_MAX_ENTRIES))
+-		{
+-			/* defensive: a linearized skb should collapse to a single entry */
+-			pr_err_ratelimited("%s()::%d number of skb frags %d crossed the MAX SGT entries%d", __func__, __LINE__, nr_frags, DPA_SGT_MAX_ENTRIES);
+-			return -1;
+-		}
++			return -ENOMEM;
+ 	}
+ 
+-	fd->format = qm_fd_sg;
+-	/* allocate an SG buffer from SG BMAN POOL
+-	   if any entries in skb_2bfreed_bpool_g, acquire and free skb and use the SG buffer */
+-	if (bman_acquire(skb_2bfreed_bpool_g->pool, &bmb, 1, 0) == 1)
+-	{
+-		/* Scrub the acquire response's bpid/reserved high bits down to
+-		 * the bare address: __bman_release() ORs the pool id into bits
+-		 * 48-55 rather than overwriting them, so a mid-build error
+-		 * release below would misroute the buffer to a foreign pool if
+-		 * they came back nonzero. */
+-		bmb.opaque = bmb.addr;
+-		sgt =  (struct qm_sg_entry *)phys_to_virt(bmb.addr);
+-		/* Bounded walk: the builder never sets final past index
+-		 * DPA_SGT_MAX_ENTRIES - 1. No final bit inside that bound
+-		 * means a malformed layout whose opaque slot cannot be
+-		 * trusted -- reuse the buffer (memset below) and skip the
+-		 * deferred free. */
+-		while (sgt_index < DPA_SGT_MAX_ENTRIES &&
+-		       !qm_sg_entry_get_final(&sgt[sgt_index]))
+-			sgt_index++;
+-		if (sgt_index < DPA_SGT_MAX_ENTRIES)
+-		{
+-			addr = sgt[sgt_index+1].opaque;
+-			if (addr) /* free the old skb */
+-			{
+-				list_skb =  (struct sk_buff *)(addr);
+-				kfree_skb(list_skb);
+-			}
+-			sgt[sgt_index+1].opaque = 0; /* set to 0*/
+-		}
+-	}
+-	else if (bman_acquire(sg_bpool_g->pool, &bmb, 1, 0) == 1)
+-	{
+-		bmb.opaque = bmb.addr;	/* scrub high bits; see above */
+-		sgt =  (struct qm_sg_entry *)phys_to_virt(bmb.addr);
+-	}
+-	else
+-	{
+-		printk("%s(%d) bman_acquire of SG bman buffer failed\n",
+-				__func__,__LINE__);
+-		return -1;
++	if (bman_acquire(done->pool, &bmb, 1, 0) == 1) {
++		sgt = dpa_sec_sg_acquire(clean, bmb.addr);
++		dpa_sec_sg_complete(sgt, true);
++	} else if (bman_acquire(clean->pool, &bmb, 1, 0) == 1) {
++		sgt = dpa_sec_sg_acquire(clean, bmb.addr);
++	} else {
++		return -ENOBUFS;
+ 	}
+-
+-
+-	/* After nr_frags, in next index of sgt array storing skb address in opaque. So doing memset for (nr_frags+1).*/
+-	sgt_size = sizeof(struct qm_sg_entry) * (nr_frags + 1);
+-
+-
+-	/* memset to 0s of size sgt_size*/
+-	memset(sgt, 0, sgt_size);
+-
+-	
+-
+-	sgt_index = 0;
+-	for (cur_skb = skb, list_skb = skb_shinfo(skb)->frag_list; cur_skb;)
+-	{
+-		dma_map_size = skb_headlen(cur_skb);
+-		addr = dma_map_single(dev, cur_skb->data, dma_map_size, dma_dir);
+-		if (unlikely(dma_mapping_error(dev, addr))) {
+-			if (net_ratelimit())
+-				netdev_err(net_dev, "skb_fraglist_to_sg_fd : 2.DMA mappping error");
+-			err = -EINVAL;
+-			dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_index);
+-			bman_release(sg_bpool_g->pool, &bmb, 1, 0);
+-			return -1;
+-		}
+-		prepare_qm_sg_entry(sgt, sgt_index, dma_map_size, addr);
+-		sgt_index++;
+-		
+-		nr_frags = skb_shinfo(cur_skb)->nr_frags;
+-		frag = skb_shinfo(cur_skb)->frags;
+-		while(nr_frags)
+-		{
+-			addr = skb_frag_dma_map(dev, frag, 0, skb_frag_size(frag), dma_dir);
+-			if (unlikely(dma_mapping_error(dev, addr))) {
+-				if (net_ratelimit())
+-					netdev_err(net_dev, "skb_fraglist_to_sg_fd : 2.DMA mappping error");
+-				dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_index);
+-				err = -EINVAL;
+-				bman_release(sg_bpool_g->pool, &bmb, 1, 0);
+-				return -1;
+-			}
+-			prepare_qm_sg_entry(sgt, sgt_index, skb_frag_size(frag), addr);
+-			frag++;
+-			nr_frags--;
+-			sgt_index++;
++	sg_addr = bmb.addr;
++	memset(sgt, 0, DPA_SEC_SG_OWNER_OFFSET + sizeof(*owner));
++	owner = dpa_sec_sg_owner(sgt);
++	owner->skb = skb;
++	owner->dev = get_device(dev);
++
++	for (cur_skb = skb, list_skb = skb_shinfo(skb)->frag_list; cur_skb;) {
++		addr = dma_map_single(dev, cur_skb->data, skb_headlen(cur_skb),
++				      DMA_TO_DEVICE);
++		if (unlikely(dma_mapping_error(dev, addr)))
++			goto mapping_failed;
++		prepare_qm_sg_entry(sgt, owner->mapped++, skb_headlen(cur_skb), addr);
++		for (i = 0; i < skb_shinfo(cur_skb)->nr_frags; i++) {
++			frag = &skb_shinfo(cur_skb)->frags[i];
++			addr = skb_frag_dma_map(dev, frag, 0, skb_frag_size(frag),
++						DMA_TO_DEVICE);
++			if (unlikely(dma_mapping_error(dev, addr)))
++				goto mapping_failed;
++			prepare_qm_sg_entry(sgt, owner->mapped++, skb_frag_size(frag), addr);
+ 		}
+ 		cur_skb = list_skb;
+ 		if (list_skb)
+ 			list_skb = list_skb->next;
+ 	}
+-
+-	qm_sg_entry_set_final(&sgt[sgt_index-1], 1);
+-
+-	addr = (dma_addr_t) (skb);
+-	sgt[sgt_index].opaque = addr;
+-
+-	sg_addr = dma_map_single(dev, sgt, sgt_size, dma_dir);
+-	if (unlikely(dma_mapping_error(dev, sg_addr))) {
+-		dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_index);
+-		if (net_ratelimit())
+-			netdev_err(net_dev, "skb_fraglist_to_sg_fd : 2.DMA mappping error");
+-		err = -EINVAL;
+-		bman_release(sg_bpool_g->pool, &bmb, 1, 0);
+-		return -1;
+-	}
++	qm_sg_entry_set_final(&sgt[owner->mapped - 1], 1);
++	dma_sync_single_for_device(clean->dev, sg_addr, clean->size, DMA_BIDIRECTIONAL);
++	fd->format = qm_fd_sg;
+ 	qm_fd_addr_set64(fd, sg_addr);
+-	fd->bpid = skb_2bfreed_bpool_g->bpid; /*sg_bpool_g->bpid;*/
++	fd->bpid = done->bpid;
+ 	fd->cmd = fd_cmd;
+ 	fd->length20 = skb->len;
+ 	fd->offset = 0;
+-
+ 	return 0;
++
++mapping_failed:
++	if (net_ratelimit())
++		netdev_err(net_dev, "SEC input DMA mapping failed\n");
++	dpa_sec_sg_complete(sgt, false);
++	dpa_sec_sg_recycle(clean, sg_addr);
++	return -ENOMEM;
+ }
+ 
+ EXPORT_SYMBOL(skb_fraglist_to_sg_fd);
+@@ -1589,47 +1597,8 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 		}
+ 
+ 		if (unlikely(err < 0)) {
+-			struct bm_buffer bmb;
+-			dma_addr_t addr;
+-			struct qm_sg_entry *sgt;
+-			struct sk_buff *list_skb;
+-			int sgt_entries, sgt_size;
+-
+-			printk("%s(%d) dpa_xmit failed\n",__func__,__LINE__);
+-			/* The frame was never handed to hardware, so the driver
+-			 * still owns the fully-built SGT FD and must unwind
+-			 * everything skb_fraglist_to_sg_fd() mapped before the
+-			 * buffer is recycled and the skb is freed below --
+-			 * otherwise the DMA_TO_DEVICE mappings leak and the
+-			 * skb data is freed while still mapped for the device.
+-			 * Recompute the entry count / SGT size by re-walking
+-			 * the (possibly linearized) skb exactly as the builder
+-			 * did so they match the mappings actually created.
+-			 * Unmap the SGT buffer itself, then each per-fragment
+-			 * mapping, and clear the skb pointer stashed in the
+-			 * trailing opaque slot so the recycled pool buffer
+-			 * carries no stale reference. Same unwind as the
+-			 * enqueue-failure path in dpaa_submit_inb_pkt_to_SEC().
+-			 */
+-			addr = qm_fd_addr(&fd);
+-			sgt = (struct qm_sg_entry *)phys_to_virt(addr);
+-			sgt_entries = 1 + skb_shinfo(skb)->nr_frags;
+-			skb_walk_frags(skb, list_skb)
+-				sgt_entries += 1 + skb_shinfo(list_skb)->nr_frags;
+-			sgt_size = sizeof(struct qm_sg_entry) * (sgt_entries + 1);
+-			dma_unmap_single(dpa_bp->dev, addr, sgt_size, DMA_TO_DEVICE);
+-			dma_unmap_skb_sg_addrs(dpa_bp->dev, skb, sgt, sgt_entries);
+-			sgt[sgt_entries].opaque = 0;
+-			/* put the buffer back to sg pool; zero bmb first --
+-			 * __bman_release() ORs the pool id into the high bits
+-			 * of the release command rather than overwriting them,
+-			 * so stack garbage there would misroute the buffer to
+-			 * a foreign pool. */
+-			bmb.opaque = 0;
+-			bm_buffer_set64(&bmb, addr);
+-			while (bman_release(sg_bpool_g->pool, &bmb, 1, 0))
+-				cpu_relax();
+-			/* release skb and retuen */
++			pr_err_ratelimited("%s: dpa_xmit failed\n", __func__);
++			dpaa_sec_sg_release(&fd, false);
+ 			goto sec_submit_failed;
+ 		}
+ 
+@@ -1842,48 +1811,8 @@ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd)
+ 		}
+ 
+ 		if (unlikely(err < 0)) {
+-			struct bm_buffer bmb;
+-			dma_addr_t addr;
+-			struct qm_sg_entry *sgt;
+-			struct sk_buff *list_skb;
+-			int sgt_entries, sgt_size;
+-
+-			printk("%s(%d) qman_enqueue failed\n",
+-					__func__,__LINE__);
+-			/* The frame was never handed to hardware, so the driver
+-			 * still owns the fully-built SGT FD and must unwind
+-			 * everything skb_fraglist_to_sg_fd() mapped before the
+-			 * buffer is recycled and the skb is returned to Linux --
+-			 * otherwise the DMA_TO_DEVICE mappings leak and the skb
+-			 * goes back to the stack still mapped for the device.
+-			 * Recompute the entry count / SGT size by re-walking the
+-			 * (possibly linearized) skb exactly as the builder did so
+-			 * they match the mappings actually created. Unmap the SGT
+-			 * buffer itself, then each per-fragment mapping, and clear
+-			 * the skb pointer stashed in the trailing opaque slot so
+-			 * the recycled pool buffer carries no stale reference.
+-			 * Unlike skb_fraglist_to_sg_fd()'s own mid-build error
+-			 * paths (which fail before the SGT buffer is mapped and so
+-			 * only undo fragment maps), a fully-built SGT additionally
+-			 * needs the sg_addr unmap done here. */
+-			addr = qm_fd_addr(&fd);
+-			sgt = (struct qm_sg_entry *)phys_to_virt(addr);
+-			sgt_entries = 1 + skb_shinfo(skb)->nr_frags;
+-			skb_walk_frags(skb, list_skb)
+-				sgt_entries += 1 + skb_shinfo(list_skb)->nr_frags;
+-			sgt_size = sizeof(struct qm_sg_entry) * (sgt_entries + 1);
+-			dma_unmap_single(dev, addr, sgt_size, DMA_TO_DEVICE);
+-			dma_unmap_skb_sg_addrs(dev, skb, sgt, sgt_entries);
+-			sgt[sgt_entries].opaque = 0;
+-			/* put the buffer back to sg pool; zero bmb first --
+-			 * __bman_release() ORs the pool id into the high bits
+-			 * of the release command rather than overwriting them,
+-			 * so stack garbage there would misroute the buffer to
+-			 * a foreign pool. */
+-			bmb.opaque = 0;
+-			bm_buffer_set64(&bmb, addr);
+-			while (bman_release(sg_bpool_g->pool, &bmb, 1, 0))
+-				cpu_relax();
++			pr_err_ratelimited("%s: qman_enqueue failed\n", __func__);
++			dpaa_sec_sg_release(&fd, false);
+ 			goto err_giveback; /* give packet to linux */
+ 		}
+ 		if (priv)
 -- 
 2.47.3
 

@@ -813,7 +813,7 @@ static int cdx_add_mcast_table_entry(struct mcast_group_info *pMcastGrpInfo)
 		goto err_ret;
 	}
 	retval = insert_mcast_entry_in_classif_table(pCtEntry, pMcastGrpInfo->uiListenerCnt, phyaddr,
-			pMcastGrpInfo->members[ii].tbl_entry);
+			pMcastGrpInfo->members[ii].tbl_entry, pMcastGrpInfo->bridged);
 	if(retval)
 	{
 		DPA_ERROR("%s::Insert Mcast entry failed \r\n",__func__);
@@ -2316,6 +2316,7 @@ int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
 	INIT_LIST_HEAD(&grp->list);
 	grp->grpid = -1;
 	grp->mctype = spec->family == AF_INET6;
+	grp->bridged = spec->bridged;
 	if (grp->mctype) {
 		memcpy(grp->ipv6_saddr, &spec->src.in6, IPV6_ADDRESS_LENGTH);
 		memcpy(grp->ipv6_daddr, &spec->dst.in6, IPV6_ADDRESS_LENGTH);
@@ -2383,6 +2384,10 @@ EXPORT_SYMBOL_NS_GPL(cdx_mc_group_add, ASK_CDX_FLOWTABLE);
 static bool cdx_mc_same_key(const struct mcast_group_info *grp,
 			    const struct cdx_mc_group_spec *spec)
 {
+	/* Replacement swaps only the listener chain. The root's hop-count
+	 * action must remain compatible with the new description. */
+	if (grp->bridged != spec->bridged)
+		return false;
 	if (grp->mctype != (spec->family == AF_INET6))
 		return false;
 	/* The device, not its name. A group installed through this interface
@@ -2476,6 +2481,7 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 	INIT_LIST_HEAD(&fresh->list);
 	fresh->grpid = -1;
 	fresh->mctype = grp->mctype;
+	fresh->bridged = grp->bridged;
 	/* The two address pairs are one union, so these copy the key whichever
 	 * family it is; the v4 fields are not a separate assignment. */
 	memcpy(fresh->ipv6_saddr, grp->ipv6_saddr, sizeof(fresh->ipv6_saddr));

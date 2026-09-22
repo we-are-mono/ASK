@@ -48,3 +48,37 @@ def configure_neighbour(iface, address, mac=None, arp_ignore=None, restore_after
     return {"op": "neighbour", "mac": link()["address"],
             "arp_ignore": int(ignore.read_text()), "time": time.time(),
             "restore_after": restore_after}
+
+
+def configure_ndp(iface, blocked=None, restore_after=None):
+    """Suppress NS in a test-owned namespace, with an independent expiry."""
+    import json
+    import subprocess
+    import threading
+    import time
+
+    table = 'ask_recovery_ndp'
+    def listing():
+        result = subprocess.run(['nft', '-j', 'list', 'table', 'ip6', table],
+                                capture_output=True, text=True)
+        assert result.returncode in (0, 1), result.stderr
+        return json.loads(result.stdout)['nftables'] if result.returncode == 0 else None
+    if restore_after is not None:
+        assert blocked is True and 0 < restore_after <= 15
+    present = listing()
+    if blocked is True and present is None:
+        rule = (f'table ip6 {table} {{ chain input {{ type filter hook input priority -10; '
+                f'iifname "{iface}" icmpv6 type nd-neighbor-solicit counter drop; }}; }}\n')
+        result = subprocess.run(['nft', '-f', '-'], input=rule, text=True, capture_output=True)
+        assert result.returncode == 0, (rule, result.stderr)
+        if restore_after is not None:
+            timer = threading.Timer(restore_after, subprocess.run,
+                args=(['nft', 'delete', 'table', 'ip6', table],), kwargs={'capture_output': True})
+            timer.daemon = True
+            timer.start()
+    elif blocked is False and present is not None:
+        subprocess.run(['nft', 'delete', 'table', 'ip6', table], check=True, capture_output=True)
+    current = listing()
+    packets = sum(expr['counter']['packets'] for item in current or []
+                  for expr in item.get('rule', {}).get('expr', []) if 'counter' in expr)
+    return {'blocked': current is not None, 'packets': packets, 'time': time.time(), 'restore_after': restore_after}

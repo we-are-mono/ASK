@@ -431,16 +431,6 @@ static int __init cdx_module_init(void)
 			__func__);
 	}
 
-	if (cdx_init_scatter_gather_bpool()) {
-		printk("%s::cdx_init_scatter_gather_bpool failed\n",__func__);
-		rc = -ENOMEM;
-		goto exit;
-	}
-	if (cdx_init_skb_2bfreed_bpool()) {
-		printk("%s(%d) : cdx_init_skb_2bfreed_bpool failed\n", __func__,__LINE__);
-		rc = -ENOMEM;
-		goto exit;
-	}
 #endif
 	return 0;
 

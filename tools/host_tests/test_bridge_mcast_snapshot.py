@@ -14,7 +14,8 @@ PATCH = ROOT / "patches/kernel/161-bridge-multicast-egress-snapshot.patch"
 def snapshot_source():
     # This is an entirely new function. Read its actual patch payload, not a
     # build tree that may contain a previous recipe's implementation.
-    added = "\n".join(line[1:] for line in PATCH.read_text().splitlines()
+    source = PATCH.read_text().split("+++ b/net/bridge/br_multicast.c\n", 1)[1]
+    added = "\n".join(line[1:] for line in source.splitlines()
                       if line.startswith("+") and not line.startswith("+++"))
     return function(added, "br_multicast_list_ports")
 

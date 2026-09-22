@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import ipaddress
 import os
 from pathlib import Path
 import time
@@ -32,6 +33,7 @@ INIT = "/etc/init.d/ask-flowtable"
 CONF = "/etc/ask/offload.conf"
 FAULT_DIR = "/tmp/ask-flowtable-service-fault"
 FIRST = SPORT + 512
+OBSERVE_TABLE = "ask_recovery_observe"
 FLOWS = [{"id": i, "proto": proto, "sport": FIRST + offset}
          for i, (proto, offset) in enumerate((("udp", 0), ("tcp", 0), ("tcp", 1), ("udp", 2)))]
 
@@ -42,6 +44,14 @@ async def service_status(r):
 
 async def supervision_status(r):
     return await flowtable_json(r.service_console, "service-status")
+
+
+async def software_forwarded(r):
+    """Only slow-path packets from the test port pair, in either direction."""
+    result = await command(r.target, r.session, "nft", "-j", "list", "counter", "inet", OBSERVE_TABLE, "slow_path")
+    counters = [item["counter"] for item in json.loads(result["stdout"])["nftables"] if "counter" in item]
+    assert len(counters) == 1, result
+    return counters[0]["packets"]
 
 
 async def wait_replacement(r, previous, timeout=8):
@@ -74,9 +84,10 @@ async def service(rig):
 
 
 @asynccontextmanager
-async def managed_service(r, addresses=None):
-    """Run the shipping service for one or more test LAN endpoints."""
+async def managed_service(r, addresses=None, *, extra_paths=()):
+    """Run the service for IPv4 endpoints and extra (source, destination) pairs."""
     addresses = tuple(addresses or (r.lan_ip,))
+    paths = [(address, WAN_IP) for address in addresses] + list(extra_paths)
     old = await read(r.target, r.session, CONF)
     cleanup = []
     initial_errors = (await r.state())["errors"]
@@ -84,22 +95,45 @@ async def managed_service(r, addresses=None):
         await asyncio.to_thread(con.login, "root", None)
         r.service_console = con
         try:
+            tables = json.loads((await command(r.target, r.session, "nft", "-j", "list", "tables"))["stdout"])
+            assert not any(item.get("table", {}).get("name") == OBSERVE_TABLE for item in tables["nftables"]), tables
+            await command(r.target, r.session, "nft", f'''table inet {OBSERVE_TABLE} {{
+ counter slow_path {{ }}
+ chain forward {{ type filter hook forward priority -10; policy accept;
+ meta l4proto {{ tcp, udp }} ct original proto-src {FIRST}-{FIRST + 2} ct original proto-dst {DPORT} counter name slow_path
+ }}
+}}''')
+            cleanup.append(["nft", "delete", "table", "inet", OBSERVE_TABLE])
+            r.software_forwarded = lambda: software_forwarded(r)
             policy = f"enabled yes\ndevices {TARGET_LAN_IF} {TARGET_WAN_IF}\n"
-            for address in addresses:
+            for address, destination in paths:
+                version = ipaddress.ip_address(address).version
+                assert ipaddress.ip_address(destination).version == version
+                firewall = "ip6tables" if version == 6 else "iptables"
                 for proto in ("tcp", "udp"):
-                    nat = ["POSTROUTING", "-s", address, "-d", WAN_IP, "-p", proto,
+                    nat = ["POSTROUTING", "-s", address, "-d", destination, "-p", proto,
                            "--sport", f"{FIRST}:{FIRST + 2}", "--dport", str(DPORT), "-j", "ACCEPT"]
-                    await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
-                    cleanup.append(["iptables", "-t", "nat", "-D", *nat])
-                    await command(r.target, r.session, "conntrack", "-D", "-p", proto,
-                                  "--orig-src", address, "--orig-dst", WAN_IP,
+                    # The routed IPv6 paths have no NAT; this image does not
+                    # build the legacy IPv6 NAT table. IPv4 needs an exemption
+                    # from the normal WAN masquerade policy.
+                    if version == 4:
+                        await command(r.target, r.session, firewall, "-t", "nat", "-I", *nat)
+                        cleanup.append([firewall, "-t", "nat", "-D", *nat])
+                    await command(r.target, r.session, "conntrack", "-D", "-f", f"ipv{version}", "-p", proto,
+                                  "--orig-src", address, "--orig-dst", destination,
                                   "--dport", str(DPORT), check=False)
-                deny = ["FORWARD", "-s", address, "-d", WAN_IP, "-p", "udp",
+                deny = ["FORWARD", "-s", address, "-d", destination, "-p", "udp",
                         "--sport", str(FIRST + 2), "--dport", str(DPORT), "-j", "DROP"]
-                await command(r.target, r.session, "iptables", "-I", *deny)
-                cleanup.append(["iptables", "-D", *deny])
-                policy += (f"scope saddr {address} daddr {WAN_IP} sport {FIRST}-{FIRST + 2} "
-                           f"dport {DPORT}\n")
+                if version == 6:
+                    await console_command(con, firewall, "-I", *deny)
+                else:
+                    await command(r.target, r.session, firewall, "-I", *deny)
+                cleanup.append([firewall, "-D", *deny])
+                # Native address selectors are IPv4-only. Port selectors are
+                # family-independent and keep IPv6 admission on our reserved
+                # test ports; the assertions also check every admitted tuple.
+                selector = f"saddr {address} daddr {destination} " if version == 4 else ""
+                policy += (f"scope {selector}sport {FIRST}-{FIRST + 2} dport {DPORT}\n")
             result = await r.target.fs_write(r.session, CONF, policy)
             assert result["errno"] == 0, result
             # Resolve the real executable before adding the fault wrapper to
@@ -151,10 +185,11 @@ compile(script, str(root / 'nft'), 'exec')
             await attempt(console_python(con, f"from pathlib import Path\nPath({CONF!r}).write_text({old!r})\n"))
             for argv in reversed(cleanup):
                 await attempt(console_command(con, *argv))
-            for address in addresses:
+            for address, destination in paths:
                 for proto in ("tcp", "udp"):
-                    await attempt(console_command(con, "conntrack", "-D", "-p", proto,
-                                                  "--orig-src", address, "--orig-dst", WAN_IP,
+                    await attempt(console_command(con, "conntrack", "-D", "-f",
+                                                  f"ipv{ipaddress.ip_address(address).version}", "-p", proto,
+                                                  "--orig-src", address, "--orig-dst", destination,
                                                   "--dport", str(DPORT), check=False))
             await attempt(console_command(con, "rm", "-rf", FAULT_DIR))
             assert not failures, ("service fixture restoration failed", failures)

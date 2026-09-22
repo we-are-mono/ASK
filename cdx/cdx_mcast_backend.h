@@ -81,6 +81,8 @@ struct cdx_mc_group_spec {
 	union nf_inet_addr dst;
 	u8 family;
 	u8 listeners;
+	/* A bridge preserves IP hop counts; a router decrements them. */
+	bool bridged;
 	struct cdx_mc_listener listener[CDX_MC_MAX_LISTENERS];
 };
 

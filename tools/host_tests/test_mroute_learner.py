@@ -104,7 +104,8 @@ def test_the_fib_handler_only_queues():
     or wait for the transaction. It holds what the worker will need, appends
     to a queue under a spinlock, and returns.
     """
-    body = function(SOURCE.read_text(), "ft_mr_fib_event")
+    source = SOURCE.read_text()
+    body = function(source, "ft_mr_fib_event") + function(source, "ft_mr_event_alloc")
     for forbidden in ("cdx_ft_begin", "mutex_lock", "rtnl_lock",
                       "GFP_KERNEL", "cdx_mc_group_add", "cdx_mc_group_del",
                       "cdx_mc_group_replace", "cdx_mc_port_supported"):

@@ -1,5 +1,10 @@
 # Multicast without CMM
 
+Validation update: the original design below did not account for the ASK
+listener encoder replacing a bridged packet's source MAC. See the
+[hardware investigation](flowtable-multicast-hardware.md) for the observed
+defect, NXP documentation, wire probes and remaining hardware proof.
+
 Roadmap item 7. What the hardware already replicates, what the bridge already
 knows, and the one thing neither of them has — which decides the shape of the
 whole increment.

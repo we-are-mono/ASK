@@ -20,6 +20,7 @@ typedef uint64_t u64;
 #define MFC_OFFLOAD 1
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
+#define smp_load_acquire(p) (*(p))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define kfree free
 #define strscpy(d, s, n) snprintf(d, n, "%s", s)
@@ -63,6 +64,10 @@ static struct ft_mr_vif ft_mr_vif[2][MAXVIFS];
 static unsigned ft_mr_count, ft_mr_installed, ft_mr_policy[2];
 static u64 ft_mr_refused, ft_mr_install_errors;
 static bool ft_mr_stopping, ft_mr_recheck, claimed;
+static bool ft_mr_ready;
+static unsigned long ft_mr_resync_pending;
+static unsigned ft_mr_idx(u8 family) { return family == AF_INET6; }
+static bool test_bit(unsigned n, const unsigned long *p) { return (*p >> n) & 1; }
 static struct work_struct ft_mr_work, ft_mr_stats;
 static struct cdx_mc_group hardware;
 static struct net_device input, output[2];
@@ -108,7 +113,10 @@ static int ft_mc_claim_take(u8 family, const union nf_inet_addr *s,
 static void ft_mc_claim_give(u8 family, const union nf_inet_addr *s,
                             const union nf_inet_addr *d)
 { assert(claimed); claimed = false; }
-static void ft_mr_apply(struct ft_mr_event *e) { abort(); }
+static bool ft_mr_apply(struct ft_mr_event *e) { abort(); }
+static void ft_mr_lost_event(u8 family) { abort(); }
+static void ft_mr_event_free(struct ft_mr_event *e) { abort(); }
+static void ft_mr_resync(void) { abort(); }
 static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p)
 {
     assert(rtnl);
@@ -172,6 +180,11 @@ int main(void)
     g->dirty = true;
     list_add(&g->list, &ft_mr_groups);
     ft_mr_count = 1;
+    /* Initial provider enumeration may queue work before the learner is
+     * published. No partial snapshot may reach the backend. */
+    run();
+    assert(!adds && !hardware.live && g->dirty);
+    ft_mr_ready = true;
     run();
     assert(adds == 1 && hardware.live && ft_mr_installed == 1);
     assert(g->offloaded && cache.mfc_flags == MFC_OFFLOAD);

@@ -66,8 +66,8 @@
 #include "cdx_wifi_backend.h"
 #include "cdx_police.h"
 
-#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 9
-#error "CDX flowtable requires flowtable context version 9 or later (patches/kernel/14x-ask-flowtable-*.patch)"
+#if !defined(FLOW_CLS_HAS_NF_CONTEXT) || FLOW_CLS_HAS_NF_CONTEXT < 12
+#error "CDX flowtable requires kernel flowtable context version 12 or later"
 #endif
 
 /* The bridge FDB pins a bridged flow's egress port, and this is the only
@@ -271,6 +271,8 @@ static atomic64_t ft_mac_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_fdb_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_admission_invalidations = ATOMIC64_INIT(0);
 static atomic64_t ft_ipsec_invalidations = ATOMIC64_INIT(0);
+static atomic64_t ft_ipsec_genid = ATOMIC64_INIT(0);
+static atomic64_t ft_ipsec_policy_invalidations = ATOMIC64_INIT(0);
 static u64 ft_installs, ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy;
 static u64 ft_rearms;
 static bool ft_ready, ft_stopping;
@@ -780,7 +782,7 @@ static bool ft_nexthop_usable(u8 family, const union nf_inet_addr *next_hop)
 }
 
 /* Borrow the route selected by Netfilter, not a second FIB lookup which could
- * lose its policy/ingress context. Patch 140 supplies the retained NEIGH and
+ * lose its policy/ingress context. The callback supplies retained NEIGH and
  * XFRM dsts with the cookie they were selected under: an IPv6 destination
  * belongs to one FIB generation and dst_check() rejects every one of them
  * against a zero cookie. No route pointer escapes the callback. A transformed
@@ -803,7 +805,8 @@ static struct xfrm_state *ft_ipsec_offloaded(const struct dst_entry *bundle,
 
 	if (!x || dst_xfrm(xfrm_dst_child(bundle)))
 		return NULL;		/* nothing, or a bundle deeper than one */
-	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET || !x->xso.offload_handle)
+	if (x->xso.type != XFRM_DEV_OFFLOAD_PACKET || !x->xso.offload_handle ||
+	    x->km.state != XFRM_STATE_VALID)
 		return NULL;		/* the stack is doing this one */
 	if (x->xso.dev != dev)
 		return NULL;		/* another port's SEC context */
@@ -818,8 +821,9 @@ static struct xfrm_state *ft_ipsec_offloaded(const struct dst_entry *bundle,
  * one here: the pair is the kernel's fact, not this adapter's, and a private
  * copy would have to be kept in step with every rekey.
  *
- * Three outcomes. No such state at all means the far end sends in the clear,
- * so the direction installs as any other with no handle. A usable one is
+ * Three outcomes. No such state leaves the receiving handle unset; the
+ * caller must still prove that forwarding policy permits plaintext before
+ * admitting the connection. A usable one is
  * named. One that exists and is not usable -- software, another port's, dead
  * -- is a refusal: its frames are decrypted before they could match this
  * tuple, so the entry would be installed, counted and never matched.
@@ -830,7 +834,8 @@ static struct xfrm_state *ft_ipsec_offloaded(const struct dst_entry *bundle,
  * deletion retires whatever still depends on it.
  */
 static bool ft_ipsec_paired_inbound(const struct xfrm_state *out,
-				    struct net_device *in, u16 *handle)
+				    struct net_device *in, u16 *handle,
+				    struct xfrm_state **received)
 {
 	struct xfrm_state *x;
 	bool ok = false;
@@ -840,15 +845,18 @@ static bool ft_ipsec_paired_inbound(const struct xfrm_state *out,
 				     &out->id.daddr, IPPROTO_ESP,
 				     out->props.family);
 	if (!x)
-		return true;		/* the far end sends in the clear */
+		return true;		/* caller checks receiving policy */
 	if (x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
 	    x->xso.dir == XFRM_DEV_OFFLOAD_IN && x->xso.offload_handle &&
 	    x->xso.dev == in && x->km.state == XFRM_STATE_VALID) {
 		*handle = cdx_ipsec_sa_handle(
-			(struct cdx_ipsec_sa *)x->xso.offload_handle);
+			(struct cdx_ipsec_sa *)READ_ONCE(x->xso.offload_handle));
 		ok = *handle != 0;
 	}
-	xfrm_state_put(x);
+	if (ok && received)
+		*received = x;
+	else
+		xfrm_state_put(x);
 	return ok;
 }
 
@@ -856,19 +864,18 @@ static bool ft_ipsec_paired_inbound(const struct xfrm_state *out,
  * direction may be installed at all.
  *
  * The sending end names the state it found. The receiving end names that
- * state's inbound half instead, and treats a missing half as "the far end
- * sends in the clear" rather than as a failure -- a one-way tunnel is unusual
- * but legal, and refusing it would give up an acceleration that works.
+ * state's inbound half instead. A missing half is usable only if the caller
+ * proves the receiving policy allows plaintext; one-way tunnels remain legal.
  */
 static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_in,
-			    u16 *handle)
+			    u16 *handle, struct xfrm_state **received)
 {
 	if (!pair_in) {
 		*handle = cdx_ipsec_sa_handle(
-			(struct cdx_ipsec_sa *)x->xso.offload_handle);
+			(struct cdx_ipsec_sa *)READ_ONCE(x->xso.offload_handle));
 		return *handle != 0;
 	}
-	return ft_ipsec_paired_inbound(x, pair_in, handle);
+	return ft_ipsec_paired_inbound(x, pair_in, handle, received);
 }
 
 /* What transform covers `fl` leaving `dev`, and which SA handle this direction
@@ -891,9 +898,8 @@ static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_
  * won the race -- the other one is routed by nf_route() with a plain FIB
  * lookup and transformed later, so its cached destination carries nothing.
  * Reading the destination alone therefore answers "no policy" for exactly the
- * flows a gateway encrypts. Where the destination *is* transformed the answer
- * is already in hand and the lookup is skipped: a transform that is there is
- * not a false positive.
+ * flows a gateway encrypts. A carried bundle can also predate a policy change,
+ * so both cases resolve the current policy from the underlying route.
  *
  * Refusal differs by end, and deliberately so:
  *
@@ -906,7 +912,8 @@ static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_
  *     and cannot be named is a refusal, because its frames are decrypted
  *     before they could match this tuple and an entry keyed on the physical
  *     port would match nothing at all. Its absence is simply a direction whose
- *     frames arrive in the clear, which must install exactly as it always did.
+ *     frames arrive in the clear. The caller checks the receiving policy
+ *     separately before accepting that interpretation.
  *
  * KEEP_DST_REF is what makes the lookup safe on a destination this code does
  * not own: without it a matching policy releases the reference the caller
@@ -914,21 +921,21 @@ static bool ft_ipsec_record(const struct xfrm_state *x, struct net_device *pair_
  */
 static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 			     struct net_device *dev, struct net_device *pair_in,
-			     u16 *handle)
+			     u16 *handle, struct xfrm_state **received)
 {
 	struct dst_entry *bundle;
 	struct xfrm_state *x;
 	bool ok;
 
 	*handle = 0;
+	if (received)
+		*received = NULL;
 	if (!dst)
 		return true;
-	if (dst_xfrm(dst)) {
-		x = ft_ipsec_offloaded(dst, dev);
-		if (!x)
-			return !!pair_in;
-		return ft_ipsec_record(x, pair_in, handle);
-	}
+	/* A packet may carry a bundle selected before the current policy
+	 * generation. Resolve against its underlying route so that a fresh
+	 * admission cannot reuse an old policy decision. */
+	dst = xfrm_dst_path(dst);
 
 	/* Take a reference before asking, because a matching policy consumes
 	 * one. xfrm_bundle_create() links the destination into the bundle it
@@ -959,7 +966,7 @@ static bool ft_ipsec_resolve(struct dst_entry *dst, struct flowi *fl,
 	}
 
 	x = ft_ipsec_offloaded(bundle, dev);
-	ok = x ? ft_ipsec_record(x, pair_in, handle) : !!pair_in;
+	ok = x ? ft_ipsec_record(x, pair_in, handle, received) : !!pair_in;
 	/* Releases the whole chain, including the reference the bundle took
 	 * over from us above. */
 	dst_release(bundle);
@@ -997,6 +1004,36 @@ static void ft_ipsec_flowi(const struct cdx_ft_rule *rule, bool reverse,
 	fl->flowi_oif = out->ifindex;
 }
 
+static bool ft_ipsec_receiving(const struct flow_cls_offload *cls,
+			   const struct cdx_ft_rule *rule, bool reverse,
+			       struct xfrm_state *received)
+{
+	struct flowi fl = {};
+	const union nf_inet_addr *src = reverse ? &rule->new_dst : &rule->src;
+	const union nf_inet_addr *dst = reverse ? &rule->new_src : &rule->dst;
+	__be16 sport = reverse ? rule->new_dport : rule->sport;
+	__be16 dport = reverse ? rule->new_sport : rule->dport;
+	struct net_device *in = reverse ? rule->out_logical : rule->in_logical;
+	struct net_device *out = reverse ? rule->in_logical : rule->out_logical;
+
+	if (rule->family == AF_INET) {
+		fl.u.ip4.saddr = src->ip;
+		fl.u.ip4.daddr = dst->ip;
+		fl.u.ip4.fl4_sport = sport;
+		fl.u.ip4.fl4_dport = dport;
+	} else {
+		fl.u.ip6.saddr = src->in6;
+		fl.u.ip6.daddr = dst->in6;
+		fl.u.ip6.fl6_sport = sport;
+		fl.u.ip6.fl6_dport = dport;
+	}
+	fl.flowi_proto = rule->proto;
+	fl.flowi_iif = in->ifindex;
+	fl.flowi_oif = out->ifindex;
+	fl.flowi_mark = READ_ONCE(cls->nf_ct->mark);
+	return xfrm_flowtable_policy_check(&init_net, &fl, rule->family, received);
+}
+
 /* Both ends of one direction: what encrypts what it sends, and what decrypted
  * what it receives. The sending end is asked of the destination this callback
  * borrowed; the receiving end of the reverse direction's, which is the path
@@ -1006,14 +1043,39 @@ static bool ft_ipsec_handle(const struct flow_cls_offload *cls,
 			    struct cdx_ft_rule *rule, struct net_device *out,
 			    struct net_device *in)
 {
+	struct xfrm_state *received = NULL;
 	struct flowi fl;
+	u16 reverse_in;
+	bool allowed;
 
 	ft_ipsec_flowi(rule, false, out, &fl);
-	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, NULL, &rule->sa_handle))
-		return false;
+	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, NULL, &rule->sa_handle, NULL))
+		goto denied;
+	/* Both directions share one Linux generation. Validate both receiving
+	 * ends even when their SAs exist: policy may now require a different
+	 * transform, or forbid the tuple altogether. */
+	if (!ft_ipsec_resolve(cls->nf_dst, &fl, out, rule->out, &reverse_in,
+			     &received))
+		goto denied;
+	allowed = ft_ipsec_receiving(cls, rule, true, received);
+	if (received)
+		xfrm_state_put(received);
+	if (!allowed)
+		goto denied;
 	ft_ipsec_flowi(rule, true, in, &fl);
-	return ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, rule->in,
-				&rule->in_sa_handle);
+	if (!ft_ipsec_resolve(cls->nf_dst_reverse, &fl, in, rule->in,
+			     &rule->in_sa_handle, &received))
+		goto denied;
+	allowed = ft_ipsec_receiving(cls, rule, false, received);
+	if (received)
+		xfrm_state_put(received);
+	if (allowed)
+		return true;
+denied:
+	/* Refusal alone leaves the software generation and its other hardware
+	 * direction alive. Invalidate both before they can bypass the policy. */
+	ft_handle_invalidate(cls->nf_handle, &ft_admission_invalidations);
+	return false;
 }
 
 static bool ft_next_hop(const struct flow_cls_offload *cls,
@@ -1889,11 +1951,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	/* This direction's destination names the device it leaves by; the
 	 * reverse direction's names the device it arrives on. Requiring each
 	 * to reach its physical port through VLAN devices alone is what ties
-	 * the borrowed destinations to the redirect and the binding. Both are
-	 * now required, where only the egress one used to be: patch 140
-	 * supplies a destination only for a neighbour-output direction, so a
-	 * missing reverse one means that direction is transformed or direct,
-	 * neither of which this contract describes. */
+	 * the borrowed destinations to the redirect and the binding. Both
+	 * destinations must be present so each logical path can be validated. */
 	out->out_logical = cls->nf_dst->dev;
 	out->in_logical = cls->nf_dst_reverse->dev;
 	/* The two sessions are named the way the two destinations are: the one
@@ -2112,6 +2171,7 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 {
 	struct cdx_ft_entry *entry = ft_find(binding, cls->cookie), *other;
 	struct cdx_ft_rule rule;
+	u64 ipsec_genid = atomic64_read_acquire(&ft_ipsec_genid);
 	union nf_inet_addr next_hop;
 	int rc;
 
@@ -2119,6 +2179,8 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	 * merely because its opaque directional cookie has the same value. */
 	if (entry && entry->handle != cls->nf_handle)
 		return ask_refuse(-ESTALE);
+	if (cls->nf_xfrm_genid != xfrm_flowtable_genid(&init_net))
+		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_policy_invalidations);
 	if (nf_flow_offload_handle_valid(cls->nf_handle) && !ft_routes_valid(cls))
 		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
 	rc = ft_parse(binding, cls, &rule, &next_hop);
@@ -2196,11 +2258,16 @@ static int ft_replace(struct cdx_ft_binding *binding, struct flow_cls_offload *c
 	hash_add(ft_keys, &entry->key_node, ft_key_hash(&entry->rule));
 	ft_count++;
 	ft_installs++;
+	/* An SA may expire before this entry joins the dependency watch. */
+	if (ipsec_genid != atomic64_read_acquire(&ft_ipsec_genid))
+		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_invalidations);
 	/* IPv6 commits routes from softirq without RTNL, so a change between
 	 * the validation above and publication here reaches neither: the entry
 	 * was not yet watched, and RTNL did not exclude it. Recheck once the
 	 * notifier can see this entry; an invalid handle then retires it below
 	 * through the same path as a change observed during insertion. */
+	if (cls->nf_xfrm_genid != xfrm_flowtable_genid(&init_net))
+		ft_handle_invalidate(cls->nf_handle, &ft_ipsec_policy_invalidations);
 	if (!ft_routes_valid(cls))
 		ft_handle_invalidate(cls->nf_handle, &ft_route_invalidations);
 	if (ft_fault(3) || atomic_read(&ft_invalid) ||
@@ -2533,7 +2600,7 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		}
 		/* Hardware rejection must leave neighbour-aware software routing,
 		 * not a DIRECT tuple with a stale Ethernet rewrite. This request
-		 * is monotonic for the table, including after unbind. Patch 140
+		 * is monotonic for the table, including after unbind. The core
 		 * also retires DIRECT flows constructed concurrently with bind. */
 		WRITE_ONCE(flowtable->use_neigh, true);
 		WRITE_ONCE(flowtable->use_hw_handles, true);
@@ -3182,6 +3249,17 @@ static int ft_neigh_event(struct notifier_block *nb, unsigned long event, void *
 	struct neighbour *neigh = ptr;
 	struct cdx_ft_entry *entry;
 
+	if (event == NETEVENT_XFRM_POLICY_UPDATE) {
+		if (!net_eq(ptr, &init_net))
+			return NOTIFY_DONE;
+		/* Atomic notification, including policy expiry. Never enter the
+		 * hardware backend while the XFRM policy lock is held. */
+		spin_lock_bh(&ft_watch_lock);
+		list_for_each_entry(entry, &ft_neigh_entries, neigh_list)
+			ft_handle_invalidate(entry->handle, &ft_ipsec_policy_invalidations);
+		spin_unlock_bh(&ft_watch_lock);
+		return NOTIFY_DONE;
+	}
 	if (event == NETEVENT_IPV4_ROUTE_UPDATE)
 		return ft_route_event(ptr);
 	if (event == NETEVENT_IPV6_ROUTE_UPDATE)
@@ -3235,7 +3313,7 @@ static int ft_fib_event(struct notifier_block *nb, unsigned long event, void *pt
 	case FIB_EVENT_ENTRY_ADD:
 	case FIB_EVENT_ENTRY_DEL:
 		/* These selected-alias notifications can precede commit and omit
-		 * other aliases. Patch 140 reports every committed prefix in both
+		 * other aliases. The routing core reports every committed prefix in both
 		 * families through NETEVENT_IPV[46]_ROUTE_UPDATE, including table
 		 * flushes. This also absorbs the registration dump. */
 		break;
@@ -4373,6 +4451,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		    target->ports && target->in && ft_mc_carriable(target) &&
 		    target->retries < FT_MC_MAX_RETRIES) {
 			spec.in = target->in;
+			spec.bridged = true;
 			spec.family = target->addr.proto == htons(ETH_P_IPV6) ?
 				AF_INET6 : AF_INET;
 			if (spec.family == AF_INET6) {
@@ -4558,7 +4637,7 @@ static bool ft_mc_swdev_obj(unsigned long event,
 		}
 		return false;
 	}
-	/* Patch 160 carries the group the bridge learned; addr[] is the
+	/* The MDB carries the group the bridge learned; addr[] is the
 	 * multicast MAC it folds into, which 32 groups share and which this
 	 * classifier cannot key on at all. A zero proto means the object came
 	 * from a path that does not populate it. */
@@ -4749,13 +4828,12 @@ static void ft_mc_rows(struct seq_file *seq)
  * recover from frames is stated outright here, so this half has no packet
  * hook and nothing is ever waiting on a source.
  *
- * It is not a second feature either. The hardware transform is a router's
- * already: fill_actions() sets TTL_HM_VALID on the root entry unconditionally,
- * so the microcode decrements the TTL -- and the parser refuses to classify a
- * frame that arrives with 0 or 1, which is the kernel's own `ttl > 1` rule --
- * and every listener entry rebuilds the Ethernet header with the egress port's
- * own address and the group's mapped multicast destination. The encoder needed
- * no change; this feeds it a different spec.
+ * Both learners use the same encoder, with explicit forwarding semantics.
+ * This learner requests a routed root, which decrements TTL or hop limit;
+ * the bridge learner preserves it. The parser refuses to classify a frame
+ * arriving with 0 or 1, matching the router's `ttl > 1` rule. Listener entries
+ * rebuild Ethernet with the egress port's address and the group's mapped
+ * multicast destination, as this routed path requires.
  *
  * The control plane is whatever fills the MFC -- igmpproxy, omcproxy,
  * smcroute, pimd -- and none of them needs anything from ASK. They install
@@ -4809,6 +4887,7 @@ enum ft_mr_state {
 	FT_MR_REFUSED_LISTENER,
 	FT_MR_REFUSED_CONTESTED,
 	FT_MR_REFUSED_FAILED,
+	FT_MR_REFUSED_RESYNC,
 };
 
 /* Why a group is not being replicated, for an operator looking at a stream
@@ -4829,6 +4908,7 @@ static const char *ft_mr_state_text(enum ft_mr_state state)
 	case FT_MR_REFUSED_LISTENER:	return "refused-listener";
 	case FT_MR_REFUSED_CONTESTED:	return "refused-contested";
 	case FT_MR_REFUSED_FAILED:	return "refused-failed";
+	case FT_MR_REFUSED_RESYNC:	return "refused-resync";
 	}
 	return "unknown";
 }
@@ -4884,6 +4964,7 @@ struct ft_mr_group {
 	bool dirty;
 	/* The kernel deleted the entry; retire and forget it. */
 	bool gone;
+	bool seen;
 	u8 retries;
 };
 
@@ -4921,7 +5002,11 @@ static unsigned int ft_mr_count, ft_mr_installed;
 static unsigned int ft_mr_policy[2];
 static u64 ft_mr_refused, ft_mr_install_errors, ft_mr_lost;
 static bool ft_mr_stopping;
+static bool ft_mr_ready;
 static bool ft_mr_recheck;
+/* A lost notification invalidates the mirror, including a family with no
+ * cached groups. Only a complete dump under RTNL clears its bit. */
+static unsigned long ft_mr_resync_pending;
 static void ft_mr_work_fn(struct work_struct *work);
 static void ft_mr_stats_fn(struct work_struct *work);
 static DECLARE_WORK(ft_mr_work, ft_mr_work_fn);
@@ -5402,7 +5487,7 @@ static void ft_mr_dirty_family(u8 family)
 /* One queued event, applied to this learner's own state. Called with
  * ft_mr_lock held, from the worker; no hardware, no RTNL, no device walks --
  * every decision is deferred to ft_mr_derive(). */
-static void ft_mr_apply(struct ft_mr_event *ev)
+static bool ft_mr_apply(struct ft_mr_event *ev)
 {
 	struct ft_mr_vif *vif;
 	struct ft_mr_group *g;
@@ -5413,18 +5498,18 @@ static void ft_mr_apply(struct ft_mr_event *ev)
 	case FIB_EVENT_RULE_ADD:
 	case FIB_EVENT_RULE_DEL:
 		if (ev->rule_default)
-			return;
+			return true;
 		if (ev->event == FIB_EVENT_RULE_ADD)
 			ft_mr_policy[idx]++;
 		else if (ft_mr_policy[idx])
 			ft_mr_policy[idx]--;
 		ft_mr_dirty_family(ev->family);
-		return;
+		return true;
 	case FIB_EVENT_VIF_ADD:
 	case FIB_EVENT_VIF_DEL:
 		if (ev->table != ft_mr_default_table(ev->family) ||
 		    ev->vif_index >= MAXVIFS)
-			return;
+			return true;
 		vif = &ft_mr_vif[idx][ev->vif_index];
 		if (vif->dev)
 			dev_put(vif->dev);
@@ -5439,7 +5524,7 @@ static void ft_mr_apply(struct ft_mr_event *ev)
 		 * every group of this family is re-derived rather than only
 		 * those that name this one. */
 		ft_mr_dirty_family(ev->family);
-		return;
+		return true;
 	default:
 		break;
 	}
@@ -5450,12 +5535,12 @@ static void ft_mr_apply(struct ft_mr_event *ev)
 			g->gone = true;
 			g->dirty = true;
 		}
-		return;
+		return true;
 	}
 	if (!g) {
 		g = kzalloc(sizeof(*g), GFP_KERNEL);
 		if (!g)
-			return;
+			return false;
 		/* The event's own reference is released when it is freed, so
 		 * the group takes one of its own for as long as it refers to
 		 * the entry -- which is what keeps the pointer it is keyed on
@@ -5485,14 +5570,15 @@ static void ft_mr_apply(struct ft_mr_event *ev)
 	 * fresh by the derivation. */
 	g->retries = 0;
 	g->dirty = true;
+	g->gone = false;
+	g->seen = true;
+	return true;
 }
 
-/* The FIB chain, for the two multicast families.
- *
- * Atomic, and every mr_* caller holds RTNL. So this may take a spinlock and
- * nothing else: it holds what the worker will need, queues it and returns.
- */
-static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
+/* Both live notifications and dumps run in atomic context. A captured event
+ * owns its references independently of the source table's lifetime. */
+static struct ft_mr_event *ft_mr_event_alloc(unsigned long event,
+					   struct fib_notifier_info *info)
 {
 	struct vif_entry_notifier_info *ven;
 	struct mfc_entry_notifier_info *men;
@@ -5509,25 +5595,11 @@ static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
 	case FIB_EVENT_ENTRY_DEL:
 		break;
 	default:
-		return NOTIFY_DONE;
+		return NULL;
 	}
-	if (READ_ONCE(ft_mr_stopping))
-		return NOTIFY_DONE;
 	ev = kzalloc(sizeof(*ev), GFP_ATOMIC);
-	if (!ev) {
-		/* Bounded and reported rather than silently absorbed. A lost
-		 * VIF, rule or replace is recovered by the full re-derivation
-		 * the kick asks for; a lost delete is not, and leaves a group
-		 * whose entry is retired only when a port it names goes away
-		 * or the adapter unloads. The mfc it still holds keeps that
-		 * safe -- stale, never freed underneath. */
-		spin_lock_bh(&ft_mr_queue_lock);
-		ft_mr_lost++;
-		spin_unlock_bh(&ft_mr_queue_lock);
-		pr_warn_ratelimited("cdx: routed multicast event dropped; groups may be stale\n");
-		ft_mr_kick();
-		return NOTIFY_DONE;
-	}
+	if (!ev)
+		return ERR_PTR(-ENOMEM);
 	ev->event = event;
 	ev->family = info->family == RTNL_FAMILY_IP6MR ? AF_INET6 : AF_INET;
 	switch (event) {
@@ -5555,11 +5627,149 @@ static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
 		mr_cache_hold(ev->mfc);
 		break;
 	}
+	return ev;
+}
+
+static void ft_mr_event_free(struct ft_mr_event *ev)
+{
+	if (ev->mfc)
+		mr_cache_put(ev->mfc);
+	if (ev->dev)
+		dev_put(ev->dev);
+	kfree(ev);
+}
+
+static void ft_mr_lost_event(u8 family)
+{
+	set_bit(ft_mr_idx(family), &ft_mr_resync_pending);
+	spin_lock_bh(&ft_mr_queue_lock);
+	ft_mr_lost++;
+	spin_unlock_bh(&ft_mr_queue_lock);
+	pr_warn_ratelimited("cdx: routed multicast event lost; resynchronizing\n");
+}
+
+/* Live multicast changes hold RTNL; the worker takes it before replacing
+ * the mirror so no older queued event can undo an authoritative snapshot. */
+static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
+{
+	struct ft_mr_event *ev;
+
+	if (READ_ONCE(ft_mr_stopping))
+		return NOTIFY_DONE;
+	ev = ft_mr_event_alloc(event, info);
+	if (!ev)
+		return NOTIFY_DONE;
+	if (IS_ERR(ev)) {
+		ft_mr_lost_event(info->family == RTNL_FAMILY_IP6MR ?
+				 AF_INET6 : AF_INET);
+		schedule_work(&ft_mr_work);
+		return NOTIFY_DONE;
+	}
 	spin_lock_bh(&ft_mr_queue_lock);
 	list_add_tail(&ev->list, &ft_mr_queue);
 	spin_unlock_bh(&ft_mr_queue_lock);
 	schedule_work(&ft_mr_work);
 	return NOTIFY_DONE;
+}
+
+struct ft_mr_snapshot {
+	struct notifier_block nb;
+	struct list_head events;
+};
+
+static int ft_mr_snapshot_event(struct notifier_block *nb, unsigned long event,
+				void *data)
+{
+	struct ft_mr_snapshot *snapshot =
+		container_of(nb, struct ft_mr_snapshot, nb);
+	struct ft_mr_event *ev = ft_mr_event_alloc(event, data);
+
+	if (IS_ERR(ev))
+		return notifier_from_errno(PTR_ERR(ev));
+	if (ev)
+		list_add_tail(&ev->list, &snapshot->events);
+	return NOTIFY_DONE;
+}
+
+/* The provider's dump includes rules, VIFs and resolved MFCs. RTNL excludes
+ * table changes across capture AND commit; RCU protects the provider and its
+ * table walks. The private callback owns no hardware and never sleeps. */
+static void ft_mr_resync(void)
+{
+	unsigned int idx;
+
+	for (idx = 0; idx < ARRAY_SIZE(ft_mr_vif); idx++) {
+		struct ft_mr_snapshot snapshot = {
+			.nb.notifier_call = ft_mr_snapshot_event,
+		};
+		struct fib_notifier_ops *ops;
+		struct ft_mr_event *ev, *tmp;
+		struct ft_mr_group *g;
+		u8 family = idx ? AF_INET6 : AF_INET;
+		unsigned int i;
+		LIST_HEAD(stale);
+		int rc = -EAGAIN;
+
+		if (!test_bit(idx, &ft_mr_resync_pending))
+			continue;
+		INIT_LIST_HEAD(&snapshot.events);
+		rtnl_lock();
+		rcu_read_lock();
+		ops = idx ? init_net.ipv6.ip6mr_notifier_ops :
+			    init_net.ipv4.ipmr_notifier_ops;
+		if (ops && try_module_get(ops->owner)) {
+			rc = ops->fib_dump(&init_net, &snapshot.nb, NULL);
+			module_put(ops->owner);
+		}
+		rcu_read_unlock();
+		if (!rc) {
+			/* These events predate the snapshot, including any queued
+			 * while the worker waited for RTNL. Replaying them later
+			 * would double rule counts or resurrect a deleted MFC. */
+			spin_lock_bh(&ft_mr_queue_lock);
+			list_for_each_entry_safe(ev, tmp, &ft_mr_queue, list)
+				if (ev->family == family)
+					list_move_tail(&ev->list, &stale);
+			spin_unlock_bh(&ft_mr_queue_lock);
+			mutex_lock(&ft_mr_lock);
+			ft_mr_policy[idx] = 0;
+			for (i = 0; i < MAXVIFS; i++) {
+				if (ft_mr_vif[idx][i].dev)
+					dev_put(ft_mr_vif[idx][i].dev);
+				memset(&ft_mr_vif[idx][i], 0,
+				       sizeof(ft_mr_vif[idx][i]));
+			}
+			list_for_each_entry(g, &ft_mr_groups, list)
+				if (g->family == family)
+					g->seen = false;
+			list_for_each_entry(ev, &snapshot.events, list)
+				if (!ft_mr_apply(ev)) {
+					rc = -ENOMEM;
+					break;
+				}
+			if (!rc) {
+				list_for_each_entry(g, &ft_mr_groups, list)
+					if (g->family == family && !g->seen)
+						g->gone = true;
+				/* No live callback can set this bit under RTNL.
+				 * The worker is the sole other producer. */
+				clear_bit(idx, &ft_mr_resync_pending);
+			}
+			mutex_unlock(&ft_mr_lock);
+		}
+		rtnl_unlock();
+		list_splice_tail_init(&stale, &snapshot.events);
+		list_for_each_entry_safe(ev, tmp, &snapshot.events, list) {
+			list_del(&ev->list);
+			ft_mr_event_free(ev);
+		}
+		/* Incomplete mirrors may not authorize forwarding. The normal
+		 * worker withdraws this family's hardware and delayed work
+		 * retries even when the lost event was the very first ADD. */
+		mutex_lock(&ft_mr_lock);
+		ft_mr_dirty_family(family);
+		mutex_unlock(&ft_mr_lock);
+	}
 }
 
 /* MFC_OFFLOAD is what makes `ip mroute show` print `offload` against an entry,
@@ -5670,6 +5880,10 @@ static void ft_mr_work_fn(struct work_struct *work)
 	struct ft_mr_event *ev;
 	LIST_HEAD(dead);
 
+	/* Registration may replay its dump after a sequence mismatch. Do not
+	 * apply those attempts before the initial authoritative resync. */
+	if (!smp_load_acquire(&ft_mr_ready))
+		return;
 	/* 1. What the chain saw. */
 	for (;;) {
 		spin_lock_bh(&ft_mr_queue_lock);
@@ -5681,15 +5895,13 @@ static void ft_mr_work_fn(struct work_struct *work)
 		if (!ev)
 			break;
 		mutex_lock(&ft_mr_lock);
-		if (!ft_mr_stopping)
-			ft_mr_apply(ev);
+		if (!ft_mr_stopping && !ft_mr_apply(ev))
+			ft_mr_lost_event(ev->family);
 		mutex_unlock(&ft_mr_lock);
-		if (ev->mfc)
-			mr_cache_put(ev->mfc);
-		if (ev->dev)
-			dev_put(ev->dev);
-		kfree(ev);
+		ft_mr_event_free(ev);
 	}
+	if (READ_ONCE(ft_mr_resync_pending) && !READ_ONCE(ft_mr_stopping))
+		ft_mr_resync();
 
 	/* 2. Anything outside this learner that stales an answer it gave. */
 	if (READ_ONCE(ft_mr_recheck)) {
@@ -5762,8 +5974,11 @@ static void ft_mr_work_fn(struct work_struct *work)
 		 * bridge and netdev state, including the kernel's current MDB
 		 * and router-port set. Nothing in it touches hardware. */
 		rtnl_lock();
-		state = retries >= FT_MR_MAX_RETRIES ?
-			FT_MR_REFUSED_FAILED : ft_mr_derive(target, &plan);
+		if (test_bit(ft_mr_idx(target->family), &ft_mr_resync_pending))
+			state = FT_MR_REFUSED_RESYNC;
+		else
+			state = retries >= FT_MR_MAX_RETRIES ?
+				FT_MR_REFUSED_FAILED : ft_mr_derive(target, &plan);
 		/* cdx_mc_group_replace() refuses a spec whose ingress differs
 		 * from the installed one -- the port is part of the classifier
 		 * key -- so a parent VIF that moved is a delete and an add
@@ -5861,7 +6076,8 @@ static void ft_mr_work_fn(struct work_struct *work)
 		ft_mr_plan_put(&plan);
 	}
 
-	if (ft_mr_count && !READ_ONCE(ft_mr_stopping))
+	if ((ft_mr_count || READ_ONCE(ft_mr_resync_pending)) &&
+	    !READ_ONCE(ft_mr_stopping))
 		schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
 }
 
@@ -5893,7 +6109,8 @@ static void ft_mr_stats_fn(struct work_struct *work)
 	}
 	mutex_unlock(&ft_mr_lock);
 	cdx_ft_end();
-	if (ft_mr_count && !READ_ONCE(ft_mr_stopping)) {
+	if ((ft_mr_count || READ_ONCE(ft_mr_resync_pending)) &&
+	    !READ_ONCE(ft_mr_stopping)) {
 		schedule_work(&ft_mr_work);
 		schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
 	}
@@ -6226,9 +6443,20 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 	return 0;
 }
 
+/* Retirement storage belongs to an SA from its initial installation.
+ * Deletion can run from expiry under a spinlock and must never allocate. */
+struct ft_ipsec_retirement {
+	struct list_head list;
+	struct cdx_ipsec_sa *sa;
+};
+static LIST_HEAD(ft_ipsec_owned);
+static LIST_HEAD(ft_ipsec_retired);
+static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
+
 static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack)
 {
 	struct ft_ipsec_watch *watch = NULL;
+	struct ft_ipsec_retirement *retirement;
 	struct cdx_ipsec_sa_spec spec;
 	struct cdx_ipsec_sa *sa;
 	int rc;
@@ -6273,14 +6501,24 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 		if (!watch)
 			return -ENOMEM;
 	}
+	retirement = kzalloc(sizeof(*retirement), GFP_KERNEL);
+	if (!retirement) {
+		kfree(watch);
+		return -ENOMEM;
+	}
 	cdx_ft_begin();
 	rc = cdx_ipsec_sa_add(&spec, x, &sa);
 	cdx_ft_end();
 	if (rc) {
+		kfree(retirement);
 		kfree(watch);
 		NL_SET_ERR_MSG_WEAK(extack, "cdx: the hardware refused this SA");
 		return rc;
 	}
+	retirement->sa = sa;
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	list_add_tail(&retirement->list, &ft_ipsec_owned);
+	spin_unlock_bh(&ft_ipsec_retired_lock);
 	if (watch)
 		ft_ipsec_watch_add(watch, &spec, sa);
 	/* The opaque owner, not the sixteen-bit handle: it identifies this SA
@@ -6302,22 +6540,11 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	return 0;
 }
 
-/* SAs whose state has been deleted and whose hardware is waiting to go.
- *
- * Teardown cannot happen in the callback that learns about it, and it must not
- * wait for the callback that could: see ft_xdo_state_delete() below.
- */
-static LIST_HEAD(ft_ipsec_retired);
-static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
-
-struct ft_ipsec_retirement {
-	struct list_head list;
-	struct cdx_ipsec_sa *sa;
-};
-
 static void ft_ipsec_retire_work(struct work_struct *work)
 {
 	struct ft_ipsec_retirement *retirement;
+	struct cdx_ft_entry *entry, *next;
+	u16 handle;
 
 	for (;;) {
 		spin_lock_bh(&ft_ipsec_retired_lock);
@@ -6328,7 +6555,26 @@ static void ft_ipsec_retire_work(struct work_struct *work)
 		spin_unlock_bh(&ft_ipsec_retired_lock);
 		if (!retirement)
 			return;
-		cdx_ft_begin();
+		handle = cdx_ipsec_sa_handle(retirement->sa);
+		for (;;) {
+			cdx_ft_begin();
+			/* Serialize with admission, including an admission the atomic
+			 * deletion callback missed before its watch was published.
+			 * Never reuse an SA handle while a flow can still name it. */
+			list_for_each_entry_safe(entry, next, &ft_entries, list) {
+				if (entry->rule.sa_handle != handle &&
+				    entry->rule.in_sa_handle != handle)
+					continue;
+				ft_handle_invalidate(entry->handle, &ft_ipsec_invalidations);
+				ft_remove(entry);
+			}
+			/* A deletion barrier can defer reclaim or require datapath
+			 * quiescence. Retain the SA until that proof completes. */
+			if (!cdx_ft_pending() || !cdx_ft_recover())
+				break;
+			cdx_ft_end();
+			msleep(20);
+		}
 		cdx_ipsec_sa_del(&retirement->sa);
 		cdx_ft_end();
 		kfree(retirement);
@@ -6480,66 +6726,34 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 	}
 }
 
-/* Delete cannot touch the hardware, and it must not wait for free either.
- *
- * It cannot touch it because xfrm_state_delete() holds x->lock across
- * __xfrm_state_delete() with spin_lock_bh(), so this runs in atomic context
- * and every backend operation needs the control mutex.
- *
- * Waiting for xdo_dev_state_free() was the first answer and it was wrong. Free
- * is reached only once the last reference to the state is gone, and a frame
- * handed to SEC holds one: the state travels on the skb's sec_path so the
- * transmit path can find its frame queue, and that skb is freed lazily -- the
- * DPAA submit path stashes it in the scatter-gather table's trailing slot and
- * the buffer's *next* user frees it. On an idle tunnel that next user never
- * arrives, so the references sit there, free never runs, and the SA stays in
- * the classifier for ever. Reinstalling the same SPI then fails with
- * "Resource Already Exists" from the hash table, which is how this was found.
- *
- * Under the legacy owner the same references are taken and the same lazy free
- * applies, but nothing depended on it: CMM retired the SA over FCI, on its own
- * schedule. Here the teardown *is* the state's destruction, so tying the two
- * together made SA removal wait on buffer recycling.
- *
- * So the hardware is retired from a workqueue instead, promptly, and the
- * state's own lifetime is left to the kernel. What survives the SA is the
- * borrowed pointer in the SA cache, which cdx_ipsec_sa_del() clears before
- * anything can follow it.
- */
+/* xfrm_state_delete() holds x->lock with bottom halves disabled, whereas
+ * backend retirement needs the control mutex. Queue it promptly without
+ * waiting for the state's final free: in-flight SEC skbs retain secpath
+ * references until their input buffers complete and are reaped. The backend
+ * clears its borrowed state pointer before anything can follow it again. */
 static void ft_xdo_state_delete(struct xfrm_state *x)
 {
-	struct cdx_ipsec_sa *sa = (struct cdx_ipsec_sa *)x->xso.offload_handle;
-	struct ft_ipsec_retirement *retirement;
+	struct cdx_ipsec_sa *sa = (void *)xchg(&x->xso.offload_handle, 0);
+	struct ft_ipsec_retirement *retirement, *owned = NULL;
 
 	if (!sa)
 		return;
-	x->xso.offload_handle = 0;
-	/* Before the retirement is queued, and this order is what the resolve
-	 * work relies on: once the watch is off the list, a pass that finds no
-	 * watch for its cookie knows the SA is going and leaves it alone. */
+	/* Close the admission-before-watch race independently of policy
+	 * changes; an SA expiry leaves policy itself unchanged. */
+	atomic64_inc_return_release(&ft_ipsec_genid);
 	ft_ipsec_watch_del(sa);
-	/* Retire the flows first, while the handle still names this SA. They
-	 * point at a SEC context that is about to stop describing anything,
-	 * and a handle is reusable the moment its SA is gone. */
 	ft_ipsec_retire_sa(cdx_ipsec_sa_handle(sa));
-	/* GFP_ATOMIC: this can arrive with x->lock held. An allocation failure
-	 * here would strand the hardware SA, so say so rather than fail
-	 * silently -- the operator can still reload the adapter, and the
-	 * alternative is a classifier entry nobody can account for. */
-	retirement = kzalloc(sizeof(*retirement), GFP_ATOMIC);
-	if (!retirement) {
-		pr_err("cdx: no memory to retire IPsec SA for spi %x; its hardware entry is stranded\n",
-		       ntohl(x->id.spi));
-		return;
-	}
-	retirement->sa = sa;
-	/* _bh for the same reason ft_ipsec_watch_del() uses it: this callback
-	 * reaches here from a softirq on SA expiry and from plain netlink
-	 * context when a state fails to insert, so the queue has to be taken
-	 * with softirqs off on both. */
 	spin_lock_bh(&ft_ipsec_retired_lock);
-	list_add_tail(&retirement->list, &ft_ipsec_retired);
+	list_for_each_entry(retirement, &ft_ipsec_owned, list) {
+		if (retirement->sa != sa)
+			continue;
+		owned = retirement;
+		list_move_tail(&retirement->list, &ft_ipsec_retired);
+		break;
+	}
 	spin_unlock_bh(&ft_ipsec_retired_lock);
+	if (WARN_ON_ONCE(!owned))
+		return;
 	schedule_work(&ft_ipsec_retire);
 }
 
@@ -6586,6 +6800,10 @@ static int ft_xdo_policy_add(struct xfrm_policy *xp, struct netlink_ext_ack *ext
 		NL_SET_ERR_MSG(extack, "cdx: not an offload-capable port");
 		return -EOPNOTSUPP;
 	}
+	/* These policies select SAs for flow admission; the hardware does not
+	 * implement their full selectors. Linux must check receiving packets,
+	 * including plaintext arriving without a secpath. */
+	xp->xdo.software_policy = true;
 	return 0;
 }
 
@@ -6598,6 +6816,7 @@ static void ft_xdo_policy_free(struct xfrm_policy *xp)
 }
 
 static const struct xfrmdev_ops ft_xfrmdev_ops = {
+	.owner			= THIS_MODULE,
 	.xdo_dev_state_add	= ft_xdo_state_add,
 	.xdo_dev_state_delete	= ft_xdo_state_delete,
 	.xdo_dev_state_free	= ft_xdo_state_free,
@@ -6620,7 +6839,7 @@ static void ft_ipsec_attach(struct net_device *dev)
 	ASSERT_RTNL();
 	if (dev->xfrmdev_ops || !cdx_ipsec_port_supported(dev))
 		return;
-	dev->xfrmdev_ops = &ft_xfrmdev_ops;
+	WRITE_ONCE(dev->xfrmdev_ops, &ft_xfrmdev_ops);
 	/* All three, and wanted_features is the one that is easy to miss.
 	 * netdev_get_wanted_features() is (features & ~hw_features) |
 	 * wanted_features, so the moment the bit is advertised in hw_features
@@ -6642,7 +6861,7 @@ static void ft_ipsec_detach(struct net_device *dev)
 	dev->features &= ~NETIF_F_HW_ESP;
 	dev->wanted_features &= ~NETIF_F_HW_ESP;
 	dev->hw_features &= ~NETIF_F_HW_ESP;
-	dev->xfrmdev_ops = NULL;
+	WRITE_ONCE(dev->xfrmdev_ops, NULL);
 	netdev_features_change(dev);
 }
 
@@ -6657,6 +6876,8 @@ static void ft_ipsec_detach_all(void)
 	for_each_netdev(&init_net, dev)
 		ft_ipsec_detach(dev);
 	rtnl_unlock();
+	/* Core dispatch pins our module inside RCU before calling an op. */
+	synchronize_rcu();
 }
 
 /* Wi-Fi VAPs.
@@ -7252,7 +7473,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
 		   "rearm_ready %u\nrearms %llu\nneighbour_refs %u\nhandle_refs %u\n"
-		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_next_hop_updates %lld\n",
+		   "neighbour_invalidations %lld\nroute_invalidations %lld\nmtu_invalidations %lld\nlink_invalidations %lld\nmac_invalidations %lld\nfdb_invalidations %lld\nadmission_invalidations %lld\nipsec_invalidations %lld\nipsec_policy_invalidations %lld\nipsec_next_hop_updates %lld\n",
 		   "flowtable", cdx_ft_observing(), ft_bound, ft_passive, ft_count, CDX_FT_MAX_ENTRIES, ft_installs,
 		   ft_deletes, ft_rejects, ft_errors, ft_validated, ft_busy, atomic_read(&ft_invalid),
 		   ft_invalid_done, cdx_ft_failed(),
@@ -7266,6 +7487,7 @@ static int ft_show(struct seq_file *seq, void *v)
 		   atomic64_read(&ft_fdb_invalidations),
 		   atomic64_read(&ft_admission_invalidations),
 		   atomic64_read(&ft_ipsec_invalidations),
+		   atomic64_read(&ft_ipsec_policy_invalidations),
 		   atomic64_read(&ft_ipsec_next_hop_updates));
 	seq_printf(seq, "session_records %u\nsession_slots %u\n",
 		   session_records, session_slots);
@@ -7372,6 +7594,12 @@ static int __init ask_flowtable_init(void)
 	rc = ft_init_fault(4) ? -ENOMEM : register_fib_notifier(&init_net, &ft_fib_nb, NULL, NULL);
 	if (rc)
 		goto neigh;
+	/* A registration retry can replay the same rules more than once.
+	 * Replace its queued multicast mirror before authorizing hardware. */
+	set_bit(0, &ft_mr_resync_pending);
+	set_bit(1, &ft_mr_resync_pending);
+	smp_store_release(&ft_mr_ready, true);
+	schedule_work(&ft_mr_work);
 	rc = ft_init_fault(6) ? -ENOMEM : register_nexthop_notifier(&init_net, &ft_nexthop_nb, NULL);
 	if (rc)
 		goto fib;

@@ -2,7 +2,8 @@
 
 Status: controller reconciliation, bounded nft execution, controller crash
 supervision, allocation-failure recovery, routed VLAN recovery and bridge VLAN
-membership, route and next-hop recovery validated 2026-09-21–22; broader fault
+membership, route, next-hop, IPv6 and routed multicast recovery validated
+2026-09-21–22; broader fault
 coverage remains planned.
 This document separates that implementation from the
 remaining recovery requirements. Hardware validation is recorded below.
@@ -442,6 +443,214 @@ references, VLAN records/slots and backend errors are zero. Final audit found
 no test routes, next-hop entry or namespace, restored neighbour timers and
 unchanged failslab settings, running binaries and taint, with no kernel splats.
 There was no reboot or counter reset.
+
+## IPv6 recovery — 2026-09-22
+
+The [IPv6 service suite](../tools/tests/test_flowtable_service_ipv6.py) keeps
+IPv4 TCP/UDP controls alongside routed IPv6 TCP/UDP connections. It exercises
+three cycles each of IPv6 route withdrawal, failed neighbour discovery and
+owned-table deletion, then one stack-filtered failslab hit during action
+allocation and hardware admission for each transport. All seven cases passed
+on the existing KASAN boot in 824.18 seconds, without product changes.
+
+| Fault | Hardware retired | Admission checks complete | Directional hardware proof complete |
+| --- | ---: | ---: | ---: |
+| IPv6 route withdrawn | 0.36–0.49 s | 5.86–7.43 s | 14.14–15.75 s |
+| IPv6 next hop stops answering NS | 0.96–0.97 s | 7.49–7.78 s | 15.80–16.10 s |
+| Owned admission table deleted | — | 6.36–6.40 s | 14.67–14.70 s |
+| TCP/UDP action or hardware allocation fails | — | 1.62–1.67 s | 9.90–11.08 s |
+
+Route and neighbour recovery timings begin after restoring the prerequisite;
+table and allocation timings begin at injection. Hardware proof includes an
+eight-second traffic window. Route/ND failures retire only the affected
+connections: IPv4 cookies survive, with no policy reinstall or global rearm.
+NS suppression has an independent expiry in the test namespace. Recovery
+removes that rule and relies on real NDP, without inserting a neighbour.
+Missing-table recovery performs one policy install per cycle. Existing sockets
+survive, new connections offload, and forbidden IPv4/IPv6 probes stay blocked.
+
+The native controller's address selectors currently accept IPv4; these IPv6
+cases use its family-independent port selectors and assert every admitted
+tuple. The fixture uses routed IPv6 without NAT. A separate, non-permitting
+counter chain measures software forwarding for the reserved test port pair in
+both directions. Whole-port software counters remain recorded, but unrelated
+bench traffic no longer determines that assertion. This was needed after an
+initial run passed its hardware packet checks and exceeded the aggregate WAN
+software-traffic threshold. Setup failures and that failed run were retained.
+
+The final IPv6 drain balanced 706 installs/deletes, with no entries, handle or
+neighbour references, quarantine, backend errors or kernel splats. The 12
+earlier rearms and all accumulated invalidation counters remain intact. No
+cleanup reboot or counter reset occurred. Subsequent subsystem tests exposed
+production defects and required booting rebuilt images for their validation.
+
+## Routed multicast recovery — 2026-09-22
+
+The [routed multicast suite](../tools/tests/test_flowtable_service_multicast.py)
+passed all ten IPv4/IPv6 cases on a rebuilt KASAN image in 977.37 seconds:
+three withdrawal/restoration cycles per family, plus one actual failslab hit
+in each of hardware-key ownership, ADD notification, DELETE notification and
+group allocation. Listeners receive exactly 256 unique tagged payloads per
+hardware window, with no duplicates, the correct source, and decremented TTL
+or hop limit. Removed routes deliver no target traffic; the independent group
+and unicast TCP/UDP connections keep working.
+
+| Fault | Hardware retired | Readmitted after restoration |
+| --- | ---: | ---: |
+| Route withdrawal | 0.02–0.04 s | 0.03–0.04 s |
+| Hardware ownership allocation | 0.04 s | 6.85–6.93 s |
+| ADD notification allocation | 0.03–0.04 s | 6.79–7.07 s |
+| Group allocation | 0.03–0.04 s | 6.86–7.01 s |
+| DELETE notification allocation | 6.69–7.00 s | 0.04 s |
+
+The original implementation lost multicast state when event/group allocation
+failed. A consumed DELETE-notification fault reproduced hardware forwarding
+past withdrawal and left one stale software group. The learner now marks that
+family uncertain, withdraws/refuses its hardware entries, and retries a
+complete authoritative multicast-routing dump. An incomplete capture or apply
+keeps the retry pending. Successful recovery reconciles deleted groups as well
+as additions, while unchanged groups retain their counters and hardware.
+
+All fault leases restored their original settings. No service restart, policy
+reinstall or global rearm repaired the tested transitions. The final drain had
+zero multicast groups, hardware entries, handle/neighbour references and device
+records, with unicast installs/deletes balanced at 112 and no backend errors
+or quarantine. The six lost-event/group allocations and two ownership
+allocation failures remain visible in counters. The pre-fix failure was saved;
+rebooting was required to load the production fixes, never to make a failed
+recovery appear successful. Bridged multicast has separate coverage.
+
+## IPsec recovery implementation
+
+The [SA recovery suite](../tools/tests/test_flowtable_service_ipsec.py) withdraws
+and restores each tunnel direction while the original TCP/UDP sockets remain
+open. It also injects SA-context allocation failures. The
+[policy suite](../tools/tests/test_flowtable_service_ipsec_policy.py) changes
+forwarding and output policies, required templates, packet marks, default
+policies and policy lifetimes. Unprotected controls, denied traffic and a
+plaintext injection probe run alongside the protected connections. Physical
+WAN captures establish ESP use; directional hardware counters and software
+forwarding counters distinguish acceleration from successful software fallback.
+
+A per-network policy generation now invalidates both native flowtable lookup
+and ASK hardware admission. Policy notifications retire stale entries; admission
+checks the current policies and repeats generation checks across publication.
+Forwarding checks retain the received security path and enforce required
+transforms, including packet-offloaded policies. Marked policies conservatively
+exclude hardware admission when their selectors cannot be represented safely.
+Restoring the policy permits automatic admission without recreating SAs or
+restarting the controller. SA retirement reserves its bookkeeping before
+installation, revokes dependent flows and waits for their hardware retirement
+before deleting the SA.
+
+XFRM states and offloaded policies retain the provider module and a stable
+callback table until final destruction. Acquired states take their own
+reference; failed setup releases it. Bonding rejects a dynamically owned
+provider rather than forwarding through callbacks it cannot retain. Host
+regressions cover detached devices, delayed state destruction, error unwind,
+module unload transitions and admission-generation races.
+
+Completed SEC input buffers now release their payload DMA mappings, original
+skb and mapping-device reference through one completion path. A bounded worker
+reaps returned buffers even while the tunnel is idle, so the last packet cannot
+retain a deleted SA and pin its provider indefinitely. The SGT keeps its original
+pool DMA mapping, with explicit ownership synchronization; per-packet mapping
+failures unwind only the entries that succeeded. Synchronous enqueue failure
+preserves the skb for Linux fallback, while asynchronous rejection releases it.
+Pool initialization rolls back partial seeding, and shutdown drains completed
+inputs before freeing both SG pools. Sanitized host tests cover these ownership
+paths, fragmented packets, partial mappings, bounded reaping and repeated
+initialization failure and retry.
+
+The software receive path now initializes the complete security-path extension,
+balances state references across NAPI deferral and drops, and transfers DMA
+buffer ownership once. Pool buffers use page-backed storage so secondary
+scatter-gather fragments retain their data after their skb shell is freed.
+Failed scatter-gather-table DMA recycling releases its old storage.
+
+Repeated policy recovery exposed a separate SEC receive-pool exhaustion bug:
+refill used the Ethernet pool's per-CPU count. Ethernet refill could hide SEC
+consumption until the dedicated 512-buffer pool emptied, after which software
+IPsec traffic could no longer produce receive callbacks. A separate debt
+counter and bounded worker now replenish consumed SEC buffers. Failed
+allocation or DMA mapping retains the debt and retries even with no arriving
+packets. The exhaustion test holds refill allocations failing, verifies an
+empty BMan pool, clears only the fault, then requires refill while protected
+traffic is idle and recovery of the original connections. The SEC enqueue
+attempt counter alone is not proof that an empty-pool enqueue succeeded.
+
+An initial continuous-fault run also exposed an injector limitation: softirq
+receive processing can interrupt a refill worker and retain its function in
+the stack. The pool filter now rejects softirq ancestry, and continuous fault
+logging is rate-limited. A finite, very large fault budget supplies a kernel
+hit count even for allocations that suppress diagnostics with `__GFP_NOWARN`.
+Production allocation failure messages are also rate-limited. The failed run's fault lease expired
+and its pool returned to 512 buffers on the same boot; the serial-console
+flood and resulting stall warnings remain recorded as a failed test.
+
+On the rebuilt KASAN image, receive-pool exhaustion consumed 139 injected
+allocation failures and drained the pool to zero. Clearing only the injector
+returned all 512 buffers while protected traffic was idle. The original
+TCP/UDP connections and a new connection subsequently passed directional
+hardware checks, with unchanged SAs, no controller restart and no plaintext
+leak. The first post-fault pool observation was already full; its measurement
+time is not a precise refill-latency claim.
+
+Three cycles each of forwarding-default and output-default block/recovery
+passed. The test control connection has narrowly scoped XFRM exceptions for
+both its original and NAT-translated tuples. The protected data ports remain
+subject to the default block. Hard policy expiry restored hardware forwarding
+without a policy-repair command. A receive-path allocation failure dropped
+exactly one of 64 UDP exchanges, followed by successful hardware recovery.
+The provider-lifetime test explicitly sends through software SEC submission,
+leaves traffic idle, then proves references fall from four to two to zero as
+states and packet policies are removed. Unload remains refused while either
+kind of object still owns a reference.
+
+All five policy-change cases also passed on the final image in 813.16 seconds:
+forwarding block, required forwarding transform, output block, marked
+forwarding block and packet-offloaded forwarding transform. Each repeated
+three times, preserving the original sockets and SAs and proving both blocked
+traffic during revocation and hardware forwarding after restoration.
+
+Both SA directions passed three withdrawal/restoration cycles, and both
+SA-context allocation faults were consumed before successful restoration.
+Admission checks completed in 4.56–5.23 seconds after SA restoration, with
+directional hardware proof complete in 15.28–16.05 seconds. Allocation-fault
+cases completed those checks within 11.04 and 22.20 seconds respectively.
+The control flows retained their cookies; required policies remained in force
+while each SA was absent, with no plaintext delivery.
+
+A further admission test recreates the protected UDP conntrack 24 times while
+protected TCP and ordinary controls remain active. All 24 cycles passed with
+exact delivery, two new hardware directions per cycle, balanced resource
+counts and no rearm. The final hardware and plaintext-blocking checks passed.
+Its bidirectional WAN capture contains 83,272 outbound and 84,310 inbound ESP
+packets with no missing or duplicate sequence numbers. One inbound pair was
+reordered, within the peer's replay window.
+
+One earlier SA-test baseline timed out on its fourth protected UDP exchange,
+before any fault injection. Both TCP streams completed their 128 records.
+The same-boot retry and the subsequent 24 admission cycles passed; that failure
+remains recorded without an established cause.
+
+An instrumented repeat followed the original SA-test order. All four fresh
+admissions delivered their first 128 UDP requests and replies exactly once,
+matched across LAN captures and decrypted WAN ESP captures. The original LAN
+journal showed no DHCP or link event around the timeout. This repeat does not
+establish a cause for the earlier loss. The third case's recovery assertions
+passed, but an unrelated Wi-Fi log split a UART acknowledgement during teardown;
+the fourth case continued separately after restoring the saved configuration
+on the same boot. UART script staging now retries only private-file preparation
+and hash verification; uncertain execution of a test operation is never retried.
+Six host checks cover that distinction.
+
+All 250 host tests passed, including the sanitized ownership and lifecycle
+regressions. Bridge multicast and tunnel validation remains in progress.
+Bridge wire checks exposed a source-MAC rewrite in the existing multicast
+encoder. The [hardware investigation](flowtable-multicast-hardware.md) records
+the relevant NXP manuals and diagnostic action sequences; those experiments
+do not count as passing recovery coverage.
 
 ## Coverage before this slice
 

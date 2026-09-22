@@ -29,7 +29,10 @@ def keys(ids, flows=FLOWS):
     for ident in ids:
         spec = flows[ident]
         proto = "6" if spec["proto"] == "tcp" else "17"
-        src, dst = f"{spec['lan']}:{spec['sport']}", f"{WAN_IP}:{DPORT}"
+        def endpoint(address, port):
+            return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+        src = endpoint(spec["lan"], spec["sport"])
+        dst = endpoint(spec.get("connect_ip", WAN_IP), spec.get("connect_port", DPORT))
         result.update(((TARGET_LAN_IF, proto, src, dst), (TARGET_WAN_IF, proto, dst, src)))
     return result
 
@@ -162,6 +165,7 @@ async def warm(r, p, ids, label, flows=FLOWS):
 async def hardware(r, p, label, flows=FLOWS):
     ids = list(range(len(flows)))
     before = await r.state()
+    forwarded = await r.software_forwarded() if hasattr(r, "software_forwarded") else None
     tx_before, cpu_before = await software_tx(r), await cpu(r)
     reports = await p.batch(ids, count=256, interval=0.03125)
     after, tx_after, cpu_after = await r.state(), await software_tx(r), await cpu(r)
@@ -176,13 +180,18 @@ async def hardware(r, p, label, flows=FLOWS):
                 # Proc reports raw ingress bytes, including any VLAN tags.
                 tags = old[key]["in_vlan"]
                 vlan_bytes = 0 if tags == "-" else 4 * len(tags.split("."))
-                assert int(new[key]["bytes"]) - int(old[key]["bytes"]) == 256 * (256 + 42 + vlan_bytes), (key, old, new)
+                ip_bytes = 40 if ":" in flows[ident]["lan"] else 20
+                assert int(new[key]["bytes"]) - int(old[key]["bytes"]) == 256 * (256 + 14 + ip_bytes + 8 + vlan_bytes), (key, old, new)
             else:
                 assert packets >= reports[ident]["bytes"] // 1500, (key, packets)
     tx = {dev: tx_after[dev] - tx_before[dev] for dev in tx_before}
-    assert 0 <= tx[TARGET_LAN_IF] <= 64 and 0 <= tx[TARGET_WAN_IF] <= 512, tx
+    slow_path = await r.software_forwarded() - forwarded if forwarded is not None else None
     r.record(label, {"before": before, "after": after, "transfers": reports,
-                     "software_tx": tx, "cpu": cpu_delta(cpu_before, cpu_after)})
+                     "software_tx": tx, "software_forwarded": slow_path, "cpu": cpu_delta(cpu_before, cpu_after)})
+    if slow_path is not None:
+        assert 0 <= slow_path <= 64, slow_path
+    else:
+        assert 0 <= tx[TARGET_LAN_IF] <= 64 and 0 <= tx[TARGET_WAN_IF] <= 512, tx
     return after
 
 

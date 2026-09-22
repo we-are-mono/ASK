@@ -81,10 +81,24 @@ static void list_del(struct list_head *e)
 	     &pos->member != (head); \
 	     pos = n, n = list_entry(n->member.next, __typeof__(*pos), member))
 
+#define list_first_entry_or_null(head, type, member) \
+	((head)->next == (head) ? NULL : list_entry((head)->next, type, member))
+static void list_move_tail(struct list_head *e, struct list_head *head)
+{ list_del(e); list_add_tail(e, head); }
+
 /* --- kernel bits ----------------------------------------------------- */
 #define GFP_KERNEL 0
 #define GFP_ATOMIC 1
-#define kzalloc(n, f) calloc(1, (n))
+static int fail_alloc_after = -1;
+static unsigned allocation_calls;
+static void *test_kzalloc(size_t size)
+{
+	allocation_calls++;
+	if (fail_alloc_after == 0) return NULL;
+	if (fail_alloc_after > 0) fail_alloc_after--;
+	return calloc(1, size);
+}
+#define kzalloc(n, f) test_kzalloc(n)
 #define kfree(p) free(p)
 #define spin_lock_bh(l) ((void)(l))
 #define spin_unlock_bh(l) ((void)(l))
@@ -93,18 +107,23 @@ static void list_del(struct list_head *e)
 #define read_lock_bh(l) ((void)(l))
 #define read_unlock_bh(l) ((void)(l))
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define THIS_MODULE NULL
 #define netdev_info(dev, fmt, ...) ((void)(dev))
 static unsigned warnings;
 #define netdev_warn(dev, fmt, ...) do { (void)(dev); warnings++; } while (0)
 #define pr_warn(...) ((void)0)
 #define pr_err(...) ((void)0)
-#define WARN_ON_ONCE(cond) assert(!(cond))
+#define WARN_ON_ONCE(cond) ({ bool hit = !!(cond); assert(!hit); hit; })
+#define xchg(p, value) ({ __typeof__(*(p)) old = *(p); *(p) = (value); old; })
 #define ASSERT_RTNL() do { } while (0)
 #define DEFINE_SPINLOCK(name) int name
 
 typedef long long atomic64_t;
 #define ATOMIC64_INIT(v) (v)
 static void atomic64_inc(atomic64_t *v) { (*v)++; }
+static void atomic64_inc_return_release(atomic64_t *v) { (*v)++; }
+static atomic64_t ft_ipsec_genid;
 
 static int ft_watch_lock;
 static bool ether_addr_equal(const u8 *a, const u8 *b)
@@ -216,6 +235,11 @@ struct dst_entry {
 };
 static struct xfrm_state *dst_xfrm(const struct dst_entry *d) { return d->xfrm; }
 static struct dst_entry *xfrm_dst_child(const struct dst_entry *d) { return d->child; }
+static struct dst_entry *xfrm_dst_path(struct dst_entry *d)
+{
+	while (d->xfrm) d = d->child;
+	return d;
+}
 static void dst_hold(struct dst_entry *d) { d->refs++; }
 /* Releases the whole chain, the way the kernel's does: a bundle holds the
  * destination it was built over, so dropping the bundle drops that too. */
@@ -238,6 +262,8 @@ struct flowi {
 	union { struct flowi4 ip4; struct flowi6 ip6; } u;
 	u8 flowi_proto;
 	int flowi_oif;
+	int flowi_iif;
+	u32 flowi_mark;
 };
 
 /* --- xfrm ------------------------------------------------------------ */
@@ -268,6 +294,7 @@ struct xfrm_dev_offload {
 	u8 type;
 	u8 dir;
 	u8 flags;
+	bool software_policy;
 };
 
 struct xfrm_lifetime_cfg {
@@ -275,7 +302,10 @@ struct xfrm_lifetime_cfg {
 	u64 soft_packet_limit, hard_packet_limit;
 };
 
+struct xfrm_selector { bool mismatch; };
 struct xfrm_state {
+	struct xfrm_selector sel;
+	u32 if_id;
 	struct { xfrm_address_t daddr; __be32 spi; u8 proto; } id;
 	struct {
 		xfrm_address_t saddr;
@@ -283,7 +313,7 @@ struct xfrm_state {
 		u8 mode;
 		u8 aalgo, ealgo;
 		u8 flags;
-		u32 replay_window;
+		u32 replay_window, reqid;
 	} props;
 	struct { u32 v; } mark;
 	struct { u8 state; } km;
@@ -298,7 +328,63 @@ struct xfrm_state {
 	unsigned refs;
 };
 
-struct xfrm_policy { struct xfrm_dev_offload xdo; };
+#define XFRM_POLICY_FWD 2
+#define XFRM_POLICY_TYPE_MAIN 0
+#define XFRM_POLICY_ALLOW 0
+#define XFRM_USERPOLICY_BLOCK 1
+#define XFRM_MAX_DEPTH 6
+#define IPSEC_PROTO_ANY 255
+struct xfrm_tmpl {
+	struct { xfrm_address_t daddr; __be32 spi; u8 proto; } id;
+	xfrm_address_t saddr;
+	u32 reqid, aalgos;
+	u8 mode, encap_family;
+	bool optional, allalgs;
+};
+struct sec_path {
+	int len, verified_cnt;
+	struct xfrm_state *xvec[XFRM_MAX_DEPTH];
+};
+static bool xfrm_state_kern(const struct xfrm_state *x) { (void)x; return false; }
+static bool xfrm_id_proto_match(u8 proto, u8 userproto) { return proto == userproto || userproto == IPSEC_PROTO_ANY; }
+static bool xfrm_selector_match(const struct xfrm_selector *s, const struct flowi *fl, u16 family)
+{ (void)fl; (void)family; return !s->mismatch; }
+static bool xfrm_state_addr_cmp(const struct xfrm_tmpl *t, const struct xfrm_state *x, u16 family)
+{
+	size_t size = family == AF_INET ? 4 : 16;
+	return memcmp(&t->id.daddr, &x->id.daddr, size) || memcmp(&t->saddr, &x->props.saddr, size);
+}
+struct xfrm_policy {
+	int lock;
+	struct xfrm_dev_offload xdo;
+	struct { struct list_head all; bool dead; } walk;
+	struct { u32 m; } mark;
+	int type, action, xfrm_nr;
+	struct xfrm_tmpl xfrm_vec[XFRM_MAX_DEPTH];
+	unsigned refs;
+};
+struct net {
+	struct { struct list_head policy_all; int xfrm_policy_lock;
+		int policy_default[3]; } xfrm;
+};
+static struct xfrm_policy *receiving_policy;
+static int receiving_oif, receiving_family;
+static struct flowi receiving_query;
+static int receiving_error;
+static struct xfrm_policy *xfrm_policy_lookup(struct net *net, const struct flowi *fl,
+					    u16 family, int dir, int if_id)
+{
+	(void)net; (void)if_id;
+	assert(dir == XFRM_POLICY_FWD);
+	receiving_query = *fl;
+	if (receiving_error)
+		return ERR_PTR(receiving_error);
+	if (!receiving_policy || family != receiving_family || fl->flowi_oif != receiving_oif)
+		return NULL;
+	receiving_policy->refs++;
+	return receiving_policy;
+}
+static void xfrm_pol_put(struct xfrm_policy *pol) { assert(pol->refs); pol->refs--; }
 
 static unsigned xfrm_state_refs;
 static void xfrm_state_put(struct xfrm_state *x)
@@ -327,8 +413,8 @@ static struct xfrm_state *xfrm_state_lookup_byaddr(void *net, u32 mark,
 		return NULL;
 	/* Mirrored endpoints: the question asked is "whose source is the peer
 	 * this outbound SA sends to, and whose destination is us". */
-	assert(paired_state->id.daddr.a4 == daddr->a4);
-	assert(paired_state->props.saddr.a4 == saddr->a4);
+	if (paired_state->id.daddr.a4 != daddr->a4 || paired_state->props.saddr.a4 != saddr->a4)
+		return NULL;
 	paired_state->refs++;
 	xfrm_state_refs++;
 	return paired_state;
@@ -380,7 +466,7 @@ static struct dst_entry *xfrm_lookup(void *net, struct dst_entry *dst,
 	return dst;			/* no policy: the plain destination */
 }
 
-static char init_net;
+static struct net init_net;
 
 /* --- the SA backend -------------------------------------------------- */
 
@@ -394,6 +480,7 @@ struct cdx_ipsec_sa {
 };
 static struct cdx_ipsec_sa sa_pool[4];
 static unsigned sa_installed, sa_deleted;
+static unsigned retirement_flows, retirement_barriers;
 static int sa_add_error;
 static int sa_next_hop_error;
 static unsigned sa_next_hop_calls;
@@ -433,6 +520,7 @@ static void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 {
 	if (!*sa)
 		return;
+	assert(!retirement_flows && !retirement_barriers);
 	(*sa)->live = false;
 	*sa = NULL;
 	sa_deleted++;
@@ -488,6 +576,7 @@ struct ft_ipsec_retirement {
 	struct cdx_ipsec_sa *sa;
 };
 static LIST_HEAD(ft_ipsec_retired);
+static LIST_HEAD(ft_ipsec_owned);
 static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
 
 struct netlink_ext_ack { const char *_msg; };
@@ -495,6 +584,7 @@ struct netlink_ext_ack { const char *_msg; };
  * of it compiles here and the attachment can be checked against it. */
 struct sk_buff;
 struct xfrmdev_ops {
+	void *owner;
 	int (*xdo_dev_state_add)(struct xfrm_state *x,
 				 struct netlink_ext_ack *extack);
 	void (*xdo_dev_state_delete)(struct xfrm_state *x);
@@ -520,7 +610,35 @@ struct xfrmdev_ops {
 struct flow_cls_offload {
 	struct dst_entry *nf_dst;
 	struct dst_entry *nf_dst_reverse;
+	const struct nf_conn { u32 mark; } *nf_ct;
+	struct nf_flow_offload_handle { bool valid; } *nf_handle;
 };
+static atomic64_t ft_admission_invalidations, ft_ipsec_invalidations;
+struct cdx_ft_entry {
+	struct list_head list;
+	struct { u16 sa_handle, in_sa_handle; } rule;
+	struct nf_flow_offload_handle *handle;
+};
+static LIST_HEAD(ft_entries);
+static int ft_remove(struct cdx_ft_entry *e)
+{
+	assert(ft_transaction && retirement_flows);
+	retirement_flows--;
+	list_del(&e->list);
+	free(e);
+	return 0;
+}
+static unsigned cdx_ft_pending(void) { assert(ft_transaction); return retirement_barriers; }
+static int cdx_ft_recover(void)
+{
+	assert(ft_transaction && !retirement_flows);
+	if (retirement_barriers) retirement_barriers--;
+	return retirement_barriers ? -EIO : 0;
+}
+static void ft_handle_invalidate(struct nf_flow_offload_handle *h, atomic64_t *count)
+{
+	if (h->valid) { h->valid = false; (*count)++; }
+}
 
 /* The route the FIB should answer with, and the neighbour on it. */
 static struct rtable *route_answer;
@@ -605,6 +723,11 @@ static struct xfrm_state *outbound_state(void)
 
 static void bench_reset(void)
 {
+	init_net.xfrm.policy_all.next = init_net.xfrm.policy_all.prev = &init_net.xfrm.policy_all;
+	memset(init_net.xfrm.policy_default, 0, sizeof(init_net.xfrm.policy_default));
+	receiving_policy = NULL;
+	receiving_error = 0;
+	ft_admission_invalidations = 0;
 	wan_route.dst.ops = &v4_ops;
 	wan_route.dst.dev = &WAN;
 	wan_route.dst.error = 0;
@@ -639,29 +762,21 @@ static void bench_reset(void)
 	assert(!ft_transaction);
 }
 
-/* What the retirement work does with the queue delete leaves behind: take the
- * control mutex and release the hardware. Draining it here is what makes the
- * ordering under test real rather than simulated -- after this the SA is gone
- * for the same reason it is gone on the target. */
+/* Run the real worker so ordering and retry ownership are tested too. */
 static void bench_drain_retirements(void)
 {
-	while (ft_ipsec_retired.next != &ft_ipsec_retired) {
-		struct ft_ipsec_retirement *r =
-			list_entry(ft_ipsec_retired.next,
-				   struct ft_ipsec_retirement, list);
-
-		list_del(&r->list);
-		cdx_ft_begin();
-		cdx_ipsec_sa_del(&r->sa);
-		cdx_ft_end();
-		kfree(r);
-	}
+	ft_ipsec_retire_work(NULL);
 }
 
 /* Drop every watch and every SA, so each group of cases starts level. */
 static void bench_clear_sas(void)
 {
 	bench_drain_retirements();
+	while (ft_ipsec_owned.next != &ft_ipsec_owned) {
+		struct ft_ipsec_retirement *r = list_entry(ft_ipsec_owned.next, struct ft_ipsec_retirement, list);
+		list_del(&r->list);
+		kfree(r);
+	}
 	ft_ipsec_watch_flush();
 	memset(sa_pool, 0, sizeof(sa_pool));
 	sa_installed = 0;
@@ -810,6 +925,14 @@ static void test_state_add(void)
 	assert(ft_xdo_state_add(x, &ack) == -EOPNOTSUPP);
 	x->id.proto = IPPROTO_ESP;
 
+	for (int fail = 0; fail < 2; fail++) {
+		fail_alloc_after = fail;
+		assert(ft_xdo_state_add(x, &ack) == -ENOMEM);
+		assert(!sa_installed && !x->xso.offload_handle);
+		assert(ft_ipsec_owned.next == &ft_ipsec_owned);
+	}
+	fail_alloc_after = -1;
+
 	/* The real thing: installed, the handle published both ways, and a
 	 * watch taken so the peer can be followed. */
 	assert(ft_xdo_state_add(x, &ack) == 0);
@@ -820,9 +943,29 @@ static void test_state_add(void)
 
 	/* Deleting retires the flows naming the handle -- while the handle
 	 * still names this SA -- and queues the hardware teardown. */
+	fail_alloc_after = 0;
+	unsigned old_allocations = allocation_calls;
 	ft_xdo_state_delete(x);
+	assert(allocation_calls == old_allocations);
+	fail_alloc_after = -1;
+	assert(ft_ipsec_owned.next == &ft_ipsec_owned);
 	assert(retired_handles == 1 && retires_scheduled == 1);
 	assert(x->xso.offload_handle == 0);
+
+	/* Model an admission that was not yet on the watch when deletion
+	 * ran. The SA worker must discover it, remove it under the transaction,
+	 * and complete deferred barriers before its handle can be reused. */
+	struct nf_flow_offload_handle late_handle = { .valid = true };
+	struct cdx_ft_entry *late = calloc(1, sizeof(*late));
+	late->handle = &late_handle;
+	late->rule.in_sa_handle = sa_pool[0].handle;
+	list_add_tail(&late->list, &ft_entries);
+	retirement_flows = 1;
+	retirement_barriers = 3;
+	unsigned slept_before = slept;
+	bench_drain_retirements();
+	assert(!late_handle.valid && !retirement_flows && !retirement_barriers);
+	assert(slept == slept_before + 2 && sa_deleted == 1);
 
 	/* A refused install leaves nothing behind: no SA, and no watch whose
 	 * SA never existed. */
@@ -861,6 +1004,7 @@ static void test_policy_add(void)
 	policy.xdo.type = XFRM_DEV_OFFLOAD_PACKET;
 	policy.xdo.dev = &WAN;
 	assert(ft_xdo_policy_add(&policy, &ack) == 0);
+	assert(policy.xdo.software_policy);
 	policy.xdo.dev = &SOFT;
 	assert(ft_xdo_policy_add(&policy, &ack) == -EOPNOTSUPP);
 	policy.xdo.dev = &WAN;
@@ -942,6 +1086,9 @@ static void test_offloaded(void)
 
 	/* A bundle of exactly one offloaded transform, on this port. */
 	assert(ft_ipsec_offloaded(&bundle, &WAN) == x);
+	x->km.state = XFRM_STATE_DEAD;
+	assert(!ft_ipsec_offloaded(&bundle, &WAN));
+	x->km.state = XFRM_STATE_VALID;
 
 	/* Another port's SEC context is not this direction's to name. */
 	assert(!ft_ipsec_offloaded(&bundle, &LAN));
@@ -977,7 +1124,7 @@ static void test_paired_inbound(void)
 	/* No inbound half at all: the far end sends in the clear, which is
 	 * unusual but legal, and the direction installs with no handle. */
 	paired_state = NULL;
-	assert(ft_ipsec_paired_inbound(out, &LAN, &handle));
+	assert(ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
 	assert(handle == 0);
 
 	/* The mirrored half, offloaded on the ingress port. */
@@ -991,7 +1138,7 @@ static void test_paired_inbound(void)
 	sa_pool[0].handle = 7;
 	in.km.state = XFRM_STATE_VALID;
 	paired_state = &in;
-	assert(ft_ipsec_paired_inbound(out, &LAN, &handle));
+	assert(ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
 	assert(handle == 7);
 	assert(xfrm_state_refs == 0);	/* the lookup's reference is given back */
 
@@ -1000,19 +1147,19 @@ static void test_paired_inbound(void)
 	 * entry keyed on the physical port would be installed, counted, and
 	 * never match a frame. */
 	in.xso.type = XFRM_DEV_OFFLOAD_UNSPECIFIED;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle));
+	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
 	assert(handle == 0);
 	in.xso.type = XFRM_DEV_OFFLOAD_PACKET;
 
 	/* On another port, dead, or facing the wrong way is the same refusal. */
 	in.xso.dev = &WAN;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle));
+	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
 	in.xso.dev = &LAN;
 	in.km.state = XFRM_STATE_DEAD;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle));
+	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
 	in.km.state = XFRM_STATE_VALID;
 	in.xso.dir = XFRM_DEV_OFFLOAD_OUT;
-	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle));
+	assert(!ft_ipsec_paired_inbound(out, &LAN, &handle, NULL));
 
 	assert(xfrm_state_refs == 0);
 	paired_state = NULL;
@@ -1035,34 +1182,32 @@ static void test_resolve(void)
 
 	/* No destination at all is not a refusal: a direction with nothing to
 	 * ask about is a plain one. */
-	assert(ft_ipsec_resolve(NULL, &fl, &WAN, NULL, &handle));
+	assert(ft_ipsec_resolve(NULL, &fl, &WAN, NULL, &handle, NULL));
 	assert(handle == 0);
 
-	/* A destination that already carries the transform answers without a
-	 * lookup: a transform that is there is not a false positive. It has a
-	 * child, because a transformed destination always does -- the route
-	 * that transmits sits under the bundle. */
+	/* A carried transform must not preserve a policy that has since been
+	 * removed. Resolve the current policy from its underlying route. */
 	{
 		struct dst_entry under = { .ops = &v4_ops, .refs = 1 };
 		struct dst_entry carried = { .ops = &v4_ops, .xfrm = x,
 					     .child = &under, .refs = 1 };
 
-		assert(ft_ipsec_resolve(&carried, &fl, &WAN, NULL, &handle));
-		assert(handle == 5 && policy_lookups == 0);
+		assert(ft_ipsec_resolve(&carried, &fl, &WAN, NULL, &handle, NULL));
+		assert(handle == 0 && policy_lookups == 1 && under.refs == 1);
 		assert(carried.refs == 1);	/* borrowed, and given back */
 	}
 
 	/* No policy covers the tuple: an ordinary plain end, with the
 	 * reference taken to ask handed back. */
-	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle));
-	assert(handle == 0 && plain.refs == 1 && policy_lookups == 1);
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
+	assert(handle == 0 && plain.refs == 1 && policy_lookups == 2);
 
 	/* A policy resolving to an offloaded SA. The bundle takes over the
 	 * caller's reference to the destination, and releasing the bundle has
 	 * to leave the borrowed destination exactly as it was found. */
 	policy_answer(WAN.ifindex, &bundle);
 	bundle.refs = 0;
-	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle));
+	assert(ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
 	assert(handle == 5);
 	assert(plain.refs == 1 && bundle.refs == 0);
 
@@ -1072,12 +1217,12 @@ static void test_resolve(void)
 	 * say -- which is how fifty-nine packets went out in the clear. */
 	memset(policy_answers, 0, sizeof(policy_answers));
 	policy_error = -EINVAL;
-	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle));
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
 	assert(plain.refs == 1);
 
 	/* The same answer at the receiving end is not a refusal: nothing has
 	 * been decrypted, so nothing is arriving that this tuple could miss. */
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL));
 	policy_error = 0;
 
 	/* A policy resolving to a transform the hardware cannot carry refuses
@@ -1086,13 +1231,107 @@ static void test_resolve(void)
 	policy_answer(WAN.ifindex, &bundle);
 	bundle.refs = 0;
 	x->xso.type = XFRM_DEV_OFFLOAD_CRYPTO;
-	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle));
+	assert(!ft_ipsec_resolve(&plain, &fl, &WAN, NULL, &handle, NULL));
 	assert(plain.refs == 1 && bundle.refs == 0);
 	bundle.refs = 0;
-	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle));
+	assert(ft_ipsec_resolve(&plain, &fl, &LAN, &LAN, &handle, NULL));
 	assert(handle == 0 && plain.refs == 1 && bundle.refs == 0);
 	x->xso.type = XFRM_DEV_OFFLOAD_PACKET;
 	sa_pool[0].handle = 0;
+}
+
+static void test_receiving_policy(void)
+{
+	struct flowi fl = { .flowi_oif = LAN.ifindex };
+	struct xfrm_policy pol = {};
+	const int families[] = { AF_INET, AF_INET6 };
+
+	for (unsigned f = 0; f < sizeof(families) / sizeof(families[0]); f++) {
+		bench_reset();
+		receiving_family = families[f];
+		receiving_oif = LAN.ifindex;
+		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		init_net.xfrm.policy_default[XFRM_POLICY_FWD] = XFRM_USERPOLICY_BLOCK;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		init_net.xfrm.policy_default[XFRM_POLICY_FWD] = 0;
+		receiving_error = -ENOMEM;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		receiving_error = 0;
+		memset(&pol, 0, sizeof(pol));
+		receiving_policy = &pol;
+		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		pol.xfrm_nr = 1;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		pol.xfrm_vec[0].optional = true;
+		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		pol.xfrm_nr = XFRM_MAX_DEPTH;
+		for (unsigned i = 0; i < XFRM_MAX_DEPTH; i++) pol.xfrm_vec[i].optional = true;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		pol.xfrm_nr = 0;
+		pol.action = 1;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		pol.action = 0;
+		pol.type = 1;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		assert(pol.refs == 0);
+		/* A policy for a mark assigned later still excludes the fast path,
+		 * even if this packet's present mark would not select it. */
+		receiving_policy = NULL;
+		pol.mark.m = 0xff;
+		list_add_tail(&pol.walk.all, &init_net.xfrm.policy_all);
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		pol.walk.dead = true;
+		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], NULL));
+		list_del(&pol.walk.all);
+	}
+}
+
+static void test_received_state_policy(void)
+{
+	const int families[] = { AF_INET, AF_INET6 };
+
+	for (unsigned f = 0; f < sizeof(families) / sizeof(families[0]); f++) {
+		struct flowi fl = { .flowi_oif = LAN.ifindex };
+		struct xfrm_state x = { .km.state = XFRM_STATE_VALID,
+			.props = { .mode = XFRM_MODE_TUNNEL, .reqid = 42 },
+			.id = { .proto = IPPROTO_ESP, .spi = 123 } };
+		struct xfrm_policy pol = { .xfrm_nr = 1 };
+
+		bench_reset();
+		receiving_family = families[f];
+		receiving_oif = LAN.ifindex;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		receiving_policy = &pol;
+		pol.xfrm_vec[0] = (struct xfrm_tmpl){ .mode = XFRM_MODE_TUNNEL,
+			.reqid = 42, .id.proto = IPPROTO_ESP, .allalgs = true };
+		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		assert(!pol.refs);
+		pol.action = 1;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		pol.action = 0;
+		pol.xfrm_vec[0].reqid++;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		pol.xfrm_vec[0].reqid--;
+		pol.xfrm_vec[0].id.spi = 456;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		pol.xfrm_vec[0].id.spi = 123;
+		x.sel.mismatch = true;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		x.sel.mismatch = false;
+		pol.xfrm_nr = 2;
+		pol.xfrm_vec[1] = pol.xfrm_vec[0];
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		pol.xfrm_nr = 1;
+		pol.mark.m = 0xff;
+		list_add_tail(&pol.walk.all, &init_net.xfrm.policy_all);
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		list_del(&pol.walk.all);
+		pol.mark.m = 0;
+		assert(xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		x.km.state = XFRM_STATE_DEAD;
+		assert(!xfrm_flowtable_policy_check(&init_net, &fl, families[f], &x));
+		assert(!pol.refs);
+	}
 }
 
 static void test_handle_and_flowi(void)
@@ -1106,6 +1345,9 @@ static void test_handle_and_flowi(void)
 	struct cdx_ft_rule rule;
 	struct flow_cls_offload cls;
 	struct flowi fl;
+	struct nf_conn ct = {};
+	struct nf_flow_offload_handle handle = { .valid = true };
+	struct xfrm_policy required = { .xfrm_nr = 1 };
 
 	bench_reset();
 	memset(&rule, 0, sizeof(rule));
@@ -1116,6 +1358,8 @@ static void test_handle_and_flowi(void)
 	rule.proto = IPPROTO_TCP;
 	rule.in = &LAN;
 	rule.out = &WAN;
+	rule.in_logical = &LAN;
+	rule.out_logical = &WAN;
 	rule.src.ip = 0x0201a8c0;
 	rule.dst.ip = 0x0301a8c0;
 	rule.new_src.ip = 0x0401a8c0;
@@ -1142,6 +1386,8 @@ static void test_handle_and_flowi(void)
 
 	cls.nf_dst = &forward;
 	cls.nf_dst_reverse = &reverse;
+	cls.nf_ct = &ct;
+	cls.nf_handle = &handle;
 
 	/* One direction encrypted and the reverse plain: what a tunnel looks
 	 * like from the direction that created the flow. Nothing covers the
@@ -1153,6 +1399,20 @@ static void test_handle_and_flowi(void)
 	assert(rule.sa_handle == 5 && rule.in_sa_handle == 0);
 	assert(forward.refs == 1 && reverse.refs == 1);
 
+	/* A missing inbound half is NOT permission for plaintext. A receiving
+	 * policy on the opposite logical egress refuses this whole generation. */
+	receiving_policy = &required;
+	receiving_family = AF_INET;
+	receiving_oif = LAN.ifindex;
+	assert(!ft_ipsec_handle(&cls, &rule, &WAN, &LAN));
+	assert(!handle.valid && ft_admission_invalidations == 1 && !required.refs);
+	assert(receiving_query.u.ip4.saddr == rule.new_dst.ip);
+	assert(receiving_query.u.ip4.daddr == rule.new_src.ip);
+	assert(receiving_query.u.ip4.fl4_sport == rule.new_dport);
+	assert(receiving_query.u.ip4.fl4_dport == rule.new_sport);
+	receiving_policy = NULL;
+	handle.valid = true;
+
 	/* Both halves offloaded.
 	 *
 	 * The receiving end's question resolves through the *ingress* port,
@@ -1162,6 +1422,8 @@ static void test_handle_and_flowi(void)
 	 * the mirrored pair xfrm's own index answers with. So the bench needs
 	 * both, and neither is the flow's own tuple. */
 	back = *x;
+	back.props.saddr.a4++;
+	back.id.daddr.a4++;
 	back.xso.dev = &LAN;
 	back.xso.offload_handle = (unsigned long)&sa_pool[2];
 	sa_pool[2].handle = 11;
@@ -1170,8 +1432,8 @@ static void test_handle_and_flowi(void)
 	policy_answer(LAN.ifindex, &back_bundle);
 
 	memset(&in, 0, sizeof(in));
-	in.props.saddr.a4 = PEER_IP;
-	in.id.daddr.a4 = LOCAL_IP;
+	in.props.saddr.a4 = back.id.daddr.a4;
+	in.id.daddr.a4 = back.props.saddr.a4;
 	in.xso.type = XFRM_DEV_OFFLOAD_PACKET;
 	in.xso.dir = XFRM_DEV_OFFLOAD_IN;
 	in.xso.dev = &LAN;
@@ -1493,6 +1755,8 @@ int main(void)
 	test_offloaded();
 	test_paired_inbound();
 	test_resolve();
+	test_receiving_policy();
+	test_received_state_policy();
 	test_handle_and_flowi();
 	test_watch_follows_peer();
 	test_watch_route_and_device();

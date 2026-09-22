@@ -33,9 +33,10 @@ async def wait_json(r, path, timeout=25):
 
 
 class Fault:
-    def __init__(self, r, target, label, root):
+    def __init__(self, r, target, label, root, continuous=False):
         self.r, self.target, self.label, self.root = r, target, label, root
         self.result = None
+        self.continuous = continuous
 
     async def hit(self):
         if self.result is None:
@@ -44,11 +45,18 @@ class Fault:
         result = self.result
         assert result["consumed"] and "error" not in result, result
         assert not result["restore_errors"] and result["restored"] == result["original"], result
+        if self.continuous:
+            # __GFP_NOWARN sites suppress even failslab's stack diagnostic.
+            # The scoped injector's finite budget records every consumed hit.
+            assert result["failures"] > 0, result
+            return result
         log = "".join(result["kernel_records"])
         assert "FAULT_INJECTION: forcing a failure" in log and "name failslab" in log, log
         # times=1 is a limit, not an atomic reservation across CPUs. Prove
         # that this run consumed exactly one failure in the selected path.
-        assert log.count("name failslab,") == 1, log
+        failures = log.count("name failslab,")
+        assert failures >= 1, log
+        assert failures == 1, log
         assert result["selected"]["name"] + "+" in log, log
         if self.target == "callback":
             assert "ft_block_setup" in log, "fault missed the flowtable binding path"
@@ -58,7 +66,7 @@ class Fault:
 
 
 @asynccontextmanager
-async def slab_fault(r, target, label):
+async def slab_fault(r, target, label, *, continuous=False):
     config = await r.target.fs_read(r.session, "/proc/config.gz")
     assert config["errno"] == 0, config
     config = gzip.decompress(bytes.fromhex(config["content_hex"])).decode()
@@ -72,7 +80,7 @@ async def slab_fault(r, target, label):
     staged = await r.target.fs_write(r.session, root + "/guard.py", script)
     assert staged["errno"] == 0, staged
     assert await read(r.target, r.session, root + "/guard.py") == script
-    fault = Fault(r, target, label, root)
+    fault = Fault(r, target, label, root, continuous)
     try:
         # Launch can succeed even when its UART acknowledgement is lost.
         # Keep cancellation protected from the moment the child may exist.
@@ -82,7 +90,8 @@ import subprocess
 root = Path({root!r})
 script = root / 'guard.py'
 with (root / 'guard.log').open('w') as log:
-    child = subprocess.Popen(['/usr/bin/python3', str(script), str(root), {target!r}],
+    child = subprocess.Popen(['/usr/bin/python3', str(script), str(root), {target!r},
+                              {'continuous' if continuous else 'once'!r}],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                              close_fds=True, start_new_session=True)
 (root / 'pid').write_text(str(child.pid))
@@ -93,7 +102,13 @@ with (root / 'guard.log').open('w') as log:
     finally:
         # Only remove our fault. A missing result is a failed guard, never
         # permission to repair flowtables or discard the failed observation.
-        await console_command(r.service_console, "touch", root + "/cancel")
+        try:
+            cancelled = await r.target.fs_write(r.session, root + "/cancel", "")
+            assert cancelled["errno"] == 0, cancelled
+        except Exception:
+            # UART remains the fallback when the fault disrupts management;
+            # HTTP avoids a lost command boundary amid kernel diagnostics.
+            await console_command(r.service_console, "touch", root + "/cancel")
         try:
             result = await wait_json(r, root + "/result.json", timeout=5)
             r.record(label + "-guard-final", result)

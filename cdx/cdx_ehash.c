@@ -790,7 +790,7 @@ static int get_table_type(PCtEntry entry, uint32_t *type)
 	return FAILURE;
 }
 
-static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
+static int fill_actions(PCtEntry entry, struct ins_entry_info *info, bool routed)
 {
 	PCtEntry twin_entry;
 	uint32_t ii; 
@@ -809,8 +809,6 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 #endif
 	twin_entry = CT_TWIN(entry);
 
-	//routing and ttl decr are mandatory
-
 	//mask it as ipv6 flow if required
 	if (IS_IPV6_FLOW(entry))
 	{
@@ -818,7 +816,9 @@ static int fill_actions(PCtEntry entry, struct ins_entry_info *info)
 		ethertype   =  ETHERTYPE_IPV6;
 	}
 
-	info->flags |= TTL_HM_VALID;
+	/* Bridged multicast reaches this encoder too, but crosses no IP hop. */
+	if (routed)
+		info->flags |= TTL_HM_VALID;
 
 	//strip vlan on ingress if incoming iface is vlan
 	if (info->l2_info.vlan_present)
@@ -1339,7 +1339,7 @@ int insert_entry_in_classif_table_encap(PCtEntry entry, const struct cdx_l2_enca
 	info->paramptr = ptr;
 	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
 			GET_PARAM_OFFSET(flags));
-	if (fill_actions(entry, info)) {
+	if (fill_actions(entry, info, true)) {
 		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
@@ -1372,7 +1372,7 @@ err_ret1:
 
 int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry, 
 					unsigned int num_members, uint64_t first_member_flow_addr,
-					void *first_listener_entry)
+					void *first_listener_entry, bool bridged)
 {
 	struct ins_entry_info *info;
 	struct en_exthash_tbl_entry *tbl_entry;
@@ -1520,7 +1520,7 @@ int insert_mcast_entry_in_classif_table(struct _tCtEntry *entry,
 	info->paramptr = ptr;
 	info->param_size = (MAX_EN_EHASH_ENTRY_SIZE - 
 		GET_PARAM_OFFSET(flags));
-	if (fill_actions(entry, info)) {
+	if (fill_actions(entry, info, !bridged)) {
 		DPA_ERROR("%s::unable to fill actions\n", __func__);
 		goto err_ret;
 	}
@@ -3216,8 +3216,6 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 			__func__, pRtEntry, info->opcptr, info->paramptr, info->param_size);
 #endif
 
-	//routing and ttl decr are mandatory
-
 	/*  Addition of IP header requires the header to be inserted at the start of the packet.
 			So we need to strip and rebuild the l2 header after tunnel header insertion. */
 	rebuild_l2_hdr = 1;
@@ -4243,4 +4241,3 @@ void cdx_ehash_update_dtmf_rtp_info_params(uint8_t *rtp_relay_param, uint8_t *DT
 	param->DTMF_PT[1] = DTMF_PT[1];
 	return;
 }
-

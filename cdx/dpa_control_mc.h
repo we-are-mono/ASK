@@ -107,6 +107,7 @@ struct mcast_group_info
    * the query walkers and the log. */
   struct net_device *in_dev;
   uint8_t mctype;
+  bool bridged;
 };
 
 #define CDX_MC_ACTION_ADD			0
@@ -117,7 +118,7 @@ int GetMcastGrpId( struct mcast_group_info *pMcastGrpInfo,
 						uint8_t *ingress_iface);
 int insert_mcast_entry_in_classif_table(struct _tCtEntry *pCtEntry, 
 		unsigned int num_members, uint64_t first_member_flow_addr,
-						void *first_listener_entry);
+						void *first_listener_entry, bool bridged);
 void *dpa_get_pcdhandle(uint32_t fm_index);
 int dpa_get_tx_info_by_itf(PRouteEntry rt_entry, struct dpa_l2hdr_info *l2_info,
 		struct dpa_l3hdr_info *l3_info, PRouteEntry tnl_rt_entry, void *queinfo, uint32_t hash);

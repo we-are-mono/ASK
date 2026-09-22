@@ -91,6 +91,9 @@ struct ipv6hdr { u8 prefix[8]; struct in6_addr saddr, daddr; };
 #define __ffs(x) ((unsigned long)__builtin_ctzl(x))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
+#define smp_store_release(p, v) (*(p) = (v))
+static void set_bit(unsigned int bit, unsigned long *p) { *p |= 1UL << bit; }
+#define NETEVENT_XFRM_POLICY_UPDATE 190
 #define GFP_KERNEL 0
 #define HZ 100
 /* A warn that fires is a bug the kernel would only log; here it fails the run,
@@ -394,6 +397,9 @@ static void ft_mc_device_gone(struct net_device *dev)
 #define RTNL_FAMILY_IPMR 128
 #define RTNL_FAMILY_IP6MR 129
 static unsigned mroute_events, mroute_kicks, mroute_devices_gone;
+static unsigned long ft_mr_resync_pending;
+static bool ft_mr_ready;
+static int ft_mr_work;
 static int ft_mr_fib_event(unsigned long event, struct fib_notifier_info *info)
 {
     (void)event; (void)info;
@@ -406,7 +412,7 @@ static void ft_mr_device_gone(struct net_device *dev)
     (void)dev;
     mroute_devices_gone++;
 }
-static void ft_mr_exit(void) { }
+static void ft_mr_exit(void) { ft_mr_ready = false; ft_mr_resync_pending = 0; }
 /* The Wi-Fi VAP registration lives in its own file and has its own harness
  * (wifi_admission.c); here the notifier's calls into it only count. */
 static unsigned wifi_reconsiders, wifi_address_changes, wifi_devices_gone;
@@ -603,6 +609,7 @@ struct flow_cls_offload {
     const struct nf_flow_tunnel *nf_tunnel, *nf_tunnel_reverse;
     struct nf_flow_offload_handle *nf_handle;
     u32 nf_dst_cookie, nf_dst_reverse_cookie;
+    u64 nf_xfrm_genid;
     unsigned command;
     u16 nf_mtu;
     bool nf_counter;
@@ -641,6 +648,9 @@ static unsigned ft_neighbour_refs, ft_handle_refs;
 static u64 ft_installs, ft_deletes, ft_errors, ft_validated, ft_rearms, ft_busy, ft_rejects;
 static u64 ft_neigh_invalidations, ft_route_invalidations, ft_mtu_invalidations, ft_link_invalidations, ft_mac_invalidations, ft_fdb_invalidations, ft_admission_invalidations;
 static void atomic64_inc(u64 *v) { (*v)++; }
+static u64 atomic64_read_acquire(u64 *v) { return *v; }
+static u64 ft_ipsec_genid, xfrm_genid, ft_ipsec_invalidations, ft_ipsec_policy_invalidations;
+static u64 xfrm_flowtable_genid(struct net *net) { return xfrm_genid; }
 static bool ft_observe, ft_stopping, ft_fatal, ft_invalid_done, ft_ready = true;
 static int ft_invalid;
 static unsigned long jiffies = 1000;
@@ -648,6 +658,7 @@ static unsigned allocated, live_hw, flushed, scheduled;
 static bool allocation_fail, hardware_fail, invalidate_on_add, physical_ok = true, neigh_ok = true;
 static int hardware_alloc_error;
 static bool change_neigh_on_add, change_neigh_on_lookup;
+static bool change_policy_on_add, change_sa_on_add;
 static unsigned neigh_lookups, neigh_uses;
 static int neigh_send_error;
 static int deletion_error;
@@ -787,6 +798,7 @@ static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
 static unsigned neigh_scheduled, dev_stats_scheduled;
 static void schedule_work(int *work)
 {
+    if (work == &ft_mr_work) { mroute_kicks++; return; }
     assert(work == &ft_retire_work || work == &ft_dev_stats_work);
     if (work == &ft_dev_stats_work) dev_stats_scheduled++; else neigh_scheduled++;
 }
@@ -1021,6 +1033,8 @@ static int cdx_ft_add(const struct cdx_ft_rule *r,
     *hw = calloc(1, sizeof(**hw)); assert(*hw); live_hw++;
     (*hw)->stats.lastused = (u32)jiffies;
     if (invalidate_on_add) ft_invalidate();
+    if (change_policy_on_add) xfrm_genid++;
+    if (change_sa_on_add) ft_ipsec_genid++;
     if (change_neigh_on_add) {
         neighbour.ha[5]++;
         ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &neighbour);
@@ -1198,6 +1212,7 @@ static void fixture(void)
     /* Both ends plain by default: a case that wants a transform says so. */
     ipsec_ok = true;
     ipsec_sa = ipsec_in_sa = 0;
+    ft_ipsec_genid = xfrm_genid = 0;
     assert(!ft_handle_refs && handle.refs <= 1);
     handle = (struct nf_flow_offload_handle){ .refs = 1 };
     assert(!gateway.refs && !alternate_gateway.refs && !neighbour.refs && !ft_neighbour_refs && ft_neigh_entries.next == &ft_neigh_entries);
@@ -4536,6 +4551,36 @@ static void test_allocation_admission_recovery(void)
             }
 }
 
+static void test_ipsec_generation_retirement(void)
+{
+    fixture();
+    xfrm_genid++;
+    assert(ft_replace(&binding, &cls) == -EOPNOTSUPP);
+    assert(handle.invalid && !ft_count && !live_hw && !allocated);
+    for (unsigned sa = 0; sa < 2; sa++) {
+        fixture();
+        u64 before = sa ? ft_ipsec_invalidations : ft_ipsec_policy_invalidations;
+        change_sa_on_add = sa;
+        change_policy_on_add = !sa;
+        assert(ft_replace(&binding, &cls) == -EIO);
+        change_sa_on_add = change_policy_on_add = false;
+        assert(handle.invalid && !ft_invalid && !ft_count && !live_hw && !allocated);
+        assert(!ft_handle_refs && !ft_neighbour_refs && handle.refs == 1);
+        assert((sa ? ft_ipsec_invalidations : ft_ipsec_policy_invalidations) == before + 1);
+        /* A fresh generation can be admitted without rearming the backend. */
+        handle = (struct nf_flow_offload_handle){ .refs = 1 };
+        cls.nf_xfrm_genid = xfrm_genid;
+        assert(ft_replace(&binding, &cls) == 0);
+        struct net foreign = {0};
+        ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &foreign);
+        assert(!handle.invalid);
+        ft_neigh_event(NULL, NETEVENT_XFRM_POLICY_UPDATE, &init_net);
+        assert(handle.invalid && ft_count == 1);
+        ft_retire_workfn(NULL);
+        assert(!ft_count && !live_hw && !allocated && !ft_handle_refs && !ft_neighbour_refs);
+    }
+}
+
 static void test_selective_routes(void)
 {
     struct nf_flow_offload_handle contexts[2] = {{1, false}, {1, false}};
@@ -5266,6 +5311,7 @@ int main(void)
     test_device_recovery();
     test_transient_admission();
     test_allocation_admission_recovery();
+    test_ipsec_generation_retirement();
     test_nexthop_objects();
     test_qos_decode();
     test_vlan_stats();

@@ -104,7 +104,13 @@ async def console_command(console, *argv, check=True, timeout=20, resync=False):
     assert all("\n" not in arg for arg in argv), "use console_python for scripts"
     marker = f"__ASK_OUTPUT_{time.monotonic_ns()}__"
     cmd = f"printf '\\n%s\\n' {shlex.quote(marker)}; {shlex.join(argv)}"
-    result = await asyncio.to_thread(console.run, cmd, timeout)
+    try:
+        result = await asyncio.to_thread(console.run, cmd, timeout)
+    except TimeoutError as error:
+        if not resync:
+            raise
+        await asyncio.to_thread(console.sync_prompt)
+        return {"rc": None, "stdout": str(error)}
     match = re.search(r"(?:^|\n)" + marker + r"\r?\n", result.stdout)
     if not match and resync:
         await asyncio.to_thread(console.sync_prompt)
@@ -141,6 +147,7 @@ async def console_python(console, script, *, timeout=20, attempts=3):
     wanted = hashlib.sha256(script.encode()).hexdigest()
     path = f"/tmp/ask_ft_{time.monotonic_ns()}.py"
     staged = f"{path}.b64"
+    last_failure = None
     try:
         for attempt in range(attempts):
             # Tolerant, and it has to be: this is the first command of each
@@ -148,19 +155,28 @@ async def console_python(console, script, *, timeout=20, attempts=3):
             # before the retry loop it sits inside could do anything. `rm -f`
             # is idempotent, and a delete that silently did not happen leaves
             # stale text the digest below catches on this same pass.
-            await console_command(console, "rm", "-f", path, staged, resync=True)
-            for offset in range(0, len(encoded), 144):
-                await console_command(console, "sh", "-c",
-                                      f"printf %s {shlex.quote(encoded[offset:offset + 144])} "
-                                      f">> {shlex.quote(staged)}")
-            decoded = await console_command(console, "sh", "-c",
-                                            f"base64 -d {shlex.quote(staged)} > {shlex.quote(path)}",
-                                            check=False)
-            digest = await console_command(console, "sha256sum", path, check=False)
-            if not decoded["rc"] and not digest["rc"] and digest["stdout"].split()[:1] == [wanted]:
-                break
+            try:
+                await console_command(console, "rm", "-f", path, staged, resync=True)
+                for offset in range(0, len(encoded), 144):
+                    await console_command(console, "sh", "-c",
+                                          f"printf %s {shlex.quote(encoded[offset:offset + 144])} "
+                                          f">> {shlex.quote(staged)}")
+                decoded = await console_command(console, "sh", "-c",
+                                                f"base64 -d {shlex.quote(staged)} > {shlex.quote(path)}",
+                                                check=False)
+                digest = await console_command(console, "sha256sum", path, check=False)
+                if decoded["rc"] == digest["rc"] == 0 and digest["stdout"].split()[:1] == [wanted]:
+                    break
+                last_failure = (decoded, digest)
+            except (AssertionError, TimeoutError) as error:
+                # Kernel messages can split either output marker. Only the
+                # private staging files have changed: discard and restage.
+                # Execution stays outside this retry boundary because an
+                # unacknowledged test operation may already have happened.
+                last_failure = repr(error)
+                await asyncio.to_thread(console.sync_prompt)
         else:
-            pytest.fail(f"UART staging corrupted {attempts} times: {decoded}, {digest}")
+            pytest.fail(f"UART staging failed {attempts} times: {last_failure}")
         return await console_command(console, "python3", path, timeout=timeout)
     finally:
         # Tolerant for the same reason, and with less at stake: this runs on
@@ -445,7 +461,7 @@ async def rig(target_agent, aiohttp_session, lan, splat_window, request):
                 await console_command(r.recovery_console, "nft", "delete", "table", "inet", TABLE, check=False)
             else:
                 await r.delete_table()
-        except Exception as error:
+        except (Exception, pytest.fail.Exception) as error:
             failures.append(str(error))
         if hasattr(r, "lan_ip"):
             try:

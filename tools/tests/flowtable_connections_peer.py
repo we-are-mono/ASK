@@ -22,6 +22,68 @@ def payload(ident, serial, size):
     return struct.pack("!IQ", ident, serial) + bytes([ident % 251]) * (size - 12)
 
 
+class WireProbe:
+    """Count uniquely marked test frames reaching the LAN interface."""
+    def __init__(self):
+        self.sock = None
+        self.received = 0
+        self.sample_limit = 0
+        self.samples = []
+
+    def rpc(self, action, iface=None, marker=None, samples=0, promiscuous=False):
+        if action == 'start':
+            assert self.sock is None
+            self.marker = bytes.fromhex(marker)
+            assert len(self.marker) >= 16
+            self.received = 0
+            assert 0 <= samples <= 32
+            self.sample_limit = samples
+            self.samples = []
+            self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+            self.sock.bind((iface, 0))
+            if samples:
+                self.sock.setsockopt(263, 8, 1)  # PACKET_AUXDATA
+            if promiscuous:
+                self.sock.setsockopt(263, 1, struct.pack('IHH8s', socket.if_nametoindex(iface), 1, 0, b''))
+            self.sock.setblocking(False)
+            asyncio.get_running_loop().add_reader(self.sock.fileno(), self.drain)
+        elif action == 'stop':
+            self.close()
+        else:
+            assert action == 'status'
+            self.drain()
+        result = {'received': self.received}
+        if self.sample_limit:
+            result['samples'] = list(self.samples)
+        return result
+
+    def drain(self):
+        while self.sock:
+            try:
+                frame, ancillary, _, _ = self.sock.recvmsg(65536, 256)
+            except BlockingIOError:
+                break
+            if self.marker in frame:
+                self.received += 1
+                if len(self.samples) < self.sample_limit:
+                    # Reconstitute a tag stripped by the receiver's VLAN
+                    # offload so the sample describes Ethernet on the wire.
+                    for level, kind, value in ancillary:
+                        if (level, kind) == (263, 8):
+                            status, _, _, _, _, tci, tpid = struct.unpack('IIIHHHH', value[:20])
+                            if status & (1 << 4):
+                                tpid = tpid if status & (1 << 6) else 0x8100
+                                frame = frame[:12] + struct.pack('!HH', tpid, tci) + frame[12:]
+                    self.samples.append({'length': len(frame), 'header': frame[:128].hex()})
+
+    def close(self):
+        if self.sock:
+            self.drain()
+            asyncio.get_running_loop().remove_reader(self.sock.fileno())
+            self.sock.close()
+            self.sock = None
+
+
 @contextmanager
 def namespace(spec):
     # No await is permitted in this context: other tasks share this thread.
@@ -54,9 +116,10 @@ class Flow:
         local = (self.spec.get("lan", config["lan"]), self.spec["sport"])
         remote = (self.spec.get("connect_ip", config["wan"]),
                   self.spec.get("connect_port", config["dport"]))
+        family = socket.AF_INET6 if ":" in local[0] else socket.AF_INET
         if self.spec["proto"] == "tcp":
             with namespace(self.spec):
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock = socket.socket(family, socket.SOCK_STREAM)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -71,7 +134,7 @@ class Flow:
             await self.writer.drain()
         else:
             with namespace(self.spec):
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.sock = socket.socket(family, socket.SOCK_DGRAM)
             self.sock.setblocking(False)
             self.sock.bind(local)
             self.sock.connect(remote)
@@ -87,8 +150,8 @@ class Flow:
         # Loss-tolerant UDP windows validate every received payload. Their
         # controller supplies the loss budget; TCP always requires delivery.
         assert not (allow_loss and self.writer)
-        deadline = 20 if self.writer else (udp_timeout if udp_timeout is not None
-                                           else 0.1 if allow_loss else 5)
+        deadline = self.spec.get("tcp_timeout", 20) if self.writer else (
+            udp_timeout if udp_timeout is not None else 0.1 if allow_loss else 5)
         assert deadline > 0
         first = self.serial
         received = lost = late = 0
@@ -145,6 +208,17 @@ class Flow:
                 "bytes": received * size, "received": received, "lost": lost, "late": late,
                 "seconds": time.monotonic() - started}
 
+    def tcp_info(self):
+        if not self.writer:
+            return None
+        sock = self.writer.get_extra_info("socket")
+        info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+        header = struct.unpack_from("8B", info)
+        values = struct.unpack_from("24I", info, 8)
+        return {"state": header[0], "backoff": header[4], "rto_us": values[0],
+                "unacked": values[4], "lost": values[6], "retrans": values[7],
+                "rtt_us": values[15], "total_retrans": values[23]}
+
     async def close(self):
         if self.writer:
             if self.spec.get("abort"):
@@ -173,6 +247,8 @@ async def main(config):
     control = None
     reports = []
     servers = None
+    multicast = MulticastListeners()
+    wire_probe = WireProbe()
 
     async def finish(ids, stop=False):
         if stop:
@@ -218,13 +294,22 @@ async def main(config):
                     result = {"running": len(running), "errors": {
                         ident: repr(task.exception()) for ident, task in running.items()
                         if task.done() and not task.cancelled() and task.exception()},
-                        "received": {ident: flow.received for ident, flow in flows.items()}}
+                        "received": {ident: flow.received for ident, flow in flows.items()},
+                        "tcp_info": {ident: flow.tcp_info() for ident, flow in flows.items() if flow.writer}}
                 elif op == "neighbour":
                     flow = flows[command["ident"]]
                     with namespace(flow.spec):
                         result = configure_neighbour(flow.spec["iface"], flow.spec["lan"], **command["changes"])
+                elif op == "ndp":
+                    flow = flows[command["ident"]]
+                    with namespace(flow.spec):
+                        result = configure_ndp(flow.spec["iface"], **command["changes"])
                 elif op == "servers":
                     result = servers.status()
+                elif op == "multicast":
+                    result = multicast.rpc(**command["changes"])
+                elif op == "wire_probe":
+                    result = wire_probe.rpc(**command["changes"])
                 elif op == "start":
                     for ident in ids:
                         assert ident not in running
@@ -253,6 +338,8 @@ async def main(config):
                     return
             raise AssertionError("controller disconnected without shutdown")
     finally:
+        wire_probe.close()
+        multicast.close()
         tasks = list(running.values())
         for task in tasks:
             task.cancel()

@@ -1,6 +1,6 @@
-From f4996fccc2c9a449aa787280b6ed9cf1feb0f931 Mon Sep 17 00:00:00 2001
+From d6c5f43f7a2cd4cfb093d6b17b8bff76669e1bb4 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
-Date: Mon, 21 Sep 2026 02:09:46 +0200
+Date: Tue, 22 Sep 2026 02:14:51 +0200
 Subject: [PATCH] netfilter: walk the forwarding path through sit and ip6_tnl
  devices
 
@@ -34,7 +34,8 @@ other keeps the tunnel device as the reverse ingress, where the software
 path matches the decapsulated packet, which moving the ingress to the
 port below would lose.
 
-Context version 9.
+Context version 12 includes XFRM policy generation, receiving-policy validation
+and callback-provider lifetime ownership.
 ---
  include/linux/netdevice.h             | 32 +++++++++++
  include/net/flow_offload.h            | 10 +++-
@@ -47,7 +48,7 @@ Context version 9.
  8 files changed, 261 insertions(+), 2 deletions(-)
 
 diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index c658c038556d..5658e8d15f41 100644
+index c658c03..5658e8d 100644
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -839,8 +839,21 @@ enum net_device_path_type {
@@ -99,7 +100,7 @@ index c658c038556d..5658e8d15f41 100644
  };
  
 diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
-index c619bb1cb63f..5c9bcfebc49a 100644
+index 7bfe51f..cbab1fa 100644
 --- a/include/net/flow_offload.h
 +++ b/include/net/flow_offload.h
 @@ -690,6 +690,7 @@ struct flow_cls_common_offload {
@@ -110,17 +111,17 @@ index c619bb1cb63f..5c9bcfebc49a 100644
  
  /* Context is borrowed for the callback and NULL for other producers. Drivers
   * must not retain nf_ct, either dst or either session. nf_dst is this
-@@ -707,14 +708,19 @@ struct nf_flow_session;
+@@ -709,14 +710,19 @@ struct nf_flow_session;
   * if any: nf_session belongs to nf_dst and nf_session_reverse to
   * nf_dst_reverse, so a direction's egress and ingress sessions are named the
   * same way its two destinations are. Both are always non-NULL; a path with no
 - * session reports a zero lower_ifindex. */
 -#define FLOW_CLS_HAS_NF_CONTEXT 8
 + * session reports a zero lower_ifindex.
-+ * Version 9 does the same for the IP-in-IP tunnel a path crosses: nf_tunnel
++ * Version 12 does the same for the IP-in-IP tunnel a path crosses: nf_tunnel
 + * belongs to nf_dst and nf_tunnel_reverse to nf_dst_reverse, always non-NULL,
 + * and a path with no tunnel reports a zero lower_ifindex. */
-+#define FLOW_CLS_HAS_NF_CONTEXT 9
++#define FLOW_CLS_HAS_NF_CONTEXT 12
  struct flow_cls_offload {
  	const struct nf_conn *nf_ct;
  	struct dst_entry *nf_dst;
@@ -130,10 +131,10 @@ index c619bb1cb63f..5c9bcfebc49a 100644
 +	const struct nf_flow_tunnel *nf_tunnel;
 +	const struct nf_flow_tunnel *nf_tunnel_reverse;
  	struct nf_flow_offload_handle *nf_handle;
+ 	u64 nf_xfrm_genid;
  	u32 nf_dst_cookie;
- 	u32 nf_dst_reverse_cookie;
 diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
-index 3764c26d19ba..64701d13405a 100644
+index 3794672..68a84cf 100644
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
 @@ -130,6 +130,32 @@ struct nf_flow_session {
@@ -177,7 +178,7 @@ index 3764c26d19ba..64701d13405a 100644
  	union {
  		struct {
  			struct dst_entry *dst_cache;
-@@ -245,6 +272,8 @@ struct nf_flow_route {
+@@ -246,6 +273,8 @@ struct nf_flow_route {
  		 * out.h_dest would otherwise be the only record of -- and that
  		 * member is not carried over to a NEIGH tuple. */
  		struct nf_flow_session		session;
@@ -187,7 +188,7 @@ index 3764c26d19ba..64701d13405a 100644
  	} tuple[FLOW_OFFLOAD_DIR_MAX];
  };
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
-index 09964b40f0d2..5ef7ce780708 100644
+index 09964b4..5ef7ce7 100644
 --- a/net/ipv6/ip6_tunnel.c
 +++ b/net/ipv6/ip6_tunnel.c
 @@ -1428,6 +1428,87 @@ ipxip6_tnl_xmit(struct sk_buff *skb, struct net_device *dev,
@@ -287,10 +288,10 @@ index 09964b40f0d2..5ef7ce780708 100644
  
  #define IPXIPX_FEATURES (NETIF_F_SG |		\
 diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
-index 710d66374c57..aeb81c942d33 100644
+index 710d663..aeb81c9 100644
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
-@@ -1069,6 +1069,74 @@ static netdev_tx_t sit_tunnel_xmit__(struct sk_buff *skb,
+@@ -1069,6 +1069,74 @@ tx_error:
  	return NETDEV_TX_OK;
  }
  
@@ -374,10 +375,10 @@ index 710d66374c57..aeb81c942d33 100644
  
  static void ipip6_dev_free(struct net_device *dev)
 diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
-index af55c12a3919..de59b6fbf362 100644
+index edfcf93..4c8e07a 100644
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -172,6 +172,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+@@ -177,6 +177,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
  	 * path, not to how the path is transmitted, and a DIRECT tuple has no
  	 * room for it once the union holds its cached addresses. */
  	flow_tuple->session = route->tuple[dir].session;
@@ -386,23 +387,23 @@ index af55c12a3919..de59b6fbf362 100644
  	switch (route->tuple[dir].xmit_type) {
  	case FLOW_OFFLOAD_XMIT_DIRECT:
 diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
-index ee87af80a9c1..f1f53559588a 100644
+index 3ffc10a..4a7c5b2 100644
 --- a/net/netfilter/nf_flow_table_offload.c
 +++ b/net/netfilter/nf_flow_table_offload.c
-@@ -979,6 +979,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+@@ -983,6 +983,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
  		 * record naming no session is already self-describing. */
  		.nf_session = &flow->tuplehash[dir].tuple.session,
  		.nf_session_reverse = &flow->tuplehash[!dir].tuple.session,
 +		.nf_tunnel = &flow->tuplehash[dir].tuple.tunnel,
 +		.nf_tunnel_reverse = &flow->tuplehash[!dir].tuple.tunnel,
  		.nf_handle = flow->hw_handle,
+ 		.nf_xfrm_genid = flow->xfrm_genid,
  		.nf_dst_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[dir].tuple),
- 		.nf_dst_reverse_cookie = nf_flow_offload_dst_cookie(&flow->tuplehash[!dir].tuple),
 diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
-index d71edfa36e95..3f0e8aa76abe 100644
+index d7e5ddf..9d793f4 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -93,6 +93,8 @@ struct nft_forward_info {
+@@ -94,6 +94,8 @@ struct nft_forward_info {
  	 * implicit in h_dest and the encap slot: a hardware adapter cannot
  	 * re-derive any of it, and h_dest is not carried to a NEIGH tuple. */
  	struct nf_flow_session session;
@@ -411,7 +412,7 @@ index d71edfa36e95..3f0e8aa76abe 100644
  	enum flow_offload_xmit_type xmit_type;
  };
  
-@@ -188,6 +190,41 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+@@ -189,6 +191,41 @@ static void nft_dev_path_info(const struct net_device_path_stack *stack,
  			if (!READ_ONCE(flowtable->use_neigh))
  				info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
  			break;
@@ -453,7 +454,7 @@ index d71edfa36e95..3f0e8aa76abe 100644
  		default:
  			goto refuse;
  		}
-@@ -256,6 +293,7 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
+@@ -257,6 +294,7 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
  	/* Belongs to this direction's egress path, as out.h_dest does, and
  	 * unlike out.h_dest it survives NEIGH output. */
  	route->tuple[dir].session = info.session;

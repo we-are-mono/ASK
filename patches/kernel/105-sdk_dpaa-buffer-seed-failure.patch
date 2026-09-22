@@ -7,7 +7,7 @@ admits an empty IPsec pool. Return a negative errno for every failure,
 leaving previously released buffers in BMan for the caller's unwind.
 
 A failed DMA mapping of an skb-backed buffer also frees its head twice:
-kfree_skb() already owns the slab allocation. Free the raw head only for
+kfree_skb() already owns the backing storage. Free the raw head only for
 buffers which were not wrapped in an skb.
 
 Upstream-Status: Pending
@@ -24,7 +24,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  	struct sk_buff *skb = NULL, **skbh;
  	uint32_t bufsize;
 @@ -215,10 +216,10 @@
- 				pr_err("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
+ 				pr_err_ratelimited("%s(%d) ii %d buffs2fill %d dma_mapping_error failed \n",
  						__func__,__LINE__,ii,buffs2fill);
  				if (act_skb)
 -				{

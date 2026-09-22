@@ -38,11 +38,16 @@ def test_ipsec_lifecycle(tmp_path):
              "ipsec_delfq_from_exceptionfq_list",
              "create_ipsec_pcd_fqs", "ipsec_init_ohport",
              "ipsec_free_pool_buffer", "release_ipsec_bpool", "add_ipsec_bpool",
+             "ipsec_free_sg_buffer", "release_ipsec_sg_pools",
+             "cdx_init_scatter_gather_bpool", "cdx_init_skb_2bfreed_bpool",
              "cdx_dpaa_ingress_cgr_init", "ipsec_delete_cgr_on_cpu",
              "cdx_dpaa_ingress_cgr_exit", "cdx_dpa_ipsec_ready",
              "cdx_dpa_ipsec_init", "cdx_dpa_ipsec_exit"]
     (tmp_path / "ipsec_lifecycle.inc").write_text(
-        function(staged.read_text(), "dpaa_bp_alloc_n_add_buffs")
+        source[source.index("#define CDX_MAX_SG_BUFF_SIZE"):
+               source.index("static void ipsec_free_sg_buffer")]
+        + function(staged.read_text(), "dpaa_bp_alloc_n_add_buffs")
+        + function(staged.read_text(), "dpa_bp_recycle_frag")
         + function(sdk, "dpa_bp_drain") + function(sdk, "_dpa_bp_free")
         + "\n".join(function(devman, n) for n in
                     ["cdx_drain_fq", "cdx_destroy_fq", "cdx_drain_fq_list", "cdx_destroy_fq_list"])

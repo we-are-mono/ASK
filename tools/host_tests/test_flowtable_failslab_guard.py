@@ -67,6 +67,48 @@ def test_refuses_another_active_injector(tmp_path, knobs):
     assert {name: (knobs["debugfs"] / name).read_text() for name in guard.KNOBS} == before
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_continuous_fault_keeps_lease_after_a_hit(tmp_path, knobs, monkeypatch, cancel):
+    root = tmp_path / "result"
+    before = {name: (knobs["debugfs"] / name).read_text() for name in guard.KNOBS}
+    polls = 0
+
+    def drain(fd):
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            assert int((knobs["debugfs"] / "times").read_text()) == guard.CONTINUOUS_BUDGET
+            (knobs["debugfs"] / "times").write_text(str(guard.CONTINUOUS_BUDGET - 3))
+            assert (knobs["debugfs"] / "verbose_ratelimit_interval_ms").read_text() == "1000"
+            assert (knobs["debugfs"] / "verbose_ratelimit_burst").read_text() == "1"
+            # __GFP_NOWARN allocations still decrement the kernel counter.
+            return []
+        if polls == 2:
+            assert (knobs["debugfs"] / "probability").read_text() == "100"
+            if cancel:
+                (root / "cancel").touch()
+        return []
+
+    monkeypatch.setattr(guard, "drain_kmsg", drain)
+    guard.run(root, "entry", lease=0.04, continuous=True, **knobs)
+    result = json.loads((root / "result.json").read_text())
+    assert result["consumed"] and result["continuous"] and polls >= 3
+    assert result["failures"] == 3
+    assert not result["restore_errors"] and result["restored"] == before
+
+
+def test_pool_fault_excludes_interrupt_receive(tmp_path, knobs, monkeypatch):
+    knobs["kallsyms"].write_text(
+        "1000 t ipsec_pool_refill_work [cdx]\n2000 t next [cdx]\n"
+        "3000 t handle_softirqs\n4000 t next\n")
+    root = tmp_path / "result"
+    guard.run(root, "ipsec-pool", lease=0.02, continuous=True, **knobs)
+    result = json.loads((root / "armed.json").read_text())
+    assert result["selected"]["start"] == 0x1000
+    assert result["excluded"]["start"] == 0x3000
+    assert result["excluded"]["end"] == 0x4000
+
+
 def test_symbol_selection_requires_unique_visible_module_function():
     text = ("1000 t ft_block_setup.constprop.0 [ask_flowtable]\n"
             "1000 t alias [ask_flowtable]\n2000 t next [ask_flowtable]\n"
@@ -79,7 +121,8 @@ def test_symbol_selection_requires_unique_visible_module_function():
         guard.symbol_range(text + "1500 t ft_block_setup [ask_flowtable]\n", "ft_block_setup", "ask_flowtable")
 
 
-async def test_lost_launch_acknowledgement_still_cancels_guard(monkeypatch):
+@pytest.mark.parametrize("cancel_transport", ["http", "uart"])
+async def test_lost_launch_acknowledgement_still_cancels_guard(monkeypatch, cancel_transport):
     monkeypatch.syspath_prepend(str(SOURCE.parent))
     import test_flowtable_failslab as suite
 
@@ -96,8 +139,13 @@ async def test_lost_launch_acknowledgement_still_cancels_guard(monkeypatch):
             return {"errno": 0, "content_hex": gzip.compress(config.encode()).hex()}
 
         async def fs_write(self, session, path, content):
-            nonlocal script
-            script = content
+            nonlocal script, cancelled
+            if path.endswith("/cancel"):
+                if cancel_transport == "uart":
+                    raise OSError("management disrupted by fault")
+                cancelled = True
+            else:
+                script = content
             return {"errno": 0}
 
     async def read(*args):

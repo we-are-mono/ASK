@@ -12,6 +12,32 @@ ROOT = Path(__file__).resolve().parents[2]
 HEADER = "drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h"
 
 
+def test_mcast_root_hop_semantics(tmp_path):
+    source = (ROOT / "cdx/cdx_ehash.c").read_text()
+    definitions = source[source.index("#define TTL_HM_VALID"):source.index("#define MURAM_VIRT_TO_PHYS_ADDR")]
+    (tmp_path / "mcast_root.inc").write_text(definitions + function(source, "fill_actions"))
+    binary = tmp_path / "mcast_root"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        "-Wno-unused-but-set-variable", "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        "-DVLAN_FILTER", "-DINCLUDE_ETHER_IFSTATS", "-I", str(tmp_path),
+        str(Path(__file__).with_name("mcast_root.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30)
+
+
+def test_bridge_mode_reaches_root_and_cannot_change_on_replace():
+    from test_mcast_backend import code
+    adapter = (ROOT / "cdx/ask_flowtable.c").read_text()
+    encoder = (ROOT / "cdx/cdx_ehash.c").read_text()
+    assert "spec.bridged = true;" in function(adapter, "ft_mc_work_fn")
+    assert "grp->bridged = spec->bridged;" in code("cdx_mc_group_add")
+    assert "grp->bridged != spec->bridged" in code("cdx_mc_same_key")
+    assert "pMcastGrpInfo->bridged" in code("cdx_add_mcast_table_entry")
+    assert "fill_actions(entry, info, !bridged)" in function(encoder, "insert_mcast_entry_in_classif_table")
+    assert "fill_actions(entry, info, true)" in function(encoder, "insert_entry_in_classif_table_encap")
+
+
 def loose_declaration(source, name):
     """As declaration(), but tolerating the vendor's other brace style. Some of
     these structs open on the line after their tag, and the point of pulling

@@ -1,9 +1,10 @@
 #!/usr/bin/python3
-"""DUT failslab lease: one real slab failure in a named allocation path.
+"""DUT failslab lease for a named allocation path.
 
 The stack filter follows asynchronous work, unlike a sender's fail-nth.
-This independent process restores every knob on consumption, cancellation or
-expiry, even if the orchestrator disconnects. It never repairs flowtables.
+This independent process restores every knob on cancellation or expiry, and
+after consumption for one-shot faults, even if the orchestrator disconnects.
+It never repairs flowtables.
 """
 import fcntl
 import json
@@ -22,11 +23,22 @@ TARGETS = {
     "work": ("nf_flow_offload_add", "nf_flow_table", None),
     "rule": ("nf_flow_offload_rule_alloc", "nf_flow_table", None),
     "actions": ("flow_rule_alloc", None, None),
+    "ipsec-receive": ("ipsec_exception_pkt_handler", "cdx", None),
+    # An interrupt can retain the worker in its stack. Exclude softirq
+    # allocations so the pool fault does not also break receive metadata.
+    "ipsec-pool": ("ipsec_pool_refill_work", "cdx", "handle_softirqs"),
+    "ipsec-context": ("cdx_ipsec_sec_sa_context_alloc", "cdx", None),
+    "multicast-claim": ("ft_mc_claim_take", "ask_flowtable", None),
+    "mroute-event": ("ft_fib_event", "ask_flowtable", None),
+    "mroute-group": ("ft_mr_apply", "ask_flowtable", None),
 }
 KNOBS = ("probability", "times", "interval", "space", "verbose", "task-filter",
          "ignore-gfp-wait", "cache-filter", "stacktrace-depth", "require-start",
          "require-end", "reject-start", "reject-end", "verbose_ratelimit_interval_ms",
          "verbose_ratelimit_burst")
+# A finite, practically inexhaustible budget retains a kernel hit counter.
+# Some allocation sites use __GFP_NOWARN and emit no fault log at all.
+CONTINUOUS_BUDGET = 2**31 - 1
 
 
 def symbol_range(text, name, module):
@@ -65,18 +77,19 @@ def drain_kmsg(fd):
             return result
 
 
-def run(root, target, *, lease=20, debugfs=Path("/sys/kernel/debug/failslab"),
+def run(root, target, *, lease=20, continuous=False, debugfs=Path("/sys/kernel/debug/failslab"),
         kallsyms=Path("/proc/kallsyms"), backend=Path("/proc/cdx_flowtable"),
         lock_path=Path("/run/lock/ask-flowtable-failslab.lock"), kmsg=Path("/dev/kmsg")):
     assert 0 < lease <= 30
     root.mkdir(exist_ok=True)
-    snapshot, result, records = {}, {"target": target, "consumed": False}, []
+    snapshot, result, records = {}, {"target": target, "consumed": False, "continuous": continuous}, []
     fd = None
     with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             for name in KNOBS:
                 snapshot[name] = (debugfs / name).read_text().strip()
+            result['original'] = snapshot
             assert int(snapshot["probability"]) == 0, "another failslab user is active"
             name, module, reject = TARGETS[target]
             symbols = kallsyms.read_text()
@@ -86,21 +99,26 @@ def run(root, target, *, lease=20, debugfs=Path("/sys/kernel/debug/failslab"),
             save(root, "original.json", snapshot)
             fd = os.open(kmsg, os.O_RDONLY | os.O_NONBLOCK)
             os.lseek(fd, 0, os.SEEK_END)
-            settings = {"times": "1", "interval": "1", "space": "0", "verbose": "2",
+            settings = {"times": str(CONTINUOUS_BUDGET) if continuous else "1", "interval": "1", "space": "0", "verbose": "2",
                         "task-filter": "N", "ignore-gfp-wait": "N", "cache-filter": "N",
                         "stacktrace-depth": "32", "require-start": hex(selected["start"]),
                         "require-end": hex(selected["end"]),
                         "reject-start": hex(excluded["start"]) if excluded else "0",
                         "reject-end": hex(excluded["end"]) if excluded else "0",
-                        "verbose_ratelimit_interval_ms": "0", "verbose_ratelimit_burst": "100"}
+                        "verbose_ratelimit_interval_ms": "1000" if continuous else "0",
+                        "verbose_ratelimit_burst": "1" if continuous else "100"}
             for name, value in settings.items():
                 (debugfs / name).write_text(value)
             started = time.monotonic()
             (debugfs / "probability").write_text("100")
+            result["armed_at"] = started
             save(root, "armed.json", {**result, "armed_at": started, "pid": os.getpid(), "lease": lease})
             while time.monotonic() - started < lease and not (root / "cancel").exists():
                 records.extend(drain_kmsg(fd))
                 remaining = int((debugfs / "times").read_text().strip())
+                if continuous:
+                    result.update(consumed=remaining < CONTINUOUS_BUDGET,
+                                  failures=CONTINUOUS_BUDGET - remaining, remaining=remaining)
                 if remaining == 0:
                     result.update(consumed=True, consumed_at=time.monotonic(), remaining=remaining)
                     break
@@ -114,6 +132,10 @@ def run(root, target, *, lease=20, debugfs=Path("/sys/kernel/debug/failslab"),
             if snapshot and snapshot.get("probability") == "0":
                 try:
                     (debugfs / "probability").write_text("0")
+                    if continuous and "armed_at" in result:
+                        remaining = int((debugfs / "times").read_text().strip())
+                        result.update(consumed=remaining < CONTINUOUS_BUDGET,
+                                      failures=CONTINUOUS_BUDGET - remaining, remaining=remaining)
                 except OSError as error:
                     failures.append(repr(error))
                 for name, value in snapshot.items():
@@ -138,4 +160,4 @@ if __name__ == "__main__":
     root = Path(sys.argv[1])
     # TERM requests the same bounded cleanup as a normal cancellation.
     signal.signal(signal.SIGTERM, lambda *_: (root / "cancel").touch())
-    run(root, sys.argv[2])
+    run(root, sys.argv[2], continuous=len(sys.argv) > 3 and sys.argv[3] == "continuous")

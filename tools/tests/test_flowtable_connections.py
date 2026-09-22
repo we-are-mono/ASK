@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import socket
 import os
 from pathlib import Path
 import secrets
@@ -97,13 +98,14 @@ class Peer:
 
 @asynccontextmanager
 async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_size=TCP_SIZE,
-               reconnect=False):
+               reconnect=False, listen_addresses=()):
     specs = {f["id"]: f for f in flows}
     accepted = asyncio.Queue()
     tasks, writers, errors, tcp_counts = set(), set(), [], {}
     active_ids = set()
     control_server = await asyncio.start_server(lambda rd, wr: accepted.put_nowait((rd, wr)), WAN_IP, DPORT + 1, limit=8 << 20)
-    server = task = controller = None
+    listeners = []
+    task = controller = None
 
     async def echo(reader, writer):
         writers.add(writer)
@@ -113,7 +115,7 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
             hello = json.loads(await asyncio.wait_for(reader.readline(), 10))
             ident = hello["id"]
             assert ident in specs and specs[ident]["proto"] == "tcp"
-            assert writer.get_extra_info("peername") == tuple(specs[ident].get("remote", (specs[ident].get("lan", r.lan_ip), specs[ident]["sport"])))
+            assert writer.get_extra_info("peername")[:2] == tuple(specs[ident].get("remote", (specs[ident].get("lan", r.lan_ip), specs[ident]["sport"])))
             assert ident not in active_ids, (ident, "overlapping TCP generations")
             assert reconnect or ident not in tcp_counts
             assert hello["serial"] == tcp_counts.get(ident, 0), (ident, hello, tcp_counts.get(ident))
@@ -152,17 +154,28 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
         job.add_done_callback(tasks.discard)
 
     try:
-        server = await asyncio.start_server(accept, WAN_IP, DPORT)
+        for address in dict.fromkeys((WAN_IP, *listen_addresses)):
+            listeners.append(await asyncio.start_server(accept, address, DPORT))
         config = {"lan": r.lan_ip, "wan": WAN_IP, "dport": DPORT,
                   "control_port": DPORT + 1, "servers": list(servers), "token": secrets.token_hex(16),
                   "lease": lease, "tcp_size": tcp_size}
         script = (f"CONFIG={config!r}\n" + Path(__file__).with_name("flowtable_neighbour_peer.py").read_text()
+                  + "\n" + Path(__file__).with_name("flowtable_multicast_peer.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_udp_wire.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_echo_peer.py").read_text()
                   + "\n" + Path(__file__).with_name("flowtable_connections_peer.py").read_text())
         task = asyncio.create_task(lan_run_python(r.lan, script, timeout=lease + 20, label="flowtable_connections"))
         reader, writer = await asyncio.wait_for(accepted.get(), 15)
         controller = Peer(reader, writer, flows, tcp_size)
+        def tcp_info():
+            snapshots = []
+            for stream in writers:
+                sock = stream.get_extra_info("socket")
+                if sock is not None:
+                    snapshots.append({"peer": stream.get_extra_info("peername"),
+                        "tcp_info_hex": sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104).hex()})
+            return snapshots
+        controller.wan_tcp_info = tcp_info
         ready = json.loads(await asyncio.wait_for(reader.readline(), 5))
         assert ready == {"ready": config["token"]}, ready
         # Transfer the potentially large workload over the control connection,
@@ -190,8 +203,8 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
                         await asyncio.wait_for(waiter, 5)
                 except (ConnectionError, OSError) as error:
                     shutdown_error = shutdown_error or error
-            if server:
-                server.close()
+            for listener in listeners:
+                listener.close()
             control_server.close()
             for writer in list(writers):
                 # NAT lifecycle tests can destroy a mapping before its peer
@@ -200,8 +213,8 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
             await asyncio.gather(*list(tasks), return_exceptions=True)
             # Python 3.13 Server.wait_closed also waits for accepted clients.
             # Close their transports before waiting for the listening servers.
-            if server:
-                await server.wait_closed()
+            for listener in listeners:
+                await listener.wait_closed()
             await control_server.wait_closed()
             # Always finish the sole LAN console operation before fixture cleanup.
             if task:

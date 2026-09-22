@@ -32,6 +32,8 @@ struct nf_flow_offload_handle;
 struct nf_conn { unsigned refs; bool dying; };
 struct net { int unused; };
 static struct net conntrack_net;
+static uint64_t policy_generation;
+static uint64_t xfrm_flowtable_genid(struct net *net) { return policy_generation; }
 #define nf_ct_net(ct) (&conntrack_net)
 /* Per-cause retirement counters. Recording them is what lets a spurious
  * hardware retirement be attributed instead of merely observed. */
@@ -48,6 +50,7 @@ struct flow_offload {
     struct nf_flow_offload_handle *hw_handle;
     unsigned long flags;
     unsigned type, timeout;
+    uint64_t xfrm_genid;
     struct rcu_head rcu_head;
 };
 struct rhashtable { struct flow_offload_tuple_rhash *slots[2]; };
@@ -108,6 +111,7 @@ static struct flow_offload *new_flow(struct nf_conn *ct)
 {
     struct flow_offload *flow = kzalloc(sizeof(*flow), GFP_ATOMIC);
     assert(flow); flow->ct = ct; ct->refs++; flow->type = NF_FLOW_OFFLOAD_ROUTE;
+    flow->xfrm_genid = policy_generation;
     flow->tuplehash[1].tuple.dir = 1;
     return flow;
 }
@@ -169,6 +173,27 @@ int main(void)
     grace_period(); assert(allocations == 1);
     nf_flow_offload_handle_put(old); grace_period(); assert(!allocations);
     assert(route_releases == 6 && adds == 2);
+    /* A policy update retires both lookup directions before asynchronous GC,
+     * even while the provider handle is still valid. Fresh flows use the new
+     * policy generation; a subsequent change cannot revive the old flow. */
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+    old = flow->hw_handle;
+    assert(flow_offload_lookup(&table, &key[0]));
+    policy_generation++;
+    assert(nf_flow_offload_handle_valid(old) && flow_offload_hw_invalid(flow));
+    for (unsigned i = 0; i < 2; i++) assert(!flow_offload_lookup(&table, &key[i]));
+    unsigned invalidations = gc_stats.count_gc_hw_invalid;
+    nf_flow_offload_gc_step(&table, flow, NULL);
+    assert(test_bit(NF_FLOW_TEARDOWN, &flow->flags));
+    assert(gc_stats.count_gc_hw_invalid == invalidations + 1);
+    policy_generation++;
+    assert(flow_offload_hw_invalid(flow));
+    set_bit(NF_FLOW_HW_DEAD, &flow->flags);
+    nf_flow_offload_gc_step(&table, flow, NULL);
+    grace_period(); assert(!allocations && !ct.refs);
+    flow = new_flow(&ct); assert(flow_offload_add(&table, flow) == 0);
+    assert(!flow_offload_hw_invalid(flow) && flow_offload_lookup(&table, &key[0]));
+    flow_offload_del(&table, flow); grace_period(); assert(!allocations && !ct.refs);
     assert(!nf_flow_offload_handle_valid(NULL) && !nf_flow_offload_handle_invalidate(NULL));
     nf_flow_offload_handle_put(NULL);
     puts("Flowtable handles: opt-in allocation, rollback, shared ownership, lookup, GC, RCU and generation isolation passed");

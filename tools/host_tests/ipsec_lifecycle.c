@@ -42,8 +42,11 @@
 #define GFP_KERNEL 0
 #define GFP_DMA 0
 #define GFP_ATOMIC 0
+#define __GFP_COMP 1
+#define PAGE_SIZE 4096
 #define DMA_BIDIRECTIONAL 0
 #define SMP_CACHE_BYTES 64
+#define ALIGN(n, a) (((n) + (a) - 1) & ~((a) - 1))
 #define DPAA_EXTRA_BUF_SIZE_4_SKB 128
 #define DPA_MAX_FD_OFFSET 64
 #define DPA_SKB_SIZE(x) (x)
@@ -52,6 +55,8 @@
 #define KERN_INFO ""
 #define printk(...) do { } while (0)
 #define pr_err(...) do { } while (0)
+#define pr_err_ratelimited(...) do { } while (0)
+#define dev_err(...) do { } while (0)
 #define pr_debug(...) do { } while (0)
 #define pr_warn_ratelimited(...) do { } while (0)
 #define DPAIPSEC_INFO(...) do { } while (0)
@@ -94,8 +99,9 @@ typedef int cpumask_t;
 struct device { int unused; };
 struct sec_descriptor { char data[128]; };
 typedef struct { void *proc_dir; } cdx_proc_dir_entry_t;
-struct sk_buff { void *head; };
-struct bm_buffer { dma_addr_t addr; unsigned bpid; };
+struct sk_buff { void *head; bool head_frag; };
+struct page { void *addr; unsigned refs, size; struct page *next; };
+struct bm_buffer { union { dma_addr_t addr; uint64_t opaque; }; unsigned bpid; };
 struct bman_pool { unsigned count; struct bm_buffer buffers[IPSEC_BUFCOUNT]; };
 struct dpa_bp {
     struct device *dev; size_t size; unsigned config_count, bpid;
@@ -131,6 +137,7 @@ static unsigned sec_congestion, qm_channel_caam;
 static struct device device;
 static struct dpa_bp parent = { .dev = &device };
 static struct dpa_bp *dpa_bp_array[64];
+static struct dpa_bp *sg_bpool_g, *skb_2bfreed_bpool_g;
 static struct dpa_iface_info iface = { .pcd_proc_entry = &iface };
 static cpumask_t cpus = 2;
 static unsigned steps, fail_step, allocs, mappings, queues, proc_entries, callbacks;
@@ -144,6 +151,12 @@ static unsigned module_refs;
 static bool module_going, sa_range;
 static void (*exit_callback)(void);
 static struct qman_fq *fq_registry[1024];
+static struct page *pages;
+static bool refill_running;
+static void ipsec_pool_refill_start(void) { assert(!refill_running); refill_running = true; }
+static void ipsec_pool_refill_stop(void) { refill_running = false; }
+static unsigned dpaa_sec_sg_reap(unsigned budget)
+{ assert(!refill_running && budget == 512); return 0; }
 
 static bool fault(void) { return ++steps == fail_step; }
 static bool seed_fault(const char *kind)
@@ -153,7 +166,7 @@ static bool seed_fault(const char *kind)
 static void *kmalloc(size_t size, int flags)
 {
     if (seed_fault("head")) return NULL;
-    void *p = malloc(size); assert(p); allocs++; return p;
+    void *p = aligned_alloc(SMP_CACHE_BYTES, ALIGN(size, SMP_CACHE_BYTES)); assert(p); allocs++; return p;
 }
 static void *kzalloc(size_t size, int flags)
 {
@@ -161,14 +174,46 @@ static void *kzalloc(size_t size, int flags)
     void *p = calloc(1, size); assert(p); allocs++; return p;
 }
 static void kfree(void *p) { if (p) { assert(allocs); allocs--; free(p); } }
-static struct sk_buff *slab_build_skb(void *head)
+static unsigned get_order(unsigned size)
+{ unsigned order = 0; while ((PAGE_SIZE << order) < size) order++; return order; }
+static struct page *alloc_pages(int flags, unsigned order)
+{
+    assert(flags & __GFP_COMP);
+    if (seed_fault("head")) return NULL;
+    struct page *p = calloc(1, sizeof(*p)); assert(p);
+    p->size = PAGE_SIZE << order;
+    p->addr = aligned_alloc(PAGE_SIZE, p->size); assert(p->addr);
+    p->refs = 1; p->next = pages; pages = p; allocs += 2;
+    return p;
+}
+static void *page_address(struct page *p) { assert(p->refs); return p->addr; }
+static struct page *virt_to_head_page(void *addr)
+{
+    for (struct page *p = pages; p; p = p->next)
+        if (addr >= p->addr && (char *)addr < (char *)p->addr + p->size) return p;
+    assert(!"slab allocation cannot be retained as an skb page fragment");
+    return NULL;
+}
+static void get_page(struct page *p) { assert(p->refs); p->refs++; }
+static void put_page(struct page *p)
+{
+    assert(p->refs);
+    if (--p->refs) return;
+    struct page **link = &pages;
+    while (*link != p) link = &(*link)->next;
+    *link = p->next;
+    kfree(p->addr); kfree(p);
+}
+static struct sk_buff *build_skb(void *head, unsigned size)
 {
     if (seed_fault("skb")) return NULL;
     struct sk_buff *skb = malloc(sizeof(*skb)); assert(skb); allocs++;
-    skb->head = head; return skb;
+    assert(virt_to_head_page(head)->size == size);
+    skb->head = head; skb->head_frag = true; return skb;
 }
 static void skb_reserve(struct sk_buff *skb, unsigned bytes) { assert(bytes >= sizeof(void *)); }
-static void kfree_skb(struct sk_buff *skb) { kfree(skb->head); kfree(skb); }
+static void kfree_skb(struct sk_buff *skb)
+{ assert(skb->head_frag); put_page(virt_to_head_page(skb->head)); kfree(skb); }
 #define dev_kfree_skb_any kfree_skb
 static dma_addr_t dma_map_single(struct device *dev, void *p, size_t size, int direction)
 {
@@ -196,7 +241,7 @@ static int bman_acquire(struct bman_pool *pool, struct bm_buffer *b, unsigned co
 }
 static void bman_free_pool(struct bman_pool *pool)
 {
-    assert(!pool->count && !queues && !callbacks && !cgr);
+    assert(!pool->count && !queues && !callbacks);
     free(pool);
 }
 static struct dpa_bp *dpa_bpid2pool(unsigned bpid)
@@ -205,9 +250,11 @@ static bool atomic_dec_and_test(int *value) { assert(*value > 0); return !--*val
 static int dpa_bp_alloc(struct dpa_bp *bp, struct device *dev)
 {
     if (fault()) return -ENOMEM;
-    assert(!dpa_bp_array[2]); bp->bpid = 2; bp->refs = 1;
+    unsigned id = 2;
+    while (dpa_bp_array[id]) id++;
+    assert(id < 64); bp->bpid = id; bp->refs = 1;
     bp->pool = calloc(1, sizeof(*bp->pool)); assert(bp->pool);
-    dpa_bp_array[2] = bp; return 0;
+    dpa_bp_array[id] = bp; return 0;
 }
 static int get_phys_port_poolinfo_bysize(unsigned size, struct port_bman_pool_info *p)
 { if (fault()) return -ENOENT; p->pool_id = 1; return 0; }
@@ -338,6 +385,8 @@ void cdx_dpa_ipsec_exit(void);
 static void clean(void)
 {
     assert(!allocs && !mappings && !queues && !proc_entries && !callbacks);
+    assert(!pages && !refill_running && !sg_bpool_g && !skb_2bfreed_bpool_g);
+    for (unsigned id = 2; id < 64; id++) assert(!dpa_bp_array[id]);
     assert(!port && !cgr && !cgrid && !preempt_count && !dpa_bp_array[2] && !cdx_dpa_ipsec_ready());
     assert(!ipsecinfo.ipsec_bp && !ipsecinfo.ipsec_pcd_fqs);
     assert(!module_refs && !sa_range && !ipsecinfo.ipsec_exception_fq);
@@ -357,7 +406,9 @@ static unsigned normal(void)
     unsigned count = steps;
     assert(cdx_dpa_ipsec_ready() && registrations == 1 && queues == 12);
     assert(ipsecinfo.ipsec_bp->pool->count == IPSEC_BUFCOUNT);
-    assert(mappings == IPSEC_BUFCOUNT);
+    assert(mappings == IPSEC_BUFCOUNT + CDX_MAX_SG_BUFF_COUNT);
+    assert(sg_bpool_g->pool->count == CDX_MAX_SG_BUFF_COUNT);
+    assert(!skb_2bfreed_bpool_g->pool->count);
     /* Embedded SA queues have a distinct owner and lookup list. */
     struct dpa_fq sa[3] = {0};
     for (unsigned i = 0; i < 3; i++) {
@@ -417,6 +468,34 @@ static unsigned sa_lifecycle(void)
 
 int main(void)
 {
+    /* An SG receiver frees the secondary skb shell after taking a page
+     * reference. Exercise that lifetime with an actually seeded buffer. */
+    reset();
+    assert(cdx_dpa_ipsec_init() == SUCCESS);
+    struct dpa_bp *bp = ipsecinfo.ipsec_bp;
+    struct bm_buffer buffer;
+    assert(bman_acquire(bp->pool, &buffer, 1, 0) == 1);
+    void *data = phys_to_virt(buffer.addr);
+    struct sk_buff *skb = ((struct sk_buff **)data)[-1];
+    struct page *page = virt_to_head_page(data);
+    assert(skb->head_frag && page->refs == 1);
+    memset(data, 0x5a, bp->size);
+    dma_unmap_single(bp->dev, buffer.addr, bp->size, DMA_BIDIRECTIONAL);
+    get_page(page);
+    kfree_skb(skb);
+    assert(page->refs == 1);
+    for (unsigned i = 0; i < bp->size; i++) assert(((unsigned char *)data)[i] == 0x5a);
+    put_page(page);
+    /* A failed remap must free the SGT and leave a replacement owed. */
+    assert(bman_acquire(bp->pool, &buffer, 1, 0) == 1);
+    data = phys_to_virt(buffer.addr);
+    dma_unmap_single(bp->dev, buffer.addr, bp->size, DMA_BIDIRECTIONAL);
+    seed_failure = "dma"; seed_step = 0; seed_fail = 1;
+    int balance = 0;
+    dpa_bp_recycle_frag(bp, (unsigned long)data, &balance);
+    assert(balance == 0 && mappings == IPSEC_BUFCOUNT + CDX_MAX_SG_BUFF_COUNT - 2);
+    seed_failure = NULL;
+    cdx_dpa_ipsec_exit(); clean();
     unsigned cases = 0;
     for (sec_congestion = 0; sec_congestion <= 1; sec_congestion++) {
         reset(); unsigned count = normal(); cases++;
@@ -431,6 +510,14 @@ int main(void)
         const unsigned positions[] = {1, 2, 8, 9, 10, 511, 512};
         for (unsigned k = 0; k < 3; k++) for (unsigned p = 0; p < 7; p++) {
             reset(); seed_failure = kinds[k]; seed_fail = positions[p];
+            assert(cdx_dpa_ipsec_init() != SUCCESS);
+            assert(seed_step == seed_fail && !registrations);
+            clean(); cases++;
+        }
+        /* Fail each boundary of raw SG seeding, after the output pool. */
+        const unsigned sg_positions[] = {513, 514, 520, 521, 1023, 1024};
+        for (unsigned k = 0; k < 3; k += 2) for (unsigned p = 0; p < 6; p++) {
+            reset(); seed_failure = kinds[k]; seed_fail = sg_positions[p];
             assert(cdx_dpa_ipsec_init() != SUCCESS);
             assert(seed_step == seed_fail && !registrations);
             clean(); cases++;

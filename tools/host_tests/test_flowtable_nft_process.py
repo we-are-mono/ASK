@@ -173,9 +173,18 @@ def test_controller_death_cancels_entire_job(runner, tmp_path, adopt_guardians):
         process.kill()
         process.communicate(timeout=1)  # no guardian retained controller pipes
         wait_for(lambda: all(not Path(f"/proc/{pids[k]}").exists() for k in ("worker", "child")))
-        assert time.monotonic() - started < 0.5  # liveness EOF, not the job timeout
         with (runner / "lock").open("r+") as lease:
-            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # The guardian can still be completing its reply after reaping
+            # the last worker. Include its final lease close in the same
+            # liveness deadline, rather than racing that last instruction.
+            while True:
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    assert time.monotonic() - started < 0.5
+                    time.sleep(0.001)
+        assert time.monotonic() - started < 0.5  # liveness EOF, not the job timeout
         time.sleep(0.55)
         assert not (tmp_path / "late-commit").exists()
     finally:
