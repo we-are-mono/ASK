@@ -35,6 +35,11 @@
 		mod-def0-gpios = <&gpio_absent 0 1>;
 	};
 
+	/* A cage whose MOD_DEF0 its sfp stand-in requests and releases. */
+	sfp_1g: sfp-1g {
+		mod-def0-gpios = <&gpio 1 1>;
+	};
+
 	mac: mac {
 		compatible = "fsl,fman-memac";
 		sfp = <&sfp>;
@@ -51,13 +56,35 @@
 		pcs-handle-names = "xfi";
 	};
 
+	/*
+	 * A 10G MAC whose lane the RCW runs at 1G: U-Boot switches it to
+	 * 1000base-x, and the base dtsi points "sgmii" and "xfi" at one PCS.
+	 */
+	mac_1g: mac-1g {
+		compatible = "fsl,fman-memac";
+		sfp = <&sfp_1g>;
+		phy-connection-type = "1000base-x";
+		pcs-handle = <&pcs>, <&pcs>;
+		pcs-handle-names = "sgmii", "xfi";
+	};
+
 	dpaa {
 		fsl,fman-mac = <&mac>;
+	};
+
+	dpaa-1g {
+		fsl,fman-mac = <&mac_1g>;
 	};
 
 	link: link-led {};
 	activity: activity-led {};
 	late: late-led {};
+
+	/* Registered by a provider that frees them on unbind, as gpio-leds does. */
+	leds {
+		link_1g: link {};
+		activity_1g: activity {};
+	};
 
 	controller {
 		port0 {
@@ -74,6 +101,11 @@
 			compatible = "mono,sfp-led-port";
 			sfp = <&sfp_nogpio>;
 			leds = <&link>, <&activity>;
+		};
+		port3 {
+			compatible = "mono,sfp-led-port";
+			sfp = <&sfp_1g>;
+			leds = <&link_1g>, <&activity_1g>;
 		};
 	};
 };

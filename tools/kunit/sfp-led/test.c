@@ -4,9 +4,17 @@
  * The fixture uses real GPIO, MDIO, LED, OF and netdev APIs with fake hardware.
  */
 #include <kunit/test.h>
+#include <kunit/test-bug.h>
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/gpio/driver.h>
 #include <linux/rtnetlink.h>
+
+/* MOD_DEF0 of /sfp on line 0, of /sfp-1g on line 1. */
+#define SFP_LED_TEST_LINES	2U
+
+/* A 1000BASE-X PCS's BMSR without link: extended status and AN ability. */
+#define SFP_LED_TEST_BMSR	(BMSR_ESTATEN | BMSR_ANEGCAPABLE | BMSR_ERCAP)
 
 struct sfp_led_test {
 	struct kunit *test;
@@ -15,19 +23,55 @@ struct sfp_led_test {
 	struct device_node *gpio_np;
 	struct mii_bus *bus;
 	struct led_classdev link, activity, late;
-	struct platform_device *provider, *consumer, *dpaa;
+	struct platform_device *provider, *consumer, *dpaa, *dpaa_1g;
 	/* Bound stand-ins for the sfp driver on /sfp and /sfp-nogpio. */
 	struct platform_device *sfp0, *sfp1;
+	/*
+	 * Suppliers of the 1000BASE-X cage, bound with their nodes: the sfp
+	 * stand-in on /sfp-1g owns its MOD_DEF0 line and the provider on /leds
+	 * its LEDs, and each lets go of them when it unbinds.
+	 */
+	struct platform_device *sfp_1g, *leds;
 	/* Port devices with the controller's child nodes, never auto-bound:
 	 * their of_node is set after registration so the driver core does not
 	 * match them, and a test drives the probe itself. */
 	struct platform_device *port0, *port1, *port2;
-	struct net_device *netdev;
+	/* A port the driver core binds, which is what device links act on. */
+	struct platform_device *bound;
+	/* What the last supplier stand-in to unbind saw of the watched port. */
+	struct device *watched, *unbound;
+	bool watched_bound, watched_lit;
+	struct net_device *netdev, *netdev_1g;
 	int pcs_status[2];
 	unsigned int pcs_reads;
+	/* The same PCS's clause 22 BMSR, which a 1000BASE-X port reads. */
+	int bmsr[2];
+	unsigned int bmsr_reads;
+	unsigned int line_reads[SFP_LED_TEST_LINES];
 	bool present;
 	bool gc_added, bus_added, late_added, probed;
 };
+
+/* The LEDs of /leds, allocated per binding of their provider. */
+struct sfp_led_test_leds {
+	struct led_classdev link, activity;
+};
+
+/*
+ * A supplier stand-in unbinding: note whether the port under watch was still
+ * bound, and so still able to use what this supplier is about to release.
+ */
+static void sfp_led_test_supplier_unbind(struct device *dev, bool lit)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct sfp_led_test *ctx = test ? test->priv : NULL;
+
+	if (!ctx || !ctx->watched)
+		return;
+	ctx->unbound = dev;
+	ctx->watched_bound = device_is_bound(ctx->watched);
+	ctx->watched_lit = lit;
+}
 
 static int sfp_led_test_provider_probe(struct platform_device *pdev)
 {
@@ -39,8 +83,32 @@ static struct platform_driver sfp_led_test_provider_driver = {
 	.driver.name = "sfp-led-kunit-provider",
 };
 
+/*
+ * The sfp driver requests its cage's MOD_DEF0 exclusively when it binds and
+ * releases it when it unbinds. A stand-in bound before its node is attached
+ * requests nothing: the fixture holds that line in its place.
+ */
+static int sfp_led_test_sfp_probe(struct platform_device *pdev)
+{
+	struct gpio_desc *desc;
+
+	if (!pdev->dev.of_node)
+		return 0;
+	desc = devm_gpiod_get(&pdev->dev, "mod-def0", GPIOD_IN);
+	if (IS_ERR(desc))
+		return PTR_ERR(desc);
+	platform_set_drvdata(pdev, desc);
+	return 0;
+}
+
+static void sfp_led_test_sfp_remove(struct platform_device *pdev)
+{
+	sfp_led_test_supplier_unbind(&pdev->dev, false);
+}
+
 static struct platform_driver sfp_led_test_sfp_driver = {
-	.probe = sfp_led_test_provider_probe,
+	.probe = sfp_led_test_sfp_probe,
+	.remove = sfp_led_test_sfp_remove,
 	.driver.name = "sfp-led-kunit-sfp",
 };
 
@@ -57,8 +125,16 @@ static int sfp_led_test_mdio_read(struct mii_bus *bus, int addr, int devad,
 
 static int sfp_led_test_mdio_c22(struct mii_bus *bus, int addr, int reg)
 {
-	/* Match the SDK's XFI PCS: no clause 22 PHY can bind. */
-	return 0xffff;
+	struct sfp_led_test *ctx = bus->priv;
+
+	/*
+	 * Match the SDK's PCS: it answers its status register, but has no
+	 * clause 22 PHY ID, so no PHY can bind.
+	 */
+	if (reg != MII_BMSR)
+		return 0xffff;
+	KUNIT_EXPECT_EQ(ctx->test, addr, 0);
+	return ctx->bmsr[min(ctx->bmsr_reads++, 1U)];
 }
 
 static int sfp_led_test_mdio_write(struct mii_bus *bus, int addr, int devad,
@@ -85,7 +161,9 @@ static int sfp_led_test_gpio_get(struct gpio_chip *gc, unsigned int offset)
 {
 	struct sfp_led_test *ctx = gpiochip_get_data(gc);
 
-	KUNIT_EXPECT_EQ(ctx->test, offset, 0U);
+	KUNIT_EXPECT_LT(ctx->test, offset, SFP_LED_TEST_LINES);
+	if (offset < SFP_LED_TEST_LINES)
+		ctx->line_reads[offset]++;
 	return !ctx->present;
 }
 
@@ -124,6 +202,65 @@ static int sfp_led_test_register_led(struct sfp_led_test *ctx,
 	return ret;
 }
 
+static int sfp_led_test_leds_add(struct device *dev, struct led_classdev *led,
+				 const char *name)
+{
+	struct fwnode_handle *node = device_get_named_child_node(dev, name);
+	struct led_init_data data = {
+		.fwnode = node,
+	};
+	int ret;
+
+	led->name = name;
+	led->max_brightness = 1;
+	led->brightness_set = sfp_led_test_brightness;
+	ret = devm_led_classdev_register_ext(dev, led, &data);
+	fwnode_handle_put(node);
+	return ret;
+}
+
+/*
+ * As gpio-leds does, the provider allocates its led_classdevs when it binds
+ * and frees them when it unbinds; a gotten LED does not keep them.
+ */
+static int sfp_led_test_leds_probe(struct platform_device *pdev)
+{
+	struct sfp_led_test_leds *leds;
+	int ret;
+
+	leds = devm_kzalloc(&pdev->dev, sizeof(*leds), GFP_KERNEL);
+	if (!leds)
+		return -ENOMEM;
+	ret = sfp_led_test_leds_add(&pdev->dev, &leds->link, "link");
+	if (ret)
+		return ret;
+	ret = sfp_led_test_leds_add(&pdev->dev, &leds->activity, "activity");
+	if (ret)
+		return ret;
+	platform_set_drvdata(pdev, leds);
+	return 0;
+}
+
+static void sfp_led_test_leds_remove(struct platform_device *pdev)
+{
+	struct sfp_led_test_leds *leds = platform_get_drvdata(pdev);
+
+	sfp_led_test_supplier_unbind(&pdev->dev, leds->link.brightness ||
+				     leds->activity.brightness);
+}
+
+static struct platform_driver sfp_led_test_leds_driver = {
+	.probe = sfp_led_test_leds_probe,
+	.remove = sfp_led_test_leds_remove,
+	.driver.name = "sfp-led-kunit-leds",
+};
+
+static struct platform_driver * const sfp_led_test_drivers[] = {
+	&sfp_led_test_provider_driver,
+	&sfp_led_test_sfp_driver,
+	&sfp_led_test_leds_driver,
+};
+
 static int sfp_led_test_open(struct net_device *netdev)
 {
 	return 0;
@@ -134,6 +271,39 @@ static const struct net_device_ops sfp_led_test_netdev_ops = {
 	.ndo_stop = sfp_led_test_open,
 };
 
+static int sfp_led_test_add_netdev(struct platform_device *parent,
+				   struct net_device **netdev)
+{
+	struct net_device *ndev;
+	int ret;
+
+	ndev = alloc_etherdev(0);
+	if (!ndev)
+		return -ENOMEM;
+	ndev->netdev_ops = &sfp_led_test_netdev_ops;
+	SET_NETDEV_DEV(ndev, &parent->dev);
+	eth_hw_addr_random(ndev);
+	ret = register_netdev(ndev);
+	if (ret) {
+		free_netdev(ndev);
+		return ret;
+	}
+	*netdev = ndev;
+	rtnl_lock();
+	ret = dev_open(ndev, NULL);
+	rtnl_unlock();
+	return ret;
+}
+
+static void sfp_led_test_put_netdev(struct net_device **netdev)
+{
+	if (!*netdev)
+		return;
+	unregister_netdev(*netdev);
+	free_netdev(*netdev);
+	*netdev = NULL;
+}
+
 static struct platform_device *sfp_led_test_port_device(int id,
 							const char *path)
 {
@@ -142,6 +312,28 @@ static struct platform_device *sfp_led_test_port_device(int id,
 	pdev = platform_device_register_simple("sfp-led-kunit-port", id, NULL, 0);
 	if (!IS_ERR(pdev))
 		pdev->dev.of_node = of_find_node_by_path(path);
+	return pdev;
+}
+
+/*
+ * A device registered with its node already attached, which it probes with:
+ * a stand-in finds its resources there, and a port is matched and bound by
+ * the driver core.
+ */
+static struct platform_device *sfp_led_test_node_device(const char *name,
+							int id,
+							const char *path)
+{
+	struct device_node *node = of_find_node_by_path(path);
+	struct platform_device_info info = {
+		.name = name,
+		.id = id,
+		.fwnode = of_fwnode_handle(node),
+	};
+	struct platform_device *pdev;
+
+	pdev = platform_device_register_full(&info);
+	of_node_put(node);
 	return pdev;
 }
 
@@ -158,13 +350,14 @@ static void sfp_led_test_cleanup(void *data)
 {
 	struct sfp_led_test *ctx = data;
 
+	/* No supplier unbinding from here on may look at the port. */
+	ctx->watched = NULL;
+	sfp_led_test_put_port_device(&ctx->bound);
 	cancel_delayed_work_sync(&ctx->port.poll_work);
 	if (ctx->probed)
 		sfp_led_port_remove(ctx->port1);
-	if (ctx->netdev) {
-		unregister_netdev(ctx->netdev);
-		free_netdev(ctx->netdev);
-	}
+	sfp_led_test_put_netdev(&ctx->netdev);
+	sfp_led_test_put_netdev(&ctx->netdev_1g);
 	/* Port devices first: their devres holds LEDs and the MDIO bus. */
 	sfp_led_test_put_port_device(&ctx->port0);
 	sfp_led_test_put_port_device(&ctx->port1);
@@ -173,10 +366,16 @@ static void sfp_led_test_cleanup(void *data)
 		platform_device_unregister(ctx->sfp0);
 	if (!IS_ERR_OR_NULL(ctx->sfp1))
 		platform_device_unregister(ctx->sfp1);
+	if (!IS_ERR_OR_NULL(ctx->sfp_1g))
+		platform_device_unregister(ctx->sfp_1g);
+	if (!IS_ERR_OR_NULL(ctx->leds))
+		platform_device_unregister(ctx->leds);
 	if (!IS_ERR_OR_NULL(ctx->consumer))
 		platform_device_unregister(ctx->consumer);
 	if (!IS_ERR_OR_NULL(ctx->dpaa))
 		platform_device_unregister(ctx->dpaa);
+	if (!IS_ERR_OR_NULL(ctx->dpaa_1g))
+		platform_device_unregister(ctx->dpaa_1g);
 	if (ctx->late_added)
 		led_classdev_unregister(&ctx->late);
 	if (ctx->activity.dev)
@@ -196,8 +395,8 @@ static void sfp_led_test_cleanup(void *data)
 	of_node_put(ctx->gpio_np);
 	if (!IS_ERR_OR_NULL(ctx->provider))
 		platform_device_unregister(ctx->provider);
-	platform_driver_unregister(&sfp_led_test_sfp_driver);
-	platform_driver_unregister(&sfp_led_test_provider_driver);
+	platform_unregister_drivers(sfp_led_test_drivers,
+				    ARRAY_SIZE(sfp_led_test_drivers));
 }
 
 static int sfp_led_test_init(struct kunit *test)
@@ -210,21 +409,16 @@ static int sfp_led_test_init(struct kunit *test)
 	if (!of_find_property(of_root, "sfp-led-kunit", NULL))
 		return -EINVAL;
 
-	ret = platform_driver_register(&sfp_led_test_provider_driver);
+	ret = platform_register_drivers(sfp_led_test_drivers,
+					ARRAY_SIZE(sfp_led_test_drivers));
 	if (ret) {
-		kunit_err(test, "fixture initialization at line %d: %d\n", __LINE__, ret);
-		return ret;
-	}
-	ret = platform_driver_register(&sfp_led_test_sfp_driver);
-	if (ret) {
-		platform_driver_unregister(&sfp_led_test_provider_driver);
 		kunit_err(test, "fixture initialization at line %d: %d\n", __LINE__, ret);
 		return ret;
 	}
 	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
-		platform_driver_unregister(&sfp_led_test_sfp_driver);
-		platform_driver_unregister(&sfp_led_test_provider_driver);
+		platform_unregister_drivers(sfp_led_test_drivers,
+					    ARRAY_SIZE(sfp_led_test_drivers));
 		return -ENOMEM;
 	}
 	ctx->test = test;
@@ -277,7 +471,7 @@ static int sfp_led_test_init(struct kunit *test)
 	ctx->gc.fwnode = of_fwnode_handle(ctx->gpio_np);
 	ctx->gc.owner = THIS_MODULE;
 	ctx->gc.base = -1;
-	ctx->gc.ngpio = 1;
+	ctx->gc.ngpio = SFP_LED_TEST_LINES;
 	ctx->gc.can_sleep = true;
 	ctx->gc.get = sfp_led_test_gpio_get;
 	ctx->gc.direction_input = sfp_led_test_gpio_direction_input;
@@ -326,6 +520,8 @@ static int sfp_led_test_init(struct kunit *test)
 	}
 	ctx->bus_added = true;
 	ctx->port.pcs_bus = ctx->bus;
+	/* /mac is XGMII, so its PCS reports link in clause 45 MDIO_STAT1. */
+	ctx->port.pcs_c45 = true;
 
 	ret = sfp_led_test_register_led(ctx, &ctx->link, "/link-led");
 	if (ret) {
@@ -340,29 +536,61 @@ static int sfp_led_test_init(struct kunit *test)
 	ctx->port.link_led = &ctx->link;
 	ctx->port.activity_led = &ctx->activity;
 
-	ctx->netdev = alloc_etherdev(0);
-	if (!ctx->netdev)
-		return -ENOMEM;
-	ctx->netdev->netdev_ops = &sfp_led_test_netdev_ops;
-	SET_NETDEV_DEV(ctx->netdev, &ctx->dpaa->dev);
-	eth_hw_addr_random(ctx->netdev);
-	ret = register_netdev(ctx->netdev);
-	if (ret) {
-		free_netdev(ctx->netdev);
-		ctx->netdev = NULL;
-		return ret;
+	ctx->sfp_1g = sfp_led_test_node_device("sfp-led-kunit-sfp", 2, "/sfp-1g");
+	if (IS_ERR(ctx->sfp_1g))
+		return PTR_ERR(ctx->sfp_1g);
+	ctx->leds = sfp_led_test_node_device("sfp-led-kunit-leds",
+					     PLATFORM_DEVID_NONE, "/leds");
+	if (IS_ERR(ctx->leds))
+		return PTR_ERR(ctx->leds);
+	if (!device_is_bound(&ctx->sfp_1g->dev) ||
+	    !device_is_bound(&ctx->leds->dev)) {
+		kunit_err(test, "fixture initialization at line %d\n", __LINE__);
+		return -ENODEV;
 	}
-	rtnl_lock();
-	ret = dev_open(ctx->netdev, NULL);
-	rtnl_unlock();
-	return ret;
+	ctx->dpaa_1g = sfp_led_test_node_device("sfp-led-kunit-dpaa", 1,
+						"/dpaa-1g");
+	if (IS_ERR(ctx->dpaa_1g))
+		return PTR_ERR(ctx->dpaa_1g);
+
+	ret = sfp_led_test_add_netdev(ctx->dpaa, &ctx->netdev);
+	if (ret)
+		return ret;
+	return sfp_led_test_add_netdev(ctx->dpaa_1g, &ctx->netdev_1g);
+}
+
+/* A bound port also polls on its own; cancel that and take a sample by hand. */
+static void sfp_led_test_poll_port(struct sfp_led_test *ctx,
+				   struct sfp_led_port *port)
+{
+	cancel_delayed_work_sync(&port->poll_work);
+	ctx->pcs_reads = 0;
+	ctx->bmsr_reads = 0;
+	sfp_led_poll(&port->poll_work.work);
+	cancel_delayed_work_sync(&port->poll_work);
 }
 
 static void sfp_led_test_poll_once(struct sfp_led_test *ctx)
 {
-	ctx->pcs_reads = 0;
-	sfp_led_poll(&ctx->port.poll_work.work);
-	cancel_delayed_work_sync(&ctx->port.poll_work);
+	sfp_led_test_poll_port(ctx, &ctx->port);
+}
+
+/*
+ * Bind /controller/<port> through the driver core, as the controller's
+ * populate does. Device links act only on a consumer bound that way: a
+ * supplier that unbinds releases the port's driver, which it cannot do for a
+ * port probed by hand.
+ */
+static struct sfp_led_port *sfp_led_test_bind_port(struct kunit *test,
+						   const char *path)
+{
+	struct sfp_led_test *ctx = test->priv;
+
+	ctx->bound = sfp_led_test_node_device("sfp-led-kunit-port",
+					      PLATFORM_DEVID_AUTO, path);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->bound);
+	KUNIT_ASSERT_TRUE(test, device_is_bound(&ctx->bound->dev));
+	return platform_get_drvdata(ctx->bound);
 }
 
 static unsigned int sfp_led_test_gpio_refs(struct sfp_led_test *ctx)
@@ -430,6 +658,85 @@ static void sfp_led_test_pcs_errors(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ctx->port.last_link);
 }
 
+/*
+ * U-Boot switches a 10G MAC to 1000base-x when the RCW runs its lane at 1G.
+ * Such a port used to fail its probe with -EOPNOTSUPP; it now reads link from
+ * the same PCS's clause 22 BMSR, and never from clause 45. Any PCS write, in
+ * either clause, fails the test in the MDIO stand-in.
+ */
+static void sfp_led_test_1000basex_link(struct kunit *test)
+{
+	struct sfp_led_test *ctx = test->priv;
+	struct sfp_led_port *port;
+
+	port = sfp_led_test_bind_port(test, "/controller/port3");
+	KUNIT_ASSERT_NOT_NULL(test, port);
+	KUNIT_EXPECT_FALSE(test, port->pcs_c45);
+	KUNIT_EXPECT_PTR_EQ(test, port->pcs_bus, ctx->bus);
+	KUNIT_EXPECT_EQ(test, port->pcs_addr, 0);
+
+	/* Module seated, PCS down: solid orange, whatever the other bits say. */
+	ctx->bmsr[0] = SFP_LED_TEST_BMSR;
+	ctx->bmsr[1] = SFP_LED_TEST_BMSR;
+	sfp_led_test_poll_port(ctx, port);
+	KUNIT_EXPECT_EQ(test, port->link_led->brightness, LED_OFF);
+	KUNIT_EXPECT_EQ(test, port->activity_led->brightness, (enum led_brightness)1);
+
+	/* Up again after a drop: the first read returns the latched low. */
+	ctx->bmsr[1] = SFP_LED_TEST_BMSR | BMSR_LSTATUS;
+	sfp_led_test_poll_port(ctx, port);
+	KUNIT_EXPECT_EQ(test, ctx->bmsr_reads, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->pcs_reads, 0U);
+	KUNIT_EXPECT_EQ(test, port->link_led->brightness, (enum led_brightness)1);
+	KUNIT_EXPECT_EQ(test, port->activity_led->brightness, LED_OFF);
+
+	/* Dropped between the two reads: the second, live one decides. */
+	ctx->bmsr[0] = SFP_LED_TEST_BMSR | BMSR_LSTATUS;
+	ctx->bmsr[1] = SFP_LED_TEST_BMSR;
+	sfp_led_test_poll_port(ctx, port);
+	KUNIT_EXPECT_EQ(test, port->link_led->brightness, LED_OFF);
+	KUNIT_EXPECT_EQ(test, port->activity_led->brightness, (enum led_brightness)1);
+
+	/* An XGMII port on the same PCS still reads clause 45 only. */
+	ctx->pcs_status[0] = MDIO_STAT1_LSTATUS;
+	ctx->pcs_status[1] = MDIO_STAT1_LSTATUS;
+	sfp_led_test_poll_once(ctx);
+	KUNIT_EXPECT_TRUE(test, ctx->port.last_link);
+	KUNIT_EXPECT_EQ(test, ctx->pcs_reads, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->bmsr_reads, 0U);
+}
+
+static void sfp_led_test_1000basex_pcs_errors(struct kunit *test)
+{
+	struct sfp_led_test *ctx = test->priv;
+	static const struct {
+		int first, second, link;
+		unsigned int reads;
+	} cases[] = {
+		{ SFP_LED_TEST_BMSR, SFP_LED_TEST_BMSR | BMSR_LSTATUS, 1, 2 },
+		{ SFP_LED_TEST_BMSR | BMSR_LSTATUS, SFP_LED_TEST_BMSR, 0, 2 },
+		{ -EIO, BMSR_LSTATUS, -EIO, 1 },
+		{ BMSR_LSTATUS, -ETIMEDOUT, -ETIMEDOUT, 2 },
+		{ 0xffff, BMSR_LSTATUS, -ENODEV, 1 },
+		{ BMSR_LSTATUS, 0xffff, -ENODEV, 2 },
+	};
+	struct sfp_led_port *port;
+	unsigned int i;
+
+	port = sfp_led_test_bind_port(test, "/controller/port3");
+	KUNIT_ASSERT_NOT_NULL(test, port);
+	cancel_delayed_work_sync(&port->poll_work);
+	ctx->pcs_reads = 0;
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		ctx->bmsr_reads = 0;
+		ctx->bmsr[0] = cases[i].first;
+		ctx->bmsr[1] = cases[i].second;
+		KUNIT_EXPECT_EQ(test, sfp_led_pcs_link(port), cases[i].link);
+		KUNIT_EXPECT_EQ(test, ctx->bmsr_reads, cases[i].reads);
+	}
+	KUNIT_EXPECT_EQ(test, ctx->pcs_reads, 0U);
+}
+
 static void sfp_led_test_presence_recovery(struct kunit *test)
 {
 	struct sfp_led_test *ctx = test->priv;
@@ -494,9 +801,7 @@ static void sfp_led_test_unregister(struct kunit *test)
 	ctx->pcs_status[1] = MDIO_STAT1_LSTATUS;
 	sfp_led_test_poll_once(ctx);
 	KUNIT_EXPECT_EQ(test, netdev_refcnt_read(ctx->netdev), refs);
-	unregister_netdev(ctx->netdev);
-	free_netdev(ctx->netdev);
-	ctx->netdev = NULL;
+	sfp_led_test_put_netdev(&ctx->netdev);
 	sfp_led_test_poll_once(ctx);
 	KUNIT_EXPECT_FALSE(test, ctx->port.last_link);
 	KUNIT_EXPECT_EQ(test, ctx->pcs_reads, 0U);
@@ -574,6 +879,97 @@ static void sfp_led_test_sfp_unbound(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, label);
 	if (!IS_ERR(label))
 		kfree(label);
+}
+
+/* Unbound, the port no longer samples its cage at all. */
+static void sfp_led_test_expect_idle(struct kunit *test)
+{
+	struct sfp_led_test *ctx = test->priv;
+	unsigned int reads = READ_ONCE(ctx->line_reads[1]);
+
+	msleep(3 * SFP_LED_POLL_INTERVAL_MS);
+	KUNIT_EXPECT_EQ(test, READ_ONCE(ctx->line_reads[1]), reads);
+}
+
+/*
+ * Unbinding the sfp driver releases MOD_DEF0, which clears its active-low
+ * flag and frees it for anyone, so a port still polling it would show
+ * presence inverted. The port is linked to the sfp device: the unbind takes
+ * the port down first, and binding the sfp driver again probes it again.
+ */
+static void sfp_led_test_sfp_rebind(struct kunit *test)
+{
+	struct sfp_led_test *ctx = test->priv;
+	struct sfp_led_port *port;
+	struct device *dev;
+	char *label;
+
+	port = sfp_led_test_bind_port(test, "/controller/port3");
+	KUNIT_ASSERT_NOT_NULL(test, port);
+	dev = &ctx->bound->dev;
+	KUNIT_EXPECT_PTR_EQ(test, port->present, platform_get_drvdata(ctx->sfp_1g));
+	KUNIT_EXPECT_FALSE(test, port->present_owned);
+
+	ctx->watched = dev;
+	device_release_driver(&ctx->sfp_1g->dev);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->unbound, &ctx->sfp_1g->dev);
+	KUNIT_EXPECT_FALSE(test, ctx->watched_bound);
+	KUNIT_EXPECT_FALSE(test, device_is_bound(dev));
+	/* The port kept no hold on the line its owner has now released. */
+	label = gpiochip_dup_line_label(&ctx->gc, 1);
+	KUNIT_EXPECT_NULL(test, label);
+	if (!IS_ERR(label))
+		kfree(label);
+	sfp_led_test_expect_idle(test);
+
+	KUNIT_ASSERT_EQ(test, device_attach(&ctx->sfp_1g->dev), 1);
+	wait_for_device_probe();
+	KUNIT_ASSERT_TRUE(test, device_is_bound(dev));
+	port = dev_get_drvdata(dev);
+	KUNIT_EXPECT_PTR_EQ(test, port->present, platform_get_drvdata(ctx->sfp_1g));
+	KUNIT_EXPECT_FALSE(test, port->present_owned);
+	/* Borrowed from the new owner, the line reads the seated module. */
+	KUNIT_EXPECT_EQ(test, gpiod_get_value_cansleep(port->present), 1);
+}
+
+/*
+ * Unbinding the LED provider frees the led_classdevs, which a gotten LED does
+ * not pin. The port is linked to the provider: the unbind takes the port down
+ * first, whose removal puts its LEDs out while they still exist, and binding
+ * the provider again probes the port again with the new LEDs.
+ */
+static void sfp_led_test_led_provider_rebind(struct kunit *test)
+{
+	struct sfp_led_test *ctx = test->priv;
+	struct sfp_led_test_leds *leds;
+	struct sfp_led_port *port;
+	struct device *dev;
+
+	port = sfp_led_test_bind_port(test, "/controller/port3");
+	KUNIT_ASSERT_NOT_NULL(test, port);
+	dev = &ctx->bound->dev;
+	leds = platform_get_drvdata(ctx->leds);
+	KUNIT_EXPECT_PTR_EQ(test, port->link_led, &leds->link);
+	KUNIT_EXPECT_PTR_EQ(test, port->activity_led, &leds->activity);
+	/* Module seated without link: solid orange, and the port keeps polling. */
+	flush_delayed_work(&port->poll_work);
+	KUNIT_EXPECT_EQ(test, leds->activity.brightness, (enum led_brightness)1);
+
+	ctx->watched = dev;
+	device_release_driver(&ctx->leds->dev);
+	KUNIT_EXPECT_PTR_EQ(test, ctx->unbound, &ctx->leds->dev);
+	KUNIT_EXPECT_FALSE(test, ctx->watched_bound);
+	KUNIT_EXPECT_FALSE(test, ctx->watched_lit);
+	KUNIT_EXPECT_FALSE(test, device_is_bound(dev));
+	sfp_led_test_expect_idle(test);
+
+	KUNIT_ASSERT_EQ(test, device_attach(&ctx->leds->dev), 1);
+	wait_for_device_probe();
+	KUNIT_ASSERT_TRUE(test, device_is_bound(dev));
+	port = dev_get_drvdata(dev);
+	leds = platform_get_drvdata(ctx->leds);
+	KUNIT_EXPECT_PTR_EQ(test, port->link_led, &leds->link);
+	KUNIT_EXPECT_PTR_EQ(test, port->activity_led, &leds->activity);
 }
 
 static void sfp_led_test_deferred_led(struct kunit *test)
@@ -659,6 +1055,8 @@ static void sfp_led_test_populate(struct kunit *test)
 static struct kunit_case sfp_led_test_cases[] = {
 	KUNIT_CASE(sfp_led_test_link_and_activity),
 	KUNIT_CASE(sfp_led_test_pcs_errors),
+	KUNIT_CASE(sfp_led_test_1000basex_link),
+	KUNIT_CASE(sfp_led_test_1000basex_pcs_errors),
 	KUNIT_CASE(sfp_led_test_presence_recovery),
 	KUNIT_CASE(sfp_led_test_admin_down),
 	KUNIT_CASE(sfp_led_test_rtnl_held),
@@ -666,6 +1064,8 @@ static struct kunit_case sfp_led_test_cases[] = {
 	KUNIT_CASE(sfp_led_test_user_trigger),
 	KUNIT_CASE(sfp_led_test_shared_gpio),
 	KUNIT_CASE(sfp_led_test_sfp_unbound),
+	KUNIT_CASE(sfp_led_test_sfp_rebind),
+	KUNIT_CASE(sfp_led_test_led_provider_rebind),
 	KUNIT_CASE(sfp_led_test_deferred_led),
 	KUNIT_CASE(sfp_led_test_deferred_gpio),
 	KUNIT_CASE(sfp_led_test_deferred_mdio),

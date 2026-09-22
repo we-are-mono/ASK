@@ -3,12 +3,13 @@
  * Mono SFP port LED controller for the DPAA SDK fixed-link configuration.
  *
  * Module presence comes from the cage's MOD_DEF0 line and link state from
- * the MAC's XFI PCS, for both optical modules and DACs. Nothing here goes
+ * the MAC's PCS, for both optical modules and DACs. Nothing here goes
  * near i2c, deliberately: a module caught mid-transfer by a reset holds SDA
  * low until it loses power, and a port whose module has done that must
  * still light its LEDs -- as must its neighbour, which shares the bus.
- * The monitor does not configure the PCS or interact with the SFP state
- * machine.
+ * What a port does wait for is the sfp driver binding to its cage, which
+ * needs the cage's i2c adapter to exist, though not to work. The monitor
+ * does not configure the PCS or interact with the SFP state machine.
  *
  * No module: both LEDs off. Module without link: solid orange. Link up:
  * green on, orange blinking on changes to the netdev packet counters.
@@ -19,8 +20,12 @@
  * "mod-def0-gpios", borrowed non-exclusively from the sfp driver that owns
  * the line and never released by the borrower (see sfp_led_get_port()).
  * The associated fsl,fman-memac node references the same SFP and
- * identifies the XFI PCS through "pcs-handle" and "pcs-handle-names". No
- * module diagnostic support is required.
+ * identifies its PCS through the "xfi" entry of "pcs-handle" and
+ * "pcs-handle-names". A 10G MAC's PCS answers at one MDIO address whichever
+ * mode the SerDes runs it in -- the base dtsi points "sgmii" and "xfi" at
+ * the same node -- so that entry serves a MAC switched to 1000base-x too,
+ * read through clause 22 instead of clause 45. No module diagnostic support
+ * is required.
  *
  * Copyright 2026 Mono Technologies Inc.
  * Author: Tomaz Zaman <tomaz@mono.si>
@@ -30,6 +35,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/leds.h>
 #include <linux/mdio.h>
+#include <linux/mii.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/of.h>
@@ -49,6 +55,8 @@ struct sfp_led_port {
 	bool present_owned;
 	struct mii_bus *pcs_bus;
 	int pcs_addr;
+	/* Clause 45 MDIO_STAT1 for XFI, clause 22 BMSR for 1000BASE-X. */
+	bool pcs_c45;
 	struct led_classdev *link_led;
 	struct led_classdev *activity_led;
 	struct delayed_work poll_work;
@@ -116,20 +124,29 @@ static bool sfp_led_module_present(struct sfp_led_port *port)
 	return gpiod_get_value_cansleep(port->present) > 0;
 }
 
+/* Called with the bus lock held. */
+static int sfp_led_pcs_status(struct sfp_led_port *port)
+{
+	if (port->pcs_c45)
+		return __mdiobus_c45_read(port->pcs_bus, port->pcs_addr,
+					  MDIO_MMD_PCS, MDIO_STAT1);
+
+	return __mdiobus_read(port->pcs_bus, port->pcs_addr, MII_BMSR);
+}
+
 static int sfp_led_pcs_link(struct sfp_led_port *port)
 {
 	int status;
 
 	/*
-	 * Read twice to clear the latched-low link indication. Keep both reads
-	 * under the bus lock so another MDIO user cannot consume the latch.
+	 * Read twice to clear the latched-low link indication, which both
+	 * status registers carry. Keep both reads under the bus lock so
+	 * another MDIO user cannot consume the latch.
 	 */
 	mutex_lock(&port->pcs_bus->mdio_lock);
-	status = __mdiobus_c45_read(port->pcs_bus, port->pcs_addr,
-				    MDIO_MMD_PCS, MDIO_STAT1);
+	status = sfp_led_pcs_status(port);
 	if (status >= 0 && status != 0xffff)
-		status = __mdiobus_c45_read(port->pcs_bus, port->pcs_addr,
-					    MDIO_MMD_PCS, MDIO_STAT1);
+		status = sfp_led_pcs_status(port);
 	mutex_unlock(&port->pcs_bus->mdio_lock);
 
 	if (status < 0)
@@ -138,7 +155,10 @@ static int sfp_led_pcs_link(struct sfp_led_port *port)
 	if (status == 0xffff)
 		return -ENODEV;
 
-	return !!(status & MDIO_STAT1_LSTATUS);
+	if (port->pcs_c45)
+		return !!(status & MDIO_STAT1_LSTATUS);
+
+	return !!(status & BMSR_LSTATUS);
 }
 
 static void sfp_led_update(struct sfp_led_port *port, bool present, bool link,
@@ -229,9 +249,19 @@ static int sfp_led_get_pcs(struct device *dev, struct sfp_led_port *port)
 	ret = of_get_phy_mode(port->mac_np, &interface);
 	if (ret)
 		return ret;
-	if (interface != PHY_INTERFACE_MODE_XGMII &&
-	    interface != PHY_INTERFACE_MODE_10GBASER)
+
+	/* U-Boot switches the MAC to 1000base-x when the RCW runs its lane at 1G. */
+	switch (interface) {
+	case PHY_INTERFACE_MODE_XGMII:
+	case PHY_INTERFACE_MODE_10GBASER:
+		port->pcs_c45 = true;
+		break;
+	case PHY_INTERFACE_MODE_1000BASEX:
+		port->pcs_c45 = false;
+		break;
+	default:
 		return -EOPNOTSUPP;
+	}
 
 	index = of_property_match_string(port->mac_np, "pcs-handle-names", "xfi");
 	if (index < 0)
@@ -251,7 +281,7 @@ static int sfp_led_get_pcs(struct device *dev, struct sfp_led_port *port)
 	/*
 	 * The SDK DT may describe the PCS as a PHY even though it has no
 	 * clause 22 PHY ID. Resolve its bus and address without requiring a
-	 * PHY driver to bind, and use only clause 45 status reads.
+	 * PHY driver to bind, and read only its status register.
 	 */
 	bus_np = of_get_parent(pcs_np);
 	if (!of_device_is_available(bus_np)) {
@@ -274,11 +304,25 @@ put_pcs:
 	return ret;
 }
 
+/*
+ * A gotten LED holds its class device and its driver's module, but not the
+ * led_classdev, which the provider frees when it unbinds. Link the port to the
+ * provider, so that unbinding it unbinds the port first.
+ */
+static int sfp_led_link_provider(struct device *dev, struct led_classdev *led)
+{
+	if (!led)
+		return 0;
+
+	return device_link_add(dev, led->dev->parent,
+			       DL_FLAG_AUTOPROBE_CONSUMER) ? 0 : -EINVAL;
+}
+
 static int sfp_led_get_port(struct device *dev, struct sfp_led_port *port)
 {
 	struct platform_device *sfp_pdev;
+	struct device_link *linked;
 	struct device_node *sfp_np;
-	bool bound;
 	int ret;
 
 	sfp_np = of_parse_phandle(dev->of_node, "sfp", 0);
@@ -306,10 +350,22 @@ static int sfp_led_get_port(struct device *dev, struct sfp_led_port *port)
 		ret = -EPROBE_DEFER;
 		goto put_sfp;
 	}
-	bound = device_is_bound(&sfp_pdev->dev);
-	put_device(&sfp_pdev->dev);
-	if (!bound) {
+	if (!device_is_bound(&sfp_pdev->dev)) {
+		put_device(&sfp_pdev->dev);
 		ret = -EPROBE_DEFER;
+		goto put_sfp;
+	}
+
+	/*
+	 * The borrowed line lives only as long as the sfp driver holds it:
+	 * releasing it clears its active-low flag and frees it for anyone. Link
+	 * the port to the sfp device, so that unbinding the sfp driver unbinds
+	 * the port first and binding it again probes the port again.
+	 */
+	linked = device_link_add(dev, &sfp_pdev->dev, DL_FLAG_AUTOPROBE_CONSUMER);
+	put_device(&sfp_pdev->dev);
+	if (!linked) {
+		ret = -EINVAL;
 		goto put_sfp;
 	}
 
@@ -348,12 +404,16 @@ static int sfp_led_get_port(struct device *dev, struct sfp_led_port *port)
 		port->link_led = NULL;
 		goto put_sfp;
 	}
+	ret = sfp_led_link_provider(dev, port->link_led);
+	if (ret)
+		goto put_sfp;
+
 	port->activity_led = devm_of_led_get_optional(dev, 1);
 	if (IS_ERR(port->activity_led)) {
 		ret = PTR_ERR(port->activity_led);
 		port->activity_led = NULL;
 	} else {
-		ret = 0;
+		ret = sfp_led_link_provider(dev, port->activity_led);
 	}
 
 put_sfp:
