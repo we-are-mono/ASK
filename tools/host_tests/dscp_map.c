@@ -60,6 +60,7 @@ typedef int mutex_t;
 #define DEFINE_MUTEX(x) mutex_t x
 static void mutex_lock(mutex_t *m) { assert(!*m); *m = 1; }
 static void mutex_unlock(mutex_t *m) { assert(*m); *m = 0; }
+#define lockdep_assert_held(m) assert(*(m))
 
 static unsigned allocations;
 static void *kzalloc(size_t n, int f) { (void)f; allocations++; return calloc(1, n); }
@@ -204,6 +205,16 @@ static int del(unsigned long cookie)
 
 int main(void)
 {
+    /* Provider shutdown visits every slot, including ports which have never
+     * had a DSCP filter or an HTB tree. Cleanup must also be repeatable. */
+    for (unsigned pass = 0; pass < 2; pass++)
+        for (unsigned i = 0; i < ARRAY_SIZE(gQMCtx); i++) {
+            cdx_dscp_port_gone(&gQMCtx[i]);
+            for (unsigned dscp = 0; dscp < 64; dscp++)
+                assert(cdx_dscp_class(&gQMCtx[i], dscp) == 0);
+        }
+    cdx_dscp_port_gone(NULL);
+
     dev.priv.qm_ctx = &gQMCtx[3];
     memset(&hw, 0, sizeof(hw));
     for (unsigned i = 0; i < 64; i++) hw.fq[i] = -1;
@@ -337,6 +348,37 @@ int main(void)
     assert(add(7, &r) == 0);
     assert(del(7) == 0);
     assert(!hw.on);
+
+    /* Context teardown owns the hardware map; DSCP cleanup must release
+     * populated software state without programming a disappearing context. */
+    assert(add(8, &r) == 0);
+    r = dscp_rule(10, 0x00010020);
+    assert(add(9, &r) == 0);
+    assert(allocations == 2);
+    unsigned disabled = hw.disabled;
+    cdx_dscp_port_gone(&gQMCtx[3]);
+    cdx_dscp_port_gone(&gQMCtx[3]);
+    assert(!allocations && hw.disabled == disabled);
+    for (unsigned dscp = 0; dscp < 64; dscp++)
+        assert(cdx_dscp_class(&gQMCtx[3], dscp) == 0);
+    ceetm_enable_disable_dscp_fq_map(&gQMCtx[3], 0);
+
+    /* Reusing the slot must not dereference the previous device, whose
+     * CEETM attachment no longer exists. */
+    struct net_device replacement = { .priv.qm_ctx = &gQMCtx[3] };
+    dev.priv.qm_ctx = NULL;
+    struct flow_cls_offload f = { .common.extack = &ack,
+        .command = FLOW_CLS_REPLACE, .cookie = 10, .rule = &r };
+    r.match.dissector = &r.dis;
+    assert(cdx_dscp_flower(&replacement, &f) == 0);
+    assert(hw.on && cdx_dscp_class(&gQMCtx[3], 10) == ((1 << 4) | 3));
+    cdx_dscp_tree_changed(&replacement);
+    f.command = FLOW_CLS_DESTROY;
+    assert(cdx_dscp_flower(&replacement, &f) == 0);
+    assert(!hw.on);
+    for (unsigned pass = 0; pass < 2; pass++)
+        for (unsigned i = 0; i < ARRAY_SIZE(gQMCtx); i++)
+            cdx_dscp_port_gone(&gQMCtx[i]);
 
     assert(!allocations);
     puts("DSCP map: codepoint parse, class resolution, tree tracking and teardown passed");

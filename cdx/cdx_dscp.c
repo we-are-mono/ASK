@@ -110,6 +110,7 @@ static struct cdx_dscp_port *cdx_dscp_port_of(struct net_device *dev)
 	struct dpa_priv_s *priv = netdev_priv(dev);
 	struct cdx_dscp_port *port = cdx_dscp_entry(priv->qm_ctx);
 
+	lockdep_assert_held(&cdx_dscp_mutex);
 	if (port && !port->dev) {
 		INIT_LIST_HEAD(&port->filters);
 		port->dev = dev;
@@ -295,13 +296,13 @@ static int cdx_dscp_action(struct flow_cls_offload *f, u32 *classid)
 static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 {
 	struct netlink_ext_ack *extack = f->common.extack;
-	struct cdx_dscp_port *port = cdx_dscp_port_of(dev);
+	struct cdx_dscp_port *port;
 	struct cdx_dscp_filter *filter, *existing;
 	u32 classid;
 	u8 dscp;
 	int rc;
 
-	if (!port)
+	if (!cdx_dscp_entry(cdx_dscp_qm_ctx(dev)))
 		return -EOPNOTSUPP;
 	rc = cdx_dscp_parse(f, &dscp);
 	if (rc)
@@ -318,6 +319,11 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 	filter->dscp = dscp;
 
 	mutex_lock(&cdx_dscp_mutex);
+	port = cdx_dscp_port_of(dev);
+	if (!port) {
+		rc = -EOPNOTSUPP;
+		goto out;
+	}
 	/* Two filters on one DSCP would each be the whole of that codepoint's
 	 * answer, and the second to be programmed would win with nothing
 	 * saying so. tc keeps both, so this has to refuse the second. */
@@ -359,12 +365,15 @@ out:
 
 static int cdx_dscp_destroy(struct net_device *dev, struct flow_cls_offload *f)
 {
-	struct cdx_dscp_port *port = cdx_dscp_port_of(dev);
+	struct cdx_dscp_port *port;
 	struct cdx_dscp_filter *filter;
 
-	if (!port)
-		return -EOPNOTSUPP;
 	mutex_lock(&cdx_dscp_mutex);
+	port = cdx_dscp_port_of(dev);
+	if (!port) {
+		mutex_unlock(&cdx_dscp_mutex);
+		return -EOPNOTSUPP;
+	}
 	filter = cdx_dscp_find(port, f->cookie);
 	if (filter) {
 		ceetm_dscp_fq_unmap(cdx_dscp_qm_ctx(dev), filter->dscp);
@@ -386,15 +395,17 @@ static int cdx_dscp_destroy(struct net_device *dev, struct flow_cls_offload *f)
 
 void cdx_dscp_tree_changed(struct net_device *dev)
 {
-	struct cdx_dscp_port *port = cdx_dscp_port_of(dev);
+	struct cdx_dscp_port *port;
 	struct cdx_dscp_filter *filter;
 
-	if (!port)
-		return;
 	mutex_lock(&cdx_dscp_mutex);
+	port = cdx_dscp_port_of(dev);
+	if (!port)
+		goto out;
 	list_for_each_entry(filter, &port->filters, list)
 		cdx_dscp_program(dev, filter, NULL);
 	cdx_dscp_publish(port);
+out:
 	mutex_unlock(&cdx_dscp_mutex);
 }
 
@@ -406,6 +417,10 @@ void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
 	if (!port)
 		return;
 	mutex_lock(&cdx_dscp_mutex);
+	/* Shutdown visits every slot, including ones never used by a filter
+	 * or qdisc. Only a bound slot has an initialized filter list. */
+	if (!port->dev)
+		goto out;
 	/* The caller is releasing the CEETM context, so the map goes with it
 	 * and only the bookkeeping is ours. */
 	list_for_each_entry_safe(filter, next, &port->filters, list) {
@@ -414,6 +429,9 @@ void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
 	}
 	port->enabled = false;
 	cdx_dscp_publish(port);
+	/* The context slot may next belong to a different netdevice. */
+	port->dev = NULL;
+out:
 	mutex_unlock(&cdx_dscp_mutex);
 }
 
