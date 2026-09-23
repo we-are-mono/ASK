@@ -35,6 +35,7 @@ import json
 import os
 import re
 import socket
+import statistics
 import struct
 import time
 
@@ -53,6 +54,7 @@ from test_flowtable_offload import (ARTIFACTS, TABLE, WAN_IP, command, console_c
 PORT = int(os.environ.get("ASK_FLOWTABLE_QOS_PORT", "49300"))
 PORT_SHAPED = PORT
 PORT_HIGH, PORT_LOW = PORT + 1, PORT + 2
+PORT_BULK, PORT_PROBE = PORT + 3, PORT + 4
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -78,6 +80,25 @@ IPERF_SECONDS = 8
 # second or two of a transfer; rates are sampled after them.
 SETTLE = 2.5
 WINDOW = 4.0
+
+# The WRED case reads queue occupancy as the extra round trip a probe waits
+# behind it, so it shapes lower than the rest: at 500 Mbit/s a full 128-frame
+# queue is 3 ms and a band a few tens of kilobytes wide a fraction of one, which
+# a probe resolves cleanly. That is still several times what the CPU forwards,
+# so the bulk flow's rate remains proof it was in hardware.
+WRED_MBIT = int(os.environ.get("ASK_FLOWTABLE_QOS_WRED_MBIT", "500"))
+# (min, max) in bytes: a narrow band, and a wider one wholly above it.
+WRED_BANDS = {"narrow": (8000, 24000), "wide": (40000, 100000)}
+# The tail-drop threshold under RED, far above either band: a curve that did
+# not drop until its tail would show as a queue this deep.
+WRED_LIMIT = 400000
+WRED_PROBABILITY = "0.1"
+# A leaf's class queue with no RED qdisc on it tail-drops at this many frames
+# (CDX_HTB_CQ_DEPTH).
+TAIL_FRAMES = 128
+TCP_FRAME, TCP_PAYLOAD = 1514, 1448
+# Scheduling noise in a round trip between two Python processes.
+PROBE_SLACK = 0.15e-3
 
 LAN_BASE = "/tmp/ask_flowtable_qos"
 ECHO = f"{LAN_BASE}_echo.py"
@@ -222,6 +243,47 @@ def lockstep(destination, port, count, *, tos=0, payload_size=256, timeout=1.0):
     finally:
         sock.close()
     return echoed
+
+
+def probe(destination, seconds, *, interval=0.01, timeout=0.25):
+    """Round trips of a small datagram to the LAN VM's echo, one at a time.
+
+    The probe's flow is marked into the same class as the traffic under test,
+    so its request waits behind whatever that class queue holds, and the round
+    trip it adds over an idle one is the queue's depth in time. A probe the
+    queue dropped is counted, not waited for.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((WAN_IP, PORT_PROBE))
+    rtts, lost, sent = [], 0, 0
+    end = time.monotonic() + seconds
+    try:
+        while time.monotonic() < end:
+            payload = struct.pack("!Q", sent) + b"ASK-qos-probe"
+            sent += 1
+            started = time.perf_counter()
+            sock.sendto(payload, (destination, PORT_PROBE))
+            while True:
+                left = started + timeout - time.perf_counter()
+                if left <= 0:
+                    lost += 1
+                    break
+                sock.settimeout(left)
+                try:
+                    data = sock.recv(2048)
+                except TimeoutError:
+                    lost += 1
+                    break
+                if data == payload:
+                    rtts.append(time.perf_counter() - started)
+                    break
+            pause = started + interval - time.perf_counter()
+            if pause > 0:
+                time.sleep(pause)
+    finally:
+        sock.close()
+    return {"rtts": rtts, "lost": lost, "sent": sent}
 
 
 # ---- reading the DUT ------------------------------------------------------
@@ -557,3 +619,94 @@ async def test_flowtable_qos_strict_priority_keeps_its_rate(qos):
     expected_low = (cap - high_shaped) / charge
     assert 0.85 * expected_low <= received_bps(low) <= 1.05 * expected_low, (
         received_bps(low), expected_low)
+
+
+async def test_flowtable_qos_wred_drops_before_the_tail(qos):
+    """A RED qdisc on a leaf is that class queue's WRED curve, and the curve is
+    what drops -- not the tail.
+
+    An offloaded bulk TCP transfer saturates the class; a probe flow marked into
+    the same class queue measures how deep the queue sits, as the round trip it
+    adds over an idle one. Three phases on one class:
+
+      - a narrow band: the queue holds within it, far below the tail threshold
+        the same qdisc sets, so drops began at the curve;
+      - a wider band wholly above the first: the queue rises with it, so where
+        drops begin follows the configured threshold rather than a fixed one;
+      - no RED at all: the queue fills to the tail-drop depth, which is the
+        proof the probe can see this queue in the first place. Without it the
+        first two would pass for a probe that bypassed the class entirely.
+
+    Each phase's leaf rejections have to move: they are the drops the curve
+    made, and the only counter that sees them for an offloaded flow.
+    """
+    r = qos
+    rate = WRED_MBIT * 1e6
+    mark = r.mark(HIGH_CQ)
+    await tree(r, TARGET_LAN_IF, WRED_MBIT, [("1:10", HIGH_PRIO)])
+    await offload(r, inbound(r, "tcp", PORT_BULK, mark), inbound(r, "udp", PORT_PROBE, mark))
+    await lan_start(r, iperf=[PORT_BULK], echo=[PORT_PROBE])
+    probe_target = f"{r.lan_ip}:{PORT_PROBE}"
+    deadline = time.monotonic() + 20
+    while True:
+        await asyncio.to_thread(probe, r.lan_ip, 0.5)
+        rows = directions(await r.state(), ingress=TARGET_WAN_IF, proto=17, dst=probe_target)
+        if rows:
+            break
+        assert time.monotonic() < deadline, "the probe flow was never admitted"
+    assert int(rows[0]["qos"], 16) == HIGH_CQ, rows
+    idle = await asyncio.to_thread(probe, r.lan_ip, 1.5)
+    base = statistics.median(idle["rtts"])
+
+    async def loaded():
+        before = await egress(r, TARGET_LAN_IF)
+        bulk = asyncio.create_task(iperf(r, PORT_BULK, seconds=6, streams=4))
+        try:
+            await asyncio.sleep(2.0)
+            sample = await asyncio.to_thread(probe, r.lan_ip, 3.0)
+            state = await r.state()
+            report = await bulk
+        finally:
+            if not bulk.done():
+                bulk.cancel()
+                await asyncio.gather(bulk, return_exceptions=True)
+        after = await egress(r, TARGET_LAN_IF)
+        return {"added": statistics.median(sample["rtts"]) - base,
+                "received": len(sample["rtts"]), "lost": sample["lost"],
+                "leaf": leaf_delta(before, after, 0),
+                "goodput": report["end"]["sum_received"]["bits_per_second"],
+                "rows": directions(state, ingress=TARGET_WAN_IF, proto=6,
+                                   dst=f"{r.lan_ip}:{PORT_BULK}")}
+
+    phases = {}
+    for name, (low, high) in WRED_BANDS.items():
+        # tc wants the averaging burst at least min/avpkt; the hardware curve
+        # works on the instantaneous count and ignores it.
+        burst = (2 * low + high) // (3 * 1500) + 1
+        await r.tc("qdisc", "add", "dev", TARGET_LAN_IF, "parent", "1:10", "handle", "10:",
+                   "red", "limit", str(WRED_LIMIT), "min", str(low), "max", str(high),
+                   "avpkt", "1500", "burst", str(burst), "probability", WRED_PROBABILITY,
+                   "bandwidth", f"{WRED_MBIT}mbit")
+        phases[name] = await loaded()
+        await r.tc("qdisc", "del", "dev", TARGET_LAN_IF, "parent", "1:10", "handle", "10:")
+    phases["tail"] = await loaded()
+    r.record("qos-wred", {"base": base, "idle": idle, "phases": phases})
+
+    def delay(size):
+        return size * 8 / rate
+
+    for name, phase in phases.items():
+        assert phase["leaf"]["rejected"] > 0, (name, phase["leaf"])
+        assert phase["received"] >= 100, (name, phase["received"], phase["lost"])
+        assert phase["goodput"] >= 0.8 * rate * TCP_PAYLOAD / (TCP_FRAME + OAL), (
+            name, phase["goodput"])
+        assert len(phase["rows"]) >= 4, (name, phase["rows"])
+        assert all(int(f["qos"], 16) == HIGH_CQ for f in phase["rows"]), (name, phase["rows"])
+    narrow, wide, tail = phases["narrow"], phases["wide"], phases["tail"]
+    assert tail["added"] >= 0.4 * delay(TAIL_FRAMES * (TCP_FRAME + OAL)), (
+        "the probe does not wait behind the class queue, so nothing below says "
+        "anything about it", tail)
+    assert narrow["added"] <= 1.3 * delay(WRED_BANDS["narrow"][1]) + PROBE_SLACK, narrow
+    assert wide["added"] <= 1.3 * delay(WRED_BANDS["wide"][1]) + PROBE_SLACK, wide
+    assert wide["added"] >= 0.5 * delay(WRED_BANDS["wide"][0]), wide
+    assert narrow["added"] < wide["added"] < tail["added"], phases
