@@ -145,7 +145,8 @@ static struct proc_dir_entry *mc_hcsync_fail_proc;
 #endif /* CDX_DEBUG_MC_HCSYNC_FAIL */
 
 /* Single funnel for every FMAN host-command barrier this file issues by
- * hand - i.e. the one that follows the open-coded listener splice.
+ * hand - i.e. the ones that follow a listener splice: the legacy REMOVE's
+ * open-coded unlink, and cdx_mc_group_replace()'s chain swap.
  * Barriers issued inside the shared ehash helpers (DeleteKey's internal
  * sync, cdx_ehash_quarantine_drain()) are not routed through here and
  * are not affected by this file's knob.
@@ -172,12 +173,13 @@ static int mc_hcsync(void *td)
  * be strictly worse. cdx_ehash_quarantine_entry() / _free_all() /
  * _drain() / _abandon() are the entry points; the rationale and the
  * lock discipline are documented there. Mcast semantics are unchanged:
- * the listener splice below still parks on a failed barrier and still
- * reclaims on the next successful one.
+ * a listener splice still parks on a failed barrier and still reclaims
+ * on the next successful one.
  *
- * Note the drain barrier is issued by the shared helper, i.e. it is not
- * routed through mc_hcsync() and the knob below cannot force it to
- * fail. */
+ * Note the reclaim drain a mutator opens with is issued by the shared
+ * helper, i.e. it is not routed through mc_hcsync() and the knob below
+ * cannot force it to fail - so an armed knob never stops a backlog from
+ * being released. */
 
 #ifdef CDX_DEBUG_MC_HCSYNC_FAIL
 static int mc_hcsync_fail_show(struct seq_file *m, void *v)
@@ -2533,10 +2535,19 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
 			if (old[ii].bIsValidEntry)
 				cdx_ehash_quarantine_entry(old[ii].tbl_entry);
 	}
-	/* And drain what was just parked. The chain is unlinked and the
-	 * barrier proves the microcode is done with it, so the backlog settles
-	 * at zero rather than growing by a chain per channel change. */
-	cdx_ehash_quarantine_drain(grp->pCtEntry->ct->td);
+	/* And the barrier proving the microcode has left the chain just
+	 * unlinked, which releases it and anything parked before it, so the
+	 * backlog settles at zero rather than growing by a chain per channel
+	 * change. This is the listener splice this interface performs, so its
+	 * barrier goes through mc_hcsync() like the legacy REMOVE's does: a
+	 * failure leaves the displaced chain parked for the next barrier on this
+	 * PCD, and the test image can make one fail on demand. */
+	if (mc_hcsync(grp->pCtEntry->ct->td)) {
+		DPA_ERROR("%s::FmPcdHcSync failed, %u entries still quarantined\n",
+			  __func__, cdx_ehash_quarantine_pending());
+	} else {
+		cdx_ehash_quarantine_free_all();
+	}
 	mutex_unlock(&mc_mutators_mutex);
 	kfree(fresh);
 	return 0;

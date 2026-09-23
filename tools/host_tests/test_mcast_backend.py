@@ -171,11 +171,18 @@ def test_replace_drains_what_it_parks():
     insert, not just multicast.
     """
     body = code("cdx_mc_group_replace")
-    assert body.count("cdx_ehash_quarantine_drain(") == 2, (
-        "replace must reclaim before parking and drain what it parked")
-    assert body.index("cdx_ehash_quarantine_entry(") < body.rindex(
-        "cdx_ehash_quarantine_drain("), (
-        "the drain that settles the backlog must follow the parking")
+    park = body.index("cdx_ehash_quarantine_entry(")
+    assert body.count("cdx_ehash_quarantine_drain(") == 1 and \
+        body.index("cdx_ehash_quarantine_drain(") < park, "replace must reclaim before parking"
+    # The splice's own barrier, through the file's funnel so the test image
+    # can fail it, and only its success may release what it parked.
+    barrier = body.index("mc_hcsync(", park)
+    assert body.index("cdx_ehash_quarantine_free_all()", barrier) > barrier, (
+        "the barrier that settles the backlog must follow the parking")
+    # DPA_ERROR is a braced block, so the arms carry braces of their own.
+    assert re.search(r"if \(mc_hcsync\([^)]*\)\)\s*\{\s*DPA_ERROR\([^;]*;\s*\}\s*else\s*\{\s*"
+                     r"cdx_ehash_quarantine_free_all\(\);\s*\}", body[park:]), (
+        "a failed barrier must leave the displaced chain parked")
 
 
 def test_a_group_is_keyed_on_its_device_not_its_name():
