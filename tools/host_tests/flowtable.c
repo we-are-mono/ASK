@@ -368,6 +368,15 @@ static __be16 vlan_dev_vlan_proto(const struct net_device *d) { return d->vlan_p
 #define dev_net(d) ((d)->net ? (d)->net : &init_net)
 struct netdev_notifier_info { struct net_device *dev; };
 #define netdev_notifier_info_to_dev(p) (((struct netdev_notifier_info *)(p))->dev)
+/* What NETDEV_CHANGEUPPER carries, leading with the common info as the
+ * kernel's does. */
+struct netdev_notifier_changeupper_info {
+    struct netdev_notifier_info info;
+    struct net_device *upper_dev;
+    bool master;
+    bool linking;
+    void *upper_info;
+};
 /* The switchdev chains the bridge reports FDB and VLAN-membership changes on.
  * Both notifier info structs lead with the common one, which is what makes
  * switchdev_notifier_info_to_dev() work on either. */
@@ -433,8 +442,14 @@ static void ft_mc_device_gone(struct net_device *dev, bool unregistering)
 }
 static void ft_mc_kick_all(void) { mc_rechecks++; }
 static unsigned mc_bridge_changes, mc_ports_moved;
+static struct net_device *mc_port_left;
 static void ft_mc_bridge_changed(struct net_device *dev) { (void)dev; mc_bridge_changes++; }
-static void ft_mc_port_moved(struct net_device *dev) { (void)dev; mc_ports_moved++; }
+static void ft_mc_port_moved(struct net_device *dev, struct net_device *left)
+{
+    (void)dev;
+    mc_ports_moved++;
+    mc_port_left = left;
+}
 /* The routed learner has its own file and its own harness
  * (mroute_learner.c); here the chains' calls into it only count. The two
  * multicast families the FIB chain carries are ipmr's and ip6mr's, and this
@@ -6106,7 +6121,8 @@ static void drop_dev_records(void)
 
 static void device_event(struct net_device *dev, unsigned long event, bool invalid)
 {
-    struct netdev_notifier_info info = { .dev = dev };
+    /* The largest info any event here carries; the common one leads it. */
+    struct netdev_notifier_changeupper_info info = { .info.dev = dev };
     ft_invalid = 0; /* Isolate selection of each event without running work. */
     assert(ft_netdev_event(NULL, event, &info) == NOTIFY_DONE);
     assert(ft_invalid == invalid && !cdx_info->ctrl.mutex && !ft_watch_lock);
@@ -6126,6 +6142,21 @@ static void test_device_dependencies(void)
      * as well: a flow's ingress may have left its bridge, which nothing else
      * reports. Unregistration reaches it by its own way. */
     assert(mc_ports_moved == moved + 1);
+    /* Leaving names the bridge left, whose memberships of the port go with
+     * it; joining names none. */
+    {
+        struct net_device bridge = { .ifindex = 90 };
+        struct netdev_notifier_changeupper_info up = {
+            .info.dev = &in, .upper_dev = &bridge, .master = true,
+        };
+
+        assert(ft_netdev_event(NULL, NETDEV_CHANGEUPPER, &up) == NOTIFY_DONE);
+        assert(mc_ports_moved == moved + 2 && mc_port_left == &bridge);
+        up.linking = true;
+        assert(ft_netdev_event(NULL, NETDEV_CHANGEUPPER, &up) == NOTIFY_DONE);
+        assert(mc_ports_moved == moved + 3 && !mc_port_left);
+        assert(!ft_invalid);
+    }
     assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
     for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
         device_event(&in, events[i], true); /* Empty binding still matters. */

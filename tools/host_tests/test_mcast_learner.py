@@ -576,7 +576,13 @@ def test_the_learner_lets_go_of_a_device_that_went_away():
     assert "ft_mc_device_gone(dev, true);" in unregister[:unregister.index("break;")]
     assert netdev.count("ft_mc_device_gone(") == 2
     upper = netdev[netdev.index("case NETDEV_CHANGEUPPER:"):]
-    assert "ft_mc_port_moved(dev);" in upper[:upper.index("break;")]
+    upper = upper[:upper.index("break;")]
+    # With the bridge it left, when it left one: the deferred deletes of its
+    # memberships arrive once it may be another bridge's port.
+    assert re.search(r"ft_mc_port_moved\(dev, upper->linking \? NULL :\s+upper->upper_dev\);",
+                     upper)
+    moved = function(source, "ft_mc_port_moved")
+    assert "ft_mc_group_drop(g, dev)" in moved and "g->bridge == left" in moved
 
     gone = function(source, "ft_mc_device_gone")
     assert gone.index("if (!unregistering) {") < gone.index("ft_mc_drop_port(dev)"), \

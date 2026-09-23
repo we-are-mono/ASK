@@ -3961,7 +3961,7 @@ static void ft_wifi_address_changed(struct net_device *dev);
 /* Defined with the multicast learners below, because they belong with that
  * state rather than with the chains they are reached from. */
 static void ft_mc_device_gone(struct net_device *dev, bool unregistering);
-static void ft_mc_port_moved(struct net_device *dev);
+static void ft_mc_port_moved(struct net_device *dev, struct net_device *left);
 static void ft_mr_device_gone(struct net_device *dev);
 static void ft_mc_kick_all(void);
 static void ft_mr_kick(void);
@@ -4101,9 +4101,14 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		fallthrough;
 	case NETDEV_CHANGEUPPER:
 		/* A port joining or leaving a bridge, which no switchdev event
-		 * reports for a multicast flow's ingress. */
-		if (event == NETDEV_CHANGEUPPER)
-			ft_mc_port_moved(dev);
+		 * reports for a multicast flow's ingress; and when leaving,
+		 * the bridge it left. */
+		if (event == NETDEV_CHANGEUPPER) {
+			struct netdev_notifier_changeupper_info *upper = ptr;
+
+			ft_mc_port_moved(dev, upper->linking ? NULL :
+					      upper->upper_dev);
+		}
 		/* A device paths only cross gaining or losing an upper changes
 		 * those paths and nothing any flow names; retire them the same
 		 * way. Anywhere else an upper change may change what a port or
@@ -7287,18 +7292,34 @@ static void ft_mc_bridge_changed(struct net_device *dev)
 		schedule_work(&ft_mc_work);
 }
 
-/* A device changed its master: a port joined or left a bridge. A flow keyed on
- * a port that left is over, and one copying to it loses that copy, but the
- * bridge says neither -- the port's memberships are flushed after it is
- * unlinked, and nothing at all is said about an ingress -- so every flow
- * naming the device is asked of the bridge again, which answers both.
- * Called from the netdev chain under RTNL. */
-static void ft_mc_port_moved(struct net_device *dev)
+/* A device changed its master: a port joined or left a bridge -- `left`, when
+ * it is one it left. A flow keyed on a port that left is over, and one copying
+ * to it loses that copy, but the bridge says neither -- the port's memberships
+ * are flushed after it is unlinked, and nothing at all is said about an
+ * ingress -- so every flow naming the device is asked of the bridge again,
+ * which answers both.
+ *
+ * The memberships themselves go here too, from the bridge the port left.
+ * del_nbp() flushes every port group the port had, but defers the deletes,
+ * and a port moved straight to another bridge is that bridge's port by the
+ * time they arrive: the MDB handler, which finds a membership through the
+ * port's master, would look on the wrong bridge and leave the old one holding
+ * the port for good. What is dropped here is exactly what that flush deletes,
+ * and its deletes then find nothing. Called from the netdev chain under
+ * RTNL. */
+static void ft_mc_port_moved(struct net_device *dev, struct net_device *left)
 {
+	struct ft_mc_group *g;
 	struct ft_mc_flow *f;
 	bool marked = false;
 
 	mutex_lock(&ft_mc_lock);
+	if (left && netif_is_bridge_master(left))
+		list_for_each_entry(g, &ft_mc_groups, list)
+			if (g->bridge == left && ft_mc_group_drop(g, dev)) {
+				ft_mc_touch(g->bridge, &g->addr);
+				marked = true;
+			}
 	list_for_each_entry(f, &ft_mc_flows, list) {
 		if (!ft_mc_flow_names_dev(f, dev))
 			continue;

@@ -590,7 +590,10 @@ then reads `refused-failed` until the bridge's answer for the flow changes.
 memberships come from the MDB and are retired by it, and a flow nothing names
 any more goes with them; its copies and its ingress port are netdev
 dependencies, retired when the device goes away or its ingress leaves the
-bridge. A link merely going down retires nothing: the bridge keeps a
+bridge. A port leaving a bridge takes its memberships there with it at once:
+the bridge flushes them with deletes it defers, and a port moved straight to
+another bridge is that bridge's by the time they arrive, where they would
+find nothing to delete. A link merely going down retires nothing: the bridge keeps a
 permanent membership across it and never announces it again, so the flows
 naming the port are asked again instead, and the bridge's answer leaves a
 port that is not forwarding out. Everything the bridge decides its ports

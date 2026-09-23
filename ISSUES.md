@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A270.** A port moved straight to another bridge kept its memberships, a reference and a listener, on the bridge it left —
+  fixed (_:/^flowtable: drop a port's memberships on the bridge it leaves_).
+
 - [x] **A269.** On NETDEV_UNREGISTER the multicast learners released a group's ingress before the worker deleted the entry that unsubscribes through it —
   fixed (_:/^flowtable: hold a multicast entry's ingress until the entry is deleted_).
 

@@ -1729,10 +1729,10 @@ static void devices_and_bridges_change(void)
     f->dirty = h->dirty = false;
     ft_mc_bridge_changed(&BR2);
     assert(!f->dirty && !h->dirty);
-    ft_mc_port_moved(&P2);              /* a copy of both */
+    ft_mc_port_moved(&P2, NULL);        /* a copy of both */
     assert(f->dirty && h->dirty);
     f->dirty = h->dirty = false;
-    ft_mc_port_moved(&P3);              /* only a route's copy: the route's to say */
+    ft_mc_port_moved(&P3, NULL);        /* only a route's copy: the route's to say */
     assert(!f->dirty && !h->dirty);
 
     /* ---- a device a flow, a route or a tap names goes away ------------- */
@@ -1892,6 +1892,64 @@ static void replayed_memberships(void)
     port_group.group = group_v4(0xfb0000e0, 0, 0);   /* 224.0.0.251 */
     assert(!ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &on_p2));
     assert(!ft_mc_find(&BR, &port_group.group));
+}
+
+static void a_port_moves_between_bridges(void)
+{
+    const uint32_t G = 0x170007ef, S = 0x0100000a;
+    struct switchdev_obj_port_mdb port_group;
+    struct switchdev_notifier_port_obj_info on_p2;
+    struct br_ip any = group_v4(G, 0, 0);
+    struct ft_mc_group *g;
+    struct ft_mc_flow *f;
+    unsigned before;
+
+    /* `ip link set eth4 master br1` with eth4 a port of br0: del_nbp()
+     * unlinks it from br0, then flushes its port groups with deletes that
+     * are deferred, and the port is br1's before they arrive. The handler
+     * finds a membership through the port's master, so those deletes look
+     * on br1. The memberships go when the port leaves br0 instead -- the
+     * same ones the flush deletes -- and the flows copying to it are asked
+     * again. */
+    reset();
+    memset(&port_group, 0, sizeof(port_group));
+    port_group.obj.id = SWITCHDEV_OBJ_ID_PORT_MDB;
+    port_group.obj.orig_dev = &P2;
+    port_group.group = any;
+    on_p2 = (struct switchdev_notifier_port_obj_info){ .info.dev = &P2, .obj = &port_group.obj };
+    assert(ft_mc_swdev_obj(SWITCHDEV_PORT_OBJ_ADD, &on_p2));
+    assert(ft_mc_membership(&BR, &P3, &any, true, false));
+    answer(&P1, S, 0, 0, 2, &P2, &P3);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    g = ft_mc_find(&BR, &any);
+    assert(f && f->hw && g->ports == 2);
+    before = holds;
+    f->dirty = false;
+    /* Joining names no bridge left, and drops nothing. */
+    ft_mc_port_moved(&P2, NULL);
+    assert(g->ports == 2 && holds == before && f->dirty);
+    f->dirty = false;
+    /* Leaving a device that is not a bridge -- a VLAN upper -- neither. */
+    ft_mc_port_moved(&P2, &P1);
+    assert(g->ports == 2 && holds == before);
+    ft_mc_port_moved(&P2, &BR);
+    assert(g->ports == 1 && g->port[0] == &P3 && holds == before - 1 && f->dirty);
+    /* The deferred delete, arriving with the port now br1's, finds nothing
+     * and releases nothing. */
+    P2.master = &BR2;
+    assert(!ft_mc_swdev_obj(SWITCHDEV_PORT_OBJ_DEL, &on_p2));
+    assert(g->ports == 1 && holds == before - 1);
+    answer(&P1, S, 0, 0, 1, &P3);
+    pass();
+    assert(f->ports == 1 && f->port[0].dev == &P3 && f->hw);
+    P2.master = &BR;
+    /* The last port leaving empties the membership, which retires with the
+     * flow it named. */
+    ft_mc_port_moved(&P3, &BR);
+    pass();
+    assert(!ft_mc_count && !ft_mc_flow_count && !holds);
 }
 
 static void idle_flows_age_out(void)
@@ -2066,6 +2124,7 @@ int main(void)
     devices_and_bridges_change();
     rows_speak_for_memberships();
     replayed_memberships();
+    a_port_moves_between_bridges();
     idle_flows_age_out();
 
     reset();
