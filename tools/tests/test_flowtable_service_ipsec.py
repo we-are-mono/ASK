@@ -12,9 +12,11 @@ import json
 import os
 import re
 import secrets
+import socket
 import struct
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -31,11 +33,23 @@ from test_flowtable_service import FIRST, managed_service, supervision_status
 from test_flowtable_service_vlan import attempts, balanced, denied, received
 from test_flowtable_tcp import software_tx
 from test_flowtable_tunnel import Capture
-from test_ipsec_inbound_flow_offload import crypto, sec_counter
+from test_ipsec_inbound_flow_offload import AUTH, CIPHER, sec_counter
 
 INNER = "198.18.102.2"
 LAN_INNER = "198.18.102.3"
 REQIDS = {"out": "49301", "in": "49302"}
+# Linux's UDP_ENCAP socket option and its ESP-in-UDP mode (linux/udp.h).
+UDP_ENCAP, UDP_ENCAP_ESPINUDP = 100, 2
+
+
+@dataclass(frozen=True)
+class Transform:
+    """The fixture's SA pair: the `ip xfrm state` algorithm arguments, and UDP
+    encapsulation as (DUT port, peer port), or None for bare ESP.
+
+    A test asks for another one by parametrizing `ipsec_service` indirectly."""
+    algorithms: tuple = ("enc", "cbc(aes)", CIPHER, "auth-trunc", "hmac(sha256)", AUTH, "128")
+    encap: tuple | None = None
 
 
 async def xfrm(r, agent, kind):
@@ -50,13 +64,22 @@ def owned_state(state):
 
 
 class SecurityAssociations:
-    def __init__(self, r, wan, outer):
+    def __init__(self, r, wan, outer, transform=Transform()):
         self.r, self.wan, self.outer = r, wan, outer
+        self.transform = transform
         self.active, self.cleanup = {}, []
 
     def state(self, direction, spi):
         src, dst = (self.outer, WAN_IP) if direction == "out" else (WAN_IP, self.outer)
         return ["src", src, "dst", dst, "proto", "esp", "spi", hex(spi)]
+
+    def crypto(self, direction):
+        encap = []
+        if self.transform.encap:
+            # The source port is the sending end's: the DUT's going out.
+            sport, dport = self.transform.encap if direction == "out" else self.transform.encap[::-1]
+            encap = ["encap", "espinudp", str(sport), str(dport), "0.0.0.0"]
+        return ["mode", "tunnel", "reqid", REQIDS[direction], *self.transform.algorithms, *encap]
 
     async def add(self, agent, kind, identity, *options, check=True):
         result = await command(agent, self.r.session, "ip", "xfrm", kind, "add", *identity, *options, check=check)
@@ -64,14 +87,21 @@ class SecurityAssociations:
             self.cleanup.append((agent, ["ip", "xfrm", kind, "delete", *identity]))
         return result
 
-    async def prepare_peer(self, direction):
+    async def prepare_peer(self, direction, *options):
         spi = 0xA9000000 | secrets.randbits(24)
-        await self.add(self.wan, "state", self.state(direction, spi), *crypto(REQIDS[direction]), "replay-window", "32")
+        await self.add(self.wan, "state", self.state(direction, spi), *self.crypto(direction),
+                       "replay-window", "32", *options)
         return spi
 
-    async def install(self, direction, spi, *, check=True):
+    async def install(self, direction, spi, *options, check=True):
+        # An inbound SA checks replays only with a window, and 0 turns the
+        # hardware's check off as it does software's. 32 is what strongSwan
+        # installs, so every case here runs with anti-replay on unless it
+        # names its own window.
+        if direction == "in" and "replay-window" not in options:
+            options = (*options, "replay-window", "32")
         result = await self.add(self.r.target, "state", self.state(direction, spi),
-                               *crypto(REQIDS[direction]), "offload", "packet", "dev", TARGET_WAN_IF,
+                               *self.crypto(direction), *options, "offload", "packet", "dev", TARGET_WAN_IF,
                                "dir", direction, check=check)
         if result["rc"] == 0:
             self.active[direction] = spi
@@ -90,12 +120,13 @@ class SecurityAssociations:
 
 
 @pytest_asyncio.fixture
-async def ipsec_service(rig):
+async def ipsec_service(rig, request):
     r = rig
+    transform = getattr(request, "param", Transform())
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
     outer = next(a["local"] for i in json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])
                  for a in i["addr_info"] if a["family"] == "inet")
-    r.ipsec = sa = SecurityAssociations(r, wan, outer)
+    r.ipsec = sa = SecurityAssociations(r, wan, outer, transform)
     # XFRM reinjects decrypted packets on the host's L3 interface. Capture
     # below a bridge so those copies cannot masquerade as plaintext on wire.
     members = Path('/sys/class/net', r.wan_if, 'brif')
@@ -105,7 +136,7 @@ async def ipsec_service(rig):
     if not r.ipsec_wire_if:
         assert len(physical) == 1, ('set ASK_WAN_WIRE_IF to the DUT-facing physical port', physical)
         r.ipsec_wire_if = physical[0]
-    transport, lan_created = None, False
+    transport, lan_created, encap = None, False, None
     cleanup = []
     for agent in (r.target, wan):
         assert not json.loads((await command(agent, r.session, "ip", "-j", "route", "show", "table", "all", "exact", INNER + "/32"))["stdout"])
@@ -134,6 +165,12 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
         ]:
             await command(agent, r.session, *args)
             cleanup.append((agent, undo))
+        if transform.encap:
+            # The peer's end of ESP-in-UDP: without an encapsulating socket on
+            # its port, this host treats the DUT's frames as plain UDP.
+            encap = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            encap.bind((WAN_IP, transform.encap[1]))
+            encap.setsockopt(socket.IPPROTO_UDP, UDP_ENCAP, UDP_ENCAP_ESPINUDP)
         for direction in ("out", "in"):
             spi = await sa.prepare_peer(direction)
             await sa.install(direction, spi)
@@ -155,6 +192,8 @@ subprocess.run(['ip','addr','add',{LAN_INNER + '/32'!r},'dev','lo'],check=True)
     finally:
         if transport:
             transport.close()
+        if encap:
+            encap.close()
         failures = []
         with Console.target(log_path=str(ARTIFACTS / "service-ipsec-cleanup-uart.log")) as con:
             await asyncio.to_thread(con.login, "root", None)
@@ -199,7 +238,10 @@ class Wire(Capture):
     def __init__(self, r, label):
         self.path = ARTIFACTS / (label + ".pcap")
         self.interface = r.ipsec_wire_if
-        self.filter = f"ether src {r.dut_wan_mac} and (ip proto 50 or (src host {LAN_INNER} and dst host {INNER}))"
+        esp = "ip proto 50"
+        if r.ipsec.transform.encap:
+            esp = f"(ip proto 50 or udp port {r.ipsec.transform.encap[0]})"
+        self.filter = f"ether src {r.dut_wan_mac} and ({esp} or (src host {LAN_INNER} and dst host {INNER}))"
 
     def check(self, *, encrypted=False, spi=None):
         from scapy.all import IP, ESP, rdpcap
