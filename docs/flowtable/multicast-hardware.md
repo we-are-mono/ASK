@@ -334,3 +334,45 @@ the replica's frame, not just its datagram, in both directions:
 
 Not established by these: MAC-variant capacity beyond one stream per
 membership, and bursty streams near the idle interval.
+
+## Routed copies in a bridged group
+
+A188 carries a stream that is both bridged and routed as one bridged group
+([design](multicast-routed.md#one-stream-both-learners)). Its root is the
+bridged one: MAC-keyed, validating the ingress tag, and preserving the hop
+count, because most of its copies are bridged. The routed copies therefore
+carry what a routed root would have done for them in their own listener
+entries:
+
+- `create_member_hop_hm()` emits `UPDATE_TTL` (IPv4) or `UPDATE_HOPLIMIT`
+  (IPv6) as the entry's first opcode, while the frame still starts at its IP
+  header — the root stripped Ethernet, and every insert after it moves the
+  start. The opcode's parameter word is the DSCP marking a flow's conntrack mark
+  can request; a replica has no mark, so it is written zero, which is what a
+  routed root with no mark writes.
+- The backend frames the copy as a router's: the egress port's address as the
+  source and the group's mapped address as the destination
+  (`cdx_mcast_group_mac()`), not the matched pair. `struct cdx_mc_listener`
+  says which copies are routed; `struct cdx_mc_member_frame` carries the
+  per-copy choice into the entry builder.
+
+**This is unproven on hardware and is the first thing to measure.** Every
+replica edit measured so far is a prepend: VLAN and Ethernet inserts, which the
+A158 run showed are private to each copy. An L3 edit in a member entry is new.
+The ASK guide describes zero-copy multicast, and nothing here establishes
+whether a replica's IP header is its own or shared with its siblings. If it is
+shared, a routed copy's decrement would reach the bridged copies too, or a
+second routed copy would decrement twice. The rig case
+`test_flowtable_service_multicast_bridge_and_route` is the discriminating
+test: the bridged copy must arrive with hop count 64 and the routed one with
+63, both whole, in one window. If it fails that way, the fallback is a refusal
+rather than a redesign — `ft_mc_carriable()` would refuse a group with both
+kinds of copy — and the entry falls back to what A188 replaced: the stream
+carried in software.
+
+Two smaller properties rest on existing behaviour rather than new measurement.
+A frame arriving with TTL 1 is bridged by Linux but not routed; the parser ends
+the parse for TTL 0 and 1 before any table is consulted, which is what makes a
+routed root's decrement safe, and a merged group depends on the same thing. And
+the counters folded into the MFC are the bridged root's, which counts each
+frame once however many copies it makes.

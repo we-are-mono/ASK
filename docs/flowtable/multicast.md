@@ -509,6 +509,18 @@ starved silently. This is a refusal rather than a gap to fill later only
 because filling it means a listener whose egress is the host's own receive
 queue, which nothing in the encoder expresses today.
 
+**The host as a router.** A bridge that is a multicast router — `mcast_router
+2`, or a querier heard from the host itself — hands every group to the host as
+well, and where a VIF receives that bridge VLAN, ipmr routes it. Such a group
+is carried only together with the route that forwards its stream, as one group
+with both output lists; without one it is `refused-routed` and stays in
+software, where ipmr sees it and a routing daemon learns its source. See
+[one stream, both learners](multicast-routed.md#one-stream-both-learners). A
+group a route names is kept even with no member port left, and a route with no
+membership to learn its stream through gets a group of its own, in the `(*,G)`
+form a later join fills. The `/proc` row lists the route's copies as
+`routed=`, beside the bridge's own `ports=`.
+
 **A group must be resolved to be installed, and installation is not
 retroactive.** An MDB entry with no observed source is a pending permission and
 occupies no hardware. This is the one place the contract admits a state the
@@ -787,13 +799,13 @@ threshold 1 into the default table and needs nothing from ASK.
   `call_ipmr_mfc_entry_notifiers()` on family `RTNL_FAMILY_IPMR`, and the
   adapter was already on that chain; `ft_fib_event()` used to drop those events
   at its `AF_INET`/`AF_INET6` filter and now hands them to `ft_mr_fib_event()`.
-  Of the three things this bullet said needed deciding, two are settled: the
-  two learners share one hardware key namespace through a register
-  (`ft_mc_claim_take()`), and whoever takes an address pair first carries it
-  while the other reports `refused-contested`; and they share the eight-listener
-  budget per group because each group is its own. The third — merging the two
-  output lists for a group that is both bridged and routed — is still open and
-  is in `ISSUES.md`.
+  All three things this bullet said needed deciding are settled. The two
+  learners do not share a key: a routed root's port is never a bridge port and
+  a bridged root's always is, in tables of their own. A group that is both
+  bridged and routed is one hardware group carrying both output lists, owned
+  by this learner, each learner keeping its own listeners within the one
+  eight-listener budget — see
+  [one stream, both learners](multicast-routed.md#one-stream-both-learners).
 
 - **The idle timer's period is unmeasured.** A source that stops sending leaves
   an entry matching nothing. Too short and a bursty stream is retired between

@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 
+from test_pppoe_hm import declaration
 from test_qos_lifecycle import function
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -13,14 +14,28 @@ SOURCE = ROOT / "cdx/ask_flowtable.c"
 
 def test_mcast_learner(tmp_path):
     source = SOURCE.read_text()
+    backend = (ROOT / "cdx/cdx_mcast_backend.h").read_text()
+    counters = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
+    taps = source.index("#define FT_MC_TAPS")
+    state = source.index("static LIST_HEAD(ft_mc_routes);")
     # The real group and port descriptions, not restatements: a field added or
     # resized on either has to fail here rather than compile into a harness
     # that no longer matches what the adapter keeps.
     (tmp_path / "mcast_learner.inc").write_text(
+        # What a group is installed from, and what a route contributes to
+        # one, as the backend and the adapter declare them.
+        declaration(backend, "cdx_mc_listener")
+        + declaration(backend, "cdx_mc_group_spec")
+        + declaration(counters, "cdx_ft_counters")
+        + source[source.index("struct ft_mc_route {"):
+                 source.index("\n", taps) + 1]
         # From the member bound rather than from the struct, so the harness
         # gets FT_MC_MAX_MEMBERS without restating it.
-        source[source.index("#define FT_MC_MAX_MEMBERS"):
-               source.index("static LIST_HEAD(ft_mc_groups)")]
+        + source[source.index("#define FT_MC_MAX_MEMBERS"):
+                 source.index("static LIST_HEAD(ft_mc_groups)")]
+        # The published routes and taps, the state they are kept in.
+        + source[state:source.index("\n", source.index(
+            "static bool ft_mc_taps_overflow", state)) + 1]
         # The observation the hook records, declared further down with the
         # traffic half rather than with the group it resolves against.
         + source[source.index("struct ft_mc_seen {"):
@@ -38,6 +53,7 @@ def test_mcast_learner(tmp_path):
           "static void ft_mc_group_free(struct ft_mc_group *g);\n"
         + "static bool ft_mc_carriable(const struct ft_mc_group *g);\n"
         + "\n".join(function(source, name) for name in [
+            "ft_mc_family",
             "ft_mc_same_group",
             "ft_mc_find",
             "ft_mc_carriable",
@@ -55,6 +71,28 @@ def test_mcast_learner(tmp_path):
             "ft_mc_resolve",
             "ft_mc_adopt_next",
             "ft_mc_revalidate",
+            # The two learners' shared streams: what the routed learner
+            # publishes, how a group finds its route, what it is installed
+            # as, when it is retired, and what the route is told back.
+            "ft_mc_route_same",
+            "ft_mc_route_clear",
+            "ft_mc_route_publish",
+            "ft_mc_route_withdraw",
+            "ft_mc_route_state",
+            "ft_mc_taps_publish",
+            "ft_mc_via_receives",
+            "ft_mc_route_names",
+            "ft_mc_tapped",
+            "ft_mc_anchor_routes",
+            "ft_mc_match_group",
+            "ft_mc_live_route",
+            "ft_mc_match_routes",
+            "ft_mc_installable",
+            "ft_mc_group_spec",
+            "ft_mc_retire",
+            "ft_mc_route_feedback",
+            "ft_mc_state",
+            "ft_mc_device_gone",
         ]))
     binary = tmp_path / "mcast_learner"
     subprocess.run([
@@ -193,8 +231,9 @@ def test_a_group_the_hardware_cannot_serve_whole_is_not_served_at_all():
     assert "uncarried" in carriable
 
     worker = function(source, "ft_mc_work_fn")
-    assert worker.count("ft_mc_carriable(") == 2, (
+    assert worker.count("ft_mc_installable(") == 2, (
         "both the pick and the spec build must ask")
+    assert "ft_mc_carriable(g)" in function(source, "ft_mc_installable")
     assert "ft_mc_carriable(g)" in function(source, "ft_mc_state"), (
         "/proc must name the reason")
     # The MDB answer must not claim a group that will never install.
@@ -215,17 +254,20 @@ def test_a_group_that_would_fragment_stays_in_software():
     """
     source = SOURCE.read_text()
     worker = function(source, "ft_mc_work_fn")
-    assert worker.count("ft_mc_mtu_bounded(") == 2, (
+    assert worker.count("ft_mc_installable(") == 2, (
         "both the pick and the spec build must ask")
+    assert "ft_mc_mtu_bounded(g)" in function(source, "ft_mc_installable")
     assert "ft_mc_mtu_bounded(g)" in function(source, "ft_mc_state")
     assert '"refused-mtu"' in function(source, "ft_mc_state")
     netdev = function(source, "ft_netdev_event")
     changemtu = netdev[netdev.index("case NETDEV_CHANGEMTU:"):]
     changemtu = changemtu[:changemtu.index("break;")]
     assert "ft_mc_kick_all();" in changemtu and "ft_mr_kick();" in changemtu
-    # And the kick that reaches installed groups is a different one from the
-    # recheck a handed-back key causes, which leaves them alone.
-    assert "g->hw && !all" in worker
+    # And the recheck it causes reaches installed groups too, which a
+    # membership event never would.
+    recheck = worker[worker.index("if (READ_ONCE(ft_mc_recheck))"):]
+    recheck = recheck[:recheck.index("mutex_unlock(&ft_mc_lock);")]
+    assert "g->dirty = true;" in recheck and "g->hw" not in recheck
 
 
 def test_the_vid_follows_the_bridge_rather_than_the_port():

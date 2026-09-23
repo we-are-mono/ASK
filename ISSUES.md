@@ -166,19 +166,6 @@ result independently of those temporary files.
   auto_bridge. Remove what the flowtable path does not use, with host-test
   coverage for the shared machinery the handlers sit beside.
 
-- [ ] **A188 — a group that is both bridged and routed is carried once, not
-  merged.** The classifier keeps one group id and one root entry per address
-  pair, so the two multicast learners share a key namespace and coordinate
-  through `ft_mc_claim_take()`: whoever takes an `(S,G)` first carries it and
-  the other reports `refused-contested` and stays in software. That is correct
-  — no listener is silently dropped — but not optimal, because the right answer
-  for an IPTV VLAN that is bridged to some ports and routed to others is one
-  hardware group carrying the union of both listener sets. Merging means
-  deciding which learner owns the retirement of a listener the other
-  contributed, and neither keeps the state for that today; it also has to fit
-  both sets inside `CDX_MC_MAX_LISTENERS`. Deferred rather than guessed at.
-  See the [routed multicast design](docs/flowtable/multicast-routed.md).
-
 - [ ] **A139.** DPAA slow-path packet loss during a simultaneous restart of
   16,384 connections. **Investigated (2026-09-15), deferred at user request:**
   outside the CMM-retirement work; no fix or tuning retained. On the KASAN
@@ -263,6 +250,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A188.** A group both bridged and routed was carried by whichever learner claimed it first, leaving the other half in software —
+  fixed (_:/^cdx: carry a stream both bridged and routed as one hardware group_).
 
 - [x] **A191.** Bridged multicast rewrote the source MAC to the egress port's and sent tagged ingress to the CPU —
   fixed (_:/^cdx: bridge multicast with the sender's MAC and its ingress tag_).

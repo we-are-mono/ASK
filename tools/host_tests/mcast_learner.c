@@ -26,20 +26,26 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
-/* The address union conntrack and the rule share. Only the two arms the
- * learner names are needed; the shape has to match so a group's key compares
- * the way the production one does. */
+struct in6_addr { unsigned char s6_addr[16]; };
+
+/* The address union conntrack and the rule share. Only the arms the learner
+ * names are needed; the shape has to match so a group's key compares the way
+ * the production one does. */
 union nf_inet_addr {
     u32 all[4];
     u32 ip;
     u32 ip6[4];
+    struct in6_addr in6;
 };
 
 #define ETH_ALEN 6
 #define ETH_P_8021Q 0x8100
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86DD
+#define AF_INET 2
+#define AF_INET6 10
 #define BRIDGE_VLAN_INFO_UNTAGGED (1 << 2)
+#define BRIDGE_VLAN_INFO_BRENTRY (1 << 5)
 #define CDX_FT_VLAN_MAX 2
 #define CDX_MC_MAX_LISTENERS 8
 #define EOPNOTSUPP 95
@@ -59,6 +65,8 @@ struct net_device {
     bool physical;
     bool bridge_master;
     unsigned int mtu;
+    /* A bridge that is a multicast router hands every group to the host. */
+    bool mrouter;
 };
 
 #define READ_ONCE(x) (x)
@@ -66,8 +74,8 @@ struct net_device {
 struct cdx_ft_vlan { uint16_t proto; uint16_t id; };
 
 struct br_ip {
-    union { uint32_t ip4; unsigned char ip6[16]; } src;
-    union { uint32_t ip4; unsigned char ip6[16]; } dst;
+    union { uint32_t ip4; struct in6_addr ip6; } src;
+    union { uint32_t ip4; struct in6_addr ip6; } dst;
     uint16_t proto;
     uint16_t vid;
 };
@@ -82,10 +90,19 @@ static void list_add(struct list_head *e, struct list_head *h)
 {
     e->next = h->next; e->prev = h; h->next->prev = e; h->next = e;
 }
+static void list_add_tail(struct list_head *e, struct list_head *h)
+{
+    e->next = h; e->prev = h->prev; h->prev->next = e; h->prev = e;
+}
 static void list_del(struct list_head *e)
 {
     e->prev->next = e->next; e->next->prev = e->prev;
     e->next = e->prev = e;
+}
+static void list_move(struct list_head *e, struct list_head *h)
+{
+    list_del(e);
+    list_add(e, h);
 }
 #define list_entry(ptr, type, member) \
     ((type *)((char *)(ptr) - offsetof(type, member)))
@@ -93,6 +110,11 @@ static void list_del(struct list_head *e)
     for (pos = list_entry((head)->next, __typeof__(*pos), member); \
          &pos->member != (head); \
          pos = list_entry(pos->member.next, __typeof__(*pos), member))
+#define list_for_each_entry_safe(pos, n, head, member) \
+    for (pos = list_entry((head)->next, __typeof__(*pos), member), \
+         n = list_entry(pos->member.next, __typeof__(*pos), member); \
+         &pos->member != (head); \
+         pos = n, n = list_entry(n->member.next, __typeof__(*n), member))
 
 /* --- stubs ----------------------------------------------------------- */
 static LIST_HEAD(ft_mc_groups);
@@ -150,23 +172,52 @@ static int br_vlan_get_pvid(struct net_device *port, uint16_t *p)
     return -EOPNOTSUPP;
 }
 
-static bool br_vlan_enabled(struct net_device *br) { (void)br; return vlan_enabled; }
+static bool br_vlan_enabled(const struct net_device *br) { (void)br; return vlan_enabled; }
 static int br_vlan_get_proto(struct net_device *br, uint16_t *p)
 {
     (void)br; *p = vlan_proto; return 0;
 }
-static int br_vlan_get_info(struct net_device *port, uint16_t vid,
-                            struct bridge_vlan_info *info)
+/* A port's membership, or -- asked of the bridge itself -- the bridge's own,
+ * which the kernel marks as a bridge entry. */
+static int br_vlan_get_info_rcu(const struct net_device *dev, uint16_t vid,
+                                struct bridge_vlan_info *info)
 {
     for (unsigned i = 0; i < membership_count; i++)
-        if (memberships[i].port == port && memberships[i].vid == vid &&
+        if (memberships[i].port == dev && memberships[i].vid == vid &&
             memberships[i].member) {
             info->vid = vid;
             info->flags = memberships[i].untagged ? BRIDGE_VLAN_INFO_UNTAGGED : 0;
+            if (dev->bridge_master)
+                info->flags |= BRIDGE_VLAN_INFO_BRENTRY;
             return 0;
         }
     return -EOPNOTSUPP;
 }
+static int br_vlan_get_info(struct net_device *port, uint16_t vid,
+                            struct bridge_vlan_info *info)
+{
+    return br_vlan_get_info_rcu(port, vid, info);
+}
+static int br_vlan_get_pvid_rcu(const struct net_device *dev, uint16_t *p)
+{
+    return br_vlan_get_pvid((struct net_device *)dev, p);
+}
+static bool br_multicast_router(const struct net_device *br) { return br->mrouter; }
+#define rcu_read_lock() ((void)0)
+#define rcu_read_unlock() ((void)0)
+
+/* The learner's own locks and worker, as far as the functions compiled here
+ * reach them: taken, never nested, and a worker that only counts wakes. */
+static int ft_mc_lock;
+static bool ft_mc_stopping;
+static int ft_mc_work;
+static unsigned works;
+static void mutex_lock(int *m) { assert(!*m); *m = 1; }
+static void mutex_unlock(int *m) { assert(*m); *m = 0; }
+#define spin_lock_bh mutex_lock
+#define spin_unlock_bh mutex_unlock
+#define DEFINE_SPINLOCK(x) int x
+static void schedule_work(int *w) { (void)w; works++; }
 
 /* Whether any byte differs from c. The learner uses it to ask whether a
  * membership named a source at all, which is what tells (S,G) from (*,G). */
@@ -224,6 +275,12 @@ static void reset(void)
         list_del(&g->list);
         ft_mc_group_free(g);
     }
+    /* Routes belong to the routed learner, which withdraws them. */
+    while (ft_mc_routes.next != &ft_mc_routes)
+        ft_mc_route_withdraw(list_entry(ft_mc_routes.next,
+                                        struct ft_mc_route, list));
+    ft_mc_taps_publish(NULL, 0, false);
+    BR.mrouter = BR2.mrouter = false;
     ft_mc_count = 0;
     membership_count = 0;
     pvid_count = 0;
@@ -232,6 +289,45 @@ static void reset(void)
     ft_mc_refused = 0;
     assert(holds == 0);
 }
+
+/* A stream the traffic half would have resolved: untagged from `in`. */
+static void stream(struct ft_mc_group *g, struct net_device *in, uint32_t src)
+{
+    static const u8 group_mac[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x0f };
+    static const u8 sender[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x51 };
+
+    dev_hold(in);
+    g->in = in;
+    g->src.ip = src;
+    memcpy(g->dst_mac, group_mac, ETH_ALEN);
+    memcpy(g->src_mac, sender, ETH_ALEN);
+    g->in_tagged = false;
+}
+
+/* What the routed learner would publish for an MFC entry whose parent is the
+ * bridge's VLAN device br0.<vid>: one routed copy, out of `port` tagged. */
+static void route_want(struct ft_mc_route *want, uint16_t vid, uint32_t src,
+                       uint32_t dst, struct net_device *port, uint16_t tag)
+{
+    memset(want, 0, sizeof(*want));
+    want->bridge = &BR;
+    want->vid = vid;
+    want->tagged = true;
+    want->family = AF_INET;
+    want->src.ip = src;
+    want->dst.ip = dst;
+    want->listener[0].dev = port;
+    want->listener[0].routed = true;
+    if (tag) {
+        want->listener[0].vlans = 1;
+        want->listener[0].vlan[0].proto = htons(ETH_P_8021Q);
+        want->listener[0].vlan[0].id = tag;
+    }
+    want->listeners = 1;
+    want->mtu = 1500;
+}
+
+static bool list_empty(const struct list_head *h) { return h->next == h; }
 
 static struct ft_mc_group *only_group(void)
 {
@@ -245,6 +341,10 @@ int main(void)
 {
     struct br_ip g1 = group_v4(0x010007ef, 0, 0);   /* 239.7.0.1, (*,G) */
     struct br_ip g2 = group_v4(0x020007ef, 0, 0);
+
+    /* Until the routed learner first says where its VIFs are, they may be
+     * anywhere: a group on a multicast-router bridge waits for it. */
+    assert(ft_mc_taps_overflow);
 
     /* One port joins: the group appears, the adapter takes it on, and the
      * port is pinned. */
@@ -637,6 +737,34 @@ int main(void)
         assert(ft_mc_membership(&BR, &P1, &wildcard, true, false));
         assert(ft_mc_membership(&BR2, &P2, &sourced, true, false));
         assert(!ft_mc_key_contested(ft_mc_find(&BR, &wildcard)));
+
+        /* The same group in another VLAN of one bridge is another stream --
+         * the listeners of an IPTV VLAN and of the LAN it is routed into --
+         * and collides only once both are learned and keyed alike. */
+        reset();
+        {
+            struct br_ip iptv = group_v4(0x0b0007ef, 0, 289);
+            struct br_ip lan = group_v4(0x0b0007ef, 0, 286);
+            struct ft_mc_group *a, *b;
+
+            vlan_enabled = true;
+            member(&P2, 289, false);
+            member(&P3, 286, false);
+            assert(ft_mc_membership(&BR, &P2, &iptv, true, false));
+            assert(ft_mc_membership(&BR, &P3, &lan, true, false));
+            a = ft_mc_find(&BR, &iptv);
+            b = ft_mc_find(&BR, &lan);
+            assert(!ft_mc_key_contested(a) && !ft_mc_key_contested(b));
+            stream(a, &P1, 0x0100000a);
+            assert(!ft_mc_key_contested(a) && !ft_mc_key_contested(b));
+            /* A second source is a second key. */
+            stream(b, &P1, 0x0200000a);
+            assert(!ft_mc_key_contested(a) && !ft_mc_key_contested(b));
+            /* The same one on the same port is one key, two tags. */
+            b->src.ip = 0x0100000a;
+            assert(ft_mc_key_contested(a) && ft_mc_key_contested(b));
+            vlan_enabled = false;
+        }
     }
 
     /* ---- the stream a group is keyed on --------------------------------
@@ -827,6 +955,336 @@ int main(void)
         /* And dropping a port nothing lists is inert. */
         ft_mc_drop_port(&P3);
         assert(holds == 3);
+    }
+
+    /* ---- one stream, both learners ------------------------------------
+     *
+     * An IPTV VLAN bridged to a set-top box and routed to the rest of the
+     * house. The stream arrives on a bridge port; the bridge forwards it to
+     * the box and, as a multicast router, hands it to br0.289, where ipmr
+     * routes it out of another port. One classifier key, so one group: the
+     * box's copy and ipmr's, each owned by the learner that asked for it. */
+    reset();
+    {
+        const uint32_t S = 0x0100000a, G = 0x0f0007ef;
+        struct br_ip any = group_v4(G, 0, 289);
+        struct cdx_mc_group_spec spec;
+        struct ft_mc_route want, r1;
+        struct ft_mc_group *g;
+        LIST_HEAD(dead);
+
+        memset(&r1, 0, sizeof(r1));
+        vlan_enabled = true;
+        member(&BR, 289, false);    /* br0.289 receives the VLAN, tagged */
+        member(&P2, 289, false);    /* the set-top box */
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        g = ft_mc_find(&BR, &any);
+        stream(g, &P1, S);
+
+        /* The routed learner publishes its copy: out of eth5 on VLAN 287.
+         * The route pins what it names. */
+        route_want(&want, 289, S, G, &P3, 287);
+        {
+            unsigned before = holds;
+
+            assert(!ft_mc_route_publish(&r1, &want));
+            assert(r1.linked && holds == before + 2);
+        }
+
+        /* A bridge that is not a multicast router hands the host nothing it
+         * did not join, so Linux routes nothing and neither may the group:
+         * the route names it not. The group is the box's alone. */
+        ft_mc_match_routes();
+        assert(!g->route && !g->routed_host && !g->routes);
+        assert(ft_mc_installable(g));
+        ft_mc_group_spec(g, &spec);
+        assert(spec.listeners == 1 && !spec.listener[0].routed);
+
+        /* A router: one group, both sets. The bridged copy keeps the
+         * sender's pair and hop count; the routed one is marked for the
+         * backend to frame as a router's. */
+        BR.mrouter = true;
+        g->dirty = false;
+        ft_mc_match_routes();
+        assert(g->route == &r1 && g->routed_host && g->routes == 1 && g->dirty);
+        assert(ft_mc_installable(g));
+        ft_mc_group_spec(g, &spec);
+        assert(spec.bridged && spec.in == &P1 && spec.in_vlans == 0);
+        assert(spec.src.ip == S && spec.dst.ip == G);
+        assert(spec.listeners == 2);
+        assert(spec.listener[0].dev == &P2 && !spec.listener[0].routed);
+        assert(spec.listener[0].vlans == 1 && spec.listener[0].vlan[0].id == 289);
+        assert(spec.listener[1].dev == &P3 && spec.listener[1].routed);
+        assert(spec.listener[1].vlan[0].id == 287);
+        assert(!strcmp(ft_mc_state(g), "pending"));
+
+        /* Installed with it: the route hears so, once. */
+        g->hw = (struct cdx_mc_group *)1;
+        g->carried_route = g->route;
+        assert(ft_mc_route_feedback());
+        assert(!ft_mc_route_feedback());
+        {
+            struct cdx_ft_counters c;
+            u8 tags = 9;
+
+            assert(ft_mc_route_state(&r1, &c, &tags) && tags == 0);
+        }
+        assert(!strcmp(ft_mc_state(g), "installed"));
+        /* Publishing the same copies again is not news. */
+        works = 0;
+        g->dirty = false;
+        assert(ft_mc_route_publish(&r1, &want));
+        assert(!works && !g->dirty);
+        /* A changed copy set is, to the group carrying it. */
+        route_want(&want, 289, S, G, &P3, 286);
+        assert(ft_mc_route_publish(&r1, &want));
+        assert(works == 1 && g->dirty && r1.listener[0].vlan[0].id == 286);
+
+        /* What does not merge, with its reason. A routed copy framed
+         * exactly like the bridged one is two entries the backend would
+         * take for a duplicate. */
+        route_want(&want, 289, S, G, &P2, 289);
+        ft_mc_route_publish(&r1, &want);
+        assert(!ft_mc_carriable(g) && !ft_mc_installable(g));
+        assert(!strcmp(ft_mc_state(g), "refused-listener"));
+        /* The union has to fit one group. */
+        route_want(&want, 289, S, G, &P3, 1);
+        for (unsigned i = 1; i < CDX_MC_MAX_LISTENERS; i++) {
+            want.listener[i] = want.listener[0];
+            want.listener[i].vlan[0].id = 1 + i;
+        }
+        want.listeners = CDX_MC_MAX_LISTENERS;
+        ft_mc_route_publish(&r1, &want);
+        assert(!strcmp(ft_mc_state(g), "refused-listener"));
+        want.listeners = CDX_MC_MAX_LISTENERS - 1;
+        ft_mc_route_publish(&r1, &want);
+        assert(ft_mc_carriable(g));
+        /* And every copy has to fit what the ingress can deliver. */
+        route_want(&want, 289, S, G, &P3, 287);
+        want.mtu = 1400;
+        P1.mtu = 1500;
+        ft_mc_route_publish(&r1, &want);
+        assert(!ft_mc_mtu_bounded(g) && !strcmp(ft_mc_state(g), "refused-mtu"));
+        want.mtu = 1500;
+        ft_mc_route_publish(&r1, &want);
+        assert(ft_mc_mtu_bounded(g) && ft_mc_installable(g));
+        P1.mtu = 0;
+
+        /* The box leaves. The group is not retired: the route still names
+         * it, and the entry now carries the routed copy alone. */
+        assert(!ft_mc_membership(&BR, &P2, &any, false, false));
+        ft_mc_match_routes();
+        ft_mc_retire(&dead);
+        assert(list_empty(&dead) && g->ports == 0 && g->routes == 1);
+        assert(ft_mc_installable(g));
+        ft_mc_group_spec(g, &spec);
+        assert(spec.listeners == 1 && spec.listener[0].routed);
+        /* The box rejoins before the route goes: the same group again. */
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_find(&BR, &any) == g && g->ports == 1);
+        assert(!ft_mc_membership(&BR, &P2, &any, false, false));
+        /* The route goes too. Every pointer to it is cleared before its
+         * owner frees it, and with neither learner naming the group, it
+         * retires. */
+        ft_mc_route_withdraw(&r1);
+        assert(!r1.linked && !g->route && !g->carried_route && g->dirty);
+        assert(!r1.carried && !r1.listeners && !r1.bridge);
+        ft_mc_match_routes();
+        ft_mc_retire(&dead);
+        assert(!list_empty(&dead) && list_empty(&ft_mc_groups));
+        g = list_entry(dead.next, struct ft_mc_group, list);
+        list_del(&g->list);
+        ft_mc_group_free(g);
+        assert(holds == 0);
+
+        /* ---- the host's copy with no route to carry ------------------- *
+         *
+         * A VIF on br0.289 and no MFC entry for the stream: ipmr sees it
+         * and upcalls, which is how a routing daemon learns a source. The
+         * group stays in software until the route exists. */
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        g = ft_mc_find(&BR, &any);
+        stream(g, &P1, S);
+        {
+            struct ft_mc_tap tap = { &BR, 289, true, AF_INET };
+
+            ft_mc_taps_publish(&tap, 1, false);
+            assert(holds == 4);   /* bridge, box, ingress, the tap's bridge */
+        }
+        ft_mc_match_routes();
+        assert(g->routed_host && !g->route && !ft_mc_installable(g));
+        assert(!strcmp(ft_mc_state(g), "refused-routed"));
+        /* A route for another source is not this stream's. */
+        memset(&r1, 0, sizeof(r1));
+        route_want(&want, 289, 0x0200000a, G, &P3, 287);
+        ft_mc_route_publish(&r1, &want);
+        ft_mc_match_routes();
+        assert(!g->route && g->routes == 1 && !ft_mc_installable(g));
+        /* Its own is. */
+        route_want(&want, 289, S, G, &P3, 287);
+        ft_mc_route_publish(&r1, &want);
+        ft_mc_match_routes();
+        assert(g->route == &r1 && ft_mc_installable(g));
+        ft_mc_route_withdraw(&r1);
+        /* Not a router: the tap sees nothing, and the group is the box's. */
+        BR.mrouter = false;
+        ft_mc_match_routes();
+        assert(!g->routed_host && ft_mc_installable(g));
+        /* A table that ran out names every bridge VLAN. */
+        BR.mrouter = true;
+        ft_mc_taps_publish(NULL, 0, true);
+        ft_mc_match_routes();
+        assert(g->routed_host && !ft_mc_installable(g));
+        ft_mc_taps_publish(NULL, 0, false);
+        ft_mc_match_routes();
+        assert(!g->routed_host && ft_mc_installable(g));
+    }
+
+    /* ---- where a VIF on a bridge receives ------------------------------ */
+    reset();
+    {
+        vlan_enabled = true;
+        member(&BR, 289, false);
+        member(&BR, 1, true);
+        /* br0.289 receives VLAN 289, which the bridge carries tagged. */
+        assert(ft_mc_via_receives(&BR, 289, true, 289));
+        assert(!ft_mc_via_receives(&BR, 288, true, 289));
+        /* br0 itself receives every VLAN it carries untagged, and only
+         * those: a tagged one surfaces on its VLAN device instead. */
+        assert(ft_mc_via_receives(&BR, 0, false, 1));
+        assert(!ft_mc_via_receives(&BR, 0, false, 289));
+        assert(!ft_mc_via_receives(&BR, 1, true, 1));
+        /* The bridge not a member of the VLAN hands up nothing of it. */
+        assert(!ft_mc_via_receives(&BR, 0, false, 7));
+        assert(!ft_mc_via_receives(&BR, 7, true, 7));
+        /* A bridge that does not filter hands everything up untagged, on
+         * VLAN zero. */
+        vlan_enabled = false;
+        assert(ft_mc_via_receives(&BR, 0, false, 0));
+        assert(!ft_mc_via_receives(&BR, 289, true, 0));
+    }
+
+    /* ---- a route with no group to learn its stream through ------------- */
+    reset();
+    {
+        const uint32_t S = 0x0100000a, G = 0x100007ef;
+        struct br_ip any = group_v4(G, 0, 289);
+        struct ft_mc_route want, r1;
+        struct ft_mc_group *g;
+        LIST_HEAD(dead);
+
+        memset(&r1, 0, sizeof(r1));
+        vlan_enabled = true;
+        member(&BR, 289, false);
+        member(&P2, 289, false);
+        route_want(&want, 289, S, G, &P3, 287);
+        ft_mc_route_publish(&r1, &want);
+        /* Not a router: nothing is routed, and nothing is created. */
+        ft_mc_match_routes();
+        assert(list_empty(&ft_mc_groups));
+        /* A router: a group in the (*,G) form, with no member port, kept
+         * while the route names it and waiting for its stream. */
+        BR.mrouter = true;
+        ft_mc_match_routes();
+        g = ft_mc_find(&BR, &any);
+        assert(g && g->ports == 0 && g->routes == 1 && !g->host);
+        assert(ft_mc_count == 1 && !strcmp(ft_mc_state(g), "pending-source"));
+        ft_mc_retire(&dead);
+        assert(list_empty(&dead));
+        /* Its stream arrives, and it is the route's alone. */
+        stream(g, &P1, S);
+        ft_mc_match_routes();
+        assert(g->route == &r1 && ft_mc_installable(g));
+        /* A set-top box joining the same group finds that group, and the
+         * two sets merge in it. */
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_find(&BR, &any) == g && g->ports == 1 && ft_mc_count == 1);
+        ft_mc_route_withdraw(&r1);
+
+        /* br0 itself: the group is created in the bridge's PVID, provided
+         * the bridge carries that VLAN untagged. */
+        reset();
+        vlan_enabled = true;
+        BR.mrouter = true;
+        member(&BR, 1, true);
+        pvids[0].port = &BR;
+        pvids[0].pvid = 1;
+        pvid_count = 1;
+        memset(&r1, 0, sizeof(r1));
+        route_want(&want, 0, S, G, &P3, 287);
+        want.tagged = false;
+        ft_mc_route_publish(&r1, &want);
+        ft_mc_match_routes();
+        any.vid = 1;
+        assert(ft_mc_find(&BR, &any) && ft_mc_count == 1);
+        ft_mc_route_withdraw(&r1);
+        ft_mc_match_routes();
+        ft_mc_retire(&dead);
+        assert(list_empty(&ft_mc_groups));
+        while (!list_empty(&dead)) {
+            g = list_entry(dead.next, struct ft_mc_group, list);
+            list_del(&g->list);
+            ft_mc_group_free(g);
+        }
+        /* A PVID the bridge carries tagged surfaces on a VLAN device, not
+         * on br0: nothing is created. */
+        membership_count = 0;
+        member(&BR, 1, false);
+        memset(&r1, 0, sizeof(r1));
+        ft_mc_route_publish(&r1, &want);
+        ft_mc_match_routes();
+        assert(list_empty(&ft_mc_groups));
+        ft_mc_route_withdraw(&r1);
+    }
+
+    /* ---- a device a route or a tap names goes away --------------------- */
+    reset();
+    {
+        const uint32_t S = 0x0100000a, G = 0x110007ef;
+        struct br_ip any = group_v4(G, 0, 289);
+        struct ft_mc_tap tap = { &BR, 289, true, AF_INET };
+        struct ft_mc_route want, r1;
+        struct ft_mc_group *g;
+
+        memset(&r1, 0, sizeof(r1));
+        vlan_enabled = true;
+        BR.mrouter = true;
+        member(&BR, 289, false);
+        member(&P2, 289, false);
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        g = ft_mc_find(&BR, &any);
+        stream(g, &P1, S);
+        route_want(&want, 289, S, G, &P3, 287);
+        ft_mc_route_publish(&r1, &want);
+        ft_mc_taps_publish(&tap, 1, false);
+        ft_mc_match_routes();
+        assert(g->route == &r1);
+        /* The routed copy's port: the route lets go of everything it
+         * names, and names nothing until the routed learner publishes what
+         * is left. The group is re-matched on the next pass. */
+        works = 0;
+        {
+            unsigned before = holds;
+
+            ft_mc_device_gone(&P3);
+            assert(!r1.listeners && !r1.bridge && holds == before - 2);
+        }
+        assert(works == 1);
+        /* Until the next pass drops it, the emptied route is not a route:
+         * the host still needs its copies, and there are none to carry. */
+        assert(g->route == &r1 && !ft_mc_installable(g));
+        assert(!strcmp(ft_mc_state(g), "refused-routed"));
+        g->dirty = false;
+        g->retries = FT_MC_MAX_RETRIES;
+        ft_mc_match_routes();
+        assert(!g->route && g->dirty && g->routed_host);
+        /* A changed answer resets the retries spent on the old one. */
+        assert(g->retries == 0);
+        assert(!strcmp(ft_mc_state(g), "refused-routed"));
+        /* The bridge itself: the tap goes with it. */
+        ft_mc_device_gone(&BR);
+        assert(!ft_mc_tap_count);
+        ft_mc_route_withdraw(&r1);
     }
 
     reset();

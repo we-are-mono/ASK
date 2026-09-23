@@ -23,6 +23,7 @@
  * headroom was six opcodes. */
 #include <assert.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -113,6 +114,8 @@ static void cursor(struct ins_entry_info *info, struct entry *e)
 /* What fill_mcast_member_actions() emits for a listener, in its order. */
 static int listener(struct ins_entry_info *info)
 {
+    if ((info->flags & TTL_HM_VALID) && create_member_hop_hm(info))
+        return FAILURE;
     if (info->l2_info.num_egress_vlan_hdrs && create_vlan_ins_hm(info))
         return FAILURE;
     return create_ethernet_hm(info, 1);
@@ -287,6 +290,57 @@ int main(void)
             mcast_member_frame(&info, &frame);
             for (unsigned i = 0; i < sizeof(info.l2_info.l2hdr); i++)
                 assert(info.l2_info.l2hdr[i] == 0xee);
+            /* And a bridged copy has no hop of its own to take off. */
+            assert(!(info.flags & TTL_HM_VALID));
+        }
+
+        /* A routed copy in a bridged group. The root kept the hop count for
+         * the bridged copies, so this copy decrements it in its own entry --
+         * first, while the frame still starts at its IP header, and with a
+         * zero DSCP word, since a replica has no mark to ask for one -- and
+         * is framed from the egress port, not with the matched pair. */
+        for (int v6 = 0; v6 < 2; v6++) {
+            struct cdx_l2_encap encap = one_tag(287);
+            struct cdx_mc_member_frame frame = { .hop = true };
+            uint32_t dscp;
+
+            memset(&info, 0, sizeof(info));
+            memset(info.l2_info.l2hdr, 0xee, sizeof(info.l2_info.l2hdr));
+            assert(apply_l2_encap(&info, &encap) == SUCCESS);
+            mcast_member_frame(&info, &frame);
+            assert(info.flags & TTL_HM_VALID);
+            for (unsigned i = 0; i < sizeof(info.l2_info.l2hdr); i++)
+                assert(info.l2_info.l2hdr[i] == 0xee);
+            if (v6)
+                info.flags |= EHASH_IPV6_FLOW;
+            cursor(&info, &e);
+            assert(listener(&info) == SUCCESS);
+            assert(info.opc_count == 3);
+            assert(e.opcodes[0] == (v6 ? UPDATE_HOPLIMIT : UPDATE_TTL));
+            assert(e.opcodes[1] == INSERT_VLAN_HDR && e.opcodes[2] == INSERT_L2_HDR);
+            memcpy(&dscp, e.params, sizeof(dscp));
+            assert(dscp == 0);
+            /* Everything after the hop's word sits where it would without
+             * it, one word on: the tag, then the walk's own header. */
+            {
+                uint8_t *l2 = e.params + sizeof(struct en_ehash_update_dscp)
+                              + sizeof(struct en_ehash_insert_vlan_hdr) + 4
+                              + sizeof(struct en_ehash_insert_l2_hdr);
+                for (unsigned i = 0; i < 12; i++)
+                    assert(l2[i] == 0xee);
+                assert(l2[12] == 0x81 && l2[13] == 0x00);
+            }
+        }
+        /* No room for the word is a failure, not a truncated entry. */
+        {
+            struct cdx_mc_member_frame frame = { .hop = true };
+
+            memset(&info, 0, sizeof(info));
+            mcast_member_frame(&info, &frame);
+            cursor(&info, &e);
+            info.param_size = sizeof(struct en_ehash_update_dscp) - 1;
+            assert(create_member_hop_hm(&info) == FAILURE);
+            assert(info.opc_count == 0);
         }
     }
 

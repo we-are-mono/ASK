@@ -41,7 +41,7 @@ TARGETS = {
     "ipsec-receive": ("ipsec_exception_pkt_handler", "cdx", None),
     "ipsec-pool": ("ipsec_pool_refill_work", "cdx", SOFTIRQ),
     "ipsec-context": ("cdx_ipsec_sec_sa_context_alloc", "cdx", SOFTIRQ),
-    "multicast-claim": ("ft_mc_claim_take", "ask_flowtable", SOFTIRQ),
+    "multicast-install": ("cdx_mc_group_add", "cdx", SOFTIRQ),
     "mroute-event": ("ft_fib_event", "ask_flowtable", SOFTIRQ),
     "mroute-group": ("ft_mr_apply", "ask_flowtable", SOFTIRQ),
 }

@@ -3145,7 +3145,8 @@ int fill_ipsec_actions(PSAEntry entry, struct ins_entry_info *info,
  * A bridged copy's Ethernet pair replaces the egress port's address and the
  * group's mapped destination the interface walk filled in. It is written over
  * the walk's result rather than instead of the walk, because the walk still
- * decides the transmit queue and the tags. */
+ * decides the transmit queue and the tags. A routed copy in a group whose root
+ * kept the hop count decrements it itself; see fill_mcast_member_actions(). */
 static void mcast_member_frame(struct ins_entry_info *info,
 			       const struct cdx_mc_member_frame *frame)
 {
@@ -3153,6 +3154,34 @@ static void mcast_member_frame(struct ins_entry_info *info,
 		return;
 	if (frame->mac_pair)
 		memcpy(info->l2_info.l2hdr, frame->mac_pair, 2 * ETHER_ADDR_LEN);
+	if (frame->hop)
+		info->flags |= TTL_HM_VALID;
+}
+
+/* One copy's own hop-count decrement.
+ *
+ * The same opcode a routed root emits, emitted per copy instead: the root of
+ * a group that also bridges preserves the hop count for its bridged copies,
+ * so a routed copy in it has to take its hop off in its own entry. It runs
+ * first, while the frame still starts at its IP header -- the root stripped
+ * Ethernet and every insert below moves the start. The opcode's parameter is
+ * also the DSCP marking a flow's conntrack mark can ask for, which a replica
+ * has none of, so it is written zero, as a routed root without a mark writes
+ * it. */
+static int create_member_hop_hm(struct ins_entry_info *info)
+{
+	struct en_ehash_update_dscp *param;
+
+	if (info->param_size < sizeof(*param))
+		return FAILURE;
+	if (insert_opcodeonly_hm(info, (info->flags & EHASH_IPV6_FLOW) ?
+				 UPDATE_HOPLIMIT : UPDATE_TTL))
+		return FAILURE;
+	param = (struct en_ehash_update_dscp *)info->paramptr;
+	param->dscp = 0;
+	info->paramptr += sizeof(*param);
+	info->param_size -= sizeof(*param);
+	return SUCCESS;
 }
 
 /* Builds one listener's entry in a multicast group's replication chain.
@@ -3378,9 +3407,13 @@ static int fill_mcast_member_actions(RouteEntry *pRtEntry, struct ins_entry_info
 	}
 	//fill all opcodes and parameters
 	while(1) {
+		/* A routed copy of a group whose root kept the hop count. */
+		if ((info->flags & TTL_HM_VALID) && create_member_hop_hm(info))
+			break;
+
 		if (info->l3_info.add_tnl_header) {
 			/* Insert Tnl header */
-			if (create_tunnel_insert_hm(info)) 
+			if (create_tunnel_insert_hm(info))
 				break;
 		}
 

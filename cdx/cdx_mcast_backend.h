@@ -44,6 +44,14 @@ struct cdx_mc_listener {
 	struct net_device *dev;
 	struct cdx_ft_vlan vlan[CDX_FT_VLAN_MAX];
 	u8 vlans;
+	/* A routed copy in a bridged group: one stream that a bridge forwards
+	 * to some ports and the host routes to others is one classifier key,
+	 * so it is one group, and its root preserves the hop count and keys on
+	 * the frame's own Ethernet pair for the bridged copies. A routed copy
+	 * therefore decrements the hop count in its own entry and takes the
+	 * egress port's address, as a router's would. Meaningless in a routed
+	 * group, whose root decrements for every copy. */
+	bool routed;
 };
 
 /* A group, described once and installed in one pass.

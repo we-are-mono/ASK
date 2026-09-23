@@ -57,6 +57,7 @@ def test_mroute_learner(tmp_path):
             "ft_mr_scope_ok",
             "ft_mr_host_member",
             "ft_mr_ingress_port",
+            "ft_mr_ingress_bridge",
             "ft_mr_listener",
             "ft_mr_bridge_vid",
             "ft_mr_expand_bridge",
@@ -312,33 +313,78 @@ def test_exit_drains_before_the_module_text_goes_away():
     assert "ft_mr_exit();" in init
 
 
-# ------------------------------------------------- the shared key register
+# ------------------------------------------------- the learners' streams
 
-def test_one_owner_per_hardware_key():
-    """The classifier keeps one group id and one root entry per address pair,
-    so the two learners share a namespace. Whoever takes the key installs;
-    whoever cannot says so rather than spending a transaction to be told
-    -EEXIST and then retrying three more times.
+def test_the_learners_share_streams_not_keys():
+    """A routed root's port is never a bridge port and a bridged root's always
+    is, in tables of their own, so neither learner can take a key from the
+    other and there is no register between them. What they share is a stream
+    that arrives on a bridge port and is also routed: the routed learner
+    publishes its copies to the bridged group carrying it instead of
+    installing a root of its own.
     """
     source = SOURCE.read_text()
-    take = function(source, "ft_mc_claim_take")
-    give = function(source, "ft_mc_claim_give")
-    assert "-EEXIST" in take
-    # Allocation before the lock, because the register is a leaf and taking it
-    # must not be able to sleep.
-    assert take.index("kzalloc") < take.index("spin_lock_bh(&ft_mc_claim_lock)")
-    # Handing a key back stales the refusal it caused, and nothing else would
-    # ever look again.
-    assert "ft_mc_kick();" in give and "ft_mr_kick();" in give
+    assert "ft_mc_claim" not in source, "the address-pair register is gone"
+    worker = function(source, "ft_mr_work_fn")
+    # A parent on a bridge installs nothing: its copies are published, and
+    # anything else takes back what it once published.
+    assert "ft_mr_publish(target, &plan)" in worker
+    assert "ft_mc_route_withdraw(target->route)" in worker
+    assert "(hw || (state == FT_MR_PENDING && !via))" in worker, (
+        "a group routed through a bridge must never reach cdx_mc_group_add")
+    # Each learner keeps its own collisions: two MFC entries on one port with
+    # different tags are one key whose root validates one stack. Asked before
+    # the transaction, so a contested key costs nothing.
+    assert "ft_mr_key_taken(target, &plan.spec)" in worker
+    assert worker.index("ft_mr_key_taken(") < worker.rindex("cdx_ft_begin();")
+    assert "FT_MR_REFUSED_CONTESTED" in worker
+    taken = function(source, "ft_mr_key_taken")
+    assert "o->in == spec->in" in taken and "o->hw" in taken
+    # And a key given up is offered again in the same pass.
+    assert worker.count("ft_mr_key_freed = true;") >= 2
+    assert "g->state == FT_MR_REFUSED_CONTESTED" in worker
 
-    for worker, state in (("ft_mc_work_fn", "contested"),
-                          ("ft_mr_work_fn", "FT_MR_REFUSED_CONTESTED")):
-        body = function(source, worker)
-        assert "ft_mc_claim_take(" in body, f"{worker} must take the key"
-        assert "ft_mc_claim_give(" in body, f"{worker} must give it back"
-        assert state in body, f"{worker} must report a contested key"
-        # Taken before the transaction, so a contested key costs nothing.
-        assert body.index("ft_mc_claim_take(") < body.rindex("cdx_ft_begin();")
+
+def test_the_routed_learner_reaches_the_bridged_one_only_through_its_door():
+    """Publishing takes ft_mc_lock, so it happens with ft_mr_lock released,
+    and freeing a group's route happens only after it is off the bridged
+    learner's list, which is what clears every pointer to it there.
+    """
+    source = SOURCE.read_text()
+    publish = function(source, "ft_mr_publish")
+    unlock = publish.index("mutex_unlock(&ft_mr_lock);")
+    assert unlock < publish.index("ft_mc_route_publish(")
+    taps = function(source, "ft_mr_publish_taps")
+    assert taps.index("mutex_unlock(&ft_mr_lock);") < taps.index("ft_mc_taps_publish(")
+    free = function(source, "ft_mr_group_free")
+    assert free.index("ft_mc_route_withdraw(g->route)") < free.index("kfree(g->route)")
+    for name in ("ft_mc_route_publish", "ft_mc_route_withdraw", "ft_mc_taps_publish"):
+        body = function(source, name)
+        assert "mutex_lock(&ft_mc_lock)" in body and "ft_mr_lock" not in body
+    # What the bridged learner reports back is read under a leaf, so the
+    # routed learner may read it holding its own lock.
+    state = function(source, "ft_mc_route_state")
+    assert "spin_lock_bh(&ft_mc_route_lock)" in state and "mutex_lock" not in state
+
+
+def test_the_taps_say_so_whenever_they_cannot_be_trusted():
+    """A group a VIF receives is carried only with its route, and the taps are
+    how the bridged learner knows a VIF receives it. Wherever this learner
+    cannot say where its VIFs are -- a mirror a lost event invalidated, a
+    policy rule that can send a stream to a table it does not mirror, before
+    its first word -- the taps say they may be anywhere. And a bridge that
+    went down, whose taps the bridged learner dropped, is published again.
+    """
+    source = SOURCE.read_text()
+    taps = function(source, "ft_mr_publish_taps")
+    assert "ft_mr_resync_pending" in taps
+    assert "ft_mr_policy[0] || ft_mr_policy[1]" in taps
+    assert "static bool ft_mc_taps_overflow = true;" in source
+    apply = function(source, "ft_mr_apply")
+    rules = apply[apply.index("case FIB_EVENT_RULE_ADD:"):apply.index("case FIB_EVENT_VIF_ADD:")]
+    assert "ft_mr_taps_stale = true;" in rules
+    gone = function(source, "ft_mr_device_gone")
+    assert "netif_is_bridge_master(dev)" in gone and "ft_mr_taps_stale = true;" in gone
 
 
 def test_a_listener_is_its_whole_framing_not_its_port():
@@ -371,14 +417,23 @@ def test_the_counter_fold_restates_the_units():
     correction would make `ip -s mroute` read high by the framing on every
     frame -- the same restatement ft_l2_overhead() makes for a flow.
     """
-    body = function(SOURCE.read_text(), "ft_mr_fold")
-    assert "ETH_HLEN + g->in_tags * VLAN_HLEN" in body
+    source = SOURCE.read_text()
+    body = function(source, "ft_mr_fold")
+    assert "ETH_HLEN + tags * VLAN_HLEN" in body
     # Added to what ipmr counted itself, never written over it: see
     # test_mroute_fold.py for what setting did to the count.
     assert "atomic_long_add(packets, &g->mfc->mfc_un.res.pkt" in body
     assert "atomic_long_add(bytes, &g->mfc->mfc_un.res.bytes" in body
     assert "atomic_long_set" not in body
     assert "lastuse" in body, "ageing reads it and the CPU sees no packets"
+    # The framing is the entry's own ingress tags, or, for a group routed
+    # through a bridge, what the bridged group carrying it reports: a daemon
+    # ageing its routes by SIOCGETSGCNT must see a merged stream flow.
+    counters = function(source, "ft_mr_counters")
+    assert "*tags = g->in_tags;" in counters
+    assert "ft_mc_route_state(g->route, c, tags)" in counters
+    for caller in ("ft_mr_stats_fn", "ft_mr_rows"):
+        assert "if (ft_mr_counters(g, &stats, &tags))" in function(source, caller)
 
 
 def test_proc_reports_a_row_and_a_summary():
@@ -397,4 +452,4 @@ def test_proc_reports_a_row_and_a_summary():
                   "listeners=", "state=", "packets=", "bytes="):
         assert field in rows, f"{field} missing from the row"
     # A read is also a fold, so the two surfaces never disagree.
-    assert "ft_mr_fold(g, &stats)" in rows
+    assert "ft_mr_fold(g, &stats, tags)" in rows

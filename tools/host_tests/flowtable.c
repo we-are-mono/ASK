@@ -390,6 +390,7 @@ enum switchdev_attr_id {
     SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS, SWITCHDEV_ATTR_ID_PORT_STP_STATE,
     SWITCHDEV_ATTR_ID_PORT_MST_STATE, SWITCHDEV_ATTR_ID_BRIDGE_MST,
     SWITCHDEV_ATTR_ID_VLAN_MSTI, SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
+    SWITCHDEV_ATTR_ID_BRIDGE_MROUTER,
 };
 struct switchdev_obj { enum switchdev_obj_id id; };
 struct switchdev_mst_state { u16 msti; u8 state; };
@@ -430,8 +431,9 @@ static void ft_mc_device_gone(struct net_device *dev)
     mc_devices_gone++;
 }
 static void ft_mc_kick_all(void) { mc_rechecks++; }
-static unsigned mc_vlan_changes;
+static unsigned mc_vlan_changes, mc_router_changes;
 static void ft_mc_vlan_changed(struct net_device *dev) { (void)dev; mc_vlan_changes++; }
+static void ft_mc_router_changed(void) { mc_router_changes++; }
 /* The routed learner has its own file and its own harness
  * (mroute_learner.c); here the chains' calls into it only count. The two
  * multicast families the FIB chain carries are ipmr's and ip6mr's, and this
@@ -2729,6 +2731,22 @@ static void test_bridge_fdb(void)
         set.info.dev = NULL;
         assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
         assert(mroute_kicks == kicks + 1);
+    }
+    /* The bridge itself becoming a multicast router decides whether it hands
+     * its groups to the host, which is the bridged learner's question: it
+     * needs the route forwarding them there. Nothing else re-derives. */
+    {
+        struct switchdev_attr change = { .id = SWITCHDEV_ATTR_ID_BRIDGE_MROUTER };
+        unsigned kicks = mroute_kicks, routers = mc_router_changes;
+
+        set.attr = &change;
+        set.info.dev = &br;
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(mc_router_changes == routers + 1 && mroute_kicks == kicks);
+        assert(!atomic_read(&ft_invalid) && !set.handled);
+        set.info.dev = NULL;
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(mc_router_changes == routers + 1);
     }
     set.attr = NULL;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);

@@ -18,13 +18,19 @@ def test_mroute_refresh(tmp_path):
     start = source.index("enum ft_mr_state {")
     structs = source[source.index("struct ft_mr_vif {"):
                      source.index("static LIST_HEAD(ft_mr_groups)")]
+    # What a group routed through a bridge publishes, as the adapter
+    # declares it.
+    route = source[source.index("struct ft_mc_route {"):
+                   source.index("struct ft_mc_tap {")]
     (tmp_path / "mroute_types.inc").write_text(
-        source[start:source.index("};", start) + 3] + structs)
+        route + source[start:source.index("};", start) + 3] + structs)
     (tmp_path / "mroute_refresh.inc").write_text("\n".join(
         function(source, name) for name in [
-            "ft_mr_refusal", "ft_mr_plan_same", "ft_mr_plan_put",
-            "ft_mr_offload_flag", "ft_mr_release_set", "ft_mr_group_free",
-            "ft_mr_dirty_family", "ft_mr_device_gone", "ft_mr_work_fn", "ft_mr_stats_fn", "ft_mr_exit",
+            "ft_mr_refusal", "ft_mr_state_text", "ft_mr_plan_same",
+            "ft_mr_plan_put", "ft_mr_offload_flag", "ft_mr_counters",
+            "ft_mr_release_set", "ft_mr_group_free", "ft_mr_dirty_family",
+            "ft_mr_device_gone", "ft_mr_key_taken", "ft_mr_publish",
+            "ft_mr_work_fn", "ft_mr_stats_fn", "ft_mr_exit",
         ]))
     binary = tmp_path / "refresh"
     subprocess.run([

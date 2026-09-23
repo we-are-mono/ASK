@@ -408,6 +408,8 @@ static LIST_HEAD(ft_mr_groups);
 static int ft_mr_lock;
 static unsigned int ft_mr_count;
 static unsigned int ft_mr_policy[2];
+/* Set by a VIF change for the worker, which is not compiled here. */
+static bool ft_mr_taps_stale;
 __attribute__((unused)) static unsigned int ft_mr_installed;
 __attribute__((unused)) static u64 ft_mr_refused;
 __attribute__((unused)) static u64 ft_mr_install_errors;
@@ -723,9 +725,6 @@ int main(void)
     assert(refuse(g) == FT_MR_REFUSED_INGRESS);
     vif_set(AF_INET, 0, &WAN, VIFF_TUNNEL);
     assert(refuse(g) == FT_MR_REFUSED_INGRESS);
-    /* A bridge is many ports and the classifier key is one. */
-    vif_set(AF_INET, 0, &BR, 0);
-    assert(refuse(g) == FT_MR_REFUSED_INGRESS);
     /* A bridge port's frames go to the bridge's rx handler, so a VIF above
      * one describes traffic that never arrives. */
     bridge_port(&WAN, BR_MCAST_FLOOD);
@@ -754,6 +753,7 @@ int main(void)
      * plan: the root it needs validates a different tag. */
     g->in = plan.spec.in;
     g->in_tags = plan.in_tags;
+    g->mtu = plan.mtu;
     g->listeners = plan.spec.listeners;
     memcpy(g->listener, plan.spec.listener, sizeof(g->listener));
     memcpy(g->in_vlan, plan.spec.in_vlan, sizeof(g->in_vlan));
@@ -769,6 +769,110 @@ int main(void)
     assert(plan.spec.in_vlans == 0);
     ft_mr_plan_put(&plan);
     free(g);
+
+    /* ---- a parent VIF on a bridge ------------------------------------- *
+     *
+     * The stream arrives on a bridge port and the bridge hands it to the
+     * host, so its key is the bridged group's for that port -- which only
+     * the bridged learner can learn. The plan names no ingress port and
+     * installs nothing; it names where the VIF sits on the bridge, and its
+     * copies are routed ones for the bridged group to carry. */
+    reset();
+    bridge_port(&WAN, BR_MCAST_FLOOD);
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+    vif_set(AF_INET, 0, &BR, 0);
+    vif_set(AF_INET, 1, &LAN2, 0);
+    oif(g, 1, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.in == NULL && plan.via == &BR && !plan.via_tagged);
+    assert(plan.via_vid == 0 && plan.in_tags == 0 && plan.spec.in_vlans == 0);
+    assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN2);
+    assert(plan.spec.listener[0].routed);
+    /* The bridged group bounds the copies against the port the stream
+     * arrives on; the plan carries the narrowest copy for it. */
+    assert(plan.mtu == 1500);
+    {
+        unsigned before = holds;
+
+        ft_mr_plan_put(&plan);
+        assert(holds == before - 2);   /* the bridge and the listener */
+    }
+    /* A bridge device larger than its copies is not this group's bound:
+     * the bridge hands up whatever arrived on the port. */
+    BR.mtu = 9000;
+    assert(derive(g, &plan) == FT_MR_PENDING && plan.mtu == 1500);
+    ft_mr_plan_put(&plan);
+    BR.mtu = 1500;
+    /* The host having joined on the bridge is a local listener, as on a
+     * port. */
+    host_join4(&BR, ip4(239, 8, 1, 5));
+    assert(refuse(g) == FT_MR_REFUSED_HOST);
+    mc_list_count = mc4_used = 0;
+    /* A copy may leave by any port, the one the stream arrived on
+     * included: it leaves by a VIF other than the parent, which ipmr sends
+     * even back out of that port. */
+    vif_set(AF_INET, 1, &WAN, 0);
+    WAN.bridge_port = false;
+    assert(derive(g, &plan) == FT_MR_PENDING && plan.spec.listener[0].dev == &WAN);
+    ft_mr_plan_put(&plan);
+    free(g);
+
+    /* An 802.1Q device above a filtering bridge receives exactly its VLAN,
+     * tagged. Above a bridge that does not filter it receives nothing the
+     * bridged learner could carry, and QinQ above a bridge is not a shape
+     * the bridge hands up at all. */
+    reset();
+    {
+        static struct net_device BRV, BRVV;
+
+        dev_init(&BRV, "br0.289", 31);
+        BRV.vlan = true;
+        BRV.vlan_proto = ETH_P_8021Q;
+        BRV.vlan_id = 289;
+        lower_add(&BRV, &BR);
+        dev_init(&BRVV, "br0.289.7", 32);
+        BRVV.vlan = true;
+        BRVV.vlan_proto = ETH_P_8021Q;
+        BRVV.vlan_id = 7;
+        lower_add(&BRVV, &BRV);
+
+        g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+        vif_set(AF_INET, 0, &BRV, 0);
+        vif_set(AF_INET, 1, &LAN2, 0);
+        oif(g, 1, 1);
+        assert(refuse(g) == FT_MR_REFUSED_INGRESS);   /* not filtering */
+        vlan_enabled = true;
+        assert(derive(g, &plan) == FT_MR_PENDING);
+        assert(plan.via == &BR && plan.via_tagged && plan.via_vid == 289);
+        assert(plan.spec.in == NULL);
+        /* Where the VIF sits is part of the plan: another VLAN, the bridge
+         * device itself, or a narrower copy is a different contribution. */
+        g->via = plan.via;
+        g->via_vid = plan.via_vid;
+        g->via_tagged = plan.via_tagged;
+        g->mtu = plan.mtu;
+        g->listeners = plan.spec.listeners;
+        memcpy(g->listener, plan.spec.listener, sizeof(g->listener));
+        assert(ft_mr_plan_same(g, &plan));
+        g->via_vid = 288;
+        assert(!ft_mr_plan_same(g, &plan));
+        g->via_vid = 289;
+        g->via_tagged = false;
+        assert(!ft_mr_plan_same(g, &plan));
+        g->via_tagged = true;
+        g->mtu = 1400;
+        assert(!ft_mr_plan_same(g, &plan));
+        g->via = NULL;
+        g->listeners = 0;
+        ft_mr_plan_put(&plan);
+        /* 802.1ad above the bridge is declined, as everywhere. */
+        BRV.vlan_proto = 0x88a8;
+        assert(refuse(g) == FT_MR_REFUSED_INGRESS);
+        BRV.vlan_proto = ETH_P_8021Q;
+        vif_set(AF_INET, 0, &BRVV, 0);
+        assert(refuse(g) == FT_MR_REFUSED_INGRESS);
+        free(g);
+    }
 
     /* ---- local delivery ---------------------------------------------- */
 
@@ -1015,6 +1119,7 @@ int main(void)
     assert(!strcmp(plan.oifs, "br0"));
     g->in = plan.spec.in;
     g->in_tags = plan.in_tags;
+    g->mtu = plan.mtu;
     g->listeners = plan.spec.listeners;
     memcpy(g->listener, plan.spec.listener, sizeof(g->listener));
     assert(ft_mr_plan_same(g, &plan));

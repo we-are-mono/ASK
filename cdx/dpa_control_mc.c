@@ -257,15 +257,9 @@ void cdx_mc_remove_hcsync_fail_probe(void)
  * applies. Without an explicit dev_mc_add() during MC4 ADD, an
  * offload-managed group silently fails: FCI returns NO_ERR, cmm
  * query mc4 shows the group, zero frames replicate. */
-static void cdx_mcast_compute_mac(const struct mcast_group_info *grp,
-				  uint8_t mac[ETH_ALEN])
+static void cdx_mcast_group_mac(const struct mcast_group_info *grp,
+				uint8_t mac[ETH_ALEN])
 {
-	/* A group keyed on its frames' own Ethernet pair matches exactly that
-	 * destination, which is the one the port has to let through. */
-	if (grp->mac_keyed) {
-		memcpy(mac, grp->mac_pair, ETH_ALEN);
-		return;
-	}
 	if (grp->mctype == 0) {
 		/* IPv4: 01:00:5E:<low 23 bits of dst>. The mask on byte 3
 		 * matches the on-disk daddr endianness used elsewhere in
@@ -288,6 +282,18 @@ static void cdx_mcast_compute_mac(const struct mcast_group_info *grp,
 		mac[4] = (lo >> 16) & 0xff;
 		mac[5] = (lo >> 24) & 0xff;
 	}
+}
+
+/* The destination the group's frames arrive with: the mapped group address,
+ * or, for a group keyed on its frames' own Ethernet pair, exactly that
+ * destination, which is the one the port has to let through. */
+static void cdx_mcast_compute_mac(const struct mcast_group_info *grp,
+				  uint8_t mac[ETH_ALEN])
+{
+	if (grp->mac_keyed)
+		memcpy(mac, grp->mac_pair, ETH_ALEN);
+	else
+		cdx_mcast_group_mac(grp, mac);
 }
 
 /* The group's ingress device.
@@ -2264,12 +2270,14 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 {
 	struct en_exthash_tbl_entry *tbl_entry = NULL;
 	RouteEntry RtEntry, *pRtEntry = &RtEntry;
+	uint8_t arrived[ETH_ALEN], mapped[ETH_ALEN];
 	struct cdx_mc_member_frame frame = {};
 	uint32_t tbl_type;
 	unsigned int ii;
 
 	memset(&RtEntry, 0, sizeof(RouteEntry));
-	cdx_mcast_compute_mac(grp, pRtEntry->dstmac);
+	cdx_mcast_compute_mac(grp, arrived);
+	cdx_mcast_group_mac(grp, mapped);
 	/* A listener's entry comes from its port's table of the root's type,
 	 * and a bridged copy writes back the pair its root matched. */
 	if (grp->mac_keyed) {
@@ -2282,8 +2290,21 @@ static int cdx_mc_build_listeners(struct mcast_group_info *grp,
 	}
 
 	for (ii = 0; ii < spec->listeners; ii++) {
+		struct cdx_mc_member_frame copy = frame;
+
+		/* A routed copy of a bridged group is a router's frame: from
+		 * the egress port to the group's mapped address, one hop fewer
+		 * than the root, which kept the count for the bridged copies,
+		 * let it arrive with. A routed group's root decrements for
+		 * every copy and needs none of this. */
+		memcpy(pRtEntry->dstmac, arrived, ETH_ALEN);
+		if (grp->mac_keyed && spec->listener[ii].routed) {
+			copy.mac_pair = NULL;
+			copy.hop = true;
+			memcpy(pRtEntry->dstmac, mapped, ETH_ALEN);
+		}
 		tbl_entry = cdx_mc_listener_entry(pRtEntry, &spec->listener[ii],
-						  &frame, tbl_entry, tbl_type);
+						  &copy, tbl_entry, tbl_type);
 		if (!tbl_entry) {
 			/* Releases the entries built so far and clears their
 			 * slots. It also hands back the group id, so a caller

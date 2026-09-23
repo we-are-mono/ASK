@@ -220,14 +220,14 @@ async def recover(r, fault):
             # Restoration touches only the MFC owner. No apply, rearm, daemon
             # restart, traffic socket replacement, or module reload occurs.
             started = time.monotonic()
-            if fault in ('claim-failslab', 'add-event-failslab', 'group-failslab'):
-                selected = {'claim-failslab': 'multicast-claim', 'add-event-failslab': 'mroute-event',
+            if fault in ('install-failslab', 'add-event-failslab', 'group-failslab'):
+                selected = {'install-failslab': 'multicast-install', 'add-event-failslab': 'mroute-event',
                             'group-failslab': 'mroute-group'}[fault]
                 async with slab_fault(r, selected, label) as injection:
                     await route(r, target)
                     hit = await injection.hit()
                     admitted = await wait_group(r, target, True)
-                    if fault == 'claim-failslab':
+                    if fault == 'install-failslab':
                         worker = 'ft_mc_work_fn' if r.multicast_kind == 'mcast' else 'ft_mr_work_fn'
                         assert worker in ''.join(hit['kernel_records']), hit
                         counter = r.multicast_kind + '_install_errors'
@@ -261,6 +261,6 @@ async def recover(r, fault):
             await p.rpc('multicast', changes={'action': 'leave', 'group': group})
 
 
-@pytest.mark.parametrize('fault', ['withdrawal', 'claim-failslab', 'add-event-failslab', 'delete-event-failslab', 'group-failslab'])
+@pytest.mark.parametrize('fault', ['withdrawal', 'install-failslab', 'add-event-failslab', 'delete-event-failslab', 'group-failslab'])
 async def test_flowtable_service_multicast_recovery(multicast_service, fault):
     await recover(multicast_service, fault)

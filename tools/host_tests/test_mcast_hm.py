@@ -30,7 +30,8 @@ def test_bridge_mode_reaches_root_and_cannot_change_on_replace():
     from test_mcast_backend import code
     adapter = (ROOT / "cdx/ask_flowtable.c").read_text()
     encoder = (ROOT / "cdx/cdx_ehash.c").read_text()
-    assert "spec.bridged = true;" in function(adapter, "ft_mc_work_fn")
+    assert "spec->bridged = true;" in function(adapter, "ft_mc_group_spec")
+    assert "ft_mc_group_spec(target, &spec);" in function(adapter, "ft_mc_work_fn")
     assert "cdx_mc_describe(grp, spec);" in code("cdx_mc_group_add")
     assert "grp->bridged = spec->bridged;" in code("cdx_mc_describe")
     assert "grp->bridged != spec->bridged" in code("cdx_mc_same_key")
@@ -79,11 +80,13 @@ def test_mcast_hm(tmp_path):
         + "".join(f"#define {name} {value}\n" for name, value in re.findall(
             r"^#define\s+(INSERT_VLAN_HDR|INSERT_L2_HDR|STRIP_ALL_VLAN_HDRS|"
             r"OP_SKIP_VLAN_VALIDATE|OP_VLAN_FILTER_EN|OP_VLAN_FILTER_PVID_SET|"
-            r"MAX_VLAN_PER_FLOW)\s+(\([^)]*\)|\S+)", header, re.M))
+            r"MAX_VLAN_PER_FLOW|UPDATE_TTL|UPDATE_HOPLIMIT)\s+(\([^)]*\)|\S+)",
+            header, re.M))
         + loose_declaration(header, "en_ehash_stats")
         + loose_declaration(header, "en_ehash_insert_vlan_hdr")
         + loose_declaration(header, "en_ehash_insert_l2_hdr")
         + loose_declaration(header, "en_ehash_strip_all_vlan_hdrs")
+        + loose_declaration(header, "en_ehash_update_dscp")
         # Every classifier key layout, the bridged multicast ones included,
         # and the union they are composed through.
         + common[common.index("//ipv4 tcp key used in cc table"):
@@ -93,7 +96,8 @@ def test_mcast_hm(tmp_path):
                       "cdx_mc_member_frame")
         # The entry-builder flags the ingress strip reads.
         + "".join(f"#define {name} {value}\n" for name, value in re.findall(
-            r"^#define\s+(EHASH_BRIDGE_FLOW|ROUTE_FLOW_VLAN_FIL_EN|ROUTE_FLOW_PVID_SET)"
+            r"^#define\s+(EHASH_BRIDGE_FLOW|ROUTE_FLOW_VLAN_FIL_EN|ROUTE_FLOW_PVID_SET|"
+            r"TTL_HM_VALID|EHASH_IPV6_FLOW)"
             r"\s+(\([^)]*\))", ehash, re.M))
         + re.search(r"^#define PAD\(.*$", ehash, re.M).group() + "\n")
     (tmp_path / "mcast_hm.inc").write_text(
@@ -107,6 +111,9 @@ def test_mcast_hm(tmp_path):
         # strip that validates the tags the group arrives with.
         + function(ehash, "fill_mcast_mac_key")
         + function(ehash, "mcast_member_frame")
+        # A routed copy's own hop decrement in a group whose root kept it.
+        + function(ehash, "insert_opcodeonly_hm")
+        + function(ehash, "create_member_hop_hm")
         + function(ehash, "insert_remove_vlan_hm"))
     binary = tmp_path / "mcast_hm"
     subprocess.run([
@@ -161,6 +168,27 @@ def test_listener_builder_owns_its_cursor():
     for caller in ("cdx_create_mcast_group", "cdx_update_mcast_group"):
         assert "ins_entry_info" not in function(mc, caller), (
             f"{caller} must not hold a cursor to share between listeners")
+
+
+def test_only_a_bridged_root_gives_a_routed_copy_its_own_hop():
+    """The routed learner marks every copy routed, and a routed group's root
+    already decrements for all of them. Only a root that keeps the hop count
+    -- the bridged one, keyed on the frame's own pair -- may have a routed copy
+    decrement again in its own entry, or a routed group's copies would leave
+    two hops down. And such a copy is a router's frame: from the egress port
+    to the group's mapped address, not the matched pair.
+    """
+    from test_mcast_backend import code
+    body = code("cdx_mc_build_listeners")
+    guard = "if (grp->mac_keyed && spec->listener[ii].routed) {"
+    assert guard in body
+    arm = body[body.index(guard):]
+    arm = arm[:arm.index("}")]
+    assert "copy.hop = true;" in arm and "copy.mac_pair = NULL;" in arm
+    assert "memcpy(pRtEntry->dstmac, mapped, ETH_ALEN);" in arm
+    assert body.count("copy.hop = true;") == 1
+    # Every copy starts from the root's framing, the per-copy change on top.
+    assert body.index("memcpy(pRtEntry->dstmac, arrived, ETH_ALEN);") < body.index(guard)
 
 
 def test_an_ipv6_listener_is_framed_as_ipv6_in_either_table():

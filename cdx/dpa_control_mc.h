@@ -166,9 +166,14 @@ int cdx_update_mcast_group(void *mcast_cmd, int bIsIPv6);
  * `mac_pair` is a bridged copy's: the destination and source the root matched,
  * in the order the header carries them, written back verbatim. A bridge
  * forwards a frame with the addresses it arrived with, and the root is keyed
- * on this pair precisely so that the listener can know them. */
+ * on this pair precisely so that the listener can know them.
+ *
+ * `hop` is a routed copy's in a group whose root preserves the hop count for
+ * its bridged copies: the entry decrements it itself, ahead of its header
+ * inserts, where a routed root would have for every copy. */
 struct cdx_mc_member_frame {
 	const uint8_t *mac_pair;
+	bool hop;
 };
 
 /* Builds one listener's entry. The listener is already resolved -- an onif and

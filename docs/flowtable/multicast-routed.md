@@ -30,8 +30,8 @@ That is why it is a sibling rather than a modification. The state is different
 (a kernel object with a refcount, not a switchdev object), the chain is
 different (the FIB notifier, not switchdev), and the eligibility questions are
 different (a VIF's flags, a threshold, a policy rule). What is shared is the
-encoder underneath and the hardware key namespace above — and the second of
-those turns out to need a register of its own; see below.
+encoder underneath and, for a stream that is both bridged and routed, the
+hardware group that carries it; see below.
 
 **The encoder needed no change at all, and that is worth stating precisely
 because it looks like it should have.** A multicast root entry is built by
@@ -121,12 +121,14 @@ test is mirrored here so `/proc` says `refused-scope` rather than
 no `VIFF_REGISTER`, no `MIFF_REGISTER`, because a PIM register VIF is a
 software tunnel to the rendezvous point and an IPIP VIF encapsulates on egress,
 and neither is a port. Its device must resolve to exactly one physical CDX
-port, directly or through at most two stacked 802.1Q VLAN devices. A bridge
-cannot be an ingress: it is many ports and the key is one. A bridge *port*
-cannot either, and for the opposite reason — its frames go to the bridge's
-receive handler and never reach a VIF above it, so a VIF naming one describes
-traffic that does not exist. A ppp device likewise. All of these are
-`refused-ingress`.
+port, directly or through at most two stacked 802.1Q VLAN devices — or be a
+bridge, or one 802.1Q device above a VLAN-filtering bridge, which is the case
+[the next section](#one-stream-both-learners) describes: the stream arrives on
+a bridge port, and the entry rides the bridged group for it instead of
+installing a root of its own. A bridge *port* cannot be an ingress — its
+frames go to the bridge's receive handler and never reach a VIF above it, so a
+VIF naming one describes traffic that does not exist. A ppp device likewise,
+and QinQ above a bridge. All of these are `refused-ingress`.
 
 The classifier key includes the port but not its VLAN tag, and the
 per-listener rebuild strips whatever L2 the frame arrived with, so a VLAN
@@ -240,57 +242,116 @@ listener, which is the bridged learner's answer to the same question. Neither
 check is exported, so the learner walks `__in_dev_get_rcu(dev)->mc_list` and
 `__in6_dev_get(dev)->mc_list` under RCU.
 
-**The key.** One address pair, one owner; see the next section.
-`refused-contested`.
+**The key.** A routed root is keyed on its port and address pair, and the key
+names no VLAN. Two MFC entries for one `(S,G)` whose parents are two VLANs of
+one port — `eth4` and `eth4.10` — are one classifier entry whose root can
+validate only one of the two tag stacks. The first installed keeps it; the
+other is `refused-contested`, and takes the key in the same worker pass the
+first gives it up. See the next section for why this is the only collision
+left.
 
 **Retries.** Four, then `refused-failed`. A failure is not permanent — a port
 that lost carrier gets it back — but retrying forever against a group that
 cannot be carried would spin the worker. Anything that could change the answer
 resets the count.
 
-## The shared key namespace
+## One stream, both learners
 
-The classifier keeps one group id and one root entry per address pair:
-`GetMcastGrpId()` matches `(saddr, daddr)` and refuses a second. The ingress is
-reported back rather than compared, so even two ingresses for one `(S,G)` are
-one entry.
+**The two learners do not share a key.** A routed root is keyed on its port and
+address pair in the routed multicast tables, and its port is never a bridge
+port. A bridged root is keyed on its port, its frames' Ethernet pair and the
+address pair in [tables of its own](multicast-hardware.md#production-integration),
+and its port always is one. No frame is a candidate for both, and the backend
+keys a group on its whole classifier key rather than on the address pair, so
+neither learner can take a key from the other. The address-pair register that
+used to arbitrate between them (`ft_mc_claim_take()`) is gone. Each learner
+refuses only its own collisions: two MFC entries on one port with different
+tags (above), and two bridged memberships whose streams resolve to one key
+([bridged contract](multicast.md#the-eligibility-contract)).
 
-Two learners now compose keys into that one space, and they can collide in
-three ways: a bridged group and a routed group for the same `(S,G)`; two
-bridged groups on different bridges; and two MFC entries with the same `(S,G)`
-on different iifs, which `rhltable` permits because `ipmr_cache_find_parent()`
-filters by parent after the hash.
+**What they share is a stream.** An IPTV VLAN bridged to a set-top box and
+routed to the rest of the house arrives on a bridge port. The bridge forwards it
+to the box and, as a multicast router, hands it to the host on `br0.289`, where
+ipmr routes it out of another port. That is one classifier key — the bridged
+one — so it is one hardware group, carrying the union of the two sets: the
+box's copy with the sender's Ethernet pair and hop count, ipmr's with the egress
+port's address, the group's mapped destination and one hop fewer.
 
-The answer is a register — `ft_mc_claim_take()` / `ft_mc_claim_give()` — that
-each learner consults before it installs and releases when it stops carrying a
-key. It is a leaf: a spinlock taken while no other lock of this module is held,
-so it orders against nothing. That is what makes it shareable. The alternative,
-each learner reading the other's list, would need `ft_mc_lock` and `ft_mr_lock`
-nested in some order. The shared register avoids that dependency.
+**Who owns what.** The bridged learner owns the group, because only its traffic
+hook knows the port, the Ethernet pair and the tag the stream arrives with. An
+MFC entry whose parent VIF is a bridge, or one 802.1Q device above a filtering
+bridge, installs nothing: the routed learner derives it as usual, publishes its
+copies to the bridged learner as an `ft_mc_route`, and reads back whether a
+bridged group is carrying them (`installed`) or not yet (`pending-bridged`,
+with the reason in the bridged row). Each learner keeps its own listeners — a
+membership's ports come and go with the MDB, a route's copies with the MFC —
+and the group is replaced in place when either set changes. It is retired only
+when both are empty: a set-top box leaving a stream the house still routes
+leaves the routed copies in hardware, and a route with no bridged listener at
+all gets a group of its own to learn its stream through, in the `(*,G)` form a
+later join of the same group finds and fills.
 
-Whoever gets there first wins; the other reports `refused-contested` and waits.
-Handing a key back wakes both learners, because the refusal it caused is now
-stale and nothing else would ever look again.
+**Where the VIF sits decides what it receives.** `br_pass_frame_up()` hands the
+host a frame only in a VLAN the bridge itself is a member of, untagged when that
+membership is untagged and tagged otherwise. So `br0.289` receives VLAN 289 when
+the bridge carries it tagged, and `br0` receives every VLAN it carries untagged.
+A route counts only for the VLANs its VIF really receives, and only while the
+bridge is a multicast router (`mcast_router 2`, or a querier heard from the
+host): a bridge that is not one hands the host only what the host itself joined,
+and a host membership keeps a group in software regardless. A route through a
+bridge that is not a router therefore forwards nothing in Linux either, and
+carrying it would forward what Linux does not.
 
-**The bridged learner's traffic hook is unaffected by any of this, and that is
-worth saying because it looks as though it should not be.** That hook stays
-registered while some bridged membership is still waiting for a source, and a
-routed group installed for the same group address does not end that wait — but
-it also cannot starve it, because the two never see the same frames. A routed
-group's ingress is a physical port that is not a bridge port (a bridge port is
-`refused-ingress`, since its frames go to the bridge's receive handler and
-never reach a VIF), and a bridged group's traffic arrives on a bridge port. The
-hook's cost is bounded by the bridged learner's own state and nothing here
-changes it.
+**The host's own copy.** Once the bridge hands a stream to a VIF, the hardware
+has to account for the host's copy, not only the ports'. A bridged group whose
+bridge VLAN a VIF receives is carried only together with the route that
+forwards its stream. Without one — no MFC entry yet, which is how `igmpproxy` or
+`smcroute` learn a source from the NOCACHE upcall, or one this learner refuses
+— it is `refused-routed` and stays in software, where ipmr sees it. So the
+routed learner also publishes where its VIFs sit on bridges (`ft_mc_tap`); a
+mirror a lost notification invalidated says instead that they may be anywhere,
+which keeps every such group in software until a resync completes. Before this,
+the bridged learner ignored a bridge that was a multicast router, installed the
+box's copy alone and starved ipmr: the routed half was silently lost.
 
-**The two listener sets are not merged, and that remains open.** A group that
-is both bridged and routed on one box is a real configuration — an IPTV VLAN
-bridged to some ports and routed to others — and what it deserves is one
-hardware group with the union of the two listener sets. What it gets is one of
-them carried and the other in software, which is correct but not optimal. It is
-recorded in `ISSUES.md` rather than guessed at here, because merging means
-deciding which learner owns the retirement of a listener the other contributed,
-and neither of them has the state for that today.
+**What does not merge**, each with its reason:
+
+- A routed copy framed exactly like a bridged one — one port, one tag stack —
+  would be two identical-looking entries the backend takes for a duplicate:
+  `refused-listener`.
+- The union has to fit `CDX_MC_MAX_LISTENERS`: `refused-listener`.
+- Every routed copy has to fit the port the stream arrives on, which the bridge
+  hands up whatever the bridge device's MTU: `refused-mtu` on the bridged row.
+- A host membership on the parent VIF is a local listener: `refused-host` on
+  both rows.
+- `(*,G)` and `(S,G)` memberships of one group on one bridge stay
+  `refused-contested`, as before: the switchdev object does not carry the
+  filter mode that says how the bridge combines them.
+
+**The routed copy's hop.** A bridged root preserves the hop count, so a routed
+copy in a bridged group decrements it in its own listener entry — `UPDATE_TTL`
+or `UPDATE_HOPLIMIT` ahead of its header inserts, with a zero DSCP word — and
+rebuilds Ethernet from the egress port. Per-copy L3 edits under `REPLICATE_PKT`
+have not been measured on hardware; see
+[the hardware notes](multicast-hardware.md#routed-copies-in-a-bridged-group).
+
+**Locking.** The routed learner reaches the bridged one only through functions
+that take `ft_mc_lock` themselves, called with `ft_mr_lock` released; what the
+bridged learner reports back — carried or not, what it counted, the ingress
+framing that count includes — sits under a leaf spinlock the routed learner
+reads holding its own lock. The bridged worker never takes `ft_mr_lock`; it
+kicks the routed worker when a route's answer changes. A route is freed by its
+owner only after it is off the bridged learner's list, which clears every
+pointer to it there.
+
+**Counters.** A merged group's frames never reach ipmr, so what the bridged
+group carrying the route matched is added to the MFC's counters, as a routed
+group's own entry's is: the bridged refresh adds each interval's growth to the
+route's count, which only grows while the route is published, and the routed
+fold adds the route's growth to the MFC in ipmr's units, less the ingress tag
+the bridged group reports. A daemon that ages routes by `SIOCGETSGCNT` sees the
+stream flow, and the count never goes backwards when an entry is replaced or
+two streams carry one route.
 
 ## Locking
 
@@ -344,7 +405,9 @@ family over:
 | The bridge's VLAN configuration or filtering | the switchdev chain | kicked and re-derived |
 | A multicast router port, snooping, flood flag or forwarding state | switchdev attributes | kicked and re-derived from the live snapshot; patch 161 emits router refreshes on either protocol's transition, even while the other remains a router |
 | Querier timers or per-VLAN snooping state without a notification | the existing five-second worker | re-derived, including refused groups; unchanged forwarding plans leave their hardware chains intact |
-| A hardware key handed back | the shared register | both learners kicked |
+| A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
+| The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
+| A bridge becoming or ceasing to be a multicast router | `SWITCHDEV_ATTR_ID_BRIDGE_MROUTER` | the bridged worker re-matches every group against the routes and VIFs |
 
 A replacement that fails is withdrawn completely: retaining the old chain
 could omit a new router port indefinitely. Software carries the whole stream
@@ -412,8 +475,11 @@ mroute family=4 table=253 group=239.8.1.5 src=10.0.0.52 in=eth4 oifs=eth3 \
 
 `oifs` names the VIF devices the kernel listed; `listeners` names the physical
 ports and tags the hardware was actually given, which is where a bridge oif
-becomes several. The states are `installed`, `pending`, and the refusals above,
-each distinct so an operator can tell them apart. `mroute_policy_rules`
+becomes several. The states are `installed`, `pending`, `pending-bridged`, and
+the refusals above, each distinct so an operator can tell them apart. A group
+routed through a bridge names the bridge as `in`: the port its stream arrives
+on is the bridged group's to know, and that row — `mcast … routed=eth3/287` —
+names it, with its own copies beside the routed ones. `mroute_policy_rules`
 is the one most likely to be needed: a single non-default ipmr rule keeps a
 whole family in software and nothing else on the box would say so.
 
@@ -429,8 +495,11 @@ whole family in software and nothing else on the box would say so.
   software for its whole life.
 - **Tunnel and register VIFs.** PIM-SM's register VIF is a software tunnel and
   an IPIP VIF encapsulates on egress; neither is a port.
-- **A bridged ingress.** The key names one port.
-- **Merging with a bridged group for the same `(S,G)`.** Open; see above.
+- **A bridge whose per-VLAN multicast snooping is on.** Whether a bridge is a
+  multicast router is read from `br_multicast_router()`, which answers for the
+  bridge's global context; with `mcast_vlan_snooping` each VLAN has its own,
+  and no exported call reads it. A per-VLAN router state that differs from the
+  global one is not seen.
 - **The Wi-Fi path.** A VAP is not a CDX physical port and a routed group's
   listener must be one. Wire-to-Wi-Fi multicast replication would go through
   the VWD path, which is a different encoder.
@@ -479,6 +548,35 @@ cannot be observed from a passing test: that the FIB handler allocates
 across `cdx_ft_begin()`, that the two learners' mutexes are never nested, that
 every reference has exactly one release path, and that `MFC_OFFLOAD` is cleared
 before the reference that keeps the entry alive goes.
+
+The shared stream is covered from both ends. `mroute_learner.c` derives a
+parent on a bridge and on a VLAN device above one into a published plan with
+no ingress port, and refuses the shapes a bridge does not hand up.
+`mroute_refresh.c` runs the real worker: a group routed through a bridge never
+reaches `cdx_mc_group_add()`, its state and `MFC_OFFLOAD` follow what the
+bridged learner reports, its counters are the bridged group's less the ingress
+tag, and a parent moving back to a port withdraws the route. It also runs two
+MFC entries on one port's two VLANs, the second `refused-contested` until the
+first retires. `mcast_learner.c` runs the bridged half: the union and its
+ceiling, a duplicate framing, the MTU bound, retention while either learner
+names a group, the group a route creates for itself and the join that fills
+it, which VLANs a VIF on a bridge receives, a bridge that is not a multicast
+router, a VIF with no route (`refused-routed`), and a departing device.
+`mcast_hm.c` checks a routed copy's entry: the hop decrement first, a zero DSCP
+word, the header from the egress port.
+
+**Rig** — `test_flowtable_service_multicast_bridge.py::`
+`test_flowtable_service_multicast_bridge_and_route`, both families. IPTV in
+untagged on the WAN port, bridged to the set-top box on VLAN 289 and routed by
+`smcroute` from `br-ftmcast.289` into VLAN 286 on the same LAN port, with the
+bridge a multicast router. It asserts the one `mcast` row carries both
+(`ports=eth3/289 routed=eth3/286`), the `mroute` row is `installed` through
+the bridge and `ip mroute` says `offload`; then, on the wire, the bridged copy
+has the sender's MAC and hop count 64 and the routed copy the port's MAC, the
+group's and 63, each whole and once, with the classifier counting at least 95%
+and the ingress CPU under 10%, and `ip -s mroute` counting the stream. The box
+leaving keeps the routed copy in hardware alone; the route going retires the
+group.
 
 **Rig** — `tools/tests/test_mcast_e2e.py`, which grew a routed section beside
 its bridged one. The DUT routes rather than bridges, which is its shipping
@@ -556,8 +654,8 @@ Two clauses of the contract are not reachable from this rig and are covered by
 the host harness alone. A **threshold above 1** needs a daemon that writes one,
 and every daemon in the contract writes 1. **`refused-host`** needs the box to
 have joined the group on its own ingress interface, which nothing here does.
-`refused-contested` is likewise host-only: it needs the bridged learner to hold
-the same address pair, and the bridged rig cases cannot run (see `ISSUES.md`).
+`refused-contested` is likewise host-only: it needs two parents on two VLANs of
+one port for one `(S,G)`, which no daemon in the contract writes on its own.
 
 One number is worth carrying forward because it is the design working rather
 than a shortfall. `ip -s mroute` lags the hardware by up to the fold's

@@ -14,9 +14,11 @@ from ask_orch.uart import Console
 from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
-from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, rig  # noqa: F401
+from test_flowtable_offload import ARTIFACTS, WAN_IP, command, console_command, read, rig  # noqa: F401
 from test_flowtable_service import managed_service
 from test_flowtable_service_multicast import recover
+from test_mcast_e2e import dut_mac, mroute_line
+from test_mroute_capacity import _daemon
 
 BRIDGE = 'br-ftmcast'
 LAN_VID, WAN_VID, IPTV_VID = 287, 288, 289
@@ -159,7 +161,7 @@ except BaseException:
         assert not failures, failures
 
 
-@pytest.mark.parametrize('fault', ['withdrawal', 'claim-failslab'])
+@pytest.mark.parametrize('fault', ['withdrawal', 'install-failslab'])
 async def test_flowtable_service_multicast_bridge_recovery(multicast_bridge_service, fault):
     await recover(multicast_bridge_service, fault)
 
@@ -345,3 +347,189 @@ async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridg
     finally:
         await _mdb(r, TARGET_WAN_IF, group, add=False)
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+
+
+# ---- one stream, bridged and routed ----------------------------------------
+#
+# The IPTV VLAN bridged to the set-top box and routed to the rest of the house.
+# The bridge hands the stream to the host on br-ftmcast.289, where ipmr routes
+# it into another VLAN of the LAN port. One classifier key, so one hardware
+# group carrying both copies (A188).
+
+ROUTED_VID = 286
+ROUTED_LISTENER = 'askftmr'
+
+
+def _iptv_row(state, group):
+    return next((g for g in state['mcast']
+                 if g['group'] == group and g['vid'] == str(IPTV_VID)), None)
+
+
+async def _iptv_group(r, group, ready, timeout=20):
+    state = await r.wait(lambda s: (row := _iptv_row(s, group)) is not None and ready(row),
+                         timeout=timeout)
+    return _iptv_row(state, group)
+
+
+def _mroute_row(state, group):
+    return next((g for g in state['mroute'] if g['group'] == group), None)
+
+
+def _assert_routed_copy(result, source_mac, group):
+    """What ipmr would have sent: the whole stream, once, from the egress
+    port's address to the group's, one hop fewer."""
+    assert not result['errors'], result
+    assert result['seen'].get('1') == list(range(FRAMING_COUNT)), result
+    assert result['duplicates'] == 0 and result['fragments'] == 0, result
+    assert result['sources'] == [source_mac.lower()], result
+    assert result['destinations'] == [multicast_mac(group).hex(':')], result
+    assert result['hops'] == [63], result
+
+
+async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_service):
+    """IPTV in on the WAN port, bridged to the set-top box on VLAN 289 and
+    routed by smcroute from br-ftmcast.289 into VLAN 286 on the same LAN port.
+
+    Both copies come out of one classifier entry. The bridged one keeps the
+    sender's MAC and hop count; the routed one leaves with the port's address
+    and one hop fewer, taken off in its own listener entry because the root
+    keeps the count for the bridged copy. That per-copy decrement is the part
+    no earlier run has measured: a replica sharing its IP header with its
+    siblings would show here as 63 on both, or 62 on the routed one. The
+    classifier counts the stream and the ingress CPU does not see it, so
+    neither copy is Linux's.
+
+    Then each learner lets go of its own half. The box leaving keeps the group
+    in hardware for the routed copy alone; the route going retires it."""
+    r = multicast_bridge_service
+    family = r.multicast_family
+    group = '239.9.5.4' if family == 4 else 'ff1e::9:5:4'
+    # A source that passes the IPv4 source check on the VIF: the WAN segment.
+    source = WAN_IP if family == 4 else r.multicast_source
+    iptv_dev, routed_dev = f'{BRIDGE}.{IPTV_VID}', f'{BRIDGE}.{ROUTED_VID}'
+    undo = []
+    lan_created = False
+
+    async def run(*argv, reverse=None):
+        await command(r.target, r.session, *argv)
+        if reverse:
+            undo.append(reverse)
+
+    try:
+        links = {i['ifname'] for i in json.loads(
+            (await command(r.target, r.session, 'ip', '-j', 'link', 'show'))['stdout'])}
+        # Where the WAN PVID is not the IPTV VLAN, the bridge has no device on
+        # it yet: the host receives nothing of VLAN 289 without one.
+        if iptv_dev not in links:
+            await run('bridge', 'vlan', 'add', 'dev', BRIDGE, 'vid', str(IPTV_VID), 'self',
+                      reverse=['bridge', 'vlan', 'del', 'dev', BRIDGE, 'vid',
+                               str(IPTV_VID), 'self'])
+            await run('ip', 'link', 'add', 'link', BRIDGE, 'name', iptv_dev, 'type', 'vlan',
+                      'id', str(IPTV_VID), reverse=['ip', 'link', 'del', iptv_dev])
+            await run('ip', 'link', 'set', iptv_dev, 'up')
+        # The LAN the stream is routed into: VLAN 286, tagged on the LAN port.
+        await run('bridge', 'vlan', 'add', 'dev', TARGET_LAN_IF, 'vid', str(ROUTED_VID),
+                  reverse=['bridge', 'vlan', 'del', 'dev', TARGET_LAN_IF, 'vid',
+                           str(ROUTED_VID)])
+        await run('bridge', 'vlan', 'add', 'dev', BRIDGE, 'vid', str(ROUTED_VID), 'self',
+                  reverse=['bridge', 'vlan', 'del', 'dev', BRIDGE, 'vid',
+                           str(ROUTED_VID), 'self'])
+        await run('ip', 'link', 'add', 'link', BRIDGE, 'name', routed_dev, 'type', 'vlan',
+                  'id', str(ROUTED_VID), reverse=['ip', 'link', 'del', routed_dev])
+        await run('ip', 'link', 'set', routed_dev, 'up')
+        # The bridge a multicast router: it hands the IPTV stream to the host.
+        await run('ip', 'link', 'set', 'dev', BRIDGE, 'type', 'bridge', 'mcast_router', '2',
+                  reverse=['ip', 'link', 'set', 'dev', BRIDGE, 'type', 'bridge',
+                           'mcast_router', '1'])
+        if family == 4:
+            # The VIF may carry no address of its own (the tagged-WAN bench),
+            # and strict source validation would drop the stream there.
+            # Slashes, because the device name has a dot in it.
+            for name in ('all', iptv_dev):
+                key = f'net/ipv4/conf/{name}/rp_filter'
+                old = (await read(r.target, r.session, f'/proc/sys/{key}')).strip()
+                await run('sysctl', '-w', f'{key}=0', reverse=['sysctl', '-w', f'{key}={old}'])
+        result = await lan_run_python(r.lan, f'''
+import subprocess
+subprocess.run(['ip','link','add','link',{LAN_NIC!r},'name',{ROUTED_LISTENER!r},'type','vlan','id',{str(ROUTED_VID)!r}],check=True)
+subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
+''', label='multicast_bridge_routed_listener', timeout=15)
+        assert result.rc == 0, result.stdout
+        lan_created = True
+        egress_mac = await dut_mac(r.target, r.session, TARGET_LAN_IF)
+
+        # The set-top box on VLAN 289, and a listener on the routed LAN, whose
+        # membership is what sends ipmr's copy out of the LAN port at all.
+        await _mdb(r, TARGET_LAN_IF, group)
+        await run('bridge', 'mdb', 'replace', 'dev', BRIDGE, 'port', TARGET_LAN_IF,
+                  'grp', group, 'vid', str(ROUTED_VID), 'permanent',
+                  reverse=['bridge', 'mdb', 'del', 'dev', BRIDGE, 'port', TARGET_LAN_IF,
+                           'grp', group, 'vid', str(ROUTED_VID)])
+        async with _daemon(r.target, r.session, [iptv_dev, routed_dev]) as ctl:
+            await ctl('add', iptv_dev, source, group, routed_dev)
+            # The first frames teach the bridged learner the stream.
+            await _from_wan(r, new_config(family, source, group, FRAMING_PORT, []),
+                            16, r.wan_mac)
+            row = await _iptv_group(r, group, lambda g: g['state'] == 'installed'
+                                    and g['routed'] != '-')
+            assert row['ports'] == f'{TARGET_LAN_IF}/{IPTV_VID}', row
+            assert row['routed'] == f'{TARGET_LAN_IF}/{ROUTED_VID}', row
+            assert row['in'] == TARGET_WAN_IF and row['smac'] == r.wan_mac.lower(), row
+            state = await r.wait(lambda s: (m := _mroute_row(s, group)) is not None
+                                 and m['state'] == 'installed', timeout=15)
+            routed = _mroute_row(state, group)
+            assert routed['in'] == BRIDGE, routed
+            assert routed['listeners'] == f'{TARGET_LAN_IF}/{ROUTED_VID}', routed
+            line, _ = await mroute_line(r.target, r.session, family, source, group)
+            assert 'offload' in line, line
+
+            result, before, after, cpu = await _window(
+                r, group, source, r.lan, [LISTENER, ROUTED_LISTENER],
+                lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+                'multicast-bridge-and-route')
+            _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
+            _assert_routed_copy(result[ROUTED_LISTENER], egress_mac, group)
+            counted = int(_iptv_row(after, group)['packets']) - \
+                int(_iptv_row(before, group)['packets'])
+            assert counted >= FRAMING_COUNT * 0.95, (before, after)
+            assert cpu < FRAMING_COUNT * 0.1, cpu
+            # ipmr's own counters are the classifier's, folded: a daemon
+            # ageing its routes sees the stream flow.
+            _, packets = await mroute_line(r.target, r.session, family, source, group)
+            assert packets >= FRAMING_COUNT, packets
+
+            # The set-top box leaves. The group stays in hardware for the
+            # routed copy alone: its root retires only when both are empty.
+            await _mdb(r, TARGET_LAN_IF, group, add=False)
+            row = await _iptv_group(r, group, lambda g: g['ports'] == '-'
+                                    and g['state'] == 'installed')
+            assert row['routed'] == f'{TARGET_LAN_IF}/{ROUTED_VID}', row
+            result, before, after, cpu = await _window(
+                r, group, source, r.lan, [LISTENER, ROUTED_LISTENER],
+                lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+                'multicast-route-alone')
+            assert not result[LISTENER]['seen'], result
+            _assert_routed_copy(result[ROUTED_LISTENER], egress_mac, group)
+            assert cpu < FRAMING_COUNT * 0.1, cpu
+
+            # And the route goes: nothing names the group, and it retires.
+            await ctl('remove', iptv_dev, source, group)
+            await r.wait(lambda s: _iptv_row(s, group) is None
+                         and _mroute_row(s, group) is None, timeout=15)
+    finally:
+        failures = []
+        # Already gone on the passing path; a failure midway may have left it.
+        await command(r.target, r.session, 'bridge', 'mdb', 'del', 'dev', BRIDGE, 'port',
+                      TARGET_LAN_IF, 'grp', group, 'vid', str(IPTV_VID), check=False)
+        for argv in reversed(undo):
+            result = await command(r.target, r.session, *argv, check=False)
+            if result['rc']:
+                failures.append(result)
+        if lan_created:
+            result = await lan_run_python(
+                r.lan, f"import subprocess\nsubprocess.run(['ip','link','del',{ROUTED_LISTENER!r}],check=True)\n",
+                label='multicast_bridge_routed_listener_cleanup', timeout=15)
+            if result.rc:
+                failures.append(result.stdout)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+        assert not failures, failures

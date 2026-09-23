@@ -10,8 +10,8 @@ typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
 #define FT_MR_OIF_TEXT 136
-#define CDX_FT_VLAN_MAX 2
 #define CDX_MC_MAX_LISTENERS 8
+#define CDX_FT_VLAN_MAX 2
 #define ETH_HLEN 14
 #define VLAN_HLEN 4
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -64,6 +64,14 @@ static void adopted(struct ft_mr_group *g, struct cdx_mc_group *hw)
     g->folded_packets = g->folded_bytes = 0;
 }
 
+/* What ft_mr_counters() decides before a fold: only a group something in
+ * hardware carries has a count to fold, with its own ingress framing. */
+static void fold(struct ft_mr_group *g, const struct cdx_ft_counters *c)
+{
+    if (g->hw)
+        ft_mr_fold(g, c, g->in_tags);
+}
+
 int main(void)
 {
     struct mr_mfc mfc;
@@ -79,62 +87,62 @@ int main(void)
      * before the worker installs it. With no hardware group there is
      * nothing to fold. */
     cpu_forwards(&mfc, 10);
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 10);
 
     /* Installed: a fresh group's zero adds nothing, and erases nothing. */
     adopted(&g, &first);
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 10);
     hw = (struct cdx_ft_counters){ 5, 5 * FRAME };
     jiffies = 2000;
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 15);
     assert(mfc.mfc_un.res.lastuse == 2000);
     /* Folding the same counts twice is not new traffic, and not new use. */
     jiffies = 3000;
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 15);
     assert(mfc.mfc_un.res.lastuse == 2000);
 
     /* Refused: the hardware group goes and the CPU carries three more. */
     g.hw = NULL;
     cpu_forwards(&mfc, 3);
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 18);
 
     /* Admitted again: a new hardware group, counting from zero. The entry's
      * count may not go back to it. */
     adopted(&g, &second);
     hw = (struct cdx_ft_counters){ 0, 0 };
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 18);
     hw = (struct cdx_ft_counters){ 2, 2 * FRAME };
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 20);
 
     /* A tagged ingress: the tag is framing the kernel never counted. */
     g.in_tags = 1;
     hw = (struct cdx_ft_counters){ 6, 2 * FRAME + 4 * (FRAME + VLAN_HLEN) };
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 24);
 
     /* Bytes moved but no packet yet: the two were read apart. Nothing is
      * added now and nothing is lost -- the next fold carries them. */
     hw.bytes += FRAME + VLAN_HLEN;
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 24);
     hw.packets += 1;
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 25);
 
     /* A sample below what was already folded is distrusted: no wrap into a
      * huge addition, no jump, and the baseline stays where it was. */
     hw = (struct cdx_ft_counters){ 1, FRAME + VLAN_HLEN };
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 25);
     hw = (struct cdx_ft_counters){ 8, 2 * FRAME + 6 * (FRAME + VLAN_HLEN) };
-    ft_mr_fold(&g, &hw);
+    fold(&g, &hw);
     counted(&mfc, 26);
     return 0;
 }

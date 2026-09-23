@@ -22,11 +22,15 @@ typedef uint64_t u64;
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define smp_load_acquire(p) (*(p))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define kzalloc(n, f) calloc(1, (n))
+#define GFP_KERNEL 0
 #define kfree free
 #define strscpy(d, s, n) snprintf(d, n, "%s", s)
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
+static void INIT_LIST_HEAD(struct list_head *h) { h->next = h->prev = h; }
 static void list_add(struct list_head *n, struct list_head *h)
 { n->next = h->next; n->prev = h; h->next->prev = n; h->next = n; }
 static void list_del(struct list_head *n)
@@ -42,7 +46,8 @@ static void list_move(struct list_head *n, struct list_head *h)
          p = t, t = container_of(t->m.next, __typeof__(*t), m))
 #define list_first_entry_or_null(h, t, m) \
     ((h)->next == h ? NULL : container_of((h)->next, t, m))
-struct net_device { unsigned refs; };
+struct net_device { unsigned refs; bool bridge; };
+static bool netif_is_bridge_master(const struct net_device *d) { return d->bridge; }
 struct mr_mfc { int mfc_flags; unsigned refs; };
 union nf_inet_addr { u32 all[4]; };
 struct cdx_ft_vlan { u16 proto, id; };
@@ -61,7 +66,7 @@ static int ft_mr_lock, ft_mr_queue_lock, rtnl, ctrl;
 static struct ft_mr_vif ft_mr_vif[2][MAXVIFS];
 static unsigned ft_mr_count, ft_mr_installed, ft_mr_policy[2];
 static u64 ft_mr_refused, ft_mr_install_errors;
-static bool ft_mr_stopping, ft_mr_recheck, claimed;
+static bool ft_mr_stopping, ft_mr_recheck, ft_mr_key_freed, ft_mr_taps_stale;
 static bool ft_mr_ready;
 static unsigned long ft_mr_resync_pending;
 static unsigned ft_mr_idx(u8 family) { return family == AF_INET6; }
@@ -102,15 +107,46 @@ static void cancel_work_sync(struct work_struct *w)
     if (simulate_rearm)
         schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
 }
-static int ft_mc_claim_take(u8 family, const union nf_inet_addr *s,
-                            const union nf_inet_addr *d)
+/* The bridged learner, as the routed worker reaches it: every call takes
+ * ft_mc_lock, which may never nest inside ft_mr_lock, RTNL or the
+ * transaction. The route is the one a group routed through a bridge
+ * publishes; `carried` is what the bridged learner would report back. */
+static int ft_mc_lock;
+static struct net_device bridge;
+static bool through_bridge, carried;
+static unsigned publishes, withdrawals, taps_published;
+static struct cdx_ft_counters bridged_count = { .packets = 7, .bytes = 7 * 578 };
+static void bridged_side(void)
 {
-    if (claimed) return -EEXIST;
-    claimed = true; return 0;
+    assert(!ft_mr_lock && !rtnl && !ctrl && !ft_mc_lock);
 }
-static void ft_mc_claim_give(u8 family, const union nf_inet_addr *s,
-                            const union nf_inet_addr *d)
-{ assert(claimed); claimed = false; }
+static bool ft_mc_route_publish(struct ft_mc_route *r, const struct ft_mc_route *want)
+{
+    bridged_side();
+    publishes++;
+    assert(want->bridge == &bridge && want->listeners == wanted);
+    for (unsigned i = 0; i < want->listeners; i++)
+        assert(want->listener[i].dev == &output[i]);
+    r->linked = true;
+    r->carried = carried;
+    return carried;
+}
+static void ft_mc_route_withdraw(struct ft_mc_route *r)
+{
+    bridged_side();
+    withdrawals++;
+    r->linked = false;
+    r->carried = false;
+}
+static bool ft_mc_route_state(struct ft_mc_route *r, struct cdx_ft_counters *stats,
+                              u8 *in_tags)
+{
+    assert(ft_mr_lock);   /* a leaf lock, readable under this learner's */
+    *stats = bridged_count;
+    *in_tags = 1;
+    return r->carried;
+}
+static void ft_mr_publish_taps(void) { bridged_side(); taps_published++; }
 static bool ft_mr_apply(struct ft_mr_event *e) { abort(); }
 static void ft_mr_lost_event(u8 family) { abort(); }
 static void ft_mr_event_free(struct ft_mr_event *e) { abort(); }
@@ -120,18 +156,27 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
     assert(rtnl);
     derives++;
     if (refuse) return FT_MR_REFUSED_LISTENER;
-    p->spec.in = &input;
-    dev_hold(&input);
+    if (through_bridge) {
+        p->via = &bridge;
+        p->via_vid = 289;
+        p->via_tagged = true;
+        p->mtu = 1500;
+        dev_hold(&bridge);
+    } else {
+        p->spec.in = &input;
+        dev_hold(&input);
+    }
     p->spec.listeners = wanted;
     for (unsigned i = 0; i < wanted; i++) {
         p->spec.listener[i].dev = &output[i];
+        p->spec.listener[i].routed = true;
         dev_hold(&output[i]);
     }
     return FT_MR_PENDING;
 }
 static int cdx_mc_group_add(const struct cdx_mc_group_spec *s, struct cdx_mc_group **hw)
 {
-    assert(ctrl && !hardware.live && claimed);
+    assert(ctrl && !hardware.live && s->in);
     adds++;
     if (fail_add) return -ENOMEM;
     hardware.live = true;
@@ -156,8 +201,10 @@ static void cdx_mc_group_del(struct cdx_mc_group **hw)
 }
 static void cdx_mc_group_stats(struct cdx_mc_group *hw, struct cdx_ft_counters *c)
 { assert(ctrl && hw->live); memset(c, 0, sizeof(*c)); }
-static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c)
-{ folds++; }
+static unsigned folded_tags;
+static struct cdx_ft_counters folded;
+static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c, u8 tags)
+{ folds++; folded = *c; folded_tags = tags; }
 #include "mroute_refresh.inc"
 static void run(void)
 { ft_mr_work.queued = false; ft_mr_work_fn(&ft_mr_work); }
@@ -205,7 +252,7 @@ int main(void)
     fail_replace = fail_add = true;
     refresh();
     assert(replaces == 3 && deletes == 1 && !hardware.live);
-    assert(!g->hw && !g->claimed && !claimed && !g->offloaded);
+    assert(!g->hw && !g->offloaded);
     assert(!cache.mfc_flags && !ft_mr_installed);
     assert(!input.refs && !output[0].refs && !output[1].refs);
     assert(g->state == FT_MR_REFUSED_FAILED && g->retries == FT_MR_MAX_RETRIES);
@@ -221,7 +268,7 @@ int main(void)
      * restored eligibility even while no group is installed. */
     refuse = true;
     refresh();
-    assert(!hardware.live && !ft_mr_installed && !input.refs && !claimed);
+    assert(!hardware.live && !ft_mr_installed && !input.refs);
     refuse = false;
     refresh();
     assert(hardware.live && hardware.copies == 2 && g->offloaded);
@@ -232,14 +279,98 @@ int main(void)
     ft_mr_device_gone(&output[1]);
     rtnl_unlock();
     assert(!input.refs && !output[0].refs && !output[1].refs);
+    assert(!ft_mr_taps_stale);   /* a port: the VIFs on bridges stand */
     wanted = 1;
     run();
     assert(hardware.live && hardware.copies == 1 && output[0].refs == 1);
 
+    /* A bridge going down: the bridged learner drops its taps, and ipmr
+     * keeps the VIFs, so nothing but this would publish them again. */
+    bridge.bridge = true;
+    ft_mr_work.queued = false;
+    rtnl_lock();
+    ft_mr_device_gone(&bridge);
+    rtnl_unlock();
+    assert(ft_mr_taps_stale && ft_mr_work.queued);
+    ft_mr_taps_stale = false;
+    bridge.bridge = false;
+
+    /* A second entry for the same (S,G) arriving on the same port -- another
+     * VLAN of it, which the key does not name -- is one classifier entry
+     * whose root validates one tag stack. It is refused, not installed over
+     * the first, and takes the key in the same pass the first gives it up. */
+    {
+        struct mr_mfc other = { .refs = 1 };
+        struct ft_mr_group *h = calloc(1, sizeof(*h));
+        unsigned added = adds;
+
+        assert(h);
+        h->mfc = &other;
+        h->family = AF_INET;
+        h->dirty = true;
+        list_add(&h->list, &ft_mr_groups);
+        ft_mr_count = 2;
+        run();
+        assert(h->state == FT_MR_REFUSED_CONTESTED && !h->hw && !h->offloaded);
+        assert(adds == added && g->hw && g->state == FT_MR_INSTALLED);
+        assert(ft_mc_lock == 0 && !ft_mr_lock);
+        g->gone = true;
+        run();
+        assert(adds == added + 1 && h->hw && h->state == FT_MR_INSTALLED);
+        assert(h->offloaded && other.mfc_flags == MFC_OFFLOAD && !cache.refs);
+        g = h;
+        cache = other;
+        g->mfc = &cache;
+    }
+
+    /* Routed through a bridge: nothing of its own goes into hardware. The
+     * copies are published to the bridged learner, the state follows what it
+     * reports, and the counters folded into the MFC are the bridged group's,
+     * less the ingress framing it reports -- one tag here. */
+    {
+        unsigned added = adds, before = publishes, withdrawn = withdrawals;
+
+        through_bridge = true;
+        ft_mr_recheck = true;
+        run();
+        /* Its own entry, keyed on a port the stream no longer arrives on,
+         * comes out; the route goes to the bridged learner instead. */
+        assert(!hardware.live && !g->hw && adds == added);
+        assert(publishes == before + 1 && g->route && g->route->linked);
+        assert(g->state == FT_MR_BRIDGED && !g->offloaded && !cache.mfc_flags);
+        assert(g->via == &bridge && bridge.refs == 1 && !input.refs);
+        assert(!strcmp(ft_mr_state_text(g->state), "pending-bridged"));
+        assert(!ft_mr_refusal(g->state));
+        /* The bridged group installs and says so; the kick re-derives. */
+        carried = true;
+        ft_mr_recheck = true;
+        run();
+        assert(g->state == FT_MR_INSTALLED && g->offloaded &&
+               cache.mfc_flags == MFC_OFFLOAD && !hardware.live);
+        unsigned folding = folds;
+        refresh();
+        assert(folds == folding + 1 && folded.packets == 7 && folded_tags == 1);
+        /* And stops carrying it. */
+        carried = false;
+        ft_mr_recheck = true;
+        run();
+        assert(g->state == FT_MR_BRIDGED && !g->offloaded && !cache.mfc_flags);
+        folding = folds;
+        refresh();
+        assert(folds == folding);
+        /* The parent moving back to a port takes the route back. */
+        through_bridge = false;
+        ft_mr_recheck = true;
+        run();
+        assert(withdrawals == withdrawn + 1 && !g->route->linked);
+        assert(hardware.live && g->hw && g->state == FT_MR_INSTALLED);
+        assert(!bridge.refs && g->via == NULL);
+    }
+
     /* Deleting the route leaves no hardware key, port or MFC reference. */
     g->gone = true;
     run();
-    assert(!hardware.live && !claimed && !cache.refs && !input.refs);
+    assert(!hardware.live && !cache.refs && !input.refs);
     assert(!cache.mfc_flags && !ft_mr_count && !ft_mr_installed);
     g = calloc(1, sizeof(*g));
     assert(g);
@@ -256,7 +387,7 @@ int main(void)
     simulate_rearm = true;
     ft_mr_exit();
     assert(cancel_step == 3 && !ft_mr_work.queued && !ft_mr_stats.queued);
-    assert(!hardware.live && !claimed && !cache.refs && !cache.mfc_flags);
+    assert(!hardware.live && !cache.refs && !cache.mfc_flags);
     assert(!input.refs && !output[0].refs && !output[1].refs);
     assert(!ft_mr_count && !ft_mr_installed);
     assert(ft_mr_groups.next == &ft_mr_groups);
