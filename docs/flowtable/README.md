@@ -66,12 +66,21 @@ the other direction accelerated. Matching transient admission contention has
 explicit partial-generation recovery. Hardware flags alone do not establish
 that both directions are offloaded.
 
-Counter-enabled hardware tables are refused because firmware counters include
-classifier hits that can later be punted to Linux. Multicast, IPsec, tunnels
-and Wi-Fi each have an eligibility contract and a hardware proof of their own,
-linked from the [reading guide](#reading-guide); MACVLAN has neither and is out
-of scope, because CMM never offloaded it either. Unsupported hardware traffic
-remains governed by Linux forwarding and firewall policy.
+Counter-enabled hardware tables are admitted, since OpenWrt's firewall declares
+`counter` on every flowtable. Conntrack accounting then includes the hardware
+traffic, restated in Netfilter's units by subtracting the ingress Ethernet,
+VLAN and PPPoE framing the classifier counted. Enabling `counter` on a table
+whose flows are already in hardware keeps them there, and their hardware
+traffic is accounted from the next statistics pass. Two bounded residuals
+remain, sub-minimum frames reading high by their padding and a frame punted
+after its classifier hit counting twice; see
+[statistics](architecture.md#statistics-diagnostics-and-verification).
+
+Multicast, IPsec, tunnels and Wi-Fi each have an eligibility contract and a
+hardware proof of their own, linked from the [reading guide](#reading-guide);
+MACVLAN has neither and is out of scope, because CMM never offloaded it either.
+Unsupported hardware traffic remains governed by Linux forwarding and firewall
+policy.
 
 A PPPoE session renegotiated under a `pppN` device that never disappears is not
 detected. Every change to the device a session runs over destroys the session,

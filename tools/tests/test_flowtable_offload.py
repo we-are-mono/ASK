@@ -967,7 +967,7 @@ async def test_flowtable_offload_invalidation(rig, trigger):
     await r.table()
     await r.exchange()
     before = await r.wait(lambda s: s["entries"] == 2)
-    assert trigger in {"neighbour", "barrier", "counter"}
+    assert trigger in {"neighbour", "barrier"}
     if trigger == "barrier":
         knob = "/proc/fm_ehash_hcsync_fail"
         result = await r.target.fs_write(r.session, knob, "2")
@@ -978,9 +978,6 @@ async def test_flowtable_offload_invalidation(rig, trigger):
         finally:
             result = await r.target.fs_write(r.session, knob, "0")
             assert result["errno"] == 0, result
-    elif trigger == "counter":
-        await r.nft(f"add flowtable inet {TABLE} fast {{ hook ingress priority 0; "
-                    f"devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; counter; }}")
     else:
         await command(r.target, r.session, "ip", "neigh", "del", WAN_IP, "dev", TARGET_WAN_IF)
     state = await r.wait(lambda s: s["entries"] == 0 and (
@@ -1039,6 +1036,73 @@ async def test_flowtable_offload_table_reload(rig):
     assert after["handle_refs"] == after["neighbour_refs"] == 2, after
     r.record("table-reload", {"before": before, "probed": probed, "after": after,
                               "crowded": crowded["stderr"]})
+
+
+async def ct_counts(r):
+    """(packets, bytes) conntrack has accounted to each direction of the flow,
+    original first."""
+    listing = await command(r.target, r.session, "conntrack", "-L", "-p", r.proto,
+                            "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
+                            "--sport", str(SPORT), "--dport", str(DPORT), "-o", "extended")
+    counts = [(int(p), int(b)) for p, b in re.findall(r"packets=(\d+) bytes=(\d+)", listing["stdout"])]
+    assert len(counts) == 2, listing
+    return counts
+
+
+async def test_flowtable_offload_counter_enabled_live(rig):
+    """Enabling `counter` on a table whose flows are already in hardware keeps
+    them there and starts accounting their hardware traffic in conntrack.
+
+    Netfilter applies the flag to the live flowtable without unbinding it, so
+    the adapter sees no event: entries, cookies and bindings stay as they were
+    and nothing is invalidated. From the next statistics pass the flowtable
+    core adds each hardware delta to conntrack, restated in Netfilter's units,
+    so a 256-byte payload counts 284 bytes in either direction.
+
+    Until then hardware traffic reaches the flowtable core but not conntrack.
+    A statistics pass runs within about four seconds of the last packet at the
+    default 30-second timeout, so the pause before the change lets one consume
+    everything earlier, and the delta measured after it is this test's own."""
+    r = rig
+    if (await r.state())["observe"]:
+        pytest.skip("live counter enablement requires installed hardware")
+    await r.table()
+    await r.exchange()
+    installed = await r.wait(lambda s: s["entries"] == 2)
+    await r.exchange(32)
+    await asyncio.sleep(8)
+    await r.nft(f"add flowtable inet {TABLE} fast {{ hook ingress priority 0; "
+                f"devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; counter; }}")
+    listed = await command(r.target, r.session, "nft", "list", "flowtable", "inet", TABLE, "fast")
+    assert "counter" in listed["stdout"], listed
+    enabled = await r.state()
+    counted = await ct_counts(r)
+    tx_before = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
+    count, payload = 64, 256
+    await r.exchange(count, payload_size=payload)
+    tx_after = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
+    after = await r.state()
+    expected = [(packets + count, octets + count * (payload + 8 + 20)) for packets, octets in counted]
+    accounted, deadline = counted, time.monotonic() + 15
+    while time.monotonic() < deadline:
+        accounted = await ct_counts(r)
+        if all(now[0] >= wanted[0] for now, wanted in zip(accounted, expected)):
+            break
+        await asyncio.sleep(0.5)
+    r.record("counter-enabled-live", {"installed": installed, "enabled": enabled, "after": after,
+                                      "conntrack_before": counted, "conntrack_after": accounted,
+                                      "expected": expected, "software_lan_tx": tx_after - tx_before})
+    for state in (enabled, after):
+        assert state["entries"] == state["bindings"] == 2, state
+        assert state["invalidated"] == state["invalidation_done"] == state["fatal"] == 0, state
+        assert (state["installs"], state["deletes"], state["rearms"], state["errors"]) == (
+            installed["installs"], installed["deletes"], installed["rearms"], installed["errors"]), (installed, state)
+    old, new = {f["in"]: f for f in enabled["flows"]}, {f["in"]: f for f in after["flows"]}
+    assert {f["in"]: f["cookie"] for f in installed["flows"]} == {i: f["cookie"] for i, f in new.items()}
+    for ingress, flow in new.items():
+        assert int(flow["packets"]) - int(old[ingress]["packets"]) == count, (enabled, after)
+    assert 0 <= tx_after - tx_before < count // 2, (tx_before, tx_after)
+    assert accounted == expected, (counted, accounted, expected)
 
 
 async def terminal_stream(r, duration=12):
