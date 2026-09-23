@@ -715,6 +715,94 @@ print(json.dumps(results))
     r.record("exceptions", {"results": json.loads(result.stdout.strip()), "state": await r.state()})
 
 
+async def ct_listing(r):
+    """The test flow's conntrack line as `conntrack -L -o id` prints it.
+
+    The third column is the remaining timeout in seconds, the id names this
+    conntrack rather than its tuple, and a flow hardware holds prints as
+    [HW_OFFLOAD], which conntrack(8) shows in place of [OFFLOAD]."""
+    result = await command(r.target, r.session, "conntrack", "-L", "-p", r.proto,
+                           "--orig-src", r.lan_ip, "--orig-dst", WAN_IP,
+                           "--sport", str(SPORT), "--dport", str(DPORT), "-o", "id")
+    lines = [line for line in result["stdout"].splitlines() if line.startswith(r.proto + " ")]
+    assert len(lines) == 1, result
+    return lines[0]
+
+
+async def test_flowtable_offload_conntrack_timeout_extension(rig):
+    """A packet that still reaches conntrack after admission cuts the offloaded
+    conntrack's timeout back to its protocol's. The flowtable GC must lift it
+    again on its next pass, or the conntrack expires under a flow hardware is
+    still carrying and its retirement takes the hardware flow with it.
+
+    The stream timeout is shortened to ten seconds so the window fits in a
+    test, and one same-tuple frame software has to handle -- TTL 1, which
+    Linux answers with Time Exceeded only after conntrack has seen it -- resets
+    the conntrack to it. Thirty seconds of hardware-only traffic follow, three
+    of those timeouts, with a table dump every round: a dump evicts any
+    expired conntrack it walks past, so one left to lapse dies inside the
+    window instead of waiting for conntrack's own GC to find it."""
+    r = rig
+    if (await r.state())["observe"]:
+        pytest.skip("timeout extension requires installed hardware")
+    await r.table()
+    opened = time.monotonic()
+    await r.exchange()
+    installed = await r.wait(lambda s: s["entries"] == 2)
+    admitted = await ct_listing(r)
+    assert "[HW_OFFLOAD]" in admitted, admitted
+    identity = re.search(r"\bid=(\d+)", admitted)[1]
+    knob = "net.netfilter.nf_conntrack_udp_timeout_stream"
+    old = (await read(r.target, r.session, "/proc/sys/" + knob.replace(".", "/"))).strip()
+    await command(r.target, r.session, "sysctl", "-w", f"{knob}=10")
+    try:
+        # udp_packet() applies the stream timeout only to a connection older
+        # than two seconds; a younger one would get the unreplied timeout.
+        await asyncio.sleep(max(0.0, 2.5 - (time.monotonic() - opened)))
+        script = f'''
+import json
+from scapy.all import Ether, IP, UDP, ICMP, Raw, srp1
+packet = IP(src={r.lan_ip!r}, dst={WAN_IP!r}, ttl=1)/UDP(sport={SPORT}, dport={DPORT})/Raw(b'ASK-ct-refresh')
+answer = srp1(Ether(dst={r.dut_lan_mac!r})/packet, iface={LAN_NIC!r}, timeout=3, verbose=False)
+assert answer is not None and ICMP in answer, answer
+assert (answer[ICMP].type, answer[ICMP].code) == (11, 0), answer.summary()
+print(json.dumps(answer.summary()))
+'''
+        result = await lan_run_python(r.lan, script, timeout=15, label="flowtable_ct_refresh")
+        assert result.rc == 0, result.stdout
+        assert not r.echo.received[b"ASK-ct-refresh"]
+        before = await r.state()
+        assert {f["cookie"] for f in before["flows"]} == {f["cookie"] for f in installed["flows"]}, before
+        tx_before = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
+        sent, rounds = 0, []
+        window = time.monotonic() + 30
+        while time.monotonic() < window:
+            await r.exchange(16, promiscuous=False)
+            sent += 16
+            listing = await ct_listing(r)
+            rounds.append({"seconds": round(time.monotonic() - window + 30, 1), "conntrack": listing})
+            assert "[HW_OFFLOAD]" in listing and f"id={identity}" in listing.split(), rounds
+            await asyncio.sleep(1)
+        after = await r.state()
+        tx_after = await kernel_tx_packets(r.target, r.session, TARGET_LAN_IF)
+        r.record("ct-timeout-extension", {"refresh": result.stdout.strip(), "before": before,
+                                          "after": after, "rounds": rounds, "sent": sent,
+                                          "software_lan_tx": tx_after - tx_before})
+        assert after["installs"] == before["installs"] and after["deletes"] == before["deletes"], (before, after)
+        old_rows, new_rows = {f["in"]: f for f in before["flows"]}, {f["in"]: f for f in after["flows"]}
+        assert after["entries"] == 2 and new_rows.keys() == old_rows.keys(), after
+        for ingress, flow in new_rows.items():
+            assert flow["cookie"] == old_rows[ingress]["cookie"], (before, after)
+            assert int(flow["packets"]) - int(old_rows[ingress]["packets"]) == sent, (ingress, before, after)
+        # Every reply crossed the LAN port; hardware carried all of them.
+        assert 0 <= tx_after - tx_before <= 64 < sent, (tx_before, tx_after, sent)
+        # The timeout itself is not observable: neither /proc/net/nf_conntrack
+        # nor ctnetlink reports one for an offloaded conntrack. Surviving three
+        # stream timeouts of dumps that evict an expired entry is the proof.
+    finally:
+        await command(r.target, r.session, "sysctl", "-w", f"{knob}={old}")
+
+
 async def test_flowtable_offload_add_failures(rig):
     r = rig
     if (await r.state())["observe"]:
