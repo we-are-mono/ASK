@@ -1694,18 +1694,20 @@ static int ft_path_stack(struct net_device *logical, struct net_device *physical
 			 * declined by the same requirement. */
 			if (netdev_master_upper_dev_get(physical) != logical)
 				return -EOPNOTSUPP;
-			/* The bridge forwards nothing through a port STP has
-			 * taken out of FORWARDING, and its forward-path walk
-			 * does not ask; the event that retires such a port's
-			 * flows is deferred, so admission asks here. With MST
-			 * the state is per VLAN and not readable from here, so
-			 * such a bridge's ports stay in software. */
-			if (br_mst_enabled(logical) ||
-			    br_port_get_stp_state(physical) != BR_STATE_FORWARDING)
-				return -EOPNOTSUPP;
 			vid = ft_bridge_vlan(logical, physical, inner, &count);
 			if (vid < 0)
 				return vid;
+			/* The bridge carries nothing through a port, or a VLAN
+			 * of one, that is not FORWARDING. Admission runs
+			 * asynchronously to the event that retires such a
+			 * port's flows, and a refresh re-offers a flow the walk
+			 * described while the port still forwarded, so ask the
+			 * bridge, per VLAN, with the predicate its own walk
+			 * applies. MST stays software-only: a VID-to-MSTI remap
+			 * moves per-VLAN states under one bridge-wide event
+			 * that this adapter does not map onto flows. */
+			if (br_mst_enabled(logical) || !br_port_forwarding(physical, vid))
+				return -EOPNOTSUPP;
 			*bridge = logical;
 			*bridge_vid = vid;
 			break;
@@ -2849,6 +2851,110 @@ static void ft_device_retire(const struct net_device *dev, atomic64_t *counter)
 	spin_unlock_bh(&ft_watch_lock);
 }
 
+/* A port, or a VLAN of one, that stops forwarding has to stop carrying
+ * software flows as well as hardware ones. ft_device_retire() reaches only
+ * entries this adapter admitted. A flow it refused, never saw, or that
+ * another table owns keeps a valid handle, and one naming the port as its
+ * ingress is matched by the flowtable hook, which __netif_receive_skb_core()
+ * runs before the bridge's rx_handler -- so br_handle_frame() never gets to
+ * drop the frame. The forward-path walk refuses such a port from now on;
+ * this takes away what it described before.
+ *
+ * Native cleanup does the teardown, but it sleeps: it takes flowtable_lock
+ * and flushes the offload work that runs this module's rule callbacks. An
+ * MSTI's state arrives inside br_mst_set_state()'s RCU read-side section, so
+ * the port is queued instead.
+ */
+struct ft_stopped {
+	struct list_head list;
+	struct net_device *dev;
+	netdevice_tracker tracker;
+};
+
+static LIST_HEAD(ft_stopped_list);
+static DEFINE_SPINLOCK(ft_stopped_lock);
+/* An allocation failed and lost which port stopped: sweep every one. */
+static bool ft_stopped_all;
+static void ft_stopped_workfn(struct work_struct *work);
+static DECLARE_WORK(ft_stopped_work, ft_stopped_workfn);
+
+static void ft_port_stopped(struct net_device *dev)
+{
+	struct ft_stopped *stopped;
+
+	/* Unload unregisters the chain that calls this before it flushes the
+	 * work, so queueing needs no lifetime test of its own. */
+	spin_lock_bh(&ft_stopped_lock);
+	list_for_each_entry(stopped, &ft_stopped_list, list)
+		if (stopped->dev == dev)
+			goto out;
+	stopped = kzalloc(sizeof(*stopped), GFP_ATOMIC);
+	if (stopped) {
+		stopped->dev = dev;
+		netdev_hold(dev, &stopped->tracker, GFP_ATOMIC);
+		list_add_tail(&stopped->list, &ft_stopped_list);
+	} else {
+		ft_stopped_all = true;
+	}
+	schedule_work(&ft_stopped_work);
+out:
+	spin_unlock_bh(&ft_stopped_lock);
+}
+
+/* Every device a flow through dev names as its ingress: the port itself and,
+ * for a port that is a VLAN device, the real device at the bottom of it,
+ * where the forward-path walk ends. A bridge, whose own entry's VLAN
+ * stopped, stands for all of its ports. */
+static void ft_stopped_clean(struct net_device *dev)
+{
+	struct net_device *lower;
+	struct list_head *iter;
+
+	ASSERT_RTNL();
+	if (netif_is_bridge_master(dev)) {
+		netdev_for_each_lower_dev(dev, lower, iter)
+			ft_stopped_clean(lower);
+		return;
+	}
+	nf_flow_table_cleanup(dev);
+	if (is_vlan_dev(dev))
+		nf_flow_table_cleanup(vlan_dev_real_dev(dev));
+}
+
+static void ft_stopped_workfn(struct work_struct *work)
+{
+	struct ft_stopped *stopped, *next;
+	struct net_device *dev;
+	LIST_HEAD(todo);
+	bool all;
+
+	spin_lock_bh(&ft_stopped_lock);
+	list_splice_init(&ft_stopped_list, &todo);
+	all = ft_stopped_all;
+	ft_stopped_all = false;
+	spin_unlock_bh(&ft_stopped_lock);
+	/* The forward hook walks the path and inserts the flow inside one RCU
+	 * read-side section. After a grace period every flow a walk described
+	 * before the state changed is in a table for the sweep to find, and
+	 * every later walk sees the new state and refuses the path. */
+	synchronize_net();
+	/* Under RTNL, as the native NETDEV_DOWN cleanup runs: rule callbacks
+	 * only try for it, so the flush inside cannot wait on this. Never
+	 * inside the backend transaction, which those callbacks take. */
+	rtnl_lock();
+	if (all)
+		for_each_netdev(&init_net, dev)
+			if (netif_is_bridge_port(dev))
+				ft_stopped_clean(dev);
+	list_for_each_entry_safe(stopped, next, &todo, list) {
+		ft_stopped_clean(stopped->dev);
+		list_del(&stopped->list);
+		netdev_put(stopped->dev, &stopped->tracker);
+		kfree(stopped);
+	}
+	rtnl_unlock();
+}
+
 /* Retire every direction encrypted by an SA that is going away.
  *
  * An offloaded SA is a dependency of the same kind as a route or a neighbour:
@@ -3536,8 +3642,8 @@ static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *pt
 static bool ft_mc_swdev_obj(unsigned long event,
 			    struct switchdev_notifier_port_obj_info *obj);
 
-/* Whether a port attribute takes a bridge port, or one MSTI of it, out of
- * FORWARDING. */
+/* Whether a port attribute takes a bridge port, one MSTI of it, or one VLAN
+ * of it or of the bridge's own entry, out of FORWARDING. */
 static bool ft_stp_stopped(const struct switchdev_attr *attr)
 {
 	switch (attr->id) {
@@ -3545,6 +3651,8 @@ static bool ft_stp_stopped(const struct switchdev_attr *attr)
 		return attr->u.stp_state != BR_STATE_FORWARDING;
 	case SWITCHDEV_ATTR_ID_PORT_MST_STATE:
 		return attr->u.mst_state.state != BR_STATE_FORWARDING;
+	case SWITCHDEV_ATTR_ID_PORT_VLAN_STATE:
+		return attr->u.vlan_state.state != BR_STATE_FORWARDING;
 	default:
 		return false;
 	}
@@ -3587,6 +3695,7 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 		case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
 		case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
 		case SWITCHDEV_ATTR_ID_PORT_MST_STATE:
+		case SWITCHDEV_ATTR_ID_PORT_VLAN_STATE:
 		case SWITCHDEV_ATTR_ID_BRIDGE_MST:
 		case SWITCHDEV_ATTR_ID_VLAN_MSTI:
 			/* Observe only: these events can change a bridge oif's
@@ -3595,13 +3704,18 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 			if (dev && net_eq(dev_net(dev), &init_net))
 				ft_mr_kick();
 			/* A port STP takes out of FORWARDING carries nothing in
-			 * software from here on, while its hardware entries would
-			 * forward on in both directions under the shared handle.
-			 * Admission refuses such a port too; this retires what was
-			 * admitted before. An MSTI leaving FORWARDING retires the
-			 * whole port: which VLANs it covers is not readable here. */
-			if (dev && ft_stp_stopped(attr->attr))
+			 * the bridge from here on, while its hardware entries
+			 * would forward on in both directions under the shared
+			 * handle, and a software flow naming it as ingress would
+			 * carry on past br_handle_frame(). Admission refuses such
+			 * a port too; this retires what was admitted or cached
+			 * before. An MSTI or a VLAN leaving FORWARDING retires
+			 * the whole port, and the bridge's own entry every port:
+			 * rules are not mapped onto VLANs here. */
+			if (dev && ft_stp_stopped(attr->attr)) {
 				ft_device_retire(dev, &ft_stp_invalidations);
+				ft_port_stopped(dev);
+			}
 			return NOTIFY_DONE;
 		default:
 			break;
@@ -8172,6 +8286,9 @@ indirect:
 not_ready:
 	WRITE_ONCE(ft_ready, false);
 	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
+	/* A port may have stopped since the chain was registered: its sweep
+	 * runs this module's code, so it finishes before the text goes. */
+	flush_work(&ft_stopped_work);
 fdb:
 	unregister_switchdev_notifier(&ft_fdb_nb);
 nexthop:
@@ -8278,6 +8395,11 @@ static void __exit ask_flowtable_exit(void)
 		nf_flow_offload_handle_invalidate(entry->handle);
 	cdx_ft_end();
 	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
+	/* After the chain that queues it, and while the rule callbacks its
+	 * native cleanup flushes are still registered: a port that stopped
+	 * forwarding just before unload still has its software flows taken
+	 * away, and the work's text outlives it. */
+	flush_work(&ft_stopped_work);
 	unregister_switchdev_notifier(&ft_fdb_nb);
 	unregister_nexthop_notifier(&init_net, &ft_nexthop_nb);
 	unregister_fib_notifier(&init_net, &ft_fib_nb);

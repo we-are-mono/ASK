@@ -140,6 +140,28 @@ whatever its VLAN filtering setting, so a handler without that scope test
 retires every flow on the hardware whenever any device anywhere is enslaved to
 anything.
 
+The bridge's forwarding state is the last input. A port that STP, MST or a
+per-VLAN state takes out of FORWARDING carries nothing through the bridge, but
+the flowtable does not ask the bridge per frame: its hook on the port runs
+before `br_handle_frame()`, and a DIRECT tuple transmits past `br_forward()`.
+Three pieces close that. `162-bridge-forward-path-forwarding-state.patch`
+makes `br_fill_forward_path()` refuse such a port with `-EAGAIN`, which
+`nft_flow_route()` turns into no flow at all -- a flow cached on the logical
+device instead would never be offered to the port once it forwarded again --
+and exports the same test as `br_port_forwarding(port, vid)`, which admission
+asks because a refresh re-offers a flow described while the port still
+forwarded. The same patch reports a per-VLAN state set directly as
+`SWITCHDEV_ATTR_ID_PORT_VLAN_STATE`; before, only MST states had an event.
+And on any of those events leaving FORWARDING the adapter retires its hardware
+entries through the port and queues `nf_flow_table_cleanup()` for it, which
+reaches the software flows no handle names: the ones admission refused and the
+ones another table owns. The sweep is queued because an MSTI's state arrives
+inside an RCU read-side section and native cleanup sleeps; it waits out a
+grace period first, so a flow whose walk read the old state is already in the
+table to be found. With spanning tree off, `bridge link set ... state 4` never
+sticks -- `br_port_state_selection()` puts a designated port straight back to
+FORWARDING -- so the rig blocks a port under user-space STP.
+
 One FDB change is not reported and so is not watched: an entry added from
 userspace as dynamic — `bridge fdb add <mac> dev <port> master dynamic` —
 takes `br_switchdev_fdb_notify()`'s early return for a user-added entry that

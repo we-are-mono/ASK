@@ -95,6 +95,7 @@ struct ipv6hdr { u8 prefix[8]; struct in6_addr saddr, daddr; };
 static void set_bit(unsigned int bit, unsigned long *p) { *p |= 1UL << bit; }
 #define NETEVENT_XFRM_POLICY_UPDATE 190
 #define GFP_KERNEL 0
+#define GFP_ATOMIC 1
 #define HZ 100
 /* A warn that fires is a bug the kernel would only log; here it fails the run,
  * which is what an invariant stated with WARN_ON_ONCE deserves from a test.
@@ -269,7 +270,7 @@ struct net_device { int ifindex, refs, mtu, ip6_mtu; u8 dev_addr[6]; struct net 
                     struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
                     bool bridge, vlan_filtering, stp_blocked, mst; struct net_device *master;
                     u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
-                    unsigned br_nvlans; };
+                    unsigned br_nvlans; u16 vid_blocked; };
 #define netdev_priv(d) ((d)->priv)
 /* A device's IPv6 MTU starts as the device's own, as addrconf sets it; a case
  * that needs the sysctl to differ sets ip6_mtu. */
@@ -295,6 +296,7 @@ static bool ipv6_addr_is_multicast(const struct in6_addr *a)
 { return a->s6_addr[0] == 0xff; }
 static bool is_vlan_dev(const struct net_device *d) { return d->real_dev && !d->bridge; }
 static bool netif_is_bridge_master(const struct net_device *d) { return d->bridge; }
+static bool netif_is_bridge_port(const struct net_device *d) { return d->master && d->master->bridge; }
 static struct net_device *netdev_master_upper_dev_get(struct net_device *d) { return d->master; }
 /* A port forwards unless a case blocks it, and MST is off unless a case turns
  * it on: the state every other case's bridge is in. */
@@ -303,8 +305,14 @@ static struct net_device *netdev_master_upper_dev_get(struct net_device *d) { re
 #define BR_STATE_LEARNING 2
 #define BR_STATE_FORWARDING 3
 #define BR_STATE_BLOCKING 4
-static u8 br_port_get_stp_state(const struct net_device *d)
-{ return d->stp_blocked ? BR_STATE_BLOCKING : BR_STATE_FORWARDING; }
+/* The bridge's own answer, which it derives from the port's STP state and,
+ * with VLAN filtering, the port's and its own entry's state for that VLAN.
+ * Modelled as the port's state and one VLAN a case can block on it. */
+static bool br_port_forwarding(const struct net_device *d, u16 vid)
+{
+    assert(netif_is_bridge_port(d));
+    return !d->stp_blocked && !(d->vid_blocked && d->vid_blocked == vid);
+}
 static bool br_mst_enabled(const struct net_device *d) { assert(d->bridge); return d->mst; }
 /* The bridge queries the adapter mirrors br_vlan_fill_forward_path_pvid() and
  * br_vlan_fill_forward_path_mode() through. br_vlan_get_proto() reports host
@@ -374,13 +382,15 @@ enum switchdev_attr_id {
     SWITCHDEV_ATTR_ID_PORT_MROUTER, SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
     SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS, SWITCHDEV_ATTR_ID_PORT_STP_STATE,
     SWITCHDEV_ATTR_ID_PORT_MST_STATE, SWITCHDEV_ATTR_ID_BRIDGE_MST,
-    SWITCHDEV_ATTR_ID_VLAN_MSTI,
+    SWITCHDEV_ATTR_ID_VLAN_MSTI, SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
 };
 struct switchdev_obj { enum switchdev_obj_id id; };
 struct switchdev_mst_state { u16 msti; u8 state; };
+struct switchdev_vlan_state { u16 vid; u8 state; };
 struct switchdev_attr {
     enum switchdev_attr_id id;
-    union { u8 stp_state; struct switchdev_mst_state mst_state; } u;
+    union { u8 stp_state; struct switchdev_mst_state mst_state;
+            struct switchdev_vlan_state vlan_state; } u;
 };
 struct switchdev_notifier_port_obj_info {
     struct switchdev_notifier_info info; /* must be first */
@@ -646,6 +656,13 @@ static void flow_stats_update(struct flow_stats *s, u64 b, u64 p, u64 d, unsigne
 struct cdx_ft_hw { struct cdx_ft_counters stats; };
 struct work_struct { int unused; };
 static int ft_work, ft_retire_work, ft_dev_stats_work;
+/* The stopped-port sweep's own declarations are compiled from the adapter;
+ * these let the stubs below name its work item before they appear. */
+#define DECLARE_WORK(n, fn) int n
+#define DEFINE_SPINLOCK(n) bool n
+typedef struct { int unused; } netdevice_tracker;
+static DECLARE_WORK(ft_stopped_work, ft_stopped_workfn);
+static void ft_stopped_workfn(struct work_struct *work);
 static LIST_HEAD(ft_bindings);
 static LIST_HEAD(ft_entries);
 static DEFINE_HASHTABLE(ft_cookies, CDX_FT_HASH_BITS);
@@ -693,6 +710,9 @@ static struct { struct { bool mutex; } ctrl; } instance, *cdx_info = &instance;
 static void mutex_lock(bool *m) { assert(!*m); *m = true; }
 static void mutex_unlock(bool *m) { assert(*m); *m = false; }
 static bool rtnl_trylock(void) { if (rtnl_busy) return false; assert(!rtnl); rtnl = true; return true; }
+/* Only the stopped-port sweep waits for RTNL, and it must never do so inside
+ * the backend transaction: the rule callbacks its flush waits for take that. */
+static void rtnl_lock(void) { assert(!rtnl && !cdx_info->ctrl.mutex && !ft_watch_lock); rtnl = true; }
 static void rtnl_unlock(void) { assert(rtnl); rtnl = false; }
 static int dpa_cfg_quiesce(void) { assert(rtnl && cdx_info->ctrl.mutex); return quiesce_fail ? -EIO : 0; }
 static void cdx_ft_begin(void) { assert(!ft_watch_lock); mutex_lock(&cdx_info->ctrl.mutex); }
@@ -817,17 +837,42 @@ static int cdx_ft_recover(void)
     return retry_error;
 }
 static void schedule_delayed_work(int *work, unsigned delay) { scheduled++; }
-static unsigned neigh_scheduled, dev_stats_scheduled;
+static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled;
 static void schedule_work(int *work)
 {
     if (work == &ft_mr_work) { mroute_kicks++; return; }
+    if (work == &ft_stopped_work) { stopped_scheduled++; return; }
     assert(work == &ft_retire_work || work == &ft_dev_stats_work);
     if (work == &ft_dev_stats_work) dev_stats_scheduled++; else neigh_scheduled++;
 }
+/* Which devices native cleanup was asked for, in order, and how many of those
+ * calls ran under RTNL -- the stopped-port sweep's are all expected to. */
+static struct net_device *swept[8];
+static unsigned nswept, swept_under_rtnl;
 static void nf_flow_table_cleanup(struct net_device *dev)
-{ assert(!cdx_info->ctrl.mutex); flushed++; if (cleanup_hook) cleanup_hook(); }
+{
+    assert(!cdx_info->ctrl.mutex);
+    flushed++;
+    if (nswept < ARRAY_SIZE(swept)) swept[nswept] = dev;
+    nswept++;
+    if (rtnl) swept_under_rtnl++;
+    if (cleanup_hook) cleanup_hook();
+}
 static void dev_hold(struct net_device *d) { d->refs++; }
 static void dev_put(struct net_device *d) { assert(d->refs > 0); d->refs--; }
+static void netdev_hold(struct net_device *d, netdevice_tracker *t, int gfp)
+{ (void)t; assert(gfp == GFP_ATOMIC); d->refs++; }
+static void netdev_put(struct net_device *d, netdevice_tracker *t)
+{ (void)t; assert(d->refs > 0); d->refs--; }
+static unsigned grace_periods;
+static void synchronize_net(void) { assert(!rtnl); grace_periods++; }
+/* What for_each_netdev() walks: set by the case that needs a namespace's
+ * whole device list, empty otherwise. */
+static struct net_device **netdev_registry;
+static unsigned netdev_registry_len;
+#define for_each_netdev(n, d)                                                  \
+    for (unsigned i_ = (assert((n) == &init_net), 0);                          \
+         i_ < netdev_registry_len && ((d) = netdev_registry[i_], 1); i_++)
 /* The IPsec side of the adapter, which the netdev notifier and the module's
  * own init and exit reach. Stubbed rather than compiled: attaching xfrmdev_ops
  * and resolving an SA pull in xfrm and the SA backend, neither of which this
@@ -839,7 +884,21 @@ static int ft_ipsec_retire, ft_ipsec_follow, ft_ipsec_stats;
 static void ft_ipsec_attach(struct net_device *d) { ipsec_attached++; }
 static void ft_ipsec_detach(struct net_device *d) { ipsec_detached++; }
 static void ft_ipsec_detach_all(void) { ipsec_detached_all++; }
-static void flush_work(int *work) { assert(work == &ft_ipsec_retire); }
+static bool swdev_obj_registered, indirect_registered;
+static unsigned stopped_flushes;
+static void flush_work(int *work)
+{
+    if (work == &ft_stopped_work) {
+        /* Only once nothing can queue it again; and on unload, while the
+         * rule callbacks the sweep's native cleanup flushes are still
+         * registered. Flushing runs whatever is still queued. */
+        assert(!swdev_obj_registered && (!ft_stopping || indirect_registered));
+        stopped_flushes++;
+        ft_stopped_workfn(NULL);
+        return;
+    }
+    assert(work == &ft_ipsec_retire);
+}
 static void ft_ipsec_watch_flush(void) { }
 /* The SA next-hop watch, which the same dependency notifiers mark. What the
  * marking then does needs an installed SA and the backend behind it, so it is
@@ -1644,6 +1703,8 @@ static void bridge_fixture(void)
     out.master = &br;
     in.master = &in_br;
     decoy.master = &br;
+    out.stp_blocked = in.stp_blocked = false;
+    out.vid_blocked = in.vid_blocked = 0;
     ether_addr_copy(br.dev_addr, out.dev_addr);
     ether_addr_copy(br_tag.dev_addr, out.dev_addr);
     ether_addr_copy(br_qinq.dev_addr, out.dev_addr);
@@ -1987,9 +2048,10 @@ static void test_bridge(void)
      * flow_offload_eth_src() writes for a neighbour-output flow. */
     assert(!memcmp(decoded.src_mac, out.dev_addr, ETH_ALEN));
     /* The bridge forwards nothing through a port STP has taken out of
-     * FORWARDING, and its forward-path walk does not ask, so admission has
-     * to. With MST the state is per VLAN and unreadable here: such a
-     * bridge's ports stay in software. */
+     * FORWARDING, and admission runs asynchronously to the event that
+     * retires such a port's flows, so it asks the bridge. MST stays in
+     * software: a VID-to-MSTI remap moves per-VLAN states under one
+     * bridge-wide event. */
     out.stp_blocked = true;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
     out.stp_blocked = false;
@@ -2010,6 +2072,14 @@ static void test_bridge(void)
            decoded.out_vlan[0].proto == htons(ETH_P_8021Q));
     assert(decoded.out_bridge == &br && decoded.out_bridge_vid == 100);
     assert(decoded.out_logical == &br_tag && decoded.out == &out);
+    /* The question is asked per VLAN, of the VLAN the bridge resolved: a
+     * blocked VLAN refuses the flow while its port forwards, and another
+     * VLAN blocked on the same port does not. */
+    out.vid_blocked = 100;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    out.vid_blocked = 200;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    out.vid_blocked = 0;
 
     /* The same devices with the port untagged for 100 -- the access port a
      * vlan-aware br-lan actually ships with. The bridge strips the tag, so
@@ -2351,21 +2421,24 @@ static void test_bridge_fdb(void)
         SWITCHDEV_ATTR_ID_PORT_MROUTER, SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
         SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS, SWITCHDEV_ATTR_ID_PORT_STP_STATE,
         SWITCHDEV_ATTR_ID_PORT_MST_STATE, SWITCHDEV_ATTR_ID_BRIDGE_MST,
-        SWITCHDEV_ATTR_ID_VLAN_MSTI,
+        SWITCHDEV_ATTR_ID_VLAN_MSTI, SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
     };
     for (unsigned i = 0; i < ARRAY_SIZE(changes); i++) {
-        /* A port going (or staying) FORWARDING retires nothing. */
+        /* A port going (or staying) FORWARDING retires nothing and queues
+         * no sweep. */
         struct switchdev_attr change = { .id = changes[i] };
-        unsigned kicks = mroute_kicks;
+        unsigned kicks = mroute_kicks, sweeps = stopped_scheduled;
         if (changes[i] == SWITCHDEV_ATTR_ID_PORT_STP_STATE)
             change.u.stp_state = BR_STATE_FORWARDING;
         if (changes[i] == SWITCHDEV_ATTR_ID_PORT_MST_STATE)
             change.u.mst_state.state = BR_STATE_FORWARDING;
+        if (changes[i] == SWITCHDEV_ATTR_ID_PORT_VLAN_STATE)
+            change.u.vlan_state = (struct switchdev_vlan_state){ 100, BR_STATE_FORWARDING };
         set.attr = &change;
         set.info.dev = &out;
         assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-        assert(mroute_kicks == kicks + 1);
-        assert(!atomic_read(&ft_invalid) && !set.handled);
+        assert(mroute_kicks == kicks + 1 && stopped_scheduled == sweeps);
+        assert(!atomic_read(&ft_invalid) && !set.handled && !handle.invalid);
         set.info.dev = NULL;
         assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
         assert(mroute_kicks == kicks + 1);
@@ -2376,8 +2449,11 @@ static void test_bridge_fdb(void)
     /* A port STP takes out of FORWARDING retires every flow through it:
      * software stops forwarding there at once, and the hardware would carry
      * on in both directions under the shared handle. Blocking, disabled and
-     * an MSTI leaving FORWARDING all count. Other ports are left alone. */
+     * an MSTI leaving FORWARDING all count, and so does one VLAN of the port.
+     * Other ports' entries are left alone. */
     const u8 stopped[] = { BR_STATE_BLOCKING, BR_STATE_DISABLED, BR_STATE_LISTENING };
+    unsigned records = allocated, sweeps = stopped_scheduled;
+    int decoy_refs = decoy.refs, out_refs = out.refs;
     for (unsigned i = 0; i < ARRAY_SIZE(stopped); i++) {
         struct switchdev_attr stp = { .id = SWITCHDEV_ATTR_ID_PORT_STP_STATE,
                                       .u.stp_state = stopped[i] };
@@ -2400,6 +2476,80 @@ static void test_bridge_fdb(void)
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
     assert(ft_stp_invalidations == before_mst + 1);
     handle.invalid = false;
+    struct switchdev_attr vlan_state = { .id = SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
+                                         .u.vlan_state = { .vid = 100, .state = BR_STATE_BLOCKING } };
+    u64 before_vlan = ft_stp_invalidations;
+    set.attr = &vlan_state;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(ft_stp_invalidations == before_vlan + 1 && !set.handled);
+    handle.invalid = false;
+
+    /* Software flows through a stopped port go too, whoever owns them: one
+     * this adapter refused, or another table's, names the port as its ingress,
+     * and the flowtable hook runs before the bridge could drop the frame --
+     * so the untouched decoy port is swept as well. The sweep is queued, one
+     * record per port however many events named it, holding the device until
+     * it runs: an MSTI's state arrives in an RCU section and native cleanup
+     * sleeps. It waits out a grace period first, so a flow a walk described
+     * just before the change is in the table to be found, then cleans under
+     * RTNL and outside the backend transaction. */
+    assert(stopped_scheduled == sweeps + 2 && allocated == records + 2);
+    assert(decoy.refs == decoy_refs + 1 && out.refs == out_refs + 1);
+    unsigned grace = grace_periods;
+    nswept = swept_under_rtnl = 0;
+    ft_stopped_workfn(NULL);
+    assert(grace_periods == grace + 1 && !rtnl);
+    assert(nswept == 2 && swept_under_rtnl == 2 && swept[0] == &decoy && swept[1] == &out);
+    assert(allocated == records && decoy.refs == decoy_refs && out.refs == out_refs);
+    /* Drained: the next event queues afresh. */
+    set.info.dev = &out;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(stopped_scheduled == sweeps + 3);
+    handle.invalid = false;
+    nswept = swept_under_rtnl = 0;
+    ft_stopped_workfn(NULL);
+    assert(nswept == 1 && swept_under_rtnl == 1 && swept[0] == &out);
+    assert(allocated == records && out.refs == out_refs);
+
+    /* A VLAN of the bridge's own entry reaches every flow through the bridge
+     * and every port of it; this harness gives the bridge one lower, decoy.
+     * A port that is itself a VLAN device is swept at the real device too,
+     * because that is where the forward-path walk ends. */
+    u64 before_entry = ft_stp_invalidations;
+    int br_refs = br.refs, tag_refs = out_tag.refs;
+    set.info.dev = &br;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    assert(ft_stp_invalidations == before_entry + 1 && handle.invalid);
+    handle.invalid = false;
+    set.info.dev = &out_tag;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    nswept = swept_under_rtnl = 0;
+    ft_stopped_workfn(NULL);
+    assert(nswept == 3 && swept_under_rtnl == 3);
+    assert(swept[0] == &decoy && swept[1] == &out_tag && swept[2] == &out);
+    assert(allocated == records && br.refs == br_refs && out_tag.refs == tag_refs);
+
+    /* Losing the record to a failed allocation must not lose the sweep: the
+     * work then cleans every bridge port in the namespace. */
+    struct net_device *registry[] = { &in, &out, &upper, &decoy, &br };
+    netdev_registry = registry;
+    netdev_registry_len = ARRAY_SIZE(registry);
+    allocation_fail = true;
+    set.info.dev = &out;
+    assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+    allocation_fail = false;
+    assert(stopped_scheduled == sweeps + 6 && allocated == records && out.refs == out_refs);
+    handle.invalid = false;
+    nswept = swept_under_rtnl = 0;
+    ft_stopped_workfn(NULL);
+    assert(nswept == 3 && swept_under_rtnl == 3);
+    assert(swept[0] == &in && swept[1] == &out && swept[2] == &decoy);
+    /* Once, not on every run after. */
+    nswept = 0;
+    ft_stopped_workfn(NULL);
+    assert(!nswept);
+    netdev_registry = NULL;
+    netdev_registry_len = 0;
     set.attr = NULL;
 
     /* A port whose egress queues changed under it -- an HTB tree coming or
@@ -5323,8 +5473,17 @@ static void test_direct_bind_unload(void)
     /* The callback is live in the table, which is where it has to be for the
      * fault to be reachable at all. */
     assert(table.flow_block.cb_list.next != &table.flow_block.cb_list);
+    /* A port that stopped forwarding just before unload still has its
+     * software flows swept, while the module whose text the work runs is
+     * here to run it. */
+    unsigned flushes = stopped_flushes;
+    ft_port_stopped(&out);
+    assert(out.refs == 1);
+    nswept = swept_under_rtnl = 0;
 
     ask_flowtable_exit();
+    assert(stopped_flushes == flushes + 1 && !out.refs);
+    assert(nswept == 1 && swept_under_rtnl == 1 && swept[0] == &out);
 
     /* Nothing may still name this module: not in the table Netfilter walks,
      * not on the adapter's own list. */

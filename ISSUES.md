@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A214.** Software flows already through a port that stopped forwarding were never swept, and kept bypassing the bridge —
+  fixed (_:/^cdx: sweep software flows off a port that stops forwarding_).
+
 - [x] **A213.** The bridge's forward-path walk resolved a port STP or a VLAN state had stopped, so the software flowtable forwarded through it —
   fixed (_:/^bridge: keep flow offload off ports that are not forwarding_).
 
