@@ -208,10 +208,13 @@ async def test_flowtable_ipv6_sa_ipv4_only_wan(ipv6_rig):
         assert set(rows) == {TARGET_LAN_IF, TARGET_WAN_IF}, admitted
         assert rows[TARGET_LAN_IF]["sa"] != "0" and rows[TARGET_WAN_IF]["in_sa"] != "0", admitted
         assert all(f["family"] == "6" for f in rows.values()), admitted
-        # The encrypted direction's next hop is the tunnel's IPv4 endpoint,
-        # resolved in its own family: the IPv6 route under the bundle has
-        # no neighbour for it.
-        assert rows[TARGET_LAN_IF]["nexthop"] == os.environ.get("ASK_WAN_IP", "127.0.0.1"), admitted
+        # The encrypted direction's next hop is the one IPv4 routing gives
+        # the tunnel's endpoint, resolved in that family: the IPv6 route
+        # under the bundle has no neighbour for it.
+        peer = os.environ.get("ASK_WAN_IP", "127.0.0.1")
+        route = json.loads((await command(r.target, r.session, "ip", "-j", "route", "get",
+                                          peer))["stdout"])[0]
+        assert rows[TARGET_LAN_IF]["nexthop"] == route.get("gateway", peer), (route, admitted)
         report = await send(64)
         assert report == {"echoed": 64, "lost": 0}, report
         after = await r.state()
