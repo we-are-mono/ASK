@@ -15,7 +15,8 @@ import pytest
 
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF
 from test_flowtable_connections import by_key, healthy, peer
-from test_flowtable_offload import DPORT, TABLE, WAN_IP, command, read, rig, status_text  # noqa: F401
+from test_flowtable_offload import (DPORT, HEALTH_BASELINE, TABLE, WAN_IP, command, read,  # noqa: F401
+                                    rig, status_text)
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
 CAPACITY = 32768
@@ -34,14 +35,15 @@ BASE = 20000
 
 def socket_drops(sock):
     inode = str(os.fstat(sock.fileno()).st_ino)
-    for line in Path("/proc/net/udp").read_text().splitlines()[1:]:
+    table = "/proc/net/udp6" if sock.family == socket.AF_INET6 else "/proc/net/udp"
+    for line in Path(table).read_text().splitlines()[1:]:
         fields = line.split()
         if fields[9] == inode:
             return int(fields[-1])
     raise AssertionError(("UDP socket missing", inode))
 
 
-async def delete_udp(r, sport, *, allow_missing=False):
+async def delete_udp(r, sport, *, allow_missing=False, source=None, destination=None):
     # conntrack(8)'s filtered deletion dumps the entire table per invocation.
     # Use the existing agent's raw netlink transport for an exact original
     # tuple deletion (nfnetlink_conntrack.h), checking its kernel ACK.
@@ -49,11 +51,16 @@ async def delete_udp(r, sport, *, allow_missing=False):
         length = 4 + len(value)
         return struct.pack("=HH", length, kind) + value + bytes((-length) % 4)
 
-    ip = attribute(1, socket.inet_aton(r.lan_ip)) + attribute(2, socket.inet_aton(WAN_IP))
+    source, destination = source or r.lan_ip, destination or WAN_IP
+    family = socket.AF_INET6 if ":" in source else socket.AF_INET
+    # CTA_IP_V4_SRC/DST are 1 and 2; CTA_IP_V6_SRC/DST are 3 and 4.
+    kinds = (3, 4) if family == socket.AF_INET6 else (1, 2)
+    ip = (attribute(kinds[0], socket.inet_pton(family, source))
+          + attribute(kinds[1], socket.inet_pton(family, destination)))
     proto = (attribute(1, bytes([socket.IPPROTO_UDP])) + attribute(2, struct.pack("!H", sport))
              + attribute(3, struct.pack("!H", DPORT)))
     original = attribute(0x8001, ip) + attribute(0x8002, proto)
-    body = struct.pack("!BBH", socket.AF_INET, 0, 0) + attribute(0x8001, original)
+    body = struct.pack("!BBH", family, 0, 0) + attribute(0x8001, original)
     result = await r.target.netlink_send(r.session, 12, body, nlmsg_type=0x102, nlmsg_flags=5)
     reply = bytes.fromhex(result["reply_hex"])
     assert len(reply) >= 20 and struct.unpack_from("=H", reply, 4)[0] == 2, result
@@ -88,7 +95,9 @@ async def wait_entries(r, count, p, timeout=90):
         jobs = await p.rpc("status")
         assert not jobs["errors"], jobs
         state = await summary(r)
-        assert not any(state[k] for k in ("errors", "fatal", "invalidated", "quarantine")), state
+        # Errors are cumulative for the boot; only this test's own count.
+        assert state["errors"] == HEALTH_BASELINE["errors"], (state, HEALTH_BASELINE)
+        assert not any(state[k] for k in ("fatal", "invalidated", "quarantine")), state
         if state["entries"] == count:
             return state
         await asyncio.sleep(1)
@@ -338,7 +347,8 @@ async def test_flowtable_capacity_overflow_and_reuse(rig):
             r.record("capacity-drain", {"state": final, "seconds": detach,
                                        "memory_drained": await read(r.target, r.session, "/proc/meminfo")})
             assert final["installs"] == final["deletes"]
-            assert all(final[k] == 0 for k in ("entries", "handle_refs", "neighbour_refs", "quarantine", "errors"))
+            assert all(final[k] == 0 for k in ("entries", "handle_refs", "neighbour_refs", "quarantine"))
+            assert final["errors"] == initial["errors"], (initial, final)
             assert socket_drops(receiver) == 0, "generator UDP receive queue overflow"
             # The retirement holds CDX's control mutex throughout, so its
             # length is a property to bound, not only to wait out.

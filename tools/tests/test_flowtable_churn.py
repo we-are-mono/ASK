@@ -1,7 +1,13 @@
-"""Sustained native NAT ownership turnover at the production admission budget."""
+"""Sustained native ownership turnover at the production admission budget.
+
+IPv4 turns over NAT connections through the gateway's MASQUERADE policy and
+IPv6 turns over routed connections between the two ULA /64s. Both fill all
+32,768 directions and run the same rounds against that budget.
+"""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import os
 import resource
@@ -11,12 +17,13 @@ import time
 
 import pytest
 
-from _topology import TARGET_LAN_IF, TARGET_WAN_IF
+from _topology import LAN_IPV6, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6
 from test_flowtable_capacity import (BASE, CAPACITY, CONNECTIONS, batch, delete_udp,
                                      delivery, hardware_window, lan_counters,
                                      socket_drops, start, unchanged, wait_entries)
 from test_flowtable_connections import by_key, healthy, peer
-from test_flowtable_offload import DPORT, TABLE, WAN_IP, command, read, rig  # noqa: F401
+from test_flowtable_ipv6 import ipv6_rig  # noqa: F401
+from test_flowtable_offload import DPORT, TABLE, WAN_IP, Echo, command, read, rig  # noqa: F401
 from test_flowtable_tcp import cpu, cpu_delta, software_tx
 
 pytestmark = pytest.mark.skipif(
@@ -24,6 +31,9 @@ pytestmark = pytest.mark.skipif(
     reason="explicit sustained full-capacity churn proof")
 GROUP = 256
 SURVIVORS = GROUP
+# Connections never opened before the last round, which retires one group for
+# good and admits these into exactly the directions it freed.
+FRESH = GROUP
 EGRESS_TABLE = "ask_churn_egress"
 # Linux owns flow lifetime. A hardware-owned flow keeps its deadline only
 # through a stats round trip, which the flowtable core queues in the last tenth
@@ -44,15 +54,44 @@ TURNOVER_BUDGET = 16
 SOFTWARE_PER_READMISSION = 8
 
 
-def flow_keys(r, specs, ids):
-    keys = set()
-    for ident in ids:
-        spec = specs[ident]
-        proto = "6" if spec["proto"] == "tcp" else "17"
-        src, dst = f"{r.lan_ip}:{spec['sport']}", f"{WAN_IP}:{DPORT}"
-        translated = f"{spec['remote'][0]}:{spec['remote'][1]}"
-        keys.update(((TARGET_LAN_IF, proto, src, dst), (TARGET_WAN_IF, proto, dst, translated)))
-    return keys
+@dataclass
+class ChurnPath:
+    """What differs between the address families. `public` is the source the
+    WAN endpoint sees: the gateway's own address under IPv4 MASQUERADE, the
+    LAN peer's own address on the routed IPv6 path."""
+    family: str        # conntrack(8) -f
+    selector: str      # nft address expression: ip or ip6
+    lan: str
+    wan: str
+    public: str
+    receiver: Echo     # the WAN endpoint's UDP echo
+    listen: tuple = ()  # addresses the WAN TCP listeners add to WAN_IP
+
+    @staticmethod
+    def endpoint(address, port):
+        return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+
+    def spec(self, r, ident):
+        sport = BASE + ident // 2
+        spec = {"id": ident, "proto": "tcp" if ident & 1 else "udp", "sport": sport,
+                "abort": ident % 4 == 3}
+        if self.lan != r.lan_ip:
+            spec["lan"] = self.lan
+        if self.wan != WAN_IP:
+            spec["connect_ip"] = self.wan
+        if self.public != self.lan:
+            spec["remote"] = [self.public, sport]
+        return spec
+
+    def keys(self, specs, ids):
+        keys = set()
+        for ident in ids:
+            spec = specs[ident]
+            proto = "6" if spec["proto"] == "tcp" else "17"
+            src, dst = self.endpoint(self.lan, spec["sport"]), self.endpoint(self.wan, DPORT)
+            translated = self.endpoint(self.public, spec["sport"])
+            keys.update(((TARGET_LAN_IF, proto, src, dst), (TARGET_WAN_IF, proto, dst, translated)))
+        return keys
 
 
 async def flowtable_work(r):
@@ -148,6 +187,28 @@ def transfer_summary(p, reports):
 
 async def test_flowtable_sustained_churn(rig):
     r = rig
+    address = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr",
+                                       "show", "dev", TARGET_WAN_IF))["stdout"])[0]
+    public = next(a["local"] for a in address["addr_info"] if a["family"] == "inet")
+    await sustained_churn(r, ChurnPath("ipv4", "ip", r.lan_ip, WAN_IP, public, r.echo))
+
+
+async def test_flowtable_ipv6_sustained_churn(rig, ipv6_rig):
+    """The same proof over routed IPv6. The IPv4 rig still carries the peer's
+    control connection and supplies the health baseline; the IPv6 rig
+    addresses both segments and pins both endpoints as neighbours."""
+    r = rig
+    echo = Echo()
+    transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+        lambda: echo, local_addr=(WAN_IPV6, DPORT), family=socket.AF_INET6)
+    try:
+        await sustained_churn(r, ChurnPath("ipv6", "ip6", LAN_IPV6, WAN_IPV6, LAN_IPV6, echo,
+                                           (WAN_IPV6,)))
+    finally:
+        transport.close()
+
+
+async def sustained_churn(r, path):
     # A short run is useful while developing the generator, but the accepted
     # proof uses the default 900 seconds and visits every rotating tuple.
     duration = int(os.environ.get("ASK_FLOWTABLE_CHURN_SECONDS", "900"))
@@ -155,23 +216,21 @@ async def test_flowtable_sustained_churn(rig):
     # timeout. A run shorter than this cannot reach the second round the
     # acceptance below requires.
     assert 3 * OFFLOAD_TIMEOUT["udp"] <= duration <= 3600
-    receiver = r.echo.transport.get_extra_info("socket")
+    receiver = path.receiver.transport.get_extra_info("socket")
     receiver.setsockopt(socket.SOL_SOCKET, 33, 4 << 20)  # SO_RCVBUFFORCE
     assert receiver.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) >= 4 << 20
     assert socket_drops(receiver) == 0
     # Payload validation remains at each peer. Do not retain millions of full
     # datagrams in the orchestrator merely to count a long-running workload.
-    r.echo.record_payloads = False
+    path.receiver.record_payloads = False
     initial = await r.state()
     assert initial["max_entries"] == CAPACITY and initial["entries"] == 0
-    address = json.loads((await command(r.target, r.session, "ip", "-j", "-4", "addr",
-                                       "show", "dev", TARGET_WAN_IF))["stdout"])[0]
-    public = next(a["local"] for a in address["addr_info"] if a["family"] == "inet")
-    specs = [{"id": i, "proto": "tcp" if i & 1 else "udp", "sport": BASE + i // 2,
-              "remote": [public, BASE + i // 2], "abort": i % 4 == 3}
-             for i in range(CONNECTIONS)]
+    specs = [path.spec(r, i) for i in range(CONNECTIONS + FRESH)]
     ids = list(range(CONNECTIONS))
+    fresh = list(range(CONNECTIONS, CONNECTIONS + FRESH))
     groups = [ids[offset:offset + GROUP] for offset in range(SURVIVORS, CONNECTIONS, GROUP)]
+    lan, wan, public, ip = path.lan, path.wan, path.public, path.selector
+    survivor_ports = f"{BASE}-{BASE + SURVIVORS // 2 - 1}"
     cleanup, samples = [], []
     totals = {"udp_sent": 0, "udp_lost": 0, "tcp_records": 0, "late": 0}
     retirements = {"fin": 0, "rst": 0, "udp_delete": 0, "udp_expiry": 0}
@@ -181,7 +240,7 @@ async def test_flowtable_sustained_churn(rig):
     # reclamation pressure, and all three are bounded rather than assumed absent.
     turnover = software_budget = absent = 0
     limits = resource.getrlimit(resource.RLIMIT_NOFILE)
-    needed = 2 * CONNECTIONS + 512
+    needed = 2 * len(specs) + 512
     assert needed <= limits[1]
     resource.setrlimit(resource.RLIMIT_NOFILE, (max(limits[0], needed), limits[1]))
 
@@ -201,35 +260,37 @@ async def test_flowtable_sustained_churn(rig):
             value = (await read(r.target, r.session, "/proc/sys/" + name.replace(".", "/"))).strip()
             cleanup.append(["sysctl", "-w", f"{name}={value}"])
             await command(r.target, r.session, "sysctl", "-w", f"{name}={timeout}")
-            await command(r.target, r.session, "conntrack", "-D", "-p", proto,
-                          "--orig-src", r.lan_ip, "--orig-dst", WAN_IP, "--dport", str(DPORT), check=False)
+            await command(r.target, r.session, "conntrack", "-D", "-f", path.family, "-p", proto,
+                          "--orig-src", lan, "--orig-dst", wan, "--dport", str(DPORT), check=False)
         existing = await command(r.target, r.session, "nft", "list", "table", "netdev", EGRESS_TABLE, check=False)
         assert existing["rc"] != 0, "churn egress table already exists"
         await r.nft(f'''table netdev {EGRESS_TABLE} {{
  counter lan {{ }}
  counter wan {{ }}
  chain lan {{ type filter hook egress device {TARGET_LAN_IF} priority 0; policy accept;
- ip saddr {WAN_IP} ip daddr {r.lan_ip} meta l4proto {{ tcp, udp }} th sport {DPORT} th dport {BASE}-{BASE + SURVIVORS//2 - 1} counter name lan
+ {ip} saddr {wan} {ip} daddr {lan} meta l4proto {{ tcp, udp }} th sport {DPORT} th dport {survivor_ports} counter name lan
  }}
  chain wan {{ type filter hook egress device {TARGET_WAN_IF} priority 0; policy accept;
- ip saddr {public} ip daddr {WAN_IP} meta l4proto {{ tcp, udp }} th sport {BASE}-{BASE + SURVIVORS//2 - 1} th dport {DPORT} counter name wan
+ {ip} saddr {public} {ip} daddr {wan} meta l4proto {{ tcp, udp }} th sport {survivor_ports} th dport {DPORT} counter name wan
  }}
 }}''')
         cleanup.append(["nft", "delete", "table", "netdev", EGRESS_TABLE])
+        churned_ports = f"{BASE}-{BASE + CONNECTIONS // 2 - 1}"
         await r.nft(f'''table inet {TABLE} {{
  flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; }}
  counter fin {{ }}
  counter rst {{ }}
  counter survivor_forward {{ }}
  chain forward {{ type filter hook forward priority 0; policy accept;
- ip saddr {r.lan_ip} ip daddr {WAN_IP} meta l4proto {{ tcp, udp }} th sport {BASE}-{BASE + SURVIVORS//2 - 1} th dport {DPORT} counter name survivor_forward
- ip saddr {WAN_IP} ip daddr {r.lan_ip} meta l4proto {{ tcp, udp }} th sport {DPORT} th dport {BASE}-{BASE + SURVIVORS//2 - 1} counter name survivor_forward
- ip saddr {r.lan_ip} ip daddr {WAN_IP} tcp sport {BASE}-{BASE + CONNECTIONS//2 - 1} tcp dport {DPORT} tcp flags & fin == fin counter name fin
- ip saddr {r.lan_ip} ip daddr {WAN_IP} tcp sport {BASE}-{BASE + CONNECTIONS//2 - 1} tcp dport {DPORT} tcp flags & rst == rst counter name rst
- ip saddr {r.lan_ip} ip daddr {WAN_IP} meta l4proto {{ tcp, udp }} th sport {BASE}-{BASE + CONNECTIONS//2 - 1} th dport {DPORT} flow add @fast
+ {ip} saddr {lan} {ip} daddr {wan} meta l4proto {{ tcp, udp }} th sport {survivor_ports} th dport {DPORT} counter name survivor_forward
+ {ip} saddr {wan} {ip} daddr {lan} meta l4proto {{ tcp, udp }} th sport {DPORT} th dport {survivor_ports} counter name survivor_forward
+ {ip} saddr {lan} {ip} daddr {wan} tcp sport {churned_ports} tcp dport {DPORT} tcp flags & fin == fin counter name fin
+ {ip} saddr {lan} {ip} daddr {wan} tcp sport {churned_ports} tcp dport {DPORT} tcp flags & rst == rst counter name rst
+ {ip} saddr {lan} {ip} daddr {wan} meta l4proto {{ tcp, udp }} th sport {BASE}-{BASE + len(specs) // 2 - 1} th dport {DPORT} flow add @fast
  }}
 }}''')
-        async with peer(r, specs, initial_ids=[], lease=duration + 600, tcp_size=1024, reconnect=True) as p:
+        async with peer(r, specs, initial_ids=[], lease=duration + 600, tcp_size=1024, reconnect=True,
+                        listen_addresses=path.listen) as p:
             warmup = {}
             for offset in range(0, CONNECTIONS, GROUP):
                 group = ids[offset:offset + GROUP]
@@ -239,8 +300,8 @@ async def test_flowtable_sustained_churn(rig):
             transfers(p, "churn-warmup", warmup)
             await wait_entries(r, CAPACITY, p)
             before = await hardware_window(r, await r.state(), "churn-initial-hardware")
-            assert by_key(before).keys() == flow_keys(r, specs, ids)
-            survivor_keys = flow_keys(r, specs, ids[:SURVIVORS])
+            assert by_key(before).keys() == path.keys(specs, ids)
+            survivor_keys = path.keys(specs, ids[:SURVIVORS])
             survivor_initial = {k: f for k, f in by_key(before).items() if k in survivor_keys}
             counts0 = await control_counters(r)
             egress0 = await egress_counters(r)
@@ -248,26 +309,27 @@ async def test_flowtable_sustained_churn(rig):
             # hook; a misplaced or incorrectly translated match is not proof.
             assert all(value > 0 for value in egress0.values()), egress0
             started = time.monotonic()
-            round_id = 0
             visited = set()
-            while time.monotonic() - started < duration:
-                group = groups[round_id % len(groups)]
-                keys = flow_keys(r, specs, group)
+
+            async def rotate(round_id, retire, admit, *, expire):
+                """Retire one group's connections and admit `admit` in their
+                place: the same tuples reopened, or tuples never seen before."""
+                nonlocal before, turnover, software_budget, absent
+                keys = path.keys(specs, retire)
                 old = by_key(before)
                 removed = {old[k]["cookie"] for k in keys}
                 cpu0, tx0 = await cpu(r), await software_tx(r)
                 begin = time.monotonic()
-                reports = await p.rpc("stop", group)
+                reports = await p.rpc("stop", retire)
                 transferred = transfers(p, f"churn-{round_id:04d}-transfers", reports)
-                await p.rpc("close", group)
-                expire = round_id % 8 == 0
-                for ident in group:
+                await p.rpc("close", retire)
+                for ident in retire:
                     if specs[ident]["proto"] == "udp":
                         # Linux may already have reclaimed the conntrack of a
                         # flow it retired. That reaches the same postcondition,
                         # so count it rather than failing the exact deletion.
-                        if not expire and not await delete_udp(r, specs[ident]["sport"],
-                                                               allow_missing=True):
+                        if not expire and not await delete_udp(r, specs[ident]["sport"], allow_missing=True,
+                                                               source=lan, destination=wan):
                             absent += 1
                         retirements["udp_expiry" if expire else "udp_delete"] += 1
                     else:
@@ -275,7 +337,7 @@ async def test_flowtable_sustained_churn(rig):
                 # Follow the offload backlog while this round's retirements
                 # drain; once the table has settled it says nothing.
                 draining = asyncio.create_task(
-                    wait_entries(r, CAPACITY - 2 * GROUP, p, timeout=OFFLOAD_TIMEOUT["udp"] + 45))
+                    wait_entries(r, CAPACITY - 2 * len(retire), p, timeout=OFFLOAD_TIMEOUT["udp"] + 45))
                 work = await work_peak(r, draining)
                 freed = await draining
                 # Retirement must free precisely this group's ownership. An
@@ -289,28 +351,29 @@ async def test_flowtable_sustained_churn(rig):
                 if readmitted:
                     r.record(f"churn-{round_id:04d}-readmitted",
                              {"before": {k: v for k, v in before.items() if k != "flows"},
-                              "freed": freed, "group": group})
+                              "freed": freed, "group": retire})
                 assert 0 <= readmitted <= TURNOVER_ROUND, (before, freed)
                 assert (freed["entries"] == freed["neighbour_refs"] == freed["handle_refs"]
-                        == CAPACITY - 2 * GROUP), freed
+                        == CAPACITY - 2 * len(retire)), freed
                 assert freed["installs"] - freed["deletes"] == freed["entries"], freed
                 assert all(freed[k] == before[k] for k in (
                     "errors", "invalidated", "quarantine", "rearms",
                     "neighbour_invalidations", "route_invalidations", "mtu_invalidations",
                     "link_invalidations", "mac_invalidations")), (before, freed)
-                # Reopen the exact tuples with continuing payload serials. This
-                # catches stale packets crossing a hardware generation boundary.
-                await p.rpc("open", group)
+                # Reopening the exact tuples continues their payload serials,
+                # which catches stale packets crossing a hardware generation
+                # boundary. Fresh tuples prove the freed directions are free.
+                await p.rpc("open", admit)
                 transferred_warm = transfers(p, f"churn-{round_id:04d}-warmup",
-                                              await batch(p, group, count=4, interval=0.025))
-                await start(p, group)
+                                             await batch(p, admit, count=4, interval=0.025))
+                await start(p, admit)
                 await wait_entries(r, CAPACITY, p)
                 # Keep admission paced even on machines with very fast control
                 # RPCs. This increment does not revisit simultaneous burst loss.
                 while time.monotonic() - begin < 4:
                     assert not (await p.rpc("status"))["errors"]
                     await asyncio.sleep(0.5)
-                after, settle = await settled(r, p, old.keys())
+                after, settle = await settled(r, p, (old.keys() - keys) | path.keys(specs, admit))
                 healthy(after)
                 current = by_key(after)
                 # The group's own change of identity is requested and excluded;
@@ -321,18 +384,18 @@ async def test_flowtable_sustained_churn(rig):
                 # reappear under a recycled one. A restarted packet count cannot
                 # alias, and the adapter's own -ESTALE guard exists for the same
                 # reason, so treat either as a new hardware generation.
-                regenerated = {k for k in current if k not in keys
+                regenerated = {k for k in current if k in old and k not in keys
                                and (current[k]["cookie"] != old[k]["cookie"]
                                     or int(current[k]["packets"]) < int(old[k]["packets"]))}
                 assert readmitted <= len(regenerated) <= TURNOVER_ROUND, (readmitted, sorted(regenerated))
                 unchanged(before, after, excluded=removed | {old[k]["cookie"] for k in regenerated})
-                # Readmitting the group is the only ownership this round asked
+                # Admitting the group is the only ownership this round asked
                 # for. Anything deleted alongside it is a contended admission
                 # rolled back, or a further flow Linux turned over; both publish
                 # and retire in pairs, so the surplus installs must match them.
                 retries = after["admission_invalidations"] - freed["admission_invalidations"]
                 surplus = after["deletes"] - freed["deletes"]
-                assert after["installs"] - freed["installs"] == 2 * GROUP + surplus, (freed, after)
+                assert after["installs"] - freed["installs"] == 2 * len(admit) + surplus, (freed, after)
                 assert 0 <= surplus <= 2 * retries + TURNOVER_ROUND, (freed, after, retries)
                 assert after["installs"] - after["deletes"] == CAPACITY
                 survivors_regenerated = regenerated & survivor_keys
@@ -362,11 +425,12 @@ async def test_flowtable_sustained_churn(rig):
                     "survivor software transmission", egress0, egress, software_budget)
                 assert absent <= TURNOVER_BUDGET * (round_id + 1), (absent, round_id)
                 mem = await memory(r)
-                assert mem["conntracks"] <= CONNECTIONS + 1024, mem["conntracks"]
+                assert mem["conntracks"] <= len(specs) + 1024, mem["conntracks"]
                 assert socket_drops(receiver) == 0, "generator UDP receive queue overflow"
                 sample = {"round": round_id, "seconds": time.monotonic() - started,
                           "round_seconds": time.monotonic() - begin, "expiry": expire,
-                          "group": group, "state": {k: v for k, v in after.items() if k != "flows"},
+                          "group": retire, "admitted": admit,
+                          "state": {k: v for k, v in after.items() if k != "flows"},
                           "memory": mem, "cpu": cpu_delta(cpu0, cpu1),
                           "forward_counters": counters,
                           "survivor_software_tx": {dev: egress[dev] - egress0[dev] for dev in egress},
@@ -381,10 +445,22 @@ async def test_flowtable_sustained_churn(rig):
                           "retirements": dict(retirements), "totals": dict(totals)}
                 r.record(f"churn-{round_id:04d}", sample)
                 samples.append(sample)
-                visited.update(group)
+                visited.update(retire)
                 before = after
+
+            round_id = 0
+            while time.monotonic() - started < duration:
+                group = groups[round_id % len(groups)]
+                await rotate(round_id, group, group, expire=round_id % 8 == 0)
                 round_id += 1
             assert round_id >= 2 and all(retirements.values()), retirements
+            # Once churn is over, retire one more group for good and fill its
+            # directions with connections never admitted before. Leaked
+            # ownership would leave the table short of capacity here.
+            closed = groups[round_id % len(groups)]
+            await rotate(round_id, closed, fresh, expire=False)
+            round_id += 1
+            active = [ident for ident in ids if ident not in closed] + fresh
             # One starved refresh can turn a round's worth of directions over.
             # A run that sustains that rate is retiring live flows systematically
             # and is the regression this budget exists to catch.
@@ -408,11 +484,12 @@ async def test_flowtable_sustained_churn(rig):
             finally:
                 r.record("churn-quiet-window",
                          {"before": quiet_before, "after": await flowtable_work(r)})
-            transfers(p, "churn-final-transfers", await p.rpc("stop", ids))
+            transfers(p, "churn-final-transfers", await p.rpc("stop", active))
             final = await r.delete_table()
             assert final["installs"] == final["deletes"]
             assert all(final[k] == 0 for k in ("entries", "bindings", "handle_refs", "neighbour_refs",
-                                              "quarantine", "errors", "fatal", "invalidated"))
+                                              "quarantine", "fatal", "invalidated"))
+            assert final["errors"] == initial["errors"], (initial, final)
             # Unreclaimable slab is a coarse platform guard, not an ownership
             # counter. Compare settled full-occupancy samples and retain all
             # raw allocator data for review; allocator caches may stay warm.
@@ -420,13 +497,13 @@ async def test_flowtable_sustained_churn(rig):
             head = samples[width:2 * width] or samples[:width]
             growth = statistics.median(s["memory"]["kib"]["SUnreclaim"] for s in samples[-width:]) - statistics.median(
                 s["memory"]["kib"]["SUnreclaim"] for s in head)
-            r.record("churn-result", {"requested_seconds": duration, "rounds": round_id,
+            r.record("churn-result", {"family": path.family, "requested_seconds": duration, "rounds": round_id,
                                      "churn_seconds": samples[-1]["seconds"], "visited": len(visited),
                                      "retirements": retirements, "totals": totals, "tcp_control": controls,
                                      "turnover": turnover, "software_budget": software_budget,
                                      "absent_conntracks": absent,
                                      "unreclaimable_growth_kib": growth, "generator_drops": socket_drops(receiver),
-                                     "udp_received": r.echo.packets, "state": final,
+                                     "udp_received": path.receiver.packets, "state": final,
                                      "last_full_state": {k: v for k, v in final_hardware.items() if k != "flows"}})
             # 32 MiB is a coarse sustained-growth tripwire, not a claim that
             # smaller leaks are acceptable. Exact backend ownership must drain.
@@ -446,15 +523,16 @@ async def test_flowtable_sustained_churn(rig):
 
         try:
             try:
-                r.record("churn-receiver", {"packets": r.echo.packets, "drops": socket_drops(receiver)})
+                r.record("churn-receiver", {"packets": path.receiver.packets, "drops": socket_drops(receiver)})
             except Exception as error:
                 failures.append(("receiver diagnostics", repr(error)))
             await restore("churn-lan-after", lan_counters(r), record=True)
             await restore("churn-drained", r.delete_table(), record=True)
             for proto in ("udp", "tcp"):
                 await restore("delete " + proto, command(
-                    r.target, r.session, "conntrack", "-D", "-p", proto, "--orig-src", r.lan_ip,
-                    "--orig-dst", WAN_IP, "--dport", str(DPORT), check=False), allowed_rc=(0, 1))
+                    r.target, r.session, "conntrack", "-D", "-f", path.family, "-p", proto,
+                    "--orig-src", lan, "--orig-dst", wan, "--dport", str(DPORT), check=False),
+                    allowed_rc=(0, 1))
             for argv in reversed(cleanup):
                 await restore(" ".join(argv), command(r.target, r.session, *argv, check=False))
             await restore("churn-memory-drained", memory(r), record=True)
