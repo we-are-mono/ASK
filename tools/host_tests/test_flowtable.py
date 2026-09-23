@@ -58,7 +58,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_targets", "ft_software_reoffers", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
              "ft_release",
-             "ft_bind_admissible", "ft_passive_callback", "ft_passive_release", "ft_bind_passive",
+             "ft_bind_admissible", "ft_passive_callback", "ft_bind_passive",
              "ft_block_setup", "ft_bind", "cdx_ft_setup_tc",
              "ft_invalidate_work", "ft_entry_crosses", "ft_entry_uses", "ft_device_used", "ft_device_role", "ft_device_retire",
              "ft_port_stopped", "ft_stopped_clean", "ft_stopped_workfn", "ft_netdev_event",

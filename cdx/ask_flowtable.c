@@ -154,12 +154,13 @@ struct cdx_ft_binding {
 	 * ft_rearm() makes it live. Changed only under the backend transaction,
 	 * which is also what its reader, the rule callback, holds. */
 	bool parked;
-};
-
-/* A device bound passively -- one the classifier cannot program, accepted so
- * that the table registers. Only what the unload drain needs. */
-struct cdx_ft_passive {
-	struct nf_flowtable *table;
+	/* Bound with ft_passive_callback: never on ft_bindings, no device
+	 * reference, no entries -- only what ft_release() and the unload drain
+	 * need. It shares ft_release() with a real binding because Netfilter
+	 * unwinds indirect callbacks by their release function alone
+	 * (flow_indr_dev_unregister()); one with a release of its own stayed on
+	 * the indirect list after the drain freed it. */
+	bool passive;
 };
 
 /* One logical device's interface counters: the record its encapsulation counts
@@ -290,6 +291,8 @@ static unsigned int ft_bound, ft_count;
  * the flag, but ft_invalidate() reads it without one: every write is
  * WRITE_ONCE, so that read sees either value, never a torn one. */
 static unsigned int ft_parked;
+/* Passive bindings, which ft_bound does not count. Transaction-only. */
+static unsigned int ft_passive;
 static unsigned int ft_neighbour_refs;
 static unsigned int ft_handle_refs;
 static atomic64_t ft_neigh_invalidations = ATOMIC64_INIT(0);
@@ -2954,6 +2957,15 @@ static void ft_release(void *priv)
 	struct cdx_ft_entry *entry, *next;
 
 	cdx_ft_begin();
+	/* Counted here rather than at unbind, because this is the one place
+	 * every route away from a binding passes: unbind, a device's indirect
+	 * cleanup, and the unload drain. */
+	if (binding->passive) {
+		ft_passive--;
+		cdx_ft_end();
+		kfree(binding);
+		return;
+	}
 	list_for_each_entry_safe(entry, next, &ft_entries, list)
 		if (entry->binding == binding)
 			ft_remove(entry);
@@ -2986,8 +2998,8 @@ static void ft_release(void *priv)
  * which declines every request. Netfilter counts a declined direction as "not
  * offloaded" and leaves it on the software fast path, which is exactly where a
  * Wi-Fi ingress belongs; the DPAA ports in the same table keep their hardware
- * path. Nothing is allocated for the device beyond the record the unload drain
- * needs to find its table (struct cdx_ft_passive, beside the binding).
+ * path. Nothing is allocated for the device beyond a binding marked passive,
+ * which is what ft_release() and the unload drain need to find its table.
  * The bind path binds a DPAA port the same way when the hardware cannot take
  * it for the rest of the boot, and says why there.
  */
@@ -2996,13 +3008,6 @@ static int ft_passive_callback(enum tc_setup_type type, void *data, void *priv)
 	return -EOPNOTSUPP;
 }
 
-static void ft_passive_release(void *priv)
-{
-	kfree(priv);
-}
-
-static unsigned int ft_passive;
-
 /* Bind dev with ft_passive_callback. why names the reason in the log, which is
  * the only place a consumer whose table committed can learn that one of its
  * ports stays in software. */
@@ -3010,20 +3015,20 @@ static int ft_bind_passive(struct net_device *dev, struct flow_block_offload *bo
 			   struct nf_flowtable *flowtable, bool indirect, struct Qdisc *sch,
 			   void (*cleanup)(struct flow_block_cb *), const char *why)
 {
-	struct cdx_ft_passive *passive;
+	struct cdx_ft_binding *passive;
 	struct flow_block_cb *cb;
 
 	cdx_ft_assert_held();
 	passive = kzalloc(sizeof(*passive), GFP_KERNEL);
 	if (!passive)
 		return -ENOMEM;
+	passive->dev = dev;
 	passive->table = flowtable;
+	passive->passive = true;
 	cb = indirect ?
 		flow_indr_block_cb_alloc(ft_passive_callback, dev, passive,
-			ft_passive_release, bo, dev, sch, flowtable, NULL,
-			cleanup) :
-		flow_block_cb_alloc(ft_passive_callback, dev, passive,
-			ft_passive_release);
+			ft_release, bo, dev, sch, flowtable, NULL, cleanup) :
+		flow_block_cb_alloc(ft_passive_callback, dev, passive, ft_release);
 	if (IS_ERR(cb)) {
 		kfree(passive);
 		return PTR_ERR(cb);
@@ -3218,11 +3223,8 @@ static int ft_block_setup(struct net_device *dev, struct flow_block_offload *bo,
 		list_add_tail(&cb->driver_list, &ft_block_list);
 	} else if (bo->command == FLOW_BLOCK_UNBIND) {
 		cb = flow_block_cb_lookup(bo->block, ft_rule_callback, dev);
-		if (!cb) {
+		if (!cb)
 			cb = flow_block_cb_lookup(bo->block, ft_passive_callback, dev);
-			if (cb)
-				ft_passive--;
-		}
 		if (!cb) {
 			rc = -ENOENT;
 			goto out;
@@ -8949,16 +8951,11 @@ release:
 static void ft_block_drain(void)
 {
 	struct flow_block_cb *cb, *next;
-	struct cdx_ft_binding *binding;
 	struct nf_flowtable *table;
 
 	list_for_each_entry_safe(cb, next, &ft_block_list, driver_list) {
-		if (cb->cb == ft_passive_callback) {
-			table = ((struct cdx_ft_passive *)cb->cb_priv)->table;
-		} else {
-			binding = cb->cb_priv;
-			table = binding->table;
-		}
+		/* Passive or real alike: both carry their table. */
+		table = ((struct cdx_ft_binding *)cb->cb_priv)->table;
 		down_write(&table->flow_block_lock);
 		list_del(&cb->list);
 		up_write(&table->flow_block_lock);

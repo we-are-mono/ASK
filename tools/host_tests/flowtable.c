@@ -233,7 +233,12 @@ struct flow_block_cb {
      * flow_indr_dev_unregister(); a direct callback stays its property until
      * somebody unbinds, which is what the adapter's own drain is for. */
     bool indirect;
+    /* Netfilter's own list of every indirect callback, kept apart from the
+     * table's block list: flow_indr_block_cb_alloc() links it here and only
+     * flow_indr_block_cb_remove() or the unregister's cleanup unlinks it. */
+    struct list_head indr_list;
 };
+static struct list_head flow_block_indr_list = { &flow_block_indr_list, &flow_block_indr_list };
 struct net { int id; };
 static struct net init_net;
 /* One bridge VLAN membership, as `bridge vlan add dev D vid N [untagged]`
@@ -1034,6 +1039,7 @@ static struct flow_block_cb *flow_indr_block_cb_alloc(rule_callback_t fn, void *
     struct flow_block_cb *cb = kzalloc(sizeof(*cb), GFP_KERNEL); assert(cb);
     cb->cb = fn; cb->ident = ident; cb->cb_priv = priv; cb->release = release;
     cb->indirect = true;
+    list_add_tail(&cb->indr_list, &flow_block_indr_list);
     if (invalidate_on_bind) { assert(ft_bound); ft_invalidate(); }
     return cb;
 }
@@ -1054,6 +1060,7 @@ static void flow_indr_block_cb_remove(struct flow_block_cb *cb, struct flow_bloc
     /* Moving a published callback must exclude native stats walkers before
      * it reaches the temporary list; protecting only its free is too late. */
     assert(block_write_lock && *block_write_lock);
+    list_del(&cb->indr_list);
     list_del(&cb->list); list_add_tail(&cb->list, &bo->cb_list);
 }
 /* The filter layer's answer for a finished tuple. A tc police filter is the
@@ -1255,7 +1262,7 @@ static void cancel_delayed_work_sync(int *work)
 { assert(work == &ft_work || work == &ft_ipsec_stats || work == &ft_rearm_work); canceled++; }
 static int register_indirect(void)
 { assert(ft_ready); if (registration_fails()) return -ENOMEM; indirect_registered=true; return 0; }
-static void unregister_indirect(void)
+static void unregister_indirect(void (*release)(void *))
 {
     assert(indirect_registered && !cdx_info->ctrl.mutex);
     /* Unload gives this route back last, with all five works cancelled --
@@ -1272,23 +1279,30 @@ static void unregister_indirect(void)
     } else {
         assert(!canceled);
     }
-    /* Only the indirect callbacks. Netfilter tracks those itself and unwinds
-     * them here; a direct callback is the flowtable's property and it has no
-     * idea the adapter is leaving. Releasing those too -- as this stub used
-     * to -- models a cleanup the kernel does not perform, and hid a
-     * use-after-free: the direct callback survived unload, and the next
-     * offload work item called into freed module text. */
+    /* Only the indirect callbacks, and only those whose release is the one
+     * given, exactly as __flow_block_indr_cleanup() selects them. Netfilter
+     * tracks those itself and unwinds them here; a direct callback is the
+     * flowtable's property and it has no idea the adapter is leaving.
+     * Releasing those too -- as this stub used to -- models a cleanup the
+     * kernel does not perform, and hid a use-after-free: the direct callback
+     * survived unload, and the next offload work item called into freed
+     * module text. Selecting by route rather than by release hid another: an
+     * indirect callback with a release of its own stays on the indirect list
+     * whatever route installed it. */
     struct flow_block_cb *cb, *next;
-    list_for_each_entry_safe(cb, next, &ft_block_list, driver_list) {
-        if (!cb->indirect)
+    list_for_each_entry_safe(cb, next, &flow_block_indr_list, indr_list) {
+        assert(cb->indirect);
+        if (cb->release != release)
             continue;
-        list_del(&cb->driver_list); list_del(&cb->list);
+        list_del(&cb->indr_list);
+        /* nf_flow_table_indr_cleanup(). */
+        list_del(&cb->list); list_del(&cb->driver_list);
         cb->release(cb->cb_priv); kfree(cb);
     }
     indirect_registered=false;
 }
 #define flow_indr_dev_register(fn, priv) register_indirect()
-#define flow_indr_dev_unregister(fn, priv, release) unregister_indirect()
+#define flow_indr_dev_unregister(fn, priv, release) unregister_indirect(release)
 static unsigned unload_sleeps, unload_failures;
 static void msleep(unsigned ms)
 {
@@ -6621,6 +6635,42 @@ static void test_direct_bind_unload(void)
     assert(!ft_bound && !in.refs && !allocated && !ft_count);
 }
 
+/* Unload after a passive bind through the indirect route -- the route a Wi-Fi
+ * VAP takes, having no ndo_setup_tc.
+ *
+ * Netfilter unwinds the indirect callbacks it brokered by their release
+ * function alone. A passive binding that carried a release of its own was left
+ * on Netfilter's indirect list, and the adapter's drain then freed it there:
+ * the next driver to walk or extend that list touched freed memory. */
+static void test_passive_indirect_unload(void)
+{
+    struct flow_block_cb *cb;
+    unsigned linked = 0;
+
+    list_init(&block.cb_list);
+    ft_ready=ft_stopping=false; registration_step=canceled=0;
+    fixture();
+    assert(ask_flowtable_init() == 0);
+    physical_ok = false;
+    assert(bind_device(&in, FLOW_BLOCK_BIND) == 0 && ft_passive == 1 && !ft_bound && !in.refs);
+    physical_ok = true;
+    assert(bind_device(&out, FLOW_BLOCK_BIND) == 0 && ft_passive == 1 && ft_bound == 1);
+    list_for_each_entry(cb, &flow_block_indr_list, indr_list)
+        linked++;
+    assert(linked == 2);
+
+    ask_flowtable_exit();
+
+    /* What the next driver on that list would do: walk it. A callback freed
+     * while still linked is a use-after-free here, under ASan. */
+    linked = 0;
+    list_for_each_entry(cb, &flow_block_indr_list, indr_list)
+        linked++;
+    assert(!linked);
+    assert(block.cb_list.next == &block.cb_list && ft_block_list.next == &ft_block_list);
+    assert(!ft_passive && !ft_bound && !allocated && !in.refs && !out.refs);
+}
+
 static void test_registration(void)
 {
     for (registration_failure = 0; registration_failure <= 9; registration_failure++) {
@@ -6808,6 +6858,7 @@ int main(void)
     test_qos_decode();
     test_vlan_stats();
     test_direct_bind_unload();
+    test_passive_indirect_unload();
     test_registration();
     puts("Flowtable: decoder, references, deltas, wrap, rollback, connections, neighbours, invalidation, rearm, class decode, VLAN records and fatal retry passed");
 }
