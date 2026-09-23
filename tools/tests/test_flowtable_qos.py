@@ -37,6 +37,7 @@ import re
 import socket
 import statistics
 import struct
+import threading
 import time
 
 import pytest
@@ -45,8 +46,8 @@ import pytest_asyncio
 from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
-from test_flowtable_offload import (ARTIFACTS, TABLE, WAN_IP, command, console_command,
-                                    read, rig)  # noqa: F401
+from test_flowtable_offload import (ARTIFACTS, DPORT, TABLE, WAN_IP, command,
+                                    console_command, read, rig)  # noqa: F401
 
 # One port per flow, so a conntrack left behind by one case never feeds another.
 # Above the gateway profiles' ranges (49100 and 49200). The devlink file takes
@@ -55,6 +56,7 @@ PORT = int(os.environ.get("ASK_FLOWTABLE_QOS_PORT", "49300"))
 PORT_SHAPED = PORT
 PORT_HIGH, PORT_LOW = PORT + 1, PORT + 2
 PORT_BULK, PORT_PROBE = PORT + 3, PORT + 4
+PORT_EF, PORT_BE, PORT_EF_SOFTWARE = PORT + 5, PORT + 6, PORT + 7
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -99,6 +101,17 @@ TAIL_FRAMES = 128
 TCP_FRAME, TCP_PAYLOAD = 1514, 1448
 # Scheduling noise in a round trip between two Python processes.
 PROBE_SLACK = 0.15e-3
+
+# Expedited forwarding, DSCP 46, as it sits in the tos byte.
+EF_DSCP = 46
+EF_TOS = EF_DSCP << 2
+COUNT = 256
+# A class that carries a remark: the flag at bit 12, the codepoint in the six
+# bits above it. The image's 0xf0 mask stops at the class queue, so the adapter
+# is reloaded with the field widened from the same base -- a mark of 0x70 still
+# names class queue 7 under it.
+REMARK_MASK = 0x7ffff0
+REMARK_CLASS = 1 << 12 | EF_DSCP << 13
 
 LAN_BASE = "/tmp/ask_flowtable_qos"
 ECHO = f"{LAN_BASE}_echo.py"
@@ -399,6 +412,62 @@ async def conntrack_clear(r):
         for src, dst in ((WAN_IP, r.lan_ip), (r.lan_ip, WAN_IP)):
             await command(r.target, r.session, "conntrack", "-D", "-p", proto,
                           "--orig-src", src, "--orig-dst", dst, check=False)
+
+
+async def admit(r, port, *, tos=0, destination=None, timeout=20):
+    """Echo short bursts to a LAN-side UDP port until both directions of the flow
+    are installed, and return the two rows.
+
+    A deadline rather than a round count: an admission that loses the adapter's
+    RTNL trylock is declined and offered again only after flowtable GC ticks, so
+    every attempt sends before it looks.
+    """
+    destination = destination or r.lan_ip
+    target = f"{destination}:{port}"
+    deadline = time.monotonic() + timeout
+    while True:
+        await asyncio.to_thread(lockstep, destination, port, 8, tos=tos)
+        state = await r.state()
+        forward = directions(state, ingress=TARGET_WAN_IF, proto=17, dst=target)
+        reverse = directions(state, ingress=TARGET_LAN_IF, proto=17, src=target)
+        if forward and reverse:
+            assert len(forward) == len(reverse) == 1, (forward, reverse)
+            return forward[0], reverse[0]
+        if time.monotonic() > deadline:
+            pytest.fail(f"{target} was not admitted in both directions: {state}")
+        await asyncio.sleep(0.5)
+
+
+async def captured(r, send):
+    """The rig's requests as they arrive on this host's WAN interface, captured
+    while the coroutine `send()` makes runs."""
+    from scapy.all import IP, UDP, AsyncSniffer
+
+    ready = threading.Event()
+    sniffer = AsyncSniffer(iface=r.wan_if, store=True, started_callback=ready.set,
+                           filter=f"udp and src host {r.lan_ip} and dst port {DPORT}")
+    sniffer.start()
+    try:
+        assert await asyncio.to_thread(ready.wait, 5), "the WAN capture did not start"
+        await send()
+    finally:
+        packets = sniffer.stop()
+    return [p for p in packets if IP in p and UDP in p]
+
+
+async def reload_adapter(r, *parameters, idle=True):
+    """Unload the flowtable adapter and load it again with `parameters`.
+
+    The class decode is boot-immutable -- its parameters are 0444 -- so a case
+    that needs a different mask reloads the module, and puts the image's own
+    options back the same way. The adapter refuses to leave while anything is
+    bound, so a caller that expects a clean reload checks that first.
+    """
+    if idle:
+        state = await r.state()
+        assert state["bindings"] == state["entries"] == 0, state
+    await console_command(r.console, "rmmod", "ask_flowtable", check=idle, timeout=30)
+    await console_command(r.console, "modprobe", "ask_flowtable", *parameters, timeout=30)
 
 
 @pytest_asyncio.fixture
@@ -710,3 +779,143 @@ async def test_flowtable_qos_wred_drops_before_the_tail(qos):
     assert wide["added"] <= 1.3 * delay(WRED_BANDS["wide"][1]) + PROBE_SLACK, wide
     assert wide["added"] >= 0.5 * delay(WRED_BANDS["wide"][0]), wide
     assert narrow["added"] < wide["added"] < tail["added"], phases
+
+
+# ---- DSCP -----------------------------------------------------------------
+
+async def test_flowtable_qos_dscp_map_classifies_unmarked_frames(qos):
+    """A frame whose mark names no class is queued by its DSCP, through the
+    egress map, in hardware and in software alike.
+
+    The map is the per-port table a `flower ip_tos ... skbedit priority` filter
+    programs, and it answers only for frames that named no class of their own.
+    Both paths once failed to reach it. The hardware enable tested the entry's
+    whole mark word, which is never zero because every offloaded flow carries a
+    valid ingress-policer field, so no offloaded flow could use the map; and the
+    software path asked a function that answers a default queue for every
+    unmarked frame. Either regression sends EF to the default class queue, and
+    the leaf counts below read zero.
+
+    The counts are exact because the queue is one nothing else reaches: EF goes
+    to the prio 1 leaf, since the DUT's own unmarked frames leave on class queue
+    7, which the prio 0 leaf holds. A best-effort flow on the same port is the
+    control, and moves neither leaf.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    await tree(r, dev, CAP_MBIT, [("1:10", HIGH_PRIO), ("1:11", LOW_PRIO)])
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+    await r.tc("filter", "add", "dev", dev, "egress", "protocol", "ip", "pref", "1",
+               "flower", "skip_sw", "ip_tos", f"{EF_TOS:#x}/0xfc",
+               "action", "skbedit", "priority", "1:11")
+    shown = (await r.tc("filter", "show", "dev", dev, "egress"))["stdout"]
+    assert "in_hw" in shown and "skip_sw" in shown, shown
+    # EF_SOFTWARE is deliberately not offered: it is the software half.
+    await offload(r, f"ip saddr {WAN_IP} ip daddr {r.lan_ip} "
+                     f"udp dport {{ {PORT_EF}, {PORT_BE} }} flow add @fast")
+    await lan_start(r, echo=[PORT_EF, PORT_BE, PORT_EF_SOFTWARE])
+    for port, tos in ((PORT_EF, EF_TOS), (PORT_BE, 0)):
+        forward, reverse = await admit(r, port, tos=tos)
+        assert int(forward["qos"], 16) == int(reverse["qos"], 16) == 0, (forward, reverse)
+
+    async def burst(port, tos):
+        target = f"{r.lan_ip}:{port}"
+        state = await r.state()
+        before = await egress(r, dev)
+        echoed = await asyncio.to_thread(lockstep, r.lan_ip, port, COUNT, tos=tos)
+        after = await egress(r, dev)
+        final = await r.state()
+        return {"echoed": echoed,
+                "rows": (directions(state, ingress=TARGET_WAN_IF, proto=17, dst=target),
+                         directions(final, ingress=TARGET_WAN_IF, proto=17, dst=target)),
+                "mapped": leaf_delta(before, after, 1), "other": leaf_delta(before, after, 0),
+                "software_tx": after["software_tx"] - before["software_tx"]}
+
+    ef = await burst(PORT_EF, EF_TOS)
+    best_effort = await burst(PORT_BE, 0)
+    software = await burst(PORT_EF_SOFTWARE, EF_TOS)
+    r.record("qos-dscp-map", {"filter": shown, "ef": ef, "best_effort": best_effort,
+                              "software": software})
+
+    frame = 256 + UDP_HEADERS
+    for name, result in (("ef", ef), ("best_effort", best_effort)):
+        assert result["echoed"] == COUNT, (name, result)
+        assert [len(rows) for rows in result["rows"]] == [1, 1], (name, result["rows"])
+        (old,), (new,) = result["rows"]
+        assert old["cookie"] == new["cookie"], (name, old, new)
+        assert int(new["packets"]) - int(old["packets"]) == COUNT, (name, old, new)
+        assert result["software_tx"] <= COUNT // 4, (name, result)
+    # Offloaded and unmarked, and every frame on the class the codepoint names.
+    assert ef["mapped"] == {"frames": COUNT, "bytes": COUNT * frame, "rejected": 0}, ef
+    assert best_effort["mapped"]["frames"] == 0, best_effort
+    assert best_effort["other"]["frames"] < COUNT // 4, best_effort
+    # The same codepoint through the CPU lands on the same class.
+    assert software["echoed"] == COUNT, software
+    assert software["rows"] == ([], []), software
+    assert software["software_tx"] >= COUNT, software
+    assert software["mapped"] == {"frames": COUNT, "bytes": COUNT * frame, "rejected": 0}, software
+
+
+async def test_flowtable_qos_dscp_remark_rewrites_the_wire(qos):
+    """A mark that carries a remark makes the hardware rewrite the DSCP on the
+    wire, and nothing else rewrites it.
+
+    The WAN host captures what arrives. First, before any class exists, the
+    rig's own sender through plain software forwarding: every request at DSCP
+    0, which is what the sender puts there itself. Then the same sender with
+    the flow in hardware under a mark naming EF: every request at EF, with an
+    IP checksum that still verifies, one TTL lower, and each one counted by the
+    classifier while the CPU transmitted next to nothing.
+
+    The remark lives in bits the image's mask does not cover, so the adapter
+    is reloaded with a wider one for the case and with the image's own options
+    afterwards; the two boot-immutable parameters have to read back as they
+    did before.
+    """
+    from scapy.all import IP
+
+    r = qos
+    parameters = "/sys/module/ask_flowtable/parameters/"
+    original = {name: (await read(r.target, r.session, parameters + name)).strip()
+                for name in ("qos_mark_mask", "qos_default_class")}
+    plain = await captured(r, lambda: r.exchange(16))
+    assert len(plain) == 16 and {p[IP].tos for p in plain} == {0}, [p.summary() for p in plain]
+    await r.clear_ct()
+    await reload_adapter(r, f"qos_mark_mask={REMARK_MASK:#x}")
+    try:
+        assert int((await read(r.target, r.session, parameters + "qos_mark_mask")).strip()) \
+            == REMARK_MASK
+        shift = (REMARK_MASK & -REMARK_MASK).bit_length() - 1
+        await r.table(mark=REMARK_CLASS << shift)
+        await r.exchange(64)
+        installed = await r.wait(lambda s: s["entries"] == 2)
+        before = await egress(r, TARGET_WAN_IF)
+        packets = await captured(r, lambda: r.exchange(COUNT))
+        after = await egress(r, TARGET_WAN_IF)
+        final = await r.state()
+        r.record("qos-dscp-remark", {"installed": installed, "final": final,
+                                     "tos": [p[IP].tos for p in packets],
+                                     "software_tx": after["software_tx"] - before["software_tx"]})
+
+        assert all(int(f["qos"], 16) == REMARK_CLASS for f in installed["flows"]), installed
+        counted = {f["cookie"]: int(f["packets"]) for f in final["flows"]}
+        assert set(counted) == {f["cookie"] for f in installed["flows"]}, (installed, final)
+        for flow in installed["flows"]:
+            assert counted[flow["cookie"]] - int(flow["packets"]) == COUNT, (flow, final)
+        assert after["software_tx"] - before["software_tx"] <= 32, (before, after)
+        assert len(packets) == COUNT, len(packets)
+        for p in packets:
+            assert p[IP].tos == EF_TOS and p[IP].ttl == 63, p.summary()
+            saved = p[IP].chksum
+            copy = p[IP].copy()
+            del copy.chksum
+            assert IP(bytes(copy)).chksum == saved, p.summary()
+    finally:
+        try:
+            await r.delete_table()
+            await r.clear_ct()
+        finally:
+            await reload_adapter(r, idle=False)
+    restored = {name: (await read(r.target, r.session, parameters + name)).strip()
+                for name in original}
+    assert restored == original, (original, restored)
