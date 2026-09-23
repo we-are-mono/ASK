@@ -4654,6 +4654,12 @@ struct ft_mc_route {
 	struct cdx_mc_listener listener[CDX_MC_MAX_LISTENERS];
 	u8 listeners;
 	u32 mtu;
+	/* Whether the bridge handed its streams to the host at the last
+	 * publication, which is when the route names its stream's flow into
+	 * existence: see ft_mc_route_learns(). A bridge turning promiscuous
+	 * raises no event at all, so each publication -- one per refresh of
+	 * the routed learner -- compares. Under ft_mc_lock. */
+	bool learns;
 	/* Reported back. `in_tags` is the ingress framing the counters include,
 	 * which the fold into the MFC's counters takes off again. */
 	bool carried;
@@ -5280,11 +5286,22 @@ static void ft_mc_route_clear(struct ft_mc_route *r)
 static bool ft_mc_route_publish(struct ft_mc_route *r,
 				const struct ft_mc_route *want)
 {
+	bool carried, learns;
 	struct ft_mc_flow *f;
-	bool carried;
 	u8 i;
 
+	/* Read before the lock like everything else the route describes; the
+	 * bridge is the caller's for the call. */
+	learns = want->bridge &&
+		 (br_multicast_router(want->bridge) ||
+		  (READ_ONCE(want->bridge->flags) & IFF_PROMISC));
 	mutex_lock(&ft_mc_lock);
+	/* The same route through a bridge that now hands the host its streams,
+	 * or no longer does: a frame of the stream recorded while nothing named
+	 * it has to be recorded again. */
+	if (!ft_mc_stopping && r->linked && r->learns != learns)
+		ft_mc_forget_seen();
+	r->learns = learns;
 	if (!ft_mc_stopping && (!r->linked || !ft_mc_route_same(r, want))) {
 		ft_mc_route_clear(r);
 		dev_hold(want->bridge);
@@ -7223,7 +7240,12 @@ out:
  * Marked rather than asked here. A port VLAN object is notified before the
  * bridge applies it, so the state it describes is not yet the state the
  * snapshot would read; the worker reads it afterwards, under RTNL of its own.
- * See ft_mc_flow_derive(). */
+ * See ft_mc_flow_derive().
+ *
+ * What names a stream can change here too: a route names its source only
+ * while the bridge is a multicast router (see ft_mc_route_learns()), so a
+ * stream recorded while it was not has to be recorded again now that it may
+ * be. */
 static void ft_mc_bridge_changed(struct net_device *dev)
 {
 	struct net_device *bridge;
@@ -7235,6 +7257,7 @@ static void ft_mc_bridge_changed(struct net_device *dev)
 	if (!bridge || !netif_is_bridge_master(bridge))
 		return;
 	mutex_lock(&ft_mc_lock);
+	ft_mc_forget_seen();
 	list_for_each_entry(f, &ft_mc_flows, list) {
 		if (f->bridge != bridge)
 			continue;

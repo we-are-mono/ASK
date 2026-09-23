@@ -557,8 +557,13 @@ its stream, as one group with both output lists; without one it is
 learns its source. See
 [one stream, both learners](multicast-routed.md#one-stream-both-learners). A
 route names its stream's flow directly: the flow is learned from traffic with
-no membership at all, and kept with no member port left. The `/proc` row lists
-the route's copies as `routed=`, beside the bridge's own `ports=`.
+no membership at all, and kept with no member port left. It does so only while
+the bridge hands the host its streams, so a bridge becoming a router
+(`BRIDGE_MROUTER`) or turning promiscuous lets a stream seen before be
+recorded again. Promiscuity raises no event, so the routed learner's publication
+of the route, one per five-second refresh, is where that change is found. The
+`/proc` row lists the route's copies as `routed=`, beside the bridge's own
+`ports=`.
 
 **A flow must be learned to be installed, and installation is not
 retroactive.** A membership with no observed source occupies no hardware. This

@@ -536,6 +536,7 @@ static void reset(void)
                                         struct ft_mc_route, list));
     ft_mc_taps_publish(NULL, 0, false);
     BR.mrouter = BR2.mrouter = false;
+    BR.flags = BR2.flags = 0;
     P1.mtu = P2.mtu = P3.mtu = 0;
     /* A fresh learner: an empty ring and nothing recorded. */
     memset(ft_mc_last, 0, sizeof(ft_mc_last));
@@ -1494,12 +1495,15 @@ static void one_stream_both_learners(void)
     /* Not a router: the host is handed nothing, and no flow is learned. */
     see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
     assert(!ft_mc_flow_count);
-    /* A router: the next frame is a flow, the route's alone. Publishing the
-     * route forgot the frame seen before, so the same frame will do. */
+    /* A router: the next frame is a flow, the route's alone. The frame seen
+     * before is still in the dedup slots until the bridge says it became
+     * one -- BRIDGE_MROUTER, which forgets them -- and then the same frame
+     * will do. */
     BR.mrouter = true;
-    ft_mc_route_withdraw(&r1);
-    ft_mc_route_publish(&r1, &want);
     answer(&P1, S, 289, BR_MCAST_TO_HOST_ROUTER, 0);
+    see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+    assert(!ft_mc_flow_count);
+    ft_mc_bridge_changed(&BR);
     see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
     pass();
     f = flow(&P1, S, 289);
@@ -1510,6 +1514,42 @@ static void one_stream_both_learners(void)
     answer(&P1, S, 289, BR_MCAST_TO_HOST_ROUTER, 1, &P2);
     pass();
     assert(ft_mc_flow_count == 1 && f->ports == 1 && f->hw);
+    ft_mc_route_withdraw(&r1);
+
+    /* A bridge turning promiscuous hands the host everything as a router
+     * does, and tells nobody: no switchdev attribute, no netdev event. The
+     * routed learner publishes the same route again at each of its
+     * refreshes, which is where it is found, and the frame seen before is
+     * recorded again. Turning back is the same. */
+    reset();
+    memset(&r1, 0, sizeof(r1));
+    vlan_enabled = true;
+    member(&BR, 289, false);
+    member(&P1, 289, false);
+    route_want(&want, 289, S, G, &P3, 287);
+    ft_mc_route_publish(&r1, &want);
+    see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+    assert(!ft_mc_flow_count && !r1.learns);
+    BR.flags |= IFF_PROMISC;
+    see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+    assert(!ft_mc_flow_count);
+    works = 0;
+    assert(!ft_mc_route_publish(&r1, &want));
+    assert(r1.learns && !works);
+    see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+    assert(ft_mc_flow_count == 1 && flow(&P1, S, 289));
+    /* Nothing changed: nothing forgotten. */
+    see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+    ft_mc_route_publish(&r1, &want);
+    {
+        unsigned recorded = ft_mc_ring_head;
+
+        see(seen_v4(&BR, &P1, G, S, 289, true, SENDER));
+        assert(ft_mc_ring_head == recorded);
+    }
+    BR.flags &= ~IFF_PROMISC;
+    ft_mc_route_publish(&r1, &want);
+    assert(!r1.learns);
     ft_mc_route_withdraw(&r1);
 }
 
