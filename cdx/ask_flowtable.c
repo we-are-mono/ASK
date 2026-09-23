@@ -7149,11 +7149,18 @@ static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 	/* The SA's own local endpoint is part of the question, not decoration:
 	 * an output lookup carrying a source address answers for the route
 	 * that address may actually use, which is the one this tunnel's frames
-	 * will take. */
+	 * will take.
+	 *
+	 * No output interface, though. A lookup bound to the SA's port answers
+	 * through that port whatever the table says -- a less specific route
+	 * via it, or the destination assumed on-link -- so the refusal below
+	 * could never fire, and a peer whose route had moved to another port
+	 * was followed to a next hop on the old one. The kernel now drops
+	 * frames for a bundle routed off the SA's port, so this has to agree
+	 * with it. */
 	struct flowi4 fl4 = {
 		.daddr = peer->ip,
 		.saddr = local->ip,
-		.flowi4_oif = dev->ifindex,
 	};
 	int rc = 0;
 

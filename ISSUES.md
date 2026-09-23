@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A244.** A packet-offloaded SA's plaintext left in the clear by whatever device the bundle's route named once the peer route moved off the SA's port —
+  fixed (_:/^xfrm: keep packet-offload plaintext on the SA's port_).
+
 - [x] **A242.** A wedged host-command channel logged every failed sync retry, several lines each, for as long as the board ran —
   fixed (_:/^sdk_fman: report a run of HC sync failures once, and its end_).
 

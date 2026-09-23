@@ -722,15 +722,45 @@ datapath sites, publish the backend's handle as `x->handle` so the SEC
 completion path can still resolve a decrypted frame, and give packet-offload
 tunnel output the sec_path and the finished Ethernet header SEC expects.
 
-Three things in that hunk are not obvious, and each one was a failure first:
+Four things in that hunk are not obvious, and each one was a failure first:
 
-**It must not take `xfrm_dev_direct_output()`.** That path pushes
-`hard_header_len` of uninitialised space and transmits without resolving a
-neighbour, because it is written for hardware that writes the L2 header
-itself. SEC is handed the frame complete with its Ethernet header, so every
-packet takes the ordinary neighbour output instead — which is the reason the
-comment beside it already gives for locally generated packets, and is simply
-true of all of them here.
+**Tunnel mode goes to the device directly, but not by
+`xfrm_dev_direct_output()`.** That path pushes `hard_header_len` of
+uninitialised space, because it is written for hardware that writes the L2
+header itself, and SEC is handed the frame with its Ethernet header. The first
+version therefore sent every packet through the ordinary neighbour output,
+which tied a tunnel's plaintext to a neighbour of its *inner* destination:
+wrong for any tunnel, and impossible for one whose outer family differs — an
+IPv4-only WAN has no IPv6 neighbours, so IPv6-in-IPv4 carried nothing.
+`xfrm_dev_sec_output()` transmits to `x->xso.dev` with a header that names the
+inner protocol and leaves both addresses zero. `cpe_fp_tx()` reads that
+ethertype to find the inner packet, SEC copies the fourteen bytes ahead of the
+tunnel header it builds, and the IPsec offline port rewrites the addresses and
+the ethertype from the SA's own next hop and outer family
+(`fill_ipsec_actions()` → `create_ethernet_hm(info, 1)`). It does not run the
+child route's `local_out`: with `ipsec_offload` set, 030's `__ip_local_out()`
+and `__ip6_local_out()` skip `LOCAL_OUT` and transmit through the child's
+neighbour themselves, which is the path this replaces, and the inner header
+was already finished by its protocol's output on the bundle or by forwarding.
+The SA's next hop is still used per packet, as neighbour output used it: that
+keeps Linux's entry from ageing out and resolves it again after a flush or a
+carrier flap, and that entry is what refreshes the SA's programmed address and
+lets its flows back into hardware. The frame does not wait for it. Transport
+mode is addressed to the peer itself and keeps the ordinary path.
+
+**It only ever leaves by the SA's device.** The frame is still plaintext and
+only that port hands it to SEC; any other device would send it in the clear,
+and the upstream wrong-device drop in `validate_xmit_xfrm()` never sees it,
+because it keys on `xfrm_offload()` and this frame carries no `olen` (below).
+So `xfrm_output()` drops a bundle whose route leaves by another device — the
+route to the peer moved by a failover, a more specific route or a rule — and
+`validate_xmit_xfrm()` drops a frame moved off the device afterwards, by a
+hook, a qdisc action or a stacked device. Both count `XfrmOutBundleCheckError`,
+a counter nothing else in this kernel increments. The adapter's own check that
+the route to the peer leaves by the SA's port, at install and when the peer
+moves, asks the FIB unbound: bound to the port, the lookup answered through it
+whatever the table held, so that refusal could never fire and a peer routed
+elsewhere was followed to a next hop on the old port.
 
 **It must set `sp->len` and not `sp->olen`.** `xfrm_offload(skb)` answers
 non-NULL exactly when `olen` is non-zero and equal to `len`, and a non-NULL

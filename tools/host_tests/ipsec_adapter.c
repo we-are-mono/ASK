@@ -775,11 +775,13 @@ static struct rtable *route_answer;
 static int route_error;
 static struct neighbour *route_neigh;
 static unsigned route_lookups, route_puts;
+static int route_oif;
 static struct dst_ops v4_ops = { .family = AF_INET };
 
 static struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
 {
-	(void)net; (void)fl4;
+	(void)net;
+	route_oif = fl4->flowi4_oif;
 	route_lookups++;
 	if (route_error)
 		return ERR_PTR(route_error);
@@ -1010,6 +1012,10 @@ static void test_next_hop(void)
 	x->xso.dev = &LAN;
 	assert(ft_ipsec_spec(x, &spec, &ack) == -EOPNOTSUPP);
 	assert(route_puts == 1);
+	/* And the FIB is left free to say so: a lookup bound to the SA's port
+	 * answers through that port whatever the table holds, and this refusal
+	 * could never happen. */
+	assert(route_oif == 0);
 	x->xso.dev = &WAN;
 
 	/* A neighbour that has not answered is asked for and waited on, not

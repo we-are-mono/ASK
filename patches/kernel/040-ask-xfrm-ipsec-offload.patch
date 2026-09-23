@@ -1,4 +1,4 @@
-From bd4ab831ff017fbd87ae2b4ea6c91232c82c56ee Mon Sep 17 00:00:00 2001
+From 3e2adf8a7bccefe849b3299b2777aa83ecba6a54 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -19,6 +19,14 @@ GCM/GMAC SAs offload like every other supported cipher; the shared
 descriptor sharing policy that made them unsafe is fixed on the cdx
 side (DNCPE-2358).
 
+A packet-offloaded SA's frames leave only by the SA's own device, the
+one that hands them to SEC: a bundle routed to another device is dropped
+and counted as XfrmOutBundleCheckError, and validate_xmit_xfrm() drops a
+frame moved off it later. Tunnel mode goes to the device directly with an
+Ethernet header the IPsec offline port rewrites, so no neighbour of the
+inner family is resolved; the SA's own next hop is still used per packet,
+as neighbour output used it, so Linux keeps that entry resolved.
+
 Compiles warning-free: the offload entry points are declared in
 include/net/xfrm.h instead of per-file externs and
 __xfrm_state_lookup_byhandle is static.
@@ -38,12 +46,13 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/Makefile            |   1 +
  net/xfrm/ipsec_flow.c        | 231 +++++++++
  net/xfrm/ipsec_flow.h        |  31 ++
+ net/xfrm/xfrm_device.c       |  24 +
  net/xfrm/xfrm_input.c        |  21 +
- net/xfrm/xfrm_output.c       | 179 +++++++
+ net/xfrm/xfrm_output.c       | 298 ++++++++++++
  net/xfrm/xfrm_policy.c       |  90 ++++
  net/xfrm/xfrm_state.c        | 236 +++++++++
  net/xfrm/xfrm_user.c         |   4 +
- 18 files changed, 1767 insertions(+), 7 deletions(-)
+ 19 files changed, 1910 insertions(+), 7 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -1521,6 +1530,41 @@ index 000000000000..ee8a7fa571b8
 +int ipsec_flow_add(struct net *net, const struct flowi *flow, u16 family, u8 dir, u16 *xfrm_handle);
 +#endif
 +
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index 7744ed8e4c83..f2a7fa2704a4 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -122,6 +122,30 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 	struct net_device *dev = skb->dev;
+ 	struct sec_path *sp;
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++	/* A frame for a packet-offloaded SA carries its state without olen
++	 * (see xfrm_output()), so xo is NULL for it and the wrong-device
++	 * check below never sees it. It is still plaintext, and only the
++	 * SA's own device hands it to SEC: sent anywhere else it would leave
++	 * in the clear. xfrm_output() refuses a bundle routed elsewhere; this
++	 * catches a frame moved after that, by a hook, a qdisc action or a
++	 * device it was handed on to.
++	 */
++	if (skb->ipsec_offload && !xo) {
++		sp = skb_sec_path(skb);
++		x = sp && sp->len ? sp->xvec[sp->len - 1] : NULL;
++		if (x && x->xso.type == XFRM_DEV_OFFLOAD_PACKET &&
++		    x->xso.dir == XFRM_DEV_OFFLOAD_OUT &&
++		    READ_ONCE(x->xso.dev) != dev) {
++			XFRM_INC_STATS(dev_net(dev),
++				       LINUX_MIB_XFRMOUTBUNDLECHECKERROR);
++			dev_core_stats_tx_dropped_inc(dev);
++			kfree_skb_list(skb);
++			return NULL;
++		}
++	}
++#endif
++
+ 	if (!xo || (xo->flags & XFRM_XMIT))
+ 		return skb;
+ 
 diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
 index 5d3633ce6ba3..907409eb5da8 100644
 --- a/net/xfrm/xfrm_input.c
@@ -1561,7 +1605,7 @@ index 5d3633ce6ba3..907409eb5da8 100644
  		spin_lock(&x->lock);
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index a5b5d82bd755..e89ccfee41c3 100644
+index a5b5d82bd755..bda6f29fb97b 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
 @@ -67,6 +67,10 @@ static int xfrm4_transport_output(struct xfrm_state *x, struct sk_buff *skb)
@@ -1728,18 +1772,120 @@ index a5b5d82bd755..e89ccfee41c3 100644
  	kfree_skb(skb);
  out:
  	return err;
-@@ -763,6 +859,71 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+@@ -644,6 +740,100 @@ static int xfrm_dev_direct_output(struct sock *sk, struct xfrm_state *x,
+ 	return dev_queue_xmit(skb);
+ }
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/* The neighbour a packet-offloaded tunnel SA's frames are addressed to, or
++ * NULL. The child route is the route to the SA's endpoint when the two share
++ * a family, so its neighbour for that endpoint is the next hop, found exactly
++ * as neighbour output would find it.
++ */
++static struct neighbour *xfrm_dev_sec_neigh(struct xfrm_state *x,
++					    struct dst_entry *child)
++{
++	if (child->ops->family != x->props.family)
++		return NULL;
++	return dst_neigh_lookup(child, &x->id.daddr);
++}
++
++/* Hand a tunnel-mode packet for a packet-offloaded SA straight to the SA's
++ * device, as xfrm_dev_direct_output() does for forwarded ones, but with the
++ * Ethernet header the SEC path is built around rather than uninitialised
++ * space.
++ *
++ * The driver reads that header's ethertype to find the inner packet, and SEC
++ * copies its fourteen bytes ahead of the tunnel header it builds. The IPsec
++ * offline port then rewrites both addresses and the ethertype from the SA's
++ * own next hop and outer family. So the header has to be well formed and
++ * name the inner protocol, which is all the neighbour path contributed to the
++ * frame: the inner family has no neighbour for a tunnel endpoint of the other
++ * family, and a link carrying only IPv4 has no IPv6 neighbours at all.
++ *
++ * The SA's next hop is still used, as neighbour output would use it for every
++ * packet: that keeps it from ageing out, moves a stale entry on to a probe and
++ * starts resolution for one that is gone. Linux's entry is what refreshes the
++ * address the SA was programmed with and what lets its flows back into
++ * hardware; the frame does not wait for it.
++ *
++ * Unlike xfrm_dev_direct_output() this does not run the child route's
++ * local_out. The inner header is already final -- the forwarding path
++ * finished a forwarded packet, and a local one was finished by its protocol's
++ * output on the bundle before it reached xfrm_output() -- and with
++ * ipsec_offload set the child's local_out skips LOCAL_OUT and transmits
++ * through the child route's neighbour itself, which is the path this
++ * replaces.
++ */
++static int xfrm_dev_sec_output(struct xfrm_state *x, struct sk_buff *skb)
++{
++	/* The offline port writes both addresses. */
++	static const u8 unset[ETH_ALEN];
++	struct net *net = xs_net(x);
++	struct net_device *dev;
++	struct dst_entry *dst;
++	struct neighbour *n;
++	int err;
++
++	dst = skb_dst_pop(skb);
++	if (!dst) {
++		XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -EHOSTUNREACH;
++	}
++	skb_dst_set(skb, dst);
++	nf_reset_ct(skb);
++
++	n = xfrm_dev_sec_neigh(x, dst);
++	if (n) {
++		neigh_event_send(n, NULL);
++		neigh_release(n);
++	}
++
++	rcu_read_lock();
++	dev = READ_ONCE(x->xso.dev);
++	if (unlikely(!dev)) {
++		err = -ENODEV;
++		goto drop;
++	}
++	if (unlikely(skb_cow_head(skb, LL_RESERVED_SPACE(dev)))) {
++		err = -ENOMEM;
++		goto drop;
++	}
++	if (unlikely(dev_hard_header(skb, dev, ntohs(skb->protocol), unset,
++				     NULL, skb->len) < 0)) {
++		err = -EINVAL;
++		goto drop;
++	}
++	skb->dev = dev;
++	err = dev_queue_xmit(skb);
++	rcu_read_unlock();
++	return err;
++
++drop:
++	rcu_read_unlock();
++	XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
++	kfree_skb(skb);
++	return err;
++}
++#endif
++
+ static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+ 	return xfrm_output_resume(sk, skb, 1);
+@@ -763,6 +953,96 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
  			return -EHOSTUNREACH;
  		}
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+		/* SEC is handed the frame complete with its Ethernet header,
-+		 * so every packet takes the ordinary path below -- the reason
-+		 * the comment after this one already gives for locally
-+		 * generated ones, which is simply true of all of them here.
-+		 * xfrm_dev_direct_output() would push hard_header_len of
-+		 * uninitialised space and transmit without resolving a
-+		 * neighbour, and the engine would encrypt that.
++		/* The frame leaves as plaintext and only the SA's own device
++		 * hands it to SEC; on any other it would be sent in the
++		 * clear. So a bundle whose route leaves elsewhere is dropped
++		 * here. For an SA of the flow's family that route is the one
++		 * to the peer, moved off the SA's port by a failover, a more
++		 * specific route or a routing rule, and the SA has to be
++		 * installed again where it now leads. validate_xmit_xfrm()
++		 * backs this up for a frame sent elsewhere after this point.
 +		 *
 +		 * The state travels with the frame instead of being looked up
 +		 * again: the transmit path needs the SA to pick a SEC frame
@@ -1747,8 +1893,23 @@ index a5b5d82bd755..e89ccfee41c3 100644
 +		 * expected to find it. The reference is released with the skb.
 +		 */
 +		{
-+			struct sec_path *sp = secpath_set(skb);
++			struct sec_path *sp;
 +
++			if (xfrm_dst_path(skb_dst(skb))->dev !=
++			    READ_ONCE(x->xso.dev)) {
++				XFRM_INC_STATS(net,
++					       LINUX_MIB_XFRMOUTBUNDLECHECKERROR);
++				kfree_skb(skb);
++				return -EHOSTUNREACH;
++			}
++
++			/* A forwarded packet decrypted by another SA still
++			 * carries that SA in its sec_path. The receive policy
++			 * has been checked by now, and the driver takes the
++			 * first entry as the SA to encrypt with, so start
++			 * from an empty one, as the software path does. */
++			secpath_reset(skb);
++			sp = secpath_set(skb);
 +			if (!sp) {
 +				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
 +				kfree_skb(skb);
@@ -1793,6 +1954,15 @@ index a5b5d82bd755..e89ccfee41c3 100644
 +					return err;
 +				}
 +			}
++			/* A tunnel's inner destination is not the next hop,
++			 * and in a tunnel of the other family it has no
++			 * neighbour at all, so tunnel mode goes straight to
++			 * the device, locally generated packets included: the
++			 * offline port frames them from the SA, not from a
++			 * neighbour. Transport mode is addressed to the peer
++			 * itself and keeps the ordinary path. */
++			if (x->props.mode == XFRM_MODE_TUNNEL)
++				return xfrm_dev_sec_output(x, skb);
 +			return xfrm_output_resume(sk, skb, 0);
 +		}
 +#endif
@@ -1800,7 +1970,7 @@ index a5b5d82bd755..e89ccfee41c3 100644
  		/* Exclusive direct xmit for tunnel mode, as
  		 * some filtering or matching rules may apply
  		 * in transport mode.
-@@ -866,10 +1027,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -866,10 +1146,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  
@@ -1821,7 +1991,7 @@ index a5b5d82bd755..e89ccfee41c3 100644
  }
  
  #if IS_ENABLED(CONFIG_IPV6)
-@@ -914,10 +1085,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -914,10 +1204,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  
