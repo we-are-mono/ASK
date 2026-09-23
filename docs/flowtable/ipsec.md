@@ -803,6 +803,23 @@ segment goes on as a packet of its own: SEC encrypts one packet per ESP, and
 the port's own segmentation would leave the checksum to a transmit offload
 that frames bound for SEC never reach.
 
+**A transport frame names its own header to SEC.** The driver gives SEC a
+DPOVRD word with every frame, and a set word overrides the SA's PDB. A
+tunnel's word names the inner protocol for the ESP trailer. Transport mode was
+given the same word, which also states a header length and a next-header
+offset of zero: SEC then encrypted the IP header with the payload and named
+IPIP in the trailer, and the peer decoded nothing. `dpa_ipsec_dpovrd()` now
+gives a transport frame its own IP header length, options included, and for
+IPv6 the hop-by-hop, routing and leading destination-options headers that
+precede ESP; and the offset of the next-header byte SEC swaps for ESP: 1 for
+IPv4's protocol byte or the IPv6 fixed header's, otherwise the extension
+header, in eight-byte units, whose first byte it is. A header the word cannot
+describe — not in the linear area, or longer than the field's 255 bytes —
+fails the frame rather than send it encrypted wrong.
+`tools/host_tests/test_ipsec_dpovrd.py` compiles that function out of the
+patched tree; `test_ipsec_offload_transport.py` has a software peer decrypt
+the DUT's transport traffic, half of it carrying IPv4 options.
+
 Proof: a tunnel carries traffic with no flowtable entry at all, with the SEC
 counter advancing and an independent peer decrypting what it produced.
 

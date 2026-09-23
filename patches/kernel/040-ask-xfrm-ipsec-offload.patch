@@ -1,4 +1,4 @@
-From c45355e53a7b1b607dfc83768c62e4187f546d22 Mon Sep 17 00:00:00 2001
+From fecc770296900543254ec5e8eebfa72dc76e131e Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -28,7 +28,9 @@ to the device directly with an Ethernet header the IPsec offline port
 rewrites, so no neighbour of the inner family is resolved; the SA's own
 next hop is still used per packet, as neighbour output used it, so Linux
 keeps that entry resolved. A GSO packet is segmented in software first,
-checksums finished, so SEC gets one packet per ESP.
+checksums finished, so SEC gets one packet per ESP. The frame's DPOVRD
+follows the SA's mode: a tunnel's names the inner protocol, a transport
+SA's the frame's own IP header length and next-header offset.
 
 Compiles warning-free: the offload entry points are declared in
 include/net/xfrm.h instead of per-file externs and
@@ -36,26 +38,27 @@ __xfrm_state_lookup_byhandle is static.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
- drivers/crypto/caam/pdb.h    |  12 +-
- include/net/ip6_tunnel.h     |   4 +-
- include/net/netns/xfrm.h     |   3 +
- include/net/xfrm.h           |  30 ++
- include/uapi/linux/pfkeyv2.h |   1 +
- net/ipv4/Kconfig             |   6 +
- net/ipv4/xfrm4_policy.c      |  13 +
- net/ipv6/Kconfig             |   6 +
- net/ipv6/xfrm6_policy.c      |  10 +
- net/key/af_key.c             | 896 +++++++++++++++++++++++++++++++++++
- net/xfrm/Makefile            |   1 +
- net/xfrm/ipsec_flow.c        | 231 +++++++++
- net/xfrm/ipsec_flow.h        |  31 ++
- net/xfrm/xfrm_device.c       |  24 +
- net/xfrm/xfrm_input.c        |  21 +
- net/xfrm/xfrm_output.c       | 354 ++++++++++++++
- net/xfrm/xfrm_policy.c       |  90 ++++
- net/xfrm/xfrm_state.c        | 236 +++++++++
- net/xfrm/xfrm_user.c         |   4 +
- 19 files changed, 1966 insertions(+), 7 deletions(-)
+ drivers/crypto/caam/pdb.h                     |  12 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  85 +-
+ include/net/ip6_tunnel.h                      |   4 +-
+ include/net/netns/xfrm.h                      |   3 +
+ include/net/xfrm.h                            |  30 +
+ include/uapi/linux/pfkeyv2.h                  |   1 +
+ net/ipv4/Kconfig                              |   6 +
+ net/ipv4/xfrm4_policy.c                       |  13 +
+ net/ipv6/Kconfig                              |   6 +
+ net/ipv6/xfrm6_policy.c                       |  10 +
+ net/key/af_key.c                              | 896 ++++++++++++++++++
+ net/xfrm/Makefile                             |   1 +
+ net/xfrm/ipsec_flow.c                         | 231 +++++
+ net/xfrm/ipsec_flow.h                         |  31 +
+ net/xfrm/xfrm_device.c                        |  24 +
+ net/xfrm/xfrm_input.c                         |  21 +
+ net/xfrm/xfrm_output.c                        | 354 +++++++
+ net/xfrm/xfrm_policy.c                        |  90 ++
+ net/xfrm/xfrm_state.c                         | 236 +++++
+ net/xfrm/xfrm_user.c                          |   4 +
+ 20 files changed, 2041 insertions(+), 17 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -117,6 +120,123 @@ index 4b1bcf53f7ac..1669e0d267e3 100644
  
  /*
   * IPSec ESP Datapath Protocol Override Register (DPOVRD)
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+index 04650986e173..c553aac2dd39 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
+@@ -58,6 +58,7 @@
+ #include <uapi/linux/ppp_defs.h>
+ #include <uapi/linux/if_pppox.h>
+ #include <linux/if_vlan.h>
++#include <net/ipv6.h>
+ #include <net/xfrm.h>
+ #endif
+ 
+@@ -1490,6 +1491,75 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 	}
+ }
+ 
++/* The DPOVRD value SEC encrypts a frame for `x` with; false if the frame's IP
++ * header is one it cannot be told about.
++ *
++ * With the override bit set SEC takes the IP header length, the next-header
++ * offset and the next header from here instead of from the SA's PDB. A
++ * tunnel's is the inner packet's own protocol for the ESP trailer, IPIP or
++ * IPv6. A transport SA's describes the frame's own IP header: SEC copies the
++ * protocol it finds at the next-header offset into the trailer, writes ESP
++ * there instead, and encrypts only what follows the header. Given a tunnel's
++ * value -- offset and length zero -- a transport frame has its IP header
++ * encrypted and IPIP named in the trailer, which no peer decodes. The PDB's
++ * own values fit only a header of the plain length, so a transport frame's
++ * are taken from the frame, IPv4 options and IPv6 extension headers
++ * included.
++ */
++static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
++			     unsigned int len, u32 *dpovrd)
++{
++	unsigned int hdr_len, nh_offset;
++
++	if (x->props.mode != XFRM_MODE_TRANSPORT) {
++		*dpovrd = DPOVRD_ENABLE |
++			  ((*nh >> 4) == IPVERSION ? IPPROTO_IPIP : IPPROTO_IPV6);
++		return true;
++	}
++	if ((*nh >> 4) == IPVERSION) {
++		hdr_len = (nh[0] & 0xf) * 4;
++		if (hdr_len < sizeof(struct iphdr) || hdr_len > len)
++			return false;
++		/* Any non-zero offset names byte 9 of an IPv4 header. */
++		nh_offset = 1;
++	} else {
++		unsigned int at = offsetof(struct ipv6hdr, nexthdr);
++		bool routing = false;
++		u8 next;
++
++		hdr_len = sizeof(struct ipv6hdr);
++		if (hdr_len > len)
++			return false;
++		next = nh[at];
++		/* ESP follows hop-by-hop options, a routing header and any
++		 * destination options ahead of one, where ip6_find_1stfragopt()
++		 * puts the transport header. */
++		for (;;) {
++			if (next == NEXTHDR_ROUTING)
++				routing = true;
++			else if (next != NEXTHDR_HOP &&
++				 (next != NEXTHDR_DEST || routing))
++				break;
++			if (hdr_len + 2 > len)
++				return false;
++			at = hdr_len;
++			next = nh[at];
++			hdr_len += (nh[at + 1] + 1) * 8;
++			if (hdr_len > len)
++				return false;
++		}
++		/* SEC reads byte 6 for an offset of one and eight times the
++		 * offset otherwise, which is where every extension header,
++		 * starting on an eight-byte boundary, keeps its own. */
++		nh_offset = at == offsetof(struct ipv6hdr, nexthdr) ? 1 : at / 8;
++	}
++	/* Both are eight-bit fields. */
++	if (hdr_len > 0xff)
++		return false;
++	*dpovrd = DPOVRD_ENABLE | hdr_len << 16 | nh_offset << 8 | IPPROTO_ESP;
++	return true;
++}
++
+  __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+ {
+ 	struct xfrm_state *x;
+@@ -1500,7 +1570,7 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 	unsigned short l3_proto, l3_offset;
+ 	unsigned char* skb_nh ;
+ 	struct sec_path *sp;
+-	unsigned int dpovrd = 0;
++	u32 dpovrd = 0;
+ 	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
+ 	 * concurrently; never read the global twice */
+ 	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
+@@ -1556,15 +1626,10 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 				skb->data = skb->data + l3_offset - ETH_HDR_SIZE;
+ 				skb->len = skb->len - l3_offset + ETH_HDR_SIZE;
+ 			}
+-			if ((*skb_nh >> 4) == IPVERSION) /* Extracting ip version from network header */
+-			{
+-				dpovrd = IPPROTO_IPIP; /* ESP trailer NH type. Here traffic is IPv4 */
+-			}
+-			else
+-			{
+-				dpovrd = IPPROTO_IPV6; /* ESP trailer NH type. Here traffic is IPv4 */
+-			}
+-			dpovrd |= DPOVRD_ENABLE; /* OVRD enable */
++			if (!dpa_ipsec_dpovrd(x, skb_nh,
++					      skb_headlen(skb) - (skb_nh - skb->data),
++					      &dpovrd))
++				goto sec_submit_failed;
+ 		}
+ 
+ 
 diff --git a/include/net/ip6_tunnel.h b/include/net/ip6_tunnel.h
 index 17913fca5445..43a3a1ef0e5e 100644
 --- a/include/net/ip6_tunnel.h

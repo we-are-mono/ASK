@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A248.** A transport-mode SA's frames were given the tunnel's DPOVRD, so SEC encrypted their IP header, named IPIP in the trailer and no peer could decode them —
+  fixed (_:/^sdk_dpaa: describe a transport-mode frame's own IP header to SEC_).
+
 - [x] **A247.** A bundle of two packet-offloaded transforms left with only the first applied —
   fixed (_:/^xfrm: refuse a nested packet-offload bundle_).
 
