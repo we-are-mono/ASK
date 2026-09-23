@@ -132,6 +132,11 @@ def capture(config: dict) -> None:
                             break
                         if address[2] == socket.PACKET_OUTGOING:
                             continue
+                        # A socket on a VLAN's parent also receives that
+                        # VLAN's frames, untagged, naming the VLAN device;
+                        # they are the child's copies to count, not ours.
+                        if address[0] != iface:
+                            continue
                         try:
                             sequence = decode(frame, config, mac)
                             if sequence is not None:
