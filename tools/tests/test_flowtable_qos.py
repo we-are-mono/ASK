@@ -1,0 +1,488 @@
+"""Hardware QoS on offloaded flows, proved at rates only the hardware reaches.
+
+Software forwarding on this rig tops out near 130 Mbit/s and the ports run at
+10 Gbit/s, so every rate case here shapes or polices around 2 Gbit/s and offers
+three times that. Delivery near the cap then says two things at once: the
+hardware enforced the rate, and the flow was in hardware, because nothing else
+could have carried it that fast. A low-rate result proves neither. Beside the
+rate, two independent oracles:
+
+  - **the adapter's row.** It names the class the hardware entry was given, and
+    its packet counter moves only for frames the classifier matched.
+  - **the leaf counters `ethtool -S` reports.** One set per leaf slot: what that
+    class queue dequeued and what its congestion group rejected. An offloaded
+    flow never reaches a leaf's software qdisc, so `tc -s class show` cannot see
+    it; these can.
+
+Most traffic runs from the orchestrator to the LAN VM, so the trees are built on
+the LAN port. The orchestrator is the side that can offer several times the cap,
+and the WAN port carries the agent every oracle is read through. The one case
+about changing the WAN port's own egress runs the other way.
+
+Enabling CEETM on a port moves its sub-portal's dequeues onto the LNI scheduler,
+and removing a tree once left that switched, with the port reporting healthy
+while it transmitted nothing. The fixture's last act is therefore to forward
+traffic through both ports after every tree is gone: a case that leaves a port
+unable to transmit fails there, not in whichever test happens to run next.
+
+Needs `ask_flowtable.qos_mark_mask` nonzero -- the test image ships 0xf0 -- and
+iperf3 on the LAN VM and on the orchestrator.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import socket
+import struct
+import time
+
+import pytest
+import pytest_asyncio
+
+from ask_orch.client import Agent
+from ask_orch.uart import Console
+from _topology import TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from test_flowtable_offload import (ARTIFACTS, TABLE, WAN_IP, command, console_command,
+                                    read, rig)  # noqa: F401
+
+# One port per flow, so a conntrack left behind by one case never feeds another.
+# Above the gateway profiles' ranges (49100 and 49200). The devlink file takes
+# PORT + 16 onwards; the NAT exemption covers the whole block.
+PORT = int(os.environ.get("ASK_FLOWTABLE_QOS_PORT", "49300"))
+PORT_SHAPED = PORT
+PORTS_LAST = PORT + 19
+
+# The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
+# unshaped and far above what the CPU can: see the module docstring.
+CAP_MBIT = int(os.environ.get("ASK_FLOWTABLE_QOS_CAP_MBIT", "2000"))
+OFFERED_MBIT = 3 * CAP_MBIT
+DATAGRAM = 1400
+UDP_HEADERS = 14 + 20 + 8
+# Bytes a CEETM shaper charges each frame beyond the frame itself -- preamble,
+# delimiter, FCS and inter-frame gap -- as the port's LNI is configured
+# (CEETM_DEFA_OAL). A shaper held at the cap passes fewer payload bits than the
+# cap by exactly this and the headers.
+OAL = 24
+
+# cdx_htb_cq_get() numbers the strict-priority class queues from the top, so a
+# leaf of `prio N` holds class queue 7 - N, and a conntrack mark names that
+# index. prio 0 is the queue that wins.
+HIGH_PRIO, HIGH_CQ = 0, 7
+
+IPERF_SECONDS = 8
+# Admission, and the burst a token bucket starts with, both happen in the first
+# second or two of a transfer; rates are sampled after them.
+SETTLE = 2.5
+WINDOW = 4.0
+
+LAN_BASE = "/tmp/ask_flowtable_qos"
+ECHO = f"{LAN_BASE}_echo.py"
+ECHO_SOURCE = '''
+import select, socket, sys
+host, ports = sys.argv[1], [int(port) for port in sys.argv[2:]]
+socks = []
+for port in ports:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 21)
+    s.bind((host, port))
+    socks.append(s)
+while True:
+    for s in select.select(socks, [], [])[0]:
+        data, peer = s.recvfrom(4096)
+        s.sendto(data, peer)
+'''
+
+
+# ---- the LAN VM's side, detached ------------------------------------------
+
+async def lan_start(r, *, iperf=(), echo=(), host=None, lifetime=240):
+    """Start iperf3 servers and a UDP echo on the LAN VM, detached.
+
+    Detached because the LAN console is a single channel and the traffic that
+    follows is driven from this host while the servers run. Each process is its
+    own session under `timeout`, so a run that dies without its teardown leaves
+    nothing listening for longer than `lifetime`, and `lan_stop` kills each
+    whole group. The servers speak JSON so a client asking for
+    `--get-server-output` gets the receiver's intervals back.
+    """
+    host = host or r.lan_ip
+    plan = [["iperf3", "-s", "-J", "-B", host, "-p", str(port)] for port in iperf]
+    if echo:
+        plan.append(["python3", ECHO, host, *map(str, echo)])
+    script = f'''
+import pathlib, subprocess, time
+pathlib.Path({ECHO!r}).write_text({ECHO_SOURCE!r})
+plan = {plan!r}
+procs = []
+with open({LAN_BASE + '.pids'!r}, 'a') as pids:
+    for index, argv in enumerate(plan):
+        log = open({LAN_BASE!r} + '_%d.err' % index, 'wb')
+        proc = subprocess.Popen(['timeout', {str(lifetime)!r}] + argv, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=log, start_new_session=True)
+        pids.write('%d\\n' % proc.pid)
+        procs.append(proc)
+time.sleep(0.7)
+for index, (argv, proc) in enumerate(zip(plan, procs)):
+    assert proc.poll() is None, (argv, pathlib.Path({LAN_BASE!r} + '_%d.err' % index).read_text())
+print('LAN-UP')
+'''
+    result = await lan_run_python(r.lan, script, label="flowtable_qos_start", timeout=30)
+    assert result.rc == 0 and "LAN-UP" in result.stdout, result.stdout
+
+
+async def lan_stop(r):
+    script = f'''
+import os, pathlib, signal
+pids = pathlib.Path({LAN_BASE + '.pids'!r})
+if pids.exists():
+    for pid in pids.read_text().split():
+        try:
+            os.killpg(int(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    pids.unlink()
+print('LAN-DOWN')
+'''
+    result = await lan_run_python(r.lan, script, label="flowtable_qos_stop", timeout=30)
+    assert result.rc == 0 and "LAN-DOWN" in result.stdout, result.stdout
+
+
+# ---- the orchestrator's side ----------------------------------------------
+
+async def iperf(r, port, *, seconds=IPERF_SECONDS, udp_mbit=None, streams=1):
+    """One iperf3 run from here to the LAN VM, and its report.
+
+    The receiver's intervals come back in `server_output_json`, which is where a
+    steady-state rate is read: the sender's own figure for UDP is what it
+    offered, not what arrived.
+    """
+    argv = ["iperf3", "-c", r.lan_ip, "-B", WAN_IP, "-p", str(port), "-t", str(seconds),
+            "-J", "--get-server-output"]
+    if udp_mbit:
+        argv += ["-u", "-b", f"{udp_mbit}M", "-l", str(DATAGRAM)]
+    if streams > 1:
+        argv += ["-P", str(streams)]
+    proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), seconds + 30)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    report = json.loads(stdout) if stdout.strip() else {}
+    assert proc.returncode == 0 and "error" not in report, (
+        proc.returncode, report.get("error"), stderr.decode(errors="replace")[-400:])
+    return report
+
+
+def received_bps(report, after=SETTLE):
+    """What the receiver counted per second once the transfer had settled."""
+    intervals = [i["sum"] for i in report["server_output_json"]["intervals"]
+                 if i["sum"]["start"] >= after - 0.01]
+    assert intervals, report["server_output_json"]
+    return sum(i["bytes"] for i in intervals) * 8 / sum(i["seconds"] for i in intervals)
+
+
+def lockstep(destination, port, count, *, tos=0, payload_size=256, timeout=1.0):
+    """Echo `count` datagrams one at a time from this host, and count the replies.
+
+    The source port is the destination port, so every call is the same flow and
+    a flow admitted by one call is measured by the next.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, tos)
+    sock.bind((WAN_IP, port))
+    sock.settimeout(timeout)
+    echoed = 0
+    try:
+        for n in range(count):
+            payload = struct.pack("!Q", n) + b"ASK-qos".ljust(payload_size - 8, b".")
+            sock.sendto(payload, (destination, port))
+            try:
+                while sock.recv(4096) != payload:
+                    pass
+                echoed += 1
+            except TimeoutError:
+                pass
+    finally:
+        sock.close()
+    return echoed
+
+
+# ---- reading the DUT ------------------------------------------------------
+
+LEAF_COUNTER = re.compile(
+    r"^\s*ceetm (dequeued frames|dequeued bytes|rejected frames) \[leaf (\d+)\]:\s*(\d+)\s*$", re.M)
+SOFTWARE_TX = re.compile(r"^\s*tx packets \[TOTAL\]:\s*(\d+)\s*$", re.M)
+LEAF_FIELDS = {"dequeued frames": "frames", "dequeued bytes": "bytes",
+               "rejected frames": "rejected"}
+
+
+async def egress(r, dev):
+    """One `ethtool -S` read of a port: each leaf slot's dequeued frames and
+    bytes and rejected frames, the port's software transmit count, and when.
+
+    The leaf counters are hardware totals read without clearing, so a delta
+    between two reads is exact. The time is the middle of the call, which is
+    what a rate over a window of a few seconds is taken against, and the call's
+    length is kept: the counters were read somewhere inside it.
+    """
+    started = time.monotonic()
+    text = (await command(r.target, r.session, "ethtool", "-S", dev))["stdout"]
+    ended = time.monotonic()
+    leaves = {}
+    for name, slot, value in LEAF_COUNTER.findall(text):
+        leaves.setdefault(int(slot), {})[LEAF_FIELDS[name]] = int(value)
+    software = SOFTWARE_TX.findall(text)
+    assert leaves and len(software) == 1, text
+    return {"at": (started + ended) / 2, "span": ended - started, "leaves": leaves,
+            "software_tx": int(software[0])}
+
+
+def leaf_delta(before, after, slot):
+    return {key: after["leaves"][slot][key] - before["leaves"][slot][key]
+            for key in ("frames", "bytes", "rejected")}
+
+
+def timing_slack(before, after):
+    """How far a rate taken between two reads can be off only because neither
+    read's instant is known better than its call's length. Small while the
+    agent's own path is idle; it grows when that path shares a shaped queue."""
+    return (before["span"] + after["span"]) / 2 / (after["at"] - before["at"])
+
+
+def shaped_bps(before, after, *slots):
+    """What the shaper let through the given leaves, in the bits it charges."""
+    charged = 0
+    for slot in slots:
+        moved = leaf_delta(before, after, slot)
+        charged += (moved["bytes"] + OAL * moved["frames"]) * 8
+    return charged / (after["at"] - before["at"])
+
+
+def directions(state, *, ingress, proto, src=None, dst=None):
+    """The installed directions arriving on `ingress`, by the endpoints of their
+    match. Either endpoint may be left open."""
+    return [f for f in state["flows"] if f["in"] == ingress and f["proto"] == str(proto)
+            and (src is None or f["src"] == src) and (dst is None or f["dst"] == dst)]
+
+
+async def offload(r, *rules):
+    """The flowtable, with the forward-chain rules that offer flows to it.
+
+    Named as the rig's own table, so the rig's teardown is what drains it.
+    """
+    body = "\n ".join(rules)
+    await r.nft(f'''table inet {TABLE} {{
+ flowtable fast {{ hook ingress priority 0; devices = {{ {TARGET_LAN_IF}, {TARGET_WAN_IF} }}; flags offload; }}
+ chain forward {{ type filter hook forward priority 0; policy accept;
+ {body}
+ }}
+}}''')
+    await r.wait(lambda s: s["bindings"] == 2)
+
+
+def inbound(r, proto, port, mark=None):
+    """A rule offering the orchestrator's flow to one LAN port, marked for a
+    class. The mark is set on every packet of the flow and the offer comes after
+    it in the same rule, so admission always sees it."""
+    marking = f"ct mark set {mark:#x} " if mark else ""
+    return f"ip saddr {WAN_IP} ip daddr {r.lan_ip} {proto} dport {port} {marking}flow add @fast"
+
+
+async def tree(r, dev, rate_mbit, leaves):
+    """The three levels CEETM has: the port as the root qdisc, one channel under
+    it shaped at `rate_mbit`, and one class queue per leaf.
+
+    rate and ceil are equal, so the channel has nothing to borrow and its
+    committed rate is its ceiling. Leaves take Tx queue slots in the order they
+    are created -- the first inherits the channel's own slot when
+    TC_HTB_LEAF_TO_INNER turns the channel into an inner class -- so the slot
+    `ethtool -S` reports a leaf under is its position in `leaves`.
+    """
+    rate = f"{rate_mbit}mbit"
+    await r.tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "offload")
+    await r.tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1",
+               "htb", "rate", rate, "ceil", rate)
+    for classid, prio in leaves:
+        await r.tc("class", "add", "dev", dev, "parent", "1:1", "classid", classid,
+                   "htb", "rate", rate, "ceil", rate, "prio", str(prio))
+    shown = (await r.tc("class", "show", "dev", dev))["stdout"]
+    for classid in ("1:1", *(leaf for leaf, _ in leaves)):
+        assert f"class htb {classid} " in shown, (classid, shown)
+
+
+async def conntrack_clear(r):
+    """Every connection between the two hosts, whichever side opened it.
+
+    A mark is sampled once, at admission, so a connection left over from an
+    earlier run would carry its old class into this one. Nothing between these
+    two hosts outlives the test that opened it, the rig's own echo included."""
+    for proto in ("tcp", "udp"):
+        for src, dst in ((WAN_IP, r.lan_ip), (r.lan_ip, WAN_IP)):
+            await command(r.target, r.session, "conntrack", "-D", "-p", proto,
+                          "--orig-src", src, "--orig-dst", dst, check=False)
+
+
+@pytest_asyncio.fixture
+async def qos(rig):
+    """The rig, readied for multi-gigabit transfers and hardware queues.
+
+    The rig pins host routes at MTU 1200 for its exception cases; a transfer
+    measured at line rate needs full-size frames, so they are widened here, and
+    the orchestrator's route to the LAN VM too, because an earlier exception
+    case can leave a path MTU cached against it. Flows in this file's port block
+    are routed rather than masqueraded, so a row's endpoints are the hosts'.
+
+    Teardown takes down every tree and clsact qdisc on both ports, then forwards
+    an exchange through both: that is the proof each port still transmits once
+    CEETM has been switched off again.
+    """
+    r = rig
+    mask = int((await read(r.target, r.session,
+                           "/sys/module/ask_flowtable/parameters/qos_mark_mask")).strip())
+    if not mask:
+        pytest.skip("classification is off in this boot; the QoS cases need "
+                    "ask_flowtable.qos_mark_mask=0xf0, which the test image ships")
+    shift = (mask & -mask).bit_length() - 1
+    r.mark = lambda cq: cq << shift
+    wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
+    console = Console.target(log_path=str(ARTIFACTS / "qos-uart.log"))
+    await asyncio.to_thread(console.login, "root", None)
+    r.console = console
+
+    async def tc(*argv, check=True):
+        """`tc` is not in the agent's argv allowlist, so trees and filters are
+        built on the console."""
+        return await console_command(console, "tc", *argv, check=check, timeout=30)
+    r.tc = tc
+    cleanup = []
+    printk = None
+    try:
+        # Every console command is framed by a marker, and a printk landing
+        # in the middle of one breaks the framing. Restored last in teardown,
+        # after the console's last use.
+        printk = " ".join((await read(r.target, r.session, "/proc/sys/kernel/printk")).split()[:4])
+        await command(r.target, r.session, "sysctl", "-w", "kernel.printk=1 4 1 7")
+        for address, dev in ((r.lan_ip, TARGET_LAN_IF), (WAN_IP, TARGET_WAN_IF)):
+            await command(r.target, r.session, "ip", "route", "replace", address + "/32",
+                          "dev", dev, "mtu", "1500")
+        route = json.loads((await command(wan, r.session, "ip", "-j", "route", "show",
+                                          "exact", f"{r.lan_ip}/32"))["stdout"])[0]
+        await command(wan, r.session, "ip", "route", "replace", f"{r.lan_ip}/32",
+                      "via", route["gateway"], "dev", route["dev"], "mtu", "1500")
+        cleanup.append((wan, ["ip", "route", "replace", f"{r.lan_ip}/32",
+                              "via", route["gateway"], "dev", route["dev"]]))
+        for proto in ("tcp", "udp"):
+            nat = ["POSTROUTING", "-s", r.lan_ip, "-d", WAN_IP, "-p", proto,
+                   "--dport", f"{PORT}:{PORTS_LAST}", "-j", "ACCEPT"]
+            await command(r.target, r.session, "iptables", "-t", "nat", "-I", *nat)
+            cleanup.append((r.target, ["iptables", "-t", "nat", "-D", *nat]))
+        await conntrack_clear(r)
+        yield r
+    finally:
+        failures = []
+
+        async def attempt(step, label):
+            try:
+                await step
+            except Exception as error:
+                failures.append(f"{label}: {error!r}")
+
+        await attempt(lan_stop(r), "LAN servers")
+        for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+            await attempt(tc("qdisc", "del", "dev", dev, "clsact", check=False), f"{dev} clsact")
+            await attempt(tc("qdisc", "del", "dev", dev, "root", check=False), f"{dev} root")
+        for agent, argv in reversed(cleanup):
+            await attempt(command(agent, r.session, *argv, check=False), " ".join(argv))
+        await attempt(conntrack_clear(r), "conntrack")
+        try:
+            for dev in (TARGET_LAN_IF, TARGET_WAN_IF):
+                shown = (await tc("qdisc", "show", "dev", dev))["stdout"]
+                assert "htb" not in shown and "clsact" not in shown, (dev, shown)
+            # Both ports' egress, after CEETM: the request leaves by the WAN
+            # port and the echo by the LAN port.
+            await r.exchange(32)
+        except (Exception, pytest.fail.Exception) as error:
+            failures.append(f"egress after teardown: {error!r}")
+        console.close()
+        if printk:
+            await attempt(command(r.target, r.session, "sysctl", "-w", f"kernel.printk={printk}",
+                                  check=False), "printk")
+        assert not failures, ("QoS fixture restoration failed", failures)
+
+
+# ---- the scheduler ---------------------------------------------------------
+
+async def test_flowtable_qos_htb_shapes_at_the_cap(qos):
+    """One class at the cap, one offloaded flow offered three times it.
+
+    The shaper's own output is measured from the leaf's dequeued bytes over a
+    window inside the transfer, which is the hardware's figure rather than the
+    receiver's: it has to sit on the cap. The receiver's steady-state goodput is
+    held to the same cap less the headers and the shaper's per-frame charge.
+
+    Every frame the classifier matched for the flow is accounted for at the
+    leaf -- dequeued or rejected -- and the only frames the leaf may carry beyond
+    those are ones the CPU sent before the flow was admitted, which the port's
+    software transmit counter bounds. The rejections are the other half of the
+    proof: the shaper held the rate by refusing the excess, rather than the
+    sender failing to offer it.
+    """
+    r = qos
+    await tree(r, TARGET_LAN_IF, CAP_MBIT, [("1:10", HIGH_PRIO)])
+    await offload(r, inbound(r, "udp", PORT_SHAPED, r.mark(HIGH_CQ)))
+    await lan_start(r, iperf=[PORT_SHAPED])
+    target = f"{r.lan_ip}:{PORT_SHAPED}"
+    before = await egress(r, TARGET_LAN_IF)
+    client = asyncio.create_task(iperf(r, PORT_SHAPED, udp_mbit=OFFERED_MBIT))
+    try:
+        await asyncio.sleep(SETTLE)
+        first = await egress(r, TARGET_LAN_IF)
+        installed = await r.state()
+        await asyncio.sleep(WINDOW)
+        second = await egress(r, TARGET_LAN_IF)
+        report = await client
+    finally:
+        if not client.done():
+            client.cancel()
+            await asyncio.gather(client, return_exceptions=True)
+    # The class queue drains at the shaped rate; give it time to empty before
+    # the totals are compared.
+    await asyncio.sleep(0.5)
+    after = await egress(r, TARGET_LAN_IF)
+    state = await r.state()
+    forward = directions(state, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    early = directions(installed, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    cap = CAP_MBIT * 1e6
+    window = leaf_delta(first, second, 0)
+    whole = leaf_delta(before, after, 0)
+    shaped = shaped_bps(first, second, 0)
+    goodput = received_bps(report)
+    offered = report["end"]["sum_sent"]["bits_per_second"]
+    r.record("qos-htb-shaped", {"installed": installed, "state": state, "window": window,
+                                "whole": whole, "shaped_bps": shaped, "goodput_bps": goodput,
+                                "offered_bps": offered, "before": before, "first": first,
+                                "second": second, "after": after, "report": report})
+
+    assert len(forward) == 1 and len(early) == 1, (early, forward)
+    row = forward[0]
+    assert row["out"] == TARGET_LAN_IF and int(row["qos"], 16) == HIGH_CQ, row
+    # One admission for the whole transfer: the row read mid-window is the row
+    # whose packets are accounted below.
+    assert early[0]["cookie"] == row["cookie"], (early, row)
+    assert offered >= 2 * cap, ("the orchestrator did not offer enough to test a cap", offered)
+    slack = timing_slack(first, second)
+    assert (0.95 - slack) * cap <= shaped <= (1.03 + slack) * cap, (shaped, cap, slack, window)
+    assert window["rejected"] >= window["frames"], window
+    software = second["software_tx"] - first["software_tx"]
+    assert software <= window["frames"] // 100, (software, window)
+    expected = cap * DATAGRAM / (DATAGRAM + UDP_HEADERS + OAL)
+    assert 0.9 * expected <= goodput <= 1.02 * expected, (goodput, expected)
+    extra = whole["frames"] + whole["rejected"] - int(row["packets"])
+    assert 0 <= extra <= after["software_tx"] - before["software_tx"], (
+        whole, row["packets"], after["software_tx"] - before["software_tx"])
