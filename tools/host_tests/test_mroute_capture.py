@@ -71,6 +71,25 @@ def test_bad_replica_rejected(family, fault):
 
 
 @pytest.mark.parametrize("family", [4, 6])
+def test_bridged_replica_keeps_the_senders_hop_count(family):
+    config, wire = frame(family)
+    wire = bytearray(wire)
+    wire[22 if family == 4 else 21] = 64
+    bridged = {**config, "hops": 64}
+    assert capture.decode(bytes(wire), bridged, MAC) == 2
+    with pytest.raises(AssertionError):
+        capture.decode(bytes(wire), config, MAC)
+    # A routed hop count is a wrong answer for a bridged case.
+    with pytest.raises(AssertionError):
+        capture.decode(frame(family)[1], bridged, MAC)
+    # The source MAC is left to the case that owns it only when asked.
+    wire[6] ^= 1
+    assert capture.decode(bytes(wire), bridged, None) == 2
+    with pytest.raises(AssertionError):
+        capture.decode(bytes(wire), bridged, MAC)
+
+
+@pytest.mark.parametrize("family", [4, 6])
 def test_other_run_and_source_ignored(family):
     config, wire = frame(family)
     assert capture.decode(wire, {**config, "token": "ff" * 16}, MAC) is None

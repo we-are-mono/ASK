@@ -63,9 +63,13 @@ def decode(frame: bytes, config: dict, source_mac: str) -> int | None:
     sequence = struct.unpack_from("!I", body, len(prefix))[0]
     assert 0 <= sequence < config["count"], f"unexpected sequence {sequence}"
     assert body == payload(config["token"], sequence), "corrupt payload"
-    assert ttl == 63, f"expected one routing hop, got TTL/hop-limit {ttl}"
+    # One routing hop by default. A bridged replica keeps the sender's 64.
+    hops = config.get("hops", 63)
+    assert ttl == hops, f"expected TTL/hop-limit {hops}, got {ttl}"
     assert frame[:6] == multicast_mac(config["group"]), "wrong multicast MAC"
-    assert frame[6:12] == bytes.fromhex(source_mac.replace(":", "")), "wrong source MAC"
+    # None leaves the source MAC to a case that asserts it on its own.
+    if source_mac is not None:
+        assert frame[6:12] == bytes.fromhex(source_mac.replace(":", "")), "wrong source MAC"
     return sequence
 
 
