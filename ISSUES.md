@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A242.** A wedged host-command channel logged every failed sync retry, several lines each, for as long as the board ran —
+  fixed (_:/^sdk_fman: report a run of HC sync failures once, and its end_).
+
 - [x] **A241.** A failed ehash barrier leaked the cumulative node its delete or rebuilding add displaced, one per failure (A98's accepted residue) —
   fixed (_:/^sdk_fman: park the cumulative nodes a failed ehash barrier displaces_).
 

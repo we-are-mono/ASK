@@ -21,8 +21,8 @@
 #define ASSERT_COND assert
 #define REPORT_ERROR(level, err, msg) ((void)0)
 #define RETURN_ERROR(level, err, msg) return ERROR_CODE(err)
-/* hc.c's rate-limited RETURN_ERROR, for failures a retry repeats. */
-#define HC_RETURN_ERROR_RATELIMITED(level, err, msg) return ERROR_CODE(err)
+/* The line a command completing after a run of failures prints. */
+#define pr_info(...) ((void)0)
 #define DBG(level, msg) ((void)0)
 #include "scheme_hc_layout.inc"
 #include "scheme_set_production.inc"

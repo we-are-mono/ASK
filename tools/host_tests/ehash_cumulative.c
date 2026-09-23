@@ -18,7 +18,11 @@ typedef int t_Error;
 #define REPORT_ERROR(level, err, msg) ((void)0)
 #define SANITY_CHECK_RETURN_ERROR(p, e) do { if (!(p)) return -1; } while (0)
 #define printk(...) ((void)0)
-#define printk_ratelimited(...) ((void)0)
+/* The barrier's own lines, counted: a run of failed barriers reports its
+ * first, and the barrier that ends it one line more. */
+static unsigned sync_failed_lines, sync_recovered_lines;
+#define pr_err(...) (sync_failed_lines++)
+#define pr_info(...) (sync_recovered_lines++)
 #define XX_VirtToPhys(p) ((uint64_t)(uintptr_t)(p))
 #define XX_PhysToVirt(a) ((void *)(uintptr_t)(a))
 #define SwapUint64(v) __builtin_bswap64(v)
@@ -159,11 +163,15 @@ int main(void)
      * is parked, the caller's entry comes back unsynced. */
     unsynced(e[2]);
     assert(parked() == 1 && live_nodes == 2 && chained() == 1 && found(e[0]) && found(e[1]));
+    assert(sync_failed_lines == 1 && !sync_recovered_lines);
     /* A barrier that fails keeps it; one that completes frees it, and the
-     * caller may then free its own entry. */
+     * caller may then free its own entry. The failure continues the delete's
+     * run, so it adds no line; the completion ends it with one. */
     fail_syncs = 1;
     assert(ExternalHashTableFmPcdHcSync(&info) == -1 && parked() == 1 && live_nodes == 2);
+    assert(sync_failed_lines == 1 && !sync_recovered_lines);
     assert(ExternalHashTableFmPcdHcSync(&info) == 0 && !parked() && live_nodes == 1);
+    assert(sync_failed_lines == 1 && sync_recovered_lines == 1);
     release_entry(e[2]);
 
     /* Two keys and no neighbour: the bucket takes the last entry directly and
@@ -247,6 +255,20 @@ int main(void)
     release_entry(e[2]);
     removed(e[0]);
     assert(!bucket.h && !live_nodes && !live_entries && !bucket_locked);
+
+    /* A barrier retried once a second while the channel stays down reports
+     * the first failure of the run only, however long it lasts; the barrier
+     * that ends it says so once, and the next run reports again. */
+    unsigned failed = sync_failed_lines, recovered = sync_recovered_lines;
+    fail_syncs = 10;
+    for (unsigned i = 0; i < 10; i++)
+        assert(ExternalHashTableFmPcdHcSync(&info) == -1);
+    assert(sync_failed_lines == failed + 1 && sync_recovered_lines == recovered);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && sync_recovered_lines == recovered + 1);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && sync_recovered_lines == recovered + 1);
+    fail_syncs = 1;
+    assert(ExternalHashTableFmPcdHcSync(&info) == -1 && sync_failed_lines == failed + 2);
+    assert(ExternalHashTableFmPcdHcSync(&info) == 0 && sync_recovered_lines == recovered + 2);
     puts("EHASH cumulative delete: every displaced node parked until a completed barrier, none leaked");
     return 0;
 }
