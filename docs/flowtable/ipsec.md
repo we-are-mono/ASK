@@ -816,9 +816,15 @@ IPv4's protocol byte or the IPv6 fixed header's, otherwise the extension
 header, in eight-byte units, whose first byte it is. A header the word cannot
 describe — not in the linear area, or longer than the field's 255 bytes —
 fails the frame rather than send it encrypted wrong.
-`tools/host_tests/test_ipsec_dpovrd.py` compiles that function out of the
-patched tree; `test_ipsec_offload_transport.py` has a software peer decrypt
-the DUT's transport traffic, half of it carrying IPv4 options.
+
+A frame the driver cannot give SEC — no SEC queue for its SA, a header the
+word cannot describe, no S/G table, a queue that refuses it — is freed and
+counted as the port's transmit drop (`ip -s link`), and `tx toenc` counts
+only the frames SEC was given. Before, every such frame vanished and was
+still counted as sent. `tools/host_tests/test_ipsec_sec_submit.py` compiles
+the word's choice and the submit out of the patched tree;
+`test_ipsec_offload_transport.py` has a software peer decrypt the DUT's
+transport traffic, half of it carrying IPv4 options.
 
 Proof: a tunnel carries traffic with no flowtable entry at all, with the SEC
 counter advancing and an independent peer decrypting what it produced.

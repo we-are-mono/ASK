@@ -1,4 +1,4 @@
-From 0a413f414b5a7475e4ea239dd6063f10b2931a7a Mon Sep 17 00:00:00 2001
+From 36d8de467231e749d0607abe5bacaaac5ef0233a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -30,7 +30,9 @@ next hop is still used per packet, as neighbour output used it, so Linux
 keeps that entry resolved. A GSO packet is segmented in software first,
 checksums finished, so SEC gets one packet per ESP. The frame's DPOVRD
 follows the SA's mode: a tunnel's names the inner protocol, a transport
-SA's the frame's own IP header length and next-header offset.
+SA's the frame's own IP header length and next-header offset. A frame
+the driver could not give SEC is counted as a transmit drop, not in
+`tx toenc`.
 
 Compiles warning-free: the offload entry points are declared in
 include/net/xfrm.h instead of per-file externs and
@@ -39,7 +41,8 @@ __xfrm_state_lookup_byhandle is static.
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  drivers/crypto/caam/pdb.h                     |  12 +-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  85 +-
+ .../freescale/sdk_dpaa/dpaa_eth_common.h      |   2 +-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c | 113 ++-
  include/net/ip6_tunnel.h                      |   4 +-
  include/net/netns/xfrm.h                      |   3 +
  include/net/xfrm.h                            |  30 +
@@ -58,7 +61,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/xfrm_policy.c                        |  87 ++
  net/xfrm/xfrm_state.c                         | 236 +++++
  net/xfrm/xfrm_user.c                          |   4 +
- 20 files changed, 2038 insertions(+), 17 deletions(-)
+ 21 files changed, 2058 insertions(+), 27 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -120,8 +123,21 @@ index 4b1bcf53f7ac..1669e0d267e3 100644
  
  /*
   * IPSec ESP Datapath Protocol Override Register (DPOVRD)
+diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
+index 46816dcda3cb..674e4cba3b29 100644
+--- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
++++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
+@@ -102,7 +102,7 @@ typedef struct qman_fq *(*cdx_get_ipsec_fq_hook_t)(u32 handle);
+ int dpa_register_ipsec_fq_handler(cdx_get_ipsec_fq_hook_t hookfn);
+ void dpa_unregister_ipsec_fq_handler(void);
+ int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, uint16_t sagd);
+- __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp);
++__hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp);
+ 
+ #endif
+ 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 04650986e173..c553aac2dd39 100644
+index 04650986e173..f9ee947a1551 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 @@ -58,6 +58,7 @@
@@ -132,10 +148,11 @@ index 04650986e173..c553aac2dd39 100644
  #include <net/xfrm.h>
  #endif
  
-@@ -1490,6 +1491,75 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+@@ -1490,17 +1491,90 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
  	}
  }
  
+- __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
 +/* The DPOVRD value SEC encrypts a frame for `x` with; false if the frame's IP
 + * header is one it cannot be told about.
 + *
@@ -205,10 +222,18 @@ index 04650986e173..c553aac2dd39 100644
 +	return true;
 +}
 +
-  __hot void dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
++/* Hand a frame for a packet-offloaded SA to SEC. 0 means SEC has it; anything
++ * else means it was freed here instead and counted as dropped on net_dev, so
++ * a caller counting what it gave SEC counts only a 0.
++ */
++__hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
  {
  	struct xfrm_state *x;
-@@ -1500,7 +1570,7 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 	struct qman_fq *egress_fq = NULL;
+ 	struct qm_fd		 fd;
+-	int err = 0,ii;
++	int err = -ENOENT, ii;
+ 	int new_ethhdr_end, old_ethhdr_end;
  	unsigned short l3_proto, l3_offset;
  	unsigned char* skb_nh ;
  	struct sec_path *sp;
@@ -217,7 +242,17 @@ index 04650986e173..c553aac2dd39 100644
  	/* snapshot: dpa_unregister_ipsec_fq_handler may NULL the hook
  	 * concurrently; never read the global twice */
  	cdx_get_ipsec_fq_hook_t get_ipsec_fq = READ_ONCE(cdx_get_ipsec_fq_hookfn);
-@@ -1556,15 +1626,10 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+@@ -1540,7 +1614,8 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 				 * offload interface), COW it first so the capture is not
+ 				 * corrupted. skb_cow_head() is a cheap branch when the skb is
+ 				 * not cloned; on failure drop the packet like the paths below. */
+-				if (skb_cow_head(skb, 0))
++				err = skb_cow_head(skb, 0);
++				if (err)
+ 					goto sec_submit_failed;
+ 				/* skb_cow_head() may have reallocated skb->head, so the cached
+ 				 * network-header pointer is now stale; re-derive it against the
+@@ -1556,15 +1631,12 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
  				skb->data = skb->data + l3_offset - ETH_HDR_SIZE;
  				skb->len = skb->len - l3_offset + ETH_HDR_SIZE;
  			}
@@ -228,15 +263,49 @@ index 04650986e173..c553aac2dd39 100644
 -			else
 -			{
 -				dpovrd = IPPROTO_IPV6; /* ESP trailer NH type. Here traffic is IPv4 */
--			}
--			dpovrd |= DPOVRD_ENABLE; /* OVRD enable */
 +			if (!dpa_ipsec_dpovrd(x, skb_nh,
 +					      skb_headlen(skb) - (skb_nh - skb->data),
-+					      &dpovrd))
++					      &dpovrd)) {
++				err = -EINVAL;
 +				goto sec_submit_failed;
+ 			}
+-			dpovrd |= DPOVRD_ENABLE; /* OVRD enable */
  		}
  
  
+@@ -1629,12 +1701,12 @@ static unsigned char* dpa_get_skb_nh(struct sk_buff* skb, unsigned short *l3_pro
+ 
+ 		/* sucessful transmit to CAAM */
+ 		netif_trans_update(net_dev);
+-		return;
++		return 0;
+ 	}
+ sec_submit_failed:
+-	dev_kfree_skb(skb);
+-	return;
+-
++	dev_core_stats_tx_dropped_inc(net_dev);
++	kfree_skb(skb);
++	return err;
+ }
+ 
+ EXPORT_SYMBOL(dpaa_submit_outb_pkt_to_SEC);
+@@ -1928,9 +2000,12 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+ #ifdef CONFIG_XFRM
+ #if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
+ 	if(skb->ipsec_offload) {
+-		dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp);
+-		percpu_priv = raw_cpu_ptr(priv->percpu_priv);
+-		percpu_priv->tx_caam_enc++;
++		/* tx toenc counts frames SEC was given; one freed instead is
++		 * already counted as dropped. */
++		if (!dpaa_submit_outb_pkt_to_SEC(skb, net_dev, priv->dpa_bp)) {
++			percpu_priv = raw_cpu_ptr(priv->percpu_priv);
++			percpu_priv->tx_caam_enc++;
++		}
+ 		return NETDEV_TX_OK;
+ 	}
+ #endif
 diff --git a/include/net/ip6_tunnel.h b/include/net/ip6_tunnel.h
 index 17913fca5445..43a3a1ef0e5e 100644
 --- a/include/net/ip6_tunnel.h
