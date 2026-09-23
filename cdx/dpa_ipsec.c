@@ -134,6 +134,22 @@ static struct ipsec_info ipsecinfo = { .ofport_handle = -1 };
 extern struct xfrm_state *xfrm_state_lookup_byhandle(struct net *net, u16 handle);
 #endif
 
+/* The dedicated SEC pool's BPID, which BMan hands out at runtime; -1 while
+ * there is no pool. Published so BMan's count for it can be found without
+ * the boot log, which a long-running system overwrites. A copy rather than a
+ * read through ipsecinfo.ipsec_bp, which is freed on release. */
+static int ipsec_bpid = -1;
+
+static int ipsec_bpid_get(char *buffer, const struct kernel_param *kp)
+{
+	return sysfs_emit(buffer, "%d\n", READ_ONCE(ipsec_bpid));
+}
+
+static const struct kernel_param_ops ipsec_bpid_ops = {
+	.get = ipsec_bpid_get,
+};
+module_param_cb(ipsec_bpid, &ipsec_bpid_ops, NULL, 0444);
+
 /* Forward declarations for internal functions */
 static int cdx_find_ipsec_pcd_fqinfo(int fqid, struct ipsec_info *info);
 static void ipsec_addfq_to_exceptionfq_list(struct dpa_fq *frameq,
@@ -1135,6 +1151,7 @@ static void release_ipsec_bpool(struct ipsec_info *info)
 	if (!bp)
 		return;
 	ipsec_pool_refill_stop();
+	WRITE_ONCE(ipsec_bpid, -1);
 	/* Unmap and drain through free_buf_cb, then remove the BPID lookup
 	 * before recycling it. bman_free_pool alone does neither. */
 	_dpa_bp_free(bp);
@@ -1185,6 +1202,7 @@ static int add_ipsec_bpool(struct ipsec_info *info)
 	printk (KERN_INFO"\n ################## %s::bp->size :%zu, bpid %d\n",
 			__func__, bp->size, bp->bpid);
 	info->ipsec_bp = bp;
+	WRITE_ONCE(ipsec_bpid, bp->bpid);
 
 	/*
 	 * Seed the BMan pool. dpa_bp_alloc only registers the pool with BMan;

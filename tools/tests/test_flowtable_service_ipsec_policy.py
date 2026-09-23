@@ -341,13 +341,15 @@ async def test_flowtable_service_ipsec_pool_recovery(ipsec_service):
 
     r, flows = ipsec_service, flows_for(ipsec_service)
     supervision, initial_attempts = await supervision_status(r), await attempts(r)
-    # The BPID is allocated at runtime. Discover the dedicated SEC pool from
-    # its boot registration and read BMan's actual available-buffer count.
+    # The BPID is allocated at runtime; cdx publishes the dedicated SEC pool's
+    # as a read-only parameter. Not the boot log: a long same-boot run fills
+    # the ring buffer and the registration line is gone. Then read BMan's
+    # actual available-buffer count for it.
     result = await console_python(r.service_console, r'''
-import json, re, subprocess
+import json
 from pathlib import Path
-log = subprocess.check_output(['dmesg'], text=True)
-bpid = re.findall(r'add_ipsec_bpool::bp->size :\d+, bpid (\d+)', log)[-1]
+bpid = Path('/sys/module/cdx/parameters/ipsec_bpid').read_text().strip()
+assert int(bpid) >= 0, bpid
 paths = list(Path('/sys/bus/platform/devices').glob('*.bman/pool_count/' + bpid))
 assert len(paths) == 1, paths
 print(json.dumps({'path': str(paths[0]), 'bpid': int(bpid)}))

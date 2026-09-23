@@ -65,6 +65,8 @@
 #define smp_load_acquire(p) (*(p))
 #define smp_store_release(p, v) (*(p) = (v))
 #define WRITE_ONCE(p, v) ((p) = (v))
+/* The published SEC pool BPID, module_param_cb in production. */
+static int ipsec_bpid = -1;
 #define DPA_WRITE_SKB_PTR(skb, skbh, addr, off) do { skbh = (void *)(addr); skbh[off] = skb; } while (0)
 #define DPA_READ_SKB_PTR(skb, skbh, addr, off) do { skbh = (void *)(addr); skb = skbh[off]; } while (0)
 #define cpu_to_be16(v) (v)
@@ -388,7 +390,7 @@ static void clean(void)
     assert(!pages && !refill_running && !sg_bpool_g && !skb_2bfreed_bpool_g);
     for (unsigned id = 2; id < 64; id++) assert(!dpa_bp_array[id]);
     assert(!port && !cgr && !cgrid && !preempt_count && !dpa_bp_array[2] && !cdx_dpa_ipsec_ready());
-    assert(!ipsecinfo.ipsec_bp && !ipsecinfo.ipsec_pcd_fqs);
+    assert(!ipsecinfo.ipsec_bp && !ipsecinfo.ipsec_pcd_fqs && ipsec_bpid == -1);
     assert(!module_refs && !sa_range && !ipsecinfo.ipsec_exception_fq);
     assert(!ipsecinfo.expt_fq_count && ipsecinfo.ofport_handle < 0);
     for (unsigned i = 0; i < MAX_MATCH_TABLES; i++) assert(!ipsecinfo.ofport_td[i]);
@@ -406,6 +408,7 @@ static unsigned normal(void)
     unsigned count = steps;
     assert(cdx_dpa_ipsec_ready() && registrations == 1 && queues == 12);
     assert(ipsecinfo.ipsec_bp->pool->count == IPSEC_BUFCOUNT);
+    assert(ipsec_bpid == ipsecinfo.ipsec_bp->bpid);
     assert(mappings == IPSEC_BUFCOUNT + CDX_MAX_SG_BUFF_COUNT);
     assert(sg_bpool_g->pool->count == CDX_MAX_SG_BUFF_COUNT);
     assert(!skb_2bfreed_bpool_g->pool->count);
