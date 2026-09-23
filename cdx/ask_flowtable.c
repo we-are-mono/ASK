@@ -6582,14 +6582,6 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 		spec->crypt.bits = x->aead->alg_key_len;
 		memcpy(spec->crypt.key, x->aead->alg_key, x->aead->alg_key_len / 8);
 	}
-	spec->lft.soft_bytes = x->lft.soft_byte_limit == XFRM_INF ? 0 :
-			       x->lft.soft_byte_limit;
-	spec->lft.hard_bytes = x->lft.hard_byte_limit == XFRM_INF ? 0 :
-			       x->lft.hard_byte_limit;
-	spec->lft.soft_packets = x->lft.soft_packet_limit == XFRM_INF ? 0 :
-				 x->lft.soft_packet_limit;
-	spec->lft.hard_packets = x->lft.hard_packet_limit == XFRM_INF ? 0 :
-				 x->lft.hard_packet_limit;
 	spec->dev_mtu = dev->mtu;
 	spec->mtu = xfrm_state_mtu(x, dev->mtu);
 	if (spec->dir == CDX_IPSEC_DIR_OUT)
@@ -6598,14 +6590,181 @@ static int ft_ipsec_spec(struct xfrm_state *x, struct cdx_ipsec_sa_spec *spec,
 }
 
 /* Retirement storage belongs to an SA from its initial installation.
- * Deletion can run from expiry under a spinlock and must never allocate. */
+ * Deletion can run from expiry under a spinlock and must never allocate.
+ *
+ * While the SA is owned, the same entry is what the accounting pass below
+ * walks, which is why it names the state as well as the SA. */
 struct ft_ipsec_retirement {
 	struct list_head list;
 	struct cdx_ipsec_sa *sa;
+	/* Borrowed, like the backend's own copy, and safe to take a reference
+	 * on exactly while this entry is on ft_ipsec_owned: xfrm drops the
+	 * reference that keeps an offloaded state alive only once
+	 * xdo_dev_state_delete() has returned, and ft_xdo_state_delete() moves
+	 * the entry off that list under ft_ipsec_retired_lock first. */
+	struct xfrm_state *x;
+	/* The accounting pass's own linkage, touched by nothing else. */
+	struct list_head pass;
+	/* What the pass last published into the state. The next pass adds
+	 * only the difference, so a state installed with traffic already
+	 * counted -- xfrm_user takes a current lifetime at install -- keeps
+	 * it. */
+	struct cdx_ipsec_counters published;
 };
 static LIST_HEAD(ft_ipsec_owned);
 static LIST_HEAD(ft_ipsec_retired);
 static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
+
+/* ------------------------------------------------ what SEC counted, for xfrm
+ *
+ * xfrm keeps an SA's lifetime in two halves: the limits the state was given,
+ * x->lft, and what it has carried so far, x->curlft. Byte and packet expiry
+ * exist only as xfrm_state_check_expire() comparing the two, which the stack
+ * calls per packet from xfrm_output_one() and xfrm_input(). Packet offload
+ * reaches neither: an outbound frame skips xfrm_output_one() entirely, and an
+ * inbound one comes back from SEC already decrypted and stamps only use_time.
+ * Left alone, curlft stays at zero, `ip -s xfrm state` shows an idle SA, and
+ * a byte or packet limit never fires -- the SA lives until its time limit
+ * however much it carries.
+ *
+ * The counters that do move are SEC's, kept per SA in its shared descriptor.
+ * This pass carries them across once a period: it reads them inside the
+ * control transaction, which is what keeps each SA installed while it is
+ * read, and publishes them into curlft under x->lock before asking xfrm to
+ * judge -- the lock and the call the software path uses per packet. A limit
+ * therefore fires within one period of being crossed, through xfrm's own soft
+ * and hard expiry and nothing private. A hard expiry does not stop SEC at
+ * once, though: the SA's entries keep forwarding until the deletion that
+ * follows retires them, so an SA can run past its hard limit by up to one
+ * period plus the retirement's own latency.
+ *
+ * There is deliberately no xdo_dev_state_update_stats(). Most of its callers
+ * hold x->lock or xfrm_state_lock -- the state timer, xfrm_state_check_expire(),
+ * state dumps -- so it cannot sleep for the control mutex, and the 64-bit
+ * packet total is built under that mutex; a second reader outside it would
+ * race the pass. XFRM_MSG_GETSA reaches it holding only xfrm_cfg_mutex, where
+ * nothing even keeps the SA from being retired underneath it. What the op
+ * could publish, curlft already holds, at most one period old -- as stale as
+ * mlx5's, whose flow counters are cached on the same one-second period
+ * (MLX5_FC_STATS_PERIOD) and whose software limits are judged by a
+ * one-second work (mlx5e_ipsec_handle_sw_limits()).
+ *
+ * Nor an xdo_dev_state_advance_esn(). xfrm_dev_state_add() asks for it only
+ * for crypto offload, and SEC keeps an ESN SA's high word in its PDB and
+ * advances it there.
+ */
+#define FT_IPSEC_STATS_PERIOD	HZ
+
+/* How close to the end of its sequence space a non-ESN outbound SA may come
+ * before the pass asks for a rekey.
+ *
+ * Such an SA's numbers end at FFFFFFFE -- SEC refuses to send FFFFFFFF (SEC
+ * RM table 9-2) and will not wrap -- and past that every frame fails in SEC
+ * and the tunnel carries nothing that way.
+ * Linux's software path stops at the same wall and warns nobody either, but
+ * it rarely gets there; the offload does. At 1.4 Mpps the space lasts 51
+ * minutes, less than strongSwan's default hour between rekeys. The legacy
+ * owner reported the approach to CMM; here it is a soft expire, which is what
+ * makes strongSwan rekey. 2^28 is a sixteenth of the space and over three
+ * minutes at that rate, enough for an IKE exchange and its retransmissions.
+ * An ESN SA has 2^64 and never comes close.
+ */
+#define FT_IPSEC_SEQ_HEADROOM	(1ULL << 28)
+
+static void ft_ipsec_stats_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ft_ipsec_stats, ft_ipsec_stats_work);
+
+static bool ft_ipsec_seq_exhausting(const struct xfrm_state *x, u64 oseq)
+{
+	return x->xso.dir == XFRM_DEV_OFFLOAD_OUT &&
+	       !(x->props.flags & XFRM_STATE_ESN) &&
+	       oseq >= (1ULL << 32) - FT_IPSEC_SEQ_HEADROOM;
+}
+
+/* Publish one SA's counters into its state and let xfrm judge them.
+ *
+ * A VALID state only. One that is being deleted has nothing left to expire,
+ * and one already hard-expired is on its way there; xfrm_state_check_expire()
+ * would only rearm the timer that is deleting it. x->lock is held across the
+ * test and everything after it, and __xfrm_state_delete() runs under the same
+ * lock, so a state seen VALID here stays so until the lock drops.
+ */
+static void ft_ipsec_account(struct ft_ipsec_retirement *owned,
+			     const struct cdx_ipsec_counters *counters)
+{
+	struct xfrm_state *x = owned->x;
+
+	spin_lock_bh(&x->lock);
+	if (x->km.state != XFRM_STATE_VALID)
+		goto out;
+	/* Only ever forward. The backend's totals do not go back, and if one
+	 * ever did, adding the difference would wrap curlft to a limit's
+	 * worth of traffic nobody sent; this waits for it to pass the figure
+	 * already published instead. */
+	if (counters->bytes > owned->published.bytes) {
+		x->curlft.bytes += counters->bytes - owned->published.bytes;
+		owned->published.bytes = counters->bytes;
+	}
+	if (counters->packets > owned->published.packets) {
+		x->curlft.packets += counters->packets - owned->published.packets;
+		owned->published.packets = counters->packets;
+	}
+	/* An SA that has carried nothing has nothing to judge, and asking
+	 * anyway would stamp use_time on it -- the moment its use-based
+	 * lifetimes count from. */
+	if (counters->packets && xfrm_state_check_expire(x))
+		goto out;
+	/* The same soft expiry xfrm_state_check_expire() raises for a byte or
+	 * packet limit, and the same flag that makes it happen once. */
+	if (ft_ipsec_seq_exhausting(x, counters->oseq) && !x->km.dying) {
+		x->km.dying = 1;
+		km_state_expired(x, 0, 0);
+	}
+out:
+	spin_unlock_bh(&x->lock);
+}
+
+/* One accounting pass over every owned SA.
+ *
+ * The control transaction is held throughout, and it is what makes the walk
+ * safe with ft_ipsec_retired_lock dropped: the retirement that frees an SA,
+ * and the entry naming it, takes the transaction first. So every entry
+ * gathered here stays allocated, with its SA installed, until the pass ends.
+ * The state is held separately, for the same span, because it is xfrm's to
+ * free and xfrm does not ask. x->lock is taken only after
+ * ft_ipsec_retired_lock is dropped: deletion holds x->lock when it takes
+ * that one.
+ *
+ * The pass keeps itself going while any SA is owned, and ft_xdo_state_add()
+ * starts it again for the first SA after a gap.
+ */
+static void ft_ipsec_stats_work(struct work_struct *work)
+{
+	struct ft_ipsec_retirement *owned, *next;
+	struct cdx_ipsec_counters counters;
+	LIST_HEAD(pass);
+	bool more;
+
+	cdx_ft_begin();
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	list_for_each_entry(owned, &ft_ipsec_owned, list) {
+		xfrm_state_hold(owned->x);
+		list_add_tail(&owned->pass, &pass);
+	}
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+	list_for_each_entry_safe(owned, next, &pass, pass) {
+		list_del(&owned->pass);
+		cdx_ipsec_sa_stats(owned->sa, &counters);
+		ft_ipsec_account(owned, &counters);
+		xfrm_state_put(owned->x);
+	}
+	spin_lock_bh(&ft_ipsec_retired_lock);
+	more = !list_empty(&ft_ipsec_owned);
+	spin_unlock_bh(&ft_ipsec_retired_lock);
+	cdx_ft_end();
+	if (more)
+		schedule_delayed_work(&ft_ipsec_stats, FT_IPSEC_STATS_PERIOD);
+}
 
 static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack)
 {
@@ -6670,9 +6829,13 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 		return rc;
 	}
 	retirement->sa = sa;
+	retirement->x = x;
 	spin_lock_bh(&ft_ipsec_retired_lock);
 	list_add_tail(&retirement->list, &ft_ipsec_owned);
 	spin_unlock_bh(&ft_ipsec_retired_lock);
+	/* Nothing if the accounting pass is already queued, and otherwise the
+	 * start of it: the pass stops itself once no SA is owned. */
+	schedule_delayed_work(&ft_ipsec_stats, FT_IPSEC_STATS_PERIOD);
 	if (watch)
 		ft_ipsec_watch_add(watch, &spec, sa);
 	/* The opaque owner, not the sixteen-bit handle: it identifies this SA
@@ -7817,14 +7980,18 @@ netdev:
 	ft_mc_exit();
 	ft_mr_exit();
 	/* The notifier's registration replayed NETDEV_REGISTER and attached
-	 * every port, so a failure after that point has ports to give back --
-	 * and an SA could already have been installed and deleted through
-	 * them, leaving a retirement queued against code about to unload. */
+	 * every port, so a failure after that point has ports to give back.
+	 * No SA can have been installed through them: xfrm_dev_ops_get()
+	 * hands out the ops of a module only once it is live, so xfrm offers
+	 * this one no state or policy until init has returned. */
 	ft_ipsec_detach_all();
 	/* The same replay could have registered a VAP for an AP interface that
 	 * already existed, so this failure path owes them back too. */
 	ft_wifi_exit();
+	/* Idle for that reason, and drained anyway: each costs nothing when
+	 * there is nothing queued, and none may outlive this text. */
 	flush_work(&ft_ipsec_retire);
+	cancel_delayed_work_sync(&ft_ipsec_stats);
 	cancel_work_sync(&ft_ipsec_follow);
 	ft_ipsec_watch_flush();
 	/* A flow admitted through the indirect bind before the failure claimed
@@ -7927,6 +8094,10 @@ static void __exit ask_flowtable_exit(void)
 	 * be unmapped, and this order is the only one that ends with an empty
 	 * list. */
 	flush_work(&ft_ipsec_retire);
+	/* The accounting pass requeues itself only while an SA is owned, and
+	 * none is by now: every offloaded state pins this module through its
+	 * ops, and xfrm deletes a state before it lets it go. */
+	cancel_delayed_work_sync(&ft_ipsec_stats);
 	/* The notifiers that mark a watch are gone above, so nothing can queue
 	 * this again; stop the pass in flight and drop the watches it walked,
 	 * which are this module's memory rather than the kernel's. */

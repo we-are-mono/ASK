@@ -89,6 +89,7 @@ static void list_del(struct list_head *e)
 
 #define list_first_entry_or_null(head, type, member) \
 	((head)->next == (head) ? NULL : list_entry((head)->next, type, member))
+static bool list_empty(const struct list_head *h) { return h->next == h; }
 static void list_move_tail(struct list_head *e, struct list_head *head)
 { list_del(e); list_add_tail(e, head); }
 
@@ -106,10 +107,17 @@ static void *test_kzalloc(size_t size)
 }
 #define kzalloc(n, f) test_kzalloc(n)
 #define kfree(p) free(p)
-#define spin_lock_bh(l) ((void)(l))
-#define spin_unlock_bh(l) ((void)(l))
-#define spin_lock(l) ((void)(l))
-#define spin_unlock(l) ((void)(l))
+/* A spinlock is a flag here, so a case can ask which are held: the
+ * accounting pass has an order to keep between two of them, and xfrm's
+ * lifetime judge wants x->lock. Taking one twice is a deadlock on hardware
+ * and an assertion here. */
+static void test_lock(int *lock) { assert(!*lock); *lock = 1; }
+static void test_unlock(int *lock) { assert(*lock); *lock = 0; }
+#define spin_lock_bh(l) test_lock(l)
+#define spin_unlock_bh(l) test_unlock(l)
+#define spin_lock(l) test_lock(l)
+#define spin_unlock(l) test_unlock(l)
+#define HZ 100
 #define read_lock_bh(l) ((void)(l))
 #define read_unlock_bh(l) ((void)(l))
 #define READ_ONCE(x) (x)
@@ -277,7 +285,9 @@ struct flowi {
 #define XFRM_MODE_TUNNEL 1
 #define XFRM_STATE_NOPMTUDISC 1
 #define XFRM_STATE_ESN 128
+#define XFRM_STATE_VOID 0
 #define XFRM_STATE_VALID 2
+#define XFRM_STATE_EXPIRED 4
 #define XFRM_STATE_DEAD 5
 #define XFRM_DEV_OFFLOAD_UNSPECIFIED 0
 #define XFRM_DEV_OFFLOAD_CRYPTO 1
@@ -307,6 +317,11 @@ struct xfrm_lifetime_cfg {
 	u64 soft_byte_limit, hard_byte_limit;
 	u64 soft_packet_limit, hard_packet_limit;
 };
+typedef long long time64_t;
+struct xfrm_lifetime_cur {
+	u64 bytes, packets;
+	time64_t add_time, use_time;
+};
 
 struct xfrm_selector { bool mismatch; };
 struct xfrm_state {
@@ -322,13 +337,16 @@ struct xfrm_state {
 		u32 replay_window, reqid;
 	} props;
 	struct { u32 v; } mark;
-	struct { u8 state; } km;
+	struct { u8 state; u8 dying; } km;
+	int lock;
+	int mtimer;
 	struct xfrm_algo_auth *aalg;
 	struct xfrm_algo *ealg;
 	struct xfrm_algo_aead *aead;
 	struct xfrm_encap_tmpl *encap;
 	void *replay_esn;
 	struct xfrm_lifetime_cfg lft;
+	struct xfrm_lifetime_cur curlft;
 	struct xfrm_dev_offload xso;
 	u16 handle;
 	unsigned refs;
@@ -393,6 +411,10 @@ static struct xfrm_policy *xfrm_policy_lookup(struct net *net, const struct flow
 static void xfrm_pol_put(struct xfrm_policy *pol) { assert(pol->refs); pol->refs--; }
 
 static unsigned xfrm_state_refs;
+static void xfrm_state_hold(struct xfrm_state *x)
+{
+	x->refs++; xfrm_state_refs++;
+}
 static void xfrm_state_put(struct xfrm_state *x)
 {
 	assert(x->refs && xfrm_state_refs);
@@ -476,15 +498,16 @@ static struct net init_net;
 
 /* --- the SA backend -------------------------------------------------- */
 
-/* An installed SA, as far as the adapter can see one: a handle, and the
- * framing the backend was last told to write. */
+/* An installed SA, as far as the adapter can see one: a handle, the framing
+ * the backend was last told to write, and what SEC has counted on it. */
 struct cdx_ipsec_sa {
 	u16 handle;
 	u8 dst_mac[ETH_ALEN];
 	bool outbound;
 	bool live;
+	u64 packets, bytes, oseq;
 };
-static struct cdx_ipsec_sa sa_pool[4];
+static struct cdx_ipsec_sa sa_pool[8];
 static unsigned sa_installed, sa_deleted;
 static unsigned retirement_flows, retirement_barriers;
 static int sa_add_error;
@@ -554,6 +577,69 @@ static int ft_transaction;
 static void cdx_ft_begin(void) { assert(!ft_transaction); ft_transaction = 1; }
 static void cdx_ft_end(void) { assert(ft_transaction); ft_transaction = 0; }
 
+/* What SEC counted, read the way the backend requires: inside the
+ * transaction, and only for an SA that is still installed -- which is the
+ * promise the accounting pass makes by holding the transaction across its
+ * walk. A case can hook the read to model what a concurrent deletion does
+ * while the pass is inside it. */
+static unsigned sa_stats_reads;
+static void (*sa_stats_hook)(struct cdx_ipsec_sa *sa);
+static void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
+			       struct cdx_ipsec_counters *counters)
+{
+	assert(ft_transaction && sa && sa->live);
+	sa_stats_reads++;
+	if (sa_stats_hook)
+		sa_stats_hook(sa);
+	counters->packets = sa->packets;
+	counters->bytes = sa->bytes;
+	counters->oseq = sa->outbound ? sa->oseq : 0;
+}
+
+/* xfrm's side of a lifetime. The judge itself is the kernel's, compiled; what
+ * it reaches is recorded here. */
+static time64_t wall_clock = 1700000000;
+static time64_t ktime_get_real_seconds(void) { return wall_clock; }
+#define HRTIMER_MODE_REL_SOFT 0
+static unsigned timers_started;
+static void hrtimer_start(int *timer, long expires, int mode)
+{
+	(void)timer; (void)mode;
+	assert(expires == 0);
+	timers_started++;
+}
+static unsigned soft_expires, hard_expires;
+static void km_state_expired(struct xfrm_state *x, int hard, u32 portid)
+{
+	assert(x->lock && !portid);
+	if (hard)
+		hard_expires++;
+	else
+		soft_expires++;
+}
+static void xfrm_dev_state_update_stats(struct xfrm_state *x) { assert(x->lock); }
+static int kernel_xfrm_state_check_expire(struct xfrm_state *x);
+/* Counted, and asked the questions the pass's locking has to answer: x->lock
+ * held, the owned list's lock not -- deletion takes that one under x->lock --
+ * and the transaction held, which is what kept the SA to read. */
+static unsigned expire_checks;
+static int xfrm_state_check_expire(struct xfrm_state *x)
+{
+	assert(x->lock && !ft_ipsec_retired_lock && ft_transaction);
+	expire_checks++;
+	return kernel_xfrm_state_check_expire(x);
+}
+
+/* The accounting pass's work item. It must only ever be asked to run a
+ * period out, never at once: installs come in bursts. */
+static int ft_ipsec_stats;
+static unsigned stats_scheduled;
+static void schedule_delayed_work(int *work, unsigned long delay)
+{
+	assert(work == &ft_ipsec_stats && delay == FT_IPSEC_STATS_PERIOD);
+	stats_scheduled++;
+}
+
 /* --- the rest of the adapter, stubbed -------------------------------- */
 static unsigned retired_handles;
 static void ft_ipsec_retire_sa(u16 handle) { if (handle) retired_handles++; }
@@ -573,17 +659,6 @@ static void schedule_work(int *work)
 		assert(0);
 }
 struct work_struct { int dummy; };
-
-/* SAs whose state has gone and whose hardware is waiting to go with it. The
- * queue itself is not under test here; that its entries are only ever made
- * after the watch is unlinked is. */
-struct ft_ipsec_retirement {
-	struct list_head list;
-	struct cdx_ipsec_sa *sa;
-};
-static LIST_HEAD(ft_ipsec_retired);
-static LIST_HEAD(ft_ipsec_owned);
-static DEFINE_SPINLOCK(ft_ipsec_retired_lock);
 
 struct netlink_ext_ack { const char *_msg; };
 /* The kernel's table, member for member, so that the adapter's own instance
@@ -755,6 +830,10 @@ static void bench_reset(void)
 	sa_next_hop_calls = 0;
 	works_scheduled = retires_scheduled = 0;
 	retired_handles = 0;
+	sa_stats_reads = expire_checks = 0;
+	sa_stats_hook = NULL;
+	soft_expires = hard_expires = timers_started = 0;
+	stats_scheduled = 0;
 	port_supported = true;
 	WAN.xfrmdev_ops = NULL;
 	WAN.features = WAN.hw_features = WAN.wanted_features = 0;
@@ -812,10 +891,6 @@ static void test_spec(void)
 	assert(spec.crypt.alg == 12 && spec.crypt.bits == 128);
 	assert(ether_addr_equal(spec.dst_mac, PEER_MAC));
 	assert(spec.dev_mtu == 1500 && spec.mtu == 1440);
-	/* Unlimited lifetimes arrive as zero rather than as XFRM_INF: the
-	 * backend reads zero as "no limit", and would otherwise be given a
-	 * byte count no SA reaches but every comparison still makes. */
-	assert(spec.lft.hard_bytes == 0 && spec.lft.soft_packets == 0);
 	/* DF is copied for an IPv4 outbound tunnel unless the state asked for
 	 * no path-MTU discovery, which is asking for the opposite. */
 	assert(spec.copy_df);
@@ -1774,6 +1849,244 @@ static void test_watch_delete_ordering(void)
 	bench_clear_sas();
 }
 
+/* Install an SA for the accounting cases, with its state as xfrm has it once
+ * inserted: VALID, every limit unlimited, nothing counted yet. */
+static struct xfrm_state *install_accounted(struct xfrm_state *x, bool outbound,
+					    u8 flags)
+{
+	struct netlink_ext_ack ack = { NULL };
+
+	*x = *outbound_state();
+	x->props.flags |= flags;
+	if (!outbound)
+		x->xso.dir = XFRM_DEV_OFFLOAD_IN;
+	assert(ft_xdo_state_add(x, &ack) == 0);
+	return x;
+}
+
+static struct cdx_ipsec_sa *sa_of(const struct xfrm_state *x)
+{
+	return (struct cdx_ipsec_sa *)x->xso.offload_handle;
+}
+
+/* What __xfrm_state_delete() does around the device callback: the state is
+ * DEAD, under x->lock, before the device hears of it. */
+static void delete_state(struct xfrm_state *x)
+{
+	test_lock(&x->lock);
+	x->km.state = XFRM_STATE_DEAD;
+	ft_xdo_state_delete(x);
+	test_unlock(&x->lock);
+}
+
+/* A deletion landing while the pass is inside its walk, between gathering an
+ * SA and publishing its counters -- which on hardware is any other CPU, at
+ * any moment the pass does not hold x->lock. */
+static struct xfrm_state *deleted_mid_pass;
+static void delete_during_read(struct cdx_ipsec_sa *sa)
+{
+	if (deleted_mid_pass && sa_of(deleted_mid_pass) == sa)
+		delete_state(deleted_mid_pass);
+}
+
+static void test_accounting(void)
+{
+	struct xfrm_state out_state, in_state, void_state;
+	struct xfrm_state *out, *in, *fresh;
+	struct cdx_ipsec_sa *out_sa, *in_sa;
+	unsigned checks, reads;
+
+	bench_reset();
+	bench_clear_sas();
+
+	/* The first SA starts the pass, a period out rather than at once. */
+	out = install_accounted(&out_state, true, 0);
+	assert(stats_scheduled == 1);
+	in = install_accounted(&in_state, false, 0);
+	out_sa = sa_of(out);
+	in_sa = sa_of(in);
+
+	/* Nothing carried: nothing published and nothing judged -- asking
+	 * would stamp use_time on an SA that was never used, and its use-based
+	 * lifetimes would start counting from the install. The pass keeps
+	 * itself going while SAs are owned, and gives back every reference and
+	 * lock it took. */
+	stats_scheduled = 0;
+	ft_ipsec_stats_work(NULL);
+	assert(sa_stats_reads == 2 && expire_checks == 0);
+	assert(!out->curlft.packets && !out->curlft.use_time);
+	assert(stats_scheduled == 1);
+	assert(xfrm_state_refs == 0 && !ft_transaction && !ft_ipsec_retired_lock);
+
+	/* SEC's counts reach curlft in both directions, and xfrm judges them
+	 * with its own function -- which is what stamps use_time. */
+	out_sa->packets = 10;
+	out_sa->bytes = 15000;
+	in_sa->packets = 7;
+	in_sa->bytes = 9000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->curlft.packets == 10 && out->curlft.bytes == 15000);
+	assert(in->curlft.packets == 7 && in->curlft.bytes == 9000);
+	assert(expire_checks == 2 && out->curlft.use_time == wall_clock);
+	assert(!soft_expires && !hard_expires);
+
+	/* Only the difference is added, so what xfrm counted by another hand --
+	 * a lifetime carried in with the state, a NEWAE -- is kept. */
+	out->curlft.packets += 100;
+	out->curlft.bytes += 1000;
+	out_sa->packets = 12;
+	out_sa->bytes = 18000;
+	ft_ipsec_stats_work(NULL);
+	assert(out->curlft.packets == 112 && out->curlft.bytes == 19000);
+
+	/* Only ever forward: totals below what was published add nothing --
+	 * rather than wrapping curlft to a limit's worth of traffic -- and
+	 * counting resumes from the published figure once they pass it. */
+	out_sa->packets = 5;
+	out_sa->bytes = 100;
+	ft_ipsec_stats_work(NULL);
+	assert(out->curlft.packets == 112 && out->curlft.bytes == 19000);
+	out_sa->packets = 13;
+	out_sa->bytes = 18500;
+	ft_ipsec_stats_work(NULL);
+	assert(out->curlft.packets == 113 && out->curlft.bytes == 19500);
+	out_sa->packets = 12;
+	out_sa->bytes = 18000;
+
+	/* A soft limit fires once, through xfrm's own judge, however many
+	 * passes see it crossed. */
+	out->lft.soft_packet_limit = 150;
+	out_sa->packets = 50;
+	ft_ipsec_stats_work(NULL);
+	assert(soft_expires == 1 && out->km.dying && !hard_expires);
+	out_sa->packets = 60;
+	ft_ipsec_stats_work(NULL);
+	assert(soft_expires == 1);
+
+	/* A hard limit expires the state and leaves its deletion to xfrm's
+	 * timer, exactly as the software path does. */
+	in->lft.hard_byte_limit = 10000;
+	in_sa->packets = 8;
+	in_sa->bytes = 10000;
+	ft_ipsec_stats_work(NULL);
+	assert(in->km.state == XFRM_STATE_EXPIRED && timers_started == 1);
+
+	/* No longer VALID: nothing published into it, nothing judged. */
+	checks = expire_checks;
+	in_sa->packets = 9;
+	in_sa->bytes = 11000;
+	ft_ipsec_stats_work(NULL);
+	assert(expire_checks == checks + 1);	/* the outbound one alone */
+	assert(in->curlft.bytes == 10000 && in->curlft.packets == 8);
+	assert(timers_started == 1);
+
+	/* Deleted: the entry is off the owned list, so the pass does not even
+	 * read the SA, which is waiting for its retirement. */
+	delete_state(in);
+	reads = sa_stats_reads;
+	ft_ipsec_stats_work(NULL);
+	assert(sa_stats_reads == reads + 1 && in_sa->live);
+
+	/* A state not yet inserted -- xfrm_add_sa() installs the offload before
+	 * it inserts -- is read but neither published into nor judged. */
+	fresh = install_accounted(&void_state, false, 0);
+	fresh->km.state = XFRM_STATE_VOID;
+	sa_of(fresh)->packets = 3;
+	checks = expire_checks;
+	ft_ipsec_stats_work(NULL);
+	assert(!fresh->curlft.packets && expire_checks == checks + 1);
+	delete_state(fresh);
+
+	/* Deleted while the pass is inside its walk. The SA it gathered is still
+	 * installed -- its retirement needs the transaction the pass holds --
+	 * and the state, held by the pass, is DEAD by the time x->lock is
+	 * taken: nothing is published and nothing judged. */
+	deleted_mid_pass = out;
+	sa_stats_hook = delete_during_read;
+	checks = expire_checks;
+	out_sa->packets = 70;
+	stats_scheduled = 0;
+	ft_ipsec_stats_work(NULL);
+	assert(out_sa->live && out->curlft.packets == 112 + 60 - 12);
+	assert(expire_checks == checks && xfrm_state_refs == 0);
+	sa_stats_hook = NULL;
+	deleted_mid_pass = NULL;
+
+	/* Nothing is owned any more, so the pass does not come back until an
+	 * install starts it again; the retirements then free every SA. */
+	assert(stats_scheduled == 0);
+	bench_drain_retirements();
+	assert(!out_sa->live && !in_sa->live && sa_deleted == 3);
+	bench_clear_sas();
+}
+
+/* A non-ESN outbound SA asks for a rekey before its sequence space runs out,
+ * because SEC will not wrap it and the offload can get there inside an
+ * ordinary rekey interval. */
+static void test_sequence_exhaustion(void)
+{
+	struct xfrm_state out_state, esn_state, in_state, idle_state, hard_state;
+	struct xfrm_state *out, *esn, *in, *idle, *hard;
+	struct cdx_ipsec_sa *out_sa;
+
+	bench_reset();
+	bench_clear_sas();
+	out = install_accounted(&out_state, true, 0);
+	out_sa = sa_of(out);
+	out_sa->packets = 1;
+
+	/* One short of the headroom: nothing yet. */
+	out_sa->oseq = (1ULL << 32) - FT_IPSEC_SEQ_HEADROOM - 1;
+	ft_ipsec_stats_work(NULL);
+	assert(!soft_expires && !out->km.dying);
+
+	/* Inside it: the soft expiry xfrm raises for a byte or packet limit,
+	 * which is what makes the keying daemon rekey. Once. */
+	out_sa->oseq++;
+	ft_ipsec_stats_work(NULL);
+	assert(soft_expires == 1 && out->km.dying && !hard_expires);
+	out_sa->oseq = 0xffffffff;
+	ft_ipsec_stats_work(NULL);
+	assert(soft_expires == 1 && out->km.state == XFRM_STATE_VALID);
+
+	/* ESN has 2^64 and never gets close; the same count means nothing. */
+	esn = install_accounted(&esn_state, true, XFRM_STATE_ESN);
+	sa_of(esn)->packets = 1;
+	sa_of(esn)->oseq = (5ULL << 32) | 0xfffffff0;
+	ft_ipsec_stats_work(NULL);
+	assert(soft_expires == 1 && !esn->km.dying);
+
+	/* An inbound SA sends nothing and has no sequence of its own. */
+	in = install_accounted(&in_state, false, 0);
+	assert(!ft_ipsec_seq_exhausting(in, 0xffffffff));
+	assert(ft_ipsec_seq_exhausting(out, 0xffffffff));
+	assert(!ft_ipsec_seq_exhausting(esn, 0xffffffff));
+
+	/* An SA installed already inside the headroom asks before it has
+	 * carried anything: the question is about the space, not the traffic. */
+	idle = install_accounted(&idle_state, true, 0);
+	sa_of(idle)->oseq = 0xfffffffe;
+	ft_ipsec_stats_work(NULL);
+	assert(soft_expires == 2 && idle->km.dying && !idle->curlft.use_time);
+
+	/* A state its hard limit has just expired is past rekeying: it is told
+	 * of that, by xfrm, and of nothing else. */
+	hard = install_accounted(&hard_state, true, 0);
+	hard->lft.hard_packet_limit = 5;
+	sa_of(hard)->packets = 5;
+	sa_of(hard)->oseq = 0xfffffffe;
+	ft_ipsec_stats_work(NULL);
+	assert(hard->km.state == XFRM_STATE_EXPIRED && !hard->km.dying);
+	assert(soft_expires == 2);
+
+	delete_state(out);
+	delete_state(esn);
+	delete_state(in);
+	delete_state(idle);
+	delete_state(hard);
+	bench_clear_sas();
+}
+
 int main(void)
 {
 	test_spec();
@@ -1792,6 +2105,8 @@ int main(void)
 	test_watch_unreachable_peer();
 	test_watch_failures();
 	test_watch_delete_ordering();
+	test_accounting();
+	test_sequence_exhaustion();
 	assert(dev_holds == 0 && neigh_refs == 0 && xfrm_state_refs == 0);
 	printf("ipsec adapter: ok\n");
 	return 0;

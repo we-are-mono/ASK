@@ -969,6 +969,53 @@ void get_stats_from_sa(PSAEntry sa, u32* pkts, u64* bytes, u8* pSeqOverflow)
 	return;
 }
 
+/* The next ESN sequence number an outbound SA will send, high word then low,
+ * each read once. */
+static u64 cdx_ipsec_next_esn(struct sec_descriptor *sec_desc)
+{
+	u64 hi = caam32_to_cpu(READ_ONCE(sec_desc->pdb_en.seq_num_ext_hi));
+
+	return hi << 32 | caam32_to_cpu(READ_ONCE(sec_desc->pdb_en.seq_num));
+}
+
+/* How many readings of an ESN number to take before settling for one. */
+#define CDX_IPSEC_OSEQ_TRIES 8
+
+/* The last sequence number an outbound SA put on the wire, in the units xfrm's
+ * own oseq counts. The PDB holds the next one to send -- SEC sends the stored
+ * value and then increments it, which is why cdx_ipsec_build_out_sa_pdb()
+ * seeds it one past sa->seq -- so this is that value less one.
+ *
+ * Without ESN only the low word exists: one aligned load, and the difference
+ * taken in 32 bits to match. With ESN the number spans two words that SEC's
+ * store rewrites one after the other, and a reading across the carry can pair
+ * either word's new value with the other's old one -- 2^32 out, high or low.
+ * Re-reading the high word around the low one does not settle it, since the
+ * store may write either word first; so the whole number is read until two
+ * readings agree. One that never holds still is reported as the lower of its
+ * last two readings: the number is only ever published forward, where low
+ * errs safe and high would have a re-added SA skip 2^32 numbers.
+ */
+u64 get_oseq_from_sa(PSAEntry sa)
+{
+	struct sec_descriptor *sec_desc = sa->pSec_sa_context->sec_desc;
+	unsigned int tries;
+	u64 next, again, low;
+
+	if (!(sa->flags & SA_ALLOW_EXT_SEQ_NUM))
+		return (u32)(caam32_to_cpu(READ_ONCE(sec_desc->pdb_en.seq_num)) - 1);
+	next = cdx_ipsec_next_esn(sec_desc);
+	low = next;
+	for (tries = 0; tries < CDX_IPSEC_OSEQ_TRIES; tries++) {
+		again = cdx_ipsec_next_esn(sec_desc);
+		if (again == next)
+			return next - 1;
+		low = min(next, again);
+		next = again;
+	}
+	return low - 1;
+}
+
 static inline void save_sa_state_in_external_mem(PSAEntry sa)
 {
 	uint32_t *desc;

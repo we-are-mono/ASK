@@ -332,7 +332,6 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 	unsigned short sagd_pkt;
 	struct sec_path *sp;
 	struct xfrm_state *x;
-	struct timespec64 ktime;
 	bool use_gro;
 	int pool_balance = 0;
 	unsigned short protocol;
@@ -456,11 +455,12 @@ static enum qman_cb_dqrr_result ipsec_exception_pkt_handler(struct qman_portal *
 
 	sp->xvec[0] = x;
 
-	if (!x->curlft.use_time)
-	{
-		ktime_get_real_ts64(&ktime);
-		x->curlft.use_time = (unsigned long)ktime.tv_sec;
-	}
+	/* First use, stamped without x->lock: this runs per frame in the
+	 * portal callback, while the SA's accounting pass and the state timer
+	 * read the field under the lock. One marked load and store, as
+	 * xfrm_state_check_expire() makes its own. */
+	if (!READ_ONCE(x->curlft.use_time))
+		WRITE_ONCE(x->curlft.use_time, ktime_get_real_seconds());
 	sp->len = 1;
 
 #ifdef DPA_IPSEC_DEBUG

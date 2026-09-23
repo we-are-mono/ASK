@@ -55,6 +55,18 @@ struct cdx_ipsec_sa {
 	 * resolved, and it never joins the legacy route hash, its reference
 	 * counting or its ageing. */
 	RouteEntry route;
+	/* The packet total cdx_ipsec_sa_stats() reports, and SEC's own count
+	 * as that function last read it. SEC keeps the count in 32 bits and
+	 * lets it wrap, so the total grows by the difference between readings
+	 * rather than being read. */
+	u64 packets;
+	u32 sec_packets;
+	/* SEC's byte count as last believed, which is 64 bits wide and
+	 * reported as it stands, and a forward jump too large to believe on
+	 * its own, waiting for the next reading to confirm it. See
+	 * cdx_ipsec_sa_bytes_believable(). */
+	u64 bytes;
+	u64 unconfirmed_bytes;
 	u16 handle;
 	/* A classifier entry this SA could not prove it had removed. The
 	 * delete path frees its software bookkeeping on every arm, including
@@ -280,6 +292,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		rc = -ENOSPC;
 		goto err_free_owner;
 	}
+	sa->flags |= SA_XFRM_OWNED;
 
 	rc = cdx_ipsec_set_keys(sa, spec);
 	if (rc)
@@ -335,11 +348,6 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 		owner->route.nbref = 1;
 		sa->pRtEntry = &owner->route;
 	}
-
-	sa->lft_conf.soft_byte_limit = spec->lft.soft_bytes;
-	sa->lft_conf.hard_byte_limit = spec->lft.hard_bytes;
-	sa->lft_conf.soft_packet_limit = spec->lft.soft_packets;
-	sa->lft_conf.hard_packet_limit = spec->lft.hard_packets;
 
 	/* Borrowed, deliberately without a reference.
 	 *
@@ -490,16 +498,105 @@ u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_handle, ASK_CDX_FLOWTABLE);
 
-void cdx_ipsec_sa_stats(const struct cdx_ipsec_sa *sa,
+/* How many times to read SEC's counters again before giving up on a clean
+ * reading of them. */
+#define CDX_IPSEC_SAMPLE_TRIES 8
+
+/* How far SEC's byte count may move between two readings and be believed
+ * without a second look. A torn 64-bit count is out by a whole 2^32, and no
+ * SA moves that much in one accounting period: at 10 Gbit/s it takes 3.4 s. */
+#define CDX_IPSEC_BYTES_STEP_MAX (1ULL << 32)
+
+/* Read SEC's per-SA counters without tearing them.
+ *
+ * SEC stores them back into the shared descriptor after every frame, and
+ * nothing orders that store against this read. The byte count is 64 bits
+ * wide and, behind an IPv4 outer header, only 4-byte aligned in the
+ * descriptor, so a read that overlaps a store can take one half old and the
+ * other new -- near a 2^32 boundary a count four gigabytes out, which
+ * against a byte limit is a hard expiry nobody asked for. Two consecutive
+ * readings that agree rule most of that out, but not all of it: the store
+ * covers the PDB and the counters together, across cache lines, and two
+ * reads can fall between the same two line updates. So the byte count is
+ * checked for plausibility as well, below. An SA busy enough to keep the
+ * readings from agreeing every time costs one skipped reading.
+ */
+static bool cdx_ipsec_sa_sample(PSAEntry entry, u32 *packets, u64 *bytes)
+{
+	unsigned int tries;
+	u32 again_packets;
+	u64 again_bytes;
+
+	get_stats_from_sa(entry, packets, bytes, NULL);
+	for (tries = 0; tries < CDX_IPSEC_SAMPLE_TRIES; tries++) {
+		get_stats_from_sa(entry, &again_packets, &again_bytes, NULL);
+		if (again_packets == *packets && again_bytes == *bytes)
+			return true;
+		*packets = again_packets;
+		*bytes = again_bytes;
+	}
+	return false;
+}
+
+/* Whether a clean reading of SEC's byte count can be believed.
+ *
+ * SEC's count only ever moves forward, so a reading that went back is torn.
+ * One that rose by CDX_IPSEC_BYTES_STEP_MAX or more is torn too -- or the
+ * pass was held off for seconds while the SA ran near line rate. The two are
+ * told apart by the next reading: a stalled count carries on from where the
+ * jump landed, within one step of it, which a torn value does not do for two
+ * readings a period apart. So such a jump is held back once, and believed
+ * when the reading after it confirms it; accounting never wedges on a count
+ * that really did move that far.
+ */
+static bool cdx_ipsec_sa_bytes_believable(struct cdx_ipsec_sa *sa, u64 bytes)
+{
+	u64 pending = sa->unconfirmed_bytes;
+
+	sa->unconfirmed_bytes = 0;
+	if (bytes < sa->bytes)
+		return false;
+	if (bytes - sa->bytes < CDX_IPSEC_BYTES_STEP_MAX)
+		return true;
+	if (pending && bytes >= pending &&
+	    bytes - pending < CDX_IPSEC_BYTES_STEP_MAX)
+		return true;
+	sa->unconfirmed_bytes = bytes;
+	return false;
+}
+
+void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 			struct cdx_ipsec_counters *counters)
 {
+	u32 packets;
+	u64 bytes;
+
 	cdx_ft_assert_held();
-	counters->packets = 0;
-	counters->bytes = 0;
+	memset(counters, 0, sizeof(*counters));
 	if (!sa || !sa->entry)
 		return;
-	counters->packets = sa->entry->stats.total_pkts_processed;
-	counters->bytes = sa->entry->stats.total_bytes_processed;
+	/* The extended encapsulation descriptor, which an outbound SA gets only
+	 * when its features overflow the normal one, keeps no counters: its
+	 * builder never enables them and leaves stats_offset at zero, where a
+	 * read would take the PDB's options word for a packet count. Such an
+	 * SA reports none, and xfrm judges its time limits alone. Its sequence
+	 * number reads as installed, because that builder does not store the
+	 * PDB back either; a stale number only ever errs low. */
+	if (!sa->entry->stats_offset)
+		goto sequence;
+	if (cdx_ipsec_sa_sample(sa->entry, &packets, &bytes) &&
+	    cdx_ipsec_sa_bytes_believable(sa, bytes)) {
+		/* Unsigned 32-bit difference, so a count that wrapped since
+		 * the last reading still adds what it carried. */
+		sa->packets += (u32)(packets - sa->sec_packets);
+		sa->sec_packets = packets;
+		sa->bytes = bytes;
+	}
+	counters->packets = sa->packets;
+	counters->bytes = sa->bytes;
+sequence:
+	if (sa->entry->direction == CDX_DPA_IPSEC_OUTBOUND)
+		counters->oseq = get_oseq_from_sa(sa->entry);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ipsec_sa_stats, ASK_CDX_FLOWTABLE);
 

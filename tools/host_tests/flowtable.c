@@ -835,7 +835,7 @@ static void dev_put(struct net_device *d) { assert(d->refs > 0); d->refs--; }
  * them. What must still hold is that the lifecycle calls them at all, so the
  * counters below let a case say so. */
 static unsigned ipsec_attached, ipsec_detached, ipsec_detached_all;
-static int ft_ipsec_retire, ft_ipsec_follow;
+static int ft_ipsec_retire, ft_ipsec_follow, ft_ipsec_stats;
 static void ft_ipsec_attach(struct net_device *d) { ipsec_attached++; }
 static void ft_ipsec_detach(struct net_device *d) { ipsec_detached++; }
 static void ft_ipsec_detach_all(void) { ipsec_detached_all++; }
@@ -1136,20 +1136,22 @@ static void unregister_switchdev_blocking_notifier(struct notifier_block *nb)
 { assert(swdev_obj_registered); swdev_obj_registered=false; }
 static void cancel_work_sync(int *work)
 { assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work); canceled++; }
-static void cancel_delayed_work_sync(int *work) { assert(work == &ft_work); canceled++; }
+static void cancel_delayed_work_sync(int *work)
+{ assert(work == &ft_work || work == &ft_ipsec_stats); canceled++; }
 static int register_indirect(void)
 { assert(ft_ready); if (registration_fails()) return -ENOMEM; indirect_registered=true; return 0; }
 static void unregister_indirect(void)
 {
     assert(indirect_registered && !cdx_info->ctrl.mutex);
-    /* Unload gives this route back last, with all three works cancelled --
-     * retirement, the delayed installer and the SA next-hop follower -- and
-     * every notifier already gone. A load unwinding its own failure gives it
-     * back first and in the opposite order, with nothing yet scheduled to
-     * cancel, so the ordering below is the exit path's alone. ft_stopping
-     * tells them apart, and only exit sets it. */
+    /* Unload gives this route back last, with all four works cancelled --
+     * retirement, the delayed installer, the SA next-hop follower and the
+     * SA accounting pass -- and every notifier already gone. A load
+     * unwinding its own failure gives it back first and in the opposite
+     * order, with nothing yet scheduled to cancel, so the ordering below is
+     * the exit path's alone. ft_stopping tells them apart, and only exit
+     * sets it. */
     if (ft_stopping) {
-        assert(canceled == 3);
+        assert(canceled == 4);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered);
         assert(!fdb_registered && !swdev_obj_registered);
     } else {
@@ -1176,7 +1178,7 @@ static unsigned unload_sleeps, unload_failures;
 static void msleep(unsigned ms)
 {
     assert(ms == 1000 && backend_claimed && !cdx_info->ctrl.mutex && !rtnl);
-    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 3);
+    assert(!indirect_registered && !ft_count && !ft_bound && canceled == 4);
     assert(unload_failures);
     unload_sleeps++;
     if (!--unload_failures) { retry_error=0; quiesce_fail=false; }

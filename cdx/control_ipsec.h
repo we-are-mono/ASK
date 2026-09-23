@@ -293,8 +293,13 @@ typedef struct _tSAID {
 #define SA_ALLOW_SEQ_ROLL 0x20
 #define SA_ALLOW_EXT_SEQ_NUM 0x40
 /* flag to indicate in SA whether the shared descriptor already built or not */
-#define SA_SH_DESC_BUILT	0x80 
+#define SA_SH_DESC_BUILT	0x80
 #define SA_DELETE		0x100
+/* Installed by cdx_ipsec_backend.c for xfrm packet offload rather than over
+ * FCI. xfrm enforces such an SA's lifetimes itself, from the counters the
+ * flowtable adapter publishes into the state, so the FCI SA timer leaves it
+ * alone. */
+#define SA_XFRM_OWNED		0x200
 #define SA_FQ_WAIT_B4_FREE	0x400 /* reserve 3 bits starting from 0x400 */
 
 #define SA_HDR_COPY_TOS  1

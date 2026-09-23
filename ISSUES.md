@@ -307,6 +307,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A209.** Offloaded IPsec SAs never accounted into xfrm's lifetimes, so byte and packet expiry never fired —
+  fixed (_:/^cdx: account offloaded IPsec SAs into xfrm lifetimes_).
+
 - [x] **A208.** Under `devices auto` any port's link change replaced the daemon's table, draining every offloaded flow —
   fixed (_:/^flowtable: follow auto device membership without replacing the table_).
 

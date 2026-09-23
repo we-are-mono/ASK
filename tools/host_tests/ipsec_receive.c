@@ -58,10 +58,9 @@ struct dpa_percpu_priv_s { unsigned rx_sg; struct dpa_napi_portal np[1]; };
 struct dpa_priv_s { struct dpa_percpu_priv_s *percpu_priv; int *percpu_count; };
 struct net_device { unsigned features; const char *name; };
 struct dpa_bp { unsigned count; void *dev; unsigned size; };
-struct xfrm_state { struct { unsigned long use_time; } curlft; };
+struct xfrm_state { struct { long long use_time; } curlft; };
 struct sec_path { int len, olen, verified_cnt; struct xfrm_state *xvec[6]; unsigned ovec[24]; };
 struct sk_buff { struct net_device *dev; unsigned protocol, mac_len; struct sec_path path; bool has_path; unsigned char *data; };
-struct timespec64 { unsigned long tv_sec; };
 static unsigned refs, fd_releases, skb_frees, delivered, converted, sg_buffers, added, concurrent, unmapped;
 static unsigned char *received_data;
 static unsigned int reaped;
@@ -128,7 +127,7 @@ static void skb_pull(struct sk_buff *skb, int n) { (void)skb; (void)n; }
 static void skb_reset_network_header(struct sk_buff *skb) { (void)skb; }
 static unsigned eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 { unsigned short type; (void)dev; memcpy(&type, skb->data + 12, 2); return type; }
-static void ktime_get_real_ts64(struct timespec64 *t) { t->tv_sec = 1; }
+static long long ktime_get_real_seconds(void) { return 1; }
 static const struct qman_portal_config *qman_p_get_portal_config(struct qman_portal *q)
 { static struct qman_portal_config pc; (void)q; return &pc; }
 static void dev_kfree_skb(struct sk_buff *skb)

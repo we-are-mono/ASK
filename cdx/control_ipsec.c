@@ -1247,6 +1247,11 @@ static int M_ipsec_sa_timer(struct timer_entry_t *timer_node)
 
 		slist_for_each(pEntry, entry, &sa_cache_by_h[i], list_h)
 		{
+			/* xfrm judges this SA's lifetimes, and the notice below
+			 * goes over FCI to a daemon that is not there when xfrm
+			 * owns the SA: it would fail and be retried every tick. */
+			if (pEntry->flags & SA_XFRM_OWNED)
+				continue;
 			if ((pEntry->ct) &&
 					(pEntry->lft_conf.hard_byte_limit ||
 					 pEntry->lft_conf.hard_packet_limit ||

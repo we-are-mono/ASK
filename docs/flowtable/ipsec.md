@@ -261,8 +261,10 @@ without reservation: A24a fixed the shared-descriptor sharing policy that made
 it unsafe (DNCPE-2358, `43f29a0`) and GCM now outperforms CBC+HMAC on TCP.
 NAT-T is carried through `x->encap->encap_sport/dport`. TFC padding is refused
 by `xfrm_dev_state_add()` before the driver sees it. ESN is admitted; the
-state is programmed with the ESN flag and `xdo_dev_state_advance_esn` is where
-the sequence-number window is kept, not in an ASK-private notifier.
+state is programmed with the ESN flag and SEC keeps the whole 64-bit sequence
+number in its PDB, advancing the high word itself. There is no
+`xdo_dev_state_advance_esn`: `xfrm_dev_state_add()` requires it only of crypto
+offload, where the stack builds the ESP header.
 
 **The device.** The state's `xso.dev` must be a registered physical CDX port.
 A state bound to any other device is refused rather than accepted and ignored,
@@ -429,10 +431,11 @@ with FCI. Only the door is new.
 
 ### 3. `xfrmdev_ops` on the DPAA netdev
 
-`xdo_dev_state_add` / `_delete` / `_free` / `_offload_ok` /
-`_state_advance_esn` / `_state_update_stats`, registered by the adapter on the
+`xdo_dev_state_add` / `_delete` / `_free` / `_offload_ok` and
+`xdo_dev_policy_add` / `_delete` / `_free`, registered by the adapter on the
 bound physical ports rather than by the SDK driver, so CDX keeps no flowtable
-dependency. `xdo_dev_state_add` maps the `xfrm_state` straight onto the
+dependency. There is no `_state_advance_esn` and no `_state_update_stats`; the
+accounting subsection below says why. `xdo_dev_state_add` maps the `xfrm_state` straight onto the
 backend call; the field mapping is exactly what `ipsec_xfrm2nlkey()` already
 computes, minus the serialisation:
 
@@ -444,7 +447,7 @@ computes, minus the serialisation:
 | AEAD key and ICV | `x->aead->alg_key`/`alg_key_len`/`alg_icv_len`, `alg_name` for the GCM/CCM/GMAC split |
 | Outer header | `x->props.mode == XFRM_MODE_TUNNEL`, built from `props.saddr`/`id.daddr` |
 | NAT-T ports | `x->encap->encap_sport`/`encap_dport` |
-| Lifetimes | `x->lft.hard_*`/`soft_*`, `x->curlft.*` |
+| Lifetimes | not passed: xfrm judges `x->lft` against the `x->curlft` the accounting pass publishes |
 | ESN | `x->props.flags & XFRM_STATE_ESN` |
 | Hardware cookie | written back to `x->xso.offload_handle` |
 
@@ -544,6 +547,73 @@ outbound SA needs egress framing, and this mode keeps no route table); and
 `unable to create shared desc` (the SEC buffer pool, skipped by the second
 ownership gate). None was visible from reading; each surfaced several layers
 from its cause.
+
+#### Counters and lifetimes
+
+xfrm expires an SA on bytes or packets only in `xfrm_state_check_expire()`,
+which compares `x->curlft` against `x->lft` and which the stack calls per
+packet from `xfrm_output_one()` and `xfrm_input()`. Packet offload reaches
+neither: an outbound frame skips `xfrm_output_one()` entirely, and an inbound
+one comes back from SEC already decrypted and stamps only `use_time`. So
+`curlft` stayed at zero, `ip -s xfrm state` showed an idle SA, and a byte or
+packet limit never fired. The legacy SA timer still walked these SAs, but it
+compared their limits against the classifier's counters and sent its expiry
+notice over FCI, to a daemon that is not there in this mode; the send failed
+and was retried every 30 seconds.
+
+The adapter now runs an accounting pass once a second while it owns an SA.
+Inside the control transaction, which keeps each SA installed while it is
+read, the pass reads SEC's per-SA counters from the shared descriptor. SEC
+keeps the packet count in 32 bits and lets it wrap, so the backend builds a
+64-bit total from successive readings. A read that races SEC's store can tear
+the 64-bit byte count, which is not always 8-byte aligned in the descriptor.
+The backend rereads until two readings agree. That is not enough on its own,
+because the store spans cache lines and two reads can land between the same
+two line updates. So it also refuses a byte count that went down, or rose by
+2^32 or more since the last one it believed: a torn value is out by a whole
+2^32. A jump that large is believed once the next reading confirms it, so a
+pass held off for seconds at line rate does not wedge the count. Under
+`x->lock`, and only for a `VALID` state, the pass adds to `curlft` whatever
+the totals moved forward since its last publication, and calls
+`xfrm_state_check_expire()`. Soft and hard expiry are then xfrm's own, down to
+`km_state_expired()` and the state timer. The legacy timer skips SAs marked
+`SA_XFRM_OWNED`, and the spec no longer carries lifetimes.
+
+A hard expiry does not stop SEC at once. The state timer deletes the state,
+and the SA's classifier entries keep forwarding until the retirement that
+follows removes them. An SA can therefore run past its hard limit by up to
+one accounting period, plus the retirement's latency.
+
+An outbound SA on the extended encapsulation descriptor, which it gets only
+when its features overflow the normal one, keeps no counters at all: that
+builder never enables them. Such an SA reports none, and only its time limits
+apply.
+
+There is no `xdo_dev_state_update_stats()`. Most of its callers hold `x->lock`
+or `xfrm_state_lock`: the state timer, `xfrm_state_check_expire()`, and state
+dumps. So it cannot sleep for the control mutex, under which the backend
+builds its 64-bit packet total; a second reader outside the mutex would race
+the pass. `XFRM_MSG_GETSA` reaches it holding only `xfrm_cfg_mutex`, and there
+nothing keeps the SA from being retired underneath it. What the op could
+publish, `curlft` already holds, at most a second old. mlx5 is no fresher: its
+flow counters are cached on a one-second period (`MLX5_FC_STATS_PERIOD`), and
+a one-second work judges its software limits (`mlx5e_ipsec_handle_sw_limits()`).
+
+The pass also raises a soft expiry for a non-ESN outbound SA within 2^28 of the
+end of its sequence space. SEC does not wrap the sequence number: past the
+last one every frame fails in SEC. At 1.4 Mpps the space lasts 51 minutes,
+less than strongSwan's default hour between rekeys. The legacy owner reported
+the approach to CMM; here it is the same soft expiry a lifetime raises, once
+per state. 2^28 is over three minutes at that rate, enough for an IKE
+exchange and its retransmissions.
+
+The pass takes a reference on each state while `ft_ipsec_retired_lock` shows
+the state's entry still owned: xfrm drops the reference that keeps a state
+alive only after `xdo_dev_state_delete()` returns, and that callback takes the
+entry off the owned list first. The pass takes `x->lock` only after it drops
+that lock, because deletion takes the two in the other order. Module exit
+cancels the pass after draining retirements; by then no SA is owned, since
+every offloaded state pins the module through its ops.
 
 ### 4. The slow path
 
@@ -1148,9 +1218,9 @@ simplification rather than a translation:
 events drive the rest, which is exactly the new shape — but its *oracle* is the
 FCI SA-statistics cursor, walking `0x0A0A`/`0x0A0B` for the SPI's packet and
 byte counts. So the install half transfers and the verification half does not.
-The replacement is upstream and better: `xdo_dev_state_update_stats()` puts
-hardware counters where `ip -s xfrm state` already reads them, so the standard
-tool becomes the oracle and the test stops needing a private cursor at all.
+The replacement is the standard tool: the adapter's accounting pass publishes
+SEC's counters into `x->curlft`, where `ip -s xfrm state` already reads them,
+so that becomes the oracle and the test stops needing a private cursor at all.
 
 **And the decision logic is compiled off the hardware.**
 `tools/host_tests/ipsec_adapter.c` builds `ft_ipsec_resolve()`,

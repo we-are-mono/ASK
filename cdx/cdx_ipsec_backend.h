@@ -43,17 +43,6 @@ struct cdx_ipsec_key {
 	u8 key[CDX_IPSEC_KEY_MAX];
 };
 
-/* Lifetimes, in the units xfrm keeps them. Zero is unlimited, matching
- * XFRM_INF at the caller. The hardware does not enforce these: the SA timer
- * compares them against the counters SEC reports and raises the soft and hard
- * expiries, exactly as it does for the legacy owner. */
-struct cdx_ipsec_lifetime {
-	u64 soft_bytes;
-	u64 hard_bytes;
-	u64 soft_packets;
-	u64 hard_packets;
-};
-
 /* Everything an SA needs, in one value.
  *
  * The legacy control plane spells this as five FCI commands in sequence --
@@ -70,6 +59,10 @@ struct cdx_ipsec_lifetime {
  * the backend's, and a caller assembling them would be writing hardware
  * knowledge into the adapter. Addresses and ports are in network byte order;
  * `family` selects the arm of each address and the unused bytes are zero.
+ *
+ * Lifetimes are not part of it. The hardware enforces none, and nothing in
+ * this backend compares them either: the caller reads the counters back with
+ * cdx_ipsec_sa_stats() and leaves the limits to xfrm, which holds them.
  */
 struct cdx_ipsec_sa_spec {
 	/* The port this SA is bound to. Packet offload binds a state to one
@@ -82,7 +75,6 @@ struct cdx_ipsec_sa_spec {
 	__be32 spi;
 	struct cdx_ipsec_key auth;
 	struct cdx_ipsec_key crypt;
-	struct cdx_ipsec_lifetime lft;
 	/* Non-zero on both when the SA is encapsulated in UDP. The pair is
 	 * what makes it NAT-T, and the classifier keys such an SA on the full
 	 * 5-tuple instead of on the SPI alone. */
@@ -125,12 +117,18 @@ struct cdx_ipsec_sa_spec {
 	bool copy_df;
 };
 
-/* What SEC counted for this SA. Packets and bytes are the classifier's own
- * totals and move only forward; the caller turns them into whatever units its
- * own accounting keeps. */
+/* What SEC counted for this SA, since it was installed. Packets and bytes are
+ * SEC's own per-SA totals, kept in the shared descriptor, and move only
+ * forward; the caller turns them into whatever units its own accounting keeps.
+ */
 struct cdx_ipsec_counters {
 	u64 packets;
 	u64 bytes;
+	/* The last sequence number an outbound SA put on the wire, in the
+	 * units xfrm's own oseq counts: the ESN high word included when the SA
+	 * has one, the low 32 bits alone when it does not. The number the SA
+	 * was installed with until the first frame; zero for an inbound SA. */
+	u64 oseq;
 };
 
 /* SA operations run inside the flowtable backend's transaction, taken with
@@ -232,11 +230,16 @@ int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac);
  */
 u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa);
 
-/* Reads the SEC context's own counters. Zeroes them if the SA has not yet
- * carried a frame, which is not distinguishable from a genuinely idle SA and
- * does not need to be.
+/* Reads the SEC context's own counters.
+ *
+ * SEC keeps the packet count in 32 bits and lets it wrap, so the total is
+ * built here from successive readings, and that is why this takes the SA
+ * mutably: a caller must read at least once per 2^32 packets the SA carries,
+ * which at any rate SEC sustains is more than half an hour. A reading that
+ * cannot be taken cleanly while SEC is writing is skipped, and the totals of
+ * the previous one are reported again.
  */
-void cdx_ipsec_sa_stats(const struct cdx_ipsec_sa *sa,
+void cdx_ipsec_sa_stats(struct cdx_ipsec_sa *sa,
 			struct cdx_ipsec_counters *counters);
 
 #endif
