@@ -891,6 +891,24 @@ int qman_set_sdest(u16 channel, unsigned int cpu_idx)
 	return 0;
 }
 
+/* The ICID a software portal gives the frames enqueued through it: the FICID
+ * field of its QCSP_IO_CFG, which the boot firmware sets and nothing here
+ * changes. */
+#define IO_CFG_FICID_MASK 0x00000fff
+int qman_portal_ficid(u16 channel)
+{
+	int idx = channel - QM_CHANNEL_SWPORTAL0;
+
+	if (!qman_have_ccsr())
+		return -ENODEV;
+	if (idx < 0 || idx >= qman_portal_max)
+		return -EINVAL;
+	if ((qman_ip_rev & 0xFF00) >= QMAN_REV30)
+		return qm_in(REV3_QCSP_IO_CFG(idx)) & IO_CFG_FICID_MASK;
+	return qm_in(QCSP_IO_CFG(idx)) & IO_CFG_FICID_MASK;
+}
+EXPORT_SYMBOL(qman_portal_ficid);
+
 #define MISC_CFG_WPM_MASK 0x00000002
 int qm_set_wpm(int wpm)
 {

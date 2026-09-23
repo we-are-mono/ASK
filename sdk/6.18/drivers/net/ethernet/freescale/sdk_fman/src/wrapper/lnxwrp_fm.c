@@ -357,16 +357,29 @@ typedef _Packed struct {
     static const uint8_t     phys10GTxPortId[] = {0x30,0x31};
 
     p_Plr = (t_Plr *)UINT_TO_PTR(p_LnxWrpFmDev->fmBaseAddr+FM_DMA_PLR_OFFSET);
+    p_Ppids = (t_Ppids *)UINT_TO_PTR(p_LnxWrpFmDev->fmBaseAddr+FM_BMI_PPIDS_OFFSET);
 #ifdef MODULE
     for (i=0;i<FM_MAX_NUM_OF_PARTITIONS/2;i++)
         p_Plr->plr[i] = 0;
 #endif /* MODULE */
 
+    /* Both tables are big-endian FMan registers, read here before FM_Init()
+     * resets the FMan; the port drivers program the values back. FMBM_PPID
+     * holds the ICID the boot firmware assigned each port, which the port
+     * stamps into every frame descriptor it enqueues. Firmware gives the
+     * FMan ports and the QMan software portals the same ICID, and SEC relies
+     * on that: it shares a descriptor, and the ESP sequence number stored in
+     * it, only between jobs whose frames carry the same ICID. A native load
+     * on a little-endian core lost the value, left every port at ICID 0, and
+     * let CPU- and FMan-fed jobs of one IPsec SA reuse sequence numbers. */
     for (i=0; i<FM_MAX_NUM_OF_PARTITIONS; i++)
     {
+        uint32_t plr = GET_UINT32(p_Plr->plr[i/2]);
         uint16_t liodnBase = (uint16_t)((i%2) ?
-                       (p_Plr->plr[i/2] & DMA_LOW_LIODN_MASK) :
-                       ((p_Plr->plr[i/2] & DMA_HIGH_LIODN_MASK) >> DMA_LIODN_SHIFT));
+                       (plr & DMA_LOW_LIODN_MASK) :
+                       ((plr & DMA_HIGH_LIODN_MASK) >> DMA_LIODN_SHIFT));
+        uint16_t liodnOffset = i ?
+                       (uint16_t)(GET_UINT32(p_Ppids->fmbm_ppid[i-1]) & FM_LIODN_OFFSET_MASK) : 0;
 #ifdef FM_PARTITION_ARRAY
         /* TODO: this was .liodnPerPartition[i] = liodnBase; is the index meaning the same? */
         p_LnxWrpFmDev->fmDevSettings.param.liodnBasePerPort[i] = liodnBase;
@@ -380,6 +393,7 @@ typedef _Packed struct {
                     break;
             ASSERT_COND(j<ARRAY_SIZE(phys1GRxPortId));
             p_LnxWrpFmDev->rxPorts[j].settings.param.liodnBase = liodnBase;
+            p_LnxWrpFmDev->rxPorts[j].settings.param.specificParams.rxParams.liodnOffset = liodnOffset;
         }
         else if (FM_MAX_NUM_OF_10G_RX_PORTS &&
                  (i >= phys10GRxPortId[0]) &&
@@ -390,6 +404,8 @@ typedef _Packed struct {
                     break;
             ASSERT_COND(j<ARRAY_SIZE(phys10GRxPortId));
             p_LnxWrpFmDev->rxPorts[FM_MAX_NUM_OF_1G_RX_PORTS+j].settings.param.liodnBase = liodnBase;
+            p_LnxWrpFmDev->rxPorts[FM_MAX_NUM_OF_1G_RX_PORTS+j].settings.param.specificParams.rxParams.liodnOffset =
+                    liodnOffset;
         }
         else if ((i >= physOhPortId[0]) &&
                  (i <= physOhPortId[FM_MAX_NUM_OF_OH_PORTS-1]))
@@ -399,9 +415,16 @@ typedef _Packed struct {
                     break;
             ASSERT_COND(j<ARRAY_SIZE(physOhPortId));
             if (j == 0)
+            {
                 p_LnxWrpFmDev->hcPort.settings.param.liodnBase = liodnBase;
+                p_LnxWrpFmDev->hcPort.settings.param.specificParams.nonRxParams.liodnOffset = liodnOffset;
+            }
             else
+            {
                 p_LnxWrpFmDev->opPorts[j - 1].settings.param.liodnBase = liodnBase;
+                p_LnxWrpFmDev->opPorts[j - 1].settings.param.specificParams.nonRxParams.liodnOffset =
+                        liodnOffset;
+            }
         }
         else if ((i >= phys1GTxPortId[0]) &&
                   (i <= phys1GTxPortId[FM_MAX_NUM_OF_1G_TX_PORTS-1]))
@@ -411,6 +434,7 @@ typedef _Packed struct {
                     break;
             ASSERT_COND(j<ARRAY_SIZE(phys1GTxPortId));
             p_LnxWrpFmDev->txPorts[j].settings.param.liodnBase = liodnBase;
+            p_LnxWrpFmDev->txPorts[j].settings.param.specificParams.nonRxParams.liodnOffset = liodnOffset;
         }
         else if (FM_MAX_NUM_OF_10G_TX_PORTS &&
                  (i >= phys10GTxPortId[0]) &&
@@ -421,18 +445,10 @@ typedef _Packed struct {
                     break;
             ASSERT_COND(j<ARRAY_SIZE(phys10GTxPortId));
             p_LnxWrpFmDev->txPorts[FM_MAX_NUM_OF_1G_TX_PORTS+j].settings.param.liodnBase = liodnBase;
+            p_LnxWrpFmDev->txPorts[FM_MAX_NUM_OF_1G_TX_PORTS+j].settings.param.specificParams.nonRxParams.liodnOffset =
+                    liodnOffset;
         }
     }
-
-    p_Ppids = (t_Ppids *)UINT_TO_PTR(p_LnxWrpFmDev->fmBaseAddr+FM_BMI_PPIDS_OFFSET);
-
-    for (i=0; i<FM_MAX_NUM_OF_1G_RX_PORTS; i++)
-        p_LnxWrpFmDev->rxPorts[i].settings.param.specificParams.rxParams.liodnOffset =
-                p_Ppids->fmbm_ppid[phys1GRxPortId[i]-1];
-
-    for (i=0; i<FM_MAX_NUM_OF_10G_RX_PORTS; i++)
-            p_LnxWrpFmDev->rxPorts[FM_MAX_NUM_OF_1G_RX_PORTS+i].settings.param.specificParams.rxParams.liodnOffset =
-                p_Ppids->fmbm_ppid[phys10GRxPortId[i]-1];
 
     return E_OK;
 }
@@ -1312,6 +1328,25 @@ int fm_port_get_hwid(const struct fm_port *port)
 
 }
 EXPORT_SYMBOL(fm_port_get_hwid);
+
+/* The ICID the port stamps into the frames it enqueues: its FMBM_SPLIODN, as
+ * the FMan holds it now rather than as the port was configured. */
+int fm_port_get_icid(const struct fm_port *port)
+{
+	const t_LnxWrpFmPortDev *p_LnxWrpFmPortDev = (const t_LnxWrpFmPortDev *)port;
+	const t_LnxWrpFmDev *p_LnxWrpFmDev = p_LnxWrpFmPortDev->h_LnxWrpFmDev;
+	volatile uint32_t *p_Spliodn;
+	uint8_t hwid;
+
+	if (!p_LnxWrpFmDev || !p_LnxWrpFmPortDev->h_Dev)
+		return -ENODEV;
+	hwid = FmPortGetHardwarePortId(p_LnxWrpFmPortDev->h_Dev);
+	if (hwid < 1 || hwid > 63)
+		return -EINVAL;
+	p_Spliodn = UINT_TO_PTR(p_LnxWrpFmDev->fmBaseAddr + FM_BMI_PPIDS_OFFSET);
+	return GET_UINT32(p_Spliodn[hwid - 1]) & FM_LIODN_OFFSET_MASK;
+}
+EXPORT_SYMBOL(fm_port_get_icid);
 
 
 u64 *fm_port_get_buffer_time_stamp(const struct fm_port *port,

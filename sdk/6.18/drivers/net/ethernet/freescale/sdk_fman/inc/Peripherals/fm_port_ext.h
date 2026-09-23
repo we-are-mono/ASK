@@ -234,6 +234,7 @@ typedef struct t_FmPortNonRxParams {
                                                      frames. For OP port - default Rx queue. */
     uint32_t                qmChannel;          /**< QM-channel dedicated to this port; will be used
                                                      by the FM for dequeue. */
+    uint16_t                liodnOffset;        /**< Port's LIODN offset. */
 } t_FmPortNonRxParams;
 
 /**************************************************************************//**

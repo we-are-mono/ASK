@@ -173,6 +173,7 @@ int fm_get_fw_rev(struct fm *fm, u16 *package, u8 *major, u8 *minor);
 struct fm_port *fm_port_bind(struct device *fm_port_dev);
 
 int fm_port_get_hwid(const struct fm_port *port);
+int fm_port_get_icid(const struct fm_port *port);
 
 /**************************************************************************//**
  @Function	fm_port_unbind

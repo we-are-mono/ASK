@@ -2125,6 +2125,15 @@ const cpumask_t *qman_affine_cpus(void);
 u16 qman_affine_channel(unsigned int cpu);
 
 /**
+ * qman_portal_ficid - return the ICID a software portal enqueues frames with
+ * @channel: the portal's channel ID, as qman_affine_channel() returns it
+ *
+ * Returns: the ICID, or a negative errno without CCSR access or for a channel
+ * that is no software portal.
+ */
+int qman_portal_ficid(u16 channel);
+
+/**
  * qman_get_affine_portal - return the portal pointer affine to cpu
  * @cpu: the cpu whose affine portal is the subject of the query
  *

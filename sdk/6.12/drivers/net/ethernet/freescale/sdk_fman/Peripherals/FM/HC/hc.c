@@ -437,6 +437,7 @@ t_Handle FmHcConfigAndInit(t_FmHcParams *p_FmHcParams)
     fmPortParam.specificParams.nonRxParams.errFqid      = p_FmHcParams->params.errFqid;
     fmPortParam.specificParams.nonRxParams.dfltFqid     = p_FmHcParams->params.confFqid;
     fmPortParam.specificParams.nonRxParams.qmChannel    = p_FmHcParams->params.qmChannel;
+    fmPortParam.specificParams.nonRxParams.liodnOffset  = p_FmHcParams->params.liodnOffset;
 
     p_FmHc->h_HcPortDev = FM_PORT_Config(&fmPortParam);
     if (!p_FmHc->h_HcPortDev)

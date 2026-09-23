@@ -216,6 +216,7 @@ typedef struct t_FmPcdHcParams {
                                                          portId=0 MUST be used. */
     uint16_t                    liodnBase;          /**< LIODN base for this port, to be used together with LIODN offset
                                                          (irrelevant for P4080 revision 1.0) */
+    uint16_t                    liodnOffset;        /**< LIODN offset for this port. */
     uint32_t                    errFqid;            /**< Host-Command Port error queue Id. */
     uint32_t                    confFqid;           /**< Host-Command Port confirmation queue Id. */
     uint32_t                    qmChannel;          /**< QM channel dedicated to this Host-Command port;

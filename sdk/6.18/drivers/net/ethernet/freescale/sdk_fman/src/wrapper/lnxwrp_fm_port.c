@@ -1113,6 +1113,8 @@ static t_Error InitFmPcdDev(t_LnxWrpFmDev *p_LnxWrpFmDev)
 			p_LnxWrpFmPortDev->settings.param.portId;
 		fmPcdParams.hc.liodnBase =
 			p_LnxWrpFmPortDev->settings.param.liodnBase;
+		fmPcdParams.hc.liodnOffset = p_LnxWrpFmPortDev->settings.
+			param.specificParams.nonRxParams.liodnOffset;
 		fmPcdParams.hc.errFqid =
 			qman_fq_fqid(p_LnxWrpFmDev->hc_tx_err_fq);
 		fmPcdParams.hc.confFqid =

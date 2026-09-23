@@ -2618,6 +2618,8 @@ t_Handle FM_PORT_Config(t_FmPortParams *p_FmPortParams)
                                 & QMI_DEQ_CFG_SUBPORTAL_MASK);
                 p_FmPort->p_FmPortDriverParam->dfltFqid =
                         p_FmPortParams->specificParams.nonRxParams.dfltFqid;
+                p_FmPort->p_FmPortDriverParam->liodnOffset =
+                        p_FmPortParams->specificParams.nonRxParams.liodnOffset;
                 break;
             default:
                 XX_Free(p_FmPort->p_FmPortDriverParam);
