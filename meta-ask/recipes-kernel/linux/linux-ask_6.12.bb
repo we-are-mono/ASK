@@ -18,7 +18,6 @@ SRC_URI += "\
            file://080-wext-core-restore-ndo_do_ioctl.patch \
            file://093-netlink-name-every-cb-mutex-class.patch \
            file://094-qbman-kasan-sanitize-off.patch \
-           file://107-sdk_dpaa-offload-hooks-under-rcu.patch \
            file://108-xfrm-validate-xmit-einprogress.patch \
            file://109-sdk_dpaa-rx-max-frame-follows-mtu.patch \
            file://110-sdk-mainline-build-compat.patch \

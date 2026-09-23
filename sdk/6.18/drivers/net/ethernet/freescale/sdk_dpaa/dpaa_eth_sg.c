@@ -82,7 +82,10 @@ int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_
 EXPORT_SYMBOL(dpa_register_ceetm_get_egress_fq);
 
 /* Called on cdx deinit. Waits out in-flight datapath readers so the
- * hooks' module text may be freed once this returns. */
+ * hooks' module text, and the frame queues they hand back, may be freed once
+ * this returns: every reader holds its own rcu_read_lock() across the call and
+ * the enqueue that uses the answer (cpe_fp_tx()), so this does not depend on
+ * which context the frame was transmitted from. */
 void dpa_unregister_ceetm_get_egress_fq(void)
 {
 	WRITE_ONCE(ceetm_fqget_func, NULL);
@@ -110,8 +113,10 @@ EXPORT_SYMBOL(dpa_register_ipsec_fq_handler);
 
 /* Called on cdx deinit, including the failed-init unwind. Clearing the
  * hook is what lets the next cdx load register again (the register
- * refuses to overwrite); the synchronize_rcu makes sure no softirq
- * reader is still inside the old hook once this returns. */
+ * refuses to overwrite); the synchronize_rcu makes sure no reader is still
+ * inside the old hook once this returns. Each reader holds its own
+ * rcu_read_lock() across the call and the enqueue that uses the answer, so
+ * that holds whatever context submitted the frame. */
 void dpa_unregister_ipsec_fq_handler(void)
 {
 	WRITE_ONCE(cdx_get_ipsec_fq_hookfn, NULL);
@@ -1607,11 +1612,7 @@ static bool dpa_ipsec_dpovrd(const struct xfrm_state *x, const u8 *nh,
 	return dpa_ipsec_transport_dpovrd(nh, hdr_len, at, IPPROTO_ESP, dpovrd);
 }
 
-/* Hand a frame for a packet-offloaded SA to SEC. 0 means SEC has it; anything
- * else means it was freed here instead and counted as dropped on net_dev, so
- * a caller counting what it gave SEC counts only a 0.
- */
-static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+static __hot int __dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
 {
 	struct xfrm_state *x;
 	struct qman_fq *egress_fq = NULL;
@@ -1718,6 +1719,25 @@ sec_submit_failed:
 	return err;
 }
 
+/* Hand a frame for a packet-offloaded SA to SEC. 0 means SEC has it; anything
+ * else means it was freed here instead and counted as dropped on net_dev, so
+ * a caller counting what it gave SEC counts only a 0.
+ *
+ * The IPsec hook and the SEC frame queue it answers belong to the offload
+ * module, which unregisters the hook and then waits for an RCU grace period
+ * before anything it answered with may go. Hold the read-side section here,
+ * across the lookup and the enqueue, rather than trusting the caller's
+ * context to be one. */
+static __hot int dpaa_submit_outb_pkt_to_SEC(struct sk_buff *skb, struct net_device *net_dev, struct dpa_bp *dpa_bp)
+{
+	int rc;
+
+	rcu_read_lock();
+	rc = __dpaa_submit_outb_pkt_to_SEC(skb, net_dev, dpa_bp);
+	rcu_read_unlock();
+	return rc;
+}
+
 /* Whether @dev is a port of this driver, and so has a struct dpa_priv_s as
  * its private area. The ops table is the driver's own, and dpa_ndo_init is
  * the one member of it exported, so no other driver's ops carry it: the test
@@ -1815,7 +1835,8 @@ static bool dpa_ipsec_inb_dpovrd(const struct xfrm_state *x,
  * skb is as it came, a stale IPv4 header checksum at most put right, for
  * xfrm_input() to decide what becomes of it.
  */
-int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+static int __dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb,
+					const struct xfrm_state *x)
 {
 	struct qman_fq *sec_fq = NULL;
 	struct dpa_priv_s	*priv = NULL;
@@ -1986,13 +2007,26 @@ err_giveback:
 	skb->data += tmp_len;
 	return -1; /* give packet to linux */
 }
+
+/* As dpaa_submit_outb_pkt_to_SEC(): xfrm_input() reaches this from softirq and
+ * from resumed asynchronous transforms alike, and the read-side section the
+ * hook's unregister waits for is taken here. */
+int dpaa_submit_inb_pkt_to_SEC(struct sk_buff *skb, const struct xfrm_state *x)
+{
+	int rc;
+
+	rcu_read_lock();
+	rc = __dpaa_submit_inb_pkt_to_SEC(skb, x);
+	rcu_read_unlock();
+	return rc;
+}
 #endif
 #endif
 
 #ifdef CONFIG_CPE_FAST_PATH
 #define CHANNEL_BIT_POSITION 24
 
-static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
 {
 	struct dpa_priv_s	*priv;
 	struct dpa_percpu_priv_s *percpu_priv;
@@ -2080,6 +2114,24 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
 	}
 	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
 	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
+}
+
+/* Every hook this path calls belongs to the offload module: the CEETM and IPsec
+ * frame-queue lookups, and the frame queues they answer with, which the
+ * enqueue below uses after the lookup has returned. The module unregisters its
+ * hooks and waits for an RCU grace period before tearing any of that down, so
+ * the read-side section has to cover the lookup and the enqueue both -- and it
+ * is taken here rather than assumed of the caller. ndo_start_xmit normally runs
+ * with bottom halves off, which a grace period also waits for, but not every
+ * caller of this path is the stack's own transmit. */
+static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+{
+	int rc;
+
+	rcu_read_lock();
+	rc = __cpe_fp_tx(skb, net_dev);
+	rcu_read_unlock();
+	return rc;
 }
 #endif
 
