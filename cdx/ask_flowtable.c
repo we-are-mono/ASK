@@ -6015,6 +6015,14 @@ static void ft_mc_hook_sync(bool wanted)
 		}
 	} else {
 		nf_unregister_net_hook(&init_net, &ft_mc_hook_ops);
+		/* Unregistering does not wait for the frames already inside
+		 * the hook: the entries are freed through call_rcu() and the
+		 * caller returns at once. A reader still running could write
+		 * the slot after it is cleared below, or queue the worker after
+		 * ft_mc_exit() has cancelled it. The hook runs under the RCU
+		 * read lock of the receive path, so one grace period is every
+		 * such reader gone. */
+		synchronize_net();
 		spin_lock_bh(&ft_mc_ring_lock);
 		memset(&ft_mc_last, 0, sizeof(ft_mc_last));
 		spin_unlock_bh(&ft_mc_ring_lock);
@@ -6783,8 +6791,9 @@ static void ft_mc_exit(void)
 	WRITE_ONCE(ft_mc_stopping, true);
 	mutex_unlock(&ft_mc_lock);
 	/* Before the work is cancelled, so a hook still registered cannot
-	 * re-arm what was just drained; unregistering waits for the readers
-	 * already inside it. And again afterwards, because the worker may have
+	 * re-arm what was just drained; ft_mc_hook_sync() waits out the
+	 * readers already inside it, which unregistering alone does not. And
+	 * again afterwards, because the worker may have
 	 * been part-way through registering one when the flag went up -- the
 	 * second call is what actually removes it in that ordering. Both are
 	 * serialized against the worker by ft_mc_hook_lock.

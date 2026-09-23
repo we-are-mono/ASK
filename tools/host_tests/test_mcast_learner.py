@@ -215,6 +215,14 @@ def test_exit_drains_before_the_module_text_goes_away():
         "the flag alone cannot serialize a registration that sleeps")
     assert "READ_ONCE(ft_mc_stopping)" in sync, (
         "teardown must win however the two interleave")
+    # Unregistering frees the hook entries through call_rcu() and returns at
+    # once, so a frame still inside the hook could write the dedup slot after
+    # it is cleared, or queue the worker after exit cancelled it. One grace
+    # period, after the unregister and before the slot is cleared, is every
+    # such reader gone.
+    off = sync[sync.index("nf_unregister_net_hook("):]
+    assert off.index("synchronize_net();") < off.index("memset(&ft_mc_last"), (
+        "readers already inside the hook must be waited out")
 
 
 def test_a_group_the_hardware_cannot_serve_whole_is_not_served_at_all():

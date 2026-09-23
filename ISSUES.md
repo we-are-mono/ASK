@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A262.** Removing the multicast hook did not wait for frames inside it, which could rewrite the cleared dedup slot or queue the worker after exit cancelled it —
+  fixed (_:/^flowtable: wait out the multicast hook's readers when it is removed_).
+
 - [x] **A188.** A group both bridged and routed was carried by whichever learner claimed it first, leaving the other half in software —
   fixed (_:/^cdx: carry a stream both bridged and routed as one hardware group_).
 
