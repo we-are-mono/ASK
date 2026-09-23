@@ -32,16 +32,16 @@ locally originated model is unchanged. Export the same context's group
 membership interval, so state learned from the traffic can age on the
 bridge's clock.
 
-Send the existing deferred PORT_MROUTER attribute on either family's router
-transition, preserving its union boolean value and netlink compatibility.
-Observers can then refresh the snapshot when one family changes while the
-other remains a router.
+PORT_MROUTER is left as it is: one boolean for both families, sent only
+when that union changes, which is what drivers count references by. A
+caller that needs one family's router change while the other remains a
+router re-reads the snapshot on its own schedule.
 
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  include/linux/if_bridge.h |  26 ++++
- net/bridge/br_multicast.c | 272 +++++++++++++++++++++++++++++++++++++-
- 2 files changed, 295 insertions(+), 3 deletions(-)
+ net/bridge/br_multicast.c | 260 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 286 insertions(+)
 
 diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
 index 13f4363917da..e4b0b8c51034 100644
@@ -95,40 +95,10 @@ index 13f4363917da..e4b0b8c51034 100644
  {
  	return false;
 diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
-index d43b39ed61c7..6b1c3e43e1ba 100644
+index d43b39ed61c7..fa0b639f97d5 100644
 --- a/net/bridge/br_multicast.c
 +++ b/net/bridge/br_multicast.c
-@@ -3360,8 +3360,10 @@ static void br_multicast_add_router(struct net_bridge_mcast *brmctx,
- 	 */
- 	if (br_multicast_no_router_otherpf(pmctx, rlist)) {
- 		br_rtr_notify(pmctx->port->br->dev, pmctx, RTM_NEWMDB);
--		br_port_mc_router_state_change(pmctx->port, true);
- 	}
-+	/* A family-specific consumer must also refresh when the other family
-+	 * was already a router. Keep the legacy boolean's union semantics. */
-+	br_port_mc_router_state_change(pmctx->port, true);
- }
- 
- /* Add port to router_list
-@@ -4501,11 +4503,15 @@ br_multicast_rport_del_notify(struct net_bridge_mcast_port *pmctx, bool deleted)
- 	/* For backwards compatibility for now, only notify if there is
- 	 * no multicast router anymore for both IPv4 and IPv6.
- 	 */
--	if (!hlist_unhashed(&pmctx->ip4_rlist))
-+	if (!hlist_unhashed(&pmctx->ip4_rlist)) {
-+		br_port_mc_router_state_change(pmctx->port, true);
- 		return;
-+	}
- #if IS_ENABLED(CONFIG_IPV6)
--	if (!hlist_unhashed(&pmctx->ip6_rlist))
-+	if (!hlist_unhashed(&pmctx->ip6_rlist)) {
-+		br_port_mc_router_state_change(pmctx->port, true);
- 		return;
-+	}
- #endif
- 
- 	br_rtr_notify(pmctx->port->br->dev, pmctx, RTM_DELMDB);
-@@ -5071,6 +5077,266 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
+@@ -5071,6 +5071,266 @@ bool br_multicast_has_router_adjacent(struct net_device *dev, int proto)
  }
  EXPORT_SYMBOL_GPL(br_multicast_has_router_adjacent);
  

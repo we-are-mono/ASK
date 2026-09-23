@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A268.** Patch 161 sent PORT_MROUTER=true on every per-family router transition, leaking a reference per extra true in drivers that count them (mlxsw) —
+  fixed (_:/^patches: send PORT_MROUTER only when the bridge's union changes_).
+
 - [x] **A267.** A failed routed multicast install spent all four retries within one worker pass and went refused-failed before anything could change —
   fixed (_:/^flowtable: retry a failed routed multicast install once per refresh_).
 

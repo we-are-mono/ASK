@@ -407,7 +407,7 @@ family over:
 | The IPv6 MTU sysctl | nothing reports it | the five-second refresh re-derives every group, which finds it |
 | A bridged membership on a bridge some group expands through | the switchdev chain | the routed worker is kicked; the second set-top box joining on a second port is the case, and the group grows from one listener to two through `cdx_mc_group_replace()` |
 | The bridge's VLAN configuration or filtering | the switchdev chain | kicked and re-derived |
-| A multicast router port, snooping, flood flag or forwarding state | switchdev attributes | kicked and re-derived from the live snapshot; patch 161 emits router refreshes on either protocol's transition, even while the other remains a router |
+| A multicast router port, snooping, flood flag or forwarding state | switchdev attributes | kicked and re-derived from the live snapshot. `PORT_MROUTER` is one boolean for both families, sent only when the union changes — drivers count references by it — so one family's router arriving or expiring while the other stands is found by the five-second refresh instead |
 | Querier timers or per-VLAN snooping state without a notification | the existing five-second worker | re-derived, including refused groups; unchanged forwarding plans leave their hardware chains intact |
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |

@@ -38,3 +38,18 @@ def test_bridge_mcast_snapshot(tmp_path, ipv6):
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
+
+
+def test_the_router_attribute_keeps_its_transitions():
+    """PORT_MROUTER is one boolean for both families, and drivers count
+    references by it: mlxsw takes one per MDB entry for every true it is sent
+    and gives one back per false. A true sent while the port is already a
+    router -- one family arriving while the other stands -- is a reference
+    never returned. So the patch leaves the attribute's sends where the
+    bridge has them, on the union's transitions, and callers re-read the
+    snapshot instead."""
+    diff = PATCH.read_text()
+    changed = [line for line in diff.splitlines()
+               if line[:1] in "+-" and not line.startswith(("+++", "---"))]
+    assert not [line for line in changed if "br_port_mc_router_state_change" in line]
+    assert not [line for line in changed if "br_multicast_rport_del_notify" in line]
