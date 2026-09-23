@@ -175,16 +175,6 @@ result independently of those temporary files.
   auto_bridge. Remove what the flowtable path does not use, with host-test
   coverage for the shared machinery the handlers sit beside.
 
-- [ ] **A193 — multicast quarantine on a failed hardware delete is untested.**
-  The test image still builds `CDX_DEBUG_MC_HCSYNC_FAIL`, whose
-  `/proc/cdx_mc_hcsync_fail` knob fails `dpa_control_mc.c`'s hand-issued HC
-  barriers, but its only driver was the FCI `test_mcast_hcsync_quarantine.py`,
-  deleted with CMM. The unicast equivalent is covered by
-  `test_flowtable_module.py` through `/proc/fm_ehash_hcsync_fail`. Add a
-  flowtable-mode test that arms the knob while a bridged and a routed learner
-  withdraw a group, proving the failed delete quarantines rather than frees live
-  hardware state and reclaims on the next good barrier.
-
 - [ ] **A191 — bridged multicast rewrites the source MAC and cannot accept
   tagged ingress.** The listener builders in `cdx/cdx_ehash.c` strip Ethernet
   at the root and insert a literal header carrying the egress port's MAC, which
@@ -295,6 +285,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A193.** Multicast quarantine on a failed hardware delete had no flowtable-mode driver —
+  covered (_:/^tests: prove a failed multicast barrier parks and the next one frees_).
 
 - [x] **A212.** The routed multicast fold wrote hardware counts over the MFC's, erasing ipmr's own and running `ip -s mroute` backwards —
   fixed (_:/^cdx: add routed multicast hardware counts to the MFC, never set them_).
