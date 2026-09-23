@@ -1,4 +1,4 @@
-From 72b4a8534995134a29cec507919e5d746a704fd6 Mon Sep 17 00:00:00 2001
+From eba56451d1caa5b9ac63e55e5f597dc772e7667d Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 13:56:19 +0200
 Subject: [PATCH] ask: IPv4/IPv6 forwarding-path hook points
@@ -15,16 +15,22 @@ The underlying_iif RX stamp covers all three tunnel receive paths
 the ip6_tunnel site was dropped during the forward-port when the
 4RD machinery was stripped, which broke the 4o6/6in6 decap binding.
 
+ip6t_NPT points a connection's reply tuple at the translated prefix, so
+replies match it. It does so only while the conntrack is unconfirmed:
+the reference wrote every IP_CT_NEW and IP_CT_RELATED packet's address
+into a confirmed, hashed tuple in place, which an ICMP error from any
+other LAN address turned into a connection no reply could find.
+
 Signed-off-by: Tomaz Zaman <tomaz@mono.si>
 ---
  net/ipv4/ip_output.c          | 38 ++++++++++++++++++++++++++++++++++-
  net/ipv4/ip_tunnel.c          |  3 +++
  net/ipv6/ip6_output.c         | 28 ++++++++++++++++++++++++--
  net/ipv6/ip6_tunnel.c         |  4 ++++
- net/ipv6/netfilter/ip6t_NPT.c | 29 ++++++++++++++++++++++++++
+ net/ipv6/netfilter/ip6t_NPT.c | 35 ++++++++++++++++++++++++++++++++
  net/ipv6/output_core.c        | 19 ++++++++++++++++++
  net/ipv6/sit.c                |  3 +++
- 7 files changed, 121 insertions(+), 3 deletions(-)
+ 7 files changed, 127 insertions(+), 3 deletions(-)
 
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
 index 41031c5c4303..2eb271fe8755 100644
@@ -195,7 +201,7 @@ index b788a06bd3a5..09964b40f0d2 100644
  		*pmtu = mtu;
  		err = -EMSGSIZE;
 diff --git a/net/ipv6/netfilter/ip6t_NPT.c b/net/ipv6/netfilter/ip6t_NPT.c
-index 787c74aa85e3..f523f471722a 100644
+index 787c74aa85e3..a63cd09c5440 100644
 --- a/net/ipv6/netfilter/ip6t_NPT.c
 +++ b/net/ipv6/netfilter/ip6t_NPT.c
 @@ -11,6 +11,9 @@
@@ -208,41 +214,47 @@ index 787c74aa85e3..f523f471722a 100644
  
  static int ip6t_npt_checkentry(const struct xt_tgchk_param *par)
  {
-@@ -114,6 +117,19 @@ ip6t_snpt_tg(struct sk_buff *skb, const struct xt_action_param *par)
+@@ -114,6 +117,25 @@ ip6t_snpt_tg(struct sk_buff *skb, const struct xt_action_param *par)
  			ip6t_npt_map_pfx(npt, &bounced_hdr->daddr);
  	}
  
 +#ifdef CONFIG_CPE_FAST_PATH
++	/* The peer answers the translated prefix, so the connection's reply
++	 * tuple has to name it or no reply matches the connection. Written
++	 * only while the conntrack is unconfirmed -- this packet's own, before
++	 * confirmation hashes it on that tuple. A confirmed one is in the
++	 * table under the tuple it has: rewritten in place it would be hashed
++	 * under one address while holding another, found by neither, and a
++	 * lookup comparing tuples meanwhile could read it torn. Later packets
++	 * of a connection, which keep IP_CT_NEW until a reply is seen, and
++	 * ICMP errors related to one, leave it as confirmation left it. */
 +	{
-+		struct nf_conn *ct;
 +		enum ip_conntrack_info ctinfo;
-+		rcu_read_lock();
-+		ct = nf_ct_get(skb, &ctinfo);
-+		if (ct && ((ctinfo == IP_CT_NEW) || (ctinfo == IP_CT_RELATED))) {
-+			memcpy(&ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u3.in6,
-+			       &ipv6_hdr(skb)->saddr, sizeof(struct in6_addr));
-+		}
-+		rcu_read_unlock();
++		struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
++
++		if (ct && !nf_ct_is_confirmed(ct))
++			ct->tuplehash[IP_CT_DIR_REPLY].tuple.dst.u3.in6 =
++				ipv6_hdr(skb)->saddr;
 +	}
 +#endif
  	return XT_CONTINUE;
  }
  
-@@ -139,6 +155,19 @@ ip6t_dnpt_tg(struct sk_buff *skb, const struct xt_action_param *par)
+@@ -139,6 +161,19 @@ ip6t_dnpt_tg(struct sk_buff *skb, const struct xt_action_param *par)
  			ip6t_npt_map_pfx(npt, &bounced_hdr->saddr);
  	}
  
 +#ifdef CONFIG_CPE_FAST_PATH
++	/* The mirror of the source rewrite above: a connection opened from
++	 * outside is answered from the address this rewrote its destination
++	 * to. Unconfirmed conntracks only, for the same reason. */
 +	{
-+		struct nf_conn *ct;
 +		enum ip_conntrack_info ctinfo;
-+		rcu_read_lock();
-+		ct = nf_ct_get(skb, &ctinfo);
-+		if (ct && ((ctinfo == IP_CT_NEW) || (ctinfo == IP_CT_RELATED))) {
-+			memcpy(&ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u3.in6,
-+			       &ipv6_hdr(skb)->daddr, sizeof(struct in6_addr));
-+		}
-+		rcu_read_unlock();
++		struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
++
++		if (ct && !nf_ct_is_confirmed(ct))
++			ct->tuplehash[IP_CT_DIR_REPLY].tuple.src.u3.in6 =
++				ipv6_hdr(skb)->daddr;
 +	}
 +#endif
  	return XT_CONTINUE;

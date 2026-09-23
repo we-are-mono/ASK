@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A259.** ip6t_NPT rewrote a confirmed conntrack's reply tuple in place, so a related ICMPv6 error could leave a hashed entry holding a tuple it is not hashed under —
+  fixed (_:/^netfilter: rewrite an NPT connection's reply tuple only before confirmation_).
+
 - [x] **A258.** CPU-forwarded frames lost their QoS class (the software flowtable dropped the conntrack, PPPoE and tunnels scrubbed it) and took queue 7 above the tree, unremarked —
   fixed (_:/^cdx: classify frames by their headers, not by what a scrub left_).
 
