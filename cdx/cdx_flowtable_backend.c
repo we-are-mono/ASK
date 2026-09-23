@@ -110,6 +110,16 @@ unsigned int cdx_ft_pending(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_pending, ASK_CDX_FLOWTABLE);
 
+bool cdx_ft_idle(void)
+{
+	bool idle;
+
+	cdx_ft_begin();
+	idle = !ft_live && !cdx_ft_pending();
+	cdx_ft_end();
+	return idle;
+}
+
 int cdx_ft_claim(void)
 {
 	cdx_ft_assert_held();

@@ -876,11 +876,13 @@ static void schedule_delayed_work(int *work, unsigned delay)
     scheduled++;
     work_queued_invalidate = true;
 }
-static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled;
+static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled, follow_scheduled;
+static int ft_ipsec_retire, ft_ipsec_follow, ft_ipsec_stats;
 static void schedule_work(int *work)
 {
     if (work == &ft_mr_work) { mroute_kicks++; return; }
     if (work == &ft_stopped_work) { stopped_scheduled++; return; }
+    if (work == &ft_ipsec_follow) { follow_scheduled++; return; }
     assert(work == &ft_retire_work || work == &ft_dev_stats_work);
     if (work == &ft_dev_stats_work) { dev_stats_scheduled++; work_queued_dev_stats = true; }
     else { neigh_scheduled++; work_queued_retire = true; }
@@ -922,12 +924,21 @@ static unsigned netdev_registry_len;
  * them. What must still hold is that the lifecycle calls them at all, so the
  * counters below let a case say so. */
 static unsigned ipsec_attached, ipsec_detached, ipsec_detached_all;
-static int ft_ipsec_retire, ft_ipsec_follow, ft_ipsec_stats;
 static void ft_ipsec_attach(struct net_device *d) { ipsec_attached++; }
 static void ft_ipsec_detach(struct net_device *d) { ipsec_detached++; }
 static void ft_ipsec_detach_all(void) { ipsec_detached_all++; }
 static bool swdev_obj_registered, indirect_registered;
-static unsigned stopped_flushes;
+/* An SA rebuild an egress change asked for and that has not happened yet, on
+ * this port; the follow pass clears it if `ipsec_rebuild_succeeds'. The watch
+ * itself is compiled in ipsec_adapter.c. */
+static struct net_device *ipsec_rebuild_pending_on;
+static bool ipsec_rebuild_succeeds = true;
+static bool ft_ipsec_rebuild_pending(const struct net_device *dev)
+{ return dev && ipsec_rebuild_pending_on == dev; }
+/* Work items run where they are flushed, which is what flushing proves. */
+static void ft_retire_workfn(struct work_struct *work);
+static void ft_invalidate_work(struct work_struct *work);
+static unsigned stopped_flushes, follow_flushes;
 static void flush_work(int *work)
 {
     if (work == &ft_stopped_work) {
@@ -943,8 +954,28 @@ static void flush_work(int *work)
         ft_stopped_workfn(NULL);
         return;
     }
+    if (work == &ft_retire_work) { ft_retire_workfn(NULL); return; }
+    if (work == &ft_ipsec_follow) {
+        assert(!cdx_info->ctrl.mutex);
+        follow_flushes++;
+        if (ipsec_rebuild_succeeds) ipsec_rebuild_pending_on = NULL;
+        return;
+    }
     assert(work == &ft_ipsec_retire);
 }
+/* Set by a case to model a rearm landing while the egress drain waits for
+ * the invalidation pass: the latch clears, and the done flag with it. */
+static bool rearm_in_flush;
+static void flush_delayed_work(int *work)
+{
+    assert(work == &ft_work);
+    ft_invalidate_work(NULL);
+    if (rearm_in_flush) {
+        ft_invalid = 0;
+        ft_invalid_done = false;
+    }
+}
+#define might_sleep() do { } while (0)
 static void ft_ipsec_watch_flush(void) { }
 /* The SA next-hop watch, which the same dependency notifiers mark. What the
  * marking then does needs an installed SA and the backend behind it, so it is
@@ -1171,18 +1202,29 @@ static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
     return 0;
 }
 static void cdx_unregister_ft_qos_class(void) { registered_qos_class = 0; }
-/* The hook CDX calls when a port's egress queues change under its entries,
- * claimed and returned with the two above. */
+/* The hooks CDX calls when a port's egress changes under its entries, claimed
+ * and returned with the two above. */
 static int registered_egress_changed;
-typedef void (*cdx_ft_egress_changed_fn)(struct net_device *dev);
-static int cdx_register_ft_egress_changed(cdx_ft_egress_changed_fn fn)
+struct cdx_ft_egress_ops {
+    void (*changed)(struct net_device *dev);
+    int (*drain)(struct net_device *dev);
+};
+static void ft_egress_changed(struct net_device *dev);
+static int ft_egress_drain(struct net_device *dev);
+static struct net_device *egress_change_on_add;
+/* File-scope data in the adapter, so defined here beside what it points at. */
+static const struct cdx_ft_egress_ops ft_egress_ops = {
+    .changed = ft_egress_changed,
+    .drain = ft_egress_drain,
+};
+static int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops)
 {
-    assert(fn);
+    assert(ops == &ft_egress_ops);
     if (registered_egress_changed) return -EBUSY;
     registered_egress_changed = 1;
     return 0;
 }
-static void cdx_unregister_ft_egress_changed(void) { registered_egress_changed = 0; }
+static void cdx_unregister_ft_egress(void) { registered_egress_changed = 0; }
 /* The IPsec half of an egress change, compiled and tested in ipsec_adapter.c;
  * here only whether the flow half hands it the port. */
 static struct net_device *ipsec_egress_changed;
@@ -1226,6 +1268,10 @@ static int cdx_ft_add(const struct cdx_ft_rule *r,
     *hw = calloc(1, sizeof(**hw)); assert(*hw); live_hw++;
     (*hw)->stats.lastused = (u32)jiffies;
     if (invalidate_on_add) ft_invalidate();
+    /* An egress change landing while the entry is being built. The change
+     * holds RTNL and admission does not, so nothing orders the two but the
+     * watch list. */
+    if (egress_change_on_add) { assert(!rtnl); ft_egress_changed(egress_change_on_add); }
     if (change_policy_on_add) xfrm_genid++;
     if (change_sa_on_add) ft_ipsec_genid++;
     if (change_neigh_on_add) {
@@ -1264,8 +1310,11 @@ static int cdx_ft_release(void)
     assert(cdx_info->ctrl.mutex && backend_claimed && !live_hw);
     backend_claimed = false; return 0;
 }
+/* The egress hook is registered before anything that can build an entry: this
+ * replay attaches the ports an SA is installed through, and the binds come
+ * after it. An entry built first would miss an egress change made meanwhile. */
 static int register_netdevice_notifier(struct notifier_block *nb)
-{ if (registration_fails()) return -ENOMEM; netdev_registered=true; return 0; }
+{ assert(registered_egress_changed); if (registration_fails()) return -ENOMEM; netdev_registered=true; return 0; }
 static int register_netevent_notifier(struct notifier_block *nb)
 { if (registration_fails()) return -ENOMEM; neigh_registered=true; return 0; }
 static int register_fib_notifier(struct net *net, struct notifier_block *nb, void *cb, void *extack)
@@ -1291,6 +1340,11 @@ static void unregister_switchdev_blocking_notifier(struct notifier_block *nb)
 static void cancel_work_sync(int *work)
 {
     assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work);
+    /* CDX's egress hook queues both of these, and nothing the adapter
+     * unregisters before it excludes the hook, so cancelling either while it
+     * is still registered could be undone by the next call. */
+    if (work != &ft_dev_stats_work)
+        assert(!registered_egress_changed);
     if (work == &ft_retire_work) work_queued_retire = false;
     if (work == &ft_dev_stats_work) work_queued_dev_stats = false;
     canceled++;
@@ -6591,6 +6645,80 @@ static void test_nexthop_objects(void)
  * the hardware rule and the software Tx path, so what it produces is a contract
  * rather than an implementation detail. Three nibbles, each with a sentinel
  * meaning "unspecified": class queue, channel, ingress policer profile. */
+/* A DSCP filter turning a port's map on or off marks what is installed there
+ * and then waits for it to leave the hardware before the map may go to another
+ * port: the map is one table with no port in it. Neither op relies on the
+ * caller's RTNL, so both are driven here without it. */
+static void test_egress_drain(void)
+{
+    u64 before;
+
+    /* Nothing marked, nothing to wait for. */
+    fixture();
+    assert(!rtnl);
+    assert(!ft_egress_drain(&out));
+
+    /* An entry on the port is marked, and the drain is what takes it out of
+     * the hardware. */
+    assert(ft_replace(&binding, &cls) == 0 && ft_count == 1 && live_hw == 1);
+    before = ft_qos_invalidations;
+    ft_egress_changed(&out);
+    assert(!rtnl && ft_qos_invalidations == before + 1 && handle.invalid && ft_count == 1);
+    assert(!ft_egress_drain(&out));
+    assert(!ft_count && !live_hw && !allocated && !out.refs);
+
+    /* An admission the change races. The entry is on the watch list before
+     * its hardware entry is built, so the change marks it mid-install and
+     * the admission takes back what it built rather than leaving an entry
+     * decided from the state before the change. */
+    fixture();
+    egress_change_on_add = &out;
+    before = ft_qos_invalidations;
+    assert(ft_replace(&binding, &cls) == -EIO);
+    egress_change_on_add = NULL;
+    assert(ft_qos_invalidations == before + 1 && !ft_count && !live_hw && !allocated);
+
+    /* A global invalidation retires everything itself, and while its
+     * recovery cannot prove the hardware stopped, nothing can be promised. */
+    fixture();
+    assert(ft_replace(&binding, &cls) == 0);
+    list_add_tail(&binding.list, &ft_bindings);
+    ft_invalid = 1; ft_invalid_done = false; ft_fatal = true; rtnl_busy = true;
+    assert(ft_egress_drain(&out) == -EAGAIN);
+    assert(!ft_count && !live_hw && !ft_invalid_done);
+    rtnl_busy = false;
+    assert(!ft_egress_drain(&out) && ft_invalid_done);
+    list_del(&binding.list);
+    ft_invalid = 0; ft_invalid_done = false; ft_fatal = false;
+
+    /* A rearm landing while the drain waits clears the latch and resets the
+     * done flag with it; it only rearms a finished invalidation, so the
+     * drain is done too rather than asked to come back. */
+    ft_invalid = 1; ft_invalid_done = false; rearm_in_flush = true;
+    assert(!ft_egress_drain(&out));
+    rearm_in_flush = false;
+    assert(!ft_invalid && !ft_invalid_done);
+
+    /* An unload in progress retires everything on its own schedule. */
+    ft_stopping = true;
+    assert(ft_egress_drain(&out) == -EAGAIN);
+    ft_stopping = false;
+
+    /* An SA on the port whose rebuild is outstanding -- being rebuilt by a
+     * pass now, or failed and waiting: a pass is asked for and waited on,
+     * outside the control transaction every pass takes, and only a rebuild
+     * that happened lets the drain say so. */
+    ipsec_rebuild_pending_on = &out;
+    ipsec_rebuild_succeeds = false;
+    follow_scheduled = follow_flushes = 0;
+    assert(ft_egress_drain(&out) == -EAGAIN);
+    assert(follow_scheduled == 1 && follow_flushes == 1);
+    assert(!ft_egress_drain(&decoy));
+    ipsec_rebuild_succeeds = true;
+    assert(!ft_egress_drain(&out) && !ipsec_rebuild_pending_on);
+    assert(follow_scheduled == 2 && follow_flushes == 2);
+}
+
 static void test_qos_decode(void)
 {
     unsigned int saved_mask = ft_qos_mark_mask, saved_default = ft_qos_default_class;
@@ -6843,6 +6971,7 @@ static void test_registration(void)
             assert(handle.invalid && unload_sleeps == 2);
         }
         assert(!ft_proc && !ft_ready && !backend_claimed && !live_hw && !allocated);
+        assert(!registered_egress_changed);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
         assert(!fdb_registered && !swdev_obj_registered);
         assert(!ft_count && !ft_bound && !ft_neighbour_refs && !ft_handle_refs);
@@ -6856,16 +6985,18 @@ static void test_registration(void)
         fixture();
         assert(ask_flowtable_init() == -ENOMEM);
         assert(!ft_ready && !ft_proc && !backend_claimed && !cdx_info->ctrl.mutex);
+        assert(!registered_egress_changed);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
         assert(!fdb_registered && !swdev_obj_registered);
         unwound();
     }
-    /* The two registrations CDX holds fail with -EBUSY rather than -ENOMEM,
-     * and the second one failing has to give the first back: a module that
-     * left the driver's ndo pointing into it would be unloadable text on the
-     * flowtable's binding path. Each of these fails with a route already
-     * open and bound through, and the direct binds of the last two are
-     * Netfilter's to keep unless the unwind drains them. */
+    /* The three registrations CDX holds fail with -EBUSY rather than -ENOMEM,
+     * and a later one failing has to give the earlier ones back: a module
+     * that left the driver's ndo or the egress hook pointing into it would be
+     * unloadable text on a path CDX still calls. The egress hook is claimed
+     * first, before anything could bind; each of the other two fails with a
+     * route already open and bound through, and the direct binds of the last
+     * one are Netfilter's to keep unless the unwind drains them. */
     for (ft_init_fail_stage=9; ft_init_fail_stage<=11; ft_init_fail_stage++) {
         ft_ready=ft_stopping=false; registration_step=canceled=0;
         work_queued_invalidate = work_queued_retire = work_queued_rearm = false;
@@ -6874,8 +7005,12 @@ static void test_registration(void)
         assert(ask_flowtable_init() == -EBUSY);
         assert(!ft_ready && !ft_proc && !backend_claimed && !indirect_registered);
         /* The admitted flow's generation is retired for Linux too, as at
-         * unload, and its hardware entry went with its binding. */
-        assert(handle.invalid && ft_deletes == deletes + 1);
+         * unload, and its hardware entry went with its binding. The egress
+         * hook's failure comes before any route opened, with nothing bound. */
+        if (ft_init_fail_stage != 11)
+            assert(handle.invalid && ft_deletes == deletes + 1);
+        else
+            assert(!handle.invalid && ft_deletes == deletes);
         unwound();
     }
     route_open_hook = NULL;
@@ -7021,6 +7156,7 @@ int main(void)
     test_ipsec_generation_retirement();
     test_nexthop_objects();
     test_qos_decode();
+    test_egress_drain();
     test_vlan_stats();
     test_direct_bind_unload();
     test_passive_indirect_unload();

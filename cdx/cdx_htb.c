@@ -39,6 +39,7 @@
  */
 #include <linux/list.h>
 #include <linux/netdevice.h>
+#include <linux/rcupdate.h>
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
 #include <linux/srcu.h>
@@ -155,10 +156,11 @@ struct cdx_htb_port {
 static struct cdx_htb_port cdx_htb_ports[MAX_PHY_PORTS];
 
 /* The class lists, which the Tx path never reads -- it reads the byte arrays
- * published from them. The HTB commands arrive under RTNL, but a filter naming
- * a class does not: cls_flower runs unlocked, so a block callback asking which
- * queue a classid means can land while a class is being added. One mutex over
- * the control side of every port serialises the two. */
+ * published from them. HTB commands and the DSCP filter callbacks that ask
+ * which queue a classid means both arrive under RTNL today -- tc takes it
+ * around the DSCP block's callback, which is not registered unlocked -- but
+ * that is the callers' arrangement rather than a contract of this file, so one
+ * mutex over the control side of every port serialises the two regardless. */
 static DEFINE_MUTEX(cdx_htb_mutex);
 
 static struct cdx_htb_port *cdx_htb_entry(struct tQM_context_ctl *qm_ctx)
@@ -932,15 +934,53 @@ static int cdx_htb_command(struct cdx_htb_port *port, struct tc_htb_qopt_offload
 	return -EOPNOTSUPP;
 }
 
-static cdx_ft_egress_changed_fn cdx_ft_egress_changed_func;
+/* ---- the flowtable's egress hook ----------------------------------------
+ *
+ * An HTB command and a DSCP filter reach it, both under RTNL today: the DSCP
+ * block callback is not registered unlocked, so tc takes RTNL around it. The
+ * adapter's registration is still kept alive by SRCU rather than by that --
+ * the adapter's unload does not take RTNL to unregister, and a caller's locking
+ * is not the hook's to depend on -- and SRCU rather than RCU because drain()
+ * sleeps. Unregistering waits out every call already inside the adapter's
+ * text.
+ */
+DEFINE_STATIC_SRCU(cdx_ft_egress_srcu);
+static const struct cdx_ft_egress_ops __rcu *cdx_ft_egress_ops;
+/* Serialises registration against itself; callers never take it. */
+static DEFINE_MUTEX(cdx_ft_egress_lock);
 
-/* Called under RTNL, which registration and unregistration also take, so the
- * adapter's module cannot leave while a call is inside it. */
-static void cdx_ft_egress_changed(struct net_device *dev)
+/* Mark every entry on `dev' for re-installation. Never sleeps, and a no-op
+ * with no adapter registered: then there are no entries to mark. */
+void cdx_ft_egress_changed(struct net_device *dev)
 {
-	ASSERT_RTNL();
-	if (cdx_ft_egress_changed_func)
-		cdx_ft_egress_changed_func(dev);
+	const struct cdx_ft_egress_ops *ops;
+	int idx;
+
+	idx = srcu_read_lock(&cdx_ft_egress_srcu);
+	ops = srcu_dereference(cdx_ft_egress_ops, &cdx_ft_egress_srcu);
+	if (ops)
+		ops->changed(dev);
+	srcu_read_unlock(&cdx_ft_egress_srcu, idx);
+}
+
+/* Wait until what cdx_ft_egress_changed(dev) started has finished, or say it
+ * cannot be told yet (-EAGAIN). With no adapter registered there is nobody to
+ * ask, but an adapter that is unloading unregisters before it retires its
+ * entries -- so the answer is then whether the backend holds any at all. */
+int cdx_ft_egress_drain(struct net_device *dev)
+{
+	const struct cdx_ft_egress_ops *ops;
+	int idx, rc;
+
+	might_sleep();
+	idx = srcu_read_lock(&cdx_ft_egress_srcu);
+	ops = srcu_dereference(cdx_ft_egress_ops, &cdx_ft_egress_srcu);
+	if (ops)
+		rc = ops->drain(dev);
+	else
+		rc = cdx_ft_idle() ? 0 : -EAGAIN;
+	srcu_read_unlock(&cdx_ft_egress_srcu, idx);
+	return rc;
 }
 
 static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *opt)
@@ -973,29 +1013,31 @@ static int cdx_htb_setup_tc(struct net_device *dev, struct tc_htb_qopt_offload *
 	return rc;
 }
 
-int cdx_register_ft_egress_changed(cdx_ft_egress_changed_fn fn)
+int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops)
 {
 	int rc = 0;
 
-	if (!fn)
+	if (!ops || !ops->changed || !ops->drain)
 		return -EINVAL;
-	rtnl_lock();
-	if (cdx_ft_egress_changed_func)
+	mutex_lock(&cdx_ft_egress_lock);
+	if (rcu_access_pointer(cdx_ft_egress_ops))
 		rc = -EBUSY;
 	else
-		cdx_ft_egress_changed_func = fn;
-	rtnl_unlock();
+		rcu_assign_pointer(cdx_ft_egress_ops, ops);
+	mutex_unlock(&cdx_ft_egress_lock);
 	return rc;
 }
-EXPORT_SYMBOL_NS_GPL(cdx_register_ft_egress_changed, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_register_ft_egress, ASK_CDX_FLOWTABLE);
 
-void cdx_unregister_ft_egress_changed(void)
+/* Returns once no call is inside either op, so the registrant's text can go. */
+void cdx_unregister_ft_egress(void)
 {
-	rtnl_lock();
-	cdx_ft_egress_changed_func = NULL;
-	rtnl_unlock();
+	mutex_lock(&cdx_ft_egress_lock);
+	RCU_INIT_POINTER(cdx_ft_egress_ops, NULL);
+	mutex_unlock(&cdx_ft_egress_lock);
+	synchronize_srcu(&cdx_ft_egress_srcu);
 }
-EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_egress_changed, ASK_CDX_FLOWTABLE);
+EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_egress, ASK_CDX_FLOWTABLE);
 
 /* The CEETM channel and class queue a leaf class names, for a filter that
  * wants to send something to it.

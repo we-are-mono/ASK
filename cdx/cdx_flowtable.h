@@ -34,19 +34,39 @@ typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
 int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn);
 void cdx_unregister_ft_qos_class(void);
 
-/* A port's egress queues changed under the entries that transmit on it.
+/* A port's egress changed under the entries that transmit on it.
  *
  * Every hardware entry names the frame queue it enqueues to, chosen once, at
- * install, from the port's scheduling mode at that moment (cdx_get_txfqid()).
- * An HTB tree switches the port to CEETM at its first leaf and back when it
- * goes, and a class change moves or removes the queue a class names. Nothing
- * drains the queues of the mode the port has left, so an entry installed
- * before the change sends everything into a queue nothing dequeues, and its
- * classifier hits keep the flow alive while it does. The adapter registers
- * this to re-install everything on the port; called under RTNL. */
-typedef void (*cdx_ft_egress_changed_fn)(struct net_device *dev);
-int cdx_register_ft_egress_changed(cdx_ft_egress_changed_fn fn);
-void cdx_unregister_ft_egress_changed(void);
+ * install, from the port's scheduling mode at that moment (cdx_get_txfqid()),
+ * and whether the microcode's DSCP map picks the queue instead. An HTB tree
+ * switches the port to CEETM at its first leaf and back when it goes, a class
+ * change moves or removes the queue a class names, and a DSCP filter turns the
+ * map on or off for the port. Nothing drains the queues of the mode the port
+ * has left, so an entry installed before the change sends everything into a
+ * queue nothing dequeues, and its classifier hits keep the flow alive while it
+ * does. The adapter registers these to re-install everything on the port.
+ *
+ * changed() marks every flow entry and outbound SA on the port for
+ * re-installation and returns without sleeping; the re-installation itself is
+ * the adapter's queued work. Multicast replicas are not covered.
+ * It relies on no lock of the caller's. Both callers hold RTNL today -- an HTB
+ * command always, and a DSCP filter because its block callback is not
+ * registered unlocked, so tc takes RTNL around it -- but neither op needs it.
+ *
+ * drain(dev) sleeps until everything changed(dev) started has finished, or
+ * reports -EAGAIN when it cannot say so yet: before CDX hands the DSCP map to
+ * another port, no entry installed while this one held it may still read it.
+ * It takes the control mutex, so it is never called with it held.
+ *
+ * Registration is a one-shot claim, and unregistration waits out every call
+ * already inside either op, so the module that registered can go once it
+ * returns. */
+struct cdx_ft_egress_ops {
+	void (*changed)(struct net_device *dev);
+	int (*drain)(struct net_device *dev);
+};
+int cdx_register_ft_egress(const struct cdx_ft_egress_ops *ops);
+void cdx_unregister_ft_egress(void);
 
 int cdx_flowtable_guard_init(void);
 void cdx_flowtable_guard_exit(void);

@@ -1455,6 +1455,48 @@ followed: every DSCP filter is resolved again after each HTB command, and a
 codepoint whose class has gone selects nothing rather than whatever now holds
 those indices.
 
+**Turning the map on or off is an egress change.** Whether a classifier entry
+consults the map is decided once, when the entry is built: an entry on a port
+whose map is published gets the microcode's DSCP bit and keeps it. So an entry
+built before a port's first filter never reads the map, however long it lives,
+and one built while the map was on keeps reading it after the last filter is
+gone. Both transitions therefore retire every entry on the port, through the
+same hook an HTB command uses (`struct cdx_ft_egress_ops`); editing one
+codepoint while the map stays on needs nothing, because an entry reads the
+table per frame. The hook's registration is kept alive by SRCU rather than by
+its callers' RTNL: both callers hold RTNL (tc takes it around the DSCP block's
+callback, which is not registered unlocked), but the adapter's unload does not,
+and the hook relies on no lock of the caller's. The adapter registers it before
+anything can build an entry and unregisters it before cancelling the work it
+queues. An SA being installed while the map turns is not on the watch list for
+the hook to mark yet, so the install compares a count of egress changes across
+its build and marks its own watch for the rebuild if one landed. Multicast
+replicas are outside this hook: they are not flow entries, and neither the
+retirement nor `drain()` covers them.
+
+Turning the map off is the sharp one, because the table carries no port id.
+An entry with the bit reads whichever port's queues the table holds, so a
+table handed to another port while an entry built under the first is still in
+the classifier sends that entry's frames out of the wrong port — across the
+LAN/WAN boundary, if that is where the map moved. The transition therefore
+runs in order: unpublish (new entries stop getting the bit and the software
+path stops reading the table), retire the port's entries, wait for the
+retirement with the filter lock dropped (`drain()`), and only then release the
+table. A port asking for the map meanwhile is told it is busy. A drain that
+cannot prove the entries gone — a global invalidation whose recovery has not
+finished, an unload in progress, an SA on the port whose rebuild is waiting
+for its peer — leaves the table claimed and says so in the kernel log; the
+next port to ask tries the drain again first, and the port that let go can
+take its own table back without one.
+
+The first filter is ordered the other way round for the same reason: the table
+is claimed and programmed before it is published, so a first filter that
+cannot be programmed gives back a table nothing ever read.
+
+The software path's copy of the table is now read under RCU and freed after a
+grace period. `cpe_fp_tx()` used to read it without any lock while the last
+filter's deletion freed it.
+
 #### It was dead on both paths, and both had to be fixed
 
 Programming the table was not enough, and it took a measurement to find out: a

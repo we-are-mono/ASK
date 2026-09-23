@@ -178,7 +178,7 @@ int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_
 			 * "policer wanted" flag -- and so never let an
 			 * offloaded flow reach the map at all. */
 			if ((!qosmark->queue && !qosmark->chnl_id) &&
-				((struct tQM_context_ctl *)priv->qm_ctx)->dscp_fq_map) /* DSCP FQ MAP enabled */
+				rcu_access_pointer(((struct tQM_context_ctl *)priv->qm_ctx)->dscp_fq_map)) /* DSCP FQ MAP published */
 				*is_dscp_fq_map = 1;
 			else
 				*is_dscp_fq_map = 0;
@@ -188,23 +188,22 @@ int cdx_get_tx_dscp_fq_map(struct eth_iface_info *eth_info, uint8_t *is_dscp_fq_
 	return 0;
 }
 
-/*
- * This function returns the dscp fq pointer from corresponding interface QM CTX. *
- * In success case it returns the fq pointer otherwise returns NULL.              *
-*/
+/* The frame queue a DSCP names on this port, for the software Tx path, or NULL.
+ *
+ * cpe_fp_tx() calls this without any lock of the map's, from inside the
+ * transmit path's RCU-bh section, while a filter change can unpublish and free
+ * the table. So the table is read through RCU and freed after a grace period
+ * (ceetm_dscp_map_release()); reading it plainly was a use-after-free against
+ * the last filter being deleted. */
 static struct qman_fq *ceetm_get_dscp_fq(void *ctx, uint8_t dscp)
 {
 	struct tQM_context_ctl *qm_ctx = (struct tQM_context_ctl *)ctx;
-	
-	if (!qm_ctx->dscp_fq_map)
-		return NULL;
-	if (dscp >= MAX_DSCP)
-	{
-		ceetm_err("Invalid dscp value %d ox tx iface <%s>\n", dscp, qm_ctx->iface_info->name);
-		return NULL;
-	}
+	struct qm_dscp_fq_map *map;
 
-	return qm_ctx->dscp_fq_map->dscp_fq[dscp];
+	if (dscp >= MAX_DSCP)
+		return NULL;
+	map = rcu_dereference_bh(qm_ctx->dscp_fq_map);
+	return map ? READ_ONCE(map->dscp_fq[dscp]) : NULL;
 }
 
 /* get count of frames on a CEETM class queue */
@@ -928,8 +927,10 @@ int ceetm_init_channels(void)
 		chinfo->wbfq_chshaper = 0;
 		chinfo->shaper_info.bsize = CEETM_DEFA_BSIZE;
 		chinfo->shaper_info.token_cr = cr;
-		/* A channel's shaper is not coupled, so its excess rate is a
-		 * rate of its own; unbounded until a class names a ceil. */
+		/* Unbounded until a class names a ceil. The shaper is coupled
+		 * (ceetm_create_channel()), so committed tokens a channel does
+		 * not use top up its excess bucket; at the maximum rate that
+		 * surplus changes nothing. */
 		chinfo->shaper_info.token_er = cr;
 		chinfo->shaper_info.rate = rate;
 		chinfo->shaper_info.enable = 0;
@@ -1858,57 +1859,112 @@ int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 	return ret;
 }
 
+/* ---- the DSCP map's lifetime ---------------------------------------------
+ *
+ * The microcode's copy of the map is one table with no port in it: an entry
+ * carrying the DSCP bit reads whichever port's queues the table holds. So
+ * handing the table from one port to another is only safe once no entry
+ * installed while the first port held it is left in the classifier, and that
+ * takes the flowtable's retirement -- which is why claiming, publishing,
+ * unpublishing and releasing are four steps here rather than one switch. The
+ * caller sequences them around retirement (cdx_dscp.c); the FCI command, whose
+ * control plane retires nothing, still uses them as one.
+ */
+
+/* Take the microcode's map for this port and give it an empty slow-path table,
+ * unpublished: until ceetm_dscp_map_publish(), no new entry gets the DSCP bit
+ * and the software path does not read the table. Fails while another port
+ * holds the map. Holding the claim already is success. */
+int ceetm_dscp_map_claim(struct tQM_context_ctl *qm_ctx)
+{
+#ifdef ENABLE_EGRESS_QOS
+	struct qm_dscp_fq_map *map;
+
+	if (qm_ctx->dscp_fq_claimed)
+		return CEETM_SUCCESS;
+	map = kzalloc(sizeof(*map), GFP_KERNEL);
+	if (!map)
+		return CEETM_FAILURE;
+	if (enable_dscp_fqid_map(qm_ctx->port_info->portid)) {
+		kfree(map);
+		return CEETM_FAILURE;
+	}
+	qm_ctx->dscp_fq_claimed = map;
+#endif
+	return CEETM_SUCCESS;
+}
+
+/* New classifier entries on this port get the DSCP bit from here, and the
+ * software Tx path reads the table. */
+void ceetm_dscp_map_publish(struct tQM_context_ctl *qm_ctx)
+{
+	rcu_assign_pointer(qm_ctx->dscp_fq_map, qm_ctx->dscp_fq_claimed);
+}
+
+/* And no longer. Entries already carrying the bit still read the microcode's
+ * table, which stays this port's until the release. */
+void ceetm_dscp_map_unpublish(struct tQM_context_ctl *qm_ctx)
+{
+	RCU_INIT_POINTER(qm_ctx->dscp_fq_map, NULL);
+}
+
+/* Give the microcode's map back, cleared, for any port to claim, and free the
+ * slow-path table once no transmit can still be reading it. Only after nothing
+ * installed under the claim is left in the classifier. */
+int ceetm_dscp_map_release(struct tQM_context_ctl *qm_ctx)
+{
+	int ret = CEETM_SUCCESS;
+#ifdef ENABLE_EGRESS_QOS
+	struct qm_dscp_fq_map *map = qm_ctx->dscp_fq_claimed;
+
+	if (!map)
+		return CEETM_SUCCESS;
+	RCU_INIT_POINTER(qm_ctx->dscp_fq_map, NULL);
+	if (disable_dscp_fqid_map(qm_ctx->port_info->portid)) {
+		ceetm_err("failed to disable dscp fqid mapping for port %s\n",
+			  qm_ctx->iface_info->name);
+		ret = CEETM_FAILURE;
+	}
+	qm_ctx->dscp_fq_claimed = NULL;
+	kfree_rcu(map, rcu);
+#endif
+	return ret;
+}
+
 /*
  * This function enable/disable dscp fq mapping on corresponding interface QM ctx for *
  * slow path, for fast path it updates in muRam. In SUCCESS case returns CEETM_SUCCESS*
  * In failure case it returns CEETM_FAILURE.                                          *
+ *
+ * The FCI command's switch, in one step each way. Its control plane has no
+ * retirement to wait on, so a disable releases at once, as it always did.
 */
-int ceetm_enable_disable_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t status) 
+int ceetm_enable_disable_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t status)
 {
-#ifdef ENABLE_EGRESS_QOS	
-	if (status && qm_ctx->dscp_fq_map)
+#ifdef ENABLE_EGRESS_QOS
+	if (status && rcu_access_pointer(qm_ctx->dscp_fq_map))
 	{
 		ceetm_err("dscp_fq_map is already enabled:\n");
 		return CEETM_SUCCESS;
 	}
-	if ((!status) && (!qm_ctx->dscp_fq_map))
+	if ((!status) && (!qm_ctx->dscp_fq_claimed))
 	{
 		ceetm_err("dscp_fq_map is already disabled:\n");
 		return CEETM_SUCCESS;
 	}
 	if (status)
 	{
-		if (enable_dscp_fqid_map(qm_ctx->port_info->portid))
+		if (ceetm_dscp_map_claim(qm_ctx))
 		{
 			ceetm_err("failed to enable dscp fqid mapping for port %s\n", qm_ctx->iface_info->name);
 			return CEETM_FAILURE;
 		}
-		if (qm_ctx->dscp_fq_map)
-		{
-			ceetm_err("earlier dscp fqid mapping disable not proper, do disable again, before this enable.\n");
-			return CEETM_FAILURE;
-		}
-		/* create memory for dscp fq map*/
-		if ((qm_ctx->dscp_fq_map = kcalloc(1, sizeof(struct qm_dscp_fq_map), GFP_KERNEL)) == NULL)
-		{
-			ceetm_err("failed to create memory for dscp fq map table for port %s\n",
-									qm_ctx->iface_info->name);		
-			if (disable_dscp_fqid_map(qm_ctx->port_info->portid))
-				ceetm_err("failed to disable dscp fqid mapping for port %s\n", 
-									qm_ctx->iface_info->name);
-			return CEETM_FAILURE;
-		}
+		ceetm_dscp_map_publish(qm_ctx);
 	}
 	else
 	{
-		if (disable_dscp_fqid_map(qm_ctx->port_info->portid))
-		{
-			ceetm_err("failed to disable dscp fqid mapping for port %s\n", qm_ctx->iface_info->name);
+		if (ceetm_dscp_map_release(qm_ctx))
 			return CEETM_FAILURE;
-		}
-		/* delete memory for dscp fq map*/
-		kfree(qm_ctx->dscp_fq_map);
-		qm_ctx->dscp_fq_map = NULL;
 	}
 #endif
 	return CEETM_SUCCESS;
@@ -1921,12 +1977,12 @@ int ceetm_enable_disable_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t sta
 */
 static int dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp)
 {
-	if (!qm_ctx->dscp_fq_map)
+	if (!qm_ctx->dscp_fq_claimed)
 	{
 		ceetm_err("dscp to fq map is not enabled on this interface <%s>\n", qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
-	qm_ctx->dscp_fq_map->dscp_fq[dscp] = NULL;
+	WRITE_ONCE(qm_ctx->dscp_fq_claimed->dscp_fq[dscp], NULL);
 
 	return CEETM_SUCCESS;
 }
@@ -2010,12 +2066,12 @@ int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, uint8_t dscp)
 */
 static int add_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t dscp, struct qman_fq *egress_fq)
 {
-	if (!qm_ctx->dscp_fq_map)
+	if (!qm_ctx->dscp_fq_claimed)
 	{
 		ceetm_err("dscp to fq map is not enabled on this interface <%s>\n", qm_ctx->iface_info->name);
 		return CEETM_FAILURE;
 	}
-	qm_ctx->dscp_fq_map->dscp_fq[dscp] = egress_fq;
+	WRITE_ONCE(qm_ctx->dscp_fq_claimed->dscp_fq[dscp], egress_fq);
 
 	return CEETM_SUCCESS;
 }
@@ -2466,14 +2522,10 @@ int ceetm_release_iface(struct tQM_context_ctl *qm_ctx)
 		priv->qm_ctx = NULL;
 	}
 	ceetm_put_channel_devices(detached);
-	if (qm_ctx->dscp_fq_map) {
-		/* The port id, as every other caller passes it. Index arithmetic
-		 * happened to give the same answer only because QM_GET_CONTEXT()
-		 * is &gQMCtx[portid]. */
-		if (disable_dscp_fqid_map(qm_ctx->port_info->portid))
-			ret = CEETM_FAILURE;
-		kfree(qm_ctx->dscp_fq_map);
-	}
+	/* Held or not, published or not: the port is going, and its claim on
+	 * the microcode's map goes with it. */
+	if (ceetm_dscp_map_release(qm_ctx))
+		ret = CEETM_FAILURE;
 	if (ceetm_release_lni(qm_ctx->lni, qm_ctx->sp))
 		ret = CEETM_FAILURE;
 	memset(qm_ctx, 0, sizeof(*qm_ctx));

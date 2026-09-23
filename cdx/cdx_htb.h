@@ -26,4 +26,11 @@ void cdx_htb_port_gone(struct tQM_context_ctl *qm_ctx);
 int cdx_htb_class_queue(struct net_device *dev, u32 classid, u8 *channel, u8 *cq,
 			struct netlink_ext_ack *extack);
 
+/* The flowtable adapter's egress hook, for CDX's own callers; see struct
+ * cdx_ft_egress_ops. The first never sleeps and needs no lock; the second
+ * sleeps, and must not be called holding a lock the adapter's retirement work
+ * takes -- the control mutex above all. */
+void cdx_ft_egress_changed(struct net_device *dev);
+int cdx_ft_egress_drain(struct net_device *dev);
+
 #endif /* CDX_HTB_H */

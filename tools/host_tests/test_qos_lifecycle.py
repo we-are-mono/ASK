@@ -60,7 +60,7 @@ def test_qos_lifecycle(tmp_path):
         "ceetm_release_fd", "ceetm_sync_portal", "ceetm_sync_portals",
         "ceetm_drain_queue", "ceetm_drain_channel",
         "ceetm_quiesce_port", "ceetm_put_channel_devices",
-        "ceetm_release_iface", "ceetm_release_queue", "ceetm_release_channels",
+        "ceetm_dscp_map_release", "ceetm_release_iface", "ceetm_release_queue", "ceetm_release_channels",
         "ceetm_exit",
     ]
     (tmp_path / "qos_production.inc").write_text(

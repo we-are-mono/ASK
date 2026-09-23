@@ -32,6 +32,19 @@
  * holds one port id -- "Now supporting only one interface", as the code that
  * enables it says -- so a second port asking for a DSCP map is refused rather
  * than silently taking the first one's table away.
+ *
+ * Which classifier entries read the map is decided when each is installed:
+ * one on a port whose map is published gets the microcode's DSCP bit, and
+ * keeps it. So turning a port's map on or off is a change to that port's
+ * egress, and every entry on it is retired and readmitted (struct
+ * cdx_ft_egress_ops), the way an HTB command's is. Turning it off is the
+ * sharp one. The table carries no port id -- an entry with the bit reads
+ * whichever port's queues it holds -- so it cannot pass to another port while
+ * an entry installed under this one is left, or that entry's frames leave by
+ * the other port's queues: the wrong wire. The release therefore waits for the
+ * retirement to finish, with the lock dropped, and a port asking for the map
+ * meanwhile is told it is busy. Editing one DSCP while the map stays on needs
+ * none of this: an entry reads the table per frame.
  */
 
 #include <linux/list.h>
@@ -80,10 +93,20 @@ struct cdx_dscp_filter {
 	u16			klass;
 };
 
+/* Where a port stands with the microcode's map. */
+enum cdx_dscp_state {
+	CDX_DSCP_OFF,		/* no claim */
+	CDX_DSCP_CLAIMED,	/* claimed for a first filter being programmed;
+				 * never published, so nothing carries the bit */
+	CDX_DSCP_ON,		/* published: new entries on the port get the bit */
+	CDX_DSCP_RETIRING,	/* unpublished, but entries installed while it was
+				 * published may still be reading it */
+};
+
 struct cdx_dscp_port {
 	struct list_head	filters;
 	struct net_device	*dev;
-	bool			enabled;	/* the map is on for this port */
+	enum cdx_dscp_state	state;
 	/* What the software Tx path reads, and the only part of this structure
 	 * it may: one class per codepoint, republished whole after every
 	 * change. ndo_select_queue cannot take the mutex above, and a walk of
@@ -92,9 +115,19 @@ struct cdx_dscp_port {
 };
 
 static struct cdx_dscp_port cdx_dscp_ports[MAX_PHY_PORTS];
-/* Serialises the filter lists and the enable, which cls_flower's unlocked
- * path can reach concurrently with each other and with an HTB command. */
+/* Serialises the filter lists and the map's state. Filter callbacks and HTB
+ * commands arrive under RTNL today, but a port's CEETM release reaches the
+ * state without it, and a drain runs with this mutex dropped; nothing here
+ * relies on the caller's RTNL. */
 static DEFINE_MUTEX(cdx_dscp_mutex);
+/* The port whose map is retiring, if one is, and whether a drain for it is in
+ * progress with the mutex dropped. Both under the mutex. There is at most one:
+ * the map it holds is the only one there is. */
+static struct cdx_dscp_port *cdx_dscp_retiring;
+static bool cdx_dscp_draining;
+/* Bumped every time a port's map is unpublished, so a drain can tell whether
+ * something was retired after it began and it has to wait again. */
+static unsigned long cdx_dscp_retire_gen;
 
 /* Indexed the way gQMCtx is, as the qdisc's own port table is, so the two
  * always mean the same port whichever key the caller has. */
@@ -123,6 +156,13 @@ static struct tQM_context_ctl *cdx_dscp_qm_ctx(struct net_device *dev)
 	struct dpa_priv_s *priv = netdev_priv(dev);
 
 	return priv->qm_ctx;
+}
+
+/* The context a port slot stands for, by the same index cdx_dscp_entry()
+ * maps the other way. Used where the slot's netdev may be gone meanwhile. */
+static struct tQM_context_ctl *cdx_dscp_port_ctx(struct cdx_dscp_port *port)
+{
+	return &gQMCtx[port - cdx_dscp_ports];
 }
 
 /* Runs under cdx_dscp_mutex. */
@@ -181,38 +221,144 @@ static void cdx_dscp_publish(struct cdx_dscp_port *port)
 			WRITE_ONCE(port->dscp_class[f->dscp], f->klass);
 }
 
-/* Turn the map on for this port, which is where the singleton bites: the
- * microcode's table carries one port id, so the second port to ask is told so
- * rather than quietly taking the first one's table. */
-static int cdx_dscp_enable(struct cdx_dscp_port *port,
-			   struct netlink_ext_ack *extack)
+/* Finish the retiring port's retirement: wait for every entry installed while
+ * its map was published to leave the hardware, then give its claim back so
+ * another port can have the map. Returns 0 once no port is retiring, however
+ * that came about, and -EBUSY while one still is -- a drain running on
+ * another thread, or one that could not prove the entries gone.
+ *
+ * Called with the mutex held. Drops it for the drain, which sleeps and waits on
+ * work that takes the control mutex, and retakes it. While it is dropped the
+ * retiring port can take its map back or go away altogether, and another can
+ * retire its map anew, so what the drain proved is re-checked against a
+ * generation rather than assumed. */
+static int cdx_dscp_finish_retiring(void)
+	__must_hold(&cdx_dscp_mutex)
 {
-	struct tQM_context_ctl *qm_ctx = cdx_dscp_qm_ctx(port->dev);
+	struct cdx_dscp_port *port = cdx_dscp_retiring;
+	struct net_device *dev;
+	unsigned long gen;
+	int rc;
 
-	if (port->enabled)
+	lockdep_assert_held(&cdx_dscp_mutex);
+	/* Busy even when the port being drained has gone meanwhile: its
+	 * context release freed the claim, but the drain is still what proves
+	 * its entries have left, and until it returns another port's queues
+	 * in the table would be read by them. */
+	if (cdx_dscp_draining)
+		return -EBUSY;
+	if (!port)
 		return 0;
+	do {
+		gen = cdx_dscp_retire_gen;
+		dev = port->dev;
+		dev_hold(dev);
+		cdx_dscp_draining = true;
+		mutex_unlock(&cdx_dscp_mutex);
+		rc = cdx_ft_egress_drain(dev);
+		mutex_lock(&cdx_dscp_mutex);
+		cdx_dscp_draining = false;
+		/* It went (its context release freed the claim) or took its
+		 * map back (the claim is in use again): nothing to release.
+		 * Going away released the table whatever the drain found, so
+		 * a drain that could not prove the entries gone is said out
+		 * loud: nothing is left here to refuse the next port with. */
+		if (cdx_dscp_retiring != port || port->state != CDX_DSCP_RETIRING) {
+			if (rc && port->dev != dev)
+				pr_warn("cdx: %s released the hardware DSCP map before entries installed under it were proven out of the hardware (%d)\n",
+					netdev_name(dev), rc);
+			dev_put(dev);
+			return cdx_dscp_retiring ? -EBUSY : 0;
+		}
+		if (rc) {
+			pr_warn("cdx: %s keeps the hardware DSCP map until entries installed under it are out of the hardware (%d); another port asking for it is refused meanwhile\n",
+				netdev_name(dev), rc);
+			dev_put(dev);
+			return -EBUSY;
+		}
+		dev_put(dev);
+	} while (gen != cdx_dscp_retire_gen);
+	if (ceetm_dscp_map_release(cdx_dscp_port_ctx(port)) != CEETM_SUCCESS)
+		pr_warn("cdx: %s did not hand the hardware DSCP map back cleanly\n",
+			netdev_name(port->dev));
+	port->state = CDX_DSCP_OFF;
+	cdx_dscp_retiring = NULL;
+	return 0;
+}
+
+/* Make sure this port holds the microcode's map, published or not, which is
+ * where the singleton bites: the table carries one port id, so a second port
+ * asking is told so rather than quietly taking the first one's table. A map
+ * still retiring from another port is finished first, if it can be. */
+static int cdx_dscp_claim(struct cdx_dscp_port *port,
+			  struct netlink_ext_ack *extack)
+	__must_hold(&cdx_dscp_mutex)
+{
+	struct tQM_context_ctl *qm_ctx;
+
+	/* Retiring is still this port's claim: the entries reading it read
+	 * this port's queues, so taking it back needs no drain. */
+	if (port->state != CDX_DSCP_OFF)
+		return 0;
+	if (cdx_dscp_finish_retiring()) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "the hardware DSCP map is still leaving another port, whose entries may be reading it; try again");
+		return -EBUSY;
+	}
+	/* The mutex may have been dropped above. Only this port's own filters
+	 * move it out of OFF, and each of them would have stopped at the same
+	 * retirement, but its context is looked up only now, after it. */
+	qm_ctx = port->dev ? cdx_dscp_qm_ctx(port->dev) : NULL;
 	if (!qm_ctx) {
 		NL_SET_ERR_MSG_MOD(extack, "CEETM is not configured on this interface");
 		return -EOPNOTSUPP;
 	}
-	if (ceetm_enable_disable_dscp_fq_map(qm_ctx, 1) != CEETM_SUCCESS) {
+	if (ceetm_dscp_map_claim(qm_ctx) != CEETM_SUCCESS) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "the hardware DSCP map serves one port at a time, and another port holds it");
 		return -EBUSY;
 	}
-	port->enabled = true;
+	port->state = CDX_DSCP_CLAIMED;
 	return 0;
 }
 
-static void cdx_dscp_disable(struct cdx_dscp_port *port)
+/* Give back a claim made for a first filter that did not get programmed. It
+ * was never published, so nothing read it and there is nothing to retire. A
+ * map that is on, or retiring, is left exactly as it is. */
+static void cdx_dscp_unclaim(struct cdx_dscp_port *port)
 {
-	struct tQM_context_ctl *qm_ctx = cdx_dscp_qm_ctx(port->dev);
-
-	if (!port->enabled)
+	if (port->state != CDX_DSCP_CLAIMED)
 		return;
-	if (qm_ctx)
-		ceetm_enable_disable_dscp_fq_map(qm_ctx, 0);
-	port->enabled = false;
+	ceetm_dscp_map_release(cdx_dscp_port_ctx(port));
+	port->state = CDX_DSCP_OFF;
+}
+
+/* The first filter is programmed: publish the map, so new entries on the port
+ * get the DSCP bit and the software path reads the table, then retire what is
+ * already installed, which was built without the bit and would never consult
+ * the map. */
+static void cdx_dscp_turn_on(struct cdx_dscp_port *port)
+{
+	ceetm_dscp_map_publish(cdx_dscp_port_ctx(port));
+	if (cdx_dscp_retiring == port)
+		cdx_dscp_retiring = NULL;
+	port->state = CDX_DSCP_ON;
+	cdx_ft_egress_changed(port->dev);
+}
+
+/* The last filter is gone: unpublish the map so nothing new is built to read
+ * it, retire everything installed while it was published, and hand the claim
+ * back once that is out of the hardware. A drain that cannot finish leaves the
+ * port retiring, and the next port to ask for the map finishes it first. */
+static void cdx_dscp_turn_off(struct cdx_dscp_port *port)
+	__must_hold(&cdx_dscp_mutex)
+{
+	ceetm_dscp_map_unpublish(cdx_dscp_port_ctx(port));
+	port->state = CDX_DSCP_RETIRING;
+	cdx_dscp_retiring = port;
+	cdx_dscp_retire_gen++;
+	cdx_ft_egress_changed(port->dev);
+	cdx_dscp_finish_retiring();
 }
 
 /* Only the keys that make a DSCP. Anything else would select a subset of the
@@ -324,6 +470,11 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 		rc = -EOPNOTSUPP;
 		goto out;
 	}
+	/* First, because it can drop the mutex to finish another port's
+	 * retirement; everything below is decided on what holds after it. */
+	rc = cdx_dscp_claim(port, extack);
+	if (rc)
+		goto out;
 	/* Two filters on one DSCP would each be the whole of that codepoint's
 	 * answer, and the second to be programmed would win with nothing
 	 * saying so. tc keeps both, so this has to refuse the second. */
@@ -331,14 +482,13 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 		if (existing->dscp == dscp && existing->cookie != f->cookie) {
 			NL_SET_ERR_MSG_MOD(extack, "another filter already claims that DSCP");
 			rc = -EEXIST;
-			goto out;
+			goto out_unclaim;
 		}
-	rc = cdx_dscp_enable(port, extack);
-	if (rc)
-		goto out;
+	/* Into the claimed table, before it is published: a first filter that
+	 * cannot be programmed leaves nothing that ever read the map. */
 	rc = cdx_dscp_program(dev, filter, extack);
 	if (rc)
-		goto out_disable;
+		goto out_unclaim;
 	/* tc replays a filter onto a block callback that binds after it, so the
 	 * same cookie can arrive twice; the second time reprograms and keeps
 	 * the record already there. */
@@ -351,12 +501,13 @@ static int cdx_dscp_replace(struct net_device *dev, struct flow_cls_offload *f)
 		list_add_tail(&filter->list, &port->filters);
 	}
 	cdx_dscp_publish(port);
+	if (port->state != CDX_DSCP_ON)
+		cdx_dscp_turn_on(port);
 	mutex_unlock(&cdx_dscp_mutex);
 	return 0;
 
-out_disable:
-	if (list_empty(&port->filters))
-		cdx_dscp_disable(port);
+out_unclaim:
+	cdx_dscp_unclaim(port);
 out:
 	mutex_unlock(&cdx_dscp_mutex);
 	kfree(filter);
@@ -378,13 +529,14 @@ static int cdx_dscp_destroy(struct net_device *dev, struct flow_cls_offload *f)
 	if (filter) {
 		ceetm_dscp_fq_unmap(cdx_dscp_qm_ctx(dev), filter->dscp);
 		list_del(&filter->list);
+		cdx_dscp_publish(port);
 		/* The last filter takes the map with it, so a port with no
 		 * filters classifies exactly as it did before one existed --
 		 * and hands the microcode's single table back to whichever
-		 * port asks next. */
-		if (list_empty(&port->filters))
-			cdx_dscp_disable(port);
-		cdx_dscp_publish(port);
+		 * port asks next, once nothing here can still read it. The
+		 * filter itself is gone whether or not that finishes now. */
+		if (list_empty(&port->filters) && port->state == CDX_DSCP_ON)
+			cdx_dscp_turn_off(port);
 	}
 	mutex_unlock(&cdx_dscp_mutex);
 	if (!filter)
@@ -422,12 +574,16 @@ void cdx_dscp_port_gone(struct tQM_context_ctl *qm_ctx)
 	if (!port->dev)
 		goto out;
 	/* The caller is releasing the CEETM context, so the map goes with it
-	 * and only the bookkeeping is ours. */
+	 * -- claimed, published or retiring -- and only the bookkeeping is
+	 * ours. A drain running for this port sees it gone and releases
+	 * nothing. */
 	list_for_each_entry_safe(filter, next, &port->filters, list) {
 		list_del(&filter->list);
 		kfree(filter);
 	}
-	port->enabled = false;
+	if (cdx_dscp_retiring == port)
+		cdx_dscp_retiring = NULL;
+	port->state = CDX_DSCP_OFF;
 	cdx_dscp_publish(port);
 	/* The context slot may next belong to a different netdevice. */
 	port->dev = NULL;

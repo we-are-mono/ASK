@@ -51,6 +51,7 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_resolve", "ft_ipsec_flowi", "ft_ipsec_receiving", "ft_ipsec_handle",
         "ft_ipsec_mark", "ft_ipsec_neigh_moved", "ft_ipsec_route_moved",
         "ft_ipsec_all_moved", "ft_ipsec_device_moved", "ft_ipsec_egress_changed",
+        "ft_ipsec_rebuild_pending",
         "ft_ipsec_watch_add", "ft_ipsec_watch_del", "ft_ipsec_watch_flush",
         "ft_ipsec_peer_mac", "ft_ipsec_route_of", "ft_ipsec_next_hop",
         "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",

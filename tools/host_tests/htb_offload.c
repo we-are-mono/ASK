@@ -397,36 +397,66 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 typedef int (*cdx_ft_setup_tc_handler)(struct net_device *dev,
 				       enum tc_setup_type type, void *type_data);
 static cdx_ft_setup_tc_handler cdx_ft_handler;
-/* The flowtable handler's SRCU. One thread cannot run an unregister beside a
- * call, so what is checked is the shape that makes waiting enough: the call
- * is inside the read section, and the unregister clears the pointer before it
- * waits on the same srcu_struct. */
+/* SRCU is a read-side depth here, which the registration's wait asserts is
+ * zero -- a caller that forgot the read lock, or an unregister that did not
+ * wait, fails an assertion rather than a race. Two domains share it: the
+ * egress hook's, below, and the flowtable handler's. One thread cannot run an
+ * unregister beside a call, so what is checked for the handler is the shape
+ * that makes waiting enough: the call is inside the read section, and the
+ * unregister clears the pointer before it waits on the same srcu_struct. */
 struct srcu_struct { int readers; unsigned syncs; };
+#define DEFINE_STATIC_SRCU(name)	static struct srcu_struct name
 static struct srcu_struct cdx_ft_handler_srcu;
 static int srcu_read_lock(struct srcu_struct *ssp) { return ssp->readers++; }
 static void srcu_read_unlock(struct srcu_struct *ssp, int idx)
 { assert(ssp->readers > 0 && idx == --ssp->readers); }
-/* Unused-tolerant so that an unregister that stopped waiting fails the count
- * below rather than the build. */
-static __attribute__((unused)) void synchronize_srcu(struct srcu_struct *ssp)
-{ assert(ssp == &cdx_ft_handler_srcu && !cdx_ft_handler && !ssp->readers); ssp->syncs++; }
+static unsigned srcu_syncs;
+static void synchronize_srcu(struct srcu_struct *ssp)
+{
+	assert(!ssp->readers);
+	if (ssp == &cdx_ft_handler_srcu)
+		assert(!cdx_ft_handler);
+	ssp->syncs++;
+	srcu_syncs++;
+}
 typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
 
-/* The flowtable's hook for a port whose egress queues changed. RTNL is modelled
- * as held throughout, so registration's lock pair has nothing to take. */
-typedef void (*cdx_ft_egress_changed_fn)(struct net_device *dev);
-static cdx_ft_egress_changed_fn cdx_ft_egress_changed_func;
-#define rtnl_lock()		do { } while (0)
-#define rtnl_unlock()		do { } while (0)
+/* The flowtable's hook for a port whose egress changed, kept alive by an SRCU
+ * domain rather than by its callers' RTNL, which the adapter's unload does not
+ * take (the SRCU stubs are above). */
+struct cdx_ft_egress_ops {
+	void (*changed)(struct net_device *dev);
+	int (*drain)(struct net_device *dev);
+};
+#define __rcu
+#define srcu_dereference(p, s)	({ assert((s)->readers > 0); (p); })
+#define rcu_access_pointer(p)	(p)
+#define rcu_assign_pointer(p, v)	((p) = (v))
+#define RCU_INIT_POINTER(p, v)	((p) = (v))
+#define might_sleep()		do { } while (0)
+/* Whether the backend holds any direction, for a drain with no adapter. */
+static bool backend_idle = true;
+static bool cdx_ft_idle(void) { return backend_idle; }
 static struct net_device *egress_changed_dev;
-static unsigned egress_changes;
+static unsigned egress_changes, egress_drains;
+static int egress_drain_rc;
 static void egress_hook(struct net_device *dev)
 {
-	assert(rtnl && dev);
+	assert(dev);
 	egress_changed_dev = dev;
 	egress_changes++;
 }
+static int egress_drain(struct net_device *dev)
+{
+	assert(dev);
+	egress_drains++;
+	return egress_drain_rc;
+}
+static const struct cdx_ft_egress_ops egress_ops = {
+	.changed = egress_hook,
+	.drain = egress_drain,
+};
 
 /* The filter layers, which own what a police action and a DSCP filter mean.
  * This file is about the qdisc layer and the one ndo_setup_tc they all share,
@@ -494,6 +524,9 @@ static void dpa_unregister_setup_tc(void) { registered_ndo = NULL; }
 
 static struct cdx_htb_port cdx_htb_ports[MAX_PHY_PORTS];
 static DEFINE_MUTEX(cdx_htb_mutex);
+DEFINE_STATIC_SRCU(cdx_ft_egress_srcu);
+static const struct cdx_ft_egress_ops __rcu *cdx_ft_egress_ops;
+static DEFINE_MUTEX(cdx_ft_egress_lock);
 
 #include "htb_production.inc"
 
@@ -528,9 +561,11 @@ static void reset_world(void)
 	real_num_tx_queues_fails = 0;
 	class_counters_fail = false;
 	cdx_ft_qos_class_func = NULL;
-	cdx_ft_egress_changed_func = NULL;
+	cdx_ft_egress_ops = NULL;
 	egress_changed_dev = NULL;
-	egress_changes = 0;
+	egress_changes = egress_drains = srcu_syncs = 0;
+	egress_drain_rc = 0;
+	backend_idle = true;
 	stop_calls = 0;
 	fault_point = -1;
 	fault_seen = 0;
@@ -1414,8 +1449,13 @@ static void test_egress_changed(void)
 	unsigned n;
 
 	reset_world();
-	assert(!cdx_register_ft_egress_changed(egress_hook));
-	assert(cdx_register_ft_egress_changed(egress_hook) == -EBUSY);
+	/* Both ops or nothing: a registrant that cannot drain would let the
+	 * DSCP map move while entries still read it. */
+	static const struct cdx_ft_egress_ops no_drain = { .changed = egress_hook };
+	assert(cdx_register_ft_egress(NULL) == -EINVAL);
+	assert(cdx_register_ft_egress(&no_drain) == -EINVAL);
+	assert(!cdx_register_ft_egress(&egress_ops));
+	assert(cdx_register_ft_egress(&egress_ops) == -EBUSY);
 	assert(!create(dev, 1, 20));
 	assert(egress_changes == 1 && egress_changed_dev == dev);
 	assert(!add_leaf(dev, 1, 0, 0, 0, 125000000, 125000000, &qid1));
@@ -1431,9 +1471,29 @@ static void test_egress_changed(void)
 	egress_changed_dev = NULL;
 	assert(!destroy(dev));
 	assert(egress_changes == n + 2 && egress_changed_dev == dev);
-	cdx_unregister_ft_egress_changed();
-	assert(!create(dev, 1, 20) && egress_changes == n + 2);
+
+	/* The DSCP map's callers hold RTNL today, but the hook relies on none
+	 * of the caller's locks, so it works without. */
+	rtnl = false;
+	cdx_ft_egress_changed(&devices[1]);
+	assert(egress_changes == n + 3 && egress_changed_dev == &devices[1]);
+	egress_drain_rc = -EAGAIN;
+	assert(cdx_ft_egress_drain(&devices[1]) == -EAGAIN && egress_drains == 1);
+	egress_drain_rc = 0;
+	assert(!cdx_ft_egress_drain(&devices[1]) && egress_drains == 2);
+	assert(!cdx_ft_egress_srcu.readers);
+	rtnl = true;
+
+	/* Unregistering waits out whoever is inside, and from then on nothing
+	 * reaches the adapter. A drain with no adapter to ask answers from the
+	 * backend: nothing installed, nothing to wait for. */
+	cdx_unregister_ft_egress();
+	assert(srcu_syncs == 1);
+	assert(!create(dev, 1, 20) && egress_changes == n + 3);
 	assert(!destroy(dev));
+	assert(!cdx_ft_egress_drain(dev) && egress_drains == 2);
+	backend_idle = false;
+	assert(cdx_ft_egress_drain(dev) == -EAGAIN);
 	assert_balanced(dev);
 }
 

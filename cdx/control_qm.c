@@ -276,7 +276,7 @@ static U16 qm_query_iface_dscp_fqid_map_handle(void *pcmd, U16 cmd_len, U16 *out
 			  __func__, __LINE__, qm_ctx->iface_info->name);
 		return QOS_ENERR_NOT_CONFIGURED;
 	}
-	pDscpFqMap->enable = qm_ctx->dscp_fq_map ? 1 : 0;
+	pDscpFqMap->enable = rcu_access_pointer(qm_ctx->dscp_fq_map) ? 1 : 0;
 	if (ceetm_get_dscp_fq_map(qm_ctx, pDscpFqMap))
 		return CMD_ERR;
 	*out_reply_len = sizeof(QosIfaceDscpFqidMapCommand);
@@ -507,7 +507,8 @@ int cdx_enable_ceetm_on_iface(struct dpa_iface_info *iface_info)
 		return FAILURE;
 	}
 
-	qm_ctx->dscp_fq_map = NULL;
+	RCU_INIT_POINTER(qm_ctx->dscp_fq_map, NULL);
+	qm_ctx->dscp_fq_claimed = NULL;
 
 	qm_ctx->iface_info = iface_info;
 	qm_ctx->port_info = port_info;

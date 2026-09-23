@@ -129,6 +129,12 @@ struct dpa_iface_info {
     struct { struct net_device *net_dev; unsigned tx_channel_id; } eth_info;
 };
 #define netdev_priv(dev) (&(dev)->priv)
+/* The DSCP map's slow-path table is published under RCU and freed after a
+ * grace period; there are no readers here to wait for. */
+#define __rcu
+struct rcu_head { void *next; };
+#define RCU_INIT_POINTER(p, v) ((p) = (v))
+#define kfree_rcu(p, field) kfree(p)
 #include "qos_types.inc"
 QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
@@ -450,7 +456,10 @@ int main(void)
     assert(!ceetm_get_egressfq(ctx, CDX_CEETM_MAX_CHANNELS + 1, 0));
     assert(!ceetm_get_egressfq(ctx, 1, MAX_SCHEDULER_QUEUES));
     assert(!ceetm_get_egressfq(&gQMCtx[0], 1, 0));
-    ctx->dscp_fq_map = kzalloc(sizeof(*ctx->dscp_fq_map), 0);
+    /* A DSCP map claimed and published: the context release gives both
+     * back, whichever stage it had reached. */
+    ctx->dscp_fq_claimed = kzalloc(sizeof(*ctx->dscp_fq_claimed), 0);
+    ctx->dscp_fq_map = ctx->dscp_fq_claimed;
     dev.priv.ceetm_en = true;
     ctx->qos_enabled = true;
     pending_enqueues = pending_frames = pending_erns = 4;

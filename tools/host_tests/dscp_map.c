@@ -24,6 +24,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define ENOMEM 12
 #define EEXIST 17
 #define EBUSY 16
+#define EAGAIN 11
 #define BIT_ULL(n) (1ULL << (n))
 #define GFP_KERNEL 0
 #define CEETM_SUCCESS 0
@@ -110,7 +111,9 @@ static struct flow_rule *flow_cls_offload_flow_rule(struct flow_cls_offload *f)
 /* --- the port, and the qdisc this file asks questions of ------------------ */
 struct tQM_context_ctl { int portid; };
 struct dpa_priv_s { struct tQM_context_ctl *qm_ctx; };
-struct net_device { struct dpa_priv_s priv; };
+struct net_device { struct dpa_priv_s priv; int refs; };
+static void dev_hold(struct net_device *dev) { assert(dev); dev->refs++; }
+static void dev_put(struct net_device *dev) { assert(dev && dev->refs > 0); dev->refs--; }
 static struct dpa_priv_s *netdev_priv(struct net_device *dev) { return &dev->priv; }
 
 static struct tQM_context_ctl gQMCtx[MAX_PHY_PORTS];
@@ -138,36 +141,115 @@ static int cdx_htb_class_queue(struct net_device *dev, u32 classid, u8 *channel,
     return -ENOENT;
 }
 
-/* The hardware map, recorded rather than performed. */
-static struct { int fq[64]; unsigned enabled, disabled; bool on; } hw;
+/* The hardware map, recorded rather than performed. It is one table for the
+ * whole SoC with one owner, and a port's view of it goes through four steps:
+ * claimed (the owner, programmable), published (new entries on the port read
+ * it), unpublished, released. `enabled' and `disabled' count the claims and
+ * releases; `on' is whether it is published. */
+static struct {
+    int fq[64];
+    unsigned enabled, disabled;
+    bool on;
+    struct tQM_context_ctl *owner;
+} hw;
 static bool enable_fail, map_fail;
-static int ceetm_enable_disable_dscp_fq_map(struct tQM_context_ctl *qm_ctx, u8 status)
+
+/* Everything that orders a transition, in the order it happened, so a case can
+ * say not only that the map ended up right but that nothing could read it at
+ * a moment it was wrong. */
+enum { EV_CLAIM, EV_PROGRAM, EV_PUBLISH, EV_UNPUBLISH, EV_CHANGED, EV_DRAIN, EV_RELEASE };
+static struct { int what; struct tQM_context_ctl *ctx; } events[1024];
+static unsigned nevents;
+static void event(int what, struct tQM_context_ctl *ctx)
 {
-    (void)qm_ctx;
-    if (status) {
-        if (enable_fail) return CEETM_FAILURE;
-        hw.enabled++; hw.on = true;
-    } else {
-        hw.disabled++; hw.on = false;
-        for (unsigned i = 0; i < 64; i++) hw.fq[i] = -1;
-    }
+    assert(nevents < ARRAY_SIZE(events));
+    events[nevents].what = what;
+    events[nevents++].ctx = ctx;
+}
+/* The events since `from', compared against an expected sequence. */
+static bool happened(unsigned from, const int *seq, unsigned n)
+{
+    if (nevents - from != n) return false;
+    for (unsigned i = 0; i < n; i++)
+        if (events[from + i].what != seq[i]) return false;
+    return true;
+}
+
+static int ceetm_dscp_map_claim(struct tQM_context_ctl *qm_ctx)
+{
+    if (hw.owner == qm_ctx) return CEETM_SUCCESS;
+    if (enable_fail || hw.owner) return CEETM_FAILURE;
+    hw.owner = qm_ctx; hw.enabled++;
+    event(EV_CLAIM, qm_ctx);
+    return CEETM_SUCCESS;
+}
+static void ceetm_dscp_map_publish(struct tQM_context_ctl *qm_ctx)
+{
+    assert(hw.owner == qm_ctx && !hw.on);
+    hw.on = true;
+    event(EV_PUBLISH, qm_ctx);
+}
+static void ceetm_dscp_map_unpublish(struct tQM_context_ctl *qm_ctx)
+{
+    assert(hw.owner == qm_ctx && hw.on);
+    hw.on = false;
+    event(EV_UNPUBLISH, qm_ctx);
+}
+static int ceetm_dscp_map_release(struct tQM_context_ctl *qm_ctx)
+{
+    assert(hw.owner == qm_ctx);
+    hw.owner = NULL; hw.on = false; hw.disabled++;
+    for (unsigned i = 0; i < 64; i++) hw.fq[i] = -1;
+    event(EV_RELEASE, qm_ctx);
     return CEETM_SUCCESS;
 }
 static int ceetm_dscp_fq_map(struct tQM_context_ctl *qm_ctx, u8 dscp, u8 channel, u8 cq)
 {
-    (void)qm_ctx;
+    /* Only the owner's table can be written. */
+    assert(hw.owner == qm_ctx);
     if (map_fail) return CEETM_FAILURE;
     assert(dscp < 64);
     hw.fq[dscp] = (channel << 8) | cq;
+    event(EV_PROGRAM, qm_ctx);
     return CEETM_SUCCESS;
 }
 static int ceetm_dscp_fq_unmap(struct tQM_context_ctl *qm_ctx, u8 dscp)
 {
-    (void)qm_ctx;
+    assert(hw.owner == qm_ctx);
     assert(dscp < 64);
     hw.fq[dscp] = -1;
     return CEETM_SUCCESS;
 }
+
+/* The flowtable's egress hook. changed() is recorded; drain() is recorded and
+ * answers `drain_rc', and a case can have it run something first, which is
+ * what happens concurrently in production while the mutex is dropped. */
+struct net_device;
+static int drain_rc;
+static void (*during_drain)(void);
+static unsigned drains_running;
+static void cdx_ft_egress_changed(struct net_device *dev)
+{
+    struct tQM_context_ctl *ctx = netdev_priv(dev)->qm_ctx;
+
+    event(EV_CHANGED, ctx);
+}
+static int cdx_ft_egress_drain(struct net_device *dev)
+{
+    void (*hook)(void) = during_drain;
+
+    assert(dev && dev->refs > 0);
+    event(EV_DRAIN, netdev_priv(dev)->qm_ctx);
+    drains_running++;
+    during_drain = NULL;
+    if (hook) hook();
+    drains_running--;
+    return drain_rc;
+}
+static unsigned warnings;
+#define pr_warn(...) ((void)snprintf(NULL, 0, __VA_ARGS__), warnings++)
+#define __must_hold(x)
+static const char *netdev_name(const struct net_device *dev) { (void)dev; return "eth"; }
 
 #include "dscp_production.inc"
 
@@ -201,6 +283,173 @@ static int del(unsigned long cookie)
         .command = FLOW_CLS_DESTROY, .cookie = cookie };
     ack.msg = NULL;
     return cdx_dscp_flower(&dev, &f);
+}
+
+/* ---- turning the map on and off retires what the hardware installed ---- */
+
+/* Two ports, as the map is moved between the LAN and the WAN. */
+static struct net_device lan = { .priv.qm_ctx = &gQMCtx[3] };
+static struct net_device wan = { .priv.qm_ctx = &gQMCtx[4] };
+
+static int add_on(struct net_device *d, unsigned long cookie, u8 dscp)
+{
+    struct flow_rule r = dscp_rule(dscp, 0x00010010);
+    struct flow_cls_offload f = { .common = { .extack = &ack },
+        .command = FLOW_CLS_REPLACE, .cookie = cookie, .rule = &r };
+    r.match.dissector = &r.dis;
+    ack.msg = NULL;
+    return cdx_dscp_flower(d, &f);
+}
+
+static int del_on(struct net_device *d, unsigned long cookie)
+{
+    struct flow_cls_offload f = { .common = { .extack = &ack },
+        .command = FLOW_CLS_DESTROY, .cookie = cookie };
+    ack.msg = NULL;
+    return cdx_dscp_flower(d, &f);
+}
+
+#define HAPPENED(from, ...) ({ static const int __seq[] = { __VA_ARGS__ }; \
+    happened((from), __seq, ARRAY_SIZE(__seq)); })
+
+/* What runs while a drain has the mutex dropped. */
+static int concurrent_rc;
+static void wan_asks(void) { concurrent_rc = add_on(&wan, 90, 46); }
+static void lan_takes_it_back_and_lets_go(void)
+{
+    /* Retiring is still this port's claim, so taking it back needs no
+     * drain -- and letting go again cannot start a second drain while the
+     * first is running, so it asks the first to go round again. */
+    assert(!add_on(&lan, 91, 46) && hw.on && hw.owner == &gQMCtx[3]);
+    assert(!del_on(&lan, 91));
+    assert(!hw.on && hw.owner == &gQMCtx[3]);
+}
+static void lan_goes(void)
+{
+    /* The interface is removed: its filters go, and the context release
+     * that follows gives the claim back itself. */
+    cdx_dscp_port_gone(&gQMCtx[3]);
+    ceetm_dscp_map_release(&gQMCtx[3]);
+    /* The map is free, but the drain still running is what proves the
+     * port's entries are out of the hardware; until it returns, another
+     * port is told to wait. */
+    concurrent_rc = add_on(&wan, 92, 46);
+}
+
+static void test_transitions(void)
+{
+    unsigned from;
+
+    memset(&hw, 0, sizeof(hw));
+    for (unsigned i = 0; i < 64; i++) hw.fq[i] = -1;
+    nevents = 0;
+
+    /* On: claimed, programmed, published, and only then is the port told,
+     * so the flows it retires come back reading a table already filled. */
+    from = nevents;
+    assert(!add_on(&lan, 20, 46));
+    assert(HAPPENED(from, EV_CLAIM, EV_PROGRAM, EV_PUBLISH, EV_CHANGED));
+    assert(events[from + 3].ctx == &gQMCtx[3]);
+
+    /* Editing one codepoint while the map stays on retires nothing: an
+     * entry reads the table per frame. */
+    from = nevents;
+    assert(!add_on(&lan, 21, 10));
+    assert(HAPPENED(from, EV_PROGRAM));
+    from = nevents;
+    assert(!del_on(&lan, 21));
+    assert(nevents == from && hw.on);
+
+    /* Off: unpublished, the port told, the retirement waited out, and only
+     * then is the table handed back for another port to take. */
+    from = nevents;
+    assert(!del_on(&lan, 20));
+    assert(HAPPENED(from, EV_UNPUBLISH, EV_CHANGED, EV_DRAIN, EV_RELEASE));
+    assert(!hw.owner && !hw.on && !lan.refs);
+
+    /* Another port asking while the drain runs is told to wait, and gets
+     * the map once it has been handed back. */
+    assert(!add_on(&lan, 22, 46));
+    during_drain = wan_asks;
+    concurrent_rc = 0;
+    assert(!del_on(&lan, 22));
+    assert(concurrent_rc == -EBUSY && ack.msg);
+    assert(!hw.owner);
+    from = nevents;
+    assert(!add_on(&wan, 30, 46));
+    assert(HAPPENED(from, EV_CLAIM, EV_PROGRAM, EV_PUBLISH, EV_CHANGED));
+    assert(events[from].ctx == &gQMCtx[4] && hw.owner == &gQMCtx[4]);
+    assert(!del_on(&wan, 30) && !hw.owner);
+
+    /* A drain that cannot prove the entries gone keeps the claim, and says
+     * so. The next port to ask tries the drain again, and is refused while
+     * it still cannot finish -- the map stays where its readers are. */
+    assert(!add_on(&lan, 23, 46));
+    drain_rc = -EAGAIN;
+    warnings = 0;
+    assert(!del_on(&lan, 23));
+    assert(hw.owner == &gQMCtx[3] && !hw.on && warnings == 1);
+    from = nevents;
+    assert(add_on(&wan, 31, 46) == -EBUSY);
+    assert(HAPPENED(from, EV_DRAIN) && hw.owner == &gQMCtx[3]);
+    drain_rc = 0;
+    from = nevents;
+    assert(!add_on(&wan, 31, 46));
+    assert(HAPPENED(from, EV_DRAIN, EV_RELEASE, EV_CLAIM, EV_PROGRAM, EV_PUBLISH,
+                    EV_CHANGED));
+    assert(hw.owner == &gQMCtx[4]);
+    assert(!del_on(&wan, 31) && !hw.owner);
+
+    /* The port whose claim is retiring can take it back without a drain:
+     * whatever still reads it reads that port's own queues. */
+    assert(!add_on(&lan, 24, 46));
+    drain_rc = -EAGAIN;
+    assert(!del_on(&lan, 24));
+    drain_rc = 0;
+    from = nevents;
+    assert(!add_on(&lan, 25, 46));
+    assert(HAPPENED(from, EV_PROGRAM, EV_PUBLISH, EV_CHANGED) && hw.on);
+    from = nevents;
+    assert(!del_on(&lan, 25));
+    assert(HAPPENED(from, EV_UNPUBLISH, EV_CHANGED, EV_DRAIN, EV_RELEASE));
+
+    /* Taken back and let go again while the first drain runs: that drain
+     * releases nothing on the strength of a wait that began before the
+     * second retirement, and goes round again first. */
+    assert(!add_on(&lan, 26, 46));
+    during_drain = lan_takes_it_back_and_lets_go;
+    from = nevents;
+    assert(!del_on(&lan, 26));
+    assert(HAPPENED(from, EV_UNPUBLISH, EV_CHANGED, EV_DRAIN,
+                    EV_PROGRAM, EV_PUBLISH, EV_CHANGED, EV_UNPUBLISH, EV_CHANGED,
+                    EV_DRAIN, EV_RELEASE));
+    assert(!hw.owner && !lan.refs);
+
+    /* The port goes while its drain runs: the drain releases nothing, the
+     * context did, and another port waits for the drain all the same. */
+    assert(!add_on(&lan, 28, 46));
+    during_drain = lan_goes;
+    concurrent_rc = 0;
+    from = nevents;
+    assert(!del_on(&lan, 28));
+    assert(concurrent_rc == -EBUSY);
+    assert(HAPPENED(from, EV_UNPUBLISH, EV_CHANGED, EV_DRAIN, EV_RELEASE));
+    assert(!hw.owner && !lan.refs);
+    assert(!add_on(&wan, 32, 46) && hw.owner == &gQMCtx[4]);
+    assert(!del_on(&wan, 32) && !hw.owner);
+
+    /* A first filter that cannot be programmed gives back a claim nothing
+     * ever read: no port is told anything and nothing is drained. */
+    map_fail = true;
+    from = nevents;
+    assert(add_on(&wan, 33, 46) == -EINVAL);
+    map_fail = false;
+    assert(HAPPENED(from, EV_CLAIM, EV_RELEASE) && !hw.owner);
+
+    for (unsigned pass = 0; pass < 2; pass++)
+        for (unsigned i = 0; i < ARRAY_SIZE(gQMCtx); i++)
+            cdx_dscp_port_gone(&gQMCtx[i]);
+    assert(!allocations && !drains_running);
 }
 
 int main(void)
@@ -361,7 +610,8 @@ int main(void)
     assert(!allocations && hw.disabled == disabled);
     for (unsigned dscp = 0; dscp < 64; dscp++)
         assert(cdx_dscp_class(&gQMCtx[3], dscp) == 0);
-    ceetm_enable_disable_dscp_fq_map(&gQMCtx[3], 0);
+    /* What the context release does with the claim. */
+    ceetm_dscp_map_release(&gQMCtx[3]);
 
     /* Reusing the slot must not dereference the previous device, whose
      * CEETM attachment no longer exists. */
@@ -381,6 +631,8 @@ int main(void)
             cdx_dscp_port_gone(&gQMCtx[i]);
 
     assert(!allocations);
-    puts("DSCP map: codepoint parse, class resolution, tree tracking and teardown passed");
+    test_transitions();
+    puts("DSCP map: codepoint parse, class resolution, tree tracking, transitions and "
+         "teardown passed");
     return 0;
 }

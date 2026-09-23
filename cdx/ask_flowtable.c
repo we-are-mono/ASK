@@ -3631,8 +3631,13 @@ struct ft_ipsec_watch {
 	u8 family;
 	bool stale;
 	/* Rebuild even though neither address moved: the port's egress queues
-	 * changed under the entry, which names one of them. */
+	 * changed under the entry, which names one of them. Set until a
+	 * rebuild succeeds, not merely until a pass takes the watch on, since
+	 * a caller waiting for the change to reach the hardware reads it
+	 * (ft_ipsec_rebuild_pending()); `rebuilds_asked' counts the changes,
+	 * so a rebuild clears it only if no other change landed meanwhile. */
 	bool rebuild;
+	u32 rebuilds_asked;
 	/* A failure has been reported for this watch, so the next one stays
 	 * quiet. Cleared by a rebuild that works, because the next failure
 	 * after a recovery is news again. */
@@ -3643,6 +3648,11 @@ static LIST_HEAD(ft_ipsec_watches);
 static u64 ft_ipsec_watch_cookies;
 static u64 ft_ipsec_follow_pass;
 static atomic64_t ft_ipsec_next_hop_updates = ATOMIC64_INIT(0);
+/* Egress changes seen so far. An SA being installed while one lands is not on
+ * the watch list yet for the change to mark, and its entry may have been built
+ * from either side of it; the install compares this across the build and marks
+ * its own watch instead. */
+static atomic64_t ft_ipsec_egress_changes = ATOMIC64_INIT(0);
 
 static void ft_ipsec_follow_work(struct work_struct *work);
 static DECLARE_WORK(ft_ipsec_follow, ft_ipsec_follow_work);
@@ -3752,18 +3762,44 @@ static void ft_ipsec_device_moved(const struct net_device *dev)
 /* This port's egress queues changed under the SAs riding it: an outbound SA's
  * entry, the one SEC's output is classified by, names the queue it transmits
  * on, chosen when it was built. Neither address moved, so this asks for the
- * rebuild outright rather than for a check. */
+ * rebuild outright rather than for a check.
+ *
+ * Counted first, fully ordered after whatever the caller changed and before
+ * the walk: an install that read the count before this built from the old
+ * state, and it either sees the new count when it publishes its watch or
+ * publishes it before the walk below finds it. */
 static void ft_ipsec_egress_changed(const struct net_device *dev)
 {
 	struct ft_ipsec_watch *watch;
 
+	atomic64_inc_return(&ft_ipsec_egress_changes);
 	spin_lock_bh(&ft_watch_lock);
 	list_for_each_entry(watch, &ft_ipsec_watches, list)
 		if (watch->dev == dev) {
 			watch->rebuild = true;
+			watch->rebuilds_asked++;
 			ft_ipsec_mark(watch);
 		}
 	spin_unlock_bh(&ft_watch_lock);
+}
+
+/* Whether an SA on this port still has the rebuild an egress change asked for
+ * outstanding. The flag stays set while a pass is rebuilding the entry and
+ * after a rebuild that failed, whose entry keeps the egress it was built with:
+ * that is the thing a caller waiting on the change needs to know. */
+static bool ft_ipsec_rebuild_pending(const struct net_device *dev)
+{
+	struct ft_ipsec_watch *watch;
+	bool pending = false;
+
+	spin_lock_bh(&ft_watch_lock);
+	list_for_each_entry(watch, &ft_ipsec_watches, list)
+		if (watch->dev == dev && watch->rebuild) {
+			pending = true;
+			break;
+		}
+	spin_unlock_bh(&ft_watch_lock);
+	return pending;
 }
 
 /* Publish a freshly installed outbound SA's next hop for watching.
@@ -3776,11 +3812,18 @@ static void ft_ipsec_egress_changed(const struct net_device *dev)
  * nothing to do. Resolving the peer at install can wait seconds for a cold
  * ARP cache, and the watch does not exist for any of it; an event arriving in
  * that window would be lost. Starting stale closes it.
+ *
+ * An egress change is the one event a check cannot recover, because it moves
+ * nothing a check compares: @changes is the count the install read before
+ * building, and a count that has moved since publishes the watch asking for
+ * the rebuild outright. Called in the install's control transaction, so a
+ * caller that passes through one after changing the port finds the watch
+ * already listed.
  */
 static void ft_ipsec_watch_add(struct ft_ipsec_watch *watch,
 			       const struct cdx_ipsec_sa_spec *spec,
 			       struct cdx_ipsec_sa *sa,
-			       const struct ft_ipsec_route *route)
+			       const struct ft_ipsec_route *route, s64 changes)
 {
 	watch->sa = sa;
 	watch->dev = spec->dev;
@@ -3792,6 +3835,7 @@ static void ft_ipsec_watch_add(struct ft_ipsec_watch *watch,
 	ether_addr_copy(watch->src_mac, spec->dev->dev_addr);
 	spin_lock_bh(&ft_watch_lock);
 	watch->cookie = ++ft_ipsec_watch_cookies;
+	watch->rebuild = atomic64_read(&ft_ipsec_egress_changes) != changes;
 	list_add_tail(&watch->list, &ft_ipsec_watches);
 	ft_ipsec_mark(watch);
 	spin_unlock_bh(&ft_watch_lock);
@@ -4368,20 +4412,87 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 	return NOTIFY_DONE;
 }
 
-/* CDX changed a port's egress queues: an HTB tree switched it to or from
- * CEETM, or a class moved or went away (cdx_register_ft_egress_changed()).
- * Each hardware entry transmitting on the port names a queue chosen when it
- * was installed, and nothing drains the queues of the mode the port left, so
+/* CDX changed a port's egress: an HTB tree switched it to or from CEETM, a
+ * class moved or went away, or the DSCP map was turned on or off for it
+ * (struct cdx_ft_egress_ops). Each hardware entry transmitting on the port
+ * names a queue chosen when it was installed -- or the map, which reads one
+ * per frame -- and nothing drains the queues of the mode the port left, so
  * everything on it is re-installed against what the port has now. Flows are
  * retired and readmitted on their next packet, which is the same treatment a
  * route or MTU change gets; SAs are rebuilt in place, because nothing
- * re-offers one. Called under RTNL. */
+ * re-offers one. Multicast replicas are not flow entries, and neither this
+ * nor ft_egress_drain() covers them.
+ *
+ * Takes only ft_watch_lock and never sleeps, and relies on no lock of the
+ * caller's: both callers hold RTNL, but admission is caught without it.
+ * Admission publishes an entry on the watch list before building the hardware
+ * entry and removes it if the handle was invalidated meanwhile, so an
+ * admission racing this either is marked here or builds from the state the
+ * caller changed before calling. An SA install does the same through the
+ * egress count (ft_ipsec_watch_add()). */
 static void ft_egress_changed(struct net_device *dev)
 {
-	ASSERT_RTNL();
 	ft_device_retire(dev, &ft_qos_invalidations);
 	ft_ipsec_egress_changed(dev);
 }
+
+/* Wait until everything ft_egress_changed(dev) started has finished: every
+ * flow it retired is out of the hardware, and every SA on the port it asked to
+ * rebuild has been rebuilt. CDX calls this before handing the microcode's DSCP
+ * map to another port: the map is one table with no port in it, so an entry
+ * still reading it after the hand-over would transmit on the other port's
+ * queues.
+ *
+ * Retirement stands aside for a global invalidation, which removes every
+ * entry itself, so that is waited for too -- and a recovery that cannot finish
+ * yet, the hardware not proven stopped, is reported rather than waited out.
+ * So is an unload in progress, which retires everything on its own schedule,
+ * and an SA whose rebuild failed and is waiting for its peer. -EAGAIN leaves
+ * nothing to undo; the caller asks again later.
+ *
+ * Sleeps. Safe under RTNL, which none of the work waited on takes except by
+ * trying; not under the control mutex, which all of it takes. */
+static int ft_egress_drain(struct net_device *dev)
+{
+	bool done;
+
+	might_sleep();
+	flush_work(&ft_retire_work);
+	if (atomic_read(&ft_invalid)) {
+		flush_delayed_work(&ft_work);
+		/* A rearm since the read above cleared the latch and reset the
+		 * done flag with it -- which it only does once the invalidation
+		 * has finished, so that counts as done too. */
+		cdx_ft_begin();
+		done = ft_invalid_done || !atomic_read(&ft_invalid);
+		cdx_ft_end();
+		if (!done)
+			return -EAGAIN;
+	}
+	if (READ_ONCE(ft_stopping))
+		return -EAGAIN;
+	/* An SA installing across the change publishes its watch, marked if
+	 * the change reached it too late, inside its control transaction; one
+	 * passed through here has finished doing so. */
+	cdx_ft_begin();
+	cdx_ft_end();
+	/* The flag stays set until the rebuild has happened, through a pass
+	 * running now and through a failure, which waits for the next event
+	 * that would retry it; so ask for a pass and wait for it rather than
+	 * for one that nothing may be running. */
+	if (ft_ipsec_rebuild_pending(dev)) {
+		schedule_work(&ft_ipsec_follow);
+		flush_work(&ft_ipsec_follow);
+		if (ft_ipsec_rebuild_pending(dev))
+			return -EAGAIN;
+	}
+	return 0;
+}
+
+static const struct cdx_ft_egress_ops ft_egress_ops = {
+	.changed = ft_egress_changed,
+	.drain = ft_egress_drain,
+};
 
 /* --------------------------------------------- The multicast key namespace
  *
@@ -7754,6 +7865,7 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	struct cdx_ipsec_sa_spec spec;
 	struct ft_ipsec_route route;
 	struct cdx_ipsec_sa *sa;
+	s64 changes;
 	int rc;
 
 	/* Crypto offload would leave the stack building every ESP header and
@@ -7802,7 +7914,14 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 		return -ENOMEM;
 	}
 	cdx_ft_begin();
+	/* Before the build reads the port's egress, which an egress change
+	 * updates before counting itself. */
+	changes = atomic64_read_acquire(&ft_ipsec_egress_changes);
 	rc = cdx_ipsec_sa_add(&spec, x, &sa);
+	if (!rc && watch) {
+		ft_ipsec_route_of(x, &route);
+		ft_ipsec_watch_add(watch, &spec, sa, &route, changes);
+	}
 	cdx_ft_end();
 	if (rc) {
 		kfree(retirement);
@@ -7818,10 +7937,6 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	/* Nothing if the accounting pass is already queued, and otherwise the
 	 * start of it: the pass stops itself once no SA is owned. */
 	schedule_delayed_work(&ft_ipsec_stats, FT_IPSEC_STATS_PERIOD);
-	if (watch) {
-		ft_ipsec_route_of(x, &route);
-		ft_ipsec_watch_add(watch, &spec, sa, &route);
-	}
 	/* The opaque owner, not the sixteen-bit handle: it identifies this SA
 	 * for as long as it lives, whereas a handle becomes reusable the
 	 * moment the SA is deleted. cdx_ipsec_sa_handle() still answers for
@@ -7949,6 +8064,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 	u8 was_src[ETH_ALEN];
 	u8 mac[ETH_ALEN];
 	bool reported, rebuild;
+	u32 asked;
 	u64 cookie;
 	u64 pass;
 	struct ft_ipsec_route route;
@@ -7975,8 +8091,10 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		local = watch->local;
 		peer = watch->peer;
 		reported = watch->reported;
+		/* Left set: it is cleared below once the rebuild has happened,
+		 * and only if no egress change asked for another meanwhile. */
 		rebuild = watch->rebuild;
-		watch->rebuild = false;
+		asked = watch->rebuilds_asked;
 		ether_addr_copy(was_dst, watch->dst_mac);
 		ether_addr_copy(was_src, watch->src_mac);
 		dev_hold(dev);
@@ -8006,6 +8124,8 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 					ether_addr_copy(watch->src_mac,
 							dev->dev_addr);
 					watch->reported = false;
+					if (watch->rebuilds_asked == asked)
+						watch->rebuild = false;
 				}
 				spin_unlock_bh(&ft_watch_lock);
 				atomic64_inc(&ft_ipsec_next_hop_updates);
@@ -8019,7 +8139,6 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 			watch = ft_ipsec_watch_find(cookie);
 			if (watch) {
 				watch->stale = true;
-				watch->rebuild |= rebuild;
 				watch->reported = true;
 			}
 			spin_unlock_bh(&ft_watch_lock);
@@ -8937,9 +9056,17 @@ static int __init ask_flowtable_init(void)
 		rc = -ENOMEM;
 		goto release;
 	}
-	rc = ft_init_fault(2) ? -ENOMEM : register_netdevice_notifier(&ft_netdev_nb);
+	/* Be told when a port's egress changes under its entries -- before
+	 * anything can build one. The netdev replay below attaches the ports
+	 * an SA is installed through, and a flow needs the binds after it; an
+	 * entry built before this, from egress that changed before it too,
+	 * would never be re-installed. */
+	rc = ft_init_fault(11) ? -EBUSY : cdx_register_ft_egress(&ft_egress_ops);
 	if (rc)
 		goto proc;
+	rc = ft_init_fault(2) ? -ENOMEM : register_netdevice_notifier(&ft_netdev_nb);
+	if (rc)
+		goto egress;
 	rc = ft_init_fault(3) ? -ENOMEM : register_netevent_notifier(&ft_neigh_nb);
 	if (rc)
 		goto netdev;
@@ -8976,14 +9103,8 @@ static int __init ask_flowtable_init(void)
 	/* Hand the classifier over too, so a frame the software path sends
 	 * takes the class this same function gave the flow's hardware rule. */
 	rc = ft_init_fault(10) ? -EBUSY : cdx_register_ft_qos_class(ft_qos_class);
-	if (rc)
-		goto classifier;
-	/* And be told when a port's egress queues change under its entries. */
-	rc = ft_init_fault(11) ? -EBUSY : cdx_register_ft_egress_changed(ft_egress_changed);
 	if (!rc)
 		return 0;
-	cdx_unregister_ft_qos_class();
-classifier:
 	cdx_unregister_ft_setup_tc();
 indirect:
 	/* A route was open, so binds may have arrived and be carrying flows,
@@ -9005,16 +9126,12 @@ indirect:
 	ft_block_drain();
 not_ready:
 	/* ft_rearm() reads ft_ready under the transaction, so clearing it
-	 * there means no pass that starts later requeues a parked retry. With
-	 * ft_stopping set nothing requeues the other two either, and with every
-	 * binding gone nothing is left to queue them, so these cancels are
-	 * final even while the notifiers below are still registered. */
+	 * there means no pass that starts later requeues a parked retry. The
+	 * works themselves are cancelled below, once CDX's egress hook, which
+	 * can queue retirement, is closed too. */
 	cdx_ft_begin();
 	WRITE_ONCE(ft_ready, false);
 	cdx_ft_end();
-	cancel_work_sync(&ft_retire_work);
-	cancel_delayed_work_sync(&ft_work);
-	cancel_delayed_work_sync(&ft_rearm_work);
 	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
 	/* A port may have stopped since the chain was registered: its sweep
 	 * runs this module's code, so it finishes before the text goes. */
@@ -9029,6 +9146,17 @@ neigh:
 	unregister_netevent_notifier(&ft_neigh_nb);
 netdev:
 	unregister_netdevice_notifier(&ft_netdev_nb);
+	/* Before the work below is cancelled, as on unload: the hook marks
+	 * entries and SAs and queues the passes that act on them. */
+	cdx_unregister_ft_egress();
+	/* A route may have been open, with work queued on a binding's behalf.
+	 * With ft_stopping set nothing requeues retirement or the installer,
+	 * with ft_ready clear nothing requeues a parked retry, and with every
+	 * binding gone and the notifiers and the egress hook closed nothing is
+	 * left to queue any of them, so these cancels are final. */
+	cancel_work_sync(&ft_retire_work);
+	cancel_delayed_work_sync(&ft_work);
+	cancel_delayed_work_sync(&ft_rearm_work);
 	/* Both chains are unregistered above, so nothing can add a membership
 	 * or an MFC entry while these drain. Registering either replays what
 	 * already exists -- the FIB notifier dumps every VIF and MFC entry,
@@ -9059,6 +9187,10 @@ netdev:
 	 * notifier that could queue the reaper is already unregistered above. */
 	cancel_work_sync(&ft_dev_stats_work);
 	ft_dev_stats_drop_all();
+	goto proc;
+egress:
+	/* Nothing the hook could mark exists before the netdev replay. */
+	cdx_unregister_ft_egress();
 proc:
 	proc_remove(ft_proc);
 	ft_proc = NULL;
@@ -9095,6 +9227,11 @@ static void __exit ask_flowtable_exit(void)
 	unregister_fib_notifier(&init_net, &ft_fib_nb);
 	unregister_netevent_notifier(&ft_neigh_nb);
 	unregister_netdevice_notifier(&ft_netdev_nb);
+	/* CDX's egress hook is the other thing that marks entries and SAs, and
+	 * no notifier above is what excludes it. Close it with them, before
+	 * any of the work it queues is cancelled below; this also waits out a
+	 * call already inside it. */
+	cdx_unregister_ft_egress();
 	/* After the switchdev chain is gone, so nothing can add a membership
 	 * while the groups drain, and before the module's text does -- the
 	 * worker holds a pointer into it. */
@@ -9136,7 +9273,6 @@ static void __exit ask_flowtable_exit(void)
 	 * classifier goes with it, and waits out the frames inside it. */
 	cdx_unregister_ft_setup_tc();
 	cdx_unregister_ft_qos_class();
-	cdx_unregister_ft_egress_changed();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
 	/* Indirect binds are gone with the line above; the direct ones are
 	 * still Netfilter's, and nothing else will ever hand them back. */

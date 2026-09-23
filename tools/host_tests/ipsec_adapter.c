@@ -28,6 +28,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int64_t s64;
 typedef uint16_t __be16;
 typedef uint32_t __be32;
 
@@ -138,6 +139,9 @@ typedef long long atomic64_t;
 #define ATOMIC64_INIT(v) (v)
 static void atomic64_inc(atomic64_t *v) { (*v)++; }
 static void atomic64_inc_return_release(atomic64_t *v) { (*v)++; }
+static atomic64_t atomic64_inc_return(atomic64_t *v) { return ++*v; }
+static atomic64_t atomic64_read(const atomic64_t *v) { return *v; }
+static atomic64_t atomic64_read_acquire(const atomic64_t *v) { return *v; }
 static atomic64_t ft_ipsec_genid;
 
 static int ft_watch_lock;
@@ -572,6 +576,8 @@ static unsigned sa_next_hop_calls;
 #include "ipsec_types.inc"
 
 static bool cdx_ipsec_port_supported(struct net_device *dev);
+static struct net_device *egress_change_during_add;
+static void ft_ipsec_egress_changed(const struct net_device *dev);
 
 static u16 cdx_ipsec_sa_handle(const struct cdx_ipsec_sa *sa)
 {
@@ -590,6 +596,10 @@ static int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec,
 		return -EOPNOTSUPP;
 	if (sa_add_error)
 		return sa_add_error;
+	/* The port's egress changing after the build read it and before the
+	 * install publishes its watch. */
+	if (egress_change_during_add)
+		ft_ipsec_egress_changed(egress_change_during_add);
 	assert(sa_installed < sizeof(sa_pool) / sizeof(sa_pool[0]));
 	sa = &sa_pool[sa_installed];
 	sa->handle = (u16)(sa_installed + 1);
@@ -609,12 +619,20 @@ static void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 	*sa = NULL;
 	sa_deleted++;
 }
+/* What a rebuild in progress lets a drain see, and an egress change landing
+ * while it runs. */
+static bool ft_ipsec_rebuild_pending(const struct net_device *dev);
+static struct net_device *pending_during_rebuild, *egress_change_during_rebuild;
 static int cdx_ipsec_sa_set_next_hop(struct cdx_ipsec_sa *sa, const u8 *dst_mac)
 {
 	sa_next_hop_calls++;
 	/* The invariant the watch design rests on: a rebuild is only ever
 	 * handed an SA that is still installed. */
 	assert(sa && sa->live && sa->outbound);
+	if (pending_during_rebuild)
+		assert(ft_ipsec_rebuild_pending(pending_during_rebuild));
+	if (egress_change_during_rebuild)
+		ft_ipsec_egress_changed(egress_change_during_rebuild);
 	if (sa_next_hop_error)
 		return sa_next_hop_error;
 	ether_addr_copy(sa->dst_mac, dst_mac);
@@ -1759,6 +1777,57 @@ static void test_watch_routes_like_install(void)
 	bench_clear_sas();
 }
 
+/* An egress change landing while an SA is being installed. The build may have
+ * read the port's queues from before it, and the watch the change would mark
+ * is not listed yet, so nothing but the install can notice: it compares the
+ * change count across the build and publishes its watch asking for the rebuild
+ * itself. A caller draining the change finds it outstanding. */
+static void test_watch_egress_change_during_install(void)
+{
+	struct netlink_ext_ack ack = { NULL };
+	struct xfrm_state state;
+
+	bench_reset();
+	bench_clear_sas();
+	state = *outbound_state();
+	egress_change_during_add = &WAN;
+	assert(ft_xdo_state_add(&state, &ack) == 0);
+	egress_change_during_add = NULL;
+	assert(ft_ipsec_rebuild_pending(&WAN) && !ft_ipsec_rebuild_pending(&LAN));
+	assert(works_scheduled == 1 && sa_next_hop_calls == 0);
+	/* Neither address moved, and the rebuild happens anyway. */
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 1 && !ft_ipsec_rebuild_pending(&WAN));
+	assert(dev_holds == 0 && !ft_transaction);
+	ft_xdo_state_delete(&state);
+	bench_clear_sas();
+
+	/* A change on another port is not this SA's, but the count is global:
+	 * the install asks for a rebuild it did not need, which costs one
+	 * rewrite of an unchanged entry and nothing else. */
+	bench_reset();
+	state = *outbound_state();
+	egress_change_during_add = &LAN;
+	assert(ft_xdo_state_add(&state, &ack) == 0);
+	egress_change_during_add = NULL;
+	assert(ft_ipsec_rebuild_pending(&WAN));
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 1 && !ft_ipsec_rebuild_pending(&WAN));
+	ft_xdo_state_delete(&state);
+	bench_clear_sas();
+
+	/* An install no change crossed publishes a watch asking for nothing:
+	 * one check, no rebuild. */
+	bench_reset();
+	state = *outbound_state();
+	assert(ft_xdo_state_add(&state, &ack) == 0);
+	assert(!ft_ipsec_rebuild_pending(&WAN));
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 0);
+	ft_xdo_state_delete(&state);
+	bench_clear_sas();
+}
+
 static void test_watch_route_and_device(void)
 {
 	struct xfrm_state state;
@@ -1839,12 +1908,43 @@ static void test_watch_route_and_device(void)
 	works_scheduled = 0;
 	ft_ipsec_egress_changed(&LAN);
 	assert(works_scheduled == 0);
+	assert(!ft_ipsec_rebuild_pending(&LAN) && !ft_ipsec_rebuild_pending(&WAN));
 	ft_ipsec_egress_changed(&WAN);
 	assert(works_scheduled == 1);
+	/* Outstanding until the rebuild happens, and only on its own port: a
+	 * caller waiting on the change -- the DSCP map leaving the port --
+	 * asks exactly this. */
+	assert(ft_ipsec_rebuild_pending(&WAN) && !ft_ipsec_rebuild_pending(&LAN));
 	ft_ipsec_follow_work(NULL);
 	assert(sa_next_hop_calls == 3);
+	assert(!ft_ipsec_rebuild_pending(&WAN));
 	ft_ipsec_follow_work(NULL);
 	assert(sa_next_hop_calls == 3);
+	/* A rebuild that fails stays outstanding. */
+	route_neigh = NULL;
+	ft_ipsec_egress_changed(&WAN);
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 3 && ft_ipsec_rebuild_pending(&WAN));
+	route_neigh = &peer_neigh;
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 4 && !ft_ipsec_rebuild_pending(&WAN));
+	/* Outstanding while the rebuild runs, too: a pass that has taken the
+	 * watch on has not rebuilt anything yet, and a drain reading the flag
+	 * then must not be told the change reached the hardware. */
+	ft_ipsec_egress_changed(&WAN);
+	pending_during_rebuild = &WAN;
+	ft_ipsec_follow_work(NULL);
+	pending_during_rebuild = NULL;
+	assert(sa_next_hop_calls == 5 && !ft_ipsec_rebuild_pending(&WAN));
+	/* A change landing while a rebuild runs asks for another: the one
+	 * running may have read the port before it. */
+	ft_ipsec_egress_changed(&WAN);
+	egress_change_during_rebuild = &WAN;
+	ft_ipsec_follow_work(NULL);
+	egress_change_during_rebuild = NULL;
+	assert(sa_next_hop_calls == 6 && ft_ipsec_rebuild_pending(&WAN));
+	ft_ipsec_follow_work(NULL);
+	assert(sa_next_hop_calls == 7 && !ft_ipsec_rebuild_pending(&WAN));
 	WAN.dev_addr[5] = 4;
 
 	/* Another port's address change is not this SA's business. */
@@ -2665,6 +2765,7 @@ int main(void)
 	test_handle_and_flowi();
 	test_watch_follows_peer();
 	test_watch_routes_like_install();
+	test_watch_egress_change_during_install();
 	test_watch_route_and_device();
 	test_watch_unreachable_peer();
 	test_watch_failures();

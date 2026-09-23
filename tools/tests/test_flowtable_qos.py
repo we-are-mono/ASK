@@ -60,6 +60,7 @@ PORT_BULK, PORT_PROBE = PORT + 3, PORT + 4
 PORT_EF, PORT_BE, PORT_EF_SOFTWARE = PORT + 5, PORT + 6, PORT + 7
 PORT_POLICED = PORT + 8
 PORT_EGRESS = PORT + 9
+PORT_EF_BEFORE, PORT_EF_MOVED = PORT + 10, PORT + 11
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -960,6 +961,142 @@ async def test_flowtable_qos_dscp_map_classifies_unmarked_frames(qos):
     assert software["rows"] == ([], []), software
     assert software["software_tx"] >= COUNT, software
     assert software["mapped"] == {"frames": COUNT, "bytes": COUNT * frame, "rejected": 0}, software
+
+
+async def ef_filter(r, dev, verb="add"):
+    """The EF filter every DSCP case here uses: codepoint 46 to class 1:11."""
+    if verb == "del":
+        await r.tc("filter", "del", "dev", dev, "egress", "pref", "1")
+        return
+    await r.tc("filter", verb, "dev", dev, "egress", "protocol", "ip", "pref", "1",
+               "flower", "skip_sw", "ip_tos", f"{EF_TOS:#x}/0xfc",
+               "action", "skbedit", "priority", "1:11")
+
+
+async def readmitted(r, port, old_cookie, *, tos=0, timeout=20):
+    """Echo to a LAN-side port until its forward direction is back on an entry
+    other than `old_cookie`, and return that row."""
+    target = f"{r.lan_ip}:{port}"
+    deadline = time.monotonic() + timeout
+    while True:
+        await asyncio.to_thread(lockstep, r.lan_ip, port, 8, tos=tos)
+        rows = directions(await r.state(), ingress=TARGET_WAN_IF, proto=17, dst=target)
+        if rows and rows[0]["cookie"] != old_cookie:
+            assert len(rows) == 1, rows
+            return rows[0]
+        if time.monotonic() > deadline:
+            pytest.fail(f"{target} was not readmitted after {old_cookie}")
+        await asyncio.sleep(0.5)
+
+
+async def test_flowtable_qos_dscp_filter_retires_flows_installed_before_it(qos):
+    """A flow offloaded before a port had a DSCP filter is retired when the
+    first filter turns the port's map on, and comes back reading it.
+
+    Whether a classifier entry consults the map is fixed when the entry is
+    built: one built while the port had no map never reads one, however long
+    it lives. So a first filter is an egress change like an HTB command's, and
+    every entry leaving by the port is retired and readmitted. Before the
+    filter, EF on the offloaded flow reaches neither leaf; after it, on a fresh
+    entry, every EF frame lands on the class the filter names -- exactly, since
+    the DUT's own frames and every unmarked flow leave elsewhere.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    target = f"{r.lan_ip}:{PORT_EF_BEFORE}"
+    frame = 256 + UDP_HEADERS
+    await tree(r, dev, CAP_MBIT, [("1:10", HIGH_PRIO), ("1:11", LOW_PRIO)])
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+    await offload(r, f"ip saddr {WAN_IP} ip daddr {r.lan_ip} udp dport {PORT_EF_BEFORE} "
+                     f"flow add @fast")
+    await lan_start(r, echo=[PORT_EF_BEFORE])
+    forward, _ = await admit(r, PORT_EF_BEFORE, tos=EF_TOS)
+    first = await egress(r, dev)
+    unmapped = await asyncio.to_thread(lockstep, r.lan_ip, PORT_EF_BEFORE, COUNT, tos=EF_TOS)
+    second = await egress(r, dev)
+    before = await r.state()
+    await ef_filter(r, dev)
+    fresh = await readmitted(r, PORT_EF_BEFORE, forward["cookie"], tos=EF_TOS)
+    changed = await r.state()
+    third = await egress(r, dev)
+    mapped = await asyncio.to_thread(lockstep, r.lan_ip, PORT_EF_BEFORE, COUNT, tos=EF_TOS)
+    fourth = await egress(r, dev)
+    final = await r.state()
+    rows = directions(final, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    r.record("qos-dscp-retire-on", {"forward": forward, "fresh": fresh, "rows": rows,
+                                    "before": before, "changed": changed,
+                                    "unmapped_leaf": leaf_delta(first, second, 1),
+                                    "mapped_leaf": leaf_delta(third, fourth, 1),
+                                    "unmapped": unmapped, "mapped": mapped})
+
+    assert unmapped == mapped == COUNT, (unmapped, mapped)
+    assert int(forward["qos"], 16) == 0, forward
+    # Built without the map, the entry never read it. The prio 0 leaf holds
+    # the queue the DUT's own frames leave on, so it is allowed their trickle.
+    assert leaf_delta(first, second, 1)["frames"] == 0, leaf_delta(first, second, 1)
+    assert leaf_delta(first, second, 0)["frames"] < COUNT // 4, leaf_delta(first, second, 0)
+    assert changed["qos_invalidations"] > before["qos_invalidations"], (before, changed)
+    assert not [f for f in changed["flows"] if f["cookie"] == forward["cookie"]], changed
+    # The fresh entry reads it, and every EF frame lands on the class named.
+    assert len(rows) == 1 and rows[0]["cookie"] == fresh["cookie"], (fresh, rows)
+    assert int(rows[0]["packets"]) - int(fresh["packets"]) == COUNT, (fresh, rows)
+    assert leaf_delta(third, fourth, 1) == {"frames": COUNT, "bytes": COUNT * frame,
+                                            "rejected": 0}, leaf_delta(third, fourth, 1)
+
+
+async def test_flowtable_qos_dscp_map_moves_ports_without_misrouting(qos):
+    """The DSCP map moved from the LAN port to the WAN port leaves nothing on
+    the LAN port reading it.
+
+    The microcode's map is one table with no port in it, and an entry built
+    while the LAN port held it carries the DSCP bit for good. Were such an
+    entry still in the classifier when the WAN port took the map, its EF
+    frames would read the WAN port's queues and leave by the wrong wire. So
+    deleting the LAN's last filter retires every entry on the LAN port and
+    waits for them to leave before the map is free, and the WAN's filter is
+    accepted only after that. Across the move the LAN VM keeps receiving every
+    EF frame, and the WAN port's EF class counts none of them.
+    """
+    r = qos
+    lan, wan = TARGET_LAN_IF, TARGET_WAN_IF
+    target = f"{r.lan_ip}:{PORT_EF_MOVED}"
+    frame = 256 + UDP_HEADERS
+    for dev in (lan, wan):
+        await tree(r, dev, CAP_MBIT, [("1:10", HIGH_PRIO), ("1:11", LOW_PRIO)])
+        await r.tc("qdisc", "add", "dev", dev, "clsact")
+    await ef_filter(r, lan)
+    await offload(r, f"ip saddr {WAN_IP} ip daddr {r.lan_ip} udp dport {PORT_EF_MOVED} "
+                     f"flow add @fast")
+    await lan_start(r, echo=[PORT_EF_MOVED])
+    forward, _ = await admit(r, PORT_EF_MOVED, tos=EF_TOS)
+    first = await egress(r, lan)
+    held = await asyncio.to_thread(lockstep, r.lan_ip, PORT_EF_MOVED, COUNT, tos=EF_TOS)
+    second = await egress(r, lan)
+    await ef_filter(r, lan, "del")
+    await ef_filter(r, wan)
+    moved = await r.state()
+    lan_before, wan_before = await egress(r, lan), await egress(r, wan)
+    received = await asyncio.to_thread(lockstep, r.lan_ip, PORT_EF_MOVED, COUNT, tos=EF_TOS)
+    lan_after, wan_after = await egress(r, lan), await egress(r, wan)
+    final = await r.state()
+    r.record("qos-dscp-map-move", {"forward": forward, "moved": moved, "final": final,
+                                   "held_leaf": leaf_delta(first, second, 1),
+                                   "lan_leaf": leaf_delta(lan_before, lan_after, 1),
+                                   "wan_leaf": leaf_delta(wan_before, wan_after, 1),
+                                   "held": held, "received": received})
+
+    # The entry built under the LAN's map read it.
+    assert held == COUNT, held
+    assert leaf_delta(first, second, 1) == {"frames": COUNT, "bytes": COUNT * frame,
+                                            "rejected": 0}, leaf_delta(first, second, 1)
+    # Gone before the WAN port could take the map.
+    assert not [f for f in moved["flows"] if f["cookie"] == forward["cookie"]], moved
+    # And nothing of the LAN's leaves by the WAN port afterwards.
+    assert received == COUNT, received
+    assert leaf_delta(wan_before, wan_after, 1)["frames"] == 0, leaf_delta(wan_before, wan_after, 1)
+    assert leaf_delta(lan_before, lan_after, 1)["frames"] == 0, leaf_delta(lan_before, lan_after, 1)
+    rows = directions(final, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    assert all(f["cookie"] != forward["cookie"] for f in rows), rows
 
 
 async def test_flowtable_qos_dscp_remark_rewrites_the_wire(qos):

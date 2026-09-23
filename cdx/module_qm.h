@@ -74,7 +74,10 @@ struct classque_info {
 };
 
 #define MAX_DSCP	64
+/* The software Tx path's copy of a port's DSCP map. Freed after a grace
+ * period: cpe_fp_tx() reads it under the transmit path's RCU-bh section. */
 struct qm_dscp_fq_map {
+	struct rcu_head rcu;
 	struct qman_fq  *dscp_fq[MAX_DSCP];
 };
 
@@ -89,7 +92,16 @@ typedef struct tQM_context_ctl {
 	struct net_device *net_dev;
 	struct qm_ceetm_lni *lni;
 	struct qm_ceetm_sp *sp;
-	struct qm_dscp_fq_map *dscp_fq_map;
+	/* The DSCP map, in two stages. `dscp_fq_claimed' is the table this
+	 * port owns while it holds the microcode's single map, from the claim
+	 * to the release; the per-DSCP setters write into it. `dscp_fq_map' is
+	 * the same table once published, and NULL otherwise: it is what the
+	 * software Tx path reads, and whether it is set is what gives a new
+	 * classifier entry the microcode's DSCP bit. A port can hold the claim
+	 * unpublished -- before its first filter is programmed, and after its
+	 * last is gone while entries installed under it are still retiring. */
+	struct qm_dscp_fq_map __rcu *dscp_fq_map;
+	struct qm_dscp_fq_map *dscp_fq_claimed;
 	uint32_t qos_enabled;		/* port qos control */
 	uint32_t chnl_map;
 	struct shaper_info shaper_info; /* port shaper config */
@@ -339,7 +351,11 @@ extern QM_context_ctl gQMCtx[MAX_PHY_PORTS];
 
 cdx_dscp_fqid_t* get_dscp_fqid_map(uint32_t portid);
 int ceetm_get_dscp_fq_map(struct tQM_context_ctl *qm_ctx, PQosIfaceDscpFqidMapCommand cmd);
-int ceetm_enable_disable_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t status); 
+int ceetm_enable_disable_dscp_fq_map(struct tQM_context_ctl *qm_ctx, uint8_t status);
+int ceetm_dscp_map_claim(struct tQM_context_ctl *qm_ctx);
+void ceetm_dscp_map_publish(struct tQM_context_ctl *qm_ctx);
+void ceetm_dscp_map_unpublish(struct tQM_context_ctl *qm_ctx);
+int ceetm_dscp_map_release(struct tQM_context_ctl *qm_ctx);
 int enable_dscp_fqid_map(uint32_t portid);
 int disable_dscp_fqid_map(uint32_t portid);
 int reset_dscp_fq_map_ff(cdx_dscp_fqid_t *muram_dscp_fqid_map, uint8_t dscp);
