@@ -387,7 +387,6 @@ async def test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter(mult
         await _from_wan(r, new_config(r.multicast_family, source, group, FRAMING_PORT, []),
                         16, r.wan_mac)
         await _bridged_row(r, group, lambda g: g['state'] == 'installed')
-        installed = (await r.state())['mcast_installed']
 
         await command(r.target, r.session, 'nft', 'add', 'table', 'bridge', FILTER_TABLE)
         filtered = True
@@ -397,7 +396,8 @@ async def test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter(mult
                       'forward', *match, group, 'drop')
         # Nothing announces a hook: the worker finds it within a refresh.
         await _bridged_row(r, group, lambda g: g['state'] == 'refused-filter')
-        await r.wait(lambda s: s['mcast_installed'] == installed - 1, timeout=10)
+        # The hook refuses every bridged flow, not only this group's.
+        await r.wait(lambda s: s['mcast_installed'] == 0, timeout=10)
         result, _, _, cpu, idle = await _window(
             r, group, source, r.lan, [LISTENER],
             lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,

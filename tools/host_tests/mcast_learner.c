@@ -957,6 +957,31 @@ static void frames_become_flows(void)
             assert(!f->gone);
     }
 
+    /* Nothing snooping the group: the bridge floods every source of it to
+     * the host as well, which refuses each flow for the host with no host
+     * membership to say so. Only the flows' own answers do, and they keep
+     * the place from being given up. */
+    reset();
+    {
+        const uint32_t NINTH = htonl(0x0a0000ff);
+        struct br_ip named = group_v4(G, NINTH, 0);
+
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_membership(&BR, &P3, &named, true, false));
+        for (uint32_t i = 0; i < FT_MC_MAX_FLOWS; i++) {
+            answer(&P1, htonl(0x0a000001 + i), 0, BR_MCAST_TO_HOST_FLOOD, 1, &P2);
+            see(seen_v4(&BR, &P1, G, htonl(0x0a000001 + i), 0, false, SENDER));
+        }
+        pass();
+        assert(!ft_mc_host_joined(&BR, &any));
+        list_for_each_entry(f, &ft_mc_flows, list)
+            assert(!strcmp(ft_mc_state(f), "refused-host"));
+        see(seen_v4(&BR, &P1, G, NINTH, 0, false, SENDER));
+        assert(!flow(&P1, NINTH, 0) && ft_mc_refused == 1);
+        list_for_each_entry(f, &ft_mc_flows, list)
+            assert(!f->gone);
+    }
+
     /* A place is given up only by a flow with nothing in hardware: when
      * every one is carried, a source asked for by name is left to the
      * bridge. A flow asked for by name keeps its place too. */
