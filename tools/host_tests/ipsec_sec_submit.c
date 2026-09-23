@@ -23,8 +23,8 @@ typedef uint32_t u32;
 #define __hot
 #define unlikely(x) (x)
 #define READ_ONCE(x) (x)
-#define printk(...) ((void)0)
 #define pr_err_ratelimited(...) ((void)0)
+#define net_err_ratelimited(...) ((void)0)
 
 #define XFRM_MODE_TRANSPORT 0
 #define XFRM_MODE_TUNNEL 1
@@ -297,10 +297,18 @@ static void test_submit(void)
 	bench.sg_result = -ENOMEM;
 	assert(submit() == -ENOMEM && dropped() && bench.enqueues == 0);
 
-	/* The queue refusing it outright releases the S/G table too. */
+	/* A queue busy through every retry gives up with -EBUSY, and the S/G
+	 * table goes back with the frame. */
+	frame(0x45, false);
+	bench.enqueue_busy = 100000;
+	assert(submit() == -EBUSY && dropped());
+	assert(bench.enqueues == 100000 && bench.releases == 1);
+
+	/* So does a queue that refuses it outright, without a retry. */
 	frame(0x45, false);
 	bench.enqueue_result = -EIO;
-	assert(submit() == -EIO && dropped() && bench.releases == 1);
+	assert(submit() == -EIO && dropped());
+	assert(bench.enqueues == 1 && bench.releases == 1);
 }
 
 int main(void)

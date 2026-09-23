@@ -263,8 +263,10 @@ static int vwd_xmit_local_packet(struct sk_buff *skb)
 		}
 	}
 
-	INCR_PER_CPU_STAT(vap->vap_stats, pkts_local_tx_dpaa);
-	dpaa_submit_outb_pkt_to_SEC(skb, skb->dev, priv->txconf_bp);
+	/* Only what SEC was given: a frame the submit could not hand over is
+	 * already freed and counted as the device's transmit drop. */
+	if (!dpaa_submit_outb_pkt_to_SEC(skb, skb->dev, priv->txconf_bp))
+		INCR_PER_CPU_STAT(vap->vap_stats, pkts_local_tx_dpaa);
 
 	return 0;
 send_pkt:

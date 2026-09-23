@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A249.** Frames SEC never got were counted as sent (`tx toenc`, the Wi-Fi local path's count) and freed without a drop count, and every failed submit printed —
+  fixed (_:/^sdk_dpaa: rate-limit SEC submit failures; count Wi-Fi SEC frames given_).
+
 - [x] **A250.** SA peer lookups dropped the output mark, VRF, protocol and NAT-T ports (plain ESP took stale ports), so hardware and Linux could pick different next hops —
   fixed (_:/^xfrm: route plain ESP without the stack's leftovers for ports_).
 
