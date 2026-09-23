@@ -861,11 +861,41 @@ PDpaSecSAContext  cdx_ipsec_sec_sa_context_alloc(uint32_t handle)
 	return pdpa_sec_context;	
 }
 
+/* How much of the shared descriptor the PDB takes, the per-SA counters that
+ * trail it included.
+ *
+ * The encapsulation PDB carries the outer header it prepends after its fixed
+ * part -- 20 bytes for IPv4, 40 for IPv6, 8 more for the UDP header of NAT-T
+ * -- rounded up to whole words, and ip_hdr_len says how much. The
+ * decapsulation PDB has no header of its own to carry: its length, and so the
+ * counters' place, is the same for either family.
+ */
+static size_t cdx_ipsec_pdb_len(PSAEntry sa)
+{
+	struct sec_descriptor *sec_desc = sa->pSec_sa_context->sec_desc;
+	size_t len = CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+
+	if (sa->direction == CDX_DPA_IPSEC_OUTBOUND)
+		return len + sizeof(struct ipsec_encap_pdb) +
+		       ((caam32_to_cpu(sec_desc->pdb_en.ip_hdr_len) + 3) & ~3);
+	return len + sizeof(struct ipsec_decap_pdb);
+}
+
+/* Where the per-SA counters sit in the shared descriptor, in bytes: the last
+ * CDX_DPA_IPSEC_STATS_LEN words of the PDB area, which starts behind the
+ * descriptor's header word. The descriptor's MOVE commands address them by
+ * this offset, and get_stats_from_sa() reads them there. */
+static uint32_t cdx_ipsec_stats_offset(size_t pdb_len)
+{
+	return sizeof(((struct sec_descriptor *)NULL)->hdr_word) + pdb_len -
+	       CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+}
+
 static  void build_stats_descriptor_part(PSAEntry sa, size_t pdb_len)
 {
 	uint32_t *desc;
 	uint32_t stats_offset;
-	PDpaSecSAContext pSec_sa_context ; 
+	PDpaSecSAContext pSec_sa_context ;
 
 
 	BUG_ON(!sa);
@@ -873,7 +903,7 @@ static  void build_stats_descriptor_part(PSAEntry sa, size_t pdb_len)
 	pSec_sa_context= sa->pSec_sa_context;
 	desc = (u32 *) pSec_sa_context->sec_desc->shared_desc;
 
-	stats_offset = sizeof(pSec_sa_context->sec_desc->hdr_word) + pdb_len - CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+	stats_offset = cdx_ipsec_stats_offset(pdb_len);
 	sa->stats_offset = stats_offset;
 	memset((u8 *)desc + stats_offset, 0, CDX_DPA_IPSEC_STATS_LEN * sizeof(u32));
 
@@ -1083,8 +1113,7 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 {
 	uint32_t *desc, *key_jump_cmd;
 	//uint32_t  copy_ptr_index = 0;
-	int opthdrsz;
-	size_t pdb_len = 0;
+	size_t pdb_len;
 	uint32_t sa_op;
 	uint32_t hdr_flags;
 	PDpaSecSAContext pSec_sa_context;
@@ -1092,27 +1121,17 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 	pSec_sa_context =sa->pSec_sa_context;
 
 	desc = (u32 *) pSec_sa_context->sec_desc->shared_desc;
-	/* Reserve 2 words for statistics */
-	pdb_len = CDX_DPA_IPSEC_STATS_LEN * sizeof(u32);
+	pdb_len = cdx_ipsec_pdb_len(sa);
 
 	/* Sharing policy is correctness-critical for the stateful PDB —
 	 * see cdx_ipsec_sh_desc_hdr_flags(). */
 	hdr_flags = cdx_ipsec_sh_desc_hdr_flags(sa);
 
-	if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND) {
-		/* Compute optional header size, rounded up to descriptor
-		 * word size */
-		opthdrsz =
-			(caam32_to_cpu(pSec_sa_context->sec_desc->pdb_en.ip_hdr_len) +
-			 3) & ~3;
-		pdb_len += sizeof(struct ipsec_encap_pdb) + opthdrsz;
-		init_sh_desc_pdb(desc, hdr_flags, pdb_len);
+	init_sh_desc_pdb(desc, hdr_flags, pdb_len);
+	if (sa->direction  == CDX_DPA_IPSEC_OUTBOUND)
 		sa_op = OP_TYPE_ENCAP_PROTOCOL;
-	} else {
-		pdb_len += sizeof(struct ipsec_decap_pdb);
-		init_sh_desc_pdb(desc, hdr_flags, pdb_len);
+	else
 		sa_op = OP_TYPE_DECAP_PROTOCOL;
-	}
 
 	/* Key jump */
 	if (((pSec_sa_context->auth_data.split_key_len) || 
@@ -1169,8 +1188,10 @@ static int cdx_ipsec_build_shared_descriptor(PSAEntry sa,
 
 skip_byte_copy:
 
-	/* Enable Stats only for IPv4  TODO-IPV6 */
-
+	/* The per-SA counters, for either outer family: cdx_ipsec_pdb_len()
+	 * places them past whatever outer header the PDB carries. Outbound
+	 * they count the input before the protocol runs, inbound what it left
+	 * after. */
 	if (sa->direction  != CDX_DPA_IPSEC_INBOUND)
 	{
 #ifdef PRINT_DESC
@@ -1209,7 +1230,6 @@ skip_byte_copy:
 #endif
 	}
 
-	/* Enable Stats only for IPv4  TODO-IPV6 */
 	save_sa_state_in_external_mem(sa);
 
 #ifdef PRINT_DESC

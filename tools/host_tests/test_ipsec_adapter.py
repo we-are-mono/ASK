@@ -182,6 +182,18 @@ def test_ipsec_backend(tmp_path):
         re.search(r"^struct cdx_ipsec_sa \{.*?^\};", backend, re.S | re.M).group() + "\n"
         + "\n".join(re.findall(r"^#define CDX_IPSEC_(?:SAMPLE_TRIES|BYTES_STEP_MAX)\s.*$",
                                backend, re.M)) + "\n"
+        # Where the counters sit and how they are read, from the descriptor
+        # code itself; the reader renamed, so the counter cases can still
+        # script what a racing read sees.
+        + re.search(r"^#define CDX_DPA_IPSEC_STATS_LEN\s+\d+",
+                    (ROOT / "cdx/cdx_dpa_ipsec.h").read_text(), re.M).group() + "\n"
+        + "\n".join(re.findall(
+            r"^#define\s+(?:MAX_IPSEC_PKTS_FWD_PSEC|SEQ_NUM_(?:ESN_)?SOFT_LIMIT)\s.*$",
+            sec, re.M)) + "\n"
+        + function(sec, "cdx_ipsec_pdb_len")
+        + function(sec, "cdx_ipsec_stats_offset")
+        + function(sec, "get_stats_from_sa").replace(
+            "void get_stats_from_sa(", "static void sec_get_stats_from_sa(", 1)
         + re.search(r"^#define CDX_IPSEC_OSEQ_TRIES\s.*$", sec, re.M).group() + "\n"
         + function(sec, "cdx_ipsec_next_esn")
         + function(sec, "get_oseq_from_sa")
@@ -201,7 +213,11 @@ def test_ipsec_backend(tmp_path):
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
         "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
-        "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+        # The descriptor reader loads the 64-bit byte count wherever the
+        # PDB leaves it, 4-byte aligned behind an IPv4 outer header, as
+        # arm64 allows.
+        "-fsanitize=address,undefined", "-fno-sanitize=alignment",
+        "-fno-pie", "-no-pie",
         "-I", str(tmp_path), str(Path(__file__).with_name("ipsec_backend.c")),
         "-o", str(binary),
     ], check=True)

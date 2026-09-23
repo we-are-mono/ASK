@@ -590,7 +590,13 @@ one accounting period, plus the retirement's latency.
 An outbound SA on the extended encapsulation descriptor, which it gets only
 when its features overflow the normal one, keeps no counters at all: that
 builder never enables them. Such an SA reports none, and only its time limits
-apply.
+apply. Every other SA has counters, whatever its outer family, despite old
+comments in the builder that said IPv4 only. `cdx_ipsec_pdb_len()` places them
+past the outer header the encapsulation PDB carries: 20 or 40 bytes, plus 8
+for NAT-T. The decapsulation PDB carries no header, so its layout is the same
+for both families, and so is the replay state read back from it.
+`tools/host_tests/ipsec_backend.c` checks the placement and the read for every
+header size.
 
 There is no `xdo_dev_state_update_stats()`. Most of its callers hold `x->lock`
 or `xfrm_state_lock`: the state timer, `xfrm_state_check_expire()`, and state

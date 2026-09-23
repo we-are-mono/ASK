@@ -83,6 +83,7 @@ typedef struct {
 typedef struct {
 	u8 direction;
 	u16 flags;
+	u8 seq_overflow;
 	u16 stats_offset;
 	u64 seq;
 	u16 replay_window;
@@ -106,6 +107,21 @@ static void get_replay_from_sa(PSAEntry sa, u64 *seq, u32 *seen)
 	if (between_reads)
 		between_reads();
 }
+
+/* The descriptor reader's own dependencies: SEC's words are big-endian, and
+ * the legacy overflow report it can also make is never asked for here. */
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define be32_to_cpu(x) __builtin_bswap32(x)
+#define be64_to_cpu(x) __builtin_bswap64(x)
+#define cpu_to_be64(x) __builtin_bswap64(x)
+#else
+#define be32_to_cpu(x) (x)
+#define be64_to_cpu(x) (x)
+#define cpu_to_be64(x) (x)
+#endif
+static int gIPSecStatQueryTimer;
+static void sec_get_stats_from_sa(PSAEntry sa, u32 *pkts, u64 *bytes,
+				  u8 *pSeqOverflow);
 
 /* What the descriptor holds, and what a racing read sees instead. A scripted
  * reading is consumed once; with none left the descriptor reads as it is. */
@@ -597,6 +613,62 @@ static void test_replay_read(void)
 	inbound_entry = NULL;
 }
 
+/* Where the per-SA counters sit in the shared descriptor, for every outer
+ * header the encapsulation PDB carries and for decapsulation -- both
+ * families -- and that the reader finds there what the descriptor stores. */
+static void test_stats_layout(void)
+{
+	static const struct { u8 direction; u32 header; } cases[] = {
+		{ CDX_DPA_IPSEC_OUTBOUND, 20 },	/* IPv4 tunnel or transport */
+		{ CDX_DPA_IPSEC_OUTBOUND, 28 },	/* IPv4 tunnel, NAT-T */
+		{ CDX_DPA_IPSEC_OUTBOUND, 40 },	/* IPv6 tunnel or transport */
+		{ CDX_DPA_IPSEC_OUTBOUND, 48 },	/* IPv6 tunnel, NAT-T */
+		{ CDX_DPA_IPSEC_INBOUND, 0 },	/* either family */
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		static struct sec_descriptor d __attribute__((aligned(64)));
+		DpaSecSAContext ctx = { .sec_desc = &d };
+		SAEntry e = { .direction = cases[i].direction,
+			      .pSec_sa_context = &ctx };
+		const u64 packets = cpu_to_be64(0x5ULL);
+		const u64 bytes = cpu_to_be64(0x200000345ULL);
+		size_t pdb_len, expected;
+		u32 offset, got_packets;
+		u64 got_bytes;
+		u8 *base;
+
+		memset(&d, 0, sizeof(d));
+		if (e.direction == CDX_DPA_IPSEC_OUTBOUND)
+			d.pdb_en.ip_hdr_len = cpu_to_caam32(cases[i].header);
+		pdb_len = cdx_ipsec_pdb_len(&e);
+		offset = cdx_ipsec_stats_offset(pdb_len);
+
+		/* Right behind the PDB and whatever outer header it carries,
+		 * so neither the header nor the anti-replay scorecard is
+		 * overwritten by a count. */
+		expected = sizeof(u32) +
+			   (e.direction == CDX_DPA_IPSEC_OUTBOUND ?
+			    sizeof(struct ipsec_encap_pdb) + cases[i].header :
+			    sizeof(struct ipsec_decap_pdb));
+		assert(offset == expected);
+		/* Inside the descriptor, and within the reach of the byte
+		 * offset the descriptor's MOVE commands address it by. */
+		assert(offset + CDX_DPA_IPSEC_STATS_LEN * sizeof(u32) <=
+		       sizeof(d.shared_desc));
+		assert(offset + 8 <= 0xff);
+
+		/* What the descriptor stores: the packet count as a 64-bit
+		 * word, the byte count as the next. */
+		base = (u8 *)d.shared_desc;
+		memcpy(base + offset, &packets, sizeof(packets));
+		memcpy(base + offset + 8, &bytes, sizeof(bytes));
+		e.stats_offset = offset;
+		sec_get_stats_from_sa(&e, &got_packets, &got_bytes, NULL);
+		assert(got_packets == 5 && got_bytes == 0x200000345ULL);
+	}
+}
+
 /* What the backend accepts of the sequence space and the window. */
 static void test_validate(void)
 {
@@ -673,6 +745,7 @@ int main(void)
 	test_set_sequence();
 	test_replay_seed();
 	test_replay_read();
+	test_stats_layout();
 	test_validate();
 	printf("ipsec backend: ok\n");
 	return 0;
