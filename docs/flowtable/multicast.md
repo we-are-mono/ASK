@@ -563,7 +563,10 @@ up. Hooks are per namespace, not per bridge, so this applies to every bridge.
 Nothing announces a registered hook, so the worker checks the hook lists at
 every pass, and the refresh runs a pass every five seconds while any flow
 exists. `/proc` says `refused-filter`, and the kernel log says so once each
-time the state changes.
+time the state changes. The rig case
+`test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter` drops the
+group in a bridge `forward` chain while it is carried: the flow comes out, the
+set-top box receives nothing, and the flow goes back in when the chain goes.
 
 Some hooks never go away once they appear, and keep bridged multicast in
 software for the rest of the boot: `br_netfilter` once loaded (Docker and

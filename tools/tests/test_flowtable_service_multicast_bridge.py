@@ -368,6 +368,63 @@ async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridg
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
 
 
+FILTER_TABLE = 'ask_ft_mc_filter'
+
+
+async def test_flowtable_service_multicast_bridge_yields_to_a_bridge_filter(multicast_bridge_service):
+    """An installed flow replicates at the classifier, before any bridge hook
+    runs. An nftables bridge chain that drops the group at forward has to be
+    obeyed: while the chain exists the flow comes out of hardware and says
+    why, the stream reaches the CPU, and the chain drops it -- the set-top box
+    receives nothing. When the chain goes, the flow is carried again."""
+    r = multicast_bridge_service
+    group = '239.9.5.6' if r.multicast_family == 4 else 'ff1e::9:5:6'
+    source = r.multicast_source
+    match = ['ip', 'daddr'] if r.multicast_family == 4 else ['ip6', 'daddr']
+    filtered = False
+    await _mdb(r, TARGET_LAN_IF, group)
+    try:
+        await _from_wan(r, new_config(r.multicast_family, source, group, FRAMING_PORT, []),
+                        16, r.wan_mac)
+        await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+        installed = (await r.state())['mcast_installed']
+
+        await command(r.target, r.session, 'nft', 'add', 'table', 'bridge', FILTER_TABLE)
+        filtered = True
+        await command(r.target, r.session, 'nft', 'add', 'chain', 'bridge', FILTER_TABLE,
+                      'forward', '{ type filter hook forward priority 0; policy accept; }')
+        await command(r.target, r.session, 'nft', 'add', 'rule', 'bridge', FILTER_TABLE,
+                      'forward', *match, group, 'drop')
+        # Nothing announces a hook: the worker finds it within a refresh.
+        await _bridged_row(r, group, lambda g: g['state'] == 'refused-filter')
+        await r.wait(lambda s: s['mcast_installed'] == installed - 1, timeout=10)
+        result, _, _, cpu, idle = await _window(
+            r, group, source, r.lan, [LISTENER],
+            lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+            'multicast-bridge-filtered')
+        assert not result[LISTENER]['errors'], result
+        assert not result[LISTENER]['seen'], result
+        assert cpu >= FRAMING_COUNT * 0.95, (cpu, idle)
+
+        await command(r.target, r.session, 'nft', 'delete', 'table', 'bridge', FILTER_TABLE)
+        filtered = False
+        await _bridged_row(r, group, lambda g: g['state'] == 'installed')
+        result, before, after, cpu, idle = await _window(
+            r, group, source, r.lan, [LISTENER],
+            lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
+            'multicast-bridge-unfiltered')
+        _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
+        assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
+            (before, after)
+        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+    finally:
+        if filtered:
+            await command(r.target, r.session, 'nft', 'delete', 'table', 'bridge',
+                          FILTER_TABLE, check=False)
+        await _mdb(r, TARGET_LAN_IF, group, add=False)
+        await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
+
+
 # ---- one stream, bridged and routed ----------------------------------------
 #
 # The IPTV VLAN bridged to the set-top box and routed to the rest of the house.
