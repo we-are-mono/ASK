@@ -7904,11 +7904,13 @@ struct ft_mr_plan {
 	bool via_tagged;
 	u32 mtu;
 	/* The MFC oifs by ifindex, which is what a copy is seen leaving by at
-	 * POST_ROUTING: listed by every derivation past the table, whatever it
-	 * then decides, so a refused group still gathers its confirmations. No
-	 * references: an index names, it does not hold. `out_bridged` says a
-	 * copy leaves through a bridge. */
+	 * POST_ROUTING, and the parent VIF's, which is what it arrived by:
+	 * listed by every derivation past the table, whatever it then decides,
+	 * so a refused group still gathers its confirmations. No references:
+	 * an index names, it does not hold. `out_bridged` says a copy leaves
+	 * through a bridge. */
 	int oif[MAXVIFS];
+	int parent;
 	u8 oif_count;
 	bool oifs_known;
 	bool out_bridged;
@@ -8009,15 +8011,18 @@ static bool ft_mr_scope_ok(u8 family, const union nf_inet_addr *dst)
 	       (ntohl(dst->ip) & 0xffffff00) != 0xe0000000;
 }
 
-/* Whether the box itself has joined this group on the interface the stream
- * arrives on.
+/* Whether the box itself has joined this group on `dev`: the interface the
+ * stream arrives on, or one it is forwarded out of.
  *
- * ip_mr_input() delivers locally as well as forwarding when it does --
- * ip_route_input_mc() asks ip_check_mc_rcu() on the input device, and IPv6
- * asks the idev's own list -- and a hardware entry replicates to ports without
- * the frame ever reaching the CPU. Such a group is refused rather than carried
+ * ip_mr_input() delivers locally as well as forwarding when the input device
+ * has -- ip_route_input_mc() asks ip_check_mc_rcu() on it, and IPv6 asks the
+ * idev's own list -- and each forwarded copy is looped back to the host when
+ * its output device has. A hardware entry replicates to ports without the
+ * frame ever reaching the CPU. Such a group is refused rather than carried
  * with a starved local listener, which is the bridged learner's answer to the
- * same question. Neither check is exported, so the lists are walked here.
+ * same question. Any membership counts, whatever its source filter: refusing
+ * one the filter would not deliver costs only the offload. Neither check is
+ * exported, so the lists are walked here.
  */
 static bool ft_mr_host_member(struct net_device *dev, u8 family,
 			      const union nf_inet_addr *group)
@@ -8376,6 +8381,13 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 		if (mfc->mfc_un.res.ttls[ct] != 255 && oif)
 			plan->oif[plan->oif_count++] = oif->ifindex;
 	}
+	/* And the VIF each copy has to have arrived by: an iif-keyed forward
+	 * rule -- fw4's zones are -- judges a stream by where it comes from,
+	 * so copies seen from one parent confirm nothing for another. No
+	 * device is no index, which no copy arrives by. */
+	vif_dev = mfc->mfc_parent < MAXVIFS ?
+		  ft_mr_vif[idx][mfc->mfc_parent].dev : NULL;
+	plan->parent = vif_dev ? vif_dev->ifindex : 0;
 	plan->oifs_known = true;
 	/* A policy rule that is not the default one can send a stream to a
 	 * table this learner does not read, and the hardware entry would keep
@@ -8420,6 +8432,18 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	memcpy(spec.in_vlan, in.vlan, sizeof(spec.in_vlan));
 	if (ft_mr_host_member(vif_dev, g->family, &g->dst))
 		return FT_MR_REFUSED_HOST;
+	/* Nor on an oif. ip_mc_output() and ip6_finish_output2() loop each
+	 * forwarded copy back to the host when it has joined the group on the
+	 * device the copy leaves by, and a copy the classifier replicates
+	 * never comes back up: a process on the router listening there would
+	 * be starved. */
+	for (ct = mfc->mfc_un.res.minvif; ct < mfc->mfc_un.res.maxvif; ct++) {
+		struct net_device *oif = ct < MAXVIFS ? ft_mr_vif[idx][ct].dev : NULL;
+
+		if (mfc->mfc_un.res.ttls[ct] != 255 && oif &&
+		    ft_mr_host_member(oif, g->family, &g->dst))
+			return FT_MR_REFUSED_HOST;
+	}
 
 	/* ip_mr_forward() forwards out vif ct when ttl > ttls[ct], and 255
 	 * means "not an oif". The hardware's own rule is ttl >= 2, because the
@@ -8532,15 +8556,18 @@ static bool ft_mr_plan_same(const struct ft_mr_group *g,
  * fw4's default from WAN to LAN -- is as much a part of the routing decision
  * as the MFC, and a hardware entry replicates at the classifier, where no
  * hook runs again. So a copy of the (S,G) has to be seen leaving each oif at
- * POST_ROUTING, at a priority after every filter and NAT hook, before the
- * group is carried: such a copy passed PRE_ROUTING, FORWARD and the earlier
- * POST_ROUTING chains on its way. ipmr_queue_xmit() and ip6mr_forward2() mark
- * each copy forwarded and send it through NF_INET_FORWARD to dst_output(),
- * whose multicast output -- ip_mc_output(), ip6_output() -- runs
- * NF_INET_POST_ROUTING with the VIF as the output device: a bridge or a VLAN
- * device above one as much as a port. A group routed through a bridge is
- * forwarded by ipmr the same way once the bridge has handed its stream up,
- * so its copies are confirmed like any other before they are published.
+ * POST_ROUTING, at a priority after every filter and NAT hook, having arrived
+ * by the parent VIF, before the group is carried: such a copy passed
+ * PRE_ROUTING, FORWARD and the earlier POST_ROUTING chains on its way, judged
+ * by where it came from as well as where it goes. ipmr_queue_xmit() and
+ * ip6mr_forward2() mark each copy forwarded and send it through
+ * NF_INET_FORWARD to dst_output(), whose multicast output -- ip_mc_output(),
+ * ip6_output() -- runs NF_INET_POST_ROUTING with the VIF as the output
+ * device: a bridge or a VLAN device above one as much as a port. skb_iif is
+ * the device ipmr saw the stream arrive on, which is the parent VIF's for
+ * every copy it forwards. A group routed through a bridge is forwarded by
+ * ipmr the same way once the bridge has handed its stream up, so its copies
+ * are confirmed like any other before they are published.
  *
  * All or nothing. A root consumes every frame it matches, and no listener the
  * encoder expresses delivers to the CPU -- the bridged learner's refused-host
@@ -8551,16 +8578,25 @@ static bool ft_mr_plan_same(const struct ft_mr_group *g,
  * A confirmation proves that the ruleset forwards the stream there, not what
  * it does to each packet: a rate limit, a quota, a counter or a match that
  * differs from packet to packet stops applying once the group is carried, as
- * it does for a flowtable flow.
+ * it does for a flowtable flow. Nor does it see past the observer: an
+ * nftables or BPF hook that runs after it at POST_ROUTING keeps the group in
+ * software, and a chain at a device's egress is not seen at all.
  *
  * A ruleset change takes every confirmation back. An nftables commit --
  * iptables-nft included -- moves init_net's base_seq and then the cursor the
  * packet path reads rules through, and confirmations are good only for the
  * pair they were made under. When either moves, every group returns to
- * software and is confirmed again from fresh traffic, so a drop rule added
- * later stops the stream rather than being bypassed. An iptables-legacy
- * table is replaced with no generation anyone can read, so a change there is
- * followed only once something else takes the group back.
+ * software, so a drop rule added later stops the stream rather than being
+ * bypassed. A commit goes on applying some of itself after it has moved the
+ * pair -- a new chain's policy, element timeouts, a concatenated set's new
+ * contents -- and nothing outside nf_tables can see when it is done: its
+ * commit mutex and busy mark are private to it, and nfnetlink's subsystem
+ * lock is let go before the batch runs. So confirmations start again only
+ * once the pair has stood still for FT_MR_RULESET_SETTLE, which outlasts
+ * that for anything short of a very large set load, and which also bounds
+ * how often a run of commits can move a group in and out of hardware. An
+ * iptables-legacy table is replaced with no generation anyone can read, so a
+ * change there is followed only once something else takes the group back.
  */
 
 /* One group's confirmations, in a table the hook reads under RCU. */
@@ -8571,11 +8607,12 @@ struct ft_mr_watch {
 	union nf_inet_addr src;
 	union nf_inet_addr dst;
 	/* The MFC oifs by ifindex, and bit i of `seen` for oif[i] seen leaving
-	 * under the ruleset the table is armed for. The list is fixed once
-	 * published -- a changed one is a new watch -- so a reader never sees
-	 * half of one. */
+	 * under the ruleset the table is armed for, by a copy that arrived by
+	 * the parent VIF `parent`. The lists are fixed once published -- a
+	 * changed one is a new watch -- so a reader never sees half of one. */
 	u8 oifs;
 	int oif[MAXVIFS];
+	int parent;
 	unsigned long seen;
 	/* Every oif seen, and the worker not told yet. */
 	bool news;
@@ -8587,15 +8624,22 @@ static struct hlist_head ft_mr_watches[FT_MR_WATCH_BUCKETS];
 static DEFINE_SPINLOCK(ft_mr_watch_lock);
 static unsigned int ft_mr_watch_count[2];
 /* The ruleset confirmations are good for -- nftables' commit counter and its
- * rules cursor -- and whether the hook may make them. Written by the worker
- * alone. */
+ * rules cursor -- when it was first seen, and whether the hook may make
+ * them. Written by the worker alone. */
 static unsigned int ft_mr_gen_seq;
 static u8 ft_mr_gen_cursor;
+static unsigned long ft_mr_gen_since;
 static bool ft_mr_gen_open, ft_mr_gen_armed;
+/* Commits that took confirmations back; failures to register the observer
+ * or to allocate a watch, each of which keeps groups in software. */
 static u64 ft_mr_ruleset_changes, ft_mr_confirm_errors;
 /* How soon a rule added under a carried group takes effect: the ruleset is
  * looked at this often while any group exists. Two loads. */
 #define FT_MR_RULESET_INTERVAL	HZ
+/* How long a ruleset has to stand still before copies confirm under it: the
+ * software episode every commit costs a carried group, less the first copy
+ * of it after that. */
+#define FT_MR_RULESET_SETTLE	HZ
 static void ft_mr_ruleset_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_mr_ruleset, ft_mr_ruleset_fn);
 
@@ -8643,10 +8687,12 @@ static bool ft_mr_watch_complete(const struct ft_mr_watch *w)
 	return (READ_ONCE(w->seen) & all) == all;
 }
 
-/* A copy of (S,G) was seen leaving by `ifindex` at POST_ROUTING. Called from
- * the hook, under RCU. The last oif of a group wakes the worker. */
+/* A copy of (S,G) that arrived by `iif` was seen leaving by `ifindex` at
+ * POST_ROUTING. Called from the hook, under RCU. The last oif of a group wakes
+ * the worker. */
 static void ft_mr_confirm_seen(u8 family, const union nf_inet_addr *src,
-			       const union nf_inet_addr *dst, int ifindex)
+			       const union nf_inet_addr *dst, int ifindex,
+			       int iif)
 {
 	struct ft_mr_watch *w;
 	unsigned int i;
@@ -8664,8 +8710,11 @@ static void ft_mr_confirm_seen(u8 family, const union nf_inet_addr *src,
 	 * watch in practice; every one that matches is told all the same. */
 	hlist_for_each_entry_rcu(w, &ft_mr_watches[ft_mr_watch_bucket(family, src, dst)],
 				 node) {
+		/* A copy from another parent was judged as coming from there:
+		 * one the MFC entry moved away from, still in flight, or one
+		 * the watch has not caught up with. */
 		if (w->family != family || memcmp(&w->src, src, sizeof(*src)) ||
-		    memcmp(&w->dst, dst, sizeof(*dst)))
+		    memcmp(&w->dst, dst, sizeof(*dst)) || w->parent != iif)
 			continue;
 		for (i = 0; i < w->oifs; i++) {
 			if (w->oif[i] != ifindex)
@@ -8701,7 +8750,8 @@ static unsigned int ft_mr_confirm_hook(void *priv, struct sk_buff *skb,
 			return NF_ACCEPT;
 		src.ip = iph->saddr;
 		dst.ip = iph->daddr;
-		ft_mr_confirm_seen(AF_INET, &src, &dst, state->out->ifindex);
+		ft_mr_confirm_seen(AF_INET, &src, &dst, state->out->ifindex,
+				   skb->skb_iif);
 	} else {
 		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
 
@@ -8710,14 +8760,18 @@ static unsigned int ft_mr_confirm_hook(void *priv, struct sk_buff *skb,
 			return NF_ACCEPT;
 		src.in6 = ip6h->saddr;
 		dst.in6 = ip6h->daddr;
-		ft_mr_confirm_seen(AF_INET6, &src, &dst, state->out->ifindex);
+		ft_mr_confirm_seen(AF_INET6, &src, &dst, state->out->ifindex,
+				   skb->skb_iif);
 	}
 	return NF_ACCEPT;	/* always: this observes, it never diverts */
 }
 
 /* Last, so that every filter and NAT chain at POST_ROUTING has had the copy
- * first. A chain registered later at the very same priority runs after it,
- * which is the one ordering netfilter leaves open. */
+ * first. At the very same priority netfilter puts a hook registered later
+ * ahead of the ones already there, so what follows the observer is whatever
+ * sat at the last priority when it was registered: conntrack's confirmation,
+ * which only drops a copy it cannot insert, and any nftables chain or BPF
+ * program placed there. ft_mr_observer_followed() looks for the last two. */
 static struct nf_hook_ops ft_mr_confirm_ops[2] = {
 	{
 		.hook = ft_mr_confirm_hook,
@@ -8778,18 +8832,31 @@ static void ft_mr_confirm_sync(void)
 }
 
 /* Follow the ruleset. When nftables has committed since confirmations were
- * armed, every one is taken back and they are armed for the ruleset in force.
- * Called by the worker with no lock held. Returns whether confirmations were
- * taken back; the first arming has none to take. */
+ * armed, every one is taken back and the new pair is timed; once it has stood
+ * still for FT_MR_RULESET_SETTLE, copies confirm under it. Called by the
+ * worker with no lock held. Returns whether confirmations were taken back;
+ * the first arming has none to take. */
 static bool ft_mr_ruleset_sync(void)
 {
 	struct ft_mr_watch *w;
 	unsigned int seq, b;
-	bool armed;
+	bool armed, watched;
 	u8 cursor;
 
-	if (READ_ONCE(ft_mr_gen_open) && ft_mr_ruleset_current())
+	if (ft_mr_gen_armed && ft_mr_ruleset_current()) {
+		if (READ_ONCE(ft_mr_gen_open) ||
+		    time_before(jiffies, ft_mr_gen_since + FT_MR_RULESET_SETTLE))
+			return false;
+		/* Stood still long enough. A copy already past FORWARD when
+		 * the pair was read may have been judged by the rules before
+		 * it: every such one finishes first. After this, a copy the
+		 * hook sees started under the pair, or under a later one it
+		 * will not match. */
+		synchronize_rcu();
+		if (ft_mr_ruleset_current())
+			WRITE_ONCE(ft_mr_gen_open, true);
 		return false;
+	}
 	/* No confirmation from here, and none still being made: a copy the
 	 * hook has in hand may have passed the old rules. */
 	WRITE_ONCE(ft_mr_gen_open, false);
@@ -8803,25 +8870,34 @@ static bool ft_mr_ruleset_sync(void)
 	ft_mr_ruleset_read(&seq, &cursor);
 	WRITE_ONCE(ft_mr_gen_seq, seq);
 	WRITE_ONCE(ft_mr_gen_cursor, cursor);
+	watched = ft_mr_watch_count[0] || ft_mr_watch_count[1];
 	spin_unlock_bh(&ft_mr_watch_lock);
-	/* A copy already past FORWARD when the pair was read may have been
-	 * judged by the rules before it: every such one finishes first. After
-	 * this, a copy the hook sees started under the pair read above, or
-	 * under a later one it will not match. */
-	synchronize_rcu();
-	WRITE_ONCE(ft_mr_gen_open, true);
+	ft_mr_gen_since = jiffies;
 	armed = ft_mr_gen_armed;
 	ft_mr_gen_armed = true;
-	if (armed)
+	/* Counted when there was something to take back. */
+	if (armed && watched)
 		ft_mr_ruleset_changes++;
 	return armed;
 }
 
-/* Watch for a group's copies leaving by each oif of its plan. The same oifs
- * keep their confirmations; a changed list is a new watch, which carries over
- * those of the oifs it shares with the old one, and a failed allocation
- * leaves none -- a list the watch no longer describes must not admit the
- * group. Called by the worker under RTNL with neither learner lock held. */
+/* How long until the ruleset in force has stood still long enough for copies
+ * to confirm under it: the rest of its settling time, at least a tick. */
+static unsigned long ft_mr_ruleset_wait(void)
+{
+	unsigned long due = ft_mr_gen_since + FT_MR_RULESET_SETTLE;
+
+	return time_after(due, jiffies) ? due - jiffies : 1;
+}
+
+/* Watch for a group's copies arriving by the parent VIF of its plan and
+ * leaving by each of its oifs. The same parent and oifs keep their
+ * confirmations. Changed oifs are a new watch, which carries over those of
+ * the oifs it shares with the old one; a changed parent is a new watch that
+ * carries over none, since every copy seen came from somewhere else. A failed
+ * allocation leaves none either -- a list the watch no longer describes must
+ * not admit the group. Called by the worker under RTNL with neither learner
+ * lock held. */
 static void ft_mr_watch_arm(struct ft_mr_group *g, const struct ft_mr_plan *plan)
 {
 	unsigned int idx = ft_mr_idx(g->family);
@@ -8829,7 +8905,8 @@ static void ft_mr_watch_arm(struct ft_mr_group *g, const struct ft_mr_plan *plan
 	unsigned long seen;
 	u8 i, j;
 
-	if (old && old->oifs == plan->oif_count &&
+	if (old && old->parent == plan->parent &&
+	    old->oifs == plan->oif_count &&
 	    !memcmp(old->oif, plan->oif, plan->oif_count * sizeof(plan->oif[0])))
 		return;
 	w = kzalloc(sizeof(*w), GFP_KERNEL);
@@ -8837,13 +8914,16 @@ static void ft_mr_watch_arm(struct ft_mr_group *g, const struct ft_mr_plan *plan
 		w->family = g->family;
 		w->src = g->src;
 		w->dst = g->dst;
+		w->parent = plan->parent;
 		w->oifs = plan->oif_count;
 		memcpy(w->oif, plan->oif, sizeof(w->oif));
-		seen = old ? READ_ONCE(old->seen) : 0;
+		seen = old && old->parent == w->parent ? READ_ONCE(old->seen) : 0;
 		for (i = 0; old && i < w->oifs; i++)
 			for (j = 0; j < old->oifs; j++)
 				if (old->oif[j] == w->oif[i] && test_bit(j, &seen))
 					__set_bit(i, &w->seen);
+	} else {
+		ft_mr_confirm_errors++;
 	}
 	spin_lock_bh(&ft_mr_watch_lock);
 	if (old && w) {
@@ -8879,18 +8959,55 @@ static void ft_mr_watch_drop(struct ft_mr_group *g)
 	kfree_rcu(w, rcu);
 }
 
+/* Whether an nftables chain or a BPF program runs after the family's observer
+ * at POST_ROUTING, where it could still drop, queue or steal a copy the
+ * observer has confirmed. The hooks registered with no type -- conntrack's
+ * confirmation, which sits at the same last priority -- are the kernel's
+ * own. A registration publishes a new array, read here under RCU; an
+ * unregistration may instead leave netfilter's placeholder in place, which
+ * has no type either. */
+static bool ft_mr_observer_followed(u8 family)
+{
+	const struct nf_hook_ops *mine = &ft_mr_confirm_ops[ft_mr_idx(family)];
+	const struct nf_hook_entries *e;
+	struct nf_hook_ops **ops;
+	bool after = false, followed = false;
+	unsigned int j;
+
+	rcu_read_lock();
+	if (family == AF_INET6)
+		e = rcu_dereference(init_net.nf.hooks_ipv6[NF_INET_POST_ROUTING]);
+	else
+		e = rcu_dereference(init_net.nf.hooks_ipv4[NF_INET_POST_ROUTING]);
+	if (e) {
+		ops = nf_hook_entries_get_hook_ops(e);
+		for (j = 0; j < e->num_hook_entries && !followed; j++) {
+			if (ops[j] == mine)
+				after = true;
+			else if (after &&
+				 ops[j]->hook_ops_type != NF_HOOK_OP_UNDEFINED)
+				followed = true;
+		}
+	}
+	rcu_read_unlock();
+	return followed;
+}
+
 /* Whether a group the contract accepts may be carried now. Called by the
  * worker under RTNL, after an accepting derivation has armed its watch.
  *
- * The confirmation covers the inet hooks. A copy routed into a bridge then
- * passes the bridge's own LOCAL_OUT and POST_ROUTING hooks after it was
- * confirmed, so any hook there keeps the group in software, as a bridge hook
- * keeps a bridged flow. */
+ * The confirmation covers the inet hooks up to the observer. A copy routed
+ * into a bridge then passes the bridge's own LOCAL_OUT and POST_ROUTING hooks
+ * after it was confirmed, so any hook there keeps the group in software, as a
+ * bridge hook keeps a bridged flow; and so does a chain that runs after the
+ * observer at POST_ROUTING itself. */
 static enum ft_mr_state ft_mr_admit(struct ft_mr_group *g,
 				    const struct ft_mr_plan *plan)
 {
 	if (plan->out_bridged &&
 	    ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)))
+		return FT_MR_REFUSED_FILTER;
+	if (ft_mr_observer_followed(g->family))
 		return FT_MR_REFUSED_FILTER;
 	/* A commit since the pass began: confirmations are not good for it,
 	 * and the next pass re-arms them. */
@@ -8905,12 +9022,14 @@ static enum ft_mr_state ft_mr_admit(struct ft_mr_group *g,
 }
 
 /* A rule added under a carried group has to take it out, and nothing reports
- * a commit: while any group exists, the ruleset is looked at this often. */
+ * a commit: while any group exists, the ruleset is looked at this often. A
+ * ruleset still settling is looked at when it will have settled, which the
+ * worker schedules; the worker opens it. */
 static void ft_mr_ruleset_fn(struct work_struct *work)
 {
 	if (READ_ONCE(ft_mr_stopping))
 		return;
-	if (!ft_mr_ruleset_current())
+	if (!ft_mr_ruleset_current() || !READ_ONCE(ft_mr_gen_open))
 		schedule_work(&ft_mr_work);
 	if (READ_ONCE(ft_mr_count))
 		schedule_delayed_work(&ft_mr_ruleset, FT_MR_RULESET_INTERVAL);
@@ -9837,10 +9956,17 @@ static void ft_mr_work_fn(struct work_struct *work)
 	}
 
 	/* The forwarding check exists while a group is watched; the ruleset is
-	 * followed while any group exists. */
+	 * followed while any group exists, and a settling one is looked at
+	 * again when it will have settled. */
 	ft_mr_confirm_sync();
-	if (ft_mr_count && !READ_ONCE(ft_mr_stopping))
-		schedule_delayed_work(&ft_mr_ruleset, FT_MR_RULESET_INTERVAL);
+	if (ft_mr_count && !READ_ONCE(ft_mr_stopping)) {
+		if (READ_ONCE(ft_mr_gen_open))
+			schedule_delayed_work(&ft_mr_ruleset,
+					      FT_MR_RULESET_INTERVAL);
+		else
+			mod_delayed_work(system_wq, &ft_mr_ruleset,
+					 ft_mr_ruleset_wait());
+	}
 	if ((ft_mr_count || READ_ONCE(ft_mr_resync_pending)) &&
 	    !READ_ONCE(ft_mr_stopping))
 		schedule_delayed_work(&ft_mr_stats, FT_MR_STATS_INTERVAL);
@@ -9934,9 +10060,34 @@ static void ft_mr_exit(void)
 	ft_mr_policy[1] = 0;
 }
 
+/* The oifs Linux has not yet been seen forwarding the group to under the
+ * ruleset in force: what keeps a pending-confirm group in software. Written
+ * name by name, since there can be as many as there are VIFs. The watch is
+ * replaced under ft_mr_lock, which the caller holds, and freed after a grace
+ * period; the names are read under RCU. */
+static void ft_mr_unconfirmed(struct seq_file *seq, const struct ft_mr_group *g)
+{
+	bool any = false;
+	u8 i;
+
+	rcu_read_lock();
+	for (i = 0; g->watch && i < g->watch->oifs; i++) {
+		struct net_device *dev;
+
+		if (test_bit(i, &g->watch->seen))
+			continue;
+		dev = dev_get_by_index_rcu(&init_net, g->watch->oif[i]);
+		seq_printf(seq, "%s%s", any ? "," : "", dev ? dev->name : "?");
+		any = true;
+	}
+	rcu_read_unlock();
+	if (!any)
+		seq_putc(seq, '-');
+}
+
 static void ft_mr_rows(struct seq_file *seq)
 {
-	char listeners[224], unseen[FT_MR_OIF_TEXT];
+	char listeners[224];
 	struct cdx_ft_counters stats;
 	struct ft_mr_group *g;
 	u8 i, tags;
@@ -9961,46 +10112,25 @@ static void ft_mr_rows(struct seq_file *seq)
 				       g->listener[i].dev->name,
 				       g->listener[i].vlans ?
 					       g->listener[i].vlan[0].id : 0);
-		/* The oifs Linux has not yet been seen forwarding the group to
-		 * under the ruleset in force: what keeps a pending-confirm
-		 * group in software. The watch is replaced under ft_mr_lock and
-		 * freed after a grace period, and the names are read under RCU. */
-		unseen[0] = '\0';
-		n = 0;
-		rcu_read_lock();
-		for (i = 0; g->watch && i < g->watch->oifs; i++) {
-			struct net_device *dev;
-
-			if (test_bit(i, &g->watch->seen))
-				continue;
-			dev = dev_get_by_index_rcu(&init_net, g->watch->oif[i]);
-			n += scnprintf(unseen + n, sizeof(unseen) - n, "%s%s",
-				       n ? "," : "", dev ? dev->name : "?");
-		}
-		rcu_read_unlock();
+		if (g->family == AF_INET6)
+			seq_printf(seq,
+				   "mroute family=6 table=%u group=%pI6c src=%pI6c",
+				   g->table, &g->dst.in6, &g->src.in6);
+		else
+			seq_printf(seq,
+				   "mroute family=4 table=%u group=%pI4 src=%pI4",
+				   g->table, &g->dst.ip, &g->src.ip);
 		/* `in` names the port, or for a stream arriving through a
 		 * bridge the bridge: its port is the bridged group's to know,
 		 * and that group's row names it. */
-		if (g->family == AF_INET6)
-			seq_printf(seq,
-				   "mroute family=6 table=%u group=%pI6c src=%pI6c in=%s oifs=%s listeners=%s state=%s unconfirmed=%s packets=%llu bytes=%llu\n",
-				   g->table, &g->dst.in6, &g->src.in6,
-				   g->in ? g->in->name : g->via ? g->via->name : "-",
-				   g->oifs[0] ? g->oifs : "-",
-				   g->listeners ? listeners : "-",
-				   ft_mr_state_text(g->state),
-				   unseen[0] ? unseen : "-",
-				   stats.packets, stats.bytes);
-		else
-			seq_printf(seq,
-				   "mroute family=4 table=%u group=%pI4 src=%pI4 in=%s oifs=%s listeners=%s state=%s unconfirmed=%s packets=%llu bytes=%llu\n",
-				   g->table, &g->dst.ip, &g->src.ip,
-				   g->in ? g->in->name : g->via ? g->via->name : "-",
-				   g->oifs[0] ? g->oifs : "-",
-				   g->listeners ? listeners : "-",
-				   ft_mr_state_text(g->state),
-				   unseen[0] ? unseen : "-",
-				   stats.packets, stats.bytes);
+		seq_printf(seq, " in=%s oifs=%s listeners=%s state=%s unconfirmed=",
+			   g->in ? g->in->name : g->via ? g->via->name : "-",
+			   g->oifs[0] ? g->oifs : "-",
+			   g->listeners ? listeners : "-",
+			   ft_mr_state_text(g->state));
+		ft_mr_unconfirmed(seq, g);
+		seq_printf(seq, " packets=%llu bytes=%llu\n",
+			   stats.packets, stats.bytes);
 	}
 	mutex_unlock(&ft_mr_lock);
 }
@@ -11756,11 +11886,14 @@ static int ft_show(struct seq_file *seq, void *v)
 		   ft_mr_install_errors, ft_mr_policy[0] + ft_mr_policy[1],
 		   ft_mr_lost);
 	/* How many times an nftables commit took every routed group back to
-	 * software to be confirmed again, and how often the forwarding check
-	 * could not be registered -- which keeps a family's groups in software
-	 * with nothing else to say why. */
-	seq_printf(seq, "mroute_ruleset_changes %llu\nmroute_confirm_errors %llu\n",
-		   READ_ONCE(ft_mr_ruleset_changes), READ_ONCE(ft_mr_confirm_errors));
+	 * software to be confirmed again; whether the ruleset has stood still
+	 * long enough since for copies to confirm under it; and how often the
+	 * forwarding check could not be registered or a group's watch
+	 * allocated -- which keeps groups in software with nothing else to say
+	 * why. */
+	seq_printf(seq, "mroute_ruleset_changes %llu\nmroute_ruleset_settled %d\nmroute_confirm_errors %llu\n",
+		   READ_ONCE(ft_mr_ruleset_changes), READ_ONCE(ft_mr_gen_open),
+		   READ_ONCE(ft_mr_confirm_errors));
 	/* How many AP-mode devices this module currently has registered, and
 	 * how many it looked at and did not. The second is what separates "no
 	 * Wi-Fi offload because nothing asked" from "no Wi-Fi offload because

@@ -23,7 +23,9 @@ typedef uint64_t u64;
 #define smp_load_acquire(p) (*(p))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define min(a, b) ((a) < (b) ? (a) : (b))
-#define kzalloc(n, f) calloc(1, (n))
+/* An allocation a case can refuse. */
+static bool fail_alloc;
+#define kzalloc(n, f) (fail_alloc ? NULL : calloc(1, (n)))
 #define GFP_KERNEL 0
 #define kfree free
 #define strscpy(d, s, n) snprintf(d, n, "%s", s)
@@ -105,8 +107,23 @@ static void hlist_replace_rcu(struct hlist_node *old, struct hlist_node *new)
 #define IS_ENABLED(x) (x)
 #define CONFIG_NF_TABLES 1
 #define HZ 100
+/* Time as the worker reads it, which a case moves by hand. */
+static unsigned long jiffies = 1000;
+#define time_before(a, b) ((long)((a) - (b)) < 0)
+#define time_after(a, b) time_before(b, a)
+static struct { struct { unsigned int base_seq; u8 gencursor; } nft; } init_net;
+/* A grace period only counts, unless a case has a commit land inside the
+ * next one. */
 static unsigned grace_periods;
-static void synchronize_rcu(void) { grace_periods++; }
+static bool commit_in_grace;
+static void synchronize_rcu(void)
+{
+    grace_periods++;
+    if (commit_in_grace) {
+        commit_in_grace = false;
+        init_net.nft.base_seq++;
+    }
+}
 static bool test_and_set_bit(unsigned n, unsigned long *p)
 {
     bool old = (*p >> n) & 1;
@@ -123,7 +140,6 @@ static u32 jhash2(const u32 *k, unsigned n, u32 seed)
         h = h * 31 + k[i];
     return h;
 }
-static struct { struct { unsigned int base_seq; u8 gencursor; } nft; } init_net;
 enum { NF_BR_PRE_ROUTING, NF_BR_LOCAL_IN, NF_BR_FORWARD, NF_BR_LOCAL_OUT,
        NF_BR_POST_ROUTING };
 /* A hook on a bridge's output, which a copy routed into the bridge passes
@@ -133,6 +149,13 @@ static bool ft_bridge_hooked(unsigned int hooks)
 {
     return bridge_out_hooked &&
            (hooks & (BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING)));
+}
+/* An nftables chain or BPF program running after the observer at
+ * POST_ROUTING, which mroute_confirm_order.c finds in the real hook lists. */
+static bool observer_followed;
+static bool ft_mr_observer_followed(u8 family)
+{
+    return observer_followed;
 }
 #include "mroute_confirm_types.inc"
 static LIST_HEAD(ft_mr_groups);
@@ -156,12 +179,14 @@ static bool fail_add, fail_replace, refuse;
 static char cancels[16];
 static unsigned cancel_count;
 static bool simulate_rearm;
-/* The MFC oifs the derivation names, by ifindex, and whether a copy leaves
- * through a bridge. */
-enum { OIF_A = 31, OIF_B = 32 };
+/* The MFC oifs the derivation names, by ifindex, the parent VIF's, and
+ * whether a copy leaves through a bridge. A derivation that bumps the
+ * ruleset is a commit landing between the worker's sync and its admission. */
+enum { OIF_A = 31, OIF_B = 32, PARENT_A = 41, PARENT_B = 42 };
 static int planned[2] = { OIF_A, OIF_B };
 static unsigned planned_oifs = 1;
-static bool out_bridged;
+static int planned_parent = PARENT_A;
+static bool out_bridged, commit_in_derive;
 static void mutex_lock(int *m) { assert(!*m); *m = 1; }
 static void mutex_unlock(int *m) { assert(*m); *m = 0; }
 #define spin_lock_bh mutex_lock
@@ -176,6 +201,15 @@ static void mr_cache_put(struct mr_mfc *c) { assert(c->refs); c->refs--; }
 static void schedule_work(struct work_struct *w) { w->queued = true; }
 static void schedule_delayed_work(struct work_struct *w, unsigned delay)
 { w->queued = true; }
+/* The ruleset poll moved to when a settling ruleset will have settled. */
+static unsigned long ruleset_delay;
+#define system_wq NULL
+static void mod_delayed_work(void *wq, struct work_struct *w, unsigned long delay)
+{
+    assert(w == &ft_mr_ruleset);
+    w->queued = true;
+    ruleset_delay = delay;
+}
 static void cancel_delayed_work_sync(struct work_struct *w)
 {
     assert(ft_mr_stopping && cancel_count < sizeof(cancels) - 1);
@@ -252,8 +286,13 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g, struct ft_mr_plan *p
     /* The oif walk, which a refusal above never reached. */
     for (unsigned i = 0; i < planned_oifs; i++)
         p->oif[p->oif_count++] = planned[i];
+    p->parent = planned_parent;
     p->oifs_known = true;
     p->out_bridged = out_bridged;
+    if (commit_in_derive) {
+        commit_in_derive = false;
+        init_net.nft.base_seq++;
+    }
     if (through_bridge) {
         p->via = &bridge;
         p->via_vid = 289;
@@ -342,10 +381,32 @@ static void refresh(void)
     run();
 }
 /* A copy of the group's stream seen leaving by `ifindex` at POST_ROUTING, as
- * the hook reports it. */
+ * the hook reports it, having arrived by `iif` -- by default the parent the
+ * derivation names. */
+static void seen_from(const struct ft_mr_group *g, int ifindex, int iif)
+{
+    ft_mr_confirm_seen(g->family, &g->src, &g->dst, ifindex, iif);
+}
 static void seen(const struct ft_mr_group *g, int ifindex)
 {
-    ft_mr_confirm_seen(g->family, &g->src, &g->dst, ifindex);
+    seen_from(g, ifindex, planned_parent);
+}
+/* The ruleset poll, as its timer runs it. */
+static void poll_ruleset(void)
+{
+    ft_mr_ruleset.queued = false;
+    ft_mr_ruleset_fn(&ft_mr_ruleset);
+}
+/* The ruleset stands still for as long as the worker asks it to: the poll
+ * finds it settling and wakes the worker, which lets copies confirm. */
+static void settle(void)
+{
+    assert(!ft_mr_gen_open && ft_mr_ruleset.queued);
+    jiffies += ruleset_delay;
+    poll_ruleset();
+    assert(ft_mr_work.queued);
+    run();
+    assert(ft_mr_gen_open);
 }
 int main(void)
 {
@@ -364,23 +425,44 @@ int main(void)
     ft_mr_ready = true;
     run();
     /* Eligible, and not carried: Linux has not been seen forwarding the
-     * stream to its oif. The confirmations are armed for the ruleset in
-     * force -- one grace period each side of reading it -- the group is
-     * watched, and the forwarding check is registered for its family. */
+     * stream to its oif. The ruleset in force has been read, after a grace
+     * period, and is being timed; the group is watched for copies from its
+     * parent, and the forwarding check is registered for its family. */
     assert(!adds && !hardware.live && g->state == FT_MR_UNCONFIRMED);
     assert(!strcmp(ft_mr_state_text(g->state), "pending-confirm"));
     assert(!ft_mr_refusal(g->state) && !g->offloaded);
-    assert(ft_mr_gen_open && grace_periods == 2 && !ft_mr_ruleset_changes);
+    assert(!ft_mr_gen_open && grace_periods == 1 && !ft_mr_ruleset_changes);
     assert(g->watch && g->watch->oifs == 1 && g->watch->oif[0] == OIF_A);
-    assert(confirm_hooked[0] && !confirm_hooked[1] && ft_mr_ruleset.queued);
-    /* A copy to another interface, or of another group, is not this one. */
+    assert(g->watch->parent == PARENT_A);
+    assert(confirm_hooked[0] && !confirm_hooked[1]);
+    /* The poll comes back when the ruleset will have stood still long
+     * enough, and until then a copy confirms nothing, and wakes nobody. */
+    assert(ft_mr_ruleset.queued && ruleset_delay == FT_MR_RULESET_SETTLE);
+    ft_mr_work.queued = false;
+    seen(g, OIF_A);
+    assert(!g->watch->seen && !ft_mr_work.queued);
+    /* Early, the poll finds it still settling: the worker is woken, looks,
+     * and leaves it closed. */
+    jiffies += FT_MR_RULESET_SETTLE - 1;
+    poll_ruleset();
+    assert(ft_mr_work.queued);
+    run();
+    assert(!ft_mr_gen_open && grace_periods == 1 && ruleset_delay == 1);
+    /* On time, it opens, after a grace period for the copies already past
+     * FORWARD when the ruleset was read. */
+    settle();
+    assert(grace_periods == 2 && !ft_mr_ruleset_changes);
+    assert(!adds && g->state == FT_MR_UNCONFIRMED);
+    /* A copy to another interface, of another group, or from another
+     * parent is not this one. */
     {
         union nf_inet_addr other = { .all = { 1 } };
 
         ft_mr_work.queued = false;
         seen(g, OIF_B);
-        ft_mr_confirm_seen(AF_INET, &other, &g->dst, OIF_A);
-        ft_mr_confirm_seen(AF_INET6, &g->src, &g->dst, OIF_A);
+        seen_from(g, OIF_A, PARENT_B);
+        ft_mr_confirm_seen(AF_INET, &other, &g->dst, OIF_A, PARENT_A);
+        ft_mr_confirm_seen(AF_INET6, &g->src, &g->dst, OIF_A, PARENT_A);
         assert(!g->watch->seen && !ft_mr_work.queued);
     }
     /* Its own oif: the worker is woken, asks again, and carries it. */
@@ -642,16 +724,22 @@ int main(void)
         unsigned added = adds, deleted = deletes, periods = grace_periods;
 
         assert(hardware.live && g->state == FT_MR_INSTALLED);
-        ft_mr_ruleset.queued = false;
-        ft_mr_ruleset_fn(&ft_mr_ruleset);
+        ft_mr_work.queued = false;
+        poll_ruleset();
         assert(!ft_mr_work.queued && ft_mr_ruleset.queued);  /* nothing moved */
         init_net.nft.base_seq++;
-        ft_mr_ruleset_fn(&ft_mr_ruleset);
+        poll_ruleset();
         assert(ft_mr_work.queued);                           /* this did */
         run();
         assert(deletes == deleted + 1 && !hardware.live && !g->offloaded);
         assert(g->state == FT_MR_UNCONFIRMED && !g->watch->seen);
-        assert(ft_mr_ruleset_changes == 1 && grace_periods == periods + 2);
+        assert(ft_mr_ruleset_changes == 1 && grace_periods == periods + 1);
+        /* Re-admission waits for the ruleset to stand still: a copy while
+         * it settles confirms nothing. */
+        seen(g, OIF_A);
+        assert(!g->watch->seen && !ft_mr_gen_open);
+        settle();
+        assert(grace_periods == periods + 2 && adds == added);
         seen(g, OIF_A);
         run();
         assert(adds == added + 1 && hardware.live && g->state == FT_MR_INSTALLED);
@@ -662,6 +750,7 @@ int main(void)
         run();
         assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);
         assert(ft_mr_ruleset_changes == 2);
+        settle();
         /* A copy seen after a commit the worker has not caught up with was
          * judged by rules nothing is armed for: no confirmation, and the
          * worker is woken to re-arm. */
@@ -671,6 +760,117 @@ int main(void)
         assert(!g->watch->seen && ft_mr_work.queued);
         run();
         assert(ft_mr_ruleset_changes == 3 && g->state == FT_MR_UNCONFIRMED);
+        /* Another commit while it settles starts the wait again, from the
+         * newer ruleset. */
+        jiffies += FT_MR_RULESET_SETTLE - 1;
+        init_net.nft.base_seq++;
+        poll_ruleset();
+        run();
+        assert(ft_mr_ruleset_changes == 4 && !ft_mr_gen_open);
+        assert(ruleset_delay == FT_MR_RULESET_SETTLE);
+        /* And one landing in the grace period before it would open leaves
+         * it closed; the next pass sees it and starts again. */
+        jiffies += ruleset_delay;
+        commit_in_grace = true;
+        poll_ruleset();
+        run();
+        assert(!ft_mr_gen_open && ft_mr_ruleset_changes == 4);
+        run();
+        assert(!ft_mr_gen_open && ft_mr_ruleset_changes == 5);
+        settle();
+        seen(g, OIF_A);
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
+    /* ---- a commit between the pass's sync and its admission ------------
+     *
+     * The derivation runs under RTNL after the worker followed the ruleset,
+     * and a commit can land in between. The watch is complete and was made
+     * under the ruleset before it, which is no longer the one in force: the
+     * group is not carried, and the worker is asked to look again. */
+    {
+        unsigned deleted = deletes;
+
+        commit_in_derive = true;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && deletes == deleted + 1);
+        assert(g->state == FT_MR_UNCONFIRMED && ft_mr_work.queued);
+        run();
+        assert(ft_mr_ruleset_changes == 6 && !g->watch->seen);
+        settle();
+        seen(g, OIF_A);
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
+    /* ---- the parent moves ------------------------------------------------
+     *
+     * An MFC entry replaced with another parent and the same oifs -- a route
+     * added again from another inbound interface, an RPF change -- is a
+     * stream judged as coming from somewhere else: an iif-keyed forward
+     * rule may drop it. Nothing seen from the old parent confirms anything
+     * for the new one. */
+    {
+        unsigned added = adds;
+
+        planned_parent = PARENT_B;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);
+        assert(g->watch->parent == PARENT_B && !g->watch->seen);
+        seen_from(g, OIF_A, PARENT_A);
+        run();
+        assert(adds == added && !hardware.live && !g->watch->seen);
+        seen(g, OIF_A);
+        run();
+        assert(adds == added + 1 && hardware.live && g->state == FT_MR_INSTALLED);
+        planned_parent = PARENT_A;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->watch->parent == PARENT_A && !g->watch->seen);
+        seen(g, OIF_A);
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
+    /* ---- a hook after the observer ---------------------------------------
+     *
+     * An nftables chain or a BPF program that runs after the observer can
+     * still drop what it confirmed: the group stays in software while one
+     * does, and its confirmations stand for when it goes. */
+    {
+        observer_followed = true;
+        ft_mr_recheck = true;
+        run();
+        assert(!hardware.live && g->state == FT_MR_REFUSED_FILTER);
+        assert(g->watch->seen == 1);
+        observer_followed = false;
+        ft_mr_recheck = true;
+        run();
+        assert(hardware.live && g->state == FT_MR_INSTALLED);
+    }
+
+    /* ---- a watch that cannot be allocated --------------------------------
+     *
+     * A changed oif list needs a new watch. Without one nothing describes
+     * the list, so nothing admits the group, and /proc counts why. */
+    {
+        u64 errors = ft_mr_confirm_errors;
+
+        planned_oifs = 2;
+        fail_alloc = true;
+        ft_mr_recheck = true;
+        run();
+        fail_alloc = false;
+        assert(!g->watch && ft_mr_confirm_errors == errors + 1);
+        assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);
+        assert(!ft_mr_watch_count[0]);
+        planned_oifs = 1;
+        ft_mr_recheck = true;
+        run();
+        assert(g->watch && !g->watch->seen && g->state == FT_MR_UNCONFIRMED);
         seen(g, OIF_A);
         run();
         assert(hardware.live && g->state == FT_MR_INSTALLED);
@@ -758,7 +958,7 @@ int main(void)
     run();
     assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);
     assert(confirm_hooked[1] && !confirm_hooked[0] && ft_mr_watch_count[1] == 1);
-    ft_mr_confirm_seen(AF_INET, &g->src, &g->dst, OIF_A);     /* not this family */
+    ft_mr_confirm_seen(AF_INET, &g->src, &g->dst, OIF_A, PARENT_A); /* not this family */
     assert(!g->watch->seen);
     seen(g, OIF_A);
     run();
@@ -766,6 +966,7 @@ int main(void)
     init_net.nft.base_seq++;
     run();
     assert(!hardware.live && g->state == FT_MR_UNCONFIRMED);
+    settle();
     seen(g, OIF_A);
     run();
     assert(hardware.live);

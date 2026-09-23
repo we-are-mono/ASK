@@ -34,7 +34,7 @@ def test_mroute_refresh(tmp_path):
             # ruleset it is good for, and the admission they decide.
             "ft_mr_ruleset_read", "ft_mr_ruleset_current", "ft_mr_watch_bucket",
             "ft_mr_watch_complete", "ft_mr_confirm_seen", "ft_mr_ruleset_sync",
-            "ft_mr_watch_arm", "ft_mr_watch_drop", "ft_mr_admit",
+            "ft_mr_ruleset_wait", "ft_mr_watch_arm", "ft_mr_watch_drop", "ft_mr_admit",
             "ft_mr_ruleset_fn",
             "ft_mr_refusal", "ft_mr_state_text", "ft_mr_plan_same",
             "ft_mr_plan_put", "ft_mr_offload_flag", "ft_mr_counters",

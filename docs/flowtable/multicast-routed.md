@@ -238,11 +238,17 @@ for why this is an admission bound rather than a check in hardware.
 
 **The host.** `ip_mr_input()` delivers locally as well as forwarding when the
 ingress interface has joined the group — `ip_route_input_mc()` asks
-`ip_check_mc_rcu()` on the input device, and IPv6 asks the idev's own list — and
-a hardware entry replicates to ports without the frame ever reaching the CPU.
-Such a group is `refused-host` rather than carried with a starved local
-listener, which is the bridged learner's answer to the same question. Neither
-check is exported, so the learner walks `__in_dev_get_rcu(dev)->mc_list` and
+`ip_check_mc_rcu()` on the input device, and IPv6 asks the idev's own list. The
+same holds on the way out. `ip_mc_output()` loops each forwarded copy back to
+the host when its output route is `RTCF_LOCAL`, which is when the host has
+joined the group on the oif. `ip6_finish_output2()` does the same when
+`ipv6_chk_mcast_addr()` finds the group on the output device. A hardware entry
+replicates to ports without the frame ever reaching the CPU, so a group with a
+host membership on its parent VIF or on any oif is `refused-host` rather than
+carried with a starved local listener, which is the bridged learner's answer to
+the same question. Any membership counts, whatever its source filter. Refusing
+one the filter would not deliver costs only the offload. Neither check is
+exported, so the learner walks `__in_dev_get_rcu(dev)->mc_list` and
 `__in6_dev_get(dev)->mc_list` under RCU.
 
 **The key.** A routed root is keyed on its port and address pair, and the key
@@ -281,11 +287,29 @@ earlier `POST_ROUTING` chain, filter and NAT alike. `ipmr_queue_xmit()` and
 send it through `NF_INET_FORWARD` to `dst_output()`. `ip_mc_output()` and
 `ip6_output()` then run `POST_ROUTING` with the VIF as the output device. The
 observer records the `(S,G)` and that device's ifindex against the group's
-oifs. What every packet pays there is one test of whether its destination is
-multicast. A forwarded copy of a group then costs one hash lookup, and only its
-first sighting per oif writes anything. A chain registered later at the very
-same last priority runs after the observer, which is the one ordering
-netfilter leaves open.
+oifs, for a copy whose `skb_iif` is the parent VIF's. `skb_iif` is the device
+ipmr saw the stream arrive on, a VLAN device or a bridge included. What every
+packet pays there is one test of whether its destination is multicast. A
+forwarded copy of a group then costs one hash lookup, and only its first
+sighting per oif writes anything.
+
+**Where it came from.** fw4's zone rules, like most forward rules, are keyed on
+the input interface as much as the output one. So a confirmation holds for the
+parent VIF it was made from. An MFC entry replaced with another parent and the
+same oifs, such as a route added again from another inbound interface or an RPF
+change under a PIM daemon, starts from nothing, and copies still in flight from
+the old parent confirm nothing for the new one.
+
+**What runs after it.** At an equal priority netfilter puts a hook registered
+later ahead of the ones already there. So an nftables chain at priority
+2147483647 created after the observer runs before it and is covered. One that
+already existed when the observer registered runs after it. The observer
+registers afresh whenever a family's first group appears. Such a chain, or a
+BPF program there, can still drop, queue or steal a confirmed copy. While one
+follows the observer on that family's `POST_ROUTING`, its groups are
+`refused-filter`. Conntrack's confirmation also sits at that priority. It is
+the kernel's own, registered with no hook type, and drops a copy only when it
+cannot insert its entry, so it does not count.
 
 **All or nothing.** A root consumes every frame it matches, and no listener the
 encoder expresses delivers to the CPU; the bridged learner's `refused-host` is
@@ -312,29 +336,66 @@ way up too.
 nftables' commit counter `init_net.nft.base_seq`, and the cursor
 `init_net.nft.gencursor` the packet path reads rules through, which the commit
 moves just after the counter. When either changes, every confirmation is taken
-back and every group returns to software. The next copy Linux forwards then
-confirms it again, so a drop rule added under a carried group stops the stream
-rather than being bypassed. Re-arming waits out the copies the observer has in
-hand, then reads the pair and waits again for every copy already past
-`FORWARD`, and only then accepts confirmations. A copy is never counted for
-rules it was not judged by. Nothing reports a commit, so the pair is read
-every second while any group exists, as well as at every worker pass and by
-the observer itself, which wakes the worker when it sees the pair move.
-`mroute_ruleset_changes` counts the times this happened.
+back and every group returns to software, so a drop rule added under a carried
+group stops the stream rather than being bypassed. Nothing reports a commit,
+so the pair is read every second while any group exists, as well as at every
+worker pass and by the observer itself, which wakes the worker when it sees
+the pair move. That second is how long a rule added under a carried group can
+go unenforced. `mroute_ruleset_changes` counts the commits that took
+confirmations back.
 
-Every commit counts, including a set element added by a daemon. A box whose
-ruleset changes often pays a brief software episode each time. The episode
-lasts until the next copy of each group, and the stream keeps flowing in
-software meanwhile.
+**Settling.** A commit goes on applying some of itself after it has moved the
+pair: a new base chain's policy, element timeouts, and a concatenated (pipapo)
+set's new contents, which become visible only after the transaction loop.
+Nothing outside nf_tables can see when that is done. Its commit mutex and busy
+mark are private to it, and in this kernel nfnetlink's subsystem lock is
+released before the batch runs, so taking it would wait for nothing. So
+confirmations start again only once the pair has stood still for a second
+(`FT_MR_RULESET_SETTLE`), and `mroute_ruleset_settled` says whether it has.
+Re-arming first waits out the copies the observer has in hand, clears every
+confirmation, and reads the pair. After the second has passed, it waits again
+for every copy already past `FORWARD` when the pair was read, reads the pair
+once more, and only then accepts confirmations. The residual is a commit whose
+post-flip work outlasts that second, which takes a very large set load. A
+confirmation made during it may reflect the half-applied set.
+
+**What a commit costs.** Every commit counts, including a set element added by
+a daemon. For each routed group it costs one episode in software, and the
+stream keeps flowing through the CPU meanwhile. The episode starts when the
+commit is noticed, at most a second after it lands. It lasts the second of
+settling, then until the next copy of the group per oif and one worker pass:
+a little over one second of software forwarding. A further commit during the
+episode starts the settling again. The settling also bounds the churn: however
+fast commits arrive, a group goes in and out of hardware at most about once a
+second, with two classifier operations and a few RTNL holds each time. This
+is deliberately stricter than unicast. Linux never revokes a unicast
+flowtable flow on a commit, only when the flowtable itself goes. A routed
+multicast stream lives for hours, no conntrack timeout bounds it, and a
+blocklist entry added for its source has to stop it.
 
 **What it does not cover.** A confirmation proves that the ruleset forwards the
-stream to that oif, not what it does to each packet. A rate limit, a quota, a
-counter, or a match that differs from one packet to the next stops applying
-once the group is carried, as it does for a flowtable flow. iptables-legacy
-tables are replaced with no generation a module can read, so a legacy rule
-change is followed only once something else takes the group back: an MFC
-change, a device change, or an nftables commit. iptables-nft is nftables and is
-followed.
+stream to that oif, not what it does to each packet:
+
+- A rate limit, a quota, a counter, or a match that differs from one packet to
+  the next stops applying once the group is carried, as it does for a
+  flowtable flow.
+- Verdicts that change without a commit are not followed:
+  - ipset membership (`iptables-nft -m set`) and stateful xt matches;
+  - set elements added by the datapath (`add @s`, `update @s`) or expiring
+    by timeout;
+  - `fib`-based rules after a route change;
+  - an interface renamed, or moved between groups, under an `oifname` or
+    `oifgroup` rule.
+- A copy queued to userspace (NFQUEUE) before a commit and reinjected after
+  the re-arm is observed under the new pair.
+- Anything after `POST_ROUTING` is not seen at all: an nftables `netdev`
+  egress chain, and a tc egress filter or action. Creating such a chain is a
+  commit. The next copy is seen at `POST_ROUTING` all the same, and is dropped
+  only in software after that.
+- iptables-legacy tables are replaced with no generation a module can read, so
+  a legacy rule change is followed only once something else takes the group
+  back: an MFC change, a device change, or an nftables commit. iptables-nft is
+  nftables and is followed.
 
 ## One stream, both learners
 
@@ -404,8 +465,8 @@ box's copy alone and starved ipmr: the routed half was silently lost.
 - The union has to fit `CDX_MC_MAX_LISTENERS`: `refused-listener`.
 - Every routed copy has to fit the port the stream arrives on, which the bridge
   hands up whatever the bridge device's MTU: `refused-mtu` on the bridged row.
-- A host membership on the parent VIF is a local listener: `refused-host` on
-  both rows.
+- A host membership on the parent VIF, or on an oif, is a local listener:
+  `refused-host` on both rows.
 - The same port, sender and source of a group on two VLANs of one bridge is
   one classifier key, and both flows stay `refused-contested`. `(*,G)` and
   `(S,G)` memberships of one group no longer contest anything: they are both
@@ -489,9 +550,13 @@ family over:
 | The bridge's VLAN configuration or filtering | the switchdev chain | kicked and re-derived |
 | A multicast router port, snooping, flood flag or forwarding state | switchdev attributes | kicked and re-derived from the live snapshot. `PORT_MROUTER` is one boolean for both families, sent only when the union changes — drivers count references by it — so one family's router arriving or expiring while the other stands is found by the five-second refresh instead |
 | Querier timers or per-VLAN snooping state without a notification | the existing five-second worker | re-derived, including refused groups; unchanged forwarding plans leave their hardware chains intact |
-| An nftables commit (iptables-nft included) | nothing reports it: read every second while any group exists, at every worker pass, and by the observer | every confirmation taken back, every group to software until a copy is seen leaving each oif again |
-| A copy seen leaving an oif at `POST_ROUTING` | the observer, which wakes the worker when a group's last oif is seen | re-derived and carried |
+| An nftables commit (iptables-nft included) | nothing reports it: read every second while any group exists, at every worker pass, and by the observer | every confirmation taken back, every group to software until the ruleset has stood still for a second and a copy is then seen leaving each oif again |
+| The ruleset having stood still for a second | the ruleset poll, moved to that moment | confirmations accepted again |
+| A copy seen leaving an oif at `POST_ROUTING`, having arrived by the parent VIF | the observer, which wakes the worker when a group's last oif is seen | re-derived and carried |
+| The MFC entry's parent replaced | the FIB chain | a new watch with nothing confirmed; to software until copies from the new parent are seen |
 | A bridge hook registered at `output` or `postrouting` | nothing reports it: asked at every derivation | a group with an oif through a bridge is `refused-filter` |
+| An nftables chain or BPF program after the observer at `POST_ROUTING` | nothing reports it: asked at every derivation, and creating a chain is a commit | the family's groups are `refused-filter` |
+| The host joining the group on the parent VIF or an oif | nothing reports it | `refused-host` at the next derivation; the five-second refresh finds it |
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
 | A bridge becoming or ceasing to be a multicast router | `SWITCHDEV_ATTR_ID_BRIDGE_MROUTER` | the bridged worker asks the bridge about every flow on it again, and re-matches each against the routes and VIFs; the dedup slots are forgotten, so a stream only a route names is learned from its next frame |
@@ -565,6 +630,7 @@ mroute_install_errors 0
 mroute_policy_rules 0
 mroute_lost 0
 mroute_ruleset_changes 3
+mroute_ruleset_settled 1
 mroute_confirm_errors 0
 ```
 
@@ -581,8 +647,11 @@ becomes several. `unconfirmed` names the oifs Linux has not yet been seen
 forwarding the group to, which is what keeps a `pending-confirm` group in
 software. The states are `installed`, `pending`, `pending-bridged`,
 `pending-confirm`, and the refusals above plus `refused-filter`, each distinct
-so an operator can tell them apart. `mroute_confirm_errors` counts failures to
-register the observer, which keep a family's groups in software. A group
+so an operator can tell them apart. `mroute_ruleset_settled` is 0 for the
+second after a commit, while no copy confirms anything and every group reads
+`pending-confirm` with all its oifs unconfirmed. `mroute_confirm_errors`
+counts failures to register the observer or to allocate a group's watch, each
+of which keeps groups in software. A group
 routed through a bridge names the bridge as `in`: the port its stream arrives
 on is the bridged group's to know, and that row — `mcast … routed=eth3/287` —
 names it, with its own copies beside the routed ones. `mroute_policy_rules`
@@ -663,16 +732,23 @@ reaches `cdx_mc_group_add()`, its state and `MFC_OFFLOAD` follow what the
 bridged learner reports, its counters are the bridged group's less the ingress
 tag, and a parent moving back to a port withdraws the route. It runs the
 admission with the real table as well. A group is `pending-confirm` until
-its oif is seen, and a copy to another device, another group or the other
-family confirms nothing. A commit, by the counter or by the cursor alone,
-withdraws the group, and the next copy re-confirms it. A copy seen after a
-commit the worker has not caught up with confirms nothing and wakes it. An
-oif Linux never forwards to keeps the group in software through any number of
-refreshes, and is carried once seen. An oif removed leaves the rest confirmed.
-A bridge output hook refuses a copy routed into a bridge. The same happens for
-IPv6 in a table of its own. It also runs two
-MFC entries on one port's two VLANs, the second `refused-contested` until the
-first retires. `mcast_learner.c` runs the bridged half: the union and its
+its oif is seen, and a copy to another device, of another group, from another
+parent or of the other family confirms nothing. A commit, by the counter or by
+the cursor alone, withdraws the group. Copies confirm nothing until the
+ruleset has stood still for its second, and a further commit, or one landing
+in the grace period before opening, starts that again. The next copy after
+it re-confirms the group. A copy seen after a commit the worker has not
+caught up with confirms nothing and wakes it. So does a commit between the
+pass's sync and its admission. An oif Linux never forwards to keeps the group
+in software through any number of refreshes, and is carried once seen. An oif
+removed leaves the rest confirmed. A new parent starts from nothing. A bridge
+output hook, or a hook after the observer, refuses the group. A watch that
+cannot be allocated admits nothing and is counted. The same happens for IPv6
+in a table of its own. It also runs two MFC entries on one port's two VLANs,
+the second `refused-contested` until the first retires.
+`mroute_confirm_order.c` runs the real walk of the `POST_ROUTING` list, where
+only an nftables or BPF hook after the observer counts.
+`mcast_learner.c` runs the bridged half: the union and its
 ceiling, a duplicate framing, the MTU bound, retention while either learner
 names a group, the group a route creates for itself and the join that fills
 it, which VLANs a VIF on a bridge receives, a bridge that is not a multicast
@@ -749,8 +825,9 @@ device, as fw4's zone policy would. The group reads `pending-confirm` with the
 VLAN device `unconfirmed`. The port receives the stream through software, and
 the VLAN peer receives nothing. With the table deleted, the group is carried to
 both, and the classifier counts the whole window. Adding the chain back is a
-commit: `mroute_ruleset_changes` moves, the group leaves hardware, and the VLAN
-peer receives nothing again.
+commit: `mroute_ruleset_changes` moves and the group leaves hardware. Once
+`mroute_ruleset_settled` is back, the port is confirmed again from the stream,
+and the VLAN peer receives nothing.
 
 ## Proved on hardware
 
@@ -780,7 +857,8 @@ same path with every counter read by hand.
 Two clauses of the contract are not reachable from this rig and are covered by
 the host harness alone. A **threshold above 1** needs a daemon that writes one,
 and every daemon in the contract writes 1. **`refused-host`** needs the box to
-have joined the group on its own ingress interface, which nothing here does.
+have joined the group on its own ingress interface or on an oif, which nothing
+here does.
 `refused-contested` is likewise host-only: it needs two parents on two VLANs of
 one port for one `(S,G)`, which no daemon in the contract writes on its own.
 

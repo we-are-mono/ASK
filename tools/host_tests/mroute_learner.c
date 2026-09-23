@@ -727,8 +727,11 @@ int main(void)
     g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
     vif_set(AF_INET, 1, &LAN, 0);
     oif(g, 1, 1);
-    /* No VIF at the parent index at all. */
+    /* No VIF at the parent index at all: no device a copy could have
+     * arrived by, so nothing it sees confirms the group. */
     assert(refuse(g) == FT_MR_REFUSED_INGRESS);
+    assert(derive(g, &plan) == FT_MR_REFUSED_INGRESS && plan.oifs_known);
+    assert(plan.parent == 0 && plan.oif[0] == LAN.ifindex);
     /* A register VIF is a software tunnel to the rendezvous point and an
      * IPIP VIF encapsulates; neither is a port. */
     vif_set(AF_INET, 0, &WAN, VIFF_REGISTER);
@@ -755,6 +758,9 @@ int main(void)
     vif_set(AF_INET, 0, &VWAN, 0);
     assert(derive(g, &plan) == FT_MR_PENDING);
     assert(plan.spec.in == &WAN && plan.in_tags == 1);
+    /* The parent a copy is judged as arriving by is the VIF, the VLAN
+     * device ipmr saw it on, not the port beneath. */
+    assert(plan.parent == VWAN.ifindex);
     assert(plan.spec.in_vlans == 1 && plan.spec.in_vlan[0].id == 10);
     assert(plan.spec.in_vlan[0].proto == htons(ETH_P_8021Q));
     /* Routed: no Ethernet pair to key on, the copies take the port's. */
@@ -795,6 +801,7 @@ int main(void)
     oif(g, 1, 1);
     assert(derive(g, &plan) == FT_MR_PENDING);
     assert(plan.spec.in == NULL && plan.via == &BR && !plan.via_tagged);
+    assert(plan.parent == BR.ifindex);   /* what the bridge hands ipmr */
     assert(plan.via_vid == 0 && plan.in_tags == 0 && plan.spec.in_vlans == 0);
     assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN2);
     assert(plan.spec.listener[0].routed);
@@ -901,10 +908,21 @@ int main(void)
     host_join4(&WAN, ip4(239, 8, 1, 9));
     assert(derive(g, &plan) == FT_MR_PENDING);
     ft_mr_plan_put(&plan);
-    /* Nor the same group on a different device: the check is the input
-     * device's, exactly as ip_route_input_mc() asks it. */
+    /* Joined on an oif is a listener too: ip_mc_output() loops each
+     * forwarded copy back to the host on the device it leaves by, and a
+     * copy the classifier replicates never comes back up. */
     mc_list_count = mc4_used = 0;
     host_join4(&LAN, ip4(239, 8, 1, 5));
+    assert(refuse(g) == FT_MR_REFUSED_HOST);
+    /* The same group on a device the stream neither arrives on nor leaves
+     * by is nobody's listener. */
+    mc_list_count = mc4_used = 0;
+    host_join4(&LAN2, ip4(239, 8, 1, 5));
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    /* Nor is a VIF inside the entry's range that it does not forward to. */
+    vif_set(AF_INET, 2, &LAN2, 0);
+    oif(g, 2, 255);
     assert(derive(g, &plan) == FT_MR_PENDING);
     ft_mr_plan_put(&plan);
     free(g);
@@ -915,6 +933,10 @@ int main(void)
     vif_set(AF_INET6, 1, &LAN, 0);
     oif(g, 1, 1);
     host_join6(&WAN, ip6(0xff1e, 0x05));
+    assert(refuse(g) == FT_MR_REFUSED_HOST);
+    /* ip6_finish_output2() loops a forwarded copy back the same way. */
+    mc_list_count = mc6_used = 0;
+    host_join6(&LAN, ip6(0xff1e, 0x05));
     assert(refuse(g) == FT_MR_REFUSED_HOST);
     free(g);
 

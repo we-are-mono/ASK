@@ -4,9 +4,12 @@
  *
  * A hardware entry replicates at the classifier, before any of them runs, so
  * while one is registered at PRE_ROUTING, FORWARD or POST_ROUTING no bridged
- * flow may be carried. The learner's own hook, at PRE_ROUTING, is the one
- * that never counts; LOCAL_IN and LOCAL_OUT see only what the host receives
- * or sends, which an installed flow never is.
+ * flow may be carried. CDX's own hooks -- the learner's, at PRE_ROUTING, and
+ * VWD's -- never count. LOCAL_IN and LOCAL_OUT see only what the host
+ * receives or sends, which a plain bridged flow never is. A route's copies
+ * are: the routed learner asks about LOCAL_OUT and POST_ROUTING for a copy
+ * routed into a bridge, and a copy handed up through LOCAL_IN is confirmed
+ * only once ipmr has forwarded it.
  */
 #include <assert.h>
 #include <stdbool.h>

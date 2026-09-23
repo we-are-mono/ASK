@@ -446,12 +446,17 @@ def test_proc_reports_a_row_and_a_summary():
     assert "ft_mr_rows(seq);" in show
     for key in ("mroute_groups", "mroute_installed", "mroute_refused",
                 "mroute_install_errors", "mroute_policy_rules",
-                "mroute_ruleset_changes", "mroute_confirm_errors"):
+                "mroute_ruleset_changes", "mroute_ruleset_settled",
+                "mroute_confirm_errors"):
         assert key in show, f"{key} missing from the summary"
     rows = function(source, "ft_mr_rows")
     for field in ("family=", "table=", "group=", "src=", "in=", "oifs=",
                   "listeners=", "state=", "unconfirmed=", "packets=", "bytes="):
         assert field in rows, f"{field} missing from the row"
+    # Every unseen oif is named, however many VIFs there are: written name
+    # by name, never through a buffer that could cut the list short.
+    assert "ft_mr_unconfirmed(seq, g);" in rows
+    assert "scnprintf" not in function(source, "ft_mr_unconfirmed")
     # A read is also a fold, so the two surfaces never disagree.
     assert "ft_mr_fold(g, &stats, tags)" in rows
 
@@ -474,6 +479,8 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
              "IP6CB(skb)->flags & IP6SKB_FORWARDED")):
         call = hook.index(f"ft_mr_confirm_seen({family},")
         assert hook.index(test) < hook.index(mark) < call
+        # Where the copy came from: the device ipmr saw it arrive on.
+        assert hook.index("skb->skb_iif", call) < hook.index(";", call)
     assert "state->out->ifindex" in hook
     assert hook.count("return NF_ACCEPT;") == 4 and "NF_DROP" not in hook
     ops = source[source.index("static struct nf_hook_ops ft_mr_confirm_ops[2]"):]
@@ -482,24 +489,34 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
     assert ".priority = NF_IP_PRI_LAST" in ops and ".priority = NF_IP6_PRI_LAST" in ops
 
     # Confirmations are good for one ruleset: nftables' commit counter and
-    # the cursor the rules are read through.
+    # the cursor the rules are read through; and for one parent, which a
+    # copy from any other confirms nothing for.
     read = function(source, "ft_mr_ruleset_read")
     assert "smp_load_acquire(&init_net.nft.base_seq)" in read
     assert "READ_ONCE(init_net.nft.gencursor)" in read
     seen = function(source, "ft_mr_confirm_seen")
     assert seen.index("READ_ONCE(ft_mr_gen_open)") < seen.index("ft_mr_ruleset_current()") < \
-        seen.index("test_and_set_bit(i, &w->seen)")
+        seen.index("w->parent != iif") < seen.index("test_and_set_bit(i, &w->seen)")
+    arm = function(source, "ft_mr_watch_arm")
+    assert "old->parent == plan->parent" in arm and "w->parent = plan->parent;" in arm
+    assert "old->parent == w->parent ? READ_ONCE(old->seen) : 0" in arm
     # Re-arming closes, waits out every copy in hand, clears, reads the
-    # ruleset, waits out every copy already past FORWARD, and only then opens.
+    # ruleset and starts timing it. Opening waits for it to have stood still,
+    # waits out every copy already past FORWARD when it was read, and opens
+    # only if it still stands.
     sync = function(source, "ft_mr_ruleset_sync")
+    close = sync[sync.index("WRITE_ONCE(ft_mr_gen_open, false);"):]
     steps = ["WRITE_ONCE(ft_mr_gen_open, false);", "synchronize_rcu();",
              "WRITE_ONCE(w->seen, 0);", "ft_mr_ruleset_read(&seq, &cursor);",
+             "ft_mr_gen_since = jiffies;"]
+    at = [close.index(s) for s in steps]
+    assert at == sorted(at) and "WRITE_ONCE(ft_mr_gen_open, true);" not in close
+    opening = sync[:sync.index("WRITE_ONCE(ft_mr_gen_open, false);")]
+    steps = ["time_before(jiffies, ft_mr_gen_since + FT_MR_RULESET_SETTLE)",
+             "synchronize_rcu();", "if (ft_mr_ruleset_current())",
              "WRITE_ONCE(ft_mr_gen_open, true);"]
-    at = [sync.index(s) for s in steps]
+    at = [opening.index(s) for s in steps]
     assert at == sorted(at)
-    assert sync.count("synchronize_rcu();") == 2
-    assert sync.index("ft_mr_ruleset_read(&seq, &cursor);") < \
-        sync.rindex("synchronize_rcu();") < sync.index("WRITE_ONCE(ft_mr_gen_open, true);")
 
     # The worker follows the ruleset first, watches a group once its oifs
     # are known, and decides its state from the confirmations before it
@@ -511,10 +528,14 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
         worker.index("state = ft_mr_admit(target, &plan)") < worker.index("same = hw &&")
     admit = function(source, "ft_mr_admit")
     assert "ft_bridge_hooked(BIT(NF_BR_LOCAL_OUT) | BIT(NF_BR_POST_ROUTING))" in admit
+    assert "if (ft_mr_observer_followed(g->family))" in admit
     assert "return FT_MR_UNCONFIRMED;" in admit and "ft_mr_watch_complete(g->watch)" in admit
-    # A ruleset commit is looked for while any group exists.
-    assert "schedule_delayed_work(&ft_mr_ruleset, FT_MR_RULESET_INTERVAL)" in worker
-    assert "schedule_work(&ft_mr_work)" in function(source, "ft_mr_ruleset_fn")
+    # A ruleset commit is looked for while any group exists, and a settling
+    # ruleset when it will have settled.
+    assert "schedule_delayed_work(&ft_mr_ruleset,\n\t\t\t\t\t      FT_MR_RULESET_INTERVAL)" in worker
+    assert "mod_delayed_work(system_wq, &ft_mr_ruleset,\n\t\t\t\t\t ft_mr_ruleset_wait())" in worker
+    poll = function(source, "ft_mr_ruleset_fn")
+    assert "!READ_ONCE(ft_mr_gen_open)" in poll and "schedule_work(&ft_mr_work)" in poll
 
     # The watch goes with its group, and teardown takes the hook down before
     # the worker and the table go, and again after anything the worker did.
@@ -525,3 +546,25 @@ def test_a_group_is_carried_only_where_linux_forwards_it():
     assert exit_body.count("cancel_delayed_work_sync(&ft_mr_ruleset)") == 2
     sync_hook = function(source, "ft_mr_confirm_sync")
     assert "READ_ONCE(ft_mr_stopping)" in sync_hook and "synchronize_net();" in sync_hook
+
+
+def test_nothing_that_can_drop_a_copy_runs_after_the_observer(tmp_path):
+    """The observer is last by priority, but at an equal priority netfilter
+    puts a later registration first, so an nftables chain or BPF program that
+    held the last priority when the observer registered runs after it and can
+    still drop what it confirmed. Such a hook keeps the group in software;
+    conntrack's confirmation, the kernel's own, does not."""
+    source = SOURCE.read_text()
+    (tmp_path / "mroute_confirm_order.inc").write_text(
+        function(source, "ft_mr_observer_followed"))
+    binary = tmp_path / "mroute_confirm_order"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("mroute_confirm_order.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
