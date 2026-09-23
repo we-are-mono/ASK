@@ -585,13 +585,14 @@ word, the header from the egress port.
 **Rig** — `test_flowtable_service_multicast_bridge.py::`
 `test_flowtable_service_multicast_bridge_and_route`, both families. IPTV in
 untagged on the WAN port, bridged to the set-top box on VLAN 289 and routed by
-`smcroute` from `br-ftmcast.289` into VLAN 286 on the same LAN port, with the
+`smcroute` from `br-ftmcast.289` into VLAN 290 on the same LAN port, with the
 bridge a multicast router. It asserts the one `mcast` row carries both
-(`ports=eth3/289 routed=eth3/286`), the `mroute` row is `installed` through
+(`ports=eth3/289 routed=eth3/290`), the `mroute` row is `installed` through
 the bridge and `ip mroute` says `offload`; then, on the wire, the bridged copy
 has the sender's MAC and hop count 64 and the routed copy the port's MAC, the
 group's and 63, each whole and once, with the classifier counting at least 95%
-and the ingress CPU under 10%, and `ip -s mroute` counting the stream. The box
+and the ingress CPU under 10% beyond what the port receives idle over as long
+again, and `ip -s mroute` counting the stream. The box
 leaving keeps the routed copy in hardware alone; the route going retires the
 group.
 

@@ -209,18 +209,31 @@ def _packets(state, group):
 
 async def _window(r, group, source, capture_on, ifaces, inject, ingress, label):
     """Inject a fresh run and read it off the listener's wire, with the
-    classifier's own count and the ingress CPU's beside it."""
+    classifier's own count and the ingress CPU's beside it.
+
+    `cpu` is the ingress port's software receive count across the injection,
+    `idle` the same count over as long again with nothing injected: the
+    segment's own traffic -- queries, reports, neighbour discovery -- which a
+    CPU bound has to allow for. The injection's length is not known until it
+    ends, since a LAN-side one runs over the console, so the idle interval is
+    taken after it rather than before."""
     config = new_config(r.multicast_family, source, group, FRAMING_PORT, ifaces)
     before = await r.state()
-    cpu = await kernel_rx_packets(r.target, r.session, ingress)
+    loop = asyncio.get_running_loop()
     async with capture(capture_on, config) as handle:
+        rx = await kernel_rx_packets(r.target, r.session, ingress)
+        started = loop.time()
         await inject(config, FRAMING_COUNT)
         await asyncio.sleep(0.5)
-    cpu = await kernel_rx_packets(r.target, r.session, ingress) - cpu
+        cpu = await kernel_rx_packets(r.target, r.session, ingress) - rx
+        elapsed = loop.time() - started
     after = await r.state()
+    rx = await kernel_rx_packets(r.target, r.session, ingress)
+    await asyncio.sleep(elapsed)
+    idle = await kernel_rx_packets(r.target, r.session, ingress) - rx
     r.record(label, {'result': handle['result'], 'before': before, 'after': after,
-                     'cpu_rx': cpu})
-    return handle['result'], before, after, cpu
+                     'cpu_rx': cpu, 'idle_rx': idle, 'seconds': elapsed})
+    return handle['result'], before, after, cpu, idle
 
 
 async def _from_wan(r, config, count, source_mac):
@@ -259,7 +272,9 @@ finally:
     assert result.rc == 0, result.stdout
 
 
-def _assert_bridged_copy(result, source_mac, group):
+def _assert_bridged_copy(result, source_mac, group, vlan=0):
+    """`vlan` is the tag the copy arrives with where it was captured: none on
+    a VLAN device, which took it off, and the wire's own on a port."""
     assert not result['errors'], result
     assert result['seen'].get('1') == list(range(FRAMING_COUNT)), result
     assert result['duplicates'] == 0 and result['fragments'] == 0, result
@@ -267,6 +282,7 @@ def _assert_bridged_copy(result, source_mac, group):
     assert result['sources'] == [source_mac.lower()], result
     assert result['destinations'] == [multicast_mac(group).hex(':')], result
     assert result['hops'] == [64], result
+    assert result['vlans'] == [vlan], result
 
 
 async def test_flowtable_service_multicast_bridge_keeps_the_sender(multicast_bridge_service):
@@ -288,14 +304,14 @@ async def test_flowtable_service_multicast_bridge_keeps_the_sender(multicast_bri
         assert row['dmac'] == multicast_mac(group).hex(':'), row
         assert row['in'] == TARGET_WAN_IF and row['in_vid'] == str(WAN_WIRE_VID), row
         assert row['ports'] == f'{TARGET_LAN_IF}/{IPTV_VID}', row
-        result, before, after, cpu = await _window(
+        result, before, after, cpu, idle = await _window(
             r, group, source, r.lan, [LISTENER],
             lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
             'multicast-bridge-sender')
         _assert_bridged_copy(result[LISTENER], r.wan_mac, group)
         assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
             (before, after)
-        assert cpu < FRAMING_COUNT * 0.1, cpu
+        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
 
         other = '02:a5:19:10:00:02'
         deadline = asyncio.get_running_loop().time() + 30
@@ -307,14 +323,14 @@ async def test_flowtable_service_multicast_bridge_keeps_the_sender(multicast_bri
                 break
             assert asyncio.get_running_loop().time() < deadline, row
             await asyncio.sleep(1)
-        result, before, after, cpu = await _window(
+        result, before, after, cpu, idle = await _window(
             r, group, source, r.lan, [LISTENER],
             lambda c, n: _from_wan(r, c, n, other), TARGET_WAN_IF,
             'multicast-bridge-new-sender')
         _assert_bridged_copy(result[LISTENER], other, group)
         assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
             (before, after)
-        assert cpu < FRAMING_COUNT * 0.1, cpu
+        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
     finally:
         await _mdb(r, TARGET_LAN_IF, group, add=False)
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
@@ -339,14 +355,14 @@ async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridg
         assert row['ports'] == f'{TARGET_WAN_IF}/{WAN_WIRE_VID}', row
         # The orchestrator's own wire port is the listener: it receives the
         # copy exactly as the WAN segment carries it.
-        result, before, after, cpu = await _window(
+        result, before, after, cpu, idle = await _window(
             r, group, source, None, [capture_if],
             lambda c, n: _from_lan(r, c, n), TARGET_LAN_IF,
             'multicast-bridge-tagged-ingress')
-        _assert_bridged_copy(result[capture_if], r.lan_mac, group)
+        _assert_bridged_copy(result[capture_if], r.lan_mac, group, WAN_WIRE_VID)
         assert _packets(after, group) - _packets(before, group) >= FRAMING_COUNT * 0.95, \
             (before, after)
-        assert cpu < FRAMING_COUNT * 0.1, cpu
+        assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
     finally:
         await _mdb(r, TARGET_WAN_IF, group, add=False)
         await r.wait(lambda s: not any(g['group'] == group for g in s['mcast']), timeout=12)
@@ -359,7 +375,7 @@ async def test_flowtable_service_multicast_bridge_tagged_ingress(multicast_bridg
 # it into another VLAN of the LAN port. One classifier key, so one hardware
 # group carrying both copies (A188).
 
-ROUTED_VID = 286
+ROUTED_VID = 290
 ROUTED_LISTENER = 'askftmr'
 
 
@@ -391,7 +407,7 @@ def _assert_routed_copy(result, source_mac, group):
 
 async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_service):
     """IPTV in on the WAN port, bridged to the set-top box on VLAN 289 and
-    routed by smcroute from br-ftmcast.289 into VLAN 286 on the same LAN port.
+    routed by smcroute from br-ftmcast.289 into VLAN 290 on the same LAN port.
 
     Both copies come out of one classifier entry. The bridged one keeps the
     sender's MAC and hop count; the routed one leaves with the port's address
@@ -430,7 +446,7 @@ async def test_flowtable_service_multicast_bridge_and_route(multicast_bridge_ser
             await run('ip', 'link', 'add', 'link', BRIDGE, 'name', iptv_dev, 'type', 'vlan',
                       'id', str(IPTV_VID), reverse=['ip', 'link', 'del', iptv_dev])
             await run('ip', 'link', 'set', iptv_dev, 'up')
-        # The LAN the stream is routed into: VLAN 286, tagged on the LAN port.
+        # The LAN the stream is routed into: VLAN 290, tagged on the LAN port.
         await run('bridge', 'vlan', 'add', 'dev', TARGET_LAN_IF, 'vid', str(ROUTED_VID),
                   reverse=['bridge', 'vlan', 'del', 'dev', TARGET_LAN_IF, 'vid',
                            str(ROUTED_VID)])
@@ -486,7 +502,7 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
             line, _ = await mroute_line(r.target, r.session, family, source, group)
             assert 'offload' in line, line
 
-            result, before, after, cpu = await _window(
+            result, before, after, cpu, idle = await _window(
                 r, group, source, r.lan, [LISTENER, ROUTED_LISTENER],
                 lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
                 'multicast-bridge-and-route')
@@ -495,7 +511,7 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
             counted = int(_iptv_row(after, group)['packets']) - \
                 int(_iptv_row(before, group)['packets'])
             assert counted >= FRAMING_COUNT * 0.95, (before, after)
-            assert cpu < FRAMING_COUNT * 0.1, cpu
+            assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
             # ipmr's own counters are the classifier's, folded: a daemon
             # ageing its routes sees the stream flow.
             _, packets = await mroute_line(r.target, r.session, family, source, group)
@@ -507,13 +523,13 @@ subprocess.run(['ip','link','set',{ROUTED_LISTENER!r},'up'],check=True)
             row = await _iptv_group(r, group, lambda g: g['ports'] == '-'
                                     and g['state'] == 'installed')
             assert row['routed'] == f'{TARGET_LAN_IF}/{ROUTED_VID}', row
-            result, before, after, cpu = await _window(
+            result, before, after, cpu, idle = await _window(
                 r, group, source, r.lan, [LISTENER, ROUTED_LISTENER],
                 lambda c, n: _from_wan(r, c, n, r.wan_mac), TARGET_WAN_IF,
                 'multicast-route-alone')
             assert not result[LISTENER]['seen'], result
             _assert_routed_copy(result[ROUTED_LISTENER], egress_mac, group)
-            assert cpu < FRAMING_COUNT * 0.1, cpu
+            assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
 
             # And the route goes: nothing names the group, and it retires.
             await ctl('remove', iptv_dev, source, group)
@@ -557,7 +573,12 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
     listener entry names the queue the port had when it was built -- which
     nothing dequeues any more. The group is rebuilt in place: the replicas
     keep arriving whole, the classifier keeps carrying them, and they leave by
-    the tree, counted on its leaves. Taking the tree away rebuilds it again."""
+    the tree, counted on its leaves. Taking the tree away rebuilds it again.
+
+    It depends on the adapter's egress hook being wired: the rebuild, and the
+    `mcast_egress_rebuilds` count the waits below read, come from
+    ft_mc_egress_changed(), and nothing in CDX calls it yet when an HTB tree
+    moves a port's queues. Until something does, those waits time out."""
     r = multicast_bridge_service
     group = '239.9.5.5' if r.multicast_family == 4 else 'ff1e::9:5:5'
     source = LAN_SOURCE[r.multicast_family]
@@ -572,21 +593,32 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
             return await console_command(con, 'tc', *argv, check=check, timeout=30)
 
         async def window(label):
-            result, before, after, cpu = await _window(
+            result, before, after, cpu, idle = await _window(
                 r, group, source, None, [capture_if],
                 lambda c, n: _from_lan(r, c, n), TARGET_LAN_IF, label)
-            _assert_bridged_copy(result[capture_if], r.lan_mac, group)
+            _assert_bridged_copy(result[capture_if], r.lan_mac, group, WAN_WIRE_VID)
             assert _packets(after, group) - _packets(before, group) >= \
                 FRAMING_COUNT * 0.95, (before, after)
-            assert cpu < FRAMING_COUNT * 0.1, cpu
+            assert cpu - idle < FRAMING_COUNT * 0.1, (cpu, idle)
+
+        async def root():
+            shown = (await tc('qdisc', 'show', 'dev', TARGET_WAN_IF, 'root'))['stdout']
+            match = re.search(r'qdisc (\S+) (\S+) root', shown)
+            assert match, shown
+            return match[1], match[2]
 
         try:
+            # The port's own root qdisc is the one the kernel attached, handle
+            # 0:, which an added root replaces without a delete and which
+            # deleting the tree gives back. A configured one would be lost, so
+            # the test does not start over one.
+            original = await root()
+            assert original[1] == '0:', ('a configured root qdisc on the WAN port', original)
             await _from_lan(r, new_config(r.multicast_family, source, group,
                                           FRAMING_PORT, []), 16)
             await _bridged_row(r, group, lambda g: g['state'] == 'installed')
             rebuilds = (await r.state())['mcast_egress_rebuilds']
 
-            await tc('qdisc', 'del', 'dev', TARGET_WAN_IF, 'root', check=False)
             await tc('qdisc', 'add', 'dev', TARGET_WAN_IF, 'root', 'handle', '1:',
                      'htb', 'offload')
             tree = True
@@ -595,6 +627,8 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
             await tc('class', 'add', 'dev', TARGET_WAN_IF, 'parent', '1:10',
                      'classid', '1:100', 'htb', 'rate', EGRESS_RATE,
                      'ceil', EGRESS_CEIL, 'prio', '0')
+            # Needs ft_mc_egress_changed() called on the tree's change; see
+            # the docstring.
             state = await r.wait(lambda s: s['mcast_egress_rebuilds'] > rebuilds,
                                  timeout=15)
             await _bridged_row(r, group, lambda g: g['state'] == 'installed')
@@ -606,6 +640,7 @@ async def test_flowtable_service_multicast_bridge_follows_egress_queues(multicas
             rebuilds = state['mcast_egress_rebuilds']
             await tc('qdisc', 'del', 'dev', TARGET_WAN_IF, 'root')
             tree = False
+            assert await root() == original, 'the kernel did not give the port its root back'
             await r.wait(lambda s: s['mcast_egress_rebuilds'] > rebuilds, timeout=15)
             await _bridged_row(r, group, lambda g: g['state'] == 'installed')
             await window('multicast-egress-plain')

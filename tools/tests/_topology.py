@@ -34,6 +34,8 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_flowtable_service_vlan.py 284      (service VLAN recovery)
 #   test_flowtable_service_bridge.py 285/286 (trusted/guest bridge membership,
 #                                            port and VLAN forwarding state)
+#   test_flowtable_service_multicast_bridge.py 287/288/289/290
+#                               (LAN, WAN, IPTV, and the VLAN IPTV is routed into)
 #   test_mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
 #   test_mroute_capacity.py     311..319     (nine LAN listeners)
 #   test_flowtable_service_multicast_leave.py      321/322 (routed via a snooping bridge)
