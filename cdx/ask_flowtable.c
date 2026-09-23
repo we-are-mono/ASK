@@ -3962,6 +3962,7 @@ static void ft_wifi_address_changed(struct net_device *dev);
  * state rather than with the chains they are reached from. */
 static void ft_mc_device_gone(struct net_device *dev);
 static void ft_mr_device_gone(struct net_device *dev);
+static void ft_mc_kick_all(void);
 static void ft_mr_kick(void);
 
 static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void *ptr)
@@ -4035,6 +4036,12 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* IPv4 flushes route caches under this event's RTNL. Admission
 		 * rechecks both destinations before publishing queued context. */
 		ft_device_retire(dev, &ft_mtu_invalidations);
+		/* A multicast group is carried only while no packet its ingress
+		 * can deliver is larger than a listener's MTU, and an installed
+		 * group is no exception: both learners reconsider every group,
+		 * installed ones included. */
+		ft_mc_kick_all();
+		ft_mr_kick();
 		break;
 	case NETDEV_CHANGEADDR:
 		/* NEIGH software output uses the current MAC. Reject a queued
@@ -4684,6 +4691,38 @@ static void ft_mc_claim_give(u8 family, const union nf_inet_addr *src,
  * record what happened.
  */
 
+/* The largest packet `dev` carries for `family`, in the units the forwarding
+ * decision on that device is made in: the IPv6 MTU for IPv6 -- the value a
+ * link's hosts learn from router advertisements and the one ip6_forward()
+ * quotes in a Packet Too Big -- and the device MTU otherwise.
+ *
+ * Both learners bound a group with it, for one reason. A listener's entry ends
+ * in ENQUEUE_PKT, and the microcode fragments any replica larger than the MTU
+ * that opcode carries; no preemptive check stands in front of it, because a
+ * member entry has none and a check on the root could only except the whole
+ * packet for IPv4 with DF set (PREEMPT_DFBIT_HONOR acts on IPv4 alone, measured
+ * for A198). Linux never does what that fragmenter does: ip6mr answers an
+ * oversized IPv6 replica with Packet Too Big, ipmr drops an IPv4 one with DF
+ * set, and a bridge fragments nothing at all. So a group is carried only while
+ * nothing larger than every listener's MTU can arrive on its ingress, and the
+ * oversized packet that cannot arrive in hardware is Linux's to handle in
+ * software. See docs/flowtable/multicast.md. */
+static u32 ft_mc_link_mtu(const struct net_device *dev, u8 family)
+{
+	u32 mtu = READ_ONCE(dev->mtu);
+
+	if (family == AF_INET6) {
+		struct inet6_dev *idev;
+
+		rcu_read_lock();
+		idev = __in6_dev_get(dev);
+		if (idev)
+			mtu = min_t(u32, mtu, (u32)READ_ONCE(idev->cnf.mtu6));
+		rcu_read_unlock();
+	}
+	return mtu;
+}
+
 /* How many memberships one group keeps a record of.
  *
  * One more than the hardware can replicate to, because a member the hardware
@@ -4798,6 +4837,10 @@ static bool ft_mc_stopping;
  * today only a hardware key being handed back. Every group that is not in
  * hardware is reconsidered on the next pass. */
 static bool ft_mc_recheck;
+/* The same, for an answer an installed group depends on too: a device MTU
+ * changed, and a group whose ports no longer bound its ingress has to leave
+ * hardware rather than wait for its membership to change. */
+static bool ft_mc_recheck_all;
 
 static void ft_mc_kick(void)
 {
@@ -4805,6 +4848,14 @@ static void ft_mc_kick(void)
 		return;
 	WRITE_ONCE(ft_mc_recheck, true);
 	schedule_work(&ft_mc_work);
+}
+
+static void ft_mc_kick_all(void)
+{
+	if (READ_ONCE(ft_mc_stopping))
+		return;
+	WRITE_ONCE(ft_mc_recheck_all, true);
+	ft_mc_kick();
 }
 
 /* The hardware key a group would occupy, in the shape the shared register
@@ -4860,6 +4911,32 @@ static bool ft_mc_carriable(const struct ft_mc_group *g)
 		return false;
 	for (i = 0; i < g->ports; i++)
 		if (g->port[i].uncarried)
+			return false;
+	return true;
+}
+
+/* Whether every frame the ingress port can deliver fits every port the group
+ * is replicated to, which is what lets the hardware carry it without ever
+ * fragmenting a copy.
+ *
+ * A bridge fragments nothing: br_dev_queue_push_xmit() drops a frame that
+ * does not fit the egress port, whatever its family and whatever its DF bit,
+ * and the microcode would instead fragment it at the listener's enqueue. The
+ * two can only agree while no such frame arrives, so a port whose MTU is below
+ * the ingress's keeps the whole group in software, where the bridge makes that
+ * decision per frame. The comparison is in device MTUs because a bridge
+ * decides in them; see ft_mc_link_mtu() for why the bound is an admission
+ * test at all. A group with no ingress yet has nothing to bound. */
+static bool ft_mc_mtu_bounded(const struct ft_mc_group *g)
+{
+	u32 in_mtu;
+	u8 i;
+
+	if (!g->in)
+		return true;
+	in_mtu = READ_ONCE(g->in->mtu);
+	for (i = 0; i < g->ports; i++)
+		if (READ_ONCE(g->port[i].dev->mtu) < in_mtu)
 			return false;
 	return true;
 }
@@ -5403,10 +5480,13 @@ static void ft_mc_work_fn(struct work_struct *work)
 	 * stale. Retries go with it: a group that failed against a key it
 	 * could not have is not a group that cannot be carried. */
 	if (READ_ONCE(ft_mc_recheck)) {
+		bool all = READ_ONCE(ft_mc_recheck_all);
+
 		WRITE_ONCE(ft_mc_recheck, false);
+		WRITE_ONCE(ft_mc_recheck_all, false);
 		mutex_lock(&ft_mc_lock);
 		list_for_each_entry(g, &ft_mc_groups, list) {
-			if (g->hw)
+			if (g->hw && !all)
 				continue;
 			g->retries = 0;
 			g->dirty = true;
@@ -5483,7 +5563,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 			if (!g->dirty || ft_mc_stopping)
 				continue;
 			if (g->host || !g->ports || !g->in ||
-			    !ft_mc_carriable(g)) {
+			    !ft_mc_carriable(g) || !ft_mc_mtu_bounded(g)) {
 				/* Not installable. A group that was installed
 				 * and has become ineligible is retired below
 				 * rather than left carrying stale ports. */
@@ -5512,6 +5592,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		 * reference had just gone. */
 		if (!target->host && !target->contested &&
 		    target->ports && target->in && ft_mc_carriable(target) &&
+		    ft_mc_mtu_bounded(target) &&
 		    target->retries < FT_MC_MAX_RETRIES) {
 			spec.in = target->in;
 			spec.bridged = true;
@@ -5818,6 +5899,8 @@ static const char *ft_mc_state(const struct ft_mc_group *g)
 	 * the reason it is about to come out. */
 	if (!ft_mc_carriable(g))
 		return "refused-listener";
+	if (!ft_mc_mtu_bounded(g))
+		return "refused-mtu";
 	if (g->contested)
 		return "refused-contested";
 	if (g->retries >= FT_MC_MAX_RETRIES)
@@ -5948,6 +6031,7 @@ enum ft_mr_state {
 	FT_MR_REFUSED_HOST,
 	FT_MR_REFUSED_THRESHOLD,
 	FT_MR_REFUSED_LISTENER,
+	FT_MR_REFUSED_MTU,
 	FT_MR_REFUSED_CONTESTED,
 	FT_MR_REFUSED_FAILED,
 	FT_MR_REFUSED_RESYNC,
@@ -5969,6 +6053,7 @@ static const char *ft_mr_state_text(enum ft_mr_state state)
 	case FT_MR_REFUSED_HOST:	return "refused-host";
 	case FT_MR_REFUSED_THRESHOLD:	return "refused-threshold";
 	case FT_MR_REFUSED_LISTENER:	return "refused-listener";
+	case FT_MR_REFUSED_MTU:		return "refused-mtu";
 	case FT_MR_REFUSED_CONTESTED:	return "refused-contested";
 	case FT_MR_REFUSED_FAILED:	return "refused-failed";
 	case FT_MR_REFUSED_RESYNC:	return "refused-resync";
@@ -6224,11 +6309,17 @@ static struct net_device *ft_mr_ingress_port(struct net_device *dev,
  * order ft_bridge_vlan() reads; a listener is described outermost first, the
  * order the wire carries. The reversal happens here, at the one place the two
  * conventions meet.
+ *
+ * `path_mtu` is the smallest MTU on the way from the oif down to this port,
+ * and *mtu the smallest over every copy the group makes -- including one that
+ * collapses into a copy another oif already produced, because Linux would have
+ * sent that one down its own, possibly narrower, path.
  */
 static int ft_mr_listener(struct net_device *port,
 			  const struct cdx_mc_listener *ingress,
 			  const struct cdx_ft_vlan *inner, unsigned int tags,
-			  struct cdx_mc_listener *out, u8 *count)
+			  u32 path_mtu, struct cdx_mc_listener *out, u8 *count,
+			  u32 *mtu)
 {
 	struct cdx_mc_listener add = {};
 	unsigned int i;
@@ -6268,6 +6359,7 @@ static int ft_mr_listener(struct net_device *port,
 	 * port are the only way replication to several listeners and the chain
 	 * swap a join performs can be exercised there at all (ISSUES.md
 	 * A158). */
+	*mtu = min(*mtu, path_mtu);
 	for (i = 0; i < *count; i++)
 		if (out[i].dev == add.dev && out[i].vlans == add.vlans &&
 		    !memcmp(out[i].vlan, add.vlan, sizeof(add.vlan)))
@@ -6305,14 +6397,18 @@ static int ft_mr_bridge_vid(struct net_device *bridge,
 /* A bridge oif uses a live kernel snapshot, including router ports. The
  * switchdev MDB mirror alone cannot supply that set, and a cached MROUTER
  * boolean loses the protocol and VLAN. RTNL keeps the borrowed ports alive
- * until the completed plan takes its references. */
+ * until the completed plan takes its references.
+ *
+ * A copy routed into a bridge meets two limits: the bridge device's own, which
+ * ip_mr_forward() sends it against, and then each port's, which the bridge
+ * drops it against rather than fragmenting. */
 static int ft_mr_expand_bridge(struct net_device *bridge,
 			       const struct cdx_mc_listener *ingress,
 			       const struct cdx_ft_vlan *inner,
 			       unsigned int tags, u8 family,
 			       const union nf_inet_addr *src,
-			       const union nf_inet_addr *dst,
-			       struct cdx_mc_listener *out, u8 *count)
+			       const union nf_inet_addr *dst, u32 path_mtu,
+			       struct cdx_mc_listener *out, u8 *count, u32 *mtu)
 {
 	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
 	struct br_ip group = {};
@@ -6345,7 +6441,9 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
 		memcpy(stack, inner, sizeof(stack));
 		if (ft_bridge_vlan(bridge, chosen[i], stack, &c) < 0)
 			return -EOPNOTSUPP;
-		rc = ft_mr_listener(chosen[i], ingress, stack, c, out, count);
+		rc = ft_mr_listener(chosen[i], ingress, stack, c,
+				    min_t(u32, path_mtu, READ_ONCE(chosen[i]->mtu)),
+				    out, count, mtu);
 		if (rc)
 			return rc;
 	}
@@ -6361,26 +6459,32 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
  * ft_bridge_vlan() gives. A bridge is its ports. Anything else -- a bond, a
  * MACVLAN, a ppp device, a tunnel -- is refused rather than approximated,
  * which is ft_path_stack()'s rule for a flow's path applied to a replica's.
+ *
+ * *mtu comes back lowered to the smallest MTU any resulting copy leaves by:
+ * each device on the way down counts, because the oif is what ipmr and ip6mr
+ * send against and the port is what the listener's enqueue fragments at.
  */
 static int ft_mr_expand(struct net_device *dev,
 			const struct cdx_mc_listener *ingress,
 			u8 family, const union nf_inet_addr *src,
 			const union nf_inet_addr *dst,
-			struct cdx_mc_listener *out, u8 *count)
+			struct cdx_mc_listener *out, u8 *count, u32 *mtu)
 {
 	struct cdx_ft_vlan inner[CDX_FT_VLAN_MAX] = {};
 	unsigned int tags = 0;
+	u32 path_mtu = U32_MAX;
 
 	for (;;) {
 		if (!dev)
 			return -EOPNOTSUPP;
+		path_mtu = min(path_mtu, ft_mc_link_mtu(dev, family));
 		if (netif_is_bridge_master(dev))
 			return ft_mr_expand_bridge(dev, ingress, inner, tags,
-						   family, src, dst, out,
-						   count);
+						   family, src, dst, path_mtu,
+						   out, count, mtu);
 		if (cdx_mc_port_identity(dev))
-			return ft_mr_listener(dev, ingress, inner, tags, out,
-					      count);
+			return ft_mr_listener(dev, ingress, inner, tags,
+					      path_mtu, out, count, mtu);
 		if (!is_vlan_dev(dev) || tags == CDX_FT_VLAN_MAX ||
 		    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
 			return -EOPNOTSUPP;
@@ -6419,6 +6523,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	struct net_device *vif_dev;
 	unsigned short bad_flags;
 	struct mr_mfc *mfc = g->mfc;
+	u32 out_mtu = U32_MAX;
 	size_t at = 0;
 	int ct;
 
@@ -6481,7 +6586,7 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 		if (!oif)
 			continue;
 		rc = ft_mr_expand(oif, &in, g->family, &g->src, &g->dst,
-				  spec.listener, &spec.listeners);
+				  spec.listener, &spec.listeners, &out_mtu);
 		if (rc)
 			return FT_MR_REFUSED_LISTENER;
 		at += scnprintf(oifs + at, sizeof(oifs) - at, "%s%s",
@@ -6489,6 +6594,16 @@ static enum ft_mr_state ft_mr_derive(struct ft_mr_group *g,
 	}
 	if (!spec.listeners)
 		return FT_MR_REFUSED_LISTENER;
+	/* The largest packet the parent VIF can hand ipmr has to fit every copy,
+	 * or the microcode would fragment one Linux never would: ip6mr answers
+	 * an oversized IPv6 replica with Packet Too Big and ipmr drops an IPv4
+	 * one with DF set. The IPv6 side is the parent's IPv6 MTU, the value
+	 * its link is told, which is the bound the unicast IPv6 path uses for
+	 * the same reason. Nothing an MTU change or the IPv6 MTU sysctl does
+	 * raises an MFC event, so this is rechecked by the periodic refresh as
+	 * well as on NETDEV_CHANGEMTU. */
+	if (out_mtu < ft_mc_link_mtu(vif_dev, g->family))
+		return FT_MR_REFUSED_MTU;
 
 	spec.family = g->family;
 	spec.src = g->src;

@@ -148,6 +148,10 @@ struct net_device {
     char name[IFNAMSIZ];
     int ifindex;
     int type;
+    /* The device MTU, and the IPv6 one where a case needs them to differ;
+     * addrconf starts the second from the first. */
+    unsigned int mtu;
+    unsigned int ip6_mtu;
     bool physical;
     bool bridge_master;
     bool bridge_port;
@@ -341,7 +345,11 @@ struct cdx_mc_group;
 struct ip_mc_list { u32 multiaddr; struct ip_mc_list *next_rcu; };
 struct ifmcaddr6 { struct in6_addr mca_addr; struct ifmcaddr6 *next; };
 struct in_device { struct net_device *dev; struct ip_mc_list *mc_list; };
-struct inet6_dev { struct net_device *dev; struct ifmcaddr6 *mc_list; };
+struct inet6_dev {
+    const struct net_device *dev;
+    struct ifmcaddr6 *mc_list;
+    struct { int mtu6; } cnf;
+};
 
 static struct ip_mc_list mc4_pool[8];
 static struct ifmcaddr6 mc6_pool[8];
@@ -362,20 +370,30 @@ static struct in_device *__in_dev_get_rcu(struct net_device *dev)
     return NULL;
 }
 
-static struct inet6_dev *__in6_dev_get(struct net_device *dev)
+/* Every device has an IPv6 view here, as every device addrconf has seen does:
+ * the MTU walk asks for one on any device in a path, and the host-delivery
+ * test on the ingress. Views rotate so two in use at once never alias. */
+static struct inet6_dev *__in6_dev_get(const struct net_device *dev)
 {
+    static unsigned next;
+    struct inet6_dev *view = &in6_dev_slots[next++ % ARRAY_SIZE(in6_dev_slots)];
+
+    view->dev = dev;
+    view->mc_list = NULL;
+    view->cnf.mtu6 = dev->ip6_mtu ? dev->ip6_mtu : dev->mtu;
     for (unsigned i = 0; i < mc_list_count; i++)
-        if (mc_lists[i].dev == dev) {
-            in6_dev_slots[i].dev = dev;
-            in6_dev_slots[i].mc_list = mc_lists[i].v6;
-            return &in6_dev_slots[i];
-        }
-    return NULL;
+        if (mc_lists[i].dev == dev)
+            view->mc_list = mc_lists[i].v6;
+    return view;
 }
 
 /* --- kernel odds and ends --------------------------------------------- */
 #define lockdep_assert_held(x) ((void)(x))
 #define ASSERT_RTNL() ((void)0)
+#define READ_ONCE(x) (x)
+#define U32_MAX 0xffffffffU
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define min_t(type, a, b) min((type)(a), (type)(b))
 #define kzalloc(n, f) calloc(1, (n))
 #define kfree(p) free(p)
 #define GFP_KERNEL 0
@@ -420,6 +438,7 @@ static void dev_init(struct net_device *d, const char *name, int ifindex)
     memset(d, 0, sizeof(*d));
     strscpy(d->name, name, sizeof(d->name));
     d->ifindex = ifindex;
+    d->mtu = 1500;
     INIT_LIST_HEAD(&d->lowers);
 }
 
@@ -1096,6 +1115,114 @@ int main(void)
     assert(refuse(g) == FT_MR_REFUSED_LISTENER);
     free(g);
 
+    /* ---- the MTU bound ----------------------------------------------- *
+     *
+     * A listener's entry ends in ENQUEUE_PKT, which fragments any replica
+     * larger than its MTU, and nothing in front of it hands such a packet to
+     * Linux. ip6mr would answer it with Packet Too Big and ipmr drop it with
+     * DF set, so a group is carried only while nothing its parent VIF can
+     * deliver is larger than the smallest MTU a copy leaves by. */
+    reset();
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &LAN, 0);
+    oif(g, 1, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);   /* 1500 into 1500 */
+    ft_mr_plan_put(&plan);
+    LAN.mtu = 1400;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    /* Larger is fine: nothing that arrives can exceed it. */
+    LAN.mtu = 9000;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    LAN.mtu = 1500;
+    /* The bound is the VIF the stream arrives on, not the port beneath it:
+     * a 1400-byte ingress VLAN on a 1500-byte port delivers 1400 at most. */
+    VWAN.mtu = 1400;
+    LAN.mtu = 1400;
+    vif_set(AF_INET, 0, &VWAN, 0);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    VWAN.mtu = 1500;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    LAN.mtu = 1500;
+    vif_set(AF_INET, 0, &WAN, 0);
+    /* A listener's own VLAN device is what ipmr sends against, so a
+     * smaller one refuses the group even over a 1500-byte port. */
+    VLAN_LAN.mtu = 1400;
+    vif_set(AF_INET, 1, &VLAN_LAN, 0);
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    VLAN_LAN.mtu = 1500;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    /* One narrow copy among several refuses the group whole, like any other
+     * copy the hardware cannot make as Linux would. */
+    vif_set(AF_INET, 1, &LAN, 0);
+    vif_set(AF_INET, 2, &LAN2, 0);
+    oif(g, 2, 1);
+    LAN2.mtu = 1280;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    /* And a VIF the kernel removed takes its MTU with it. */
+    vif_set(AF_INET, 2, NULL, 0);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1);
+    ft_mr_plan_put(&plan);
+    /* The IPv6 MTU does not bound an IPv4 group. */
+    LAN2.mtu = 1500;
+    LAN.ip6_mtu = 1280;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    free(g);
+
+    /* IPv6 is bounded in its own units: the IPv6 MTU on both sides, which is
+     * what the link is told and what ip6_forward()'s Packet Too Big quotes.
+     * The device MTU of the listener is not the test while its IPv6 one is
+     * smaller, and a matching pair is carried whatever the device MTUs. */
+    reset();
+    g = group6(&MFC6, ip6(0xfc00, 0x99), ip6(0xff1e, 0x05), 0);
+    vif_set(AF_INET6, 0, &WAN, 0);
+    vif_set(AF_INET6, 1, &LAN, 0);
+    oif(g, 1, 1);
+    LAN.ip6_mtu = 1280;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    WAN.ip6_mtu = 1280;
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    free(g);
+
+    /* Into a bridge, both limits count: the bridge device's, which ip6mr and
+     * ipmr send against, and each chosen port's, which the bridge drops at
+     * rather than fragmenting. A collapsed copy keeps the narrower path. */
+    reset();
+    bridge_port(&LAN, BR_MCAST_FLOOD);
+    bridge_port(&LAN2, BR_MCAST_FLOOD);
+    g = group4(&MFC, ip4(10, 0, 0, 52), ip4(239, 8, 1, 5), 0);
+    vif_set(AF_INET, 0, &WAN, 0);
+    vif_set(AF_INET, 1, &BR, 0);
+    oif(g, 1, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    ft_mr_plan_put(&plan);
+    LAN2.mtu = 1400;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    LAN2.mtu = 1500;
+    BR.mtu = 1400;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    BR.mtu = 1500;
+    /* eth3 directly and eth3 through the bridge are one copy. The direct
+     * oif comes first and the bridge's copy collapses into it, yet the
+     * bridge path is the narrower one and still bounds the group. */
+    LAN2.port_flags = 0;
+    LAN.mtu = 9000;
+    vif_set(AF_INET, 1, &LAN, 0);
+    vif_set(AF_INET, 2, &BR, 0);
+    oif(g, 2, 1);
+    assert(derive(g, &plan) == FT_MR_PENDING);
+    assert(plan.spec.listeners == 1 && plan.spec.listener[0].dev == &LAN);
+    ft_mr_plan_put(&plan);
+    BR.mtu = 1400;
+    assert(refuse(g) == FT_MR_REFUSED_MTU);
+    free(g);
+
     /* ---- what the chain does to the list ------------------------------ */
 
     reset();
@@ -1229,7 +1356,8 @@ int main(void)
             FT_MR_REFUSED_POLICY, FT_MR_REFUSED_WILDCARD,
             FT_MR_REFUSED_SCOPE, FT_MR_REFUSED_INGRESS, FT_MR_REFUSED_HOST,
             FT_MR_REFUSED_THRESHOLD, FT_MR_REFUSED_LISTENER,
-            FT_MR_REFUSED_CONTESTED, FT_MR_REFUSED_FAILED,
+            FT_MR_REFUSED_MTU, FT_MR_REFUSED_CONTESTED,
+            FT_MR_REFUSED_FAILED, FT_MR_REFUSED_RESYNC,
         };
 
         for (unsigned i = 0; i < ARRAY_SIZE(all); i++) {

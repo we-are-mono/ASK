@@ -43,6 +43,8 @@ def test_mroute_learner(tmp_path):
             # second caller -- so it is compiled here rather than stubbed.
             "ft_vlan_lower",
             "ft_bridge_vlan",
+            # Both learners' MTU bound, shared with the bridged one.
+            "ft_mc_link_mtu",
             "ft_mr_idx",
             "ft_mr_default_table",
             "ft_mr_state_text",
@@ -171,6 +173,25 @@ def test_the_derivation_touches_no_hardware_and_takes_no_rtnl():
                       "cdx_mc_group_replace", "cdx_mc_group_del"):
         assert forbidden not in body, f"{forbidden} does not belong here"
     assert "ASSERT_RTNL();" in body, "the walk needs RTNL and should say so"
+
+
+def test_the_mtu_bound_is_rechecked_without_an_mfc_event():
+    """Neither a device MTU change nor the IPv6 MTU sysctl touches the MFC, so
+    the bound a group was admitted under would otherwise hold for its life.
+    The device change kicks the worker; the sysctl, which no event reports, is
+    found by the periodic refresh re-deriving every group, installed ones
+    included, exactly as the unicast IPv6 bound is found by the stats pass.
+    """
+    source = SOURCE.read_text()
+    derive = function(source, "ft_mr_derive")
+    assert "return FT_MR_REFUSED_MTU;" in derive
+    assert "ft_mc_link_mtu(vif_dev, g->family)" in derive
+    # After the listeners, because only they say how narrow the copies are.
+    assert derive.index("FT_MR_REFUSED_MTU") > derive.rindex("FT_MR_REFUSED_LISTENER")
+    refresh = function(source, "ft_mr_stats_fn")
+    assert "g->dirty = true;" in refresh
+    link = function(source, "ft_mc_link_mtu")
+    assert "idev->cnf.mtu6" in link, "IPv6 is bounded in its own units"
 
 
 def test_the_contract_is_tested_in_the_order_it_is_written():

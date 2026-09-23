@@ -57,7 +57,10 @@ struct net_device {
     int ifindex;
     bool physical;
     bool bridge_master;
+    unsigned int mtu;
 };
+
+#define READ_ONCE(x) (x)
 
 struct cdx_ft_vlan { uint16_t proto; uint16_t id; };
 
@@ -345,6 +348,32 @@ int main(void)
         assert(!ft_mc_membership(&BR, &ports[0], &g1, false, false));
         assert(only_group()->overflow && !ft_mc_carriable(only_group()));
     }
+
+    /* The MTU bound. A bridge fragments nothing -- it drops a frame that does
+     * not fit the egress port, whatever its family or DF bit -- while the
+     * listener's enqueue would fragment it. So a group is carried only while
+     * no frame the ingress port can deliver is larger than a listener port's
+     * MTU, and a group with no ingress yet has nothing to bound. */
+    reset();
+    P1.mtu = P2.mtu = P3.mtu = 1500;
+    assert(ft_mc_membership(&BR, &P1, &g1, true, false));
+    assert(ft_mc_membership(&BR, &P2, &g1, true, false));
+    assert(ft_mc_mtu_bounded(only_group()));
+    only_group()->in = &P3;
+    assert(ft_mc_mtu_bounded(only_group()));
+    P2.mtu = 1400;
+    assert(!ft_mc_mtu_bounded(only_group()));
+    /* Carriable still: it is a different refusal, and /proc says which. */
+    assert(ft_mc_carriable(only_group()));
+    P2.mtu = 9000;
+    assert(ft_mc_mtu_bounded(only_group()));
+    /* A smaller ingress bounds itself. */
+    P2.mtu = 1400;
+    P3.mtu = 1400;
+    assert(ft_mc_mtu_bounded(only_group()));
+    P3.mtu = 1500;
+    P2.mtu = 1500;
+    only_group()->in = NULL;
 
     /* A host membership makes the group ineligible without removing its
      * ports: the frame would never reach the CPU, so a local listener would

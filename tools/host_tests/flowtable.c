@@ -423,12 +423,13 @@ static bool ft_mc_swdev_obj(unsigned long event,
     return false;
 }
 static void ft_mc_exit(void) { }
-static unsigned mc_devices_gone;
+static unsigned mc_devices_gone, mc_rechecks;
 static void ft_mc_device_gone(struct net_device *dev)
 {
     (void)dev;
     mc_devices_gone++;
 }
+static void ft_mc_kick_all(void) { mc_rechecks++; }
 /* The routed learner has its own file and its own harness
  * (mroute_learner.c); here the chains' calls into it only count. The two
  * multicast families the FIB chain carries are ipmr's and ip6mr's, and this
@@ -6609,7 +6610,11 @@ static void test_device_recovery(void)
         struct cdx_ft_binding *b = list_entry(ft_bindings.next, struct cdx_ft_binding, list);
         assert(ft_replace(b, &cls) == 0);
         info.dev = &out;
+        unsigned rechecks = mc_rechecks, kicks = mroute_kicks;
         ft_netdev_event(NULL, NETDEV_CHANGEMTU, &info);
+        /* Both multicast learners hear it too: a group is carried only while
+         * no copy can outgrow a listener, installed groups included. */
+        assert(mc_rechecks == rechecks + 1 && mroute_kicks == kicks + 1);
         deletion_error = fatal ? -EIO : -EAGAIN;
         ft_retire_workfn(NULL);
         deletion_error = 0;

@@ -152,15 +152,6 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A196 — oversized multicast replicas are fragmented by the microcode.**
-  A multicast member's entry has no preemptive-check op
-  (`fill_mcast_member_actions()` in `cdx/cdx_ehash.c` starts from a fresh
-  `ins_entry_info`, so `seal_preemptive_checks_hm()` returns early), and its
-  `ENQUEUE_PKT` fragments any replica over the member's MTU. Linux's ip6mr
-  never fragments a forwarded IPv6 replica (Packet Too Big, dropped) and ipmr
-  drops an IPv4 DF one. Needs a member-MTU admission bound or an exception
-  path for replicas.
-
 - [ ] **A194 — cdx and the kernel patches still carry CMM's control plane.**
   Retiring CMM left dead code behind, kept deliberately while the cmm/, fci/
   and auto_bridge/ reference sources are still consulted. `cdx/cdx_cmdhandler.c`
@@ -285,6 +276,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A196.** The microcode fragmented multicast replicas over a listener's MTU, where Linux sends Packet Too Big or drops —
+  fixed (_:/^flowtable: keep a multicast group that could fragment in software_).
 
 - [x] **A260.** CDX read any Ethernet netdev's private area as a DPAA port's, bridges and VLAN devices included, in registration, the FMan-port walk and the queue lookups —
   fixed (_:/^cdx: read netdev_priv as a DPAA port's only for a DPAA port_).

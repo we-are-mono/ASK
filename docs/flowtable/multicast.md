@@ -452,6 +452,35 @@ rather than through a registered VLAN interface. 802.1ad bridges are refused
 for the reason `ft_bridge_vlan()` already gives: the kernel describes no
 selector for that tag and the hardware would be asked to reproduce it blind.
 
+**The MTU.** No listener port may have a smaller MTU than the ingress port. A
+listener's entry ends in `ENQUEUE_PKT`, and the microcode fragments any replica
+larger than the MTU that opcode carries. A bridge never fragments:
+`br_dev_queue_push_xmit()` drops a frame that does not fit the egress port,
+whatever its family or DF bit. The two agree only while no such frame can
+arrive, so a narrower listener keeps the whole group in software, where the
+bridge decides per frame. `/proc` says `refused-mtu`. The comparison is in
+device MTUs because a bridge decides in them, and an MTU change re-derives
+installed groups as well as refused ones. The routed contract has the same
+clause in IP units; see [the routed design](multicast-routed.md#the-eligibility-contract).
+
+Why an admission bound rather than a check in hardware. A member entry has no
+preemptive check: `fill_mcast_member_actions()` starts from a fresh
+`ins_entry_info`, so `seal_preemptive_checks_hm()` has nothing to seal. And
+excepting a single replica would duplicate the packet, because Linux would
+re-replicate it to every member. The only place a check could stop the whole
+packet is the root, before `REPLICATE_PKT`. The root already emits
+`PREEMPTIVE_CHECKS_ON_PKT`, unsealed. What that opcode can express does not
+cover the case. `PREEMPT_DFBIT_HONOR` excepts oversized IPv4 with DF set and
+nothing else: A198 measured that neither it nor the fragmenter's DF action
+stops IPv6. And a bridge must not fragment IPv4 without DF either. The check
+also locates its MTU through `mtu_offset`, relative to an enqueue parameter
+block that a root does not have, so it would have to read a synthetic MTU word
+no hardware run has shown a replicating entry reading. An admission bound
+covers every case with no unproven microcode behaviour. Its cost is that a
+group whose listener MTU is below its ingress MTU stays in software even for
+packets that would fit. That shape is rare on a gateway: it needs a jumbo
+ingress or a deliberately narrowed listener.
+
 **The host.** A group carrying a `SWITCHDEV_OBJ_ID_HOST_MDB` object, or whose
 bridge device has itself joined it, is refused. The classifier entry replicates
 to ports and the frame does not reach the CPU, so a local listener would be

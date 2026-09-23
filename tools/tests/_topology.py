@@ -38,6 +38,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_mroute_capacity.py     311..319     (nine LAN listeners)
 #   test_flowtable_service_multicast_leave.py      321/322 (routed via a snooping bridge)
 #   test_flowtable_service_multicast_quarantine.py 323     (listener swap)
+#   test_mcast_member_mtu.py    324          (VLAN_ID_MCAST_MTU, narrow oif)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
@@ -49,6 +50,7 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # and test_flowtable_service_multicast_edges.py does the same.
 VLAN_ID_MROUTE: int                   = 244
 VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
+VLAN_ID_MCAST_MTU: int                = 324
 VLAN_ID_PPPOE_WAN: int                = 3900
 
 # Bench wiring: the DUT's eth3 faces the LAN client VM, eth4 faces the

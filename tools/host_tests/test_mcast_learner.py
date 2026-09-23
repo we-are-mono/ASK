@@ -41,6 +41,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_same_group",
             "ft_mc_find",
             "ft_mc_carriable",
+            "ft_mc_mtu_bounded",
             "ft_mc_port_eligible",
             "ft_mc_port_tags",
             "ft_mc_group_free",
@@ -172,6 +173,28 @@ def test_a_group_the_hardware_cannot_serve_whole_is_not_served_at_all():
     routed = function(source, "ft_mr_expand_bridge")
     assert "br_multicast_list_ports(" in routed
     assert "!cdx_mc_port_identity(chosen[i])" in routed
+
+
+def test_a_group_that_would_fragment_stays_in_software():
+    """A bridge fragments nothing -- it drops a frame that does not fit the
+    egress port -- while a listener's enqueue fragments anything over the
+    port's MTU. So a group is carried only while its ingress cannot deliver a
+    frame larger than some listener port's MTU, and an MTU change, which
+    changes no membership, has to reach installed groups as well.
+    """
+    source = SOURCE.read_text()
+    worker = function(source, "ft_mc_work_fn")
+    assert worker.count("ft_mc_mtu_bounded(") == 2, (
+        "both the pick and the spec build must ask")
+    assert "ft_mc_mtu_bounded(g)" in function(source, "ft_mc_state")
+    assert '"refused-mtu"' in function(source, "ft_mc_state")
+    netdev = function(source, "ft_netdev_event")
+    changemtu = netdev[netdev.index("case NETDEV_CHANGEMTU:"):]
+    changemtu = changemtu[:changemtu.index("break;")]
+    assert "ft_mc_kick_all();" in changemtu and "ft_mr_kick();" in changemtu
+    # And the kick that reaches installed groups is a different one from the
+    # recheck a handed-back key causes, which leaves them alone.
+    assert "g->hw && !all" in worker
 
 
 def test_the_vid_follows_the_bridge_rather_than_the_port():

@@ -210,6 +210,23 @@ copies rather than in ports, since one port can be several of them. An oif
 whose VIF has been removed is dropped rather than refused, because what is left
 is a shorter replication list; an empty one is `refused-listener`.
 
+**The MTU.** No copy may leave by a path narrower than the parent VIF. Each
+listener's entry ends in `ENQUEUE_PKT`, which fragments a replica larger than
+its MTU, and nothing in front of it hands such a packet to Linux. Linux would
+not fragment it: `ip6mr` answers an oversized IPv6 replica with Packet Too Big,
+and `ipmr_queue_xmit()` drops an IPv4 one with DF set. So a group is carried
+only while nothing the parent VIF can deliver is larger than the smallest MTU a
+copy leaves by. That MTU is taken over the whole path: the oif, each VLAN
+device below it, the port, and for a bridge oif the bridge and each chosen
+port. A copy that collapses into another oif's keeps the narrower of the two
+paths. IPv6 is compared in IPv6 MTUs, the value a link is told and the one a
+Packet Too Big quotes, which is the bound the unicast IPv6 path uses
+([IPv6 guide](ipv6.md#packets-larger-than-the-path)). Otherwise the group is
+`refused-mtu`. Neither an MTU change nor the IPv6 MTU sysctl raises an MFC
+event, so the device change kicks the worker and the five-second refresh
+catches the sysctl. See [the bridged contract](multicast.md#the-eligibility-contract)
+for why this is an admission bound rather than a check in hardware.
+
 **The host.** `ip_mr_input()` delivers locally as well as forwarding when the
 ingress interface has joined the group — `ip_route_input_mc()` asks
 `ip_check_mc_rcu()` on the input device, and IPv6 asks the idev's own list — and
@@ -317,6 +334,8 @@ family over:
 | A policy rule | `FIB_EVENT_RULE_*` | the family's count moves and every group re-derived |
 | A port down or unregistering | the netdev chain, beside `ft_mc_device_gone()` | references released synchronously — one still held when `netdev_wait_allrefs()` starts spinning is a device that never finishes unregistering — and the group re-derived |
 | A port coming back up | the netdev chain | re-derived; nothing else would ever reconsider a refused group, because the MFC entry does not change and no frame re-offers it |
+| A device MTU | `NETDEV_CHANGEMTU` | every group re-derived, installed ones included; a copy narrower than its parent VIF takes the group out as `refused-mtu` |
+| The IPv6 MTU sysctl | nothing reports it | the five-second refresh re-derives every group, which finds it |
 | A bridged membership on a bridge some group expands through | the switchdev chain | the routed worker is kicked; the second set-top box joining on a second port is the case, and the group grows from one listener to two through `cdx_mc_group_replace()` |
 | The bridge's VLAN configuration or filtering | the switchdev chain | kicked and re-derived |
 | A multicast router port, snooping, flood flag or forwarding state | switchdev attributes | kicked and re-derived from the live snapshot; patch 161 emits router refreshes on either protocol's transition, even while the other remains a router |
@@ -389,8 +408,8 @@ mroute family=4 table=253 group=239.8.1.5 src=10.0.0.52 in=eth4 oifs=eth3 \
 
 `oifs` names the VIF devices the kernel listed; `listeners` names the physical
 ports and tags the hardware was actually given, which is where a bridge oif
-becomes several. The states are `installed`, `pending`, and the ten refusals
-above, each distinct so an operator can tell them apart. `mroute_policy_rules`
+becomes several. The states are `installed`, `pending`, and the refusals above,
+each distinct so an operator can tell them apart. `mroute_policy_rules`
 is the one most likely to be needed: a single non-default ipmr rule keeps a
 whole family in software and nothing else on the box would say so.
 
@@ -492,6 +511,17 @@ Six oracles each, and the last two are ones a bridged case cannot produce:
 
 Teardown is an assertion too — removing the route has to take the hardware
 group, the `/proc` row and the kernel's flag with it.
+
+`tools/tests/test_mcast_member_mtu.py` proves the MTU clause on the wire, for
+both families. The listener is a 1400-byte VLAN device behind a 1500-byte
+ingress. The group reads `refused-mtu`. Small datagrams arrive through
+software. 1448-byte ones, with DF for IPv4, arrive neither whole nor as
+fragments, and the microcode's fragment counters do not move. Raising the
+listener to 1500 re-derives the group into hardware through the MTU change
+alone. Full 1500-byte datagrams then arrive whole with hop count 63, the
+classifier counts them, and the fragment counters still do not move. Lowering
+it again takes the installed group back out. For IPv6, the IPv6 MTU sysctl
+alone does the same within the refresh interval.
 
 ## Proved on hardware
 
