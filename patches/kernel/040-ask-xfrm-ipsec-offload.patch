@@ -1,4 +1,4 @@
-From 559c1ddb8501977b43069590183712264c2e33bc Mon Sep 17 00:00:00 2001
+From ef3a52b82a83bd1dc39bfbff405176073ca38f6f Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -33,9 +33,10 @@ follows the SA's mode: a tunnel's names the inner protocol, a transport
 SA's the frame's own IP header length and next-header offset. A frame
 the driver could not give SEC is counted as a transmit drop, not in
 `tx toenc`. An update that would change a packet-offloaded state's
-encapsulation ports in place is refused: no driver hears of an update,
-and the hardware SA carries the ports, so deleting and adding the state
-is what programs new ones.
+encapsulation ports or output mark in place is refused: no driver hears
+of an update, and the hardware SA carries the ports and was addressed by
+a route looked up with the mark, so deleting and adding the state is
+what programs new ones.
 
 Compiles warning-free: the offload entry points are declared in
 include/net/xfrm.h instead of per-file externs and
@@ -62,9 +63,9 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/xfrm_input.c                         |  21 +
  net/xfrm/xfrm_output.c                        | 354 +++++++
  net/xfrm/xfrm_policy.c                        |  87 ++
- net/xfrm/xfrm_state.c                         | 262 ++++-
+ net/xfrm/xfrm_state.c                         | 274 ++++++
  net/xfrm/xfrm_user.c                          |   4 +
- 21 files changed, 2089 insertions(+), 35 deletions(-)
+ 21 files changed, 2103 insertions(+), 33 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -2457,7 +2458,7 @@ index e033390e7785..152ae1ec8617 100644
  	xfrm_policy_fini(net);
  	xfrm_state_fini(net);
 diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
-index 792e5ef9361a..ab7f67f16c3a 100644
+index 792e5ef9361a..fbd25d184c11 100644
 --- a/net/xfrm/xfrm_state.c
 +++ b/net/xfrm/xfrm_state.c
 @@ -58,6 +58,75 @@ static inline bool xfrm_state_hold_rcu(struct xfrm_state __rcu *x)
@@ -2541,20 +2542,20 @@ index 792e5ef9361a..ab7f67f16c3a 100644
  	}
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+static void xfrm_hash_transfer(struct hlist_head *list,
-+			       struct hlist_head *ndsttable,
-+			       struct hlist_head *nsrctable,
-+			       struct hlist_head *nspitable,
-+			       struct hlist_head *nseqtable,
-+			       struct hlist_head *nhtable,
-+			       unsigned int nhashmask)
-+#else
  static void xfrm_hash_transfer(struct hlist_head *list,
  			       struct hlist_head *ndsttable,
  			       struct hlist_head *nsrctable,
  			       struct hlist_head *nspitable,
  			       struct hlist_head *nseqtable,
++			       struct hlist_head *nhtable,
  			       unsigned int nhashmask)
++#else
++static void xfrm_hash_transfer(struct hlist_head *list,
++			       struct hlist_head *ndsttable,
++			       struct hlist_head *nsrctable,
++			       struct hlist_head *nspitable,
++			       struct hlist_head *nseqtable,
++			       unsigned int nhashmask)
 +#endif
  {
  	struct hlist_node *tmp;
@@ -2752,48 +2753,59 @@ index 792e5ef9361a..ab7f67f16c3a 100644
  }
  
  void xfrm_state_insert(struct xfrm_state *x)
-@@ -2098,6 +2273,24 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
+@@ -2098,6 +2273,40 @@ struct xfrm_state *xfrm_state_migrate(struct xfrm_state *x,
  EXPORT_SYMBOL(xfrm_state_migrate);
  #endif
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+/* Whether an update may copy @x's encapsulation into @x1 in place. A
-+ * packet-offloaded state's ports are in its hardware SA -- SEC writes them in
-+ * front of every frame it encrypts, and the classifier keys the SA's inbound
-+ * frames on them -- and an update reaches no driver. Changing them in place
-+ * would leave the hardware on the old ports while the state reports the new
-+ * ones, so that is refused; deleting the state and adding it again programs
-+ * them. An update that keeps the ports is unaffected.
++/* Whether an update may be copied into the packet-offloaded state @x1 in
++ * place. An update reaches no driver, so it may not change what the hardware
++ * SA was programmed from:
++ *
++ *  - the encapsulation ports, which SEC writes in front of every frame it
++ *    encrypts and the classifier keys the SA's inbound frames on;
++ *  - the output mark, which the peer's route was looked up with to address
++ *    the SA's frames, and is looked up with again whenever the peer moves.
++ *
++ * Changing either in place would leave the hardware on the old value while
++ * the state reports the new one, so that is refused; deleting the state and
++ * adding it again programs it. An update that keeps them, or names no mark
++ * at all and so keeps the state's, is unaffected, and so are the lifetimes,
++ * which this state's own expiry enforces from the counters the driver
++ * reports.
 + */
-+static bool xfrm_state_update_encap_ok(const struct xfrm_state *x1,
-+				       const struct xfrm_state *x)
++static bool xfrm_state_update_offload_ok(const struct xfrm_state *x1,
++					 const struct xfrm_state *x)
 +{
-+	return x1->xso.type != XFRM_DEV_OFFLOAD_PACKET ||
-+	       (x->encap->encap_sport == x1->encap->encap_sport &&
-+		x->encap->encap_dport == x1->encap->encap_dport);
++	if (x1->xso.type != XFRM_DEV_OFFLOAD_PACKET)
++		return true;
++	if (x->encap && x1->encap &&
++	    (x->encap->encap_sport != x1->encap->encap_sport ||
++	     x->encap->encap_dport != x1->encap->encap_dport))
++		return false;
++	if ((x->props.smark.v || x->props.smark.m) &&
++	    (x->props.smark.v != x1->props.smark.v ||
++	     x->props.smark.m != x1->props.smark.m))
++		return false;
++	return true;
 +}
 +#endif
 +
  int xfrm_state_update(struct xfrm_state *x)
  {
  	struct xfrm_state *x1, *to_put;
-@@ -2155,9 +2348,13 @@ int xfrm_state_update(struct xfrm_state *x)
+@@ -2154,6 +2363,10 @@ int xfrm_state_update(struct xfrm_state *x)
+ 	err = -EINVAL;
  	spin_lock_bh(&x1->lock);
  	if (likely(x1->km.state == XFRM_STATE_VALID)) {
- 		if (x->encap && x1->encap &&
--		    x->encap->encap_type == x1->encap->encap_type)
-+		    x->encap->encap_type == x1->encap->encap_type) {
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
-+			if (!xfrm_state_update_encap_ok(x1, x))
-+				goto fail;
++		if (!xfrm_state_update_offload_ok(x1, x))
++			goto fail;
 +#endif
+ 		if (x->encap && x1->encap &&
+ 		    x->encap->encap_type == x1->encap->encap_type)
  			memcpy(x1->encap, x->encap, sizeof(*x1->encap));
--		else if (x->encap || x1->encap)
-+		} else if (x->encap || x1->encap)
- 			goto fail;
- 
- 		if (x->coaddr && x1->coaddr) {
-@@ -2272,6 +2469,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
+@@ -2272,6 +2485,36 @@ xfrm_state_lookup_byaddr(struct net *net, u32 mark,
  }
  EXPORT_SYMBOL(xfrm_state_lookup_byaddr);
  
@@ -2830,7 +2842,7 @@ index 792e5ef9361a..ab7f67f16c3a 100644
  struct xfrm_state *
  xfrm_find_acq(struct net *net, const struct xfrm_mark *mark, u8 mode, u32 reqid,
  	      u32 if_id, u32 pcpu_num, u8 proto, const xfrm_address_t *daddr,
-@@ -2521,6 +2748,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
+@@ -2521,6 +2764,16 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high,
  			x->id.spi = newspi;
  			h = xfrm_spi_hash(net, &x->id.daddr, newspi, x->id.proto, x->props.family);
  			XFRM_STATE_INSERT(byspi, &x->byspi, net->xfrm.state_byspi + h, x->xso.type);
@@ -2847,7 +2859,7 @@ index 792e5ef9361a..ab7f67f16c3a 100644
  			spin_unlock_bh(&net->xfrm.xfrm_state_lock);
  			err = 0;
  			goto unlock;
-@@ -3207,6 +3444,19 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3207,6 +3460,19 @@ int __net_init xfrm_state_init(struct net *net)
  	if (!net->xfrm.state_byseq)
  		goto out_byseq;
  
@@ -2867,7 +2879,7 @@ index 792e5ef9361a..ab7f67f16c3a 100644
  	net->xfrm.state_cache_input = alloc_percpu(struct hlist_head);
  	if (!net->xfrm.state_cache_input)
  		goto out_state_cache_input;
-@@ -3221,6 +3471,10 @@ int __net_init xfrm_state_init(struct net *net)
+@@ -3221,6 +3487,10 @@ int __net_init xfrm_state_init(struct net *net)
  	return 0;
  
  out_state_cache_input:
@@ -2878,7 +2890,7 @@ index 792e5ef9361a..ab7f67f16c3a 100644
  	xfrm_hash_free(net->xfrm.state_byseq, sz);
  out_byseq:
  	xfrm_hash_free(net->xfrm.state_byspi, sz);
-@@ -3251,6 +3505,10 @@ void xfrm_state_fini(struct net *net)
+@@ -3251,6 +3521,10 @@ void xfrm_state_fini(struct net *net)
  	xfrm_hash_free(net->xfrm.state_bysrc, sz);
  	WARN_ON(!hlist_empty(net->xfrm.state_bydst));
  	xfrm_hash_free(net->xfrm.state_bydst, sz);

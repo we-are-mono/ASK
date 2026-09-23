@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A251.** `xfrm_state_update()` moved a packet-offloaded SA's NAT-T ports or output mark in place without telling the driver, leaving the hardware on the old ones —
+  fixed (_:/^xfrm: refuse changing a packet-offloaded state's output mark in place_).
+
 - [x] **A249.** Frames SEC never got were counted as sent (`tx toenc`, the Wi-Fi local path's count) and freed without a drop count, and every failed submit printed —
   fixed (_:/^sdk_dpaa: rate-limit SEC submit failures; count Wi-Fi SEC frames given_).
 

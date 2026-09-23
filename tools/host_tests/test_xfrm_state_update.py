@@ -1,8 +1,9 @@
 """Which in-place xfrm state updates the kernel lets through for a
 packet-offloaded SA, compiled from the patched kernel.
 
-An update reaches no driver. The encapsulation ports of a packet-offloaded SA
-are in its hardware SA, so an update may keep them but not move them.
+An update reaches no driver. A packet-offloaded SA's encapsulation ports are
+in its hardware SA, and its output mark chose the route that addressed it, so
+an update may keep them but not change them.
 """
 
 import os
@@ -18,7 +19,7 @@ def test_xfrm_state_update(tmp_path):
     kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
         "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
     source = (kernel / "net/xfrm/xfrm_state.c").read_text()
-    (tmp_path / "xfrm_state_update.inc").write_text(function(source, "xfrm_state_update_encap_ok"))
+    (tmp_path / "xfrm_state_update.inc").write_text(function(source, "xfrm_state_update_offload_ok"))
     binary = tmp_path / "xfrm_state_update"
     subprocess.run([
         os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
