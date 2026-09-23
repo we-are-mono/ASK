@@ -146,6 +146,24 @@ class Flow:
                 if self.spec["wire"].get("zero_checksum"):
                     self.sock.setsockopt(socket.SOL_SOCKET, 11, 1)  # Linux SO_NO_CHECK
 
+    async def probe_after_loss(self, size):
+        """Whether a lost datagram was one packet or the flow going dark: five
+        more probes a second apart, and what came back. Only on the failure
+        path, so it spends serials nothing counts any more."""
+        loop = asyncio.get_running_loop()
+        results = []
+        for n in range(1, 6):
+            data = payload(self.spec["id"], self.serial + n, size)
+            try:
+                await loop.sock_sendall(self.sock, data)
+                async with asyncio.timeout(1):
+                    while await loop.sock_recv(self.sock, size + 1) != data:
+                        pass
+                results.append("ok")
+            except (TimeoutError, OSError) as error:
+                results.append(type(error).__name__)
+        return f"after the loss, {time.monotonic():.3f}: " + " ".join(results)
+
     async def run(self, count, interval, allow_loss=False, udp_timeout=None):
         # Loss-tolerant UDP windows validate every received payload. Their
         # controller supplies the loss budget; TCP always requires delivery.
@@ -195,6 +213,8 @@ class Flow:
                                       and error.errno not in {errno.EHOSTUNREACH, errno.ENETUNREACH,
                                                               errno.ECONNREFUSED}):
                     error.add_note(f"flow={self.spec} serial={self.serial} first={first}")
+                    if not self.writer and isinstance(error, TimeoutError):
+                        error.add_note(await self.probe_after_loss(size))
                     if self.wire:
                         packets, drops = struct.unpack("II", self.wire.getsockopt(263, 6, 8))
                         error.add_note(f"receive capture: {packets} packets, {drops} socket drops; serial={self.serial}")

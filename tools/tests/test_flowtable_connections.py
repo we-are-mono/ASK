@@ -7,6 +7,7 @@ import json
 import socket
 from pathlib import Path
 import secrets
+import struct
 
 import pytest_asyncio
 
@@ -217,6 +218,25 @@ async def peer(r, flows=FLOWS, *, initial_ids=None, servers=(), lease=180, tcp_s
                 result = await task
                 r.record("connections-peer", {"rc": result.rc, "stdout": result.stdout,
                                                 "server_errors": errors, "tcp_records": tcp_counts})
+                if result.rc != 0 or errors:
+                    # Which way a lost datagram died: the WAN echo's own record
+                    # of what reached it, the newest serials of each flow. A
+                    # serial the LAN never got back but the WAN saw was lost on
+                    # the way back.
+                    seen = {}
+                    for data in getattr(getattr(r, "echo", None), "received", {}):
+                        if len(data) >= 12:
+                            ident, serial = struct.unpack("!IQ", data[:12])
+                            seen.setdefault(ident, []).append(serial)
+                    dut = {}
+                    for path in ("/proc/net/xfrm_stat", "/proc/cdx_flowtable"):
+                        try:
+                            dut[path] = await read(r.target, r.session, path)
+                        except Exception as error:
+                            dut[path] = repr(error)
+                    r.record("connections-wan-received",
+                             {"wan": {ident: sorted(serials)[-32:] for ident, serials in seen.items()},
+                              "dut": dut})
                 assert result.rc == 0 and not errors, (result.stdout, errors)
         if shutdown_error:
             raise shutdown_error
