@@ -2774,10 +2774,11 @@ void cdx_mc_group_del(struct cdx_mc_group **group)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_mc_group_del, ASK_CDX_FLOWTABLE);
 
-void cdx_mc_group_stats(const struct cdx_mc_group *group,
+bool cdx_mc_group_stats(const struct cdx_mc_group *group,
 			struct cdx_ft_counters *stats)
 {
 	struct mcast_group_info *grp;
+	bool read;
 
 	/* Under the transaction like every other operation here, and not
 	 * merely by convention: hw_ct_get_active() reads and writes back
@@ -2787,17 +2788,18 @@ void cdx_mc_group_stats(const struct cdx_mc_group *group,
 	cdx_ft_assert_held();
 	memset(stats, 0, sizeof(*stats));
 	if (!group || !group->info)
-		return;
+		return false;
 	grp = group->info;
 	if (!grp->pCtEntry || !grp->pCtEntry->ct)
-		return;
+		return false;
 	/* The root entry's own counters: frames matched on ingress, once each.
 	 * The replication happens below this entry and nothing between here and
 	 * the wire counts a replica separately, so a caller reporting
 	 * per-listener delivery wants the ports' own counters. */
-	hw_ct_get_active(grp->pCtEntry->ct);
+	read = !hw_ct_get_active(grp->pCtEntry->ct);
 	stats->packets = grp->pCtEntry->ct->pkts;
 	stats->bytes = grp->pCtEntry->ct->bytes;
 	stats->lastused = grp->pCtEntry->ct->timestamp;
+	return read;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_mc_group_stats, ASK_CDX_FLOWTABLE);

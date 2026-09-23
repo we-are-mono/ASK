@@ -108,6 +108,7 @@ def test_mcast_learner(tmp_path):
             "ft_mc_flow_derive",
             "ft_mc_count_delta",
             "ft_mc_flow_counted",
+            "ft_mc_refresh_fn",
             "ft_mc_key_contested",
             "ft_mc_drain",
             "ft_mc_flow_names_dev",

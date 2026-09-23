@@ -212,8 +212,12 @@ unsigned int cdx_mc_group_count(void);
  * each, not once per replica. A caller reporting per-listener delivery wants
  * the port's own counters instead -- the replication happens below this entry
  * and nothing between here and the wire counts it separately.
+ *
+ * Returns whether the counters were read. When they were not, *stats is zero,
+ * which is no sample: a caller taking deltas from one would see a count gone
+ * backwards, and one that re-bases on it would count the whole stream again.
  */
-void cdx_mc_group_stats(const struct cdx_mc_group *group,
+bool cdx_mc_group_stats(const struct cdx_mc_group *group,
 			struct cdx_ft_counters *stats);
 
 #endif

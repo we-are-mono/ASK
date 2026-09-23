@@ -492,20 +492,31 @@ static uint32_t fill_mcast_mac_key(PCtEntry entry, const uint8_t *mac_pair,
 	return sizeof(key->ipv4_mcast_mac_key) + 1;
 }
 
-/* check activity */
-void hw_ct_get_active(struct hw_ct *ct)
+/* check activity
+ *
+ * Returns 0 when the entry's counters were read, and a negative errno when
+ * there was no entry or it keeps none. The fields are written either way, as
+ * they always were -- zero where nothing was read -- so a caller taking deltas
+ * has to know which it got: a zero standing in for a count reads as one that
+ * went backwards. */
+int hw_ct_get_active(struct hw_ct *ct)
 {
 	struct en_tbl_entry_stats stats;
+	int rc;
+
 	memset(&stats, 0, sizeof(struct en_tbl_entry_stats));
-	ExternalHashTableEntryGetStatsAndTS(ct->handle, &stats);
+	rc = ExternalHashTableEntryGetStatsAndTS(ct->handle, &stats);
 	ct->pkts = stats.pkts;
 	ct->bytes = stats.bytes;
 	ct->timestamp = stats.timestamp;
 #ifdef CDX_DPA_DEBUG
-	DPA_INFO("%s::ct %p pkts %lu, bytes %lu, timestamp %x jiffies %x\n", 
+	DPA_INFO("%s::ct %p pkts %lu, bytes %lu, timestamp %x jiffies %x\n",
 		__func__, ct, (unsigned long)ct->pkts, (unsigned long)ct->bytes, ct->timestamp,
 		JIFFIES32);
 #endif
+	if (rc)
+		return -ENOENT;
+	return (stats.flags & STATS_VALID) ? 0 : -ENODATA;
 }
 
 /* Pending-free quarantine for external-hash table entries (ISSUES.md

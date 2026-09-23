@@ -216,8 +216,18 @@ static void cdx_mc_group_del(struct cdx_mc_group **hw)
     *hw = NULL;
 }
 static struct cdx_ft_counters hw_count;
-static void cdx_mc_group_stats(struct cdx_mc_group *hw, struct cdx_ft_counters *c)
-{ assert(ctrl && hw->live); *c = hw_count; }
+/* A read the backend could not make: zero, and said so. */
+static bool fail_stats;
+static bool cdx_mc_group_stats(struct cdx_mc_group *hw, struct cdx_ft_counters *c)
+{
+    assert(ctrl && hw->live);
+    if (fail_stats) {
+        memset(c, 0, sizeof(*c));
+        return false;
+    }
+    *c = hw_count;
+    return true;
+}
 static unsigned folded_tags;
 static struct cdx_ft_counters folded;
 static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c, u8 tags)
@@ -255,6 +265,15 @@ int main(void)
     for (unsigned i = 0; i < 20; i++) refresh();
     assert(adds == 1 && replaces == 0 && deletes == 0);
     assert(derives == 21 && folds == 20 && input.refs == 2);
+    /* A read that fails is no sample, however many come in a row: folded as
+     * zero it would re-base the fold, and the first read after would count
+     * the whole stream into the MFC entry again. */
+    fail_stats = true;
+    for (unsigned i = 0; i < 3; i++) refresh();
+    assert(folds == 20 && hardware.live && g->offloaded);
+    fail_stats = false;
+    refresh();
+    assert(folds == 21);
 
     /* A router appeared, then disappeared. Refreshed chains carry exact sets. */
     wanted = 2;
@@ -307,6 +326,20 @@ int main(void)
     }
     hw_count = (struct cdx_ft_counters){ 0, 0 };
     assert(!hardware.live && !ft_mr_installed && !input.refs);
+    refuse = false;
+    refresh();
+    assert(hardware.live && hardware.copies == 2 && g->offloaded);
+    /* The same withdrawal with every read failing, the one taken just before
+     * the delete included: nothing is folded for it. */
+    refuse = true;
+    fail_stats = true;
+    {
+        unsigned before = folds;
+
+        refresh();
+        assert(folds == before && !hardware.live);
+    }
+    fail_stats = false;
     refuse = false;
     refresh();
     assert(hardware.live && hardware.copies == 2 && g->offloaded);

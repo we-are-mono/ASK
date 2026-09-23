@@ -438,7 +438,7 @@ int dpa_add_oh_if(char *name);
 int cdx_init_frag_module(void);
 void cdx_deinit_frag_module(void);
 
-void hw_ct_get_active(struct hw_ct *ct);
+int hw_ct_get_active(struct hw_ct *ct);
 
 /* External-hash entry disposition (ISSUES.md A95; implemented in
  * cdx_ehash.c, where the full rationale lives).

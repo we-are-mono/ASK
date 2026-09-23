@@ -387,7 +387,7 @@ file's git history.
   covered (_:/^tests: prove a failed multicast barrier parks and the next one frees_).
 
 - [x] **A212.** The routed multicast fold wrote hardware counts over the MFC's, erasing ipmr's own and running `ip -s mroute` backwards —
-  fixed (_:/^cdx: add routed multicast hardware counts to the MFC, never set them_).
+  fixed (_:/^flowtable: take no multicast sample from a counter read that failed_).
 
 - [x] **A201.** Oversized IPv6 into an SA was unmeasured — measured: SEC encrypts it whole and only the outer IPv4 packet is fragmented, so no bound
   is needed (_:/^tests: measure what an oversized IPv6 packet into an SA becomes_).

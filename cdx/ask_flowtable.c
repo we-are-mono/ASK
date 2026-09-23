@@ -7078,10 +7078,11 @@ static void ft_mc_refresh_fn(struct work_struct *work)
 		 * from costing a transaction every interval for good. */
 		if (!f->hw && f->retries && f->retries < FT_MC_MAX_RETRIES)
 			f->stale = true;
-		if (!f->hw)
-			continue;
-		cdx_mc_group_stats(f->hw, &stats);
-		ft_mc_flow_counted(f, &stats, jiffies);
+		/* A read that failed is no sample: taken as one, it is a count
+		 * gone backwards, and two in a row would re-base the entry at
+		 * zero and count the whole stream again into its route. */
+		if (f->hw && cdx_mc_group_stats(f->hw, &stats))
+			ft_mc_flow_counted(f, &stats, jiffies);
 	}
 	mutex_unlock(&ft_mc_lock);
 	cdx_ft_end();
@@ -8859,15 +8860,14 @@ static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c,
  * includes: its own entry's, or for a group routed through a bridge, what the
  * bridged group carrying its copies counted -- every frame of which the bridge
  * would have handed to ipmr. False, with nothing counted, while nothing in
- * hardware carries it. Called with ft_mr_lock and the transaction held. */
+ * hardware carries it or its count could not be read; see
+ * cdx_mc_group_stats(). Called with ft_mr_lock and the transaction held. */
 static bool ft_mr_counters(struct ft_mr_group *g, struct cdx_ft_counters *c,
 			   u8 *tags)
 {
 	*tags = g->in_tags;
-	if (g->hw) {
-		cdx_mc_group_stats(g->hw, c);
-		return true;
-	}
+	if (g->hw)
+		return cdx_mc_group_stats(g->hw, c);
 	if (g->route && ft_mc_route_state(g->route, c, tags))
 		return true;
 	memset(c, 0, sizeof(*c));
@@ -9244,8 +9244,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 			 * unless it is read first; it is folded once the group
 			 * is under its lock again. */
 			if (hw && (rekey || state != FT_MR_PENDING)) {
-				cdx_mc_group_stats(hw, &last);
-				counted = true;
+				counted = cdx_mc_group_stats(hw, &last);
 				cdx_mc_group_del(&hw);
 				deleted = true;
 				ft_mr_installed--;
@@ -9259,8 +9258,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 						/* The old set can omit a newly learned
 						 * router. Return the entire stream to
 						 * software until a full set installs. */
-						cdx_mc_group_stats(hw, &last);
-						counted = true;
+						counted = cdx_mc_group_stats(hw, &last);
 						cdx_mc_group_del(&hw);
 						deleted = true;
 						ft_mr_installed--;

@@ -370,7 +370,39 @@ static bool net_eq(const int *a, const int *b) { return a == b; }
 static unsigned mr_kicks;
 static void ft_mr_kick(void) { mr_kicks++; }
 
+/* The refresh, as far as it reaches past the learner: the transaction, the
+ * clock, its own rearm, and the entry's count, which a case can make fail. */
+struct work_struct;
+struct cdx_mc_group;
+struct cdx_ft_counters;
+static unsigned long jiffies;
+static int ft_mc_refresh;
+static unsigned refresh_rearms;
+static void schedule_delayed_work(int *w, unsigned long delay)
+{
+    (void)w;
+    (void)delay;
+    refresh_rearms++;
+}
+static int in_transaction;
+static void cdx_ft_begin(void) { assert(!in_transaction && !ft_mc_lock); in_transaction = 1; }
+static void cdx_ft_end(void) { assert(in_transaction); in_transaction = 0; }
+static bool cdx_mc_group_stats(const struct cdx_mc_group *hw, struct cdx_ft_counters *c);
+
 #include "mcast_learner.inc"
+
+static bool stats_fail;
+static struct cdx_ft_counters stats_now;
+static bool cdx_mc_group_stats(const struct cdx_mc_group *hw, struct cdx_ft_counters *c)
+{
+    assert(hw && in_transaction);
+    if (stats_fail) {
+        memset(c, 0, sizeof(*c));
+        return false;
+    }
+    *c = stats_now;
+    return true;
+}
 
 #include <stdarg.h>
 
@@ -2143,15 +2175,58 @@ static void idle_flows_age_out(void)
     f->active = t0;
     ft_mc_flow_counted(f, &c, t0 + 100000 * HZ);
     assert(!f->gone);
-    /* And jiffies wrapping round does not age a live entry. */
+    /* And jiffies wrapping round does not age a live entry. Counted 50 s
+     * before the wrap, it ages 210 s after it -- a sum that has wrapped, and
+     * that a plain comparison takes for long past at any moment before the
+     * wrap itself. */
     membership_interval = 260 * HZ;
     f->dirty = true;
     pass();
     f->active = (unsigned long)-50 * HZ;
+    ft_mc_flow_counted(f, &c, (unsigned long)-10 * HZ);
+    assert(!f->gone);
     ft_mc_flow_counted(f, &c, 100 * HZ);
     assert(!f->gone);
     ft_mc_flow_counted(f, &c, 211 * HZ);
     assert(f->gone);
+    pass();
+    assert(!ft_mc_flow_count);
+
+    /* A read of the entry's count that fails is no sample. The refresh does
+     * not pass it on: the flow is neither idle nor active on it and ages on
+     * nothing, and the baseline stands however many fail in a row. Taken
+     * as zero, two would re-base the entry there, and the first read after
+     * would count the whole stream again into the route it carries. */
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw);
+    {
+        struct ft_mc_route r;
+
+        memset(&r, 0, sizeof(r));
+        f->carried_route = &r;
+        f->hw_packets = 100;
+        f->hw_bytes = 6400;
+        f->count_suspect = f->idle = false;
+        jiffies = t0;
+        f->active = t0;
+        stats_fail = true;
+        for (int i = 1; i <= 3; i++) {
+            jiffies = t0 + i * FT_MC_REFRESH_INTERVAL;
+            ft_mc_refresh_fn(NULL);
+        }
+        assert(f->hw_packets == 100 && f->hw_bytes == 6400 && !f->count_suspect);
+        assert(!f->idle && !f->gone && f->active == t0 && !r.stats.packets);
+        stats_fail = false;
+        stats_now = (struct cdx_ft_counters){ .packets = 110, .bytes = 7040 };
+        jiffies += FT_MC_REFRESH_INTERVAL;
+        ft_mc_refresh_fn(NULL);
+        assert(r.stats.packets == 10 && r.stats.bytes == 640);
+        assert(f->active == jiffies && !f->idle && !f->gone);
+        f->carried_route = NULL;
+    }
+    assert(!ft_mc_lock && !in_transaction && refresh_rearms);
 }
 
 int main(void)
