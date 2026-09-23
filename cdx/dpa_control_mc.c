@@ -2300,6 +2300,16 @@ err_ret:
 	return rc;
 }
 
+/* Groups added through this interface and not yet deleted. Under the
+ * transaction. */
+static unsigned int cdx_mc_groups_owned;
+
+unsigned int cdx_mc_group_count(void)
+{
+	cdx_ft_assert_held();
+	return cdx_mc_groups_owned;
+}
+
 int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
 		     struct cdx_mc_group **result)
 {
@@ -2376,6 +2386,7 @@ int cdx_mc_group_add(const struct cdx_mc_group_spec *spec,
 	mutex_unlock(&mc_mutators_mutex);
 
 	group->info = grp;
+	cdx_mc_groups_owned++;
 	*result = group;
 	return 0;
 
@@ -2578,6 +2589,8 @@ void cdx_mc_group_del(struct cdx_mc_group **group)
 	grp = (*group)->info;
 	kfree(*group);
 	*group = NULL;
+	if (!WARN_ON_ONCE(!cdx_mc_groups_owned))
+		cdx_mc_groups_owned--;
 	if (!grp)
 		return;
 

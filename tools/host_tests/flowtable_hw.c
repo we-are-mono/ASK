@@ -260,6 +260,11 @@ static uint32_t dpa_get_num_fmans(void) { lockdep_assert_held(&cdx_info->ctrl.mu
 static unsigned long jiffies = 1000;
 #define HZ 100
 #define time_before(a, b) ((long)((a) - (b)) < 0)
+/* SAs and multicast groups installed through the other two backends, which the
+ * idle answer counts along with this one's directions. */
+static unsigned sa_owned, mc_owned;
+static unsigned int cdx_ipsec_sa_count(void) { assert(cdx_info->ctrl.mutex); return sa_owned; }
+static unsigned int cdx_mc_group_count(void) { assert(cdx_info->ctrl.mutex); return mc_owned; }
 static unsigned allocations, deletes, syncs;
 static bool fail_alloc, fail_insert, fail_sync, stopped;
 static int delete_result;
@@ -676,6 +681,15 @@ static void test_backend(void)
     cdx_flowtable_quiesced();
     cdx_ft_end();
     assert(!cdx_info->ctrl.mutex && !rtnl && !allocations);
+    /* With no adapter registered to ask, CDX asks this whether anything the
+     * adapter installed is still in the hardware -- a direction, or an SA or
+     * a multicast group, which an adapter on its way out retires only after
+     * it has stopped answering. Each one alone is an answer of "not idle". */
+    assert(cdx_ft_idle() && !cdx_info->ctrl.mutex);
+    sa_owned = 1; assert(!cdx_ft_idle()); sa_owned = 0;
+    mc_owned = 1; assert(!cdx_ft_idle()); mc_owned = 0;
+    legacy_pending = 1; assert(!cdx_ft_idle()); legacy_pending = 0;
+    assert(cdx_ft_idle() && !cdx_info->ctrl.mutex);
     /* A released adapter cannot bypass the provider's terminal guard.
      * The callback runs without a backend transaction and uses object identity. */
     strcpy(out.name,"renamed");

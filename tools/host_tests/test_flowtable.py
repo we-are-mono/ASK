@@ -184,3 +184,26 @@ def test_flowtable_stats_poll(tmp_path):
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
+
+
+def test_idle_counts_what_the_other_backends_own():
+    """With no adapter registered, CDX asks the backend whether anything the
+    adapter installed is still in the hardware. SAs and multicast groups go in
+    through backends of their own, and an adapter on its way out retires them
+    only after it has unregistered the hook that would otherwise answer; so
+    each backend counts what it holds, on the one path that hands an object
+    back and the one that consumes it, and the answer includes both."""
+    idle = function((ROOT / "cdx/cdx_flowtable_backend.c").read_text(), "cdx_ft_idle")
+    assert "cdx_ipsec_sa_count()" in idle and "cdx_mc_group_count()" in idle
+    for path, add, delete, counter in (
+            ("cdx/cdx_ipsec_backend.c", "cdx_ipsec_sa_add", "cdx_ipsec_sa_del",
+             "cdx_ipsec_sa_owned"),
+            ("cdx/dpa_control_mc.c", "cdx_mc_group_add", "cdx_mc_group_del",
+             "cdx_mc_groups_owned")):
+        source = (ROOT / path).read_text()
+        body = function(source, add)
+        assert body.count(counter + "++") == 1, add
+        # After every way out that installed nothing, before the success.
+        assert body.rindex("goto ") < body.index(counter + "++") < \
+            body.index("return 0;"), add
+        assert function(source, delete).count(counter + "--") == 1, delete

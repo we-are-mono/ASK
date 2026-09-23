@@ -225,6 +225,10 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
  */
 void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa);
 
+/* How many SAs added here are not yet deleted, whatever became of the module
+ * that added them. Transaction held. */
+unsigned int cdx_ipsec_sa_count(void);
+
 /* Point an outbound SA's egress framing at a different next hop.
  *
  * The peer's Ethernet address is not consulted per frame. It is written into

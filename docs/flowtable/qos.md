@@ -1558,6 +1558,10 @@ its build and marks its own watch for the rebuild if one landed. Multicast
 replicas are outside this hook: they are not flow entries, and neither the
 retirement nor `drain()` covers them.
 
+With no adapter registered — one on its way out has unregistered the hook
+before it retires its SAs and multicast groups — CDX asks the backend instead,
+and the answer counts SAs and groups as well as flow directions.
+
 Turning the map off is the sharp one, because the table carries no port id.
 An entry with the bit reads whichever port's queues the table holds, so a
 table handed to another port while an entry built under the first is still in

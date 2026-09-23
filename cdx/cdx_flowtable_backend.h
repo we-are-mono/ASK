@@ -361,10 +361,11 @@ int cdx_ft_release(void);
 bool cdx_ft_failed(void);
 unsigned int cdx_ft_pending(void);
 
-/* No direction this backend installed is in the hardware, live or waiting on
- * a delete. Takes the transaction itself, so it is for CDX's own callers --
- * one that has to know the classifier is not reading something while no
- * adapter is registered to ask. */
+/* Nothing the adapter installed through this backend -- a flow direction, an
+ * SA or a multicast group -- is in the hardware, live or waiting on a delete.
+ * Takes the transaction itself, so it is for CDX's own callers -- one that has
+ * to know the classifier is not reading something while no adapter is
+ * registered to ask. */
 bool cdx_ft_idle(void);
 
 /* Admission also excludes network configuration. Call outside RTNL; begin

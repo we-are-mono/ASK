@@ -81,6 +81,15 @@ struct cdx_ipsec_sa {
 /* Rotating hint for the handle search below. Static because the handle space
  * is per-instance in exactly the way the SA cache is, and both are global. */
 static u16 cdx_ipsec_next_handle = 1;
+/* SAs installed through this interface and not yet deleted. Under the
+ * transaction. */
+static unsigned int cdx_ipsec_sa_owned;
+
+unsigned int cdx_ipsec_sa_count(void)
+{
+	cdx_ft_assert_held();
+	return cdx_ipsec_sa_owned;
+}
 
 /* Find a handle no live SA holds.
  *
@@ -417,6 +426,7 @@ int cdx_ipsec_sa_add(const struct cdx_ipsec_sa_spec *spec, struct xfrm_state *x,
 	owner->entry = sa;
 	owner->handle = handle;
 	owner->dev = spec->dev;
+	cdx_ipsec_sa_owned++;
 	*result = owner;
 	return 0;
 
@@ -439,6 +449,8 @@ void cdx_ipsec_sa_del(struct cdx_ipsec_sa **sa)
 	if (!owner)
 		return;
 	*sa = NULL;
+	if (!WARN_ON_ONCE(!cdx_ipsec_sa_owned))
+		cdx_ipsec_sa_owned--;
 	/* Drop the borrowed state pointer before the release path runs. That
 	 * path puts a reference for the legacy owner, which does hold one --
 	 * this SA does not, for the reason cdx_ipsec_sa_add() gives, so the

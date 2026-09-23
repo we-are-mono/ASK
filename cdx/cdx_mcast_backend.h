@@ -181,6 +181,10 @@ int cdx_mc_group_replace(struct cdx_mc_group *group,
  */
 void cdx_mc_group_del(struct cdx_mc_group **group);
 
+/* How many groups added here are not yet deleted, whatever became of the
+ * module that added them. Transaction held. */
+unsigned int cdx_mc_group_count(void);
+
 /* What the classifier counted for this group: frames matched on ingress, once
  * each, not once per replica. A caller reporting per-listener delivery wants
  * the port's own counters instead -- the replication happens below this entry

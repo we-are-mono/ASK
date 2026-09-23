@@ -9,6 +9,8 @@
 #include "cdx_flowtable.h"
 #include "cdx_flowtable_backend.h"
 #include "cdx_flowtable_hw.h"
+#include "cdx_ipsec_backend.h"
+#include "cdx_mcast_backend.h"
 #include "devman.h"
 #include "dpa_wifi.h"
 
@@ -115,7 +117,10 @@ bool cdx_ft_idle(void)
 	bool idle;
 
 	cdx_ft_begin();
-	idle = !ft_live && !cdx_ft_pending();
+	/* SAs and multicast groups too: an adapter that has unregistered its
+	 * egress hook retires them after it, on its way out. */
+	idle = !ft_live && !cdx_ft_pending() && !cdx_ipsec_sa_count() &&
+	       !cdx_mc_group_count();
 	cdx_ft_end();
 	return idle;
 }
