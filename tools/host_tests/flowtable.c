@@ -863,11 +863,17 @@ static int cdx_ft_recover(void)
 /* The parked rearm's retry is counted apart from the invalidation worker's,
  * so a case can say which of the two was asked to come back. */
 static unsigned rearm_retries;
+/* Which of the adapter's own work items are queued and not yet cancelled.
+ * Cases mostly run a work function by hand instead of from the queue, so this
+ * only means something across a stretch a case clears it for -- a load that
+ * fails, which must leave nothing queued against text about to go. */
+static bool work_queued_invalidate, work_queued_retire, work_queued_rearm, work_queued_dev_stats;
 static void schedule_delayed_work(int *work, unsigned delay)
 {
-    if (work == &ft_rearm_work) { assert(delay == HZ); rearm_retries++; return; }
+    if (work == &ft_rearm_work) { assert(delay == HZ); rearm_retries++; work_queued_rearm = true; return; }
     assert(work == &ft_work);
     scheduled++;
+    work_queued_invalidate = true;
 }
 static unsigned neigh_scheduled, dev_stats_scheduled, stopped_scheduled;
 static void schedule_work(int *work)
@@ -875,7 +881,8 @@ static void schedule_work(int *work)
     if (work == &ft_mr_work) { mroute_kicks++; return; }
     if (work == &ft_stopped_work) { stopped_scheduled++; return; }
     assert(work == &ft_retire_work || work == &ft_dev_stats_work);
-    if (work == &ft_dev_stats_work) dev_stats_scheduled++; else neigh_scheduled++;
+    if (work == &ft_dev_stats_work) { dev_stats_scheduled++; work_queued_dev_stats = true; }
+    else { neigh_scheduled++; work_queued_retire = true; }
 }
 /* Which devices native cleanup was asked for, in order, and how many of those
  * calls ran under RTNL -- the stopped-port sweep's are all expected to. */
@@ -925,8 +932,12 @@ static void flush_work(int *work)
     if (work == &ft_stopped_work) {
         /* Only once nothing can queue it again; and on unload, while the
          * rule callbacks the sweep's native cleanup flushes are still
-         * registered. Flushing runs whatever is still queued. */
-        assert(!swdev_obj_registered && (!ft_stopping || indirect_registered));
+         * registered. A failed load's unwind sets ft_stopping as well, but
+         * flushes only once ft_ready is clear and every bind is drained, so
+         * the cleanup reaches none of them. Flushing runs whatever is still
+         * queued. */
+        assert(!swdev_obj_registered);
+        assert(ft_ready ? indirect_registered : ft_block_list.next == &ft_block_list);
         stopped_flushes++;
         ft_stopped_workfn(NULL);
         return;
@@ -1116,12 +1127,19 @@ static void flow_block_cb_remove(struct flow_block_cb *cb, struct flow_block_off
  * it has to give it back -- otherwise the next load finds the slot occupied by
  * a module that is no longer there. */
 static int registered_setup_tc;
+/* What a consumer does the moment a route opens while the load is still
+ * running: bind, admit, and leave work queued. Run as each registration that
+ * opens one -- the indirect route, then the direct route and what follows it
+ * -- returns, so a load failing at any later stage has to unwind it. */
+static void (*route_open_hook)(void);
+static void route_opened(void) { if (route_open_hook) route_open_hook(); }
 typedef int (*cdx_ft_setup_tc_handler)(struct net_device *, enum tc_setup_type, void *);
 static int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler)
 {
     assert(handler);
     if (registered_setup_tc) return -EBUSY;
     registered_setup_tc = 1;
+    route_opened();
     return 0;
 }
 static void cdx_unregister_ft_setup_tc(void) { registered_setup_tc = 0; }
@@ -1136,6 +1154,7 @@ static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
     assert(fn);
     if (registered_qos_class) return -EBUSY;
     registered_qos_class = 1;
+    route_opened();
     return 0;
 }
 static void cdx_unregister_ft_qos_class(void) { registered_qos_class = 0; }
@@ -1257,24 +1276,41 @@ static int register_switchdev_blocking_notifier(struct notifier_block *nb)
 static void unregister_switchdev_blocking_notifier(struct notifier_block *nb)
 { assert(swdev_obj_registered); swdev_obj_registered=false; }
 static void cancel_work_sync(int *work)
-{ assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work); canceled++; }
+{
+    assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work);
+    if (work == &ft_retire_work) work_queued_retire = false;
+    if (work == &ft_dev_stats_work) work_queued_dev_stats = false;
+    canceled++;
+}
 static void cancel_delayed_work_sync(int *work)
-{ assert(work == &ft_work || work == &ft_ipsec_stats || work == &ft_rearm_work); canceled++; }
+{
+    assert(work == &ft_work || work == &ft_ipsec_stats || work == &ft_rearm_work);
+    if (work == &ft_work) work_queued_invalidate = false;
+    else if (work == &ft_rearm_work) work_queued_rearm = false;
+    canceled++;
+}
 static int register_indirect(void)
-{ assert(ft_ready); if (registration_fails()) return -ENOMEM; indirect_registered=true; return 0; }
+{
+    assert(ft_ready);
+    if (registration_fails()) return -ENOMEM;
+    indirect_registered=true;
+    route_opened();
+    return 0;
+}
 static void unregister_indirect(void (*release)(void *))
 {
     assert(indirect_registered && !cdx_info->ctrl.mutex);
-    /* Unload gives this route back last, with all five works cancelled --
-     * retirement, the delayed installer, the parked rearm's retry, the SA
-     * next-hop follower and the SA accounting pass -- and every notifier
-     * already gone. A load unwinding its own failure gives it back first
-     * and in the opposite order, with nothing yet scheduled to cancel, so
-     * the ordering below is the exit path's alone. ft_stopping tells them
-     * apart, and only exit sets it. */
-    if (ft_stopping) {
+    /* Both unwinds stop new binds first. Unload gives this route back last,
+     * with all five works cancelled -- retirement, the delayed installer, the
+     * parked rearm's retry, the SA next-hop follower and the SA accounting
+     * pass -- and every notifier already gone. A load unwinding its own
+     * failure gives it back first and cancels the works after, once nothing
+     * bound is left to queue them, with its notifiers still registered: that
+     * is what tells the two apart. */
+    assert(ft_stopping);
+    if (!netdev_registered) {
         assert(canceled == 5);
-        assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered);
+        assert(!neigh_registered && !fib_registered && !nexthop_registered);
         assert(!fdb_registered && !swdev_obj_registered);
     } else {
         assert(!canceled);
@@ -6671,15 +6707,53 @@ static void test_passive_indirect_unload(void)
     assert(!ft_passive && !ft_bound && !allocated && !in.refs && !out.refs);
 }
 
+/* A consumer binding the moment a route opens, while the load goes on: through
+ * the indirect route a passive and a real bind, a flow admitted and all three
+ * of the adapter's own work items queued; through the direct route a real
+ * bind. A load failing after that owes every one of them back. */
+static void bind_while_loading(void)
+{
+    if (!registered_setup_tc) {
+        physical_ok = false;
+        assert(bind_device(&decoy, FLOW_BLOCK_BIND) == 0 && ft_passive == 1);
+        physical_ok = true;
+        assert(bind_device(&in, FLOW_BLOCK_BIND) == 0 && ft_bound == 1);
+        cls.command = FLOW_CLS_REPLACE;
+        assert(ft_rule_callback(TC_SETUP_CLSFLOWER, &cls, bound_to(&block, &in)) == 0);
+        assert(ft_count == 1 && live_hw == 1);
+        schedule_work(&ft_retire_work);
+        schedule_delayed_work(&ft_work, 0);
+        schedule_delayed_work(&ft_rearm_work, HZ);
+    } else if (!registered_qos_class) {
+        assert(bind_device_direct(&out, FLOW_BLOCK_BIND) == 0 && ft_bound == 2);
+    }
+}
+static void unwound(void)
+{
+    assert(!work_queued_invalidate && !work_queued_retire && !work_queued_rearm);
+    assert(!work_queued_dev_stats);
+    assert(!ft_bound && !ft_parked && !ft_passive && !ft_count && !live_hw && !allocated);
+    assert(ft_bindings.next == &ft_bindings && ft_block_list.next == &ft_block_list);
+    assert(block.cb_list.next == &block.cb_list);
+    assert(table.flow_block.cb_list.next == &table.flow_block.cb_list);
+    assert(flow_block_indr_list.next == &flow_block_indr_list);
+    assert(!in.refs && !out.refs && !decoy.refs && handle.refs == 1);
+    assert(!registered_setup_tc && !registered_qos_class && !registered_egress_changed);
+}
 static void test_registration(void)
 {
+    list_init(&block.cb_list);
+    list_init(&table.flow_block.cb_list);
     for (registration_failure = 0; registration_failure <= 9; registration_failure++) {
         /* A fresh adapter instance, backed by an independently owned CDX. */
         ft_ready=ft_stopping=false; registration_step=canceled=0;
+        work_queued_invalidate = work_queued_retire = work_queued_rearm = false;
+        route_open_hook = registration_failure ? bind_while_loading : NULL;
         fixture();
         int rc=ask_flowtable_init();
         if (registration_failure) {
             assert(rc < 0 && !ft_ready && !ft_proc && !backend_claimed);
+            unwound();
         } else {
             assert(!rc && ft_ready && backend_claimed);
             assert(bind_device(&in,FLOW_BLOCK_BIND) == 0);
@@ -6698,26 +6772,39 @@ static void test_registration(void)
         assert(!in.refs && !out.refs && !cdx_info->ctrl.mutex);
     }
     registration_failure=0;
+    route_open_hook = bind_while_loading;
     for (ft_init_fail_stage=1; ft_init_fail_stage<=8; ft_init_fail_stage++) {
         ft_ready=ft_stopping=false; registration_step=canceled=0;
+        work_queued_invalidate = work_queued_retire = work_queued_rearm = false;
+        fixture();
         assert(ask_flowtable_init() == -ENOMEM);
         assert(!ft_ready && !ft_proc && !backend_claimed && !cdx_info->ctrl.mutex);
         assert(!netdev_registered && !neigh_registered && !fib_registered && !nexthop_registered && !indirect_registered);
         assert(!fdb_registered && !swdev_obj_registered);
+        unwound();
     }
     /* The two registrations CDX holds fail with -EBUSY rather than -ENOMEM,
      * and the second one failing has to give the first back: a module that
      * left the driver's ndo pointing into it would be unloadable text on the
-     * flowtable's binding path. */
+     * flowtable's binding path. Each of these fails with a route already
+     * open and bound through, and the direct binds of the last two are
+     * Netfilter's to keep unless the unwind drains them. */
     for (ft_init_fail_stage=9; ft_init_fail_stage<=11; ft_init_fail_stage++) {
         ft_ready=ft_stopping=false; registration_step=canceled=0;
+        work_queued_invalidate = work_queued_retire = work_queued_rearm = false;
+        fixture();
+        unsigned deletes = ft_deletes;
         assert(ask_flowtable_init() == -EBUSY);
-        assert(!registered_setup_tc && !registered_qos_class && !registered_egress_changed);
         assert(!ft_ready && !ft_proc && !backend_claimed && !indirect_registered);
+        /* The admitted flow's generation is retired for Linux too, as at
+         * unload, and its hardware entry went with its binding. */
+        assert(handle.invalid && ft_deletes == deletes + 1);
+        unwound();
     }
+    route_open_hook = NULL;
     ft_init_fail_stage=0;
     /* Fatal deletion on exit still waits for quiescence. Reload is refused. */
-    registration_step=canceled=0; fixture();
+    ft_ready=ft_stopping=false; registration_step=canceled=0; fixture();
     assert(ask_flowtable_init() == 0);
     assert(bind_device(&in,FLOW_BLOCK_BIND) == 0);
     struct cdx_ft_binding *b=list_entry(ft_bindings.next,struct cdx_ft_binding,list);

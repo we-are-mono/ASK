@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A240.** Teardown left Netfilter able to call freed adapter text: a passive binding's indirect callback outlived unload, and a failed load kept its direct binds and works —
+  fixed (_:/^flowtable: unwind a failed load's binds and work as unload does_).
+
 - [x] **A239.** Flowtable mode never released entries a failed multicast or IPsec barrier parked, refusing unicast offload, the parked rearm and the adapter's load —
   fixed (_:/^cdx: release parked ehash entries on any completed barrier_).
 

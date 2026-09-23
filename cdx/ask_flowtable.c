@@ -8776,6 +8776,42 @@ static const struct proc_ops ft_proc_ops = {
 	.proc_release = seq_release,
 };
 
+/* Give back the callbacks Netfilter is still holding.
+ *
+ * A bind installs a flow_block_cb into the flowtable's own block, and
+ * Netfilter keeps it until something unbinds. flow_indr_dev_unregister()
+ * unwinds the *indirect* binds for us and knows nothing about the direct
+ * ones -- which is every bind since the driver grew an ndo_setup_tc, because
+ * that is what nf_flow_table_offload_setup() prefers once it exists. Left
+ * behind, the callback still points into this module's text, and the next
+ * queued offload calls it: flow_offload_work_handler faulting on freed text
+ * with the flowtable itself perfectly healthy. Both exit and a load that
+ * fails after opening a route owe this.
+ *
+ * Any callback still on the driver list belongs to a table that is still
+ * live, because a table on its way out unbinds first. Its lock is therefore
+ * safe to take, and taking it for write is also what waits out a callback
+ * already running on nf_flow_offload_tuple()'s read side -- so no caller is
+ * inside this text by the time it goes.
+ */
+static void ft_block_drain(void)
+{
+	struct flow_block_cb *cb, *next;
+	struct nf_flowtable *table;
+
+	list_for_each_entry_safe(cb, next, &ft_block_list, driver_list) {
+		/* Passive or real alike: both carry their table. */
+		table = ((struct cdx_ft_binding *)cb->cb_priv)->table;
+		down_write(&table->flow_block_lock);
+		list_del(&cb->list);
+		up_write(&table->flow_block_lock);
+		list_del(&cb->driver_list);
+		/* Runs ft_release(), which retires this binding's entries and
+		 * drops its device reference, exactly as an unbind would. */
+		flow_block_cb_free(cb);
+	}
+}
+
 static bool ft_init_fault(unsigned int stage)
 {
 #ifdef CDX_DEBUG_FLOWTABLE
@@ -8867,15 +8903,34 @@ static int __init ask_flowtable_init(void)
 classifier:
 	cdx_unregister_ft_setup_tc();
 indirect:
+	/* A route was open, so binds may have arrived and be carrying flows,
+	 * with work queued on their behalf. Unwind them the way exit does:
+	 * stop new binds and requeueing, and exclude Linux's cached lookups,
+	 * in one transaction; give the indirect binds back, then drain the
+	 * direct ones, which Netfilter would otherwise keep pointing into
+	 * text about to go. */
+	cdx_ft_begin();
+	WRITE_ONCE(ft_stopping, true);
+	{
+		struct cdx_ft_entry *entry;
+
+		list_for_each_entry(entry, &ft_entries, list)
+			nf_flow_offload_handle_invalidate(entry->handle);
+	}
+	cdx_ft_end();
 	flow_indr_dev_unregister(ft_bind, NULL, ft_release);
+	ft_block_drain();
 not_ready:
-	/* A bind that arrived while registered may have parked and left its
-	 * rearm retrying. ft_rearm() reads ft_ready under the transaction, so
-	 * clearing it there means no pass that starts later requeues the
-	 * retry, and one that already did is cancelled below. */
+	/* ft_rearm() reads ft_ready under the transaction, so clearing it
+	 * there means no pass that starts later requeues a parked retry. With
+	 * ft_stopping set nothing requeues the other two either, and with every
+	 * binding gone nothing is left to queue them, so these cancels are
+	 * final even while the notifiers below are still registered. */
 	cdx_ft_begin();
 	WRITE_ONCE(ft_ready, false);
 	cdx_ft_end();
+	cancel_work_sync(&ft_retire_work);
+	cancel_delayed_work_sync(&ft_work);
 	cancel_delayed_work_sync(&ft_rearm_work);
 	unregister_switchdev_blocking_notifier(&ft_swdev_nb);
 	/* A port may have stopped since the chain was registered: its sweep
@@ -8929,41 +8984,6 @@ release:
 	WARN_ON_ONCE(cdx_ft_release());
 	cdx_ft_end();
 	return rc;
-}
-
-/* Give back the callbacks Netfilter is still holding.
- *
- * A bind installs a flow_block_cb into the flowtable's own block, and
- * Netfilter keeps it until something unbinds. flow_indr_dev_unregister()
- * unwinds the *indirect* binds for us and knows nothing about the direct
- * ones -- which is every bind since the driver grew an ndo_setup_tc, because
- * that is what nf_flow_table_offload_setup() prefers once it exists. Left
- * behind, the callback still points into this module's text, and the next
- * queued offload calls it: flow_offload_work_handler faulting on freed text
- * with the flowtable itself perfectly healthy.
- *
- * Any callback still on the driver list belongs to a table that is still
- * live, because a table on its way out unbinds first. Its lock is therefore
- * safe to take, and taking it for write is also what waits out a callback
- * already running on nf_flow_offload_tuple()'s read side -- so no caller is
- * inside this text by the time it goes.
- */
-static void ft_block_drain(void)
-{
-	struct flow_block_cb *cb, *next;
-	struct nf_flowtable *table;
-
-	list_for_each_entry_safe(cb, next, &ft_block_list, driver_list) {
-		/* Passive or real alike: both carry their table. */
-		table = ((struct cdx_ft_binding *)cb->cb_priv)->table;
-		down_write(&table->flow_block_lock);
-		list_del(&cb->list);
-		up_write(&table->flow_block_lock);
-		list_del(&cb->driver_list);
-		/* Runs ft_release(), which retires this binding's entries and
-		 * drops its device reference, exactly as an unbind would. */
-		flow_block_cb_free(cb);
-	}
 }
 
 static void __exit ask_flowtable_exit(void)
