@@ -4951,6 +4951,10 @@ static void ft_mc_router_changed(void)
 		schedule_work(&ft_mc_work);
 }
 
+/* Defined with the traffic half below, whose dedup slot it clears; called
+ * wherever a group comes or goes. */
+static void ft_mc_forget_seen(void);
+
 static u8 ft_mc_family(const struct ft_mc_group *g)
 {
 	return g->addr.proto == htons(ETH_P_IPV6) ? AF_INET6 : AF_INET;
@@ -5449,6 +5453,7 @@ static void ft_mc_anchor_routes(void)
 		g->dirty = true;
 		list_add(&g->list, &ft_mc_groups);
 		ft_mc_count++;
+		ft_mc_forget_seen();	/* its stream may be recorded already */
 	}
 }
 
@@ -5593,6 +5598,7 @@ static void ft_mc_group_spec(const struct ft_mc_group *g,
 static void ft_mc_retire(struct list_head *dead)
 {
 	struct ft_mc_group *g, *tmp;
+	bool retired = false;
 
 	lockdep_assert_held(&ft_mc_lock);
 	list_for_each_entry_safe(g, tmp, &ft_mc_groups, list) {
@@ -5600,7 +5606,13 @@ static void ft_mc_retire(struct list_head *dead)
 			continue;
 		list_move(&g->list, dead);
 		ft_mc_count--;
+		retired = true;
 	}
+	/* A retired group may have been the first match for a frame another
+	 * group needed -- an (S,G) membership takes its source's frames before
+	 * the (*,G) one sees them -- so that frame may be recorded again. */
+	if (retired)
+		ft_mc_forget_seen();
 }
 
 /* Tell each route whether an installed group is carrying it. Called by the
@@ -5677,6 +5689,11 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 			g->addr = *addr;
 			list_add(&g->list, &ft_mc_groups);
 			ft_mc_count++;
+			/* A frame of this group recorded before the group
+			 * existed matched nothing; it is worth recording again
+			 * now that something could match it. The MDB add is
+			 * deferred, so that order is the ordinary one. */
+			ft_mc_forget_seen();
 		}
 		g->host = true;
 		g->dirty = true;
@@ -5709,6 +5726,7 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 		g->addr = *addr;
 		list_add(&g->list, &ft_mc_groups);
 		ft_mc_count++;
+		ft_mc_forget_seen();	/* as for a host membership above */
 	}
 	for (i = 0; i < g->ports; i++) {
 		struct ft_mc_port *p = &g->port[i];
@@ -5807,11 +5825,31 @@ static struct ft_mc_seen ft_mc_ring[FT_MC_RING];
 static unsigned int ft_mc_ring_head, ft_mc_ring_tail;
 static DEFINE_SPINLOCK(ft_mc_ring_lock);
 /* The last thing recorded, so a stream at line rate does not fill the ring
- * with restatements of one fact between two runs of the worker. */
+ * with restatements of one fact between two runs of the worker.
+ *
+ * That makes it a promise as well as a filter: the same frame is not recorded
+ * again until the slot is forgotten, however long the stream runs. So the slot
+ * is forgotten (ft_mc_forget_seen()) whenever the answer the recorded frame got
+ * may have changed -- a group created that could now match it, a group retired
+ * that may have shadowed another, an ingress that went away, an entry taken
+ * out of hardware -- and at no other time: forgetting it after every drain
+ * would record every frame of a stream that never installs. */
 static struct ft_mc_seen ft_mc_last;
 static u64 ft_mc_observed, ft_mc_dropped, ft_mc_hook_errors;
 static bool ft_mc_hooked;
 static DEFINE_MUTEX(ft_mc_hook_lock);
+
+/* Let the next frame of any stream be recorded again, however it compares
+ * with the last. Called with ft_mc_lock held, after the change that makes it
+ * worth recording is visible on the list, so the worker that drains the frame
+ * matches it against the new state. */
+static void ft_mc_forget_seen(void)
+{
+	lockdep_assert_held(&ft_mc_lock);
+	spin_lock_bh(&ft_mc_ring_lock);
+	memset(&ft_mc_last, 0, sizeof(ft_mc_last));
+	spin_unlock_bh(&ft_mc_ring_lock);
+}
 
 static bool ft_mc_seen_eq(const struct ft_mc_seen *a, const struct ft_mc_seen *b)
 {
@@ -5857,13 +5895,40 @@ static u16 ft_mc_frame_vid(struct net_device *bridge, struct net_device *port,
 	return vid;
 }
 
+/* Put one observation in the ring for the worker, unless it restates the last
+ * one recorded or the ring is full. Returns whether it was recorded. Called
+ * from the hook, in softirq. */
+static bool ft_mc_record(const struct ft_mc_seen *seen)
+{
+	bool recorded = false;
+	unsigned int next;
+
+	spin_lock(&ft_mc_ring_lock);
+	if (ft_mc_seen_eq(seen, &ft_mc_last))
+		goto out;	/* recorded already, and nothing has changed since */
+	next = (ft_mc_ring_head + 1) % FT_MC_RING;
+	if (next == ft_mc_ring_tail) {
+		ft_mc_dropped++;
+		goto out;
+	}
+	ft_mc_ring[ft_mc_ring_head] = *seen;
+	ft_mc_ring_head = next;
+	ft_mc_last = *seen;
+	ft_mc_observed++;
+	recorded = true;
+	schedule_work(&ft_mc_work);
+out:
+	spin_unlock(&ft_mc_ring_lock);
+	return recorded;
+}
+
 static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 			       const struct nf_hook_state *state)
 {
 	struct net_device *port = state->in;
 	struct net_device *bridge;
 	struct ft_mc_seen seen = {};
-	unsigned int next, l3_off;
+	unsigned int l3_off;
 	__be16 proto;
 
 	/* Cheapest tests first: this sits in the bridge's receive path. A
@@ -5945,21 +6010,7 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 	ether_addr_copy(seen.src_mac, eth_hdr(skb)->h_source);
 	seen.tagged = skb_vlan_tag_present(skb);
 
-	spin_lock(&ft_mc_ring_lock);
-	if (ft_mc_seen_eq(&seen, &ft_mc_last))
-		goto out;	/* already recorded and not yet acted on */
-	next = (ft_mc_ring_head + 1) % FT_MC_RING;
-	if (next == ft_mc_ring_tail) {
-		ft_mc_dropped++;
-		goto out;
-	}
-	ft_mc_ring[ft_mc_ring_head] = seen;
-	ft_mc_ring_head = next;
-	ft_mc_last = seen;
-	ft_mc_observed++;
-	schedule_work(&ft_mc_work);
-out:
-	spin_unlock(&ft_mc_ring_lock);
+	ft_mc_record(&seen);
 	return NF_ACCEPT;	/* always: this observes, it never diverts */
 }
 
@@ -6250,13 +6301,38 @@ static bool ft_mc_key_contested(const struct ft_mc_group *g)
 	return false;
 }
 
+/* Match what the hook observed against the memberships, oldest first. Called
+ * by the worker with no lock held; each observation is taken under the ring's
+ * lock and matched under ft_mc_lock. */
+static void ft_mc_drain(void)
+{
+	struct ft_mc_seen seen;
+	struct ft_mc_group *g;
+
+	for (;;) {
+		spin_lock_bh(&ft_mc_ring_lock);
+		if (ft_mc_ring_head == ft_mc_ring_tail) {
+			spin_unlock_bh(&ft_mc_ring_lock);
+			break;
+		}
+		seen = ft_mc_ring[ft_mc_ring_tail];
+		ft_mc_ring_tail = (ft_mc_ring_tail + 1) % FT_MC_RING;
+		spin_unlock_bh(&ft_mc_ring_lock);
+
+		mutex_lock(&ft_mc_lock);
+		g = ft_mc_stopping ? NULL : ft_mc_match(&seen);
+		if (g && ft_mc_resolve(g, &seen))
+			g->dirty = true;
+		mutex_unlock(&ft_mc_lock);
+	}
+}
+
 /* The worker. Runs outside RTNL, so it may take the transaction -- and never
  * while holding ft_mc_lock, which is the ordering obligation stated above.
  */
 static void ft_mc_work_fn(struct work_struct *work)
 {
 	struct ft_mc_group *g, *tmp;
-	struct ft_mc_seen seen;
 	LIST_HEAD(dead);
 	bool want_hook, told;
 
@@ -6283,27 +6359,15 @@ static void ft_mc_work_fn(struct work_struct *work)
 		list_for_each_entry(g, &ft_mc_groups, list)
 			if (g->vlan_stale && !ft_mc_stopping)
 				ft_mc_revalidate(g);
+		/* A stream forgotten because its shape stopped resolving to
+		 * the group's VLAN may come back in exactly that shape once the
+		 * configuration returns. */
+		ft_mc_forget_seen();
 		mutex_unlock(&ft_mc_lock);
 		rtnl_unlock();
 	}
 
-	/* Drain what the hook observed. */
-	for (;;) {
-		spin_lock_bh(&ft_mc_ring_lock);
-		if (ft_mc_ring_head == ft_mc_ring_tail) {
-			spin_unlock_bh(&ft_mc_ring_lock);
-			break;
-		}
-		seen = ft_mc_ring[ft_mc_ring_tail];
-		ft_mc_ring_tail = (ft_mc_ring_tail + 1) % FT_MC_RING;
-		spin_unlock_bh(&ft_mc_ring_lock);
-
-		mutex_lock(&ft_mc_lock);
-		g = ft_mc_stopping ? NULL : ft_mc_match(&seen);
-		if (g && ft_mc_resolve(g, &seen))
-			g->dirty = true;
-		mutex_unlock(&ft_mc_lock);
-	}
+	ft_mc_drain();
 
 	/* Match the routed learner's routes against the streams just resolved,
 	 * then retire what lost its last listener. */
@@ -6337,7 +6401,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 		struct cdx_mc_group *hw = NULL, *stale = NULL;
 		struct ft_mc_route *route = NULL;
 		struct ft_mc_group *target = NULL;
-		bool replace = false;
+		bool replace = false, withdrew = false;
 		int rc = 0, gen;
 		u8 i;
 
@@ -6416,6 +6480,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 			if (hw) {
 				cdx_mc_group_del(&hw);
 				ft_mc_installed--;
+				withdrew = true;
 			}
 		} else if (replace) {
 			rc = cdx_mc_group_replace(hw, &spec);
@@ -6468,13 +6533,16 @@ static void ft_mc_work_fn(struct work_struct *work)
 			 */
 			if (++target->retries < FT_MC_MAX_RETRIES) {
 				target->dirty = true;
-				spin_lock_bh(&ft_mc_ring_lock);
-				memset(&ft_mc_last, 0, sizeof(ft_mc_last));
-				spin_unlock_bh(&ft_mc_ring_lock);
+				ft_mc_forget_seen();
 			}
 		} else if (!rc) {
 			target->retries = 0;
 		}
+		/* Out of hardware and still a membership: its frames reach the
+		 * CPU again, and one recorded while the entry carried a
+		 * different answer must be able to be recorded again. */
+		if (withdrew)
+			ft_mc_forget_seen();
 		mutex_unlock(&ft_mc_lock);
 		if (spec.listeners) {
 			dev_put(spec.in);
@@ -6655,9 +6723,9 @@ static bool ft_mc_swdev_obj(unsigned long event,
  */
 static void ft_mc_device_gone(struct net_device *dev)
 {
+	bool changed = false, lost_ingress = false;
 	struct ft_mc_route *r;
 	struct ft_mc_group *g;
-	bool changed = false;
 	unsigned int i, n;
 	u8 j;
 
@@ -6690,8 +6758,10 @@ static void ft_mc_device_gone(struct net_device *dev)
 		if (g->in == dev) {
 			/* Back to pending: the membership is still what the
 			 * bridge says, and a stream arriving on some other
-			 * port will resolve it again. */
+			 * port -- or on this one, once it is back -- resolves
+			 * it again. The same frame as before included. */
 			ft_mc_drop_stream(g);
+			lost_ingress = true;
 		}
 		if (g->has_next && g->next.in == dev)
 			ft_mc_drop_next(g);
@@ -6710,6 +6780,8 @@ static void ft_mc_device_gone(struct net_device *dev)
 		}
 		changed |= g->dirty;
 	}
+	if (lost_ingress)
+		ft_mc_forget_seen();
 	mutex_unlock(&ft_mc_lock);
 	if (changed && !READ_ONCE(ft_mc_stopping))
 		schedule_work(&ft_mc_work);

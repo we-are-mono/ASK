@@ -40,6 +40,10 @@ def test_mcast_learner(tmp_path):
         # traffic half rather than with the group it resolves against.
         + source[source.index("struct ft_mc_seen {"):
                  source.index("};", source.index("struct ft_mc_seen {")) + 3]
+        # The ring the hook records into, its dedup slot, and what forgets
+        # the slot.
+        + source[source.index("#define FT_MC_RING"):
+                 source.index("static bool ft_mc_seen_eq(")]
         # The extraction order is the file's, which is not a valid declaration
         # order on its own: ft_mc_membership calls helpers defined after it in
         # the list. Forward-declare rather than reorder, so the harness does
@@ -67,8 +71,10 @@ def test_mcast_learner(tmp_path):
             "ft_mc_drop_port",
             "ft_mc_key_contested",
             "ft_mc_seen_eq",
+            "ft_mc_record",
             "ft_mc_match",
             "ft_mc_resolve",
+            "ft_mc_drain",
             "ft_mc_adopt_next",
             "ft_mc_revalidate",
             # The two learners' shared streams: what the routed learner
@@ -304,6 +310,42 @@ def test_a_blocked_port_group_is_not_a_listener():
     body = function(SOURCE.read_text(), "ft_mc_swdev_obj")
     assert "SWITCHDEV_OBJ_MDB_F_BLOCKED" in body, (
         "the learner must honour the bridge's source filter")
+
+
+def test_the_dedup_slot_is_forgotten_whenever_an_answer_may_change():
+    """The hook records a frame once and then ignores its restatements until
+    the slot is forgotten. A frame recorded while no group matched it -- the
+    group withdrawn, or its deferred MDB add not yet arrived -- would
+    otherwise keep a group created later pending for as long as the stream
+    runs. So every event that can change the answer a recorded frame got
+    forgets the slot, after the change is on the list; and the drain does
+    not, because forgetting after every drain would record every frame of a
+    stream that never installs.
+    """
+    source = SOURCE.read_text()
+    forget = "ft_mc_forget_seen();"
+    assert function(source, "ft_mc_membership").count(forget) == 2, (
+        "a group created by a host membership or by a port")
+    assert forget in function(source, "ft_mc_anchor_routes"), (
+        "a group a route creates")
+    assert forget in function(source, "ft_mc_retire"), (
+        "an (S,G) retiring may have shadowed the (*,G) the frame now needs")
+    gone = function(source, "ft_mc_device_gone")
+    assert "lost_ingress = true;" in gone and "if (lost_ingress)" in gone
+    worker = function(source, "ft_mc_work_fn")
+    vlan = worker[worker.index("if (READ_ONCE(ft_mc_vlan_stale))"):]
+    assert forget in vlan[:vlan.index("rtnl_unlock();")]
+    # An entry taken out of hardware and kept -- only one that was in it.
+    withdraw = worker[worker.index("if (!spec.listeners) {"):]
+    withdraw = withdraw[:withdraw.index("} else if (replace)")]
+    assert withdraw.index("if (hw) {") < withdraw.index("withdrew = true;")
+    assert "if (withdrew)\n\t\t\tft_mc_forget_seen();" in worker
+    # The retry goes through the helper, which asserts the group lock.
+    assert "memset(&ft_mc_last" not in worker
+    assert "lockdep_assert_held(&ft_mc_lock)" in function(source, "ft_mc_forget_seen")
+    assert forget not in function(source, "ft_mc_drain")
+    assert "memset(&ft_mc_last" in function(source, "ft_mc_hook_sync")
+    assert "ft_mc_record(&seen);" in function(source, "ft_mc_hook")
 
 
 def test_the_learner_lets_go_of_a_device_that_went_away():

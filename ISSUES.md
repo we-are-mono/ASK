@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A263.** The multicast hook's dedup slot kept a frame recorded while no group matched, so a group created later stayed pending-source for as long as the stream ran —
+  fixed (_:/^flowtable: forget the multicast hook's last frame when its answer changes_).
+
 - [x] **A262.** Removing the multicast hook did not wait for frames inside it, which could rewrite the cleared dedup slot or queue the worker after exit cancelled it —
   fixed (_:/^flowtable: wait out the multicast hook's readers when it is removed_).
 

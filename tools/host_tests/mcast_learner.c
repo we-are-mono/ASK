@@ -216,7 +216,10 @@ static void mutex_lock(int *m) { assert(!*m); *m = 1; }
 static void mutex_unlock(int *m) { assert(*m); *m = 0; }
 #define spin_lock_bh mutex_lock
 #define spin_unlock_bh mutex_unlock
+#define spin_lock mutex_lock
+#define spin_unlock mutex_unlock
 #define DEFINE_SPINLOCK(x) int x
+#define DEFINE_MUTEX(x) int x
 static void schedule_work(int *w) { (void)w; works++; }
 
 /* Whether any byte differs from c. The learner uses it to ask whether a
@@ -281,6 +284,9 @@ static void reset(void)
                                         struct ft_mc_route, list));
     ft_mc_taps_publish(NULL, 0, false);
     BR.mrouter = BR2.mrouter = false;
+    /* A fresh learner: an empty ring and nothing recorded. */
+    memset(&ft_mc_last, 0, sizeof(ft_mc_last));
+    ft_mc_ring_head = ft_mc_ring_tail = 0;
     ft_mc_count = 0;
     membership_count = 0;
     pvid_count = 0;
@@ -1235,6 +1241,114 @@ int main(void)
         ft_mc_match_routes();
         assert(list_empty(&ft_mc_groups));
         ft_mc_route_withdraw(&r1);
+    }
+
+    /* ---- the hook's dedup slot -----------------------------------------
+     *
+     * The slot keeps a line-rate stream from filling the ring with one
+     * fact, and so it also keeps the same frame from being recorded again
+     * until something forgets it. Each case is a way the answer that frame
+     * got could change without the frame changing: a group created after
+     * it, retired under it, or robbed of its ingress. */
+    (void)ft_mc_hooked;
+    (void)ft_mc_hook_errors;
+    (void)ft_mc_hook_lock;
+    reset();
+    {
+        static const u8 group_mac[ETH_ALEN] = { 0x01, 0, 0x5e, 0x07, 0, 0x13 };
+        static const u8 sender[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x13 };
+        struct br_ip any = group_v4(0x130007ef, 0, 0);
+        struct br_ip sourced = group_v4(0x130007ef, 0x0100000a, 0);
+        struct ft_mc_seen o;
+        struct ft_mc_group *g;
+        LIST_HEAD(dead);
+
+#define RETIRE() do { \
+        ft_mc_retire(&dead); \
+        while (!list_empty(&dead)) { \
+            struct ft_mc_group *d = list_entry(dead.next, struct ft_mc_group, list); \
+            list_del(&d->list); \
+            ft_mc_group_free(d); \
+        } \
+    } while (0)
+#define FRESH() do { reset(); by_index[0] = &P1; } while (0)
+
+        by_index[0] = &P1;
+        memset(&o, 0, sizeof(o));
+        o.bridge_ifindex = BR.ifindex;
+        o.in_ifindex = P1.ifindex;
+        o.addr = any;
+        o.src.ip = 0x0100000a;
+        memcpy(o.dst_mac, group_mac, ETH_ALEN);
+        memcpy(o.src_mac, sender, ETH_ALEN);
+
+        /* Resolve, leave, retire, then the set-top box joins again: the
+         * new group must learn the same stream from the same frame. */
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(ft_mc_find(&BR, &any)->in == &P1);
+        assert(!ft_mc_record(&o));      /* nothing has changed */
+        assert(!ft_mc_membership(&BR, &P2, &any, false, false));
+        RETIRE();
+        assert(ft_mc_record(&o));       /* and nothing matches it */
+        ft_mc_drain();
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        g = ft_mc_find(&BR, &any);
+        assert(g && g->in == &P1);
+        FRESH();
+
+        /* The frame first, the membership after: the MDB add is deferred,
+         * so this is the ordinary order, and the one a host membership
+         * creating the group takes too. */
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(!ft_mc_record(&o));
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(ft_mc_find(&BR, &any)->in == &P1);
+        FRESH();
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(!ft_mc_membership(&BR, &BR, &any, true, true));
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(ft_mc_find(&BR, &any)->in == &P1);
+        FRESH();
+
+        /* The ingress goes and comes back: the group waits for its
+         * stream, and the stream is the same frame as before. */
+        assert(ft_mc_membership(&BR, &P2, &any, true, false));
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        g = ft_mc_find(&BR, &any);
+        assert(g->in == &P1);
+        ft_mc_device_gone(&P1);
+        assert(!g->in);
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(g->in == &P1);
+        FRESH();
+
+        /* Shadowing. The (S,G) membership takes its source's frame before
+         * the (*,G) one sees it; once the (S,G) one retires, the (*,G) one
+         * has to be able to see the same frame. */
+        assert(ft_mc_membership(&BR, &P3, &any, true, false));
+        assert(ft_mc_membership(&BR, &P2, &sourced, true, false));
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(ft_mc_find(&BR, &sourced)->in == &P1);
+        assert(!ft_mc_find(&BR, &any)->in);
+        assert(!ft_mc_membership(&BR, &P2, &sourced, false, false));
+        RETIRE();
+        assert(ft_mc_record(&o));
+        ft_mc_drain();
+        assert(ft_mc_find(&BR, &any)->in == &P1);
+#undef RETIRE
+#undef FRESH
     }
 
     /* ---- a port's egress queues change ---------------------------------
