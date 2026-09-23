@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A241.** A failed ehash barrier leaked the cumulative node its delete or rebuilding add displaced, one per failure (A98's accepted residue) —
+  fixed (_:/^sdk_fman: park the cumulative nodes a failed ehash barrier displaces_).
+
 - [x] **A240.** Teardown left Netfilter able to call freed adapter text: a passive binding's indirect callback outlived unload, and a failed load kept its direct binds and works —
   fixed (_:/^flowtable: unwind a failed load's binds and work as unload does_).
 

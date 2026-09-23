@@ -1,4 +1,4 @@
-From a07b95ead4f463ca8b5ab98c6165c27dcdcd832c Mon Sep 17 00:00:00 2001
+From 74576e3fa661231fed6c4dd0ccc2f3b742212607 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -102,7 +102,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.c       | 1020 ++-----
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc.h       |   26 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h   | 1374 ++++++++++
- .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1211 +++++++++
+ .../sdk_fman/Peripherals/FM/Pcd/fm_ehash.c    | 1297 +++++++++
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.c       |  251 +-
  .../sdk_fman/Peripherals/FM/Pcd/fm_kg.h       |    1 -
  .../sdk_fman/Peripherals/FM/Pcd/fm_manip.c    | 1439 +---------
@@ -123,7 +123,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  .../Peripherals/FM/inc/fm_sp_common.h         |    2 +-
  .../ethernet/freescale/sdk_fman/etc/memcpy.c  |  301 +--
  .../sdk_fman/inc/Peripherals/fm_eh_types.h    |   52 +
- .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1477 ++++++++++
+ .../sdk_fman/inc/Peripherals/fm_ehash.h       | 1481 ++++++++++
  .../sdk_fman/inc/Peripherals/fm_ext.h         |   15 +
  .../sdk_fman/inc/Peripherals/fm_mac_ext.h     |    1 +
  .../sdk_fman/inc/Peripherals/fm_muram_ext.h   |    1 +
@@ -163,7 +163,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
  net/core/skbuff.c                             |   35 +-
- 81 files changed, 9204 insertions(+), 5157 deletions(-)
+ 81 files changed, 9294 insertions(+), 5157 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -5262,10 +5262,10 @@ index 000000000000..d4b8f6671a83
 +
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
 new file mode 100644
-index 000000000000..ab643e703257
+index 000000000000..bf2c14247fa2
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
-@@ -0,0 +1,1211 @@
+@@ -0,0 +1,1297 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Copyright 2018 NXP
@@ -5281,6 +5281,7 @@ index 000000000000..ab643e703257
 +#include <linux/module.h>
 +#include <linux/kernel.h>
 +#include <linux/slab.h>
++#include <linux/spinlock.h>
 +#include "fm_common.h"
 +#include "fm_muram_ext.h"
 +#include "fm_ehash.h"
@@ -5473,6 +5474,80 @@ index 000000000000..ab643e703257
 +	XX_FreeSmart(entry);
 +}
 +
++/* Cumulative nodes an add or a delete took out of a bucket's chain when the
++ * sync that would prove the microcode had left them failed. Such a node can
++ * be neither freed -- a walker that entered before the splice may still be
++ * reading it -- nor spliced out again, so it is parked here and released by
++ * the next sync on the PCD that completes, the same way callers park the
++ * table entry a failed delete hands back to them.
++ *
++ * Linked through next_entry, which only software reads: the microcode follows
++ * cumulative_entry.next_entry_addr, and nothing in software reaches a node
++ * once it is out of its chain. Parking therefore allocates nothing on a path
++ * that has just failed.
++ *
++ * One sync proves every unlink before it only because every table lives on
++ * one PCD, as on LS1046A. A node from a second PCD would need a list of its
++ * own; none is expected, so one is refused loudly and leaked rather than
++ * freed on the strength of a barrier that proves nothing about it.
++ */
++static DEFINE_SPINLOCK(ehash_parked_lock);
++static struct en_cumulative_tbl_entry *ehash_parked;
++static void *ehash_parked_pcd;
++
++static void ehash_park_node(struct en_exthash_info *info,
++			    struct en_cumulative_tbl_entry *node)
++{
++	unsigned long flags;
++
++	if (!node)
++		return;
++	spin_lock_irqsave(&ehash_parked_lock, flags);
++	if (ehash_parked && ehash_parked_pcd != info->pcd) {
++		spin_unlock_irqrestore(&ehash_parked_lock, flags);
++		WARN_ONCE(1, "fm_ehash: a second PCD's node cannot share the parked list, leaking %p\n",
++			  node);
++		return;
++	}
++	ehash_parked_pcd = info->pcd;
++	node->next_entry = ehash_parked;
++	ehash_parked = node;
++	spin_unlock_irqrestore(&ehash_parked_lock, flags);
++}
++
++/* A sync on this table's PCD. What was parked before it is issued is freed
++ * if it completes and parked again if it does not; a node parked while it
++ * runs was unlinked too late to be proven by it, and waits for the next.
++ * delete_barrier routes the sync through the DeleteKey fault knob. */
++static int ehash_barrier(struct en_exthash_info *info, bool delete_barrier)
++{
++	struct en_cumulative_tbl_entry *parked = NULL, *node;
++	unsigned long flags;
++	int rc;
++
++	spin_lock_irqsave(&ehash_parked_lock, flags);
++	if (ehash_parked_pcd == info->pcd) {
++		parked = ehash_parked;
++		ehash_parked = NULL;
++	}
++	spin_unlock_irqrestore(&ehash_parked_lock, flags);
++	rc = delete_barrier ? ehash_delete_hcsync(info) : FmPcdHcSync(info->pcd);
++	if (!rc) {
++		while (parked) {
++			node = parked;
++			parked = node->next_entry;
++			ExternalHashTableCumulativeEntryFree(node);
++		}
++		return 0;
++	}
++	while (parked) {
++		node = parked;
++		parked = node->next_entry;
++		ehash_park_node(info, node);
++	}
++	return rc;
++}
++
 +
 +
 +#define MAX_HIST_SIZE	15
@@ -5635,18 +5710,19 @@ index 000000000000..ab643e703257
 +				cumulative_entry->flags = flags;
 +				info = (struct en_exthash_info *)h_HashTbl;
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+				if (FmPcdHcSync(info->pcd)) {
++				if (ehash_barrier(info, false)) {
 +					/* The replacement cumulative node - with the
 +					 * caller's entry inside it - is already
 +					 * published, so the add stands regardless of
 +					 * the barrier: report success (the bucket
 +					 * index), or the caller would free an entry
 +					 * the ucode can reach. Only the REPLACED
-+					 * node's free needed the barrier; without one
-+					 * it must leak, the same discipline as the
-+					 * DeleteKey sync-failure arms. */
-+					printk("%s::FmPcdHcSync failed; add stands, leaking the replaced cumulative node\n",
++					 * node's free needed the barrier; it waits
++					 * for the next one, the same discipline as
++					 * the DeleteKey sync-failure arms. */
++					printk("%s::FmPcdHcSync failed; add stands, the replaced cumulative node is parked\n",
 +					       __func__);
++					ehash_park_node(info, cumulative_tbl_entry);
 +					return retval;
 +				}
 +				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
@@ -6035,13 +6111,13 @@ index 000000000000..ab643e703257
 +{
 +	struct en_exthash_info *info;
 +	info = (struct en_exthash_info *)h_HashTbl;
-+	if (FmPcdHcSync(info->pcd)) {
++	if (ehash_barrier(info, false)) {
 +		printk("%s::FmPcdHcSync failed\n", __func__);
 +		return -1;
 +	}
 +	return 0;
 +}
-+EXPORT_SYMBOL(ExternalHashTableFmPcdHcSync); 
++EXPORT_SYMBOL(ExternalHashTableFmPcdHcSync);
 +
 +int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index, void *tbl_entry)
 +{
@@ -6070,7 +6146,7 @@ index 000000000000..ab643e703257
 +		FM_EHASH_PRINT("%s(%d)\n",__func__,__LINE__);
 +		bucket->h = 0;
 +		XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+		if (ehash_delete_hcsync(info)) {
++		if (ehash_barrier(info, true)) {
 +			printk("%s::FmPcdHcSync failed\n", __func__);
 +			return EN_EHASH_DELETE_UNSYNCED;
 +		}
@@ -6185,8 +6261,12 @@ index 000000000000..ab643e703257
 +					bucket->h = phyaddr;
 +				}
 +				XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+				if (ehash_delete_hcsync(info)) {
++				if (ehash_barrier(info, true)) {
++					/* The replaced node is out of the chain
++					 * just as the caller's entry is, and waits
++					 * for the next barrier the same way. */
 +					printk("%s::FmPcdHcSync failed\n", __func__);
++					ehash_park_node(info, cumulative_tbl_entry);
 +					return EN_EHASH_DELETE_UNSYNCED;
 +				}
 +				ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
@@ -6239,8 +6319,12 @@ index 000000000000..ab643e703257
 +							XX_PhysToVirt(SwapUint64(phyaddr)));
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+					if (ehash_delete_hcsync(info)) {
++					if (ehash_barrier(info, true)) {
++						/* Both nodes left the chain when the
++						 * bucket took the last entry directly. */
 +						printk("%s::FmPcdHcSync failed\n", __func__);
++						ehash_park_node(info, tmp_tbl_entry);
++						ehash_park_node(info, cumulative_tbl_entry);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}
 +					if (tmp_tbl_entry)
@@ -6257,8 +6341,9 @@ index 000000000000..ab643e703257
 +						phyaddr = SwapUint64(XX_VirtToPhys(cumulative_tbl_entry->next_entry));
 +						bucket->h = phyaddr;
 +						XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+						if (ehash_delete_hcsync(info)) {
++						if (ehash_barrier(info, true)) {
 +							printk("%s::FmPcdHcSync failed\n", __func__);
++							ehash_park_node(info, cumulative_tbl_entry);
 +							return EN_EHASH_DELETE_UNSYNCED;
 +						}
 +						ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
@@ -6296,8 +6381,9 @@ index 000000000000..ab643e703257
 +						cumulative_tbl_entry->prev_entry->cumulative_entry.next_entry_addr = 0;
 +					}
 +					XX_UnlockIntrSpinlock(h_Spinlock, intFlags);
-+					if (ehash_delete_hcsync(info)) {
++					if (ehash_barrier(info, true)) {
 +						printk("%s::FmPcdHcSync failed\n", __func__);
++						ehash_park_node(info, cumulative_tbl_entry);
 +						return EN_EHASH_DELETE_UNSYNCED;
 +					}
 +					ExternalHashTableCumulativeEntryFree(cumulative_tbl_entry);
@@ -11818,10 +11904,10 @@ index 000000000000..6f4002588234
 +#endif
 diff --git a/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
 new file mode 100644
-index 000000000000..31ca9978b13e
+index 000000000000..b37754e6c6b3
 --- /dev/null
 +++ b/drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_ehash.h
-@@ -0,0 +1,1477 @@
+@@ -0,0 +1,1481 @@
 +/*
 + *  Copyright (c) 2011, 2014 Freescale Semiconductor, Inc.
 + *
@@ -13277,7 +13363,8 @@ index 000000000000..31ca9978b13e
 + * means the entry IS linked into the table and owned by it -- including
 + * when a post-publish host-command sync failed (the add stands; only
 + * the internally replaced cumulative node needed that barrier, and it
-+ * is leaked and logged inside). -1 means the entry was NEVER linked
++ * is parked inside until a later sync on the PCD completes). -1 means
++ * the entry was NEVER linked
 + * (duplicate key, allocation failure): the caller keeps ownership and
 + * may free it. Freeing on any >= 0 return hands the ucode freed
 + * memory. */
@@ -13293,7 +13380,10 @@ index 000000000000..31ca9978b13e
 + * unlink surgery completed but the sync failed (transient HC-channel
 + * exhaustion): the entry is out of the software chain but a walker
 + * that entered before the unlink is not proven gone, so the caller
-+ * must defer the free until a later sync on the same PCD succeeds. */
++ * must defer the free until a later sync on the same PCD succeeds.
++ * Any cumulative node the unlink displaced is parked inside the same
++ * way, and freed by the first later sync through this API -- a delete,
++ * an add or ExternalHashTableFmPcdHcSync() -- that completes. */
 +#define EN_EHASH_DELETE_UNSYNCED	(-2)
 +extern int ExternalHashTableDeleteKey(void *h_HashTbl, uint16_t index,
 +				void *tbl_entry);

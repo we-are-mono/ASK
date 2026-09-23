@@ -377,6 +377,9 @@ themselves: a claim once per attempt, admission at most once a second, the
 unload loop and invalidation worker on each pass, and a parked binding every
 second. A parked backlog therefore no longer waits for an unrelated delete of
 the same kind. A key that may still be linked is never released by a barrier.
+Inside the table API the same rule covers the cumulative nodes of a colliding
+bucket. A node that a delete or an add displaced while its sync failed is
+parked there, and the first later sync on the PCD that completes frees it.
 
 Terminal recovery stops the datapath; completion does not establish usable
 software fallback. A provider `NETDEV_PRE_UP` guard prevents physical ports
