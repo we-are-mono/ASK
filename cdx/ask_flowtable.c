@@ -3960,7 +3960,8 @@ static void ft_wifi_address_changed(struct net_device *dev);
 
 /* Defined with the multicast learners below, because they belong with that
  * state rather than with the chains they are reached from. */
-static void ft_mc_device_gone(struct net_device *dev);
+static void ft_mc_device_gone(struct net_device *dev, bool unregistering);
+static void ft_mc_port_moved(struct net_device *dev);
 static void ft_mr_device_gone(struct net_device *dev);
 static void ft_mc_kick_all(void);
 static void ft_mr_kick(void);
@@ -4025,12 +4026,11 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		/* Native DOWN also flushes flowtable work. Admission rechecks
 		 * both ports under RTNL; UP never clears failure state. */
 		ft_device_retire(dev, &ft_link_invalidations);
-		/* A group's ports are not flowtable entries and no admission
-		 * recheck reaches them, so they need telling separately. An
-		 * ingress that went down is the sharper case: the bridge never
-		 * reports it, so without this the group would keep an entry
-		 * keyed on a port carrying nothing. */
-		ft_mc_device_gone(dev);
+		/* A multicast flow's ports are not flowtable entries and no
+		 * admission recheck reaches them, so they need telling
+		 * separately: every flow naming the device is asked of the
+		 * bridge again, and its memberships stand. */
+		ft_mc_device_gone(dev, false);
 		/* And a routed group's, which ipmr reports only when the VIF
 		 * itself is removed -- a link going down leaves the VIF in
 		 * place and the entry keyed on a port carrying nothing. */
@@ -4074,7 +4074,7 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		 * otherwise hold the unregistration open forever. Both
 		 * learners: a routed group pins its ingress port and every
 		 * listener exactly as a bridged one does. */
-		ft_mc_device_gone(dev);
+		ft_mc_device_gone(dev, true);
 		ft_mr_device_gone(dev);
 		/* Same shape for a VAP: the watch stops naming the device here
 		 * so nothing can follow the pointer, and the worker releases
@@ -4100,6 +4100,10 @@ static int ft_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		}
 		fallthrough;
 	case NETDEV_CHANGEUPPER:
+		/* A port joining or leaving a bridge, which no switchdev event
+		 * reports for a multicast flow's ingress. */
+		if (event == NETDEV_CHANGEUPPER)
+			ft_mc_port_moved(dev);
 		/* A device paths only cross gaining or losing an upper changes
 		 * those paths and nothing any flow names; retire them the same
 		 * way. Anywhere else an upper change may change what a port or
@@ -4375,8 +4379,7 @@ static int ft_fdb_event(struct notifier_block *nb, unsigned long event, void *pt
  * with that state rather than with this chain's other cases. */
 static bool ft_mc_swdev_obj(unsigned long event,
 			    struct switchdev_notifier_port_obj_info *obj);
-static void ft_mc_vlan_changed(struct net_device *dev);
-static void ft_mc_router_changed(void);
+static void ft_mc_bridge_changed(struct net_device *dev);
 
 /* Whether a port attribute takes a bridge port, one MSTI of it, or one VLAN
  * of it or of the bridge's own entry, out of FORWARDING -- or may take any
@@ -4435,13 +4438,6 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 			return NOTIFY_DONE;
 		switch (attr->attr->id) {
 		case SWITCHDEV_ATTR_ID_BRIDGE_MROUTER:
-			/* The bridge became, or stopped being, a multicast
-			 * router, which decides whether it hands its groups to
-			 * the host -- and so whether a bridged group needs the
-			 * route that forwards it there. */
-			if (dev && net_eq(dev_net(dev), &init_net))
-				ft_mc_router_changed();
-			return NOTIFY_DONE;
 		case SWITCHDEV_ATTR_ID_PORT_MROUTER:
 		case SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED:
 		case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
@@ -4450,11 +4446,17 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 		case SWITCHDEV_ATTR_ID_PORT_VLAN_STATE:
 		case SWITCHDEV_ATTR_ID_BRIDGE_MST:
 		case SWITCHDEV_ATTR_ID_VLAN_MSTI:
-			/* Observe only: these events can change a bridge oif's
-			 * copy set without changing any MFC entry. The kernel
-			 * snapshot, not the event's coarse boolean, is authority. */
-			if (dev && net_eq(dev_net(dev), &init_net))
+			/* Observe only: each of these can change where the
+			 * bridge forwards a stream, and whether it hands one to
+			 * the host, without changing any MFC entry or MDB
+			 * membership -- a bridge oif's copy set for the routed
+			 * learner, a flow's ports and host delivery for the
+			 * bridged one. The kernel snapshot, not the event's
+			 * coarse boolean, is authority for both. */
+			if (dev && net_eq(dev_net(dev), &init_net)) {
 				ft_mr_kick();
+				ft_mc_bridge_changed(dev);
+			}
 			/* A port STP takes out of FORWARDING carries nothing in
 			 * the bridge from here on, while its hardware entries
 			 * would forward on in both directions under the shared
@@ -4489,10 +4491,10 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 	 * a change to any of them makes its recorded set describe something
 	 * the bridge no longer does. It is re-derived rather than retired; the
 	 * worker decides whether the group survives the new configuration.
-	 * A bridged group holds the same three decisions for its listeners and
-	 * its ingress, and is re-derived the same way. */
+	 * A bridged flow holds the same three decisions for its copies and its
+	 * ingress, and is asked of the bridge again the same way. */
 	ft_mr_kick();
-	ft_mc_vlan_changed(dev);
+	ft_mc_bridge_changed(dev);
 	spin_lock_bh(&ft_watch_lock);
 	/* Latch before releasing the watch lock, exactly as the netdev
 	 * upper-device event does: a concurrent last unbind and fresh bind must
@@ -4596,7 +4598,7 @@ static const struct cdx_ft_egress_ops ft_egress_ops = {
  * for both, so neither learner can take a key from the other. Each refuses
  * only its own collisions: two MFC entries arriving on one port with different
  * tags, whose one root could validate only one stack (ft_mr_key_taken()), and
- * two memberships whose streams resolve to one key (ft_mc_key_contested()).
+ * two bridged flows that are one key on two VLANs (ft_mc_key_contested()).
  *
  * What the two can share is a stream. An IPTV VLAN bridged to a set-top box
  * and routed to the rest of the house arrives on a bridge port; the bridge
@@ -4606,17 +4608,17 @@ static const struct cdx_ft_egress_ops ft_egress_ops = {
  * learners' copies: the bridge's with the sender's Ethernet pair and hop
  * count, ipmr's with the egress port's address and one hop fewer.
  *
- * The bridged learner owns that group, because only its traffic hook knows the
- * port, the pair and the tag the stream arrives with. An MFC entry whose
- * parent VIF is a bridge, or an 802.1Q device above one, installs nothing of
- * its own: the routed learner publishes its copies as an ft_mc_route and reads
- * back whether a bridged group carries them and what it counted. Each learner
- * keeps its own listeners -- a membership's ports come and go with the MDB, a
- * route's copies with the MFC -- and the group is replaced in place when either
- * set changes and retired only when both are empty.
+ * The bridged learner owns that group, as one of its flows, because only its
+ * traffic hook knows the port, the pair and the tag the stream arrives with.
+ * An MFC entry whose parent VIF is a bridge, or an 802.1Q device above one,
+ * installs nothing of its own: the routed learner publishes its copies as an
+ * ft_mc_route and reads back whether a bridged flow carries them and what it
+ * counted. Each learner keeps its own copies -- the bridge's come and go with
+ * its answer, a route's with the MFC -- and the group is replaced in place
+ * when either set changes and retired only when neither learner names it.
  *
  * The bridge handing a stream to the host is also what makes the host's copy
- * something the hardware has to account for. A group the bridge delivers to a
+ * something the hardware has to account for. A flow the bridge delivers to a
  * VIF is carried only together with the route that forwards it. Without one --
  * no MFC entry yet, which is how a routing daemon learns a source, or one the
  * routed learner refuses -- it stays in software, where ipmr sees it. So the
@@ -4685,20 +4687,33 @@ struct ft_mc_tap {
  * exact (S,G) on an exact ingress port, and an IGMPv2 join produces a (*,G)
  * with neither a source nor any notion of where the traffic comes from. Both
  * are properties of the traffic rather than of the membership, so both are
- * learned from the stream -- see docs/flowtable/multicast.md. This half is the
- * membership; it records what the bridge says and installs nothing.
+ * learned from the stream -- see docs/flowtable/multicast.md.
+ *
+ * So there are two kinds of object. A membership (struct ft_mc_group) records
+ * what the bridge says -- a port group or a host membership -- and installs
+ * nothing: it is what makes a group's traffic worth learning. A flow (struct
+ * ft_mc_flow) is what the hardware carries: one source's frames of a group as
+ * they arrive on one bridge port, keyed the way the classifier is. Where a
+ * flow's frames go is not read off the memberships either. The bridge decides
+ * that per frame -- an (S,G) entry before the (*,G) one under IGMPv3 and
+ * MLDv2, INCLUDE port groups the (*,G) lookup skips, ports that block the
+ * source, multicast router ports, the ingress never -- and a switchdev object
+ * carries none of it. The worker asks the bridge instead, through
+ * br_multicast_list_ports() with the flow's ingress, and a membership changing
+ * only tells it which flows to ask about again.
  *
  * Locking, which is not incidental here. The switchdev handler runs holding
  * RTNL (switchdev_port_obj_add_deferred() asserts it), and a backend operation
  * needs the transaction, and cdx_ctrl_lock_with_rtnl() states the rule those
  * two live under: never wait for either lock while holding the other. So the
- * handler only ever takes ft_mc_lock, and a work item does the hardware
- * outside RTNL.
+ * handler only ever takes ft_mc_lock and marks, and a work item asks the
+ * bridge -- under RTNL, then ft_mc_lock, the handler's own order -- and then
+ * does the hardware with neither held.
  *
  * That leaves one ordering obligation, which every function below keeps:
- * **ft_mc_lock is never held across cdx_ft_begin()**. /proc reads the group
- * list from inside the transaction, so a worker that took the transaction
- * while holding ft_mc_lock would close a cycle with it. The worker therefore
+ * **ft_mc_lock is never held across cdx_ft_begin()**. /proc reads the lists
+ * from inside the transaction, so a worker that took the transaction while
+ * holding ft_mc_lock would close a cycle with it. The worker therefore
  * snapshots under the lock, releases it, does the hardware, and re-takes it to
  * record what happened.
  */
@@ -4735,169 +4750,158 @@ static u32 ft_mc_link_mtu(const struct net_device *dev, u8 family)
 	return mtu;
 }
 
-/* How many memberships one group keeps a record of.
+/* How many ports one membership keeps a record of: more than a board has.
  *
- * One more than the hardware can replicate to, because a member the hardware
- * *cannot* carry still has to be recorded: it is what makes the group
- * ineligible, and forgetting it is how a group comes to be installed for a
- * subset of the ports the bridge delivers to. The extra slot is what lets the
- * ninth join be recorded as the thing that refuses the group rather than
- * disappearing. A tenth distinct port in one MDB port group is unreachable on
- * a board with five, and fails closed; see `overflow`.
+ * A membership's ports say only that it stands -- which ports a flow's frames
+ * go to is the bridge's answer, not this list -- so a join past the last slot
+ * is simply not recorded. The cost is bounded and safe: the membership may
+ * retire while that port still holds it, which takes its flows back to the
+ * bridge in software rather than carrying them for a set missing somebody.
  */
 #define FT_MC_MAX_MEMBERS	(CDX_MC_MAX_LISTENERS + 1)
 
-/* One member: a bridge port this group is delivered to, and the tags a copy
- * leaves it with.
- *
- * The tags are not the port's own -- a physical port in this ownership mode
- * has no VLAN interface and would describe none. They are what the bridge
- * would have added on egress for this group's VLAN, which is a tag when the
- * port is a tagged member of it and nothing when it is untagged.
- */
-struct ft_mc_port {
-	struct net_device *dev;
-	struct cdx_ft_vlan vlan[CDX_FT_VLAN_MAX];
-	u8 vlans;
-	/* The bridge delivers this group here and the hardware cannot: the
-	 * port is not a CDX port at all -- a Wi-Fi VAP on br-lan is the
-	 * shipping example -- or its egress framing is one no rule can
-	 * describe. The member is recorded anyway, because a group that
-	 * installed without it would take the frame away from the bridge and
-	 * this listener would simply stop receiving, with nothing anywhere to
-	 * say why. That is the partial replication the contract refuses, and
-	 * refusing it means knowing the member is there. */
-	bool uncarried;
-	/* The port left the group's VLAN after it joined, so the bridge no
-	 * longer delivers to it and neither may the hardware. Kept rather than
-	 * dropped, because the membership still stands and the port rejoining
-	 * the VLAN makes it a listener again with no MDB event to say so. */
-	bool absent;
-};
-
-/* One stream of a group, as the traffic half observed it: the port it
- * arrives on, its source, its frames' Ethernet pair, and whether they carry
- * the group's VLAN as a tag. Everything a bridged group's hardware key and
- * ingress validation are made of. */
+/* The shape a flow's frames arrive in: their own Ethernet pair, and whether
+ * they carry the group's VLAN as a tag. The rest of a bridged entry's key --
+ * the port, the source and the group -- is the flow's identity; this is what
+ * can change under it. */
 struct ft_mc_stream {
-	struct net_device *in;
-	union nf_inet_addr src;
 	u8 dst_mac[ETH_ALEN];
 	u8 src_mac[ETH_ALEN];
 	bool tagged;
 };
 
-/* A group the bridge has told us about.
+/* A membership the bridge has told us about.
  *
  * Keyed on (bridge, br_ip), which is what the MDB itself is keyed on: the
  * group address, the VLAN, the address family, and -- for a source-specific
- * membership -- the source. Two bridges carrying the same group are two
- * groups here, because they resolve to different ports.
+ * membership -- the source. It installs nothing. It says which flows are
+ * worth learning and keeping, and a change to it says which flows to ask the
+ * bridge about again.
  */
 struct ft_mc_group {
 	struct list_head list;
 	struct net_device *bridge;
 	struct br_ip addr;
-	struct ft_mc_port port[FT_MC_MAX_MEMBERS];
+	/* The ports holding the membership, each pinned. */
+	struct net_device *port[FT_MC_MAX_MEMBERS];
 	u8 ports;
-	/* A join arrived with no slot left to record it in, so this group has
-	 * a member it cannot name. Sticky until the group empties, because
-	 * there is no way to tell a later leave apart from that member's:
-	 * conservative, and it fails towards software rather than towards
-	 * replicating to a set that is missing somebody. */
-	bool overflow;
-	/* The bridge itself has joined, so the host needs a copy. A hardware
-	 * entry replicates to ports and the frame never reaches the CPU, so
-	 * such a group is refused rather than carried: the alternative is
-	 * starving a local listener silently. */
+	/* The bridge itself has joined. The flows this membership names hear
+	 * the same from the bridge's answer, and are refused rather than
+	 * carried: a hardware entry replicates to ports and the frame never
+	 * reaches the CPU, which would starve a local listener silently. Kept
+	 * here because it keeps the membership: br_multicast_host_join() emits
+	 * it before any port group. */
 	bool host;
-	/* The membership changed and the worker has not caught up. */
-	bool dirty;
-	/* Supplied by the traffic half: the source and the port its frames
-	 * arrive on. Until both are known the group is a permission rather
-	 * than something installable.
-	 *
-	 * One pair, and the contract says a group with several simultaneous
-	 * sources wants an entry each. Widening this to a set belongs with the
-	 * traffic learner that would populate it, not here -- an IPTV channel
-	 * has one source, and a structure for a shape nobody has produced yet
-	 * would be guessing at its own requirements.
-	 */
+};
+
+/* A flow: one source's frames of a group as they arrive on one bridge port,
+ * which is exactly what one classifier entry matches, and so what the
+ * hardware carries. Learned from traffic -- see the traffic half below -- and
+ * kept while a membership or a route names it.
+ *
+ * `addr` is the group, its VLAN and family, and the source; `in` the port.
+ * Two sources of a group are two flows, and so is one source arriving on two
+ * ports: the bridge forwards each frame on its own, and so does each entry.
+ */
+struct ft_mc_flow {
+	struct list_head list;
+	struct net_device *bridge;
+	struct br_ip addr;
 	struct net_device *in;
-	union nf_inet_addr src;
-	/* The rest of what the traffic half learned, and the rest of the key:
-	 * the frames' own Ethernet pair, which a bridged group is keyed on and
-	 * rebuilt with, and whether they carry the group's VLAN as a tag or
-	 * arrive untagged on the port's PVID, which is what the root accepts. */
+	/* The frames' own Ethernet pair, which a bridged entry is keyed on and
+	 * every bridged copy is rebuilt with, and whether they carry the
+	 * group's VLAN as a tag or arrive untagged on the port's PVID, which
+	 * is the one shape the root accepts. */
 	u8 dst_mac[ETH_ALEN];
 	u8 src_mac[ETH_ALEN];
 	bool in_tagged;
 	struct cdx_mc_group *hw;
-	/* Another stream of this group reached the CPU while an entry was
-	 * installed -- the only way one can, because the entry's own frames
-	 * never do: a sender whose MAC changed, a source that moved, the same
-	 * stream on another port. It takes over the key once the installed
-	 * one has gone idle, and not while that one is still carrying traffic,
-	 * so two live senders do not trade one entry back and forth. `next.in`
-	 * holds a reference of its own. */
+	/* The flow in another shape reached the CPU while an entry was
+	 * installed -- the only way it can, because the entry's own frames
+	 * never do: a sender whose MAC changed, a tag the port now carries. It
+	 * takes over the key once the installed one has gone idle, and not
+	 * while that one is still carrying traffic, so two live senders do not
+	 * trade one entry back and forth. */
 	struct ft_mc_stream next;
 	bool has_next;
 	/* What the classifier had counted at the last refresh, and whether it
-	 * has counted nothing since. An idle installed group reopens the
-	 * traffic hook, which is how `next` is ever seen. */
+	 * has counted nothing since. An idle entry is how `next` takes over. */
 	u64 hw_packets;
 	u64 hw_bytes;
 	bool idle;
-	/* The bridge's VLAN configuration changed and the worker has not
-	 * re-derived this group's tags and ingress against it yet. */
-	bool vlan_stale;
-	/* The routed half of this group's stream; see the section on the
-	 * learners' streams above.
-	 *
-	 * `route` is the route whose source is this group's stream, matched by
-	 * the worker and never owned: the routed learner withdraws a route
-	 * before freeing it, which clears every pointer to it here.
-	 * `carried_route` is the one the installed entry was built with, and
-	 * is what tells the routed learner its copies are in hardware.
-	 * `routed_host` says the bridge hands this group to a VIF, so the host
-	 * routes it and it is carried only together with its route. `routes`
-	 * counts the routes that name this group whatever their source: a
-	 * group is kept while one does, even with no member port left. */
+	/* When the entry last counted a frame, or was added, and how long it
+	 * may then count nothing before the stream is taken to have stopped:
+	 * the bridge's group membership interval for the flow's VLAN, read at
+	 * each derivation, so the entry ages on the clock the bridge ages its
+	 * memberships by. Zero never ages. */
+	unsigned long active;
+	unsigned long age;
+	/* What the bridge would do with the flow's frames, asked under RTNL at
+	 * the last derivation; see ft_mc_flow_derive(). `port` holds the
+	 * bridged copies with the tags each leaves with, every device pinned;
+	 * `local` the BR_MCAST_TO_HOST_* reasons the bridge also hands a frame
+	 * up; `error` what the bridge said instead of a port set, or
+	 * -EOPNOTSUPP for a port the hardware cannot carry, which refuses the
+	 * whole flow: a matched frame never reaches the bridge, so a port left
+	 * out of the hardware set would not fall back to software, it would
+	 * stop receiving. */
+	struct cdx_mc_listener port[CDX_MC_MAX_LISTENERS];
+	u8 ports;
+	unsigned int local;
+	int error;
+	bool derived;
+	/* The routed half of the flow's stream; see the section on the
+	 * learners' streams above. `route` is the published route whose
+	 * source and bridge VLAN are this flow's, matched by the worker and
+	 * never owned: the routed learner withdraws a route before freeing
+	 * it, which clears every pointer to it here. `carried_route` is the
+	 * one the installed entry was built with, which is what tells the
+	 * routed learner its copies are in hardware. `routed_host` says the
+	 * bridge hands the flow's frames to a VIF, so the host routes them and
+	 * the flow is carried only together with its route. */
 	struct ft_mc_route *route;
 	struct ft_mc_route *carried_route;
 	bool routed_host;
-	u8 routes;
-	/* Another membership on this bridge resolves to the same hardware key,
-	 * so neither may be installed.
-	 *
-	 * A membership is keyed on br_ip, which includes the source, and the
-	 * bridge produces both shapes for one group routinely:
-	 * br_multicast_sg_add_exclude_ports() creates (S,G) entries alongside
-	 * the (*,G) one whenever INCLUDE and EXCLUDE listeners coexist. A (*,G)
-	 * group that learned S and the (S,G) one then describe one stream, one
-	 * classifier key and two port sets, and the switchdev object does not
-	 * carry the filter mode that would say how the bridge combines them.
-	 * Installing either stops the frame reaching the bridge, and the other
-	 * one's ports stop receiving with nothing to say why -- the silent
-	 * partial replication the contract refuses. So both stay in software
-	 * and /proc says so.
-	 */
+	/* Another flow has the same classifier key -- the same port, sender
+	 * and source, on another VLAN of the bridge -- so neither may be
+	 * installed: the key names no VLAN, and one root validates one tag. */
 	bool contested;
+	/* The derivation is due (`dirty`); an answer changed and the hardware
+	 * has not caught up (`stale`); the flow cannot exist any more -- its
+	 * ingress went, left the bridge, or no longer resolves to its VLAN --
+	 * and the worker is to take it out (`gone`). */
+	bool dirty;
+	bool stale;
+	bool gone;
+	/* A source of the group was turned away at FT_MC_MAX_FLOWS while this
+	 * flow held its place, and counted in mcast_refused. The next one is
+	 * not counted again until the group's flows change: a group every host
+	 * sends to would otherwise count one on every frame the dedup slots
+	 * could not hold. */
+	bool turned;
 	/* Consecutive failed installs. A failure is not permanent -- a port
 	 * that lost carrier gets it back -- but retrying on every frame of a
-	 * live stream would spin the worker against a group that cannot be
+	 * live stream would spin the worker against a flow that cannot be
 	 * carried, so it is bounded and then reported. */
 	u8 retries;
 };
 
 /* Enough to ride out a transient -- a port bouncing, a moment of capacity
- * pressure -- and few enough that a group which genuinely cannot be carried
- * stops costing anything. */
+ * pressure; the tries are a refresh interval apart -- and few enough that a
+ * flow which genuinely cannot be carried stops costing anything. A changed
+ * answer from the bridge starts the count again. */
 #define FT_MC_MAX_RETRIES 4
 
+/* Sources one group may have in hardware on one bridge. An IPTV channel has
+ * one; a group every host on a LAN sends to -- SSDP's 239.255.255.250 is the
+ * common one -- has as many as there are hosts, and each would take an entry
+ * the table is short of. Past this a source is left to the bridge. */
+#define FT_MC_MAX_FLOWS	8
+
 static LIST_HEAD(ft_mc_groups);
+static LIST_HEAD(ft_mc_flows);
 static DEFINE_MUTEX(ft_mc_lock);
-static unsigned int ft_mc_count, ft_mc_installed;
+static unsigned int ft_mc_count, ft_mc_flow_count, ft_mc_installed;
 static u64 ft_mc_refused, ft_mc_install_errors;
 /* Installed groups of either learner rebuilt because a port they copy out of
  * changed its egress queues, and how many times that happened -- the second
@@ -4907,22 +4911,21 @@ static atomic64_t ft_mc_egress_rebuilds = ATOMIC64_INIT(0);
 static atomic_t ft_mc_egress_gen = ATOMIC_INIT(0);
 static void ft_mc_work_fn(struct work_struct *work);
 static DECLARE_WORK(ft_mc_work, ft_mc_work_fn);
-/* How often an installed group's entry is asked what it has counted. The
- * routed learner's fold runs at the same pace, and nothing here wants to be
- * finer: an entry idle this long hands its key to another stream. */
+/* How often an installed flow's entry is asked what it has counted, and every
+ * flow's answer is asked of the bridge again. The routed learner's fold and
+ * re-derivation run at the same pace, for the same reason: some of what the
+ * bridge decides by -- a querier appearing or timing out -- changes with no
+ * notification at all. */
 #define FT_MC_REFRESH_INTERVAL	(5 * HZ)
 static void ft_mc_refresh_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(ft_mc_refresh, ft_mc_refresh_fn);
-/* Some group's bridge changed its VLAN configuration; the worker re-derives
- * every group marked vlan_stale under RTNL before it installs anything. */
-static bool ft_mc_vlan_stale;
 /* Set once the adapter is tearing down, so a queued worker that runs during
  * exit does nothing rather than reaching a backend that is going away. */
 static bool ft_mc_stopping;
 /* Something outside this learner changed an answer it had already given, with
- * no membership event to say so: a device MTU changed, and a group whose ports
+ * no membership event to say so: a device MTU changed, and a flow whose ports
  * no longer bound its ingress has to leave hardware rather than wait for its
- * membership to change. Every group is reconsidered on the next pass,
+ * membership to change. Every flow is reconsidered on the next pass,
  * installed ones included. */
 static bool ft_mc_recheck;
 /* The routes and taps the routed learner publishes, under ft_mc_lock; what
@@ -4943,21 +4946,50 @@ static void ft_mc_kick_all(void)
 	schedule_work(&ft_mc_work);
 }
 
-/* A bridge's multicast router state changed. Only the answer ft_mc_match_group()
- * reads from it can have, and the worker re-reads that every pass. */
-static void ft_mc_router_changed(void)
-{
-	if (!READ_ONCE(ft_mc_stopping))
-		schedule_work(&ft_mc_work);
-}
-
-/* Defined with the traffic half below, whose dedup slot it clears; called
- * wherever a group comes or goes. */
+/* Defined with the traffic half below, whose dedup slots it clears; called
+ * wherever the answer a recorded frame got may have changed. */
 static void ft_mc_forget_seen(void);
 
-static u8 ft_mc_family(const struct ft_mc_group *g)
+static u8 ft_mc_family(const struct br_ip *addr)
 {
-	return g->addr.proto == htons(ETH_P_IPV6) ? AF_INET6 : AF_INET;
+	return addr->proto == htons(ETH_P_IPV6) ? AF_INET6 : AF_INET;
+}
+
+/* Link-local scope: 224.0.0.0/24, and ff01::/16 and ff02::/16. It carries IGMP,
+ * MLD and neighbour discovery, and the querier the whole design depends on;
+ * taking any of it away from the bridge would take the control plane with
+ * it, so no flow of it is ever learned -- and a membership of it would be a
+ * reason to learn nothing, so none is recorded. The bridge's own IPv6
+ * addresses join a solicited-node group each, and recording those kept the
+ * hook registered on every IPv6 LAN for nothing. */
+static bool ft_mc_link_local(const struct br_ip *addr)
+{
+	if (addr->proto == htons(ETH_P_IP))
+		return ipv4_is_local_multicast(addr->dst.ip4);
+	return __ipv6_addr_src_scope(__ipv6_addr_type(&addr->dst.ip6)) <=
+	       IPV6_ADDR_SCOPE_LINKLOCAL;
+}
+
+/* Whether a membership and a flow are about the same group on the same bridge
+ * VLAN, which is what makes a change to the one a question about the other. */
+static bool ft_mc_same_vlan_group(const struct br_ip *a, const struct br_ip *b)
+{
+	return a->proto == b->proto && a->vid == b->vid &&
+	       !memcmp(&a->dst, &b->dst, sizeof(a->dst));
+}
+
+/* Ask the bridge again about every flow of this group on this bridge VLAN,
+ * whatever its source: a membership changing -- a join, a leave, an (S,G)
+ * port group created or blocked, a filter mode switched -- can change the
+ * answer for any of them. Called with ft_mc_lock held. */
+static void ft_mc_touch(const struct net_device *bridge, const struct br_ip *addr)
+{
+	struct ft_mc_flow *f;
+
+	lockdep_assert_held(&ft_mc_lock);
+	list_for_each_entry(f, &ft_mc_flows, list)
+		if (f->bridge == bridge && ft_mc_same_vlan_group(&f->addr, addr))
+			f->dirty = true;
 }
 
 static bool ft_mc_same_group(const struct ft_mc_group *g,
@@ -4978,43 +5010,38 @@ static struct ft_mc_group *ft_mc_find(const struct net_device *bridge,
 	return NULL;
 }
 
-/* Whether every port the bridge delivers this group to is one the hardware can
- * be given.
+/* Whether every port the bridge delivers this flow to is one the hardware can
+ * be given, together with the copies of the route riding it.
  *
  * All or nothing, and the reason is that there is no half. A matched frame
- * never reaches the bridge, so a member left out of the hardware set does not
- * fall back to software -- it stops receiving, silently. A group with a Wi-Fi
- * VAP among its listeners, which is what br-lan looks like the moment a phone
+ * never reaches the bridge, so a port left out of the hardware set does not
+ * fall back to software -- it stops receiving, silently. A flow with a Wi-Fi
+ * VAP among its ports, which is what br-lan looks like the moment a phone
  * joins the same stream as a set-top box, is therefore carried by the bridge
- * in software in its entirety rather than by the hardware in part.
+ * in software in its entirety rather than by the hardware in part; the
+ * derivation records that as `error`.
  *
- * A route riding the group is part of the same set. The union has to fit one
+ * A route riding the flow is part of the same set. The union has to fit one
  * group, and a routed copy framed exactly like a bridged one -- one port, one
  * tag stack, two VLANs untagged on it -- is refused rather than programmed as
  * a second entry the backend would take for a duplicate.
  */
-static bool ft_mc_carriable(const struct ft_mc_group *g)
+static bool ft_mc_carriable(const struct ft_mc_flow *f)
 {
-	const struct ft_mc_route *r = g->route;
-	u8 i, j, copies = 0;
+	const struct ft_mc_route *r = f->route;
+	u8 i, j;
 
-	if (g->overflow || g->ports > CDX_MC_MAX_LISTENERS)
+	if (f->error)
 		return false;
-	for (i = 0; i < g->ports; i++) {
-		if (g->port[i].uncarried)
-			return false;
-		if (!g->port[i].absent)
-			copies++;
-	}
 	if (!r)
 		return true;
-	if (copies + r->listeners > CDX_MC_MAX_LISTENERS)
+	if (f->ports + r->listeners > CDX_MC_MAX_LISTENERS)
 		return false;
 	for (j = 0; j < r->listeners; j++)
-		for (i = 0; i < g->ports; i++) {
-			const struct ft_mc_port *p = &g->port[i];
+		for (i = 0; i < f->ports; i++) {
+			const struct cdx_mc_listener *p = &f->port[i];
 
-			if (!p->absent && p->dev == r->listener[j].dev &&
+			if (p->dev == r->listener[j].dev &&
 			    p->vlans == r->listener[j].vlans &&
 			    !memcmp(p->vlan, r->listener[j].vlan, sizeof(p->vlan)))
 				return false;
@@ -5022,7 +5049,7 @@ static bool ft_mc_carriable(const struct ft_mc_group *g)
 	return true;
 }
 
-/* Whether every frame the ingress port can deliver fits every port the group
+/* Whether every frame the ingress port can deliver fits every port the flow
  * is replicated to, which is what lets the hardware carry it without ever
  * fragmenting a copy.
  *
@@ -5030,27 +5057,27 @@ static bool ft_mc_carriable(const struct ft_mc_group *g)
  * does not fit the egress port, whatever its family and whatever its DF bit,
  * and the microcode would instead fragment it at the listener's enqueue. The
  * two can only agree while no such frame arrives, so a port whose MTU is below
- * the ingress's keeps the whole group in software, where the bridge makes that
+ * the ingress's keeps the whole flow in software, where the bridge makes that
  * decision per frame. The comparison is in device MTUs because a bridge
  * decides in them; see ft_mc_link_mtu() for why the bound is an admission
- * test at all. A group with no ingress yet has nothing to bound.
+ * test at all. A flow whose ingress has gone has nothing left to bound.
  *
  * A route's copies are bounded by the same port: whatever the bridge hands the
  * host arrived there, and ipmr and ip6mr would drop or answer rather than
  * fragment what does not fit. The route states its narrowest path in the
  * family's own units, the IPv6 MTU for IPv6. */
-static bool ft_mc_mtu_bounded(const struct ft_mc_group *g)
+static bool ft_mc_mtu_bounded(const struct ft_mc_flow *f)
 {
 	u32 in_mtu;
 	u8 i;
 
-	if (!g->in)
+	if (!f->in)
 		return true;
-	in_mtu = READ_ONCE(g->in->mtu);
-	for (i = 0; i < g->ports; i++)
-		if (READ_ONCE(g->port[i].dev->mtu) < in_mtu)
+	in_mtu = READ_ONCE(f->in->mtu);
+	for (i = 0; i < f->ports; i++)
+		if (READ_ONCE(f->port[i].dev->mtu) < in_mtu)
 			return false;
-	return !g->route || g->route->mtu >= in_mtu;
+	return !f->route || f->route->mtu >= in_mtu;
 }
 
 /* Whether this port could carry a replica, asked the only way a caller holding
@@ -5067,17 +5094,16 @@ static bool ft_mc_port_eligible(struct net_device *dev)
 	return cdx_mc_port_identity(dev);
 }
 
-/* The tags this group's copies leave `port` with.
+/* The tags a copy of a group in `vid` leaves `port` with.
  *
  * ft_bridge_vlan() asks the same question from the other end -- it walks a
  * flow's path down to a port and works out what the bridge added along the
- * way. Here the VLAN is already known, because the MDB entry names it, so
- * only the port's membership is in question.
+ * way. Here the VLAN is already known, because the membership or the flow
+ * names it, so only the port's membership of it is in question.
  *
- * Two kinds of failure, and the caller has to tell them apart. -ENOENT means
- * the bridge would not deliver to this port at all, so dropping the member
- * costs nothing. -EOPNOTSUPP means it would and this side cannot describe the
- * framing, which makes the member one the group has to be refused over.
+ * Two kinds of failure. -ENOENT means the bridge would not deliver to this
+ * port at all. -EOPNOTSUPP means it would and this side cannot describe the
+ * framing, which makes the port one a flow has to be refused over.
  */
 static int ft_mc_port_tags(struct net_device *bridge, struct net_device *port,
 			   u16 vid, struct cdx_ft_vlan *stack, u8 *count)
@@ -5108,52 +5134,66 @@ static int ft_mc_port_tags(struct net_device *bridge, struct net_device *port,
 	return 0;
 }
 
-/* Remove a port from every group that lists it, wherever the caller could not
- * say which group. Called with ft_mc_lock held. */
-static void ft_mc_drop_port(struct net_device *port)
+/* Take one port out of a membership. Returns whether it was there. Called with
+ * ft_mc_lock held. */
+static bool ft_mc_group_drop(struct ft_mc_group *g, const struct net_device *port)
 {
-	struct ft_mc_group *g;
 	u8 i;
 
 	lockdep_assert_held(&ft_mc_lock);
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		for (i = 0; i < g->ports; i++) {
-			if (g->port[i].dev != port)
-				continue;
-			dev_put(g->port[i].dev);
-			memmove(&g->port[i], &g->port[i + 1],
-				(g->ports - i - 1) * sizeof(g->port[0]));
-			g->ports--;
-			memset(&g->port[g->ports], 0, sizeof(g->port[0]));
-			g->dirty = true;
-			break;
-		}
+	for (i = 0; i < g->ports; i++) {
+		if (g->port[i] != port)
+			continue;
+		dev_put(g->port[i]);
+		memmove(&g->port[i], &g->port[i + 1],
+			(g->ports - i - 1) * sizeof(g->port[0]));
+		g->ports--;
+		g->port[g->ports] = NULL;
+		return true;
+	}
+	return false;
+}
+
+/* Remove a port from every membership that lists it, wherever the caller could
+ * not say which. Called with ft_mc_lock held. */
+static void ft_mc_drop_port(struct net_device *port)
+{
+	struct ft_mc_group *g;
+
+	lockdep_assert_held(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list)
+		if (ft_mc_group_drop(g, port))
+			ft_mc_touch(g->bridge, &g->addr);
+}
+
+/* Take one port out of a flow's derived copies: the port is going away, and
+ * the bridge's next answer will not name it either. The flow is asked again
+ * and its entry rebuilt without it. Called with ft_mc_lock held. */
+static void ft_mc_flow_drop_port(struct ft_mc_flow *f,
+				 const struct net_device *port)
+{
+	u8 i;
+
+	lockdep_assert_held(&ft_mc_lock);
+	for (i = 0; i < f->ports; i++) {
+		if (f->port[i].dev != port)
+			continue;
+		dev_put(f->port[i].dev);
+		memmove(&f->port[i], &f->port[i + 1],
+			(f->ports - i - 1) * sizeof(f->port[0]));
+		f->ports--;
+		memset(&f->port[f->ports], 0, sizeof(f->port[0]));
+		f->dirty = true;
+		f->stale = true;
+		return;
 	}
 }
 
-/* Forget a stream the group was keeping for later. */
-static void ft_mc_drop_next(struct ft_mc_group *g)
+/* Forget the shape a flow was keeping for later. */
+static void ft_mc_drop_next(struct ft_mc_flow *f)
 {
-	if (g->has_next)
-		dev_put(g->next.in);
-	memset(&g->next, 0, sizeof(g->next));
-	g->has_next = false;
-}
-
-/* Forget the stream the group is keyed on, which returns it to waiting for
- * one. The hardware entry, if any, is the worker's to retire: a group with no
- * ingress is not installable. */
-static void ft_mc_drop_stream(struct ft_mc_group *g)
-{
-	if (g->in)
-		dev_put(g->in);
-	g->in = NULL;
-	memset(&g->src, 0, sizeof(g->src));
-	eth_zero_addr(g->dst_mac);
-	eth_zero_addr(g->src_mac);
-	g->in_tagged = false;
-	g->retries = 0;
-	g->dirty = true;
+	memset(&f->next, 0, sizeof(f->next));
+	f->has_next = false;
 }
 
 static void ft_mc_group_free(struct ft_mc_group *g)
@@ -5161,12 +5201,29 @@ static void ft_mc_group_free(struct ft_mc_group *g)
 	u8 i;
 
 	for (i = 0; i < g->ports; i++)
-		dev_put(g->port[i].dev);
-	if (g->in)
-		dev_put(g->in);
-	ft_mc_drop_next(g);
+		dev_put(g->port[i]);
 	dev_put(g->bridge);
 	kfree(g);
+}
+
+/* Let go of every copy a flow's last derivation named. */
+static void ft_mc_flow_release_ports(struct ft_mc_flow *f)
+{
+	u8 i;
+
+	for (i = 0; i < f->ports; i++)
+		dev_put(f->port[i].dev);
+	memset(f->port, 0, sizeof(f->port));
+	f->ports = 0;
+}
+
+static void ft_mc_flow_free(struct ft_mc_flow *f)
+{
+	ft_mc_flow_release_ports(f);
+	if (f->in)
+		dev_put(f->in);
+	dev_put(f->bridge);
+	kfree(f);
 }
 
 /* ---- what the routed learner publishes -----------------------------------
@@ -5220,7 +5277,7 @@ static void ft_mc_route_clear(struct ft_mc_route *r)
 static bool ft_mc_route_publish(struct ft_mc_route *r,
 				const struct ft_mc_route *want)
 {
-	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 	bool carried;
 	u8 i;
 
@@ -5248,12 +5305,16 @@ static bool ft_mc_route_publish(struct ft_mc_route *r,
 			memset(&r->stats, 0, sizeof(r->stats));
 			spin_unlock_bh(&ft_mc_route_lock);
 		}
-		/* The worker re-matches every group each pass, but a group
+		/* The worker re-matches every flow each pass, but a flow
 		 * already matched to this route would not see its copies
 		 * change without being told. */
-		list_for_each_entry(g, &ft_mc_groups, list)
-			if (g->route == r || g->carried_route == r)
-				g->dirty = true;
+		list_for_each_entry(f, &ft_mc_flows, list)
+			if (f->route == r || f->carried_route == r)
+				f->stale = true;
+		/* A route names its stream's flow into existence, and a frame
+		 * of it recorded while nothing named it has to be recorded
+		 * again. */
+		ft_mc_forget_seen();
 		schedule_work(&ft_mc_work);
 	}
 	mutex_unlock(&ft_mc_lock);
@@ -5263,12 +5324,12 @@ static bool ft_mc_route_publish(struct ft_mc_route *r,
 	return carried;
 }
 
-/* Take a route back. Its group loses those copies at the worker's next pass,
+/* Take a route back. Its flow loses those copies at the worker's next pass,
  * and is retired then if nothing else names it. Safe on a route that was never
  * published, and after ft_mc_exit(), which unlinks every route itself. */
 static void ft_mc_route_withdraw(struct ft_mc_route *r)
 {
-	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 
 	mutex_lock(&ft_mc_lock);
 	if (r->linked) {
@@ -5276,14 +5337,14 @@ static void ft_mc_route_withdraw(struct ft_mc_route *r)
 		r->linked = false;
 	}
 	ft_mc_route_clear(r);
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		if (g->route == r) {
-			g->route = NULL;
-			g->dirty = true;
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		if (f->route == r) {
+			f->route = NULL;
+			f->stale = true;
 		}
-		if (g->carried_route == r) {
-			g->carried_route = NULL;
-			g->dirty = true;
+		if (f->carried_route == r) {
+			f->carried_route = NULL;
+			f->stale = true;
 		}
 	}
 	if (!ft_mc_stopping)
@@ -5370,215 +5431,165 @@ static bool ft_mc_via_receives(const struct net_device *bridge, u16 via_vid,
 	return !(info.flags & BRIDGE_VLAN_INFO_UNTAGGED) == tagged;
 }
 
-/* Whether a route names this group: its bridge, its VLAN, its group address,
- * and a source it accepts -- any, for a (*,G) membership. Called with
- * ft_mc_lock held. */
-static bool ft_mc_route_names(const struct ft_mc_route *r,
-			      const struct ft_mc_group *g)
+/* Whether a route's parent VIF receives a group of this family on this bridge
+ * VLAN, whatever its source. Called with ft_mc_lock held. */
+static bool ft_mc_route_reaches(const struct ft_mc_route *r,
+				const struct net_device *bridge,
+				const struct br_ip *addr)
 {
-	if (!r->listeners || r->bridge != g->bridge ||
-	    r->family != ft_mc_family(g) ||
-	    memcmp(&r->dst, &g->addr.dst, sizeof(r->dst)))
+	if (!r->listeners || r->bridge != bridge ||
+	    r->family != ft_mc_family(addr) ||
+	    memcmp(&r->dst, &addr->dst, sizeof(r->dst)))
 		return false;
-	if (memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) &&
-	    memcmp(&g->addr.src, &r->src, sizeof(r->src)))
-		return false;
-	return ft_mc_via_receives(r->bridge, r->vid, r->tagged, g->addr.vid);
+	return ft_mc_via_receives(r->bridge, r->vid, r->tagged, addr->vid);
 }
 
-/* Whether a VIF receives this group's bridge VLAN, route or none. Called with
+/* Whether a route is this flow's stream routed: the same bridge VLAN, group
+ * and source. Called with ft_mc_lock held. */
+static bool ft_mc_route_names(const struct ft_mc_route *r,
+			      const struct ft_mc_flow *f)
+{
+	return ft_mc_route_reaches(r, f->bridge, &f->addr) &&
+	       !memcmp(&r->src, &f->addr.src, sizeof(f->addr.src));
+}
+
+/* Whether a VIF receives this flow's bridge VLAN, route or none. Called with
  * ft_mc_lock held. */
-static bool ft_mc_tapped(const struct ft_mc_group *g)
+static bool ft_mc_tapped(const struct ft_mc_flow *f)
 {
 	unsigned int i;
 
 	if (ft_mc_taps_overflow)
 		return true;
 	for (i = 0; i < ft_mc_tap_count; i++)
-		if (ft_mc_taps[i].bridge == g->bridge &&
-		    ft_mc_taps[i].family == ft_mc_family(g) &&
-		    ft_mc_via_receives(g->bridge, ft_mc_taps[i].vid,
-				       ft_mc_taps[i].tagged, g->addr.vid))
+		if (ft_mc_taps[i].bridge == f->bridge &&
+		    ft_mc_taps[i].family == ft_mc_family(&f->addr) &&
+		    ft_mc_via_receives(f->bridge, ft_mc_taps[i].vid,
+				       ft_mc_taps[i].tagged, f->addr.vid))
 			return true;
 	return false;
 }
 
-/* A route with no group to learn its stream through gets one: in the (*,G)
- * form, which a later join of the same group finds and fills, and in the VLAN
- * the route names or, for the bridge device itself, the bridge's PVID -- the
- * untagged VLAN its streams arrive in. A group created here has no member
- * port; it is kept while a route names it. Called with ft_mc_lock held. */
-static void ft_mc_anchor_routes(void)
-{
-	struct ft_mc_route *r;
-	struct ft_mc_group *g;
-
-	lockdep_assert_held(&ft_mc_lock);
-	list_for_each_entry(r, &ft_mc_routes, list) {
-		bool named = false;
-		u16 vid = r->vid;
-		int rc = 0;
-
-		if (!r->listeners || !br_multicast_router(r->bridge))
-			continue;
-		list_for_each_entry(g, &ft_mc_groups, list)
-			if (ft_mc_route_names(r, g)) {
-				named = true;
-				break;
-			}
-		if (named)
-			continue;
-		if (!br_vlan_enabled(r->bridge)) {
-			vid = 0;
-		} else if (!r->tagged) {
-			rcu_read_lock();
-			rc = br_vlan_get_pvid_rcu(r->bridge, &vid);
-			rcu_read_unlock();
-		}
-		if (rc || !ft_mc_via_receives(r->bridge, r->vid, r->tagged, vid))
-			continue;
-		g = kzalloc(sizeof(*g), GFP_KERNEL);
-		if (!g)
-			continue;	/* the next pass tries again */
-		dev_hold(r->bridge);
-		g->bridge = r->bridge;
-		g->addr.vid = vid;
-		if (r->family == AF_INET6) {
-			g->addr.proto = htons(ETH_P_IPV6);
-			g->addr.dst.ip6 = r->dst.in6;
-		} else {
-			g->addr.proto = htons(ETH_P_IP);
-			g->addr.dst.ip4 = r->dst.ip;
-		}
-		g->dirty = true;
-		list_add(&g->list, &ft_mc_groups);
-		ft_mc_count++;
-		ft_mc_forget_seen();	/* its stream may be recorded already */
-	}
-}
-
-/* Match every group against the routes and taps. Called by the worker with
- * ft_mc_lock held, after the traffic half has resolved streams and before
- * anything is retired or installed; a group whose answer changed is marked for
- * the install pass.
+/* Match a flow against the routes and taps. Called by the worker with
+ * ft_mc_lock held, after the flow's derivation and before anything is retired
+ * or installed; a flow whose answer changed is marked for the install pass.
  *
- * A route counts only while its bridge is a multicast router. A bridge that is
- * not one hands the host only what the host itself joined, and a host
- * membership keeps a group in software regardless -- so a route through a
- * bridge that is not a router forwards nothing in Linux either, and carrying
- * it would forward what Linux does not. br_multicast_router() is the bridge's
- * own answer, and SWITCHDEV_ATTR_ID_BRIDGE_MROUTER wakes the worker when it
- * changes. */
-static void ft_mc_match_group(struct ft_mc_group *g)
+ * A route counts only while the bridge hands this flow's frames to the host
+ * for a VIF to see: as a multicast router, or because the bridge device is
+ * promiscuous -- the derivation's BR_MCAST_TO_HOST_ROUTER and _PROMISC. A
+ * bridge that is neither hands the host only what the host itself joined, and
+ * a host membership keeps a flow in software regardless -- so a route through
+ * such a bridge forwards nothing in Linux either, and carrying it would
+ * forward what Linux does not. */
+static void ft_mc_match_flow(struct ft_mc_flow *f)
 {
-	bool router = br_multicast_router(g->bridge);
+	bool up = f->local & (BR_MCAST_TO_HOST_ROUTER | BR_MCAST_TO_HOST_PROMISC);
 	struct ft_mc_route *r, *found = NULL;
-	bool routed_host;
-	u8 routes = 0;
+	bool routed_host, routes = false;
 
 	lockdep_assert_held(&ft_mc_lock);
 	list_for_each_entry(r, &ft_mc_routes, list) {
-		if (!router || !ft_mc_route_names(r, g))
+		if (!up || !ft_mc_route_reaches(r, f->bridge, &f->addr))
 			continue;
-		routes++;
-		if (g->in && !memcmp(&r->src, &g->src, sizeof(g->src)))
+		routes = true;
+		if (!memcmp(&r->src, &f->addr.src, sizeof(f->addr.src)))
 			found = r;
 	}
-	routed_host = router && (routes || ft_mc_tapped(g));
+	routed_host = up && (routes || ft_mc_tapped(f));
 	/* A changed answer is a new question: retries spent against the old
 	 * one say nothing about this one. */
-	if (found != g->route || routed_host != g->routed_host ||
-	    !routes != !g->routes) {
-		g->dirty = true;
-		g->retries = 0;
+	if (found != f->route || routed_host != f->routed_host) {
+		f->stale = true;
+		f->retries = 0;
 	}
-	g->route = found;
-	g->routed_host = routed_host;
-	g->routes = routes;
+	f->route = found;
+	f->routed_host = routed_host;
 }
 
-/* The route whose copies ride a group, while it names any: a route a
- * departing device emptied stays matched until the next pass drops it, and
- * must not be carried as though it were none in the meantime. */
-static const struct ft_mc_route *ft_mc_live_route(const struct ft_mc_group *g)
+/* The route whose copies ride a flow, while it names any: a route a departing
+ * device emptied stays matched until the next pass drops it, and must not be
+ * carried as though it were none in the meantime. */
+static const struct ft_mc_route *ft_mc_live_route(const struct ft_mc_flow *f)
 {
-	return g->route && g->route->listeners ? g->route : NULL;
+	return f->route && f->route->listeners ? f->route : NULL;
 }
 
 static void ft_mc_match_routes(void)
 {
-	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 
 	lockdep_assert_held(&ft_mc_lock);
-	ft_mc_anchor_routes();
-	list_for_each_entry(g, &ft_mc_groups, list)
-		ft_mc_match_group(g);
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		ft_mc_match_flow(f);
+		/* A key another flow held may have been given up since; a
+		 * refused flow asks again, at no cost to the hardware. */
+		if (f->contested)
+			f->stale = true;
+	}
 }
 
-/* Whether a group can go into hardware as it stands, short of the key check
+/* Whether the bridge also hands this flow's frames to the host for a reason no
+ * route can stand in for: the host joined the group, or nothing is snooping
+ * and the bridge floods it up with everything else. */
+static bool ft_mc_host_wants(const struct ft_mc_flow *f)
+{
+	return f->local & (BR_MCAST_TO_HOST_JOINED | BR_MCAST_TO_HOST_FLOOD);
+}
+
+/* Whether a flow can go into hardware as it stands, short of the key check
  * the worker makes and the retry ceiling. Called with ft_mc_lock held.
  *
- * A group the bridge hands to a VIF is carried only together with the route
+ * A flow the bridge hands to a VIF is carried only together with the route
  * that forwards its stream there: installing the bridged copies alone would
  * take every frame away from the host, and with it ipmr's upcall, its
- * forwarding and the daemon's view of the source. */
-static bool ft_mc_installable(const struct ft_mc_group *g)
+ * forwarding and the daemon's view of the source. And a flow the bridge
+ * forwards nowhere -- every listener is behind the port it arrives on, or
+ * blocks its source -- has nothing to replicate: it stays with the bridge,
+ * which drops it. */
+static bool ft_mc_installable(const struct ft_mc_flow *f)
 {
-	const struct ft_mc_route *r = ft_mc_live_route(g);
+	const struct ft_mc_route *r = ft_mc_live_route(f);
 
-	return !g->host && g->in && (g->ports || r) && (r || !g->routed_host) &&
-	       ft_mc_carriable(g) && ft_mc_mtu_bounded(g);
+	return f->derived && f->in && !f->gone && !ft_mc_host_wants(f) &&
+	       (f->ports || r) && (r || !f->routed_host) &&
+	       ft_mc_carriable(f) && ft_mc_mtu_bounded(f);
 }
 
-/* The hardware group a membership's stream becomes: its member ports, as the
- * bridge forwards to them, and the copies of the route riding it. Called with
- * ft_mc_lock held on a group ft_mc_installable() accepts; leaves
- * spec->listeners zero when there is nothing the group may replicate to. The
- * devices are borrowed; the caller holds its own for the hardware call. */
-static void ft_mc_group_spec(const struct ft_mc_group *g,
-			     struct cdx_mc_group_spec *spec)
+/* The hardware group a flow becomes: the ports the bridge forwards it to, and
+ * the copies of the route riding it. Called with ft_mc_lock held on a flow
+ * ft_mc_installable() accepts. The devices are borrowed; the caller holds its
+ * own for the hardware call. */
+static void ft_mc_flow_spec(const struct ft_mc_flow *f,
+			    struct cdx_mc_group_spec *spec)
 {
-	const struct ft_mc_route *r = ft_mc_live_route(g);
+	const struct ft_mc_route *r = ft_mc_live_route(f);
 	u8 i;
 
 	lockdep_assert_held(&ft_mc_lock);
 	memset(spec, 0, sizeof(*spec));
-	spec->in = g->in;
+	spec->in = f->in;
 	spec->bridged = true;
-	spec->family = ft_mc_family(g);
+	spec->family = ft_mc_family(&f->addr);
 	if (spec->family == AF_INET6) {
-		spec->src.in6 = g->src.in6;
-		spec->dst.in6 = g->addr.dst.ip6;
+		spec->src.in6 = f->addr.src.ip6;
+		spec->dst.in6 = f->addr.dst.ip6;
 	} else {
-		spec->src.ip = g->src.ip;
-		spec->dst.ip = g->addr.dst.ip4;
+		spec->src.ip = f->addr.src.ip4;
+		spec->dst.ip = f->addr.dst.ip4;
 	}
 	/* The frames' own pair, which the root is keyed on and every bridged
 	 * copy is rebuilt with, and the one ingress shape the root accepts. */
-	ether_addr_copy(spec->dst_mac, g->dst_mac);
-	ether_addr_copy(spec->src_mac, g->src_mac);
-	if (g->in_tagged) {
+	ether_addr_copy(spec->dst_mac, f->dst_mac);
+	ether_addr_copy(spec->src_mac, f->src_mac);
+	if (f->in_tagged) {
 		spec->in_vlan[0].proto = htons(ETH_P_8021Q);
-		spec->in_vlan[0].id = g->addr.vid;
+		spec->in_vlan[0].id = f->addr.vid;
 		spec->in_vlans = 1;
 	}
-	for (i = 0; i < g->ports; i++) {
-		struct cdx_mc_listener *l;
-
-		if (g->port[i].absent)
-			continue;
-		/* A port replicating back out the port the frame arrived on
-		 * is something br_forward() never does, and a LAN segment
-		 * with a dumb switch produces exactly that membership. */
-		if (g->port[i].dev == g->in) {
-			spec->listeners = 0;
-			return;
-		}
-		l = &spec->listener[spec->listeners++];
-		l->dev = g->port[i].dev;
-		l->vlans = g->port[i].vlans;
-		memcpy(l->vlan, g->port[i].vlan, sizeof(l->vlan));
-	}
+	/* The bridge's copies, as its answer named them: never the ingress,
+	 * which br_multicast_list_ports() leaves out as should_deliver() does. */
+	for (i = 0; i < f->ports; i++)
+		spec->listener[spec->listeners++] = f->port[i];
 	/* The routed copies take the egress port's address and one hop off,
 	 * as ipmr's would; a routed copy back out of the ingress port is one
 	 * ipmr sends too, since it leaves by another VIF. */
@@ -5588,40 +5599,72 @@ static void ft_mc_group_spec(const struct ft_mc_group *g,
 	}
 }
 
-/* Move every group nothing names any more onto `dead`, for the worker to take
- * out of hardware and free: no member port, no host membership, no route. A
- * host-only membership is kept -- it has no ports by definition, and
- * forgetting it would let the next port join install a group the host is
- * still listening to -- and so is a group a route names, whose copies are the
- * other half of its set: the entry goes only when both learners are done with
- * it. Called with ft_mc_lock held. */
-static void ft_mc_retire(struct list_head *dead)
+/* Whether anything still names a flow: a membership of its group on its
+ * bridge VLAN that takes its source -- any, for a (*,G) one -- or a route that
+ * is its stream routed. Called with ft_mc_lock held. */
+static bool ft_mc_flow_named(const struct ft_mc_flow *f)
 {
-	struct ft_mc_group *g, *tmp;
+	const struct ft_mc_route *r;
+	const struct ft_mc_group *g;
+
+	lockdep_assert_held(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		if (g->bridge != f->bridge || (!g->ports && !g->host) ||
+		    !ft_mc_same_vlan_group(&g->addr, &f->addr))
+			continue;
+		if (!memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) ||
+		    !memcmp(&g->addr.src, &f->addr.src, sizeof(g->addr.src)))
+			return true;
+	}
+	list_for_each_entry(r, &ft_mc_routes, list)
+		if (ft_mc_route_names(r, f))
+			return true;
+	return false;
+}
+
+/* Move every membership nothing holds any more onto `dead`, and every flow
+ * nothing names or that cannot exist any more onto `gone`, for the worker to
+ * take out of hardware and free. A host-only membership is kept -- it has no
+ * ports by definition, and forgetting it would let the next port join install
+ * a flow the host is still listening to -- and a flow a route names is kept
+ * with no membership left, because its copies are the other half of its set:
+ * the entry goes only when both learners are done with it. Called with
+ * ft_mc_lock held. */
+static void ft_mc_retire(struct list_head *dead, struct list_head *gone)
+{
+	struct ft_mc_group *g, *gtmp;
+	struct ft_mc_flow *f, *ftmp;
 	bool retired = false;
 
 	lockdep_assert_held(&ft_mc_lock);
-	list_for_each_entry_safe(g, tmp, &ft_mc_groups, list) {
-		if (g->ports || g->host || g->routes)
+	list_for_each_entry_safe(g, gtmp, &ft_mc_groups, list) {
+		if (g->ports || g->host)
 			continue;
 		list_move(&g->list, dead);
 		ft_mc_count--;
 		retired = true;
 	}
-	/* A retired group may have been the first match for a frame another
-	 * group needed -- an (S,G) membership takes its source's frames before
-	 * the (*,G) one sees them -- so that frame may be recorded again. */
+	list_for_each_entry_safe(f, ftmp, &ft_mc_flows, list) {
+		if (!f->gone && ft_mc_flow_named(f))
+			continue;
+		list_move(&f->list, gone);
+		ft_mc_flow_count--;
+		retired = true;
+	}
+	/* A frame recorded against what just went -- a flow whose ingress
+	 * left, a membership that named it -- may be one a new flow is to be
+	 * learned from, so it may be recorded again. */
 	if (retired)
 		ft_mc_forget_seen();
 }
 
-/* Tell each route whether an installed group is carrying it. Called by the
+/* Tell each route whether an installed flow is carrying it. Called by the
  * worker with ft_mc_lock held; returns true when an answer changed, which the
  * routed learner has to hear about. */
 static bool ft_mc_route_feedback(void)
 {
 	struct ft_mc_route *r;
-	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 	bool changed = false;
 
 	lockdep_assert_held(&ft_mc_lock);
@@ -5629,10 +5672,10 @@ static bool ft_mc_route_feedback(void)
 		bool carried = false;
 		u8 tags = 0;
 
-		list_for_each_entry(g, &ft_mc_groups, list)
-			if (g->hw && g->carried_route == r) {
+		list_for_each_entry(f, &ft_mc_flows, list)
+			if (f->hw && f->carried_route == r) {
 				carried = true;
-				tags = g->in_tagged;
+				tags = f->in_tagged;
 				break;
 			}
 		spin_lock_bh(&ft_mc_route_lock);
@@ -5644,145 +5687,103 @@ static bool ft_mc_route_feedback(void)
 	return changed;
 }
 
-/* Add or remove one port group. Called with ft_mc_lock held and no hardware
- * touched; the worker is what acts on the result. Returns true when the
- * adapter is taking responsibility for this membership, which is what the
- * switchdev answer reports. */
+/* A membership nothing recorded before. Called with ft_mc_lock held. */
+static struct ft_mc_group *ft_mc_group_new(struct net_device *bridge,
+					   const struct br_ip *addr)
+{
+	struct ft_mc_group *g = kzalloc(sizeof(*g), GFP_KERNEL);
+
+	lockdep_assert_held(&ft_mc_lock);
+	if (!g)
+		return NULL;
+	dev_hold(bridge);
+	g->bridge = bridge;
+	g->addr = *addr;
+	list_add(&g->list, &ft_mc_groups);
+	ft_mc_count++;
+	/* A frame of this group recorded before the membership existed was
+	 * named by nothing; it is worth recording again now that something
+	 * names it. The MDB add is deferred, so that order is the ordinary
+	 * one. */
+	ft_mc_forget_seen();
+	return g;
+}
+
+/* Add or remove one port group, or the host's membership. Called with
+ * ft_mc_lock held and no hardware touched; the worker is what acts on the
+ * result. Returns true when the adapter takes responsibility for this port's
+ * membership, which is what the switchdev answer reports: `handled` becomes
+ * MDB_PG_FLAGS_OFFLOAD, shown by `bridge mdb show`, so a port the hardware
+ * could never replicate to, or a membership the host shares, must not claim
+ * it. */
 static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
 			     const struct br_ip *addr, bool adding, bool host)
 {
+	struct cdx_ft_vlan stack[CDX_FT_VLAN_MAX];
 	struct ft_mc_group *g;
-	bool uncarried;
-	int rc;
-	u8 i;
+	bool named;
+	u8 i, tags;
 
 	lockdep_assert_held(&ft_mc_lock);
 	g = ft_mc_find(bridge, addr);
+	/* Whatever changed, the bridge's answer for every flow of the group on
+	 * this VLAN may have with it. */
+	ft_mc_touch(bridge, addr);
+	/* A membership whose last port left and which the worker has not
+	 * retired yet names nothing; a frame drained meanwhile was named by
+	 * nothing either, and has to be recorded again once it names flows. */
+	named = g && (g->ports || g->host);
+	if (g && adding && !named)
+		ft_mc_forget_seen();
 
 	if (host) {
 		/* A host membership carries no port of its own; it says the
-		 * bridge itself wants a copy, which makes the whole group
-		 * ineligible for as long as it holds -- a hardware entry
-		 * replicates to ports and the frame never reaches the CPU.
+		 * bridge itself wants a copy, which the derivation reads as
+		 * BR_MCAST_TO_HOST_JOINED and refuses every flow of the group
+		 * over for as long as it holds.
 		 *
-		 * It has to create the group when none exists yet, and this is
-		 * the common ordering rather than a corner: br_multicast_add_
-		 * group() calls br_multicast_host_join() on a freshly created
-		 * mdb entry, so the host membership is emitted *before* any
-		 * port group for that address. Dropping it here left the group
-		 * to be created later by the first port join, with host clear
-		 * -- and then the local listener stopped receiving the moment
-		 * the offload installed. */
+		 * It has to create the membership when none exists yet, and
+		 * this is the common ordering rather than a corner:
+		 * br_multicast_add_group() calls br_multicast_host_join() on a
+		 * freshly created mdb entry, so the host membership is emitted
+		 * *before* any port group for that address. */
 		if (!adding) {
-			if (g) {
+			if (g)
 				g->host = false;
-				g->dirty = true;
-			}
 			return false;
 		}
-		if (!g) {
-			g = kzalloc(sizeof(*g), GFP_KERNEL);
-			if (!g)
-				return false;
-			dev_hold(bridge);
-			g->bridge = bridge;
-			g->addr = *addr;
-			list_add(&g->list, &ft_mc_groups);
-			ft_mc_count++;
-			/* A frame of this group recorded before the group
-			 * existed matched nothing; it is worth recording again
-			 * now that something could match it. The MDB add is
-			 * deferred, so that order is the ordinary one. */
-			ft_mc_forget_seen();
-		}
-		g->host = true;
-		g->dirty = true;
+		if (!g)
+			g = ft_mc_group_new(bridge, addr);
+		if (g)
+			g->host = true;
 		return false;
 	}
 
 	if (!adding) {
-		if (!g)
-			return false;
-		for (i = 0; i < g->ports; i++) {
-			if (g->port[i].dev != port)
-				continue;
-			dev_put(g->port[i].dev);
-			memmove(&g->port[i], &g->port[i + 1],
-				(g->ports - i - 1) * sizeof(g->port[0]));
-			g->ports--;
-			memset(&g->port[g->ports], 0, sizeof(g->port[0]));
-			g->dirty = true;
-			break;
-		}
+		if (g)
+			ft_mc_group_drop(g, port);
 		return false;
 	}
 
-	if (!g) {
-		g = kzalloc(sizeof(*g), GFP_KERNEL);
-		if (!g)
-			return false;
-		dev_hold(bridge);
-		g->bridge = bridge;
-		g->addr = *addr;
-		list_add(&g->list, &ft_mc_groups);
-		ft_mc_count++;
-		ft_mc_forget_seen();	/* as for a host membership above */
-	}
-	for (i = 0; i < g->ports; i++) {
-		struct ft_mc_port *p = &g->port[i];
-
-		if (p->dev != port)
-			continue;
-		/* Already a member. One that had left the group's VLAN and is
-		 * joining again is in it again: the bridge would not report the
-		 * join otherwise. */
-		if (p->absent && !p->uncarried &&
-		    !ft_mc_port_tags(bridge, port, addr->vid, p->vlan, &p->vlans)) {
-			p->absent = false;
-			g->dirty = true;
-		}
-		return !p->uncarried && !p->absent && !g->host &&
-		       ft_mc_carriable(g);
-	}
-	if (g->ports == FT_MC_MAX_MEMBERS) {
-		/* Nowhere to record it, so from here the group has a member it
-		 * cannot name and must not be installed. */
-		g->overflow = true;
-		g->dirty = true;
-		ft_mc_refused++;
+	if (!g)
+		g = ft_mc_group_new(bridge, addr);
+	if (!g)
 		return false;
-	}
-	memset(&g->port[g->ports], 0, sizeof(g->port[0]));
-	uncarried = !ft_mc_port_eligible(port);
-	if (!uncarried) {
-		rc = ft_mc_port_tags(bridge, port, addr->vid,
-				     g->port[g->ports].vlan,
-				     &g->port[g->ports].vlans);
-		if (rc == -ENOENT) {
-			/* Not a listener at all; the bridge would drop the
-			 * copy on egress too. */
-			memset(&g->port[g->ports], 0, sizeof(g->port[0]));
+	for (i = 0; i < g->ports && g->port[i] != port; i++)
+		;
+	if (i == g->ports) {
+		/* A port the bridge restates is already here; past the last
+		 * slot it is not recorded, and not claimed. */
+		if (g->ports == FT_MC_MAX_MEMBERS)
 			return false;
-		}
-		uncarried = rc != 0;
+		dev_hold(port);
+		g->port[g->ports++] = port;
 	}
-	if (uncarried) {
-		/* Recorded, never programmed. */
-		memset(&g->port[g->ports], 0, sizeof(g->port[0]));
-		g->port[g->ports].uncarried = true;
-		ft_mc_refused++;
-	}
-	dev_hold(port);
-	g->port[g->ports].dev = port;
-	g->ports++;
-	g->dirty = true;
-	/* One more listener than the hardware can replicate to. Capacity and
-	 * an uncarriable port are the same outcome as far as the group is
-	 * concerned -- it stays in software and /proc says which -- exactly as
-	 * an exhausted statistics pool does for a PPPoE session. */
-	if (!uncarried && g->ports > CDX_MC_MAX_LISTENERS)
-		ft_mc_refused++;
-	return !uncarried && !g->host && ft_mc_carriable(g);
+	/* Claimed when the hardware could replicate to the port with the tags
+	 * the bridge adds there. Whether a given flow is carried is a later
+	 * question with its own answer in /proc. */
+	return !g->host && ft_mc_port_eligible(port) &&
+	       !ft_mc_port_tags(bridge, port, addr->vid, stack, &tags);
 }
 
 /* ---- the traffic half -------------------------------------------------
@@ -5790,9 +5791,13 @@ static bool ft_mc_membership(struct net_device *bridge, struct net_device *port,
  * A membership says which ports want a group. It cannot say which source is
  * sending it or which port that source is behind, because until a frame
  * arrives neither is a fact about anything. Both are read off the frames the
- * bridge is still flooding in software, which is what it does for every group
- * that has no hardware entry -- and stops doing the moment one appears, so
- * this costs nothing once the offload starts paying.
+ * bridge is still forwarding in software, which is what it does for every
+ * flow that has no hardware entry -- and stops doing the moment one appears,
+ * so an installed flow costs the hook nothing.
+ *
+ * The hook stays registered while a membership or a route could name a flow
+ * not learned yet: a group can have a second source at any time, and only a
+ * frame says so.
  *
  * The hook runs in softirq and may not sleep, so it records into a small ring
  * and wakes the worker. No allocation, no mutex, no hardware.
@@ -5817,37 +5822,42 @@ struct ft_mc_seen {
 
 /* Deep enough to absorb the few frames between an observation and the worker
  * installing its entry, and no deeper: past that the stream is either
- * offloaded or the group was refused, and in both cases further observations
+ * offloaded or its flow was refused, and in both cases further observations
  * describe nothing new. Overflow drops the newest, which costs a retry on the
  * next frame rather than anything permanent. */
 #define FT_MC_RING 16
 static struct ft_mc_seen ft_mc_ring[FT_MC_RING];
 static unsigned int ft_mc_ring_head, ft_mc_ring_tail;
 static DEFINE_SPINLOCK(ft_mc_ring_lock);
-/* The last thing recorded, so a stream at line rate does not fill the ring
- * with restatements of one fact between two runs of the worker.
+/* The last few things recorded, so streams at line rate do not fill the ring
+ * with restatements of the same facts between two runs of the worker. Several,
+ * because the hook stays registered while flows are refused: two refused
+ * streams interleaving would otherwise each restate itself on every frame.
  *
- * That makes it a promise as well as a filter: the same frame is not recorded
- * again until the slot is forgotten, however long the stream runs. So the slot
- * is forgotten (ft_mc_forget_seen()) whenever the answer the recorded frame got
- * may have changed -- a group created that could now match it, a group retired
- * that may have shadowed another, an ingress that went away, an entry taken
- * out of hardware -- and at no other time: forgetting it after every drain
- * would record every frame of a stream that never installs. */
-static struct ft_mc_seen ft_mc_last;
+ * That makes them a promise as well as a filter: the same frame is not
+ * recorded again until the slots are forgotten, however long the stream runs.
+ * So they are forgotten (ft_mc_forget_seen()) whenever the answer a recorded
+ * frame got may have changed -- a membership or a route created that could
+ * now name it, a flow retired, an entry taken out of hardware -- and at no
+ * other time: forgetting them after every drain would record every frame of a
+ * stream that never installs. A cleared slot names ifindex zero, which no
+ * frame arrives on. */
+#define FT_MC_SEEN_SLOTS 8
+static struct ft_mc_seen ft_mc_last[FT_MC_SEEN_SLOTS];
+static unsigned int ft_mc_last_next;
 static u64 ft_mc_observed, ft_mc_dropped, ft_mc_hook_errors;
 static bool ft_mc_hooked;
 static DEFINE_MUTEX(ft_mc_hook_lock);
 
 /* Let the next frame of any stream be recorded again, however it compares
  * with the last. Called with ft_mc_lock held, after the change that makes it
- * worth recording is visible on the list, so the worker that drains the frame
+ * worth recording is visible on the lists, so the worker that drains the frame
  * matches it against the new state. */
 static void ft_mc_forget_seen(void)
 {
 	lockdep_assert_held(&ft_mc_lock);
 	spin_lock_bh(&ft_mc_ring_lock);
-	memset(&ft_mc_last, 0, sizeof(ft_mc_last));
+	memset(ft_mc_last, 0, sizeof(ft_mc_last));
 	spin_unlock_bh(&ft_mc_ring_lock);
 }
 
@@ -5895,17 +5905,18 @@ static u16 ft_mc_frame_vid(struct net_device *bridge, struct net_device *port,
 	return vid;
 }
 
-/* Put one observation in the ring for the worker, unless it restates the last
- * one recorded or the ring is full. Returns whether it was recorded. Called
- * from the hook, in softirq. */
+/* Put one observation in the ring for the worker, unless it restates one of
+ * the last recorded or the ring is full. Returns whether it was recorded.
+ * Called from the hook, in softirq. */
 static bool ft_mc_record(const struct ft_mc_seen *seen)
 {
 	bool recorded = false;
-	unsigned int next;
+	unsigned int next, i;
 
 	spin_lock(&ft_mc_ring_lock);
-	if (ft_mc_seen_eq(seen, &ft_mc_last))
-		goto out;	/* recorded already, and nothing has changed since */
+	for (i = 0; i < FT_MC_SEEN_SLOTS; i++)
+		if (ft_mc_seen_eq(seen, &ft_mc_last[i]))
+			goto out;	/* recorded already, and nothing has changed since */
 	next = (ft_mc_ring_head + 1) % FT_MC_RING;
 	if (next == ft_mc_ring_tail) {
 		ft_mc_dropped++;
@@ -5913,7 +5924,8 @@ static bool ft_mc_record(const struct ft_mc_seen *seen)
 	}
 	ft_mc_ring[ft_mc_ring_head] = *seen;
 	ft_mc_ring_head = next;
-	ft_mc_last = *seen;
+	ft_mc_last[ft_mc_last_next] = *seen;
+	ft_mc_last_next = (ft_mc_last_next + 1) % FT_MC_SEEN_SLOTS;
 	ft_mc_observed++;
 	recorded = true;
 	schedule_work(&ft_mc_work);
@@ -5930,6 +5942,7 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 	struct ft_mc_seen seen = {};
 	unsigned int l3_off;
 	__be16 proto;
+	u16 bproto;
 
 	/* Cheapest tests first: this sits in the bridge's receive path. A
 	 * source that is not a station's cannot key an entry whose listeners
@@ -5966,10 +5979,14 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 	 * in software, which is where they were anyway: before a group could
 	 * say what it arrives with, its root refused every tagged frame. And a
 	 * bridge that does not filter forwards a tagged frame with its tag,
-	 * which a listener given the bridge's (empty) egress tags would drop. */
+	 * which a listener given the bridge's (empty) egress tags would drop.
+	 * The bridge's protocol has to be 802.1Q as well as the tag's: an
+	 * 802.1ad bridge takes an 802.1Q tag for payload and resolves the frame
+	 * to its PVID, which is not the VLAN the tag names. */
 	if (l3_off ||
 	    (skb_vlan_tag_present(skb) &&
-	     (!br_vlan_enabled(bridge) || skb->vlan_proto != htons(ETH_P_8021Q))))
+	     (!br_vlan_enabled(bridge) || skb->vlan_proto != htons(ETH_P_8021Q) ||
+	      br_vlan_get_proto(bridge, &bproto) || bproto != ETH_P_8021Q)))
 		return NF_ACCEPT;
 
 	if (proto == htons(ETH_P_IP)) {
@@ -5980,10 +5997,6 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 		if (!pskb_may_pull(skb, l3_off + sizeof(*iph)))
 			return NF_ACCEPT;
 		iph = (const struct iphdr *)(skb->data + l3_off);
-		/* Link-local scope carries IGMP itself and the querier the
-		 * whole design depends on; never a candidate. */
-		if ((ntohl(iph->daddr) & 0xffffff00) == 0xe0000000)
-			return NF_ACCEPT;
 		seen.addr.dst.ip4 = iph->daddr;
 		seen.src.ip = iph->saddr;
 		seen.addr.proto = htons(ETH_P_IP);
@@ -5993,15 +6006,15 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 		if (!pskb_may_pull(skb, l3_off + sizeof(*ip6h)))
 			return NF_ACCEPT;
 		ip6h = (const struct ipv6hdr *)(skb->data + l3_off);
-		if (__ipv6_addr_src_scope(__ipv6_addr_type(&ip6h->daddr)) <=
-		    IPV6_ADDR_SCOPE_LINKLOCAL)
-			return NF_ACCEPT;
 		seen.addr.dst.ip6 = ip6h->daddr;
 		seen.src.in6 = ip6h->saddr;
 		seen.addr.proto = htons(ETH_P_IPV6);
 	} else {
 		return NF_ACCEPT;
 	}
+	/* Never a candidate; see ft_mc_link_local(). */
+	if (ft_mc_link_local(&seen.addr))
+		return NF_ACCEPT;
 
 	seen.addr.vid = ft_mc_frame_vid(bridge, port, skb);
 	seen.bridge_ifindex = bridge->ifindex;
@@ -6009,6 +6022,17 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 	ether_addr_copy(seen.dst_mac, eth_hdr(skb)->h_dest);
 	ether_addr_copy(seen.src_mac, eth_hdr(skb)->h_source);
 	seen.tagged = skb_vlan_tag_present(skb);
+	/* This hook runs before br_allowed_ingress(), which drops a tagged
+	 * frame in a VLAN the port is not a member of. A flow learned from one
+	 * would be asked of the bridge, found not to resolve, retired, and
+	 * learned again from the next such frame, for as long as a host sends
+	 * them -- so it is not learned at all. */
+	if (seen.tagged) {
+		struct bridge_vlan_info info;
+
+		if (br_vlan_get_info_rcu(port, seen.addr.vid, &info))
+			return NF_ACCEPT;
+	}
 
 	ft_mc_record(&seen);
 	return NF_ACCEPT;	/* always: this observes, it never diverts */
@@ -6031,9 +6055,8 @@ static struct nf_hook_ops ft_mc_hook_ops = {
 	.priority = NF_BR_PRI_LAST,
 };
 
-/* The hook exists only while something is waiting for a source. A box whose
- * groups are all installed, or which has no memberships at all, pays the
- * static key in nf_hook_bridge_pre() and nothing else.
+/* The hook exists only while a membership or a route could name a flow. A box
+ * with neither pays the static key in nf_hook_bridge_pre() and nothing else.
  *
  * Registration sleeps, so this runs from the worker. Called without
  * ft_mc_lock. */
@@ -6069,13 +6092,13 @@ static void ft_mc_hook_sync(bool wanted)
 		/* Unregistering does not wait for the frames already inside
 		 * the hook: the entries are freed through call_rcu() and the
 		 * caller returns at once. A reader still running could write
-		 * the slot after it is cleared below, or queue the worker after
-		 * ft_mc_exit() has cancelled it. The hook runs under the RCU
-		 * read lock of the receive path, so one grace period is every
-		 * such reader gone. */
+		 * a slot after they are cleared below, or queue the worker
+		 * after ft_mc_exit() has cancelled it. The hook runs under the
+		 * RCU read lock of the receive path, so one grace period is
+		 * every such reader gone. */
 		synchronize_net();
 		spin_lock_bh(&ft_mc_ring_lock);
-		memset(&ft_mc_last, 0, sizeof(ft_mc_last));
+		memset(ft_mc_last, 0, sizeof(ft_mc_last));
 		spin_unlock_bh(&ft_mc_ring_lock);
 	}
 	ft_mc_hooked = wanted;
@@ -6083,231 +6106,445 @@ out:
 	mutex_unlock(&ft_mc_hook_lock);
 }
 
-/* Match an observation to a membership. Called with ft_mc_lock held.
- *
- * A (*,G) membership takes any source; an (S,G) one -- which an IGMPv3
- * INCLUDE report produces -- takes only its own, because the bridge already
- * said which source that group is about.
- */
-static struct ft_mc_group *ft_mc_match(const struct ft_mc_seen *seen)
+/* The key a flow would have for this observation: its group, VLAN and family,
+ * and its source. */
+static void ft_mc_seen_key(const struct ft_mc_seen *seen, struct br_ip *key)
 {
-	struct ft_mc_group *g;
+	*key = seen->addr;
+	if (key->proto == htons(ETH_P_IPV6))
+		key->src.ip6 = seen->src.in6;
+	else
+		key->src.ip4 = seen->src.ip;
+}
 
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		if (g->bridge->ifindex != seen->bridge_ifindex ||
-		    g->addr.proto != seen->addr.proto ||
-		    g->addr.vid != seen->addr.vid ||
-		    memcmp(&g->addr.dst, &seen->addr.dst, sizeof(g->addr.dst)))
-			continue;
-		if (memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) &&
-		    memcmp(&g->addr.src, &seen->src, sizeof(seen->src)))
-			continue;
-		return g;
-	}
+static bool ft_mc_same_shape(const struct ft_mc_stream *shape,
+			     const struct ft_mc_seen *seen)
+{
+	return ether_addr_equal(shape->dst_mac, seen->dst_mac) &&
+	       ether_addr_equal(shape->src_mac, seen->src_mac) &&
+	       shape->tagged == seen->tagged;
+}
+
+/* The flow an observation belongs to, if one exists. Called with ft_mc_lock
+ * held. */
+static struct ft_mc_flow *ft_mc_flow_find(const struct br_ip *key,
+					  const struct ft_mc_seen *seen)
+{
+	struct ft_mc_flow *f;
+
+	lockdep_assert_held(&ft_mc_lock);
+	list_for_each_entry(f, &ft_mc_flows, list)
+		if (!f->gone && f->in && f->in->ifindex == seen->in_ifindex &&
+		    f->bridge->ifindex == seen->bridge_ifindex &&
+		    !memcmp(&f->addr, key, sizeof(*key)))
+			return f;
 	return NULL;
 }
 
-/* Fill in a group's source and ingress from an observation. Returns true when
- * that changed something the hardware has to be told about. */
-static bool ft_mc_resolve(struct ft_mc_group *g, const struct ft_mc_seen *seen)
+/* Whether a published route names this source through its own bridge: only
+ * while the bridge hands its streams to the host, as a multicast router or a
+ * promiscuous bridge does, since otherwise the host never sees them for the
+ * route to forward. Called with ft_mc_lock held. */
+static bool ft_mc_route_learns(const struct ft_mc_route *r,
+			       const struct br_ip *key)
 {
-	struct net_device *in;
+	return r->bridge && ft_mc_route_reaches(r, r->bridge, key) &&
+	       !memcmp(&r->src, &key->src, sizeof(key->src)) &&
+	       (br_multicast_router(r->bridge) ||
+		(READ_ONCE(r->bridge->flags) & IFF_PROMISC));
+}
+
+/* The bridge whose membership or route names a flow with this key, or NULL
+ * when nothing does. Called with ft_mc_lock held.
+ *
+ * A (*,G) membership names any source and an (S,G) one -- which an IGMPv3
+ * report produces -- only its own; either is only a reason to ask, and the
+ * bridge's answer decides what the flow is. A route names its own source;
+ * see ft_mc_route_learns(). */
+static struct net_device *ft_mc_namer(const struct br_ip *key, int bridge_ifindex)
+{
+	const struct ft_mc_group *g;
+	const struct ft_mc_route *r;
 
 	lockdep_assert_held(&ft_mc_lock);
-	if (g->in && g->in->ifindex == seen->in_ifindex &&
-	    !memcmp(&g->src, &seen->src, sizeof(g->src)) &&
-	    ether_addr_equal(g->dst_mac, seen->dst_mac) &&
-	    ether_addr_equal(g->src_mac, seen->src_mac) &&
-	    g->in_tagged == seen->tagged)
-		return false;	/* already what we have */
-	if (g->hw && g->has_next && g->next.in->ifindex == seen->in_ifindex &&
-	    !memcmp(&g->next.src, &seen->src, sizeof(g->next.src)) &&
-	    ether_addr_equal(g->next.dst_mac, seen->dst_mac) &&
-	    ether_addr_equal(g->next.src_mac, seen->src_mac) &&
-	    g->next.tagged == seen->tagged)
-		return false;	/* already waiting to take over */
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		if (g->bridge->ifindex != bridge_ifindex ||
+		    (!g->ports && !g->host) ||
+		    !ft_mc_same_vlan_group(&g->addr, key))
+			continue;
+		if (!memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) ||
+		    !memcmp(&g->addr.src, &key->src, sizeof(key->src)))
+			return g->bridge;
+	}
+	list_for_each_entry(r, &ft_mc_routes, list)
+		if (r->bridge && r->bridge->ifindex == bridge_ifindex &&
+		    ft_mc_route_learns(r, key))
+			return r->bridge;
+	return NULL;
+}
+
+/* Whether something on this bridge asked for this source of the group by
+ * name, rather than for the group whatever its source: an (S,G) membership,
+ * which an IGMPv3 or MLDv2 INCLUDE report produces, or a route, which always
+ * names its source. Called with ft_mc_lock held. */
+static bool ft_mc_source_named(const struct net_device *bridge,
+			       const struct br_ip *key)
+{
+	const struct ft_mc_group *g;
+	const struct ft_mc_route *r;
+
+	lockdep_assert_held(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list)
+		if (g->bridge == bridge && (g->ports || g->host) &&
+		    ft_mc_same_vlan_group(&g->addr, key) &&
+		    memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) &&
+		    !memcmp(&g->addr.src, &key->src, sizeof(key->src)))
+			return true;
+	list_for_each_entry(r, &ft_mc_routes, list)
+		if (r->bridge == bridge && ft_mc_route_learns(r, key))
+			return true;
+	return false;
+}
+
+/* Whether the host has joined this group on this bridge VLAN. The bridge
+ * records a host join as (*,G) only, and hands the host every source of the
+ * group for it, so the answer for each of them is refused-host. Called with
+ * ft_mc_lock held. */
+static bool ft_mc_host_joined(const struct net_device *bridge,
+			      const struct br_ip *key)
+{
+	const struct ft_mc_group *g;
+
+	lockdep_assert_held(&ft_mc_lock);
+	list_for_each_entry(g, &ft_mc_groups, list)
+		if (g->bridge == bridge && g->host &&
+		    ft_mc_same_vlan_group(&g->addr, key))
+			return true;
+	return false;
+}
+
+/* Whether two flows are the same classifier key: the key names the port, the
+ * Ethernet pair and the address pair, and no VLAN. */
+static bool ft_mc_same_key(const struct ft_mc_flow *a, const struct ft_mc_flow *b)
+{
+	return a->in && a->in == b->in && a->addr.proto == b->addr.proto &&
+	       !memcmp(&a->addr.dst, &b->addr.dst, sizeof(a->addr.dst)) &&
+	       !memcmp(&a->addr.src, &b->addr.src, sizeof(a->addr.src)) &&
+	       ether_addr_equal(a->src_mac, b->src_mac) &&
+	       ether_addr_equal(a->dst_mac, b->dst_mac);
+}
+
+/* Take what the hook observed: a frame of a flow already known, or the first
+ * of one that something names. Called with ft_mc_lock held. */
+static void ft_mc_observe(const struct ft_mc_seen *seen)
+{
+	bool counted = false, shared = false;
+	struct net_device *bridge, *in;
+	struct ft_mc_flow *f, *o;
+	unsigned int flows = 0;
+	struct br_ip key;
+
+	lockdep_assert_held(&ft_mc_lock);
+	ft_mc_seen_key(seen, &key);
+	f = ft_mc_flow_find(&key, seen);
+	if (f) {
+		if (ether_addr_equal(f->dst_mac, seen->dst_mac) &&
+		    ether_addr_equal(f->src_mac, seen->src_mac) &&
+		    f->in_tagged == seen->tagged)
+			return;	/* already what we have */
+		/* An installed flow keeps the key it was installed with for
+		 * as long as that key carries traffic.
+		 *
+		 * cdx_mc_group_replace() exchanges a listener set under a
+		 * fixed key and refuses anything else, so a new shape is a new
+		 * entry rather than a modified one. And two live senders of
+		 * one source -- a MAC that moved between two hosts, a port that
+		 * now carries the tag -- must not trade one entry between them
+		 * on every frame, taking the global control mutex each time.
+		 * So the shape is kept for later, and takes over once the
+		 * refresh finds the installed key idle. A tag the flow did not
+		 * arrive with is asked of the bridge first, which validates
+		 * it; a MAC changes nothing the bridge decides. */
+		if (f->hw) {
+			if (f->has_next && ft_mc_same_shape(&f->next, seen))
+				return;	/* already waiting to take over */
+			ether_addr_copy(f->next.dst_mac, seen->dst_mac);
+			ether_addr_copy(f->next.src_mac, seen->src_mac);
+			f->next.tagged = seen->tagged;
+			f->has_next = true;
+			if (seen->tagged != f->in_tagged)
+				f->dirty = true;
+			if (f->idle)
+				f->stale = true;
+			return;
+		}
+		/* With nothing installed there is nothing to wait for: the flow
+		 * takes the shape it is seen in, and one kept from an installed
+		 * phase is stale. The shape it had is a different answer now,
+		 * and its next frame has to be able to say so. */
+		ft_mc_drop_next(f);
+		if (seen->tagged != f->in_tagged)
+			f->dirty = true;
+		ether_addr_copy(f->dst_mac, seen->dst_mac);
+		ether_addr_copy(f->src_mac, seen->src_mac);
+		f->in_tagged = seen->tagged;
+		f->retries = 0;
+		f->stale = true;
+		ft_mc_forget_seen();
+		return;
+	}
+
+	bridge = ft_mc_namer(&key, seen->bridge_ifindex);
+	if (!bridge)
+		return;
 	in = dev_get_by_index(&init_net, seen->in_ifindex);
 	if (!in)
-		return false;
+		return;
 	if (!cdx_mc_port_identity(in)) {
 		dev_put(in);
-		return false;
+		return;
 	}
-	/* An installed group keeps the key it was installed with for as long
-	 * as that key carries traffic.
+	/* The group's flows on this bridge VLAN, and the one to give way if
+	 * there are as many as it may have.
 	 *
-	 * cdx_mc_group_replace() exchanges a listener set under a fixed key
-	 * and refuses anything else, so a new stream is a new entry rather than
-	 * a modified one. And a group with two live senders -- 239.255.255.250
-	 * has as many senders as there are hosts -- must not trade one entry
-	 * between them on every frame, taking the global control mutex each
-	 * time. So the stream is kept for later, and takes over once the
-	 * refresh finds the installed key idle: the sender's MAC changed, the
-	 * source moved, the stream now arrives elsewhere. Carrying several live
-	 * streams at once would take a set of hardware groups per membership. */
-	if (g->hw) {
-		ft_mc_drop_next(g);
-		g->next.in = in;
-		g->next.src = seen->src;
-		ether_addr_copy(g->next.dst_mac, seen->dst_mac);
-		ether_addr_copy(g->next.src_mac, seen->src_mac);
-		g->next.tagged = seen->tagged;
-		g->has_next = true;
-		return g->idle;
+	 * Past FT_MC_MAX_FLOWS a new source takes a place only when something
+	 * asked for that source by name -- an (S,G) membership, which an SSM
+	 * listener's report produces, or a route -- and only from a flow that
+	 * nothing names that way and nothing carries, which gives way at no
+	 * cost to the hardware. So a source an SSM listener asked for is not
+	 * refused because the group's other senders got here first, and none
+	 * of those can take a place back: a group every host sends to keeps
+	 * the first eight it saw, and the rest cost a lookup here rather than
+	 * a flow made, asked of the bridge under RTNL and retired again on
+	 * each of their frames. Nor is a place given up while the bridge
+	 * refuses the whole group -- the host joined it, or it floods -- since
+	 * the new source would be refused the same way. */
+	o = NULL;
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		if (f->gone || f->bridge != bridge ||
+		    !ft_mc_same_vlan_group(&f->addr, &key))
+			continue;
+		flows++;
+		counted |= f->turned;
+		shared |= f->derived && ft_mc_host_wants(f);
+		if (!f->hw && !ft_mc_source_named(bridge, &f->addr))
+			o = f;
 	}
-	/* With nothing installed there is nothing to wait for: the stream is
-	 * the group's now, and one kept from an installed phase is stale. */
-	ft_mc_drop_next(g);
-	if (g->in)
-		dev_put(g->in);
-	g->in = in;
-	g->src = seen->src;
-	ether_addr_copy(g->dst_mac, seen->dst_mac);
-	ether_addr_copy(g->src_mac, seen->src_mac);
-	g->in_tagged = seen->tagged;
-	g->retries = 0;
+	if (flows >= FT_MC_MAX_FLOWS) {
+		if (!o || shared || ft_mc_host_joined(bridge, &key) ||
+		    !ft_mc_source_named(bridge, &key)) {
+			/* Counted once until the group's flows change, which
+			 * the mark on each of them says. */
+			if (!counted) {
+				ft_mc_refused++;
+				list_for_each_entry(f, &ft_mc_flows, list)
+					if (!f->gone && f->bridge == bridge &&
+					    ft_mc_same_vlan_group(&f->addr, &key))
+						f->turned = true;
+			}
+			dev_put(in);
+			return;
+		}
+		ft_mc_refused++;
+		o->gone = true;
+	}
+	f = kzalloc(sizeof(*f), GFP_KERNEL);
+	if (!f) {
+		dev_put(in);
+		/* Nothing else would ask for the frame again. */
+		ft_mc_forget_seen();
+		return;
+	}
+	dev_hold(bridge);
+	f->bridge = bridge;
+	f->addr = key;
+	f->in = in;
+	ether_addr_copy(f->dst_mac, seen->dst_mac);
+	ether_addr_copy(f->src_mac, seen->src_mac);
+	f->in_tagged = seen->tagged;
+	f->dirty = true;
+	f->stale = true;
+	list_add_tail(&f->list, &ft_mc_flows);
+	ft_mc_flow_count++;
+	list_for_each_entry(o, &ft_mc_flows, list) {
+		/* The same key on another VLAN of the bridge: both are asked
+		 * again, and neither installs while both stand. */
+		if (o != f && ft_mc_same_key(o, f))
+			o->stale = true;
+		/* The group's flows changed, so a source turned away from now
+		 * on is news again. */
+		if (o->bridge == bridge && ft_mc_same_vlan_group(&o->addr, &key))
+			o->turned = false;
+	}
+}
+
+/* Put the shape a flow was keeping in place of the one it is keyed on. Called
+ * with ft_mc_lock held, once the installed key has been taken out of
+ * hardware. */
+static void ft_mc_adopt_next(struct ft_mc_flow *f)
+{
+	lockdep_assert_held(&ft_mc_lock);
+	if (!f->has_next)
+		return;
+	ether_addr_copy(f->dst_mac, f->next.dst_mac);
+	ether_addr_copy(f->src_mac, f->next.src_mac);
+	f->in_tagged = f->next.tagged;
+	ft_mc_drop_next(f);
+	f->retries = 0;
+}
+
+/* Whether frames arriving on `in` in this shape resolve to `vid`, as
+ * br_allowed_ingress() would resolve them now: a tag the port is a member of,
+ * or no tag and the port's PVID. Asked of every flow at every derivation,
+ * because none of the settings it reads emits a netdev event when it changes,
+ * and a root still accepting untagged frames on a port whose PVID moved would
+ * replicate another VLAN's traffic. A bridge that does not filter resolves
+ * everything to VLAN zero and forwards a tagged frame with its tag, which the
+ * copies it resolves carry none of; see ft_mc_hook(). Called with RTNL held. */
+static bool ft_mc_shape_resolves(struct net_device *bridge,
+				 struct net_device *in, bool tagged, u16 vid)
+{
+	struct bridge_vlan_info info;
+	u16 pvid, proto;
+
+	if (!br_vlan_enabled(bridge))
+		return !tagged && !vid;
+	if (tagged)
+		return !br_vlan_get_proto(bridge, &proto) &&
+		       proto == ETH_P_8021Q && !br_vlan_get_info(in, vid, &info);
+	return !br_vlan_get_pvid(in, &pvid) && pvid == vid;
+}
+
+static bool ft_mc_listeners_same(const struct cdx_mc_listener *a,
+				 const struct cdx_mc_listener *b, u8 n)
+{
+	u8 i;
+
+	/* Field by field: the listener struct has tail padding. */
+	for (i = 0; i < n; i++)
+		if (a[i].dev != b[i].dev || a[i].vlans != b[i].vlans ||
+		    memcmp(a[i].vlan, b[i].vlan, sizeof(a[i].vlan)))
+			return false;
 	return true;
 }
 
-/* Put the stream a group was keeping in place of the one it is keyed on.
- * Called with ft_mc_lock held, once the installed key has been taken out of
- * hardware; the reference `next.in` held becomes the group's own. */
-static void ft_mc_adopt_next(struct ft_mc_group *g)
-{
-	lockdep_assert_held(&ft_mc_lock);
-	if (!g->has_next)
-		return;
-	if (g->in)
-		dev_put(g->in);
-	g->in = g->next.in;
-	g->src = g->next.src;
-	ether_addr_copy(g->dst_mac, g->next.dst_mac);
-	ether_addr_copy(g->src_mac, g->next.src_mac);
-	g->in_tagged = g->next.tagged;
-	memset(&g->next, 0, sizeof(g->next));
-	g->has_next = false;
-	g->retries = 0;
-}
-
-/* Re-derive a group against the bridge's VLAN configuration as it now is.
+/* Ask the bridge what it does with this flow's frames, and keep the answer.
  *
- * Every tag decision the group holds was made against the configuration of
- * the moment: each listener's egress tag at its join, and the ingress shape
- * -- tagged, or untagged and resolved to the VLAN by the port's PVID -- at the
- * frame it was learned from. None of them emits a netdev event when it
- * changes. A listener whose membership changed is re-resolved, and one that
- * left the VLAN stops being a listener until it returns. An ingress whose
- * shape no longer resolves to this group's VLAN is forgotten, and the stream
- * is learned again from its next frame: a root still accepting untagged frames
- * on a port whose PVID moved would replicate another VLAN's traffic here.
+ * br_multicast_list_ports() models the bridge's own receive path for a frame
+ * of this source and group arriving on this port: an (S,G) entry before the
+ * (*,G) one under IGMPv3 and MLDv2, INCLUDE port groups the (*,G) lookup
+ * skips, ports that block the source, multicast router ports, never the
+ * ingress, no isolated port from an isolated one, and whether the frame also
+ * goes up to the host. Every one of those is a decision a membership alone
+ * cannot reproduce -- a switchdev object carries no filter mode -- and reading
+ * them off the bridge is what keeps the hardware from delivering a source a
+ * port excluded. Each port it names must be one the hardware can replicate to
+ * with the tags the bridge adds there, or the flow is refused whole.
  *
- * Called from the worker with RTNL, which the bridge VLAN lookups need, and
- * then ft_mc_lock -- the order the switchdev handler takes them in. */
-static void ft_mc_revalidate(struct ft_mc_group *g)
+ * A changed answer marks the flow for the install pass, and an unchanged one
+ * does not, so asking again at every refresh costs the hardware nothing.
+ *
+ * Called from the worker with RTNL, which the snapshot and the bridge VLAN
+ * lookups need, and then ft_mc_lock -- the order the switchdev handler takes
+ * them in. The ports the bridge names are borrowed until RTNL is released;
+ * the flow pins the ones it keeps. */
+static void ft_mc_flow_derive(struct ft_mc_flow *f)
 {
-	u16 pvid;
-	u8 i;
+	struct net_device *chosen[CDX_MC_MAX_LISTENERS];
+	struct cdx_mc_listener port[CDX_MC_MAX_LISTENERS];
+	unsigned int local = 0;
+	int n, error = 0;
+	u8 ports = 0, i;
 
 	ASSERT_RTNL();
 	lockdep_assert_held(&ft_mc_lock);
-	g->vlan_stale = false;
-	for (i = 0; i < g->ports; i++) {
-		struct ft_mc_port *p = &g->port[i];
-		struct cdx_ft_vlan stack[CDX_FT_VLAN_MAX] = {};
-		bool uncarried, absent = false;
-		u8 count = 0;
-		int rc;
-
-		/* A port that is not a CDX port stays what it was. */
-		if (!ft_mc_port_eligible(p->dev))
-			continue;
-		rc = ft_mc_port_tags(g->bridge, p->dev, g->addr.vid, stack, &count);
-		if (rc == -ENOENT) {
-			absent = true;
-			rc = 0;
-			count = 0;
-			memset(stack, 0, sizeof(stack));
+	f->dirty = false;
+	if (f->gone || !f->in)
+		return;
+	if (!ft_mc_shape_resolves(f->bridge, f->in, f->in_tagged, f->addr.vid)) {
+		/* Frames in this shape are another VLAN's now, or none: the
+		 * flow is over, and learned again from its next frame. */
+		f->gone = true;
+		return;
+	}
+	if (f->has_next &&
+	    !ft_mc_shape_resolves(f->bridge, f->in, f->next.tagged, f->addr.vid))
+		ft_mc_drop_next(f);
+	/* Read at every derivation, and so followed within a refresh when
+	 * whoever configures the bridge changes it; it changes nothing the
+	 * hardware holds. */
+	f->age = br_multicast_membership_interval(f->bridge, f->addr.vid);
+	memset(port, 0, sizeof(port));
+	n = br_multicast_list_ports(f->bridge, &f->addr, f->in, &local, chosen,
+				    ARRAY_SIZE(chosen));
+	if (n == -EINVAL) {
+		/* The ingress is no longer a port of this bridge: it left, and
+		 * its frames go wherever its new master sends them. */
+		f->gone = true;
+		return;
+	}
+	if (n < 0) {
+		error = n;
+		local = 0;
+	}
+	for (i = 0; !error && i < n; i++) {
+		if (!ft_mc_port_eligible(chosen[i]) ||
+		    ft_mc_port_tags(f->bridge, chosen[i], f->addr.vid,
+				    port[ports].vlan, &port[ports].vlans)) {
+			error = -EOPNOTSUPP;
+			break;
 		}
-		uncarried = rc != 0;
-		if (uncarried) {
-			count = 0;
-			memset(stack, 0, sizeof(stack));
-		}
-		if (p->absent == absent && p->uncarried == uncarried &&
-		    p->vlans == count && !memcmp(p->vlan, stack, sizeof(stack)))
-			continue;
-		if (uncarried && !p->uncarried)
-			ft_mc_refused++;
-		p->absent = absent;
-		p->uncarried = uncarried;
-		p->vlans = count;
-		memcpy(p->vlan, stack, sizeof(p->vlan));
-		g->dirty = true;
+		port[ports++].dev = chosen[i];
 	}
-	/* A stream waiting to take over was observed against the old
-	 * configuration too, and is simply seen again if it is still there. */
-	ft_mc_drop_next(g);
-	if (!g->in)
-		return;
-	/* A bridge that stopped filtering forwards a tagged frame with its
-	 * tag, and the listeners it resolves carry none; see ft_mc_hook(). */
-	if (!br_vlan_enabled(g->bridge)) {
-		if (g->in_tagged)
-			ft_mc_drop_stream(g);
-		return;
+	if (error) {
+		memset(port, 0, sizeof(port));
+		ports = 0;
 	}
-	if (g->in_tagged) {
-		struct bridge_vlan_info info;
-
-		if (!br_vlan_get_info(g->in, g->addr.vid, &info))
-			return;
-	} else if (!br_vlan_get_pvid(g->in, &pvid) && pvid == g->addr.vid) {
+	if (f->derived && error == f->error && local == f->local &&
+	    ports == f->ports && ft_mc_listeners_same(port, f->port, ports))
 		return;
-	}
-	ft_mc_drop_stream(g);
+	if (error && (!f->derived || !f->error))
+		ft_mc_refused++;
+	ft_mc_flow_release_ports(f);
+	for (i = 0; i < ports; i++)
+		dev_hold(port[i].dev);
+	memcpy(f->port, port, sizeof(f->port));
+	f->ports = ports;
+	f->local = local;
+	f->error = error;
+	f->derived = true;
+	/* A changed answer is a new question: retries spent against the old
+	 * one say nothing about this one. */
+	f->stale = true;
+	f->retries = 0;
 }
 
-/* Whether another membership on this bridge could resolve to the same
- * hardware key. The key is the stream's -- its port, its Ethernet pair and its
- * address pair -- and two memberships of one group in one VLAN can learn the
- * same stream; what they share before either has learned one is the group
- * address, so that is what is compared. In two VLANs they are two streams,
- * which collide only once both are learned and keyed alike: one port, one
- * sender, one source, whose single root could validate only one of the two
- * tags. A group with neither a member port nor an entry makes no claim: a host
- * membership keeps its group in software regardless, and a group a route
- * created is kept for the route alone. Called with ft_mc_lock held. */
-static bool ft_mc_key_contested(const struct ft_mc_group *g)
+/* Whether another flow on this bridge is the same classifier key: the same
+ * port, sender and source of the group, on another VLAN of the bridge. The
+ * one root could validate only one of the two tags, so neither may install.
+ * A flow the bridge hands to the host, or not asked yet, makes no claim.
+ * Called with ft_mc_lock held. */
+static bool ft_mc_key_contested(const struct ft_mc_flow *f)
 {
-	const struct ft_mc_group *o;
+	const struct ft_mc_flow *o;
 
 	lockdep_assert_held(&ft_mc_lock);
-	list_for_each_entry(o, &ft_mc_groups, list) {
-		if (o == g || o->bridge != g->bridge)
+	list_for_each_entry(o, &ft_mc_flows, list) {
+		if (o == f || o->gone || !ft_mc_same_key(o, f))
 			continue;
-		if (o->host || (!o->ports && !o->hw))
+		if (!o->hw && (!o->derived || ft_mc_host_wants(o)))
 			continue;	/* not a claim on the key */
-		if (o->addr.proto != g->addr.proto ||
-		    memcmp(&o->addr.dst, &g->addr.dst, sizeof(o->addr.dst)))
-			continue;
-		if (o->addr.vid != g->addr.vid &&
-		    (!o->in || o->in != g->in ||
-		     memcmp(&o->src, &g->src, sizeof(o->src)) ||
-		     !ether_addr_equal(o->src_mac, g->src_mac) ||
-		     !ether_addr_equal(o->dst_mac, g->dst_mac)))
-			continue;
 		return true;
 	}
 	return false;
 }
 
-/* Match what the hook observed against the memberships, oldest first. Called
- * by the worker with no lock held; each observation is taken under the ring's
- * lock and matched under ft_mc_lock. */
+/* Take what the hook observed, oldest first. Called by the worker with no lock
+ * held; each observation is taken under the ring's lock and matched under
+ * ft_mc_lock. */
 static void ft_mc_drain(void)
 {
 	struct ft_mc_seen seen;
-	struct ft_mc_group *g;
 
 	for (;;) {
 		spin_lock_bh(&ft_mc_ring_lock);
@@ -6320,136 +6557,146 @@ static void ft_mc_drain(void)
 		spin_unlock_bh(&ft_mc_ring_lock);
 
 		mutex_lock(&ft_mc_lock);
-		g = ft_mc_stopping ? NULL : ft_mc_match(&seen);
-		if (g && ft_mc_resolve(g, &seen))
-			g->dirty = true;
+		if (!ft_mc_stopping)
+			ft_mc_observe(&seen);
 		mutex_unlock(&ft_mc_lock);
 	}
 }
 
-/* The worker. Runs outside RTNL, so it may take the transaction -- and never
- * while holding ft_mc_lock, which is the ordering obligation stated above.
+/* The worker. Runs outside RTNL except while it asks the bridge, so it may
+ * take the transaction -- and never while holding ft_mc_lock or RTNL, which is
+ * the ordering obligation stated above.
  */
 static void ft_mc_work_fn(struct work_struct *work)
 {
-	struct ft_mc_group *g, *tmp;
+	struct ft_mc_group *g, *gtmp;
+	struct ft_mc_flow *f, *ftmp;
+	struct ft_mc_route *r;
+	bool want_hook, told, derive = false;
 	LIST_HEAD(dead);
-	bool want_hook, told;
+	LIST_HEAD(gone);
 
 	/* Something outside this learner changed an answer it gave, so every
-	 * refusal is stale. Retries go with it: a group that failed against a
-	 * port that has since changed is not a group that cannot be carried. */
+	 * refusal is stale. Retries go with it: a flow that failed against a
+	 * port that has since changed is not a flow that cannot be carried. */
 	if (READ_ONCE(ft_mc_recheck)) {
 		WRITE_ONCE(ft_mc_recheck, false);
 		mutex_lock(&ft_mc_lock);
-		list_for_each_entry(g, &ft_mc_groups, list) {
-			g->retries = 0;
-			g->dirty = true;
+		list_for_each_entry(f, &ft_mc_flows, list) {
+			f->retries = 0;
+			f->stale = true;
 		}
 		mutex_unlock(&ft_mc_lock);
-	}
-
-	/* A bridge's VLAN configuration changed under some groups. The lookups
-	 * need RTNL, taken before ft_mc_lock as the switchdev handler takes them,
-	 * and neither is held across the transaction below. */
-	if (READ_ONCE(ft_mc_vlan_stale)) {
-		WRITE_ONCE(ft_mc_vlan_stale, false);
-		rtnl_lock();
-		mutex_lock(&ft_mc_lock);
-		list_for_each_entry(g, &ft_mc_groups, list)
-			if (g->vlan_stale && !ft_mc_stopping)
-				ft_mc_revalidate(g);
-		/* A stream forgotten because its shape stopped resolving to
-		 * the group's VLAN may come back in exactly that shape once the
-		 * configuration returns. */
-		ft_mc_forget_seen();
-		mutex_unlock(&ft_mc_lock);
-		rtnl_unlock();
 	}
 
 	ft_mc_drain();
 
-	/* Match the routed learner's routes against the streams just resolved,
-	 * then retire what lost its last listener. */
+	/* Ask the bridge about every flow whose answer may have changed. The
+	 * snapshot and the VLAN lookups need RTNL, taken before ft_mc_lock as
+	 * the switchdev handler takes them, and neither is held across the
+	 * transaction below. */
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(f, &ft_mc_flows, list)
+		derive |= f->dirty;
+	mutex_unlock(&ft_mc_lock);
+	if (derive) {
+		rtnl_lock();
+		mutex_lock(&ft_mc_lock);
+		list_for_each_entry(f, &ft_mc_flows, list)
+			if (f->dirty && !ft_mc_stopping)
+				ft_mc_flow_derive(f);
+		mutex_unlock(&ft_mc_lock);
+		rtnl_unlock();
+	}
+
+	/* Match the routed learner's routes against the answers just derived,
+	 * then retire what nothing holds or names any more. */
 	mutex_lock(&ft_mc_lock);
 	if (!ft_mc_stopping)
 		ft_mc_match_routes();
-	ft_mc_retire(&dead);
+	ft_mc_retire(&dead, &gone);
 	mutex_unlock(&ft_mc_lock);
 
-	list_for_each_entry_safe(g, tmp, &dead, list) {
-		if (g->hw) {
-			/* Even while stopping. Skipping the delete would strand
-			 * the classifier entry, its group id and its listener
-			 * chain in hardware with nothing left to own them --
-			 * this group is already off the list ft_mc_exit()
-			 * drains, so nobody else would ever see it. */
-			cdx_ft_begin();
-			cdx_mc_group_del(&g->hw);
-			cdx_ft_end();
-			ft_mc_installed--;
-		}
+	list_for_each_entry_safe(g, gtmp, &dead, list) {
 		list_del(&g->list);
 		ft_mc_group_free(g);
 	}
+	list_for_each_entry_safe(f, ftmp, &gone, list) {
+		if (f->hw) {
+			/* Even while stopping. Skipping the delete would strand
+			 * the classifier entry, its group id and its listener
+			 * chain in hardware with nothing left to own them --
+			 * this flow is already off the list ft_mc_exit()
+			 * drains, so nobody else would ever see it. */
+			cdx_ft_begin();
+			cdx_mc_group_del(&f->hw);
+			cdx_ft_end();
+			ft_mc_installed--;
+		}
+		list_del(&f->list);
+		ft_mc_flow_free(f);
+	}
 
-	/* Install or update whatever is now installable. One group per pass
+	/* Install or update whatever is now installable. One flow per pass
 	 * through the list, because the transaction is dropped between each --
 	 * ft_mc_lock is never held across it. */
 	for (;;) {
 		struct cdx_mc_group_spec spec = {};
 		struct cdx_mc_group *hw = NULL, *stale = NULL;
 		struct ft_mc_route *route = NULL;
-		struct ft_mc_group *target = NULL;
+		struct ft_mc_flow *target = NULL;
 		bool replace = false, withdrew = false;
 		int rc = 0, gen;
 		u8 i;
 
 		mutex_lock(&ft_mc_lock);
-		list_for_each_entry(g, &ft_mc_groups, list) {
-			if (!g->dirty || ft_mc_stopping)
+		list_for_each_entry(f, &ft_mc_flows, list) {
+			if (!f->stale || ft_mc_stopping)
 				continue;
-			/* Not installable. A group that was installed and has
-			 * become ineligible is retired below rather than left
-			 * carrying stale ports. */
-			if (!ft_mc_installable(g) && !g->hw) {
-				g->dirty = false;
-				continue;
+			/* Not installable, or its key another's: nothing to put
+			 * in hardware and nothing there to take out, so no
+			 * transaction. A flow that was installed and has become
+			 * either is taken out below rather than left carrying
+			 * stale ports. */
+			if (!f->hw) {
+				f->contested = ft_mc_installable(f) &&
+					       ft_mc_key_contested(f);
+				if (!ft_mc_installable(f) || f->contested) {
+					f->stale = false;
+					continue;
+				}
 			}
-			target = g;
+			target = f;
 			break;
 		}
 		if (!target) {
 			mutex_unlock(&ft_mc_lock);
 			break;
 		}
-		target->dirty = false;
+		target->stale = false;
 		/* The installed key has carried nothing for a whole refresh while
-		 * another stream of the group reached the CPU: that stream takes
+		 * the flow reached the CPU in another shape: that shape takes
 		 * over. The old entry comes out first -- it matches nothing, so
 		 * its going costs no frame -- and the new one goes in as an add,
-		 * because a different key is a different entry. A different
-		 * source may be a different route's. */
+		 * because a different key is a different entry. */
 		if (target->hw && target->has_next && target->idle) {
 			stale = target->hw;
 			target->hw = NULL;
 			target->carried_route = NULL;
 			ft_mc_adopt_next(target);
-			ft_mc_match_group(target);
 		}
 		target->contested = ft_mc_key_contested(target);
 		gen = atomic_read(&ft_mc_egress_gen);
 		/* Snapshot under the lock; the hardware call happens after it
 		 * is dropped. Every device in the spec gets a reference of its
-		 * own for that window: the group's own pins are dropped by a
-		 * leave, which runs from the switchdev handler under RTNL and
-		 * takes no part in this transaction, so it can remove a port
-		 * between the snapshot and the call -- and a route's by the
-		 * routed learner. Borrowing either would leave the spec naming a
+		 * own for that window: the flow's own pins are dropped when a
+		 * port goes away, from the netdev chain under RTNL, which takes
+		 * no part in this transaction -- and a route's by the routed
+		 * learner. Borrowing either would leave the spec naming a
 		 * device whose last reference had just gone. */
 		if (!target->contested && ft_mc_installable(target) &&
 		    target->retries < FT_MC_MAX_RETRIES)
-			ft_mc_group_spec(target, &spec);
+			ft_mc_flow_spec(target, &spec);
 		hw = target->hw;
 		if (spec.listeners) {
 			replace = hw != NULL;
@@ -6473,10 +6720,9 @@ static void ft_mc_work_fn(struct work_struct *work)
 		}
 		cdx_ft_begin();
 		if (!spec.listeners) {
-			/* Became ineligible: take it out of hardware and leave
-			 * the membership, which may become installable again
-			 * when the host leaves, a port returns or a route
-			 * arrives. */
+			/* Became ineligible: take it out of hardware and keep
+			 * the flow, which may become installable again when the
+			 * host leaves, a port returns or a route arrives. */
 			if (hw) {
 				cdx_mc_group_del(&hw);
 				ft_mc_installed--;
@@ -6492,7 +6738,7 @@ static void ft_mc_work_fn(struct work_struct *work)
 				 * set installs, as a routed group's failed update
 				 * goes.
 				 *
-				 * Off the group before it is freed: /proc and the
+				 * Off the flow before it is freed: /proc and the
 				 * refresh read the entry under this transaction and
 				 * then ft_mc_lock, and one waiting for the
 				 * transaction would find it freed the moment this
@@ -6519,13 +6765,13 @@ static void ft_mc_work_fn(struct work_struct *work)
 		cdx_ft_end();
 
 		mutex_lock(&ft_mc_lock);
-		/* The group may have been retired while the transaction was
+		/* The flow may have been retired while the transaction was
 		 * held; it is still allocated, because only this function
 		 * frees one and it is not reentrant. */
 		if (spec.listeners || hw)
 			target->hw = hw;
 		/* What the entry was built with. A route withdrawn while the
-		 * transaction was held has already cleared the group's pointer
+		 * transaction was held has already cleared the flow's pointer
 		 * and marked it for another pass, and must not be recorded: its
 		 * owner is free to release it the moment it is off the list. */
 		if (spec.listeners && !rc)
@@ -6533,36 +6779,32 @@ static void ft_mc_work_fn(struct work_struct *work)
 						route : NULL;
 		if (!hw)
 			target->carried_route = NULL;
-		/* A new entry has counted nothing yet and is not idle until a
-		 * whole refresh says so. */
+		/* A new entry has counted nothing yet, is not idle until a
+		 * whole refresh says so, and ages from now. */
 		if (spec.listeners && !rc && !replace) {
 			target->hw_packets = target->hw_bytes = 0;
 			target->idle = false;
+			target->active = jiffies;
 		}
 		/* A port's queues changed while this chain was being built from
-		 * the old ones; ft_mc_egress_changed() could not tell a group
+		 * the old ones; ft_mc_egress_changed() could not tell a flow
 		 * that had no entry yet. Build it again. */
 		if (spec.listeners && !rc && atomic_read(&ft_mc_egress_gen) != gen)
-			target->dirty = true;
+			target->stale = true;
 		if (spec.listeners && rc) {
-			/* Try again rather than leaving a group pending for
-			 * good: a port that lost carrier gets it back, and
-			 * nothing else would wake this. Clearing the dedup
-			 * slot is what lets the next frame of the stream do
-			 * the waking -- without it every later frame looks
-			 * like one already recorded and the ring stays empty.
-			 */
-			if (++target->retries < FT_MC_MAX_RETRIES) {
-				target->dirty = true;
-				ft_mc_forget_seen();
-			}
+			/* Tried again at the next refresh, not now: a port
+			 * that lost carrier, or room another entry is about to
+			 * give back, needs time rather than repetition. See
+			 * ft_mc_refresh_fn(). */
+			target->retries++;
 		} else if (!rc) {
 			target->retries = 0;
 		}
-		/* Out of hardware and still a membership: its frames reach the
-		 * CPU again, and one recorded while the entry carried a
-		 * different answer must be able to be recorded again. */
-		if (withdrew)
+		/* Out of hardware and still a flow, or keyed on another shape:
+		 * frames the entry matched reach the CPU again, and one recorded
+		 * while the entry carried a different answer must be able to be
+		 * recorded again. */
+		if (withdrew || stale)
 			ft_mc_forget_seen();
 		mutex_unlock(&ft_mc_lock);
 		if (spec.listeners) {
@@ -6572,16 +6814,21 @@ static void ft_mc_work_fn(struct work_struct *work)
 		}
 	}
 
-	/* Somebody still waiting for a source keeps the hook registered, and so
-	 * does an installed group that has gone idle: its stream may simply
-	 * have stopped, or may be reaching the CPU as another sender's -- and
-	 * only a frame can say which. A group whose entry is carrying its
-	 * stream costs the hook nothing. And every route hears whether it is
-	 * in hardware now, which the routed learner reports and folds. */
+	/* A membership with a port, or a route, keeps the hook registered: any
+	 * of them can name a flow no frame has shown yet -- a second source, the
+	 * same one on another port -- and only a frame can say so. A host-only
+	 * membership cannot, since every flow of it goes to the host. And every
+	 * route hears whether it is in hardware now, which the routed learner
+	 * reports and folds. */
 	mutex_lock(&ft_mc_lock);
 	want_hook = false;
 	list_for_each_entry(g, &ft_mc_groups, list)
-		if (!g->host && (g->ports || g->routes) && (!g->hw || g->idle)) {
+		if (g->ports && !g->host) {
+			want_hook = true;
+			break;
+		}
+	list_for_each_entry(r, &ft_mc_routes, list)
+		if (r->listeners) {
 			want_hook = true;
 			break;
 		}
@@ -6593,69 +6840,94 @@ static void ft_mc_work_fn(struct work_struct *work)
 		ft_mc_hook_sync(want_hook);
 	else
 		ft_mc_hook_sync(false);
-	/* The refresh runs while anything is installed; see ft_mc_refresh_fn(). */
-	if (READ_ONCE(ft_mc_installed) && !READ_ONCE(ft_mc_stopping))
+	/* The refresh runs while any flow exists; see ft_mc_refresh_fn(). */
+	if (READ_ONCE(ft_mc_flow_count) && !READ_ONCE(ft_mc_stopping))
 		schedule_delayed_work(&ft_mc_refresh, FT_MC_REFRESH_INTERVAL);
 }
 
-/* The periodic half of the bridged learner: what each installed entry has
- * counted since the last pass.
+/* What an installed flow's entry counted since the last refresh, read at `now`.
  *
- * An entry that counted nothing for a whole interval is idle. That reopens the
- * traffic hook, because an idle entry is either a stream that stopped or one
- * whose frames no longer match it -- a sender whose MAC changed, a source that
- * moved -- and those are reaching the CPU and the bridge in software. A stream
- * the hook saw in the meantime takes over the key. The transaction first and
- * the lock second, which is /proc's order and so the only one either may use.
- */
+ * An entry that counted nothing for a whole interval is idle, and an idle
+ * entry is either a stream that stopped or one whose frames no longer match
+ * it -- a sender whose MAC changed, a tag the port now carries -- and those
+ * are reaching the CPU and the bridge in software. A shape the hook saw in the
+ * meantime takes over the key.
+ *
+ * An entry that has counted nothing for as long as the bridge keeps a
+ * membership nobody refreshes is a stream that stopped. It goes: the entry
+ * and its place among the group's flows are for a source that is sending, and
+ * a source that resumes reaches the CPU again, where the hook learns it as it
+ * learned it the first time. Only an entry's own count says so; a flow never
+ * in hardware has none, and is bounded by the group's flows instead.
+ *
+ * Called with the transaction and ft_mc_lock held. */
+static void ft_mc_flow_counted(struct ft_mc_flow *f,
+			       const struct cdx_ft_counters *stats,
+			       unsigned long now)
+{
+	bool idle = stats->packets == f->hw_packets;
+
+	/* Every frame the root matched since the last pass is one the bridge
+	 * would have handed the host for ipmr to route, so it is added to the
+	 * route's count, which the routed learner folds into the MFC's. Added,
+	 * because more than one flow can carry a route and an entry counts
+	 * from zero again when it is replaced by another; a sample below the
+	 * last is distrusted. */
+	if (f->carried_route && stats->packets >= f->hw_packets &&
+	    stats->bytes >= f->hw_bytes) {
+		spin_lock_bh(&ft_mc_route_lock);
+		f->carried_route->stats.packets += stats->packets - f->hw_packets;
+		f->carried_route->stats.bytes += stats->bytes - f->hw_bytes;
+		spin_unlock_bh(&ft_mc_route_lock);
+	}
+	if (stats->packets > f->hw_packets)
+		f->active = now;
+	f->hw_packets = stats->packets;
+	f->hw_bytes = stats->bytes;
+	f->idle = idle;
+	if (idle && f->has_next)
+		f->stale = true;
+	if (f->age && time_after(now, f->active + f->age))
+		f->gone = true;
+}
+
+/* The periodic half of the bridged learner: what each installed entry has
+ * counted since the last pass, and every flow asked of the bridge again.
+ *
+ * Asking every flow again is for what the bridge decides by and never
+ * announces: a querier appearing or timing out turns snooping, and so every
+ * answer, on and off with no switchdev event at all. An unchanged answer costs
+ * RTNL for the asking and nothing in hardware. The transaction first and the
+ * lock second, which is /proc's order and so the only one either may use. */
 static void ft_mc_refresh_fn(struct work_struct *work)
 {
 	struct cdx_ft_counters stats;
-	struct ft_mc_group *g;
-	bool kick = false;
+	struct ft_mc_flow *f;
 
 	if (READ_ONCE(ft_mc_stopping))
 		return;
 	cdx_ft_begin();
 	mutex_lock(&ft_mc_lock);
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		bool idle;
-
-		if (!g->hw)
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		f->dirty = true;
+		/* A failed install is tried again one interval apart, up to the
+		 * ceiling, which is what stops a flow that cannot be carried
+		 * from costing a transaction every interval for good. */
+		if (!f->hw && f->retries && f->retries < FT_MC_MAX_RETRIES)
+			f->stale = true;
+		if (!f->hw)
 			continue;
-		cdx_mc_group_stats(g->hw, &stats);
-		idle = stats.packets == g->hw_packets;
-		/* Every frame the root matched since the last pass is one the
-		 * bridge would have handed the host for ipmr to route, so it is
-		 * added to the route's count, which the routed learner folds
-		 * into the MFC's. Added, because more than one group can carry
-		 * a route and an entry counts from zero again when it is
-		 * replaced by another; a sample below the last is distrusted. */
-		if (g->carried_route && stats.packets >= g->hw_packets &&
-		    stats.bytes >= g->hw_bytes) {
-			spin_lock_bh(&ft_mc_route_lock);
-			g->carried_route->stats.packets += stats.packets - g->hw_packets;
-			g->carried_route->stats.bytes += stats.bytes - g->hw_bytes;
-			spin_unlock_bh(&ft_mc_route_lock);
-		}
-		g->hw_packets = stats.packets;
-		g->hw_bytes = stats.bytes;
-		if (idle != g->idle)
-			kick = true;
-		g->idle = idle;
-		if (idle && g->has_next) {
-			g->dirty = true;
-			kick = true;
-		}
+		cdx_mc_group_stats(f->hw, &stats);
+		ft_mc_flow_counted(f, &stats, jiffies);
 	}
 	mutex_unlock(&ft_mc_lock);
 	cdx_ft_end();
 	if (READ_ONCE(ft_mc_stopping))
 		return;
-	if (kick)
+	if (READ_ONCE(ft_mc_flow_count)) {
 		schedule_work(&ft_mc_work);
-	if (READ_ONCE(ft_mc_installed))
 		schedule_delayed_work(&ft_mc_refresh, FT_MC_REFRESH_INTERVAL);
+	}
 }
 
 /* The MDB half of the switchdev chain.
@@ -6714,14 +6986,13 @@ static bool ft_mc_swdev_obj(unsigned long event,
 	 * multicast MAC it folds into, which 32 groups share and which this
 	 * classifier cannot key on at all. A zero proto means the object came
 	 * from a path that does not populate it. */
-	if (!mdb->group.proto)
+	if (!mdb->group.proto || ft_mc_link_local(&mdb->group))
 		return false;
 	/* A blocked port group is one an IGMPv3 source filter says must NOT
-	 * receive this source; br_forward() skips it. Installing it as an
-	 * ordinary listener would deliver exactly what the filter excluded,
-	 * and with the frame no longer reaching the bridge there would be no
-	 * software path left to correct it. Treat it as a leave: whatever the
-	 * port had, it does not have this. */
+	 * receive this source; br_forward() skips it. As a membership it holds
+	 * nothing, so it is a leave of the (S,G) record; what it does to the
+	 * group's flows is the bridge's answer, which leaves the port out and
+	 * which every flow of the group is asked for again below. */
 	if (mdb->flags & SWITCHDEV_OBJ_MDB_F_BLOCKED)
 		adding = false;
 
@@ -6734,19 +7005,43 @@ static bool ft_mc_swdev_obj(unsigned long event,
 	return taken;
 }
 
-/* A device this learner holds is going away or has stopped forwarding.
+/* Whether a flow names a device: its bridge, its ingress, or a copy. */
+static bool ft_mc_flow_names_dev(const struct ft_mc_flow *f,
+				 const struct net_device *dev)
+{
+	u8 i;
+
+	if (f->bridge == dev || f->in == dev)
+		return true;
+	for (i = 0; i < f->ports; i++)
+		if (f->port[i].dev == dev)
+			return true;
+	return false;
+}
+
+/* A device this learner holds is going away (`unregistering`) or has stopped
+ * forwarding.
  *
  * Runs from the netdev chain under RTNL, so it may take ft_mc_lock and must
- * not touch the backend -- the worker does that. Three roles to clear: a
- * listener, a group's ingress, and the bridge itself. The bridge reports the
- * first through the MDB, but only sometimes and sometimes too late, and it
- * reports the other two never.
+ * not touch the backend -- the worker does that.
+ *
+ * A device that stopped forwarding is still what it was: the bridge keeps a
+ * permanent port group across a link going down, and never announces it again
+ * when the link returns, so a membership naming the device stands. Every flow
+ * naming it is asked of the bridge again, whose answer leaves out a port that
+ * is not forwarding and forwards nothing received on one.
+ *
+ * One going away is four roles to clear: a membership's port, a flow's copy, a
+ * flow's ingress, and the bridge itself. The bridge reports the first through
+ * the MDB, but only sometimes and sometimes too late, and it reports the
+ * others never.
  */
-static void ft_mc_device_gone(struct net_device *dev)
+static void ft_mc_device_gone(struct net_device *dev, bool unregistering)
 {
-	bool changed = false, lost_ingress = false;
+	bool changed = false;
 	struct ft_mc_route *r;
 	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 	unsigned int i, n;
 	u8 j;
 
@@ -6774,53 +7069,65 @@ static void ft_mc_device_gone(struct net_device *dev)
 	}
 	memset(&ft_mc_taps[n], 0, (ft_mc_tap_count - n) * sizeof(ft_mc_taps[0]));
 	ft_mc_tap_count = n;
+	if (!unregistering) {
+		list_for_each_entry(f, &ft_mc_flows, list) {
+			if (!ft_mc_flow_names_dev(f, dev))
+				continue;
+			f->dirty = true;
+			changed = true;
+		}
+		goto out;
+	}
 	ft_mc_drop_port(dev);
 	list_for_each_entry(g, &ft_mc_groups, list) {
-		if (g->in == dev) {
-			/* Back to pending: the membership is still what the
-			 * bridge says, and a stream arriving on some other
-			 * port -- or on this one, once it is back -- resolves
-			 * it again. The same frame as before included. */
-			ft_mc_drop_stream(g);
-			lost_ingress = true;
+		if (g->bridge != dev)
+			continue;
+		/* The bridge itself. Its memberships cannot outlive it, and
+		 * emptying them is what makes the worker retire them. */
+		while (g->ports) {
+			g->ports--;
+			dev_put(g->port[g->ports]);
+			g->port[g->ports] = NULL;
 		}
-		if (g->has_next && g->next.in == dev)
-			ft_mc_drop_next(g);
-		if (g->bridge == dev) {
-			/* The bridge itself. Its memberships cannot outlive
-			 * it, and dropping every port is what makes the
-			 * worker retire the group. */
-			while (g->ports) {
-				g->ports--;
-				dev_put(g->port[g->ports].dev);
-				memset(&g->port[g->ports], 0,
-				       sizeof(g->port[0]));
-			}
-			g->host = false;
-			g->dirty = true;
-		}
-		changed |= g->dirty;
+		g->host = false;
+		changed = true;
 	}
-	if (lost_ingress)
-		ft_mc_forget_seen();
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		if (f->in == dev || f->bridge == dev) {
+			/* The flow's ingress, or its bridge: the flow is over.
+			 * The reference goes now, because the device is waiting
+			 * for it to unregister. */
+			if (f->in) {
+				dev_put(f->in);
+				f->in = NULL;
+			}
+			f->gone = true;
+			changed = true;
+		}
+		ft_mc_flow_drop_port(f, dev);
+		changed |= f->dirty;
+	}
+out:
 	mutex_unlock(&ft_mc_lock);
 	if (changed && !READ_ONCE(ft_mc_stopping))
 		schedule_work(&ft_mc_work);
 }
 
-/* A bridge's VLAN configuration changed: a port's membership, the bridge's
- * own, its filtering or its protocol. `dev` is the bridge or one of its
- * ports.
+/* Mark every flow on the bridge `dev` is, or is a port of, to be asked of the
+ * bridge again. Called from the switchdev chain under RTNL for whatever the
+ * bridge decides a flow's ports by and reports as an attribute or a VLAN
+ * object: a port's VLAN membership, the bridge's own, its filtering or
+ * protocol, a port's STP state, its flags, its multicast router state, the
+ * bridge's snooping and its own router state.
  *
- * Every group on that bridge is marked for re-derivation rather than
- * re-derived here. This runs from the switchdev chain under RTNL, and a
- * port VLAN object is notified before the bridge applies it, so the state it
- * describes is not yet the state the lookups would read. The worker reads it
- * afterwards, under RTNL of its own; see ft_mc_revalidate(). */
-static void ft_mc_vlan_changed(struct net_device *dev)
+ * Marked rather than asked here. A port VLAN object is notified before the
+ * bridge applies it, so the state it describes is not yet the state the
+ * snapshot would read; the worker reads it afterwards, under RTNL of its own.
+ * See ft_mc_flow_derive(). */
+static void ft_mc_bridge_changed(struct net_device *dev)
 {
 	struct net_device *bridge;
-	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 	bool marked = false;
 
 	bridge = netif_is_bridge_master(dev) ? dev :
@@ -6828,43 +7135,64 @@ static void ft_mc_vlan_changed(struct net_device *dev)
 	if (!bridge || !netif_is_bridge_master(bridge))
 		return;
 	mutex_lock(&ft_mc_lock);
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		if (g->bridge != bridge)
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		if (f->bridge != bridge)
 			continue;
-		g->vlan_stale = true;
+		f->dirty = true;
 		marked = true;
 	}
 	mutex_unlock(&ft_mc_lock);
-	if (marked && !READ_ONCE(ft_mc_stopping)) {
-		WRITE_ONCE(ft_mc_vlan_stale, true);
+	if (marked && !READ_ONCE(ft_mc_stopping))
 		schedule_work(&ft_mc_work);
-	}
 }
 
-/* This learner's half of ft_mc_egress_changed(): every installed group with a
- * copy on `dev` -- a member port, or a route's copy riding the group -- is
- * marked for the worker, whose replace rebuilds the whole chain. Takes
- * ft_mc_lock and nothing else. Returns how many were marked. */
+/* A device changed its master: a port joined or left a bridge. A flow keyed on
+ * a port that left is over, and one copying to it loses that copy, but the
+ * bridge says neither -- the port's memberships are flushed after it is
+ * unlinked, and nothing at all is said about an ingress -- so every flow
+ * naming the device is asked of the bridge again, which answers both.
+ * Called from the netdev chain under RTNL. */
+static void ft_mc_port_moved(struct net_device *dev)
+{
+	struct ft_mc_flow *f;
+	bool marked = false;
+
+	mutex_lock(&ft_mc_lock);
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		if (!ft_mc_flow_names_dev(f, dev))
+			continue;
+		f->dirty = true;
+		marked = true;
+	}
+	mutex_unlock(&ft_mc_lock);
+	if (marked && !READ_ONCE(ft_mc_stopping))
+		schedule_work(&ft_mc_work);
+}
+
+/* This learner's half of ft_mc_egress_changed(): every installed flow with a
+ * copy on `dev` -- a port the bridge forwards it to, or a route's copy riding
+ * it -- is marked for the worker, whose replace rebuilds the whole chain.
+ * Takes ft_mc_lock and nothing else. Returns how many were marked. */
 static unsigned int ft_mc_egress_mark(const struct net_device *dev)
 {
 	unsigned int marked = 0;
-	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 	u8 i;
 
 	mutex_lock(&ft_mc_lock);
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		const struct ft_mc_route *r = g->carried_route;
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		const struct ft_mc_route *r = f->carried_route;
 		bool hit = false;
 
-		if (!g->hw)
+		if (!f->hw)
 			continue;
-		for (i = 0; i < g->ports; i++)
-			hit |= !g->port[i].absent && g->port[i].dev == dev;
+		for (i = 0; i < f->ports; i++)
+			hit |= f->port[i].dev == dev;
 		for (i = 0; r && i < r->listeners; i++)
 			hit |= r->listener[i].dev == dev;
 		if (!hit)
 			continue;
-		g->dirty = true;
+		f->stale = true;
 		marked++;
 	}
 	if (marked && !ft_mc_stopping)
@@ -6876,8 +7204,10 @@ static unsigned int ft_mc_egress_mark(const struct net_device *dev)
 static void ft_mc_exit(void)
 {
 	struct ft_mc_route *r, *rtmp;
-	struct ft_mc_group *g, *tmp;
+	struct ft_mc_group *g, *gtmp;
+	struct ft_mc_flow *f, *ftmp;
 	LIST_HEAD(dead);
+	LIST_HEAD(gone);
 	unsigned int i;
 
 	mutex_lock(&ft_mc_lock);
@@ -6901,13 +7231,14 @@ static void ft_mc_exit(void)
 	ft_mc_hook_sync(false);
 	/* The chain is already unregistered by the caller, so nothing can add
 	 * a membership while this drains. The routed learner still runs until
-	 * ft_mr_exit() and still reaches the routes, the taps and the group
-	 * list through the functions above, so all three are emptied under the
-	 * lock; with ft_mc_stopping set, nothing it calls refills them. Routes
-	 * stay allocated -- their owners free them -- and only come off the
-	 * list and let go of their devices. */
+	 * ft_mr_exit() and still reaches the routes, the taps and the flows
+	 * through the functions above, so all are emptied under the lock; with
+	 * ft_mc_stopping set, nothing it calls refills them. Routes stay
+	 * allocated -- their owners free them -- and only come off the list
+	 * and let go of their devices. */
 	mutex_lock(&ft_mc_lock);
 	list_splice_init(&ft_mc_groups, &dead);
+	list_splice_init(&ft_mc_flows, &gone);
 	list_for_each_entry_safe(r, rtmp, &ft_mc_routes, list) {
 		list_del(&r->list);
 		r->linked = false;
@@ -6921,78 +7252,141 @@ static void ft_mc_exit(void)
 	memset(ft_mc_taps, 0, sizeof(ft_mc_taps));
 	ft_mc_tap_count = 0;
 	mutex_unlock(&ft_mc_lock);
-	list_for_each_entry_safe(g, tmp, &dead, list) {
-		if (g->hw) {
+	list_for_each_entry_safe(f, ftmp, &gone, list) {
+		if (f->hw) {
 			cdx_ft_begin();
-			cdx_mc_group_del(&g->hw);
+			cdx_mc_group_del(&f->hw);
 			cdx_ft_end();
 		}
+		list_del(&f->list);
+		ft_mc_flow_free(f);
+	}
+	list_for_each_entry_safe(g, gtmp, &dead, list) {
 		list_del(&g->list);
 		ft_mc_group_free(g);
 	}
 	ft_mc_count = 0;
+	ft_mc_flow_count = 0;
 	ft_mc_installed = 0;
 }
 
-/* Why a group is not being replicated, for an operator looking at a stream
- * that is not offloaded. "Pending" alone would answer three different
+/* Why a flow is not being replicated, for an operator looking at a stream
+ * that is not offloaded. "Pending" alone would answer several different
  * questions with one word. */
-static const char *ft_mc_state(const struct ft_mc_group *g)
+static const char *ft_mc_state(const struct ft_mc_flow *f)
 {
-	if (g->host)
+	if (!f->derived)
+		return "pending";
+	/* Before "installed", deliberately: a flow whose answer has just
+	 * changed is still in the table for one more worker pass, and what an
+	 * operator needs to read in that window is the reason it is about to
+	 * come out. */
+	if (ft_mc_host_wants(f))
 		return "refused-host";
-	/* Before "installed", deliberately: a group that has just gained a
-	 * member the hardware cannot carry is still in the table for one more
-	 * worker pass, and what an operator needs to read in that window is
-	 * the reason it is about to come out. */
-	/* The host routes this stream and no route of it can ride the group:
-	 * a stream not yet learned has not been asked. */
-	if (g->in && g->routed_host && !ft_mc_live_route(g))
+	/* The host routes this stream and no route of it can ride the flow. */
+	if (f->routed_host && !ft_mc_live_route(f))
 		return "refused-routed";
-	if (!ft_mc_carriable(g))
+	/* A port the hardware cannot carry, more of them than it can, or none
+	 * at all: every listener is behind the ingress, or blocks the source. */
+	if (!ft_mc_carriable(f) || (!f->ports && !ft_mc_live_route(f)))
 		return "refused-listener";
-	if (!ft_mc_mtu_bounded(g))
+	if (!ft_mc_mtu_bounded(f))
 		return "refused-mtu";
-	if (g->contested)
+	if (f->contested)
 		return "refused-contested";
-	if (g->retries >= FT_MC_MAX_RETRIES)
+	if (f->retries >= FT_MC_MAX_RETRIES)
 		return "refused-failed";
-	if (g->hw)
+	if (f->hw)
 		return "installed";
-	if (!g->in)
-		return "pending-source";
 	return "pending";
 }
 
+/* The source of the most specific membership naming a flow: its own for an
+ * (S,G) one, zero for a (*,G) one. Called with ft_mc_lock held. */
+static const struct br_ip *ft_mc_member_src(const struct ft_mc_flow *f)
+{
+	static const struct br_ip any;
+	const struct ft_mc_group *g;
+
+	list_for_each_entry(g, &ft_mc_groups, list)
+		if (g->bridge == f->bridge && (g->ports || g->host) &&
+		    ft_mc_same_vlan_group(&g->addr, &f->addr) &&
+		    !memcmp(&g->addr.src, &f->addr.src, sizeof(g->addr.src)))
+			return &g->addr;
+	return &any;
+}
+
+/* Whether a membership names any flow, which then speaks for it in /proc.
+ * Called with ft_mc_lock held. */
+static bool ft_mc_group_has_flow(const struct ft_mc_group *g)
+{
+	const struct ft_mc_flow *f;
+
+	list_for_each_entry(f, &ft_mc_flows, list)
+		if (f->bridge == g->bridge &&
+		    ft_mc_same_vlan_group(&g->addr, &f->addr) &&
+		    (!memchr_inv(&g->addr.src, 0, sizeof(g->addr.src)) ||
+		     !memcmp(&g->addr.src, &f->addr.src, sizeof(g->addr.src))))
+			return true;
+	return false;
+}
+
+static void ft_mc_row(struct seq_file *seq, const struct net_device *bridge,
+		      const struct br_ip *addr, const struct br_ip *member,
+		      const char *ports, const char *routed,
+		      const struct net_device *in, u16 in_vid, const u8 *smac,
+		      const u8 *dmac, const char *state,
+		      const struct cdx_ft_counters *stats)
+{
+	if (addr->proto == htons(ETH_P_IPV6))
+		seq_printf(seq,
+			   "mcast br=%s family=6 group=%pI6c member_src=%pI6c src=%pI6c vid=%u ports=%s routed=%s in=%s in_vid=%u smac=%pM dmac=%pM state=%s packets=%llu bytes=%llu\n",
+			   bridge->name, &addr->dst.ip6, &member->src.ip6,
+			   &addr->src.ip6, addr->vid, ports, routed,
+			   in ? in->name : "-", in_vid, smac, dmac, state,
+			   stats->packets, stats->bytes);
+	else
+		seq_printf(seq,
+			   "mcast br=%s family=4 group=%pI4 member_src=%pI4 src=%pI4 vid=%u ports=%s routed=%s in=%s in_vid=%u smac=%pM dmac=%pM state=%s packets=%llu bytes=%llu\n",
+			   bridge->name, &addr->dst.ip4, &member->src.ip4,
+			   &addr->src.ip4, addr->vid, ports, routed,
+			   in ? in->name : "-", in_vid, smac, dmac, state,
+			   stats->packets, stats->bytes);
+}
+
+/* One row per flow, and one per membership that names none yet -- the
+ * memberships a flow speaks for are the reason it exists, not rows of their
+ * own. */
 static void ft_mc_rows(struct seq_file *seq)
 {
+	static const u8 none[ETH_ALEN];
 	char ports[192], routed[192];
 	struct cdx_ft_counters stats;
 	struct ft_mc_group *g;
+	struct ft_mc_flow *f;
 	u8 i;
 
 	/* Read outside the transaction the caller holds, which is what the
 	 * ordering rule requires: /proc takes cdx_ft_begin() then this, so the
 	 * worker must never take them the other way round. It does not. */
 	mutex_lock(&ft_mc_lock);
-	list_for_each_entry(g, &ft_mc_groups, list) {
-		const struct ft_mc_route *r = g->carried_route ?: g->route;
+	list_for_each_entry(f, &ft_mc_flows, list) {
+		const struct ft_mc_route *r = f->carried_route ?: f->route;
 		size_t n = 0;
 
 		/* What the classifier entry actually matched. The one number
-		 * that distinguishes a group the hardware is carrying from one
-		 * that is merely in the table: an installed group whose count
+		 * that distinguishes a flow the hardware is carrying from one
+		 * that is merely in the table: an installed flow whose count
 		 * stays at zero while its stream runs is being forwarded by
 		 * the bridge in software, and every other field looks
 		 * identical in both cases. The caller holds the transaction
 		 * this read needs. */
-		cdx_mc_group_stats(g->hw, &stats);
+		cdx_mc_group_stats(f->hw, &stats);
 		ports[0] = '\0';
-		for (i = 0; i < g->ports; i++)
-			n += scnprintf(ports + n, sizeof(ports) - n, "%s%s/%u%s",
-				       i ? "," : "", g->port[i].dev->name,
-				       g->port[i].vlans ? g->port[i].vlan[0].id : 0,
-				       g->port[i].absent ? "!" : "");
+		for (i = 0; i < f->ports; i++)
+			n += scnprintf(ports + n, sizeof(ports) - n, "%s%s/%u",
+				       i ? "," : "", f->port[i].dev->name,
+				       f->port[i].vlans ? f->port[i].vlan[0].id : 0);
 		/* The route's copies beside the bridge's own: the ports each
 		 * leaves and the tag it leaves with. */
 		routed[0] = '\0';
@@ -7001,35 +7395,35 @@ static void ft_mc_rows(struct seq_file *seq)
 				       i ? "," : "", r->listener[i].dev->name,
 				       r->listener[i].vlans ?
 					       r->listener[i].vlan[0].id : 0);
-		/* Two sources, and the difference is the whole design: `member`
-		 * is what the bridge asked for -- zero for a (*,G) join -- and
-		 * `src` is what the traffic taught us, which is the one in the
-		 * hardware key. Showing only the first makes an installed group
-		 * look unkeyed. The Ethernet pair and the ingress tag are the
-		 * rest of that key; `in_vid` is 0 for a stream that arrives
-		 * untagged on the port's PVID. */
-		if (g->addr.proto == htons(ETH_P_IPV6))
-			seq_printf(seq,
-				   "mcast br=%s family=6 group=%pI6c member_src=%pI6c src=%pI6c vid=%u ports=%s routed=%s in=%s in_vid=%u smac=%pM dmac=%pM state=%s packets=%llu bytes=%llu\n",
-				   g->bridge->name, &g->addr.dst.ip6,
-				   &g->addr.src.ip6, &g->src.in6, g->addr.vid,
-				   g->ports ? ports : "-",
-				   routed[0] ? routed : "-",
-				   g->in ? g->in->name : "-",
-				   g->in_tagged ? g->addr.vid : 0,
-				   g->src_mac, g->dst_mac,
-				   ft_mc_state(g), stats.packets, stats.bytes);
-		else
-			seq_printf(seq,
-				   "mcast br=%s family=4 group=%pI4 member_src=%pI4 src=%pI4 vid=%u ports=%s routed=%s in=%s in_vid=%u smac=%pM dmac=%pM state=%s packets=%llu bytes=%llu\n",
-				   g->bridge->name, &g->addr.dst.ip4,
-				   &g->addr.src.ip4, &g->src.ip, g->addr.vid,
-				   g->ports ? ports : "-",
-				   routed[0] ? routed : "-",
-				   g->in ? g->in->name : "-",
-				   g->in_tagged ? g->addr.vid : 0,
-				   g->src_mac, g->dst_mac,
-				   ft_mc_state(g), stats.packets, stats.bytes);
+		/* Two sources, and the difference is the whole design:
+		 * `member_src` is what the bridge was asked for -- zero for a
+		 * (*,G) join -- and `src` is what the traffic taught us, which
+		 * is the one in the hardware key. The Ethernet pair and the
+		 * ingress tag are the rest of that key; `in_vid` is 0 for a
+		 * stream that arrives untagged on the port's PVID. */
+		ft_mc_row(seq, f->bridge, &f->addr, ft_mc_member_src(f),
+			  f->ports ? ports : "-", routed[0] ? routed : "-",
+			  f->in, f->in_tagged ? f->addr.vid : 0, f->src_mac,
+			  f->dst_mac, ft_mc_state(f), &stats);
+	}
+	memset(&stats, 0, sizeof(stats));
+	list_for_each_entry(g, &ft_mc_groups, list) {
+		struct br_ip unlearned = g->addr;
+		size_t n = 0;
+
+		if (ft_mc_group_has_flow(g))
+			continue;
+		/* A membership waiting for its first frame: the ports holding
+		 * it, which are not yet anything the bridge forwards to, and no
+		 * source the traffic has taught. */
+		ports[0] = '\0';
+		for (i = 0; i < g->ports; i++)
+			n += scnprintf(ports + n, sizeof(ports) - n, "%s%s",
+				       i ? "," : "", g->port[i]->name);
+		memset(&unlearned.src, 0, sizeof(unlearned.src));
+		ft_mc_row(seq, g->bridge, &unlearned, &g->addr,
+			  g->ports ? ports : "-", "-", NULL, 0, none, none,
+			  g->host ? "refused-host" : "pending-source", &stats);
 	}
 	mutex_unlock(&ft_mc_lock);
 }
@@ -7573,7 +7967,10 @@ static int ft_mr_expand_bridge(struct net_device *bridge,
 		group.src.ip4 = src->ip;
 		group.dst.ip4 = dst->ip;
 	}
-	n = br_multicast_list_ports(bridge, &group, chosen, ARRAY_SIZE(chosen));
+	/* Sent by the host through the bridge device, as ipmr's copy is: no
+	 * ingress port, and nothing handed back up to the host. */
+	n = br_multicast_list_ports(bridge, &group, NULL, NULL, chosen,
+				    ARRAY_SIZE(chosen));
 	if (n < 0)
 		return n;
 	for (i = 0; i < n; i++) {
@@ -10566,9 +10963,13 @@ static int ft_show(struct seq_file *seq, void *v)
 	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, false);
 	seq_printf(seq, "tunnel_records %u\ntunnel_slots %u\n", tunnel_records, tunnel_slots);
 	ft_dev_rows(seq, CDX_FT_STATS_PLAIN, true);
-	seq_printf(seq, "mcast_groups %u\nmcast_installed %u\nmcast_refused %llu\nmcast_install_errors %llu\n"
-		   "mcast_observed %llu\nmcast_dropped %llu\nmcast_hooked %u\nmcast_hook_errors %llu\n",
-		   ft_mc_count, ft_mc_installed, ft_mc_refused,
+	/* Memberships the bridge reported, and the flows learned from traffic
+	 * that they and the routed learner's routes name; `installed` counts
+	 * flows, each one classifier entry. */
+	seq_printf(seq, "mcast_groups %u\nmcast_flows %u\nmcast_installed %u\nmcast_refused %llu\n"
+		   "mcast_install_errors %llu\nmcast_observed %llu\nmcast_dropped %llu\n"
+		   "mcast_hooked %u\nmcast_hook_errors %llu\n",
+		   ft_mc_count, ft_mc_flow_count, ft_mc_installed, ft_mc_refused,
 		   ft_mc_install_errors, ft_mc_observed, ft_mc_dropped,
 		   ft_mc_hooked, ft_mc_hook_errors);
 	/* Installed groups of either learner rebuilt because a port they copy

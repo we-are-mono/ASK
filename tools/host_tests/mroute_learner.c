@@ -255,11 +255,15 @@ struct br_ip {
 static int snapshot_error;
 static int br_multicast_list_ports(struct net_device *bridge,
                                   const struct br_ip *group,
+                                  struct net_device *in_dev, unsigned *local,
                                   struct net_device **ports, unsigned max)
 {
     struct net_device *port;
     struct list_head *iter;
     unsigned n = 0;
+    /* A routed copy is sent by the host through the bridge device: there
+     * is no ingress port to model, and nothing handed back up. */
+    assert(!in_dev && !local);
     mdb_vid_seen = group->vid;
     if (snapshot_error)
         return snapshot_error;

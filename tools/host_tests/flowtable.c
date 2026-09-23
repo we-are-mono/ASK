@@ -425,15 +425,16 @@ static bool ft_mc_swdev_obj(unsigned long event,
 }
 static void ft_mc_exit(void) { }
 static unsigned mc_devices_gone, mc_rechecks;
-static void ft_mc_device_gone(struct net_device *dev)
+static void ft_mc_device_gone(struct net_device *dev, bool unregistering)
 {
     (void)dev;
+    (void)unregistering;
     mc_devices_gone++;
 }
 static void ft_mc_kick_all(void) { mc_rechecks++; }
-static unsigned mc_vlan_changes, mc_router_changes;
-static void ft_mc_vlan_changed(struct net_device *dev) { (void)dev; mc_vlan_changes++; }
-static void ft_mc_router_changed(void) { mc_router_changes++; }
+static unsigned mc_bridge_changes, mc_ports_moved;
+static void ft_mc_bridge_changed(struct net_device *dev) { (void)dev; mc_bridge_changes++; }
+static void ft_mc_port_moved(struct net_device *dev) { (void)dev; mc_ports_moved++; }
 /* The routed learner has its own file and its own harness
  * (mroute_learner.c); here the chains' calls into it only count. The two
  * multicast families the FIB chain carries are ipmr's and ip6mr's, and this
@@ -2635,7 +2636,7 @@ static void test_bridge_fdb(void)
     bridge_out_fixture();
     assert(ft_replace(&binding, &cls) == 0);
     assert(!atomic_read(&ft_invalid));
-    unsigned vlan_changes = mc_vlan_changes;
+    unsigned vlan_changes = mc_bridge_changes;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &obj) == NOTIFY_DONE);
     assert(atomic_read(&ft_invalid) && !obj.handled);
     atomic_set(&ft_invalid, 0);
@@ -2643,8 +2644,8 @@ static void test_bridge_fdb(void)
     assert(atomic_read(&ft_invalid) && !obj.handled);
     atomic_set(&ft_invalid, 0);
     /* The bridged multicast learner holds the same VLAN decisions for its
-     * listeners and ingress, and hears both. */
-    assert(mc_vlan_changes == vlan_changes + 2);
+     * flows' copies and ingress, and hears both. */
+    assert(mc_bridge_changes == vlan_changes + 2);
     /* A device nothing here depends on is somebody else's bridge. Every
      * bridge installs its default PVID on a port the moment it is enslaved,
      * whatever its VLAN filtering setting, so a scope test that let this
@@ -2701,9 +2702,12 @@ static void test_bridge_fdb(void)
     set.info.dev = &upper;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
     assert(!atomic_read(&ft_invalid) && !set.handled);
-    /* Multicast router and forwarding changes refresh routed groups without
-     * claiming the attribute or retiring unrelated unicast entries. */
+    /* Multicast router, snooping and forwarding changes -- the bridge's own
+     * router state among them -- refresh routed groups and ask the bridge
+     * about every bridged flow again, without claiming the attribute or
+     * retiring unrelated unicast entries. */
     enum switchdev_attr_id changes[] = {
+        SWITCHDEV_ATTR_ID_BRIDGE_MROUTER,
         SWITCHDEV_ATTR_ID_PORT_MROUTER, SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
         SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS, SWITCHDEV_ATTR_ID_PORT_STP_STATE,
         SWITCHDEV_ATTR_ID_PORT_MST_STATE, SWITCHDEV_ATTR_ID_BRIDGE_MST,
@@ -2714,7 +2718,7 @@ static void test_bridge_fdb(void)
          * no sweep, and neither does switching MST on, which only stops
          * the ports' own STP states from applying. */
         struct switchdev_attr change = { .id = changes[i] };
-        unsigned kicks = mroute_kicks, sweeps = stopped_scheduled;
+        unsigned kicks = mroute_kicks, sweeps = stopped_scheduled, bridges = mc_bridge_changes;
         if (changes[i] == SWITCHDEV_ATTR_ID_PORT_STP_STATE)
             change.u.stp_state = BR_STATE_FORWARDING;
         if (changes[i] == SWITCHDEV_ATTR_ID_PORT_MST_STATE)
@@ -2724,29 +2728,14 @@ static void test_bridge_fdb(void)
         if (changes[i] == SWITCHDEV_ATTR_ID_BRIDGE_MST)
             change.u.mst = true;
         set.attr = &change;
-        set.info.dev = &out;
+        set.info.dev = changes[i] == SWITCHDEV_ATTR_ID_BRIDGE_MROUTER ? &br : &out;
         assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
         assert(mroute_kicks == kicks + 1 && stopped_scheduled == sweeps);
+        assert(mc_bridge_changes == bridges + 1);
         assert(!atomic_read(&ft_invalid) && !set.handled && !handle.invalid);
         set.info.dev = NULL;
         assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-        assert(mroute_kicks == kicks + 1);
-    }
-    /* The bridge itself becoming a multicast router decides whether it hands
-     * its groups to the host, which is the bridged learner's question: it
-     * needs the route forwarding them there. Nothing else re-derives. */
-    {
-        struct switchdev_attr change = { .id = SWITCHDEV_ATTR_ID_BRIDGE_MROUTER };
-        unsigned kicks = mroute_kicks, routers = mc_router_changes;
-
-        set.attr = &change;
-        set.info.dev = &br;
-        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-        assert(mc_router_changes == routers + 1 && mroute_kicks == kicks);
-        assert(!atomic_read(&ft_invalid) && !set.handled);
-        set.info.dev = NULL;
-        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
-        assert(mc_router_changes == routers + 1);
+        assert(mroute_kicks == kicks + 1 && mc_bridge_changes == bridges + 1);
     }
     set.attr = NULL;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
@@ -6126,7 +6115,12 @@ static void test_device_dependencies(void)
     unsigned long events[] = { NETDEV_UNREGISTER, NETDEV_CHANGEUPPER };
     fixture();
     assert(!ft_bound && !ft_count && !ft_invalid);
+    unsigned moved = mc_ports_moved;
     for (unsigned i = 0; i < ARRAY_SIZE(events); i++) device_event(&in, events[i], false);
+    /* A device changing its master is the bridged multicast learner's news
+     * as well: a flow's ingress may have left its bridge, which nothing else
+     * reports. Unregistration reaches it by its own way. */
+    assert(mc_ports_moved == moved + 1);
     assert(bind_device(&in, FLOW_BLOCK_BIND) == 0);
     for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
         device_event(&in, events[i], true); /* Empty binding still matters. */

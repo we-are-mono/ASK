@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A265.** Bridged multicast ignored IGMPv3/MLDv2 source filters, so a source the bridge stopped forwarding to a port still reached it in hardware —
+  fixed (_:/^cdx: ask the bridge where a bridged multicast flow's frames go_).
+
 - [x] **A264.** A bridged group whose chain swap failed stayed counted installed on its old listener set, its route reported carried and the MFC flagged offloaded —
   fixed (_:/^flowtable: take a bridged multicast group out when its chain swap fails_).
 

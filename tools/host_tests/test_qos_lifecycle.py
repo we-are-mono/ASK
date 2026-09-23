@@ -18,9 +18,10 @@ def function(source, name):
     # keeps a forward declaration or a call site from being mistaken for the
     # definition. Widen it when a new one is needed.
     match = re.search(r"^(?:static )?(?:inline )?(?:int\s+|void |bool |U8 |U16 |u8 |u16 |u32 |u64 |uint32_t |"
-                      r"unsigned int |size_t |const char \*|"
+                      r"unsigned int |unsigned long |size_t |const char \*|"
                       r"struct qman_fq \*|struct en_exthash_tbl_entry ?\* ?|"
                       r"struct net_device ?\* ?|struct ft_mc_group ?\* ?|"
+                      r"struct ft_mc_flow ?\* ?|const struct br_ip ?\* ?|"
                       r"const struct ft_mc_route ?\* ?|"
                       r"struct ft_mr_group ?\* ?|struct ft_mr_event ?\* ?|"
                       r"struct xfrm_state ?\* ?|struct ft_ipsec_watch ?\* ?|const struct xfrmdev_ops ?\* ?|"

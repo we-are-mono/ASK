@@ -266,7 +266,7 @@ keys a group on its whole classifier key rather than on the address pair, so
 neither learner can take a key from the other. The address-pair register that
 used to arbitrate between them (`ft_mc_claim_take()`) is gone. Each learner
 refuses only its own collisions: two MFC entries on one port with different
-tags (above), and two bridged memberships whose streams resolve to one key
+tags (above), and two bridged flows that are one key on two VLANs
 ([bridged contract](multicast.md#the-eligibility-contract)).
 
 **What they share is a stream.** An IPTV VLAN bridged to a set-top box and
@@ -277,30 +277,31 @@ one — so it is one hardware group, carrying the union of the two sets: the
 box's copy with the sender's Ethernet pair and hop count, ipmr's with the egress
 port's address, the group's mapped destination and one hop fewer.
 
-**Who owns what.** The bridged learner owns the group, because only its traffic
-hook knows the port, the Ethernet pair and the tag the stream arrives with. An
-MFC entry whose parent VIF is a bridge, or one 802.1Q device above a filtering
-bridge, installs nothing: the routed learner derives it as usual, publishes its
-copies to the bridged learner as an `ft_mc_route`, and reads back whether a
-bridged group is carrying them (`installed`) or not yet (`pending-bridged`,
-with the reason in the bridged row). Each learner keeps its own listeners — a
-membership's ports come and go with the MDB, a route's copies with the MFC —
-and the group is replaced in place when either set changes. It is retired only
-when both are empty: a set-top box leaving a stream the house still routes
-leaves the routed copies in hardware, and a route with no bridged listener at
-all gets a group of its own to learn its stream through, in the `(*,G)` form a
-later join of the same group finds and fills.
+**Who owns what.** The bridged learner owns the group, as one of its flows,
+because only its traffic hook knows the port, the Ethernet pair and the tag the
+stream arrives with. An MFC entry whose parent VIF is a bridge, or one 802.1Q
+device above a filtering bridge, installs nothing: the routed learner derives
+it as usual, publishes its copies to the bridged learner as an `ft_mc_route`,
+and reads back whether a bridged flow is carrying them (`installed`) or not yet
+(`pending-bridged`, with the reason in the bridged row). Each learner keeps its
+own copies — the bridge's come and go with its answer for the flow, a route's
+with the MFC — and the group is replaced in place when either set changes. It
+is retired only when neither learner names the flow: a set-top box leaving a
+stream the house still routes leaves the routed copies in hardware, and a
+route with no bridged listener at all names its stream's flow by itself, so
+the flow is learned from the stream's first frame with no membership.
 
 **Where the VIF sits decides what it receives.** `br_pass_frame_up()` hands the
 host a frame only in a VLAN the bridge itself is a member of, untagged when that
 membership is untagged and tagged otherwise. So `br0.289` receives VLAN 289 when
 the bridge carries it tagged, and `br0` receives every VLAN it carries untagged.
 A route counts only for the VLANs its VIF really receives, and only while the
-bridge is a multicast router (`mcast_router 2`, or a querier heard from the
-host): a bridge that is not one hands the host only what the host itself joined,
-and a host membership keeps a group in software regardless. A route through a
-bridge that is not a router therefore forwards nothing in Linux either, and
-carrying it would forward what Linux does not.
+bridge is a multicast router for the flow's family (`mcast_router 2`, or a
+query heard from the host) — which the bridge's own answer for the flow says,
+as `BR_MCAST_TO_HOST_ROUTER`: a bridge that is not one hands the host only what
+the host itself joined, and a host membership keeps a flow in software
+regardless. A route through a bridge that is not a router therefore forwards
+nothing in Linux either, and carrying it would forward what Linux does not.
 
 **The host's own copy.** Once the bridge hands a stream to a VIF, the hardware
 has to account for the host's copy, not only the ports'. A bridged group whose
@@ -324,9 +325,11 @@ box's copy alone and starved ipmr: the routed half was silently lost.
   hands up whatever the bridge device's MTU: `refused-mtu` on the bridged row.
 - A host membership on the parent VIF is a local listener: `refused-host` on
   both rows.
-- `(*,G)` and `(S,G)` memberships of one group on one bridge stay
-  `refused-contested`, as before: the switchdev object does not carry the
-  filter mode that says how the bridge combines them.
+- The same port, sender and source of a group on two VLANs of one bridge is
+  one classifier key, and both flows stay `refused-contested`. `(*,G)` and
+  `(S,G)` memberships of one group no longer contest anything: they are both
+  reasons to ask the bridge about the same flow, and its answer combines them
+  as it does per frame.
 
 **The routed copy's hop.** A bridged root preserves the hop count, so a routed
 copy in a bridged group decrements it in its own listener entry — `UPDATE_TTL`
@@ -407,7 +410,7 @@ family over:
 | Querier timers or per-VLAN snooping state without a notification | the existing five-second worker | re-derived, including refused groups; unchanged forwarding plans leave their hardware chains intact |
 | A root this learner gives up | its own worker | a group refused its key is asked again in the same pass |
 | The bridged group carrying a route installs or retires | the bridged worker kicks this one | re-derived; the route's state follows, and `MFC_OFFLOAD` with it |
-| A bridge becoming or ceasing to be a multicast router | `SWITCHDEV_ATTR_ID_BRIDGE_MROUTER` | the bridged worker re-matches every group against the routes and VIFs |
+| A bridge becoming or ceasing to be a multicast router | `SWITCHDEV_ATTR_ID_BRIDGE_MROUTER` | the bridged worker asks the bridge about every flow on it again, and re-matches each against the routes and VIFs |
 | A port's egress queues: an HTB tree switching it to or from CEETM, a class moving or going, the DSCP map changing | `ft_mc_egress_changed()`, from the adapter's egress hook | every installed group of either learner with a copy on the port is rebuilt in place, because each listener entry names the queue and the DSCP-map bit its port had when it was built; `mcast_egress_rebuilds` counts them |
 
 A replacement that fails is withdrawn completely: retaining the old chain

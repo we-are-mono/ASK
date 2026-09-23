@@ -270,12 +270,16 @@ sources multiplies entries. All three are stated there rather than discovered.
 **A netfilter hook is a packet-path cost the other increments did not have.**
 Every previous increment put its cost in control paths only. This one registers
 `NF_BR_PRE_ROUTING` and so appears in the bridge's receive path for every
-frame. Three things bound it. The hook is registered only while at least one
-group is pending, so a box with no unresolved `(*,G)` membership pays the
-static-key check and nothing else — `nf_hook_bridge_pre()` tests
-`static_key_false(&nf_hooks_needed[NFPROTO_BRIDGE][NF_BR_PRE_ROUTING])` before
-anything else happens. The hook's own first test is on the destination MAC's
-multicast bit. And it never mutates or consumes an skb: it records and returns
+frame. Three things bound it. The hook is registered only while a membership
+with a port, or a route through a bridge, could name a flow, so a box with
+neither pays the static-key check and nothing else — `nf_hook_bridge_pre()`
+tests `static_key_false(&nf_hooks_needed[NFPROTO_BRIDGE][NF_BR_PRE_ROUTING])`
+before anything else happens. It stays registered while such a membership
+stands even when every flow is installed, because a group can gain a second
+source at any time and only a frame says so; an installed flow's frames never
+reach it. The hook's own first test is on the destination MAC's multicast bit,
+and a restatement of any of the last eight things it recorded is dropped under
+one spinlock. And it never mutates or consumes an skb: it records and returns
 `NF_ACCEPT`, always.
 
 It is still a hook in a datapath, and that is a real difference in kind from
@@ -442,27 +446,57 @@ A frame with two tags, a tag in another protocol, or a tag on a bridge that
 does not filter is not learned from, because no root can validate it. The
 `/proc` row shows `smac`, `dmac` and `in_vid`, which is 0 for untagged.
 
-**A stream is replaced only when idle.** An installed entry keeps its key
-while it carries traffic, so two live senders do not trade one entry. A
-five-second refresh reads each entry's counter. An entry that counted nothing
-for a whole interval reopens the traffic hook, and a stream seen then takes
-over the key: a sender whose MAC changed, a source that moved, the stream on
-another port. The hook costs nothing while every installed entry is carrying
-its stream.
+**One flow per source and ingress.** What is installed is a *flow*: one
+source's frames of a group as they arrive on one bridge port, keyed exactly as
+the classifier matches. A membership installs nothing; it is a reason to learn
+the flows of its group, and a change to it is a reason to ask about them again.
+Two sources of a group are two flows with their own port sets, and so is one
+source arriving on two ports. A group has at most eight flows per bridge VLAN
+(`FT_MC_MAX_FLOWS`), which keeps a group every host sends to — SSDP's
+`239.255.255.250` is the common one — from taking entries the table is short
+of. A ninth source takes a place only when something asked for it by name —
+an `(S,G)` membership, which an SSM listener's report produces, or a route —
+and only from a flow that nothing names that way and nothing carries. So a
+source an SSM listener asked for is not refused because the group's other
+senders got there first, and none of those can take a place back: a group
+every host sends to keeps the first eight it saw, and later senders cost a
+lookup, not a flow made, asked of the bridge under RTNL and retired again on
+each of their frames. No place is given up while the bridge refuses the whole
+group — the host joined it, or it floods — because the new source would be
+refused the same way. `mcast_refused` counts a place given up, and a source
+turned away once until the group's flows change.
 
-**The listeners.** Each MDB port group names a bridge port. That port must
-satisfy `cdx_ft_port_supported()` — a registered physical CDX Ethernet onif,
-not an L3 slave, not a switch-ASIC port, up and with carrier. A port that does
-not **is recorded as a member the hardware cannot carry, and the whole group is
-then refused**, because a partially replicated group is a silently broken one:
-the matched frame never reaches the bridge, so a listener left out of the
-hardware set does not fall back to software, it stops receiving. Recording it
-is what makes refusing possible — dropping the member and installing for the
-rest is the same bug wearing a shorter listener list. The shipping shape is a
-Wi-Fi VAP on `br-lan`: a phone joining the stream a set-top box is already
-watching puts an uncarriable port in the group, and the group goes back to the
-bridge in its entirety. Exceeding the listener ceiling is the same outcome and
-is reported the same way. `/proc` says `refused-listener`.
+**A shape is replaced only when idle.** An installed flow keeps its key while
+it carries traffic, so two live senders of one source do not trade one entry.
+A five-second refresh reads each entry's counter. When an entry counted nothing
+for a whole interval, a shape seen meanwhile takes over the key: a sender whose
+MAC changed, a port that now carries the tag.
+
+**The listeners are the bridge's answer.** Where a flow's frames go is not read
+off the memberships. The bridge decides it per frame, and a switchdev object
+carries none of what it decides by: an `(S,G)` entry is looked up before the
+`(*,G)` one under IGMPv3 and MLDv2, a `(*,G)` INCLUDE port group is skipped, a
+port that blocks the source is skipped, multicast router ports receive
+everything, the ingress never receives its own frame, and an isolated port
+does not forward to another. So the worker asks the bridge, under RTNL,
+through `br_multicast_list_ports()` with the flow's ingress (patch 161), and
+installs exactly the ports it names. A hairpin ingress, a port converting to
+unicast, per-VLAN STP, or more ports than a group holds come back as an error
+and refuse the flow. This is what keeps an IGMPv3 source filter in force: a
+`BLOCK` or `TO_EX{S}` that makes the bridge stop forwarding `S` to a port asks
+every flow of the group again, and the hardware stops with it.
+
+Each port the bridge names must satisfy `cdx_mc_port_identity()` — a physical
+CDX Ethernet port — and have egress framing a rule can describe. A port that
+does not **refuses the whole flow**, because a partially replicated flow is a
+silently broken one: the matched frame never reaches the bridge, so a listener
+left out of the hardware set does not fall back to software, it stops
+receiving. The shipping shape is a Wi-Fi VAP on `br-lan`: a phone joining the
+stream a set-top box is already watching puts an uncarriable port in the
+answer, and the flow goes back to the bridge in its entirety. A flow the bridge
+forwards nowhere — every listener behind its ingress, or blocking its source —
+has nothing to replicate and stays with the bridge too. `/proc` says
+`refused-listener` for all of these.
 
 **The tag stack.** A bridged group carries the MDB entry's `vid`. Each
 listener's egress framing is resolved from that vid and the port's own
@@ -502,44 +536,71 @@ group whose listener MTU is below its ingress MTU stays in software even for
 packets that would fit. That shape is rare on a gateway: it needs a jumbo
 ingress or a deliberately narrowed listener.
 
-**The host.** A group carrying a `SWITCHDEV_OBJ_ID_HOST_MDB` object, or whose
-bridge device has itself joined it, is refused. The classifier entry replicates
-to ports and the frame does not reach the CPU, so a local listener would be
-starved silently. This is a refusal rather than a gap to fill later only
-because filling it means a listener whose egress is the host's own receive
-queue, which nothing in the encoder expresses today.
+**The host.** A flow the bridge also hands to the host because the bridge
+device itself joined the group — a `SWITCHDEV_OBJ_ID_HOST_MDB` object — is
+refused, and so is one it hands up because nothing is snooping it: snooping
+off, or no querier on the segment, where the bridge floods every group to
+every port and to the host alike. The classifier entry replicates to ports and
+the frame does not reach the CPU, so a local listener would be starved
+silently. This is a refusal rather than a gap to fill later only because
+filling it means a listener whose egress is the host's own receive queue,
+which nothing in the encoder expresses today. `/proc` says `refused-host`.
 
-**The host as a router.** A bridge that is a multicast router — `mcast_router
-2`, or a querier heard from the host itself — hands every group to the host as
-well, and where a VIF receives that bridge VLAN, ipmr routes it. Such a group
-is carried only together with the route that forwards its stream, as one group
-with both output lists; without one it is `refused-routed` and stays in
-software, where ipmr sees it and a routing daemon learns its source. See
+**The host as a router.** A bridge that is a multicast router for the flow's
+family — `mcast_router 2`, or a query heard from the host itself — hands every
+group to the host as well, and so does a promiscuous one: a bridge has no
+unicast filter, so an upper device with an address of its own makes it
+promiscuous. Where a VIF receives that bridge VLAN, ipmr routes what it is
+handed. Such a flow is carried only together with the route that forwards
+its stream, as one group with both output lists; without one it is
+`refused-routed` and stays in software, where ipmr sees it and a routing daemon
+learns its source. See
 [one stream, both learners](multicast-routed.md#one-stream-both-learners). A
-group a route names is kept even with no member port left, and a route with no
-membership to learn its stream through gets a group of its own, in the `(*,G)`
-form a later join fills. The `/proc` row lists the route's copies as
-`routed=`, beside the bridge's own `ports=`.
+route names its stream's flow directly: the flow is learned from traffic with
+no membership at all, and kept with no member port left. The `/proc` row lists
+the route's copies as `routed=`, beside the bridge's own `ports=`.
 
-**A group must be resolved to be installed, and installation is not
-retroactive.** An MDB entry with no observed source is a pending permission and
-occupies no hardware. This is the one place the contract admits a state the
-other increments have no analogue for, and it is why `/proc` has to show it:
-an operator looking at a group that is not being replicated must be able to
-tell "refused" from "not yet seen".
+**A flow must be learned to be installed, and installation is not
+retroactive.** A membership with no observed source occupies no hardware. This
+is the one place the contract admits a state the other increments have no
+analogue for, and it is why `/proc` has to show it: an operator looking at a
+group that is not being replicated must be able to tell "refused" from "not yet
+seen". `/proc` prints one `mcast` row per flow, with `member_src` the source of
+the most specific membership naming it, and one per membership that names no
+flow yet, as `pending-source`. `mcast_groups` counts memberships and
+`mcast_flows` flows; `mcast_installed` counts flows in hardware.
 
 **Capacity.** 512 group ids per family (`MAX_MC4_ENTRIES`), and one id per
-`(S,G,ingress)` triple rather than per membership. Exhaustion is an ordinary
-outcome: the group stays in software and says so, exactly as an exhausted
-statistics pool does for a PPPoE session.
+flow — per `(S,G,ingress)` triple — rather than per membership. Exhaustion is
+an ordinary outcome: the flow stays in software and says so, exactly as an
+exhausted statistics pool does for a PPPoE session. A failed install is tried
+again at each of the next refreshes, five seconds apart, up to four times, and
+then reads `refused-failed` until the bridge's answer for the flow changes.
 
-**Dependencies.** A multicast group is the sixth dependency class. Its
-memberships come from the MDB and are retired by it; its listener ports and
-ingress port are netdev dependencies retired the way a flow's are; its tag
-stack depends on the bridge's VLAN configuration, which the adapter already
-watches on the switchdev chain. What is new is the source: an installed `(S,G)`
-entry whose stream stops has nothing to retire it, so it carries an idle timer
-of its own.
+**Dependencies.** A multicast flow is the sixth dependency class. Its
+memberships come from the MDB and are retired by it, and a flow nothing names
+any more goes with them; its copies and its ingress port are netdev
+dependencies, retired when the device goes away or its ingress leaves the
+bridge. A link merely going down retires nothing: the bridge keeps a
+permanent membership across it and never announces it again, so the flows
+naming the port are asked again instead, and the bridge's answer leaves a
+port that is not forwarding out. Everything the bridge decides its ports
+by — the MDB, the bridge's and its ports' VLANs, STP state, port flags,
+multicast router ports and state, snooping itself — is watched on the
+switchdev chain and asks the bridge's flows again. Some of it changes with no
+notification at all: a querier appearing or timing out turns snooping, and so
+every answer, on or off. So the refresh asks every flow again every five
+seconds as well, which costs RTNL for the asking and nothing in hardware
+unless the answer changed. What is new is the source: an installed `(S,G)`
+entry whose stream stops matches nothing. The refresh already reads each
+entry's count, and an entry that has counted nothing for the bridge's group
+membership interval -- `multicast_membership_interval`, 260 seconds unless
+configured, read for the flow's VLAN at each derivation -- goes, flow and all.
+That is the clock the bridge forgets an unrefreshed membership by, so a
+stopped source is aged as the bridge would age a silent listener. A source
+that resumes reaches the CPU again and is learned from its next frames like
+any new one; a flow never in hardware has no count to age by, and is bounded
+by the group's eight instead.
 
 A listener's entry also names the frame queue its port had when it was built,
 and whether the port's DSCP map was on. When CDX changes a port's egress
@@ -553,13 +614,13 @@ generation the workers compare after recording the build. `/proc` counts the
 rebuilds as `mcast_egress_rebuilds`.
 
 A VLAN change on the bridge, whether a port's membership, the bridge's own,
-its filtering or its protocol, marks every group on that bridge. The worker
-re-derives them under RTNL, not in the notifier, because a port VLAN object
-is notified before the bridge applies it. Each listener's tag is re-resolved.
-A listener that left the VLAN stops being one, but stays recorded so it
-returns with its VLAN. An ingress whose shape no longer resolves to the
-group's VLAN is forgotten and learned again: a moved PVID, or a tagged
-ingress port that left the VLAN.
+its filtering or its protocol, marks every flow on that bridge. The worker
+asks the bridge again under RTNL, not in the notifier, because a port VLAN
+object is notified before the bridge applies it. Each copy's tag is
+re-resolved, and a port that left the VLAN is no longer in the answer. A flow
+whose ingress shape no longer resolves to its VLAN is over and is learned
+again from its next frame: a moved PVID, or a tagged ingress port that left
+the VLAN.
 
 ## Implementation plan
 
@@ -818,16 +879,10 @@ threshold 1 into the default table and needs nothing from ASK.
   eight-listener budget — see
   [one stream, both learners](multicast-routed.md#one-stream-both-learners).
 
-- **The idle timer's period is unmeasured.** A source that stops sending leaves
-  an entry matching nothing. Too short and a bursty stream is retired between
-  bursts; too long and capacity is held by ghosts. The hardware entry has flow
-  statistics, so the timer can read the frame count rather than guess, but what
-  a sensible period is has not been measured against a real stream.
-
-- **Whether a group with many simultaneous sources is a real shape.** The
-  design produces one entry per source and the contract says so, but an IPTV
-  channel has exactly one source and the multi-source case may be purely
-  theoretical. If it is not, the entry count wants a bound of its own.
+- **Whether eight flows per group is the right bound.** An IPTV channel has
+  exactly one source and an SSM subscriber names its own; the bound exists for
+  groups every host sends to. It is a guess at where such a group stops being
+  worth hardware, not a measurement.
 
 - **`MC_MAX_LISTENERS_PER_GROUP` remains a copied constant until step 1
   reports.** Recorded here so that the number is not treated as a hardware fact

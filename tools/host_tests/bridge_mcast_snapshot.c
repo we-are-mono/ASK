@@ -9,12 +9,28 @@
 #include <errno.h>
 #include <arpa/inet.h>
 
+typedef uint8_t u8;
+typedef uint16_t u16;
+
 #define IS_ENABLED(x) (x)
 #define ETH_P_IP 0x0800
 #define ETH_P_IPV6 0x86dd
+#define BR_STATE_LEARNING 2
 #define BR_STATE_FORWARDING 3
 #define BR_MCAST_FLOOD 1
 #define BR_MULTICAST_TO_UNICAST 2
+#define BR_HAIRPIN_MODE 4
+#define BR_ISOLATED 8
+#define BR_PORT_LOCKED 16
+#define BR_PROXYARP 32
+#define IFF_PROMISC 0x100
+#define MDB_RTR_TYPE_DISABLED 0
+#define MDB_RTR_TYPE_TEMP_QUERY 1
+#define MDB_RTR_TYPE_PERM 2
+#define BR_MCAST_TO_HOST_JOINED (1U << 0)
+#define BR_MCAST_TO_HOST_ROUTER (1U << 1)
+#define BR_MCAST_TO_HOST_FLOOD (1U << 2)
+#define BR_MCAST_TO_HOST_PROMISC (1U << 3)
 #define MDB_PG_FLAGS_BLOCKED 1
 #define MCAST_INCLUDE 1
 #define BROPT_VLAN_ENABLED 0
@@ -37,10 +53,22 @@ struct br_ip {
 };
 struct net_bridge;
 struct net_bridge_vlan;
-struct net_device { bool master, running; struct net_bridge *priv; int id; };
+struct net_bridge_port;
+struct net_device {
+    bool master, running;
+    unsigned flags;
+    struct net_bridge *priv;
+    struct net_bridge_port *port;   /* the bridge port it is, if any */
+    int id;
+};
 struct net_bridge_mcast {
     struct hlist_head ip4_mc_router_list, ip6_mc_router_list;
     bool disabled, querier[2], include[2];
+    unsigned long multicast_membership_interval;
+    /* The bridge's own router state: its mode, and per family whether the
+     * query-learned router timer is running. */
+    int multicast_router;
+    bool router_timer[2];
 };
 struct net_bridge_vlan {
     struct net_bridge_mcast br_mcast_ctx;
@@ -51,6 +79,7 @@ struct net_bridge_vlan {
 struct net_bridge_port {
     struct list_head list;
     struct net_device *dev;
+    struct net_bridge *br;
     struct net_bridge_vlan vlan;
     int state;
     unsigned flags;
@@ -69,8 +98,10 @@ struct net_bridge_port_group {
 struct net_bridge_mdb_entry {
     struct br_ip addr;
     struct net_bridge_port_group *ports;
+    bool host_joined;
 };
 struct net_bridge {
+    struct net_device *dev;
     struct list_head port_list;
     struct net_bridge_mcast multicast_ctx;
     struct net_bridge_vlan vlan;
@@ -84,9 +115,15 @@ static void rcu_read_lock(void) { rcu++; }
 static void rcu_read_unlock(void) { assert(rcu); rcu--; }
 static void spin_lock_bh(int *lock) { assert(!*lock); *lock = 1; }
 static void spin_unlock_bh(int *lock) { assert(*lock); *lock = 0; }
-static bool netif_is_bridge_master(struct net_device *d) { return d->master; }
+static bool netif_is_bridge_master(const struct net_device *d) { return d->master; }
+static struct net_bridge_port *br_port_get_rtnl(const struct net_device *d)
+{ return d->port; }
+static bool br_ip4_multicast_is_router(struct net_bridge_mcast *c)
+{ return c->router_timer[0]; }
+static bool br_ip6_multicast_is_router(struct net_bridge_mcast *c)
+{ return c->router_timer[1]; }
 static bool netif_running(struct net_device *d) { return d->running; }
-static struct net_bridge *netdev_priv(struct net_device *d) { return d->priv; }
+static struct net_bridge *netdev_priv(const struct net_device *d) { return d->priv; }
 static bool br_opt_get(struct net_bridge *b, int opt) { return b->opts[opt]; }
 static struct net_bridge_vlan *br_vlan_group_rcu(struct net_bridge *b)
 { assert(rcu); return &b->vlan; }
@@ -111,6 +148,8 @@ static bool br_multicast_is_star_g(const struct br_ip *g)
     return !memcmp(&g->src, zero, sizeof(g->src));
 }
 static bool br_mst_is_enabled(struct net_bridge_port *p) { return p->mst; }
+static unsigned long br_multicast_gmi(const struct net_bridge_mcast *c)
+{ return c->multicast_membership_interval; }
 static struct net_bridge_mdb_entry mdb[2];
 static bool present[2];
 static struct net_bridge_mdb_entry *br_mdb_ip_get(struct net_bridge *b, struct br_ip *key)
@@ -153,9 +192,12 @@ static void setup(int family, bool vlan)
     key.src.ip4 = 123;
     key.dst.ip4 = 456;
     bridge = (struct net_device){ .master = true, .running = true, .priv = &br };
+    br.dev = &bridge;
     for (unsigned i = 0; i < 10; i++) {
         dev[i].id = i;
+        dev[i].port = &port[i];
         port[i].dev = &dev[i];
+        port[i].br = &br;
         port[i].state = BR_STATE_FORWARDING;
         port[i].vlan = br.vlan;
         router[i].port = &port[i];
@@ -181,10 +223,26 @@ static void add_router(unsigned i, int family)
 }
 static int snapshot(unsigned max)
 {
-    int n = br_multicast_list_ports(&bridge, &key, out, max);
+    int n = br_multicast_list_ports(&bridge, &key, NULL, NULL, out, max);
     assert(!rcu && !br.multicast_lock);
     calls++;
     return n;
+}
+/* Data received on port `in`, and what the bridge hands the host of it. */
+static unsigned local;
+static int received(unsigned in, unsigned max)
+{
+    int n = br_multicast_list_ports(&bridge, &key, &dev[in], &local, out, max);
+    assert(!rcu && !br.multicast_lock);
+    calls++;
+    return n;
+}
+static bool listed(int n, unsigned i)
+{
+    for (int j = 0; j < n; j++)
+        if (out[j] == &dev[i])
+            return true;
+    return false;
 }
 int main(void)
 {
@@ -246,9 +304,13 @@ int main(void)
             port[3].mst = true;
             assert(snapshot(8) == -EOPNOTSUPP);
             port[3].mst = false;
-            /* Without a querier, even an existing MDB follows flood flags. */
+            /* Without a querier, even with an MDB entry, what the host
+             * sends floods as br_flood() floods it: to every port but a
+             * proxy-ARP one, mcast_flood or not -- that flag filters only
+             * what other ports send. */
             ctx()->querier[family] = false;
-            port[5].flags = BR_MCAST_FLOOD;
+            for (unsigned i = 0; i < 10; i++)
+                port[i].flags = i == 5 ? 0 : BR_PROXYARP;
             assert(snapshot(8) == 1 && out[0] == &dev[5]);
             ctx()->querier[family] = true;
             ctx()->disabled = true;
@@ -256,6 +318,11 @@ int main(void)
             ctx()->disabled = false;
             br.opts[BROPT_MULTICAST_ENABLED] = false;
             assert(snapshot(8) == 1 && out[0] == &dev[5]);
+            port[5].flags = BR_PROXYARP;
+            assert(snapshot(8) == 0);
+            for (unsigned i = 0; i < 10; i++)
+                port[i].flags = 0;
+            assert(snapshot(8) == -E2BIG && snapshot(10) == 10);
             bridge.running = false;
             assert(snapshot(8) == 0);
             bridge.running = true;
@@ -269,6 +336,155 @@ int main(void)
             assert(snapshot(8) == -E2BIG);
             assert(snapshot(9) == 9);
         }
+    }
+    /* Data received on a bridge port: br_handle_frame_finish() and
+     * br_multicast_flood(), and what goes up to the host besides. */
+    for (int family = 0; family <= CONFIG_IPV6; family++) {
+        for (int vlan = 0; vlan < 2; vlan++) {
+            int n;
+
+            setup(family, vlan);
+            present[0] = true;              /* the (*,G) entry: ports 0, 1 */
+            mdb[0].ports = &pg[0];
+            pg[0].next = &pg[1];
+            /* Never back out of the ingress, member or not. */
+            n = received(0, 8);
+            assert(n == 1 && listed(n, 1) && local == 0);
+            /* Router ports too, the ingress excepted. */
+            add_router(2, family);
+            add_router(0, family);
+            n = received(0, 8);
+            assert(n == 2 && listed(n, 1) && listed(n, 2) && !listed(n, 0));
+            /* No isolated port from an isolated ingress. */
+            port[0].flags = port[1].flags = BR_ISOLATED;
+            n = received(0, 8);
+            assert(n == 1 && listed(n, 2));
+            port[0].flags = 0;
+            n = received(0, 8);
+            assert(n == 2 && listed(n, 1));
+            port[1].flags = 0;
+            /* A hairpin ingress would have its own frames back, and a
+             * locked one forwards only sources its FDB knows. */
+            port[0].flags = BR_HAIRPIN_MODE;
+            assert(received(0, 8) == -EOPNOTSUPP);
+            port[0].flags = BR_PORT_LOCKED;
+            assert(received(0, 8) == -EOPNOTSUPP);
+            port[0].flags = 0;
+            /* An ingress that is not this bridge's port. */
+            port[9].br = NULL;
+            assert(received(9, 8) == -EINVAL);
+            port[9].br = &br;
+            dev[9].port = NULL;
+            assert(received(9, 8) == -EINVAL);
+            dev[9].port = &port[9];
+            /* An ingress that is not forwarding forwards nothing, and hands
+             * the host nothing: a learning port learns the source and drops
+             * the frame. */
+            mdb[0].host_joined = true;
+            port[0].state = BR_STATE_LEARNING;
+            assert(received(0, 8) == 0 && local == 0);
+            port[0].state = BR_STATE_FORWARDING;
+            mdb[0].host_joined = false;
+            port[0].mst = true;
+            assert(received(0, 8) == -EOPNOTSUPP);
+            port[0].mst = false;
+            if (vlan) {
+                /* Nor one whose VLAN is not forwarding, not usable, or not
+                 * the port's at all. */
+                port[0].vlan.state = BR_STATE_LEARNING;
+                assert(received(0, 8) == 0);
+                port[0].vlan.state = BR_STATE_FORWARDING;
+                port[0].vlan.usable = false;
+                assert(received(0, 8) == 0);
+                port[0].vlan.usable = true;
+                port[0].vlan.vid = 43;
+                assert(received(0, 8) == 0);
+                port[0].vlan.vid = 42;
+                /* The bridge itself outside the VLAN: what it sends goes
+                 * nowhere, but a port's data is forwarded port to port. */
+                br.vlan.usable = false;
+                assert(snapshot(8) == 0);
+                n = received(0, 8);
+                assert(n == 2 && listed(n, 1) && listed(n, 2));
+                br.vlan.usable = true;
+            }
+
+            /* What goes up: the host joined it; the bridge is a router,
+             * permanently or by a query heard for this family only; or
+             * nobody snoops, so everything floods and goes up. */
+            mdb[0].host_joined = true;
+            assert(received(0, 8) == 2 && local == BR_MCAST_TO_HOST_JOINED);
+            mdb[0].host_joined = false;
+            ctx()->multicast_router = MDB_RTR_TYPE_PERM;
+            assert(received(0, 8) == 2 && local == BR_MCAST_TO_HOST_ROUTER);
+            ctx()->multicast_router = MDB_RTR_TYPE_TEMP_QUERY;
+            ctx()->router_timer[!family] = true;
+            assert(received(0, 8) == 2 && local == 0);
+            ctx()->router_timer[family] = true;
+            assert(received(0, 8) == 2 && local == BR_MCAST_TO_HOST_ROUTER);
+            ctx()->multicast_router = MDB_RTR_TYPE_DISABLED;
+            assert(received(0, 8) == 2 && local == 0);
+            ctx()->multicast_router = MDB_RTR_TYPE_PERM;
+            mdb[0].host_joined = true;
+            ctx()->querier[family] = false;
+            port[5].flags = BR_MCAST_FLOOD;
+            n = received(0, 8);
+            assert(n == 1 && listed(n, 5) && local == BR_MCAST_TO_HOST_FLOOD);
+            /* A proxy-ARP port is flooded nothing, whatever its flag. */
+            port[5].flags = BR_MCAST_FLOOD | BR_PROXYARP;
+            assert(received(0, 8) == 0 && local == BR_MCAST_TO_HOST_FLOOD);
+            port[5].flags = 0;
+            ctx()->querier[family] = true;
+            /* A promiscuous bridge hands everything up besides. */
+            bridge.flags = IFF_PROMISC;
+            assert(received(0, 8) == 2 &&
+                   local == (BR_MCAST_TO_HOST_JOINED | BR_MCAST_TO_HOST_ROUTER |
+                             BR_MCAST_TO_HOST_PROMISC));
+            bridge.flags = 0;
+            mdb[0].host_joined = false;
+            ctx()->multicast_router = MDB_RTR_TYPE_TEMP_QUERY;
+            ctx()->router_timer[0] = ctx()->router_timer[1] = false;
+            ctx()->ip4_mc_router_list.first = NULL;
+            ctx()->ip6_mc_router_list.first = NULL;
+
+            /* IGMPv3/MLDv2. An INCLUDE port group of the (*,G) entry is
+             * never forwarded for a source; a source's own entry, with its
+             * EXCLUDE ports copied in, is looked up first; a port that
+             * blocks the source is skipped. */
+            ctx()->include[family] = true;
+            pg[1].filter_mode = MCAST_INCLUDE;
+            assert(received(0, 8) == 0);
+            present[1] = true;
+            mdb[1].ports = &pg[3];
+            pg[3].next = &pg[4];
+            n = received(0, 8);
+            assert(n == 2 && listed(n, 3) && listed(n, 4));
+            pg[3].flags = MDB_PG_FLAGS_BLOCKED;
+            n = received(0, 8);
+            assert(n == 1 && listed(n, 4));
+            pg[4].flags = MDB_PG_FLAGS_BLOCKED;
+            assert(received(0, 8) == 0);
+            /* IGMPv2/MLDv1: the (*,G) entry alone, whatever its modes. */
+            ctx()->include[family] = false;
+            n = received(0, 8);
+            assert(n == 1 && listed(n, 1));
+        }
+    }
+    /* The membership interval of the context the snapshot uses: the VLAN's
+     * own under per-VLAN snooping, the bridge's otherwise, and nothing from a
+     * device that is not a bridge. */
+    for (int vlan = 0; vlan < 2; vlan++) {
+        setup(0, vlan);
+        br.multicast_ctx.multicast_membership_interval = 260;
+        br.vlan.br_mcast_ctx.multicast_membership_interval = 20;
+        assert(br_multicast_membership_interval(&bridge, 42) == (vlan ? 20 : 260));
+        assert(br_multicast_membership_interval(&bridge, 43) == 260);
+        br.opts[BROPT_MCAST_VLAN_SNOOPING_ENABLED] = false;
+        assert(br_multicast_membership_interval(&bridge, 42) == 260);
+        bridge.master = false;
+        assert(br_multicast_membership_interval(&bridge, 42) == 0);
+        assert(!rcu);
+        calls++;
     }
 #if !CONFIG_IPV6
     setup(1, false);

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 
 import pytest
 
@@ -34,6 +35,11 @@ SECOND_SOURCE = {4: "198.18.165.2", 6: "fd00:165::2"}
 HANDOFF_GROUP = {4: "239.9.9.3", 6: "ff1e::9:9:3"}
 RELOAD_GROUP = {4: "239.9.9.4", 6: "ff1e::9:9:4"}
 FOLD_GROUP = {4: "239.9.9.5", 6: "ff1e::9:9:5"}
+IDLE_GROUP = {4: "239.9.9.7", 6: "ff1e::9:9:7"}
+# The bridge's group membership interval for the ageing case, in centiseconds
+# as the bridge takes it: short enough to wait out, and not so short that a
+# refresh or two could land either side of it.
+IDLE_INTERVAL = 1500
 # The standing bench VLAN the WAN switch carries to the orchestrator, where a
 # packet socket on the existing device receives a replica sent out the WAN
 # port. Read, never reconfigured.
@@ -538,3 +544,61 @@ async def test_flowtable_service_multicast_reload_bridged(multicast_rig, mcast_b
     final = await r.settle(lambda s: row(s) is None and s["mcast_installed"] == r.initial["mcast_installed"],
                            "removed after the reload")
     assert final["quarantine"] == 0, summary(final)
+
+
+@pytest.mark.parametrize("family", [4, 6])
+async def test_flowtable_service_multicast_bridged_idle_flow_ages_out(multicast_rig, mcast_bridge, family):
+    """A bridged stream that stops leaves hardware on the bridge's own clock.
+
+    Its membership stands -- a static one here, which the bridge never ages
+    -- but its entry counts nothing, and after the bridge's group membership
+    interval, lowered for the case and put back, the flow goes: the entry and
+    its place among the group's flows are for a source that is sending. The
+    source resuming is a flow again from its next frames, in hardware."""
+    r = multicast_rig
+    bridge = mcast_bridge
+    group, source = IDLE_GROUP[family], wan_source_address(family)
+    observers = [(r.lan, {LAN_NIC: None})]
+
+    def row(state):
+        rows = [g for g in mcast_rows(state, group) if same(g["src"], source)]
+        assert len(rows) <= 1, rows
+        return rows[0] if rows else None
+
+    def carried(state):
+        current = row(state)
+        return (bool(current) and current["state"] == "installed"
+                and members(current, "ports") == {LOCAL})
+
+    async def live(label):
+        result = await r.window([stream(family, group, hops=64)], observers, ingress=TARGET_WAN_IF,
+                                label=f"idle-v{family}-{label}")
+        assert delivered(result, streamed(result, group), LAN_NIC)
+        assert moved(result, row) == COUNT, summary(result["after"])
+        in_hardware(result)
+
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(bridge_settings(r, bridge, membership_interval=IDLE_INTERVAL))
+        await mdb(r, bridge, group, add=True)
+        stack.push_async_callback(mdb, r, bridge, group, add=False)
+        await learn(r, [stream(family, group, hops=64)], carried, "installed from traffic")
+        await live("before")
+
+        stopped = time.monotonic()
+        aged = await r.settle(lambda s: row(s) is None and
+                              s["mcast_installed"] == r.initial["mcast_installed"],
+                              "the idle flow out of hardware", timeout=IDLE_INTERVAL / 100 + 25)
+        # Not before the interval: the refresh reads the count five seconds
+        # apart, so the entry was last seen counting at most that long after
+        # the window ended.
+        assert time.monotonic() - stopped >= IDLE_INTERVAL / 100 - 5, summary(aged)
+        # The membership stands, waiting for a source again.
+        assert [g["state"] for g in mcast_rows(aged, group)] == ["pending-source"], summary(aged)
+
+        await learn(r, [stream(family, group, hops=64)], carried, "learned again when it resumes")
+        await live("resumed")
+    final = await r.settle(lambda s: not mcast_rows(s, group) and
+                           s["mcast_installed"] == r.initial["mcast_installed"],
+                           "removed", timeout=15)
+    assert final["quarantine"] == 0, summary(final)
+    assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)

@@ -17,7 +17,8 @@ def snapshot_source():
     source = PATCH.read_text().split("+++ b/net/bridge/br_multicast.c\n", 1)[1]
     added = "\n".join(line[1:] for line in source.splitlines()
                       if line.startswith("+") and not line.startswith("+++"))
-    return function(added, "br_multicast_list_ports")
+    return (function(added, "br_multicast_list_ports")
+            + function(added, "br_multicast_membership_interval"))
 
 
 @pytest.mark.parametrize("ipv6", [0, 1])

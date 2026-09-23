@@ -30,8 +30,8 @@ def test_bridge_mode_reaches_root_and_cannot_change_on_replace():
     from test_mcast_backend import code
     adapter = (ROOT / "cdx/ask_flowtable.c").read_text()
     encoder = (ROOT / "cdx/cdx_ehash.c").read_text()
-    assert "spec->bridged = true;" in function(adapter, "ft_mc_group_spec")
-    assert "ft_mc_group_spec(target, &spec);" in function(adapter, "ft_mc_work_fn")
+    assert "spec->bridged = true;" in function(adapter, "ft_mc_flow_spec")
+    assert "ft_mc_flow_spec(target, &spec);" in function(adapter, "ft_mc_work_fn")
     assert "cdx_mc_describe(grp, spec);" in code("cdx_mc_group_add")
     assert "grp->bridged = spec->bridged;" in code("cdx_mc_describe")
     assert "grp->bridged != spec->bridged" in code("cdx_mc_same_key")
