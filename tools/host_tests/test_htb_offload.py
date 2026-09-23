@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -26,6 +28,17 @@ def function(source, name):
 def test_htb_offload(tmp_path):
     compiler = os.environ.get("CC", "cc")
     assert shutil.which(compiler), f"C compiler required: {compiler}"
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    dsfield = kernel / "include/net/dsfield.h"
+    if not dsfield.exists():
+        pytest.fail("build the ASK kernel or set ASK_KERNEL_SOURCE for include/net/dsfield.h")
+    # The kernel's own rewrite, so a remark is checked against the header and
+    # checksum it really leaves rather than against a restatement of it.
+    (tmp_path / "dsfield.inc").write_text("".join(
+        function(dsfield.read_text(), name) for name in
+        ("ipv4_get_dsfield", "ipv6_get_dsfield", "ipv4_change_dsfield",
+         "ipv6_change_dsfield")))
     source = (ROOT / "cdx/cdx_htb.c").read_text()
     backend = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     (tmp_path / "htb_types.inc").write_text(
@@ -56,6 +69,7 @@ def test_htb_offload(tmp_path):
         "cdx_htb_class_queue",
         "cdx_htb_port_gone", "cdx_register_ft_qos_class",
         "cdx_unregister_ft_qos_class", "cdx_htb_dscp_slot", "cdx_htb_forwarded",
+        "cdx_ft_qos_remark_failures", "cdx_htb_remark",
         "cdx_htb_select_queue", "cdx_htb_txq_fq", "cdx_htb_resolve_class",
         "cdx_htb_class_stats", "cdx_htb_red", "cdx_htb_setup_red",
         "cdx_register_ft_setup_tc",

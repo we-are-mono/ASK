@@ -1949,6 +1949,38 @@ connection shows the same thing from the inside — its handshake leaves at
 
 No BUG, WARNING, call trace or KASAN output beyond the init banner.
 
+#### The software path remarks too
+
+That last observation was a defect, not a property. A flow changing codepoint
+at the moment it is offloaded is exactly the switch
+[the rule against classifying by HTB leaf](#why-htb-offload-does-not-classify)
+exists to prevent, and a flow that is never offloaded was never remarked at
+all. The software path now rewrites the frames it forwards, in the queue
+selection that already decodes the same class from the same mark:
+
+- **Forwarded frames only**, as in hardware: a frame with an ingress and no
+  socket. The gateway's own frames keep whatever their sockets set.
+- **The DSCP, not the ECN bits.** `ipv4_change_dsfield()` or
+  `ipv6_change_dsfield()` with the ECN mask kept, the IPv4 checksum updated in
+  the same step. Neither family's pseudo-header includes the field, so a
+  transport checksum left for the hardware is unaffected.
+- **Behind a PPPoE session header** when the frame for a session reaches the
+  port with one: the inner IP header is the field the hardware rewrites.
+- **A frame that cannot be rewritten is sent as it is**, never dropped for a
+  marking, and counted in `/proc/cdx_flowtable` as `qos_remark_failures`. A
+  frame already at the codepoint costs no copy of a shared head.
+- **Before the DSCP map is consulted**, so the map reads the codepoint the
+  frame leaves with. In hardware the rewrite is an opcode of the entry's
+  header manipulation and the map is read by the enqueue that ends it, which
+  is the order this follows; `test_flowtable_qos_dscp_remark_agrees_in_software`
+  checks it on the rig, and the order in `cdx_htb_select_queue()` is the one
+  line to change if the hardware turns out to read the field first.
+
+Frames the software *flowtable* forwards carry no conntrack, so they have no
+class to read and are neither classified nor remarked in software; a flow the
+adapter declines without retiring stays on that path. That is a property of the
+kernel's flowtable fast path, not of this code.
+
 *Effort: 3–4 days.*
 
 ### Order and total

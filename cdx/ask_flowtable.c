@@ -8902,6 +8902,9 @@ static int ft_show(struct seq_file *seq, void *v)
 	 * mark selectors contradict what the running adapter will decode. */
 	seq_printf(seq, "qos_mark_mask %u\nqos_default_class %u\n",
 		   ft_qos_mark_mask, ft_qos_default_class);
+	/* Frames the software path forwarded unchanged because their header
+	 * could not be made writable for the remark their class asks for. */
+	seq_printf(seq, "qos_remark_failures %llu\n", cdx_ft_qos_remark_failures());
 	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nparked %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"

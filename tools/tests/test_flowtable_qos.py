@@ -65,6 +65,7 @@ PORT_EF_BEFORE, PORT_EF_MOVED = PORT + 10, PORT + 11
 PORT_SATURATE = PORT + 12
 PORT_UNCLASSIFIED_SW, PORT_UNCLASSIFIED_HW = PORT + 13, PORT + 14
 PORT_DEFAULT = PORT + 15
+PORT_REMARK_HW, PORT_REMARK_SW = PORT + 18, PORT + 19
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -1418,6 +1419,134 @@ async def test_flowtable_qos_default_class_takes_unclassified_traffic(qos):
     assert pinged[0] == pinged[1] == COUNT, pinged
     assert leaf_delta(after, pinged_after, 1)["frames"] >= COUNT, leaf_delta(after, pinged_after, 1)
     assert leaf_delta(after, pinged_after, 0)["frames"] == 0, leaf_delta(after, pinged_after, 0)
+
+
+async def test_flowtable_qos_dscp_remark_agrees_in_software(qos):
+    """A remark class rewrites forwarded frames in software as the hardware
+    rewrites them, and the DSCP map reads the same codepoint in both paths.
+
+    Two flows from the LAN VM to this host, both marked with a class that
+    remarks to EF and names no queue of its own; one is offered to the
+    flowtable and one never is. They leave at AF11. On the WAN port two DSCP
+    filters wait: AF11 to 1:12 and EF to 1:11. So the capture says whether the
+    remark happened, and the leaf a flow's frames land on says which codepoint
+    the map read -- the one the frame arrived with, or the remarked one. The
+    two paths have to agree on both; before, the software flow left at AF11.
+
+    The remark bits lie outside the image's mask, so the adapter is reloaded
+    with a wider one for the case and put back afterwards.
+    """
+    from scapy.all import IP, AsyncSniffer
+
+    r = qos
+    dev = TARGET_WAN_IF
+    af11 = 10 << 2
+    parameters = "/sys/module/ask_flowtable/parameters/"
+    original = {name: (await read(r.target, r.session, parameters + name)).strip()
+                for name in ("qos_mark_mask", "qos_default_class")}
+    shift = (REMARK_MASK & -REMARK_MASK).bit_length() - 1
+    mark = REMARK_CLASS << shift
+
+    async def send(port, count):
+        script = f'''
+import json, socket, struct, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, {af11})
+s.bind(({r.lan_ip!r}, {port}))
+for n in range({count}):
+    s.sendto(struct.pack('!Q', n) + b'ASK-remark'.ljust(120, b'.'), ({WAN_IP!r}, {port}))
+    time.sleep(0.002)
+print(json.dumps({{'sent': {count}}}))
+'''
+        result = await lan_run_python(r.lan, script, label="flowtable_qos_remark", timeout=60)
+        assert result.rc == 0, result.stdout
+
+    async def measured(port):
+        ready = threading.Event()
+        sniffer = AsyncSniffer(iface=r.wan_if, store=True, started_callback=ready.set,
+                               filter=f"udp and src host {r.lan_ip} and dst port {port}")
+        sniffer.start()
+        try:
+            assert await asyncio.to_thread(ready.wait, 5), "the WAN capture did not start"
+            before = await egress(r, dev)
+            await send(port, COUNT)
+            await asyncio.sleep(0.3)
+            after = await egress(r, dev)
+        finally:
+            packets = [p for p in sniffer.stop() if IP in p]
+        return {"packets": packets, "ef": leaf_delta(before, after, 0),
+                "af11": leaf_delta(before, after, 1),
+                "software_tx": after["software_tx"] - before["software_tx"]}
+
+    await r.clear_ct()
+    await reload_adapter(r, f"qos_mark_mask={REMARK_MASK:#x}")
+    try:
+        await tree(r, dev, CAP_MBIT, [("1:11", LOW_PRIO), ("1:12", 2)])
+        await r.tc("qdisc", "add", "dev", dev, "clsact")
+        for pref, tos, classid in (("1", EF_TOS, "1:11"), ("2", af11, "1:12")):
+            await r.tc("filter", "add", "dev", dev, "egress", "protocol", "ip", "pref", pref,
+                       "flower", "skip_sw", "ip_tos", f"{tos:#x}/0xfc",
+                       "action", "skbedit", "priority", classid)
+        await offload(r, f"ip saddr {r.lan_ip} ip daddr {WAN_IP} udp dport {PORT_REMARK_HW} "
+                         f"ct mark set {mark:#x} flow add @fast",
+                         f"ip saddr {r.lan_ip} ip daddr {WAN_IP} udp dport {PORT_REMARK_SW} "
+                         f"ct mark set {mark:#x}")
+        target = f"{WAN_IP}:{PORT_REMARK_HW}"
+        deadline = time.monotonic() + 20
+        while True:
+            await send(PORT_REMARK_HW, 16)
+            rows = directions(await r.state(), ingress=TARGET_LAN_IF, proto=17, dst=target)
+            if rows:
+                break
+            assert time.monotonic() < deadline, "the remarked flow was never admitted"
+            await asyncio.sleep(0.5)
+        installed = rows[0]
+        hardware = await measured(PORT_REMARK_HW)
+        software = await measured(PORT_REMARK_SW)
+        final = await r.state()
+    finally:
+        try:
+            await r.delete_table()
+            await r.clear_ct()
+        finally:
+            await reload_adapter(r, idle=False)
+    restored = {name: (await read(r.target, r.session, parameters + name)).strip()
+                for name in original}
+    rows = directions(final, ingress=TARGET_LAN_IF, proto=17, dst=target)
+    unoffered = directions(final, ingress=TARGET_LAN_IF, proto=17,
+                           dst=f"{WAN_IP}:{PORT_REMARK_SW}")
+    r.record("qos-dscp-remark-software", {
+        "installed": installed, "rows": rows, "unoffered": unoffered,
+        "hardware": {k: v for k, v in hardware.items() if k != "packets"},
+        "software": {k: v for k, v in software.items() if k != "packets"},
+        "hardware_tos": sorted({p[IP].tos for p in hardware["packets"]}),
+        "software_tos": sorted({p[IP].tos for p in software["packets"]})})
+
+    assert restored == original, (original, restored)
+    assert int(installed["qos"], 16) == REMARK_CLASS, installed
+    assert len(rows) == 1 and rows[0]["cookie"] == installed["cookie"], (installed, rows)
+    assert int(rows[0]["packets"]) - int(installed["packets"]) == COUNT, (installed, rows)
+    assert hardware["software_tx"] <= COUNT // 4, hardware
+    assert not unoffered and software["software_tx"] >= COUNT, (unoffered, software)
+    # Both paths put EF on the wire, the ECN bits left as the sender had them
+    # and an IPv4 checksum that still verifies.
+    for name, result in (("hardware", hardware), ("software", software)):
+        packets = result["packets"]
+        assert len(packets) == COUNT, (name, len(packets))
+        for p in packets:
+            assert p[IP].tos == EF_TOS, (name, p.summary())
+            saved = p[IP].chksum
+            copy = p[IP].copy()
+            del copy.chksum
+            assert IP(bytes(copy)).chksum == saved, (name, p.summary())
+    # And the map read the same codepoint in both: every frame of each flow on
+    # one leaf, the same leaf for both. EF means the map reads the remarked
+    # codepoint, AF11 the one the frame arrived with.
+    def landed(result):
+        ef, af11_leaf = result["ef"]["frames"], result["af11"]["frames"]
+        assert sorted((ef, af11_leaf)) == [0, COUNT], result
+        return "ef" if ef else "af11"
+    assert landed(software) == landed(hardware), (software, hardware)
 
 
 # ---- ingress policing ------------------------------------------------------

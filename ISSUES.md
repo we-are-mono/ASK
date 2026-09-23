@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A256.** A class's DSCP remark was applied only in hardware, so a flow changed codepoint when offloaded and one never offloaded was never remarked —
+  fixed (_:/^cdx: remark forwarded frames in software as the hardware does_).
+
 - [x] **A253.** A refused RED change left the old curve running under a qdisc showing the new one, stats cleared `offloaded`, and a RED could program an unrelated leaf's queue —
   fixed (_:/^cdx: make a RED qdisc's offload state what the class queue runs_).
 

@@ -164,11 +164,39 @@ enum ip_conntrack_info { IP_CT_NEW, IP_CT_ESTABLISHED };
 struct nf_conn { u32 mark; };
 #define ETH_P_IP	0x0800
 #define ETH_P_IPV6	0x86DD
+#define ETH_P_PPP_SES	0x8864
+#define PPP_IP		0x21
+#define PPP_IPV6	0x57
+#define PPPOE_SES_HLEN	8
+#define INET_ECN_MASK	3
 /* A macro rather than a function, because the production switch uses it in
  * case labels, where the kernel's own htons() is equally constant-foldable. */
 #define htons(v)	((u16)((((u16)(v)) >> 8) | (((u16)(v)) << 8)))
-struct iphdr { u8 tos; };
-struct ipv6hdr { u8 dsfield; };
+#define ntohs(v)	htons(v)
+#define __force
+typedef u8 __u8;
+typedef u32 __u32;
+typedef u16 __be16;
+typedef u16 __sum16;
+/* The real headers, and the kernel's own dsfield helpers (dsfield.inc), so a
+ * rewrite is checked against the bytes and the checksum a wire would see. */
+struct iphdr {
+	u8 ihl:4, version:4;
+	u8 tos;
+	__be16 tot_len, id, frag_off;
+	u8 ttl, protocol;
+	__sum16 check;
+	u32 saddr, daddr;
+};
+struct ipv6hdr {
+	u8 priority:4, version:4;
+	u8 flow_lbl[3];
+	__be16 payload_len;
+	u8 nexthdr, hop_limit;
+	u8 saddr[16], daddr[16];
+};
+struct pppoe_hdr { u8 type_ver, code; __be16 sid, length; };
+#include "dsfield.inc"
 struct sock;
 struct sk_buff {
 	struct nf_conn *ct;
@@ -177,6 +205,12 @@ struct sk_buff {
 	bool short_header;	/* too short to read the network header */
 	int skb_iif;		/* the ingress a forwarded frame arrived on */
 	struct sock *sk;	/* the gateway's own frames carry their socket */
+	/* The network header onwards, built from the fields above the first
+	 * time anything looks: a PPPoE session header, then an IP header of
+	 * the family `inner' names, or the IP header of `protocol' itself. */
+	u16 inner;
+	bool built, unwritable;
+	u8 head[96];
 };
 struct qman_fq { unsigned channel, quenum; };
 static struct nf_conn *nf_ct_get(struct sk_buff *skb, enum ip_conntrack_info *info)
@@ -184,14 +218,89 @@ static struct nf_conn *nf_ct_get(struct sk_buff *skb, enum ip_conntrack_info *in
 	*info = IP_CT_ESTABLISHED;
 	return skb->ct;
 }
+
+/* RFC 1071, for an oracle independent of the incremental update being checked:
+ * a header whose checksum is right sums to zero. */
+static u16 fold_sum(const u8 *p, unsigned len)
+{
+	u32 sum = 0;
+
+	for (unsigned i = 0; i < len; i += 2)
+		sum += (u32)p[i] << 8 | p[i + 1];
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (u16)~sum;
+}
+
+static void build_ip(u8 *at, u16 proto, u8 tos)
+{
+	if (proto == htons(ETH_P_IP)) {
+		struct iphdr *iph = (struct iphdr *)at;
+		u16 sum;
+
+		iph->version = 4;
+		iph->ihl = 5;
+		iph->tos = tos;
+		iph->tot_len = htons(40);
+		iph->ttl = 63;
+		iph->protocol = 17;
+		iph->saddr = 0x0101a8c0;
+		iph->daddr = 0xe800000a;
+		sum = fold_sum(at, sizeof(*iph));
+		at[10] = sum >> 8;
+		at[11] = sum & 0xff;
+	} else if (proto == htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6h = (struct ipv6hdr *)at;
+
+		ip6h->version = 6;
+		ip6h->priority = tos >> 4;
+		/* Traffic class low nibble, then a flow label that has to survive. */
+		ip6h->flow_lbl[0] = (u8)(tos << 4) | 0x0a;
+		ip6h->flow_lbl[1] = 0xbc;
+		ip6h->flow_lbl[2] = 0xde;
+		ip6h->nexthdr = 17;
+		ip6h->hop_limit = 63;
+	}
+}
+
+static u8 *skb_network_header(struct sk_buff *skb)
+{
+	if (!skb->built) {
+		skb->built = true;
+		if (skb->protocol == htons(ETH_P_PPP_SES)) {
+			struct pppoe_hdr *ph = (struct pppoe_hdr *)skb->head;
+
+			ph->type_ver = 0x11;
+			ph->sid = htons(0x1234);
+			skb->head[6] = 0;
+			skb->head[7] = skb->inner == htons(ETH_P_IPV6) ? PPP_IPV6 : PPP_IP;
+			build_ip(skb->head + PPPOE_SES_HLEN, skb->inner, skb->tos);
+		} else {
+			build_ip(skb->head, skb->protocol, skb->tos);
+		}
+	}
+	return skb->head;
+}
+static int skb_network_offset(const struct sk_buff *skb) { (void)skb; return 0; }
 static bool pskb_network_may_pull(struct sk_buff *skb, unsigned len)
-{ (void)len; return !skb->short_header; }
+{ assert(len <= sizeof(skb->head)); return !skb->short_header; }
+static int skb_ensure_writable(struct sk_buff *skb, unsigned len)
+{ assert(len <= sizeof(skb->head)); return skb->unwritable ? -ENOMEM : 0; }
+static int skb_copy_bits(struct sk_buff *skb, int offset, void *to, int len)
+{
+	if (skb->short_header)
+		return -EFAULT;
+	memcpy(to, skb_network_header(skb) + offset, len);
+	return 0;
+}
 static struct iphdr *ip_hdr(struct sk_buff *skb)
-{ static struct iphdr h; h.tos = skb->tos; return &h; }
+{ return (struct iphdr *)skb_network_header(skb); }
 static struct ipv6hdr *ipv6_hdr(struct sk_buff *skb)
-{ static struct ipv6hdr h; h.dsfield = skb->tos; return &h; }
-static u8 ipv4_get_dsfield(const struct iphdr *h) { return h->tos; }
-static u8 ipv6_get_dsfield(const struct ipv6hdr *h) { return h->dsfield; }
+{ return (struct ipv6hdr *)skb_network_header(skb); }
+typedef struct { long long counter; } atomic64_t;
+#define ATOMIC64_INIT(v)	{ (v) }
+static void atomic64_inc(atomic64_t *v) { v->counter++; }
+static long long atomic64_read(const atomic64_t *v) { return v->counter; }
 
 /* The DSCP filters, which own what a codepoint means. Their own validation is
  * tools/host_tests/dscp_map.c; here all that matters is that a frame naming no
@@ -199,7 +308,10 @@ static u8 ipv6_get_dsfield(const struct ipv6hdr *h) { return h->dsfield; }
 static u16 dscp_classes[64];
 static u16 cdx_dscp_class(struct tQM_context_ctl *qm_ctx, u8 dscp)
 {
-	assert(qm_ctx);
+	/* A port no tc command has touched yet has no context recorded, and
+	 * no filter either: the production lookup answers zero for it. */
+	if (!qm_ctx)
+		return 0;
 	return dscp < 64 ? dscp_classes[dscp] : 0;
 }
 static void synchronize_net(void) {}
@@ -422,8 +534,12 @@ static void synchronize_srcu(struct srcu_struct *ssp)
 	ssp->syncs++;
 	srcu_syncs++;
 }
-typedef u16 (*cdx_ft_qos_class_fn)(u32 mark);
+/* Nineteen bits wide, as cdx_flowtable.h declares it: the remark flag and
+ * its codepoint sit above the sixteen a narrower type would keep. */
+typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
+/* File-scope in the production file, so declared here. */
+static atomic64_t cdx_htb_remark_failures = ATOMIC64_INIT(0);
 
 /* The flowtable's hook for a port whose egress changed, kept alive by an SRCU
  * domain rather than by its callers' RTNL, which the adapter's unload does not
@@ -981,7 +1097,7 @@ static void test_dispatch(void)
  * masked bits shifted down to their own base. Twelve bits wide, because a class
  * names a class queue, a channel and an ingress policer profile, one nibble
  * each, and a narrower field can only ever name the queue. */
-static u16 test_qos_class(u32 mark) { return (mark & 0xfff00) >> 8; }
+static u32 test_qos_class(u32 mark) { return (mark & 0xfff00) >> 8; }
 
 /* Send a frame whose conntrack carries the mark that decodes to `class`. */
 static u16 pick(struct net_device *dev, u16 class)
@@ -1269,6 +1385,122 @@ static void test_unclassified(void)
 	assert_balanced(dev);
 	cdx_unregister_ft_qos_class();
 	assert(allocations == 0);
+}
+
+/* A class's whole value, remark included: the mark is the class here. */
+static u32 whole_class(u32 mark) { return mark; }
+
+/* What a frame's IP header says after the port picked its queue. */
+static u8 ipv4_tos(struct sk_buff *skb, unsigned offset)
+{ return ((struct iphdr *)(skb_network_header(skb) + offset))->tos; }
+static bool ipv4_sum_ok(struct sk_buff *skb, unsigned offset)
+{ return fold_sum(skb_network_header(skb) + offset, sizeof(struct iphdr)) == 0; }
+static u8 ipv6_tc(struct sk_buff *skb, unsigned offset)
+{ return ipv6_get_dsfield((struct ipv6hdr *)(skb_network_header(skb) + offset)); }
+
+/* The software path remarks what the hardware remarks.
+ *
+ * A class carrying a remark makes the hardware rewrite the DSCP of every routed
+ * flow it carries. The frames the CPU forwards -- a flow's first, and every one
+ * of a flow never offloaded -- used to leave as they arrived, so a flow changed
+ * codepoint the moment it was offloaded. Now they are rewritten too, the ECN
+ * bits kept and the IPv4 checksum with it; the gateway's own frames, a class
+ * with no remark, and anything not IP are left alone. */
+static void test_remark(void)
+{
+	struct net_device *dev = &devices[0];
+	const u32 ef = CDX_FT_QOS_REMARK_MASK | 46u << CDX_FT_QOS_DSCP_SHIFT;
+	struct nf_conn remarked = { .mark = ef }, plain = { .mark = 0 };
+	u64 failures;
+	u16 qid1, qid10, qid11;
+
+	reset_world();
+	assert(!cdx_register_ft_qos_class(whole_class));
+
+	/* IPv4 at AF11 with ECT(0): EF, ECN kept, a checksum that verifies. */
+	struct sk_buff v4 = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
+			      .tos = 10 << 2 | 2 };
+	assert(ipv4_sum_ok(&v4, 0));
+	cdx_htb_select_queue(dev, &v4);
+	assert(ipv4_tos(&v4, 0) == (46 << 2 | 2) && ipv4_sum_ok(&v4, 0));
+	/* IPv6 at AF11 with ECT(1): the traffic class rewritten, ECN, version
+	 * and flow label kept. */
+	struct sk_buff v6 = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IPV6),
+			      .tos = 10 << 2 | 1 };
+	cdx_htb_select_queue(dev, &v6);
+	assert(ipv6_tc(&v6, 0) == (46 << 2 | 1));
+	assert(ipv6_hdr(&v6)->version == 6 && (ipv6_hdr(&v6)->flow_lbl[0] & 0x0f) == 0x0a);
+	assert(ipv6_hdr(&v6)->flow_lbl[1] == 0xbc && ipv6_hdr(&v6)->flow_lbl[2] == 0xde);
+	/* Inside a PPPoE session, which is how a frame for one reaches the
+	 * port: the inner header, and the session header untouched. */
+	struct sk_buff pppoe = { .ct = &remarked, .skb_iif = 5,
+				 .protocol = htons(ETH_P_PPP_SES), .inner = htons(ETH_P_IP),
+				 .tos = 0 };
+	cdx_htb_select_queue(dev, &pppoe);
+	assert(ipv4_tos(&pppoe, PPPOE_SES_HLEN) == 46 << 2 && ipv4_sum_ok(&pppoe, PPPOE_SES_HLEN));
+	assert(pppoe.head[0] == 0x11 && pppoe.head[7] == PPP_IP);
+	struct sk_buff pppoe6 = { .ct = &remarked, .skb_iif = 5,
+				  .protocol = htons(ETH_P_PPP_SES), .inner = htons(ETH_P_IPV6),
+				  .tos = 3 };
+	cdx_htb_select_queue(dev, &pppoe6);
+	assert(ipv6_tc(&pppoe6, PPPOE_SES_HLEN) == (46 << 2 | 3));
+
+	/* The gateway's own, by socket or by having no ingress: untouched. */
+	struct sock *owner = (struct sock *)&plain;
+	struct sk_buff own = { .ct = &remarked, .skb_iif = 5, .sk = owner,
+			       .protocol = htons(ETH_P_IP), .tos = 10 << 2 };
+	struct sk_buff generated = { .ct = &remarked, .protocol = htons(ETH_P_IP), .tos = 10 << 2 };
+	cdx_htb_select_queue(dev, &own);
+	cdx_htb_select_queue(dev, &generated);
+	assert(ipv4_tos(&own, 0) == 10 << 2 && ipv4_tos(&generated, 0) == 10 << 2);
+	/* A class with no remark, and a frame with no class at all. */
+	struct sk_buff unmarked = { .ct = &plain, .skb_iif = 5, .protocol = htons(ETH_P_IP),
+				    .tos = 10 << 2 };
+	struct sk_buff untracked = { .skb_iif = 5, .protocol = htons(ETH_P_IP), .tos = 10 << 2 };
+	cdx_htb_select_queue(dev, &unmarked);
+	cdx_htb_select_queue(dev, &untracked);
+	assert(ipv4_tos(&unmarked, 0) == 10 << 2 && ipv4_tos(&untracked, 0) == 10 << 2);
+	/* Not IP: nothing to mark, and not a failure either. */
+	failures = cdx_ft_qos_remark_failures();
+	struct sk_buff arp = { .ct = &remarked, .skb_iif = 5, .protocol = htons(0x0806) };
+	cdx_htb_select_queue(dev, &arp);
+	assert(cdx_ft_qos_remark_failures() == failures);
+
+	/* A header that cannot be made writable, or cannot be read at all, is
+	 * counted and the frame sent as it is rather than dropped. */
+	struct sk_buff shared = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
+				  .tos = 10 << 2, .unwritable = true };
+	cdx_htb_select_queue(dev, &shared);
+	assert(ipv4_tos(&shared, 0) == 10 << 2 && ipv4_sum_ok(&shared, 0));
+	assert(cdx_ft_qos_remark_failures() == failures + 1);
+	struct sk_buff runt = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_PPP_SES),
+				.short_header = true };
+	cdx_htb_select_queue(dev, &runt);
+	assert(cdx_ft_qos_remark_failures() == failures + 2);
+	/* One already at the codepoint needs no write, so a header that could
+	 * not be written costs nothing either. */
+	struct sk_buff there = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
+				 .tos = 46 << 2, .unwritable = true };
+	cdx_htb_select_queue(dev, &there);
+	assert(cdx_ft_qos_remark_failures() == failures + 2);
+
+	/* The DSCP map reads the codepoint the frame leaves with: a remark to EF
+	 * with no egress class of its own lands where the EF filter says. */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!to_inner(dev, 10, 1, 0, 0));
+	assert(!query(dev, 10, &qid10));
+	assert(!add_leaf(dev, 11, 1, 1, 0, 0, 0, &qid11));
+	memset(dscp_classes, 0, sizeof(dscp_classes));
+	dscp_classes[46] = (1 << 4) | (NUM_PQS - 2);		/* EF: 1:11 */
+	dscp_classes[10] = (1 << 4) | (NUM_PQS - 1);		/* AF11: 1:10 */
+	struct sk_buff mapped = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
+				  .tos = 10 << 2 };
+	assert(cdx_htb_select_queue(dev, &mapped) == qid11);
+	memset(dscp_classes, 0, sizeof(dscp_classes));
+	assert(!destroy(dev));
+	assert_balanced(dev);
+	cdx_unregister_ft_qos_class();
 }
 
 /* ethtool asks for a fixed number of values and gets one for every leaf slot,
@@ -1653,6 +1885,7 @@ int main(void)
 	test_channel_reuse();
 	test_software_path();
 	test_unclassified();
+	test_remark();
 	test_class_statistics();
 	test_red();
 	test_queue_budget();

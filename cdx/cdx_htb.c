@@ -46,9 +46,12 @@
 #include <net/pkt_cls.h>
 #include <net/pkt_sched.h>
 #include <net/dsfield.h>
+#include <net/inet_ecn.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/netfilter/nf_conntrack.h>
+#include <linux/if_pppox.h>
+#include <linux/ppp_defs.h>
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
 #include "cdx.h"
@@ -1313,6 +1316,80 @@ static bool cdx_htb_forwarded(struct sk_buff *skb, const struct nf_conn *ct)
 	return ct && skb->skb_iif && !skb->sk;
 }
 
+/* Forwarded frames whose class carries a remark that could not be written --
+ * the header could not be made writable -- and so left as they arrived rather
+ * than dropped for a marking. Reported in /proc/cdx_flowtable. */
+static atomic64_t cdx_htb_remark_failures = ATOMIC64_INIT(0);
+
+u64 cdx_ft_qos_remark_failures(void)
+{
+	return atomic64_read(&cdx_htb_remark_failures);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_remark_failures, ASK_CDX_FLOWTABLE);
+
+/* Rewrite a forwarded frame's DSCP to the codepoint its class carries, keeping
+ * the two ECN bits, as the hardware rule for the same flow does.
+ *
+ * The hardware rewrites every routed flow it carries, in the opcode that
+ * decrements TTL; nothing on the software path did, so a flow changed DSCP at
+ * the moment it was offloaded, and one that never was left unmarked. This is
+ * the software half. A frame for a PPPoE session reaches the port with its
+ * session header already on, so the IP header is looked for behind it: the
+ * field the hardware rewrites for the same flow is the inner header's.
+ *
+ * Only the IP header is touched, which is linear by the time the port has the
+ * frame, and made writable first: a clone shares its head with a tap. The IPv4
+ * checksum is updated with it; neither family's pseudo-header includes the
+ * field, so a checksum the stack left for the hardware is unaffected. */
+static void cdx_htb_remark(struct sk_buff *skb, u8 dscp)
+{
+	unsigned int offset = 0;
+	__be16 proto = skb->protocol;
+	__be16 ppp;
+
+	if (proto == htons(ETH_P_PPP_SES)) {
+		if (skb_copy_bits(skb, skb_network_offset(skb) + sizeof(struct pppoe_hdr),
+				  &ppp, sizeof(ppp)))
+			goto failed;
+		proto = ppp == htons(PPP_IP) ? htons(ETH_P_IP) :
+			ppp == htons(PPP_IPV6) ? htons(ETH_P_IPV6) : 0;
+		offset = PPPOE_SES_HLEN;
+	}
+	/* Read before writing: a frame already carrying the codepoint -- a
+	 * sender that sets it itself -- costs no copy of a shared head. The
+	 * header is looked up again after the head is made writable, which
+	 * may have moved it. */
+	switch (proto) {
+	case htons(ETH_P_IP):
+		if (!pskb_network_may_pull(skb, offset + sizeof(struct iphdr)))
+			goto failed;
+		if (ipv4_get_dsfield((struct iphdr *)(skb_network_header(skb) + offset)) >> 2 == dscp)
+			return;
+		if (skb_ensure_writable(skb, skb_network_offset(skb) + offset +
+					sizeof(struct iphdr)))
+			goto failed;
+		ipv4_change_dsfield((struct iphdr *)(skb_network_header(skb) + offset),
+				    INET_ECN_MASK, dscp << 2);
+		return;
+	case htons(ETH_P_IPV6):
+		if (!pskb_network_may_pull(skb, offset + sizeof(struct ipv6hdr)))
+			goto failed;
+		if (ipv6_get_dsfield((struct ipv6hdr *)(skb_network_header(skb) + offset)) >> 2 == dscp)
+			return;
+		if (skb_ensure_writable(skb, skb_network_offset(skb) + offset +
+					sizeof(struct ipv6hdr)))
+			goto failed;
+		ipv6_change_dsfield((struct ipv6hdr *)(skb_network_header(skb) + offset),
+				    INET_ECN_MASK, dscp << 2);
+		return;
+	default:
+		/* Nothing IP to mark: the class meant a codepoint. */
+		return;
+	}
+failed:
+	atomic64_inc(&cdx_htb_remark_failures);
+}
+
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 {
 	cdx_ft_qos_class_fn decode = READ_ONCE(cdx_ft_qos_class_func);
@@ -1320,6 +1397,7 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	struct cdx_htb_port *port;
 	enum ip_conntrack_info cinfo;
 	struct nf_conn *ct;
+	u32 class = 0;
 	u16 klass = 0;
 	u8 slot;
 
@@ -1337,8 +1415,18 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	 * is wider than an egress destination — it also names an ingress policer
 	 * profile, which has no bearing on which queue a frame leaves by — and
 	 * this table is sized for the egress class alone. */
-	if (ct)
-		klass = decode(READ_ONCE(ct->mark)) & CDX_FT_QOS_EGRESS_MASK;
+	if (ct) {
+		class = decode(READ_ONCE(ct->mark));
+		klass = class & CDX_FT_QOS_EGRESS_MASK;
+	}
+	/* The remark before the DSCP map, so the map reads the codepoint the
+	 * frame leaves with. In hardware the rewrite is an opcode of the
+	 * entry's header manipulation and the map is read by the enqueue that
+	 * ends it; the order here follows that one, and has to change with it
+	 * if the hardware turns out to read the field first. Forwarded frames
+	 * only, as in hardware: the gateway's own keep what their sockets set. */
+	if ((class & CDX_FT_QOS_REMARK_MASK) && cdx_htb_forwarded(skb, ct))
+		cdx_htb_remark(skb, (class & CDX_FT_QOS_DSCP_MASK) >> CDX_FT_QOS_DSCP_SHIFT);
 	/* No class named, so the DSCP map gets to choose. A frame with no
 	 * conntrack at all reaches here too: it has a DSCP like any other, and
 	 * nothing has named a class for it. */

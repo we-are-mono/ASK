@@ -34,6 +34,10 @@ typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
 int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn);
 void cdx_unregister_ft_qos_class(void);
 
+/* Forwarded frames the software path could not remark as their class asks --
+ * sent unchanged -- for the adapter's status to report. */
+u64 cdx_ft_qos_remark_failures(void);
+
 /* A port's egress changed under the entries that transmit on it.
  *
  * Every hardware entry names the frame queue it enqueues to, chosen once, at
