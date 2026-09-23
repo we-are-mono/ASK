@@ -52,6 +52,7 @@ from test_flowtable_offload import (ARTIFACTS, TABLE, WAN_IP, command, console_c
 # PORT + 16 onwards; the NAT exemption covers the whole block.
 PORT = int(os.environ.get("ASK_FLOWTABLE_QOS_PORT", "49300"))
 PORT_SHAPED = PORT
+PORT_HIGH, PORT_LOW = PORT + 1, PORT + 2
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -70,6 +71,7 @@ OAL = 24
 # leaf of `prio N` holds class queue 7 - N, and a conntrack mark names that
 # index. prio 0 is the queue that wins.
 HIGH_PRIO, HIGH_CQ = 0, 7
+LOW_PRIO, LOW_CQ = 1, 6
 
 IPERF_SECONDS = 8
 # Admission, and the burst a token bucket starts with, both happen in the first
@@ -184,6 +186,15 @@ def received_bps(report, after=SETTLE):
                  if i["sum"]["start"] >= after - 0.01]
     assert intervals, report["server_output_json"]
     return sum(i["bytes"] for i in intervals) * 8 / sum(i["seconds"] for i in intervals)
+
+
+def received_loss(report, after=SETTLE):
+    """The fraction of a UDP transfer the receiver never saw, once settled."""
+    intervals = [i["sum"] for i in report["server_output_json"]["intervals"]
+                 if i["sum"]["start"] >= after - 0.01]
+    packets = sum(i["packets"] for i in intervals)
+    assert packets, report["server_output_json"]
+    return sum(i["lost_packets"] for i in intervals) / packets
 
 
 def lockstep(destination, port, count, *, tos=0, payload_size=256, timeout=1.0):
@@ -486,3 +497,63 @@ async def test_flowtable_qos_htb_shapes_at_the_cap(qos):
     extra = whole["frames"] + whole["rejected"] - int(row["packets"])
     assert 0 <= extra <= after["software_tx"] - before["software_tx"], (
         whole, row["packets"], after["software_tx"] - before["software_tx"])
+
+
+async def test_flowtable_qos_strict_priority_keeps_its_rate(qos):
+    """Two classes on one channel at the cap: the high-priority one offered half
+    of it, the low-priority one three times all of it.
+
+    Strict priority serves the high class whenever it holds a frame, so
+    saturating its neighbour must cost it nothing: its leaf dequeues what it
+    offered and rejects next to nothing, and its receiver loses next to nothing.
+    The low class gets what is left -- the two leaves together sit on the cap --
+    and its leaf is where the excess is refused.
+    """
+    r = qos
+    await tree(r, TARGET_LAN_IF, CAP_MBIT, [("1:10", HIGH_PRIO), ("1:11", LOW_PRIO)])
+    await offload(r, inbound(r, "udp", PORT_HIGH, r.mark(HIGH_CQ)),
+                  inbound(r, "udp", PORT_LOW, r.mark(LOW_CQ)))
+    await lan_start(r, iperf=[PORT_HIGH, PORT_LOW])
+    high_mbit = CAP_MBIT // 2
+    clients = [asyncio.create_task(iperf(r, PORT_HIGH, udp_mbit=high_mbit)),
+               asyncio.create_task(iperf(r, PORT_LOW, udp_mbit=OFFERED_MBIT))]
+    try:
+        await asyncio.sleep(SETTLE)
+        first = await egress(r, TARGET_LAN_IF)
+        state = await r.state()
+        await asyncio.sleep(WINDOW)
+        second = await egress(r, TARGET_LAN_IF)
+        high, low = await asyncio.gather(*clients)
+    finally:
+        for client in clients:
+            if not client.done():
+                client.cancel()
+        await asyncio.gather(*clients, return_exceptions=True)
+    cap = CAP_MBIT * 1e6
+    # Shaper bits per payload bit, for datagrams of DATAGRAM bytes.
+    charge = (DATAGRAM + UDP_HEADERS + OAL) / DATAGRAM
+    held, starved = leaf_delta(first, second, 0), leaf_delta(first, second, 1)
+    high_shaped = shaped_bps(first, second, 0)
+    total = shaped_bps(first, second, 0, 1)
+    rows = {port: directions(state, ingress=TARGET_WAN_IF, proto=17, dst=f"{r.lan_ip}:{port}")
+            for port in (PORT_HIGH, PORT_LOW)}
+    r.record("qos-strict-priority", {"state": state, "first": first, "second": second,
+                                     "high_leaf": held, "low_leaf": starved,
+                                     "high_shaped_bps": high_shaped, "total_bps": total,
+                                     "high": high, "low": low})
+
+    for port, cq in ((PORT_HIGH, HIGH_CQ), (PORT_LOW, LOW_CQ)):
+        assert len(rows[port]) == 1 and int(rows[port][0]["qos"], 16) == cq, rows
+    assert low["end"]["sum_sent"]["bits_per_second"] >= 2 * cap, low["end"]["sum_sent"]
+    slack = timing_slack(first, second)
+    assert (0.95 - slack) * cap <= total <= (1.03 + slack) * cap, (total, cap, slack, held,
+                                                                   starved)
+    expected_high = high_mbit * 1e6 * charge
+    assert (0.95 - slack) * expected_high <= high_shaped <= (1.05 + slack) * expected_high, (
+        "the high class did not keep the rate it offered", high_shaped, expected_high, slack)
+    assert held["rejected"] <= held["frames"] // 200, held
+    assert received_loss(high) <= 0.01, high["server_output_json"]["intervals"]
+    assert starved["rejected"] >= starved["frames"], starved
+    expected_low = (cap - high_shaped) / charge
+    assert 0.85 * expected_low <= received_bps(low) <= 1.05 * expected_low, (
+        received_bps(low), expected_low)
