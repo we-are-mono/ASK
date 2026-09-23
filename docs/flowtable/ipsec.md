@@ -766,16 +766,20 @@ when that leaves by the SA's device, instead of the SA's endpoints looked up
 in the wrong family. That route then cannot name the tunnel's next hop, so
 the flowtable's Ethernet destination, the adapter's next hop and the direct
 output's per-packet neighbour use come from `xfrm_dev_peer_route()`, which
-routes the endpoint in the SA's family with the SA's output mark and its
-port's VRF, and the adapter checks and watches that neighbour in that family
-(`cdx_ft_rule.next_hop_family`). Before, both read the IPv4 endpoint as an
+routes the endpoint in the SA's family with the SA's output mark, its
+port's VRF and the protocol and ports its frames leave with (ESP, or NAT-T's
+UDP ports), as `xfrm_dst_lookup()` does, and the adapter checks and watches
+that neighbour in that family (`cdx_ft_rule.next_hop_family`). Before, both read the IPv4 endpoint as an
 IPv6 address on the route under the bundle, which answered only through a
 default route's gateway. The same per-packet lookup is where such an SA's
 endpoint moving off its port shows, so the packet is refused as
 `XfrmOutBundleCheckError` there, as a same-family SA's is by its own route;
 and the lookup names its next hop itself, so an on-link endpoint takes the
 FIB's cached route rather than the per-lookup clone the tunnel lookups ask
-for. The adapter's own peer lookup carries the same mark and VRF.
+for. The adapter's own peer lookup, at install and when it follows the
+peer, carries the same mark, VRF, protocol and ports: without the last two a
+rule on them, or a multipath hash over the ports, could give the hardware
+one next hop while Linux's frames take another.
 
 **It must set `sp->len` and not `sp->olen`.** `xfrm_offload(skb)` answers
 non-NULL exactly when `olen` is non-zero and equal to `len`, and a non-NULL

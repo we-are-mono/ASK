@@ -42,6 +42,7 @@ typedef uint32_t __be32;
 #define AF_INET6 10
 #define IPPROTO_ESP 50
 #define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
 #define UDP_ENCAP_ESPINUDP 2
 #define EINVAL 22
 #define EIO 5
@@ -270,7 +271,14 @@ static void dst_release(struct dst_entry *d)
 }
 
 struct rtable { struct dst_entry dst; };
-struct flowi4 { __be32 daddr, saddr; __be16 fl4_dport, fl4_sport; int flowi4_oif; u32 flowi4_mark; int flowi4_l3mdev; };
+struct flowi4 {
+	__be32 daddr, saddr;
+	__be16 fl4_dport, fl4_sport;
+	int flowi4_oif;
+	u32 flowi4_mark;
+	int flowi4_l3mdev;
+	u8 flowi4_proto;
+};
 struct flowi6 { struct in6_addr daddr, saddr; __be16 fl6_dport, fl6_sport; };
 struct flowi {
 	union { struct flowi4 ip4; struct flowi6 ip6; } u;
@@ -778,6 +786,8 @@ static struct neighbour *route_neigh;
 static unsigned route_lookups, route_puts;
 static int route_oif, route_l3mdev;
 static u32 route_mark;
+/* The last lookup's whole key. */
+static struct flowi4 route_key;
 static struct dst_ops v4_ops = { .family = AF_INET };
 /* The VRF the SA's port is enslaved to, or zero. */
 static int port_l3_master;
@@ -793,6 +803,7 @@ static struct rtable *ip_route_output_key(void *net, struct flowi4 *fl4)
 	route_oif = fl4->flowi4_oif;
 	route_mark = fl4->flowi4_mark;
 	route_l3mdev = fl4->flowi4_l3mdev;
+	route_key = *fl4;
 	route_lookups++;
 	if (route_error)
 		return ERR_PTR(route_error);
@@ -1007,6 +1018,8 @@ static void test_next_hop(void)
 {
 	struct cdx_ipsec_sa_spec spec;
 	struct xfrm_state *x = outbound_state();
+	struct xfrm_encap_tmpl natt = { .encap_type = UDP_ENCAP_ESPINUDP,
+					.encap_sport = htons(4500), .encap_dport = htons(61000) };
 	struct netlink_ext_ack ack = { NULL };
 
 	/* No route to the peer is a refusal: an outbound SA leaves SEC
@@ -1040,6 +1053,20 @@ static void test_next_hop(void)
 	assert(route_l3mdev == 9 && route_mark == 0x70);
 	port_l3_master = 0;
 	x->props.smark.v = x->props.smark.m = 0;
+
+	/* And with the protocol and ports the SA's frames leave with, which
+	 * the kernel's lookup carries too, so a rule or a multipath hash on
+	 * them answers both alike: ESP, or NAT-T's UDP and its own ports. */
+	bench_reset();
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && route_lookups == 1);
+	assert(route_key.flowi4_proto == IPPROTO_ESP);
+	assert(route_key.fl4_sport == 0 && route_key.fl4_dport == 0);
+	bench_reset();
+	x->encap = &natt;
+	assert(ft_ipsec_spec(x, &spec, &ack) == 0 && route_lookups == 1);
+	assert(route_key.flowi4_proto == IPPROTO_UDP);
+	assert(route_key.fl4_sport == htons(4500) && route_key.fl4_dport == htons(61000));
+	x->encap = NULL;
 
 	/* A neighbour that has not answered is asked for and waited on, not
 	 * refused outright -- a cold ARP cache is the normal state of a
@@ -1701,6 +1728,34 @@ static void test_watch_follows_peer(void)
 	assert(works_scheduled == 0);
 
 	ft_xdo_state_delete(x);
+	bench_clear_sas();
+}
+
+/* The watch re-resolves with what the install resolved with: the SA's mark,
+ * protocol and ports, not only its addresses. */
+static void test_watch_routes_like_install(void)
+{
+	struct xfrm_encap_tmpl natt = { .encap_type = UDP_ENCAP_ESPINUDP,
+					.encap_sport = htons(4500), .encap_dport = htons(61000) };
+	struct netlink_ext_ack ack = { NULL };
+	struct xfrm_state state;
+
+	bench_reset();
+	bench_clear_sas();
+	state = *outbound_state();
+	state.encap = &natt;
+	state.props.smark.v = 0x70;
+	state.props.smark.m = 0xf0;
+	assert(ft_xdo_state_add(&state, &ack) == 0);
+	/* The watch starts stale, so this pass is the re-resolution. */
+	memset(&route_key, 0, sizeof(route_key));
+	route_lookups = 0;
+	ft_ipsec_follow_work(NULL);
+	assert(route_lookups == 1);
+	assert(route_key.flowi4_mark == 0x70 && route_key.flowi4_proto == IPPROTO_UDP);
+	assert(route_key.fl4_sport == htons(4500) && route_key.fl4_dport == htons(61000));
+	works_scheduled = 0;
+	ft_xdo_state_delete(&state);
 	bench_clear_sas();
 }
 
@@ -2609,6 +2664,7 @@ int main(void)
 	test_received_state_policy();
 	test_handle_and_flowi();
 	test_watch_follows_peer();
+	test_watch_routes_like_install();
 	test_watch_route_and_device();
 	test_watch_unreachable_peer();
 	test_watch_failures();

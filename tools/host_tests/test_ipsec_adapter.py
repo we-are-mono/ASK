@@ -35,7 +35,7 @@ def test_ipsec_adapter(tmp_path):
         + backend[backend.index("#define CDX_IPSEC_KEY_MAX"):
                   backend.index("/* SA operations run inside")]
         # Up to the work item, which is the kernel's and not a type.
-        + source[source.index("struct ft_ipsec_watch {"):
+        + source[source.index("struct ft_ipsec_route {"):
                  source.index("static void ft_ipsec_follow_work(struct work_struct")]
         # The SAs the adapter owns and the bounds of the pass that accounts
         # for them, again up to that pass's work item.
@@ -52,7 +52,7 @@ def test_ipsec_adapter(tmp_path):
         "ft_ipsec_mark", "ft_ipsec_neigh_moved", "ft_ipsec_route_moved",
         "ft_ipsec_all_moved", "ft_ipsec_device_moved", "ft_ipsec_egress_changed",
         "ft_ipsec_watch_add", "ft_ipsec_watch_del", "ft_ipsec_watch_flush",
-        "ft_ipsec_peer_mac", "ft_ipsec_next_hop",
+        "ft_ipsec_peer_mac", "ft_ipsec_route_of", "ft_ipsec_next_hop",
         "ft_ipsec_replay_bit", "ft_ipsec_replay_seen", "ft_ipsec_spec",
         "ft_ipsec_seq_exhausting", "ft_ipsec_publish_oseq",
         "ft_ipsec_publish_window", "ft_ipsec_account", "ft_ipsec_stats_work",

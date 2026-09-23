@@ -3593,6 +3593,19 @@ static void ft_ipsec_retire_sa(u16 handle)
  * the control mutex to do it. So a watch still on this list while the control
  * mutex is held names an SA that is still there.
  */
+
+/* What the kernel routes an SA's peer with besides the two endpoints
+ * (xfrm_dst_lookup()): the SA's output mark, and the protocol and ports its
+ * frames leave with. A rule on any of them, or a multipath hash over the
+ * ports, has to answer the adapter's lookup as it answers the kernel's, or
+ * the hardware addresses one next hop while Linux's frames take another. */
+struct ft_ipsec_route {
+	u32 mark;
+	__be16 sport;
+	__be16 dport;
+	u8 proto;
+};
+
 struct ft_ipsec_watch {
 	struct list_head list;
 	/* Identity that survives the memory. The work drops every lock to
@@ -3608,8 +3621,8 @@ struct ft_ipsec_watch {
 	struct net_device *dev;
 	union nf_inet_addr local;
 	union nf_inet_addr peer;
-	/* The SA's output mark, which the peer is routed with. */
-	u32 mark;
+	/* What the peer is routed with besides the two addresses. */
+	struct ft_ipsec_route route;
 	/* What the hardware is currently writing: the peer's address and the
 	 * port's own. Both are in the entry's header-manipulation opcodes, so
 	 * either changing is the same defect and takes the same rebuild. */
@@ -3766,12 +3779,13 @@ static void ft_ipsec_egress_changed(const struct net_device *dev)
  */
 static void ft_ipsec_watch_add(struct ft_ipsec_watch *watch,
 			       const struct cdx_ipsec_sa_spec *spec,
-			       struct cdx_ipsec_sa *sa, u32 mark)
+			       struct cdx_ipsec_sa *sa,
+			       const struct ft_ipsec_route *route)
 {
 	watch->sa = sa;
 	watch->dev = spec->dev;
 	watch->family = spec->family;
-	watch->mark = mark;
+	watch->route = *route;
 	watch->local = spec->src;
 	watch->peer = spec->dst;
 	ether_addr_copy(watch->dst_mac, spec->dst_mac);
@@ -7164,7 +7178,8 @@ static void ft_mr_rows(struct seq_file *seq)
  */
 static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 			     const union nf_inet_addr *local,
-			     const union nf_inet_addr *peer, u32 mark, bool wait,
+			     const union nf_inet_addr *peer,
+			     const struct ft_ipsec_route *route, bool wait,
 			     u8 *mac, struct netlink_ext_ack *extack)
 {
 	struct neighbour *neighbour;
@@ -7182,13 +7197,16 @@ static int ft_ipsec_peer_mac(struct net_device *dev, u8 family,
 	 * was followed to a next hop on the old one. The kernel now drops
 	 * frames for a bundle routed off the SA's port, so this has to agree
 	 * with it, and asks with what the kernel's own lookup of the peer
-	 * carries: the SA's output mark, and the table of the VRF the port is
-	 * enslaved to, if any. */
+	 * carries: the table of the VRF the port is enslaved to, if any, and
+	 * the SA's `route`. */
 	struct flowi4 fl4 = {
 		.daddr = peer->ip,
 		.saddr = local->ip,
-		.flowi4_mark = mark,
+		.flowi4_mark = route->mark,
 		.flowi4_l3mdev = l3mdev_master_ifindex(dev),
+		.flowi4_proto = route->proto,
+		.fl4_sport = route->sport,
+		.fl4_dport = route->dport,
 	};
 	int rc = 0;
 
@@ -7253,12 +7271,29 @@ out:
 	return rc;
 }
 
+static void ft_ipsec_route_of(struct xfrm_state *x, struct ft_ipsec_route *route)
+{
+	*route = (struct ft_ipsec_route){
+		.mark = xfrm_smark_get(0, x),
+		.proto = x->id.proto,
+	};
+	/* The one encapsulation ft_ipsec_spec() admits. */
+	if (x->encap && x->encap->encap_type == UDP_ENCAP_ESPINUDP) {
+		route->proto = IPPROTO_UDP;
+		route->sport = x->encap->encap_sport;
+		route->dport = x->encap->encap_dport;
+	}
+}
+
 static int ft_ipsec_next_hop(struct xfrm_state *x,
 			     struct cdx_ipsec_sa_spec *spec,
 			     struct netlink_ext_ack *extack)
 {
+	struct ft_ipsec_route route;
+
+	ft_ipsec_route_of(x, &route);
 	return ft_ipsec_peer_mac(spec->dev, spec->family, &spec->src, &spec->dst,
-				 xfrm_smark_get(0, x), true, spec->dst_mac, extack);
+				 &route, true, spec->dst_mac, extack);
 }
 
 /* Where xfrm keeps the bit for sequence number top - k in a replay_esn ring.
@@ -7716,6 +7751,7 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	struct ft_ipsec_watch *watch = NULL;
 	struct ft_ipsec_retirement *retirement;
 	struct cdx_ipsec_sa_spec spec;
+	struct ft_ipsec_route route;
 	struct cdx_ipsec_sa *sa;
 	int rc;
 
@@ -7781,8 +7817,10 @@ static int ft_xdo_state_add(struct xfrm_state *x, struct netlink_ext_ack *extack
 	/* Nothing if the accounting pass is already queued, and otherwise the
 	 * start of it: the pass stops itself once no SA is owned. */
 	schedule_delayed_work(&ft_ipsec_stats, FT_IPSEC_STATS_PERIOD);
-	if (watch)
-		ft_ipsec_watch_add(watch, &spec, sa, xfrm_smark_get(0, x));
+	if (watch) {
+		ft_ipsec_route_of(x, &route);
+		ft_ipsec_watch_add(watch, &spec, sa, &route);
+	}
 	/* The opaque owner, not the sixteen-bit handle: it identifies this SA
 	 * for as long as it lives, whereas a handle becomes reusable the
 	 * moment the SA is deleted. cdx_ipsec_sa_handle() still answers for
@@ -7912,7 +7950,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 	bool reported, rebuild;
 	u64 cookie;
 	u64 pass;
-	u32 mark;
+	struct ft_ipsec_route route;
 	u8 family;
 	int rc;
 
@@ -7932,7 +7970,7 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		cookie = watch->cookie;
 		dev = watch->dev;
 		family = watch->family;
-		mark = watch->mark;
+		route = watch->route;
 		local = watch->local;
 		peer = watch->peer;
 		reported = watch->reported;
@@ -7943,8 +7981,8 @@ static void ft_ipsec_follow_work(struct work_struct *work)
 		dev_hold(dev);
 		spin_unlock_bh(&ft_watch_lock);
 
-		rc = ft_ipsec_peer_mac(dev, family, &local, &peer, mark, false, mac,
-				       NULL);
+		rc = ft_ipsec_peer_mac(dev, family, &local, &peer, &route, false,
+				       mac, NULL);
 		if (!rc && !rebuild && ether_addr_equal(mac, was_dst) &&
 		    ether_addr_equal(dev->dev_addr, was_src)) {
 			/* Neither address moved. A route event marks every SA
