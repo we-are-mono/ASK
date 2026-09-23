@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A247.** A bundle of two packet-offloaded transforms left with only the first applied —
+  fixed (_:/^xfrm: refuse a nested packet-offload bundle_).
+
 - [x] **A246.** GSO packets for a packet-offloaded SA hit `skb_checksum_help()`'s WARN and were dropped: all local TCP and GRO-merged forwarded traffic on the software path —
   fixed (_:/^xfrm: segment GSO packets for a packet-offloaded SA in software_).
 
