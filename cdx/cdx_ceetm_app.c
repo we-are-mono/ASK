@@ -209,11 +209,18 @@ static struct qman_fq *ceetm_get_dscp_fq(void *ctx, uint8_t dscp)
 {
 	struct tQM_context_ctl *qm_ctx = (struct tQM_context_ctl *)ctx;
 	struct qm_dscp_fq_map *map;
+	struct qman_fq *fq;
 
 	if (dscp >= MAX_DSCP)
 		return NULL;
+	/* The table is freed with kfree_rcu() once unpublished. The section is
+	 * taken here rather than assumed of the transmit path that calls this;
+	 * the queue read out of it is a class queue's, which outlives it. */
+	rcu_read_lock_bh();
 	map = rcu_dereference_bh(qm_ctx->dscp_fq_map);
-	return map ? READ_ONCE(map->dscp_fq[dscp]) : NULL;
+	fq = map ? READ_ONCE(map->dscp_fq[dscp]) : NULL;
+	rcu_read_unlock_bh();
+	return fq;
 }
 
 /* get count of frames on a CEETM class queue */

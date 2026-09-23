@@ -16,7 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?[^\n]+\b" + name + r"\([^;]*?\)\s*\{", source, re.M)
+    # The line has to begin with a word, the return type: a comment line that
+    # names `foo()' would otherwise match and run on to the next definition.
+    match = re.search(r"^(?:static )?\w[^\n]*\b" + name + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     end, depth = match.end(), 1
     while depth:
@@ -69,7 +71,7 @@ def test_htb_offload(tmp_path):
         "cdx_htb_class_queue",
         "cdx_htb_port_gone", "cdx_register_ft_qos_class",
         "cdx_unregister_ft_qos_class", "cdx_htb_dscp_slot", "cdx_htb_forwarded",
-        "cdx_ft_qos_remark_failures", "cdx_htb_remark",
+        "cdx_ft_qos_remark_failures", "cdx_htb_remark", "cdx_htb_decode",
         "cdx_htb_select_queue", "cdx_htb_txq_fq", "cdx_htb_resolve_class",
         "cdx_htb_class_stats", "cdx_htb_red", "cdx_htb_setup_red",
         "cdx_register_ft_setup_tc",

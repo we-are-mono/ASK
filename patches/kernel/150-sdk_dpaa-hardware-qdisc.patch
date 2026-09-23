@@ -1,4 +1,4 @@
-From 09dede8fce7c21b8c8d7daaaa98e2a44b56d2169 Mon Sep 17 00:00:00 2001
+From 4a9278860924de5f118054f64e1a808f95e7c057 Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Wed, 23 Sep 2026 19:08:09 +0200
 Subject: [PATCH] sdk_dpaa: let this netdev host a hardware qdisc
@@ -74,25 +74,46 @@ One set per leaf slot rather than per class in the tree, so the number of
 statistics is a compile-time constant: ethtool fetches the names and the values
 in separate ioctls, and a count that moved with `tc class add` would leave
 userspace lining one up against the other.
+
+Both registrations point into the module's text, so both unregisters wait
+for the calls already inside it. The ndo_setup_tc handler sleeps, and runs
+in an SRCU read-side section the unregister synchronizes against; without
+that, a tc command or flowtable bind racing the module's unload or its
+failed-init unwind ran in freed text. The data-path callbacks may not
+sleep and are each called inside an rcu_read_lock() the driver takes
+itself, since ndo_select_queue is not always entered with one held --
+AF_PACKET's qdisc bypass calls it from plain process context, which under
+PREEMPT_RCU is no reader -- and the unregister waits for a grace period.
 ---
- .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 140 +++++++++++++++++-
- .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |  33 ++++-
- .../freescale/sdk_dpaa/dpaa_eth_common.h      |  53 +++++++
- .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  30 +++-
- .../freescale/sdk_dpaa/dpaa_ethtool.c         |  53 ++++++-
- 5 files changed, 299 insertions(+), 10 deletions(-)
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.c    | 173 +++++++++++++++++-
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth.h    |  33 +++-
+ .../freescale/sdk_dpaa/dpaa_eth_common.h      |  65 +++++++
+ .../ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c |  30 ++-
+ .../freescale/sdk_dpaa/dpaa_ethtool.c         |  53 +++++-
+ 5 files changed, 344 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-index 063302116911..177d59e3bab9 100644
+index 063302116911..0deb06afde81 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.c
-@@ -684,6 +684,109 @@ static void dpaa_eth_poll_controller(struct net_device *net_dev)
+@@ -57,6 +57,7 @@
+ #include <linux/if_ether.h>	/* ETH_P_IP and ETH_P_IPV6 */
+ #include <linux/highmem.h>
+ #include <linux/percpu.h>
++#include <linux/srcu.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/fsl_bman.h>
+ #ifdef CONFIG_SOC_BUS
+@@ -684,6 +685,141 @@ static void dpaa_eth_poll_controller(struct net_device *net_dev)
  }
  #endif
  
 +#ifdef CONFIG_CPE_FAST_PATH
-+/* Set by the offload module; a built-in driver cannot link against one. */
++/* Set by the offload module; a built-in driver cannot link against one. The
++ * handler sleeps, so its calls are counted by an SRCU domain rather than by
++ * RCU: the unregister waits for the ones already inside it. */
 +static dpa_setup_tc_handler dpa_setup_tc_func;
++DEFINE_STATIC_SRCU(dpa_setup_tc_srcu);
 +
 +int dpa_register_setup_tc(dpa_setup_tc_handler handler)
 +{
@@ -104,14 +125,20 @@ index 063302116911..177d59e3bab9 100644
 +}
 +EXPORT_SYMBOL(dpa_register_setup_tc);
 +
++/* Returns once no call is inside the handler, so the module's text -- and
++ * the state the handler reaches, its own SRCU domains among it -- may be freed
++ * after. Must not be called from inside the handler, nor with anything held
++ * that a handler call waits for. */
 +void dpa_unregister_setup_tc(void)
 +{
 +	WRITE_ONCE(dpa_setup_tc_func, NULL);
++	synchronize_srcu(&dpa_setup_tc_srcu);
 +}
 +EXPORT_SYMBOL(dpa_unregister_setup_tc);
 +
-+/* Read the handler once: an unregister can NULL it concurrently, and a
-+ * half-torn read would call through freed module text.
++/* Read the handler once, inside the read-side section the unregister waits
++ * for: an unregister can NULL it concurrently, and a call that began before
++ * it must finish before the module's text goes.
 + *
 + * Refusing when nothing is registered is deliberate rather than convenient.
 + * Netfilter has already chosen this route over the module's indirect
@@ -121,9 +148,14 @@ index 063302116911..177d59e3bab9 100644
 +static int dpa_setup_tc(struct net_device *dev, enum tc_setup_type type,
 +			void *type_data)
 +{
-+	dpa_setup_tc_handler handler = READ_ONCE(dpa_setup_tc_func);
++	dpa_setup_tc_handler handler;
++	int idx, rc;
 +
-+	return handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
++	idx = srcu_read_lock(&dpa_setup_tc_srcu);
++	handler = READ_ONCE(dpa_setup_tc_func);
++	rc = handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
++	srcu_read_unlock(&dpa_setup_tc_srcu, idx);
++	return rc;
 +}
 +
 +/* The data-path half, published and retired as one pointer so a frame never
@@ -142,8 +174,10 @@ index 063302116911..177d59e3bab9 100644
 +}
 +EXPORT_SYMBOL(dpa_register_qdisc_ops);
 +
-+/* Waits out in-flight Tx before returning, so the callbacks' module text may
-+ * be freed once it does. */
++/* Waits for a grace period before returning, so the callbacks' module text
++ * may be freed once it does. Every caller below takes its own rcu_read_lock()
++ * around the pointer and the call, so that holds whatever context it was
++ * entered from. */
 +void dpa_unregister_qdisc_ops(void)
 +{
 +	WRITE_ONCE(dpa_qdisc, NULL);
@@ -151,11 +185,19 @@ index 063302116911..177d59e3bab9 100644
 +}
 +EXPORT_SYMBOL(dpa_unregister_qdisc_ops);
 +
++/* The frame queue answered is used for the enqueue after this returns, which
++ * cpe_fp_tx() keeps inside its own read-side section. */
 +struct qman_fq *dpa_qdisc_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb)
 +{
-+	const struct dpa_qdisc_ops *ops = READ_ONCE(dpa_qdisc);
++	const struct dpa_qdisc_ops *ops;
++	struct qman_fq *fq = NULL;
 +
-+	return ops ? ops->txq_fq(qm_ctx, txq, skb) : NULL;
++	rcu_read_lock();
++	ops = READ_ONCE(dpa_qdisc);
++	if (ops)
++		fq = ops->txq_fq(qm_ctx, txq, skb);
++	rcu_read_unlock();
++	return fq;
 +}
 +
 +/* Always answers, so the count of statistics this driver reports is a
@@ -164,25 +206,33 @@ index 063302116911..177d59e3bab9 100644
 + * read zero. */
 +void dpa_qdisc_class_stats(void *qm_ctx, u64 *data)
 +{
-+	const struct dpa_qdisc_ops *ops = READ_ONCE(dpa_qdisc);
++	const struct dpa_qdisc_ops *ops;
 +
 +	memset(data, 0, DPAA_ETH_CEETM_LEAF_QUEUES * DPA_CEETM_CLASS_STATS *
 +			sizeof(*data));
++	rcu_read_lock();
++	ops = READ_ONCE(dpa_qdisc);
 +	if (ops && qm_ctx)
 +		ops->class_stats(qm_ctx, data);
++	rcu_read_unlock();
 +}
 +
++/* Not always entered with a read-side section held: AF_PACKET's qdisc bypass
++ * calls ndo_select_queue from plain process context, which under PREEMPT_RCU
++ * is no reader at all. So the section is taken here. */
 +static u16 dpa_qdisc_select_queue(struct net_device *dev, struct sk_buff *skb,
 +				  struct net_device *sb_dev)
 +{
-+	const struct dpa_qdisc_ops *ops = READ_ONCE(dpa_qdisc);
-+	u16 queue;
++	const struct dpa_qdisc_ops *ops;
++	u16 queue = DPA_SELECT_QUEUE_NONE;
 +
-+	if (ops) {
++	rcu_read_lock();
++	ops = READ_ONCE(dpa_qdisc);
++	if (ops)
 +		queue = ops->select_queue(dev, skb);
-+		if (queue != DPA_SELECT_QUEUE_NONE)
-+			return queue;
-+	}
++	rcu_read_unlock();
++	if (queue != DPA_SELECT_QUEUE_NONE)
++		return queue;
 +	/* Traffic that named no class keeps the stack's own choice -- socket
 +	 * affinity and XPS included -- folded back into the queues that carry
 +	 * it. The fold is what keeps it off the leaf classes above them, which
@@ -196,7 +246,7 @@ index 063302116911..177d59e3bab9 100644
  static const struct net_device_ops dpa_private_ops = {
  	.ndo_open = dpa_eth_priv_start,
  	.ndo_start_xmit = dpa_tx,
-@@ -692,8 +795,13 @@ static const struct net_device_ops dpa_private_ops = {
+@@ -692,8 +828,13 @@ static const struct net_device_ops dpa_private_ops = {
  	.ndo_get_stats64 = dpa_get_stats64,
  	.ndo_set_mac_address = dpa_set_mac_address,
  	.ndo_validate_addr = eth_validate_addr,
@@ -211,7 +261,7 @@ index 063302116911..177d59e3bab9 100644
  #endif
  	.ndo_set_rx_mode = dpa_set_rx_mode,
  	.ndo_init = dpa_ndo_init,
-@@ -703,6 +811,9 @@ static const struct net_device_ops dpa_private_ops = {
+@@ -703,6 +844,9 @@ static const struct net_device_ops dpa_private_ops = {
  #endif
  	.ndo_set_features = dpa_set_features,
  	.ndo_fix_features = dpa_fix_features,
@@ -221,7 +271,7 @@ index 063302116911..177d59e3bab9 100644
  };
  
  static int dpa_private_napi_add(struct net_device *net_dev)
-@@ -779,6 +890,15 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
+@@ -779,6 +923,15 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
  				NETIF_F_RXCSUM;
  	net_dev->lltx               = true;
  
@@ -237,7 +287,7 @@ index 063302116911..177d59e3bab9 100644
  	/* Advertise S/G and HIGHDMA support for private interfaces */
  	net_dev->hw_features |= NETIF_F_SG | NETIF_F_HIGHDMA;
  	/* Recent kernels enable GSO automatically, if
-@@ -953,11 +1073,25 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+@@ -953,11 +1106,25 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  	/* Allocate this early, so we can store relevant information in
  	 * the private area (needed by 1588 code in dpa_mac_probe)
  	 */
@@ -264,7 +314,7 @@ index 063302116911..177d59e3bab9 100644
  
  	/* Do this here, so we can be verbose early */
  	SET_NETDEV_DEV(net_dev, dev);
-@@ -1152,6 +1286,8 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
+@@ -1152,6 +1319,8 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
  alloc_failed:
  mac_probe_failed:
  	dev_set_drvdata(dev, NULL);
@@ -323,10 +373,10 @@ index b83261780d96..80350d0a1a64 100644
  #define DPAA_IP_VERSION_4  4
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-index 46816dcda3cb..c9d66add4d58 100644
+index 46816dcda3cb..7d0de0cc9391 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_common.h
-@@ -111,6 +111,59 @@ typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint
+@@ -111,6 +111,71 @@ typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint
  typedef struct qman_fq *(*cdx_get_ceetm_dscp_fq)(void *, uint8_t dscp);
  int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func);
  void dpa_unregister_ceetm_get_egress_fq(void);
@@ -340,6 +390,11 @@ index 46816dcda3cb..c9d66add4d58 100644
 + * every hardware flowtable bind arrives here instead of through the module's
 + * indirect registration. With no handler those binds are refused, where before
 + * they were served.
++ *
++ * The handler sleeps -- it takes the module's own locks and can wait on RTNL --
++ * so calls are held in an SRCU read-side section, and the unregister returns
++ * only once every call already inside the handler has left it: the module's
++ * text, and anything of its own the handler touches, may go after that.
 + */
 +typedef int (*dpa_setup_tc_handler)(struct net_device *dev,
 +				    enum tc_setup_type type, void *type_data);
@@ -370,6 +425,13 @@ index 46816dcda3cb..c9d66add4d58 100644
 + * currently looks like, zeroing the slots no class holds, because ethtool's
 + * string set is fixed length: names and values arrive in separate ioctls, so a
 + * count that moved with tc would leave userspace reading one against the other.
++ *
++ * None of the three may sleep. Each is called inside an rcu_read_lock() the
++ * driver takes itself -- ndo_select_queue has callers that hold none, AF_PACKET's
++ * qdisc bypass among them -- and the unregister waits for a grace period, so
++ * the module may free its text and state once it returns. A frame queue txq_fq
++ * answers with has to stay valid for the enqueue that follows, which the
++ * transmit path keeps inside its own read-side section.
 + */
 +#define DPA_SELECT_QUEUE_NONE	((u16)~0U)
 +/* dequeued frames, dequeued bytes, rejected frames */
@@ -387,10 +449,10 @@ index 46816dcda3cb..c9d66add4d58 100644
  
  
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-index 31c5b805af87..f15d66955fa7 100644
+index 62fc7105e9c9..903a88e95aad 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
 +++ b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth_sg.c
-@@ -1449,9 +1449,9 @@ EXPORT_SYMBOL(skb_to_sg_fd);
+@@ -1454,9 +1454,9 @@ EXPORT_SYMBOL(skb_to_sg_fd);
  #define EMAC_QUEUENUM_MASK 0xff
  
  #ifdef CONFIG_CPE_FAST_PATH
@@ -403,7 +465,7 @@ index 31c5b805af87..f15d66955fa7 100644
   */
  static int pfe_eth_get_queuenum( struct sk_buff *skb )
  {
-@@ -1888,9 +1888,22 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1917,9 +1917,22 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  		egress_fq = NULL;
  		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when the frame names
  						no class and the DSCP map answers */
@@ -427,7 +489,7 @@ index 31c5b805af87..f15d66955fa7 100644
  			skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
  			if (skb_nh)
  			{
-@@ -1932,7 +1945,14 @@ static int cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
+@@ -1961,7 +1974,14 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
  			queuenum = queuenum % DPAA_ETH_TX_QUEUES;
  		egress_fq = priv->egress_fqs[queuenum];
  	}
@@ -442,7 +504,7 @@ index 31c5b805af87..f15d66955fa7 100644
 +	conf_fq = priv->conf_fqs[skb_get_queue_mapping(skb) & (DPAA_ETH_TX_QUEUES - 1)];
  	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
  }
- #endif
+ 
 diff --git a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c b/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c
 index 95f6db29416b..c5f99dbf8a7c 100644
 --- a/drivers/net/ethernet/freescale/sdk_dpaa/dpaa_ethtool.c

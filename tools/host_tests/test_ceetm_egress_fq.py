@@ -49,3 +49,27 @@ def test_ceetm_egress_fq(tmp_path):
         **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
         "UBSAN_OPTIONS": "halt_on_error=1",
     })
+
+
+def test_dscp_fq_lookup_holds_its_own_section(tmp_path):
+    """The DSCP map is freed after a grace period once its port's last filter
+    goes, and the transmit path reads it per frame; the lookup takes the
+    read-side section itself rather than relying on its caller's context."""
+    compiler = os.environ.get("CC", "cc")
+    source = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
+    header = (ROOT / "cdx/module_qm.h").read_text()
+    (tmp_path / "dscp_fq_types.inc").write_text(
+        re.search(r"^#define MAX_DSCP\s.*$", header, re.M).group() + "\n"
+        + re.search(r"struct qm_dscp_fq_map \{.*?\n\};\n", header, re.S).group())
+    (tmp_path / "dscp_fq_production.inc").write_text(function(source, "ceetm_get_dscp_fq"))
+    binary = tmp_path / "dscp_fq_lookup"
+    subprocess.run([
+        compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        "-Wno-unused-parameter", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("dscp_fq_lookup.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })

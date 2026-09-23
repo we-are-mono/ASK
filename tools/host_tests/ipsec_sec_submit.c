@@ -111,6 +111,11 @@ static void dpaa_sec_sg_release(const struct qm_fd *fd, bool free_skb)
 static void kfree_skb(struct sk_buff *skb) { (void)skb; bench.frees++; }
 static void dev_core_stats_tx_dropped_inc(struct net_device *dev) { dev->tx_dropped++; }
 static void netif_trans_update(struct net_device *dev) { dev->trans++; }
+/* The submit holds RCU across the hook's lookup and the enqueue using its
+ * answer (patch 107); the frame queue is looked up only inside it. */
+static int rcu_depth;
+static void rcu_read_lock(void) { rcu_depth++; }
+static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }
 
 #include "ipsec_sec_submit.inc"
 
@@ -201,6 +206,7 @@ static u32 fq_asked;
 
 static struct qman_fq *get_fq(u32 handle)
 {
+	assert(rcu_depth == 1);
 	fq_asked = handle;
 	return fq_answer;
 }

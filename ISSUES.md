@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A243.** Unregistering a hook (`ndo_setup_tc`, TC_SETUP_FT, the Tx and SEC hooks) waited for no caller, so a racing tc command, bind or frame could run freed text —
+  fixed (_:/^sdk_dpaa, cdx: wait out every call into a hook before its module goes_).
+
 - [x] **A257.** `tc filter replace` of a DSCP filter was refused as a duplicate, and the old filter's destroy then unmapped the codepoint —
   fixed (_:/^cdx: keep a DSCP codepoint across tc filter replace_).
 

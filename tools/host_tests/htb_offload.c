@@ -19,6 +19,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int64_t s64;
 
 #define MAX_PHY_PORTS			40
 #define CDX_CEETM_MAX_CHANNELS		8
@@ -314,7 +315,14 @@ static u16 cdx_dscp_class(struct tQM_context_ctl *qm_ctx, u8 dscp)
 		return 0;
 	return dscp < 64 ? dscp_classes[dscp] : 0;
 }
-static void synchronize_net(void) {}
+/* RCU read-side depth. A hook called on the transmit path takes its own
+ * section around the pointer and the call; a grace period cannot be waited
+ * for from inside one. */
+static int rcu_depth;
+static void rcu_read_lock(void) { rcu_depth++; }
+static void rcu_read_unlock(void) { assert(rcu_depth > 0); rcu_depth--; }
+static unsigned net_syncs;
+static void synchronize_net(void) { assert(!rcu_depth); net_syncs++; }
 
 static int real_num_tx_queues_fails;
 static int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int txq)
@@ -1042,7 +1050,8 @@ static int ft_stub(struct net_device *dev, enum tc_setup_type type, void *data)
 {
 	(void)dev; (void)data;
 	assert(type == TC_SETUP_FT);
-	/* Inside the section the unregister waits out. */
+	/* Inside the section its unregister waits for: a bind racing the
+	 * adapter's unload must finish before the adapter's text goes. */
 	assert(cdx_ft_handler_srcu.readers == 1);
 	ft_calls++;
 	return 0;
@@ -1078,10 +1087,11 @@ static void test_dispatch(void)
 	assert(!cdx_setup_tc(&devices[0], TC_SETUP_QDISC_HTB, &opt));
 
 	assert(!cdx_ft_handler_srcu.readers && !cdx_ft_handler_srcu.syncs);
-	/* Unregistering waits out the calls already inside the handler before
-	 * the module that owns its text may go. */
+	/* The adapter's unregister waits out the binds already inside its
+	 * handler, so its text can go once it returns. */
+	srcu_syncs = 0;
 	cdx_unregister_ft_setup_tc();
-	assert(cdx_ft_handler_srcu.syncs == 1);
+	assert(cdx_ft_handler_srcu.syncs == 1 && srcu_syncs == 1);
 	assert(cdx_setup_tc(&devices[0], TC_SETUP_FT, &block) == -EOPNOTSUPP);
 	assert(!cdx_ft_handler_srcu.readers && ft_calls == 1);
 
@@ -1097,7 +1107,9 @@ static void test_dispatch(void)
  * masked bits shifted down to their own base. Twelve bits wide, because a class
  * names a class queue, a channel and an ingress policer profile, one nibble
  * each, and a narrower field can only ever name the queue. */
-static u32 test_qos_class(u32 mark) { return (mark & 0xfff00) >> 8; }
+/* Called only inside a read-side section select_queue takes itself, since
+ * ndo_select_queue is not always entered holding one. */
+static u32 test_qos_class(u32 mark) { assert(rcu_depth == 1); return (mark & 0xfff00) >> 8; }
 
 /* Send a frame whose conntrack carries the mark that decodes to `class`. */
 static u16 pick(struct net_device *dev, u16 class)
@@ -1251,10 +1263,13 @@ static void test_software_path(void)
 	 * on a leaf's queue. The tree still owns the port, though, so every
 	 * frame still lands on one of its queues rather than wherever the
 	 * driver's mark field would have sent it. */
+	net_syncs = 0;
 	cdx_unregister_ft_qos_class();
+	assert(net_syncs == 1 && !rcu_depth);
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
+	assert(!rcu_depth);
 	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[0][NUM_PQS - 1]);
 	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &forwarded) == &class_fqs[0][0]);
 	assert(!destroy(dev));
@@ -1388,7 +1403,7 @@ static void test_unclassified(void)
 }
 
 /* A class's whole value, remark included: the mark is the class here. */
-static u32 whole_class(u32 mark) { return mark; }
+static u32 whole_class(u32 mark) { assert(rcu_depth == 1); return mark; }
 
 /* What a frame's IP header says after the port picked its queue. */
 static u8 ipv4_tos(struct sk_buff *skb, unsigned offset)

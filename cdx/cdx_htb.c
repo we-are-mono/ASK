@@ -1263,10 +1263,13 @@ int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_register_ft_qos_class, ASK_CDX_FLOWTABLE);
 
+/* Finishes the readers that may be inside the classifier before its module
+ * goes. Each takes its own rcu_read_lock() around the pointer and the call
+ * (cdx_htb_select_queue()), so this holds whatever context the frame came
+ * from -- AF_PACKET's qdisc bypass reaches ndo_select_queue holding none. */
 void cdx_unregister_ft_qos_class(void)
 {
 	WRITE_ONCE(cdx_ft_qos_class_func, NULL);
-	/* Finish the Tx readers that may be inside it before its module goes. */
 	synchronize_net();
 }
 EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_qos_class, ASK_CDX_FLOWTABLE);
@@ -1393,19 +1396,34 @@ failed:
 	atomic64_inc(&cdx_htb_remark_failures);
 }
 
+/* The adapter's classifier applied to a frame's connection, or -1 with no
+ * classifier registered. The classifier is the adapter's text, so the pointer
+ * and the call share a read-side section taken here: the unregister's grace
+ * period waits for it whatever context the frame arrived in. */
+static s64 cdx_htb_decode(const struct nf_conn *ct)
+{
+	cdx_ft_qos_class_fn decode;
+	s64 class = -1;
+
+	rcu_read_lock();
+	decode = READ_ONCE(cdx_ft_qos_class_func);
+	if (decode)
+		class = ct ? decode(READ_ONCE(ct->mark)) : 0;
+	rcu_read_unlock();
+	return class;
+}
+
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 {
-	cdx_ft_qos_class_fn decode = READ_ONCE(cdx_ft_qos_class_func);
 	struct dpa_priv_s *priv = netdev_priv(dev);
 	struct cdx_htb_port *port;
 	enum ip_conntrack_info cinfo;
 	struct nf_conn *ct;
+	s64 decoded;
 	u32 class = 0;
 	u16 klass = 0;
 	u8 slot;
 
-	if (!decode)
-		return DPA_SELECT_QUEUE_NONE;
 	port = cdx_htb_entry(priv->qm_ctx);
 	if (!port)
 		return DPA_SELECT_QUEUE_NONE;
@@ -1418,10 +1436,11 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 	 * is wider than an egress destination — it also names an ingress policer
 	 * profile, which has no bearing on which queue a frame leaves by — and
 	 * this table is sized for the egress class alone. */
-	if (ct) {
-		class = decode(READ_ONCE(ct->mark));
-		klass = class & CDX_FT_QOS_EGRESS_MASK;
-	}
+	decoded = cdx_htb_decode(ct);
+	if (decoded < 0)
+		return DPA_SELECT_QUEUE_NONE;
+	class = (u32)decoded;
+	klass = class & CDX_FT_QOS_EGRESS_MASK;
 	/* The remark before the DSCP map, so the map reads the codepoint the
 	 * frame leaves with. In hardware the rewrite is an opcode of the
 	 * entry's header manipulation and the map is read by the enqueue that
@@ -1590,6 +1609,9 @@ int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_register_ft_setup_tc, ASK_CDX_FLOWTABLE);
 
+/* Returns once no bind or unbind is inside the adapter's handler, so the
+ * adapter's text may go after it. Not from inside the handler, nor holding
+ * anything a bind waits for. */
 void cdx_unregister_ft_setup_tc(void)
 {
 	WRITE_ONCE(cdx_ft_handler, NULL);
