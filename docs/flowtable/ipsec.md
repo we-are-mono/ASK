@@ -760,7 +760,16 @@ a counter nothing else in this kernel increments. The adapter's own check that
 the route to the peer leaves by the SA's port, at install and when the peer
 moves, asks the FIB unbound: bound to the port, the lookup answered through it
 whatever the table held, so that refusal could never fire and a peer routed
-elsewhere was followed to a next hop on the old port.
+elsewhere was followed to a next hop on the old port. Patch 146 is the other half
+for a tunnel whose outer family differs: the child route is the flow's own
+when that leaves by the SA's device, instead of the SA's endpoints looked up
+in the wrong family. That route then cannot name the tunnel's next hop, so
+the flowtable's Ethernet destination and the adapter's next hop come from
+`xfrm_dev_peer_neigh()`, which routes the endpoint in the SA's family, and the
+adapter checks and watches that neighbour in that family
+(`cdx_ft_rule.next_hop_family`). Before, both read the IPv4 endpoint as an
+IPv6 address on the route under the bundle, which answered only through a
+default route's gateway.
 
 **It must set `sp->len` and not `sp->olen`.** `xfrm_offload(skb)` answers
 non-NULL exactly when `olen` is non-zero and equal to `len`, and a non-NULL

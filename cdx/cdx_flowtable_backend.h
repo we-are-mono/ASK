@@ -172,6 +172,10 @@ struct cdx_ft_rule {
 	u8 out_vlans;
 	u8 family;
 	u8 proto;
+	/* Adapter state: the family of the next hop dst_mac was resolved for.
+	 * The flow's own, except for a direction encrypted by an SA of the
+	 * other family, whose frames are addressed to the SA's endpoint. */
+	u8 next_hop_family;
 	u8 src_mac[ETH_ALEN];
 	u8 dst_mac[ETH_ALEN];
 	u16 mtu;

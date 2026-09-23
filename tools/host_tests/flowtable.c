@@ -464,7 +464,7 @@ struct dst_ops { unsigned family; };
 /* Only the field the adapter reads off a transform: what leaves the port is
  * the outer packet, addressed to the SA's remote endpoint. */
 typedef union { __be32 a4; u32 a6[4]; } xfrm_address_t;
-struct xfrm_state { struct { xfrm_address_t daddr; } id; };
+struct xfrm_state { struct { xfrm_address_t daddr; } id; struct { u16 family; } props; };
 struct dst_entry {
     struct dst_ops *ops;
     struct net_device *dev;
@@ -506,8 +506,9 @@ static const struct in6_addr *rt6_nexthop(const struct rt6_info *r,
     if (r->rt6i_flags & RTF_CACHE) return &r->rt6i_dst.addr;
     return address;
 }
-struct neigh_table { unsigned key_len; };
-static struct neigh_table arp_tbl = { .key_len = 4 }, nd_tbl = { .key_len = 16 };
+struct neigh_table { unsigned key_len; int family; };
+static struct neigh_table arp_tbl = { .key_len = 4, .family = AF_INET },
+                          nd_tbl = { .key_len = 16, .family = AF_INET6 };
 struct neighbour {
     struct neigh_table *tbl;
     struct net_device *dev;
@@ -1030,6 +1031,18 @@ static struct neighbour *neigh_lookup(struct neigh_table *table, const void *dst
     return NULL;
 }
 static void neigh_release(struct neighbour *n) { assert(n->refs); n->refs--; }
+/* The kernel routes an SA's endpoint in the SA's own family and names the
+ * neighbour on the SA's device; a case says which one that is, or none. */
+static struct neighbour *peer_neigh;
+static unsigned peer_neigh_lookups;
+static struct neighbour *xfrm_dev_peer_neigh(struct xfrm_state *x)
+{
+    (void)x;
+    peer_neigh_lookups++;
+    if (peer_neigh)
+        peer_neigh->refs++;
+    return peer_neigh;
+}
 static int neigh_event_send(struct neighbour *n, void *skb)
 {
     assert(n->refs && !n->lock && !ft_watch_lock && !skb);
@@ -1737,6 +1750,70 @@ static void test_ipv6(void)
     assert(handle.invalid);
     ft_retire_workfn(NULL);
     assert(!ft_count && !ft_handle_refs && !ft_neighbour_refs && !allocated);
+    neighbour.tbl = &arp_tbl;
+}
+
+/* An IPv6 flow encrypted by an SA whose endpoints are IPv4. The route under
+ * the bundle is the flow's own on-link route, which has no neighbour for an
+ * IPv4 endpoint, so the next hop is the one the kernel resolves for the SA in
+ * the SA's family, and the entry checks and watches it in that family. */
+static struct xfrm_state cross_sa;
+static struct dst_entry cross_bundle;
+static void cross_fixture(u16 sa_family)
+{
+    fixture6();
+    cross_sa = (struct xfrm_state){ .props.family = sa_family };
+    if (sa_family == AF_INET)
+        cross_sa.id.daddr.a4 = htonl(0x0a0000e8);
+    else
+        memcpy(cross_sa.id.daddr.a6, &i6k.dst, sizeof(cross_sa.id.daddr.a6));
+    cross_bundle = (struct dst_entry){ .ops = &ipv6_ops6, .dev = &out, .xfrm = &cross_sa,
+                                       .xfrm_child = &route6.dst, .valid = true,
+                                       .cookie = cls.nf_dst_cookie };
+    cls.nf_dst = &cross_bundle;
+    /* The endpoint's ARP neighbour on the SA's port, carrying the address
+     * the Ethernet rewrite names. */
+    gateway.tbl = &arp_tbl;
+    gateway.primary_key = (union nf_inet_addr){ .ip = htonl(0x0a0000e8) };
+    peer_neigh = &gateway;
+    peer_neigh_lookups = 0;
+}
+
+static void test_cross_family_sa(void)
+{
+    union nf_inet_addr peer = { .ip = htonl(0x0a0000e8) };
+    union nf_inet_addr own = { .in6 = i6k.dst };
+    struct cdx_ft_rule decoded;
+
+    cross_fixture(AF_INET);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.family == AF_INET6 && decoded.next_hop_family == AF_INET);
+    assert(nf_inet_addr_cmp(&next_hop, &peer) && peer_neigh_lookups == 1 && !gateway.refs);
+    assert(ft_replace(&binding, &cls) == 0);
+    struct cdx_ft_entry *e = ft_find(&binding, cls.cookie);
+    assert(e && e->neigh == &gateway && gateway.refs == 1 && !neighbour.refs);
+    /* The IPv4 neighbour is the dependency: its move retires the flow. */
+    gateway.ha[5]++;
+    ft_neigh_event(NULL, NETEVENT_NEIGH_UPDATE, &gateway);
+    assert(handle.invalid);
+    ft_retire_workfn(NULL);
+    assert(!ft_count && !gateway.refs && !ft_neighbour_refs && !allocated);
+
+    /* No route to the endpoint on the SA's port: nothing to address the
+     * frames to, so the direction stays in software. */
+    cross_fixture(AF_INET);
+    peer_neigh = NULL;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == -EOPNOTSUPP);
+    assert(!gateway.refs && !neighbour.refs);
+
+    /* An SA of the flow's own family keeps asking the route under the
+     * bundle, and never the endpoint lookup. */
+    cross_fixture(AF_INET6);
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    assert(decoded.next_hop_family == AF_INET6 && !peer_neigh_lookups);
+    assert(nf_inet_addr_cmp(&next_hop, &own) && !neighbour.refs);
+
+    peer_neigh = NULL;
     neighbour.tbl = &arp_tbl;
 }
 
@@ -6917,6 +6994,7 @@ int main(void)
     test_selective_neighbours();
     test_selective_routes();
     test_ipv6();
+    test_cross_family_sa();
     test_vlan();
     test_bridge();
     test_bridge_fdb();

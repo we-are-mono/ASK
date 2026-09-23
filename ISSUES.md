@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A245.** IPv6-in-IPv4 over a packet-offloaded SA failed every bundle without an IPv6 default route: the SA's IPv4 endpoints were looked up as IPv6 —
+  fixed (_:/^xfrm: route a cross-family packet-offload tunnel by the flow_).
+
 - [x] **A244.** A packet-offloaded SA's plaintext left in the clear by whatever device the bundle's route named once the peer route moved off the SA's port —
   fixed (_:/^xfrm: keep packet-offload plaintext on the SA's port_).
 

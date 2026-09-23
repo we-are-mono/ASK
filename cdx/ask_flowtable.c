@@ -1216,12 +1216,13 @@ denied:
 static bool ft_next_hop(const struct flow_cls_offload *cls,
 			struct net_device *dev, u8 family,
 			const union nf_inet_addr *daddr,
-			union nf_inet_addr *next_hop)
+			union nf_inet_addr *next_hop, u8 *next_hop_family)
 {
 	struct dst_entry *dst = cls->nf_dst;
-	const struct xfrm_state *x = NULL;
+	struct xfrm_state *x = NULL;
 	union nf_inet_addr peer;
 
+	*next_hop_family = family;
 	if (!dst || dst->ops->family != family || dst->error ||
 	    !dst_check(dst, cls->nf_dst_cookie))
 		return false;
@@ -1245,6 +1246,22 @@ static bool ft_next_hop(const struct flow_cls_offload *cls,
 	 * describes the frame this port puts on the wire. */
 	if (dst->dev != dev || dst->lwtstate)
 		return false;
+	/* An SA of the other family: the route under its bundle is the flow's
+	 * own, which has no neighbour for an endpoint of the SA's family, so
+	 * the kernel routes the endpoint in that family. The next hop and its
+	 * neighbour are then that family's, and so is everything that checks
+	 * or watches them. */
+	if (x && x->props.family != family) {
+		struct neighbour *neigh = xfrm_dev_peer_neigh(x);
+
+		if (!neigh)
+			return false;
+		memset(next_hop, 0, sizeof(*next_hop));
+		memcpy(next_hop, &neigh->primary_key, neigh->tbl->key_len);
+		*next_hop_family = neigh->tbl->family;
+		neigh_release(neigh);
+		return ft_nexthop_usable(*next_hop_family, next_hop);
+	}
 	/* Past a transform the address to resolve is the tunnel's far end, not
 	 * the flow's own destination. Both reach the same answer through a
 	 * gateway route, which is why this went unnoticed: rt_nexthop() returns
@@ -1347,9 +1364,10 @@ static int ft_neigh_attach(struct cdx_ft_entry *entry)
 	} else {
 		/* Neighbours belong to the device the route names, which is
 		 * the VLAN subinterface for a tagged flow; the physical port
-		 * never sees them. */
-		neigh = neigh_lookup(ft_neigh_table(entry->rule.family), &entry->next_hop,
-				     entry->rule.out_logical);
+		 * never sees them. In the next hop's family, which is the
+		 * SA's for a flow encrypted by an SA of the other family. */
+		neigh = neigh_lookup(ft_neigh_table(entry->rule.next_hop_family),
+				     &entry->next_hop, entry->rule.out_logical);
 	}
 	if (!neigh)
 		return -EOPNOTSUPP;
@@ -2353,7 +2371,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	 * port's, because that is the address Netfilter writes for a
 	 * neighbour-output flow and the only one the encoder can cache. */
 	if (!ft_vlan_actions(&rule->action, out) ||
-	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop) ||
+	    !ft_next_hop(cls, out->out_logical, family, &out->new_dst, next_hop,
+			 &out->next_hop_family) ||
 	    !ft_ipsec_handle(cls, out, out->out_logical, out->in_logical) ||
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
@@ -2430,7 +2449,8 @@ static int ft_parse(struct cdx_ft_binding *binding,
 		ether_addr_copy(out->dst_mac, out->out_tunnel.mac);
 	} else {
 		if (!is_valid_ether_addr(ethernet) ||
-		    !ft_neigh_check(family, out->out_logical, next_hop, ethernet))
+		    !ft_neigh_check(out->next_hop_family, out->out_logical, next_hop,
+				    ethernet))
 			return ask_refuse(-EOPNOTSUPP);
 		ether_addr_copy(out->dst_mac, ethernet);
 	}
@@ -8647,6 +8667,7 @@ static int ft_show(struct seq_file *seq, void *v)
 	char in_br[IFNAMSIZ + 8], out_br[IFNAMSIZ + 8];
 	char in_ppp[26], out_ppp[26];
 	char in_tnl[IFNAMSIZ + 100], out_tnl[IFNAMSIZ + 100];
+	char nexthop[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
 
 	if (v != &ft_entries) {
 		entry = list_entry(v, struct cdx_ft_entry, list);
@@ -8662,10 +8683,16 @@ static int ft_show(struct seq_file *seq, void *v)
 			       sizeof(out_br));
 		ft_session_text(&entry->rule.in_session, in_ppp, sizeof(in_ppp));
 		ft_session_text(&entry->rule.out_session, out_ppp, sizeof(out_ppp));
+		/* In its own family, which is not the row's for a flow encrypted
+		 * by an SA of the other family. */
+		if (entry->rule.next_hop_family == AF_INET6)
+			snprintf(nexthop, sizeof(nexthop), "%pI6c", &entry->next_hop.in6);
+		else
+			snprintf(nexthop, sizeof(nexthop), "%pI4", &entry->next_hop.ip);
 		/* One row shape per family. Brackets keep an IPv6 address and its
 		 * port a single whitespace-free token, as the IPv4 rows already are. */
 		if (entry->rule.family == AF_INET6)
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI6c packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=6 src=[%pI6c]:%u dst=[%pI6c]:%u new_src=[%pI6c]:%u new_dst=[%pI6c]:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   in_tnl, out_tnl,
@@ -8675,9 +8702,9 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_dst.in6, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
 				   entry->rule.sa_handle, entry->rule.in_sa_handle,
-				   &entry->next_hop.in6, stats.packets, stats.bytes, stats.lastused);
+				   nexthop, stats.packets, stats.bytes, stats.lastused);
 		else
-			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%pI4 packets=%llu bytes=%llu lastused=%u\n",
+			seq_printf(seq, "flow cookie=%lx in=%s out=%s in_vlan=%s out_vlan=%s in_br=%s out_br=%s in_ppp=%s out_ppp=%s in_tnl=%s out_tnl=%s family=4 src=%pI4:%u dst=%pI4:%u new_src=%pI4:%u new_dst=%pI4:%u proto=%u mtu=%u qos=%05x sa=%u in_sa=%u nexthop=%s packets=%llu bytes=%llu lastused=%u\n",
 				   entry->cookie, entry->rule.in->name, entry->rule.out->name,
 				   in_vlan, out_vlan, in_br, out_br, in_ppp, out_ppp,
 				   in_tnl, out_tnl,
@@ -8687,7 +8714,7 @@ static int ft_show(struct seq_file *seq, void *v)
 				   &entry->rule.new_dst.ip, ntohs(entry->rule.new_dport),
 				   entry->rule.proto, entry->rule.mtu, entry->rule.qos,
 				   entry->rule.sa_handle, entry->rule.in_sa_handle,
-				   &entry->next_hop.ip, stats.packets, stats.bytes, stats.lastused);
+				   nexthop, stats.packets, stats.bytes, stats.lastused);
 		return 0;
 	}
 	list_for_each_entry(record, &ft_dev_stats, list) {
