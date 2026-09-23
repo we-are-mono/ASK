@@ -57,6 +57,7 @@ PORT_SHAPED = PORT
 PORT_HIGH, PORT_LOW = PORT + 1, PORT + 2
 PORT_BULK, PORT_PROBE = PORT + 3, PORT + 4
 PORT_EF, PORT_BE, PORT_EF_SOFTWARE = PORT + 5, PORT + 6, PORT + 7
+PORT_POLICED = PORT + 8
 PORTS_LAST = PORT + 19
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
@@ -112,6 +113,10 @@ COUNT = 256
 # names class queue 7 under it.
 REMARK_MASK = 0x7ffff0
 REMARK_CLASS = 1 << 12 | EF_DSCP << 13
+
+# A UDP flow does not back off, so the policer's burst only shapes the first
+# instant of the transfer; a megabyte keeps that instant short.
+POLICE_BURST = "1m"
 
 LAN_BASE = "/tmp/ask_flowtable_qos"
 ECHO = f"{LAN_BASE}_echo.py"
@@ -348,6 +353,19 @@ def shaped_bps(before, after, *slots):
         moved = leaf_delta(before, after, slot)
         charged += (moved["bytes"] + OAL * moved["frames"]) * 8
     return charged / (after["at"] - before["at"])
+
+
+def police_counters(text):
+    """What a hardware police action reports through `tc -s filter show`: the
+    frames its meter saw and how many it dropped.
+
+    The profile counts frames per colour and no bytes, so tc is handed frames
+    and drops; a filter and its action each print a stats block, and the larger
+    reading is the one carrying the driver's numbers.
+    """
+    metered = [int(n) for n in re.findall(r"Sent hardware \d+ bytes (\d+) pkt", text)]
+    dropped = [int(n) for n in re.findall(r"\(dropped (\d+)", text)]
+    return max(metered, default=0), max(dropped, default=0)
 
 
 def directions(state, *, ingress, proto, src=None, dst=None):
@@ -919,3 +937,63 @@ async def test_flowtable_qos_dscp_remark_rewrites_the_wire(qos):
     restored = {name: (await read(r.target, r.session, parameters + name)).strip()
                 for name in original}
     assert restored == original, (original, restored)
+
+
+# ---- ingress policing ------------------------------------------------------
+
+async def test_flowtable_qos_flower_police_caps_the_flow(qos):
+    """A `flower` police filter on the WAN port's ingress, offloaded, holds one
+    offloaded flow offered three times its rate.
+
+    The filter is bound to the flow at admission: the adapter matches the
+    finished tuple against it and writes the profile it allocated into the
+    entry, so the forward row names a policer and the reverse row, which
+    arrives on the other port, names none. The filter reports zero the moment it
+    exists -- its baseline is seeded from the profile, which an earlier filter
+    may have used -- and afterwards the frames it metered are the frames the
+    classifier matched for the flow. Which exact reading that is depends on
+    whether the microcode counts an entry hit before or after the meter's
+    verdict, which its headers do not say, so both exact readings are
+    accepted and nothing between them.
+    """
+    r = qos
+    dev = TARGET_WAN_IF
+    target = f"{r.lan_ip}:{PORT_POLICED}"
+    await r.tc("qdisc", "add", "dev", dev, "clsact")
+    await r.tc("filter", "add", "dev", dev, "ingress", "protocol", "ip", "pref", "1",
+               "flower", "skip_sw", "ip_proto", "udp", "dst_ip", r.lan_ip,
+               "dst_port", str(PORT_POLICED),
+               "action", "police", "rate", f"{CAP_MBIT}mbit", "burst", POLICE_BURST,
+               "conform-exceed", "drop")
+    installed = (await r.tc("-s", "filter", "show", "dev", dev, "ingress"))["stdout"]
+    assert "in_hw" in installed and "skip_sw" in installed, installed
+    assert police_counters(installed) == (0, 0), installed
+    # The filter exists before the flow does, because the binding is made at
+    # admission and a flow admitted earlier would never meet it.
+    await offload(r, inbound(r, "udp", PORT_POLICED))
+    await lan_start(r, iperf=[PORT_POLICED])
+    report = await iperf(r, PORT_POLICED, udp_mbit=OFFERED_MBIT)
+    state = await r.state()
+    shown = (await r.tc("-s", "filter", "show", "dev", dev, "ingress"))["stdout"]
+    metered, dropped = police_counters(shown)
+    forward = directions(state, ingress=dev, proto=17, dst=target)
+    reverse = directions(state, ingress=TARGET_LAN_IF, proto=17, src=target)
+    goodput = received_bps(report)
+    offered = report["end"]["sum_sent"]["bits_per_second"]
+    r.record("qos-flower-police", {"filter": shown, "state": state, "metered": metered,
+                                   "dropped": dropped, "goodput_bps": goodput,
+                                   "offered_bps": offered, "report": report})
+
+    cap = CAP_MBIT * 1e6
+    assert len(forward) == len(reverse) == 1, (forward, reverse)
+    profile = int(forward[0]["qos"], 16) >> 8 & 0xf
+    assert 1 <= profile <= 7, forward
+    assert int(reverse[0]["qos"], 16) >> 8 & 0xf == 0, reverse
+    assert offered >= 2 * cap, ("the orchestrator did not offer enough to test a meter", offered)
+    hits = int(forward[0]["packets"])
+    assert hits in (metered, metered - dropped), (hits, metered, dropped)
+    # Three times the rate offered: about two frames in three are red.
+    assert dropped >= metered // 2, (metered, dropped)
+    # The profile meters the frame the port received, headers and all.
+    expected = cap * DATAGRAM / (DATAGRAM + UDP_HEADERS)
+    assert 0.9 * expected <= goodput <= 1.03 * expected, (goodput, expected)
