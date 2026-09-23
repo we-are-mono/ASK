@@ -15,22 +15,32 @@ import signal
 import sys
 import time
 
+# A softirq that interrupts the target runs on top of it, so its stack
+# unwinds through the target's frames and passes the require filter; the
+# failed allocation's own diagnostic, printed before the one-shot budget is
+# spent, is a window long enough for that on a serial console. Receive
+# buffer refills there are __GFP_NOWARN: the stray failure leaves no fault
+# log, only the driver's allocation warning. Every target that runs in task
+# context therefore rejects softirq stacks. The two that run inside the
+# forwarding and SEC-exception softirqs cannot, and take none.
+SOFTIRQ = "handle_softirqs"
 TARGETS = {
-    "binding": ("ft_block_setup", "ask_flowtable", "flow_block_cb_alloc"),
-    "callback": ("flow_block_cb_alloc", None, None),
-    "entry": ("ft_replace", "ask_flowtable", None),
-    "hardware": ("cdx_ft_hw_add", "cdx", None),
+    # One-shot, so the first allocation under ft_block_setup fails: its own
+    # binding or passive state, before any flow_block_cb_alloc. Fault.hit()
+    # asserts that, which keeps it apart from "callback".
+    "binding": ("ft_block_setup", "ask_flowtable", SOFTIRQ),
+    "callback": ("flow_block_cb_alloc", None, SOFTIRQ),
+    "entry": ("ft_replace", "ask_flowtable", SOFTIRQ),
+    "hardware": ("cdx_ft_hw_add", "cdx", SOFTIRQ),
     "work": ("nf_flow_offload_add", "nf_flow_table", None),
-    "rule": ("nf_flow_offload_rule_alloc", "nf_flow_table", None),
-    "actions": ("flow_rule_alloc", None, None),
+    "rule": ("nf_flow_offload_rule_alloc", "nf_flow_table", SOFTIRQ),
+    "actions": ("flow_rule_alloc", None, SOFTIRQ),
     "ipsec-receive": ("ipsec_exception_pkt_handler", "cdx", None),
-    # An interrupt can retain the worker in its stack. Exclude softirq
-    # allocations so the pool fault does not also break receive metadata.
-    "ipsec-pool": ("ipsec_pool_refill_work", "cdx", "handle_softirqs"),
-    "ipsec-context": ("cdx_ipsec_sec_sa_context_alloc", "cdx", None),
-    "multicast-claim": ("ft_mc_claim_take", "ask_flowtable", None),
-    "mroute-event": ("ft_fib_event", "ask_flowtable", None),
-    "mroute-group": ("ft_mr_apply", "ask_flowtable", None),
+    "ipsec-pool": ("ipsec_pool_refill_work", "cdx", SOFTIRQ),
+    "ipsec-context": ("cdx_ipsec_sec_sa_context_alloc", "cdx", SOFTIRQ),
+    "multicast-claim": ("ft_mc_claim_take", "ask_flowtable", SOFTIRQ),
+    "mroute-event": ("ft_fib_event", "ask_flowtable", SOFTIRQ),
+    "mroute-group": ("ft_mr_apply", "ask_flowtable", SOFTIRQ),
 }
 KNOBS = ("probability", "times", "interval", "space", "verbose", "task-filter",
          "ignore-gfp-wait", "cache-filter", "stacktrace-depth", "require-start",

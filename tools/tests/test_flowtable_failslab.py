@@ -56,6 +56,8 @@ class Fault:
         assert result["selected"]["name"] + "+" in log, log
         if self.target == "callback":
             assert "ft_block_setup" in log, "fault missed the flowtable binding path"
+        if self.target == "binding":
+            assert "flow_block_cb_alloc" not in log, "fault hit the callback allocation, not the binding's own"
         if self.target == "actions":
             assert "flow_offload_work" in log, "fault missed native flow admission"
         return result

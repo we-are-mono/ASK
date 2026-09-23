@@ -20,7 +20,8 @@ def knobs(tmp_path):
     for name in guard.KNOBS:
         (debugfs / name).write_text("0" if name == "probability" else "1")
     symbols = tmp_path / "symbols"
-    symbols.write_text("1000 t ft_replace [ask_flowtable]\n2000 t next [ask_flowtable]\n")
+    symbols.write_text("1000 t ft_replace [ask_flowtable]\n2000 t next [ask_flowtable]\n"
+                       "3000 t handle_softirqs\n4000 t after\n")
     backend, kmsg = tmp_path / "backend", tmp_path / "kmsg"
     backend.write_text("entries 0\n")
     kmsg.touch()
@@ -97,16 +98,23 @@ def test_continuous_fault_keeps_lease_after_a_hit(tmp_path, knobs, monkeypatch, 
     assert not result["restore_errors"] and result["restored"] == before
 
 
-def test_pool_fault_excludes_interrupt_receive(tmp_path, knobs, monkeypatch):
+@pytest.mark.parametrize("target", sorted(guard.TARGETS))
+def test_task_context_faults_exclude_softirq_stacks(tmp_path, knobs, target):
+    name, module, _ = guard.TARGETS[target]
+    owner = f" [{module}]" if module else ""
     knobs["kallsyms"].write_text(
-        "1000 t ipsec_pool_refill_work [cdx]\n2000 t next [cdx]\n"
-        "3000 t handle_softirqs\n4000 t next\n")
+        f"1000 t {name}{owner}\n2000 t next{owner}\n"
+        "3000 t handle_softirqs\n4000 t after\n")
     root = tmp_path / "result"
-    guard.run(root, "ipsec-pool", lease=0.02, continuous=True, **knobs)
+    guard.run(root, target, lease=0.02, **knobs)
     result = json.loads((root / "armed.json").read_text())
     assert result["selected"]["start"] == 0x1000
-    assert result["excluded"]["start"] == 0x3000
-    assert result["excluded"]["end"] == 0x4000
+    # These two run inside a softirq themselves; rejecting softirq stacks
+    # would stop them ever firing.
+    if target in ("work", "ipsec-receive"):
+        assert result["excluded"] is None
+    else:
+        assert (result["excluded"]["start"], result["excluded"]["end"]) == (0x3000, 0x4000)
 
 
 def test_symbol_selection_requires_unique_visible_module_function():
