@@ -294,6 +294,25 @@ async def learn(r: MulticastRig, configs: list[dict], installed, what: str) -> d
         await asyncio.sleep(0.3)
 
 
+async def trickle(r: MulticastRig, configs: list[dict], seconds: float) -> None:
+    """Keep the streams' entries counting across a wait of `seconds`.
+
+    An installed bridged flow whose entry counts nothing for the bridge's
+    membership interval -- two refreshes at the least -- is a stream that
+    stopped: it ages out and is learned again from its next frame, and a
+    window across that counts frames in software. A few frames a second, each
+    burst with a token of its own so no capture counts it, keep the entry
+    live through a wait longer than that."""
+    deadline = time.monotonic() + seconds
+    while True:
+        keep = [{**config, "count": 4, "token": uuid.uuid4().hex} for config in configs]
+        await asyncio.to_thread(send_wire, keep, r.wire)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        await asyncio.sleep(min(1.0, left))
+
+
 async def mdb(r: MulticastRig, bridge: str, group: str, *, add: bool, vid: int | None = None,
               port: str = TARGET_LAN_IF) -> None:
     """A static membership: what an operator configures, never learned."""

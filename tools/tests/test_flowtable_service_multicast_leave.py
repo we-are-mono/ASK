@@ -36,7 +36,7 @@ import pytest_asyncio
 from _mcast_windows import (COUNT, bridge_settings, delivered, host, in_hardware, in_software,
                             learn, mcast_rows, mdb, mdb_ports, members, moved, mroute_row,
                             multicast_rig, packets, same, silenced, stream, streamed,  # noqa: F401
-                            summary)
+                            summary, trickle)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, TopologyStack, dut_vlan_subif,
                        lan_vlan_subif)
 from test_flowtable_offload import command
@@ -300,9 +300,14 @@ async def test_flowtable_service_multicast_bridged_leave(multicast_rig, mcast_br
         in_hardware(both)
 
         # One host goes. The other still wants the stream on the same port,
-        # and says so when the bridge asks, so nothing may change.
+        # and says so when the bridge asks, so nothing may change. The stream
+        # keeps flowing meanwhile, as it would: with expiry's four-second
+        # membership interval an entry that counts nothing for ten ages out,
+        # and the wait and the window's own setup can take that long, so a
+        # silent stream would be learned afresh inside the window below
+        # rather than carried across it.
         await end(stack, hosts[0], spec, LAN_NIC)
-        await asyncio.sleep(forgotten)
+        await trickle(r, [stream(family, group, hops=64)], forgotten)
         assert TARGET_LAN_IF in await mdb_ports(r, mcast_bridge, group)
         one = await window("one-host")
         assert delivered(one, streamed(one, group), LAN_NIC)
