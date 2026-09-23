@@ -152,6 +152,39 @@ result independently of those temporary files.
 
 ## Open
 
+- [ ] **A201 — oversized IPv6 into an SA is unmeasured.** The A198 bound does
+  not cover a transform: `ip6_dst_mtu_maybe_forward()` ignores the bundle's
+  unlocked `RTAX_MTU`, so an IPv6 direction into an SA carries its outer
+  device's MTU and is admitted, while software would send Packet Too Big at
+  `dst_mtu(bundle)` (`xfrm6_tunnel_check_size`). The entry is programmed with
+  the port MTU plus the ESP expansion (`cdx/cdx_flowtable_hw.c`), and no rig case
+  sends a full-size IPv6 inner packet into an SA. Measure it (`/proc/ucode_frag/stats`,
+  Packet Too Big or not): if the microcode fragments the inner packet, bound
+  `sa_handle` directions by `dst_mtu(cls->nf_dst)` at admission and in
+  `ft_stats`, and `in_sa` ones by the reverse bundle's.
+
+- [ ] **A200 — consumers do not advertise a smaller upstream's IPv6 MTU.**
+  An IPv6 direction is admitted to hardware only while its ingress
+  interface's IPv6 MTU is no larger than the path's (A198), so on a PPPoE
+  (1492) or 6in4 (1480) uplink the LAN-to-WAN IPv6 direction runs in
+  software unless the LAN's `net.ipv6.conf.<lan>.mtu` is lowered and advertised
+  in router advertisements. Neither the OpenWrt package (odhcpd `ra_mtu`, the
+  interface's IPv6 MTU) nor the Armbian integration sets it. Derive it from the
+  upstream when the uplink is PPPoE or a tunnel.
+
+- [ ] **A199 — one first-packet timeout in the IPsec admission-churn baseline.**
+  `test_flowtable_service_ipsec_admission_churn` failed once in eight same-boot
+  runs on 2026-09-23 (KASAN image before the A195 patch's expiry guard): the
+  LAN peer's first datagram on the unprotected UDP control flow
+  (198.18.102.3:48782) got no echo during `warm()`'s baseline, `serial=0
+  first=0`. Not A195's signature (a live flow retired as dying mid-churn). The
+  run's artifacts were overwritten by the next; the following five runs passed.
+  The same shape hit `test_flowtable_service_tunnel_recreated[4o6]` on the next
+  image: TCP flow 3 (198.18.101.2:48782 to 198.18.100.2 through the 4o6
+  tunnel), no reply to its first record in `warm()`'s baseline.
+  Reproduce with a per-run `ASK_FLOWTABLE_ARTIFACTS` and capture the DUT's
+  conntrack and flowtable state for that tuple at the failure.
+
 - [ ] **A197 — two later upstream flowtable lifetime fixes are not in the
   tree.** 2014ac62df9d ("netfilter: flowtable: publish GC-visible tuple
   last"): `flow_offload_add()` publishes the ORIGINAL tuple, the one the GC
@@ -347,6 +380,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A198.** The microcode fragmented forwarded IPv6 into a smaller path instead of Packet Too Big —
+  fixed (_:/^flowtable: keep an IPv6 direction into a smaller path in software_).
 
 - [x] **A195.** An offloaded flow's conntrack could expire under it (only gc_worker extended it) —
   fixed (_:/^flowtable: extend offloaded conntrack timeouts from the flowtable GC_).

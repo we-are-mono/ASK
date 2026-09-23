@@ -917,6 +917,15 @@ async def _session_ipv6(ctx, cleanup):
     async def dut(*argv, check=True):
         return await command(ctx.target, ctx.session, *argv, check=check)
 
+    # The subscriber VLAN tells its hosts the session's MTU, as a PPPoE LAN has
+    # to for its IPv6 upload to be offloaded: the microcode would fragment a
+    # larger packet instead of letting Linux send Packet Too Big (see
+    # test_flowtable_ipv6_mtu_bound). The VLAN is this fixture's and goes
+    # with it, so nothing is restored.
+    subscriber_mtu = f"/proc/sys/net/ipv6/conf/{BRIDGE}.{LAN_VID}/mtu"
+    assert (await ctx.target.fs_write(ctx.session, subscriber_mtu,
+                                      str(SESSION_MTU)))["errno"] == 0
+
     addresses = json.loads((await command(ctx.wan, ctx.session, "ip", "-j", "-4",
                                           "addr"))["stdout"])
     ctx.server_ppp_if = next(

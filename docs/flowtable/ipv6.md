@@ -66,6 +66,45 @@ Beyond the IPv4 rules, which all still apply:
 - The route must not be `RTF_REJECT`, `RTF_LOCAL` or `RTF_ANYCAST`, and its
   `dst->error` must be clear.
 - The MTU floor is `IPV6_MIN_MTU` (1280), not 68.
+- A direction's MTU may not be below its ingress interface's IPv6 MTU; see
+  the next section.
+
+## Packets larger than the path
+
+The microcode fragments any forwarded packet larger than its entry's MTU, and
+for IPv6 nothing makes it hand the packet to Linux instead. A router must never
+fragment IPv6 (RFC 8200): it drops the packet and returns ICMPv6 Packet Too Big
+with the link MTU (RFC 4443), which is how the sender learns the path MTU.
+Linux does exactly that; the hardware, left to itself, does not. Measured on
+a route locked to 1280: a 1448-byte datagram left the WAN port as two fragments
+carrying the microcode's own sequential identification, and no Packet Too Big
+came back. Both controls the encoder has were tried on the board and act on
+IPv4 alone: the `PREEMPT_DFBIT_HONOR` preemptive check, which excepts an
+oversized IPv4 packet with DF set, and the fragmenter's DF action in the MURAM
+parameter block, set live to don't-fragment.
+
+So an IPv6 direction is admitted only while nothing larger than its MTU is
+expected to arrive: while the IPv6 MTU of the interface it arrives on
+(`net.ipv6.conf.<if>.mtu`, the value its hosts learn from router
+advertisements) is no larger than the direction's own. A direction refused for
+this stays on the software flowtable path, where the oversized packet reaches
+`ip6_forward()` and gets its Packet Too Big; the reverse direction is admitted
+on its own. The IPv6 MTU is a sysctl that no device event reports, so every
+stats pass rechecks the bound and retires an installed direction that no
+longer satisfies it (counted as `mtu_invalidations`).
+
+Equal MTUs everywhere, the ordinary case, are unaffected. A smaller upstream
+is where it shows: IPv6 leaving a 1500-byte LAN by PPPoE (1492) or a 6in4
+tunnel (1480) runs in software in that direction unless the LAN is told the
+smaller MTU, by setting its IPv6 MTU and advertising it. That is the
+configuration such a network wants anyway, since it is also what spares its
+hosts a Packet Too Big round trip on every new path. An SA does not narrow
+the bound: through a transform a flow's MTU is its outer device's, because
+`ip6_dst_mtu_maybe_forward()` ignores the bundle's unlocked `RTAX_MTU`, so an
+IPv6 direction into an SA is admitted as before (what the microcode then does
+with an oversized one is open, A201). IPv4 is not bounded: the microcode
+fragments a packet without DF as a Linux router would, and excepts one with DF
+for Linux's ICMP.
 
 ## Translation
 
@@ -122,11 +161,22 @@ every packet of the measurement burst:
 | Hairpin double NAT | 64 | both translations at once, both directions entering and leaving by the LAN port |
 | TCP | ≥100 segments | half a megabyte each way on one connection, cookies unchanged |
 
-Two further cases assert behaviour rather than a packet count. A device MTU
+Further cases assert behaviour rather than a packet count. A device MTU
 change retires the connection and lets it come back describing the new path:
-each direction carries the MTU of the interface *it* leaves by, so reducing
-the WAN port moves only the forward direction, and one connection is one
-retirement because both directions share an invalidation handle. Twenty-four
+each direction carries the MTU of the interface *it* leaves by, and one
+connection is one retirement because both directions share an invalidation
+handle. The WAN port is reduced to 1400 together with the LAN's IPv6 MTU, as
+an operator would, so both directions come back at 1400 in hardware.
+`test_flowtable_ipv6_mtu_bound` proves the bound itself: with the WAN route
+locked to 1280 and the LAN's IPv6 MTU at 1280, only the LAN-to-WAN direction
+is admitted; raising the LAN to 1500 retires it on the next stats pass and the
+flow comes back with only the WAN-to-LAN direction in hardware; a 1448-byte
+datagram then gets Packet Too Big with MTU 1280 and the microcode's IPv6
+fragment counter does not move. `test_flowtable_ipv6_same_tuple_exceptions`
+sends a hop limit of 1, hop-by-hop options, destination options, a chain of
+both and fragments down a tuple with both directions in hardware: the first is
+answered with Time Exceeded, the rest arrive intact, and the entries keep the
+flow. Twenty-four
 concurrent IPv6 connections then consume forty-eight directions with matching
 handle and neighbour references, which is what makes the shared 32,768 budget
 observable — accounting at a readable scale rather than a capacity fill.

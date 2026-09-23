@@ -1819,6 +1819,33 @@ static bool ft_vlan_actions(const struct flow_action *actions,
 	return true;
 }
 
+/* Whether an IPv6 direction leaving by a path of @mtu can only ever be handed
+ * packets that fit it. The microcode fragments anything over the entry's MTU
+ * itself, IPv6 included, and nothing hands such a packet to Linux instead:
+ * PREEMPT_DFBIT_HONOR and the fragmenter's DF action were both tried on the
+ * board and act on IPv4 alone. A router never fragments IPv6 -- Linux answers
+ * with Packet Too Big -- so the hardware may carry a direction only while its
+ * ingress interface's IPv6 MTU, the one its hosts learn from router
+ * advertisements, is no larger. Anything else stays on the software path,
+ * which sends the Packet Too Big: IPv6 from a 1500-byte LAN to PPPoE or a 6in4
+ * tunnel, unless that LAN's IPv6 MTU is set to the smaller path's. An SA does
+ * not narrow the bound: through a transform the flow's MTU is its outer
+ * device's, because ip6_dst_mtu_maybe_forward() ignores the bundle's unlocked
+ * RTAX_MTU. Checked at admission and on every stats pass, because the IPv6
+ * MTU is a sysctl of its own that no device event reports. */
+static bool ft_ipv6_mtu_bounded(struct net_device *in, u32 mtu)
+{
+	struct inet6_dev *idev;
+	bool bounded = false;
+
+	rcu_read_lock();
+	idev = __in6_dev_get(in);
+	if (idev)
+		bounded = (u32)READ_ONCE(idev->cnf.mtu6) <= mtu;
+	rcu_read_unlock();
+	return bounded;
+}
+
 /* Exact masks preserve every selector. Native flowtables supply routing
  * semantics (including TTL decrement), four Ethernet mangle words, an
  * encapsulation block, optional translation/checksum actions and a final
@@ -2075,6 +2102,11 @@ static int ft_parse(struct cdx_ft_binding *binding,
 	    cls->nf_mtu > out->out_logical->mtu ||
 	    cls->nf_mtu < (family == AF_INET6 ? IPV6_MIN_MTU : 68))
 		return ask_refuse(-EOPNOTSUPP);
+	if (family == AF_INET6 && !ft_ipv6_mtu_bounded(out->in_logical, cls->nf_mtu)) {
+		ask_dbg(ASK_DBG_DEVICE, "ipv6 mtu %u below ingress %s\n",
+			cls->nf_mtu, netdev_name(out->in_logical));
+		return ask_refuse(-EOPNOTSUPP);
+	}
 	/* A tunnel inside a transform, or a transform inside a tunnel, is a
 	 * header order nothing here proves. The walk already refuses an outer
 	 * packet a policy would transform; this refuses an inner one. */
@@ -2318,6 +2350,11 @@ static int ft_stats(struct cdx_ft_entry *entry, struct flow_cls_offload *cls)
 
 	if (!nf_flow_offload_handle_valid(entry->handle)) {
 		ft_neigh_invalidate(entry);
+		return -EOPNOTSUPP;
+	}
+	if (entry->rule.family == AF_INET6 &&
+	    !ft_ipv6_mtu_bounded(entry->rule.in_logical, entry->rule.mtu)) {
+		ft_handle_invalidate(entry->handle, &ft_mtu_invalidations);
 		return -EOPNOTSUPP;
 	}
 	cdx_ft_stats(entry->hw, &now);

@@ -84,6 +84,12 @@ async def tunnel_service(rig, request):
             await change(r.target, ['ip', 'route', 'change', WAN_IP + '/32', 'dev', TARGET_WAN_IF, 'mtu', '1500'],
                          ['ip', 'route', 'change', WAN_IP + '/32', 'dev', TARGET_WAN_IF, 'mtu', '1200'])
         if shape.family == 6:
+            # The LAN tells its hosts the tunnel's MTU, without which the
+            # IPv6 direction into the tunnel stays in software (see
+            # test_flowtable_ipv6_mtu_bound).
+            key = f'net.ipv6.conf.{TARGET_LAN_IF}.mtu'
+            previous_mtu = (await command(r.target, r.session, 'sysctl', '-n', key))['stdout'].strip()
+            await change(r.target, ['sysctl', '-w', f'{key}={shape.mtu}'], ['sysctl', '-w', f'{key}={previous_mtu}'])
             await change(r.target, ['ip', '-6', 'addr', 'add', gateway + '/64', 'dev', TARGET_LAN_IF, 'nodad'],
                          ['ip', '-6', 'addr', 'del', gateway + '/64', 'dev', TARGET_LAN_IF])
             await lan_change(['ip', '-6', 'addr', 'add', r.tunnel_source + '/64', 'dev', LAN_NIC, 'nodad'],

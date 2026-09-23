@@ -264,13 +264,21 @@ struct bridge_vlan_info { u16 vid, flags; };
  * they build, and that is what Netfilter then writes into the Ethernet
  * destination of a flow leaving by one. priv is what netdev_priv() hands back,
  * which is where the adapter reads the tunnel's configuration from. */
-struct net_device { int ifindex, refs, mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
+struct net_device { int ifindex, refs, mtu, ip6_mtu; u8 dev_addr[6]; struct net *net; bool carrier_lost, down;
                     unsigned short type; unsigned char addr_len; void *priv;
                     struct net_device *real_dev; u16 vlan_id; __be16 vlan_proto;
                     bool bridge, vlan_filtering; struct net_device *master;
                     u16 br_proto, pvid; struct br_vlan_entry br_vlans[BR_MAX_VLANS];
                     unsigned br_nvlans; };
 #define netdev_priv(d) ((d)->priv)
+/* A device's IPv6 MTU starts as the device's own, as addrconf sets it; a case
+ * that needs the sysctl to differ sets ip6_mtu. */
+struct inet6_dev { struct { int mtu6; } cnf; };
+static struct inet6_dev inet6_view;
+static struct inet6_dev *__in6_dev_get(const struct net_device *d)
+{ inet6_view.cnf.mtu6 = d->ip6_mtu ? d->ip6_mtu : d->mtu; return &inet6_view; }
+#define rcu_read_lock() do { } while (0)
+#define rcu_read_unlock() do { } while (0)
 /* Devices are told apart by pointer here, never by name; the production
  * traces that print one only have to compile and consume their argument. */
 static const char *netdev_name(const struct net_device *d) { (void)d; return "dev"; }
@@ -1211,6 +1219,7 @@ static void fixture(void)
     /* Both ends plain by default: a case that wants a transform says so. */
     ipsec_ok = true;
     ipsec_sa = ipsec_in_sa = 0;
+    in.ip6_mtu = 0;
     ft_ipsec_genid = xfrm_genid = 0;
     assert(!ft_handle_refs && handle.refs <= 1);
     handle = (struct nf_flow_offload_handle){ .refs = 1 };
@@ -1294,6 +1303,9 @@ static void fixture6(void)
     reverse_route6.dst.dev = &in;
     cls.nf_dst = &route6.dst; cls.nf_dst_reverse = &reverse_route6.dst;
     cls.nf_dst_cookie = cls.nf_dst_reverse_cookie = 0x5e1;
+    /* The LAN advertises the path's MTU, which is what lets an IPv6
+     * direction into hardware at all when the path is smaller. */
+    in.ip6_mtu = cls.nf_mtu;
     neighbour.tbl = &nd_tbl;
     neighbour.primary_key = (union nf_inet_addr){ .in6 = i6k.dst };
     gateway = alternate_gateway = neighbour;
@@ -1392,11 +1404,35 @@ static void test_ipv6(void)
     V6_REJECT(ct.tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.l3num = AF_INET);
     /* IPv6 never fragments in transit, so the floor is its minimum link MTU. */
     V6_REJECT(cls.nf_mtu = IPV6_MIN_MTU - 1);
-    fixture6(); cls.nf_mtu = IPV6_MIN_MTU;
+    fixture6(); cls.nf_mtu = in.ip6_mtu = IPV6_MIN_MTU;
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0 && decoded.mtu == IPV6_MIN_MTU);
+    /* Nor may the microcode fragment one, which it does to anything over the
+     * entry's MTU: a path smaller than the ingress interface's IPv6 MTU stays
+     * in software, where Linux answers with Packet Too Big. Equal is enough,
+     * and the device MTU only matters as the IPv6 one's default. */
+    V6_REJECT(cls.nf_mtu = 1491);
+    V6_REJECT(in.ip6_mtu = 1500);
+    V6_REJECT(in.ip6_mtu = 0);
+    fixture6(); in.mtu = 9000;
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
+    in.mtu = 1500;
+    /* IPv4 is not bounded: there the microcode fragments as Linux would, and
+     * hands a DF packet to Linux for its ICMP. */
+    fixture(); in.ip6_mtu = 9000;
+    assert(in.mtu > cls.nf_mtu && ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     /* The neighbour must be discovered in the IPv6 table. */
     V6_REJECT(neighbour.tbl = &arp_tbl);
 #undef V6_REJECT
+    /* The IPv6 MTU is a sysctl no device event reports, so every stats pass
+     * rechecks the bound and retires a direction it no longer holds for. */
+    fixture6(); assert(ft_replace(&binding, &cls) == 0);
+    struct cdx_ft_entry *bounded = ft_find(&binding, cls.cookie);
+    u64 mtu_invalidations = ft_mtu_invalidations;
+    assert(bounded && ft_stats(bounded, &cls) == 0 && !handle.invalid);
+    in.ip6_mtu = 1500;
+    assert(ft_stats(bounded, &cls) == -EOPNOTSUPP && handle.invalid &&
+           ft_mtu_invalidations == mtu_invalidations + 1);
+    assert(ft_remove(bounded) == 0); ft_invalid = 0;
 
     /* Translation: five actions per edit and no checksum action. */
     nat6_fixture();
@@ -2969,7 +3005,8 @@ static void sit_out_fixture(void)
     fixture6();
     tunnel_devices();
     route6.dst.dev = &sit;
-    cls.nf_mtu = sit.mtu;
+    /* The LAN advertises the tunnel's MTU; see the reject case below. */
+    cls.nf_mtu = in.ip6_mtu = sit.mtu;
     tnl4_hop(&egress_tunnel, out.ifindex);
     tunnel_ethernet_dest(&sit);
     outer_neighbour(&out, AF_INET);
@@ -3033,6 +3070,12 @@ static void test_tunnel(void)
     assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.out_tunnel.present && !decoded.in_tunnel.present);
     assert(decoded.out_tunnel.mode == CDX_FT_TUNNEL_6O4);
+    /* A LAN that still lets its hosts send 1500 bytes into a 1480-byte
+     * tunnel keeps this direction in software, where the inner packet gets
+     * its Packet Too Big instead of an outer fragmentation. */
+    TUNNEL_REJECT(in.ip6_mtu = 1500);
+    sit_out_fixture();
+    assert(ft_parse(&binding, &cls, &decoded, &next_hop) == 0);
     assert(decoded.out_tunnel.family == AF_INET);
     assert(decoded.out_tunnel.proto == IPPROTO_IPV6);
     assert(decoded.out_tunnel.ttl == 64 && !decoded.out_tunnel.tos);

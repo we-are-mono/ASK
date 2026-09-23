@@ -96,10 +96,13 @@ address is scoped to one link and cannot be forwarded between the two ports (a
 *gateway* may be, and normally is); the accepted MTU floor is the IPv6 minimum
 link MTU of 1280 rather than 68; and extension headers have no eligibility
 contract, so only packets whose transport header follows the fixed header are
-described by an admitted rule. What IPv6 still lacks against IPv4 is a
-sustained-churn proof at full capacity and a proof that it emits ICMPv6
-Packet Too Big for an oversized datagram; device-MTU retirement, budget
-accounting, masquerade and hairpin double NAT each have one.
+described by an admitted rule. Because the microcode fragments IPv6 as
+readily as IPv4, a direction whose path is smaller than its ingress
+interface's IPv6 MTU stays in software, where Linux sends Packet Too Big
+([ipv6.md](ipv6.md#packets-larger-than-the-path)). What IPv6 still lacks
+against IPv4 is a sustained-churn proof at full capacity; the Packet Too Big
+bound, device-MTU retirement, budget accounting, masquerade and hairpin double
+NAT each have one.
 
 ## How the components fit
 

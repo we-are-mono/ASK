@@ -387,7 +387,6 @@ async def stop_boot_daemon():
     kills it and removes its table, draining the hardware to an unbound state.
     Every rig does this itself rather than rely on an earlier test having done
     it, so a test run on its own after a boot sees the same start."""
-    ARTIFACTS.mkdir(parents=True, exist_ok=True)
     with Console.target(log_path=str(ARTIFACTS / "boot-daemon-stop.log")) as con:
         await asyncio.to_thread(con.login, "root", None)
         await console_command(con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)

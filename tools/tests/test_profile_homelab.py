@@ -1222,6 +1222,14 @@ async def homelab(target_agent, lan):
             await _outer_segment(ctx, cleanup)
             await _dut_tunnel(ctx, cleanup)
             await _orchestrator_tunnel(ctx, cleanup)
+            # VLAN A tells its hosts the tunnel's MTU, as a 6in4 LAN has to for
+            # its IPv6 upload to be offloaded: the microcode would fragment a
+            # larger packet instead of letting Linux send Packet Too Big (see
+            # test_flowtable_ipv6_mtu_bound). The VLAN is this fixture's and
+            # goes with it, so nothing is restored.
+            vlan_a_mtu = f"/proc/sys/net/ipv6/conf/{ctx.bridge_text[VID_A]}/mtu"
+            assert (await ctx.target.fs_write(ctx.session, vlan_a_mtu,
+                                              str(ctx.shape.mtu)))["errno"] == 0
 
             loop = asyncio.get_running_loop()
             # No endpoint on the throughput port: that case starts a real

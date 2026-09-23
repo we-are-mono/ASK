@@ -156,6 +156,13 @@ which is the arithmetic the legacy owner's tunnel-interface path in `devman.c`
 already did. The full-MTU case below is the proof: a datagram that exactly fills
 the tunnel MTU is carried in hardware rather than excepted.
 
+A 6o4 egress direction is IPv6 into a path smaller than an ordinary LAN, and
+the microcode would fragment the outer packet of an oversized one where Linux
+sends the inner Packet Too Big. It is admitted only while the LAN's IPv6 MTU
+is no larger than the tunnel's ([ipv6.md](ipv6.md#packets-larger-than-the-path)),
+so the rig sets the LAN's IPv6 MTU to the tunnel's, the configuration a 6in4
+LAN wants anyway.
+
 ## Per-tunnel-device counters
 
 The firmware counts bytes and packets into a record the two opcodes name, and

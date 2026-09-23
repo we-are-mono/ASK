@@ -31,7 +31,8 @@ NAT_TABLE = "ask_nat6"
 PORTS = {"routed": (48810, 48811), "snat": (48820, 48821),
          "dnat": (48830, 48831), "tcp": (48840, 48841),
          "masquerade": (48850, 48851), "mtu": (48860, 48861),
-         "exceptions": (48870, 48871), "budget": (48900, 48990)}
+         "exceptions": (48870, 48871), "bound": (48880, 48881),
+         "budget": (48900, 48990)}
 SNAT_PORT = 49820
 
 
@@ -528,7 +529,13 @@ async def test_flowtable_ipv6_masquerade(ipv6_rig):
 
 async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
     """A device MTU change must retire both IPv6 directions and let them come
-    back describing the new MTU, exactly as the IPv4 path does."""
+    back describing the new MTU, exactly as the IPv4 path does.
+
+    The LAN's IPv6 MTU is lowered with the WAN, as an operator would for any
+    smaller upstream: a LAN-to-WAN direction may only be in hardware while no
+    LAN host is told it can send more than the path carries (see
+    test_flowtable_ipv6_mtu_bound). It also lowers the LAN route, so both
+    directions come back at 1400."""
     r = ipv6_rig
     sport, dport = PORTS["mtu"]
     loop = asyncio.get_running_loop()
@@ -537,6 +544,7 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
         lambda: echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
     original = int((await read(r.target, r.session, f"/sys/class/net/{TARGET_WAN_IF}/mtu")).strip())
     assert original == 1500, original
+    lan_mtu = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
     try:
         await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
 
@@ -564,6 +572,10 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
         # -EAGAIN, retires the generation, and Linux re-offers the flow after
         # two flowtable GC ticks. Any RTNL holder can cause that in production,
         # so the re-description has to survive it every run, not by chance.
+        #
+        # The LAN's IPv6 MTU goes first: lowering it leaves both installed
+        # directions bounded, so nothing retires until the device change.
+        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}=1400")
         knob = "/sys/module/ask_flowtable/parameters/flowtable_fail_stage"
         assert (await r.target.fs_write(r.session, knob, "4"))["errno"] == 0
         try:
@@ -573,7 +585,7 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
             # the counter moves on the transition, so a single connection
             # retiring is one increment -- not one per direction.
             retired = await r.wait(lambda s: s["mtu_invalidations"] >= initial["mtu_invalidations"] + 1)
-            reduced = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: 1400})
+            reduced = await settled({TARGET_LAN_IF: 1400, TARGET_WAN_IF: 1400})
             assert (await read(r.target, r.session, knob)).strip() == "0", "fault not consumed"
         finally:
             assert (await r.target.fs_write(r.session, knob, "0"))["errno"] == 0
@@ -582,6 +594,11 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
         assert reduced["admission_invalidations"] >= initial["admission_invalidations"] + 1, \
             (initial, reduced)
         r.record("ipv6-mtu-reduced", {"retired": retired, "reduced": reduced})
+        # The LAN first again, so the WAN-to-LAN direction is never left
+        # unbounded behind a 1400-byte WAN: raising it retires the bounded
+        # LAN-to-WAN one, and the device change then retires whatever came
+        # back in between.
+        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}")
         await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
                       "mtu", str(original))
         restored = await settled({TARGET_LAN_IF: original, TARGET_WAN_IF: original})
@@ -589,6 +606,7 @@ async def test_flowtable_ipv6_mtu_recovery(ipv6_rig):
         r.record("ipv6-mtu-restored", restored)
     finally:
         transport.close()
+        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}", check=False)
         await command(r.target, r.session, "ip", "link", "set", "dev", TARGET_WAN_IF,
                       "mtu", str(original), check=False)
         await _drop_tables(r)
@@ -602,7 +620,9 @@ async def test_flowtable_ipv6_same_tuple_exceptions(ipv6_rig):
     which must come back as an ICMPv6 error from Linux rather than leave the
     WAN port, and hop-by-hop options, destination options, a chain of both and
     fragments, which Linux forwards intact. The entries must still be carrying
-    the flow afterwards.
+    the flow afterwards. An oversized packet is not among them: a path smaller
+    than the LAN's IPv6 MTU never has that direction in hardware at all, which
+    test_flowtable_ipv6_mtu_bound covers.
     """
     r = ipv6_rig
     sport, dport = PORTS["exceptions"]
@@ -686,6 +706,94 @@ print(json.dumps(results))
     finally:
         transport.close()
         await _drop_tables(r)
+
+
+async def test_flowtable_ipv6_mtu_bound(ipv6_rig):
+    """The microcode fragments an IPv6 packet over its entry's MTU instead of
+    handing it to Linux, so a direction whose path is smaller than its ingress
+    interface's IPv6 MTU must stay in software, where Linux answers with
+    Packet Too Big. The route to the WAN host is locked to 1280, the minimum.
+
+    While the LAN's IPv6 MTU is 1280 as well, the LAN-to-WAN direction is
+    bounded and goes to hardware; the WAN-to-LAN one is not, because the LAN
+    route now carries 1280 against a 1500-byte WAN. Raising the LAN back to
+    1500 is a sysctl no device event reports, so the next stats pass has to
+    retire the flow, and it comes back the other way round. Then an oversized
+    packet gets its Packet Too Big and the microcode fragments nothing.
+    """
+    r = ipv6_rig
+    sport, dport = PORTS["bound"]
+    loop = asyncio.get_running_loop()
+    echo = PayloadEcho()
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: echo, local_addr=(WAN_IPV6, dport), family=socket.AF_INET6)
+    lan_mtu = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
+    original = (await command(r.target, r.session, "sysctl", "-n", lan_mtu))["stdout"].strip()
+    assert original == "1500", original
+    # IPv6 forwarding ignores an unlocked route MTU (ip6_dst_mtu_maybe_forward),
+    # in software and so in the flow too.
+    route = ["ip", "-6", "route", "replace", f"{WAN_IPV6}/128", "dev", TARGET_WAN_IF,
+             "mtu", "lock", "1280"]
+
+    def one_direction(ingress, mtu):
+        def settled(s):
+            return (s["entries"] == 1 and s["flows"][0]["in"] == ingress
+                    and int(s["flows"][0]["mtu"]) == mtu)
+        return settled
+
+    async def send(count=8):
+        return await _udp_exchange(r, sport, WAN_IPV6, dport, count, (WAN_IPV6, dport),
+                                   "flowtable_v6_bound")
+
+    async def fragments_sent():
+        text = await read(r.target, r.session, "/proc/ucode_frag/stats")
+        return int(text.split("Number of IPv6 fragments sent :")[1].split()[0])
+
+    try:
+        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}=1280")
+        await command(r.target, r.session, *route)
+        initial = await r.state()
+        await _offload_table(r, f'ip6 saddr {LAN_IPV6} udp sport {sport} udp dport {dport}')
+        bounded = await _drive(r, send, one_direction(TARGET_LAN_IF, 1280),
+                               "only the LAN-to-WAN direction should be in hardware")
+        assert bounded["rejects"] > initial["rejects"], (initial, bounded)
+        r.record("ipv6-bound-lan", bounded)
+
+        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}")
+        retired = await r.wait(lambda s: s["mtu_invalidations"] > bounded["mtu_invalidations"])
+        unbounded = await _drive(r, send, one_direction(TARGET_WAN_IF, 1500),
+                                 "only the WAN-to-LAN direction should be in hardware")
+        r.record("ipv6-bound-wan", {"retired": retired, "unbounded": unbounded})
+
+        before = await fragments_sent()
+        script = f'''
+import json
+from scapy.all import Ether, IPv6, UDP, Raw, ICMPv6PacketTooBig, srp1
+packet = IPv6(src={LAN_IPV6!r}, dst={WAN_IPV6!r})/UDP(sport={sport}, dport={dport})/Raw(b'M' * 1400)
+answer = srp1(Ether(dst={r.dut_lan_mac!r})/packet, iface={LAN_NIC!r}, timeout=3, verbose=False)
+assert answer is not None and ICMPv6PacketTooBig in answer, answer
+assert answer[ICMPv6PacketTooBig].mtu == 1280, answer.show(dump=True)
+print(json.dumps(answer.summary()))
+'''
+        result = await lan_run_python(r.lan, script, timeout=20, label="flowtable_v6_bound")
+        assert result.rc == 0, result.stdout
+        await asyncio.sleep(0.5)
+        assert not echo.received[b"M" * 1400], echo.received
+        assert await fragments_sent() == before
+
+        # Small packets still cross, the bounded direction in software.
+        report = await send(16)
+        assert report == {"echoed": 16, "lost": 0}, report
+        final = await r.state()
+        assert one_direction(TARGET_WAN_IF, 1500)(final), final
+        assert final["errors"] == r.errors, final
+        r.record("ipv6-bound", {"too_big": result.stdout.strip().splitlines()[-1], "final": final})
+    finally:
+        transport.close()
+        await _drop_tables(r)
+        await command(r.target, r.session, "ip", "-6", "route", "del", f"{WAN_IPV6}/128",
+                      "dev", TARGET_WAN_IF, check=False)
+        await command(r.target, r.session, "sysctl", "-w", f"{lan_mtu}={original}", check=False)
 
 
 async def test_flowtable_ipv6_shares_the_admission_budget(ipv6_rig):

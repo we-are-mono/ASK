@@ -167,6 +167,12 @@ completed cleanly, so the peer parsed every frame the microcode emitted. A
 wrong protocol id is a header the peer discards, which would have shown as loss
 rather than as a rate.
 
+IPv6 into the session is admitted only while the LAN's IPv6 MTU is no larger
+than the session's 1492: the microcode would fragment a larger packet where a
+router has to answer with Packet Too Big
+([ipv6.md](ipv6.md#packets-larger-than-the-path)). A PPPoE LAN should
+advertise 1492 anyway; the IPv6 case and the ISP profile set it.
+
 The classifier key is unchanged — the physical port plus the 5-tuple — so a
 session reaches the hardware only as the header it inserts or strips.
 

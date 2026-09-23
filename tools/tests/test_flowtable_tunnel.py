@@ -40,11 +40,10 @@ import pytest
 import pytest_asyncio
 
 from ask_orch.client import Agent
-from ask_orch.uart import Console
 from _topology import (DUT_IPV6_LAN, DUT_IPV6_WAN, LAN_IPV6, LAN_NIC, TARGET_LAN_IF,
                        TARGET_WAN_IF, kernel_rx_packets, lan_run, lan_run_python)
 import test_flowtable_offload as ft
-from test_flowtable_offload import ARTIFACTS, Rig, command, console_command, read
+from test_flowtable_offload import ARTIFACTS, Rig, command, read
 
 TABLE = "ask_tunnel"
 DUT_WAN_IPV4 = os.environ.get("ASK_TARGET_IP", "10.0.0.62")
@@ -551,11 +550,7 @@ async def tunnel_rig(target_agent, aiohttp_session, lan, splat_window, request):
     r.shape = Shape(mode, sport, dport)
     r.target, r.session, r.lan, r.sequence = target_agent, aiohttp_session, lan, 1
     r.recovery_console = None
-    # The offload service is default-on and would have bound the ports with
-    # its own policy; these cases own the policy, so stop it first.
-    with Console.target(log_path=str(ARTIFACTS / "tunnel-daemon-stop.log")) as con:
-        await asyncio.to_thread(con.login, "root", None)
-        await console_command(con, "/etc/init.d/ask-flowtable", "stop", check=False, timeout=45)
+    await ft.stop_boot_daemon()
     initial = await r.state()
     assert initial["entries"] == initial["bindings"] == initial["invalidated"] == 0, initial
     ft.HEALTH_BASELINE["errors"] = initial["errors"]
@@ -579,6 +574,15 @@ async def tunnel_rig(target_agent, aiohttp_session, lan, splat_window, request):
             previous = (await command(r.target, r.session, "sysctl", "-n", key))["stdout"].strip()
             cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
             await command(r.target, r.session, "sysctl", "-w", f"{key}=1")
+        if r.shape.family == 6:
+            # An IPv6 direction into a smaller path is only offloaded while
+            # the LAN tells its hosts that path's MTU: the microcode would
+            # fragment anything larger instead of letting Linux send its
+            # Packet Too Big. This is the configuration a 6in4 LAN needs.
+            key = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
+            previous = (await command(r.target, r.session, "sysctl", "-n", key))["stdout"].strip()
+            cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
+            await command(r.target, r.session, "sysctl", "-w", f"{key}={r.shape.mtu}")
         await _lan_side(r, cleanup, lan_cleanup)
         await _outer_segment(r, cleanup)
         await _dut_tunnel(r, cleanup)

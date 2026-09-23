@@ -114,6 +114,10 @@ class Console:
         self.write_chunk_bytes = write_chunk_bytes
         self.write_pause_s = write_pause_s
         self.buf       = b""
+        # Callers name a log under an artifact directory a test may not have
+        # written to yet, e.g. one set per run through ASK_FLOWTABLE_ARTIFACTS.
+        if log_path:
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
         self.log_fp    = open(log_path, "ab", buffering=0) if log_path else None
         self.ser       = serial.Serial(port=port, baudrate=baud, timeout=0)
         self.lock      = port_lock(port)

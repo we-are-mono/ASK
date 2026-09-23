@@ -493,6 +493,14 @@ async def _ipv6_session(r, stack, cleanup):
     cleanup.append((r.target, ["sysctl", "-w",
                                f"net.ipv6.conf.all.forwarding={previous}"]))
     await target("sysctl", "-w", "net.ipv6.conf.all.forwarding=1")
+    # The LAN tells its hosts the session's MTU, the configuration a PPPoE LAN
+    # needs for its IPv6 upload to be offloaded at all: the microcode would
+    # fragment a larger packet instead of letting Linux send Packet Too Big
+    # (see test_flowtable_ipv6_mtu_bound).
+    key = f"net.ipv6.conf.{TARGET_LAN_IF}.mtu"
+    previous = (await target("sysctl", "-n", key))["stdout"].strip()
+    cleanup.append((r.target, ["sysctl", "-w", f"{key}={previous}"]))
+    await target("sysctl", "-w", f"{key}={SESSION_MTU}")
 
     # nodad throughout: duplicate address detection leaves an address tentative
     # for about a second and a half, and the first flow would silently not come
