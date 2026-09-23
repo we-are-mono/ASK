@@ -259,7 +259,10 @@ Ciphers as the CDX shared-descriptor builder supports them: CBC and CTR with
 an HMAC, and AEAD — GCM at ICV 8/12/16 and GMAC (`rfc4543`). GCM is admitted
 without reservation: A24a fixed the shared-descriptor sharing policy that made
 it unsafe (DNCPE-2358, `43f29a0`) and GCM now outperforms CBC+HMAC on TCP.
-NAT-T is carried through `x->encap->encap_sport/dport`. TFC padding is refused
+NAT-T is carried through `x->encap->encap_sport/dport`, which the hardware SA
+keeps: an in-place `XFRM_MSG_UPDSA` reaches no driver, so 040 refuses one that
+would move a packet-offloaded state's ports (`EINVAL`), and deleting and adding
+the state is what programs new ones. TFC padding is refused
 by `xfrm_dev_state_add()` before the driver sees it. ESN is admitted; the
 state is programmed with the ESN flag and SEC keeps the whole 64-bit sequence
 number in its PDB, advancing the high word itself. There is no

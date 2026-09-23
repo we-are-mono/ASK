@@ -11,7 +11,9 @@ behind a NAT, and the wire is checked per direction.
 Transport mode is refused: SEC builds the UDP header, and the decapsulation
 offset past it, only on its tunnel arms, so a transport SA would leave as bare
 ESP. Packet offload has no software fallback (xfrm_dev_state_add() returns
-the driver's error for it), so the add fails with the adapter's reason.
+the driver's error for it), so the add fails with the adapter's reason. And an
+in-place update may not move an offloaded SA's ports, which the hardware SA
+carries and no update reaches.
 """
 from __future__ import annotations
 
@@ -157,6 +159,52 @@ async def test_ipsec_natt_transport_refused(aiohttp_session, target_agent, splat
                     assert f"encap type espinudp sport {sport} dport {dport}" in shown["stdout"], results[-1]
                     assert re.search(rf"crypto offload parameters: dev {TARGET_WAN_IF} dir {direction} mode packet",
                                      shown["stdout"]), results[-1]
+    finally:
+        for identity in identities:
+            await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", *identity, check=False)
+        await endpoints_down(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=LOCAL, peer=PEER)
+
+
+def natt(sport, dport):
+    return ["encap", "espinudp", str(sport), str(dport), "0.0.0.0"]
+
+
+async def test_ipsec_natt_update_keeps_hardware_ports(aiohttp_session, target_agent, splat_window):
+    """An in-place update of an offloaded NAT-T SA may not move its ports.
+
+    The ports are in the hardware SA: SEC writes them in front of every frame
+    it encrypts, and the classifier keys the SA's inbound frames on them. An
+    update reaches no driver, so changing them in place would leave the
+    hardware on the old ports while `ip xfrm state` showed the new ones. The
+    update is refused and the state keeps its ports and its offload. An update
+    that keeps the ports still applies: here, a new hard lifetime."""
+    await endpoints_up(target_agent, aiohttp_session, iface=TARGET_WAN_IF, local=LOCAL, peer=PEER,
+                       lladdr="02:00:00:00:04:02")
+    identities, results = [], []
+    try:
+        for direction in ("out", "in"):
+            src, dst = (LOCAL, PEER) if direction == "out" else (PEER, LOCAL)
+            ports = PORTS if direction == "out" else PORTS[::-1]
+            identity = ["src", src, "dst", dst, "proto", "esp", "spi", hex(0x4F000000 | secrets.randbits(24))]
+            state = [*identity, "mode", "tunnel", "reqid", REQID, *Transform().algorithms]
+            await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "add", *state, *natt(*ports),
+                          "offload", "packet", "dev", TARGET_WAN_IF, "dir", direction)
+            identities.append(identity)
+            # The DUT's own port, whichever side of the pair it is on.
+            moved = (ports[0] + 1, ports[1]) if direction == "out" else (ports[0], ports[1] + 1)
+            refused = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "update", *state,
+                                    *natt(*moved), check=False)
+            kept = await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "update", *state,
+                                 *natt(*ports), "limit", "time-hard", "86400", check=False)
+            shown = (await command(target_agent, aiohttp_session, "ip", "-s", "xfrm", "state", "get",
+                                   *identity))["stdout"]
+            results.append({"direction": direction, "refused": refused, "kept": kept, "shown": shown})
+            assert refused["rc"] != 0 and "Invalid argument" in refused["stderr"], results[-1]
+            assert kept["rc"] == 0, results[-1]
+            assert f"encap type espinudp sport {ports[0]} dport {ports[1]}" in shown, results[-1]
+            assert "hard 86400(sec)" in shown, results[-1]
+            assert re.search(rf"crypto offload parameters: dev {TARGET_WAN_IF} dir {direction} mode packet",
+                             shown), results[-1]
     finally:
         for identity in identities:
             await command(target_agent, aiohttp_session, "ip", "xfrm", "state", "delete", *identity, check=False)
