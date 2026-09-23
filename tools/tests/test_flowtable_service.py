@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 import json
 import ipaddress
 from pathlib import Path
+import re
 import time
 
 import pytest
@@ -20,10 +21,10 @@ import pytest_asyncio
 
 from ask_orch.uart import Console
 from _topology import TARGET_LAN_IF, TARGET_WAN_IF
-from test_flowtable_connections import peer
-from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command,
-                                    console_command, console_python, flowtable_json, read, rig)  # noqa: F401
-from test_flowtable_selective_neighbour import hardware, warm
+from test_flowtable_connections import by_key, peer
+from test_flowtable_offload import (ARTIFACTS, DPORT, SPORT, WAN_IP, command, console_command,
+                                    console_json, console_python, flowtable_json, read, rig)  # noqa: F401
+from test_flowtable_selective_neighbour import hardware, keys, warm
 
 DAEMON = "/usr/sbin/ask-flowtable"
 INIT = "/etc/init.d/ask-flowtable"
@@ -81,8 +82,10 @@ async def service(rig):
 
 
 @asynccontextmanager
-async def managed_service(r, addresses=None, *, extra_paths=()):
-    """Run the service for IPv4 endpoints and extra (source, destination) pairs."""
+async def managed_service(r, addresses=None, *, extra_paths=(), devices=(TARGET_LAN_IF, TARGET_WAN_IF)):
+    """Run the service for IPv4 endpoints and extra (source, destination) pairs.
+
+    `devices` is the policy's device list; ("auto",) leaves it to the daemon."""
     addresses = tuple(addresses or (r.lan_ip,))
     paths = [(address, WAN_IP) for address in addresses] + list(extra_paths)
     old = await read(r.target, r.session, CONF)
@@ -102,7 +105,7 @@ async def managed_service(r, addresses=None, *, extra_paths=()):
 }}''')
             cleanup.append(["nft", "delete", "table", "inet", OBSERVE_TABLE])
             r.software_forwarded = lambda: software_forwarded(r)
-            policy = f"enabled yes\ndevices {TARGET_LAN_IF} {TARGET_WAN_IF}\n"
+            policy = f"enabled yes\ndevices {' '.join(devices)}\n"
             for address, destination in paths:
                 version = ipaddress.ip_address(address).version
                 assert ipaddress.ip_address(destination).version == version
@@ -192,11 +195,11 @@ compile(script, str(root / 'nft'), 'exec')
             assert not failures, ("service fixture restoration failed", failures)
 
 
-async def blocked_probe(r, p):
+async def blocked_probe(r, p, ident=3):
     received = r.echo.packets
-    await p.rpc("start", [3], count=4, interval=0.01, allow_loss=True, udp_timeout=0.1)
-    result = await p.rpc("wait", [3])
-    assert result["3"]["received"] == 0 and result["3"]["lost"] == 4, result
+    await p.rpc("start", [ident], count=4, interval=0.01, allow_loss=True, udp_timeout=0.1)
+    result = await p.rpc("wait", [ident])
+    assert result[str(ident)]["received"] == 0 and result[str(ident)]["lost"] == 4, result
     assert r.echo.packets == received, "forbidden UDP reached WAN"
     return result
 
@@ -401,3 +404,211 @@ async def test_flowtable_service_intentional_stop(service):
         await warm(r, p, [0, 1], "service-stop-supervisor-readmitted", flows[:2])
         await hardware(r, p, "service-stop-supervisor-hardware", flows[:2])
         r.record("service-intentional-stop", {"paused_status": status, "supervision": await supervision_status(r)})
+
+
+# What render.c puts ahead of any policy selector, in its order: the conditions
+# under which no configuration may offload a flow. The mark guard follows,
+# derived from the adapter's mask. nft lists the protocol set by number.
+ADMISSION_GUARDS = ("meta nfproto != { ipv4, ipv6 } return",
+                    "meta l4proto != { 6, 17 } return",
+                    "ct direction != original return",
+                    "ct state != established return")
+
+
+def chain_rules(listing, chain):
+    """One chain's rule lines from `nft list` text. nft prints a mark padded to
+    eight hex digits and the renderer does not, so hex constants are compared
+    by value."""
+    rules, inside = [], False
+    for line in (text.strip() for text in listing.splitlines()):
+        if line == f"chain {chain} {{":
+            inside = True
+        elif inside and line == "}":
+            return rules
+        elif inside and line and not line.startswith("type "):
+            rules.append(re.sub(r"0x[0-9a-f]+", lambda m: hex(int(m[0], 16)), line))
+    raise AssertionError((chain, listing))
+
+
+async def test_flowtable_service_rendered_admission(service):
+    """The installed table is the one render.c describes. Its admission chain
+    hooks forward at priority 10, behind every firewall chain at the standard
+    filter priority, and its guards come before any policy selector.
+
+    Priority is read from nft's JSON, which states it as a number; the text
+    form names it relative to `filter`. Rules are read from the text form."""
+    r = service
+    objects = json.loads((await command(r.target, r.session, "nft", "-j", "list", "table", "inet",
+                                        "ask_flowtable"))["stdout"])["nftables"]
+    listing = (await command(r.target, r.session, "nft", "list", "table", "inet", "ask_flowtable"))["stdout"]
+    r.record("service-rendered-admission", {"json": objects, "text": listing})
+    table = next(item["table"] for item in objects if "table" in item)
+    assert table.get("comment") == "ask-flowtable/v1:" + r.service_hash, table
+    flowtables = [item["flowtable"] for item in objects if "flowtable" in item]
+    assert [(f["name"], f["hook"], f["prio"]) for f in flowtables] == [("fast", "ingress", 0)], flowtables
+    devices = flowtables[0]["dev"]
+    assert sorted([devices] if isinstance(devices, str) else devices) == sorted([TARGET_LAN_IF, TARGET_WAN_IF])
+    assert "flags offload" in listing, listing
+    chains = [item["chain"] for item in objects if "chain" in item]
+    assert [(c["name"], c.get("type"), c.get("hook"), c.get("prio"), c.get("policy")) for c in chains] == [
+        ("admit", "filter", "forward", 10, "accept")], chains
+    refused = ~(await r.state())["qos_mark_mask"] & 0xffffffff
+    rules = chain_rules(listing, "admit")
+    guards = [*ADMISSION_GUARDS, f"ct mark & {refused:#x} != 0x0 return"]
+    assert rules[:len(guards)] == guards, rules
+    # The fixture's policy is one scope line and no exclusion.
+    policy = rules[len(guards):]
+    assert len(policy) == 1 and policy[0].endswith(" flow add @fast"), rules
+    assert f"ct original proto-src {FIRST}-{FIRST + 2}" in policy[0], policy
+    assert f"ct original proto-dst {DPORT}" in policy[0], policy
+
+
+async def test_flowtable_service_firewall_revocation(service):
+    """Revoke a cached flow across a service stop, the firewall-maintenance
+    procedure policy.md prescribes: stop acceleration, change the firewall,
+    then reload, which resumes the daemon and starts it.
+
+    The stop drains every hardware flow. Resume clears the pause and nothing
+    else; the running daemon reinstalls its unchanged policy on its next
+    check. What must not return is the flow the new firewall forbids: it is
+    dropped before the admission chain at priority 10 sees it, while a flow
+    the firewall still permits is readmitted over the same connection."""
+    r = service
+    flows = [{**f, "lan": r.lan_ip} for f in FLOWS]
+    deny = ["FORWARD", "-s", r.lan_ip, "-d", WAN_IP, "-p", "udp", "--sport", str(FIRST),
+            "--dport", str(DPORT), "-j", "DROP"]
+    async with peer(r, flows, initial_ids=[0, 1, 3]) as p:
+        await warm(r, p, [0, 1], "revocation-warm", flows[:2])
+        initial = await hardware(r, p, "revocation-before", flows[:2])
+        await console_command(r.service_console, INIT, "stop", timeout=45)
+        drained = await r.state()
+        assert drained["entries"] == drained["bindings"] == drained["handle_refs"] == 0, drained
+        assert drained["installs"] == initial["installs"], (initial, drained)
+        assert drained["deletes"] == initial["deletes"] + 4, (initial, drained)
+        await command(r.target, r.session, "iptables", "-I", *deny)
+        try:
+            await console_command(r.service_console, INIT, "reload", timeout=45)
+            samples = await wait_service(r, policy_hash=r.service_hash)
+            assert not samples[-1]["status"]["reconciliation_paused"], samples
+            readmitted = await warm(r, p, [1], "revocation-permitted", flows[1:2])
+            probe = await blocked_probe(r, p, 0)
+            state = await r.state()
+            r.record("revocation-firewall", {"drained": drained, "readmitted": readmitted,
+                                             "probe": probe, "state": state})
+            assert by_key(state).keys() == keys([0], flows[1:2]), state
+            assert state["installs"] - state["deletes"] == state["entries"] == 2, state
+            assert state["errors"] == initial["errors"], (initial, state)
+        finally:
+            await command(r.target, r.session, "iptables", "-D", *deny)
+        # The same conntrack is admissible again once the firewall allows it,
+        # so its absence above was the firewall's doing.
+        await warm(r, p, [0, 1], "revocation-restored", flows[:2])
+        await hardware(r, p, "revocation-restored-hardware", flows[:2])
+
+
+async def dpaa_ports(r):
+    """Every fsl_dpa port with its administrative and operational state, read
+    from sysfs by the same test `devices auto` resolution applies."""
+    result = await console_python(r.service_console, """
+import json, os
+ports = {}
+for name in sorted(os.listdir('/sys/class/net')):
+    driver = '/sys/class/net/%s/device/driver' % name
+    if os.path.islink(driver) and os.path.basename(os.readlink(driver)) == 'fsl_dpa':
+        with open('/sys/class/net/%s/flags' % name) as flags, open('/sys/class/net/%s/operstate' % name) as state:
+            ports[name] = {'up': bool(int(flags.read(), 16) & 1), 'operstate': state.read().strip()}
+print(json.dumps(ports))
+""")
+    return console_json(result["stdout"])
+
+
+async def rendered_devices(r):
+    """The devices the installed flowtable names, or None while no table exists."""
+    result = await command(r.target, r.session, "nft", "-j", "list", "flowtable", "inet",
+                           "ask_flowtable", "fast", check=False)
+    if result["rc"]:
+        return None
+    flowtable = next(item["flowtable"] for item in json.loads(result["stdout"])["nftables"] if "flowtable" in item)
+    devices = flowtable.get("dev", [])
+    return sorted([devices] if isinstance(devices, str) else devices)
+
+
+async def devices_follow(r, expected, timeout=20):
+    """Wait until the installed flowtable names exactly `expected`, each of
+    them bound, with the service healthy."""
+    deadline, samples = time.monotonic() + timeout, []
+    while time.monotonic() < deadline:
+        devices, status = await rendered_devices(r), await service_status(r)
+        samples.append({"devices": devices, "status": status})
+        if (devices == expected and status["admission_ready"]
+                and status["backend"]["bindings"] == len(expected)):
+            return status
+        await asyncio.sleep(0.5)
+    r.record("service-devices-timeout", samples)
+    pytest.fail(f"flowtable devices did not follow {expected}: {samples[-3:]}")
+
+
+async def operstate(r, port, wanted, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (await read(r.target, r.session, f"/sys/class/net/{port}/operstate")).strip() == wanted:
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
+async def test_flowtable_service_devices_follow_ports(rig):
+    """`devices auto` is resolved on every reconciliation, not once at start:
+    an offload-capable port gaining its link joins the flowtable and one going
+    down leaves it, with no restart, reload or policy edit in between.
+
+    This image configures only the LAN and WAN ports, so the spare fsl_dpa
+    ports are administratively down. One with a cable is brought up and down
+    again; an already eligible spare is taken down and back up instead. A port
+    carrying an address is never touched."""
+    r = rig
+    async with managed_service(r, devices=("auto",)):
+        ports = await dpaa_ports(r)
+        eligible = sorted(name for name, port in ports.items() if port["operstate"] == "up")
+        assert {TARGET_LAN_IF, TARGET_WAN_IF} <= set(eligible), ports
+        baseline = await devices_follow(r, eligible)
+        assert baseline["policy_hash"] == r.service_hash, baseline
+        links = json.loads((await command(r.target, r.session, "ip", "-j", "addr", "show"))["stdout"])
+        addressed = {link["ifname"] for link in links
+                     if any(a["family"] == "inet" or a.get("scope") == "global" for a in link.get("addr_info", []))}
+        spare = [name for name in ports if name not in (TARGET_LAN_IF, TARGET_WAN_IF, *addressed)]
+        port = restore = None
+        steps = []
+        try:
+            live = [name for name in spare if ports[name]["operstate"] == "up"]
+            if live:
+                port, restore = live[0], "up"
+                steps = [("down", sorted(set(eligible) - {port})), ("up", eligible)]
+            else:
+                for name in (name for name in spare if not ports[name]["up"]):
+                    await command(r.target, r.session, "ip", "link", "set", "dev", name, "up")
+                    port, restore = name, "down"
+                    # A 1G copper port negotiates for a few seconds.
+                    if await operstate(r, name, "up", timeout=8):
+                        break
+                    await command(r.target, r.session, "ip", "link", "set", "dev", name, "down")
+                    port = restore = None
+                if port is None:
+                    pytest.skip(f"no spare fsl_dpa port has a link to toggle: {ports}")
+                steps = [(None, sorted([*eligible, port])), ("down", eligible)]
+            transitions = []
+            for action, expected in steps:
+                if action:
+                    await command(r.target, r.session, "ip", "link", "set", "dev", port, action)
+                status = await devices_follow(r, expected)
+                transitions.append({"port": port, "action": action or "carrier", "devices": expected,
+                                    "status": status})
+                # The marker hashes the resolved devices, so a changed set is a
+                # replaced table and the original set is the original policy.
+                assert (status["policy_hash"] == r.service_hash) == (expected == eligible), transitions
+            r.record("service-devices-follow", {"ports": ports, "eligible": eligible,
+                                                "transitions": transitions})
+        finally:
+            if restore:
+                await command(r.target, r.session, "ip", "link", "set", "dev", port, restore)
+                await devices_follow(r, eligible)

@@ -238,6 +238,28 @@ def test_marker_ownership(engine, text, owned):
     assert r.stdout.startswith("OWNED " if owned else "FOREIGN"), r.stdout
 
 
+def test_builtin_default_is_the_shipped_configuration(engine):
+    """With /etc/ask/offload.conf absent the daemon falls back to a policy
+    compiled into main.c, and the image installs config/offload.conf in that
+    path. Both describe what an unconfigured box does, so they must be one
+    policy: the fingerprint's canonical form covers enablement, device
+    resolution and every scope and exclusion in order, so an edit to either
+    that is not made to the other changes it."""
+    recipe = (ROOT / "meta-ask/recipes-ask/config/config_1.0.bb").read_text()
+    assert "${ASK_SRCROOT}/config/offload.conf ${D}${sysconfdir}/ask/offload.conf" in recipe
+    source = (ENGINE / "main.c").read_text()
+    literal = re.search(r"static const char DEFAULT_CONF\[\] =(.*?);", source, re.S)
+    assert literal, "main.c no longer defines DEFAULT_CONF"
+    pieces = re.findall(r'"((?:[^"\\]|\\.)*)"', re.sub(r"/\*.*?\*/", "", literal[1], flags=re.S))
+    builtin = "".join(pieces).encode().decode("unicode_escape")
+    shipped = (ROOT / "config/offload.conf").read_text()
+    compiled, installed = check(engine, builtin), check(engine, shipped)
+    assert compiled.returncode == 0 and compiled.stdout.startswith("OK "), compiled.stdout + compiled.stderr
+    assert installed.returncode == 0 and installed.stdout.startswith("OK "), installed.stdout + installed.stderr
+    assert compiled.stdout == installed.stdout, (builtin, shipped)
+    assert render(engine, builtin) == render(engine, shipped)
+
+
 def test_device_bound_matches_the_adapter():
     """FT_MAX_DEVICES restates CDX_FT_MAX_TABLE_DEVICES, the adapter's bound for
     one table. Drift would refuse a policy the adapter would have taken, or
