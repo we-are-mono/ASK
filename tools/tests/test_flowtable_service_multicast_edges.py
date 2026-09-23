@@ -13,15 +13,18 @@ and whether the CPU carried the stream at all.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 import os
 import time
 
 import pytest
 
-from _mcast_windows import (COUNT, delivered, dut_console, in_hardware, in_software,
-                            kernel_mroute, learn, mcast_rows, mdb, members, moved, mroute_row,
-                            multicast_rig, packets, same, stream, streamed, summary)  # noqa: F401
+from _mcast_helpers import arm_bridge_querier
+from _mcast_windows import (COUNT, bridge_settings, delivered, dut_console, host, in_hardware,
+                            in_software, kernel_mroute, learn, mcast_rows, mdb, members, moved,
+                            mroute_row, multicast_rig, packets, same, stream, streamed,  # noqa: F401
+                            summary)
 from _topology import (LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, VLAN_ID_PPPOE_WAN, TopologyStack,
                        dut_vlan_subif)
 from mroute_capture import payload
@@ -35,6 +38,7 @@ SECOND_SOURCE = {4: "198.18.165.2", 6: "fd00:165::2"}
 HANDOFF_GROUP = {4: "239.9.9.3", 6: "ff1e::9:9:3"}
 RELOAD_GROUP = {4: "239.9.9.4", 6: "ff1e::9:9:4"}
 FOLD_GROUP = {4: "239.9.9.5", 6: "ff1e::9:9:5"}
+RELOAD_FILTER_GROUP = {4: "239.9.9.6", 6: "ff1e::9:9:6"}
 IDLE_GROUP = {4: "239.9.9.7", 6: "ff1e::9:9:7"}
 # The bridge's group membership interval for the ageing case, in centiseconds
 # as the bridge takes it: short enough to wait out, and not so short that a
@@ -248,6 +252,9 @@ async def rebuild(r, console, bridge, address, gateway, mac):
         await console_command(console, *argv, timeout=30)
     await healthy_agent(r)
     await asyncio.sleep(3)  # the querier's startup queries
+    # A new bridge floods everything until its querier counts, and the
+    # bridged learner carries nothing the bridge floods.
+    await arm_bridge_querier(lambda *argv: command(r.target, r.session, *argv), bridge)
 
 
 @pytest.mark.parametrize("family", [4, 6])
@@ -543,6 +550,77 @@ async def test_flowtable_service_multicast_reload_bridged(multicast_rig, mcast_b
     await mdb(r, bridge, group, add=False)
     final = await r.settle(lambda s: row(s) is None and s["mcast_installed"] == r.initial["mcast_installed"],
                            "removed after the reload")
+    assert final["quarantine"] == 0, summary(final)
+
+
+@pytest.mark.parametrize("family", [4, 6])
+async def test_flowtable_service_multicast_reload_bridged_blocked_source(multicast_rig, mcast_bridge,
+                                                                        family):
+    """A blocked source stands across the reload, and stays blocked after it.
+
+    An IGMPv3 or MLDv2 host on the LAN port listens to any source but one.
+    The bridge holds that source's (S,G) port group blocked. The replay at
+    load has to say so: replayed as an ordinary member, the blocked source
+    would be carried to the very port that refused it, with the frame no
+    longer reaching the bridge to correct it. The allowed source comes back
+    in hardware; the blocked one never reaches the port, before, during or
+    after."""
+    r = multicast_rig
+    bridge = mcast_bridge
+    group, blocked, allowed = RELOAD_FILTER_GROUP[family], wan_source_address(family), SECOND_SOURCE[family]
+    port = f"{TARGET_LAN_IF}/0"
+    observers = [(r.lan, {LAN_NIC: None})]
+    streams = [stream(family, group, hops=64, source=s) for s in (blocked, allowed)]
+
+    def row(state, source):
+        rows = [g for g in mcast_rows(state, group) if same(g["src"], source)]
+        assert len(rows) <= 1, rows
+        return rows[0] if rows else None
+
+    def settled(state):
+        kept, refused = row(state, allowed), row(state, blocked)
+        return (bool(kept) and kept["state"] == "installed" and members(kept, "ports") == {port}
+                and bool(refused) and refused["state"] == "refused-listener"
+                and refused["ports"] == "-")
+
+    async def window(label, adapter=True):
+        result = await r.window([stream(family, group, hops=64, source=s) for s in (blocked, allowed)],
+                                observers, ingress=TARGET_WAN_IF, adapter=adapter,
+                                label=f"reload-blocked-v{family}-{label}")
+        assert delivered(result, streamed(result, group, allowed), LAN_NIC)
+        assert not delivered(result, streamed(result, group, blocked), LAN_NIC)
+        return result
+
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(bridge_settings(
+            r, bridge, igmp_version=3, mld_version=2, last_member_count=2,
+            last_member_interval=100))
+        member = await stack.enter_async_context(host(
+            r.lan, family=family, group=group, iface=LAN_NIC, mode="asm",
+            version=3 if family == 4 else 2, source=blocked))
+        await member.do("block")
+        await asyncio.sleep(3.5)   # the unanswered group-and-source queries
+        await learn(r, streams, settled, "the allowed source carried, the blocked one not")
+        before = await window("before")
+        assert moved(before, lambda s: row(s, allowed)) == COUNT, summary(before["after"])
+        assert before["cpu"] - before["idle"] < COUNT * 1.1, (before["cpu"], before["idle"])
+
+        async def unloaded():
+            out = await window("unloaded", adapter=False)
+            in_software(out, streams=2)
+
+        async def standing():
+            return await learn(r, streams, settled, "the blocked source standing across the reload")
+
+        relearned = await reload_adapter(r, f"mcast-reload-blocked-v{family}", standing, unloaded)
+        assert relearned["mcast_installed"] == r.initial["mcast_installed"] + 1, summary(relearned)
+        after = await window("after")
+        assert moved(after, lambda s: row(s, allowed)) == COUNT, summary(after["after"])
+        assert moved(after, lambda s: row(s, blocked)) == 0, summary(after["after"])
+        assert after["cpu"] - after["idle"] < COUNT * 1.1, (after["cpu"], after["idle"])
+    final = await r.settle(lambda s: not mcast_rows(s, group) and
+                           s["mcast_installed"] == r.initial["mcast_installed"],
+                           "removed after the reload", timeout=15)
     assert final["quarantine"] == 0, summary(final)
 
 

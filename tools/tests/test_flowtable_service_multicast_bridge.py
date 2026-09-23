@@ -12,6 +12,7 @@ import pytest_asyncio
 
 from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
+from _mcast_helpers import arm_bridge_querier
 from _mcast_wire import capture, frames, new_config, send
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from mcast_wire_capture import multicast_mac
@@ -128,6 +129,7 @@ except BaseException:
         assert result.rc == 0, result.stdout
         lan_created = True
         await asyncio.sleep(3)
+        await arm_bridge_querier(lambda *argv: command(r.target, r.session, *argv), BRIDGE)
         async with managed_service(r):
             yield r
     finally:

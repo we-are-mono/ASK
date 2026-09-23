@@ -56,6 +56,16 @@ MECHANISMS = {
 }
 BRIDGED_GROUP = {4: "239.9.8.1", 6: "ff1e::9:8:1"}
 ROUTED_GROUP = {4: "239.9.8.2", 6: "ff1e::9:8:2"}
+FILTER_GROUP = {4: "239.9.8.3", 6: "ff1e::9:8:3"}
+BLOCK_GROUP = {4: "239.9.8.4", 6: "ff1e::9:8:4"}
+# A second sender of a bridged group. The bridge validates no source, so any
+# address the WAN segment could carry will do.
+OTHER_SOURCE = {4: "198.18.166.2", 6: "fd00:166::2"}
+# The source-filtering reports: IGMPv3 and MLDv2, with the querier speaking
+# them. A blocked source is blocked once its group-and-source query goes
+# unanswered, two queries a second apart.
+FILTER_TIMERS = dict(igmp_version=3, mld_version=2, last_member_count=2, last_member_interval=100)
+FILTER_VERSION = {4: 3, 6: 2}
 SECOND_HOST = "askmcb"
 LISTENER_BRIDGE = "br-askmcl"
 VID_LEFT, VID_KEPT = 321, 322
@@ -321,4 +331,127 @@ async def test_flowtable_service_multicast_bridged_leave(multicast_rig, mcast_br
                            f"{mechanism}: no group record left", timeout=15)
     assert final["mcast_installed"] == r.initial["mcast_installed"], summary(final)
     assert final["quarantine"] == 0, summary(final)
+    assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)
+
+
+def flow_row(state, group, source):
+    """The bridged learner's row for one source of a group: one per flow."""
+    rows = [row for row in mcast_rows(state, group) if same(row["src"], source)]
+    assert len(rows) <= 1, rows
+    return rows[0] if rows else None
+
+
+def carried_to(state, group, source, port=f"{TARGET_LAN_IF}/0"):
+    row = flow_row(state, group, source)
+    return bool(row) and row["state"] == "installed" and members(row, "ports") == {port}
+
+
+def withheld(state, group, source):
+    """Learned, and the bridge forwards it nowhere: left to the bridge."""
+    row = flow_row(state, group, source)
+    return bool(row) and row["state"] == "refused-listener" and row["ports"] == "-"
+
+
+@pytest.mark.parametrize("family", [4, 6])
+async def test_flowtable_service_multicast_bridged_ssm_beside_asm(multicast_rig, mcast_bridge, family):
+    """A source-specific listener and an any-source one behind the LAN port.
+
+    The SSM host's INCLUDE{S1} makes the bridge hold a (*,G) INCLUDE port
+    group, which it never forwards, and an (S1,G) one; the ASM host's
+    EXCLUDE{} makes the port want every source. Two sources are two flows,
+    each carried to the port. When the ASM host leaves, the port wants S1
+    alone: S2's flow leaves hardware and S2 stops reaching the port, while S1
+    stays in hardware on its entry. Before flows, both memberships contested
+    one key and neither was carried; installed from the (*,G) set, S2 would
+    have kept arriving at a port nothing on it wants."""
+    r = multicast_rig
+    group, first, second = FILTER_GROUP[family], wan_source_address(family), OTHER_SOURCE[family]
+    observers = [(r.lan, {LAN_NIC: None})]
+    version = FILTER_VERSION[family]
+
+    def window(label):
+        return r.window([stream(family, group, hops=64, source=s) for s in (first, second)],
+                        observers, ingress=TARGET_WAN_IF, label=f"ssm-asm-v{family}-{label}")
+
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(bridge_settings(r, mcast_bridge, **FILTER_TIMERS))
+        other = await stack.enter_async_context(second_host(r.lan))
+        await stack.enter_async_context(host(
+            r.lan, family=family, group=group, iface=LAN_NIC, mode="ssm", version=version,
+            source=first))
+        asm = await stack.enter_async_context(host(
+            r.lan, family=family, group=group, iface=other, mode="asm", version=version))
+        both = await learn(r, [stream(family, group, hops=64, source=s) for s in (first, second)],
+                           lambda s: carried_to(s, group, first) and carried_to(s, group, second),
+                           f"v{family}: both sources carried")
+        assert both["mcast_installed"] == r.initial["mcast_installed"] + 2, summary(both)
+        together = await window("both-hosts")
+        for source in (first, second):
+            assert delivered(together, streamed(together, group, source), LAN_NIC), source
+            assert moved(together, lambda s, source=source: flow_row(s, group, source)) == COUNT, \
+                (source, summary(together["after"]))
+        in_hardware(together, streams=2)
+
+        # The any-source host goes. What stays on the port is INCLUDE{S1}.
+        await asm.do("leave")
+        alone = await r.settle(lambda s: carried_to(s, group, first) and withheld(s, group, second),
+                               f"v{family}: the second source withdrawn", timeout=15)
+        assert alone["mcast_installed"] == r.initial["mcast_installed"] + 1, summary(alone)
+        after = await window("ssm-host")
+        assert delivered(after, streamed(after, group, first), LAN_NIC)
+        assert not delivered(after, streamed(after, group, second), LAN_NIC)
+        assert moved(after, lambda s: flow_row(s, group, first)) == COUNT, summary(after["after"])
+        assert moved(after, lambda s: flow_row(s, group, second)) == 0, summary(after["after"])
+        # The second source reached the CPU, and the bridge dropped it there.
+        assert after["cpu"] - after["idle"] < COUNT * 1.1, (after["cpu"], after["idle"])
+    final = await r.settle(lambda s: not mcast_rows(s, group) and
+                           s["mcast_groups"] == r.initial["mcast_groups"],
+                           f"v{family}: no record left", timeout=15)
+    assert final["mcast_installed"] == r.initial["mcast_installed"], summary(final)
+    assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)
+
+
+@pytest.mark.parametrize("family", [4, 6])
+async def test_flowtable_service_multicast_bridged_block_before_the_stream(multicast_rig, mcast_bridge,
+                                                                         family):
+    """A host joins any-source and blocks one source before anything is sent.
+
+    The bridge answers the block with a group-and-source query nobody
+    answers, and holds the source blocked from then on. From the first frame,
+    the blocked source never reaches the port -- not in software while the
+    learner learns it, and not in hardware once the other source is carried --
+    and its own flow stays out of hardware."""
+    r = multicast_rig
+    group, blocked, allowed = BLOCK_GROUP[family], wan_source_address(family), OTHER_SOURCE[family]
+    observers = [(r.lan, {LAN_NIC: None})]
+
+    def window(label):
+        return r.window([stream(family, group, hops=64, source=s) for s in (blocked, allowed)],
+                        observers, ingress=TARGET_WAN_IF, label=f"block-first-v{family}-{label}")
+
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(bridge_settings(r, mcast_bridge, **FILTER_TIMERS))
+        member = await stack.enter_async_context(host(
+            r.lan, family=family, group=group, iface=LAN_NIC, mode="asm",
+            version=FILTER_VERSION[family], source=blocked))
+        await member.do("block")
+        # Two unanswered queries a second apart, and then some.
+        await asyncio.sleep(3.5)
+
+        first = await window("learning")
+        assert not delivered(first, streamed(first, group, blocked), LAN_NIC)
+        assert delivered(first, streamed(first, group, allowed), LAN_NIC)
+        settled = await r.settle(lambda s: carried_to(s, group, allowed) and withheld(s, group, blocked),
+                                 f"v{family}: the allowed source carried, the blocked one not")
+        assert settled["mcast_installed"] == r.initial["mcast_installed"] + 1, summary(settled)
+        second = await window("carried")
+        assert not delivered(second, streamed(second, group, blocked), LAN_NIC)
+        assert delivered(second, streamed(second, group, allowed), LAN_NIC)
+        assert moved(second, lambda s: flow_row(s, group, allowed)) == COUNT, summary(second["after"])
+        assert moved(second, lambda s: flow_row(s, group, blocked)) == 0, summary(second["after"])
+        assert second["cpu"] - second["idle"] < COUNT * 1.1, (second["cpu"], second["idle"])
+    final = await r.settle(lambda s: not mcast_rows(s, group) and
+                           s["mcast_groups"] == r.initial["mcast_groups"],
+                           f"v{family}: no record left", timeout=15)
+    assert final["mcast_installed"] == r.initial["mcast_installed"], summary(final)
     assert final["mcast_install_errors"] == r.initial["mcast_install_errors"], summary(final)

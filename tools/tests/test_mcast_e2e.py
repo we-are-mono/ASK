@@ -54,6 +54,7 @@ from ask_orch.counters import kernel_rx_packets
 from ask_orch.uart import Console
 
 from _mcast_helpers import (  # noqa: F401  (fixture imported for resolution)
+    arm_bridge_querier,
     capture_parallel_window,
     kill_parallel_tcpdumps,
     pcap_cleanup_lan,
@@ -257,6 +258,9 @@ async def mcast_bridge(aiohttp_session, target_agent):
         # multicast_startup_query_interval; without waiting them out the first
         # join can land before snooping is querying and be missed.
         await asyncio.sleep(3.0)
+        # And it has to count as a querier at all, in both families, or the
+        # bridge floods every group and none is carried in hardware.
+        await arm_bridge_querier(_exec, BRIDGE)
         yield BRIDGE
     finally:
         await stack.teardown("mcast_bridge")

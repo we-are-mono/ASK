@@ -10,8 +10,43 @@ two concurrent `lan.run` calls would interleave.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest_asyncio
+
+
+# ---- the bridge's own querier ----------------------------------------------
+
+async def arm_bridge_querier(run, bridge: str) -> None:
+    """Make a new bridge's own querier count, in both families, now.
+
+    Snooping decides nothing without a querier: the bridge floods every group,
+    registered or not, to every port and up to the host. And a bridge created
+    with `mcast_querier 1` does not count as one for a whole query response
+    interval -- ten seconds by default -- while other queriers get the chance
+    to answer, nor for IPv6 at all until a query of its own has gone out from a
+    usable link-local address. Its first one leaves before the address exists,
+    which counts it out until the next startup query, half a minute on.
+
+    The bridged learner asks the bridge what it forwards, so while the bridge
+    floods it refuses to carry the group (`refused-host`: the flood reaches
+    the host too) rather than install the MDB's ports in its place. Restarting
+    the querier once the address is usable, with a one-second response
+    interval, makes both families count within two seconds.
+
+    `run(*argv)` executes on the DUT and returns the agent's result dict."""
+    for _ in range(100):
+        out = await run("ip", "-6", "-j", "addr", "show", "dev", bridge, "scope", "link")
+        info = [a for i in json.loads(out.get("stdout") or "[]") for a in i.get("addr_info", [])]
+        if info and not any(a.get("tentative") for a in info):
+            break
+        await asyncio.sleep(0.1)
+    # Without an address IPv6 snooping cannot query; IPv4 is armed regardless.
+    await run("ip", "link", "set", "dev", bridge, "type", "bridge",
+              "mcast_query_response_interval", "100")
+    for value in ("0", "1"):
+        await run("ip", "link", "set", "dev", bridge, "type", "bridge", "mcast_querier", value)
+    await asyncio.sleep(2.0)
 
 
 # ---- capture (UART-driven, no LAN agent required) -------------------------
