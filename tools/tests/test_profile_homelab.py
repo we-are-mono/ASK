@@ -1883,11 +1883,21 @@ async def test_profile_homelab_module_reload_reproves_the_profile(homelab,
     IPsec tunnel is the exception that has to be reinstalled: its hardware state
     belonged to the module, so its SAs are offered again -- which is itself worth
     proving, because it is what an operator would do.
+
+    It is also the one thing the operator has to take down first. Every
+    offloaded state and policy holds a reference on the module that provides
+    its device operations, so the kernel can never call into unloaded text,
+    and while the tunnel stands the unload is refused.
     """
     ctx = homelab
     console = ctx.console
     await console_command(console, "test", "-e",
                           "/sys/module/cdx/holders/ask_flowtable")
+    pinned = await console_command(console, "rmmod", "ask_flowtable", check=False,
+                                   timeout=30)
+    assert pinned["rc"] != 0 and "in use" in pinned["stdout"], pinned
+    await console_command(console, "ip", "xfrm", "policy", "flush")
+    await console_command(console, "ip", "xfrm", "state", "flush")
     await console_command(console, "rmmod", "ask_flowtable", timeout=30)
     for path in ("/sys/module/ask_flowtable", "/proc/cdx_flowtable",
                  "/sys/module/cdx/holders/ask_flowtable"):
