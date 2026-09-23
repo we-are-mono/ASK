@@ -95,6 +95,13 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  */
 #define CDX_HTB_CQ_DEPTH	128
 
+/* The WRED curve a RED qdisc on a leaf asked for, kept so it can be put back
+ * after the class queue is configured afresh: ceetm_set_class_queue() starts
+ * every queue on plain tail drop. */
+struct cdx_htb_red_curve {
+	u32 min, max, probability, limit;
+};
+
 struct cdx_htb_class {
 	struct list_head list;
 	/* Minors only. sch_htb truncates classid to u16 in the offload
@@ -107,6 +114,21 @@ struct cdx_htb_class {
 	u8 channel;		/* CEETM channel index, both kinds */
 	u8 cq;			/* class-queue index, leaves only */
 	bool inner;		/* a channel with children, so not a queue */
+	/* The class queue is running `curve' for the RED qdisc `red_qdisc'
+	 * grafted on this leaf. Only a curve the hardware took sets it, so it
+	 * is also what that qdisc's statistics call reports as offloaded. The
+	 * handle matters because a qdisc replacing another on the same class
+	 * is created before the one it replaces is destroyed. */
+	bool red;
+	u32 red_qdisc;
+	struct cdx_htb_red_curve curve;
+	/* The curve that one displaced, kept until its qdisc is destroyed. A
+	 * new qdisc that fails after its REPLACE programmed the queue is
+	 * destroyed with the one it would have replaced still grafted, and
+	 * that one gets its curve back. */
+	bool red_displaced;
+	u32 displaced_qdisc;
+	struct cdx_htb_red_curve displaced;
 };
 
 struct cdx_htb_port {
@@ -330,14 +352,40 @@ static void cdx_htb_cq_release(struct cdx_htb_port *port, u8 channel, u8 cq)
 			channel, cq);
 }
 
+static const char *cdx_htb_port_name(struct cdx_htb_port *port)
+{
+	return port->qm_ctx->net_dev ? port->qm_ctx->net_dev->name : "?";
+}
+
+/* Give a leaf its RED curve back once its class queue has been configured
+ * afresh, which always starts the queue on tail drop. A curve that will not go
+ * back is dropped from the class too, so the qdisc stops reporting an offload
+ * the hardware no longer has. */
+static void cdx_htb_red_restore(struct cdx_htb_port *port, struct cdx_htb_class *cl)
+{
+	if (!cl->red)
+		return;
+	if (!ceetm_set_class_wred(cl->channel, cl->cq, cl->curve.min, cl->curve.max,
+				  cl->curve.probability, cl->curve.limit))
+		return;
+	cl->red = false;
+	pr_warn("cdx: %s class %x lost its RED curve moving to class queue %u; the RED qdisc is no longer offloaded\n",
+		cdx_htb_port_name(port), cl->classid, cl->cq);
+}
+
 /* Put a class queue back the way it was, after a change that could not be
  * completed. Nothing else can be done about a failure here: the caller is
  * already unwinding. */
 static void cdx_htb_cq_restore(struct cdx_htb_port *port, struct cdx_htb_class *cl)
 {
-	if (cdx_htb_cq_configure(port, cl->channel, cl->cq, cl->quantum, NULL))
+	if (cdx_htb_cq_configure(port, cl->channel, cl->cq, cl->quantum, NULL)) {
 		pr_warn("cdx: CEETM channel %u queue %u lost its configuration\n",
 			cl->channel, cl->cq);
+		/* Released on the way here, which took its curve with it. */
+		cl->red = false;
+		return;
+	}
+	cdx_htb_red_restore(port, cl);
 }
 
 /* tc rates are bytes per second; CEETM shapers are programmed in bits.
@@ -575,6 +623,12 @@ static int cdx_htb_leaf_to_inner(struct cdx_htb_port *port,
 	parent->qid = 0;
 	parent->cq = 0;
 	parent->quantum = 0;
+	/* Its class queue was released above, curve and all, and a channel
+	 * has no congestion group of its own to carry one. sch_htb destroys
+	 * the parent's old qdisc next; that finds an inner class and does
+	 * nothing. */
+	parent->red = false;
+	parent->red_displaced = false;
 	cdx_htb_publish(port);
 	return 0;
 }
@@ -627,10 +681,19 @@ static int cdx_htb_leaf_del_last(struct cdx_htb_port *port,
 		cdx_htb_publish(port);
 		return force ? 0 : -ENOENT;
 	}
+	/* The child's RED qdisc goes with the child, but only after this
+	 * command, and its destroy will then name a class that no longer
+	 * exists. So its curve comes off the class queue here, before the
+	 * parent inherits the queue as plain tail drop. */
+	if (cl->red && ceetm_clear_class_wred(cl->channel, cl->cq, CDX_HTB_CQ_DEPTH))
+		pr_warn("cdx: CEETM channel %u queue %u kept a RED curve its class no longer has\n",
+			cl->channel, cl->cq);
 	parent->inner = false;
 	parent->qid = cl->qid;
 	parent->cq = cl->cq;
 	parent->quantum = cl->quantum;
+	parent->red = false;
+	parent->red_displaced = false;
 	cdx_htb_class_free(port, cl);
 	cdx_htb_publish(port);
 	return 0;
@@ -661,6 +724,9 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
 	}
 	cl->cq = cq;
 	cl->quantum = opt->quantum;
+	/* A RED qdisc on the leaf moves with it: the queue it now occupies was
+	 * configured on tail drop, and the one it left was reset. */
+	cdx_htb_red_restore(port, cl);
 	cdx_htb_publish(port);
 	return 0;
 }
@@ -675,32 +741,137 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
  *
  * ECN is refused for the same reason: this hardware drops, it does not mark, so
  * accepting `ecn` would answer a request to mark by dropping instead.
+ *
+ * "Refused" has to mean the hardware is left without a curve, and the qdisc has
+ * to say so, because sch_red discards what this returns and creates or changes
+ * the software qdisc regardless. So a refused or failed REPLACE also takes away
+ * a curve the class already had -- otherwise `tc qdisc change` to a setting
+ * this refuses would leave the old curve running under a qdisc showing the
+ * new one -- and the statistics call answers "offloaded" only for a class
+ * whose curve the hardware took, which is what tc's `offloaded' reflects. The
+ * reason goes to the kernel log, the one place sch_red leaves to say it.
+ *
+ * The curve belongs to one qdisc, not to the class. `tc qdisc replace' of a
+ * RED qdisc by another creates the new one -- its REPLACE programs the class
+ * queue -- and only then destroys the old one, whose DESTROY names the same
+ * class; so everything but a successful REPLACE acts only on the qdisc whose
+ * curve is running. The curve a replacement displaced is kept until its own
+ * qdisc's destroy, and put back if the replacement is destroyed first, which
+ * is how a replacement that fails after programming the queue goes.
  */
-static int cdx_htb_red(struct cdx_htb_port *port, struct tc_red_qopt_offload *opt)
+static int cdx_htb_red(struct net_device *dev, struct cdx_htb_port *port,
+		       struct tc_red_qopt_offload *opt)
 {
-	struct cdx_htb_class *cl;
+	struct cdx_htb_class *cl = NULL;
+	const char *refused = NULL;
+	bool running;
+	int rc = -EOPNOTSUPP;
 
+	/* A qdisc's parent is a whole handle. Only one grafted directly on a
+	 * class of this qdisc names a class queue; one deeper in, under a
+	 * leaf's own child qdisc, carries that qdisc's major and a minor this
+	 * tree could mistake for one of its own classes. */
 	if (opt->parent == TC_H_ROOT)
-		return -EOPNOTSUPP;
-	cl = cdx_htb_find(port, TC_H_MIN(opt->parent));
-	if (!cl || cl->inner)
-		return -EOPNOTSUPP;
+		refused = "the root qdisc is the port, which has no single class queue";
+	else if (TC_H_MAJ(opt->parent) != (u32)port->major << 16)
+		refused = "it is not grafted directly on a class of the hardware qdisc";
+	else if (!(cl = cdx_htb_find(port, TC_H_MIN(opt->parent))))
+		refused = "the hardware qdisc has no such class";
+	else if (cl->inner) {
+		refused = "its class is a channel, which has no congestion group";
+		cl = NULL;
+	}
+	running = cl && cl->red && cl->red_qdisc == opt->handle;
 
 	switch (opt->command) {
 	case TC_RED_REPLACE:
-		if (opt->set.is_ecn)
-			return -EOPNOTSUPP;
-		if (!opt->set.max || opt->set.max <= opt->set.min || !opt->set.limit)
-			return -EINVAL;
-		return ceetm_set_class_wred(cl->channel, cl->cq, opt->set.min,
-					    opt->set.max, opt->set.probability,
-					    opt->set.limit);
+		if (!refused && opt->set.is_ecn) {
+			refused = "the hardware drops and cannot mark, so ECN cannot be offloaded";
+		} else if (!refused &&
+			   (!opt->set.max || opt->set.max <= opt->set.min || !opt->set.limit)) {
+			refused = "the curve needs a band, min below max, and a limit";
+			rc = -EINVAL;
+		} else if (!refused) {
+			rc = ceetm_set_class_wred(cl->channel, cl->cq, opt->set.min,
+						  opt->set.max, opt->set.probability,
+						  opt->set.limit);
+			if (!rc) {
+				if (cl->red && !running) {
+					cl->red_displaced = true;
+					cl->displaced_qdisc = cl->red_qdisc;
+					cl->displaced = cl->curve;
+				}
+				cl->red = true;
+				cl->red_qdisc = opt->handle;
+				cl->curve = (struct cdx_htb_red_curve){
+					opt->set.min, opt->set.max,
+					opt->set.probability, opt->set.limit };
+				return 0;
+			}
+			refused = "CEETM rejected the curve";
+		}
+		/* A change to this qdisc: the old curve must not run under the
+		 * settings the software qdisc now shows. Another qdisc's curve
+		 * stays until that qdisc is destroyed, as it is next when this
+		 * one was meant to replace it. */
+		if (running) {
+			cl->red = false;
+			if (ceetm_clear_class_wred(cl->channel, cl->cq, CDX_HTB_CQ_DEPTH))
+				netdev_warn(dev, "class %x kept a RED curve it was meant to lose\n",
+					    cl->classid);
+		}
+		if (cl && cl->red)
+			netdev_warn(dev, "RED qdisc %x: not offloaded: %s; its class queue keeps RED qdisc %x's curve until that qdisc goes\n",
+				    TC_H_MAJ(opt->handle) >> 16, refused,
+				    TC_H_MAJ(cl->red_qdisc) >> 16);
+		else
+			netdev_warn(dev, "RED qdisc %x: not offloaded: %s%s\n",
+				    TC_H_MAJ(opt->handle) >> 16, refused,
+				    cl ? "; its class queue is on tail drop" : "");
+		return rc;
 	case TC_RED_DESTROY:
-		return ceetm_clear_class_wred(cl->channel, cl->cq,
-					      CDX_HTB_CQ_DEPTH);
+		if (!cl)
+			return -EOPNOTSUPP;
+		/* The qdisc a replacement displaced, going as the replacement
+		 * completes: its successor's curve is the one running, and
+		 * stays. */
+		if (cl->red_displaced && cl->displaced_qdisc == opt->handle) {
+			cl->red_displaced = false;
+			return 0;
+		}
+		if (!running)
+			return 0;
+		/* The replacement itself, failing after its REPLACE: the qdisc
+		 * it displaced is still grafted, and gets its curve back. */
+		if (cl->red_displaced) {
+			cl->red_displaced = false;
+			if (!ceetm_set_class_wred(cl->channel, cl->cq, cl->displaced.min,
+						  cl->displaced.max,
+						  cl->displaced.probability,
+						  cl->displaced.limit)) {
+				cl->red_qdisc = cl->displaced_qdisc;
+				cl->curve = cl->displaced;
+				return 0;
+			}
+			netdev_warn(dev, "RED qdisc %x: its curve could not be put back; its class queue is on tail drop\n",
+				    TC_H_MAJ(cl->displaced_qdisc) >> 16);
+		}
+		cl->red = false;
+		return ceetm_clear_class_wred(cl->channel, cl->cq, CDX_HTB_CQ_DEPTH);
+	case TC_RED_STATS:
+		/* Answering is what marks the qdisc offloaded, so only a class
+		 * running the curve answers. The counters stay software's: what
+		 * the class queue dropped for an offloaded flow never reached
+		 * this qdisc, and ethtool -S reports it per leaf, as rejected
+		 * frames. */
+		return running ? 0 : -EOPNOTSUPP;
+	case TC_RED_XSTATS:
+		/* Asked only of a qdisc already reported offloaded. RED's own
+		 * early and forced drop counts have no hardware source. */
+		return 0;
 	default:
-		/* Statistics come from ethtool, where they describe the
-		 * accelerated traffic a qdisc counter cannot see. */
+		/* TC_RED_GRAFT: a qdisc under RED would sit below the class
+		 * queue, where nothing offloaded ever arrives. */
 		return -EOPNOTSUPP;
 	}
 }
@@ -723,10 +894,14 @@ static int cdx_htb_setup_red(struct net_device *dev,
 	int rc;
 
 	ASSERT_RTNL();
-	if (!port || !port->live)
+	if (!port || !port->live) {
+		if (opt->command == TC_RED_REPLACE)
+			netdev_warn(dev, "RED qdisc %x: not offloaded: no hardware qdisc on this port\n",
+				    TC_H_MAJ(opt->handle) >> 16);
 		return -EOPNOTSUPP;
+	}
 	mutex_lock(&cdx_htb_mutex);
-	rc = cdx_htb_red(port, opt);
+	rc = cdx_htb_red(dev, port, opt);
 	mutex_unlock(&cdx_htb_mutex);
 	return rc;
 }

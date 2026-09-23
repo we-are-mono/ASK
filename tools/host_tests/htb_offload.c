@@ -39,7 +39,9 @@ typedef uint64_t u64;
 			*(p) = (new);					\
 		__o;							\
 	})
-#define pr_warn(...)		((void)0)
+/* Formatted and discarded, so the compiler checks every format against its
+ * arguments the way the kernel's printk attribute would. */
+#define pr_warn(...)		((void)snprintf(NULL, 0, __VA_ARGS__))
 #define WARN_ON_ONCE(c)		({ int __c = !!(c); assert(!__c); __c; })
 
 static bool rtnl = true;
@@ -239,13 +241,20 @@ static int ceetm_class_counters(u32 channel, u32 quenum, u64 *deq_frames,
 }
 
 /* The WRED curve a class queue was last given, so a test can say which class
- * a RED qdisc reached. */
+ * a RED qdisc reached. The hardware layer's own handling of the curve --
+ * including that configuring or resetting a class queue turns it off -- is
+ * compiled in tools/host_tests/ceetm_wred.c; the stubs below mirror that. */
 static struct { u32 min, max, probability, limit; bool set; }
 	wred[CDX_CEETM_MAX_CHANNELS][MAX_SCHEDULER_QUEUES];
+static unsigned wred_sets, wred_clears;
+static bool wred_fail;
 static int ceetm_set_class_wred(u32 channel, u32 quenum, u32 min, u32 max,
 				u32 probability, u32 limit)
 {
 	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
+	wred_sets++;
+	if (wred_fail)
+		return -EIO;
 	wred[channel][quenum] = (__typeof__(wred[0][0])){ min, max, probability,
 							  limit, true };
 	return 0;
@@ -254,9 +263,14 @@ static int ceetm_clear_class_wred(u32 channel, u32 quenum, u32 depth)
 {
 	assert(channel < CDX_CEETM_MAX_CHANNELS && quenum < MAX_SCHEDULER_QUEUES);
 	assert(depth == 128);
+	wred_clears++;
 	memset(&wred[channel][quenum], 0, sizeof(wred[0][0]));
 	return 0;
 }
+static unsigned warnings;
+static char warning[256];
+#define netdev_warn(dev, ...)	\
+	((void)(dev), warnings++, (void)snprintf(warning, sizeof(warning), __VA_ARGS__))
 
 static const struct dpa_qdisc_ops *registered_qdisc_ops;
 static int dpa_register_qdisc_ops(const struct dpa_qdisc_ops *ops)
@@ -329,6 +343,8 @@ static int ceetm_set_class_queue(u32 channel_num, u32 quenum, u32 weight, u32 de
 		return -EIO;
 	cq_live[channel_num][quenum] = true;
 	cq_weight[channel_num][quenum] = weight;
+	/* Configured afresh, which starts it on tail drop. */
+	memset(&wred[channel_num][quenum], 0, sizeof(wred[0][0]));
 	return 0;
 }
 
@@ -338,6 +354,7 @@ static int ceetm_reset_class_queue(u32 channel_num, u32 quenum)
 	assert(quenum < MAX_SCHEDULER_QUEUES);
 	cq_live[channel_num][quenum] = false;
 	cq_weight[channel_num][quenum] = 0;
+	memset(&wred[channel_num][quenum], 0, sizeof(wred[0][0]));
 	return 0;
 }
 
@@ -365,6 +382,7 @@ static int ceetm_stop_qos(struct tQM_context_ctl *qm_ctx)
 		for (jj = 0; jj < MAX_SCHEDULER_QUEUES; jj++) {
 			cq_live[ii][jj] = false;
 			cq_weight[ii][jj] = 0;
+			memset(&wred[ii][jj], 0, sizeof(wred[0][0]));
 		}
 		chan_cir[ii] = chan_eir[ii] = 0;
 		chan_owner_set[ii] = false;
@@ -505,6 +523,8 @@ static void reset_world(void)
 	devices[1].real_num_tx_queues = DPAA_ETH_TX_QUEUES;
 	memset(class_fqs, 0, sizeof(class_fqs));
 	memset(wred, 0, sizeof(wred));
+	wred_sets = wred_clears = warnings = 0;
+	wred_fail = false;
 	real_num_tx_queues_fails = 0;
 	class_counters_fail = false;
 	cdx_ft_qos_class_func = NULL;
@@ -1122,11 +1142,16 @@ static void test_class_statistics(void)
 
 /* A RED qdisc names the class it was grafted under, and that class is the
  * class queue whose congestion group it configures. */
+/* The RED qdisc the calls below come from, by handle. */
+#define RED_QDISC	TC_H_MAKE(20u << 16, 0)
+static u32 red_qdisc = RED_QDISC;
+
 static int red(struct net_device *dev, u32 parent, enum tc_red_command cmd,
 	       u32 min, u32 max, u32 probability, u32 limit, bool ecn)
 {
 	struct tc_red_qopt_offload opt = {
 		.command = cmd,
+		.handle = red_qdisc,
 		.parent = parent,
 		.set = { .min = min, .max = max, .probability = probability,
 			 .limit = limit, .is_ecn = ecn },
@@ -1135,57 +1160,203 @@ static int red(struct net_device *dev, u32 parent, enum tc_red_command cmd,
 	return cdx_htb_setup_red(dev, &opt);
 }
 
+/* A curve the hardware takes, on whichever class `parent' names. */
+static int red_good(struct net_device *dev, u32 parent)
+{
+	return red(dev, parent, TC_RED_REPLACE, 1000, 4000, 1u << 26, 16000, false);
+}
+
+/* What tc reads as "offloaded": the statistics call answering at all. */
+static bool red_offloaded(struct net_device *dev, u32 parent)
+{
+	int rc = red(dev, parent, TC_RED_STATS, 0, 0, 0, 0, false);
+
+	assert(!rc || rc == -EOPNOTSUPP);
+	return !rc;
+}
+
 static void test_red(void)
 {
 	struct net_device *dev = &devices[0];
-	u16 qid1, qid10;
+	const u32 on1 = TC_H_MAKE(1 << 16, 1), on10 = TC_H_MAKE(1 << 16, 10);
+	const u32 on11 = TC_H_MAKE(1 << 16, 11), on12 = TC_H_MAKE(1 << 16, 12);
+	unsigned sets, clears;
+	u16 qid1, qid10, qid11;
 
 	reset_world();
-	/* Nothing to graft onto before a qdisc exists. */
-	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
-		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
+	/* Nothing to graft onto before a qdisc exists, and the log says so. */
+	assert(red_good(dev, on10) == -EOPNOTSUPP);
+	assert(warnings == 1 && !wred_sets);
 
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
 	assert(!to_inner(dev, 10, 1, 0, 0));
 	assert(!query(dev, 10, &qid10));
+	assert(!red_offloaded(dev, on10));
 
 	/* Class 10 is channel 0's top strict-priority queue. */
-	assert(!red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
-		    1000, 4000, 1u << 26, 16000, false));
+	assert(!red_good(dev, on10));
 	assert(wred[0][NUM_PQS - 1].set);
 	assert(wred[0][NUM_PQS - 1].min == 1000 && wred[0][NUM_PQS - 1].max == 4000);
 	assert(wred[0][NUM_PQS - 1].limit == 16000);
+	/* Only now does the qdisc report itself offloaded. Its counters stay
+	 * software's -- ethtool -S has the class queue's -- so the extended
+	 * statistics answer without changing them. */
+	assert(red_offloaded(dev, on10));
+	assert(!red(dev, on10, TC_RED_XSTATS, 0, 0, 0, 0, false));
+	/* A qdisc under RED would sit below the class queue. */
+	assert(red(dev, on10, TC_RED_GRAFT, 0, 0, 0, 0, false) == -EOPNOTSUPP);
 
-	/* ECN is a request to mark, and this hardware only drops. Answering it
-	 * by dropping would be the wrong answer to the question asked. */
-	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
-		   1000, 4000, 1u << 26, 16000, true) == -EOPNOTSUPP);
-	/* A curve with no band, and one with no limit, are refused. */
-	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
-		   4000, 4000, 1u << 26, 16000, false) == -EINVAL);
-	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_REPLACE,
-		   1000, 4000, 1u << 26, 0, false) == -EINVAL);
+	/* ECN is a request to mark, and this hardware only drops. It is refused
+	 * without the curve setter being asked, and -- because sch_red keeps the
+	 * changed qdisc in software whatever this says -- the curve the class
+	 * had comes off too, rather than running under a qdisc showing another. */
+	sets = wred_sets;
+	warnings = 0;
+	assert(red(dev, on10, TC_RED_REPLACE, 2000, 8000, 1u << 26, 16000, true) == -EOPNOTSUPP);
+	assert(wred_sets == sets && !wred[0][NUM_PQS - 1].set && warnings == 1);
+	assert(!red_offloaded(dev, on10));
+	/* The same for a curve with no band, one with no limit, and one the
+	 * hardware will not take. */
+	assert(!red_good(dev, on10));
+	assert(red(dev, on10, TC_RED_REPLACE, 4000, 4000, 1u << 26, 16000, false) == -EINVAL);
+	assert(!wred[0][NUM_PQS - 1].set && !red_offloaded(dev, on10));
+	assert(!red_good(dev, on10));
+	assert(red(dev, on10, TC_RED_REPLACE, 1000, 4000, 1u << 26, 0, false) == -EINVAL);
+	assert(!wred[0][NUM_PQS - 1].set && !red_offloaded(dev, on10));
+	assert(!red_good(dev, on10));
+	wred_fail = true;
+	assert(red(dev, on10, TC_RED_REPLACE, 2000, 8000, 1u << 26, 16000, false) == -EIO);
+	wred_fail = false;
+	assert(!wred[0][NUM_PQS - 1].set && !red_offloaded(dev, on10));
+	/* A destroy after a refusal has nothing left to take off. */
+	clears = wred_clears;
+	assert(!red(dev, on10, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	assert(wred_clears == clears);
 
 	/* The root qdisc is the port, not a class queue; an inner class is a
-	 * channel, which has no congestion group of its own. */
-	assert(red(dev, TC_H_ROOT, TC_RED_REPLACE,
-		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
-	assert(red(dev, TC_H_MAKE(1 << 16, 1), TC_RED_REPLACE,
-		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
-	assert(red(dev, TC_H_MAKE(1 << 16, 99), TC_RED_REPLACE,
-		   1000, 4000, 1u << 26, 16000, false) == -EOPNOTSUPP);
+	 * channel, which has no congestion group of its own; and a class the
+	 * tree does not have is nothing. None of them reaches the setter. */
+	sets = wred_sets;
+	assert(red_good(dev, TC_H_ROOT) == -EOPNOTSUPP);
+	assert(red_good(dev, on1) == -EOPNOTSUPP);
+	assert(red_good(dev, TC_H_MAKE(1 << 16, 99)) == -EOPNOTSUPP);
+	/* A RED one level further down -- under a qdisc 10: grafted on the
+	 * leaf -- names minor 10 too. Its major is not the tree's, so it
+	 * programs nothing, rather than class 1:10's queue. */
+	assert(red_good(dev, TC_H_MAKE(10 << 16, 10)) == -EOPNOTSUPP);
+	assert(!red_offloaded(dev, TC_H_MAKE(10 << 16, 10)));
+	assert(wred_sets == sets && !wred[0][NUM_PQS - 1].set);
 
-	/* Statistics are ethtool's, where they describe what the qdisc cannot
-	 * see; tc is told so rather than given zeroes. */
-	assert(red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_STATS,
-		   0, 0, 0, 0, false) == -EOPNOTSUPP);
+	/* Moving the leaf to another priority takes its curve along: the queue
+	 * it leaves is reset and the one it takes starts on tail drop. */
+	assert(!red_good(dev, on10));
+	assert(!modify(dev, 10, 2, 0, 0, 0));
+	assert(!wred[0][NUM_PQS - 1].set && wred[0][NUM_PQS - 3].set);
+	assert(wred[0][NUM_PQS - 3].min == 1000 && wred[0][NUM_PQS - 3].limit == 16000);
+	assert(red_offloaded(dev, on10));
 
-	assert(!red(dev, TC_H_MAKE(1 << 16, 10), TC_RED_DESTROY,
-		    0, 0, 0, 0, false));
+	/* A leaf deleted with its RED qdisc still on it. sch_htb deletes the
+	 * class first and destroys the qdisc afterwards, naming a class that
+	 * is gone by then, so the delete is what has to take the curve off. */
+	assert(!add_leaf(dev, 11, 1, 1, 0, 0, 0, &qid11));
+	assert(!red_good(dev, on11));
+	assert(wred[0][NUM_PQS - 2].set);
+	assert(!del_leaf(dev, 11, NULL));
+	assert(!wred[0][NUM_PQS - 2].set);
+	assert(red(dev, on11, TC_RED_DESTROY, 0, 0, 0, 0, false) == -EOPNOTSUPP);
+
+	/* The last child's curve does not pass to the parent that inherits its
+	 * class queue: its RED qdisc belonged to the child. */
+	assert(wred[0][NUM_PQS - 3].set);
+	assert(!del_last(dev, 10, false));
+	assert(!wred[0][NUM_PQS - 3].set);
+	assert(!red_offloaded(dev, on1));
+
+	/* A leaf that becomes a channel loses its curve with its queue. */
+	assert(!red_good(dev, on1));
+	assert(wred[0][NUM_PQS - 3].set && red_offloaded(dev, on1));
+	assert(!to_inner(dev, 12, 1, 0, 0));
+	assert(!wred[0][NUM_PQS - 3].set && !wred[0][NUM_PQS - 1].set);
+	assert(red(dev, on1, TC_RED_DESTROY, 0, 0, 0, 0, false) == -EOPNOTSUPP);
+
+	/* A destroy of a curve that is running takes it off. */
+	assert(!red_good(dev, on12));
+	clears = wred_clears;
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	assert(wred_clears == clears + 1 && !wred[0][NUM_PQS - 1].set);
+	assert(!red_offloaded(dev, on12));
+
+	/* `tc qdisc replace' of one RED qdisc by another on the same class
+	 * creates the new one before it destroys the old one. The old one's
+	 * destroy leaves the new curve running, and the old one never reports
+	 * the new curve as its own. */
+	assert(!red_good(dev, on12));
+	red_qdisc = TC_H_MAKE(21u << 16, 0);
+	assert(!red(dev, on12, TC_RED_REPLACE, 2000, 8000, 1u << 26, 32000, false));
+	assert(red_offloaded(dev, on12));
+	red_qdisc = RED_QDISC;
+	assert(!red_offloaded(dev, on12));
+	clears = wred_clears;
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	assert(wred_clears == clears && wred[0][NUM_PQS - 1].limit == 32000);
+	/* A replacement refused leaves the running curve for its own qdisc's
+	 * destroy, and the log does not claim tail drop meanwhile; a change
+	 * refused to the qdisc whose curve runs takes it off at once. */
+	red_qdisc = TC_H_MAKE(22u << 16, 0);
+	warnings = 0;
+	assert(red(dev, on12, TC_RED_REPLACE, 2000, 8000, 1u << 26, 16000, true) == -EOPNOTSUPP);
+	assert(warnings == 1 && !strstr(warning, "tail drop"));
+	assert(strstr(warning, "keeps RED qdisc 15's curve"));
+	assert(wred[0][NUM_PQS - 1].set && !red_offloaded(dev, on12));
+	red_qdisc = TC_H_MAKE(21u << 16, 0);
+	assert(red_offloaded(dev, on12));
+	assert(red(dev, on12, TC_RED_REPLACE, 2000, 8000, 1u << 26, 16000, true) == -EOPNOTSUPP);
+	assert(warnings == 2 && strstr(warning, "tail drop"));
+	assert(!wred[0][NUM_PQS - 1].set && !red_offloaded(dev, on12));
+	clears = wred_clears;
+	red_qdisc = TC_H_MAKE(22u << 16, 0);
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	red_qdisc = TC_H_MAKE(21u << 16, 0);
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	assert(wred_clears == clears);
+	/* A replacement that fails after its REPLACE programmed the queue --
+	 * sch_red's qevents or estimator refusing -- is destroyed with the
+	 * qdisc it would have replaced still grafted, and that one gets its
+	 * curve back rather than silently losing it. */
+	red_qdisc = RED_QDISC;
+	assert(!red_good(dev, on12) && wred[0][NUM_PQS - 1].limit == 16000);
+	red_qdisc = TC_H_MAKE(23u << 16, 0);
+	assert(!red(dev, on12, TC_RED_REPLACE, 2000, 8000, 1u << 26, 32000, false));
+	assert(wred[0][NUM_PQS - 1].limit == 32000);
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	assert(!red_offloaded(dev, on12));
+	red_qdisc = RED_QDISC;
+	assert(red_offloaded(dev, on12));
+	assert(wred[0][NUM_PQS - 1].set && wred[0][NUM_PQS - 1].limit == 16000);
+	/* And once the curve is its own again, its destroy takes it off. */
+	clears = wred_clears;
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	assert(wred_clears == clears + 1 && !wred[0][NUM_PQS - 1].set);
+	/* A curve that will not go back leaves tail drop and says so. */
+	assert(!red_good(dev, on12));
+	red_qdisc = TC_H_MAKE(23u << 16, 0);
+	assert(!red(dev, on12, TC_RED_REPLACE, 2000, 8000, 1u << 26, 32000, false));
+	wred_fail = true;
+	warnings = 0;
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
+	wred_fail = false;
+	assert(warnings == 1 && strstr(warning, "tail drop"));
 	assert(!wred[0][NUM_PQS - 1].set);
+	red_qdisc = RED_QDISC;
+	assert(!red_offloaded(dev, on12));
+	assert(!red(dev, on12, TC_RED_DESTROY, 0, 0, 0, 0, false));
 
+	/* Tearing the tree down with a curve still running leaves none behind:
+	 * the RED qdisc's own destroy comes after the tree's. */
+	assert(!red_good(dev, on12));
 	assert(!destroy(dev));
+	assert(!wred[0][NUM_PQS - 1].set);
 	assert_balanced(dev);
 }
 

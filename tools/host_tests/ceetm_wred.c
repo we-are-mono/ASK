@@ -110,12 +110,24 @@ struct qm_ceetm_ccg_params {
 	struct qm_cgr_wr_parm wr_parm_r;
 };
 
-struct qm_ceetm_ccg { int idx; };
+#define DEFAULT_WBFQ_WEIGHT		1
+
+/* Each congestion group remembers whether its curve is on, as the hardware
+ * would, so a test can ask after a whole sequence rather than one call. */
+struct qm_ceetm_ccg { int idx; bool wred_on; };
 struct classque_info {
 	void *ccg;
+	void *cq;
+	uint32_t ceetm_idx;
+	union {
+		uint32_t ch_shaper_enable;
+		uint32_t weight;
+	};
 	uint32_t qdepth;
 };
+struct qm_ceetm_channel { int idx; };
 struct ceetm_chnl_info {
+	struct qm_ceetm_channel *channel;
 	struct classque_info cq_info[MAX_SCHEDULER_QUEUES];
 };
 static struct ceetm_chnl_info qm_chnl_info[CDX_CEETM_MAX_CHANNELS];
@@ -134,8 +146,31 @@ static int qman_ceetm_ccg_set(struct qm_ceetm_ccg *ccg, uint16_t we_mask,
 	last_params = *params;
 	last_mask = we_mask;
 	ccg_set_calls++;
+	/* One curve for every colour, so the three enables move together. */
+	if (we_mask & QM_CCGR_WE_WR_EN_G) {
+		assert(!!(we_mask & QM_CCGR_WE_WR_EN_Y) && !!(we_mask & QM_CCGR_WE_WR_EN_R));
+		assert(params->wr_en_g == params->wr_en_y && params->wr_en_g == params->wr_en_r);
+		ccg->wred_on = params->wr_en_g;
+	}
 	return 0;
 }
+
+/* The scheduler side of configuring and resetting a class queue, which this
+ * file is not about: recorded, and never failing. */
+struct qm_ceetm_weight_code { int code; };
+static int qman_ceetm_ratio2wbfs(uint32_t n, uint32_t d, struct qm_ceetm_weight_code *w,
+				 int roundup)
+{ (void)d; (void)roundup; w->code = (int)n; return 0; }
+static int qman_ceetm_set_queue_weight(void *cq, struct qm_ceetm_weight_code *w)
+{ (void)cq; (void)w; return 0; }
+static int qman_ceetm_channel_set_group_cr_eligibility(struct qm_ceetm_channel *ch, int g, int on)
+{ assert(ch); (void)g; (void)on; return 0; }
+static int qman_ceetm_channel_set_group_er_eligibility(struct qm_ceetm_channel *ch, int g, int on)
+{ assert(ch); (void)g; (void)on; return 0; }
+static int qman_ceetm_channel_set_cq_cr_eligibility(struct qm_ceetm_channel *ch, uint32_t idx, int on)
+{ assert(ch); (void)idx; (void)on; return 0; }
+static int qman_ceetm_channel_set_cq_er_eligibility(struct qm_ceetm_channel *ch, uint32_t idx, int on)
+{ assert(ch); (void)idx; (void)on; return 0; }
 
 /* Frame-mode tail drop, as the leaf class has it without a RED qdisc. */
 static unsigned td_calls;
@@ -264,7 +299,40 @@ int main(void)
 	assert(td_calls == 1 && td_depth == 128);
 	assert(ceetm_clear_class_wred(0, 4, 128) == -ENODEV);
 
+	/* A curve outlives everything that only reconfigures a class queue's
+	 * depth, so the paths that hand a queue to a new class, or back to its
+	 * defaults, have to take it off themselves. A leaf deleted with a RED
+	 * qdisc on it is reset before that qdisc's destroy arrives, and the
+	 * destroy then names a class that is gone. */
+	static struct qm_ceetm_channel channel = { .idx = 0 };
+	struct qm_ceetm_ccg weighted = { .idx = 9 };
+
+	qm_chnl_info[0].channel = &channel;
+	qm_chnl_info[0].cq_info[NUM_PQS + 1].ccg = &weighted;
+	for (ii = 0; ii < 2; ii++) {
+		uint32_t queue = ii ? NUM_PQS + 1 : 3;
+		struct qm_ceetm_ccg *group = qm_chnl_info[0].cq_info[queue].ccg;
+
+		assert(!ceetm_set_class_wred(0, queue, 10000, 40000, 1u << 26, 160000));
+		assert(group->wred_on);
+		assert(!ceetm_reset_class_queue(0, queue));
+		assert(!group->wred_on && td_depth == DEFAULT_CQ_DEPTH);
+		/* And configuring a queue for a class starts it on plain tail
+		 * drop, whatever the previous owner left behind. */
+		assert(!ceetm_set_class_wred(0, queue, 10000, 40000, 1u << 26, 160000));
+		assert(!ceetm_set_class_queue(0, queue, ii ? 4 : 0, 128));
+		assert(!group->wred_on && td_depth == 128);
+	}
+	/* A congestion group that will not take the change is reported. */
+	assert(!ceetm_set_class_wred(0, 3, 10000, 40000, 1u << 26, 160000));
+	ccg_set_fails = true;
+	assert(ceetm_reset_class_queue(0, 3) == -EIO);
+	assert(ceetm_set_class_queue(0, 3, 0, 128) == -EIO);
+	ccg_set_fails = false;
+	assert(ccg.wred_on);
+	assert(!ceetm_reset_class_queue(0, 3) && !ccg.wred_on);
+
 	printf("CEETM WRED: 7 curves encode with their implied minimum back on the "
-	       "one asked for, %u refusals\n", 6u);
+	       "one asked for, %u refusals, and configure and reset take a curve off\n", 6u);
 	return 0;
 }

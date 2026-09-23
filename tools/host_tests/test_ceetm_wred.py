@@ -14,7 +14,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def function(source, name):
-    match = re.search(r"^(?:static )?[^\n]+\b" + name + r"\([^;]*?\)\s*\{", source, re.M)
+    # The line has to begin with a return type, not with the ` * ' of a comment
+    # continuation: a comment naming `foo()' above the definition of foo would
+    # otherwise be lifted instead.
+    match = re.search(r"^(?:static\s+)?\w[\w \*]*\b" + name + r"\([^;]*?\)\s*\{", source, re.M)
     assert match, name
     end, depth = match.end(), 1
     while depth:
@@ -27,8 +30,9 @@ def test_ceetm_wred_curve(tmp_path):
     compiler = os.environ.get("CC", "cc")
     assert shutil.which(compiler), f"C compiler required: {compiler}"
     source = (ROOT / "cdx/cdx_ceetm_app.c").read_text()
-    names = ["ceetm_wred_maxth", "ceetm_wred_slope",
-             "ceetm_set_class_wred", "ceetm_clear_class_wred"]
+    names = ["ceetm_cq_wred_off", "ceetm_wred_maxth", "ceetm_wred_slope",
+             "ceetm_set_class_wred", "ceetm_clear_class_wred",
+             "ceetm_set_class_queue", "ceetm_reset_class_queue"]
     (tmp_path / "wred_production.inc").write_text(
         "#define CEETM_WRED_MAXP_UNITS\t256u\n"
         + "\n".join(function(source, name) for name in names))

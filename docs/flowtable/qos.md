@@ -803,11 +803,49 @@ regress, because nothing used it.
 `TC_SETUP_QDISC_RED`. It is the only vocabulary in tc for what the congestion
 group does, it ships everywhere, and sch_red hands the driver the class the
 qdisc was grafted under — which is exactly the class queue whose congestion
-group it configures. A RED qdisc anywhere else is refused rather than quietly
-kept in software, because an offloaded flow would never reach it.
+group it configures. A RED qdisc anywhere else is not offloaded, because an
+offloaded flow would never reach it: `tc qdisc show` omits `offloaded` for it
+and the kernel log says why. "Anywhere else" includes a RED grafted one level
+further down — under a qdisc that sits on a leaf — whose parent carries that
+qdisc's major and a minor the tree may also use; the major is checked before
+the minor is looked up, so it cannot program a class queue it does not sit on.
 
-ECN is refused too. This hardware drops; it cannot mark. Accepting `ecn` would
-answer a request to mark by dropping instead.
+ECN is not offloaded either. This hardware drops; it cannot mark. Accepting
+`ecn` would answer a request to mark by dropping instead.
+
+**sch_red ignores the answer, so "not offloaded" has to be made true.** It
+creates or changes the software qdisc whatever the driver returns. So a
+refused or failed `REPLACE` also takes away the curve the class already had —
+otherwise `tc qdisc change` to a refused setting would leave the old curve
+running under a qdisc showing the new one — and the class queue goes back to
+its frame-counted tail drop. The statistics call is what sets tc's `offloaded`
+flag, and it answers only for a class whose curve the hardware took; it
+reports no hardware counters, because what the class queue dropped for an
+offloaded flow never reached the qdisc. Those are in `ethtool -S`, as the
+leaf's rejected frames.
+
+The running curve is recorded with the handle of the RED qdisc it came from,
+and only that qdisc's change, statistics call or destroy acts on it.
+`tc qdisc replace` of one RED qdisc by another creates the new one — whose
+`REPLACE` programs the class queue — before it destroys the old one, and the
+old one's destroy names the same class; answering it by class would take the
+new curve off and leave the new qdisc reporting a curve the hardware no longer
+runs. A replacement that is refused leaves the old curve in place until the old
+qdisc's destroy, which follows, and the kernel log says which qdisc's curve the
+queue keeps. The curve a replacement displaced is remembered until the
+displaced qdisc's destroy: a replacement that fails after its `REPLACE`
+programmed the queue — sch_red's qevents or estimator refusing — is destroyed
+first, with the old qdisc still grafted, and the old curve goes back.
+
+**The curve belongs to the class, not to the queue.** Moving a leaf to another
+priority (`tc class change`) moves its curve to the class queue it now holds.
+Deleting a leaf takes the curve off its queue, and so does a last child handing
+its queue back to its parent: sch_htb deletes the class before it destroys the
+RED qdisc on it, so the qdisc's own destroy arrives naming a class that is
+gone. The hardware layer backs that up for every path — configuring a class
+queue for a class, resetting one, and resetting a port all turn the curve off
+— because a curve drawn in bytes left under a tail drop counted in frames is
+something no qdisc describes and nothing would ever take away.
 
 **Converting the curve is the whole of the work.** RED says "start dropping at
 min, reach probability P at max". The CCG says "reach P at MaxTH, getting there

@@ -34,6 +34,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import socket
 import statistics
 import struct
@@ -47,7 +48,7 @@ from ask_orch.client import Agent
 from ask_orch.uart import Console
 from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
 from test_flowtable_offload import (ARTIFACTS, DPORT, TABLE, WAN_IP, command,
-                                    console_command, read, rig)  # noqa: F401
+                                    console_command, console_json, read, rig)  # noqa: F401
 
 # One port per flow, so a conntrack left behind by one case never feeds another.
 # Above the gateway profiles' ranges (49100 and 49200). The devlink file takes
@@ -801,6 +802,89 @@ async def test_flowtable_qos_wred_drops_before_the_tail(qos):
     assert wide["added"] <= 1.3 * delay(WRED_BANDS["wide"][1]) + PROBE_SLACK, wide
     assert wide["added"] >= 0.5 * delay(WRED_BANDS["wide"][0]), wide
     assert narrow["added"] < wide["added"] < tail["added"], phases
+
+
+async def qdisc_shown(r, dev, handle):
+    """One qdisc as `tc -j qdisc show` reports it, found by handle."""
+    shown = console_json((await r.tc("-j", "qdisc", "show", "dev", dev))["stdout"])
+    found = [q for q in shown if q.get("handle") == handle]
+    assert len(found) == 1, (handle, shown)
+    return found[0]
+
+
+async def logged(r, text):
+    """How many kernel log lines contain `text`. A count, so a case compares
+    two reads and a rerun on the same boot starts from wherever the last left."""
+    result = await console_command(r.console, "sh", "-c",
+                                   f"dmesg | grep -cF {shlex.quote(text)}", check=False)
+    return int(result["stdout"].split()[-1])
+
+
+async def test_flowtable_qos_red_reports_what_the_hardware_holds(qos):
+    """A RED qdisc on a leaf reads `offloaded` exactly while its class queue
+    runs the curve, and a refusal says why in the kernel log.
+
+    sch_red keeps whatever `tc` asked for in software whether or not the driver
+    took it, so the flag and the log are the only places a refusal shows. A
+    change to a setting the hardware cannot run -- ECN, since it drops and
+    cannot mark -- has to take the old curve off too, or the queue would run a
+    curve the qdisc no longer shows; the flag clearing is how that reads. The
+    curve follows the class, so moving the class to another priority keeps it
+    offloaded on the queue it moves to. It is the qdisc's, though: a RED
+    replacing another on the class is created before the old one is destroyed,
+    and the old one's destroy leaves the new curve running. And a RED grafted
+    one level further down, under a qdisc that sits on a leaf, names a minor
+    the tree also uses for a leaf; it is not offloaded rather than programming
+    that leaf's queue.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    rate = f"{WRED_MBIT}mbit"
+    low, high = WRED_BANDS["narrow"]
+    curve = ["limit", str(WRED_LIMIT), "min", str(low), "max", str(high), "avpkt", "1500",
+             "burst", str((2 * low + high) // (3 * 1500) + 1),
+             "probability", WRED_PROBABILITY, "bandwidth", rate]
+    # 1:2 is a leaf whose minor a qdisc under another leaf can also name.
+    await tree(r, dev, WRED_MBIT, [("1:10", HIGH_PRIO), ("1:2", LOW_PRIO)])
+
+    async def red(verb, parent, handle, *extra):
+        await r.tc("qdisc", verb, "dev", dev, "parent", parent, "handle", handle, "red",
+                   *curve, *extra)
+
+    ecn_refusals = await logged(r, "RED qdisc 10: not offloaded")
+    await red("add", "1:10", "10:")
+    added = await qdisc_shown(r, dev, "10:")
+    await red("change", "1:10", "10:", "ecn")
+    ecn = await qdisc_shown(r, dev, "10:")
+    ecn_logged = await logged(r, "RED qdisc 10: not offloaded")
+    await red("change", "1:10", "10:")
+    restored = await qdisc_shown(r, dev, "10:")
+    await r.tc("class", "change", "dev", dev, "parent", "1:1", "classid", "1:10",
+               "htb", "rate", rate, "ceil", rate, "prio", "3")
+    moved = await qdisc_shown(r, dev, "10:")
+    # A RED qdisc replaced by another on the same class: the new one is
+    # created, and its curve programmed, before the old one's destroy names
+    # the same class. The curve is the new qdisc's and survives it.
+    await red("replace", "1:10", "40:")
+    swapped = await qdisc_shown(r, dev, "40:")
+    foreign_refusals = await logged(r, "RED qdisc 30: not offloaded")
+    await r.tc("qdisc", "add", "dev", dev, "parent", "1:2", "handle", "20:", "prio")
+    await red("add", "20:2", "30:")
+    foreign = await qdisc_shown(r, dev, "30:")
+    foreign_logged = await logged(r, "RED qdisc 30: not offloaded")
+    r.record("qos-red-offload-state", {"added": added, "ecn": ecn, "restored": restored,
+                                       "moved": moved, "swapped": swapped, "foreign": foreign,
+                                       "logged": [ecn_refusals, ecn_logged,
+                                                  foreign_refusals, foreign_logged]})
+
+    assert added.get("offloaded") is True, added
+    assert not ecn.get("offloaded") and ecn_logged == ecn_refusals + 1, (
+        ecn, ecn_refusals, ecn_logged)
+    assert restored.get("offloaded") is True, restored
+    assert moved.get("offloaded") is True, moved
+    assert swapped.get("offloaded") is True, swapped
+    assert not foreign.get("offloaded") and foreign_logged == foreign_refusals + 1, (
+        foreign, foreign_refusals, foreign_logged)
 
 
 # ---- DSCP -----------------------------------------------------------------

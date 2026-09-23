@@ -532,6 +532,29 @@ static int ceetm_cfg_td_on_class_queue(struct ceetm_chnl_info *chnl_ctx, uint32_
 	return CEETM_SUCCESS;
 }
 
+/* Turn a class queue's WRED curve off, leaving its tail drop as it is.
+ *
+ * Only ceetm_set_class_wred() ever turns a curve on, for a RED qdisc on an HTB
+ * leaf, and the curve survives everything that reconfigures a class queue's
+ * depth: ceetm_cfg_td_on_class_queue() writes the tail-drop fields and nothing
+ * else. So every path that hands a class queue to a new class, or back to its
+ * defaults, turns it off here -- otherwise the next class on the queue inherits
+ * a curve drawn in bytes over a tail drop now counted in frames, which no RED
+ * qdisc describes and nothing will ever take away.
+ */
+static int ceetm_cq_wred_off(struct classque_info *cqinfo)
+{
+	struct qm_ceetm_ccg_params params;
+
+	if (!cqinfo->ccg)
+		return -ENODEV;
+	memset(&params, 0, sizeof(params));
+	if (qman_ceetm_ccg_set(cqinfo->ccg, QM_CCGR_WE_WR_EN_G | QM_CCGR_WE_WR_EN_Y |
+			       QM_CCGR_WE_WR_EN_R, &params))
+		return -EIO;
+	return 0;
+}
+
 static void ceetm_release_fd(struct net_device *net_dev, const struct qm_fd *fd)
 {
 	struct sk_buff *skb;
@@ -1107,7 +1130,15 @@ int ceetm_reset_qos(struct tQM_context_ctl *qm_ctx)
 					}
 				}
 				cqinfo->qdepth = DEFAULT_CQ_DEPTH;
-				ceetm_dbg("%s::resetting que depth on class queue %d\n", __func__, ii); 
+				/* Back to the defaults means no curve either: a
+				 * RED qdisc's own destroy arrives after the tree's,
+				 * finds no qdisc, and so cannot take one off. */
+				if (ceetm_cq_wred_off(cqinfo)) {
+					ceetm_err("%s::cannot turn WRED off on chnl %d cq %d\n",
+						__func__, ii, jj);
+					return CEETM_FAILURE;
+				}
+				ceetm_dbg("%s::resetting que depth on class queue %d\n", __func__, ii);
 				if (ceetm_cfg_td_on_class_queue(qm_channel, jj, cqinfo->qdepth)) {
 					ceetm_err("%s::ceetm_cfg_ccg_to_class_queue failed on chnl %d\n", 
 							__func__, ii);
@@ -1652,19 +1683,13 @@ int ceetm_set_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t min,
  * has without a RED qdisc on it. */
 int ceetm_clear_class_wred(uint32_t channel_num, uint32_t quenum, uint32_t depth)
 {
-	struct qm_ceetm_ccg_params params;
-	struct qm_ceetm_ccg *ccg;
-	uint16_t mask;
+	int rc;
 
 	if (channel_num >= CDX_CEETM_MAX_CHANNELS || quenum >= MAX_SCHEDULER_QUEUES)
 		return -EINVAL;
-	ccg = qm_chnl_info[channel_num].cq_info[quenum].ccg;
-	if (!ccg)
-		return -ENODEV;
-	memset(&params, 0, sizeof(params));
-	mask = QM_CCGR_WE_WR_EN_G | QM_CCGR_WE_WR_EN_Y | QM_CCGR_WE_WR_EN_R;
-	if (qman_ceetm_ccg_set(ccg, mask, &params))
-		return -EIO;
+	rc = ceetm_cq_wred_off(&qm_chnl_info[channel_num].cq_info[quenum]);
+	if (rc)
+		return rc;
 	if (ceetm_cfg_td_on_class_queue(&qm_chnl_info[channel_num], quenum, depth))
 		return -EIO;
 	return 0;
@@ -1770,6 +1795,10 @@ int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight
 	chnl_ctx = &qm_chnl_info[channel_num];
 	cqinfo = &chnl_ctx->cq_info[quenum];
 	ceetm_quenum = cqinfo->ceetm_idx;
+	/* A class queue starts on plain tail drop whoever had it before; a RED
+	 * qdisc on the new class puts its own curve back afterwards. */
+	if (ceetm_cq_wred_off(cqinfo))
+		return -EIO;
 	if (ceetm_cfg_td_on_class_queue(chnl_ctx, quenum, depth))
 		return -EIO;
 	if (weight) {
@@ -1792,10 +1821,14 @@ int ceetm_set_class_queue(uint32_t channel_num, uint32_t quenum, uint32_t weight
 	return 0;
 }
 
-/* Return a class queue to the state ceetm_reset_qos() would leave it in: its
- * default depth, and out of contention for the channel's committed rate. Group
- * eligibility is deliberately left alone -- it belongs to all eight weighted
- * queues, and the surviving ones still want it. */
+/* Return a class queue to the state ceetm_reset_qos() would leave it in: no
+ * WRED curve, its default depth, and out of contention for the channel's
+ * committed rate. Group eligibility is deliberately left alone -- it belongs to
+ * all eight weighted queues, and the surviving ones still want it.
+ *
+ * The curve matters because nothing else will take it off. A leaf deleted with
+ * a RED qdisc on it is deleted before that qdisc is destroyed, and the destroy
+ * then names a class that no longer exists. */
 int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 {
 	struct qm_ceetm_weight_code weight_code;
@@ -1807,6 +1840,8 @@ int ceetm_reset_class_queue(uint32_t channel_num, uint32_t quenum)
 		return -EINVAL;
 	chnl_ctx = &qm_chnl_info[channel_num];
 	cqinfo = &chnl_ctx->cq_info[quenum];
+	if (ceetm_cq_wred_off(cqinfo))
+		ret = -EIO;
 	if (ceetm_cfg_td_on_class_queue(chnl_ctx, quenum, DEFAULT_CQ_DEPTH))
 		ret = -EIO;
 	if (quenum >= NUM_PQS) {

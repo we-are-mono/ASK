@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A253.** A refused RED change left the old curve running under a qdisc showing the new one, stats cleared `offloaded`, and a RED could program an unrelated leaf's queue —
+  fixed (_:/^cdx: make a RED qdisc's offload state what the class queue runs_).
+
 - [x] **A252.** The devlink policers reported their ranges' ceilings until first set, so restoring what `show` reported switched both meters off —
   fixed (_:/^cdx: register the devlink policers with what the meters run_).
 
