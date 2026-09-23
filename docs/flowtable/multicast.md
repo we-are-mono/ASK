@@ -550,6 +550,34 @@ silently. This is a refusal rather than a gap to fill later only because
 filling it means a listener whose egress is the host's own receive queue,
 which nothing in the encoder expresses today. `/proc` says `refused-host`.
 
+**Bridge filtering.** A carried flow is replicated at the classifier, before
+any bridge netfilter hook runs. An nftables `bridge` chain, an ebtables table,
+or `br_netfilter` handing bridged traffic to iptables would stop seeing the
+stream the moment it went into hardware: a drop rule would stop dropping it,
+and a counter would stop counting it. So while any bridge hook is registered
+in the initial namespace at `prerouting`, `forward` or `postrouting`, no
+bridged flow is carried, and installed ones come out. CDX's own hooks do not
+count: the learner's, which only observes, and VWD's, which hands frames bound
+for a Wi-Fi VAP to its fast path and is registered whenever an access point is
+up. Hooks are per namespace, not per bridge, so this applies to every bridge.
+Nothing announces a registered hook, so the worker checks the hook lists at
+every pass, and the refresh runs a pass every five seconds while any flow
+exists. `/proc` says `refused-filter`, and the kernel log says so once each
+time the state changes.
+
+Some hooks never go away once they appear, and keep bridged multicast in
+software for the rest of the boot: `br_netfilter` once loaded (Docker and
+libvirt load it), an ebtables table once anything has listed or used it, and
+an nftables bridge base chain even when it is empty with an accept policy.
+`br_netfilter` counts whether or not `bridge-nf-call-iptables` is set. Its
+per-namespace sysctls live in its own private state and the per-bridge option
+in the bridge's, neither of which a module can read, and its hooks cannot be
+told from an nftables chain at the same priority; the setting also defaults to
+on. A host that wants bridged multicast offloaded unloads it. Hooks the check
+does not see at all: an nftables `netdev` ingress chain and a tc ingress
+filter on a bridge port run before the bridge and are bypassed by a carried
+flow like any other software step.
+
 **The host as a router.** A bridge that is a multicast router for the flow's
 family — `mcast_router 2`, or a query heard from the host itself — hands every
 group to the host as well, and so does a promiscuous one: a bridge has no

@@ -4942,6 +4942,10 @@ static bool ft_mc_stopping;
  * membership to change. Every flow is reconsidered on the next pass,
  * installed ones included. */
 static bool ft_mc_recheck;
+/* A bridge hook other than the learner's own was registered at the worker's
+ * last pass, and no flow may be carried: see ft_mc_bridge_filtered(). Written
+ * by the worker under ft_mc_lock. */
+static bool ft_mc_filtered;
 /* The routes and taps the routed learner publishes, under ft_mc_lock; what
  * each route is told back, under the leaf below. */
 static LIST_HEAD(ft_mc_routes);
@@ -5570,12 +5574,14 @@ static bool ft_mc_host_wants(const struct ft_mc_flow *f)
  * forwarding and the daemon's view of the source. And a flow the bridge
  * forwards nowhere -- every listener is behind the port it arrives on, or
  * blocks its source -- has nothing to replicate: it stays with the bridge,
- * which drops it. */
+ * which drops it. And no flow is carried while a bridge filter hook would see
+ * its frames; see ft_mc_bridge_filtered(). */
 static bool ft_mc_installable(const struct ft_mc_flow *f)
 {
 	const struct ft_mc_route *r = ft_mc_live_route(f);
 
-	return f->derived && f->in && !f->gone && !ft_mc_host_wants(f) &&
+	return !ft_mc_filtered &&
+	       f->derived && f->in && !f->gone && !ft_mc_host_wants(f) &&
 	       (f->ports || r) && (r || !f->routed_host) &&
 	       ft_mc_carriable(f) && ft_mc_mtu_bounded(f);
 }
@@ -6090,6 +6096,61 @@ static struct nf_hook_ops ft_mc_hook_ops = {
 	.priority = NF_BR_PRI_LAST,
 };
 
+/* Whether a bridge hook that could decide a frame's fate is registered in
+ * init_net at any of `hooks`, a mask of NF_BR_* bits. CDX's own are not: the
+ * bridged learner's, which only observes, and VWD's, which hands a frame
+ * bound for a VAP to its fast path and is registered whenever an access point
+ * is up. Asked of the hook lists themselves, which cost a few loads under
+ * RCU: no event says a hook was registered. */
+static bool ft_bridge_hooked(unsigned int hooks)
+{
+#if IS_ENABLED(CONFIG_NETFILTER_FAMILY_BRIDGE)
+	const struct nf_hook_entries *e;
+	struct nf_hook_ops **ops;
+	bool hooked = false;
+	unsigned int i, j;
+
+	rcu_read_lock();
+	/* The array's own bound: it has NF_INET_NUMHOOKS slots, one fewer than
+	 * NF_BR_NUMHOOKS counts, since BROUTING is no netfilter hook. */
+	for (i = 0; i < ARRAY_SIZE(init_net.nf.hooks_bridge) && !hooked; i++) {
+		if (!(hooks & BIT(i)))
+			continue;
+		e = rcu_dereference(init_net.nf.hooks_bridge[i]);
+		if (!e)
+			continue;
+		ops = nf_hook_entries_get_hook_ops(e);
+		for (j = 0; j < e->num_hook_entries; j++)
+			if (ops[j] != &ft_mc_hook_ops &&
+			    !cdx_wifi_owns_hook(ops[j])) {
+				hooked = true;
+				break;
+			}
+	}
+	rcu_read_unlock();
+	return hooked;
+#else
+	return false;
+#endif
+}
+
+/* Whether a bridge hook sees the frames a bridge forwards: at PRE_ROUTING,
+ * FORWARD or POST_ROUTING. An nftables bridge-family chain, an ebtables
+ * table, br_netfilter handing bridged traffic to iptables -- any of them can
+ * drop, count or mark a forwarded frame, and an installed entry replicates at
+ * the classifier where none of them runs. So while one is registered, no
+ * bridged flow is carried.
+ *
+ * The worker asks at every pass, and the refresh runs one every interval
+ * while any flow exists. br_netfilter is counted whatever its call-iptables
+ * settings say, since those are its own and its hooks sit at FORWARD and
+ * POST_ROUTING regardless. */
+static bool ft_mc_bridge_filtered(void)
+{
+	return ft_bridge_hooked(BIT(NF_BR_PRE_ROUTING) | BIT(NF_BR_FORWARD) |
+				BIT(NF_BR_POST_ROUTING));
+}
+
 /* The hook exists only while a membership or a route could name a flow. A box
  * with neither pays the static key in nf_hook_bridge_pre() and nothing else.
  *
@@ -6351,9 +6412,10 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 	 * of those can take a place back: a group every host sends to keeps
 	 * the first eight it saw, and the rest cost a lookup here rather than
 	 * a flow made, asked of the bridge under RTNL and retired again on
-	 * each of their frames. Nor is a place given up while the bridge
-	 * refuses the whole group -- the host joined it, or it floods -- since
-	 * the new source would be refused the same way. */
+	 * each of their frames. Nor is a place given up while the whole group
+	 * is refused -- the host joined it, it floods, or a bridge filter hook
+	 * refuses every flow -- since the new source would be refused the same
+	 * way. */
 	o = NULL;
 	list_for_each_entry(f, &ft_mc_flows, list) {
 		if (f->gone || f->bridge != bridge ||
@@ -6366,7 +6428,8 @@ static void ft_mc_observe(const struct ft_mc_seen *seen)
 			o = f;
 	}
 	if (flows >= FT_MC_MAX_FLOWS) {
-		if (!o || shared || ft_mc_host_joined(bridge, &key) ||
+		if (!o || shared || ft_mc_filtered ||
+		    ft_mc_host_joined(bridge, &key) ||
 		    !ft_mc_source_named(bridge, &key)) {
 			/* Counted once until the group's flows change, which
 			 * the mark on each of them says. */
@@ -6609,19 +6672,33 @@ static void ft_mc_drain(void)
  */
 static void ft_mc_work_fn(struct work_struct *work)
 {
+	bool want_hook, told, derive = false, filtered;
 	struct ft_mc_group *g, *gtmp;
 	struct ft_mc_flow *f, *ftmp;
 	struct ft_mc_route *r;
-	bool want_hook, told, derive = false;
 	LIST_HEAD(dead);
 	LIST_HEAD(gone);
 
-	/* Something outside this learner changed an answer it gave, so every
-	 * refusal is stale. Retries go with it: a flow that failed against a
-	 * port that has since changed is not a flow that cannot be carried. */
-	if (READ_ONCE(ft_mc_recheck)) {
+	/* Something outside this learner changed an answer it gave -- a device
+	 * MTU, or a bridge filter hook registered or gone -- so every answer is
+	 * stale, installed ones included. Retries go with it: a flow that failed
+	 * against a port that has since changed is not a flow that cannot be
+	 * carried. */
+	filtered = ft_mc_bridge_filtered();
+	/* Said once per change: a hook that is never unregistered --
+	 * br_netfilter once loaded, an ebtables table once used -- keeps every
+	 * bridged stream in software for the boot, and without this only /proc
+	 * would say why. */
+	if (filtered != READ_ONCE(ft_mc_filtered)) {
+		if (filtered)
+			pr_info("cdx: a bridge netfilter hook is registered; bridged multicast stays in software while it is\n");
+		else
+			pr_info("cdx: no bridge netfilter hook remains; bridged multicast offload resumes\n");
+	}
+	if (READ_ONCE(ft_mc_recheck) || filtered != READ_ONCE(ft_mc_filtered)) {
 		WRITE_ONCE(ft_mc_recheck, false);
 		mutex_lock(&ft_mc_lock);
+		WRITE_ONCE(ft_mc_filtered, filtered);
 		list_for_each_entry(f, &ft_mc_flows, list) {
 			f->retries = 0;
 			f->stale = true;
@@ -7442,7 +7519,10 @@ static const char *ft_mc_state(const struct ft_mc_flow *f)
 	/* Before "installed", deliberately: a flow whose answer has just
 	 * changed is still in the table for one more worker pass, and what an
 	 * operator needs to read in that window is the reason it is about to
-	 * come out. */
+	 * come out. A bridge filter hook first: it refuses every flow, and
+	 * removing it is what would let this one in. */
+	if (ft_mc_filtered)
+		return "refused-filter";
 	if (ft_mc_host_wants(f))
 		return "refused-host";
 	/* The host routes this stream and no route of it can ride the flow. */

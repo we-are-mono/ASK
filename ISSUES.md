@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A271.** Bridged multicast in hardware bypassed bridge netfilter (nftables bridge chains, ebtables, br_netfilter), so a drop rule stopped applying once a flow was offloaded —
+  fixed (_:/^flowtable: keep bridged multicast in software while a bridge hook filters_).
+
 - [x] **A270.** A port moved straight to another bridge kept its memberships, a reference and a listener, on the bridge it left —
   fixed (_:/^flowtable: drop a port's memberships on the bridge it leaves_).
 

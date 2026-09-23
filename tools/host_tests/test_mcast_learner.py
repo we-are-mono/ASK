@@ -402,7 +402,7 @@ def test_a_flow_that_would_fragment_stays_in_software():
     # And the recheck it causes reaches installed flows too, which a
     # membership event never would.
     worker = function(source, "ft_mc_work_fn")
-    recheck = worker[worker.index("if (READ_ONCE(ft_mc_recheck))"):]
+    recheck = worker[worker.index("if (READ_ONCE(ft_mc_recheck) ||"):]
     recheck = recheck[:recheck.index("mutex_unlock(&ft_mc_lock);")]
     assert "f->stale = true;" in recheck and "f->hw" not in recheck
 
@@ -466,6 +466,40 @@ def test_a_stream_the_parser_never_classifies_is_not_learned():
     record = hook.index("ft_mc_record(&seen);")
     assert hook.index("if (iph->ttl <= 1)\n\t\t\treturn NF_ACCEPT;") < record
     assert hook.index("if (ip6h->hop_limit <= 1)\n\t\t\treturn NF_ACCEPT;") < record
+
+
+def test_a_bridge_filter_hook_keeps_bridged_multicast_in_software(tmp_path):
+    """An installed flow replicates at the classifier, where no bridge hook
+    runs: an nftables bridge chain, ebtables, or br_netfilter handing bridged
+    traffic to iptables would stop seeing the stream the moment it was
+    carried. So while any hook but the learner's own is registered where a
+    forwarded frame passes, every flow is refused, installed ones included,
+    and the worker asks at every pass because nothing announces a hook."""
+    source = SOURCE.read_text()
+    (tmp_path / "mcast_bridge_filter.inc").write_text(
+        function(source, "ft_bridge_hooked") + function(source, "ft_mc_bridge_filtered"))
+    binary = tmp_path / "mcast_bridge_filter"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1",
+        "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("mcast_bridge_filter.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
+
+    worker = function(source, "ft_mc_work_fn")
+    asked = worker.index("filtered = ft_mc_bridge_filtered();")
+    assert asked < worker.index("ft_mc_drain();")
+    changed = worker[asked:worker.index("ft_mc_drain();")]
+    assert "filtered != READ_ONCE(ft_mc_filtered)" in changed
+    assert "f->stale = true;" in changed and "f->retries = 0;" in changed
+    assert "!ft_mc_filtered" in function(source, "ft_mc_installable")
+    assert 'return "refused-filter";' in function(source, "ft_mc_state")
+    # Nothing gives up a place for a source the filter would refuse too.
+    assert "ft_mc_filtered" in function(source, "ft_mc_observe")
 
 
 def test_a_failed_install_is_tried_again_an_interval_apart():

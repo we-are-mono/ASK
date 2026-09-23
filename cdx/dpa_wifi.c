@@ -39,6 +39,7 @@
 #include "dpa_wifi.h"
 #include "layer2.h"
 #include "cdx.h"
+#include "cdx_wifi_backend.h"
 #include "procfs.h"
 
 //uncomment to allow debug prints
@@ -213,6 +214,15 @@ static struct nf_hook_ops vwd_hook_bridge = {
 	.hooknum = NF_BR_PRE_ROUTING,
 	.priority = NF_BR_PRI_FIRST,
 };
+
+/* See cdx_wifi_backend.h. Compared by identity, which a registered hook's
+ * orig_ops keeps. */
+bool cdx_wifi_owns_hook(const struct nf_hook_ops *ops)
+{
+	return ops == &vwd_hook || ops == &vwd_hook_ipv6 ||
+	       ops == &vwd_hook_bridge;
+}
+EXPORT_SYMBOL_NS_GPL(cdx_wifi_owns_hook, ASK_CDX_FLOWTABLE);
 /* In case VWD OFFLOAD , headers can be added in ucode, and the length of the 
 	 original buffer can be increased. And this increased length is written from 
 	 fixed offset (192) for packets coming from OH port causing headers to grow at tail.

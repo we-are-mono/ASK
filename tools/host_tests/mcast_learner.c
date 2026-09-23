@@ -139,6 +139,9 @@ static LIST_HEAD(ft_mc_groups);
 static LIST_HEAD(ft_mc_flows);
 static unsigned int ft_mc_count, ft_mc_flow_count;
 static unsigned long long ft_mc_refused;
+/* What the worker last found of the bridge filter hooks; the cases set it
+ * as the worker would. */
+static bool ft_mc_filtered;
 /* Read only by the worker and /proc, neither of which is compiled here. */
 __attribute__((unused)) static unsigned int ft_mc_installed;
 __attribute__((unused)) static unsigned long long ft_mc_install_errors;
@@ -1894,6 +1897,49 @@ static void replayed_memberships(void)
     assert(!ft_mc_find(&BR, &port_group.group));
 }
 
+static void a_bridge_filter_refuses_every_flow(void)
+{
+    const uint32_t G = 0x180007ef, S = 0x0100000a;
+    struct br_ip any = group_v4(G, 0, 0);
+    struct br_ip named = group_v4(G, htonl(0x0a0000ff), 0);
+    struct ft_mc_flow *f;
+
+    /* An nftables bridge chain appears while a flow is carried. The worker
+     * finds it and marks every flow for the install pass, which takes the
+     * carried one out: its frames reach the chain again. The flow stays,
+     * and says why. When the chain goes, it goes back in. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    answer(&P1, S, 0, 0, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && !strcmp(ft_mc_state(f), "installed"));
+    ft_mc_filtered = true;
+    f->stale = true;
+    pass();
+    assert(!f->hw && !ft_mc_installable(f));
+    assert(!strcmp(ft_mc_state(f), "refused-filter"));
+    ft_mc_filtered = false;
+    f->stale = true;
+    pass();
+    assert(f->hw && !strcmp(ft_mc_state(f), "installed"));
+
+    /* And no place is given up for a source the filter would refuse too,
+     * however it is named. */
+    reset();
+    assert(ft_mc_membership(&BR, &P2, &any, true, false));
+    assert(ft_mc_membership(&BR, &P3, &named, true, false));
+    for (uint32_t i = 0; i < FT_MC_MAX_FLOWS; i++)
+        see(seen_v4(&BR, &P1, G, htonl(0x0a000001 + i), 0, false, SENDER));
+    ft_mc_filtered = true;
+    see(seen_v4(&BR, &P1, G, htonl(0x0a0000ff), 0, false, SENDER));
+    assert(!flow(&P1, htonl(0x0a0000ff), 0) && ft_mc_refused == 1);
+    list_for_each_entry(f, &ft_mc_flows, list)
+        assert(!f->gone);
+    ft_mc_filtered = false;
+}
+
 static void a_port_moves_between_bridges(void)
 {
     const uint32_t G = 0x170007ef, S = 0x0100000a;
@@ -2124,6 +2170,7 @@ int main(void)
     devices_and_bridges_change();
     rows_speak_for_memberships();
     replayed_memberships();
+    a_bridge_filter_refuses_every_flow();
     a_port_moves_between_bridges();
     idle_flows_age_out();
 

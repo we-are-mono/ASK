@@ -113,4 +113,14 @@ void cdx_wifi_vap_del(struct cdx_wifi_vap **vap);
  */
 u16 cdx_wifi_vap_id(const struct cdx_wifi_vap *vap);
 
+struct nf_hook_ops;
+
+/* Whether a netfilter hook is one of VWD's own: the IPv4, IPv6 and bridge
+ * PRE_ROUTING hooks that hand a frame bound for a VAP to its fast path, and
+ * are registered while any VAP is open. They decide no policy, so a caller
+ * asking whether some filter could see a frame -- the multicast learners do,
+ * before carrying a stream past every hook -- does not count them.
+ */
+bool cdx_wifi_owns_hook(const struct nf_hook_ops *ops);
+
 #endif
