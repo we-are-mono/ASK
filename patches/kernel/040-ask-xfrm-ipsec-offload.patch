@@ -1,4 +1,4 @@
-From fecc770296900543254ec5e8eebfa72dc76e131e Mon Sep 17 00:00:00 2001
+From 0a413f414b5a7475e4ea239dd6063f10b2931a7a Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -55,10 +55,10 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/xfrm_device.c                        |  24 +
  net/xfrm/xfrm_input.c                         |  21 +
  net/xfrm/xfrm_output.c                        | 354 +++++++
- net/xfrm/xfrm_policy.c                        |  90 ++
+ net/xfrm/xfrm_policy.c                        |  87 ++
  net/xfrm/xfrm_state.c                         | 236 +++++
  net/xfrm/xfrm_user.c                          |   4 +
- 20 files changed, 2041 insertions(+), 17 deletions(-)
+ 20 files changed, 2038 insertions(+), 17 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -2197,7 +2197,7 @@ index a5b5d82bd755..2bce33d6e2f9 100644
  	WARN_ON_ONCE(1);
  	return -EAFNOSUPPORT;
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index e033390e7785..40e367641f53 100644
+index e033390e7785..152ae1ec8617 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
 @@ -48,6 +48,11 @@
@@ -2282,7 +2282,7 @@ index e033390e7785..40e367641f53 100644
  ok:
  	xfrm_pols_put(pols, drop_pols);
  	if (dst && dst->xfrm &&
-@@ -3847,6 +3893,31 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+@@ -3847,6 +3893,28 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
  			goto reject;
  		}
  
@@ -2304,9 +2304,6 @@ index e033390e7785..40e367641f53 100644
 +			}
 +		}
 +
-+		/* Hub and spoke changes: Setting the POLICY_IN direction in the packet */
-+		skb->ipsec_xfrm_dir |= (1 << XFRM_POLICY_IN);
-+
 +std_path:
 +#endif
 +#endif
@@ -2314,7 +2311,7 @@ index e033390e7785..40e367641f53 100644
  out:
  		xfrm_pols_put(pols, npols);
  		sp->verified_cnt = k;
-@@ -4321,6 +4392,14 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4321,6 +4389,14 @@ static int __net_init xfrm_net_init(struct net *net)
  	if (rv < 0)
  		goto out_sysctl;
  
@@ -2329,7 +2326,7 @@ index e033390e7785..40e367641f53 100644
  	rv = xfrm_nat_keepalive_net_init(net);
  	if (rv < 0)
  		goto out_nat_keepalive;
-@@ -4328,6 +4407,12 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4328,6 +4404,12 @@ static int __net_init xfrm_net_init(struct net *net)
  	return 0;
  
  out_nat_keepalive:
@@ -2342,7 +2339,7 @@ index e033390e7785..40e367641f53 100644
  	xfrm_sysctl_fini(net);
  out_sysctl:
  	xfrm_policy_fini(net);
-@@ -4342,6 +4427,11 @@ static int __net_init xfrm_net_init(struct net *net)
+@@ -4342,6 +4424,11 @@ static int __net_init xfrm_net_init(struct net *net)
  static void __net_exit xfrm_net_exit(struct net *net)
  {
  	xfrm_nat_keepalive_net_fini(net);

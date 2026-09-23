@@ -1,4 +1,4 @@
-From 9276ee31aaceb5f992c9fdd941fc35bc9ea126d5 Mon Sep 17 00:00:00 2001
+From faf65e8faecc5d5144f6b9710f2bf92314d648fb Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 03:51:31 +0200
 Subject: [PATCH] ask: FMAN/DPAA EHASH foundation for fast-path offload
@@ -13,7 +13,7 @@ sdk_dpaa, sdk_fman, drivers/staging/fsl_qbman) with ASK-specific
 EHASH extensions for hardware packet classification, declares
 the master CONFIG_CPE_FAST_PATH Kconfig in net/Kconfig, and extends the
 core kernel with the skb fields (abm_ff, expt_pkt, iif_index,
-underlying_iif/vlan_tci, ipsec_offload, ipsec_xfrm_dir) and
+underlying_iif/vlan_tci, ipsec_offload) and
 netdevice/net_device fields (wifi_offload_dev) plus the dev_queue_xmit
 hook infrastructure (dpaa_wifi_xmit_local_ipsec_handler,
 dpa_register_wifi_xmit_local_hook, original_dev_queue_xmit,
@@ -152,7 +152,7 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  include/linux/fsl_oh_port.h                   |   26 +
  include/linux/fsl_qman.h                      |    6 +
  include/linux/netdevice.h                     |   43 +
- include/linux/skbuff.h                        |   12 +
+ include/linux/skbuff.h                        |   11 +
  .../uapi/linux/fmd/Peripherals/fm_ioctls.h    |   28 +
  .../linux/fmd/Peripherals/fm_pcd_ioctls.h     |   57 +-
  .../linux/fmd/Peripherals/fm_port_ioctls.h    |   18 +-
@@ -162,8 +162,8 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/core/dev.c                                |  101 +-
  net/core/gro.c                                |    5 +
  net/core/rtnetlink.c                          |   19 +
- net/core/skbuff.c                             |   35 +-
- 81 files changed, 9340 insertions(+), 5161 deletions(-)
+ net/core/skbuff.c                             |   34 +-
+ 81 files changed, 9338 insertions(+), 5161 deletions(-)
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_cc_dbg.h
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/Peripherals/FM/Pcd/fm_ehash.c
  create mode 100644 drivers/net/ethernet/freescale/sdk_fman/inc/Peripherals/fm_eh_types.h
@@ -18331,7 +18331,7 @@ index ea9b40b196de..c658c038556d 100644
  #define DEV_STATS_INC(DEV, FIELD) atomic_long_inc(&(DEV)->stats.__##FIELD)
  #define DEV_STATS_ADD(DEV, FIELD, VAL) 	\
 diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-index 107a8c3ff07f..8b050be52ac9 100644
+index 107a8c3ff07f..956bc8ad25dd 100644
 --- a/include/linux/skbuff.h
 +++ b/include/linux/skbuff.h
 @@ -1028,6 +1028,13 @@ struct sk_buff {
@@ -18348,13 +18348,12 @@ index 107a8c3ff07f..8b050be52ac9 100644
  	__u32			hash;
  	union {
  		u32		vlan_all;
-@@ -1051,6 +1058,11 @@ struct sk_buff {
+@@ -1051,6 +1058,10 @@ struct sk_buff {
  		__u32		reserved_tailroom;
  	};
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 +	__u16			ipsec_offload;
-+	__u16			ipsec_xfrm_dir;
 +#endif
 +
  	union {
@@ -18787,16 +18786,15 @@ index 625f273aeeed..a13e87558d0e 100644
  
  	if (!valid) {
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index dcb5d025dc08..b682f42a5a39 100644
+index dcb5d025dc08..cef20afbc891 100644
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -1535,12 +1535,23 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+@@ -1535,12 +1535,22 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
  	 */
  	new->queue_mapping = old->queue_mapping;
  
 +#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
 +	new->ipsec_offload       = old->ipsec_offload;
-+	new->ipsec_xfrm_dir      = old->ipsec_xfrm_dir;
 +#endif
  	memcpy(&new->headers, &old->headers, sizeof(new->headers));
  	CHECK_SKB_FIELD(protocol);
@@ -18814,7 +18812,7 @@ index dcb5d025dc08..b682f42a5a39 100644
  	CHECK_SKB_FIELD(vlan_proto);
  	CHECK_SKB_FIELD(vlan_tci);
  	CHECK_SKB_FIELD(transport_header);
-@@ -6157,7 +6168,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+@@ -6157,7 +6167,29 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
  	skb->skb_iif = 0;
  	skb->ignore_df = 0;
  	skb_dst_drop(skb);
