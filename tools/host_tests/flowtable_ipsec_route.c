@@ -58,6 +58,8 @@ struct iphdr { int tos; };
 static struct iphdr header;
 static struct dst_entry *reverse_dst;
 static int walks[2];
+/* The direction whose bridge port is not forwarding, or -1. */
+static int stopped_dir = -1;
 static struct net_device logical_lan = { 281 }, physical_lan = { 3 }, wan = { 4 };
 
 #define dst_xfrm(dst) ((dst)->xfrm)
@@ -82,15 +84,19 @@ static void nf_route(void *net, struct dst_entry **dst, struct flowi *fl,
 	if (*dst)
 		(*dst)->refs++;
 }
-static void nft_dev_forward_path(struct nf_flow_route *route,
-				 const struct nf_conn *ct,
-				 enum ip_conntrack_dir dir,
-				 struct nft_flowtable *ft)
+static int nft_dev_forward_path(struct nf_flow_route *route,
+				const struct nf_conn *ct,
+				enum ip_conntrack_dir dir,
+				struct nft_flowtable *ft)
 {
 	/* Generic neighbour walking cannot resolve an XFRM outer peer from the
 	 * inner tuple. Calling it on that direction is itself a regression. */
 	assert(route->tuple[dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH);
 	walks[dir]++;
+	/* The bridge refuses a port that is not forwarding outright; nothing
+	 * of this direction's path is filled in. */
+	if ((int)dir == stopped_dir)
+		return -EAGAIN;
 	if (route->tuple[dir].dst->dev == &logical_lan) {
 		route->tuple[!dir].in.ifindex = physical_lan.ifindex;
 		route->tuple[!dir].in.num_encaps = 1;
@@ -98,6 +104,7 @@ static void nft_dev_forward_path(struct nf_flow_route *route,
 	}
 	if (!ft->data.use_neigh)
 		route->tuple[dir].xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+	return 0;
 }
 
 #include "route_production.inc"
@@ -113,14 +120,16 @@ static void check_route(int family, enum ip_conntrack_dir dir,
 	struct nf_conn ct = {};
 	struct nf_flow_route route = {};
 	bool any_xfrm = this_xfrm || other_xfrm;
+	bool walk_this = !this_xfrm && (use_neigh || !any_xfrm);
+	bool walk_other = !other_xfrm && (use_neigh || !any_xfrm);
 
 	memset(walks, 0, sizeof(walks));
 	reverse_dst = &there;
 	assert(nft_flow_route(&pkt, &ct, &route, dir, &ft) == 0);
 	assert(route.tuple[dir].dst == &here && route.tuple[!dir].dst == &there);
 	assert(here.refs == 2 && there.refs == 2);
-	assert(walks[dir] == (!this_xfrm && (use_neigh || !any_xfrm)));
-	assert(walks[!dir] == (!other_xfrm && (use_neigh || !any_xfrm)));
+	assert(walks[dir] == walk_this);
+	assert(walks[!dir] == walk_other);
 	if (walks[!dir]) {
 		assert(route.tuple[dir].in.ifindex == physical_lan.ifindex);
 		assert(route.tuple[dir].in.num_encaps == 1);
@@ -137,6 +146,32 @@ static void check_route(int family, enum ip_conntrack_dir dir,
 	dst_release(route.tuple[dir].dst);
 	dst_release(route.tuple[!dir].dst);
 	assert(here.refs == 1 && there.refs == 1);
+
+	/* A bridge port that is not forwarding, in either direction, fails the
+	 * whole route: dir is walked first, so its refusal leaves !dir unwalked,
+	 * and both references go back. A direction that is not walked has no
+	 * port to refuse, and the route stands. */
+	for (int side = 0; side < 2; side++) {
+		enum ip_conntrack_dir stopped = side ? !dir : dir;
+		bool refused = stopped == dir ? walk_this : walk_other;
+
+		memset(walks, 0, sizeof(walks));
+		memset(&route, 0, sizeof(route));
+		stopped_dir = stopped;
+		assert(nft_flow_route(&pkt, &ct, &route, dir, &ft) ==
+		       (refused ? -EAGAIN : 0));
+		stopped_dir = -1;
+		if (refused) {
+			assert(walks[dir] == (stopped == dir || walk_this));
+			assert(walks[!dir] == (stopped != dir));
+		} else {
+			assert(walks[dir] == walk_this && walks[!dir] == walk_other);
+			assert(here.refs == 2 && there.refs == 2);
+			dst_release(route.tuple[dir].dst);
+			dst_release(route.tuple[!dir].dst);
+		}
+		assert(here.refs == 1 && there.refs == 1);
+	}
 
 	/* A failed reverse route must release its borrowed forward reference. */
 	reverse_dst = NULL;
