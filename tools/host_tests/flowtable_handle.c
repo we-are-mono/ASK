@@ -86,7 +86,13 @@ static struct flow_offload_tuple_rhash *rhashtable_lookup(struct rhashtable *tab
                                                         struct flow_offload_tuple *tuple, int params)
 { return table->slots[tuple->dir]; }
 static unsigned flow_offload_get_timeout(struct flow_offload *flow) { return 100; }
-static void nf_ct_offload_timeout(struct nf_conn *ct) { assert(ct->refs); }
+#define NF_CT_DAY 86400
+static unsigned refreshes, extensions;
+static void nf_ct_refresh(struct nf_conn *ct, const void *skb, unsigned extra)
+{ assert(ct->refs && !skb && extra == NF_CT_DAY); refreshes++; }
+/* The GC extends a live flow's conntrack on every pass, and never one it is
+ * tearing down: that one's timeout was just handed back to conntrack. */
+static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct) { assert(ct->refs); extensions++; }
 static bool nf_ct_is_dying(struct nf_conn *ct) { return ct->dying; }
 static void nf_ct_put(struct nf_conn *ct) { assert(ct->refs); ct->refs--; }
 static bool nf_flowtable_hw_offload(struct nf_flowtable *table) { return table->hardware; }
@@ -125,10 +131,12 @@ int main(void)
     /* Non-opted-in tables allocate no handle, even under allocation pressure. */
     allocation_fail = true;
     assert(flow_offload_add(&table, flow) == 0 && !flow->hw_handle && allocations == 1);
+    assert(refreshes == 1);
     allocation_fail = false;
     assert(!flow_offload_hw_invalid(flow) && flow_offload_lookup(&table, &key[0]));
     expired = true; nf_flow_offload_gc_step(&table, flow, NULL); expired = false;
-    assert(!ct.refs && !table.rhashtable.slots[0]); grace_period(); assert(!allocations);
+    assert(!ct.refs && !table.rhashtable.slots[0] && !extensions);
+    grace_period(); assert(!allocations);
 
     table.use_hw_handles = table.hardware = true;
     flow = new_flow(&ct); allocation_fail = true;
@@ -146,7 +154,7 @@ int main(void)
     nf_flow_offload_handle_get(old); nf_flow_offload_handle_get(old);
     assert(old->refs == 3 && nf_flow_offload_handle_valid(old));
     for (unsigned i = 0; i < 2; i++) assert(flow_offload_lookup(&table, &key[i]) == &flow->tuplehash[i]);
-    nf_flow_offload_gc_step(&table, flow, NULL); assert(stats == 1 && !deletes);
+    nf_flow_offload_gc_step(&table, flow, NULL); assert(stats == 1 && !deletes && extensions == 1);
     assert(nf_flow_offload_handle_invalidate(old));
     assert(!nf_flow_offload_handle_invalidate(old));
     for (unsigned i = 0; i < 2; i++) assert(!flow_offload_lookup(&table, &key[i]));
@@ -154,7 +162,8 @@ int main(void)
     nf_flow_offload_gc_step(&table, flow, NULL); assert(deletes == 1);
     set_bit(NF_FLOW_HW_DEAD, &flow->flags);
     nf_flow_offload_gc_step(&table, flow, NULL);
-    assert(old->refs == 2 && !ct.refs); grace_period(); assert(allocations == 1);
+    assert(old->refs == 2 && !ct.refs && extensions == 1);
+    grace_period(); assert(allocations == 1);
 
     /* A retained old handle owns no Linux flow/route/CT. Reusing the tuple
      * cannot turn a delayed invalidation into an operation on the new flow. */

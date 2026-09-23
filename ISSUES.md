@@ -152,19 +152,25 @@ result independently of those temporary files.
 
 ## Open
 
-- [ ] **A195 — an offloaded flow's conntrack can expire underneath it.** Linux
-  6.12 re-extends an offloaded ct's timeout only from conntrack's own
-  gc_worker (`nf_ct_offload_timeout()`, `net/netfilter/nf_conntrack_core.c`),
-  on that worker's adaptive schedule. A packet that still passes conntrack
-  after admission (kprobes caught one 20 ms in, status already `IPS_OFFLOAD`)
-  resets `ct->timeout` to the protocol timeout, 30 s for UDP; if gc_worker does
-  not revisit in time the ct expires, the next table walk (`conntrack -L/-D`,
-  `nf_ct_gc_expired`) evicts it, and flowtable GC retires the live hardware
-  flow as `gc_dying`. Seen as intermittent
-  `test_flowtable_service_ipsec_admission_churn` failures (2 of 4 same-boot
-  reruns). Upstream moved the extension into the flowtable GC
-  (`nf_flow_table_extend_ct_timeout()`, every pass; present in the 6.18 tree);
-  backport it as a kernel patch.
+- [ ] **A197 — two later upstream flowtable lifetime fixes are not in the
+  tree.** 2014ac62df9d ("netfilter: flowtable: publish GC-visible tuple
+  last"): `flow_offload_add()` publishes the ORIGINAL tuple, the one the GC
+  walk treats as owning the flow, before the REPLY one, so the GC can free a
+  flow still being inserted (KASAN use-after-free in the rhashtable path).
+  e75a9fa1d44b ("netfilter: flowtable: hold reference on ct until flow is
+  released"): `nf_ct_put()` frees ct->ext at once while the datapath may still
+  reach the conntrack through the flow until the RCU grace period. Both touch
+  `net/netfilter/nf_flow_table_core.c` where patches 141-144 sit; backport them
+  into a patch after 144.
+
+- [ ] **A196 — oversized multicast replicas are fragmented by the microcode.**
+  A multicast member's entry has no preemptive-check op
+  (`fill_mcast_member_actions()` in `cdx/cdx_ehash.c` starts from a fresh
+  `ins_entry_info`, so `seal_preemptive_checks_hm()` returns early), and its
+  `ENQUEUE_PKT` fragments any replica over the member's MTU. Linux's ip6mr
+  never fragments a forwarded IPv6 replica (Packet Too Big, dropped) and ipmr
+  drops an IPv4 DF one. Needs a member-MTU admission bound or an exception
+  path for replicas.
 
 - [ ] **A194 — cdx and the kernel patches still carry CMM's control plane.**
   Retiring CMM left dead code behind, kept deliberately while the cmm/, fci/
@@ -341,6 +347,9 @@ Closed items, one line each. Detail lives in the referenced commit and in this
 file's git history.
 
 ## Gating
+
+- [x] **A195.** An offloaded flow's conntrack could expire under it (only gc_worker extended it) —
+  fixed (_:/^flowtable: extend offloaded conntrack timeouts from the flowtable GC_).
 
 - [x] **A190.** IPsec skipped the opposite LAN bridge/VLAN path and prevented flow offload —
   fixed (_:/^flowtable: resolve bridged LAN paths beside IPsec_).

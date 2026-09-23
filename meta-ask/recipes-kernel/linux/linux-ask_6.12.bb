@@ -86,6 +86,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://141-ask-flowtable-teardown-attribution.patch \
            file://142-ask-flowtable-teardown-handback-once.patch \
            file://143-ask-flowtable-tunnel-path.patch \
+           file://144-ask-flowtable-extend-ct-timeout.patch \
            file://150-sdk_dpaa-hardware-qdisc.patch \
            file://160-bridge-switchdev-mdb-group.patch \
            file://161-bridge-multicast-egress-snapshot.patch \

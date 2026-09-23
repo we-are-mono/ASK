@@ -1,0 +1,232 @@
+From c0635c25c16ee0acb6fcfb04e4b4749e168bccc9 Mon Sep 17 00:00:00 2001
+From: Tomaz Zaman <tomaz@mono.si>
+Date: Wed, 23 Sep 2026 01:01:33 +0200
+Subject: [PATCH] netfilter: flowtable: extend offloaded conntrack timeouts
+ from the GC
+
+Linux 6.12 re-extends an offloaded conntrack only from conntrack's own
+gc_worker, on that worker's adaptive schedule. A packet that still passes
+conntrack after admission resets ct->timeout to the protocol timeout, 30 s
+for unreplied UDP. If gc_worker does not come back in time the conntrack
+expires, the next table walk evicts it, and the flowtable GC then retires
+the live hardware flow as dying.
+
+Backport the upstream rework, which moves the extension into the flowtable
+GC so it runs on every pass (once a second) for every flow that is not
+being torn down:
+
+ - 03428ca5cee9 ("netfilter: conntrack: rework offload nf_conn timeout
+   extension logic"): drop nf_ct_offload_timeout() and gc_worker's
+   IPS_OFFLOAD block, refresh to NF_CT_DAY on admission, add
+   nf_flow_table_extend_ct_timeout(). Hand-applied to the gc_step shape of
+   patch 141; the IPS_OFFLOAD hand-back half is patch 142.
+ - 53b3e60edb67 ("netfilter: flowtable: fix offloaded ct timeout never
+   being extended"): the cmpxchg compared ct->timeout against the
+   relative time left, which never matches, so the extension never
+   happened. Snapshot the absolute deadline instead, and never revive a
+   conntrack that has already expired: lookups skip it, so a new packet
+   would create a duplicate that clashes on confirm.
+
+GRE is admitted to the flowtable in this tree, so it is extended like UDP
+rather than hitting the unknown-protocol WARN. The comment patch 142 left
+in flow_offload_teardown() names the new refresher instead of gc_worker.
+
+Signed-off-by: Tomaz Zaman <tomaz@mono.si>
+---
+ include/net/netfilter/nf_conntrack.h |  10 ---
+ net/netfilter/nf_conntrack_core.c    |   6 --
+ net/netfilter/nf_flow_table_core.c   | 119 ++++++++++++++++++++++++++-
+ 3 files changed, 116 insertions(+), 19 deletions(-)
+
+diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
+index 6bee6dccf84e..1c3b1e0add95 100644
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -369,16 +369,6 @@ static inline bool nf_ct_should_gc(const struct nf_conn *ct)
+ 
+ #define	NF_CT_DAY	(86400 * HZ)
+ 
+-/* Set an arbitrary timeout large enough not to ever expire, this save
+- * us a check for the IPS_OFFLOAD_BIT from the packet path via
+- * nf_ct_is_expired().
+- */
+-static inline void nf_ct_offload_timeout(struct nf_conn *ct)
+-{
+-	if (nf_ct_expires(ct) < NF_CT_DAY / 2)
+-		WRITE_ONCE(ct->timeout, nfct_time_stamp + NF_CT_DAY);
+-}
+-
+ struct kernel_param;
+ 
+ #if defined(CONFIG_CPE_FAST_PATH)
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index cef394777efc..6a2174fd2dd8 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -1514,12 +1514,6 @@ static void gc_worker(struct work_struct *work)
+ 
+ 			tmp = nf_ct_tuplehash_to_ctrack(h);
+ 
+-			if (test_bit(IPS_OFFLOAD_BIT, &tmp->status)) {
+-				nf_ct_offload_timeout(tmp);
+-				if (!nf_conntrack_max95)
+-					continue;
+-			}
+-
+ 			if (expired_count > GC_SCAN_EXPIRED_MAX) {
+ 				rcu_read_unlock();
+ 
+diff --git a/net/netfilter/nf_flow_table_core.c b/net/netfilter/nf_flow_table_core.c
+index 4c8e07a6e4ee..e43ee1b1bd95 100644
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -360,7 +360,7 @@ int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow)
+ 		return err;
+ 	}
+ 
+-	nf_ct_offload_timeout(flow->ct);
++	nf_ct_refresh(flow->ct, NULL, NF_CT_DAY);
+ 
+ 	if (nf_flowtable_hw_offload(flow_table)) {
+ 		__set_bit(NF_FLOW_HW, &flow->flags);
+@@ -412,8 +412,9 @@ void flow_offload_teardown(struct flow_offload *flow)
+ 	 * collector calls this again on every pass while the flow waits for its
+ 	 * hardware retirement, and a tuple reopened in the meantime has already
+ 	 * given the conntrack to a new flow, which the repeat would rob of the
+-	 * only refresh it can get: gc_worker skips conntracks without
+-	 * IPS_OFFLOAD, and the new flow is forwarded in hardware, so no packet
++	 * only refresh it can get: nf_flow_table_extend_ct_timeout() skips
++	 * conntracks without IPS_OFFLOAD, and the new flow is forwarded in
++	 * hardware, so no packet
+ 	 * reaches the software path to set the bit again.
+ 	 */
+ 	if (!test_and_set_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
+@@ -489,6 +490,116 @@ static bool nf_flow_custom_gc(struct nf_flowtable *flow_table,
+ 	return flow_table->type->gc && flow_table->type->gc(flow);
+ }
+ 
++/**
++ * nf_flow_table_tcp_timeout() - new timeout of offloaded tcp entry
++ * @ct:		Flowtable offloaded tcp ct
++ *
++ * Return: number of seconds when ct entry should expire.
++ */
++static u32 nf_flow_table_tcp_timeout(const struct nf_conn *ct)
++{
++	u8 state = READ_ONCE(ct->proto.tcp.state);
++
++	switch (state) {
++	case TCP_CONNTRACK_SYN_SENT:
++	case TCP_CONNTRACK_SYN_RECV:
++		return 0;
++	case TCP_CONNTRACK_ESTABLISHED:
++		return NF_CT_DAY;
++	case TCP_CONNTRACK_FIN_WAIT:
++	case TCP_CONNTRACK_CLOSE_WAIT:
++	case TCP_CONNTRACK_LAST_ACK:
++	case TCP_CONNTRACK_TIME_WAIT:
++		return 5 * 60 * HZ;
++	case TCP_CONNTRACK_CLOSE:
++		return 0;
++	}
++
++	return 0;
++}
++
++/**
++ * nf_flow_table_extend_ct_timeout() - Extend ct timeout of offloaded conntrack entry
++ * @ct:		Flowtable offloaded ct
++ *
++ * Datapath lookups in the conntrack table will evict nf_conn entries
++ * if they have expired.
++ *
++ * Once nf_conn entries have been offloaded, nf_conntrack might not see any
++ * packets anymore.  Thus ct->timeout is no longer refreshed and ct can
++ * be evicted.
++ *
++ * To avoid the need for an additional check on the offload bit for every
++ * packet processed via nf_conntrack_in(), set an arbitrary timeout large
++ * enough not to ever expire, this save us a check for the IPS_OFFLOAD_BIT
++ * from the packet path via nf_ct_is_expired().
++ */
++static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct)
++{
++	static const s32 min_timeout = 5 * 60 * HZ;
++	u32 timeout = READ_ONCE(ct->timeout);
++	s32 expires = timeout - nfct_time_stamp;
++
++	/* normal case: large enough timeout, nothing to do. */
++	if (likely(expires >= min_timeout))
++		return;
++
++	/* already expired: conntrack lookups skip it, so reviving it here
++	 * would let a new packet create a duplicate that clashes with it on
++	 * confirm. Leave it to be reaped.
++	 */
++	if (expires <= 0)
++		return;
++
++	/* must check offload bit after this, we do not hold any locks.
++	 * flowtable and ct entries could have been removed on another CPU.
++	 */
++	if (!refcount_inc_not_zero(&ct->ct_general.use))
++		return;
++
++	/* load ct->status after refcount increase */
++	smp_acquire__after_ctrl_dep();
++
++	if (nf_ct_is_confirmed(ct) &&
++	    test_bit(IPS_OFFLOAD_BIT, &ct->status)) {
++		u8 l4proto = nf_ct_protonum(ct);
++		u32 new_timeout = 1;
++
++		switch (l4proto) {
++		case IPPROTO_UDP:
++		case IPPROTO_GRE:
++			new_timeout = NF_CT_DAY;
++			break;
++		case IPPROTO_TCP:
++			new_timeout = nf_flow_table_tcp_timeout(ct);
++			break;
++		default:
++			WARN_ON_ONCE(1);
++			break;
++		}
++
++		/* Update to ct->timeout from nf_conntrack happens
++		 * without holding ct->lock.
++		 *
++		 * Use cmpxchg to ensure timeout extension doesn't
++		 * happen when we race with conntrack datapath.
++		 *
++		 * The inverse -- datapath updating ->timeout right
++		 * after this -- is fine, datapath is authoritative.
++		 *
++		 * Compare against the absolute deadline read above, not
++		 * the relative time left: the two never match, and the
++		 * extension would silently never happen.
++		 */
++		if (new_timeout) {
++			new_timeout += nfct_time_stamp;
++			cmpxchg(&ct->timeout, timeout, new_timeout);
++		}
++	}
++
++	nf_ct_put(ct);
++}
++
+ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 				    struct flow_offload *flow, void *data)
+ {
+@@ -511,6 +622,8 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
+ 
+ 	if (retire)
+ 		flow_offload_teardown(flow);
++	else if (!test_bit(NF_FLOW_TEARDOWN, &flow->flags))
++		nf_flow_table_extend_ct_timeout(flow->ct);
+ 
+ 	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags)) {
+ 		if (test_bit(NF_FLOW_HW, &flow->flags)) {
+-- 
+2.47.3
+
