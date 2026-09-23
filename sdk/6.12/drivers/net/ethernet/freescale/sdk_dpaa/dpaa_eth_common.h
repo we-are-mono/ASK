@@ -111,6 +111,75 @@ typedef struct qman_fq *(*cdx_get_ceetm_egressfq)(void *, uint32_t chnl_id, uint
 typedef struct qman_fq *(*cdx_get_ceetm_dscp_fq)(void *, uint8_t dscp);
 int dpa_register_ceetm_get_egress_fq(cdx_get_ceetm_egressfq egress_fq_func, cdx_get_ceetm_dscp_fq dscp_fq_func);
 void dpa_unregister_ceetm_get_egress_fq(void);
+
+/* Handler for the netdev's ndo_setup_tc, registered by the offload module
+ * because a built-in driver cannot link against one.
+ *
+ * Registering is not optional once the ndo exists. Netfilter picks its
+ * flowtable binding route on whether the netdev has an ndo_setup_tc at all
+ * (nf_flow_table_offload_setup), so from the moment this driver offers one,
+ * every hardware flowtable bind arrives here instead of through the module's
+ * indirect registration. With no handler those binds are refused, where before
+ * they were served.
+ *
+ * The handler sleeps -- it takes the module's own locks and can wait on RTNL --
+ * so calls are held in an SRCU read-side section, and the unregister returns
+ * only once every call already inside the handler has left it: the module's
+ * text, and anything of its own the handler touches, may go after that.
+ */
+typedef int (*dpa_setup_tc_handler)(struct net_device *dev,
+				    enum tc_setup_type type, void *type_data);
+int dpa_register_setup_tc(dpa_setup_tc_handler handler);
+void dpa_unregister_setup_tc(void);
+
+/* The data-path half of the hardware qdisc, which only the module that hands
+ * out leaf classes can answer.
+ *
+ * select_queue turns a frame into the Tx queue of the leaf class it belongs
+ * to, or DPA_SELECT_QUEUE_NONE when it belongs to none, which leaves the
+ * stack's own choice in place -- folded below the leaf range by the caller,
+ * because real_num_tx_queues covers those queues once a class is using one and
+ * nothing but a named class may be sent there.
+ *
+ * txq_fq then names the CEETM frame queue a frame on that Tx queue leaves by.
+ * For a leaf's queue that is the leaf's class queue: reading the class from
+ * the queue index rather than resolving the mark a second time is what keeps
+ * the software path on the same class the hardware path put the flow on. For
+ * an ordinary queue it is where a frame that named no class goes on a port the
+ * module's tree owns, which the module decides from the frame itself -- so it
+ * is handed the skb. NULL means the module has no tree on the port, and only
+ * then does the driver resolve the frame from its own mark: on a port with a
+ * tree that reading would pick queues the tree never configured.
+ *
+ * class_stats fills the hardware counters for every leaf slot, in slot order,
+ * DPA_CEETM_CLASS_STATS values each, and then for the DPA_CEETM_IMPLICIT_QUEUES
+ * queues traffic that names no leaf takes: the one unclassified traffic goes
+ * to, then the one control traffic goes to. It fills all of them whatever the
+ * tree currently looks like, zeroing what nothing holds, because ethtool's
+ * string set is fixed length: names and values arrive in separate ioctls, so a
+ * count that moved with tc would leave userspace reading one against the other.
+ *
+ * None of the three may sleep. Each is called inside an rcu_read_lock() the
+ * driver takes itself -- ndo_select_queue has callers that hold none, AF_PACKET's
+ * qdisc bypass among them -- and the unregister waits for a grace period, so
+ * the module may free its text and state once it returns. A frame queue txq_fq
+ * answers with has to stay valid for the enqueue that follows, which the
+ * transmit path keeps inside its own read-side section.
+ */
+#define DPA_SELECT_QUEUE_NONE	((u16)~0U)
+/* dequeued frames, dequeued bytes, rejected frames */
+#define DPA_CEETM_CLASS_STATS	3
+/* the unclassified queue, then the control queue, after the leaf slots */
+#define DPA_CEETM_IMPLICIT_QUEUES	2
+struct dpa_qdisc_ops {
+	u16 (*select_queue)(struct net_device *dev, struct sk_buff *skb);
+	struct qman_fq *(*txq_fq)(void *qm_ctx, u16 txq, struct sk_buff *skb);
+	void (*class_stats)(void *qm_ctx, u64 *data);
+};
+void dpa_qdisc_class_stats(void *qm_ctx, u64 *data);
+int dpa_register_qdisc_ops(const struct dpa_qdisc_ops *ops);
+void dpa_unregister_qdisc_ops(void);
+struct qman_fq *dpa_qdisc_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb);
 #endif
 
 

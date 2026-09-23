@@ -33,7 +33,6 @@ SRC_URI += "\
            file://147-netfilter-flowtable-attach-conntrack.patch \
            file://148-netfilter-port-probe.patch \
            file://149-netfilter-ipv6-prefix-translation.patch \
-           file://150-sdk_dpaa-hardware-qdisc.patch \
            file://151-netfilter-flowtable-pppoe-peer.patch \
            file://152-netfilter-nftables-device-hook-transactions.patch \
            file://160-bridge-switchdev-mdb-group.patch \

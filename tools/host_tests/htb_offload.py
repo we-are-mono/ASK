@@ -17,6 +17,13 @@ from _kernel_source import kernel_source
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _dpaa_eth_header():
+    """sdk_dpaa's dpaa_eth.h in the line's SDK copy. Its Tx queue counts are
+    the ones without CONFIG_FMAN_PFC, which ASK's kernel config leaves off."""
+    return (ROOT / "sdk" / kernel_line.current()
+            / "drivers/net/ethernet/freescale/sdk_dpaa/dpaa_eth.h").read_text()
+
+
 def function(source, name):
     # The line has to begin with a word, the return type: a comment line that
     # names `foo()' would otherwise match and run on to the next definition.
@@ -44,12 +51,13 @@ def test_htb_offload(tmp_path):
     backend = (ROOT / "cdx/cdx_flowtable_backend.h").read_text()
     exports = (ROOT / "cdx/cdx_flowtable.h").read_text()
     # The ceilings the tables are sized by: one CEETM instance's channels, and
-    # the direct and leaf-class Tx queues patch 150 gives the netdev.
-    patch = (kernel_line.patches() / "150-sdk_dpaa-hardware-qdisc.patch").read_text()
+    # the direct and leaf-class Tx queues sdk_dpaa's hardware qdisc gives the
+    # netdev.
+    dpaa_eth = _dpaa_eth_header()
     (tmp_path / "htb_limits.inc").write_text(
         re.search(r"^#define\s+CDX_CEETM_MAX_CHANNELS\s.*$",
                   (ROOT / "cdx/cdx_ceetm_app.h").read_text(), re.M).group() + "\n"
-        + "".join(re.search(rf"^\+(#define {name}\s.*)$", patch, re.M).group(1) + "\n"
+        + "".join(re.search(rf"^(#define {name}\s+\d+)\s*$", dpaa_eth, re.M).group(1) + "\n"
                   for name in ("DPAA_ETH_TX_QUEUES", "DPAA_ETH_CEETM_LEAF_QUEUES")))
     # The pools a tree's class queues are budgeted against, as the headers
     # define them, and the hardware layer's own reading of how narrow a WRED
@@ -173,12 +181,12 @@ def test_htb_queue_budget_matches_the_driver(tmp_path):
 
     sch_htb turns the index the driver returns straight into
     netdev_get_tx_queue() with no bounds check, so the budget this file hands
-    out and the headroom patch 150 reserves are one number, not two that happen
-    to agree.
+    out and the headroom sdk_dpaa's hardware qdisc reserves are one number,
+    not two that happen to agree.
     """
-    patch = (kernel_line.patches() / "150-sdk_dpaa-hardware-qdisc.patch").read_text()
-    assert "+#define DPAA_ETH_CEETM_LEAF_QUEUES\t64" in patch
-    assert "+#define DPAA_ETH_TX_QUEUES\t16" in patch
+    dpaa_eth = _dpaa_eth_header()
+    assert re.search(r"^#define DPAA_ETH_CEETM_LEAF_QUEUES\t64$", dpaa_eth, re.M)
+    assert re.search(r"^#define DPAA_ETH_TX_QUEUES\t16$", dpaa_eth, re.M)
     source = (ROOT / "cdx/cdx_htb.c").read_text()
     assert "#define CDX_HTB_QID_BASE\tDPAA_ETH_TX_QUEUES" in source
     assert "#define CDX_HTB_MAX_LEAVES\tDPAA_ETH_CEETM_LEAF_QUEUES" in source

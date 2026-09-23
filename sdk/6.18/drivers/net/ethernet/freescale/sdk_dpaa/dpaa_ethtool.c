@@ -93,6 +93,50 @@ static char dpa_stats_global[][ETH_GSTRING_LEN] = {
 #define DPA_STATS_PERCPU_LEN ARRAY_SIZE(dpa_stats_percpu)
 #define DPA_STATS_GLOBAL_LEN ARRAY_SIZE(dpa_stats_global)
 
+#ifdef CONFIG_CPE_FAST_PATH
+/* What a hardware qdisc's leaf classes actually dequeued and dropped.
+ *
+ * These are the only counters that describe accelerated traffic. A leaf class
+ * has a software qdisc too, and tc reports that one, but an offloaded flow
+ * produces no skb and never enqueues there -- so `tc -s class show` reads
+ * approximately zero for precisely the traffic being accelerated, and this is
+ * where the rest of the link is.
+ *
+ * One entry per leaf slot rather than per class in the tree, so the count is a
+ * constant: ethtool fetches the names and the values in separate ioctls, and a
+ * count that moved with `tc class add` would leave userspace lining one up
+ * against the other. A slot no class holds reads zero.
+ *
+ * Then the two queues traffic that names no leaf takes, which a leaf may or
+ * may not hold: [default], where unclassified traffic goes, and [control],
+ * where the frames that keep the link and the gateway itself running go. A
+ * leaf holding one reports the same queue under its own slot too.
+ */
+static const char dpa_stats_ceetm[][ETH_GSTRING_LEN] = {
+	"ceetm dequeued frames",
+	"ceetm dequeued bytes",
+	"ceetm rejected frames",
+};
+
+/* In the order dpa_qdisc_ops.class_stats fills them, after the leaf slots. */
+static const char * const dpa_stats_ceetm_implicit[] = { "default", "control" };
+static_assert(ARRAY_SIZE(dpa_stats_ceetm_implicit) == DPA_CEETM_IMPLICIT_QUEUES,
+	      "one name per queue the qdisc module reports beyond the leaves");
+
+#define DPA_STATS_CEETM_LEN \
+	((DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) * \
+	 ARRAY_SIZE(dpa_stats_ceetm))
+static_assert(ARRAY_SIZE(dpa_stats_ceetm) == DPA_CEETM_CLASS_STATS,
+	      "one name per value the qdisc module reports");
+/* A slot's names carry its index in at most two digits: ethtool_sprintf()
+ * cuts a longer name at ETH_GSTRING_LEN without a word, and two slots' names
+ * would read the same (dpa_get_strings()). */
+static_assert(DPAA_ETH_CEETM_LEAF_QUEUES <= 100,
+	      "a leaf slot numbered from a hundred would not fit its ethtool names");
+#else
+#define DPA_STATS_CEETM_LEN 0
+#endif
+
 static int __cold dpa_get_ksettings(struct net_device *net_dev,
 		struct ethtool_link_ksettings *cmd)
 {
@@ -357,7 +401,8 @@ static int dpa_get_sset_count(struct net_device *net_dev, int type)
 	unsigned int total_stats, num_stats;
 
 	num_stats   = num_online_cpus() + 1;
-	total_stats = num_stats * DPA_STATS_PERCPU_LEN + DPA_STATS_GLOBAL_LEN;
+	total_stats = num_stats * DPA_STATS_PERCPU_LEN + DPA_STATS_GLOBAL_LEN +
+		      DPA_STATS_CEETM_LEN;
 
 	switch (type) {
 	case ETH_SS_STATS:
@@ -480,6 +525,14 @@ static void dpa_get_ethtool_stats(struct net_device *net_dev,
 	data[offset++] = cg_time;
 	data[offset++] = cg_num;
 	data[offset++] = cg_status;
+
+#ifdef CONFIG_CPE_FAST_PATH
+	/* Read rather than accumulated: these are hardware counters, and they
+	 * are read without the clear flag so repeated calls report totals and
+	 * not deltas. A control plane that clears them -- CMD_QM_QUERY_QUEUE
+	 * can -- moves the baseline underneath this. */
+	dpa_qdisc_class_stats(priv->qm_ctx, data + offset);
+#endif
 }
 
 static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
@@ -503,6 +556,22 @@ static void dpa_get_strings(struct net_device *net_dev, u32 stringset, u8 *data)
 		strings += ETH_GSTRING_LEN;
 	}
 	memcpy(strings, dpa_stats_global, size);
+	strings += size;
+
+#ifdef CONFIG_CPE_FAST_PATH
+	/* Leaf i is Tx queue DPAA_ETH_TX_QUEUES + i, which is what
+	 * TC_HTB_LEAF_QUERY_QUEUE answers for a classid. Every name fits
+	 * ETH_GSTRING_LEN, the longest -- "ceetm rejected frames [leaf 63]" and
+	 * "ceetm dequeued frames [default]", thirty-one characters and the NUL
+	 * -- with no room to spare: a slot numbered from a hundred would not. */
+	for (i = 0; i < DPAA_ETH_CEETM_LEAF_QUEUES; i++)
+		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++)
+			ethtool_sprintf(&strings, "%s [leaf %u]", dpa_stats_ceetm[j], i);
+	for (i = 0; i < ARRAY_SIZE(dpa_stats_ceetm_implicit); i++)
+		for (j = 0; j < ARRAY_SIZE(dpa_stats_ceetm); j++)
+			ethtool_sprintf(&strings, "%s [%s]", dpa_stats_ceetm[j],
+					dpa_stats_ceetm_implicit[i]);
+#endif
 }
 
 static int dpaa_get_ts_info(struct net_device *net_dev,

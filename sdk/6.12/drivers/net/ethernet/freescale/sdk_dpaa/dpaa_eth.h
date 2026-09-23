@@ -189,12 +189,49 @@ increased buffer size from 2048 to 2176, to accomodate them in contiguous fd */
 #define fm_l4_frame_is_tcp(parse_result_ptr) \
 	((parse_result_ptr)->l4r & FM_L4_PARSE_RESULT_TCP)
 
-/* number of Tx queues to FMan */
+/* Number of Tx queues to FMan that carry ordinary, unclassified traffic.
+ *
+ * These are the queues the CPU sends through: locally generated traffic, flows
+ * that were never offloaded, and the punt path. A hardware-offloaded flow
+ * never reaches one, so this count says nothing about offload capacity.
+ *
+ * It was NR_CPUS, which is a distribution's build-time ceiling rather than a
+ * property of the board: the same driver offered 16 queues under one kernel
+ * configuration and 64 under another, and sized egress_fqs[] and conf_fqs[] to
+ * match. A hardware qdisc allocates its leaf classes out of the queues above
+ * this count, so a budget that moves with someone else's Kconfig cannot be
+ * part of an interface contract.
+ *
+ * Sixteen is chosen because it is what the more constrained of those two
+ * configurations already ran, which makes this a fixed number rather than a
+ * new one. It stays a power of two because the Tx paths index conf_fqs[] with
+ * & (DPAA_ETH_TX_QUEUES - 1). Queues are picked by flow hash rather than by
+ * CPU -- this driver installs no XPS maps -- so the count trades qdisc
+ * contention between concurrent software senders against the frame queues each
+ * one costs, and is not bounded by the core count in either direction.
+ */
 #ifdef CONFIG_FMAN_PFC
 #define DPAA_ETH_TX_QUEUES	(NR_CPUS * CONFIG_FMAN_PFC_COS_COUNT)
 #else
-#define DPAA_ETH_TX_QUEUES	NR_CPUS
+#define DPAA_ETH_TX_QUEUES	16
 #endif
+
+/* Headroom above the direct queues, one slot per leaf class a hardware qdisc
+ * can hold on this port, reserved so it can hand sch_htb a real and
+ * exclusively owned netdev_queue index for each. Nothing allocates an egress
+ * FQ for these: a leaf's frames leave through a CEETM logical FQ that the
+ * scheduler owns, not through egress_fqs[].
+ *
+ * A tree's leaves spread over its CEETM channels, one for each class under
+ * its root, so the count is not one channel's sixteen class queues: sixty-four
+ * is a leaf on each of a CEETM instance's thirty-two channels twice over. Each
+ * slot is a netdev queue, which the stack's default root qdisc also gives a
+ * child qdisc of its own until a hardware qdisc takes the port. And each
+ * slot's ethtool counters are named by its index, which a hundred would not
+ * fit (dpa_get_strings()).
+ */
+#define DPAA_ETH_CEETM_LEAF_QUEUES	64
+#define DPAA_ETH_TX_QUEUES_MAX	(DPAA_ETH_TX_QUEUES + DPAA_ETH_CEETM_LEAF_QUEUES)
 
 #define DPAA_ETH_RX_QUEUES	128
 #define DPAA_IP_VERSION_4  4

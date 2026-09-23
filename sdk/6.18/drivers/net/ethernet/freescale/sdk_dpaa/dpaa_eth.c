@@ -57,6 +57,7 @@
 #include <linux/if_ether.h>	/* ETH_P_IP and ETH_P_IPV6 */
 #include <linux/highmem.h>
 #include <linux/percpu.h>
+#include <linux/srcu.h>
 #include <linux/dma-mapping.h>
 #include <linux/fsl_bman.h>
 #ifdef CONFIG_SOC_BUS
@@ -760,6 +761,141 @@ static void dpaa_eth_poll_controller(struct net_device *net_dev)
 }
 #endif
 
+#ifdef CONFIG_CPE_FAST_PATH
+/* Set by the offload module; a built-in driver cannot link against one. The
+ * handler sleeps, so its calls are counted by an SRCU domain rather than by
+ * RCU: the unregister waits for the ones already inside it. */
+static dpa_setup_tc_handler dpa_setup_tc_func;
+DEFINE_STATIC_SRCU(dpa_setup_tc_srcu);
+
+int dpa_register_setup_tc(dpa_setup_tc_handler handler)
+{
+	if (!handler)
+		return -EINVAL;
+	if (cmpxchg(&dpa_setup_tc_func, NULL, handler))
+		return -EBUSY;
+	return 0;
+}
+EXPORT_SYMBOL(dpa_register_setup_tc);
+
+/* Returns once no call is inside the handler, so the module's text -- and
+ * the state the handler reaches, its own SRCU domains among it -- may be freed
+ * after. Must not be called from inside the handler, nor with anything held
+ * that a handler call waits for. */
+void dpa_unregister_setup_tc(void)
+{
+	WRITE_ONCE(dpa_setup_tc_func, NULL);
+	synchronize_srcu(&dpa_setup_tc_srcu);
+}
+EXPORT_SYMBOL(dpa_unregister_setup_tc);
+
+/* Read the handler once, inside the read-side section the unregister waits
+ * for: an unregister can NULL it concurrently, and a call that began before
+ * it must finish before the module's text goes.
+ *
+ * Refusing when nothing is registered is deliberate rather than convenient.
+ * Netfilter has already chosen this route over the module's indirect
+ * registration by the time it gets here, so answering anything but an error
+ * would claim a binding no one is going to service.
+ */
+static int dpa_setup_tc(struct net_device *dev, enum tc_setup_type type,
+			void *type_data)
+{
+	dpa_setup_tc_handler handler;
+	int idx, rc;
+
+	idx = srcu_read_lock(&dpa_setup_tc_srcu);
+	handler = READ_ONCE(dpa_setup_tc_func);
+	rc = handler ? handler(dev, type, type_data) : -EOPNOTSUPP;
+	srcu_read_unlock(&dpa_setup_tc_srcu, idx);
+	return rc;
+}
+
+/* The data-path half, published and retired as one pointer so a frame never
+ * sees one callback without the other. */
+static const struct dpa_qdisc_ops *dpa_qdisc;
+
+int dpa_register_qdisc_ops(const struct dpa_qdisc_ops *ops)
+{
+	if (!ops || !ops->select_queue || !ops->txq_fq || !ops->class_stats)
+		return -EINVAL;
+	/* release-publish so a frame cannot see the pointer before the queue
+	 * map it walks is initialized */
+	if (cmpxchg_release(&dpa_qdisc, NULL, ops))
+		return -EBUSY;
+	return 0;
+}
+EXPORT_SYMBOL(dpa_register_qdisc_ops);
+
+/* Waits for a grace period before returning, so the callbacks' module text
+ * may be freed once it does. Every caller below takes its own rcu_read_lock()
+ * around the pointer and the call, so that holds whatever context it was
+ * entered from. */
+void dpa_unregister_qdisc_ops(void)
+{
+	WRITE_ONCE(dpa_qdisc, NULL);
+	synchronize_net();
+}
+EXPORT_SYMBOL(dpa_unregister_qdisc_ops);
+
+/* The frame queue answered is used for the enqueue after this returns, which
+ * cpe_fp_tx() keeps inside its own read-side section. */
+struct qman_fq *dpa_qdisc_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb)
+{
+	const struct dpa_qdisc_ops *ops;
+	struct qman_fq *fq = NULL;
+
+	rcu_read_lock();
+	ops = READ_ONCE(dpa_qdisc);
+	if (ops)
+		fq = ops->txq_fq(qm_ctx, txq, skb);
+	rcu_read_unlock();
+	return fq;
+}
+
+/* Always answers, so the count of statistics this driver reports is a
+ * compile-time constant rather than something that changes when a module
+ * loads. Unclaimed leaf slots, and every value when nothing is registered,
+ * read zero. */
+void dpa_qdisc_class_stats(void *qm_ctx, u64 *data)
+{
+	const struct dpa_qdisc_ops *ops;
+
+	memset(data, 0, (DPAA_ETH_CEETM_LEAF_QUEUES + DPA_CEETM_IMPLICIT_QUEUES) *
+			DPA_CEETM_CLASS_STATS * sizeof(*data));
+	rcu_read_lock();
+	ops = READ_ONCE(dpa_qdisc);
+	if (ops && qm_ctx)
+		ops->class_stats(qm_ctx, data);
+	rcu_read_unlock();
+}
+
+/* Not always entered with a read-side section held: AF_PACKET's qdisc bypass
+ * calls ndo_select_queue from plain process context, which under PREEMPT_RCU
+ * is no reader at all. So the section is taken here. */
+static u16 dpa_qdisc_select_queue(struct net_device *dev, struct sk_buff *skb,
+				  struct net_device *sb_dev)
+{
+	const struct dpa_qdisc_ops *ops;
+	u16 queue = DPA_SELECT_QUEUE_NONE;
+
+	rcu_read_lock();
+	ops = READ_ONCE(dpa_qdisc);
+	if (ops)
+		queue = ops->select_queue(dev, skb);
+	rcu_read_unlock();
+	if (queue != DPA_SELECT_QUEUE_NONE)
+		return queue;
+	/* Traffic that named no class keeps the stack's own choice -- socket
+	 * affinity and XPS included -- folded back into the queues that carry
+	 * it. The fold is what keeps it off the leaf classes above them, which
+	 * real_num_tx_queues now covers and which are reached only by naming
+	 * one; DPAA_ETH_TX_QUEUES is a power of two for exactly this kind of
+	 * masking. */
+	return netdev_pick_tx(dev, skb, sb_dev) & (DPAA_ETH_TX_QUEUES - 1);
+}
+#endif
+
 static const struct net_device_ops dpa_private_ops = {
 	.ndo_open = dpa_eth_priv_start,
 	.ndo_start_xmit = dpa_tx,
@@ -768,8 +904,13 @@ static const struct net_device_ops dpa_private_ops = {
 	.ndo_get_stats64 = dpa_get_stats64,
 	.ndo_set_mac_address = dpa_set_mac_address,
 	.ndo_validate_addr = eth_validate_addr,
-#ifdef CONFIG_FMAN_PFC
+#if defined(CONFIG_FMAN_PFC)
 	.ndo_select_queue = dpa_select_queue,
+#elif defined(CONFIG_CPE_FAST_PATH)
+	/* Load-bearing beyond the qdisc: the leaf-class queues live above
+	 * real_num_tx_queues' probe-time value, and once one is in service the
+	 * stack's own hash would otherwise spread ordinary traffic across it. */
+	.ndo_select_queue = dpa_qdisc_select_queue,
 #endif
 	.ndo_set_rx_mode = dpa_set_rx_mode,
 	.ndo_init = dpa_ndo_init,
@@ -780,6 +921,9 @@ static const struct net_device_ops dpa_private_ops = {
 #endif
 	.ndo_set_features = dpa_set_features,
 	.ndo_fix_features = dpa_fix_features,
+#ifdef CONFIG_CPE_FAST_PATH
+	.ndo_setup_tc = dpa_setup_tc,
+#endif
 };
 
 static int dpa_private_napi_add(struct net_device *net_dev)
@@ -858,6 +1002,15 @@ static int dpa_private_netdev_init(struct net_device *net_dev)
 	net_dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
 				NETIF_F_RXCSUM;
 	net_dev->lltx               = true;
+
+#ifdef CONFIG_CPE_FAST_PATH
+	/* tc_can_offload() gates every hardware qdisc on this bit, and it has
+	 * to be in features rather than only in hw_features to be on by
+	 * default. Offered alongside ndo_setup_tc, since neither is any use
+	 * without the other. */
+	net_dev->hw_features |= NETIF_F_HW_TC;
+	net_dev->features |= NETIF_F_HW_TC;
+#endif
 
 	/* Advertise S/G and HIGHDMA support for private interfaces */
 	net_dev->hw_features |= NETIF_F_SG | NETIF_F_HIGHDMA;
@@ -1069,10 +1222,24 @@ dpaa_eth_priv_probe(struct platform_device *_of_dev)
 	/* Allocate this early, so we can store relevant information in
 	 * the private area (needed by 1588 code in dpa_mac_probe)
 	 */
-	net_dev = alloc_etherdev_mq(sizeof(*priv), DPAA_ETH_TX_QUEUES);
+	/* Allocate the leaf-class headroom up front, the way every other
+	 * hardware-qdisc driver does: sch_htb turns the qid a driver hands back
+	 * straight into netdev_get_tx_queue() with no bounds check, so those
+	 * slots have to exist before a class can name one. Only the direct
+	 * queues are live until then; see the real_num_tx_queues call below. */
+	net_dev = alloc_etherdev_mq(sizeof(*priv), DPAA_ETH_TX_QUEUES_MAX);
 	if (!net_dev) {
 		dev_err(dev, "alloc_etherdev_mq() failed\n");
 		goto alloc_etherdev_mq_failed;
+	}
+	/* alloc_etherdev_mq() reports every allocated queue as usable. Narrow
+	 * that to the queues that actually have an egress FQ behind them, so
+	 * ordinary traffic never hashes into the reserved range and a later
+	 * qdisc sees an honest count of pre-existing direct queues. */
+	err = netif_set_real_num_tx_queues(net_dev, DPAA_ETH_TX_QUEUES);
+	if (err) {
+		dev_err(dev, "netif_set_real_num_tx_queues() = %d\n", err);
+		goto netif_set_real_num_tx_queues_failed;
 	}
 
 	/* Do this here, so we can be verbose early */
@@ -1274,6 +1441,8 @@ fq_probe_failed:
 alloc_failed:
 mac_probe_failed:
 	dev_set_drvdata(dev, NULL);
+	/* Reached before drvdata is set, so it has nothing to undo. */
+netif_set_real_num_tx_queues_failed:
 	free_netdev(net_dev);
 alloc_etherdev_mq_failed:
 	if (atomic_read(&dpa_bp->refs) == 0)

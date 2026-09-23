@@ -1513,9 +1513,9 @@ EXPORT_SYMBOL(skb_to_sg_fd);
 #define EMAC_QUEUENUM_MASK 0xff
 
 #ifdef CONFIG_CPE_FAST_PATH
-/* Resolve a frame's CEETM class from the skb mark. This is the fallback for
- * frames the qdisc layer did not already place on a leaf class's Tx queue;
- * a frame that did carries its class in the queue index instead.
+/* Resolve a frame's CEETM class from the skb mark. This is the resolution for
+ * a port with no hardware qdisc; on a port with one, the qdisc module names
+ * every frame's queue itself (dpa_qdisc_txq_fq()).
  */
 static int pfe_eth_get_queuenum( struct sk_buff *skb )
 {
@@ -2150,9 +2150,22 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
 		egress_fq = NULL;
 		get_ceetm_cm_egress_fq = 1; /* This becomes 0 when the frame names
 						no class and the DSCP map answers */
+		/* A hardware qdisc has already decided this frame's class, in
+		 * ndo_select_queue and from the same key the hardware rule used,
+		 * and put the frame on that leaf's Tx queue. Reading the class
+		 * back out of the queue index is what stops the two paths
+		 * resolving it twice and disagreeing. A frame on an ordinary
+		 * queue named no class, and on a port the qdisc owns the qdisc
+		 * decides where it goes too, from the frame. Only a port with no
+		 * qdisc answers NULL, and the mark and DSCP paths below are
+		 * reached there exactly as before -- and nowhere else. */
+		egress_fq = dpa_qdisc_txq_fq(priv->qm_ctx, skb_get_queue_mapping(skb),
+					     skb);
+		if (egress_fq)
+			get_ceetm_cm_egress_fq = 0;
 		/* No class named, so take the DSCP from the frame and let the
 		 * map choose the egress fq. */
-		if (!markval && ceetm_get_dscp_fq) {
+		if (get_ceetm_cm_egress_fq && !markval && ceetm_get_dscp_fq) {
 			skb_nh = dpa_get_skb_nh(skb, &l3_proto, &l3_offset);
 			if (skb_nh)
 			{
@@ -2194,7 +2207,14 @@ static int __cpe_fp_tx(struct sk_buff *skb, struct net_device *net_dev)
 			queuenum = queuenum % DPAA_ETH_TX_QUEUES;
 		egress_fq = priv->egress_fqs[queuenum];
 	}
-	conf_fq = priv->conf_fqs[queuenum  & (DPAA_ETH_TX_QUEUES-1)];
+	/* Confirm on the queue that sent the frame. This indexed conf_fqs[] with
+	 * queuenum, which in the CEETM branch is a class-queue id and not a Tx
+	 * queue at all -- so a DSCP-classified frame, whose queuenum is always
+	 * zero, confirmed on conf_fqs[0] whichever core sent it, and a marked
+	 * one confirmed on whichever conf queue its class happened to number.
+	 * Neither is the queue whose Tx ring the frame left by, which is what
+	 * confirmation accounting and completion affinity both assume. */
+	conf_fq = priv->conf_fqs[skb_get_queue_mapping(skb) & (DPAA_ETH_TX_QUEUES - 1)];
 	return dpa_tx_extended(skb, net_dev, egress_fq, conf_fq);
 }
 
