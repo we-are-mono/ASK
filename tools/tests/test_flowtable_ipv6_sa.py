@@ -13,6 +13,15 @@ inner family has none to copy. The inner packet is never fragmented, which is
 what bounding an IPv6 direction exists to prevent (a router must not fragment
 IPv6), and it arrives exactly once. Outer fragmentation is what Linux itself
 does for an IPv4 inner packet without DF.
+
+The same tunnel is also what carries IPv6 across a WAN that has no IPv6 at
+all, and that case gets its own test. There the remote IPv6 prefix is routed
+to the WAN port with no gateway and nothing else: no IPv6 default route and no
+IPv6 neighbour on the link. A packet-offloaded bundle has to take its child
+route from the flow, since the SA's IPv4 endpoints mean nothing to IPv6
+routing, and the software path has to hand the plaintext to SEC without
+resolving a neighbour of the inner destination, which nothing on the link
+would answer.
 """
 from __future__ import annotations
 
@@ -24,14 +33,20 @@ import socket
 
 import pytest
 
-from _topology import LAN_IPV6, LAN_NIC, TARGET_WAN_IF, WAN_IPV6, lan_run_python
-from test_flowtable_ipv6 import (PayloadEcho, _drive, _drop_tables, _offload_table, _udp_exchange,
-                                 ipv6_rig)  # noqa: F401
+from _topology import LAN_IPV6, LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, WAN_IPV6, lan_run_python
+from test_flowtable_ipv6 import (PayloadEcho, _drive, _drop_tables, _hardware_delta, _offload_table,
+                                 _udp_exchange, ipv6_rig)  # noqa: F401
 from test_flowtable_offload import command, read
+from test_flowtable_service_ipsec_replay import xfrm_mib
 from test_ipsec_inbound_flow_offload import crypto
 
 SPORT, DPORT = 48960, 48961
+V4_WAN_SPORT, V4_WAN_DPORT = 48962, 48963
 REQIDS = {"out": "49411", "in": "49412"}
+# The far end's IPv6 address when the WAN carries no IPv6: on the WAN host's
+# loopback, in a prefix no segment of the rig uses.
+REMOTE_V6 = "fc00:a6::99"
+REMOTE_PREFIX = "fc00:a6::/64"
 # The bundle's MTU for AES-CBC and a 128-bit HMAC-SHA256 tag over an IPv4
 # outer header: ((1500 - 20 - 8 - 16 - 16) & ~15) - 2.
 BUNDLE_MTU = 1438
@@ -44,10 +59,11 @@ async def fragments_sent(r):
             for family in (4, 6)}
 
 
-async def sa_pair(r, cleanup):
+async def sa_pair(r, cleanup, remote=WAN_IPV6):
     """A tunnel-mode SA pair between the DUT's WAN address and the WAN host,
-    selecting the IPv6 flow between the LAN VM and the WAN host's IPv6 address.
-    The DUT's half is packet-offloaded; the WAN host's is ordinary software."""
+    selecting the IPv6 flow between the LAN VM and `remote`, an IPv6 address
+    of the WAN host. The DUT's half is packet-offloaded; the WAN host's is
+    ordinary software."""
     outer = next(a["local"] for i in json.loads((await command(
         r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])
         for a in i["addr_info"] if a["family"] == "inet")
@@ -60,7 +76,7 @@ async def sa_pair(r, cleanup):
     for direction in ("out", "in"):
         spi = hex(0xA6000000 | secrets.randbits(24))
         outer_src, outer_dst = (outer, peer) if direction == "out" else (peer, outer)
-        src, dst = (LAN_IPV6, WAN_IPV6) if direction == "out" else (WAN_IPV6, LAN_IPV6)
+        src, dst = (LAN_IPV6, remote) if direction == "out" else (remote, LAN_IPV6)
         state = ["src", outer_src, "dst", outer_dst, "proto", "esp", "spi", spi]
         # A state's selector takes the outer family unless told otherwise, and
         # xfrm hands a flow only a state whose selector is the flow's family.
@@ -91,10 +107,9 @@ async def test_flowtable_ipv6_sa_oversized(ipv6_rig):
                                    "flowtable_v6_sa")
 
     try:
-        # A dual-stack WAN carries an IPv6 default route. With packet offload
-        # the kernel looks the child route up in the policy's family
-        # (xfrm_bundle_create), which only a default route can answer for an
-        # IPv4 outer address.
+        # A dual-stack WAN carries an IPv6 default route. The bundle does not
+        # need it: the flow's own route leaves by the offload port and is the
+        # child. It is here because a dual-stack WAN is this case's setting.
         await command(r.target, r.session, "ip", "-6", "route", "add", "default", "via", WAN_IPV6,
                       "dev", TARGET_WAN_IF)
         cleanup.append((r.target, ["ip", "-6", "route", "del", "default", "via", WAN_IPV6,
@@ -142,6 +157,82 @@ print(json.dumps({{"too_big": [a[ICMPv6PacketTooBig].mtu for a in answers]}}))
         r.record("ipv6-sa-oversized", {"results": results, "final": final})
     finally:
         transport.close()
+        await _drop_tables(r)
+        for agent, argv in reversed(cleanup):
+            await command(agent, r.session, *argv, check=False)
+
+
+async def xfrm_counters(r):
+    return xfrm_mib(await read(r.target, r.session, "/proc/net/xfrm_stat"))
+
+
+async def test_flowtable_ipv6_sa_ipv4_only_wan(ipv6_rig):
+    """IPv6-in-IPv4 across a WAN with no IPv6: the remote prefix is routed to
+    the WAN port without a gateway, the DUT has no IPv6 default route, and the
+    far end's address is on no link, so no IPv6 neighbour exists for it.
+
+    Every bundle must still build (XfrmOutBundleGenError does not move), the
+    first packets must cross in software for the flow to be established at
+    all, and once admitted the classifier carries both directions exactly."""
+    r = ipv6_rig
+    echo = PayloadEcho()
+    transport = None
+    cleanup = []
+
+    async def send(count=8):
+        return await _udp_exchange(r, V4_WAN_SPORT, REMOTE_V6, V4_WAN_DPORT, count,
+                                   (REMOTE_V6, V4_WAN_DPORT), "flowtable_v6_sa_ipv4_wan")
+
+    try:
+        defaults = (await command(r.target, r.session, "ip", "-6", "route", "show",
+                                  "default"))["stdout"].strip()
+        assert not defaults, ("this case needs a DUT without an IPv6 default route", defaults)
+        await command(r.wan, r.session, "ip", "-6", "addr", "add", REMOTE_V6 + "/128", "dev", "lo",
+                      "nodad")
+        cleanup.append((r.wan, ["ip", "-6", "addr", "del", REMOTE_V6 + "/128", "dev", "lo"]))
+        transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: echo, local_addr=(REMOTE_V6, V4_WAN_DPORT), family=socket.AF_INET6)
+        await command(r.target, r.session, "ip", "-6", "route", "add", REMOTE_PREFIX, "dev",
+                      TARGET_WAN_IF)
+        cleanup.append((r.target, ["ip", "-6", "route", "del", REMOTE_PREFIX, "dev",
+                                   TARGET_WAN_IF]))
+        await sa_pair(r, cleanup, remote=REMOTE_V6)
+        await _offload_table(r, f"ip6 saddr {LAN_IPV6} udp sport {V4_WAN_SPORT} "
+                                f"udp dport {V4_WAN_DPORT}")
+        mib = await xfrm_counters(r)
+        # Admission needs an established connection, so it also proves the
+        # first packets crossed the software path in both directions.
+        admitted = await _drive(r, send, lambda s: s["entries"] == 2,
+                                "the protected IPv6 flow should be in hardware on an IPv4-only WAN")
+        rows = {f["in"]: f for f in admitted["flows"]}
+        assert set(rows) == {TARGET_LAN_IF, TARGET_WAN_IF}, admitted
+        assert rows[TARGET_LAN_IF]["sa"] != "0" and rows[TARGET_WAN_IF]["in_sa"] != "0", admitted
+        assert all(f["family"] == "6" for f in rows.values()), admitted
+        # The encrypted direction's next hop is the tunnel's IPv4 endpoint,
+        # resolved in its own family: the IPv6 route under the bundle has
+        # no neighbour for it.
+        assert rows[TARGET_LAN_IF]["nexthop"] == os.environ.get("ASK_WAN_IP", "127.0.0.1"), admitted
+        report = await send(64)
+        assert report == {"echoed": 64, "lost": 0}, report
+        after = await r.state()
+        moved = {f["in"]: f for f in after["flows"]}
+        delta = _hardware_delta(rows, moved)
+        assert delta == {TARGET_LAN_IF: 64, TARGET_WAN_IF: 64}, (delta, admitted, after)
+        assert (admitted["installs"], admitted["deletes"]) == (after["installs"], after["deletes"]), \
+            (admitted, after)
+        assert after["errors"] == r.errors, after
+        for direction in rows:
+            assert moved[direction]["cookie"] == rows[direction]["cookie"], (rows, moved)
+        now = await xfrm_counters(r)
+        refused = {name: now[name] - mib[name]
+                   for name in ("XfrmOutBundleGenError", "XfrmOutBundleCheckError",
+                                "XfrmOutNoStates", "XfrmOutError")}
+        assert not any(refused.values()), refused
+        r.record("ipv6-sa-ipv4-only-wan", {"admitted": admitted, "after": after,
+                                           "hardware_delta": delta, "xfrm": refused})
+    finally:
+        if transport:
+            transport.close()
         await _drop_tables(r)
         for agent, argv in reversed(cleanup):
             await command(agent, r.session, *argv, check=False)
