@@ -333,6 +333,12 @@ async def test_flowtable_service_multicast_quarantine_released_without_multicast
         assert drained["quarantine"] == 0 and drained["errors"] == parked["errors"], drained
 
         await park("reload")
+        # Nothing multicast is left installed for the unload to delete: that
+        # delete's own barrier would release the backlog, and an unload that
+        # never retries one would pass anyway.
+        idle = await m.proc()
+        assert idle["mcast_installed"] == idle["mroute_installed"] == 0, summary(idle)
+        assert idle["quarantine"] == 2, summary(idle)
         console = await dut_console("quarantine-reload")
         try:
             await console_command(console, "rmmod", "ask_flowtable", timeout=30)
