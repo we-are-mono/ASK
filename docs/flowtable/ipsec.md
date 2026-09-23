@@ -788,6 +788,15 @@ peer's SA counters advance and nothing is delivered. Upstream skips that help
 only for a device advertising `NETIF_F_HW_ESP_TX_CSUM`, which this does not
 claim.
 
+A GSO packet cannot be finished that way: `skb_checksum_help()` refuses one
+with a warning and the packet was dropped, which is every TCP packet a local
+socket builds over the tunnel and every forwarded one the LAN port's GRO
+merged. So `xfrm_dev_sec_gso()` segments it first, in software and with no
+features, as `xfrm_output_gso()` does for a software transform, and each
+segment goes on as a packet of its own: SEC encrypts one packet per ESP, and
+the port's own segmentation would leave the checksum to a transmit offload
+that frames bound for SEC never reach.
+
 Proof: a tunnel carries traffic with no flowtable entry at all, with the SEC
 counter advancing and an independent peer decrypting what it produced.
 

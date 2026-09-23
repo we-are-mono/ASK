@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A246.** GSO packets for a packet-offloaded SA hit `skb_checksum_help()`'s WARN and were dropped: all local TCP and GRO-merged forwarded traffic on the software path —
+  fixed (_:/^xfrm: segment GSO packets for a packet-offloaded SA in software_).
+
 - [x] **A245.** IPv6-in-IPv4 over a packet-offloaded SA failed every bundle without an IPv6 default route: the SA's IPv4 endpoints were looked up as IPv6 —
   fixed (_:/^xfrm: route a cross-family packet-offload tunnel by the flow_).
 

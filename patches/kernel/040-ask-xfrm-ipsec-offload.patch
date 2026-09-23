@@ -1,4 +1,4 @@
-From 3e2adf8a7bccefe849b3299b2777aa83ecba6a54 Mon Sep 17 00:00:00 2001
+From 214937a24e106ae6cb55c66e72b5d9f5c44aa25d Mon Sep 17 00:00:00 2001
 From: Tomaz Zaman <tomaz@mono.si>
 Date: Sun, 9 Aug 2026 23:32:38 +0200
 Subject: [PATCH] ask: XFRM/IPsec hardware offload
@@ -25,7 +25,9 @@ and counted as XfrmOutBundleCheckError, and validate_xmit_xfrm() drops a
 frame moved off it later. Tunnel mode goes to the device directly with an
 Ethernet header the IPsec offline port rewrites, so no neighbour of the
 inner family is resolved; the SA's own next hop is still used per packet,
-as neighbour output used it, so Linux keeps that entry resolved.
+as neighbour output used it, so Linux keeps that entry resolved. A GSO
+packet is segmented in software first, checksums finished, so SEC gets
+one packet per ESP.
 
 Compiles warning-free: the offload entry points are declared in
 include/net/xfrm.h instead of per-file externs and
@@ -48,11 +50,11 @@ Signed-off-by: Tomaz Zaman <tomaz@mono.si>
  net/xfrm/ipsec_flow.h        |  31 ++
  net/xfrm/xfrm_device.c       |  24 +
  net/xfrm/xfrm_input.c        |  21 +
- net/xfrm/xfrm_output.c       | 298 ++++++++++++
+ net/xfrm/xfrm_output.c       | 354 ++++++++++++++
  net/xfrm/xfrm_policy.c       |  90 ++++
  net/xfrm/xfrm_state.c        | 236 +++++++++
  net/xfrm/xfrm_user.c         |   4 +
- 19 files changed, 1910 insertions(+), 7 deletions(-)
+ 19 files changed, 1966 insertions(+), 7 deletions(-)
  create mode 100644 net/xfrm/ipsec_flow.c
  create mode 100644 net/xfrm/ipsec_flow.h
 
@@ -1605,7 +1607,7 @@ index 5d3633ce6ba3..907409eb5da8 100644
  		spin_lock(&x->lock);
  
 diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
-index a5b5d82bd755..bda6f29fb97b 100644
+index a5b5d82bd755..71d040bd5bc8 100644
 --- a/net/xfrm/xfrm_output.c
 +++ b/net/xfrm/xfrm_output.c
 @@ -67,6 +67,10 @@ static int xfrm4_transport_output(struct xfrm_state *x, struct sk_buff *skb)
@@ -1873,7 +1875,135 @@ index a5b5d82bd755..bda6f29fb97b 100644
  static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
  {
  	return xfrm_output_resume(sk, skb, 1);
-@@ -763,6 +953,96 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+@@ -734,6 +924,127 @@ static void xfrm_get_inner_ipproto(struct sk_buff *skb, struct xfrm_state *x)
+ 	}
+ }
+ 
++#if defined(CONFIG_INET_IPSEC_OFFLOAD) || defined(CONFIG_INET6_IPSEC_OFFLOAD)
++/* Carry one packet for a packet-offloaded SA on to SEC. The caller has
++ * already checked that its bundle leaves by the SA's own port.
++ *
++ * The state travels with the frame instead of being looked up again: the
++ * transmit path needs the SA to pick a SEC frame queue, and the sec_path is
++ * where a driver is already expected to find it. The reference is released
++ * with the skb.
++ */
++static int xfrm_dev_sec_xmit(struct sock *sk, struct xfrm_state *x,
++			     struct sk_buff *skb)
++{
++	struct sec_path *sp;
++	int err;
++
++	/* A forwarded packet decrypted by another SA still
++	 * carries that SA in its sec_path. The receive policy
++	 * has been checked by now, and the driver takes the
++	 * first entry as the SA to encrypt with, so start
++	 * from an empty one, as the software path does. */
++	secpath_reset(skb);
++	sp = secpath_set(skb);
++	if (!sp) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return -ENOMEM;
++	}
++	/* len only, deliberately not olen.
++	 *
++	 * xfrm_offload() answers non-NULL exactly when olen is
++	 * non-zero and equal to len, and a non-NULL answer is
++	 * what draws the frame into validate_xmit_xfrm() on
++	 * the way out -- which, on a device advertising
++	 * NETIF_F_HW_ESP, encrypts it in software and hands
++	 * the finished packet to the driver. SEC would then
++	 * never see it, and the only visible sign would be a
++	 * tunnel that works with the hardware counter at zero.
++	 * xfrm_output()'s crypto-offload branch does increment
++	 * olen, because that path wants exactly that fixup. This
++	 * one does not: it needs the state carried to the driver
++	 * and nothing else done to the frame. */
++	sp->xvec[sp->len++] = x;
++	xfrm_state_hold(x);
++	skb->ipsec_offload = 1;
++	/* Finish the inner checksum before SEC sees the frame.
++	 *
++	 * The engine encrypts what it is given, and ESP
++	 * authenticates the ciphertext rather than the payload
++	 * inside it -- so a locally generated packet still
++	 * carrying CHECKSUM_PARTIAL encrypts, traverses, and
++	 * decrypts perfectly at the far end, which then drops
++	 * the inner datagram for a bad checksum. The peer's SA
++	 * counters advance and nothing is delivered.
++	 *
++	 * xfrm_output()'s software path does this for the same
++	 * reason; it is only skipped for a device advertising
++	 * NETIF_F_HW_ESP_TX_CSUM, which computes the inner sum
++	 * itself. This one does not claim that. */
++	if (skb->ip_summed == CHECKSUM_PARTIAL) {
++		err = skb_checksum_help(skb);
++		if (err) {
++			XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++			kfree_skb(skb);
++			return err;
++		}
++	}
++	/* A tunnel's inner destination is not the next hop,
++	 * and in a tunnel of the other family it has no
++	 * neighbour at all, so tunnel mode goes straight to
++	 * the device, locally generated packets included: the
++	 * offline port frames them from the SA, not from a
++	 * neighbour. Transport mode is addressed to the peer
++	 * itself and keeps the ordinary path. */
++	if (x->props.mode == XFRM_MODE_TUNNEL)
++		return xfrm_dev_sec_output(x, skb);
++	return xfrm_output_resume(sk, skb, 0);
++}
++
++/* A GSO packet is segmented here, in software and with every checksum
++ * finished, and each segment goes on as a packet of its own.
++ *
++ * SEC encrypts what it is handed as one ESP packet, so it has to be handed
++ * segments, and the inner checksums have to be complete before it sees them
++ * (see xfrm_dev_sec_xmit()). Left to the port, a GSO packet would be
++ * segmented with the port's own checksum offload, which finishes the sum on
++ * a transmit path that frames bound for SEC never take; and finishing it
++ * here with skb_checksum_help() refuses a GSO packet outright, with a
++ * warning. So this segments with no features at all, as xfrm_output_gso()
++ * does for a software transform. Every segment is sent whatever became of
++ * the one before, as ip_finish_output_gso() does, and the first failure is
++ * what is returned.
++ */
++static int xfrm_dev_sec_gso(struct sock *sk, struct xfrm_state *x,
++			    struct sk_buff *skb)
++{
++	struct sk_buff *segs, *nskb;
++	int ret = 0;
++
++	BUILD_BUG_ON(sizeof(*IPCB(skb)) > SKB_GSO_CB_OFFSET);
++	BUILD_BUG_ON(sizeof(*IP6CB(skb)) > SKB_GSO_CB_OFFSET);
++	segs = skb_gso_segment(skb, 0);
++	if (IS_ERR_OR_NULL(segs)) {
++		XFRM_INC_STATS(xs_net(x), LINUX_MIB_XFRMOUTERROR);
++		kfree_skb(skb);
++		return segs ? PTR_ERR(segs) : -EINVAL;
++	}
++	consume_skb(skb);
++
++	skb_list_walk_safe(segs, segs, nskb) {
++		int err;
++
++		skb_mark_not_on_list(segs);
++		err = xfrm_dev_sec_xmit(sk, x, segs);
++		if (err && !ret)
++			ret = err;
++	}
++
++	return ret;
++}
++#endif
++
+ int xfrm_output(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct net *net = dev_net(skb_dst(skb)->dev);
+@@ -763,6 +1074,31 @@ int xfrm_output(struct sock *sk, struct sk_buff *skb)
  			return -EHOSTUNREACH;
  		}
  
@@ -1886,15 +2016,8 @@ index a5b5d82bd755..bda6f29fb97b 100644
 +		 * specific route or a routing rule, and the SA has to be
 +		 * installed again where it now leads. validate_xmit_xfrm()
 +		 * backs this up for a frame sent elsewhere after this point.
-+		 *
-+		 * The state travels with the frame instead of being looked up
-+		 * again: the transmit path needs the SA to pick a SEC frame
-+		 * queue, and the sec_path is where a driver is already
-+		 * expected to find it. The reference is released with the skb.
 +		 */
 +		{
-+			struct sec_path *sp;
-+
 +			if (xfrm_dst_path(skb_dst(skb))->dev !=
 +			    READ_ONCE(x->xso.dev)) {
 +				XFRM_INC_STATS(net,
@@ -1903,74 +2026,16 @@ index a5b5d82bd755..bda6f29fb97b 100644
 +				return -EHOSTUNREACH;
 +			}
 +
-+			/* A forwarded packet decrypted by another SA still
-+			 * carries that SA in its sec_path. The receive policy
-+			 * has been checked by now, and the driver takes the
-+			 * first entry as the SA to encrypt with, so start
-+			 * from an empty one, as the software path does. */
-+			secpath_reset(skb);
-+			sp = secpath_set(skb);
-+			if (!sp) {
-+				XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-+				kfree_skb(skb);
-+				return -ENOMEM;
-+			}
-+			/* len only, deliberately not olen.
-+			 *
-+			 * xfrm_offload() answers non-NULL exactly when olen is
-+			 * non-zero and equal to len, and a non-NULL answer is
-+			 * what draws the frame into validate_xmit_xfrm() on
-+			 * the way out -- which, on a device advertising
-+			 * NETIF_F_HW_ESP, encrypts it in software and hands
-+			 * the finished packet to the driver. SEC would then
-+			 * never see it, and the only visible sign would be a
-+			 * tunnel that works with the hardware counter at zero.
-+			 * The crypto-offload branch below does increment olen,
-+			 * because that path wants exactly that fixup. This one
-+			 * does not: it needs the state carried to the driver
-+			 * and nothing else done to the frame. */
-+			sp->xvec[sp->len++] = x;
-+			xfrm_state_hold(x);
-+			skb->ipsec_offload = 1;
-+			/* Finish the inner checksum before SEC sees the frame.
-+			 *
-+			 * The engine encrypts what it is given, and ESP
-+			 * authenticates the ciphertext rather than the payload
-+			 * inside it -- so a locally generated packet still
-+			 * carrying CHECKSUM_PARTIAL encrypts, traverses, and
-+			 * decrypts perfectly at the far end, which then drops
-+			 * the inner datagram for a bad checksum. The peer's SA
-+			 * counters advance and nothing is delivered.
-+			 *
-+			 * The ordinary path below does this for the same
-+			 * reason; it is only skipped for a device advertising
-+			 * NETIF_F_HW_ESP_TX_CSUM, which computes the inner sum
-+			 * itself. This one does not claim that. */
-+			if (skb->ip_summed == CHECKSUM_PARTIAL) {
-+				err = skb_checksum_help(skb);
-+				if (err) {
-+					XFRM_INC_STATS(net, LINUX_MIB_XFRMOUTERROR);
-+					kfree_skb(skb);
-+					return err;
-+				}
-+			}
-+			/* A tunnel's inner destination is not the next hop,
-+			 * and in a tunnel of the other family it has no
-+			 * neighbour at all, so tunnel mode goes straight to
-+			 * the device, locally generated packets included: the
-+			 * offline port frames them from the SA, not from a
-+			 * neighbour. Transport mode is addressed to the peer
-+			 * itself and keeps the ordinary path. */
-+			if (x->props.mode == XFRM_MODE_TUNNEL)
-+				return xfrm_dev_sec_output(x, skb);
-+			return xfrm_output_resume(sk, skb, 0);
++			if (skb_is_gso(skb))
++				return xfrm_dev_sec_gso(sk, x, skb);
++			return xfrm_dev_sec_xmit(sk, x, skb);
 +		}
 +#endif
 +
  		/* Exclusive direct xmit for tunnel mode, as
  		 * some filtering or matching rules may apply
  		 * in transport mode.
-@@ -866,10 +1146,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -866,10 +1202,20 @@ static int xfrm4_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  
@@ -1991,7 +2056,7 @@ index a5b5d82bd755..bda6f29fb97b 100644
  }
  
  #if IS_ENABLED(CONFIG_IPV6)
-@@ -914,10 +1204,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+@@ -914,10 +1260,18 @@ static int xfrm6_extract_output(struct xfrm_state *x, struct sk_buff *skb)
  	if (err)
  		return err;
  

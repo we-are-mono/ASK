@@ -97,12 +97,63 @@ def moved(before, after):
     return {name: after[name] - before[name] for name in before}
 
 
+async def wan_outer(r):
+    """The DUT's IPv4 address on its WAN port: the local tunnel endpoint."""
+    return next(a["local"] for i in json.loads((await command(
+        r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])
+        for a in i["addr_info"] if a["family"] == "inet")
+
+
+async def install_tunnel(r, wan, outer, sources, step):
+    """INNER and the tunnel endpoint PEER on the WAN host's loopback, and a
+    packet-offloaded SA pair on the DUT's WAN port selecting each of
+    `sources` <-> INNER. The WAN host's half is ordinary software. `step`
+    runs a command and records how to undo it."""
+    for address in (INNER, PEER):
+        await step(wan, ["ip", "addr", "add", address + "/32", "dev", "lo"],
+                   ["ip", "addr", "del", address + "/32", "dev", "lo"])
+    # The DUT masquerades what leaves by the WAN port; the inner source has to
+    # reach the policy and the peer's selector unchanged.
+    for source in sources:
+        exempt = ["POSTROUTING", "-s", source, "-d", INNER, "-j", "ACCEPT"]
+        await step(r.target, ["iptables", "-t", "nat", "-I", *exempt],
+                   ["iptables", "-t", "nat", "-D", *exempt])
+    for address in (INNER, PEER):
+        await step(r.target, ["ip", "route", "add", address + "/32", "via", WAN_IP, "dev",
+                              TARGET_WAN_IF],
+                   ["ip", "route", "del", address + "/32"])
+    for direction in ("out", "in"):
+        spi = hex(0xA7000000 | secrets.randbits(24))
+        outer_src, outer_dst = (outer, PEER) if direction == "out" else (PEER, outer)
+        state = ["src", outer_src, "dst", outer_dst, "proto", "esp", "spi", spi]
+        window = ["replay-window", "32"] if direction == "in" else []
+        await step(wan, ["ip", "xfrm", "state", "add", *state, *crypto(REQIDS[direction]),
+                         "replay-window", "32"],
+                   ["ip", "xfrm", "state", "delete", *state])
+        await step(r.target, ["ip", "xfrm", "state", "add", *state, *crypto(REQIDS[direction]),
+                              *window, "offload", "packet", "dev", TARGET_WAN_IF, "dir", direction],
+                   ["ip", "xfrm", "state", "delete", *state])
+        template = ["tmpl", "src", outer_src, "dst", outer_dst, "proto", "esp", "mode", "tunnel",
+                    "reqid", REQIDS[direction], "level", "required"]
+        peer_dir = "in" if direction == "out" else "out"
+        for source in sources:
+            src, dst = (source, INNER) if direction == "out" else (INNER, source)
+            selector = ["src", src + "/32", "dst", dst + "/32"]
+            await step(wan, ["ip", "xfrm", "policy", "add", *selector, "dir", peer_dir, *template],
+                       ["ip", "xfrm", "policy", "delete", *selector, "dir", peer_dir])
+            await step(r.target, ["ip", "xfrm", "policy", "add", *selector, "dir", direction,
+                                  *template, "offload", "packet", "dev", TARGET_WAN_IF],
+                       ["ip", "xfrm", "policy", "delete", *selector, "dir", direction])
+            if direction == "in":
+                await step(r.target, ["ip", "xfrm", "policy", "add", *selector, "dir", "fwd",
+                                      *template],
+                           ["ip", "xfrm", "policy", "delete", *selector, "dir", "fwd"])
+
+
 async def test_offloaded_sa_plaintext_stays_on_its_port(rig):
     r = rig
     wan = Agent("wan", f"http://{os.environ.get('ASK_WAN_IP', '127.0.0.1')}:9110")
-    outer = next(a["local"] for i in json.loads((await command(
-        r.target, r.session, "ip", "-j", "-4", "addr", "show", "dev", TARGET_WAN_IF))["stdout"])
-        for a in i["addr_info"] if a["family"] == "inet")
+    outer = await wan_outer(r)
     echo = Echo()
     transport = None
     cleanup = []
@@ -115,20 +166,9 @@ async def test_offloaded_sa_plaintext_stays_on_its_port(rig):
         route = json.loads(r.lan.run(f"ip -j route get {INNER}", timeout=10).stdout.strip())[0]
         assert route.get("gateway") == r.lan_gateway, ("the LAN VM must reach INNER through the DUT",
                                                         route)
-        for address in (INNER, PEER):
-            await step(wan, ["ip", "addr", "add", address + "/32", "dev", "lo"],
-                       ["ip", "addr", "del", address + "/32", "dev", "lo"])
+        await install_tunnel(r, wan, outer, [r.lan_ip], step)
         transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: echo, local_addr=(INNER, DPORT))
-        # The DUT masquerades what leaves by the WAN port; the inner source has
-        # to reach the policy and the peer's selector unchanged.
-        exempt = ["POSTROUTING", "-s", r.lan_ip, "-d", INNER, "-j", "ACCEPT"]
-        await step(r.target, ["iptables", "-t", "nat", "-I", *exempt],
-                   ["iptables", "-t", "nat", "-D", *exempt])
-        for address in (INNER, PEER):
-            await step(r.target, ["ip", "route", "add", address + "/32", "via", WAN_IP, "dev",
-                                  TARGET_WAN_IF],
-                       ["ip", "route", "del", address + "/32"])
         await command(r.target, r.session, "modprobe", "dummy", "numdummies=0")
         await step(r.target, ["ip", "link", "add", DETOUR, "type", "dummy"],
                    ["ip", "link", "del", DETOUR])
@@ -137,32 +177,6 @@ async def test_offloaded_sa_plaintext_stays_on_its_port(rig):
         await command(r.target, r.session, "sysctl", "-w", f"net.ipv6.conf.{DETOUR}.disable_ipv6=1")
         await command(r.target, r.session, "ip", "addr", "add", DETOUR_LOCAL + "/30", "dev", DETOUR)
         await command(r.target, r.session, "ip", "link", "set", DETOUR, "up")
-
-        for direction in ("out", "in"):
-            spi = hex(0xA7000000 | secrets.randbits(24))
-            outer_src, outer_dst = (outer, PEER) if direction == "out" else (PEER, outer)
-            src, dst = (r.lan_ip, INNER) if direction == "out" else (INNER, r.lan_ip)
-            state = ["src", outer_src, "dst", outer_dst, "proto", "esp", "spi", spi]
-            window = ["replay-window", "32"] if direction == "in" else []
-            await step(wan, ["ip", "xfrm", "state", "add", *state, *crypto(REQIDS[direction]),
-                             "replay-window", "32"],
-                       ["ip", "xfrm", "state", "delete", *state])
-            await step(r.target, ["ip", "xfrm", "state", "add", *state, *crypto(REQIDS[direction]),
-                                  *window, "offload", "packet", "dev", TARGET_WAN_IF, "dir", direction],
-                       ["ip", "xfrm", "state", "delete", *state])
-            selector = ["src", src + "/32", "dst", dst + "/32"]
-            template = ["tmpl", "src", outer_src, "dst", outer_dst, "proto", "esp", "mode", "tunnel",
-                        "reqid", REQIDS[direction], "level", "required"]
-            peer_dir = "in" if direction == "out" else "out"
-            await step(wan, ["ip", "xfrm", "policy", "add", *selector, "dir", peer_dir, *template],
-                       ["ip", "xfrm", "policy", "delete", *selector, "dir", peer_dir])
-            await step(r.target, ["ip", "xfrm", "policy", "add", *selector, "dir", direction,
-                                  *template, "offload", "packet", "dev", TARGET_WAN_IF],
-                       ["ip", "xfrm", "policy", "delete", *selector, "dir", direction])
-            if direction == "in":
-                await step(r.target, ["ip", "xfrm", "policy", "add", *selector, "dir", "fwd",
-                                      *template],
-                           ["ip", "xfrm", "policy", "delete", *selector, "dir", "fwd"])
 
         phases = {}
         before = await counters(r)
