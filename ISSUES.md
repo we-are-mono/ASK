@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A255.** Traffic naming no HTB leaf took an unconfigured, excess-only queue 7 (a saturated leaf starved ARP, LCP and DHCP) or an unshaped claimed channel; `default` was ignored —
+  fixed (_:/^cdx: keep unclassified traffic on a channel a class holds_).
+
 - [x] **A243.** Unregistering a hook (`ndo_setup_tc`, TC_SETUP_FT, the Tx and SEC hooks) waited for no caller, so a racing tc command, bind or frame could run freed text —
   fixed (_:/^sdk_dpaa, cdx: wait out every call into a hook before its module goes_).
 

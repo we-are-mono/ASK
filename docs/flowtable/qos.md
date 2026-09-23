@@ -789,12 +789,16 @@ deciding:
   queue and appears in its counters, and it keeps the priority it needs.
 - **Every queue a frame can be resolved to competes for committed tokens.** The
   tree makes the top channel's class queues 0 and 7 eligible for both token
-  buckets, at a leaf's depth, whenever no leaf holds them, and moves them when
-  a class under the root claims a higher channel. Strict priority then decides
-  between them and the leaves exactly as it does between leaves: control
-  traffic above everything, unclassified traffic below every leaf -- the
-  weighted group included, which is placed directly above class queue 0 for
-  that reason -- sharing its queue only with a `prio 7` leaf.
+  buckets, at a leaf's depth, whenever no leaf holds them, and moves them with
+  the top channel. That is the highest channel a class under the root *holds*:
+  one whose class was deleted, or whose add failed after the claim, stays
+  claimed for the next class but runs unshaped, so it never becomes the top
+  and takes nothing out from under the cap. A leaf that takes one of the two
+  queues and then fails to come into service hands it back eligible. Strict
+  priority then decides between them and the leaves exactly as it does between
+  leaves: control traffic above everything, unclassified traffic below every
+  leaf -- the weighted group included, which is placed directly above class
+  queue 0 for that reason -- sharing its queue only with a `prio 7` leaf.
 - **None of it is unshaped.** Software HTB sends unclassified traffic with no
   default to its direct queue, which bypasses the tree. Here it stays on the
   top channel, under that channel's cap. That is deliberate: a link shaped to

@@ -1244,12 +1244,13 @@ static void test_software_path(void)
 	assert(pick(dev, (2 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 2)) == qid2);
 	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2, &own) == &class_fqs[0][NUM_PQS - 2]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &own) == &class_fqs[1][NUM_PQS - 1]);
-	/* Channel 2 stays claimed for the next class under the root, so the
-	 * mark that names "whichever channel this port owns" still resolves the
-	 * way ceetm_get_egressfq() resolves it: to that channel, which now
-	 * holds no class of its own. */
-	assert(pick(dev, NUM_PQS - 1) == DPA_SELECT_QUEUE_NONE);
+	/* Channel 2 stays claimed for the next class under the root, but no
+	 * class holds it and it runs unshaped, so it is no longer the top
+	 * channel: frames on a queue no class holds take the first channel's
+	 * control queue, and the mark that names "whichever channel this port
+	 * owns" means the first channel -- where 1:10 holds queue 7. */
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(pick(dev, NUM_PQS - 1) == qid10);
 
 	assert(!destroy(dev));
 	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES);
@@ -1359,6 +1360,59 @@ static void test_unclassified(void)
 	assert(!cq_live[0][0] && !cq_live[0][NUM_PQS - 1]);
 	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[1][NUM_PQS - 1]);
 	assert(cdx_htb_txq_fq(ctx, 3, &forwarded) == &class_fqs[1][0]);
+
+	/* Deleting that class leaves its channel claimed and unshaped, and the
+	 * top channel goes back to the one a class still holds: frames that
+	 * name no leaf stay under a cap. The hardware is told the same channel,
+	 * explicitly. */
+	assert(!del_leaf(dev, 2, NULL));
+	assert(cdx_htb_port_of(dev)->channels == (BIT(0) | BIT(1)));
+	assert(chan_cir[1] == 0 && chan_eir[1] == 0);
+	assert(cq_live[0][0] && cq_live[0][NUM_PQS - 1]);
+	assert(!cq_live[1][0] && !cq_live[1][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(ctx, 3, &forwarded) == &class_fqs[0][0]);
+	channel = 0; cq = 0;
+	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == 0);
+	/* A class under the root that fails after the claim changes nothing
+	 * either: refused outright, or refused after its channel was shaped,
+	 * in which case the rate goes back with it. */
+	assert(add_leaf(dev, 3, 0, NUM_PQS, 0, 1000, 1000, NULL) == -EINVAL);
+	fault_seen = 0;
+	fault_point = 1;	/* the class queue, after the channel's rates */
+	assert(add_leaf(dev, 3, 0, 2, 0, 5000, 5000, NULL) == -EIO);
+	fault_point = -1;
+	assert(chan_cir[1] == 0 && chan_eir[1] == 0);
+	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cq_live[0][0] && cq_live[0][NUM_PQS - 1]);
+
+	/* A leaf that takes one of those queues and then fails to come into
+	 * service hands the queue back eligible, not reset and forgotten. The
+	 * Tx queue count only fails to grow, so a weighted leaf takes the one
+	 * the deleted classes left in service first. */
+	assert(!add_leaf(dev, 12, 1, 0, 1, 0, 0, NULL));
+	assert(dev->real_num_tx_queues == CDX_HTB_QID_BASE + (unsigned)cdx_htb_port_of(dev)->leaves);
+	real_num_tx_queues_fails = 1;
+	assert(add_leaf(dev, 11, 1, 0, 0, 0, 0, NULL) == -ENOMEM);
+	assert(add_leaf(dev, 17, 1, 7, 0, 0, 0, NULL) == -ENOMEM);
+	real_num_tx_queues_fails = 0;
+	assert(cq_live[0][0] && cq_live[0][NUM_PQS - 1]);
+	assert(cdx_htb_port_of(dev)->implicit == (BIT(0) | BIT(NUM_PQS - 1)));
+	assert(!del_leaf(dev, 12, NULL));
+	/* And so does one whose class queue the hardware refused. */
+	fault_seen = 0;
+	fault_point = 0;
+	assert(add_leaf(dev, 11, 1, 0, 0, 0, 0, NULL) == -EIO);
+	fault_point = -1;
+	assert(cq_live[0][NUM_PQS - 1]);
+	assert(cdx_htb_port_of(dev)->implicit == (BIT(0) | BIT(NUM_PQS - 1)));
+	/* A leaf moved onto one and back off by a failed modify likewise. */
+	fault_seen = 0;
+	fault_point = 0;
+	assert(modify(dev, 10, 7, 0, 0, 0) == -EIO);
+	fault_point = -1;
+	assert(cq_live[0][0] && cq_live[0][NUM_PQS - 2]);
+	assert(cdx_htb_port_of(dev)->implicit == (BIT(0) | BIT(NUM_PQS - 1)));
 	assert(!destroy(dev));
 	assert_balanced(dev);
 

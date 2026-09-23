@@ -174,7 +174,8 @@ struct cdx_htb_port {
 	/* Class queues this file made eligible for the unclassified and
 	 * control traffic above while no leaf holds them, all on one channel
 	 * (NONE when there are none). Undone when the channel stops being the
-	 * top one or a leaf takes the queue. */
+	 * top one, and forgotten as soon as anything else configures or resets
+	 * the queue (cdx_htb_implicit_forget()). */
 	u8 implicit_channel;
 	u16 implicit;
 	/* What the Tx path reads, and the only part of this structure it may.
@@ -266,23 +267,35 @@ static bool cdx_htb_channel_owned(struct cdx_htb_port *port, u8 channel)
  *
  * A class names its channel the way a conntrack mark does, where a channel
  * nibble of zero means "whichever channel this port owns" rather than channel
- * zero, and ceetm_get_egressfq() resolves that to the highest one it has. The
- * same answer has to come out here, or a flow the hardware put on a class
- * would take a different one in software. */
+ * zero. The top channel is the answer both paths give: the highest channel a
+ * class under the root holds, which is also where every frame that names no
+ * leaf goes, so it has to be one that is shaped. A channel this port claimed
+ * and no class holds -- its class was deleted, or its add failed after the
+ * claim -- runs unshaped, and taking it as the top would move that traffic
+ * out from under the port's cap. Only while no class holds any channel is the
+ * highest claimed one taken instead, so frames still have somewhere to go;
+ * nothing is shaped then anyway. The hardware follows through
+ * cdx_htb_resolve_class(), which hands it an explicit channel. */
 static void cdx_htb_implicit_sync(struct cdx_htb_port *port, u8 top);
 
 static void cdx_htb_publish(struct cdx_htb_port *port)
 {
 	struct cdx_htb_class *cl;
-	u8 top = CDX_HTB_NONE, default_slot = CDX_HTB_NONE;
+	u8 top = CDX_HTB_NONE, claimed = CDX_HTB_NONE, default_slot = CDX_HTB_NONE;
 	u16 unclassified;
 	unsigned int ii;
 
 	memset(port->class_txq, CDX_HTB_NONE, sizeof(port->class_txq));
 	memset(port->txq_channel, CDX_HTB_NONE, sizeof(port->txq_channel));
-	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++)
-		if (port->channels & BIT(ii))
+	for (ii = 0; ii < CDX_CEETM_MAX_CHANNELS; ii++) {
+		if (!(port->channels & BIT(ii)))
+			continue;
+		claimed = ii;
+		if (cdx_htb_channel_owned(port, ii))
 			top = ii;
+	}
+	if (top == CDX_HTB_NONE)
+		top = claimed;
 	if (!port->live)
 		top = CDX_HTB_NONE;
 	unclassified = top << 8 | CDX_HTB_UNCLASSIFIED_CQ;
@@ -454,12 +467,27 @@ static int cdx_htb_cq_get(struct cdx_htb_port *port, u8 channel, u8 prio,
 	return 0;
 }
 
+/* A class queue cdx_htb_implicit_sync() configured is being configured or
+ * reset by something else, so the configuration it made no longer stands:
+ * the queue is a leaf's now, or back at its defaults, or in whatever state a
+ * failed command left it. Forgetting it is what lets the next sync program it
+ * again once no leaf holds it -- a queue still marked would be taken as
+ * eligible when it is not, and nothing moves the mark until the top channel
+ * does. */
+static void cdx_htb_implicit_forget(struct cdx_htb_port *port, u8 channel, u8 cq)
+{
+	if (channel == port->implicit_channel)
+		port->implicit &= (u16)~BIT(cq);
+}
+
 /* Program a leaf's class queue, and remember that it is taken. */
 static int cdx_htb_cq_configure(struct cdx_htb_port *port, u8 channel, u8 cq,
 				u32 quantum, struct netlink_ext_ack *extack)
 {
-	int rc = ceetm_set_class_queue(channel, cq, quantum, CDX_HTB_CQ_DEPTH);
+	int rc;
 
+	cdx_htb_implicit_forget(port, channel, cq);
+	rc = ceetm_set_class_queue(channel, cq, quantum, CDX_HTB_CQ_DEPTH);
 	if (rc) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "CEETM rejected the class queue; a quantum is a weight of 1 to 255, not a byte count");
@@ -474,6 +502,7 @@ static void cdx_htb_cq_release(struct cdx_htb_port *port, u8 channel, u8 cq)
 	if (!(port->cq_used[channel] & BIT(cq)))
 		return;
 	port->cq_used[channel] &= (u16)~BIT(cq);
+	cdx_htb_implicit_forget(port, channel, cq);
 	if (ceetm_reset_class_queue(channel, cq))
 		pr_warn("cdx: CEETM channel %u queue %u did not return to its defaults\n",
 			channel, cq);
@@ -533,6 +562,17 @@ static int cdx_htb_shape(u8 channel, u64 rate, u64 ceil,
 		return -EINVAL;
 	}
 	return 0;
+}
+
+/* Take a channel's rate away when the class that asked for it goes. Left
+ * programmed, it would shape whatever class is given the channel next, before
+ * that class has said anything. Nothing can be done about a failure here: the
+ * caller is already giving the channel up. */
+static void cdx_htb_unshape(u8 channel)
+{
+	if (ceetm_set_channel_rates(channel, 0, 0))
+		pr_warn("cdx: CEETM channel %u kept a rate it no longer has a class for\n",
+			channel);
 }
 
 static void cdx_htb_class_free(struct cdx_htb_port *port, struct cdx_htb_class *cl)
@@ -697,9 +737,14 @@ err_cq:
 err_class:
 	kfree(cl);
 	/* A channel claimed for a class that did not come into being stays
-	 * bound to this port and unowned, so the next class reuses it. Nothing
-	 * reaches it meanwhile: no class queue on it is configured, and a mark
-	 * cannot name a channel the port is not scheduling on. */
+	 * bound to this port and unowned, so the next class reuses it. It gives
+	 * back the rate it was shaped at, as a deleted class's channel does,
+	 * and the top channel stays where a class holds one. The queue this
+	 * class briefly took may have been one unclassified or control traffic
+	 * was using, and the publish makes it eligible again. */
+	if (root)
+		cdx_htb_unshape(channel);
+	cdx_htb_publish(port);
 	return rc;
 }
 
@@ -738,6 +783,9 @@ static int cdx_htb_leaf_to_inner(struct cdx_htb_port *port,
 	if (rc) {
 		cdx_htb_cq_restore(port, parent);
 		kfree(cl);
+		/* The queue the child was refused may have been one the tree
+		 * keeps eligible for unclassified or control traffic. */
+		cdx_htb_publish(port);
 		return rc;
 	}
 	cl->classid = opt->classid;
@@ -773,12 +821,9 @@ static int cdx_htb_leaf_del(struct cdx_htb_port *port,
 	if (!cl || cl->inner)
 		return -ENOENT;
 	cdx_htb_cq_release(port, cl->channel, cl->cq);
-	/* A class under the root takes its channel out of service with it.
-	 * Leaving the rate it asked for programmed would shape whatever class
-	 * is given the channel next, before that class has said anything. */
-	if (!cl->parent && ceetm_set_channel_rates(cl->channel, 0, 0))
-		pr_warn("cdx: CEETM channel %u kept a rate it no longer has a class for\n",
-			cl->channel);
+	/* A class under the root takes its channel out of service with it. */
+	if (!cl->parent)
+		cdx_htb_unshape(cl->channel);
 	moved = cdx_htb_qid_free(port, cl->qid);
 	cdx_htb_class_free(port, cl);
 	cdx_htb_publish(port);
@@ -848,6 +893,7 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
 		rc = cdx_htb_cq_configure(port, cl->channel, cq, opt->quantum, opt->extack);
 	if (rc) {
 		cdx_htb_cq_restore(port, cl);
+		cdx_htb_publish(port);
 		return rc;
 	}
 	cl->cq = cq;
