@@ -115,6 +115,10 @@ def test_mcast_learner(tmp_path):
             "ft_mc_state",
             "ft_mc_member_src",
             "ft_mc_group_has_flow",
+            # The switchdev MDB handler, and the filter a replay reaches it
+            # through.
+            "ft_mc_swdev_obj",
+            "ft_mc_replay_event",
         ]))
     binary = tmp_path / "mcast_learner"
     subprocess.run([
@@ -234,6 +238,52 @@ def test_every_bridge_decision_asks_the_flows_again():
     # And the refresh runs while any flow exists, installed or not.
     assert "READ_ONCE(ft_mc_flow_count)" in refresh
     assert "READ_ONCE(ft_mc_flow_count)" in function(source, "ft_mc_work_fn")
+
+
+def test_a_reload_asks_the_bridge_for_standing_memberships():
+    """Registering on the switchdev chain replays nothing, and a standing
+    membership is never announced again -- a refreshing report only restarts
+    a timer. So the adapter asks every bridge port for what it holds, after
+    its own notifier is registered so nothing falls between, under the RTNL
+    the replay asserts, through a notifier that takes only added MDB objects
+    and reads nothing else as one."""
+    source = SOURCE.read_text()
+    init = function(source, "ask_flowtable_init")
+    registered = init.index("register_switchdev_blocking_notifier(&ft_swdev_nb)")
+    assert registered < init.index("ft_mc_replay();") < init.index("WRITE_ONCE(ft_ready, true);")
+    replay = function(source, "ft_mc_replay")
+    assert replay.index("rtnl_lock();") < replay.index("switchdev_bridge_port_replay(") < \
+        replay.index("rtnl_unlock();")
+    assert "for_each_netdev(&init_net, dev)" in replay and "netif_is_bridge_port(dev)" in replay
+    assert "&ft_mc_replay_nb" in replay
+    event = function(source, "ft_mc_replay_event")
+    # An attribute event's ptr is not an object: the event is tested first.
+    assert event.index("event != SWITCHDEV_PORT_OBJ_ADD") < event.index("info->obj")
+    assert "ft_mc_swdev_obj(event, info);" in event
+    # The VLAN arm of ft_swdev_event() would retire every unicast flow.
+    assert "ft_swdev_event" not in event
+    assert ".notifier_call = ft_mc_replay_event," in source
+
+
+def test_patch_160_replays_what_it_notifies():
+    """The replay built its objects from the MDB entry alone, so a blocked
+    port group replayed as a member; and a replay was elided when a deferred
+    event merely shared its MAC and VID -- which a group's (*,G) and (S,G)
+    entries always do -- though that event restated something else."""
+    patch = (ROOT / "patches/kernel/160-bridge-switchdev-mdb-group.patch").read_text()
+    added = "\n".join(line[1:] for line in patch.splitlines()
+                      if line.startswith("+") and not line.startswith("+++"))
+    # One translation of a port group's flags, used by both paths.
+    assert "static u8 br_switchdev_mdb_flags(const struct net_bridge_port_group *pg)" in added
+    assert "mdb.flags = br_switchdev_mdb_flags(pg);" in added
+    assert "\tif (pg)\n\t\tmdb.flags = br_switchdev_mdb_flags(pg);" in added
+    assert "const struct net_bridge_port_group *pg," in added
+    assert "mp, NULL, br_dev);" in added and "mp, p, dev);" in added
+    # The deferred-event match compares what distinguishes two groups.
+    eq = patch[patch.index("static bool switchdev_obj_eq"):]
+    eq = eq[:eq.index("default:")]
+    assert "+\t\t\tma->flags == mb->flags &&" in eq
+    assert "+\t\t\t!memcmp(&ma->group, &mb->group, sizeof(ma->group));" in eq
 
 
 def test_every_reference_the_learner_takes_is_released():

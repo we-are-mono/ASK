@@ -332,6 +332,41 @@ static void *kzalloc_stub(size_t n)
 #define kfree(p) free(p)
 #define GFP_KERNEL 0
 
+/* --- the switchdev objects the MDB handler reads, as patch 160 has them -- */
+#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+enum switchdev_obj_id {
+    SWITCHDEV_OBJ_ID_UNDEFINED,
+    SWITCHDEV_OBJ_ID_PORT_VLAN,
+    SWITCHDEV_OBJ_ID_PORT_MDB,
+    SWITCHDEV_OBJ_ID_HOST_MDB,
+};
+enum { SWITCHDEV_PORT_OBJ_ADD = 1, SWITCHDEV_PORT_OBJ_DEL, SWITCHDEV_PORT_ATTR_SET };
+#define SWITCHDEV_OBJ_MDB_F_BLOCKED (1 << 0)
+#define NOTIFY_DONE 0
+struct switchdev_obj {
+    struct net_device *orig_dev;
+    enum switchdev_obj_id id;
+};
+struct switchdev_obj_port_mdb {
+    struct switchdev_obj obj;
+    unsigned char addr[ETH_ALEN];
+    u16 vid;
+    struct br_ip group;
+    u8 flags;
+};
+#define SWITCHDEV_OBJ_PORT_MDB(o) container_of((o), struct switchdev_obj_port_mdb, obj)
+struct switchdev_notifier_info { struct net_device *dev; };
+struct switchdev_notifier_port_obj_info {
+    struct switchdev_notifier_info info;
+    const struct switchdev_obj *obj;
+    bool handled;
+};
+struct notifier_block;
+static int *dev_net(const struct net_device *d) { (void)d; return &init_net; }
+static bool net_eq(const int *a, const int *b) { return a == b; }
+static unsigned mr_kicks;
+static void ft_mr_kick(void) { mr_kicks++; }
+
 #include "mcast_learner.inc"
 
 #include <stdarg.h>
@@ -1742,6 +1777,78 @@ static void rows_speak_for_memberships(void)
     assert(ft_mc_member_src(f)->src.ip4 == 0);
 }
 
+static void replayed_memberships(void)
+{
+    const uint32_t G = 0x150007ef, S = 0x0100000a;
+    struct switchdev_obj_port_mdb port_group, host_group, vlan_obj;
+    struct switchdev_notifier_port_obj_info on_p1, on_p2, host_p1, host_p2, vlan;
+    struct ft_mc_flow *f;
+    char attr[1] = { 0 };
+
+    /* An adapter reloaded under a standing membership: the bridge's replay
+     * of each port brings the port's groups and, with every port, the
+     * host's. The chain may deliver some of the same again. However many
+     * times each arrives, one membership results, with the port once. */
+    reset();
+    memset(&port_group, 0, sizeof(port_group));
+    port_group.obj.id = SWITCHDEV_OBJ_ID_PORT_MDB;
+    port_group.obj.orig_dev = &P2;
+    port_group.group = group_v4(G, 0, 0);
+    host_group = port_group;
+    host_group.obj.id = SWITCHDEV_OBJ_ID_HOST_MDB;
+    host_group.obj.orig_dev = &BR;
+    on_p2 = (struct switchdev_notifier_port_obj_info){ .info.dev = &P2, .obj = &port_group.obj };
+    host_p1 = (struct switchdev_notifier_port_obj_info){ .info.dev = &P1, .obj = &host_group.obj };
+    host_p2 = (struct switchdev_notifier_port_obj_info){ .info.dev = &P2, .obj = &host_group.obj };
+    for (int round = 0; round < 2; round++) {
+        assert(ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &host_p1) == NOTIFY_DONE);
+        assert(ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &host_p2) == NOTIFY_DONE);
+        assert(ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &on_p2) == NOTIFY_DONE);
+        assert(ft_mc_swdev_obj(SWITCHDEV_PORT_OBJ_ADD, &on_p2) == false);  /* host joined */
+    }
+    assert(ft_mc_count == 1 && only_group()->host && only_group()->ports == 1);
+    assert(only_group()->port[0] == &P2 && holds == 2);
+    /* The host's copy is no longer wanted: its delete is the chain's, and
+     * the port's membership is claimed again. */
+    assert(!ft_mc_swdev_obj(SWITCHDEV_PORT_OBJ_DEL, &host_p1));
+    assert(ft_mc_swdev_obj(SWITCHDEV_PORT_OBJ_ADD, &on_p2));
+    answer(&P1, S, 0, 0, 1, &P2);
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw);
+
+    /* A replayed port group the bridge has blocked is a leave: what the
+     * notification says, the replay says (patch 160). */
+    port_group.group = group_v4(G, S, 0);
+    port_group.flags = SWITCHDEV_OBJ_MDB_F_BLOCKED;
+    assert(!ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &on_p2));
+    assert(!ft_mc_find(&BR, &port_group.group) && f->dirty);
+
+    /* Everything else the replay sends is not a membership, and is never
+     * read as one: a VLAN object, a delete, and an attribute, whose `ptr`
+     * is not an object at all. */
+    memset(&vlan_obj, 0, sizeof(vlan_obj));
+    vlan_obj.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN;
+    vlan = (struct switchdev_notifier_port_obj_info){ .info.dev = &P1, .obj = &vlan_obj.obj };
+    on_p1 = on_p2;
+    on_p1.info.dev = &P1;
+    port_group.flags = 0;
+    {
+        unsigned before = ft_mc_count, kicks = mr_kicks;
+
+        assert(ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &vlan) == NOTIFY_DONE);
+        assert(ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_DEL, &on_p1) == NOTIFY_DONE);
+        assert(ft_mc_replay_event(NULL, SWITCHDEV_PORT_ATTR_SET, attr) == NOTIFY_DONE);
+        assert(ft_mc_count == before && mr_kicks == kicks);
+    }
+    /* And a link-local group, which the bridge reports like any other, is
+     * never recorded. */
+    port_group.group = group_v4(0xfb0000e0, 0, 0);   /* 224.0.0.251 */
+    assert(!ft_mc_replay_event(NULL, SWITCHDEV_PORT_OBJ_ADD, &on_p2));
+    assert(!ft_mc_find(&BR, &port_group.group));
+}
+
 static void idle_flows_age_out(void)
 {
     const uint32_t G = 0x160007ef, S = 0x0100000a;
@@ -1840,6 +1947,7 @@ int main(void)
     the_dedup_slots();
     devices_and_bridges_change();
     rows_speak_for_memberships();
+    replayed_memberships();
     idle_flows_age_out();
 
     reset();

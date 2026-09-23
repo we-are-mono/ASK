@@ -602,6 +602,15 @@ that resumes reaches the CPU again and is learned from its next frames like
 any new one; a flow never in hardware has no count to age by, and is bounded
 by the group's eight instead.
 
+**A reload.** Registering on the switchdev chain replays nothing, and a
+membership that stands is never announced again — a refreshing report finds
+its port group and only restarts a timer. So at load the adapter asks every
+bridge port for what it holds, through the bridge's own
+`switchdev_bridge_port_replay()`, and a stream already flowing is learned
+again from its next frame. Patch 160 makes the replay say what the
+notification says: a blocked port group replays blocked, and a replay is not
+dropped as a duplicate of a queued event for another group sharing its MAC.
+
 A listener's entry also names the frame queue its port had when it was built,
 and whether the port's DSCP map was on. When CDX changes a port's egress
 queues — an HTB offload tree switching it to or from CEETM, a class moving or

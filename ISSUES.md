@@ -251,6 +251,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A266.** Bridged memberships standing when the adapter loaded were never offloaded until joined afresh (nothing replayed them, and patch 160's replay could be dropped) —
+  fixed (_:/^cdx: offload the bridged memberships standing when the adapter loads_).
+
 - [x] **A265.** Bridged multicast ignored IGMPv3/MLDv2 source filters, so a source the bridge stopped forwarding to a port still reached it in hardware —
   fixed (_:/^cdx: ask the bridge where a bridged multicast flow's frames go_).
 

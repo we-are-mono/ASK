@@ -7005,6 +7005,59 @@ static bool ft_mc_swdev_obj(unsigned long event,
 	return taken;
 }
 
+/* The bridge's replay of one port's objects. It sends everything it would
+ * send a driver offloading the port -- the VLANs of every port and the
+ * bridge, VLAN attributes, the port's MDB -- to this notifier alone; only an
+ * added MDB object is a membership, and only it may be read as one: an
+ * attribute event's `ptr` is not an object at all. Not ft_swdev_event(),
+ * whose VLAN arm would retire every unicast flow on the bridge for nothing. */
+static int ft_mc_replay_event(struct notifier_block *nb, unsigned long event,
+			      void *ptr)
+{
+	struct switchdev_notifier_port_obj_info *info = ptr;
+
+	if (event != SWITCHDEV_PORT_OBJ_ADD || !info->obj ||
+	    (info->obj->id != SWITCHDEV_OBJ_ID_PORT_MDB &&
+	     info->obj->id != SWITCHDEV_OBJ_ID_HOST_MDB))
+		return NOTIFY_DONE;
+	ft_mc_swdev_obj(event, info);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block ft_mc_replay_nb = {
+	.notifier_call = ft_mc_replay_event,
+};
+
+/* Ask every bridge port for the memberships it already holds.
+ *
+ * Registering on the switchdev chain replays nothing, and a membership that
+ * stands is never announced again: a refreshing report finds its port group
+ * and only restarts a timer. So a group joined before this module loaded --
+ * a reload is the ordinary case -- would never be offloaded. The bridge's own
+ * replay of a port (patch 160 carries each port group's group and blocked
+ * flag through it) gives the objects the chain would have. Called after the
+ * blocking notifier is registered, so nothing falls between the two; an
+ * object arriving both ways is harmless, because ft_mc_membership() takes a
+ * restatement as one. Under RTNL, which the replay asserts. */
+static void ft_mc_replay(void)
+{
+	struct net_device *dev;
+	unsigned int failed = 0;
+
+	rtnl_lock();
+	for_each_netdev(&init_net, dev)
+		if (netif_is_bridge_port(dev) &&
+		    switchdev_bridge_port_replay(dev, dev, NULL, NULL,
+						 &ft_mc_replay_nb, NULL))
+			failed++;
+	rtnl_unlock();
+	/* A port whose replay failed part-way keeps what arrived; the rest of
+	 * its memberships come back only when announced again. Say so. */
+	if (failed)
+		pr_warn("cdx: %u bridge ports could not replay their multicast memberships; those stay in software until rejoined\n",
+			failed);
+}
+
 /* Whether a flow names a device: its bridge, its ingress, or a copy. */
 static bool ft_mc_flow_names_dev(const struct ft_mc_flow *f,
 				 const struct net_device *dev)
@@ -11128,6 +11181,9 @@ static int __init ask_flowtable_init(void)
 	rc = ft_init_fault(8) ? -ENOMEM : register_switchdev_blocking_notifier(&ft_swdev_nb);
 	if (rc)
 		goto fdb;
+	/* The chain replays nothing on registration; the memberships already
+	 * standing are asked for instead. */
+	ft_mc_replay();
 	WRITE_ONCE(ft_ready, true);
 	rc = ft_init_fault(5) ? -ENOMEM : flow_indr_dev_register(ft_bind, NULL);
 	if (rc)
@@ -11199,11 +11255,12 @@ netdev:
 	cancel_delayed_work_sync(&ft_work);
 	cancel_delayed_work_sync(&ft_rearm_work);
 	/* Both chains are unregistered above, so nothing can add a membership
-	 * or an MFC entry while these drain. Registering either replays what
-	 * already exists -- the FIB notifier dumps every VIF and MFC entry,
-	 * the switchdev chain reports every port group -- so a failure after
-	 * those points has groups, hardware entries and pinned devices to give
-	 * back, and a worker holding a pointer into text about to go. */
+	 * or an MFC entry while these drain. What already existed was replayed
+	 * at registration -- the FIB notifier dumps every VIF and MFC entry,
+	 * and ft_mc_replay() asks every bridge port for its port groups -- so a
+	 * failure after those points has memberships, flows, hardware entries
+	 * and pinned devices to give back, and a worker holding a pointer into
+	 * text about to go. */
 	ft_mc_exit();
 	ft_mr_exit();
 	/* The notifier's registration replayed NETDEV_REGISTER and attached

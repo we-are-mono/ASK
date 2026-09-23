@@ -1350,6 +1350,11 @@ static int register_switchdev_blocking_notifier(struct notifier_block *nb)
 { if (registration_fails()) return -ENOMEM; swdev_obj_registered=true; return 0; }
 static void unregister_switchdev_blocking_notifier(struct notifier_block *nb)
 { assert(swdev_obj_registered); swdev_obj_registered=false; }
+/* The bridged multicast learner asks every bridge port for the memberships
+ * it already holds: only once the blocking notifier is registered, so
+ * nothing falls between the two, and before the adapter says it is ready. */
+static unsigned mc_replays;
+static void ft_mc_replay(void) { assert(swdev_obj_registered && !ft_ready); mc_replays++; }
 static void cancel_work_sync(int *work)
 {
     assert(work == &ft_retire_work || work == &ft_ipsec_follow || work == &ft_dev_stats_work);
@@ -7000,12 +7005,14 @@ static void test_registration(void)
         work_queued_invalidate = work_queued_retire = work_queued_rearm = false;
         route_open_hook = registration_failure ? bind_while_loading : NULL;
         fixture();
+        unsigned replays = mc_replays;
         int rc=ask_flowtable_init();
         if (registration_failure) {
             assert(rc < 0 && !ft_ready && !ft_proc && !backend_claimed);
             unwound();
         } else {
             assert(!rc && ft_ready && backend_claimed);
+            assert(mc_replays == replays + 1);
             assert(bind_device(&in,FLOW_BLOCK_BIND) == 0);
             assert(bind_device(&out,FLOW_BLOCK_BIND) == 0);
             struct cdx_ft_binding *b=list_entry(ft_bindings.next,struct cdx_ft_binding,list);
