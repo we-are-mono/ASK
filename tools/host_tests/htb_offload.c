@@ -159,27 +159,70 @@ struct dpa_qdisc_ops {
 	void (*class_stats)(void *qm_ctx, u64 *data);
 };
 
-/* Conntrack, and the frame's own header, as much of each as the queue
- * selection touches. A frame carries a DSCP whether or not it has a
- * conntrack: the map answers for the ones that named no class. */
-enum ip_conntrack_info { IP_CT_NEW, IP_CT_ESTABLISHED };
-struct nf_conn { u32 mark; };
+/* A frame as the port receives it, and as much of the stack's view of it as
+ * the queue selection touches: bytes from the Ethernet header on, the socket
+ * the gateway's own frames carry, and pkt_type. What the stack attached on the
+ * way -- a conntrack, an ingress index -- is deliberately absent: scrubs take
+ * it, so nothing in the Tx path may depend on it, and the adapter's
+ * classifier below stands in for the conntrack lookup that finds the
+ * connection again. */
+#define ETH_HLEN	14
+#define VLAN_HLEN	4
 #define ETH_P_IP	0x0800
+#define ETH_P_ARP	0x0806
+#define ETH_P_8021Q	0x8100
+#define ETH_P_8021AD	0x88A8
 #define ETH_P_IPV6	0x86DD
+#define ETH_P_PPP_DISC	0x8863
 #define ETH_P_PPP_SES	0x8864
 #define PPP_IP		0x21
 #define PPP_IPV6	0x57
+#define PPP_LCP		0xc021
 #define PPPOE_SES_HLEN	8
+#define PACKET_HOST	0
+#define PACKET_OTHERHOST	3
+#define AF_INET		2
+#define AF_INET6	10
+#define IPPROTO_ICMP	1
+#define IPPROTO_IGMP	2
+#define IPPROTO_IPIP	4
+#define IPPROTO_TCP	6
+#define IPPROTO_UDP	17
+#define IPPROTO_IPV6	41
+#define IPPROTO_ICMPV6	58
+#define IP_OFFSET	0x1FFF
+#define IP_MF		0x2000
+#define IP6_MF		0x0001
+#define ICMPV6_ECHO_REQUEST	128
+#define ICMPV6_MGM_QUERY	130
+#define ICMPV6_MGM_REPORT	131
+#define ICMPV6_MGM_REDUCTION	132
+#define ICMPV6_MLD2_REPORT	143
+#define NDISC_ROUTER_SOLICITATION	133
+#define NDISC_ROUTER_ADVERTISEMENT	134
+#define NDISC_NEIGHBOUR_SOLICITATION	135
+#define NDISC_NEIGHBOUR_ADVERTISEMENT	136
+#define NDISC_REDIRECT		137
 #define INET_ECN_MASK	3
+#define NSEC_PER_SEC	1000000000LL
 /* A macro rather than a function, because the production switch uses it in
  * case labels, where the kernel's own htons() is equally constant-foldable. */
 #define htons(v)	((u16)((((u16)(v)) >> 8) | (((u16)(v)) << 8)))
 #define ntohs(v)	htons(v)
 #define __force
+#define min_t(t, a, b)	((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define max(a, b)	((a) > (b) ? (a) : (b))
+static u64 div64_u64(u64 a, u64 b) { return a / b; }
+static u32 ntohl(u32 v) { return __builtin_bswap32(v); }
+static bool ipv4_is_multicast(u32 addr) { return (ntohl(addr) & 0xf0000000) == 0xe0000000; }
+static bool ipv4_is_lbcast(u32 addr) { return addr == 0xffffffff; }
 typedef u8 __u8;
 typedef u32 __u32;
 typedef u16 __be16;
+typedef u32 __be32;
 typedef u16 __sum16;
+static bool eth_type_vlan(__be16 type)
+{ return type == htons(ETH_P_8021Q) || type == htons(ETH_P_8021AD); }
 /* The real headers, and the kernel's own dsfield helpers (dsfield.inc), so a
  * rewrite is checked against the bytes and the checksum a wire would see. */
 struct iphdr {
@@ -190,119 +233,71 @@ struct iphdr {
 	__sum16 check;
 	u32 saddr, daddr;
 };
+struct in6_addr { u8 s6_addr[16]; };
 struct ipv6hdr {
 	u8 priority:4, version:4;
 	u8 flow_lbl[3];
 	__be16 payload_len;
 	u8 nexthdr, hop_limit;
-	u8 saddr[16], daddr[16];
+	struct in6_addr saddr, daddr;
 };
 struct pppoe_hdr { u8 type_ver, code; __be16 sid, length; };
+struct udphdr { __be16 source, dest, len, check; };
+struct ipv6_opt_hdr { u8 nexthdr, hdrlen; };
+struct frag_hdr { u8 nexthdr, reserved; __be16 frag_off; u32 identification; };
 #include "dsfield.inc"
 struct sock;
 struct sk_buff {
-	struct nf_conn *ct;
-	u16 protocol;		/* big-endian, as the kernel keeps it */
-	u8 tos;			/* the whole dsfield, as a header carries it */
-	bool short_header;	/* too short to read the network header */
-	int skb_iif;		/* the ingress a forwarded frame arrived on */
+	u8 *data;
+	unsigned int len;
 	struct sock *sk;	/* the gateway's own frames carry their socket */
-	/* The network header onwards, built from the fields above the first
-	 * time anything looks: a PPPoE session header, then an IP header of
-	 * the family `inner' names, or the IP header of `protocol' itself. */
-	u16 inner;
-	bool built, unwritable;
-	u8 head[96];
+	int skb_iif;		/* where a received frame came in; a scrub clears it */
+	u8 pkt_type;
+	/* A head shared with a clone cannot be written until it is copied,
+	 * and here the copy fails. */
+	bool unwritable;
+	u8 head[160];
 };
-struct qman_fq { unsigned channel, quenum; };
-static struct nf_conn *nf_ct_get(struct sk_buff *skb, enum ip_conntrack_info *info)
+static void *skb_header_pointer(const struct sk_buff *skb, int offset, int len, void *buffer)
 {
-	*info = IP_CT_ESTABLISHED;
-	return skb->ct;
+	if (offset < 0 || len < 0 || (unsigned)offset + (unsigned)len > skb->len)
+		return NULL;
+	memcpy(buffer, skb->data + offset, len);
+	return buffer;
 }
-
-/* RFC 1071, for an oracle independent of the incremental update being checked:
- * a header whose checksum is right sums to zero. */
-static u16 fold_sum(const u8 *p, unsigned len)
+static int skb_ensure_writable(struct sk_buff *skb, unsigned int len)
 {
-	u32 sum = 0;
-
-	for (unsigned i = 0; i < len; i += 2)
-		sum += (u32)p[i] << 8 | p[i + 1];
-	while (sum >> 16)
-		sum = (sum & 0xffff) + (sum >> 16);
-	return (u16)~sum;
+	assert(len <= skb->len);
+	return skb->unwritable ? -ENOMEM : 0;
 }
-
-static void build_ip(u8 *at, u16 proto, u8 tos)
-{
-	if (proto == htons(ETH_P_IP)) {
-		struct iphdr *iph = (struct iphdr *)at;
-		u16 sum;
-
-		iph->version = 4;
-		iph->ihl = 5;
-		iph->tos = tos;
-		iph->tot_len = htons(40);
-		iph->ttl = 63;
-		iph->protocol = 17;
-		iph->saddr = 0x0101a8c0;
-		iph->daddr = 0xe800000a;
-		sum = fold_sum(at, sizeof(*iph));
-		at[10] = sum >> 8;
-		at[11] = sum & 0xff;
-	} else if (proto == htons(ETH_P_IPV6)) {
-		struct ipv6hdr *ip6h = (struct ipv6hdr *)at;
-
-		ip6h->version = 6;
-		ip6h->priority = tos >> 4;
-		/* Traffic class low nibble, then a flow label that has to survive. */
-		ip6h->flow_lbl[0] = (u8)(tos << 4) | 0x0a;
-		ip6h->flow_lbl[1] = 0xbc;
-		ip6h->flow_lbl[2] = 0xde;
-		ip6h->nexthdr = 17;
-		ip6h->hop_limit = 63;
-	}
-}
-
-static u8 *skb_network_header(struct sk_buff *skb)
-{
-	if (!skb->built) {
-		skb->built = true;
-		if (skb->protocol == htons(ETH_P_PPP_SES)) {
-			struct pppoe_hdr *ph = (struct pppoe_hdr *)skb->head;
-
-			ph->type_ver = 0x11;
-			ph->sid = htons(0x1234);
-			skb->head[6] = 0;
-			skb->head[7] = skb->inner == htons(ETH_P_IPV6) ? PPP_IPV6 : PPP_IP;
-			build_ip(skb->head + PPPOE_SES_HLEN, skb->inner, skb->tos);
-		} else {
-			build_ip(skb->head, skb->protocol, skb->tos);
-		}
-	}
-	return skb->head;
-}
-static int skb_network_offset(const struct sk_buff *skb) { (void)skb; return 0; }
-static bool pskb_network_may_pull(struct sk_buff *skb, unsigned len)
-{ assert(len <= sizeof(skb->head)); return !skb->short_header; }
-static int skb_ensure_writable(struct sk_buff *skb, unsigned len)
-{ assert(len <= sizeof(skb->head)); return skb->unwritable ? -ENOMEM : 0; }
-static int skb_copy_bits(struct sk_buff *skb, int offset, void *to, int len)
-{
-	if (skb->short_header)
-		return -EFAULT;
-	memcpy(to, skb_network_header(skb) + offset, len);
-	return 0;
-}
-static struct iphdr *ip_hdr(struct sk_buff *skb)
-{ return (struct iphdr *)skb_network_header(skb); }
-static struct ipv6hdr *ipv6_hdr(struct sk_buff *skb)
-{ return (struct ipv6hdr *)skb_network_header(skb); }
+/* The kernel's own test for an IPv6 extension header (exthdrs.inc). */
+#include "exthdrs.inc"
 typedef struct { long long counter; } atomic64_t;
 #define ATOMIC64_INIT(v)	{ (v) }
 static void atomic64_inc(atomic64_t *v) { v->counter++; }
 static long long atomic64_read(const atomic64_t *v) { return v->counter; }
+static bool atomic64_try_cmpxchg(atomic64_t *v, s64 *old, s64 new)
+{
+	if (v->counter != *old) {
+		*old = v->counter;
+		return false;
+	}
+	v->counter = new;
+	return true;
+}
+struct qman_fq { unsigned channel, quenum; };
+/* netpoll sends with interrupts off, which the tests say. */
+static bool irqs_off;
+static bool irqs_disabled(void) { return irqs_off; }
+/* One CPU, whose per-CPU cache is only ever touched with interrupts off. */
+static int irq_depth;
+#define DEFINE_PER_CPU(type, name)	type name
+#define local_irq_save(flags)		((flags) = (unsigned long)irq_depth++)
+#define local_irq_restore(flags)	do { (void)(flags); assert(irq_depth > 0); irq_depth--; } while (0)
+#define this_cpu_ptr(p)			(assert(irq_depth > 0), (p))
+/* The clock the control budget runs on, which the tests move. */
+static s64 now_ns = 1000000000;
+static u64 ktime_get_mono_fast_ns(void) { return (u64)now_ns; }
 
 /* The DSCP filters, which own what a codepoint means. Their own validation is
  * tools/host_tests/dscp_map.c; here all that matters is that a frame naming no
@@ -543,12 +538,16 @@ static void synchronize_srcu(struct srcu_struct *ssp)
 	ssp->syncs++;
 	srcu_syncs++;
 }
-/* Nineteen bits wide, as cdx_flowtable.h declares it: the remark flag and
- * its codepoint sit above the sixteen a narrower type would keep. */
-typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
+/* As cdx_flowtable.h declares it: the class of the connection the IP header
+ * at nhoff belongs to. The class is nineteen bits wide, the remark flag and its
+ * codepoint above the sixteen a narrower type would keep. */
+typedef bool (*cdx_ft_qos_class_fn)(const struct sk_buff *skb, unsigned int nhoff,
+				    u8 family, bool own, u32 *class);
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
+static bool cdx_ft_qos_remarks;
 /* File-scope in the production file, so declared here. */
 static atomic64_t cdx_htb_remark_failures = ATOMIC64_INIT(0);
+static atomic64_t cdx_htb_control_overruns = ATOMIC64_INIT(0);
 
 /* The flowtable's hook for a port whose egress changed, kept alive by an SRCU
  * domain rather than by its callers' RTNL, which the adapter's unload does not
@@ -693,6 +692,9 @@ static void reset_world(void)
 	real_num_tx_queues_fails = 0;
 	class_counters_fail = false;
 	cdx_ft_qos_class_func = NULL;
+	cdx_ft_qos_remarks = false;
+	memset(&cdx_htb_datagrams, 0, sizeof(cdx_htb_datagrams));
+	irqs_off = false;
 	cdx_ft_egress_ops = NULL;
 	egress_changed_dev = NULL;
 	egress_changes = egress_drains = srcu_syncs = 0;
@@ -1104,21 +1106,218 @@ static void test_dispatch(void)
 	assert(allocations == 0);
 }
 
-/* The classifier the adapter registers, as ft_qos_class() decodes a mark: the
- * masked bits shifted down to their own base. Twelve bits wide, because a class
- * names a class queue, a channel and an ingress policer profile, one nibble
- * each, and a narrower field can only ever name the queue. */
-/* Called only inside a read-side section select_queue takes itself, since
- * ndo_select_queue is not always entered holding one. */
-static u32 test_qos_class(u32 mark) { assert(rcu_depth == 1); return (mark & 0xfff00) >> 8; }
+/* ---- frames ---------------------------------------------------------- */
 
-/* Send a frame whose conntrack carries the mark that decodes to `class`. */
-static u16 pick(struct net_device *dev, u16 class)
+/* RFC 1071, for an oracle independent of the incremental update being checked:
+ * a header whose checksum is right sums to zero. */
+static u16 fold_sum(const u8 *p, unsigned len)
 {
-	struct nf_conn ct = { .mark = (u32)class << 8 };
-	struct sk_buff skb = { .ct = &ct };
+	u32 sum = 0;
 
+	for (unsigned i = 0; i < len; i += 2)
+		sum += (u32)p[i] << 8 | p[i + 1];
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return (u16)~sum;
+}
+
+static void put16(u8 *at, u16 value) { at[0] = value >> 8; at[1] = value & 0xff; }
+
+/* What a test frame is made of. Every field left zero means the plain case:
+ * an untagged Ethernet frame carrying IPv4 UDP. */
+struct frame {
+	u16 tags[CDX_HTB_MAX_TAGS + 1];	/* outermost first, as TPIDs */
+	unsigned ntags;
+	bool pppoe;			/* a PPPoE session header */
+	u16 ppp;			/* its PPP protocol, when not IP */
+	u16 ethertype;			/* a frame that is not IP at all */
+	u8 family;			/* AF_INET by default */
+	u8 tos;
+	u8 proto;			/* UDP by default */
+	u16 dport;
+	u8 icmp6;			/* the ICMPv6 type, for proto ICMPv6 */
+	/* The destination: 0 off the link, 1 a multicast group (the limited
+	 * broadcast for DHCP), 2 IPv6 link-local. */
+	unsigned scope;
+	/* A fragment: the first of its datagram, or a later one, which
+	 * carries no transport header; the datagram's identification. */
+	bool first_fragment, later_fragment, last_fragment;
+	u16 id;
+	bool hop_by_hop;		/* IPv6: an extension header first */
+	u8 inner_family;		/* the IP header an IP-in-IP frame carries */
+	u8 inner_tos;
+	unsigned truncate;		/* bytes to cut off the end */
+};
+
+/* An IP header at `at', and the length of it with any extension headers.
+ * `fragment' is 0 for a whole datagram, 1 for its first fragment, 2 for a
+ * later one and 3 for the last. `scope' as struct frame has it. */
+static unsigned put_ip(u8 *at, u8 family, u8 tos, u8 proto, unsigned fragment,
+		       u16 id, bool hop_by_hop, unsigned scope)
+{
+	unsigned len = 40;
+
+	if (family == AF_INET6) {
+		at[0] = 0x60 | tos >> 4;
+		/* Traffic class low nibble, then a flow label that has to
+		 * survive a rewrite. */
+		at[1] = (u8)(tos << 4) | 0x0a;
+		at[2] = 0xbc;
+		at[3] = 0xde;
+		put16(at + 4, 64);
+		at[7] = 63;
+		memcpy(at + 8, "\xfd\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02", 16);
+		memcpy(at + 24, scope == 1 ? "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xff\x00\x00\x01" :
+				scope == 2 ? "\xfe\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01" :
+				"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", 16);
+		u8 *next = at + 6;
+		if (hop_by_hop) {
+			*next = 0;
+			next = at + len;
+			at[len + 1] = 0;
+			len += 8;
+		}
+		if (fragment) {
+			*next = 44;
+			next = at + len;
+			put16(at + len + 2, fragment == 1 ? IP6_MF :
+					    fragment == 2 ? 185 << 3 | IP6_MF : 370 << 3);
+			put16(at + len + 6, id);
+			len += 8;
+		}
+		*next = proto;
+		return len;
+	}
+	at[0] = 0x45;
+	at[1] = tos;
+	put16(at + 2, 60);
+	put16(at + 4, id);
+	if (fragment)
+		put16(at + 6, fragment == 1 ? IP_MF : fragment == 2 ? 185 | IP_MF : 370);
+	at[8] = 63;
+	at[9] = proto;
+	memcpy(at + 12, "\xc0\xa8\x01\x01", 4);
+	memcpy(at + 16, !scope ? "\x0a\x00\x00\xe8" : proto == IPPROTO_UDP ? "\xff\xff\xff\xff" :
+			"\xe0\x00\x00\x16", 4);
+	put16(at + 10, fold_sum(at, 20));
+	return 20;
+}
+
+/* Build `f' into `skb', and return where its own IP header starts, or 0. */
+static unsigned build(struct sk_buff *skb, const struct frame *f)
+{
+	u8 family = f->family ?: AF_INET;
+	u8 proto = f->proto ?: IPPROTO_UDP;
+	unsigned off = 12, nh, thoff;
+
+	memset(skb, 0, sizeof(*skb));
+	skb->data = skb->head;
+	memcpy(skb->head, "\x02\x00\x00\x00\x00\x01\x02\x00\x00\x00\x00\x02", 12);
+	for (unsigned i = 0; i < f->ntags; i++, off += VLAN_HLEN) {
+		put16(skb->head + off, f->tags[i]);
+		put16(skb->head + off + 2, 100 + i);
+	}
+	if (f->ethertype) {
+		put16(skb->head + off, f->ethertype);
+		skb->len = off + 2 + 46 - f->truncate;
+		return 0;
+	}
+	if (f->pppoe) {
+		put16(skb->head + off, ETH_P_PPP_SES);
+		off += 2;
+		skb->head[off] = 0x11;
+		put16(skb->head + off + 2, 0x1234);
+		put16(skb->head + off + 6, f->ppp ? f->ppp :
+		      family == AF_INET6 ? PPP_IPV6 : PPP_IP);
+		nh = off + PPPOE_SES_HLEN;
+		if (f->ppp) {
+			skb->len = nh + 40 - f->truncate;
+			return 0;
+		}
+	} else {
+		put16(skb->head + off, family == AF_INET6 ? ETH_P_IPV6 : ETH_P_IP);
+		nh = off + 2;
+	}
+	if (f->inner_family)
+		proto = f->inner_family == AF_INET ? IPPROTO_IPIP : IPPROTO_IPV6;
+	thoff = nh + put_ip(skb->head + nh, family, f->tos, proto,
+			    f->last_fragment ? 3 : f->later_fragment ? 2 :
+			    f->first_fragment ? 1 : 0, f->id, f->hop_by_hop, f->scope);
+	if (f->inner_family)
+		thoff += put_ip(skb->head + thoff, f->inner_family, f->inner_tos,
+				IPPROTO_UDP, 0, 0, false, 0);
+	if (proto == IPPROTO_ICMPV6 && !f->later_fragment && !f->last_fragment) {
+		skb->head[thoff] = f->icmp6 ? f->icmp6 : ICMPV6_ECHO_REQUEST;
+	} else {
+		put16(skb->head + thoff, 5000);
+		put16(skb->head + thoff + 2, f->dport ? f->dport : 5001);
+	}
+	skb->len = thoff + 8 + 32 - f->truncate;
+	assert(skb->len <= sizeof(skb->head));
+	return nh;
+}
+
+static u8 dsfield_at(struct sk_buff *skb, unsigned at)
+{
+	return skb->data[at] >> 4 == 6 ? ipv6_get_dsfield((struct ipv6hdr *)(skb->data + at)) :
+					  ipv4_get_dsfield((struct iphdr *)(skb->data + at));
+}
+static bool ipv4_sum_ok(struct sk_buff *skb, unsigned at)
+{ return fold_sum(skb->data + at, sizeof(struct iphdr)) == 0; }
+
+/* ---- the adapter's classifier ----------------------------------------- */
+
+/* What the connection of the frame's own header, and of the header an IP-in-IP
+ * frame carries, would be found as: known with a class, or not known. The
+ * classifier checks what it is handed -- a header of the family it is told,
+ * at the offset it is told, inside a read-side section the caller took -- and
+ * records it. A family of zero is a frame whose network header was not found,
+ * which only the conntrack an skb carries can answer for. */
+static struct conn { bool known; u32 class; } own_conn, inner_conn;
+static unsigned own_asked, inner_asked, last_nhoff;
+static u8 last_family;
+static bool test_classify(const struct sk_buff *skb, unsigned int nhoff, u8 family,
+			  bool own, u32 *class)
+{
+	const struct conn *conn = own ? &own_conn : &inner_conn;
+
+	assert(rcu_depth == 1);
+	if (family)
+		assert(nhoff < skb->len &&
+		       skb->data[nhoff] >> 4 == (family == AF_INET ? 4 : 6));
+	else
+		assert(own);
+	own ? own_asked++ : inner_asked++;
+	last_nhoff = nhoff;
+	last_family = family;
+	if (!conn->known)
+		return false;
+	*class = conn->class;
+	return true;
+}
+
+static void connections(struct conn own, struct conn inner)
+{
+	own_conn = own;
+	inner_conn = inner;
+	own_asked = inner_asked = 0;
+}
+#define KNOWN(c)	((struct conn){ true, (c) })
+#define UNKNOWN		((struct conn){ false, 0 })
+
+/* Queue selection for a frame built from `f', its connection known with
+ * `class'. */
+static u16 pick_frame(struct net_device *dev, const struct frame *f, u32 class)
+{
+	struct sk_buff skb;
+
+	build(&skb, f);
+	connections(KNOWN(class), UNKNOWN);
 	return cdx_htb_select_queue(dev, &skb);
+}
+static u16 pick(struct net_device *dev, u32 class)
+{
+	return pick_frame(dev, &(struct frame){ 0 }, class);
 }
 
 /* The software path has to reach the class the hardware path would have put
@@ -1127,12 +1326,12 @@ static u16 pick(struct net_device *dev, u16 class)
 static void test_software_path(void)
 {
 	struct net_device *dev = &devices[0];
-	struct sk_buff skb = { .ct = NULL };
+	struct sk_buff skb;
 	u16 qid1, qid2, qid10, qid11, moved;
 
 	reset_world();
-	assert(!cdx_register_ft_qos_class(test_qos_class));
-	assert(cdx_register_ft_qos_class(test_qos_class) == -EBUSY);
+	assert(!cdx_register_ft_qos_class(test_classify, true));
+	assert(cdx_register_ft_qos_class(test_classify, true) == -EBUSY);
 	assert(!create(dev, 1, 0));
 
 	/* Two channels, so the channel nibble has something to choose between. */
@@ -1144,12 +1343,14 @@ static void test_software_path(void)
 	/* Each leaf's queue is usable, which is the count the stack caps to. */
 	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES + 3);
 
-	/* Channel 1 is the first channel, class queue 7 is prio 0: the mark
+	/* Channel 1 is the first channel, class queue 7 is prio 0: the class
 	 * 0x70 | 0x0 that named 1:10 in hardware picks 1:10's Tx queue here.
-	 * The mark's channel nibble is one-based, as ceetm_get_egressfq()
+	 * The class's channel nibble is one-based, as ceetm_get_egressfq()
 	 * numbers them. */
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == qid10);
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 2)) == qid11);
+	/* The classifier was asked about the frame's own IPv4 header. */
+	assert(own_asked == 1 && !inner_asked && last_nhoff == ETH_HLEN && last_family == AF_INET);
 	/* Channel 2's only leaf is class 2, which still holds its own queue. */
 	assert(pick(dev, (2 << 4) | (NUM_PQS - 1)) == qid2);
 	/* A channel nibble of zero means the highest channel this port owns,
@@ -1169,9 +1370,34 @@ static void test_software_path(void)
 		assert(pick(dev, policed | (2 << 4) | (NUM_PQS - 1)) == qid2);
 		assert(pick(dev, policed | 0x03) == DPA_SELECT_QUEUE_NONE);
 	}
-	/* A frame with no conntrack has no class to read, and no DSCP filter
-	 * claims one either. */
+	/* A frame whose connection is not known has no class to read, and no
+	 * DSCP filter claims one either. */
+	build(&skb, &(struct frame){ 0 });
+	connections(UNKNOWN, UNKNOWN);
 	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+
+	/* However the frame is framed, the class of its connection reaches the
+	 * same leaf: behind a VLAN tag or two, in a PPPoE session, with an IPv6
+	 * extension header first. Each time the classifier is handed the IP
+	 * header where it really starts. */
+	const u32 ef_class = (1 << 4) | (NUM_PQS - 1);
+	assert(pick_frame(dev, &(struct frame){ .ntags = 1, .tags = { ETH_P_8021Q } },
+			  ef_class) == qid10 && last_nhoff == ETH_HLEN + VLAN_HLEN);
+	assert(pick_frame(dev, &(struct frame){ .ntags = 2,
+						.tags = { ETH_P_8021AD, ETH_P_8021Q } },
+			  ef_class) == qid10 && last_nhoff == ETH_HLEN + 2 * VLAN_HLEN);
+	assert(pick_frame(dev, &(struct frame){ .pppoe = true }, ef_class) == qid10 &&
+	       last_nhoff == ETH_HLEN + PPPOE_SES_HLEN && last_family == AF_INET);
+	assert(pick_frame(dev, &(struct frame){ .ntags = 1, .tags = { ETH_P_8021Q },
+						.pppoe = true, .family = AF_INET6 },
+			  ef_class) == qid10 &&
+	       last_nhoff == ETH_HLEN + VLAN_HLEN + PPPOE_SES_HLEN && last_family == AF_INET6);
+	/* Behind more tags than a port can carry the IP header is not read, so
+	 * the classifier is handed none: only a conntrack the skb still
+	 * carries can answer, and here it does. */
+	assert(pick_frame(dev, &(struct frame){ .ntags = 3,
+						.tags = { ETH_P_8021AD, ETH_P_8021Q, ETH_P_8021Q } },
+			  ef_class) == qid10 && !last_family);
 
 	/* ---- the DSCP map answers for frames that named no class ---- */
 
@@ -1179,62 +1405,71 @@ static void test_software_path(void)
 	/* EF on channel 1, class queue 7 -- 1:10's pair, in the encoding the
 	 * published class map is indexed by. */
 	dscp_classes[46] = (1 << 4) | (NUM_PQS - 1);
-	struct sk_buff ef = { .ct = NULL, .protocol = htons(ETH_P_IP), .tos = 46 << 2 };
-	assert(cdx_htb_select_queue(dev, &ef) == qid10);
+	connections(UNKNOWN, UNKNOWN);
+	build(&skb, &(struct frame){ .tos = 46 << 2 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
 	/* Including over IPv6, where the same six bits sit in a different
-	 * header. */
-	struct sk_buff ef6 = { .ct = NULL, .protocol = htons(ETH_P_IPV6), .tos = 46 << 2 };
-	assert(cdx_htb_select_queue(dev, &ef6) == qid10);
+	 * header, and behind a tag or a session header, which the map used to
+	 * miss because it read only the frame's own protocol. */
+	build(&skb, &(struct frame){ .family = AF_INET6, .tos = 46 << 2 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .pppoe = true, .tos = 46 << 2 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .ntags = 1, .tags = { ETH_P_8021Q },
+				     .family = AF_INET6, .tos = 46 << 2 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	/* Inside an IP-in-IP frame, the carried packet's codepoint: the one its
+	 * sender set, whatever the tunnel wrote outside. */
+	build(&skb, &(struct frame){ .inner_family = AF_INET6, .inner_tos = 46 << 2 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .tos = 46 << 2, .inner_family = AF_INET6 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 	/* A codepoint nobody claimed leaves the stack's own choice alone. */
-	struct sk_buff be = { .ct = NULL, .protocol = htons(ETH_P_IP), .tos = 0 };
-	assert(cdx_htb_select_queue(dev, &be) == DPA_SELECT_QUEUE_NONE);
-	/* So does a frame that is not IP at all, and one whose header cannot
-	 * be read without pulling it. */
-	struct sk_buff arp = { .ct = NULL, .protocol = htons(0x0806), .tos = 46 << 2 };
-	assert(cdx_htb_select_queue(dev, &arp) == DPA_SELECT_QUEUE_NONE);
-	struct sk_buff runt = { .ct = NULL, .protocol = htons(ETH_P_IP),
-				.tos = 46 << 2, .short_header = true };
-	assert(cdx_htb_select_queue(dev, &runt) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .tos = 0 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	/* So does a frame that is not IP at all, one whose header is cut
+	 * short, and a PPP frame that is not IP. */
+	build(&skb, &(struct frame){ .ethertype = ETH_P_ARP });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .tos = 46 << 2 });
+	skb.len = ETH_HLEN + 12;
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .pppoe = true, .ppp = PPP_LCP });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 
 	/* A frame that *did* name a class keeps it: the mark outranks the map,
 	 * which is the precedence the hardware applies to the same frame. */
-	struct nf_conn marked = { .mark = (u32)((2 << 4) | (NUM_PQS - 1)) << 8 };
-	struct sk_buff both = { .ct = &marked, .protocol = htons(ETH_P_IP),
-				.tos = 46 << 2 };
-	assert(cdx_htb_select_queue(dev, &both) == qid2);
-	/* And a conntracked frame whose mark names nothing still gets the map's
+	build(&skb, &(struct frame){ .tos = 46 << 2 });
+	connections(KNOWN((2 << 4) | (NUM_PQS - 1)), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid2);
+	/* And a connection whose mark names nothing still gets the map's
 	 * answer, rather than falling through to the stack's choice. */
-	struct nf_conn unmarked = { .mark = 0 };
-	struct sk_buff ct_ef = { .ct = &unmarked, .protocol = htons(ETH_P_IP),
-				 .tos = 46 << 2 };
-	assert(cdx_htb_select_queue(dev, &ct_ef) == qid10);
+	connections(KNOWN(0), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
 
 	/* A class the map names but no leaf holds is not a queue. */
 	dscp_classes[46] = 0x03;
-	assert(cdx_htb_select_queue(dev, &ef) == DPA_SELECT_QUEUE_NONE);
+	connections(UNKNOWN, UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 	/* Nor is one past the table the class map is sized for. */
 	dscp_classes[46] = CDX_HTB_CLASSES + 1;
-	assert(cdx_htb_select_queue(dev, &ef) == DPA_SELECT_QUEUE_NONE);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 	memset(dscp_classes, 0, sizeof(dscp_classes));
 
 	/* And the Tx path resolves the pair back out of the queue index. */
-	struct sk_buff own = { .ct = NULL };
-	struct nf_conn plain = { .mark = 0 };
-	struct sk_buff forwarded = { .ct = &plain, .skb_iif = 5 };
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid10, &own) == &class_fqs[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &own) == &class_fqs[0][NUM_PQS - 2]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2, &own) == &class_fqs[1][NUM_PQS - 1]);
+	struct sk_buff data_frame;
+	build(&data_frame, &(struct frame){ 0 });
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid10, &data_frame) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &data_frame) == &class_fqs[0][NUM_PQS - 2]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2, &data_frame) == &class_fqs[1][NUM_PQS - 1]);
 	/* An ordinary queue, or a slot no class holds, carries a frame that
 	 * named no leaf -- and on a port with a tree that frame is the tree's
-	 * to place too, never the driver's mark-based guess. The gateway's own
-	 * frame takes the top channel's control queue; a forwarded, tracked
-	 * one takes class queue 0 there, where the hardware puts its flow. */
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[1][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES - 1, &forwarded) ==
+	 * to place too, never the driver's mark-based guess: class queue 0 of
+	 * the top channel, where the hardware puts a flow with no class. */
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &data_frame) == &class_fqs[1][0]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES + 3, &data_frame) ==
 	       &class_fqs[1][0]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES + 3, &own) ==
-	       &class_fqs[1][NUM_PQS - 1]);
-	assert(!cdx_htb_txq_fq(NULL, qid10, &own));
+	assert(!cdx_htb_txq_fq(NULL, qid10, &data_frame));
 
 	/* Deleting a leaf that is not the last one takes its class off the map,
 	 * and the leaf that moved into the hole answers for the hole -- with
@@ -1244,25 +1479,25 @@ static void test_software_path(void)
 	assert(moved == 11);
 	assert(pick(dev, (2 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 2)) == qid2);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2, &own) == &class_fqs[0][NUM_PQS - 2]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid2, &data_frame) == &class_fqs[0][NUM_PQS - 2]);
 	/* Channel 2 stays claimed for the next class under the root, but no
 	 * class holds it and it runs unshaped, so it is no longer the top
 	 * channel: frames on a queue no class holds take the first channel's
-	 * control queue, and the mark that names "whichever channel this port
+	 * class queue 0, and the class that names "whichever channel this port
 	 * owns" means the first channel -- where 1:10 holds queue 7. */
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, qid11, &data_frame) == &class_fqs[0][0]);
 	assert(pick(dev, NUM_PQS - 1) == qid10);
 
 	assert(!destroy(dev));
 	assert(dev->real_num_tx_queues == DPAA_ETH_TX_QUEUES);
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
 	/* No tree, no opinion: the driver's own resolution is back. */
-	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES, &own));
-	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &forwarded));
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, DPAA_ETH_TX_QUEUES, &data_frame));
+	assert(!cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &data_frame));
 	assert_balanced(dev);
 
-	/* With no classifier registered no mark is decoded, and no frame is put
-	 * on a leaf's queue. The tree still owns the port, though, so every
+	/* With no classifier registered no class is decoded, and no frame is
+	 * put on a leaf's queue. The tree still owns the port, though, so every
 	 * frame still lands on one of its queues rather than wherever the
 	 * driver's mark field would have sent it. */
 	net_syncs = 0;
@@ -1271,60 +1506,207 @@ static void test_software_path(void)
 	assert(!create(dev, 1, 0));
 	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == DPA_SELECT_QUEUE_NONE);
-	assert(!rcu_depth);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &forwarded) == &class_fqs[0][0]);
+	assert(!own_asked && !rcu_depth);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &data_frame) == &class_fqs[0][0]);
+	build(&skb, &(struct frame){ .ethertype = ETH_P_ARP });
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &skb) == &class_fqs[0][NUM_PQS - 1]);
 	assert(!destroy(dev));
 	assert_balanced(dev);
+}
+
+/* A frame for the port, and the queue the Tx path puts it on when it names no
+ * leaf: selected, then resolved from the direct queue if it is left there. */
+static struct qman_fq *queue_of(struct net_device *dev, struct sk_buff *skb)
+{
+	u16 qid = cdx_htb_select_queue(dev, skb);
+
+	return cdx_htb_txq_fq(dev->priv.qm_ctx, qid == DPA_SELECT_QUEUE_NONE ? 3 : qid, skb);
 }
 
 /* Traffic that names no leaf, on a port whose tree is live.
  *
  * It used to go wherever the driver's mark field said: class queue 7 for every
  * frame with no mark, a queue no leaf configured and eligible only for excess
- * tokens. With rate equal to ceil a channel has none except what its classes
- * leave over, so one saturated leaf starved the gateway's own frames, and the
- * same flow sat on queue 7 in software and queue 0 in hardware. Now both
- * paths resolve it the same way, onto a queue the tree keeps eligible for
- * committed tokens, and `default' is honoured. */
+ * tokens, so one saturated leaf starved the gateway's own frames. Then it was
+ * split on whether the frame still had its conntrack and ingress index, which a
+ * PPPoE session or a tunnel scrubs, so every frame the CPU sent into a session
+ * rode the top of the tree. Now the split is on what the frame is: anything
+ * whose connection names no class is unclassified -- class queue 0, or the
+ * default leaf -- wherever it came from; link traffic and the gateway's own
+ * are control -- class queue 7, never the default leaf, and inside a budget. */
 static void test_unclassified(void)
 {
 	struct net_device *dev = &devices[0];
 	struct tQM_context_ctl *ctx = dev->priv.qm_ctx;
-	struct nf_conn plain = { .mark = 0 };
-	struct nf_conn stray = { .mark = (u32)((1 << 4) | 3) << 8 };	/* no leaf holds it */
-	struct sk_buff own = { .ct = NULL };
-	struct sk_buff own_tracked = { .ct = &plain };
-	struct sk_buff forwarded = { .ct = &plain, .skb_iif = 5 };
-	struct sk_buff forwarded_stray = { .ct = &stray, .skb_iif = 5 };
-	struct sk_buff bridged = { .ct = NULL, .skb_iif = 5 };
+	struct sock *owner = (struct sock *)&own_conn;
+	struct sk_buff skb;
 	u16 qid1, qid10, qid20, qid17, qid2;
 	u32 channel, cq;
 
 	/* ---- no default: control on queue 7, unclassified on queue 0 ---- */
 	reset_world();
-	assert(!cdx_register_ft_qos_class(test_qos_class));
+	assert(!cdx_register_ft_qos_class(test_classify, true));
 	channel = 0; cq = 0;
 	assert(!cdx_htb_resolve_class(ctx, &channel, &cq));	/* no tree yet */
 	assert(!create(dev, 1, 0));
-	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000000, 1000000, &qid1));
 	assert(!to_inner(dev, 10, 1, 1, 0));			/* prio 1: queue 6 */
 	assert(!query(dev, 10, &qid10));
 	/* Both queues those frames take are eligible for the channel's
 	 * committed rate, configured as a leaf's would be. */
 	assert(cq_live[0][0] && cq_weight[0][0] == 0);
 	assert(cq_live[0][NUM_PQS - 1] && cq_weight[0][NUM_PQS - 1] == 0);
-	/* The gateway's own frames, and those conntrack never saw, take the
-	 * control queue; a forwarded, tracked frame takes queue 0 -- as does
-	 * one naming a class no leaf holds. */
-	assert(cdx_htb_select_queue(dev, &own) == DPA_SELECT_QUEUE_NONE);
-	assert(cdx_htb_select_queue(dev, &own_tracked) == DPA_SELECT_QUEUE_NONE);
-	assert(cdx_htb_select_queue(dev, &forwarded) == DPA_SELECT_QUEUE_NONE);
-	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(ctx, 3, &own_tracked) == &class_fqs[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(ctx, 3, &bridged) == &class_fqs[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(ctx, 3, &forwarded) == &class_fqs[0][0]);
-	assert(cdx_htb_txq_fq(ctx, 3, &forwarded_stray) == &class_fqs[0][0]);
+
+	/* Unclassified, whatever the stack did or did not attach on the way: a
+	 * forwarded frame with no class, one naming a class no leaf holds, a
+	 * frame bridged without conntrack, one untracked on purpose. */
+	struct conn stray = KNOWN((1 << 4) | 3);
+	build(&skb, &(struct frame){ 0 });
+	connections(KNOWN(0), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	connections(stray, UNKNOWN);
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	connections(UNKNOWN, UNKNOWN);
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	skb.pkt_type = PACKET_OTHERHOST;
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	/* A frame for a PPPoE session reaches the port with no conntrack and
+	 * no ingress -- ppp_start_xmit() scrubbed both -- and is unclassified
+	 * too, not control: it used to take the top of the tree. */
+	build(&skb, &(struct frame){ .ntags = 1, .tags = { ETH_P_8021Q }, .pppoe = true });
+	connections(UNKNOWN, UNKNOWN);
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	/* And its connection, found again from its tuple, picks its leaf. */
+	connections(KNOWN((1 << 4) | (NUM_PQS - 2)), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	assert(last_nhoff == ETH_HLEN + VLAN_HLEN + PPPOE_SES_HLEN);
+
+	/* An IP-in-IP frame takes the class of the connection it carries,
+	 * which is what the hardware entry of the offloaded flow carries; the
+	 * tunnel's own conntrack only when the carried one is not known. */
+	build(&skb, &(struct frame){ .inner_family = AF_INET6 });
+	connections(KNOWN((1 << 4) | 3), KNOWN((1 << 4) | (NUM_PQS - 2)));
+	assert(cdx_htb_select_queue(dev, &skb) == qid10 && inner_asked == 1 && !own_asked);
+	assert(last_nhoff == ETH_HLEN + 20 && last_family == AF_INET6);
+	connections(KNOWN((1 << 4) | (NUM_PQS - 2)), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10 && inner_asked == 1 && own_asked == 1);
+	connections(UNKNOWN, UNKNOWN);
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	build(&skb, &(struct frame){ .family = AF_INET6, .inner_family = AF_INET });
+	connections(UNKNOWN, KNOWN((1 << 4) | (NUM_PQS - 2)));
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	assert(last_nhoff == ETH_HLEN + 40 && last_family == AF_INET);
+
+	/* Link protocols the gateway originates -- no socket and no ingress,
+	 * as ARP, LCP and IGMP leave it, and in IP addressed on the link --
+	 * are control, and take queue 7. */
+	const struct frame link[] = {
+		{ .ethertype = ETH_P_ARP },
+		{ .ethertype = ETH_P_PPP_DISC },
+		{ .pppoe = true, .ppp = PPP_LCP },
+		{ .ntags = 1, .tags = { ETH_P_8021Q }, .ethertype = ETH_P_ARP },
+		{ .proto = IPPROTO_IGMP, .scope = 1 },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6, .icmp6 = NDISC_NEIGHBOUR_SOLICITATION,
+		  .scope = 1 },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6, .icmp6 = NDISC_ROUTER_ADVERTISEMENT,
+		  .hop_by_hop = true, .scope = 1 },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6, .icmp6 = ICMPV6_MLD2_REPORT,
+		  .hop_by_hop = true, .scope = 1 },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6,
+		  .icmp6 = NDISC_NEIGHBOUR_ADVERTISEMENT, .scope = 2 },
+		{ .dport = 67, .scope = 1 }, { .dport = 68, .scope = 1 },
+		{ .family = AF_INET6, .dport = 546, .scope = 2 },
+		{ .family = AF_INET6, .dport = 547, .scope = 1 },
+		{ .ethertype = 0x88cc },			/* LLDP */
+	};
+	for (unsigned i = 0; i < ARRAY_SIZE(link); i++) {
+		bool ip = !link[i].ethertype && !link[i].ppp;
+		struct frame off_link = link[i];
+
+		build(&skb, &link[i]);
+		connections(UNKNOWN, UNKNOWN);
+		assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+		assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
+		/* So is one the bridge forwards between ports, received on one
+		 * and addressed to another host. */
+		skb.skb_iif = 4;
+		skb.pkt_type = PACKET_OTHERHOST;
+		assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
+		/* One routing forwarded is traffic, on its flow's queue: a
+		 * link protocol is never routed but DHCP, and a unicast DHCP
+		 * flow can be offloaded like any other. Not IP, it cannot have
+		 * been routed at all. */
+		skb.pkt_type = PACKET_HOST;
+		assert(queue_of(dev, &skb) == &class_fqs[0][ip ? 0 : NUM_PQS - 1]);
+		if (!ip)
+			continue;
+		/* Nor is one shaped like a link protocol and addressed off the
+		 * link, that reached the port with its ingress scrubbed -- a
+		 * host routing it into a PPPoE session. It would otherwise
+		 * spend the reserve the gateway's own link traffic has. */
+		off_link.scope = 0;
+		build(&skb, &off_link);
+		assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+		assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+		off_link.pppoe = true;
+		build(&skb, &off_link);
+		assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	}
+	/* The gateway's own frames of every other kind, by their socket --
+	 * its ICMP echoes and errors, its sessions -- and whatever netpoll
+	 * sends with interrupts off. */
+	const struct frame own[] = {
+		{ .proto = IPPROTO_UDP },
+		{ .proto = IPPROTO_ICMP },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6 },
+		{ .pppoe = true, .proto = IPPROTO_ICMP },
+		{ .proto = IPPROTO_TCP },
+	};
+	for (unsigned i = 0; i < ARRAY_SIZE(own); i++) {
+		build(&skb, &own[i]);
+		connections(UNKNOWN, UNKNOWN);
+		skb.sk = owner;
+		assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+		assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
+		skb.sk = NULL;
+		irqs_off = true;
+		assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
+		irqs_off = false;
+	}
+	/* Not control: ICMP a host sent through the gateway, however it was
+	 * framed; a protocol number or a DHCP port in the wrong family; and a
+	 * fragment whose transport header is not in it -- nothing says what it
+	 * carries. */
+	const struct frame data[] = {
+		{ .proto = IPPROTO_ICMP },
+		{ .pppoe = true, .proto = IPPROTO_ICMP },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6 },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMP },
+		{ .proto = IPPROTO_ICMPV6 },
+		{ .proto = IPPROTO_IGMP, .family = AF_INET6 },
+		{ .family = AF_INET6, .dport = 67 },
+		{ .dport = 547 },
+		{ .dport = 67, .later_fragment = true },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6,
+		  .icmp6 = NDISC_NEIGHBOUR_SOLICITATION, .later_fragment = true },
+		{ .family = AF_INET6, .proto = IPPROTO_ICMPV6, .hop_by_hop = true,
+		  .later_fragment = true },
+	};
+	for (unsigned i = 0; i < ARRAY_SIZE(data); i++) {
+		build(&skb, &data[i]);
+		connections(UNKNOWN, UNKNOWN);
+		assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+		skb.skb_iif = 4;
+		assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+		skb.pkt_type = PACKET_OTHERHOST;
+		assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	}
+	/* A control frame whose connection does name a leaf takes it. */
+	build(&skb, &(struct frame){ .proto = IPPROTO_ICMP });
+	connections(KNOWN((1 << 4) | (NUM_PQS - 2)), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+
 	/* And the hardware agrees: no class, or a class no leaf holds, is the
 	 * top channel's queue 0; a leaf's class is the leaf's. The channel is
 	 * in the mark's numbering both ways. */
@@ -1339,28 +1721,36 @@ static void test_unclassified(void)
 
 	/* A leaf on queue 0 (prio 7) is where the unclassified already went, so
 	 * it is now the class they land on in software too, from the leaf's
-	 * own Tx queue. The gateway's own frames stay on the control queue. */
+	 * own Tx queue. Control stays on the control queue. */
 	assert(!add_leaf(dev, 17, 1, 7, 0, 0, 0, &qid17));
-	assert(cdx_htb_select_queue(dev, &forwarded) == qid17);
-	assert(cdx_htb_select_queue(dev, &forwarded_stray) == qid17);
-	assert(cdx_htb_select_queue(dev, &own) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ 0 });
+	connections(KNOWN(0), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid17);
+	connections(stray, UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid17);
+	skb.sk = owner;
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 	/* It is the leaf's queue now, and deleting the leaf gives it back to
 	 * the unclassified: reset, then eligible again. */
 	assert(!del_leaf(dev, 17, NULL));
-	assert(cq_live[0][0] && cdx_htb_select_queue(dev, &forwarded) == DPA_SELECT_QUEUE_NONE);
+	skb.sk = NULL;
+	assert(cq_live[0][0] && cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 	/* A prio 0 leaf shares the control queue rather than displacing it. */
 	assert(!add_leaf(dev, 11, 1, 0, 0, 0, 0, NULL));
-	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
+	build(&skb, &(struct frame){ .ethertype = ETH_P_ARP });
+	assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
 	assert(!del_leaf(dev, 11, NULL));
 	assert(cq_live[0][NUM_PQS - 1]);
 
 	/* A class under the root on a higher channel moves the top channel, and
 	 * the eligible queues move with it; the ones left behind are reset. */
-	assert(!add_leaf(dev, 2, 0, 3, 0, 1000, 1000, &qid2));	/* channel 1 */
+	assert(!add_leaf(dev, 2, 0, 3, 0, 1000000, 1000000, &qid2));	/* channel 1 */
 	assert(cq_live[1][0] && cq_live[1][NUM_PQS - 1]);
 	assert(!cq_live[0][0] && !cq_live[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[1][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(ctx, 3, &forwarded) == &class_fqs[1][0]);
+	assert(queue_of(dev, &skb) == &class_fqs[1][NUM_PQS - 1]);
+	build(&skb, &(struct frame){ 0 });
+	connections(UNKNOWN, UNKNOWN);
+	assert(queue_of(dev, &skb) == &class_fqs[1][0]);
 
 	/* Deleting that class leaves its channel claimed and unshaped, and the
 	 * top channel goes back to the one a class still holds: frames that
@@ -1371,8 +1761,10 @@ static void test_unclassified(void)
 	assert(chan_cir[1] == 0 && chan_eir[1] == 0);
 	assert(cq_live[0][0] && cq_live[0][NUM_PQS - 1]);
 	assert(!cq_live[1][0] && !cq_live[1][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
-	assert(cdx_htb_txq_fq(ctx, 3, &forwarded) == &class_fqs[0][0]);
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
+	skb.sk = owner;
+	assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
+	skb.sk = NULL;
 	channel = 0; cq = 0;
 	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == 0);
 	/* A class under the root that fails after the claim changes nothing
@@ -1384,7 +1776,7 @@ static void test_unclassified(void)
 	assert(add_leaf(dev, 3, 0, 2, 0, 5000, 5000, NULL) == -EIO);
 	fault_point = -1;
 	assert(chan_cir[1] == 0 && chan_eir[1] == 0);
-	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(queue_of(dev, &skb) == &class_fqs[0][0]);
 	assert(cq_live[0][0] && cq_live[0][NUM_PQS - 1]);
 
 	/* A leaf that takes one of those queues and then fails to come into
@@ -1417,28 +1809,52 @@ static void test_unclassified(void)
 	assert(!destroy(dev));
 	assert_balanced(dev);
 
-	/* ---- a default leaf takes all of it ---- */
+	/* ---- a default leaf takes unclassified traffic, never control ---- */
 	reset_world();
-	assert(!cdx_register_ft_qos_class(test_qos_class));
+	assert(!cdx_register_ft_qos_class(test_classify, true));
 	assert(!create(dev, 1, 20));
-	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000000, 1000000, &qid1));
 	assert(!to_inner(dev, 10, 1, 0, 0));			/* queue 7 */
 	assert(!query(dev, 10, &qid10));
 	/* Named before the leaf exists, as `tc qdisc add ... default 20' is:
 	 * nothing to honour until a leaf by that minor arrives. */
-	assert(cdx_htb_select_queue(dev, &forwarded) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ 0 });
+	connections(KNOWN(0), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 	assert(!add_leaf(dev, 20, 1, 2, 0, 0, 0, &qid20));	/* queue 5 */
-	/* Tracked or not, forwarded or the gateway's own, with no class or a
-	 * class no leaf holds: the default leaf, from its own Tx queue. */
-	assert(cdx_htb_select_queue(dev, &own) == qid20);
-	assert(cdx_htb_select_queue(dev, &own_tracked) == qid20);
-	assert(cdx_htb_select_queue(dev, &forwarded) == qid20);
-	assert(cdx_htb_select_queue(dev, &forwarded_stray) == qid20);
-	assert(cdx_htb_select_queue(dev, &bridged) == qid20);
+	/* Tracked or not, forwarded or bridged, with no class or a class no
+	 * leaf holds: the default leaf, from its own Tx queue. */
+	assert(cdx_htb_select_queue(dev, &skb) == qid20);
+	connections(stray, UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid20);
+	connections(UNKNOWN, UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid20);
+	skb.pkt_type = PACKET_OTHERHOST;
+	assert(cdx_htb_select_queue(dev, &skb) == qid20);
 	/* A class a leaf does hold is still that leaf. */
 	assert(pick(dev, (1 << 4) | (NUM_PQS - 1)) == qid10);
-	/* A frame caught on a direct queue anyway goes there too. */
-	assert(cdx_htb_txq_fq(ctx, 3, &own) == &class_fqs[0][NUM_PQS - 3]);
+	/* Control does not follow it: a default is commonly the lowest class,
+	 * and a saturated leaf above it would starve an LCP echo there. It
+	 * takes queue 7, which the prio 0 leaf shares. */
+	for (unsigned i = 0; i < ARRAY_SIZE(link); i++) {
+		build(&skb, &link[i]);
+		connections(UNKNOWN, UNKNOWN);
+		assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+		assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
+	}
+	build(&skb, &(struct frame){ 0 });
+	skb.sk = owner;
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	assert(queue_of(dev, &skb) == &class_fqs[0][NUM_PQS - 1]);
+	/* ICMP a host sent through the gateway is its traffic, and takes the
+	 * default leaf with everything else unclassified. */
+	build(&skb, &(struct frame){ .proto = IPPROTO_ICMP });
+	skb.skb_iif = 4;
+	assert(cdx_htb_select_queue(dev, &skb) == qid20);
+	build(&skb, &(struct frame){ 0 });
+	/* A frame caught on a direct queue anyway goes to the default leaf. */
+	skb.sk = NULL;
+	assert(cdx_htb_txq_fq(ctx, 3, &skb) == &class_fqs[0][NUM_PQS - 3]);
 	/* The hardware resolves no class, and a class no leaf holds, to it. */
 	channel = 0; cq = 0;
 	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == NUM_PQS - 3);
@@ -1450,23 +1866,252 @@ static void test_unclassified(void)
 	assert(!del_leaf(dev, 20, NULL));
 	channel = 0; cq = 0;
 	assert(cdx_htb_resolve_class(ctx, &channel, &cq) && channel == 1 && cq == 0);
-	assert(cdx_htb_select_queue(dev, &own) == DPA_SELECT_QUEUE_NONE);
+	connections(KNOWN(0), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
 	assert(!destroy(dev));
 	assert_balanced(dev);
 	cdx_unregister_ft_qos_class();
 	assert(allocations == 0);
 }
 
-/* A class's whole value, remark included: the mark is the class here. */
-static u32 whole_class(u32 mark) { assert(rcu_depth == 1); return mark; }
+/* Control traffic's budget: what it may take of the top channel before the
+ * rest of it is sent as unclassified traffic. */
+static void test_control_budget(void)
+{
+	struct net_device *dev = &devices[0];
+	struct cdx_htb_port *port;
+	struct sock *owner = (struct sock *)&own_conn;
+	struct sk_buff arp, own;
+	unsigned sessions, links;
+	u64 overruns;
+	u16 qid1;
 
-/* What a frame's IP header says after the port picked its queue. */
-static u8 ipv4_tos(struct sk_buff *skb, unsigned offset)
-{ return ((struct iphdr *)(skb_network_header(skb) + offset))->tos; }
-static bool ipv4_sum_ok(struct sk_buff *skb, unsigned offset)
-{ return fold_sum(skb_network_header(skb) + offset, sizeof(struct iphdr)) == 0; }
-static u8 ipv6_tc(struct sk_buff *skb, unsigned offset)
-{ return ipv6_get_dsfield((struct ipv6hdr *)(skb_network_header(skb) + offset)); }
+	reset_world();
+	assert(!cdx_register_ft_qos_class(test_classify, true));
+	connections(UNKNOWN, UNKNOWN);
+	assert(!create(dev, 1, 0));
+	port = cdx_htb_port_of(dev);
+	/* No tree yet: nothing to budget, and nothing asks. */
+	assert(!port->control_rate);
+	/* A sixteenth of the top channel's committed rate. */
+	assert(!add_leaf(dev, 1, 0, 0, 0, 16000000, 32000000, &qid1));
+	assert(port->control_rate == 1000000);
+	assert(port->control_tau == (s64)CDX_HTB_CONTROL_BURST * 1000);
+	/* And it follows the rate. */
+	assert(!modify(dev, 1, 0, 0, 125000000, 125000000));
+	assert(port->control_rate == 125000000 / 16);
+	/* Never under the floor, unless the channel is slower than twice it. */
+	assert(!modify(dev, 1, 0, 0, 64000, 64000));
+	assert(port->control_rate == CDX_HTB_CONTROL_FLOOR);
+	assert(!modify(dev, 1, 0, 0, 10000, 10000));
+	assert(port->control_rate == 5000);
+	assert(!modify(dev, 1, 0, 0, 16000000, 32000000));
+
+	/* The gateway's own sessions spend the budget down to one burst ahead
+	 * of now; after that their frames go where unclassified traffic goes. */
+	build(&own, &(struct frame){ 0 });
+	own.sk = owner;
+	own.len = 1000;
+	overruns = cdx_ft_qos_control_overruns();
+	for (sessions = 0;
+	     cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[0][NUM_PQS - 1];
+	     sessions++)
+		assert(sessions < 100);
+	/* A burst of CDX_HTB_CONTROL_BURST bytes, give or take the frame that
+	 * crosses it. */
+	assert(sessions * 1000 >= CDX_HTB_CONTROL_BURST &&
+	       sessions * 1000 <= CDX_HTB_CONTROL_BURST + 1000);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[0][0]);
+	assert(cdx_ft_qos_control_overruns() == overruns + 2);
+	/* A host's broadcast the bridge carries between ports is control, but
+	 * it spends what the gateway's sessions spend, not the reserve the
+	 * gateway's own link traffic has. */
+	struct sk_buff bridged;
+	build(&bridged, &(struct frame){ .ethertype = ETH_P_ARP });
+	bridged.skb_iif = 4;
+	bridged.pkt_type = PACKET_OTHERHOST;
+	bridged.len = 1000;
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &bridged) == &class_fqs[0][0]);
+	/* Link traffic has a second burst of its own beyond that, so the
+	 * gateway's sessions cannot push an ARP reply or an LCP echo off the
+	 * top of the tree. */
+	build(&arp, &(struct frame){ .ethertype = ETH_P_ARP });
+	arp.len = 1000;
+	for (links = 0;
+	     cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &arp) == &class_fqs[0][NUM_PQS - 1];
+	     links++)
+		assert(links < 100);
+	assert(links * 1000 >= CDX_HTB_CONTROL_BURST - 1000 &&
+	       links * 1000 <= CDX_HTB_CONTROL_BURST + 1000);
+	/* Past both, link traffic too is sent on as unclassified, not dropped:
+	 * a flood of it is bounded like anything else. */
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &arp) == &class_fqs[0][0]);
+	/* The budget refills at its rate: a millisecond is a thousand bytes at
+	 * a megabyte a second, so a session frame fits again once the clock
+	 * has moved past both bursts' worth and a frame more. */
+	now_ns += (s64)(sessions + links + 1) * 1000 * 1000;
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[0][NUM_PQS - 1]);
+	assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &arp) == &class_fqs[0][NUM_PQS - 1]);
+	/* Unclassified traffic never touches the budget. */
+	build(&own, &(struct frame){ 0 });
+	overruns = cdx_ft_qos_control_overruns();
+	for (unsigned i = 0; i < 100; i++)
+		assert(cdx_htb_txq_fq(dev->priv.qm_ctx, 0, &own) == &class_fqs[0][0]);
+	assert(cdx_ft_qos_control_overruns() == overruns);
+	assert(!destroy(dev));
+	assert(!port->control_rate);
+	assert_balanced(dev);
+	cdx_unregister_ft_qos_class();
+}
+
+/* A datagram's fragments take one class. Where a scrub left none of them a
+ * conntrack, the first finds its connection by its tuple, and the later ones --
+ * which carry no transport header, so no tuple -- follow it rather than being
+ * sent unclassified behind it, reordered and starved under a saturated class. */
+static void test_fragments(void)
+{
+	struct net_device *dev = &devices[0];
+	const u32 class = (1 << 4) | (NUM_PQS - 2);
+	const u32 remark = CDX_FT_QOS_REMARK_MASK | 46u << CDX_FT_QOS_DSCP_SHIFT;
+	struct sk_buff skb;
+	unsigned nh;
+	u16 qid1, qid10;
+
+	reset_world();
+	assert(!cdx_register_ft_qos_class(test_classify, true));
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	assert(!to_inner(dev, 10, 1, 1, 0));
+	assert(!query(dev, 10, &qid10));
+	for (u8 family = AF_INET; family; family = family == AF_INET ? AF_INET6 : 0) {
+		build(&skb, &(struct frame){ .family = family, .pppoe = true,
+					     .first_fragment = true, .id = 7 });
+		connections(KNOWN(class), UNKNOWN);
+		assert(cdx_htb_select_queue(dev, &skb) == qid10);
+		build(&skb, &(struct frame){ .family = family, .pppoe = true,
+					     .later_fragment = true, .id = 7 });
+		connections(UNKNOWN, UNKNOWN);
+		assert(cdx_htb_select_queue(dev, &skb) == qid10);
+		/* Another datagram's later fragment is not this one's. */
+		build(&skb, &(struct frame){ .family = family, .pppoe = true,
+					     .later_fragment = true, .id = 8 });
+		assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	}
+	/* The class was found for the fragment's own header, which every later
+	 * fragment repeats, so a remark rewrites each of them. */
+	build(&skb, &(struct frame){ .first_fragment = true, .id = 11, .tos = 10 << 2 });
+	connections(KNOWN(remark | class), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	nh = build(&skb, &(struct frame){ .later_fragment = true, .id = 11, .tos = 10 << 2 });
+	connections(UNKNOWN, UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	assert(dsfield_at(&skb, nh) == 46 << 2 && ipv4_sum_ok(&skb, nh));
+	/* A tunnel's later fragment follows the class of the connection its
+	 * first carried, but holds no carried header to remark, and its own
+	 * is the tunnel's. */
+	build(&skb, &(struct frame){ .first_fragment = true, .id = 12,
+				     .inner_family = AF_INET6, .inner_tos = 10 << 2 });
+	connections(UNKNOWN, KNOWN(remark | class));
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	nh = build(&skb, &(struct frame){ .later_fragment = true, .id = 12,
+					  .proto = IPPROTO_IPV6, .tos = 10 << 2 });
+	connections(UNKNOWN, UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	assert(dsfield_at(&skb, nh) == 10 << 2);
+	/* The last fragment retires the datagram: a later datagram reusing its
+	 * identity -- IPv4 IDs wrap, and after translation every host shares
+	 * the source -- does not inherit its class. */
+	build(&skb, &(struct frame){ .first_fragment = true, .id = 13 });
+	connections(KNOWN(class), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	connections(UNKNOWN, UNKNOWN);
+	build(&skb, &(struct frame){ .later_fragment = true, .id = 13 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .last_fragment = true, .id = 13 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .later_fragment = true, .id = 13 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .family = AF_INET6, .first_fragment = true, .id = 14 });
+	connections(KNOWN(class), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	connections(UNKNOWN, UNKNOWN);
+	build(&skb, &(struct frame){ .family = AF_INET6, .later_fragment = true, .id = 14 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .family = AF_INET6, .last_fragment = true, .id = 14 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .family = AF_INET6, .later_fragment = true, .id = 14 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	/* A first fragment replaces what an earlier datagram with its identity
+	 * left, whether its own connection is known or not. */
+	build(&skb, &(struct frame){ .first_fragment = true, .id = 15 });
+	connections(KNOWN(class), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	build(&skb, &(struct frame){ .first_fragment = true, .id = 15 });
+	connections(UNKNOWN, UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .later_fragment = true, .id = 15 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	/* A handful of datagrams per CPU is remembered, the oldest going
+	 * first; fragments leave back to back, so that covers the ones in
+	 * flight. */
+	for (u16 id = 20; id < 20 + CDX_HTB_DATAGRAMS + 1; id++) {
+		build(&skb, &(struct frame){ .first_fragment = true, .id = id });
+		connections(KNOWN(class), UNKNOWN);
+		assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	}
+	connections(UNKNOWN, UNKNOWN);
+	build(&skb, &(struct frame){ .later_fragment = true, .id = 20 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .later_fragment = true, .id = 20 + CDX_HTB_DATAGRAMS });
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	/* A first fragment of no known connection leaves nothing behind, and
+	 * a later fragment that kept its conntrack needs nothing remembered. */
+	build(&skb, &(struct frame){ .first_fragment = true, .id = 40 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .later_fragment = true, .id = 40 });
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	build(&skb, &(struct frame){ .later_fragment = true, .id = 41 });
+	connections(KNOWN(class), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid10);
+	assert(!irq_depth);
+	assert(!destroy(dev));
+	assert_balanced(dev);
+	cdx_unregister_ft_qos_class();
+}
+
+/* On a port with no tree a class can only remark, so the port asks the
+ * classifier only when some class can carry a remark. */
+static void test_treeless_port(void)
+{
+	struct net_device *dev = &devices[0];
+	const u32 ef = CDX_FT_QOS_REMARK_MASK | 46u << CDX_FT_QOS_DSCP_SHIFT;
+	struct sk_buff skb;
+	unsigned nh;
+	u16 qid1;
+
+	reset_world();
+	assert(!cdx_register_ft_qos_class(test_classify, false));
+	nh = build(&skb, &(struct frame){ .pppoe = true, .tos = 10 << 2 });
+	connections(KNOWN(ef), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	assert(!own_asked && dsfield_at(&skb, nh) == 10 << 2);
+	/* A tree is something to choose a queue in, so it asks then. */
+	assert(!create(dev, 1, 0));
+	assert(!add_leaf(dev, 1, 0, 0, 0, 1000, 1000, &qid1));
+	connections(KNOWN(ef), UNKNOWN);
+	cdx_htb_select_queue(dev, &skb);
+	assert(own_asked == 1);
+	assert(!destroy(dev));
+	cdx_unregister_ft_qos_class();
+	assert(!cdx_ft_qos_remarks);
+	/* And with a remark to be had, it asks, and remarks. */
+	assert(!cdx_register_ft_qos_class(test_classify, true));
+	connections(KNOWN(ef), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == DPA_SELECT_QUEUE_NONE);
+	assert(own_asked == 1 && dsfield_at(&skb, nh) == 46 << 2);
+	assert_balanced(dev);
+	cdx_unregister_ft_qos_class();
+}
 
 /* The software path remarks what the hardware remarks.
  *
@@ -1474,84 +2119,109 @@ static u8 ipv6_tc(struct sk_buff *skb, unsigned offset)
  * flow it carries. The frames the CPU forwards -- a flow's first, and every one
  * of a flow never offloaded -- used to leave as they arrived, so a flow changed
  * codepoint the moment it was offloaded. Now they are rewritten too, the ECN
- * bits kept and the IPv4 checksum with it; the gateway's own frames, a class
- * with no remark, and anything not IP are left alone. */
+ * bits kept and the IPv4 checksum with it, in the header the class belongs to,
+ * however the frame is framed -- including a frame for a PPPoE session, which
+ * reaches the port with its conntrack scrubbed. The gateway's own frames, a
+ * bridged frame, a class with no remark, and anything not IP are left alone. */
 static void test_remark(void)
 {
 	struct net_device *dev = &devices[0];
 	const u32 ef = CDX_FT_QOS_REMARK_MASK | 46u << CDX_FT_QOS_DSCP_SHIFT;
-	struct nf_conn remarked = { .mark = ef }, plain = { .mark = 0 };
+	struct sock *owner = (struct sock *)&own_conn;
+	struct sk_buff skb;
 	u64 failures;
+	unsigned nh;
 	u16 qid1, qid10, qid11;
 
 	reset_world();
-	assert(!cdx_register_ft_qos_class(whole_class));
+	assert(!cdx_register_ft_qos_class(test_classify, true));
 
 	/* IPv4 at AF11 with ECT(0): EF, ECN kept, a checksum that verifies. */
-	struct sk_buff v4 = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
-			      .tos = 10 << 2 | 2 };
-	assert(ipv4_sum_ok(&v4, 0));
-	cdx_htb_select_queue(dev, &v4);
-	assert(ipv4_tos(&v4, 0) == (46 << 2 | 2) && ipv4_sum_ok(&v4, 0));
+	nh = build(&skb, &(struct frame){ .tos = 10 << 2 | 2 });
+	connections(KNOWN(ef), UNKNOWN);
+	assert(ipv4_sum_ok(&skb, nh));
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == (46 << 2 | 2) && ipv4_sum_ok(&skb, nh));
 	/* IPv6 at AF11 with ECT(1): the traffic class rewritten, ECN, version
 	 * and flow label kept. */
-	struct sk_buff v6 = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IPV6),
-			      .tos = 10 << 2 | 1 };
-	cdx_htb_select_queue(dev, &v6);
-	assert(ipv6_tc(&v6, 0) == (46 << 2 | 1));
-	assert(ipv6_hdr(&v6)->version == 6 && (ipv6_hdr(&v6)->flow_lbl[0] & 0x0f) == 0x0a);
-	assert(ipv6_hdr(&v6)->flow_lbl[1] == 0xbc && ipv6_hdr(&v6)->flow_lbl[2] == 0xde);
-	/* Inside a PPPoE session, which is how a frame for one reaches the
-	 * port: the inner header, and the session header untouched. */
-	struct sk_buff pppoe = { .ct = &remarked, .skb_iif = 5,
-				 .protocol = htons(ETH_P_PPP_SES), .inner = htons(ETH_P_IP),
-				 .tos = 0 };
-	cdx_htb_select_queue(dev, &pppoe);
-	assert(ipv4_tos(&pppoe, PPPOE_SES_HLEN) == 46 << 2 && ipv4_sum_ok(&pppoe, PPPOE_SES_HLEN));
-	assert(pppoe.head[0] == 0x11 && pppoe.head[7] == PPP_IP);
-	struct sk_buff pppoe6 = { .ct = &remarked, .skb_iif = 5,
-				  .protocol = htons(ETH_P_PPP_SES), .inner = htons(ETH_P_IPV6),
-				  .tos = 3 };
-	cdx_htb_select_queue(dev, &pppoe6);
-	assert(ipv6_tc(&pppoe6, PPPOE_SES_HLEN) == (46 << 2 | 3));
+	nh = build(&skb, &(struct frame){ .family = AF_INET6, .tos = 10 << 2 | 1 });
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == (46 << 2 | 1));
+	assert(skb.data[nh] >> 4 == 6 && (skb.data[nh + 1] & 0x0f) == 0x0a);
+	assert(skb.data[nh + 2] == 0xbc && skb.data[nh + 3] == 0xde);
+	/* Inside a PPPoE session over a tag, which is how a frame for one
+	 * reaches the port: the IP header, and the headers before it
+	 * untouched. */
+	struct frame session = { .ntags = 1, .tags = { ETH_P_8021Q }, .pppoe = true };
+	nh = build(&skb, &session);
+	cdx_htb_select_queue(dev, &skb);
+	assert(nh == ETH_HLEN + VLAN_HLEN + PPPOE_SES_HLEN);
+	assert(dsfield_at(&skb, nh) == 46 << 2 && ipv4_sum_ok(&skb, nh));
+	assert(skb.data[nh - PPPOE_SES_HLEN] == 0x11 && skb.data[nh - 1] == PPP_IP);
+	session.family = AF_INET6;
+	session.tos = 3;
+	nh = build(&skb, &session);
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == (46 << 2 | 3));
+	/* An IP-in-IP frame whose carried connection has the remark: the
+	 * carried header, which is the flow the hardware entry is for; the
+	 * tunnel's header is the tunnel's. */
+	nh = build(&skb, &(struct frame){ .tos = 10 << 2, .inner_family = AF_INET6 });
+	connections(UNKNOWN, KNOWN(ef));
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == 10 << 2 && ipv4_sum_ok(&skb, nh));
+	assert(dsfield_at(&skb, nh + 20) == 46 << 2);
+	nh = build(&skb, &(struct frame){ .family = AF_INET6, .inner_family = AF_INET });
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh + 40) == 46 << 2 && ipv4_sum_ok(&skb, nh + 40));
+	/* Or the tunnel's own, when only that connection is known. */
+	nh = build(&skb, &(struct frame){ .inner_family = AF_INET6 });
+	connections(KNOWN(ef), UNKNOWN);
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == 46 << 2 && dsfield_at(&skb, nh + 20) == 0);
 
-	/* The gateway's own, by socket or by having no ingress: untouched. */
-	struct sock *owner = (struct sock *)&plain;
-	struct sk_buff own = { .ct = &remarked, .skb_iif = 5, .sk = owner,
-			       .protocol = htons(ETH_P_IP), .tos = 10 << 2 };
-	struct sk_buff generated = { .ct = &remarked, .protocol = htons(ETH_P_IP), .tos = 10 << 2 };
-	cdx_htb_select_queue(dev, &own);
-	cdx_htb_select_queue(dev, &generated);
-	assert(ipv4_tos(&own, 0) == 10 << 2 && ipv4_tos(&generated, 0) == 10 << 2);
-	/* A class with no remark, and a frame with no class at all. */
-	struct sk_buff unmarked = { .ct = &plain, .skb_iif = 5, .protocol = htons(ETH_P_IP),
-				    .tos = 10 << 2 };
-	struct sk_buff untracked = { .skb_iif = 5, .protocol = htons(ETH_P_IP), .tos = 10 << 2 };
-	cdx_htb_select_queue(dev, &unmarked);
-	cdx_htb_select_queue(dev, &untracked);
-	assert(ipv4_tos(&unmarked, 0) == 10 << 2 && ipv4_tos(&untracked, 0) == 10 << 2);
+	/* The gateway's own frame, by its socket: untouched. */
+	nh = build(&skb, &(struct frame){ .tos = 10 << 2 });
+	skb.sk = owner;
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == 10 << 2);
+	/* A bridged frame: the hardware remark rides the opcode that
+	 * decrements TTL, which a bridged flow's entry does not carry. */
+	nh = build(&skb, &(struct frame){ .tos = 10 << 2 });
+	skb.pkt_type = PACKET_OTHERHOST;
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == 10 << 2);
+	/* A class with no remark, and a frame with no connection at all. */
+	nh = build(&skb, &(struct frame){ .tos = 10 << 2 });
+	connections(KNOWN(0), UNKNOWN);
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == 10 << 2);
+	connections(UNKNOWN, UNKNOWN);
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == 10 << 2);
 	/* Not IP: nothing to mark, and not a failure either. */
 	failures = cdx_ft_qos_remark_failures();
-	struct sk_buff arp = { .ct = &remarked, .skb_iif = 5, .protocol = htons(0x0806) };
-	cdx_htb_select_queue(dev, &arp);
+	build(&skb, &(struct frame){ .ethertype = ETH_P_ARP });
+	connections(KNOWN(ef), UNKNOWN);
+	cdx_htb_select_queue(dev, &skb);
 	assert(cdx_ft_qos_remark_failures() == failures);
 
-	/* A header that cannot be made writable, or cannot be read at all, is
+	/* A header that cannot be made writable, or cannot be read whole, is
 	 * counted and the frame sent as it is rather than dropped. */
-	struct sk_buff shared = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
-				  .tos = 10 << 2, .unwritable = true };
-	cdx_htb_select_queue(dev, &shared);
-	assert(ipv4_tos(&shared, 0) == 10 << 2 && ipv4_sum_ok(&shared, 0));
+	nh = build(&skb, &(struct frame){ .tos = 10 << 2 });
+	skb.unwritable = true;
+	cdx_htb_select_queue(dev, &skb);
+	assert(dsfield_at(&skb, nh) == 10 << 2 && ipv4_sum_ok(&skb, nh));
 	assert(cdx_ft_qos_remark_failures() == failures + 1);
-	struct sk_buff runt = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_PPP_SES),
-				.short_header = true };
-	cdx_htb_select_queue(dev, &runt);
+	build(&skb, &(struct frame){ .pppoe = true });
+	skb.len = ETH_HLEN + PPPOE_SES_HLEN + 12;
+	cdx_htb_select_queue(dev, &skb);
 	assert(cdx_ft_qos_remark_failures() == failures + 2);
 	/* One already at the codepoint needs no write, so a header that could
 	 * not be written costs nothing either. */
-	struct sk_buff there = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
-				 .tos = 46 << 2, .unwritable = true };
-	cdx_htb_select_queue(dev, &there);
+	build(&skb, &(struct frame){ .tos = 46 << 2 });
+	skb.unwritable = true;
+	cdx_htb_select_queue(dev, &skb);
 	assert(cdx_ft_qos_remark_failures() == failures + 2);
 
 	/* The DSCP map reads the codepoint the frame leaves with: a remark to EF
@@ -1564,9 +2234,11 @@ static void test_remark(void)
 	memset(dscp_classes, 0, sizeof(dscp_classes));
 	dscp_classes[46] = (1 << 4) | (NUM_PQS - 2);		/* EF: 1:11 */
 	dscp_classes[10] = (1 << 4) | (NUM_PQS - 1);		/* AF11: 1:10 */
-	struct sk_buff mapped = { .ct = &remarked, .skb_iif = 5, .protocol = htons(ETH_P_IP),
-				  .tos = 10 << 2 };
-	assert(cdx_htb_select_queue(dev, &mapped) == qid11);
+	build(&skb, &(struct frame){ .tos = 10 << 2 });
+	connections(KNOWN(ef), UNKNOWN);
+	assert(cdx_htb_select_queue(dev, &skb) == qid11);
+	build(&skb, &(struct frame){ .pppoe = true, .tos = 10 << 2 });
+	assert(cdx_htb_select_queue(dev, &skb) == qid11);
 	memset(dscp_classes, 0, sizeof(dscp_classes));
 	assert(!destroy(dev));
 	assert_balanced(dev);
@@ -1975,6 +2647,9 @@ int main(void)
 	test_channel_reuse();
 	test_software_path();
 	test_unclassified();
+	test_control_budget();
+	test_fragments();
+	test_treeless_port();
 	test_remark();
 	test_class_statistics();
 	test_red();

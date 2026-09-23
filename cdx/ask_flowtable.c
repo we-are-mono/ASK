@@ -52,6 +52,7 @@
 #include <net/route.h>
 #include <net/tcp.h>
 #include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_l4proto.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_flow_table.h>
@@ -144,6 +145,72 @@ static u32 ft_qos_class(u32 mark)
 		return 0;
 	mark = (mark & ft_qos_mark_mask) >> __ffs(ft_qos_mark_mask);
 	return mark ? mark : ft_qos_default_class;
+}
+
+/* Whether any class this decode can produce carries a remark: a bit of the
+ * mark that shifts onto the remark flag, or a default class with one. Fixed
+ * for the module's life, since both parameters are. */
+static bool ft_qos_remarks(void)
+{
+	if (!ft_qos_mark_mask)
+		return false;
+	return ((ft_qos_mark_mask >> __ffs(ft_qos_mark_mask)) & CDX_FT_QOS_REMARK_MASK) ||
+	       (ft_qos_default_class & CDX_FT_QOS_REMARK_MASK);
+}
+
+/* The class of the connection an IP packet belongs to, for cdx's software Tx
+ * path (cdx_ft_qos_class_fn): the decode above, applied to the same mark the
+ * flow's hardware rule was given its class from.
+ *
+ * The conntrack an skb carries answers for its own header. A frame reaches the
+ * port without it when a scrub took it -- ppp_start_xmit() and the IP tunnels
+ * drop it, and the ingress index with it -- and a packet an IP-in-IP frame
+ * carries never had one on this skb at all. Conntrack is then asked by the
+ * packet's tuple. The port sees a packet after NAT, which makes its tuple the
+ * inverse of the tuple the other direction is keyed on, so the inverse is
+ * what is looked up; for an untranslated packet it is the reply tuple, which
+ * finds the same entry. Only the default zone is searched.
+ *
+ * Not looked up: a frame untracked on purpose (_nfct without a conntrack is
+ * IP_CT_UNTRACKED), and one still carrying its ingress index, which crossed no
+ * scrub and so kept whatever it had. Nor while interrupts are off, as netpoll
+ * sends: the reference dropped below could be the last, and freeing a
+ * conntrack takes locks that must not be taken there. With no mask every
+ * class is zero, and no lookup can change that. */
+static bool ft_qos_flow_class(const struct sk_buff *skb, unsigned int nhoff,
+			      u8 family, bool own, u32 *class)
+{
+	struct nf_conntrack_tuple tuple, inverse;
+	struct nf_conntrack_tuple_hash *h;
+	enum ip_conntrack_info ctinfo;
+	struct nf_conn *ct;
+	struct net *net;
+	u32 mark;
+
+	if (own) {
+		ct = nf_ct_get(skb, &ctinfo);
+		if (ct) {
+			*class = ft_qos_class(READ_ONCE(ct->mark));
+			return true;
+		}
+		if (skb->_nfct || skb->skb_iif)
+			return false;
+	}
+	if (!family || !ft_qos_mark_mask || irqs_disabled() || !skb->dev)
+		return false;
+	net = dev_net(skb->dev);
+	if (!nf_ct_get_tuplepr(skb, nhoff, family == AF_INET6 ? NFPROTO_IPV6 : NFPROTO_IPV4,
+			       net, &tuple) ||
+	    !nf_ct_invert_tuple(&inverse, &tuple))
+		return false;
+	h = nf_conntrack_find_get(net, &nf_ct_zone_dflt, &inverse);
+	if (!h)
+		return false;
+	ct = nf_ct_tuplehash_to_ctrack(h);
+	mark = READ_ONCE(ct->mark);
+	nf_ct_put(ct);
+	*class = ft_qos_class(mark);
+	return true;
 }
 
 struct cdx_ft_binding {
@@ -8905,6 +8972,9 @@ static int ft_show(struct seq_file *seq, void *v)
 	/* Frames the software path forwarded unchanged because their header
 	 * could not be made writable for the remark their class asks for. */
 	seq_printf(seq, "qos_remark_failures %llu\n", cdx_ft_qos_remark_failures());
+	/* Control frames sent as unclassified traffic because their port's
+	 * control budget was spent. */
+	seq_printf(seq, "qos_control_overruns %llu\n", cdx_ft_qos_control_overruns());
 	seq_printf(seq, "observe %u\nbindings %u\npassive %u\nparked %u\nentries %u\nmax_entries %u\n"
 		   "installs %llu\ndeletes %llu\nrejects %llu\nerrors %llu\nvalidated %llu\nbusy %llu\n"
 		   "invalidated %u\ninvalidation_done %u\nfatal %u\nquarantine %u\n"
@@ -9104,8 +9174,9 @@ static int __init ask_flowtable_init(void)
 	if (rc)
 		goto indirect;
 	/* Hand the classifier over too, so a frame the software path sends
-	 * takes the class this same function gave the flow's hardware rule. */
-	rc = ft_init_fault(10) ? -EBUSY : cdx_register_ft_qos_class(ft_qos_class);
+	 * takes the class this same decode gave the flow's hardware rule. */
+	rc = ft_init_fault(10) ? -EBUSY :
+	     cdx_register_ft_qos_class(ft_qos_flow_class, ft_qos_remarks());
 	if (!rc)
 		return 0;
 	cdx_unregister_ft_setup_tc();

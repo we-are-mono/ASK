@@ -1530,12 +1530,13 @@ async def test_profile_isp_qos_marks_pick_the_class(isp, splat_window):
         # not the other, or if both land in the same queue.
         after_bulk = {slot: bulked[slot] - voiced[slot] for slot in bulked}
         assert after_bulk.get(1, 0) >= 64, (after_bulk, voiced, bulked)
-        # Every leaf but the bulk one and the default one. This port carries
-        # the box's own unmarked traffic -- the test agent's HTTP among it --
-        # and unmarked means the default class, which on this tree shares a
-        # queue with leaf 0. Demanding a flat zero there asked the bench to be
-        # silent on its own management path, which it never is; what the case
-        # can honestly require is that nothing reached a queue no mark named.
+        # Every leaf but the bulk one and the voice one. This port carries
+        # the box's own traffic -- the test agent's HTTP among it, and the
+        # session's LCP -- and that is control traffic, which takes class queue
+        # 7: on this tree, the queue leaf 0 holds. Demanding a flat zero there
+        # asked the bench to be silent on its own management path, which it
+        # never is; what the case can honestly require is that nothing reached
+        # a queue no mark named.
         for slot, value in after_bulk.items():
             if slot not in (0, 1):
                 assert value == 0, (slot, after_bulk)

@@ -23,20 +23,41 @@ typedef int (*cdx_ft_setup_tc_handler)(struct net_device *dev,
 int cdx_register_ft_setup_tc(cdx_ft_setup_tc_handler handler);
 void cdx_unregister_ft_setup_tc(void);
 
-/* The adapter's own classifier: a conntrack mark in, an egress class out.
+/* The adapter's own classifier, for the software Tx path: the class of the
+ * connection an IP packet belongs to.
  *
- * Registered so the software Tx path resolves a frame's class with the very
- * function that decided the class of the hardware rule for the same flow.
- * Deriving it twice from the same mark would still be two decodes to keep in
- * step; this is one. Unregistered, the software path expresses no opinion and
- * behaves as it did before there was a qdisc. */
-typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
-int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn);
+ * Registered so the software path resolves a frame's class with the very
+ * decode that gave the hardware rule for the same flow its class, from the
+ * same conntrack mark. Unregistered, the software path expresses no opinion
+ * and behaves as it did before there was a qdisc.
+ *
+ * nhoff is the offset from skb->data of an IPv4 or IPv6 header, as family
+ * says; a family of zero means the frame's network header was not found, and
+ * only a conntrack the skb carries is consulted. own says the header is the
+ * frame's own, so a conntrack the skb carries describes it; a header a 6in4 or
+ * 4in6 frame carries is not, and only a lookup finds its connection. The
+ * conntrack is looked for when a scrub took it -- ppp_start_xmit() and the IP
+ * tunnels drop it, and the ingress index with it -- because cdx sees the frame
+ * only at the port, after those.
+ *
+ * True with *class set when a connection was found, false otherwise with
+ * *class untouched. Never sleeps: called inside rcu_read_lock() from whatever
+ * context the frame is sent from, interrupts off included (netpoll). */
+struct sk_buff;
+typedef bool (*cdx_ft_qos_class_fn)(const struct sk_buff *skb, unsigned int nhoff,
+				    u8 family, bool own, u32 *class);
+/* `remarks' says whether any class the classifier can decode carries a
+ * remark; without one, a port with no tree does not ask it about any frame. */
+int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn, bool remarks);
 void cdx_unregister_ft_qos_class(void);
 
 /* Forwarded frames the software path could not remark as their class asks --
  * sent unchanged -- for the adapter's status to report. */
 u64 cdx_ft_qos_remark_failures(void);
+
+/* Control frames sent as unclassified traffic because their port's control
+ * budget was spent, summed over every port, for the adapter's status. */
+u64 cdx_ft_qos_control_overruns(void);
 
 /* A port's egress changed under the entries that transmit on it.
  *

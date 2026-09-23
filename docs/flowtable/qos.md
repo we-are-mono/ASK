@@ -687,10 +687,13 @@ a frame never sees one without the other.
 reused what `pfe_eth_get_queuenum()` does, and that was wrong in a way worth
 recording: that function reads `ct->qosconnmark`, the ASK mark, while the
 flowtable classifies on `ct->mark` under `qos_mark_mask`. Two fields, two
-encodings. So the adapter registers `ft_qos_class()` itself with cdx, and the
-software path calls the very function that gave the flow's hardware rule its
-class. Deriving the same answer twice would still be two things to keep in
-step.
+encodings. So the adapter registers its own classifier with cdx, and the
+software path calls the very decode, `ft_qos_class()`, that gave the flow's
+hardware rule its class. Deriving the same answer twice would still be two
+things to keep in step. What the adapter registers is `ft_qos_flow_class()`,
+which also finds the frame's connection when a scrub on the way to the port
+took its conntrack ([unclassified traffic](#unclassified-traffic)); keeping
+that lookup in the adapter keeps cdx free of any dependency on conntrack.
 
 That registration is also the switch. With no classifier registered — every
 CMM port, because the adapter is not loaded there — queue selection expresses
@@ -766,27 +769,97 @@ everything unclassified**: ARP and neighbour discovery, DHCP, PPPoE's LCP echoes
 Unmarked flows were split too — queue 7 in software before admission, queue 0
 in hardware after — and `default` was recorded and ignored.
 
-Both paths now resolve unclassified traffic the same way, with the tree
-deciding:
+A first fix split the traffic on whether the frame still carried its conntrack
+and an ingress index. That split does not survive the path to the port.
+`ppp_start_xmit()` calls `skb_scrub_packet()`, which drops both from every
+frame, and so do the IP tunnels: on a PPPoE WAN — the shipping configuration —
+every frame the CPU forwarded arrived looking like the gateway's own, took
+class queue 7 above every class, lost its class and its remark, and shared the
+voice leaf's queue in the ISP profile. Tunnels, `NOTRACK` and bridging without
+conntrack fell the same way, and a queue 7 that could take committed tokens
+starved the whole top channel instead of itself.
+
+So the decision is made from what survives every such boundary, the frame's own
+headers, read from `skb->data` through any VLAN tags and a PPPoE session header:
 
 | frame | with `default` | without |
 | --- | --- | --- |
-| no class, or a class no leaf holds, forwarded and tracked | the default leaf | the top channel's class queue 0 |
-| no conntrack, or the gateway's own | the default leaf | the top channel's class queue 7 |
+| a class no leaf holds, or no class — forwarded or not, tracked or not | the default leaf | the top channel's class queue 0 |
+| control, within the port's control budget | the top channel's class queue 7 | the top channel's class queue 7 |
+| control, over the budget | the default leaf | the top channel's class queue 0 |
 
+- **The connection is found again, not assumed lost.** The adapter's classifier
+  (`ft_qos_flow_class()`, registered with cdx) answers from the conntrack an skb
+  carries, and when a scrub took it asks conntrack for it by the packet's own
+  tuple: the port sees the packet after NAT, so its tuple is the inverse of the
+  other direction's, which is what is looked up. A frame untracked on purpose,
+  or one still carrying its ingress index — it crossed no scrub — is not looked
+  up. The class that comes back is the decode the hardware rule for the same
+  flow was given, from the same mark. Only the default conntrack zone is
+  searched.
+- **An IP-in-IP frame takes the class of the connection it carries.** A 6in4 or
+  4in6 flow the hardware offloads is an entry for the carried connection,
+  classified by its mark; the tunnel's own conntrack describes only the outer
+  header and counts only when the carried connection is not known. Other
+  encapsulations — GRE, WireGuard — are classified by their own outer flow,
+  which an operator can mark like any other.
+- **A datagram's fragments take one class.** A later fragment carries no
+  transport header, so no tuple to look up; where the conntrack reached the
+  port every fragment carries it, but a scrub drops it from all of them. The
+  first fragment's answer is kept, a few datagrams per CPU, and the later ones
+  follow it — otherwise they would be reordered behind it onto the
+  unclassified queue and starve under a saturated class, losing the datagram.
+  The last fragment retires the entry, and a first fragment replaces any entry
+  with its identity, so a reused IP ID does not inherit a stale class. It holds
+  on the stock path, where a PPPoE session has no qdisc and a datagram's
+  fragments leave from the CPU that made them; with a qdisc on the ppp device
+  another CPU may send the later ones, which then go unclassified, as they did
+  before.
+- **Control is what the gateway sends itself, and link protocols it bridges.**
+  The gateway's own frames are its sockets' — how it is reached and managed,
+  its ICMP echoes and errors, the queries it forwards for the network behind
+  it — the socketless link frames it originates, ARP, LCP and IGMP among them,
+  and whatever netpoll sends with interrupts off. A link protocol is one that
+  never leaves its link: every frame that is not IP — ARP, PPPoE discovery, a
+  session's own LCP, authentication and NCP frames, LLDP, spanning tree — and
+  IGMP, neighbour discovery and MLD, and DHCP. One the bridge carries between
+  ports is control too. Nothing a host sends *through* the gateway is: ICMP
+  included, and a unicast DHCP renewal routed upstream, whose flow can be
+  offloaded and so takes its flow's queue. A scrub erases the ingress index
+  that says a frame was routed, so an IP link frame without a socket or one
+  counts as the gateway's own only when it is addressed on the link — a
+  multicast group, the limited broadcast, an IPv6 link-local address — as the
+  kernel's own IGMP and DHCP are; anything a host shapes like a link protocol
+  and routes into a PPPoE session is its traffic. A control frame whose
+  connection names a leaf takes the leaf.
+- **Control never takes the default leaf.** A `default` is commonly the lowest
+  class, and a saturated class above it would starve an LCP echo there until
+  the session dropped. Software HTB guarantees a default class its rate; CEETM
+  has no per-queue guarantee to give it.
+- **Control is bounded.** Class queue 7 is the highest priority and takes
+  committed tokens, so a budget stands in front of it: a sixteenth of the top
+  channel's committed rate, never under 64 kbit/s unless the channel is slower
+  than twice that, with a burst of sixteen full-size frames. What exceeds it is
+  sent as unclassified traffic, not dropped, and counted in `/proc/cdx_flowtable`
+  as `qos_control_overruns`. The gateway's own link traffic may run a second
+  burst beyond what its sessions and the hosts it bridges for have spent, so
+  neither a bulk transfer from the gateway nor a host flooding broadcasts can
+  push an ARP reply or an LCP echo off the top of the tree; nothing a host sends
+  through the gateway touches the budget at all. A leaf can lose at most the
+  budget to control traffic.
 - **`default` is honoured**, as software HTB honours it and as mlx5 does. The
   software path puts the frame on the default leaf's Tx queue; the hardware
   path, in `cdx_get_txfqid()`, resolves a mark with no class — and one naming a
   class no leaf holds — to the same leaf, which covers flows, multicast members
   and SAs alike.
-- **Without one**, a frame the hardware could carry goes where the hardware has
-  always put its flow — class queue 0 of the top channel, the lowest strict
-  priority — so a flow no longer changes queue when it is offloaded. A leaf at
-  `prio 7` holds that queue and then counts both. Frames the hardware never
-  carries go to class queue 7 of the top channel, the highest priority, as the
-  driver's own choice always put them. **Class queue 7 is not reserved**: a
-  `prio 0` leaf on the top channel holds it, control traffic shares that leaf's
-  queue and appears in its counters, and it keeps the priority it needs.
+- **Without one**, a frame whose connection names no class goes where the
+  hardware has always put its flow — class queue 0 of the top channel, the
+  lowest strict priority — so a flow is on one queue before and after it is
+  offloaded, over a PPPoE session or a tunnel as much as over a plain port. A
+  leaf at `prio 7` holds that queue and then counts both. **Class queue 7 is
+  not reserved**: a `prio 0` leaf on the top channel holds it, control traffic
+  shares that leaf's queue and appears in its counters, and it keeps the
+  priority it needs.
 - **Every queue a frame can be resolved to competes for committed tokens.** The
   tree makes the top channel's class queues 0 and 7 eligible for both token
   buckets, at a leaf's depth, whenever no leaf holds them, and moves them with
@@ -811,11 +884,13 @@ deciding:
   legacy DSCP table. That also takes the legacy table's unlocked read off every
   port a DSCP filter can be installed on.
 
-The consequence worth stating: without `default`, an unmarked forwarded flow is
-the lowest priority on its channel, so a saturated leaf of any higher priority
+The consequence worth stating: without `default`, an unmarked flow is the
+lowest priority on its channel, so a saturated leaf of any higher priority
 still starves it — that is strict priority doing what it was asked. What no
-longer starves is the traffic that keeps the link and the gateway alive. A tree
-that should carry unmarked flows alongside a busy class names a `default`.
+longer starves is the traffic that keeps the link and the gateway alive, and
+what no longer starves the leaves is anything that merely lost its conntrack on
+the way. A tree that should carry unmarked flows alongside a busy class names a
+`default`, or marks them.
 
 ### 5. Hardware statistics through ethtool
 
@@ -1620,7 +1695,12 @@ counters showed 144 frames — the software handshake and nothing else.
   `ndo_select_queue`, where increment 4 already resolves the conntrack mark:
   a frame whose mark names no class asks the DSCP table, and the answer is the
   same class the filter gave the hardware. One filter, two readers, and no
-  change to the SDK driver.
+  change to the SDK driver. The codepoint is read from the innermost IP header
+  of the frame as the port holds it — behind VLAN tags and a PPPoE session
+  header, and inside an IP-in-IP frame the carried packet's. Reading only a
+  frame whose own protocol was IP, as it first did, left every frame for a
+  PPPoE session or an in-band tag out of the map in software while the
+  hardware classified its flow by it.
 
 Both are filed as **A151**.
 
@@ -1989,14 +2069,30 @@ exists to prevent, and a flow that is never offloaded was never remarked at
 all. The software path now rewrites the frames it forwards, in the queue
 selection that already decodes the same class from the same mark:
 
-- **Forwarded frames only**, as in hardware: a frame with an ingress and no
-  socket. The gateway's own frames keep whatever their sockets set.
+- **Routed frames only**, as in hardware, whose remark rides the opcode that
+  decrements TTL: a frame with no socket that routing took, which it takes only
+  when addressed to this host and leaves `PACKET_HOST`. The gateway's own
+  frames keep whatever their sockets set, and a frame the bridge forwards —
+  `PACKET_OTHERHOST`, or a broadcast or multicast — is left as the hardware
+  leaves a bridged flow.
 - **The DSCP, not the ECN bits.** `ipv4_change_dsfield()` or
   `ipv6_change_dsfield()` with the ECN mask kept, the IPv4 checksum updated in
   the same step. Neither family's pseudo-header includes the field, so a
   transport checksum left for the hardware is unaffected.
-- **Behind a PPPoE session header** when the frame for a session reaches the
-  port with one: the inner IP header is the field the hardware rewrites.
+- **In the header the class was found for**, behind any VLAN tags and a PPPoE
+  session header: the packet's own, or the one an IP-in-IP frame carries when
+  the class is that connection's — the flow the hardware entry is for. A frame
+  for a PPPoE session reaches the port with its conntrack scrubbed, and its
+  class, remark included, comes from the connection found again by its tuple
+  ([unclassified traffic](#unclassified-traffic)). The tunnel's own outer header
+  is left as the tunnel wrote it, before the remark: a tunnel that copies the
+  inner codepoint outward shows the upstream the old one. Whether the
+  microcode copies the remarked codepoint into the outer header of an
+  offloaded 6in4 or 4in6 flow is not known from source, and needs a capture on
+  the rig to settle.
+- **On a port with no tree**, a class does nothing but remark, so the port asks
+  the adapter about a frame only when some class it can decode carries a remark
+  — the image's 0xf0 mask cannot, and its default class does not.
 - **A frame that cannot be rewritten is sent as it is**, never dropped for a
   marking, and counted in `/proc/cdx_flowtable` as `qos_remark_failures`. A
   frame already at the codepoint costs no copy of a shared head.
@@ -2012,15 +2108,20 @@ kernel's flowtable fast path used to send a frame on without one, so a flow the
 adapter declined — or one never offered to it, or one waiting for admission —
 had no class to read once the flowtable took it over: every frame went to class
 queue 7 of the top channel, above every class in the tree, and nothing was
-remarked. With admission refusing a non-TCP IPv4 flow whose path MTU is below
-its ingress port's, that is every UDP upload over a PPPoE WAN. Patch 147
+remarked. Patch 147
 attaches the flow's conntrack in `nf_flow_offload_forward()` and its IPv6 twin
 the way act_ct does for its own flowtable: once the frame is committed to the
 fast path, with a reference of its own, `IP_CT_ESTABLISHED` or
 `IP_CT_ESTABLISHED_REPLY` by direction, and any conntrack the frame arrived
 with dropped first. Nothing is accounted twice — the flowtable already updates
 the conntrack's counters, and no hook between it and the wire does — and the
-cost is the one reference per frame the stack's own lookup takes.
+cost is the one reference per frame the stack's own lookup takes. That covers
+a flow leaving by a plain port. One leaving by a PPPoE session or a tunnel —
+with admission refusing a non-TCP IPv4 flow whose path MTU is below its ingress
+port's, every UDP upload over a PPPoE WAN is one — loses the conntrack again at
+`ppp_start_xmit()` or the tunnel's own scrub, and the port finds its connection
+by the packet's tuple instead; `test_flowtable_pppoe_qos_upload_keeps_its_class`
+checks that on the rig.
 `test_flowtable_software_path_carries_the_conntrack` compiles the kernel's
 forward step on the host, and
 `test_flowtable_qos_declined_flow_keeps_its_class_in_software` checks the leaf

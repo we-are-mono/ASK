@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A258.** CPU-forwarded frames lost their QoS class (the software flowtable dropped the conntrack, PPPoE and tunnels scrubbed it) and took queue 7 above the tree, unremarked —
+  fixed (_:/^cdx: classify frames by their headers, not by what a scrub left_).
+
 - [x] **A255.** Traffic naming no HTB leaf took an unconfigured, excess-only queue 7 (a saturated leaf starved ARP, LCP and DHCP) or an unshaped claimed channel; `default` was ignored —
   fixed (_:/^cdx: keep unclassified traffic on a channel a class holds_).
 

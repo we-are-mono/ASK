@@ -100,6 +100,20 @@ NAT_TABLE = "ask_pppoe_nat"
 # at 1492 on its own is part of what the MTU case proves.
 SESSION_MTU = 1492
 
+# The QoS case's two flows: one marked into a class, which the port has to find
+# again after the session scrubbed its conntrack, and one unmarked, which
+# saturates the shaped channel beside it. The channel is slow enough that the
+# CPU forwards several times its rate through the session; the class the mark
+# names is the prio 1 leaf's, class queue 6.
+PORT_QOS_VOICE = int(os.environ.get("ASK_FLOWTABLE_PPPOE_QOS_PORT", "48290"))
+PORT_QOS_BULK = PORT_QOS_VOICE + 1
+QOS_TABLE = "ask_pppoe_qos"
+QOS_RATE_MBIT, QOS_BULK_MBIT = 20, 60
+QOS_VOICE_PRIO, QOS_VOICE_CQ = 1, 6
+QOS_DATAGRAM, QOS_COUNT = 1200, 200
+QOS_BULK_SCRIPT = "/tmp/ask_pppoe_qos_bulk.py"
+QOS_BULK_PID = "/tmp/ask_pppoe_qos_bulk.pid"
+
 SERVER_OPTS = "/tmp/ask-flowtable-pppoe-server.opt"
 SERVER_SECRETS = "/tmp/ask-flowtable-pppoe-secrets"
 DUT_PEER = "/tmp/ask-flowtable-pppoe-peer"
@@ -1247,6 +1261,192 @@ async def test_flowtable_pppoe_full_mtu_datagram(pppoe_rig):
     delta = {c: after[c] - before[c] for c in before}
     assert all(d == 16 for d in delta.values()), delta
     r.record("pppoe-full-mtu", {"delta": delta, "payload": SESSION_MTU - 28})
+
+
+async def _qos_bulk(r, seconds):
+    """Start the unmarked flow on the LAN VM, detached, paced at QOS_BULK_MBIT
+    towards a port on the far end that nothing reads. It is its own session
+    under `timeout`, so a run that dies without its teardown leaves nothing
+    sending for longer than that."""
+    blaster = f'''
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(({r.lan_ip!r}, {PORT_QOS_BULK}))
+payload = b'ASK-pppoe-qos-bulk'.ljust({QOS_DATAGRAM}, b'.')
+per_second = {QOS_BULK_MBIT} * 1e6 / 8 / {QOS_DATAGRAM}
+start = time.monotonic()
+sent = 0
+while time.monotonic() - start < {seconds}:
+    s.sendto(payload, ({INNER_LOCAL!r}, {PORT_QOS_BULK}))
+    sent += 1
+    ahead = sent / per_second - (time.monotonic() - start)
+    if ahead > 0.002:
+        time.sleep(ahead)
+'''
+    script = f'''
+import pathlib, subprocess
+pathlib.Path({QOS_BULK_SCRIPT!r}).write_text({blaster!r})
+proc = subprocess.Popen(['timeout', {str(seconds + 30)!r}, 'python3', {QOS_BULK_SCRIPT!r}],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, start_new_session=True)
+pathlib.Path({QOS_BULK_PID!r}).write_text(str(proc.pid))
+print('BULK-UP')
+'''
+    result = await r.run_peer(script, label="pppoe_qos_bulk", timeout=30)
+    assert result.rc == 0 and "BULK-UP" in result.stdout, result.stdout
+
+
+async def _qos_bulk_stop(r):
+    script = f'''
+import os, pathlib, signal
+pid = pathlib.Path({QOS_BULK_PID!r})
+if pid.exists():
+    try:
+        os.killpg(int(pid.read_text()), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    pid.unlink()
+print('BULK-DOWN')
+'''
+    result = await r.run_peer(script, label="pppoe_qos_bulk_stop", timeout=30)
+    assert result.rc == 0 and "BULK-DOWN" in result.stdout, result.stdout
+
+
+async def test_flowtable_pppoe_qos_upload_keeps_its_class(pppoe_rig):
+    """A marked upload through the session lands on its class, and unmarked
+    bulk through the same session cannot starve it.
+
+    Every frame the CPU sends into a PPPoE session loses its conntrack and its
+    ingress index before it reaches the port: ppp_start_xmit() scrubs both. The
+    port's queue selection used to take such a frame for the gateway's own,
+    which put every upload over the session -- marked or not -- on class queue
+    7, above every class in the tree. The marked flow lost its class, and an
+    unmarked one could take the whole channel from every leaf. Now the port
+    reads the frame through the tag and the session header and finds the
+    connection again by the translated packet's tuple.
+
+    The tree is on the WAN port: one channel at QOS_RATE_MBIT and one prio 1
+    leaf. The marked flow is translated, as a subscriber's is, and echoed one
+    datagram at a time while the unmarked one offers three times the channel.
+    Nothing is offloaded -- no flowtable is bound -- so this is the software
+    path alone. The oracles are the port's CEETM counters: every marked frame
+    on the leaf, the unmarked flow holding the unclassified queue full, and
+    the control queue carrying only control traffic.
+    """
+    from test_flowtable_qos import OAL, egress, leaf_delta, timing_slack
+
+    r = pppoe_rig
+    mask = int((await read(r.target, r.session,
+                           "/sys/module/ask_flowtable/parameters/qos_mark_mask")).strip())
+    if not mask:
+        pytest.skip("classification is off in this boot; the QoS case needs "
+                    "ask_flowtable.qos_mark_mask=0xf0, which the test image ships")
+    mark = QOS_VOICE_CQ << ((mask & -mask).bit_length() - 1)
+    dev = TARGET_WAN_IF
+    rate = f"{QOS_RATE_MBIT}mbit"
+
+    async def tc(*argv, check=True):
+        """`tc` is not in the agent's argv allowlist, so the tree is built on
+        the console the fixture holds."""
+        return await console_command(r.console, "tc", *argv, check=check, timeout=30)
+
+    async def clear_ct():
+        for port in (PORT_QOS_VOICE, PORT_QOS_BULK):
+            await command(r.target, r.session, "conntrack", "-D", "-p", "udp",
+                          "--orig-src", r.lan_ip, "--dport", str(port), check=False)
+
+    # A port nothing reads: the far end queues what arrives until its buffer
+    # is full and drops the rest, rather than answering every datagram with an
+    # ICMP error back down the session.
+    sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sink.bind((INNER_LOCAL, PORT_QOS_BULK))
+    transport, echo = await asyncio.get_running_loop().create_datagram_endpoint(
+        SourceEcho, local_addr=(INNER_LOCAL, PORT_QOS_VOICE))
+    bulk = False
+    try:
+        await clear_ct()
+        # A run killed before its teardown leaves its tree behind.
+        await tc("qdisc", "del", "dev", dev, "root", check=False)
+        await tc("qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "offload")
+        await tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1",
+                 "htb", "rate", rate, "ceil", rate)
+        await tc("class", "add", "dev", dev, "parent", "1:1", "classid", "1:10",
+                 "htb", "rate", rate, "ceil", rate, "prio", str(QOS_VOICE_PRIO))
+        # The mark at forward/mangle, and the translation at the priority the
+        # SNAT case uses, ahead of the image's own masquerade.
+        await command(r.target, r.session, "nft", f"""table ip {QOS_TABLE} {{
+ chain forward {{ type filter hook forward priority -150; policy accept;
+ ip saddr {r.lan_ip} udp dport {PORT_QOS_VOICE} ct mark set {mark:#x} }}
+ chain postrouting {{ type nat hook postrouting priority 90; policy accept;
+ ip saddr {r.lan_ip} ip daddr {INNER_LOCAL} udp dport {PORT_QOS_VOICE} snat to {SNAT_ADDR} }}
+}}""")
+        await _qos_bulk(r, seconds=30)
+        bulk = True
+        await asyncio.sleep(3)
+        first = await egress(r, dev)
+        voice = f'''
+import json, socket, struct, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(({r.lan_ip!r}, {PORT_QOS_VOICE}))
+s.settimeout(1)
+echoed = lost = 0
+for n in range({QOS_COUNT}):
+    payload = struct.pack('!Q', n) + b'ASK-pppoe-qos'.ljust(120, b'.')
+    s.sendto(payload, ({INNER_LOCAL!r}, {PORT_QOS_VOICE}))
+    try:
+        while s.recv(2048) != payload:
+            pass
+        echoed += 1
+    except TimeoutError:
+        lost += 1
+    time.sleep(0.02)
+print(json.dumps({{'echoed': echoed, 'lost': lost}}))
+'''
+        result = await r.run_peer(voice, label="pppoe_qos_voice", timeout=QOS_COUNT * 1.1 + 30)
+        assert result.rc == 0, result.stdout
+        report = json.loads(result.stdout.strip().splitlines()[-1])
+        second = await egress(r, dev)
+        conntrack = await command(r.target, r.session, "conntrack", "-L", "-p", "udp",
+                                  "--dport", str(PORT_QOS_VOICE), "-o", "extended", check=False)
+    finally:
+        if bulk:
+            await _qos_bulk_stop(r)
+        transport.close()
+        sink.close()
+        await tc("qdisc", "del", "dev", dev, "root", check=False)
+        await command(r.target, r.session, "nft", "delete", "table", "ip", QOS_TABLE,
+                      check=False)
+        await clear_ct()
+    voice_leaf = leaf_delta(first, second, 0)
+    unclassified = leaf_delta(first, second, "default")
+    control = leaf_delta(first, second, "control")
+    window = second["at"] - first["at"]
+    shaped = sum((q["bytes"] + OAL * q["frames"]) * 8
+                 for q in (voice_leaf, unclassified, control)) / window
+    r.record("pppoe-qos", {"report": report, "voice_leaf": voice_leaf,
+                           "unclassified": unclassified, "control": control,
+                           "shaped_bps": shaped, "window": window,
+                           "sources": sorted(echo.sources),
+                           "conntrack": conntrack["stdout"]})
+
+    # Translated on the way, so the connection was found by the inverse of a
+    # tuple the table does not hold.
+    assert echo.sources == {(SNAT_ADDR, PORT_QOS_VOICE)}, echo.sources
+    # Every marked frame on the leaf its mark names, and it lost nothing to
+    # the unmarked flow beside it: the leaf is above the queue that flow is on.
+    assert report["echoed"] + report["lost"] == QOS_COUNT, report
+    assert report["lost"] <= QOS_COUNT // 100, report
+    assert QOS_COUNT - report["lost"] <= voice_leaf["frames"] <= QOS_COUNT, (voice_leaf, report)
+    assert voice_leaf["rejected"] == 0, voice_leaf
+    # The unmarked flow held the unclassified queue full -- the queue refused
+    # what the channel could not carry -- and the channel carried what it was
+    # shaped to.
+    assert unclassified["rejected"] > 0 and unclassified["frames"] > 0, unclassified
+    slack = timing_slack(first, second)
+    assert shaped >= (0.85 - slack) * QOS_RATE_MBIT * 1e6, (shaped, slack)
+    # None of it rode the control queue, which now carries only control
+    # traffic: the session's LCP, the gateway's own sessions.
+    assert control["frames"] * 20 < unclassified["frames"], (control, unclassified)
 
 
 @pytest.mark.parametrize("pppoe_rig", ["tcp"], indirect=True)

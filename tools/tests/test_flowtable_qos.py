@@ -1362,9 +1362,10 @@ async def test_flowtable_qos_saturated_leaf_starves_no_control_traffic(qos):
     when the classes leave committed ones unused -- which a backlogged leaf
     never does. The gateway's own frames once went to exactly such a queue,
     and starved. They now take the top channel's control queue, eligible for
-    committed tokens and above every leaf in priority: the DUT pings this host
-    with no loss worth the name, and fresh TCP handshakes with the DUT's agent,
-    whose answers leave by the shaped port, all complete.
+    committed tokens and above every leaf in priority, within a budget of a
+    sixteenth of the channel: the DUT pings this host with no loss worth the
+    name, and fresh TCP handshakes with the DUT's agent, whose answers leave by
+    the shaped port, all complete.
     """
     r = qos
     dev = TARGET_WAN_IF
@@ -1377,8 +1378,12 @@ async def test_flowtable_qos_saturated_leaf_starves_no_control_traffic(qos):
     client = f'''
 import json, subprocess
 route = {route!r}
-existing = json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'exact', route], text=True))
-assert not existing, existing
+# A run killed before its own cleanup leaves this route behind, and that one
+# is this case's to remove. Anything else holding the prefix is not.
+for entry in json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'exact', route],
+                                               text=True)):
+    assert (entry.get('gateway'), entry.get('dev')) == ({r.lan_gateway!r}, {LAN_NIC!r}), entry
+    subprocess.run(['ip', 'route', 'del', route, 'dev', {LAN_NIC!r}], check=True)
 subprocess.run(['ip', 'route', 'add', route, 'via', {r.lan_gateway!r}, 'dev', {LAN_NIC!r},
                 'mtu', '1500'], check=True)
 try:
@@ -1574,14 +1579,18 @@ async def test_flowtable_qos_declined_flow_keeps_its_class_in_software(qos):
 
 
 async def test_flowtable_qos_default_class_takes_unclassified_traffic(qos):
-    """`default` names the leaf everything unclassified takes, in both paths.
+    """`default` names the leaf everything unclassified takes, in both paths,
+    and control traffic is not unclassified.
 
     A tree built with `default 20`: an unmarked flow offloaded at three times
     the cap is shaped on leaf 1:20 -- its classifier entry resolves the missing
-    class to that leaf -- and every frame the CPU sends on the port meanwhile,
-    the iperf3 control connection's handshake included, lands there too. The
-    DUT's own pings do as well, as they would under software HTB. The prio 0
-    leaf beside it sees none of it.
+    class to that leaf -- and every unclassified frame the CPU forwards on the
+    port meanwhile, the iperf3 control connection's handshake included, lands
+    there too. The prio 1 leaf beside it sees none of it. The DUT's own pings
+    do not follow: they are control traffic, which takes the top channel's
+    control queue rather than the default -- a default is commonly the lowest
+    class, where a saturated class above it would starve them. They used to
+    land on the default leaf, as software HTB would put them.
     """
     r = qos
     dev = TARGET_LAN_IF
@@ -1591,7 +1600,7 @@ async def test_flowtable_qos_default_class_takes_unclassified_traffic(qos):
                "default", "20")
     await r.tc("class", "add", "dev", dev, "parent", "1:", "classid", "1:1",
                "htb", "rate", rate, "ceil", rate)
-    for classid, prio in (("1:10", HIGH_PRIO), ("1:20", 2)):
+    for classid, prio in (("1:10", LOW_PRIO), ("1:20", 2)):
         await r.tc("class", "add", "dev", dev, "parent", "1:1", "classid", classid,
                    "htb", "rate", rate, "ceil", rate, "prio", str(prio))
     await offload(r, inbound(r, "udp", PORT_DEFAULT))
@@ -1623,6 +1632,7 @@ async def test_flowtable_qos_default_class_takes_unclassified_traffic(qos):
                                    "pinged": pinged,
                                    "ping_default": leaf_delta(after, pinged_after, 1),
                                    "ping_other": leaf_delta(after, pinged_after, 0),
+                                   "ping_control": leaf_delta(after, pinged_after, "control"),
                                    "report": report})
 
     cap = CAP_MBIT * 1e6
@@ -1635,17 +1645,23 @@ async def test_flowtable_qos_default_class_takes_unclassified_traffic(qos):
     slack = timing_slack(first, second)
     shaped = shaped_bps(first, second, 1)
     assert (0.95 - slack) * cap <= shaped <= (1.03 + slack) * cap, (shaped, cap, slack)
-    # Every frame of the flow the classifier matched, and every frame the CPU
-    # sent on the port -- the control connection's handshake among them --
-    # is on the default leaf, dequeued or rejected. The other leaf saw none.
+    # Every frame of the flow the classifier matched, and every unclassified
+    # frame the CPU sent on the port -- the control connection's handshake
+    # among them -- is on the default leaf, dequeued or rejected. The other
+    # leaf saw none.
     extra = whole["frames"] + whole["rejected"] - int(row["packets"])
     assert 0 <= extra <= after["software_tx"] - before["software_tx"], (
         whole, row["packets"], after["software_tx"] - before["software_tx"])
     assert extra > 0, whole
     assert leaf_delta(before, after, 0)["frames"] == 0, leaf_delta(before, after, 0)
-    # The gateway's own frames too.
+    # The gateway's own frames are control, and go to the control queue.
     assert pinged[0] == pinged[1] == COUNT, pinged
-    assert leaf_delta(after, pinged_after, 1)["frames"] >= COUNT, leaf_delta(after, pinged_after, 1)
+    assert leaf_delta(after, pinged_after, "control")["frames"] >= COUNT, (
+        leaf_delta(after, pinged_after, "control"))
+    # None of them on the default leaf, which the port's other unclassified
+    # traffic may still touch; the prio 1 leaf takes only its own mark.
+    assert leaf_delta(after, pinged_after, 1)["frames"] < COUNT // 4, (
+        leaf_delta(after, pinged_after, 1))
     assert leaf_delta(after, pinged_after, 0)["frames"] == 0, leaf_delta(after, pinged_after, 0)
 
 
@@ -1886,8 +1902,12 @@ async def test_flowtable_qos_egress_change_readmits_under_the_tree(qos):
     client = f'''
 import json, subprocess
 route = {route!r}
-existing = json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'exact', route], text=True))
-assert not existing, existing
+# A run killed before its own cleanup leaves this route behind, and that one
+# is this case's to remove. Anything else holding the prefix is not.
+for entry in json.loads(subprocess.check_output(['ip', '-j', 'route', 'show', 'exact', route],
+                                               text=True)):
+    assert (entry.get('gateway'), entry.get('dev')) == ({r.lan_gateway!r}, {LAN_NIC!r}), entry
+    subprocess.run(['ip', 'route', 'del', route, 'dev', {LAN_NIC!r}], check=True)
 subprocess.run(['ip', 'route', 'add', route, 'via', {r.lan_gateway!r}, 'dev', {LAN_NIC!r},
                 'mtu', '1500'], check=True)
 try:

@@ -49,9 +49,17 @@
 #include <net/inet_ecn.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
-#include <net/netfilter/nf_conntrack.h>
+#include <net/ndisc.h>
+#include <linux/atomic.h>
+#include <linux/if_packet.h>
 #include <linux/if_pppox.h>
+#include <linux/icmpv6.h>
+#include <linux/if_vlan.h>
+#include <linux/math64.h>
+#include <linux/percpu.h>
 #include <linux/ppp_defs.h>
+#include <linux/timekeeping.h>
+#include <linux/udp.h>
 #include <dpaa_eth.h>
 #include <dpaa_eth_common.h>
 #include "cdx.h"
@@ -101,18 +109,24 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
 
 /* Where a frame goes that names no leaf, on a port whose tree is live.
  *
- * Unclassified traffic -- no class in its mark, or a class no leaf holds --
- * takes the leaf `default' names, as software HTB sends it there. With no
- * default leaf it takes the top channel's class queue 0, the lowest strict
- * priority: the queue the hardware has always resolved a mark with no class to
- * (cdx_get_txfqid() with zero nibbles), so a flow's frames land on the same
- * queue before and after it is offloaded.
+ * Unclassified traffic -- no class known for the frame's connection, or a
+ * class no leaf holds -- takes the leaf `default' names, as software HTB sends
+ * it there. With no default leaf it takes the top channel's class queue 0, the
+ * lowest strict priority, below the weighted group: the queue the hardware has
+ * always resolved a mark with no class to (cdx_get_txfqid() with zero
+ * nibbles). That holds forwarded or not, tracked or not, so a flow's frames
+ * land on the same queue before and after it is offloaded, and a frame whose
+ * connection nothing classified is never anywhere better than that.
  *
- * Frames the hardware never carries -- no conntrack, or the gateway's own --
- * take the top channel's class queue 7, the highest strict priority, as the
- * driver's own queue choice always gave them: ARP and neighbour discovery,
- * PPPoE's LCP echoes, DHCP, the gateway's own sessions. A default leaf takes
- * these too, as it does in software HTB.
+ * Control traffic is the exception: what the gateway sends itself -- from its
+ * sockets, and the link frames it originates, ARP, neighbour discovery, PPPoE
+ * discovery and a session's LCP, IGMP, DHCP -- and link protocols the bridge
+ * carries between ports (cdx_htb_parse(), cdx_htb_control()). None of it is
+ * ever offloaded, and nothing a host sends through the gateway is control. It takes the top channel's class queue 7, the
+ * highest strict priority, never the default leaf -- a default is commonly the
+ * lowest class, and a saturated one above it would starve an LCP echo there
+ * until the session dropped. Class queue 7 is bounded by a budget instead
+ * (CDX_HTB_CONTROL_SHARE); what exceeds it is sent as unclassified traffic.
  *
  * Unlike software HTB's direct queue, neither is unshaped: both sit on the top
  * channel and so under its cap. That is deliberate. A link shaped to what the
@@ -125,6 +139,22 @@ static_assert(CDX_HTB_CLASSES > CDX_FT_QOS_EGRESS_MASK,
  */
 #define CDX_HTB_UNCLASSIFIED_CQ	0
 #define CDX_HTB_CONTROL_CQ	(NUM_PQS - 1)
+
+/* What control traffic may take of the top channel.
+ *
+ * Its queue is the highest priority there is and competes for committed
+ * tokens, so nothing about the queue itself bounds it: unbounded, anything
+ * that counts as control -- the gateway's own bulk transfer, a flood of ARP
+ * requests it answers -- would starve every leaf on the channel. So a budget
+ * stands in front of it: a sixteenth of the top channel's committed rate,
+ * never less than 64 kbit/s unless the channel is slower than twice that, and
+ * a burst of sixteen full-size frames. Enough for every link protocol and the
+ * gateway's own sessions many times over; what a leaf can lose to it is
+ * bounded by it. A control frame over budget is sent as unclassified traffic
+ * rather than dropped. */
+#define CDX_HTB_CONTROL_SHARE	16
+#define CDX_HTB_CONTROL_FLOOR	8000		/* bytes per second */
+#define CDX_HTB_CONTROL_BURST	(16 * 1536)	/* bytes */
 
 /* The WRED curve a RED qdisc on a leaf asked for, kept so it can be put back
  * after the class queue is configured afresh: ceetm_set_class_queue() starts
@@ -190,12 +220,19 @@ struct cdx_htb_port {
 	/* The top channel, or NONE while no tree is live: which is also the
 	 * switch that tells both paths whether any of this applies. */
 	u8 top;
-	/* The leaf `default' names, as a slot, or NONE. */
-	u8 default_slot;
 	/* Where unclassified traffic goes, as channel << 8 | class queue: the
 	 * default leaf's pair, or the top channel's class queue 0. One word, so
 	 * a reader never pairs one channel with another's queue. */
 	u16 unclassified;
+	/* The committed rate each channel was shaped at, bytes per second. */
+	u64 rate[CDX_CEETM_MAX_CHANNELS];
+	/* The control budget (cdx_htb_control_admit()): bytes per second and
+	 * the burst, in nanoseconds at that rate, published from the top
+	 * channel's rate, and the time by which what it admitted would have
+	 * left. */
+	u64 control_rate;
+	s64 control_tau;
+	atomic64_t control_tat;
 };
 
 /* Indexed the way gQMCtx is, so a netdev's stashed QoS context names its
@@ -278,6 +315,25 @@ static bool cdx_htb_channel_owned(struct cdx_htb_port *port, u8 channel)
  * cdx_htb_resolve_class(), which hands it an explicit channel. */
 static void cdx_htb_implicit_sync(struct cdx_htb_port *port, u8 top);
 
+/* Size the control budget from the top channel's committed rate. The two
+ * words are read without a lock; a reader that pairs an old one with a new
+ * one admits by a burst that was right a moment ago. */
+static void cdx_htb_control_budget(struct cdx_htb_port *port, u8 top)
+{
+	u64 rate = top == CDX_HTB_NONE ? 0 : port->rate[top], budget = 0;
+
+	if (top != CDX_HTB_NONE) {
+		/* A channel with no rate is unshaped, and a floor is all there
+		 * is to go by. */
+		budget = max(rate / CDX_HTB_CONTROL_SHARE,
+			     rate ? min_t(u64, CDX_HTB_CONTROL_FLOOR, rate / 2) :
+				    CDX_HTB_CONTROL_FLOOR);
+	}
+	WRITE_ONCE(port->control_tau, budget ?
+		   (s64)div64_u64((u64)CDX_HTB_CONTROL_BURST * NSEC_PER_SEC, budget) : 0);
+	WRITE_ONCE(port->control_rate, budget);
+}
+
 static void cdx_htb_publish(struct cdx_htb_port *port)
 {
 	struct cdx_htb_class *cl;
@@ -322,8 +378,8 @@ static void cdx_htb_publish(struct cdx_htb_port *port)
 	 * class queue 0, which is where the hardware sends it too. */
 	if (default_slot != CDX_HTB_NONE)
 		WRITE_ONCE(port->class_txq[0], default_slot);
-	WRITE_ONCE(port->default_slot, default_slot);
 	WRITE_ONCE(port->unclassified, unclassified);
+	cdx_htb_control_budget(port, top);
 	WRITE_ONCE(port->top, top);
 	cdx_htb_implicit_sync(port, top);
 }
@@ -552,8 +608,8 @@ static void cdx_htb_cq_restore(struct cdx_htb_port *port, struct cdx_htb_class *
  * ceil equal to rate therefore leaves nothing to borrow, which is what an HTB
  * class with no ceil of its own is asking for.
  */
-static int cdx_htb_shape(u8 channel, u64 rate, u64 ceil,
-			 struct netlink_ext_ack *extack)
+static int cdx_htb_shape(struct cdx_htb_port *port, u8 channel, u64 rate,
+			 u64 ceil, struct netlink_ext_ack *extack)
 {
 	u64 excess = ceil > rate ? ceil - rate : 0;
 
@@ -561,6 +617,7 @@ static int cdx_htb_shape(u8 channel, u64 rate, u64 ceil,
 		NL_SET_ERR_MSG_MOD(extack, "CEETM cannot shape at the requested rate");
 		return -EINVAL;
 	}
+	port->rate[channel] = rate;
 	return 0;
 }
 
@@ -568,8 +625,9 @@ static int cdx_htb_shape(u8 channel, u64 rate, u64 ceil,
  * programmed, it would shape whatever class is given the channel next, before
  * that class has said anything. Nothing can be done about a failure here: the
  * caller is already giving the channel up. */
-static void cdx_htb_unshape(u8 channel)
+static void cdx_htb_unshape(struct cdx_htb_port *port, u8 channel)
 {
+	port->rate[channel] = 0;
 	if (ceetm_set_channel_rates(channel, 0, 0))
 		pr_warn("cdx: CEETM channel %u kept a rate it no longer has a class for\n",
 			channel);
@@ -616,6 +674,7 @@ static int cdx_htb_create(struct cdx_htb_port *port, struct tc_htb_qopt_offload 
 	}
 	INIT_LIST_HEAD(&port->classes);
 	memset(port->cq_used, 0, sizeof(port->cq_used));
+	memset(port->rate, 0, sizeof(port->rate));
 	port->channels = 0;
 	port->leaves = 0;
 	port->implicit = 0;
@@ -649,6 +708,7 @@ static void cdx_htb_destroy(struct cdx_htb_port *port)
 	list_for_each_entry_safe(cl, next, &port->classes, list)
 		cdx_htb_class_free(port, cl);
 	memset(port->cq_used, 0, sizeof(port->cq_used));
+	memset(port->rate, 0, sizeof(port->rate));
 	port->channels = 0;
 	port->leaves = 0;
 	port->live = false;
@@ -697,7 +757,7 @@ static int cdx_htb_leaf_alloc(struct cdx_htb_port *port,
 	/* Shape before the port starts scheduling, so the first frame out of a
 	 * new channel already meets the rate it was given. */
 	if (root) {
-		rc = cdx_htb_shape(channel, opt->rate, opt->ceil, opt->extack);
+		rc = cdx_htb_shape(port, channel, opt->rate, opt->ceil, opt->extack);
 		if (rc)
 			goto err_class;
 	}
@@ -743,7 +803,7 @@ err_class:
 	 * class briefly took may have been one unclassified or control traffic
 	 * was using, and the publish makes it eligible again. */
 	if (root)
-		cdx_htb_unshape(channel);
+		cdx_htb_unshape(port, channel);
 	cdx_htb_publish(port);
 	return rc;
 }
@@ -823,7 +883,7 @@ static int cdx_htb_leaf_del(struct cdx_htb_port *port,
 	cdx_htb_cq_release(port, cl->channel, cl->cq);
 	/* A class under the root takes its channel out of service with it. */
 	if (!cl->parent)
-		cdx_htb_unshape(cl->channel);
+		cdx_htb_unshape(port, cl->channel);
 	moved = cdx_htb_qid_free(port, cl->qid);
 	cdx_htb_class_free(port, cl);
 	cdx_htb_publish(port);
@@ -885,8 +945,12 @@ static int cdx_htb_node_modify(struct cdx_htb_port *port,
 	 * here with a shaper. A class queue's rate and ceil have no hardware
 	 * behind them, so what a leaf can change is where it sits among its
 	 * siblings. */
-	if (!cl->parent)
-		return cdx_htb_shape(cl->channel, opt->rate, opt->ceil, opt->extack);
+	if (!cl->parent) {
+		rc = cdx_htb_shape(port, cl->channel, opt->rate, opt->ceil, opt->extack);
+		/* The control budget follows the top channel's rate. */
+		cdx_htb_publish(port);
+		return rc;
+	}
 	cdx_htb_cq_release(port, cl->channel, cl->cq);
 	rc = cdx_htb_cq_get(port, cl->channel, opt->prio, opt->quantum, &cq, opt->extack);
 	if (!rc)
@@ -1290,21 +1354,35 @@ out:
  *
  * The class comes from the adapter's own classifier, registered below, so the
  * frame lands on the class the hardware rule would have given the same flow.
- * With no classifier registered no mark is decoded, but a port with a live
+ * With no classifier registered no class is decoded, but a port with a live
  * tree still answers for every frame through cdx_htb_txq_fq(): the driver's own
  * resolution from skb->mark reads a different field in a different encoding,
  * and on a port the tree owns it would pick queues the tree never configured.
  * A port without a tree answers nothing, and cpe_fp_tx() resolves the frame as
  * it did before any of this existed.
+ *
+ * Nothing here reads what the stack attached to the skb on the way, because
+ * crossing a device boundary scrubs it: ppp_start_xmit() drops every frame's
+ * conntrack and ingress index, and so do the IP tunnels, so a frame for a PPPoE
+ * session or a 6in4 tunnel reaches the port looking like one nothing
+ * forwarded. The headers survive every such boundary. So the decisions are
+ * made from them: the connection is found again from the packet's tuple
+ * (cdx_ft_qos_class_fn), and whether a frame is control traffic is a property
+ * of its protocol and of whether the gateway sent it.
  */
 static cdx_ft_qos_class_fn cdx_ft_qos_class_func;
+/* Whether any class the classifier can decode carries a remark. A remark is
+ * the one thing a class does on a port with no tree, so without one such a
+ * port has nothing to ask the classifier. */
+static bool cdx_ft_qos_remarks;
 
-int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
+int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn, bool remarks)
 {
 	if (!fn)
 		return -EINVAL;
 	if (cmpxchg(&cdx_ft_qos_class_func, NULL, fn))
 		return -EBUSY;
+	WRITE_ONCE(cdx_ft_qos_remarks, remarks);
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cdx_register_ft_qos_class, ASK_CDX_FLOWTABLE);
@@ -1317,35 +1395,482 @@ void cdx_unregister_ft_qos_class(void)
 {
 	WRITE_ONCE(cdx_ft_qos_class_func, NULL);
 	synchronize_net();
+	WRITE_ONCE(cdx_ft_qos_remarks, false);
 }
 EXPORT_SYMBOL_NS_GPL(cdx_unregister_ft_qos_class, ASK_CDX_FLOWTABLE);
+
+/* A datagram an IP fragment belongs to: the fields every fragment of it
+ * repeats, which is how a later fragment is matched to the first. */
+struct cdx_htb_datagram {
+	__be32 saddr[4], daddr[4];
+	__be32 id;
+	u8 family, proto;
+};
+
+/* What the Tx path reads from a frame's headers. Offsets are from skb->data,
+ * which is where the Ethernet header starts both in ndo_select_queue and in
+ * ndo_start_xmit; a VLAN tag the stack still carries out of band is not in the
+ * frame yet, and one already pushed in is walked past, as is a PPPoE session
+ * header. */
+struct cdx_htb_frame {
+	/* The frame's own IP header, and AF_INET or AF_INET6; a family of zero
+	 * for a frame that carries none. */
+	unsigned int nh;
+	u8 family;
+	/* The IP header an IP-in-IP frame carries -- 6in4, 4in6, and their
+	 * like -- likewise. */
+	unsigned int inner;
+	u8 inner_family;
+	/* A link protocol (cdx_htb_parse()). */
+	bool link;
+	/* The frame's own IP header is addressed within the link: to a
+	 * multicast group, the limited broadcast, or an IPv6 link-local
+	 * address. Nothing so addressed is ever routed. */
+	bool scoped;
+	/* A fragment of a larger datagram; whether it is a later one, which
+	 * carries no transport header to find a connection by; and whether it
+	 * is the datagram's last. */
+	bool fragment, later, last;
+	struct cdx_htb_datagram datagram;
+};
+
+/* The transport protocol of the IP packet at `off', and where its header
+ * starts. False for a packet whose transport header cannot be reached: a
+ * fragment after the first, or a header this frame does not hold. A fragment
+ * is recorded in `f' either way, first or later, with the datagram it is of.
+ *
+ * IPv6 extension headers are walked as ipv6_skip_exthdr() walks them, which
+ * this does itself only because that one does not say where the fragment
+ * header it passed was. */
+static bool cdx_htb_l4(const struct sk_buff *skb, struct cdx_htb_frame *f,
+		       unsigned int off, u8 family, u8 *proto, unsigned int *thoff)
+{
+	if (family == AF_INET) {
+		struct iphdr _iph;
+		const struct iphdr *iph;
+
+		iph = skb_header_pointer(skb, off, sizeof(_iph), &_iph);
+		if (!iph || iph->version != 4 || iph->ihl < 5)
+			return false;
+		if (off == f->nh)
+			f->scoped = ipv4_is_multicast(iph->daddr) || ipv4_is_lbcast(iph->daddr);
+		if (iph->frag_off & htons(IP_MF | IP_OFFSET)) {
+			f->fragment = true;
+			f->later = !!(iph->frag_off & htons(IP_OFFSET));
+			f->last = f->later && !(iph->frag_off & htons(IP_MF));
+			f->datagram.family = AF_INET;
+			f->datagram.proto = iph->protocol;
+			f->datagram.id = (__force __be32)iph->id;
+			f->datagram.saddr[0] = iph->saddr;
+			f->datagram.daddr[0] = iph->daddr;
+			if (f->later)
+				return false;
+		}
+		*proto = iph->protocol;
+		*thoff = off + iph->ihl * 4;
+		return true;
+	} else {
+		struct ipv6hdr _ip6h;
+		const struct ipv6hdr *ip6h;
+		unsigned int at = off + sizeof(_ip6h);
+		u8 nexthdr;
+
+		ip6h = skb_header_pointer(skb, off, sizeof(_ip6h), &_ip6h);
+		if (!ip6h || ip6h->version != 6)
+			return false;
+		if (off == f->nh)
+			f->scoped = ip6h->daddr.s6_addr[0] == 0xff ||
+				    (ip6h->daddr.s6_addr[0] == 0xfe &&
+				     (ip6h->daddr.s6_addr[1] & 0xc0) == 0x80);
+		for (nexthdr = ip6h->nexthdr; ipv6_ext_hdr(nexthdr);) {
+			struct ipv6_opt_hdr _hdr;
+			const struct ipv6_opt_hdr *hp;
+			unsigned int hdrlen;
+
+			if (nexthdr == NEXTHDR_NONE)
+				return false;
+			hp = skb_header_pointer(skb, at, sizeof(_hdr), &_hdr);
+			if (!hp)
+				return false;
+			if (nexthdr == NEXTHDR_FRAGMENT) {
+				struct frag_hdr _fh;
+				const struct frag_hdr *fh;
+
+				fh = skb_header_pointer(skb, at, sizeof(_fh), &_fh);
+				if (!fh)
+					return false;
+				f->fragment = true;
+				f->later = !!(ntohs(fh->frag_off) & ~0x7);
+				f->last = f->later && !(ntohs(fh->frag_off) & IP6_MF);
+				f->datagram.family = AF_INET6;
+				f->datagram.proto = fh->nexthdr;
+				f->datagram.id = fh->identification;
+				memcpy(f->datagram.saddr, &ip6h->saddr, sizeof(ip6h->saddr));
+				memcpy(f->datagram.daddr, &ip6h->daddr, sizeof(ip6h->daddr));
+				if (f->later)
+					return false;
+				hdrlen = sizeof(*fh);
+			} else if (nexthdr == NEXTHDR_AUTH) {
+				hdrlen = ipv6_authlen(hp);
+			} else {
+				hdrlen = ipv6_optlen(hp);
+			}
+			nexthdr = hp->nexthdr;
+			at += hdrlen;
+		}
+		*proto = nexthdr;
+		*thoff = at;
+		return true;
+	}
+}
+
+/* The IP version of the header at `off', or zero. */
+static u8 cdx_htb_ip_family(const struct sk_buff *skb, unsigned int off)
+{
+	u8 _first, *first = skb_header_pointer(skb, off, sizeof(_first), &_first);
+
+	if (!first)
+		return 0;
+	return *first >> 4 == 4 ? AF_INET : *first >> 4 == 6 ? AF_INET6 : 0;
+}
+
+#define CDX_HTB_MAX_TAGS	2
+
+/* Read a frame's headers into `f'.
+ *
+ * A link protocol is one that keeps links, addresses and neighbours working
+ * and never leaves the link it is on: every frame that is not IP -- ARP, PPPoE
+ * discovery, a PPP session's own LCP, authentication and NCP frames, LLDP,
+ * spanning tree -- and, in IP, IGMP, neighbour discovery and MLD, and DHCP in
+ * either family. Whose it is decides whether it is control (cdx_htb_control()).
+ * ICMP echoes and errors are not link protocols: the gateway's own are control
+ * because the gateway sent them, and a forwarded one is traffic like any other.
+ */
+static void cdx_htb_parse(const struct sk_buff *skb, struct cdx_htb_frame *f)
+{
+	unsigned int off = ETH_HLEN, tags, thoff;
+	__be16 _field, *field, type;
+	struct udphdr _uh;
+	const struct udphdr *uh;
+	u8 proto, _icmp6, *icmp6;
+
+	memset(f, 0, sizeof(*f));
+	f->link = true;
+	/* The EtherType, and past each tag the one it encapsulates. */
+	field = skb_header_pointer(skb, ETH_HLEN - sizeof(_field), sizeof(_field), &_field);
+	for (tags = 0; field && eth_type_vlan(*field) && tags < CDX_HTB_MAX_TAGS; tags++) {
+		off += VLAN_HLEN;
+		field = skb_header_pointer(skb, off - sizeof(_field), sizeof(_field), &_field);
+	}
+	if (!field)
+		return;
+	type = *field;
+	/* A session's own PPP protocol, behind its six-byte header. */
+	if (type == htons(ETH_P_PPP_SES)) {
+		field = skb_header_pointer(skb, off + sizeof(struct pppoe_hdr),
+					   sizeof(_field), &_field);
+		if (!field)
+			return;
+		off += PPPOE_SES_HLEN;
+		type = *field == htons(PPP_IP) ? htons(ETH_P_IP) :
+		       *field == htons(PPP_IPV6) ? htons(ETH_P_IPV6) : 0;
+	}
+	if (type == htons(ETH_P_IP))
+		f->family = AF_INET;
+	else if (type == htons(ETH_P_IPV6))
+		f->family = AF_INET6;
+	else
+		return;
+	f->nh = off;
+	f->link = false;
+	if (!cdx_htb_l4(skb, f, off, f->family, &proto, &thoff))
+		return;
+	switch (proto) {
+	case IPPROTO_IGMP:
+		f->link = f->family == AF_INET;
+		break;
+	case IPPROTO_ICMPV6:
+		icmp6 = skb_header_pointer(skb, thoff, sizeof(_icmp6), &_icmp6);
+		if (!icmp6 || f->family != AF_INET6)
+			break;
+		switch (*icmp6) {
+		case ICMPV6_MGM_QUERY:
+		case ICMPV6_MGM_REPORT:
+		case ICMPV6_MGM_REDUCTION:
+		case ICMPV6_MLD2_REPORT:
+		case NDISC_ROUTER_SOLICITATION:
+		case NDISC_ROUTER_ADVERTISEMENT:
+		case NDISC_NEIGHBOUR_SOLICITATION:
+		case NDISC_NEIGHBOUR_ADVERTISEMENT:
+		case NDISC_REDIRECT:
+			f->link = true;
+		}
+		break;
+	case IPPROTO_UDP:
+		uh = skb_header_pointer(skb, thoff, sizeof(_uh), &_uh);
+		if (!uh)
+			break;
+		if (f->family == AF_INET)
+			f->link = uh->dest == htons(67) || uh->dest == htons(68);
+		else
+			f->link = uh->dest == htons(546) || uh->dest == htons(547);
+		break;
+	case IPPROTO_IPIP:
+	case IPPROTO_IPV6:
+		f->inner_family = cdx_htb_ip_family(skb, thoff);
+		if (f->inner_family != (proto == IPPROTO_IPIP ? AF_INET : AF_INET6))
+			f->inner_family = 0;
+		else
+			f->inner = thoff;
+		break;
+	}
+}
+
+/* Whether a frame is control traffic, and if so whether it is the gateway's
+ * own link traffic, which *own_link says.
+ *
+ * Control is what the gateway sends itself, and link protocols the bridge
+ * carries between its ports. None of it is ever offloaded. The gateway's own
+ * are its sockets' frames -- how it is reached and managed, and how it
+ * resolves names for the network behind it -- the socketless frames it
+ * originates, ARP, LCP and IGMP among them, which never received an ingress
+ * index, and whatever netpoll sends with interrupts off, which is how a
+ * console reaches the network when everything else has failed.
+ *
+ * A link protocol the bridge forwards between ports is control too, but not
+ * the gateway's own: it is a host on the other side being answered. And one
+ * that routing forwarded -- a unicast DHCP renewal to a server upstream, say,
+ * or anything a host shapes like a link protocol and addresses off the link --
+ * is traffic like any other, taking its flow's queue, as the flow does in
+ * hardware. Routing takes only a frame addressed to this host, which leaves
+ * PACKET_HOST; a frame the bridge forwards is addressed to another. A routed
+ * frame a scrub reached first has no ingress index either, so an IP link frame
+ * without one is taken for the gateway's own only when its destination is on
+ * the link, which every such frame the kernel originates without a socket --
+ * IGMP, a kernel DHCP client -- has. A frame that is not IP cannot have been
+ * routed at all.
+ *
+ * The distinction matters for the budget (cdx_htb_control_admit()): the
+ * gateway's own link traffic may run past what its sessions and the hosts it
+ * bridges for have spent, so neither a bulk transfer from the gateway nor a
+ * host flooding broadcasts can push an LCP echo off the top of the tree. */
+static bool cdx_htb_control(const struct sk_buff *skb, const struct cdx_htb_frame *f,
+			    bool *own_link)
+{
+	*own_link = false;
+	if (skb->sk || irqs_disabled()) {
+		*own_link = f->link;
+		return true;
+	}
+	if (!f->link)
+		return false;
+	if (!skb->skb_iif && (!f->family || f->scoped)) {
+		*own_link = true;
+		return true;
+	}
+	return skb->skb_iif && (!f->family || skb->pkt_type != PACKET_HOST);
+}
+
+/* Control frames sent as unclassified traffic because their port's budget was
+ * spent. Reported in /proc/cdx_flowtable. */
+static atomic64_t cdx_htb_control_overruns = ATOMIC64_INIT(0);
+
+/* Take `len' bytes from the port's control budget, or refuse. Lock-free, and
+ * callable from any context a frame is sent from.
+ *
+ * The budget is a rate and a burst (cdx_htb_control_budget()), kept as the
+ * time by which everything admitted so far would have left at that rate. A
+ * frame is admitted while that time is no more than the burst's worth ahead of
+ * now -- twice that for the gateway's own link traffic, so neither its own
+ * sessions nor the hosts it bridges for, spending the budget, can push an LCP
+ * echo or an ARP reply off the top of the tree. */
+static bool cdx_htb_control_admit(struct cdx_htb_port *port, unsigned int len,
+				  bool link)
+{
+	u64 rate = READ_ONCE(port->control_rate);
+	s64 tau = READ_ONCE(port->control_tau), now, tat, start, cost;
+
+	if (!rate)
+		return false;
+	if (link)
+		tau *= 2;
+	cost = div64_u64((u64)len * NSEC_PER_SEC, rate);
+	now = ktime_get_mono_fast_ns();
+	tat = atomic64_read(&port->control_tat);
+	do {
+		start = tat > now ? tat : now;
+		if (start - now > tau) {
+			atomic64_inc(&cdx_htb_control_overruns);
+			return false;
+		}
+	} while (!atomic64_try_cmpxchg(&port->control_tat, &tat, start + cost));
+	return true;
+}
+
+u64 cdx_ft_qos_control_overruns(void)
+{
+	return atomic64_read(&cdx_htb_control_overruns);
+}
+EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_control_overruns, ASK_CDX_FLOWTABLE);
+
+/* The class of the connection a frame belongs to: -1 with no classifier
+ * registered, 0 when no connection is known, with *class zero, and 1 when one
+ * was found, with *at and *family naming the IP header it was found for --
+ * the one a remark rewrites.
+ *
+ * An IP-in-IP frame is classified by the connection it carries first. That is
+ * the connection the hardware entry of an offloaded 6in4 or 4in6 flow was
+ * built from and carries the class of, so its software frames take the same
+ * one; the tunnel's own conntrack describes only the outer header, and counts
+ * only when the carried connection is not known.
+ *
+ * The classifier is the adapter's text, so the pointer and the calls share a
+ * read-side section taken here: the unregister's grace period waits for it
+ * whatever context the frame arrived in. */
+static int cdx_htb_frame_class(const struct sk_buff *skb,
+			       const struct cdx_htb_frame *f, u32 *class,
+			       unsigned int *at, u8 *family)
+{
+	cdx_ft_qos_class_fn classify;
+	int found = -1;
+
+	*class = 0;
+	rcu_read_lock();
+	classify = READ_ONCE(cdx_ft_qos_class_func);
+	if (!classify)
+		goto out;
+	found = 1;
+	if (f->inner_family && classify(skb, f->inner, f->inner_family, false, class)) {
+		*at = f->inner;
+		*family = f->inner_family;
+		goto out;
+	}
+	if (classify(skb, f->nh, f->family, true, class)) {
+		*at = f->nh;
+		*family = f->family;
+		goto out;
+	}
+	*class = 0;
+	found = 0;
+out:
+	rcu_read_unlock();
+	return found;
+}
+
+/* The class a datagram's first fragment was found, for its later fragments.
+ *
+ * A later fragment carries no transport header, so no connection can be found
+ * for it by its tuple. Where the conntrack survived to the port every fragment
+ * carries it -- ip_do_fragment() copies it to each -- but a scrub on the way,
+ * PPPoE's among them, drops it from all of them, and the later fragments would
+ * then take a different queue from the first: reordered, and starved whenever
+ * that class is not. So the first fragment's answer is kept for the others.
+ *
+ * A datagram's fragments leave one after another from the CPU that made them
+ * -- on the stock path a PPPoE session has no qdisc of its own, and ppp drains
+ * its queue under its own lock -- so a handful of entries per CPU covers every
+ * datagram in flight there. A qdisc on the ppp device can let another CPU send
+ * the later fragments; they then find nothing here and go unclassified, which
+ * is where they went before. An entry is one datagram: a first fragment
+ * replaces whatever an earlier datagram with the same identity left, and the
+ * last fragment retires it, so a reused IP ID cannot inherit a stale class. */
+#define CDX_HTB_DATAGRAMS	4
+struct cdx_htb_datagram_class {
+	struct cdx_htb_datagram datagram;
+	u32 class;
+	/* The class was found for the fragment's own header, which each later
+	 * fragment repeats and a remark rewrites; not for one the first
+	 * fragment carried, which the later ones do not hold. */
+	bool own;
+	bool valid;
+};
+struct cdx_htb_datagrams {
+	struct cdx_htb_datagram_class entry[CDX_HTB_DATAGRAMS];
+	unsigned int next;
+};
+static DEFINE_PER_CPU(struct cdx_htb_datagrams, cdx_htb_datagrams);
+
+static bool cdx_htb_same_datagram(const struct cdx_htb_datagram *a,
+				  const struct cdx_htb_datagram *b)
+{
+	return a->family == b->family && a->proto == b->proto && a->id == b->id &&
+	       !memcmp(a->saddr, b->saddr, sizeof(a->saddr)) &&
+	       !memcmp(a->daddr, b->daddr, sizeof(a->daddr));
+}
+
+static int cdx_htb_fragment_class(const struct cdx_htb_frame *f, int found,
+				  u32 *class, unsigned int *at, u8 *family)
+{
+	struct cdx_htb_datagram_class *entry = NULL;
+	struct cdx_htb_datagrams *cache;
+	unsigned long flags;
+	unsigned int ii;
+
+	if (!f->fragment || found < 0 || (f->later && found))
+		return found;
+	/* Interrupts off rather than only preemption: this runs with bottom
+	 * halves enabled from AF_PACKET's qdisc bypass and with interrupts off
+	 * from netpoll, and neither a softirq nor netpoll may meet an entry
+	 * half written on this CPU. */
+	local_irq_save(flags);
+	cache = this_cpu_ptr(&cdx_htb_datagrams);
+	for (ii = 0; ii < CDX_HTB_DATAGRAMS && !entry; ii++)
+		if (cache->entry[ii].valid &&
+		    cdx_htb_same_datagram(&cache->entry[ii].datagram, &f->datagram))
+			entry = &cache->entry[ii];
+	if (!f->later) {
+		if (found) {
+			if (!entry)
+				entry = &cache->entry[cache->next++ % CDX_HTB_DATAGRAMS];
+			entry->datagram = f->datagram;
+			entry->class = *class;
+			entry->own = *at == f->nh;
+			entry->valid = true;
+		} else if (entry) {
+			entry->valid = false;
+		}
+	} else if (entry) {
+		*class = entry->class;
+		*at = f->nh;
+		*family = entry->own ? f->family : 0;
+		found = 1;
+		if (f->last)
+			entry->valid = false;
+	}
+	local_irq_restore(flags);
+	return found;
+}
 
 /* The class queue a DSCP filter names for this frame, as a leaf slot.
  *
  * Only reached when the frame named no class of its own, which is the same
  * precedence the hardware applies: an entry whose mark carries a class does not
- * get the microcode's DSCP bit set either. The answer comes from the table the
- * filter published, so software and hardware resolve one filter rather than
- * agreeing twice. */
-static u8 cdx_htb_dscp_slot(struct cdx_htb_port *port, struct sk_buff *skb)
+ * get the microcode's DSCP bit set either. The codepoint is read from the
+ * innermost IP header -- behind any tag or session header, and inside an
+ * IP-in-IP frame the carried packet's -- which is the one its sender set, and
+ * the one the hardware parsed the flow by at its ingress. The answer comes from
+ * the table the filter published, so software and hardware resolve one filter
+ * rather than agreeing twice. */
+static u8 cdx_htb_dscp_slot(struct cdx_htb_port *port, const struct sk_buff *skb,
+			    const struct cdx_htb_frame *f)
 {
+	unsigned int at = f->inner_family ? f->inner : f->nh;
+	u8 family = f->inner_family ?: f->family;
+	union {
+		struct iphdr v4;
+		struct ipv6hdr v6;
+	} _hdr;
+	const void *hdr;
 	u16 klass;
 	u8 dscp;
 
-	switch (skb->protocol) {
-	case htons(ETH_P_IP):
-		if (!pskb_network_may_pull(skb, sizeof(struct iphdr)))
-			return CDX_HTB_NONE;
-		dscp = ipv4_get_dsfield(ip_hdr(skb)) >> 2;
-		break;
-	case htons(ETH_P_IPV6):
-		if (!pskb_network_may_pull(skb, sizeof(struct ipv6hdr)))
-			return CDX_HTB_NONE;
-		dscp = ipv6_get_dsfield(ipv6_hdr(skb)) >> 2;
-		break;
-	default:
+	if (!family)
 		return CDX_HTB_NONE;
-	}
+	hdr = skb_header_pointer(skb, at, family == AF_INET ? sizeof(_hdr.v4) :
+				 sizeof(_hdr.v6), &_hdr);
+	if (!hdr)
+		return CDX_HTB_NONE;
+	dscp = (family == AF_INET ? ipv4_get_dsfield(hdr) : ipv6_get_dsfield(hdr)) >> 2;
 	/* Already in this file's own class encoding, because the filter
 	 * resolved its classid against this tree when it was programmed. So the
 	 * published map answers it exactly as it answers a conntrack mark's --
@@ -1356,20 +1881,20 @@ static u8 cdx_htb_dscp_slot(struct cdx_htb_port *port, struct sk_buff *skb)
 	return READ_ONCE(port->class_txq[klass]);
 }
 
-/* A frame the hardware could carry: forwarded, and tracked. The gateway's own
- * frames and anything conntrack never saw -- ARP, neighbour discovery, PPPoE
- * discovery and LCP, frames bridged without netfilter -- are never offloaded,
- * so they have no hardware rule whose queue they must agree with. A frame the
- * software flowtable forwards is tracked too: the flowtable hands it its
- * flow's conntrack (patch 147), so a flow the hardware declined keeps the
- * class, and the remark, its mark names. */
-static bool cdx_htb_forwarded(struct sk_buff *skb, const struct nf_conn *ct)
+/* A frame the hardware would remark: one it forwards by routing. The gateway's
+ * own carry their socket; a frame the bridge forwards arrived for another host,
+ * and routing takes only a frame addressed to this one (ip_forward() and
+ * ip6_forward() drop anything else), which it leaves as PACKET_HOST -- as the
+ * scrubs on the way to a session or a tunnel also do. The hardware's remark
+ * rides the opcode that decrements TTL, which a bridged flow's entry does not
+ * carry. */
+static bool cdx_htb_routed(const struct sk_buff *skb)
 {
-	return ct && skb->skb_iif && !skb->sk;
+	return !skb->sk && skb->pkt_type == PACKET_HOST;
 }
 
-/* Forwarded frames whose class carries a remark that could not be written --
- * the header could not be made writable -- and so left as they arrived rather
+/* Frames the software path found a remark class for but could not rewrite --
+ * the header could not be made writable -- and so sent as they arrived rather
  * than dropped for a marking. Reported in /proc/cdx_flowtable. */
 static atomic64_t cdx_htb_remark_failures = ATOMIC64_INIT(0);
 
@@ -1379,139 +1904,104 @@ u64 cdx_ft_qos_remark_failures(void)
 }
 EXPORT_SYMBOL_NS_GPL(cdx_ft_qos_remark_failures, ASK_CDX_FLOWTABLE);
 
-/* Rewrite a forwarded frame's DSCP to the codepoint its class carries, keeping
- * the two ECN bits, as the hardware rule for the same flow does.
+/* Rewrite the DSCP of the IP header at `at' to the codepoint its class
+ * carries, keeping the two ECN bits, as the hardware rule for the same flow
+ * does.
  *
  * The hardware rewrites every routed flow it carries, in the opcode that
  * decrements TTL; nothing on the software path did, so a flow changed DSCP at
  * the moment it was offloaded, and one that never was left unmarked. This is
- * the software half. A frame for a PPPoE session reaches the port with its
- * session header already on, so the IP header is looked for behind it: the
- * field the hardware rewrites for the same flow is the inner header's.
+ * the software half, and the header is the one the class was found for: the
+ * packet's own, behind any tag or session header, or the one an IP-in-IP frame
+ * carries, which is the flow the hardware entry is for.
  *
- * Only the IP header is touched, which is linear by the time the port has the
- * frame, and made writable first: a clone shares its head with a tap. The IPv4
- * checksum is updated with it; neither family's pseudo-header includes the
- * field, so a checksum the stack left for the hardware is unaffected. */
-static void cdx_htb_remark(struct sk_buff *skb, u8 dscp)
+ * Read first, and made writable only to change it: a clone shares its head
+ * with a tap, and a frame already carrying the codepoint -- a sender that sets
+ * it itself -- costs no copy. The IPv4 checksum is updated with it; neither
+ * family's pseudo-header includes the field, so a checksum the stack left for
+ * the hardware is unaffected. */
+static void cdx_htb_remark(struct sk_buff *skb, unsigned int at, u8 family, u8 dscp)
 {
-	unsigned int offset = 0;
-	__be16 proto = skb->protocol;
-	__be16 ppp;
+	unsigned int len = family == AF_INET ? sizeof(struct iphdr) : sizeof(struct ipv6hdr);
+	union {
+		struct iphdr v4;
+		struct ipv6hdr v6;
+	} _hdr;
+	const void *hdr;
 
-	if (proto == htons(ETH_P_PPP_SES)) {
-		if (skb_copy_bits(skb, skb_network_offset(skb) + sizeof(struct pppoe_hdr),
-				  &ppp, sizeof(ppp)))
-			goto failed;
-		proto = ppp == htons(PPP_IP) ? htons(ETH_P_IP) :
-			ppp == htons(PPP_IPV6) ? htons(ETH_P_IPV6) : 0;
-		offset = PPPOE_SES_HLEN;
-	}
-	/* Read before writing: a frame already carrying the codepoint -- a
-	 * sender that sets it itself -- costs no copy of a shared head. The
-	 * header is looked up again after the head is made writable, which
-	 * may have moved it. */
-	switch (proto) {
-	case htons(ETH_P_IP):
-		if (!pskb_network_may_pull(skb, offset + sizeof(struct iphdr)))
-			goto failed;
-		if (ipv4_get_dsfield((struct iphdr *)(skb_network_header(skb) + offset)) >> 2 == dscp)
-			return;
-		if (skb_ensure_writable(skb, skb_network_offset(skb) + offset +
-					sizeof(struct iphdr)))
-			goto failed;
-		ipv4_change_dsfield((struct iphdr *)(skb_network_header(skb) + offset),
-				    INET_ECN_MASK, dscp << 2);
+	hdr = skb_header_pointer(skb, at, len, &_hdr);
+	if (!hdr)
+		goto failed;
+	if ((family == AF_INET ? ipv4_get_dsfield(hdr) : ipv6_get_dsfield(hdr)) >> 2 == dscp)
 		return;
-	case htons(ETH_P_IPV6):
-		if (!pskb_network_may_pull(skb, offset + sizeof(struct ipv6hdr)))
-			goto failed;
-		if (ipv6_get_dsfield((struct ipv6hdr *)(skb_network_header(skb) + offset)) >> 2 == dscp)
-			return;
-		if (skb_ensure_writable(skb, skb_network_offset(skb) + offset +
-					sizeof(struct ipv6hdr)))
-			goto failed;
-		ipv6_change_dsfield((struct ipv6hdr *)(skb_network_header(skb) + offset),
-				    INET_ECN_MASK, dscp << 2);
-		return;
-	default:
-		/* Nothing IP to mark: the class meant a codepoint. */
-		return;
-	}
+	if (skb_ensure_writable(skb, at + len))
+		goto failed;
+	/* Looked up again: making the head writable may have moved it. */
+	if (family == AF_INET)
+		ipv4_change_dsfield((struct iphdr *)(skb->data + at), INET_ECN_MASK, dscp << 2);
+	else
+		ipv6_change_dsfield((struct ipv6hdr *)(skb->data + at), INET_ECN_MASK, dscp << 2);
+	return;
 failed:
 	atomic64_inc(&cdx_htb_remark_failures);
-}
-
-/* The adapter's classifier applied to a frame's connection, or -1 with no
- * classifier registered. The classifier is the adapter's text, so the pointer
- * and the call share a read-side section taken here: the unregister's grace
- * period waits for it whatever context the frame arrived in. */
-static s64 cdx_htb_decode(const struct nf_conn *ct)
-{
-	cdx_ft_qos_class_fn decode;
-	s64 class = -1;
-
-	rcu_read_lock();
-	decode = READ_ONCE(cdx_ft_qos_class_func);
-	if (decode)
-		class = ct ? decode(READ_ONCE(ct->mark)) : 0;
-	rcu_read_unlock();
-	return class;
 }
 
 static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
 {
 	struct dpa_priv_s *priv = netdev_priv(dev);
 	struct cdx_htb_port *port;
-	enum ip_conntrack_info cinfo;
-	struct nf_conn *ct;
-	s64 decoded;
-	u32 class = 0;
-	u16 klass = 0;
-	u8 slot;
+	struct cdx_htb_frame f;
+	unsigned int at = 0;
+	u8 family = 0, slot;
+	bool own_link;
+	u32 class;
+	u16 klass;
+	int found;
 
 	port = cdx_htb_entry(priv->qm_ctx);
 	if (!port)
 		return DPA_SELECT_QUEUE_NONE;
-	ct = nf_ct_get(skb, &cinfo);
-	/* One read of the mark, as the adapter takes one when it admits a flow:
-	 * a class chosen from a value that changed underneath would put this
-	 * frame somewhere the flow's own rule does not name.
-	 *
-	 * Only the egress nibbles index the table. The class the adapter decodes
-	 * is wider than an egress destination — it also names an ingress policer
-	 * profile, which has no bearing on which queue a frame leaves by — and
-	 * this table is sized for the egress class alone. */
-	decoded = cdx_htb_decode(ct);
-	if (decoded < 0)
+	/* With no tree there is no queue to choose, and a class can only
+	 * remark: when no class can, a lookup here would buy nothing. */
+	if (READ_ONCE(port->top) == CDX_HTB_NONE && !READ_ONCE(cdx_ft_qos_remarks))
 		return DPA_SELECT_QUEUE_NONE;
-	class = (u32)decoded;
+	cdx_htb_parse(skb, &f);
+	found = cdx_htb_frame_class(skb, &f, &class, &at, &family);
+	found = cdx_htb_fragment_class(&f, found, &class, &at, &family);
+	if (found < 0)
+		return DPA_SELECT_QUEUE_NONE;
+	/* Only the egress nibbles index the table. The class the adapter
+	 * decodes is wider than an egress destination -- it also names an
+	 * ingress policer profile and a remark, neither of which has any
+	 * bearing on which queue a frame leaves by -- and this table is sized
+	 * for the egress class alone. */
 	klass = class & CDX_FT_QOS_EGRESS_MASK;
 	/* The remark before the DSCP map, so the map reads the codepoint the
 	 * frame leaves with. In hardware the rewrite is an opcode of the
 	 * entry's header manipulation and the map is read by the enqueue that
 	 * ends it; the order here follows that one, and has to change with it
-	 * if the hardware turns out to read the field first. Forwarded frames
-	 * only, as in hardware: the gateway's own keep what their sockets set. */
-	if ((class & CDX_FT_QOS_REMARK_MASK) && cdx_htb_forwarded(skb, ct))
-		cdx_htb_remark(skb, (class & CDX_FT_QOS_DSCP_MASK) >> CDX_FT_QOS_DSCP_SHIFT);
-	/* No class named, so the DSCP map gets to choose. A frame with no
-	 * conntrack at all reaches here too: it has a DSCP like any other, and
-	 * nothing has named a class for it. */
+	 * if the hardware turns out to read the field first. */
+	if (found && (class & CDX_FT_QOS_REMARK_MASK) && family && cdx_htb_routed(skb))
+		cdx_htb_remark(skb, at, family,
+			       (class & CDX_FT_QOS_DSCP_MASK) >> CDX_FT_QOS_DSCP_SHIFT);
+	/* No class named, so the DSCP map gets to choose, for every frame that
+	 * carries a codepoint: nothing has named a class for it otherwise. */
 	if (!klass) {
-		slot = cdx_htb_dscp_slot(port, skb);
+		slot = cdx_htb_dscp_slot(port, skb, &f);
 		if (slot != CDX_HTB_NONE)
 			return CDX_HTB_QID_BASE + slot;
 	}
 	slot = klass ? READ_ONCE(port->class_txq[klass]) : CDX_HTB_NONE;
-	/* Unclassified: no class, or one no leaf holds, which the hardware
-	 * resolves the same way (cdx_htb_resolve_class()). A default leaf takes
-	 * all of it, as software HTB's does. Without one only a frame the
-	 * hardware could carry takes class zero -- whichever leaf holds the
-	 * top channel's class queue 0, where the flow's rule will send it --
-	 * and everything else is left to cdx_htb_txq_fq(), on a direct queue. */
-	if (slot == CDX_HTB_NONE &&
-	    (READ_ONCE(port->default_slot) != CDX_HTB_NONE || cdx_htb_forwarded(skb, ct)))
+	/* No class known: none named, or one no leaf holds, which the hardware
+	 * resolves the same way (cdx_htb_resolve_class()). It takes class zero
+	 * -- the default leaf, or whichever leaf holds the top channel's class
+	 * queue 0, where the flow's rule will send it -- forwarded or not,
+	 * tracked or not, so a flow is on one queue before and after it is
+	 * offloaded. Control traffic is the exception, and is left to
+	 * cdx_htb_txq_fq(), on a direct queue: it never goes to the default
+	 * leaf, which is commonly the lowest-priority one and would starve it
+	 * behind any saturated class. */
+	if (slot == CDX_HTB_NONE && !cdx_htb_control(skb, &f, &own_link))
 		slot = READ_ONCE(port->class_txq[0]);
 	if (slot == CDX_HTB_NONE)
 		return DPA_SELECT_QUEUE_NONE;
@@ -1523,16 +2013,17 @@ static u16 cdx_htb_select_queue(struct net_device *dev, struct sk_buff *skb)
  *
  * A leaf's queue names its class queue. Any other -- a direct queue, or a leaf
  * slot that went away after the frame was put on it -- carries a frame that
- * named no leaf, and it goes where unclassified traffic goes: the default leaf,
- * or for a frame the hardware could carry the top channel's class queue 0, or
- * for anything else the top channel's control queue. Every one of those is a
- * queue this port owns and cdx_htb_implicit_sync() keeps eligible, so while
+ * named no leaf. Control traffic takes the top channel's control queue while
+ * the port's budget lasts, and past it goes where unclassified traffic goes:
+ * the default leaf, or the top channel's class queue 0. Every one of those is
+ * a queue this port owns and cdx_htb_implicit_sync() keeps eligible, so while
  * the tree is live no frame is left to the driver's mark-based resolution. */
 static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb)
 {
 	struct cdx_htb_port *port = cdx_htb_entry(qm_ctx);
-	enum ip_conntrack_info cinfo;
-	u8 top, channel, cq;
+	struct cdx_htb_frame f;
+	bool own_link;
+	u8 top, channel;
 	u16 slot, pair;
 
 	if (!port)
@@ -1549,16 +2040,12 @@ static struct qman_fq *cdx_htb_txq_fq(void *qm_ctx, u16 txq, struct sk_buff *skb
 						      READ_ONCE(port->txq_cq[slot]));
 		}
 	}
-	if (READ_ONCE(port->default_slot) != CDX_HTB_NONE ||
-	    cdx_htb_forwarded(skb, nf_ct_get(skb, &cinfo))) {
-		pair = READ_ONCE(port->unclassified);
-		channel = pair >> 8;
-		cq = pair & 0xff;
-	} else {
-		channel = top;
-		cq = CDX_HTB_CONTROL_CQ;
-	}
-	return ceetm_class_fq(qm_ctx, channel, cq);
+	cdx_htb_parse(skb, &f);
+	if (cdx_htb_control(skb, &f, &own_link) &&
+	    cdx_htb_control_admit(port, skb->len, own_link))
+		return ceetm_class_fq(qm_ctx, top, CDX_HTB_CONTROL_CQ);
+	pair = READ_ONCE(port->unclassified);
+	return ceetm_class_fq(qm_ctx, pair >> 8, pair & 0xff);
 }
 
 /* The (channel, class queue) a hardware entry on this port enqueues to for an

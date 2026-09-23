@@ -1192,8 +1192,15 @@ static void cdx_unregister_ft_setup_tc(void) { registered_setup_tc = 0; }
  * and returned alongside the handler above, and a load that fails after taking
  * it has to give both back. */
 static int registered_qos_class;
-typedef u32 (*cdx_ft_qos_class_fn)(u32 mark);
-static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn)
+struct sk_buff;
+typedef bool (*cdx_ft_qos_class_fn)(const struct sk_buff *skb, unsigned int nhoff,
+                                    u8 family, bool own, u32 *class);
+/* What it hands over has a harness of its own (qos_flow_class.c); here only
+ * the claim and its return are exercised. */
+static bool ft_qos_flow_class(const struct sk_buff *skb, unsigned int nhoff,
+                              u8 family, bool own, u32 *class)
+{ return false; }
+static int cdx_register_ft_qos_class(cdx_ft_qos_class_fn fn, bool remarks)
 {
     assert(fn);
     if (registered_qos_class) return -EBUSY;
@@ -6745,6 +6752,21 @@ static void test_qos_decode(void)
      * not reach read zero, which every position spells "unspecified". */
     ft_qos_mark_mask = 0xf; ft_qos_default_class = 0;
     assert(ft_qos_class(0x7) == 0x007);
+
+    /* Whether any class can carry a remark, which is what a port with no
+     * tree asks the classifier about frames for at all: never with no mask,
+     * not with a mask whose bits stop short of the remark flag unless the
+     * default class carries one, and always with one that reaches it. */
+    ft_qos_mark_mask = 0; ft_qos_default_class = CDX_FT_QOS_REMARK_MASK;
+    assert(!ft_qos_remarks());
+    ft_qos_mark_mask = 0xf0; ft_qos_default_class = 0;
+    assert(!ft_qos_remarks());
+    ft_qos_default_class = CDX_FT_QOS_REMARK_MASK | 46u << CDX_FT_QOS_DSCP_SHIFT;
+    assert(ft_qos_remarks());
+    ft_qos_mark_mask = 0x7ffff0; ft_qos_default_class = 0;
+    assert(ft_qos_remarks());
+    ft_qos_mark_mask = 0xfff0;
+    assert(!ft_qos_remarks());
 
     ft_qos_mark_mask = saved_mask; ft_qos_default_class = saved_default;
 

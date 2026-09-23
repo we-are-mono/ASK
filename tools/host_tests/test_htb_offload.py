@@ -51,14 +51,33 @@ def test_htb_offload(tmp_path):
         # The queue budget and both structures, stopping where the file's own
         # storage begins: the harness declares that itself so it can inspect it.
         + source[source.index("/* Leaf classes are handed netdev"):
-                 source.index("/* Indexed the way gQMCtx is")])
+                 source.index("/* Indexed the way gQMCtx is")]
+        # And what the Tx path reads a frame into, with the datagram a
+        # fragment is of and the per-CPU memory of first fragments' classes.
+        + source[source.index("struct cdx_htb_datagram {"):
+                 source.index("};", source.index("struct cdx_htb_frame {")) + 3]
+        + re.search(r"^#define CDX_HTB_MAX_TAGS\s.*$", source, re.M).group() + "\n"
+        + source[source.index("#define CDX_HTB_DATAGRAMS"):
+                 source.index("static DEFINE_PER_CPU(struct cdx_htb_datagrams, cdx_htb_datagrams);")]
+        + "static DEFINE_PER_CPU(struct cdx_htb_datagrams, cdx_htb_datagrams);\n")
+    # The kernel's test for an IPv6 extension header, which the Tx path's own
+    # walk to a transport header uses, with the constants and lengths it is
+    # written in.
+    ipv6 = (kernel / "include/net/ipv6.h").read_text()
+    lengths = (kernel / "include/linux/ipv6.h").read_text()
+    exthdrs = (kernel / "net/ipv6/exthdrs_core.c").read_text()
+    (tmp_path / "exthdrs.inc").write_text(
+        "\n".join(re.findall(r"^#define NEXTHDR_\w+\s.*$", ipv6, re.M)) + "\n"
+        + re.search(r"^#define ipv6_optlen\(p\).*$", lengths, re.M).group() + "\n"
+        + re.search(r"^#define ipv6_authlen\(p\).*$", lengths, re.M).group() + "\n"
+        + function(exthdrs, "ipv6_ext_hdr"))
     # In dependency order, which is file order but for the eligibility sync
     # the publish calls and the file declares ahead: no forward declarations
     # are needed and the compiler catches a call to something not yet defined.
     names = [
         "cdx_htb_entry", "cdx_htb_port_of", "cdx_htb_port_name", "cdx_htb_find",
         "cdx_htb_find_qid", "cdx_htb_channel_owned", "cdx_htb_implicit_sync",
-        "cdx_htb_publish", "cdx_htb_resize",
+        "cdx_htb_control_budget", "cdx_htb_publish", "cdx_htb_resize",
         "cdx_htb_channel_get", "cdx_htb_cq_get", "cdx_htb_implicit_forget",
         "cdx_htb_cq_configure", "cdx_htb_cq_release",
         "cdx_htb_red_restore", "cdx_htb_cq_restore",
@@ -70,8 +89,11 @@ def test_htb_offload(tmp_path):
         "cdx_register_ft_egress", "cdx_unregister_ft_egress",
         "cdx_htb_class_queue",
         "cdx_htb_port_gone", "cdx_register_ft_qos_class",
-        "cdx_unregister_ft_qos_class", "cdx_htb_dscp_slot", "cdx_htb_forwarded",
-        "cdx_ft_qos_remark_failures", "cdx_htb_remark", "cdx_htb_decode",
+        "cdx_unregister_ft_qos_class", "cdx_htb_l4", "cdx_htb_ip_family",
+        "cdx_htb_parse", "cdx_htb_control", "cdx_htb_control_admit",
+        "cdx_ft_qos_control_overruns", "cdx_htb_frame_class", "cdx_htb_same_datagram", "cdx_htb_fragment_class",
+        "cdx_htb_dscp_slot",
+        "cdx_htb_routed", "cdx_ft_qos_remark_failures", "cdx_htb_remark",
         "cdx_htb_select_queue", "cdx_htb_txq_fq", "cdx_htb_resolve_class",
         "cdx_htb_class_stats", "cdx_htb_red", "cdx_htb_setup_red",
         "cdx_register_ft_setup_tc",

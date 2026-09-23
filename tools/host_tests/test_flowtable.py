@@ -55,7 +55,7 @@ def test_flowtable_decoder_and_lifecycle(tmp_path):
              "ft_dev_stats_get", "ft_dev_stats_put", "ft_dev_stats_gone",
              "ft_dev_stats_reap", "ft_dev_stats_drop_all", "ft_stats_attach",
              "ft_stats_detach", "ft_stats_binding",
-             "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
+             "ft_l2_overhead", "ft_remove", "ft_retire_workfn", "ft_endpoint", "ft_exact6", "ft_qos_class_valid", "ft_qos_class", "ft_qos_remarks", "ft_tuple_matches", "ft_nat_edit", "ft_translation",
              "ft_vlan_lower", "ft_bridge_vlan", "ft_tunnel_dev", "ft_tunnel_hop", "ft_path_stack", "ft_same_tags", "ft_vlan_match", "ft_vlan_actions", "ft_ipv6_mtu_bounded", "ft_ipv4_arriving", "ft_ipv4_mtu_carried", "ft_mtu_refused", "ft_parse", "ft_same_key", "ft_key_hash",
              "ft_replace", "ft_entry_bounded", "ft_stats", "ft_request_targets", "ft_software_reoffers", "ft_offer_installed", "ft_admission_fault", "ft_rule_callback",
              "ft_invalid_complete", "ft_drained", "ft_can_rearm", "ft_rearm", "ft_rearm_workfn",
@@ -207,6 +207,32 @@ def test_idle_counts_what_the_other_backends_own():
         assert body.rindex("goto ") < body.index(counter + "++") < \
             body.index("return 0;"), add
         assert function(source, delete).count(counter + "--") == 1, delete
+
+
+def test_flowtable_qos_flow_class(tmp_path):
+    """The adapter's classifier for the software Tx path finds a frame's
+    connection again when a scrub took its conntrack, by the inverse of the
+    packet's own tuple, and gives back the reference the lookup took."""
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    uapi = (kernel / "include/uapi/linux/netfilter/nf_conntrack_common.h").read_text()
+    start = "enum ip_conntrack_info {"
+    (tmp_path / "qos_flow_class_types.inc").write_text(
+        uapi[uapi.index(start):uapi.index("};", uapi.index(start)) + 3])
+    source = (ROOT / "cdx/ask_flowtable.c").read_text()
+    (tmp_path / "qos_flow_class_production.inc").write_text(
+        function(source, "ft_qos_class") + function(source, "ft_qos_flow_class"))
+    binary = tmp_path / "qos_flow_class"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
+        "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("qos_flow_class.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })
 
 
 def test_flowtable_software_path_carries_the_conntrack(tmp_path):
