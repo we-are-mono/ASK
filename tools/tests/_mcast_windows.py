@@ -1,0 +1,485 @@
+"""Exact multicast traffic windows for the flowtable multicast cases.
+
+Every window sends numbered streams and counts each sequence at every observer
+beneath the IP layer (mroute_capture.py), so a copy that is missing, doubled or
+still arriving after its listener left is a number rather than an impression.
+Beside it, the ingress port's SDK software receive counter says whether the
+CPU carried the stream: a replicated frame never reaches the host.
+
+The rig traps that make a working offload read as dead are kept out of the
+cases here rather than in each of them:
+
+  - The LAN console is one channel. Captures and member hosts run on the LAN
+    VM as background processes coordinated through files, so no window holds
+    the console while traffic runs.
+  - An IPv4 join through ip_mreq names its interface by address and silently
+    lands on the default route's device. Hosts join through the index-based
+    MCAST_* calls instead (multicast_member.py).
+  - `ip -s mroute` lags the hardware by up to one fold interval. Every read of
+    the kernel's counters here follows a read of /proc/cdx_flowtable, which is
+    itself a fold.
+  - Streams are injected on the orchestrator's physical port, so its own
+    bridge's snooping cannot decide whether they reach the DUT at all.
+"""
+from __future__ import annotations
+
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+import inspect
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import time
+import uuid
+
+import pytest
+import pytest_asyncio
+
+from ask_orch.counters import kernel_rx_packets
+from ask_orch.uart import Console
+from _topology import LAN_NIC, TARGET_LAN_IF, TARGET_WAN_IF, lan_run_python
+from mroute_capture import MAGIC, multicast_mac, payload
+from test_flowtable_offload import ARTIFACTS, command, read, status_text, stop_boot_daemon
+from test_mcast_e2e import dut_mac, wan_source_address
+from test_mroute_capacity import _capture, _finish, _python
+
+COUNT, PPS, PORT = 256, 320, 47420
+MEMBER_SOURCE = Path(__file__).with_name("multicast_member.py").read_text()
+# The capture's own payload and group MAC, so a LAN-side sender cannot drift
+# from the oracle that decodes what it sent.
+WIRE_HELPERS = ("import ipaddress, struct\n" + f"MAGIC = {MAGIC!r}\n"
+                + inspect.getsource(multicast_mac) + inspect.getsource(payload))
+
+
+def wire_interface() -> str:
+    """The orchestrator's physical port toward the DUT.
+
+    Not the bridge above it: that bridge snoops too, and a stream sent into it
+    reaches the DUT only while something on the DUT's side has joined -- which
+    a case about leaving must not depend on."""
+    configured = os.environ.get("ASK_WAN_WIRE_IF")
+    if configured:
+        return configured
+    inject = os.environ.get("ASK_WAN_INJECT_IF", "br0")
+    members = Path("/sys/class/net", inject, "brif")
+    if not members.exists():
+        return inject
+    physical = [p.name for p in members.iterdir()
+                if Path("/sys/class/net", p.name, "device").exists()]
+    assert len(physical) == 1, ("set ASK_WAN_WIRE_IF to the DUT-facing physical port", physical)
+    return physical[0]
+
+
+def same(a: str, b: str) -> bool:
+    return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+
+
+def mroute_row(state: dict, group: str, source: str) -> dict | None:
+    rows = [row for row in state["mroute"] if same(row["group"], group) and same(row["src"], source)]
+    assert len(rows) <= 1, ("duplicate routed rows", rows)
+    return rows[0] if rows else None
+
+
+def mcast_rows(state: dict, group: str) -> list[dict]:
+    return [row for row in state["mcast"] if same(row["group"], group)]
+
+
+def members(row: dict | None, field: str) -> set[str]:
+    """A row's `listeners` or `ports` as a set; empty for no row at all."""
+    if row is None or row[field] == "-":
+        return set()
+    return set(row[field].split(","))
+
+
+def summary(state: dict) -> dict:
+    """The multicast part of the adapter's state, for failure messages."""
+    keys = [k for k in state if k.startswith(("mcast_", "mroute_"))] + ["quarantine", "fatal"]
+    return {**{k: state[k] for k in keys}, "mcast": state["mcast"], "mroute": state["mroute"]}
+
+
+def stream(family: int, group: str, *, hops: int, source: str | None = None) -> dict:
+    """One numbered stream, in the shape mroute_capture.py decodes."""
+    return {"family": family, "source": source or wan_source_address(family), "group": group,
+            "port": PORT, "count": COUNT, "token": uuid.uuid4().hex, "hops": hops}
+
+
+def frames(config: dict) -> list:
+    from scapy.all import Ether, IP, IPv6, UDP, Raw
+    # Explicit and above 1: the parser refuses to classify TTL 0 or 1.
+    layer = (IP(src=config["source"], dst=config["group"], ttl=64) if config["family"] == 4 else
+             IPv6(src=config["source"], dst=config["group"], hlim=64))
+    return [Ether(dst=multicast_mac(config["group"]).hex(":")) / layer /
+            UDP(sport=config["port"], dport=config["port"]) / Raw(payload(config["token"], i))
+            for i in range(config["count"])]
+
+
+def send_wire(configs: list[dict], iface: str) -> None:
+    """Send every stream once from this host, interleaved frame by frame."""
+    from scapy.all import sendp
+    batches = [frames(config) for config in configs]
+    interleaved = [f for batch in zip(*batches, strict=True) for f in batch]
+    sendp(interleaved, iface=iface, inter=1 / (PPS * len(configs)), verbose=False)
+
+
+async def send_lan(lan, configs: list[dict], iface: str = LAN_NIC) -> None:
+    """The same streams, sent from the LAN VM: a source behind the LAN port."""
+    script = WIRE_HELPERS + f"""
+from scapy.all import Ether, IP, IPv6, UDP, Raw, sendp
+configs = {configs!r}
+batches = []
+for c in configs:
+    layer = (IP(src=c['source'], dst=c['group'], ttl=64) if c['family'] == 4 else
+             IPv6(src=c['source'], dst=c['group'], hlim=64))
+    batches.append([Ether(dst=multicast_mac(c['group']).hex(':')) / layer /
+                    UDP(sport=c['port'], dport=c['port']) / Raw(payload(c['token'], i))
+                    for i in range(c['count'])])
+sendp([f for batch in zip(*batches) for f in batch], iface={iface!r},
+      inter=1 / ({PPS} * len(configs)), verbose=False)
+print('SENT')
+"""
+    result = await lan_run_python(lan, script, label="mcast_send", timeout=40)
+    assert result.rc == 0 and "SENT" in result.stdout, result.stdout
+
+
+class MulticastRig:
+    def __init__(self, target, session, lan):
+        self.target, self.session, self.lan = target, session, lan
+
+    async def proc(self) -> dict:
+        return status_text(await read(self.target, self.session, "/proc/cdx_flowtable"))
+
+    async def settle(self, predicate, what: str, timeout: float = 15) -> dict:
+        deadline = time.monotonic() + timeout
+        while True:
+            state = await self.proc()
+            if predicate(state):
+                return state
+            if time.monotonic() > deadline:
+                pytest.fail(f"{what}: not reached in {timeout}s: {summary(state)}")
+            await asyncio.sleep(0.1)
+
+    async def window(self, streams: list[dict], observers: list, *, ingress: str,
+                     label: str, sender: str = "wan", adapter: bool = True) -> dict:
+        """Send `streams` once and count every sequence at every observer.
+
+        observers is [(peer, {interface: expected source MAC or None})]; peer
+        is the LAN console, or None for a capture on this host. `cpu` is the
+        ingress port's software receive delta across the send, `idle` what the
+        same counter moved by over an idle interval just before, scaled to the
+        send's own length: a busy segment's background traffic grows with the
+        interval, and the send runs longer than its paced frames.
+        `adapter` is False while the adapter is unloaded and has no /proc."""
+        idle_start, idle_began = await kernel_rx_packets(self.target, self.session, ingress), time.monotonic()
+        await asyncio.sleep(COUNT / PPS)
+        idle = await kernel_rx_packets(self.target, self.session, ingress) - idle_start
+        idle_seconds = time.monotonic() - idle_began
+        captures = []
+        async with AsyncExitStack() as stack:
+            for config in streams:
+                for peer, interfaces in observers:
+                    captures.append((config, await stack.enter_async_context(
+                        _capture(peer, {**config, "interfaces": interfaces}))))
+            before = await self.proc() if adapter else None
+            rx, sent = await kernel_rx_packets(self.target, self.session, ingress), time.monotonic()
+            if sender == "lan":
+                await send_lan(self.lan, streams)
+            else:
+                await asyncio.to_thread(send_wire, streams, self.wire)
+            cpu = await kernel_rx_packets(self.target, self.session, ingress) - rx
+            idle = round(idle * (time.monotonic() - sent) / idle_seconds)
+            await asyncio.sleep(0.4)  # drain receiver queues before asking
+        received = {}
+        for config, capture in captures:
+            received.setdefault(config["group"] + "/" + config["source"], {}).update(await _finish(capture))
+        after = await self.proc() if adapter else None  # also folds the routed counters
+        result = {"streams": streams, "received": received, "cpu": cpu, "idle": idle,
+                  "before": before and summary(before), "after": after and summary(after)}
+        self.record(f"mcast-window-{label}", result)
+        return {**result, "before": before, "after": after}
+
+    def record(self, name: str, data) -> None:
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        (ARTIFACTS / f"{name}.json").write_text(json.dumps(data, indent=2, default=str) + "\n")
+
+
+def streamed(window: dict, group: str, source: str | None = None) -> dict:
+    """The config a window sent for `group` (and `source`, where it had two)."""
+    configs = [c for c in window["streams"] if same(c["group"], group) and
+               (source is None or same(c["source"], source))]
+    assert len(configs) == 1, (group, source, window["streams"])
+    return configs[0]
+
+
+def moved(window: dict, row) -> int:
+    """How far a /proc row's classifier count moved across a window.
+
+    `row` maps a state to the row, so a group installed or retired inside the
+    window counts from or to zero."""
+    return packets(row(window["after"])) - packets(row(window["before"]))
+
+
+def seen(window: dict, config: dict, iface: str) -> list[int]:
+    """The sequences one stream delivered at one interface; exact or it fails."""
+    result = window["received"][config["group"] + "/" + config["source"]][iface]
+    assert result["duplicates"] == 0 and not result["errors"], (iface, result)
+    return result["seen"]
+
+
+def delivered(window: dict, config: dict, iface: str) -> bool:
+    """Every sequence exactly once (True) or none at all (False)."""
+    sequences = seen(window, config, iface)
+    assert sequences in ([], list(range(config["count"]))), (iface, "partial delivery", sequences)
+    return bool(sequences)
+
+
+def in_hardware(window: dict, streams: int = 1) -> None:
+    """None of the stream reached the CPU beyond the segment's own noise."""
+    assert window["cpu"] - window["idle"] < COUNT * streams * 0.1, (window["cpu"], window["idle"])
+
+
+def in_software(window: dict, streams: int = 1) -> None:
+    """The whole stream reached the CPU: the classifier matched none of it."""
+    assert window["cpu"] >= COUNT * streams, (window["cpu"], window["idle"])
+
+
+def packets(row: dict | None) -> int:
+    return int(row["packets"]) if row else 0
+
+
+async def kernel_mroute(r: MulticastRig, family: int, source: str, group: str, *,
+                        offloaded: bool | None = None, fold: bool = True):
+    """The kernel's MFC entry for (S,G): its `ip mroute` line and ip -s counters.
+
+    `fold` reads /proc first, which folds the hardware counts in; the fold's
+    own timer lags by up to five seconds. MFC_OFFLOAD is written just after
+    /proc starts saying `installed` and just after it stops, so a caller
+    that names the flag it expects waits a moment for it."""
+    deadline = time.monotonic() + 5
+    while True:
+        if fold:
+            await r.proc()
+        out = (await command(r.target, r.session, "ip", "-s", *(["-6"] if family == 6 else []),
+                             "mroute", "show"))["stdout"].splitlines()
+        found = None, None, None
+        for i, line in enumerate(out):
+            match = re.match(r"\((\S+?),\s*(\S+?)\)", line.strip())
+            if match and same(match[1], source) and same(match[2], group):
+                counts = re.search(r"(\d+) packets, (\d+) bytes", out[i + 1] if i + 1 < len(out) else "")
+                assert counts, (line, out[i + 1:i + 2])
+                found = line, int(counts[1]), int(counts[2])
+                break
+        if offloaded is None or (found[0] and ("offload" in found[0]) == offloaded) or \
+                time.monotonic() > deadline:
+            return found
+        await asyncio.sleep(0.2)
+
+
+async def learn(r: MulticastRig, configs: list[dict], installed, what: str) -> dict:
+    """Short bursts until the bridged learner has taken each stream's source.
+
+    A (*,G) membership has no key until traffic supplies one, and a frame
+    sent before the learner's hook is registered teaches it nothing, so this
+    keeps offering until the groups are installed."""
+    deadline = time.monotonic() + 15
+    while True:
+        primers = [{**config, "count": 8, "token": uuid.uuid4().hex} for config in configs]
+        await asyncio.to_thread(send_wire, primers, r.wire)
+        state = await r.proc()
+        if installed(state):
+            return state
+        if time.monotonic() > deadline:
+            pytest.fail(f"{what}: never installed from traffic: {summary(state)}")
+        await asyncio.sleep(0.3)
+
+
+async def mdb(r: MulticastRig, bridge: str, group: str, *, add: bool, vid: int | None = None,
+              port: str = TARGET_LAN_IF) -> None:
+    """A static membership: what an operator configures, never learned."""
+    await command(r.target, r.session, "bridge", "mdb", "add" if add else "del", "dev", bridge,
+                  "port", port, "grp", group, *(["vid", str(vid)] if vid else []),
+                  *(["permanent"] if add else []))
+
+
+async def mdb_ports(r: MulticastRig, bridge: str, group: str) -> set[str]:
+    """Which ports the bridge itself says are members of `group`."""
+    entries = json.loads((await command(r.target, r.session, "bridge", "-j", "mdb", "show",
+                                        "dev", bridge))["stdout"] or "[]")
+    ports = set()
+    for entry in entries:
+        for item in entry.get("mdb", []):
+            if same(item["grp"], group):
+                ports.add(item["port"])
+    return ports
+
+
+# Bridge multicast settings, by sysfs name; `ip link` takes them as mcast_<name>.
+# Intervals are clock_t in both places.
+@asynccontextmanager
+async def bridge_settings(r: MulticastRig, bridge: str, **values):
+    """Set a test bridge's querier and membership timers, restart its own
+    querier under them, and put the old settings back.
+
+    The restart is not optional. New intervals apply only from the next query,
+    and a querier started with its bridge sent its first IPv6 query before the
+    bridge had a usable link-local address; that failure counts it out until
+    the next startup query, half a minute on. Until then the bridge floods an
+    unregistered IPv6 group to every port -- which reads exactly like a
+    listener that never left -- and the routed learner's bridge snapshot sees
+    the flood set rather than the members. Restarted once the address is
+    valid, it queries at once in both families and counts after one response
+    interval."""
+    values = {"query_response_interval": 100, **values}
+    old = {}
+    for name in values:
+        old[name] = (await read(r.target, r.session,
+                                f"/sys/class/net/{bridge}/bridge/multicast_{name}")).strip()
+
+    async def apply(settings):
+        argv = ["ip", "link", "set", "dev", bridge, "type", "bridge"]
+        for name, value in settings.items():
+            argv += [f"mcast_{name}", str(value)]
+        await command(r.target, r.session, *argv)
+
+    await apply(values)
+    for querier in ("0", "1"):
+        await command(r.target, r.session, "ip", "link", "set", "dev", bridge, "type", "bridge",
+                      "mcast_querier", querier)
+    await asyncio.sleep(int(values["query_response_interval"]) / 100 + 1)
+    try:
+        yield
+    finally:
+        # A case may have taken the bridge down itself, which restores
+        # nothing but leaves nothing to restore either.
+        present = await r.target.fs_read(r.session, f"/sys/class/net/{bridge}/bridge/multicast_querier")
+        if present["errno"] == 0:
+            await apply(old)
+
+
+class Host:
+    """One multicast listener on the LAN VM; see multicast_member.py."""
+
+    def __init__(self, lan, config: dict, path: str):
+        self.lan, self.config, self.path, self.serial = lan, config, path, 0
+
+    async def do(self, action: str) -> None:
+        self.serial += 1
+        out = await _python(self.lan, f"""
+import json, pathlib, time
+new = pathlib.Path({self.path + '.command-new'!r})
+new.write_text(json.dumps({{'serial': {self.serial}, 'action': {action!r}}}))
+new.replace({self.config['command']!r})
+state = pathlib.Path({self.config['state']!r})
+for _ in range(100):
+    if {self.serial} in json.loads(state.read_text())['done']:
+        print('DONE')
+        break
+    time.sleep(0.05)
+else:
+    print('TIMEOUT', state.read_text(), open({self.path + '.log'!r}).read())
+""")
+        assert "DONE" in out.splitlines(), out
+
+
+@asynccontextmanager
+async def host(lan, *, family: int, group: str, iface: str, mode: str, version: int,
+               source: str | None = None):
+    """A listener that joins on entry and is gone, membership and all, on exit."""
+    path = f"/tmp/ask-mcast-member-{uuid.uuid4().hex}"
+    config = {"family": family, "group": group, "source": source or wan_source_address(family),
+              "iface": iface, "mode": mode, "version": version,
+              "state": path + ".json", "command": path + ".command"}
+    script = path + ".py"
+    try:
+        out = await _python(lan, f"""
+import json, pathlib, subprocess, sys, time
+pathlib.Path({script!r}).write_text({MEMBER_SOURCE!r})
+with open({path + '.log'!r}, 'w') as log:
+    child = subprocess.Popen([sys.executable, {script!r}, {json.dumps(config)!r}],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
+pathlib.Path({path + '.pid'!r}).write_text(str(child.pid))
+state = pathlib.Path({config['state']!r})
+for _ in range(50):
+    if state.exists() or child.poll() is not None:
+        break
+    time.sleep(0.1)
+print('JOINED' if state.exists() else 'FAILED ' + open({path + '.log'!r}).read())
+""")
+        assert "JOINED" in out.splitlines(), out
+        yield Host(lan, config, path)
+    finally:
+        # Only this host's process, identified by its script, never a
+        # recycled PID. Its exit drops whatever membership is left.
+        await _python(lan, f"""
+import os, pathlib, signal, time
+pidfile = pathlib.Path({path + '.pid'!r})
+if pidfile.exists():
+    pid = int(pidfile.read_text())
+    try:
+        if {script.encode()!r} in pathlib.Path('/proc/%d/cmdline' % pid).read_bytes().split(b'\\0'):
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(50):
+                if not pathlib.Path('/proc/%d' % pid).exists():
+                    break
+                time.sleep(0.1)
+    except (ProcessLookupError, FileNotFoundError):
+        pass
+for suffix in ('.py', '.pid', '.json', '.tmp', '.command', '.command-new', '.log'):
+    pathlib.Path({path!r} + suffix).unlink(missing_ok=True)
+""")
+
+
+@asynccontextmanager
+async def silenced(lan, iface: str):
+    """The host behind `iface` stops answering queries, without leaving.
+
+    Its membership stands in its own stack; only the reports that would
+    refresh it on the bridge are dropped, which is how a set-top box that
+    lost power looks from the querier's side."""
+    table = "ask_mcast_silence_" + uuid.uuid4().hex[:8]
+    rules = f'''table inet {table} {{
+ chain output {{ type filter hook output priority -300; policy accept;
+  oifname "{iface}" ip protocol igmp drop
+  oifname "{iface}" meta l4proto ipv6-icmp icmpv6 type {{ 130, 131, 132, 143 }} drop
+ }}
+}}'''
+    await _python(lan, f"import subprocess\nsubprocess.run(['nft', '-f', '-'], input={rules!r}, text=True, check=True)\n")
+    try:
+        yield
+    finally:
+        await _python(lan, f"import subprocess\nsubprocess.run(['nft', 'delete', 'table', 'inet', {table!r}], check=True)\n")
+
+
+async def dut_console(label: str) -> Console:
+    console = Console.target(log_path=str(ARTIFACTS / f"{label}-uart.log"))
+    await asyncio.to_thread(console.login, "root", None)
+    return console
+
+
+@pytest_asyncio.fixture
+async def multicast_rig(target_agent, aiohttp_session, lan, splat_window):
+    """The DUT with no multicast workload of its own and no unicast policy.
+
+    The boot service is stopped the way every controlled rig stops it: its
+    offloaded flows would put unrelated hardware deletions -- and their
+    barriers -- inside windows these cases count. On the way out, every group,
+    installed entry and parked table entry a case created must be gone."""
+    await stop_boot_daemon()
+    r = MulticastRig(target_agent, aiohttp_session, lan)
+    r.initial = await r.proc()
+    assert r.initial["mcast_groups"] == r.initial["mroute_groups"] == 0, \
+        ("existing multicast groups belong to another workload", summary(r.initial))
+    assert r.initial["quarantine"] == r.initial["fatal"] == 0, summary(r.initial)
+    r.wire = wire_interface()
+    r.dut_lan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_LAN_IF)
+    r.dut_wan_mac = await dut_mac(target_agent, aiohttp_session, TARGET_WAN_IF)
+    try:
+        yield r
+    finally:
+        drained = await r.settle(
+            lambda s: s["mcast_groups"] == s["mroute_groups"] == 0 and
+            s["mcast_installed"] == s["mroute_installed"] == 0 and s["quarantine"] == 0,
+            "multicast state drained after the case", timeout=15)
+        r.record("mcast-drained", summary(drained))

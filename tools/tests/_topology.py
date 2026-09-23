@@ -35,6 +35,8 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 #   test_flowtable_service_bridge.py 285/286 (trusted/guest bridge membership)
 #   test_mcast_e2e.py           244          (VLAN_ID_MROUTE, routed oif)
 #   test_mroute_capacity.py     311..319     (nine LAN listeners)
+#   test_flowtable_service_multicast_leave.py      321/322 (routed via a snooping bridge)
+#   test_flowtable_service_multicast_quarantine.py 323     (listener swap)
 #
 # 3900 is not a claim on that segment but a standing bench VLAN: the
 # orchestrator carries a permanent `wan3900` device on br0 and the PPPoE access
@@ -42,7 +44,8 @@ from ask_orch.counters import kernel_rx_packets  # noqa: F401 (shared helper)
 # DUT to meet it and never creates or deletes anything on the orchestrator
 # side. Do not reuse 3900 for a test that does.
 # test_mroute_capacity.py also receives a tagged WAN replica on that existing
-# device using a temporary packet-socket membership, without reconfiguring it.
+# device using a temporary packet-socket membership, without reconfiguring it,
+# and test_flowtable_service_multicast_edges.py does the same.
 VLAN_ID_MROUTE: int                   = 244
 VLAN_IDS_MROUTE_LIMIT: tuple[int, ...] = tuple(range(311, 320))
 VLAN_ID_PPPOE_WAN: int                = 3900
