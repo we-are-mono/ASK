@@ -1994,10 +1994,24 @@ selection that already decodes the same class from the same mark:
   checks it on the rig, and the order in `cdx_htb_select_queue()` is the one
   line to change if the hardware turns out to read the field first.
 
-Frames the software *flowtable* forwards carry no conntrack, so they have no
-class to read and are neither classified nor remarked in software; a flow the
-adapter declines without retiring stays on that path. That is a property of the
-kernel's flowtable fast path, not of this code.
+**Frames the software *flowtable* forwards carry their conntrack too.** The
+kernel's flowtable fast path used to send a frame on without one, so a flow the
+adapter declined — or one never offered to it, or one waiting for admission —
+had no class to read once the flowtable took it over: every frame went to class
+queue 7 of the top channel, above every class in the tree, and nothing was
+remarked. With admission refusing a non-TCP IPv4 flow whose path MTU is below
+its ingress port's, that is every UDP upload over a PPPoE WAN. Patch 147
+attaches the flow's conntrack in `nf_flow_offload_forward()` and its IPv6 twin
+the way act_ct does for its own flowtable: once the frame is committed to the
+fast path, with a reference of its own, `IP_CT_ESTABLISHED` or
+`IP_CT_ESTABLISHED_REPLY` by direction, and any conntrack the frame arrived
+with dropped first. Nothing is accounted twice — the flowtable already updates
+the conntrack's counters, and no hook between it and the wire does — and the
+cost is the one reference per frame the stack's own lookup takes.
+`test_flowtable_software_path_carries_the_conntrack` compiles the kernel's
+forward step on the host, and
+`test_flowtable_qos_declined_flow_keeps_its_class_in_software` checks the leaf
+counters on the rig.
 
 *Effort: 3–4 days.*
 

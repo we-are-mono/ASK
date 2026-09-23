@@ -67,7 +67,8 @@ PORT_UNCLASSIFIED_SW, PORT_UNCLASSIFIED_HW = PORT + 13, PORT + 14
 PORT_DEFAULT = PORT + 15
 PORT_REMARK_HW, PORT_REMARK_SW = PORT + 18, PORT + 19
 PORT_EF_REPLACED = PORT + 20
-PORTS_LAST = PORT + 20
+PORT_DECLINED = PORT + 21
+PORTS_LAST = PORT + 21
 
 # The shaped or policed rate. Below the roughly 9 Gbit/s the rig forwards
 # unshaped and far above what the CPU can: see the module docstring.
@@ -1413,6 +1414,84 @@ async def test_flowtable_qos_unclassified_flow_keeps_its_queue_when_offloaded(qo
     assert pinged[0] == pinged[1] == COUNT, pinged
     assert leaf_delta(before, after, 0)["frames"] >= COUNT, leaf_delta(before, after, 0)
     assert leaf_delta(before, after, 1)["frames"] == 0, leaf_delta(before, after, 1)
+
+
+async def offered(r):
+    """Packets the forward chain's one counting rule has seen. A frame the
+    flowtable forwards never reaches the chain, so a count that does not move
+    across a burst says the flowtable carried all of it."""
+    result = await command(r.target, r.session, "nft", "-j", "list", "chain", "inet",
+                           TABLE, "forward")
+    counts = [expr["counter"]["packets"]
+              for obj in json.loads(result["stdout"])["nftables"] if "rule" in obj
+              for expr in obj["rule"]["expr"] if "counter" in expr]
+    assert len(counts) == 1, result["stdout"]
+    return counts[0]
+
+
+async def test_flowtable_qos_declined_flow_keeps_its_class_in_software(qos):
+    """A flow the hardware declines is forwarded by the software flowtable, and
+    every frame of it still lands on the class its mark names.
+
+    The software flowtable forwards a frame past the stack, and it used to do
+    so without the frame's conntrack: the queue selection found no connection,
+    so no mark and no class, and every frame of a declined flow went to class
+    queue 7 -- the top of the tree, above every class the operator configured,
+    and the queue the prio 0 leaf holds here. The flowtable now hands the frame
+    its flow's conntrack as act_ct does (patch 147). The flow is declined by a
+    mark bit outside the classification mask, which the adapter cannot honour
+    and the class decode ignores. The offering rule's counter proves the
+    measured frames never reached the forward chain, so the flowtable carried
+    them; the leaf counts are exact because nothing else reaches the class
+    queue the mark names.
+    """
+    r = qos
+    dev = TARGET_LAN_IF
+    frame = 256 + UDP_HEADERS
+    target = f"{r.lan_ip}:{PORT_DECLINED}"
+    await tree(r, dev, CAP_MBIT, [("1:10", HIGH_PRIO), ("1:11", LOW_PRIO)])
+    before = await r.state()
+    # The lowest bit the running mask leaves out, as the ARP fallback case
+    # takes it: the flow is refused whatever the boot configured.
+    outside = ~int(before["qos_mark_mask"]) & 0xffffffff
+    mark = r.mark(LOW_CQ) | (outside & -outside)
+    await offload(r, f"ip saddr {WAN_IP} ip daddr {r.lan_ip} udp dport {PORT_DECLINED} "
+                     f"counter ct mark set {mark:#x} flow add @fast")
+    await lan_start(r, echo=[PORT_DECLINED])
+    deadline = time.monotonic() + 20
+    while True:
+        await asyncio.to_thread(lockstep, r.lan_ip, PORT_DECLINED, 8)
+        declined = await r.state()
+        if declined["rejects"] > before["rejects"]:
+            break
+        assert time.monotonic() < deadline, "the marked flow was never offered"
+        await asyncio.sleep(0.5)
+    # Past admission, so every frame from here on is the flowtable's.
+    await asyncio.to_thread(lockstep, r.lan_ip, PORT_DECLINED, 8)
+    counted = await offered(r)
+    first = await egress(r, dev)
+    echoed = await asyncio.to_thread(lockstep, r.lan_ip, PORT_DECLINED, COUNT)
+    second = await egress(r, dev)
+    recounted = await offered(r)
+    final = await r.state()
+    rows = directions(final, ingress=TARGET_WAN_IF, proto=17, dst=target)
+    r.record("qos-declined-software-class", {
+        "mark": mark, "declined": declined, "final": final, "rows": rows,
+        "offered": [counted, recounted], "echoed": echoed,
+        "class_leaf": leaf_delta(first, second, 1),
+        "control_leaf": leaf_delta(first, second, 0),
+        "software_tx": second["software_tx"] - first["software_tx"]})
+
+    assert echoed == COUNT, echoed
+    # Declined, so nothing of it is in hardware and the CPU forwarded it all;
+    # never offered to the forward chain again, so the flowtable did.
+    assert not rows, rows
+    assert second["software_tx"] - first["software_tx"] >= COUNT, (first, second)
+    assert recounted == counted, (counted, recounted)
+    # Every frame on the class the mark names, and none above the tree.
+    assert leaf_delta(first, second, 1) == {"frames": COUNT, "bytes": COUNT * frame,
+                                            "rejected": 0}, leaf_delta(first, second, 1)
+    assert leaf_delta(first, second, 0)["frames"] < COUNT // 4, leaf_delta(first, second, 0)
 
 
 async def test_flowtable_qos_default_class_takes_unclassified_traffic(qos):

@@ -1310,7 +1310,10 @@ static u8 cdx_htb_dscp_slot(struct cdx_htb_port *port, struct sk_buff *skb)
 /* A frame the hardware could carry: forwarded, and tracked. The gateway's own
  * frames and anything conntrack never saw -- ARP, neighbour discovery, PPPoE
  * discovery and LCP, frames bridged without netfilter -- are never offloaded,
- * so they have no hardware rule whose queue they must agree with. */
+ * so they have no hardware rule whose queue they must agree with. A frame the
+ * software flowtable forwards is tracked too: the flowtable hands it its
+ * flow's conntrack (patch 147), so a flow the hardware declined keeps the
+ * class, and the remark, its mark names. */
 static bool cdx_htb_forwarded(struct sk_buff *skb, const struct nf_conn *ct)
 {
 	return ct && skb->skb_iif && !skb->sk;

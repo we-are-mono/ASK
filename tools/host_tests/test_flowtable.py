@@ -207,3 +207,31 @@ def test_idle_counts_what_the_other_backends_own():
         assert body.rindex("goto ") < body.index(counter + "++") < \
             body.index("return 0;"), add
         assert function(source, delete).count(counter + "--") == 1, delete
+
+
+def test_flowtable_software_path_carries_the_conntrack(tmp_path):
+    """The software flowtable's forward step, compiled from the kernel, hands
+    every frame it forwards its flow's conntrack with a reference of its own,
+    and none to a frame it gives back to the stack."""
+    kernel = Path(os.environ.get("ASK_KERNEL_SOURCE", ROOT /
+        "meta-ask/build/tmp/work-shared/ask-ls1046a/kernel-source"))
+    source = (kernel / "net/netfilter/nf_flow_table_ip.c").read_text()
+    uapi = (kernel / "include/uapi/linux/netfilter/nf_conntrack_common.h").read_text()
+    (tmp_path / "flowtable_ct_types.inc").write_text("".join(
+        uapi[uapi.index(start):uapi.index("};", uapi.index(start)) + 3]
+        for start in ("enum ip_conntrack_info {", "enum ip_conntrack_status {")))
+    (tmp_path / "flowtable_ct_production.inc").write_text(
+        function(source, "nf_flow_ct_set")
+        + function(source, "nf_flow_offload_forward")
+        + function(source, "nf_flow_offload_ipv6_forward"))
+    binary = tmp_path / "flowtable_ct"
+    subprocess.run([
+        os.environ.get("HOSTCC", "cc"), "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra",
+        "-Werror", "-Wno-unused-parameter", "-fsanitize=address,undefined",
+        "-fno-pie", "-no-pie", "-I", str(tmp_path),
+        str(Path(__file__).with_name("flowtable_ct.c")), "-o", str(binary),
+    ], check=True)
+    subprocess.run([str(binary)], check=True, timeout=30, env={
+        **os.environ, "ASAN_OPTIONS": "detect_leaks=1:abort_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1",
+    })

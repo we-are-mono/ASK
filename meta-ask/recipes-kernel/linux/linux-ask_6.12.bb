@@ -90,6 +90,7 @@ SRC_URI = "${KERNEL_SRC};branch=${KERNEL_BRANCH};name=kernel \
            file://144-ask-flowtable-extend-ct-timeout.patch \
            file://145-netfilter-flowtable-upstream-lifetime-fixes.patch \
            file://146-xfrm-packet-offload-mixed-family-child-route.patch \
+           file://147-netfilter-flowtable-attach-conntrack.patch \
            file://150-sdk_dpaa-hardware-qdisc.patch \
            file://160-bridge-switchdev-mdb-group.patch \
            file://161-bridge-multicast-egress-snapshot.patch \
