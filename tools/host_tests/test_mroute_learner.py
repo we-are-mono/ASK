@@ -348,8 +348,11 @@ def test_the_counter_fold_restates_the_units():
     """
     body = function(SOURCE.read_text(), "ft_mr_fold")
     assert "ETH_HLEN + g->in_tags * VLAN_HLEN" in body
-    assert "atomic_long_set(&g->mfc->mfc_un.res.pkt" in body
-    assert "atomic_long_set(&g->mfc->mfc_un.res.bytes" in body
+    # Added to what ipmr counted itself, never written over it: see
+    # test_mroute_fold.py for what setting did to the count.
+    assert "atomic_long_add(packets, &g->mfc->mfc_un.res.pkt" in body
+    assert "atomic_long_add(bytes, &g->mfc->mfc_un.res.bytes" in body
+    assert "atomic_long_set" not in body
     assert "lastuse" in body, "ageing reads it and the CPU sees no packets"
 
 

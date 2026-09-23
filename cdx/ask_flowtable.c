@@ -5104,6 +5104,11 @@ struct ft_mr_group {
 	u8 listeners;
 	char oifs[FT_MR_OIF_TEXT];
 	struct cdx_mc_group *hw;
+	/* How much of `hw`'s own count the MFC entry already holds, raw as the
+	 * classifier reports it. A group the worker has just added counts from
+	 * zero again. */
+	u64 folded_packets;
+	u64 folded_bytes;
 	enum ft_mr_state state;
 	/* The shared address-pair register holds this group's key. */
 	bool claimed;
@@ -5938,29 +5943,50 @@ static void ft_mr_offload_flag(struct ft_mr_group *g, bool on)
 	g->offloaded = on;
 }
 
-/* What the hardware counted, restated in the units the kernel counts in and
- * written where the standard tools read it.
+/* What the hardware counted since the last fold, restated in the units the
+ * kernel counts in and added where the standard tools read it.
  *
  * ip_mr_forward() counts skb->len, which is the L3 packet; the classifier
  * counts the L2 frame it matched. The difference is the ingress framing, the
  * same correction ft_l2_overhead() makes for a flow -- and the same residual,
  * since padding on a short frame is not recoverable.
  *
- * The values are absolute rather than deltas, and the software counters are
- * zero for an entry the CPU never sees, so there is nothing to double count.
+ * Added, never set. The CPU counts into the same fields: the packets that
+ * resolve an entry, every one before the worker installs it, and all of them
+ * while a refusal keeps the group in software. And a hardware group counts
+ * from zero each time one is added, so setting its total erased the first
+ * kind and sent the count backwards on every reinstall -- which is what a
+ * daemon polling SIOCGETSGCNT prunes on. mlxsw can set, because its counter
+ * is the route's from creation and counts trapped packets too; this one
+ * exists only while the group is in hardware.
+ *
+ * What the hardware matched after the last fold is not carried over when the
+ * group leaves hardware: at most one fold interval, and never backwards.
  */
 static void ft_mr_fold(struct ft_mr_group *g, const struct cdx_ft_counters *c)
 {
-	u64 bytes = c->bytes;
+	u64 packets, bytes;
 
 	if (!g->hw)
 		return;
+	/* One hardware group's counters only grow, and the worker zeroes these
+	 * for a new one, so a sample below them is a read to distrust: it adds
+	 * nothing and moves nothing, as ft_stats() treats one. */
+	if (c->packets < g->folded_packets || c->bytes < g->folded_bytes)
+		return;
+	packets = c->packets - g->folded_packets;
+	bytes = c->bytes - g->folded_bytes;
+	/* Bytes without a packet are a sample taken between the two loads;
+	 * they belong to the next fold, which will see the packet too. */
+	if (!packets)
+		return;
+	g->folded_packets = c->packets;
+	g->folded_bytes = c->bytes;
 	bytes -= min_t(u64, bytes,
-		       c->packets * (u64)(ETH_HLEN + g->in_tags * VLAN_HLEN));
-	if (atomic_long_read(&g->mfc->mfc_un.res.pkt) != (long)c->packets)
-		WRITE_ONCE(g->mfc->mfc_un.res.lastuse, jiffies);
-	atomic_long_set(&g->mfc->mfc_un.res.pkt, c->packets);
-	atomic_long_set(&g->mfc->mfc_un.res.bytes, bytes);
+		       packets * (u64)(ETH_HLEN + g->in_tags * VLAN_HLEN));
+	atomic_long_add(packets, &g->mfc->mfc_un.res.pkt);
+	atomic_long_add(bytes, &g->mfc->mfc_un.res.bytes);
+	WRITE_ONCE(g->mfc->mfc_un.res.lastuse, jiffies);
 }
 
 static void ft_mr_release_set(struct ft_mr_group *g)
@@ -6096,7 +6122,7 @@ static void ft_mr_work_fn(struct work_struct *work)
 		struct ft_mr_plan plan = {};
 		enum ft_mr_state state;
 		bool claimed = false;
-		bool rekey = false, same = false;
+		bool rekey = false, same = false, added = false;
 		u8 retries = 0;
 		int rc = 0;
 
@@ -6169,10 +6195,12 @@ static void ft_mr_work_fn(struct work_struct *work)
 					}
 				} else {
 					rc = cdx_mc_group_add(&plan.spec, &hw);
-					if (rc)
+					if (rc) {
 						hw = NULL;
-					else
+					} else {
 						ft_mr_installed++;
+						added = true;
+					}
 				}
 			}
 			cdx_ft_end();
@@ -6184,6 +6212,11 @@ static void ft_mr_work_fn(struct work_struct *work)
 
 		mutex_lock(&ft_mr_lock);
 		target->hw = hw;
+		/* A group made in this pass counts from zero, whatever the last
+		 * one had reached. Here, not by comparing handles: the one a
+		 * delete frees is the next add's allocation often enough. */
+		if (added)
+			target->folded_packets = target->folded_bytes = 0;
 		if (state == FT_MR_INSTALLED) {
 			/* Adopt the plan whole, references included: the
 			 * backend borrows exactly these pointers, so a group

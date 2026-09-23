@@ -343,16 +343,25 @@ racing a read-modify-write with it — which is why it is written outside the
 derivation, where RTNL is already held. It is cleared *before* the
 `mr_cache_put()` that may free the entry through RCU.
 
-**The counters.** `mfc_un.res.pkt`, `.bytes` and `.lastuse`, set to the
-hardware's absolute values the way mlxsw does. There is no double counting: the
-software counters stay at zero for an entry the CPU never sees. The bytes are
-restated into the kernel's units first — `ip_mr_forward()` counts `skb->len`,
-which is the L3 packet, and the classifier counts the L2 frame it matched, so
-the ingress framing comes off per packet exactly as `ft_l2_overhead()` takes it
-off a flow's. The fold runs on a delayed work of its own every five seconds and
-again on every `/proc` read, so the two surfaces never disagree and a daemon
-polling `SIOCGETSGCNT` sees activity within one interval without anybody
-reading `/proc` at all.
+**The counters.** `mfc_un.res.pkt`, `.bytes` and `.lastuse`, with the
+hardware's count *added* to them. They are the CPU's counters too:
+`ip_mr_forward()` counts the packets that resolve an entry, every one before
+the worker installs it, and all of them while a refusal keeps the group in
+software. A hardware group counts from zero each time one is added, so writing
+its total over the entry's — mlxsw's way, which works there because its counter
+belongs to the route from creation and counts trapped packets too — erased the
+first kind and sent the count backwards on every reinstall. The fold adds what
+the classifier matched since the last fold instead, and the entry reads the
+CPU's count plus the hardware's, never less than it did. The bytes are restated
+into the kernel's units first — `ip_mr_forward()` counts `skb->len`, which is
+the L3 packet, and the classifier counts the L2 frame it matched, so the ingress
+framing comes off per packet exactly as `ft_l2_overhead()` takes it off a
+flow's. The fold runs on a delayed work of its own every five seconds and again
+on every `/proc` read, so a daemon polling `SIOCGETSGCNT` sees activity within
+one interval without anybody reading `/proc` at all. What the hardware matched
+after the last fold is not carried over when a group leaves hardware: at most
+one interval, and the count still never goes back. `/proc`'s own row reports the
+present hardware group's raw L2 count, which starts again with each group.
 
 The effect is that `ip mroute show` prints `offload`, `ip -s mroute` shows
 traffic the CPU never handled, and `igmpproxy` or `pimd` see their entries
@@ -477,9 +486,9 @@ Six oracles each, and the last two are ones a bridged case cannot produce:
    the sender's MAC and the TTL untouched, so this is what tells *routed* from
    *bridged* — and it is the one assertion that proves `TTL_HM_VALID` and the
    listener's header rebuild are doing what this document claims.
-6. `ip -s mroute` shows the traffic, which is the counter fold: the software
-   counter is zero for an offloaded entry, so a number there is the
-   classifier's.
+6. `ip -s mroute` shows the traffic, which is the counter fold: the CPU never
+   forwards an offloaded stream, so what the entry's count gains across it is
+   the classifier's.
 
 Teardown is an assertion too — removing the route has to take the hardware
 group, the `/proc` row and the kernel's flag with it.
