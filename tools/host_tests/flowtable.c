@@ -390,7 +390,7 @@ struct switchdev_vlan_state { u16 vid; u8 state; };
 struct switchdev_attr {
     enum switchdev_attr_id id;
     union { u8 stp_state; struct switchdev_mst_state mst_state;
-            struct switchdev_vlan_state vlan_state; } u;
+            struct switchdev_vlan_state vlan_state; bool mst; } u;
 };
 struct switchdev_notifier_port_obj_info {
     struct switchdev_notifier_info info; /* must be first */
@@ -865,7 +865,9 @@ static void netdev_hold(struct net_device *d, netdevice_tracker *t, int gfp)
 static void netdev_put(struct net_device *d, netdevice_tracker *t)
 { (void)t; assert(d->refs > 0); d->refs--; }
 static unsigned grace_periods;
-static void synchronize_net(void) { assert(!rtnl); grace_periods++; }
+/* The stopped-port sweep's grace period starts under RTNL, after whichever
+ * change raised its event before making it. */
+static void synchronize_net(void) { assert(rtnl); grace_periods++; }
 /* What for_each_netdev() walks: set by the case that needs a namespace's
  * whole device list, empty otherwise. */
 static struct net_device **netdev_registry;
@@ -2421,11 +2423,12 @@ static void test_bridge_fdb(void)
         SWITCHDEV_ATTR_ID_PORT_MROUTER, SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
         SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS, SWITCHDEV_ATTR_ID_PORT_STP_STATE,
         SWITCHDEV_ATTR_ID_PORT_MST_STATE, SWITCHDEV_ATTR_ID_BRIDGE_MST,
-        SWITCHDEV_ATTR_ID_VLAN_MSTI, SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
+        SWITCHDEV_ATTR_ID_PORT_VLAN_STATE,
     };
     for (unsigned i = 0; i < ARRAY_SIZE(changes); i++) {
         /* A port going (or staying) FORWARDING retires nothing and queues
-         * no sweep. */
+         * no sweep, and neither does switching MST on, which only stops
+         * the ports' own STP states from applying. */
         struct switchdev_attr change = { .id = changes[i] };
         unsigned kicks = mroute_kicks, sweeps = stopped_scheduled;
         if (changes[i] == SWITCHDEV_ATTR_ID_PORT_STP_STATE)
@@ -2434,6 +2437,8 @@ static void test_bridge_fdb(void)
             change.u.mst_state.state = BR_STATE_FORWARDING;
         if (changes[i] == SWITCHDEV_ATTR_ID_PORT_VLAN_STATE)
             change.u.vlan_state = (struct switchdev_vlan_state){ 100, BR_STATE_FORWARDING };
+        if (changes[i] == SWITCHDEV_ATTR_ID_BRIDGE_MST)
+            change.u.mst = true;
         set.attr = &change;
         set.info.dev = &out;
         assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
@@ -2490,9 +2495,10 @@ static void test_bridge_fdb(void)
      * so the untouched decoy port is swept as well. The sweep is queued, one
      * record per port however many events named it, holding the device until
      * it runs: an MSTI's state arrives in an RCU section and native cleanup
-     * sleeps. It waits out a grace period first, so a flow a walk described
-     * just before the change is in the table to be found, then cleans under
-     * RTNL and outside the backend transaction. */
+     * sleeps. It takes RTNL first, so a change whose event came before it is
+     * in place, then waits out a grace period, so a flow a walk described
+     * just before the change is in the table to be found, and cleans outside
+     * the backend transaction. */
     assert(stopped_scheduled == sweeps + 2 && allocated == records + 2);
     assert(decoy.refs == decoy_refs + 1 && out.refs == out_refs + 1);
     unsigned grace = grace_periods;
@@ -2529,6 +2535,31 @@ static void test_bridge_fdb(void)
     assert(swept[0] == &decoy && swept[1] == &out_tag && swept[2] == &out);
     assert(allocated == records && br.refs == br_refs && out_tag.refs == tag_refs);
 
+    /* The two bridge-wide MST events stop the whole bridge as well, and still
+     * refresh routed groups. A VLAN moved to another MSTI takes up that
+     * MSTI's state on every port, DISABLED where it has none, and no port
+     * event reports it; switching MST off lets each port's own STP state
+     * apply again. Neither says which port stopped, so every port is swept. */
+    struct switchdev_attr remap = { .id = SWITCHDEV_ATTR_ID_VLAN_MSTI };
+    struct switchdev_attr mst_off = { .id = SWITCHDEV_ATTR_ID_BRIDGE_MST, .u.mst = false };
+    struct switchdev_attr *bridge_wide[] = { &remap, &mst_off };
+    for (unsigned i = 0; i < ARRAY_SIZE(bridge_wide); i++) {
+        u64 before_wide = ft_stp_invalidations;
+        unsigned kicks = mroute_kicks, queued = stopped_scheduled;
+        set.attr = bridge_wide[i];
+        set.info.dev = &br;
+        assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
+        assert(mroute_kicks == kicks + 1 && stopped_scheduled == queued + 1);
+        assert(ft_stp_invalidations == before_wide + 1 && handle.invalid);
+        assert(!atomic_read(&ft_invalid) && !set.handled);
+        handle.invalid = false;
+        nswept = swept_under_rtnl = 0;
+        ft_stopped_workfn(NULL);
+        assert(nswept == 1 && swept_under_rtnl == 1 && swept[0] == &decoy);
+        assert(allocated == records && br.refs == br_refs);
+    }
+    set.attr = &vlan_state;
+
     /* Losing the record to a failed allocation must not lose the sweep: the
      * work then cleans every bridge port in the namespace. */
     struct net_device *registry[] = { &in, &out, &upper, &decoy, &br };
@@ -2538,7 +2569,7 @@ static void test_bridge_fdb(void)
     set.info.dev = &out;
     assert(ft_swdev_event(NULL, SWITCHDEV_PORT_ATTR_SET, &set) == NOTIFY_DONE);
     allocation_fail = false;
-    assert(stopped_scheduled == sweeps + 6 && allocated == records && out.refs == out_refs);
+    assert(stopped_scheduled == sweeps + 8 && allocated == records && out.refs == out_refs);
     handle.invalid = false;
     nswept = swept_under_rtnl = 0;
     ft_stopped_workfn(NULL);

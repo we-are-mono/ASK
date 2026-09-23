@@ -2933,15 +2933,18 @@ static void ft_stopped_workfn(struct work_struct *work)
 	all = ft_stopped_all;
 	ft_stopped_all = false;
 	spin_unlock_bh(&ft_stopped_lock);
-	/* The forward hook walks the path and inserts the flow inside one RCU
-	 * read-side section. After a grace period every flow a walk described
-	 * before the state changed is in a table for the sweep to find, and
-	 * every later walk sees the new state and refuses the path. */
-	synchronize_net();
 	/* Under RTNL, as the native NETDEV_DOWN cleanup runs: rule callbacks
 	 * only try for it, so the flush inside cannot wait on this. Never
 	 * inside the backend transaction, which those callbacks take. */
 	rtnl_lock();
+	/* The forward hook walks the path and inserts the flow inside one RCU
+	 * read-side section. After a grace period every flow a walk described
+	 * before the state changed is in a table for the sweep to find, and
+	 * every later walk sees the new state and refuses the path. The grace
+	 * period starts only once RTNL is held: several events are raised
+	 * before the change they report, inside the RTNL section that makes
+	 * it, so only then is the change certain to be in place. */
+	synchronize_net();
 	if (all)
 		for_each_netdev(&init_net, dev)
 			if (netif_is_bridge_port(dev))
@@ -3643,7 +3646,11 @@ static bool ft_mc_swdev_obj(unsigned long event,
 			    struct switchdev_notifier_port_obj_info *obj);
 
 /* Whether a port attribute takes a bridge port, one MSTI of it, or one VLAN
- * of it or of the bridge's own entry, out of FORWARDING. */
+ * of it or of the bridge's own entry, out of FORWARDING -- or may take any
+ * port of a bridge out of it, for the two bridge-wide MST events. A VLAN
+ * moved to another MSTI takes up, on every port, the state that MSTI has
+ * there, or DISABLED if none, and has no event of its own for it; switching
+ * MST off makes each port's own STP state, which MST ignored, apply again. */
 static bool ft_stp_stopped(const struct switchdev_attr *attr)
 {
 	switch (attr->id) {
@@ -3653,6 +3660,10 @@ static bool ft_stp_stopped(const struct switchdev_attr *attr)
 		return attr->u.mst_state.state != BR_STATE_FORWARDING;
 	case SWITCHDEV_ATTR_ID_PORT_VLAN_STATE:
 		return attr->u.vlan_state.state != BR_STATE_FORWARDING;
+	case SWITCHDEV_ATTR_ID_VLAN_MSTI:
+		return true;
+	case SWITCHDEV_ATTR_ID_BRIDGE_MST:
+		return !attr->u.mst;
 	default:
 		return false;
 	}
@@ -3711,7 +3722,10 @@ static int ft_swdev_event(struct notifier_block *nb, unsigned long event, void *
 			 * a port too; this retires what was admitted or cached
 			 * before. An MSTI or a VLAN leaving FORWARDING retires
 			 * the whole port, and the bridge's own entry every port:
-			 * rules are not mapped onto VLANs here. */
+			 * rules are not mapped onto VLANs here. The bridge-wide
+			 * MST events, on the bridge itself, retire every port of
+			 * it; admission keeps such a bridge out of hardware, so
+			 * what they reach is software. */
 			if (dev && ft_stp_stopped(attr->attr)) {
 				ft_device_retire(dev, &ft_stp_invalidations);
 				ft_port_stopped(dev);

@@ -155,10 +155,18 @@ forwarded. The same patch reports a per-VLAN state set directly as
 And on any of those events leaving FORWARDING the adapter retires its hardware
 entries through the port and queues `nf_flow_table_cleanup()` for it, which
 reaches the software flows no handle names: the ones admission refused and the
-ones another table owns. The sweep is queued because an MSTI's state arrives
-inside an RCU read-side section and native cleanup sleeps; it waits out a
-grace period first, so a flow whose walk read the old state is already in the
-table to be found. With spanning tree off, `bridge link set ... state 4` never
+ones another table owns. Two MST events are raised on the bridge alone and
+stop every port of it: `SWITCHDEV_ATTR_ID_VLAN_MSTI`, since a VLAN moved to
+another MSTI takes up that MSTI's state on each port (DISABLED where it has
+none) with no port event, and `SWITCHDEV_ATTR_ID_BRIDGE_MST` switching MST
+off, since each port's own STP state then applies again. Admission keeps an
+MST bridge out of hardware, so those two reach software flows. The sweep is
+queued because an MSTI's state arrives inside an RCU read-side section and
+native cleanup sleeps. It takes RTNL, then waits out a grace period: several
+of these events are raised before the change they report, inside the RTNL
+section that makes it, so only then is the new state certain to be in place
+and every flow whose walk read the old one already in the table to be found.
+With spanning tree off, `bridge link set ... state 4` never
 sticks -- `br_port_state_selection()` puts a designated port straight back to
 FORWARDING -- so the rig blocks a port under user-space STP.
 

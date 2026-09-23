@@ -286,6 +286,9 @@ file's git history.
 
 ## Gating
 
+- [x] **A215.** An MSTI remap or MST switched off stopped bridge ports without naming them, and their software flows were never swept —
+  fixed (_:/^cdx: sweep a bridge whose MST events stop ports without saying which_).
+
 - [x] **A214.** Software flows already through a port that stopped forwarding were never swept, and kept bypassing the bridge —
   fixed (_:/^cdx: sweep software flows off a port that stops forwarding_).
 
