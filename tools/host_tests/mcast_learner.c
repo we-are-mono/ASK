@@ -1999,6 +1999,32 @@ static void idle_flows_age_out(void)
     assert(!ft_mc_flow_count);
     memset(&c, 0, sizeof(c));
 
+    /* An interval shorter than two refreshes is taken as two: the count is
+     * read one refresh apart, and a read that has not seen a running
+     * stream's frames yet must not age it out. And a sample that answers
+     * nothing -- below the baseline -- ages nothing, however late it is. */
+    membership_interval = 4 * HZ;
+    see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));
+    pass();
+    f = flow(&P1, S, 0);
+    assert(f && f->hw && f->age == 2 * FT_MC_REFRESH_INTERVAL);
+    f->active = t0;
+    f->hw_packets = f->hw_bytes = 0;
+    f->count_suspect = false;
+    ft_mc_flow_counted(f, &c, t0 + FT_MC_REFRESH_INTERVAL);
+    assert(f->idle && !f->gone);
+    f->hw_packets = 100;
+    f->hw_bytes = 6400;
+    ft_mc_flow_counted(f, &c, t0 + 3 * FT_MC_REFRESH_INTERVAL);
+    assert(f->count_suspect && !f->idle && !f->gone);
+    c = (struct cdx_ft_counters){ .packets = 101, .bytes = 6464 };
+    ft_mc_flow_counted(f, &c, t0 + 4 * FT_MC_REFRESH_INTERVAL);
+    assert(!f->gone && f->active == t0 + 4 * FT_MC_REFRESH_INTERVAL);
+    f->gone = true;
+    pass();
+    assert(!ft_mc_flow_count);
+    memset(&c, 0, sizeof(c));
+
     /* No interval, no ageing. */
     membership_interval = 0;
     see(seen_v4(&BR, &P1, G, S, 0, false, SENDER));

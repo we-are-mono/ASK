@@ -34,6 +34,8 @@ def test_mcast_learner(tmp_path):
         # restating them.
         + source[source.index("#define FT_MC_MAX_MEMBERS"):
                  source.index("static LIST_HEAD(ft_mc_groups)")]
+        # The refresh interval, which the shortest age is two of.
+        + re.search(r"#define FT_MC_REFRESH_INTERVAL.*\n", source).group(0)
         # The published routes and taps, the state they are kept in.
         + source[state:source.index("\n", source.index(
             "static bool ft_mc_taps_overflow", state)) + 1]
@@ -452,6 +454,18 @@ def test_an_idle_entry_ages_on_the_bridges_clock():
     patch = (ROOT / "patches/kernel/161-bridge-multicast-egress-snapshot.patch").read_text()
     assert "+EXPORT_SYMBOL_GPL(br_multicast_membership_interval);" in patch
     assert "+	interval = br_multicast_gmi(brmctx);" in patch
+
+
+def test_a_stream_the_parser_never_classifies_is_not_learned():
+    """The soft parser ends the parse of an IPv4 frame whose TTL is 0 or 1, and
+    of an IPv6 one whose hop limit is, before any table is consulted. An entry
+    learned from such a stream would count nothing, age out, and be learned
+    again from the next frame for as long as the stream runs, so the hook
+    records neither."""
+    hook = function(SOURCE.read_text(), "ft_mc_hook")
+    record = hook.index("ft_mc_record(&seen);")
+    assert hook.index("if (iph->ttl <= 1)\n\t\t\treturn NF_ACCEPT;") < record
+    assert hook.index("if (ip6h->hop_limit <= 1)\n\t\t\treturn NF_ACCEPT;") < record
 
 
 def test_a_failed_install_is_tried_again_an_interval_apart():

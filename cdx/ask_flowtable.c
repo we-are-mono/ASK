@@ -6017,6 +6017,14 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 		if (!pskb_may_pull(skb, l3_off + sizeof(*iph)))
 			return NF_ACCEPT;
 		iph = (const struct iphdr *)(skb->data + l3_off);
+		/* The parser ends the parse of a frame whose TTL is 0 or 1
+		 * before any table is consulted, so no entry ever matches one:
+		 * the stream stays in software whatever is installed. A flow
+		 * learned from it would be an entry that counts nothing, aged
+		 * out and learned again from the next frame for as long as the
+		 * stream runs. The same holds for the IPv6 hop limit. */
+		if (iph->ttl <= 1)
+			return NF_ACCEPT;
 		seen.addr.dst.ip4 = iph->daddr;
 		seen.src.ip = iph->saddr;
 		seen.addr.proto = htons(ETH_P_IP);
@@ -6026,6 +6034,8 @@ static unsigned int ft_mc_hook(void *priv, struct sk_buff *skb,
 		if (!pskb_may_pull(skb, l3_off + sizeof(*ip6h)))
 			return NF_ACCEPT;
 		ip6h = (const struct ipv6hdr *)(skb->data + l3_off);
+		if (ip6h->hop_limit <= 1)
+			return NF_ACCEPT;
 		seen.addr.dst.ip6 = ip6h->daddr;
 		seen.src.in6 = ip6h->saddr;
 		seen.addr.proto = htons(ETH_P_IPV6);
@@ -6492,8 +6502,13 @@ static void ft_mc_flow_derive(struct ft_mc_flow *f)
 		ft_mc_drop_next(f);
 	/* Read at every derivation, and so followed within a refresh when
 	 * whoever configures the bridge changes it; it changes nothing the
-	 * hardware holds. */
+	 * hardware holds. Never shorter than two refreshes: the count is read
+	 * one refresh apart, and an interval the next read could overrun would
+	 * take a stream whose frames that read has not seen yet for one that
+	 * stopped. */
 	f->age = br_multicast_membership_interval(f->bridge, f->addr.vid);
+	if (f->age && f->age < 2 * FT_MC_REFRESH_INTERVAL)
+		f->age = 2 * FT_MC_REFRESH_INTERVAL;
 	memset(port, 0, sizeof(port));
 	n = br_multicast_list_ports(f->bridge, &f->addr, f->in, &local, chosen,
 				    ARRAY_SIZE(chosen));
@@ -6951,7 +6966,9 @@ static void ft_mc_flow_counted(struct ft_mc_flow *f,
 	f->idle = counted && !packets;
 	if (f->idle && f->has_next)
 		f->stale = true;
-	if (f->age && time_after(now, f->active + f->age))
+	/* Aged only on a sample that answers: one below the baseline cannot
+	 * tell a stream that stopped from one that is running. */
+	if (counted && f->age && time_after(now, f->active + f->age))
 		f->gone = true;
 }
 

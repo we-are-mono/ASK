@@ -396,15 +396,19 @@ forward beyond this link, so a router must not replicate it. For a **bridge**
 it is a genuine gap, because bridging is not forwarding in the IP sense and
 the Linux bridge will happily replicate a TTL-1 group. Anything that scopes
 itself to the local link by TTL — and a good deal of service discovery does —
-is therefore carried in software on this hardware whatever the MDB says. The
-group still installs and still reports `offload`; it simply never matches.
+is therefore carried in software on this hardware whatever the MDB says.
 
 Nothing in the adapter can change that: the decision is made in the parser
-before any table is consulted. It is recorded here because it is invisible
-from every surface an operator has, and because it is a very effective way to
-convince yourself the offload is broken when it is working. Measure with a TTL
-above 1, and have a test that sets it explicitly rather than inheriting a
-default: a plain UDP multicast socket sends TTL 1.
+before any table is consulted. What the adapter does is not learn from such a
+frame. An entry for the stream would count nothing, age out after the
+membership interval, and be learned again from the next frame, for as long as
+the stream runs. So the membership stays `pending-source` in `/proc` and the
+MDB claims `offload` for a port that is only ever served in software. It is
+recorded here because it is invisible from every surface an operator has, and
+because it is a very effective way to convince yourself the offload is broken
+when it is working. Measure with a TTL above 1, and have a test that sets it
+explicitly rather than inheriting a default: a plain UDP multicast socket sends
+TTL 1.
 
 **Host delivery is not solved by this increment.**
 `SWITCHDEV_OBJ_ID_HOST_MDB` exists for traffic the bridge itself must receive,
@@ -602,7 +606,10 @@ entry's count, and an entry that has counted nothing for the bridge's group
 membership interval -- `multicast_membership_interval`, 260 seconds unless
 configured, read for the flow's VLAN at each derivation -- goes, flow and all.
 That is the clock the bridge forgets an unrefreshed membership by, so a
-stopped source is aged as the bridge would age a silent listener. A source
+stopped source is aged as the bridge would age a silent listener. An interval
+shorter than two refreshes is taken as two, and a count read below the last
+one ages nothing, because neither can tell a running stream from a stopped
+one. A source
 that resumes reaches the CPU again and is learned from its next frames like
 any new one; a flow never in hardware has no count to age by, and is bounded
 by the group's eight instead.
